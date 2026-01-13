@@ -1,23 +1,23 @@
-# name: test/sql/quack.test
-# description: test quack extension
+# name: test/sql/vgi.test
+# description: test vgi extension
 # group: [sql]
 
 # Before we load the extension, this will fail
 statement error
-SELECT quack('Sam');
+SELECT vgi('Sam');
 ----
-Catalog Error: Scalar Function with name quack does not exist!
+Catalog Error: Scalar Function with name vgi does not exist!
 
 # Require statement will ensure this test is run with this extension loaded
-require quack
+require vgi
 
 # Confirm the extension works
 query I
-SELECT quack('Sam');
+SELECT vgi('Sam');
 ----
-Quack Sam 🐥
+vgi Sam 🐥
 
 query I
-SELECT quack_openssl_version('Michael') ILIKE 'Quack Michael, my linked OpenSSL version is OpenSSL%';
+SELECT vgi_openssl_version('Michael') ILIKE 'vgi Michael, my linked OpenSSL version is OpenSSL%';
 ----
 true
