@@ -19,3 +19,23 @@ query I
 SELECT typeof(catalog) FROM vgi_catalogs('${VGI_TEST_WORKER}') LIMIT 1;
 ----
 VARCHAR
+
+# Test ATTACH with VGI catalog
+statement ok
+ATTACH 'example' AS vgi_test (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# Test schema discovery - verify we can see the 'main' schema
+query II
+SELECT catalog_name, schema_name FROM information_schema.schemata WHERE catalog_name = 'vgi_test';
+----
+vgi_test	main
+
+# DETACH the catalog
+statement ok
+DETACH vgi_test;
+
+# Test ATTACH with non-existent catalog returns proper error
+statement error
+ATTACH 'nonexistent_catalog' AS vgi_bad (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+----
+Unknown catalog: 'nonexistent_catalog'

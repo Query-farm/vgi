@@ -135,5 +135,108 @@ std::shared_ptr<arrow::RecordBatch> CreateEmptyArgsBatch() {
 	return arrow::RecordBatch::Make(schema, 0, arrays);
 }
 
+// Create arguments batch with attach_id (for catalog methods that need it)
+std::shared_ptr<arrow::RecordBatch> CreateCatalogArgsWithAttachId(const std::vector<uint8_t> &attach_id) {
+	auto schema = arrow::schema({
+	    arrow::field("attach_id", arrow::binary(), false),
+	    arrow::field("transaction_id", arrow::binary(), true), // nullable
+	});
+
+	arrow::BinaryBuilder attach_id_builder;
+	CheckArrowStatus(attach_id_builder.Append(attach_id.data(), attach_id.size()), "append attach_id");
+
+	arrow::BinaryBuilder transaction_id_builder;
+	CheckArrowStatus(transaction_id_builder.AppendNull(), "append null transaction_id");
+
+	std::vector<std::shared_ptr<arrow::Array>> arrays;
+	arrays.push_back(FinishBuilder(attach_id_builder, "attach_id"));
+	arrays.push_back(FinishBuilder(transaction_id_builder, "transaction_id"));
+
+	return arrow::RecordBatch::Make(schema, 1, arrays);
+}
+
+// Create arguments batch for catalog_attach method
+std::shared_ptr<arrow::RecordBatch> CreateCatalogAttachArgs(const std::string &catalog_name) {
+	// Create map type for options: map<utf8, utf8>
+	auto map_type = arrow::map(arrow::utf8(), arrow::utf8());
+
+	auto schema = arrow::schema({
+	    arrow::field("name", arrow::utf8(), false),
+	    arrow::field("options", map_type, false),
+	});
+
+	arrow::StringBuilder name_builder;
+	CheckArrowStatus(name_builder.Append(catalog_name), "append name");
+
+	// Build empty map for options
+	auto key_builder = std::make_shared<arrow::StringBuilder>();
+	auto value_builder = std::make_shared<arrow::StringBuilder>();
+	arrow::MapBuilder map_builder(arrow::default_memory_pool(), key_builder, value_builder, map_type);
+	CheckArrowStatus(map_builder.Append(), "start empty map");
+
+	std::vector<std::shared_ptr<arrow::Array>> arrays;
+	arrays.push_back(FinishBuilder(name_builder, "name"));
+	arrays.push_back(FinishBuilder(map_builder, "options"));
+
+	return arrow::RecordBatch::Make(schema, 1, arrays);
+}
+
+// Create arguments batch for schema_get method
+std::shared_ptr<arrow::RecordBatch> CreateSchemaGetArgs(const std::vector<uint8_t> &attach_id,
+                                                        const std::string &schema_name) {
+	auto schema = arrow::schema({
+	    arrow::field("attach_id", arrow::binary(), false),
+	    arrow::field("transaction_id", arrow::binary(), true), // nullable
+	    arrow::field("name", arrow::utf8(), false),
+	});
+
+	arrow::BinaryBuilder attach_id_builder;
+	CheckArrowStatus(attach_id_builder.Append(attach_id.data(), attach_id.size()), "append attach_id");
+
+	arrow::BinaryBuilder transaction_id_builder;
+	CheckArrowStatus(transaction_id_builder.AppendNull(), "append null transaction_id");
+
+	arrow::StringBuilder name_builder;
+	CheckArrowStatus(name_builder.Append(schema_name), "append name");
+
+	std::vector<std::shared_ptr<arrow::Array>> arrays;
+	arrays.push_back(FinishBuilder(attach_id_builder, "attach_id"));
+	arrays.push_back(FinishBuilder(transaction_id_builder, "transaction_id"));
+	arrays.push_back(FinishBuilder(name_builder, "name"));
+
+	return arrow::RecordBatch::Make(schema, 1, arrays);
+}
+
+// Create arguments batch for table_get method
+std::shared_ptr<arrow::RecordBatch> CreateTableGetArgs(const std::vector<uint8_t> &attach_id,
+                                                       const std::string &schema_name, const std::string &table_name) {
+	auto schema = arrow::schema({
+	    arrow::field("attach_id", arrow::binary(), false),
+	    arrow::field("transaction_id", arrow::binary(), true), // nullable
+	    arrow::field("schema_name", arrow::utf8(), false),
+	    arrow::field("name", arrow::utf8(), false),
+	});
+
+	arrow::BinaryBuilder attach_id_builder;
+	CheckArrowStatus(attach_id_builder.Append(attach_id.data(), attach_id.size()), "append attach_id");
+
+	arrow::BinaryBuilder transaction_id_builder;
+	CheckArrowStatus(transaction_id_builder.AppendNull(), "append null transaction_id");
+
+	arrow::StringBuilder schema_name_builder;
+	CheckArrowStatus(schema_name_builder.Append(schema_name), "append schema_name");
+
+	arrow::StringBuilder name_builder;
+	CheckArrowStatus(name_builder.Append(table_name), "append name");
+
+	std::vector<std::shared_ptr<arrow::Array>> arrays;
+	arrays.push_back(FinishBuilder(attach_id_builder, "attach_id"));
+	arrays.push_back(FinishBuilder(transaction_id_builder, "transaction_id"));
+	arrays.push_back(FinishBuilder(schema_name_builder, "schema_name"));
+	arrays.push_back(FinishBuilder(name_builder, "name"));
+
+	return arrow::RecordBatch::Make(schema, 1, arrays);
+}
+
 } // namespace vgi
 } // namespace duckdb

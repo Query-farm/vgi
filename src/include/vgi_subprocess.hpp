@@ -39,7 +39,10 @@ public:
 // exec fails, so it won't become a zombie.
 class SubProcess {
 public:
-	explicit SubProcess(const std::string &command);
+	// Create a subprocess running the given command.
+	// If stderr_passthrough is true, worker stderr goes directly to the terminal
+	// instead of being captured (useful for debugging).
+	explicit SubProcess(const std::string &command, bool stderr_passthrough = false);
 	~SubProcess();
 
 	// Accessors for process info and file descriptors
@@ -87,6 +90,13 @@ private:
 
 // Helper to write all bytes to a file descriptor
 void WriteAll(int fd, const uint8_t *data, size_t len);
+
+// Default timeout for catalog operations (5 seconds)
+constexpr int CATALOG_OPERATION_TIMEOUT_SECONDS = 5;
+
+// Wait for a file descriptor to become readable with a timeout.
+// Returns true if readable, throws IOException on timeout or error.
+void WaitForReadable(int fd, int timeout_seconds = CATALOG_OPERATION_TIMEOUT_SECONDS);
 
 } // namespace vgi
 } // namespace duckdb

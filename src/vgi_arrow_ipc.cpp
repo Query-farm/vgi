@@ -5,6 +5,7 @@
 #include <unistd.h>
 
 #include "duckdb/common/exception.hpp"
+#include "vgi_subprocess.hpp"
 
 namespace duckdb {
 namespace vgi {
@@ -60,6 +61,14 @@ arrow::Result<int64_t> FdInputStream::Read(int64_t nbytes, void *out) {
 	if (!is_open_) {
 		return arrow::Status::Invalid("Stream is closed");
 	}
+
+	// Wait for data with timeout before blocking read
+	try {
+		WaitForReadable(fd_);
+	} catch (const std::exception &e) {
+		return arrow::Status::IOError("Timeout waiting for data: ", e.what());
+	}
+
 	ssize_t bytes_read;
 	while (true) {
 		bytes_read = read(fd_, out, nbytes);
@@ -83,7 +92,10 @@ arrow::Result<std::shared_ptr<arrow::Buffer>> FdInputStream::Read(int64_t nbytes
 }
 
 // Read a single RecordBatch from a file descriptor
-std::shared_ptr<arrow::RecordBatch> ReadRecordBatch(int fd) {
+arrow::RecordBatchWithMetadata ReadRecordBatch(int fd) {
+	// Wait for data to be available with timeout
+	WaitForReadable(fd);
+
 	auto input = std::make_shared<FdInputStream>(fd);
 
 	auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(input);
@@ -92,13 +104,16 @@ std::shared_ptr<arrow::RecordBatch> ReadRecordBatch(int fd) {
 	}
 	auto reader = reader_result.ValueUnsafe();
 
-	std::shared_ptr<arrow::RecordBatch> batch;
-	auto status = reader->ReadNext(&batch);
-	if (!status.ok()) {
-		throw IOException("Failed to read Arrow batch: " + status.ToString());
+	// Use ReadNext() which returns RecordBatchWithMetadata including custom metadata
+	auto result = reader->ReadNext();
+	if (!result.ok()) {
+		throw IOException("Failed to read Arrow batch: " + result.status().ToString());
 	}
 
-	return batch;
+	// Reset reader to consume any remaining stream data (e.g., EOS marker)
+	reader.reset();
+
+	return result.ValueUnsafe();
 }
 
 // Extract string values from a result batch column.
@@ -131,6 +146,21 @@ std::vector<std::string> ExtractStringColumn(const std::shared_ptr<arrow::Record
 	}
 
 	return values;
+}
+
+// Deserialize an Arrow schema from IPC format bytes
+std::shared_ptr<arrow::Schema> DeserializeSchema(const std::vector<uint8_t> &data) {
+	if (data.empty()) {
+		return nullptr;
+	}
+
+	auto buffer = arrow::Buffer::Wrap(data.data(), data.size());
+	arrow::io::BufferReader reader(buffer);
+	auto schema_result = arrow::ipc::ReadSchema(&reader, nullptr);
+	if (!schema_result.ok()) {
+		throw IOException("Failed to deserialize Arrow schema: " + schema_result.status().ToString());
+	}
+	return schema_result.ValueUnsafe();
 }
 
 } // namespace vgi

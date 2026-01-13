@@ -25,7 +25,15 @@ src/vgi_logging.cpp
 src/vgi_subprocess.cpp
 src/vgi_arrow_ipc.cpp
 src/vgi_protocol.cpp
-src/vgi_catalogs.cpp)
+src/vgi_catalogs.cpp
+src/vgi_catalog_api.cpp
+src/storage/vgi_catalog.cpp
+src/storage/vgi_catalog_set.cpp
+src/storage/vgi_schema_set.cpp
+src/storage/vgi_schema_entry.cpp
+src/storage/vgi_table_set.cpp
+src/storage/vgi_table_entry.cpp
+src/storage/vgi_transaction.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})

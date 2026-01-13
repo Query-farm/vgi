@@ -33,11 +33,17 @@ private:
 };
 
 // Read a single RecordBatch from a file descriptor (Arrow IPC stream format)
-std::shared_ptr<arrow::RecordBatch> ReadRecordBatch(int fd);
+// Returns RecordBatchWithMetadata containing both the batch and any custom metadata.
+// NOTE: This creates a new stream reader each time. For streaming multiple batches,
+// use CatalogMethodStream from vgi_catalog_api.hpp which properly handles log messages.
+arrow::RecordBatchWithMetadata ReadRecordBatch(int fd);
 
 // Extract string values from a result batch column
 std::vector<std::string> ExtractStringColumn(const std::shared_ptr<arrow::RecordBatch> &batch,
                                              const std::string &column_name = "value");
+
+// Deserialize an Arrow schema from IPC format bytes
+std::shared_ptr<arrow::Schema> DeserializeSchema(const std::vector<uint8_t> &data);
 
 } // namespace vgi
 } // namespace duckdb

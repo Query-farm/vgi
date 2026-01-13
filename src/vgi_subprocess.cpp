@@ -1,7 +1,9 @@
 #include "vgi_subprocess.hpp"
 
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
+#include <sys/select.h>
 
 #include "duckdb/common/exception.hpp"
 
@@ -38,10 +40,16 @@ void Pipe::CloseWrite() {
 }
 
 // SubProcess implementation
-SubProcess::SubProcess(const std::string &command) {
+SubProcess::SubProcess(const std::string &command, bool stderr_passthrough) {
+	// Also check environment variable for backwards compatibility
+	if (!stderr_passthrough) {
+		const char *passthrough_env = std::getenv("VGI_WORKER_STDERR_PASSTHROUGH");
+		stderr_passthrough = passthrough_env && std::string(passthrough_env) == "1";
+	}
+
 	Pipe stdin_pipe;
 	Pipe stdout_pipe;
-	Pipe stderr_pipe;
+	Pipe stderr_pipe; // Only used if not passthrough
 
 	pid_ = fork();
 	if (pid_ < 0) {
@@ -60,10 +68,16 @@ SubProcess::SubProcess(const std::string &command) {
 		stdout_pipe.CloseRead();
 		stdout_pipe.CloseWrite();
 
-		// Redirect stderr
-		dup2(stderr_pipe.write_fd, STDERR_FILENO);
-		stderr_pipe.CloseRead();
-		stderr_pipe.CloseWrite();
+		// Redirect stderr (only if not passthrough)
+		if (!stderr_passthrough) {
+			dup2(stderr_pipe.write_fd, STDERR_FILENO);
+			stderr_pipe.CloseRead();
+			stderr_pipe.CloseWrite();
+		} else {
+			// Enable IPC debug output in the worker when debugging
+			setenv("VGI_IPC_DEBUG", "1", 1);
+		}
+		// If passthrough, stderr remains connected to parent's stderr
 
 		// Execute command via shell
 		execl("/bin/sh", "sh", "-c", command.c_str(), nullptr);
@@ -77,13 +91,19 @@ SubProcess::SubProcess(const std::string &command) {
 	stdout_fd_ = stdout_pipe.read_fd;
 	stdout_pipe.read_fd = -1; // Transfer ownership
 
-	stderr_fd_ = stderr_pipe.read_fd;
-	stderr_pipe.read_fd = -1; // Transfer ownership
+	if (!stderr_passthrough) {
+		stderr_fd_ = stderr_pipe.read_fd;
+		stderr_pipe.read_fd = -1; // Transfer ownership
+	} else {
+		stderr_fd_ = -1; // No stderr pipe when passthrough
+	}
 
 	// Close unused ends
 	stdin_pipe.CloseRead();
 	stdout_pipe.CloseWrite();
-	stderr_pipe.CloseWrite();
+	if (!stderr_passthrough) {
+		stderr_pipe.CloseWrite();
+	}
 }
 
 SubProcess::~SubProcess() {
@@ -182,6 +202,35 @@ void WriteAll(int fd, const uint8_t *data, size_t len) {
 		}
 		written += result;
 	}
+}
+
+// WaitForReadable implementation - wait for fd to be readable with timeout
+void WaitForReadable(int fd, int timeout_seconds) {
+	fd_set read_fds;
+	struct timeval timeout;
+
+	FD_ZERO(&read_fds);
+	FD_SET(fd, &read_fds);
+
+	timeout.tv_sec = timeout_seconds;
+	timeout.tv_usec = 0;
+
+	int result = select(fd + 1, &read_fds, nullptr, nullptr, &timeout);
+
+	if (result < 0) {
+		if (errno == EINTR) {
+			// Interrupted by signal, treat as timeout for simplicity
+			throw IOException("VGI catalog operation interrupted");
+		}
+		throw IOException("VGI catalog operation failed: select error: %s", strerror(errno));
+	}
+
+	if (result == 0) {
+		// Timeout
+		throw IOException("VGI catalog operation timed out after %d seconds", timeout_seconds);
+	}
+
+	// fd is readable, return successfully
 }
 
 } // namespace vgi
