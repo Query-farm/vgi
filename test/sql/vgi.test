@@ -1,0 +1,24 @@
+# name: test/sql/vgi.test
+# description: test vgi extension
+# group: [vgi]
+
+# Require statement will ensure this test is run with this extension loaded
+require vgi
+
+# Test vgi_catalogs with non-existent worker path
+statement error
+SELECT * FROM vgi_catalogs('/nonexistent/path/to/worker');
+----
+VGI worker '/nonexistent/path/to/worker' failed
+
+# Test vgi_catalogs with a file that exists but is not a valid VGI worker
+statement error
+SELECT * FROM vgi_catalogs('/bin/echo');
+----
+VGI worker '/bin/echo' failed
+
+# Test vgi_catalogs with empty string path
+statement error
+SELECT * FROM vgi_catalogs('');
+----
+VGI worker '' failed

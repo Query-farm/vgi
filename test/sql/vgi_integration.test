@@ -1,0 +1,21 @@
+# name: test/sql/vgi_integration.test
+# description: test vgi extension with a real VGI worker
+# group: [vgi]
+
+# This test requires a VGI worker to be available
+# Set VGI_TEST_WORKER environment variable to the path of a VGI worker executable
+require-env VGI_TEST_WORKER
+
+require vgi
+
+# Test vgi_catalogs returns at least 0 rows (the worker exists and responds)
+query I
+SELECT count(*) >= 0 FROM vgi_catalogs('${VGI_TEST_WORKER}');
+----
+true
+
+# Verify the result is a table with a catalog column of VARCHAR type
+query I
+SELECT typeof(catalog) FROM vgi_catalogs('${VGI_TEST_WORKER}') LIMIT 1;
+----
+VARCHAR
