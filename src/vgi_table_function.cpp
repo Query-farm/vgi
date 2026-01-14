@@ -344,9 +344,19 @@ static unique_ptr<NodeStatistics> VgiTableFunctionCardinality(ClientContext &con
 	auto &bind_data = bind_data_p->Cast<VgiTableFunctionBindData>();
 
 	if (bind_data.cardinality_estimate >= 0) {
+		VGI_LOG(context, "table_function.cardinality",
+		        {{"worker_path", bind_data.worker_path},
+		         {"function_name", bind_data.function_name},
+		         {"invocation_id", bind_data.invocation_id_hex},
+		         {"cardinality_estimate", std::to_string(bind_data.cardinality_estimate)}});
 		return make_uniq<NodeStatistics>(static_cast<idx_t>(bind_data.cardinality_estimate));
 	}
 
+	VGI_LOG(context, "table_function.cardinality",
+	        {{"worker_path", bind_data.worker_path},
+	         {"function_name", bind_data.function_name},
+	         {"invocation_id", bind_data.invocation_id_hex},
+	         {"cardinality_estimate", "unknown"}});
 	// No estimate available
 	return make_uniq<NodeStatistics>();
 }
@@ -361,11 +371,27 @@ static double VgiTableFunctionProgress(ClientContext &context, const FunctionDat
 	auto &global_state = global_state_p->Cast<VgiTableFunctionGlobalState>();
 
 	if (bind_data.cardinality_estimate > 0) {
-		double progress = (static_cast<double>(global_state.rows_read.load()) /
+		idx_t rows_read = global_state.rows_read.load();
+		double progress = (static_cast<double>(rows_read) /
 		                   static_cast<double>(bind_data.cardinality_estimate)) * 100.0;
-		return MinValue(progress, 100.0);
+		progress = MinValue(progress, 100.0);
+		VGI_LOG(context, "table_function.progress",
+		        {{"worker_path", bind_data.worker_path},
+		         {"function_name", bind_data.function_name},
+		         {"invocation_id", bind_data.invocation_id_hex},
+		         {"rows_read", std::to_string(rows_read)},
+		         {"cardinality_estimate", std::to_string(bind_data.cardinality_estimate)},
+		         {"progress_percent", std::to_string(progress)}});
+		return progress;
 	}
 
+	VGI_LOG(context, "table_function.progress",
+	        {{"worker_path", bind_data.worker_path},
+	         {"function_name", bind_data.function_name},
+	         {"invocation_id", bind_data.invocation_id_hex},
+	         {"rows_read", std::to_string(global_state.rows_read.load())},
+	         {"cardinality_estimate", "unknown"},
+	         {"progress_percent", "-1"}});
 	// No estimate available
 	return -1.0;
 }
