@@ -6,6 +6,7 @@
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "vgi_arrow_ipc.hpp"
 #include "vgi_arrow_utils.hpp"
+#include "vgi_exception.hpp"
 #include "vgi_logging.hpp"
 #include "vgi_protocol.hpp"
 #include "yyjson.hpp"
@@ -20,12 +21,12 @@ namespace vgi {
 // ============================================================================
 
 // Check if a batch contains a log message (zero rows with vgi.log_* metadata).
-// If it's an EXCEPTION, throws IOException with the message and traceback.
+// If it's an EXCEPTION, throws IOException with the message, traceback, and worker context.
 // For other log levels, logs to DuckDB if context is provided.
 // Returns true if the batch was a log message, false otherwise.
 bool HandleBatchLogMessage(const std::shared_ptr<arrow::RecordBatch> &batch,
                            const std::shared_ptr<arrow::KeyValueMetadata> &custom_metadata, ClientContext *context,
-                           const std::string &worker_path) {
+                           const std::string &worker_path, pid_t worker_pid, const std::string &invocation_id_hex) {
 	if (!batch || batch->num_rows() != 0) {
 		return false;
 	}
@@ -71,16 +72,12 @@ bool HandleBatchLogMessage(const std::shared_ptr<arrow::RecordBatch> &batch,
 
 	// Handle based on log level
 	if (log_level == "EXCEPTION") {
-		// Construct error message with traceback and worker info
-		std::string full_message = "VGI Worker Exception";
-		if (!worker_path.empty()) {
-			full_message += " [" + worker_path + "]";
-		}
-		full_message += ": " + log_message;
+		// Construct error message with traceback (worker context is in extra_info)
+		std::string full_message = "VGI Worker Exception: " + log_message;
 		if (!traceback.empty()) {
 			full_message += "\n" + traceback;
 		}
-		throw IOException(full_message);
+		ThrowVgiIOException(full_message, worker_path, worker_pid, invocation_id_hex);
 	}
 
 	// For non-exception log levels, log to DuckDB if we have a context
@@ -136,11 +133,29 @@ std::shared_ptr<arrow::RecordBatch> InvokeCatalogMethod(const std::string &worke
 	// Read batches, handling log messages until we get actual data
 	arrow::RecordBatchWithMetadata result;
 	while (true) {
-		result = ReadRecordBatch(proc.GetStdoutFd());
+		try {
+			result = ReadRecordBatch(proc.GetStdoutFd(), worker_path, proc.GetPid());
+		} catch (const IOException &e) {
+			// Check if the worker process died early (e.g., command not found)
+			int exit_status = 0;
+			if (proc.TryWait(&exit_status)) {
+				if (exit_status == 127) {
+					ThrowVgiIOException("VGI worker not found or not executable", worker_path, proc.GetPid(), "");
+				} else if (exit_status == 126) {
+					ThrowVgiIOException("VGI worker permission denied", worker_path, proc.GetPid(), "");
+				} else if (exit_status != 0) {
+					ThrowVgiIOException("VGI worker failed to start (exit code %d)", worker_path, proc.GetPid(), "",
+					                    exit_status);
+				}
+			}
+			// Re-throw original error if process didn't die early
+			throw;
+		}
 
 		// Check for log messages (will throw on EXCEPTION)
 		// If it was a log message, continue reading the next batch
-		if (!HandleBatchLogMessage(result.batch, result.custom_metadata, &context, worker_path)) {
+		// Note: Catalog methods don't have invocation_id
+		if (!HandleBatchLogMessage(result.batch, result.custom_metadata, &context, worker_path, proc.GetPid(), "")) {
 			break;
 		}
 	}
@@ -150,10 +165,10 @@ std::shared_ptr<arrow::RecordBatch> InvokeCatalogMethod(const std::string &worke
 	int exit_status = proc.Wait(&exited_normally);
 
 	if (!exited_normally) {
-		throw IOException("VGI worker '%s' was killed by signal %d", worker_path, exit_status);
+		ThrowVgiIOException("VGI worker was killed by signal %d", worker_path, proc.GetPid(), "", exit_status);
 	}
 	if (exit_status != 0) {
-		throw IOException("VGI worker '%s' exited with status %d", worker_path, exit_status);
+		ThrowVgiIOException("VGI worker exited with status %d", worker_path, proc.GetPid(), "", exit_status);
 	}
 
 	return result.batch;
@@ -183,8 +198,20 @@ std::shared_ptr<arrow::RecordBatch> CatalogMethodStream::ReadNext() {
 
 	arrow::RecordBatchWithMetadata result;
 	try {
-		result = ReadRecordBatch(proc_->GetStdoutFd());
+		result = ReadRecordBatch(proc_->GetStdoutFd(), worker_path_, proc_->GetPid());
 	} catch (const IOException &e) {
+		// Check if the worker process died early (e.g., command not found)
+		int exit_status = 0;
+		if (proc_->TryWait(&exit_status)) {
+			if (exit_status == 127) {
+				ThrowVgiIOException("VGI worker not found or not executable", worker_path_, proc_->GetPid(), "");
+			} else if (exit_status == 126) {
+				ThrowVgiIOException("VGI worker permission denied", worker_path_, proc_->GetPid(), "");
+			} else if (exit_status != 0) {
+				ThrowVgiIOException("VGI worker failed to start (exit code %d)", worker_path_, proc_->GetPid(), "",
+				                    exit_status);
+			}
+		}
 		// Check if this is an EOF indicator (invalid IPC stream at end)
 		// The Python worker may signal EOF by closing the pipe or writing
 		// invalid data, which causes specific error messages.
@@ -200,7 +227,8 @@ std::shared_ptr<arrow::RecordBatch> CatalogMethodStream::ReadNext() {
 
 	// Check for log messages (will throw on EXCEPTION)
 	// Note: A zero-row batch with log metadata is a log message, not end of stream
-	if (HandleBatchLogMessage(result.batch, result.custom_metadata, &context_, worker_path_)) {
+	// Catalog methods don't have invocation_id
+	if (HandleBatchLogMessage(result.batch, result.custom_metadata, &context_, worker_path_, proc_->GetPid(), "")) {
 		// It was a log message - read the next batch
 		return ReadNext();
 	}
@@ -284,6 +312,40 @@ std::vector<uint8_t> GetBinaryValue(const std::shared_ptr<arrow::RecordBatch> &b
 	                            reinterpret_cast<const uint8_t *>(value.data()) + value.size());
 }
 
+// Helper to get a map<string, string> column value, returns empty map if null
+std::map<std::string, std::string> GetStringMapValue(const std::shared_ptr<arrow::RecordBatch> &batch,
+                                                     const std::string &column_name, int64_t row_idx) {
+	std::map<std::string, std::string> result;
+	auto column = batch->GetColumnByName(column_name);
+	if (!column) {
+		return result;
+	}
+	auto map_array = std::dynamic_pointer_cast<arrow::MapArray>(column);
+	if (!map_array || map_array->IsNull(row_idx)) {
+		return result;
+	}
+
+	// Get the offsets for this row's entries
+	int64_t start = map_array->value_offset(row_idx);
+	int64_t end = map_array->value_offset(row_idx + 1);
+
+	// Get the key and value arrays
+	auto keys = std::dynamic_pointer_cast<arrow::StringArray>(map_array->keys());
+	auto values = std::dynamic_pointer_cast<arrow::StringArray>(map_array->items());
+
+	if (!keys || !values) {
+		return result;
+	}
+
+	for (int64_t i = start; i < end; i++) {
+		if (!keys->IsNull(i) && !values->IsNull(i)) {
+			result[keys->GetString(i)] = values->GetString(i);
+		}
+	}
+
+	return result;
+}
+
 } // namespace
 
 CatalogAttachResult ParseCatalogAttachResult(const std::shared_ptr<arrow::RecordBatch> &batch) {
@@ -316,8 +378,7 @@ VgiSchemaInfo ParseSchemaInfo(const std::shared_ptr<arrow::RecordBatch> &batch) 
 
 	info.name = GetStringValue(batch, "name", 0);
 	info.comment = GetStringValue(batch, "comment", 0);
-
-	// TODO: Parse tags map if present
+	info.tags = GetStringMapValue(batch, "tags", 0);
 
 	return info;
 }
@@ -332,6 +393,7 @@ VgiTableInfo ParseTableInfo(const std::shared_ptr<arrow::RecordBatch> &batch) {
 	info.name = GetStringValue(batch, "name", 0);
 	info.schema_name = GetStringValue(batch, "schema_name", 0);
 	info.comment = GetStringValue(batch, "comment", 0);
+	info.tags = GetStringMapValue(batch, "tags", 0);
 
 	// Parse the columns field which contains a serialized Arrow schema
 	auto columns_data = GetBinaryValue(batch, "columns", 0);
@@ -353,6 +415,7 @@ std::vector<VgiSchemaInfo> ParseSchemaList(const std::shared_ptr<arrow::RecordBa
 		VgiSchemaInfo info;
 		info.name = GetStringValue(batch, "name", i);
 		info.comment = GetStringValue(batch, "comment", i);
+		info.tags = GetStringMapValue(batch, "tags", i);
 		schemas.push_back(std::move(info));
 	}
 
@@ -392,6 +455,7 @@ VgiFunctionInfo ParseFunctionInfo(const std::shared_ptr<arrow::RecordBatch> &bat
 	if (info.max_workers <= 0) {
 		info.max_workers = 1;
 	}
+	info.tags = GetStringMapValue(batch, "tags", 0);
 
 	// Parse the return_schema field which contains a serialized Arrow schema
 	auto schema_data = GetBinaryValue(batch, "return_schema", 0);
@@ -469,8 +533,20 @@ std::shared_ptr<arrow::RecordBatch> FunctionInvokeStream::ReadNext() {
 
 	arrow::RecordBatchWithMetadata result;
 	try {
-		result = ReadRecordBatch(proc_->GetStdoutFd());
+		result = ReadRecordBatch(proc_->GetStdoutFd(), worker_path_, proc_->GetPid());
 	} catch (const IOException &e) {
+		// Check if the worker process died early (e.g., command not found)
+		int exit_status = 0;
+		if (proc_->TryWait(&exit_status)) {
+			if (exit_status == 127) {
+				ThrowVgiIOException("VGI worker not found or not executable", worker_path_, proc_->GetPid(), "");
+			} else if (exit_status == 126) {
+				ThrowVgiIOException("VGI worker permission denied", worker_path_, proc_->GetPid(), "");
+			} else if (exit_status != 0) {
+				ThrowVgiIOException("VGI worker failed to start (exit code %d)", worker_path_, proc_->GetPid(), "",
+				                    exit_status);
+			}
+		}
 		// Check if this is an EOF indicator
 		std::string error_msg = e.what();
 		if (error_msg.find("Tried reading schema message") != std::string::npos ||
@@ -482,7 +558,8 @@ std::shared_ptr<arrow::RecordBatch> FunctionInvokeStream::ReadNext() {
 	}
 
 	// Check for log messages (will throw on EXCEPTION)
-	if (HandleBatchLogMessage(result.batch, result.custom_metadata, &context_, worker_path_)) {
+	// FunctionInvokeStream doesn't track invocation_id
+	if (HandleBatchLogMessage(result.batch, result.custom_metadata, &context_, worker_path_, proc_->GetPid(), "")) {
 		// It was a log message - read the next batch
 		return ReadNext();
 	}
@@ -509,9 +586,11 @@ int FunctionInvokeStream::Wait() {
 
 FunctionConnection::FunctionConnection(const std::string &worker_path, const std::string &function_name,
                                        const ArrowArguments &arguments, const std::vector<uint8_t> &attach_id,
-                                       ClientContext &context, bool worker_debug)
+                                       ClientContext &context, const std::vector<uint8_t> &global_execution_id,
+                                       bool worker_debug)
     : worker_path_(worker_path), function_name_(function_name), arguments_type_(arguments.type),
-      arguments_array_(arguments.array), attach_id_(attach_id), context_(context), worker_debug_(worker_debug) {
+      arguments_array_(arguments.array), attach_id_(attach_id), global_execution_id_(global_execution_id),
+      context_(context), worker_debug_(worker_debug) {
 }
 
 FunctionConnection::~FunctionConnection() {
@@ -529,19 +608,45 @@ OutputSpecResult FunctionConnection::PerformBindFull() {
 	// Spawn the worker process
 	proc_ = std::make_unique<SubProcess>(worker_path_, worker_debug_);
 
+	// Log the invocation request
+	int64_t num_args = arguments_array_ ? arguments_array_->length() : 0;
+	DUCKDB_LOG(context_, VgiLogType, "function_connection.invoke",
+	           {{"worker_path", worker_path_},
+	            {"worker_pid", std::to_string(proc_->GetPid())},
+	            {"function_name", function_name_},
+	            {"num_args", std::to_string(num_args)}});
+
 	// Stream 1: Send Invocation
 	auto invocation =
-	    CreateFunctionInvocationFull(function_name_, arguments_type_, arguments_array_, attach_id_, {});
+	    CreateFunctionInvocationFull(function_name_, arguments_type_, arguments_array_, attach_id_, global_execution_id_);
 	auto invocation_bytes = SerializeRecordBatch(invocation);
 	WriteAll(proc_->GetStdinFd(), invocation_bytes->data(), invocation_bytes->size());
 
 	// Stream 2: Read OutputSpec
+	// Note: We don't have invocation_id yet (it comes in the OutputSpec response)
 	arrow::RecordBatchWithMetadata output_spec_result;
 	while (true) {
-		output_spec_result = ReadRecordBatch(proc_->GetStdoutFd());
+		try {
+			output_spec_result = ReadRecordBatch(proc_->GetStdoutFd(), worker_path_, proc_->GetPid());
+		} catch (const IOException &e) {
+			// Check if the worker process died early (e.g., command not found)
+			int exit_status = 0;
+			if (proc_->TryWait(&exit_status)) {
+				if (exit_status == 127) {
+					ThrowVgiIOException("VGI worker not found or not executable", worker_path_, proc_->GetPid(), "");
+				} else if (exit_status == 126) {
+					ThrowVgiIOException("VGI worker permission denied", worker_path_, proc_->GetPid(), "");
+				} else if (exit_status != 0) {
+					ThrowVgiIOException("VGI worker failed to start (exit code %d)", worker_path_, proc_->GetPid(), "",
+					                    exit_status);
+				}
+			}
+			// Re-throw original error if process didn't die early
+			throw;
+		}
 		// Handle log messages (throws on EXCEPTION)
 		if (!HandleBatchLogMessage(output_spec_result.batch, output_spec_result.custom_metadata, &context_,
-		                           worker_path_)) {
+		                           worker_path_, proc_->GetPid(), "")) {
 			break;
 		}
 	}
@@ -565,12 +670,14 @@ std::shared_ptr<arrow::Schema> FunctionConnection::PerformBind(int32_t &max_proc
 	return output_spec.output_schema;
 }
 
-void FunctionConnection::PerformInit(const std::vector<int32_t> &projection_ids) {
+InitResultData FunctionConnection::PerformInit(const std::vector<int32_t> &projection_ids) {
 	if (!bind_done_) {
-		throw IOException("FunctionConnection::PerformInit called before PerformBind");
+		ThrowVgiIOException("FunctionConnection::PerformInit called before PerformBind", worker_path_,
+		                    proc_ ? proc_->GetPid() : -1, GetInvocationIdHex());
 	}
 	if (init_done_) {
-		return; // Already initialized
+		ThrowVgiIOException("FunctionConnection::PerformInit called twice", worker_path_, proc_ ? proc_->GetPid() : -1,
+		                    GetInvocationIdHex());
 	}
 
 	// Stream 3: Send InitInput (TableFunctionInitInput with projection_ids)
@@ -582,16 +689,16 @@ void FunctionConnection::PerformInit(const std::vector<int32_t> &projection_ids)
 	// The worker sends a single batch with global_execution_identifier
 	arrow::RecordBatchWithMetadata init_result;
 	while (true) {
-		init_result = ReadRecordBatch(proc_->GetStdoutFd());
+		init_result = ReadRecordBatch(proc_->GetStdoutFd(), worker_path_, proc_->GetPid());
 		// Handle log messages (throws on EXCEPTION)
-		if (!HandleBatchLogMessage(init_result.batch, init_result.custom_metadata, &context_, worker_path_)) {
+		if (!HandleBatchLogMessage(init_result.batch, init_result.custom_metadata, &context_, worker_path_,
+		                           proc_->GetPid(), GetInvocationIdHex())) {
 			break;
 		}
 	}
 
-	// Parse InitResult (we don't need the global_execution_identifier for single-worker)
+	// Parse InitResult to get global_execution_identifier for multi-worker coordination
 	auto init_data = ParseInitResult(init_result.batch);
-	(void)init_data; // Suppress unused variable warning
 
 	// For Table functions (no input), close stdin to signal no more input
 	proc_->CloseStdin();
@@ -602,7 +709,45 @@ void FunctionConnection::PerformInit(const std::vector<int32_t> &projection_ids)
 	data_stream_ = std::make_shared<FdInputStream>(proc_->GetStdoutFd());
 	auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(data_stream_);
 	if (!reader_result.ok()) {
-		throw IOException("Failed to open data stream: " + reader_result.status().ToString());
+		ThrowVgiIOException("Failed to open data stream: %s", worker_path_, proc_->GetPid(), GetInvocationIdHex(),
+		                    reader_result.status().ToString());
+	}
+	data_reader_ = reader_result.ValueUnsafe();
+
+	init_done_ = true;
+	return init_data;
+}
+
+void FunctionConnection::SkipInit() {
+	if (!bind_done_) {
+		ThrowVgiIOException("FunctionConnection::SkipInit called before PerformBind", worker_path_,
+		                    proc_ ? proc_->GetPid() : -1, GetInvocationIdHex());
+	}
+	if (init_done_) {
+		ThrowVgiIOException("FunctionConnection::SkipInit called after init already done", worker_path_,
+		                    proc_ ? proc_->GetPid() : -1, GetInvocationIdHex());
+	}
+
+	// For secondary workers, send InitInput but skip reading InitResult.
+	// The Python worker reads InitInput but doesn't write InitResult for secondary workers,
+	// going straight to the data stream.
+
+	// Stream 3: Send InitInput (with empty projection_ids)
+	auto init_input = CreateInitInput({});
+	auto init_input_bytes = SerializeRecordBatch(init_input);
+	WriteAll(proc_->GetStdinFd(), init_input_bytes->data(), init_input_bytes->size());
+
+	// Skip Stream 4 (InitResult) - secondary workers don't send it
+
+	// Close stdin to signal no more input
+	proc_->CloseStdin();
+
+	// Open the data stream reader
+	data_stream_ = std::make_shared<FdInputStream>(proc_->GetStdoutFd());
+	auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(data_stream_);
+	if (!reader_result.ok()) {
+		ThrowVgiIOException("Failed to open data stream: %s", worker_path_, proc_->GetPid(), GetInvocationIdHex(),
+		                    reader_result.status().ToString());
 	}
 	data_reader_ = reader_result.ValueUnsafe();
 
@@ -611,7 +756,8 @@ void FunctionConnection::PerformInit(const std::vector<int32_t> &projection_ids)
 
 std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 	if (!init_done_) {
-		throw IOException("FunctionConnection::ReadDataBatch called before PerformInit");
+		ThrowVgiIOException("FunctionConnection::ReadDataBatch called before PerformInit", worker_path_,
+		                    proc_ ? proc_->GetPid() : -1, GetInvocationIdHex());
 	}
 	if (data_finished_ || !data_reader_) {
 		return nullptr;
@@ -628,7 +774,8 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 			data_finished_ = true;
 			return nullptr;
 		}
-		throw IOException("Failed to read data batch: " + error_msg);
+		ThrowVgiIOException("Failed to read data batch: %s", worker_path_, proc_ ? proc_->GetPid() : -1,
+		                    GetInvocationIdHex(), error_msg);
 	}
 	result = read_result.ValueUnsafe();
 
@@ -639,7 +786,8 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 	}
 
 	// Check for log messages (will throw on EXCEPTION)
-	if (HandleBatchLogMessage(result.batch, result.custom_metadata, &context_, worker_path_)) {
+	if (HandleBatchLogMessage(result.batch, result.custom_metadata, &context_, worker_path_, proc_->GetPid(),
+	                          GetInvocationIdHex())) {
 		// It was a log message - read the next batch
 		return ReadDataBatch();
 	}
@@ -667,6 +815,13 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 	}
 
 	return result.batch;
+}
+
+std::string FunctionConnection::GetInvocationIdHex() const {
+	if (!bind_done_ || output_spec_.invocation_id.empty()) {
+		return "";
+	}
+	return BytesToHex(output_spec_.invocation_id);
 }
 
 int FunctionConnection::Wait() {

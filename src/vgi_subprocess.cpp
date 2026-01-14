@@ -189,6 +189,40 @@ int SubProcess::Wait(bool *exited_normally) {
 	return -1;
 }
 
+bool SubProcess::TryWait(int *exit_status) {
+	if (pid_ <= 0) {
+		return true; // Already waited or invalid
+	}
+
+	int status;
+	pid_t result = waitpid(pid_, &status, WNOHANG);
+
+	if (result == 0) {
+		// Process still running
+		return false;
+	}
+
+	if (result < 0) {
+		// Error (process doesn't exist)
+		return true;
+	}
+
+	// Process has exited
+	pid_ = -1; // Mark as waited
+
+	if (exit_status) {
+		if (WIFEXITED(status)) {
+			*exit_status = WEXITSTATUS(status);
+		} else if (WIFSIGNALED(status)) {
+			*exit_status = -WTERMSIG(status); // Negative to indicate signal
+		} else {
+			*exit_status = -1;
+		}
+	}
+
+	return true;
+}
+
 // WriteAll implementation
 void WriteAll(int fd, const uint8_t *data, size_t len) {
 	size_t written = 0;

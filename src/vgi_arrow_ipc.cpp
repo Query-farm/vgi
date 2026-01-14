@@ -5,6 +5,7 @@
 #include <unistd.h>
 
 #include "duckdb/common/exception.hpp"
+#include "vgi_exception.hpp"
 #include "vgi_subprocess.hpp"
 
 namespace duckdb {
@@ -93,7 +94,7 @@ arrow::Result<std::shared_ptr<arrow::Buffer>> FdInputStream::Read(int64_t nbytes
 
 // Read a single RecordBatch from a file descriptor
 // This reads one complete IPC stream (schema + 1 batch + EOS marker)
-arrow::RecordBatchWithMetadata ReadRecordBatch(int fd) {
+arrow::RecordBatchWithMetadata ReadRecordBatch(int fd, const std::string &worker_path, pid_t worker_pid) {
 	// Wait for data to be available with timeout
 	WaitForReadable(fd);
 
@@ -101,14 +102,16 @@ arrow::RecordBatchWithMetadata ReadRecordBatch(int fd) {
 
 	auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(input);
 	if (!reader_result.ok()) {
-		throw IOException("Failed to open Arrow IPC stream: " + reader_result.status().ToString());
+		ThrowVgiIOException("Failed to open Arrow IPC stream: %s", worker_path, worker_pid, "",
+		                    reader_result.status().ToString());
 	}
 	auto reader = reader_result.ValueUnsafe();
 
 	// Use ReadNext() which returns RecordBatchWithMetadata including custom metadata
 	auto result = reader->ReadNext();
 	if (!result.ok()) {
-		throw IOException("Failed to read Arrow batch: " + result.status().ToString());
+		ThrowVgiIOException("Failed to read Arrow batch: %s", worker_path, worker_pid, "",
+		                    result.status().ToString());
 	}
 	auto batch_with_metadata = result.ValueUnsafe();
 

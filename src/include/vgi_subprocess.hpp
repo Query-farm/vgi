@@ -70,6 +70,12 @@ public:
 	// Sets exited_normally to true if the process exited via exit(), false if killed by signal.
 	int Wait(bool *exited_normally = nullptr);
 
+	// Non-blocking check if the process has exited.
+	// Returns true if the process has exited (and populates exit_status if provided).
+	// Returns false if the process is still running.
+	// Useful for detecting early failures (e.g., command not found).
+	bool TryWait(int *exit_status = nullptr);
+
 	// Release ownership of stderr fd (caller takes responsibility for closing)
 	int ReleaseStderrFd() {
 		int fd = stderr_fd_;

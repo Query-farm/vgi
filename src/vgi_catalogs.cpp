@@ -1,6 +1,7 @@
 #include "vgi_catalogs.hpp"
 #include "vgi_arrow_ipc.hpp"
 #include "vgi_catalog_api.hpp"
+#include "vgi_exception.hpp"
 #include "vgi_logging.hpp"
 #include "vgi_protocol.hpp"
 
@@ -41,10 +42,15 @@ std::vector<std::string> GetCatalogsFromWorker(ClientContext &context, const std
 		            {"duration_ms", std::to_string(duration_ms)}});
 
 		return catalogs;
+	} catch (const IOException &) {
+		// Let IOException propagate - it already has good context
+		throw;
 	} catch (const Exception &e) {
-		throw IOException("VGI worker '%s' failed: %s", worker_path, e.what());
+		// Wrap other DuckDB exceptions with worker context
+		vgi::ThrowVgiIOException("VGI worker failed: %s", worker_path, -1, "", e.what());
 	} catch (const std::exception &e) {
-		throw IOException("VGI worker '%s' failed: %s", worker_path, e.what());
+		// Wrap std::exception with worker context
+		vgi::ThrowVgiIOException("VGI worker failed: %s", worker_path, -1, "", e.what());
 	}
 }
 

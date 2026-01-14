@@ -48,12 +48,13 @@ private:
 // ============================================================================
 
 // Check if a batch contains a log message (zero rows with vgi.log_* custom metadata).
-// If it's an EXCEPTION, throws IOException with the message, traceback, and worker path.
+// If it's an EXCEPTION, throws IOException with the message, traceback, and worker context.
 // For other log levels, logs to DuckDB if context is provided.
 // Returns true if the batch was a log message, false otherwise.
 bool HandleBatchLogMessage(const std::shared_ptr<arrow::RecordBatch> &batch,
                            const std::shared_ptr<arrow::KeyValueMetadata> &custom_metadata, ClientContext *context,
-                           const std::string &worker_path);
+                           const std::string &worker_path, pid_t worker_pid = -1,
+                           const std::string &invocation_id_hex = "");
 
 // ============================================================================
 // Catalog Method Invocation API
@@ -251,9 +252,10 @@ class FunctionConnection {
 public:
 	// Create connection parameters (does not spawn worker yet)
 	// arguments: Arrow struct array with fields named positional_0, positional_1, etc.
+	// global_execution_id: For secondary workers, pass the ID from the primary worker's InitResult
 	FunctionConnection(const std::string &worker_path, const std::string &function_name,
 	                   const ArrowArguments &arguments, const std::vector<uint8_t> &attach_id, ClientContext &context,
-	                   bool worker_debug = false);
+	                   const std::vector<uint8_t> &global_execution_id = {}, bool worker_debug = false);
 	~FunctionConnection();
 
 	// Phase 1: Perform bind handshake (Streams 1-2)
@@ -271,7 +273,14 @@ public:
 	// Sends InitInput, reads InitResult, then closes stdin (for Table functions)
 	// After this call, the connection is ready to read data
 	// projection_ids: optional list of column indices for projection pushdown
-	void PerformInit(const std::vector<int32_t> &projection_ids = {});
+	// Returns InitResultData containing global_execution_identifier for multi-worker coordination
+	InitResultData PerformInit(const std::vector<int32_t> &projection_ids = {});
+
+	// Phase 2 (secondary worker): Skip init handshake for secondary workers
+	// The Python worker's secondary worker path doesn't do InitInput/InitResult exchange,
+	// it goes straight from OutputSpec to generating batches.
+	// This method closes stdin and opens the data stream without the handshake.
+	void SkipInit();
 
 	// Phase 3: Read a data batch (Stream 6)
 	// Returns nullptr when stream is exhausted
@@ -281,6 +290,14 @@ public:
 	bool IsFinished() const {
 		return data_finished_;
 	}
+
+	// Get the worker process PID (returns -1 if not yet spawned)
+	pid_t GetPid() const {
+		return proc_ ? proc_->GetPid() : -1;
+	}
+
+	// Get the invocation ID as hex string (empty if bind not done)
+	std::string GetInvocationIdHex() const;
 
 	// Wait for worker process to exit
 	int Wait();
@@ -297,6 +314,7 @@ private:
 	std::shared_ptr<arrow::DataType> arguments_type_;
 	std::shared_ptr<arrow::Array> arguments_array_;
 	std::vector<uint8_t> attach_id_;
+	std::vector<uint8_t> global_execution_id_;
 	ClientContext &context_;
 	bool worker_debug_;
 

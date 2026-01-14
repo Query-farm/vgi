@@ -39,3 +39,50 @@ statement error
 ATTACH 'nonexistent_catalog' AS vgi_bad (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 ----
 Unknown catalog: 'nonexistent_catalog'
+
+# ============================================================================
+# Test vgi_table_function with multi-worker execution and logging
+# ============================================================================
+
+require json
+
+# Enable VGI logging
+statement ok
+CALL enable_logging(level := 'debug');
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# Test partitioned_range function with 1 million values
+# This exercises multi-worker execution via work queue pattern
+query IIII
+SELECT COUNT(*) as total, COUNT(DISTINCT value) as distinct_count, MIN(value) as min_val, MAX(value) as max_val
+FROM vgi_table_function('${VGI_TEST_WORKER}', 'partitioned_range', [1000000]);
+----
+1000000	1000000	0	999999
+
+# Verify logging captured table function operations
+query I
+SELECT COUNT(*) > 0 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%table_function.bind%';
+----
+true
+
+# Verify batch_received events contain worker_pid
+query I
+SELECT COUNT(*) > 0 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%batch_received%worker_pid=%';
+----
+true
+
+# Verify multiple workers produced batches (multi-worker execution)
+query I
+SELECT COUNT(DISTINCT regexp_extract(message, 'worker_pid=(\d+)', 1)) > 1
+FROM duckdb_logs()
+WHERE type = 'VGI' AND message LIKE '%batch_received%';
+----
+true
+
+# Verify scan completed for at least one worker
+query I
+SELECT COUNT(*) > 0 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%scan_complete%';
+----
+true

@@ -9,16 +9,16 @@ require vgi
 statement error
 SELECT * FROM vgi_catalogs('/nonexistent/path/to/worker');
 ----
-VGI worker '/nonexistent/path/to/worker' failed
+VGI worker not found or not executable
 
 # Test vgi_catalogs with a file that exists but is not a valid VGI worker
 statement error
 SELECT * FROM vgi_catalogs('/bin/echo');
 ----
-VGI worker '/bin/echo' failed
+Failed to open Arrow IPC stream
 
 # Test vgi_catalogs with empty string path
 statement error
 SELECT * FROM vgi_catalogs('');
 ----
-VGI worker '' failed
+Failed to open Arrow IPC stream
