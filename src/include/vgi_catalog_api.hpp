@@ -10,6 +10,7 @@
 #include <arrow/io/api.h>
 #include <arrow/ipc/api.h>
 
+#include "vgi_protocol.hpp"
 #include "vgi_subprocess.hpp"
 
 namespace duckdb {
@@ -231,9 +232,8 @@ private:
 // Function Connection - Proper 6-Stream Protocol
 // ============================================================================
 
-// Forward declaration of protocol result types
-struct OutputSpecResult;
-struct InitResultData;
+// Forward declaration for ArrowArguments (defined in vgi_arrow_utils.hpp)
+struct ArrowArguments;
 
 // FunctionConnection implements the proper VGI function protocol with 6 streams:
 // Stream 1: Invocation (client → worker)
@@ -250,10 +250,10 @@ struct InitResultData;
 class FunctionConnection {
 public:
 	// Create connection parameters (does not spawn worker yet)
+	// arguments: Arrow struct array with fields named positional_0, positional_1, etc.
 	FunctionConnection(const std::string &worker_path, const std::string &function_name,
-	                   const std::string &positional_args_json,
-	                   const std::vector<std::pair<std::string, std::string>> &named_args,
-	                   const std::vector<uint8_t> &attach_id, ClientContext &context, bool worker_debug = false);
+	                   const ArrowArguments &arguments, const std::vector<uint8_t> &attach_id, ClientContext &context,
+	                   bool worker_debug = false);
 	~FunctionConnection();
 
 	// Phase 1: Perform bind handshake (Streams 1-2)
@@ -261,6 +261,11 @@ public:
 	// Returns the output schema and metadata
 	// After this call, the worker is waiting for InitInput
 	std::shared_ptr<arrow::Schema> PerformBind(int32_t &max_processes_out, int64_t &cardinality_estimate_out);
+
+	// Phase 1 (full): Perform bind handshake and return full OutputSpec
+	// Same as PerformBind but returns the complete OutputSpecResult including
+	// invocation_id, active_features, and other metadata
+	OutputSpecResult PerformBindFull();
 
 	// Phase 2: Perform init handshake (Streams 3-4)
 	// Sends InitInput, reads InitResult, then closes stdin (for Table functions)
@@ -289,8 +294,8 @@ public:
 private:
 	std::string worker_path_;
 	std::string function_name_;
-	std::string positional_args_json_;
-	std::vector<std::pair<std::string, std::string>> named_args_;
+	std::shared_ptr<arrow::DataType> arguments_type_;
+	std::shared_ptr<arrow::Array> arguments_array_;
 	std::vector<uint8_t> attach_id_;
 	ClientContext &context_;
 	bool worker_debug_;
@@ -303,26 +308,14 @@ private:
 	bool init_done_ = false;
 	bool data_finished_ = false;
 
-	// Cached bind results
-	std::shared_ptr<arrow::Schema> output_schema_;
-	int32_t max_processes_ = 1;
-	int64_t cardinality_estimate_ = -1;
+	// Cached bind results (full OutputSpec)
+	OutputSpecResult output_spec_;
 
 	// Data stream reader (opened during PerformInit, used for ReadDataBatch)
 	// The data phase uses a single long-lived IPC stream with multiple batches
 	std::shared_ptr<arrow::io::InputStream> data_stream_;
 	std::shared_ptr<arrow::ipc::RecordBatchStreamReader> data_reader_;
 };
-
-// Perform a bind-only call to get schema for a function
-// This spawns a worker, completes the bind handshake, then closes the connection.
-// Use this when you only need schema info (e.g., during table function bind phase).
-std::shared_ptr<arrow::Schema> GetFunctionSchema(const std::string &worker_path, const std::string &function_name,
-                                                  const std::string &positional_args_json,
-                                                  const std::vector<std::pair<std::string, std::string>> &named_args,
-                                                  const std::vector<uint8_t> &attach_id, ClientContext &context,
-                                                  int32_t &max_processes_out, int64_t &cardinality_estimate_out,
-                                                  bool worker_debug = false);
 
 } // namespace vgi
 

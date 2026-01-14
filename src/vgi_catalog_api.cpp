@@ -1,12 +1,11 @@
 #include "vgi_catalog_api.hpp"
 
-#include <arrow/c/bridge.h>
-
 #include "duckdb.hpp"
 #include "duckdb/function/table/arrow/arrow_duck_schema.hpp"
 #include "duckdb/logging/log_manager.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "vgi_arrow_ipc.hpp"
+#include "vgi_arrow_utils.hpp"
 #include "vgi_logging.hpp"
 #include "vgi_protocol.hpp"
 #include "yyjson.hpp"
@@ -371,29 +370,7 @@ CreateTableInfo CreateTableInfoFromVgiTable(ClientContext &context, const VgiTab
 	create_info.schema = schema_name;
 
 	if (table_info.arrow_schema) {
-		auto &db_config = DBConfig::GetConfig(context);
-		for (int i = 0; i < table_info.arrow_schema->num_fields(); i++) {
-			auto &field = table_info.arrow_schema->field(i);
-
-			// Export Arrow C++ field to C ABI format
-			ArrowSchema c_schema;
-			auto status = arrow::ExportField(*field, &c_schema);
-			if (!status.ok()) {
-				throw IOException("Failed to export Arrow field '%s': %s", field->name(), status.ToString());
-			}
-
-			// Use DuckDB's built-in Arrow type conversion
-			auto arrow_type = ArrowType::GetArrowLogicalType(db_config, c_schema);
-			arrow_type->ThrowIfInvalid();
-			LogicalType duckdb_type = arrow_type->GetDuckType();
-
-			// Release the C schema
-			if (c_schema.release) {
-				c_schema.release(&c_schema);
-			}
-
-			create_info.columns.AddColumn(ColumnDefinition(field->name(), duckdb_type));
-		}
+		ArrowSchemaToColumnList(context, table_info.arrow_schema, create_info.columns);
 	}
 
 	return create_info;
@@ -531,11 +508,10 @@ int FunctionInvokeStream::Wait() {
 // ============================================================================
 
 FunctionConnection::FunctionConnection(const std::string &worker_path, const std::string &function_name,
-                                       const std::string &positional_args_json,
-                                       const std::vector<std::pair<std::string, std::string>> &named_args,
-                                       const std::vector<uint8_t> &attach_id, ClientContext &context, bool worker_debug)
-    : worker_path_(worker_path), function_name_(function_name), positional_args_json_(positional_args_json),
-      named_args_(named_args), attach_id_(attach_id), context_(context), worker_debug_(worker_debug) {
+                                       const ArrowArguments &arguments, const std::vector<uint8_t> &attach_id,
+                                       ClientContext &context, bool worker_debug)
+    : worker_path_(worker_path), function_name_(function_name), arguments_type_(arguments.type),
+      arguments_array_(arguments.array), attach_id_(attach_id), context_(context), worker_debug_(worker_debug) {
 }
 
 FunctionConnection::~FunctionConnection() {
@@ -544,13 +520,10 @@ FunctionConnection::~FunctionConnection() {
 	}
 }
 
-std::shared_ptr<arrow::Schema> FunctionConnection::PerformBind(int32_t &max_processes_out,
-                                                                int64_t &cardinality_estimate_out) {
+OutputSpecResult FunctionConnection::PerformBindFull() {
 	if (bind_done_) {
 		// Return cached results
-		max_processes_out = max_processes_;
-		cardinality_estimate_out = cardinality_estimate_;
-		return output_schema_;
+		return output_spec_;
 	}
 
 	// Spawn the worker process
@@ -558,7 +531,7 @@ std::shared_ptr<arrow::Schema> FunctionConnection::PerformBind(int32_t &max_proc
 
 	// Stream 1: Send Invocation
 	auto invocation =
-	    CreateFunctionInvocationFull(function_name_, positional_args_json_, named_args_, attach_id_, {});
+	    CreateFunctionInvocationFull(function_name_, arguments_type_, arguments_array_, attach_id_, {});
 	auto invocation_bytes = SerializeRecordBatch(invocation);
 	WriteAll(proc_->GetStdinFd(), invocation_bytes->data(), invocation_bytes->size());
 
@@ -573,18 +546,23 @@ std::shared_ptr<arrow::Schema> FunctionConnection::PerformBind(int32_t &max_proc
 		}
 	}
 
-	// Parse OutputSpec
-	auto output_spec = ParseOutputSpec(output_spec_result.batch);
-	output_schema_ = output_spec.output_schema;
-	max_processes_ = output_spec.max_processes;
-	cardinality_estimate_ = output_spec.cardinality_estimate;
-
-	// Return results
-	max_processes_out = max_processes_;
-	cardinality_estimate_out = cardinality_estimate_;
+	// Parse and cache OutputSpec
+	output_spec_ = ParseOutputSpec(output_spec_result.batch);
 	bind_done_ = true;
 
-	return output_schema_;
+	return output_spec_;
+}
+
+std::shared_ptr<arrow::Schema> FunctionConnection::PerformBind(int32_t &max_processes_out,
+                                                                int64_t &cardinality_estimate_out) {
+	// Call PerformBindFull to do the actual work
+	auto output_spec = PerformBindFull();
+
+	// Return results via output parameters for backwards compatibility
+	max_processes_out = output_spec.max_processes;
+	cardinality_estimate_out = output_spec.cardinality_estimate;
+
+	return output_spec.output_schema;
 }
 
 void FunctionConnection::PerformInit(const std::vector<int32_t> &projection_ids) {
@@ -696,35 +674,6 @@ int FunctionConnection::Wait() {
 		return 0;
 	}
 	return proc_->Wait();
-}
-
-// Helper function for bind-only schema retrieval
-std::shared_ptr<arrow::Schema> GetFunctionSchema(const std::string &worker_path, const std::string &function_name,
-                                                  const std::string &positional_args_json,
-                                                  const std::vector<std::pair<std::string, std::string>> &named_args,
-                                                  const std::vector<uint8_t> &attach_id, ClientContext &context,
-                                                  int32_t &max_processes_out, int64_t &cardinality_estimate_out,
-                                                  bool worker_debug) {
-	// Create a temporary connection just for bind
-	FunctionConnection conn(worker_path, function_name, positional_args_json, named_args, attach_id, context,
-	                        worker_debug);
-
-	// Perform bind to get schema
-	auto schema = conn.PerformBind(max_processes_out, cardinality_estimate_out);
-
-	// Also perform init to let the worker complete the handshake
-	// The worker expects InitInput before it will proceed
-	conn.PerformInit();
-
-	// Drain any data output from the worker (we don't need it, just schema)
-	// This is necessary because the worker won't exit until we read its output
-	while (conn.ReadDataBatch() != nullptr) {
-		// Discard data batches
-	}
-
-	// Now the worker has finished and will exit when we destroy the connection
-
-	return schema;
 }
 
 } // namespace vgi

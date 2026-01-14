@@ -72,6 +72,12 @@ struct OutputSpecResult {
 	int32_t max_processes = 1;
 	bool requires_finalize = false;
 	std::string stability;
+
+	// Invocation identifier returned by the worker (for correlation in subsequent streams)
+	std::vector<uint8_t> invocation_id;
+
+	// Features that the worker has activated for this invocation
+	std::vector<std::string> active_features;
 };
 
 // Result from parsing InitResult (Stream 4)
@@ -81,10 +87,12 @@ struct InitResultData {
 
 // Create the full Invocation batch for function protocol (Stream 1)
 // This includes the function arguments in the invocation itself
+// arguments_type: The Arrow struct type with fields named positional_0, positional_1, etc.
+// arguments_array: The Arrow struct array containing the argument values
 std::shared_ptr<arrow::RecordBatch> CreateFunctionInvocationFull(
-    const std::string &function_name, const std::string &positional_args_json,
-    const std::vector<std::pair<std::string, std::string>> &named_args,
-    const std::vector<uint8_t> &attach_id = {}, const std::vector<uint8_t> &global_exec_id = {});
+    const std::string &function_name, const std::shared_ptr<arrow::DataType> &arguments_type,
+    const std::shared_ptr<arrow::Array> &arguments_array, const std::vector<uint8_t> &attach_id = {},
+    const std::vector<uint8_t> &global_exec_id = {});
 
 // Create InitInput batch (Stream 3)
 // For table functions, this is TableFunctionInitInput with projection_ids

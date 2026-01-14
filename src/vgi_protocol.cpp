@@ -5,9 +5,6 @@
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/uuid.hpp"
-#include "yyjson.hpp"
-
-using namespace duckdb_yyjson; // NOLINT
 
 namespace duckdb {
 namespace vgi {
@@ -447,159 +444,15 @@ std::shared_ptr<arrow::RecordBatch> CreateFunctionInvokeArgs(const std::vector<u
 // Function Protocol - Proper 6-Stream Implementation
 // ============================================================================
 
-// Helper: Build arguments struct array from JSON positional args and named args
-// The struct has fields: positional_0, positional_1, ..., named_<name>, ...
-// Each field is typed according to the JSON value type
-static std::pair<std::shared_ptr<arrow::DataType>, std::shared_ptr<arrow::Array>> BuildArgumentsStruct(
-    const std::string &positional_args_json,
-    const std::vector<std::pair<std::string, std::string>> &named_args) {
-
-	// Parse positional args JSON
-	auto doc = yyjson_read(positional_args_json.c_str(), positional_args_json.size(), 0);
-	if (!doc) {
-		throw IOException("Failed to parse positional args JSON: %s", positional_args_json);
-	}
-
-	auto root = yyjson_doc_get_root(doc);
-	if (!yyjson_is_arr(root)) {
-		yyjson_doc_free(doc);
-		throw IOException("Positional args must be a JSON array");
-	}
-
-	// Build fields and builders based on JSON values
-	std::vector<std::shared_ptr<arrow::Field>> fields;
-	std::vector<std::shared_ptr<arrow::ArrayBuilder>> builders;
-	std::vector<std::shared_ptr<arrow::Array>> child_arrays;
-
-	// Process positional arguments
-	size_t idx, max;
-	yyjson_val *val;
-	yyjson_arr_foreach(root, idx, max, val) {
-		std::string field_name = "positional_" + std::to_string(idx);
-
-		if (yyjson_is_null(val)) {
-			// Null value - use null type
-			fields.push_back(arrow::field(field_name, arrow::null(), true));
-			arrow::NullBuilder builder;
-			CheckArrowStatus(builder.AppendNull(), "append null arg");
-			child_arrays.push_back(FinishBuilder(builder, field_name.c_str()));
-		} else if (yyjson_is_bool(val)) {
-			fields.push_back(arrow::field(field_name, arrow::boolean(), false));
-			arrow::BooleanBuilder builder;
-			CheckArrowStatus(builder.Append(yyjson_get_bool(val)), "append bool arg");
-			child_arrays.push_back(FinishBuilder(builder, field_name.c_str()));
-		} else if (yyjson_is_int(val)) {
-			fields.push_back(arrow::field(field_name, arrow::int64(), false));
-			arrow::Int64Builder builder;
-			CheckArrowStatus(builder.Append(yyjson_get_sint(val)), "append int arg");
-			child_arrays.push_back(FinishBuilder(builder, field_name.c_str()));
-		} else if (yyjson_is_real(val)) {
-			fields.push_back(arrow::field(field_name, arrow::float64(), false));
-			arrow::DoubleBuilder builder;
-			CheckArrowStatus(builder.Append(yyjson_get_real(val)), "append double arg");
-			child_arrays.push_back(FinishBuilder(builder, field_name.c_str()));
-		} else if (yyjson_is_str(val)) {
-			fields.push_back(arrow::field(field_name, arrow::utf8(), false));
-			arrow::StringBuilder builder;
-			CheckArrowStatus(builder.Append(yyjson_get_str(val)), "append string arg");
-			child_arrays.push_back(FinishBuilder(builder, field_name.c_str()));
-		} else {
-			// For complex types (arrays, objects), fall back to JSON string
-			size_t len = 0;
-			const char *json_str = yyjson_val_write(val, 0, &len);
-			fields.push_back(arrow::field(field_name, arrow::utf8(), false));
-			arrow::StringBuilder builder;
-			if (json_str) {
-				CheckArrowStatus(builder.Append(json_str, static_cast<int64_t>(len)), "append json arg");
-				free(const_cast<char *>(json_str));
-			} else {
-				CheckArrowStatus(builder.Append("null"), "append json arg fallback");
-			}
-			child_arrays.push_back(FinishBuilder(builder, field_name.c_str()));
-		}
-	}
-
-	yyjson_doc_free(doc);
-
-	// Process named arguments (all stored as JSON strings for simplicity)
-	for (const auto &pair : named_args) {
-		std::string field_name = "named_" + pair.first;
-
-		// Parse the JSON value to determine type
-		auto ndoc = yyjson_read(pair.second.c_str(), pair.second.size(), 0);
-		if (!ndoc) {
-			// Treat as string if not valid JSON
-			fields.push_back(arrow::field(field_name, arrow::utf8(), false));
-			arrow::StringBuilder builder;
-			CheckArrowStatus(builder.Append(pair.second), "append named string arg");
-			child_arrays.push_back(FinishBuilder(builder, field_name.c_str()));
-			continue;
-		}
-
-		auto nroot = yyjson_doc_get_root(ndoc);
-		if (yyjson_is_null(nroot)) {
-			fields.push_back(arrow::field(field_name, arrow::null(), true));
-			arrow::NullBuilder builder;
-			CheckArrowStatus(builder.AppendNull(), "append null named arg");
-			child_arrays.push_back(FinishBuilder(builder, field_name.c_str()));
-		} else if (yyjson_is_bool(nroot)) {
-			fields.push_back(arrow::field(field_name, arrow::boolean(), false));
-			arrow::BooleanBuilder builder;
-			CheckArrowStatus(builder.Append(yyjson_get_bool(nroot)), "append bool named arg");
-			child_arrays.push_back(FinishBuilder(builder, field_name.c_str()));
-		} else if (yyjson_is_int(nroot)) {
-			fields.push_back(arrow::field(field_name, arrow::int64(), false));
-			arrow::Int64Builder builder;
-			CheckArrowStatus(builder.Append(yyjson_get_sint(nroot)), "append int named arg");
-			child_arrays.push_back(FinishBuilder(builder, field_name.c_str()));
-		} else if (yyjson_is_real(nroot)) {
-			fields.push_back(arrow::field(field_name, arrow::float64(), false));
-			arrow::DoubleBuilder builder;
-			CheckArrowStatus(builder.Append(yyjson_get_real(nroot)), "append double named arg");
-			child_arrays.push_back(FinishBuilder(builder, field_name.c_str()));
-		} else if (yyjson_is_str(nroot)) {
-			fields.push_back(arrow::field(field_name, arrow::utf8(), false));
-			arrow::StringBuilder builder;
-			CheckArrowStatus(builder.Append(yyjson_get_str(nroot)), "append string named arg");
-			child_arrays.push_back(FinishBuilder(builder, field_name.c_str()));
-		} else {
-			// For complex types, store as JSON string
-			fields.push_back(arrow::field(field_name, arrow::utf8(), false));
-			arrow::StringBuilder builder;
-			CheckArrowStatus(builder.Append(pair.second), "append json named arg");
-			child_arrays.push_back(FinishBuilder(builder, field_name.c_str()));
-		}
-		yyjson_doc_free(ndoc);
-	}
-
-	// If no arguments, create an empty struct
-	if (fields.empty()) {
-		auto empty_type = arrow::struct_({});
-		auto result = arrow::StructArray::Make(child_arrays, fields);
-		if (!result.ok()) {
-			throw IOException("Failed to create empty struct array: %s", result.status().ToString());
-		}
-		return {empty_type, result.ValueUnsafe()};
-	}
-
-	// Create the struct type and array
-	auto struct_type = arrow::struct_(fields);
-	auto result = arrow::StructArray::Make(child_arrays, fields);
-	if (!result.ok()) {
-		throw IOException("Failed to create struct array: %s", result.status().ToString());
-	}
-
-	return {struct_type, result.ValueUnsafe()};
-}
-
 // Create the full Invocation batch for function protocol (Stream 1)
 std::shared_ptr<arrow::RecordBatch> CreateFunctionInvocationFull(
-    const std::string &function_name, const std::string &positional_args_json,
-    const std::vector<std::pair<std::string, std::string>> &named_args, const std::vector<uint8_t> &attach_id,
+    const std::string &function_name, const std::shared_ptr<arrow::DataType> &arguments_type,
+    const std::shared_ptr<arrow::Array> &arguments_array, const std::vector<uint8_t> &attach_id,
     const std::vector<uint8_t> &global_exec_id) {
 
-	// Build the arguments struct
-	auto [args_type, args_array] = BuildArgumentsStruct(positional_args_json, named_args);
+	// Use the provided arguments struct (already built by BuildArgumentsFromValues)
+	auto args_type = arguments_type;
+	auto args_array = arguments_array;
 
 	auto schema = arrow::schema({
 	    arrow::field("function_name", arrow::utf8(), false),
@@ -804,6 +657,34 @@ OutputSpecResult ParseOutputSpec(const std::shared_ptr<arrow::RecordBatch> &batc
 		auto string_array = std::dynamic_pointer_cast<arrow::StringArray>(stability_col);
 		if (string_array && !string_array->IsNull(0)) {
 			result.stability = string_array->GetString(0);
+		}
+	}
+
+	// Get invocation_id (binary, nullable)
+	auto invocation_id_col = batch->GetColumnByName("invocation_id");
+	if (invocation_id_col) {
+		auto binary_array = std::dynamic_pointer_cast<arrow::BinaryArray>(invocation_id_col);
+		if (binary_array && !binary_array->IsNull(0)) {
+			auto view = binary_array->GetView(0);
+			result.invocation_id.assign(view.data(), view.data() + view.size());
+		}
+	}
+
+	// Get active_features (list<string>, nullable)
+	auto active_features_col = batch->GetColumnByName("active_features");
+	if (active_features_col) {
+		auto list_array = std::dynamic_pointer_cast<arrow::ListArray>(active_features_col);
+		if (list_array && !list_array->IsNull(0)) {
+			auto values = std::dynamic_pointer_cast<arrow::StringArray>(list_array->values());
+			if (values) {
+				int64_t start = list_array->value_offset(0);
+				int64_t end = list_array->value_offset(1);
+				for (int64_t i = start; i < end; i++) {
+					if (!values->IsNull(i)) {
+						result.active_features.push_back(values->GetString(i));
+					}
+				}
+			}
 		}
 	}
 

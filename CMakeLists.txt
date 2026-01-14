@@ -24,7 +24,7 @@ src/query_farm_telemetry.cpp
 src/vgi_logging.cpp
 src/vgi_subprocess.cpp
 src/vgi_arrow_ipc.cpp
-src/vgi_arrow_convert.cpp
+src/vgi_arrow_utils.cpp
 src/vgi_protocol.cpp
 src/vgi_catalogs.cpp
 src/vgi_table_function.cpp
