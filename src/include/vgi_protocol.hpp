@@ -67,7 +67,6 @@ std::shared_ptr<arrow::RecordBatch> CreateFunctionInvokeArgs(const std::vector<u
 struct OutputSpecResult {
 	std::shared_ptr<arrow::Schema> output_schema;
 	int64_t cardinality_estimate = -1;
-	int64_t cardinality_min = -1;
 	int64_t cardinality_max = -1;
 	int32_t max_processes = 1;
 	bool requires_finalize = false;

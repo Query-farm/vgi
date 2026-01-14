@@ -621,33 +621,19 @@ OutputSpecResult ParseOutputSpec(const std::shared_ptr<arrow::RecordBatch> &batc
 		}
 	}
 
-	// Get cardinality struct (optional)
-	auto cardinality_col = batch->GetColumnByName("cardinality");
-	if (cardinality_col) {
-		auto struct_array = std::dynamic_pointer_cast<arrow::StructArray>(cardinality_col);
-		if (struct_array && !struct_array->IsNull(0)) {
-			// Extract estimate, min, max from the struct
-			auto estimate_field = struct_array->GetFieldByName("estimate");
-			if (estimate_field) {
-				auto int_array = std::dynamic_pointer_cast<arrow::Int64Array>(estimate_field);
-				if (int_array && !int_array->IsNull(0)) {
-					result.cardinality_estimate = int_array->Value(0);
-				}
-			}
-			auto min_field = struct_array->GetFieldByName("min");
-			if (min_field) {
-				auto int_array = std::dynamic_pointer_cast<arrow::Int64Array>(min_field);
-				if (int_array && !int_array->IsNull(0)) {
-					result.cardinality_min = int_array->Value(0);
-				}
-			}
-			auto max_field = struct_array->GetFieldByName("max");
-			if (max_field) {
-				auto int_array = std::dynamic_pointer_cast<arrow::Int64Array>(max_field);
-				if (int_array && !int_array->IsNull(0)) {
-					result.cardinality_max = int_array->Value(0);
-				}
-			}
+	// Get cardinality information (int64 columns, nullable)
+	auto estimated_col = batch->GetColumnByName("cardinality_estimated");
+	if (estimated_col) {
+		auto int_array = std::dynamic_pointer_cast<arrow::Int64Array>(estimated_col);
+		if (int_array && !int_array->IsNull(0)) {
+			result.cardinality_estimate = int_array->Value(0);
+		}
+	}
+	auto max_col = batch->GetColumnByName("cardinality_max");
+	if (max_col) {
+		auto int_array = std::dynamic_pointer_cast<arrow::Int64Array>(max_col);
+		if (int_array && !int_array->IsNull(0)) {
+			result.cardinality_max = int_array->Value(0);
 		}
 	}
 
