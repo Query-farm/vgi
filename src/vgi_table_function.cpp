@@ -113,14 +113,29 @@ static unique_ptr<FunctionData> VgiTableFunctionBind(ClientContext &context, Tab
 		positional_args = ListValue::GetChildren(input.inputs[2]);
 	}
 
+	// Extract named arguments from the STRUCT parameter
+	// STRUCT allows each field to have a different type (unlike MAP)
+	vector<std::pair<string, Value>> named_args;
+	if (input.inputs.size() > 3 && !input.inputs[3].IsNull()) {
+		auto &struct_value = input.inputs[3];
+		if (struct_value.type().id() == LogicalTypeId::STRUCT) {
+			auto &struct_children = StructValue::GetChildren(struct_value);
+			auto &child_types = StructType::GetChildTypes(struct_value.type());
+			for (idx_t i = 0; i < struct_children.size(); i++) {
+				named_args.emplace_back(child_types[i].first, struct_children[i]);
+			}
+		}
+	}
+
 	// Log the invocation
 	VGI_LOG(context, "table_function.bind",
 	        {{"worker_path", bind_data->worker_path},
 	         {"function_name", bind_data->function_name},
-	         {"num_args", std::to_string(positional_args.size())}});
+	         {"num_positional_args", std::to_string(positional_args.size())},
+	         {"num_named_args", std::to_string(named_args.size())}});
 
-	// Build Arrow arguments struct from positional args (stored for creating secondary workers)
-	bind_data->arguments = vgi::BuildArgumentsFromValues(context, positional_args);
+	// Build Arrow arguments struct from positional and named args (stored for creating secondary workers)
+	bind_data->arguments = vgi::BuildArgumentsFromValues(context, positional_args, named_args);
 
 	// Create connection to worker and perform bind handshake
 	// The connection is persisted and reused in InitGlobal to avoid spawning two workers
@@ -397,24 +412,33 @@ static InsertionOrderPreservingMap<string> VgiTableFunctionToString(TableFunctio
 // ============================================================================
 
 void RegisterVgiTableFunction(ExtensionLoader &loader) {
-	// vgi_table_function(worker_path, function_name, args)
-	TableFunction func(
-	    "vgi_table_function", {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::LIST(LogicalType::ANY)},
+	TableFunctionSet func_set("vgi_table_function");
+
+	// Helper lambda to configure common function properties
+	auto configure_func = [](TableFunction &func) {
+		func.projection_pushdown = true;
+		func.cardinality = VgiTableFunctionCardinality;
+		func.table_scan_progress = VgiTableFunctionProgress;
+		func.to_string = VgiTableFunctionToString;
+	};
+
+	// Overload 1: vgi_table_function(worker_path, function_name, positional_args)
+	TableFunction func3("vgi_table_function",
+	                    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::LIST(LogicalType::ANY)},
+	                    VgiTableFunctionScan, VgiTableFunctionBind, VgiTableFunctionInitGlobal, VgiTableFunctionInitLocal);
+	configure_func(func3);
+	func_set.AddFunction(func3);
+
+	// Overload 2: vgi_table_function(worker_path, function_name, positional_args, named_args)
+	// named_args is ANY type to accept a STRUCT with arbitrary fields
+	TableFunction func4(
+	    "vgi_table_function",
+	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::LIST(LogicalType::ANY), LogicalType::ANY},
 	    VgiTableFunctionScan, VgiTableFunctionBind, VgiTableFunctionInitGlobal, VgiTableFunctionInitLocal);
+	configure_func(func4);
+	func_set.AddFunction(func4);
 
-	// Enable projection pushdown
-	func.projection_pushdown = true;
-
-	// Enable cardinality estimation from worker
-	func.cardinality = VgiTableFunctionCardinality;
-
-	// Enable progress reporting
-	func.table_scan_progress = VgiTableFunctionProgress;
-
-	// Enable EXPLAIN output
-	func.to_string = VgiTableFunctionToString;
-
-	loader.RegisterFunction(func);
+	loader.RegisterFunction(func_set);
 }
 
 } // namespace duckdb
