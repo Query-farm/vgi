@@ -594,9 +594,10 @@ FunctionConnection::FunctionConnection(const std::string &worker_path, const std
 }
 
 FunctionConnection::~FunctionConnection() {
-	if (proc_) {
-		proc_->Wait();
-	}
+	// SubProcess destructor handles termination:
+	// - Non-blocking check if process already exited
+	// - SIGTERM + wait if still running
+	// VGI workers don't exit after invocation, so we let destructor terminate them.
 }
 
 OutputSpecResult FunctionConnection::PerformBindFull() {
