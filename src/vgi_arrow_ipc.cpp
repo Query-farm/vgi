@@ -92,6 +92,7 @@ arrow::Result<std::shared_ptr<arrow::Buffer>> FdInputStream::Read(int64_t nbytes
 }
 
 // Read a single RecordBatch from a file descriptor
+// This reads one complete IPC stream (schema + 1 batch + EOS marker)
 arrow::RecordBatchWithMetadata ReadRecordBatch(int fd) {
 	// Wait for data to be available with timeout
 	WaitForReadable(fd);
@@ -109,11 +110,24 @@ arrow::RecordBatchWithMetadata ReadRecordBatch(int fd) {
 	if (!result.ok()) {
 		throw IOException("Failed to read Arrow batch: " + result.status().ToString());
 	}
+	auto batch_with_metadata = result.ValueUnsafe();
 
-	// Reset reader to consume any remaining stream data (e.g., EOS marker)
-	reader.reset();
+	// Consume any remaining stream data including EOS marker
+	// This is critical to avoid leaving data in the stream that would confuse the next reader
+	while (true) {
+		auto drain_result = reader->ReadNext();
+		if (!drain_result.ok()) {
+			// Error reading - might be at end of stream
+			break;
+		}
+		if (!drain_result.ValueUnsafe().batch) {
+			// Null batch means end of stream
+			break;
+		}
+		// Unexpected extra batch - this shouldn't happen for single-batch streams
+	}
 
-	return result.ValueUnsafe();
+	return batch_with_metadata;
 }
 
 // Extract string values from a result batch column.

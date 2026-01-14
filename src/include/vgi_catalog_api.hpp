@@ -7,6 +7,8 @@
 #include <vector>
 
 #include <arrow/api.h>
+#include <arrow/io/api.h>
+#include <arrow/ipc/api.h>
 
 #include "vgi_subprocess.hpp"
 
@@ -188,7 +190,7 @@ VgiFunctionInfo GetFunctionInfo(const std::string &worker_path, const std::vecto
                                 const std::string &schema_name, const std::string &function_name,
                                 ClientContext &context, bool worker_debug = false);
 
-// Streaming interface for function invocation.
+// Streaming interface for function invocation (legacy - uses catalog-style protocol).
 // Use this to invoke a table function and stream results.
 class FunctionInvokeStream {
 public:
@@ -224,6 +226,103 @@ private:
 	std::string worker_path_;
 	bool finished_ = false;
 };
+
+// ============================================================================
+// Function Connection - Proper 6-Stream Protocol
+// ============================================================================
+
+// Forward declaration of protocol result types
+struct OutputSpecResult;
+struct InitResultData;
+
+// FunctionConnection implements the proper VGI function protocol with 6 streams:
+// Stream 1: Invocation (client → worker)
+// Stream 2: OutputSpec (worker → client) - contains output schema
+// Stream 3: InitInput (client → worker)
+// Stream 4: InitResult (worker → client)
+// Stream 5: Input batches (client → worker) - not used for Table functions
+// Stream 6: Output batches (worker → client)
+//
+// Usage:
+// 1. During Bind: Call PerformBind() to get schema from OutputSpec
+// 2. During Init Local: Call PerformInit() to complete handshake
+// 3. During Scan: Call ReadDataBatch() to stream results
+class FunctionConnection {
+public:
+	// Create connection parameters (does not spawn worker yet)
+	FunctionConnection(const std::string &worker_path, const std::string &function_name,
+	                   const std::string &positional_args_json,
+	                   const std::vector<std::pair<std::string, std::string>> &named_args,
+	                   const std::vector<uint8_t> &attach_id, ClientContext &context, bool worker_debug = false);
+	~FunctionConnection();
+
+	// Phase 1: Perform bind handshake (Streams 1-2)
+	// Spawns worker, sends Invocation, reads OutputSpec
+	// Returns the output schema and metadata
+	// After this call, the worker is waiting for InitInput
+	std::shared_ptr<arrow::Schema> PerformBind(int32_t &max_processes_out, int64_t &cardinality_estimate_out);
+
+	// Phase 2: Perform init handshake (Streams 3-4)
+	// Sends InitInput, reads InitResult, then closes stdin (for Table functions)
+	// After this call, the connection is ready to read data
+	// projection_ids: optional list of column indices for projection pushdown
+	void PerformInit(const std::vector<int32_t> &projection_ids = {});
+
+	// Phase 3: Read a data batch (Stream 6)
+	// Returns nullptr when stream is exhausted
+	std::shared_ptr<arrow::RecordBatch> ReadDataBatch();
+
+	// Check if data stream is exhausted
+	bool IsFinished() const {
+		return data_finished_;
+	}
+
+	// Wait for worker process to exit
+	int Wait();
+
+	// Non-copyable and non-movable (contains reference)
+	FunctionConnection(const FunctionConnection &) = delete;
+	FunctionConnection &operator=(const FunctionConnection &) = delete;
+	FunctionConnection(FunctionConnection &&) = delete;
+	FunctionConnection &operator=(FunctionConnection &&) = delete;
+
+private:
+	std::string worker_path_;
+	std::string function_name_;
+	std::string positional_args_json_;
+	std::vector<std::pair<std::string, std::string>> named_args_;
+	std::vector<uint8_t> attach_id_;
+	ClientContext &context_;
+	bool worker_debug_;
+
+	// Worker process (created during bind)
+	std::unique_ptr<SubProcess> proc_;
+
+	// State tracking
+	bool bind_done_ = false;
+	bool init_done_ = false;
+	bool data_finished_ = false;
+
+	// Cached bind results
+	std::shared_ptr<arrow::Schema> output_schema_;
+	int32_t max_processes_ = 1;
+	int64_t cardinality_estimate_ = -1;
+
+	// Data stream reader (opened during PerformInit, used for ReadDataBatch)
+	// The data phase uses a single long-lived IPC stream with multiple batches
+	std::shared_ptr<arrow::io::InputStream> data_stream_;
+	std::shared_ptr<arrow::ipc::RecordBatchStreamReader> data_reader_;
+};
+
+// Perform a bind-only call to get schema for a function
+// This spawns a worker, completes the bind handshake, then closes the connection.
+// Use this when you only need schema info (e.g., during table function bind phase).
+std::shared_ptr<arrow::Schema> GetFunctionSchema(const std::string &worker_path, const std::string &function_name,
+                                                  const std::string &positional_args_json,
+                                                  const std::vector<std::pair<std::string, std::string>> &named_args,
+                                                  const std::vector<uint8_t> &attach_id, ClientContext &context,
+                                                  int32_t &max_processes_out, int64_t &cardinality_estimate_out,
+                                                  bool worker_debug = false);
 
 } // namespace vgi
 

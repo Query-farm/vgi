@@ -526,5 +526,206 @@ int FunctionInvokeStream::Wait() {
 	return proc_->Wait();
 }
 
+// ============================================================================
+// FunctionConnection - Proper 6-Stream Protocol Implementation
+// ============================================================================
+
+FunctionConnection::FunctionConnection(const std::string &worker_path, const std::string &function_name,
+                                       const std::string &positional_args_json,
+                                       const std::vector<std::pair<std::string, std::string>> &named_args,
+                                       const std::vector<uint8_t> &attach_id, ClientContext &context, bool worker_debug)
+    : worker_path_(worker_path), function_name_(function_name), positional_args_json_(positional_args_json),
+      named_args_(named_args), attach_id_(attach_id), context_(context), worker_debug_(worker_debug) {
+}
+
+FunctionConnection::~FunctionConnection() {
+	if (proc_) {
+		proc_->Wait();
+	}
+}
+
+std::shared_ptr<arrow::Schema> FunctionConnection::PerformBind(int32_t &max_processes_out,
+                                                                int64_t &cardinality_estimate_out) {
+	if (bind_done_) {
+		// Return cached results
+		max_processes_out = max_processes_;
+		cardinality_estimate_out = cardinality_estimate_;
+		return output_schema_;
+	}
+
+	// Spawn the worker process
+	proc_ = std::make_unique<SubProcess>(worker_path_, worker_debug_);
+
+	// Stream 1: Send Invocation
+	auto invocation =
+	    CreateFunctionInvocationFull(function_name_, positional_args_json_, named_args_, attach_id_, {});
+	auto invocation_bytes = SerializeRecordBatch(invocation);
+	WriteAll(proc_->GetStdinFd(), invocation_bytes->data(), invocation_bytes->size());
+
+	// Stream 2: Read OutputSpec
+	arrow::RecordBatchWithMetadata output_spec_result;
+	while (true) {
+		output_spec_result = ReadRecordBatch(proc_->GetStdoutFd());
+		// Handle log messages (throws on EXCEPTION)
+		if (!HandleBatchLogMessage(output_spec_result.batch, output_spec_result.custom_metadata, &context_,
+		                           worker_path_)) {
+			break;
+		}
+	}
+
+	// Parse OutputSpec
+	auto output_spec = ParseOutputSpec(output_spec_result.batch);
+	output_schema_ = output_spec.output_schema;
+	max_processes_ = output_spec.max_processes;
+	cardinality_estimate_ = output_spec.cardinality_estimate;
+
+	// Return results
+	max_processes_out = max_processes_;
+	cardinality_estimate_out = cardinality_estimate_;
+	bind_done_ = true;
+
+	return output_schema_;
+}
+
+void FunctionConnection::PerformInit(const std::vector<int32_t> &projection_ids) {
+	if (!bind_done_) {
+		throw IOException("FunctionConnection::PerformInit called before PerformBind");
+	}
+	if (init_done_) {
+		return; // Already initialized
+	}
+
+	// Stream 3: Send InitInput (TableFunctionInitInput with projection_ids)
+	auto init_input = CreateInitInput(projection_ids);
+	auto init_input_bytes = SerializeRecordBatch(init_input);
+	WriteAll(proc_->GetStdinFd(), init_input_bytes->data(), init_input_bytes->size());
+
+	// Stream 4: Read InitResult
+	// The worker sends a single batch with global_execution_identifier
+	arrow::RecordBatchWithMetadata init_result;
+	while (true) {
+		init_result = ReadRecordBatch(proc_->GetStdoutFd());
+		// Handle log messages (throws on EXCEPTION)
+		if (!HandleBatchLogMessage(init_result.batch, init_result.custom_metadata, &context_, worker_path_)) {
+			break;
+		}
+	}
+
+	// Parse InitResult (we don't need the global_execution_identifier for single-worker)
+	auto init_data = ParseInitResult(init_result.batch);
+	(void)init_data; // Suppress unused variable warning
+
+	// For Table functions (no input), close stdin to signal no more input
+	proc_->CloseStdin();
+
+	// Stream 6: Open the data stream reader
+	// Unlike handshake streams which are one batch each, the data phase uses
+	// a single long-lived IPC stream with multiple batches
+	data_stream_ = std::make_shared<FdInputStream>(proc_->GetStdoutFd());
+	auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(data_stream_);
+	if (!reader_result.ok()) {
+		throw IOException("Failed to open data stream: " + reader_result.status().ToString());
+	}
+	data_reader_ = reader_result.ValueUnsafe();
+
+	init_done_ = true;
+}
+
+std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
+	if (!init_done_) {
+		throw IOException("FunctionConnection::ReadDataBatch called before PerformInit");
+	}
+	if (data_finished_ || !data_reader_) {
+		return nullptr;
+	}
+
+	// Read from the persistent data stream reader
+	arrow::RecordBatchWithMetadata result;
+	auto read_result = data_reader_->ReadNext();
+	if (!read_result.ok()) {
+		// Check if this is an EOF indicator or actual error
+		std::string error_msg = read_result.status().ToString();
+		if (error_msg.find("end of stream") != std::string::npos ||
+		    error_msg.find("EOF") != std::string::npos) {
+			data_finished_ = true;
+			return nullptr;
+		}
+		throw IOException("Failed to read data batch: " + error_msg);
+	}
+	result = read_result.ValueUnsafe();
+
+	// Null batch means end of stream
+	if (!result.batch) {
+		data_finished_ = true;
+		return nullptr;
+	}
+
+	// Check for log messages (will throw on EXCEPTION)
+	if (HandleBatchLogMessage(result.batch, result.custom_metadata, &context_, worker_path_)) {
+		// It was a log message - read the next batch
+		return ReadDataBatch();
+	}
+
+	// Check vgi.status metadata for FINISHED
+	if (result.custom_metadata) {
+		int status_idx = result.custom_metadata->FindKey("vgi.status");
+		if (status_idx >= 0) {
+			std::string status = result.custom_metadata->value(status_idx);
+			if (status == "FINISHED") {
+				data_finished_ = true;
+				// Still return the batch if it has data
+				if (result.batch->num_rows() > 0) {
+					return result.batch;
+				}
+				return nullptr;
+			}
+		}
+	}
+
+	// Empty batch signals end of stream
+	if (result.batch->num_rows() == 0) {
+		data_finished_ = true;
+		return nullptr;
+	}
+
+	return result.batch;
+}
+
+int FunctionConnection::Wait() {
+	if (!proc_) {
+		return 0;
+	}
+	return proc_->Wait();
+}
+
+// Helper function for bind-only schema retrieval
+std::shared_ptr<arrow::Schema> GetFunctionSchema(const std::string &worker_path, const std::string &function_name,
+                                                  const std::string &positional_args_json,
+                                                  const std::vector<std::pair<std::string, std::string>> &named_args,
+                                                  const std::vector<uint8_t> &attach_id, ClientContext &context,
+                                                  int32_t &max_processes_out, int64_t &cardinality_estimate_out,
+                                                  bool worker_debug) {
+	// Create a temporary connection just for bind
+	FunctionConnection conn(worker_path, function_name, positional_args_json, named_args, attach_id, context,
+	                        worker_debug);
+
+	// Perform bind to get schema
+	auto schema = conn.PerformBind(max_processes_out, cardinality_estimate_out);
+
+	// Also perform init to let the worker complete the handshake
+	// The worker expects InitInput before it will proceed
+	conn.PerformInit();
+
+	// Drain any data output from the worker (we don't need it, just schema)
+	// This is necessary because the worker won't exit until we read its output
+	while (conn.ReadDataBatch() != nullptr) {
+		// Discard data batches
+	}
+
+	// Now the worker has finished and will exit when we destroy the connection
+
+	return schema;
+}
+
 } // namespace vgi
 } // namespace duckdb

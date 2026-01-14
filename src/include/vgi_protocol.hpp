@@ -59,5 +59,42 @@ std::shared_ptr<arrow::RecordBatch> CreateFunctionInvokeArgs(const std::vector<u
                                                               const std::vector<std::pair<std::string, std::string>> &named_args,
                                                               const std::vector<int32_t> &projection_ids = {});
 
+// ============================================================================
+// Function Protocol - Proper 6-Stream Implementation
+// ============================================================================
+
+// Result from parsing OutputSpec (Stream 2)
+struct OutputSpecResult {
+	std::shared_ptr<arrow::Schema> output_schema;
+	int64_t cardinality_estimate = -1;
+	int64_t cardinality_min = -1;
+	int64_t cardinality_max = -1;
+	int32_t max_processes = 1;
+	bool requires_finalize = false;
+	std::string stability;
+};
+
+// Result from parsing InitResult (Stream 4)
+struct InitResultData {
+	std::vector<uint8_t> global_execution_identifier;
+};
+
+// Create the full Invocation batch for function protocol (Stream 1)
+// This includes the function arguments in the invocation itself
+std::shared_ptr<arrow::RecordBatch> CreateFunctionInvocationFull(
+    const std::string &function_name, const std::string &positional_args_json,
+    const std::vector<std::pair<std::string, std::string>> &named_args,
+    const std::vector<uint8_t> &attach_id = {}, const std::vector<uint8_t> &global_exec_id = {});
+
+// Create InitInput batch (Stream 3)
+// For table functions, this is TableFunctionInitInput with projection_ids
+std::shared_ptr<arrow::RecordBatch> CreateInitInput(const std::vector<int32_t> &projection_ids = {});
+
+// Parse OutputSpec response (Stream 2)
+OutputSpecResult ParseOutputSpec(const std::shared_ptr<arrow::RecordBatch> &batch);
+
+// Parse InitResult response (Stream 4)
+InitResultData ParseInitResult(const std::shared_ptr<arrow::RecordBatch> &batch);
+
 } // namespace vgi
 } // namespace duckdb

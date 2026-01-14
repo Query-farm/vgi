@@ -9,9 +9,6 @@
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "yyjson.hpp"
 
-#include <chrono>
-#include <mutex>
-
 using namespace duckdb_yyjson; // NOLINT
 
 namespace duckdb {
@@ -35,26 +32,26 @@ struct VgiTableFunctionBindData : public TableFunctionData {
 	std::string positional_args_json;
 	std::vector<std::pair<std::string, std::string>> named_args;
 
-	// Schema information from function_get
+	// Schema information (discovered from OutputSpec during bind)
 	std::shared_ptr<arrow::Schema> arrow_schema;
 	vector<LogicalType> return_types;
 	vector<string> return_names;
 
-	// Optimization hints
-	idx_t cardinality_estimate = 0;
-	int32_t max_workers = 1;
+	// Execution hints from OutputSpec
+	int32_t max_processes = 1;
+	int64_t cardinality_estimate = -1;
 
 	// Debug flag
 	bool worker_debug = false;
 };
 
 // ============================================================================
-// Global State
+// Global State - Contains the connection for streaming
 // ============================================================================
 
 struct VgiTableFunctionGlobalState : public GlobalTableFunctionState {
-	// Stream from worker
-	std::unique_ptr<vgi::FunctionInvokeStream> stream;
+	// Connection to worker (owns the subprocess)
+	std::unique_ptr<vgi::FunctionConnection> connection;
 
 	// Current batch being processed
 	std::shared_ptr<arrow::RecordBatch> current_batch;
@@ -63,8 +60,8 @@ struct VgiTableFunctionGlobalState : public GlobalTableFunctionState {
 	// Completion tracking
 	bool exhausted = false;
 
-	// Thread safety
-	std::mutex stream_lock;
+	// Thread safety for multi-threaded scan (future use)
+	std::mutex scan_lock;
 
 	idx_t MaxThreads() const override {
 		return 1; // Single-threaded for now
@@ -197,53 +194,44 @@ static unique_ptr<FunctionData> VgiTableFunctionBind(ClientContext &context, Tab
 	            {"function_name", bind_data->function_name},
 	            {"args", bind_data->positional_args_json}});
 
-	// Attach to catalog to get attach_id
-	auto attach_args = vgi::CreateCatalogAttachArgs("example"); // Default catalog
-	auto attach_batch =
-	    vgi::InvokeCatalogMethod(bind_data->worker_path, "catalog_attach", attach_args, context, bind_data->worker_debug);
-	auto attach_result = vgi::ParseCatalogAttachResult(attach_batch);
-	bind_data->attach_id = attach_result.attach_id;
-
-	// Get function metadata
-	auto func_info = vgi::GetFunctionInfo(bind_data->worker_path, bind_data->attach_id, bind_data->schema_name,
-	                                      bind_data->function_name, context, bind_data->worker_debug);
-
-	// Store function metadata
-	bind_data->arrow_schema = func_info.return_schema;
-	bind_data->cardinality_estimate = func_info.cardinality_estimate > 0 ? func_info.cardinality_estimate : 0;
-	bind_data->max_workers = func_info.max_workers;
+	// Get schema from OutputSpec using the proper protocol
+	// This spawns a worker, completes the full handshake, drains output, then closes
+	bind_data->arrow_schema = vgi::GetFunctionSchema(
+	    bind_data->worker_path, bind_data->function_name, bind_data->positional_args_json, bind_data->named_args,
+	    bind_data->attach_id, context, bind_data->max_processes, bind_data->cardinality_estimate, bind_data->worker_debug);
 
 	// Convert Arrow schema to DuckDB types
-	if (func_info.return_schema) {
-		vgi::ArrowSchemaToDuckDB(func_info.return_schema, return_types, names);
-		bind_data->return_types = return_types;
-		bind_data->return_names = names;
-	} else {
-		throw IOException("Function '%s' did not return a schema", bind_data->function_name);
-	}
+	vgi::ArrowSchemaToDuckDB(bind_data->arrow_schema, return_types, names);
+	bind_data->return_types = return_types;
+	bind_data->return_names = names;
 
 	return bind_data;
 }
 
 // ============================================================================
-// Init Function
+// Init Global Function - Creates connection and performs init handshake
 // ============================================================================
 
 static unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &context,
                                                                         TableFunctionInitInput &input) {
 	auto &bind_data = input.bind_data->Cast<VgiTableFunctionBindData>();
-	auto state = make_uniq<VgiTableFunctionGlobalState>();
+	auto global_state = make_uniq<VgiTableFunctionGlobalState>();
 
-	// Get projection IDs if available
-	vector<int32_t> projection_ids;
-	// Note: projection pushdown can be added later
+	// Create connection with same parameters as bind
+	global_state->connection = make_uniq<vgi::FunctionConnection>(
+	    bind_data.worker_path, bind_data.function_name, bind_data.positional_args_json, bind_data.named_args,
+	    bind_data.attach_id, context, bind_data.worker_debug);
 
-	// Start function invocation stream
-	state->stream = make_uniq<vgi::FunctionInvokeStream>(
-	    bind_data.worker_path, bind_data.attach_id, bind_data.schema_name, bind_data.function_name,
-	    bind_data.positional_args_json, bind_data.named_args, projection_ids, context, bind_data.worker_debug);
+	// Perform bind phase (Streams 1-2)
+	int32_t max_processes;
+	int64_t cardinality_estimate;
+	global_state->connection->PerformBind(max_processes, cardinality_estimate);
 
-	return state;
+	// Perform init phase (Streams 3-4)
+	// For projection pushdown, we could pass column names here
+	global_state->connection->PerformInit();
+
+	return global_state;
 }
 
 // ============================================================================
@@ -253,7 +241,7 @@ static unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientCon
 static void VgiTableFunctionScan(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
 	auto &global_state = input.global_state->Cast<VgiTableFunctionGlobalState>();
 
-	std::lock_guard<std::mutex> lock(global_state.stream_lock);
+	std::lock_guard<std::mutex> lock(global_state.scan_lock);
 
 	if (global_state.exhausted) {
 		output.SetCardinality(0);
@@ -268,7 +256,8 @@ static void VgiTableFunctionScan(ClientContext &context, TableFunctionInput &inp
 		if (!global_state.current_batch ||
 		    global_state.current_batch_offset >= static_cast<idx_t>(global_state.current_batch->num_rows())) {
 
-			global_state.current_batch = global_state.stream->ReadNext();
+			// Read next batch from connection
+			global_state.current_batch = global_state.connection->ReadDataBatch();
 			global_state.current_batch_offset = 0;
 
 			if (!global_state.current_batch) {
@@ -293,18 +282,6 @@ static void VgiTableFunctionScan(ClientContext &context, TableFunctionInput &inp
 	output.SetCardinality(rows_read);
 }
 
-// ============================================================================
-// Cardinality Estimation
-// ============================================================================
-
-static unique_ptr<NodeStatistics> VgiTableFunctionCardinality(ClientContext &context, const FunctionData *bind_data_p) {
-	auto &bind_data = bind_data_p->Cast<VgiTableFunctionBindData>();
-	if (bind_data.cardinality_estimate > 0) {
-		return make_uniq<NodeStatistics>(bind_data.cardinality_estimate);
-	}
-	return nullptr;
-}
-
 } // anonymous namespace
 
 // ============================================================================
@@ -319,10 +296,6 @@ void RegisterVgiTableFunction(ExtensionLoader &loader) {
 	// Named parameters
 	func.named_parameters["debug"] = LogicalType::BOOLEAN;
 	func.named_parameters["schema"] = LogicalType::VARCHAR;
-
-	// Function properties
-	func.cardinality = VgiTableFunctionCardinality;
-	// func.projection_pushdown = true; // Can be enabled later
 
 	loader.RegisterFunction(func);
 }
