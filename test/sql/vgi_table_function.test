@@ -152,6 +152,86 @@ FROM vgi_table_function('${VGI_TEST_WORKER}', 'sequence', [2]) a,
 1	1
 
 # =============================================================================
+# random_sample Function
+# =============================================================================
+
+# Test random_sample generates correct number of rows
+query I
+SELECT COUNT(*) FROM vgi_table_function('${VGI_TEST_WORKER}', 'random_sample', [100]);
+----
+100
+
+# Test random_sample has correct columns (id and value)
+query II
+SELECT typeof(id), typeof(value) FROM vgi_table_function('${VGI_TEST_WORKER}', 'random_sample', [1]);
+----
+BIGINT	DOUBLE
+
+# Test random_sample with seed for reproducibility - verify id column is sequential
+query I
+SELECT MIN(id) FROM vgi_table_function('${VGI_TEST_WORKER}', 'random_sample', [10, 42]);
+----
+0
+
+query I
+SELECT MAX(id) FROM vgi_table_function('${VGI_TEST_WORKER}', 'random_sample', [10, 42]);
+----
+9
+
+# =============================================================================
+# logging_generator Function
+# =============================================================================
+
+# Test logging_generator produces correct output (log messages are handled internally)
+query I
+SELECT * FROM vgi_table_function('${VGI_TEST_WORKER}', 'logging_generator', [3]);
+----
+0
+1
+2
+
+# =============================================================================
+# partitioned_range Function
+# =============================================================================
+
+# Test partitioned_range generates correct range
+query I
+SELECT COUNT(*) FROM vgi_table_function('${VGI_TEST_WORKER}', 'partitioned_range', [100]);
+----
+100
+
+# Verify partitioned_range produces values 0..99
+query II
+SELECT MIN(value), MAX(value) FROM vgi_table_function('${VGI_TEST_WORKER}', 'partitioned_range', [100]);
+----
+0	99
+
+# =============================================================================
+# projected_data Function (Multiple Columns)
+# =============================================================================
+
+# Test projected_data has all 4 columns
+query IIII
+SELECT typeof(id), typeof(name), typeof(value), typeof(extra)
+FROM vgi_table_function('${VGI_TEST_WORKER}', 'projected_data', [1]);
+----
+BIGINT	VARCHAR	DOUBLE	BIGINT
+
+# Test projected_data values are computed correctly
+query IIRI
+SELECT id, name, value, extra FROM vgi_table_function('${VGI_TEST_WORKER}', 'projected_data', [3]);
+----
+0	item_0	0.0	0
+1	item_1	1.5	1
+2	item_2	3.0	4
+
+# Test large projected_data spans multiple batches
+query I
+SELECT COUNT(*) FROM vgi_table_function('${VGI_TEST_WORKER}', 'projected_data', [1500]);
+----
+1500
+
+# =============================================================================
 # Error Handling
 # =============================================================================
 
@@ -166,4 +246,10 @@ statement error
 SELECT * FROM vgi_table_function('/nonexistent/worker/path', 'sequence', [5]);
 ----
 IO Error
+
+# Test generator_exception - worker raises an exception after generating some rows
+statement error
+SELECT * FROM vgi_table_function('${VGI_TEST_WORKER}', 'generator_exception', [2]);
+----
+Intentional failure after 2 batches
 
