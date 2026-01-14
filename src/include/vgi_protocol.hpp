@@ -54,8 +54,6 @@ struct OutputSpecResult {
 	int64_t cardinality_estimate = -1;
 	int64_t cardinality_max = -1;
 	int32_t max_processes = 1;
-	bool requires_finalize = false;
-	std::string stability;
 
 	// Invocation identifier returned by the worker (for correlation in subsequent streams)
 	std::vector<uint8_t> invocation_id;

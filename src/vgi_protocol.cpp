@@ -445,15 +445,6 @@ OutputSpecResult ParseOutputSpec(const std::shared_ptr<arrow::RecordBatch> &batc
 		result.max_processes = 1;
 	}
 
-	// Get requires_finalize (bool, nullable)
-	auto requires_finalize_col = batch->GetColumnByName("requires_finalize");
-	if (requires_finalize_col) {
-		auto bool_array = std::dynamic_pointer_cast<arrow::BooleanArray>(requires_finalize_col);
-		if (bool_array && !bool_array->IsNull(0)) {
-			result.requires_finalize = bool_array->Value(0);
-		}
-	}
-
 	// Get cardinality information (int64 columns, nullable)
 	auto estimated_col = batch->GetColumnByName("cardinality_estimated");
 	if (estimated_col) {
@@ -467,15 +458,6 @@ OutputSpecResult ParseOutputSpec(const std::shared_ptr<arrow::RecordBatch> &batc
 		auto int_array = std::dynamic_pointer_cast<arrow::Int64Array>(max_col);
 		if (int_array && !int_array->IsNull(0)) {
 			result.cardinality_max = int_array->Value(0);
-		}
-	}
-
-	// Get stability (string, nullable)
-	auto stability_col = batch->GetColumnByName("stability");
-	if (stability_col) {
-		auto string_array = std::dynamic_pointer_cast<arrow::StringArray>(stability_col);
-		if (string_array && !string_array->IsNull(0)) {
-			result.stability = string_array->GetString(0);
 		}
 	}
 
