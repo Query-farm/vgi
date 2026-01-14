@@ -53,9 +53,6 @@ struct VgiTableFunctionBindData : public TableFunctionData {
 	// Features that the worker has activated for this invocation
 	std::unordered_set<std::string> active_features;
 
-	// Worker process info (cached for logging)
-	pid_t worker_pid = -1;
-
 	// Connection to worker (created during bind, moved to local state during init)
 	// Protected by connection_mutex for thread-safe handoff to first InitLocal caller.
 	// Mutable because InitLocal needs to move ownership to LocalState.
@@ -140,7 +137,6 @@ static unique_ptr<FunctionData> VgiTableFunctionBind(ClientContext &context, Tab
 	bind_data->invocation_id_hex = BytesToHex(bind_data->invocation_id);
 	bind_data->active_features =
 	    std::unordered_set<std::string>(output_spec.active_features.begin(), output_spec.active_features.end());
-	bind_data->worker_pid = bind_data->connection->GetPid();
 
 	// Log the bind result
 	std::string features_str;
@@ -152,7 +148,7 @@ static unique_ptr<FunctionData> VgiTableFunctionBind(ClientContext &context, Tab
 	}
 	VGI_LOG(context, "table_function.bind_result",
 	        {{"worker_path", bind_data->worker_path},
-	         {"worker_pid", std::to_string(bind_data->worker_pid)},
+	         {"worker_pid", std::to_string(bind_data->connection->GetPid())},
 	         {"function_name", bind_data->function_name},
 	         {"invocation_id", bind_data->invocation_id_hex},
 	         {"max_processes", std::to_string(bind_data->max_processes)},
