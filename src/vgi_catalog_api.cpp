@@ -158,6 +158,11 @@ std::shared_ptr<arrow::RecordBatch> InvokeCatalogMethod(const std::string &worke
 	// Spawn the worker process
 	SubProcess proc(worker_path, worker_debug);
 
+	VGI_LOG(context, "catalog_method.invoke",
+	        {{"worker_path", worker_path},
+	         {"worker_pid", std::to_string(proc.GetPid())},
+	         {"method_name", method_name}});
+
 	// Send invocation and args
 	SendInvocationAndArgs(proc, method_name, args);
 
@@ -209,7 +214,12 @@ std::shared_ptr<arrow::RecordBatch> InvokeCatalogMethod(const std::string &worke
 CatalogMethodStream::CatalogMethodStream(const std::string &worker_path, const std::string &method_name,
                                          const std::shared_ptr<arrow::RecordBatch> &args, ClientContext &context,
                                          bool worker_debug)
-    : proc_(std::make_unique<SubProcess>(worker_path, worker_debug)), context_(context), worker_path_(worker_path) {
+    : proc_(std::make_unique<SubProcess>(worker_path, worker_debug)), context_(context), worker_path_(worker_path),
+      method_name_(method_name) {
+	VGI_LOG(context_, "catalog_method.invoke",
+	        {{"worker_path", worker_path_},
+	         {"worker_pid", std::to_string(proc_->GetPid())},
+	         {"method_name", method_name_}});
 	SendInvocationAndArgs(*proc_, method_name, args);
 }
 

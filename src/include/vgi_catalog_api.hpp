@@ -113,6 +113,7 @@ private:
 	std::unique_ptr<SubProcess> proc_;
 	ClientContext &context_;
 	std::string worker_path_;
+	std::string method_name_;
 	bool finished_ = false;
 };
 
@@ -209,6 +210,16 @@ struct ArrowArguments;
 // Stream 4: InitResult (worker → client)
 // Stream 5: Input batches (client → worker) - not used for Table functions
 // Stream 6: Output batches (worker → client)
+//
+// State machine with validation:
+// - Created → bind_done_ (via PerformBind/PerformBindFull)
+// - bind_done_ → init_done_ (via PerformInit or SkipInit)
+// - init_done_ → data_finished_ (via ReadDataBatch returning nullptr)
+//
+// Validation rules:
+// - PerformBindFull: Idempotent, returns cached result if already called
+// - PerformInit/SkipInit: Throws if !bind_done_ or init_done_
+// - ReadDataBatch: Throws if !init_done_, returns nullptr if data_finished_
 //
 // Usage:
 // 1. During Bind: Call PerformBind() to get schema from OutputSpec
