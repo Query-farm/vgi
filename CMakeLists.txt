@@ -27,6 +27,7 @@ src/vgi_arrow_ipc.cpp
 src/vgi_arrow_convert.cpp
 src/vgi_protocol.cpp
 src/vgi_catalogs.cpp
+src/vgi_table_function.cpp
 src/vgi_catalog_api.cpp
 src/storage/vgi_catalog.cpp
 src/storage/vgi_catalog_set.cpp

@@ -12,6 +12,7 @@
 #include "vgi_catalogs.hpp"
 #include "vgi_logging.hpp"
 #include "vgi_protocol.hpp"
+#include "vgi_table_function.hpp"
 
 #define VGI_EXTENSION_VERSION "2026011201"
 
@@ -85,6 +86,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	// Register VGI table functions
 	RegisterVgiCatalogsFunction(loader);
+	RegisterVgiTableFunction(loader);
 }
 
 void VgiExtension::Load(ExtensionLoader &loader) {
