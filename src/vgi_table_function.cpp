@@ -174,8 +174,12 @@ static unique_ptr<FunctionData> VgiTableFunctionBind(ClientContext &context, Tab
 	// bind_connection closes here - InitGlobal will create a fresh connection
 
 	// Convert Arrow schema to DuckDB types using centralized utility
-	vgi::ArrowSchemaToDuckDBTypes(context, output_spec.output_schema, bind_data->c_schema, bind_data->arrow_table,
-	                              return_types, names);
+	try {
+		vgi::ArrowSchemaToDuckDBTypes(context, output_spec.output_schema, bind_data->c_schema, bind_data->arrow_table,
+		                              return_types, names);
+	} catch (const std::exception &e) {
+		throw IOException("Failed to convert output schema for function '%s': %s", bind_data->function_name, e.what());
+	}
 
 	return bind_data;
 }

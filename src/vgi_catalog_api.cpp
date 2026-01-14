@@ -1,5 +1,7 @@
 #include "vgi_catalog_api.hpp"
 
+#include <poll.h>
+
 #include "duckdb.hpp"
 #include "duckdb/function/table/arrow/arrow_duck_schema.hpp"
 #include "duckdb/logging/log_manager.hpp"
@@ -118,6 +120,35 @@ static void SendInvocationAndArgs(SubProcess &proc, const std::string &method_na
 }
 
 // ============================================================================
+// Worker Error Handling Helper
+// ============================================================================
+
+// Check if a worker process exited with an error and throw appropriate exception.
+// Returns true if the process has exited, false if still running.
+// Throws VgiIOException for exit codes 127 (not found), 126 (permission denied), or other non-zero.
+// The error_context parameter customizes the message for non-special exit codes:
+// - "failed to start" for errors during read attempts
+// - "exited with status" for EOF/null batch cases
+bool CheckWorkerExitStatus(SubProcess &proc, const std::string &worker_path, const std::string &error_context,
+                           const std::string &invocation_id_hex = "") {
+	int exit_status = 0;
+	if (!proc.TryWait(&exit_status)) {
+		return false; // Process still running
+	}
+
+	if (exit_status == 127) {
+		ThrowVgiIOException("VGI worker not found or not executable", worker_path, proc.GetPid(), invocation_id_hex);
+	} else if (exit_status == 126) {
+		ThrowVgiIOException("VGI worker permission denied", worker_path, proc.GetPid(), invocation_id_hex);
+	} else if (exit_status != 0) {
+		ThrowVgiIOException("VGI worker %s (exit code %d)", worker_path, proc.GetPid(), invocation_id_hex, error_context,
+		                    exit_status);
+	}
+
+	return true; // Process exited normally (exit_status == 0)
+}
+
+// ============================================================================
 // InvokeCatalogMethod - Single result batch
 // ============================================================================
 
@@ -137,17 +168,7 @@ std::shared_ptr<arrow::RecordBatch> InvokeCatalogMethod(const std::string &worke
 			result = ReadRecordBatch(proc.GetStdoutFd(), worker_path, proc.GetPid());
 		} catch (const IOException &e) {
 			// Check if the worker process died early (e.g., command not found)
-			int exit_status = 0;
-			if (proc.TryWait(&exit_status)) {
-				if (exit_status == 127) {
-					ThrowVgiIOException("VGI worker not found or not executable", worker_path, proc.GetPid(), "");
-				} else if (exit_status == 126) {
-					ThrowVgiIOException("VGI worker permission denied", worker_path, proc.GetPid(), "");
-				} else if (exit_status != 0) {
-					ThrowVgiIOException("VGI worker failed to start (exit code %d)", worker_path, proc.GetPid(), "",
-					                    exit_status);
-				}
-			}
+			CheckWorkerExitStatus(proc, worker_path, "failed to start");
 			// Re-throw original error if process didn't die early
 			throw;
 		}
@@ -155,16 +176,7 @@ std::shared_ptr<arrow::RecordBatch> InvokeCatalogMethod(const std::string &worke
 		// Null batch from ReadRecordBatch means EOF (pipe closed)
 		// Check if the worker failed before sending data
 		if (!result.batch) {
-			int exit_status = 0;
-			if (proc.TryWait(&exit_status)) {
-				if (exit_status == 127) {
-					ThrowVgiIOException("VGI worker not found or not executable", worker_path, proc.GetPid(), "");
-				} else if (exit_status == 126) {
-					ThrowVgiIOException("VGI worker permission denied", worker_path, proc.GetPid(), "");
-				} else if (exit_status != 0) {
-					ThrowVgiIOException("VGI worker exited with status %d", worker_path, proc.GetPid(), "", exit_status);
-				}
-			}
+			CheckWorkerExitStatus(proc, worker_path, "exited with status");
 			ThrowVgiIOException("VGI worker closed connection without sending data", worker_path, proc.GetPid(), "");
 		}
 
@@ -217,17 +229,7 @@ std::shared_ptr<arrow::RecordBatch> CatalogMethodStream::ReadNext() {
 		result = ReadRecordBatch(proc_->GetStdoutFd(), worker_path_, proc_->GetPid());
 	} catch (const IOException &e) {
 		// Check if the worker process died early (e.g., command not found)
-		int exit_status = 0;
-		if (proc_->TryWait(&exit_status)) {
-			if (exit_status == 127) {
-				ThrowVgiIOException("VGI worker not found or not executable", worker_path_, proc_->GetPid(), "");
-			} else if (exit_status == 126) {
-				ThrowVgiIOException("VGI worker permission denied", worker_path_, proc_->GetPid(), "");
-			} else if (exit_status != 0) {
-				ThrowVgiIOException("VGI worker failed to start (exit code %d)", worker_path_, proc_->GetPid(), "",
-				                    exit_status);
-			}
-		}
+		CheckWorkerExitStatus(*proc_, worker_path_, "failed to start");
 		// Re-throw - ReadRecordBatch now returns null batch for EOF instead of throwing
 		throw;
 	}
@@ -235,16 +237,7 @@ std::shared_ptr<arrow::RecordBatch> CatalogMethodStream::ReadNext() {
 	// Null batch from ReadRecordBatch means EOF (pipe closed)
 	// Check if the worker failed before sending data
 	if (!result.batch) {
-		int exit_status = 0;
-		if (proc_->TryWait(&exit_status)) {
-			if (exit_status == 127) {
-				ThrowVgiIOException("VGI worker not found or not executable", worker_path_, proc_->GetPid(), "");
-			} else if (exit_status == 126) {
-				ThrowVgiIOException("VGI worker permission denied", worker_path_, proc_->GetPid(), "");
-			} else if (exit_status != 0) {
-				ThrowVgiIOException("VGI worker exited with status %d", worker_path_, proc_->GetPid(), "", exit_status);
-			}
-		}
+		CheckWorkerExitStatus(*proc_, worker_path_, "exited with status");
 		finished_ = true;
 		return nullptr;
 	}
@@ -370,6 +363,164 @@ std::map<std::string, std::string> GetStringMapValue(const std::shared_ptr<arrow
 	return result;
 }
 
+// Helper to get a List<Int32> column value (for not_null_constraints)
+std::vector<int> GetInt32ListValue(const std::shared_ptr<arrow::RecordBatch> &batch, const std::string &column_name,
+                                   int64_t row_idx) {
+	std::vector<int> result;
+	auto column = batch->GetColumnByName(column_name);
+	if (!column) {
+		return result;
+	}
+	auto list_array = std::dynamic_pointer_cast<arrow::ListArray>(column);
+	if (!list_array || list_array->IsNull(row_idx)) {
+		return result;
+	}
+
+	int64_t start = list_array->value_offset(row_idx);
+	int64_t end = list_array->value_offset(row_idx + 1);
+
+	auto int_array = std::dynamic_pointer_cast<arrow::Int32Array>(list_array->values());
+	if (!int_array) {
+		return result;
+	}
+
+	for (int64_t i = start; i < end; i++) {
+		if (!int_array->IsNull(i)) {
+			result.push_back(int_array->Value(i));
+		}
+	}
+	return result;
+}
+
+// Helper to get a List<List<Int32>> column value (for unique_constraints)
+std::vector<std::vector<int>> GetInt32ListListValue(const std::shared_ptr<arrow::RecordBatch> &batch,
+                                                    const std::string &column_name, int64_t row_idx) {
+	std::vector<std::vector<int>> result;
+	auto column = batch->GetColumnByName(column_name);
+	if (!column) {
+		return result;
+	}
+	auto outer_list = std::dynamic_pointer_cast<arrow::ListArray>(column);
+	if (!outer_list || outer_list->IsNull(row_idx)) {
+		return result;
+	}
+
+	int64_t outer_start = outer_list->value_offset(row_idx);
+	int64_t outer_end = outer_list->value_offset(row_idx + 1);
+
+	auto inner_list = std::dynamic_pointer_cast<arrow::ListArray>(outer_list->values());
+	if (!inner_list) {
+		return result;
+	}
+
+	auto int_array = std::dynamic_pointer_cast<arrow::Int32Array>(inner_list->values());
+	if (!int_array) {
+		return result;
+	}
+
+	for (int64_t i = outer_start; i < outer_end; i++) {
+		std::vector<int> inner_result;
+		if (!inner_list->IsNull(i)) {
+			int64_t inner_start = inner_list->value_offset(i);
+			int64_t inner_end = inner_list->value_offset(i + 1);
+			for (int64_t j = inner_start; j < inner_end; j++) {
+				if (!int_array->IsNull(j)) {
+					inner_result.push_back(int_array->Value(j));
+				}
+			}
+		}
+		result.push_back(std::move(inner_result));
+	}
+	return result;
+}
+
+// Helper to get a List<Utf8> column value (for check_constraints)
+std::vector<std::string> GetStringListValue(const std::shared_ptr<arrow::RecordBatch> &batch,
+                                            const std::string &column_name, int64_t row_idx) {
+	std::vector<std::string> result;
+	auto column = batch->GetColumnByName(column_name);
+	if (!column) {
+		return result;
+	}
+	auto list_array = std::dynamic_pointer_cast<arrow::ListArray>(column);
+	if (!list_array || list_array->IsNull(row_idx)) {
+		return result;
+	}
+
+	int64_t start = list_array->value_offset(row_idx);
+	int64_t end = list_array->value_offset(row_idx + 1);
+
+	auto string_array = std::dynamic_pointer_cast<arrow::StringArray>(list_array->values());
+	if (!string_array) {
+		return result;
+	}
+
+	for (int64_t i = start; i < end; i++) {
+		if (!string_array->IsNull(i)) {
+			result.push_back(string_array->GetString(i));
+		}
+	}
+	return result;
+}
+
+// Helper to get function parameters from a List<Struct> column
+std::vector<VgiFunctionParameter> GetParametersValue(const std::shared_ptr<arrow::RecordBatch> &batch,
+                                                     const std::string &column_name, int64_t row_idx) {
+	std::vector<VgiFunctionParameter> result;
+	auto column = batch->GetColumnByName(column_name);
+	if (!column) {
+		return result;
+	}
+	auto list_array = std::dynamic_pointer_cast<arrow::ListArray>(column);
+	if (!list_array || list_array->IsNull(row_idx)) {
+		return result;
+	}
+
+	// Get the offsets for this row's list elements
+	int64_t start = list_array->value_offset(row_idx);
+	int64_t end = list_array->value_offset(row_idx + 1);
+
+	// Get the struct array containing the list elements
+	auto struct_array = std::dynamic_pointer_cast<arrow::StructArray>(list_array->values());
+	if (!struct_array) {
+		return result;
+	}
+
+	// Get each field array from the struct
+	auto name_array = std::dynamic_pointer_cast<arrow::StringArray>(struct_array->GetFieldByName("name"));
+	auto position_array = std::dynamic_pointer_cast<arrow::Int32Array>(struct_array->GetFieldByName("position"));
+	auto arrow_type_array = std::dynamic_pointer_cast<arrow::StringArray>(struct_array->GetFieldByName("arrow_type"));
+	auto default_value_array =
+	    std::dynamic_pointer_cast<arrow::StringArray>(struct_array->GetFieldByName("default_value"));
+	auto doc_array = std::dynamic_pointer_cast<arrow::StringArray>(struct_array->GetFieldByName("doc"));
+	auto is_varargs_array = std::dynamic_pointer_cast<arrow::BooleanArray>(struct_array->GetFieldByName("is_varargs"));
+
+	for (int64_t i = start; i < end; i++) {
+		VgiFunctionParameter param;
+		if (name_array && !name_array->IsNull(i)) {
+			param.name = name_array->GetString(i);
+		}
+		if (position_array && !position_array->IsNull(i)) {
+			param.position = position_array->Value(i);
+		}
+		if (arrow_type_array && !arrow_type_array->IsNull(i)) {
+			param.arrow_type = arrow_type_array->GetString(i);
+		}
+		if (default_value_array && !default_value_array->IsNull(i)) {
+			param.default_value = default_value_array->GetString(i);
+		}
+		if (doc_array && !doc_array->IsNull(i)) {
+			param.doc = doc_array->GetString(i);
+		}
+		if (is_varargs_array && !is_varargs_array->IsNull(i)) {
+			param.is_varargs = is_varargs_array->Value(i);
+		}
+		result.push_back(std::move(param));
+	}
+
+	return result;
+}
+
 } // namespace
 
 CatalogAttachResult ParseCatalogAttachResult(const std::shared_ptr<arrow::RecordBatch> &batch) {
@@ -423,7 +574,10 @@ VgiTableInfo ParseTableInfo(const std::shared_ptr<arrow::RecordBatch> &batch) {
 	auto columns_data = GetBinaryValue(batch, "columns", 0);
 	info.arrow_schema = DeserializeSchema(columns_data);
 
-	// TODO: Parse constraints if present
+	// Parse constraints if present
+	info.not_null_constraints = GetInt32ListValue(batch, "not_null_constraints", 0);
+	info.unique_constraints = GetInt32ListListValue(batch, "unique_constraints", 0);
+	info.check_constraints = GetStringListValue(batch, "check_constraints", 0);
 
 	return info;
 }
@@ -487,7 +641,8 @@ VgiFunctionInfo ParseFunctionInfo(const std::shared_ptr<arrow::RecordBatch> &bat
 		info.return_schema = DeserializeSchema(schema_data);
 	}
 
-	// TODO: Parse parameters if present
+	// Parse parameters if present (List<Struct>)
+	info.parameters = GetParametersValue(batch, "parameters", 0);
 
 	return info;
 }
@@ -565,17 +720,7 @@ OutputSpecResult FunctionConnection::PerformBindFull() {
 			output_spec_result = ReadRecordBatch(proc_->GetStdoutFd(), worker_path_, proc_->GetPid());
 		} catch (const IOException &e) {
 			// Check if the worker process died early (e.g., command not found)
-			int exit_status = 0;
-			if (proc_->TryWait(&exit_status)) {
-				if (exit_status == 127) {
-					ThrowVgiIOException("VGI worker not found or not executable", worker_path_, proc_->GetPid(), "");
-				} else if (exit_status == 126) {
-					ThrowVgiIOException("VGI worker permission denied", worker_path_, proc_->GetPid(), "");
-				} else if (exit_status != 0) {
-					ThrowVgiIOException("VGI worker failed to start (exit code %d)", worker_path_, proc_->GetPid(), "",
-					                    exit_status);
-				}
-			}
+			CheckWorkerExitStatus(*proc_, worker_path_, "failed to start");
 			// Re-throw original error if process didn't die early
 			throw;
 		}
@@ -790,7 +935,26 @@ void FunctionConnection::StartStderrReader() {
 		char buffer[4096];
 		std::string line_buffer;
 
+		struct pollfd pfd;
+		pfd.fd = stderr_fd;
+		pfd.events = POLLIN;
+
 		while (!stderr_stop_.load(std::memory_order_relaxed)) {
+			// Use poll() with timeout to allow periodic checking of stderr_stop_
+			// This avoids blocking indefinitely on read() which could cause
+			// the destructor to hang waiting for the thread to join
+			int poll_result = poll(&pfd, 1, 100); // 100ms timeout
+			if (poll_result < 0) {
+				if (errno == EINTR) {
+					continue; // Interrupted by signal, retry
+				}
+				break; // Error
+			}
+			if (poll_result == 0) {
+				continue; // Timeout, check stop flag and poll again
+			}
+
+			// Data available or hangup - read what's available
 			ssize_t bytes_read = read(stderr_fd, buffer, sizeof(buffer) - 1);
 			if (bytes_read <= 0) {
 				break; // EOF or error

@@ -86,10 +86,8 @@ static unique_ptr<LocalTableFunctionState> VgiTableScanInitLocal(ExecutionContex
 	auto current_chunk = make_uniq<ArrowArrayWrapper>();
 	auto local_state = make_uniq<VgiTableScanLocalState>(std::move(current_chunk), context.client);
 
-	// Set up column_ids for projection (identity mapping - we read all columns)
-	for (idx_t i = 0; i < input.column_ids.size(); i++) {
-		local_state->column_ids.push_back(input.column_ids[i]);
-	}
+	// Set up column_ids for projection
+	local_state->column_ids = input.column_ids;
 
 	return local_state;
 }
@@ -175,8 +173,12 @@ TableFunction VgiTableEntry::GetScanFunction(ClientContext &context, unique_ptr<
 	// Convert Arrow schema to DuckDB types for ArrowToDuckDB conversion
 	// The table_info_ contains the Arrow schema from the worker
 	if (table_info_.arrow_schema) {
-		vgi::ArrowSchemaToDuckDBTypes(context, table_info_.arrow_schema, scan_bind_data->c_schema,
-		                              scan_bind_data->arrow_table, return_types, names);
+		try {
+			vgi::ArrowSchemaToDuckDBTypes(context, table_info_.arrow_schema, scan_bind_data->c_schema,
+			                              scan_bind_data->arrow_table, return_types, names);
+		} catch (const std::exception &e) {
+			throw IOException("Failed to convert schema for table '%s': %s", name, e.what());
+		}
 	}
 
 	bind_data = std::move(scan_bind_data);
