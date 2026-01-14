@@ -152,6 +152,22 @@ std::shared_ptr<arrow::RecordBatch> InvokeCatalogMethod(const std::string &worke
 			throw;
 		}
 
+		// Null batch from ReadRecordBatch means EOF (pipe closed)
+		// Check if the worker failed before sending data
+		if (!result.batch) {
+			int exit_status = 0;
+			if (proc.TryWait(&exit_status)) {
+				if (exit_status == 127) {
+					ThrowVgiIOException("VGI worker not found or not executable", worker_path, proc.GetPid(), "");
+				} else if (exit_status == 126) {
+					ThrowVgiIOException("VGI worker permission denied", worker_path, proc.GetPid(), "");
+				} else if (exit_status != 0) {
+					ThrowVgiIOException("VGI worker exited with status %d", worker_path, proc.GetPid(), "", exit_status);
+				}
+			}
+			ThrowVgiIOException("VGI worker closed connection without sending data", worker_path, proc.GetPid(), "");
+		}
+
 		// Check for log messages (will throw on EXCEPTION)
 		// If it was a log message, continue reading the next batch
 		// Note: Catalog methods don't have invocation_id
@@ -212,17 +228,25 @@ std::shared_ptr<arrow::RecordBatch> CatalogMethodStream::ReadNext() {
 				                    exit_status);
 			}
 		}
-		// Check if this is an EOF indicator (invalid IPC stream at end)
-		// The Python worker may signal EOF by closing the pipe or writing
-		// invalid data, which causes specific error messages.
-		std::string error_msg = e.what();
-		if (error_msg.find("Tried reading schema message") != std::string::npos ||
-		    error_msg.find("was null or length 0") != std::string::npos) {
-			finished_ = true;
-			return nullptr;
-		}
-		// Re-throw other errors
+		// Re-throw - ReadRecordBatch now returns null batch for EOF instead of throwing
 		throw;
+	}
+
+	// Null batch from ReadRecordBatch means EOF (pipe closed)
+	// Check if the worker failed before sending data
+	if (!result.batch) {
+		int exit_status = 0;
+		if (proc_->TryWait(&exit_status)) {
+			if (exit_status == 127) {
+				ThrowVgiIOException("VGI worker not found or not executable", worker_path_, proc_->GetPid(), "");
+			} else if (exit_status == 126) {
+				ThrowVgiIOException("VGI worker permission denied", worker_path_, proc_->GetPid(), "");
+			} else if (exit_status != 0) {
+				ThrowVgiIOException("VGI worker exited with status %d", worker_path_, proc_->GetPid(), "", exit_status);
+			}
+		}
+		finished_ = true;
+		return nullptr;
 	}
 
 	// Check for log messages (will throw on EXCEPTION)
@@ -233,8 +257,8 @@ std::shared_ptr<arrow::RecordBatch> CatalogMethodStream::ReadNext() {
 		return ReadNext();
 	}
 
-	// Empty batch or null signals end of stream (but only if not a log message)
-	if (!result.batch || result.batch->num_rows() == 0) {
+	// Empty batch signals end of stream
+	if (result.batch->num_rows() == 0) {
 		finished_ = true;
 		return nullptr;
 	}
@@ -691,15 +715,15 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 	arrow::RecordBatchWithMetadata result;
 	auto read_result = data_reader_->ReadNext();
 	if (!read_result.ok()) {
-		// Check if this is an EOF indicator or actual error
-		std::string error_msg = read_result.status().ToString();
-		if (error_msg.find("end of stream") != std::string::npos ||
-		    error_msg.find("EOF") != std::string::npos) {
+		auto status = read_result.status();
+		// Invalid status from IPC reader typically indicates end-of-stream
+		// (e.g., trying to read past the stream end marker)
+		if (status.IsInvalid()) {
 			data_finished_ = true;
 			return nullptr;
 		}
 		ThrowVgiIOException("Failed to read data batch: %s", worker_path_, proc_ ? proc_->GetPid() : -1,
-		                    GetInvocationIdHex(), error_msg);
+		                    GetInvocationIdHex(), status.ToString());
 	}
 	result = read_result.ValueUnsafe();
 
@@ -732,8 +756,8 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 		}
 	}
 
-	// Empty batch signals end of stream
-	if (result.batch->num_rows() == 0) {
+	// Null or empty batch signals end of stream
+	if (!result.batch || result.batch->num_rows() == 0) {
 		data_finished_ = true;
 		return nullptr;
 	}

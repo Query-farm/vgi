@@ -15,10 +15,10 @@ VGI worker not found or not executable
 statement error
 SELECT * FROM vgi_catalogs('/bin/echo');
 ----
-Failed to open Arrow IPC stream
+VGI worker closed connection without sending data
 
 # Test vgi_catalogs with empty string path
 statement error
 SELECT * FROM vgi_catalogs('');
 ----
-Failed to open Arrow IPC stream
+VGI worker closed connection without sending data

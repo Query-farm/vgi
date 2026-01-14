@@ -96,6 +96,7 @@ arrow::Result<std::shared_ptr<arrow::Buffer>> FdInputStream::Read(int64_t nbytes
 
 // Read a single RecordBatch from a file descriptor
 // This reads one complete IPC stream (schema + 1 batch + EOS marker)
+// Returns a result with null batch if the stream is at EOF (pipe closed, no more data)
 arrow::RecordBatchWithMetadata ReadRecordBatch(int fd, const std::string &worker_path, pid_t worker_pid) {
 	// Wait for data to be available with timeout
 	WaitForReadable(fd);
@@ -104,15 +105,24 @@ arrow::RecordBatchWithMetadata ReadRecordBatch(int fd, const std::string &worker
 
 	auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(input);
 	if (!reader_result.ok()) {
-		ThrowVgiIOException("Failed to open Arrow IPC stream: %s", worker_path, worker_pid, "",
-		                    reader_result.status().ToString());
+		auto status = reader_result.status();
+		// Invalid status when opening typically indicates EOF (no schema to read)
+		if (status.IsInvalid()) {
+			return arrow::RecordBatchWithMetadata{nullptr, nullptr};
+		}
+		ThrowVgiIOException("Failed to open Arrow IPC stream: %s", worker_path, worker_pid, "", status.ToString());
 	}
 	auto reader = reader_result.ValueUnsafe();
 
 	// Use ReadNext() which returns RecordBatchWithMetadata including custom metadata
 	auto result = reader->ReadNext();
 	if (!result.ok()) {
-		ThrowVgiIOException("Failed to read Arrow batch: %s", worker_path, worker_pid, "", result.status().ToString());
+		auto status = result.status();
+		// Invalid status typically indicates end-of-stream
+		if (status.IsInvalid()) {
+			return arrow::RecordBatchWithMetadata{nullptr, nullptr};
+		}
+		ThrowVgiIOException("Failed to read Arrow batch: %s", worker_path, worker_pid, "", status.ToString());
 	}
 	auto batch_with_metadata = result.ValueUnsafe();
 

@@ -33,7 +33,7 @@ struct VgiTableFunctionBindData : public TableFunctionData {
 	// Function identification
 	std::string function_name;
 
-	// Arguments for creating secondary worker connections
+	// Arguments for creating worker connections
 	vgi::ArrowArguments arguments;
 
 	// Schema information (discovered from OutputSpec during bind)
@@ -52,12 +52,6 @@ struct VgiTableFunctionBindData : public TableFunctionData {
 
 	// Features that the worker has activated for this invocation
 	std::unordered_set<std::string> active_features;
-
-	// Connection to worker (created during bind, moved to local state during init)
-	// Protected by connection_mutex for thread-safe handoff to first InitLocal caller.
-	// Mutable because InitLocal needs to move ownership to LocalState.
-	mutable std::mutex connection_mutex;
-	mutable std::unique_ptr<vgi::FunctionConnection> connection;
 };
 
 // ============================================================================
@@ -73,6 +67,11 @@ struct VgiTableFunctionGlobalState : public GlobalTableFunctionState {
 
 	// Progress tracking (atomic for thread safety with progress callback)
 	std::atomic<idx_t> rows_read {0};
+
+	// Primary connection (moved from bind_data during InitGlobal)
+	// Protected by mutex for thread-safe handoff to first InitLocal caller.
+	std::mutex connection_mutex;
+	std::unique_ptr<vgi::FunctionConnection> primary_connection;
 
 	idx_t MaxThreads() const override {
 		return max_processes;
@@ -134,18 +133,19 @@ static unique_ptr<FunctionData> VgiTableFunctionBind(ClientContext &context, Tab
 	         {"num_positional_args", std::to_string(positional_args.size())},
 	         {"num_named_args", std::to_string(named_args.size())}});
 
-	// Build Arrow arguments struct from positional and named args (stored for creating secondary workers)
+	// Build Arrow arguments struct from positional and named args (stored for creating worker connections)
 	bind_data->arguments = vgi::BuildArgumentsFromValues(context, positional_args, named_args);
 
-	// Create connection to worker and perform bind handshake
-	// The connection is persisted and reused in InitGlobal to avoid spawning two workers
-	bind_data->connection = make_uniq<vgi::FunctionConnection>(bind_data->worker_path, bind_data->function_name,
-	                                                           bind_data->arguments, bind_data->attach_id, context);
+	// Create temporary connection to worker to perform bind handshake and get schema.
+	// This connection will close after bind completes; InitGlobal creates a fresh connection.
+	// This approach maintains const-correctness of bind_data after bind completes.
+	vgi::FunctionConnection bind_connection(bind_data->worker_path, bind_data->function_name, bind_data->arguments,
+	                                        bind_data->attach_id, context);
 
 	// Perform bind to get OutputSpec (Streams 1-2)
-	auto output_spec = bind_data->connection->PerformBindFull();
+	auto output_spec = bind_connection.PerformBindFull();
 
-	// Store bind result fields
+	// Store bind result fields for use in InitGlobal
 	bind_data->max_processes = output_spec.max_processes;
 	bind_data->cardinality_estimate = output_spec.cardinality_estimate;
 	bind_data->invocation_id = std::move(output_spec.invocation_id);
@@ -163,13 +163,15 @@ static unique_ptr<FunctionData> VgiTableFunctionBind(ClientContext &context, Tab
 	}
 	VGI_LOG(context, "table_function.bind_result",
 	        {{"worker_path", bind_data->worker_path},
-	         {"worker_pid", std::to_string(bind_data->connection->GetPid())},
+	         {"worker_pid", std::to_string(bind_connection.GetPid())},
 	         {"function_name", bind_data->function_name},
 	         {"invocation_id", bind_data->invocation_id_hex},
 	         {"max_processes", std::to_string(bind_data->max_processes)},
 	         {"cardinality_estimate", std::to_string(bind_data->cardinality_estimate)},
 	         {"active_features", features_str},
 	         {"num_columns", std::to_string(output_spec.output_schema->num_fields())}});
+
+	// bind_connection closes here - InitGlobal will create a fresh connection
 
 	// Convert Arrow schema to DuckDB types using centralized utility
 	vgi::ArrowSchemaToDuckDBTypes(context, output_spec.output_schema, bind_data->c_schema, bind_data->arrow_table,
@@ -193,17 +195,24 @@ static unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientCon
 		projection_ids.push_back(static_cast<int32_t>(col_id));
 	}
 
-	// Perform init phase (Streams 3-4) with projection pushdown.
-	// Note: Connection remains in bind_data here and is moved to local_state in InitLocal.
-	// This is safe because DuckDB guarantees InitGlobal completes before InitLocal is called.
-	auto init_result = bind_data.connection->PerformInit(projection_ids);
+	// Create fresh connection for execution (bind phase connection was temporary)
+	auto connection = make_uniq<vgi::FunctionConnection>(bind_data.worker_path, bind_data.function_name,
+	                                                     bind_data.arguments, bind_data.attach_id, context);
+
+	// Perform bind handshake (Streams 1-2) to establish this as the primary worker
+	connection->PerformBindFull();
+
+	// Perform init phase (Streams 3-4) with projection pushdown
+	auto init_result = connection->PerformInit(projection_ids);
 
 	auto global_state = make_uniq<VgiTableFunctionGlobalState>();
 	global_state->global_execution_id = std::move(init_result.global_execution_identifier);
 	global_state->max_processes = static_cast<idx_t>(bind_data.max_processes);
+	global_state->primary_connection = std::move(connection);
 
 	VGI_LOG(context, "table_function.init_global",
 	        {{"worker_path", bind_data.worker_path},
+	         {"worker_pid", std::to_string(global_state->primary_connection->GetPid())},
 	         {"invocation_id", bind_data.invocation_id_hex},
 	         {"function_name", bind_data.function_name},
 	         {"global_execution_id", BytesToHex(global_state->global_execution_id)},
@@ -226,12 +235,12 @@ static unique_ptr<LocalTableFunctionState> VgiTableFunctionInitLocal(ExecutionCo
 	auto current_chunk = make_uniq<ArrowArrayWrapper>();
 	auto local_state = make_uniq<VgiTableFunctionLocalState>(std::move(current_chunk), context.client);
 
-	// Try to claim the primary connection (thread-safe check-and-move)
+	// Try to claim the primary connection from global_state (thread-safe check-and-move)
 	std::unique_ptr<vgi::FunctionConnection> primary_connection;
 	{
-		std::lock_guard<std::mutex> lock(bind_data.connection_mutex);
-		if (bind_data.connection) {
-			primary_connection = std::move(bind_data.connection);
+		std::lock_guard<std::mutex> lock(global_state.connection_mutex);
+		if (global_state.primary_connection) {
+			primary_connection = std::move(global_state.primary_connection);
 		}
 	}
 
@@ -255,7 +264,7 @@ static unique_ptr<LocalTableFunctionState> VgiTableFunctionInitLocal(ExecutionCo
 		// Perform bind for secondary worker
 		// The worker uses global_execution_id to identify this as a secondary worker
 		// and retrieves shared state instead of initializing new state
-		local_state->connection->PerformBindFull();
+		auto secondary_output_spec = local_state->connection->PerformBindFull();
 
 		// For secondary workers, send InitInput but skip reading InitResult
 		// (the Python worker doesn't write InitResult for secondary workers)
@@ -264,6 +273,7 @@ static unique_ptr<LocalTableFunctionState> VgiTableFunctionInitLocal(ExecutionCo
 		VGI_LOG(context.client, "table_function.init_local",
 		        {{"worker_path", bind_data.worker_path},
 		         {"worker_pid", std::to_string(local_state->connection->GetPid())},
+		         {"invocation_id", BytesToHex(secondary_output_spec.invocation_id)},
 		         {"function_name", bind_data.function_name},
 		         {"global_execution_id", BytesToHex(global_state.global_execution_id)},
 		         {"worker_type", "secondary"}});
