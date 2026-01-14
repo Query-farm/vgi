@@ -13,16 +13,17 @@ namespace duckdb {
 namespace vgi {
 
 // Convert binary bytes to hex string for logging/exceptions
+// Uses lookup table for efficiency instead of snprintf per byte
 inline std::string BytesToHex(const std::vector<uint8_t> &bytes) {
+	static constexpr char hex_chars[] = "0123456789abcdef";
 	if (bytes.empty()) {
 		return "";
 	}
 	std::string result;
-	result.reserve(bytes.size() * 2);
-	for (auto b : bytes) {
-		char buf[3];
-		snprintf(buf, sizeof(buf), "%02x", b);
-		result += buf;
+	result.resize(bytes.size() * 2);
+	for (size_t i = 0; i < bytes.size(); i++) {
+		result[i * 2] = hex_chars[bytes[i] >> 4];
+		result[i * 2 + 1] = hex_chars[bytes[i] & 0x0F];
 	}
 	return result;
 }

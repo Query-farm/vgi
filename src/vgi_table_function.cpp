@@ -136,6 +136,9 @@ static unique_ptr<FunctionData> VgiTableFunctionBind(ClientContext &context, Tab
 	// Build Arrow arguments struct from positional and named args (stored for creating worker connections)
 	bind_data->arguments = vgi::BuildArgumentsFromValues(context, positional_args, named_args);
 
+	// Validate that arguments type is a struct (defensive check)
+	D_ASSERT(!bind_data->arguments.type || bind_data->arguments.type->id() == arrow::Type::STRUCT);
+
 	// Create temporary connection to worker to perform bind handshake and get schema.
 	// This connection will close after bind completes; InitGlobal creates a fresh connection.
 	// This approach maintains const-correctness of bind_data after bind completes.

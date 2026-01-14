@@ -59,18 +59,24 @@ SubProcess::SubProcess(const std::string &command, bool stderr_passthrough) {
 	if (pid_ == 0) {
 		// Child process
 		// Redirect stdin
-		dup2(stdin_pipe.read_fd, STDIN_FILENO);
+		if (dup2(stdin_pipe.read_fd, STDIN_FILENO) < 0) {
+			_exit(126); // dup2 failed
+		}
 		stdin_pipe.CloseRead();
 		stdin_pipe.CloseWrite();
 
 		// Redirect stdout
-		dup2(stdout_pipe.write_fd, STDOUT_FILENO);
+		if (dup2(stdout_pipe.write_fd, STDOUT_FILENO) < 0) {
+			_exit(126); // dup2 failed
+		}
 		stdout_pipe.CloseRead();
 		stdout_pipe.CloseWrite();
 
 		// Redirect stderr (only if not passthrough)
 		if (!stderr_passthrough) {
-			dup2(stderr_pipe.write_fd, STDERR_FILENO);
+			if (dup2(stderr_pipe.write_fd, STDERR_FILENO) < 0) {
+				_exit(126); // dup2 failed
+			}
 			stderr_pipe.CloseRead();
 			stderr_pipe.CloseWrite();
 		} else {

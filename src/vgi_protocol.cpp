@@ -427,18 +427,12 @@ OutputSpecResult ParseOutputSpec(const std::shared_ptr<arrow::RecordBatch> &batc
 		throw IOException("OutputSpec missing output_schema field");
 	}
 
-	// Get max_processes (int64 from worker, nullable)
+	// Get max_processes (int64, nullable)
 	auto max_processes_col = batch->GetColumnByName("max_processes");
 	if (max_processes_col) {
 		auto int64_array = std::dynamic_pointer_cast<arrow::Int64Array>(max_processes_col);
 		if (int64_array && !int64_array->IsNull(0)) {
 			result.max_processes = static_cast<int32_t>(int64_array->Value(0));
-		} else {
-			// Try int32 as fallback
-			auto int32_array = std::dynamic_pointer_cast<arrow::Int32Array>(max_processes_col);
-			if (int32_array && !int32_array->IsNull(0)) {
-				result.max_processes = int32_array->Value(0);
-			}
 		}
 	}
 	if (result.max_processes <= 0) {
