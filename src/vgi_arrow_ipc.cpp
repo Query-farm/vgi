@@ -63,26 +63,28 @@ arrow::Result<int64_t> FdInputStream::Read(int64_t nbytes, void *out) {
 		return arrow::Status::Invalid("Stream is closed");
 	}
 
-	// Wait for data with timeout before blocking read
-	try {
-		WaitForReadable(fd_);
-	} catch (const std::exception &e) {
-		return arrow::Status::IOError("Timeout waiting for data: ", e.what());
-	}
+	// Loop until we have all requested bytes or hit EOF.
+	// Pipes may return partial reads, so we must loop.
+	uint8_t *buffer = static_cast<uint8_t *>(out);
+	int64_t total_bytes_read = 0;
 
-	ssize_t bytes_read;
-	while (true) {
-		bytes_read = read(fd_, out, nbytes);
-		if (bytes_read >= 0) {
+	while (total_bytes_read < nbytes) {
+		ssize_t bytes_read = read(fd_, buffer + total_bytes_read, nbytes - total_bytes_read);
+		if (bytes_read == -1) {
+			if (errno == EINTR) {
+				continue;
+			}
+			return arrow::Status::IOError("Read error: ", strerror(errno));
+		}
+		if (bytes_read == 0) {
+			// EOF
 			break;
 		}
-		if (errno == EINTR) {
-			continue; // Interrupted by signal, retry
-		}
-		return arrow::Status::IOError("Read error: ", strerror(errno));
+		total_bytes_read += bytes_read;
 	}
-	position_ += bytes_read;
-	return bytes_read;
+
+	position_ += total_bytes_read;
+	return total_bytes_read;
 }
 
 arrow::Result<std::shared_ptr<arrow::Buffer>> FdInputStream::Read(int64_t nbytes) {
@@ -95,9 +97,6 @@ arrow::Result<std::shared_ptr<arrow::Buffer>> FdInputStream::Read(int64_t nbytes
 // Read a single RecordBatch from a file descriptor
 // This reads one complete IPC stream (schema + 1 batch + EOS marker)
 arrow::RecordBatchWithMetadata ReadRecordBatch(int fd, const std::string &worker_path, pid_t worker_pid) {
-	// Wait for data to be available with timeout
-	WaitForReadable(fd);
-
 	auto input = std::make_shared<FdInputStream>(fd);
 
 	auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(input);

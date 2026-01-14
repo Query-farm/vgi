@@ -1,9 +1,12 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <arrow/api.h>
@@ -333,6 +336,19 @@ private:
 	// The data phase uses a single long-lived IPC stream with multiple batches
 	std::shared_ptr<arrow::io::InputStream> data_stream_;
 	std::shared_ptr<arrow::ipc::RecordBatchStreamReader> data_reader_;
+
+	// Stderr reader thread - reads stderr and buffers lines for main thread to log
+	std::thread stderr_thread_;
+	std::atomic<bool> stderr_stop_{false};
+	std::mutex stderr_mutex_;
+	std::vector<std::string> stderr_lines_;
+
+	// Start stderr reader thread (called after spawning worker)
+	void StartStderrReader();
+	// Stop stderr reader thread (called in destructor)
+	void StopStderrReader();
+	// Drain buffered stderr lines and log them via VGI_LOG (call from main thread)
+	void DrainStderrLog();
 };
 
 } // namespace vgi

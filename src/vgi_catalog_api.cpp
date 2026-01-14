@@ -594,6 +594,13 @@ FunctionConnection::FunctionConnection(const std::string &worker_path, const std
 }
 
 FunctionConnection::~FunctionConnection() {
+	// Stop stderr reader thread first
+	StopStderrReader();
+	// Drain any remaining stderr (can't log without context, just discard)
+	{
+		std::lock_guard<std::mutex> lock(stderr_mutex_);
+		stderr_lines_.clear();
+	}
 	// SubProcess destructor handles termination:
 	// - Non-blocking check if process already exited
 	// - SIGTERM + wait if still running
@@ -608,6 +615,9 @@ OutputSpecResult FunctionConnection::PerformBindFull() {
 
 	// Spawn the worker process
 	proc_ = std::make_unique<SubProcess>(worker_path_, worker_debug_);
+
+	// Start stderr reader thread to prevent pipe buffer from blocking worker
+	StartStderrReader();
 
 	// Log the invocation request
 	int64_t num_args = arguments_array_ ? arguments_array_->length() : 0;
@@ -764,6 +774,9 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 		return nullptr;
 	}
 
+	// Drain any buffered stderr to logging
+	DrainStderrLog();
+
 	// Read from the persistent data stream reader
 	arrow::RecordBatchWithMetadata result;
 	auto read_result = data_reader_->ReadNext();
@@ -830,6 +843,75 @@ int FunctionConnection::Wait() {
 		return 0;
 	}
 	return proc_->Wait();
+}
+
+void FunctionConnection::StartStderrReader() {
+	if (!proc_ || proc_->GetStderrFd() < 0) {
+		return; // No stderr to read (passthrough mode or no process)
+	}
+
+	int stderr_fd = proc_->ReleaseStderrFd();
+
+	stderr_thread_ = std::thread([this, stderr_fd]() {
+		char buffer[4096];
+		std::string line_buffer;
+
+		while (!stderr_stop_.load(std::memory_order_relaxed)) {
+			ssize_t bytes_read = read(stderr_fd, buffer, sizeof(buffer) - 1);
+			if (bytes_read <= 0) {
+				break; // EOF or error
+			}
+			buffer[bytes_read] = '\0';
+
+			// Append to line buffer and process complete lines
+			line_buffer.append(buffer, bytes_read);
+			size_t pos;
+			while ((pos = line_buffer.find('\n')) != std::string::npos) {
+				std::string line = line_buffer.substr(0, pos);
+				line_buffer.erase(0, pos + 1);
+
+				// Trim trailing \r if present
+				if (!line.empty() && line.back() == '\r') {
+					line.pop_back();
+				}
+				if (!line.empty()) {
+					std::lock_guard<std::mutex> lock(stderr_mutex_);
+					stderr_lines_.push_back(std::move(line));
+				}
+			}
+		}
+
+		// Buffer any remaining partial line
+		if (!line_buffer.empty()) {
+			std::lock_guard<std::mutex> lock(stderr_mutex_);
+			stderr_lines_.push_back(std::move(line_buffer));
+		}
+
+		close(stderr_fd);
+	});
+}
+
+void FunctionConnection::StopStderrReader() {
+	stderr_stop_.store(true, std::memory_order_relaxed);
+	if (stderr_thread_.joinable()) {
+		stderr_thread_.join();
+	}
+}
+
+void FunctionConnection::DrainStderrLog() {
+	std::vector<std::string> lines;
+	{
+		std::lock_guard<std::mutex> lock(stderr_mutex_);
+		lines.swap(stderr_lines_);
+	}
+
+	pid_t worker_pid = proc_ ? proc_->GetPid() : -1;
+	for (const auto &line : lines) {
+		VGI_LOG(context_, "worker.stderr",
+		        {{"worker_path", worker_path_},
+		         {"worker_pid", std::to_string(worker_pid)},
+		         {"message", line}});
+	}
 }
 
 } // namespace vgi
