@@ -22,7 +22,7 @@ namespace {
 std::vector<std::string> GetCatalogsFromWorker(ClientContext &context, const std::string &worker_path) {
 	auto start_time = std::chrono::steady_clock::now();
 
-	DUCKDB_LOG(context, VgiLogType, "catalog.start", {{"worker_path", worker_path}, {"method", "catalogs"}});
+	VGI_LOG(context, "catalog.start", {{"worker_path", worker_path}, {"method", "catalogs"}});
 
 	try {
 		// Invoke the catalogs method
@@ -35,7 +35,7 @@ std::vector<std::string> GetCatalogsFromWorker(ClientContext &context, const std
 		auto end_time = std::chrono::steady_clock::now();
 		auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
 
-		DUCKDB_LOG(context, VgiLogType, "catalog.complete",
+		VGI_LOG(context, "catalog.complete",
 		           {{"worker_path", worker_path},
 		            {"method", "catalogs"},
 		            {"num_catalogs", std::to_string(catalogs.size())},

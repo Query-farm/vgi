@@ -24,5 +24,6 @@ All tests can complete in less than 10 seconds.
 
 ## Debug Environment Variables
 
+- `VGI_STDERR_LOG=1` - Write VGI log events to stderr in addition to DuckDB's logging system. Useful for debugging protocol issues when DuckDB hangs and normal logging is unavailable.
 - `VGI_IPC_DEBUG=1` - Enable IPC debugging output from the worker process
 - `VGI_WORKER_STDERR_PASSTHROUGH=1` - Pass worker stderr directly to the terminal instead of capturing it (useful for seeing Python tracebacks and debug output)

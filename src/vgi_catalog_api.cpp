@@ -92,7 +92,7 @@ bool HandleBatchLogMessage(const std::shared_ptr<arrow::RecordBatch> &batch,
 			info.emplace_back("traceback", traceback);
 		}
 
-		DUCKDB_LOG(*context, VgiLogType, log_message, info);
+		VGI_LOG(*context, log_message, info);
 	}
 
 	return true;
@@ -611,11 +611,11 @@ OutputSpecResult FunctionConnection::PerformBindFull() {
 
 	// Log the invocation request
 	int64_t num_args = arguments_array_ ? arguments_array_->length() : 0;
-	DUCKDB_LOG(context_, VgiLogType, "function_connection.invoke",
-	           {{"worker_path", worker_path_},
-	            {"worker_pid", std::to_string(proc_->GetPid())},
-	            {"function_name", function_name_},
-	            {"num_args", std::to_string(num_args)}});
+	VGI_LOG(context_, "function_connection.invoke",
+	        {{"worker_path", worker_path_},
+	         {"worker_pid", std::to_string(proc_->GetPid())},
+	         {"function_name", function_name_},
+	         {"num_args", std::to_string(num_args)}});
 
 	// Stream 1: Send Invocation
 	auto invocation =

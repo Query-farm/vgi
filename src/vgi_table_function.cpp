@@ -117,7 +117,7 @@ static unique_ptr<FunctionData> VgiTableFunctionBind(ClientContext &context, Tab
 	}
 
 	// Log the invocation
-	DUCKDB_LOG(context, VgiLogType, "table_function.bind",
+	VGI_LOG(context, "table_function.bind",
 	           {{"worker_path", bind_data->worker_path},
 	            {"function_name", bind_data->function_name},
 	            {"num_args", std::to_string(positional_args.size())}});
@@ -150,7 +150,7 @@ static unique_ptr<FunctionData> VgiTableFunctionBind(ClientContext &context, Tab
 		}
 		features_str += f;
 	}
-	DUCKDB_LOG(context, VgiLogType, "table_function.bind_result",
+	VGI_LOG(context, "table_function.bind_result",
 	           {{"worker_path", bind_data->worker_path},
 	            {"worker_pid", std::to_string(bind_data->worker_pid)},
 	            {"function_name", bind_data->function_name},
@@ -191,7 +191,7 @@ static unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientCon
 	global_state->global_execution_id = std::move(init_result.global_execution_identifier);
 	global_state->max_processes = static_cast<idx_t>(bind_data.max_processes);
 
-	DUCKDB_LOG(context, VgiLogType, "table_function.init_global",
+	VGI_LOG(context, "table_function.init_global",
 	           {{"worker_path", bind_data.worker_path},
 	            {"invocation_id", bind_data.invocation_id_hex},
 	            {"function_name", bind_data.function_name},
@@ -226,7 +226,7 @@ static unique_ptr<LocalTableFunctionState> VgiTableFunctionInitLocal(ExecutionCo
 
 	if (primary_connection) {
 		// Primary worker: use connection from bind phase
-		DUCKDB_LOG(context.client, VgiLogType, "table_function.init_local",
+		VGI_LOG(context.client, "table_function.init_local",
 		           {{"worker_path", bind_data.worker_path},
 		            {"worker_pid", std::to_string(primary_connection->GetPid())},
 		            {"invocation_id", bind_data.invocation_id_hex},
@@ -250,7 +250,7 @@ static unique_ptr<LocalTableFunctionState> VgiTableFunctionInitLocal(ExecutionCo
 		// (the Python worker doesn't write InitResult for secondary workers)
 		local_state->connection->SkipInit();
 
-		DUCKDB_LOG(context.client, VgiLogType, "table_function.init_local",
+		VGI_LOG(context.client, "table_function.init_local",
 		           {{"worker_path", bind_data.worker_path},
 		            {"worker_pid", std::to_string(local_state->connection->GetPid())},
 		            {"function_name", bind_data.function_name},
@@ -276,7 +276,7 @@ static bool GetNextBatch(ClientContext &context, const VgiTableFunctionBindData 
 	auto arrow_batch = local_state.connection->ReadDataBatch();
 	if (!arrow_batch) {
 		local_state.done = true;
-		DUCKDB_LOG(context, VgiLogType, "table_function.scan_complete",
+		VGI_LOG(context, "table_function.scan_complete",
 		           {{"worker_path", bind_data.worker_path},
 		            {"worker_pid", std::to_string(worker_pid)},
 		            {"invocation_id", bind_data.invocation_id_hex},
@@ -292,7 +292,7 @@ static bool GetNextBatch(ClientContext &context, const VgiTableFunctionBindData 
 	local_state.chunk_offset = 0;
 	local_state.Reset();
 
-	DUCKDB_LOG(context, VgiLogType, "table_function.batch_received",
+	VGI_LOG(context, "table_function.batch_received",
 	           {{"worker_path", bind_data.worker_path},
 	            {"worker_pid", std::to_string(local_state.connection->GetPid())},
 	            {"invocation_id", bind_data.invocation_id_hex},
