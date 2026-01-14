@@ -44,21 +44,6 @@ std::shared_ptr<arrow::RecordBatch> CreateFunctionGetArgs(const std::vector<uint
                                                           const std::string &schema_name,
                                                           const std::string &function_name);
 
-// Create the VGI Invocation RecordBatch for a function invocation
-// Unlike catalog invocations, this uses function_type="function"
-std::shared_ptr<arrow::RecordBatch> CreateFunctionInvocation(const std::string &function_name);
-
-// Create arguments batch for function_invoke method
-// positional_args: JSON-encoded array of positional arguments
-// named_args: map of named arguments (string keys, JSON-encoded values)
-// projection_ids: optional list of column indices for projection pushdown
-std::shared_ptr<arrow::RecordBatch> CreateFunctionInvokeArgs(const std::vector<uint8_t> &attach_id,
-                                                              const std::string &schema_name,
-                                                              const std::string &function_name,
-                                                              const std::string &positional_args_json,
-                                                              const std::vector<std::pair<std::string, std::string>> &named_args,
-                                                              const std::vector<int32_t> &projection_ids = {});
-
 // ============================================================================
 // Function Protocol - Proper 6-Stream Implementation
 // ============================================================================

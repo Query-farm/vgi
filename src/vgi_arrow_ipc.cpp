@@ -78,7 +78,7 @@ arrow::Result<int64_t> FdInputStream::Read(int64_t nbytes, void *out) {
 		}
 		if (bytes_read == 0) {
 			// EOF
-			break;
+			return 0;
 		}
 		total_bytes_read += bytes_read;
 	}
@@ -97,6 +97,9 @@ arrow::Result<std::shared_ptr<arrow::Buffer>> FdInputStream::Read(int64_t nbytes
 // Read a single RecordBatch from a file descriptor
 // This reads one complete IPC stream (schema + 1 batch + EOS marker)
 arrow::RecordBatchWithMetadata ReadRecordBatch(int fd, const std::string &worker_path, pid_t worker_pid) {
+	// Wait for data to be available with timeout
+	WaitForReadable(fd);
+
 	auto input = std::make_shared<FdInputStream>(fd);
 
 	auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(input);
@@ -109,8 +112,7 @@ arrow::RecordBatchWithMetadata ReadRecordBatch(int fd, const std::string &worker
 	// Use ReadNext() which returns RecordBatchWithMetadata including custom metadata
 	auto result = reader->ReadNext();
 	if (!result.ok()) {
-		ThrowVgiIOException("Failed to read Arrow batch: %s", worker_path, worker_pid, "",
-		                    result.status().ToString());
+		ThrowVgiIOException("Failed to read Arrow batch: %s", worker_path, worker_pid, "", result.status().ToString());
 	}
 	auto batch_with_metadata = result.ValueUnsafe();
 

@@ -118,9 +118,9 @@ static unique_ptr<FunctionData> VgiTableFunctionBind(ClientContext &context, Tab
 
 	// Log the invocation
 	VGI_LOG(context, "table_function.bind",
-	           {{"worker_path", bind_data->worker_path},
-	            {"function_name", bind_data->function_name},
-	            {"num_args", std::to_string(positional_args.size())}});
+	        {{"worker_path", bind_data->worker_path},
+	         {"function_name", bind_data->function_name},
+	         {"num_args", std::to_string(positional_args.size())}});
 
 	// Build Arrow arguments struct from positional args (stored for creating secondary workers)
 	bind_data->arguments = vgi::BuildArgumentsFromValues(context, positional_args);
@@ -151,14 +151,14 @@ static unique_ptr<FunctionData> VgiTableFunctionBind(ClientContext &context, Tab
 		features_str += f;
 	}
 	VGI_LOG(context, "table_function.bind_result",
-	           {{"worker_path", bind_data->worker_path},
-	            {"worker_pid", std::to_string(bind_data->worker_pid)},
-	            {"function_name", bind_data->function_name},
-	            {"invocation_id", bind_data->invocation_id_hex},
-	            {"max_processes", std::to_string(bind_data->max_processes)},
-	            {"cardinality_estimate", std::to_string(bind_data->cardinality_estimate)},
-	            {"active_features", features_str},
-	            {"num_columns", std::to_string(output_spec.output_schema->num_fields())}});
+	        {{"worker_path", bind_data->worker_path},
+	         {"worker_pid", std::to_string(bind_data->worker_pid)},
+	         {"function_name", bind_data->function_name},
+	         {"invocation_id", bind_data->invocation_id_hex},
+	         {"max_processes", std::to_string(bind_data->max_processes)},
+	         {"cardinality_estimate", std::to_string(bind_data->cardinality_estimate)},
+	         {"active_features", features_str},
+	         {"num_columns", std::to_string(output_spec.output_schema->num_fields())}});
 
 	// Convert Arrow schema to DuckDB types using centralized utility
 	vgi::ArrowSchemaToDuckDBTypes(context, output_spec.output_schema, bind_data->c_schema, bind_data->arrow_table,
@@ -192,12 +192,12 @@ static unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientCon
 	global_state->max_processes = static_cast<idx_t>(bind_data.max_processes);
 
 	VGI_LOG(context, "table_function.init_global",
-	           {{"worker_path", bind_data.worker_path},
-	            {"invocation_id", bind_data.invocation_id_hex},
-	            {"function_name", bind_data.function_name},
-	            {"global_execution_id", BytesToHex(global_state->global_execution_id)},
-	            {"max_processes", std::to_string(global_state->max_processes)},
-	            {"num_projection_columns", std::to_string(projection_ids.size())}});
+	        {{"worker_path", bind_data.worker_path},
+	         {"invocation_id", bind_data.invocation_id_hex},
+	         {"function_name", bind_data.function_name},
+	         {"global_execution_id", BytesToHex(global_state->global_execution_id)},
+	         {"max_processes", std::to_string(global_state->max_processes)},
+	         {"num_projection_columns", std::to_string(projection_ids.size())}});
 
 	return global_state;
 }
@@ -227,19 +227,19 @@ static unique_ptr<LocalTableFunctionState> VgiTableFunctionInitLocal(ExecutionCo
 	if (primary_connection) {
 		// Primary worker: use connection from bind phase
 		VGI_LOG(context.client, "table_function.init_local",
-		           {{"worker_path", bind_data.worker_path},
-		            {"worker_pid", std::to_string(primary_connection->GetPid())},
-		            {"invocation_id", bind_data.invocation_id_hex},
-		            {"function_name", bind_data.function_name},
-		            {"global_execution_id", BytesToHex(global_state.global_execution_id)},
-		            {"worker_type", "primary"}});
+		        {{"worker_path", bind_data.worker_path},
+		         {"worker_pid", std::to_string(primary_connection->GetPid())},
+		         {"invocation_id", bind_data.invocation_id_hex},
+		         {"function_name", bind_data.function_name},
+		         {"global_execution_id", BytesToHex(global_state.global_execution_id)},
+		         {"worker_type", "primary"}});
 
 		local_state->connection = std::move(primary_connection);
 	} else {
 		// Secondary worker: create new connection with global_execution_id
-		local_state->connection = make_uniq<vgi::FunctionConnection>(
-		    bind_data.worker_path, bind_data.function_name, bind_data.arguments, bind_data.attach_id, context.client,
-		    global_state.global_execution_id);
+		local_state->connection =
+		    make_uniq<vgi::FunctionConnection>(bind_data.worker_path, bind_data.function_name, bind_data.arguments,
+		                                       bind_data.attach_id, context.client, global_state.global_execution_id);
 
 		// Perform bind for secondary worker
 		// The worker uses global_execution_id to identify this as a secondary worker
@@ -251,11 +251,11 @@ static unique_ptr<LocalTableFunctionState> VgiTableFunctionInitLocal(ExecutionCo
 		local_state->connection->SkipInit();
 
 		VGI_LOG(context.client, "table_function.init_local",
-		           {{"worker_path", bind_data.worker_path},
-		            {"worker_pid", std::to_string(local_state->connection->GetPid())},
-		            {"function_name", bind_data.function_name},
-		            {"global_execution_id", BytesToHex(global_state.global_execution_id)},
-		            {"worker_type", "secondary"}});
+		        {{"worker_path", bind_data.worker_path},
+		         {"worker_pid", std::to_string(local_state->connection->GetPid())},
+		         {"function_name", bind_data.function_name},
+		         {"global_execution_id", BytesToHex(global_state.global_execution_id)},
+		         {"worker_type", "secondary"}});
 	}
 
 	return local_state;
@@ -277,10 +277,10 @@ static bool GetNextBatch(ClientContext &context, const VgiTableFunctionBindData 
 	if (!arrow_batch) {
 		local_state.done = true;
 		VGI_LOG(context, "table_function.scan_complete",
-		           {{"worker_path", bind_data.worker_path},
-		            {"worker_pid", std::to_string(worker_pid)},
-		            {"invocation_id", bind_data.invocation_id_hex},
-		            {"function_name", bind_data.function_name}});
+		        {{"worker_path", bind_data.worker_path},
+		         {"worker_pid", std::to_string(worker_pid)},
+		         {"invocation_id", bind_data.invocation_id_hex},
+		         {"function_name", bind_data.function_name}});
 		return false;
 	}
 
@@ -293,11 +293,11 @@ static bool GetNextBatch(ClientContext &context, const VgiTableFunctionBindData 
 	local_state.Reset();
 
 	VGI_LOG(context, "table_function.batch_received",
-	           {{"worker_path", bind_data.worker_path},
-	            {"worker_pid", std::to_string(local_state.connection->GetPid())},
-	            {"invocation_id", bind_data.invocation_id_hex},
-	            {"function_name", bind_data.function_name},
-	            {"batch_rows", std::to_string(arrow_batch->num_rows())}});
+	        {{"worker_path", bind_data.worker_path},
+	         {"worker_pid", std::to_string(local_state.connection->GetPid())},
+	         {"invocation_id", bind_data.invocation_id_hex},
+	         {"function_name", bind_data.function_name},
+	         {"batch_rows", std::to_string(arrow_batch->num_rows())}});
 
 	return true;
 }
@@ -372,26 +372,12 @@ static double VgiTableFunctionProgress(ClientContext &context, const FunctionDat
 
 	if (bind_data.cardinality_estimate > 0) {
 		idx_t rows_read = global_state.rows_read.load();
-		double progress = (static_cast<double>(rows_read) /
-		                   static_cast<double>(bind_data.cardinality_estimate)) * 100.0;
+		double progress =
+		    (static_cast<double>(rows_read) / static_cast<double>(bind_data.cardinality_estimate)) * 100.0;
 		progress = MinValue(progress, 100.0);
-		VGI_LOG(context, "table_function.progress",
-		        {{"worker_path", bind_data.worker_path},
-		         {"function_name", bind_data.function_name},
-		         {"invocation_id", bind_data.invocation_id_hex},
-		         {"rows_read", std::to_string(rows_read)},
-		         {"cardinality_estimate", std::to_string(bind_data.cardinality_estimate)},
-		         {"progress_percent", std::to_string(progress)}});
 		return progress;
 	}
 
-	VGI_LOG(context, "table_function.progress",
-	        {{"worker_path", bind_data.worker_path},
-	         {"function_name", bind_data.function_name},
-	         {"invocation_id", bind_data.invocation_id_hex},
-	         {"rows_read", std::to_string(global_state.rows_read.load())},
-	         {"cardinality_estimate", "unknown"},
-	         {"progress_percent", "-1"}});
 	// No estimate available
 	return -1.0;
 }

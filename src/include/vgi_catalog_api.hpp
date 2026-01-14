@@ -195,43 +195,6 @@ VgiFunctionInfo GetFunctionInfo(const std::string &worker_path, const std::vecto
                                 const std::string &schema_name, const std::string &function_name,
                                 ClientContext &context, bool worker_debug = false);
 
-// Streaming interface for function invocation (legacy - uses catalog-style protocol).
-// Use this to invoke a table function and stream results.
-class FunctionInvokeStream {
-public:
-	// Start a streaming function invocation
-	// positional_args_json: JSON-encoded array of positional arguments
-	// named_args: map of named argument name to JSON-encoded value
-	FunctionInvokeStream(const std::string &worker_path, const std::vector<uint8_t> &attach_id,
-	                     const std::string &schema_name, const std::string &function_name,
-	                     const std::string &positional_args_json,
-	                     const std::vector<std::pair<std::string, std::string>> &named_args,
-	                     const std::vector<int32_t> &projection_ids, ClientContext &context,
-	                     bool worker_debug = false);
-	~FunctionInvokeStream();
-
-	// Read the next result batch. Returns nullptr at end of stream.
-	std::shared_ptr<arrow::RecordBatch> ReadNext();
-
-	// Wait for the worker process to exit. Called automatically by destructor.
-	int Wait();
-
-	// Check if stream has finished
-	bool IsFinished() const {
-		return finished_;
-	}
-
-	// Non-copyable
-	FunctionInvokeStream(const FunctionInvokeStream &) = delete;
-	FunctionInvokeStream &operator=(const FunctionInvokeStream &) = delete;
-
-private:
-	std::unique_ptr<SubProcess> proc_;
-	ClientContext &context_;
-	std::string worker_path_;
-	bool finished_ = false;
-};
-
 // ============================================================================
 // Function Connection - Proper 6-Stream Protocol
 // ============================================================================

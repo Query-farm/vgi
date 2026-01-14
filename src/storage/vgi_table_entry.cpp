@@ -1,11 +1,15 @@
 #include "storage/vgi_table_entry.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
+#include "duckdb/common/arrow/arrow_wrapper.hpp"
+#include "duckdb/function/table/arrow.hpp"
+#include "duckdb/function/table/arrow/arrow_duck_schema.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/storage/table_storage_info.hpp"
 
 #include "storage/vgi_catalog.hpp"
+#include "vgi_arrow_utils.hpp"
 #include "vgi_catalog_api.hpp"
 #include "vgi_protocol.hpp"
 
@@ -32,14 +36,26 @@ struct VgiTableScanBindData : public TableFunctionData {
 	std::vector<std::string> column_names;
 	std::vector<LogicalType> column_types;
 	bool worker_debug = false;
+
+	// Arrow schema for type conversion
+	ArrowSchemaWrapper c_schema;
+	ArrowTableSchema arrow_table;
 };
 
 // Global state for VGI table scan
 struct VgiTableScanGlobalState : public GlobalTableFunctionState {
 	std::unique_ptr<vgi::CatalogMethodStream> stream;
+	bool done = false;
 
 	idx_t MaxThreads() const override {
 		return 1;
+	}
+};
+
+// Local state for VGI table scan - extends ArrowScanLocalState for Arrow conversion
+struct VgiTableScanLocalState : public ArrowScanLocalState {
+	explicit VgiTableScanLocalState(unique_ptr<ArrowArrayWrapper> current_chunk, ClientContext &ctx)
+	    : ArrowScanLocalState(std::move(current_chunk), ctx) {
 	}
 };
 
@@ -49,112 +65,88 @@ static unique_ptr<FunctionData> VgiTableScanBind(ClientContext &context, TableFu
 	throw InternalException("VgiTableScanBind should not be called directly");
 }
 
-// Init function for VGI table scan
-static unique_ptr<GlobalTableFunctionState> VgiTableScanInit(ClientContext &context, TableFunctionInitInput &input) {
+// Global init function for VGI table scan
+static unique_ptr<GlobalTableFunctionState> VgiTableScanInitGlobal(ClientContext &context,
+                                                                    TableFunctionInitInput &input) {
 	auto &bind_data = input.bind_data->Cast<VgiTableScanBindData>();
 	auto state = make_uniq<VgiTableScanGlobalState>();
 
 	// Create streaming method call for table_scan
 	auto args = vgi::CreateTableGetArgs(bind_data.attach_id, bind_data.schema_name, bind_data.table_name);
-	state->stream = make_uniq<vgi::CatalogMethodStream>(bind_data.worker_path, "table_scan", args, context, bind_data.worker_debug);
+	state->stream =
+	    make_uniq<vgi::CatalogMethodStream>(bind_data.worker_path, "table_scan", args, context, bind_data.worker_debug);
 
 	return state;
 }
 
+// Local init function for VGI table scan
+static unique_ptr<LocalTableFunctionState> VgiTableScanInitLocal(ExecutionContext &context,
+                                                                  TableFunctionInitInput &input,
+                                                                  GlobalTableFunctionState *global_state_p) {
+	auto current_chunk = make_uniq<ArrowArrayWrapper>();
+	auto local_state = make_uniq<VgiTableScanLocalState>(std::move(current_chunk), context.client);
+
+	// Set up column_ids for projection (identity mapping - we read all columns)
+	for (idx_t i = 0; i < input.column_ids.size(); i++) {
+		local_state->column_ids.push_back(input.column_ids[i]);
+	}
+
+	return local_state;
+}
+
+// Helper: Get next batch from stream and convert to Arrow C ABI
+static bool GetNextBatch(const VgiTableScanBindData &bind_data, VgiTableScanGlobalState &global_state,
+                         VgiTableScanLocalState &local_state) {
+	if (global_state.done) {
+		return false;
+	}
+
+	// Read next Arrow C++ batch from stream
+	auto arrow_batch = global_state.stream->ReadNext();
+	if (!arrow_batch) {
+		global_state.done = true;
+		return false;
+	}
+
+	// Export batch to C ABI format
+	auto chunk = make_uniq<ArrowArrayWrapper>();
+	vgi::ExportRecordBatch(arrow_batch, *chunk);
+
+	local_state.chunk = shared_ptr<ArrowArrayWrapper>(chunk.release());
+	local_state.chunk_offset = 0;
+	local_state.Reset();
+
+	return true;
+}
+
 // Main scan function for VGI table scan
 static void VgiTableScanFunction(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
-	auto &state = data.global_state->Cast<VgiTableScanGlobalState>();
+	auto &bind_data = data.bind_data->Cast<VgiTableScanBindData>();
+	auto &global_state = data.global_state->Cast<VgiTableScanGlobalState>();
+	auto &local_state = data.local_state->Cast<VgiTableScanLocalState>();
 
-	if (!state.stream || state.stream->IsFinished()) {
-		output.SetCardinality(0);
-		return;
-	}
-
-	// Read next batch from stream
-	auto batch = state.stream->ReadNext();
-
-	if (!batch) {
-		// End of stream
-		output.SetCardinality(0);
-		return;
-	}
-
-	// Convert Arrow batch to DuckDB DataChunk
-	idx_t row_count = batch->num_rows();
-	output.SetCardinality(row_count);
-
-	for (idx_t col_idx = 0; col_idx < output.ColumnCount(); col_idx++) {
-		auto &out_vec = output.data[col_idx];
-		auto arrow_col = batch->column(col_idx);
-
-		// Simple conversion for common types
-		// TODO: Handle more types and nested structures
-		switch (out_vec.GetType().id()) {
-		case LogicalTypeId::VARCHAR: {
-			auto string_array = std::static_pointer_cast<arrow::StringArray>(arrow_col);
-			for (idx_t row_idx = 0; row_idx < row_count; row_idx++) {
-				if (string_array->IsNull(row_idx)) {
-					FlatVector::SetNull(out_vec, row_idx, true);
-				} else {
-					auto val = string_array->GetString(row_idx);
-					FlatVector::GetData<string_t>(out_vec)[row_idx] =
-					    StringVector::AddString(out_vec, val.data(), val.size());
-				}
-			}
-			break;
-		}
-		case LogicalTypeId::BIGINT: {
-			auto int_array = std::static_pointer_cast<arrow::Int64Array>(arrow_col);
-			for (idx_t row_idx = 0; row_idx < row_count; row_idx++) {
-				if (int_array->IsNull(row_idx)) {
-					FlatVector::SetNull(out_vec, row_idx, true);
-				} else {
-					FlatVector::GetData<int64_t>(out_vec)[row_idx] = int_array->Value(row_idx);
-				}
-			}
-			break;
-		}
-		case LogicalTypeId::INTEGER: {
-			auto int_array = std::static_pointer_cast<arrow::Int32Array>(arrow_col);
-			for (idx_t row_idx = 0; row_idx < row_count; row_idx++) {
-				if (int_array->IsNull(row_idx)) {
-					FlatVector::SetNull(out_vec, row_idx, true);
-				} else {
-					FlatVector::GetData<int32_t>(out_vec)[row_idx] = int_array->Value(row_idx);
-				}
-			}
-			break;
-		}
-		case LogicalTypeId::DOUBLE: {
-			auto double_array = std::static_pointer_cast<arrow::DoubleArray>(arrow_col);
-			for (idx_t row_idx = 0; row_idx < row_count; row_idx++) {
-				if (double_array->IsNull(row_idx)) {
-					FlatVector::SetNull(out_vec, row_idx, true);
-				} else {
-					FlatVector::GetData<double>(out_vec)[row_idx] = double_array->Value(row_idx);
-				}
-			}
-			break;
-		}
-		case LogicalTypeId::BOOLEAN: {
-			auto bool_array = std::static_pointer_cast<arrow::BooleanArray>(arrow_col);
-			for (idx_t row_idx = 0; row_idx < row_count; row_idx++) {
-				if (bool_array->IsNull(row_idx)) {
-					FlatVector::SetNull(out_vec, row_idx, true);
-				} else {
-					FlatVector::GetData<bool>(out_vec)[row_idx] = bool_array->Value(row_idx);
-				}
-			}
-			break;
-		}
-		default:
-			// For unsupported types, set to NULL
-			for (idx_t row_idx = 0; row_idx < row_count; row_idx++) {
-				FlatVector::SetNull(out_vec, row_idx, true);
-			}
-			break;
+	// Get a batch if we don't have one or we've exhausted the current one
+	while (!local_state.chunk || !local_state.chunk->arrow_array.release ||
+	       local_state.chunk_offset >= static_cast<idx_t>(local_state.chunk->arrow_array.length)) {
+		if (!GetNextBatch(bind_data, global_state, local_state)) {
+			output.SetCardinality(0);
+			return;
 		}
 	}
+
+	// Calculate output size
+	idx_t output_size =
+	    MinValue<idx_t>(STANDARD_VECTOR_SIZE, local_state.chunk->arrow_array.length - local_state.chunk_offset);
+
+	output.SetCardinality(output_size);
+
+	// Convert Arrow data to DuckDB using ArrowTableFunction::ArrowToDuckDB
+	if (output_size > 0) {
+		ArrowTableFunction::ArrowToDuckDB(local_state, bind_data.arrow_table.GetColumns(), output, false);
+	}
+
+	local_state.chunk_offset += output.size();
+	output.Verify();
 }
 
 TableFunction VgiTableEntry::GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data) {
@@ -171,15 +163,28 @@ TableFunction VgiTableEntry::GetScanFunction(ClientContext &context, unique_ptr<
 	scan_bind_data->worker_debug = attach_params->worker_debug();
 
 	// Get column info from the table
+	vector<LogicalType> return_types;
+	vector<string> names;
 	for (auto &col : GetColumns().Logical()) {
 		scan_bind_data->column_names.push_back(col.Name());
 		scan_bind_data->column_types.push_back(col.Type());
+		return_types.push_back(col.Type());
+		names.push_back(col.Name());
+	}
+
+	// Convert Arrow schema to DuckDB types for ArrowToDuckDB conversion
+	// The table_info_ contains the Arrow schema from the worker
+	if (table_info_.arrow_schema) {
+		vgi::ArrowSchemaToDuckDBTypes(context, table_info_.arrow_schema, scan_bind_data->c_schema,
+		                              scan_bind_data->arrow_table, return_types, names);
 	}
 
 	bind_data = std::move(scan_bind_data);
 
-	// Create the table function
-	TableFunction func("vgi_table_scan", {}, VgiTableScanFunction, VgiTableScanBind, VgiTableScanInit);
+	// Create the table function with local init
+	TableFunction func("vgi_table_scan", {}, VgiTableScanFunction, VgiTableScanBind, VgiTableScanInitGlobal,
+	                   VgiTableScanInitLocal);
+	func.projection_pushdown = true;
 	return func;
 }
 
