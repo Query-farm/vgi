@@ -370,6 +370,18 @@ static double VgiTableFunctionProgress(ClientContext &context, const FunctionDat
 	return -1.0;
 }
 
+// ============================================================================
+// ToString Function - Returns info for EXPLAIN output
+// ============================================================================
+
+static InsertionOrderPreservingMap<string> VgiTableFunctionToString(TableFunctionToStringInput &input) {
+	InsertionOrderPreservingMap<string> result;
+	auto &bind_data = input.bind_data->Cast<VgiTableFunctionBindData>();
+	result["Worker"] = bind_data.worker_path;
+	result["Function"] = bind_data.function_name;
+	return result;
+}
+
 } // anonymous namespace
 
 // ============================================================================
@@ -390,6 +402,9 @@ void RegisterVgiTableFunction(ExtensionLoader &loader) {
 
 	// Enable progress reporting
 	func.table_scan_progress = VgiTableFunctionProgress;
+
+	// Enable EXPLAIN output
+	func.to_string = VgiTableFunctionToString;
 
 	loader.RegisterFunction(func);
 }

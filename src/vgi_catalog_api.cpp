@@ -594,17 +594,17 @@ FunctionConnection::FunctionConnection(const std::string &worker_path, const std
 }
 
 FunctionConnection::~FunctionConnection() {
-	// Stop stderr reader thread first
+	// Terminate the subprocess first - this causes EOF on stderr which unblocks
+	// the stderr reader thread. Without this, StopStderrReader() would block forever
+	// waiting for the thread that's blocked on read().
+	proc_.reset();
+	// Now stop stderr reader thread (should exit quickly due to EOF)
 	StopStderrReader();
 	// Drain any remaining stderr (can't log without context, just discard)
 	{
 		std::lock_guard<std::mutex> lock(stderr_mutex_);
 		stderr_lines_.clear();
 	}
-	// SubProcess destructor handles termination:
-	// - Non-blocking check if process already exited
-	// - SIGTERM + wait if still running
-	// VGI workers don't exit after invocation, so we let destructor terminate them.
 }
 
 OutputSpecResult FunctionConnection::PerformBindFull() {
