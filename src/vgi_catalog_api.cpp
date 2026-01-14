@@ -129,8 +129,8 @@ static void SendInvocationAndArgs(SubProcess &proc, const std::string &method_na
 // The error_context parameter customizes the message for non-special exit codes:
 // - "failed to start" for errors during read attempts
 // - "exited with status" for EOF/null batch cases
-bool CheckWorkerExitStatus(SubProcess &proc, const std::string &worker_path, const std::string &error_context,
-                           const std::string &invocation_id_hex = "") {
+static bool CheckWorkerExitStatus(SubProcess &proc, const std::string &worker_path, const std::string &error_context,
+                                  const std::string &invocation_id_hex = "") {
 	int exit_status = 0;
 	if (!proc.TryWait(&exit_status)) {
 		return false; // Process still running
