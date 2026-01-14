@@ -399,5 +399,132 @@ CreateTableInfo CreateTableInfoFromVgiTable(ClientContext &context, const VgiTab
 	return create_info;
 }
 
+VgiFunctionInfo ParseFunctionInfo(const std::shared_ptr<arrow::RecordBatch> &batch) {
+	VgiFunctionInfo info;
+
+	if (!batch || batch->num_rows() == 0) {
+		throw IOException("Empty response from function_get");
+	}
+
+	info.name = GetStringValue(batch, "name", 0);
+	info.schema_name = GetStringValue(batch, "schema_name", 0);
+	info.type = GetStringValue(batch, "type", 0);
+	info.description = GetStringValue(batch, "description", 0);
+	info.cardinality_estimate = GetInt64Value(batch, "cardinality_estimate", 0);
+	info.max_workers = static_cast<int32_t>(GetInt64Value(batch, "max_workers", 0));
+	if (info.max_workers <= 0) {
+		info.max_workers = 1;
+	}
+
+	// Parse the return_schema field which contains a serialized Arrow schema
+	auto schema_data = GetBinaryValue(batch, "return_schema", 0);
+	if (!schema_data.empty()) {
+		info.return_schema = DeserializeSchema(schema_data);
+	}
+
+	// TODO: Parse parameters if present
+
+	return info;
+}
+
+// ============================================================================
+// Function Invocation API
+// ============================================================================
+
+VgiFunctionInfo GetFunctionInfo(const std::string &worker_path, const std::vector<uint8_t> &attach_id,
+                                const std::string &schema_name, const std::string &function_name,
+                                ClientContext &context, bool worker_debug) {
+	auto args = CreateFunctionGetArgs(attach_id, schema_name, function_name);
+	auto result_batch = InvokeCatalogMethod(worker_path, "function_get", args, context, worker_debug);
+	return ParseFunctionInfo(result_batch);
+}
+
+// ============================================================================
+// FunctionInvokeStream implementation
+// ============================================================================
+
+namespace {
+
+// Helper to send function invocation and args to a worker process
+static void SendFunctionInvocationAndArgs(SubProcess &proc, const std::string &function_name,
+                                          const std::shared_ptr<arrow::RecordBatch> &args) {
+	// Create and send the invocation
+	auto invocation = CreateFunctionInvocation(function_name);
+	auto invocation_bytes = SerializeRecordBatch(invocation);
+	WriteAll(proc.GetStdinFd(), invocation_bytes->data(), invocation_bytes->size());
+
+	// Send the arguments
+	auto args_bytes = SerializeRecordBatch(args);
+	WriteAll(proc.GetStdinFd(), args_bytes->data(), args_bytes->size());
+
+	// Close stdin to signal end of input
+	proc.CloseStdin();
+}
+
+} // namespace
+
+FunctionInvokeStream::FunctionInvokeStream(const std::string &worker_path, const std::vector<uint8_t> &attach_id,
+                                           const std::string &schema_name, const std::string &function_name,
+                                           const std::string &positional_args_json,
+                                           const std::vector<std::pair<std::string, std::string>> &named_args,
+                                           const std::vector<int32_t> &projection_ids, ClientContext &context,
+                                           bool worker_debug)
+    : proc_(std::make_unique<SubProcess>(worker_path, worker_debug)), context_(context), worker_path_(worker_path) {
+
+	// Create args batch
+	auto args = CreateFunctionInvokeArgs(attach_id, schema_name, function_name, positional_args_json, named_args,
+	                                     projection_ids);
+
+	// Send invocation and args
+	SendFunctionInvocationAndArgs(*proc_, function_name, args);
+}
+
+FunctionInvokeStream::~FunctionInvokeStream() {
+	if (proc_) {
+		proc_->Wait();
+	}
+}
+
+std::shared_ptr<arrow::RecordBatch> FunctionInvokeStream::ReadNext() {
+	if (finished_ || !proc_) {
+		return nullptr;
+	}
+
+	arrow::RecordBatchWithMetadata result;
+	try {
+		result = ReadRecordBatch(proc_->GetStdoutFd());
+	} catch (const IOException &e) {
+		// Check if this is an EOF indicator
+		std::string error_msg = e.what();
+		if (error_msg.find("Tried reading schema message") != std::string::npos ||
+		    error_msg.find("was null or length 0") != std::string::npos) {
+			finished_ = true;
+			return nullptr;
+		}
+		throw;
+	}
+
+	// Check for log messages (will throw on EXCEPTION)
+	if (HandleBatchLogMessage(result.batch, result.custom_metadata, &context_, worker_path_)) {
+		// It was a log message - read the next batch
+		return ReadNext();
+	}
+
+	// Empty batch or null signals end of stream
+	if (!result.batch || result.batch->num_rows() == 0) {
+		finished_ = true;
+		return nullptr;
+	}
+
+	return result.batch;
+}
+
+int FunctionInvokeStream::Wait() {
+	if (!proc_) {
+		return 0;
+	}
+	return proc_->Wait();
+}
+
 } // namespace vgi
 } // namespace duckdb

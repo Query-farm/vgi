@@ -140,6 +140,29 @@ struct VgiTableInfo {
 	std::vector<std::string> check_constraints;
 };
 
+// Function parameter metadata
+struct VgiFunctionParameter {
+	std::string name;
+	int32_t position;
+	std::string arrow_type;    // Arrow type name (e.g., "int64", "utf8")
+	std::string default_value; // JSON-encoded default value, empty if required
+	std::string doc;
+	bool is_varargs = false;
+};
+
+// Function metadata from the worker
+struct VgiFunctionInfo {
+	std::string name;
+	std::string schema_name;
+	std::string type;          // "table", "table_in_out", "scalar"
+	std::string description;
+	std::vector<VgiFunctionParameter> parameters;
+	std::shared_ptr<arrow::Schema> return_schema;
+	int64_t cardinality_estimate = -1;  // -1 means unknown
+	int32_t max_workers = 1;
+	std::map<std::string, std::string> tags;
+};
+
 // Parse a CatalogAttachResult from an Arrow RecordBatch
 CatalogAttachResult ParseCatalogAttachResult(const std::shared_ptr<arrow::RecordBatch> &batch);
 
@@ -151,6 +174,56 @@ VgiTableInfo ParseTableInfo(const std::shared_ptr<arrow::RecordBatch> &batch);
 
 // Parse multiple schemas from a batch (for schemas() call)
 std::vector<VgiSchemaInfo> ParseSchemaList(const std::shared_ptr<arrow::RecordBatch> &batch);
+
+// Parse a VgiFunctionInfo from an Arrow RecordBatch (single row)
+VgiFunctionInfo ParseFunctionInfo(const std::shared_ptr<arrow::RecordBatch> &batch);
+
+// ============================================================================
+// Function Invocation API
+// ============================================================================
+
+// Get function metadata from a VGI worker.
+// Calls the "function_get" catalog method and parses the result.
+VgiFunctionInfo GetFunctionInfo(const std::string &worker_path, const std::vector<uint8_t> &attach_id,
+                                const std::string &schema_name, const std::string &function_name,
+                                ClientContext &context, bool worker_debug = false);
+
+// Streaming interface for function invocation.
+// Use this to invoke a table function and stream results.
+class FunctionInvokeStream {
+public:
+	// Start a streaming function invocation
+	// positional_args_json: JSON-encoded array of positional arguments
+	// named_args: map of named argument name to JSON-encoded value
+	FunctionInvokeStream(const std::string &worker_path, const std::vector<uint8_t> &attach_id,
+	                     const std::string &schema_name, const std::string &function_name,
+	                     const std::string &positional_args_json,
+	                     const std::vector<std::pair<std::string, std::string>> &named_args,
+	                     const std::vector<int32_t> &projection_ids, ClientContext &context,
+	                     bool worker_debug = false);
+	~FunctionInvokeStream();
+
+	// Read the next result batch. Returns nullptr at end of stream.
+	std::shared_ptr<arrow::RecordBatch> ReadNext();
+
+	// Wait for the worker process to exit. Called automatically by destructor.
+	int Wait();
+
+	// Check if stream has finished
+	bool IsFinished() const {
+		return finished_;
+	}
+
+	// Non-copyable
+	FunctionInvokeStream(const FunctionInvokeStream &) = delete;
+	FunctionInvokeStream &operator=(const FunctionInvokeStream &) = delete;
+
+private:
+	std::unique_ptr<SubProcess> proc_;
+	ClientContext &context_;
+	std::string worker_path_;
+	bool finished_ = false;
+};
 
 } // namespace vgi
 
