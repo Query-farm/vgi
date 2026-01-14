@@ -86,3 +86,13 @@ query I
 SELECT COUNT(*) > 0 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%scan_complete%';
 ----
 true
+
+# ============================================================================
+# Test EXPLAIN with vgi_table_function
+# ============================================================================
+
+# EXPLAIN should work without hanging and show Worker/Function in output
+query II
+EXPLAIN SELECT * FROM vgi_table_function('${VGI_TEST_WORKER}', 'sequence', [10]);
+----
+physical_plan	<REGEX>:.*VGI_TABLE_FUNCTION.*Function: sequence.*
