@@ -1,0 +1,169 @@
+# name: test/sql/vgi_table_function.test
+# description: test vgi_table_function with VGI worker
+# group: [vgi]
+
+# This test requires a VGI worker to be available
+require-env VGI_TEST_WORKER
+
+require vgi
+
+# =============================================================================
+# Basic Function Invocation
+# =============================================================================
+
+# Test sequence function with small count
+query I
+SELECT * FROM vgi_table_function('${VGI_TEST_WORKER}', 'sequence', [5]);
+----
+0
+1
+2
+3
+4
+
+# Test sequence with count of 1
+query I
+SELECT * FROM vgi_table_function('${VGI_TEST_WORKER}', 'sequence', [1]);
+----
+0
+
+# Test sequence with count of 0 (empty result)
+query I
+SELECT count(*) FROM vgi_table_function('${VGI_TEST_WORKER}', 'sequence', [0]);
+----
+0
+
+# Test range function
+query I
+SELECT * FROM vgi_table_function('${VGI_TEST_WORKER}', 'range', [0, 10, 2]);
+----
+0
+2
+4
+6
+8
+
+# Test range with step=1
+query I
+SELECT * FROM vgi_table_function('${VGI_TEST_WORKER}', 'range', [5, 8, 1]);
+----
+5
+6
+7
+
+# Test constant_table function
+query I
+SELECT * FROM vgi_table_function('${VGI_TEST_WORKER}', 'constant_table', [42]);
+----
+42
+
+# =============================================================================
+# Large Result Sets (Multiple Batches)
+# =============================================================================
+
+# Test large sequence spans multiple Arrow batches (batch size is 1000)
+query I
+SELECT COUNT(*) FROM vgi_table_function('${VGI_TEST_WORKER}', 'sequence', [2500]);
+----
+2500
+
+# Verify first and last values in large result
+query II
+SELECT MIN(n), MAX(n) FROM vgi_table_function('${VGI_TEST_WORKER}', 'sequence', [2500]);
+----
+0	2499
+
+# =============================================================================
+# Integration with DuckDB Features
+# =============================================================================
+
+# Test with WHERE clause
+query I
+SELECT n FROM vgi_table_function('${VGI_TEST_WORKER}', 'sequence', [10]) WHERE n > 7;
+----
+8
+9
+
+# Test with ORDER BY DESC
+query I
+SELECT n FROM vgi_table_function('${VGI_TEST_WORKER}', 'sequence', [5]) ORDER BY n DESC;
+----
+4
+3
+2
+1
+0
+
+# Test with LIMIT
+query I
+SELECT n FROM vgi_table_function('${VGI_TEST_WORKER}', 'sequence', [100]) LIMIT 3;
+----
+0
+1
+2
+
+# Test in subquery with expression
+query I
+SELECT * FROM (SELECT n * 2 as doubled FROM vgi_table_function('${VGI_TEST_WORKER}', 'sequence', [3]));
+----
+0
+2
+4
+
+# Test aggregation
+query III
+SELECT MIN(n), MAX(n), SUM(n) FROM vgi_table_function('${VGI_TEST_WORKER}', 'sequence', [10]);
+----
+0	9	45
+
+# =============================================================================
+# JOIN with Other Tables
+# =============================================================================
+
+statement ok
+CREATE TABLE local_data AS SELECT * FROM range(3);
+
+query II rowsort
+SELECT l.range, v.n
+FROM local_data l
+JOIN vgi_table_function('${VGI_TEST_WORKER}', 'sequence', [3]) v
+ON l.range = v.n;
+----
+0	0
+1	1
+2	2
+
+statement ok
+DROP TABLE local_data;
+
+# =============================================================================
+# Multiple vgi_table_function Calls
+# =============================================================================
+
+# Test cross join of two VGI table functions
+query II rowsort
+SELECT a.n as a, b.n as b
+FROM vgi_table_function('${VGI_TEST_WORKER}', 'sequence', [2]) a,
+     vgi_table_function('${VGI_TEST_WORKER}', 'sequence', [2]) b;
+----
+0	0
+0	1
+1	0
+1	1
+
+# =============================================================================
+# Error Handling
+# =============================================================================
+
+# Test invalid function name
+statement error
+SELECT * FROM vgi_table_function('${VGI_TEST_WORKER}', 'nonexistent_function', [5]);
+----
+Unknown function
+
+# Test invalid worker path
+statement error
+SELECT * FROM vgi_table_function('/nonexistent/worker/path', 'sequence', [5]);
+----
+IO Error
+
