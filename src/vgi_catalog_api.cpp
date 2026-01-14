@@ -666,6 +666,9 @@ OutputSpecResult FunctionConnection::PerformBindFull() {
 	output_spec_ = ParseOutputSpec(output_spec_result.batch);
 	bind_done_ = true;
 
+	// Drain any buffered stderr from bind phase
+	DrainStderrLog();
+
 	return output_spec_;
 }
 
@@ -726,6 +729,10 @@ InitResultData FunctionConnection::PerformInit(const std::vector<int32_t> &proje
 	data_reader_ = reader_result.ValueUnsafe();
 
 	init_done_ = true;
+
+	// Drain any buffered stderr from init phase
+	DrainStderrLog();
+
 	return init_data;
 }
 
@@ -763,6 +770,9 @@ void FunctionConnection::SkipInit() {
 	data_reader_ = reader_result.ValueUnsafe();
 
 	init_done_ = true;
+
+	// Drain any buffered stderr from init phase
+	DrainStderrLog();
 }
 
 std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
