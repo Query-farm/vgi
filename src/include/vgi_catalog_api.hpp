@@ -434,6 +434,9 @@ public:
 	// Get the invocation ID as hex string (empty if bind not done)
 	std::string GetInvocationIdHex() const;
 
+	// Get the attach ID as hex string (empty if no attach_id)
+	std::string GetAttachIdHex() const;
+
 	// Wait for worker process to exit
 	int Wait();
 

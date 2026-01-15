@@ -68,6 +68,12 @@ SELECT COUNT(*) > 0 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%Sta
 ----
 true
 
+# Check attach_id is present in in-band messages (for catalog-attached functions)
+query I
+SELECT COUNT(*) > 0 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%Starting generation%' AND message LIKE '%attach_id=%';
+----
+true
+
 # ============================================================================
 # Cleanup
 # ============================================================================

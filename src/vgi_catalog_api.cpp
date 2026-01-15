@@ -221,8 +221,9 @@ std::shared_ptr<arrow::RecordBatch> InvokeCatalogMethod(const std::string &worke
 
 		// Check for log messages (will throw on EXCEPTION)
 		// If it was a log message, continue reading the next batch
-		// Note: Catalog methods don't have invocation_id
-		if (!HandleBatchLogMessage(result.batch, result.custom_metadata, &context, worker_path, proc.GetPid(), "")) {
+		// Note: Catalog methods don't have invocation_id or attach_id
+		if (!HandleBatchLogMessage(result.batch, result.custom_metadata, &context, worker_path, proc.GetPid(), "", "",
+		                           "")) {
 			break;
 		}
 	}
@@ -288,8 +289,9 @@ std::shared_ptr<arrow::RecordBatch> CatalogMethodStream::ReadNext() {
 
 	// Check for log messages (will throw on EXCEPTION)
 	// Note: A zero-row batch with log metadata is a log message, not end of stream
-	// Catalog methods don't have invocation_id
-	if (HandleBatchLogMessage(result.batch, result.custom_metadata, &context_, worker_path_, proc_->GetPid(), "")) {
+	// Catalog methods don't have invocation_id or attach_id
+	if (HandleBatchLogMessage(result.batch, result.custom_metadata, &context_, worker_path_, proc_->GetPid(), "", "",
+	                          "")) {
 		// It was a log message - read the next batch
 		return ReadNext();
 	}
@@ -843,8 +845,9 @@ OutputSpecResult FunctionConnection::PerformBindFull() {
 			throw;
 		}
 		// Handle log messages (throws on EXCEPTION)
+		// Note: invocation_id not yet available during bind phase
 		if (!HandleBatchLogMessage(output_spec_result.batch, output_spec_result.custom_metadata, &context_,
-		                           worker_path_, proc_->GetPid(), "")) {
+		                           worker_path_, proc_->GetPid(), "", GetAttachIdHex(), "")) {
 			break;
 		}
 	}
@@ -893,7 +896,7 @@ InitResultData FunctionConnection::PerformInit(const std::vector<int32_t> &proje
 		init_result = ReadRecordBatch(proc_->GetStdoutFd(), worker_path_, proc_->GetPid());
 		// Handle log messages (throws on EXCEPTION)
 		if (!HandleBatchLogMessage(init_result.batch, init_result.custom_metadata, &context_, worker_path_,
-		                           proc_->GetPid(), GetInvocationIdHex())) {
+		                           proc_->GetPid(), GetInvocationIdHex(), GetAttachIdHex(), "")) {
 			break;
 		}
 	}
@@ -998,7 +1001,7 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 
 	// Check for log messages (will throw on EXCEPTION)
 	if (HandleBatchLogMessage(result.batch, result.custom_metadata, &context_, worker_path_, proc_->GetPid(),
-	                          GetInvocationIdHex())) {
+	                          GetInvocationIdHex(), GetAttachIdHex(), "")) {
 		// It was a log message - read the next batch
 		return ReadDataBatch();
 	}
@@ -1047,6 +1050,13 @@ std::string FunctionConnection::GetInvocationIdHex() const {
 		return "";
 	}
 	return BytesToHex(output_spec_.invocation_id);
+}
+
+std::string FunctionConnection::GetAttachIdHex() const {
+	if (attach_id_.empty()) {
+		return "";
+	}
+	return BytesToHex(attach_id_);
 }
 
 int FunctionConnection::Wait() {

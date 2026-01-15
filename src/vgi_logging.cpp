@@ -86,7 +86,8 @@ string VgiLogType::ConstructLogMessage(const string &event, const vector<pair<st
 // Returns true if the batch was a log message, false otherwise.
 bool HandleBatchLogMessage(const std::shared_ptr<arrow::RecordBatch> &batch,
                            const std::shared_ptr<arrow::KeyValueMetadata> &custom_metadata, ClientContext *context,
-                           const std::string &worker_path, pid_t worker_pid, const std::string &invocation_id_hex) {
+                           const std::string &worker_path, pid_t worker_pid, const std::string &invocation_id_hex,
+                           const std::string &attach_id_hex, const std::string &transaction_id_hex) {
 	if (!batch || batch->num_rows() != 0) {
 		return false;
 	}
@@ -150,6 +151,12 @@ bool HandleBatchLogMessage(const std::shared_ptr<arrow::RecordBatch> &batch,
 		if (!invocation_id_hex.empty()) {
 			info.emplace_back("invocation_id", invocation_id_hex);
 		}
+		if (!attach_id_hex.empty()) {
+			info.emplace_back("attach_id", attach_id_hex);
+		}
+		if (!transaction_id_hex.empty()) {
+			info.emplace_back("transaction_id", transaction_id_hex);
+		}
 		if (!exception_type.empty()) {
 			info.emplace_back("exception_type", exception_type);
 		}
@@ -157,7 +164,9 @@ bool HandleBatchLogMessage(const std::shared_ptr<arrow::RecordBatch> &batch,
 			info.emplace_back("traceback", traceback);
 		}
 
-		VGI_LOG(*context, log_message, info);
+		// Log at the level specified by the worker
+		LogLevel duckdb_level = ParseLogLevel(log_level);
+		VGI_LOG_LEVEL(*context, duckdb_level, log_message, info);
 	}
 
 	return true;

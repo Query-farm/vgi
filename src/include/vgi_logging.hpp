@@ -8,6 +8,7 @@
 
 #include "duckdb/logging/logging.hpp"
 #include "duckdb/logging/log_type.hpp"
+#include "duckdb/logging/logger.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/client_context.hpp"
 
@@ -43,6 +44,31 @@ inline void VGI_LOG(ClientContext &context, const string &event, const vector<pa
 	DUCKDB_LOG(context, VgiLogType, event, info);
 }
 
+//! VGI_LOG_LEVEL - logs to DuckDB at a specific level
+//! Used for in-band log messages from workers where the worker specifies the log level
+inline void VGI_LOG_LEVEL(ClientContext &context, LogLevel level, const string &event,
+                          const vector<pair<string, string>> &info) {
+	if (VgiStderrLogEnabled()) {
+		VgiLogToStderr(event, info);
+	}
+	DUCKDB_LOG_INTERNAL(context, VgiLogType::NAME, level, VgiLogType::ConstructLogMessage(event, info));
+}
+
+//! Parse a log level string (INFO, DEBUG, WARNING, ERROR) to DuckDB LogLevel
+//! Returns LOG_INFO for unknown levels
+inline LogLevel ParseLogLevel(const string &level_str) {
+	if (level_str == "DEBUG" || level_str == "TRACE") {
+		return LogLevel::LOG_DEBUG;
+	} else if (level_str == "INFO") {
+		return LogLevel::LOG_INFO;
+	} else if (level_str == "WARNING" || level_str == "WARN") {
+		return LogLevel::LOG_WARNING;
+	} else if (level_str == "ERROR") {
+		return LogLevel::LOG_ERROR;
+	}
+	return LogLevel::LOG_INFO; // Default
+}
+
 // ============================================================================
 // Log Message Handling from Arrow RecordBatch Metadata
 // ============================================================================
@@ -54,6 +80,7 @@ inline void VGI_LOG(ClientContext &context, const string &event, const vector<pa
 bool HandleBatchLogMessage(const std::shared_ptr<arrow::RecordBatch> &batch,
                            const std::shared_ptr<arrow::KeyValueMetadata> &custom_metadata, ClientContext *context,
                            const std::string &worker_path, pid_t worker_pid = -1,
-                           const std::string &invocation_id_hex = "");
+                           const std::string &invocation_id_hex = "", const std::string &attach_id_hex = "",
+                           const std::string &transaction_id_hex = "");
 
 } // namespace duckdb
