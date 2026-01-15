@@ -47,19 +47,6 @@ private:
 };
 
 // ============================================================================
-// Log Message Handling
-// ============================================================================
-
-// Check if a batch contains a log message (zero rows with vgi.log_* custom metadata).
-// If it's an EXCEPTION, throws IOException with the message, traceback, and worker context.
-// For other log levels, logs to DuckDB if context is provided.
-// Returns true if the batch was a log message, false otherwise.
-bool HandleBatchLogMessage(const std::shared_ptr<arrow::RecordBatch> &batch,
-                           const std::shared_ptr<arrow::KeyValueMetadata> &custom_metadata, ClientContext *context,
-                           const std::string &worker_path, pid_t worker_pid = -1,
-                           const std::string &invocation_id_hex = "");
-
-// ============================================================================
 // Catalog Method Invocation API
 // ============================================================================
 

@@ -1,5 +1,11 @@
 #pragma once
 
+#include <memory>
+#include <string>
+#include <sys/types.h>
+
+#include <arrow/api.h>
+
 #include "duckdb/logging/logging.hpp"
 #include "duckdb/logging/log_type.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -36,5 +42,18 @@ inline void VGI_LOG(ClientContext &context, const string &event, const vector<pa
 	}
 	DUCKDB_LOG(context, VgiLogType, event, info);
 }
+
+// ============================================================================
+// Log Message Handling from Arrow RecordBatch Metadata
+// ============================================================================
+
+//! Check if a batch contains a log message (zero rows with vgi.log_* custom metadata).
+//! If it's an EXCEPTION, throws IOException with the message, traceback, and worker context.
+//! For other log levels, logs to DuckDB if context is provided.
+//! Returns true if the batch was a log message, false otherwise.
+bool HandleBatchLogMessage(const std::shared_ptr<arrow::RecordBatch> &batch,
+                           const std::shared_ptr<arrow::KeyValueMetadata> &custom_metadata, ClientContext *context,
+                           const std::string &worker_path, pid_t worker_pid = -1,
+                           const std::string &invocation_id_hex = "");
 
 } // namespace duckdb
