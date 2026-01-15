@@ -12,6 +12,7 @@
 
 #include "vgi_arrow_utils.hpp"
 #include "vgi_catalog_api.hpp"
+#include "vgi_worker_pool.hpp"
 
 namespace duckdb {
 namespace vgi {
@@ -27,6 +28,7 @@ struct VgiTableFunctionBindData : public TableFunctionData {
 	std::string worker_path;
 	std::vector<uint8_t> attach_id;
 	bool worker_debug = false;
+	bool use_pool = true; // Whether to use the worker connection pool
 
 	// Function identification
 	std::string function_name;
@@ -53,6 +55,10 @@ struct VgiTableFunctionBindData : public TableFunctionData {
 
 	// Features that the worker has activated for this invocation
 	std::unordered_set<std::string> active_features;
+
+	// Connection from bind phase, persisted for reuse in InitGlobal.
+	// Mutable to allow InitGlobal to move it out (bind_data is const after bind).
+	mutable std::unique_ptr<FunctionConnection> bind_connection;
 };
 
 // ============================================================================
@@ -84,8 +90,26 @@ struct VgiTableFunctionGlobalState : public GlobalTableFunctionState {
 // ============================================================================
 
 struct VgiTableFunctionLocalState : public ArrowScanLocalState {
-	explicit VgiTableFunctionLocalState(unique_ptr<ArrowArrayWrapper> current_chunk, ClientContext &ctx)
-	    : ArrowScanLocalState(std::move(current_chunk), ctx) {
+	VgiTableFunctionLocalState(unique_ptr<ArrowArrayWrapper> current_chunk, ClientContext &ctx, bool use_pool,
+	                           const std::string &worker_path)
+	    : ArrowScanLocalState(std::move(current_chunk), ctx), context_(ctx), use_pool_(use_pool),
+	      worker_path_(worker_path) {
+	}
+
+	~VgiTableFunctionLocalState() {
+		// Return connection to pool if applicable
+		if (use_pool_ && connection && connection->CanBePooled()) {
+			// Read max pool size from settings
+			Value max_val;
+			size_t max_pool_size = 0;
+			if (context_.TryGetCurrentSetting("vgi_worker_pool_max", max_val)) {
+				max_pool_size = static_cast<size_t>(max_val.GetValue<int64_t>());
+			}
+			auto pooled = connection->ReleaseForPooling();
+			if (pooled) {
+				VgiWorkerPool::Instance().Release(std::move(pooled), max_pool_size);
+			}
+		}
 	}
 
 	// Connection to worker (owns the subprocess)
@@ -93,6 +117,11 @@ struct VgiTableFunctionLocalState : public ArrowScanLocalState {
 
 	// Completion tracking
 	bool done = false;
+
+private:
+	ClientContext &context_;
+	bool use_pool_;
+	std::string worker_path_;
 };
 
 // ============================================================================

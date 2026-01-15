@@ -13,6 +13,7 @@
 #include "vgi_logging.hpp"
 #include "vgi_protocol.hpp"
 #include "vgi_table_function.hpp"
+#include "vgi_worker_pool_functions.hpp"
 
 #define VGI_EXTENSION_VERSION "2026011201"
 
@@ -25,6 +26,7 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	string worker_path;
 	string catalog_name = info.path; // The first argument to ATTACH is the catalog name
 	bool worker_debug = false;
+	bool use_pool = true;
 
 	// Extract options
 	for (auto &entry : info.options) {
@@ -35,6 +37,8 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 			worker_path = entry.second.ToString();
 		} else if (lower_name == "worker_debug") {
 			worker_debug = entry.second.GetValue<bool>();
+		} else if (lower_name == "pool") {
+			use_pool = entry.second.GetValue<bool>();
 		} else {
 			throw BinderException("Unrecognized option for VGI ATTACH: %s", entry.first);
 		}
@@ -69,7 +73,7 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	}
 
 	// Create attach parameters
-	auto attach_params = std::make_shared<vgi::VgiAttachParameters>(worker_path, catalog_name, worker_debug);
+	auto attach_params = std::make_shared<vgi::VgiAttachParameters>(worker_path, catalog_name, worker_debug, use_pool);
 	auto attach_result_ptr = std::make_shared<vgi::CatalogAttachResult>(std::move(attach_result));
 
 	return make_uniq<VgiCatalog>(db, name, options.access_mode, std::move(attach_params), std::move(attach_result_ptr));
@@ -103,9 +107,21 @@ static void LoadInternal(ExtensionLoader &loader) {
 	auto &config = DBConfig::GetConfig(loader.GetDatabaseInstance());
 	config.storage_extensions["vgi"] = make_uniq<VgiStorageExtension>();
 
+	// Register worker pool settings
+	config.AddExtensionOption("vgi_worker_pool_idle_limit_seconds",
+	                          "Maximum idle time in seconds before pooled workers are removed", LogicalType::BIGINT,
+	                          Value::BIGINT(5));
+	config.AddExtensionOption("vgi_worker_pool_max",
+	                          "Maximum number of workers to keep in the pool (0 = unlimited)", LogicalType::BIGINT,
+	                          Value::BIGINT(0));
+
 	// Register VGI table functions
 	RegisterVgiCatalogsFunction(loader);
 	RegisterVgiTableFunction(loader);
+
+	// Register worker pool diagnostic functions
+	vgi::RegisterVgiWorkerPoolFunction(loader);
+	vgi::RegisterVgiWorkerPoolFlushFunction(loader);
 }
 
 void VgiExtension::Load(ExtensionLoader &loader) {

@@ -46,10 +46,10 @@ std::map<std::string, std::string> ExtractVgiSettings(ClientContext &context,
 //! accessed in the bind function via input.info->Cast<VgiTableFunctionInfo>().
 class VgiTableFunctionInfo : public TableFunctionInfo {
 public:
-	VgiTableFunctionInfo(std::string worker_path, std::vector<uint8_t> attach_id, bool worker_debug,
+	VgiTableFunctionInfo(std::string worker_path, std::vector<uint8_t> attach_id, bool worker_debug, bool use_pool,
 	                     vgi::VgiFunctionInfo function_info, std::vector<std::string> setting_names)
 	    : worker_path_(std::move(worker_path)), attach_id_(std::move(attach_id)), worker_debug_(worker_debug),
-	      function_info_(std::move(function_info)), setting_names_(std::move(setting_names)) {
+	      use_pool_(use_pool), function_info_(std::move(function_info)), setting_names_(std::move(setting_names)) {
 	}
 
 	~VgiTableFunctionInfo() override = default;
@@ -69,6 +69,11 @@ public:
 		return worker_debug_;
 	}
 
+	//! Whether to use the worker connection pool
+	bool use_pool() const {
+		return use_pool_;
+	}
+
 	//! Full function metadata from the worker
 	const vgi::VgiFunctionInfo &function_info() const {
 		return function_info_;
@@ -83,6 +88,7 @@ private:
 	std::string worker_path_;
 	std::vector<uint8_t> attach_id_;
 	bool worker_debug_;
+	bool use_pool_;
 	vgi::VgiFunctionInfo function_info_;
 	std::vector<std::string> setting_names_;
 };
@@ -106,6 +112,7 @@ static unique_ptr<FunctionData> VgiCatalogTableFunctionBind(ClientContext &conte
 	bind_data->worker_path = vgi_info.worker_path();
 	bind_data->attach_id = vgi_info.attach_id();
 	bind_data->worker_debug = vgi_info.worker_debug();
+	bind_data->use_pool = vgi_info.use_pool();
 	bind_data->function_name = vgi_info.function_info().name;
 
 	// Build Arrow arguments from the function call inputs
@@ -208,8 +215,9 @@ void VgiTableFunctionSet::LoadEntries(ClientContext &context) {
 			}
 
 			// Attach VgiTableFunctionInfo so the bind function can access worker_path and function metadata
-			table_func.function_info = make_uniq<VgiTableFunctionInfo>(worker_path, attach_result->attach_id,
-			                                                           attach_params->worker_debug(), func_info, setting_names);
+			table_func.function_info = make_uniq<VgiTableFunctionInfo>(
+			    worker_path, attach_result->attach_id, attach_params->worker_debug(), attach_params->use_pool(),
+			    func_info, setting_names);
 
 			func_set.AddFunction(table_func);
 

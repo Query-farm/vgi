@@ -30,6 +30,8 @@ src/vgi_catalogs.cpp
 src/vgi_table_function.cpp
 src/vgi_table_function_impl.cpp
 src/vgi_catalog_api.cpp
+src/vgi_worker_pool.cpp
+src/vgi_worker_pool_functions.cpp
 src/storage/vgi_catalog.cpp
 src/storage/vgi_catalog_set.cpp
 src/storage/vgi_schema_set.cpp

@@ -19,6 +19,7 @@
 
 #include "vgi_protocol.hpp"
 #include "vgi_subprocess.hpp"
+#include "vgi_worker_pool.hpp"
 
 namespace duckdb {
 
@@ -28,8 +29,9 @@ namespace vgi {
 
 // Parameters for connecting to a VGI worker
 struct VgiAttachParameters {
-	VgiAttachParameters(const std::string &worker_path, const std::string &catalog_name, bool worker_debug = false)
-	    : worker_path_(worker_path), catalog_name_(catalog_name), worker_debug_(worker_debug) {
+	VgiAttachParameters(const std::string &worker_path, const std::string &catalog_name, bool worker_debug = false,
+	                    bool use_pool = true)
+	    : worker_path_(worker_path), catalog_name_(catalog_name), worker_debug_(worker_debug), use_pool_(use_pool) {
 	}
 
 	const std::string &worker_path() const {
@@ -44,10 +46,15 @@ struct VgiAttachParameters {
 		return worker_debug_;
 	}
 
+	bool use_pool() const {
+		return use_pool_;
+	}
+
 private:
 	std::string worker_path_;
 	std::string catalog_name_;
 	bool worker_debug_;
+	bool use_pool_;
 };
 
 // ============================================================================
@@ -323,6 +330,13 @@ public:
 	                   const ArrowArguments &arguments, const std::vector<uint8_t> &attach_id, ClientContext &context,
 	                   const std::vector<uint8_t> &global_execution_id = {}, bool worker_debug = false,
 	                   const std::map<std::string, std::string> &settings = {});
+
+	// Create connection using a pooled worker (skips spawning new subprocess)
+	FunctionConnection(std::unique_ptr<PooledWorker> pooled_worker, const std::string &function_name,
+	                   const ArrowArguments &arguments, const std::vector<uint8_t> &attach_id, ClientContext &context,
+	                   const std::vector<uint8_t> &global_execution_id = {}, bool worker_debug = false,
+	                   const std::map<std::string, std::string> &settings = {});
+
 	~FunctionConnection();
 
 	// Phase 1: Perform bind handshake (Streams 1-2)
@@ -368,6 +382,15 @@ public:
 
 	// Wait for worker process to exit
 	int Wait();
+
+	// Check if this connection can be returned to the pool
+	// Returns true if data finished and subprocess is still alive
+	bool CanBePooled() const;
+
+	// Release the subprocess for pooling (transfers ownership)
+	// Returns nullptr if cannot be pooled
+	// Stops stderr thread and releases subprocess ownership
+	std::unique_ptr<PooledWorker> ReleaseForPooling();
 
 	// Non-copyable and non-movable (contains reference)
 	FunctionConnection(const FunctionConnection &) = delete;

@@ -700,6 +700,17 @@ FunctionConnection::FunctionConnection(const std::string &worker_path, const std
       context_(context), worker_debug_(worker_debug), settings_(settings) {
 }
 
+FunctionConnection::FunctionConnection(std::unique_ptr<PooledWorker> pooled_worker, const std::string &function_name,
+                                       const ArrowArguments &arguments, const std::vector<uint8_t> &attach_id,
+                                       ClientContext &context, const std::vector<uint8_t> &global_execution_id,
+                                       bool worker_debug, const std::map<std::string, std::string> &settings)
+    : worker_path_(pooled_worker->GetWorkerPath()), function_name_(function_name), arguments_type_(arguments.type),
+      arguments_array_(arguments.array), attach_id_(attach_id), global_execution_id_(global_execution_id),
+      context_(context), worker_debug_(worker_debug), settings_(settings), proc_(pooled_worker->Release()) {
+	// Start stderr reader thread for the existing subprocess
+	StartStderrReader();
+}
+
 FunctionConnection::~FunctionConnection() {
 	// Terminate the subprocess first - this causes EOF on stderr which unblocks
 	// the stderr reader thread. Without this, StopStderrReader() would block forever
@@ -811,8 +822,8 @@ InitResultData FunctionConnection::PerformInit(const std::vector<int32_t> &proje
 	// Parse InitResult to get global_execution_identifier for multi-worker coordination
 	auto init_data = ParseInitResult(init_result.batch);
 
-	// For Table functions (no input), close stdin to signal no more input
-	proc_->CloseStdin();
+	// Note: We no longer close stdin here to allow connection pooling.
+	// The worker will receive EOF when the process is actually terminated.
 
 	// Stream 6: Open the data stream reader
 	// Unlike handshake streams which are one batch each, the data phase uses
@@ -854,8 +865,8 @@ void FunctionConnection::SkipInit() {
 
 	// Skip Stream 4 (InitResult) - secondary workers don't send it
 
-	// Close stdin to signal no more input
-	proc_->CloseStdin();
+	// Note: We no longer close stdin here to allow connection pooling.
+	// The worker will receive EOF when the process is actually terminated.
 
 	// Open the data stream reader
 	data_stream_ = std::make_shared<FdInputStream>(proc_->GetStdoutFd());
@@ -950,6 +961,33 @@ int FunctionConnection::Wait() {
 		return 0;
 	}
 	return proc_->Wait();
+}
+
+bool FunctionConnection::CanBePooled() const {
+	// Can only pool if:
+	// 1. Data phase completed (data_finished_ is true)
+	// 2. Subprocess is still alive
+	if (!data_finished_ || !proc_) {
+		return false;
+	}
+	return !proc_->TryWait(); // TryWait returns true if process exited
+}
+
+std::unique_ptr<PooledWorker> FunctionConnection::ReleaseForPooling() {
+	if (!CanBePooled()) {
+		return nullptr;
+	}
+
+	// Stop stderr thread before releasing subprocess
+	StopStderrReader();
+
+	// Create pooled worker with our subprocess
+	auto pooled = std::make_unique<PooledWorker>(std::move(proc_), worker_path_);
+
+	// Clear our state so destructor doesn't try to use proc_
+	proc_.reset();
+
+	return pooled;
 }
 
 void FunctionConnection::StartStderrReader() {
