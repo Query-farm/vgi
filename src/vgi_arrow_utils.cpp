@@ -180,5 +180,305 @@ ArrowArguments BuildArgumentsFromValues(ClientContext &context, const vector<Val
 	return ArrowArguments{struct_type, struct_result.ValueUnsafe()};
 }
 
+// ============================================================================
+// ColumnValue Implementation
+// ============================================================================
+
+ColumnValue::ColumnValue(const std::shared_ptr<arrow::RecordBatch> &batch, const std::string &column_name,
+                         int64_t row_idx, const std::string &batch_description, const std::string &worker_path)
+    : batch_(batch), column_name_(column_name), row_idx_(row_idx), batch_description_(batch_description),
+      worker_path_(worker_path) {
+}
+
+bool ColumnValue::exists() const {
+	if (!batch_) {
+		return false;
+	}
+	return batch_->schema()->GetFieldByName(column_name_) != nullptr;
+}
+
+bool ColumnValue::is_null() const {
+	if (!exists()) {
+		return false;
+	}
+	auto column = batch_->GetColumnByName(column_name_);
+	if (!column) {
+		return false;
+	}
+	return column->IsNull(row_idx_);
+}
+
+bool ColumnValue::is_nullable() const {
+	if (!batch_) {
+		return true;
+	}
+	auto field = batch_->schema()->GetFieldByName(column_name_);
+	if (!field) {
+		return true;
+	}
+	return field->nullable();
+}
+
+void ColumnValue::ThrowNotNullError() const {
+	if (!exists()) {
+		throw InvalidInputException("VGI protocol error: Required column '%s' not found in %s response from worker '%s'",
+		                            column_name_, batch_description_, worker_path_);
+	}
+	throw InvalidInputException(
+	    "VGI protocol error: Column '%s' has unexpected null value at row %lld in %s response from worker '%s'",
+	    column_name_, row_idx_, batch_description_, worker_path_);
+}
+
+// ============================================================================
+// ColumnValue Implicit Conversions to std::optional<T>
+// ============================================================================
+
+ColumnValue::operator std::optional<std::string>() const {
+	auto column = batch_ ? batch_->GetColumnByName(column_name_) : nullptr;
+	if (!column) {
+		return std::nullopt;
+	}
+	auto string_array = std::dynamic_pointer_cast<arrow::StringArray>(column);
+	if (!string_array || string_array->IsNull(row_idx_)) {
+		return std::nullopt;
+	}
+	return string_array->GetString(row_idx_);
+}
+
+ColumnValue::operator std::optional<int64_t>() const {
+	auto column = batch_ ? batch_->GetColumnByName(column_name_) : nullptr;
+	if (!column) {
+		return std::nullopt;
+	}
+	auto int_array = std::dynamic_pointer_cast<arrow::Int64Array>(column);
+	if (!int_array || int_array->IsNull(row_idx_)) {
+		return std::nullopt;
+	}
+	return int_array->Value(row_idx_);
+}
+
+ColumnValue::operator std::optional<int32_t>() const {
+	auto column = batch_ ? batch_->GetColumnByName(column_name_) : nullptr;
+	if (!column) {
+		return std::nullopt;
+	}
+	auto int_array = std::dynamic_pointer_cast<arrow::Int32Array>(column);
+	if (!int_array || int_array->IsNull(row_idx_)) {
+		return std::nullopt;
+	}
+	return int_array->Value(row_idx_);
+}
+
+ColumnValue::operator std::optional<bool>() const {
+	auto column = batch_ ? batch_->GetColumnByName(column_name_) : nullptr;
+	if (!column) {
+		return std::nullopt;
+	}
+	auto bool_array = std::dynamic_pointer_cast<arrow::BooleanArray>(column);
+	if (!bool_array || bool_array->IsNull(row_idx_)) {
+		return std::nullopt;
+	}
+	return bool_array->Value(row_idx_);
+}
+
+ColumnValue::operator std::optional<std::vector<uint8_t>>() const {
+	auto column = batch_ ? batch_->GetColumnByName(column_name_) : nullptr;
+	if (!column) {
+		return std::nullopt;
+	}
+	auto binary_array = std::dynamic_pointer_cast<arrow::BinaryArray>(column);
+	if (!binary_array || binary_array->IsNull(row_idx_)) {
+		return std::nullopt;
+	}
+	auto value = binary_array->GetView(row_idx_);
+	return std::vector<uint8_t>(reinterpret_cast<const uint8_t *>(value.data()),
+	                            reinterpret_cast<const uint8_t *>(value.data()) + value.size());
+}
+
+ColumnValue::operator std::optional<std::vector<std::string>>() const {
+	auto column = batch_ ? batch_->GetColumnByName(column_name_) : nullptr;
+	if (!column) {
+		return std::nullopt;
+	}
+	auto list_array = std::dynamic_pointer_cast<arrow::ListArray>(column);
+	if (!list_array || list_array->IsNull(row_idx_)) {
+		return std::nullopt;
+	}
+
+	int64_t start = list_array->value_offset(row_idx_);
+	int64_t end = list_array->value_offset(row_idx_ + 1);
+
+	auto string_array = std::dynamic_pointer_cast<arrow::StringArray>(list_array->values());
+	if (!string_array) {
+		return std::nullopt;
+	}
+
+	std::vector<std::string> result;
+	for (int64_t i = start; i < end; i++) {
+		if (!string_array->IsNull(i)) {
+			result.push_back(string_array->GetString(i));
+		}
+	}
+	return result;
+}
+
+ColumnValue::operator std::optional<std::vector<int32_t>>() const {
+	auto column = batch_ ? batch_->GetColumnByName(column_name_) : nullptr;
+	if (!column) {
+		return std::nullopt;
+	}
+	auto list_array = std::dynamic_pointer_cast<arrow::ListArray>(column);
+	if (!list_array || list_array->IsNull(row_idx_)) {
+		return std::nullopt;
+	}
+
+	int64_t start = list_array->value_offset(row_idx_);
+	int64_t end = list_array->value_offset(row_idx_ + 1);
+
+	auto int_array = std::dynamic_pointer_cast<arrow::Int32Array>(list_array->values());
+	if (!int_array) {
+		return std::nullopt;
+	}
+
+	std::vector<int32_t> result;
+	for (int64_t i = start; i < end; i++) {
+		if (!int_array->IsNull(i)) {
+			result.push_back(int_array->Value(i));
+		}
+	}
+	return result;
+}
+
+ColumnValue::operator std::optional<std::vector<std::vector<int32_t>>>() const {
+	auto column = batch_ ? batch_->GetColumnByName(column_name_) : nullptr;
+	if (!column) {
+		return std::nullopt;
+	}
+	auto outer_list = std::dynamic_pointer_cast<arrow::ListArray>(column);
+	if (!outer_list || outer_list->IsNull(row_idx_)) {
+		return std::nullopt;
+	}
+
+	int64_t outer_start = outer_list->value_offset(row_idx_);
+	int64_t outer_end = outer_list->value_offset(row_idx_ + 1);
+
+	auto inner_list = std::dynamic_pointer_cast<arrow::ListArray>(outer_list->values());
+	if (!inner_list) {
+		return std::nullopt;
+	}
+
+	auto int_array = std::dynamic_pointer_cast<arrow::Int32Array>(inner_list->values());
+	if (!int_array) {
+		return std::nullopt;
+	}
+
+	std::vector<std::vector<int32_t>> result;
+	for (int64_t i = outer_start; i < outer_end; i++) {
+		std::vector<int32_t> inner_result;
+		if (!inner_list->IsNull(i)) {
+			int64_t inner_start = inner_list->value_offset(i);
+			int64_t inner_end = inner_list->value_offset(i + 1);
+			for (int64_t j = inner_start; j < inner_end; j++) {
+				if (!int_array->IsNull(j)) {
+					inner_result.push_back(int_array->Value(j));
+				}
+			}
+		}
+		result.push_back(std::move(inner_result));
+	}
+	return result;
+}
+
+ColumnValue::operator std::optional<std::map<std::string, std::string>>() const {
+	auto column = batch_ ? batch_->GetColumnByName(column_name_) : nullptr;
+	if (!column) {
+		return std::nullopt;
+	}
+	auto map_array = std::dynamic_pointer_cast<arrow::MapArray>(column);
+	if (!map_array || map_array->IsNull(row_idx_)) {
+		return std::nullopt;
+	}
+
+	int64_t start = map_array->value_offset(row_idx_);
+	int64_t end = map_array->value_offset(row_idx_ + 1);
+
+	auto keys = std::dynamic_pointer_cast<arrow::StringArray>(map_array->keys());
+	auto values = std::dynamic_pointer_cast<arrow::StringArray>(map_array->items());
+
+	if (!keys || !values) {
+		return std::nullopt;
+	}
+
+	std::map<std::string, std::string> result;
+	for (int64_t i = start; i < end; i++) {
+		if (!keys->IsNull(i) && !values->IsNull(i)) {
+			result[keys->GetString(i)] = values->GetString(i);
+		}
+	}
+	return result;
+}
+
+// ============================================================================
+// ColumnValue value_or() Methods
+// ============================================================================
+
+std::string ColumnValue::value_or(const std::string &default_val) const {
+	auto opt = static_cast<std::optional<std::string>>(*this);
+	return opt.value_or(default_val);
+}
+
+int64_t ColumnValue::value_or(int64_t default_val) const {
+	auto opt = static_cast<std::optional<int64_t>>(*this);
+	return opt.value_or(default_val);
+}
+
+int32_t ColumnValue::value_or(int32_t default_val) const {
+	auto opt = static_cast<std::optional<int32_t>>(*this);
+	return opt.value_or(default_val);
+}
+
+bool ColumnValue::value_or(bool default_val) const {
+	auto opt = static_cast<std::optional<bool>>(*this);
+	return opt.value_or(default_val);
+}
+
+std::vector<uint8_t> ColumnValue::value_or(std::vector<uint8_t> default_val) const {
+	auto opt = static_cast<std::optional<std::vector<uint8_t>>>(*this);
+	return opt.value_or(std::move(default_val));
+}
+
+std::vector<std::string> ColumnValue::value_or(std::vector<std::string> default_val) const {
+	auto opt = static_cast<std::optional<std::vector<std::string>>>(*this);
+	return opt.value_or(std::move(default_val));
+}
+
+std::vector<int32_t> ColumnValue::value_or(std::vector<int32_t> default_val) const {
+	auto opt = static_cast<std::optional<std::vector<int32_t>>>(*this);
+	return opt.value_or(std::move(default_val));
+}
+
+std::vector<std::vector<int32_t>> ColumnValue::value_or(std::vector<std::vector<int32_t>> default_val) const {
+	auto opt = static_cast<std::optional<std::vector<std::vector<int32_t>>>>(*this);
+	return opt.value_or(std::move(default_val));
+}
+
+std::map<std::string, std::string> ColumnValue::value_or(std::map<std::string, std::string> default_val) const {
+	auto opt = static_cast<std::optional<std::map<std::string, std::string>>>(*this);
+	return opt.value_or(std::move(default_val));
+}
+
+// ============================================================================
+// RecordBatchSingleRow Implementation
+// ============================================================================
+
+RecordBatchSingleRow::RecordBatchSingleRow(const std::shared_ptr<arrow::RecordBatch> &batch, int64_t row_idx,
+                                           const std::string &batch_description, const std::string &worker_path)
+    : batch_(batch), row_idx_(row_idx), batch_description_(batch_description), worker_path_(worker_path) {
+}
+
+ColumnValue RecordBatchSingleRow::operator[](const std::string &column_name) const {
+	return ColumnValue(batch_, column_name, row_idx_, batch_description_, worker_path_);
+}
+
 } // namespace vgi
 } // namespace duckdb

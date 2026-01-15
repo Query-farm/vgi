@@ -148,43 +148,58 @@ struct VgiTableInfo {
 	std::vector<std::string> check_constraints;
 };
 
-// Function parameter metadata
-struct VgiFunctionParameter {
-	std::string name;
-	int32_t position;
-	std::string arrow_type;    // Arrow type name (e.g., "int64", "utf8")
-	std::string default_value; // JSON-encoded default value, empty if required
-	std::string doc;
-	bool is_varargs = false;
-};
-
-// Function metadata from the worker
-struct VgiFunctionInfo {
+// View metadata from the worker
+struct VgiViewInfo {
 	std::string name;
 	std::string schema_name;
-	std::string type;          // "table", "table_in_out", "scalar"
-	std::string description;
-	std::vector<VgiFunctionParameter> parameters;
-	std::shared_ptr<arrow::Schema> return_schema;
-	int64_t cardinality_estimate = -1;  // -1 means unknown
-	int32_t max_workers = 1;
+	std::string definition; // SQL query defining the view
+	std::string comment;
 	std::map<std::string, std::string> tags;
 };
 
+// Function metadata from the worker (matches Python FunctionInfo)
+struct VgiFunctionInfo {
+	std::string name;
+	std::string schema_name;
+	std::string function_type;  // "scalar", "table", "table_in_out", "aggregate"
+	std::string comment;
+	std::map<std::string, std::string> tags;
+
+	// Arguments and output as deserialized Arrow schemas
+	std::shared_ptr<arrow::Schema> arguments_schema;
+	std::shared_ptr<arrow::Schema> output_schema;
+
+	// Scalar function behavior fields (empty if not applicable)
+	std::string stability;      // "immutable", "stable", "volatile"
+	std::string null_handling;  // "called_on_null_input", "returns_null_on_null_input", "special_null_handling"
+
+	// Table function capabilities
+	bool projection_pushdown = false;
+	bool filter_pushdown = false;
+	std::string order_preservation;  // "no_order", "fixed_order", "any_order"
+	int32_t max_workers = 1;
+};
+
 // Parse a CatalogAttachResult from an Arrow RecordBatch
-CatalogAttachResult ParseCatalogAttachResult(const std::shared_ptr<arrow::RecordBatch> &batch);
+CatalogAttachResult ParseCatalogAttachResult(const std::shared_ptr<arrow::RecordBatch> &batch,
+                                             const std::string &worker_path);
 
 // Parse a VgiSchemaInfo from an Arrow RecordBatch (single row)
-VgiSchemaInfo ParseSchemaInfo(const std::shared_ptr<arrow::RecordBatch> &batch);
+VgiSchemaInfo ParseSchemaInfo(const std::shared_ptr<arrow::RecordBatch> &batch, const std::string &worker_path);
 
 // Parse a VgiTableInfo from an Arrow RecordBatch (single row)
-VgiTableInfo ParseTableInfo(const std::shared_ptr<arrow::RecordBatch> &batch);
+VgiTableInfo ParseTableInfo(const std::shared_ptr<arrow::RecordBatch> &batch, const std::string &worker_path);
 
 // Parse multiple schemas from a batch (for schemas() call)
-std::vector<VgiSchemaInfo> ParseSchemaList(const std::shared_ptr<arrow::RecordBatch> &batch);
+std::vector<VgiSchemaInfo> ParseSchemaList(const std::shared_ptr<arrow::RecordBatch> &batch,
+                                           const std::string &worker_path);
 
-// Parse a VgiFunctionInfo from an Arrow RecordBatch (single row)
-VgiFunctionInfo ParseFunctionInfo(const std::shared_ptr<arrow::RecordBatch> &batch);
+// Parse a VgiFunctionInfo from an Arrow RecordBatch at a specific row
+VgiFunctionInfo ParseFunctionInfo(const std::shared_ptr<arrow::RecordBatch> &batch, int64_t row_idx,
+                                  const std::string &worker_path);
+
+// Parse a VgiViewInfo from an Arrow RecordBatch (single row)
+VgiViewInfo ParseViewInfo(const std::shared_ptr<arrow::RecordBatch> &batch, const std::string &worker_path);
 
 // ============================================================================
 // Function Invocation API

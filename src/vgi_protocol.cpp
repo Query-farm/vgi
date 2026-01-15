@@ -241,6 +241,42 @@ std::shared_ptr<arrow::RecordBatch> CreateTableGetArgs(const std::vector<uint8_t
 	return arrow::RecordBatch::Make(schema, 1, arrays);
 }
 
+// Create arguments batch for schema_contents method
+std::shared_ptr<arrow::RecordBatch> CreateSchemaContentsArgs(const std::vector<uint8_t> &attach_id,
+                                                              const std::string &schema_name,
+                                                              const std::string &type_filter) {
+	auto schema = arrow::schema({
+	    arrow::field("attach_id", arrow::binary(), false),
+	    arrow::field("transaction_id", arrow::binary(), true), // nullable
+	    arrow::field("name", arrow::utf8(), false),
+	    arrow::field("type", arrow::utf8(), true), // nullable - SchemaObjectType filter
+	});
+
+	arrow::BinaryBuilder attach_id_builder;
+	CheckArrowStatus(attach_id_builder.Append(attach_id.data(), attach_id.size()), "append attach_id");
+
+	arrow::BinaryBuilder transaction_id_builder;
+	CheckArrowStatus(transaction_id_builder.AppendNull(), "append null transaction_id");
+
+	arrow::StringBuilder name_builder;
+	CheckArrowStatus(name_builder.Append(schema_name), "append name");
+
+	arrow::StringBuilder type_builder;
+	if (type_filter.empty()) {
+		CheckArrowStatus(type_builder.AppendNull(), "append null type");
+	} else {
+		CheckArrowStatus(type_builder.Append(type_filter), "append type");
+	}
+
+	std::vector<std::shared_ptr<arrow::Array>> arrays;
+	arrays.push_back(FinishBuilder(attach_id_builder, "attach_id"));
+	arrays.push_back(FinishBuilder(transaction_id_builder, "transaction_id"));
+	arrays.push_back(FinishBuilder(name_builder, "name"));
+	arrays.push_back(FinishBuilder(type_builder, "type"));
+
+	return arrow::RecordBatch::Make(schema, 1, arrays);
+}
+
 // Create arguments batch for function_get method
 std::shared_ptr<arrow::RecordBatch> CreateFunctionGetArgs(const std::vector<uint8_t> &attach_id,
                                                           const std::string &schema_name,

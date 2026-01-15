@@ -277,276 +277,25 @@ int CatalogMethodStream::Wait() {
 }
 
 // ============================================================================
-// Result parsing helpers
+// Result parsing using RecordBatchSingleRow
 // ============================================================================
 
-namespace {
-
-// Helper to get a string column value, returns empty string if null
-std::string GetStringValue(const std::shared_ptr<arrow::RecordBatch> &batch, const std::string &column_name,
-                           int64_t row_idx) {
-	auto column = batch->GetColumnByName(column_name);
-	if (!column) {
-		return "";
-	}
-	auto string_array = std::dynamic_pointer_cast<arrow::StringArray>(column);
-	if (!string_array || string_array->IsNull(row_idx)) {
-		return "";
-	}
-	return string_array->GetString(row_idx);
-}
-
-// Helper to get a bool column value, returns false if null
-bool GetBoolValue(const std::shared_ptr<arrow::RecordBatch> &batch, const std::string &column_name, int64_t row_idx) {
-	auto column = batch->GetColumnByName(column_name);
-	if (!column) {
-		return false;
-	}
-	auto bool_array = std::dynamic_pointer_cast<arrow::BooleanArray>(column);
-	if (!bool_array || bool_array->IsNull(row_idx)) {
-		return false;
-	}
-	return bool_array->Value(row_idx);
-}
-
-// Helper to get an int64 column value, returns 0 if null
-int64_t GetInt64Value(const std::shared_ptr<arrow::RecordBatch> &batch, const std::string &column_name,
-                      int64_t row_idx) {
-	auto column = batch->GetColumnByName(column_name);
-	if (!column) {
-		return 0;
-	}
-	auto int_array = std::dynamic_pointer_cast<arrow::Int64Array>(column);
-	if (!int_array || int_array->IsNull(row_idx)) {
-		return 0;
-	}
-	return int_array->Value(row_idx);
-}
-
-// Helper to get a binary column value, returns empty vector if null
-std::vector<uint8_t> GetBinaryValue(const std::shared_ptr<arrow::RecordBatch> &batch, const std::string &column_name,
-                                    int64_t row_idx) {
-	auto column = batch->GetColumnByName(column_name);
-	if (!column) {
-		return {};
-	}
-	auto binary_array = std::dynamic_pointer_cast<arrow::BinaryArray>(column);
-	if (!binary_array || binary_array->IsNull(row_idx)) {
-		return {};
-	}
-	auto value = binary_array->GetView(row_idx);
-	return std::vector<uint8_t>(reinterpret_cast<const uint8_t *>(value.data()),
-	                            reinterpret_cast<const uint8_t *>(value.data()) + value.size());
-}
-
-// Helper to get a map<string, string> column value, returns empty map if null
-std::map<std::string, std::string> GetStringMapValue(const std::shared_ptr<arrow::RecordBatch> &batch,
-                                                     const std::string &column_name, int64_t row_idx) {
-	std::map<std::string, std::string> result;
-	auto column = batch->GetColumnByName(column_name);
-	if (!column) {
-		return result;
-	}
-	auto map_array = std::dynamic_pointer_cast<arrow::MapArray>(column);
-	if (!map_array || map_array->IsNull(row_idx)) {
-		return result;
-	}
-
-	// Get the offsets for this row's entries
-	int64_t start = map_array->value_offset(row_idx);
-	int64_t end = map_array->value_offset(row_idx + 1);
-
-	// Get the key and value arrays
-	auto keys = std::dynamic_pointer_cast<arrow::StringArray>(map_array->keys());
-	auto values = std::dynamic_pointer_cast<arrow::StringArray>(map_array->items());
-
-	if (!keys || !values) {
-		return result;
-	}
-
-	for (int64_t i = start; i < end; i++) {
-		if (!keys->IsNull(i) && !values->IsNull(i)) {
-			result[keys->GetString(i)] = values->GetString(i);
-		}
-	}
-
-	return result;
-}
-
-// Helper to get a List<Int32> column value (for not_null_constraints)
-std::vector<int> GetInt32ListValue(const std::shared_ptr<arrow::RecordBatch> &batch, const std::string &column_name,
-                                   int64_t row_idx) {
-	std::vector<int> result;
-	auto column = batch->GetColumnByName(column_name);
-	if (!column) {
-		return result;
-	}
-	auto list_array = std::dynamic_pointer_cast<arrow::ListArray>(column);
-	if (!list_array || list_array->IsNull(row_idx)) {
-		return result;
-	}
-
-	int64_t start = list_array->value_offset(row_idx);
-	int64_t end = list_array->value_offset(row_idx + 1);
-
-	auto int_array = std::dynamic_pointer_cast<arrow::Int32Array>(list_array->values());
-	if (!int_array) {
-		return result;
-	}
-
-	for (int64_t i = start; i < end; i++) {
-		if (!int_array->IsNull(i)) {
-			result.push_back(int_array->Value(i));
-		}
-	}
-	return result;
-}
-
-// Helper to get a List<List<Int32>> column value (for unique_constraints)
-std::vector<std::vector<int>> GetInt32ListListValue(const std::shared_ptr<arrow::RecordBatch> &batch,
-                                                    const std::string &column_name, int64_t row_idx) {
-	std::vector<std::vector<int>> result;
-	auto column = batch->GetColumnByName(column_name);
-	if (!column) {
-		return result;
-	}
-	auto outer_list = std::dynamic_pointer_cast<arrow::ListArray>(column);
-	if (!outer_list || outer_list->IsNull(row_idx)) {
-		return result;
-	}
-
-	int64_t outer_start = outer_list->value_offset(row_idx);
-	int64_t outer_end = outer_list->value_offset(row_idx + 1);
-
-	auto inner_list = std::dynamic_pointer_cast<arrow::ListArray>(outer_list->values());
-	if (!inner_list) {
-		return result;
-	}
-
-	auto int_array = std::dynamic_pointer_cast<arrow::Int32Array>(inner_list->values());
-	if (!int_array) {
-		return result;
-	}
-
-	for (int64_t i = outer_start; i < outer_end; i++) {
-		std::vector<int> inner_result;
-		if (!inner_list->IsNull(i)) {
-			int64_t inner_start = inner_list->value_offset(i);
-			int64_t inner_end = inner_list->value_offset(i + 1);
-			for (int64_t j = inner_start; j < inner_end; j++) {
-				if (!int_array->IsNull(j)) {
-					inner_result.push_back(int_array->Value(j));
-				}
-			}
-		}
-		result.push_back(std::move(inner_result));
-	}
-	return result;
-}
-
-// Helper to get a List<Utf8> column value (for check_constraints)
-std::vector<std::string> GetStringListValue(const std::shared_ptr<arrow::RecordBatch> &batch,
-                                            const std::string &column_name, int64_t row_idx) {
-	std::vector<std::string> result;
-	auto column = batch->GetColumnByName(column_name);
-	if (!column) {
-		return result;
-	}
-	auto list_array = std::dynamic_pointer_cast<arrow::ListArray>(column);
-	if (!list_array || list_array->IsNull(row_idx)) {
-		return result;
-	}
-
-	int64_t start = list_array->value_offset(row_idx);
-	int64_t end = list_array->value_offset(row_idx + 1);
-
-	auto string_array = std::dynamic_pointer_cast<arrow::StringArray>(list_array->values());
-	if (!string_array) {
-		return result;
-	}
-
-	for (int64_t i = start; i < end; i++) {
-		if (!string_array->IsNull(i)) {
-			result.push_back(string_array->GetString(i));
-		}
-	}
-	return result;
-}
-
-// Helper to get function parameters from a List<Struct> column
-std::vector<VgiFunctionParameter> GetParametersValue(const std::shared_ptr<arrow::RecordBatch> &batch,
-                                                     const std::string &column_name, int64_t row_idx) {
-	std::vector<VgiFunctionParameter> result;
-	auto column = batch->GetColumnByName(column_name);
-	if (!column) {
-		return result;
-	}
-	auto list_array = std::dynamic_pointer_cast<arrow::ListArray>(column);
-	if (!list_array || list_array->IsNull(row_idx)) {
-		return result;
-	}
-
-	// Get the offsets for this row's list elements
-	int64_t start = list_array->value_offset(row_idx);
-	int64_t end = list_array->value_offset(row_idx + 1);
-
-	// Get the struct array containing the list elements
-	auto struct_array = std::dynamic_pointer_cast<arrow::StructArray>(list_array->values());
-	if (!struct_array) {
-		return result;
-	}
-
-	// Get each field array from the struct
-	auto name_array = std::dynamic_pointer_cast<arrow::StringArray>(struct_array->GetFieldByName("name"));
-	auto position_array = std::dynamic_pointer_cast<arrow::Int32Array>(struct_array->GetFieldByName("position"));
-	auto arrow_type_array = std::dynamic_pointer_cast<arrow::StringArray>(struct_array->GetFieldByName("arrow_type"));
-	auto default_value_array =
-	    std::dynamic_pointer_cast<arrow::StringArray>(struct_array->GetFieldByName("default_value"));
-	auto doc_array = std::dynamic_pointer_cast<arrow::StringArray>(struct_array->GetFieldByName("doc"));
-	auto is_varargs_array = std::dynamic_pointer_cast<arrow::BooleanArray>(struct_array->GetFieldByName("is_varargs"));
-
-	for (int64_t i = start; i < end; i++) {
-		VgiFunctionParameter param;
-		if (name_array && !name_array->IsNull(i)) {
-			param.name = name_array->GetString(i);
-		}
-		if (position_array && !position_array->IsNull(i)) {
-			param.position = position_array->Value(i);
-		}
-		if (arrow_type_array && !arrow_type_array->IsNull(i)) {
-			param.arrow_type = arrow_type_array->GetString(i);
-		}
-		if (default_value_array && !default_value_array->IsNull(i)) {
-			param.default_value = default_value_array->GetString(i);
-		}
-		if (doc_array && !doc_array->IsNull(i)) {
-			param.doc = doc_array->GetString(i);
-		}
-		if (is_varargs_array && !is_varargs_array->IsNull(i)) {
-			param.is_varargs = is_varargs_array->Value(i);
-		}
-		result.push_back(std::move(param));
-	}
-
-	return result;
-}
-
-} // namespace
-
-CatalogAttachResult ParseCatalogAttachResult(const std::shared_ptr<arrow::RecordBatch> &batch) {
+CatalogAttachResult ParseCatalogAttachResult(const std::shared_ptr<arrow::RecordBatch> &batch,
+                                             const std::string &worker_path) {
 	CatalogAttachResult result;
 
 	if (!batch || batch->num_rows() == 0) {
 		throw IOException("Empty response from catalog_attach");
 	}
 
-	result.attach_id = GetBinaryValue(batch, "attach_id", 0);
-	result.supports_transactions = GetBoolValue(batch, "supports_transactions", 0);
-	result.supports_time_travel = GetBoolValue(batch, "supports_time_travel", 0);
-	result.catalog_version_frozen = GetBoolValue(batch, "catalog_version_frozen", 0);
-	result.catalog_version = GetInt64Value(batch, "catalog_version", 0);
-	result.attach_id_required = GetBoolValue(batch, "attach_id_required", 0);
-	result.default_schema = GetStringValue(batch, "default_schema", 0);
+	RecordBatchSingleRow row(batch, 0, "CatalogAttachResult", worker_path);
+	result.attach_id = row["attach_id"].value_not_null<std::vector<uint8_t>>();
+	result.supports_transactions = row["supports_transactions"].value_not_null<bool>();
+	result.supports_time_travel = row["supports_time_travel"].value_not_null<bool>();
+	result.catalog_version_frozen = row["catalog_version_frozen"].value_not_null<bool>();
+	result.catalog_version = row["catalog_version"].value_not_null<int64_t>();
+	result.attach_id_required = row["attach_id_required"].value_not_null<bool>();
+	result.default_schema = row["default_schema"].value_not_null<std::string>();
 	if (result.default_schema.empty()) {
 		result.default_schema = "main";
 	}
@@ -554,45 +303,52 @@ CatalogAttachResult ParseCatalogAttachResult(const std::shared_ptr<arrow::Record
 	return result;
 }
 
-VgiSchemaInfo ParseSchemaInfo(const std::shared_ptr<arrow::RecordBatch> &batch) {
+VgiSchemaInfo ParseSchemaInfo(const std::shared_ptr<arrow::RecordBatch> &batch, const std::string &worker_path) {
 	VgiSchemaInfo info;
 
 	if (!batch || batch->num_rows() == 0) {
 		throw IOException("Empty response from schema_get");
 	}
 
-	info.name = GetStringValue(batch, "name", 0);
-	info.comment = GetStringValue(batch, "comment", 0);
-	info.tags = GetStringMapValue(batch, "tags", 0);
+	RecordBatchSingleRow row(batch, 0, "SchemaInfo", worker_path);
+	info.name = row["name"].value_not_null<std::string>();
+	info.comment = row["comment"].value_or("");
+	info.tags = row["tags"].value_not_null<std::map<std::string, std::string>>();
 
 	return info;
 }
 
-VgiTableInfo ParseTableInfo(const std::shared_ptr<arrow::RecordBatch> &batch) {
+VgiTableInfo ParseTableInfo(const std::shared_ptr<arrow::RecordBatch> &batch, const std::string &worker_path) {
 	VgiTableInfo info;
 
 	if (!batch || batch->num_rows() == 0) {
 		throw IOException("Empty response from table_get");
 	}
 
-	info.name = GetStringValue(batch, "name", 0);
-	info.schema_name = GetStringValue(batch, "schema_name", 0);
-	info.comment = GetStringValue(batch, "comment", 0);
-	info.tags = GetStringMapValue(batch, "tags", 0);
+	RecordBatchSingleRow row(batch, 0, "TableInfo", worker_path);
+	info.name = row["name"].value_not_null<std::string>();
+	info.schema_name = row["schema_name"].value_not_null<std::string>();
+	info.comment = row["comment"].value_or("");
+	info.tags = row["tags"].value_not_null<std::map<std::string, std::string>>();
 
 	// Parse the columns field which contains a serialized Arrow schema
-	auto columns_data = GetBinaryValue(batch, "columns", 0);
+	auto columns_data = row["columns"].value_not_null<std::vector<uint8_t>>();
 	info.arrow_schema = DeserializeSchema(columns_data);
 
-	// Parse constraints if present
-	info.not_null_constraints = GetInt32ListValue(batch, "not_null_constraints", 0);
-	info.unique_constraints = GetInt32ListListValue(batch, "unique_constraints", 0);
-	info.check_constraints = GetStringListValue(batch, "check_constraints", 0);
+	// Parse constraints (non-nullable arrays per protocol)
+	auto not_null = row["not_null_constraints"].value_not_null<std::vector<int32_t>>();
+	info.not_null_constraints = std::vector<int>(not_null.begin(), not_null.end());
+	auto unique = row["unique_constraints"].value_not_null<std::vector<std::vector<int32_t>>>();
+	for (const auto &u : unique) {
+		info.unique_constraints.push_back(std::vector<int>(u.begin(), u.end()));
+	}
+	info.check_constraints = row["check_constraints"].value_not_null<std::vector<std::string>>();
 
 	return info;
 }
 
-std::vector<VgiSchemaInfo> ParseSchemaList(const std::shared_ptr<arrow::RecordBatch> &batch) {
+std::vector<VgiSchemaInfo> ParseSchemaList(const std::shared_ptr<arrow::RecordBatch> &batch,
+                                           const std::string &worker_path) {
 	std::vector<VgiSchemaInfo> schemas;
 
 	if (!batch || batch->num_rows() == 0) {
@@ -600,14 +356,32 @@ std::vector<VgiSchemaInfo> ParseSchemaList(const std::shared_ptr<arrow::RecordBa
 	}
 
 	for (int64_t i = 0; i < batch->num_rows(); i++) {
+		RecordBatchSingleRow row(batch, i, "SchemaInfo", worker_path);
 		VgiSchemaInfo info;
-		info.name = GetStringValue(batch, "name", i);
-		info.comment = GetStringValue(batch, "comment", i);
-		info.tags = GetStringMapValue(batch, "tags", i);
+		info.name = row["name"].value_not_null<std::string>();
+		info.comment = row["comment"].value_or("");
+		info.tags = row["tags"].value_not_null<std::map<std::string, std::string>>();
 		schemas.push_back(std::move(info));
 	}
 
 	return schemas;
+}
+
+VgiViewInfo ParseViewInfo(const std::shared_ptr<arrow::RecordBatch> &batch, const std::string &worker_path) {
+	VgiViewInfo info;
+
+	if (!batch || batch->num_rows() == 0) {
+		throw IOException("Empty response from view_get");
+	}
+
+	RecordBatchSingleRow row(batch, 0, "ViewInfo", worker_path);
+	info.name = row["name"].value_not_null<std::string>();
+	info.schema_name = row["schema_name"].value_not_null<std::string>();
+	info.definition = row["definition"].value_not_null<std::string>();
+	info.comment = row["comment"].value_or("");
+	info.tags = row["tags"].value_not_null<std::map<std::string, std::string>>();
+
+	return info;
 }
 
 // ============================================================================
@@ -627,32 +401,53 @@ CreateTableInfo CreateTableInfoFromVgiTable(ClientContext &context, const VgiTab
 	return create_info;
 }
 
-VgiFunctionInfo ParseFunctionInfo(const std::shared_ptr<arrow::RecordBatch> &batch) {
+VgiFunctionInfo ParseFunctionInfo(const std::shared_ptr<arrow::RecordBatch> &batch, int64_t row_idx,
+                                  const std::string &worker_path) {
 	VgiFunctionInfo info;
 
 	if (!batch || batch->num_rows() == 0) {
 		throw IOException("Empty response from function_get");
 	}
 
-	info.name = GetStringValue(batch, "name", 0);
-	info.schema_name = GetStringValue(batch, "schema_name", 0);
-	info.type = GetStringValue(batch, "type", 0);
-	info.description = GetStringValue(batch, "description", 0);
-	info.cardinality_estimate = GetInt64Value(batch, "cardinality_estimate", 0);
-	info.max_workers = static_cast<int32_t>(GetInt64Value(batch, "max_workers", 0));
+	if (row_idx >= batch->num_rows()) {
+		throw IOException("Row index %lld out of range (batch has %lld rows)", row_idx, batch->num_rows());
+	}
+
+	RecordBatchSingleRow row(batch, row_idx, "FunctionInfo", worker_path);
+
+	// Required fields (non-nullable per protocol)
+	info.name = row["name"].value_not_null<std::string>();
+	info.schema_name = row["schema_name"].value_not_null<std::string>();
+	info.function_type = row["function_type"].value_not_null<std::string>();
+	info.tags = row["tags"].value_not_null<std::map<std::string, std::string>>();
+
+	// Optional string fields (nullable per protocol)
+	info.comment = row["comment"].value_or("");
+	info.stability = row["stability"].value_or("");
+	info.null_handling = row["null_handling"].value_or("");
+	info.order_preservation = row["order_preservation"].value_or("");
+
+	// Parse the arguments field which contains a serialized Arrow schema (non-nullable)
+	auto args_data = row["arguments"].value_not_null<std::vector<uint8_t>>();
+	if (!args_data.empty()) {
+		info.arguments_schema = DeserializeSchema(args_data);
+	}
+
+	// Parse the output_schema field which contains a serialized Arrow schema (non-nullable)
+	auto output_data = row["output_schema"].value_not_null<std::vector<uint8_t>>();
+	if (!output_data.empty()) {
+		info.output_schema = DeserializeSchema(output_data);
+	}
+
+	// Table function capabilities (nullable booleans)
+	info.projection_pushdown = row["projection_pushdown"].value_or(false);
+	info.filter_pushdown = row["filter_pushdown"].value_or(false);
+
+	// max_workers (nullable int)
+	info.max_workers = row["max_workers"].value_or(int32_t{1});
 	if (info.max_workers <= 0) {
 		info.max_workers = 1;
 	}
-	info.tags = GetStringMapValue(batch, "tags", 0);
-
-	// Parse the return_schema field which contains a serialized Arrow schema
-	auto schema_data = GetBinaryValue(batch, "return_schema", 0);
-	if (!schema_data.empty()) {
-		info.return_schema = DeserializeSchema(schema_data);
-	}
-
-	// Parse parameters if present (List<Struct>)
-	info.parameters = GetParametersValue(batch, "parameters", 0);
 
 	return info;
 }
@@ -666,7 +461,7 @@ VgiFunctionInfo GetFunctionInfo(const std::string &worker_path, const std::vecto
                                 ClientContext &context, bool worker_debug) {
 	auto args = CreateFunctionGetArgs(attach_id, schema_name, function_name);
 	auto result_batch = InvokeCatalogMethod(worker_path, "function_get", args, context, worker_debug);
-	return ParseFunctionInfo(result_batch);
+	return ParseFunctionInfo(result_batch, 0, worker_path);
 }
 
 // ============================================================================

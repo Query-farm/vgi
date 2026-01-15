@@ -11,7 +11,8 @@
 namespace duckdb {
 
 VgiSchemaEntry::VgiSchemaEntry(Catalog &catalog, CreateSchemaInfo &info, const vgi::VgiSchemaInfo &schema_info)
-    : SchemaCatalogEntry(catalog, info), schema_info_(schema_info), tables_(catalog, *this) {
+    : SchemaCatalogEntry(catalog, info), schema_info_(schema_info), tables_(catalog, *this), views_(catalog, *this),
+      scalar_functions_(catalog, *this), table_functions_(catalog, *this) {
 }
 
 VgiSchemaEntry::~VgiSchemaEntry() = default;
@@ -66,10 +67,23 @@ void VgiSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 
 void VgiSchemaEntry::Scan(ClientContext &context, CatalogType type,
                           const std::function<void(CatalogEntry &)> &callback) {
-	if (type == CatalogType::TABLE_ENTRY) {
+	switch (type) {
+	case CatalogType::TABLE_ENTRY:
 		tables_.Scan(context, callback);
+		break;
+	case CatalogType::VIEW_ENTRY:
+		views_.Scan(context, callback);
+		break;
+	case CatalogType::SCALAR_FUNCTION_ENTRY:
+		scalar_functions_.Scan(context, callback);
+		break;
+	case CatalogType::TABLE_FUNCTION_ENTRY:
+		table_functions_.Scan(context, callback);
+		break;
+	default:
+		// Other types not yet implemented
+		break;
 	}
-	// Other types (functions, etc.) not yet implemented
 }
 
 void VgiSchemaEntry::Scan(CatalogType type, const std::function<void(CatalogEntry &)> &callback) {
@@ -83,18 +97,37 @@ void VgiSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
 optional_ptr<CatalogEntry> VgiSchemaEntry::LookupEntry(CatalogTransaction transaction,
                                                        const EntryLookupInfo &lookup_info) {
 	auto type = lookup_info.GetCatalogType();
-	if (type == CatalogType::TABLE_ENTRY) {
-		return tables_.GetEntry(transaction.GetContext(), lookup_info.GetEntryName());
+	auto &entry_name = lookup_info.GetEntryName();
+	auto &context = transaction.GetContext();
+
+	switch (type) {
+	case CatalogType::TABLE_ENTRY:
+		return tables_.GetEntry(context, entry_name);
+	case CatalogType::VIEW_ENTRY:
+		return views_.GetEntry(context, entry_name);
+	case CatalogType::SCALAR_FUNCTION_ENTRY:
+		return scalar_functions_.GetEntry(context, entry_name);
+	case CatalogType::TABLE_FUNCTION_ENTRY:
+		return table_functions_.GetEntry(context, entry_name);
+	default:
+		// Other types not yet implemented
+		return nullptr;
 	}
-	// Other types (functions, etc.) not yet implemented
-	return nullptr;
 }
 
 VgiCatalogSet &VgiSchemaEntry::GetCatalogSet(CatalogType type) {
-	if (type == CatalogType::TABLE_ENTRY) {
+	switch (type) {
+	case CatalogType::TABLE_ENTRY:
 		return tables_;
+	case CatalogType::VIEW_ENTRY:
+		return views_;
+	case CatalogType::SCALAR_FUNCTION_ENTRY:
+		return scalar_functions_;
+	case CatalogType::TABLE_FUNCTION_ENTRY:
+		return table_functions_;
+	default:
+		throw InternalException("Unsupported catalog type for VgiSchemaEntry");
 	}
-	throw InternalException("Unsupported catalog type for VgiSchemaEntry");
 }
 
 } // namespace duckdb

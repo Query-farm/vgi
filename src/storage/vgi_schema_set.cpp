@@ -35,13 +35,14 @@ void VgiSchemaSet::LoadEntries(ClientContext &context) {
 	}
 
 	// Call "schemas" method via streaming API
+	auto worker_path = attach_params->worker_path();
 	auto args = vgi::CreateCatalogArgsWithAttachId(attach_result->attach_id);
-	vgi::CatalogMethodStream stream(attach_params->worker_path(), "schemas", args, context, attach_params->worker_debug());
+	vgi::CatalogMethodStream stream(worker_path, "schemas", args, context, attach_params->worker_debug());
 
 	// Read schema entries from the stream
 	while (auto result_batch = stream.ReadNext()) {
 		// Parse schema list from this batch
-		auto schema_list = vgi::ParseSchemaList(result_batch);
+		auto schema_list = vgi::ParseSchemaList(result_batch, worker_path);
 
 		// Create schema entries
 		for (auto &schema_info : schema_list) {
