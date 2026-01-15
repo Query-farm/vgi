@@ -43,15 +43,28 @@ SELECT COUNT(*) > 0 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%Gen
 ----
 true
 
-# Verify log messages include the INFO level
+# Verify in-band log messages include worker context for debugging
+# Check level is present
 query I
-SELECT COUNT(*) > 0 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%level=INFO%';
+SELECT COUNT(*) > 0 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%Starting generation%' AND message LIKE '%level=INFO%';
 ----
 true
 
-# Verify worker path is included in VGI infrastructure log messages (bind, init, etc.)
+# Check worker_path is present in in-band messages
 query I
-SELECT COUNT(*) > 0 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%table_function.bind%' AND message LIKE '%worker_path=%';
+SELECT COUNT(*) > 0 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%Starting generation%' AND message LIKE '%worker_path=%';
+----
+true
+
+# Check worker_pid is present in in-band messages
+query I
+SELECT COUNT(*) > 0 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%Starting generation%' AND message LIKE '%worker_pid=%';
+----
+true
+
+# Check invocation_id is present in in-band messages
+query I
+SELECT COUNT(*) > 0 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%Starting generation%' AND message LIKE '%invocation_id=%';
 ----
 true
 

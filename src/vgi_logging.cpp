@@ -142,9 +142,14 @@ bool HandleBatchLogMessage(const std::shared_ptr<arrow::RecordBatch> &batch,
 
 	// For non-exception log levels, log to DuckDB if we have a context
 	if (context) {
-		// Create log info with the level and optional details
+		// Create log info with worker context and level for debugging
 		vector<pair<string, string>> info;
+		info.emplace_back("worker_path", worker_path);
+		info.emplace_back("worker_pid", std::to_string(worker_pid));
 		info.emplace_back("level", log_level);
+		if (!invocation_id_hex.empty()) {
+			info.emplace_back("invocation_id", invocation_id_hex);
+		}
 		if (!exception_type.empty()) {
 			info.emplace_back("exception_type", exception_type);
 		}
