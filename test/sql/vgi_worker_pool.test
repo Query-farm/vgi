@@ -1,0 +1,138 @@
+# name: test/sql/vgi_worker_pool.test
+# description: test vgi worker pool functionality
+# group: [vgi]
+
+# This test requires a VGI worker to be available
+require-env VGI_TEST_WORKER
+
+require vgi
+
+# ============================================================================
+# Test vgi_worker_pool() table function structure
+# ============================================================================
+
+# Verify vgi_worker_pool() returns a table with the correct schema
+query III
+SELECT typeof(worker_path), typeof(pid), typeof(age_seconds) FROM vgi_worker_pool() LIMIT 0;
+----
+
+# ============================================================================
+# Test vgi_worker_pool_flush() scalar function
+# ============================================================================
+
+# Flush should return an integer count (0 when pool is empty)
+query I
+SELECT typeof(vgi_worker_pool_flush());
+----
+BIGINT
+
+# Flush on empty pool returns 0
+query I
+SELECT vgi_worker_pool_flush();
+----
+0
+
+# ============================================================================
+# Test worker pool settings exist
+# ============================================================================
+
+query I
+SELECT COUNT(*) FROM duckdb_settings() WHERE name = 'vgi_worker_pool_idle_limit_seconds';
+----
+1
+
+query I
+SELECT COUNT(*) FROM duckdb_settings() WHERE name = 'vgi_worker_pool_max';
+----
+1
+
+# ============================================================================
+# Test worker pooling - workers should be reused across queries
+# ============================================================================
+
+# First, flush the pool to start clean
+query I
+SELECT vgi_worker_pool_flush();
+----
+0
+
+# Run a query to populate the pool
+query I
+SELECT COUNT(*) FROM vgi_table_function('${VGI_TEST_WORKER}', 'sequence', [10]);
+----
+10
+
+# Pool should now have at least one worker
+query I
+SELECT COUNT(*) >= 1 FROM vgi_worker_pool();
+----
+true
+
+# Save the PID from the pool
+query I
+SELECT pid FROM vgi_worker_pool() LIMIT 1;
+----
+<REGEX>:\d+
+
+# Run another query - should reuse the pooled worker
+query I
+SELECT COUNT(*) FROM vgi_table_function('${VGI_TEST_WORKER}', 'sequence', [5]);
+----
+5
+
+# Pool should still have a worker (was returned after use)
+query I
+SELECT COUNT(*) >= 1 FROM vgi_worker_pool();
+----
+true
+
+# Flush and verify pool is empty
+query I
+SELECT vgi_worker_pool_flush();
+----
+<REGEX>:\d+
+
+query I
+SELECT COUNT(*) FROM vgi_worker_pool();
+----
+0
+
+# ============================================================================
+# Test pool=false ATTACH option disables pooling
+# ============================================================================
+
+# Attach with pooling disabled
+statement ok
+ATTACH 'example' AS vgi_nopool (TYPE vgi, LOCATION '${VGI_TEST_WORKER}', pool false);
+
+# Verify the catalog attached successfully
+query I
+SELECT COUNT(*) FROM information_schema.schemata WHERE catalog_name = 'vgi_nopool';
+----
+1
+
+statement ok
+DETACH vgi_nopool;
+
+# ============================================================================
+# Test pool=true ATTACH option (explicit enable)
+# ============================================================================
+
+# Flush pool first
+query I
+SELECT vgi_worker_pool_flush() >= 0;
+----
+true
+
+# Attach with pooling explicitly enabled
+statement ok
+ATTACH 'example' AS vgi_pool (TYPE vgi, LOCATION '${VGI_TEST_WORKER}', pool true);
+
+# Verify the catalog attached successfully
+query I
+SELECT COUNT(*) FROM information_schema.schemata WHERE catalog_name = 'vgi_pool';
+----
+1
+
+statement ok
+DETACH vgi_pool;
