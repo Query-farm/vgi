@@ -227,6 +227,7 @@ FROM example.partitioned_sequence(50000, increment=2);
 # ============================================================================
 # Single-threaded execution (threads=1)
 # Verifies correctness when only one worker can be used
+# Using smaller sizes (25K) since single-threaded is slower
 # ============================================================================
 
 statement ok
@@ -235,14 +236,14 @@ SET threads=1;
 # Correctness test
 query IIII
 SELECT COUNT(*) as total, COUNT(DISTINCT n) as distinct_count, MIN(n) as min_val, MAX(n) as max_val
-FROM example.partitioned_sequence(100000);
+FROM example.partitioned_sequence(25000);
 ----
-100000	100000	0	99999
+25000	25000	0	24999
 
 # Sum verification (no gaps)
 query I
-SELECT SUM(n) = (100000::BIGINT * 99999 / 2) as sum_correct
-FROM example.partitioned_sequence(100000);
+SELECT SUM(n) = (25000::BIGINT * 24999 / 2) as sum_correct
+FROM example.partitioned_sequence(25000);
 ----
 true
 
@@ -252,9 +253,9 @@ CALL truncate_duckdb_logs();
 
 query IIII
 SELECT COUNT(*) as total, COUNT(DISTINCT n) as distinct_count, MIN(n) as min_val, MAX(n) as max_val
-FROM example.partitioned_sequence(100000);
+FROM example.partitioned_sequence(25000);
 ----
-100000	100000	0	99999
+25000	25000	0	24999
 
 # Verify only one worker was used (single PID in batch_received logs)
 query I
