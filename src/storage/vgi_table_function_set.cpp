@@ -96,7 +96,7 @@ void VgiTableFunctionSet::LoadEntries(ClientContext &context) {
 			FunctionDescription desc;
 			desc.parameter_types = input_types;
 			desc.parameter_names = input_names;
-			desc.description = func_info.comment;
+			desc.description = func_info.description;
 			for (const auto &ex : func_info.examples) {
 				desc.examples.push_back(ex);
 			}

@@ -124,6 +124,7 @@ public:
 	// Does NOT throw if column missing - just returns default
 	// ========================================================================
 	std::string value_or(const std::string &default_val) const;
+	std::string value_or(const char *default_val) const;  // Prevent implicit conversion to optional
 	int64_t value_or(int64_t default_val) const;
 	int32_t value_or(int32_t default_val) const;
 	bool value_or(bool default_val) const;

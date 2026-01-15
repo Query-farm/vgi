@@ -211,7 +211,7 @@ struct VgiFunctionInfo {
 	std::string name;
 	std::string schema_name;
 	VgiFunctionType function_type = VgiFunctionType::Scalar;
-	std::string comment;
+	std::string description;
 	std::map<std::string, std::string> tags;
 
 	// Arguments and output as deserialized Arrow schemas

@@ -463,8 +463,8 @@ VgiFunctionInfo ParseFunctionInfo(const std::shared_ptr<arrow::RecordBatch> &bat
 	}
 	info.function_type = *function_type;
 
-	// Optional string field for comment
-	info.comment = row["comment"].value_or("");
+	// Optional string field for description
+	info.description = row["description"].value_or("");
 
 	// Parse optional enum fields (nullable per protocol)
 	auto stability_str = row["stability"].as<std::string>();

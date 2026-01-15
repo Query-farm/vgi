@@ -448,6 +448,10 @@ std::string ColumnValue::value_or(const std::string &default_val) const {
 	return opt.value_or(default_val);
 }
 
+std::string ColumnValue::value_or(const char *default_val) const {
+	return value_or(std::string{default_val});
+}
+
 int64_t ColumnValue::value_or(int64_t default_val) const {
 	auto opt = static_cast<std::optional<int64_t>>(*this);
 	return opt.value_or(default_val);
