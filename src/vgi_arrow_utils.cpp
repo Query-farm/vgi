@@ -238,11 +238,32 @@ ColumnValue::operator std::optional<std::string>() const {
 	if (!column) {
 		return std::nullopt;
 	}
+
+	// Try plain StringArray first
 	auto string_array = std::dynamic_pointer_cast<arrow::StringArray>(column);
-	if (!string_array || string_array->IsNull(row_idx_)) {
-		return std::nullopt;
+	if (string_array) {
+		if (string_array->IsNull(row_idx_)) {
+			return std::nullopt;
+		}
+		return string_array->GetString(row_idx_);
 	}
-	return string_array->GetString(row_idx_);
+
+	// Try DictionaryArray with string values (used for enum-like fields)
+	auto dict_array = std::dynamic_pointer_cast<arrow::DictionaryArray>(column);
+	if (dict_array) {
+		if (dict_array->IsNull(row_idx_)) {
+			return std::nullopt;
+		}
+		// Get the index and look up the value in the dictionary
+		auto dict_values = std::dynamic_pointer_cast<arrow::StringArray>(dict_array->dictionary());
+		if (!dict_values) {
+			return std::nullopt;
+		}
+		auto index = dict_array->GetValueIndex(row_idx_);
+		return dict_values->GetString(index);
+	}
+
+	return std::nullopt;
 }
 
 ColumnValue::operator std::optional<int64_t>() const {

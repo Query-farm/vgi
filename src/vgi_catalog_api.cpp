@@ -70,6 +70,81 @@ static bool CheckWorkerExitStatus(SubProcess &proc, const std::string &worker_pa
 // CatalogMethod enum to string conversion
 // ============================================================================
 
+// ============================================================================
+// Enum parsing functions
+// ============================================================================
+
+std::optional<VgiFunctionType> ParseVgiFunctionType(const std::string &value) {
+	if (value == "scalar") {
+		return VgiFunctionType::Scalar;
+	} else if (value == "table" || value == "table_in_out") {
+		// Both "table" and "table_in_out" map to Table type
+		return VgiFunctionType::Table;
+	} else if (value == "aggregate") {
+		return VgiFunctionType::Aggregate;
+	}
+	return std::nullopt;
+}
+
+// Parse FunctionStability from wire format (Python enum .name)
+// Wire format: "CONSISTENT", "VOLATILE", "CONSISTENT_WITHIN_QUERY"
+static std::optional<FunctionStability> ParseFunctionStability(const std::string &value) {
+	if (value == "CONSISTENT") {
+		return FunctionStability::CONSISTENT;
+	} else if (value == "VOLATILE") {
+		return FunctionStability::VOLATILE;
+	} else if (value == "CONSISTENT_WITHIN_QUERY") {
+		return FunctionStability::CONSISTENT_WITHIN_QUERY;
+	}
+	return std::nullopt;
+}
+
+// Parse FunctionNullHandling from wire format (Python enum .name)
+// Wire format: "DEFAULT", "SPECIAL"
+static std::optional<FunctionNullHandling> ParseFunctionNullHandling(const std::string &value) {
+	if (value == "DEFAULT") {
+		return FunctionNullHandling::DEFAULT_NULL_HANDLING;
+	} else if (value == "SPECIAL") {
+		return FunctionNullHandling::SPECIAL_HANDLING;
+	}
+	return std::nullopt;
+}
+
+std::optional<VgiOrderPreservation> ParseVgiOrderPreservation(const std::string &value) {
+	if (value == "PRESERVES_ORDER") {
+		return VgiOrderPreservation::PreservesOrder;
+	} else if (value == "NO_ORDER_GUARANTEE") {
+		return VgiOrderPreservation::NoOrderGuarantee;
+	}
+	return std::nullopt;
+}
+
+// Parse AggregateOrderDependent from wire format (Python enum .name)
+// Wire format: "ORDER_DEPENDENT", "NOT_ORDER_DEPENDENT"
+static std::optional<AggregateOrderDependent> ParseAggregateOrderDependent(const std::string &value) {
+	if (value == "ORDER_DEPENDENT") {
+		return AggregateOrderDependent::ORDER_DEPENDENT;
+	} else if (value == "NOT_ORDER_DEPENDENT") {
+		return AggregateOrderDependent::NOT_ORDER_DEPENDENT;
+	}
+	return std::nullopt;
+}
+
+// Parse AggregateDistinctDependent from wire format (Python enum .name)
+// Wire format: "DISTINCT_DEPENDENT", "NOT_DISTINCT_DEPENDENT"
+static std::optional<AggregateDistinctDependent> ParseAggregateDistinctDependent(const std::string &value) {
+	if (value == "DISTINCT_DEPENDENT") {
+		return AggregateDistinctDependent::DISTINCT_DEPENDENT;
+	} else if (value == "NOT_DISTINCT_DEPENDENT") {
+		return AggregateDistinctDependent::NOT_DISTINCT_DEPENDENT;
+	}
+	return std::nullopt;
+}
+
+// ============================================================================
+// CatalogMethod enum to string conversion
+// ============================================================================
+
 const char *CatalogMethodToString(CatalogMethod method) {
 	switch (method) {
 	case CatalogMethod::Catalogs:
@@ -377,17 +452,59 @@ VgiFunctionInfo ParseFunctionInfo(const std::shared_ptr<arrow::RecordBatch> &bat
 	// Required fields (non-nullable per protocol)
 	info.name = row["name"].value_not_null<std::string>();
 	info.schema_name = row["schema_name"].value_not_null<std::string>();
-	info.function_type = row["function_type"].value_not_null<std::string>();
 	info.tags = row["tags"].value_not_null<std::map<std::string, std::string>>();
 
-	// Optional string fields (nullable per protocol)
-	info.comment = row["comment"].value_or("");
-	info.stability = row["stability"].value_or("");
-	info.null_handling = row["null_handling"].value_or("");
-	info.order_preservation = row["order_preservation"].value_or("");
+	// Parse function_type as enum (required, non-nullable)
+	auto function_type_str = row["function_type"].value_not_null<std::string>();
+	auto function_type = ParseVgiFunctionType(function_type_str);
+	if (!function_type) {
+		throw IOException("VGI worker '%s' returned unknown function_type '%s' for function '%s'", worker_path,
+		                  function_type_str, info.name);
+	}
+	info.function_type = *function_type;
 
-	// Documentation fields (nullable arrays per protocol)
-	info.examples = row["examples"].value_or(std::vector<std::string>{});
+	// Optional string field for comment
+	info.comment = row["comment"].value_or("");
+
+	// Parse optional enum fields (nullable per protocol)
+	auto stability_str = row["stability"].as<std::string>();
+	if (stability_str) {
+		info.stability = ParseFunctionStability(*stability_str);
+	}
+
+	auto null_handling_str = row["null_handling"].as<std::string>();
+	if (null_handling_str) {
+		info.null_handling = ParseFunctionNullHandling(*null_handling_str);
+	}
+
+	auto order_preservation_str = row["order_preservation"].as<std::string>();
+	if (order_preservation_str) {
+		info.order_preservation = ParseVgiOrderPreservation(*order_preservation_str);
+	}
+
+	// Documentation fields
+	// examples is a list of structs with {sql, description, expected_output} - extract sql strings
+	auto examples_col = batch->GetColumnByName("examples");
+	if (examples_col) {
+		auto list_array = std::dynamic_pointer_cast<arrow::ListArray>(examples_col);
+		if (list_array && !list_array->IsNull(row_idx)) {
+			auto start = list_array->value_offset(row_idx);
+			auto end = list_array->value_offset(row_idx + 1);
+			auto struct_array = std::dynamic_pointer_cast<arrow::StructArray>(list_array->values());
+			if (struct_array) {
+				auto sql_field = struct_array->GetFieldByName("sql");
+				auto sql_array = std::dynamic_pointer_cast<arrow::StringArray>(sql_field);
+				if (sql_array) {
+					for (int64_t i = start; i < end; i++) {
+						if (!sql_array->IsNull(i)) {
+							info.examples.push_back(sql_array->GetString(i));
+						}
+					}
+				}
+			}
+		}
+	}
+	// categories is a simple list of strings
 	info.categories = row["categories"].value_or(std::vector<std::string>{});
 
 	// Parse the arguments field which contains a serialized Arrow schema (non-nullable)
@@ -402,15 +519,21 @@ VgiFunctionInfo ParseFunctionInfo(const std::shared_ptr<arrow::RecordBatch> &bat
 		info.output_schema = DeserializeSchema(output_data);
 	}
 
-	// Table function capabilities (nullable booleans)
-	info.projection_pushdown = row["projection_pushdown"].value_or(false);
-	info.filter_pushdown = row["filter_pushdown"].value_or(false);
+	// Table function capabilities (nullable booleans, stored as optional)
+	info.projection_pushdown = row["projection_pushdown"].as<bool>();
+	info.filter_pushdown = row["filter_pushdown"].as<bool>();
 
-	// max_workers (nullable int)
-	info.max_workers = row["max_workers"].value_or(int32_t{1});
-	if (info.max_workers <= 0) {
-		info.max_workers = 1;
-	}
+	// max_workers (nullable int, stored as optional)
+	info.max_workers = row["max_workers"].as<int32_t>();
+
+	// Aggregate function fields (non-nullable with defaults)
+	auto order_dependent_str = row["order_dependent"].value_or(std::string{"NOT_ORDER_DEPENDENT"});
+	auto order_dependent = ParseAggregateOrderDependent(order_dependent_str);
+	info.order_dependent = order_dependent.value_or(AggregateOrderDependent::NOT_ORDER_DEPENDENT);
+
+	auto distinct_dependent_str = row["distinct_dependent"].value_or(std::string{"NOT_DISTINCT_DEPENDENT"});
+	auto distinct_dependent = ParseAggregateDistinctDependent(distinct_dependent_str);
+	info.distinct_dependent = distinct_dependent.value_or(AggregateDistinctDependent::NOT_DISTINCT_DEPENDENT);
 
 	return info;
 }

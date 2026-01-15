@@ -5,6 +5,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -12,6 +13,9 @@
 #include <arrow/api.h>
 #include <arrow/io/api.h>
 #include <arrow/ipc/api.h>
+
+#include "duckdb/function/aggregate_state.hpp"
+#include "duckdb/function/function.hpp"
 
 #include "vgi_protocol.hpp"
 #include "vgi_subprocess.hpp"
@@ -174,11 +178,39 @@ struct VgiViewInfo {
 	std::map<std::string, std::string> tags;
 };
 
+// ============================================================================
+// Function Metadata Enums and Parsing
+// ============================================================================
+
+// Type of function for DuckDB registration
+// Wire format: lowercase string ("scalar", "table", "aggregate")
+enum class VgiFunctionType {
+	Scalar,    // Scalar function: one output per input row
+	Table,     // Table function: returns a table (includes table_in_out)
+	Aggregate  // Aggregate function: many inputs → one output
+};
+
+// Parse VgiFunctionType from wire format string
+// Returns nullopt for unrecognized values
+std::optional<VgiFunctionType> ParseVgiFunctionType(const std::string &value);
+
+// Row order preservation behavior for table functions
+// Wire format: uppercase enum name ("PRESERVES_ORDER", "NO_ORDER_GUARANTEE")
+enum class VgiOrderPreservation {
+	PreservesOrder,    // Output rows are in same order as input rows
+	NoOrderGuarantee   // Output order is undefined (may be reordered)
+};
+
+// Parse VgiOrderPreservation from wire format string
+// Returns nullopt for unrecognized values
+std::optional<VgiOrderPreservation> ParseVgiOrderPreservation(const std::string &value);
+
+// ============================================================================
 // Function metadata from the worker (matches Python FunctionInfo)
 struct VgiFunctionInfo {
 	std::string name;
 	std::string schema_name;
-	std::string function_type;  // "scalar", "table", "table_in_out", "aggregate"
+	VgiFunctionType function_type = VgiFunctionType::Scalar;
 	std::string comment;
 	std::map<std::string, std::string> tags;
 
@@ -190,15 +222,21 @@ struct VgiFunctionInfo {
 	std::vector<std::string> examples;    // SQL examples showing function usage
 	std::vector<std::string> categories;  // Function categories for organization
 
-	// Scalar function behavior fields (empty if not applicable)
-	std::string stability;      // "immutable", "stable", "volatile"
-	std::string null_handling;  // "called_on_null_input", "returns_null_on_null_input", "special_null_handling"
+	// Scalar function behavior fields (nullopt if not applicable)
+	// Uses DuckDB's FunctionStability enum (CONSISTENT, VOLATILE, CONSISTENT_WITHIN_QUERY)
+	std::optional<FunctionStability> stability;
+	// Uses DuckDB's FunctionNullHandling enum (DEFAULT_NULL_HANDLING, SPECIAL_HANDLING)
+	std::optional<FunctionNullHandling> null_handling;
 
-	// Table function capabilities
-	bool projection_pushdown = false;
-	bool filter_pushdown = false;
-	std::string order_preservation;  // "no_order", "fixed_order", "any_order"
-	int32_t max_workers = 1;
+	// Table function capabilities (nullopt if not applicable)
+	std::optional<bool> projection_pushdown;
+	std::optional<bool> filter_pushdown;
+	std::optional<VgiOrderPreservation> order_preservation;
+	std::optional<int32_t> max_workers;
+
+	// Aggregate function fields - uses DuckDB's enums
+	AggregateOrderDependent order_dependent = AggregateOrderDependent::NOT_ORDER_DEPENDENT;
+	AggregateDistinctDependent distinct_dependent = AggregateDistinctDependent::NOT_DISTINCT_DEPENDENT;
 };
 
 // Parse a CatalogAttachResult from an Arrow RecordBatch

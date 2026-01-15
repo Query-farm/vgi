@@ -60,9 +60,9 @@ void VgiTableFunctionSet::LoadEntries(ClientContext &context) {
 		// Parse each row in the batch as a function
 		for (int64_t i = 0; i < batch->num_rows(); i++) {
 			auto func_info = vgi::ParseFunctionInfo(batch, i, worker_path);
-			if (func_info.function_type != "table" && func_info.function_type != "table_in_out") {
-				throw IOException("VGI worker returned function_type '%s' when 'table' or 'table_in_out' was requested (function: %s)",
-				                  func_info.function_type, func_info.name);
+			if (func_info.function_type != vgi::VgiFunctionType::Table) {
+				throw IOException("VGI worker returned non-table function_type when 'table' was requested (function: %s)",
+				                  func_info.name);
 			}
 			functions_by_name[func_info.name].push_back(std::move(func_info));
 		}
@@ -88,8 +88,8 @@ void VgiTableFunctionSet::LoadEntries(ClientContext &context) {
 
 			// Create the table function
 			TableFunction table_func(input_types, VgiCatalogTableFunctionScan, VgiCatalogTableFunctionBind);
-			table_func.projection_pushdown = func_info.projection_pushdown;
-			table_func.filter_pushdown = func_info.filter_pushdown;
+			table_func.projection_pushdown = func_info.projection_pushdown.value_or(false);
+			table_func.filter_pushdown = func_info.filter_pushdown.value_or(false);
 			func_set.AddFunction(table_func);
 
 			// Create function description with full metadata
