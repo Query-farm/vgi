@@ -232,22 +232,29 @@ FROM example.partitioned_sequence(50000, increment=2);
 statement ok
 SET threads=1;
 
-statement ok
-CALL truncate_duckdb_logs();
-
-# 100K values with single thread - must still be correct
+# Correctness test
 query IIII
 SELECT COUNT(*) as total, COUNT(DISTINCT n) as distinct_count, MIN(n) as min_val, MAX(n) as max_val
 FROM example.partitioned_sequence(100000);
 ----
 100000	100000	0	99999
 
-# Verify sum is correct (no gaps)
+# Sum verification (no gaps)
 query I
 SELECT SUM(n) = (100000::BIGINT * 99999 / 2) as sum_correct
 FROM example.partitioned_sequence(100000);
 ----
 true
+
+# Worker count verification - truncate logs, run query, check PID count
+statement ok
+CALL truncate_duckdb_logs();
+
+query IIII
+SELECT COUNT(*) as total, COUNT(DISTINCT n) as distinct_count, MIN(n) as min_val, MAX(n) as max_val
+FROM example.partitioned_sequence(100000);
+----
+100000	100000	0	99999
 
 # Verify only one worker was used (single PID in batch_received logs)
 query I
@@ -265,32 +272,31 @@ true
 statement ok
 SET threads=4;
 
-statement ok
-CALL truncate_duckdb_logs();
-
-# 500K values with 4 threads - should use multiple workers
+# Correctness test
 query IIII
 SELECT COUNT(*) as total, COUNT(DISTINCT n) as distinct_count, MIN(n) as min_val, MAX(n) as max_val
 FROM example.partitioned_sequence(500000);
 ----
 500000	500000	0	499999
 
-# Verify sum is correct (no gaps even with parallel execution)
+# Sum verification (no gaps even with parallel execution)
 query I
 SELECT SUM(n) = (500000::BIGINT * 499999 / 2) as sum_correct
 FROM example.partitioned_sequence(500000);
 ----
 true
 
-# Verify multiple workers were used (multiple PIDs in batch_received logs)
-query I
-SELECT COUNT(DISTINCT regexp_extract(message, 'worker_pid=(\d+)', 1)) > 1
-FROM duckdb_logs()
-WHERE type = 'VGI' AND message LIKE '%batch_received%';
-----
-true
+# Worker count verification - truncate logs, run query, check PID count
+statement ok
+CALL truncate_duckdb_logs();
 
-# Verify we got batches from at least 2 different workers
+query IIII
+SELECT COUNT(*) as total, COUNT(DISTINCT n) as distinct_count, MIN(n) as min_val, MAX(n) as max_val
+FROM example.partitioned_sequence(500000);
+----
+500000	500000	0	499999
+
+# Verify multiple workers were used (at least 2 PIDs in batch_received logs)
 query I
 SELECT COUNT(DISTINCT regexp_extract(message, 'worker_pid=(\d+)', 1)) >= 2
 FROM duckdb_logs()
@@ -298,10 +304,10 @@ WHERE type = 'VGI' AND message LIKE '%batch_received%';
 ----
 true
 
+# 1M stress test - truncate logs, run query, verify
 statement ok
 CALL truncate_duckdb_logs();
 
-# 1M values stress test with parallelism
 query IIII
 SELECT COUNT(*) as total, COUNT(DISTINCT n) as distinct_count, MIN(n) as min_val, MAX(n) as max_val
 FROM example.partitioned_sequence(1000000);
@@ -315,9 +321,18 @@ FROM example.partitioned_sequence(1000000);
 ----
 true
 
-# Verify multiple workers for 1M
+# Verify multiple workers for 1M (check logs from the first 1M query only)
+statement ok
+CALL truncate_duckdb_logs();
+
+query IIII
+SELECT COUNT(*) as total, COUNT(DISTINCT n) as distinct_count, MIN(n) as min_val, MAX(n) as max_val
+FROM example.partitioned_sequence(1000000);
+----
+1000000	1000000	0	999999
+
 query I
-SELECT COUNT(DISTINCT regexp_extract(message, 'worker_pid=(\d+)', 1)) > 1
+SELECT COUNT(DISTINCT regexp_extract(message, 'worker_pid=(\d+)', 1)) >= 2
 FROM duckdb_logs()
 WHERE type = 'VGI' AND message LIKE '%batch_received%';
 ----
