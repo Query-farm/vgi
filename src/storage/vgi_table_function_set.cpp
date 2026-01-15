@@ -72,6 +72,9 @@ void VgiTableFunctionSet::LoadEntries(ClientContext &context) {
 	for (const auto &pair : functions_by_name) {
 		TableFunctionSet func_set(pair.first);
 
+		// Collect function descriptions for all overloads
+		vector<FunctionDescription> descriptions;
+
 		for (const auto &func_info : pair.second) {
 			// Convert argument types from Arrow schema using proper conversion
 			vector<LogicalType> input_types;
@@ -88,12 +91,26 @@ void VgiTableFunctionSet::LoadEntries(ClientContext &context) {
 			table_func.projection_pushdown = func_info.projection_pushdown;
 			table_func.filter_pushdown = func_info.filter_pushdown;
 			func_set.AddFunction(table_func);
+
+			// Create function description with full metadata
+			FunctionDescription desc;
+			desc.parameter_types = input_types;
+			desc.parameter_names = input_names;
+			desc.description = func_info.comment;
+			for (const auto &ex : func_info.examples) {
+				desc.examples.push_back(ex);
+			}
+			for (const auto &cat : func_info.categories) {
+				desc.categories.push_back(cat);
+			}
+			descriptions.push_back(std::move(desc));
 		}
 
 		// Create function info and entry
 		CreateTableFunctionInfo info(func_set);
 		info.schema = schema_.name;
 		info.internal = true;
+		info.descriptions = std::move(descriptions);
 
 		auto function_entry = make_uniq_base<StandardEntry, TableFunctionCatalogEntry>(
 		    catalog_, schema_, info.Cast<CreateTableFunctionInfo>());

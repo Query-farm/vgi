@@ -386,6 +386,10 @@ VgiFunctionInfo ParseFunctionInfo(const std::shared_ptr<arrow::RecordBatch> &bat
 	info.null_handling = row["null_handling"].value_or("");
 	info.order_preservation = row["order_preservation"].value_or("");
 
+	// Documentation fields (nullable arrays per protocol)
+	info.examples = row["examples"].value_or(std::vector<std::string>{});
+	info.categories = row["categories"].value_or(std::vector<std::string>{});
+
 	// Parse the arguments field which contains a serialized Arrow schema (non-nullable)
 	auto args_data = row["arguments"].value_not_null<std::vector<uint8_t>>();
 	if (!args_data.empty()) {

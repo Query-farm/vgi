@@ -186,6 +186,10 @@ struct VgiFunctionInfo {
 	std::shared_ptr<arrow::Schema> arguments_schema;
 	std::shared_ptr<arrow::Schema> output_schema;
 
+	// Documentation fields
+	std::vector<std::string> examples;    // SQL examples showing function usage
+	std::vector<std::string> categories;  // Function categories for organization
+
 	// Scalar function behavior fields (empty if not applicable)
 	std::string stability;      // "immutable", "stable", "volatile"
 	std::string null_handling;  // "called_on_null_input", "returns_null_on_null_input", "special_null_handling"
