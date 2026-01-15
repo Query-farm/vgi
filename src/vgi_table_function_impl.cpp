@@ -31,15 +31,26 @@ void PerformVgiTableFunctionBind(ClientContext &context, VgiTableFunctionBindDat
 	if (bind_data.use_pool) {
 		auto pooled = VgiWorkerPool::Instance().TryAcquire(bind_data.worker_path);
 		if (pooled) {
+			auto pooled_pid = pooled->GetPid();
 			conn = make_uniq<FunctionConnection>(std::move(pooled), bind_data.function_name, bind_data.arguments,
 			                                     bind_data.attach_id, context, std::vector<uint8_t>{},
 			                                     bind_data.worker_debug, bind_data.settings);
+			VGI_LOG(context, "worker_pool.acquire",
+			        {{"worker_path", bind_data.worker_path},
+			         {"worker_pid", std::to_string(pooled_pid)},
+			         {"result", "hit"},
+			         {"phase", "bind"}});
 		}
 	}
 	if (!conn) {
 		conn = make_uniq<FunctionConnection>(bind_data.worker_path, bind_data.function_name, bind_data.arguments,
 		                                     bind_data.attach_id, context, std::vector<uint8_t>{},
 		                                     bind_data.worker_debug, bind_data.settings);
+		VGI_LOG(context, "worker_pool.acquire",
+		        {{"worker_path", bind_data.worker_path},
+		         {"worker_pid", std::to_string(conn->GetPid())},
+		         {"result", bind_data.use_pool ? "miss" : "disabled"},
+		         {"phase", "bind"}});
 	}
 	bind_data.bind_connection = std::move(conn);
 
@@ -159,15 +170,26 @@ unique_ptr<LocalTableFunctionState> VgiTableFunctionInitLocal(ExecutionContext &
 		if (bind_data.use_pool) {
 			auto pooled = VgiWorkerPool::Instance().TryAcquire(bind_data.worker_path);
 			if (pooled) {
+				auto pooled_pid = pooled->GetPid();
 				local_state->connection = make_uniq<FunctionConnection>(
 				    std::move(pooled), bind_data.function_name, bind_data.arguments, bind_data.attach_id, context.client,
 				    global_state.global_execution_id, bind_data.worker_debug, bind_data.settings);
+				VGI_LOG(context.client, "worker_pool.acquire",
+				        {{"worker_path", bind_data.worker_path},
+				         {"worker_pid", std::to_string(pooled_pid)},
+				         {"result", "hit"},
+				         {"phase", "init_local_secondary"}});
 			}
 		}
 		if (!local_state->connection) {
 			local_state->connection = make_uniq<FunctionConnection>(
 			    bind_data.worker_path, bind_data.function_name, bind_data.arguments, bind_data.attach_id, context.client,
 			    global_state.global_execution_id, bind_data.worker_debug, bind_data.settings);
+			VGI_LOG(context.client, "worker_pool.acquire",
+			        {{"worker_path", bind_data.worker_path},
+			         {"worker_pid", std::to_string(local_state->connection->GetPid())},
+			         {"result", bind_data.use_pool ? "miss" : "disabled"},
+			         {"phase", "init_local_secondary"}});
 		}
 
 		// Perform bind for secondary worker

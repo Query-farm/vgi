@@ -706,8 +706,9 @@ FunctionConnection::FunctionConnection(std::unique_ptr<PooledWorker> pooled_work
                                        bool worker_debug, const std::map<std::string, std::string> &settings)
     : worker_path_(pooled_worker->GetWorkerPath()), function_name_(function_name), arguments_type_(arguments.type),
       arguments_array_(arguments.array), attach_id_(attach_id), global_execution_id_(global_execution_id),
-      context_(context), worker_debug_(worker_debug), settings_(settings), proc_(pooled_worker->Release()) {
-	// Start stderr reader thread for the existing subprocess
+      context_(context), worker_debug_(worker_debug), settings_(settings), proc_(pooled_worker->Release()),
+      stderr_fd_(pooled_worker->ReleaseStderrFd()) {
+	// Start stderr reader thread for the existing subprocess (reusing the fd)
 	StartStderrReader();
 }
 
@@ -731,11 +732,12 @@ OutputSpecResult FunctionConnection::PerformBindFull() {
 		return output_spec_;
 	}
 
-	// Spawn the worker process
-	proc_ = std::make_unique<SubProcess>(worker_path_, worker_debug_);
-
-	// Start stderr reader thread to prevent pipe buffer from blocking worker
-	StartStderrReader();
+	// Spawn the worker process (unless we already have one from the pool)
+	if (!proc_) {
+		proc_ = std::make_unique<SubProcess>(worker_path_, worker_debug_);
+		// Start stderr reader thread to prevent pipe buffer from blocking worker
+		StartStderrReader();
+	}
 
 	// Log the invocation request
 	int64_t num_args = arguments_array_ ? arguments_array_->length() : 0;
@@ -978,11 +980,12 @@ std::unique_ptr<PooledWorker> FunctionConnection::ReleaseForPooling() {
 		return nullptr;
 	}
 
-	// Stop stderr thread before releasing subprocess
-	StopStderrReader();
+	// Stop stderr thread but keep the fd open for reuse
+	StopStderrReader(false);
 
-	// Create pooled worker with our subprocess
-	auto pooled = std::make_unique<PooledWorker>(std::move(proc_), worker_path_);
+	// Create pooled worker with our subprocess and stderr fd
+	auto pooled = std::make_unique<PooledWorker>(std::move(proc_), worker_path_, stderr_fd_);
+	stderr_fd_ = -1; // Ownership transferred to pooled worker
 
 	// Clear our state so destructor doesn't try to use proc_
 	proc_.reset();
@@ -991,18 +994,23 @@ std::unique_ptr<PooledWorker> FunctionConnection::ReleaseForPooling() {
 }
 
 void FunctionConnection::StartStderrReader() {
-	if (!proc_ || proc_->GetStderrFd() < 0) {
-		return; // No stderr to read (passthrough mode or no process)
+	// If we don't have an fd yet, try to get one from the subprocess
+	if (stderr_fd_ < 0) {
+		if (!proc_ || proc_->GetStderrFd() < 0) {
+			return; // No stderr to read (passthrough mode or no process)
+		}
+		stderr_fd_ = proc_->ReleaseStderrFd();
 	}
 
-	int stderr_fd = proc_->ReleaseStderrFd();
+	// Reset stop flag for new thread
+	stderr_stop_.store(false, std::memory_order_relaxed);
 
-	stderr_thread_ = std::thread([this, stderr_fd]() {
+	stderr_thread_ = std::thread([this]() {
 		char buffer[4096];
 		std::string line_buffer;
 
 		struct pollfd pfd;
-		pfd.fd = stderr_fd;
+		pfd.fd = stderr_fd_;
 		pfd.events = POLLIN;
 
 		while (!stderr_stop_.load(std::memory_order_relaxed)) {
@@ -1021,7 +1029,7 @@ void FunctionConnection::StartStderrReader() {
 			}
 
 			// Data available or hangup - read what's available
-			ssize_t bytes_read = read(stderr_fd, buffer, sizeof(buffer) - 1);
+			ssize_t bytes_read = read(stderr_fd_, buffer, sizeof(buffer) - 1);
 			if (bytes_read <= 0) {
 				break; // EOF or error
 			}
@@ -1051,14 +1059,18 @@ void FunctionConnection::StartStderrReader() {
 			stderr_lines_.push_back(std::move(line_buffer));
 		}
 
-		close(stderr_fd);
+		// Note: fd is NOT closed here - it's owned by the class and closed in StopStderrReader(true)
 	});
 }
 
-void FunctionConnection::StopStderrReader() {
+void FunctionConnection::StopStderrReader(bool close_fd) {
 	stderr_stop_.store(true, std::memory_order_relaxed);
 	if (stderr_thread_.joinable()) {
 		stderr_thread_.join();
+	}
+	if (close_fd && stderr_fd_ >= 0) {
+		close(stderr_fd_);
+		stderr_fd_ = -1;
 	}
 }
 

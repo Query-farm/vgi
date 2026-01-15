@@ -430,11 +430,14 @@ private:
 	std::atomic<bool> stderr_stop_{false};
 	std::mutex stderr_mutex_;
 	std::vector<std::string> stderr_lines_;
+	int stderr_fd_ = -1; // Stderr fd, owned by this class after release from SubProcess
 
 	// Start stderr reader thread (called after spawning worker)
 	void StartStderrReader();
-	// Stop stderr reader thread (called in destructor)
-	void StopStderrReader();
+	// Stop stderr reader thread (called in destructor or before pooling)
+	// If close_fd is true, also closes the stderr fd (use in destructor)
+	// If false, keeps fd open for reuse (use when pooling)
+	void StopStderrReader(bool close_fd = true);
 	// Drain buffered stderr lines and log them via VGI_LOG (call from main thread)
 	void DrainStderrLog();
 };

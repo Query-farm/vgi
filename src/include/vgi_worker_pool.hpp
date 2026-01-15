@@ -22,7 +22,8 @@ class PooledWorker {
 public:
 	// Create a pooled worker from an existing subprocess.
 	// The subprocess should have completed an invocation and be ready for reuse.
-	PooledWorker(std::unique_ptr<SubProcess> proc, const std::string &worker_path);
+	// stderr_fd is the stderr file descriptor (owned by this object, will be closed on destroy)
+	PooledWorker(std::unique_ptr<SubProcess> proc, const std::string &worker_path, int stderr_fd = -1);
 	~PooledWorker();
 
 	// Move-only (owns subprocess)
@@ -36,6 +37,9 @@ public:
 
 	// Get the subprocess (releases ownership)
 	std::unique_ptr<SubProcess> Release();
+
+	// Get and release the stderr fd (releases ownership, returns -1 if none)
+	int ReleaseStderrFd();
 
 	// Get worker path
 	const std::string &GetWorkerPath() const {
@@ -54,6 +58,7 @@ private:
 	std::unique_ptr<SubProcess> proc_;
 	std::string worker_path_;
 	std::chrono::steady_clock::time_point pooled_at_;
+	int stderr_fd_ = -1; // Stderr file descriptor (owned)
 };
 
 // Thread-safe singleton pool for reusing VGI worker subprocesses.

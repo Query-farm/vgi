@@ -1,5 +1,7 @@
 #include "vgi_worker_pool.hpp"
 
+#include <unistd.h>
+
 namespace duckdb {
 namespace vgi {
 
@@ -7,23 +9,36 @@ namespace vgi {
 // PooledWorker
 //===--------------------------------------------------------------------===//
 
-PooledWorker::PooledWorker(std::unique_ptr<SubProcess> proc, const std::string &worker_path)
-    : proc_(std::move(proc)), worker_path_(worker_path), pooled_at_(std::chrono::steady_clock::now()) {
+PooledWorker::PooledWorker(std::unique_ptr<SubProcess> proc, const std::string &worker_path, int stderr_fd)
+    : proc_(std::move(proc)), worker_path_(worker_path), pooled_at_(std::chrono::steady_clock::now()),
+      stderr_fd_(stderr_fd) {
 }
 
 PooledWorker::~PooledWorker() {
-	// SubProcess destructor handles cleanup
+	// Close stderr fd if still owned
+	if (stderr_fd_ >= 0) {
+		close(stderr_fd_);
+	}
+	// SubProcess destructor handles the rest
 }
 
 PooledWorker::PooledWorker(PooledWorker &&other) noexcept
-    : proc_(std::move(other.proc_)), worker_path_(std::move(other.worker_path_)), pooled_at_(other.pooled_at_) {
+    : proc_(std::move(other.proc_)), worker_path_(std::move(other.worker_path_)), pooled_at_(other.pooled_at_),
+      stderr_fd_(other.stderr_fd_) {
+	other.stderr_fd_ = -1; // Transfer ownership
 }
 
 PooledWorker &PooledWorker::operator=(PooledWorker &&other) noexcept {
 	if (this != &other) {
+		// Close our existing stderr fd if any
+		if (stderr_fd_ >= 0) {
+			close(stderr_fd_);
+		}
 		proc_ = std::move(other.proc_);
 		worker_path_ = std::move(other.worker_path_);
 		pooled_at_ = other.pooled_at_;
+		stderr_fd_ = other.stderr_fd_;
+		other.stderr_fd_ = -1; // Transfer ownership
 	}
 	return *this;
 }
@@ -39,6 +54,12 @@ bool PooledWorker::IsAlive() const {
 
 std::unique_ptr<SubProcess> PooledWorker::Release() {
 	return std::move(proc_);
+}
+
+int PooledWorker::ReleaseStderrFd() {
+	int fd = stderr_fd_;
+	stderr_fd_ = -1;
+	return fd;
 }
 
 pid_t PooledWorker::GetPid() const {

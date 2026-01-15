@@ -62,35 +62,49 @@ SELECT COUNT(*) FROM vgi_table_function('${VGI_TEST_WORKER}', 'sequence', [10]);
 ----
 10
 
-# Pool should now have at least one worker
+# Pool should now have exactly one worker
 query I
-SELECT COUNT(*) >= 1 FROM vgi_worker_pool();
+SELECT COUNT(*) FROM vgi_worker_pool();
 ----
-true
+1
 
-# Save the PID from the pool
+# Snapshot the pool state (save the PID)
+statement ok
+CREATE TEMP TABLE pool_snapshot AS SELECT * FROM vgi_worker_pool();
+
+# Verify we captured a PID
 query I
-SELECT pid FROM vgi_worker_pool() LIMIT 1;
+SELECT COUNT(*) FROM pool_snapshot;
 ----
-<REGEX>:\d+
+1
 
-# Run another query - should reuse the pooled worker
+# Run another query - should acquire from pool, then return to pool
 query I
 SELECT COUNT(*) FROM vgi_table_function('${VGI_TEST_WORKER}', 'sequence', [5]);
 ----
 5
 
-# Pool should still have a worker (was returned after use)
+# Pool should still have exactly one worker
 query I
-SELECT COUNT(*) >= 1 FROM vgi_worker_pool();
+SELECT COUNT(*) FROM vgi_worker_pool();
+----
+1
+
+# THE KEY TEST: Verify the PID is the same (worker was reused)
+query I
+SELECT p.pid = s.pid FROM vgi_worker_pool() p, pool_snapshot s;
 ----
 true
+
+# Clean up snapshot
+statement ok
+DROP TABLE pool_snapshot;
 
 # Flush and verify pool is empty
 query I
 SELECT vgi_worker_pool_flush();
 ----
-<REGEX>:\d+
+1
 
 query I
 SELECT COUNT(*) FROM vgi_worker_pool();

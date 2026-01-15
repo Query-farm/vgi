@@ -12,6 +12,7 @@
 
 #include "vgi_arrow_utils.hpp"
 #include "vgi_catalog_api.hpp"
+#include "vgi_logging.hpp"
 #include "vgi_worker_pool.hpp"
 
 namespace duckdb {
@@ -99,6 +100,7 @@ struct VgiTableFunctionLocalState : public ArrowScanLocalState {
 	~VgiTableFunctionLocalState() {
 		// Return connection to pool if applicable
 		if (use_pool_ && connection && connection->CanBePooled()) {
+			auto worker_pid = connection->GetPid();
 			// Read max pool size from settings
 			Value max_val;
 			size_t max_pool_size = 0;
@@ -108,6 +110,10 @@ struct VgiTableFunctionLocalState : public ArrowScanLocalState {
 			auto pooled = connection->ReleaseForPooling();
 			if (pooled) {
 				VgiWorkerPool::Instance().Release(std::move(pooled), max_pool_size);
+				VGI_LOG(context_, "worker_pool.release",
+				        {{"worker_path", worker_path_},
+				         {"worker_pid", std::to_string(worker_pid)},
+				         {"max_pool_size", std::to_string(max_pool_size)}});
 			}
 		}
 	}
