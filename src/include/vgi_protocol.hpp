@@ -31,11 +31,22 @@ std::shared_ptr<arrow::RecordBatch> CreateSchemaGetArgs(const std::vector<uint8_
 std::shared_ptr<arrow::RecordBatch> CreateTableGetArgs(const std::vector<uint8_t> &attach_id,
                                                        const std::string &schema_name, const std::string &table_name);
 
+// Schema object type filter for schema_contents method
+enum class SchemaObjectType {
+	All,            // No filter - return all object types
+	Table,          // Tables only
+	View,           // Views only
+	ScalarFunction, // Scalar functions only
+	TableFunction   // Table functions only
+};
+
+// Convert SchemaObjectType to protocol string (or empty for All)
+const char *SchemaObjectTypeToString(SchemaObjectType type);
+
 // Create arguments batch for schema_contents method
-// type_filter: empty string for all types, or "table", "view", "scalar_function", "table_function"
 std::shared_ptr<arrow::RecordBatch> CreateSchemaContentsArgs(const std::vector<uint8_t> &attach_id,
                                                               const std::string &schema_name,
-                                                              const std::string &type_filter = "");
+                                                              SchemaObjectType type_filter = SchemaObjectType::All);
 
 // ============================================================================
 // Function Invocation Protocol

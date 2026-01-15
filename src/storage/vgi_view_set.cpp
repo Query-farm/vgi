@@ -26,8 +26,8 @@ void VgiViewSet::LoadEntries(ClientContext &context) {
 		return;
 	}
 
-	// Call schema_contents with type filter "view"
-	auto args = vgi::CreateSchemaContentsArgs(attach_result->attach_id, schema_.name, "view");
+	// Call schema_contents with type filter for views
+	auto args = vgi::CreateSchemaContentsArgs(attach_result->attach_id, schema_.name, vgi::SchemaObjectType::View);
 	vgi::CatalogMethodStream stream(attach_params->worker_path(), "schema_contents", args, context,
 	                                attach_params->worker_debug());
 

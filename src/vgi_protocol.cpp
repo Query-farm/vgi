@@ -241,10 +241,28 @@ std::shared_ptr<arrow::RecordBatch> CreateTableGetArgs(const std::vector<uint8_t
 	return arrow::RecordBatch::Make(schema, 1, arrays);
 }
 
+// Convert SchemaObjectType to protocol string
+const char *SchemaObjectTypeToString(SchemaObjectType type) {
+	switch (type) {
+	case SchemaObjectType::All:
+		return "";
+	case SchemaObjectType::Table:
+		return "table";
+	case SchemaObjectType::View:
+		return "view";
+	case SchemaObjectType::ScalarFunction:
+		return "scalar_function";
+	case SchemaObjectType::TableFunction:
+		return "table_function";
+	default:
+		return "";
+	}
+}
+
 // Create arguments batch for schema_contents method
 std::shared_ptr<arrow::RecordBatch> CreateSchemaContentsArgs(const std::vector<uint8_t> &attach_id,
                                                               const std::string &schema_name,
-                                                              const std::string &type_filter) {
+                                                              SchemaObjectType type_filter) {
 	auto schema = arrow::schema({
 	    arrow::field("attach_id", arrow::binary(), false),
 	    arrow::field("transaction_id", arrow::binary(), true), // nullable
@@ -262,10 +280,11 @@ std::shared_ptr<arrow::RecordBatch> CreateSchemaContentsArgs(const std::vector<u
 	CheckArrowStatus(name_builder.Append(schema_name), "append name");
 
 	arrow::StringBuilder type_builder;
-	if (type_filter.empty()) {
+	const char *type_str = SchemaObjectTypeToString(type_filter);
+	if (type_str[0] == '\0') {
 		CheckArrowStatus(type_builder.AppendNull(), "append null type");
 	} else {
-		CheckArrowStatus(type_builder.Append(type_filter), "append type");
+		CheckArrowStatus(type_builder.Append(type_str), "append type");
 	}
 
 	std::vector<std::shared_ptr<arrow::Array>> arrays;
