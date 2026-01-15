@@ -15,6 +15,50 @@
 
 namespace duckdb {
 
+// ============================================================================
+// VgiTableFunctionInfo - Stores metadata needed to invoke a VGI table function
+// ============================================================================
+
+//! Information stored with each VGI table function to enable invocation.
+//! This is attached to the TableFunction via the function_info member and
+//! accessed in the bind function via input.info->Cast<VgiTableFunctionInfo>().
+class VgiTableFunctionInfo : public TableFunctionInfo {
+public:
+	VgiTableFunctionInfo(std::string worker_path, std::vector<uint8_t> attach_id, bool worker_debug,
+	                     vgi::VgiFunctionInfo function_info)
+	    : worker_path_(std::move(worker_path)), attach_id_(std::move(attach_id)), worker_debug_(worker_debug),
+	      function_info_(std::move(function_info)) {
+	}
+
+	~VgiTableFunctionInfo() override = default;
+
+	//! Path to the VGI worker executable
+	const std::string &worker_path() const {
+		return worker_path_;
+	}
+
+	//! Attach ID for the catalog connection
+	const std::vector<uint8_t> &attach_id() const {
+		return attach_id_;
+	}
+
+	//! Whether to enable worker debug output
+	bool worker_debug() const {
+		return worker_debug_;
+	}
+
+	//! Full function metadata from the worker
+	const vgi::VgiFunctionInfo &function_info() const {
+		return function_info_;
+	}
+
+private:
+	std::string worker_path_;
+	std::vector<uint8_t> attach_id_;
+	bool worker_debug_;
+	vgi::VgiFunctionInfo function_info_;
+};
+
 VgiTableFunctionSet::VgiTableFunctionSet(Catalog &catalog, VgiSchemaEntry &schema)
     : VgiCatalogSet(catalog), schema_(schema) {
 }
@@ -28,9 +72,14 @@ static void VgiCatalogTableFunctionScan(ClientContext &context, TableFunctionInp
 }
 
 static unique_ptr<FunctionData> VgiCatalogTableFunctionBind(ClientContext &context, TableFunctionBindInput &input,
-                                                             vector<LogicalType> &return_types, vector<string> &names) {
+                                                            vector<LogicalType> &return_types, vector<string> &names) {
+	// Access the VgiTableFunctionInfo attached to this function
+	auto &vgi_info = input.info->Cast<VgiTableFunctionInfo>();
+
 	// TODO: Implement actual VGI table function bind via FunctionConnection
-	throw NotImplementedException("VGI catalog table function binding not yet implemented");
+	// Use vgi_info.worker_path(), vgi_info.attach_id(), vgi_info.function_info()
+	throw NotImplementedException("VGI catalog table function binding not yet implemented for function '%s'",
+	                              vgi_info.function_info().name);
 }
 
 void VgiTableFunctionSet::LoadEntries(ClientContext &context) {
@@ -90,6 +139,11 @@ void VgiTableFunctionSet::LoadEntries(ClientContext &context) {
 			TableFunction table_func(input_types, VgiCatalogTableFunctionScan, VgiCatalogTableFunctionBind);
 			table_func.projection_pushdown = func_info.projection_pushdown.value_or(false);
 			table_func.filter_pushdown = func_info.filter_pushdown.value_or(false);
+
+			// Attach VgiTableFunctionInfo so the bind function can access worker_path and function metadata
+			table_func.function_info =
+			    make_uniq<VgiTableFunctionInfo>(worker_path, attach_result->attach_id, attach_params->worker_debug(), func_info);
+
 			func_set.AddFunction(table_func);
 
 			// Create function description with full metadata
