@@ -39,7 +39,7 @@ void VgiScalarFunctionSet::LoadEntries(ClientContext &context) {
 	// Call schema_contents with type filter for scalar functions
 	auto worker_path = attach_params->worker_path();
 	auto args = vgi::CreateSchemaContentsArgs(attach_result->attach_id, schema_.name, vgi::SchemaObjectType::ScalarFunction);
-	vgi::CatalogMethodStream stream(worker_path, "schema_contents", args, context, attach_params->worker_debug());
+	vgi::CatalogMethodStream stream(worker_path, vgi::CatalogMethod::SchemaContents, args, context, attach_params->worker_debug());
 
 	// Group functions by name (overloads)
 	std::unordered_map<std::string, std::vector<vgi::VgiFunctionInfo>> functions_by_name;
@@ -76,19 +76,21 @@ void VgiScalarFunctionSet::LoadEntries(ClientContext &context) {
 				                              input_types, input_names);
 			}
 
-			// Determine return type from output_schema
-			LogicalType return_type = LogicalType::VARCHAR; // Default
-			if (func_info.output_schema && func_info.output_schema->num_fields() > 0) {
-				ArrowSchemaWrapper c_schema;
-				ArrowTableSchema arrow_table;
-				vector<LogicalType> output_types;
-				vector<string> output_names;
-				vgi::ArrowSchemaToDuckDBTypes(context, func_info.output_schema, c_schema, arrow_table,
-				                              output_types, output_names);
-				if (!output_types.empty()) {
-					return_type = output_types[0];
-				}
+			// Determine return type from output_schema (required, must have exactly 1 field)
+			if (!func_info.output_schema) {
+				throw InvalidInputException("Scalar function '%s' missing required output_schema", func_info.name);
 			}
+			if (func_info.output_schema->num_fields() != 1) {
+				throw InvalidInputException("Scalar function '%s' output_schema must have exactly 1 field, got %d",
+				                            func_info.name, func_info.output_schema->num_fields());
+			}
+			ArrowSchemaWrapper c_schema;
+			ArrowTableSchema arrow_table;
+			vector<LogicalType> output_types;
+			vector<string> output_names;
+			vgi::ArrowSchemaToDuckDBTypes(context, func_info.output_schema, c_schema, arrow_table, output_types,
+			                              output_names);
+			LogicalType return_type = output_types[0];
 
 			// Create the scalar function
 			ScalarFunction scalar_func(input_types, return_type, VgiScalarFunctionExecute);

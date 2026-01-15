@@ -52,7 +52,7 @@ optional_ptr<CatalogEntry> VgiTableSet::GetEntry(ClientContext &context, const s
 	// Call "table_get" method
 	auto worker_path = attach_params->worker_path();
 	auto args = vgi::CreateTableGetArgs(attach_result->attach_id, schema_.name, name);
-	auto result_batch = vgi::InvokeCatalogMethod(worker_path, "table_get", args, context, attach_params->worker_debug());
+	auto result_batch = vgi::InvokeCatalogMethod(worker_path, vgi::CatalogMethod::TableGet, args, context, attach_params->worker_debug());
 
 	// Check if table was found (empty batch means not found)
 	if (!result_batch || result_batch->num_rows() == 0) {

@@ -46,7 +46,7 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 
 	// Call catalog_attach via worker
 	auto args = vgi::CreateCatalogAttachArgs(catalog_name);
-	auto result_batch = vgi::InvokeCatalogMethod(worker_path, "catalog_attach", args, context, worker_debug);
+	auto result_batch = vgi::InvokeCatalogMethod(worker_path, vgi::CatalogMethod::CatalogAttach, args, context, worker_debug);
 	auto attach_result = vgi::ParseCatalogAttachResult(result_batch, worker_path);
 
 	// Create attach parameters

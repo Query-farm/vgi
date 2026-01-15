@@ -66,7 +66,7 @@ static unique_ptr<GlobalTableFunctionState> VgiCatalogsInitGlobal(ClientContext 
 
 	// Invoke the catalogs method using standard catalog API
 	auto args = vgi::CreateEmptyArgsBatch();
-	auto result_batch = vgi::InvokeCatalogMethod(bind_data.worker_path, "catalogs", args, context);
+	auto result_batch = vgi::InvokeCatalogMethod(bind_data.worker_path, vgi::CatalogMethod::Catalogs, args, context);
 
 	// Extract catalog names from the "value" column
 	state->catalogs = vgi::ExtractStringColumn(result_batch, "value");

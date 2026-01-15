@@ -63,26 +63,57 @@ bool HandleBatchLogMessage(const std::shared_ptr<arrow::RecordBatch> &batch,
 // Catalog Method Invocation API
 // ============================================================================
 
+// Catalog method names for type-safe invocation
+// These correspond to methods in the Python CatalogInterface
+enum class CatalogMethod {
+	// Catalog-level methods
+	Catalogs,                  // List available catalogs
+	CatalogAttach,             // Attach to a catalog
+	CatalogDetach,             // Detach from a catalog
+	CatalogVersion,            // Get catalog version
+	CatalogTransactionBegin,   // Begin a transaction
+	CatalogTransactionCommit,  // Commit a transaction
+	CatalogTransactionRollback, // Rollback a transaction
+
+	// Schema methods
+	Schemas,        // List schemas
+	SchemaGet,      // Get schema info
+	SchemaContents, // List schema contents (tables, views, functions)
+
+	// Table methods
+	TableGet,  // Get table info
+	TableScan, // Scan table data (streaming)
+
+	// View methods
+	ViewGet, // Get view info
+
+	// Function methods
+	FunctionGet // Get function info
+};
+
+// Convert CatalogMethod to protocol string
+const char *CatalogMethodToString(CatalogMethod method);
+
 // Invoke a catalog method and return a single result batch.
-// Use this for methods that return a single response (catalog_attach, table_get, catalogs).
+// Use this for methods that return a single response (CatalogAttach, TableGet, Catalogs).
 // Handles all the plumbing: spawns worker, sends invocation+args, reads result, waits for exit.
 // Handles log message batches from the worker - exceptions are thrown, other levels are logged.
 // Throws IOException on worker failure or timeout.
 // Non-exception log messages are written to DuckDB's log via the provided context.
 // If worker_debug is true, worker stderr is passed through to the terminal for debugging.
-std::shared_ptr<arrow::RecordBatch> InvokeCatalogMethod(const std::string &worker_path, const std::string &method_name,
+std::shared_ptr<arrow::RecordBatch> InvokeCatalogMethod(const std::string &worker_path, CatalogMethod method,
                                                         const std::shared_ptr<arrow::RecordBatch> &args,
                                                         ClientContext &context, bool worker_debug = false);
 
 // Streaming interface for catalog methods that return multiple batches.
-// Use this for methods like "schemas" or "table_scan" that stream results.
+// Use this for methods like Schemas or TableScan that stream results.
 // Handles log message batches from the worker - exceptions are thrown, other levels are logged.
 class CatalogMethodStream {
 public:
 	// Start a streaming catalog method call
 	// Non-exception log messages are written to DuckDB's log via the provided context.
 	// If worker_debug is true, worker stderr is passed through to the terminal for debugging.
-	CatalogMethodStream(const std::string &worker_path, const std::string &method_name,
+	CatalogMethodStream(const std::string &worker_path, CatalogMethod method,
 	                    const std::shared_ptr<arrow::RecordBatch> &args, ClientContext &context,
 	                    bool worker_debug = false);
 	~CatalogMethodStream();
@@ -113,7 +144,6 @@ private:
 	std::unique_ptr<SubProcess> proc_;
 	ClientContext &context_;
 	std::string worker_path_;
-	std::string method_name_;
 	bool finished_ = false;
 };
 

@@ -28,7 +28,7 @@ void VgiViewSet::LoadEntries(ClientContext &context) {
 
 	// Call schema_contents with type filter for views
 	auto args = vgi::CreateSchemaContentsArgs(attach_result->attach_id, schema_.name, vgi::SchemaObjectType::View);
-	vgi::CatalogMethodStream stream(attach_params->worker_path(), "schema_contents", args, context,
+	vgi::CatalogMethodStream stream(attach_params->worker_path(), vgi::CatalogMethod::SchemaContents, args, context,
 	                                attach_params->worker_debug());
 
 	// Read all view batches

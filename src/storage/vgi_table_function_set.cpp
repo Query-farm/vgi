@@ -45,7 +45,7 @@ void VgiTableFunctionSet::LoadEntries(ClientContext &context) {
 	// Call schema_contents with type filter for table functions
 	auto worker_path = attach_params->worker_path();
 	auto args = vgi::CreateSchemaContentsArgs(attach_result->attach_id, schema_.name, vgi::SchemaObjectType::TableFunction);
-	vgi::CatalogMethodStream stream(worker_path, "schema_contents", args, context, attach_params->worker_debug());
+	vgi::CatalogMethodStream stream(worker_path, vgi::CatalogMethod::SchemaContents, args, context, attach_params->worker_debug());
 
 	// Group functions by name (overloads)
 	std::unordered_map<std::string, std::vector<vgi::VgiFunctionInfo>> functions_by_name;

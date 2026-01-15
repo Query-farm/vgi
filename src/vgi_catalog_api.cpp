@@ -149,12 +149,53 @@ static bool CheckWorkerExitStatus(SubProcess &proc, const std::string &worker_pa
 }
 
 // ============================================================================
+// CatalogMethod enum to string conversion
+// ============================================================================
+
+const char *CatalogMethodToString(CatalogMethod method) {
+	switch (method) {
+	case CatalogMethod::Catalogs:
+		return "catalogs";
+	case CatalogMethod::CatalogAttach:
+		return "catalog_attach";
+	case CatalogMethod::CatalogDetach:
+		return "catalog_detach";
+	case CatalogMethod::CatalogVersion:
+		return "catalog_version";
+	case CatalogMethod::CatalogTransactionBegin:
+		return "catalog_transaction_begin";
+	case CatalogMethod::CatalogTransactionCommit:
+		return "catalog_transaction_commit";
+	case CatalogMethod::CatalogTransactionRollback:
+		return "catalog_transaction_rollback";
+	case CatalogMethod::Schemas:
+		return "schemas";
+	case CatalogMethod::SchemaGet:
+		return "schema_get";
+	case CatalogMethod::SchemaContents:
+		return "schema_contents";
+	case CatalogMethod::TableGet:
+		return "table_get";
+	case CatalogMethod::TableScan:
+		return "table_scan";
+	case CatalogMethod::ViewGet:
+		return "view_get";
+	case CatalogMethod::FunctionGet:
+		return "function_get";
+	default:
+		throw InternalException("Unknown CatalogMethod value");
+	}
+}
+
+// ============================================================================
 // InvokeCatalogMethod - Single result batch
 // ============================================================================
 
-std::shared_ptr<arrow::RecordBatch> InvokeCatalogMethod(const std::string &worker_path, const std::string &method_name,
+std::shared_ptr<arrow::RecordBatch> InvokeCatalogMethod(const std::string &worker_path, CatalogMethod method,
                                                         const std::shared_ptr<arrow::RecordBatch> &args,
                                                         ClientContext &context, bool worker_debug) {
+	const char *method_name = CatalogMethodToString(method);
+
 	// Spawn the worker process
 	SubProcess proc(worker_path, worker_debug);
 
@@ -211,15 +252,15 @@ std::shared_ptr<arrow::RecordBatch> InvokeCatalogMethod(const std::string &worke
 // CatalogMethodStream - Streaming results
 // ============================================================================
 
-CatalogMethodStream::CatalogMethodStream(const std::string &worker_path, const std::string &method_name,
+CatalogMethodStream::CatalogMethodStream(const std::string &worker_path, CatalogMethod method,
                                          const std::shared_ptr<arrow::RecordBatch> &args, ClientContext &context,
                                          bool worker_debug)
-    : proc_(std::make_unique<SubProcess>(worker_path, worker_debug)), context_(context), worker_path_(worker_path),
-      method_name_(method_name) {
+    : proc_(std::make_unique<SubProcess>(worker_path, worker_debug)), context_(context), worker_path_(worker_path) {
+	const char *method_name = CatalogMethodToString(method);
 	VGI_LOG(context_, "catalog_method.invoke",
 	        {{"worker_path", worker_path_},
 	         {"worker_pid", std::to_string(proc_->GetPid())},
-	         {"method_name", method_name_}});
+	         {"method_name", method_name}});
 	SendInvocationAndArgs(*proc_, method_name, args);
 }
 
@@ -460,7 +501,7 @@ VgiFunctionInfo GetFunctionInfo(const std::string &worker_path, const std::vecto
                                 const std::string &schema_name, const std::string &function_name,
                                 ClientContext &context, bool worker_debug) {
 	auto args = CreateFunctionGetArgs(attach_id, schema_name, function_name);
-	auto result_batch = InvokeCatalogMethod(worker_path, "function_get", args, context, worker_debug);
+	auto result_batch = InvokeCatalogMethod(worker_path, CatalogMethod::FunctionGet, args, context, worker_debug);
 	return ParseFunctionInfo(result_batch, 0, worker_path);
 }
 
