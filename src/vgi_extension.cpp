@@ -1,6 +1,9 @@
 #define DUCKDB_EXTENSION_MAIN
 
 #include "vgi_extension.hpp"
+
+#include <csignal>
+
 #include "duckdb.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/parser/parsed_data/attach_info.hpp"
@@ -96,6 +99,9 @@ public:
 };
 
 static void LoadInternal(ExtensionLoader &loader) {
+	// Ignore SIGPIPE - we handle broken pipes via EPIPE error from write()
+	// This prevents the process from being killed when a worker dies unexpectedly
+	std::signal(SIGPIPE, SIG_IGN);
 
 	// Register VGI log type
 	auto &log_manager = loader.GetDatabaseInstance().GetLogManager();

@@ -17,6 +17,7 @@
 #include "duckdb/function/aggregate_state.hpp"
 #include "duckdb/function/function.hpp"
 
+#include "vgi_arrow_utils.hpp"
 #include "vgi_protocol.hpp"
 #include "vgi_subprocess.hpp"
 #include "vgi_worker_pool.hpp"
@@ -292,11 +293,64 @@ VgiFunctionInfo GetFunctionInfo(const std::string &worker_path, const std::vecto
                                 ClientContext &context, bool worker_debug = false);
 
 // ============================================================================
-// Function Connection - Proper 6-Stream Protocol
+// Connection Acquisition with Retry
 // ============================================================================
 
-// Forward declaration for ArrowArguments (defined in vgi_arrow_utils.hpp)
-struct ArrowArguments;
+// Forward declaration for FunctionConnection (defined below)
+class FunctionConnection;
+
+// Parameters for creating a FunctionConnection
+// Used with AcquireAndBindConnection to handle pool acquire + stale connection retry
+struct FunctionConnectionParams {
+	std::string worker_path;
+	std::string function_name;
+	ArrowArguments arguments;
+	std::vector<uint8_t> attach_id;
+	std::vector<uint8_t> global_execution_id;  // Empty for primary workers
+	bool worker_debug = false;
+	std::map<std::string, std::string> settings;
+	bool use_pool = true;
+	std::string phase;  // For logging (e.g., "bind", "init_local_secondary")
+
+	// Default constructor
+	FunctionConnectionParams() = default;
+
+	// Convenience constructor for common case
+	FunctionConnectionParams(const std::string &worker_path, const std::string &function_name,
+	                         const ArrowArguments &arguments, const std::vector<uint8_t> &attach_id,
+	                         const std::vector<uint8_t> &global_execution_id, bool worker_debug,
+	                         const std::map<std::string, std::string> &settings, bool use_pool,
+	                         const std::string &phase)
+	    : worker_path(worker_path), function_name(function_name), arguments(arguments), attach_id(attach_id),
+	      global_execution_id(global_execution_id), worker_debug(worker_debug), settings(settings), use_pool(use_pool),
+	      phase(phase) {
+	}
+};
+
+// Result of AcquireAndBindConnection
+struct AcquireAndBindResult {
+	std::unique_ptr<FunctionConnection> connection;
+	OutputSpecResult output_spec;
+};
+
+// Acquire a FunctionConnection and perform bind with automatic retry for stale pool connections.
+//
+// This helper encapsulates the common pattern of:
+// 1. Try to acquire a pooled worker
+// 2. Create FunctionConnection (from pool or fresh)
+// 3. Attempt PerformBindFull()
+// 4. If bind fails and connection was from pool, retry with fresh connection
+//
+// The retry handles the case where a pooled worker died while idle. If the
+// fresh connection also fails, the exception propagates to the caller.
+//
+// Returns the successfully-bound connection and the OutputSpecResult.
+// Throws IOException if bind fails (after retry if applicable).
+AcquireAndBindResult AcquireAndBindConnection(ClientContext &context, const FunctionConnectionParams &params);
+
+// ============================================================================
+// Function Connection - Proper 6-Stream Protocol
+// ============================================================================
 
 // FunctionConnection implements the proper VGI function protocol with 6 streams:
 // Stream 1: Invocation (client → worker)

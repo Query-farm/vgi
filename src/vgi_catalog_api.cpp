@@ -688,6 +688,83 @@ VgiFunctionInfo GetFunctionInfo(const std::string &worker_path, const std::vecto
 }
 
 // ============================================================================
+// Connection Acquisition with Retry
+// ============================================================================
+
+AcquireAndBindResult AcquireAndBindConnection(ClientContext &context, const FunctionConnectionParams &params) {
+	std::unique_ptr<FunctionConnection> conn;
+	OutputSpecResult output_spec;
+	bool from_pool = false;
+
+	// Lambda to create a fresh connection
+	auto create_fresh_connection = [&]() {
+		return make_uniq<FunctionConnection>(params.worker_path, params.function_name, params.arguments,
+		                                     params.attach_id, context, params.global_execution_id,
+		                                     params.worker_debug, params.settings);
+	};
+
+	// Lambda to attempt bind, returns true on success, false if retry needed
+	auto try_bind = [&](bool is_retry) -> bool {
+		try {
+			output_spec = conn->PerformBindFull();
+			return true; // Success
+		} catch (const IOException &e) {
+			if (!is_retry && from_pool) {
+				// Pooled worker was stale, signal retry needed
+				VGI_LOG(context, "worker_pool.stale",
+				        {{"worker_path", params.worker_path},
+				         {"worker_pid", std::to_string(conn->GetPid())},
+				         {"error", e.what()},
+				         {"phase", params.phase}});
+				return false; // Trigger retry
+			}
+			throw; // Fresh connection or retry failed, propagate
+		}
+	};
+
+	// Try pool first
+	if (params.use_pool) {
+		auto pooled = VgiWorkerPool::Instance().TryAcquire(params.worker_path);
+		if (pooled) {
+			auto pooled_pid = pooled->GetPid();
+			conn = make_uniq<FunctionConnection>(std::move(pooled), params.function_name, params.arguments,
+			                                     params.attach_id, context, params.global_execution_id,
+			                                     params.worker_debug, params.settings);
+			from_pool = true;
+			VGI_LOG(context, "worker_pool.acquire",
+			        {{"worker_path", params.worker_path},
+			         {"worker_pid", std::to_string(pooled_pid)},
+			         {"result", "hit"},
+			         {"phase", params.phase}});
+		}
+	}
+
+	// Create fresh if pool miss
+	if (!conn) {
+		conn = create_fresh_connection();
+		VGI_LOG(context, "worker_pool.acquire",
+		        {{"worker_path", params.worker_path},
+		         {"worker_pid", std::to_string(conn->GetPid())},
+		         {"result", params.use_pool ? "miss" : "disabled"},
+		         {"phase", params.phase}});
+	}
+
+	// Attempt bind with single retry for stale pool connections
+	if (!try_bind(false)) {
+		// Pooled worker was stale, retry with fresh
+		conn = create_fresh_connection();
+		VGI_LOG(context, "worker_pool.acquire",
+		        {{"worker_path", params.worker_path},
+		         {"worker_pid", std::to_string(conn->GetPid())},
+		         {"result", "retry_after_stale"},
+		         {"phase", params.phase}});
+		try_bind(true); // Throws if fails, no more retries
+	}
+
+	return AcquireAndBindResult{std::move(conn), std::move(output_spec)};
+}
+
+// ============================================================================
 // FunctionConnection - Proper 6-Stream Protocol Implementation
 // ============================================================================
 
@@ -933,6 +1010,13 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 			std::string status = result.custom_metadata->value(status_idx);
 			if (status == "FINISHED") {
 				data_finished_ = true;
+				// Drain remaining stream (EOS marker) to clean up for potential pooling
+				while (data_reader_) {
+					auto drain_result = data_reader_->ReadNext();
+					if (!drain_result.ok() || !drain_result.ValueUnsafe().batch) {
+						break;
+					}
+				}
 				// Still return the batch if it has data
 				if (result.batch->num_rows() > 0) {
 					return result.batch;
@@ -945,6 +1029,13 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 	// Null or empty batch signals end of stream
 	if (!result.batch || result.batch->num_rows() == 0) {
 		data_finished_ = true;
+		// Drain remaining stream (EOS marker) to clean up for potential pooling
+		while (data_reader_) {
+			auto drain_result = data_reader_->ReadNext();
+			if (!drain_result.ok() || !drain_result.ValueUnsafe().batch) {
+				break;
+			}
+		}
 		return nullptr;
 	}
 

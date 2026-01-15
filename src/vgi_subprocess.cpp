@@ -238,6 +238,11 @@ void WriteAll(int fd, const uint8_t *data, size_t len) {
 			if (errno == EINTR) {
 				continue; // Interrupted by signal, retry
 			}
+			if (errno == EPIPE) {
+				// Worker closed its stdin - it likely crashed or exited early
+				throw IOException("Worker closed pipe (EPIPE). Worker may have crashed - "
+				                  "use VGI_WORKER_STDERR_PASSTHROUGH=1 for diagnostics");
+			}
 			throw IOException("Failed to write to pipe: %s", strerror(errno));
 		}
 		written += result;
