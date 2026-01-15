@@ -336,7 +336,7 @@ std::shared_ptr<arrow::RecordBatch> CreateFunctionGetArgs(const std::vector<uint
 std::shared_ptr<arrow::RecordBatch> CreateFunctionInvocationFull(
     const std::string &function_name, const std::shared_ptr<arrow::DataType> &arguments_type,
     const std::shared_ptr<arrow::Array> &arguments_array, const std::vector<uint8_t> &attach_id,
-    const std::vector<uint8_t> &global_exec_id) {
+    const std::vector<uint8_t> &global_exec_id, const std::map<std::string, std::string> &settings) {
 
 	// Use the provided arguments struct (already built by BuildArgumentsFromValues)
 	auto args_type = arguments_type;
@@ -398,11 +398,19 @@ std::shared_ptr<arrow::RecordBatch> CreateFunctionInvocationFull(
 		CheckArrowStatus(attach_id_builder.Append(attach_id.data(), attach_id.size()), "append attach_id");
 	}
 
-	// settings - null
+	// settings - map of key-value pairs (or null if empty)
 	auto settings_key_builder = std::make_shared<arrow::StringBuilder>();
 	auto settings_value_builder = std::make_shared<arrow::StringBuilder>();
 	arrow::MapBuilder settings_builder(arrow::default_memory_pool(), settings_key_builder, settings_value_builder);
-	CheckArrowStatus(settings_builder.AppendNull(), "append null settings");
+	if (settings.empty()) {
+		CheckArrowStatus(settings_builder.AppendNull(), "append null settings");
+	} else {
+		CheckArrowStatus(settings_builder.Append(), "begin settings map");
+		for (const auto &[key, value] : settings) {
+			CheckArrowStatus(settings_key_builder->Append(key), "append settings key");
+			CheckArrowStatus(settings_value_builder->Append(value), "append settings value");
+		}
+	}
 
 	// transaction_id - null
 	arrow::BinaryBuilder transaction_id_builder;

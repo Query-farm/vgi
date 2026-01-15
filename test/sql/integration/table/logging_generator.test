@@ -1,0 +1,29 @@
+# name: test/sql/integration/table/logging_generator.test
+# description: Integration tests for VGI logging_generator table function
+# group: [vgi]
+
+# This test requires a VGI worker to be available
+# Set VGI_TEST_WORKER environment variable to the path of a VGI worker executable
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# logging_generator function
+# Generates data and emits log messages (verify it runs without error)
+# ============================================================================
+
+query I
+SELECT COUNT(*) FROM example.logging_generator(10);
+----
+10
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;

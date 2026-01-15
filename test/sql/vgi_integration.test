@@ -67,11 +67,11 @@ CALL enable_logging(level := 'debug');
 statement ok
 CALL truncate_duckdb_logs();
 
-# Test partitioned_range function with 1 million values
+# Test partitioned_sequence function with 1 million values
 # This exercises multi-worker execution via work queue pattern
 query IIII
-SELECT COUNT(*) as total, COUNT(DISTINCT value) as distinct_count, MIN(value) as min_val, MAX(value) as max_val
-FROM vgi_table_function('${VGI_TEST_WORKER}', 'partitioned_range', [1000000]);
+SELECT COUNT(*) as total, COUNT(DISTINCT n) as distinct_count, MIN(n) as min_val, MAX(n) as max_val
+FROM vgi_table_function('${VGI_TEST_WORKER}', 'partitioned_sequence', [1000000]);
 ----
 1000000	1000000	0	999999
 

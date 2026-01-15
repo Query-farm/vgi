@@ -70,14 +70,13 @@ void VgiScalarFunctionSet::LoadEntries(ClientContext &context) {
 		vector<FunctionDescription> descriptions;
 
 		for (const auto &func_info : pair.second) {
-			// Convert argument types from Arrow schema using proper conversion
-			vector<LogicalType> input_types;
-			vector<string> input_names;
+			// Parse argument types, distinguishing positional from named arguments
+			// Named arguments have metadata "vgi_arg: named" in the Arrow schema
+			// Note: ScalarFunction doesn't support named_parameters like TableFunction does,
+			// so named arguments would need to be handled differently when execution is implemented
+			vgi::FunctionArgumentTypes arg_types;
 			if (func_info.arguments_schema) {
-				ArrowSchemaWrapper c_schema;
-				ArrowTableSchema arrow_table;
-				vgi::ArrowSchemaToDuckDBTypes(context, func_info.arguments_schema, c_schema, arrow_table,
-				                              input_types, input_names);
+				arg_types = vgi::ParseFunctionArgumentSchema(context, func_info.arguments_schema);
 			}
 
 			// Determine return type from output_schema (required, must have exactly 1 field)
@@ -96,14 +95,15 @@ void VgiScalarFunctionSet::LoadEntries(ClientContext &context) {
 			                              output_names);
 			LogicalType return_type = output_types[0];
 
-			// Create the scalar function
-			ScalarFunction scalar_func(input_types, return_type, VgiScalarFunctionExecute);
+			// Create the scalar function with positional arguments only
+			// DuckDB's ScalarFunction doesn't have built-in named parameter support
+			ScalarFunction scalar_func(arg_types.positional_types, return_type, VgiScalarFunctionExecute);
 			func_set.AddFunction(scalar_func);
 
 			// Create function description with full metadata
 			FunctionDescription desc;
-			desc.parameter_types = input_types;
-			desc.parameter_names = input_names;
+			desc.parameter_types = arg_types.positional_types;
+			desc.parameter_names = arg_types.positional_names;
 			desc.description = func_info.description;
 			for (const auto &ex : func_info.examples) {
 				desc.examples.push_back(ex);

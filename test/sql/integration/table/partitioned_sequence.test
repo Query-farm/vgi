@@ -1,0 +1,48 @@
+# name: test/sql/integration/table/partitioned_sequence.test
+# description: Integration tests for VGI partitioned_sequence table function
+# group: [vgi]
+
+# This test requires a VGI worker to be available
+# Set VGI_TEST_WORKER environment variable to the path of a VGI worker executable
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# partitioned_sequence function (multi-worker)
+# Generates a sequence that can be executed in parallel
+# ============================================================================
+
+# Verify all values are present and correct
+query III
+SELECT COUNT(*) as total, MIN(n) as min_val, MAX(n) as max_val
+FROM example.partitioned_sequence(1000, increment=1);
+----
+1000	0	999
+
+# Smaller range
+query III
+SELECT COUNT(*) as total, MIN(n) as min_val, MAX(n) as max_val
+FROM example.partitioned_sequence(100, increment=1);
+----
+100	0	99
+
+# With increment
+query I
+SELECT * FROM example.partitioned_sequence(5, increment=10);
+----
+0
+10
+20
+30
+40
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;

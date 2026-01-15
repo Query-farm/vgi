@@ -3,6 +3,7 @@
 #include <arrow/api.h>
 
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -84,10 +85,12 @@ struct InitResultData {
 // This includes the function arguments in the invocation itself
 // arguments_type: The Arrow struct type with fields named positional_0, positional_1, etc.
 // arguments_array: The Arrow struct array containing the argument values
+// settings: Optional map of setting name to value (e.g., DuckDB pragmas)
 std::shared_ptr<arrow::RecordBatch> CreateFunctionInvocationFull(
     const std::string &function_name, const std::shared_ptr<arrow::DataType> &arguments_type,
     const std::shared_ptr<arrow::Array> &arguments_array, const std::vector<uint8_t> &attach_id = {},
-    const std::vector<uint8_t> &global_exec_id = {});
+    const std::vector<uint8_t> &global_exec_id = {},
+    const std::map<std::string, std::string> &settings = {});
 
 // Create InitInput batch (Stream 3)
 // For table functions, this is TableFunctionInitInput with projection_ids

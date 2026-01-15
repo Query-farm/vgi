@@ -49,6 +49,25 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	auto result_batch = vgi::InvokeCatalogMethod(worker_path, vgi::CatalogMethod::CatalogAttach, args, context, worker_debug);
 	auto attach_result = vgi::ParseCatalogAttachResult(result_batch, worker_path);
 
+	// Register extension options for settings exposed by this catalog
+	// Check for type conflicts with existing settings
+	auto &config = DBConfig::GetConfig(db.GetDatabase());
+	for (const auto &setting : attach_result.settings) {
+		auto existing = config.extension_parameters.find(setting.name);
+		if (existing != config.extension_parameters.end()) {
+			// Setting already exists - verify types match
+			if (existing->second.type != setting.type) {
+				throw BinderException(
+				    "VGI setting '%s' already exists with type %s, but catalog '%s' requires type %s",
+				    setting.name, existing->second.type.ToString(), catalog_name, setting.type.ToString());
+			}
+			// Types match - setting is already registered, no need to add again
+		} else {
+			// New setting - register it
+			config.AddExtensionOption(setting.name, setting.description, setting.type, setting.default_value);
+		}
+	}
+
 	// Create attach parameters
 	auto attach_params = std::make_shared<vgi::VgiAttachParameters>(worker_path, catalog_name, worker_debug);
 	auto attach_result_ptr = std::make_shared<vgi::CatalogAttachResult>(std::move(attach_result));

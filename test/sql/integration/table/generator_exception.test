@@ -1,0 +1,34 @@
+# name: test/sql/integration/table/generator_exception.test
+# description: Integration tests for VGI generator_exception table function
+# group: [vgi]
+
+# This test requires a VGI worker to be available
+# Set VGI_TEST_WORKER environment variable to the path of a VGI worker executable
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# generator_exception function (error handling)
+# Raises an exception after N batches for testing error propagation
+# ============================================================================
+
+statement error
+SELECT * FROM example.generator_exception(2);
+----
+Intentional failure after 2 batches
+
+statement error
+SELECT * FROM example.generator_exception(1);
+----
+Intentional failure after 1 batches
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;

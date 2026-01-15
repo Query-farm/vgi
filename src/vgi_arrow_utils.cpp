@@ -1,4 +1,5 @@
 #include "vgi_arrow_utils.hpp"
+#include "vgi_protocol_constants.hpp"
 
 #include <arrow/c/bridge.h>
 
@@ -93,6 +94,76 @@ void ArrowSchemaToColumnList(ClientContext &context, const std::shared_ptr<arrow
 }
 
 // ============================================================================
+// Function Argument Schema Parsing
+// ============================================================================
+
+FunctionArgumentTypes ParseFunctionArgumentSchema(ClientContext &context,
+                                                   const std::shared_ptr<arrow::Schema> &schema) {
+	FunctionArgumentTypes result;
+
+	if (!schema) {
+		return result;
+	}
+
+	// Export schema to C ABI and get DuckDB types
+	ArrowSchemaWrapper c_schema;
+	ArrowTableSchema arrow_table;
+	ExportSchema(schema, c_schema);
+	ArrowTableFunction::PopulateArrowTableSchema(DBConfig::GetConfig(context), arrow_table, c_schema.arrow_schema);
+
+	auto &columns = arrow_table.GetColumns();
+	int num_fields = schema->num_fields();
+	for (int field_idx = 0; field_idx < num_fields; field_idx++) {
+		auto field = schema->field(field_idx);
+		auto &child = c_schema.arrow_schema.children[field_idx];
+
+		// Get column name
+		string col_name = child->name ? child->name : "column" + to_string(field_idx);
+
+		// Get DuckDB type
+		auto arrow_type = columns.at(field_idx);
+		LogicalType duckdb_type = arrow_type->GetDuckType();
+
+		// Check metadata for special markers
+		bool is_named = false;
+		bool is_varargs = false;
+		if (field->HasMetadata()) {
+			auto metadata = field->metadata();
+
+			// Check for named argument marker
+			auto named_idx = metadata->FindKey(VGI_ARG_METADATA_KEY);
+			if (named_idx >= 0) {
+				auto value = metadata->value(named_idx);
+				is_named = (value == VGI_ARG_NAMED_VALUE);
+			}
+
+			// Check for varargs marker (on field, not schema)
+			auto varargs_idx = metadata->FindKey(VGI_VARARGS_METADATA_KEY);
+			if (varargs_idx >= 0) {
+				auto value = metadata->value(varargs_idx);
+				is_varargs = (value == VGI_VARARGS_TRUE_VALUE);
+			}
+		}
+
+		if (is_varargs) {
+			// Varargs field - set flag and type (varargs accepts ANY type)
+			result.has_varargs = true;
+			result.varargs_type = LogicalType::ANY;
+			// Don't add varargs to positional_types - it's a sentinel
+		} else if (is_named) {
+			// Named argument - add to named_parameters map
+			result.named_parameters[col_name] = duckdb_type;
+		} else {
+			// Positional argument
+			result.positional_types.push_back(duckdb_type);
+			result.positional_names.push_back(col_name);
+		}
+	}
+
+	return result;
+}
+
+// ============================================================================
 // DuckDB Value to Arrow Conversion (using ArrowAppender)
 // ============================================================================
 
@@ -102,15 +173,15 @@ ArrowArguments BuildArgumentsFromValues(ClientContext &context, const vector<Val
 	vector<LogicalType> field_types;
 	vector<string> field_names;
 
-	// Add positional arguments
+	// Add positional arguments (prefixed with VGI_POSITIONAL_PREFIX per VGI protocol)
 	for (idx_t i = 0; i < positional_args.size(); i++) {
-		field_names.push_back("positional_" + to_string(i));
+		field_names.push_back(VGI_POSITIONAL_PREFIX + to_string(i));
 		field_types.push_back(positional_args[i].type());
 	}
 
-	// Add named arguments
+	// Add named arguments (prefixed with VGI_NAMED_PREFIX per VGI protocol)
 	for (auto &[name, value] : named_args) {
-		field_names.push_back(name);
+		field_names.push_back(VGI_NAMED_PREFIX + name);
 		field_types.push_back(value.type());
 	}
 
@@ -316,6 +387,35 @@ ColumnValue::operator std::optional<std::vector<uint8_t>>() const {
 	                            reinterpret_cast<const uint8_t *>(value.data()) + value.size());
 }
 
+ColumnValue::operator std::optional<std::vector<std::vector<uint8_t>>>() const {
+	auto column = batch_ ? batch_->GetColumnByName(column_name_) : nullptr;
+	if (!column) {
+		return std::nullopt;
+	}
+	auto list_array = std::dynamic_pointer_cast<arrow::ListArray>(column);
+	if (!list_array || list_array->IsNull(row_idx_)) {
+		return std::nullopt;
+	}
+
+	int64_t start = list_array->value_offset(row_idx_);
+	int64_t end = list_array->value_offset(row_idx_ + 1);
+
+	auto binary_array = std::dynamic_pointer_cast<arrow::BinaryArray>(list_array->values());
+	if (!binary_array) {
+		return std::nullopt;
+	}
+
+	std::vector<std::vector<uint8_t>> result;
+	for (int64_t i = start; i < end; i++) {
+		if (!binary_array->IsNull(i)) {
+			auto value = binary_array->GetView(i);
+			result.push_back(std::vector<uint8_t>(reinterpret_cast<const uint8_t *>(value.data()),
+			                                      reinterpret_cast<const uint8_t *>(value.data()) + value.size()));
+		}
+	}
+	return result;
+}
+
 ColumnValue::operator std::optional<std::vector<std::string>>() const {
 	auto column = batch_ ? batch_->GetColumnByName(column_name_) : nullptr;
 	if (!column) {
@@ -484,6 +584,11 @@ std::vector<int32_t> ColumnValue::value_or(std::vector<int32_t> default_val) con
 
 std::vector<std::vector<int32_t>> ColumnValue::value_or(std::vector<std::vector<int32_t>> default_val) const {
 	auto opt = static_cast<std::optional<std::vector<std::vector<int32_t>>>>(*this);
+	return opt.value_or(std::move(default_val));
+}
+
+std::vector<std::vector<uint8_t>> ColumnValue::value_or(std::vector<std::vector<uint8_t>> default_val) const {
+	auto opt = static_cast<std::optional<std::vector<std::vector<uint8_t>>>>(*this);
 	return opt.value_or(std::move(default_val));
 }
 

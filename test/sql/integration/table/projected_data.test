@@ -1,0 +1,60 @@
+# name: test/sql/integration/table/projected_data.test
+# description: Integration tests for VGI projected_data table function
+# group: [vgi]
+
+# This test requires a VGI worker to be available
+# Set VGI_TEST_WORKER environment variable to the path of a VGI worker executable
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# projected_data function (projection pushdown)
+# Generates data with 4 columns: id, name, value, extra
+# ============================================================================
+
+# All columns
+query IRTI
+SELECT * FROM example.projected_data(3);
+----
+0	item_0	0.0	0
+1	item_1	1.5	1
+2	item_2	3.0	4
+
+# Projection pushdown - only select specific columns
+query II
+SELECT id, extra FROM example.projected_data(3);
+----
+0	0
+1	1
+2	4
+
+query IR
+SELECT id, value FROM example.projected_data(3);
+----
+0	0.0
+1	1.5
+2	3.0
+
+query IT
+SELECT id, name FROM example.projected_data(3);
+----
+0	item_0
+1	item_1
+2	item_2
+
+# Verify row count with larger dataset
+query I
+SELECT COUNT(*) FROM example.projected_data(100);
+----
+100
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;

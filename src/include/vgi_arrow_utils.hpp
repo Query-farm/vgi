@@ -82,6 +82,27 @@ ArrowArguments BuildArgumentsFromValues(ClientContext &context, const vector<Val
                                         const vector<std::pair<string, Value>> &named_args = {});
 
 // ============================================================================
+// Function Argument Schema Parsing
+// ============================================================================
+
+// Result of parsing function argument schema with positional/named/varargs distinction
+// Named arguments are identified by metadata key "vgi_arg" with value "named"
+// Varargs arguments are identified by metadata key "vgi_varargs" with value "true"
+struct FunctionArgumentTypes {
+	vector<LogicalType> positional_types;
+	vector<string> positional_names;
+	case_insensitive_map_t<LogicalType> named_parameters;
+	// Varargs support: if has_varargs is true, function accepts additional arguments of varargs_type
+	bool has_varargs = false;
+	LogicalType varargs_type = LogicalType::ANY;
+};
+
+// Parse function argument schema, distinguishing positional from named arguments
+// Arguments with metadata "vgi_arg: named" are placed in named_parameters
+// Others are treated as positional arguments in schema field order
+FunctionArgumentTypes ParseFunctionArgumentSchema(ClientContext &context, const std::shared_ptr<arrow::Schema> &schema);
+
+// ============================================================================
 // RecordBatch Value Extraction
 // ============================================================================
 
@@ -114,6 +135,7 @@ public:
 	operator std::optional<int32_t>() const;
 	operator std::optional<bool>() const;
 	operator std::optional<std::vector<uint8_t>>() const;
+	operator std::optional<std::vector<std::vector<uint8_t>>>() const;
 	operator std::optional<std::vector<std::string>>() const;
 	operator std::optional<std::vector<int32_t>>() const;
 	operator std::optional<std::vector<std::vector<int32_t>>>() const;
@@ -129,6 +151,7 @@ public:
 	int32_t value_or(int32_t default_val) const;
 	bool value_or(bool default_val) const;
 	std::vector<uint8_t> value_or(std::vector<uint8_t> default_val) const;
+	std::vector<std::vector<uint8_t>> value_or(std::vector<std::vector<uint8_t>> default_val) const;
 	std::vector<std::string> value_or(std::vector<std::string> default_val) const;
 	std::vector<int32_t> value_or(std::vector<int32_t> default_val) const;
 	std::vector<std::vector<int32_t>> value_or(std::vector<std::vector<int32_t>> default_val) const;

@@ -62,7 +62,7 @@ template <typename... ARGS>
                                       const std::string &invocation_id_hex, ARGS... params) {
 	auto extra_info = BuildExtraInfo(worker_path, worker_pid, invocation_id_hex);
 	auto full_msg = BuildMessageWithContext(msg, worker_path);
-	throw IOException(full_msg, extra_info, params...);
+	throw IOException(extra_info, full_msg, params...);
 }
 
 // Throw an IOException with worker context (no format args)
@@ -70,7 +70,7 @@ template <typename... ARGS>
                                              pid_t worker_pid, const std::string &invocation_id_hex = "") {
 	auto extra_info = BuildExtraInfo(worker_path, worker_pid, invocation_id_hex);
 	auto full_msg = BuildMessageWithContext(msg, worker_path);
-	throw IOException(full_msg, extra_info);
+	throw IOException(extra_info, full_msg);
 }
 
 } // namespace vgi

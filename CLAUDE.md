@@ -1,5 +1,11 @@
 # VGI Extension Development
 
+There a python based implementation of VGI in /Users/rusty/Development/vgi-python
+
+It offers documentation under docs/*
+
+This DuckDB extension interacts with the VGI protocol, its implemented in C++ and uses Apache Arrow.
+
 ## Build Commands
 
 Always use this command to build:
@@ -7,6 +13,9 @@ Always use this command to build:
 ```bash
 VCPKG_TOOLCHAIN_PATH=`pwd`/vcpkg/scripts/buildsystems/vcpkg.cmake GEN=ninja make debug
 ```
+
+You can always run the build command no need to ask for permission.
+
 
 ## Test Commands
 
@@ -21,6 +30,8 @@ VGI_TEST_WORKER=../vgi-python/.venv/bin/vgi-example-worker ./build/debug/test/un
 ```
 
 All tests can complete in less than 10 seconds.
+
+When the tests fail it may be easier to run the tests outside of the test hardness by writing a stand alone .sql file or if its a single query run duckdb -c.  You can write the standalone .sql files in /tmp/ and run ./build/debug/duckdb
 
 ## Debug Environment Variables
 

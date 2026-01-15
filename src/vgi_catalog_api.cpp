@@ -314,6 +314,137 @@ int CatalogMethodStream::Wait() {
 // Result parsing using RecordBatchSingleRow
 // ============================================================================
 
+// Helper to deserialize an Arrow RecordBatch from bytes
+static std::shared_ptr<arrow::RecordBatch> DeserializeRecordBatch(const std::vector<uint8_t> &bytes) {
+	auto buffer = arrow::Buffer::Wrap(bytes.data(), bytes.size());
+	auto buffer_reader = std::make_shared<arrow::io::BufferReader>(buffer);
+	auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(buffer_reader);
+	if (!reader_result.ok()) {
+		throw IOException("Failed to open IPC stream: %s", reader_result.status().ToString());
+	}
+	auto reader = reader_result.ValueUnsafe();
+
+	std::shared_ptr<arrow::RecordBatch> batch;
+	auto status = reader->ReadNext(&batch);
+	if (!status.ok()) {
+		throw IOException("Failed to read batch: %s", status.ToString());
+	}
+	return batch;
+}
+
+// Helper to get DuckDB LogicalType from an Arrow type
+static LogicalType ArrowTypeToDuckDBType(ClientContext &context, const std::shared_ptr<arrow::DataType> &arrow_type) {
+	// Create a single-field schema and convert
+	auto schema = arrow::schema({arrow::field("value", arrow_type)});
+	ArrowSchemaWrapper c_schema;
+	ArrowTableSchema arrow_table;
+	vector<LogicalType> types;
+	vector<string> names;
+	vgi::ArrowSchemaToDuckDBTypes(context, schema, c_schema, arrow_table, types, names);
+	return types[0];
+}
+
+// Helper to convert Arrow scalar to DuckDB Value
+static Value ArrowScalarToDuckDBValue(const std::shared_ptr<arrow::Scalar> &scalar, const LogicalType &type) {
+	if (!scalar || !scalar->is_valid) {
+		return Value(type);
+	}
+
+	switch (type.id()) {
+	case LogicalTypeId::BOOLEAN:
+		return Value::BOOLEAN(std::static_pointer_cast<arrow::BooleanScalar>(scalar)->value);
+	case LogicalTypeId::BIGINT:
+		return Value::BIGINT(std::static_pointer_cast<arrow::Int64Scalar>(scalar)->value);
+	case LogicalTypeId::INTEGER:
+		return Value::INTEGER(std::static_pointer_cast<arrow::Int32Scalar>(scalar)->value);
+	case LogicalTypeId::DOUBLE:
+		return Value::DOUBLE(std::static_pointer_cast<arrow::DoubleScalar>(scalar)->value);
+	case LogicalTypeId::FLOAT:
+		return Value::FLOAT(std::static_pointer_cast<arrow::FloatScalar>(scalar)->value);
+	case LogicalTypeId::VARCHAR: {
+		auto str_scalar = std::static_pointer_cast<arrow::StringScalar>(scalar);
+		return Value(str_scalar->value->ToString());
+	}
+	default:
+		// For unsupported types, return NULL
+		return Value(type);
+	}
+}
+
+VgiSetting ParseVgiSetting(const std::vector<uint8_t> &bytes, const std::string &worker_path) {
+	// Deserialize the Setting RecordBatch
+	auto batch = DeserializeRecordBatch(bytes);
+	if (!batch || batch->num_rows() == 0) {
+		throw IOException("Empty Setting batch from worker: %s", worker_path);
+	}
+
+	RecordBatchSingleRow row(batch, 0, "Setting", worker_path);
+
+	VgiSetting setting;
+	setting.name = row["name"].value_not_null<std::string>();
+	setting.description = row["description"].value_not_null<std::string>();
+
+	// Parse the type from the serialized schema bytes
+	auto type_bytes = row["type"].value_not_null<std::vector<uint8_t>>();
+	auto type_buffer = arrow::Buffer::Wrap(type_bytes.data(), type_bytes.size());
+	auto type_stream = std::make_shared<arrow::io::BufferReader>(type_buffer);
+	auto type_schema_result = arrow::ipc::ReadSchema(type_stream.get(), nullptr);
+	if (!type_schema_result.ok()) {
+		throw IOException("Failed to read type schema for setting '%s': %s", setting.name,
+		                  type_schema_result.status().ToString());
+	}
+	auto type_schema = type_schema_result.ValueUnsafe();
+	auto arrow_type = type_schema->field(0)->type();
+
+	// We need a context to convert Arrow type to DuckDB type
+	// For now, use a simple mapping for common types
+	switch (arrow_type->id()) {
+	case arrow::Type::BOOL:
+		setting.type = LogicalType::BOOLEAN;
+		break;
+	case arrow::Type::INT32:
+		setting.type = LogicalType::INTEGER;
+		break;
+	case arrow::Type::INT64:
+		setting.type = LogicalType::BIGINT;
+		break;
+	case arrow::Type::FLOAT:
+		setting.type = LogicalType::FLOAT;
+		break;
+	case arrow::Type::DOUBLE:
+		setting.type = LogicalType::DOUBLE;
+		break;
+	case arrow::Type::STRING:
+	case arrow::Type::LARGE_STRING:
+		setting.type = LogicalType::VARCHAR;
+		break;
+	default:
+		// Default to VARCHAR for unknown types
+		setting.type = LogicalType::VARCHAR;
+		break;
+	}
+
+	// Parse the default value if present
+	auto default_bytes_opt = row["default_value"].as<std::vector<uint8_t>>();
+	if (default_bytes_opt && !default_bytes_opt->empty()) {
+		auto default_batch = DeserializeRecordBatch(*default_bytes_opt);
+		if (default_batch && default_batch->num_rows() > 0) {
+			auto scalar_result = default_batch->column(0)->GetScalar(0);
+			if (scalar_result.ok()) {
+				setting.default_value = ArrowScalarToDuckDBValue(scalar_result.ValueUnsafe(), setting.type);
+			} else {
+				setting.default_value = Value(setting.type);
+			}
+		} else {
+			setting.default_value = Value(setting.type);
+		}
+	} else {
+		setting.default_value = Value(setting.type);
+	}
+
+	return setting;
+}
+
 CatalogAttachResult ParseCatalogAttachResult(const std::shared_ptr<arrow::RecordBatch> &batch,
                                              const std::string &worker_path) {
 	CatalogAttachResult result;
@@ -332,6 +463,12 @@ CatalogAttachResult ParseCatalogAttachResult(const std::shared_ptr<arrow::Record
 	result.default_schema = row["default_schema"].value_not_null<std::string>();
 	if (result.default_schema.empty()) {
 		result.default_schema = "main";
+	}
+
+	// Parse settings list - each element is a serialized Setting
+	auto settings_bytes = row["settings"].value_or(std::vector<std::vector<uint8_t>>{});
+	for (const auto &setting_bytes : settings_bytes) {
+		result.settings.push_back(ParseVgiSetting(setting_bytes, worker_path));
 	}
 
 	return result;
@@ -557,10 +694,10 @@ VgiFunctionInfo GetFunctionInfo(const std::string &worker_path, const std::vecto
 FunctionConnection::FunctionConnection(const std::string &worker_path, const std::string &function_name,
                                        const ArrowArguments &arguments, const std::vector<uint8_t> &attach_id,
                                        ClientContext &context, const std::vector<uint8_t> &global_execution_id,
-                                       bool worker_debug)
+                                       bool worker_debug, const std::map<std::string, std::string> &settings)
     : worker_path_(worker_path), function_name_(function_name), arguments_type_(arguments.type),
       arguments_array_(arguments.array), attach_id_(attach_id), global_execution_id_(global_execution_id),
-      context_(context), worker_debug_(worker_debug) {
+      context_(context), worker_debug_(worker_debug), settings_(settings) {
 }
 
 FunctionConnection::~FunctionConnection() {
@@ -598,8 +735,8 @@ OutputSpecResult FunctionConnection::PerformBindFull() {
 	         {"num_args", std::to_string(num_args)}});
 
 	// Stream 1: Send Invocation
-	auto invocation =
-	    CreateFunctionInvocationFull(function_name_, arguments_type_, arguments_array_, attach_id_, global_execution_id_);
+	auto invocation = CreateFunctionInvocationFull(function_name_, arguments_type_, arguments_array_, attach_id_,
+	                                               global_execution_id_, settings_);
 	auto invocation_bytes = SerializeRecordBatch(invocation);
 	WriteAll(proc_->GetStdinFd(), invocation_bytes->data(), invocation_bytes->size());
 

@@ -1,0 +1,172 @@
+# name: test/sql/integration/table/settings_aware.test
+# description: Integration tests for VGI settings_aware table function
+# group: [vgi]
+
+# This test requires a VGI worker to be available
+# Set VGI_TEST_WORKER environment variable to the path of a VGI worker executable
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# settings_aware function (settings support)
+# Demonstrates settings are passed to functions:
+# - vgi_verbose_mode: bool - adds details column when true
+# - greeting: str - echoed in greeting column
+# - multiplier: int - multiplies the value column (value = id * 2.5 * multiplier)
+# Output schema: {id: int64, greeting: string, value: float64, [details: string]}
+# ============================================================================
+
+# Test with default values: greeting="Hello", multiplier=1, verbose=false
+# value = id * 2.5 * 1
+query ITR
+SELECT * FROM example.settings_aware(3);
+----
+0	Hello	0.0
+1	Hello	2.5
+2	Hello	5.0
+
+# Test changing greeting setting - should be echoed back
+statement ok
+SET greeting = 'Hi there';
+
+query ITR
+SELECT * FROM example.settings_aware(2);
+----
+0	Hi there	0.0
+1	Hi there	2.5
+
+# Test changing multiplier setting - value = id * 2.5 * multiplier
+statement ok
+SET multiplier = 2;
+
+# With multiplier=2: value = id * 2.5 * 2 = id * 5.0
+query ITR
+SELECT * FROM example.settings_aware(3);
+----
+0	Hi there	0.0
+1	Hi there	5.0
+2	Hi there	10.0
+
+# Test changing multiplier to 10
+statement ok
+SET multiplier = 10;
+
+# With multiplier=10: value = id * 2.5 * 10 = id * 25.0
+query ITR
+SELECT * FROM example.settings_aware(3);
+----
+0	Hi there	0.0
+1	Hi there	25.0
+2	Hi there	50.0
+
+# Reset multiplier and test greeting again
+statement ok
+SET multiplier = 1;
+
+statement ok
+SET greeting = 'Bonjour';
+
+query ITR
+SELECT * FROM example.settings_aware(2);
+----
+0	Bonjour	0.0
+1	Bonjour	2.5
+
+# Test vgi_verbose_mode - adds details column
+statement ok
+SET vgi_verbose_mode = 'true';
+
+query ITRT
+SELECT * FROM example.settings_aware(3);
+----
+0	Bonjour	0.0	row_0
+1	Bonjour	2.5	row_1
+2	Bonjour	5.0	row_2
+
+# Test all three settings together
+statement ok
+SET greeting = 'Hola';
+
+statement ok
+SET multiplier = 3;
+
+# With greeting=Hola, multiplier=3, verbose=true
+# value = id * 2.5 * 3 = id * 7.5
+query ITRT
+SELECT * FROM example.settings_aware(4);
+----
+0	Hola	0.0	row_0
+1	Hola	7.5	row_1
+2	Hola	15.0	row_2
+3	Hola	22.5	row_3
+
+# Toggle verbose mode off
+statement ok
+SET vgi_verbose_mode = 'false';
+
+query ITR
+SELECT * FROM example.settings_aware(2);
+----
+0	Hola	0.0
+1	Hola	7.5
+
+# Toggle verbose mode back on to verify it works multiple times
+statement ok
+SET vgi_verbose_mode = 'true';
+
+query ITRT
+SELECT * FROM example.settings_aware(2);
+----
+0	Hola	0.0	row_0
+1	Hola	7.5	row_1
+
+# Verify row count with larger dataset
+query I
+SELECT COUNT(*) FROM example.settings_aware(100);
+----
+100
+
+# Test with vgi_table_function() direct call - settings should still apply
+# since extension options are registered from the attached catalog
+statement ok
+SET greeting = 'Direct';
+
+statement ok
+SET multiplier = 2;
+
+statement ok
+SET vgi_verbose_mode = 'true';
+
+query ITRT
+SELECT * FROM vgi_table_function('${VGI_TEST_WORKER}', 'settings_aware', [3]);
+----
+0	Direct	0.0	row_0
+1	Direct	5.0	row_1
+2	Direct	10.0	row_2
+
+statement ok
+SET vgi_verbose_mode = 'false';
+
+query ITR
+SELECT * FROM vgi_table_function('${VGI_TEST_WORKER}', 'settings_aware', [2]);
+----
+0	Direct	0.0
+1	Direct	5.0
+
+# Reset settings to defaults for cleanup
+statement ok
+SET greeting = 'Hello';
+
+statement ok
+SET multiplier = 1;
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;

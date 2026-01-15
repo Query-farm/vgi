@@ -138,6 +138,15 @@ private:
 	bool finished_ = false;
 };
 
+// A setting exposed by a VGI worker
+// Parsed from serialized Setting objects in CatalogAttachResult
+struct VgiSetting {
+	std::string name;                     // Setting name (e.g., "vgi_verbose_mode")
+	std::string description;              // Human-readable description
+	LogicalType type;                     // DuckDB logical type
+	Value default_value;                  // Default value (may be NULL if required)
+};
+
 // Result of catalog_attach call
 struct CatalogAttachResult {
 	std::vector<uint8_t> attach_id;
@@ -147,6 +156,7 @@ struct CatalogAttachResult {
 	int64_t catalog_version = 0;
 	bool attach_id_required = false;
 	std::string default_schema = "main";
+	std::vector<VgiSetting> settings;     // Extension options exposed by this catalog
 };
 
 // Schema metadata from the worker
@@ -239,6 +249,10 @@ struct VgiFunctionInfo {
 	AggregateDistinctDependent distinct_dependent = AggregateDistinctDependent::NOT_DISTINCT_DEPENDENT;
 };
 
+// Parse a VgiSetting from serialized bytes (Arrow IPC format)
+// The bytes contain a single-row RecordBatch with: name, description, type, default_value
+VgiSetting ParseVgiSetting(const std::vector<uint8_t> &bytes, const std::string &worker_path);
+
 // Parse a CatalogAttachResult from an Arrow RecordBatch
 CatalogAttachResult ParseCatalogAttachResult(const std::shared_ptr<arrow::RecordBatch> &batch,
                                              const std::string &worker_path);
@@ -304,9 +318,11 @@ public:
 	// Create connection parameters (does not spawn worker yet)
 	// arguments: Arrow struct array with fields named positional_0, positional_1, etc.
 	// global_execution_id: For secondary workers, pass the ID from the primary worker's InitResult
+	// settings: Optional map of settings to pass to the worker (e.g., DuckDB pragmas)
 	FunctionConnection(const std::string &worker_path, const std::string &function_name,
 	                   const ArrowArguments &arguments, const std::vector<uint8_t> &attach_id, ClientContext &context,
-	                   const std::vector<uint8_t> &global_execution_id = {}, bool worker_debug = false);
+	                   const std::vector<uint8_t> &global_execution_id = {}, bool worker_debug = false,
+	                   const std::map<std::string, std::string> &settings = {});
 	~FunctionConnection();
 
 	// Phase 1: Perform bind handshake (Streams 1-2)
@@ -368,6 +384,7 @@ private:
 	std::vector<uint8_t> global_execution_id_;
 	ClientContext &context_;
 	bool worker_debug_;
+	std::map<std::string, std::string> settings_;
 
 	// Worker process (created during bind)
 	std::unique_ptr<SubProcess> proc_;
