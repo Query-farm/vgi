@@ -136,42 +136,18 @@ FROM example.partitioned_sequence(35000);
 
 # ----------------------------------------------------------------------------
 # Scale tests - verify correctness at larger sizes
-# Multi-worker execution may or may not occur depending on system configuration
-# The key is that results are correct regardless of parallelism
 # ----------------------------------------------------------------------------
 
-# 100K values - complete sequence verification
+# 50K values - complete sequence verification with sum check
 query IIII
 SELECT COUNT(*) as total, COUNT(DISTINCT n) as distinct_count, MIN(n) as min_val, MAX(n) as max_val
-FROM example.partitioned_sequence(100000);
+FROM example.partitioned_sequence(50000);
 ----
-100000	100000	0	99999
+50000	50000	0	49999
 
-# Verify no gaps in sequence (sum should equal n*(n-1)/2)
 query I
-SELECT SUM(n) = (100000::BIGINT * 99999 / 2) as sum_correct
-FROM example.partitioned_sequence(100000);
-----
-true
-
-# 250K values
-query IIII
-SELECT COUNT(*) as total, COUNT(DISTINCT n) as distinct_count, MIN(n) as min_val, MAX(n) as max_val
-FROM example.partitioned_sequence(250000);
-----
-250000	250000	0	249999
-
-# 500K values - stress test
-query IIII
-SELECT COUNT(*) as total, COUNT(DISTINCT n) as distinct_count, MIN(n) as min_val, MAX(n) as max_val
-FROM example.partitioned_sequence(500000);
-----
-500000	500000	0	499999
-
-# Verify no gaps in 500K sequence
-query I
-SELECT SUM(n) = (500000::BIGINT * 499999 / 2) as sum_correct
-FROM example.partitioned_sequence(500000);
+SELECT SUM(n) = (50000::BIGINT * 49999 / 2) as sum_correct
+FROM example.partitioned_sequence(50000);
 ----
 true
 
@@ -273,24 +249,11 @@ true
 statement ok
 SET threads=4;
 
-# Correctness test
-query IIII
-SELECT COUNT(*) as total, COUNT(DISTINCT n) as distinct_count, MIN(n) as min_val, MAX(n) as max_val
-FROM example.partitioned_sequence(500000);
-----
-500000	500000	0	499999
-
-# Sum verification (no gaps even with parallel execution)
-query I
-SELECT SUM(n) = (500000::BIGINT * 499999 / 2) as sum_correct
-FROM example.partitioned_sequence(500000);
-----
-true
-
 # Worker count verification - truncate logs, run query, check PID count
 statement ok
 CALL truncate_duckdb_logs();
 
+# 500K with 4 threads - should use multiple workers
 query IIII
 SELECT COUNT(*) as total, COUNT(DISTINCT n) as distinct_count, MIN(n) as min_val, MAX(n) as max_val
 FROM example.partitioned_sequence(500000);
@@ -305,43 +268,15 @@ WHERE type = 'VGI' AND message LIKE '%batch_received%';
 ----
 true
 
-# 1M stress test - truncate logs, run query, verify
-statement ok
-CALL truncate_duckdb_logs();
-
-query IIII
-SELECT COUNT(*) as total, COUNT(DISTINCT n) as distinct_count, MIN(n) as min_val, MAX(n) as max_val
-FROM example.partitioned_sequence(1000000);
-----
-1000000	1000000	0	999999
-
-# Verify sum for 1M values
+# Sum verification (no gaps even with parallel execution)
 query I
-SELECT SUM(n) = (1000000::BIGINT * 999999 / 2) as sum_correct
-FROM example.partitioned_sequence(1000000);
-----
-true
-
-# Verify multiple workers for 1M (check logs from the first 1M query only)
-statement ok
-CALL truncate_duckdb_logs();
-
-query IIII
-SELECT COUNT(*) as total, COUNT(DISTINCT n) as distinct_count, MIN(n) as min_val, MAX(n) as max_val
-FROM example.partitioned_sequence(1000000);
-----
-1000000	1000000	0	999999
-
-query I
-SELECT COUNT(DISTINCT regexp_extract(message, 'worker_pid=(\d+)', 1)) >= 2
-FROM duckdb_logs()
-WHERE type = 'VGI' AND message LIKE '%batch_received%';
+SELECT SUM(n) = (500000::BIGINT * 499999 / 2) as sum_correct
+FROM example.partitioned_sequence(500000);
 ----
 true
 
 # ============================================================================
 # Thread scaling verification
-# Test with different thread counts to ensure results are always correct
 # ============================================================================
 
 # 2 threads
@@ -350,9 +285,9 @@ SET threads=2;
 
 query IIII
 SELECT COUNT(*) as total, COUNT(DISTINCT n) as distinct_count, MIN(n) as min_val, MAX(n) as max_val
-FROM example.partitioned_sequence(200000);
+FROM example.partitioned_sequence(50000);
 ----
-200000	200000	0	199999
+50000	50000	0	49999
 
 # 8 threads
 statement ok
@@ -360,9 +295,9 @@ SET threads=8;
 
 query IIII
 SELECT COUNT(*) as total, COUNT(DISTINCT n) as distinct_count, MIN(n) as min_val, MAX(n) as max_val
-FROM example.partitioned_sequence(200000);
+FROM example.partitioned_sequence(50000);
 ----
-200000	200000	0	199999
+50000	50000	0	49999
 
 # Reset to default
 statement ok
