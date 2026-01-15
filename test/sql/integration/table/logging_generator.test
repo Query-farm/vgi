@@ -8,18 +8,52 @@ require-env VGI_TEST_WORKER
 
 require vgi
 
+require json
+
 statement ok
 ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
+# Enable logging to capture worker log messages
+statement ok
+CALL enable_logging(level := 'debug');
+
+statement ok
+CALL truncate_duckdb_logs();
+
 # ============================================================================
 # logging_generator function
-# Generates data and emits log messages (verify it runs without error)
+# Generates data and emits log messages that should be captured in duckdb_logs()
 # ============================================================================
 
 query I
 SELECT COUNT(*) FROM example.logging_generator(10);
 ----
 10
+
+# Verify worker log messages were captured (logging_generator emits in-band log messages)
+# The worker sends "Starting generation of N values" at the start
+query I
+SELECT COUNT(*) > 0 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%Starting generation%';
+----
+true
+
+# The worker sends "Generation complete" at the end
+query I
+SELECT COUNT(*) > 0 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%Generation complete%';
+----
+true
+
+# Verify log messages include the INFO level
+query I
+SELECT COUNT(*) > 0 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%level=INFO%';
+----
+true
+
+# Verify worker path is included in VGI infrastructure log messages (bind, init, etc.)
+query I
+SELECT COUNT(*) > 0 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%table_function.bind%' AND message LIKE '%worker_path=%';
+----
+true
 
 # ============================================================================
 # Cleanup
