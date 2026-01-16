@@ -20,6 +20,12 @@ SELECT typeof(worker_path), typeof(pid), typeof(age_seconds) FROM vgi_worker_poo
 # Test vgi_worker_pool_flush() scalar function
 # ============================================================================
 
+# First flush any workers left over from previous tests
+query I
+SELECT vgi_worker_pool_flush() >= 0;
+----
+true
+
 # Flush should return an integer count (0 when pool is empty)
 query I
 SELECT typeof(vgi_worker_pool_flush());
