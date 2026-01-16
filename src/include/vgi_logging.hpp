@@ -30,6 +30,12 @@ struct VgiLogType : public LogType {
 //! Result is cached after first call.
 bool VgiStderrLogEnabled();
 
+//! Check if pretty stderr logging is enabled via VGI_STDERR_LOG_PRETTY environment variable.
+//! When enabled, log output is formatted with sorted keys and indentation.
+//! Requires VGI_STDERR_LOG=1 to have any effect.
+//! Result is cached after first call.
+bool VgiStderrLogPrettyEnabled();
+
 //! Write a log message to stderr in human-readable format.
 //! Format: [VGI] event key1=value1 key2=value2 ...
 void VgiLogToStderr(const string &event, const vector<pair<string, string>> &info);

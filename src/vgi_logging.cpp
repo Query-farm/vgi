@@ -3,6 +3,7 @@
 #include "vgi_exception.hpp"
 #include "yyjson.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdlib>
 #include <iostream>
@@ -35,17 +36,50 @@ bool VgiStderrLogEnabled() {
 	return enabled;
 }
 
+// Cached check for VGI_STDERR_LOG_PRETTY environment variable
+bool VgiStderrLogPrettyEnabled() {
+	// Use a static atomic to cache the result after first check
+	// -1 = not checked yet, 0 = disabled, 1 = enabled
+	static std::atomic<int> cached_value {-1};
+
+	int value = cached_value.load(std::memory_order_relaxed);
+	if (value >= 0) {
+		return value == 1;
+	}
+
+	// First call - check environment variable
+	const char *env = std::getenv("VGI_STDERR_LOG_PRETTY");
+	bool enabled = env && std::string(env) == "1";
+	cached_value.store(enabled ? 1 : 0, std::memory_order_relaxed);
+	return enabled;
+}
+
 // Write log message to stderr in human-readable format
 void VgiLogToStderr(const string &event, const vector<pair<string, string>> &info) {
 	// Mutex to prevent interleaved output from multiple threads
 	static std::mutex stderr_mutex;
 	std::lock_guard<std::mutex> lock(stderr_mutex);
 
-	std::cerr << "[VGI] " << event;
-	for (const auto &kv : info) {
-		std::cerr << " " << kv.first << "=" << kv.second;
+	if (VgiStderrLogPrettyEnabled()) {
+		// Pretty format: sorted keys with indentation
+		std::cerr << "[VGI] " << event << std::endl;
+
+		// Sort key-value pairs alphabetically by key
+		auto sorted_info = info;
+		std::sort(sorted_info.begin(), sorted_info.end(),
+		          [](const auto &a, const auto &b) { return a.first < b.first; });
+
+		for (const auto &kv : sorted_info) {
+			std::cerr << "      " << kv.first << ": " << kv.second << std::endl;
+		}
+	} else {
+		// Compact format: single line
+		std::cerr << "[VGI] " << event;
+		for (const auto &kv : info) {
+			std::cerr << " " << kv.first << "=" << kv.second;
+		}
+		std::cerr << std::endl;
 	}
-	std::cerr << std::endl;
 }
 
 template <class ITERABLE>

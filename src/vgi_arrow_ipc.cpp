@@ -11,8 +11,46 @@
 namespace duckdb {
 namespace vgi {
 
+// ============================================================================
+// Protocol State Metadata
+// ============================================================================
+
+std::shared_ptr<arrow::KeyValueMetadata> CreateProtocolStateMetadata(const char *state) {
+	return arrow::KeyValueMetadata::Make({PROTOCOL_STATE_KEY}, {state});
+}
+
+std::string GetProtocolState(const std::shared_ptr<arrow::KeyValueMetadata> &metadata) {
+	if (!metadata) {
+		return "";
+	}
+	auto result = metadata->Get(PROTOCOL_STATE_KEY);
+	if (!result.ok()) {
+		return "";
+	}
+	return result.ValueUnsafe();
+}
+
+void ValidateProtocolState(const std::shared_ptr<arrow::KeyValueMetadata> &metadata, const char *expected_state,
+                           const std::string &context, const std::string &worker_path, pid_t worker_pid) {
+	auto actual_state = GetProtocolState(metadata);
+	if (actual_state.empty()) {
+		ThrowVgiIOException("Protocol state missing in %s response (expected '%s')", worker_path, worker_pid, "",
+		                    context, expected_state);
+	}
+	if (actual_state != expected_state) {
+		ThrowVgiIOException("Protocol state mismatch in %s: expected '%s', got '%s'", worker_path, worker_pid, "",
+		                    context, expected_state, actual_state);
+	}
+}
+
+// ============================================================================
+// Serialization Functions
+// ============================================================================
+
 // Serialize an Arrow RecordBatch to IPC stream format bytes
-std::shared_ptr<arrow::Buffer> SerializeRecordBatch(const std::shared_ptr<arrow::RecordBatch> &batch) {
+std::shared_ptr<arrow::Buffer> SerializeRecordBatch(
+    const std::shared_ptr<arrow::RecordBatch> &batch,
+    const std::shared_ptr<const arrow::KeyValueMetadata> &custom_metadata) {
 	auto sink_result = arrow::io::BufferOutputStream::Create();
 	if (!sink_result.ok()) {
 		throw IOException("Failed to create Arrow buffer: " + sink_result.status().ToString());
@@ -25,7 +63,12 @@ std::shared_ptr<arrow::Buffer> SerializeRecordBatch(const std::shared_ptr<arrow:
 	}
 	auto writer = writer_result.ValueUnsafe();
 
-	auto status = writer->WriteRecordBatch(*batch);
+	arrow::Status status;
+	if (custom_metadata) {
+		status = writer->WriteRecordBatch(*batch, custom_metadata);
+	} else {
+		status = writer->WriteRecordBatch(*batch);
+	}
 	if (!status.ok()) {
 		throw IOException("Failed to serialize Arrow batch: " + status.ToString());
 	}

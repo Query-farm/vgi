@@ -24,13 +24,15 @@ namespace vgi {
 
 static void SendInvocationAndArgs(SubProcess &proc, const std::string &method_name,
                                   const std::shared_ptr<arrow::RecordBatch> &args) {
-	// Create and send the invocation
+	// Create and send the invocation with protocol state metadata
 	auto invocation = CreateCatalogInvocation(method_name);
-	auto invocation_bytes = SerializeRecordBatch(invocation);
+	auto invocation_metadata = CreateProtocolStateMetadata(ProtocolState::INVOCATION);
+	auto invocation_bytes = SerializeRecordBatch(invocation, invocation_metadata);
 	WriteAll(proc.GetStdinFd(), invocation_bytes->data(), invocation_bytes->size());
 
-	// Send the arguments
-	auto args_bytes = SerializeRecordBatch(args);
+	// Send the arguments with catalog_args protocol state
+	auto args_metadata = CreateProtocolStateMetadata(ProtocolState::CATALOG_ARGS);
+	auto args_bytes = SerializeRecordBatch(args, args_metadata);
 	WriteAll(proc.GetStdinFd(), args_bytes->data(), args_bytes->size());
 
 	// Close stdin to signal end of input
@@ -84,6 +86,19 @@ std::optional<VgiFunctionType> ParseVgiFunctionType(const std::string &value) {
 		return VgiFunctionType::Aggregate;
 	}
 	return std::nullopt;
+}
+
+std::string VgiFunctionTypeToString(VgiFunctionType type) {
+	switch (type) {
+	case VgiFunctionType::Scalar:
+		return "scalar";
+	case VgiFunctionType::Table:
+		return "table";
+	case VgiFunctionType::Aggregate:
+		return "aggregate";
+	default:
+		return "unknown";
+	}
 }
 
 // Parse FunctionStability from wire format (Python enum .name)
@@ -295,6 +310,10 @@ std::shared_ptr<arrow::RecordBatch> CatalogMethodStream::ReadNext() {
 		// It was a log message - read the next batch
 		return ReadNext();
 	}
+
+	// Validate protocol state for catalog results
+	ValidateProtocolState(result.custom_metadata, ProtocolState::CATALOG_RESULT, "catalog result", worker_path_,
+	                      proc_->GetPid());
 
 	// Empty batch signals end of stream
 	if (result.batch->num_rows() == 0) {
@@ -829,10 +848,11 @@ OutputSpecResult FunctionConnection::PerformBindFull() {
 	         {"function_name", function_name_},
 	         {"num_args", std::to_string(num_args)}});
 
-	// Stream 1: Send Invocation
+	// Stream 1: Send Invocation with protocol state metadata
 	auto invocation = CreateFunctionInvocationFull(function_name_, arguments_type_, arguments_array_, attach_id_,
 	                                               global_execution_id_, settings_);
-	auto invocation_bytes = SerializeRecordBatch(invocation);
+	auto invocation_metadata = CreateProtocolStateMetadata(ProtocolState::INVOCATION);
+	auto invocation_bytes = SerializeRecordBatch(invocation, invocation_metadata);
 	WriteAll(proc_->GetStdinFd(), invocation_bytes->data(), invocation_bytes->size());
 
 	// Stream 2: Read OutputSpec
@@ -855,7 +875,9 @@ OutputSpecResult FunctionConnection::PerformBindFull() {
 		}
 	}
 
-	// Parse and cache OutputSpec
+	// Validate protocol state and parse OutputSpec
+	ValidateProtocolState(output_spec_result.custom_metadata, ProtocolState::BIND_RESULT, "OutputSpec", worker_path_,
+	                      proc_->GetPid());
 	output_spec_ = ParseOutputSpec(output_spec_result.batch);
 	bind_done_ = true;
 
@@ -887,9 +909,10 @@ InitResultData FunctionConnection::PerformInit(const std::vector<int32_t> &proje
 		                    GetInvocationIdHex());
 	}
 
-	// Stream 3: Send InitInput (TableFunctionInitInput with projection_ids)
+	// Stream 3: Send InitInput (TableFunctionInitInput with projection_ids) with protocol state
 	auto init_input = CreateInitInput(projection_ids);
-	auto init_input_bytes = SerializeRecordBatch(init_input);
+	auto init_input_metadata = CreateProtocolStateMetadata(ProtocolState::INIT_INPUT);
+	auto init_input_bytes = SerializeRecordBatch(init_input, init_input_metadata);
 	WriteAll(proc_->GetStdinFd(), init_input_bytes->data(), init_input_bytes->size());
 
 	// Stream 4: Read InitResult
@@ -904,7 +927,9 @@ InitResultData FunctionConnection::PerformInit(const std::vector<int32_t> &proje
 		}
 	}
 
-	// Parse InitResult to get global_execution_identifier for multi-worker coordination
+	// Validate protocol state and parse InitResult
+	ValidateProtocolState(init_result.custom_metadata, ProtocolState::INIT_RESULT, "InitResult", worker_path_,
+	                      proc_->GetPid());
 	auto init_data = ParseInitResult(init_result.batch);
 
 	// Note: We no longer close stdin here to allow connection pooling.
@@ -943,9 +968,10 @@ void FunctionConnection::SkipInit() {
 	// The Python worker reads InitInput but doesn't write InitResult for secondary workers,
 	// going straight to the data stream.
 
-	// Stream 3: Send InitInput (with empty projection_ids)
+	// Stream 3: Send InitInput (with empty projection_ids) with protocol state
 	auto init_input = CreateInitInput({});
-	auto init_input_bytes = SerializeRecordBatch(init_input);
+	auto init_input_metadata = CreateProtocolStateMetadata(ProtocolState::INIT_INPUT);
+	auto init_input_bytes = SerializeRecordBatch(init_input, init_input_metadata);
 	WriteAll(proc_->GetStdinFd(), init_input_bytes->data(), init_input_bytes->size());
 
 	// Skip Stream 4 (InitResult) - secondary workers don't send it
@@ -1008,6 +1034,10 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 		// It was a log message - read the next batch
 		return ReadDataBatch();
 	}
+
+	// Validate protocol state for output data batches
+	ValidateProtocolState(result.custom_metadata, ProtocolState::OUTPUT, "data batch", worker_path_,
+	                      proc_ ? proc_->GetPid() : -1);
 
 	// Check vgi.status metadata for FINISHED
 	if (result.custom_metadata) {

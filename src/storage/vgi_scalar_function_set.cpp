@@ -55,8 +55,8 @@ void VgiScalarFunctionSet::LoadEntries(ClientContext &context) {
 		for (int64_t i = 0; i < batch->num_rows(); i++) {
 			auto func_info = vgi::ParseFunctionInfo(batch, i, worker_path);
 			if (func_info.function_type != vgi::VgiFunctionType::Scalar) {
-				throw IOException("VGI worker returned non-scalar function_type when 'scalar' was requested (function: %s)",
-				                  func_info.name);
+				throw IOException("VGI worker returned '%s' function_type when 'scalar' was requested (function: %s)",
+				                  vgi::VgiFunctionTypeToString(func_info.function_type), func_info.name);
 			}
 			functions_by_name[func_info.name].push_back(std::move(func_info));
 		}

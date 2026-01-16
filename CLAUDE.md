@@ -28,6 +28,7 @@ Tests complete in <10 seconds. For debugging failures, write standalone `.sql` f
 ## Debug Environment Variables
 
 - `VGI_STDERR_LOG=1` - Log to stderr (useful when DuckDB hangs)
+- `VGI_STDERR_LOG_PRETTY=1` - Pretty-print log output with sorted keys and indentation (requires `VGI_STDERR_LOG=1`)
 - `VGI_IPC_DEBUG=1` - IPC debug output from worker
 - `VGI_WORKER_STDERR_PASSTHROUGH=1` - Pass worker stderr to terminal (Python tracebacks)
 

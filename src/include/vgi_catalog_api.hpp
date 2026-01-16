@@ -212,6 +212,9 @@ enum class VgiFunctionType {
 // Returns nullopt for unrecognized values
 std::optional<VgiFunctionType> ParseVgiFunctionType(const std::string &value);
 
+// Convert VgiFunctionType to string for error messages
+std::string VgiFunctionTypeToString(VgiFunctionType type);
+
 // Row order preservation behavior for table functions
 // Wire format: uppercase enum name ("PRESERVES_ORDER", "NO_ORDER_GUARANTEE")
 enum class VgiOrderPreservation {
