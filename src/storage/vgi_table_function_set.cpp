@@ -114,6 +114,7 @@ static unique_ptr<FunctionData> VgiCatalogTableFunctionBind(ClientContext &conte
 	bind_data->worker_debug = vgi_info.worker_debug();
 	bind_data->use_pool = vgi_info.use_pool();
 	bind_data->function_name = vgi_info.function_info().name;
+	bind_data->projection_pushdown = vgi_info.function_info().projection_pushdown.value_or(false);
 
 	// Build Arrow arguments from the function call inputs
 	// input.inputs contains positional arguments passed to the function

@@ -122,6 +122,12 @@ unique_ptr<LocalTableFunctionState> VgiTableFunctionInitLocal(ExecutionContext &
 	auto local_state = make_uniq<VgiTableFunctionLocalState>(std::move(current_chunk), context.client,
 	                                                         bind_data.use_pool, bind_data.worker_path);
 
+	// Set column_ids for ArrowToDuckDB projection support if function supports it
+	// This tells ArrowToDuckDB which columns to extract from the Arrow arrays
+	if (bind_data.projection_pushdown) {
+		local_state->column_ids = input.column_ids;
+	}
+
 	// Try to claim the primary connection from global_state (thread-safe check-and-move)
 	std::unique_ptr<FunctionConnection> primary_connection;
 	{
@@ -238,8 +244,10 @@ void VgiTableFunctionScan(ClientContext &context, TableFunctionInput &input, Dat
 	output.SetCardinality(output_size);
 
 	// Convert Arrow data to DuckDB using ArrowTableFunction::ArrowToDuckDB
+	// Pass true if projection pushdown is enabled (column_ids was set in InitLocal)
 	if (output_size > 0) {
-		ArrowTableFunction::ArrowToDuckDB(local_state, bind_data.arrow_table.GetColumns(), output, false);
+		ArrowTableFunction::ArrowToDuckDB(local_state, bind_data.arrow_table.GetColumns(), output,
+		                                  bind_data.projection_pushdown);
 	}
 
 	local_state.chunk_offset += output.size();

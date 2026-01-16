@@ -31,6 +31,8 @@ Tests complete in <10 seconds. For debugging failures, write standalone `.sql` f
 - `VGI_IPC_DEBUG=1` - IPC debug output from worker
 - `VGI_WORKER_STDERR_PASSTHROUGH=1` - Pass worker stderr to terminal (Python tracebacks)
 
+**vgi-python function classes**: Function names are CamelCased with a `Function` suffix (e.g., `projected_data` → `ProjectedDataFunction` in vgi-python).
+
 ## Key Source Files
 
 | File | Purpose |

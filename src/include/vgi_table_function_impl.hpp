@@ -57,6 +57,9 @@ struct VgiTableFunctionBindData : public TableFunctionData {
 	// Features that the worker has activated for this invocation
 	std::unordered_set<std::string> active_features;
 
+	// Whether this function supports projection pushdown (from FunctionInfo)
+	bool projection_pushdown = false;
+
 	// Connection from bind phase, persisted for reuse in InitGlobal.
 	// Mutable to allow InitGlobal to move it out (bind_data is const after bind).
 	mutable std::unique_ptr<FunctionConnection> bind_connection;

@@ -46,7 +46,143 @@ SELECT id, name FROM example.projected_data(3);
 1	item_1
 2	item_2
 
+# ============================================================================
+# Out-of-order column selection (columns not in schema order)
+# Schema order is: id (0), name (1), value (2), extra (3)
+# ============================================================================
+
+# Reverse pairs
+query II
+SELECT extra, id FROM example.projected_data(3);
+----
+0	0
+1	1
+4	2
+
+query TI
+SELECT name, extra FROM example.projected_data(3);
+----
+item_0	0
+item_1	1
+item_2	4
+
+query RI
+SELECT value, id FROM example.projected_data(3);
+----
+0.0	0
+1.5	1
+3.0	2
+
+# Non-adjacent columns in reverse order
+query IT
+SELECT extra, name FROM example.projected_data(3);
+----
+0	item_0
+1	item_1
+4	item_2
+
+# Three columns out of order
+query RTI
+SELECT value, name, id FROM example.projected_data(3);
+----
+0.0	item_0	0
+1.5	item_1	1
+3.0	item_2	2
+
+query ITR
+SELECT extra, name, value FROM example.projected_data(3);
+----
+0	item_0	0.0
+1	item_1	1.5
+4	item_2	3.0
+
+# Complete reverse order (all 4 columns)
+query IRTI
+SELECT extra, value, name, id FROM example.projected_data(3);
+----
+0	0.0	item_0	0
+1	1.5	item_1	1
+4	3.0	item_2	2
+
+# Single column selections
+query T
+SELECT name FROM example.projected_data(3);
+----
+item_0
+item_1
+item_2
+
+query R
+SELECT value FROM example.projected_data(3);
+----
+0.0
+1.5
+3.0
+
+query I
+SELECT extra FROM example.projected_data(3);
+----
+0
+1
+4
+
+# ============================================================================
+# Window functions with projection (large dataset)
+# ============================================================================
+
+# ROW_NUMBER with subset of columns - verify count and boundaries
+query III
+SELECT COUNT(*), MIN(rn), MAX(rn) FROM (
+    SELECT id, ROW_NUMBER() OVER (ORDER BY id) as rn, name FROM example.projected_data(4000)
+);
+----
+4000	1	4000
+
+# LAG with out-of-order columns - count non-null lag values
+query II
+SELECT COUNT(*), COUNT(prev_name) FROM (
+    SELECT id, name, LAG(name) OVER (ORDER BY id) as prev_name FROM example.projected_data(4000)
+);
+----
+4000	3999
+
+# Running sum with non-adjacent columns - verify final sum
+query IR
+SELECT MAX(id), MAX(running_sum) FROM (
+    SELECT id, extra, SUM(value) OVER (ORDER BY id) as running_sum FROM example.projected_data(4000)
+);
+----
+3999	11994000.0
+
+# RANK with reverse column order - verify all ranks present
+query III
+SELECT COUNT(*), MIN(rnk), MAX(rnk) FROM (
+    SELECT value, RANK() OVER (ORDER BY extra DESC) as rnk, id FROM example.projected_data(4000)
+);
+----
+4000	1	4000
+
+# Multiple window functions - verify consistency
+query IIII
+SELECT COUNT(*), MIN(rn), MAX(rn), MAX(total) FROM (
+    SELECT id, name, ROW_NUMBER() OVER (ORDER BY id) as rn, COUNT(*) OVER () as total
+    FROM example.projected_data(4000)
+);
+----
+4000	1	4000	4000
+
+# LEAD with reverse column selection
+query II
+SELECT COUNT(*), COUNT(next_extra) FROM (
+    SELECT name, id, LEAD(extra) OVER (ORDER BY id) as next_extra FROM example.projected_data(4000)
+);
+----
+4000	3999
+
+# ============================================================================
 # Verify row count with larger dataset
+# ============================================================================
+
 query I
 SELECT COUNT(*) FROM example.projected_data(100);
 ----
