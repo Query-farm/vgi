@@ -1,0 +1,107 @@
+# name: test/sql/integration/table_in_out/repeat_inputs.test
+# description: Integration tests for VGI repeat_inputs table-in-out function
+# group: [vgi]
+
+# This test requires a VGI worker to be available
+# Set VGI_TEST_WORKER environment variable to the path of a VGI worker executable
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# repeat_inputs function
+# Duplicates each input batch N times
+# Args: repeat_count (BIGINT), data (TABLE)
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# Basic repeat - single row, repeat 2 times
+# ----------------------------------------------------------------------------
+
+query II
+SELECT * FROM example.repeat_inputs(2, (SELECT 1 AS a, 2 AS b));
+----
+1	2
+1	2
+
+query I
+SELECT * FROM example.repeat_inputs(3, (SELECT 42 AS value));
+----
+42
+42
+42
+
+# ----------------------------------------------------------------------------
+# Multiple rows, repeated
+# ----------------------------------------------------------------------------
+
+query II
+SELECT * FROM example.repeat_inputs(2, (SELECT * FROM (VALUES (1, 'a'), (2, 'b')) t(x, y)));
+----
+1	a
+2	b
+1	a
+2	b
+
+query I
+SELECT COUNT(*) FROM example.repeat_inputs(3, (SELECT * FROM (VALUES (1), (2), (3)) t(n)));
+----
+9
+
+# Verify: 3 rows * 3 repeats = 9 rows
+
+# ----------------------------------------------------------------------------
+# Repeat count of 1 (identity)
+# ----------------------------------------------------------------------------
+
+query II
+SELECT * FROM example.repeat_inputs(1, (SELECT 10 AS a, 20 AS b));
+----
+10	20
+
+query I
+SELECT COUNT(*) FROM example.repeat_inputs(1, (SELECT unnest(generate_series(1, 5)) AS n));
+----
+5
+
+# ----------------------------------------------------------------------------
+# Aggregations on repeated data
+# ----------------------------------------------------------------------------
+
+query I
+SELECT SUM(n) FROM example.repeat_inputs(2, (SELECT unnest(generate_series(1, 5)) AS n));
+----
+30
+
+# Verify: sum(1..5) = 15, repeated 2x = 30
+
+query I
+SELECT COUNT(DISTINCT n) FROM example.repeat_inputs(3, (SELECT unnest(generate_series(1, 10)) AS n));
+----
+10
+
+# Distinct values should still be 10 despite repetition
+
+# ----------------------------------------------------------------------------
+# Larger repeat counts
+# ----------------------------------------------------------------------------
+
+query I
+SELECT COUNT(*) FROM example.repeat_inputs(5, (SELECT 1 AS n));
+----
+5
+
+query I
+SELECT COUNT(*) FROM example.repeat_inputs(10, (SELECT * FROM (VALUES (1), (2)) t(n)));
+----
+20
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;

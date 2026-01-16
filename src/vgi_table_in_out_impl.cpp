@@ -155,9 +155,17 @@ unique_ptr<FunctionData> VgiTableInOutBind(ClientContext &context, TableFunction
 	bind_data->settings = params.settings;
 
 	// Build arguments from the regular (non-TABLE) inputs
-	// For now, we support TABLE as the only positional argument
-	// Named arguments are still supported
+	// input.inputs contains positional arguments, but TABLE arguments are represented as NULL
+	// We skip NULL values since they represent the TABLE input (not a scalar argument)
+	// Named arguments are in input.named_parameters
 	vector<Value> positional_args;
+	for (auto &val : input.inputs) {
+		// Skip NULL values - these represent TABLE arguments
+		if (val.IsNull()) {
+			continue;
+		}
+		positional_args.push_back(val);
+	}
 	vector<std::pair<string, Value>> named_args;
 	for (auto &[name, value] : input.named_parameters) {
 		named_args.emplace_back(name, value);

@@ -1,0 +1,100 @@
+# name: test/sql/integration/table_in_out/distributed_sum.test
+# description: Integration tests for VGI distributed sum table-in-out functions
+# group: [vgi]
+
+# This test requires a VGI worker to be available
+# Set VGI_TEST_WORKER environment variable to the path of a VGI worker executable
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# sum_all_columns_distributed function
+# Distributed column-wise sum aggregation (generator API)
+# Args: data (TABLE) - input table with numeric columns
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# Basic sum - single row
+# ----------------------------------------------------------------------------
+
+query II
+SELECT * FROM example.sum_all_columns_distributed((SELECT 1 AS a, 2 AS b));
+----
+1	2
+
+# ----------------------------------------------------------------------------
+# Multiple rows
+# ----------------------------------------------------------------------------
+
+query II
+SELECT * FROM example.sum_all_columns_distributed((SELECT * FROM (VALUES (1, 2), (3, 4), (5, 6)) t(a, b)));
+----
+9	12
+
+# Verify: a = 1+3+5 = 9, b = 2+4+6 = 12
+
+# ----------------------------------------------------------------------------
+# Larger dataset
+# ----------------------------------------------------------------------------
+
+query I
+SELECT n FROM example.sum_all_columns_distributed((SELECT unnest(generate_series(1, 100)) AS n));
+----
+5050
+
+# Verify: sum(1..100) = 5050
+
+# ============================================================================
+# sum_all_columns_simple_distributed function
+# Distributed sum using simple callback API (TableInOutFunction)
+# Args: data (TABLE) - input table with numeric columns
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# Basic sum - single row
+# ----------------------------------------------------------------------------
+
+query II
+SELECT * FROM example.sum_all_columns_simple_distributed((SELECT 1 AS a, 2 AS b));
+----
+1	2
+
+# ----------------------------------------------------------------------------
+# Multiple rows
+# ----------------------------------------------------------------------------
+
+query II
+SELECT * FROM example.sum_all_columns_simple_distributed((SELECT * FROM (VALUES (1, 2), (3, 4), (5, 6)) t(a, b)));
+----
+9	12
+
+# ----------------------------------------------------------------------------
+# Larger dataset
+# ----------------------------------------------------------------------------
+
+query I
+SELECT n FROM example.sum_all_columns_simple_distributed((SELECT unnest(generate_series(1, 100)) AS n));
+----
+5050
+
+# ============================================================================
+# Verify both distributed implementations produce same results
+# ============================================================================
+
+query II
+SELECT
+    (SELECT SUM(a) FROM example.sum_all_columns_distributed((SELECT unnest(generate_series(1, 50)) AS a))),
+    (SELECT SUM(a) FROM example.sum_all_columns_simple_distributed((SELECT unnest(generate_series(1, 50)) AS a)));
+----
+1275	1275
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;
