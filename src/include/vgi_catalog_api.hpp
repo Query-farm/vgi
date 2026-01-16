@@ -255,6 +255,9 @@ struct VgiFunctionInfo {
 	// Aggregate function fields - uses DuckDB's enums
 	AggregateOrderDependent order_dependent = AggregateOrderDependent::NOT_ORDER_DEPENDENT;
 	AggregateDistinctDependent distinct_dependent = AggregateDistinctDependent::NOT_DISTINCT_DEPENDENT;
+
+	// Settings required by this function (must be set before invocation)
+	std::vector<std::string> required_settings;
 };
 
 // Parse a VgiSetting from serialized bytes (Arrow IPC format)

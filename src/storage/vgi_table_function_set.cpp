@@ -135,6 +135,29 @@ static unique_ptr<FunctionData> VgiCatalogTableFunctionBind(ClientContext &conte
 	// Extract settings registered by this catalog
 	bind_data->settings = ExtractVgiSettings(context, vgi_info.setting_names());
 
+	// Validate that all required settings for this function are present
+	const auto &required_settings = vgi_info.function_info().required_settings;
+	if (!required_settings.empty()) {
+		std::vector<std::string> missing_settings;
+		for (const auto &setting_name : required_settings) {
+			if (bind_data->settings.find(setting_name) == bind_data->settings.end()) {
+				missing_settings.push_back(setting_name);
+			}
+		}
+		if (!missing_settings.empty()) {
+			std::string missing_list;
+			for (size_t i = 0; i < missing_settings.size(); i++) {
+				if (i > 0) {
+					missing_list += ", ";
+				}
+				missing_list += missing_settings[i];
+			}
+			throw BinderException("Function '%s' requires the following settings to be set: %s. "
+			                      "Use SET <setting_name> = <value> before calling this function.",
+			                      bind_data->function_name, missing_list);
+		}
+	}
+
 	// Perform the common bind handshake
 	vgi::PerformVgiTableFunctionBind(context, *bind_data, return_types, names);
 

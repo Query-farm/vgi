@@ -18,9 +18,26 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 # - greeting: str - echoed in greeting column
 # - multiplier: int - multiplies the value column (value = id * 2.5 * multiplier)
 # Output schema: {id: int64, greeting: string, value: float64, [details: string]}
+#
+# Required settings validation:
+# This function declares required_settings = ["vgi_verbose_mode", "greeting", "multiplier"]
+# The client validates all required settings are registered before invoking the function.
+# Since the catalog registers these settings with default values, they're always available.
+# If a function declared a required_setting not registered by the catalog, the client
+# would throw: "Function 'X' requires the following settings to be set: Y"
 # ============================================================================
 
-# Test with default values: greeting="Hello", multiplier=1, verbose=false
+# Explicitly set all required settings before testing (don't rely on defaults)
+statement ok
+SET vgi_verbose_mode = 'false';
+
+statement ok
+SET greeting = 'Hello';
+
+statement ok
+SET multiplier = 1;
+
+# Test with explicit values: greeting="Hello", multiplier=1, verbose=false
 # value = id * 2.5 * 1
 query ITR
 SELECT * FROM example.settings_aware(3);

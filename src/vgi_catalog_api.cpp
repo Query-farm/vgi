@@ -674,6 +674,9 @@ VgiFunctionInfo ParseFunctionInfo(const std::shared_ptr<arrow::RecordBatch> &bat
 	auto distinct_dependent = ParseAggregateDistinctDependent(distinct_dependent_str);
 	info.distinct_dependent = distinct_dependent.value_or(AggregateDistinctDependent::NOT_DISTINCT_DEPENDENT);
 
+	// Required settings for this function (list of strings)
+	info.required_settings = row["required_settings"].value_or(std::vector<std::string>{});
+
 	return info;
 }
 
