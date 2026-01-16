@@ -110,6 +110,8 @@ std::unique_ptr<PooledWorker> VgiWorkerPool::TryAcquire(const std::string &worke
 		pool.pop_front();
 
 		if (worker->IsAlive()) {
+			// Record hit
+			stats_[worker_path].first++;
 			return worker;
 		}
 		// Worker died while pooled, discard and try next
@@ -123,10 +125,15 @@ void VgiWorkerPool::Release(std::unique_ptr<PooledWorker> worker, size_t max_poo
 		return; // Don't pool dead workers
 	}
 
+	// max_pool_size of 0 means pool is disabled
+	if (max_pool_size == 0) {
+		return; // Pool disabled, discard worker
+	}
+
 	std::lock_guard<std::mutex> lock(mutex_);
 
-	// Check max pool size
-	if (max_pool_size > 0 && TotalPoolSizeLocked() >= max_pool_size) {
+	// Check if pool is full
+	if (TotalPoolSizeLocked() >= max_pool_size) {
 		// Pool is full, discard this worker
 		return;
 	}
@@ -216,6 +223,21 @@ size_t VgiWorkerPool::TotalPoolSizeLocked() const {
 		total += pool.size();
 	}
 	return total;
+}
+
+std::vector<VgiWorkerPool::PoolStats> VgiWorkerPool::GetPoolStats() const {
+	std::lock_guard<std::mutex> lock(mutex_);
+
+	std::vector<PoolStats> result;
+	for (const auto &[path, counts] : stats_) {
+		result.push_back({path, counts.first, counts.second});
+	}
+	return result;
+}
+
+void VgiWorkerPool::RecordMiss(const std::string &worker_path) {
+	std::lock_guard<std::mutex> lock(mutex_);
+	stats_[worker_path].second++;
 }
 
 } // namespace vgi

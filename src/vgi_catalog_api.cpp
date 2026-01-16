@@ -766,6 +766,9 @@ AcquireAndBindResult AcquireAndBindConnection(ClientContext &context, const Func
 	// Create fresh if pool miss
 	if (!conn) {
 		conn = create_fresh_connection();
+		if (params.use_pool) {
+			VgiWorkerPool::Instance().RecordMiss(params.worker_path);
+		}
 		VGI_LOG(context, "worker_pool.acquire",
 		        {{"worker_path", params.worker_path},
 		         {"worker_pid", std::to_string(conn->GetPid())},

@@ -75,8 +75,8 @@ public:
 	std::unique_ptr<PooledWorker> TryAcquire(const std::string &worker_path);
 
 	// Return a worker to the pool for reuse.
-	// max_pool_size: 0 = unlimited, >0 = discard if pool would exceed this size
-	void Release(std::unique_ptr<PooledWorker> worker, size_t max_pool_size = 0);
+	// max_pool_size: 0 = pool disabled, >0 = max workers to keep in pool
+	void Release(std::unique_ptr<PooledWorker> worker, size_t max_pool_size);
 
 	// Flush all workers from the pool, returns count flushed
 	size_t Flush();
@@ -90,6 +90,22 @@ public:
 
 	// Get pool statistics for the vgi_worker_pool() table function
 	std::vector<PoolEntry> GetPoolEntries() const;
+
+	// Pool statistics by worker path
+	struct PoolStats {
+		std::string worker_path;
+		uint64_t hits;     // Successfully acquired from pool
+		uint64_t misses;   // Pool empty, had to spawn new worker
+	};
+
+	// Get hit/miss statistics for each worker path
+	std::vector<PoolStats> GetPoolStats() const;
+
+	// Record a pool hit (called internally by TryAcquire)
+	void RecordHit(const std::string &worker_path);
+
+	// Record a pool miss (called by callers when TryAcquire returns nullptr)
+	void RecordMiss(const std::string &worker_path);
 
 	// Set the idle timeout for worker cleanup (default 5 seconds)
 	void SetIdleTimeout(std::chrono::seconds timeout);
@@ -111,6 +127,9 @@ private:
 
 	mutable std::mutex mutex_;
 	std::map<std::string, std::deque<std::unique_ptr<PooledWorker>>> pools_;
+
+	// Hit/miss statistics by worker path
+	std::map<std::string, std::pair<uint64_t, uint64_t>> stats_; // {hits, misses}
 
 	// Cleanup thread
 	std::thread cleanup_thread_;

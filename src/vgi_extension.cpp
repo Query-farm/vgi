@@ -118,8 +118,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "Maximum idle time in seconds before pooled workers are removed", LogicalType::BIGINT,
 	                          Value::BIGINT(5));
 	config.AddExtensionOption("vgi_worker_pool_max",
-	                          "Maximum number of workers to keep in the pool (0 = unlimited)", LogicalType::BIGINT,
-	                          Value::BIGINT(0));
+	                          "Maximum number of workers to keep in the pool (0 = disabled)", LogicalType::BIGINT,
+	                          Value::BIGINT(256));
 
 	// Register VGI table functions
 	RegisterVgiCatalogsFunction(loader);
@@ -127,6 +127,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	// Register worker pool diagnostic functions
 	vgi::RegisterVgiWorkerPoolFunction(loader);
+	vgi::RegisterVgiWorkerPoolStatsFunction(loader);
 	vgi::RegisterVgiWorkerPoolFlushFunction(loader);
 }
 
