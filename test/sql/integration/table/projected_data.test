@@ -14,9 +14,17 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 # ============================================================================
 # projected_data function (projection pushdown)
 # Generates data with 4 columns: id, name, value, extra
+# - id: sequential integer (0, 1, 2, ...)
+# - name: string "item_N"
+# - value: float (id * 1.5)
+# - extra: integer (id * id)
 # ============================================================================
 
-# All columns
+# ============================================================================
+# No projection (SELECT *) - all columns requested
+# ============================================================================
+
+# All columns with small dataset
 query IRTI
 SELECT * FROM example.projected_data(3);
 ----
@@ -24,7 +32,57 @@ SELECT * FROM example.projected_data(3);
 1	item_1	1.5	1
 2	item_2	3.0	4
 
+# All columns with medium dataset - verify correctness
+query IIII
+SELECT COUNT(*), COUNT(DISTINCT id), MIN(id), MAX(id) FROM example.projected_data(1000);
+----
+1000	1000	0	999
+
+# Verify all columns present and correct with SELECT *
+query IRTI
+SELECT * FROM example.projected_data(5);
+----
+0	item_0	0.0	0
+1	item_1	1.5	1
+2	item_2	3.0	4
+3	item_3	4.5	9
+4	item_4	6.0	16
+
+# SELECT * with aggregations (no projection pushdown)
+query IRIRI
+SELECT COUNT(*), SUM(value), COUNT(DISTINCT name), MIN(extra), MAX(extra)
+FROM example.projected_data(100);
+----
+100	7425.0	100	0	9801
+
+# SELECT * with ORDER BY
+query IRTI
+SELECT * FROM example.projected_data(5) ORDER BY id DESC;
+----
+4	item_4	6.0	16
+3	item_3	4.5	9
+2	item_2	3.0	4
+1	item_1	1.5	1
+0	item_0	0.0	0
+
+# SELECT * with LIMIT
+query IRTI
+SELECT * FROM example.projected_data(1000) LIMIT 3;
+----
+0	item_0	0.0	0
+1	item_1	1.5	1
+2	item_2	3.0	4
+
+# SELECT * with large dataset - verify no projection still works
+query IIII
+SELECT COUNT(*), COUNT(DISTINCT id), MIN(id), MAX(id) FROM example.projected_data(5000);
+----
+5000	5000	0	4999
+
+# ============================================================================
 # Projection pushdown - only select specific columns
+# ============================================================================
+
 query II
 SELECT id, extra FROM example.projected_data(3);
 ----
@@ -180,13 +238,56 @@ SELECT COUNT(*), COUNT(next_extra) FROM (
 4000	3999
 
 # ============================================================================
-# Verify row count with larger dataset
+# Large dataset tests - comparing projection vs no-projection
 # ============================================================================
 
+# Verify row count with larger dataset (no projection)
 query I
 SELECT COUNT(*) FROM example.projected_data(100);
 ----
 100
+
+# Large dataset with SELECT * (no projection)
+query IIII
+SELECT COUNT(*), COUNT(DISTINCT id), MIN(id), MAX(id) FROM example.projected_data(10000);
+----
+10000	10000	0	9999
+
+# Large dataset with projection (single column)
+query IIII
+SELECT COUNT(*), COUNT(DISTINCT id), MIN(id), MAX(id) FROM (
+    SELECT id FROM example.projected_data(10000)
+);
+----
+10000	10000	0	9999
+
+# Verify projection and no-projection produce same id values
+query I
+SELECT COUNT(*) FROM (
+    SELECT id FROM example.projected_data(5000)
+    EXCEPT
+    SELECT id FROM example.projected_data(5000)
+);
+----
+0
+
+# Verify sum of extra is same with projection vs explicit column list
+query I
+SELECT SUM(extra) FROM example.projected_data(1000);
+----
+332833500
+
+query I
+SELECT SUM(extra) FROM (SELECT extra FROM example.projected_data(1000));
+----
+332833500
+
+# Verify all 4 columns explicitly selected matches SELECT *
+query IIII
+SELECT COUNT(*), MIN(id), MAX(id), COUNT(DISTINCT name)
+FROM (SELECT id, name, value, extra FROM example.projected_data(1000));
+----
+1000	0	999	1000
 
 # ============================================================================
 # Cleanup
