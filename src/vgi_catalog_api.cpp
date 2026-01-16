@@ -964,22 +964,13 @@ void FunctionConnection::SkipInit() {
 		                    proc_ ? proc_->GetPid() : -1, GetInvocationIdHex());
 	}
 
-	// For secondary workers, send InitInput but skip reading InitResult.
-	// The Python worker reads InitInput but doesn't write InitResult for secondary workers,
-	// going straight to the data stream.
+	// For secondary workers, skip the init phase entirely.
+	// The Python worker gets init data from shared storage (via global_execution_identifier),
+	// not from stdin. It does NOT read InitInput, so we must NOT send it.
+	// If we send InitInput, it will sit in the pipe and cause a protocol error when
+	// the worker loops back expecting a new Invocation.
 
-	// Stream 3: Send InitInput (with empty projection_ids) with protocol state
-	auto init_input = CreateInitInput({});
-	auto init_input_metadata = CreateProtocolStateMetadata(ProtocolState::INIT_INPUT);
-	auto init_input_bytes = SerializeRecordBatch(init_input, init_input_metadata);
-	WriteAll(proc_->GetStdinFd(), init_input_bytes->data(), init_input_bytes->size());
-
-	// Skip Stream 4 (InitResult) - secondary workers don't send it
-
-	// Note: We no longer close stdin here to allow connection pooling.
-	// The worker will receive EOF when the process is actually terminated.
-
-	// Open the data stream reader
+	// Open the data stream reader to read output batches
 	data_stream_ = std::make_shared<FdInputStream>(proc_->GetStdoutFd());
 	auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(data_stream_);
 	if (!reader_result.ok()) {
