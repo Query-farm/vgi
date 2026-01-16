@@ -852,8 +852,9 @@ OutputSpecResult FunctionConnection::PerformBindFull() {
 	         {"num_args", std::to_string(num_args)}});
 
 	// Stream 1: Send Invocation with protocol state metadata
+	// Pass input_schema for table-in-out functions (nullptr for regular table functions)
 	auto invocation = CreateFunctionInvocationFull(function_name_, arguments_type_, arguments_array_, attach_id_,
-	                                               global_execution_id_, settings_);
+	                                               global_execution_id_, settings_, input_schema_);
 	auto invocation_metadata = CreateProtocolStateMetadata(ProtocolState::INVOCATION);
 	auto invocation_bytes = SerializeRecordBatch(invocation, invocation_metadata);
 	WriteAll(proc_->GetStdinFd(), invocation_bytes->data(), invocation_bytes->size());
@@ -939,15 +940,21 @@ InitResultData FunctionConnection::PerformInit(const std::vector<int32_t> &proje
 	// The worker will receive EOF when the process is actually terminated.
 
 	// Stream 6: Open the data stream reader
-	// Unlike handshake streams which are one batch each, the data phase uses
-	// a single long-lived IPC stream with multiple batches
-	data_stream_ = std::make_shared<FdInputStream>(proc_->GetStdoutFd());
-	auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(data_stream_);
-	if (!reader_result.ok()) {
-		ThrowVgiIOException("Failed to open data stream: %s", worker_path_, proc_->GetPid(), GetInvocationIdHex(),
-		                    reader_result.status().ToString());
+	// For table-in-out functions, we defer opening the reader because the worker
+	// won't write output until it receives input. Opening the reader now would
+	// block waiting for the schema.
+	if (!input_schema_) {
+		// Regular table function - worker will start writing immediately
+		data_stream_ = std::make_shared<FdInputStream>(proc_->GetStdoutFd());
+		auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(data_stream_);
+		if (!reader_result.ok()) {
+			ThrowVgiIOException("Failed to open data stream: %s", worker_path_, proc_->GetPid(), GetInvocationIdHex(),
+			                    reader_result.status().ToString());
+		}
+		data_reader_ = reader_result.ValueUnsafe();
 	}
-	data_reader_ = reader_result.ValueUnsafe();
+	// For table-in-out functions (input_schema_ set), data_reader_ will be opened
+	// lazily in ReadDataBatch after we've sent at least one input batch
 
 	init_done_ = true;
 
@@ -993,8 +1000,27 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 		ThrowVgiIOException("FunctionConnection::ReadDataBatch called before PerformInit", worker_path_,
 		                    proc_ ? proc_->GetPid() : -1, GetInvocationIdHex());
 	}
-	if (data_finished_ || !data_reader_) {
+	if (data_finished_) {
 		return nullptr;
+	}
+
+	// Lazily open the data reader for table-in-out functions
+	// We defer opening until we've sent at least one input batch because the worker
+	// won't write output until it receives input
+	if (!data_reader_) {
+		if (!input_schema_) {
+			// Regular table function should have had data_reader_ opened in PerformInit
+			ThrowVgiIOException("FunctionConnection::ReadDataBatch data_reader_ is null", worker_path_,
+			                    proc_ ? proc_->GetPid() : -1, GetInvocationIdHex());
+		}
+		// Table-in-out function - open the reader now
+		data_stream_ = std::make_shared<FdInputStream>(proc_->GetStdoutFd());
+		auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(data_stream_);
+		if (!reader_result.ok()) {
+			ThrowVgiIOException("Failed to open data stream: %s", worker_path_, proc_->GetPid(), GetInvocationIdHex(),
+			                    reader_result.status().ToString());
+		}
+		data_reader_ = reader_result.ValueUnsafe();
 	}
 
 	// Drain any buffered stderr to logging
@@ -1033,7 +1059,7 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 	ValidateProtocolState(result.custom_metadata, ProtocolState::OUTPUT, "data batch", worker_path_,
 	                      proc_ ? proc_->GetPid() : -1);
 
-	// Check vgi.status metadata for FINISHED
+	// Check vgi.status metadata for FINISHED or NEED_MORE_INPUT
 	if (result.custom_metadata) {
 		int status_idx = result.custom_metadata->FindKey("vgi.status");
 		if (status_idx >= 0) {
@@ -1048,6 +1074,15 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 					}
 				}
 				// Still return the batch if it has data
+				if (result.batch->num_rows() > 0) {
+					return result.batch;
+				}
+				return nullptr;
+			} else if (status == "NEED_MORE_INPUT") {
+				// Table-in-out function needs more input data
+				needs_more_input_ = true;
+				// Return the batch if it has data, otherwise nullptr
+				// The caller should check NeedsMoreInput() and provide more data
 				if (result.batch->num_rows() > 0) {
 					return result.batch;
 				}
@@ -1084,6 +1119,158 @@ std::string FunctionConnection::GetAttachIdHex() const {
 		return "";
 	}
 	return BytesToHex(attach_id_);
+}
+
+void FunctionConnection::SetInputSchema(const std::shared_ptr<arrow::Schema> &input_schema) {
+	if (bind_done_) {
+		ThrowVgiIOException("FunctionConnection::SetInputSchema called after bind", worker_path_,
+		                    proc_ ? proc_->GetPid() : -1, GetInvocationIdHex());
+	}
+	input_schema_ = input_schema;
+}
+
+void FunctionConnection::OpenInputWriter() {
+	if (!init_done_) {
+		ThrowVgiIOException("FunctionConnection::OpenInputWriter called before PerformInit", worker_path_,
+		                    proc_ ? proc_->GetPid() : -1, GetInvocationIdHex());
+	}
+	if (!input_schema_) {
+		ThrowVgiIOException("FunctionConnection::OpenInputWriter called on non-table-in-out function", worker_path_,
+		                    proc_ ? proc_->GetPid() : -1, GetInvocationIdHex());
+	}
+	if (input_writer_opened_) {
+		ThrowVgiIOException("FunctionConnection::OpenInputWriter called twice", worker_path_, proc_ ? proc_->GetPid() : -1,
+		                    GetInvocationIdHex());
+	}
+
+	// Create an IPC stream writer for stdin (Stream 5)
+	auto sink = std::make_shared<FdOutputStream>(proc_->GetStdinFd());
+	auto writer_result = arrow::ipc::MakeStreamWriter(sink, input_schema_);
+	if (!writer_result.ok()) {
+		ThrowVgiIOException("Failed to create input stream writer: %s", worker_path_, proc_ ? proc_->GetPid() : -1,
+		                    GetInvocationIdHex(), writer_result.status().ToString());
+	}
+	input_writer_ = writer_result.ValueUnsafe();
+	input_writer_opened_ = true;
+
+	VGI_LOG(context_, "function_connection.input_writer_opened",
+	        {{"worker_path", worker_path_},
+	         {"worker_pid", std::to_string(proc_->GetPid())},
+	         {"invocation_id", GetInvocationIdHex()},
+	         {"function_name", function_name_},
+	         {"input_schema_fields", std::to_string(input_schema_->num_fields())}});
+}
+
+void FunctionConnection::WriteInputBatch(const std::shared_ptr<arrow::RecordBatch> &batch) {
+	if (!input_writer_opened_) {
+		ThrowVgiIOException("FunctionConnection::WriteInputBatch called before OpenInputWriter", worker_path_,
+		                    proc_ ? proc_->GetPid() : -1, GetInvocationIdHex());
+	}
+	if (input_writer_closed_) {
+		ThrowVgiIOException("FunctionConnection::WriteInputBatch called after CloseInputWriter", worker_path_,
+		                    proc_ ? proc_->GetPid() : -1, GetInvocationIdHex());
+	}
+
+	// Create protocol state metadata for data batches
+	auto data_metadata = CreateProtocolStateMetadata(ProtocolState::DATA);
+
+	// Write the batch with metadata
+	auto write_status = input_writer_->WriteRecordBatch(*batch, data_metadata);
+	if (!write_status.ok()) {
+		ThrowVgiIOException("Failed to write input batch: %s", worker_path_, proc_ ? proc_->GetPid() : -1,
+		                    GetInvocationIdHex(), write_status.ToString());
+	}
+
+	VGI_LOG(context_, "function_connection.input_batch_written",
+	        {{"worker_path", worker_path_},
+	         {"worker_pid", std::to_string(proc_->GetPid())},
+	         {"invocation_id", GetInvocationIdHex()},
+	         {"function_name", function_name_},
+	         {"batch_rows", std::to_string(batch->num_rows())}});
+
+	// Drain any buffered stderr
+	DrainStderrLog();
+}
+
+void FunctionConnection::SendFinalize() {
+	if (!input_writer_opened_) {
+		ThrowVgiIOException("FunctionConnection::SendFinalize called before OpenInputWriter", worker_path_,
+		                    proc_ ? proc_->GetPid() : -1, GetInvocationIdHex());
+	}
+	if (input_writer_closed_) {
+		ThrowVgiIOException("FunctionConnection::SendFinalize called after CloseInputWriter", worker_path_,
+		                    proc_ ? proc_->GetPid() : -1, GetInvocationIdHex());
+	}
+
+	// Create an empty batch with the input schema
+	std::vector<std::shared_ptr<arrow::Array>> empty_arrays;
+	for (int i = 0; i < input_schema_->num_fields(); i++) {
+		auto builder_result = arrow::MakeBuilder(input_schema_->field(i)->type());
+		if (!builder_result.ok()) {
+			ThrowVgiIOException("Failed to create Arrow builder for finalize: %s", worker_path_, proc_->GetPid(),
+			                    GetInvocationIdHex(), builder_result.status().ToString());
+		}
+		auto array_result = builder_result.ValueUnsafe()->Finish();
+		if (!array_result.ok()) {
+			ThrowVgiIOException("Failed to finish Arrow array for finalize: %s", worker_path_, proc_->GetPid(),
+			                    GetInvocationIdHex(), array_result.status().ToString());
+		}
+		empty_arrays.push_back(array_result.ValueUnsafe());
+	}
+	auto empty_batch = arrow::RecordBatch::Make(input_schema_, 0, empty_arrays);
+
+	// Create metadata with protocol state DATA and type FINALIZE
+	// Keys vector: [vgi.protocol_state, type]
+	// Values vector: [data, FINALIZE]
+	auto finalize_metadata = arrow::KeyValueMetadata::Make(
+		std::vector<std::string>{PROTOCOL_STATE_KEY, "type"},
+		std::vector<std::string>{ProtocolState::DATA, "FINALIZE"}
+	);
+
+	// Write the finalize batch
+	auto write_status = input_writer_->WriteRecordBatch(*empty_batch, finalize_metadata);
+	if (!write_status.ok()) {
+		ThrowVgiIOException("Failed to write finalize batch: %s", worker_path_, proc_->GetPid(),
+		                    GetInvocationIdHex(), write_status.ToString());
+	}
+
+	VGI_LOG(context_, "function_connection.finalize_sent",
+	        {{"worker_path", worker_path_},
+	         {"worker_pid", std::to_string(proc_->GetPid())},
+	         {"invocation_id", GetInvocationIdHex()},
+	         {"function_name", function_name_}});
+
+	// Drain any buffered stderr
+	DrainStderrLog();
+}
+
+void FunctionConnection::CloseInputWriter() {
+	if (!input_writer_opened_) {
+		ThrowVgiIOException("FunctionConnection::CloseInputWriter called before OpenInputWriter", worker_path_,
+		                    proc_ ? proc_->GetPid() : -1, GetInvocationIdHex());
+	}
+	if (input_writer_closed_) {
+		// Already closed, no-op
+		return;
+	}
+
+	// Close the IPC stream writer (sends end-of-stream marker)
+	auto close_status = input_writer_->Close();
+	if (!close_status.ok()) {
+		ThrowVgiIOException("Failed to close input stream: %s", worker_path_, proc_ ? proc_->GetPid() : -1,
+		                    GetInvocationIdHex(), close_status.ToString());
+	}
+	input_writer_.reset();
+	input_writer_closed_ = true;
+
+	VGI_LOG(context_, "function_connection.input_writer_closed",
+	        {{"worker_path", worker_path_},
+	         {"worker_pid", std::to_string(proc_->GetPid())},
+	         {"invocation_id", GetInvocationIdHex()},
+	         {"function_name", function_name_}});
+
+	// Drain any buffered stderr
+	DrainStderrLog();
 }
 
 int FunctionConnection::Wait() {

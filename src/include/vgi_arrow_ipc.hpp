@@ -72,6 +72,24 @@ private:
 	bool is_open_;
 };
 
+// Output stream wrapper for writing to a file descriptor
+class FdOutputStream : public arrow::io::OutputStream {
+public:
+	explicit FdOutputStream(int fd);
+	~FdOutputStream() override = default;
+
+	arrow::Status Close() override;
+	bool closed() const override;
+	arrow::Result<int64_t> Tell() const override;
+	arrow::Status Write(const void *data, int64_t nbytes) override;
+	arrow::Status Flush() override;
+
+private:
+	int fd_;
+	int64_t position_;
+	bool is_open_;
+};
+
 // Read a single RecordBatch from a file descriptor (Arrow IPC stream format)
 // Returns RecordBatchWithMetadata containing both the batch and any custom metadata.
 // NOTE: This creates a new stream reader each time. For streaming multiple batches,

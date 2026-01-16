@@ -1,0 +1,116 @@
+# name: test/sql/integration/table_in_out/buffer_input.test
+# description: Integration tests for VGI buffer_input table-in-out function
+# group: [vgi]
+
+# This test requires a VGI worker to be available
+# Set VGI_TEST_WORKER environment variable to the path of a VGI worker executable
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# buffer_input function
+# Buffers all input rows and emits them all during finalize.
+# Tests that data is correctly accumulated and emitted in finalize phase.
+# Args: data (TABLE) - input table to buffer
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# Basic buffer - single row
+# ----------------------------------------------------------------------------
+
+query II
+SELECT * FROM example.buffer_input((SELECT 1 AS a, 2 AS b));
+----
+1	2
+
+query I
+SELECT * FROM example.buffer_input((SELECT 42 AS value));
+----
+42
+
+# ----------------------------------------------------------------------------
+# Multiple rows - all buffered and emitted in finalize
+# ----------------------------------------------------------------------------
+
+query II
+SELECT * FROM example.buffer_input((SELECT * FROM (VALUES (1, 'a'), (2, 'b'), (3, 'c')) t(x, y)));
+----
+1	a
+2	b
+3	c
+
+query I
+SELECT * FROM example.buffer_input((SELECT unnest([5, 4, 3, 2, 1]) AS n));
+----
+5
+4
+3
+2
+1
+
+# ----------------------------------------------------------------------------
+# Empty input
+# ----------------------------------------------------------------------------
+
+query II
+SELECT * FROM example.buffer_input((SELECT * FROM (VALUES (1, 'a')) t(x, y) WHERE false));
+----
+
+query I
+SELECT COUNT(*) FROM example.buffer_input((SELECT * FROM (VALUES (1)) t(x) WHERE false));
+----
+0
+
+# ----------------------------------------------------------------------------
+# Larger dataset
+# ----------------------------------------------------------------------------
+
+query I
+SELECT COUNT(*) FROM example.buffer_input((SELECT unnest(generate_series(1, 500)) AS n));
+----
+500
+
+query I
+SELECT SUM(n) FROM example.buffer_input((SELECT unnest(generate_series(1, 100)) AS n));
+----
+5050
+
+query II
+SELECT MIN(n), MAX(n) FROM example.buffer_input((SELECT unnest(generate_series(1, 200)) AS n));
+----
+1	200
+
+# ----------------------------------------------------------------------------
+# Verify data integrity after buffering
+# The buffer_input should preserve all values exactly
+# ----------------------------------------------------------------------------
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT n FROM example.buffer_input((SELECT unnest(generate_series(1, 100)) AS n))
+    EXCEPT
+    SELECT unnest(generate_series(1, 100)) AS n
+);
+----
+0
+
+# All values from buffer_input should be in original set
+query I
+SELECT COUNT(*) FROM (
+    SELECT unnest(generate_series(1, 100)) AS n
+    EXCEPT
+    SELECT n FROM example.buffer_input((SELECT unnest(generate_series(1, 100)) AS n))
+);
+----
+0
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;

@@ -336,7 +336,8 @@ std::shared_ptr<arrow::RecordBatch> CreateFunctionGetArgs(const std::vector<uint
 std::shared_ptr<arrow::RecordBatch> CreateFunctionInvocationFull(
     const std::string &function_name, const std::shared_ptr<arrow::DataType> &arguments_type,
     const std::shared_ptr<arrow::Array> &arguments_array, const std::vector<uint8_t> &attach_id,
-    const std::vector<uint8_t> &global_exec_id, const std::map<std::string, std::string> &settings) {
+    const std::vector<uint8_t> &global_exec_id, const std::map<std::string, std::string> &settings,
+    const std::shared_ptr<arrow::Schema> &input_schema) {
 
 	// Use the provided arguments struct (already built by BuildArgumentsFromValues)
 	auto args_type = arguments_type;
@@ -360,9 +361,21 @@ std::shared_ptr<arrow::RecordBatch> CreateFunctionInvocationFull(
 	arrow::StringBuilder function_name_builder;
 	CheckArrowStatus(function_name_builder.Append(function_name), "append function_name");
 
-	// input_schema - null for table functions (no table input)
+	// input_schema - serialize the schema if provided (for table-in-out functions),
+	// or null for regular table functions
 	arrow::BinaryBuilder input_schema_builder;
-	CheckArrowStatus(input_schema_builder.AppendNull(), "append null input_schema");
+	if (input_schema) {
+		// Serialize the Arrow schema to IPC format
+		auto serialize_result = arrow::ipc::SerializeSchema(*input_schema);
+		if (!serialize_result.ok()) {
+			throw IOException("Failed to serialize input schema: %s", serialize_result.status().ToString());
+		}
+		auto schema_buffer = serialize_result.ValueUnsafe();
+		CheckArrowStatus(input_schema_builder.Append(schema_buffer->data(), schema_buffer->size()),
+		                 "append input_schema");
+	} else {
+		CheckArrowStatus(input_schema_builder.AppendNull(), "append null input_schema");
+	}
 
 	// function_type - "table" for table function invocations
 	arrow::StringBuilder function_type_builder;

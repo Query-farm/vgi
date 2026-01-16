@@ -1,0 +1,135 @@
+# name: test/sql/integration/table_in_out/echo.test
+# description: Integration tests for VGI echo table-in-out function
+# group: [vgi]
+
+# This test requires a VGI worker to be available
+# Set VGI_TEST_WORKER environment variable to the path of a VGI worker executable
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# echo function
+# Passthrough function that emits each input batch unchanged
+# Args: data (TABLE) - input table to echo back
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# Basic echo - single row
+# ----------------------------------------------------------------------------
+
+query II
+SELECT * FROM example.echo((SELECT 1 AS a, 2 AS b));
+----
+1	2
+
+query I
+SELECT * FROM example.echo((SELECT 42 AS value));
+----
+42
+
+# ----------------------------------------------------------------------------
+# Multiple rows
+# ----------------------------------------------------------------------------
+
+query II
+SELECT * FROM example.echo((SELECT * FROM (VALUES (1, 'a'), (2, 'b'), (3, 'c')) t(x, y)));
+----
+1	a
+2	b
+3	c
+
+query I
+SELECT * FROM example.echo((SELECT unnest([1, 2, 3, 4, 5]) AS n));
+----
+1
+2
+3
+4
+5
+
+# ----------------------------------------------------------------------------
+# Empty input
+# ----------------------------------------------------------------------------
+
+query II
+SELECT * FROM example.echo((SELECT * FROM (VALUES (1, 'a')) t(x, y) WHERE false));
+----
+
+query I
+SELECT COUNT(*) FROM example.echo((SELECT * FROM (VALUES (1)) t(x) WHERE false));
+----
+0
+
+# ----------------------------------------------------------------------------
+# Different data types
+# ----------------------------------------------------------------------------
+
+query IIR
+SELECT * FROM example.echo((SELECT 1 AS int_col, 'hello' AS str_col, CAST(3.14 AS DOUBLE) AS float_col));
+----
+1	hello	3.14
+
+query I
+SELECT * FROM example.echo((SELECT true AS bool_col));
+----
+1
+
+# ----------------------------------------------------------------------------
+# Large number of rows (multiple batches)
+# ----------------------------------------------------------------------------
+
+query I
+SELECT COUNT(*) FROM example.echo((SELECT unnest(generate_series(1, 1000)) AS n));
+----
+1000
+
+query I
+SELECT SUM(n) FROM example.echo((SELECT unnest(generate_series(1, 100)) AS n));
+----
+5050
+
+query II
+SELECT MIN(n), MAX(n) FROM example.echo((SELECT unnest(generate_series(1, 500)) AS n));
+----
+1	500
+
+# ----------------------------------------------------------------------------
+# Preserves column order and names
+# ----------------------------------------------------------------------------
+
+query III
+SELECT first_col, second_col, third_col
+FROM example.echo((SELECT 1 AS first_col, 2 AS second_col, 3 AS third_col));
+----
+1	2	3
+
+# ----------------------------------------------------------------------------
+# Works with subqueries
+# ----------------------------------------------------------------------------
+
+query I
+SELECT n FROM example.echo((SELECT n FROM (VALUES (1), (2), (3)) t(n) WHERE n > 1));
+----
+2
+3
+
+# ----------------------------------------------------------------------------
+# Aggregations on echoed data
+# ----------------------------------------------------------------------------
+
+query IIRI
+SELECT SUM(x), COUNT(*), AVG(x), MAX(x)
+FROM example.echo((SELECT unnest(generate_series(1, 10)) AS x));
+----
+55	10	5.5	10
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;

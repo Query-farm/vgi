@@ -1,0 +1,97 @@
+# name: test/sql/integration/table_in_out/sum_all_columns.test
+# description: Integration tests for VGI sum_all_columns table-in-out function (aggregation)
+# group: [vgi]
+
+# This test requires a VGI worker to be available
+# Set VGI_TEST_WORKER environment variable to the path of a VGI worker executable
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# sum_all_columns function
+# Aggregation function that sums all numeric columns and emits a single row
+# during finalize. Tests the FINALIZE protocol.
+# Args: data (TABLE) - input table with numeric columns
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# Basic sum - single row
+# ----------------------------------------------------------------------------
+
+query II
+SELECT * FROM example.sum_all_columns((SELECT 1 AS a, 2 AS b));
+----
+1	2
+
+query I
+SELECT * FROM example.sum_all_columns((SELECT 42 AS value));
+----
+42
+
+# ----------------------------------------------------------------------------
+# Multiple rows - sum each column
+# ----------------------------------------------------------------------------
+
+query II
+SELECT * FROM example.sum_all_columns((SELECT * FROM (VALUES (1, 2), (3, 4), (5, 6)) t(a, b)));
+----
+9	12
+
+# Verify: a = 1+3+5 = 9, b = 2+4+6 = 12
+
+query I
+SELECT * FROM example.sum_all_columns((SELECT unnest([1, 2, 3, 4, 5]) AS n));
+----
+15
+
+# Verify: 1+2+3+4+5 = 15
+
+query III
+SELECT * FROM example.sum_all_columns((SELECT * FROM (VALUES (1, 10, 100), (2, 20, 200), (3, 30, 300)) t(x, y, z)));
+----
+6	60	600
+
+# Verify: x = 1+2+3 = 6, y = 10+20+30 = 60, z = 100+200+300 = 600
+
+# ----------------------------------------------------------------------------
+# Larger dataset
+# ----------------------------------------------------------------------------
+
+query I
+SELECT n FROM example.sum_all_columns((SELECT unnest(generate_series(1, 100)) AS n));
+----
+5050
+
+# Verify: sum of 1..100 = 100*101/2 = 5050
+
+query I
+SELECT n FROM example.sum_all_columns((SELECT unnest(generate_series(1, 1000)) AS n));
+----
+500500
+
+# Verify: sum of 1..1000 = 1000*1001/2 = 500500
+
+# ----------------------------------------------------------------------------
+# Two columns summed independently
+# ----------------------------------------------------------------------------
+
+query II
+SELECT * FROM example.sum_all_columns((
+    SELECT n, n * 2 AS double_n
+    FROM (SELECT unnest(generate_series(1, 10)) AS n)
+));
+----
+55	110
+
+# Verify: sum(1..10) = 55, sum(2,4,6,...,20) = 2*55 = 110
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;

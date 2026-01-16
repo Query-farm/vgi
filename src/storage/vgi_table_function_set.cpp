@@ -14,6 +14,7 @@
 #include "vgi_arrow_utils.hpp"
 #include "vgi_catalog_api.hpp"
 #include "vgi_table_function_impl.hpp"
+#include "vgi_table_in_out_impl.hpp"
 
 namespace duckdb {
 
@@ -164,6 +165,51 @@ static unique_ptr<FunctionData> VgiCatalogTableFunctionBind(ClientContext &conte
 	return bind_data;
 }
 
+// ============================================================================
+// Bind Function - For catalog-based VGI table-in-out functions
+// ============================================================================
+
+static unique_ptr<FunctionData> VgiCatalogTableInOutFunctionBind(ClientContext &context, TableFunctionBindInput &input,
+                                                                   vector<LogicalType> &return_types, vector<string> &names) {
+	// Access the VgiTableFunctionInfo attached to this function
+	auto &vgi_info = input.info->Cast<VgiTableFunctionInfo>();
+
+	// Build parameters for the table-in-out bind
+	vgi::VgiTableInOutBindParams params;
+	params.worker_path = vgi_info.worker_path();
+	params.function_name = vgi_info.function_info().name;
+	params.attach_id = vgi_info.attach_id();
+	params.worker_debug = vgi_info.worker_debug();
+	params.use_pool = vgi_info.use_pool();
+	params.settings = ExtractVgiSettings(context, vgi_info.setting_names());
+
+	// Validate required settings
+	const auto &required_settings = vgi_info.function_info().required_settings;
+	if (!required_settings.empty()) {
+		std::vector<std::string> missing_settings;
+		for (const auto &setting_name : required_settings) {
+			if (params.settings.find(setting_name) == params.settings.end()) {
+				missing_settings.push_back(setting_name);
+			}
+		}
+		if (!missing_settings.empty()) {
+			std::string missing_list;
+			for (size_t i = 0; i < missing_settings.size(); i++) {
+				if (i > 0) {
+					missing_list += ", ";
+				}
+				missing_list += missing_settings[i];
+			}
+			throw BinderException("Function '%s' requires the following settings to be set: %s. "
+			                      "Use SET <setting_name> = <value> before calling this function.",
+			                      params.function_name, missing_list);
+		}
+	}
+
+	// Use the table-in-out bind function
+	return vgi::VgiTableInOutBind(context, input, return_types, names, params);
+}
+
 void VgiTableFunctionSet::LoadEntries(ClientContext &context) {
 	auto &vgi_catalog = catalog_.Cast<VgiCatalog>();
 	auto &attach_params = vgi_catalog.attach_parameters();
@@ -220,30 +266,52 @@ void VgiTableFunctionSet::LoadEntries(ClientContext &context) {
 				arg_types = vgi::ParseFunctionArgumentSchema(context, func_info.arguments_schema);
 			}
 
-			// Create the table function with shared implementation
-			// Only positional arguments go in the function signature
-			TableFunction table_func(arg_types.positional_types, vgi::VgiTableFunctionScan, VgiCatalogTableFunctionBind,
-			                         vgi::VgiTableFunctionInitGlobal, vgi::VgiTableFunctionInitLocal);
-			table_func.projection_pushdown = func_info.projection_pushdown.value_or(false);
-			table_func.filter_pushdown = func_info.filter_pushdown.value_or(false);
-			table_func.cardinality = vgi::VgiTableFunctionCardinality;
-			table_func.table_scan_progress = vgi::VgiTableFunctionProgress;
-			table_func.to_string = vgi::VgiTableFunctionToString;
+			// Check if this is a table-in-out function (has TABLE input argument)
+			if (arg_types.HasTableInput()) {
+				// Create a table-in-out function
+				// Table-in-out functions use LogicalType::TABLE in args and have an in_out_function
+				TableFunction table_func(arg_types.positional_types, nullptr, VgiCatalogTableInOutFunctionBind,
+				                         vgi::VgiTableInOutInitGlobal, vgi::VgiTableInOutInitLocal);
 
-			// Register named parameters so DuckDB knows how to handle them
-			table_func.named_parameters = arg_types.named_parameters;
+				// Set the in_out_function for processing streaming input
+				table_func.in_out_function = vgi::VgiTableInOutFunction;
+				table_func.in_out_function_final = vgi::VgiTableInOutFinalize;
 
-			// Register varargs support if the function accepts additional positional arguments
-			if (arg_types.has_varargs) {
-				table_func.varargs = arg_types.varargs_type;
+				// Register named parameters
+				table_func.named_parameters = arg_types.named_parameters;
+
+				// Attach function info
+				table_func.function_info = make_uniq<VgiTableFunctionInfo>(
+				    worker_path, attach_result->attach_id, attach_params->worker_debug(), attach_params->use_pool(),
+				    func_info, setting_names);
+
+				func_set.AddFunction(table_func);
+			} else {
+				// Create a regular table function
+				// Only positional arguments go in the function signature
+				TableFunction table_func(arg_types.positional_types, vgi::VgiTableFunctionScan, VgiCatalogTableFunctionBind,
+				                         vgi::VgiTableFunctionInitGlobal, vgi::VgiTableFunctionInitLocal);
+				table_func.projection_pushdown = func_info.projection_pushdown.value_or(false);
+				table_func.filter_pushdown = func_info.filter_pushdown.value_or(false);
+				table_func.cardinality = vgi::VgiTableFunctionCardinality;
+				table_func.table_scan_progress = vgi::VgiTableFunctionProgress;
+				table_func.to_string = vgi::VgiTableFunctionToString;
+
+				// Register named parameters so DuckDB knows how to handle them
+				table_func.named_parameters = arg_types.named_parameters;
+
+				// Register varargs support if the function accepts additional positional arguments
+				if (arg_types.has_varargs) {
+					table_func.varargs = arg_types.varargs_type;
+				}
+
+				// Attach VgiTableFunctionInfo so the bind function can access worker_path and function metadata
+				table_func.function_info = make_uniq<VgiTableFunctionInfo>(
+				    worker_path, attach_result->attach_id, attach_params->worker_debug(), attach_params->use_pool(),
+				    func_info, setting_names);
+
+				func_set.AddFunction(table_func);
 			}
-
-			// Attach VgiTableFunctionInfo so the bind function can access worker_path and function metadata
-			table_func.function_info = make_uniq<VgiTableFunctionInfo>(
-			    worker_path, attach_result->attach_id, attach_params->worker_debug(), attach_params->use_pool(),
-			    func_info, setting_names);
-
-			func_set.AddFunction(table_func);
 
 			// Create function description with full metadata
 			FunctionDescription desc;

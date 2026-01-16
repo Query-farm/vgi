@@ -410,6 +410,11 @@ public:
 	// invocation_id, active_features, and other metadata
 	OutputSpecResult PerformBindFull();
 
+	// Set the input schema for table-in-out functions
+	// Must be called before PerformBindFull() for table-in-out functions
+	// input_schema: Arrow schema describing the input data that will be sent via Stream 5
+	void SetInputSchema(const std::shared_ptr<arrow::Schema> &input_schema);
+
 	// Phase 2: Perform init handshake (Streams 3-4)
 	// Sends InitInput, reads InitResult, then closes stdin (for Table functions)
 	// After this call, the connection is ready to read data
@@ -423,13 +428,56 @@ public:
 	// This method closes stdin and opens the data stream without the handshake.
 	void SkipInit();
 
+	// ========================================================================
+	// Stream 5: Input Data (Table-In-Out Functions Only)
+	// ========================================================================
+
+	// Open Stream 5 for writing input data batches (table-in-out functions)
+	// Must be called after PerformInit() and before WriteInputBatch()
+	// Throws if called on a regular table function (no input schema)
+	void OpenInputWriter();
+
+	// Write an input batch to Stream 5 (table-in-out functions)
+	// Must be called after OpenInputWriter()
+	// The batch schema must match the input_schema set via SetInputSchema()
+	void WriteInputBatch(const std::shared_ptr<arrow::RecordBatch> &batch);
+
+	// Send a finalize signal to the worker via Stream 5 (table-in-out functions)
+	// This sends an empty batch with type=FINALIZE metadata, signaling the worker
+	// to run its finalize() method and output any remaining data
+	// Must be called before CloseInputWriter() for aggregation functions
+	void SendFinalize();
+
+	// Close Stream 5 (signals end of input to the worker)
+	// Must be called after all input batches have been written
+	// After this, the worker will process remaining data and output results via Stream 6
+	void CloseInputWriter();
+
+	// Check if this is a table-in-out function (has input schema)
+	bool IsTableInOut() const {
+		return input_schema_ != nullptr;
+	}
+
 	// Phase 3: Read a data batch (Stream 6)
-	// Returns nullptr when stream is exhausted
+	// Returns nullptr when stream is exhausted OR when NEED_MORE_INPUT is received
+	// After nullptr, check NeedsMoreInput() to determine which case
 	std::shared_ptr<arrow::RecordBatch> ReadDataBatch();
 
 	// Check if data stream is exhausted
 	bool IsFinished() const {
 		return data_finished_;
+	}
+
+	// Check if the worker requested more input (table-in-out functions only)
+	// This is set when ReadDataBatch receives a batch with vgi.status = NEED_MORE_INPUT
+	// After sending more input via WriteInputBatch(), call ClearNeedsMoreInput() and continue reading
+	bool NeedsMoreInput() const {
+		return needs_more_input_;
+	}
+
+	// Clear the needs_more_input flag after sending more input
+	void ClearNeedsMoreInput() {
+		needs_more_input_ = false;
 	}
 
 	// Get the worker process PID (returns -1 if not yet spawned)
@@ -479,6 +527,7 @@ private:
 	bool bind_done_ = false;
 	bool init_done_ = false;
 	bool data_finished_ = false;
+	bool needs_more_input_ = false;  // Set when worker responds with NEED_MORE_INPUT status
 
 	// Cached bind results (full OutputSpec)
 	OutputSpecResult output_spec_;
@@ -487,6 +536,15 @@ private:
 	// The data phase uses a single long-lived IPC stream with multiple batches
 	std::shared_ptr<arrow::io::InputStream> data_stream_;
 	std::shared_ptr<arrow::ipc::RecordBatchStreamReader> data_reader_;
+
+	// Input schema for table-in-out functions (nullptr for regular table functions)
+	std::shared_ptr<arrow::Schema> input_schema_;
+
+	// Input data writer (Stream 5) for table-in-out functions
+	// Used to send input batches to the worker
+	std::shared_ptr<arrow::ipc::RecordBatchWriter> input_writer_;
+	bool input_writer_opened_ = false;
+	bool input_writer_closed_ = false;
 
 	// Stderr reader thread - reads stderr and buffers lines for main thread to log
 	std::thread stderr_thread_;

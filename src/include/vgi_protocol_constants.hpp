@@ -30,6 +30,19 @@ constexpr const char *VGI_POSITIONAL_PREFIX = "positional_";
 constexpr const char *VGI_NAMED_PREFIX = "named_";
 
 // ----------------------------------------------------------------------------
+// Type Metadata (for special argument types like table input)
+// ----------------------------------------------------------------------------
+// Arrow schema metadata key that indicates a special type
+constexpr const char *VGI_TYPE_METADATA_KEY = "vgi_type";
+
+// Value for VGI_TYPE_METADATA_KEY indicating a table input argument
+// Table inputs are streaming RecordBatches passed via Stream 5
+constexpr const char *VGI_TYPE_TABLE_VALUE = "table";
+
+// Value for VGI_TYPE_METADATA_KEY indicating any Arrow type is accepted
+constexpr const char *VGI_TYPE_ANY_VALUE = "any";
+
+// ----------------------------------------------------------------------------
 // Varargs Metadata
 // ----------------------------------------------------------------------------
 // Arrow schema metadata key indicating the function accepts varargs

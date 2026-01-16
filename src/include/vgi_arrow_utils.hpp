@@ -95,6 +95,15 @@ struct FunctionArgumentTypes {
 	// Varargs support: if has_varargs is true, function accepts additional arguments of varargs_type
 	bool has_varargs = false;
 	LogicalType varargs_type = LogicalType::ANY;
+	// Table input support: position of the table input argument (-1 if none)
+	// Table inputs are marked with vgi_type: table metadata in the Arrow schema
+	// These become TABLE parameters in DuckDB function registration
+	int table_input_position = -1;
+	string table_input_name;
+
+	bool HasTableInput() const {
+		return table_input_position >= 0;
+	}
 };
 
 // Parse function argument schema, distinguishing positional from named arguments

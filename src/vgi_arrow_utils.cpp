@@ -127,6 +127,7 @@ FunctionArgumentTypes ParseFunctionArgumentSchema(ClientContext &context,
 		// Check metadata for special markers
 		bool is_named = false;
 		bool is_varargs = false;
+		bool is_table_input = false;
 		if (field->HasMetadata()) {
 			auto metadata = field->metadata();
 
@@ -143,6 +144,13 @@ FunctionArgumentTypes ParseFunctionArgumentSchema(ClientContext &context,
 				auto value = metadata->value(varargs_idx);
 				is_varargs = (value == VGI_VARARGS_TRUE_VALUE);
 			}
+
+			// Check for table input marker (vgi_type: table)
+			auto type_idx = metadata->FindKey(VGI_TYPE_METADATA_KEY);
+			if (type_idx >= 0) {
+				auto value = metadata->value(type_idx);
+				is_table_input = (value == VGI_TYPE_TABLE_VALUE);
+			}
 		}
 
 		if (is_varargs) {
@@ -150,6 +158,15 @@ FunctionArgumentTypes ParseFunctionArgumentSchema(ClientContext &context,
 			result.has_varargs = true;
 			result.varargs_type = LogicalType::ANY;
 			// Don't add varargs to positional_types - it's a sentinel
+		} else if (is_table_input) {
+			// Table input field - record position and name for table-in-out function registration
+			// Store the current position (in terms of positional args only)
+			result.table_input_position = static_cast<int>(result.positional_types.size());
+			result.table_input_name = col_name;
+			// Add TABLE type placeholder - this will be replaced with actual TABLE type
+			// during function registration
+			result.positional_types.push_back(LogicalType::TABLE);
+			result.positional_names.push_back(col_name);
 		} else if (is_named) {
 			// Named argument - add to named_parameters map
 			result.named_parameters[col_name] = duckdb_type;
@@ -185,12 +202,13 @@ ArrowArguments BuildArgumentsFromValues(ClientContext &context, const vector<Val
 		field_types.push_back(value.type());
 	}
 
-	// Handle empty arguments case
+	// Handle empty arguments case - create a struct array with 1 row but no fields
+	// This happens for table-in-out functions that only have a TABLE argument
 	if (field_types.empty()) {
 		std::vector<std::shared_ptr<arrow::Field>> empty_fields;
-		std::vector<std::shared_ptr<arrow::Array>> empty_arrays;
 		auto empty_struct_type = arrow::struct_(empty_fields);
-		auto empty_result = arrow::StructArray::Make(empty_arrays, empty_fields);
+		// Use MakeArrayOfNull to create a struct array with explicit length
+		auto empty_result = arrow::MakeArrayOfNull(empty_struct_type, 1);
 		if (!empty_result.ok()) {
 			throw IOException("Failed to create empty struct array: %s", empty_result.status().ToString());
 		}

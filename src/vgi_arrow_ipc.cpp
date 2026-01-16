@@ -137,6 +137,54 @@ arrow::Result<std::shared_ptr<arrow::Buffer>> FdInputStream::Read(int64_t nbytes
 	return buffer;
 }
 
+// FdOutputStream implementation
+FdOutputStream::FdOutputStream(int fd) : fd_(fd), position_(0), is_open_(true) {
+}
+
+arrow::Status FdOutputStream::Close() {
+	is_open_ = false;
+	return arrow::Status::OK();
+}
+
+bool FdOutputStream::closed() const {
+	return !is_open_;
+}
+
+arrow::Result<int64_t> FdOutputStream::Tell() const {
+	return position_;
+}
+
+arrow::Status FdOutputStream::Write(const void *data, int64_t nbytes) {
+	if (!is_open_) {
+		return arrow::Status::Invalid("Stream is closed");
+	}
+
+	const uint8_t *bytes = static_cast<const uint8_t *>(data);
+	int64_t total_written = 0;
+
+	while (total_written < nbytes) {
+		ssize_t written = write(fd_, bytes + total_written, nbytes - total_written);
+		if (written < 0) {
+			if (errno == EINTR) {
+				continue;
+			}
+			if (errno == EPIPE) {
+				return arrow::Status::IOError("Broken pipe writing to worker");
+			}
+			return arrow::Status::IOError("Write error: ", strerror(errno));
+		}
+		total_written += written;
+	}
+
+	position_ += total_written;
+	return arrow::Status::OK();
+}
+
+arrow::Status FdOutputStream::Flush() {
+	// File descriptors don't need explicit flushing
+	return arrow::Status::OK();
+}
+
 // Read a single RecordBatch from a file descriptor
 // This reads one complete IPC stream (schema + 1 batch + EOS marker)
 // Returns a result with null batch if the stream is at EOF (pipe closed, no more data)

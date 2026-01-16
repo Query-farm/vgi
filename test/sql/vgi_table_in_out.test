@@ -1,0 +1,119 @@
+# name: test/sql/vgi_table_in_out.test
+# description: test VGI table-in-out functions with a real VGI worker
+# group: [vgi]
+
+# This test requires a VGI worker to be available
+# Set VGI_TEST_WORKER environment variable to the path of a VGI worker executable
+require-env VGI_TEST_WORKER
+
+require vgi
+
+# ============================================================================
+# Test ATTACH to access table-in-out functions
+# ============================================================================
+
+statement ok
+ATTACH 'example' AS vgi_test (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# Test echo function - passthrough
+# ============================================================================
+
+# Create test data
+statement ok
+CREATE TABLE test_data AS SELECT i AS a, i * 2 AS b FROM range(10) t(i);
+
+# Test echo function - should return same data
+query II
+SELECT * FROM vgi_test.echo((SELECT * FROM test_data)) ORDER BY a;
+----
+0	0
+1	2
+2	4
+3	6
+4	8
+5	10
+6	12
+7	14
+8	16
+9	18
+
+# Test echo with empty input
+query II
+SELECT * FROM vgi_test.echo((SELECT * FROM test_data WHERE a < 0)) ORDER BY a;
+----
+
+# ============================================================================
+# Test sum_all_columns function - aggregation
+# ============================================================================
+
+# Test sum_all_columns - should sum all numeric columns
+query II
+SELECT * FROM vgi_test.sum_all_columns((SELECT * FROM test_data));
+----
+45	90
+
+# Test sum_all_columns with single row
+query II
+SELECT * FROM vgi_test.sum_all_columns((SELECT 10 AS a, 20 AS b));
+----
+10	20
+
+# ============================================================================
+# Test buffer_input function - buffers all rows, emits during finalize
+# ============================================================================
+
+query II
+SELECT * FROM vgi_test.buffer_input((SELECT * FROM test_data)) ORDER BY a;
+----
+0	0
+1	2
+2	4
+3	6
+4	8
+5	10
+6	12
+7	14
+8	16
+9	18
+
+# ============================================================================
+# Test with different data types
+# ============================================================================
+
+# Create table with various types
+statement ok
+CREATE TABLE typed_data AS SELECT
+    i AS int_col,
+    i::BIGINT * 1000000000 AS bigint_col,
+    i::DOUBLE AS double_col
+FROM range(5) t(i);
+
+# Test echo preserves types
+query III
+SELECT * FROM vgi_test.echo((SELECT * FROM typed_data)) ORDER BY int_col;
+----
+0	0	0.0
+1	1000000000	1.0
+2	2000000000	2.0
+3	3000000000	3.0
+4	4000000000	4.0
+
+# Test sum_all_columns with different numeric types
+query III
+SELECT * FROM vgi_test.sum_all_columns((SELECT * FROM typed_data));
+----
+10	10000000000	10.0
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DROP TABLE test_data;
+
+statement ok
+DROP TABLE typed_data;
+
+statement ok
+DETACH vgi_test;
