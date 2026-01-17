@@ -12,19 +12,12 @@
 #include "vgi_arrow_utils.hpp"
 #include "vgi_catalog_api.hpp"
 #include "vgi_protocol.hpp"
+#include "vgi_scalar_function_impl.hpp"
 
 namespace duckdb {
 
 VgiScalarFunctionSet::VgiScalarFunctionSet(Catalog &catalog, VgiSchemaEntry &schema)
     : VgiCatalogSet(catalog), schema_(schema) {
-}
-
-// Placeholder scalar function that calls VGI worker
-// This will be replaced with actual VGI function invocation
-static void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &result) {
-	// TODO: Implement actual VGI scalar function invocation
-	// For now, throw an error indicating the function is not yet implemented
-	throw NotImplementedException("VGI scalar function execution not yet implemented");
 }
 
 void VgiScalarFunctionSet::LoadEntries(ClientContext &context) {
@@ -87,17 +80,60 @@ void VgiScalarFunctionSet::LoadEntries(ClientContext &context) {
 				throw InvalidInputException("Scalar function '%s' output_schema must have exactly 1 field, got %d",
 				                            func_info.name, func_info.output_schema->num_fields());
 			}
-			ArrowSchemaWrapper c_schema;
-			ArrowTableSchema arrow_table;
-			vector<LogicalType> output_types;
-			vector<string> output_names;
-			vgi::ArrowSchemaToDuckDBTypes(context, func_info.output_schema, c_schema, arrow_table, output_types,
-			                              output_names);
-			LogicalType return_type = output_types[0];
+
+			// Check if output type is marked as "any" type (dynamic output type)
+			auto output_field = func_info.output_schema->field(0);
+			bool is_any_output = false;
+			if (output_field->HasMetadata()) {
+				auto metadata = output_field->metadata();
+				auto type_idx = metadata->FindKey("vgi:any");
+				if (type_idx >= 0) {
+					is_any_output = true;
+				}
+				// Also check vgi_type metadata
+				type_idx = metadata->FindKey("vgi_type");
+				if (type_idx >= 0 && metadata->value(type_idx) == "any") {
+					is_any_output = true;
+				}
+			}
+
+			LogicalType return_type;
+			if (is_any_output) {
+				// Dynamic return type - use ANY
+				return_type = LogicalType::ANY;
+			} else {
+				// Static return type - convert from Arrow schema
+				ArrowSchemaWrapper c_schema;
+				ArrowTableSchema arrow_table;
+				vector<LogicalType> output_types;
+				vector<string> output_names;
+				vgi::ArrowSchemaToDuckDBTypes(context, func_info.output_schema, c_schema, arrow_table, output_types,
+				                              output_names);
+				return_type = output_types[0];
+			}
 
 			// Create the scalar function with positional arguments only
 			// DuckDB's ScalarFunction doesn't have built-in named parameter support
-			ScalarFunction scalar_func(arg_types.positional_types, return_type, VgiScalarFunctionExecute);
+			ScalarFunction scalar_func(arg_types.positional_types, return_type, vgi::VgiScalarFunctionExecute);
+
+			// Mark as VOLATILE to prevent constant folding - VGI functions call external workers
+			// and cannot be evaluated at compile time
+			scalar_func.SetStability(FunctionStability::VOLATILE);
+
+			// Create VgiScalarFunctionInfo with worker connection details
+			auto scalar_func_info = make_shared_ptr<VgiScalarFunctionInfo>();
+			scalar_func_info->worker_path = worker_path;
+			scalar_func_info->attach_id = attach_result->attach_id;
+			scalar_func_info->function_name = func_info.name;
+			scalar_func_info->worker_debug = attach_params->worker_debug();
+			scalar_func_info->use_pool = attach_params->use_pool();
+			scalar_func_info->output_schema = func_info.output_schema;
+			// Copy settings from catalog if any
+
+			// Attach the function info and init callback
+			scalar_func.SetExtraFunctionInfo(scalar_func_info);
+			scalar_func.SetInitStateCallback(vgi::VgiScalarFunctionInitLocalState);
+
 			func_set.AddFunction(scalar_func);
 
 			// Create function description with full metadata

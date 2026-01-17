@@ -1,0 +1,150 @@
+# name: test/sql/integration/scalar/upper_case.test
+# description: Integration tests for VGI upper_case scalar function
+# group: [vgi]
+
+# This test requires a VGI worker to be available
+# Set VGI_TEST_WORKER environment variable to the path of a VGI worker executable
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# upper_case function
+# Converts string column to uppercase
+# Args: column (string)
+# Returns: string (uppercase version)
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# Basic single value tests
+# ----------------------------------------------------------------------------
+
+query I
+SELECT example.upper_case('hello');
+----
+HELLO
+
+query I
+SELECT example.upper_case('world');
+----
+WORLD
+
+query I
+SELECT example.upper_case('VGI Test');
+----
+VGI TEST
+
+# ----------------------------------------------------------------------------
+# Empty and special strings
+# ----------------------------------------------------------------------------
+
+query I
+SELECT example.upper_case('');
+----
+(empty)
+
+query I
+SELECT example.upper_case('123');
+----
+123
+
+query I
+SELECT example.upper_case('Already UPPER');
+----
+ALREADY UPPER
+
+query I
+SELECT example.upper_case('Mixed Case String');
+----
+MIXED CASE STRING
+
+# ----------------------------------------------------------------------------
+# Multiple rows from table
+# ----------------------------------------------------------------------------
+
+query I
+SELECT example.upper_case(col) FROM (VALUES ('hello'), ('world'), ('test')) t(col);
+----
+HELLO
+WORLD
+TEST
+
+query I
+SELECT example.upper_case(name) FROM (VALUES ('alice'), ('bob'), ('charlie')) t(name) ORDER BY name;
+----
+ALICE
+BOB
+CHARLIE
+
+# ----------------------------------------------------------------------------
+# Larger datasets
+# ----------------------------------------------------------------------------
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT example.upper_case('row_' || i::VARCHAR) AS result
+    FROM (SELECT unnest(generate_series(1, 100)) AS i)
+);
+----
+100
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT example.upper_case('item') AS result
+    FROM (SELECT unnest(generate_series(1, 500)) AS i)
+);
+----
+500
+
+# Verify values are actually uppercase
+query I
+SELECT COUNT(*) FROM (
+    SELECT example.upper_case('test') AS result
+    FROM (SELECT unnest(generate_series(1, 50)) AS i)
+) WHERE result = 'TEST';
+----
+50
+
+# ----------------------------------------------------------------------------
+# Integration with other SQL operations
+# ----------------------------------------------------------------------------
+
+query II
+SELECT col, example.upper_case(col) AS upper_col
+FROM (VALUES ('foo'), ('bar'), ('baz')) t(col)
+ORDER BY col;
+----
+bar	BAR
+baz	BAZ
+foo	FOO
+
+query I
+SELECT example.upper_case(col) FROM (VALUES ('a'), ('b'), ('c'), ('a'), ('b')) t(col) GROUP BY col ORDER BY col;
+----
+A
+B
+C
+
+# ----------------------------------------------------------------------------
+# With expressions
+# ----------------------------------------------------------------------------
+
+query I
+SELECT example.upper_case('prefix_' || 'suffix');
+----
+PREFIX_SUFFIX
+
+query I
+SELECT example.upper_case(col || '_end') FROM (VALUES ('start')) t(col);
+----
+START_END
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;

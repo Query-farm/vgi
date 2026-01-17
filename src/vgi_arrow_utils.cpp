@@ -128,6 +128,7 @@ FunctionArgumentTypes ParseFunctionArgumentSchema(ClientContext &context,
 		bool is_named = false;
 		bool is_varargs = false;
 		bool is_table_input = false;
+		bool is_any_type = false;
 		if (field->HasMetadata()) {
 			auto metadata = field->metadata();
 
@@ -145,12 +146,18 @@ FunctionArgumentTypes ParseFunctionArgumentSchema(ClientContext &context,
 				is_varargs = (value == VGI_VARARGS_TRUE_VALUE);
 			}
 
-			// Check for table input marker (vgi_type: table)
+			// Check for vgi_type metadata (table input or any type)
 			auto type_idx = metadata->FindKey(VGI_TYPE_METADATA_KEY);
 			if (type_idx >= 0) {
 				auto value = metadata->value(type_idx);
 				is_table_input = (value == VGI_TYPE_TABLE_VALUE);
+				is_any_type = (value == VGI_TYPE_ANY_VALUE);
 			}
+		}
+
+		// Override DuckDB type if this is an "any" type field
+		if (is_any_type) {
+			duckdb_type = LogicalType::ANY;
 		}
 
 		if (is_varargs) {
