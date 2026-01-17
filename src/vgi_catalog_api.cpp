@@ -1051,7 +1051,35 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 	// Check for log messages (will throw on EXCEPTION)
 	if (HandleBatchLogMessage(result.batch, result.custom_metadata, &context_, worker_path_, proc_->GetPid(),
 	                          GetInvocationIdHex(), GetAttachIdHex(), "")) {
-		// It was a log message - read the next batch
+		// It was a log message - for table-in-out functions, we need to send a "continue" signal
+		// because the Python generator is waiting for input to resume after yielding the log message.
+		// The protocol says: "When a Message is yielded, an empty batch is sent with the message
+		// in metadata, and the current input is re-sent."
+		// We send an empty batch to resume the generator (the Python side discards it for log messages).
+		if (IsTableInOut() && input_writer_opened_ && !input_writer_closed_) {
+			// Create and send an empty input batch with the input schema
+			std::vector<std::shared_ptr<arrow::Array>> empty_arrays;
+			for (int i = 0; i < input_schema_->num_fields(); i++) {
+				auto builder_result = arrow::MakeBuilder(input_schema_->field(i)->type());
+				if (!builder_result.ok()) {
+					ThrowVgiIOException("Failed to create Arrow builder: %s", worker_path_, proc_->GetPid(),
+					                    GetInvocationIdHex(), builder_result.status().ToString());
+				}
+				auto array_result = builder_result.ValueUnsafe()->Finish();
+				if (!array_result.ok()) {
+					ThrowVgiIOException("Failed to finish Arrow array: %s", worker_path_, proc_->GetPid(),
+					                    GetInvocationIdHex(), array_result.status().ToString());
+				}
+				empty_arrays.push_back(array_result.ValueUnsafe());
+			}
+			auto empty_batch = arrow::RecordBatch::Make(input_schema_, 0, empty_arrays);
+			auto write_status = input_writer_->WriteRecordBatch(*empty_batch);
+			if (!write_status.ok()) {
+				ThrowVgiIOException("Failed to write continue batch after log message: %s", worker_path_,
+				                    proc_->GetPid(), GetInvocationIdHex(), write_status.ToString());
+			}
+		}
+		// Read the next batch
 		return ReadDataBatch();
 	}
 
@@ -1066,6 +1094,12 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 			std::string status = result.custom_metadata->value(status_idx);
 			if (status == "FINISHED") {
 				data_finished_ = true;
+				// For table-in-out functions, close the input writer to signal the Python worker
+				// that we're done. This allows the worker to close its output writer and the
+				// drain loop below to complete.
+				if (IsTableInOut() && input_writer_opened_ && !input_writer_closed_) {
+					CloseInputWriter();
+				}
 				// Drain remaining stream (EOS marker) to clean up for potential pooling
 				while (data_reader_) {
 					auto drain_result = data_reader_->ReadNext();
@@ -1087,6 +1121,37 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 					return result.batch;
 				}
 				return nullptr;
+			} else if (status == "HAVE_MORE_OUTPUT") {
+				// The worker has more output to produce.
+				// During finalize phase (after SendFinalize()), we need to send a "continue" signal
+				// because the Python generator is waiting for input to resume after yielding.
+				// During data phase, DuckDB will call the operator again with the same input,
+				// which serves as the continue signal - we don't send anything extra.
+				if (IsTableInOut() && finalize_sent_ && input_writer_opened_ && !input_writer_closed_) {
+					// Create and send an empty input batch with the input schema
+					std::vector<std::shared_ptr<arrow::Array>> empty_arrays;
+					for (int i = 0; i < input_schema_->num_fields(); i++) {
+						auto builder_result = arrow::MakeBuilder(input_schema_->field(i)->type());
+						if (!builder_result.ok()) {
+							ThrowVgiIOException("Failed to create Arrow builder: %s", worker_path_, proc_->GetPid(),
+							                    GetInvocationIdHex(), builder_result.status().ToString());
+						}
+						auto array_result = builder_result.ValueUnsafe()->Finish();
+						if (!array_result.ok()) {
+							ThrowVgiIOException("Failed to finish Arrow array: %s", worker_path_, proc_->GetPid(),
+							                    GetInvocationIdHex(), array_result.status().ToString());
+						}
+						empty_arrays.push_back(array_result.ValueUnsafe());
+					}
+					auto empty_batch = arrow::RecordBatch::Make(input_schema_, 0, empty_arrays);
+					auto write_status = input_writer_->WriteRecordBatch(*empty_batch);
+					if (!write_status.ok()) {
+						ThrowVgiIOException("Failed to write continue batch for HAVE_MORE_OUTPUT: %s", worker_path_,
+						                    proc_->GetPid(), GetInvocationIdHex(), write_status.ToString());
+					}
+				}
+				// Return the batch - caller will call ReadDataBatch again
+				return result.batch;
 			}
 		}
 	}
@@ -1094,6 +1159,12 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 	// Null or empty batch signals end of stream
 	if (!result.batch || result.batch->num_rows() == 0) {
 		data_finished_ = true;
+		// For table-in-out functions, close the input writer to signal the Python worker
+		// that we're done. This allows the worker to close its output writer and the
+		// drain loop below to complete.
+		if (IsTableInOut() && input_writer_opened_ && !input_writer_closed_) {
+			CloseInputWriter();
+		}
 		// Drain remaining stream (EOS marker) to clean up for potential pooling
 		while (data_reader_) {
 			auto drain_result = data_reader_->ReadNext();
@@ -1233,6 +1304,8 @@ void FunctionConnection::SendFinalize() {
 		ThrowVgiIOException("Failed to write finalize batch: %s", worker_path_, proc_->GetPid(),
 		                    GetInvocationIdHex(), write_status.ToString());
 	}
+
+	finalize_sent_ = true;
 
 	VGI_LOG(context_, "function_connection.finalize_sent",
 	        {{"worker_path", worker_path_},

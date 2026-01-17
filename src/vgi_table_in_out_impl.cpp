@@ -407,15 +407,14 @@ OperatorFinalizeResultType VgiTableInOutFinalize(ExecutionContext &context, Tabl
 		return OperatorFinalizeResultType::FINISHED;
 	}
 
-	// Send finalize signal and close the input writer (only once)
+	// Send finalize signal (only once)
+	// Note: We don't close the input writer here because log messages during finalize
+	// still need to receive "continue" signals via the input stream. The input writer
+	// will be closed when we receive the FINISHED status.
 	if (global_state.connection->IsTableInOut() && !global_state.connection->IsFinished() && !global_state.finalize_sent) {
 		// Send finalize signal to trigger worker's finalize() method
 		global_state.connection->SendFinalize();
 		global_state.finalize_sent = true;
-
-		// Close stdin to let the worker's read loop exit.
-		// This causes the Python IPC writer to flush its buffer when the context exits.
-		global_state.connection->CloseInputWriter();
 
 		VGI_LOG(client_context, "table_in_out.finalize",
 		        {{"worker_path", bind_data.worker_path}, {"function_name", bind_data.function_name}});

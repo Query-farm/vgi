@@ -545,6 +545,7 @@ private:
 	std::shared_ptr<arrow::ipc::RecordBatchWriter> input_writer_;
 	bool input_writer_opened_ = false;
 	bool input_writer_closed_ = false;
+	bool finalize_sent_ = false;  // Set when SendFinalize() is called
 
 	// Stderr reader thread - reads stderr and buffers lines for main thread to log
 	std::thread stderr_thread_;

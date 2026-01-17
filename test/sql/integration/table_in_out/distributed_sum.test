@@ -48,6 +48,31 @@ SELECT n FROM example.sum_all_columns_distributed((SELECT unnest(generate_series
 
 # Verify: sum(1..100) = 5050
 
+# ----------------------------------------------------------------------------
+# Very large datasets (10,000+ rows to span multiple batches)
+# ----------------------------------------------------------------------------
+
+# 10,000 rows
+query I
+SELECT n FROM example.sum_all_columns_distributed((SELECT unnest(generate_series(1, 10000)) AS n));
+----
+50005000
+
+# 12,000 rows
+query I
+SELECT n FROM example.sum_all_columns_distributed((SELECT unnest(generate_series(1, 12000)) AS n));
+----
+72006000
+
+# Multiple columns with 10,000 rows
+query II
+SELECT * FROM example.sum_all_columns_distributed((
+    SELECT unnest(generate_series(1, 10000)) AS a,
+           unnest(generate_series(10001, 20000)) AS b
+));
+----
+50005000	150005000
+
 # ============================================================================
 # sum_all_columns_simple_distributed function
 # Distributed sum using simple callback API (TableInOutFunction)
@@ -81,6 +106,31 @@ SELECT n FROM example.sum_all_columns_simple_distributed((SELECT unnest(generate
 ----
 5050
 
+# ----------------------------------------------------------------------------
+# Very large datasets (10,000+ rows to span multiple batches)
+# ----------------------------------------------------------------------------
+
+# 10,000 rows
+query I
+SELECT n FROM example.sum_all_columns_simple_distributed((SELECT unnest(generate_series(1, 10000)) AS n));
+----
+50005000
+
+# 12,000 rows
+query I
+SELECT n FROM example.sum_all_columns_simple_distributed((SELECT unnest(generate_series(1, 12000)) AS n));
+----
+72006000
+
+# Multiple columns with 10,000 rows
+query II
+SELECT * FROM example.sum_all_columns_simple_distributed((
+    SELECT unnest(generate_series(1, 10000)) AS a,
+           unnest(generate_series(10001, 20000)) AS b
+));
+----
+50005000	150005000
+
 # ============================================================================
 # Verify both distributed implementations produce same results
 # ============================================================================
@@ -91,6 +141,38 @@ SELECT
     (SELECT SUM(a) FROM example.sum_all_columns_simple_distributed((SELECT unnest(generate_series(1, 50)) AS a)));
 ----
 1275	1275
+
+# Large dataset comparison - both implementations should produce identical results
+query II
+SELECT
+    (SELECT n FROM example.sum_all_columns_distributed((SELECT unnest(generate_series(1, 10000)) AS n))),
+    (SELECT n FROM example.sum_all_columns_simple_distributed((SELECT unnest(generate_series(1, 10000)) AS n)));
+----
+50005000	50005000
+
+# ============================================================================
+# Edge cases
+# ============================================================================
+
+# All zeros
+query I
+SELECT n FROM example.sum_all_columns_distributed((SELECT 0 AS n FROM (SELECT unnest(generate_series(1, 100)))));
+----
+0
+
+# Negative numbers
+query I
+SELECT n FROM example.sum_all_columns_distributed((SELECT * FROM (VALUES (-1), (-2), (-3), (6)) t(n)));
+----
+0
+
+# Wide tables
+query IIII
+SELECT * FROM example.sum_all_columns_distributed((
+    SELECT * FROM (VALUES (1, 2, 3, 4), (10, 20, 30, 40), (100, 200, 300, 400)) t(c1, c2, c3, c4)
+));
+----
+111	222	333	444
 
 # ============================================================================
 # Cleanup
