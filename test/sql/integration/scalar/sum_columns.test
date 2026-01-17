@@ -165,6 +165,352 @@ SELECT example.sum_columns(x * 2, y * 2, z * 2) FROM (VALUES (5, 10, 15)) t(x, y
 ----
 60
 
+# ----------------------------------------------------------------------------
+# Boundary cases: Single argument (minimum varargs)
+# ----------------------------------------------------------------------------
+
+query I
+SELECT example.sum_columns(42);
+----
+42
+
+query I
+SELECT example.sum_columns(0);
+----
+0
+
+query I
+SELECT example.sum_columns(-100);
+----
+-100
+
+query R
+SELECT example.sum_columns(3.14::DOUBLE);
+----
+3.14
+
+# ----------------------------------------------------------------------------
+# Boundary cases: Many arguments (6+)
+# ----------------------------------------------------------------------------
+
+# 6 arguments
+query I
+SELECT example.sum_columns(1, 2, 3, 4, 5, 6);
+----
+21
+
+# 7 arguments
+query I
+SELECT example.sum_columns(1, 2, 3, 4, 5, 6, 7);
+----
+28
+
+# 8 arguments
+query I
+SELECT example.sum_columns(1, 2, 3, 4, 5, 6, 7, 8);
+----
+36
+
+# 10 arguments
+query I
+SELECT example.sum_columns(1, 2, 3, 4, 5, 6, 7, 8, 9, 10);
+----
+55
+
+# 10 identical values
+query I
+SELECT example.sum_columns(10, 10, 10, 10, 10, 10, 10, 10, 10, 10);
+----
+100
+
+# ----------------------------------------------------------------------------
+# Boundary cases: NULL handling
+# ----------------------------------------------------------------------------
+
+# Single NULL argument
+query I
+SELECT example.sum_columns(NULL::INTEGER);
+----
+NULL
+
+# NULL mixed with values
+query I
+SELECT example.sum_columns(1, NULL, 3);
+----
+NULL
+
+query I
+SELECT example.sum_columns(NULL, 2, 3);
+----
+NULL
+
+query I
+SELECT example.sum_columns(1, 2, NULL);
+----
+NULL
+
+# Multiple NULLs
+query I
+SELECT example.sum_columns(NULL::INTEGER, NULL::INTEGER);
+----
+NULL
+
+# NULL in batch
+query I
+SELECT example.sum_columns(a, b, c) FROM (VALUES (1, 2, 3), (NULL, 5, 6), (7, 8, 9)) t(a, b, c);
+----
+6
+NULL
+24
+
+# Count non-null results
+query I
+SELECT COUNT(*) FROM (
+    SELECT example.sum_columns(a, b) AS result
+    FROM (VALUES (1, 1), (NULL, 2), (3, 3)) t(a, b)
+) WHERE result IS NOT NULL;
+----
+2
+
+# ----------------------------------------------------------------------------
+# Boundary cases: All zeros
+# ----------------------------------------------------------------------------
+
+query I
+SELECT example.sum_columns(0, 0);
+----
+0
+
+query I
+SELECT example.sum_columns(0, 0, 0, 0, 0);
+----
+0
+
+query R
+SELECT example.sum_columns(0.0::DOUBLE, 0.0::DOUBLE, 0.0::DOUBLE);
+----
+0.0
+
+# ----------------------------------------------------------------------------
+# Boundary cases: Cancellation (positive + negative = 0)
+# ----------------------------------------------------------------------------
+
+query I
+SELECT example.sum_columns(100, -100);
+----
+0
+
+query I
+SELECT example.sum_columns(50, -25, -25);
+----
+0
+
+query I
+SELECT example.sum_columns(10, -20, 30, -40, 20);
+----
+0
+
+query R
+SELECT example.sum_columns(1.5::DOUBLE, -0.5::DOUBLE, -1.0::DOUBLE);
+----
+0.0
+
+# ----------------------------------------------------------------------------
+# Boundary cases: Large values
+# ----------------------------------------------------------------------------
+
+query I
+SELECT example.sum_columns(1000000000::BIGINT, 1000000000::BIGINT);
+----
+2000000000
+
+query I
+SELECT example.sum_columns(500000000::BIGINT, 500000000::BIGINT, 500000000::BIGINT);
+----
+1500000000
+
+query I
+SELECT example.sum_columns(-1000000000::BIGINT, -1000000000::BIGINT);
+----
+-2000000000
+
+# Large + small
+query I
+SELECT example.sum_columns(1000000000::BIGINT, 1::BIGINT, 1::BIGINT);
+----
+1000000002
+
+# ----------------------------------------------------------------------------
+# Boundary cases: Small decimal values
+# ----------------------------------------------------------------------------
+
+query R
+SELECT example.sum_columns(0.001::DOUBLE, 0.002::DOUBLE, 0.003::DOUBLE);
+----
+0.006
+
+query R
+SELECT example.sum_columns(0.1::DOUBLE, 0.01::DOUBLE, 0.001::DOUBLE);
+----
+0.111
+
+# ----------------------------------------------------------------------------
+# Boundary cases: Type mixing
+# Note: Python preserves input types, so mixing int/float can cause issues
+# Use consistent types within each call
+# ----------------------------------------------------------------------------
+
+# All DOUBLE (Float mix)
+query R
+SELECT example.sum_columns(10.0::DOUBLE, 0.5::DOUBLE, 20.0::DOUBLE);
+----
+30.5
+
+# All BIGINT (different sizes promoted)
+query I
+SELECT example.sum_columns(100::BIGINT, 1000000::BIGINT, 50::BIGINT);
+----
+1000150
+
+# All INTEGER
+query I
+SELECT example.sum_columns(1::INTEGER, 10::INTEGER, 100::INTEGER, 1000::INTEGER);
+----
+1111
+
+# ----------------------------------------------------------------------------
+# Boundary cases: Sequence patterns
+# ----------------------------------------------------------------------------
+
+# Sum of 1 to 5 (= 15)
+query I
+SELECT example.sum_columns(1, 2, 3, 4, 5);
+----
+15
+
+# Sum of powers of 2
+query I
+SELECT example.sum_columns(1, 2, 4, 8, 16);
+----
+31
+
+# Alternating signs
+query I
+SELECT example.sum_columns(1, -2, 3, -4, 5);
+----
+3
+
+# ============================================================================
+# Large table tests (5000 rows) - tests parallelism
+# ============================================================================
+
+# Create a table with 5000 rows and three integer columns
+statement ok
+CREATE TABLE large_triplets AS
+SELECT i AS col_a, i * 2 AS col_b, i * 3 AS col_c, i AS id
+FROM (SELECT unnest(generate_series(1, 5000)) AS i);
+
+# Verify table size
+query I
+SELECT COUNT(*) FROM large_triplets;
+----
+5000
+
+# Run sum_columns on all rows (3 columns)
+query I
+SELECT COUNT(*) FROM (
+    SELECT example.sum_columns(col_a, col_b, col_c) AS result
+    FROM large_triplets
+);
+----
+5000
+
+# Verify all sums are correct (i + 2i + 3i = 6i)
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, example.sum_columns(col_a, col_b, col_c) AS sum_result
+    FROM large_triplets
+) WHERE sum_result = id * 6;
+----
+5000
+
+# Test with filtering
+query I
+SELECT COUNT(*) FROM (
+    SELECT example.sum_columns(col_a, col_b, col_c) AS result
+    FROM large_triplets
+    WHERE id <= 2500
+);
+----
+2500
+
+# Test with aggregation
+# Sum of 6*i for i=1 to 100 = 6 * (100 * 101 / 2) = 30300
+query I
+SELECT SUM(example.sum_columns(col_a, col_b, col_c))
+FROM large_triplets
+WHERE id <= 100;
+----
+30300
+
+# Create table with 4 columns to test more varargs
+statement ok
+CREATE TABLE large_quads AS
+SELECT i AS col_a, i AS col_b, i AS col_c, i AS col_d, i AS id
+FROM (SELECT unnest(generate_series(1, 5000)) AS i);
+
+# Run sum_columns with 4 columns
+query I
+SELECT COUNT(*) FROM (
+    SELECT example.sum_columns(col_a, col_b, col_c, col_d) AS result
+    FROM large_quads
+);
+----
+5000
+
+# All sums should be 4*i
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, example.sum_columns(col_a, col_b, col_c, col_d) AS sum_result
+    FROM large_quads
+) WHERE sum_result = id * 4;
+----
+5000
+
+# Create table with double precision values
+statement ok
+CREATE TABLE large_double_triplets AS
+SELECT (i * 0.1)::DOUBLE AS col_a, (i * 0.2)::DOUBLE AS col_b, (i * 0.3)::DOUBLE AS col_c, i AS id
+FROM (SELECT unnest(generate_series(1, 5000)) AS i);
+
+# Run sum_columns on all double rows
+query I
+SELECT COUNT(*) FROM (
+    SELECT example.sum_columns(col_a, col_b, col_c) AS result
+    FROM large_double_triplets
+);
+----
+5000
+
+# Verify sums with tolerance (0.1i + 0.2i + 0.3i = 0.6i)
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, col_a, col_b, col_c, example.sum_columns(col_a, col_b, col_c) AS sum_result
+    FROM large_double_triplets
+) WHERE ABS(sum_result - (id * 0.6)) < 0.0001;
+----
+5000
+
+# Cleanup test tables
+statement ok
+DROP TABLE large_triplets;
+
+statement ok
+DROP TABLE large_quads;
+
+statement ok
+DROP TABLE large_double_triplets;
+
 # ============================================================================
 # Cleanup
 # ============================================================================

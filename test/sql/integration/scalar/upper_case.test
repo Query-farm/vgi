@@ -142,6 +142,222 @@ SELECT example.upper_case(col || '_end') FROM (VALUES ('start')) t(col);
 ----
 START_END
 
+# ----------------------------------------------------------------------------
+# Boundary cases: NULL handling
+# ----------------------------------------------------------------------------
+
+query I
+SELECT example.upper_case(NULL);
+----
+NULL
+
+query I
+SELECT example.upper_case(col) FROM (VALUES ('hello'), (NULL), ('world')) t(col);
+----
+HELLO
+NULL
+WORLD
+
+# Count non-null results
+query I
+SELECT COUNT(*) FROM (
+    SELECT example.upper_case(col) AS result
+    FROM (VALUES ('a'), (NULL), ('b'), (NULL), ('c')) t(col)
+) WHERE result IS NOT NULL;
+----
+3
+
+# ----------------------------------------------------------------------------
+# Boundary cases: Special characters and punctuation
+# ----------------------------------------------------------------------------
+
+query I
+SELECT example.upper_case('hello, world!');
+----
+HELLO, WORLD!
+
+query I
+SELECT example.upper_case('test@example.com');
+----
+TEST@EXAMPLE.COM
+
+query I
+SELECT example.upper_case('price: $100.00');
+----
+PRICE: $100.00
+
+query I
+SELECT example.upper_case('a-b_c.d');
+----
+A-B_C.D
+
+query I
+SELECT example.upper_case('(parentheses) [brackets] {braces}');
+----
+(PARENTHESES) [BRACKETS] {BRACES}
+
+query I
+SELECT example.upper_case('question? exclaim! "quotes"');
+----
+QUESTION? EXCLAIM! "QUOTES"
+
+# ----------------------------------------------------------------------------
+# Boundary cases: Whitespace handling
+# ----------------------------------------------------------------------------
+
+# Leading whitespace preserved
+query I
+SELECT example.upper_case('  leading');
+----
+  LEADING
+
+# Note: Trailing whitespace is hard to test in sqllogictest format
+# Internal whitespace preserved
+query I
+SELECT example.upper_case('  both ends  ') LIKE '  BOTH ENDS  ';
+----
+true
+
+query I
+SELECT example.upper_case('multiple   spaces   inside');
+----
+MULTIPLE   SPACES   INSIDE
+
+# Note: Tab and newline characters are hard to test in sqllogictest format
+# since the format uses tabs as column separators and newlines as row separators
+
+# ----------------------------------------------------------------------------
+# Boundary cases: Long strings
+# ----------------------------------------------------------------------------
+
+# 100 character string
+query I
+SELECT LENGTH(example.upper_case(repeat('a', 100)));
+----
+100
+
+# 1000 character string
+query I
+SELECT LENGTH(example.upper_case(repeat('abcdefghij', 100)));
+----
+1000
+
+# Verify long string is actually uppercased
+query I
+SELECT example.upper_case(repeat('abc', 10));
+----
+ABCABCABCABCABCABCABCABCABCABC
+
+# ----------------------------------------------------------------------------
+# Boundary cases: Single characters
+# ----------------------------------------------------------------------------
+
+query I
+SELECT example.upper_case('a');
+----
+A
+
+query I
+SELECT example.upper_case('z');
+----
+Z
+
+query I
+SELECT example.upper_case('A');
+----
+A
+
+query I
+SELECT example.upper_case('1');
+----
+1
+
+# Note: Single space character is hard to test in sqllogictest format
+
+# ----------------------------------------------------------------------------
+# Boundary cases: Unicode and international characters
+# ----------------------------------------------------------------------------
+
+# Note: Python's upper() handles basic ASCII well, but Unicode uppercasing
+# behavior depends on the Python implementation
+
+query I
+SELECT example.upper_case('cafe');
+----
+CAFE
+
+# Numbers mixed with letters
+query I
+SELECT example.upper_case('abc123def456');
+----
+ABC123DEF456
+
+# ============================================================================
+# Large table tests (5000 rows) - tests parallelism
+# ============================================================================
+
+# Create a table with 5000 rows
+statement ok
+CREATE TABLE large_strings AS
+SELECT 'row_' || i::VARCHAR AS str_col, i AS id
+FROM (SELECT unnest(generate_series(1, 5000)) AS i);
+
+# Verify table size
+query I
+SELECT COUNT(*) FROM large_strings;
+----
+5000
+
+# Run upper_case on all rows
+query I
+SELECT COUNT(*) FROM (
+    SELECT example.upper_case(str_col) AS result
+    FROM large_strings
+);
+----
+5000
+
+# Verify all results are uppercase
+query I
+SELECT COUNT(*) FROM (
+    SELECT example.upper_case(str_col) AS result
+    FROM large_strings
+) WHERE result LIKE 'ROW_%';
+----
+5000
+
+# Test with filtering
+query I
+SELECT COUNT(*) FROM (
+    SELECT example.upper_case(str_col) AS result
+    FROM large_strings
+    WHERE id <= 2500
+);
+----
+2500
+
+# Test with ordering
+query I
+SELECT COUNT(*) FROM (
+    SELECT example.upper_case(str_col) AS result
+    FROM large_strings
+    ORDER BY id
+);
+----
+5000
+
+# Test aggregation on large results
+query I
+SELECT COUNT(DISTINCT LENGTH(example.upper_case(str_col)))
+FROM large_strings
+WHERE id <= 100;
+----
+3
+
+# Cleanup test table
+statement ok
+DROP TABLE large_strings;
+
 # ============================================================================
 # Cleanup
 # ============================================================================
