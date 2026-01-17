@@ -120,6 +120,11 @@ void VgiScalarFunctionSet::LoadEntries(ClientContext &context) {
 			// and cannot be evaluated at compile time
 			scalar_func.SetStability(FunctionStability::VOLATILE);
 
+			// Set varargs if this function accepts variable arguments
+			if (arg_types.has_varargs) {
+				scalar_func.varargs = arg_types.varargs_type;
+			}
+
 			// Create VgiScalarFunctionInfo with worker connection details
 			auto scalar_func_info = make_shared_ptr<VgiScalarFunctionInfo>();
 			scalar_func_info->worker_path = worker_path;

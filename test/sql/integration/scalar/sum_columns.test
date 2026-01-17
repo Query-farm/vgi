@@ -1,0 +1,173 @@
+# name: test/sql/integration/scalar/sum_columns.test
+# description: Integration tests for VGI sum_columns scalar function (varargs)
+# group: [vgi]
+
+# This test requires a VGI worker to be available
+# Set VGI_TEST_WORKER environment variable to the path of a VGI worker executable
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# sum_columns function
+# Sums multiple numeric columns together (varargs)
+# Args: columns... (numeric, varargs)
+# Returns: numeric (sum, promoted type)
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# Basic tests with varying number of arguments
+# ----------------------------------------------------------------------------
+
+# 2 arguments
+query I
+SELECT example.sum_columns(10, 20);
+----
+30
+
+# 3 arguments
+query I
+SELECT example.sum_columns(10, 20, 30);
+----
+60
+
+# 4 arguments
+query I
+SELECT example.sum_columns(1, 2, 3, 4);
+----
+10
+
+# 5 arguments
+query I
+SELECT example.sum_columns(10, 20, 30, 40, 50);
+----
+150
+
+# ----------------------------------------------------------------------------
+# Type-specific tests
+# ----------------------------------------------------------------------------
+
+# Integer sum
+query I
+SELECT example.sum_columns(100::INTEGER, 200::INTEGER, 300::INTEGER);
+----
+600
+
+# BIGINT sum
+query I
+SELECT example.sum_columns(1000::BIGINT, 2000::BIGINT, 3000::BIGINT);
+----
+6000
+
+# DOUBLE sum
+query R
+SELECT example.sum_columns(1.5::DOUBLE, 2.5::DOUBLE, 3.0::DOUBLE);
+----
+7.0
+
+query R
+SELECT example.sum_columns(0.1::DOUBLE, 0.2::DOUBLE, 0.3::DOUBLE, 0.4::DOUBLE);
+----
+1.0
+
+# ----------------------------------------------------------------------------
+# Edge cases
+# ----------------------------------------------------------------------------
+
+# With zeros
+query I
+SELECT example.sum_columns(0, 0, 0);
+----
+0
+
+# With negative numbers
+query I
+SELECT example.sum_columns(-10, 20, -5);
+----
+5
+
+query I
+SELECT example.sum_columns(-10, -20, -30);
+----
+-60
+
+# ----------------------------------------------------------------------------
+# Multiple rows from table
+# ----------------------------------------------------------------------------
+
+query I
+SELECT example.sum_columns(a, b, c) FROM (VALUES (1, 2, 3), (4, 5, 6), (7, 8, 9)) t(a, b, c);
+----
+6
+15
+24
+
+query I
+SELECT example.sum_columns(x, y) FROM (VALUES (10, 1), (20, 2), (30, 3)) t(x, y) ORDER BY x;
+----
+11
+22
+33
+
+# ----------------------------------------------------------------------------
+# Larger datasets
+# ----------------------------------------------------------------------------
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT example.sum_columns(i::INTEGER, i::INTEGER, i::INTEGER) AS result
+    FROM (SELECT unnest(generate_series(1, 100)) AS i)
+);
+----
+100
+
+# Verify values are correct (sum of i + i + i = 3*i)
+query I
+SELECT COUNT(*) FROM (
+    SELECT i::INTEGER AS val, example.sum_columns(i::INTEGER, i::INTEGER, i::INTEGER) AS summed
+    FROM (SELECT unnest(generate_series(1, 50)) AS i)
+) WHERE summed = val * 3;
+----
+50
+
+# ----------------------------------------------------------------------------
+# Integration with other SQL operations
+# ----------------------------------------------------------------------------
+
+query IIII
+SELECT a, b, c, example.sum_columns(a, b, c) AS total
+FROM (VALUES (1, 2, 3), (4, 5, 6), (7, 8, 9)) t(a, b, c)
+ORDER BY a;
+----
+1	2	3	6
+4	5	6	15
+7	8	9	24
+
+query I
+SELECT SUM(example.sum_columns(a, b)) FROM (VALUES (1, 1), (2, 2), (3, 3)) t(a, b);
+----
+12
+
+# ----------------------------------------------------------------------------
+# With expressions
+# ----------------------------------------------------------------------------
+
+query I
+SELECT example.sum_columns(10 + 5, 20 + 5, 30 + 5);
+----
+75
+
+query I
+SELECT example.sum_columns(x * 2, y * 2, z * 2) FROM (VALUES (5, 10, 15)) t(x, y, z);
+----
+60
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;
