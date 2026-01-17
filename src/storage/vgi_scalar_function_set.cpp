@@ -128,11 +128,17 @@ void VgiScalarFunctionSet::LoadEntries(ClientContext &context) {
 			scalar_func_info->worker_debug = attach_params->worker_debug();
 			scalar_func_info->use_pool = attach_params->use_pool();
 			scalar_func_info->output_schema = func_info.output_schema;
+			scalar_func_info->has_dynamic_return_type = is_any_output;
 			// Copy settings from catalog if any
 
 			// Attach the function info and init callback
 			scalar_func.SetExtraFunctionInfo(scalar_func_info);
 			scalar_func.SetInitStateCallback(vgi::VgiScalarFunctionInitLocalState);
+
+			// For dynamic return types, attach the bind function to resolve actual type at bind time
+			if (is_any_output) {
+				scalar_func.SetBindCallback(vgi::VgiScalarFunctionBind);
+			}
 
 			func_set.AddFunction(scalar_func);
 

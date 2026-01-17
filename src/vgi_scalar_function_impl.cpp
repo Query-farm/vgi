@@ -117,6 +117,94 @@ unique_ptr<FunctionLocalState> VgiScalarFunctionInitLocalState(ExpressionState &
 }
 
 // ============================================================================
+// Scalar Function Bind (for dynamic return types)
+// ============================================================================
+
+unique_ptr<FunctionData> VgiScalarFunctionBind(ClientContext &context, ScalarFunction &bound_function,
+                                                vector<unique_ptr<Expression>> &arguments) {
+	// Get the function info attached to the function
+	if (!bound_function.HasExtraFunctionInfo()) {
+		throw InternalException("VgiScalarFunctionBind: missing VgiScalarFunctionInfo");
+	}
+	auto &func_info = bound_function.GetExtraFunctionInfo().Cast<VgiScalarFunctionInfo>();
+
+	// Build input schema from argument types
+	// For scalar functions, arguments are the actual values/columns passed in
+	vector<LogicalType> input_types;
+	vector<string> input_names;
+	for (idx_t i = 0; i < arguments.size(); i++) {
+		input_types.push_back(arguments[i]->return_type);
+		input_names.push_back("col_" + std::to_string(i));
+	}
+	auto input_schema = BuildArrowSchemaFromDuckDB(context, input_types, input_names);
+
+	// Build arguments - column names as positional args
+	vector<Value> positional_args;
+	for (idx_t i = 0; i < arguments.size(); i++) {
+		positional_args.push_back(Value("col_" + std::to_string(i)));
+	}
+	ArrowArguments arrow_arguments = BuildArgumentsFromValues(context, positional_args, {});
+
+	// Create temporary connection to get actual output type from worker
+	std::unique_ptr<FunctionConnection> connection;
+	if (func_info.use_pool) {
+		auto pooled = VgiWorkerPool::Instance().TryAcquire(func_info.worker_path);
+		if (pooled) {
+			connection = std::make_unique<FunctionConnection>(
+			    std::move(pooled), func_info.function_name, arrow_arguments, func_info.attach_id, context,
+			    std::vector<uint8_t>{}, func_info.worker_debug, func_info.settings);
+		}
+	}
+	if (!connection) {
+		connection = std::make_unique<FunctionConnection>(
+		    func_info.worker_path, func_info.function_name, arrow_arguments, func_info.attach_id, context,
+		    std::vector<uint8_t>{}, func_info.worker_debug, func_info.settings);
+	}
+
+	// Set input schema and perform bind to get actual output schema
+	connection->SetInputSchema(input_schema);
+	auto output_spec = connection->PerformBindFull();
+
+	// Get the output schema from bind result
+	auto output_schema = output_spec.output_schema;
+	if (!output_schema || output_schema->num_fields() != 1) {
+		throw IOException("VGI scalar function '%s' bind did not return valid output schema",
+		                  func_info.function_name);
+	}
+
+	// Convert Arrow output type to DuckDB type
+	ArrowSchemaWrapper c_schema;
+	ArrowTableSchema arrow_table;
+	vector<LogicalType> output_types;
+	vector<string> output_names;
+	ArrowSchemaToDuckDBTypes(context, output_schema, c_schema, arrow_table, output_types, output_names);
+
+	// Set the actual return type on the bound function
+	bound_function.return_type = output_types[0];
+
+	VGI_LOG(context, "scalar.bind",
+	        {{"function_name", func_info.function_name},
+	         {"input_types", std::to_string(input_types.size())},
+	         {"return_type", output_types[0].ToString()}});
+
+	// Create bind data with resolved information
+	auto bind_data = make_uniq<VgiScalarFunctionBindData>();
+	bind_data->worker_path = func_info.worker_path;
+	bind_data->attach_id = func_info.attach_id;
+	bind_data->function_name = func_info.function_name;
+	bind_data->worker_debug = func_info.worker_debug;
+	bind_data->use_pool = func_info.use_pool;
+	bind_data->settings = func_info.settings;
+	bind_data->resolved_output_schema = output_schema;
+	bind_data->input_schema = input_schema;
+
+	// We don't keep the connection - it will be recreated during execution
+	// (The bind connection is discarded; scalar functions create new connections per execution)
+
+	return bind_data;
+}
+
+// ============================================================================
 // Scalar Function Execution
 // ============================================================================
 
