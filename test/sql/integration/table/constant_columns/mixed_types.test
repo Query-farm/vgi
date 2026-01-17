@@ -1,0 +1,57 @@
+# name: test/sql/integration/table/constant_columns/mixed_types.test
+# description: Mixed type tests for VGI constant_columns table function
+# group: [vgi]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ----------------------------------------------------------------------------
+# Mixed types in single query
+# ----------------------------------------------------------------------------
+
+# Integer + String
+query IT
+SELECT * FROM example.constant_columns(3, 42, 'hello');
+----
+42	hello
+42	hello
+42	hello
+
+# Integer + String + Float
+query ITR
+SELECT * FROM example.constant_columns(2, 100, 'test', 3.14);
+----
+100	test	3.14
+100	test	3.14
+
+# Four different types
+query ITRI
+SELECT * FROM example.constant_columns(2, 1, 'test', 3.14, 999);
+----
+1	test	3.14	999
+1	test	3.14	999
+
+# Five columns
+query ITRIT
+SELECT * FROM example.constant_columns(2, 10, 'a', 1.5, 20, 'b');
+----
+10	a	1.5	20	b
+10	a	1.5	20	b
+
+# Many columns (8 columns)
+query ITITIRIT
+SELECT * FROM example.constant_columns(2, 1, 'one', 2, 'two', 3, 4.0, 5, 'five');
+----
+1	one	2	two	3	4.0	5	five
+1	one	2	two	3	4.0	5	five
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;

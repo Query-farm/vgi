@@ -1,0 +1,149 @@
+# name: test/sql/integration/table_in_out/repeat_inputs/scale.test_slow
+# description: Scale tests for VGI repeat_inputs table-in-out function
+# group: [vgi]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ----------------------------------------------------------------------------
+# Very large datasets (10,000+ rows to span multiple batches)
+# ----------------------------------------------------------------------------
+
+# 5,000 rows repeated 2 times = 10,000 output rows
+query II
+SELECT COUNT(*), SUM(n) FROM example.repeat_inputs(2, (SELECT unnest(generate_series(1, 5000)) AS n));
+----
+10000	25005000
+
+# Verify: sum(1..5000) = 5000*5001/2 = 12502500, repeated 2x = 25005000
+
+# 2,500 rows repeated 4 times = 10,000 output rows
+query II
+SELECT COUNT(*), SUM(n) FROM example.repeat_inputs(4, (SELECT unnest(generate_series(1, 2500)) AS n));
+----
+10000	12505000
+
+# Verify: sum(1..2500) = 2500*2501/2 = 3126250, repeated 4x = 12505000
+
+# 5,000 rows repeated 3 times = 15,000 output rows
+query II
+SELECT COUNT(*), SUM(n) FROM example.repeat_inputs(3, (SELECT unnest(generate_series(1, 5000)) AS n));
+----
+15000	37507500
+
+# Repeat count of 1 on large data (identity)
+query II
+SELECT COUNT(*), SUM(n) FROM example.repeat_inputs(1, (SELECT unnest(generate_series(1, 10000)) AS n));
+----
+10000	50005000
+
+# ----------------------------------------------------------------------------
+# Batch boundary edge cases - test HAVE_MORE_OUTPUT during data phase
+# DuckDB batch size is 2048, with repeat_count=2 we span batches differently
+# ----------------------------------------------------------------------------
+
+# Exactly 2048 rows repeated 2 times = 4096 output rows
+query II
+SELECT COUNT(*), SUM(n) FROM example.repeat_inputs(2, (SELECT unnest(generate_series(1, 2048)) AS n));
+----
+4096	4196352
+
+# 2049 rows repeated 2 times = 4098 output rows (crosses batch boundary)
+query II
+SELECT COUNT(*), SUM(n) FROM example.repeat_inputs(2, (SELECT unnest(generate_series(1, 2049)) AS n));
+----
+4098	4200450
+
+# 1000 rows repeated 3 times = 3000 output rows
+query II
+SELECT COUNT(*), SUM(n) FROM example.repeat_inputs(3, (SELECT unnest(generate_series(1, 1000)) AS n));
+----
+3000	1501500
+
+# ----------------------------------------------------------------------------
+# High repeat counts
+# ----------------------------------------------------------------------------
+
+# 100 rows repeated 50 times = 5000 output rows
+query II
+SELECT COUNT(*), SUM(n) FROM example.repeat_inputs(50, (SELECT unnest(generate_series(1, 100)) AS n));
+----
+5000	252500
+
+# Single row repeated 1000 times
+query II
+SELECT COUNT(*), SUM(n) FROM example.repeat_inputs(1000, (SELECT 42 AS n));
+----
+1000	42000
+
+# ----------------------------------------------------------------------------
+# Large dataset with repeats - tests HAVE_MORE_OUTPUT extensively
+# ----------------------------------------------------------------------------
+
+# 5000 rows repeated 4 times = 20,000 output rows
+query IIII
+SELECT COUNT(*), MIN(n), MAX(n), SUM(n)
+FROM example.repeat_inputs(4, (SELECT unnest(generate_series(1, 5000)) AS n));
+----
+20000	1	5000	50010000
+
+# 10,000 rows repeated 3 times = 30,000 output rows
+query IIII
+SELECT COUNT(*), MIN(n), MAX(n), SUM(n)
+FROM example.repeat_inputs(3, (SELECT unnest(generate_series(1, 10000)) AS n));
+----
+30000	1	10000	150015000
+
+# ----------------------------------------------------------------------------
+# Data integrity with repeats
+# Each value should appear exactly N times
+# ----------------------------------------------------------------------------
+
+# 100 rows repeated 5 times - verify each value appears exactly 5 times
+query II
+SELECT n, COUNT(*) AS cnt
+FROM example.repeat_inputs(5, (SELECT unnest(generate_series(1, 100)) AS n))
+GROUP BY n
+HAVING COUNT(*) != 5;
+----
+
+# The above query should return no rows (all counts are 5)
+
+# Verify total distinct values equals input distinct values
+query I
+SELECT COUNT(DISTINCT n)
+FROM example.repeat_inputs(10, (SELECT unnest(generate_series(1, 500)) AS n));
+----
+500
+
+# Large data integrity check - each value appears exactly N times
+query II
+SELECT n, COUNT(*) FROM example.repeat_inputs(5, (SELECT unnest(generate_series(1, 100)) AS n)) GROUP BY n ORDER BY n LIMIT 5;
+----
+1	5
+2	5
+3	5
+4	5
+5	5
+
+# ----------------------------------------------------------------------------
+# Stress test - many small batches repeated
+# ----------------------------------------------------------------------------
+
+# 200 rows repeated 100 times = 20,000 output rows
+query II
+SELECT COUNT(*), SUM(n)
+FROM example.repeat_inputs(100, (SELECT unnest(generate_series(1, 200)) AS n));
+----
+20000	2010000
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;

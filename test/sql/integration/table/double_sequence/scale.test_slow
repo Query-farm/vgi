@@ -1,0 +1,67 @@
+# name: test/sql/integration/table/double_sequence/scale.test_slow
+# description: Scale tests for VGI double_sequence table function (large sequences)
+# group: [vgi]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ----------------------------------------------------------------------------
+# Large row counts with various batch sizes
+# Tests sustained streaming
+# ----------------------------------------------------------------------------
+
+# 1000 rows, batch_size=1: 1000 batches
+query I
+SELECT COUNT(*) FROM example.double_sequence(1000, 1);
+----
+1000
+
+query R
+SELECT SUM(n) FROM example.double_sequence(1000, 1);
+----
+499500.0
+
+# 10000 rows, batch_size=100: 100 batches
+query I
+SELECT COUNT(*) FROM example.double_sequence(10000, 100);
+----
+10000
+
+query RR
+SELECT MIN(n), MAX(n) FROM example.double_sequence(10000, 100);
+----
+0.0	9999.0
+
+query R
+SELECT SUM(n) FROM example.double_sequence(10000, 100);
+----
+49995000.0
+
+# 10000 rows, batch_size=10000: single batch
+query I
+SELECT COUNT(*) FROM example.double_sequence(10000, 10000);
+----
+10000
+
+# 10000 rows, batch_size=9999: batches of [9999, 1]
+query I
+SELECT COUNT(*) FROM example.double_sequence(10000, 9999);
+----
+10000
+
+# 10000 rows, batch_size=3333: batches of [3333, 3333, 3333, 1]
+query I
+SELECT COUNT(*) FROM example.double_sequence(10000, 3333);
+----
+10000
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;

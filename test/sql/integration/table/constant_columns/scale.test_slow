@@ -1,0 +1,105 @@
+# name: test/sql/integration/table/constant_columns/scale.test_slow
+# description: Scale tests for VGI constant_columns table function (multi-batch, large counts)
+# group: [vgi]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ----------------------------------------------------------------------------
+# Multi-batch scenarios (count > 1000)
+# Internal BATCH_SIZE is 1000
+# ----------------------------------------------------------------------------
+
+# Just over one batch
+query I
+SELECT COUNT(*) FROM example.constant_columns(1001, 42);
+----
+1001
+
+# Two full batches
+query I
+SELECT COUNT(*) FROM example.constant_columns(2000, 'test');
+----
+2000
+
+# Mixed types across batches
+query I
+SELECT COUNT(*) FROM example.constant_columns(2500, 1, 'hello', 3.14);
+----
+2500
+
+# Verify consistency across batches - all values should be identical
+query II
+SELECT MIN(col_0), MAX(col_0) FROM example.constant_columns(2500, 999);
+----
+999	999
+
+query I
+SELECT COUNT(DISTINCT col_0) FROM example.constant_columns(3000, 'constant');
+----
+1
+
+# Large multi-batch (5000 rows)
+query I
+SELECT COUNT(*) FROM example.constant_columns(5000, 42, 'text', 1.23);
+----
+5000
+
+# Verify all columns are consistent across batches
+query IITTRR
+SELECT MIN(col_0), MAX(col_0), MIN(col_1), MAX(col_1), MIN(col_2), MAX(col_2)
+FROM example.constant_columns(3000, 100, 'abc', 7.5);
+----
+100	100	abc	abc	7.5	7.5
+
+# 10000 rows (10 batches)
+query I
+SELECT COUNT(*) FROM example.constant_columns(10000, 'large');
+----
+10000
+
+# ----------------------------------------------------------------------------
+# Deeply nested types across batches
+# Verify complex types are consistent across batch boundaries
+# ----------------------------------------------------------------------------
+
+# Nested structs across batches
+query I
+SELECT COUNT(*) FROM example.constant_columns(2500, {'a': {'b': {'c': 123}}});
+----
+2500
+
+query I
+SELECT COUNT(DISTINCT col_0::VARCHAR) FROM example.constant_columns(2500, {'a': {'b': {'c': 123}}});
+----
+1
+
+# Nested lists across batches
+query I
+SELECT COUNT(*) FROM example.constant_columns(2500, [[1, 2], [3, 4]]);
+----
+2500
+
+# Complex nested type across batches
+query I
+SELECT COUNT(*) FROM example.constant_columns(2500, {'data': [{'id': 1, 'values': [10, 20]}]});
+----
+2500
+
+# Verify first and last rows are identical in multi-batch scenario
+query II
+SELECT MIN(col_0::VARCHAR), MAX(col_0::VARCHAR)
+FROM example.constant_columns(3000, {'nested': {'deep': [1, 2, 3]}});
+----
+{'nested': {'deep': [1, 2, 3]}}	{'nested': {'deep': [1, 2, 3]}}
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;

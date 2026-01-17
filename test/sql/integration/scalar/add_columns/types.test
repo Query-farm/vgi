@@ -1,0 +1,247 @@
+# name: test/sql/integration/scalar/add_columns/types.test
+# description: Type tests for VGI add_columns scalar function
+# group: [vgi]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ----------------------------------------------------------------------------
+# Type-specific tests
+# ----------------------------------------------------------------------------
+
+# INTEGER + INTEGER -> INT64 (promoted)
+query I
+SELECT example.add_columns(100::INTEGER, 200::INTEGER);
+----
+300
+
+# BIGINT + BIGINT -> INT64
+query I
+SELECT example.add_columns(1000::BIGINT, 2000::BIGINT);
+----
+3000
+
+# DOUBLE + DOUBLE -> DOUBLE
+query R
+SELECT example.add_columns(1.5::DOUBLE, 2.5::DOUBLE);
+----
+4.0
+
+query R
+SELECT example.add_columns(3.14::DOUBLE, 2.86::DOUBLE);
+----
+6.0
+
+# FLOAT + FLOAT -> FLOAT
+query R
+SELECT example.add_columns(1.25::FLOAT, 2.75::FLOAT);
+----
+4.0
+
+# Mixed precision (both promoted)
+query R
+SELECT example.add_columns(1::INTEGER, 2.5::DOUBLE);
+----
+3.5
+
+# ----------------------------------------------------------------------------
+# NULL handling
+# ----------------------------------------------------------------------------
+
+# First argument NULL
+query I
+SELECT example.add_columns(NULL::INTEGER, 10);
+----
+NULL
+
+# Second argument NULL
+query I
+SELECT example.add_columns(10, NULL::INTEGER);
+----
+NULL
+
+# Both arguments NULL
+query I
+SELECT example.add_columns(NULL::INTEGER, NULL::INTEGER);
+----
+NULL
+
+# Mixed NULL and non-NULL in batch
+query I
+SELECT example.add_columns(a, b) FROM (VALUES (1, 2), (NULL, 3), (4, NULL), (5, 6)) t(a, b);
+----
+3
+NULL
+NULL
+11
+
+# Count non-null results
+query I
+SELECT COUNT(*) FROM (
+    SELECT example.add_columns(a, b) AS result
+    FROM (VALUES (1, 1), (NULL, 2), (3, NULL), (4, 4)) t(a, b)
+) WHERE result IS NOT NULL;
+----
+2
+
+# ----------------------------------------------------------------------------
+# Zero combinations
+# ----------------------------------------------------------------------------
+
+query I
+SELECT example.add_columns(0, 0);
+----
+0
+
+query I
+SELECT example.add_columns(0, 100);
+----
+100
+
+query I
+SELECT example.add_columns(100, 0);
+----
+100
+
+query I
+SELECT example.add_columns(0, -100);
+----
+-100
+
+query R
+SELECT example.add_columns(0.0::DOUBLE, 3.14::DOUBLE);
+----
+3.14
+
+# ----------------------------------------------------------------------------
+# Opposite signs (cancellation)
+# ----------------------------------------------------------------------------
+
+query I
+SELECT example.add_columns(100, -100);
+----
+0
+
+query I
+SELECT example.add_columns(-50, 50);
+----
+0
+
+query R
+SELECT example.add_columns(3.14::DOUBLE, -3.14::DOUBLE);
+----
+0.0
+
+query R
+SELECT example.add_columns(-1.5::DOUBLE, 1.5::DOUBLE);
+----
+0.0
+
+# ----------------------------------------------------------------------------
+# Large values
+# ----------------------------------------------------------------------------
+
+query I
+SELECT example.add_columns(1000000000::BIGINT, 1000000000::BIGINT);
+----
+2000000000
+
+query I
+SELECT example.add_columns(999999999::BIGINT, 1::BIGINT);
+----
+1000000000
+
+query I
+SELECT example.add_columns(-1000000000::BIGINT, -1000000000::BIGINT);
+----
+-2000000000
+
+# Large positive + large negative
+query I
+SELECT example.add_columns(1000000000::BIGINT, -999999999::BIGINT);
+----
+1
+
+# ----------------------------------------------------------------------------
+# Small decimal values
+# ----------------------------------------------------------------------------
+
+query R
+SELECT example.add_columns(0.001::DOUBLE, 0.002::DOUBLE);
+----
+0.003
+
+query R
+SELECT example.add_columns(0.0001::DOUBLE, 0.0002::DOUBLE);
+----
+0.0003
+
+query R
+SELECT example.add_columns(0.123456::DOUBLE, 0.654321::DOUBLE);
+----
+0.777777
+
+# ----------------------------------------------------------------------------
+# Consistent type usage
+# ----------------------------------------------------------------------------
+
+# Both DOUBLE (for float results)
+query R
+SELECT example.add_columns(10.0::DOUBLE, 0.5::DOUBLE);
+----
+10.5
+
+# Both DOUBLE (negative + positive)
+query R
+SELECT example.add_columns(-10.0::DOUBLE, 10.5::DOUBLE);
+----
+0.5
+
+# Both BIGINT
+query I
+SELECT example.add_columns(100::BIGINT, 1000000::BIGINT);
+----
+1000100
+
+# Both INTEGER
+query I
+SELECT example.add_columns(1000::INTEGER, 1000000::INTEGER);
+----
+1001000
+
+# ----------------------------------------------------------------------------
+# Extreme values of small types
+# ----------------------------------------------------------------------------
+
+# TINYINT values cast to INTEGER to avoid overflow
+query I
+SELECT example.add_columns(127::INTEGER, 127::INTEGER);
+----
+254
+
+query I
+SELECT example.add_columns(-128::INTEGER, -128::INTEGER);
+----
+-256
+
+# SMALLINT values cast to INTEGER to avoid overflow
+query I
+SELECT example.add_columns(32767::INTEGER, 32767::INTEGER);
+----
+65534
+
+query I
+SELECT example.add_columns(-32768::INTEGER, -32768::INTEGER);
+----
+-65536
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;

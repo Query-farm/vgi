@@ -1,0 +1,99 @@
+# name: test/sql/integration/scalar/add_columns/scale.test_slow
+# description: Scale tests for VGI add_columns scalar function (5000+ rows)
+# group: [vgi]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# Large table tests (5000 rows) - tests parallelism
+# ============================================================================
+
+# Create a table with 5000 rows and two integer columns
+statement ok
+CREATE TABLE large_pairs AS
+SELECT i AS col_a, (5000 - i) AS col_b, i AS id
+FROM (SELECT unnest(generate_series(1, 5000)) AS i);
+
+# Verify table size
+query I
+SELECT COUNT(*) FROM large_pairs;
+----
+5000
+
+# Run add_columns on all rows
+query I
+SELECT COUNT(*) FROM (
+    SELECT example.add_columns(col_a, col_b) AS result
+    FROM large_pairs
+);
+----
+5000
+
+# All sums should equal 5000 (i + (5000 - i) = 5000)
+query I
+SELECT COUNT(*) FROM (
+    SELECT example.add_columns(col_a, col_b) AS result
+    FROM large_pairs
+) WHERE result = 5000;
+----
+5000
+
+# Test with filtering
+query I
+SELECT COUNT(*) FROM (
+    SELECT example.add_columns(col_a, col_b) AS result
+    FROM large_pairs
+    WHERE id <= 2500
+);
+----
+2500
+
+# Test with aggregation (5000 * 5000 = 25000000)
+query I
+SELECT SUM(example.add_columns(col_a, col_b))
+FROM large_pairs;
+----
+25000000
+
+# Create table with double precision values
+statement ok
+CREATE TABLE large_double_pairs AS
+SELECT (i * 0.1)::DOUBLE AS col_a, (i * 0.2)::DOUBLE AS col_b, i AS id
+FROM (SELECT unnest(generate_series(1, 5000)) AS i);
+
+# Run add_columns on all double rows
+query I
+SELECT COUNT(*) FROM (
+    SELECT example.add_columns(col_a, col_b) AS result
+    FROM large_double_pairs
+);
+----
+5000
+
+# Verify addition with tolerance
+query I
+SELECT COUNT(*) FROM (
+    SELECT col_a, col_b, example.add_columns(col_a, col_b) AS sum_result
+    FROM large_double_pairs
+) WHERE ABS(sum_result - (col_a + col_b)) < 0.0001;
+----
+5000
+
+# Cleanup test tables
+statement ok
+DROP TABLE large_pairs;
+
+statement ok
+DROP TABLE large_double_pairs;
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;

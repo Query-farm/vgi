@@ -1,0 +1,51 @@
+# name: test/sql/integration/table/double_sequence/basic.test
+# description: Basic tests for VGI double_sequence table function
+# group: [vgi]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# double_sequence function
+# Generates floats from 0.0 to (count-1)*increment
+# Args: count (int), batch_size (int, default=1000), increment (float, default=1.0)
+# ============================================================================
+
+# Basic double sequence generation
+query R
+SELECT * FROM example.double_sequence(5, 1000);
+----
+0.0
+1.0
+2.0
+3.0
+4.0
+
+# Verify count
+query I
+SELECT COUNT(*) FROM example.double_sequence(100, 10);
+----
+100
+
+# Verify values
+query RR
+SELECT MIN(n), MAX(n) FROM example.double_sequence(100, 10);
+----
+0.0	99.0
+
+# Verify sum
+query R
+SELECT SUM(n) FROM example.double_sequence(10, 10);
+----
+45.0
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;

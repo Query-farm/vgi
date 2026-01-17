@@ -1,0 +1,64 @@
+# name: test/sql/integration/table/constant_columns/strings.test
+# description: String type tests for VGI constant_columns table function
+# group: [vgi]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ----------------------------------------------------------------------------
+# String types
+# ----------------------------------------------------------------------------
+
+# Basic string
+query T
+SELECT * FROM example.constant_columns(3, 'hello');
+----
+hello
+hello
+hello
+
+# Empty string
+query T
+SELECT * FROM example.constant_columns(2, '');
+----
+(empty)
+(empty)
+
+# String with spaces
+query T
+SELECT * FROM example.constant_columns(2, 'hello world');
+----
+hello world
+hello world
+
+# Unicode string
+query T
+SELECT * FROM example.constant_columns(2, 'héllo wörld 你好');
+----
+héllo wörld 你好
+héllo wörld 你好
+
+# Long string
+query T
+SELECT * FROM example.constant_columns(2, 'abcdefghijklmnopqrstuvwxyz0123456789');
+----
+abcdefghijklmnopqrstuvwxyz0123456789
+abcdefghijklmnopqrstuvwxyz0123456789
+
+# Multiple string columns
+query TT
+SELECT * FROM example.constant_columns(2, 'foo', 'bar');
+----
+foo	bar
+foo	bar
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;

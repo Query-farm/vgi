@@ -1,0 +1,114 @@
+# name: test/sql/integration/table/partitioned_sequence/boundaries.test
+# description: Boundary tests for VGI partitioned_sequence table function
+# group: [vgi]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ----------------------------------------------------------------------------
+# Boundary cases around vector size (2048)
+# These test that chunking across DuckDB vectors works correctly
+# ----------------------------------------------------------------------------
+
+# Just under vector size
+query IIII
+SELECT COUNT(*) as total, COUNT(DISTINCT n) as distinct_count, MIN(n) as min_val, MAX(n) as max_val
+FROM example.partitioned_sequence(2047);
+----
+2047	2047	0	2046
+
+# Exactly vector size
+query IIII
+SELECT COUNT(*) as total, COUNT(DISTINCT n) as distinct_count, MIN(n) as min_val, MAX(n) as max_val
+FROM example.partitioned_sequence(2048);
+----
+2048	2048	0	2047
+
+# Just over vector size (requires 2 vectors)
+query IIII
+SELECT COUNT(*) as total, COUNT(DISTINCT n) as distinct_count, MIN(n) as min_val, MAX(n) as max_val
+FROM example.partitioned_sequence(2049);
+----
+2049	2049	0	2048
+
+# Two full vectors
+query IIII
+SELECT COUNT(*) as total, COUNT(DISTINCT n) as distinct_count, MIN(n) as min_val, MAX(n) as max_val
+FROM example.partitioned_sequence(4096);
+----
+4096	4096	0	4095
+
+# Three vectors minus one
+query IIII
+SELECT COUNT(*) as total, COUNT(DISTINCT n) as distinct_count, MIN(n) as min_val, MAX(n) as max_val
+FROM example.partitioned_sequence(6143);
+----
+6143	6143	0	6142
+
+# ----------------------------------------------------------------------------
+# Boundary cases around default batch size (10000)
+# These test that chunking across Arrow batches works correctly
+# ----------------------------------------------------------------------------
+
+# Just under batch size
+query IIII
+SELECT COUNT(*) as total, COUNT(DISTINCT n) as distinct_count, MIN(n) as min_val, MAX(n) as max_val
+FROM example.partitioned_sequence(9999);
+----
+9999	9999	0	9998
+
+# Exactly batch size
+query IIII
+SELECT COUNT(*) as total, COUNT(DISTINCT n) as distinct_count, MIN(n) as min_val, MAX(n) as max_val
+FROM example.partitioned_sequence(10000);
+----
+10000	10000	0	9999
+
+# Just over batch size (requires 2 batches)
+query IIII
+SELECT COUNT(*) as total, COUNT(DISTINCT n) as distinct_count, MIN(n) as min_val, MAX(n) as max_val
+FROM example.partitioned_sequence(10001);
+----
+10001	10001	0	10000
+
+# Two full batches
+query IIII
+SELECT COUNT(*) as total, COUNT(DISTINCT n) as distinct_count, MIN(n) as min_val, MAX(n) as max_val
+FROM example.partitioned_sequence(20000);
+----
+20000	20000	0	19999
+
+# Multiple batches (tests work queue distribution)
+query IIII
+SELECT COUNT(*) as total, COUNT(DISTINCT n) as distinct_count, MIN(n) as min_val, MAX(n) as max_val
+FROM example.partitioned_sequence(15000);
+----
+15000	15000	0	14999
+
+# ----------------------------------------------------------------------------
+# Scale tests - verify correctness at larger sizes
+# ----------------------------------------------------------------------------
+
+# 20K values - complete sequence verification with sum check
+query IIII
+SELECT COUNT(*) as total, COUNT(DISTINCT n) as distinct_count, MIN(n) as min_val, MAX(n) as max_val
+FROM example.partitioned_sequence(20000);
+----
+20000	20000	0	19999
+
+query I
+SELECT SUM(n) = (20000::BIGINT * 19999 / 2) as sum_correct
+FROM example.partitioned_sequence(20000);
+----
+true
+
+# ----------------------------------------------------------------------------
+# Cleanup
+# ----------------------------------------------------------------------------
+
+statement ok
+DETACH example;

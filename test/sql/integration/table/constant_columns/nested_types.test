@@ -1,0 +1,237 @@
+# name: test/sql/integration/table/constant_columns/nested_types.test
+# description: Deeply nested type tests for VGI constant_columns table function
+# group: [vgi]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ----------------------------------------------------------------------------
+# Deeply nested types - Lists of lists
+# ----------------------------------------------------------------------------
+
+# 2D list (list of lists of integers)
+query I
+SELECT col_0 FROM example.constant_columns(2, [[1, 2], [3, 4], [5, 6]]);
+----
+[[1, 2], [3, 4], [5, 6]]
+[[1, 2], [3, 4], [5, 6]]
+
+# 3D list (list of lists of lists)
+query I
+SELECT col_0 FROM example.constant_columns(2, [[[1, 2], [3, 4]], [[5, 6], [7, 8]]]);
+----
+[[[1, 2], [3, 4]], [[5, 6], [7, 8]]]
+[[[1, 2], [3, 4]], [[5, 6], [7, 8]]]
+
+# Access nested list elements
+query I
+SELECT col_0[1][1] FROM example.constant_columns(3, [[10, 20], [30, 40]]);
+----
+10
+10
+10
+
+query I
+SELECT col_0[2][2] FROM example.constant_columns(3, [[10, 20], [30, 40]]);
+----
+40
+40
+40
+
+# Empty nested lists
+query I
+SELECT col_0 FROM example.constant_columns(2, [[]::INT[], [1, 2]]);
+----
+[[], [1, 2]]
+[[], [1, 2]]
+
+# ----------------------------------------------------------------------------
+# Deeply nested types - Structs of structs
+# ----------------------------------------------------------------------------
+
+# 2-level nested struct
+query I
+SELECT col_0 FROM example.constant_columns(2, {'outer': {'inner': 42}});
+----
+{'outer': {'inner': 42}}
+{'outer': {'inner': 42}}
+
+# 3-level nested struct
+query I
+SELECT col_0 FROM example.constant_columns(2, {'a': {'b': {'c': 'deep'}}});
+----
+{'a': {'b': {'c': deep}}}
+{'a': {'b': {'c': deep}}}
+
+# Access deeply nested struct fields
+query I
+SELECT col_0.outer.inner FROM example.constant_columns(3, {'outer': {'inner': 100}});
+----
+100
+100
+100
+
+query T
+SELECT col_0.a.b.c FROM example.constant_columns(3, {'a': {'b': {'c': 'value'}}});
+----
+value
+value
+value
+
+# Struct with multiple nested structs
+query I
+SELECT col_0 FROM example.constant_columns(2, {'left': {'x': 1}, 'right': {'x': 2}});
+----
+{'left': {'x': 1}, 'right': {'x': 2}}
+{'left': {'x': 1}, 'right': {'x': 2}}
+
+# ----------------------------------------------------------------------------
+# Deeply nested types - Lists of structs
+# ----------------------------------------------------------------------------
+
+# List of simple structs
+query I
+SELECT col_0 FROM example.constant_columns(2, [{'id': 1, 'name': 'a'}, {'id': 2, 'name': 'b'}]);
+----
+[{'id': 1, 'name': a}, {'id': 2, 'name': b}]
+[{'id': 1, 'name': a}, {'id': 2, 'name': b}]
+
+# List of nested structs
+query I
+SELECT col_0 FROM example.constant_columns(2, [{'data': {'value': 10}}, {'data': {'value': 20}}]);
+----
+[{'data': {'value': 10}}, {'data': {'value': 20}}]
+[{'data': {'value': 10}}, {'data': {'value': 20}}]
+
+# Access struct field from list element
+query I
+SELECT col_0[1].id FROM example.constant_columns(3, [{'id': 100, 'x': 1}, {'id': 200, 'x': 2}]);
+----
+100
+100
+100
+
+query I
+SELECT col_0[2].id FROM example.constant_columns(3, [{'id': 100, 'x': 1}, {'id': 200, 'x': 2}]);
+----
+200
+200
+200
+
+# ----------------------------------------------------------------------------
+# Deeply nested types - Structs of lists
+# ----------------------------------------------------------------------------
+
+# Struct containing multiple lists
+query I
+SELECT col_0 FROM example.constant_columns(2, {'numbers': [1, 2, 3], 'letters': ['a', 'b', 'c']});
+----
+{'numbers': [1, 2, 3], 'letters': [a, b, c]}
+{'numbers': [1, 2, 3], 'letters': [a, b, c]}
+
+# Struct containing nested list
+query I
+SELECT col_0 FROM example.constant_columns(2, {'matrix': [[1, 2], [3, 4]]});
+----
+{'matrix': [[1, 2], [3, 4]]}
+{'matrix': [[1, 2], [3, 4]]}
+
+# Access list from struct
+query I
+SELECT col_0.numbers[2] FROM example.constant_columns(3, {'numbers': [10, 20, 30]});
+----
+20
+20
+20
+
+# Struct with list of structs
+query I
+SELECT col_0 FROM example.constant_columns(2, {'items': [{'x': 1}, {'x': 2}]});
+----
+{'items': [{'x': 1}, {'x': 2}]}
+{'items': [{'x': 1}, {'x': 2}]}
+
+# ----------------------------------------------------------------------------
+# Deeply nested types - Maps with nested types
+# ----------------------------------------------------------------------------
+
+# Map with list values
+query I
+SELECT col_0 FROM example.constant_columns(2, MAP {'a': [1, 2], 'b': [3, 4]});
+----
+{a=[1, 2], b=[3, 4]}
+{a=[1, 2], b=[3, 4]}
+
+# Map with struct values
+query I
+SELECT col_0 FROM example.constant_columns(2, MAP {'key1': {'v': 1}, 'key2': {'v': 2}});
+----
+{key1={'v': 1}, key2={'v': 2}}
+{key1={'v': 1}, key2={'v': 2}}
+
+# Access nested map values
+query I
+SELECT col_0['a'][1] FROM example.constant_columns(3, MAP {'a': [100, 200], 'b': [300, 400]});
+----
+100
+100
+100
+
+# ----------------------------------------------------------------------------
+# Deeply nested types - Complex combinations
+# ----------------------------------------------------------------------------
+
+# List of maps
+query I
+SELECT col_0 FROM example.constant_columns(2, [MAP {'x': 1}, MAP {'y': 2}]);
+----
+[{x=1}, {y=2}]
+[{x=1}, {y=2}]
+
+# Struct with map field
+query I
+SELECT col_0 FROM example.constant_columns(2, {'lookup': MAP {'a': 1, 'b': 2}});
+----
+{'lookup': {a=1, b=2}}
+{'lookup': {a=1, b=2}}
+
+# Struct containing list of structs containing lists
+query I
+SELECT col_0 FROM example.constant_columns(2, {'data': [{'values': [1, 2]}, {'values': [3, 4]}]});
+----
+{'data': [{'values': [1, 2]}, {'values': [3, 4]}]}
+{'data': [{'values': [1, 2]}, {'values': [3, 4]}]}
+
+# Access deeply nested value
+query I
+SELECT col_0.data[1].values[2] FROM example.constant_columns(3, {'data': [{'values': [10, 20]}, {'values': [30, 40]}]});
+----
+20
+20
+20
+
+# 4-level deep nesting: struct -> list -> struct -> list
+query I
+SELECT col_0 FROM example.constant_columns(2, {'rows': [{'cells': [1, 2, 3]}, {'cells': [4, 5, 6]}]});
+----
+{'rows': [{'cells': [1, 2, 3]}, {'cells': [4, 5, 6]}]}
+{'rows': [{'cells': [1, 2, 3]}, {'cells': [4, 5, 6]}]}
+
+# Access 4-level deep value
+query I
+SELECT col_0.rows[2].cells[3] FROM example.constant_columns(3, {'rows': [{'cells': [1, 2, 3]}, {'cells': [4, 5, 6]}]});
+----
+6
+6
+6
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;

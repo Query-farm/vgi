@@ -1,0 +1,56 @@
+# name: test/sql/integration/table/double_sequence/joins.test
+# description: Join tests for VGI double_sequence table function
+# group: [vgi]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ----------------------------------------------------------------------------
+# Join double sequences (stress test multiple concurrent generators)
+# ----------------------------------------------------------------------------
+
+query RR
+SELECT a.n as a_val, b.n as b_val
+FROM example.double_sequence(5, 2) a, example.double_sequence(5, 3) b
+WHERE a.n = b.n
+ORDER BY a.n;
+----
+0.0	0.0
+1.0	1.0
+2.0	2.0
+3.0	3.0
+4.0	4.0
+
+# Self-join with different batch sizes
+query I
+SELECT COUNT(*) FROM example.double_sequence(100, 7) a, example.double_sequence(100, 13) b WHERE a.n = b.n;
+----
+100
+
+# ----------------------------------------------------------------------------
+# Mixed joins with integer sequence
+# ----------------------------------------------------------------------------
+
+# Join double_sequence with sequence (matching integer values)
+query RI
+SELECT d.n as double_val, s.n as int_val
+FROM example.double_sequence(5, 2) d, example.sequence(5, 3) s
+WHERE CAST(d.n AS INTEGER) = s.n
+ORDER BY d.n;
+----
+0.0	0
+1.0	1
+2.0	2
+3.0	3
+4.0	4
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;

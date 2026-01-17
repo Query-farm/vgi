@@ -1,0 +1,197 @@
+# name: test/sql/integration/scalar/sum_columns/types.test
+# description: Type tests for VGI sum_columns scalar function
+# group: [vgi]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ----------------------------------------------------------------------------
+# Type-specific tests
+# ----------------------------------------------------------------------------
+
+# INTEGER sum
+query I
+SELECT example.sum_columns(100::INTEGER, 200::INTEGER, 300::INTEGER);
+----
+600
+
+# BIGINT sum
+query I
+SELECT example.sum_columns(1000::BIGINT, 2000::BIGINT, 3000::BIGINT);
+----
+6000
+
+# DOUBLE sum
+query R
+SELECT example.sum_columns(1.5::DOUBLE, 2.5::DOUBLE, 3.0::DOUBLE);
+----
+7.0
+
+query R
+SELECT example.sum_columns(0.1::DOUBLE, 0.2::DOUBLE, 0.3::DOUBLE, 0.4::DOUBLE);
+----
+1.0
+
+# ----------------------------------------------------------------------------
+# NULL handling
+# ----------------------------------------------------------------------------
+
+# Single NULL argument
+query I
+SELECT example.sum_columns(NULL::INTEGER);
+----
+NULL
+
+# NULL mixed with values
+query I
+SELECT example.sum_columns(1, NULL, 3);
+----
+NULL
+
+query I
+SELECT example.sum_columns(NULL, 2, 3);
+----
+NULL
+
+query I
+SELECT example.sum_columns(1, 2, NULL);
+----
+NULL
+
+# Multiple NULLs
+query I
+SELECT example.sum_columns(NULL::INTEGER, NULL::INTEGER);
+----
+NULL
+
+# NULL in batch
+query I
+SELECT example.sum_columns(a, b, c) FROM (VALUES (1, 2, 3), (NULL, 5, 6), (7, 8, 9)) t(a, b, c);
+----
+6
+NULL
+24
+
+# Count non-null results
+query I
+SELECT COUNT(*) FROM (
+    SELECT example.sum_columns(a, b) AS result
+    FROM (VALUES (1, 1), (NULL, 2), (3, 3)) t(a, b)
+) WHERE result IS NOT NULL;
+----
+2
+
+# ----------------------------------------------------------------------------
+# All zeros
+# ----------------------------------------------------------------------------
+
+query I
+SELECT example.sum_columns(0, 0);
+----
+0
+
+query I
+SELECT example.sum_columns(0, 0, 0, 0, 0);
+----
+0
+
+query R
+SELECT example.sum_columns(0.0::DOUBLE, 0.0::DOUBLE, 0.0::DOUBLE);
+----
+0.0
+
+# ----------------------------------------------------------------------------
+# Cancellation (positive + negative = 0)
+# ----------------------------------------------------------------------------
+
+query I
+SELECT example.sum_columns(100, -100);
+----
+0
+
+query I
+SELECT example.sum_columns(50, -25, -25);
+----
+0
+
+query I
+SELECT example.sum_columns(10, -20, 30, -40, 20);
+----
+0
+
+query R
+SELECT example.sum_columns(1.5::DOUBLE, -0.5::DOUBLE, -1.0::DOUBLE);
+----
+0.0
+
+# ----------------------------------------------------------------------------
+# Large values
+# ----------------------------------------------------------------------------
+
+query I
+SELECT example.sum_columns(1000000000::BIGINT, 1000000000::BIGINT);
+----
+2000000000
+
+query I
+SELECT example.sum_columns(500000000::BIGINT, 500000000::BIGINT, 500000000::BIGINT);
+----
+1500000000
+
+query I
+SELECT example.sum_columns(-1000000000::BIGINT, -1000000000::BIGINT);
+----
+-2000000000
+
+# Large + small
+query I
+SELECT example.sum_columns(1000000000::BIGINT, 1::BIGINT, 1::BIGINT);
+----
+1000000002
+
+# ----------------------------------------------------------------------------
+# Small decimal values
+# ----------------------------------------------------------------------------
+
+query R
+SELECT example.sum_columns(0.001::DOUBLE, 0.002::DOUBLE, 0.003::DOUBLE);
+----
+0.006
+
+query R
+SELECT example.sum_columns(0.1::DOUBLE, 0.01::DOUBLE, 0.001::DOUBLE);
+----
+0.111
+
+# ----------------------------------------------------------------------------
+# Consistent type usage
+# ----------------------------------------------------------------------------
+
+# All DOUBLE
+query R
+SELECT example.sum_columns(10.0::DOUBLE, 0.5::DOUBLE, 20.0::DOUBLE);
+----
+30.5
+
+# All BIGINT
+query I
+SELECT example.sum_columns(100::BIGINT, 1000000::BIGINT, 50::BIGINT);
+----
+1000150
+
+# All INTEGER
+query I
+SELECT example.sum_columns(1::INTEGER, 10::INTEGER, 100::INTEGER, 1000::INTEGER);
+----
+1111
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;

@@ -1,0 +1,63 @@
+# name: test/sql/integration/table/constant_columns/integers.test
+# description: Integer type tests for VGI constant_columns table function
+# group: [vgi]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ----------------------------------------------------------------------------
+# Integer types
+# ----------------------------------------------------------------------------
+
+# Basic integers
+query I
+SELECT * FROM example.constant_columns(3, 42);
+----
+42
+42
+42
+
+# Zero
+query I
+SELECT * FROM example.constant_columns(2, 0);
+----
+0
+0
+
+# Negative integers
+query I
+SELECT * FROM example.constant_columns(2, -999);
+----
+-999
+-999
+
+# Large integers (int64 range)
+query I
+SELECT * FROM example.constant_columns(2, 9223372036854775807);
+----
+9223372036854775807
+9223372036854775807
+
+query I
+SELECT * FROM example.constant_columns(2, -9223372036854775808);
+----
+-9223372036854775808
+-9223372036854775808
+
+# Multiple integer columns
+query III
+SELECT * FROM example.constant_columns(2, 1, 2, 3);
+----
+1	2	3
+1	2	3
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;

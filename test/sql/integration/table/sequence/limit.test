@@ -1,0 +1,133 @@
+# name: test/sql/integration/table/sequence/limit.test
+# description: LIMIT tests for VGI sequence table function
+# group: [vgi]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# LIMIT tests
+# Verify LIMIT works correctly with sequences
+# ============================================================================
+
+# Small limit on large sequence - early termination
+query I
+SELECT COUNT(*) FROM (SELECT * FROM example.sequence(10000, 100) LIMIT 10);
+----
+10
+
+# Limit equals count
+query I
+SELECT COUNT(*) FROM (SELECT * FROM example.sequence(100, 10) LIMIT 100);
+----
+100
+
+# Limit larger than count - should return all rows
+query I
+SELECT COUNT(*) FROM (SELECT * FROM example.sequence(50, 10) LIMIT 1000);
+----
+50
+
+# Limit with ORDER BY - get smallest values
+query I
+SELECT * FROM example.sequence(1000, 50) ORDER BY n LIMIT 5;
+----
+0
+1
+2
+3
+4
+
+# Limit with ORDER BY DESC - get largest values
+query I
+SELECT * FROM example.sequence(1000, 50) ORDER BY n DESC LIMIT 5;
+----
+999
+998
+997
+996
+995
+
+# Limit across batch boundaries (batch size = 100)
+query I
+SELECT COUNT(*) FROM (SELECT * FROM example.sequence(5000, 100) LIMIT 350);
+----
+350
+
+# Limit with increment
+query I
+SELECT * FROM example.sequence(1000, 50, increment=5) ORDER BY n LIMIT 5;
+----
+0
+5
+10
+15
+20
+
+# LIMIT 1 - minimal result
+query I
+SELECT COUNT(*) FROM (SELECT * FROM example.sequence(10000, 100) LIMIT 1);
+----
+1
+
+# LIMIT 0 - empty result
+query I
+SELECT COUNT(*) FROM (SELECT * FROM example.sequence(10000, 100) LIMIT 0);
+----
+0
+
+# LIMIT with OFFSET
+query I
+SELECT * FROM example.sequence(100, 10) ORDER BY n LIMIT 5 OFFSET 10;
+----
+10
+11
+12
+13
+14
+
+# Large LIMIT with OFFSET near end
+query I
+SELECT * FROM example.sequence(100, 10) ORDER BY n LIMIT 10 OFFSET 95;
+----
+95
+96
+97
+98
+99
+
+# LIMIT with small batch size (batch_size=1)
+query I
+SELECT COUNT(*) FROM (SELECT * FROM example.sequence(1000, 1) LIMIT 50);
+----
+50
+
+# Verify LIMIT doesn't affect correctness of returned values
+query I
+SELECT SUM(n) = (100::BIGINT * 99 / 2) as sum_correct
+FROM (SELECT * FROM example.sequence(10000, 50) ORDER BY n LIMIT 100);
+----
+true
+
+# LIMIT with filtering
+query I
+SELECT COUNT(*) FROM (SELECT * FROM example.sequence(1000, 50) WHERE n % 2 = 0 LIMIT 25);
+----
+25
+
+# LIMIT with aggregation in subquery
+query I
+SELECT total FROM (SELECT SUM(n) as total FROM example.sequence(100, 10)) LIMIT 1;
+----
+4950
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;

@@ -1,0 +1,129 @@
+# name: test/sql/integration/table/partitioned_sequence/limits.test
+# description: LIMIT and OFFSET tests for VGI partitioned_sequence table function
+# group: [vgi]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# LIMIT tests
+# Verify LIMIT works correctly with partitioned sequences
+# ============================================================================
+
+# Small limit on large sequence - early termination
+query I
+SELECT COUNT(*) FROM (SELECT * FROM example.partitioned_sequence(20000) LIMIT 10);
+----
+10
+
+# Limit equals count
+query IIII
+SELECT COUNT(*) as total, COUNT(DISTINCT n) as distinct_count, MIN(n) as min_val, MAX(n) as max_val
+FROM (SELECT * FROM example.partitioned_sequence(100) LIMIT 100);
+----
+100	100	0	99
+
+# Limit larger than count - should return all rows
+query IIII
+SELECT COUNT(*) as total, COUNT(DISTINCT n) as distinct_count, MIN(n) as min_val, MAX(n) as max_val
+FROM (SELECT * FROM example.partitioned_sequence(50) LIMIT 1000);
+----
+50	50	0	49
+
+# Limit with ORDER BY - get smallest values
+query I
+SELECT * FROM example.partitioned_sequence(10000) ORDER BY n LIMIT 5;
+----
+0
+1
+2
+3
+4
+
+# Limit with ORDER BY DESC - get largest values
+query I
+SELECT * FROM example.partitioned_sequence(10000) ORDER BY n DESC LIMIT 5;
+----
+9999
+9998
+9997
+9996
+9995
+
+# Limit across batch boundaries (batch size = 10000)
+query I
+SELECT COUNT(*) FROM (SELECT * FROM example.partitioned_sequence(20000) LIMIT 15000);
+----
+15000
+
+# Limit with increment
+query I
+SELECT * FROM example.partitioned_sequence(1000, increment=5) ORDER BY n LIMIT 5;
+----
+0
+5
+10
+15
+20
+
+# LIMIT 1 - minimal result
+query I
+SELECT COUNT(*) FROM (SELECT * FROM example.partitioned_sequence(20000) LIMIT 1);
+----
+1
+
+# LIMIT 0 - empty result
+query I
+SELECT COUNT(*) FROM (SELECT * FROM example.partitioned_sequence(20000) LIMIT 0);
+----
+0
+
+# LIMIT with OFFSET
+query I
+SELECT * FROM example.partitioned_sequence(100) ORDER BY n LIMIT 5 OFFSET 10;
+----
+10
+11
+12
+13
+14
+
+# Large LIMIT with OFFSET near end
+query I
+SELECT * FROM example.partitioned_sequence(100) ORDER BY n LIMIT 10 OFFSET 95;
+----
+95
+96
+97
+98
+99
+
+# LIMIT with multi-threaded execution
+statement ok
+SET threads=4;
+
+query I
+SELECT COUNT(*) FROM (SELECT * FROM example.partitioned_sequence(100000) LIMIT 1000);
+----
+1000
+
+# Verify LIMIT doesn't affect correctness of returned values
+query I
+SELECT SUM(n) = (1000::BIGINT * 999 / 2) as sum_correct
+FROM (SELECT * FROM example.partitioned_sequence(100000) ORDER BY n LIMIT 1000);
+----
+true
+
+statement ok
+RESET threads;
+
+# ----------------------------------------------------------------------------
+# Cleanup
+# ----------------------------------------------------------------------------
+
+statement ok
+DETACH example;

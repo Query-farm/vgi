@@ -1,0 +1,100 @@
+# name: test/sql/integration/table/sequence/parameters.test
+# description: Parameter variation tests for VGI sequence table function
+# group: [vgi]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ----------------------------------------------------------------------------
+# Increment parameter variations
+# Tests value generation with different increments
+# ----------------------------------------------------------------------------
+
+query I
+SELECT * FROM example.sequence(5, 1000, increment=1);
+----
+0
+1
+2
+3
+4
+
+query I
+SELECT * FROM example.sequence(5, 1000, increment=10);
+----
+0
+10
+20
+30
+40
+
+query I
+SELECT * FROM example.sequence(4, 1000, increment=25);
+----
+0
+25
+50
+75
+
+# Small batch with increment
+query I
+SELECT * FROM example.sequence(5, 2, increment=3);
+----
+0
+3
+6
+9
+12
+
+# Batch size = 1 with increment
+query I
+SELECT * FROM example.sequence(4, 1, increment=100);
+----
+0
+100
+200
+300
+
+# Large increment
+query I
+SELECT SUM(n) FROM example.sequence(100, 10, increment=7);
+----
+34650
+
+# Verify increment math: sum of 0, 7, 14, 21, ..., 693 (100 terms)
+# = 7 * (0 + 1 + 2 + ... + 99) = 7 * 4950 = 34650
+
+# ----------------------------------------------------------------------------
+# Combined edge cases
+# Tests interactions between parameters
+# ----------------------------------------------------------------------------
+
+# Single row with large increment (should just return 0)
+query I
+SELECT * FROM example.sequence(1, 1, increment=1000000);
+----
+0
+
+# Two rows with increment, batch_size=1
+query I
+SELECT * FROM example.sequence(2, 1, increment=50);
+----
+0
+50
+
+# Zero rows with increment (still empty)
+query I
+SELECT COUNT(*) FROM example.sequence(0, 1, increment=100);
+----
+0
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;

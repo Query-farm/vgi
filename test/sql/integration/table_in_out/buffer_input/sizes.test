@@ -1,0 +1,131 @@
+# name: test/sql/integration/table_in_out/buffer_input/sizes.test
+# description: Size variation tests for VGI buffer_input table-in-out function
+# group: [vgi]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ----------------------------------------------------------------------------
+# Verify data integrity after buffering
+# The buffer_input should preserve all values exactly
+# ----------------------------------------------------------------------------
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT n FROM example.buffer_input((SELECT unnest(generate_series(1, 100)) AS n))
+    EXCEPT
+    SELECT unnest(generate_series(1, 100)) AS n
+);
+----
+0
+
+# All values from buffer_input should be in original set
+query I
+SELECT COUNT(*) FROM (
+    SELECT unnest(generate_series(1, 100)) AS n
+    EXCEPT
+    SELECT n FROM example.buffer_input((SELECT unnest(generate_series(1, 100)) AS n))
+);
+----
+0
+
+# Integrity check - 1000 rows (EXCEPT is expensive, so keep dataset small)
+query I
+SELECT COUNT(*) FROM (
+    SELECT n FROM example.buffer_input((SELECT unnest(generate_series(1, 1000)) AS n))
+    EXCEPT
+    SELECT unnest(generate_series(1, 1000)) AS n
+);
+----
+0
+
+# ----------------------------------------------------------------------------
+# NULLs with moderately large dataset
+# NULL for every multiple of 3: i % 3 = 0 -> NULL
+# 1000 multiples of 3 in range 1-3000, so 2000 non-null values
+# Sum(1..3000) = 4501500, Sum(multiples of 3) = 1501500
+# Sum of non-nulls = 4501500 - 1501500 = 3000000
+# ----------------------------------------------------------------------------
+
+query III
+SELECT COUNT(*), COUNT(n), SUM(n) FROM example.buffer_input((
+    SELECT CASE WHEN i % 3 = 0 THEN NULL ELSE i END AS n
+    FROM (SELECT unnest(generate_series(1, 3000)) AS i)
+));
+----
+3000	2000	3000000
+
+# ----------------------------------------------------------------------------
+# Different data types
+# ----------------------------------------------------------------------------
+
+# Strings - 1000 rows
+# Note: MAX(s) returns 'row_999' (length 7) because strings are compared lexicographically
+query II
+SELECT COUNT(*), LENGTH(MAX(s)) FROM example.buffer_input((
+    SELECT 'row_' || i::VARCHAR AS s FROM (SELECT unnest(generate_series(1, 1000)) AS i)
+));
+----
+1000	7
+
+# Mixed types
+query III
+SELECT COUNT(*), SUM(int_col), COUNT(str_col)
+FROM example.buffer_input((
+    SELECT i AS int_col, 'str_' || i::VARCHAR AS str_col, i * 1.5 AS float_col
+    FROM (SELECT unnest(generate_series(1, 1000)) AS i)
+));
+----
+1000	500500	1000
+
+# ----------------------------------------------------------------------------
+# Batch boundary edge cases
+# Exactly 2048 rows (one full batch)
+# ----------------------------------------------------------------------------
+
+query II
+SELECT COUNT(*), SUM(n) FROM example.buffer_input((SELECT unnest(generate_series(1, 2048)) AS n));
+----
+2048	2098176
+
+# 2049 rows (just over batch boundary)
+query II
+SELECT COUNT(*), SUM(n) FROM example.buffer_input((SELECT unnest(generate_series(1, 2049)) AS n));
+----
+2049	2100225
+
+# 4096 rows (exactly two batches)
+query II
+SELECT COUNT(*), SUM(n) FROM example.buffer_input((SELECT unnest(generate_series(1, 4096)) AS n));
+----
+4096	8390656
+
+# 4097 rows (just over two batches)
+query II
+SELECT COUNT(*), SUM(n) FROM example.buffer_input((SELECT unnest(generate_series(1, 4097)) AS n));
+----
+4097	8394753
+
+# ----------------------------------------------------------------------------
+# Wide table test (many columns)
+# ----------------------------------------------------------------------------
+
+query IIIIII
+SELECT COUNT(*), SUM(c1), SUM(c2), SUM(c3), SUM(c4), SUM(c5)
+FROM example.buffer_input((
+    SELECT i AS c1, i*2 AS c2, i*3 AS c3, i*4 AS c4, i*5 AS c5
+    FROM (SELECT unnest(generate_series(1, 5000)) AS i)
+));
+----
+5000	12502500	25005000	37507500	50010000	62512500
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;

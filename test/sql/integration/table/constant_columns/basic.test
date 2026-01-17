@@ -1,0 +1,63 @@
+# name: test/sql/integration/table/constant_columns/basic.test
+# description: Basic functionality tests for VGI constant_columns table function
+# group: [vgi]
+
+# This test requires a VGI worker to be available
+# Set VGI_TEST_WORKER environment variable to the path of a VGI worker executable
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# constant_columns function (varargs)
+# Generates rows with constant values from varargs arguments
+# Args: count (int >= 0), *values (any Arrow types)
+# Output: columns named col_0, col_1, col_2, etc.
+# Internal batch size: 1000 rows
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# Basic usage with simple types
+# ----------------------------------------------------------------------------
+
+# Basic integer
+query I
+SELECT * FROM example.constant_columns(3, 42);
+----
+42
+42
+42
+
+# Basic float
+query R
+SELECT * FROM example.constant_columns(3, 3.14159);
+----
+3.14159
+3.14159
+3.14159
+
+# Basic string
+query T
+SELECT * FROM example.constant_columns(3, 'hello');
+----
+hello
+hello
+hello
+
+# Basic boolean
+query T
+SELECT * FROM example.constant_columns(3, true);
+----
+true
+true
+true
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;

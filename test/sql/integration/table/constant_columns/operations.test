@@ -1,0 +1,274 @@
+# name: test/sql/integration/table/constant_columns/operations.test
+# description: SQL operations tests for VGI constant_columns table function
+# group: [vgi]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ----------------------------------------------------------------------------
+# Aggregations on various types
+# ----------------------------------------------------------------------------
+
+# Integer aggregations
+query IIRI
+SELECT SUM(col_0), COUNT(*), AVG(col_0), COUNT(DISTINCT col_0)
+FROM example.constant_columns(100, 5);
+----
+500	100	5.0	1
+
+# Float aggregations
+query RRI
+SELECT SUM(col_0), AVG(col_0), COUNT(DISTINCT col_0)
+FROM example.constant_columns(100, 2.5);
+----
+250.0	2.5	1
+
+# String aggregations
+query TTI
+SELECT MIN(col_0), MAX(col_0), COUNT(DISTINCT col_0)
+FROM example.constant_columns(100, 'hello');
+----
+hello	hello	1
+
+# Mixed type aggregations (integer and string columns only - float aggregation has known issues)
+query ITTI
+SELECT SUM(col_0), MIN(col_1), MAX(col_1), COUNT(*)
+FROM example.constant_columns(100, 10, 'text');
+----
+1000	text	text	100
+
+# Aggregations across batches
+query IIRI
+SELECT SUM(col_0), COUNT(*), AVG(col_0), COUNT(DISTINCT col_0)
+FROM example.constant_columns(2500, 4);
+----
+10000	2500	4.0	1
+
+# ----------------------------------------------------------------------------
+# Filtering on various types
+# ----------------------------------------------------------------------------
+
+# Filter on integer column
+query I
+SELECT COUNT(*) FROM example.constant_columns(100, 42) WHERE col_0 = 42;
+----
+100
+
+query I
+SELECT COUNT(*) FROM example.constant_columns(100, 42) WHERE col_0 > 40;
+----
+100
+
+query I
+SELECT COUNT(*) FROM example.constant_columns(100, 42) WHERE col_0 > 50;
+----
+0
+
+# Filter on string column
+query I
+SELECT COUNT(*) FROM example.constant_columns(100, 'hello') WHERE col_0 = 'hello';
+----
+100
+
+query I
+SELECT COUNT(*) FROM example.constant_columns(100, 'hello') WHERE col_0 LIKE 'hel%';
+----
+100
+
+query I
+SELECT COUNT(*) FROM example.constant_columns(100, 'hello') WHERE col_0 = 'goodbye';
+----
+0
+
+# Filter on float column
+query I
+SELECT COUNT(*) FROM example.constant_columns(100, 3.14) WHERE col_0 > 3.0;
+----
+100
+
+query I
+SELECT COUNT(*) FROM example.constant_columns(100, 3.14) WHERE col_0 BETWEEN 3.0 AND 4.0;
+----
+100
+
+# Filter on multiple columns
+query I
+SELECT COUNT(*) FROM example.constant_columns(100, 42, 'test')
+WHERE col_0 = 42 AND col_1 = 'test';
+----
+100
+
+query I
+SELECT COUNT(*) FROM example.constant_columns(100, 42, 'test')
+WHERE col_0 = 42 AND col_1 = 'wrong';
+----
+0
+
+# Filter across batches
+query I
+SELECT COUNT(*) FROM example.constant_columns(2500, 999, 'multi')
+WHERE col_0 = 999 AND col_1 = 'multi';
+----
+2500
+
+# ----------------------------------------------------------------------------
+# Expressions and computed columns
+# ----------------------------------------------------------------------------
+
+# Arithmetic on integer column
+query I
+SELECT col_0 * 2 FROM example.constant_columns(3, 10);
+----
+20
+20
+20
+
+# String operations
+query T
+SELECT col_0 || '_suffix' FROM example.constant_columns(3, 'prefix');
+----
+prefix_suffix
+prefix_suffix
+prefix_suffix
+
+query I
+SELECT LENGTH(col_0) FROM example.constant_columns(3, 'hello');
+----
+5
+5
+5
+
+# Arithmetic on float column
+query R
+SELECT col_0 + 1.0 FROM example.constant_columns(3, 2.5);
+----
+3.5
+3.5
+3.5
+
+# Combined expressions
+query IR
+SELECT col_0 * 10, col_1 + 0.5
+FROM example.constant_columns(3, 5, 2.0);
+----
+50	2.5
+50	2.5
+50	2.5
+
+# ----------------------------------------------------------------------------
+# Window functions
+# ----------------------------------------------------------------------------
+
+query II
+SELECT col_0, ROW_NUMBER() OVER () as rn
+FROM example.constant_columns(5, 42)
+LIMIT 5;
+----
+42	1
+42	2
+42	3
+42	4
+42	5
+
+query TI
+SELECT col_0, ROW_NUMBER() OVER () as rn
+FROM example.constant_columns(5, 'text')
+LIMIT 5;
+----
+text	1
+text	2
+text	3
+text	4
+text	5
+
+# Running sum
+query II
+SELECT col_0, SUM(col_0) OVER (ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) as running_sum
+FROM example.constant_columns(5, 10);
+----
+10	10
+10	20
+10	30
+10	40
+10	50
+
+# ----------------------------------------------------------------------------
+# Joins with different types
+# ----------------------------------------------------------------------------
+
+# Join two constant_columns tables
+query IT
+SELECT a.col_0, b.col_0
+FROM example.constant_columns(2, 100) a, example.constant_columns(3, 'text') b;
+----
+100	text
+100	text
+100	text
+100	text
+100	text
+100	text
+
+# Join with sequence
+query II
+SELECT c.col_0, s.n
+FROM example.constant_columns(1, 50) c, example.sequence(5, 10) s
+WHERE c.col_0 > s.n
+ORDER BY s.n;
+----
+50	0
+50	1
+50	2
+50	3
+50	4
+
+# ----------------------------------------------------------------------------
+# LIMIT and OFFSET
+# ----------------------------------------------------------------------------
+
+query I
+SELECT col_0 FROM example.constant_columns(100, 42) LIMIT 5;
+----
+42
+42
+42
+42
+42
+
+query T
+SELECT col_0 FROM example.constant_columns(100, 'test') LIMIT 3 OFFSET 97;
+----
+test
+test
+test
+
+query I
+SELECT COUNT(*) FROM (SELECT * FROM example.constant_columns(5000, 1, 'a') LIMIT 100);
+----
+100
+
+# ----------------------------------------------------------------------------
+# GROUP BY (somewhat trivial since all values are the same)
+# ----------------------------------------------------------------------------
+
+query II
+SELECT col_0, COUNT(*) FROM example.constant_columns(100, 42)
+GROUP BY col_0;
+----
+42	100
+
+query TI
+SELECT col_0, SUM(col_1) FROM example.constant_columns(100, 'key', 5)
+GROUP BY col_0;
+----
+key	500
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;
