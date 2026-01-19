@@ -129,6 +129,7 @@ FunctionArgumentTypes ParseFunctionArgumentSchema(ClientContext &context,
 		bool is_varargs = false;
 		bool is_table_input = false;
 		bool is_any_type = false;
+		bool is_const = false;
 		if (field->HasMetadata()) {
 			auto metadata = field->metadata();
 
@@ -153,6 +154,13 @@ FunctionArgumentTypes ParseFunctionArgumentSchema(ClientContext &context,
 				is_table_input = (value == VGI_TYPE_TABLE_VALUE);
 				is_any_type = (value == VGI_TYPE_ANY_VALUE);
 			}
+
+			// Check for const parameter marker
+			auto const_idx = metadata->FindKey(VGI_CONST_METADATA_KEY);
+			if (const_idx >= 0) {
+				auto value = metadata->value(const_idx);
+				is_const = (value == VGI_CONST_TRUE_VALUE);
+			}
 		}
 
 		// Override DuckDB type if this is an "any" type field
@@ -174,6 +182,7 @@ FunctionArgumentTypes ParseFunctionArgumentSchema(ClientContext &context,
 			// during function registration
 			result.positional_types.push_back(LogicalType::TABLE);
 			result.positional_names.push_back(col_name);
+			result.positional_is_const.push_back(false);  // Table inputs are never const
 		} else if (is_named) {
 			// Named argument - add to named_parameters map
 			result.named_parameters[col_name] = duckdb_type;
@@ -181,6 +190,7 @@ FunctionArgumentTypes ParseFunctionArgumentSchema(ClientContext &context,
 			// Positional argument
 			result.positional_types.push_back(duckdb_type);
 			result.positional_names.push_back(col_name);
+			result.positional_is_const.push_back(is_const);
 		}
 	}
 

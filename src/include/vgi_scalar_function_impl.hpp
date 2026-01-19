@@ -39,6 +39,10 @@ struct VgiScalarFunctionInfo : public ScalarFunctionInfo {
 
 	// Whether this function has a dynamic return type (vgi:any) that needs bind-time resolution
 	bool has_dynamic_return_type = false;
+
+	// Const parameter support: which positional params are constants
+	std::vector<bool> positional_is_const;
+	std::vector<std::string> positional_names;
 };
 
 // ============================================================================
@@ -60,8 +64,11 @@ struct VgiScalarFunctionBindData : public FunctionData {
 	// Actual output schema resolved during bind (with concrete types)
 	std::shared_ptr<arrow::Schema> resolved_output_schema;
 
-	// Input schema built from argument types during bind
+	// Input schema built from argument types during bind (after const params erased)
 	std::shared_ptr<arrow::Schema> input_schema;
+
+	// Extracted constant values (from const parameters erased at bind time)
+	vector<Value> const_values;
 
 	unique_ptr<FunctionData> Copy() const override {
 		auto copy = make_uniq<VgiScalarFunctionBindData>();
@@ -73,6 +80,7 @@ struct VgiScalarFunctionBindData : public FunctionData {
 		copy->settings = settings;
 		copy->resolved_output_schema = resolved_output_schema;
 		copy->input_schema = input_schema;
+		copy->const_values = const_values;
 		return copy;
 	}
 

@@ -1,5 +1,7 @@
 #include "storage/vgi_scalar_function_set.hpp"
 
+#include <algorithm>
+
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/scalar_function_catalog_entry.hpp"
 #include "duckdb/function/scalar_function.hpp"
@@ -31,8 +33,10 @@ void VgiScalarFunctionSet::LoadEntries(ClientContext &context) {
 
 	// Call schema_contents with type filter for scalar functions
 	auto worker_path = attach_params->worker_path();
-	auto args = vgi::CreateSchemaContentsArgs(attach_result->attach_id, schema_.name, vgi::SchemaObjectType::ScalarFunction);
-	vgi::CatalogMethodStream stream(worker_path, vgi::CatalogMethod::SchemaContents, args, context, attach_params->worker_debug());
+	auto args =
+	    vgi::CreateSchemaContentsArgs(attach_result->attach_id, schema_.name, vgi::SchemaObjectType::ScalarFunction);
+	vgi::CatalogMethodStream stream(worker_path, vgi::CatalogMethod::SchemaContents, args, context,
+	                                attach_params->worker_debug());
 
 	// Group functions by name (overloads)
 	std::unordered_map<std::string, std::vector<vgi::VgiFunctionInfo>> functions_by_name;
@@ -116,9 +120,18 @@ void VgiScalarFunctionSet::LoadEntries(ClientContext &context) {
 			// DuckDB's ScalarFunction doesn't have built-in named parameter support
 			ScalarFunction scalar_func(arg_types.positional_types, return_type, vgi::VgiScalarFunctionExecute);
 
-			// Mark as VOLATILE to prevent constant folding - VGI functions call external workers
-			// and cannot be evaluated at compile time
-			scalar_func.SetStability(FunctionStability::VOLATILE);
+			// Set stability from function metadata, defaulting to CONSISTENT
+			// to match the DuckDB default.
+			if (func_info.stability.has_value()) {
+				scalar_func.SetStability(func_info.stability.value());
+			} else {
+				scalar_func.SetStability(FunctionStability::CONSISTENT);
+			}
+
+			// Set null handling from function metadata (SPECIAL_HANDLING allows function to receive nulls)
+			if (func_info.null_handling.has_value()) {
+				scalar_func.null_handling = func_info.null_handling.value();
+			}
 
 			// Set varargs if this function accepts variable arguments
 			if (arg_types.has_varargs) {
@@ -134,14 +147,23 @@ void VgiScalarFunctionSet::LoadEntries(ClientContext &context) {
 			scalar_func_info->use_pool = attach_params->use_pool();
 			scalar_func_info->output_schema = func_info.output_schema;
 			scalar_func_info->has_dynamic_return_type = is_any_output;
+			scalar_func_info->positional_is_const = arg_types.positional_is_const;
+			scalar_func_info->positional_names = arg_types.positional_names;
 			// Copy settings from catalog if any
+
+			// Check if any params are const
+			bool has_const_params = std::any_of(arg_types.positional_is_const.begin(),
+			                                     arg_types.positional_is_const.end(),
+			                                     [](bool b) { return b; });
 
 			// Attach the function info and init callback
 			scalar_func.SetExtraFunctionInfo(scalar_func_info);
 			scalar_func.SetInitStateCallback(vgi::VgiScalarFunctionInitLocalState);
 
-			// For dynamic return types, attach the bind function to resolve actual type at bind time
-			if (is_any_output) {
+			// Set bind callback if:
+			// 1. Function has dynamic return type (is_any_output), OR
+			// 2. Function has const parameters that need folding
+			if (is_any_output || has_const_params) {
 				scalar_func.SetBindCallback(vgi::VgiScalarFunctionBind);
 			}
 

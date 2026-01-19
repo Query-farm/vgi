@@ -1,0 +1,143 @@
+# name: test/sql/integration/scalar/binary_packet/basic.test
+# description: Basic tests for VGI binary_packet scalar function with ConstParam
+# group: [vgi]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# binary_packet function
+# Builds binary packets with header, payload, and config metadata
+# SQL signature: binary_packet(header BLOB, payload BLOB, config STRUCT)
+# Parameters are in Python method order: (header, payload, config)
+# Returns: binary (header + payload + config.label + version byte)
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# Basic usage with constant payload
+# ----------------------------------------------------------------------------
+
+# Simple packet: header=0xCAFE, payload=0x0102, config={label: 'v1', version: 1}
+# Output: 0xCAFE + 0x0102 + 'v1' (0x7631) + 0x01 = 0xCAFE0102763101
+query I
+SELECT hex(example.binary_packet('\xCA\xFE'::BLOB, '\x01\x02'::BLOB, {label: 'v1', version: 1}));
+----
+CAFE0102763101
+
+# Different header
+query I
+SELECT hex(example.binary_packet('\xFF'::BLOB, '\x00'::BLOB, {label: 'a', version: 2}));
+----
+FF006102
+
+# Empty payload
+query I
+SELECT hex(example.binary_packet('\xAB'::BLOB, ''::BLOB, {label: 'x', version: 0}));
+----
+AB7800
+
+# ----------------------------------------------------------------------------
+# Multiple rows from table
+# ----------------------------------------------------------------------------
+
+query I
+SELECT hex(example.binary_packet('\xAA'::BLOB, data, {label: 't', version: 5}))
+FROM (VALUES ('\x01'::BLOB), ('\x02'::BLOB), ('\x03'::BLOB)) t(data);
+----
+AA017405
+AA027405
+AA037405
+
+query I
+SELECT hex(example.binary_packet('\x00'::BLOB, payload, {label: 'z', version: 9}))
+FROM (VALUES ('\xFF\xFF'::BLOB), ('\x00\x00'::BLOB)) t(payload);
+----
+00FFFF7A09
+0000007A09
+
+# ----------------------------------------------------------------------------
+# Different config values
+# ----------------------------------------------------------------------------
+
+# Version 0
+query I
+SELECT hex(example.binary_packet('\x11'::BLOB, '\x22'::BLOB, {label: 'v0', version: 0}));
+----
+1122763000
+
+# Version 255 (max byte)
+query I
+SELECT hex(example.binary_packet('\x11'::BLOB, '\x22'::BLOB, {label: 'hi', version: 255}));
+----
+11226869FF
+
+# Longer label
+query I
+SELECT hex(example.binary_packet('\x00'::BLOB, '\x00'::BLOB, {label: 'test', version: 1}));
+----
+00007465737401
+
+# ----------------------------------------------------------------------------
+# Different header sizes
+# ----------------------------------------------------------------------------
+
+# Single byte header
+query I
+SELECT hex(example.binary_packet('\xAA'::BLOB, '\xBB'::BLOB, {label: 'm', version: 1}));
+----
+AABB6D01
+
+# Multi-byte header
+query I
+SELECT hex(example.binary_packet('\x01\x02\x03\x04'::BLOB, '\xFF'::BLOB, {label: 'n', version: 2}));
+----
+01020304FF6E02
+
+# Empty header
+query I
+SELECT hex(example.binary_packet(''::BLOB, '\xDE\xAD'::BLOB, {label: 'p', version: 3}));
+----
+DEAD7003
+
+# ----------------------------------------------------------------------------
+# Larger datasets
+# ----------------------------------------------------------------------------
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT example.binary_packet('\xFF'::BLOB, '\x01'::BLOB, {label: 'b', version: 1}) AS result
+    FROM (SELECT unnest(generate_series(1, 100)) AS i)
+);
+----
+100
+
+# ----------------------------------------------------------------------------
+# Integration with other SQL operations
+# ----------------------------------------------------------------------------
+
+query II
+SELECT
+    hex(data) as input,
+    hex(example.binary_packet('\xAA\xBB'::BLOB, data, {label: 'q', version: 7})) as output
+FROM (VALUES ('\x01'::BLOB), ('\x02'::BLOB)) t(data)
+ORDER BY input;
+----
+01	AABB017107
+02	AABB027107
+
+# Check packet length (header 2 + payload 1 + label 1 + version 1 = 5)
+query I
+SELECT octet_length(example.binary_packet('\xAA\xBB'::BLOB, '\xCC'::BLOB, {label: 'x', version: 1}));
+----
+5
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;

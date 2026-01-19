@@ -51,5 +51,14 @@ constexpr const char *VGI_VARARGS_METADATA_KEY = "vgi_varargs";
 // Value for VGI_VARARGS_METADATA_KEY indicating varargs are enabled
 constexpr const char *VGI_VARARGS_TRUE_VALUE = "true";
 
+// ----------------------------------------------------------------------------
+// Const Parameter Metadata
+// ----------------------------------------------------------------------------
+// Arrow schema metadata key indicating the parameter is a constant (scalar value passed at bind time)
+constexpr const char *VGI_CONST_METADATA_KEY = "vgi_const";
+
+// Value for VGI_CONST_METADATA_KEY indicating the parameter is constant
+constexpr const char *VGI_CONST_TRUE_VALUE = "true";
+
 } // namespace vgi
 } // namespace duckdb

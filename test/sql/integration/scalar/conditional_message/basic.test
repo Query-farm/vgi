@@ -1,0 +1,169 @@
+# name: test/sql/integration/scalar/conditional_message/basic.test
+# description: Basic tests for VGI conditional_message scalar function with ConstParam
+# group: [vgi]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# conditional_message function
+# Returns repeated message when condition is true, empty string otherwise
+# SQL signature: conditional_message(repeat_count BIGINT, message VARCHAR, condition BOOLEAN)
+# Parameters are in Python method order: (repeat_count, message, condition)
+# Returns: string
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# Basic usage with constant condition
+# ----------------------------------------------------------------------------
+
+query I
+SELECT example.conditional_message(3, 'Hi', true);
+----
+HiHiHi
+
+query I
+SELECT example.conditional_message(3, 'Hello', false);
+----
+(empty)
+
+query I
+SELECT example.conditional_message(1, 'Hello', true);
+----
+Hello
+
+query I
+SELECT example.conditional_message(0, 'Test', true);
+----
+(empty)
+
+query I
+SELECT example.conditional_message(5, 'x', true);
+----
+xxxxx
+
+# ----------------------------------------------------------------------------
+# Multiple rows from table
+# ----------------------------------------------------------------------------
+
+query I
+SELECT example.conditional_message(2, 'OK', flag) FROM (VALUES (true), (false), (true)) t(flag);
+----
+OKOK
+(empty)
+OKOK
+
+query I
+SELECT example.conditional_message(3, '*', is_active) FROM (VALUES (true), (true), (false), (true)) t(is_active);
+----
+***
+***
+(empty)
+***
+
+# ----------------------------------------------------------------------------
+# Different repeat counts
+# ----------------------------------------------------------------------------
+
+query I
+SELECT example.conditional_message(1, 'A', true);
+----
+A
+
+query I
+SELECT example.conditional_message(4, '-', true);
+----
+----
+
+query I
+SELECT example.conditional_message(10, '.', true);
+----
+..........
+
+# ----------------------------------------------------------------------------
+# Different message strings
+# ----------------------------------------------------------------------------
+
+query I
+SELECT example.conditional_message(2, 'Test', true);
+----
+TestTest
+
+query I
+SELECT example.conditional_message(3, '!', true);
+----
+!!!
+
+query I
+SELECT example.conditional_message(2, 'abc', true);
+----
+abcabc
+
+# ----------------------------------------------------------------------------
+# With expressions as condition
+# ----------------------------------------------------------------------------
+
+query I
+SELECT example.conditional_message(2, 'Y', x > 5) FROM (VALUES (10), (3), (7), (1)) t(x);
+----
+YY
+(empty)
+YY
+(empty)
+
+query I
+SELECT example.conditional_message(1, 'MATCH', name = 'Alice') FROM (VALUES ('Alice'), ('Bob'), ('Alice')) t(name);
+----
+MATCH
+(empty)
+MATCH
+
+# ----------------------------------------------------------------------------
+# Larger datasets
+# ----------------------------------------------------------------------------
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT example.conditional_message(1, 'X', i % 2 = 0) AS result
+    FROM (SELECT unnest(generate_series(1, 100)) AS i)
+);
+----
+100
+
+# Count non-empty results (even numbers)
+query I
+SELECT COUNT(*) FROM (
+    SELECT example.conditional_message(1, 'X', i % 2 = 0) AS result
+    FROM (SELECT unnest(generate_series(1, 100)) AS i)
+) WHERE result != '';
+----
+50
+
+# ----------------------------------------------------------------------------
+# Integration with other SQL operations
+# ----------------------------------------------------------------------------
+
+query II
+SELECT flag, example.conditional_message(2, 'ON', flag) AS status
+FROM (VALUES (true), (false), (true)) t(flag)
+ORDER BY flag DESC;
+----
+true	ONON
+true	ONON
+false	(empty)
+
+query I
+SELECT LENGTH(example.conditional_message(5, 'abc', true));
+----
+15
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;

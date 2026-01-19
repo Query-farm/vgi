@@ -91,6 +91,7 @@ ArrowArguments BuildArgumentsFromValues(ClientContext &context, const vector<Val
 struct FunctionArgumentTypes {
 	vector<LogicalType> positional_types;
 	vector<string> positional_names;
+	vector<bool> positional_is_const;  // Parallel to positional_types: true if param is a constant
 	case_insensitive_map_t<LogicalType> named_parameters;
 	// Varargs support: if has_varargs is true, function accepts additional arguments of varargs_type
 	bool has_varargs = false;
