@@ -468,6 +468,12 @@ public:
 		return data_finished_;
 	}
 
+	// Mark the data phase as finished (for scalar functions after sending finalize)
+	// This allows the connection to be pooled without reading a FINISHED status
+	void MarkDataFinished() {
+		data_finished_ = true;
+	}
+
 	// Check if the worker requested more input (table-in-out functions only)
 	// This is set when ReadDataBatch receives a batch with vgi.status = NEED_MORE_INPUT
 	// After sending more input via WriteInputBatch(), call ClearNeedsMoreInput() and continue reading

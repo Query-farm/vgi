@@ -1,5 +1,5 @@
-# name: test/sql/integration/scalar/sum_columns/scale.test_slow
-# description: Scale tests for VGI sum_columns scalar function (5000+ rows)
+# name: test/sql/integration/scalar/sum_values/scale.test_slow
+# description: Scale tests for VGI sum_values scalar function (5000+ rows)
 # group: [vgi]
 
 require-env VGI_TEST_WORKER
@@ -15,7 +15,7 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
 query I
 SELECT COUNT(*) FROM (
-    SELECT example.sum_columns(i::INTEGER, i::INTEGER, i::INTEGER) AS result
+    SELECT example.sum_values(i::INTEGER, i::INTEGER, i::INTEGER) AS result
     FROM (SELECT unnest(generate_series(1, 100)) AS i)
 );
 ----
@@ -24,7 +24,7 @@ SELECT COUNT(*) FROM (
 # Verify values are correct (sum of i + i + i = 3*i)
 query I
 SELECT COUNT(*) FROM (
-    SELECT i::INTEGER AS val, example.sum_columns(i::INTEGER, i::INTEGER, i::INTEGER) AS summed
+    SELECT i::INTEGER AS val, example.sum_values(i::INTEGER, i::INTEGER, i::INTEGER) AS summed
     FROM (SELECT unnest(generate_series(1, 50)) AS i)
 ) WHERE summed = val * 3;
 ----
@@ -46,10 +46,10 @@ SELECT COUNT(*) FROM large_triplets;
 ----
 5000
 
-# Run sum_columns on all rows (3 columns)
+# Run sum_values on all rows (3 columns)
 query I
 SELECT COUNT(*) FROM (
-    SELECT example.sum_columns(col_a, col_b, col_c) AS result
+    SELECT example.sum_values(col_a, col_b, col_c) AS result
     FROM large_triplets
 );
 ----
@@ -58,7 +58,7 @@ SELECT COUNT(*) FROM (
 # Verify all sums are correct (i + 2i + 3i = 6i)
 query I
 SELECT COUNT(*) FROM (
-    SELECT id, example.sum_columns(col_a, col_b, col_c) AS sum_result
+    SELECT id, example.sum_values(col_a, col_b, col_c) AS sum_result
     FROM large_triplets
 ) WHERE sum_result = id * 6;
 ----
@@ -67,7 +67,7 @@ SELECT COUNT(*) FROM (
 # Test with filtering
 query I
 SELECT COUNT(*) FROM (
-    SELECT example.sum_columns(col_a, col_b, col_c) AS result
+    SELECT example.sum_values(col_a, col_b, col_c) AS result
     FROM large_triplets
     WHERE id <= 2500
 );
@@ -77,7 +77,7 @@ SELECT COUNT(*) FROM (
 # Test with aggregation
 # Sum of 6*i for i=1 to 100 = 6 * (100 * 101 / 2) = 30300
 query I
-SELECT SUM(example.sum_columns(col_a, col_b, col_c))
+SELECT SUM(example.sum_values(col_a, col_b, col_c))
 FROM large_triplets
 WHERE id <= 100;
 ----
@@ -89,10 +89,10 @@ CREATE TABLE large_quads AS
 SELECT i AS col_a, i AS col_b, i AS col_c, i AS col_d, i AS id
 FROM (SELECT unnest(generate_series(1, 5000)) AS i);
 
-# Run sum_columns with 4 columns
+# Run sum_values with 4 columns
 query I
 SELECT COUNT(*) FROM (
-    SELECT example.sum_columns(col_a, col_b, col_c, col_d) AS result
+    SELECT example.sum_values(col_a, col_b, col_c, col_d) AS result
     FROM large_quads
 );
 ----
@@ -101,7 +101,7 @@ SELECT COUNT(*) FROM (
 # All sums should be 4*i
 query I
 SELECT COUNT(*) FROM (
-    SELECT id, example.sum_columns(col_a, col_b, col_c, col_d) AS sum_result
+    SELECT id, example.sum_values(col_a, col_b, col_c, col_d) AS sum_result
     FROM large_quads
 ) WHERE sum_result = id * 4;
 ----
@@ -113,10 +113,10 @@ CREATE TABLE large_double_triplets AS
 SELECT (i * 0.1)::DOUBLE AS col_a, (i * 0.2)::DOUBLE AS col_b, (i * 0.3)::DOUBLE AS col_c, i AS id
 FROM (SELECT unnest(generate_series(1, 5000)) AS i);
 
-# Run sum_columns on all double rows
+# Run sum_values on all double rows
 query I
 SELECT COUNT(*) FROM (
-    SELECT example.sum_columns(col_a, col_b, col_c) AS result
+    SELECT example.sum_values(col_a, col_b, col_c) AS result
     FROM large_double_triplets
 );
 ----
@@ -125,7 +125,7 @@ SELECT COUNT(*) FROM (
 # Verify sums with tolerance (0.1i + 0.2i + 0.3i = 0.6i)
 query I
 SELECT COUNT(*) FROM (
-    SELECT id, col_a, col_b, col_c, example.sum_columns(col_a, col_b, col_c) AS sum_result
+    SELECT id, col_a, col_b, col_c, example.sum_values(col_a, col_b, col_c) AS sum_result
     FROM large_double_triplets
 ) WHERE ABS(sum_result - (id * 0.6)) < 0.0001;
 ----

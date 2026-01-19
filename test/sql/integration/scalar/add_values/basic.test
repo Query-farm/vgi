@@ -1,0 +1,132 @@
+# name: test/sql/integration/scalar/add_values/basic.test
+# description: Basic tests for VGI add_values scalar function
+# group: [vgi]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# add_values function
+# Adds two numeric columns together
+# Args: col1 (numeric), col2 (numeric)
+# Returns: numeric (sum, promoted type)
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# Basic integer tests
+# ----------------------------------------------------------------------------
+
+query I
+SELECT example.add_values(1, 2);
+----
+3
+
+query I
+SELECT example.add_values(10, 20);
+----
+30
+
+query I
+SELECT example.add_values(0, 0);
+----
+0
+
+query I
+SELECT example.add_values(-5, 10);
+----
+5
+
+query I
+SELECT example.add_values(-10, -5);
+----
+-15
+
+# ----------------------------------------------------------------------------
+# Multiple rows from table
+# ----------------------------------------------------------------------------
+
+query I
+SELECT example.add_values(a, b) FROM (VALUES (1, 10), (2, 20), (3, 30)) t(a, b);
+----
+11
+22
+33
+
+query I
+SELECT example.add_values(x, y) FROM (VALUES (5, 5), (10, 10), (15, 15)) t(x, y) ORDER BY x;
+----
+10
+20
+30
+
+# ----------------------------------------------------------------------------
+# Larger datasets
+# ----------------------------------------------------------------------------
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT example.add_values(i::INTEGER, i::INTEGER) AS result
+    FROM (SELECT unnest(generate_series(1, 100)) AS i)
+);
+----
+100
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT example.add_values(i::INTEGER, (100 - i)::INTEGER) AS result
+    FROM (SELECT unnest(generate_series(1, 500)) AS i)
+);
+----
+500
+
+# All should equal 100 (i + (100 - i) = 100)
+query I
+SELECT COUNT(*) FROM (
+    SELECT example.add_values(i::INTEGER, (100 - i)::INTEGER) AS result
+    FROM (SELECT unnest(generate_series(1, 50)) AS i)
+) WHERE result = 100;
+----
+50
+
+# ----------------------------------------------------------------------------
+# Integration with other SQL operations
+# ----------------------------------------------------------------------------
+
+query III
+SELECT a, b, example.add_values(a, b) AS sum
+FROM (VALUES (1, 2), (3, 4), (5, 6)) t(a, b)
+ORDER BY a;
+----
+1	2	3
+3	4	7
+5	6	11
+
+query I
+SELECT SUM(example.add_values(a, b)) FROM (VALUES (1, 1), (2, 2), (3, 3)) t(a, b);
+----
+12
+
+# ----------------------------------------------------------------------------
+# With expressions
+# ----------------------------------------------------------------------------
+
+query I
+SELECT example.add_values(10 + 5, 20 + 5);
+----
+40
+
+query I
+SELECT example.add_values(x * 2, y * 3) FROM (VALUES (5, 10)) t(x, y);
+----
+40
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;

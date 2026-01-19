@@ -1,5 +1,5 @@
-# name: test/sql/integration/scalar/sum_columns/varargs.test
-# description: Varargs tests for VGI sum_columns scalar function
+# name: test/sql/integration/scalar/sum_values/varargs.test
+# description: Varargs tests for VGI sum_values scalar function
 # group: [vgi]
 
 require-env VGI_TEST_WORKER
@@ -15,49 +15,49 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
 # 3 arguments
 query I
-SELECT example.sum_columns(10, 20, 30);
+SELECT example.sum_values(10, 20, 30);
 ----
 60
 
 # 4 arguments
 query I
-SELECT example.sum_columns(1, 2, 3, 4);
+SELECT example.sum_values(1, 2, 3, 4);
 ----
 10
 
 # 5 arguments
 query I
-SELECT example.sum_columns(10, 20, 30, 40, 50);
+SELECT example.sum_values(10, 20, 30, 40, 50);
 ----
 150
 
 # 6 arguments
 query I
-SELECT example.sum_columns(1, 2, 3, 4, 5, 6);
+SELECT example.sum_values(1, 2, 3, 4, 5, 6);
 ----
 21
 
 # 7 arguments
 query I
-SELECT example.sum_columns(1, 2, 3, 4, 5, 6, 7);
+SELECT example.sum_values(1, 2, 3, 4, 5, 6, 7);
 ----
 28
 
 # 8 arguments
 query I
-SELECT example.sum_columns(1, 2, 3, 4, 5, 6, 7, 8);
+SELECT example.sum_values(1, 2, 3, 4, 5, 6, 7, 8);
 ----
 36
 
 # 10 arguments
 query I
-SELECT example.sum_columns(1, 2, 3, 4, 5, 6, 7, 8, 9, 10);
+SELECT example.sum_values(1, 2, 3, 4, 5, 6, 7, 8, 9, 10);
 ----
 55
 
 # 10 identical values
 query I
-SELECT example.sum_columns(10, 10, 10, 10, 10, 10, 10, 10, 10, 10);
+SELECT example.sum_values(10, 10, 10, 10, 10, 10, 10, 10, 10, 10);
 ----
 100
 
@@ -66,22 +66,22 @@ SELECT example.sum_columns(10, 10, 10, 10, 10, 10, 10, 10, 10, 10);
 # ----------------------------------------------------------------------------
 
 query I
-SELECT example.sum_columns(42);
+SELECT example.sum_values(42);
 ----
 42
 
 query I
-SELECT example.sum_columns(0);
+SELECT example.sum_values(0);
 ----
 0
 
 query I
-SELECT example.sum_columns(-100);
+SELECT example.sum_values(-100);
 ----
 -100
 
 query R
-SELECT example.sum_columns(3.14::DOUBLE);
+SELECT example.sum_values(3.14::DOUBLE);
 ----
 3.14
 
@@ -91,19 +91,19 @@ SELECT example.sum_columns(3.14::DOUBLE);
 
 # Sum of 1 to 5 (= 15)
 query I
-SELECT example.sum_columns(1, 2, 3, 4, 5);
+SELECT example.sum_values(1, 2, 3, 4, 5);
 ----
 15
 
 # Sum of powers of 2
 query I
-SELECT example.sum_columns(1, 2, 4, 8, 16);
+SELECT example.sum_values(1, 2, 4, 8, 16);
 ----
 31
 
 # Alternating signs
 query I
-SELECT example.sum_columns(1, -2, 3, -4, 5);
+SELECT example.sum_values(1, -2, 3, -4, 5);
 ----
 3
 

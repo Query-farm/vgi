@@ -121,7 +121,10 @@ std::unique_ptr<PooledWorker> VgiWorkerPool::TryAcquire(const std::string &worke
 }
 
 void VgiWorkerPool::Release(std::unique_ptr<PooledWorker> worker, size_t max_pool_size) {
-	if (!worker || !worker->IsAlive()) {
+	if (!worker) {
+		return;
+	}
+	if (!worker->IsAlive()) {
 		return; // Don't pool dead workers
 	}
 

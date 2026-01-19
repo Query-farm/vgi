@@ -14,6 +14,7 @@
 #include "vgi_catalog_api.hpp"
 #include "vgi_catalogs.hpp"
 #include "vgi_logging.hpp"
+#include "vgi_profiling.hpp"
 #include "vgi_protocol.hpp"
 #include "vgi_table_function.hpp"
 #include "vgi_worker_pool_functions.hpp"
@@ -102,6 +103,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// Ignore SIGPIPE - we handle broken pipes via EPIPE error from write()
 	// This prevents the process from being killed when a worker dies unexpectedly
 	std::signal(SIGPIPE, SIG_IGN);
+
+	// Register profiling atexit handler if VGI_PROFILE is enabled
+	vgi::VgiProfileRegisterAtExit();
 
 	// Register VGI log type
 	auto &log_manager = loader.GetDatabaseInstance().GetLogManager();

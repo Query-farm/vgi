@@ -1,0 +1,137 @@
+# name: test/sql/integration/scalar/random_int/basic.test
+# description: Basic tests for VGI random_int scalar function
+# group: [vgi]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# random_int function
+# Generates random integers (demonstrates VOLATILE stability)
+# Args: min_val (int), max_val (int)
+# Returns: int64
+# Uses FunctionStability.VOLATILE - non-deterministic
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# Basic usage with range [0, 100]
+# ----------------------------------------------------------------------------
+
+# Single value in range
+query I
+SELECT CASE WHEN example.random_int(0, 100) BETWEEN 0 AND 100 THEN 1 ELSE 0 END;
+----
+1
+
+query I
+SELECT CASE WHEN example.random_int(0, 100) >= 0 AND example.random_int(0, 100) <= 100 THEN 1 ELSE 0 END;
+----
+1
+
+# ----------------------------------------------------------------------------
+# Custom range
+# ----------------------------------------------------------------------------
+
+# Range [1, 10]
+query I
+SELECT CASE WHEN example.random_int(1, 10) BETWEEN 1 AND 10 THEN 1 ELSE 0 END;
+----
+1
+
+# Range [50, 60]
+query I
+SELECT CASE WHEN example.random_int(50, 60) BETWEEN 50 AND 60 THEN 1 ELSE 0 END;
+----
+1
+
+# Negative range
+query I
+SELECT CASE WHEN example.random_int(-100, -50) BETWEEN -100 AND -50 THEN 1 ELSE 0 END;
+----
+1
+
+# Range spanning zero
+query I
+SELECT CASE WHEN example.random_int(-10, 10) BETWEEN -10 AND 10 THEN 1 ELSE 0 END;
+----
+1
+
+# ----------------------------------------------------------------------------
+# Multiple rows
+# ----------------------------------------------------------------------------
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT example.random_int(0, 100) AS r
+    FROM (SELECT unnest(generate_series(1, 10)) AS i)
+) WHERE r BETWEEN 0 AND 100;
+----
+10
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT example.random_int(1, 5) AS r
+    FROM (SELECT unnest(generate_series(1, 20)) AS i)
+) WHERE r BETWEEN 1 AND 5;
+----
+20
+
+# ----------------------------------------------------------------------------
+# Larger datasets
+# ----------------------------------------------------------------------------
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT example.random_int(0, 1000) AS result
+    FROM (SELECT unnest(generate_series(1, 100)) AS i)
+) WHERE result BETWEEN 0 AND 1000;
+----
+100
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT example.random_int(-500, 500) AS result
+    FROM (SELECT unnest(generate_series(1, 200)) AS i)
+) WHERE result BETWEEN -500 AND 500;
+----
+200
+
+# ----------------------------------------------------------------------------
+# Integration with other SQL operations
+# ----------------------------------------------------------------------------
+
+# Aggregations work correctly
+query I
+SELECT COUNT(example.random_int(0, 100)) FROM (VALUES (1), (2), (3), (4), (5)) t(x);
+----
+5
+
+# MIN/MAX should be within bounds
+query I
+SELECT CASE WHEN MIN(r) >= 0 AND MAX(r) <= 100 THEN 1 ELSE 0 END
+FROM (
+    SELECT example.random_int(0, 100) AS r
+    FROM (SELECT unnest(generate_series(1, 50)) AS i)
+);
+----
+1
+
+query I
+SELECT CASE WHEN MIN(r) >= 10 AND MAX(r) <= 20 THEN 1 ELSE 0 END
+FROM (
+    SELECT example.random_int(10, 20) AS r
+    FROM (SELECT unnest(generate_series(1, 100)) AS i)
+);
+----
+1
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;

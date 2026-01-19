@@ -1,0 +1,159 @@
+# name: test/sql/integration/scalar/null_handling/basic.test
+# description: Basic tests for VGI null_handling scalar function
+# group: [vgi]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# null_handling function
+# Returns value if not null, otherwise returns -5000
+# Uses NullHandling.SPECIAL to receive null values in batches
+# Args: value (int64)
+# Returns: int64
+# Note: Scalar NULL is short-circuited by DuckDB before reaching the function
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# Basic non-null pass-through
+# ----------------------------------------------------------------------------
+
+query I
+SELECT example.null_handling(1);
+----
+1
+
+query I
+SELECT example.null_handling(42);
+----
+42
+
+query I
+SELECT example.null_handling(0);
+----
+0
+
+query I
+SELECT example.null_handling(-100);
+----
+-100
+
+# ----------------------------------------------------------------------------
+# NULL handling in batches (NullHandling.SPECIAL)
+# When NULL is part of a batch, the function receives it and returns -5000
+# ----------------------------------------------------------------------------
+
+query I
+SELECT example.null_handling(val) FROM (VALUES (1), (NULL), (3)) t(val);
+----
+1
+-5000
+3
+
+query I
+SELECT example.null_handling(val) FROM (VALUES (NULL), (2), (NULL)) t(val);
+----
+-5000
+2
+-5000
+
+# All nulls in batch (need explicit cast for VALUES with all NULLs)
+query I
+SELECT example.null_handling(val::BIGINT) FROM (VALUES (NULL), (NULL), (NULL)) t(val);
+----
+-5000
+-5000
+-5000
+
+# All non-nulls in batch
+query I
+SELECT example.null_handling(val) FROM (VALUES (10), (20), (30)) t(val);
+----
+10
+20
+30
+
+# ----------------------------------------------------------------------------
+# Multiple rows from table
+# ----------------------------------------------------------------------------
+
+query I
+SELECT example.null_handling(x) FROM (VALUES (1), (2), (3), (4), (5)) t(x);
+----
+1
+2
+3
+4
+5
+
+query I
+SELECT example.null_handling(val) FROM (VALUES (100), (200), (300)) t(val) ORDER BY val;
+----
+100
+200
+300
+
+# ----------------------------------------------------------------------------
+# Larger datasets with conditional nulls
+# ----------------------------------------------------------------------------
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT example.null_handling(i::INTEGER) AS result
+    FROM (SELECT unnest(generate_series(1, 100)) AS i)
+);
+----
+100
+
+# Verify non-null values pass through
+query I
+SELECT COUNT(*) FROM (
+    SELECT i::INTEGER AS val, example.null_handling(i::INTEGER) AS result
+    FROM (SELECT unnest(generate_series(1, 50)) AS i)
+) WHERE result = val;
+----
+50
+
+# ----------------------------------------------------------------------------
+# Integration with other SQL operations
+# ----------------------------------------------------------------------------
+
+query II
+SELECT val, example.null_handling(val) AS processed
+FROM (VALUES (5), (10), (15)) t(val)
+ORDER BY val;
+----
+5	5
+10	10
+15	15
+
+query I
+SELECT SUM(example.null_handling(x)) FROM (VALUES (1), (2), (3)) t(x);
+----
+6
+
+# Sum including null replacement
+query I
+SELECT SUM(example.null_handling(val)) FROM (VALUES (10), (NULL), (30)) t(val);
+----
+-4960
+
+# Count with null handling
+query I
+SELECT COUNT(*) FROM (
+    SELECT example.null_handling(val) AS result
+    FROM (VALUES (1), (NULL), (2), (NULL), (3)) t(val)
+) WHERE result = -5000;
+----
+2
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;

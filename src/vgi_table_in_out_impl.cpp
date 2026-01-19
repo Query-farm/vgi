@@ -183,9 +183,16 @@ unique_ptr<FunctionData> VgiTableInOutBind(ClientContext &context, TableFunction
 	// Create the connection and perform bind
 	// Try pool first
 	std::unique_ptr<FunctionConnection> connection;
+	bool from_pool = false;
 	if (bind_data->use_pool) {
 		auto pooled = VgiWorkerPool::Instance().TryAcquire(bind_data->worker_path);
 		if (pooled) {
+			from_pool = true;
+			VGI_LOG(context, "table_in_out.pool_acquire",
+			        {{"worker_path", bind_data->worker_path},
+			         {"function_name", bind_data->function_name},
+			         {"from_pool", "true"},
+			         {"pid", std::to_string(pooled->GetPid())}});
 			connection = std::make_unique<FunctionConnection>(std::move(pooled), bind_data->function_name,
 			                                                   bind_data->arguments, bind_data->attach_id, context,
 			                                                   std::vector<uint8_t>{}, bind_data->worker_debug,
@@ -197,6 +204,12 @@ unique_ptr<FunctionData> VgiTableInOutBind(ClientContext &context, TableFunction
 		                                                   bind_data->arguments, bind_data->attach_id, context,
 		                                                   std::vector<uint8_t>{}, bind_data->worker_debug,
 		                                                   bind_data->settings);
+		if (!from_pool) {
+			VGI_LOG(context, "table_in_out.pool_acquire",
+			        {{"worker_path", bind_data->worker_path},
+			         {"function_name", bind_data->function_name},
+			         {"from_pool", "false"}});
+		}
 	}
 
 	// Set the input schema for table-in-out functions
@@ -475,6 +488,10 @@ OperatorFinalizeResultType VgiTableInOutFinalize(ExecutionContext &context, Tabl
 			if (global_state.connection->CanBePooled()) {
 				auto pooled = global_state.connection->ReleaseForPooling();
 				if (pooled) {
+					VGI_LOG(client_context, "table_in_out.pool_release",
+					        {{"worker_path", bind_data.worker_path},
+					         {"function_name", bind_data.function_name},
+					         {"pid", std::to_string(pooled->GetPid())}});
 					VgiWorkerPool::Instance().Release(std::move(pooled), 10);
 				}
 			}
@@ -501,6 +518,10 @@ OperatorFinalizeResultType VgiTableInOutFinalize(ExecutionContext &context, Tabl
 		if (global_state.connection->CanBePooled()) {
 			auto pooled = global_state.connection->ReleaseForPooling();
 			if (pooled) {
+				VGI_LOG(client_context, "table_in_out.pool_release",
+				        {{"worker_path", bind_data.worker_path},
+				         {"function_name", bind_data.function_name},
+				         {"pid", std::to_string(pooled->GetPid())}});
 				VgiWorkerPool::Instance().Release(std::move(pooled), 10);
 			}
 		}
@@ -562,6 +583,10 @@ OperatorFinalizeResultType VgiTableInOutFinalize(ExecutionContext &context, Tabl
 		if (global_state.connection->CanBePooled()) {
 			auto pooled = global_state.connection->ReleaseForPooling();
 			if (pooled) {
+				VGI_LOG(client_context, "table_in_out.pool_release",
+				        {{"worker_path", bind_data.worker_path},
+				         {"function_name", bind_data.function_name},
+				         {"pid", std::to_string(pooled->GetPid())}});
 				VgiWorkerPool::Instance().Release(std::move(pooled), 10);
 			}
 		}

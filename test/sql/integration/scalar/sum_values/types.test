@@ -1,5 +1,5 @@
-# name: test/sql/integration/scalar/sum_columns/types.test
-# description: Type tests for VGI sum_columns scalar function
+# name: test/sql/integration/scalar/sum_values/types.test
+# description: Type tests for VGI sum_values scalar function
 # group: [vgi]
 
 require-env VGI_TEST_WORKER
@@ -15,24 +15,24 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
 # INTEGER sum
 query I
-SELECT example.sum_columns(100::INTEGER, 200::INTEGER, 300::INTEGER);
+SELECT example.sum_values(100::INTEGER, 200::INTEGER, 300::INTEGER);
 ----
 600
 
 # BIGINT sum
 query I
-SELECT example.sum_columns(1000::BIGINT, 2000::BIGINT, 3000::BIGINT);
+SELECT example.sum_values(1000::BIGINT, 2000::BIGINT, 3000::BIGINT);
 ----
 6000
 
 # DOUBLE sum
 query R
-SELECT example.sum_columns(1.5::DOUBLE, 2.5::DOUBLE, 3.0::DOUBLE);
+SELECT example.sum_values(1.5::DOUBLE, 2.5::DOUBLE, 3.0::DOUBLE);
 ----
 7.0
 
 query R
-SELECT example.sum_columns(0.1::DOUBLE, 0.2::DOUBLE, 0.3::DOUBLE, 0.4::DOUBLE);
+SELECT example.sum_values(0.1::DOUBLE, 0.2::DOUBLE, 0.3::DOUBLE, 0.4::DOUBLE);
 ----
 1.0
 
@@ -42,35 +42,35 @@ SELECT example.sum_columns(0.1::DOUBLE, 0.2::DOUBLE, 0.3::DOUBLE, 0.4::DOUBLE);
 
 # Single NULL argument
 query I
-SELECT example.sum_columns(NULL::INTEGER);
+SELECT example.sum_values(NULL::INTEGER);
 ----
 NULL
 
 # NULL mixed with values
 query I
-SELECT example.sum_columns(1, NULL, 3);
+SELECT example.sum_values(1, NULL, 3);
 ----
 NULL
 
 query I
-SELECT example.sum_columns(NULL, 2, 3);
+SELECT example.sum_values(NULL, 2, 3);
 ----
 NULL
 
 query I
-SELECT example.sum_columns(1, 2, NULL);
+SELECT example.sum_values(1, 2, NULL);
 ----
 NULL
 
 # Multiple NULLs
 query I
-SELECT example.sum_columns(NULL::INTEGER, NULL::INTEGER);
+SELECT example.sum_values(NULL::INTEGER, NULL::INTEGER);
 ----
 NULL
 
 # NULL in batch
 query I
-SELECT example.sum_columns(a, b, c) FROM (VALUES (1, 2, 3), (NULL, 5, 6), (7, 8, 9)) t(a, b, c);
+SELECT example.sum_values(a, b, c) FROM (VALUES (1, 2, 3), (NULL, 5, 6), (7, 8, 9)) t(a, b, c);
 ----
 6
 NULL
@@ -79,7 +79,7 @@ NULL
 # Count non-null results
 query I
 SELECT COUNT(*) FROM (
-    SELECT example.sum_columns(a, b) AS result
+    SELECT example.sum_values(a, b) AS result
     FROM (VALUES (1, 1), (NULL, 2), (3, 3)) t(a, b)
 ) WHERE result IS NOT NULL;
 ----
@@ -90,17 +90,17 @@ SELECT COUNT(*) FROM (
 # ----------------------------------------------------------------------------
 
 query I
-SELECT example.sum_columns(0, 0);
+SELECT example.sum_values(0, 0);
 ----
 0
 
 query I
-SELECT example.sum_columns(0, 0, 0, 0, 0);
+SELECT example.sum_values(0, 0, 0, 0, 0);
 ----
 0
 
 query R
-SELECT example.sum_columns(0.0::DOUBLE, 0.0::DOUBLE, 0.0::DOUBLE);
+SELECT example.sum_values(0.0::DOUBLE, 0.0::DOUBLE, 0.0::DOUBLE);
 ----
 0.0
 
@@ -109,22 +109,22 @@ SELECT example.sum_columns(0.0::DOUBLE, 0.0::DOUBLE, 0.0::DOUBLE);
 # ----------------------------------------------------------------------------
 
 query I
-SELECT example.sum_columns(100, -100);
+SELECT example.sum_values(100, -100);
 ----
 0
 
 query I
-SELECT example.sum_columns(50, -25, -25);
+SELECT example.sum_values(50, -25, -25);
 ----
 0
 
 query I
-SELECT example.sum_columns(10, -20, 30, -40, 20);
+SELECT example.sum_values(10, -20, 30, -40, 20);
 ----
 0
 
 query R
-SELECT example.sum_columns(1.5::DOUBLE, -0.5::DOUBLE, -1.0::DOUBLE);
+SELECT example.sum_values(1.5::DOUBLE, -0.5::DOUBLE, -1.0::DOUBLE);
 ----
 0.0
 
@@ -133,23 +133,23 @@ SELECT example.sum_columns(1.5::DOUBLE, -0.5::DOUBLE, -1.0::DOUBLE);
 # ----------------------------------------------------------------------------
 
 query I
-SELECT example.sum_columns(1000000000::BIGINT, 1000000000::BIGINT);
+SELECT example.sum_values(1000000000::BIGINT, 1000000000::BIGINT);
 ----
 2000000000
 
 query I
-SELECT example.sum_columns(500000000::BIGINT, 500000000::BIGINT, 500000000::BIGINT);
+SELECT example.sum_values(500000000::BIGINT, 500000000::BIGINT, 500000000::BIGINT);
 ----
 1500000000
 
 query I
-SELECT example.sum_columns(-1000000000::BIGINT, -1000000000::BIGINT);
+SELECT example.sum_values(-1000000000::BIGINT, -1000000000::BIGINT);
 ----
 -2000000000
 
 # Large + small
 query I
-SELECT example.sum_columns(1000000000::BIGINT, 1::BIGINT, 1::BIGINT);
+SELECT example.sum_values(1000000000::BIGINT, 1::BIGINT, 1::BIGINT);
 ----
 1000000002
 
@@ -158,12 +158,12 @@ SELECT example.sum_columns(1000000000::BIGINT, 1::BIGINT, 1::BIGINT);
 # ----------------------------------------------------------------------------
 
 query R
-SELECT example.sum_columns(0.001::DOUBLE, 0.002::DOUBLE, 0.003::DOUBLE);
+SELECT example.sum_values(0.001::DOUBLE, 0.002::DOUBLE, 0.003::DOUBLE);
 ----
 0.006
 
 query R
-SELECT example.sum_columns(0.1::DOUBLE, 0.01::DOUBLE, 0.001::DOUBLE);
+SELECT example.sum_values(0.1::DOUBLE, 0.01::DOUBLE, 0.001::DOUBLE);
 ----
 0.111
 
@@ -173,19 +173,19 @@ SELECT example.sum_columns(0.1::DOUBLE, 0.01::DOUBLE, 0.001::DOUBLE);
 
 # All DOUBLE
 query R
-SELECT example.sum_columns(10.0::DOUBLE, 0.5::DOUBLE, 20.0::DOUBLE);
+SELECT example.sum_values(10.0::DOUBLE, 0.5::DOUBLE, 20.0::DOUBLE);
 ----
 30.5
 
 # All BIGINT
 query I
-SELECT example.sum_columns(100::BIGINT, 1000000::BIGINT, 50::BIGINT);
+SELECT example.sum_values(100::BIGINT, 1000000::BIGINT, 50::BIGINT);
 ----
 1000150
 
 # All INTEGER
 query I
-SELECT example.sum_columns(1::INTEGER, 10::INTEGER, 100::INTEGER, 1000::INTEGER);
+SELECT example.sum_values(1::INTEGER, 10::INTEGER, 100::INTEGER, 1000::INTEGER);
 ----
 1111
 

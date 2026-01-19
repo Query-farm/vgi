@@ -1,0 +1,138 @@
+# name: test/sql/integration/scalar/polars/sum_values.test
+# description: Tests for VGI polars_sum_values scalar function
+# group: [vgi]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# polars_sum_values function
+# Sums multiple numeric values using Polars (varargs)
+# Args: values (float64...) - variable number of float64 arguments
+# Returns: float64 (sum)
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# Basic sum tests
+# ----------------------------------------------------------------------------
+
+query R
+SELECT example.polars_sum_values(1, 2, 3);
+----
+6.0
+
+query R
+SELECT example.polars_sum_values(10, 20, 30, 40);
+----
+100.0
+
+query R
+SELECT example.polars_sum_values(1, 2, 3, 4, 5);
+----
+15.0
+
+# ----------------------------------------------------------------------------
+# Two arguments (minimum)
+# ----------------------------------------------------------------------------
+
+query R
+SELECT example.polars_sum_values(5, 10);
+----
+15.0
+
+query R
+SELECT example.polars_sum_values(100, 200);
+----
+300.0
+
+# ----------------------------------------------------------------------------
+# With negative numbers
+# ----------------------------------------------------------------------------
+
+query R
+SELECT example.polars_sum_values(-1, 2, -3);
+----
+-2.0
+
+query R
+SELECT example.polars_sum_values(10, -5, 10, -5);
+----
+10.0
+
+# Cancellation
+query R
+SELECT example.polars_sum_values(100, -50, -50);
+----
+0.0
+
+# ----------------------------------------------------------------------------
+# With zeros
+# ----------------------------------------------------------------------------
+
+query R
+SELECT example.polars_sum_values(0, 0, 0);
+----
+0.0
+
+query R
+SELECT example.polars_sum_values(1, 0, 2, 0, 3);
+----
+6.0
+
+# ----------------------------------------------------------------------------
+# Floating point values
+# ----------------------------------------------------------------------------
+
+query R
+SELECT example.polars_sum_values(1.5, 2.5, 3.0);
+----
+7.0
+
+query R
+SELECT example.polars_sum_values(0.1, 0.2, 0.3);
+----
+0.6
+
+# ----------------------------------------------------------------------------
+# Multiple rows from table
+# ----------------------------------------------------------------------------
+
+query R
+SELECT example.polars_sum_values(a, b, c) FROM (VALUES (1, 2, 3), (4, 5, 6), (7, 8, 9)) t(a, b, c);
+----
+6.0
+15.0
+24.0
+
+# ----------------------------------------------------------------------------
+# Larger datasets
+# ----------------------------------------------------------------------------
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT example.polars_sum_values(a::DOUBLE, b::DOUBLE, c::DOUBLE) AS result
+    FROM (VALUES (1, 2, 3), (4, 5, 6), (7, 8, 9), (10, 11, 12)) t(a, b, c)
+) WHERE result > 0;
+----
+4
+
+# ----------------------------------------------------------------------------
+# Integration with other SQL operations
+# ----------------------------------------------------------------------------
+
+query R
+SELECT SUM(example.polars_sum_values(a, b, c))
+FROM (VALUES (1, 1, 1), (2, 2, 2), (3, 3, 3)) t(a, b, c);
+----
+18.0
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;

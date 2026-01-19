@@ -1,0 +1,76 @@
+# name: test/sql/integration/scalar/random_int/scale.test_slow
+# description: Scale tests for VGI random_int scalar function
+# group: [vgi]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# random_int function - scale tests
+# Verify behavior with larger datasets
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# Large dataset - all values in range
+# ----------------------------------------------------------------------------
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT example.random_int(1, 1000) AS result
+    FROM (SELECT unnest(generate_series(1, 1000)) AS i)
+) WHERE result BETWEEN 1 AND 1000;
+----
+1000
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT example.random_int(-1000, 1000) AS result
+    FROM (SELECT unnest(generate_series(1, 2000)) AS i)
+) WHERE result BETWEEN -1000 AND 1000;
+----
+2000
+
+# ----------------------------------------------------------------------------
+# Verify bounds are respected at scale
+# ----------------------------------------------------------------------------
+
+query I
+SELECT CASE WHEN MIN(r) >= 1 AND MAX(r) <= 10 THEN 1 ELSE 0 END
+FROM (
+    SELECT example.random_int(1, 10) AS r
+    FROM (SELECT unnest(generate_series(1, 500)) AS i)
+);
+----
+1
+
+query I
+SELECT CASE WHEN MIN(r) >= -100 AND MAX(r) <= 100 THEN 1 ELSE 0 END
+FROM (
+    SELECT example.random_int(-100, 100) AS r
+    FROM (SELECT unnest(generate_series(1, 1000)) AS i)
+);
+----
+1
+
+# ----------------------------------------------------------------------------
+# Multiple batches (larger than typical batch size)
+# ----------------------------------------------------------------------------
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT example.random_int(0, 100) AS result
+    FROM (SELECT unnest(generate_series(1, 5000)) AS i)
+) WHERE result BETWEEN 0 AND 100;
+----
+5000
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;

@@ -1,5 +1,5 @@
-# name: test/sql/integration/scalar/sum_columns/basic.test
-# description: Basic tests for VGI sum_columns scalar function
+# name: test/sql/integration/scalar/sum_values/basic.test
+# description: Basic tests for VGI sum_values scalar function
 # group: [vgi]
 
 require-env VGI_TEST_WORKER
@@ -10,7 +10,7 @@ statement ok
 ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
 # ============================================================================
-# sum_columns function
+# sum_values function
 # Sums multiple numeric columns together (varargs)
 # Args: columns... (numeric, varargs)
 # Returns: numeric (sum, promoted type)
@@ -21,22 +21,22 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 # ----------------------------------------------------------------------------
 
 query I
-SELECT example.sum_columns(10, 20);
+SELECT example.sum_values(10, 20);
 ----
 30
 
 query I
-SELECT example.sum_columns(0, 0);
+SELECT example.sum_values(0, 0);
 ----
 0
 
 query I
-SELECT example.sum_columns(-10, 20);
+SELECT example.sum_values(-10, 20);
 ----
 10
 
 query I
-SELECT example.sum_columns(-10, -20);
+SELECT example.sum_values(-10, -20);
 ----
 -30
 
@@ -45,14 +45,14 @@ SELECT example.sum_columns(-10, -20);
 # ----------------------------------------------------------------------------
 
 query I
-SELECT example.sum_columns(a, b, c) FROM (VALUES (1, 2, 3), (4, 5, 6), (7, 8, 9)) t(a, b, c);
+SELECT example.sum_values(a, b, c) FROM (VALUES (1, 2, 3), (4, 5, 6), (7, 8, 9)) t(a, b, c);
 ----
 6
 15
 24
 
 query I
-SELECT example.sum_columns(x, y) FROM (VALUES (10, 1), (20, 2), (30, 3)) t(x, y) ORDER BY x;
+SELECT example.sum_values(x, y) FROM (VALUES (10, 1), (20, 2), (30, 3)) t(x, y) ORDER BY x;
 ----
 11
 22
@@ -63,7 +63,7 @@ SELECT example.sum_columns(x, y) FROM (VALUES (10, 1), (20, 2), (30, 3)) t(x, y)
 # ----------------------------------------------------------------------------
 
 query IIII
-SELECT a, b, c, example.sum_columns(a, b, c) AS total
+SELECT a, b, c, example.sum_values(a, b, c) AS total
 FROM (VALUES (1, 2, 3), (4, 5, 6), (7, 8, 9)) t(a, b, c)
 ORDER BY a;
 ----
@@ -72,7 +72,7 @@ ORDER BY a;
 7	8	9	24
 
 query I
-SELECT SUM(example.sum_columns(a, b)) FROM (VALUES (1, 1), (2, 2), (3, 3)) t(a, b);
+SELECT SUM(example.sum_values(a, b)) FROM (VALUES (1, 1), (2, 2), (3, 3)) t(a, b);
 ----
 12
 
@@ -81,12 +81,12 @@ SELECT SUM(example.sum_columns(a, b)) FROM (VALUES (1, 1), (2, 2), (3, 3)) t(a, 
 # ----------------------------------------------------------------------------
 
 query I
-SELECT example.sum_columns(10 + 5, 20 + 5, 30 + 5);
+SELECT example.sum_values(10 + 5, 20 + 5, 30 + 5);
 ----
 75
 
 query I
-SELECT example.sum_columns(x * 2, y * 2, z * 2) FROM (VALUES (5, 10, 15)) t(x, y, z);
+SELECT example.sum_values(x * 2, y * 2, z * 2) FROM (VALUES (5, 10, 15)) t(x, y, z);
 ----
 60
 
