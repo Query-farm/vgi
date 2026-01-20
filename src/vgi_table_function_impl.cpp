@@ -4,7 +4,23 @@
 #include "vgi_logging.hpp"
 #include "vgi_protocol.hpp"
 
+#include "duckdb/common/arrow/arrow_appender.hpp"
+#include "duckdb/common/arrow/arrow_converter.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/function/table/arrow.hpp"
+#include "duckdb/planner/filter/conjunction_filter.hpp"
+#include "duckdb/planner/filter/constant_filter.hpp"
+#include "duckdb/planner/filter/in_filter.hpp"
+#include "duckdb/planner/filter/null_filter.hpp"
+#include "duckdb/planner/filter/struct_filter.hpp"
+#include "duckdb/planner/table_filter.hpp"
+
+#include "yyjson.hpp"
+
+#include <arrow/c/bridge.h>
+#include <arrow/ipc/writer.h>
+
+using namespace duckdb_yyjson; // NOLINT
 
 namespace duckdb {
 namespace vgi {
@@ -51,15 +67,6 @@ void PerformVgiTableFunctionBind(ClientContext &context, VgiTableFunctionBindDat
 		}
 		features_str += f;
 	}
-	VGI_LOG(context, "table_function.bind_result",
-	        {{"worker_path", bind_data.worker_path},
-	         {"worker_pid", std::to_string(bind_data.bind_connection->GetPid())},
-	         {"function_name", bind_data.function_name},
-	         {"invocation_id", bind_data.invocation_id_hex},
-	         {"max_processes", std::to_string(bind_data.max_processes)},
-	         {"cardinality_estimate", std::to_string(bind_data.cardinality_estimate)},
-	         {"active_features", features_str},
-	         {"num_columns", std::to_string(output_spec.output_schema->num_fields())}});
 
 	// bind_connection is preserved for reuse in InitGlobal
 
@@ -70,6 +77,295 @@ void PerformVgiTableFunctionBind(ClientContext &context, VgiTableFunctionBindDat
 	} catch (const std::exception &e) {
 		throw IOException("Failed to convert output schema for function '%s': %s", bind_data.function_name, e.what());
 	}
+
+	bind_data.all_column_names = names;
+
+	VGI_LOG(context, "table_function.bind_result",
+	        {{"worker_path", bind_data.worker_path},
+	         {"worker_pid", std::to_string(bind_data.bind_connection->GetPid())},
+	         {"function_name", bind_data.function_name},
+	         {"invocation_id", bind_data.invocation_id_hex},
+	         {"max_processes", std::to_string(bind_data.max_processes)},
+	         {"cardinality_estimate", std::to_string(bind_data.cardinality_estimate)},
+	         {"active_features", features_str},
+	         {"num_columns", std::to_string(output_spec.output_schema->num_fields())}});
+}
+
+// ============================================================================
+// FilterSerializer - Builds JSON filter structure and collects values
+// ============================================================================
+
+namespace {
+
+//! Convert ExpressionType to operator string for JSON
+const char *ExpressionTypeToOp(ExpressionType type) {
+	switch (type) {
+	case ExpressionType::COMPARE_EQUAL:
+		return "eq";
+	case ExpressionType::COMPARE_NOTEQUAL:
+		return "ne";
+	case ExpressionType::COMPARE_GREATERTHAN:
+		return "gt";
+	case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+		return "ge";
+	case ExpressionType::COMPARE_LESSTHAN:
+		return "lt";
+	case ExpressionType::COMPARE_LESSTHANOREQUALTO:
+		return "le";
+	default:
+		return "unknown";
+	}
+}
+
+//! FilterSerializer walks the filter tree, builds JSON, and collects values
+class FilterSerializer {
+public:
+	FilterSerializer(const string &worker_path) : doc_(yyjson_mut_doc_new(nullptr)), worker_path_(worker_path) {
+	}
+
+	~FilterSerializer() {
+		if (doc_) {
+			yyjson_mut_doc_free(doc_);
+		}
+	}
+
+	//! Serialize a single filter for a column
+	yyjson_mut_val *SerializeColumnFilter(idx_t column_index, const string &column_name, const TableFilter &filter) {
+		auto obj = yyjson_mut_obj(doc_);
+		yyjson_mut_obj_add_strcpy(doc_, obj, "column_name", column_name.c_str());
+		yyjson_mut_obj_add_uint(doc_, obj, "column_index", column_index);
+
+		SerializeFilterInto(obj, filter);
+		return obj;
+	}
+
+	//! Get the collected values
+	const vector<Value> &GetValues() const {
+		return values_;
+	}
+
+	//! Get the collected value types
+	const vector<LogicalType> &GetValueTypes() const {
+		return value_types_;
+	}
+
+	//! Write the JSON to a string (caller must free with free())
+	char *WriteJson(yyjson_mut_val *root) {
+		return yyjson_mut_val_write(root, 0, nullptr);
+	}
+
+	//! Get the document for creating arrays
+	yyjson_mut_doc *GetDoc() {
+		return doc_;
+	}
+
+private:
+	//! Serialize filter fields into an existing object
+	void SerializeFilterInto(yyjson_mut_val *obj, const TableFilter &filter) {
+		switch (filter.filter_type) {
+		case TableFilterType::CONSTANT_COMPARISON: {
+			auto &const_filter = filter.Cast<ConstantFilter>();
+			yyjson_mut_obj_add_str(doc_, obj, "type", "constant");
+			yyjson_mut_obj_add_str(doc_, obj, "op", ExpressionTypeToOp(const_filter.comparison_type));
+			yyjson_mut_obj_add_uint(doc_, obj, "value_ref", AddValue(const_filter.constant));
+			break;
+		}
+		case TableFilterType::IS_NULL: {
+			yyjson_mut_obj_add_str(doc_, obj, "type", "is_null");
+			break;
+		}
+		case TableFilterType::IS_NOT_NULL: {
+			yyjson_mut_obj_add_str(doc_, obj, "type", "is_not_null");
+			break;
+		}
+		case TableFilterType::IN_FILTER: {
+			auto &in_filter = filter.Cast<InFilter>();
+			yyjson_mut_obj_add_str(doc_, obj, "type", "in");
+			yyjson_mut_obj_add_uint(doc_, obj, "value_ref", AddListValue(in_filter.values));
+			break;
+		}
+		case TableFilterType::CONJUNCTION_AND: {
+			auto &conj_filter = filter.Cast<ConjunctionAndFilter>();
+			yyjson_mut_obj_add_str(doc_, obj, "type", "and");
+			auto children = yyjson_mut_arr(doc_);
+			for (auto &child : conj_filter.child_filters) {
+				auto child_obj = yyjson_mut_obj(doc_);
+				SerializeFilterInto(child_obj, *child);
+				yyjson_mut_arr_append(children, child_obj);
+			}
+			yyjson_mut_obj_add_val(doc_, obj, "children", children);
+			break;
+		}
+		case TableFilterType::CONJUNCTION_OR: {
+			auto &conj_filter = filter.Cast<ConjunctionOrFilter>();
+			yyjson_mut_obj_add_str(doc_, obj, "type", "or");
+			auto children = yyjson_mut_arr(doc_);
+			for (auto &child : conj_filter.child_filters) {
+				auto child_obj = yyjson_mut_obj(doc_);
+				SerializeFilterInto(child_obj, *child);
+				yyjson_mut_arr_append(children, child_obj);
+			}
+			yyjson_mut_obj_add_val(doc_, obj, "children", children);
+			break;
+		}
+		case TableFilterType::STRUCT_EXTRACT: {
+			auto &struct_filter = filter.Cast<StructFilter>();
+			yyjson_mut_obj_add_str(doc_, obj, "type", "struct");
+			yyjson_mut_obj_add_uint(doc_, obj, "child_index", struct_filter.child_idx);
+			yyjson_mut_obj_add_strcpy(doc_, obj, "child_name", struct_filter.child_name.c_str());
+			auto child_filter_obj = yyjson_mut_obj(doc_);
+			SerializeFilterInto(child_filter_obj, *struct_filter.child_filter);
+			yyjson_mut_obj_add_val(doc_, obj, "child_filter", child_filter_obj);
+			break;
+		}
+		case TableFilterType::DYNAMIC_FILTER: {
+			throw InvalidInputException(
+			    "VGI filter pushdown failed for worker '%s': DynamicFilter cannot be serialized because the filter "
+			    "value mutates during query execution (e.g., TOP-N optimization)",
+			    worker_path_);
+		}
+		case TableFilterType::EXPRESSION_FILTER: {
+			throw InvalidInputException(
+			    "VGI filter pushdown failed for worker '%s': ExpressionFilter cannot be serialized because it "
+			    "contains an expression tree that may reference functions unavailable in the worker",
+			    worker_path_);
+		}
+		case TableFilterType::BLOOM_FILTER: {
+			throw InvalidInputException(
+			    "VGI filter pushdown failed for worker '%s': BloomFilter cannot be serialized because it contains a "
+			    "large binary buffer from join optimization",
+			    worker_path_);
+		}
+		case TableFilterType::OPTIONAL_FILTER: {
+			throw InvalidInputException(
+			    "VGI filter pushdown failed for worker '%s': OptionalFilter cannot be serialized (internal filter "
+			    "type)",
+			    worker_path_);
+		}
+		default: {
+			throw InvalidInputException(
+			    "VGI filter pushdown failed for worker '%s': unknown filter type %d cannot be serialized",
+			    worker_path_, static_cast<int>(filter.filter_type));
+		}
+		}
+	}
+
+	//! Add a value and return its reference index
+	idx_t AddValue(const Value &value) {
+		idx_t ref = values_.size();
+		values_.push_back(value);
+		value_types_.push_back(value.type());
+		return ref;
+	}
+
+	//! Add a list value from multiple values (for IN filters) and return its reference index
+	idx_t AddListValue(const vector<Value> &list_values) {
+		// All values in an IN filter have the same type
+		auto element_type = list_values[0].type();
+		auto list_type = LogicalType::LIST(element_type);
+		auto list_value = Value::LIST(element_type, list_values);
+
+		idx_t ref = values_.size();
+		values_.push_back(list_value);
+		value_types_.push_back(list_type);
+		return ref;
+	}
+
+	yyjson_mut_doc *doc_;
+	string worker_path_;
+	vector<Value> values_;
+	vector<LogicalType> value_types_;
+};
+
+} // anonymous namespace
+
+// ============================================================================
+// Serialize Filters - Convert TableFilterSet to Arrow IPC bytes for worker
+// ============================================================================
+
+std::shared_ptr<arrow::Buffer> VgiSerializeFilters(ClientContext &context, const vector<column_t> &column_ids,
+                                                   optional_ptr<TableFilterSet> filters,
+                                                   const vector<string> &column_names, const string &worker_path) {
+	// Return nullptr if no filters
+	if (!filters || filters->filters.empty()) {
+		return nullptr;
+	}
+
+	// Build JSON filter structure and collect values
+	FilterSerializer serializer(worker_path);
+	auto filter_array = yyjson_mut_arr(serializer.GetDoc());
+
+	for (auto &entry : filters->filters) {
+		idx_t col_idx = entry.first;
+		auto &filter = *entry.second;
+
+		// Get column name (use index if out of bounds)
+		string col_name = col_idx < column_names.size() ? column_names[col_idx] : std::to_string(col_idx);
+
+		auto filter_obj = serializer.SerializeColumnFilter(col_idx, col_name, filter);
+		yyjson_mut_arr_append(filter_array, filter_obj);
+	}
+
+	// Write JSON string
+	char *json_str = serializer.WriteJson(filter_array);
+	if (!json_str) {
+		throw IOException("Failed to serialize filters to JSON");
+	}
+	string filter_spec(json_str);
+	free(json_str);
+
+	// Build Arrow RecordBatch with filter_spec + value columns
+	auto &values = serializer.GetValues();
+	auto &value_types = serializer.GetValueTypes();
+
+	// Build types and names: filter_spec (VARCHAR) + value columns
+	vector<LogicalType> types;
+	vector<string> names;
+	types.push_back(LogicalType::VARCHAR);
+	names.push_back("filter_spec");
+	for (idx_t i = 0; i < value_types.size(); i++) {
+		types.push_back(value_types[i]);
+		names.push_back("_val_" + std::to_string(i));
+	}
+
+	// Create single-row DataChunk and populate
+	DataChunk chunk;
+	chunk.Initialize(Allocator::DefaultAllocator(), types);
+	chunk.SetCardinality(1);
+	chunk.SetValue(0, 0, Value(filter_spec));
+	for (idx_t i = 0; i < values.size(); i++) {
+		chunk.SetValue(i + 1, 0, values[i]);
+	}
+
+	// Convert to Arrow via ArrowAppender
+	ClientProperties client_props = context.GetClientProperties();
+	ArrowAppender appender(types, 1, client_props, ArrowTypeExtensionData::GetExtensionTypes(context, types));
+	appender.Append(chunk, 0, 1, 1);
+	ArrowArray arr = appender.Finalize();
+
+	// Build Arrow schema
+	ArrowSchema c_schema;
+	ArrowConverter::ToArrowSchema(&c_schema, types, names, client_props);
+
+	// Add version metadata to filter_spec field (field 0)
+	// Arrow C API metadata format: int32 num_entries, then pairs of (int32 key_len, key, int32 val_len, val)
+	// For simplicity, we'll add it to the schema-level metadata
+	// TODO: Add field-level metadata for vgi_filter_version
+
+	// Import to Arrow C++ RecordBatch
+	auto import_result = arrow::ImportRecordBatch(&arr, &c_schema);
+	if (!import_result.ok()) {
+		throw IOException("Failed to import filter RecordBatch: %s", import_result.status().ToString());
+	}
+	auto record_batch = import_result.ValueUnsafe();
+
+	// Serialize to Arrow IPC
+	auto ipc_result = arrow::ipc::SerializeRecordBatch(*record_batch, arrow::ipc::IpcWriteOptions::Defaults());
+	if (!ipc_result.ok()) {
+		throw IOException("Failed to serialize filter RecordBatch to IPC: %s", ipc_result.status().ToString());
+	}
+
+	return ipc_result.ValueUnsafe();
 }
 
 // ============================================================================
@@ -89,8 +385,28 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 	// Move connection from bind phase (bind already completed, skip redundant handshake)
 	auto connection = std::move(bind_data.bind_connection);
 
-	// Perform init phase (Streams 3-4) with projection pushdown
-	auto init_result = connection->PerformInit(projection_ids);
+	// Serialize the filters (returns nullptr if no filters or if serialization fails)
+	std::shared_ptr<arrow::Buffer> filter_bytes;
+	try {
+		filter_bytes =
+		    VgiSerializeFilters(context, input.column_ids, input.filters, bind_data.all_column_names, bind_data.worker_path);
+		if (filter_bytes) {
+			VGI_LOG(context, "table_function.filters_serialized",
+			        {{"function_name", bind_data.function_name},
+			         {"invocation_id", bind_data.invocation_id_hex},
+			         {"filter_bytes_size", std::to_string(filter_bytes->size())}});
+		}
+	} catch (const InvalidInputException &e) {
+		// Filter contains unsupported types - skip pushdown, let DuckDB filter locally
+		VGI_LOG(context, "table_function.filter_pushdown_skipped",
+		        {{"function_name", bind_data.function_name},
+		         {"invocation_id", bind_data.invocation_id_hex},
+		         {"reason", e.what()}});
+		filter_bytes = nullptr;
+	}
+
+	// Perform init phase (Streams 3-4) with projection and filter pushdown
+	auto init_result = connection->PerformInit(projection_ids, filter_bytes);
 
 	auto global_state = make_uniq<VgiTableFunctionGlobalState>();
 	global_state->global_execution_id = std::move(init_result.global_execution_identifier);

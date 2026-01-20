@@ -904,7 +904,7 @@ std::shared_ptr<arrow::Schema> FunctionConnection::PerformBind(int32_t &max_proc
 }
 
 InitResultData FunctionConnection::PerformInit(const std::vector<int32_t> &projection_ids,
-                                                const std::string &pushdown_filters) {
+                                                std::shared_ptr<arrow::Buffer> pushdown_filters) {
 	if (!bind_done_) {
 		ThrowVgiIOException("FunctionConnection::PerformInit called before PerformBind", worker_path_,
 		                    proc_ ? proc_->GetPid() : -1, GetInvocationIdHex());

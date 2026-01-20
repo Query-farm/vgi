@@ -420,11 +420,11 @@ public:
 	// After this call, the connection is ready to read data
 	// For table functions only:
 	//   projection_ids: optional list of column indices for projection pushdown
-	//   pushdown_filters: optional filter expression string for filter pushdown
+	//   pushdown_filters: Arrow IPC bytes of filter RecordBatch (nullptr if no filters)
 	// For scalar/table-in-out functions, these parameters are omitted from the init message
 	// Returns InitResultData containing global_execution_identifier for multi-worker coordination
 	InitResultData PerformInit(const std::vector<int32_t> &projection_ids = {},
-	                           const std::string &pushdown_filters = "");
+	                           std::shared_ptr<arrow::Buffer> pushdown_filters = nullptr);
 
 	// Phase 2 (secondary worker): Skip init handshake for secondary workers
 	// The Python worker's secondary worker path doesn't do InitInput/InitResult exchange,

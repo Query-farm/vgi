@@ -97,8 +97,9 @@ std::shared_ptr<arrow::RecordBatch> CreateFunctionInvocationFull(
 // Create InitInput batch (Stream 3)
 // For table functions, this includes projection_ids and pushdown_filters
 // For scalar/table-in-out functions, projection_ids and pushdown_filters are omitted
+// pushdown_filters: Arrow IPC bytes of filter RecordBatch (nullptr if no filters)
 std::shared_ptr<arrow::RecordBatch> CreateInitInput(const std::vector<int32_t> &projection_ids = {},
-                                                     const std::string &pushdown_filters = "");
+                                                     std::shared_ptr<arrow::Buffer> pushdown_filters = nullptr);
 
 // Parse OutputSpec response (Stream 2)
 OutputSpecResult ParseOutputSpec(const std::shared_ptr<arrow::RecordBatch> &batch);

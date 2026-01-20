@@ -60,6 +60,8 @@ struct VgiTableFunctionBindData : public TableFunctionData {
 	// Whether this function supports projection pushdown (from FunctionInfo)
 	bool projection_pushdown = false;
 
+	vector<string> all_column_names;
+
 	// Connection from bind phase, persisted for reuse in InitGlobal.
 	// Mutable to allow InitGlobal to move it out (bind_data is const after bind).
 	mutable std::unique_ptr<FunctionConnection> bind_connection;
@@ -77,7 +79,7 @@ struct VgiTableFunctionGlobalState : public GlobalTableFunctionState {
 	idx_t max_processes = 1;
 
 	// Progress tracking (atomic for thread safety with progress callback)
-	std::atomic<idx_t> rows_read{0};
+	std::atomic<idx_t> rows_read {0};
 
 	// Primary connection (moved from bind_data during InitGlobal)
 	// Protected by mutex for thread-safe handoff to first InitLocal caller.
@@ -143,6 +145,17 @@ private:
 //! Returns the output schema from the worker.
 void PerformVgiTableFunctionBind(ClientContext &context, VgiTableFunctionBindData &bind_data,
                                  vector<LogicalType> &return_types, vector<string> &names);
+
+//! Serialize filters to Arrow IPC bytes for worker.
+//! Returns nullptr if filters is empty/null.
+//! Throws InvalidInputException if filters contain unsupported types (e.g., DynamicFilter, BloomFilter).
+//! The returned RecordBatch has:
+//!   - Column 0: filter_spec (string) - JSON-encoded filter structure
+//!   - Columns 1..N: Values referenced by filters, with exact Arrow types
+//! Version is stored in Arrow schema metadata on filter_spec field: {"vgi_filter_version": "1"}
+std::shared_ptr<arrow::Buffer> VgiSerializeFilters(ClientContext &context, const vector<column_t> &column_ids,
+                                                   optional_ptr<TableFilterSet> filters,
+                                                   const vector<string> &column_names, const string &worker_path);
 
 //! Init global function - creates primary connection and performs init handshake
 unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &context, TableFunctionInitInput &input);
