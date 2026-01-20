@@ -18,6 +18,7 @@
 #include "yyjson.hpp"
 
 #include <arrow/c/bridge.h>
+#include <arrow/io/memory.h>
 #include <arrow/ipc/writer.h>
 
 using namespace duckdb_yyjson; // NOLINT
@@ -135,7 +136,7 @@ public:
 		yyjson_mut_obj_add_strcpy(doc_, obj, "column_name", column_name.c_str());
 		yyjson_mut_obj_add_uint(doc_, obj, "column_index", column_index);
 
-		SerializeFilterInto(obj, filter);
+		SerializeFilterInto(obj, filter, column_index, column_name);
 		return obj;
 	}
 
@@ -161,7 +162,9 @@ public:
 
 private:
 	//! Serialize filter fields into an existing object
-	void SerializeFilterInto(yyjson_mut_val *obj, const TableFilter &filter) {
+	//! column_index and column_name are passed through for child filters in conjunctions
+	void SerializeFilterInto(yyjson_mut_val *obj, const TableFilter &filter, idx_t column_index,
+	                         const string &column_name) {
 		switch (filter.filter_type) {
 		case TableFilterType::CONSTANT_COMPARISON: {
 			auto &const_filter = filter.Cast<ConstantFilter>();
@@ -190,7 +193,10 @@ private:
 			auto children = yyjson_mut_arr(doc_);
 			for (auto &child : conj_filter.child_filters) {
 				auto child_obj = yyjson_mut_obj(doc_);
-				SerializeFilterInto(child_obj, *child);
+				// Children inherit column_name and column_index from parent
+				yyjson_mut_obj_add_strcpy(doc_, child_obj, "column_name", column_name.c_str());
+				yyjson_mut_obj_add_uint(doc_, child_obj, "column_index", column_index);
+				SerializeFilterInto(child_obj, *child, column_index, column_name);
 				yyjson_mut_arr_append(children, child_obj);
 			}
 			yyjson_mut_obj_add_val(doc_, obj, "children", children);
@@ -202,7 +208,10 @@ private:
 			auto children = yyjson_mut_arr(doc_);
 			for (auto &child : conj_filter.child_filters) {
 				auto child_obj = yyjson_mut_obj(doc_);
-				SerializeFilterInto(child_obj, *child);
+				// Children inherit column_name and column_index from parent
+				yyjson_mut_obj_add_strcpy(doc_, child_obj, "column_name", column_name.c_str());
+				yyjson_mut_obj_add_uint(doc_, child_obj, "column_index", column_index);
+				SerializeFilterInto(child_obj, *child, column_index, column_name);
 				yyjson_mut_arr_append(children, child_obj);
 			}
 			yyjson_mut_obj_add_val(doc_, obj, "children", children);
@@ -214,7 +223,10 @@ private:
 			yyjson_mut_obj_add_uint(doc_, obj, "child_index", struct_filter.child_idx);
 			yyjson_mut_obj_add_strcpy(doc_, obj, "child_name", struct_filter.child_name.c_str());
 			auto child_filter_obj = yyjson_mut_obj(doc_);
-			SerializeFilterInto(child_filter_obj, *struct_filter.child_filter);
+			// Struct child filter inherits column info from parent struct column
+			yyjson_mut_obj_add_strcpy(doc_, child_filter_obj, "column_name", column_name.c_str());
+			yyjson_mut_obj_add_uint(doc_, child_filter_obj, "column_index", column_index);
+			SerializeFilterInto(child_filter_obj, *struct_filter.child_filter, column_index, column_name);
 			yyjson_mut_obj_add_val(doc_, obj, "child_filter", child_filter_obj);
 			break;
 		}
@@ -343,14 +355,9 @@ std::shared_ptr<arrow::Buffer> VgiSerializeFilters(ClientContext &context, const
 	appender.Append(chunk, 0, 1, 1);
 	ArrowArray arr = appender.Finalize();
 
-	// Build Arrow schema
+	// Build Arrow schema via C API
 	ArrowSchema c_schema;
 	ArrowConverter::ToArrowSchema(&c_schema, types, names, client_props);
-
-	// Add version metadata to filter_spec field (field 0)
-	// Arrow C API metadata format: int32 num_entries, then pairs of (int32 key_len, key, int32 val_len, val)
-	// For simplicity, we'll add it to the schema-level metadata
-	// TODO: Add field-level metadata for vgi_filter_version
 
 	// Import to Arrow C++ RecordBatch
 	auto import_result = arrow::ImportRecordBatch(&arr, &c_schema);
@@ -359,13 +366,52 @@ std::shared_ptr<arrow::Buffer> VgiSerializeFilters(ClientContext &context, const
 	}
 	auto record_batch = import_result.ValueUnsafe();
 
-	// Serialize to Arrow IPC
-	auto ipc_result = arrow::ipc::SerializeRecordBatch(*record_batch, arrow::ipc::IpcWriteOptions::Defaults());
-	if (!ipc_result.ok()) {
-		throw IOException("Failed to serialize filter RecordBatch to IPC: %s", ipc_result.status().ToString());
+	// Add version metadata to filter_spec field (field 0)
+	// We need to rebuild the schema with the metadata
+	auto filter_spec_field = record_batch->schema()->field(0);
+	auto metadata = arrow::KeyValueMetadata::Make({"vgi_filter_version"}, {"1"});
+	auto new_field = filter_spec_field->WithMetadata(metadata);
+
+	// Build new schema with the updated field
+	std::vector<std::shared_ptr<arrow::Field>> new_fields;
+	new_fields.push_back(new_field);
+	for (int i = 1; i < record_batch->schema()->num_fields(); i++) {
+		new_fields.push_back(record_batch->schema()->field(i));
+	}
+	auto new_schema = arrow::schema(new_fields);
+
+	// Create new RecordBatch with updated schema
+	record_batch = arrow::RecordBatch::Make(new_schema, record_batch->num_rows(), record_batch->columns());
+
+	// Serialize to Arrow IPC stream format (schema + record batch)
+	auto buffer_result = arrow::io::BufferOutputStream::Create();
+	if (!buffer_result.ok()) {
+		throw IOException("Failed to create buffer for filter IPC: %s", buffer_result.status().ToString());
+	}
+	auto buffer_stream = buffer_result.ValueUnsafe();
+
+	auto writer_result = arrow::ipc::MakeStreamWriter(buffer_stream, record_batch->schema());
+	if (!writer_result.ok()) {
+		throw IOException("Failed to create IPC stream writer: %s", writer_result.status().ToString());
+	}
+	auto writer = writer_result.ValueUnsafe();
+
+	auto write_status = writer->WriteRecordBatch(*record_batch);
+	if (!write_status.ok()) {
+		throw IOException("Failed to write filter RecordBatch to IPC stream: %s", write_status.ToString());
 	}
 
-	return ipc_result.ValueUnsafe();
+	auto close_status = writer->Close();
+	if (!close_status.ok()) {
+		throw IOException("Failed to close IPC stream writer: %s", close_status.ToString());
+	}
+
+	auto finish_result = buffer_stream->Finish();
+	if (!finish_result.ok()) {
+		throw IOException("Failed to finish filter IPC buffer: %s", finish_result.status().ToString());
+	}
+
+	return finish_result.ValueUnsafe();
 }
 
 // ============================================================================
