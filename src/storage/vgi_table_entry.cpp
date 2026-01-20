@@ -67,22 +67,22 @@ static unique_ptr<FunctionData> VgiTableScanBind(ClientContext &context, TableFu
 
 // Global init function for VGI table scan
 static unique_ptr<GlobalTableFunctionState> VgiTableScanInitGlobal(ClientContext &context,
-                                                                    TableFunctionInitInput &input) {
+                                                                   TableFunctionInitInput &input) {
 	auto &bind_data = input.bind_data->Cast<VgiTableScanBindData>();
 	auto state = make_uniq<VgiTableScanGlobalState>();
 
 	// Create streaming method call for table_scan
 	auto args = vgi::CreateTableGetArgs(bind_data.attach_id, bind_data.schema_name, bind_data.table_name);
-	state->stream =
-	    make_uniq<vgi::CatalogMethodStream>(bind_data.worker_path, vgi::CatalogMethod::TableScan, args, context, bind_data.worker_debug);
+	state->stream = make_uniq<vgi::CatalogMethodStream>(bind_data.worker_path, vgi::CatalogMethod::TableScan, args,
+	                                                    context, bind_data.worker_debug);
 
 	return state;
 }
 
 // Local init function for VGI table scan
 static unique_ptr<LocalTableFunctionState> VgiTableScanInitLocal(ExecutionContext &context,
-                                                                  TableFunctionInitInput &input,
-                                                                  GlobalTableFunctionState *global_state_p) {
+                                                                 TableFunctionInitInput &input,
+                                                                 GlobalTableFunctionState *global_state_p) {
 	auto current_chunk = make_uniq<ArrowArrayWrapper>();
 	auto local_state = make_uniq<VgiTableScanLocalState>(std::move(current_chunk), context.client);
 
@@ -186,6 +186,9 @@ TableFunction VgiTableEntry::GetScanFunction(ClientContext &context, unique_ptr<
 	// Create the table function with local init
 	TableFunction func("vgi_table_scan", {}, VgiTableScanFunction, VgiTableScanBind, VgiTableScanInitGlobal,
 	                   VgiTableScanInitLocal);
+	// FIXME: this depends on the function info, but mostly
+	// the function will likely already exist defined in the catalog
+	// elsewhere.
 	func.projection_pushdown = true;
 	return func;
 }

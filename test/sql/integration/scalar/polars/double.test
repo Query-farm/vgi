@@ -2,12 +2,12 @@
 # description: Tests for VGI polars_double scalar function
 # group: [vgi]
 
-require-env VGI_TEST_WORKER
+require-env VGI_TEST_POLARS_WORKER
 
 require vgi
 
 statement ok
-ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+ATTACH 'example_polars' AS example (TYPE vgi, LOCATION '${VGI_TEST_POLARS_WORKER}');
 
 # ============================================================================
 # polars_double function

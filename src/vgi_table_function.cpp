@@ -72,6 +72,10 @@ static unique_ptr<FunctionData> VgiTableFunctionBind(ClientContext &context, Tab
 	// Perform the common bind handshake
 	vgi::PerformVgiTableFunctionBind(context, *bind_data, return_types, names);
 
+	// Since the bind data will indicate if the function can perform
+	// projection store that here.
+	input.table_function.projection_pushdown = bind_data->projection_pushdown;
+
 	return bind_data;
 }
 
@@ -86,7 +90,6 @@ void RegisterVgiTableFunction(ExtensionLoader &loader) {
 
 	// Helper lambda to configure common function properties
 	auto configure_func = [](TableFunction &func) {
-		func.projection_pushdown = true;
 		func.cardinality = vgi::VgiTableFunctionCardinality;
 		func.table_scan_progress = vgi::VgiTableFunctionProgress;
 		func.to_string = vgi::VgiTableFunctionToString;
@@ -102,10 +105,11 @@ void RegisterVgiTableFunction(ExtensionLoader &loader) {
 
 	// Overload 2: vgi_table_function(worker_path, function_name, positional_args, named_args)
 	// named_args is ANY type to accept a STRUCT with arbitrary fields
-	TableFunction func4("vgi_table_function",
-	                    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::LIST(LogicalType::ANY), LogicalType::ANY},
-	                    vgi::VgiTableFunctionScan, VgiTableFunctionBind, vgi::VgiTableFunctionInitGlobal,
-	                    vgi::VgiTableFunctionInitLocal);
+	TableFunction func4(
+	    "vgi_table_function",
+	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::LIST(LogicalType::ANY), LogicalType::ANY},
+	    vgi::VgiTableFunctionScan, VgiTableFunctionBind, vgi::VgiTableFunctionInitGlobal,
+	    vgi::VgiTableFunctionInitLocal);
 	configure_func(func4);
 	func_set.AddFunction(func4);
 

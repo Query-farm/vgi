@@ -95,8 +95,10 @@ std::shared_ptr<arrow::RecordBatch> CreateFunctionInvocationFull(
     const std::shared_ptr<arrow::Schema> &input_schema = nullptr);
 
 // Create InitInput batch (Stream 3)
-// For table functions, this is TableFunctionInitInput with projection_ids
-std::shared_ptr<arrow::RecordBatch> CreateInitInput(const std::vector<int32_t> &projection_ids = {});
+// For table functions, this includes projection_ids and pushdown_filters
+// For scalar/table-in-out functions, projection_ids and pushdown_filters are omitted
+std::shared_ptr<arrow::RecordBatch> CreateInitInput(const std::vector<int32_t> &projection_ids = {},
+                                                     const std::string &pushdown_filters = "");
 
 // Parse OutputSpec response (Stream 2)
 OutputSpecResult ParseOutputSpec(const std::shared_ptr<arrow::RecordBatch> &batch);

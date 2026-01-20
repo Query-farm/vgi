@@ -418,9 +418,13 @@ public:
 	// Phase 2: Perform init handshake (Streams 3-4)
 	// Sends InitInput, reads InitResult, then closes stdin (for Table functions)
 	// After this call, the connection is ready to read data
-	// projection_ids: optional list of column indices for projection pushdown
+	// For table functions only:
+	//   projection_ids: optional list of column indices for projection pushdown
+	//   pushdown_filters: optional filter expression string for filter pushdown
+	// For scalar/table-in-out functions, these parameters are omitted from the init message
 	// Returns InitResultData containing global_execution_identifier for multi-worker coordination
-	InitResultData PerformInit(const std::vector<int32_t> &projection_ids = {});
+	InitResultData PerformInit(const std::vector<int32_t> &projection_ids = {},
+	                           const std::string &pushdown_filters = "");
 
 	// Phase 2 (secondary worker): Skip init handshake for secondary workers
 	// The Python worker's secondary worker path doesn't do InitInput/InitResult exchange,

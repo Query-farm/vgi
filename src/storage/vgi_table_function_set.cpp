@@ -162,6 +162,8 @@ static unique_ptr<FunctionData> VgiCatalogTableFunctionBind(ClientContext &conte
 	// Perform the common bind handshake
 	vgi::PerformVgiTableFunctionBind(context, *bind_data, return_types, names);
 
+	input.table_function.projection_pushdown = bind_data->projection_pushdown;
+
 	return bind_data;
 }
 
@@ -170,7 +172,8 @@ static unique_ptr<FunctionData> VgiCatalogTableFunctionBind(ClientContext &conte
 // ============================================================================
 
 static unique_ptr<FunctionData> VgiCatalogTableInOutFunctionBind(ClientContext &context, TableFunctionBindInput &input,
-                                                                   vector<LogicalType> &return_types, vector<string> &names) {
+                                                                 vector<LogicalType> &return_types,
+                                                                 vector<string> &names) {
 	// Access the VgiTableFunctionInfo attached to this function
 	auto &vgi_info = input.info->Cast<VgiTableFunctionInfo>();
 
@@ -227,8 +230,10 @@ void VgiTableFunctionSet::LoadEntries(ClientContext &context) {
 
 	// Call schema_contents with type filter for table functions
 	auto worker_path = attach_params->worker_path();
-	auto args = vgi::CreateSchemaContentsArgs(attach_result->attach_id, schema_.name, vgi::SchemaObjectType::TableFunction);
-	vgi::CatalogMethodStream stream(worker_path, vgi::CatalogMethod::SchemaContents, args, context, attach_params->worker_debug());
+	auto args =
+	    vgi::CreateSchemaContentsArgs(attach_result->attach_id, schema_.name, vgi::SchemaObjectType::TableFunction);
+	vgi::CatalogMethodStream stream(worker_path, vgi::CatalogMethod::SchemaContents, args, context,
+	                                attach_params->worker_debug());
 
 	// Group functions by name (overloads)
 	std::unordered_map<std::string, std::vector<vgi::VgiFunctionInfo>> functions_by_name;
@@ -289,8 +294,9 @@ void VgiTableFunctionSet::LoadEntries(ClientContext &context) {
 			} else {
 				// Create a regular table function
 				// Only positional arguments go in the function signature
-				TableFunction table_func(arg_types.positional_types, vgi::VgiTableFunctionScan, VgiCatalogTableFunctionBind,
-				                         vgi::VgiTableFunctionInitGlobal, vgi::VgiTableFunctionInitLocal);
+				TableFunction table_func(arg_types.positional_types, vgi::VgiTableFunctionScan,
+				                         VgiCatalogTableFunctionBind, vgi::VgiTableFunctionInitGlobal,
+				                         vgi::VgiTableFunctionInitLocal);
 				table_func.projection_pushdown = func_info.projection_pushdown.value_or(false);
 				table_func.filter_pushdown = func_info.filter_pushdown.value_or(false);
 				table_func.cardinality = vgi::VgiTableFunctionCardinality;

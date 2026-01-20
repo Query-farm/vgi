@@ -903,7 +903,8 @@ std::shared_ptr<arrow::Schema> FunctionConnection::PerformBind(int32_t &max_proc
 	return output_spec.output_schema;
 }
 
-InitResultData FunctionConnection::PerformInit(const std::vector<int32_t> &projection_ids) {
+InitResultData FunctionConnection::PerformInit(const std::vector<int32_t> &projection_ids,
+                                                const std::string &pushdown_filters) {
 	if (!bind_done_) {
 		ThrowVgiIOException("FunctionConnection::PerformInit called before PerformBind", worker_path_,
 		                    proc_ ? proc_->GetPid() : -1, GetInvocationIdHex());
@@ -913,8 +914,10 @@ InitResultData FunctionConnection::PerformInit(const std::vector<int32_t> &proje
 		                    GetInvocationIdHex());
 	}
 
-	// Stream 3: Send InitInput (TableFunctionInitInput with projection_ids) with protocol state
-	auto init_input = CreateInitInput(projection_ids);
+	// Stream 3: Send InitInput with protocol state
+	// For table functions: includes projection_ids and pushdown_filters
+	// For scalar/table-in-out functions: both fields are null
+	auto init_input = CreateInitInput(projection_ids, pushdown_filters);
 	auto init_input_metadata = CreateProtocolStateMetadata(ProtocolState::INIT_INPUT);
 	auto init_input_bytes = SerializeRecordBatch(init_input, init_input_metadata);
 	WriteAll(proc_->GetStdinFd(), init_input_bytes->data(), init_input_bytes->size());

@@ -21,6 +21,7 @@ Run test suites after changes:
 VGI_TEST_WORKER=../vgi-python/.venv/bin/vgi-example-worker ./build/debug/test/unittest --test-dir . "test/sql/vgi_integration.test"
 VGI_TEST_WORKER=../vgi-python/.venv/bin/vgi-example-worker ./build/debug/test/unittest --test-dir . "test/sql/vgi_worker_pool.test"
 VGI_TEST_WORKER=../vgi-python/.venv/bin/vgi-example-worker ./build/debug/test/unittest --test-dir . "test/sql/integration/*"
+VGI_TEST_POLARS_WORKER=../vgi-python/.venv/bin/vgi-example-polars-worker ./build/debug/test/unittest --test-dir . "test/sql/integration/scalar/polars/*"
 ```
 
 Tests complete in <10 seconds. For debugging failures, write standalone `.sql` files in `/tmp/` and run with `./build/debug/duckdb`.

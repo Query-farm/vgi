@@ -447,13 +447,16 @@ std::shared_ptr<arrow::RecordBatch> CreateFunctionInvocationFull(
 }
 
 // Create InitInput batch (Stream 3)
-// For table functions, this is TableFunctionInitInput with projection_ids (list of int32)
-std::shared_ptr<arrow::RecordBatch> CreateInitInput(const std::vector<int32_t> &projection_ids) {
+// For table functions, this includes projection_ids and pushdown_filters
+// For scalar/table-in-out functions, both fields are null (parameters empty)
+std::shared_ptr<arrow::RecordBatch> CreateInitInput(const std::vector<int32_t> &projection_ids,
+                                                     const std::string &pushdown_filters) {
 	auto schema = arrow::schema({
 	    arrow::field("projection_ids", arrow::list(arrow::int32()), true),
+	    arrow::field("pushdown_filters", arrow::utf8(), true),
 	});
 
-	// Build projection_ids list
+	// Build projection_ids list (null for scalar/table-in-out functions)
 	auto value_builder = std::make_shared<arrow::Int32Builder>();
 	arrow::ListBuilder list_builder(arrow::default_memory_pool(), value_builder);
 
@@ -466,8 +469,17 @@ std::shared_ptr<arrow::RecordBatch> CreateInitInput(const std::vector<int32_t> &
 		}
 	}
 
+	// Build pushdown_filters string (null for scalar/table-in-out functions)
+	arrow::StringBuilder filters_builder;
+	if (pushdown_filters.empty()) {
+		CheckArrowStatus(filters_builder.AppendNull(), "append null pushdown_filters");
+	} else {
+		CheckArrowStatus(filters_builder.Append(pushdown_filters), "append pushdown_filters");
+	}
+
 	std::vector<std::shared_ptr<arrow::Array>> arrays;
 	arrays.push_back(FinishBuilder(list_builder, "projection_ids"));
+	arrays.push_back(FinishBuilder(filters_builder, "pushdown_filters"));
 
 	return arrow::RecordBatch::Make(schema, 1, arrays);
 }
