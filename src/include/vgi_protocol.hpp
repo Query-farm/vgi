@@ -32,6 +32,14 @@ std::shared_ptr<arrow::RecordBatch> CreateSchemaGetArgs(const std::vector<uint8_
 std::shared_ptr<arrow::RecordBatch> CreateTableGetArgs(const std::vector<uint8_t> &attach_id,
                                                        const std::string &schema_name, const std::string &table_name);
 
+// Create arguments batch for table_scan_function_get method
+// at_unit/at_value are for time travel queries (e.g., "timestamp", "2024-01-01")
+std::shared_ptr<arrow::RecordBatch> CreateTableScanFunctionGetArgs(const std::vector<uint8_t> &attach_id,
+                                                                    const std::string &schema_name,
+                                                                    const std::string &table_name,
+                                                                    const std::string &at_unit = "",
+                                                                    const std::string &at_value = "");
+
 // Schema object type filter for schema_contents method
 enum class SchemaObjectType {
 	All,            // No filter - return all object types

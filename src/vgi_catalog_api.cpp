@@ -61,8 +61,8 @@ static bool CheckWorkerExitStatus(SubProcess &proc, const std::string &worker_pa
 	} else if (exit_status == 126) {
 		ThrowVgiIOException("VGI worker permission denied", worker_path, proc.GetPid(), invocation_id_hex);
 	} else if (exit_status != 0) {
-		ThrowVgiIOException("VGI worker %s (exit code %d)", worker_path, proc.GetPid(), invocation_id_hex, error_context,
-		                    exit_status);
+		ThrowVgiIOException("VGI worker %s (exit code %d)", worker_path, proc.GetPid(), invocation_id_hex,
+		                    error_context, exit_status);
 	}
 
 	return true; // Process exited normally (exit_status == 0)
@@ -186,6 +186,8 @@ const char *CatalogMethodToString(CatalogMethod method) {
 		return "table_get";
 	case CatalogMethod::TableScan:
 		return "table_scan";
+	case CatalogMethod::TableScanFunctionGet:
+		return "table_scan_function_get";
 	case CatalogMethod::ViewGet:
 		return "view_get";
 	case CatalogMethod::FunctionGet:
@@ -207,10 +209,9 @@ std::shared_ptr<arrow::RecordBatch> InvokeCatalogMethod(const std::string &worke
 	// Spawn the worker process
 	SubProcess proc(worker_path, worker_debug);
 
-	VGI_LOG(context, "catalog_method.invoke",
-	        {{"worker_path", worker_path},
-	         {"worker_pid", std::to_string(proc.GetPid())},
-	         {"method_name", method_name}});
+	VGI_LOG(
+	    context, "catalog_method.invoke",
+	    {{"worker_path", worker_path}, {"worker_pid", std::to_string(proc.GetPid())}, {"method_name", method_name}});
 
 	// Send invocation and args
 	SendInvocationAndArgs(proc, method_name, args);
@@ -266,10 +267,9 @@ CatalogMethodStream::CatalogMethodStream(const std::string &worker_path, Catalog
                                          bool worker_debug)
     : proc_(std::make_unique<SubProcess>(worker_path, worker_debug)), context_(context), worker_path_(worker_path) {
 	const char *method_name = CatalogMethodToString(method);
-	VGI_LOG(context_, "catalog_method.invoke",
-	        {{"worker_path", worker_path_},
-	         {"worker_pid", std::to_string(proc_->GetPid())},
-	         {"method_name", method_name}});
+	VGI_LOG(
+	    context_, "catalog_method.invoke",
+	    {{"worker_path", worker_path_}, {"worker_pid", std::to_string(proc_->GetPid())}, {"method_name", method_name}});
 	SendInvocationAndArgs(*proc_, method_name, args);
 }
 
@@ -353,43 +353,111 @@ static std::shared_ptr<arrow::RecordBatch> DeserializeRecordBatch(const std::vec
 	return batch;
 }
 
-// Helper to get DuckDB LogicalType from an Arrow type
-static LogicalType ArrowTypeToDuckDBType(ClientContext &context, const std::shared_ptr<arrow::DataType> &arrow_type) {
-	// Create a single-field schema and convert
-	auto schema = arrow::schema({arrow::field("value", arrow_type)});
+// Helper to extract a single value from an Arrow array at given row index
+// Uses DuckDB type from ArrowSchemaToDuckDBTypes and constructs Value appropriately
+static Value ExtractArrowValue(const std::shared_ptr<arrow::Array> &array, int64_t row_idx,
+                               const LogicalType &duck_type) {
+	if (!array || array->IsNull(row_idx)) {
+		return Value(duck_type);
+	}
+
+	// Extract value based on Arrow type and construct DuckDB Value
+	switch (array->type()->id()) {
+	case arrow::Type::BOOL: {
+		auto typed = std::static_pointer_cast<arrow::BooleanArray>(array);
+		return Value::BOOLEAN(typed->Value(row_idx));
+	}
+	case arrow::Type::INT8: {
+		auto typed = std::static_pointer_cast<arrow::Int8Array>(array);
+		return Value::TINYINT(typed->Value(row_idx));
+	}
+	case arrow::Type::INT16: {
+		auto typed = std::static_pointer_cast<arrow::Int16Array>(array);
+		return Value::SMALLINT(typed->Value(row_idx));
+	}
+	case arrow::Type::INT32: {
+		auto typed = std::static_pointer_cast<arrow::Int32Array>(array);
+		return Value::INTEGER(typed->Value(row_idx));
+	}
+	case arrow::Type::INT64: {
+		auto typed = std::static_pointer_cast<arrow::Int64Array>(array);
+		return Value::BIGINT(typed->Value(row_idx));
+	}
+	case arrow::Type::UINT8: {
+		auto typed = std::static_pointer_cast<arrow::UInt8Array>(array);
+		return Value::UTINYINT(typed->Value(row_idx));
+	}
+	case arrow::Type::UINT16: {
+		auto typed = std::static_pointer_cast<arrow::UInt16Array>(array);
+		return Value::USMALLINT(typed->Value(row_idx));
+	}
+	case arrow::Type::UINT32: {
+		auto typed = std::static_pointer_cast<arrow::UInt32Array>(array);
+		return Value::UINTEGER(typed->Value(row_idx));
+	}
+	case arrow::Type::UINT64: {
+		auto typed = std::static_pointer_cast<arrow::UInt64Array>(array);
+		return Value::UBIGINT(typed->Value(row_idx));
+	}
+	case arrow::Type::FLOAT: {
+		auto typed = std::static_pointer_cast<arrow::FloatArray>(array);
+		return Value::FLOAT(typed->Value(row_idx));
+	}
+	case arrow::Type::DOUBLE: {
+		auto typed = std::static_pointer_cast<arrow::DoubleArray>(array);
+		return Value::DOUBLE(typed->Value(row_idx));
+	}
+	case arrow::Type::STRING: {
+		auto typed = std::static_pointer_cast<arrow::StringArray>(array);
+		return Value(typed->GetString(row_idx));
+	}
+	case arrow::Type::LARGE_STRING: {
+		auto typed = std::static_pointer_cast<arrow::LargeStringArray>(array);
+		return Value(typed->GetString(row_idx));
+	}
+	case arrow::Type::BINARY: {
+		auto typed = std::static_pointer_cast<arrow::BinaryArray>(array);
+		auto view = typed->GetView(row_idx);
+		return Value::BLOB(reinterpret_cast<const_data_ptr_t>(view.data()), view.size());
+	}
+	case arrow::Type::LARGE_BINARY: {
+		auto typed = std::static_pointer_cast<arrow::LargeBinaryArray>(array);
+		auto view = typed->GetView(row_idx);
+		return Value::BLOB(reinterpret_cast<const_data_ptr_t>(view.data()), view.size());
+	}
+	default:
+		// For complex/unsupported types, try to get string representation
+		auto scalar_result = array->GetScalar(row_idx);
+		if (scalar_result.ok()) {
+			return Value(scalar_result.ValueUnsafe()->ToString());
+		}
+		return Value(duck_type);
+	}
+}
+
+// Helper to convert Arrow RecordBatch to vector of DuckDB Values
+// Uses DuckDB's ArrowSchemaToDuckDBTypes for proper type mapping
+static vector<Value> ArrowBatchToValues(ClientContext &context, const std::shared_ptr<arrow::RecordBatch> &batch) {
+	vector<Value> result;
+	if (!batch || batch->num_rows() == 0) {
+		return result;
+	}
+
+	// Use DuckDB's proper Arrow schema conversion to get correct types
 	ArrowSchemaWrapper c_schema;
 	ArrowTableSchema arrow_table;
 	vector<LogicalType> types;
 	vector<string> names;
-	vgi::ArrowSchemaToDuckDBTypes(context, schema, c_schema, arrow_table, types, names);
-	return types[0];
-}
+	ArrowSchemaToDuckDBTypes(context, batch->schema(), c_schema, arrow_table, types, names);
 
-// Helper to convert Arrow scalar to DuckDB Value
-static Value ArrowScalarToDuckDBValue(const std::shared_ptr<arrow::Scalar> &scalar, const LogicalType &type) {
-	if (!scalar || !scalar->is_valid) {
-		return Value(type);
+	// Extract value from each column at row 0
+	for (int64_t col_idx = 0; col_idx < batch->num_columns(); col_idx++) {
+		auto array = batch->column(col_idx);
+		auto &duck_type = types[col_idx];
+		result.push_back(ExtractArrowValue(array, 0, duck_type));
 	}
 
-	switch (type.id()) {
-	case LogicalTypeId::BOOLEAN:
-		return Value::BOOLEAN(std::static_pointer_cast<arrow::BooleanScalar>(scalar)->value);
-	case LogicalTypeId::BIGINT:
-		return Value::BIGINT(std::static_pointer_cast<arrow::Int64Scalar>(scalar)->value);
-	case LogicalTypeId::INTEGER:
-		return Value::INTEGER(std::static_pointer_cast<arrow::Int32Scalar>(scalar)->value);
-	case LogicalTypeId::DOUBLE:
-		return Value::DOUBLE(std::static_pointer_cast<arrow::DoubleScalar>(scalar)->value);
-	case LogicalTypeId::FLOAT:
-		return Value::FLOAT(std::static_pointer_cast<arrow::FloatScalar>(scalar)->value);
-	case LogicalTypeId::VARCHAR: {
-		auto str_scalar = std::static_pointer_cast<arrow::StringScalar>(scalar);
-		return Value(str_scalar->value->ToString());
-	}
-	default:
-		// For unsupported types, return NULL
-		return Value(type);
-	}
+	return result;
 }
 
 VgiSetting ParseVgiSetting(const std::vector<uint8_t> &bytes, const std::string &worker_path) {
@@ -449,13 +517,8 @@ VgiSetting ParseVgiSetting(const std::vector<uint8_t> &bytes, const std::string 
 	auto default_bytes_opt = row["default_value"].as<std::vector<uint8_t>>();
 	if (default_bytes_opt && !default_bytes_opt->empty()) {
 		auto default_batch = DeserializeRecordBatch(*default_bytes_opt);
-		if (default_batch && default_batch->num_rows() > 0) {
-			auto scalar_result = default_batch->column(0)->GetScalar(0);
-			if (scalar_result.ok()) {
-				setting.default_value = ArrowScalarToDuckDBValue(scalar_result.ValueUnsafe(), setting.type);
-			} else {
-				setting.default_value = Value(setting.type);
-			}
+		if (default_batch && default_batch->num_rows() > 0 && default_batch->num_columns() > 0) {
+			setting.default_value = ExtractArrowValue(default_batch->column(0), 0, setting.type);
 		} else {
 			setting.default_value = Value(setting.type);
 		}
@@ -487,7 +550,7 @@ CatalogAttachResult ParseCatalogAttachResult(const std::shared_ptr<arrow::Record
 	}
 
 	// Parse settings list - each element is a serialized Setting
-	auto settings_bytes = row["settings"].value_or(std::vector<std::vector<uint8_t>>{});
+	auto settings_bytes = row["settings"].value_or(std::vector<std::vector<uint8_t>> {});
 	for (const auto &setting_bytes : settings_bytes) {
 		result.settings.push_back(ParseVgiSetting(setting_bytes, worker_path));
 	}
@@ -574,6 +637,61 @@ VgiViewInfo ParseViewInfo(const std::shared_ptr<arrow::RecordBatch> &batch, cons
 	info.tags = row["tags"].value_not_null<std::map<std::string, std::string>>();
 
 	return info;
+}
+
+VgiScanFunctionResult ParseScanFunctionResult(ClientContext &context, const std::shared_ptr<arrow::RecordBatch> &batch,
+                                               const std::string &worker_path) {
+	VgiScanFunctionResult result;
+
+	if (!batch || batch->num_rows() == 0) {
+		throw IOException("Empty response from table_scan_function_get");
+	}
+
+	RecordBatchSingleRow row(batch, 0, "ScanFunctionResult", worker_path);
+
+	// Get function_name (required, non-nullable)
+	result.function_name = row["function_name"].value_not_null<std::string>();
+
+	// Get required_extensions (required, non-nullable list<string>)
+	result.required_extensions = row["required_extensions"].value_or(std::vector<std::string> {});
+
+	// Get arguments as binary and deserialize the nested IPC batch
+	auto arguments_bytes = row["arguments"].value_not_null<std::vector<uint8_t>>();
+	if (!arguments_bytes.empty()) {
+		auto arguments_batch = DeserializeRecordBatch(arguments_bytes);
+		if (arguments_batch && arguments_batch->num_rows() > 0) {
+			// Convert the entire batch to DuckDB Values using proper conversion
+			auto values = ArrowBatchToValues(context, arguments_batch);
+			auto &schema = arguments_batch->schema();
+
+			// Map values to positional or named arguments based on field names
+			for (int i = 0; i < schema->num_fields(); i++) {
+				const auto &field_name = schema->field(i)->name();
+				auto &duck_value = values[i];
+
+				// Check if this is a positional argument (arg_0, arg_1, etc.)
+				if (field_name.rfind("arg_", 0) == 0) {
+					// Extract index from arg_N
+					try {
+						size_t idx = std::stoul(field_name.substr(4));
+						// Ensure positional_arguments vector is large enough
+						if (idx >= result.positional_arguments.size()) {
+							result.positional_arguments.resize(idx + 1);
+						}
+						result.positional_arguments[idx] = duck_value;
+					} catch (const std::exception &) {
+						// If parsing fails, treat as named argument
+						result.named_arguments[field_name] = duck_value;
+					}
+				} else {
+					// Named argument
+					result.named_arguments[field_name] = duck_value;
+				}
+			}
+		}
+	}
+
+	return result;
 }
 
 // ============================================================================
@@ -663,7 +781,7 @@ VgiFunctionInfo ParseFunctionInfo(const std::shared_ptr<arrow::RecordBatch> &bat
 		}
 	}
 	// categories is a simple list of strings
-	info.categories = row["categories"].value_or(std::vector<std::string>{});
+	info.categories = row["categories"].value_or(std::vector<std::string> {});
 
 	// Parse the arguments field which contains a serialized Arrow schema (non-nullable)
 	auto args_data = row["arguments"].value_not_null<std::vector<uint8_t>>();
@@ -685,16 +803,16 @@ VgiFunctionInfo ParseFunctionInfo(const std::shared_ptr<arrow::RecordBatch> &bat
 	info.max_workers = row["max_workers"].as<int32_t>();
 
 	// Aggregate function fields (non-nullable with defaults)
-	auto order_dependent_str = row["order_dependent"].value_or(std::string{"NOT_ORDER_DEPENDENT"});
+	auto order_dependent_str = row["order_dependent"].value_or(std::string {"NOT_ORDER_DEPENDENT"});
 	auto order_dependent = ParseAggregateOrderDependent(order_dependent_str);
 	info.order_dependent = order_dependent.value_or(AggregateOrderDependent::NOT_ORDER_DEPENDENT);
 
-	auto distinct_dependent_str = row["distinct_dependent"].value_or(std::string{"NOT_DISTINCT_DEPENDENT"});
+	auto distinct_dependent_str = row["distinct_dependent"].value_or(std::string {"NOT_DISTINCT_DEPENDENT"});
 	auto distinct_dependent = ParseAggregateDistinctDependent(distinct_dependent_str);
 	info.distinct_dependent = distinct_dependent.value_or(AggregateDistinctDependent::NOT_DISTINCT_DEPENDENT);
 
 	// Required settings for this function (list of strings)
-	info.required_settings = row["required_settings"].value_or(std::vector<std::string>{});
+	info.required_settings = row["required_settings"].value_or(std::vector<std::string> {});
 
 	return info;
 }
@@ -723,8 +841,8 @@ AcquireAndBindResult AcquireAndBindConnection(ClientContext &context, const Func
 	// Lambda to create a fresh connection
 	auto create_fresh_connection = [&]() {
 		return make_uniq<FunctionConnection>(params.worker_path, params.function_name, params.arguments,
-		                                     params.attach_id, context, params.global_execution_id,
-		                                     params.worker_debug, params.settings);
+		                                     params.attach_id, context, params.global_execution_id, params.worker_debug,
+		                                     params.settings);
 	};
 
 	// Lambda to attempt bind, returns true on success, false if retry needed
@@ -788,7 +906,7 @@ AcquireAndBindResult AcquireAndBindConnection(ClientContext &context, const Func
 		try_bind(true); // Throws if fails, no more retries
 	}
 
-	return AcquireAndBindResult{std::move(conn), std::move(output_spec)};
+	return AcquireAndBindResult {std::move(conn), std::move(output_spec)};
 }
 
 // ============================================================================
@@ -892,7 +1010,7 @@ OutputSpecResult FunctionConnection::PerformBindFull() {
 }
 
 std::shared_ptr<arrow::Schema> FunctionConnection::PerformBind(int32_t &max_processes_out,
-                                                                int64_t &cardinality_estimate_out) {
+                                                               int64_t &cardinality_estimate_out) {
 	// Call PerformBindFull to do the actual work
 	auto output_spec = PerformBindFull();
 
@@ -904,7 +1022,7 @@ std::shared_ptr<arrow::Schema> FunctionConnection::PerformBind(int32_t &max_proc
 }
 
 InitResultData FunctionConnection::PerformInit(const std::vector<int32_t> &projection_ids,
-                                                std::shared_ptr<arrow::Buffer> pushdown_filters) {
+                                               std::shared_ptr<arrow::Buffer> pushdown_filters) {
 	if (!bind_done_) {
 		ThrowVgiIOException("FunctionConnection::PerformInit called before PerformBind", worker_path_,
 		                    proc_ ? proc_->GetPid() : -1, GetInvocationIdHex());
@@ -1213,8 +1331,8 @@ void FunctionConnection::OpenInputWriter() {
 		                    proc_ ? proc_->GetPid() : -1, GetInvocationIdHex());
 	}
 	if (input_writer_opened_) {
-		ThrowVgiIOException("FunctionConnection::OpenInputWriter called twice", worker_path_, proc_ ? proc_->GetPid() : -1,
-		                    GetInvocationIdHex());
+		ThrowVgiIOException("FunctionConnection::OpenInputWriter called twice", worker_path_,
+		                    proc_ ? proc_->GetPid() : -1, GetInvocationIdHex());
 	}
 
 	// Create an IPC stream writer for stdin (Stream 5)
@@ -1296,16 +1414,14 @@ void FunctionConnection::SendFinalize() {
 	// Create metadata with protocol state DATA and type FINALIZE
 	// Keys vector: [vgi.protocol_state, type]
 	// Values vector: [data, FINALIZE]
-	auto finalize_metadata = arrow::KeyValueMetadata::Make(
-		std::vector<std::string>{PROTOCOL_STATE_KEY, "type"},
-		std::vector<std::string>{ProtocolState::DATA, "FINALIZE"}
-	);
+	auto finalize_metadata = arrow::KeyValueMetadata::Make(std::vector<std::string> {PROTOCOL_STATE_KEY, "type"},
+	                                                       std::vector<std::string> {ProtocolState::DATA, "FINALIZE"});
 
 	// Write the finalize batch
 	auto write_status = input_writer_->WriteRecordBatch(*empty_batch, finalize_metadata);
 	if (!write_status.ok()) {
-		ThrowVgiIOException("Failed to write finalize batch: %s", worker_path_, proc_->GetPid(),
-		                    GetInvocationIdHex(), write_status.ToString());
+		ThrowVgiIOException("Failed to write finalize batch: %s", worker_path_, proc_->GetPid(), GetInvocationIdHex(),
+		                    write_status.ToString());
 	}
 
 	finalize_sent_ = true;
@@ -1475,9 +1591,7 @@ void FunctionConnection::DrainStderrLog() {
 	pid_t worker_pid = proc_ ? proc_->GetPid() : -1;
 	for (const auto &line : lines) {
 		VGI_LOG(context_, "worker.stderr",
-		        {{"worker_path", worker_path_},
-		         {"worker_pid", std::to_string(worker_pid)},
-		         {"message", line}});
+		        {{"worker_path", worker_path_}, {"worker_pid", std::to_string(worker_pid)}, {"message", line}});
 	}
 }
 

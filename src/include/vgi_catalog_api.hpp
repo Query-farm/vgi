@@ -14,6 +14,7 @@
 #include <arrow/io/api.h>
 #include <arrow/ipc/api.h>
 
+#include "duckdb/common/types/value.hpp"
 #include "duckdb/function/aggregate_state.hpp"
 #include "duckdb/function/function.hpp"
 
@@ -80,8 +81,9 @@ enum class CatalogMethod {
 	SchemaContents, // List schema contents (tables, views, functions)
 
 	// Table methods
-	TableGet,  // Get table info
-	TableScan, // Scan table data (streaming)
+	TableGet,             // Get table info
+	TableScan,            // Scan table data (streaming)
+	TableScanFunctionGet, // Get scan function for a table (returns ScanFunctionResult)
 
 	// View methods
 	ViewGet, // Get view info
@@ -196,6 +198,15 @@ struct VgiViewInfo {
 	std::map<std::string, std::string> tags;
 };
 
+// Result of table_scan_function_get - tells DuckDB which function to call to scan a table
+// This enables catalogs to delegate scanning to any DuckDB function (e.g., read_parquet, iceberg_scan)
+struct VgiScanFunctionResult {
+	std::string function_name;                              // The DuckDB function to call (e.g., "read_parquet")
+	std::vector<Value> positional_arguments;                // Positional arguments for the function
+	std::map<std::string, Value> named_arguments;           // Named arguments for the function
+	std::vector<std::string> required_extensions;           // Extensions to load before calling
+};
+
 // ============================================================================
 // Function Metadata Enums and Parsing
 // ============================================================================
@@ -287,6 +298,11 @@ VgiFunctionInfo ParseFunctionInfo(const std::shared_ptr<arrow::RecordBatch> &bat
 
 // Parse a VgiViewInfo from an Arrow RecordBatch (single row)
 VgiViewInfo ParseViewInfo(const std::shared_ptr<arrow::RecordBatch> &batch, const std::string &worker_path);
+
+// Parse a VgiScanFunctionResult from an Arrow RecordBatch (single row)
+// The arguments field is a nested IPC batch with arg_0, arg_1, ... for positional args and named args by name
+VgiScanFunctionResult ParseScanFunctionResult(ClientContext &context, const std::shared_ptr<arrow::RecordBatch> &batch,
+                                               const std::string &worker_path);
 
 // ============================================================================
 // Function Invocation API

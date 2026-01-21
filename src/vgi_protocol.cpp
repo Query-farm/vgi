@@ -241,6 +241,58 @@ std::shared_ptr<arrow::RecordBatch> CreateTableGetArgs(const std::vector<uint8_t
 	return arrow::RecordBatch::Make(schema, 1, arrays);
 }
 
+// Create arguments batch for table_scan_function_get method
+std::shared_ptr<arrow::RecordBatch> CreateTableScanFunctionGetArgs(const std::vector<uint8_t> &attach_id,
+                                                                    const std::string &schema_name,
+                                                                    const std::string &table_name,
+                                                                    const std::string &at_unit,
+                                                                    const std::string &at_value) {
+	auto schema = arrow::schema({
+	    arrow::field("attach_id", arrow::binary(), false),
+	    arrow::field("transaction_id", arrow::binary(), true), // nullable
+	    arrow::field("schema_name", arrow::utf8(), false),
+	    arrow::field("name", arrow::utf8(), false),
+	    arrow::field("at_unit", arrow::utf8(), true),  // nullable - for time travel
+	    arrow::field("at_value", arrow::utf8(), true), // nullable - for time travel
+	});
+
+	arrow::BinaryBuilder attach_id_builder;
+	CheckArrowStatus(attach_id_builder.Append(attach_id.data(), attach_id.size()), "append attach_id");
+
+	arrow::BinaryBuilder transaction_id_builder;
+	CheckArrowStatus(transaction_id_builder.AppendNull(), "append null transaction_id");
+
+	arrow::StringBuilder schema_name_builder;
+	CheckArrowStatus(schema_name_builder.Append(schema_name), "append schema_name");
+
+	arrow::StringBuilder name_builder;
+	CheckArrowStatus(name_builder.Append(table_name), "append name");
+
+	arrow::StringBuilder at_unit_builder;
+	if (at_unit.empty()) {
+		CheckArrowStatus(at_unit_builder.AppendNull(), "append null at_unit");
+	} else {
+		CheckArrowStatus(at_unit_builder.Append(at_unit), "append at_unit");
+	}
+
+	arrow::StringBuilder at_value_builder;
+	if (at_value.empty()) {
+		CheckArrowStatus(at_value_builder.AppendNull(), "append null at_value");
+	} else {
+		CheckArrowStatus(at_value_builder.Append(at_value), "append at_value");
+	}
+
+	std::vector<std::shared_ptr<arrow::Array>> arrays;
+	arrays.push_back(FinishBuilder(attach_id_builder, "attach_id"));
+	arrays.push_back(FinishBuilder(transaction_id_builder, "transaction_id"));
+	arrays.push_back(FinishBuilder(schema_name_builder, "schema_name"));
+	arrays.push_back(FinishBuilder(name_builder, "name"));
+	arrays.push_back(FinishBuilder(at_unit_builder, "at_unit"));
+	arrays.push_back(FinishBuilder(at_value_builder, "at_value"));
+
+	return arrow::RecordBatch::Make(schema, 1, arrays);
+}
+
 // Convert SchemaObjectType to protocol string
 const char *SchemaObjectTypeToString(SchemaObjectType type) {
 	switch (type) {

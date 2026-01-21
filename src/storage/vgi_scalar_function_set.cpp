@@ -170,9 +170,16 @@ void VgiScalarFunctionSet::LoadEntries(ClientContext &context) {
 			func_set.AddFunction(scalar_func);
 
 			// Create function description with full metadata
+			// Include both positional and named parameters so duckdb_functions() shows them correctly
 			FunctionDescription desc;
 			desc.parameter_types = arg_types.positional_types;
 			desc.parameter_names = arg_types.positional_names;
+
+			// Append named parameters to the description
+			for (const auto &[name, type] : arg_types.named_parameters) {
+				desc.parameter_types.push_back(type);
+				desc.parameter_names.push_back(name);
+			}
 			desc.description = func_info.description;
 			for (const auto &ex : func_info.examples) {
 				desc.examples.push_back(ex);
