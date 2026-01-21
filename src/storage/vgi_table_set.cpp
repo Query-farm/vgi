@@ -25,9 +25,27 @@ void VgiTableSet::LoadEntries(ClientContext &context) {
 		return;
 	}
 
-	// For now, we don't bulk load tables. Tables are loaded on-demand via GetEntry.
-	// This method is called when scanning, but VGI doesn't support listing all tables yet.
-	// We'll just mark as loaded and rely on individual table_get calls.
+	// Call schema_contents with type filter for tables
+	// Use InvokeCatalogMethod (single response) instead of CatalogMethodStream (streaming)
+	// because schema_contents returns all tables in a single batch
+	auto worker_path = attach_params->worker_path();
+	auto args = vgi::CreateSchemaContentsArgs(attach_result->attach_id, schema_.name, vgi::SchemaObjectType::Table);
+	auto batch = vgi::InvokeCatalogMethod(worker_path, vgi::CatalogMethod::SchemaContents, args, context,
+	                                      attach_params->worker_debug());
+
+	if (!batch || batch->num_rows() == 0) {
+		return;
+	}
+
+	// Parse each row in the batch as a table
+	for (int64_t i = 0; i < batch->num_rows(); i++) {
+		auto table_info = vgi::ParseTableInfo(batch, i, worker_path);
+		auto create_info = vgi::CreateTableInfoFromVgiTable(context, table_info, schema_.name);
+
+		// Create the table entry
+		auto table_entry = make_uniq<VgiTableEntry>(catalog_, schema_, create_info, table_info);
+		CreateEntry(std::move(table_entry));
+	}
 }
 
 // Override GetEntry to do on-demand loading for individual tables

@@ -573,14 +573,19 @@ VgiSchemaInfo ParseSchemaInfo(const std::shared_ptr<arrow::RecordBatch> &batch, 
 	return info;
 }
 
-VgiTableInfo ParseTableInfo(const std::shared_ptr<arrow::RecordBatch> &batch, const std::string &worker_path) {
+VgiTableInfo ParseTableInfo(const std::shared_ptr<arrow::RecordBatch> &batch, int64_t row_idx,
+                            const std::string &worker_path) {
 	VgiTableInfo info;
 
 	if (!batch || batch->num_rows() == 0) {
 		throw IOException("Empty response from table_get");
 	}
 
-	RecordBatchSingleRow row(batch, 0, "TableInfo", worker_path);
+	if (row_idx >= batch->num_rows()) {
+		throw IOException("Row index %lld out of range (batch has %lld rows)", row_idx, batch->num_rows());
+	}
+
+	RecordBatchSingleRow row(batch, row_idx, "TableInfo", worker_path);
 	info.name = row["name"].value_not_null<std::string>();
 	info.schema_name = row["schema_name"].value_not_null<std::string>();
 	info.comment = row["comment"].value_or("");
@@ -600,6 +605,10 @@ VgiTableInfo ParseTableInfo(const std::shared_ptr<arrow::RecordBatch> &batch, co
 	info.check_constraints = row["check_constraints"].value_not_null<std::vector<std::string>>();
 
 	return info;
+}
+
+VgiTableInfo ParseTableInfo(const std::shared_ptr<arrow::RecordBatch> &batch, const std::string &worker_path) {
+	return ParseTableInfo(batch, 0, worker_path);
 }
 
 std::vector<VgiSchemaInfo> ParseSchemaList(const std::shared_ptr<arrow::RecordBatch> &batch,

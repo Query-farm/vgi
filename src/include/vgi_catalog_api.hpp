@@ -288,6 +288,10 @@ VgiSchemaInfo ParseSchemaInfo(const std::shared_ptr<arrow::RecordBatch> &batch, 
 // Parse a VgiTableInfo from an Arrow RecordBatch (single row)
 VgiTableInfo ParseTableInfo(const std::shared_ptr<arrow::RecordBatch> &batch, const std::string &worker_path);
 
+// Parse a VgiTableInfo from an Arrow RecordBatch at a specific row (for multi-row batches)
+VgiTableInfo ParseTableInfo(const std::shared_ptr<arrow::RecordBatch> &batch, int64_t row_idx,
+                            const std::string &worker_path);
+
 // Parse multiple schemas from a batch (for schemas() call)
 std::vector<VgiSchemaInfo> ParseSchemaList(const std::shared_ptr<arrow::RecordBatch> &batch,
                                            const std::string &worker_path);
