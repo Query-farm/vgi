@@ -44,7 +44,7 @@ struct VgiTableScanBindData : public TableFunctionData {
 
 // Global state for VGI table scan
 struct VgiTableScanGlobalState : public GlobalTableFunctionState {
-	std::unique_ptr<vgi::CatalogMethodStream> stream;
+	std::unique_ptr<vgi::CatalogMethodCall> stream;
 	bool done = false;
 
 	idx_t MaxThreads() const override {
@@ -73,7 +73,7 @@ static unique_ptr<GlobalTableFunctionState> VgiTableScanInitGlobal(ClientContext
 
 	// Create streaming method call for table_scan
 	auto args = vgi::CreateTableGetArgs(bind_data.attach_id, bind_data.schema_name, bind_data.table_name);
-	state->stream = make_uniq<vgi::CatalogMethodStream>(bind_data.worker_path, vgi::CatalogMethod::TableScan, args,
+	state->stream = make_uniq<vgi::CatalogMethodCall>(bind_data.worker_path, vgi::CatalogMethod::TableScan, args,
 	                                                    context, bind_data.worker_debug);
 
 	return state;

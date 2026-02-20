@@ -1,8 +1,17 @@
 # VGI Extension Development
 
-A DuckDB extension implementing the VGI protocol for remote function execution via subprocess workers. Uses Apache Arrow for data interchange.
+This is a DuckDB extension implementing the VGI protocol for remote function execution for table and scalar functions.
 
-Reference implementation: `/Users/rusty/Development/vgi-python` (see `docs/*` for protocol documentation)
+It utilizes the `vgi_rpc` RPC framework for RPC calls over to subprocesses or via http.  The initial implementation will focus on subprocesses. `vgi` uses Apache Arrow for data interchange which makes it efficient and performant.
+
+There is a reference implementation of vgi in `/Users/rusty/Development/vgi-python` (see `docs/*` for protocol documentation)
+There is a reference implementation of vgi_rpc in `/Users/rusty/Development/vgi-rpc-python` (see `docs/*` for protocol documentation)
+
+You will need to activate the `.venv` in vgi or vgi_rpc before running any of their code.
+
+As there is no C++ implementation of `vgi_rpc` as a library this module will need to construct its own implementation for the subprocess transport.  For the HTTP based transport it should use DuckDB's provided `HttpUtils` interface for interacting with the web.
+
+The acceptance critieria for this `vgi` DuckDB module is that it validates and interacts with the example workers implemented in the python implementation of `vgi` for table, scalar and table in/out functions in addition to the entire catalog interface.
 
 ## Build
 
@@ -21,17 +30,13 @@ Run test suites after changes:
 VGI_TEST_WORKER=../vgi-python/.venv/bin/vgi-example-worker ./build/debug/test/unittest --test-dir . "test/sql/vgi_integration.test"
 VGI_TEST_WORKER=../vgi-python/.venv/bin/vgi-example-worker ./build/debug/test/unittest --test-dir . "test/sql/vgi_worker_pool.test"
 VGI_TEST_WORKER=../vgi-python/.venv/bin/vgi-example-worker ./build/debug/test/unittest --test-dir . "test/sql/integration/*"
-VGI_TEST_POLARS_WORKER=../vgi-python/.venv/bin/vgi-example-polars-worker ./build/debug/test/unittest --test-dir . "test/sql/integration/scalar/polars/*"
 ```
 
 Tests complete in <10 seconds. For debugging failures, write standalone `.sql` files in `/tmp/` and run with `./build/debug/duckdb`.
 
 ## Debug Environment Variables
 
-- `VGI_STDERR_LOG=1` - Log to stderr (useful when DuckDB hangs)
-- `VGI_STDERR_LOG_PRETTY=1` - Pretty-print log output with sorted keys and indentation (requires `VGI_STDERR_LOG=1`)
-- `VGI_IPC_DEBUG=1` - IPC debug output from worker
-- `VGI_WORKER_STDERR_PASSTHROUGH=1` - Pass worker stderr to terminal (Python tracebacks)
+See the documentation in `vgi_rpc` to enable logging for the RPC layer.
 
 **vgi-python function classes**: Function names are CamelCased with a `Function` suffix (e.g., `projected_data` → `ProjectedDataFunction` in vgi-python).
 
@@ -53,22 +58,6 @@ Tests complete in <10 seconds. For debugging failures, write standalone `.sql` f
 | `storage/vgi_scalar_function_set.cpp` | Catalog-based scalar functions |
 
 ## Architecture
-
-### Protocol Flow
-
-1. **Bind** (Streams 1-2): Send function name + args, receive output schema
-2. **Init** (Streams 3-4): Send projection pushdown, receive execution ID
-3. **Data** (Streams 5-6): Read Arrow batches until completion
-
-### Table Function Connection Lifecycle (DO NOT CHANGE)
-
-A single FunctionConnection is reused through the query lifecycle:
-
-1. **Bind**: Creates connection, performs bind handshake, stores in `bind_data.bind_connection`
-2. **InitGlobal**: Moves connection from bind_data, performs init, stores in `global_state.primary_connection`
-3. **InitLocal**: First caller claims `primary_connection`; additional workers create secondary connections
-
-This eliminates redundant connection creation. Do not create separate connections per phase.
 
 ### Catalog Integration
 

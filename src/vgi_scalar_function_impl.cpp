@@ -24,10 +24,54 @@ VgiScalarFunctionLocalState::VgiScalarFunctionLocalState() = default;
 
 VgiScalarFunctionLocalState::~VgiScalarFunctionLocalState() {
 	// Clean up connection - try to return to pool if possible
-	if (connection && connection->IsFinished() && connection->CanBePooled()) {
-		auto pooled = connection->ReleaseForPooling();
-		if (pooled) {
-			vgi::VgiWorkerPool::Instance().Release(std::move(pooled), 10);
+	if (connection && initialized) {
+		bool debug = getenv("VGI_STDERR_LOG") != nullptr;
+		if (debug) {
+			fprintf(stderr, "[VGI] scalar.destructor is_finished=%s pid=%d\n",
+			        connection->IsFinished() ? "true" : "false", connection->GetPid());
+		}
+
+		if (!connection->IsFinished()) {
+			try {
+				// Close input stream to signal worker we're done
+				connection->CloseInputWriter();
+				if (debug) {
+					fprintf(stderr, "[VGI] scalar.destructor closed_input_writer pid=%d\n", connection->GetPid());
+				}
+				// Read the output EOS to complete the IPC stream protocol
+				// Worker sends EOS immediately after seeing input close
+				auto batch = connection->ReadDataBatch();
+				if (debug) {
+					fprintf(stderr, "[VGI] scalar.destructor read_eos batch=%s is_finished=%s pid=%d\n",
+					        batch ? "non-null" : "null", connection->IsFinished() ? "true" : "false",
+					        connection->GetPid());
+				}
+			} catch (const std::exception &e) {
+				if (debug) {
+					fprintf(stderr, "[VGI] scalar.destructor exception=%s pid=%d\n", e.what(), connection->GetPid());
+				}
+				return;
+			} catch (...) {
+				if (debug) {
+					fprintf(stderr, "[VGI] scalar.destructor unknown_exception pid=%d\n", connection->GetPid());
+				}
+				return;
+			}
+		}
+
+		if (debug) {
+			fprintf(stderr, "[VGI] scalar.destructor can_be_pooled=%s pid=%d\n",
+			        connection->CanBePooled() ? "true" : "false", connection->GetPid());
+		}
+
+		if (connection->CanBePooled()) {
+			auto pooled = connection->ReleaseForPooling();
+			if (pooled) {
+				if (debug) {
+					fprintf(stderr, "[VGI] scalar.destructor pooled pid=%d\n", pooled->GetPid());
+				}
+				vgi::VgiWorkerPool::Instance().Release(std::move(pooled), 10);
+			}
 		}
 	}
 	// Otherwise connection destructor handles cleanup
@@ -352,18 +396,31 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 		bool worker_debug = bind_data ? bind_data->worker_debug : func_info.worker_debug;
 		const auto &settings = bind_data ? bind_data->settings : func_info.settings;
 
+		bool debug = getenv("VGI_STDERR_LOG") != nullptr;
 		if (use_pool) {
 			auto pooled = VgiWorkerPool::Instance().TryAcquire(worker_path);
 			if (pooled) {
+				if (debug) {
+					fprintf(stderr, "[VGI] scalar.pool_acquire result=hit worker_path=%s pid=%d\n",
+					        worker_path.c_str(), pooled->GetPid());
+				}
 				connection = std::make_unique<FunctionConnection>(
 				    std::move(pooled), function_name, arguments, attach_id, context,
 				    std::vector<uint8_t>{}, worker_debug, settings);
+			} else {
+				if (debug) {
+					fprintf(stderr, "[VGI] scalar.pool_acquire result=miss worker_path=%s\n", worker_path.c_str());
+				}
 			}
 		}
 		if (!connection) {
 			connection = std::make_unique<FunctionConnection>(
 			    worker_path, function_name, arguments, attach_id, context,
 			    std::vector<uint8_t>{}, worker_debug, settings);
+			if (debug) {
+				fprintf(stderr, "[VGI] scalar.new_connection worker_path=%s pid=%d\n",
+				        worker_path.c_str(), connection->GetPid());
+			}
 		}
 
 		// Set input schema for scalar functions (they receive input data as batches)

@@ -26,7 +26,7 @@ void VgiTableSet::LoadEntries(ClientContext &context) {
 	}
 
 	// Call schema_contents with type filter for tables
-	// Use InvokeCatalogMethod (single response) instead of CatalogMethodStream (streaming)
+	// Use InvokeCatalogMethod (single response) instead of CatalogMethodCall (streaming)
 	// because schema_contents returns all tables in a single batch
 	auto worker_path = attach_params->worker_path();
 	auto args = vgi::CreateSchemaContentsArgs(attach_result->attach_id, schema_.name, vgi::SchemaObjectType::Table);

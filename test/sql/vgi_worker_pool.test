@@ -125,11 +125,11 @@ SELECT COUNT(*) FROM vgi_worker_pool();
 statement ok
 ATTACH 'example' AS vgi_nopool (TYPE vgi, LOCATION '${VGI_TEST_WORKER}', pool false);
 
-# Verify the catalog attached successfully
+# Verify the catalog attached successfully (2 schemas: data, main)
 query I
 SELECT COUNT(*) FROM information_schema.schemata WHERE catalog_name = 'vgi_nopool';
 ----
-1
+2
 
 statement ok
 DETACH vgi_nopool;
@@ -148,11 +148,11 @@ true
 statement ok
 ATTACH 'example' AS vgi_pool (TYPE vgi, LOCATION '${VGI_TEST_WORKER}', pool true);
 
-# Verify the catalog attached successfully
+# Verify the catalog attached successfully (2 schemas: data, main)
 query I
 SELECT COUNT(*) FROM information_schema.schemata WHERE catalog_name = 'vgi_pool';
 ----
-1
+2
 
 statement ok
 DETACH vgi_pool;

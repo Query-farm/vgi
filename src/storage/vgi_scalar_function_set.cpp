@@ -35,7 +35,7 @@ void VgiScalarFunctionSet::LoadEntries(ClientContext &context) {
 	auto worker_path = attach_params->worker_path();
 	auto args =
 	    vgi::CreateSchemaContentsArgs(attach_result->attach_id, schema_.name, vgi::SchemaObjectType::ScalarFunction);
-	vgi::CatalogMethodStream stream(worker_path, vgi::CatalogMethod::SchemaContents, args, context,
+	vgi::CatalogMethodCall stream(worker_path, vgi::CatalogMethod::SchemaContents, args, context,
 	                                attach_params->worker_debug());
 
 	// Group functions by name (overloads)

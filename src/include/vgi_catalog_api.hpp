@@ -97,37 +97,39 @@ const char *CatalogMethodToString(CatalogMethod method);
 
 // Invoke a catalog method and return a single result batch.
 // Use this for methods that return a single response (CatalogAttach, TableGet, Catalogs).
-// Handles all the plumbing: spawns worker, sends invocation+args, reads result, waits for exit.
+// Handles all the plumbing: spawns worker, sends invocation+args, reads result.
 // Handles log message batches from the worker - exceptions are thrown, other levels are logged.
 // Throws IOException on worker failure or timeout.
 // Non-exception log messages are written to DuckDB's log via the provided context.
 // If worker_debug is true, worker stderr is passed through to the terminal for debugging.
+// If use_pool is true, attempts to acquire a worker from the pool and returns it after use.
 std::shared_ptr<arrow::RecordBatch> InvokeCatalogMethod(const std::string &worker_path, CatalogMethod method,
                                                         const std::shared_ptr<arrow::RecordBatch> &args,
-                                                        ClientContext &context, bool worker_debug = false);
+                                                        ClientContext &context, bool worker_debug = false,
+                                                        bool use_pool = true);
 
-// Streaming interface for catalog methods that return multiple batches.
-// Use this for methods like Schemas or TableScan that stream results.
+// Wrapper for invoking catalog methods that return a result batch.
+// Catalog methods now return a complete IPC stream: schema header, single record batch
+// (which may have 0 or more rows), and end-of-stream marker.
 // Handles log message batches from the worker - exceptions are thrown, other levels are logged.
-class CatalogMethodStream {
+// If use_pool is true, acquires worker from pool and returns it when call finishes.
+class CatalogMethodCall {
 public:
-	// Start a streaming catalog method call
+	// Start a catalog method call
 	// Non-exception log messages are written to DuckDB's log via the provided context.
 	// If worker_debug is true, worker stderr is passed through to the terminal for debugging.
-	CatalogMethodStream(const std::string &worker_path, CatalogMethod method,
-	                    const std::shared_ptr<arrow::RecordBatch> &args, ClientContext &context,
-	                    bool worker_debug = false);
-	~CatalogMethodStream();
+	// If use_pool is true, attempts to acquire a worker from the pool and returns it after use.
+	CatalogMethodCall(const std::string &worker_path, CatalogMethod method,
+	                  const std::shared_ptr<arrow::RecordBatch> &args, ClientContext &context,
+	                  bool worker_debug = false, bool use_pool = true);
+	~CatalogMethodCall();
 
 	// Read the next result batch. Returns nullptr at end of stream.
 	// Handles log message batches internally (exceptions thrown, others logged).
+	// When stream finishes, automatically returns worker to pool if pooling is enabled.
 	std::shared_ptr<arrow::RecordBatch> ReadNext();
 
-	// Wait for the worker process to exit. Called automatically by destructor.
-	// Returns exit status (0 = success).
-	int Wait();
-
-	// Check if stream has finished (ReadNext returned nullptr)
+	// Check if call has finished (ReadNext returned nullptr)
 	bool IsFinished() const {
 		return finished_;
 	}
@@ -138,14 +140,25 @@ public:
 	}
 
 	// Non-copyable
-	CatalogMethodStream(const CatalogMethodStream &) = delete;
-	CatalogMethodStream &operator=(const CatalogMethodStream &) = delete;
+	CatalogMethodCall(const CatalogMethodCall &) = delete;
+	CatalogMethodCall &operator=(const CatalogMethodCall &) = delete;
 
 private:
+	// Return worker to pool if eligible
+	void ReturnToPoolIfEligible();
+	// Open the IPC stream reader (called lazily on first ReadNext)
+	void OpenStreamReader();
+
 	std::unique_ptr<SubProcess> proc_;
 	ClientContext &context_;
 	std::string worker_path_;
 	bool finished_ = false;
+	bool use_pool_ = true;
+	bool returned_to_pool_ = false;
+
+	// Persistent IPC stream reader for reading multiple batches
+	std::shared_ptr<arrow::io::InputStream> stream_;
+	std::shared_ptr<arrow::ipc::RecordBatchStreamReader> reader_;
 };
 
 // A setting exposed by a VGI worker

@@ -38,10 +38,11 @@ physical_plan	<REGEX>:.*VGI_CATALOGS.*Worker:.*
 statement ok
 ATTACH 'example' AS vgi_test (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
-# Test schema discovery - verify we can see the 'main' schema
-query II
+# Test schema discovery - verify we can see the schemas
+query II rowsort
 SELECT catalog_name, schema_name FROM information_schema.schemata WHERE catalog_name = 'vgi_test';
 ----
+vgi_test	data
 vgi_test	main
 
 # DETACH the catalog

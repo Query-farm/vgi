@@ -37,7 +37,7 @@ void VgiSchemaSet::LoadEntries(ClientContext &context) {
 	// Call "schemas" method via streaming API
 	auto worker_path = attach_params->worker_path();
 	auto args = vgi::CreateCatalogArgsWithAttachId(attach_result->attach_id);
-	vgi::CatalogMethodStream stream(worker_path, vgi::CatalogMethod::Schemas, args, context, attach_params->worker_debug());
+	vgi::CatalogMethodCall stream(worker_path, vgi::CatalogMethod::Schemas, args, context, attach_params->worker_debug());
 
 	// Read schema entries from the stream
 	while (auto result_batch = stream.ReadNext()) {
@@ -53,9 +53,7 @@ void VgiSchemaSet::LoadEntries(ClientContext &context) {
 			CreateEntry(std::move(schema_entry));
 		}
 	}
-
-	// Wait for worker to exit
-	stream.Wait();
+	// Worker is automatically returned to pool when stream finishes or destructor runs
 }
 
 } // namespace duckdb

@@ -70,8 +70,7 @@ void ArrowSchemaToDuckDBTypes(ClientContext &context, const std::shared_ptr<arro
 	ExportSchema(schema, c_schema_out);
 
 	// Step 2: Populate ArrowTableSchema using DuckDB's built-in conversion
-	ArrowTableFunction::PopulateArrowTableSchema(DBConfig::GetConfig(context), arrow_table_out,
-	                                             c_schema_out.arrow_schema);
+	ArrowTableFunction::PopulateArrowTableSchema(context, arrow_table_out, c_schema_out.arrow_schema);
 
 	// Step 3: Extract DuckDB types and names
 	GetDuckDBTypesFromArrowTable(arrow_table_out, c_schema_out.arrow_schema, types, names);
@@ -98,7 +97,7 @@ void ArrowSchemaToColumnList(ClientContext &context, const std::shared_ptr<arrow
 // ============================================================================
 
 FunctionArgumentTypes ParseFunctionArgumentSchema(ClientContext &context,
-                                                   const std::shared_ptr<arrow::Schema> &schema) {
+                                                  const std::shared_ptr<arrow::Schema> &schema) {
 	FunctionArgumentTypes result;
 
 	if (!schema) {
@@ -109,7 +108,7 @@ FunctionArgumentTypes ParseFunctionArgumentSchema(ClientContext &context,
 	ArrowSchemaWrapper c_schema;
 	ArrowTableSchema arrow_table;
 	ExportSchema(schema, c_schema);
-	ArrowTableFunction::PopulateArrowTableSchema(DBConfig::GetConfig(context), arrow_table, c_schema.arrow_schema);
+	ArrowTableFunction::PopulateArrowTableSchema(context, arrow_table, c_schema.arrow_schema);
 
 	auto &columns = arrow_table.GetColumns();
 	int num_fields = schema->num_fields();
@@ -182,7 +181,7 @@ FunctionArgumentTypes ParseFunctionArgumentSchema(ClientContext &context,
 			// during function registration
 			result.positional_types.push_back(LogicalType::TABLE);
 			result.positional_names.push_back(col_name);
-			result.positional_is_const.push_back(false);  // Table inputs are never const
+			result.positional_is_const.push_back(false); // Table inputs are never const
 		} else if (is_named) {
 			// Named argument - add to named_parameters map
 			result.named_parameters[col_name] = duckdb_type;
@@ -229,7 +228,7 @@ ArrowArguments BuildArgumentsFromValues(ClientContext &context, const vector<Val
 		if (!empty_result.ok()) {
 			throw IOException("Failed to create empty struct array: %s", empty_result.status().ToString());
 		}
-		return ArrowArguments{empty_struct_type, empty_result.ValueUnsafe()};
+		return ArrowArguments {empty_struct_type, empty_result.ValueUnsafe()};
 	}
 
 	// Create a single-row DataChunk with the values
@@ -250,7 +249,8 @@ ArrowArguments BuildArgumentsFromValues(ClientContext &context, const vector<Val
 
 	// Use ArrowAppender to convert the DataChunk to Arrow
 	ClientProperties client_props = context.GetClientProperties();
-	ArrowAppender appender(field_types, 1, client_props, ArrowTypeExtensionData::GetExtensionTypes(context, field_types));
+	ArrowAppender appender(field_types, 1, client_props,
+	                       ArrowTypeExtensionData::GetExtensionTypes(context, field_types));
 	appender.Append(chunk, 0, 1, 1);
 	ArrowArray arr = appender.Finalize();
 
@@ -283,7 +283,7 @@ ArrowArguments BuildArgumentsFromValues(ClientContext &context, const vector<Val
 		throw IOException("Failed to create struct array: %s", struct_result.status().ToString());
 	}
 
-	return ArrowArguments{struct_type, struct_result.ValueUnsafe()};
+	return ArrowArguments {struct_type, struct_result.ValueUnsafe()};
 }
 
 // ============================================================================
@@ -327,8 +327,9 @@ bool ColumnValue::is_nullable() const {
 
 void ColumnValue::ThrowNotNullError() const {
 	if (!exists()) {
-		throw InvalidInputException("VGI protocol error: Required column '%s' not found in %s response from worker '%s'",
-		                            column_name_, batch_description_, worker_path_);
+		throw InvalidInputException(
+		    "VGI protocol error: Required column '%s' not found in %s response from worker '%s'", column_name_,
+		    batch_description_, worker_path_);
 	}
 	throw InvalidInputException(
 	    "VGI protocol error: Column '%s' has unexpected null value at row %lld in %s response from worker '%s'",
@@ -584,7 +585,7 @@ std::string ColumnValue::value_or(const std::string &default_val) const {
 }
 
 std::string ColumnValue::value_or(const char *default_val) const {
-	return value_or(std::string{default_val});
+	return value_or(std::string {default_val});
 }
 
 int64_t ColumnValue::value_or(int64_t default_val) const {

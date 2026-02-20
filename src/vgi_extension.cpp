@@ -54,20 +54,25 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 
 	// Call catalog_attach via worker
 	auto args = vgi::CreateCatalogAttachArgs(catalog_name);
-	auto result_batch = vgi::InvokeCatalogMethod(worker_path, vgi::CatalogMethod::CatalogAttach, args, context, worker_debug);
+	auto result_batch =
+	    vgi::InvokeCatalogMethod(worker_path, vgi::CatalogMethod::CatalogAttach, args, context, worker_debug);
 	auto attach_result = vgi::ParseCatalogAttachResult(result_batch, worker_path);
 
 	// Register extension options for settings exposed by this catalog
 	// Check for type conflicts with existing settings
 	auto &config = DBConfig::GetConfig(db.GetDatabase());
+
 	for (const auto &setting : attach_result.settings) {
-		auto existing = config.extension_parameters.find(setting.name);
-		if (existing != config.extension_parameters.end()) {
+		if (config.HasExtensionOption(setting.name)) {
 			// Setting already exists - verify types match
-			if (existing->second.type != setting.type) {
-				throw BinderException(
-				    "VGI setting '%s' already exists with type %s, but catalog '%s' requires type %s",
-				    setting.name, existing->second.type.ToString(), catalog_name, setting.type.ToString());
+			ExtensionOption existing_option;
+			if (!config.TryGetExtensionOption(setting.name, existing_option)) {
+				throw BinderException("Failed to retrieve existing VGI setting '%s'", setting.name);
+			}
+			if (existing_option.type != setting.type) {
+				throw BinderException("VGI setting '%s' already exists with type %s, but catalog '%s' requires type %s",
+				                      setting.name, existing_option.type.ToString(), catalog_name,
+				                      setting.type.ToString());
 			}
 			// Types match - setting is already registered, no need to add again
 		} else {
@@ -85,7 +90,7 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 
 // Create transaction manager for VGI catalog
 static unique_ptr<TransactionManager> CreateVgiTransactionManager(optional_ptr<StorageExtensionInfo> storage_info,
-                                                                   AttachedDatabase &db, Catalog &catalog) {
+                                                                  AttachedDatabase &db, Catalog &catalog) {
 	auto &vgi_catalog = catalog.Cast<VgiCatalog>();
 	return make_uniq<VgiTransactionManager>(db, vgi_catalog);
 }
@@ -115,15 +120,14 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	// Register VGI storage extension
 	auto &config = DBConfig::GetConfig(loader.GetDatabaseInstance());
-	config.storage_extensions["vgi"] = make_uniq<VgiStorageExtension>();
+	StorageExtension::Register(config, "vgi", make_shared_ptr<VgiStorageExtension>());
 
 	// Register worker pool settings
 	config.AddExtensionOption("vgi_worker_pool_idle_limit_seconds",
 	                          "Maximum idle time in seconds before pooled workers are removed", LogicalType::BIGINT,
 	                          Value::BIGINT(5));
-	config.AddExtensionOption("vgi_worker_pool_max",
-	                          "Maximum number of workers to keep in the pool (0 = disabled)", LogicalType::BIGINT,
-	                          Value::BIGINT(256));
+	config.AddExtensionOption("vgi_worker_pool_max", "Maximum number of workers to keep in the pool (0 = disabled)",
+	                          LogicalType::BIGINT, Value::BIGINT(256));
 
 	// Register VGI table functions
 	RegisterVgiCatalogsFunction(loader);

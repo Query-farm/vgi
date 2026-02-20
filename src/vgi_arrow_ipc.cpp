@@ -219,17 +219,31 @@ arrow::RecordBatchWithMetadata ReadRecordBatch(int fd, const std::string &worker
 
 	// Consume any remaining stream data including EOS marker
 	// This is critical to avoid leaving data in the stream that would confuse the next reader
+	int drain_count = 0;
+	bool debug_ipc = getenv("VGI_IPC_DEBUG") != nullptr;
 	while (true) {
 		auto drain_result = reader->ReadNext();
 		if (!drain_result.ok()) {
 			// Error reading - might be at end of stream
+			if (debug_ipc) {
+				fprintf(stderr, "[VGI_IPC_DEBUG] pid=%d drain error after %d batches: %s\n", worker_pid, drain_count,
+				        drain_result.status().ToString().c_str());
+			}
 			break;
 		}
+		drain_count++;
 		if (!drain_result.ValueUnsafe().batch) {
-			// Null batch means end of stream
+			// Null batch means end of stream - this is the expected EOS
+			if (debug_ipc) {
+				fprintf(stderr, "[VGI_IPC_DEBUG] pid=%d drain complete after %d reads (EOS)\n", worker_pid, drain_count);
+			}
 			break;
 		}
 		// Unexpected extra batch - this shouldn't happen for single-batch streams
+		if (debug_ipc) {
+			fprintf(stderr, "[VGI_IPC_DEBUG] pid=%d unexpected extra batch %d with %lld rows\n", worker_pid, drain_count,
+			        drain_result.ValueUnsafe().batch->num_rows());
+		}
 	}
 
 	return batch_with_metadata;

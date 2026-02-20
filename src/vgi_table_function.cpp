@@ -12,23 +12,6 @@ using vgi::VgiTableFunctionBindData;
 using vgi::VgiTableFunctionGlobalState;
 using vgi::VgiTableFunctionLocalState;
 
-// Extract all registered extension options and return their current values
-// For direct vgi_table_function() calls, we pass all extension options since
-// we don't know which catalog the function belongs to
-std::map<std::string, std::string> ExtractAllExtensionSettings(ClientContext &context) {
-	std::map<std::string, std::string> settings;
-
-	auto &db_config = DBConfig::GetConfig(context);
-	for (const auto &[name, opt] : db_config.extension_parameters) {
-		Value value;
-		if (context.TryGetCurrentSetting(name, value)) {
-			settings[name] = value.ToString();
-		}
-	}
-
-	return settings;
-}
-
 // ============================================================================
 // Bind Function - Specific to vgi_table_function() direct invocation
 // ============================================================================
@@ -63,11 +46,6 @@ static unique_ptr<FunctionData> VgiTableFunctionBind(ClientContext &context, Tab
 
 	// Build Arrow arguments struct from positional and named args
 	bind_data->arguments = vgi::BuildArgumentsFromValues(context, positional_args, named_args);
-
-	// Extract all registered extension settings
-	// For direct calls, we pass all extension options since we don't know which
-	// catalog's settings this function might need
-	bind_data->settings = ExtractAllExtensionSettings(context);
 
 	// Perform the common bind handshake
 	vgi::PerformVgiTableFunctionBind(context, *bind_data, return_types, names);

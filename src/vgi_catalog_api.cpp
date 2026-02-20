@@ -35,8 +35,9 @@ static void SendInvocationAndArgs(SubProcess &proc, const std::string &method_na
 	auto args_bytes = SerializeRecordBatch(args, args_metadata);
 	WriteAll(proc.GetStdinFd(), args_bytes->data(), args_bytes->size());
 
-	// Close stdin to signal end of input
-	proc.CloseStdin();
+	// Note: We do NOT close stdin here. The VGI protocol supports worker reuse -
+	// after responding, the worker loops back waiting for the next invocation.
+	// Keeping stdin open allows the worker to be returned to the pool.
 }
 
 // ============================================================================
@@ -203,27 +204,68 @@ const char *CatalogMethodToString(CatalogMethod method) {
 
 std::shared_ptr<arrow::RecordBatch> InvokeCatalogMethod(const std::string &worker_path, CatalogMethod method,
                                                         const std::shared_ptr<arrow::RecordBatch> &args,
-                                                        ClientContext &context, bool worker_debug) {
+                                                        ClientContext &context, bool worker_debug, bool use_pool) {
 	const char *method_name = CatalogMethodToString(method);
 
-	// Spawn the worker process
-	SubProcess proc(worker_path, worker_debug);
+	// Try to acquire a worker from the pool if enabled
+	std::unique_ptr<SubProcess> proc;
+
+	if (use_pool) {
+		auto pooled_worker = VgiWorkerPool::Instance().TryAcquire(worker_path);
+		if (pooled_worker) {
+			proc = pooled_worker->Release();
+			VGI_LOG(context, "worker_pool.acquire",
+			        {{"worker_path", worker_path},
+			         {"worker_pid", std::to_string(proc->GetPid())},
+			         {"result", "hit"},
+			         {"phase", "catalog_method"}});
+		}
+	}
+
+	// Spawn fresh worker if pool miss or pool disabled
+	if (!proc) {
+		proc = std::make_unique<SubProcess>(worker_path, worker_debug);
+		if (use_pool) {
+			VgiWorkerPool::Instance().RecordMiss(worker_path);
+		}
+		VGI_LOG(context, "worker_pool.acquire",
+		        {{"worker_path", worker_path},
+		         {"worker_pid", std::to_string(proc->GetPid())},
+		         {"result", use_pool ? "miss" : "disabled"},
+		         {"phase", "catalog_method"}});
+	}
 
 	VGI_LOG(
 	    context, "catalog_method.invoke",
-	    {{"worker_path", worker_path}, {"worker_pid", std::to_string(proc.GetPid())}, {"method_name", method_name}});
+	    {{"worker_path", worker_path}, {"worker_pid", std::to_string(proc->GetPid())}, {"method_name", method_name}});
 
 	// Send invocation and args
-	SendInvocationAndArgs(proc, method_name, args);
+	SendInvocationAndArgs(*proc, method_name, args);
 
 	// Read batches, handling log messages until we get actual data
 	arrow::RecordBatchWithMetadata result;
+	int batches_read = 0;
 	while (true) {
 		try {
-			result = ReadRecordBatch(proc.GetStdoutFd(), worker_path, proc.GetPid());
+			VGI_LOG(context, "catalog_method.read_batch",
+			        {{"worker_path", worker_path},
+			         {"worker_pid", std::to_string(proc->GetPid())},
+			         {"method_name", method_name},
+			         {"batches_read", std::to_string(batches_read)},
+			         {"phase", "before_read"}});
+			result = ReadRecordBatch(proc->GetStdoutFd(), worker_path, proc->GetPid());
+			batches_read++;
+			VGI_LOG(context, "catalog_method.read_batch",
+			        {{"worker_path", worker_path},
+			         {"worker_pid", std::to_string(proc->GetPid())},
+			         {"method_name", method_name},
+			         {"batches_read", std::to_string(batches_read)},
+			         {"has_batch", result.batch ? "true" : "false"},
+			         {"num_rows", result.batch ? std::to_string(result.batch->num_rows()) : "null"},
+			         {"phase", "after_read"}});
 		} catch (const IOException &e) {
 			// Check if the worker process died early (e.g., command not found)
-			CheckWorkerExitStatus(proc, worker_path, "failed to start");
+			CheckWorkerExitStatus(*proc, worker_path, "failed to start");
 			// Re-throw original error if process didn't die early
 			throw;
 		}
@@ -231,74 +273,209 @@ std::shared_ptr<arrow::RecordBatch> InvokeCatalogMethod(const std::string &worke
 		// Null batch from ReadRecordBatch means EOF (pipe closed)
 		// Check if the worker failed before sending data
 		if (!result.batch) {
-			CheckWorkerExitStatus(proc, worker_path, "exited with status");
-			ThrowVgiIOException("VGI worker closed connection without sending data", worker_path, proc.GetPid(), "");
+			VGI_LOG(context, "catalog_method.null_batch",
+			        {{"worker_path", worker_path},
+			         {"worker_pid", std::to_string(proc->GetPid())},
+			         {"method_name", method_name},
+			         {"batches_read", std::to_string(batches_read)}});
+			CheckWorkerExitStatus(*proc, worker_path, "exited with status");
+			ThrowVgiIOException("VGI worker closed connection without sending data", worker_path, proc->GetPid(), "");
 		}
 
 		// Check for log messages (will throw on EXCEPTION)
 		// If it was a log message, continue reading the next batch
 		// Note: Catalog methods don't have invocation_id or attach_id
-		if (!HandleBatchLogMessage(result.batch, result.custom_metadata, &context, worker_path, proc.GetPid(), "", "",
+		if (!HandleBatchLogMessage(result.batch, result.custom_metadata, &context, worker_path, proc->GetPid(), "", "",
 		                           "")) {
 			break;
 		}
 	}
 
-	// Wait for the worker to exit and check status
-	bool exited_normally = false;
-	int exit_status = proc.Wait(&exited_normally);
+	// Return worker to pool if still alive, otherwise let it be cleaned up
+	if (use_pool) {
+		int exit_status = 0;
+		bool has_exited = proc->TryWait(&exit_status);
+		VGI_LOG(context, "catalog_method.pool_check",
+		        {{"worker_path", worker_path},
+		         {"worker_pid", std::to_string(proc->GetPid())},
+		         {"method_name", method_name},
+		         {"has_exited", has_exited ? "true" : "false"},
+		         {"exit_status", std::to_string(exit_status)},
+		         {"batches_read", std::to_string(batches_read)}});
 
-	if (!exited_normally) {
-		ThrowVgiIOException("VGI worker was killed by signal %d", worker_path, proc.GetPid(), "", exit_status);
+		if (!has_exited) {
+			// Worker is still alive - return to pool
+			Value max_val;
+			size_t max_pool_size = 0;
+			if (context.TryGetCurrentSetting("vgi_worker_pool_max", max_val)) {
+				max_pool_size = static_cast<size_t>(max_val.GetValue<int64_t>());
+			}
+
+			auto to_pool = std::make_unique<PooledWorker>(std::move(proc), worker_path, -1);
+			VGI_LOG(context, "worker_pool.release",
+			        {{"worker_path", worker_path},
+			         {"worker_pid", std::to_string(to_pool->GetPid())},
+			         {"max_pool_size", std::to_string(max_pool_size)},
+			         {"phase", "catalog_method"}});
+			VgiWorkerPool::Instance().Release(std::move(to_pool), max_pool_size);
+		}
 	}
-	if (exit_status != 0) {
-		ThrowVgiIOException("VGI worker exited with status %d", worker_path, proc.GetPid(), "", exit_status);
-	}
+	// If worker exited or pool disabled, proc destructor will clean up
 
 	return result.batch;
 }
 
 // ============================================================================
-// CatalogMethodStream - Streaming results
+// CatalogMethodCall - Invoke catalog methods
 // ============================================================================
 
-CatalogMethodStream::CatalogMethodStream(const std::string &worker_path, CatalogMethod method,
-                                         const std::shared_ptr<arrow::RecordBatch> &args, ClientContext &context,
-                                         bool worker_debug)
-    : proc_(std::make_unique<SubProcess>(worker_path, worker_debug)), context_(context), worker_path_(worker_path) {
+CatalogMethodCall::CatalogMethodCall(const std::string &worker_path, CatalogMethod method,
+                                     const std::shared_ptr<arrow::RecordBatch> &args, ClientContext &context,
+                                     bool worker_debug, bool use_pool)
+    : context_(context), worker_path_(worker_path), use_pool_(use_pool) {
 	const char *method_name = CatalogMethodToString(method);
+
+	// Try to acquire a worker from the pool if enabled
+	if (use_pool_) {
+		auto pooled_worker = VgiWorkerPool::Instance().TryAcquire(worker_path);
+		if (pooled_worker) {
+			proc_ = pooled_worker->Release();
+			VGI_LOG(context_, "worker_pool.acquire",
+			        {{"worker_path", worker_path_},
+			         {"worker_pid", std::to_string(proc_->GetPid())},
+			         {"result", "hit"},
+			         {"phase", "catalog_method_call"}});
+		}
+	}
+
+	// Spawn fresh worker if pool miss or pool disabled
+	if (!proc_) {
+		proc_ = std::make_unique<SubProcess>(worker_path, worker_debug);
+		if (use_pool_) {
+			VgiWorkerPool::Instance().RecordMiss(worker_path);
+		}
+		VGI_LOG(context_, "worker_pool.acquire",
+		        {{"worker_path", worker_path_},
+		         {"worker_pid", std::to_string(proc_->GetPid())},
+		         {"result", use_pool_ ? "miss" : "disabled"},
+		         {"phase", "catalog_method_call"}});
+	}
+
 	VGI_LOG(
 	    context_, "catalog_method.invoke",
 	    {{"worker_path", worker_path_}, {"worker_pid", std::to_string(proc_->GetPid())}, {"method_name", method_name}});
 	SendInvocationAndArgs(*proc_, method_name, args);
 }
 
-CatalogMethodStream::~CatalogMethodStream() {
-	if (proc_) {
-		proc_->Wait();
+CatalogMethodCall::~CatalogMethodCall() {
+	// Return to pool if we haven't already
+	ReturnToPoolIfEligible();
+	// If we still have a proc (pooling failed or disabled), it will be destroyed here
+}
+
+void CatalogMethodCall::ReturnToPoolIfEligible() {
+	if (returned_to_pool_ || !proc_ || !use_pool_) {
+		return;
+	}
+
+	// Drain and close the stream reader before returning to pool
+	// This ensures the IPC stream is fully consumed and no lingering reads
+	// happen when the stream objects are destroyed later
+	int drained_batches = 0;
+	if (reader_) {
+		// Drain any remaining data (similar to FunctionConnection::ReadDataBatch)
+		while (true) {
+			auto drain_result = reader_->ReadNext();
+			if (!drain_result.ok() || !drain_result.ValueUnsafe().batch) {
+				break;
+			}
+			drained_batches++;
+		}
+		reader_.reset();
+	}
+	stream_.reset();
+
+	// Check if worker is still alive
+	if (!proc_->TryWait()) {
+		Value max_val;
+		size_t max_pool_size = 0;
+		if (context_.TryGetCurrentSetting("vgi_worker_pool_max", max_val)) {
+			max_pool_size = static_cast<size_t>(max_val.GetValue<int64_t>());
+		}
+
+		auto to_pool = std::make_unique<PooledWorker>(std::move(proc_), worker_path_, -1);
+		VGI_LOG(context_, "worker_pool.release",
+		        {{"worker_path", worker_path_},
+		         {"worker_pid", std::to_string(to_pool->GetPid())},
+		         {"max_pool_size", std::to_string(max_pool_size)},
+		         {"finished", finished_ ? "true" : "false"},
+		         {"reader_was_open", reader_ ? "false" : "true"},
+		         {"drained_batches", std::to_string(drained_batches)},
+		         {"phase", "catalog_method_call"}});
+		VgiWorkerPool::Instance().Release(std::move(to_pool), max_pool_size);
+		returned_to_pool_ = true;
 	}
 }
 
-std::shared_ptr<arrow::RecordBatch> CatalogMethodStream::ReadNext() {
+void CatalogMethodCall::OpenStreamReader() {
+	if (reader_) {
+		return; // Already opened
+	}
+
+	stream_ = std::make_shared<FdInputStream>(proc_->GetStdoutFd());
+	auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(stream_);
+	if (!reader_result.ok()) {
+		auto status = reader_result.status();
+		// Check if the worker process died early
+		CheckWorkerExitStatus(*proc_, worker_path_, "failed to start");
+		ThrowVgiIOException("Failed to open catalog result stream: %s", worker_path_, proc_->GetPid(), "",
+		                    status.ToString());
+	}
+	reader_ = reader_result.ValueUnsafe();
+}
+
+std::shared_ptr<arrow::RecordBatch> CatalogMethodCall::ReadNext() {
 	if (finished_ || !proc_) {
+		VGI_LOG(context_, "catalog_method_call.read_next",
+		        {{"worker_path", worker_path_},
+		         {"worker_pid", proc_ ? std::to_string(proc_->GetPid()) : "null"},
+		         {"result", "already_finished"}});
 		return nullptr;
 	}
 
-	arrow::RecordBatchWithMetadata result;
-	try {
-		result = ReadRecordBatch(proc_->GetStdoutFd(), worker_path_, proc_->GetPid());
-	} catch (const IOException &e) {
-		// Check if the worker process died early (e.g., command not found)
-		CheckWorkerExitStatus(*proc_, worker_path_, "failed to start");
-		// Re-throw - ReadRecordBatch now returns null batch for EOF instead of throwing
-		throw;
+	// Open the stream reader on first call
+	OpenStreamReader();
+
+	// Read from the persistent IPC stream reader
+	auto read_result = reader_->ReadNext();
+	if (!read_result.ok()) {
+		auto status = read_result.status();
+		// Invalid status typically indicates end-of-stream
+		if (status.IsInvalid()) {
+			VGI_LOG(context_, "catalog_method_call.read_next",
+			        {{"worker_path", worker_path_},
+			         {"worker_pid", std::to_string(proc_->GetPid())},
+			         {"result", "invalid_status_eos"}});
+			finished_ = true;
+			ReturnToPoolIfEligible();
+			return nullptr;
+		}
+		// Check if the worker process died
+		CheckWorkerExitStatus(*proc_, worker_path_, "failed during read");
+		ThrowVgiIOException("Failed to read catalog result batch: %s", worker_path_, proc_->GetPid(), "",
+		                    status.ToString());
 	}
 
-	// Null batch from ReadRecordBatch means EOF (pipe closed)
-	// Check if the worker failed before sending data
+	auto result = read_result.ValueUnsafe();
+
+	// Null batch means end of stream
 	if (!result.batch) {
-		CheckWorkerExitStatus(*proc_, worker_path_, "exited with status");
+		VGI_LOG(context_, "catalog_method_call.read_next",
+		        {{"worker_path", worker_path_},
+		         {"worker_pid", std::to_string(proc_->GetPid())},
+		         {"result", "null_batch_eos"}});
 		finished_ = true;
+		ReturnToPoolIfEligible();
 		return nullptr;
 	}
 
@@ -315,20 +492,15 @@ std::shared_ptr<arrow::RecordBatch> CatalogMethodStream::ReadNext() {
 	ValidateProtocolState(result.custom_metadata, ProtocolState::CATALOG_RESULT, "catalog result", worker_path_,
 	                      proc_->GetPid());
 
-	// Empty batch signals end of stream
-	if (result.batch->num_rows() == 0) {
-		finished_ = true;
-		return nullptr;
-	}
+	VGI_LOG(context_, "catalog_method_call.read_next",
+	        {{"worker_path", worker_path_},
+	         {"worker_pid", std::to_string(proc_->GetPid())},
+	         {"result", "batch"},
+	         {"num_rows", std::to_string(result.batch->num_rows())}});
 
+	// Return the batch (may have 0 or more rows - empty batches are valid data)
+	// The IPC stream reader returns nullptr when reaching the actual EOS marker
 	return result.batch;
-}
-
-int CatalogMethodStream::Wait() {
-	if (!proc_) {
-		return 0;
-	}
-	return proc_->Wait();
 }
 
 // ============================================================================
@@ -1495,6 +1667,13 @@ std::unique_ptr<PooledWorker> FunctionConnection::ReleaseForPooling() {
 	if (!CanBePooled()) {
 		return nullptr;
 	}
+
+	// Clean up the IPC stream reader before releasing the worker
+	// This ensures no lingering references that could interfere with future reads
+	// The data stream should already be drained (ReadDataBatch drains on FINISHED status)
+	// but we need to release these objects before moving the subprocess
+	data_reader_.reset();
+	data_stream_.reset();
 
 	// Stop stderr thread but keep the fd open for reuse
 	StopStderrReader(false);
