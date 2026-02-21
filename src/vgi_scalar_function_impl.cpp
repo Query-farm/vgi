@@ -172,6 +172,7 @@ unique_ptr<FunctionData> VgiScalarFunctionBind(ClientContext &context, ScalarFun
 	// Phase 5: Connect to worker and perform bind to get output schema
 	// ========================================================================
 	std::shared_ptr<arrow::Schema> output_schema;
+	std::unique_ptr<FunctionConnection> bind_connection;
 
 	// For functions with const params, skip the worker call on re-bind (const values were already extracted)
 	// For functions without const params (but with dynamic return type), always call the worker
@@ -204,6 +205,9 @@ unique_ptr<FunctionData> VgiScalarFunctionBind(ClientContext &context, ScalarFun
 
 		// Get the output schema from bind result
 		output_schema = bind_result.output_schema;
+
+		// Persist bind connection for reuse in execute (avoids spawning a second worker)
+		bind_connection = std::move(connection);
 	}
 
 	if (!output_schema || output_schema->num_fields() != 1) {
@@ -241,8 +245,10 @@ unique_ptr<FunctionData> VgiScalarFunctionBind(ClientContext &context, ScalarFun
 	bind_data->input_schema = input_schema;
 	bind_data->const_values = const_values;
 
-	// We don't keep the connection - it will be recreated during execution
-	// (The bind connection is discarded; scalar functions create new connections per execution)
+	// Persist the bind connection for reuse in execute.
+	// The connection is post-bind, pre-init; execute will call PerformInit() + OpenInputWriter().
+	// Copy() leaves bind_connection as nullptr, so copies fall back to pool/fresh connection.
+	bind_data->bind_connection = std::move(bind_connection);
 
 	return bind_data;
 }
@@ -299,8 +305,9 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 		}
 		ArrowArguments arguments = BuildArgumentsFromValues(context, positional_args, {});
 
-		// Create connection (try pool first)
+		// Acquire connection: reuse bind connection, try pool, or spawn fresh
 		std::unique_ptr<FunctionConnection> connection;
+		bool reused_bind_connection = false;
 		bool use_pool = bind_data ? bind_data->use_pool : func_info.use_pool;
 		const auto &worker_path = bind_data ? bind_data->worker_path : func_info.worker_path;
 		const auto &attach_id = bind_data ? bind_data->attach_id : func_info.attach_id;
@@ -308,7 +315,19 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 		bool worker_debug = bind_data ? bind_data->worker_debug : func_info.worker_debug;
 		const auto &settings = bind_data ? bind_data->settings : func_info.settings;
 
-		if (use_pool) {
+		// Try to reuse the bind-phase connection (avoids spawning a second worker)
+		if (bind_data) {
+			std::lock_guard<std::mutex> lock(bind_data->bind_connection_mutex);
+			if (bind_data->bind_connection) {
+				connection = std::move(bind_data->bind_connection);
+				reused_bind_connection = true;
+				VGI_STDERR_DEBUG("[VGI] scalar.reuse_bind_connection worker_path=%s pid=%d\n",
+				                 worker_path.c_str(), connection->GetPid());
+			}
+		}
+
+		// Fall back to pool or fresh connection
+		if (!connection && use_pool) {
 			auto pooled = VgiWorkerPool::Instance().TryAcquire(worker_path);
 			if (pooled) {
 				VGI_STDERR_DEBUG("[VGI] scalar.pool_acquire result=hit worker_path=%s pid=%d\n",
@@ -328,11 +347,13 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 			                 worker_path.c_str(), connection->GetPid());
 		}
 
-		// Set input schema for scalar functions (they receive input data as batches)
-		connection->SetInputSchema(local_state.input_schema);
-
-		// Perform bind and init
-		connection->PerformBindFull();
+		if (!reused_bind_connection) {
+			// New connection needs input schema set and full bind handshake.
+			// Reused connections already have these from the bind phase.
+			// (SetInputSchema throws if called after bind — see vgi_catalog_api.cpp:1475)
+			connection->SetInputSchema(local_state.input_schema);
+			connection->PerformBindFull();
+		}
 		connection->PerformInit();
 		connection->OpenInputWriter();
 
