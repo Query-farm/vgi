@@ -8,7 +8,6 @@
 #include "storage/vgi_catalog.hpp"
 #include "storage/vgi_schema_entry.hpp"
 #include "vgi_catalog_api.hpp"
-#include "vgi_protocol.hpp"
 
 namespace duckdb {
 
@@ -34,26 +33,18 @@ void VgiSchemaSet::LoadEntries(ClientContext &context) {
 		return;
 	}
 
-	// Call "schemas" method via streaming API
-	auto worker_path = attach_params->worker_path();
-	auto args = vgi::CreateCatalogArgsWithAttachId(attach_result->attach_id);
-	vgi::CatalogMethodCall stream(worker_path, vgi::CatalogMethod::Schemas, args, context, attach_params->worker_debug());
+	// Call catalog_schemas via RPC
+	auto schema_list = vgi::InvokeCatalogSchemas(attach_params->worker_path(), attach_result->attach_id, context,
+	                                             attach_params->worker_debug());
 
-	// Read schema entries from the stream
-	while (auto result_batch = stream.ReadNext()) {
-		// Parse schema list from this batch
-		auto schema_list = vgi::ParseSchemaList(result_batch, worker_path);
+	// Create schema entries
+	for (auto &schema_info : schema_list) {
+		CreateSchemaInfo info;
+		info.schema = schema_info.name;
 
-		// Create schema entries
-		for (auto &schema_info : schema_list) {
-			CreateSchemaInfo info;
-			info.schema = schema_info.name;
-
-			auto schema_entry = make_uniq<VgiSchemaEntry>(catalog_, info, schema_info);
-			CreateEntry(std::move(schema_entry));
-		}
+		auto schema_entry = make_uniq<VgiSchemaEntry>(catalog_, info, schema_info);
+		CreateEntry(std::move(schema_entry));
 	}
-	// Worker is automatically returned to pool when stream finishes or destructor runs
 }
 
 } // namespace duckdb

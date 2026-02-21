@@ -15,10 +15,10 @@ VGI worker not found or not executable
 statement error
 SELECT * FROM vgi_catalogs('/bin/echo');
 ----
-VGI worker closed connection without sending data
+RPC response stream EOF (no schema)
 
 # Test vgi_catalogs with empty string path
 statement error
 SELECT * FROM vgi_catalogs('');
 ----
-VGI worker closed connection without sending data
+RPC response stream EOF (no schema)

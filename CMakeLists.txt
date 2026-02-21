@@ -25,7 +25,8 @@ src/vgi_logging.cpp
 src/vgi_subprocess.cpp
 src/vgi_arrow_ipc.cpp
 src/vgi_arrow_utils.cpp
-src/vgi_protocol.cpp
+src/vgi_rpc_client.cpp
+src/vgi_rpc_types.cpp
 src/vgi_catalogs.cpp
 src/vgi_table_function.cpp
 src/vgi_table_function_impl.cpp

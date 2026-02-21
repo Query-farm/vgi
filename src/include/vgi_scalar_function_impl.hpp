@@ -108,6 +108,9 @@ struct VgiScalarFunctionLocalState : public FunctionLocalState {
 
 	// Cached input schema (built from DataChunk column types on first call)
 	std::shared_ptr<arrow::Schema> input_schema;
+
+	// Pool settings captured during initialization (for use in destructor)
+	size_t max_pool_size = 0;
 };
 
 // ============================================================================

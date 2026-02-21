@@ -131,9 +131,16 @@ bool HandleBatchLogMessage(const std::shared_ptr<arrow::RecordBatch> &batch,
 		return false;
 	}
 
-	// Look for vgi.log_level and vgi.log_message
-	int level_idx = custom_metadata->FindKey("vgi.log_level");
-	int message_idx = custom_metadata->FindKey("vgi.log_message");
+	// Look for vgi_rpc.log_level and vgi_rpc.log_message (new protocol)
+	// Also check legacy vgi.log_level for backwards compatibility during migration
+	int level_idx = custom_metadata->FindKey("vgi_rpc.log_level");
+	int message_idx = custom_metadata->FindKey("vgi_rpc.log_message");
+	if (level_idx < 0) {
+		level_idx = custom_metadata->FindKey("vgi.log_level");
+	}
+	if (message_idx < 0) {
+		message_idx = custom_metadata->FindKey("vgi.log_message");
+	}
 
 	if (level_idx < 0 || message_idx < 0) {
 		return false;
@@ -142,10 +149,14 @@ bool HandleBatchLogMessage(const std::shared_ptr<arrow::RecordBatch> &batch,
 	std::string log_level = custom_metadata->value(level_idx);
 	std::string log_message = custom_metadata->value(message_idx);
 
-	// Parse vgi.log_extra if present (contains traceback for exceptions)
+	// Parse vgi_rpc.log_extra if present (contains traceback for exceptions)
+	// Also check legacy vgi.log_extra for backwards compatibility
 	std::string traceback;
 	std::string exception_type;
-	int extra_idx = custom_metadata->FindKey("vgi.log_extra");
+	int extra_idx = custom_metadata->FindKey("vgi_rpc.log_extra");
+	if (extra_idx < 0) {
+		extra_idx = custom_metadata->FindKey("vgi.log_extra");
+	}
 	if (extra_idx >= 0) {
 		std::string extra_json = custom_metadata->value(extra_idx);
 		auto doc = yyjson_read(extra_json.c_str(), extra_json.size(), 0);

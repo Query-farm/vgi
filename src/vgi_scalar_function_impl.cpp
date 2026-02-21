@@ -70,7 +70,7 @@ VgiScalarFunctionLocalState::~VgiScalarFunctionLocalState() {
 				if (debug) {
 					fprintf(stderr, "[VGI] scalar.destructor pooled pid=%d\n", pooled->GetPid());
 				}
-				vgi::VgiWorkerPool::Instance().Release(std::move(pooled), 10);
+				vgi::VgiWorkerPool::Instance().Release(std::move(pooled), max_pool_size);
 			}
 		}
 	}
@@ -277,21 +277,21 @@ unique_ptr<FunctionData> VgiScalarFunctionBind(ClientContext &context, ScalarFun
 			if (pooled) {
 				connection = std::make_unique<FunctionConnection>(
 				    std::move(pooled), func_info.function_name, arrow_arguments, func_info.attach_id, context,
-				    std::vector<uint8_t>{}, func_info.worker_debug, func_info.settings);
+				    "SCALAR", std::vector<uint8_t>{}, func_info.worker_debug, func_info.settings);
 			}
 		}
 		if (!connection) {
 			connection = std::make_unique<FunctionConnection>(
 			    func_info.worker_path, func_info.function_name, arrow_arguments, func_info.attach_id, context,
-			    std::vector<uint8_t>{}, func_info.worker_debug, func_info.settings);
+			    "SCALAR", std::vector<uint8_t>{}, func_info.worker_debug, func_info.settings);
 		}
 
 		// Set input schema and perform bind to get actual output schema
 		connection->SetInputSchema(input_schema);
-		auto output_spec = connection->PerformBindFull();
+		auto bind_result = connection->PerformBindFull();
 
 		// Get the output schema from bind result
-		output_schema = output_spec.output_schema;
+		output_schema = bind_result.output_schema;
 	}
 
 	if (!output_schema || output_schema->num_fields() != 1) {
@@ -406,7 +406,7 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 				}
 				connection = std::make_unique<FunctionConnection>(
 				    std::move(pooled), function_name, arguments, attach_id, context,
-				    std::vector<uint8_t>{}, worker_debug, settings);
+				    "SCALAR", std::vector<uint8_t>{}, worker_debug, settings);
 			} else {
 				if (debug) {
 					fprintf(stderr, "[VGI] scalar.pool_acquire result=miss worker_path=%s\n", worker_path.c_str());
@@ -416,7 +416,7 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 		if (!connection) {
 			connection = std::make_unique<FunctionConnection>(
 			    worker_path, function_name, arguments, attach_id, context,
-			    std::vector<uint8_t>{}, worker_debug, settings);
+			    "SCALAR", std::vector<uint8_t>{}, worker_debug, settings);
 			if (debug) {
 				fprintf(stderr, "[VGI] scalar.new_connection worker_path=%s pid=%d\n",
 				        worker_path.c_str(), connection->GetPid());
@@ -433,6 +433,9 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 
 		local_state.connection = std::move(connection);
 		local_state.initialized = true;
+
+		// Capture pool max size for use in destructor (where ClientContext may not be accessible)
+		local_state.max_pool_size = vgi::VgiWorkerPool::GetMaxPoolSize(context);
 
 		VGI_LOG(context, "scalar.init",
 		        {{"worker_path", worker_path},

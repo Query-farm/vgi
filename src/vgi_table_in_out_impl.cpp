@@ -195,15 +195,15 @@ unique_ptr<FunctionData> VgiTableInOutBind(ClientContext &context, TableFunction
 			         {"pid", std::to_string(pooled->GetPid())}});
 			connection = std::make_unique<FunctionConnection>(std::move(pooled), bind_data->function_name,
 			                                                   bind_data->arguments, bind_data->attach_id, context,
-			                                                   std::vector<uint8_t>{}, bind_data->worker_debug,
-			                                                   bind_data->settings);
+			                                                   "TABLE", std::vector<uint8_t>{},
+			                                                   bind_data->worker_debug, bind_data->settings);
 		}
 	}
 	if (!connection) {
 		connection = std::make_unique<FunctionConnection>(bind_data->worker_path, bind_data->function_name,
 		                                                   bind_data->arguments, bind_data->attach_id, context,
-		                                                   std::vector<uint8_t>{}, bind_data->worker_debug,
-		                                                   bind_data->settings);
+		                                                   "TABLE", std::vector<uint8_t>{},
+		                                                   bind_data->worker_debug, bind_data->settings);
 		if (!from_pool) {
 			VGI_LOG(context, "table_in_out.pool_acquire",
 			        {{"worker_path", bind_data->worker_path},
@@ -216,12 +216,12 @@ unique_ptr<FunctionData> VgiTableInOutBind(ClientContext &context, TableFunction
 	connection->SetInputSchema(bind_data->input_schema);
 
 	// Perform bind
-	auto output_spec = connection->PerformBindFull();
+	auto bind_result = connection->PerformBindFull();
 
-	// Store output schema
-	bind_data->output_schema = output_spec.output_schema;
-	bind_data->max_processes = output_spec.max_processes;
-	bind_data->cardinality_estimate = output_spec.cardinality_estimate;
+	// Store output schema (max_processes and cardinality_estimate set from init result later)
+	bind_data->output_schema = bind_result.output_schema;
+	bind_data->max_processes = 1;
+	bind_data->cardinality_estimate = -1;
 
 	// Convert Arrow schema to DuckDB return types
 	ArrowSchemaWrapper c_schema_out;
@@ -253,9 +253,9 @@ unique_ptr<GlobalTableFunctionState> VgiTableInOutInitGlobal(ClientContext &cont
 		throw InternalException("VgiTableInOutInitGlobal: bind_connection is null");
 	}
 
-	// Perform init
-	auto init_result = connection->PerformInit();
-	global_state->global_execution_id = std::move(init_result.global_execution_identifier);
+	// Perform init with phase=INPUT for table-in-out functions
+	auto init_result = connection->PerformInit({}, nullptr, "INPUT");
+	global_state->global_execution_id = std::move(init_result.execution_id);
 
 	// Open the input writer for Stream 5
 	connection->OpenInputWriter();
@@ -277,96 +277,30 @@ unique_ptr<LocalTableFunctionState> VgiTableInOutInitLocal(ExecutionContext &con
 }
 
 // ============================================================================
-// In-Out Function (Main Processing)
+// Arrow Batch to DuckDB DataChunk Conversion Helper
 // ============================================================================
 
-OperatorResultType VgiTableInOutFunction(ExecutionContext &context, TableFunctionInput &data,
-                                          DataChunk &input, DataChunk &output) {
-	auto &bind_data = data.bind_data->Cast<VgiTableInOutBindData>();
-	auto &global_state = data.global_state->Cast<VgiTableInOutGlobalState>();
-	auto &client_context = context.client;
-
-	if (!global_state.connection) {
-		throw InternalException("VgiTableInOutFunction: connection is null");
-	}
-
-	// Convert input DataChunk to Arrow RecordBatch
-	auto input_batch = DataChunkToArrow(client_context, input, bind_data.input_schema);
-
-	VGI_LOG(client_context, "table_in_out.write_input",
-	        {{"worker_path", bind_data.worker_path},
-	         {"function_name", bind_data.function_name},
-	         {"input_rows", std::to_string(input_batch->num_rows())}});
-
-	// Write the input batch to the worker
-	global_state.connection->WriteInputBatch(input_batch);
-	global_state.connection->ClearNeedsMoreInput();
-
-	// Read output batch
-	auto output_batch = global_state.connection->ReadDataBatch();
-
-	if (!output_batch) {
-		// Null batch - check status
-		if (global_state.connection->IsFinished()) {
-			output.SetCardinality(0);
-			return OperatorResultType::FINISHED;
-		}
-		if (global_state.connection->NeedsMoreInput()) {
-			output.SetCardinality(0);
-			return OperatorResultType::NEED_MORE_INPUT;
-		}
-		// Unexpected null batch
-		output.SetCardinality(0);
-		return OperatorResultType::NEED_MORE_INPUT;
-	}
-
-	// Empty batch (not null, just 0 rows) - check status
-	if (output_batch->num_rows() == 0) {
-		output.SetCardinality(0);
-		if (global_state.connection->IsFinished()) {
-			return OperatorResultType::FINISHED;
-		}
-		if (global_state.connection->NeedsMoreInput()) {
-			return OperatorResultType::NEED_MORE_INPUT;
-		}
-		return OperatorResultType::HAVE_MORE_OUTPUT;
-	}
-
-	// We have data - process it, then check status for return type
-
-	// Convert output batch to DuckDB DataChunk using the Arrow scan pattern
-	// Export to C ABI and use DuckDB's built-in conversion
+static idx_t CopyArrowBatchToOutput(const std::shared_ptr<arrow::RecordBatch> &batch, DataChunk &output) {
 	ArrowArrayWrapper arr_wrapper;
-	ExportRecordBatch(output_batch, arr_wrapper);
+	ExportRecordBatch(batch, arr_wrapper);
 
-	ArrowSchemaWrapper schema_wrapper;
-	auto status = arrow::ExportSchema(*output_batch->schema(), &schema_wrapper.arrow_schema);
-	if (!status.ok()) {
-		throw IOException("Failed to export Arrow schema: %s", status.ToString());
-	}
-
-	// Use DuckDB's ArrowToDuckDB to convert the data
-	idx_t rows_to_copy = MinValue<idx_t>(output_batch->num_rows(), STANDARD_VECTOR_SIZE);
+	idx_t rows_to_copy = MinValue<idx_t>(batch->num_rows(), STANDARD_VECTOR_SIZE);
 	output.SetCardinality(rows_to_copy);
 
-	for (idx_t col_idx = 0; col_idx < output.ColumnCount() && col_idx < static_cast<idx_t>(output_batch->num_columns());
+	for (idx_t col_idx = 0; col_idx < output.ColumnCount() && col_idx < static_cast<idx_t>(batch->num_columns());
 	     col_idx++) {
 		ArrowArray *child_array = arr_wrapper.arrow_array.children[col_idx];
 
-		// Import each column using Arrow C++ and convert
-		auto col_status = arrow::ImportArray(child_array, output_batch->schema()->field(col_idx)->type());
+		auto col_status = arrow::ImportArray(child_array, batch->schema()->field(col_idx)->type());
 		if (!col_status.ok()) {
 			throw IOException("Failed to import Arrow column: %s", col_status.status().ToString());
 		}
 		auto arrow_array = col_status.ValueUnsafe();
 
-		// For now, do a simple conversion based on type
-		// This is a simplified version - production code would use ArrowToDuckDB properly
 		for (idx_t row_idx = 0; row_idx < rows_to_copy; row_idx++) {
 			if (arrow_array->IsNull(row_idx)) {
 				FlatVector::SetNull(output.data[col_idx], row_idx, true);
 			} else {
-				// Convert based on type - this is simplified
 				auto &out_vec = output.data[col_idx];
 				auto out_type = out_vec.GetType();
 
@@ -387,24 +321,76 @@ OperatorResultType VgiTableInOutFunction(ExecutionContext &context, TableFunctio
 					auto bool_array = std::static_pointer_cast<arrow::BooleanArray>(arrow_array);
 					FlatVector::GetData<bool>(out_vec)[row_idx] = bool_array->Value(row_idx);
 				}
-				// Add more type conversions as needed
 			}
 		}
 	}
 
+	return rows_to_copy;
+}
+
+// ============================================================================
+// In-Out Function (Main Processing)
+// ============================================================================
+
+OperatorResultType VgiTableInOutFunction(ExecutionContext &context, TableFunctionInput &data,
+                                          DataChunk &input, DataChunk &output) {
+	auto &bind_data = data.bind_data->Cast<VgiTableInOutBindData>();
+	auto &global_state = data.global_state->Cast<VgiTableInOutGlobalState>();
+	auto &client_context = context.client;
+
+	if (!global_state.connection) {
+		throw InternalException("VgiTableInOutFunction: connection is null");
+	}
+
+	// Check for pending output from a previous call that produced more rows
+	// than STANDARD_VECTOR_SIZE. Process pending output before reading new input.
+	std::shared_ptr<arrow::RecordBatch> output_batch;
+	if (global_state.pending_output) {
+		output_batch = global_state.pending_output;
+		global_state.pending_output = nullptr;
+	} else {
+		// Convert input DataChunk to Arrow RecordBatch
+		auto input_batch = DataChunkToArrow(client_context, input, bind_data.input_schema);
+
+		VGI_LOG(client_context, "table_in_out.write_input",
+		        {{"worker_path", bind_data.worker_path},
+		         {"function_name", bind_data.function_name},
+		         {"input_rows", std::to_string(input_batch->num_rows())}});
+
+		// Write the input batch to the worker
+		global_state.connection->WriteInputBatch(input_batch);
+
+		// Read output batch (1:1 lockstep in exchange mode)
+		output_batch = global_state.connection->ReadDataBatch();
+	}
+
+	if (!output_batch) {
+		// EOS - stream exhausted
+		output.SetCardinality(0);
+		return OperatorResultType::FINISHED;
+	}
+
+	// Empty batch (0 rows) - worker consumed input but has no output yet
+	if (output_batch->num_rows() == 0) {
+		output.SetCardinality(0);
+		return OperatorResultType::NEED_MORE_INPUT;
+	}
+
+	// Convert and copy rows to output DataChunk
+	idx_t rows_copied = CopyArrowBatchToOutput(output_batch, output);
+
 	VGI_LOG(client_context, "table_in_out.read_output",
 	        {{"worker_path", bind_data.worker_path},
 	         {"function_name", bind_data.function_name},
-	         {"output_rows", std::to_string(rows_to_copy)}});
+	         {"output_rows", std::to_string(rows_copied)}});
 
-	// Check if there's more output or if we need more input
-	if (global_state.connection->NeedsMoreInput()) {
-		return OperatorResultType::NEED_MORE_INPUT;
+	// If the output batch had more rows than we could copy, save the remainder
+	if (static_cast<idx_t>(output_batch->num_rows()) > rows_copied) {
+		global_state.pending_output = output_batch->Slice(rows_copied);
+		return OperatorResultType::HAVE_MORE_OUTPUT;
 	}
-	if (global_state.connection->IsFinished()) {
-		return OperatorResultType::FINISHED;
-	}
-	return OperatorResultType::HAVE_MORE_OUTPUT;
+
+	return OperatorResultType::NEED_MORE_INPUT;
 }
 
 // ============================================================================
@@ -420,174 +406,70 @@ OperatorFinalizeResultType VgiTableInOutFinalize(ExecutionContext &context, Tabl
 		return OperatorFinalizeResultType::FINISHED;
 	}
 
-	// Send finalize signal (only once)
-	// Note: We don't close the input writer here because log messages during finalize
-	// still need to receive "continue" signals via the input stream. The input writer
-	// will be closed when we receive the FINISHED status.
+	// Perform finalize init (only once)
+	// This closes current data streams and opens new init with phase=FINALIZE
+	// The worker enters producer mode (tick-based) to emit any finalize output
 	if (global_state.connection->IsTableInOut() && !global_state.connection->IsFinished() && !global_state.finalize_sent) {
-		// Send finalize signal to trigger worker's finalize() method
-		global_state.connection->SendFinalize();
+		global_state.connection->PerformFinalizeInit();
 		global_state.finalize_sent = true;
 
 		VGI_LOG(client_context, "table_in_out.finalize",
 		        {{"worker_path", bind_data.worker_path}, {"function_name", bind_data.function_name}});
 	}
 
-	// Check if we have a pending output batch from a previous call
+	// Process pending or new output batch
+	std::shared_ptr<arrow::RecordBatch> output_batch;
 	if (global_state.pending_output) {
-		auto output_batch = global_state.pending_output;
+		output_batch = global_state.pending_output;
 		global_state.pending_output = nullptr;
-
-		// Convert output batch to DuckDB DataChunk
-		ArrowArrayWrapper arr_wrapper;
-		ExportRecordBatch(output_batch, arr_wrapper);
-
-		idx_t rows_to_copy = MinValue<idx_t>(output_batch->num_rows(), STANDARD_VECTOR_SIZE);
-		output.SetCardinality(rows_to_copy);
-
-		for (idx_t col_idx = 0; col_idx < output.ColumnCount() && col_idx < static_cast<idx_t>(output_batch->num_columns());
-		     col_idx++) {
-			ArrowArray *child_array = arr_wrapper.arrow_array.children[col_idx];
-			auto col_status = arrow::ImportArray(child_array, output_batch->schema()->field(col_idx)->type());
-			if (!col_status.ok()) {
-				throw IOException("Failed to import Arrow column: %s", col_status.status().ToString());
-			}
-			auto arrow_array = col_status.ValueUnsafe();
-
-			for (idx_t row_idx = 0; row_idx < rows_to_copy; row_idx++) {
-				if (arrow_array->IsNull(row_idx)) {
-					FlatVector::SetNull(output.data[col_idx], row_idx, true);
-				} else {
-					auto &out_vec = output.data[col_idx];
-					auto out_type = out_vec.GetType();
-
-					if (out_type == LogicalType::BIGINT) {
-						auto int_array = std::static_pointer_cast<arrow::Int64Array>(arrow_array);
-						FlatVector::GetData<int64_t>(out_vec)[row_idx] = int_array->Value(row_idx);
-					} else if (out_type == LogicalType::INTEGER) {
-						auto int_array = std::static_pointer_cast<arrow::Int32Array>(arrow_array);
-						FlatVector::GetData<int32_t>(out_vec)[row_idx] = int_array->Value(row_idx);
-					} else if (out_type == LogicalType::DOUBLE) {
-						auto dbl_array = std::static_pointer_cast<arrow::DoubleArray>(arrow_array);
-						FlatVector::GetData<double>(out_vec)[row_idx] = dbl_array->Value(row_idx);
-					} else if (out_type == LogicalType::VARCHAR) {
-						auto str_array = std::static_pointer_cast<arrow::StringArray>(arrow_array);
-						FlatVector::GetData<string_t>(out_vec)[row_idx] =
-						    StringVector::AddString(out_vec, str_array->GetString(row_idx));
-					} else if (out_type == LogicalType::BOOLEAN) {
-						auto bool_array = std::static_pointer_cast<arrow::BooleanArray>(arrow_array);
-						FlatVector::GetData<bool>(out_vec)[row_idx] = bool_array->Value(row_idx);
-					}
-				}
-			}
-		}
-
-		// Check if worker is finished
-		if (global_state.connection->IsFinished()) {
-			// Try to return the connection to the pool
-			if (global_state.connection->CanBePooled()) {
-				auto pooled = global_state.connection->ReleaseForPooling();
-				if (pooled) {
-					VGI_LOG(client_context, "table_in_out.pool_release",
-					        {{"worker_path", bind_data.worker_path},
-					         {"function_name", bind_data.function_name},
-					         {"pid", std::to_string(pooled->GetPid())}});
-					VgiWorkerPool::Instance().Release(std::move(pooled), 10);
-				}
-			}
-			return OperatorFinalizeResultType::FINISHED;
-		}
-		return OperatorFinalizeResultType::HAVE_MORE_OUTPUT;
+	} else {
+		// Read output batch from worker
+		VGI_LOG(client_context, "table_in_out.finalize_reading",
+		        {{"worker_path", bind_data.worker_path}, {"function_name", bind_data.function_name}});
+		output_batch = global_state.connection->ReadDataBatch();
 	}
 
-	// Read output batch from worker
-	VGI_LOG(client_context, "table_in_out.finalize_reading",
-	        {{"worker_path", bind_data.worker_path}, {"function_name", bind_data.function_name}});
-	auto output_batch = global_state.connection->ReadDataBatch();
-	VGI_LOG(client_context, "table_in_out.finalize_read_done",
-	        {{"worker_path", bind_data.worker_path},
-	         {"function_name", bind_data.function_name},
-	         {"batch_rows", output_batch ? std::to_string(output_batch->num_rows()) : "null"},
-	         {"is_finished", global_state.connection->IsFinished() ? "true" : "false"}});
-
-	// Only return FINISHED if we have no batch to process
-	// If we have a batch with rows, we need to return the data even if IsFinished() is true
-	// (FINISHED just means there's no MORE data after this batch)
 	if (!output_batch || output_batch->num_rows() == 0) {
 		// No more output - clean up
-		if (global_state.connection->CanBePooled()) {
+		if (global_state.connection && global_state.connection->CanBePooled()) {
 			auto pooled = global_state.connection->ReleaseForPooling();
 			if (pooled) {
+				auto max_pool_size = VgiWorkerPool::GetMaxPoolSize(client_context);
 				VGI_LOG(client_context, "table_in_out.pool_release",
 				        {{"worker_path", bind_data.worker_path},
 				         {"function_name", bind_data.function_name},
 				         {"pid", std::to_string(pooled->GetPid())}});
-				VgiWorkerPool::Instance().Release(std::move(pooled), 10);
+				VgiWorkerPool::Instance().Release(std::move(pooled), max_pool_size);
 			}
 		}
 		return OperatorFinalizeResultType::FINISHED;
 	}
 
-	// Convert output batch to DuckDB DataChunk
-	ArrowArrayWrapper arr_wrapper;
-	ExportRecordBatch(output_batch, arr_wrapper);
-
-	idx_t rows_to_copy = MinValue<idx_t>(output_batch->num_rows(), STANDARD_VECTOR_SIZE);
-	output.SetCardinality(rows_to_copy);
-
-	for (idx_t col_idx = 0; col_idx < output.ColumnCount() && col_idx < static_cast<idx_t>(output_batch->num_columns());
-	     col_idx++) {
-		ArrowArray *child_array = arr_wrapper.arrow_array.children[col_idx];
-		auto col_status = arrow::ImportArray(child_array, output_batch->schema()->field(col_idx)->type());
-		if (!col_status.ok()) {
-			throw IOException("Failed to import Arrow column: %s", col_status.status().ToString());
-		}
-		auto arrow_array = col_status.ValueUnsafe();
-
-		for (idx_t row_idx = 0; row_idx < rows_to_copy; row_idx++) {
-			if (arrow_array->IsNull(row_idx)) {
-				FlatVector::SetNull(output.data[col_idx], row_idx, true);
-			} else {
-				auto &out_vec = output.data[col_idx];
-				auto out_type = out_vec.GetType();
-
-				if (out_type == LogicalType::BIGINT) {
-					auto int_array = std::static_pointer_cast<arrow::Int64Array>(arrow_array);
-					FlatVector::GetData<int64_t>(out_vec)[row_idx] = int_array->Value(row_idx);
-				} else if (out_type == LogicalType::INTEGER) {
-					auto int_array = std::static_pointer_cast<arrow::Int32Array>(arrow_array);
-					FlatVector::GetData<int32_t>(out_vec)[row_idx] = int_array->Value(row_idx);
-				} else if (out_type == LogicalType::DOUBLE) {
-					auto dbl_array = std::static_pointer_cast<arrow::DoubleArray>(arrow_array);
-					FlatVector::GetData<double>(out_vec)[row_idx] = dbl_array->Value(row_idx);
-				} else if (out_type == LogicalType::VARCHAR) {
-					auto str_array = std::static_pointer_cast<arrow::StringArray>(arrow_array);
-					FlatVector::GetData<string_t>(out_vec)[row_idx] =
-					    StringVector::AddString(out_vec, str_array->GetString(row_idx));
-				} else if (out_type == LogicalType::BOOLEAN) {
-					auto bool_array = std::static_pointer_cast<arrow::BooleanArray>(arrow_array);
-					FlatVector::GetData<bool>(out_vec)[row_idx] = bool_array->Value(row_idx);
-				}
-			}
-		}
-	}
+	// Convert and copy rows to output DataChunk
+	idx_t rows_copied = CopyArrowBatchToOutput(output_batch, output);
 
 	VGI_LOG(client_context, "table_in_out.finalize_output",
 	        {{"worker_path", bind_data.worker_path},
 	         {"function_name", bind_data.function_name},
-	         {"output_rows", std::to_string(rows_to_copy)}});
+	         {"output_rows", std::to_string(rows_copied)}});
+
+	// Save remainder if batch was larger than STANDARD_VECTOR_SIZE
+	if (static_cast<idx_t>(output_batch->num_rows()) > rows_copied) {
+		global_state.pending_output = output_batch->Slice(rows_copied);
+		return OperatorFinalizeResultType::HAVE_MORE_OUTPUT;
+	}
 
 	// Check if worker is finished
 	if (global_state.connection->IsFinished()) {
-		// Try to return the connection to the pool
 		if (global_state.connection->CanBePooled()) {
 			auto pooled = global_state.connection->ReleaseForPooling();
 			if (pooled) {
+				auto max_pool_size = VgiWorkerPool::GetMaxPoolSize(client_context);
 				VGI_LOG(client_context, "table_in_out.pool_release",
 				        {{"worker_path", bind_data.worker_path},
 				         {"function_name", bind_data.function_name},
 				         {"pid", std::to_string(pooled->GetPid())}});
-				VgiWorkerPool::Instance().Release(std::move(pooled), 10);
+				VgiWorkerPool::Instance().Release(std::move(pooled), max_pool_size);
 			}
 		}
 		return OperatorFinalizeResultType::FINISHED;

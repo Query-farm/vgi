@@ -3,7 +3,6 @@
 #include <atomic>
 #include <map>
 #include <mutex>
-#include <unordered_set>
 
 #include "duckdb/common/arrow/arrow_wrapper.hpp"
 #include "duckdb/function/table/arrow.hpp"
@@ -46,16 +45,9 @@ struct VgiTableFunctionBindData : public TableFunctionData {
 	// DuckDB's Arrow table schema for type conversion
 	ArrowTableSchema arrow_table;
 
-	// Execution hints from OutputSpec
+	// Execution hints (defaults at bind, updated after init)
 	int32_t max_processes = 1;
 	int64_t cardinality_estimate = -1;
-
-	// Invocation identifier returned by the worker (for correlation in subsequent streams)
-	std::vector<uint8_t> invocation_id;
-	std::string invocation_id_hex; // Cached hex representation for logging
-
-	// Features that the worker has activated for this invocation
-	std::unordered_set<std::string> active_features;
 
 	// Whether this function supports projection pushdown (from FunctionInfo)
 	bool projection_pushdown = false;
@@ -106,12 +98,7 @@ struct VgiTableFunctionLocalState : public ArrowScanLocalState {
 		// Return connection to pool if applicable
 		if (use_pool_ && connection && connection->CanBePooled()) {
 			auto worker_pid = connection->GetPid();
-			// Read max pool size from settings
-			Value max_val;
-			size_t max_pool_size = 0;
-			if (context_.TryGetCurrentSetting("vgi_worker_pool_max", max_val)) {
-				max_pool_size = static_cast<size_t>(max_val.GetValue<int64_t>());
-			}
+			auto max_pool_size = VgiWorkerPool::GetMaxPoolSize(context_);
 			auto pooled = connection->ReleaseForPooling();
 			if (pooled) {
 				VgiWorkerPool::Instance().Release(std::move(pooled), max_pool_size);

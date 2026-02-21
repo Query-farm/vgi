@@ -9,7 +9,6 @@
 #include "storage/vgi_schema_entry.hpp"
 #include "storage/vgi_table_entry.hpp"
 #include "vgi_catalog_api.hpp"
-#include "vgi_protocol.hpp"
 
 namespace duckdb {
 
@@ -25,24 +24,12 @@ void VgiTableSet::LoadEntries(ClientContext &context) {
 		return;
 	}
 
-	// Call schema_contents with type filter for tables
-	// Use InvokeCatalogMethod (single response) instead of CatalogMethodCall (streaming)
-	// because schema_contents returns all tables in a single batch
-	auto worker_path = attach_params->worker_path();
-	auto args = vgi::CreateSchemaContentsArgs(attach_result->attach_id, schema_.name, vgi::SchemaObjectType::Table);
-	auto batch = vgi::InvokeCatalogMethod(worker_path, vgi::CatalogMethod::SchemaContents, args, context,
-	                                      attach_params->worker_debug());
+	// Call catalog_schema_contents_tables via RPC
+	auto tables = vgi::InvokeCatalogSchemaContentsTables(attach_params->worker_path(), attach_result->attach_id,
+	                                                     schema_.name, context, attach_params->worker_debug());
 
-	if (!batch || batch->num_rows() == 0) {
-		return;
-	}
-
-	// Parse each row in the batch as a table
-	for (int64_t i = 0; i < batch->num_rows(); i++) {
-		auto table_info = vgi::ParseTableInfo(batch, i, worker_path);
+	for (auto &table_info : tables) {
 		auto create_info = vgi::CreateTableInfoFromVgiTable(context, table_info, schema_.name);
-
-		// Create the table entry
 		auto table_entry = make_uniq<VgiTableEntry>(catalog_, schema_, create_info, table_info);
 		CreateEntry(std::move(table_entry));
 	}
@@ -67,21 +54,16 @@ optional_ptr<CatalogEntry> VgiTableSet::GetEntry(ClientContext &context, const s
 		return nullptr;
 	}
 
-	// Call "table_get" method
-	auto worker_path = attach_params->worker_path();
-	auto args = vgi::CreateTableGetArgs(attach_result->attach_id, schema_.name, name);
-	auto result_batch = vgi::InvokeCatalogMethod(worker_path, vgi::CatalogMethod::TableGet, args, context, attach_params->worker_debug());
+	// Call catalog_table_get via RPC
+	auto table_info_opt = vgi::InvokeCatalogTableGet(attach_params->worker_path(), attach_result->attach_id,
+	                                                  schema_.name, name, context, attach_params->worker_debug());
 
-	// Check if table was found (empty batch means not found)
-	if (!result_batch || result_batch->num_rows() == 0) {
+	if (!table_info_opt) {
 		return nullptr;
 	}
 
-	// Parse table info and convert to DuckDB CreateTableInfo
-	auto table_info = vgi::ParseTableInfo(result_batch, worker_path);
+	auto &table_info = *table_info_opt;
 	auto create_info = vgi::CreateTableInfoFromVgiTable(context, table_info, schema_.name);
-
-	// Create the table entry
 	auto table_entry = make_uniq<VgiTableEntry>(catalog_, schema_, create_info, table_info);
 	auto result = table_entry.get();
 	GetEntries()[name] = std::move(table_entry);

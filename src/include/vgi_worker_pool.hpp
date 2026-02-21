@@ -14,6 +14,9 @@
 #include <vector>
 
 namespace duckdb {
+
+class ClientContext;
+
 namespace vgi {
 
 // Represents a pooled worker subprocess ready for reuse.
@@ -68,6 +71,9 @@ class VgiWorkerPool {
 public:
 	// Get the singleton instance
 	static VgiWorkerPool &Instance();
+
+	// Read vgi_worker_pool_max setting from context (returns 0 if unset)
+	static size_t GetMaxPoolSize(duckdb::ClientContext &context);
 
 	// Acquire a worker from the pool for the given worker_path.
 	// Returns nullptr if no worker is available (never blocks).

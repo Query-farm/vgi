@@ -41,10 +41,14 @@ void Pipe::CloseWrite() {
 
 // SubProcess implementation
 SubProcess::SubProcess(const std::string &command, bool stderr_passthrough) {
-	// Also check environment variable for backwards compatibility
+	// Also check environment variables
 	if (!stderr_passthrough) {
 		const char *passthrough_env = std::getenv("VGI_WORKER_STDERR_PASSTHROUGH");
 		stderr_passthrough = passthrough_env && std::string(passthrough_env) == "1";
+	}
+	if (!stderr_passthrough) {
+		const char *debug_env = std::getenv("VGI_WORKER_DEBUG");
+		stderr_passthrough = debug_env && std::string(debug_env) == "1";
 	}
 
 	Pipe stdin_pipe;

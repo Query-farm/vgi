@@ -1,0 +1,100 @@
+#pragma once
+
+#include <arrow/api.h>
+#include <arrow/io/api.h>
+#include <arrow/ipc/api.h>
+
+#include <memory>
+#include <string>
+#include <vector>
+
+#include "duckdb/main/client_context.hpp"
+
+namespace duckdb {
+namespace vgi {
+
+// ============================================================================
+// vgi_rpc Wire Protocol Constants
+// ============================================================================
+
+// Request metadata keys (written on request batches)
+constexpr const char *RPC_METHOD_KEY = "vgi_rpc.method";
+constexpr const char *RPC_REQUEST_VERSION_KEY = "vgi_rpc.request_version";
+constexpr const char *RPC_REQUEST_VERSION_VALUE = "1";
+
+// Response/log/error metadata keys (read from response batches)
+constexpr const char *RPC_LOG_LEVEL_KEY = "vgi_rpc.log_level";
+constexpr const char *RPC_LOG_MESSAGE_KEY = "vgi_rpc.log_message";
+constexpr const char *RPC_LOG_EXTRA_KEY = "vgi_rpc.log_extra";
+constexpr const char *RPC_SERVER_ID_KEY = "vgi_rpc.server_id";
+constexpr const char *RPC_REQUEST_ID_KEY = "vgi_rpc.request_id";
+
+// ============================================================================
+// Batch Classification
+// ============================================================================
+// Per wire protocol spec:
+// - num_rows > 0 or no metadata → DATA
+// - num_rows == 0 + vgi_rpc.log_level == "EXCEPTION" → ERROR (throw)
+// - num_rows == 0 + vgi_rpc.log_level present → LOG (forward to logger)
+// - Otherwise → DATA (void return / stream-finish)
+
+enum class RpcBatchType {
+	DATA,
+	LOG,
+	ERROR
+};
+
+// Classify a batch according to the vgi_rpc wire protocol.
+// Does NOT throw or dispatch - just classifies.
+RpcBatchType ClassifyBatch(const std::shared_ptr<arrow::RecordBatch> &batch,
+                           const std::shared_ptr<arrow::KeyValueMetadata> &custom_metadata);
+
+// ============================================================================
+// Request Writing
+// ============================================================================
+
+// Write an RPC request with parameters to a file descriptor.
+// Creates an IPC stream: schema (from params_batch) + 1-row batch with method metadata + EOS.
+// The params_batch must have exactly 1 row with one field per method parameter.
+void WriteRpcRequest(int fd, const std::string &method_name,
+                     const std::shared_ptr<arrow::RecordBatch> &params_batch);
+
+// Write an RPC request with no parameters (zero-field schema, 1-row batch).
+// Used for parameterless methods like catalog_catalogs.
+void WriteEmptyRpcRequest(int fd, const std::string &method_name);
+
+// ============================================================================
+// Response Reading
+// ============================================================================
+
+// Result from reading a unary response
+struct UnaryResponseResult {
+	std::shared_ptr<arrow::RecordBatch> batch;           // The data batch (1-row with "result" column, or empty for void)
+	std::shared_ptr<arrow::KeyValueMetadata> metadata;   // Custom metadata from the data batch
+};
+
+// Read a unary RPC response from a file descriptor.
+// Opens an IPC stream reader, dispatches log batches, returns the first data batch.
+// Throws IOException on EXCEPTION-level log batches.
+// The response stream has schema with "result" column (or empty for void methods).
+// worker_path/worker_pid are for error context.
+UnaryResponseResult ReadUnaryResponse(int fd, ClientContext *context,
+                                      const std::string &worker_path = "",
+                                      pid_t worker_pid = -1);
+
+// Result from reading a stream header
+struct StreamHeaderResult {
+	std::shared_ptr<arrow::RecordBatch> header_batch;    // The header data batch (1-row)
+	std::shared_ptr<arrow::KeyValueMetadata> metadata;   // Custom metadata from the header batch
+};
+
+// Read a stream header (phase 1.5) from a file descriptor.
+// Opens an IPC stream reader on the header schema, dispatches log batches,
+// returns the header data batch, and drains to EOS.
+// Used for streaming RPC methods that declare a header type (e.g., init()).
+StreamHeaderResult ReadStreamHeader(int fd, ClientContext *context,
+                                    const std::string &worker_path = "",
+                                    pid_t worker_pid = -1);
+
+} // namespace vgi
+} // namespace duckdb

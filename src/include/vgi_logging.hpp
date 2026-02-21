@@ -79,7 +79,7 @@ inline LogLevel ParseLogLevel(const string &level_str) {
 // Log Message Handling from Arrow RecordBatch Metadata
 // ============================================================================
 
-//! Check if a batch contains a log message (zero rows with vgi.log_* custom metadata).
+//! Check if a batch contains a log message (zero rows with vgi_rpc.log_* or vgi.log_* custom metadata).
 //! If it's an EXCEPTION, throws IOException with the message, traceback, and worker context.
 //! For other log levels, logs to DuckDB if context is provided.
 //! Returns true if the batch was a log message, false otherwise.

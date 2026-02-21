@@ -15,7 +15,6 @@
 #include "vgi_catalogs.hpp"
 #include "vgi_logging.hpp"
 #include "vgi_profiling.hpp"
-#include "vgi_protocol.hpp"
 #include "vgi_table_function.hpp"
 #include "vgi_worker_pool_functions.hpp"
 
@@ -52,11 +51,8 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 		throw BinderException("VGI ATTACH requires LOCATION option specifying the worker path");
 	}
 
-	// Call catalog_attach via worker
-	auto args = vgi::CreateCatalogAttachArgs(catalog_name);
-	auto result_batch =
-	    vgi::InvokeCatalogMethod(worker_path, vgi::CatalogMethod::CatalogAttach, args, context, worker_debug);
-	auto attach_result = vgi::ParseCatalogAttachResult(result_batch, worker_path);
+	// Call catalog_attach via RPC
+	auto attach_result = vgi::InvokeCatalogAttach(worker_path, catalog_name, context, worker_debug, use_pool);
 
 	// Register extension options for settings exposed by this catalog
 	// Check for type conflicts with existing settings

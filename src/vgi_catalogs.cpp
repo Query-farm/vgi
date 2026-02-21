@@ -1,8 +1,6 @@
 #include "vgi_catalogs.hpp"
-#include "vgi_arrow_ipc.hpp"
 #include "vgi_catalog_api.hpp"
 #include "vgi_logging.hpp"
-#include "vgi_protocol.hpp"
 
 #include <string>
 #include <vector>
@@ -64,12 +62,8 @@ static unique_ptr<GlobalTableFunctionState> VgiCatalogsInitGlobal(ClientContext 
 	auto &bind_data = input.bind_data->Cast<VgiCatalogsBindData>();
 	auto state = make_uniq<VgiCatalogsGlobalState>();
 
-	// Invoke the catalogs method using standard catalog API
-	auto args = vgi::CreateEmptyArgsBatch();
-	auto result_batch = vgi::InvokeCatalogMethod(bind_data.worker_path, vgi::CatalogMethod::Catalogs, args, context);
-
-	// Extract catalog names from the "value" column
-	state->catalogs = vgi::ExtractStringColumn(result_batch, "value");
+	// Invoke catalog_catalogs via RPC
+	state->catalogs = vgi::InvokeCatalogCatalogs(bind_data.worker_path, context);
 
 	VGI_LOG(context, "vgi_catalogs.init",
 	        {{"worker_path", bind_data.worker_path}, {"num_catalogs", std::to_string(state->catalogs.size())}});

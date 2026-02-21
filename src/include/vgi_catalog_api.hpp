@@ -59,108 +59,6 @@ private:
 	bool use_pool_;
 };
 
-// ============================================================================
-// Catalog Method Invocation API
-// ============================================================================
-
-// Catalog method names for type-safe invocation
-// These correspond to methods in the Python CatalogInterface
-enum class CatalogMethod {
-	// Catalog-level methods
-	Catalogs,                  // List available catalogs
-	CatalogAttach,             // Attach to a catalog
-	CatalogDetach,             // Detach from a catalog
-	CatalogVersion,            // Get catalog version
-	CatalogTransactionBegin,   // Begin a transaction
-	CatalogTransactionCommit,  // Commit a transaction
-	CatalogTransactionRollback, // Rollback a transaction
-
-	// Schema methods
-	Schemas,        // List schemas
-	SchemaGet,      // Get schema info
-	SchemaContents, // List schema contents (tables, views, functions)
-
-	// Table methods
-	TableGet,             // Get table info
-	TableScan,            // Scan table data (streaming)
-	TableScanFunctionGet, // Get scan function for a table (returns ScanFunctionResult)
-
-	// View methods
-	ViewGet, // Get view info
-
-	// Function methods
-	FunctionGet // Get function info
-};
-
-// Convert CatalogMethod to protocol string
-const char *CatalogMethodToString(CatalogMethod method);
-
-// Invoke a catalog method and return a single result batch.
-// Use this for methods that return a single response (CatalogAttach, TableGet, Catalogs).
-// Handles all the plumbing: spawns worker, sends invocation+args, reads result.
-// Handles log message batches from the worker - exceptions are thrown, other levels are logged.
-// Throws IOException on worker failure or timeout.
-// Non-exception log messages are written to DuckDB's log via the provided context.
-// If worker_debug is true, worker stderr is passed through to the terminal for debugging.
-// If use_pool is true, attempts to acquire a worker from the pool and returns it after use.
-std::shared_ptr<arrow::RecordBatch> InvokeCatalogMethod(const std::string &worker_path, CatalogMethod method,
-                                                        const std::shared_ptr<arrow::RecordBatch> &args,
-                                                        ClientContext &context, bool worker_debug = false,
-                                                        bool use_pool = true);
-
-// Wrapper for invoking catalog methods that return a result batch.
-// Catalog methods now return a complete IPC stream: schema header, single record batch
-// (which may have 0 or more rows), and end-of-stream marker.
-// Handles log message batches from the worker - exceptions are thrown, other levels are logged.
-// If use_pool is true, acquires worker from pool and returns it when call finishes.
-class CatalogMethodCall {
-public:
-	// Start a catalog method call
-	// Non-exception log messages are written to DuckDB's log via the provided context.
-	// If worker_debug is true, worker stderr is passed through to the terminal for debugging.
-	// If use_pool is true, attempts to acquire a worker from the pool and returns it after use.
-	CatalogMethodCall(const std::string &worker_path, CatalogMethod method,
-	                  const std::shared_ptr<arrow::RecordBatch> &args, ClientContext &context,
-	                  bool worker_debug = false, bool use_pool = true);
-	~CatalogMethodCall();
-
-	// Read the next result batch. Returns nullptr at end of stream.
-	// Handles log message batches internally (exceptions thrown, others logged).
-	// When stream finishes, automatically returns worker to pool if pooling is enabled.
-	std::shared_ptr<arrow::RecordBatch> ReadNext();
-
-	// Check if call has finished (ReadNext returned nullptr)
-	bool IsFinished() const {
-		return finished_;
-	}
-
-	// Get the subprocess (for access to stderr, pid, etc.)
-	SubProcess &GetProcess() {
-		return *proc_;
-	}
-
-	// Non-copyable
-	CatalogMethodCall(const CatalogMethodCall &) = delete;
-	CatalogMethodCall &operator=(const CatalogMethodCall &) = delete;
-
-private:
-	// Return worker to pool if eligible
-	void ReturnToPoolIfEligible();
-	// Open the IPC stream reader (called lazily on first ReadNext)
-	void OpenStreamReader();
-
-	std::unique_ptr<SubProcess> proc_;
-	ClientContext &context_;
-	std::string worker_path_;
-	bool finished_ = false;
-	bool use_pool_ = true;
-	bool returned_to_pool_ = false;
-
-	// Persistent IPC stream reader for reading multiple batches
-	std::shared_ptr<arrow::io::InputStream> stream_;
-	std::shared_ptr<arrow::ipc::RecordBatchStreamReader> reader_;
-};
-
 // A setting exposed by a VGI worker
 // Parsed from serialized Setting objects in CatalogAttachResult
 struct VgiSetting {
@@ -215,7 +113,7 @@ struct VgiViewInfo {
 // This enables catalogs to delegate scanning to any DuckDB function (e.g., read_parquet, iceberg_scan)
 struct VgiScanFunctionResult {
 	std::string function_name;                              // The DuckDB function to call (e.g., "read_parquet")
-	std::vector<Value> positional_arguments;                // Positional arguments for the function
+	duckdb::vector<Value> positional_arguments;             // Positional arguments for the function
 	std::map<std::string, Value> named_arguments;           // Named arguments for the function
 	std::vector<std::string> required_extensions;           // Extensions to load before calling
 };
@@ -322,11 +220,67 @@ VgiScanFunctionResult ParseScanFunctionResult(ClientContext &context, const std:
                                                const std::string &worker_path);
 
 // ============================================================================
+// Typed Catalog RPC Functions (vgi_rpc protocol)
+// ============================================================================
+
+// Invoke catalog_catalogs: list available catalogs from a worker
+std::vector<std::string> InvokeCatalogCatalogs(const std::string &worker_path, ClientContext &context,
+                                                bool worker_debug = false, bool use_pool = true);
+
+// Invoke catalog_attach: attach to a catalog and get configuration
+CatalogAttachResult InvokeCatalogAttach(const std::string &worker_path, const std::string &catalog_name,
+                                        ClientContext &context, bool worker_debug = false, bool use_pool = true);
+
+// Invoke catalog_schemas: list schemas in an attached catalog
+std::vector<VgiSchemaInfo> InvokeCatalogSchemas(const std::string &worker_path,
+                                                const std::vector<uint8_t> &attach_id, ClientContext &context,
+                                                bool worker_debug = false, bool use_pool = true);
+
+// Invoke catalog_schema_contents_tables: list tables in a schema
+std::vector<VgiTableInfo> InvokeCatalogSchemaContentsTables(const std::string &worker_path,
+                                                            const std::vector<uint8_t> &attach_id,
+                                                            const std::string &schema_name, ClientContext &context,
+                                                            bool worker_debug = false, bool use_pool = true);
+
+// Invoke catalog_schema_contents_views: list views in a schema
+std::vector<VgiViewInfo> InvokeCatalogSchemaContentsViews(const std::string &worker_path,
+                                                          const std::vector<uint8_t> &attach_id,
+                                                          const std::string &schema_name, ClientContext &context,
+                                                          bool worker_debug = false, bool use_pool = true);
+
+// Invoke catalog_schema_contents_functions: list functions in a schema
+// function_type: "SCALAR_FUNCTION" or "TABLE_FUNCTION"
+std::vector<VgiFunctionInfo> InvokeCatalogSchemaContentsFunctions(
+    const std::string &worker_path, const std::vector<uint8_t> &attach_id, const std::string &schema_name,
+    const std::string &function_type, ClientContext &context, bool worker_debug = false, bool use_pool = true);
+
+// Invoke catalog_table_get: get a specific table's metadata
+// Returns nullopt if table not found (empty response)
+std::optional<VgiTableInfo> InvokeCatalogTableGet(const std::string &worker_path,
+                                                   const std::vector<uint8_t> &attach_id,
+                                                   const std::string &schema_name, const std::string &table_name,
+                                                   ClientContext &context, bool worker_debug = false,
+                                                   bool use_pool = true);
+
+// Invoke catalog_view_get: get a specific view's metadata
+std::optional<VgiViewInfo> InvokeCatalogViewGet(const std::string &worker_path,
+                                                 const std::vector<uint8_t> &attach_id,
+                                                 const std::string &schema_name, const std::string &view_name,
+                                                 ClientContext &context, bool worker_debug = false,
+                                                 bool use_pool = true);
+
+// Invoke catalog_table_scan_function_get: get scan function for a table
+VgiScanFunctionResult InvokeCatalogTableScanFunctionGet(
+    const std::string &worker_path, const std::vector<uint8_t> &attach_id, const std::string &schema_name,
+    const std::string &table_name, ClientContext &context, const std::string &at_unit = "",
+    const std::string &at_value = "", bool worker_debug = false, bool use_pool = true);
+
+// ============================================================================
 // Function Invocation API
 // ============================================================================
 
 // Get function metadata from a VGI worker.
-// Calls the "function_get" catalog method and parses the result.
+// Calls the "catalog_function_get" RPC method and parses the result.
 VgiFunctionInfo GetFunctionInfo(const std::string &worker_path, const std::vector<uint8_t> &attach_id,
                                 const std::string &schema_name, const std::string &function_name,
                                 ClientContext &context, bool worker_debug = false);
@@ -350,6 +304,7 @@ struct FunctionConnectionParams {
 	std::map<std::string, std::string> settings;
 	bool use_pool = true;
 	std::string phase;  // For logging (e.g., "bind", "init_local_secondary")
+	std::string function_type = "TABLE";  // "TABLE", "SCALAR", "AGGREGATE"
 
 	// Default constructor
 	FunctionConnectionParams() = default;
@@ -359,17 +314,17 @@ struct FunctionConnectionParams {
 	                         const ArrowArguments &arguments, const std::vector<uint8_t> &attach_id,
 	                         const std::vector<uint8_t> &global_execution_id, bool worker_debug,
 	                         const std::map<std::string, std::string> &settings, bool use_pool,
-	                         const std::string &phase)
+	                         const std::string &phase, const std::string &function_type = "TABLE")
 	    : worker_path(worker_path), function_name(function_name), arguments(arguments), attach_id(attach_id),
 	      global_execution_id(global_execution_id), worker_debug(worker_debug), settings(settings), use_pool(use_pool),
-	      phase(phase) {
+	      phase(phase), function_type(function_type) {
 	}
 };
 
 // Result of AcquireAndBindConnection
 struct AcquireAndBindResult {
 	std::unique_ptr<FunctionConnection> connection;
-	OutputSpecResult output_spec;
+	BindResult bind_result;
 };
 
 // Acquire a FunctionConnection and perform bind with automatic retry for stale pool connections.
@@ -383,111 +338,89 @@ struct AcquireAndBindResult {
 // The retry handles the case where a pooled worker died while idle. If the
 // fresh connection also fails, the exception propagates to the caller.
 //
-// Returns the successfully-bound connection and the OutputSpecResult.
+// Returns the successfully-bound connection and the BindResult.
 // Throws IOException if bind fails (after retry if applicable).
 AcquireAndBindResult AcquireAndBindConnection(ClientContext &context, const FunctionConnectionParams &params);
 
 // ============================================================================
-// Function Connection - Proper 6-Stream Protocol
+// Function Connection - vgi_rpc Protocol
 // ============================================================================
 
-// FunctionConnection implements the proper VGI function protocol with 6 streams:
-// Stream 1: Invocation (client → worker)
-// Stream 2: OutputSpec (worker → client) - contains output schema
-// Stream 3: InitInput (client → worker)
-// Stream 4: InitResult (worker → client)
-// Stream 5: Input batches (client → worker) - not used for Table functions
-// Stream 6: Output batches (worker → client)
+// FunctionConnection implements the VGI function protocol using vgi_rpc:
+// Phase 1: bind RPC (unary) - send BindRequest, receive BindResponse
+// Phase 2: init RPC (streaming) - send InitRequest, receive GlobalInitResponse + data streams
+// Phase 3: data exchange - lockstep IPC streams (client sends → server responds)
 //
 // State machine with validation:
-// - Created → bind_done_ (via PerformBind/PerformBindFull)
-// - bind_done_ → init_done_ (via PerformInit or SkipInit)
+// - Created → bind_done_ (via PerformBindFull)
+// - bind_done_ → init_done_ (via PerformInit)
 // - init_done_ → data_finished_ (via ReadDataBatch returning nullptr)
 //
-// Validation rules:
-// - PerformBindFull: Idempotent, returns cached result if already called
-// - PerformInit/SkipInit: Throws if !bind_done_ or init_done_
-// - ReadDataBatch: Throws if !init_done_, returns nullptr if data_finished_
-//
-// Usage:
-// 1. During Bind: Call PerformBind() to get schema from OutputSpec
-// 2. During Init Local: Call PerformInit() to complete handshake
-// 3. During Scan: Call ReadDataBatch() to stream results
+// For table functions (producer mode):
+//   Client sends 0-row "tick" batches, server responds with output batches
+// For scalar/table-in-out functions (exchange mode):
+//   Client sends input batches, server responds with output batches
 class FunctionConnection {
 public:
 	// Create connection parameters (does not spawn worker yet)
 	// arguments: Arrow struct array with fields named positional_0, positional_1, etc.
 	// global_execution_id: For secondary workers, pass the ID from the primary worker's InitResult
+	// function_type: "TABLE", "SCALAR", or "AGGREGATE" (for BindRequest)
 	// settings: Optional map of settings to pass to the worker (e.g., DuckDB pragmas)
 	FunctionConnection(const std::string &worker_path, const std::string &function_name,
 	                   const ArrowArguments &arguments, const std::vector<uint8_t> &attach_id, ClientContext &context,
+	                   const std::string &function_type = "TABLE",
 	                   const std::vector<uint8_t> &global_execution_id = {}, bool worker_debug = false,
 	                   const std::map<std::string, std::string> &settings = {});
 
 	// Create connection using a pooled worker (skips spawning new subprocess)
 	FunctionConnection(std::unique_ptr<PooledWorker> pooled_worker, const std::string &function_name,
 	                   const ArrowArguments &arguments, const std::vector<uint8_t> &attach_id, ClientContext &context,
+	                   const std::string &function_type = "TABLE",
 	                   const std::vector<uint8_t> &global_execution_id = {}, bool worker_debug = false,
 	                   const std::map<std::string, std::string> &settings = {});
 
 	~FunctionConnection();
 
-	// Phase 1: Perform bind handshake (Streams 1-2)
-	// Spawns worker, sends Invocation, reads OutputSpec
-	// Returns the output schema and metadata
-	// After this call, the worker is waiting for InitInput
-	std::shared_ptr<arrow::Schema> PerformBind(int32_t &max_processes_out, int64_t &cardinality_estimate_out);
+	// Phase 1: Perform bind via vgi_rpc "bind" RPC call
+	// Spawns worker if needed, sends BindRequest, reads BindResponse
+	// Returns BindResult with output schema and opaque data
+	BindResult PerformBindFull();
 
-	// Phase 1 (full): Perform bind handshake and return full OutputSpec
-	// Same as PerformBind but returns the complete OutputSpecResult including
-	// invocation_id, active_features, and other metadata
-	OutputSpecResult PerformBindFull();
-
-	// Set the input schema for table-in-out functions
+	// Set the input schema for table-in-out/scalar functions
 	// Must be called before PerformBindFull() for table-in-out functions
-	// input_schema: Arrow schema describing the input data that will be sent via Stream 5
+	// input_schema: Arrow schema describing the input data
 	void SetInputSchema(const std::shared_ptr<arrow::Schema> &input_schema);
 
-	// Phase 2: Perform init handshake (Streams 3-4)
-	// Sends InitInput, reads InitResult, then closes stdin (for Table functions)
-	// After this call, the connection is ready to read data
-	// For table functions only:
-	//   projection_ids: optional list of column indices for projection pushdown
-	//   pushdown_filters: Arrow IPC bytes of filter RecordBatch (nullptr if no filters)
-	// For scalar/table-in-out functions, these parameters are omitted from the init message
-	// Returns InitResultData containing global_execution_identifier for multi-worker coordination
-	InitResultData PerformInit(const std::vector<int32_t> &projection_ids = {},
-	                           std::shared_ptr<arrow::Buffer> pushdown_filters = nullptr);
+	// Phase 2: Perform init via vgi_rpc "init" RPC call
+	// Sends InitRequest, reads GlobalInitResponse, opens data streams
+	// For table functions: enters producer mode (tick-based)
+	// For scalar/table-in-out: enters exchange mode
+	// Optional phase parameter for FINALIZE init calls
+	InitResult PerformInit(const std::vector<int32_t> &projection_ids = {},
+	                       std::shared_ptr<arrow::Buffer> pushdown_filters = nullptr,
+	                       const std::string &phase = "");
 
-	// Phase 2 (secondary worker): Skip init handshake for secondary workers
-	// The Python worker's secondary worker path doesn't do InitInput/InitResult exchange,
-	// it goes straight from OutputSpec to generating batches.
-	// This method closes stdin and opens the data stream without the handshake.
-	void SkipInit();
+	// Perform finalize init for table-in-out functions
+	// Closes current data streams, sends new init RPC with phase=FINALIZE
+	// Opens new data streams in producer mode (tick-based)
+	void PerformFinalizeInit();
 
 	// ========================================================================
-	// Stream 5: Input Data (Table-In-Out Functions Only)
+	// Input Data (Scalar and Table-In-Out Functions)
 	// ========================================================================
 
-	// Open Stream 5 for writing input data batches (table-in-out functions)
+	// Open input writer for sending input data batches
 	// Must be called after PerformInit() and before WriteInputBatch()
-	// Throws if called on a regular table function (no input schema)
+	// For scalar and table-in-out functions
 	void OpenInputWriter();
 
-	// Write an input batch to Stream 5 (table-in-out functions)
+	// Write an input batch (scalar and table-in-out functions)
 	// Must be called after OpenInputWriter()
-	// The batch schema must match the input_schema set via SetInputSchema()
 	void WriteInputBatch(const std::shared_ptr<arrow::RecordBatch> &batch);
 
-	// Send a finalize signal to the worker via Stream 5 (table-in-out functions)
-	// This sends an empty batch with type=FINALIZE metadata, signaling the worker
-	// to run its finalize() method and output any remaining data
-	// Must be called before CloseInputWriter() for aggregation functions
-	void SendFinalize();
-
-	// Close Stream 5 (signals end of input to the worker)
-	// Must be called after all input batches have been written
-	// After this, the worker will process remaining data and output results via Stream 6
+	// Close input writer (signals end of input to the worker)
+	// After this, the worker will send EOS on the output stream
 	void CloseInputWriter();
 
 	// Check if this is a table-in-out function (has input schema)
@@ -495,9 +428,10 @@ public:
 		return input_schema_ != nullptr;
 	}
 
-	// Phase 3: Read a data batch (Stream 6)
-	// Returns nullptr when stream is exhausted OR when NEED_MORE_INPUT is received
-	// After nullptr, check NeedsMoreInput() to determine which case
+	// Phase 3: Read a data batch from the output stream
+	// For producer mode: sends tick, reads response
+	// For exchange mode: reads response (caller must write input first)
+	// Returns nullptr when stream is exhausted (EOS)
 	std::shared_ptr<arrow::RecordBatch> ReadDataBatch();
 
 	// Check if data stream is exhausted
@@ -511,25 +445,13 @@ public:
 		data_finished_ = true;
 	}
 
-	// Check if the worker requested more input (table-in-out functions only)
-	// This is set when ReadDataBatch receives a batch with vgi.status = NEED_MORE_INPUT
-	// After sending more input via WriteInputBatch(), call ClearNeedsMoreInput() and continue reading
-	bool NeedsMoreInput() const {
-		return needs_more_input_;
-	}
-
-	// Clear the needs_more_input flag after sending more input
-	void ClearNeedsMoreInput() {
-		needs_more_input_ = false;
-	}
-
 	// Get the worker process PID (returns -1 if not yet spawned)
 	pid_t GetPid() const {
 		return proc_ ? proc_->GetPid() : -1;
 	}
 
-	// Get the invocation ID as hex string (empty if bind not done)
-	std::string GetInvocationIdHex() const;
+	// Get the execution ID as hex string (empty if init not done)
+	std::string GetExecutionIdHex() const;
 
 	// Get the attach ID as hex string (empty if no attach_id)
 	std::string GetAttachIdHex() const;
@@ -555,6 +477,7 @@ public:
 private:
 	std::string worker_path_;
 	std::string function_name_;
+	std::string function_type_;  // "TABLE", "SCALAR", "AGGREGATE"
 	std::shared_ptr<arrow::DataType> arguments_type_;
 	std::shared_ptr<arrow::Array> arguments_array_;
 	std::vector<uint8_t> attach_id_;
@@ -570,25 +493,28 @@ private:
 	bool bind_done_ = false;
 	bool init_done_ = false;
 	bool data_finished_ = false;
-	bool needs_more_input_ = false;  // Set when worker responds with NEED_MORE_INPUT status
 
-	// Cached bind results (full OutputSpec)
-	OutputSpecResult output_spec_;
+	// Cached bind results (vgi_rpc BindResult)
+	BindResult bind_result_;
+
+	// Execution ID from GlobalInitResponse
+	std::vector<uint8_t> execution_id_;
+
+	// Producer mode (true for table functions - tick-based data exchange)
+	bool is_producer_mode_ = false;
+	std::shared_ptr<arrow::Schema> tick_schema_;  // Empty schema for tick batches
 
 	// Data stream reader (opened during PerformInit, used for ReadDataBatch)
-	// The data phase uses a single long-lived IPC stream with multiple batches
 	std::shared_ptr<arrow::io::InputStream> data_stream_;
 	std::shared_ptr<arrow::ipc::RecordBatchStreamReader> data_reader_;
 
-	// Input schema for table-in-out functions (nullptr for regular table functions)
+	// Input schema for table-in-out/scalar functions (nullptr for regular table functions)
 	std::shared_ptr<arrow::Schema> input_schema_;
 
-	// Input data writer (Stream 5) for table-in-out functions
-	// Used to send input batches to the worker
+	// Input data writer for exchange-mode functions
 	std::shared_ptr<arrow::ipc::RecordBatchWriter> input_writer_;
 	bool input_writer_opened_ = false;
 	bool input_writer_closed_ = false;
-	bool finalize_sent_ = false;  // Set when SendFinalize() is called
 
 	// Stderr reader thread - reads stderr and buffers lines for main thread to log
 	std::thread stderr_thread_;

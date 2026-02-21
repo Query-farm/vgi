@@ -11,7 +11,10 @@
 #include "storage/vgi_catalog.hpp"
 #include "vgi_arrow_utils.hpp"
 #include "vgi_catalog_api.hpp"
-#include "vgi_protocol.hpp"
+#include "vgi_logging.hpp"
+#include "vgi_worker_pool.hpp"
+
+#include "duckdb/main/extension_helper.hpp"
 
 namespace duckdb {
 
@@ -37,6 +40,15 @@ struct VgiTableScanBindData : public TableFunctionData {
 	std::vector<LogicalType> column_types;
 	bool worker_debug = false;
 
+	// From InvokeCatalogTableScanFunctionGet: the actual function to call
+	std::string scan_function_name;
+	duckdb::vector<Value> scan_positional_args;
+	std::map<std::string, Value> scan_named_args;
+
+	// Worker pool settings
+	bool use_pool = true;
+	size_t max_pool_size = 0;
+
 	// Arrow schema for type conversion
 	ArrowSchemaWrapper c_schema;
 	ArrowTableSchema arrow_table;
@@ -44,8 +56,19 @@ struct VgiTableScanBindData : public TableFunctionData {
 
 // Global state for VGI table scan
 struct VgiTableScanGlobalState : public GlobalTableFunctionState {
-	std::unique_ptr<vgi::CatalogMethodCall> stream;
+	std::unique_ptr<vgi::FunctionConnection> connection;
 	bool done = false;
+	bool use_pool = false;
+	size_t max_pool_size = 0;
+
+	~VgiTableScanGlobalState() {
+		if (use_pool && connection && connection->CanBePooled()) {
+			auto pooled = connection->ReleaseForPooling();
+			if (pooled) {
+				vgi::VgiWorkerPool::Instance().Release(std::move(pooled), max_pool_size);
+			}
+		}
+	}
 
 	idx_t MaxThreads() const override {
 		return 1;
@@ -71,11 +94,40 @@ static unique_ptr<GlobalTableFunctionState> VgiTableScanInitGlobal(ClientContext
 	auto &bind_data = input.bind_data->Cast<VgiTableScanBindData>();
 	auto state = make_uniq<VgiTableScanGlobalState>();
 
-	// Create streaming method call for table_scan
-	auto args = vgi::CreateTableGetArgs(bind_data.attach_id, bind_data.schema_name, bind_data.table_name);
-	state->stream = make_uniq<vgi::CatalogMethodCall>(bind_data.worker_path, vgi::CatalogMethod::TableScan, args,
-	                                                    context, bind_data.worker_debug);
+	// Convert scan function arguments from DuckDB Values to Arrow
+	vector<std::pair<string, Value>> named_args_vec;
+	for (auto &[k, v] : bind_data.scan_named_args) {
+		named_args_vec.emplace_back(k, v);
+	}
+	auto arrow_args = vgi::BuildArgumentsFromValues(context, bind_data.scan_positional_args, named_args_vec);
 
+	// Build FunctionConnectionParams for AcquireAndBindConnection
+	// Uses the scan function name (from table_scan_function_get), NOT the table name.
+	vgi::FunctionConnectionParams params;
+	params.worker_path = bind_data.worker_path;
+	params.function_name = bind_data.scan_function_name;
+	params.arguments = arrow_args;
+	params.attach_id = bind_data.attach_id;
+	params.worker_debug = bind_data.worker_debug;
+	params.use_pool = bind_data.use_pool;
+	params.function_type = "TABLE";
+	params.phase = "table_scan";
+
+	// Acquire connection (from pool or fresh) and perform bind with stale retry
+	auto result = vgi::AcquireAndBindConnection(context, params);
+
+	// Build projection_ids from column_ids for projection pushdown
+	std::vector<int32_t> projection_ids;
+	for (auto &col_id : input.column_ids) {
+		projection_ids.push_back(static_cast<int32_t>(col_id));
+	}
+
+	// Perform init to start streaming
+	result.connection->PerformInit(projection_ids);
+
+	state->connection = std::move(result.connection);
+	state->use_pool = bind_data.use_pool;
+	state->max_pool_size = bind_data.max_pool_size;
 	return state;
 }
 
@@ -99,8 +151,8 @@ static bool GetNextBatch(const VgiTableScanBindData &bind_data, VgiTableScanGlob
 		return false;
 	}
 
-	// Read next Arrow C++ batch from stream
-	auto arrow_batch = global_state.stream->ReadNext();
+	// Read next Arrow C++ batch from connection
+	auto arrow_batch = global_state.connection->ReadDataBatch();
 	if (!arrow_batch) {
 		global_state.done = true;
 		return false;
@@ -159,6 +211,27 @@ TableFunction VgiTableEntry::GetScanFunction(ClientContext &context, unique_ptr<
 	scan_bind_data->schema_name = ParentSchema().name;
 	scan_bind_data->table_name = name;
 	scan_bind_data->worker_debug = attach_params->worker_debug();
+
+	// Read pool settings
+	Value pool_enabled_val;
+	if (context.TryGetCurrentSetting("vgi_worker_pool_enabled", pool_enabled_val)) {
+		scan_bind_data->use_pool = pool_enabled_val.GetValue<bool>();
+	}
+	scan_bind_data->max_pool_size = vgi::VgiWorkerPool::GetMaxPoolSize(context);
+
+	// Ask the worker which function to call to scan this table
+	auto scan_result = vgi::InvokeCatalogTableScanFunctionGet(
+	    attach_params->worker_path(), attach_result->attach_id,
+	    ParentSchema().name, name, context, "", "",
+	    attach_params->worker_debug(), true);
+	scan_bind_data->scan_function_name = scan_result.function_name;
+	scan_bind_data->scan_positional_args = scan_result.positional_arguments;
+	scan_bind_data->scan_named_args = scan_result.named_arguments;
+
+	// Load any required extensions before scanning
+	for (auto &ext : scan_result.required_extensions) {
+		ExtensionHelper::TryAutoLoadExtension(context, ext);
+	}
 
 	// Get column info from the table
 	vector<LogicalType> return_types;

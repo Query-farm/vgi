@@ -228,32 +228,20 @@ void VgiTableFunctionSet::LoadEntries(ClientContext &context) {
 		setting_names.push_back(setting.name);
 	}
 
-	// Call schema_contents with type filter for table functions
+	// Call catalog_schema_contents_functions via RPC for table functions
 	auto worker_path = attach_params->worker_path();
-	auto args =
-	    vgi::CreateSchemaContentsArgs(attach_result->attach_id, schema_.name, vgi::SchemaObjectType::TableFunction);
-	vgi::CatalogMethodCall stream(worker_path, vgi::CatalogMethod::SchemaContents, args, context,
-	                                attach_params->worker_debug());
+	auto function_list = vgi::InvokeCatalogSchemaContentsFunctions(worker_path, attach_result->attach_id, schema_.name,
+	                                                               "TABLE_FUNCTION", context,
+	                                                               attach_params->worker_debug());
 
 	// Group functions by name (overloads)
 	std::unordered_map<std::string, std::vector<vgi::VgiFunctionInfo>> functions_by_name;
-
-	// Read all function batches
-	while (true) {
-		auto batch = stream.ReadNext();
-		if (!batch) {
-			break;
+	for (auto &func_info : function_list) {
+		if (func_info.function_type != vgi::VgiFunctionType::Table) {
+			throw IOException("VGI worker returned '%s' function_type when 'table' was requested (function: %s)",
+			                  vgi::VgiFunctionTypeToString(func_info.function_type), func_info.name);
 		}
-
-		// Parse each row in the batch as a function
-		for (int64_t i = 0; i < batch->num_rows(); i++) {
-			auto func_info = vgi::ParseFunctionInfo(batch, i, worker_path);
-			if (func_info.function_type != vgi::VgiFunctionType::Table) {
-				throw IOException("VGI worker returned '%s' function_type when 'table' was requested (function: %s)",
-				                  vgi::VgiFunctionTypeToString(func_info.function_type), func_info.name);
-			}
-			functions_by_name[func_info.name].push_back(std::move(func_info));
-		}
+		functions_by_name[func_info.name].push_back(std::move(func_info));
 	}
 
 	// Create function entries

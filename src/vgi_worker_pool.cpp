@@ -1,5 +1,7 @@
 #include "vgi_worker_pool.hpp"
 
+#include "duckdb/main/client_context.hpp"
+
 #include <unistd.h>
 
 namespace duckdb {
@@ -73,6 +75,14 @@ pid_t PooledWorker::GetPid() const {
 VgiWorkerPool &VgiWorkerPool::Instance() {
 	static VgiWorkerPool instance;
 	return instance;
+}
+
+size_t VgiWorkerPool::GetMaxPoolSize(duckdb::ClientContext &context) {
+	Value max_val;
+	if (context.TryGetCurrentSetting("vgi_worker_pool_max", max_val)) {
+		return static_cast<size_t>(max_val.GetValue<int64_t>());
+	}
+	return 0;
 }
 
 VgiWorkerPool::VgiWorkerPool() {

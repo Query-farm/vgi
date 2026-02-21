@@ -92,8 +92,7 @@ private:
 
 // Read a single RecordBatch from a file descriptor (Arrow IPC stream format)
 // Returns RecordBatchWithMetadata containing both the batch and any custom metadata.
-// NOTE: This creates a new stream reader each time. For catalog methods that return batches,
-// use CatalogMethodCall from vgi_catalog_api.hpp which properly handles log messages.
+// NOTE: This creates a new stream reader each time.
 // Optional worker_path and worker_pid are included in exception messages for debugging.
 arrow::RecordBatchWithMetadata ReadRecordBatch(int fd, const std::string &worker_path = "",
                                                pid_t worker_pid = -1);
