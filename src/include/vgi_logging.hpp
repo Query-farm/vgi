@@ -89,4 +89,14 @@ bool HandleBatchLogMessage(const std::shared_ptr<arrow::RecordBatch> &batch,
                            const std::string &invocation_id_hex = "", const std::string &attach_id_hex = "",
                            const std::string &transaction_id_hex = "");
 
+//! VGI_STDERR_DEBUG - lightweight stderr debug logging without requiring a ClientContext.
+//! Uses the same VGI_STDERR_LOG env var as VGI_LOG.
+//! Usage: VGI_STDERR_DEBUG("[VGI] pool.acquire worker=%s\n", path.c_str());
+#define VGI_STDERR_DEBUG(fmt, ...)                          \
+    do {                                                     \
+        if (VgiStderrLogEnabled()) {                         \
+            fprintf(stderr, fmt __VA_OPT__(,) __VA_ARGS__);  \
+        }                                                    \
+    } while (0)
+
 } // namespace duckdb

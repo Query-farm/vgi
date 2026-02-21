@@ -66,6 +66,18 @@ void ArrowSchemaToDuckDBTypes(ClientContext &context, const std::shared_ptr<arro
 void ArrowSchemaToColumnList(ClientContext &context, const std::shared_ptr<arrow::Schema> &schema, ColumnList &columns);
 
 // ============================================================================
+// DuckDB DataChunk / Type to Arrow Conversion
+// ============================================================================
+
+// Convert DuckDB DataChunk to Arrow RecordBatch using the given schema
+std::shared_ptr<arrow::RecordBatch> DataChunkToArrow(ClientContext &context, DataChunk &chunk,
+                                                      const std::shared_ptr<arrow::Schema> &schema);
+
+// Build Arrow C++ Schema from DuckDB logical types and names
+std::shared_ptr<arrow::Schema> BuildArrowSchemaFromDuckDB(ClientContext &context, const vector<LogicalType> &types,
+                                                            const vector<string> &names);
+
+// ============================================================================
 // DuckDB Value to Arrow Conversion
 // ============================================================================
 

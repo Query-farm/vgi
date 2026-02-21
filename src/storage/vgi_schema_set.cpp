@@ -43,7 +43,7 @@ void VgiSchemaSet::LoadEntries(ClientContext &context) {
 		info.schema = schema_info.name;
 
 		auto schema_entry = make_uniq<VgiSchemaEntry>(catalog_, info, schema_info);
-		CreateEntry(std::move(schema_entry));
+		CreateEntryLocked(std::move(schema_entry));
 	}
 }
 

@@ -22,8 +22,9 @@ public:
 	// Get an entry by name, loading if necessary
 	optional_ptr<CatalogEntry> GetEntry(ClientContext &context, const std::string &name);
 
-	// Create a new entry and add it to the set
-	void CreateEntry(unique_ptr<CatalogEntry> entry);
+	// Create a new entry and add it to the set.
+	// PRECONDITION: Caller must hold entry_lock_ (called from LoadEntries under lock).
+	void CreateEntryLocked(unique_ptr<CatalogEntry> entry);
 
 	// Drop an entry from the set
 	void DropEntry(const std::string &name);

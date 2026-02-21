@@ -66,7 +66,8 @@ public:
 	void CloseStderr();
 
 	// Wait for the process to exit and return the exit status.
-	// Returns 0 on success, or the exit code/signal number on failure.
+	// Returns 0 on success, positive exit code on normal exit, or negative signal number
+	// (i.e. -WTERMSIG) if killed by a signal. This matches TryWait() convention.
 	// Sets exited_normally to true if the process exited via exit(), false if killed by signal.
 	int Wait(bool *exited_normally = nullptr);
 
@@ -105,4 +106,13 @@ constexpr int CATALOG_OPERATION_TIMEOUT_SECONDS = 5;
 void WaitForReadable(int fd, int timeout_seconds = CATALOG_OPERATION_TIMEOUT_SECONDS);
 
 } // namespace vgi
+
+class ClientContext;
+
+namespace vgi {
+// Get the catalog operation timeout from client context settings.
+// Returns CATALOG_OPERATION_TIMEOUT_SECONDS if context is null or setting is not found.
+int GetCatalogTimeout(ClientContext *context);
+} // namespace vgi
+
 } // namespace duckdb

@@ -121,7 +121,7 @@ void WriteEmptyRpcRequest(int fd, const std::string &method_name) {
 UnaryResponseResult ReadUnaryResponse(int fd, ClientContext *context,
                                       const std::string &worker_path, pid_t worker_pid) {
 	// Wait for data to be available
-	WaitForReadable(fd);
+	WaitForReadable(fd, GetCatalogTimeout(context));
 
 	auto input = std::make_shared<FdInputStream>(fd);
 	auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(input);
@@ -184,7 +184,7 @@ UnaryResponseResult ReadUnaryResponse(int fd, ClientContext *context,
 StreamHeaderResult ReadStreamHeader(int fd, ClientContext *context,
                                     const std::string &worker_path, pid_t worker_pid) {
 	// Wait for data to be available
-	WaitForReadable(fd);
+	WaitForReadable(fd, GetCatalogTimeout(context));
 
 	auto input = std::make_shared<FdInputStream>(fd);
 	auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(input);
@@ -201,21 +201,28 @@ StreamHeaderResult ReadStreamHeader(int fd, ClientContext *context,
 	// Check if this is an error stream (empty schema means error during init)
 	auto response_schema = reader->schema();
 	if (response_schema->num_fields() == 0) {
-		// Error stream - read the error batch
+		// Error stream - read the error batch, capturing any exception so we can drain first
+		std::exception_ptr caught_exception;
 		auto read_result = reader->ReadNext();
 		if (read_result.ok()) {
 			auto bwm = read_result.ValueUnsafe();
 			if (bwm.batch) {
-				// This should be an EXCEPTION batch
-				DispatchBatch(bwm.batch, bwm.custom_metadata, context, worker_path, worker_pid);
+				try {
+					DispatchBatch(bwm.batch, bwm.custom_metadata, context, worker_path, worker_pid);
+				} catch (...) {
+					caught_exception = std::current_exception();
+				}
 			}
 		}
-		// Drain
+		// Drain remaining stream data before rethrowing
 		while (true) {
 			auto drain = reader->ReadNext();
 			if (!drain.ok() || !drain.ValueUnsafe().batch) {
 				break;
 			}
+		}
+		if (caught_exception) {
+			std::rethrow_exception(caught_exception);
 		}
 		ThrowVgiIOException("Stream init failed (empty error schema)", worker_path, worker_pid, "");
 	}

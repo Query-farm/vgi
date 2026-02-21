@@ -84,6 +84,9 @@ struct VgiScalarFunctionBindData : public FunctionData {
 		return copy;
 	}
 
+	// Intentionally compares only identity fields (worker_path, attach_id, function_name, etc.)
+	// for DuckDB plan cache matching. Derived fields like schemas and constants are excluded
+	// because they are deterministic given the identity fields and argument types.
 	bool Equals(const FunctionData &other_p) const override {
 		auto &other = other_p.Cast<VgiScalarFunctionBindData>();
 		return worker_path == other.worker_path && attach_id == other.attach_id &&

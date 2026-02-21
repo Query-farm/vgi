@@ -1,6 +1,7 @@
 #include "vgi_worker_pool.hpp"
 
 #include "duckdb/main/client_context.hpp"
+#include "vgi_logging.hpp"
 
 #include <unistd.h>
 
@@ -108,17 +109,12 @@ VgiWorkerPool::~VgiWorkerPool() {
 std::unique_ptr<PooledWorker> VgiWorkerPool::TryAcquire(const std::string &worker_path) {
 	std::lock_guard<std::mutex> lock(mutex_);
 
-	bool debug = getenv("VGI_STDERR_LOG") != nullptr;
-	if (debug) {
-		size_t total = TotalPoolSizeLocked();
-		fprintf(stderr, "[VGI] pool.try_acquire worker_path=%s total_pool_size=%zu\n", worker_path.c_str(), total);
-	}
+	VGI_STDERR_DEBUG("[VGI] pool.try_acquire worker_path=%s total_pool_size=%zu\n",
+	                 worker_path.c_str(), TotalPoolSizeLocked());
 
 	auto it = pools_.find(worker_path);
 	if (it == pools_.end() || it->second.empty()) {
-		if (debug) {
-			fprintf(stderr, "[VGI] pool.try_acquire path_not_found_or_empty worker_path=%s\n", worker_path.c_str());
-		}
+		VGI_STDERR_DEBUG("[VGI] pool.try_acquire path_not_found_or_empty worker_path=%s\n", worker_path.c_str());
 		return nullptr;
 	}
 
@@ -131,38 +127,28 @@ std::unique_ptr<PooledWorker> VgiWorkerPool::TryAcquire(const std::string &worke
 		if (worker->IsAlive()) {
 			// Record hit
 			stats_[worker_path].first++;
-			if (debug) {
-				fprintf(stderr, "[VGI] pool.try_acquire found_alive pid=%d\n", worker->GetPid());
-			}
+			VGI_STDERR_DEBUG("[VGI] pool.try_acquire found_alive pid=%d\n", worker->GetPid());
 			return worker;
 		}
 		// Worker died while pooled, discard and try next
-		if (debug) {
-			fprintf(stderr, "[VGI] pool.try_acquire worker_died pid=%d\n", worker->GetPid());
-		}
+		VGI_STDERR_DEBUG("[VGI] pool.try_acquire worker_died pid=%d\n", worker->GetPid());
 	}
 
 	return nullptr;
 }
 
 void VgiWorkerPool::Release(std::unique_ptr<PooledWorker> worker, size_t max_pool_size) {
-	bool debug = getenv("VGI_STDERR_LOG") != nullptr;
-
 	if (!worker) {
 		return;
 	}
 	if (!worker->IsAlive()) {
-		if (debug) {
-			fprintf(stderr, "[VGI] pool.release worker_not_alive pid=%d\n", worker->GetPid());
-		}
+		VGI_STDERR_DEBUG("[VGI] pool.release worker_not_alive pid=%d\n", worker->GetPid());
 		return; // Don't pool dead workers
 	}
 
 	// max_pool_size of 0 means pool is disabled
 	if (max_pool_size == 0) {
-		if (debug) {
-			fprintf(stderr, "[VGI] pool.release pool_disabled pid=%d\n", worker->GetPid());
-		}
+		VGI_STDERR_DEBUG("[VGI] pool.release pool_disabled pid=%d\n", worker->GetPid());
 		return; // Pool disabled, discard worker
 	}
 
@@ -170,10 +156,8 @@ void VgiWorkerPool::Release(std::unique_ptr<PooledWorker> worker, size_t max_poo
 
 	// Check if pool is full
 	if (TotalPoolSizeLocked() >= max_pool_size) {
-		if (debug) {
-			fprintf(stderr, "[VGI] pool.release pool_full pid=%d total=%zu max=%zu\n",
-			        worker->GetPid(), TotalPoolSizeLocked(), max_pool_size);
-		}
+		VGI_STDERR_DEBUG("[VGI] pool.release pool_full pid=%d total=%zu max=%zu\n",
+		                 worker->GetPid(), TotalPoolSizeLocked(), max_pool_size);
 		// Pool is full, discard this worker
 		return;
 	}
@@ -181,10 +165,8 @@ void VgiWorkerPool::Release(std::unique_ptr<PooledWorker> worker, size_t max_poo
 	// Add to the pool for this worker path
 	const std::string &path = worker->GetWorkerPath();
 	pools_[path].push_back(std::move(worker));
-	if (debug) {
-		fprintf(stderr, "[VGI] pool.release added worker_path=%s pool_size=%zu total=%zu\n",
-		        path.c_str(), pools_[path].size(), TotalPoolSizeLocked());
-	}
+	VGI_STDERR_DEBUG("[VGI] pool.release added worker_path=%s pool_size=%zu total=%zu\n",
+	                 path.c_str(), pools_[path].size(), TotalPoolSizeLocked());
 }
 
 size_t VgiWorkerPool::Flush() {

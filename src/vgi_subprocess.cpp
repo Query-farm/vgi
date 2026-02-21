@@ -1,11 +1,13 @@
 #include "vgi_subprocess.hpp"
 
 #include <cerrno>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <sys/select.h>
 
 #include "duckdb/common/exception.hpp"
+#include "duckdb/main/client_context.hpp"
 
 namespace duckdb {
 namespace vgi {
@@ -190,7 +192,7 @@ int SubProcess::Wait(bool *exited_normally) {
 		if (exited_normally) {
 			*exited_normally = false;
 		}
-		return WTERMSIG(status);
+		return -WTERMSIG(status);
 	}
 
 	if (exited_normally) {
@@ -253,33 +255,52 @@ void WriteAll(int fd, const uint8_t *data, size_t len) {
 	}
 }
 
-// WaitForReadable implementation - wait for fd to be readable with timeout
+// WaitForReadable implementation - wait for fd to be readable with timeout.
+// Retries on EINTR with deadline-based remaining time calculation.
 void WaitForReadable(int fd, int timeout_seconds) {
-	fd_set read_fds;
-	struct timeval timeout;
+	auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout_seconds);
 
-	FD_ZERO(&read_fds);
-	FD_SET(fd, &read_fds);
-
-	timeout.tv_sec = timeout_seconds;
-	timeout.tv_usec = 0;
-
-	int result = select(fd + 1, &read_fds, nullptr, nullptr, &timeout);
-
-	if (result < 0) {
-		if (errno == EINTR) {
-			// Interrupted by signal, treat as timeout for simplicity
-			throw IOException("VGI catalog operation interrupted");
+	while (true) {
+		auto now = std::chrono::steady_clock::now();
+		auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(deadline - now);
+		if (remaining.count() <= 0) {
+			throw IOException("VGI catalog operation timed out after %d seconds", timeout_seconds);
 		}
-		throw IOException("VGI catalog operation failed: select error: %s", strerror(errno));
-	}
 
-	if (result == 0) {
-		// Timeout
-		throw IOException("VGI catalog operation timed out after %d seconds", timeout_seconds);
-	}
+		fd_set read_fds;
+		FD_ZERO(&read_fds);
+		FD_SET(fd, &read_fds);
 
-	// fd is readable, return successfully
+		struct timeval tv;
+		tv.tv_sec = remaining.count() / 1000000;
+		tv.tv_usec = remaining.count() % 1000000;
+
+		int result = select(fd + 1, &read_fds, nullptr, nullptr, &tv);
+
+		if (result < 0) {
+			if (errno == EINTR) {
+				continue; // Recalculate remaining time and retry
+			}
+			throw IOException("VGI catalog operation failed: select error: %s", strerror(errno));
+		}
+
+		if (result == 0) {
+			throw IOException("VGI catalog operation timed out after %d seconds", timeout_seconds);
+		}
+
+		// fd is readable, return successfully
+		return;
+	}
+}
+
+int GetCatalogTimeout(ClientContext *context) {
+	if (context) {
+		Value val;
+		if (context->TryGetCurrentSetting("vgi_catalog_timeout_seconds", val)) {
+			return static_cast<int>(val.GetValue<int64_t>());
+		}
+	}
+	return CATALOG_OPERATION_TIMEOUT_SECONDS;
 }
 
 } // namespace vgi

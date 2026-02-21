@@ -337,7 +337,7 @@ void VgiTableFunctionSet::LoadEntries(ClientContext &context) {
 		auto function_entry = make_uniq_base<StandardEntry, TableFunctionCatalogEntry>(
 		    catalog_, schema_, info.Cast<CreateTableFunctionInfo>());
 
-		CreateEntry(std::move(function_entry));
+		CreateEntryLocked(std::move(function_entry));
 	}
 }
 

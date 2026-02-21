@@ -25,51 +25,36 @@ VgiScalarFunctionLocalState::VgiScalarFunctionLocalState() = default;
 VgiScalarFunctionLocalState::~VgiScalarFunctionLocalState() {
 	// Clean up connection - try to return to pool if possible
 	if (connection && initialized) {
-		bool debug = getenv("VGI_STDERR_LOG") != nullptr;
-		if (debug) {
-			fprintf(stderr, "[VGI] scalar.destructor is_finished=%s pid=%d\n",
-			        connection->IsFinished() ? "true" : "false", connection->GetPid());
-		}
+		VGI_STDERR_DEBUG("[VGI] scalar.destructor is_finished=%s pid=%d\n",
+		                 connection->IsFinished() ? "true" : "false", connection->GetPid());
 
 		if (!connection->IsFinished()) {
 			try {
 				// Close input stream to signal worker we're done
 				connection->CloseInputWriter();
-				if (debug) {
-					fprintf(stderr, "[VGI] scalar.destructor closed_input_writer pid=%d\n", connection->GetPid());
-				}
+				VGI_STDERR_DEBUG("[VGI] scalar.destructor closed_input_writer pid=%d\n", connection->GetPid());
 				// Read the output EOS to complete the IPC stream protocol
 				// Worker sends EOS immediately after seeing input close
 				auto batch = connection->ReadDataBatch();
-				if (debug) {
-					fprintf(stderr, "[VGI] scalar.destructor read_eos batch=%s is_finished=%s pid=%d\n",
-					        batch ? "non-null" : "null", connection->IsFinished() ? "true" : "false",
-					        connection->GetPid());
-				}
+				VGI_STDERR_DEBUG("[VGI] scalar.destructor read_eos batch=%s is_finished=%s pid=%d\n",
+				                 batch ? "non-null" : "null", connection->IsFinished() ? "true" : "false",
+				                 connection->GetPid());
 			} catch (const std::exception &e) {
-				if (debug) {
-					fprintf(stderr, "[VGI] scalar.destructor exception=%s pid=%d\n", e.what(), connection->GetPid());
-				}
+				VGI_STDERR_DEBUG("[VGI] scalar.destructor exception=%s pid=%d\n", e.what(), connection->GetPid());
 				return;
 			} catch (...) {
-				if (debug) {
-					fprintf(stderr, "[VGI] scalar.destructor unknown_exception pid=%d\n", connection->GetPid());
-				}
+				VGI_STDERR_DEBUG("[VGI] scalar.destructor unknown_exception pid=%d\n", connection->GetPid());
 				return;
 			}
 		}
 
-		if (debug) {
-			fprintf(stderr, "[VGI] scalar.destructor can_be_pooled=%s pid=%d\n",
-			        connection->CanBePooled() ? "true" : "false", connection->GetPid());
-		}
+		VGI_STDERR_DEBUG("[VGI] scalar.destructor can_be_pooled=%s pid=%d\n",
+		                 connection->CanBePooled() ? "true" : "false", connection->GetPid());
 
 		if (connection->CanBePooled()) {
 			auto pooled = connection->ReleaseForPooling();
 			if (pooled) {
-				if (debug) {
-					fprintf(stderr, "[VGI] scalar.destructor pooled pid=%d\n", pooled->GetPid());
-				}
+				VGI_STDERR_DEBUG("[VGI] scalar.destructor pooled pid=%d\n", pooled->GetPid());
 				vgi::VgiWorkerPool::Instance().Release(std::move(pooled), max_pool_size);
 			}
 		}
@@ -78,79 +63,6 @@ VgiScalarFunctionLocalState::~VgiScalarFunctionLocalState() {
 }
 
 namespace vgi {
-
-// ============================================================================
-// Arrow Conversion Helpers (same as table-in-out)
-// ============================================================================
-
-// Convert DuckDB DataChunk to Arrow RecordBatch
-static std::shared_ptr<arrow::RecordBatch> DataChunkToArrow(ClientContext &context, DataChunk &chunk,
-                                                             const std::shared_ptr<arrow::Schema> &schema) {
-	if (chunk.size() == 0) {
-		// Create empty batch with schema
-		std::vector<std::shared_ptr<arrow::Array>> empty_arrays;
-		for (int i = 0; i < schema->num_fields(); i++) {
-			auto builder_result = arrow::MakeBuilder(schema->field(i)->type());
-			if (!builder_result.ok()) {
-				throw IOException("Failed to create Arrow builder: %s", builder_result.status().ToString());
-			}
-			auto array_result = builder_result.ValueUnsafe()->Finish();
-			if (!array_result.ok()) {
-				throw IOException("Failed to finish Arrow array: %s", array_result.status().ToString());
-			}
-			empty_arrays.push_back(array_result.ValueUnsafe());
-		}
-		return arrow::RecordBatch::Make(schema, 0, empty_arrays);
-	}
-
-	// Use ArrowAppender to convert the DataChunk
-	vector<LogicalType> types;
-	vector<string> names;
-	for (idx_t i = 0; i < chunk.ColumnCount(); i++) {
-		types.push_back(chunk.data[i].GetType());
-		names.push_back(schema->field(i)->name());
-	}
-
-	ClientProperties client_props = context.GetClientProperties();
-	ArrowAppender appender(types, chunk.size(), client_props, ArrowTypeExtensionData::GetExtensionTypes(context, types));
-	appender.Append(chunk, 0, chunk.size(), chunk.size());
-	ArrowArray arr = appender.Finalize();
-
-	// Get the Arrow schema for the chunk
-	ArrowSchema c_schema;
-	ArrowConverter::ToArrowSchema(&c_schema, types, names, client_props);
-
-	// Import to Arrow C++
-	auto import_result = arrow::ImportRecordBatch(&arr, &c_schema);
-	if (!import_result.ok()) {
-		if (c_schema.release) {
-			c_schema.release(&c_schema);
-		}
-		throw IOException("Failed to import Arrow batch: %s", import_result.status().ToString());
-	}
-
-	return import_result.ValueUnsafe();
-}
-
-// Build Arrow Schema from DuckDB Types
-static std::shared_ptr<arrow::Schema> BuildArrowSchemaFromDuckDB(ClientContext &context,
-                                                                   const vector<LogicalType> &types,
-                                                                   const vector<string> &names) {
-	// Use DuckDB's converter to get Arrow schema
-	ArrowSchema c_schema;
-	ClientProperties client_props = context.GetClientProperties();
-	ArrowConverter::ToArrowSchema(&c_schema, types, names, client_props);
-
-	auto import_result = arrow::ImportSchema(&c_schema);
-	if (!import_result.ok()) {
-		if (c_schema.release) {
-			c_schema.release(&c_schema);
-		}
-		throw IOException("Failed to import Arrow schema: %s", import_result.status().ToString());
-	}
-
-	return import_result.ValueUnsafe();
-}
 
 // ============================================================================
 // Initialize Local State
@@ -396,31 +308,24 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 		bool worker_debug = bind_data ? bind_data->worker_debug : func_info.worker_debug;
 		const auto &settings = bind_data ? bind_data->settings : func_info.settings;
 
-		bool debug = getenv("VGI_STDERR_LOG") != nullptr;
 		if (use_pool) {
 			auto pooled = VgiWorkerPool::Instance().TryAcquire(worker_path);
 			if (pooled) {
-				if (debug) {
-					fprintf(stderr, "[VGI] scalar.pool_acquire result=hit worker_path=%s pid=%d\n",
-					        worker_path.c_str(), pooled->GetPid());
-				}
+				VGI_STDERR_DEBUG("[VGI] scalar.pool_acquire result=hit worker_path=%s pid=%d\n",
+				                 worker_path.c_str(), pooled->GetPid());
 				connection = std::make_unique<FunctionConnection>(
 				    std::move(pooled), function_name, arguments, attach_id, context,
 				    "SCALAR", std::vector<uint8_t>{}, worker_debug, settings);
 			} else {
-				if (debug) {
-					fprintf(stderr, "[VGI] scalar.pool_acquire result=miss worker_path=%s\n", worker_path.c_str());
-				}
+				VGI_STDERR_DEBUG("[VGI] scalar.pool_acquire result=miss worker_path=%s\n", worker_path.c_str());
 			}
 		}
 		if (!connection) {
 			connection = std::make_unique<FunctionConnection>(
 			    worker_path, function_name, arguments, attach_id, context,
 			    "SCALAR", std::vector<uint8_t>{}, worker_debug, settings);
-			if (debug) {
-				fprintf(stderr, "[VGI] scalar.new_connection worker_path=%s pid=%d\n",
-				        worker_path.c_str(), connection->GetPid());
-			}
+			VGI_STDERR_DEBUG("[VGI] scalar.new_connection worker_path=%s pid=%d\n",
+			                 worker_path.c_str(), connection->GetPid());
 		}
 
 		// Set input schema for scalar functions (they receive input data as batches)

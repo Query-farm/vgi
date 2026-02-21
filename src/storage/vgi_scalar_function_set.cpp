@@ -186,7 +186,7 @@ void VgiScalarFunctionSet::LoadEntries(ClientContext &context) {
 		auto function_entry = make_uniq_base<StandardEntry, ScalarFunctionCatalogEntry>(
 		    catalog_, schema_, info.Cast<CreateScalarFunctionInfo>());
 
-		CreateEntry(std::move(function_entry));
+		CreateEntryLocked(std::move(function_entry));
 	}
 }
 

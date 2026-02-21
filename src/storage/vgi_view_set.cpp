@@ -10,6 +10,7 @@
 #include "storage/vgi_catalog.hpp"
 #include "storage/vgi_schema_entry.hpp"
 #include "vgi_catalog_api.hpp"
+#include "vgi_logging.hpp"
 
 namespace duckdb {
 
@@ -41,12 +42,16 @@ void VgiViewSet::LoadEntries(ClientContext &context) {
 			if (!parser.statements.empty() && parser.statements[0]->type == StatementType::SELECT_STATEMENT) {
 				info.query = unique_ptr_cast<SQLStatement, SelectStatement>(std::move(parser.statements[0]));
 			}
+		} catch (const std::exception &e) {
+			VGI_STDERR_DEBUG("[VGI] view.parse_warning name=%s error=%s\n",
+			                 view_info.name.c_str(), e.what());
 		} catch (...) {
-			// If parsing fails, we still create the view but without a parsed query
+			VGI_STDERR_DEBUG("[VGI] view.parse_warning name=%s error=unknown\n",
+			                 view_info.name.c_str());
 		}
 
 		auto view_entry = make_uniq<ViewCatalogEntry>(catalog_, schema_, info);
-		CreateEntry(std::move(view_entry));
+		CreateEntryLocked(std::move(view_entry));
 	}
 }
 

@@ -54,7 +54,8 @@ std::shared_ptr<arrow::Buffer> SerializeRecordBatch(
     const std::shared_ptr<arrow::RecordBatch> &batch,
     const std::shared_ptr<const arrow::KeyValueMetadata> &custom_metadata = nullptr);
 
-// Input stream wrapper for reading from a file descriptor
+// Input stream wrapper for reading from a file descriptor.
+// NON-OWNING: Does not close the fd on destruction. The caller retains ownership.
 class FdInputStream : public arrow::io::InputStream {
 public:
 	explicit FdInputStream(int fd);
@@ -72,7 +73,8 @@ private:
 	bool is_open_;
 };
 
-// Output stream wrapper for writing to a file descriptor
+// Output stream wrapper for writing to a file descriptor.
+// NON-OWNING: Does not close the fd on destruction. The caller retains ownership.
 class FdOutputStream : public arrow::io::OutputStream {
 public:
 	explicit FdOutputStream(int fd);

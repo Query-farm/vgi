@@ -1,17 +1,12 @@
 # VGI Extension Development
 
-This is a DuckDB extension implementing the VGI protocol for remote function execution for table and scalar functions.
+DuckDB extension implementing the VGI protocol for remote function execution. Supports table, scalar, and table-in-out functions over subprocess transport using Apache Arrow IPC for data interchange.
 
-It utilizes the `vgi_rpc` RPC framework for RPC calls over to subprocesses or via http.  The initial implementation will focus on subprocesses. `vgi` uses Apache Arrow for data interchange which makes it efficient and performant.
+Reference implementations:
+- **vgi**: `/Users/rusty/Development/vgi-python` (see `docs/*` for protocol documentation)
+- **vgi_rpc**: `/Users/rusty/Development/vgi-rpc-python` (see `docs/*` for RPC protocol)
 
-There is a reference implementation of vgi in `/Users/rusty/Development/vgi-python` (see `docs/*` for protocol documentation)
-There is a reference implementation of vgi_rpc in `/Users/rusty/Development/vgi-rpc-python` (see `docs/*` for protocol documentation)
-
-You will need to activate the `.venv` in vgi or vgi_rpc before running any of their code.
-
-As there is no C++ implementation of `vgi_rpc` as a library this module will need to construct its own implementation for the subprocess transport.  For the HTTP based transport it should use DuckDB's provided `HttpUtils` interface for interacting with the web.
-
-The acceptance critieria for this `vgi` DuckDB module is that it validates and interacts with the example workers implemented in the python implementation of `vgi` for table, scalar and table in/out functions in addition to the entire catalog interface.
+Activate the `.venv` in vgi-python or vgi-rpc-python before running their code.
 
 ## Build
 
@@ -26,54 +21,137 @@ No permission needed to run builds.
 Run test suites after changes:
 
 ```bash
+# Core unit tests (no worker needed)
 ./build/debug/test/unittest --test-dir . "test/sql/vgi.test"
-VGI_TEST_WORKER=../vgi-python/.venv/bin/vgi-example-worker ./build/debug/test/unittest --test-dir . "test/sql/vgi_integration.test"
+
+# Integration tests (need worker)
+VGI_TEST_WORKER=../vgi-python/.venv/bin/vgi-example-worker ./build/debug/test/unittest --test-dir . "test/sql/integration/table/*"
+VGI_TEST_WORKER=../vgi-python/.venv/bin/vgi-example-worker ./build/debug/test/unittest --test-dir . "test/sql/integration/table_in_out/*"
+VGI_TEST_WORKER=../vgi-python/.venv/bin/vgi-example-worker ./build/debug/test/unittest --test-dir . "test/sql/integration/scalar/*"
+
+# Worker pool tests
 VGI_TEST_WORKER=../vgi-python/.venv/bin/vgi-example-worker ./build/debug/test/unittest --test-dir . "test/sql/vgi_worker_pool.test"
-VGI_TEST_WORKER=../vgi-python/.venv/bin/vgi-example-worker ./build/debug/test/unittest --test-dir . "test/sql/integration/*"
 ```
 
-Tests complete in <10 seconds. For debugging failures, write standalone `.sql` files in `/tmp/` and run with `./build/debug/duckdb`.
+Tests complete in <10 seconds per suite. For debugging failures, write standalone `.sql` files in `/tmp/` and run with `./build/debug/duckdb -f /tmp/test.sql`.
+
+**Known failure**: `settings_aware.test:161` — direct `vgi_table_function()` doesn't pass settings (pre-existing).
 
 ## Debug Environment Variables
 
-See the documentation in `vgi_rpc` to enable logging for the RPC layer.
+| Variable | Effect |
+|----------|--------|
+| `VGI_STDERR_LOG=1` | Enable stderr debug logging (used by `VGI_LOG` and `VGI_STDERR_DEBUG`) |
+| `VGI_STDERR_LOG_PRETTY=1` | Pretty-print stderr logs with indentation (requires `VGI_STDERR_LOG=1`) |
+| `VGI_IPC_DEBUG=1` | Low-level Arrow IPC stream debug output |
+| `VGI_WORKER_STDERR_PASSTHROUGH=1` | Pass worker stderr directly to terminal |
+| `VGI_WORKER_DEBUG=1` | Same as PASSTHROUGH + sets `VGI_IPC_DEBUG=1` in worker |
 
 **vgi-python function classes**: Function names are CamelCased with a `Function` suffix (e.g., `projected_data` → `ProjectedDataFunction` in vgi-python).
 
+## Extension Settings
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `vgi_catalog_timeout_seconds` | BIGINT | 5 | Timeout for catalog RPC operations |
+| `vgi_worker_pool_idle_limit_seconds` | BIGINT | 5 | Max idle time before pooled workers are removed |
+| `vgi_worker_pool_max` | BIGINT | 256 | Max workers in pool (0 = disabled) |
+
+Catalogs may register additional settings at `ATTACH` time (e.g., `greeting`, `multiplier`).
+
+## SQL Functions
+
+| Function | Type | Description |
+|----------|------|-------------|
+| `vgi_table_function(worker_path, function_name, args)` | Table | Direct table function execution |
+| `vgi_catalogs(worker_path)` | Table | List available catalogs from a worker |
+| `vgi_worker_pool()` | Table | Diagnostic: list pooled workers (worker_path, pid, age_seconds) |
+| `vgi_worker_pool_stats()` | Table | Diagnostic: hit/miss statistics by worker_path |
+| `vgi_worker_pool_flush()` | Scalar | Clear all pooled workers (returns count flushed) |
+
 ## Key Source Files
+
+### Core Implementation (`src/`)
 
 | File | Purpose |
 |------|---------|
-| `vgi_protocol.cpp` | VGI protocol implementation, FunctionConnection class |
-| `vgi_table_function_impl.cpp` | Shared table function logic (bind/init/scan) |
+| `vgi_extension.cpp` | Extension entry point, settings registration, SIGPIPE setup |
+| `vgi_rpc_client.cpp` | RPC wire protocol: request writing, response reading, batch classification |
+| `vgi_rpc_types.cpp` | RPC type definitions |
+| `vgi_catalog_api.cpp` | Catalog RPC functions, `FunctionConnection` class, `AcquireAndBindConnection()` |
+| `vgi_subprocess.cpp` | SubProcess/Pipe RAII, `WaitForReadable()` with EINTR retry, `GetCatalogTimeout()` |
+| `vgi_worker_pool.cpp` | `VgiWorkerPool` singleton, background cleanup thread |
+| `vgi_worker_pool_functions.cpp` | Pool diagnostic SQL functions |
 | `vgi_table_function.cpp` | Direct `vgi_table_function()` SQL function |
-| `vgi_subprocess.cpp` | Worker subprocess management, SIGPIPE/EPIPE handling |
-| `vgi_worker_pool.cpp` | Worker connection pooling (VgiWorkerPool singleton) |
-| `vgi_worker_pool_functions.cpp` | Pool diagnostic functions (`vgi_worker_pool()`, `vgi_worker_pool_flush()`) |
-| `vgi_arrow_ipc.cpp` | Arrow IPC stream reading/writing |
+| `vgi_table_function_impl.cpp` | Shared table function logic (bind/init/scan) |
+| `vgi_scalar_function_impl.cpp` | Scalar function bind/execute with dynamic types and const params |
+| `vgi_table_in_out_impl.cpp` | Table-in-out function implementation |
+| `vgi_arrow_ipc.cpp` | Arrow IPC stream I/O: `FdInputStream`, `FdOutputStream`, `ReadRecordBatch` |
 | `vgi_arrow_utils.cpp` | Arrow-to-DuckDB type conversion |
-| `vgi_catalog_api.cpp` | Catalog introspection API, `AcquireAndBindConnection()` helper |
-| `storage/vgi_catalog.cpp` | DuckDB catalog integration |
-| `storage/vgi_table_function_set.cpp` | Catalog-based table functions |
-| `storage/vgi_scalar_function_set.cpp` | Catalog-based scalar functions |
+| `vgi_logging.cpp` | `VgiLogType`, `VgiStderrLogEnabled()`, `VgiLogToStderr()` |
+| `vgi_catalogs.cpp` | `vgi_catalogs()` SQL function |
+
+### Storage Layer (`src/storage/`)
+
+| File | Purpose |
+|------|---------|
+| `vgi_catalog.cpp` | `VgiCatalog`: DuckDB catalog integration |
+| `vgi_catalog_set.cpp` | `VgiCatalogSet`: Base class for lazy-loading catalog entry sets |
+| `vgi_schema_set.cpp` | Schema set management |
+| `vgi_schema_entry.cpp` | Individual schema entries |
+| `vgi_table_set.cpp` | Table set with on-demand single-table loading |
+| `vgi_table_entry.cpp` | Individual table entries |
+| `vgi_table_function_set.cpp` | Catalog-based table function registration |
+| `vgi_scalar_function_set.cpp` | Catalog-based scalar function registration |
+| `vgi_view_set.cpp` | View set management with parse failure logging |
+| `vgi_transaction.cpp` | Transaction manager |
+
+### Key Headers (`src/include/`)
+
+| Header | Key contents |
+|--------|-------------|
+| `vgi_catalog_api.hpp` | `FunctionConnection` class, all `InvokeCatalog*()` functions, `VgiFunctionInfo` |
+| `vgi_rpc_client.hpp` | `WriteRpcRequest()`, `ReadUnaryResponse()`, `ReadStreamHeader()`, `RpcBatchType` |
+| `vgi_subprocess.hpp` | `SubProcess`, `Pipe`, `WaitForReadable()`, `GetCatalogTimeout()` |
+| `vgi_worker_pool.hpp` | `PooledWorker`, `VgiWorkerPool` singleton |
+| `vgi_logging.hpp` | `VGI_LOG()`, `VGI_STDERR_DEBUG()` macro, `HandleBatchLogMessage()` |
+| `vgi_arrow_ipc.hpp` | `FdInputStream`, `FdOutputStream` (non-owning), Arrow IPC helpers |
+| `vgi_scalar_function_impl.hpp` | `VgiScalarFunctionInfo`, `VgiScalarFunctionBindData` |
+| `storage/vgi_catalog_set.hpp` | `VgiCatalogSet` with `CreateEntryLocked()` (requires lock held) |
 
 ## Architecture
 
+### Function Protocol
+
+VGI uses `vgi_rpc` for RPC over subprocess stdin/stdout using Arrow IPC streams:
+
+- **Table functions** — Producer mode: client sends tick (0-row) batches, worker produces output
+- **Scalar functions** — Exchange mode: client sends input batches, worker returns 1:1 output
+- **Table-in-out functions** — Exchange mode for INPUT phase, producer mode for FINALIZE phase
+
 ### Catalog Integration
 
-VGI workers expose functions via `ATTACH`. The catalog system (`storage/*`) maps worker-provided metadata to DuckDB's catalog interface, enabling standard SQL function calls.
+Workers expose functions via `ATTACH 'catalog_name' AS name (TYPE vgi, LOCATION 'worker_path')`. The storage layer (`storage/*`) maps worker-provided metadata to DuckDB's catalog interface.
 
 ### Worker Connection Pool
 
-Worker subprocesses are pooled for reuse across queries. Key details:
+Worker subprocesses are pooled for reuse across queries:
 
-- **Pool settings**: `vgi_worker_pool_enabled` (default true), `vgi_worker_pool_max_idle_seconds` (default 300)
-- **Diagnostic functions**: `vgi_worker_pool()` lists pooled workers, `vgi_worker_pool_flush()` clears pool
-- **Stale connection handling**: `AcquireAndBindConnection()` retries with fresh connection if pooled worker died
-- **SIGPIPE handling**: Extension ignores SIGPIPE; broken pipes return EPIPE error with diagnostic hint
+- **Pool settings**: `vgi_worker_pool_max` (default 256, 0 = disabled), `vgi_worker_pool_idle_limit_seconds` (default 5)
+- **Diagnostics**: `vgi_worker_pool()` lists pooled workers, `vgi_worker_pool_stats()` shows hit/miss rates
+- **Stale connection handling**: `AcquireAndBindConnection()` retries with fresh connection if pooled worker died (EPIPE)
+- **SIGPIPE handling**: Extension uses `sigaction()` to ignore SIGPIPE; broken pipes return EPIPE error with diagnostic hint
+- **Background cleanup**: Thread removes dead and idle workers every second
 
-Connection acquisition flow (in `vgi_catalog_api.cpp`):
-1. Try pool first if enabled
-2. If pool miss or disabled, spawn fresh worker
-3. On EPIPE during bind, retry once with fresh connection (stale pool entry)
-4. If retry fails, propagate exception with helpful error message
+### Logging
+
+Two-tier logging system:
+1. **DuckDB logging**: `VGI_LOG(context, "event", {{"key", "val"}})` — records to DuckDB log manager
+2. **Stderr debug**: `VGI_STDERR_DEBUG("[VGI] message %s\n", val)` — lightweight, no context needed, enabled by `VGI_STDERR_LOG=1`
+3. **In-band worker logs**: Workers send 0-row batches with `vgi_rpc.log_level` metadata; EXCEPTION level throws `IOException`
+
+### Concurrency
+
+- `VgiCatalogSet` uses `entry_lock_` mutex; `LoadEntries()` overrides call `CreateEntryLocked()` while lock is held
+- `VgiWorkerPool` uses separate `mutex_` (pool operations) and `cleanup_mutex_` (cleanup thread)
+- `FunctionConnection` is single-threaded per instance (one per query thread)

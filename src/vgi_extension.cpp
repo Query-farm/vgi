@@ -2,7 +2,8 @@
 
 #include "vgi_extension.hpp"
 
-#include <csignal>
+#include <cerrno>
+#include <signal.h>
 
 #include "duckdb.hpp"
 #include "duckdb/main/config.hpp"
@@ -15,6 +16,7 @@
 #include "vgi_catalogs.hpp"
 #include "vgi_logging.hpp"
 #include "vgi_profiling.hpp"
+#include "vgi_subprocess.hpp"
 #include "vgi_table_function.hpp"
 #include "vgi_worker_pool_functions.hpp"
 
@@ -103,7 +105,13 @@ public:
 static void LoadInternal(ExtensionLoader &loader) {
 	// Ignore SIGPIPE - we handle broken pipes via EPIPE error from write()
 	// This prevents the process from being killed when a worker dies unexpectedly
-	std::signal(SIGPIPE, SIG_IGN);
+	struct sigaction sa;
+	sa.sa_handler = SIG_IGN;
+	sigemptyset(&sa.sa_mask);
+	sa.sa_flags = 0;
+	if (sigaction(SIGPIPE, &sa, nullptr) == -1) {
+		VGI_STDERR_DEBUG("[VGI] extension.load sigpipe_ignore_failed errno=%d\n", errno);
+	}
 
 	// Register profiling atexit handler if VGI_PROFILE is enabled
 	vgi::VgiProfileRegisterAtExit();
@@ -117,6 +125,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// Register VGI storage extension
 	auto &config = DBConfig::GetConfig(loader.GetDatabaseInstance());
 	StorageExtension::Register(config, "vgi", make_shared_ptr<VgiStorageExtension>());
+
+	// Register catalog timeout setting
+	config.AddExtensionOption("vgi_catalog_timeout_seconds",
+	                          "Timeout in seconds for VGI catalog operations (list schemas, functions, etc.)",
+	                          LogicalType::BIGINT, Value::BIGINT(vgi::CATALOG_OPERATION_TIMEOUT_SECONDS));
 
 	// Register worker pool settings
 	config.AddExtensionOption("vgi_worker_pool_idle_limit_seconds",

@@ -31,7 +31,7 @@ void VgiTableSet::LoadEntries(ClientContext &context) {
 	for (auto &table_info : tables) {
 		auto create_info = vgi::CreateTableInfoFromVgiTable(context, table_info, schema_.name);
 		auto table_entry = make_uniq<VgiTableEntry>(catalog_, schema_, create_info, table_info);
-		CreateEntry(std::move(table_entry));
+		CreateEntryLocked(std::move(table_entry));
 	}
 }
 

@@ -33,7 +33,7 @@ struct VgiWorkerPoolData : public TableFunctionData {
 
 static unique_ptr<FunctionData> VgiWorkerPoolBind(ClientContext &context, TableFunctionBindInput &input,
                                                   vector<LogicalType> &return_types, vector<string> &names) {
-	return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::BIGINT};
+	return_types = {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT};
 	names = {"worker_path", "pid", "age_seconds"};
 
 	auto data = make_uniq<VgiWorkerPoolData>();
@@ -48,7 +48,7 @@ static void VgiWorkerPoolScan(ClientContext &context, TableFunctionInput &input,
 	while (data.current_idx < data.entries.size() && count < STANDARD_VECTOR_SIZE) {
 		auto &entry = data.entries[data.current_idx++];
 		output.SetValue(0, count, Value(entry.worker_path));
-		output.SetValue(1, count, Value::INTEGER(static_cast<int32_t>(entry.pid)));
+		output.SetValue(1, count, Value::BIGINT(static_cast<int64_t>(entry.pid)));
 		output.SetValue(2, count, Value::BIGINT(entry.age_seconds));
 		count++;
 	}

@@ -31,12 +31,8 @@ optional_ptr<CatalogEntry> VgiCatalogSet::GetEntry(ClientContext &context, const
 	return nullptr;
 }
 
-void VgiCatalogSet::CreateEntry(unique_ptr<CatalogEntry> entry) {
-	// Note: LoadEntries (called from GetEntry while holding the lock) calls this method,
-	// so we don't acquire the lock here. The caller is responsible for thread safety.
-	// This is safe because:
-	// - GetEntry acquires the lock before calling LoadEntries
-	// - External callers should use thread-safe methods or provide their own synchronization
+void VgiCatalogSet::CreateEntryLocked(unique_ptr<CatalogEntry> entry) {
+	// Called from LoadEntries while entry_lock_ is held by GetEntry/Scan.
 	entries_[entry->name] = std::move(entry);
 }
 
