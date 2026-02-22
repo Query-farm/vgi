@@ -18,87 +18,87 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
 # SUM: 0+1+2+...+99 = 4950
 query I
-SELECT SUM(n) FROM example.sequence(100, 10);
+SELECT SUM(n) FROM example.sequence(100, batch_size := 10);
 ----
 4950
 
 # SUM with different batch sizes (verify consistency)
 query I
-SELECT SUM(n) FROM example.sequence(100, 1);
+SELECT SUM(n) FROM example.sequence(100, batch_size := 1);
 ----
 4950
 
 query I
-SELECT SUM(n) FROM example.sequence(100, 100);
+SELECT SUM(n) FROM example.sequence(100, batch_size := 100);
 ----
 4950
 
 query I
-SELECT SUM(n) FROM example.sequence(100, 1000);
+SELECT SUM(n) FROM example.sequence(100, batch_size := 1000);
 ----
 4950
 
 # AVG: average of 0..99 = 49.5
 query R
-SELECT AVG(n) FROM example.sequence(100, 10);
+SELECT AVG(n) FROM example.sequence(100, batch_size := 10);
 ----
 49.5
 
 # MIN/MAX
 query II
-SELECT MIN(n), MAX(n) FROM example.sequence(100, 10);
+SELECT MIN(n), MAX(n) FROM example.sequence(100, batch_size := 10);
 ----
 0	99
 
 # COUNT
 query I
-SELECT COUNT(*) FROM example.sequence(100, 10);
+SELECT COUNT(*) FROM example.sequence(100, batch_size := 10);
 ----
 100
 
 # Multiple aggregations in one query
 query IIRIII
 SELECT SUM(n), COUNT(*), AVG(n), MIN(n), MAX(n), COUNT(DISTINCT n)
-FROM example.sequence(1000, 50);
+FROM example.sequence(1000, batch_size := 50);
 ----
 499500	1000	499.5	0	999	1000
 
 # --- Aggregations on empty sequences ---
 
 query I
-SELECT SUM(n) FROM example.sequence(0, 10);
+SELECT SUM(n) FROM example.sequence(0, batch_size := 10);
 ----
 NULL
 
 query I
-SELECT COUNT(*) FROM example.sequence(0, 10);
+SELECT COUNT(*) FROM example.sequence(0, batch_size := 10);
 ----
 0
 
 query R
-SELECT AVG(n) FROM example.sequence(0, 10);
+SELECT AVG(n) FROM example.sequence(0, batch_size := 10);
 ----
 NULL
 
 query II
-SELECT MIN(n), MAX(n) FROM example.sequence(0, 10);
+SELECT MIN(n), MAX(n) FROM example.sequence(0, batch_size := 10);
 ----
 NULL	NULL
 
 # --- Aggregations on single row ---
 
 query I
-SELECT SUM(n) FROM example.sequence(1, 10);
+SELECT SUM(n) FROM example.sequence(1, batch_size := 10);
 ----
 0
 
 query R
-SELECT AVG(n) FROM example.sequence(1, 10);
+SELECT AVG(n) FROM example.sequence(1, batch_size := 10);
 ----
 0.0
 
 query II
-SELECT MIN(n), MAX(n) FROM example.sequence(1, 10);
+SELECT MIN(n), MAX(n) FROM example.sequence(1, batch_size := 10);
 ----
 0	0
 
@@ -106,13 +106,13 @@ SELECT MIN(n), MAX(n) FROM example.sequence(1, 10);
 
 # SUM with increment=2: 0+2+4+6+8 = 20
 query I
-SELECT SUM(n) FROM example.sequence(5, 10, increment=2);
+SELECT SUM(n) FROM example.sequence(5, batch_size := 10, increment=2);
 ----
 20
 
 # AVG with increment=2: avg(0,2,4,6,8) = 4.0
 query R
-SELECT AVG(n) FROM example.sequence(5, 10, increment=2);
+SELECT AVG(n) FROM example.sequence(5, batch_size := 10, increment=2);
 ----
 4.0
 
@@ -121,7 +121,7 @@ SELECT AVG(n) FROM example.sequence(5, 10, increment=2);
 # Group by modulo (count values in each bucket)
 query II
 SELECT n % 10 as bucket, COUNT(*) as cnt
-FROM example.sequence(100, 7)
+FROM example.sequence(100, batch_size := 7)
 GROUP BY bucket
 ORDER BY bucket;
 ----
@@ -139,7 +139,7 @@ ORDER BY bucket;
 # Sum within groups
 query II
 SELECT n % 5 as bucket, SUM(n) as total
-FROM example.sequence(20, 3)
+FROM example.sequence(20, batch_size := 3)
 GROUP BY bucket
 ORDER BY bucket;
 ----
@@ -153,30 +153,30 @@ ORDER BY bucket;
 
 # Filter half the values
 query I
-SELECT COUNT(*) FROM example.sequence(100, 7) WHERE n >= 50;
+SELECT COUNT(*) FROM example.sequence(100, batch_size := 7) WHERE n >= 50;
 ----
 50
 
 # Filter with modulo
 query I
-SELECT COUNT(*) FROM example.sequence(100, 13) WHERE n % 10 = 0;
+SELECT COUNT(*) FROM example.sequence(100, batch_size := 13) WHERE n % 10 = 0;
 ----
 10
 
 # Filter with range
 query I
-SELECT COUNT(*) FROM example.sequence(1000, 50) WHERE n BETWEEN 100 AND 199;
+SELECT COUNT(*) FROM example.sequence(1000, batch_size := 50) WHERE n BETWEEN 100 AND 199;
 ----
 100
 
 # Aggregation on filtered data
 query I
-SELECT SUM(n) FROM example.sequence(100, 10) WHERE n < 10;
+SELECT SUM(n) FROM example.sequence(100, batch_size := 10) WHERE n < 10;
 ----
 45
 
 query R
-SELECT AVG(n) FROM example.sequence(100, 10) WHERE n >= 90;
+SELECT AVG(n) FROM example.sequence(100, batch_size := 10) WHERE n >= 90;
 ----
 94.5
 
@@ -184,7 +184,7 @@ SELECT AVG(n) FROM example.sequence(100, 10) WHERE n >= 90;
 
 # ORDER BY (should already be ordered, but verify)
 query I
-SELECT * FROM example.sequence(5, 2) ORDER BY n DESC;
+SELECT * FROM example.sequence(5, batch_size := 2) ORDER BY n DESC;
 ----
 4
 3
@@ -194,7 +194,7 @@ SELECT * FROM example.sequence(5, 2) ORDER BY n DESC;
 
 # ORDER BY with LIMIT
 query I
-SELECT * FROM example.sequence(100, 10) ORDER BY n DESC LIMIT 5;
+SELECT * FROM example.sequence(100, batch_size := 10) ORDER BY n DESC LIMIT 5;
 ----
 99
 98
@@ -203,7 +203,7 @@ SELECT * FROM example.sequence(100, 10) ORDER BY n DESC LIMIT 5;
 95
 
 query I
-SELECT * FROM example.sequence(100, 10) ORDER BY n ASC LIMIT 5;
+SELECT * FROM example.sequence(100, batch_size := 10) ORDER BY n ASC LIMIT 5;
 ----
 0
 1
@@ -215,13 +215,13 @@ SELECT * FROM example.sequence(100, 10) ORDER BY n ASC LIMIT 5;
 
 # All values should be unique
 query I
-SELECT COUNT(DISTINCT n) FROM example.sequence(1000, 50);
+SELECT COUNT(DISTINCT n) FROM example.sequence(1000, batch_size := 50);
 ----
 1000
 
 # DISTINCT on small set
 query I
-SELECT DISTINCT n FROM example.sequence(5, 2) ORDER BY n;
+SELECT DISTINCT n FROM example.sequence(5, batch_size := 2) ORDER BY n;
 ----
 0
 1
@@ -234,7 +234,7 @@ SELECT DISTINCT n FROM example.sequence(5, 2) ORDER BY n;
 # Running sum
 query II
 SELECT n, SUM(n) OVER (ORDER BY n) as running_sum
-FROM example.sequence(5, 2)
+FROM example.sequence(5, batch_size := 2)
 ORDER BY n;
 ----
 0	0
@@ -246,7 +246,7 @@ ORDER BY n;
 # Row number
 query II
 SELECT n, ROW_NUMBER() OVER (ORDER BY n) as rn
-FROM example.sequence(5, 2)
+FROM example.sequence(5, batch_size := 2)
 ORDER BY n;
 ----
 0	1
@@ -259,7 +259,7 @@ ORDER BY n;
 
 query II
 SELECT n % 3 as bucket, COUNT(*) as cnt
-FROM example.sequence(30, 5)
+FROM example.sequence(30, batch_size := 5)
 GROUP BY bucket
 HAVING COUNT(*) = 10
 ORDER BY bucket;

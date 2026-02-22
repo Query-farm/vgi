@@ -15,7 +15,7 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 # ----------------------------------------------------------------------------
 
 query R
-SELECT * FROM example.double_sequence(5, 1);
+SELECT * FROM example.double_sequence(5, batch_size := 1);
 ----
 0.0
 1.0
@@ -24,17 +24,17 @@ SELECT * FROM example.double_sequence(5, 1);
 4.0
 
 query I
-SELECT COUNT(*) FROM example.double_sequence(100, 1);
+SELECT COUNT(*) FROM example.double_sequence(100, batch_size := 1);
 ----
 100
 
 query R
-SELECT SUM(n) FROM example.double_sequence(50, 1);
+SELECT SUM(n) FROM example.double_sequence(50, batch_size := 1);
 ----
 1225.0
 
 query RR
-SELECT MIN(n), MAX(n) FROM example.double_sequence(10, 1);
+SELECT MIN(n), MAX(n) FROM example.double_sequence(10, batch_size := 1);
 ----
 0.0	9.0
 
@@ -44,7 +44,7 @@ SELECT MIN(n), MAX(n) FROM example.double_sequence(10, 1);
 # ----------------------------------------------------------------------------
 
 query R
-SELECT * FROM example.double_sequence(5, 10000);
+SELECT * FROM example.double_sequence(5, batch_size := 10000);
 ----
 0.0
 1.0
@@ -53,12 +53,12 @@ SELECT * FROM example.double_sequence(5, 10000);
 4.0
 
 query I
-SELECT COUNT(*) FROM example.double_sequence(10, 100000);
+SELECT COUNT(*) FROM example.double_sequence(10, batch_size := 100000);
 ----
 10
 
 query R
-SELECT SUM(n) FROM example.double_sequence(100, 10000);
+SELECT SUM(n) FROM example.double_sequence(100, batch_size := 10000);
 ----
 4950.0
 
@@ -68,7 +68,7 @@ SELECT SUM(n) FROM example.double_sequence(100, 10000);
 # ----------------------------------------------------------------------------
 
 query R
-SELECT * FROM example.double_sequence(5, 5);
+SELECT * FROM example.double_sequence(5, batch_size := 5);
 ----
 0.0
 1.0
@@ -77,12 +77,12 @@ SELECT * FROM example.double_sequence(5, 5);
 4.0
 
 query I
-SELECT COUNT(*) FROM example.double_sequence(100, 100);
+SELECT COUNT(*) FROM example.double_sequence(100, batch_size := 100);
 ----
 100
 
 query R
-SELECT SUM(n) FROM example.double_sequence(10, 10);
+SELECT SUM(n) FROM example.double_sequence(10, batch_size := 10);
 ----
 45.0
 
@@ -93,7 +93,7 @@ SELECT SUM(n) FROM example.double_sequence(10, 10);
 
 # 7 rows, batch_size=3: batches of [3, 3, 1]
 query R
-SELECT * FROM example.double_sequence(7, 3);
+SELECT * FROM example.double_sequence(7, batch_size := 3);
 ----
 0.0
 1.0
@@ -105,25 +105,25 @@ SELECT * FROM example.double_sequence(7, 3);
 
 # 10 rows, batch_size=3: batches of [3, 3, 3, 1]
 query I
-SELECT COUNT(*) FROM example.double_sequence(10, 3);
+SELECT COUNT(*) FROM example.double_sequence(10, batch_size := 3);
 ----
 10
 
 # 11 rows, batch_size=4: batches of [4, 4, 3]
 query R
-SELECT SUM(n) FROM example.double_sequence(11, 4);
+SELECT SUM(n) FROM example.double_sequence(11, batch_size := 4);
 ----
 55.0
 
 # 99 rows, batch_size=10: batches of [10, 10, ..., 9]
 query I
-SELECT COUNT(*) FROM example.double_sequence(99, 10);
+SELECT COUNT(*) FROM example.double_sequence(99, batch_size := 10);
 ----
 99
 
 # 101 rows, batch_size=100: batches of [100, 1]
 query I
-SELECT COUNT(*) FROM example.double_sequence(101, 100);
+SELECT COUNT(*) FROM example.double_sequence(101, batch_size := 100);
 ----
 101
 

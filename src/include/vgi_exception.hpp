@@ -9,6 +9,8 @@
 
 #include "duckdb/common/exception.hpp"
 
+#include "vgi_subprocess.hpp"
+
 namespace duckdb {
 namespace vgi {
 
@@ -71,6 +73,31 @@ template <typename... ARGS>
 	auto extra_info = BuildExtraInfo(worker_path, worker_pid, invocation_id_hex);
 	auto full_msg = BuildMessageWithContext(msg, worker_path);
 	throw IOException(extra_info, full_msg);
+}
+
+// Check if a worker process exited with an error and throw appropriate exception.
+// Returns true if the process has exited, false if still running.
+// Throws VgiIOException for exit codes 127 (not found), 126 (permission denied), or other non-zero.
+// The error_context parameter customizes the message for non-special exit codes:
+// - "failed to start" for errors during read attempts
+// - "exited with status" for EOF/null batch cases
+inline bool CheckWorkerExitStatus(SubProcess &proc, const std::string &worker_path, const std::string &error_context,
+                                  const std::string &invocation_id_hex = "") {
+	int exit_status = 0;
+	if (!proc.TryWait(&exit_status)) {
+		return false; // Process still running
+	}
+
+	if (exit_status == 127) {
+		ThrowVgiIOException("VGI worker not found or not executable", worker_path, proc.GetPid(), invocation_id_hex);
+	} else if (exit_status == 126) {
+		ThrowVgiIOException("VGI worker permission denied", worker_path, proc.GetPid(), invocation_id_hex);
+	} else if (exit_status != 0) {
+		ThrowVgiIOException("VGI worker %s (exit code %d)", worker_path, proc.GetPid(), invocation_id_hex,
+		                    error_context, exit_status);
+	}
+
+	return true; // Process exited normally (exit_status == 0)
 }
 
 } // namespace vgi

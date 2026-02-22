@@ -16,7 +16,7 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
 # Default increment = 1.0
 query R
-SELECT * FROM example.double_sequence(5, 1000, increment=1.0);
+SELECT * FROM example.double_sequence(5, batch_size := 1000, increment=1.0);
 ----
 0.0
 1.0
@@ -26,7 +26,7 @@ SELECT * FROM example.double_sequence(5, 1000, increment=1.0);
 
 # increment = 0.5 (fractional step)
 query R
-SELECT * FROM example.double_sequence(5, 1000, increment=0.5);
+SELECT * FROM example.double_sequence(5, batch_size := 1000, increment=0.5);
 ----
 0.0
 0.5
@@ -36,7 +36,7 @@ SELECT * FROM example.double_sequence(5, 1000, increment=0.5);
 
 # increment = 0.1 (smaller fractional step)
 query R
-SELECT * FROM example.double_sequence(5, 1000, increment=0.1);
+SELECT * FROM example.double_sequence(5, batch_size := 1000, increment=0.1);
 ----
 0.0
 0.1
@@ -46,7 +46,7 @@ SELECT * FROM example.double_sequence(5, 1000, increment=0.1);
 
 # increment = 2.5 (mixed increment)
 query R
-SELECT * FROM example.double_sequence(4, 1000, increment=2.5);
+SELECT * FROM example.double_sequence(4, batch_size := 1000, increment=2.5);
 ----
 0.0
 2.5
@@ -55,7 +55,7 @@ SELECT * FROM example.double_sequence(4, 1000, increment=2.5);
 
 # increment = 10.0 (larger step)
 query R
-SELECT * FROM example.double_sequence(5, 1000, increment=10.0);
+SELECT * FROM example.double_sequence(5, batch_size := 1000, increment=10.0);
 ----
 0.0
 10.0
@@ -65,7 +65,7 @@ SELECT * FROM example.double_sequence(5, 1000, increment=10.0);
 
 # Small batch with fractional increment
 query R
-SELECT * FROM example.double_sequence(5, 2, increment=0.25);
+SELECT * FROM example.double_sequence(5, batch_size := 2, increment=0.25);
 ----
 0.0
 0.25
@@ -75,7 +75,7 @@ SELECT * FROM example.double_sequence(5, 2, increment=0.25);
 
 # Batch size = 1 with fractional increment
 query R
-SELECT * FROM example.double_sequence(4, 1, increment=0.5);
+SELECT * FROM example.double_sequence(4, batch_size := 1, increment=0.5);
 ----
 0.0
 0.5
@@ -84,13 +84,13 @@ SELECT * FROM example.double_sequence(4, 1, increment=0.5);
 
 # Large increment
 query R
-SELECT SUM(n) FROM example.double_sequence(100, 10, increment=7.0);
+SELECT SUM(n) FROM example.double_sequence(100, batch_size := 10, increment=7.0);
 ----
 34650.0
 
 # Fractional increment sum: 0.0 + 0.1 + 0.2 + ... + 0.9 = 4.5
 query R
-SELECT SUM(n) FROM example.double_sequence(10, 5, increment=0.1);
+SELECT SUM(n) FROM example.double_sequence(10, batch_size := 5, increment=0.1);
 ----
 4.5
 
@@ -101,20 +101,20 @@ SELECT SUM(n) FROM example.double_sequence(10, 5, increment=0.1);
 
 # Single row with large increment (should just return 0.0)
 query R
-SELECT * FROM example.double_sequence(1, 1, increment=1000000.0);
+SELECT * FROM example.double_sequence(1, batch_size := 1, increment=1000000.0);
 ----
 0.0
 
 # Two rows with increment, batch_size=1
 query R
-SELECT * FROM example.double_sequence(2, 1, increment=50.5);
+SELECT * FROM example.double_sequence(2, batch_size := 1, increment=50.5);
 ----
 0.0
 50.5
 
 # Zero rows with increment (still empty)
 query I
-SELECT COUNT(*) FROM example.double_sequence(0, 1, increment=100.0);
+SELECT COUNT(*) FROM example.double_sequence(0, batch_size := 1, increment=100.0);
 ----
 0
 

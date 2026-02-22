@@ -21,16 +21,15 @@ No permission needed to run builds.
 Run test suites after changes:
 
 ```bash
-# Core unit tests (no worker needed)
-./build/debug/test/unittest --test-dir . "test/sql/vgi.test"
+# You need to activate the vgi-python .venv to run the vgi-example-worker
+source /Users/rusty/Development/vgi-python/.venv/bin/activate
 
-# Integration tests (need worker)
-VGI_TEST_WORKER=../vgi-python/.venv/bin/vgi-example-worker ./build/debug/test/unittest --test-dir . "test/sql/integration/table/*"
-VGI_TEST_WORKER=../vgi-python/.venv/bin/vgi-example-worker ./build/debug/test/unittest --test-dir . "test/sql/integration/table_in_out/*"
-VGI_TEST_WORKER=../vgi-python/.venv/bin/vgi-example-worker ./build/debug/test/unittest --test-dir . "test/sql/integration/scalar/*"
+# The VGI_TEST_WORKER determines what vgi worker to use for tests.
+VGI_TEST_WORKER=vgi-example-worker make test_debug
 
-# Worker pool tests
-VGI_TEST_WORKER=../vgi-python/.venv/bin/vgi-example-worker ./build/debug/test/unittest --test-dir . "test/sql/vgi_worker_pool.test"
+# This in turn runs the unittest command, you may wish to run tests in parallel from the
+# tests/sql directory to speed up execution, but it is important to run all tests
+# comprehensively.
 ```
 
 Tests complete in <10 seconds per suite. For debugging failures, write standalone `.sql` files in `/tmp/` and run with `./build/debug/duckdb -f /tmp/test.sql`.
@@ -78,7 +77,8 @@ Catalogs may register additional settings at `ATTACH` time (e.g., `greeting`, `m
 | `vgi_extension.cpp` | Extension entry point, settings registration, SIGPIPE setup |
 | `vgi_rpc_client.cpp` | RPC wire protocol: request writing, response reading, batch classification |
 | `vgi_rpc_types.cpp` | RPC type definitions |
-| `vgi_catalog_api.cpp` | Catalog RPC functions, `FunctionConnection` class, `AcquireAndBindConnection()` |
+| `vgi_catalog_api.cpp` | Catalog RPC dispatchers, response parsers, type conversion |
+| `vgi_function_connection.cpp` | `FunctionConnection` class, `AcquireAndBindConnection()` |
 | `vgi_subprocess.cpp` | SubProcess/Pipe RAII, `WaitForReadable()` with EINTR retry, `GetCatalogTimeout()` |
 | `vgi_worker_pool.cpp` | `VgiWorkerPool` singleton, background cleanup thread |
 | `vgi_worker_pool_functions.cpp` | Pool diagnostic SQL functions |
@@ -110,7 +110,8 @@ Catalogs may register additional settings at `ATTACH` time (e.g., `greeting`, `m
 
 | Header | Key contents |
 |--------|-------------|
-| `vgi_catalog_api.hpp` | `FunctionConnection` class, all `InvokeCatalog*()` functions, `VgiFunctionInfo` |
+| `vgi_catalog_api.hpp` | All `InvokeCatalog*()` functions, `VgiFunctionInfo`, catalog metadata types |
+| `vgi_function_connection.hpp` | `FunctionConnection` class, `FunctionConnectionParams`, `AcquireAndBindConnection()` |
 | `vgi_rpc_client.hpp` | `WriteRpcRequest()`, `ReadUnaryResponse()`, `ReadStreamHeader()`, `RpcBatchType` |
 | `vgi_subprocess.hpp` | `SubProcess`, `Pipe`, `WaitForReadable()`, `GetCatalogTimeout()` |
 | `vgi_worker_pool.hpp` | `PooledWorker`, `VgiWorkerPool` singleton |

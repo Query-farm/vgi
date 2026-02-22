@@ -1,6 +1,7 @@
 #include "vgi_table_in_out_impl.hpp"
 #include "vgi_arrow_utils.hpp"
 #include "vgi_catalog_api.hpp"
+#include "vgi_function_connection.hpp"
 #include "vgi_logging.hpp"
 #include "vgi_worker_pool.hpp"
 

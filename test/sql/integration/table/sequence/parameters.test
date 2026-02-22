@@ -15,7 +15,7 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 # ----------------------------------------------------------------------------
 
 query I
-SELECT * FROM example.sequence(5, 1000, increment=1);
+SELECT * FROM example.sequence(5, batch_size := 1000, increment=1);
 ----
 0
 1
@@ -24,7 +24,7 @@ SELECT * FROM example.sequence(5, 1000, increment=1);
 4
 
 query I
-SELECT * FROM example.sequence(5, 1000, increment=10);
+SELECT * FROM example.sequence(5, batch_size := 1000, increment=10);
 ----
 0
 10
@@ -33,7 +33,7 @@ SELECT * FROM example.sequence(5, 1000, increment=10);
 40
 
 query I
-SELECT * FROM example.sequence(4, 1000, increment=25);
+SELECT * FROM example.sequence(4, batch_size := 1000, increment=25);
 ----
 0
 25
@@ -42,7 +42,7 @@ SELECT * FROM example.sequence(4, 1000, increment=25);
 
 # Small batch with increment
 query I
-SELECT * FROM example.sequence(5, 2, increment=3);
+SELECT * FROM example.sequence(5, batch_size := 2, increment=3);
 ----
 0
 3
@@ -52,7 +52,7 @@ SELECT * FROM example.sequence(5, 2, increment=3);
 
 # Batch size = 1 with increment
 query I
-SELECT * FROM example.sequence(4, 1, increment=100);
+SELECT * FROM example.sequence(4, batch_size := 1, increment=100);
 ----
 0
 100
@@ -61,7 +61,7 @@ SELECT * FROM example.sequence(4, 1, increment=100);
 
 # Large increment
 query I
-SELECT SUM(n) FROM example.sequence(100, 10, increment=7);
+SELECT SUM(n) FROM example.sequence(100, batch_size := 10, increment=7);
 ----
 34650
 
@@ -75,20 +75,20 @@ SELECT SUM(n) FROM example.sequence(100, 10, increment=7);
 
 # Single row with large increment (should just return 0)
 query I
-SELECT * FROM example.sequence(1, 1, increment=1000000);
+SELECT * FROM example.sequence(1, batch_size := 1, increment=1000000);
 ----
 0
 
 # Two rows with increment, batch_size=1
 query I
-SELECT * FROM example.sequence(2, 1, increment=50);
+SELECT * FROM example.sequence(2, batch_size := 1, increment=50);
 ----
 0
 50
 
 # Zero rows with increment (still empty)
 query I
-SELECT COUNT(*) FROM example.sequence(0, 1, increment=100);
+SELECT COUNT(*) FROM example.sequence(0, batch_size := 1, increment=100);
 ----
 0
 

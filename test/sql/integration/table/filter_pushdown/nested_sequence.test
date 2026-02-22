@@ -15,7 +15,7 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
 # Verify basic output structure
 query III
-SELECT n, metadata, history FROM example.nested_sequence(3, 1000);
+SELECT n, metadata, history FROM example.nested_sequence(3, batch_size := 1000);
 ----
 0	{'index': 0, 'label': row_0}	[0]
 1	{'index': 1, 'label': row_1}	[0, 1]
@@ -23,7 +23,7 @@ SELECT n, metadata, history FROM example.nested_sequence(3, 1000);
 
 # Verify row count
 query I
-SELECT COUNT(*) FROM example.nested_sequence(10, 1000);
+SELECT COUNT(*) FROM example.nested_sequence(10, batch_size := 1000);
 ----
 10
 
@@ -33,7 +33,7 @@ SELECT COUNT(*) FROM example.nested_sequence(10, 1000);
 
 # Access struct fields directly
 query II
-SELECT metadata.index, metadata.label FROM example.nested_sequence(3, 1000);
+SELECT metadata.index, metadata.label FROM example.nested_sequence(3, batch_size := 1000);
 ----
 0	row_0
 1	row_1
@@ -45,7 +45,7 @@ SELECT metadata.index, metadata.label FROM example.nested_sequence(3, 1000);
 
 # Filter on n with struct access
 query III
-SELECT n, metadata.index, metadata.label FROM example.nested_sequence(10, 1000) WHERE n >= 7;
+SELECT n, metadata.index, metadata.label FROM example.nested_sequence(10, batch_size := 1000) WHERE n >= 7;
 ----
 7	7	row_7
 8	8	row_8
@@ -53,13 +53,13 @@ SELECT n, metadata.index, metadata.label FROM example.nested_sequence(10, 1000) 
 
 # Equality filter on n
 query II
-SELECT n, metadata.index FROM example.nested_sequence(10, 1000) WHERE n = 5;
+SELECT n, metadata.index FROM example.nested_sequence(10, batch_size := 1000) WHERE n = 5;
 ----
 5	5
 
 # Range filter on n
 query II
-SELECT n, metadata.index FROM example.nested_sequence(10, 1000) WHERE n >= 3 AND n < 6;
+SELECT n, metadata.index FROM example.nested_sequence(10, batch_size := 1000) WHERE n >= 3 AND n < 6;
 ----
 3	3
 4	4
@@ -67,7 +67,7 @@ SELECT n, metadata.index FROM example.nested_sequence(10, 1000) WHERE n >= 3 AND
 
 # IN filter on n
 query II
-SELECT n, metadata.index FROM example.nested_sequence(10, 1000) WHERE n IN (1, 3, 5, 7);
+SELECT n, metadata.index FROM example.nested_sequence(10, batch_size := 1000) WHERE n IN (1, 3, 5, 7);
 ----
 1	1
 3	3
@@ -80,20 +80,20 @@ SELECT n, metadata.index FROM example.nested_sequence(10, 1000) WHERE n IN (1, 3
 
 # Equality filter on struct.index
 query II
-SELECT n, metadata.index FROM example.nested_sequence(10, 1000) WHERE metadata.index = 5;
+SELECT n, metadata.index FROM example.nested_sequence(10, batch_size := 1000) WHERE metadata.index = 5;
 ----
 5	5
 
 # Comparison filter on struct.index
 query II
-SELECT n, metadata.index FROM example.nested_sequence(10, 1000) WHERE metadata.index > 7;
+SELECT n, metadata.index FROM example.nested_sequence(10, batch_size := 1000) WHERE metadata.index > 7;
 ----
 8	8
 9	9
 
 # Range filter on struct.index
 query II
-SELECT n, metadata.index FROM example.nested_sequence(10, 1000) WHERE metadata.index >= 3 AND metadata.index < 6;
+SELECT n, metadata.index FROM example.nested_sequence(10, batch_size := 1000) WHERE metadata.index >= 3 AND metadata.index < 6;
 ----
 3	3
 4	4
@@ -101,13 +101,13 @@ SELECT n, metadata.index FROM example.nested_sequence(10, 1000) WHERE metadata.i
 
 # Filter on struct.label (string field)
 query II
-SELECT n, metadata.label FROM example.nested_sequence(10, 1000) WHERE metadata.label = 'row_5';
+SELECT n, metadata.label FROM example.nested_sequence(10, batch_size := 1000) WHERE metadata.label = 'row_5';
 ----
 5	row_5
 
 # Combined filters: top-level and struct field
 query II
-SELECT n, metadata.index FROM example.nested_sequence(20, 1000) WHERE n >= 10 AND metadata.index < 15;
+SELECT n, metadata.index FROM example.nested_sequence(20, batch_size := 1000) WHERE n >= 10 AND metadata.index < 15;
 ----
 10	10
 11	11
@@ -121,7 +121,7 @@ SELECT n, metadata.index FROM example.nested_sequence(20, 1000) WHERE n >= 10 AN
 
 # Verify history list contents
 query II
-SELECT n, history FROM example.nested_sequence(5, 1000);
+SELECT n, history FROM example.nested_sequence(5, batch_size := 1000);
 ----
 0	[0]
 1	[0, 1]
@@ -131,7 +131,7 @@ SELECT n, history FROM example.nested_sequence(5, 1000);
 
 # List length operations
 query II
-SELECT n, len(history) FROM example.nested_sequence(5, 1000);
+SELECT n, len(history) FROM example.nested_sequence(5, batch_size := 1000);
 ----
 0	1
 1	2
@@ -141,7 +141,7 @@ SELECT n, len(history) FROM example.nested_sequence(5, 1000);
 
 # Filter on n combined with list operations
 query II
-SELECT n, len(history) FROM example.nested_sequence(10, 1000) WHERE n >= 5;
+SELECT n, len(history) FROM example.nested_sequence(10, batch_size := 1000) WHERE n >= 5;
 ----
 5	6
 6	7
@@ -151,7 +151,7 @@ SELECT n, len(history) FROM example.nested_sequence(10, 1000) WHERE n >= 5;
 
 # List element access with filter on n
 query II
-SELECT n, history[1] FROM example.nested_sequence(5, 1000) WHERE n > 0;
+SELECT n, history[1] FROM example.nested_sequence(5, batch_size := 1000) WHERE n > 0;
 ----
 1	0
 2	0
@@ -160,7 +160,7 @@ SELECT n, history[1] FROM example.nested_sequence(5, 1000) WHERE n > 0;
 
 # Check if list contains a value with filter on n
 query II
-SELECT n, list_contains(history, 3) FROM example.nested_sequence(10, 1000) WHERE n >= 3 AND n <= 6;
+SELECT n, list_contains(history, 3) FROM example.nested_sequence(10, batch_size := 1000) WHERE n >= 3 AND n <= 6;
 ----
 3	true
 4	true
@@ -173,25 +173,25 @@ SELECT n, list_contains(history, 3) FROM example.nested_sequence(10, 1000) WHERE
 
 # Count with n filter
 query I
-SELECT COUNT(*) FROM example.nested_sequence(100, 10) WHERE n >= 50;
+SELECT COUNT(*) FROM example.nested_sequence(100, batch_size := 10) WHERE n >= 50;
 ----
 50
 
 # Sum with n filter
 query I
-SELECT SUM(n) FROM example.nested_sequence(10, 1000) WHERE n > 5;
+SELECT SUM(n) FROM example.nested_sequence(10, batch_size := 1000) WHERE n > 5;
 ----
 30
 
 # Count with struct filter
 query I
-SELECT COUNT(*) FROM example.nested_sequence(100, 10) WHERE metadata.index >= 50;
+SELECT COUNT(*) FROM example.nested_sequence(100, batch_size := 10) WHERE metadata.index >= 50;
 ----
 50
 
 # Sum with struct filter
 query I
-SELECT SUM(n) FROM example.nested_sequence(10, 1000) WHERE metadata.index > 5;
+SELECT SUM(n) FROM example.nested_sequence(10, batch_size := 1000) WHERE metadata.index > 5;
 ----
 30
 
@@ -201,31 +201,31 @@ SELECT SUM(n) FROM example.nested_sequence(10, 1000) WHERE metadata.index > 5;
 
 # Equality filter on large dataset (n)
 query I
-SELECT COUNT(*) FROM example.nested_sequence(10000, 100) WHERE n = 5000;
+SELECT COUNT(*) FROM example.nested_sequence(10000, batch_size := 100) WHERE n = 5000;
 ----
 1
 
 # Range filter on large dataset (n)
 query I
-SELECT COUNT(*) FROM example.nested_sequence(10000, 100) WHERE n >= 9990;
+SELECT COUNT(*) FROM example.nested_sequence(10000, batch_size := 100) WHERE n >= 9990;
 ----
 10
 
 # IN filter on large dataset (n)
 query I
-SELECT COUNT(*) FROM example.nested_sequence(10000, 100) WHERE n IN (0, 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000);
+SELECT COUNT(*) FROM example.nested_sequence(10000, batch_size := 100) WHERE n IN (0, 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000);
 ----
 10
 
 # Struct filter on larger dataset
 query I
-SELECT COUNT(*) FROM example.nested_sequence(1000, 100) WHERE metadata.index = 500;
+SELECT COUNT(*) FROM example.nested_sequence(1000, batch_size := 100) WHERE metadata.index = 500;
 ----
 1
 
 # Range filter on struct field (large dataset)
 query I
-SELECT COUNT(*) FROM example.nested_sequence(1000, 100) WHERE metadata.index >= 900;
+SELECT COUNT(*) FROM example.nested_sequence(1000, batch_size := 100) WHERE metadata.index >= 900;
 ----
 100
 
@@ -235,19 +235,19 @@ SELECT COUNT(*) FROM example.nested_sequence(1000, 100) WHERE metadata.index >= 
 
 # Project only struct, filter on n
 query I
-SELECT metadata.index FROM example.nested_sequence(10, 1000) WHERE n = 5;
+SELECT metadata.index FROM example.nested_sequence(10, batch_size := 1000) WHERE n = 5;
 ----
 5
 
 # Project only history, filter on n
 query I
-SELECT len(history) FROM example.nested_sequence(10, 1000) WHERE n = 5;
+SELECT len(history) FROM example.nested_sequence(10, batch_size := 1000) WHERE n = 5;
 ----
 6
 
 # Project only n, filter on struct field
 query I
-SELECT n FROM example.nested_sequence(10, 1000) WHERE metadata.index = 5;
+SELECT n FROM example.nested_sequence(10, batch_size := 1000) WHERE metadata.index = 5;
 ----
 5
 

@@ -15,17 +15,17 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 # ----------------------------------------------------------------------------
 
 query I
-SELECT COUNT(*) FROM example.double_sequence(0, 1000);
+SELECT COUNT(*) FROM example.double_sequence(0, batch_size := 1000);
 ----
 0
 
 query I
-SELECT COUNT(*) FROM example.double_sequence(0, 1);
+SELECT COUNT(*) FROM example.double_sequence(0, batch_size := 1);
 ----
 0
 
 query R
-SELECT SUM(n) FROM example.double_sequence(0, 100);
+SELECT SUM(n) FROM example.double_sequence(0, batch_size := 100);
 ----
 NULL
 
@@ -35,17 +35,17 @@ NULL
 # ----------------------------------------------------------------------------
 
 query R
-SELECT * FROM example.double_sequence(1, 1000);
+SELECT * FROM example.double_sequence(1, batch_size := 1000);
 ----
 0.0
 
 query R
-SELECT * FROM example.double_sequence(1, 1);
+SELECT * FROM example.double_sequence(1, batch_size := 1);
 ----
 0.0
 
 query I
-SELECT COUNT(*) FROM example.double_sequence(1, 10000);
+SELECT COUNT(*) FROM example.double_sequence(1, batch_size := 10000);
 ----
 1
 

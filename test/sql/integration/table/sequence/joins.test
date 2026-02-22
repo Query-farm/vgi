@@ -15,7 +15,7 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
 query II
 SELECT a.n as a_val, b.n as b_val
-FROM example.sequence(5, 2) a, example.sequence(5, 3) b
+FROM example.sequence(5, batch_size := 2) a, example.sequence(5, batch_size := 3) b
 WHERE a.n = b.n
 ORDER BY a.n;
 ----
@@ -27,7 +27,7 @@ ORDER BY a.n;
 
 # Self-join with different batch sizes
 query I
-SELECT COUNT(*) FROM example.sequence(100, 7) a, example.sequence(100, 13) b WHERE a.n = b.n;
+SELECT COUNT(*) FROM example.sequence(100, batch_size := 7) a, example.sequence(100, batch_size := 13) b WHERE a.n = b.n;
 ----
 100
 

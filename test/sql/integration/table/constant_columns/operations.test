@@ -215,7 +215,7 @@ FROM example.constant_columns(2, 100) a, example.constant_columns(3, 'text') b;
 # Join with sequence
 query II
 SELECT c.col_0, s.n
-FROM example.constant_columns(1, 50) c, example.sequence(5, 10) s
+FROM example.constant_columns(1, 50) c, example.sequence(5, batch_size := 10) s
 WHERE c.col_0 > s.n
 ORDER BY s.n;
 ----

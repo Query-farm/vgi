@@ -33,6 +33,7 @@ src/vgi_table_function_impl.cpp
 src/vgi_table_in_out_impl.cpp
 src/vgi_scalar_function_impl.cpp
 src/vgi_catalog_api.cpp
+src/vgi_function_connection.cpp
 src/vgi_worker_pool.cpp
 src/vgi_worker_pool_functions.cpp
 src/storage/vgi_catalog.cpp

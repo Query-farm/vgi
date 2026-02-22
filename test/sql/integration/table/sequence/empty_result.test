@@ -16,24 +16,24 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
 # sequence(0, ...) should produce zero rows
 query I
-SELECT COUNT(*) FROM example.sequence(0, 1000);
+SELECT COUNT(*) FROM example.sequence(0, batch_size := 1000);
 ----
 0
 
 # Aggregates on empty result
 query I
-SELECT SUM(n) FROM example.sequence(0, 1000);
+SELECT SUM(n) FROM example.sequence(0, batch_size := 1000);
 ----
 NULL
 
 query I
-SELECT MIN(n) FROM example.sequence(0, 100);
+SELECT MIN(n) FROM example.sequence(0, batch_size := 100);
 ----
 NULL
 
 # Empty result in subquery
 query I
-SELECT COUNT(*) FROM (SELECT * FROM example.sequence(0, 10)) sub;
+SELECT COUNT(*) FROM (SELECT * FROM example.sequence(0, batch_size := 10)) sub;
 ----
 0
 

@@ -17,7 +17,7 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
 # Basic double sequence generation
 query R
-SELECT * FROM example.double_sequence(5, 1000);
+SELECT * FROM example.double_sequence(5, batch_size := 1000);
 ----
 0.0
 1.0
@@ -27,19 +27,19 @@ SELECT * FROM example.double_sequence(5, 1000);
 
 # Verify count
 query I
-SELECT COUNT(*) FROM example.double_sequence(100, 10);
+SELECT COUNT(*) FROM example.double_sequence(100, batch_size := 10);
 ----
 100
 
 # Verify values
 query RR
-SELECT MIN(n), MAX(n) FROM example.double_sequence(100, 10);
+SELECT MIN(n), MAX(n) FROM example.double_sequence(100, batch_size := 10);
 ----
 0.0	99.0
 
 # Verify sum
 query R
-SELECT SUM(n) FROM example.double_sequence(10, 10);
+SELECT SUM(n) FROM example.double_sequence(10, batch_size := 10);
 ----
 45.0
 
