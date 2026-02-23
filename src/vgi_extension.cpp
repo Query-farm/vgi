@@ -18,6 +18,7 @@
 #include "vgi_profiling.hpp"
 #include "vgi_subprocess.hpp"
 #include "vgi_table_function.hpp"
+#include "vgi_worker_pool.hpp"
 #include "vgi_worker_pool_functions.hpp"
 
 #define VGI_EXTENSION_VERSION "2026011201"
@@ -32,6 +33,8 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	string catalog_name = info.path; // The first argument to ATTACH is the catalog name
 	bool worker_debug = false;
 	bool use_pool = true;
+	int64_t pool_max_override = -1;      // -1 = not set
+	int64_t pool_timeout_override = -1;  // -1 = not set
 
 	// Extract options
 	for (auto &entry : info.options) {
@@ -44,6 +47,10 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 			worker_debug = entry.second.GetValue<bool>();
 		} else if (lower_name == "pool") {
 			use_pool = entry.second.GetValue<bool>();
+		} else if (lower_name == "pool_max") {
+			pool_max_override = entry.second.GetValue<int64_t>();
+		} else if (lower_name == "pool_timeout") {
+			pool_timeout_override = entry.second.GetValue<int64_t>();
 		} else {
 			throw BinderException("Unrecognized option for VGI ATTACH: %s", entry.first);
 		}
@@ -78,6 +85,25 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 			config.AddExtensionOption(setting.name, setting.description, setting.type, setting.default_value);
 		}
 	}
+
+	// Build per-path pool config and register with pool
+	vgi::PoolSettings pool_settings;
+	if (use_pool) {
+		pool_settings.max_pool_size = vgi::VgiWorkerPool::GetMaxPoolSize(context);
+		Value idle_val;
+		if (context.TryGetCurrentSetting("vgi_worker_pool_idle_limit_seconds", idle_val)) {
+			pool_settings.idle_timeout_seconds = static_cast<size_t>(idle_val.GetValue<int64_t>());
+		}
+		if (pool_max_override >= 0) {
+			pool_settings.max_pool_size = static_cast<size_t>(pool_max_override);
+		}
+		if (pool_timeout_override >= 0) {
+			pool_settings.idle_timeout_seconds = static_cast<size_t>(pool_timeout_override);
+		}
+	} else {
+		pool_settings.max_pool_size = 0; // disabled
+	}
+	vgi::VgiWorkerPool::Instance().ConfigurePath(worker_path, pool_settings);
 
 	// Create attach parameters
 	auto attach_params = std::make_shared<vgi::VgiAttachParameters>(worker_path, catalog_name, worker_debug, use_pool);

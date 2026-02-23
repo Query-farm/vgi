@@ -192,3 +192,154 @@ query I
 SELECT vgi_worker_pool_flush() >= 0;
 ----
 true
+
+# ============================================================================
+# Test pool_max=0 ATTACH option disables pooling
+# ============================================================================
+
+# Flush pool first
+query I
+SELECT vgi_worker_pool_flush() >= 0;
+----
+true
+
+# Attach with pool_max=0 (pool disabled for this catalog)
+statement ok
+ATTACH 'example' AS vgi_pm0 (TYPE vgi, LOCATION '${VGI_TEST_WORKER}', pool_max 0);
+
+# Run a table scan - should NOT pool the worker
+query I
+SELECT COUNT(*) FROM vgi_pm0.main.sequence(5, batch_size := 1000);
+----
+5
+
+# Pool should be empty (pool_max=0 disables pooling)
+query I
+SELECT COUNT(*) FROM vgi_worker_pool();
+----
+0
+
+# Run a scalar function - also should NOT pool
+query I
+SELECT vgi_pm0.main.double(21);
+----
+42
+
+query I
+SELECT COUNT(*) FROM vgi_worker_pool();
+----
+0
+
+statement ok
+DETACH vgi_pm0;
+
+# ============================================================================
+# Test pool_max=1 limits pool size for this path
+# ============================================================================
+
+query I
+SELECT vgi_worker_pool_flush() >= 0;
+----
+true
+
+# Attach with pool_max=1
+statement ok
+ATTACH 'example' AS vgi_pm1 (TYPE vgi, LOCATION '${VGI_TEST_WORKER}', pool_max 1);
+
+# Run a query to populate the pool
+query I
+SELECT COUNT(*) FROM vgi_pm1.main.sequence(5, batch_size := 1000);
+----
+5
+
+# Pool should have exactly 1 worker
+query I
+SELECT COUNT(*) FROM vgi_worker_pool();
+----
+1
+
+# Run another query - pool should still be limited to 1
+query I
+SELECT COUNT(*) FROM vgi_pm1.main.sequence(3, batch_size := 1000);
+----
+3
+
+query I
+SELECT COUNT(*) FROM vgi_worker_pool();
+----
+1
+
+statement ok
+DETACH vgi_pm1;
+
+query I
+SELECT vgi_worker_pool_flush() >= 0;
+----
+true
+
+# ============================================================================
+# Test pool_timeout controls idle cleanup
+# ============================================================================
+
+query I
+SELECT vgi_worker_pool_flush() >= 0;
+----
+true
+
+# Attach with pool_timeout=1 (workers expire after 1 second)
+statement ok
+ATTACH 'example' AS vgi_pt1 (TYPE vgi, LOCATION '${VGI_TEST_WORKER}', pool_timeout 1);
+
+# Run a query to pool a worker
+query I
+SELECT COUNT(*) FROM vgi_pt1.main.sequence(5, batch_size := 1000);
+----
+5
+
+# Pool should have a worker now
+query I
+SELECT COUNT(*) >= 1 FROM vgi_worker_pool();
+----
+true
+
+# Wait for the pool_timeout to expire (cleanup runs every 1s, timeout is 1s)
+query I
+SELECT sleep_ms(3000);
+----
+NULL
+
+# Pool should be empty now (worker expired after 1 second idle)
+query I
+SELECT COUNT(*) FROM vgi_worker_pool();
+----
+0
+
+statement ok
+DETACH vgi_pt1;
+
+# ============================================================================
+# Test pool=false with pool_max still disables pooling
+# ============================================================================
+
+query I
+SELECT vgi_worker_pool_flush() >= 0;
+----
+true
+
+# pool=false should disable even if pool_max is set
+statement ok
+ATTACH 'example' AS vgi_pf_pm (TYPE vgi, LOCATION '${VGI_TEST_WORKER}', pool false, pool_max 5);
+
+query I
+SELECT COUNT(*) FROM vgi_pf_pm.main.sequence(5, batch_size := 1000);
+----
+5
+
+# Pool should be empty because pool=false overrides pool_max
+query I
+SELECT COUNT(*) FROM vgi_worker_pool();
+----
+0
+
+statement ok
+DETACH vgi_pf_pm;

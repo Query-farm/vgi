@@ -58,6 +58,16 @@ Tests complete in <10 seconds per suite. For debugging failures, write standalon
 
 Catalogs may register additional settings at `ATTACH` time (e.g., `greeting`, `multiplier`).
 
+### ATTACH Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `LOCATION` / `PATH` | VARCHAR | (required) | Path to VGI worker executable |
+| `pool` | BOOLEAN | true | Enable/disable worker pooling for this catalog |
+| `pool_max` | BIGINT | (global default) | Max pooled workers for this worker path (0 = disabled) |
+| `pool_timeout` | BIGINT | (global default) | Idle timeout in seconds before pooled workers are removed |
+| `worker_debug` | BOOLEAN | false | Enable worker debug output |
+
 ## SQL Functions
 
 | Function | Type | Description |
@@ -138,7 +148,7 @@ Workers expose functions via `ATTACH 'catalog_name' AS name (TYPE vgi, LOCATION 
 
 Worker subprocesses are pooled for reuse across queries:
 
-- **Pool settings**: `vgi_worker_pool_max` (default 256, 0 = disabled), `vgi_worker_pool_idle_limit_seconds` (default 5)
+- **Pool settings**: `vgi_worker_pool_max` (default 256, 0 = disabled), `vgi_worker_pool_idle_limit_seconds` (default 5); per-catalog overrides via `pool_max` and `pool_timeout` ATTACH options
 - **Diagnostics**: `vgi_worker_pool()` lists pooled workers, `vgi_worker_pool_stats()` shows hit/miss rates
 - **Stale connection handling**: `AcquireAndBindConnection()` retries with fresh connection if pooled worker died (EPIPE)
 - **SIGPIPE handling**: Extension uses `sigaction()` to ignore SIGPIPE; broken pipes return EPIPE error with diagnostic hint

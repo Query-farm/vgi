@@ -154,16 +154,35 @@ void VgiWorkerPool::Release(std::unique_ptr<PooledWorker> worker, size_t max_poo
 
 	std::lock_guard<std::mutex> lock(mutex_);
 
-	// Check if pool is full
-	if (TotalPoolSizeLocked() >= max_pool_size) {
-		VGI_STDERR_DEBUG("[VGI] pool.release pool_full pid=%d total=%zu max=%zu\n",
-		                 worker->GetPid(), TotalPoolSizeLocked(), max_pool_size);
-		// Pool is full, discard this worker
-		return;
+	const std::string &path = worker->GetWorkerPath();
+
+	// Check per-path config first (set at ATTACH time via ConfigurePath)
+	auto config_it = path_configs_.find(path);
+	if (config_it != path_configs_.end()) {
+		const auto &config = config_it->second;
+		// Per-path config controls pool size for this path
+		if (config.max_pool_size == 0) {
+			VGI_STDERR_DEBUG("[VGI] pool.release path_config_disabled pid=%d path=%s\n",
+			                 worker->GetPid(), path.c_str());
+			return;
+		}
+		if (pools_[path].size() >= config.max_pool_size) {
+			VGI_STDERR_DEBUG("[VGI] pool.release path_pool_full pid=%d path=%s size=%zu max=%zu\n",
+			                 worker->GetPid(), path.c_str(), pools_[path].size(), config.max_pool_size);
+			return;
+		}
+		worker->SetIdleTimeout(std::chrono::seconds(config.idle_timeout_seconds));
+	} else {
+		// No per-path config: use caller's max_pool_size with total-size check (backward compatible)
+		if (TotalPoolSizeLocked() >= max_pool_size) {
+			VGI_STDERR_DEBUG("[VGI] pool.release pool_full pid=%d total=%zu max=%zu\n",
+			                 worker->GetPid(), TotalPoolSizeLocked(), max_pool_size);
+			return;
+		}
+		// Worker keeps default 5s idle timeout
 	}
 
 	// Add to the pool for this worker path
-	const std::string &path = worker->GetWorkerPath();
 	pools_[path].push_back(std::move(worker));
 	VGI_STDERR_DEBUG("[VGI] pool.release added worker_path=%s pool_size=%zu total=%zu\n",
 	                 path.c_str(), pools_[path].size(), TotalPoolSizeLocked());
@@ -193,9 +212,16 @@ std::vector<VgiWorkerPool::PoolEntry> VgiWorkerPool::GetPoolEntries() const {
 	return entries;
 }
 
-void VgiWorkerPool::SetIdleTimeout(std::chrono::seconds timeout) {
+void VgiWorkerPool::ConfigurePath(const std::string &path, const PoolSettings &settings) {
 	std::lock_guard<std::mutex> lock(mutex_);
-	idle_timeout_ = timeout;
+	auto it = path_configs_.find(path);
+	if (it != path_configs_.end() && (it->second.max_pool_size != settings.max_pool_size ||
+	                                   it->second.idle_timeout_seconds != settings.idle_timeout_seconds)) {
+		VGI_STDERR_DEBUG("[VGI] pool.configure_path overwrite path=%s old_max=%zu new_max=%zu old_timeout=%zu new_timeout=%zu\n",
+		                 path.c_str(), it->second.max_pool_size, settings.max_pool_size,
+		                 it->second.idle_timeout_seconds, settings.idle_timeout_seconds);
+	}
+	path_configs_[path] = settings;
 }
 
 void VgiWorkerPool::CleanupThread() {
@@ -231,9 +257,9 @@ void VgiWorkerPool::RemoveStaleWorkersLocked() {
 				continue;
 			}
 
-			// Check if stale (idle too long)
+			// Check if stale (idle too long) — uses per-worker timeout
 			auto age = std::chrono::duration_cast<std::chrono::seconds>(now - worker->GetPooledAt());
-			if (age >= idle_timeout_) {
+			if (age >= worker->GetIdleTimeout()) {
 				it = pool.erase(it);
 				continue;
 			}

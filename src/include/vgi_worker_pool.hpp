@@ -19,6 +19,12 @@ class ClientContext;
 
 namespace vgi {
 
+// Per-path pool configuration, set at ATTACH time via ConfigurePath().
+struct PoolSettings {
+	size_t max_pool_size = 0;        // 0 = pool disabled
+	size_t idle_timeout_seconds = 5; // How long idle workers survive
+};
+
 // Represents a pooled worker subprocess ready for reuse.
 // Holds a subprocess that has completed an invocation and is waiting for the next one.
 class PooledWorker {
@@ -57,11 +63,20 @@ public:
 	// Get PID of the subprocess
 	pid_t GetPid() const;
 
+	// Per-worker idle timeout (set when added to pool)
+	void SetIdleTimeout(std::chrono::seconds timeout) {
+		idle_timeout_ = timeout;
+	}
+	std::chrono::seconds GetIdleTimeout() const {
+		return idle_timeout_;
+	}
+
 private:
 	std::unique_ptr<SubProcess> proc_;
 	std::string worker_path_;
 	std::chrono::steady_clock::time_point pooled_at_;
-	int stderr_fd_ = -1; // Stderr file descriptor (owned)
+	int stderr_fd_ = -1;                            // Stderr file descriptor (owned)
+	std::chrono::seconds idle_timeout_ {5};          // Default 5s, overridden by per-path config
 };
 
 // Thread-safe singleton pool for reusing VGI worker subprocesses.
@@ -113,8 +128,9 @@ public:
 	// Record a pool miss (called by callers when TryAcquire returns nullptr)
 	void RecordMiss(const std::string &worker_path);
 
-	// Set the idle timeout for worker cleanup (default 5 seconds)
-	void SetIdleTimeout(std::chrono::seconds timeout);
+	// Configure per-path pool settings (called at ATTACH time).
+	// If a config already exists for this path with different values, it is overwritten with a warning.
+	void ConfigurePath(const std::string &path, const PoolSettings &settings);
 
 private:
 	VgiWorkerPool();
@@ -134,6 +150,9 @@ private:
 	mutable std::mutex mutex_;
 	std::map<std::string, std::deque<std::unique_ptr<PooledWorker>>> pools_;
 
+	// Per-path pool configuration (set at ATTACH time)
+	std::map<std::string, PoolSettings> path_configs_;
+
 	// Hit/miss statistics by worker path
 	std::map<std::string, std::pair<uint64_t, uint64_t>> stats_; // {hits, misses}
 
@@ -142,9 +161,6 @@ private:
 	std::atomic<bool> shutdown_ {false};
 	std::condition_variable cleanup_cv_;
 	std::mutex cleanup_mutex_; // Separate mutex for condition variable
-
-	// Configuration
-	std::chrono::seconds idle_timeout_ {5};
 };
 
 } // namespace vgi
