@@ -29,7 +29,7 @@ unique_ptr<FunctionData> VgiTableInOutBindData::Copy() const {
 	copy->worker_path = worker_path;
 	copy->attach_id = attach_id;
 	copy->worker_debug = worker_debug;
-	copy->use_pool = use_pool;
+	copy->max_pool_size = max_pool_size;
 	copy->function_name = function_name;
 	copy->settings = settings;
 	copy->arguments = arguments;
@@ -75,7 +75,7 @@ unique_ptr<FunctionData> VgiTableInOutBind(ClientContext &context, TableFunction
 	bind_data->worker_path = params.worker_path;
 	bind_data->attach_id = params.attach_id;
 	bind_data->worker_debug = params.worker_debug;
-	bind_data->use_pool = params.use_pool;
+	bind_data->max_pool_size = params.max_pool_size;
 	bind_data->function_name = params.function_name;
 	bind_data->settings = params.settings;
 
@@ -109,7 +109,7 @@ unique_ptr<FunctionData> VgiTableInOutBind(ClientContext &context, TableFunction
 	// Try pool first
 	std::unique_ptr<FunctionConnection> connection;
 	bool from_pool = false;
-	if (bind_data->use_pool) {
+	if (bind_data->max_pool_size > 0) {
 		auto pooled = VgiWorkerPool::Instance().TryAcquire(bind_data->worker_path);
 		if (pooled) {
 			from_pool = true;
@@ -356,15 +356,14 @@ OperatorFinalizeResultType VgiTableInOutFinalize(ExecutionContext &context, Tabl
 
 	if (!output_batch || output_batch->num_rows() == 0) {
 		// No more output - clean up
-		if (global_state.connection && global_state.connection->CanBePooled()) {
+		if (bind_data.max_pool_size > 0 && global_state.connection && global_state.connection->CanBePooled()) {
 			auto pooled = global_state.connection->ReleaseForPooling();
 			if (pooled) {
-				auto max_pool_size = VgiWorkerPool::GetMaxPoolSize(client_context);
 				VGI_LOG(client_context, "table_in_out.pool_release",
 				        {{"worker_path", bind_data.worker_path},
 				         {"function_name", bind_data.function_name},
 				         {"pid", std::to_string(pooled->GetPid())}});
-				VgiWorkerPool::Instance().Release(std::move(pooled), max_pool_size);
+				VgiWorkerPool::Instance().Release(std::move(pooled), bind_data.max_pool_size);
 			}
 		}
 		return OperatorFinalizeResultType::FINISHED;
@@ -386,15 +385,14 @@ OperatorFinalizeResultType VgiTableInOutFinalize(ExecutionContext &context, Tabl
 
 	// Check if worker is finished
 	if (global_state.connection->IsFinished()) {
-		if (global_state.connection->CanBePooled()) {
+		if (bind_data.max_pool_size > 0 && global_state.connection->CanBePooled()) {
 			auto pooled = global_state.connection->ReleaseForPooling();
 			if (pooled) {
-				auto max_pool_size = VgiWorkerPool::GetMaxPoolSize(client_context);
 				VGI_LOG(client_context, "table_in_out.pool_release",
 				        {{"worker_path", bind_data.worker_path},
 				         {"function_name", bind_data.function_name},
 				         {"pid", std::to_string(pooled->GetPid())}});
-				VgiWorkerPool::Instance().Release(std::move(pooled), max_pool_size);
+				VgiWorkerPool::Instance().Release(std::move(pooled), bind_data.max_pool_size);
 			}
 		}
 		return OperatorFinalizeResultType::FINISHED;

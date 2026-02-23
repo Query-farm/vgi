@@ -121,21 +121,45 @@ SELECT COUNT(*) FROM vgi_worker_pool();
 # Test pool=false ATTACH option disables pooling
 # ============================================================================
 
+# Flush pool to start clean
+query I
+SELECT vgi_worker_pool_flush() >= 0;
+----
+true
+
 # Attach with pooling disabled
 statement ok
 ATTACH 'example' AS vgi_nopool (TYPE vgi, LOCATION '${VGI_TEST_WORKER}', pool false);
 
-# Verify the catalog attached successfully (2 schemas: data, main)
+# Run a table scan - this should NOT pool the worker
 query I
-SELECT COUNT(*) FROM information_schema.schemata WHERE catalog_name = 'vgi_nopool';
+SELECT COUNT(*) FROM vgi_nopool.main.sequence(5, batch_size := 1000);
 ----
-2
+5
+
+# Pool should still be empty because pool=false
+query I
+SELECT COUNT(*) FROM vgi_worker_pool();
+----
+0
+
+# Run a scalar function - this should also NOT pool the worker
+query I
+SELECT vgi_nopool.main.double(21);
+----
+42
+
+# Pool should still be empty
+query I
+SELECT COUNT(*) FROM vgi_worker_pool();
+----
+0
 
 statement ok
 DETACH vgi_nopool;
 
 # ============================================================================
-# Test pool=true ATTACH option (explicit enable)
+# Test pool=true ATTACH option pools workers
 # ============================================================================
 
 # Flush pool first
@@ -148,11 +172,23 @@ true
 statement ok
 ATTACH 'example' AS vgi_pool (TYPE vgi, LOCATION '${VGI_TEST_WORKER}', pool true);
 
-# Verify the catalog attached successfully (2 schemas: data, main)
+# Run a table scan - this SHOULD pool the worker
 query I
-SELECT COUNT(*) FROM information_schema.schemata WHERE catalog_name = 'vgi_pool';
+SELECT COUNT(*) FROM vgi_pool.main.sequence(5, batch_size := 1000);
 ----
-2
+5
+
+# Pool should have at least one worker now
+query I
+SELECT COUNT(*) >= 1 FROM vgi_worker_pool();
+----
+true
 
 statement ok
 DETACH vgi_pool;
+
+# Clean up
+query I
+SELECT vgi_worker_pool_flush() >= 0;
+----
+true

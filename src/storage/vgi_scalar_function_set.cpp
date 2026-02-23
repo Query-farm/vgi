@@ -14,6 +14,7 @@
 #include "vgi_arrow_utils.hpp"
 #include "vgi_catalog_api.hpp"
 #include "vgi_scalar_function_impl.hpp"
+#include "vgi_worker_pool.hpp"
 
 namespace duckdb {
 
@@ -34,7 +35,8 @@ void VgiScalarFunctionSet::LoadEntries(ClientContext &context) {
 	auto worker_path = attach_params->worker_path();
 	auto function_list = vgi::InvokeCatalogSchemaContentsFunctions(worker_path, attach_result->attach_id, schema_.name,
 	                                                               "SCALAR_FUNCTION", context,
-	                                                               attach_params->worker_debug());
+	                                                               attach_params->worker_debug(),
+	                                                               attach_params->use_pool());
 
 	// Group functions by name (overloads)
 	std::unordered_map<std::string, std::vector<vgi::VgiFunctionInfo>> functions_by_name;
@@ -131,7 +133,8 @@ void VgiScalarFunctionSet::LoadEntries(ClientContext &context) {
 			scalar_func_info->attach_id = attach_result->attach_id;
 			scalar_func_info->function_name = func_info.name;
 			scalar_func_info->worker_debug = attach_params->worker_debug();
-			scalar_func_info->use_pool = attach_params->use_pool();
+			scalar_func_info->max_pool_size =
+			    attach_params->use_pool() ? vgi::VgiWorkerPool::GetMaxPoolSize(context) : 0;
 			scalar_func_info->output_schema = func_info.output_schema;
 			scalar_func_info->has_dynamic_return_type = is_any_output;
 			scalar_func_info->positional_is_const = arg_types.positional_is_const;

@@ -1,0 +1,62 @@
+# name: test/sql/vgi_cardinality.test
+# description: test cardinality estimates for VGI table functions
+# group: [vgi]
+
+# This test requires a VGI worker to be available
+require-env VGI_TEST_WORKER
+
+require vgi
+
+# ============================================================================
+# Setup: attach catalog
+# ============================================================================
+
+statement ok
+ATTACH 'example' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# Catalog table function: sequence(100) — has @_cardinality_from_count decorator
+# Python worker defines cardinality(estimate=100, max=100) for this function.
+# Currently NOT transmitted through the protocol, so estimate defaults to 1.
+# ============================================================================
+
+query II
+EXPLAIN (FORMAT JSON) SELECT * FROM ex.main.sequence(100);
+----
+physical_plan	<REGEX>:.*"Estimated Cardinality":\s*"1".*
+
+# ============================================================================
+# Catalog table function: ten_thousand() — defines cardinality(10000, 10000)
+# Python worker hardcodes cardinality(estimate=10000, max=10000).
+# Currently NOT transmitted through the protocol, so estimate defaults to 1.
+# ============================================================================
+
+query II
+EXPLAIN (FORMAT JSON) SELECT * FROM ex.main.ten_thousand();
+----
+physical_plan	<REGEX>:.*"Estimated Cardinality":\s*"1".*
+
+# ============================================================================
+# Direct vgi_table_function() call — same issue
+# ============================================================================
+
+query II
+EXPLAIN (FORMAT JSON) SELECT * FROM vgi_table_function('${VGI_TEST_WORKER}', 'sequence', [50]);
+----
+physical_plan	<REGEX>:.*"Estimated Cardinality":\s*"1".*
+
+# ============================================================================
+# Sanity check: DuckDB built-in range(100) reports correct cardinality
+# ============================================================================
+
+query II
+EXPLAIN (FORMAT JSON) SELECT * FROM range(100);
+----
+physical_plan	<REGEX>:.*"Estimated Cardinality":\s*"100".*
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH ex;

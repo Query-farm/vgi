@@ -26,7 +26,8 @@ void VgiTableSet::LoadEntries(ClientContext &context) {
 
 	// Call catalog_schema_contents_tables via RPC
 	auto tables = vgi::InvokeCatalogSchemaContentsTables(attach_params->worker_path(), attach_result->attach_id,
-	                                                     schema_.name, context, attach_params->worker_debug());
+	                                                     schema_.name, context, attach_params->worker_debug(),
+	                                                     attach_params->use_pool());
 
 	for (auto &table_info : tables) {
 		auto create_info = vgi::CreateTableInfoFromVgiTable(context, table_info, schema_.name);
@@ -56,7 +57,8 @@ optional_ptr<CatalogEntry> VgiTableSet::GetEntry(ClientContext &context, const s
 
 	// Call catalog_table_get via RPC
 	auto table_info_opt = vgi::InvokeCatalogTableGet(attach_params->worker_path(), attach_result->attach_id,
-	                                                  schema_.name, name, context, attach_params->worker_debug());
+	                                                  schema_.name, name, context, attach_params->worker_debug(),
+	                                                  attach_params->use_pool());
 
 	if (!table_info_opt) {
 		return nullptr;

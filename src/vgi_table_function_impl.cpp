@@ -46,7 +46,7 @@ void PerformVgiTableFunctionBind(ClientContext &context, VgiTableFunctionBindDat
 	// Uses helper that handles pool acquire and stale connection retry.
 	FunctionConnectionParams params(bind_data.worker_path, bind_data.function_name, bind_data.arguments,
 	                                bind_data.attach_id, {} /* primary worker, no global exec ID */,
-	                                bind_data.worker_debug, bind_data.settings, bind_data.use_pool, "bind", "TABLE");
+	                                bind_data.worker_debug, bind_data.settings, bind_data.max_pool_size, "bind", "TABLE");
 
 	auto result = AcquireAndBindConnection(context, params);
 	bind_data.bind_connection = std::move(result.connection);
@@ -467,7 +467,7 @@ unique_ptr<LocalTableFunctionState> VgiTableFunctionInitLocal(ExecutionContext &
 
 	auto current_chunk = make_uniq<ArrowArrayWrapper>();
 	auto local_state = make_uniq<VgiTableFunctionLocalState>(std::move(current_chunk), context.client,
-	                                                         bind_data.use_pool, bind_data.worker_path);
+	                                                         bind_data.max_pool_size, bind_data.worker_path);
 
 	// Set column_ids for ArrowToDuckDB projection support if function supports it
 	// This tells ArrowToDuckDB which columns to extract from the Arrow arrays
@@ -501,7 +501,7 @@ unique_ptr<LocalTableFunctionState> VgiTableFunctionInitLocal(ExecutionContext &
 		// PerformInit includes it in the InitRequest automatically.
 		FunctionConnectionParams params(bind_data.worker_path, bind_data.function_name, bind_data.arguments,
 		                                bind_data.attach_id, global_state.global_execution_id, bind_data.worker_debug,
-		                                bind_data.settings, bind_data.use_pool, "init_local_secondary", "TABLE");
+		                                bind_data.settings, bind_data.max_pool_size, "init_local_secondary", "TABLE");
 
 		auto result = AcquireAndBindConnection(context.client, params);
 		local_state->connection = std::move(result.connection);

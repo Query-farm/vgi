@@ -35,7 +35,7 @@ void VgiSchemaSet::LoadEntries(ClientContext &context) {
 
 	// Call catalog_schemas via RPC
 	auto schema_list = vgi::InvokeCatalogSchemas(attach_params->worker_path(), attach_result->attach_id, context,
-	                                             attach_params->worker_debug());
+	                                             attach_params->worker_debug(), attach_params->use_pool());
 
 	// Create schema entries
 	for (auto &schema_info : schema_list) {

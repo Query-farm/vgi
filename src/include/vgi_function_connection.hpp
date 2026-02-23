@@ -43,7 +43,7 @@ struct FunctionConnectionParams {
 	std::vector<uint8_t> global_execution_id;  // Empty for primary workers
 	bool worker_debug = false;
 	std::map<std::string, std::string> settings;
-	bool use_pool = true;
+	size_t max_pool_size = 0;  // 0 = pool disabled
 	std::string phase;  // For logging (e.g., "bind", "init_local_secondary")
 	std::string function_type = "TABLE";  // "TABLE", "SCALAR", "AGGREGATE"
 
@@ -54,11 +54,11 @@ struct FunctionConnectionParams {
 	FunctionConnectionParams(const std::string &worker_path, const std::string &function_name,
 	                         const ArrowArguments &arguments, const std::vector<uint8_t> &attach_id,
 	                         const std::vector<uint8_t> &global_execution_id, bool worker_debug,
-	                         const std::map<std::string, std::string> &settings, bool use_pool,
+	                         const std::map<std::string, std::string> &settings, size_t max_pool_size,
 	                         const std::string &phase, const std::string &function_type = "TABLE")
 	    : worker_path(worker_path), function_name(function_name), arguments(arguments), attach_id(attach_id),
-	      global_execution_id(global_execution_id), worker_debug(worker_debug), settings(settings), use_pool(use_pool),
-	      phase(phase), function_type(function_type) {
+	      global_execution_id(global_execution_id), worker_debug(worker_debug), settings(settings),
+	      max_pool_size(max_pool_size), phase(phase), function_type(function_type) {
 	}
 };
 

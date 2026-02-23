@@ -51,7 +51,7 @@ AcquireAndBindResult AcquireAndBindConnection(ClientContext &context, const Func
 	};
 
 	// Try pool first
-	if (params.use_pool) {
+	if (params.max_pool_size > 0) {
 		auto pooled = VgiWorkerPool::Instance().TryAcquire(params.worker_path);
 		if (pooled) {
 			auto pooled_pid = pooled->GetPid();
@@ -71,13 +71,13 @@ AcquireAndBindResult AcquireAndBindConnection(ClientContext &context, const Func
 	// Create fresh if pool miss
 	if (!conn) {
 		conn = create_fresh_connection();
-		if (params.use_pool) {
+		if (params.max_pool_size > 0) {
 			VgiWorkerPool::Instance().RecordMiss(params.worker_path);
 		}
 		VGI_LOG(context, "worker_pool.acquire",
 		        {{"worker_path", params.worker_path},
 		         {"worker_pid", std::to_string(conn->GetPid())},
-		         {"result", params.use_pool ? "miss" : "disabled"},
+		         {"result", params.max_pool_size > 0 ? "miss" : "disabled"},
 		         {"phase", params.phase}});
 	}
 

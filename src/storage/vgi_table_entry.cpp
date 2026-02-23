@@ -46,8 +46,7 @@ struct VgiTableScanBindData : public TableFunctionData {
 	duckdb::vector<Value> scan_positional_args;
 	std::map<std::string, Value> scan_named_args;
 
-	// Worker pool settings
-	bool use_pool = true;
+	// Worker pool settings (0 = pool disabled)
 	size_t max_pool_size = 0;
 
 	// Arrow schema for type conversion
@@ -59,11 +58,10 @@ struct VgiTableScanBindData : public TableFunctionData {
 struct VgiTableScanGlobalState : public GlobalTableFunctionState {
 	std::unique_ptr<vgi::FunctionConnection> connection;
 	bool done = false;
-	bool use_pool = false;
 	size_t max_pool_size = 0;
 
 	~VgiTableScanGlobalState() {
-		if (use_pool && connection && connection->CanBePooled()) {
+		if (max_pool_size > 0 && connection && connection->CanBePooled()) {
 			auto pooled = connection->ReleaseForPooling();
 			if (pooled) {
 				vgi::VgiWorkerPool::Instance().Release(std::move(pooled), max_pool_size);
@@ -110,7 +108,7 @@ static unique_ptr<GlobalTableFunctionState> VgiTableScanInitGlobal(ClientContext
 	params.arguments = arrow_args;
 	params.attach_id = bind_data.attach_id;
 	params.worker_debug = bind_data.worker_debug;
-	params.use_pool = bind_data.use_pool;
+	params.max_pool_size = bind_data.max_pool_size;
 	params.function_type = "TABLE";
 	params.phase = "table_scan";
 
@@ -127,7 +125,6 @@ static unique_ptr<GlobalTableFunctionState> VgiTableScanInitGlobal(ClientContext
 	result.connection->PerformInit(projection_ids);
 
 	state->connection = std::move(result.connection);
-	state->use_pool = bind_data.use_pool;
 	state->max_pool_size = bind_data.max_pool_size;
 	return state;
 }
@@ -213,18 +210,15 @@ TableFunction VgiTableEntry::GetScanFunction(ClientContext &context, unique_ptr<
 	scan_bind_data->table_name = name;
 	scan_bind_data->worker_debug = attach_params->worker_debug();
 
-	// Read pool settings
-	Value pool_enabled_val;
-	if (context.TryGetCurrentSetting("vgi_worker_pool_enabled", pool_enabled_val)) {
-		scan_bind_data->use_pool = pool_enabled_val.GetValue<bool>();
-	}
-	scan_bind_data->max_pool_size = vgi::VgiWorkerPool::GetMaxPoolSize(context);
+	// Read pool settings from attach parameters (0 = pool disabled)
+	scan_bind_data->max_pool_size =
+	    attach_params->use_pool() ? vgi::VgiWorkerPool::GetMaxPoolSize(context) : 0;
 
 	// Ask the worker which function to call to scan this table
 	auto scan_result = vgi::InvokeCatalogTableScanFunctionGet(
 	    attach_params->worker_path(), attach_result->attach_id,
 	    ParentSchema().name, name, context, "", "",
-	    attach_params->worker_debug(), true);
+	    attach_params->worker_debug(), attach_params->use_pool());
 	scan_bind_data->scan_function_name = scan_result.function_name;
 	scan_bind_data->scan_positional_args = scan_result.positional_arguments;
 	scan_bind_data->scan_named_args = scan_result.named_arguments;

@@ -33,7 +33,7 @@ struct VgiTableInOutBindData : public TableFunctionData {
 	std::string worker_path;
 	std::vector<uint8_t> attach_id;
 	bool worker_debug = false;
-	bool use_pool = true;
+	size_t max_pool_size = 0;  // 0 = pool disabled
 	std::string function_name;
 	std::map<std::string, std::string> settings;
 
@@ -97,7 +97,7 @@ struct VgiTableInOutBindParams {
 	std::string function_name;
 	std::vector<uint8_t> attach_id;
 	bool worker_debug = false;
-	bool use_pool = true;
+	size_t max_pool_size = 0;  // 0 = pool disabled
 	std::map<std::string, std::string> settings;
 };
 

@@ -28,7 +28,8 @@ void VgiViewSet::LoadEntries(ClientContext &context) {
 
 	// Call catalog_schema_contents_views via RPC
 	auto views = vgi::InvokeCatalogSchemaContentsViews(attach_params->worker_path(), attach_result->attach_id,
-	                                                   schema_.name, context, attach_params->worker_debug());
+	                                                   schema_.name, context, attach_params->worker_debug(),
+	                                                   attach_params->use_pool());
 
 	for (auto &view_info : views) {
 		CreateViewInfo info;

@@ -1,0 +1,667 @@
+# name: test/sql/integration/table/double_sequence.test
+# description: Tests for VGI double_sequence table function
+# group: [vgi]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# double_sequence function
+# Generates floats from 0.0 to (count-1)*increment
+# Args: count (int), batch_size (int, default=1000), increment (float, default=1.0)
+# ============================================================================
+
+# ============================================================================
+# Basic double sequence generation
+# ============================================================================
+
+query R
+SELECT * FROM example.double_sequence(5, batch_size := 1000);
+----
+0.0
+1.0
+2.0
+3.0
+4.0
+
+# Verify count
+query I
+SELECT COUNT(*) FROM example.double_sequence(100, batch_size := 10);
+----
+100
+
+# Verify values
+query RR
+SELECT MIN(n), MAX(n) FROM example.double_sequence(100, batch_size := 10);
+----
+0.0	99.0
+
+# Verify sum
+query R
+SELECT SUM(n) FROM example.double_sequence(10, batch_size := 10);
+----
+45.0
+
+# ============================================================================
+# Batch boundaries - batch_size=1 (one row per batch)
+# ============================================================================
+
+query R
+SELECT * FROM example.double_sequence(5, batch_size := 1);
+----
+0.0
+1.0
+2.0
+3.0
+4.0
+
+query I
+SELECT COUNT(*) FROM example.double_sequence(100, batch_size := 1);
+----
+100
+
+query R
+SELECT SUM(n) FROM example.double_sequence(50, batch_size := 1);
+----
+1225.0
+
+query RR
+SELECT MIN(n), MAX(n) FROM example.double_sequence(10, batch_size := 1);
+----
+0.0	9.0
+
+# ============================================================================
+# Batch boundaries - batch_size > count (single batch)
+# ============================================================================
+
+query R
+SELECT * FROM example.double_sequence(5, batch_size := 10000);
+----
+0.0
+1.0
+2.0
+3.0
+4.0
+
+query I
+SELECT COUNT(*) FROM example.double_sequence(10, batch_size := 100000);
+----
+10
+
+query R
+SELECT SUM(n) FROM example.double_sequence(100, batch_size := 10000);
+----
+4950.0
+
+# ============================================================================
+# Batch boundaries - batch_size = count (exact fit)
+# ============================================================================
+
+query R
+SELECT * FROM example.double_sequence(5, batch_size := 5);
+----
+0.0
+1.0
+2.0
+3.0
+4.0
+
+query I
+SELECT COUNT(*) FROM example.double_sequence(100, batch_size := 100);
+----
+100
+
+query R
+SELECT SUM(n) FROM example.double_sequence(10, batch_size := 10);
+----
+45.0
+
+# ============================================================================
+# Batch boundaries - partial final batch
+# ============================================================================
+
+# 7 rows, batch_size=3: batches of [3, 3, 1]
+query R
+SELECT * FROM example.double_sequence(7, batch_size := 3);
+----
+0.0
+1.0
+2.0
+3.0
+4.0
+5.0
+6.0
+
+# 10 rows, batch_size=3: batches of [3, 3, 3, 1]
+query I
+SELECT COUNT(*) FROM example.double_sequence(10, batch_size := 3);
+----
+10
+
+# 11 rows, batch_size=4: batches of [4, 4, 3]
+query R
+SELECT SUM(n) FROM example.double_sequence(11, batch_size := 4);
+----
+55.0
+
+# 99 rows, batch_size=10: batches of [10, 10, ..., 9]
+query I
+SELECT COUNT(*) FROM example.double_sequence(99, batch_size := 10);
+----
+99
+
+# 101 rows, batch_size=100: batches of [100, 1]
+query I
+SELECT COUNT(*) FROM example.double_sequence(101, batch_size := 100);
+----
+101
+
+# ============================================================================
+# Edge cases - Zero rows
+# ============================================================================
+
+query I
+SELECT COUNT(*) FROM example.double_sequence(0, batch_size := 1000);
+----
+0
+
+query I
+SELECT COUNT(*) FROM example.double_sequence(0, batch_size := 1);
+----
+0
+
+query R
+SELECT SUM(n) FROM example.double_sequence(0, batch_size := 100);
+----
+NULL
+
+# ============================================================================
+# Edge cases - Single row
+# ============================================================================
+
+query R
+SELECT * FROM example.double_sequence(1, batch_size := 1000);
+----
+0.0
+
+query R
+SELECT * FROM example.double_sequence(1, batch_size := 1);
+----
+0.0
+
+query I
+SELECT COUNT(*) FROM example.double_sequence(1, batch_size := 10000);
+----
+1
+
+# ============================================================================
+# Parameter variations - Increment
+# ============================================================================
+
+# Default increment = 1.0
+query R
+SELECT * FROM example.double_sequence(5, batch_size := 1000, increment=1.0);
+----
+0.0
+1.0
+2.0
+3.0
+4.0
+
+# increment = 0.5 (fractional step)
+query R
+SELECT * FROM example.double_sequence(5, batch_size := 1000, increment=0.5);
+----
+0.0
+0.5
+1.0
+1.5
+2.0
+
+# increment = 0.1 (smaller fractional step)
+query R
+SELECT * FROM example.double_sequence(5, batch_size := 1000, increment=0.1);
+----
+0.0
+0.1
+0.2
+0.3
+0.4
+
+# increment = 2.5 (mixed increment)
+query R
+SELECT * FROM example.double_sequence(4, batch_size := 1000, increment=2.5);
+----
+0.0
+2.5
+5.0
+7.5
+
+# increment = 10.0 (larger step)
+query R
+SELECT * FROM example.double_sequence(5, batch_size := 1000, increment=10.0);
+----
+0.0
+10.0
+20.0
+30.0
+40.0
+
+# Small batch with fractional increment
+query R
+SELECT * FROM example.double_sequence(5, batch_size := 2, increment=0.25);
+----
+0.0
+0.25
+0.5
+0.75
+1.0
+
+# Batch size = 1 with fractional increment
+query R
+SELECT * FROM example.double_sequence(4, batch_size := 1, increment=0.5);
+----
+0.0
+0.5
+1.0
+1.5
+
+# Large increment
+query R
+SELECT SUM(n) FROM example.double_sequence(100, batch_size := 10, increment=7.0);
+----
+34650.0
+
+# Fractional increment sum: 0.0 + 0.1 + 0.2 + ... + 0.9 = 4.5
+query R
+SELECT SUM(n) FROM example.double_sequence(10, batch_size := 5, increment=0.1);
+----
+4.5
+
+# Single row with large increment (should just return 0.0)
+query R
+SELECT * FROM example.double_sequence(1, batch_size := 1, increment=1000000.0);
+----
+0.0
+
+# Two rows with increment, batch_size=1
+query R
+SELECT * FROM example.double_sequence(2, batch_size := 1, increment=50.5);
+----
+0.0
+50.5
+
+# Zero rows with increment (still empty)
+query I
+SELECT COUNT(*) FROM example.double_sequence(0, batch_size := 1, increment=100.0);
+----
+0
+
+# ============================================================================
+# SQL operations - Aggregations
+# ============================================================================
+
+# SUM: 0.0+1.0+2.0+...+99.0 = 4950.0
+query R
+SELECT SUM(n) FROM example.double_sequence(100, batch_size := 10);
+----
+4950.0
+
+# SUM with different batch sizes (verify consistency)
+query R
+SELECT SUM(n) FROM example.double_sequence(100, batch_size := 1);
+----
+4950.0
+
+query R
+SELECT SUM(n) FROM example.double_sequence(100, batch_size := 100);
+----
+4950.0
+
+query R
+SELECT SUM(n) FROM example.double_sequence(100, batch_size := 1000);
+----
+4950.0
+
+# AVG: average of 0.0..99.0 = 49.5
+query R
+SELECT AVG(n) FROM example.double_sequence(100, batch_size := 10);
+----
+49.5
+
+# MIN/MAX
+query RR
+SELECT MIN(n), MAX(n) FROM example.double_sequence(100, batch_size := 10);
+----
+0.0	99.0
+
+# COUNT
+query I
+SELECT COUNT(*) FROM example.double_sequence(100, batch_size := 10);
+----
+100
+
+# Multiple aggregations in one query
+query RIRIRI
+SELECT SUM(n), COUNT(*), AVG(n), MIN(n), MAX(n), COUNT(DISTINCT n)
+FROM example.double_sequence(1000, batch_size := 50);
+----
+499500.0	1000	499.5	0.0	999.0	1000
+
+# Aggregations on empty sequences
+query R
+SELECT SUM(n) FROM example.double_sequence(0, batch_size := 10);
+----
+NULL
+
+query I
+SELECT COUNT(*) FROM example.double_sequence(0, batch_size := 10);
+----
+0
+
+query R
+SELECT AVG(n) FROM example.double_sequence(0, batch_size := 10);
+----
+NULL
+
+query RR
+SELECT MIN(n), MAX(n) FROM example.double_sequence(0, batch_size := 10);
+----
+NULL	NULL
+
+# Aggregations on single row
+query R
+SELECT SUM(n) FROM example.double_sequence(1, batch_size := 10);
+----
+0.0
+
+query R
+SELECT AVG(n) FROM example.double_sequence(1, batch_size := 10);
+----
+0.0
+
+query RR
+SELECT MIN(n), MAX(n) FROM example.double_sequence(1, batch_size := 10);
+----
+0.0	0.0
+
+# Aggregations with fractional increment
+# SUM with increment=0.5: 0.0+0.5+1.0+1.5+2.0 = 5.0
+query R
+SELECT SUM(n) FROM example.double_sequence(5, batch_size := 10, increment=0.5);
+----
+5.0
+
+# AVG with increment=0.5: avg(0.0, 0.5, 1.0, 1.5, 2.0) = 1.0
+query R
+SELECT AVG(n) FROM example.double_sequence(5, batch_size := 10, increment=0.5);
+----
+1.0
+
+# MIN/MAX with increment=0.5
+query RR
+SELECT MIN(n), MAX(n) FROM example.double_sequence(5, batch_size := 10, increment=0.5);
+----
+0.0	2.0
+
+# SUM with increment=0.1: 0.0+0.1+0.2+...+0.9 = 4.5
+query R
+SELECT SUM(n) FROM example.double_sequence(10, batch_size := 5, increment=0.1);
+----
+4.5
+
+# SUM with increment=0.25: 0.0+0.25+0.5+0.75 = 1.5
+query R
+SELECT SUM(n) FROM example.double_sequence(4, batch_size := 10, increment=0.25);
+----
+1.5
+
+# ============================================================================
+# SQL operations - GROUP BY
+# ============================================================================
+
+# Group by floor value
+query IR
+SELECT CAST(FLOOR(n) AS INTEGER) as bucket, COUNT(*) as cnt
+FROM example.double_sequence(20, batch_size := 5, increment=0.5)
+GROUP BY bucket
+ORDER BY bucket;
+----
+0	2
+1	2
+2	2
+3	2
+4	2
+5	2
+6	2
+7	2
+8	2
+9	2
+
+# Sum within groups
+query IR
+SELECT CAST(FLOOR(n) AS INTEGER) as bucket, SUM(n) as total
+FROM example.double_sequence(10, batch_size := 3, increment=0.5)
+GROUP BY bucket
+ORDER BY bucket;
+----
+0	0.5
+1	2.5
+2	4.5
+3	6.5
+4	8.5
+
+# ============================================================================
+# SQL operations - Filtering
+# ============================================================================
+
+query I
+SELECT COUNT(*) FROM example.double_sequence(100, batch_size := 7) WHERE n >= 50.0;
+----
+50
+
+query I
+SELECT COUNT(*) FROM example.double_sequence(1000, batch_size := 50) WHERE n BETWEEN 100.0 AND 199.0;
+----
+100
+
+# Filter with fractional increment
+query I
+SELECT COUNT(*) FROM example.double_sequence(20, batch_size := 5, increment=0.5) WHERE n >= 5.0;
+----
+10
+
+# Aggregation on filtered data
+query R
+SELECT SUM(n) FROM example.double_sequence(100, batch_size := 10) WHERE n < 10.0;
+----
+45.0
+
+query R
+SELECT AVG(n) FROM example.double_sequence(100, batch_size := 10) WHERE n >= 90.0;
+----
+94.5
+
+# ============================================================================
+# SQL operations - Sorting
+# ============================================================================
+
+query R
+SELECT * FROM example.double_sequence(5, batch_size := 2) ORDER BY n DESC;
+----
+4.0
+3.0
+2.0
+1.0
+0.0
+
+query R
+SELECT * FROM example.double_sequence(100, batch_size := 10) ORDER BY n DESC LIMIT 5;
+----
+99.0
+98.0
+97.0
+96.0
+95.0
+
+query R
+SELECT * FROM example.double_sequence(5, batch_size := 2, increment=0.5) ORDER BY n DESC;
+----
+2.0
+1.5
+1.0
+0.5
+0.0
+
+# ============================================================================
+# SQL operations - DISTINCT
+# ============================================================================
+
+query I
+SELECT COUNT(DISTINCT n) FROM example.double_sequence(1000, batch_size := 50);
+----
+1000
+
+query R
+SELECT DISTINCT n FROM example.double_sequence(5, batch_size := 2, increment=0.5) ORDER BY n;
+----
+0.0
+0.5
+1.0
+1.5
+2.0
+
+# ============================================================================
+# SQL operations - Window functions
+# ============================================================================
+
+# Running sum
+query RR
+SELECT n, SUM(n) OVER (ORDER BY n) as running_sum
+FROM example.double_sequence(5, batch_size := 2)
+ORDER BY n;
+----
+0.0	0.0
+1.0	1.0
+2.0	3.0
+3.0	6.0
+4.0	10.0
+
+# Row number
+query RI
+SELECT n, ROW_NUMBER() OVER (ORDER BY n) as rn
+FROM example.double_sequence(5, batch_size := 2)
+ORDER BY n;
+----
+0.0	1
+1.0	2
+2.0	3
+3.0	4
+4.0	5
+
+# Running sum with fractional increment
+query RR
+SELECT n, SUM(n) OVER (ORDER BY n) as running_sum
+FROM example.double_sequence(5, batch_size := 2, increment=0.5)
+ORDER BY n;
+----
+0.0	0.0
+0.5	0.5
+1.0	1.5
+1.5	3.0
+2.0	5.0
+
+# ============================================================================
+# SQL operations - Joins
+# ============================================================================
+
+query RR
+SELECT a.n as a_val, b.n as b_val
+FROM example.double_sequence(5, batch_size := 2) a, example.double_sequence(5, batch_size := 3) b
+WHERE a.n = b.n
+ORDER BY a.n;
+----
+0.0	0.0
+1.0	1.0
+2.0	2.0
+3.0	3.0
+4.0	4.0
+
+# Self-join with different batch sizes
+query I
+SELECT COUNT(*) FROM example.double_sequence(100, batch_size := 7) a, example.double_sequence(100, batch_size := 13) b WHERE a.n = b.n;
+----
+100
+
+# Join double_sequence with sequence (matching integer values)
+query RI
+SELECT d.n as double_val, s.n as int_val
+FROM example.double_sequence(5, batch_size := 2) d, example.sequence(5, batch_size := 3) s
+WHERE CAST(d.n AS INTEGER) = s.n
+ORDER BY d.n;
+----
+0.0	0
+1.0	1
+2.0	2
+3.0	3
+4.0	4
+
+# ============================================================================
+# Scale tests - Large row counts
+# ============================================================================
+
+# 1000 rows, batch_size=1: 1000 batches
+query I
+SELECT COUNT(*) FROM example.double_sequence(1000, batch_size := 1);
+----
+1000
+
+query R
+SELECT SUM(n) FROM example.double_sequence(1000, batch_size := 1);
+----
+499500.0
+
+# 10000 rows, batch_size=100: 100 batches
+query I
+SELECT COUNT(*) FROM example.double_sequence(10000, batch_size := 100);
+----
+10000
+
+query RR
+SELECT MIN(n), MAX(n) FROM example.double_sequence(10000, batch_size := 100);
+----
+0.0	9999.0
+
+query R
+SELECT SUM(n) FROM example.double_sequence(10000, batch_size := 100);
+----
+49995000.0
+
+# 10000 rows, batch_size=10000: single batch
+query I
+SELECT COUNT(*) FROM example.double_sequence(10000, batch_size := 10000);
+----
+10000
+
+# 10000 rows, batch_size=9999: batches of [9999, 1]
+query I
+SELECT COUNT(*) FROM example.double_sequence(10000, batch_size := 9999);
+----
+10000
+
+# 10000 rows, batch_size=3333: batches of [3333, 3333, 3333, 1]
+query I
+SELECT COUNT(*) FROM example.double_sequence(10000, batch_size := 3333);
+----
+10000
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;

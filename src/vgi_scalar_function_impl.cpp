@@ -52,7 +52,7 @@ VgiScalarFunctionLocalState::~VgiScalarFunctionLocalState() {
 		VGI_STDERR_DEBUG("[VGI] scalar.destructor can_be_pooled=%s pid=%d\n",
 		                 connection->CanBePooled() ? "true" : "false", connection->GetPid());
 
-		if (connection->CanBePooled()) {
+		if (max_pool_size > 0 && connection->CanBePooled()) {
 			auto pooled = connection->ReleaseForPooling();
 			if (pooled) {
 				VGI_STDERR_DEBUG("[VGI] scalar.destructor pooled pid=%d\n", pooled->GetPid());
@@ -186,7 +186,7 @@ unique_ptr<FunctionData> VgiScalarFunctionBind(ClientContext &context, ScalarFun
 	} else {
 		// Initial bind - call worker to get output schema
 		std::unique_ptr<FunctionConnection> connection;
-		if (func_info.use_pool) {
+		if (func_info.max_pool_size > 0) {
 			auto pooled = VgiWorkerPool::Instance().TryAcquire(func_info.worker_path);
 			if (pooled) {
 				connection = std::make_unique<FunctionConnection>(
@@ -240,7 +240,7 @@ unique_ptr<FunctionData> VgiScalarFunctionBind(ClientContext &context, ScalarFun
 	bind_data->attach_id = func_info.attach_id;
 	bind_data->function_name = func_info.function_name;
 	bind_data->worker_debug = func_info.worker_debug;
-	bind_data->use_pool = func_info.use_pool;
+	bind_data->max_pool_size = func_info.max_pool_size;
 	bind_data->settings = func_info.settings;
 	bind_data->resolved_output_schema = output_schema;
 	bind_data->input_schema = input_schema;
@@ -309,7 +309,7 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 		// Acquire connection: reuse bind connection, try pool, or spawn fresh
 		std::unique_ptr<FunctionConnection> connection;
 		bool reused_bind_connection = false;
-		bool use_pool = bind_data ? bind_data->use_pool : func_info.use_pool;
+		size_t max_pool_size = bind_data ? bind_data->max_pool_size : func_info.max_pool_size;
 		const auto &worker_path = bind_data ? bind_data->worker_path : func_info.worker_path;
 		const auto &attach_id = bind_data ? bind_data->attach_id : func_info.attach_id;
 		const auto &function_name = bind_data ? bind_data->function_name : func_info.function_name;
@@ -328,7 +328,7 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 		}
 
 		// Fall back to pool or fresh connection
-		if (!connection && use_pool) {
+		if (!connection && max_pool_size > 0) {
 			auto pooled = VgiWorkerPool::Instance().TryAcquire(worker_path);
 			if (pooled) {
 				VGI_STDERR_DEBUG("[VGI] scalar.pool_acquire result=hit worker_path=%s pid=%d\n",
@@ -362,7 +362,7 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 		local_state.initialized = true;
 
 		// Capture pool max size for use in destructor (where ClientContext may not be accessible)
-		local_state.max_pool_size = vgi::VgiWorkerPool::GetMaxPoolSize(context);
+		local_state.max_pool_size = max_pool_size;
 
 		VGI_LOG(context, "scalar.init",
 		        {{"worker_path", worker_path},

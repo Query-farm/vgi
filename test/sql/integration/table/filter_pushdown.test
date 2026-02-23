@@ -1,5 +1,5 @@
-# name: test/sql/integration/table/filter_pushdown/nested_sequence.test
-# description: Filter pushdown tests for nested types (structs and lists)
+# name: test/sql/integration/table/filter_pushdown.test
+# description: Filter pushdown tests for VGI table functions
 # group: [vgi]
 
 require-env VGI_TEST_WORKER
@@ -10,7 +10,196 @@ statement ok
 ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
 # ============================================================================
-# Basic nested_sequence function tests
+# sequence - Constant comparison filters
+# ============================================================================
+
+# Greater than filter
+query I
+SELECT * FROM example.sequence(10, batch_size := 1000) WHERE n > 7;
+----
+8
+9
+
+# Greater than or equal filter
+query I
+SELECT * FROM example.sequence(10, batch_size := 1000) WHERE n >= 8;
+----
+8
+9
+
+# Less than filter
+query I
+SELECT * FROM example.sequence(10, batch_size := 1000) WHERE n < 3;
+----
+0
+1
+2
+
+# Less than or equal filter
+query I
+SELECT * FROM example.sequence(10, batch_size := 1000) WHERE n <= 2;
+----
+0
+1
+2
+
+# Equality filter
+query I
+SELECT * FROM example.sequence(10, batch_size := 1000) WHERE n = 5;
+----
+5
+
+# Not equal filter
+query I
+SELECT * FROM example.sequence(5, batch_size := 1000) WHERE n != 2;
+----
+0
+1
+3
+4
+
+# ============================================================================
+# sequence - IN filter (tests list column serialization)
+# ============================================================================
+
+# Basic IN filter
+query I
+SELECT * FROM example.sequence(10, batch_size := 1000) WHERE n IN (1, 3, 5, 7, 9);
+----
+1
+3
+5
+7
+9
+
+# IN filter with single value
+query I
+SELECT * FROM example.sequence(10, batch_size := 1000) WHERE n IN (5);
+----
+5
+
+# IN filter with consecutive values
+query I
+SELECT * FROM example.sequence(10, batch_size := 1000) WHERE n IN (2, 3, 4);
+----
+2
+3
+4
+
+# IN filter with no matches
+query I
+SELECT * FROM example.sequence(5, batch_size := 1000) WHERE n IN (10, 20, 30);
+----
+
+# ============================================================================
+# sequence - IS NULL / IS NOT NULL filters
+# ============================================================================
+
+# IS NOT NULL (sequence never produces NULL, so all rows pass)
+query I
+SELECT COUNT(*) FROM example.sequence(10, batch_size := 1000) WHERE n IS NOT NULL;
+----
+10
+
+# ============================================================================
+# sequence - Conjunction (AND) filters
+# ============================================================================
+
+# Range filter: n >= 3 AND n < 7
+query I
+SELECT * FROM example.sequence(10, batch_size := 1000) WHERE n >= 3 AND n < 7;
+----
+3
+4
+5
+6
+
+# Range filter: n > 2 AND n <= 6
+query I
+SELECT * FROM example.sequence(10, batch_size := 1000) WHERE n > 2 AND n <= 6;
+----
+3
+4
+5
+6
+
+# Tight range: n >= 5 AND n <= 5 (equivalent to n = 5)
+query I
+SELECT * FROM example.sequence(10, batch_size := 1000) WHERE n >= 5 AND n <= 5;
+----
+5
+
+# Empty range: n > 5 AND n < 5 (impossible condition)
+query I
+SELECT * FROM example.sequence(10, batch_size := 1000) WHERE n > 5 AND n < 5;
+----
+
+# ============================================================================
+# sequence - Combined with aggregations
+# ============================================================================
+
+# Count with filter
+query I
+SELECT COUNT(*) FROM example.sequence(100, batch_size := 10) WHERE n >= 50;
+----
+50
+
+# Sum with filter
+query I
+SELECT SUM(n) FROM example.sequence(10, batch_size := 1000) WHERE n > 5;
+----
+30
+
+# Min/max with filter
+query II
+SELECT MIN(n), MAX(n) FROM example.sequence(100, batch_size := 10) WHERE n >= 20 AND n < 80;
+----
+20	79
+
+# ============================================================================
+# sequence - Filter with increment parameter
+# ============================================================================
+
+# Filter on sequence with increment
+query I
+SELECT * FROM example.sequence(5, batch_size := 1000, increment=10) WHERE n >= 20;
+----
+20
+30
+40
+
+# IN filter with increment
+query I
+SELECT * FROM example.sequence(5, batch_size := 1000, increment=10) WHERE n IN (0, 20, 40);
+----
+0
+20
+40
+
+# ============================================================================
+# sequence - Larger dataset tests
+# ============================================================================
+
+# Filter pushdown should reduce data transfer
+query I
+SELECT COUNT(*) FROM example.sequence(10000, batch_size := 100) WHERE n = 5000;
+----
+1
+
+# Range on large dataset
+query I
+SELECT COUNT(*) FROM example.sequence(10000, batch_size := 100) WHERE n >= 9990;
+----
+10
+
+# IN filter on large dataset
+query I
+SELECT COUNT(*) FROM example.sequence(10000, batch_size := 100) WHERE n IN (0, 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000);
+----
+10
+
+# ============================================================================
+# nested_sequence - Basic tests
 # ============================================================================
 
 # Verify basic output structure
@@ -28,10 +217,9 @@ SELECT COUNT(*) FROM example.nested_sequence(10, batch_size := 1000);
 10
 
 # ============================================================================
-# Struct field access (no filter)
+# nested_sequence - Struct field access (no filter)
 # ============================================================================
 
-# Access struct fields directly
 query II
 SELECT metadata.index, metadata.label FROM example.nested_sequence(3, batch_size := 1000);
 ----
@@ -40,7 +228,7 @@ SELECT metadata.index, metadata.label FROM example.nested_sequence(3, batch_size
 2	row_2
 
 # ============================================================================
-# Filter on top-level column (n) - filter pushdown works
+# nested_sequence - Filter on top-level column (n)
 # ============================================================================
 
 # Filter on n with struct access
@@ -75,7 +263,7 @@ SELECT n, metadata.index FROM example.nested_sequence(10, batch_size := 1000) WH
 7	7
 
 # ============================================================================
-# Filter on struct field (StructFilter pushdown)
+# nested_sequence - Filter on struct field (StructFilter pushdown)
 # ============================================================================
 
 # Equality filter on struct.index
@@ -116,7 +304,7 @@ SELECT n, metadata.index FROM example.nested_sequence(20, batch_size := 1000) WH
 14	14
 
 # ============================================================================
-# List column tests
+# nested_sequence - List column tests
 # ============================================================================
 
 # Verify history list contents
@@ -168,7 +356,7 @@ SELECT n, list_contains(history, 3) FROM example.nested_sequence(10, batch_size 
 6	true
 
 # ============================================================================
-# Aggregations with filters
+# nested_sequence - Aggregations with filters
 # ============================================================================
 
 # Count with n filter
@@ -196,7 +384,7 @@ SELECT SUM(n) FROM example.nested_sequence(10, batch_size := 1000) WHERE metadat
 30
 
 # ============================================================================
-# Larger dataset tests
+# nested_sequence - Larger dataset tests
 # ============================================================================
 
 # Equality filter on large dataset (n)
@@ -230,7 +418,7 @@ SELECT COUNT(*) FROM example.nested_sequence(1000, batch_size := 100) WHERE meta
 100
 
 # ============================================================================
-# Projection with filters
+# nested_sequence - Projection with filters
 # ============================================================================
 
 # Project only struct, filter on n
