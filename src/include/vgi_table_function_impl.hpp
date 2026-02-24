@@ -29,7 +29,7 @@ struct VgiTableFunctionBindData : public TableFunctionData {
 	std::string worker_path;
 	std::vector<uint8_t> attach_id;
 	bool worker_debug = false;
-	size_t max_pool_size = 0; // 0 = pool disabled
+	bool use_pool = false;
 
 	// Function identification
 	std::string function_name;
@@ -96,15 +96,15 @@ struct VgiTableFunctionGlobalState : public GlobalTableFunctionState {
 // ============================================================================
 
 struct VgiTableFunctionLocalState : public ArrowScanLocalState {
-	VgiTableFunctionLocalState(unique_ptr<ArrowArrayWrapper> current_chunk, ClientContext &ctx, size_t max_pool_size,
+	VgiTableFunctionLocalState(unique_ptr<ArrowArrayWrapper> current_chunk, ClientContext &ctx, bool use_pool,
 	                           const std::string &worker_path)
-	    : ArrowScanLocalState(std::move(current_chunk), ctx), context_(ctx), max_pool_size_(max_pool_size),
+	    : ArrowScanLocalState(std::move(current_chunk), ctx), context_(ctx), use_pool_(use_pool),
 	      worker_path_(worker_path) {
 	}
 
 	~VgiTableFunctionLocalState() {
 		// Return connection to pool if applicable
-		if (max_pool_size_ > 0 && connection && connection->CanBePooled()) {
+		if (use_pool_ && connection && connection->CanBePooled()) {
 			auto worker_pid = connection->GetPid();
 			auto pooled = connection->ReleaseForPooling();
 			if (pooled) {
@@ -112,7 +112,7 @@ struct VgiTableFunctionLocalState : public ArrowScanLocalState {
 				VGI_LOG(context_, "worker_pool.release",
 				        {{"worker_path", worker_path_},
 				         {"worker_pid", std::to_string(worker_pid)},
-				         {"max_pool_size", std::to_string(max_pool_size_)}});
+				         {"use_pool", "true"}});
 			}
 		}
 	}
@@ -125,7 +125,7 @@ struct VgiTableFunctionLocalState : public ArrowScanLocalState {
 
 private:
 	ClientContext &context_;
-	size_t max_pool_size_;
+	bool use_pool_;
 	std::string worker_path_;
 };
 

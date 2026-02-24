@@ -32,7 +32,7 @@ struct VgiScalarFunctionInfo : public ScalarFunctionInfo {
 	std::vector<uint8_t> attach_id;
 	std::string function_name;
 	bool worker_debug = false;
-	size_t max_pool_size = 0;  // 0 = pool disabled
+	bool use_pool = false;
 	std::map<std::string, std::string> settings;
 
 	// Schema info from catalog registration
@@ -59,7 +59,7 @@ struct VgiScalarFunctionBindData : public FunctionData {
 	std::vector<uint8_t> attach_id;
 	std::string function_name;
 	bool worker_debug = false;
-	size_t max_pool_size = 0;  // 0 = pool disabled
+	bool use_pool = false;
 	std::map<std::string, std::string> settings;
 
 	// Actual output schema resolved during bind (with concrete types)
@@ -84,7 +84,7 @@ struct VgiScalarFunctionBindData : public FunctionData {
 		copy->attach_id = attach_id;
 		copy->function_name = function_name;
 		copy->worker_debug = worker_debug;
-		copy->max_pool_size = max_pool_size;
+		copy->use_pool = use_pool;
 		copy->settings = settings;
 		copy->resolved_output_schema = resolved_output_schema;
 		copy->input_schema = input_schema;
@@ -99,7 +99,7 @@ struct VgiScalarFunctionBindData : public FunctionData {
 		auto &other = other_p.Cast<VgiScalarFunctionBindData>();
 		return worker_path == other.worker_path && attach_id == other.attach_id &&
 		       function_name == other.function_name && worker_debug == other.worker_debug &&
-		       max_pool_size == other.max_pool_size;
+		       use_pool == other.use_pool;
 	}
 };
 
@@ -120,8 +120,8 @@ struct VgiScalarFunctionLocalState : public FunctionLocalState {
 	// Cached input schema (built from DataChunk column types on first call)
 	std::shared_ptr<arrow::Schema> input_schema;
 
-	// Pool settings captured during initialization (for use in destructor)
-	size_t max_pool_size = 0;
+	// Pool setting captured during initialization (for use in destructor)
+	bool use_pool = false;
 };
 
 // ============================================================================

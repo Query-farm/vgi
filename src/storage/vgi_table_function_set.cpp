@@ -48,10 +48,10 @@ std::map<std::string, std::string> ExtractVgiSettings(ClientContext &context,
 class VgiTableFunctionInfo : public TableFunctionInfo {
 public:
 	VgiTableFunctionInfo(std::string worker_path, std::vector<uint8_t> attach_id, bool worker_debug,
-	                     size_t max_pool_size, vgi::VgiFunctionInfo function_info,
+	                     bool use_pool, vgi::VgiFunctionInfo function_info,
 	                     std::vector<std::string> setting_names)
 	    : worker_path_(std::move(worker_path)), attach_id_(std::move(attach_id)), worker_debug_(worker_debug),
-	      max_pool_size_(max_pool_size), function_info_(std::move(function_info)),
+	      use_pool_(use_pool), function_info_(std::move(function_info)),
 	      setting_names_(std::move(setting_names)) {
 	}
 
@@ -72,9 +72,9 @@ public:
 		return worker_debug_;
 	}
 
-	//! Max pool size (0 = pool disabled)
-	size_t max_pool_size() const {
-		return max_pool_size_;
+	//! Whether pooling is enabled for this function's workers
+	bool use_pool() const {
+		return use_pool_;
 	}
 
 	//! Full function metadata from the worker
@@ -91,7 +91,7 @@ private:
 	std::string worker_path_;
 	std::vector<uint8_t> attach_id_;
 	bool worker_debug_;
-	size_t max_pool_size_;
+	bool use_pool_;
 	vgi::VgiFunctionInfo function_info_;
 	std::vector<std::string> setting_names_;
 };
@@ -115,7 +115,7 @@ static unique_ptr<FunctionData> VgiCatalogTableFunctionBind(ClientContext &conte
 	bind_data->worker_path = vgi_info.worker_path();
 	bind_data->attach_id = vgi_info.attach_id();
 	bind_data->worker_debug = vgi_info.worker_debug();
-	bind_data->max_pool_size = vgi_info.max_pool_size();
+	bind_data->use_pool = vgi_info.use_pool();
 	bind_data->function_name = vgi_info.function_info().name;
 	bind_data->projection_pushdown = vgi_info.function_info().projection_pushdown.value_or(false);
 
@@ -185,7 +185,7 @@ static unique_ptr<FunctionData> VgiCatalogTableInOutFunctionBind(ClientContext &
 	params.function_name = vgi_info.function_info().name;
 	params.attach_id = vgi_info.attach_id();
 	params.worker_debug = vgi_info.worker_debug();
-	params.max_pool_size = vgi_info.max_pool_size();
+	params.use_pool = vgi_info.use_pool();
 	params.settings = ExtractVgiSettings(context, vgi_info.setting_names());
 
 	// Validate required settings
@@ -279,7 +279,7 @@ void VgiTableFunctionSet::LoadEntries(ClientContext &context) {
 				// Attach function info
 				table_func.function_info = make_uniq<VgiTableFunctionInfo>(
 				    worker_path, attach_result->attach_id, attach_params->worker_debug(),
-				    attach_params->use_pool() ? 1 : 0, func_info, setting_names);
+				    attach_params->use_pool(), func_info, setting_names);
 
 				func_set.AddFunction(table_func);
 			} else {
@@ -305,7 +305,7 @@ void VgiTableFunctionSet::LoadEntries(ClientContext &context) {
 				// Attach VgiTableFunctionInfo so the bind function can access worker_path and function metadata
 				table_func.function_info = make_uniq<VgiTableFunctionInfo>(
 				    worker_path, attach_result->attach_id, attach_params->worker_debug(),
-				    attach_params->use_pool() ? 1 : 0, func_info, setting_names);
+				    attach_params->use_pool(), func_info, setting_names);
 
 				func_set.AddFunction(table_func);
 			}
