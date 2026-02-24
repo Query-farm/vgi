@@ -231,12 +231,13 @@ BindResponseResult ParseBindResponse(const std::shared_ptr<arrow::RecordBatch> &
 	auto view = binary_array->GetView(0);
 	auto schema_buffer = arrow::Buffer::Wrap(view.data(), view.size());
 	arrow::io::BufferReader reader(schema_buffer);
-	auto schema_result = arrow::ipc::ReadSchema(&reader, nullptr);
+	arrow::ipc::DictionaryMemo dict_memo;
+	auto schema_result = arrow::ipc::ReadSchema(&reader, &dict_memo);
 	if (!schema_result.ok()) {
 		throw IOException("Failed to deserialize output schema: %s [worker: %s]",
 		                  schema_result.status().ToString(), worker_path);
 	}
-	result.output_schema = schema_result.ValueUnsafe();
+	result.output_schema = ResolveDictionaryTypes(schema_result.ValueUnsafe());
 
 	// opaque_data: binary (nullable)
 	auto opaque_col = batch->GetColumnByName("opaque_data");
@@ -461,6 +462,53 @@ std::vector<std::string> UnwrapStringResponseItems(const std::shared_ptr<arrow::
 	}
 
 	return items;
+}
+
+// ============================================================================
+// TableFunctionCardinalityRequest / TableCardinality
+// ============================================================================
+
+std::shared_ptr<arrow::RecordBatch> BuildTableFunctionCardinalityRequest(
+    const std::vector<uint8_t> &bind_call_bytes,
+    const std::vector<uint8_t> &bind_opaque_data) {
+	auto schema = arrow::schema({
+	    arrow::field("bind_call", arrow::binary(), false),
+	    arrow::field("bind_opaque_data", arrow::binary(), true),
+	});
+	std::vector<std::shared_ptr<arrow::Array>> arrays;
+	arrays.push_back(BuildBinaryScalar(bind_call_bytes));
+	arrays.push_back(BuildBinaryScalar(bind_opaque_data));
+	return arrow::RecordBatch::Make(schema, 1, arrays);
+}
+
+TableFunctionCardinalityResult ParseTableFunctionCardinalityResult(
+    const std::shared_ptr<arrow::RecordBatch> &batch,
+    const std::string &worker_path) {
+	TableFunctionCardinalityResult result;
+
+	if (!batch || batch->num_rows() == 0) {
+		return result;  // Unknown cardinality
+	}
+
+	// estimate: int64|null
+	auto estimate_col = batch->GetColumnByName("estimate");
+	if (estimate_col) {
+		auto int_array = std::dynamic_pointer_cast<arrow::Int64Array>(estimate_col);
+		if (int_array && !int_array->IsNull(0)) {
+			result.estimate = int_array->Value(0);
+		}
+	}
+
+	// max: int64|null
+	auto max_col = batch->GetColumnByName("max");
+	if (max_col) {
+		auto int_array = std::dynamic_pointer_cast<arrow::Int64Array>(max_col);
+		if (int_array && !int_array->IsNull(0)) {
+			result.max = int_array->Value(0);
+		}
+	}
+
+	return result;
 }
 
 // ============================================================================

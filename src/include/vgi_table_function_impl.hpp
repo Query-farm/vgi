@@ -48,12 +48,19 @@ struct VgiTableFunctionBindData : public TableFunctionData {
 
 	// Execution hints (defaults at bind, updated after init)
 	int32_t max_processes = 1;
-	int64_t cardinality_estimate = -1;
+	mutable int64_t cardinality_estimate = -1;
 
 	// Whether this function supports projection pushdown (from FunctionInfo)
 	bool projection_pushdown = false;
 
 	vector<string> all_column_names;
+
+	// Cached bind request for lazy cardinality RPC (populated during bind)
+	std::vector<uint8_t> bind_request_bytes;
+	std::vector<uint8_t> bind_opaque_data;
+
+	// Lazy cardinality fetching flag (mutable for const callback access)
+	mutable bool cardinality_fetched = false;
 
 	// Connection from bind phase, persisted for reuse in InitGlobal.
 	// Mutable to allow InitGlobal to move it out (bind_data is const after bind).

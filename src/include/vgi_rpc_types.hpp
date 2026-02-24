@@ -127,6 +127,34 @@ std::vector<std::string> UnwrapStringResponseItems(const std::shared_ptr<arrow::
 // RPC Params Builders for Catalog Methods
 // ============================================================================
 
+// ============================================================================
+// TableFunctionCardinalityRequest / TableCardinality
+// ============================================================================
+
+// Build a TableFunctionCardinalityRequest as a RecordBatch (for serialization to IPC bytes).
+// Fields match Python TableFunctionCardinalityRequest dataclass:
+//   bind_call: binary (BindRequest as IPC bytes)
+//   bind_opaque_data: binary|null
+std::shared_ptr<arrow::RecordBatch> BuildTableFunctionCardinalityRequest(
+    const std::vector<uint8_t> &bind_call_bytes,
+    const std::vector<uint8_t> &bind_opaque_data = {});
+
+// Parsed TableCardinality result
+struct TableFunctionCardinalityResult {
+	int64_t estimate = -1;  // -1 = unknown (null from worker)
+	int64_t max = -1;       // -1 = unknown (null from worker)
+};
+
+// Parse TableCardinality from a deserialized RecordBatch (1 row).
+// Fields: estimate: int64|null, max: int64|null
+TableFunctionCardinalityResult ParseTableFunctionCardinalityResult(
+    const std::shared_ptr<arrow::RecordBatch> &batch,
+    const std::string &worker_path = "");
+
+// ============================================================================
+// RPC Params Builders for Catalog Methods
+// ============================================================================
+
 // Build params batch for the "bind" RPC method.
 // The bind RPC has a single "request" field containing the serialized BindRequest.
 std::shared_ptr<arrow::RecordBatch> BuildBindRpcParams(const std::vector<uint8_t> &bind_request_bytes);

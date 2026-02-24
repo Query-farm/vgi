@@ -279,6 +279,29 @@ VgiScanFunctionResult InvokeCatalogTableScanFunctionGet(
 }
 
 // ============================================================================
+// Table Function Cardinality
+// ============================================================================
+
+TableFunctionCardinalityResult InvokeTableFunctionCardinality(
+    const std::string &worker_path, const std::vector<uint8_t> &bind_request_bytes,
+    const std::vector<uint8_t> &bind_opaque_data, ClientContext &context,
+    bool worker_debug, bool use_pool) {
+	// Build the TableFunctionCardinalityRequest batch and serialize to IPC bytes
+	auto request_batch = BuildTableFunctionCardinalityRequest(bind_request_bytes, bind_opaque_data);
+	auto request_bytes = SerializeToIpcBytes(request_batch);
+
+	// Wrap in params batch with {request: binary} (reuses bind pattern)
+	auto params = BuildBindRpcParams(request_bytes);
+
+	auto response = InvokeRpcMethod(worker_path, "table_function_cardinality", params, context, worker_debug, use_pool);
+	auto result_batch = ExtractAndDeserializeResult(response, "table_function_cardinality", worker_path);
+	if (!result_batch) {
+		return {};  // Unknown cardinality
+	}
+	return ParseTableFunctionCardinalityResult(result_batch, worker_path);
+}
+
+// ============================================================================
 // Enum parsing functions
 // ============================================================================
 
@@ -491,7 +514,8 @@ VgiSetting ParseVgiSetting(const std::vector<uint8_t> &bytes, const std::string 
 	auto type_bytes = row["type"].value_not_null<std::vector<uint8_t>>();
 	auto type_buffer = arrow::Buffer::Wrap(type_bytes.data(), type_bytes.size());
 	auto type_stream = std::make_shared<arrow::io::BufferReader>(type_buffer);
-	auto type_schema_result = arrow::ipc::ReadSchema(type_stream.get(), nullptr);
+	arrow::ipc::DictionaryMemo type_dict_memo;
+	auto type_schema_result = arrow::ipc::ReadSchema(type_stream.get(), &type_dict_memo);
 	if (!type_schema_result.ok()) {
 		throw IOException("Failed to read type schema for setting '%s': %s", setting.name,
 		                  type_schema_result.status().ToString());

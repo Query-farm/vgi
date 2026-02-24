@@ -1,5 +1,6 @@
 #include "vgi_table_function_impl.hpp"
 
+#include "vgi_catalog_api.hpp"
 #include "vgi_exception.hpp"
 #include "vgi_logging.hpp"
 #include "vgi_protocol.hpp"
@@ -52,10 +53,13 @@ void PerformVgiTableFunctionBind(ClientContext &context, VgiTableFunctionBindDat
 	bind_data.bind_connection = std::move(result.connection);
 	auto &bind_result = result.bind_result;
 
-	// At bind time, max_processes and cardinality_estimate are unknown
-	// They will be updated after init (max_workers from GlobalInitResponse)
+	// At bind time, max_processes is unknown (updated after init)
 	bind_data.max_processes = 1;
 	bind_data.cardinality_estimate = -1;
+
+	// Cache bind request bytes for lazy cardinality RPC in the cardinality callback
+	bind_data.bind_request_bytes = bind_result.bind_request_bytes;
+	bind_data.bind_opaque_data = bind_result.opaque_data;
 
 	// bind_connection is preserved for reuse in InitGlobal
 
@@ -604,6 +608,23 @@ void VgiTableFunctionScan(ClientContext &context, TableFunctionInput &input, Dat
 
 unique_ptr<NodeStatistics> VgiTableFunctionCardinality(ClientContext &context, const FunctionData *bind_data_p) {
 	auto &bind_data = bind_data_p->Cast<VgiTableFunctionBindData>();
+
+	// Lazy fetch: make a single table_function_cardinality RPC call on first invocation
+	if (!bind_data.cardinality_fetched && !bind_data.bind_request_bytes.empty()) {
+		bind_data.cardinality_fetched = true;
+		try {
+			auto result = InvokeTableFunctionCardinality(bind_data.worker_path, bind_data.bind_request_bytes,
+			                                             bind_data.bind_opaque_data, context, bind_data.worker_debug,
+			                                             bind_data.max_pool_size > 0);
+			bind_data.cardinality_estimate = result.estimate;
+		} catch (const std::exception &e) {
+			// Not critical — continue with unknown cardinality
+			VGI_LOG(context, "table_function.cardinality_error",
+			        {{"worker_path", bind_data.worker_path},
+			         {"function_name", bind_data.function_name},
+			         {"error", e.what()}});
+		}
+	}
 
 	if (bind_data.cardinality_estimate >= 0) {
 		VGI_LOG(context, "table_function.cardinality",

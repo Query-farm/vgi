@@ -12,6 +12,7 @@
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/function/aggregate_state.hpp"
 #include "duckdb/function/function.hpp"
+#include "vgi_rpc_types.hpp"
 
 #include "vgi_arrow_utils.hpp"
 #include "vgi_protocol.hpp"
@@ -273,6 +274,18 @@ VgiScanFunctionResult InvokeCatalogTableScanFunctionGet(
     const std::string &worker_path, const std::vector<uint8_t> &attach_id, const std::string &schema_name,
     const std::string &table_name, ClientContext &context, const std::string &at_unit = "",
     const std::string &at_value = "", bool worker_debug = false, bool use_pool = true);
+
+// ============================================================================
+// Table Function Cardinality
+// ============================================================================
+
+// Invoke table_function_cardinality RPC: get cardinality estimate for a table function.
+// Uses the serialized BindRequest bytes from a completed bind phase.
+// Returns TableFunctionCardinalityResult with estimate and max (-1 = unknown).
+TableFunctionCardinalityResult InvokeTableFunctionCardinality(
+    const std::string &worker_path, const std::vector<uint8_t> &bind_request_bytes,
+    const std::vector<uint8_t> &bind_opaque_data, ClientContext &context,
+    bool worker_debug = false, bool use_pool = true);
 
 // ============================================================================
 // Function Invocation API
