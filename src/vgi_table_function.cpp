@@ -20,7 +20,10 @@ using vgi::VgiTableFunctionLocalState;
 static unique_ptr<FunctionData> VgiTableFunctionBind(ClientContext &context, TableFunctionBindInput &input,
                                                      vector<LogicalType> &return_types, vector<string> &names) {
 	auto bind_data = make_uniq<VgiTableFunctionBindData>();
-	bind_data->max_pool_size = vgi::VgiWorkerPool::GetMaxPoolSize(context);
+	Value max_pool_val;
+	bind_data->max_pool_size = context.TryGetCurrentSetting("vgi_worker_pool_max", max_pool_val)
+	                               ? static_cast<size_t>(max_pool_val.GetValue<int64_t>())
+	                               : 0;
 
 	// Extract required parameters from vgi_table_function(worker_path, function_name, args, named_args)
 	bind_data->worker_path = input.inputs[0].GetValue<string>();

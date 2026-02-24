@@ -14,9 +14,6 @@
 #include <vector>
 
 namespace duckdb {
-
-class ClientContext;
-
 namespace vgi {
 
 // Per-path pool configuration, set at ATTACH time via ConfigurePath().
@@ -87,17 +84,19 @@ public:
 	// Get the singleton instance
 	static VgiWorkerPool &Instance();
 
-	// Read vgi_worker_pool_max setting from context (returns 0 if unset)
-	static size_t GetMaxPoolSize(duckdb::ClientContext &context);
-
 	// Acquire a worker from the pool for the given worker_path.
 	// Returns nullptr if no worker is available (never blocks).
 	// The returned worker is guaranteed to be alive.
 	std::unique_ptr<PooledWorker> TryAcquire(const std::string &worker_path);
 
 	// Return a worker to the pool for reuse.
-	// max_pool_size: 0 = pool disabled, >0 = max workers to keep in pool
-	void Release(std::unique_ptr<PooledWorker> worker, size_t max_pool_size);
+	// Uses per-path config (from ConfigurePath) if available, otherwise default settings.
+	void Release(std::unique_ptr<PooledWorker> worker);
+
+	// Set default pool settings for paths without explicit per-path config
+	// (e.g., direct vgi_table_function() calls that don't go through ATTACH).
+	// Called once at extension load time with values from vgi_worker_pool_max / idle_limit settings.
+	void SetDefaultSettings(const PoolSettings &settings);
 
 	// Flush all workers from the pool, returns count flushed
 	size_t Flush();
@@ -152,6 +151,9 @@ private:
 
 	// Per-path pool configuration (set at ATTACH time)
 	std::map<std::string, PoolSettings> path_configs_;
+
+	// Default settings for paths without explicit per-path config
+	PoolSettings default_settings_ {256, 5};
 
 	// Hit/miss statistics by worker path
 	std::map<std::string, std::pair<uint64_t, uint64_t>> stats_; // {hits, misses}

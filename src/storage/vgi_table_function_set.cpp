@@ -279,8 +279,7 @@ void VgiTableFunctionSet::LoadEntries(ClientContext &context) {
 				// Attach function info
 				table_func.function_info = make_uniq<VgiTableFunctionInfo>(
 				    worker_path, attach_result->attach_id, attach_params->worker_debug(),
-				    attach_params->use_pool() ? vgi::VgiWorkerPool::GetMaxPoolSize(context) : 0,
-				    func_info, setting_names);
+				    attach_params->use_pool() ? 1 : 0, func_info, setting_names);
 
 				func_set.AddFunction(table_func);
 			} else {
@@ -306,8 +305,7 @@ void VgiTableFunctionSet::LoadEntries(ClientContext &context) {
 				// Attach VgiTableFunctionInfo so the bind function can access worker_path and function metadata
 				table_func.function_info = make_uniq<VgiTableFunctionInfo>(
 				    worker_path, attach_result->attach_id, attach_params->worker_debug(),
-				    attach_params->use_pool() ? vgi::VgiWorkerPool::GetMaxPoolSize(context) : 0,
-				    func_info, setting_names);
+				    attach_params->use_pool() ? 1 : 0, func_info, setting_names);
 
 				func_set.AddFunction(table_func);
 			}

@@ -52,8 +52,7 @@ TableFunction VgiTableEntry::GetScanFunction(ClientContext &context, unique_ptr<
 	scan_bind_data->worker_path = attach_params->worker_path();
 	scan_bind_data->attach_id = attach_result->attach_id;
 	scan_bind_data->worker_debug = attach_params->worker_debug();
-	scan_bind_data->max_pool_size =
-	    attach_params->use_pool() ? vgi::VgiWorkerPool::GetMaxPoolSize(context) : 0;
+	scan_bind_data->max_pool_size = attach_params->use_pool() ? 1 : 0;
 	scan_bind_data->function_name = scan_result.function_name;
 	scan_bind_data->arguments = vgi::BuildArgumentsFromValues(context, scan_result.positional_arguments, named_args_vec);
 	scan_bind_data->projection_pushdown = true;

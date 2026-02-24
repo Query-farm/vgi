@@ -56,7 +56,7 @@ VgiScalarFunctionLocalState::~VgiScalarFunctionLocalState() {
 			auto pooled = connection->ReleaseForPooling();
 			if (pooled) {
 				VGI_STDERR_DEBUG("[VGI] scalar.destructor pooled pid=%d\n", pooled->GetPid());
-				vgi::VgiWorkerPool::Instance().Release(std::move(pooled), max_pool_size);
+				vgi::VgiWorkerPool::Instance().Release(std::move(pooled));
 			}
 		}
 	}
@@ -406,79 +406,27 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 	VGI_LOG(context, "scalar.read_output",
 	        {{"function_name", func_info.function_name}, {"output_rows", std::to_string(output_batch->num_rows())}});
 
-	// Convert Arrow result array to DuckDB Vector
-	// Export to C ABI and convert
-	ArrowArrayWrapper arr_wrapper;
-	ExportRecordBatch(output_batch, arr_wrapper);
+	// Convert Arrow result to DuckDB Vector using DuckDB's built-in ArrowToDuckDB
+	// This supports all DuckDB types (including dates, timestamps, lists, structs, etc.)
+	ArrowSchemaWrapper c_schema;
+	ArrowTableSchema arrow_table;
+	vector<LogicalType> output_types;
+	vector<string> output_names;
+	ArrowSchemaToDuckDBTypes(context, output_batch->schema(), c_schema, arrow_table, output_types, output_names);
 
-	ArrowArray *result_array = arr_wrapper.arrow_array.children[0];
+	auto chunk_wrapper = make_uniq<ArrowArrayWrapper>();
+	ExportRecordBatch(output_batch, *chunk_wrapper);
+	ArrowScanLocalState scan_state(std::move(chunk_wrapper), context);
 
-	// Import the column using Arrow C++
-	auto col_status = arrow::ImportArray(result_array, output_batch->schema()->field(0)->type());
-	if (!col_status.ok()) {
-		throw IOException("Failed to import Arrow column: %s", col_status.status().ToString());
-	}
-	auto arrow_array = col_status.ValueUnsafe();
+	DataChunk temp_output;
+	temp_output.Initialize(context, {result.GetType()});
+	temp_output.SetCardinality(args.size());
+	ArrowTableFunction::ArrowToDuckDB(scan_state, arrow_table.GetColumns(), temp_output, false);
 
-	// Convert Arrow array to DuckDB Vector based on type
-	auto result_type = result.GetType();
-	idx_t count = args.size();
-
-	for (idx_t row_idx = 0; row_idx < count; row_idx++) {
-		if (arrow_array->IsNull(row_idx)) {
-			FlatVector::SetNull(result, row_idx, true);
-		} else {
-			if (result_type == LogicalType::BIGINT) {
-				auto int_array = std::static_pointer_cast<arrow::Int64Array>(arrow_array);
-				FlatVector::GetData<int64_t>(result)[row_idx] = int_array->Value(row_idx);
-			} else if (result_type == LogicalType::INTEGER) {
-				auto int_array = std::static_pointer_cast<arrow::Int32Array>(arrow_array);
-				FlatVector::GetData<int32_t>(result)[row_idx] = int_array->Value(row_idx);
-			} else if (result_type == LogicalType::SMALLINT) {
-				auto int_array = std::static_pointer_cast<arrow::Int16Array>(arrow_array);
-				FlatVector::GetData<int16_t>(result)[row_idx] = int_array->Value(row_idx);
-			} else if (result_type == LogicalType::TINYINT) {
-				auto int_array = std::static_pointer_cast<arrow::Int8Array>(arrow_array);
-				FlatVector::GetData<int8_t>(result)[row_idx] = int_array->Value(row_idx);
-			} else if (result_type == LogicalType::UBIGINT) {
-				auto int_array = std::static_pointer_cast<arrow::UInt64Array>(arrow_array);
-				FlatVector::GetData<uint64_t>(result)[row_idx] = int_array->Value(row_idx);
-			} else if (result_type == LogicalType::UINTEGER) {
-				auto int_array = std::static_pointer_cast<arrow::UInt32Array>(arrow_array);
-				FlatVector::GetData<uint32_t>(result)[row_idx] = int_array->Value(row_idx);
-			} else if (result_type == LogicalType::USMALLINT) {
-				auto int_array = std::static_pointer_cast<arrow::UInt16Array>(arrow_array);
-				FlatVector::GetData<uint16_t>(result)[row_idx] = int_array->Value(row_idx);
-			} else if (result_type == LogicalType::UTINYINT) {
-				auto int_array = std::static_pointer_cast<arrow::UInt8Array>(arrow_array);
-				FlatVector::GetData<uint8_t>(result)[row_idx] = int_array->Value(row_idx);
-			} else if (result_type == LogicalType::DOUBLE) {
-				auto dbl_array = std::static_pointer_cast<arrow::DoubleArray>(arrow_array);
-				FlatVector::GetData<double>(result)[row_idx] = dbl_array->Value(row_idx);
-			} else if (result_type == LogicalType::FLOAT) {
-				auto flt_array = std::static_pointer_cast<arrow::FloatArray>(arrow_array);
-				FlatVector::GetData<float>(result)[row_idx] = flt_array->Value(row_idx);
-			} else if (result_type == LogicalType::VARCHAR) {
-				auto str_array = std::static_pointer_cast<arrow::StringArray>(arrow_array);
-				FlatVector::GetData<string_t>(result)[row_idx] =
-				    StringVector::AddString(result, str_array->GetString(row_idx));
-			} else if (result_type == LogicalType::BOOLEAN) {
-				auto bool_array = std::static_pointer_cast<arrow::BooleanArray>(arrow_array);
-				FlatVector::GetData<bool>(result)[row_idx] = bool_array->Value(row_idx);
-			} else if (result_type == LogicalType::BLOB) {
-				auto bin_array = std::static_pointer_cast<arrow::BinaryArray>(arrow_array);
-				auto value = bin_array->GetView(row_idx);
-				FlatVector::GetData<string_t>(result)[row_idx] =
-				    StringVector::AddStringOrBlob(result, value.data(), value.size());
-			} else {
-				throw NotImplementedException("VGI scalar function: unsupported result type %s",
-				                              result_type.ToString());
-			}
-		}
-	}
+	result.Reference(temp_output.data[0]);
 
 	// For single-row results (constant folding), set vector type to CONSTANT_VECTOR
-	if (count == 1) {
+	if (args.size() == 1) {
 		result.SetVectorType(VectorType::CONSTANT_VECTOR);
 	}
 }

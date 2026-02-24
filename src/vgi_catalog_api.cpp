@@ -81,15 +81,13 @@ static UnaryResponseResult InvokeRpcMethod(const std::string &worker_path, const
 	if (use_pool) {
 		int exit_status = 0;
 		if (!proc->TryWait(&exit_status)) {
-			auto max_pool_size = VgiWorkerPool::GetMaxPoolSize(context);
 			auto to_pool = std::make_unique<PooledWorker>(std::move(proc), worker_path, -1);
 			VGI_LOG(context, "worker_pool.release",
 			        {{"worker_path", worker_path},
 			         {"worker_pid", std::to_string(to_pool->GetPid())},
 			         {"method_name", method_name},
-			         {"max_pool_size", std::to_string(max_pool_size)},
 			         {"phase", "rpc_catalog"}});
-			VgiWorkerPool::Instance().Release(std::move(to_pool), max_pool_size);
+			VgiWorkerPool::Instance().Release(std::move(to_pool));
 		}
 	}
 

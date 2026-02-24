@@ -1,5 +1,5 @@
-# name: test/sql/integration/scalar/null_handling/basic.test
-# description: Basic tests for VGI null_handling scalar function
+# name: test/sql/integration/scalar/null_handling.test
+# description: Tests for VGI null_handling scalar function
 # group: [vgi]
 
 require-env VGI_TEST_WORKER
@@ -18,9 +18,9 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 # Note: Scalar NULL is short-circuited by DuckDB before reaching the function
 # ============================================================================
 
-# ----------------------------------------------------------------------------
+# ============================================================================
 # Basic non-null pass-through
-# ----------------------------------------------------------------------------
+# ============================================================================
 
 query I
 SELECT example.null_handling(1);
@@ -42,10 +42,10 @@ SELECT example.null_handling(-100);
 ----
 -100
 
-# ----------------------------------------------------------------------------
+# ============================================================================
 # NULL handling in batches (NullHandling.SPECIAL)
 # When NULL is part of a batch, the function receives it and returns -5000
-# ----------------------------------------------------------------------------
+# ============================================================================
 
 query I
 SELECT example.null_handling(val) FROM (VALUES (1), (NULL), (3)) t(val);
@@ -77,9 +77,9 @@ SELECT example.null_handling(val) FROM (VALUES (10), (20), (30)) t(val);
 20
 30
 
-# ----------------------------------------------------------------------------
+# ============================================================================
 # Multiple rows from table
-# ----------------------------------------------------------------------------
+# ============================================================================
 
 query I
 SELECT example.null_handling(x) FROM (VALUES (1), (2), (3), (4), (5)) t(x);
@@ -97,9 +97,9 @@ SELECT example.null_handling(val) FROM (VALUES (100), (200), (300)) t(val) ORDER
 200
 300
 
-# ----------------------------------------------------------------------------
+# ============================================================================
 # Larger datasets with conditional nulls
-# ----------------------------------------------------------------------------
+# ============================================================================
 
 query I
 SELECT COUNT(*) FROM (
@@ -118,9 +118,9 @@ SELECT COUNT(*) FROM (
 ----
 50
 
-# ----------------------------------------------------------------------------
+# ============================================================================
 # Integration with other SQL operations
-# ----------------------------------------------------------------------------
+# ============================================================================
 
 query II
 SELECT val, example.null_handling(val) AS processed

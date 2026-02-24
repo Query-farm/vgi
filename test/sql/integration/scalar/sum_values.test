@@ -1,0 +1,508 @@
+# name: test/sql/integration/scalar/sum_values.test
+# description: Tests for VGI sum_values scalar function
+# group: [vgi]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# sum_values function
+# Sums multiple numeric columns together (varargs)
+# Args: columns... (numeric, varargs)
+# Returns: numeric (sum, promoted type)
+# ============================================================================
+
+# ============================================================================
+# Basic tests with 2 arguments
+# ============================================================================
+
+query I
+SELECT example.sum_values(10, 20);
+----
+30
+
+query I
+SELECT example.sum_values(0, 0);
+----
+0
+
+query I
+SELECT example.sum_values(-10, 20);
+----
+10
+
+query I
+SELECT example.sum_values(-10, -20);
+----
+-30
+
+# ============================================================================
+# Multiple rows from table
+# ============================================================================
+
+query I
+SELECT example.sum_values(a, b, c) FROM (VALUES (1, 2, 3), (4, 5, 6), (7, 8, 9)) t(a, b, c);
+----
+6
+15
+24
+
+query I
+SELECT example.sum_values(x, y) FROM (VALUES (10, 1), (20, 2), (30, 3)) t(x, y) ORDER BY x;
+----
+11
+22
+33
+
+# ============================================================================
+# Integration with other SQL operations
+# ============================================================================
+
+query IIII
+SELECT a, b, c, example.sum_values(a, b, c) AS total
+FROM (VALUES (1, 2, 3), (4, 5, 6), (7, 8, 9)) t(a, b, c)
+ORDER BY a;
+----
+1	2	3	6
+4	5	6	15
+7	8	9	24
+
+query I
+SELECT SUM(example.sum_values(a, b)) FROM (VALUES (1, 1), (2, 2), (3, 3)) t(a, b);
+----
+12
+
+# ============================================================================
+# With expressions
+# ============================================================================
+
+query I
+SELECT example.sum_values(10 + 5, 20 + 5, 30 + 5);
+----
+75
+
+query I
+SELECT example.sum_values(x * 2, y * 2, z * 2) FROM (VALUES (5, 10, 15)) t(x, y, z);
+----
+60
+
+# ============================================================================
+# Varargs - varying number of arguments
+# ============================================================================
+
+# 3 arguments
+query I
+SELECT example.sum_values(10, 20, 30);
+----
+60
+
+# 4 arguments
+query I
+SELECT example.sum_values(1, 2, 3, 4);
+----
+10
+
+# 5 arguments
+query I
+SELECT example.sum_values(10, 20, 30, 40, 50);
+----
+150
+
+# 6 arguments
+query I
+SELECT example.sum_values(1, 2, 3, 4, 5, 6);
+----
+21
+
+# 7 arguments
+query I
+SELECT example.sum_values(1, 2, 3, 4, 5, 6, 7);
+----
+28
+
+# 8 arguments
+query I
+SELECT example.sum_values(1, 2, 3, 4, 5, 6, 7, 8);
+----
+36
+
+# 10 arguments
+query I
+SELECT example.sum_values(1, 2, 3, 4, 5, 6, 7, 8, 9, 10);
+----
+55
+
+# 10 identical values
+query I
+SELECT example.sum_values(10, 10, 10, 10, 10, 10, 10, 10, 10, 10);
+----
+100
+
+# ============================================================================
+# Single argument (minimum varargs)
+# ============================================================================
+
+query I
+SELECT example.sum_values(42);
+----
+42
+
+query I
+SELECT example.sum_values(0);
+----
+0
+
+query I
+SELECT example.sum_values(-100);
+----
+-100
+
+query R
+SELECT example.sum_values(3.14::DOUBLE);
+----
+3.14
+
+# ============================================================================
+# Sequence patterns
+# ============================================================================
+
+# Sum of 1 to 5 (= 15)
+query I
+SELECT example.sum_values(1, 2, 3, 4, 5);
+----
+15
+
+# Sum of powers of 2
+query I
+SELECT example.sum_values(1, 2, 4, 8, 16);
+----
+31
+
+# Alternating signs
+query I
+SELECT example.sum_values(1, -2, 3, -4, 5);
+----
+3
+
+# ============================================================================
+# Type-specific tests
+# ============================================================================
+
+# INTEGER sum
+query I
+SELECT example.sum_values(100::INTEGER, 200::INTEGER, 300::INTEGER);
+----
+600
+
+# BIGINT sum
+query I
+SELECT example.sum_values(1000::BIGINT, 2000::BIGINT, 3000::BIGINT);
+----
+6000
+
+# DOUBLE sum
+query R
+SELECT example.sum_values(1.5::DOUBLE, 2.5::DOUBLE, 3.0::DOUBLE);
+----
+7.0
+
+query R
+SELECT example.sum_values(0.1::DOUBLE, 0.2::DOUBLE, 0.3::DOUBLE, 0.4::DOUBLE);
+----
+1.0
+
+# ============================================================================
+# NULL handling
+# ============================================================================
+
+# Single NULL argument
+query I
+SELECT example.sum_values(NULL::INTEGER);
+----
+NULL
+
+# NULL mixed with values
+query I
+SELECT example.sum_values(1, NULL, 3);
+----
+NULL
+
+query I
+SELECT example.sum_values(NULL, 2, 3);
+----
+NULL
+
+query I
+SELECT example.sum_values(1, 2, NULL);
+----
+NULL
+
+# Multiple NULLs
+query I
+SELECT example.sum_values(NULL::INTEGER, NULL::INTEGER);
+----
+NULL
+
+# NULL in batch
+query I
+SELECT example.sum_values(a, b, c) FROM (VALUES (1, 2, 3), (NULL, 5, 6), (7, 8, 9)) t(a, b, c);
+----
+6
+NULL
+24
+
+# Count non-null results
+query I
+SELECT COUNT(*) FROM (
+    SELECT example.sum_values(a, b) AS result
+    FROM (VALUES (1, 1), (NULL, 2), (3, 3)) t(a, b)
+) WHERE result IS NOT NULL;
+----
+2
+
+# ============================================================================
+# All zeros
+# ============================================================================
+
+query I
+SELECT example.sum_values(0, 0);
+----
+0
+
+query I
+SELECT example.sum_values(0, 0, 0, 0, 0);
+----
+0
+
+query R
+SELECT example.sum_values(0.0::DOUBLE, 0.0::DOUBLE, 0.0::DOUBLE);
+----
+0.0
+
+# ============================================================================
+# Cancellation (positive + negative = 0)
+# ============================================================================
+
+query I
+SELECT example.sum_values(100, -100);
+----
+0
+
+query I
+SELECT example.sum_values(50, -25, -25);
+----
+0
+
+query I
+SELECT example.sum_values(10, -20, 30, -40, 20);
+----
+0
+
+query R
+SELECT example.sum_values(1.5::DOUBLE, -0.5::DOUBLE, -1.0::DOUBLE);
+----
+0.0
+
+# ============================================================================
+# Large values
+# ============================================================================
+
+query I
+SELECT example.sum_values(1000000000::BIGINT, 1000000000::BIGINT);
+----
+2000000000
+
+query I
+SELECT example.sum_values(500000000::BIGINT, 500000000::BIGINT, 500000000::BIGINT);
+----
+1500000000
+
+query I
+SELECT example.sum_values(-1000000000::BIGINT, -1000000000::BIGINT);
+----
+-2000000000
+
+# Large + small
+query I
+SELECT example.sum_values(1000000000::BIGINT, 1::BIGINT, 1::BIGINT);
+----
+1000000002
+
+# ============================================================================
+# Small decimal values
+# ============================================================================
+
+query R
+SELECT example.sum_values(0.001::DOUBLE, 0.002::DOUBLE, 0.003::DOUBLE);
+----
+0.006
+
+query R
+SELECT example.sum_values(0.1::DOUBLE, 0.01::DOUBLE, 0.001::DOUBLE);
+----
+0.111
+
+# ============================================================================
+# Consistent type usage
+# ============================================================================
+
+# All DOUBLE
+query R
+SELECT example.sum_values(10.0::DOUBLE, 0.5::DOUBLE, 20.0::DOUBLE);
+----
+30.5
+
+# All BIGINT
+query I
+SELECT example.sum_values(100::BIGINT, 1000000::BIGINT, 50::BIGINT);
+----
+1000150
+
+# All INTEGER
+query I
+SELECT example.sum_values(1::INTEGER, 10::INTEGER, 100::INTEGER, 1000::INTEGER);
+----
+1111
+
+# ============================================================================
+# Scale tests - larger datasets
+# ============================================================================
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT example.sum_values(i::INTEGER, i::INTEGER, i::INTEGER) AS result
+    FROM (SELECT unnest(generate_series(1, 100)) AS i)
+);
+----
+100
+
+# Verify values are correct (sum of i + i + i = 3*i)
+query I
+SELECT COUNT(*) FROM (
+    SELECT i::INTEGER AS val, example.sum_values(i::INTEGER, i::INTEGER, i::INTEGER) AS summed
+    FROM (SELECT unnest(generate_series(1, 50)) AS i)
+) WHERE summed = val * 3;
+----
+50
+
+# ============================================================================
+# Large table tests (5000 rows) - tests parallelism
+# ============================================================================
+
+# Create a table with 5000 rows and three integer columns
+statement ok
+CREATE TABLE large_triplets AS
+SELECT i AS col_a, i * 2 AS col_b, i * 3 AS col_c, i AS id
+FROM (SELECT unnest(generate_series(1, 5000)) AS i);
+
+# Verify table size
+query I
+SELECT COUNT(*) FROM large_triplets;
+----
+5000
+
+# Run sum_values on all rows (3 columns)
+query I
+SELECT COUNT(*) FROM (
+    SELECT example.sum_values(col_a, col_b, col_c) AS result
+    FROM large_triplets
+);
+----
+5000
+
+# Verify all sums are correct (i + 2i + 3i = 6i)
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, example.sum_values(col_a, col_b, col_c) AS sum_result
+    FROM large_triplets
+) WHERE sum_result = id * 6;
+----
+5000
+
+# Test with filtering
+query I
+SELECT COUNT(*) FROM (
+    SELECT example.sum_values(col_a, col_b, col_c) AS result
+    FROM large_triplets
+    WHERE id <= 2500
+);
+----
+2500
+
+# Test with aggregation
+# Sum of 6*i for i=1 to 100 = 6 * (100 * 101 / 2) = 30300
+query I
+SELECT SUM(example.sum_values(col_a, col_b, col_c))
+FROM large_triplets
+WHERE id <= 100;
+----
+30300
+
+# Create table with 4 columns to test more varargs
+statement ok
+CREATE TABLE large_quads AS
+SELECT i AS col_a, i AS col_b, i AS col_c, i AS col_d, i AS id
+FROM (SELECT unnest(generate_series(1, 5000)) AS i);
+
+# Run sum_values with 4 columns
+query I
+SELECT COUNT(*) FROM (
+    SELECT example.sum_values(col_a, col_b, col_c, col_d) AS result
+    FROM large_quads
+);
+----
+5000
+
+# All sums should be 4*i
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, example.sum_values(col_a, col_b, col_c, col_d) AS sum_result
+    FROM large_quads
+) WHERE sum_result = id * 4;
+----
+5000
+
+# Create table with double precision values
+statement ok
+CREATE TABLE large_double_triplets AS
+SELECT (i * 0.1)::DOUBLE AS col_a, (i * 0.2)::DOUBLE AS col_b, (i * 0.3)::DOUBLE AS col_c, i AS id
+FROM (SELECT unnest(generate_series(1, 5000)) AS i);
+
+# Run sum_values on all double rows
+query I
+SELECT COUNT(*) FROM (
+    SELECT example.sum_values(col_a, col_b, col_c) AS result
+    FROM large_double_triplets
+);
+----
+5000
+
+# Verify sums with tolerance (0.1i + 0.2i + 0.3i = 0.6i)
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, col_a, col_b, col_c, example.sum_values(col_a, col_b, col_c) AS sum_result
+    FROM large_double_triplets
+) WHERE ABS(sum_result - (id * 0.6)) < 0.0001;
+----
+5000
+
+# Cleanup test tables
+statement ok
+DROP TABLE large_triplets;
+
+statement ok
+DROP TABLE large_quads;
+
+statement ok
+DROP TABLE large_double_triplets;
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;

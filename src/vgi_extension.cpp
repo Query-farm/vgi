@@ -89,11 +89,16 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	// Build per-path pool config and register with pool
 	vgi::PoolSettings pool_settings;
 	if (use_pool) {
-		pool_settings.max_pool_size = vgi::VgiWorkerPool::GetMaxPoolSize(context);
+		// Default per-path limit from vgi_worker_pool_max setting
+		Value max_val;
+		if (context.TryGetCurrentSetting("vgi_worker_pool_max", max_val)) {
+			pool_settings.max_pool_size = static_cast<size_t>(max_val.GetValue<int64_t>());
+		}
 		Value idle_val;
 		if (context.TryGetCurrentSetting("vgi_worker_pool_idle_limit_seconds", idle_val)) {
 			pool_settings.idle_timeout_seconds = static_cast<size_t>(idle_val.GetValue<int64_t>());
 		}
+		// ATTACH options override the defaults
 		if (pool_max_override >= 0) {
 			pool_settings.max_pool_size = static_cast<size_t>(pool_max_override);
 		}
@@ -161,8 +166,12 @@ static void LoadInternal(ExtensionLoader &loader) {
 	config.AddExtensionOption("vgi_worker_pool_idle_limit_seconds",
 	                          "Maximum idle time in seconds before pooled workers are removed", LogicalType::BIGINT,
 	                          Value::BIGINT(5));
-	config.AddExtensionOption("vgi_worker_pool_max", "Maximum number of workers to keep in the pool (0 = disabled)",
+	config.AddExtensionOption("vgi_worker_pool_max", "Default per-path pool limit for VGI workers (0 = disabled)",
 	                          LogicalType::BIGINT, Value::BIGINT(256));
+
+	// Set default pool settings for paths without explicit per-path config
+	// (e.g., direct vgi_table_function() calls that don't go through ATTACH)
+	vgi::VgiWorkerPool::Instance().SetDefaultSettings({256, 5});
 
 	// Register VGI table functions
 	RegisterVgiCatalogsFunction(loader);

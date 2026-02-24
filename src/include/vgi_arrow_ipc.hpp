@@ -104,7 +104,12 @@ std::vector<std::string> ExtractStringColumn(const std::shared_ptr<arrow::Record
                                              const std::string &column_name = "value");
 
 // Deserialize an Arrow schema from IPC format bytes
+// Dictionary-encoded types are resolved to their value types
 std::shared_ptr<arrow::Schema> DeserializeSchema(const std::vector<uint8_t> &data);
+
+// Resolve dictionary-encoded types to their value types in a schema
+// e.g., dictionary(int8, string) → string
+std::shared_ptr<arrow::Schema> ResolveDictionaryTypes(const std::shared_ptr<arrow::Schema> &schema);
 
 } // namespace vgi
 } // namespace duckdb

@@ -133,8 +133,7 @@ void VgiScalarFunctionSet::LoadEntries(ClientContext &context) {
 			scalar_func_info->attach_id = attach_result->attach_id;
 			scalar_func_info->function_name = func_info.name;
 			scalar_func_info->worker_debug = attach_params->worker_debug();
-			scalar_func_info->max_pool_size =
-			    attach_params->use_pool() ? vgi::VgiWorkerPool::GetMaxPoolSize(context) : 0;
+			scalar_func_info->max_pool_size = attach_params->use_pool() ? 1 : 0;
 			scalar_func_info->output_schema = func_info.output_schema;
 			scalar_func_info->has_dynamic_return_type = is_any_output;
 			scalar_func_info->positional_is_const = arg_types.positional_is_const;

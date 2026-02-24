@@ -108,7 +108,7 @@ struct VgiTableFunctionLocalState : public ArrowScanLocalState {
 			auto worker_pid = connection->GetPid();
 			auto pooled = connection->ReleaseForPooling();
 			if (pooled) {
-				VgiWorkerPool::Instance().Release(std::move(pooled), max_pool_size_);
+				VgiWorkerPool::Instance().Release(std::move(pooled));
 				VGI_LOG(context_, "worker_pool.release",
 				        {{"worker_path", worker_path_},
 				         {"worker_pid", std::to_string(worker_pid)},

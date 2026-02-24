@@ -281,6 +281,76 @@ std::vector<std::string> ExtractStringColumn(const std::shared_ptr<arrow::Record
 	return values;
 }
 
+// Resolve dictionary-encoded types to their value types
+// e.g., dictionary(int8, string) → string
+static std::shared_ptr<arrow::DataType> ResolveDictionaryType(const std::shared_ptr<arrow::DataType> &type) {
+	if (type->id() == arrow::Type::DICTIONARY) {
+		auto dict_type = std::static_pointer_cast<arrow::DictionaryType>(type);
+		return ResolveDictionaryType(dict_type->value_type());
+	}
+	// Recurse into list/large_list value types
+	if (type->id() == arrow::Type::LIST) {
+		auto list_type = std::static_pointer_cast<arrow::ListType>(type);
+		auto resolved = ResolveDictionaryType(list_type->value_type());
+		if (resolved != list_type->value_type()) {
+			return arrow::list(list_type->value_field()->WithType(resolved));
+		}
+	} else if (type->id() == arrow::Type::LARGE_LIST) {
+		auto list_type = std::static_pointer_cast<arrow::LargeListType>(type);
+		auto resolved = ResolveDictionaryType(list_type->value_type());
+		if (resolved != list_type->value_type()) {
+			return arrow::large_list(list_type->value_field()->WithType(resolved));
+		}
+	} else if (type->id() == arrow::Type::MAP) {
+		auto map_type = std::static_pointer_cast<arrow::MapType>(type);
+		auto key_resolved = ResolveDictionaryType(map_type->key_type());
+		auto val_resolved = ResolveDictionaryType(map_type->item_type());
+		if (key_resolved != map_type->key_type() || val_resolved != map_type->item_type()) {
+			return arrow::map(key_resolved, map_type->item_field()->WithType(val_resolved),
+			                  map_type->keys_sorted());
+		}
+	} else if (type->id() == arrow::Type::STRUCT) {
+		arrow::FieldVector new_fields;
+		bool changed = false;
+		for (int i = 0; i < type->num_fields(); i++) {
+			auto field = type->field(i);
+			auto resolved = ResolveDictionaryType(field->type());
+			if (resolved != field->type()) {
+				new_fields.push_back(field->WithType(resolved));
+				changed = true;
+			} else {
+				new_fields.push_back(field);
+			}
+		}
+		if (changed) {
+			return arrow::struct_(new_fields);
+		}
+	}
+	return type;
+}
+
+std::shared_ptr<arrow::Schema> ResolveDictionaryTypes(const std::shared_ptr<arrow::Schema> &schema) {
+	if (!schema) {
+		return schema;
+	}
+	arrow::FieldVector new_fields;
+	bool changed = false;
+	for (int i = 0; i < schema->num_fields(); i++) {
+		auto field = schema->field(i);
+		auto resolved = ResolveDictionaryType(field->type());
+		if (resolved != field->type()) {
+			new_fields.push_back(field->WithType(resolved));
+			changed = true;
+		} else {
+			new_fields.push_back(field);
+		}
+	}
+	if (!changed) {
+		return schema;
+	}
+	return std::make_shared<arrow::Schema>(new_fields, schema->metadata());
+}
+
 // Deserialize an Arrow schema from IPC format bytes
 std::shared_ptr<arrow::Schema> DeserializeSchema(const std::vector<uint8_t> &data) {
 	if (data.empty()) {
@@ -289,11 +359,12 @@ std::shared_ptr<arrow::Schema> DeserializeSchema(const std::vector<uint8_t> &dat
 
 	auto buffer = arrow::Buffer::Wrap(data.data(), data.size());
 	arrow::io::BufferReader reader(buffer);
-	auto schema_result = arrow::ipc::ReadSchema(&reader, nullptr);
+	arrow::ipc::DictionaryMemo dict_memo;
+	auto schema_result = arrow::ipc::ReadSchema(&reader, &dict_memo);
 	if (!schema_result.ok()) {
 		throw IOException("Failed to deserialize Arrow schema: " + schema_result.status().ToString());
 	}
-	return schema_result.ValueUnsafe();
+	return ResolveDictionaryTypes(schema_result.ValueUnsafe());
 }
 
 } // namespace vgi

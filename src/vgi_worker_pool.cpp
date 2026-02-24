@@ -1,6 +1,5 @@
 #include "vgi_worker_pool.hpp"
 
-#include "duckdb/main/client_context.hpp"
 #include "vgi_logging.hpp"
 
 #include <unistd.h>
@@ -78,12 +77,9 @@ VgiWorkerPool &VgiWorkerPool::Instance() {
 	return instance;
 }
 
-size_t VgiWorkerPool::GetMaxPoolSize(duckdb::ClientContext &context) {
-	Value max_val;
-	if (context.TryGetCurrentSetting("vgi_worker_pool_max", max_val)) {
-		return static_cast<size_t>(max_val.GetValue<int64_t>());
-	}
-	return 0;
+void VgiWorkerPool::SetDefaultSettings(const PoolSettings &settings) {
+	std::lock_guard<std::mutex> lock(mutex_);
+	default_settings_ = settings;
 }
 
 VgiWorkerPool::VgiWorkerPool() {
@@ -137,7 +133,7 @@ std::unique_ptr<PooledWorker> VgiWorkerPool::TryAcquire(const std::string &worke
 	return nullptr;
 }
 
-void VgiWorkerPool::Release(std::unique_ptr<PooledWorker> worker, size_t max_pool_size) {
+void VgiWorkerPool::Release(std::unique_ptr<PooledWorker> worker) {
 	if (!worker) {
 		return;
 	}
@@ -146,43 +142,26 @@ void VgiWorkerPool::Release(std::unique_ptr<PooledWorker> worker, size_t max_poo
 		return; // Don't pool dead workers
 	}
 
-	// max_pool_size of 0 means pool is disabled
-	if (max_pool_size == 0) {
-		VGI_STDERR_DEBUG("[VGI] pool.release pool_disabled pid=%d\n", worker->GetPid());
-		return; // Pool disabled, discard worker
-	}
-
 	std::lock_guard<std::mutex> lock(mutex_);
 
 	const std::string &path = worker->GetWorkerPath();
 
-	// Check per-path config first (set at ATTACH time via ConfigurePath)
+	// Resolve settings: per-path config if available (from ATTACH), otherwise default settings
 	auto config_it = path_configs_.find(path);
-	if (config_it != path_configs_.end()) {
-		const auto &config = config_it->second;
-		// Per-path config controls pool size for this path
-		if (config.max_pool_size == 0) {
-			VGI_STDERR_DEBUG("[VGI] pool.release path_config_disabled pid=%d path=%s\n",
-			                 worker->GetPid(), path.c_str());
-			return;
-		}
-		if (pools_[path].size() >= config.max_pool_size) {
-			VGI_STDERR_DEBUG("[VGI] pool.release path_pool_full pid=%d path=%s size=%zu max=%zu\n",
-			                 worker->GetPid(), path.c_str(), pools_[path].size(), config.max_pool_size);
-			return;
-		}
-		worker->SetIdleTimeout(std::chrono::seconds(config.idle_timeout_seconds));
-	} else {
-		// No per-path config: use caller's max_pool_size with total-size check (backward compatible)
-		if (TotalPoolSizeLocked() >= max_pool_size) {
-			VGI_STDERR_DEBUG("[VGI] pool.release pool_full pid=%d total=%zu max=%zu\n",
-			                 worker->GetPid(), TotalPoolSizeLocked(), max_pool_size);
-			return;
-		}
-		// Worker keeps default 5s idle timeout
+	const auto &settings = (config_it != path_configs_.end()) ? config_it->second : default_settings_;
+
+	if (settings.max_pool_size == 0) {
+		VGI_STDERR_DEBUG("[VGI] pool.release pool_disabled pid=%d path=%s\n",
+		                 worker->GetPid(), path.c_str());
+		return;
+	}
+	if (pools_[path].size() >= settings.max_pool_size) {
+		VGI_STDERR_DEBUG("[VGI] pool.release path_pool_full pid=%d path=%s size=%zu max=%zu\n",
+		                 worker->GetPid(), path.c_str(), pools_[path].size(), settings.max_pool_size);
+		return;
 	}
 
-	// Add to the pool for this worker path
+	worker->SetIdleTimeout(std::chrono::seconds(settings.idle_timeout_seconds));
 	pools_[path].push_back(std::move(worker));
 	VGI_STDERR_DEBUG("[VGI] pool.release added worker_path=%s pool_size=%zu total=%zu\n",
 	                 path.c_str(), pools_[path].size(), TotalPoolSizeLocked());

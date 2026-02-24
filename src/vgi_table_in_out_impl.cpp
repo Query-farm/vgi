@@ -363,7 +363,7 @@ OperatorFinalizeResultType VgiTableInOutFinalize(ExecutionContext &context, Tabl
 				        {{"worker_path", bind_data.worker_path},
 				         {"function_name", bind_data.function_name},
 				         {"pid", std::to_string(pooled->GetPid())}});
-				VgiWorkerPool::Instance().Release(std::move(pooled), bind_data.max_pool_size);
+				VgiWorkerPool::Instance().Release(std::move(pooled));
 			}
 		}
 		return OperatorFinalizeResultType::FINISHED;
@@ -392,7 +392,7 @@ OperatorFinalizeResultType VgiTableInOutFinalize(ExecutionContext &context, Tabl
 				        {{"worker_path", bind_data.worker_path},
 				         {"function_name", bind_data.function_name},
 				         {"pid", std::to_string(pooled->GetPid())}});
-				VgiWorkerPool::Instance().Release(std::move(pooled), bind_data.max_pool_size);
+				VgiWorkerPool::Instance().Release(std::move(pooled));
 			}
 		}
 		return OperatorFinalizeResultType::FINISHED;
