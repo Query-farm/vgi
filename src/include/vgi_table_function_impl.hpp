@@ -12,6 +12,7 @@
 #include "vgi_arrow_utils.hpp"
 #include "vgi_catalog_api.hpp"
 #include "vgi_function_connection.hpp"
+#include "vgi_ifunction_connection.hpp"
 #include "vgi_logging.hpp"
 #include "vgi_worker_pool.hpp"
 
@@ -64,7 +65,7 @@ struct VgiTableFunctionBindData : public TableFunctionData {
 
 	// Connection from bind phase, persisted for reuse in InitGlobal.
 	// Mutable to allow InitGlobal to move it out (bind_data is const after bind).
-	mutable std::unique_ptr<FunctionConnection> bind_connection;
+	mutable std::unique_ptr<IFunctionConnection> bind_connection;
 };
 
 // ============================================================================
@@ -84,7 +85,7 @@ struct VgiTableFunctionGlobalState : public GlobalTableFunctionState {
 	// Primary connection (moved from bind_data during InitGlobal)
 	// Protected by mutex for thread-safe handoff to first InitLocal caller.
 	std::mutex connection_mutex;
-	std::unique_ptr<FunctionConnection> primary_connection;
+	std::unique_ptr<IFunctionConnection> primary_connection;
 
 	idx_t MaxThreads() const override {
 		return max_processes;
@@ -117,8 +118,8 @@ struct VgiTableFunctionLocalState : public ArrowScanLocalState {
 		}
 	}
 
-	// Connection to worker (owns the subprocess)
-	std::unique_ptr<FunctionConnection> connection;
+	// Connection to worker (owns the subprocess or HTTP state)
+	std::unique_ptr<IFunctionConnection> connection;
 
 	// Completion tracking
 	bool done = false;

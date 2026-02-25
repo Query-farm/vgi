@@ -16,6 +16,7 @@
 #include "duckdb/common/types/value.hpp"
 
 #include "vgi_arrow_utils.hpp"
+#include "vgi_ifunction_connection.hpp"
 #include "vgi_protocol.hpp"
 #include "vgi_subprocess.hpp"
 #include "vgi_worker_pool.hpp"
@@ -64,7 +65,7 @@ struct FunctionConnectionParams {
 
 // Result of AcquireAndBindConnection
 struct AcquireAndBindResult {
-	std::unique_ptr<FunctionConnection> connection;
+	std::unique_ptr<IFunctionConnection> connection;
 	BindResult bind_result;
 };
 
@@ -101,7 +102,7 @@ AcquireAndBindResult AcquireAndBindConnection(ClientContext &context, const Func
 //   Client sends 0-row "tick" batches, server responds with output batches
 // For scalar/table-in-out functions (exchange mode):
 //   Client sends input batches, server responds with output batches
-class FunctionConnection {
+class FunctionConnection : public IFunctionConnection {
 public:
 	// Create connection parameters (does not spawn worker yet)
 	// arguments: Arrow struct array with fields named positional_0, positional_1, etc.
@@ -121,17 +122,17 @@ public:
 	                   const std::vector<uint8_t> &global_execution_id = {}, bool worker_debug = false,
 	                   const std::map<std::string, std::string> &settings = {});
 
-	~FunctionConnection();
+	~FunctionConnection() override;
 
 	// Phase 1: Perform bind via vgi_rpc "bind" RPC call
 	// Spawns worker if needed, sends BindRequest, reads BindResponse
 	// Returns BindResult with output schema and opaque data
-	BindResult PerformBindFull();
+	BindResult PerformBindFull() override;
 
 	// Set the input schema for table-in-out/scalar functions
 	// Must be called before PerformBindFull() for table-in-out functions
 	// input_schema: Arrow schema describing the input data
-	void SetInputSchema(const std::shared_ptr<arrow::Schema> &input_schema);
+	void SetInputSchema(const std::shared_ptr<arrow::Schema> &input_schema) override;
 
 	// Phase 2: Perform init via vgi_rpc "init" RPC call
 	// Sends InitRequest, reads GlobalInitResponse, opens data streams
@@ -140,12 +141,12 @@ public:
 	// Optional phase parameter for FINALIZE init calls
 	InitResult PerformInit(const std::vector<int32_t> &projection_ids = {},
 	                       std::shared_ptr<arrow::Buffer> pushdown_filters = nullptr,
-	                       const std::string &phase = "");
+	                       const std::string &phase = "") override;
 
 	// Perform finalize init for table-in-out functions
 	// Closes current data streams, sends new init RPC with phase=FINALIZE
 	// Opens new data streams in producer mode (tick-based)
-	void PerformFinalizeInit();
+	void PerformFinalizeInit() override;
 
 	// ========================================================================
 	// Input Data (Scalar and Table-In-Out Functions)
@@ -154,18 +155,18 @@ public:
 	// Open input writer for sending input data batches
 	// Must be called after PerformInit() and before WriteInputBatch()
 	// For scalar and table-in-out functions
-	void OpenInputWriter();
+	void OpenInputWriter() override;
 
 	// Write an input batch (scalar and table-in-out functions)
 	// Must be called after OpenInputWriter()
-	void WriteInputBatch(const std::shared_ptr<arrow::RecordBatch> &batch);
+	void WriteInputBatch(const std::shared_ptr<arrow::RecordBatch> &batch) override;
 
 	// Close input writer (signals end of input to the worker)
 	// After this, the worker will send EOS on the output stream
-	void CloseInputWriter();
+	void CloseInputWriter() override;
 
 	// Check if this is a table-in-out function (has input schema)
-	bool IsTableInOut() const {
+	bool IsTableInOut() const override {
 		return input_schema_ != nullptr;
 	}
 
@@ -173,41 +174,41 @@ public:
 	// For producer mode: sends tick, reads response
 	// For exchange mode: reads response (caller must write input first)
 	// Returns nullptr when stream is exhausted (EOS)
-	std::shared_ptr<arrow::RecordBatch> ReadDataBatch();
+	std::shared_ptr<arrow::RecordBatch> ReadDataBatch() override;
 
 	// Check if data stream is exhausted
-	bool IsFinished() const {
+	bool IsFinished() const override {
 		return data_finished_;
 	}
 
 	// Mark the data phase as finished (for scalar functions after sending finalize)
 	// This allows the connection to be pooled without reading a FINISHED status
-	void MarkDataFinished() {
+	void MarkDataFinished() override {
 		data_finished_ = true;
 	}
 
 	// Get the worker process PID (returns -1 if not yet spawned)
-	pid_t GetPid() const {
+	pid_t GetPid() const override {
 		return proc_ ? proc_->GetPid() : -1;
 	}
 
 	// Get the execution ID as hex string (empty if init not done)
-	std::string GetExecutionIdHex() const;
+	std::string GetExecutionIdHex() const override;
 
 	// Get the attach ID as hex string (empty if no attach_id)
-	std::string GetAttachIdHex() const;
+	std::string GetAttachIdHex() const override;
 
 	// Wait for worker process to exit
-	int Wait();
+	int Wait() override;
 
 	// Check if this connection can be returned to the pool
 	// Returns true if data finished and subprocess is still alive
-	bool CanBePooled() const;
+	bool CanBePooled() const override;
 
 	// Release the subprocess for pooling (transfers ownership)
 	// Returns nullptr if cannot be pooled
 	// Stops stderr thread and releases subprocess ownership
-	std::unique_ptr<PooledWorker> ReleaseForPooling();
+	std::unique_ptr<PooledWorker> ReleaseForPooling() override;
 
 	// Non-copyable and non-movable (contains reference)
 	FunctionConnection(const FunctionConnection &) = delete;

@@ -55,7 +55,7 @@ void GetDuckDBTypesFromArrowTable(const ArrowTableSchema &arrow_table, const Arr
 
 		// Get DuckDB type from ArrowTableSchema
 		auto arrow_type = columns.at(i);
-		types.push_back(arrow_type->GetDuckType());
+		types.push_back(arrow_type->GetDuckType(true));
 	}
 }
 

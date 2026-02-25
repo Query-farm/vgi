@@ -480,7 +480,7 @@ unique_ptr<LocalTableFunctionState> VgiTableFunctionInitLocal(ExecutionContext &
 	}
 
 	// Try to claim the primary connection from global_state (thread-safe check-and-move)
-	std::unique_ptr<FunctionConnection> primary_connection;
+	std::unique_ptr<IFunctionConnection> primary_connection;
 	{
 		std::lock_guard<std::mutex> lock(global_state.connection_mutex);
 		if (global_state.primary_connection) {

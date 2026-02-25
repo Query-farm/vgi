@@ -216,6 +216,70 @@ SELECT example.sum_values(0.1::DOUBLE, 0.2::DOUBLE, 0.3::DOUBLE, 0.4::DOUBLE);
 1.0
 
 # ============================================================================
+# Return type validation (ANY type resolution via on_bind with varargs)
+# sum_values uses ArrowAny with varargs. The worker's on_bind takes the first
+# argument's type and promotes it one size up. All varargs are cast to the
+# same type by DuckDB. These tests ensure the type resolution is correct.
+# ============================================================================
+
+# INTEGER varargs -> first arg int32, promoted to BIGINT (int64)
+query I
+SELECT typeof(example.sum_values(1::INTEGER, 2::INTEGER, 3::INTEGER));
+----
+BIGINT
+
+# BIGINT varargs -> first arg int64, promoted to BIGINT (int64, no further promotion)
+query I
+SELECT typeof(example.sum_values(1::BIGINT, 2::BIGINT));
+----
+BIGINT
+
+# SMALLINT varargs -> first arg int16, promoted to INTEGER (int32)
+query I
+SELECT typeof(example.sum_values(1::SMALLINT, 2::SMALLINT, 3::SMALLINT));
+----
+INTEGER
+
+# TINYINT varargs -> first arg int8, promoted to SMALLINT (int16)
+query I
+SELECT typeof(example.sum_values(1::TINYINT, 2::TINYINT));
+----
+SMALLINT
+
+# DOUBLE varargs -> first arg float64, no promotion for floats -> DOUBLE
+query I
+SELECT typeof(example.sum_values(1.0::DOUBLE, 2.0::DOUBLE, 3.0::DOUBLE));
+----
+DOUBLE
+
+# FLOAT varargs -> first arg float32, no promotion for floats -> FLOAT
+query I
+SELECT typeof(example.sum_values(1.0::FLOAT, 2.0::FLOAT));
+----
+FLOAT
+
+# Single argument type resolution
+query I
+SELECT typeof(example.sum_values(42::INTEGER));
+----
+BIGINT
+
+query I
+SELECT typeof(example.sum_values(42::TINYINT));
+----
+SMALLINT
+
+# Note: typeof() with NULL args returns "NULL" because DuckDB short-circuits
+# scalar NULLs before the worker bind resolves the output type
+
+# Verify type is consistent across batch
+query I
+SELECT CASE WHEN COUNT(DISTINCT typeof(result)) = 1 AND MIN(typeof(result)) = 'BIGINT' THEN 'OK' ELSE 'FAIL' END
+FROM (SELECT example.sum_values(a, b, c) AS result FROM (VALUES (1, 2, 3), (4, 5, 6), (7, 8, 9)) t(a, b, c));
+----
+OK
+
+# ============================================================================
 # NULL handling
 # ============================================================================
 

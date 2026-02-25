@@ -161,6 +161,59 @@ SELECT example.double(1.5::FLOAT);
 3.0
 
 # ============================================================================
+# Return type validation (ANY type resolution via on_bind)
+# The double function uses ArrowAny input/output types. The worker's on_bind
+# promotes the output type to prevent overflow: int promotes up one size,
+# float/double stay the same. These tests ensure the type resolution is correct.
+# ============================================================================
+
+# INTEGER (int32) input -> BIGINT (int64) output
+query I
+SELECT typeof(example.double(1::INTEGER));
+----
+BIGINT
+
+# BIGINT (int64) input -> BIGINT (int64) output (no further promotion)
+query I
+SELECT typeof(example.double(1::BIGINT));
+----
+BIGINT
+
+# SMALLINT (int16) input -> INTEGER (int32) output
+query I
+SELECT typeof(example.double(1::SMALLINT));
+----
+INTEGER
+
+# TINYINT (int8) input -> SMALLINT (int16) output
+query I
+SELECT typeof(example.double(1::TINYINT));
+----
+SMALLINT
+
+# DOUBLE (float64) input -> DOUBLE (float64) output (no promotion for floats)
+query I
+SELECT typeof(example.double(1.0::DOUBLE));
+----
+DOUBLE
+
+# FLOAT (float32) input -> FLOAT (float32) output (no promotion for floats)
+query I
+SELECT typeof(example.double(1.0::FLOAT));
+----
+FLOAT
+
+# Verify type is consistent across multiple rows
+query I
+SELECT CASE WHEN COUNT(DISTINCT typeof(result)) = 1 AND MIN(typeof(result)) = 'BIGINT' THEN 'OK' ELSE 'FAIL' END
+FROM (SELECT example.double(x) AS result FROM (VALUES (1), (2), (3)) t(x));
+----
+OK
+
+# Note: typeof(example.double(NULL::INTEGER)) returns "NULL" because DuckDB
+# short-circuits scalar NULLs before the worker bind resolves the output type
+
+# ============================================================================
 # NULL handling
 # ============================================================================
 

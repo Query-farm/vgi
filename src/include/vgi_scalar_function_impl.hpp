@@ -16,7 +16,7 @@ namespace duckdb {
 
 // Forward declaration
 namespace vgi {
-class FunctionConnection;
+class IFunctionConnection;
 }
 
 // ============================================================================
@@ -76,7 +76,7 @@ struct VgiScalarFunctionBindData : public FunctionData {
 	// Copies (plan caching) get nullptr — execute falls back to pool/fresh.
 	// Protected by bind_connection_mutex for thread-safe move in execute.
 	mutable std::mutex bind_connection_mutex;
-	mutable std::unique_ptr<vgi::FunctionConnection> bind_connection;
+	mutable std::unique_ptr<vgi::IFunctionConnection> bind_connection;
 
 	unique_ptr<FunctionData> Copy() const override {
 		auto copy = make_uniq<VgiScalarFunctionBindData>();
@@ -112,7 +112,7 @@ struct VgiScalarFunctionLocalState : public FunctionLocalState {
 	~VgiScalarFunctionLocalState() override;
 
 	// Active connection to worker (created lazily on first execute)
-	std::unique_ptr<vgi::FunctionConnection> connection;
+	std::unique_ptr<vgi::IFunctionConnection> connection;
 
 	// Whether connection has been initialized
 	bool initialized = false;

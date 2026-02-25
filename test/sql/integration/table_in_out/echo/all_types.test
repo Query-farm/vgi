@@ -1,0 +1,244 @@
+# name: test/sql/integration/table_in_out/echo/all_types.test
+# description: Echo test_all_types() through VGI table-in-out and verify round-trip fidelity
+# group: [vgi]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+SET arrow_lossless_conversion = true;
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# Round-trip test_all_types() through echo
+# Verifies that every supported type survives the DuckDB -> Arrow IPC ->
+# Python worker -> Arrow IPC -> DuckDB round-trip unchanged.
+#
+# Time columns (time, time_tz, time_ns) are excluded from the main view
+# because DuckDB's max TIME value (24:00:00) is outside Arrow's exclusive
+# upper bound, causing PyArrow validation to reject it. They are tested
+# separately with a filtered source that excludes the 24:00:00 row.
+# ============================================================================
+
+statement ok
+CREATE OR REPLACE VIEW all_types AS SELECT * EXCLUDE (time, time_tz, time_ns) FROM test_all_types();
+
+# ----------------------------------------------------------------------------
+# Integer types (signed and unsigned)
+# ----------------------------------------------------------------------------
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT bool, tinyint, smallint, int, bigint, hugeint, uhugeint,
+           utinyint, usmallint, uint, ubigint
+    FROM example.echo((
+        SELECT bool, tinyint, smallint, int, bigint, hugeint, uhugeint,
+               utinyint, usmallint, uint, ubigint
+        FROM all_types
+    ))
+    EXCEPT
+    SELECT bool, tinyint, smallint, int, bigint, hugeint, uhugeint,
+           utinyint, usmallint, uint, ubigint
+    FROM all_types
+);
+----
+0
+
+# ----------------------------------------------------------------------------
+# Float, double, and decimal types
+# ----------------------------------------------------------------------------
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT float, double, dec_4_1, dec_9_4, dec_18_6, dec38_10, bignum
+    FROM example.echo((
+        SELECT float, double, dec_4_1, dec_9_4, dec_18_6, dec38_10, bignum
+        FROM all_types
+    ))
+    EXCEPT
+    SELECT float, double, dec_4_1, dec_9_4, dec_18_6, dec38_10, bignum
+    FROM all_types
+);
+----
+0
+
+# ----------------------------------------------------------------------------
+# Date, timestamp, and interval types
+# ----------------------------------------------------------------------------
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT date, timestamp, timestamp_s, timestamp_ms, timestamp_ns,
+           timestamp_tz, interval
+    FROM example.echo((
+        SELECT date, timestamp, timestamp_s, timestamp_ms, timestamp_ns,
+               timestamp_tz, interval
+        FROM all_types
+    ))
+    EXCEPT
+    SELECT date, timestamp, timestamp_s, timestamp_ms, timestamp_ns,
+           timestamp_tz, interval
+    FROM all_types
+);
+----
+0
+
+# ----------------------------------------------------------------------------
+# Time types (excluding 24:00:00 which exceeds Arrow's exclusive upper bound)
+# ----------------------------------------------------------------------------
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT time, time_tz, time_ns
+    FROM example.echo((
+        SELECT time, time_tz, time_ns
+        FROM test_all_types()
+        WHERE time IS DISTINCT FROM '24:00:00'::TIME
+    ))
+    EXCEPT
+    SELECT time, time_tz, time_ns
+    FROM test_all_types()
+    WHERE time IS DISTINCT FROM '24:00:00'::TIME
+);
+----
+0
+
+# ----------------------------------------------------------------------------
+# String, blob, and UUID types
+# ----------------------------------------------------------------------------
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT varchar, blob, uuid
+    FROM example.echo((
+        SELECT varchar, blob, uuid
+        FROM all_types
+    ))
+    EXCEPT
+    SELECT varchar, blob, uuid
+    FROM all_types
+);
+----
+0
+
+# ----------------------------------------------------------------------------
+# List / array types
+# ----------------------------------------------------------------------------
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT int_array, double_array, date_array, timestamp_array,
+           timestamptz_array, varchar_array, nested_int_array
+    FROM example.echo((
+        SELECT int_array, double_array, date_array, timestamp_array,
+               timestamptz_array, varchar_array, nested_int_array
+        FROM all_types
+    ))
+    EXCEPT
+    SELECT int_array, double_array, date_array, timestamp_array,
+           timestamptz_array, varchar_array, nested_int_array
+    FROM all_types
+);
+----
+0
+
+# ----------------------------------------------------------------------------
+# Struct, map, and union types
+# ----------------------------------------------------------------------------
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT struct, struct_of_arrays, array_of_structs, map, "union"
+    FROM example.echo((
+        SELECT struct, struct_of_arrays, array_of_structs, map, "union"
+        FROM all_types
+    ))
+    EXCEPT
+    SELECT struct, struct_of_arrays, array_of_structs, map, "union"
+    FROM all_types
+);
+----
+0
+
+# ----------------------------------------------------------------------------
+# Fixed-size array types
+# ----------------------------------------------------------------------------
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT fixed_int_array, fixed_varchar_array,
+           fixed_nested_int_array, fixed_nested_varchar_array,
+           fixed_struct_array, struct_of_fixed_array,
+           fixed_array_of_int_list, list_of_fixed_int_array
+    FROM example.echo((
+        SELECT fixed_int_array, fixed_varchar_array,
+               fixed_nested_int_array, fixed_nested_varchar_array,
+               fixed_struct_array, struct_of_fixed_array,
+               fixed_array_of_int_list, list_of_fixed_int_array
+        FROM all_types
+    ))
+    EXCEPT
+    SELECT fixed_int_array, fixed_varchar_array,
+           fixed_nested_int_array, fixed_nested_varchar_array,
+           fixed_struct_array, struct_of_fixed_array,
+           fixed_array_of_int_list, list_of_fixed_int_array
+    FROM all_types
+);
+----
+0
+
+# ----------------------------------------------------------------------------
+# Enum types (echoed as VARCHAR due to dictionary type resolution)
+# Both sides cast to VARCHAR for comparison since the DuckDB return type
+# is VARCHAR rather than ENUM after the Arrow round-trip.
+# ----------------------------------------------------------------------------
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT small_enum::VARCHAR as small_enum,
+           medium_enum::VARCHAR as medium_enum,
+           large_enum::VARCHAR as large_enum
+    FROM example.echo((
+        SELECT small_enum, medium_enum, large_enum
+        FROM all_types
+    ))
+    EXCEPT
+    SELECT small_enum::VARCHAR as small_enum,
+           medium_enum::VARCHAR as medium_enum,
+           large_enum::VARCHAR as large_enum
+    FROM all_types
+);
+----
+0
+
+# ----------------------------------------------------------------------------
+# Reverse EXCEPT: verify echo doesn't produce extra rows
+# ----------------------------------------------------------------------------
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM all_types
+    EXCEPT
+    SELECT * FROM example.echo((SELECT * FROM all_types))
+);
+----
+0
+
+# ----------------------------------------------------------------------------
+# Row count check
+# ----------------------------------------------------------------------------
+
+query I
+SELECT COUNT(*) FROM example.echo((SELECT * FROM all_types));
+----
+3
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;

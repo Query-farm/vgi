@@ -164,6 +164,70 @@ SELECT example.add_values(1::INTEGER, 2.5::DOUBLE);
 3.5
 
 # ============================================================================
+# Return type validation (ANY type resolution via on_bind)
+# add_values uses ArrowAny for both input params and the output. The worker's
+# on_bind finds the common type of both inputs, then promotes it one size up
+# for overflow safety. These tests ensure the type resolution is correct.
+# ============================================================================
+
+# INTEGER + INTEGER -> common int32, promoted to BIGINT (int64)
+query I
+SELECT typeof(example.add_values(1::INTEGER, 2::INTEGER));
+----
+BIGINT
+
+# BIGINT + BIGINT -> common int64, promoted to BIGINT (int64, no further promotion)
+query I
+SELECT typeof(example.add_values(1::BIGINT, 2::BIGINT));
+----
+BIGINT
+
+# SMALLINT + SMALLINT -> common int16, promoted to INTEGER (int32)
+query I
+SELECT typeof(example.add_values(1::SMALLINT, 2::SMALLINT));
+----
+INTEGER
+
+# TINYINT + TINYINT -> common int8, promoted to SMALLINT (int16)
+query I
+SELECT typeof(example.add_values(1::TINYINT, 2::TINYINT));
+----
+SMALLINT
+
+# DOUBLE + DOUBLE -> common float64, no promotion for floats -> DOUBLE
+query I
+SELECT typeof(example.add_values(1.0::DOUBLE, 2.0::DOUBLE));
+----
+DOUBLE
+
+# FLOAT + FLOAT -> common float32, no promotion for floats -> FLOAT
+query I
+SELECT typeof(example.add_values(1.0::FLOAT, 2.0::FLOAT));
+----
+FLOAT
+
+# Mixed: INTEGER + DOUBLE -> common float64 (Arrow upcasts int32 to float64), promoted to DOUBLE
+query I
+SELECT typeof(example.add_values(1::INTEGER, 2.5::DOUBLE));
+----
+DOUBLE
+
+# Mixed: SMALLINT + BIGINT -> common int64, promoted to BIGINT
+query I
+SELECT typeof(example.add_values(1::SMALLINT, 2::BIGINT));
+----
+BIGINT
+
+# Mixed: INTEGER + BIGINT -> common int64, promoted to BIGINT
+query I
+SELECT typeof(example.add_values(1::INTEGER, 2::BIGINT));
+----
+BIGINT
+
+# Note: typeof() with NULL args returns "NULL" because DuckDB short-circuits
+# scalar NULLs before the worker bind resolves the output type
+
+# ============================================================================
 # NULL handling
 # ============================================================================
 

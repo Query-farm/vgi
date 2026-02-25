@@ -27,6 +27,9 @@ src/vgi_arrow_ipc.cpp
 src/vgi_arrow_utils.cpp
 src/vgi_rpc_client.cpp
 src/vgi_rpc_types.cpp
+src/vgi_transport.cpp
+src/vgi_http_client.cpp
+src/vgi_http_function_connection.cpp
 src/vgi_catalogs.cpp
 src/vgi_table_function.cpp
 src/vgi_table_function_impl.cpp

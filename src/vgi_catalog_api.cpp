@@ -7,9 +7,11 @@
 #include "vgi_arrow_ipc.hpp"
 #include "vgi_arrow_utils.hpp"
 #include "vgi_exception.hpp"
+#include "vgi_http_client.hpp"
 #include "vgi_logging.hpp"
 #include "vgi_rpc_client.hpp"
 #include "vgi_rpc_types.hpp"
+#include "vgi_transport.hpp"
 #include "yyjson.hpp"
 
 using namespace duckdb_yyjson; // NOLINT
@@ -23,10 +25,16 @@ namespace vgi {
 
 // Invoke a unary RPC catalog method and return the raw unary response.
 // Handles worker lifecycle: acquire from pool, send request, read response, return to pool.
+// For HTTP transport, dispatches to HttpInvokeUnary instead.
 static UnaryResponseResult InvokeRpcMethod(const std::string &worker_path, const std::string &method_name,
                                             const std::shared_ptr<arrow::RecordBatch> &params, ClientContext &context,
                                             bool worker_debug, bool use_pool) {
-	// Acquire worker from pool or spawn fresh
+	// HTTP transport: dispatch to HttpInvokeUnary
+	if (IsHttpTransport(worker_path)) {
+		return HttpInvokeUnary(context, worker_path, method_name, params);
+	}
+
+	// Subprocess transport: acquire worker from pool or spawn fresh
 	std::unique_ptr<SubProcess> proc;
 
 	if (use_pool) {

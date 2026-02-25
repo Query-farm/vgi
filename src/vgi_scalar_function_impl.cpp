@@ -2,7 +2,9 @@
 #include "vgi_arrow_utils.hpp"
 #include "vgi_catalog_api.hpp"
 #include "vgi_function_connection.hpp"
+#include "vgi_ifunction_connection.hpp"
 #include "vgi_logging.hpp"
+#include "vgi_transport.hpp"
 #include "vgi_worker_pool.hpp"
 
 #include "duckdb/common/arrow/arrow_appender.hpp"
@@ -173,7 +175,7 @@ unique_ptr<FunctionData> VgiScalarFunctionBind(ClientContext &context, ScalarFun
 	// Phase 5: Connect to worker and perform bind to get output schema
 	// ========================================================================
 	std::shared_ptr<arrow::Schema> output_schema;
-	std::unique_ptr<FunctionConnection> bind_connection;
+	std::unique_ptr<IFunctionConnection> bind_connection;
 
 	// For functions with const params, skip the worker call on re-bind (const values were already extracted)
 	// For functions without const params (but with dynamic return type), always call the worker
@@ -185,17 +187,17 @@ unique_ptr<FunctionData> VgiScalarFunctionBind(ClientContext &context, ScalarFun
 		output_schema = func_info.output_schema;
 	} else {
 		// Initial bind - call worker to get output schema
-		std::unique_ptr<FunctionConnection> connection;
-		if (func_info.use_pool) {
+		std::unique_ptr<IFunctionConnection> connection;
+		if (func_info.use_pool && !IsHttpTransport(func_info.worker_path)) {
 			auto pooled = VgiWorkerPool::Instance().TryAcquire(func_info.worker_path);
 			if (pooled) {
-				connection = std::make_unique<FunctionConnection>(
+				connection = CreateFunctionConnectionFromPool(
 				    std::move(pooled), func_info.function_name, arrow_arguments, func_info.attach_id, context,
 				    "SCALAR", std::vector<uint8_t>{}, func_info.worker_debug, func_info.settings);
 			}
 		}
 		if (!connection) {
-			connection = std::make_unique<FunctionConnection>(
+			connection = CreateFunctionConnection(
 			    func_info.worker_path, func_info.function_name, arrow_arguments, func_info.attach_id, context,
 			    "SCALAR", std::vector<uint8_t>{}, func_info.worker_debug, func_info.settings);
 		}
@@ -307,7 +309,7 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 		ArrowArguments arguments = BuildArgumentsFromValues(context, positional_args, {});
 
 		// Acquire connection: reuse bind connection, try pool, or spawn fresh
-		std::unique_ptr<FunctionConnection> connection;
+		std::unique_ptr<IFunctionConnection> connection;
 		bool reused_bind_connection = false;
 		bool use_pool = bind_data ? bind_data->use_pool : func_info.use_pool;
 		const auto &worker_path = bind_data ? bind_data->worker_path : func_info.worker_path;
@@ -328,12 +330,12 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 		}
 
 		// Fall back to pool or fresh connection
-		if (!connection && use_pool) {
+		if (!connection && use_pool && !IsHttpTransport(worker_path)) {
 			auto pooled = VgiWorkerPool::Instance().TryAcquire(worker_path);
 			if (pooled) {
 				VGI_STDERR_DEBUG("[VGI] scalar.pool_acquire result=hit worker_path=%s pid=%d\n",
 				                 worker_path.c_str(), pooled->GetPid());
-				connection = std::make_unique<FunctionConnection>(
+				connection = CreateFunctionConnectionFromPool(
 				    std::move(pooled), function_name, arguments, attach_id, context,
 				    "SCALAR", std::vector<uint8_t>{}, worker_debug, settings);
 			} else {
@@ -341,7 +343,7 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 			}
 		}
 		if (!connection) {
-			connection = std::make_unique<FunctionConnection>(
+			connection = CreateFunctionConnection(
 			    worker_path, function_name, arguments, attach_id, context,
 			    "SCALAR", std::vector<uint8_t>{}, worker_debug, settings);
 			VGI_STDERR_DEBUG("[VGI] scalar.new_connection worker_path=%s pid=%d\n",

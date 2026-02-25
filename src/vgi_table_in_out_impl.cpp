@@ -2,7 +2,9 @@
 #include "vgi_arrow_utils.hpp"
 #include "vgi_catalog_api.hpp"
 #include "vgi_function_connection.hpp"
+#include "vgi_ifunction_connection.hpp"
 #include "vgi_logging.hpp"
+#include "vgi_transport.hpp"
 #include "vgi_worker_pool.hpp"
 
 #include "duckdb/common/arrow/arrow_appender.hpp"
@@ -10,8 +12,6 @@
 #include "duckdb/function/table/arrow.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/config.hpp"
-
-#include <arrow/c/bridge.h>
 
 namespace duckdb {
 namespace vgi {
@@ -57,8 +57,6 @@ VgiTableInOutGlobalState::~VgiTableInOutGlobalState() = default;
 // ============================================================================
 // Local State for Table-In-Out Functions
 // ============================================================================
-
-VgiTableInOutLocalState::VgiTableInOutLocalState() = default;
 
 VgiTableInOutLocalState::~VgiTableInOutLocalState() = default;
 
@@ -106,10 +104,10 @@ unique_ptr<FunctionData> VgiTableInOutBind(ClientContext &context, TableFunction
 	         {"input_columns", std::to_string(input.input_table_types.size())}});
 
 	// Create the connection and perform bind
-	// Try pool first
-	std::unique_ptr<FunctionConnection> connection;
+	// Try pool first (only for subprocess transport)
+	std::unique_ptr<IFunctionConnection> connection;
 	bool from_pool = false;
-	if (bind_data->use_pool) {
+	if (bind_data->use_pool && !IsHttpTransport(bind_data->worker_path)) {
 		auto pooled = VgiWorkerPool::Instance().TryAcquire(bind_data->worker_path);
 		if (pooled) {
 			from_pool = true;
@@ -118,17 +116,17 @@ unique_ptr<FunctionData> VgiTableInOutBind(ClientContext &context, TableFunction
 			         {"function_name", bind_data->function_name},
 			         {"from_pool", "true"},
 			         {"pid", std::to_string(pooled->GetPid())}});
-			connection = std::make_unique<FunctionConnection>(std::move(pooled), bind_data->function_name,
-			                                                   bind_data->arguments, bind_data->attach_id, context,
-			                                                   "TABLE", std::vector<uint8_t>{},
-			                                                   bind_data->worker_debug, bind_data->settings);
+			connection = CreateFunctionConnectionFromPool(std::move(pooled), bind_data->function_name,
+			                                              bind_data->arguments, bind_data->attach_id, context,
+			                                              "TABLE", std::vector<uint8_t>{},
+			                                              bind_data->worker_debug, bind_data->settings);
 		}
 	}
 	if (!connection) {
-		connection = std::make_unique<FunctionConnection>(bind_data->worker_path, bind_data->function_name,
-		                                                   bind_data->arguments, bind_data->attach_id, context,
-		                                                   "TABLE", std::vector<uint8_t>{},
-		                                                   bind_data->worker_debug, bind_data->settings);
+		connection = CreateFunctionConnection(bind_data->worker_path, bind_data->function_name,
+		                                      bind_data->arguments, bind_data->attach_id, context,
+		                                      "TABLE", std::vector<uint8_t>{},
+		                                      bind_data->worker_debug, bind_data->settings);
 		if (!from_pool) {
 			VGI_LOG(context, "table_in_out.pool_acquire",
 			        {{"worker_path", bind_data->worker_path},
@@ -148,10 +146,9 @@ unique_ptr<FunctionData> VgiTableInOutBind(ClientContext &context, TableFunction
 	bind_data->max_processes = 1;
 	bind_data->cardinality_estimate = -1;
 
-	// Convert Arrow schema to DuckDB return types
-	ArrowSchemaWrapper c_schema_out;
-	ArrowTableSchema arrow_table_out;
-	ArrowSchemaToDuckDBTypes(context, bind_data->output_schema, c_schema_out, arrow_table_out, return_types, names);
+	// Convert Arrow schema to DuckDB return types (stored for ArrowToDuckDB in scan)
+	ArrowSchemaToDuckDBTypes(context, bind_data->output_schema, bind_data->c_schema, bind_data->arrow_table,
+	                         return_types, names);
 
 	// Store the connection for use in init
 	bind_data->bind_connection = std::move(connection);
@@ -196,61 +193,42 @@ unique_ptr<GlobalTableFunctionState> VgiTableInOutInitGlobal(ClientContext &cont
 
 unique_ptr<LocalTableFunctionState> VgiTableInOutInitLocal(ExecutionContext &context, TableFunctionInitInput &input,
                                                             GlobalTableFunctionState *global_state_p) {
-	auto local_state = make_uniq<VgiTableInOutLocalState>();
-	// Currently no per-thread state needed
+	auto current_chunk = make_uniq<ArrowArrayWrapper>();
+	auto local_state = make_uniq<VgiTableInOutLocalState>(std::move(current_chunk), context.client);
 	return local_state;
 }
 
 // ============================================================================
-// Arrow Batch to DuckDB DataChunk Conversion Helper
+// Arrow Batch to DuckDB DataChunk Conversion Helpers
 // ============================================================================
 
-static idx_t CopyArrowBatchToOutput(const std::shared_ptr<arrow::RecordBatch> &batch, DataChunk &output) {
-	ArrowArrayWrapper arr_wrapper;
-	ExportRecordBatch(batch, arr_wrapper);
+//! Load an Arrow C++ RecordBatch into the ArrowScanLocalState for consumption.
+//! Must call Reset() to clear stale owned_data references before loading a new batch.
+static void LoadBatchIntoScanState(VgiTableInOutLocalState &local_state,
+                                   const std::shared_ptr<arrow::RecordBatch> &batch) {
+	auto chunk = make_uniq<ArrowArrayWrapper>();
+	ExportRecordBatch(batch, *chunk);
+	local_state.chunk = shared_ptr<ArrowArrayWrapper>(chunk.release());
+	local_state.chunk_offset = 0;
+	local_state.Reset();
+}
 
-	idx_t rows_to_copy = MinValue<idx_t>(batch->num_rows(), STANDARD_VECTOR_SIZE);
-	output.SetCardinality(rows_to_copy);
+//! Check whether the local state has remaining rows to produce from the current batch.
+static bool HasRemainingBatchData(const VgiTableInOutLocalState &local_state) {
+	return local_state.chunk && local_state.chunk->arrow_array.release &&
+	       local_state.chunk_offset < static_cast<idx_t>(local_state.chunk->arrow_array.length);
+}
 
-	for (idx_t col_idx = 0; col_idx < output.ColumnCount() && col_idx < static_cast<idx_t>(batch->num_columns());
-	     col_idx++) {
-		ArrowArray *child_array = arr_wrapper.arrow_array.children[col_idx];
-
-		auto col_status = arrow::ImportArray(child_array, batch->schema()->field(col_idx)->type());
-		if (!col_status.ok()) {
-			throw IOException("Failed to import Arrow column: %s", col_status.status().ToString());
-		}
-		auto arrow_array = col_status.ValueUnsafe();
-
-		for (idx_t row_idx = 0; row_idx < rows_to_copy; row_idx++) {
-			if (arrow_array->IsNull(row_idx)) {
-				FlatVector::SetNull(output.data[col_idx], row_idx, true);
-			} else {
-				auto &out_vec = output.data[col_idx];
-				auto out_type = out_vec.GetType();
-
-				if (out_type == LogicalType::BIGINT) {
-					auto int_array = std::static_pointer_cast<arrow::Int64Array>(arrow_array);
-					FlatVector::GetData<int64_t>(out_vec)[row_idx] = int_array->Value(row_idx);
-				} else if (out_type == LogicalType::INTEGER) {
-					auto int_array = std::static_pointer_cast<arrow::Int32Array>(arrow_array);
-					FlatVector::GetData<int32_t>(out_vec)[row_idx] = int_array->Value(row_idx);
-				} else if (out_type == LogicalType::DOUBLE) {
-					auto dbl_array = std::static_pointer_cast<arrow::DoubleArray>(arrow_array);
-					FlatVector::GetData<double>(out_vec)[row_idx] = dbl_array->Value(row_idx);
-				} else if (out_type == LogicalType::VARCHAR) {
-					auto str_array = std::static_pointer_cast<arrow::StringArray>(arrow_array);
-					FlatVector::GetData<string_t>(out_vec)[row_idx] =
-					    StringVector::AddString(out_vec, str_array->GetString(row_idx));
-				} else if (out_type == LogicalType::BOOLEAN) {
-					auto bool_array = std::static_pointer_cast<arrow::BooleanArray>(arrow_array);
-					FlatVector::GetData<bool>(out_vec)[row_idx] = bool_array->Value(row_idx);
-				}
-			}
-		}
-	}
-
-	return rows_to_copy;
+//! Produce one DataChunk (up to STANDARD_VECTOR_SIZE rows) from the current batch,
+//! advancing chunk_offset. Returns the number of rows produced.
+static idx_t ProduceOutputFromBatch(VgiTableInOutLocalState &local_state, const ArrowTableSchema &arrow_table,
+                                    DataChunk &output) {
+	idx_t remaining = static_cast<idx_t>(local_state.chunk->arrow_array.length) - local_state.chunk_offset;
+	idx_t output_size = MinValue<idx_t>(STANDARD_VECTOR_SIZE, remaining);
+	output.SetCardinality(output_size);
+	ArrowTableFunction::ArrowToDuckDB(local_state, arrow_table.GetColumns(), output, false);
+	local_state.chunk_offset += output.size();
+	return output.size();
 }
 
 // ============================================================================
@@ -261,33 +239,37 @@ OperatorResultType VgiTableInOutFunction(ExecutionContext &context, TableFunctio
                                           DataChunk &input, DataChunk &output) {
 	auto &bind_data = data.bind_data->Cast<VgiTableInOutBindData>();
 	auto &global_state = data.global_state->Cast<VgiTableInOutGlobalState>();
+	auto &local_state = data.local_state->Cast<VgiTableInOutLocalState>();
 	auto &client_context = context.client;
 
 	if (!global_state.connection) {
 		throw InternalException("VgiTableInOutFunction: connection is null");
 	}
 
-	// Check for pending output from a previous call that produced more rows
-	// than STANDARD_VECTOR_SIZE. Process pending output before reading new input.
-	std::shared_ptr<arrow::RecordBatch> output_batch;
-	if (global_state.pending_output) {
-		output_batch = global_state.pending_output;
-		global_state.pending_output = nullptr;
-	} else {
-		// Convert input DataChunk to Arrow RecordBatch
-		auto input_batch = DataChunkToArrow(client_context, input, bind_data.input_schema);
-
-		VGI_LOG(client_context, "table_in_out.write_input",
+	// Continue producing rows from a batch that exceeded STANDARD_VECTOR_SIZE
+	if (HasRemainingBatchData(local_state)) {
+		idx_t rows_copied = ProduceOutputFromBatch(local_state, bind_data.arrow_table, output);
+		VGI_LOG(client_context, "table_in_out.read_output",
 		        {{"worker_path", bind_data.worker_path},
 		         {"function_name", bind_data.function_name},
-		         {"input_rows", std::to_string(input_batch->num_rows())}});
-
-		// Write the input batch to the worker
-		global_state.connection->WriteInputBatch(input_batch);
-
-		// Read output batch (1:1 lockstep in exchange mode)
-		output_batch = global_state.connection->ReadDataBatch();
+		         {"output_rows", std::to_string(rows_copied)}});
+		return HasRemainingBatchData(local_state) ? OperatorResultType::HAVE_MORE_OUTPUT
+		                                          : OperatorResultType::NEED_MORE_INPUT;
 	}
+
+	// Convert input DataChunk to Arrow RecordBatch
+	auto input_batch = DataChunkToArrow(client_context, input, bind_data.input_schema);
+
+	VGI_LOG(client_context, "table_in_out.write_input",
+	        {{"worker_path", bind_data.worker_path},
+	         {"function_name", bind_data.function_name},
+	         {"input_rows", std::to_string(input_batch->num_rows())}});
+
+	// Write the input batch to the worker
+	global_state.connection->WriteInputBatch(input_batch);
+
+	// Read output batch (1:1 lockstep in exchange mode)
+	auto output_batch = global_state.connection->ReadDataBatch();
 
 	if (!output_batch) {
 		// EOS - stream exhausted
@@ -301,21 +283,17 @@ OperatorResultType VgiTableInOutFunction(ExecutionContext &context, TableFunctio
 		return OperatorResultType::NEED_MORE_INPUT;
 	}
 
-	// Convert and copy rows to output DataChunk
-	idx_t rows_copied = CopyArrowBatchToOutput(output_batch, output);
+	// Load batch into scan state and produce output
+	LoadBatchIntoScanState(local_state, output_batch);
+	idx_t rows_copied = ProduceOutputFromBatch(local_state, bind_data.arrow_table, output);
 
 	VGI_LOG(client_context, "table_in_out.read_output",
 	        {{"worker_path", bind_data.worker_path},
 	         {"function_name", bind_data.function_name},
 	         {"output_rows", std::to_string(rows_copied)}});
 
-	// If the output batch had more rows than we could copy, save the remainder
-	if (static_cast<idx_t>(output_batch->num_rows()) > rows_copied) {
-		global_state.pending_output = output_batch->Slice(rows_copied);
-		return OperatorResultType::HAVE_MORE_OUTPUT;
-	}
-
-	return OperatorResultType::NEED_MORE_INPUT;
+	return HasRemainingBatchData(local_state) ? OperatorResultType::HAVE_MORE_OUTPUT
+	                                          : OperatorResultType::NEED_MORE_INPUT;
 }
 
 // ============================================================================
@@ -325,6 +303,7 @@ OperatorResultType VgiTableInOutFunction(ExecutionContext &context, TableFunctio
 OperatorFinalizeResultType VgiTableInOutFinalize(ExecutionContext &context, TableFunctionInput &data, DataChunk &output) {
 	auto &bind_data = data.bind_data->Cast<VgiTableInOutBindData>();
 	auto &global_state = data.global_state->Cast<VgiTableInOutGlobalState>();
+	auto &local_state = data.local_state->Cast<VgiTableInOutLocalState>();
 	auto &client_context = context.client;
 
 	if (!global_state.connection) {
@@ -342,17 +321,22 @@ OperatorFinalizeResultType VgiTableInOutFinalize(ExecutionContext &context, Tabl
 		        {{"worker_path", bind_data.worker_path}, {"function_name", bind_data.function_name}});
 	}
 
-	// Process pending or new output batch
-	std::shared_ptr<arrow::RecordBatch> output_batch;
-	if (global_state.pending_output) {
-		output_batch = global_state.pending_output;
-		global_state.pending_output = nullptr;
-	} else {
-		// Read output batch from worker
-		VGI_LOG(client_context, "table_in_out.finalize_reading",
-		        {{"worker_path", bind_data.worker_path}, {"function_name", bind_data.function_name}});
-		output_batch = global_state.connection->ReadDataBatch();
+	// Continue producing rows from a batch that exceeded STANDARD_VECTOR_SIZE
+	if (HasRemainingBatchData(local_state)) {
+		idx_t rows_copied = ProduceOutputFromBatch(local_state, bind_data.arrow_table, output);
+		VGI_LOG(client_context, "table_in_out.finalize_output",
+		        {{"worker_path", bind_data.worker_path},
+		         {"function_name", bind_data.function_name},
+		         {"output_rows", std::to_string(rows_copied)}});
+		// Always return HAVE_MORE_OUTPUT — next call will either continue this batch
+		// or read the next one from the worker
+		return OperatorFinalizeResultType::HAVE_MORE_OUTPUT;
 	}
+
+	// Read next output batch from worker
+	VGI_LOG(client_context, "table_in_out.finalize_reading",
+	        {{"worker_path", bind_data.worker_path}, {"function_name", bind_data.function_name}});
+	auto output_batch = global_state.connection->ReadDataBatch();
 
 	if (!output_batch || output_batch->num_rows() == 0) {
 		// No more output - clean up
@@ -369,22 +353,17 @@ OperatorFinalizeResultType VgiTableInOutFinalize(ExecutionContext &context, Tabl
 		return OperatorFinalizeResultType::FINISHED;
 	}
 
-	// Convert and copy rows to output DataChunk
-	idx_t rows_copied = CopyArrowBatchToOutput(output_batch, output);
+	// Load batch into scan state and produce output
+	LoadBatchIntoScanState(local_state, output_batch);
+	idx_t rows_copied = ProduceOutputFromBatch(local_state, bind_data.arrow_table, output);
 
 	VGI_LOG(client_context, "table_in_out.finalize_output",
 	        {{"worker_path", bind_data.worker_path},
 	         {"function_name", bind_data.function_name},
 	         {"output_rows", std::to_string(rows_copied)}});
 
-	// Save remainder if batch was larger than STANDARD_VECTOR_SIZE
-	if (static_cast<idx_t>(output_batch->num_rows()) > rows_copied) {
-		global_state.pending_output = output_batch->Slice(rows_copied);
-		return OperatorFinalizeResultType::HAVE_MORE_OUTPUT;
-	}
-
-	// Check if worker is finished
-	if (global_state.connection->IsFinished()) {
+	// Check if worker is finished and we've exhausted the current batch
+	if (!HasRemainingBatchData(local_state) && global_state.connection->IsFinished()) {
 		if (bind_data.use_pool && global_state.connection->CanBePooled()) {
 			auto pooled = global_state.connection->ReleaseForPooling();
 			if (pooled) {

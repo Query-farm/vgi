@@ -274,5 +274,217 @@ StreamHeaderResult ReadStreamHeader(int fd, ClientContext *context,
 	return result;
 }
 
+// ============================================================================
+// Buffer-based Serialization/Deserialization (for HTTP transport)
+// ============================================================================
+
+std::vector<uint8_t> SerializeRpcRequest(const std::string &method_name,
+                                          const std::shared_ptr<arrow::RecordBatch> &params_batch) {
+	auto sink_result = arrow::io::BufferOutputStream::Create();
+	if (!sink_result.ok()) {
+		throw IOException("Failed to create buffer for RPC request: " + sink_result.status().ToString());
+	}
+	auto sink = sink_result.ValueUnsafe();
+
+	auto writer_result = arrow::ipc::MakeStreamWriter(sink, params_batch->schema());
+	if (!writer_result.ok()) {
+		throw IOException("Failed to create RPC request writer: " + writer_result.status().ToString());
+	}
+	auto writer = writer_result.ValueUnsafe();
+
+	// Create custom metadata with method and version
+	auto metadata = arrow::KeyValueMetadata::Make(
+	    {RPC_METHOD_KEY, RPC_REQUEST_VERSION_KEY},
+	    {method_name, RPC_REQUEST_VERSION_VALUE});
+
+	auto status = writer->WriteRecordBatch(*params_batch, metadata);
+	if (!status.ok()) {
+		throw IOException("Failed to write RPC request batch: " + status.ToString());
+	}
+
+	status = writer->Close();
+	if (!status.ok()) {
+		throw IOException("Failed to close RPC request stream: " + status.ToString());
+	}
+
+	auto finish_result = sink->Finish();
+	if (!finish_result.ok()) {
+		throw IOException("Failed to finish RPC request buffer: " + finish_result.status().ToString());
+	}
+	auto buffer = finish_result.ValueUnsafe();
+	return std::vector<uint8_t>(buffer->data(), buffer->data() + buffer->size());
+}
+
+std::vector<uint8_t> SerializeEmptyRpcRequest(const std::string &method_name) {
+	auto schema = arrow::schema({});
+	auto batch = arrow::RecordBatch::Make(schema, 1, std::vector<std::shared_ptr<arrow::Array>> {});
+	return SerializeRpcRequest(method_name, batch);
+}
+
+// Helper: copy raw data into an owning Arrow buffer.
+// Arrow IPC zero-copy reads reference the buffer memory, so it must outlive any returned batches.
+static std::shared_ptr<arrow::Buffer> CopyToOwnedBuffer(const uint8_t *data, size_t len) {
+	auto alloc_result = arrow::AllocateBuffer(static_cast<int64_t>(len));
+	if (!alloc_result.ok()) {
+		throw IOException("Failed to allocate buffer for HTTP RPC response: %s",
+		                  alloc_result.status().ToString());
+	}
+	auto owned = std::shared_ptr<arrow::Buffer>(std::move(alloc_result).ValueUnsafe());
+	memcpy(const_cast<uint8_t *>(owned->data()), data, len);
+	return owned;
+}
+
+UnaryResponseResult ReadUnaryResponseFromBuffer(const uint8_t *data, size_t len,
+                                                 ClientContext *context,
+                                                 const std::string &url) {
+	auto buffer = CopyToOwnedBuffer(data, len);
+	auto input = std::make_shared<arrow::io::BufferReader>(buffer);
+	auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(input);
+	if (!reader_result.ok()) {
+		auto status = reader_result.status();
+		if (status.IsInvalid()) {
+			throw IOException("HTTP RPC response stream EOF (no schema) [url: %s]", url);
+		}
+		throw IOException("Failed to open HTTP RPC response stream: %s [url: %s]",
+		                  status.ToString(), url);
+	}
+	auto reader = reader_result.ValueUnsafe();
+
+	// Read batches, dispatching log/error until we find a data batch
+	UnaryResponseResult result;
+	while (true) {
+		auto read_result = reader->ReadNext();
+		if (!read_result.ok()) {
+			auto status = read_result.status();
+			if (status.IsInvalid()) {
+				break;
+			}
+			throw IOException("Failed to read HTTP RPC response batch: %s [url: %s]",
+			                  status.ToString(), url);
+		}
+		auto batch_with_metadata = read_result.ValueUnsafe();
+
+		if (!batch_with_metadata.batch) {
+			break;
+		}
+
+		if (DispatchBatch(batch_with_metadata.batch, batch_with_metadata.custom_metadata,
+		                  context, url, -1)) {
+			continue;
+		}
+
+		result.batch = batch_with_metadata.batch;
+		result.metadata = batch_with_metadata.custom_metadata;
+		break;
+	}
+
+	// Drain remaining stream to EOS
+	while (true) {
+		auto drain_result = reader->ReadNext();
+		if (!drain_result.ok() || !drain_result.ValueUnsafe().batch) {
+			break;
+		}
+		auto &bwm = drain_result.ValueUnsafe();
+		DispatchBatch(bwm.batch, bwm.custom_metadata, context, url, -1);
+	}
+
+	return result;
+}
+
+BufferStreamHeaderResult ReadStreamHeaderFromBuffer(const uint8_t *data, size_t len,
+                                                     ClientContext *context,
+                                                     const std::string &url) {
+	auto buffer = CopyToOwnedBuffer(data, len);
+	auto input = std::make_shared<arrow::io::BufferReader>(buffer);
+	auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(input);
+	if (!reader_result.ok()) {
+		auto status = reader_result.status();
+		if (status.IsInvalid()) {
+			throw IOException("HTTP stream header EOF (no schema) [url: %s]", url);
+		}
+		throw IOException("Failed to open HTTP stream header: %s [url: %s]",
+		                  status.ToString(), url);
+	}
+	auto reader = reader_result.ValueUnsafe();
+
+	// Check for error stream (empty schema)
+	auto response_schema = reader->schema();
+	if (response_schema->num_fields() == 0) {
+		std::exception_ptr caught_exception;
+		auto read_result = reader->ReadNext();
+		if (read_result.ok()) {
+			auto bwm = read_result.ValueUnsafe();
+			if (bwm.batch) {
+				try {
+					DispatchBatch(bwm.batch, bwm.custom_metadata, context, url, -1);
+				} catch (...) {
+					caught_exception = std::current_exception();
+				}
+			}
+		}
+		while (true) {
+			auto drain = reader->ReadNext();
+			if (!drain.ok() || !drain.ValueUnsafe().batch) {
+				break;
+			}
+		}
+		if (caught_exception) {
+			std::rethrow_exception(caught_exception);
+		}
+		throw IOException("HTTP stream init failed (empty error schema) [url: %s]", url);
+	}
+
+	// Read header batches
+	BufferStreamHeaderResult result;
+	while (true) {
+		auto read_result = reader->ReadNext();
+		if (!read_result.ok()) {
+			auto status = read_result.status();
+			if (status.IsInvalid()) {
+				break;
+			}
+			throw IOException("Failed to read HTTP stream header batch: %s [url: %s]",
+			                  status.ToString(), url);
+		}
+		auto batch_with_metadata = read_result.ValueUnsafe();
+
+		if (!batch_with_metadata.batch) {
+			break;
+		}
+
+		if (DispatchBatch(batch_with_metadata.batch, batch_with_metadata.custom_metadata,
+		                  context, url, -1)) {
+			continue;
+		}
+
+		result.header.header_batch = batch_with_metadata.batch;
+		result.header.metadata = batch_with_metadata.custom_metadata;
+		break;
+	}
+
+	// Drain remaining header stream to EOS
+	while (true) {
+		auto drain_result = reader->ReadNext();
+		if (!drain_result.ok() || !drain_result.ValueUnsafe().batch) {
+			break;
+		}
+		auto &bwm = drain_result.ValueUnsafe();
+		DispatchBatch(bwm.batch, bwm.custom_metadata, context, url, -1);
+	}
+
+	if (!result.header.header_batch) {
+		throw IOException("HTTP stream header missing data batch [url: %s]", url);
+	}
+
+	// Record the byte offset where the data IPC stream begins
+	auto tell_result = input->Tell();
+	if (!tell_result.ok()) {
+		throw IOException("Failed to get buffer position after header [url: %s]", url);
+	}
+	result.data_offset = static_cast<size_t>(tell_result.ValueUnsafe());
+
+	return result;
+}
+
 } // namespace vgi
 } // namespace duckdb

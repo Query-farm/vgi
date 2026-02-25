@@ -7,6 +7,7 @@
 
 #include "duckdb.hpp"
 #include "duckdb/main/config.hpp"
+#include "duckdb/main/extension_helper.hpp"
 #include "duckdb/parser/parsed_data/attach_info.hpp"
 #include "duckdb/storage/storage_extension.hpp"
 #include "query_farm_telemetry.hpp"
@@ -18,6 +19,7 @@
 #include "vgi_profiling.hpp"
 #include "vgi_subprocess.hpp"
 #include "vgi_table_function.hpp"
+#include "vgi_transport.hpp"
 #include "vgi_worker_pool.hpp"
 #include "vgi_worker_pool_functions.hpp"
 
@@ -58,6 +60,20 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 
 	if (worker_path.empty()) {
 		throw BinderException("VGI ATTACH requires LOCATION option specifying the worker path");
+	}
+
+	// HTTP transport: require httpfs for POST support, disable subprocess pooling
+	if (vgi::IsHttpTransport(worker_path)) {
+		try {
+			ExtensionHelper::TryAutoLoadExtension(db.GetDatabase(), "httpfs");
+		} catch (...) {
+			// ignore auto-load errors, check below
+		}
+		if (!db.GetDatabase().ExtensionIsLoaded("httpfs")) {
+			throw BinderException("VGI HTTP transport requires the httpfs extension. "
+			                      "Install it with: INSTALL httpfs; LOAD httpfs;");
+		}
+		use_pool = false; // HTTP is stateless, no subprocess pooling
 	}
 
 	// Call catalog_attach via RPC

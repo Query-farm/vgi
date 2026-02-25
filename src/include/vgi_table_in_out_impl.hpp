@@ -6,7 +6,9 @@
 
 #include <arrow/api.h>
 
+#include "duckdb/common/arrow/arrow_wrapper.hpp"
 #include "duckdb/execution/execution_context.hpp"
+#include "duckdb/function/table/arrow.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/client_context.hpp"
 
@@ -16,7 +18,7 @@ namespace duckdb {
 namespace vgi {
 
 // Forward declaration
-class FunctionConnection;
+class IFunctionConnection;
 
 // ============================================================================
 // Bind Data for Table-In-Out Functions
@@ -43,6 +45,10 @@ struct VgiTableInOutBindData : public TableFunctionData {
 	// Output schema from bind handshake
 	std::shared_ptr<arrow::Schema> output_schema;
 
+	// Arrow C ABI schema and table schema for ArrowToDuckDB conversion
+	ArrowSchemaWrapper c_schema;
+	ArrowTableSchema arrow_table;
+
 	// Input schema (built from table input types/names)
 	std::shared_ptr<arrow::Schema> input_schema;
 
@@ -51,7 +57,7 @@ struct VgiTableInOutBindData : public TableFunctionData {
 	int64_t cardinality_estimate = -1;
 
 	// Connection created during bind, moved to global state during init
-	mutable std::unique_ptr<FunctionConnection> bind_connection;
+	mutable std::unique_ptr<IFunctionConnection> bind_connection;
 };
 
 // ============================================================================
@@ -63,13 +69,10 @@ struct VgiTableInOutGlobalState : public GlobalTableFunctionState {
 	~VgiTableInOutGlobalState() override;
 
 	// Primary connection for this execution
-	std::unique_ptr<FunctionConnection> connection;
+	std::unique_ptr<IFunctionConnection> connection;
 
 	// Global execution ID for multi-worker coordination
 	std::vector<uint8_t> global_execution_id;
-
-	// Pending output batch (when worker produces more output than fits in one chunk)
-	std::shared_ptr<arrow::RecordBatch> pending_output;
 
 	// Whether finalize signal has been sent to the worker
 	bool finalize_sent = false;
@@ -83,8 +86,10 @@ struct VgiTableInOutGlobalState : public GlobalTableFunctionState {
 // Local State for Table-In-Out Functions
 // ============================================================================
 
-struct VgiTableInOutLocalState : public LocalTableFunctionState {
-	VgiTableInOutLocalState();
+struct VgiTableInOutLocalState : public ArrowScanLocalState {
+	VgiTableInOutLocalState(unique_ptr<ArrowArrayWrapper> current_chunk, ClientContext &ctx)
+	    : ArrowScanLocalState(std::move(current_chunk), ctx) {
+	}
 	~VgiTableInOutLocalState() override;
 };
 

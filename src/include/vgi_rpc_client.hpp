@@ -29,6 +29,9 @@ constexpr const char *RPC_LOG_EXTRA_KEY = "vgi_rpc.log_extra";
 constexpr const char *RPC_SERVER_ID_KEY = "vgi_rpc.server_id";
 constexpr const char *RPC_REQUEST_ID_KEY = "vgi_rpc.request_id";
 
+// HTTP streaming state token metadata key
+constexpr const char *RPC_STREAM_STATE_KEY = "vgi_rpc.stream_state";
+
 // ============================================================================
 // Batch Classification
 // ============================================================================
@@ -95,6 +98,37 @@ struct StreamHeaderResult {
 StreamHeaderResult ReadStreamHeader(int fd, ClientContext *context,
                                     const std::string &worker_path = "",
                                     pid_t worker_pid = -1);
+
+// ============================================================================
+// Buffer-based Serialization/Deserialization (for HTTP transport)
+// ============================================================================
+
+// Serialize an RPC request to bytes (same format as WriteRpcRequest but to buffer).
+// Returns a complete Arrow IPC stream: schema + 1-row batch with method metadata + EOS.
+std::vector<uint8_t> SerializeRpcRequest(const std::string &method_name,
+                                          const std::shared_ptr<arrow::RecordBatch> &params_batch);
+
+// Serialize an RPC request with no parameters (zero-field schema, 1-row batch).
+std::vector<uint8_t> SerializeEmptyRpcRequest(const std::string &method_name);
+
+// Parse a unary response from bytes (same logic as ReadUnaryResponse but from buffer).
+// url is used for error context (replaces worker_path in fd-based version).
+UnaryResponseResult ReadUnaryResponseFromBuffer(const uint8_t *data, size_t len,
+                                                 ClientContext *context,
+                                                 const std::string &url = "");
+
+// Result from reading a stream header from a buffer.
+// For HTTP init responses: the response body contains header IPC stream + data IPC stream.
+struct BufferStreamHeaderResult {
+	StreamHeaderResult header;
+	size_t data_offset;  // Byte offset where the data IPC stream begins
+};
+
+// Parse a stream header from a buffer.
+// Reads the header IPC stream, dispatches log batches, returns header batch + data offset.
+BufferStreamHeaderResult ReadStreamHeaderFromBuffer(const uint8_t *data, size_t len,
+                                                     ClientContext *context,
+                                                     const std::string &url = "");
 
 } // namespace vgi
 } // namespace duckdb

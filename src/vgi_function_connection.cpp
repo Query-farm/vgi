@@ -7,9 +7,11 @@
 
 #include "vgi_arrow_ipc.hpp"
 #include "vgi_exception.hpp"
+#include "vgi_http_function_connection.hpp"
 #include "vgi_logging.hpp"
 #include "vgi_rpc_client.hpp"
 #include "vgi_rpc_types.hpp"
+#include "vgi_transport.hpp"
 
 namespace duckdb {
 namespace vgi {
@@ -19,16 +21,16 @@ namespace vgi {
 // ============================================================================
 
 AcquireAndBindResult AcquireAndBindConnection(ClientContext &context, const FunctionConnectionParams &params) {
-	std::unique_ptr<FunctionConnection> conn;
+	std::unique_ptr<IFunctionConnection> conn;
 	BindResult bind_result;
 	bool from_pool = false;
 
-	// Lambda to create a fresh connection
+	// Lambda to create a fresh connection (uses factory for HTTP/subprocess dispatch)
 	auto create_fresh_connection = [&]() {
-		return make_uniq<FunctionConnection>(params.worker_path, params.function_name, params.arguments,
-		                                     params.attach_id, context, params.function_type,
-		                                     params.global_execution_id, params.worker_debug,
-		                                     params.settings);
+		return CreateFunctionConnection(params.worker_path, params.function_name, params.arguments,
+		                                params.attach_id, context, params.function_type,
+		                                params.global_execution_id, params.worker_debug,
+		                                params.settings);
 	};
 
 	// Lambda to attempt bind, returns true on success, false if retry needed
@@ -50,15 +52,15 @@ AcquireAndBindResult AcquireAndBindConnection(ClientContext &context, const Func
 		}
 	};
 
-	// Try pool first
-	if (params.use_pool) {
+	// Try pool first (only for subprocess transport)
+	if (params.use_pool && !IsHttpTransport(params.worker_path)) {
 		auto pooled = VgiWorkerPool::Instance().TryAcquire(params.worker_path);
 		if (pooled) {
 			auto pooled_pid = pooled->GetPid();
-			conn = make_uniq<FunctionConnection>(std::move(pooled), params.function_name, params.arguments,
-			                                     params.attach_id, context, params.function_type,
-			                                     params.global_execution_id,
-			                                     params.worker_debug, params.settings);
+			conn = CreateFunctionConnectionFromPool(std::move(pooled), params.function_name, params.arguments,
+			                                        params.attach_id, context, params.function_type,
+			                                        params.global_execution_id,
+			                                        params.worker_debug, params.settings);
 			from_pool = true;
 			VGI_LOG(context, "worker_pool.acquire",
 			        {{"worker_path", params.worker_path},
@@ -71,7 +73,7 @@ AcquireAndBindResult AcquireAndBindConnection(ClientContext &context, const Func
 	// Create fresh if pool miss
 	if (!conn) {
 		conn = create_fresh_connection();
-		if (params.use_pool) {
+		if (params.use_pool && !IsHttpTransport(params.worker_path)) {
 			VgiWorkerPool::Instance().RecordMiss(params.worker_path);
 		}
 		VGI_LOG(context, "worker_pool.acquire",
@@ -846,6 +848,40 @@ void FunctionConnection::DrainStderrLog() {
 		VGI_LOG(context_, "worker.stderr",
 		        {{"worker_path", worker_path_}, {"worker_pid", std::to_string(worker_pid)}, {"message", line}});
 	}
+}
+
+// ============================================================================
+// Factory Functions
+// ============================================================================
+
+std::unique_ptr<IFunctionConnection> CreateFunctionConnection(
+    const std::string &worker_path, const std::string &function_name,
+    const ArrowArguments &arguments, const std::vector<uint8_t> &attach_id,
+    ClientContext &context, const std::string &function_type,
+    const std::vector<uint8_t> &global_execution_id,
+    bool worker_debug,
+    const std::map<std::string, std::string> &settings) {
+	if (IsHttpTransport(worker_path)) {
+		return std::make_unique<HttpFunctionConnection>(
+		    worker_path, function_name, arguments, attach_id, context,
+		    function_type, global_execution_id, worker_debug, settings);
+	}
+	return std::make_unique<FunctionConnection>(
+	    worker_path, function_name, arguments, attach_id, context,
+	    function_type, global_execution_id, worker_debug, settings);
+}
+
+std::unique_ptr<IFunctionConnection> CreateFunctionConnectionFromPool(
+    std::unique_ptr<PooledWorker> pooled_worker, const std::string &function_name,
+    const ArrowArguments &arguments, const std::vector<uint8_t> &attach_id,
+    ClientContext &context, const std::string &function_type,
+    const std::vector<uint8_t> &global_execution_id,
+    bool worker_debug,
+    const std::map<std::string, std::string> &settings) {
+	// Only subprocess connections use the pool
+	return std::make_unique<FunctionConnection>(
+	    std::move(pooled_worker), function_name, arguments, attach_id, context,
+	    function_type, global_execution_id, worker_debug, settings);
 }
 
 } // namespace vgi

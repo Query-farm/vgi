@@ -10,6 +10,45 @@ statement ok
 ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
 # ----------------------------------------------------------------------------
+# Output type validation (table-in-out passthrough)
+# repeat_inputs passes input types through unchanged. These tests verify
+# that the output column types match the input column types exactly.
+# ----------------------------------------------------------------------------
+
+# Integer types preserved
+query IIII
+SELECT typeof(a), typeof(b), typeof(c), typeof(d)
+FROM example.repeat_inputs(1, (
+    SELECT 1::INTEGER AS a, 2::BIGINT AS b, 3::SMALLINT AS c, 4::TINYINT AS d
+));
+----
+INTEGER	BIGINT	SMALLINT	TINYINT
+
+# Float types preserved
+query II
+SELECT typeof(a), typeof(b)
+FROM example.repeat_inputs(1, (
+    SELECT 1.0::DOUBLE AS a, 2.0::FLOAT AS b
+));
+----
+DOUBLE	FLOAT
+
+# String type preserved
+query I
+SELECT typeof(a)
+FROM example.repeat_inputs(1, (
+    SELECT 'hello'::VARCHAR AS a
+));
+----
+VARCHAR
+
+# Boolean type preserved
+query I
+SELECT typeof(a) FROM example.repeat_inputs(1, (SELECT true AS a));
+----
+BOOLEAN
+
+# ----------------------------------------------------------------------------
 # Different data types
 # ----------------------------------------------------------------------------
 

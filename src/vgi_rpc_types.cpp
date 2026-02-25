@@ -119,7 +119,7 @@ std::vector<uint8_t> SerializeSchemaToIpcBytes(const std::shared_ptr<arrow::Sche
 // ============================================================================
 
 std::shared_ptr<arrow::Array> BuildEnumArray(const std::string &value,
-                                              const std::vector<std::string> &dictionary_values) {
+                                             const std::vector<std::string> &dictionary_values) {
 	// Build the dictionary (all enum member names)
 	arrow::StringBuilder dict_builder;
 	for (const auto &v : dictionary_values) {
@@ -164,15 +164,11 @@ std::shared_ptr<arrow::Array> BuildEnumArray(const std::string &value,
 // BindRequest
 // ============================================================================
 
-std::shared_ptr<arrow::RecordBatch> BuildBindRequest(
-    const std::string &function_name,
-    const std::vector<uint8_t> &arguments_ipc_bytes,
-    const std::string &function_type,
-    const std::vector<uint8_t> &input_schema_bytes,
-    const std::vector<uint8_t> &settings_bytes,
-    const std::vector<uint8_t> &attach_id,
-    const std::vector<uint8_t> &transaction_id) {
-
+std::shared_ptr<arrow::RecordBatch>
+BuildBindRequest(const std::string &function_name, const std::vector<uint8_t> &arguments_ipc_bytes,
+                 const std::string &function_type, const std::vector<uint8_t> &input_schema_bytes,
+                 const std::vector<uint8_t> &settings_bytes, const std::vector<uint8_t> &attach_id,
+                 const std::vector<uint8_t> &transaction_id) {
 	// FunctionType enum: SCALAR, TABLE, AGGREGATE
 	static const std::vector<std::string> function_type_values = {"SCALAR", "TABLE", "AGGREGATE"};
 
@@ -211,8 +207,7 @@ std::shared_ptr<arrow::RecordBatch> BuildBindRequest(
 // BindResponse Parsing
 // ============================================================================
 
-BindResponseResult ParseBindResponse(const std::shared_ptr<arrow::RecordBatch> &batch,
-                                     const std::string &worker_path) {
+BindResponseResult ParseBindResponse(const std::shared_ptr<arrow::RecordBatch> &batch, const std::string &worker_path) {
 	BindResponseResult result;
 
 	if (!batch || batch->num_rows() == 0) {
@@ -234,10 +229,10 @@ BindResponseResult ParseBindResponse(const std::shared_ptr<arrow::RecordBatch> &
 	arrow::ipc::DictionaryMemo dict_memo;
 	auto schema_result = arrow::ipc::ReadSchema(&reader, &dict_memo);
 	if (!schema_result.ok()) {
-		throw IOException("Failed to deserialize output schema: %s [worker: %s]",
-		                  schema_result.status().ToString(), worker_path);
+		throw IOException("Failed to deserialize output schema: %s [worker: %s]", schema_result.status().ToString(),
+		                  worker_path);
 	}
-	result.output_schema = ResolveDictionaryTypes(schema_result.ValueUnsafe());
+	result.output_schema = schema_result.ValueUnsafe();
 
 	// opaque_data: binary (nullable)
 	auto opaque_col = batch->GetColumnByName("opaque_data");
@@ -256,16 +251,11 @@ BindResponseResult ParseBindResponse(const std::shared_ptr<arrow::RecordBatch> &
 // InitRequest
 // ============================================================================
 
-std::shared_ptr<arrow::RecordBatch> BuildInitRequest(
-    const std::vector<uint8_t> &bind_call_bytes,
-    const std::vector<uint8_t> &output_schema_bytes,
-    const std::vector<uint8_t> &bind_opaque_data,
-    const std::vector<int64_t> &projection_ids,
-    const std::vector<uint8_t> &pushdown_filters_bytes,
-    const std::string &phase,
-    const std::vector<uint8_t> &execution_id,
-    const std::vector<uint8_t> &init_opaque_data) {
-
+std::shared_ptr<arrow::RecordBatch>
+BuildInitRequest(const std::vector<uint8_t> &bind_call_bytes, const std::vector<uint8_t> &output_schema_bytes,
+                 const std::vector<uint8_t> &bind_opaque_data, const std::vector<int64_t> &projection_ids,
+                 const std::vector<uint8_t> &pushdown_filters_bytes, const std::string &phase,
+                 const std::vector<uint8_t> &execution_id, const std::vector<uint8_t> &init_opaque_data) {
 	static const std::vector<std::string> phase_values = {"INPUT", "FINALIZE"};
 
 	auto phase_type = arrow::dictionary(arrow::int16(), arrow::utf8());
@@ -328,7 +318,8 @@ std::shared_ptr<arrow::RecordBatch> BuildInitRequest(
 		if (!dict_result.ok()) {
 			throw IOException("Failed to build phase dictionary: " + dict_result.status().ToString());
 		}
-		auto dict_array_result = arrow::DictionaryArray::FromArrays(phase_type, index_result.ValueUnsafe(), dict_result.ValueUnsafe());
+		auto dict_array_result =
+		    arrow::DictionaryArray::FromArrays(phase_type, index_result.ValueUnsafe(), dict_result.ValueUnsafe());
 		if (!dict_array_result.ok()) {
 			throw IOException("Failed to create null phase array: " + dict_array_result.status().ToString());
 		}
@@ -351,7 +342,7 @@ std::shared_ptr<arrow::RecordBatch> BuildInitRequest(
 // ============================================================================
 
 GlobalInitResponseResult ParseGlobalInitResponse(const std::shared_ptr<arrow::RecordBatch> &batch,
-                                                  const std::string &worker_path) {
+                                                 const std::string &worker_path) {
 	GlobalInitResponseResult result;
 
 	if (!batch || batch->num_rows() == 0) {
@@ -468,9 +459,8 @@ std::vector<std::string> UnwrapStringResponseItems(const std::shared_ptr<arrow::
 // TableFunctionCardinalityRequest / TableCardinality
 // ============================================================================
 
-std::shared_ptr<arrow::RecordBatch> BuildTableFunctionCardinalityRequest(
-    const std::vector<uint8_t> &bind_call_bytes,
-    const std::vector<uint8_t> &bind_opaque_data) {
+std::shared_ptr<arrow::RecordBatch> BuildTableFunctionCardinalityRequest(const std::vector<uint8_t> &bind_call_bytes,
+                                                                         const std::vector<uint8_t> &bind_opaque_data) {
 	auto schema = arrow::schema({
 	    arrow::field("bind_call", arrow::binary(), false),
 	    arrow::field("bind_opaque_data", arrow::binary(), true),
@@ -481,13 +471,12 @@ std::shared_ptr<arrow::RecordBatch> BuildTableFunctionCardinalityRequest(
 	return arrow::RecordBatch::Make(schema, 1, arrays);
 }
 
-TableFunctionCardinalityResult ParseTableFunctionCardinalityResult(
-    const std::shared_ptr<arrow::RecordBatch> &batch,
-    const std::string &worker_path) {
+TableFunctionCardinalityResult ParseTableFunctionCardinalityResult(const std::shared_ptr<arrow::RecordBatch> &batch,
+                                                                   const std::string &worker_path) {
 	TableFunctionCardinalityResult result;
 
 	if (!batch || batch->num_rows() == 0) {
-		return result;  // Unknown cardinality
+		return result; // Unknown cardinality
 	}
 
 	// estimate: int64|null
@@ -534,7 +523,7 @@ std::shared_ptr<arrow::RecordBatch> BuildInitRpcParams(const std::vector<uint8_t
 }
 
 std::shared_ptr<arrow::RecordBatch> BuildCatalogAttachParams(const std::string &name,
-                                                              const std::vector<uint8_t> &options_bytes) {
+                                                             const std::vector<uint8_t> &options_bytes) {
 	// Build the CatalogAttachRequest dataclass batch (fields: name, options)
 	auto request_schema = arrow::schema({
 	    arrow::field("name", arrow::utf8(), false),
@@ -558,7 +547,7 @@ std::shared_ptr<arrow::RecordBatch> BuildCatalogAttachParams(const std::string &
 }
 
 std::shared_ptr<arrow::RecordBatch> BuildAttachIdParams(const std::vector<uint8_t> &attach_id,
-                                                         const std::vector<uint8_t> &transaction_id) {
+                                                        const std::vector<uint8_t> &transaction_id) {
 	auto schema = arrow::schema({
 	    arrow::field("attach_id", arrow::binary(), false),
 	    arrow::field("transaction_id", arrow::binary(), true),
@@ -576,9 +565,8 @@ std::shared_ptr<arrow::RecordBatch> BuildAttachIdParams(const std::vector<uint8_
 	return arrow::RecordBatch::Make(schema, 1, arrays);
 }
 
-std::shared_ptr<arrow::RecordBatch> BuildSchemaGetParams(const std::vector<uint8_t> &attach_id,
-                                                          const std::string &name,
-                                                          const std::vector<uint8_t> &transaction_id) {
+std::shared_ptr<arrow::RecordBatch> BuildSchemaGetParams(const std::vector<uint8_t> &attach_id, const std::string &name,
+                                                         const std::vector<uint8_t> &transaction_id) {
 	auto schema = arrow::schema({
 	    arrow::field("attach_id", arrow::binary(), false),
 	    arrow::field("name", arrow::utf8(), false),
@@ -598,8 +586,8 @@ std::shared_ptr<arrow::RecordBatch> BuildSchemaGetParams(const std::vector<uint8
 }
 
 std::shared_ptr<arrow::RecordBatch> BuildSchemaContentsParams(const std::vector<uint8_t> &attach_id,
-                                                               const std::string &name,
-                                                               const std::vector<uint8_t> &transaction_id) {
+                                                              const std::string &name,
+                                                              const std::vector<uint8_t> &transaction_id) {
 	auto schema = arrow::schema({
 	    arrow::field("attach_id", arrow::binary(), false),
 	    arrow::field("name", arrow::utf8(), false),
@@ -618,12 +606,12 @@ std::shared_ptr<arrow::RecordBatch> BuildSchemaContentsParams(const std::vector<
 	return arrow::RecordBatch::Make(schema, 1, arrays);
 }
 
-std::shared_ptr<arrow::RecordBatch> BuildSchemaContentsFunctionsParams(
-    const std::vector<uint8_t> &attach_id, const std::string &name,
-    const std::string &function_type, const std::vector<uint8_t> &transaction_id) {
-
-	static const std::vector<std::string> schema_object_type_values = {
-	    "TABLE", "VIEW", "SCALAR_FUNCTION", "TABLE_FUNCTION"};
+std::shared_ptr<arrow::RecordBatch> BuildSchemaContentsFunctionsParams(const std::vector<uint8_t> &attach_id,
+                                                                       const std::string &name,
+                                                                       const std::string &function_type,
+                                                                       const std::vector<uint8_t> &transaction_id) {
+	static const std::vector<std::string> schema_object_type_values = {"TABLE", "VIEW", "SCALAR_FUNCTION",
+	                                                                   "TABLE_FUNCTION"};
 
 	auto schema = arrow::schema({
 	    arrow::field("attach_id", arrow::binary(), false),
@@ -646,9 +634,8 @@ std::shared_ptr<arrow::RecordBatch> BuildSchemaContentsFunctionsParams(
 }
 
 std::shared_ptr<arrow::RecordBatch> BuildTableOrViewGetParams(const std::vector<uint8_t> &attach_id,
-                                                               const std::string &schema_name,
-                                                               const std::string &name,
-                                                               const std::vector<uint8_t> &transaction_id) {
+                                                              const std::string &schema_name, const std::string &name,
+                                                              const std::vector<uint8_t> &transaction_id) {
 	auto schema = arrow::schema({
 	    arrow::field("attach_id", arrow::binary(), false),
 	    arrow::field("schema_name", arrow::utf8(), false),
@@ -669,11 +656,11 @@ std::shared_ptr<arrow::RecordBatch> BuildTableOrViewGetParams(const std::vector<
 	return arrow::RecordBatch::Make(schema, 1, arrays);
 }
 
-std::shared_ptr<arrow::RecordBatch> BuildTableScanFunctionGetParams(
-    const std::vector<uint8_t> &attach_id, const std::string &schema_name,
-    const std::string &name, const std::string &at_unit,
-    const std::string &at_value, const std::vector<uint8_t> &transaction_id) {
-
+std::shared_ptr<arrow::RecordBatch> BuildTableScanFunctionGetParams(const std::vector<uint8_t> &attach_id,
+                                                                    const std::string &schema_name,
+                                                                    const std::string &name, const std::string &at_unit,
+                                                                    const std::string &at_value,
+                                                                    const std::vector<uint8_t> &transaction_id) {
 	auto schema = arrow::schema({
 	    arrow::field("attach_id", arrow::binary(), false),
 	    arrow::field("schema_name", arrow::utf8(), false),

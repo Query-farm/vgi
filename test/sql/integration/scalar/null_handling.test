@@ -43,6 +43,15 @@ SELECT example.null_handling(-100);
 -100
 
 # ============================================================================
+# Return type validation
+# ============================================================================
+
+query I
+SELECT typeof(example.null_handling(1));
+----
+BIGINT
+
+# ============================================================================
 # NULL handling in batches (NullHandling.SPECIAL)
 # When NULL is part of a batch, the function receives it and returns -5000
 # ============================================================================
