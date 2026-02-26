@@ -35,6 +35,61 @@ FROM example.echo((
 ----
 10000	50005000	150005000	200010000
 
+# ----------------------------------------------------------------------------
+# Batch boundary tests (DuckDB sends batches of up to 2048 rows)
+# ----------------------------------------------------------------------------
+
+# Exactly 1 batch (2048 rows)
+query III
+SELECT COUNT(*), MIN(n), MAX(n) FROM example.echo((SELECT unnest(generate_series(1, 2048)) AS n));
+----
+2048	1	2048
+
+# Crosses first batch boundary (2049 rows = 2 batches)
+query III
+SELECT COUNT(*), MIN(n), MAX(n) FROM example.echo((SELECT unnest(generate_series(1, 2049)) AS n));
+----
+2049	1	2049
+
+# Exactly 2 batches (4096 rows)
+query III
+SELECT COUNT(*), MIN(n), MAX(n) FROM example.echo((SELECT unnest(generate_series(1, 4096)) AS n));
+----
+4096	1	4096
+
+# Crosses second batch boundary (4097 rows = 3 batches)
+query III
+SELECT COUNT(*), MIN(n), MAX(n) FROM example.echo((SELECT unnest(generate_series(1, 4097)) AS n));
+----
+4097	1	4097
+
+# ----------------------------------------------------------------------------
+# Data integrity - EXCEPT-based verification (echo output must equal input)
+# ----------------------------------------------------------------------------
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT n FROM example.echo((SELECT unnest(generate_series(1, 5000)) AS n))
+    EXCEPT
+    SELECT unnest(generate_series(1, 5000)) AS n
+);
+----
+0
+
+# ----------------------------------------------------------------------------
+# Multi-column batch boundary (2049 rows, 3 columns)
+# ----------------------------------------------------------------------------
+
+query IIIIII
+SELECT COUNT(*), MIN(a), MAX(a), MIN(b), MAX(b), SUM(c)
+FROM example.echo((
+    SELECT unnest(generate_series(1, 2049)) AS a,
+           unnest(generate_series(1, 2049)) * 10 AS b,
+           1 AS c
+));
+----
+2049	1	2049	10	20490	2049
+
 # ============================================================================
 # Cleanup
 # ============================================================================

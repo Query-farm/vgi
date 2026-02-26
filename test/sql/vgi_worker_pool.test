@@ -112,6 +112,55 @@ SELECT COUNT(*) FROM vgi_worker_pool();
 0
 
 # ============================================================================
+# Test vgi_worker_pool_stats() table function
+# ============================================================================
+
+# Verify schema
+query III
+SELECT typeof(worker_path), typeof(hits), typeof(misses) FROM vgi_worker_pool_stats() LIMIT 0;
+----
+
+# Flush pool, then run a query (first run = miss)
+query I
+SELECT vgi_worker_pool_flush() >= 0;
+----
+true
+
+query I
+SELECT COUNT(*) FROM vgi_table_function('${VGI_TEST_WORKER}', 'sequence', [10]);
+----
+10
+
+# Stats should show at least 1 miss (fresh worker was spawned)
+query I
+SELECT SUM(misses) >= 1 FROM vgi_worker_pool_stats();
+----
+true
+
+# Run another query - should hit the pool (worker was returned after first query)
+query I
+SELECT COUNT(*) FROM vgi_table_function('${VGI_TEST_WORKER}', 'sequence', [5]);
+----
+5
+
+# Stats should now show at least 1 hit
+query I
+SELECT SUM(hits) >= 1 FROM vgi_worker_pool_stats();
+----
+true
+
+# Flush pool and verify stats still reflect historical counts
+query I
+SELECT vgi_worker_pool_flush() >= 1;
+----
+true
+
+query I
+SELECT SUM(hits) >= 1 FROM vgi_worker_pool_stats();
+----
+true
+
+# ============================================================================
 # Test pool=false ATTACH option disables pooling
 # ============================================================================
 
