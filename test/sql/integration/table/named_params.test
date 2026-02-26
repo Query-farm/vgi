@@ -1,0 +1,184 @@
+# name: test/sql/integration/table/named_params.test
+# description: Tests named parameter passing on table functions
+# group: [vgi_integration_table]
+
+# Tests that named parameters of various types (VARCHAR, BIGINT, DOUBLE, BOOLEAN)
+# are correctly passed from DuckDB to VGI workers. The named_params_echo function
+# echoes each parameter value directly in output columns for easy assertion.
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# A. Defaults — all named params omitted
+# greeting='hello', value=id*1, float_value=id*1.0, enabled=true
+# ============================================================================
+
+query ITIRT
+SELECT * FROM example.named_params_echo(3);
+----
+0	hello	0	0.0	true
+1	hello	1	1.0	true
+2	hello	2	2.0	true
+
+# ============================================================================
+# B. Override single named param (others keep defaults)
+# ============================================================================
+
+# Override greeting only
+query ITIRT
+SELECT * FROM example.named_params_echo(3, greeting := 'hi');
+----
+0	hi	0	0.0	true
+1	hi	1	1.0	true
+2	hi	2	2.0	true
+
+# Override multiplier only — value = id * 10
+query ITIRT
+SELECT * FROM example.named_params_echo(3, multiplier := 10);
+----
+0	hello	0	0.0	true
+1	hello	10	1.0	true
+2	hello	20	2.0	true
+
+# Override scale only — float_value = id * 0.5
+query ITIRT
+SELECT * FROM example.named_params_echo(3, scale := 0.5);
+----
+0	hello	0	0.0	true
+1	hello	1	0.5	true
+2	hello	2	1.0	true
+
+# Override enabled only
+query ITIRT
+SELECT * FROM example.named_params_echo(3, enabled := false);
+----
+0	hello	0	0.0	false
+1	hello	1	1.0	false
+2	hello	2	2.0	false
+
+# ============================================================================
+# C. Override multiple named params
+# ============================================================================
+
+# Two params: greeting and multiplier
+query ITIRT
+SELECT * FROM example.named_params_echo(3, greeting := 'hey', multiplier := 5);
+----
+0	hey	0	0.0	true
+1	hey	5	1.0	true
+2	hey	10	2.0	true
+
+# All four named params
+query ITIRT
+SELECT * FROM example.named_params_echo(3, greeting := 'yo', multiplier := 100, scale := 2.5, enabled := false);
+----
+0	yo	0	0.0	false
+1	yo	100	2.5	false
+2	yo	200	5.0	false
+
+# ============================================================================
+# D. Parameter ordering — reversed order, same results
+# ============================================================================
+
+query ITIRT
+SELECT * FROM example.named_params_echo(3, enabled := false, scale := 2.5, multiplier := 100, greeting := 'yo');
+----
+0	yo	0	0.0	false
+1	yo	100	2.5	false
+2	yo	200	5.0	false
+
+# ============================================================================
+# E. Edge cases
+# ============================================================================
+
+# Zero rows — empty result
+query ITIRT
+SELECT * FROM example.named_params_echo(0);
+----
+
+# Single row with custom params
+query ITIRT
+SELECT * FROM example.named_params_echo(1, greeting := 'one', multiplier := 42);
+----
+0	one	0	0.0	true
+
+# Empty string greeting
+query I
+SELECT COUNT(*) FROM example.named_params_echo(2, greeting := '') WHERE greeting = '';
+----
+2
+
+# ============================================================================
+# F. SQL operations on echoed values
+# ============================================================================
+
+# WHERE filter on greeting column
+query ITIRT
+SELECT * FROM example.named_params_echo(5, greeting := 'test') WHERE id >= 3;
+----
+3	test	3	3.0	true
+4	test	4	4.0	true
+
+# SUM on multiplied value column
+query I
+SELECT SUM(value) FROM example.named_params_echo(5, multiplier := 10);
+----
+100
+
+# SUM on scaled float_value column
+query R
+SELECT SUM(float_value) FROM example.named_params_echo(5, scale := 0.5);
+----
+5.0
+
+# COUNT with boolean filter
+query I
+SELECT COUNT(*) FROM example.named_params_echo(5, enabled := false) WHERE enabled = false;
+----
+5
+
+# ============================================================================
+# G. Existing functions — default value gap tests
+# ============================================================================
+
+# sequence with no named params — defaults apply (increment=1 → values 0..4)
+query I
+SELECT * FROM example.sequence(5);
+----
+0
+1
+2
+3
+4
+
+# sequence with only one named param
+query I
+SELECT * FROM example.sequence(5, increment := 10);
+----
+0
+10
+20
+30
+40
+
+# double_sequence with no named params — defaults apply
+query R
+SELECT * FROM example.double_sequence(5);
+----
+0.0
+1.0
+2.0
+3.0
+4.0
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;

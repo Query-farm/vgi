@@ -1,0 +1,245 @@
+# name: test/sql/integration/table/function_registration.test
+# description: Validates table function registration metadata matches the VGI example worker specification
+# group: [vgi_integration_table]
+
+# Table functions registered by the example worker must expose consistent metadata
+# through duckdb_functions() so that all VGI worker implementations (Python, Go, etc.)
+# can be validated against the same expectations.
+#
+# Note: Table-in-out functions also register as function_type='table' in DuckDB.
+# They are tested separately in table_in_out/function_registration.test.
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# Function Inventory
+# 11 pure table functions + 7 table-in-out functions = 18 total table-type functions
+# ============================================================================
+
+# Total table-type function count (includes table-in-out)
+query I
+SELECT COUNT(*)
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_type = 'table';
+----
+18
+
+# The 11 pure table functions (no TABLE parameter type)
+query T
+SELECT function_name
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_type = 'table'
+AND function_name IN (
+    'constant_columns', 'double_sequence', 'generator_exception',
+    'logging_generator', 'named_params_echo', 'nested_sequence',
+    'partitioned_sequence', 'projected_data', 'sequence',
+    'settings_aware', 'ten_thousand'
+)
+ORDER BY function_name;
+----
+constant_columns
+double_sequence
+generator_exception
+logging_generator
+named_params_echo
+nested_sequence
+partitioned_sequence
+projected_data
+sequence
+settings_aware
+ten_thousand
+
+# ============================================================================
+# Per-function Registration
+# Each query checks: name, parameters, parameter_types, description
+# Note: Table functions have return_type=NULL (output schema is determined at bind)
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# constant_columns — Varargs with dynamic output schema
+# Parameters: count (BIGINT), varargs=ANY
+# Each vararg value becomes a column in the output
+# ----------------------------------------------------------------------------
+
+query TTTT
+SELECT function_name, parameters, parameter_types, description
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_name = 'constant_columns';
+----
+constant_columns	[count]	[BIGINT]	Generates rows with constant values from varargs
+
+# ----------------------------------------------------------------------------
+# double_sequence — Float sequence generator
+# Parameters: count (BIGINT), batch_size (BIGINT named), increment (DOUBLE named)
+# Note: increment is DOUBLE (not BIGINT) for this function
+# Note: Named parameter ordering in duckdb_functions() is hash-dependent,
+#       so we sort the arrays for deterministic comparison.
+# ----------------------------------------------------------------------------
+
+query TTTT
+SELECT function_name, list_sort(parameters), list_sort(parameter_types), description
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_name = 'double_sequence';
+----
+double_sequence	[batch_size, count, increment]	[BIGINT, BIGINT, DOUBLE]	Generates a sequence of floating-point numbers from 0 to n-1
+
+# ----------------------------------------------------------------------------
+# generator_exception — Error handling test function
+# Parameters: fail_after (BIGINT)
+# ----------------------------------------------------------------------------
+
+query TTTT
+SELECT function_name, parameters, parameter_types, description
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_name = 'generator_exception';
+----
+generator_exception	[fail_after]	[BIGINT]	Raises an exception after N batches for testing
+
+# ----------------------------------------------------------------------------
+# logging_generator — Log message emission during generation
+# Parameters: count (BIGINT)
+# ----------------------------------------------------------------------------
+
+query TTTT
+SELECT function_name, parameters, parameter_types, description
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_name = 'logging_generator';
+----
+logging_generator	[count]	[BIGINT]	Emits log messages during generation
+
+# ----------------------------------------------------------------------------
+# named_params_echo — Echoes named parameter values in output columns
+# Parameters: count (BIGINT), enabled (BOOLEAN named), greeting (VARCHAR named),
+#             multiplier (BIGINT named), scale (DOUBLE named)
+# ----------------------------------------------------------------------------
+
+query TTTT
+SELECT function_name, list_sort(parameters), list_sort(parameter_types), description
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_name = 'named_params_echo';
+----
+named_params_echo	[count, enabled, greeting, multiplier, scale]	[BIGINT, BIGINT, BOOLEAN, DOUBLE, VARCHAR]	Echoes named parameter values in output columns
+
+# ----------------------------------------------------------------------------
+# nested_sequence — Struct and list output columns
+# Parameters: count (BIGINT), batch_size (BIGINT named), history_size (BIGINT named)
+# ----------------------------------------------------------------------------
+
+query TTTT
+SELECT function_name, list_sort(parameters), list_sort(parameter_types), description
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_name = 'nested_sequence';
+----
+nested_sequence	[batch_size, count, history_size]	[BIGINT, BIGINT, BIGINT]	Generates a sequence with nested struct and list columns
+
+# ----------------------------------------------------------------------------
+# partitioned_sequence — Multi-worker parallel execution via work queue
+# Parameters: count (BIGINT), increment (BIGINT named)
+# ----------------------------------------------------------------------------
+
+query TTTT
+SELECT function_name, parameters, parameter_types, description
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_name = 'partitioned_sequence';
+----
+partitioned_sequence	[count, increment]	[BIGINT, BIGINT]	Generates a partitioned sequence for multi-worker execution
+
+# ----------------------------------------------------------------------------
+# projected_data — 4-column output with projection pushdown
+# Parameters: count (BIGINT)
+# ----------------------------------------------------------------------------
+
+query TTTT
+SELECT function_name, parameters, parameter_types, description
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_name = 'projected_data';
+----
+projected_data	[count]	[BIGINT]	Generates data with 4 columns, supporting projection pushdown
+
+# ----------------------------------------------------------------------------
+# sequence — Integer sequence generator with optional increment
+# Parameters: count (BIGINT), batch_size (BIGINT named), increment (BIGINT named)
+# ----------------------------------------------------------------------------
+
+query TTTT
+SELECT function_name, list_sort(parameters), list_sort(parameter_types), description
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_name = 'sequence';
+----
+sequence	[batch_size, count, increment]	[BIGINT, BIGINT, BIGINT]	Generates a sequence of integers from 0 to n-1
+
+# ----------------------------------------------------------------------------
+# settings_aware — Output depends on DuckDB settings
+# Parameters: count (BIGINT)
+# Note: Settings (vgi_verbose_mode, greeting, multiplier) are passed internally,
+#       not as function parameters
+# ----------------------------------------------------------------------------
+
+query TTTT
+SELECT function_name, parameters, parameter_types, description
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_name = 'settings_aware';
+----
+settings_aware	[count]	[BIGINT]	Generates data demonstrating settings are passed
+
+# ----------------------------------------------------------------------------
+# ten_thousand — No parameters, fixed 10000-row output
+# Parameters: (none)
+# ----------------------------------------------------------------------------
+
+query TTTT
+SELECT function_name, parameters, parameter_types, description
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_name = 'ten_thousand';
+----
+ten_thousand	[]	[]	Generates 10000 integers from 0 to 9999
+
+# ============================================================================
+# Varargs
+# Only constant_columns declares varargs (accepts variable number of ANY-typed args)
+# ============================================================================
+
+query TT
+SELECT function_name, varargs
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_type = 'table'
+AND function_name IN (
+    'constant_columns', 'double_sequence', 'generator_exception',
+    'logging_generator', 'named_params_echo', 'nested_sequence',
+    'partitioned_sequence', 'projected_data', 'sequence',
+    'settings_aware', 'ten_thousand'
+)
+AND varargs IS NOT NULL;
+----
+constant_columns	ANY
+
+# ============================================================================
+# Categories
+# Functions declare categories for discoverability
+# ============================================================================
+
+query TT
+SELECT function_name, categories
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_name = 'sequence';
+----
+sequence	[generator, utility]
+
+query TT
+SELECT function_name, categories
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_name = 'generator_exception';
+----
+generator_exception	[testing]
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;
