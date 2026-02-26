@@ -20,45 +20,45 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 # Basic integer tests
 # ============================================================================
 
-query I
-SELECT example.double(1);
+query IT
+SELECT example.double(1), typeof(example.double(1));
 ----
-2
+2	BIGINT
 
-query I
-SELECT example.double(21);
+query IT
+SELECT example.double(21), typeof(example.double(21));
 ----
-42
+42	BIGINT
 
-query I
-SELECT example.double(0);
+query IT
+SELECT example.double(0), typeof(example.double(0));
 ----
-0
+0	BIGINT
 
-query I
-SELECT example.double(-5);
+query IT
+SELECT example.double(-5), typeof(example.double(-5));
 ----
--10
+-10	BIGINT
 
 # ============================================================================
 # Multiple rows from table
 # ============================================================================
 
-query I
-SELECT example.double(x) FROM (VALUES (1), (2), (3), (4), (5)) t(x);
+query IT
+SELECT example.double(x), typeof(example.double(x)) FROM (VALUES (1), (2), (3), (4), (5)) t(x);
 ----
-2
-4
-6
-8
-10
+2	BIGINT
+4	BIGINT
+6	BIGINT
+8	BIGINT
+10	BIGINT
 
-query I
-SELECT example.double(val) FROM (VALUES (10), (20), (30)) t(val) ORDER BY val;
+query IT
+SELECT example.double(val), typeof(example.double(val)) FROM (VALUES (10), (20), (30)) t(val) ORDER BY val;
 ----
-20
-40
-60
+20	BIGINT
+40	BIGINT
+60	BIGINT
 
 # ============================================================================
 # Larger datasets
@@ -93,14 +93,14 @@ SELECT COUNT(*) FROM (
 # Integration with other SQL operations
 # ============================================================================
 
-query II
-SELECT val, example.double(val) AS doubled
+query IIT
+SELECT val, example.double(val) AS doubled, typeof(example.double(val))
 FROM (VALUES (5), (10), (15)) t(val)
 ORDER BY val;
 ----
-5	10
-10	20
-15	30
+5	10	BIGINT
+10	20	BIGINT
+15	30	BIGINT
 
 query I
 SELECT SUM(example.double(x)) FROM (VALUES (1), (2), (3)) t(x);
@@ -111,60 +111,60 @@ SELECT SUM(example.double(x)) FROM (VALUES (1), (2), (3)) t(x);
 # With expressions
 # ============================================================================
 
-query I
-SELECT example.double(10 + 5);
+query IT
+SELECT example.double(10 + 5), typeof(example.double(10 + 5));
 ----
-30
+30	BIGINT
 
-query I
-SELECT example.double(x * 2) FROM (VALUES (5)) t(x);
+query IT
+SELECT example.double(x * 2), typeof(example.double(x * 2)) FROM (VALUES (5)) t(x);
 ----
-20
+20	BIGINT
 
 # ============================================================================
 # Type-specific tests
 # ============================================================================
 
 # BIGINT
-query I
-SELECT example.double(100::BIGINT);
+query IT
+SELECT example.double(100::BIGINT), typeof(example.double(100::BIGINT));
 ----
-200
+200	BIGINT
 
 # INTEGER
-query I
-SELECT example.double(50::INTEGER);
+query IT
+SELECT example.double(50::INTEGER), typeof(example.double(50::INTEGER));
 ----
-100
+100	BIGINT
 
 # SMALLINT
-query I
-SELECT example.double(10::SMALLINT);
+query IT
+SELECT example.double(10::SMALLINT), typeof(example.double(10::SMALLINT));
 ----
-20
+20	INTEGER
 
 # DOUBLE
-query R
-SELECT example.double(3.14::DOUBLE);
+query RT
+SELECT example.double(3.14::DOUBLE), typeof(example.double(3.14::DOUBLE));
 ----
-6.28
+6.28	DOUBLE
 
-query R
-SELECT example.double(2.5::DOUBLE);
+query RT
+SELECT example.double(2.5::DOUBLE), typeof(example.double(2.5::DOUBLE));
 ----
-5.0
+5.0	DOUBLE
 
-# FLOAT
-query R
-SELECT example.double(1.5::FLOAT);
+# FLOAT (promoted to DOUBLE for overflow safety)
+query RT
+SELECT example.double(1.5::FLOAT), typeof(example.double(1.5::FLOAT));
 ----
-3.0
+3.0	DOUBLE
 
 # ============================================================================
 # Return type validation (ANY type resolution via on_bind)
 # The double function uses ArrowAny input/output types. The worker's on_bind
 # promotes the output type to prevent overflow: int promotes up one size,
-# float/double stay the same. These tests ensure the type resolution is correct.
+# float32 promotes to float64, float64 stays the same.
 # ============================================================================
 
 # INTEGER (int32) input -> BIGINT (int64) output
@@ -191,17 +191,17 @@ SELECT typeof(example.double(1::TINYINT));
 ----
 SMALLINT
 
-# DOUBLE (float64) input -> DOUBLE (float64) output (no promotion for floats)
+# DOUBLE (float64) input -> DOUBLE (float64) output
 query I
 SELECT typeof(example.double(1.0::DOUBLE));
 ----
 DOUBLE
 
-# FLOAT (float32) input -> FLOAT (float32) output (no promotion for floats)
+# FLOAT (float32) input -> DOUBLE (float64) output (promoted for overflow safety)
 query I
 SELECT typeof(example.double(1.0::FLOAT));
 ----
-FLOAT
+DOUBLE
 
 # Verify type is consistent across multiple rows
 query I
@@ -242,90 +242,90 @@ SELECT COUNT(*) FROM (
 # Zero values
 # ============================================================================
 
-query I
-SELECT example.double(0::INTEGER);
+query IT
+SELECT example.double(0::INTEGER), typeof(example.double(0::INTEGER));
 ----
-0
+0	BIGINT
 
-query I
-SELECT example.double(0::BIGINT);
+query IT
+SELECT example.double(0::BIGINT), typeof(example.double(0::BIGINT));
 ----
-0
+0	BIGINT
 
-query R
-SELECT example.double(0.0::DOUBLE);
+query RT
+SELECT example.double(0.0::DOUBLE), typeof(example.double(0.0::DOUBLE));
 ----
-0.0
+0.0	DOUBLE
 
 # ============================================================================
 # Negative numbers
 # ============================================================================
 
-query I
-SELECT example.double(-1);
+query IT
+SELECT example.double(-1), typeof(example.double(-1));
 ----
--2
+-2	BIGINT
 
-query I
-SELECT example.double(-100);
+query IT
+SELECT example.double(-100), typeof(example.double(-100));
 ----
--200
+-200	BIGINT
 
-query I
-SELECT example.double(-1000000);
+query IT
+SELECT example.double(-1000000), typeof(example.double(-1000000));
 ----
--2000000
+-2000000	BIGINT
 
-query R
-SELECT example.double(-3.14::DOUBLE);
+query RT
+SELECT example.double(-3.14::DOUBLE), typeof(example.double(-3.14::DOUBLE));
 ----
--6.28
+-6.28	DOUBLE
 
 # ============================================================================
 # Large integer values
 # ============================================================================
 
-query I
-SELECT example.double(1000000000::BIGINT);
+query IT
+SELECT example.double(1000000000::BIGINT), typeof(example.double(1000000000::BIGINT));
 ----
-2000000000
+2000000000	BIGINT
 
-query I
-SELECT example.double(999999999::BIGINT);
+query IT
+SELECT example.double(999999999::BIGINT), typeof(example.double(999999999::BIGINT));
 ----
-1999999998
+1999999998	BIGINT
 
-query I
-SELECT example.double(-1000000000::BIGINT);
+query IT
+SELECT example.double(-1000000000::BIGINT), typeof(example.double(-1000000000::BIGINT));
 ----
--2000000000
+-2000000000	BIGINT
 
 # ============================================================================
 # Small decimal values
 # ============================================================================
 
-query R
-SELECT example.double(0.001::DOUBLE);
+query RT
+SELECT example.double(0.001::DOUBLE), typeof(example.double(0.001::DOUBLE));
 ----
-0.002
+0.002	DOUBLE
 
-query R
-SELECT example.double(0.0001::DOUBLE);
+query RT
+SELECT example.double(0.0001::DOUBLE), typeof(example.double(0.0001::DOUBLE));
 ----
-0.0002
+0.0002	DOUBLE
 
 # ============================================================================
 # Mixed signs in batch
 # ============================================================================
 
-query I
-SELECT example.double(x) FROM (VALUES (-5), (0), (5), (-10), (10)) t(x);
+query IT
+SELECT example.double(x), typeof(example.double(x)) FROM (VALUES (-5), (0), (5), (-10), (10)) t(x);
 ----
--10
-0
-10
--20
-20
+-10	BIGINT
+0	BIGINT
+10	BIGINT
+-20	BIGINT
+20	BIGINT
 
 # ============================================================================
 # Cleanup

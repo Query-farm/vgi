@@ -200,11 +200,11 @@ SELECT typeof(example.add_values(1.0::DOUBLE, 2.0::DOUBLE));
 ----
 DOUBLE
 
-# FLOAT + FLOAT -> common float32, no promotion for floats -> FLOAT
+# FLOAT + FLOAT -> common float32, promoted to float64 -> DOUBLE
 query I
 SELECT typeof(example.add_values(1.0::FLOAT, 2.0::FLOAT));
 ----
-FLOAT
+DOUBLE
 
 # Mixed: INTEGER + DOUBLE -> common float64 (Arrow upcasts int32 to float64), promoted to DOUBLE
 query I

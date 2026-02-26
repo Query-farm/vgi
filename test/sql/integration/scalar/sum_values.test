@@ -252,11 +252,11 @@ SELECT typeof(example.sum_values(1.0::DOUBLE, 2.0::DOUBLE, 3.0::DOUBLE));
 ----
 DOUBLE
 
-# FLOAT varargs -> first arg float32, no promotion for floats -> FLOAT
+# FLOAT varargs -> first arg float32, promoted to float64 -> DOUBLE
 query I
 SELECT typeof(example.sum_values(1.0::FLOAT, 2.0::FLOAT));
 ----
-FLOAT
+DOUBLE
 
 # Single argument type resolution
 query I
