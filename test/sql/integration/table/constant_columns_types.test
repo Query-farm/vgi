@@ -1,0 +1,524 @@
+# name: test/sql/integration/table/constant_columns_types.test
+# description: Tests explicit DuckDB types through constant_columns Arrow round-trip
+# group: [vgi_integration_table]
+
+# Verifies that explicitly-typed values survive the varargs -> pa.repeat(scalar, N)
+# -> Arrow IPC round-trip through constant_columns. Each section tests one type with
+# typeof() + value checks on 3 rows.
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+SET arrow_lossless_conversion = true;
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# Signed integer types
+# ============================================================================
+
+# --- TINYINT ---
+
+query I
+SELECT typeof(col_0) FROM example.constant_columns(1, 42::TINYINT);
+----
+TINYINT
+
+query I
+SELECT col_0 FROM example.constant_columns(3, 42::TINYINT);
+----
+42
+42
+42
+
+# TINYINT min/max
+query II
+SELECT col_0, col_1 FROM example.constant_columns(3, (-128)::TINYINT, 127::TINYINT);
+----
+-128	127
+-128	127
+-128	127
+
+# --- SMALLINT ---
+
+query I
+SELECT typeof(col_0) FROM example.constant_columns(1, 1000::SMALLINT);
+----
+SMALLINT
+
+query I
+SELECT col_0 FROM example.constant_columns(3, 1000::SMALLINT);
+----
+1000
+1000
+1000
+
+# --- INTEGER ---
+
+query I
+SELECT typeof(col_0) FROM example.constant_columns(1, 100000::INTEGER);
+----
+INTEGER
+
+query I
+SELECT col_0 FROM example.constant_columns(3, 100000::INTEGER);
+----
+100000
+100000
+100000
+
+# --- BIGINT ---
+
+query I
+SELECT typeof(col_0) FROM example.constant_columns(1, 9223372036854775807::BIGINT);
+----
+BIGINT
+
+query I
+SELECT col_0 FROM example.constant_columns(3, 9223372036854775807::BIGINT);
+----
+9223372036854775807
+9223372036854775807
+9223372036854775807
+
+# --- HUGEINT ---
+# Note: HUGEINT may round-trip as HUGEINT or DECIMAL depending on Arrow mapping
+
+query I
+SELECT col_0 FROM example.constant_columns(3, 170141183460469231731687303715884105727::HUGEINT);
+----
+170141183460469231731687303715884105727
+170141183460469231731687303715884105727
+170141183460469231731687303715884105727
+
+# ============================================================================
+# Unsigned integer types
+# ============================================================================
+
+# --- UTINYINT ---
+
+query I
+SELECT typeof(col_0) FROM example.constant_columns(1, 255::UTINYINT);
+----
+UTINYINT
+
+query I
+SELECT col_0 FROM example.constant_columns(3, 255::UTINYINT);
+----
+255
+255
+255
+
+# --- USMALLINT ---
+
+query I
+SELECT typeof(col_0) FROM example.constant_columns(1, 65535::USMALLINT);
+----
+USMALLINT
+
+query I
+SELECT col_0 FROM example.constant_columns(3, 65535::USMALLINT);
+----
+65535
+65535
+65535
+
+# --- UINTEGER ---
+
+query I
+SELECT typeof(col_0) FROM example.constant_columns(1, 4294967295::UINTEGER);
+----
+UINTEGER
+
+query I
+SELECT col_0 FROM example.constant_columns(3, 4294967295::UINTEGER);
+----
+4294967295
+4294967295
+4294967295
+
+# --- UBIGINT ---
+
+query I
+SELECT typeof(col_0) FROM example.constant_columns(1, 18446744073709551615::UBIGINT);
+----
+UBIGINT
+
+query I
+SELECT col_0 FROM example.constant_columns(3, 18446744073709551615::UBIGINT);
+----
+18446744073709551615
+18446744073709551615
+18446744073709551615
+
+# ============================================================================
+# Float types
+# ============================================================================
+
+# --- FLOAT ---
+# Note: 3.14::FLOAT displays with float32 precision artifacts (~3.140000104904175)
+
+query I
+SELECT typeof(col_0) FROM example.constant_columns(1, 3.14::FLOAT);
+----
+FLOAT
+
+query I
+SELECT col_0::VARCHAR FROM example.constant_columns(3, 3.14::FLOAT);
+----
+3.14
+3.14
+3.14
+
+# --- DOUBLE ---
+
+query I
+SELECT typeof(col_0) FROM example.constant_columns(1, 3.141592653589793::DOUBLE);
+----
+DOUBLE
+
+query R
+SELECT col_0 FROM example.constant_columns(3, 3.141592653589793::DOUBLE);
+----
+3.141592653589793
+3.141592653589793
+3.141592653589793
+
+# ============================================================================
+# Decimal types
+# ============================================================================
+
+# --- DECIMAL(4,1) ---
+
+query I
+SELECT typeof(col_0) FROM example.constant_columns(1, 12.3::DECIMAL(4,1));
+----
+DECIMAL(4,1)
+
+query I
+SELECT col_0 FROM example.constant_columns(3, 12.3::DECIMAL(4,1));
+----
+12.3
+12.3
+12.3
+
+# --- DECIMAL(9,4) ---
+
+query I
+SELECT typeof(col_0) FROM example.constant_columns(1, 1234.5678::DECIMAL(9,4));
+----
+DECIMAL(9,4)
+
+query I
+SELECT col_0 FROM example.constant_columns(3, 1234.5678::DECIMAL(9,4));
+----
+1234.5678
+1234.5678
+1234.5678
+
+# --- DECIMAL(18,6) ---
+
+query I
+SELECT typeof(col_0) FROM example.constant_columns(1, 123456789012.123456::DECIMAL(18,6));
+----
+DECIMAL(18,6)
+
+query I
+SELECT col_0 FROM example.constant_columns(3, 123456789012.123456::DECIMAL(18,6));
+----
+123456789012.123456
+123456789012.123456
+123456789012.123456
+
+# ============================================================================
+# Boolean
+# ============================================================================
+
+query I
+SELECT typeof(col_0) FROM example.constant_columns(1, true);
+----
+BOOLEAN
+
+query II
+SELECT col_0, col_1 FROM example.constant_columns(3, true, false);
+----
+true	false
+true	false
+true	false
+
+# ============================================================================
+# Date/Time types
+# ============================================================================
+
+# --- DATE ---
+
+query I
+SELECT typeof(col_0) FROM example.constant_columns(1, '2024-01-15'::DATE);
+----
+DATE
+
+query I
+SELECT col_0 FROM example.constant_columns(3, '2024-01-15'::DATE);
+----
+2024-01-15
+2024-01-15
+2024-01-15
+
+# --- TIMESTAMP ---
+
+query I
+SELECT typeof(col_0) FROM example.constant_columns(1, '2024-01-15 12:30:45'::TIMESTAMP);
+----
+TIMESTAMP
+
+query I
+SELECT col_0 FROM example.constant_columns(3, '2024-01-15 12:30:45'::TIMESTAMP);
+----
+2024-01-15 12:30:45
+2024-01-15 12:30:45
+2024-01-15 12:30:45
+
+# --- TIMESTAMP_S ---
+
+query I
+SELECT typeof(col_0) FROM example.constant_columns(1, '2024-01-15 12:30:45'::TIMESTAMP_S);
+----
+TIMESTAMP_S
+
+query I
+SELECT col_0 FROM example.constant_columns(3, '2024-01-15 12:30:45'::TIMESTAMP_S);
+----
+2024-01-15 12:30:45
+2024-01-15 12:30:45
+2024-01-15 12:30:45
+
+# --- TIMESTAMP_MS ---
+
+query I
+SELECT typeof(col_0) FROM example.constant_columns(1, '2024-01-15 12:30:45.123'::TIMESTAMP_MS);
+----
+TIMESTAMP_MS
+
+query I
+SELECT col_0 FROM example.constant_columns(3, '2024-01-15 12:30:45.123'::TIMESTAMP_MS);
+----
+2024-01-15 12:30:45.123
+2024-01-15 12:30:45.123
+2024-01-15 12:30:45.123
+
+# --- TIMESTAMP_NS ---
+
+query I
+SELECT typeof(col_0) FROM example.constant_columns(1, '2024-01-15 12:30:45.123456789'::TIMESTAMP_NS);
+----
+TIMESTAMP_NS
+
+query I
+SELECT col_0 FROM example.constant_columns(3, '2024-01-15 12:30:45.123456789'::TIMESTAMP_NS);
+----
+2024-01-15 12:30:45.123456789
+2024-01-15 12:30:45.123456789
+2024-01-15 12:30:45.123456789
+
+# --- TIMESTAMPTZ ---
+
+query I
+SELECT typeof(col_0) FROM example.constant_columns(1, '2024-01-15 12:30:45+00'::TIMESTAMPTZ);
+----
+TIMESTAMP WITH TIME ZONE
+
+query I
+SELECT col_0 FROM example.constant_columns(3, '2024-01-15 12:30:45+00'::TIMESTAMPTZ);
+----
+2024-01-15 12:30:45+00
+2024-01-15 12:30:45+00
+2024-01-15 12:30:45+00
+
+# --- TIME ---
+# Note: Avoid 24:00:00 — DuckDB allows it but Arrow rejects it
+
+query I
+SELECT typeof(col_0) FROM example.constant_columns(1, '12:30:45'::TIME);
+----
+TIME
+
+query I
+SELECT col_0 FROM example.constant_columns(3, '12:30:45'::TIME);
+----
+12:30:45
+12:30:45
+12:30:45
+
+# --- INTERVAL ---
+
+query I
+SELECT typeof(col_0) FROM example.constant_columns(1, INTERVAL '1 year 2 months 3 days');
+----
+INTERVAL
+
+query I
+SELECT col_0 FROM example.constant_columns(3, INTERVAL '1 year 2 months 3 days');
+----
+1 year 2 months 3 days
+1 year 2 months 3 days
+1 year 2 months 3 days
+
+# ============================================================================
+# String/Binary types
+# ============================================================================
+
+# --- VARCHAR ---
+
+query I
+SELECT typeof(col_0) FROM example.constant_columns(1, 'hello world'::VARCHAR);
+----
+VARCHAR
+
+query I
+SELECT col_0 FROM example.constant_columns(3, 'hello world'::VARCHAR);
+----
+hello world
+hello world
+hello world
+
+# --- BLOB ---
+
+query I
+SELECT typeof(col_0) FROM example.constant_columns(1, '\xDEADBEEF'::BLOB);
+----
+BLOB
+
+query I
+SELECT col_0 FROM example.constant_columns(3, '\xDEADBEEF'::BLOB);
+----
+\xDEADBEEF
+\xDEADBEEF
+\xDEADBEEF
+
+# --- UUID ---
+
+query I
+SELECT typeof(col_0) FROM example.constant_columns(1, '550e8400-e29b-41d4-a716-446655440000'::UUID);
+----
+UUID
+
+query I
+SELECT col_0 FROM example.constant_columns(3, '550e8400-e29b-41d4-a716-446655440000'::UUID);
+----
+550e8400-e29b-41d4-a716-446655440000
+550e8400-e29b-41d4-a716-446655440000
+550e8400-e29b-41d4-a716-446655440000
+
+# ============================================================================
+# Enum type
+# Note: ENUMs return as VARCHAR after Arrow round-trip (Arrow dictionary type
+# does not preserve DuckDB enum identity)
+# ============================================================================
+
+statement ok
+CREATE TYPE test_mood AS ENUM ('happy', 'sad', 'neutral');
+
+query I
+SELECT typeof(col_0) FROM example.constant_columns(1, 'happy'::test_mood);
+----
+VARCHAR
+
+query I
+SELECT col_0 FROM example.constant_columns(3, 'happy'::test_mood);
+----
+happy
+happy
+happy
+
+statement ok
+DROP TYPE test_mood;
+
+# ============================================================================
+# Typed list columns
+# ============================================================================
+
+query I
+SELECT typeof(col_0) FROM example.constant_columns(1, [1, 2, 3]::INTEGER[]);
+----
+INTEGER[]
+
+query I
+SELECT col_0 FROM example.constant_columns(3, [1, 2, 3]::INTEGER[]);
+----
+[1, 2, 3]
+[1, 2, 3]
+[1, 2, 3]
+
+query I
+SELECT typeof(col_0) FROM example.constant_columns(1, ['a', 'b']::VARCHAR[]);
+----
+VARCHAR[]
+
+query I
+SELECT col_0 FROM example.constant_columns(3, ['a', 'b']::VARCHAR[]);
+----
+[a, b]
+[a, b]
+[a, b]
+
+query I
+SELECT typeof(col_0) FROM example.constant_columns(1, [1.5, 2.5]::DOUBLE[]);
+----
+DOUBLE[]
+
+query I
+SELECT col_0 FROM example.constant_columns(3, [1.5, 2.5]::DOUBLE[]);
+----
+[1.5, 2.5]
+[1.5, 2.5]
+[1.5, 2.5]
+
+# ============================================================================
+# NULL values with explicit types
+# ============================================================================
+
+query IIII
+SELECT typeof(col_0), typeof(col_1), typeof(col_2), typeof(col_3)
+FROM example.constant_columns(1, NULL::INTEGER, NULL::VARCHAR, NULL::BOOLEAN, NULL::DATE);
+----
+INTEGER	VARCHAR	BOOLEAN	DATE
+
+query IIII
+SELECT col_0, col_1, col_2, col_3
+FROM example.constant_columns(3, NULL::INTEGER, NULL::VARCHAR, NULL::BOOLEAN, NULL::DATE);
+----
+NULL	NULL	NULL	NULL
+NULL	NULL	NULL	NULL
+NULL	NULL	NULL	NULL
+
+# ============================================================================
+# Edge values
+# ============================================================================
+
+# Zero values across types
+query IIRI
+SELECT col_0, col_1, col_2, col_3
+FROM example.constant_columns(3, 0::TINYINT, 0::INTEGER, 0.0::FLOAT, ''::VARCHAR);
+----
+0	0	0.0	(empty)
+0	0	0.0	(empty)
+0	0	0.0	(empty)
+
+# Empty containers
+query II
+SELECT col_0, col_1
+FROM example.constant_columns(3, []::INTEGER[], MAP {}::MAP(VARCHAR, INTEGER));
+----
+[]	{}
+[]	{}
+[]	{}
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;
