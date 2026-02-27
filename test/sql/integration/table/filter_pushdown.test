@@ -1,6 +1,6 @@
 # name: test/sql/integration/table/filter_pushdown.test
 # description: Filter pushdown tests for VGI table functions
-# group: [vgi]
+# group: [vgi_integration_table]
 
 require-env VGI_TEST_WORKER
 

@@ -1,6 +1,6 @@
 # name: test/sql/integration/table_in_out/distributed_sum.test
 # description: Integration tests for VGI distributed sum table-in-out functions
-# group: [vgi]
+# group: [vgi_integration_table_in_out]
 
 # This test requires a VGI worker to be available
 # Set VGI_TEST_WORKER environment variable to the path of a VGI worker executable

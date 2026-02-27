@@ -1,6 +1,6 @@
 # name: test/sql/integration/scalar/random_int.test
 # description: Tests for VGI random_int scalar function
-# group: [vgi]
+# group: [vgi_integration_scalar]
 
 require-env VGI_TEST_WORKER
 

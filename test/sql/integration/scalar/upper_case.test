@@ -1,6 +1,6 @@
 # name: test/sql/integration/scalar/upper_case.test
 # description: Integration tests for VGI upper_case scalar function
-# group: [vgi]
+# group: [vgi_integration_scalar]
 
 # This test requires a VGI worker to be available
 # Set VGI_TEST_WORKER environment variable to the path of a VGI worker executable

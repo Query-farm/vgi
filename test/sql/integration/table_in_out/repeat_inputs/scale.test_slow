@@ -1,6 +1,6 @@
 # name: test/sql/integration/table_in_out/repeat_inputs/scale.test_slow
 # description: Scale tests for VGI repeat_inputs table-in-out function
-# group: [vgi]
+# group: [vgi_integration_table_in_out_repeat_inputs]
 
 require-env VGI_TEST_WORKER
 

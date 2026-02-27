@@ -1,6 +1,6 @@
 # name: test/sql/integration/table_in_out/echo/projection_filters.test
 # description: Projection and filter pushdown tests for VGI echo table-in-out function
-# group: [vgi]
+# group: [vgi_integration_table_in_out_echo]
 
 require-env VGI_TEST_WORKER
 

@@ -1,6 +1,6 @@
 # name: test/sql/integration/scalar/conditional_message.test
 # description: Tests for VGI conditional_message scalar function with ConstParam
-# group: [vgi]
+# group: [vgi_integration_scalar]
 
 require-env VGI_TEST_WORKER
 

@@ -1,6 +1,6 @@
 # name: test/sql/integration/table/projected_data.test
 # description: Integration tests for VGI projected_data table function
-# group: [vgi]
+# group: [vgi_integration_table]
 
 # This test requires a VGI worker to be available
 # Set VGI_TEST_WORKER environment variable to the path of a VGI worker executable
