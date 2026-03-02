@@ -231,6 +231,26 @@ std::vector<VgiFunctionInfo> InvokeCatalogSchemaContentsFunctions(
 	return functions;
 }
 
+std::vector<VgiMacroInfo> InvokeCatalogSchemaContentsMacros(
+    const std::string &worker_path, const std::vector<uint8_t> &attach_id, const std::string &schema_name,
+    const std::string &macro_type, ClientContext &context, bool worker_debug, bool use_pool) {
+	auto params = BuildSchemaContentsFunctionsParams(attach_id, schema_name, macro_type);
+	auto response =
+	    InvokeRpcMethod(worker_path, "catalog_schema_contents_macros", params, context, worker_debug, use_pool);
+	auto result_batch = ExtractAndDeserializeResult(response, "catalog_schema_contents_macros", worker_path);
+	if (!result_batch) {
+		return {};
+	}
+
+	auto item_bytes_list = UnwrapBinaryResponseItems(result_batch);
+	std::vector<VgiMacroInfo> macros;
+	for (const auto &item_bytes : item_bytes_list) {
+		auto info_batch = DeserializeFromIpcBytes(item_bytes);
+		macros.push_back(ParseMacroInfo(info_batch, worker_path));
+	}
+	return macros;
+}
+
 std::optional<VgiTableInfo> InvokeCatalogTableGet(const std::string &worker_path,
                                                    const std::vector<uint8_t> &attach_id,
                                                    const std::string &schema_name, const std::string &table_name,
@@ -688,6 +708,31 @@ VgiViewInfo ParseViewInfo(const std::shared_ptr<arrow::RecordBatch> &batch, cons
 	info.definition = row["definition"].value_not_null<std::string>();
 	info.comment = row["comment"].value_or("");
 	info.tags = row["tags"].value_not_null<std::map<std::string, std::string>>();
+
+	return info;
+}
+
+VgiMacroInfo ParseMacroInfo(const std::shared_ptr<arrow::RecordBatch> &batch, const std::string &worker_path) {
+	VgiMacroInfo info;
+
+	if (!batch || batch->num_rows() == 0) {
+		throw IOException("Empty response from macro_get");
+	}
+
+	RecordBatchSingleRow row(batch, 0, "MacroInfo", worker_path);
+	info.name = row["name"].value_not_null<std::string>();
+	info.schema_name = row["schema_name"].value_not_null<std::string>();
+	info.macro_type = row["macro_type"].value_not_null<std::string>();
+	info.definition = row["definition"].value_not_null<std::string>();
+	info.comment = row["comment"].value_or("");
+	info.tags = row["tags"].value_not_null<std::map<std::string, std::string>>();
+	info.parameters = row["parameters"].value_not_null<std::vector<std::string>>();
+
+	// parameter_default_values is nullable binary (IPC bytes)
+	auto default_bytes = row["parameter_default_values"].as<std::vector<uint8_t>>();
+	if (default_bytes && !default_bytes->empty()) {
+		info.parameter_default_values_bytes = std::move(*default_bytes);
+	}
 
 	return info;
 }

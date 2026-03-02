@@ -1,0 +1,105 @@
+# name: test/sql/integration/view/views.test
+# description: Tests for VGI view support
+# group: [vgi_integration_view]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# View inventory: views should appear in duckdb_views()
+# ============================================================================
+
+query III rowsort
+SELECT database_name, schema_name, view_name FROM duckdb_views() WHERE database_name = 'example';
+----
+example	data	small_numbers
+example	main	even_numbers
+example	main	first_ten
+
+# ============================================================================
+# main.first_ten — SELECT * FROM sequence(10) → n: 0..9
+# ============================================================================
+
+query I
+SELECT COUNT(*) FROM example.first_ten;
+----
+10
+
+query I
+SELECT MIN(n) FROM example.first_ten;
+----
+0
+
+query I
+SELECT MAX(n) FROM example.first_ten;
+----
+9
+
+query I rowsort
+SELECT n FROM example.first_ten;
+----
+0
+1
+2
+3
+4
+5
+6
+7
+8
+9
+
+# ============================================================================
+# main.even_numbers — SELECT * FROM sequence(100) WHERE n % 2 = 0 → 50 rows
+# ============================================================================
+
+query I
+SELECT COUNT(*) FROM example.even_numbers;
+----
+50
+
+query I
+SELECT MIN(n) FROM example.even_numbers;
+----
+0
+
+query I
+SELECT MAX(n) FROM example.even_numbers;
+----
+98
+
+# Verify all values are even
+query I
+SELECT COUNT(*) FROM example.even_numbers WHERE n % 2 != 0;
+----
+0
+
+# ============================================================================
+# data.small_numbers — SELECT * FROM numbers WHERE value < 10 → 10 rows
+# ============================================================================
+
+query I
+SELECT COUNT(*) FROM example.data.small_numbers;
+----
+10
+
+query I
+SELECT MIN(value) FROM example.data.small_numbers;
+----
+0
+
+query I
+SELECT MAX(value) FROM example.data.small_numbers;
+----
+9
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;

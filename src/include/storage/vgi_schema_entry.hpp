@@ -1,6 +1,7 @@
 #pragma once
 
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
+#include "storage/vgi_macro_set.hpp"
 #include "storage/vgi_scalar_function_set.hpp"
 #include "storage/vgi_table_function_set.hpp"
 #include "storage/vgi_table_set.hpp"
@@ -51,6 +52,8 @@ private:
 	VgiViewSet views_;
 	VgiScalarFunctionSet scalar_functions_;
 	VgiTableFunctionSet table_functions_;
+	VgiMacroSet scalar_macros_;
+	VgiMacroSet table_macros_;
 };
 
 } // namespace duckdb

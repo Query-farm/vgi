@@ -1,0 +1,132 @@
+# name: test/sql/integration/macro/macros.test
+# description: Tests for VGI macro support (scalar and table macros)
+# group: [vgi_integration_macro]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# Macro inventory: macros should appear in duckdb_functions()
+# ============================================================================
+
+# Scalar macros
+query IIII rowsort
+SELECT database_name, schema_name, function_name, function_type
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_type = 'macro';
+----
+example	main	vgi_clamp	macro
+example	main	vgi_multiply	macro
+
+# Table macros
+query IIII rowsort
+SELECT database_name, schema_name, function_name, function_type
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_type = 'table_macro';
+----
+example	main	vgi_range_table	table_macro
+
+# ============================================================================
+# vgi_multiply(x, y) — x * y
+# ============================================================================
+
+query I
+SELECT example.vgi_multiply(3, 4);
+----
+12
+
+query I
+SELECT example.vgi_multiply(0, 100);
+----
+0
+
+query I
+SELECT example.vgi_multiply(-5, 3);
+----
+-15
+
+# Works with expressions
+query I
+SELECT example.vgi_multiply(2 + 3, 4);
+----
+20
+
+# ============================================================================
+# vgi_clamp(val, lo, hi) — GREATEST(lo, LEAST(hi, val))
+# Defaults: lo=0, hi=100
+# ============================================================================
+
+# All arguments specified
+query I
+SELECT example.vgi_clamp(50, 0, 100);
+----
+50
+
+# Value below lo
+query I
+SELECT example.vgi_clamp(-10, 0, 100);
+----
+0
+
+# Value above hi
+query I
+SELECT example.vgi_clamp(200, 0, 100);
+----
+100
+
+# Using defaults (lo=0, hi=100)
+query I
+SELECT example.vgi_clamp(50);
+----
+50
+
+query I
+SELECT example.vgi_clamp(-10);
+----
+0
+
+query I
+SELECT example.vgi_clamp(200);
+----
+100
+
+# Override just one default
+query I
+SELECT example.vgi_clamp(5, lo := 10);
+----
+10
+
+query I
+SELECT example.vgi_clamp(50, hi := 25);
+----
+25
+
+# ============================================================================
+# vgi_range_table(n) — SELECT * FROM range(n)
+# ============================================================================
+
+query I
+SELECT COUNT(*) FROM example.vgi_range_table(10);
+----
+10
+
+query I
+SELECT MIN(range) FROM example.vgi_range_table(5);
+----
+0
+
+query I
+SELECT MAX(range) FROM example.vgi_range_table(5);
+----
+4
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;

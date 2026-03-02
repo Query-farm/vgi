@@ -109,6 +109,18 @@ struct VgiViewInfo {
 	std::map<std::string, std::string> tags;
 };
 
+// Macro metadata from the worker
+struct VgiMacroInfo {
+	std::string name;
+	std::string schema_name;
+	std::string macro_type;   // "scalar" or "table"
+	std::string definition;
+	std::string comment;
+	std::vector<std::string> parameters;
+	std::vector<uint8_t> parameter_default_values_bytes;  // IPC-serialized defaults batch
+	std::map<std::string, std::string> tags;
+};
+
 // Result of table_scan_function_get - tells DuckDB which function to call to scan a table
 // This enables catalogs to delegate scanning to any DuckDB function (e.g., read_parquet, iceberg_scan)
 struct VgiScanFunctionResult {
@@ -214,6 +226,9 @@ VgiFunctionInfo ParseFunctionInfo(const std::shared_ptr<arrow::RecordBatch> &bat
 // Parse a VgiViewInfo from an Arrow RecordBatch (single row)
 VgiViewInfo ParseViewInfo(const std::shared_ptr<arrow::RecordBatch> &batch, const std::string &worker_path);
 
+// Parse a VgiMacroInfo from an Arrow RecordBatch (single row)
+VgiMacroInfo ParseMacroInfo(const std::shared_ptr<arrow::RecordBatch> &batch, const std::string &worker_path);
+
 // Parse a VgiScanFunctionResult from an Arrow RecordBatch (single row)
 // The arguments field is a nested IPC batch with arg_0, arg_1, ... for positional args and named args by name
 VgiScanFunctionResult ParseScanFunctionResult(ClientContext &context, const std::shared_ptr<arrow::RecordBatch> &batch,
@@ -247,6 +262,12 @@ std::vector<VgiViewInfo> InvokeCatalogSchemaContentsViews(const std::string &wor
                                                           const std::vector<uint8_t> &attach_id,
                                                           const std::string &schema_name, ClientContext &context,
                                                           bool worker_debug = false, bool use_pool = true);
+
+// Invoke catalog_schema_contents_macros: list macros in a schema
+// macro_type: "SCALAR_MACRO" or "TABLE_MACRO"
+std::vector<VgiMacroInfo> InvokeCatalogSchemaContentsMacros(
+    const std::string &worker_path, const std::vector<uint8_t> &attach_id, const std::string &schema_name,
+    const std::string &macro_type, ClientContext &context, bool worker_debug = false, bool use_pool = true);
 
 // Invoke catalog_schema_contents_functions: list functions in a schema
 // function_type: "SCALAR_FUNCTION" or "TABLE_FUNCTION"
