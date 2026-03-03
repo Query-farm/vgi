@@ -20,7 +20,7 @@ statement ok
 SET threshold = 3;
 
 query I
-SELECT value FROM filter_by_setting((SELECT * FROM (VALUES (0), (1), (2), (3), (4)) AS t(value))) ORDER BY value;
+SELECT value FROM example.filter_by_setting((SELECT * FROM (VALUES (0), (1), (2), (3), (4)) AS t(value))) ORDER BY value;
 ----
 3
 4
@@ -33,7 +33,7 @@ statement ok
 SET threshold = 0;
 
 query I
-SELECT value FROM filter_by_setting((SELECT * FROM (VALUES (0), (1), (2), (3), (4)) AS t(value))) ORDER BY value;
+SELECT value FROM example.filter_by_setting((SELECT * FROM (VALUES (0), (1), (2), (3), (4)) AS t(value))) ORDER BY value;
 ----
 0
 1

@@ -20,7 +20,7 @@ statement ok
 SET config = {'start': 10, 'step': 5, 'label': 'item'};
 
 query IT
-SELECT n, label FROM struct_settings(3) ORDER BY n;
+SELECT n, label FROM example.struct_settings(3) ORDER BY n;
 ----
 10	item_0
 15	item_1
@@ -34,7 +34,7 @@ statement ok
 SET config = {'start': 0, 'step': 100, 'label': 'row'};
 
 query IT
-SELECT n, label FROM struct_settings(4) ORDER BY n;
+SELECT n, label FROM example.struct_settings(4) ORDER BY n;
 ----
 0	row_0
 100	row_1

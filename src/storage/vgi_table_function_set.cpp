@@ -22,14 +22,14 @@ namespace {
 
 // Extract settings from client context given a list of setting names
 // This is used for catalog-bound functions where we know which settings the catalog registered
-std::map<std::string, std::string> ExtractVgiSettings(ClientContext &context,
-                                                      const std::vector<std::string> &setting_names) {
-	std::map<std::string, std::string> settings;
+std::map<std::string, Value> ExtractVgiSettings(ClientContext &context,
+                                                const std::vector<std::string> &setting_names) {
+	std::map<std::string, Value> settings;
 
 	for (const auto &name : setting_names) {
 		Value value;
 		if (context.TryGetCurrentSetting(name, value)) {
-			settings[name] = value.ToString();
+			settings[name] = value;
 		}
 	}
 

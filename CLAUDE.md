@@ -151,6 +151,12 @@ Catalogs may register additional settings at `ATTACH` time (e.g., `greeting`, `m
 | `vgi_scalar_function_impl.hpp` | `VgiScalarFunctionInfo`, `VgiScalarFunctionBindData` |
 | `storage/vgi_catalog_set.hpp` | `VgiCatalogSet` with `CreateEntryLocked()` (requires lock held) |
 
+## Coding Conventions
+
+### Arrow-to-DuckDB Type Conversion
+
+Always use `ArrowSchemaToDuckDBTypes()` (from `vgi_arrow_utils.hpp`) to convert Arrow types to DuckDB types. Do not write manual switch statements over `arrow::Type` IDs — this misses complex types (structs, lists, maps, timestamps, etc.) and leads to silent fallback to VARCHAR. The utility handles all types correctly via the DuckDB Arrow C ABI bridge.
+
 ## Architecture
 
 ### Function Protocol

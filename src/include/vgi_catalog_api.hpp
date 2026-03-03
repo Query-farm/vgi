@@ -199,11 +199,12 @@ struct VgiFunctionInfo {
 
 // Parse a VgiSetting from serialized bytes (Arrow IPC format)
 // The bytes contain a single-row RecordBatch with: name, description, type, default_value
-VgiSetting ParseVgiSetting(const std::vector<uint8_t> &bytes, const std::string &worker_path);
+VgiSetting ParseVgiSetting(const std::vector<uint8_t> &bytes, const std::string &worker_path,
+                           ClientContext &context);
 
 // Parse a CatalogAttachResult from an Arrow RecordBatch
 CatalogAttachResult ParseCatalogAttachResult(const std::shared_ptr<arrow::RecordBatch> &batch,
-                                             const std::string &worker_path);
+                                             const std::string &worker_path, ClientContext &context);
 
 // Parse a VgiSchemaInfo from an Arrow RecordBatch (single row)
 VgiSchemaInfo ParseSchemaInfo(const std::shared_ptr<arrow::RecordBatch> &batch, const std::string &worker_path);

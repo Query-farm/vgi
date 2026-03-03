@@ -20,7 +20,7 @@ statement ok
 SET multiplier = 5;
 
 query I
-SELECT multiply_by_setting(v) FROM (VALUES (1), (2), (3)) AS t(v) ORDER BY v;
+SELECT example.multiply_by_setting(v) FROM (VALUES (1), (2), (3)) AS t(v) ORDER BY v;
 ----
 5
 10
@@ -34,7 +34,7 @@ statement ok
 SET multiplier = 10;
 
 query I
-SELECT multiply_by_setting(v) FROM (VALUES (1), (2), (3)) AS t(v) ORDER BY v;
+SELECT example.multiply_by_setting(v) FROM (VALUES (1), (2), (3)) AS t(v) ORDER BY v;
 ----
 10
 20

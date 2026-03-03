@@ -19,6 +19,23 @@
 
 namespace duckdb {
 
+namespace {
+
+// Extract settings from client context given a list of setting names
+std::map<std::string, Value> ExtractVgiSettings(ClientContext &context,
+                                                const std::vector<std::string> &setting_names) {
+	std::map<std::string, Value> settings;
+	for (const auto &name : setting_names) {
+		Value value;
+		if (context.TryGetCurrentSetting(name, value)) {
+			settings[name] = value;
+		}
+	}
+	return settings;
+}
+
+} // anonymous namespace
+
 // ============================================================================
 // Local State Constructor/Destructor
 // ============================================================================
@@ -88,6 +105,9 @@ unique_ptr<FunctionData> VgiScalarFunctionBind(ClientContext &context, ScalarFun
 		throw InternalException("VgiScalarFunctionBind: missing VgiScalarFunctionInfo");
 	}
 	auto &func_info = bound_function.GetExtraFunctionInfo().Cast<VgiScalarFunctionInfo>();
+
+	// Extract settings from context using setting_names registered during catalog load
+	auto settings = ExtractVgiSettings(context, func_info.setting_names);
 
 	// ========================================================================
 	// Phase 1: Extract const values and collect indices to erase
@@ -243,7 +263,7 @@ unique_ptr<FunctionData> VgiScalarFunctionBind(ClientContext &context, ScalarFun
 	bind_data->function_name = func_info.function_name;
 	bind_data->worker_debug = func_info.worker_debug;
 	bind_data->use_pool = func_info.use_pool;
-	bind_data->settings = func_info.settings;
+	bind_data->settings = settings;
 	bind_data->resolved_output_schema = output_schema;
 	bind_data->input_schema = input_schema;
 	bind_data->const_values = const_values;
@@ -316,7 +336,8 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 		const auto &attach_id = bind_data ? bind_data->attach_id : func_info.attach_id;
 		const auto &function_name = bind_data ? bind_data->function_name : func_info.function_name;
 		bool worker_debug = bind_data ? bind_data->worker_debug : func_info.worker_debug;
-		const auto &settings = bind_data ? bind_data->settings : func_info.settings;
+		// Extract settings: from bind_data if available, otherwise extract fresh from context
+		auto settings = bind_data ? bind_data->settings : ExtractVgiSettings(context, func_info.setting_names);
 
 		// Try to reuse the bind-phase connection (avoids spawning a second worker)
 		if (bind_data) {

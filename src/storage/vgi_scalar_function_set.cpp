@@ -31,6 +31,12 @@ void VgiScalarFunctionSet::LoadEntries(ClientContext &context) {
 		return;
 	}
 
+	// Extract setting names from the attach result for passing to scalar functions
+	std::vector<std::string> setting_names;
+	for (const auto &setting : attach_result->settings) {
+		setting_names.push_back(setting.name);
+	}
+
 	// Call catalog_schema_contents_functions via RPC for scalar functions
 	auto worker_path = attach_params->worker_path();
 	auto function_list = vgi::InvokeCatalogSchemaContentsFunctions(worker_path, attach_result->attach_id, schema_.name,
@@ -138,7 +144,7 @@ void VgiScalarFunctionSet::LoadEntries(ClientContext &context) {
 			scalar_func_info->has_dynamic_return_type = is_any_output;
 			scalar_func_info->positional_is_const = arg_types.positional_is_const;
 			scalar_func_info->positional_names = arg_types.positional_names;
-			// Copy settings from catalog if any
+			scalar_func_info->setting_names = setting_names;
 
 			// Check if any params are const
 			bool has_const_params = std::any_of(arg_types.positional_is_const.begin(),

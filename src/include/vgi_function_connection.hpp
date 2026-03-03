@@ -43,7 +43,7 @@ struct FunctionConnectionParams {
 	std::vector<uint8_t> attach_id;
 	std::vector<uint8_t> global_execution_id;  // Empty for primary workers
 	bool worker_debug = false;
-	std::map<std::string, std::string> settings;
+	std::map<std::string, Value> settings;
 	bool use_pool = false;
 	std::string phase;  // For logging (e.g., "bind", "init_local_secondary")
 	std::string function_type = "TABLE";  // "TABLE", "SCALAR", "AGGREGATE"
@@ -55,7 +55,7 @@ struct FunctionConnectionParams {
 	FunctionConnectionParams(const std::string &worker_path, const std::string &function_name,
 	                         const ArrowArguments &arguments, const std::vector<uint8_t> &attach_id,
 	                         const std::vector<uint8_t> &global_execution_id, bool worker_debug,
-	                         const std::map<std::string, std::string> &settings, bool use_pool,
+	                         const std::map<std::string, Value> &settings, bool use_pool,
 	                         const std::string &phase, const std::string &function_type = "TABLE")
 	    : worker_path(worker_path), function_name(function_name), arguments(arguments), attach_id(attach_id),
 	      global_execution_id(global_execution_id), worker_debug(worker_debug), settings(settings),
@@ -113,14 +113,14 @@ public:
 	                   const ArrowArguments &arguments, const std::vector<uint8_t> &attach_id, ClientContext &context,
 	                   const std::string &function_type = "TABLE",
 	                   const std::vector<uint8_t> &global_execution_id = {}, bool worker_debug = false,
-	                   const std::map<std::string, std::string> &settings = {});
+	                   const std::map<std::string, Value> &settings = {});
 
 	// Create connection using a pooled worker (skips spawning new subprocess)
 	FunctionConnection(std::unique_ptr<PooledWorker> pooled_worker, const std::string &function_name,
 	                   const ArrowArguments &arguments, const std::vector<uint8_t> &attach_id, ClientContext &context,
 	                   const std::string &function_type = "TABLE",
 	                   const std::vector<uint8_t> &global_execution_id = {}, bool worker_debug = false,
-	                   const std::map<std::string, std::string> &settings = {});
+	                   const std::map<std::string, Value> &settings = {});
 
 	~FunctionConnection() override;
 
@@ -226,7 +226,7 @@ private:
 	std::vector<uint8_t> global_execution_id_;
 	ClientContext &context_;
 	bool worker_debug_;
-	std::map<std::string, std::string> settings_;
+	std::map<std::string, Value> settings_;
 
 	// Worker process (created during bind)
 	std::unique_ptr<SubProcess> proc_;

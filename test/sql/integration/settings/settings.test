@@ -39,7 +39,7 @@ statement ok
 SET vgi_verbose_mode = false;
 
 query ITR
-SELECT id, greeting, value FROM settings_aware(3) ORDER BY id;
+SELECT id, greeting, value FROM example.settings_aware(3) ORDER BY id;
 ----
 0	Bonjour	0.0
 1	Bonjour	7.5
@@ -53,7 +53,7 @@ statement ok
 SET vgi_verbose_mode = true;
 
 query ITRT
-SELECT id, greeting, value, details FROM settings_aware(3) ORDER BY id;
+SELECT id, greeting, value, details FROM example.settings_aware(3) ORDER BY id;
 ----
 0	Bonjour	0.0	row_0
 1	Bonjour	7.5	row_1
@@ -73,7 +73,7 @@ statement ok
 RESET multiplier;
 
 query ITR
-SELECT id, greeting, value FROM settings_aware(3) ORDER BY id;
+SELECT id, greeting, value FROM example.settings_aware(3) ORDER BY id;
 ----
 0	Hello	0.0
 1	Hello	2.5

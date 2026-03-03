@@ -33,7 +33,8 @@ struct VgiScalarFunctionInfo : public ScalarFunctionInfo {
 	std::string function_name;
 	bool worker_debug = false;
 	bool use_pool = false;
-	std::map<std::string, std::string> settings;
+	std::map<std::string, Value> settings;
+	std::vector<std::string> setting_names;
 
 	// Schema info from catalog registration
 	std::shared_ptr<arrow::Schema> output_schema;  // Single "result" column
@@ -60,7 +61,7 @@ struct VgiScalarFunctionBindData : public FunctionData {
 	std::string function_name;
 	bool worker_debug = false;
 	bool use_pool = false;
-	std::map<std::string, std::string> settings;
+	std::map<std::string, Value> settings;
 
 	// Actual output schema resolved during bind (with concrete types)
 	std::shared_ptr<arrow::Schema> resolved_output_schema;

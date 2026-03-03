@@ -6,6 +6,7 @@
 
 #include <arrow/api.h>
 
+#include "duckdb/common/types/value.hpp"
 #include "duckdb/common/arrow/arrow_wrapper.hpp"
 #include "duckdb/execution/execution_context.hpp"
 #include "duckdb/function/table/arrow.hpp"
@@ -37,7 +38,7 @@ struct VgiTableInOutBindData : public TableFunctionData {
 	bool worker_debug = false;
 	bool use_pool = false;
 	std::string function_name;
-	std::map<std::string, std::string> settings;
+	std::map<std::string, Value> settings;
 
 	// Arguments (excluding TABLE input)
 	ArrowArguments arguments;
@@ -103,7 +104,7 @@ struct VgiTableInOutBindParams {
 	std::vector<uint8_t> attach_id;
 	bool worker_debug = false;
 	bool use_pool = false;
-	std::map<std::string, std::string> settings;
+	std::map<std::string, Value> settings;
 };
 
 // ============================================================================

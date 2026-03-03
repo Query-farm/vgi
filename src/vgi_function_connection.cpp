@@ -106,7 +106,7 @@ FunctionConnection::FunctionConnection(const std::string &worker_path, const std
                                        const ArrowArguments &arguments, const std::vector<uint8_t> &attach_id,
                                        ClientContext &context, const std::string &function_type,
                                        const std::vector<uint8_t> &global_execution_id,
-                                       bool worker_debug, const std::map<std::string, std::string> &settings)
+                                       bool worker_debug, const std::map<std::string, Value> &settings)
     : worker_path_(worker_path), function_name_(function_name), function_type_(function_type),
       arguments_type_(arguments.type), arguments_array_(arguments.array), attach_id_(attach_id),
       global_execution_id_(global_execution_id), context_(context), worker_debug_(worker_debug), settings_(settings) {
@@ -116,7 +116,7 @@ FunctionConnection::FunctionConnection(std::unique_ptr<PooledWorker> pooled_work
                                        const ArrowArguments &arguments, const std::vector<uint8_t> &attach_id,
                                        ClientContext &context, const std::string &function_type,
                                        const std::vector<uint8_t> &global_execution_id,
-                                       bool worker_debug, const std::map<std::string, std::string> &settings)
+                                       bool worker_debug, const std::map<std::string, Value> &settings)
     : worker_path_(pooled_worker->GetWorkerPath()), function_name_(function_name), function_type_(function_type),
       arguments_type_(arguments.type), arguments_array_(arguments.array), attach_id_(attach_id),
       global_execution_id_(global_execution_id), context_(context), worker_debug_(worker_debug), settings_(settings),
@@ -184,28 +184,10 @@ BindResult FunctionConnection::PerformBindFull() {
 		arguments_bytes = SerializeToIpcBytes(args_batch);
 	}
 
-	// 2. Serialize settings if non-empty
+	// 2. Serialize settings if non-empty (typed values via BuildSettingsBatch)
 	std::vector<uint8_t> settings_bytes;
 	if (!settings_.empty()) {
-		std::vector<std::shared_ptr<arrow::Field>> fields;
-		std::vector<std::shared_ptr<arrow::Array>> arrays;
-		for (const auto &[key, value] : settings_) {
-			fields.push_back(arrow::field(key, arrow::utf8()));
-			arrow::StringBuilder builder;
-			auto status = builder.Append(value);
-			if (!status.ok()) {
-				ThrowVgiIOException("Failed to build settings array: %s", worker_path_, proc_->GetPid(), "",
-				                    status.ToString());
-			}
-			auto result = builder.Finish();
-			if (!result.ok()) {
-				ThrowVgiIOException("Failed to finish settings array: %s", worker_path_, proc_->GetPid(), "",
-				                    result.status().ToString());
-			}
-			arrays.push_back(result.ValueUnsafe());
-		}
-		auto settings_schema = arrow::schema(fields);
-		auto settings_batch = arrow::RecordBatch::Make(settings_schema, 1, arrays);
+		auto settings_batch = BuildSettingsBatch(context_, settings_);
 		settings_bytes = SerializeToIpcBytes(settings_batch);
 	}
 
@@ -860,7 +842,7 @@ std::unique_ptr<IFunctionConnection> CreateFunctionConnection(
     ClientContext &context, const std::string &function_type,
     const std::vector<uint8_t> &global_execution_id,
     bool worker_debug,
-    const std::map<std::string, std::string> &settings) {
+    const std::map<std::string, Value> &settings) {
 	if (IsHttpTransport(worker_path)) {
 		return std::make_unique<HttpFunctionConnection>(
 		    worker_path, function_name, arguments, attach_id, context,
@@ -877,7 +859,7 @@ std::unique_ptr<IFunctionConnection> CreateFunctionConnectionFromPool(
     ClientContext &context, const std::string &function_type,
     const std::vector<uint8_t> &global_execution_id,
     bool worker_debug,
-    const std::map<std::string, std::string> &settings) {
+    const std::map<std::string, Value> &settings) {
 	// Only subprocess connections use the pool
 	return std::make_unique<FunctionConnection>(
 	    std::move(pooled_worker), function_name, arguments, attach_id, context,

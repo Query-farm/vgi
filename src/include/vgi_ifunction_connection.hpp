@@ -10,6 +10,8 @@
 
 #include <sys/types.h>
 
+#include "duckdb/common/types/value.hpp"
+
 #include "vgi_arrow_utils.hpp"
 #include "vgi_protocol.hpp"
 
@@ -74,7 +76,7 @@ std::unique_ptr<IFunctionConnection> CreateFunctionConnection(
     ClientContext &context, const std::string &function_type = "TABLE",
     const std::vector<uint8_t> &global_execution_id = {},
     bool worker_debug = false,
-    const std::map<std::string, std::string> &settings = {});
+    const std::map<std::string, Value> &settings = {});
 
 // Create from a pooled worker (subprocess only — HTTP connections are never pooled).
 std::unique_ptr<IFunctionConnection> CreateFunctionConnectionFromPool(
@@ -83,7 +85,7 @@ std::unique_ptr<IFunctionConnection> CreateFunctionConnectionFromPool(
     ClientContext &context, const std::string &function_type = "TABLE",
     const std::vector<uint8_t> &global_execution_id = {},
     bool worker_debug = false,
-    const std::map<std::string, std::string> &settings = {});
+    const std::map<std::string, Value> &settings = {});
 
 } // namespace vgi
 } // namespace duckdb

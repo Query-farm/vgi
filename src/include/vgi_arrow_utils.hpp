@@ -93,6 +93,12 @@ struct ArrowArguments {
 ArrowArguments BuildArgumentsFromValues(ClientContext &context, const vector<Value> &positional_args,
                                         const vector<std::pair<string, Value>> &named_args = {});
 
+// Build a settings RecordBatch from a map of setting name → DuckDB Value
+// Creates a single-row RecordBatch where each field preserves its DuckDB type as Arrow type
+// Uses DataChunk + ArrowAppender to ensure proper type conversion (same pattern as BuildArgumentsFromValues)
+std::shared_ptr<arrow::RecordBatch> BuildSettingsBatch(ClientContext &context,
+                                                        const std::map<std::string, Value> &settings);
+
 // ============================================================================
 // Function Argument Schema Parsing
 // ============================================================================

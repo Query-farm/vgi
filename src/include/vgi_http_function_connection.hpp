@@ -31,7 +31,7 @@ public:
 	                       ClientContext &context, const std::string &function_type = "TABLE",
 	                       const std::vector<uint8_t> &global_execution_id = {},
 	                       bool worker_debug = false,
-	                       const std::map<std::string, std::string> &settings = {});
+	                       const std::map<std::string, Value> &settings = {});
 
 	~HttpFunctionConnection() override = default;
 
@@ -80,7 +80,7 @@ private:
 	std::vector<uint8_t> global_execution_id_;
 	ClientContext &context_;
 	bool worker_debug_;
-	std::map<std::string, std::string> settings_;
+	std::map<std::string, Value> settings_;
 
 	// State tracking
 	bool bind_done_ = false;

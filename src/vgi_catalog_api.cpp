@@ -147,7 +147,7 @@ CatalogAttachResult InvokeCatalogAttach(const std::string &worker_path, const st
 	if (!result_batch) {
 		throw IOException("Empty response from catalog_attach [worker: %s]", worker_path);
 	}
-	return ParseCatalogAttachResult(result_batch, worker_path);
+	return ParseCatalogAttachResult(result_batch, worker_path, context);
 }
 
 std::vector<VgiSchemaInfo> InvokeCatalogSchemas(const std::string &worker_path, const std::vector<uint8_t> &attach_id,
@@ -523,7 +523,8 @@ static vector<Value> ArrowBatchToValues(ClientContext &context, const std::share
 	return result;
 }
 
-VgiSetting ParseVgiSetting(const std::vector<uint8_t> &bytes, const std::string &worker_path) {
+VgiSetting ParseVgiSetting(const std::vector<uint8_t> &bytes, const std::string &worker_path,
+                           ClientContext &context) {
 	// Deserialize the Setting RecordBatch
 	auto batch = DeserializeFromIpcBytes(bytes);
 	if (!batch || batch->num_rows() == 0) {
@@ -549,32 +550,14 @@ VgiSetting ParseVgiSetting(const std::vector<uint8_t> &bytes, const std::string 
 	auto type_schema = type_schema_result.ValueUnsafe();
 	auto arrow_type = type_schema->field(0)->type();
 
-	// We need a context to convert Arrow type to DuckDB type
-	// For now, use a simple mapping for common types
-	switch (arrow_type->id()) {
-	case arrow::Type::BOOL:
-		setting.type = LogicalType::BOOLEAN;
-		break;
-	case arrow::Type::INT32:
-		setting.type = LogicalType::INTEGER;
-		break;
-	case arrow::Type::INT64:
-		setting.type = LogicalType::BIGINT;
-		break;
-	case arrow::Type::FLOAT:
-		setting.type = LogicalType::FLOAT;
-		break;
-	case arrow::Type::DOUBLE:
-		setting.type = LogicalType::DOUBLE;
-		break;
-	case arrow::Type::STRING:
-	case arrow::Type::LARGE_STRING:
-		setting.type = LogicalType::VARCHAR;
-		break;
-	default:
-		// Default to VARCHAR for unknown types
-		setting.type = LogicalType::VARCHAR;
-		break;
+	// Convert Arrow type to DuckDB type using the standard conversion pipeline
+	{
+		ArrowSchemaWrapper c_schema;
+		ArrowTableSchema arrow_table;
+		vector<LogicalType> types;
+		vector<string> names;
+		ArrowSchemaToDuckDBTypes(context, type_schema, c_schema, arrow_table, types, names);
+		setting.type = types[0];
 	}
 
 	// Parse the default value if present
@@ -594,7 +577,7 @@ VgiSetting ParseVgiSetting(const std::vector<uint8_t> &bytes, const std::string 
 }
 
 CatalogAttachResult ParseCatalogAttachResult(const std::shared_ptr<arrow::RecordBatch> &batch,
-                                             const std::string &worker_path) {
+                                             const std::string &worker_path, ClientContext &context) {
 	CatalogAttachResult result;
 
 	if (!batch || batch->num_rows() == 0) {
@@ -616,7 +599,7 @@ CatalogAttachResult ParseCatalogAttachResult(const std::shared_ptr<arrow::Record
 	// Parse settings list - each element is a serialized Setting
 	auto settings_bytes = row["settings"].value_or(std::vector<std::vector<uint8_t>> {});
 	for (const auto &setting_bytes : settings_bytes) {
-		result.settings.push_back(ParseVgiSetting(setting_bytes, worker_path));
+		result.settings.push_back(ParseVgiSetting(setting_bytes, worker_path, context));
 	}
 
 	return result;

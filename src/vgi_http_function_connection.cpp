@@ -20,7 +20,7 @@ HttpFunctionConnection::HttpFunctionConnection(
     const ArrowArguments &arguments, const std::vector<uint8_t> &attach_id,
     ClientContext &context, const std::string &function_type,
     const std::vector<uint8_t> &global_execution_id,
-    bool worker_debug, const std::map<std::string, std::string> &settings)
+    bool worker_debug, const std::map<std::string, Value> &settings)
     : base_url_(worker_path), function_name_(function_name), function_type_(function_type),
       arguments_type_(arguments.type), arguments_array_(arguments.array), attach_id_(attach_id),
       global_execution_id_(global_execution_id), context_(context), worker_debug_(worker_debug), settings_(settings) {
@@ -198,23 +198,7 @@ BindResult HttpFunctionConnection::PerformBindFull() {
 
 	std::vector<uint8_t> settings_bytes;
 	if (!settings_.empty()) {
-		std::vector<std::shared_ptr<arrow::Field>> fields;
-		std::vector<std::shared_ptr<arrow::Array>> arrays;
-		for (const auto &[key, value] : settings_) {
-			fields.push_back(arrow::field(key, arrow::utf8()));
-			arrow::StringBuilder builder;
-			auto status = builder.Append(value);
-			if (!status.ok()) {
-				throw IOException("Failed to build settings: %s [url: %s]", status.ToString(), base_url_);
-			}
-			auto result = builder.Finish();
-			if (!result.ok()) {
-				throw IOException("Failed to finish settings: %s [url: %s]", result.status().ToString(), base_url_);
-			}
-			arrays.push_back(result.ValueUnsafe());
-		}
-		auto settings_schema = arrow::schema(fields);
-		auto settings_batch = arrow::RecordBatch::Make(settings_schema, 1, arrays);
+		auto settings_batch = BuildSettingsBatch(context_, settings_);
 		settings_bytes = SerializeToIpcBytes(settings_batch);
 	}
 

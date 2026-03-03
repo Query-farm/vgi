@@ -163,6 +163,35 @@ std::shared_ptr<arrow::Schema> BuildArrowSchemaFromDuckDB(ClientContext &context
 }
 
 // ============================================================================
+// DuckDB Value Settings to Arrow RecordBatch
+// ============================================================================
+
+std::shared_ptr<arrow::RecordBatch> BuildSettingsBatch(ClientContext &context,
+                                                        const std::map<std::string, Value> &settings) {
+	vector<LogicalType> field_types;
+	vector<string> field_names;
+
+	for (const auto &[name, value] : settings) {
+		field_names.push_back(name);
+		field_types.push_back(value.type());
+	}
+
+	// Create a single-row DataChunk with the setting values
+	DataChunk chunk;
+	chunk.Initialize(Allocator::DefaultAllocator(), field_types);
+	chunk.SetCardinality(1);
+
+	idx_t col_idx = 0;
+	for (const auto &[name, value] : settings) {
+		chunk.SetValue(col_idx++, 0, value);
+	}
+
+	// Convert to Arrow RecordBatch using the existing utilities
+	auto schema = BuildArrowSchemaFromDuckDB(context, field_types, field_names);
+	return DataChunkToArrow(context, chunk, schema);
+}
+
+// ============================================================================
 // Function Argument Schema Parsing
 // ============================================================================
 

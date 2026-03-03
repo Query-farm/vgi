@@ -39,7 +39,7 @@ struct VgiTableFunctionBindData : public TableFunctionData {
 	ArrowArguments arguments;
 
 	// Settings to pass to the worker (e.g., DuckDB pragmas)
-	std::map<std::string, std::string> settings;
+	std::map<std::string, Value> settings;
 
 	// Schema information (discovered from OutputSpec during bind)
 	// Arrow C ABI schema wrapper for DuckDB conversion
