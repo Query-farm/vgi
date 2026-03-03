@@ -1,12 +1,15 @@
 #include "vgi_catalogs.hpp"
 #include "vgi_catalog_api.hpp"
 #include "vgi_logging.hpp"
+#include "vgi_transport.hpp"
 
 #include <string>
 #include <vector>
 
+#include "duckdb.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/main/extension_helper.hpp"
 
 namespace duckdb {
 
@@ -43,6 +46,20 @@ static unique_ptr<FunctionData> VgiCatalogsBind(ClientContext &context, TableFun
 	auto bind_data = make_uniq<VgiCatalogsBindData>();
 
 	bind_data->worker_path = input.inputs[0].GetValue<string>();
+
+	// HTTP transport: require httpfs for POST support
+	if (vgi::IsHttpTransport(bind_data->worker_path)) {
+		auto &db = DatabaseInstance::GetDatabase(context);
+		try {
+			ExtensionHelper::TryAutoLoadExtension(db, "httpfs");
+		} catch (...) {
+			// ignore auto-load errors, check below
+		}
+		if (!db.ExtensionIsLoaded("httpfs")) {
+			throw BinderException("VGI HTTP transport requires the httpfs extension. "
+			                      "Install it with: INSTALL httpfs; LOAD httpfs;");
+		}
+	}
 
 	VGI_LOG(context, "vgi_catalogs.bind", {{"worker_path", bind_data->worker_path}});
 

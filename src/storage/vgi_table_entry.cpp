@@ -95,4 +95,9 @@ TableStorageInfo VgiTableEntry::GetStorageInfo(ClientContext &context) {
 	return info;
 }
 
+virtual_column_map_t VgiTableEntry::GetVirtualColumns() const {
+	// VGI tables are remote — they don't have a rowid or other virtual columns
+	return {};
+}
+
 } // namespace duckdb

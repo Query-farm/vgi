@@ -22,6 +22,9 @@ public:
 
 	TableStorageInfo GetStorageInfo(ClientContext &context) override;
 
+	// VGI tables don't support rowid — return no virtual columns
+	virtual_column_map_t GetVirtualColumns() const override;
+
 	const vgi::VgiTableInfo &GetTableInfo() const {
 		return table_info_;
 	}

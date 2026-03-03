@@ -30,7 +30,7 @@ constexpr const char *RPC_SERVER_ID_KEY = "vgi_rpc.server_id";
 constexpr const char *RPC_REQUEST_ID_KEY = "vgi_rpc.request_id";
 
 // HTTP streaming state token metadata key
-constexpr const char *RPC_STREAM_STATE_KEY = "vgi_rpc.stream_state";
+constexpr const char *RPC_STREAM_STATE_KEY = "vgi_rpc.stream_state#b64";
 
 // ============================================================================
 // Batch Classification

@@ -98,8 +98,8 @@ private:
 // Helper to write all bytes to a file descriptor
 void WriteAll(int fd, const uint8_t *data, size_t len);
 
-// Default timeout for catalog operations (5 seconds)
-constexpr int CATALOG_OPERATION_TIMEOUT_SECONDS = 5;
+// Default timeout for catalog operations (30 seconds)
+constexpr int CATALOG_OPERATION_TIMEOUT_SECONDS = 30;
 
 // Wait for a file descriptor to become readable with a timeout.
 // Returns true if readable, throws IOException on timeout or error.
