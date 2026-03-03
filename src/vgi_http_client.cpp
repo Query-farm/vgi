@@ -6,7 +6,6 @@
 
 #include "vgi_logging.hpp"
 #include "vgi_rpc_client.hpp"
-#include "vgi_subprocess.hpp"
 
 namespace duckdb {
 namespace vgi {
@@ -26,10 +25,12 @@ std::string HttpPostArrowIpc(ClientContext &context,
 	auto &http_util = HTTPUtil::Get(db);
 	auto params = http_util.InitializeParameters(context, url);
 
-	// Set timeout from vgi_catalog_timeout_seconds if available
+	// Use the configurable HTTP timeout setting (default 5 minutes)
 	Value timeout_val;
-	if (context.TryGetCurrentSetting("vgi_catalog_timeout_seconds", timeout_val)) {
+	if (context.TryGetCurrentSetting("vgi_http_timeout_seconds", timeout_val)) {
 		params->timeout = static_cast<uint64_t>(timeout_val.GetValue<int64_t>());
+	} else {
+		params->timeout = 300; // fallback: 5 minutes
 	}
 
 	HTTPHeaders headers;
@@ -91,7 +92,7 @@ UnaryResponseResult HttpInvokeUnary(ClientContext &context,
 		body = SerializeEmptyRpcRequest(method_name);
 	}
 
-	// POST to {worker_path}/{method_name}
+	// POST to {worker_path}/{method_name} using standard HTTP timeout
 	auto response_body = HttpPostArrowIpc(context, url, body);
 
 	// Parse the Arrow IPC response

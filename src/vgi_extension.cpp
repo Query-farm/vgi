@@ -173,10 +173,15 @@ static void LoadInternal(ExtensionLoader &loader) {
 	auto &config = DBConfig::GetConfig(loader.GetDatabaseInstance());
 	StorageExtension::Register(config, "vgi", make_shared_ptr<VgiStorageExtension>());
 
-	// Register catalog timeout setting
+	// Register catalog timeout setting (used for subprocess transport)
 	config.AddExtensionOption("vgi_catalog_timeout_seconds",
-	                          "Timeout in seconds for VGI catalog operations (list schemas, functions, etc.)",
+	                          "Timeout in seconds for VGI subprocess catalog operations (list schemas, functions, etc.)",
 	                          LogicalType::BIGINT, Value::BIGINT(vgi::CATALOG_OPERATION_TIMEOUT_SECONDS));
+
+	// Register HTTP timeout setting
+	config.AddExtensionOption("vgi_http_timeout_seconds",
+	                          "Timeout in seconds for VGI HTTP requests (catalog, init, and exchange operations)",
+	                          LogicalType::BIGINT, Value::BIGINT(300));
 
 	// Register worker pool settings
 	config.AddExtensionOption("vgi_worker_pool_idle_limit_seconds",

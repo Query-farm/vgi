@@ -26,7 +26,8 @@ UnaryResponseResult HttpInvokeUnary(ClientContext &context,
                                      const std::shared_ptr<arrow::RecordBatch> &params);
 
 // POST Arrow IPC bytes to a URL, return raw response body bytes.
-// Used for stream init and exchange operations.
+// Used for catalog, stream init, and exchange operations.
+// Timeout is controlled by the vgi_http_timeout_seconds setting (default 300s).
 std::string HttpPostArrowIpc(ClientContext &context,
                               const std::string &url,
                               const std::vector<uint8_t> &body);
