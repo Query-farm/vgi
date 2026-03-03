@@ -1,0 +1,52 @@
+# name: test/sql/integration/settings/filter_by_setting.test
+# description: Validates the filter_by_setting table-in-out function filters by threshold setting
+# group: [vgi_integration_settings]
+
+# The filter_by_setting function filters input rows where the value column
+# is >= the threshold DuckDB setting.
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# Filter rows by threshold
+# ============================================================================
+
+statement ok
+SET threshold = 3;
+
+query I
+SELECT value FROM filter_by_setting((SELECT * FROM (VALUES (0), (1), (2), (3), (4)) AS t(value))) ORDER BY value;
+----
+3
+4
+
+# ============================================================================
+# Threshold = 0 passes all rows
+# ============================================================================
+
+statement ok
+SET threshold = 0;
+
+query I
+SELECT value FROM filter_by_setting((SELECT * FROM (VALUES (0), (1), (2), (3), (4)) AS t(value))) ORDER BY value;
+----
+0
+1
+2
+3
+4
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+RESET threshold;
+
+statement ok
+DETACH example;

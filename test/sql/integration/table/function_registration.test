@@ -18,7 +18,7 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
 # ============================================================================
 # Function Inventory
-# 11 pure table functions + 7 table-in-out functions = 18 total table-type functions
+# 12 pure table functions + 8 table-in-out functions = 20 total table-type functions
 # ============================================================================
 
 # Total table-type function count (includes table-in-out)
@@ -27,9 +27,9 @@ SELECT COUNT(*)
 FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'table';
 ----
-18
+20
 
-# The 11 pure table functions (no TABLE parameter type)
+# The 12 pure table functions (no TABLE parameter type)
 query T
 SELECT function_name
 FROM duckdb_functions()
@@ -38,7 +38,7 @@ AND function_name IN (
     'constant_columns', 'double_sequence', 'generator_exception',
     'logging_generator', 'named_params_echo', 'nested_sequence',
     'partitioned_sequence', 'projected_data', 'sequence',
-    'settings_aware', 'ten_thousand'
+    'settings_aware', 'struct_settings', 'ten_thousand'
 )
 ORDER BY function_name;
 ----
@@ -52,6 +52,7 @@ partitioned_sequence
 projected_data
 sequence
 settings_aware
+struct_settings
 ten_thousand
 
 # ============================================================================
@@ -188,6 +189,19 @@ WHERE database_name = 'example' AND function_name = 'settings_aware';
 settings_aware	[count]	[BIGINT]	Generates data demonstrating settings are passed
 
 # ----------------------------------------------------------------------------
+# struct_settings — Sequence configured by struct setting
+# Parameters: count (BIGINT)
+# Note: The config setting is passed internally via DuckDB settings
+# ----------------------------------------------------------------------------
+
+query TTTT
+SELECT function_name, parameters, parameter_types, description
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_name = 'struct_settings';
+----
+struct_settings	[count]	[BIGINT]	Generate a sequence configured by a struct setting
+
+# ----------------------------------------------------------------------------
 # ten_thousand — No parameters, fixed 10000-row output
 # Parameters: (none)
 # ----------------------------------------------------------------------------
@@ -212,7 +226,7 @@ AND function_name IN (
     'constant_columns', 'double_sequence', 'generator_exception',
     'logging_generator', 'named_params_echo', 'nested_sequence',
     'partitioned_sequence', 'projected_data', 'sequence',
-    'settings_aware', 'ten_thousand'
+    'settings_aware', 'struct_settings', 'ten_thousand'
 )
 AND varargs IS NOT NULL;
 ----

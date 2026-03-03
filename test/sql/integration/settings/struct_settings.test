@@ -1,0 +1,52 @@
+# name: test/sql/integration/settings/struct_settings.test
+# description: Validates the struct_settings function uses a struct-typed DuckDB setting
+# group: [vgi_integration_settings]
+
+# The struct_settings function generates a sequence configured by a struct setting
+# with fields: start (int64), step (int64), label (string).
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# Struct setting configures sequence generation
+# ============================================================================
+
+statement ok
+SET config = {'start': 10, 'step': 5, 'label': 'item'};
+
+query IT
+SELECT n, label FROM struct_settings(3) ORDER BY n;
+----
+10	item_0
+15	item_1
+20	item_2
+
+# ============================================================================
+# Different struct values produce different output
+# ============================================================================
+
+statement ok
+SET config = {'start': 0, 'step': 100, 'label': 'row'};
+
+query IT
+SELECT n, label FROM struct_settings(4) ORDER BY n;
+----
+0	row_0
+100	row_1
+200	row_2
+300	row_3
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+RESET config;
+
+statement ok
+DETACH example;

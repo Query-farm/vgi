@@ -1,0 +1,87 @@
+# name: test/sql/integration/settings/settings.test
+# description: Validates settings registration and settings_aware function behavior
+# group: [vgi_integration_settings]
+
+# Settings defined in Worker.Settings must appear in duckdb_settings() after ATTACH
+# and be usable by functions via SET/RESET.
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# Settings Registration
+# All settings from ExampleWorker.Settings must be visible
+# ============================================================================
+
+query I
+SELECT COUNT(*)
+FROM duckdb_settings()
+WHERE name IN ('vgi_verbose_mode', 'greeting', 'multiplier', 'threshold', 'config');
+----
+5
+
+# ============================================================================
+# settings_aware function with custom settings
+# ============================================================================
+
+# Set non-verbose mode with custom greeting and multiplier
+statement ok
+SET greeting = 'Bonjour';
+
+statement ok
+SET multiplier = 3;
+
+statement ok
+SET vgi_verbose_mode = false;
+
+query ITR
+SELECT id, greeting, value FROM settings_aware(3) ORDER BY id;
+----
+0	Bonjour	0.0
+1	Bonjour	7.5
+2	Bonjour	15.0
+
+# ============================================================================
+# Verbose mode adds details column
+# ============================================================================
+
+statement ok
+SET vgi_verbose_mode = true;
+
+query ITRT
+SELECT id, greeting, value, details FROM settings_aware(3) ORDER BY id;
+----
+0	Bonjour	0.0	row_0
+1	Bonjour	7.5	row_1
+2	Bonjour	15.0	row_2
+
+# ============================================================================
+# RESET returns to defaults
+# ============================================================================
+
+statement ok
+RESET vgi_verbose_mode;
+
+statement ok
+RESET greeting;
+
+statement ok
+RESET multiplier;
+
+query ITR
+SELECT id, greeting, value FROM settings_aware(3) ORDER BY id;
+----
+0	Hello	0.0
+1	Hello	2.5
+2	Hello	5.0
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;

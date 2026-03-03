@@ -1,0 +1,51 @@
+# name: test/sql/integration/settings/multiply_by_setting.test
+# description: Validates the multiply_by_setting scalar function uses the multiplier setting
+# group: [vgi_integration_settings]
+
+# The multiply_by_setting scalar function multiplies its input by the
+# multiplier DuckDB setting value.
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# Basic multiplication by setting
+# ============================================================================
+
+statement ok
+SET multiplier = 5;
+
+query I
+SELECT multiply_by_setting(v) FROM (VALUES (1), (2), (3)) AS t(v) ORDER BY v;
+----
+5
+10
+15
+
+# ============================================================================
+# Change setting and verify new value is used
+# ============================================================================
+
+statement ok
+SET multiplier = 10;
+
+query I
+SELECT multiply_by_setting(v) FROM (VALUES (1), (2), (3)) AS t(v) ORDER BY v;
+----
+10
+20
+30
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+RESET multiplier;
+
+statement ok
+DETACH example;

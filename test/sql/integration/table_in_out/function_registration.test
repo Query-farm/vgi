@@ -18,7 +18,7 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
 # ============================================================================
 # Function Inventory
-# All 7 table-in-out functions must be registered
+# All 8 table-in-out functions must be registered
 # ============================================================================
 
 query T
@@ -27,7 +27,8 @@ FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'table'
 AND function_name IN (
     'buffer_input', 'echo', 'exception_finalize', 'exception_process',
-    'repeat_inputs', 'sum_all_columns', 'sum_all_columns_simple_distributed'
+    'filter_by_setting', 'repeat_inputs', 'sum_all_columns',
+    'sum_all_columns_simple_distributed'
 )
 ORDER BY function_name;
 ----
@@ -35,6 +36,7 @@ buffer_input
 echo
 exception_finalize
 exception_process
+filter_by_setting
 repeat_inputs
 sum_all_columns
 sum_all_columns_simple_distributed
@@ -46,7 +48,7 @@ FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'table'
 AND list_contains(parameter_types, 'TABLE');
 ----
-7
+8
 
 # ============================================================================
 # Per-function Registration
@@ -78,6 +80,19 @@ FROM duckdb_functions()
 WHERE database_name = 'example' AND function_name = 'echo';
 ----
 echo	[data]	[TABLE]	Passthrough function that emits each input batch unchanged
+
+# ----------------------------------------------------------------------------
+# filter_by_setting — Filters rows by threshold setting
+# Parameters: data (TABLE)
+# Uses the threshold DuckDB setting to filter rows
+# ----------------------------------------------------------------------------
+
+query TTTT
+SELECT function_name, parameters, parameter_types, description
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_name = 'filter_by_setting';
+----
+filter_by_setting	[data]	[TABLE]	Filter rows where value column >= threshold setting
 
 # ----------------------------------------------------------------------------
 # exception_finalize — Raises exception during finalize phase (test function)
@@ -174,7 +189,8 @@ FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'table'
 AND function_name IN (
     'buffer_input', 'echo', 'exception_finalize', 'exception_process',
-    'repeat_inputs', 'sum_all_columns', 'sum_all_columns_simple_distributed'
+    'filter_by_setting', 'repeat_inputs', 'sum_all_columns',
+    'sum_all_columns_simple_distributed'
 )
 AND varargs IS NOT NULL;
 ----
