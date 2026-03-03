@@ -1,0 +1,188 @@
+# name: test/sql/integration/table_in_out/function_registration.test
+# description: Validates table-in-out function registration metadata matches the VGI example worker specification
+# group: [vgi_integration_table_in_out]
+
+# Table-in-out functions registered by the example worker must expose consistent
+# metadata through duckdb_functions() so that all VGI worker implementations
+# (Python, Go, etc.) can be validated against the same expectations.
+#
+# Table-in-out functions appear as function_type='table' in duckdb_functions()
+# and are distinguished by having a TABLE parameter type in their signature.
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# Function Inventory
+# All 7 table-in-out functions must be registered
+# ============================================================================
+
+query T
+SELECT function_name
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_type = 'table'
+AND function_name IN (
+    'buffer_input', 'echo', 'exception_finalize', 'exception_process',
+    'repeat_inputs', 'sum_all_columns', 'sum_all_columns_simple_distributed'
+)
+ORDER BY function_name;
+----
+buffer_input
+echo
+exception_finalize
+exception_process
+repeat_inputs
+sum_all_columns
+sum_all_columns_simple_distributed
+
+# All table-in-out functions have TABLE in their parameter types
+query I
+SELECT COUNT(*)
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_type = 'table'
+AND list_contains(parameter_types, 'TABLE');
+----
+7
+
+# ============================================================================
+# Per-function Registration
+# Each query checks: name, parameters, parameter_types, description
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# buffer_input — Collects all input, emits during finalization
+# Parameters: data (TABLE)
+# Single-table passthrough with buffering semantics
+# ----------------------------------------------------------------------------
+
+query TTTT
+SELECT function_name, parameters, parameter_types, description
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_name = 'buffer_input';
+----
+buffer_input	[data]	[TABLE]	Collects all input batches and emits during finalization
+
+# ----------------------------------------------------------------------------
+# echo — Passthrough function (identity transform)
+# Parameters: data (TABLE)
+# Supports projection and filter pushdown
+# ----------------------------------------------------------------------------
+
+query TTTT
+SELECT function_name, parameters, parameter_types, description
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_name = 'echo';
+----
+echo	[data]	[TABLE]	Passthrough function that emits each input batch unchanged
+
+# ----------------------------------------------------------------------------
+# exception_finalize — Raises exception during finalize phase (test function)
+# Parameters: data (TABLE), logging (BOOLEAN named)
+# Inherits parameter signature from sum_all_columns
+# ----------------------------------------------------------------------------
+
+query TTTT
+SELECT function_name, parameters, parameter_types, description
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_name = 'exception_finalize';
+----
+exception_finalize	[data, logging]	[TABLE, BOOLEAN]	Test function that raises exception during finalize
+
+# ----------------------------------------------------------------------------
+# exception_process — Raises exception during process phase (test function)
+# Parameters: data (TABLE), logging (BOOLEAN named)
+# Inherits parameter signature from sum_all_columns
+# ----------------------------------------------------------------------------
+
+query TTTT
+SELECT function_name, parameters, parameter_types, description
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_name = 'exception_process';
+----
+exception_process	[data, logging]	[TABLE, BOOLEAN]	Test function that raises exception during process
+
+# ----------------------------------------------------------------------------
+# repeat_inputs — Duplicates each input batch N times
+# Parameters: repeat_count (BIGINT), data (TABLE)
+# Note: repeat_count is positional (before the TABLE input)
+# ----------------------------------------------------------------------------
+
+query TTTT
+SELECT function_name, parameters, parameter_types, description
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_name = 'repeat_inputs';
+----
+repeat_inputs	[repeat_count, data]	[BIGINT, TABLE]	Duplicates each input batch N times
+
+# ----------------------------------------------------------------------------
+# sum_all_columns — Column-wise aggregation of numeric columns
+# Parameters: data (TABLE), logging (BOOLEAN named)
+# Accumulates in process(), emits single row in finalize()
+# ----------------------------------------------------------------------------
+
+query TTTT
+SELECT function_name, parameters, parameter_types, description
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_name = 'sum_all_columns';
+----
+sum_all_columns	[data, logging]	[TABLE, BOOLEAN]	Computes column-wise sums across all batches
+
+# ----------------------------------------------------------------------------
+# sum_all_columns_simple_distributed — Distributed aggregation via callback API
+# Parameters: data (TABLE)
+# Uses ArrowSerializableDataclass for distributed state management
+# ----------------------------------------------------------------------------
+
+query TTTT
+SELECT function_name, parameters, parameter_types, description
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_name = 'sum_all_columns_simple_distributed';
+----
+sum_all_columns_simple_distributed	[data]	[TABLE]	Distributed sum using simple callback API
+
+# ============================================================================
+# Categories
+# Functions declare categories for discoverability
+# ============================================================================
+
+query TT
+SELECT function_name, categories
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_name = 'echo';
+----
+echo	[utility, debug]
+
+query TT
+SELECT function_name, categories
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_name = 'sum_all_columns';
+----
+sum_all_columns	[aggregation, numeric]
+
+# ============================================================================
+# No varargs
+# None of the table-in-out functions use varargs
+# ============================================================================
+
+query I
+SELECT COUNT(*)
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_type = 'table'
+AND function_name IN (
+    'buffer_input', 'echo', 'exception_finalize', 'exception_process',
+    'repeat_inputs', 'sum_all_columns', 'sum_all_columns_simple_distributed'
+)
+AND varargs IS NOT NULL;
+----
+0
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;

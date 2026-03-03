@@ -6,35 +6,56 @@ Reference implementations:
 - **vgi**: `/Users/rusty/Development/vgi-python` (see `docs/*` for protocol documentation)
 - **vgi_rpc**: `/Users/rusty/Development/vgi-rpc-python` (see `docs/*` for RPC protocol)
 
-Activate the `.venv` in vgi-python or vgi-rpc-python before running their code.
+When building you must set the VCPKG_TOOLCHAIN_PATH variable with:
+
+```bash
+VCPKG_TOOLCHAIN_PATH=$(pwd)/vcpkg/scripts/buildsystems/vcpkg.cmake
+```
+
 
 ## Build
 
 ```bash
-VCPKG_TOOLCHAIN_PATH=$(pwd)/vcpkg/scripts/buildsystems/vcpkg.cmake GEN=ninja make debug
+# both builds use the ninja build tool by setting it in GEN
+# This builds the debug build
+GEN=ninja make debug
+# This builds the release build
+GEN=ninja make release
 ```
 
-No permission needed to run builds.
+No permission needed to run either build target.
 
 ## Test
+
+There are many tests for this extension that take a long time to run in debug mode, so
+its best to run the tests against the release build first then run the failed tests
+using the debug build to isolate failures.
 
 Run test suites after changes:
 
 ```bash
-# You need to activate the vgi-python .venv to run the vgi-example-worker
-source /Users/rusty/Development/vgi-python/.venv/bin/activate
 
-# The VGI_TEST_WORKER determines what vgi worker to use for tests.
-VGI_TEST_WORKER=vgi-example-worker make test_debug
+# The VGI_TEST_WORKER determines what vgi worker to use for tests, this runs the
+# VGI python example worker
+VGI_TEST_WORKER="uv run --project ~/Development/vgi-python vgi-example-worker"
+
+# Run all tests in debug mode
+make test_debug
+
+# Run all tests in release mode
+make test
+
+# To run all tests and return failures you may want to use
+make test | grep -A 20 "FAILED"
 
 # This in turn runs the unittest command, you may wish to run tests in parallel from the
 # tests/sql directory to speed up execution, but it is important to run all tests
-# comprehensively.
+# comprehensively before commiting changes.
 ```
 
-Tests complete in <10 seconds per suite. For debugging failures, write standalone `.sql` files in `/tmp/` and run with `./build/debug/duckdb -f /tmp/test.sql`.
+Each test file should complete in <10 seconds per suite.
 
-**Known failure**: `settings_aware.test:161` — direct `vgi_table_function()` doesn't pass settings (pre-existing).
+For debugging failures, write standalone `.sql` files in `/tmp/` and run with `./build/debug/duckdb -f /tmp/test.sql`.
 
 ## Debug Environment Variables
 

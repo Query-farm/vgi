@@ -1,6 +1,7 @@
 #include "storage/vgi_table_entry.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/extension_helper.hpp"
@@ -47,6 +48,19 @@ TableFunction VgiTableEntry::GetScanFunction(ClientContext &context, unique_ptr<
 		named_args_vec.emplace_back(k, v);
 	}
 
+	// Look up the scan function's catalog entry to get its capabilities
+	// (e.g., filter_pushdown, projection_pushdown)
+	bool has_projection_pushdown = false;
+	bool has_filter_pushdown = false;
+	auto func_entry = catalog_.GetEntry<TableFunctionCatalogEntry>(
+	    context, ParentSchema().name, scan_result.function_name, OnEntryNotFound::RETURN_NULL);
+	if (func_entry) {
+		for (auto &tf : func_entry->functions.functions) {
+			has_projection_pushdown = has_projection_pushdown || tf.projection_pushdown;
+			has_filter_pushdown = has_filter_pushdown || tf.filter_pushdown;
+		}
+	}
+
 	// Build shared bind data
 	auto scan_bind_data = make_uniq<vgi::VgiTableFunctionBindData>();
 	scan_bind_data->worker_path = attach_params->worker_path();
@@ -55,7 +69,7 @@ TableFunction VgiTableEntry::GetScanFunction(ClientContext &context, unique_ptr<
 	scan_bind_data->use_pool = attach_params->use_pool();
 	scan_bind_data->function_name = scan_result.function_name;
 	scan_bind_data->arguments = vgi::BuildArgumentsFromValues(context, scan_result.positional_arguments, named_args_vec);
-	scan_bind_data->projection_pushdown = true;
+	scan_bind_data->projection_pushdown = has_projection_pushdown;
 
 	// Perform bind handshake with the worker (discovers output schema)
 	vector<LogicalType> return_types;
@@ -67,7 +81,8 @@ TableFunction VgiTableEntry::GetScanFunction(ClientContext &context, unique_ptr<
 	// Wire up the shared table function implementation
 	TableFunction func("vgi_table_scan", {}, vgi::VgiTableFunctionScan, nullptr,
 	                   vgi::VgiTableFunctionInitGlobal, vgi::VgiTableFunctionInitLocal);
-	func.projection_pushdown = true;
+	func.projection_pushdown = has_projection_pushdown;
+	func.filter_pushdown = has_filter_pushdown;
 	func.cardinality = vgi::VgiTableFunctionCardinality;
 	func.table_scan_progress = vgi::VgiTableFunctionProgress;
 	func.to_string = vgi::VgiTableFunctionToString;

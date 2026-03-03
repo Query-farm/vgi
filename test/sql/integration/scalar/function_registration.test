@@ -1,0 +1,257 @@
+# name: test/sql/integration/scalar/function_registration.test
+# description: Validates scalar function registration metadata matches the VGI example worker specification
+# group: [vgi_integration_scalar]
+
+# Scalar functions registered by the example worker must expose consistent metadata
+# through duckdb_functions() so that all VGI worker implementations (Python, Go, etc.)
+# can be validated against the same expectations.
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# Function Inventory
+# All 13 scalar functions must be registered
+# ============================================================================
+
+query I
+SELECT COUNT(*)
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_type = 'scalar';
+----
+13
+
+query T
+SELECT function_name
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_type = 'scalar'
+ORDER BY function_name;
+----
+add_values
+bernoulli
+binary_packet
+conditional_message
+double
+multiply
+multiply_by_setting
+null_handling
+random_bytes
+random_int
+return_secret_value
+sum_values
+upper_case
+
+# ============================================================================
+# Per-function Registration
+# Each query checks: name, parameters, parameter_types, return_type, stability, description
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# add_values — Adds two AnyArrow numeric columns with dynamic return type
+# Parameters: col1 (ANY), col2 (ANY) → ANY
+# ----------------------------------------------------------------------------
+
+query TTTTTT
+SELECT function_name, parameters, parameter_types, return_type, stability, description
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_name = 'add_values';
+----
+add_values	[col1, col2]	[ANY, ANY]	ANY	CONSISTENT	Adds two numeric values
+
+# ----------------------------------------------------------------------------
+# bernoulli — No input parameters, returns random booleans (VOLATILE)
+# Parameters: (none) → BOOLEAN
+# ----------------------------------------------------------------------------
+
+query TTTTTT
+SELECT function_name, parameters, parameter_types, return_type, stability, description
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_name = 'bernoulli';
+----
+bernoulli	[]	[]	BOOLEAN	VOLATILE	Generate random booleans (demonstrates VOLATILE stability)
+
+# ----------------------------------------------------------------------------
+# binary_packet — Complex ConstParam types (binary header, struct config)
+# Parameters: header (BLOB), payload (BLOB), config (STRUCT) → BLOB
+# ----------------------------------------------------------------------------
+
+query TTTTTT
+SELECT function_name, parameters, parameter_types, return_type, stability, description
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_name = 'binary_packet';
+----
+binary_packet	[header, payload, config]	[BLOB, BLOB, 'STRUCT("label" VARCHAR, "version" BIGINT)']	BLOB	CONSISTENT	Build binary packets with header, payload, and config
+
+# ----------------------------------------------------------------------------
+# conditional_message — Multiple ConstParam parameters (int, string) + column
+# Parameters: repeat_count (BIGINT), message (VARCHAR), condition (BOOLEAN) → VARCHAR
+# ----------------------------------------------------------------------------
+
+query TTTTTT
+SELECT function_name, parameters, parameter_types, return_type, stability, description
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_name = 'conditional_message';
+----
+conditional_message	[repeat_count, message, condition]	[BIGINT, VARCHAR, BOOLEAN]	VARCHAR	CONSISTENT	Returns repeated message when condition is true
+
+# ----------------------------------------------------------------------------
+# double — AnyArrow input with dynamic return type via on_bind
+# Parameters: value (ANY) → ANY
+# ----------------------------------------------------------------------------
+
+query TTTTTT
+SELECT function_name, parameters, parameter_types, return_type, stability, description
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_name = 'double';
+----
+double	[value]	[ANY]	ANY	CONSISTENT	Doubles numeric values
+
+# ----------------------------------------------------------------------------
+# multiply — ConstParam example with static types
+# Parameters: value (BIGINT), factor (BIGINT) → BIGINT
+# ----------------------------------------------------------------------------
+
+query TTTTTT
+SELECT function_name, parameters, parameter_types, return_type, stability, description
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_name = 'multiply';
+----
+multiply	[value, factor]	[BIGINT, BIGINT]	BIGINT	CONSISTENT	Multiplies a value by a constant factor
+
+# ----------------------------------------------------------------------------
+# multiply_by_setting — Setting() parameter (not visible in duckdb_functions)
+# Parameters: value (BIGINT) → BIGINT
+# Note: 'multiplier' setting is passed internally, not as a function parameter
+# ----------------------------------------------------------------------------
+
+query TTTTTT
+SELECT function_name, parameters, parameter_types, return_type, stability, description
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_name = 'multiply_by_setting';
+----
+multiply_by_setting	[value]	[BIGINT]	BIGINT	CONSISTENT	Multiply the input value by a setting value
+
+# ----------------------------------------------------------------------------
+# null_handling — NullHandling.SPECIAL (receives NULLs instead of skipping)
+# Parameters: value (BIGINT) → BIGINT
+# ----------------------------------------------------------------------------
+
+query TTTTTT
+SELECT function_name, parameters, parameter_types, return_type, stability, description
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_name = 'null_handling';
+----
+null_handling	[value]	[BIGINT]	BIGINT	CONSISTENT	Returns value or -5000 if null
+
+# ----------------------------------------------------------------------------
+# random_bytes — ConstParam seed + length, CONSISTENT stability
+# Parameters: seed (BIGINT), byte_length (BIGINT) → BLOB
+# ----------------------------------------------------------------------------
+
+query TTTTTT
+SELECT function_name, parameters, parameter_types, return_type, stability, description
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_name = 'random_bytes';
+----
+random_bytes	[seed, byte_length]	[BIGINT, BIGINT]	BLOB	CONSISTENT	Generate pseudo-random binary blobs from seed and length
+
+# ----------------------------------------------------------------------------
+# random_int — VOLATILE stability (non-deterministic output)
+# Parameters: min_val (BIGINT), max_val (BIGINT) → BIGINT
+# ----------------------------------------------------------------------------
+
+query TTTTTT
+SELECT function_name, parameters, parameter_types, return_type, stability, description
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_name = 'random_int';
+----
+random_int	[min_val, max_val]	[BIGINT, BIGINT]	BIGINT	VOLATILE	Generate random integers (demonstrates VOLATILE stability)
+
+# ----------------------------------------------------------------------------
+# return_secret_value — Secret() parameter (not visible in duckdb_functions)
+# Parameters: (none) → VARCHAR
+# Note: 'vgi_example_secret' is passed internally, not as a function parameter
+# ----------------------------------------------------------------------------
+
+query TTTTTT
+SELECT function_name, parameters, parameter_types, return_type, stability, description
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_name = 'return_secret_value';
+----
+return_secret_value	[]	[]	VARCHAR	CONSISTENT	Return a secret's value
+
+# ----------------------------------------------------------------------------
+# sum_values — Varargs with AnyArrow type and dynamic return type
+# Parameters: (none positional), varargs=ANY → ANY
+# ----------------------------------------------------------------------------
+
+query TTTTTT
+SELECT function_name, parameters, parameter_types, return_type, stability, description
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_name = 'sum_values';
+----
+sum_values	[]	[]	ANY	CONSISTENT	Sum multiple numeric values
+
+# ----------------------------------------------------------------------------
+# upper_case — Simple string→string transformation
+# Parameters: value (VARCHAR) → VARCHAR
+# ----------------------------------------------------------------------------
+
+query TTTTTT
+SELECT function_name, parameters, parameter_types, return_type, stability, description
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_name = 'upper_case';
+----
+upper_case	[value]	[VARCHAR]	VARCHAR	CONSISTENT	Converts string values to uppercase
+
+# ============================================================================
+# Varargs
+# Only sum_values declares varargs (accepts variable number of ANY-typed args)
+# ============================================================================
+
+query TT
+SELECT function_name, varargs
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_type = 'scalar' AND varargs IS NOT NULL;
+----
+sum_values	ANY
+
+# Verify all other scalar functions have no varargs
+query I
+SELECT COUNT(*)
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_type = 'scalar' AND varargs IS NULL;
+----
+12
+
+# ============================================================================
+# Stability
+# Most scalar functions are CONSISTENT; bernoulli and random_int are VOLATILE
+# ============================================================================
+
+query T
+SELECT function_name
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_type = 'scalar' AND stability = 'VOLATILE'
+ORDER BY function_name;
+----
+bernoulli
+random_int
+
+query I
+SELECT COUNT(*)
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_type = 'scalar' AND stability = 'CONSISTENT';
+----
+11
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;

@@ -13,6 +13,7 @@
 #include "duckdb/planner/filter/constant_filter.hpp"
 #include "duckdb/planner/filter/in_filter.hpp"
 #include "duckdb/planner/filter/null_filter.hpp"
+#include "duckdb/planner/filter/optional_filter.hpp"
 #include "duckdb/planner/filter/struct_filter.hpp"
 #include "duckdb/planner/table_filter.hpp"
 
@@ -237,10 +238,11 @@ private:
 			    worker_path_);
 		}
 		case TableFilterType::OPTIONAL_FILTER: {
-			throw InvalidInputException(
-			    "VGI filter pushdown failed for worker '%s': OptionalFilter cannot be serialized (internal filter "
-			    "type)",
-			    worker_path_);
+			auto &optional_filter = filter.Cast<OptionalFilter>();
+			if (optional_filter.child_filter) {
+				SerializeFilterInto(obj, *optional_filter.child_filter, column_index, column_name);
+			}
+			break;
 		}
 		default: {
 			throw InvalidInputException(
