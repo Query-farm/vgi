@@ -17,7 +17,7 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
 # ============================================================================
 # Function Inventory
-# All 13 scalar functions must be registered
+# All 14 scalar functions must be registered
 # ============================================================================
 
 query I
@@ -25,7 +25,7 @@ SELECT COUNT(*)
 FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'scalar';
 ----
-13
+14
 
 query T
 SELECT function_name
@@ -38,6 +38,7 @@ bernoulli
 binary_packet
 conditional_message
 double
+hash_seed
 multiply
 multiply_by_setting
 null_handling
@@ -111,6 +112,18 @@ FROM duckdb_functions()
 WHERE database_name = 'example' AND function_name = 'double';
 ----
 double	[value]	[ANY]	ANY	CONSISTENT	Doubles numeric values
+
+# ----------------------------------------------------------------------------
+# hash_seed — Single ConstParam, no Params (1 ConstParam, 0 Params pattern)
+# Parameters: seed (BIGINT) → BIGINT
+# ----------------------------------------------------------------------------
+
+query TTTTTT
+SELECT function_name, parameters, parameter_types, return_type, stability, description
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_name = 'hash_seed';
+----
+hash_seed	[seed]	[BIGINT]	BIGINT	CONSISTENT	Generate deterministic integers from a constant seed
 
 # ----------------------------------------------------------------------------
 # multiply — ConstParam example with static types
@@ -228,7 +241,7 @@ SELECT COUNT(*)
 FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'scalar' AND varargs IS NULL;
 ----
-12
+13
 
 # ============================================================================
 # Stability
@@ -249,7 +262,7 @@ SELECT COUNT(*)
 FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'scalar' AND stability = 'CONSISTENT';
 ----
-11
+12
 
 # ============================================================================
 # Cleanup

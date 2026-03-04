@@ -1,0 +1,144 @@
+# name: test/sql/integration/scalar/hash_seed.test
+# description: Integration tests for VGI hash_seed scalar function
+# group: [vgi_integration_scalar]
+
+# This test requires a VGI worker to be available
+# Set VGI_TEST_WORKER environment variable to the path of a VGI worker executable
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# hash_seed function
+# Generates deterministic integers from a constant seed (seed + row_index).
+# When called with only constant args, DuckDB folds the result: the function
+# is invoked once (length=1) and the single value is broadcast to all rows.
+# Args: seed (constant integer)
+# Returns: int64
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# Basic single value tests
+# ----------------------------------------------------------------------------
+
+query I
+SELECT example.hash_seed(0);
+----
+0
+
+query I
+SELECT example.hash_seed(42);
+----
+42
+
+query I
+SELECT example.hash_seed(100);
+----
+100
+
+query I
+SELECT example.hash_seed(-10);
+----
+-10
+
+# ----------------------------------------------------------------------------
+# Multiple rows — DuckDB folds the constant, so every row gets seed+0
+# ----------------------------------------------------------------------------
+
+query I
+SELECT example.hash_seed(0) FROM (VALUES (1), (2), (3), (4), (5)) t(x);
+----
+0
+0
+0
+0
+0
+
+query I
+SELECT example.hash_seed(42) FROM (VALUES (1), (2), (3)) t(x);
+----
+42
+42
+42
+
+query I
+SELECT example.hash_seed(100) FROM (VALUES (1), (2), (3), (4), (5)) t(x);
+----
+100
+100
+100
+100
+100
+
+# ----------------------------------------------------------------------------
+# Deterministic: same seed → same output
+# ----------------------------------------------------------------------------
+
+query I
+SELECT a.result = b.result FROM (
+    SELECT example.hash_seed(99) AS result
+) a, (
+    SELECT example.hash_seed(99) AS result
+) b;
+----
+true
+
+# ----------------------------------------------------------------------------
+# Different seeds produce different results
+# ----------------------------------------------------------------------------
+
+query I
+SELECT a.result != b.result FROM (
+    SELECT example.hash_seed(1) AS result
+) a, (
+    SELECT example.hash_seed(1000) AS result
+) b;
+----
+true
+
+# ----------------------------------------------------------------------------
+# Return type validation
+# ----------------------------------------------------------------------------
+
+query I
+SELECT typeof(example.hash_seed(42));
+----
+BIGINT
+
+# ----------------------------------------------------------------------------
+# Larger dataset
+# ----------------------------------------------------------------------------
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT example.hash_seed(0) AS result
+    FROM (SELECT unnest(generate_series(1, 100)) AS i)
+);
+----
+100
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT example.hash_seed(0) AS result
+    FROM (SELECT unnest(generate_series(1, 1000)) AS i)
+);
+----
+1000
+
+# All rows should have the same folded value
+query I
+SELECT COUNT(DISTINCT example.hash_seed(7)) FROM (SELECT unnest(generate_series(1, 100)) AS i);
+----
+1
+
+# ----------------------------------------------------------------------------
+# Cleanup
+# ----------------------------------------------------------------------------
+
+statement ok
+DETACH example;
