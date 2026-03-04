@@ -169,24 +169,9 @@ unique_ptr<FunctionData> VgiScalarFunctionBind(ClientContext &context, ScalarFun
 	// ========================================================================
 	vector<Value> positional_args;
 
-	if (num_const_params > 0) {
-		// Function has vgi_const params: only pass the extracted const values
-		// Non-const params come from input batch columns
-		for (auto &val : const_values) {
-			positional_args.push_back(val);
-		}
-	} else {
-		// Function has no vgi_const params (but may have dynamic return type)
-		// Use original behavior: pass actual value for constants, column index for columns
-		for (idx_t i = 0; i < arguments.size(); i++) {
-			auto &expr = arguments[i];
-			if (expr->type == ExpressionType::VALUE_CONSTANT) {
-				auto &const_expr = expr->Cast<BoundConstantExpression>();
-				positional_args.push_back(const_expr.value);
-			} else {
-				positional_args.push_back(Value::INTEGER(static_cast<int32_t>(i)));
-			}
-		}
+	// Pass only the extracted const values — non-const params come from input batch columns
+	for (auto &val : const_values) {
+		positional_args.push_back(val);
 	}
 
 	ArrowArguments arrow_arguments = BuildArgumentsFromValues(context, positional_args, {});
@@ -197,9 +182,8 @@ unique_ptr<FunctionData> VgiScalarFunctionBind(ClientContext &context, ScalarFun
 	std::shared_ptr<arrow::Schema> output_schema;
 	std::unique_ptr<IFunctionConnection> bind_connection;
 
-	// For functions with const params, skip the worker call on re-bind (const values were already extracted)
-	// For functions without const params (but with dynamic return type), always call the worker
-	bool skip_worker_call = const_args_already_erased && (num_const_params > 0);
+	// Skip the worker call on re-bind when const values were already extracted
+	bool skip_worker_call = const_args_already_erased;
 
 	if (skip_worker_call) {
 		// Re-bind during deserialization for function with const params
@@ -313,20 +297,11 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 		}
 		local_state.input_schema = BuildArrowSchemaFromDuckDB(context, input_types, input_names);
 
-		// Build invocation arguments:
-		// - If bind_data has const_values: pass const values (const params were erased at bind time)
-		// - Otherwise: pass column indices (original behavior for functions without const params)
+		// Build invocation arguments: pass const values (const params were erased at bind time)
 		vector<Value> positional_args;
-		if (bind_data && !bind_data->const_values.empty()) {
-			// Functions with const params: pass the extracted constant values
+		if (bind_data) {
 			for (auto &val : bind_data->const_values) {
 				positional_args.push_back(val);
-			}
-		} else {
-			// Functions without const params: pass column indices (original behavior)
-			// The worker receives the index and accesses batch.column(index)
-			for (idx_t i = 0; i < args.ColumnCount(); i++) {
-				positional_args.push_back(Value::INTEGER(static_cast<int32_t>(i)));
 			}
 		}
 		ArrowArguments arguments = BuildArgumentsFromValues(context, positional_args, {});
@@ -377,10 +352,14 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 			                 worker_path.c_str(), connection->GetPid());
 		}
 
-		if (!reused_bind_connection) {
+		if (reused_bind_connection) {
+			// Update connection's input schema to match actual DataChunk types.
+			// Bind-time expression types may differ from execute-time DataChunk types
+			// (e.g., DOUBLE from function signature vs DECIMAL from VALUES clause).
+			// The IPC writer uses this schema, so it must match the actual batch.
+			connection->UpdateInputSchemaForExecution(local_state.input_schema);
+		} else {
 			// New connection needs input schema set and full bind handshake.
-			// Reused connections already have these from the bind phase.
-			// (SetInputSchema throws if called after bind — see vgi_catalog_api.cpp:1475)
 			connection->SetInputSchema(local_state.input_schema);
 			connection->PerformBindFull();
 		}

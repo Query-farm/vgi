@@ -38,6 +38,10 @@ public:
 	virtual BindResult PerformBindFull() = 0;
 	virtual void SetInputSchema(const std::shared_ptr<arrow::Schema> &input_schema) = 0;
 
+	// Update input schema for execute phase (after bind, before OpenInputWriter)
+	// Used when reusing bind connection and actual DataChunk types differ from bind types
+	virtual void UpdateInputSchemaForExecution(const std::shared_ptr<arrow::Schema> &input_schema) = 0;
+
 	// Phase 2: Init
 	virtual InitResult PerformInit(const std::vector<int32_t> &projection_ids = {},
 	                               std::shared_ptr<arrow::Buffer> pushdown_filters = nullptr,

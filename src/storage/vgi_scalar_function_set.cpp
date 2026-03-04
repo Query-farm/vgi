@@ -147,21 +147,10 @@ void VgiScalarFunctionSet::LoadEntries(ClientContext &context) {
 			scalar_func_info->setting_names = setting_names;
 			scalar_func_info->required_secrets = func_info.required_secrets;
 
-			// Check if any params are const
-			bool has_const_params = std::any_of(arg_types.positional_is_const.begin(),
-			                                     arg_types.positional_is_const.end(),
-			                                     [](bool b) { return b; });
-
-			// Attach the function info and init callback
+			// Attach the function info, init callback, and bind callback
 			scalar_func.SetExtraFunctionInfo(scalar_func_info);
 			scalar_func.SetInitStateCallback(vgi::VgiScalarFunctionInitLocalState);
-
-			// Set bind callback if:
-			// 1. Function has dynamic return type (is_any_output), OR
-			// 2. Function has const parameters that need folding
-			if (is_any_output || has_const_params) {
-				scalar_func.SetBindCallback(vgi::VgiScalarFunctionBind);
-			}
+			scalar_func.SetBindCallback(vgi::VgiScalarFunctionBind);
 
 			func_set.AddFunction(scalar_func);
 

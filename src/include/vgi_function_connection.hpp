@@ -141,6 +141,9 @@ public:
 	// input_schema: Arrow schema describing the input data
 	void SetInputSchema(const std::shared_ptr<arrow::Schema> &input_schema) override;
 
+	// Update input schema for execution phase (when DataChunk types differ from bind types)
+	void UpdateInputSchemaForExecution(const std::shared_ptr<arrow::Schema> &input_schema) override;
+
 	// Phase 2: Perform init via vgi_rpc "init" RPC call
 	// Sends InitRequest, reads GlobalInitResponse, opens data streams
 	// For table functions: enters producer mode (tick-based)

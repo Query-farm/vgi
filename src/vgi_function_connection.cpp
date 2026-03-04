@@ -542,6 +542,17 @@ void FunctionConnection::SetInputSchema(const std::shared_ptr<arrow::Schema> &in
 	input_schema_ = input_schema;
 }
 
+void FunctionConnection::UpdateInputSchemaForExecution(const std::shared_ptr<arrow::Schema> &input_schema) {
+	// Allow updating input schema after bind but before OpenInputWriter.
+	// Used when reusing a bind connection and the actual DataChunk types
+	// differ from the bind-time expression types (e.g., DECIMAL vs DOUBLE).
+	if (input_writer_opened_) {
+		ThrowVgiIOException("FunctionConnection::UpdateInputSchemaForExecution called after OpenInputWriter",
+		                    worker_path_, proc_ ? proc_->GetPid() : -1, GetExecutionIdHex());
+	}
+	input_schema_ = input_schema;
+}
+
 void FunctionConnection::OpenInputWriter() {
 	if (!init_done_) {
 		ThrowVgiIOException("FunctionConnection::OpenInputWriter called before PerformInit", worker_path_,

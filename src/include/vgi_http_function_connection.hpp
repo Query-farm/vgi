@@ -41,6 +41,7 @@ public:
 	// Phase 1: Bind
 	BindResult PerformBindFull() override;
 	void SetInputSchema(const std::shared_ptr<arrow::Schema> &input_schema) override;
+	void UpdateInputSchemaForExecution(const std::shared_ptr<arrow::Schema> &input_schema) override;
 
 	// Phase 2: Init
 	InitResult PerformInit(const std::vector<int32_t> &projection_ids = {},

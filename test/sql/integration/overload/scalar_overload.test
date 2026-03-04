@@ -1,0 +1,155 @@
+# name: test/sql/integration/overload/scalar_overload.test
+# description: Validates scalar function overloading by ConstParam count
+# group: [vgi_integration_overload]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# Overload dispatch — 0 ConstParams (column only)
+# format_number(value) → integer part only
+# ============================================================================
+
+query T
+SELECT example.format_number(3.14);
+----
+3
+
+query T
+SELECT example.format_number(n::DOUBLE) FROM example.sequence(3) ORDER BY n;
+----
+0
+1
+2
+
+# ============================================================================
+# Overload dispatch — 1 ConstParam (precision)
+# format_number(precision, value) → specified decimal places
+# ============================================================================
+
+query T
+SELECT example.format_number(2, 3.14159);
+----
+3.14
+
+query T
+SELECT example.format_number(0, 99.9);
+----
+100
+
+# ============================================================================
+# Overload dispatch — 2 ConstParams (precision + prefix)
+# format_number(precision, prefix, value) → prefixed formatted number
+# ============================================================================
+
+query T
+SELECT example.format_number(2, '$', 3.14);
+----
+$3.14
+
+query T
+SELECT example.format_number(1, '€', 10.0);
+----
+€10.0
+
+# ============================================================================
+# NULL handling
+# ============================================================================
+
+query T
+SELECT example.format_number(NULL::DOUBLE);
+----
+NULL
+
+query T
+SELECT example.format_number(2, NULL::DOUBLE);
+----
+NULL
+
+query T
+SELECT example.format_number(2, '$', NULL::DOUBLE);
+----
+NULL
+
+# ============================================================================
+# typeof() — all overloads return VARCHAR
+# ============================================================================
+
+query T
+SELECT typeof(example.format_number(3.14));
+----
+VARCHAR
+
+query T
+SELECT typeof(example.format_number(2, 3.14));
+----
+VARCHAR
+
+query T
+SELECT typeof(example.format_number(2, '$', 3.14));
+----
+VARCHAR
+
+# ============================================================================
+# Multiple rows from table source
+# ============================================================================
+
+query T
+SELECT example.format_number(n::DOUBLE) FROM example.sequence(5) WHERE n > 0 ORDER BY n;
+----
+1
+2
+3
+4
+
+query T
+SELECT example.format_number(2, n::DOUBLE) FROM example.sequence(3) ORDER BY n;
+----
+0.00
+1.00
+2.00
+
+query T
+SELECT example.format_number(1, '#', n::DOUBLE) FROM example.sequence(3) ORDER BY n;
+----
+#0.0
+#1.0
+#2.0
+
+# ============================================================================
+# Multiple rows from VALUES (DECIMAL type auto-cast to DOUBLE)
+# ============================================================================
+
+query T
+SELECT example.format_number(v) FROM (VALUES (1.5), (2.7), (3.9)) AS t(v) ORDER BY v;
+----
+2
+3
+4
+
+query T
+SELECT example.format_number(2, v) FROM (VALUES (1.5), (2.7), (3.9)) AS t(v) ORDER BY v;
+----
+1.50
+2.70
+3.90
+
+query T
+SELECT example.format_number(2, '$', v) FROM (VALUES (1.5), (2.7), (3.9)) AS t(v) ORDER BY v;
+----
+$1.50
+$2.70
+$3.90
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;

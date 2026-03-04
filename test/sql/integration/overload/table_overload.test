@@ -1,0 +1,124 @@
+# name: test/sql/integration/overload/table_overload.test
+# description: Validates table function overloading by positional arg count
+# group: [vgi_integration_overload]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# Overload dispatch — 1 arg: example.make_series(count)
+# ============================================================================
+
+query I
+SELECT * FROM example.make_series(5) ORDER BY value;
+----
+0
+1
+2
+3
+4
+
+query I
+SELECT COUNT(*) FROM example.make_series(10);
+----
+10
+
+# ============================================================================
+# Overload dispatch — 2 args: example.make_series(start, stop)
+# ============================================================================
+
+query I
+SELECT * FROM example.make_series(3, 7) ORDER BY value;
+----
+3
+4
+5
+6
+
+query I
+SELECT COUNT(*) FROM example.make_series(0, 100);
+----
+100
+
+# ============================================================================
+# Overload dispatch — 3 args: example.make_series(start, stop, step)
+# ============================================================================
+
+query I
+SELECT * FROM example.make_series(0, 10, 3) ORDER BY value;
+----
+0
+3
+6
+9
+
+query I
+SELECT * FROM example.make_series(5, 20, 5) ORDER BY value;
+----
+5
+10
+15
+
+# ============================================================================
+# Aggregation
+# ============================================================================
+
+query IIII
+SELECT SUM(value), COUNT(*), MIN(value), MAX(value) FROM example.make_series(10);
+----
+45	10	0	9
+
+query I
+SELECT SUM(value) FROM example.make_series(0, 100, 10);
+----
+450
+
+# ============================================================================
+# Edge cases
+# ============================================================================
+
+# count=0 → empty result
+query I
+SELECT COUNT(*) FROM example.make_series(0);
+----
+0
+
+# start=stop → empty result
+query I
+SELECT COUNT(*) FROM example.make_series(5, 5);
+----
+0
+
+# start>stop → empty result
+query I
+SELECT COUNT(*) FROM example.make_series(10, 5);
+----
+0
+
+# step > range → single element
+query I
+SELECT * FROM example.make_series(0, 5, 100);
+----
+0
+
+# ============================================================================
+# Large series (>1024 rows, spanning multiple batches)
+# ============================================================================
+
+query II
+SELECT COUNT(*), SUM(value) FROM example.make_series(2000);
+----
+2000	1999000
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;

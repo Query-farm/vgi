@@ -174,6 +174,14 @@ void HttpFunctionConnection::SetInputSchema(const std::shared_ptr<arrow::Schema>
 	input_schema_ = input_schema;
 }
 
+void HttpFunctionConnection::UpdateInputSchemaForExecution(const std::shared_ptr<arrow::Schema> &input_schema) {
+	if (input_writer_opened_) {
+		throw IOException("HttpFunctionConnection::UpdateInputSchemaForExecution called after OpenInputWriter [url: %s]",
+		                   base_url_);
+	}
+	input_schema_ = input_schema;
+}
+
 BindResult HttpFunctionConnection::PerformBindFull() {
 	if (bind_done_) {
 		return bind_result_;
