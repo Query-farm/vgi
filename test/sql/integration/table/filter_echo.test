@@ -1,0 +1,275 @@
+# name: test/sql/integration/table/filter_echo.test
+# description: Comprehensive filter echo tests — verifies filter pushdown serialization,
+#              deserialization, column name mapping, and correct application
+# group: [vgi_integration_table]
+
+# FilterEchoFunction has filter_pushdown=True, auto_apply_filters=True,
+# projection_pushdown=True. The pushed_filters column echoes the SQL
+# representation of whatever DuckDB pushed down, while the worker also
+# applies those filters to produce the correct result set.
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# No filter — baseline: all rows, pushed_filters = (none)
+# ============================================================================
+
+query III
+SELECT * FROM example.filter_echo(5);
+----
+0	row_0	(none)
+1	row_1	(none)
+2	row_2	(none)
+3	row_3	(none)
+4	row_4	(none)
+
+# ============================================================================
+# All six comparison operators on n
+# ============================================================================
+
+# =
+query III
+SELECT * FROM example.filter_echo(10) WHERE n = 5;
+----
+5	row_5	n = 5
+
+# !=
+query I
+SELECT COUNT(*) FROM example.filter_echo(10) WHERE n != 5;
+----
+9
+
+query T
+SELECT DISTINCT pushed_filters FROM example.filter_echo(10) WHERE n != 5;
+----
+n != 5
+
+# >
+query III
+SELECT * FROM example.filter_echo(10) WHERE n > 7;
+----
+8	row_8	n > 7
+9	row_9	n > 7
+
+# >=
+query III
+SELECT * FROM example.filter_echo(10) WHERE n >= 8;
+----
+8	row_8	n >= 8
+9	row_9	n >= 8
+
+# <
+query III
+SELECT * FROM example.filter_echo(10) WHERE n < 3;
+----
+0	row_0	n < 3
+1	row_1	n < 3
+2	row_2	n < 3
+
+# <=
+query III
+SELECT * FROM example.filter_echo(10) WHERE n <= 2;
+----
+0	row_0	n <= 2
+1	row_1	n <= 2
+2	row_2	n <= 2
+
+# ============================================================================
+# IN filter — set membership
+# ============================================================================
+
+query III
+SELECT * FROM example.filter_echo(10) WHERE n IN (1, 3, 7);
+----
+1	row_1	n IN (1, 3, 7)
+3	row_3	n IN (1, 3, 7)
+7	row_7	n IN (1, 3, 7)
+
+# Large IN list
+query I
+SELECT COUNT(*) FROM example.filter_echo(100) WHERE n IN (0, 10, 20, 30, 40, 50, 60, 70, 80, 90);
+----
+10
+
+# ============================================================================
+# IS NULL — pushed down, filters all rows (n is never null)
+# ============================================================================
+
+query I
+SELECT COUNT(*) FROM example.filter_echo(10) WHERE n IS NULL;
+----
+0
+
+# ============================================================================
+# IS NOT NULL — not pushed down by DuckDB (shows (none))
+# ============================================================================
+
+query I
+SELECT COUNT(*) FROM example.filter_echo(5) WHERE n IS NOT NULL;
+----
+5
+
+query T
+SELECT DISTINCT pushed_filters FROM example.filter_echo(5) WHERE n IS NOT NULL;
+----
+(none)
+
+# ============================================================================
+# AND — conjunction of filters on the same column
+# DuckDB rewrites BETWEEN into AND
+# ============================================================================
+
+query III
+SELECT * FROM example.filter_echo(10) WHERE n >= 3 AND n < 7;
+----
+3	row_3	(n >= 3 AND n < 7)
+4	row_4	(n >= 3 AND n < 7)
+5	row_5	(n >= 3 AND n < 7)
+6	row_6	(n >= 3 AND n < 7)
+
+# BETWEEN rewrites to AND
+query III
+SELECT * FROM example.filter_echo(10) WHERE n BETWEEN 3 AND 7;
+----
+3	row_3	(n >= 3 AND n <= 7)
+4	row_4	(n >= 3 AND n <= 7)
+5	row_5	(n >= 3 AND n <= 7)
+6	row_6	(n >= 3 AND n <= 7)
+7	row_7	(n >= 3 AND n <= 7)
+
+# ============================================================================
+# OR — disjunction
+# ============================================================================
+
+query III
+SELECT * FROM example.filter_echo(10) WHERE n = 1 OR n = 9;
+----
+1	row_1	(n = 1 OR n = 9)
+9	row_9	(n = 1 OR n = 9)
+
+# ============================================================================
+# NOT — DuckDB rewrites to negated comparison
+# ============================================================================
+
+query T
+SELECT DISTINCT pushed_filters FROM example.filter_echo(10) WHERE NOT n >= 5;
+----
+n < 5
+
+# ============================================================================
+# Multi-column filters — filters on different columns
+# ============================================================================
+
+# n AND s — two separate top-level filters
+query III
+SELECT * FROM example.filter_echo(10) WHERE n >= 3 AND s = 'row_5';
+----
+5	row_5	n >= 3 AND s = 'row_5'
+
+# AND on same column + different column
+query III
+SELECT * FROM example.filter_echo(10) WHERE n >= 2 AND n < 8 AND s = 'row_5';
+----
+5	row_5	(n >= 2 AND n < 8) AND s = 'row_5'
+
+# ============================================================================
+# String column filters — verifies correct column name mapping
+# (regression test: previously s filters were serialized with column name n)
+# ============================================================================
+
+query III
+SELECT * FROM example.filter_echo(10) WHERE s = 'row_5';
+----
+5	row_5	s = 'row_5'
+
+query III
+SELECT * FROM example.filter_echo(10) WHERE s IN ('row_1', 'row_5');
+----
+1	row_1	s IN ('row_1', 'row_5')
+5	row_5	s IN ('row_1', 'row_5')
+
+# ============================================================================
+# Empty result sets
+# ============================================================================
+
+# Impossible condition — no matching rows
+query I
+SELECT COUNT(*) FROM example.filter_echo(10) WHERE n > 100;
+----
+0
+
+# IS NULL on non-nullable column
+query I
+SELECT COUNT(*) FROM example.filter_echo(10) WHERE n IS NULL;
+----
+0
+
+# ============================================================================
+# Projection combined with filters
+# ============================================================================
+
+# Filter on n, project only pushed_filters
+query T
+SELECT pushed_filters FROM example.filter_echo(5) WHERE n >= 3;
+----
+n >= 3
+n >= 3
+
+# Filter on n, project only s
+query T
+SELECT s FROM example.filter_echo(5) WHERE n = 2;
+----
+row_2
+
+# Filter on s, project only n (exercises cross-column filter + projection)
+query I
+SELECT n FROM example.filter_echo(10) WHERE s = 'row_5';
+----
+5
+
+# ============================================================================
+# Aggregation with filters
+# ============================================================================
+
+query I
+SELECT COUNT(*) FROM example.filter_echo(100) WHERE n >= 50;
+----
+50
+
+query I
+SELECT SUM(n) FROM example.filter_echo(10) WHERE n > 5;
+----
+30
+
+query II
+SELECT MIN(n), MAX(n) FROM example.filter_echo(100) WHERE n >= 20 AND n < 80;
+----
+20	79
+
+# ============================================================================
+# Larger dataset — batch boundary testing
+# ============================================================================
+
+query I
+SELECT COUNT(*) FROM example.filter_echo(10000) WHERE n = 5000;
+----
+1
+
+query I
+SELECT COUNT(*) FROM example.filter_echo(10000) WHERE n >= 9990;
+----
+10
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;

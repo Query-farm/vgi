@@ -302,8 +302,12 @@ std::shared_ptr<arrow::Buffer> VgiSerializeFilters(ClientContext &context, const
 		idx_t col_idx = entry.first;
 		auto &filter = *entry.second;
 
-		// Get column name (use index if out of bounds)
-		string col_name = col_idx < column_names.size() ? column_names[col_idx] : std::to_string(col_idx);
+		// DuckDB's TableFilterSet uses indices into the projected column list (column_ids).
+		// Map through column_ids to get the original schema column name, but keep the
+		// projected index as column_index since the worker output follows projection order.
+		idx_t original_col_idx = col_idx < column_ids.size() ? column_ids[col_idx] : col_idx;
+		string col_name =
+		    original_col_idx < column_names.size() ? column_names[original_col_idx] : std::to_string(original_col_idx);
 
 		auto filter_obj = serializer.SerializeColumnFilter(col_idx, col_name, filter);
 		yyjson_mut_arr_append(filter_array, filter_obj);

@@ -20,7 +20,7 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
 # ============================================================================
 # Function Inventory
-# 14 pure table functions + 8 table-in-out functions = 22 total table-type functions
+# 15 pure table functions + 8 table-in-out functions = 23 total table-type functions
 # ============================================================================
 
 # Total table-type function count (includes table-in-out)
@@ -29,24 +29,25 @@ SELECT COUNT(*)
 FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'table';
 ----
-22
+23
 
-# The 14 pure table functions (no TABLE parameter type)
+# The 15 pure table functions (no TABLE parameter type)
 query T
 SELECT function_name
 FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'table'
 AND function_name IN (
-    'constant_columns', 'double_sequence', 'generator_exception',
-    'logging_generator', 'named_params_echo', 'nested_sequence',
-    'partitioned_sequence', 'projected_data', 'scoped_secret_demo',
-    'secret_demo', 'sequence', 'settings_aware', 'struct_settings',
-    'ten_thousand'
+    'constant_columns', 'double_sequence', 'filter_echo',
+    'generator_exception', 'logging_generator', 'named_params_echo',
+    'nested_sequence', 'partitioned_sequence', 'projected_data',
+    'scoped_secret_demo', 'secret_demo', 'sequence', 'settings_aware',
+    'struct_settings', 'ten_thousand'
 )
 ORDER BY function_name;
 ----
 constant_columns
 double_sequence
+filter_echo
 generator_exception
 logging_generator
 named_params_echo
