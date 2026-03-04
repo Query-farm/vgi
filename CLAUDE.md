@@ -77,6 +77,23 @@ make test_all
 make test_all_debug
 ```
 
+### Running Specific Failed Tests
+
+After a full test run shows failures, re-run only the failed tests instead of the entire suite:
+
+```bash
+# Run a single test file (subprocess)
+VGI_TEST_WORKER="uv run --project ~/Development/vgi-python vgi-example-worker" \
+    ./build/release/test/unittest "test/sql/integration/scalar/double.test"
+
+# Run a test directory (subprocess)
+VGI_TEST_WORKER="uv run --project ~/Development/vgi-python vgi-example-worker" \
+    ./build/release/test/unittest "test/sql/integration/scalar/*"
+
+# Run a single test file (HTTP)
+./test/run_http_integration.sh "test/sql/integration/scalar/double.test"
+```
+
 ### General Notes
 
 Each test file should complete in <10 seconds per suite.

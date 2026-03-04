@@ -124,8 +124,11 @@ unique_ptr<FunctionData> VgiScalarFunctionBind(ClientContext &context, ScalarFun
 	}
 	idx_t expected_args_after_erase = func_info.positional_is_const.size() - num_const_params;
 
-	// Only extract/erase if arguments haven't been modified yet
-	bool const_args_already_erased = (arguments.size() == expected_args_after_erase);
+	// Only extract/erase if arguments haven't been modified yet.
+	// Re-bind detection: if we have const params and argument count matches post-erase count,
+	// const args were already extracted in a previous bind call (e.g., deserialization).
+	// When num_const_params == 0, there's nothing to erase, so never skip.
+	bool const_args_already_erased = (num_const_params > 0 && arguments.size() == expected_args_after_erase);
 
 	if (!const_args_already_erased) {
 		for (idx_t i = 0; i < arguments.size() && i < func_info.positional_is_const.size(); i++) {
@@ -197,14 +200,14 @@ unique_ptr<FunctionData> VgiScalarFunctionBind(ClientContext &context, ScalarFun
 			if (pooled) {
 				connection = CreateFunctionConnectionFromPool(
 				    std::move(pooled), func_info.function_name, arrow_arguments, func_info.attach_id, context,
-				    "SCALAR", std::vector<uint8_t>{}, func_info.worker_debug, func_info.settings,
+				    "SCALAR", std::vector<uint8_t>{}, func_info.worker_debug, settings,
 				    func_info.required_secrets);
 			}
 		}
 		if (!connection) {
 			connection = CreateFunctionConnection(
 			    func_info.worker_path, func_info.function_name, arrow_arguments, func_info.attach_id, context,
-			    "SCALAR", std::vector<uint8_t>{}, func_info.worker_debug, func_info.settings,
+			    "SCALAR", std::vector<uint8_t>{}, func_info.worker_debug, settings,
 			    func_info.required_secrets);
 		}
 
