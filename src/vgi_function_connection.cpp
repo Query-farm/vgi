@@ -800,7 +800,7 @@ std::unique_ptr<IFunctionConnection> CreateFunctionConnection(
 	if (IsHttpTransport(worker_path)) {
 		return std::make_unique<HttpFunctionConnection>(
 		    worker_path, function_name, arguments, attach_id, context,
-		    function_type, global_execution_id, worker_debug, settings);
+		    function_type, global_execution_id, worker_debug, settings, required_secrets);
 	}
 	return std::make_unique<FunctionConnection>(
 	    worker_path, function_name, arguments, attach_id, context,
