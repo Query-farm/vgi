@@ -52,12 +52,18 @@ TableFunction VgiTableEntry::GetScanFunction(ClientContext &context, unique_ptr<
 	// (e.g., filter_pushdown, projection_pushdown)
 	bool has_projection_pushdown = false;
 	bool has_filter_pushdown = false;
+	std::vector<vgi::VgiSecretRequirement> scan_required_secrets;
 	auto func_entry = catalog_.GetEntry<TableFunctionCatalogEntry>(
 	    context, ParentSchema().name, scan_result.function_name, OnEntryNotFound::RETURN_NULL);
 	if (func_entry) {
 		for (auto &tf : func_entry->functions.functions) {
 			has_projection_pushdown = has_projection_pushdown || tf.projection_pushdown;
 			has_filter_pushdown = has_filter_pushdown || tf.filter_pushdown;
+			// Extract required_secrets from the VgiTableFunctionInfo
+			if (tf.function_info) {
+				auto &vgi_tf_info = tf.function_info->Cast<vgi::VgiTableFunctionInfo>();
+				scan_required_secrets = vgi_tf_info.function_info().required_secrets;
+			}
 		}
 	}
 
@@ -70,6 +76,7 @@ TableFunction VgiTableEntry::GetScanFunction(ClientContext &context, unique_ptr<
 	scan_bind_data->function_name = scan_result.function_name;
 	scan_bind_data->arguments = vgi::BuildArgumentsFromValues(context, scan_result.positional_arguments, named_args_vec);
 	scan_bind_data->projection_pushdown = has_projection_pushdown;
+	scan_bind_data->required_secrets = scan_required_secrets;
 
 	// Perform bind handshake with the worker (discovers output schema)
 	vector<LogicalType> return_types;

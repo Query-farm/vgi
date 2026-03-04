@@ -38,64 +38,6 @@ std::map<std::string, Value> ExtractVgiSettings(ClientContext &context,
 
 } // anonymous namespace
 
-// ============================================================================
-// VgiTableFunctionInfo - Stores metadata needed to invoke a VGI table function
-// ============================================================================
-
-//! Information stored with each VGI table function to enable invocation.
-//! This is attached to the TableFunction via the function_info member and
-//! accessed in the bind function via input.info->Cast<VgiTableFunctionInfo>().
-class VgiTableFunctionInfo : public TableFunctionInfo {
-public:
-	VgiTableFunctionInfo(std::string worker_path, std::vector<uint8_t> attach_id, bool worker_debug,
-	                     bool use_pool, vgi::VgiFunctionInfo function_info,
-	                     std::vector<std::string> setting_names)
-	    : worker_path_(std::move(worker_path)), attach_id_(std::move(attach_id)), worker_debug_(worker_debug),
-	      use_pool_(use_pool), function_info_(std::move(function_info)),
-	      setting_names_(std::move(setting_names)) {
-	}
-
-	~VgiTableFunctionInfo() override = default;
-
-	//! Path to the VGI worker executable
-	const std::string &worker_path() const {
-		return worker_path_;
-	}
-
-	//! Attach ID for the catalog connection
-	const std::vector<uint8_t> &attach_id() const {
-		return attach_id_;
-	}
-
-	//! Whether to enable worker debug output
-	bool worker_debug() const {
-		return worker_debug_;
-	}
-
-	//! Whether pooling is enabled for this function's workers
-	bool use_pool() const {
-		return use_pool_;
-	}
-
-	//! Full function metadata from the worker
-	const vgi::VgiFunctionInfo &function_info() const {
-		return function_info_;
-	}
-
-	//! Names of settings registered by this catalog
-	const std::vector<std::string> &setting_names() const {
-		return setting_names_;
-	}
-
-private:
-	std::string worker_path_;
-	std::vector<uint8_t> attach_id_;
-	bool worker_debug_;
-	bool use_pool_;
-	vgi::VgiFunctionInfo function_info_;
-	std::vector<std::string> setting_names_;
-};
-
 VgiTableFunctionSet::VgiTableFunctionSet(Catalog &catalog, VgiSchemaEntry &schema)
     : VgiCatalogSet(catalog), schema_(schema) {
 }
@@ -107,7 +49,7 @@ VgiTableFunctionSet::VgiTableFunctionSet(Catalog &catalog, VgiSchemaEntry &schem
 static unique_ptr<FunctionData> VgiCatalogTableFunctionBind(ClientContext &context, TableFunctionBindInput &input,
                                                             vector<LogicalType> &return_types, vector<string> &names) {
 	// Access the VgiTableFunctionInfo attached to this function
-	auto &vgi_info = input.info->Cast<VgiTableFunctionInfo>();
+	auto &vgi_info = input.info->Cast<vgi::VgiTableFunctionInfo>();
 
 	auto bind_data = make_uniq<vgi::VgiTableFunctionBindData>();
 
@@ -137,6 +79,9 @@ static unique_ptr<FunctionData> VgiCatalogTableFunctionBind(ClientContext &conte
 
 	// Extract settings registered by this catalog
 	bind_data->settings = ExtractVgiSettings(context, vgi_info.setting_names());
+
+	// Copy required secrets from function metadata
+	bind_data->required_secrets = vgi_info.function_info().required_secrets;
 
 	// Validate that all required settings for this function are present
 	const auto &required_settings = vgi_info.function_info().required_settings;
@@ -177,7 +122,7 @@ static unique_ptr<FunctionData> VgiCatalogTableInOutFunctionBind(ClientContext &
                                                                  vector<LogicalType> &return_types,
                                                                  vector<string> &names) {
 	// Access the VgiTableFunctionInfo attached to this function
-	auto &vgi_info = input.info->Cast<VgiTableFunctionInfo>();
+	auto &vgi_info = input.info->Cast<vgi::VgiTableFunctionInfo>();
 
 	// Build parameters for the table-in-out bind
 	vgi::VgiTableInOutBindParams params;
@@ -187,6 +132,7 @@ static unique_ptr<FunctionData> VgiCatalogTableInOutFunctionBind(ClientContext &
 	params.worker_debug = vgi_info.worker_debug();
 	params.use_pool = vgi_info.use_pool();
 	params.settings = ExtractVgiSettings(context, vgi_info.setting_names());
+	params.required_secrets = vgi_info.function_info().required_secrets;
 
 	// Validate required settings
 	const auto &required_settings = vgi_info.function_info().required_settings;
@@ -277,7 +223,7 @@ void VgiTableFunctionSet::LoadEntries(ClientContext &context) {
 				table_func.named_parameters = arg_types.named_parameters;
 
 				// Attach function info
-				table_func.function_info = make_uniq<VgiTableFunctionInfo>(
+				table_func.function_info = make_uniq<vgi::VgiTableFunctionInfo>(
 				    worker_path, attach_result->attach_id, attach_params->worker_debug(),
 				    attach_params->use_pool(), func_info, setting_names);
 
@@ -303,7 +249,7 @@ void VgiTableFunctionSet::LoadEntries(ClientContext &context) {
 				}
 
 				// Attach VgiTableFunctionInfo so the bind function can access worker_path and function metadata
-				table_func.function_info = make_uniq<VgiTableFunctionInfo>(
+				table_func.function_info = make_uniq<vgi::VgiTableFunctionInfo>(
 				    worker_path, attach_result->attach_id, attach_params->worker_debug(),
 				    attach_params->use_pool(), func_info, setting_names);
 

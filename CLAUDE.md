@@ -6,11 +6,8 @@ Reference implementations:
 - **vgi**: `/Users/rusty/Development/vgi-python` (see `docs/*` for protocol documentation)
 - **vgi_rpc**: `/Users/rusty/Development/vgi-rpc-python` (see `docs/*` for RPC protocol)
 
-When building you must set the VCPKG_TOOLCHAIN_PATH variable with:
-
-```bash
-VCPKG_TOOLCHAIN_PATH=$(pwd)/vcpkg/scripts/buildsystems/vcpkg.cmake
-```
+The Makefile auto-detects `VCPKG_TOOLCHAIN_PATH` from `vcpkg/` in the project tree.
+No need to set it manually.
 
 
 ## Build

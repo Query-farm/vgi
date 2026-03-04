@@ -13,12 +13,14 @@ require-env VGI_TEST_WORKER
 
 require vgi
 
+require httpfs
+
 statement ok
 ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
 # ============================================================================
 # Function Inventory
-# 12 pure table functions + 8 table-in-out functions = 20 total table-type functions
+# 14 pure table functions + 8 table-in-out functions = 22 total table-type functions
 # ============================================================================
 
 # Total table-type function count (includes table-in-out)
@@ -27,9 +29,9 @@ SELECT COUNT(*)
 FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'table';
 ----
-20
+22
 
-# The 12 pure table functions (no TABLE parameter type)
+# The 14 pure table functions (no TABLE parameter type)
 query T
 SELECT function_name
 FROM duckdb_functions()
@@ -37,8 +39,9 @@ WHERE database_name = 'example' AND function_type = 'table'
 AND function_name IN (
     'constant_columns', 'double_sequence', 'generator_exception',
     'logging_generator', 'named_params_echo', 'nested_sequence',
-    'partitioned_sequence', 'projected_data', 'sequence',
-    'settings_aware', 'struct_settings', 'ten_thousand'
+    'partitioned_sequence', 'projected_data', 'scoped_secret_demo',
+    'secret_demo', 'sequence', 'settings_aware', 'struct_settings',
+    'ten_thousand'
 )
 ORDER BY function_name;
 ----
@@ -50,6 +53,8 @@ named_params_echo
 nested_sequence
 partitioned_sequence
 projected_data
+scoped_secret_demo
+secret_demo
 sequence
 settings_aware
 struct_settings

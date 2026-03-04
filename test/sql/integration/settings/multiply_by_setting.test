@@ -9,6 +9,8 @@ require-env VGI_TEST_WORKER
 
 require vgi
 
+require httpfs
+
 statement ok
 ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 

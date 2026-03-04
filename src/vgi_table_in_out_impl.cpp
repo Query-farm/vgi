@@ -76,6 +76,7 @@ unique_ptr<FunctionData> VgiTableInOutBind(ClientContext &context, TableFunction
 	bind_data->use_pool = params.use_pool;
 	bind_data->function_name = params.function_name;
 	bind_data->settings = params.settings;
+	bind_data->required_secrets = params.required_secrets;
 
 	// Build arguments from the regular (non-TABLE) inputs
 	// input.inputs contains positional arguments, but TABLE arguments are represented as NULL
@@ -119,14 +120,16 @@ unique_ptr<FunctionData> VgiTableInOutBind(ClientContext &context, TableFunction
 			connection = CreateFunctionConnectionFromPool(std::move(pooled), bind_data->function_name,
 			                                              bind_data->arguments, bind_data->attach_id, context,
 			                                              "TABLE", std::vector<uint8_t>{},
-			                                              bind_data->worker_debug, bind_data->settings);
+			                                              bind_data->worker_debug, bind_data->settings,
+			                                              bind_data->required_secrets);
 		}
 	}
 	if (!connection) {
 		connection = CreateFunctionConnection(bind_data->worker_path, bind_data->function_name,
 		                                      bind_data->arguments, bind_data->attach_id, context,
 		                                      "TABLE", std::vector<uint8_t>{},
-		                                      bind_data->worker_debug, bind_data->settings);
+		                                      bind_data->worker_debug, bind_data->settings,
+		                                      bind_data->required_secrets);
 		if (!from_pool) {
 			VGI_LOG(context, "table_in_out.pool_acquire",
 			        {{"worker_path", bind_data->worker_path},

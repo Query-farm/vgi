@@ -68,6 +68,28 @@ struct VgiSetting {
 	Value default_value;                  // Default value (may be NULL if required)
 };
 
+// A parameter definition for a VGI secret type
+struct VgiSecretTypeParam {
+	std::string name;       // Key name (e.g., "secret_string")
+	LogicalType type;       // Value type — any DuckDB type (VARCHAR, INTEGER, BOOLEAN, etc.)
+	bool redact = false;    // Whether this key should be redacted in SHOW SECRETS
+};
+
+// A secret type exposed by a VGI worker
+// Parsed from serialized SecretTypeSpec objects in CatalogAttachResult
+struct VgiSecretType {
+	std::string name;                              // Secret type name (e.g., "vgi_example")
+	std::string description;                       // Human-readable description
+	std::vector<VgiSecretTypeParam> parameters;    // Key-value parameter definitions
+};
+
+// A secret requirement declared by a function
+struct VgiSecretRequirement {
+	std::string secret_type;    // Required — C++ enforces type matching
+	std::string name;           // Empty = not specified
+	std::string scope;          // Empty = not specified (dynamic — resolved at bind time)
+};
+
 // Result of catalog_attach call
 struct CatalogAttachResult {
 	std::vector<uint8_t> attach_id;
@@ -77,7 +99,8 @@ struct CatalogAttachResult {
 	int64_t catalog_version = 0;
 	bool attach_id_required = false;
 	std::string default_schema = "main";
-	std::vector<VgiSetting> settings;     // Extension options exposed by this catalog
+	std::vector<VgiSetting> settings;             // Extension options exposed by this catalog
+	std::vector<VgiSecretType> secret_types;      // Secret types exposed by this catalog
 };
 
 // Schema metadata from the worker
@@ -195,12 +218,22 @@ struct VgiFunctionInfo {
 
 	// Settings required by this function (must be set before invocation)
 	std::vector<std::string> required_settings;
+
+	// Secrets required by this function (resolved from SecretManager during bind)
+	std::vector<VgiSecretRequirement> required_secrets;
 };
 
 // Parse a VgiSetting from serialized bytes (Arrow IPC format)
 // The bytes contain a single-row RecordBatch with: name, description, type, default_value
 VgiSetting ParseVgiSetting(const std::vector<uint8_t> &bytes, const std::string &worker_path,
                            ClientContext &context);
+
+// Parse a VgiSecretType from serialized bytes (Arrow IPC format)
+// The bytes contain a single-row RecordBatch with: name, description, parameters_schema
+// parameters_schema is an IPC-serialized Arrow schema where each field defines a secret parameter
+// Field metadata {"redact": "true"} marks keys that should be redacted in SHOW SECRETS
+VgiSecretType ParseVgiSecretType(const std::vector<uint8_t> &bytes, const std::string &worker_path,
+                                  ClientContext &context);
 
 // Parse a CatalogAttachResult from an Arrow RecordBatch
 CatalogAttachResult ParseCatalogAttachResult(const std::shared_ptr<arrow::RecordBatch> &batch,
@@ -318,6 +351,17 @@ TableFunctionCardinalityResult InvokeTableFunctionCardinality(
 VgiFunctionInfo GetFunctionInfo(const std::string &worker_path, const std::vector<uint8_t> &attach_id,
                                 const std::string &schema_name, const std::string &function_name,
                                 ClientContext &context, bool worker_debug = false);
+
+// ============================================================================
+// Secret Extraction from DuckDB SecretManager
+// ============================================================================
+
+// Extract secrets from DuckDB's SecretManager based on function requirements.
+// For each VgiSecretRequirement, looks up the secret by type (required),
+// optionally filtered by name and/or scope.
+// Returns map of secret_type → {key → Value}. Missing secrets are skipped.
+std::map<std::string, std::map<std::string, Value>> ExtractVgiSecrets(
+    ClientContext &context, const std::vector<VgiSecretRequirement> &requirements);
 
 // ============================================================================
 // DuckDB Type Conversion

@@ -6,6 +6,8 @@
 #include "duckdb/logging/log_manager.hpp"
 
 #include "vgi_arrow_ipc.hpp"
+#include "vgi_bind_protocol.hpp"
+#include "vgi_catalog_api.hpp"
 #include "vgi_exception.hpp"
 #include "vgi_http_function_connection.hpp"
 #include "vgi_logging.hpp"
@@ -30,7 +32,7 @@ AcquireAndBindResult AcquireAndBindConnection(ClientContext &context, const Func
 		return CreateFunctionConnection(params.worker_path, params.function_name, params.arguments,
 		                                params.attach_id, context, params.function_type,
 		                                params.global_execution_id, params.worker_debug,
-		                                params.settings);
+		                                params.settings, params.required_secrets);
 	};
 
 	// Lambda to attempt bind, returns true on success, false if retry needed
@@ -60,7 +62,8 @@ AcquireAndBindResult AcquireAndBindConnection(ClientContext &context, const Func
 			conn = CreateFunctionConnectionFromPool(std::move(pooled), params.function_name, params.arguments,
 			                                        params.attach_id, context, params.function_type,
 			                                        params.global_execution_id,
-			                                        params.worker_debug, params.settings);
+			                                        params.worker_debug, params.settings,
+			                                        params.required_secrets);
 			from_pool = true;
 			VGI_LOG(context, "worker_pool.acquire",
 			        {{"worker_path", params.worker_path},
@@ -106,20 +109,24 @@ FunctionConnection::FunctionConnection(const std::string &worker_path, const std
                                        const ArrowArguments &arguments, const std::vector<uint8_t> &attach_id,
                                        ClientContext &context, const std::string &function_type,
                                        const std::vector<uint8_t> &global_execution_id,
-                                       bool worker_debug, const std::map<std::string, Value> &settings)
+                                       bool worker_debug, const std::map<std::string, Value> &settings,
+                                       const std::vector<VgiSecretRequirement> &required_secrets)
     : worker_path_(worker_path), function_name_(function_name), function_type_(function_type),
       arguments_type_(arguments.type), arguments_array_(arguments.array), attach_id_(attach_id),
-      global_execution_id_(global_execution_id), context_(context), worker_debug_(worker_debug), settings_(settings) {
+      global_execution_id_(global_execution_id), context_(context), worker_debug_(worker_debug), settings_(settings),
+      required_secrets_(required_secrets) {
 }
 
 FunctionConnection::FunctionConnection(std::unique_ptr<PooledWorker> pooled_worker, const std::string &function_name,
                                        const ArrowArguments &arguments, const std::vector<uint8_t> &attach_id,
                                        ClientContext &context, const std::string &function_type,
                                        const std::vector<uint8_t> &global_execution_id,
-                                       bool worker_debug, const std::map<std::string, Value> &settings)
+                                       bool worker_debug, const std::map<std::string, Value> &settings,
+                                       const std::vector<VgiSecretRequirement> &required_secrets)
     : worker_path_(pooled_worker->GetWorkerPath()), function_name_(function_name), function_type_(function_type),
       arguments_type_(arguments.type), arguments_array_(arguments.array), attach_id_(attach_id),
       global_execution_id_(global_execution_id), context_(context), worker_debug_(worker_debug), settings_(settings),
+      required_secrets_(required_secrets),
       proc_(pooled_worker->Release()), stderr_fd_(pooled_worker->ReleaseStderrFd()) {
 	// Start stderr reader thread for the existing subprocess (reusing the fd)
 	StartStderrReader();
@@ -141,18 +148,15 @@ FunctionConnection::~FunctionConnection() {
 
 BindResult FunctionConnection::PerformBindFull() {
 	if (bind_done_) {
-		// Return cached results
 		return bind_result_;
 	}
 
 	// Spawn the worker process (unless we already have one from the pool)
 	if (!proc_) {
 		proc_ = std::make_unique<SubProcess>(worker_path_, worker_debug_);
-		// Start stderr reader thread to prevent pipe buffer from blocking worker
 		StartStderrReader();
 	}
 
-	// Log the invocation request
 	int64_t num_args = arguments_array_ ? arguments_array_->length() : 0;
 	VGI_LOG(context_, "function_connection.bind",
 	        {{"worker_path", worker_path_},
@@ -161,106 +165,55 @@ BindResult FunctionConnection::PerformBindFull() {
 	         {"function_type", function_type_},
 	         {"num_args", std::to_string(num_args)}});
 
-	// Build BindRequest using vgi_rpc types
-
-	// 1. Convert arguments to IPC bytes
-	// Python expects a single-column batch with an "args" struct column
-	std::vector<uint8_t> arguments_bytes;
-	if (arguments_array_) {
-		// Wrap the struct array in a batch with a single "args" column
-		auto args_schema = arrow::schema({arrow::field("args", arguments_array_->type())});
-		auto args_batch = arrow::RecordBatch::Make(args_schema, arguments_array_->length(), {arguments_array_});
-		arguments_bytes = SerializeToIpcBytes(args_batch);
-	} else {
-		// Empty arguments: create batch with empty struct "args" column
-		auto empty_struct_type = arrow::struct_({});
-		auto empty_struct_result = arrow::MakeEmptyArray(empty_struct_type);
-		if (!empty_struct_result.ok()) {
-			ThrowVgiIOException("Failed to create empty struct array: %s", worker_path_, proc_->GetPid(),
-			                    "", empty_struct_result.status().ToString());
+	// Transport: send bind via subprocess stdin/stdout
+	auto transport_fn = [&](const std::vector<uint8_t> &request_bytes) -> std::shared_ptr<arrow::RecordBatch> {
+		auto rpc_params = BuildBindRpcParams(request_bytes);
+		try {
+			WriteRpcRequest(proc_->GetStdinFd(), "bind", rpc_params);
+		} catch (const IOException &e) {
+			CheckWorkerExitStatus(*proc_, worker_path_, "failed to start");
+			throw;
 		}
-		auto args_schema = arrow::schema({arrow::field("args", empty_struct_type)});
-		auto args_batch = arrow::RecordBatch::Make(args_schema, 0, {empty_struct_result.ValueUnsafe()});
-		arguments_bytes = SerializeToIpcBytes(args_batch);
-	}
 
-	// 2. Serialize settings if non-empty (typed values via BuildSettingsBatch)
-	std::vector<uint8_t> settings_bytes;
-	if (!settings_.empty()) {
-		auto settings_batch = BuildSettingsBatch(context_, settings_);
-		settings_bytes = SerializeToIpcBytes(settings_batch);
-	}
+		UnaryResponseResult response;
+		try {
+			response = ReadUnaryResponse(proc_->GetStdoutFd(), &context_, worker_path_, proc_->GetPid());
+		} catch (const IOException &e) {
+			CheckWorkerExitStatus(*proc_, worker_path_, "failed during bind");
+			throw;
+		}
 
-	// 3. Serialize input_schema if set
-	std::vector<uint8_t> input_schema_bytes;
-	if (input_schema_) {
-		input_schema_bytes = SerializeSchemaToIpcBytes(input_schema_);
-	}
+		if (!response.batch || response.batch->num_rows() == 0) {
+			ThrowVgiIOException("Empty bind response from worker", worker_path_, proc_->GetPid(), "");
+		}
 
-	// 4. Build BindRequest
-	auto bind_request = BuildBindRequest(function_name_, arguments_bytes, function_type_,
-	                                     input_schema_bytes, settings_bytes, attach_id_);
-	auto bind_request_bytes = SerializeToIpcBytes(bind_request);
+		auto result_col = response.batch->GetColumnByName("result");
+		if (!result_col) {
+			ThrowVgiIOException("Bind response missing 'result' column", worker_path_, proc_->GetPid(), "");
+		}
 
-	// 5. Build RPC params and send request
-	auto params = BuildBindRpcParams(bind_request_bytes);
-	try {
-		WriteRpcRequest(proc_->GetStdinFd(), "bind", params);
-	} catch (const IOException &e) {
-		CheckWorkerExitStatus(*proc_, worker_path_, "failed to start");
-		throw;
-	}
+		auto bin_array = std::dynamic_pointer_cast<arrow::BinaryArray>(result_col);
+		if (!bin_array || bin_array->IsNull(0)) {
+			ThrowVgiIOException("Bind response 'result' column is null", worker_path_, proc_->GetPid(), "");
+		}
 
-	// 6. Read unary response
-	UnaryResponseResult response;
-	try {
-		response = ReadUnaryResponse(proc_->GetStdoutFd(), &context_, worker_path_, proc_->GetPid());
-	} catch (const IOException &e) {
-		CheckWorkerExitStatus(*proc_, worker_path_, "failed during bind");
-		throw;
-	}
-
-	// 7. Extract and parse BindResponse
-	if (!response.batch || response.batch->num_rows() == 0) {
-		ThrowVgiIOException("Empty bind response from worker", worker_path_, proc_->GetPid(), "");
-	}
-
-	auto result_col = response.batch->GetColumnByName("result");
-	if (!result_col) {
-		ThrowVgiIOException("Bind response missing 'result' column", worker_path_, proc_->GetPid(), "");
-	}
-
-	auto binary_array = std::dynamic_pointer_cast<arrow::BinaryArray>(result_col);
-	if (!binary_array || binary_array->IsNull(0)) {
-		ThrowVgiIOException("Bind response 'result' column is null", worker_path_, proc_->GetPid(), "");
-	}
-
-	auto view = binary_array->GetView(0);
-	auto bind_response_batch = DeserializeFromIpcBytes(
-	    reinterpret_cast<const uint8_t *>(view.data()), view.size());
-	auto bind_response = ParseBindResponse(bind_response_batch, worker_path_);
-
-	// 8. Cache the output schema as IPC bytes for InitRequest
-	auto output_schema_bytes = SerializeSchemaToIpcBytes(bind_response.output_schema);
-
-	// 9. Store result
-	bind_result_ = BindResult {
-	    bind_response.output_schema,
-	    bind_response.opaque_data,
-	    bind_request_bytes,
-	    output_schema_bytes
+		auto v = bin_array->GetView(0);
+		return DeserializeFromIpcBytes(reinterpret_cast<const uint8_t *>(v.data()), v.size());
 	};
+
+	bind_result_ = PerformBindProtocol(context_, function_name_, function_type_,
+	                                    arguments_array_, input_schema_, attach_id_,
+	                                    settings_, required_secrets_, worker_path_, transport_fn);
 	bind_done_ = true;
 
-	// Drain any buffered stderr from bind phase
 	DrainStderrLog();
 
 	VGI_LOG(context_, "function_connection.bind_result",
 	        {{"worker_path", worker_path_},
 	         {"worker_pid", std::to_string(proc_->GetPid())},
 	         {"function_name", function_name_},
-	         {"num_output_columns", std::to_string(bind_response.output_schema->num_fields())},
-	         {"has_opaque_data", bind_response.opaque_data.empty() ? "false" : "true"}});
+	         {"num_output_columns", std::to_string(bind_result_.output_schema->num_fields())},
+	         {"has_opaque_data", bind_result_.opaque_data.empty() ? "false" : "true"}});
 
 	return bind_result_;
 }
@@ -842,7 +795,8 @@ std::unique_ptr<IFunctionConnection> CreateFunctionConnection(
     ClientContext &context, const std::string &function_type,
     const std::vector<uint8_t> &global_execution_id,
     bool worker_debug,
-    const std::map<std::string, Value> &settings) {
+    const std::map<std::string, Value> &settings,
+    const std::vector<VgiSecretRequirement> &required_secrets) {
 	if (IsHttpTransport(worker_path)) {
 		return std::make_unique<HttpFunctionConnection>(
 		    worker_path, function_name, arguments, attach_id, context,
@@ -850,7 +804,7 @@ std::unique_ptr<IFunctionConnection> CreateFunctionConnection(
 	}
 	return std::make_unique<FunctionConnection>(
 	    worker_path, function_name, arguments, attach_id, context,
-	    function_type, global_execution_id, worker_debug, settings);
+	    function_type, global_execution_id, worker_debug, settings, required_secrets);
 }
 
 std::unique_ptr<IFunctionConnection> CreateFunctionConnectionFromPool(
@@ -859,11 +813,12 @@ std::unique_ptr<IFunctionConnection> CreateFunctionConnectionFromPool(
     ClientContext &context, const std::string &function_type,
     const std::vector<uint8_t> &global_execution_id,
     bool worker_debug,
-    const std::map<std::string, Value> &settings) {
+    const std::map<std::string, Value> &settings,
+    const std::vector<VgiSecretRequirement> &required_secrets) {
 	// Only subprocess connections use the pool
 	return std::make_unique<FunctionConnection>(
 	    std::move(pooled_worker), function_name, arguments, attach_id, context,
-	    function_type, global_execution_id, worker_debug, settings);
+	    function_type, global_execution_id, worker_debug, settings, required_secrets);
 }
 
 } // namespace vgi

@@ -99,6 +99,12 @@ ArrowArguments BuildArgumentsFromValues(ClientContext &context, const vector<Val
 std::shared_ptr<arrow::RecordBatch> BuildSettingsBatch(ClientContext &context,
                                                         const std::map<std::string, Value> &settings);
 
+// Build a secrets RecordBatch from a map of secret_type → {key → Value}
+// Creates a single-row RecordBatch where each column is a struct containing the secret's key-value pairs
+// Returns empty vector if no secrets. Each struct column preserves DuckDB types as Arrow types.
+std::vector<uint8_t> BuildSecretsBatch(ClientContext &context,
+                                        const std::map<std::string, std::map<std::string, Value>> &secrets);
+
 // ============================================================================
 // Function Argument Schema Parsing
 // ============================================================================

@@ -22,6 +22,7 @@ class ClientContext;
 namespace vgi {
 
 class PooledWorker;
+struct VgiSecretRequirement;
 
 // ============================================================================
 // IFunctionConnection - Abstract interface for VGI function connections
@@ -76,7 +77,8 @@ std::unique_ptr<IFunctionConnection> CreateFunctionConnection(
     ClientContext &context, const std::string &function_type = "TABLE",
     const std::vector<uint8_t> &global_execution_id = {},
     bool worker_debug = false,
-    const std::map<std::string, Value> &settings = {});
+    const std::map<std::string, Value> &settings = {},
+    const std::vector<VgiSecretRequirement> &required_secrets = {});
 
 // Create from a pooled worker (subprocess only — HTTP connections are never pooled).
 std::unique_ptr<IFunctionConnection> CreateFunctionConnectionFromPool(
@@ -85,7 +87,8 @@ std::unique_ptr<IFunctionConnection> CreateFunctionConnectionFromPool(
     ClientContext &context, const std::string &function_type = "TABLE",
     const std::vector<uint8_t> &global_execution_id = {},
     bool worker_debug = false,
-    const std::map<std::string, Value> &settings = {});
+    const std::map<std::string, Value> &settings = {},
+    const std::vector<VgiSecretRequirement> &required_secrets = {});
 
 } // namespace vgi
 } // namespace duckdb

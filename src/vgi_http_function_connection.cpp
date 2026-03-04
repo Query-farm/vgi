@@ -2,6 +2,8 @@
 
 #include "duckdb.hpp"
 
+#include "vgi_bind_protocol.hpp"
+#include "vgi_catalog_api.hpp"
 #include "vgi_exception.hpp"
 #include "vgi_http_client.hpp"
 #include "vgi_logging.hpp"
@@ -20,10 +22,12 @@ HttpFunctionConnection::HttpFunctionConnection(
     const ArrowArguments &arguments, const std::vector<uint8_t> &attach_id,
     ClientContext &context, const std::string &function_type,
     const std::vector<uint8_t> &global_execution_id,
-    bool worker_debug, const std::map<std::string, Value> &settings)
+    bool worker_debug, const std::map<std::string, Value> &settings,
+    const std::vector<VgiSecretRequirement> &required_secrets)
     : base_url_(worker_path), function_name_(function_name), function_type_(function_type),
       arguments_type_(arguments.type), arguments_array_(arguments.array), attach_id_(attach_id),
-      global_execution_id_(global_execution_id), context_(context), worker_debug_(worker_debug), settings_(settings) {
+      global_execution_id_(global_execution_id), context_(context), worker_debug_(worker_debug), settings_(settings),
+      required_secrets_(required_secrets) {
 	// Strip trailing slash from base URL
 	if (!base_url_.empty() && base_url_.back() == '/') {
 		base_url_.pop_back();
@@ -137,11 +141,13 @@ void HttpFunctionConnection::BufferDataBatches(const std::string &response_body,
 		// Check for log/error batches
 		auto batch_type = ClassifyBatch(bwm.batch, bwm.custom_metadata);
 		if (batch_type == RpcBatchType::ERROR) {
-			HandleBatchLogMessage(bwm.batch, bwm.custom_metadata, &context_, base_url_);
+			HandleBatchLogMessage(bwm.batch, bwm.custom_metadata, &context_, base_url_,
+			                     -1, GetExecutionIdHex(), GetAttachIdHex());
 			throw IOException("VGI HTTP error from server [url: %s]", base_url_);
 		}
 		if (batch_type == RpcBatchType::LOG) {
-			HandleBatchLogMessage(bwm.batch, bwm.custom_metadata, &context_, base_url_);
+			HandleBatchLogMessage(bwm.batch, bwm.custom_metadata, &context_, base_url_,
+			                     -1, GetExecutionIdHex(), GetAttachIdHex());
 			continue;
 		}
 
@@ -178,77 +184,34 @@ BindResult HttpFunctionConnection::PerformBindFull() {
 	         {"function_name", function_name_},
 	         {"function_type", function_type_}});
 
-	// Build BindRequest (same logic as FunctionConnection::PerformBindFull)
-	std::vector<uint8_t> arguments_bytes;
-	if (arguments_array_) {
-		auto args_schema = arrow::schema({arrow::field("args", arguments_array_->type())});
-		auto args_batch = arrow::RecordBatch::Make(args_schema, arguments_array_->length(), {arguments_array_});
-		arguments_bytes = SerializeToIpcBytes(args_batch);
-	} else {
-		auto empty_struct_type = arrow::struct_({});
-		auto empty_struct_result = arrow::MakeEmptyArray(empty_struct_type);
-		if (!empty_struct_result.ok()) {
-			throw IOException("Failed to create empty struct array: %s [url: %s]",
-			                  empty_struct_result.status().ToString(), base_url_);
+	// Transport: send bind via HTTP
+	auto transport_fn = [&](const std::vector<uint8_t> &request_bytes) -> std::shared_ptr<arrow::RecordBatch> {
+		auto rpc_params = BuildBindRpcParams(request_bytes);
+		auto resp = HttpInvokeUnary(context_, base_url_, "bind", rpc_params);
+		if (!resp.batch || resp.batch->num_rows() == 0) {
+			throw IOException("Empty bind response from HTTP server [url: %s]", base_url_);
 		}
-		auto args_schema = arrow::schema({arrow::field("args", empty_struct_type)});
-		auto args_batch = arrow::RecordBatch::Make(args_schema, 0, {empty_struct_result.ValueUnsafe()});
-		arguments_bytes = SerializeToIpcBytes(args_batch);
-	}
-
-	std::vector<uint8_t> settings_bytes;
-	if (!settings_.empty()) {
-		auto settings_batch = BuildSettingsBatch(context_, settings_);
-		settings_bytes = SerializeToIpcBytes(settings_batch);
-	}
-
-	std::vector<uint8_t> input_schema_bytes;
-	if (input_schema_) {
-		input_schema_bytes = SerializeSchemaToIpcBytes(input_schema_);
-	}
-
-	auto bind_request = BuildBindRequest(function_name_, arguments_bytes, function_type_,
-	                                     input_schema_bytes, settings_bytes, attach_id_);
-	auto bind_request_bytes = SerializeToIpcBytes(bind_request);
-	auto params = BuildBindRpcParams(bind_request_bytes);
-
-	// Send bind RPC via HTTP
-	auto response = HttpInvokeUnary(context_, base_url_, "bind", params);
-
-	// Parse BindResponse
-	if (!response.batch || response.batch->num_rows() == 0) {
-		throw IOException("Empty bind response from HTTP server [url: %s]", base_url_);
-	}
-
-	auto result_col = response.batch->GetColumnByName("result");
-	if (!result_col) {
-		throw IOException("Bind response missing 'result' column [url: %s]", base_url_);
-	}
-
-	auto binary_array = std::dynamic_pointer_cast<arrow::BinaryArray>(result_col);
-	if (!binary_array || binary_array->IsNull(0)) {
-		throw IOException("Bind response 'result' column is null [url: %s]", base_url_);
-	}
-
-	auto view = binary_array->GetView(0);
-	auto bind_response_batch = DeserializeFromIpcBytes(
-	    reinterpret_cast<const uint8_t *>(view.data()), view.size());
-	auto bind_response = ParseBindResponse(bind_response_batch, base_url_);
-
-	auto output_schema_bytes = SerializeSchemaToIpcBytes(bind_response.output_schema);
-
-	bind_result_ = BindResult {
-	    bind_response.output_schema,
-	    bind_response.opaque_data,
-	    bind_request_bytes,
-	    output_schema_bytes
+		auto rcol = resp.batch->GetColumnByName("result");
+		if (!rcol) {
+			throw IOException("Bind response missing 'result' column [url: %s]", base_url_);
+		}
+		auto bin_arr = std::dynamic_pointer_cast<arrow::BinaryArray>(rcol);
+		if (!bin_arr || bin_arr->IsNull(0)) {
+			throw IOException("Bind response 'result' column is null [url: %s]", base_url_);
+		}
+		auto v = bin_arr->GetView(0);
+		return DeserializeFromIpcBytes(reinterpret_cast<const uint8_t *>(v.data()), v.size());
 	};
+
+	bind_result_ = PerformBindProtocol(context_, function_name_, function_type_,
+	                                    arguments_array_, input_schema_, attach_id_,
+	                                    settings_, required_secrets_, base_url_, transport_fn);
 	bind_done_ = true;
 
 	VGI_LOG(context_, "http_function_connection.bind_result",
 	        {{"url", base_url_},
 	         {"function_name", function_name_},
-	         {"num_output_columns", std::to_string(bind_response.output_schema->num_fields())}});
+	         {"num_output_columns", std::to_string(bind_result_.output_schema->num_fields())}});
 
 	return bind_result_;
 }
@@ -496,11 +459,13 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 		// Dispatch log/error batches
 		auto batch_type = ClassifyBatch(bwm.batch, bwm.custom_metadata);
 		if (batch_type == RpcBatchType::ERROR) {
-			HandleBatchLogMessage(bwm.batch, bwm.custom_metadata, &context_, base_url_);
+			HandleBatchLogMessage(bwm.batch, bwm.custom_metadata, &context_, base_url_,
+			                     -1, GetExecutionIdHex(), GetAttachIdHex());
 			throw IOException("VGI HTTP error from server [url: %s]", base_url_);
 		}
 		if (batch_type == RpcBatchType::LOG) {
-			HandleBatchLogMessage(bwm.batch, bwm.custom_metadata, &context_, base_url_);
+			HandleBatchLogMessage(bwm.batch, bwm.custom_metadata, &context_, base_url_,
+			                     -1, GetExecutionIdHex(), GetAttachIdHex());
 			continue;
 		}
 

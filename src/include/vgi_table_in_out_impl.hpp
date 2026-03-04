@@ -14,6 +14,7 @@
 #include "duckdb/main/client_context.hpp"
 
 #include "vgi_arrow_utils.hpp"
+#include "vgi_catalog_api.hpp"
 
 namespace duckdb {
 namespace vgi {
@@ -39,6 +40,7 @@ struct VgiTableInOutBindData : public TableFunctionData {
 	bool use_pool = false;
 	std::string function_name;
 	std::map<std::string, Value> settings;
+	std::vector<vgi::VgiSecretRequirement> required_secrets;
 
 	// Arguments (excluding TABLE input)
 	ArrowArguments arguments;
@@ -105,6 +107,7 @@ struct VgiTableInOutBindParams {
 	bool worker_debug = false;
 	bool use_pool = false;
 	std::map<std::string, Value> settings;
+	std::vector<vgi::VgiSecretRequirement> required_secrets;
 };
 
 // ============================================================================

@@ -5,8 +5,8 @@
 #include <arrow/ipc/api.h>
 
 #include <cstdint>
-#include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -49,17 +49,20 @@ std::shared_ptr<arrow::Array> BuildEnumArray(const std::string &value,
 //   function_type: dictionary(int16, utf8) ("SCALAR", "TABLE", "AGGREGATE")
 //   input_schema: binary|null (serialized Arrow schema)
 //   settings: binary|null (settings RecordBatch as IPC bytes)
-//   secrets: binary|null
+//   secrets: binary|null (secrets RecordBatch as IPC bytes, one struct column per secret)
 //   attach_id: binary|null
 //   transaction_id: binary|null
+//   resolved_secrets_provided: bool (true when scoped secrets have been resolved)
 std::shared_ptr<arrow::RecordBatch> BuildBindRequest(
     const std::string &function_name,
     const std::vector<uint8_t> &arguments_ipc_bytes,
     const std::string &function_type,   // "SCALAR", "TABLE", "AGGREGATE"
     const std::vector<uint8_t> &input_schema_bytes = {},   // Empty = null
     const std::vector<uint8_t> &settings_bytes = {},       // Empty = null
+    const std::vector<uint8_t> &secrets_bytes = {},        // Empty = null
     const std::vector<uint8_t> &attach_id = {},
-    const std::vector<uint8_t> &transaction_id = {});
+    const std::vector<uint8_t> &transaction_id = {},
+    bool resolved_secrets_provided = false);
 
 // Parsed BindResponse
 struct BindResponseResult {
@@ -71,6 +74,23 @@ struct BindResponseResult {
 // Fields: output_schema: binary, opaque_data: binary|null
 BindResponseResult ParseBindResponse(const std::shared_ptr<arrow::RecordBatch> &batch,
                                      const std::string &worker_path = "");
+
+// Result of trying to parse scoped secret lookup requests from a BindResponse
+struct BindSecretScopeResponseResult {
+	struct Lookup {
+		std::string secret_type;  // Required — C++ enforces type matching
+		std::string scope;        // Empty = not specified
+		std::string name;         // Empty = not specified
+	};
+	std::vector<Lookup> lookups;
+};
+
+// Try to parse scoped secret lookup requests from a BindResponse batch.
+// If the BindResponse contains non-empty lookup_secret_types field, this is a
+// secret scope request and the function returns the parsed lookups.
+// Returns nullopt if this is a normal BindResponse (no lookup fields or all empty).
+std::optional<BindSecretScopeResponseResult> TryParseBindSecretScopeResponse(
+    const std::shared_ptr<arrow::RecordBatch> &batch);
 
 // ============================================================================
 // InitRequest

@@ -12,6 +12,8 @@
 #include "duckdb/execution/expression_executor_state.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 
+#include "vgi_catalog_api.hpp"
+
 namespace duckdb {
 
 // Forward declaration
@@ -35,6 +37,7 @@ struct VgiScalarFunctionInfo : public ScalarFunctionInfo {
 	bool use_pool = false;
 	std::map<std::string, Value> settings;
 	std::vector<std::string> setting_names;
+	std::vector<vgi::VgiSecretRequirement> required_secrets;
 
 	// Schema info from catalog registration
 	std::shared_ptr<arrow::Schema> output_schema;  // Single "result" column
@@ -62,6 +65,7 @@ struct VgiScalarFunctionBindData : public FunctionData {
 	bool worker_debug = false;
 	bool use_pool = false;
 	std::map<std::string, Value> settings;
+	std::vector<vgi::VgiSecretRequirement> required_secrets;
 
 	// Actual output schema resolved during bind (with concrete types)
 	std::shared_ptr<arrow::Schema> resolved_output_schema;
@@ -87,6 +91,7 @@ struct VgiScalarFunctionBindData : public FunctionData {
 		copy->worker_debug = worker_debug;
 		copy->use_pool = use_pool;
 		copy->settings = settings;
+		copy->required_secrets = required_secrets;
 		copy->resolved_output_schema = resolved_output_schema;
 		copy->input_schema = input_schema;
 		copy->const_values = const_values;

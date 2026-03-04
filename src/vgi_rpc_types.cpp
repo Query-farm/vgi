@@ -85,7 +85,13 @@ std::vector<uint8_t> SerializeToIpcBytes(const std::shared_ptr<arrow::RecordBatc
 }
 
 std::shared_ptr<arrow::RecordBatch> DeserializeFromIpcBytes(const uint8_t *data, size_t len) {
-	auto buffer = arrow::Buffer::Wrap(data, len);
+	auto alloc_result = arrow::AllocateBuffer(static_cast<int64_t>(len));
+	if (!alloc_result.ok()) {
+		throw IOException("Failed to allocate buffer for IPC deserialization: %s",
+		                  alloc_result.status().ToString());
+	}
+	auto buffer = std::shared_ptr<arrow::Buffer>(std::move(alloc_result).ValueUnsafe());
+	memcpy(const_cast<uint8_t *>(buffer->data()), data, len);
 	auto buffer_reader = std::make_shared<arrow::io::BufferReader>(buffer);
 	auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(buffer_reader);
 	if (!reader_result.ok()) {
@@ -167,8 +173,9 @@ std::shared_ptr<arrow::Array> BuildEnumArray(const std::string &value,
 std::shared_ptr<arrow::RecordBatch>
 BuildBindRequest(const std::string &function_name, const std::vector<uint8_t> &arguments_ipc_bytes,
                  const std::string &function_type, const std::vector<uint8_t> &input_schema_bytes,
-                 const std::vector<uint8_t> &settings_bytes, const std::vector<uint8_t> &attach_id,
-                 const std::vector<uint8_t> &transaction_id) {
+                 const std::vector<uint8_t> &settings_bytes, const std::vector<uint8_t> &secrets_bytes,
+                 const std::vector<uint8_t> &attach_id, const std::vector<uint8_t> &transaction_id,
+                 bool resolved_secrets_provided) {
 	// FunctionType enum: SCALAR, TABLE, AGGREGATE
 	static const std::vector<std::string> function_type_values = {"SCALAR", "TABLE", "AGGREGATE"};
 
@@ -181,6 +188,7 @@ BuildBindRequest(const std::string &function_name, const std::vector<uint8_t> &a
 	    arrow::field("secrets", arrow::binary(), true),
 	    arrow::field("attach_id", arrow::binary(), true),
 	    arrow::field("transaction_id", arrow::binary(), true),
+	    arrow::field("resolved_secrets_provided", arrow::boolean(), false),
 	});
 
 	std::vector<std::shared_ptr<arrow::Array>> arrays;
@@ -189,16 +197,16 @@ BuildBindRequest(const std::string &function_name, const std::vector<uint8_t> &a
 	arrays.push_back(BuildEnumArray(function_type, function_type_values));
 	arrays.push_back(BuildBinaryScalar(input_schema_bytes));
 	arrays.push_back(BuildBinaryScalar(settings_bytes));
-
-	// secrets - always null for now
-	{
-		arrow::BinaryBuilder builder;
-		CheckStatus(builder.AppendNull(), "append null secrets");
-		arrays.push_back(FinishArray(builder, "secrets"));
-	}
-
+	arrays.push_back(BuildBinaryScalar(secrets_bytes));
 	arrays.push_back(BuildBinaryScalar(attach_id));
 	arrays.push_back(BuildBinaryScalar(transaction_id));
+
+	// resolved_secrets_provided: bool
+	{
+		arrow::BooleanBuilder builder;
+		CheckStatus(builder.Append(resolved_secrets_provided), "append resolved_secrets_provided");
+		arrays.push_back(FinishArray(builder, "resolved_secrets_provided"));
+	}
 
 	return arrow::RecordBatch::Make(schema, 1, arrays);
 }
@@ -242,6 +250,72 @@ BindResponseResult ParseBindResponse(const std::shared_ptr<arrow::RecordBatch> &
 			auto opaque_view = opaque_array->GetView(0);
 			result.opaque_data.assign(opaque_view.data(), opaque_view.data() + opaque_view.size());
 		}
+	}
+
+	return result;
+}
+
+// ============================================================================
+// BindSecretScopeResponse Parsing
+// ============================================================================
+
+std::optional<BindSecretScopeResponseResult> TryParseBindSecretScopeResponse(
+    const std::shared_ptr<arrow::RecordBatch> &batch) {
+	if (!batch || batch->num_rows() == 0) {
+		return std::nullopt;
+	}
+
+	// Check for lookup_secret_types column — if present and non-empty, this is a scope request
+	auto types_col = batch->GetColumnByName("lookup_secret_types");
+	if (!types_col) {
+		return std::nullopt;
+	}
+
+	auto types_list = std::dynamic_pointer_cast<arrow::ListArray>(types_col);
+	if (!types_list || types_list->IsNull(0)) {
+		return std::nullopt;
+	}
+
+	int64_t start = types_list->value_offset(0);
+	int64_t end = types_list->value_offset(1);
+	int64_t num_lookups = end - start;
+
+	if (num_lookups == 0) {
+		return std::nullopt; // Empty list — not a scope request
+	}
+
+	auto types_values = std::dynamic_pointer_cast<arrow::StringArray>(types_list->values());
+	if (!types_values) {
+		return std::nullopt;
+	}
+
+	// Parse scopes and names (parallel lists)
+	auto scopes_col = batch->GetColumnByName("lookup_scopes");
+	auto names_col = batch->GetColumnByName("lookup_names");
+
+	auto scopes_list = scopes_col ? std::dynamic_pointer_cast<arrow::ListArray>(scopes_col) : nullptr;
+	auto names_list = names_col ? std::dynamic_pointer_cast<arrow::ListArray>(names_col) : nullptr;
+
+	std::shared_ptr<arrow::StringArray> scopes_values;
+	std::shared_ptr<arrow::StringArray> names_values;
+	if (scopes_list && !scopes_list->IsNull(0)) {
+		scopes_values = std::dynamic_pointer_cast<arrow::StringArray>(scopes_list->values());
+	}
+	if (names_list && !names_list->IsNull(0)) {
+		names_values = std::dynamic_pointer_cast<arrow::StringArray>(names_list->values());
+	}
+
+	BindSecretScopeResponseResult result;
+	for (int64_t i = start; i < end; i++) {
+		BindSecretScopeResponseResult::Lookup lookup;
+		lookup.secret_type = types_values->GetString(i);
+		if (scopes_values && i < scopes_values->length() && !scopes_values->IsNull(i)) {
+			lookup.scope = scopes_values->GetString(i);
+		}
+		if (names_values && i < names_values->length() && !names_values->IsNull(i)) {
+			lookup.name = names_values->GetString(i);
+		}
+		result.lookups.push_back(std::move(lookup));
 	}
 
 	return result;

@@ -48,7 +48,8 @@ void PerformVgiTableFunctionBind(ClientContext &context, VgiTableFunctionBindDat
 	// Uses helper that handles pool acquire and stale connection retry.
 	FunctionConnectionParams params(bind_data.worker_path, bind_data.function_name, bind_data.arguments,
 	                                bind_data.attach_id, {} /* primary worker, no global exec ID */,
-	                                bind_data.worker_debug, bind_data.settings, bind_data.use_pool, "bind", "TABLE");
+	                                bind_data.worker_debug, bind_data.settings, bind_data.use_pool, "bind", "TABLE",
+	                                bind_data.required_secrets);
 
 	auto result = AcquireAndBindConnection(context, params);
 	bind_data.bind_connection = std::move(result.connection);
@@ -507,7 +508,8 @@ unique_ptr<LocalTableFunctionState> VgiTableFunctionInitLocal(ExecutionContext &
 		// PerformInit includes it in the InitRequest automatically.
 		FunctionConnectionParams params(bind_data.worker_path, bind_data.function_name, bind_data.arguments,
 		                                bind_data.attach_id, global_state.global_execution_id, bind_data.worker_debug,
-		                                bind_data.settings, bind_data.use_pool, "init_local_secondary", "TABLE");
+		                                bind_data.settings, bind_data.use_pool, "init_local_secondary", "TABLE",
+		                                bind_data.required_secrets);
 
 		auto result = AcquireAndBindConnection(context.client, params);
 		local_state->connection = std::move(result.connection);

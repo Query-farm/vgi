@@ -17,6 +17,8 @@
 namespace duckdb {
 namespace vgi {
 
+struct VgiSecretRequirement;
+
 // ============================================================================
 // HttpFunctionConnection - HTTP transport for VGI function connections
 // ============================================================================
@@ -31,7 +33,8 @@ public:
 	                       ClientContext &context, const std::string &function_type = "TABLE",
 	                       const std::vector<uint8_t> &global_execution_id = {},
 	                       bool worker_debug = false,
-	                       const std::map<std::string, Value> &settings = {});
+	                       const std::map<std::string, Value> &settings = {},
+	                       const std::vector<VgiSecretRequirement> &required_secrets = {});
 
 	~HttpFunctionConnection() override = default;
 
@@ -81,6 +84,7 @@ private:
 	ClientContext &context_;
 	bool worker_debug_;
 	std::map<std::string, Value> settings_;
+	std::vector<VgiSecretRequirement> required_secrets_;
 
 	// State tracking
 	bool bind_done_ = false;

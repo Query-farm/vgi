@@ -213,13 +213,15 @@ unique_ptr<FunctionData> VgiScalarFunctionBind(ClientContext &context, ScalarFun
 			if (pooled) {
 				connection = CreateFunctionConnectionFromPool(
 				    std::move(pooled), func_info.function_name, arrow_arguments, func_info.attach_id, context,
-				    "SCALAR", std::vector<uint8_t>{}, func_info.worker_debug, func_info.settings);
+				    "SCALAR", std::vector<uint8_t>{}, func_info.worker_debug, func_info.settings,
+				    func_info.required_secrets);
 			}
 		}
 		if (!connection) {
 			connection = CreateFunctionConnection(
 			    func_info.worker_path, func_info.function_name, arrow_arguments, func_info.attach_id, context,
-			    "SCALAR", std::vector<uint8_t>{}, func_info.worker_debug, func_info.settings);
+			    "SCALAR", std::vector<uint8_t>{}, func_info.worker_debug, func_info.settings,
+			    func_info.required_secrets);
 		}
 
 		// Set input schema and perform bind to get actual output schema
@@ -264,6 +266,7 @@ unique_ptr<FunctionData> VgiScalarFunctionBind(ClientContext &context, ScalarFun
 	bind_data->worker_debug = func_info.worker_debug;
 	bind_data->use_pool = func_info.use_pool;
 	bind_data->settings = settings;
+	bind_data->required_secrets = func_info.required_secrets;
 	bind_data->resolved_output_schema = output_schema;
 	bind_data->input_schema = input_schema;
 	bind_data->const_values = const_values;
@@ -338,6 +341,7 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 		bool worker_debug = bind_data ? bind_data->worker_debug : func_info.worker_debug;
 		// Extract settings: from bind_data if available, otherwise extract fresh from context
 		auto settings = bind_data ? bind_data->settings : ExtractVgiSettings(context, func_info.setting_names);
+		const auto &required_secrets = bind_data ? bind_data->required_secrets : func_info.required_secrets;
 
 		// Try to reuse the bind-phase connection (avoids spawning a second worker)
 		if (bind_data) {
@@ -358,7 +362,8 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 				                 worker_path.c_str(), pooled->GetPid());
 				connection = CreateFunctionConnectionFromPool(
 				    std::move(pooled), function_name, arguments, attach_id, context,
-				    "SCALAR", std::vector<uint8_t>{}, worker_debug, settings);
+				    "SCALAR", std::vector<uint8_t>{}, worker_debug, settings,
+				    required_secrets);
 			} else {
 				VGI_STDERR_DEBUG("[VGI] scalar.pool_acquire result=miss worker_path=%s\n", worker_path.c_str());
 			}
@@ -366,7 +371,8 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 		if (!connection) {
 			connection = CreateFunctionConnection(
 			    worker_path, function_name, arguments, attach_id, context,
-			    "SCALAR", std::vector<uint8_t>{}, worker_debug, settings);
+			    "SCALAR", std::vector<uint8_t>{}, worker_debug, settings,
+			    required_secrets);
 			VGI_STDERR_DEBUG("[VGI] scalar.new_connection worker_path=%s pid=%d\n",
 			                 worker_path.c_str(), connection->GetPid());
 		}

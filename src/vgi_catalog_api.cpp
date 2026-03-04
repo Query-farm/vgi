@@ -1,6 +1,8 @@
 #include "vgi_catalog_api.hpp"
 
 #include "duckdb.hpp"
+#include "duckdb/catalog/catalog_transaction.hpp"
+#include "duckdb/main/secret/secret_manager.hpp"
 #include "duckdb/function/table/arrow/arrow_duck_schema.hpp"
 #include "duckdb/logging/log_manager.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
@@ -576,6 +578,60 @@ VgiSetting ParseVgiSetting(const std::vector<uint8_t> &bytes, const std::string 
 	return setting;
 }
 
+VgiSecretType ParseVgiSecretType(const std::vector<uint8_t> &bytes, const std::string &worker_path,
+                                  ClientContext &context) {
+	// Deserialize the SecretTypeSpec RecordBatch
+	auto batch = DeserializeFromIpcBytes(bytes);
+	if (!batch || batch->num_rows() == 0) {
+		throw IOException("Empty SecretTypeSpec batch from worker: %s", worker_path);
+	}
+
+	RecordBatchSingleRow row(batch, 0, "SecretTypeSpec", worker_path);
+
+	VgiSecretType secret_type;
+	secret_type.name = row["name"].value_not_null<std::string>();
+	secret_type.description = row["description"].value_not_null<std::string>();
+
+	// Parse the parameters schema from IPC-serialized Arrow schema bytes
+	auto schema_bytes = row["parameters_schema"].value_not_null<std::vector<uint8_t>>();
+	auto schema_buffer = arrow::Buffer::Wrap(schema_bytes.data(), schema_bytes.size());
+	auto schema_stream = std::make_shared<arrow::io::BufferReader>(schema_buffer);
+	arrow::ipc::DictionaryMemo dict_memo;
+	auto schema_result = arrow::ipc::ReadSchema(schema_stream.get(), &dict_memo);
+	if (!schema_result.ok()) {
+		throw IOException("Failed to read parameters schema for secret type '%s': %s", secret_type.name,
+		                  schema_result.status().ToString());
+	}
+	auto params_schema = schema_result.ValueUnsafe();
+
+	// Convert Arrow schema to DuckDB types in one pass
+	ArrowSchemaWrapper c_schema;
+	ArrowTableSchema arrow_table;
+	vector<LogicalType> types;
+	vector<string> names;
+	ArrowSchemaToDuckDBTypes(context, params_schema, c_schema, arrow_table, types, names);
+
+	// Build VgiSecretTypeParam for each field
+	for (int i = 0; i < params_schema->num_fields(); i++) {
+		VgiSecretTypeParam param;
+		param.name = names[i];
+		param.type = types[i];
+
+		// Check for redact metadata
+		auto field_metadata = params_schema->field(i)->metadata();
+		if (field_metadata) {
+			auto redact_idx = field_metadata->FindKey("redact");
+			if (redact_idx >= 0 && field_metadata->value(redact_idx) == "true") {
+				param.redact = true;
+			}
+		}
+
+		secret_type.parameters.push_back(std::move(param));
+	}
+
+	return secret_type;
+}
+
 CatalogAttachResult ParseCatalogAttachResult(const std::shared_ptr<arrow::RecordBatch> &batch,
                                              const std::string &worker_path, ClientContext &context) {
 	CatalogAttachResult result;
@@ -600,6 +656,12 @@ CatalogAttachResult ParseCatalogAttachResult(const std::shared_ptr<arrow::Record
 	auto settings_bytes = row["settings"].value_or(std::vector<std::vector<uint8_t>> {});
 	for (const auto &setting_bytes : settings_bytes) {
 		result.settings.push_back(ParseVgiSetting(setting_bytes, worker_path, context));
+	}
+
+	// Parse secret_types list - each element is a serialized SecretTypeSpec
+	auto secret_types_bytes = row["secret_types"].value_or(std::vector<std::vector<uint8_t>> {});
+	for (const auto &st_bytes : secret_types_bytes) {
+		result.secret_types.push_back(ParseVgiSecretType(st_bytes, worker_path, context));
 	}
 
 	return result;
@@ -895,6 +957,40 @@ VgiFunctionInfo ParseFunctionInfo(const std::shared_ptr<arrow::RecordBatch> &bat
 	// Required settings for this function (list of strings)
 	info.required_settings = row["required_settings"].value_or(std::vector<std::string> {});
 
+	// Required secrets for this function (list of struct<secret_type, secret_name, scope>)
+	// Parse from the Arrow list<struct> column
+	auto secrets_col = batch->GetColumnByName("required_secrets");
+	if (secrets_col && !secrets_col->IsNull(row_idx)) {
+		auto list_array = std::dynamic_pointer_cast<arrow::ListArray>(secrets_col);
+		if (list_array) {
+			auto struct_array = std::dynamic_pointer_cast<arrow::StructArray>(list_array->values());
+			if (struct_array) {
+				int64_t start = list_array->value_offset(row_idx);
+				int64_t end = list_array->value_offset(row_idx + 1);
+
+				auto type_col = std::dynamic_pointer_cast<arrow::StringArray>(struct_array->GetFieldByName("secret_type"));
+				auto name_col = std::dynamic_pointer_cast<arrow::StringArray>(struct_array->GetFieldByName("secret_name"));
+				auto scope_col = std::dynamic_pointer_cast<arrow::StringArray>(struct_array->GetFieldByName("scope"));
+
+				for (int64_t i = start; i < end; i++) {
+					VgiSecretRequirement req;
+					if (type_col && !type_col->IsNull(i)) {
+						req.secret_type = type_col->GetString(i);
+					}
+					if (name_col && !name_col->IsNull(i)) {
+						req.name = name_col->GetString(i);
+					}
+					if (scope_col && !scope_col->IsNull(i)) {
+						req.scope = scope_col->GetString(i);
+					}
+					if (!req.secret_type.empty()) {
+						info.required_secrets.push_back(std::move(req));
+					}
+				}
+			}
+		}
+	}
+
 	return info;
 }
 
@@ -913,6 +1009,64 @@ VgiFunctionInfo GetFunctionInfo(const std::string &worker_path, const std::vecto
 		                  worker_path);
 	}
 	return ParseFunctionInfo(result_batch, 0, worker_path);
+}
+
+// ============================================================================
+// Secret Extraction from DuckDB SecretManager
+// ============================================================================
+
+// Extract key-value pairs from a KeyValueSecret into a map.
+// Must be called while the secret reference is still valid.
+static std::map<std::string, Value> ExtractSecretKeyValues(const KeyValueSecret &kv_secret) {
+	std::map<std::string, Value> kv_pairs;
+	// Add standard fields from BaseSecret
+	kv_pairs["type"] = Value(kv_secret.GetType());
+	kv_pairs["provider"] = Value(kv_secret.GetProvider());
+	kv_pairs["name"] = Value(kv_secret.GetName());
+	// Add all custom key-value entries
+	for (const auto &[k, v] : kv_secret.secret_map) {
+		kv_pairs[k] = v;
+	}
+	return kv_pairs;
+}
+
+std::map<std::string, std::map<std::string, Value>> ExtractVgiSecrets(
+    ClientContext &context, const std::vector<VgiSecretRequirement> &requirements) {
+	std::map<std::string, std::map<std::string, Value>> result;
+
+	if (requirements.empty()) {
+		return result;
+	}
+
+	auto &secret_manager = SecretManager::Get(context);
+	auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
+
+	for (const auto &req : requirements) {
+		if (!req.name.empty()) {
+			// Name-based lookup (optionally constrained by type)
+			auto secret_entry = secret_manager.GetSecretByName(transaction, req.name);
+			if (secret_entry) {
+				auto &base_secret = secret_entry->secret;
+				if (base_secret->GetType() == req.secret_type) {
+					auto *kv_secret = dynamic_cast<const KeyValueSecret *>(base_secret.get());
+					if (kv_secret) {
+						result[req.secret_type] = ExtractSecretKeyValues(*kv_secret);
+					}
+				}
+			}
+		} else {
+			// Scope-based lookup (unscoped if scope is empty)
+			auto match = secret_manager.LookupSecret(transaction, req.scope, req.secret_type);
+			if (match.HasMatch()) {
+				auto *kv_secret = dynamic_cast<const KeyValueSecret *>(&match.GetSecret());
+				if (kv_secret) {
+					result[req.secret_type] = ExtractSecretKeyValues(*kv_secret);
+				}
+			}
+		}
+	}
+
+	return result;
 }
 
 } // namespace vgi

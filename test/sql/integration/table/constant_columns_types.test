@@ -10,6 +10,8 @@ require-env VGI_TEST_WORKER
 
 require vgi
 
+require httpfs
+
 statement ok
 SET arrow_lossless_conversion = true;
 

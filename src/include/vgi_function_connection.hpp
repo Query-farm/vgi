@@ -27,6 +27,9 @@ class ClientContext;
 
 namespace vgi {
 
+// Forward declaration — full definition in vgi_catalog_api.hpp
+struct VgiSecretRequirement;
+
 // ============================================================================
 // Connection Acquisition with Retry
 // ============================================================================
@@ -44,6 +47,7 @@ struct FunctionConnectionParams {
 	std::vector<uint8_t> global_execution_id;  // Empty for primary workers
 	bool worker_debug = false;
 	std::map<std::string, Value> settings;
+	std::vector<vgi::VgiSecretRequirement> required_secrets;
 	bool use_pool = false;
 	std::string phase;  // For logging (e.g., "bind", "init_local_secondary")
 	std::string function_type = "TABLE";  // "TABLE", "SCALAR", "AGGREGATE"
@@ -56,10 +60,11 @@ struct FunctionConnectionParams {
 	                         const ArrowArguments &arguments, const std::vector<uint8_t> &attach_id,
 	                         const std::vector<uint8_t> &global_execution_id, bool worker_debug,
 	                         const std::map<std::string, Value> &settings, bool use_pool,
-	                         const std::string &phase, const std::string &function_type = "TABLE")
+	                         const std::string &phase, const std::string &function_type = "TABLE",
+	                         const std::vector<vgi::VgiSecretRequirement> &required_secrets = {})
 	    : worker_path(worker_path), function_name(function_name), arguments(arguments), attach_id(attach_id),
 	      global_execution_id(global_execution_id), worker_debug(worker_debug), settings(settings),
-	      use_pool(use_pool), phase(phase), function_type(function_type) {
+	      required_secrets(required_secrets), use_pool(use_pool), phase(phase), function_type(function_type) {
 	}
 };
 
@@ -113,14 +118,16 @@ public:
 	                   const ArrowArguments &arguments, const std::vector<uint8_t> &attach_id, ClientContext &context,
 	                   const std::string &function_type = "TABLE",
 	                   const std::vector<uint8_t> &global_execution_id = {}, bool worker_debug = false,
-	                   const std::map<std::string, Value> &settings = {});
+	                   const std::map<std::string, Value> &settings = {},
+	                   const std::vector<VgiSecretRequirement> &required_secrets = {});
 
 	// Create connection using a pooled worker (skips spawning new subprocess)
 	FunctionConnection(std::unique_ptr<PooledWorker> pooled_worker, const std::string &function_name,
 	                   const ArrowArguments &arguments, const std::vector<uint8_t> &attach_id, ClientContext &context,
 	                   const std::string &function_type = "TABLE",
 	                   const std::vector<uint8_t> &global_execution_id = {}, bool worker_debug = false,
-	                   const std::map<std::string, Value> &settings = {});
+	                   const std::map<std::string, Value> &settings = {},
+	                   const std::vector<VgiSecretRequirement> &required_secrets = {});
 
 	~FunctionConnection() override;
 
@@ -227,6 +234,7 @@ private:
 	ClientContext &context_;
 	bool worker_debug_;
 	std::map<std::string, Value> settings_;
+	std::vector<VgiSecretRequirement> required_secrets_;
 
 	// Worker process (created during bind)
 	std::unique_ptr<SubProcess> proc_;

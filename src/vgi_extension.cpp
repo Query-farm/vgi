@@ -3,11 +3,13 @@
 #include "vgi_extension.hpp"
 
 #include <cerrno>
+#include <mutex>
 #include <signal.h>
 
 #include "duckdb.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/extension_helper.hpp"
+#include "duckdb/main/secret/secret_manager.hpp"
 #include "duckdb/parser/parsed_data/attach_info.hpp"
 #include "duckdb/storage/storage_extension.hpp"
 #include "query_farm_telemetry.hpp"
@@ -26,6 +28,65 @@
 #define VGI_EXTENSION_VERSION "2026011201"
 
 namespace duckdb {
+
+// Forward declarations — functions defined below after VgiStorageExtension class
+static unique_ptr<BaseSecret> VgiCreateSecret(ClientContext &context, CreateSecretInput &input);
+static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> storage_info, ClientContext &context,
+                                            AttachedDatabase &db, const string &name, AttachInfo &info,
+                                            AttachOptions &options);
+static unique_ptr<TransactionManager> CreateVgiTransactionManager(optional_ptr<StorageExtensionInfo> storage_info,
+                                                                  AttachedDatabase &db, Catalog &catalog);
+
+// Storage extension for VGI — also holds per-secret-type redact keys
+class VgiStorageExtension : public StorageExtension {
+public:
+	VgiStorageExtension() {
+		attach = VgiCatalogAttach;
+		create_transaction_manager = CreateVgiTransactionManager;
+	}
+
+	// Thread-safe registry of redact keys per secret type name.
+	// Populated during ATTACH after successful secret type registration.
+	void SetRedactKeys(const std::string &secret_type_name, case_insensitive_set_t keys) {
+		std::lock_guard<std::mutex> lock(redact_mutex_);
+		redact_keys_[secret_type_name] = std::move(keys);
+	}
+
+	case_insensitive_set_t GetRedactKeys(const std::string &secret_type_name) const {
+		std::lock_guard<std::mutex> lock(redact_mutex_);
+		auto it = redact_keys_.find(secret_type_name);
+		if (it != redact_keys_.end()) {
+			return it->second;
+		}
+		return {};
+	}
+
+private:
+	mutable std::mutex redact_mutex_;
+	std::unordered_map<std::string, case_insensitive_set_t> redact_keys_;
+};
+
+// Create function for VGI secrets — builds a KeyValueSecret from config options.
+// All named parameters from CREATE SECRET are copied into the secret's key-value map.
+static unique_ptr<BaseSecret> VgiCreateSecret(ClientContext &context, CreateSecretInput &input) {
+	auto scope = input.scope;
+	auto secret = make_uniq<KeyValueSecret>(scope, input.type, input.provider, input.name);
+
+	// Look up redact keys from VgiStorageExtension (per-DatabaseInstance, not global)
+	auto &config = DBConfig::GetConfig(context);
+	auto vgi_ext = StorageExtension::Find(config, "vgi");
+	if (vgi_ext) {
+		auto &vgi_storage = static_cast<VgiStorageExtension &>(*vgi_ext);
+		secret->redact_keys = vgi_storage.GetRedactKeys(input.type);
+	}
+
+	// Copy all user-provided options into the secret map
+	for (const auto &entry : input.options) {
+		secret->secret_map[entry.first] = entry.second;
+	}
+
+	return secret;
+}
 
 // ATTACH handler for VGI catalogs
 static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> storage_info, ClientContext &context,
@@ -102,6 +163,48 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 		}
 	}
 
+	// Register secret types exposed by this catalog
+	auto &secret_manager = SecretManager::Get(context);
+	auto vgi_ext = StorageExtension::Find(config, "vgi");
+	for (const auto &st : attach_result.secret_types) {
+		// Build redact keys set from parameter metadata
+		case_insensitive_set_t redact_set;
+		for (const auto &param : st.parameters) {
+			if (param.redact) {
+				redact_set.insert(param.name);
+			}
+		}
+
+		// Register the secret type with DuckDB
+		SecretType secret_type;
+		secret_type.name = st.name;
+		secret_type.deserializer = KeyValueSecret::Deserialize<KeyValueSecret>;
+		secret_type.default_provider = "config";
+		secret_type.extension = "vgi";
+		try {
+			secret_manager.RegisterSecretType(secret_type);
+		} catch (const InternalException &) {
+			// Already registered by another VGI catalog — skip
+			// Don't overwrite redact keys from the first (winning) registration
+			redact_set = {};
+		}
+
+		// Store redact keys on VgiStorageExtension (only for newly registered types)
+		if (vgi_ext && !redact_set.empty()) {
+			static_cast<VgiStorageExtension &>(*vgi_ext).SetRedactKeys(st.name, std::move(redact_set));
+		}
+
+		// Register "config" provider create function with named parameters
+		CreateSecretFunction create_func;
+		create_func.secret_type = st.name;
+		create_func.provider = "config";
+		create_func.function = VgiCreateSecret;
+		for (const auto &param : st.parameters) {
+			create_func.named_parameters[param.name] = param.type;
+		}
+		secret_manager.RegisterSecretFunction(create_func, OnCreateConflict::IGNORE_ON_CONFLICT);
+	}
+
 	// Build per-path pool config and register with pool
 	vgi::PoolSettings pool_settings;
 	if (use_pool) {
@@ -139,15 +242,6 @@ static unique_ptr<TransactionManager> CreateVgiTransactionManager(optional_ptr<S
 	auto &vgi_catalog = catalog.Cast<VgiCatalog>();
 	return make_uniq<VgiTransactionManager>(db, vgi_catalog);
 }
-
-// Storage extension for VGI
-class VgiStorageExtension : public StorageExtension {
-public:
-	VgiStorageExtension() {
-		attach = VgiCatalogAttach;
-		create_transaction_manager = CreateVgiTransactionManager;
-	}
-};
 
 static void LoadInternal(ExtensionLoader &loader) {
 	// Ignore SIGPIPE - we handle broken pipes via EPIPE error from write()

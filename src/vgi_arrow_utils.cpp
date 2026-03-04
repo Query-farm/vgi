@@ -1,5 +1,6 @@
 #include "vgi_arrow_utils.hpp"
 #include "vgi_protocol_constants.hpp"
+#include "vgi_rpc_types.hpp"
 
 #include <arrow/c/bridge.h>
 
@@ -189,6 +190,75 @@ std::shared_ptr<arrow::RecordBatch> BuildSettingsBatch(ClientContext &context,
 	// Convert to Arrow RecordBatch using the existing utilities
 	auto schema = BuildArrowSchemaFromDuckDB(context, field_types, field_names);
 	return DataChunkToArrow(context, chunk, schema);
+}
+
+// ============================================================================
+// DuckDB Value Secrets to Arrow RecordBatch
+// ============================================================================
+
+std::vector<uint8_t> BuildSecretsBatch(ClientContext &context,
+                                        const std::map<std::string, std::map<std::string, Value>> &secrets) {
+	if (secrets.empty()) {
+		return {};
+	}
+
+	std::vector<std::shared_ptr<arrow::Field>> outer_fields;
+	std::vector<std::shared_ptr<arrow::Array>> outer_arrays;
+
+	for (const auto &[secret_type, kv_pairs] : secrets) {
+		if (kv_pairs.empty()) {
+			continue;
+		}
+
+		// Build DuckDB types and values for this secret's key-value pairs
+		vector<LogicalType> field_types;
+		vector<string> field_names;
+
+		for (const auto &[key, value] : kv_pairs) {
+			field_names.push_back(key);
+			field_types.push_back(value.type());
+		}
+
+		// Create a single-row DataChunk with the key-value pairs
+		DataChunk chunk;
+		chunk.Initialize(Allocator::DefaultAllocator(), field_types);
+		chunk.SetCardinality(1);
+
+		idx_t col_idx = 0;
+		for (const auto &[key, value] : kv_pairs) {
+			chunk.SetValue(col_idx++, 0, value);
+		}
+
+		// Convert to Arrow RecordBatch (preserves DuckDB types as Arrow types)
+		auto inner_schema = BuildArrowSchemaFromDuckDB(context, field_types, field_names);
+		auto inner_batch = DataChunkToArrow(context, chunk, inner_schema);
+
+		// Convert RecordBatch columns into a StructArray
+		std::vector<std::shared_ptr<arrow::Field>> struct_fields;
+		std::vector<std::shared_ptr<arrow::Array>> struct_arrays;
+		for (int i = 0; i < inner_batch->num_columns(); i++) {
+			struct_fields.push_back(inner_batch->schema()->field(i));
+			struct_arrays.push_back(inner_batch->column(i));
+		}
+
+		auto struct_type = arrow::struct_(struct_fields);
+		auto struct_result = arrow::StructArray::Make(struct_arrays, struct_fields);
+		if (!struct_result.ok()) {
+			throw IOException("Failed to create struct array for secret '%s': %s",
+			                  secret_type, struct_result.status().ToString());
+		}
+
+		outer_fields.push_back(arrow::field(secret_type, struct_type, true));
+		outer_arrays.push_back(struct_result.ValueUnsafe());
+	}
+
+	if (outer_fields.empty()) {
+		return {};
+	}
+
+	auto outer_schema = arrow::schema(outer_fields);
+	auto outer_batch = arrow::RecordBatch::Make(outer_schema, 1, outer_arrays);
+	return SerializeToIpcBytes(outer_batch);
 }
 
 // ============================================================================

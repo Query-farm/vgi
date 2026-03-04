@@ -20,6 +20,64 @@ namespace duckdb {
 namespace vgi {
 
 // ============================================================================
+// VgiTableFunctionInfo - Stores metadata needed to invoke a VGI table function
+// ============================================================================
+
+//! Information stored with each VGI table function to enable invocation.
+//! This is attached to the TableFunction via the function_info member and
+//! accessed in the bind function via input.info->Cast<VgiTableFunctionInfo>().
+class VgiTableFunctionInfo final : public TableFunctionInfo {
+public:
+	VgiTableFunctionInfo(std::string worker_path, std::vector<uint8_t> attach_id, bool worker_debug,
+	                     bool use_pool, VgiFunctionInfo function_info,
+	                     std::vector<std::string> setting_names)
+	    : worker_path_(std::move(worker_path)), attach_id_(std::move(attach_id)), worker_debug_(worker_debug),
+	      use_pool_(use_pool), function_info_(std::move(function_info)),
+	      setting_names_(std::move(setting_names)) {
+	}
+
+	~VgiTableFunctionInfo() override = default;
+
+	//! Path to the VGI worker executable
+	const std::string &worker_path() const {
+		return worker_path_;
+	}
+
+	//! Attach ID for the catalog connection
+	const std::vector<uint8_t> &attach_id() const {
+		return attach_id_;
+	}
+
+	//! Whether to enable worker debug output
+	bool worker_debug() const {
+		return worker_debug_;
+	}
+
+	//! Whether pooling is enabled for this function's workers
+	bool use_pool() const {
+		return use_pool_;
+	}
+
+	//! Full function metadata from the worker
+	const VgiFunctionInfo &function_info() const {
+		return function_info_;
+	}
+
+	//! Names of settings registered by this catalog
+	const std::vector<std::string> &setting_names() const {
+		return setting_names_;
+	}
+
+private:
+	std::string worker_path_;
+	std::vector<uint8_t> attach_id_;
+	bool worker_debug_;
+	bool use_pool_;
+	VgiFunctionInfo function_info_;
+	std::vector<std::string> setting_names_;
+};
+
+// ============================================================================
 // VgiTableFunctionBindData - Shared bind data for VGI table functions
 // ============================================================================
 
@@ -40,6 +98,9 @@ struct VgiTableFunctionBindData : public TableFunctionData {
 
 	// Settings to pass to the worker (e.g., DuckDB pragmas)
 	std::map<std::string, Value> settings;
+
+	// Required secrets for this function (from function metadata)
+	std::vector<VgiSecretRequirement> required_secrets;
 
 	// Schema information (discovered from OutputSpec during bind)
 	// Arrow C ABI schema wrapper for DuckDB conversion

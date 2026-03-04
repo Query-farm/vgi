@@ -8,6 +8,8 @@ require-env VGI_TEST_WORKER
 
 require vgi
 
+require httpfs
+
 require json
 
 statement ok
