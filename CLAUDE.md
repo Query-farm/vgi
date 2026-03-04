@@ -28,27 +28,56 @@ There are many tests for this extension that take a long time to run in debug mo
 its best to run the tests against the release build first then run the failed tests
 using the debug build to isolate failures.
 
-Run test suites after changes:
+The extension supports two transports: **subprocess** (worker spawned as a child process) and **HTTP** (worker as an HTTP server). Both should be tested, though subprocess is faster.
+
+### Subprocess Transport (default, faster)
 
 ```bash
+# Run all tests in release mode (subprocess)
+make test_subprocess
 
-# The VGI_TEST_WORKER determines what vgi worker to use for tests, this runs the
-# VGI python example worker
-VGI_TEST_WORKER="uv run --project ~/Development/vgi-python vgi-example-worker"
+# Run all tests in debug mode (subprocess)
+make test_subprocess_debug
 
-# Run all tests in debug mode
+# The legacy `make test` / `make test_debug` also work (run all tests including non-integration)
+make test
 make test_debug
 
-# Run all tests in release mode
-make test
-
-# To run all tests and return failures you may want to use
-make test | grep -A 20 "FAILED"
-
-# This in turn runs the unittest command, you may wish to run tests in parallel from the
-# tests/sql directory to speed up execution, but it is important to run all tests
-# comprehensively before commiting changes.
+# To see failures:
+make test_subprocess | grep -A 20 "FAILED"
 ```
+
+The `VGI_TEST_WORKER` env var controls which worker is used. It defaults to
+`uv run --project ~/Development/vgi-python vgi-example-worker` and can be overridden.
+
+### HTTP Transport
+
+```bash
+# Run integration tests over HTTP (release build)
+make test_http
+
+# Run integration tests over HTTP (debug build)
+make test_http_debug
+```
+
+This uses `test/run_http_integration.sh` which starts an HTTP server (`vgi-serve`), waits for it to be ready, runs the tests, and cleans up. Server logs are at `/tmp/vgi-http-test-server.log`.
+
+**Known HTTP limitations** (these tests fail over HTTP, not regressions):
+- `logging_generator.test` — inline log streaming not supported over HTTP
+- `partitioned_sequence.test` — partition-local state not preserved across HTTP exchanges
+- `buffer_input/sizes.test`, `buffer_input/scale.test_slow` — input buffering semantics differ
+
+### Both Transports
+
+```bash
+# Run subprocess then HTTP tests (release)
+make test_all
+
+# Run subprocess then HTTP tests (debug)
+make test_all_debug
+```
+
+### General Notes
 
 Each test file should complete in <10 seconds per suite.
 

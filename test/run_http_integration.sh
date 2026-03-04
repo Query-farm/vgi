@@ -4,18 +4,16 @@
 # Example: ./test/run_http_integration.sh "test/sql/integration/table/*"
 set -euo pipefail
 
-PORT=9878
 VGI_PYTHON_DIR="${VGI_PYTHON_DIR:-$HOME/Development/vgi-python}"
+BUILD_DIR="${BUILD_DIR:-release}"
 FILTER="${1:-test/sql/integration/*}"
 shift 2>/dev/null || true
 
-# Kill any leftover server on our port
-lsof -ti:$PORT 2>/dev/null | xargs kill -9 2>/dev/null || true
-sleep 0.5
+LOG_FILE="/tmp/vgi-http-test-server.log"
 
-# Start HTTP server
+# Start HTTP server with auto-selected port; stdout goes to a pipe so we can read PORT:XXXX
 uv run --project "$VGI_PYTHON_DIR" vgi-serve vgi.examples.worker:ExampleWorker \
-    --http --port $PORT > /tmp/vgi-http-test-server.log 2>&1 &
+    --http --port 0 > "$LOG_FILE" 2>&1 &
 SERVER_PID=$!
 
 cleanup() {
@@ -24,19 +22,29 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Wait for server to be ready
+# Wait for PORT:XXXX line in the log (server prints this on startup)
+PORT=""
 for i in $(seq 1 30); do
-    if curl -sf http://localhost:$PORT/vgi/describe > /dev/null 2>&1; then
-        break
-    fi
     if ! kill -0 "$SERVER_PID" 2>/dev/null; then
         echo "ERROR: Server failed to start. Log:" >&2
-        cat /tmp/vgi-http-test-server.log >&2
+        cat "$LOG_FILE" >&2
         exit 1
+    fi
+    PORT=$(sed -n 's/.*PORT:\([0-9]*\).*/\1/p' "$LOG_FILE" 2>/dev/null | head -1)
+    if [[ -n "$PORT" ]]; then
+        break
     fi
     sleep 0.5
 done
 
+if [[ -z "$PORT" ]]; then
+    echo "ERROR: Timed out waiting for server to report port. Log:" >&2
+    cat "$LOG_FILE" >&2
+    exit 1
+fi
+
+echo "HTTP server running on port $PORT (pid $SERVER_PID)"
+
 # Run tests
 VGI_TEST_WORKER="http://localhost:$PORT/vgi" \
-    ./build/release/test/unittest "$FILTER" "$@"
+    ./build/$BUILD_DIR/test/unittest "$FILTER" "$@"
