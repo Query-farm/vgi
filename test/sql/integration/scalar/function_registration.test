@@ -17,7 +17,7 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
 # ============================================================================
 # Function Inventory
-# All 17 scalar functions must be registered (includes 3 format_number overloads)
+# All 37 scalar functions must be registered (includes overloads)
 # ============================================================================
 
 query I
@@ -25,7 +25,7 @@ SELECT COUNT(*)
 FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'scalar';
 ----
-17
+37
 
 query T
 SELECT function_name
@@ -34,21 +34,41 @@ WHERE database_name = 'example' AND function_type = 'scalar'
 ORDER BY function_name;
 ----
 add_values
+any_mixed
+any_mixed
 bernoulli
 binary_packet
+concat_values
+concat_values
 conditional_message
 double
 format_number
 format_number
 format_number
+geo_centroid_fixed
+geo_centroid_list
+geo_centroid_struct
+geo_distance_fixed
+geo_distance_list
+geo_distance_struct
 hash_seed
 multiply
 multiply_by_setting
 null_handling
+pair_type
+pair_type
+pair_type
 random_bytes
 random_int
 return_secret_value
+smart_format
+smart_format
 sum_values
+type_info
+type_info
+type_info
+type_info
+type_info
 upper_case
 
 # ============================================================================
@@ -115,6 +135,78 @@ FROM duckdb_functions()
 WHERE database_name = 'example' AND function_name = 'double';
 ----
 double	[value]	[ANY]	ANY	CONSISTENT	Doubles numeric values
+
+# ----------------------------------------------------------------------------
+# geo_centroid_fixed — Varargs fixed-size list centroid
+# Parameters: (none positional), varargs=DOUBLE[2] → STRUCT(lat DOUBLE, lon DOUBLE)
+# ----------------------------------------------------------------------------
+
+query TTTTTT
+SELECT function_name, parameters, parameter_types, return_type, stability, description
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_name = 'geo_centroid_fixed';
+----
+geo_centroid_fixed	[]	[]	STRUCT(lat DOUBLE, lon DOUBLE)	CONSISTENT	Centroid of N fixed-size list points
+
+# ----------------------------------------------------------------------------
+# geo_centroid_list — Varargs list centroid
+# Parameters: (none positional), varargs=DOUBLE[] → STRUCT(lat DOUBLE, lon DOUBLE)
+# ----------------------------------------------------------------------------
+
+query TTTTTT
+SELECT function_name, parameters, parameter_types, return_type, stability, description
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_name = 'geo_centroid_list';
+----
+geo_centroid_list	[]	[]	STRUCT(lat DOUBLE, lon DOUBLE)	CONSISTENT	Centroid of N list points
+
+# ----------------------------------------------------------------------------
+# geo_centroid_struct — Varargs struct centroid
+# Parameters: (none positional), varargs=STRUCT(lat DOUBLE, lon DOUBLE) → STRUCT(lat DOUBLE, lon DOUBLE)
+# ----------------------------------------------------------------------------
+
+query TTTTTT
+SELECT function_name, parameters, parameter_types, return_type, stability, description
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_name = 'geo_centroid_struct';
+----
+geo_centroid_struct	[]	[]	STRUCT(lat DOUBLE, lon DOUBLE)	CONSISTENT	Centroid of N struct points
+
+# ----------------------------------------------------------------------------
+# geo_distance_fixed — Distance between two fixed-size list points
+# Parameters: p1 (DOUBLE[2]), p2 (DOUBLE[2]) → DOUBLE
+# ----------------------------------------------------------------------------
+
+query TTTTTT
+SELECT function_name, parameters, parameter_types, return_type, stability, description
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_name = 'geo_distance_fixed';
+----
+geo_distance_fixed	[p1, p2]	['DOUBLE[2]', 'DOUBLE[2]']	DOUBLE	CONSISTENT	Euclidean distance between two fixed-size list points
+
+# ----------------------------------------------------------------------------
+# geo_distance_list — Distance between two list points
+# Parameters: p1 (DOUBLE[]), p2 (DOUBLE[]) → DOUBLE
+# ----------------------------------------------------------------------------
+
+query TTTTTT
+SELECT function_name, parameters, parameter_types, return_type, stability, description
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_name = 'geo_distance_list';
+----
+geo_distance_list	[p1, p2]	['DOUBLE[]', 'DOUBLE[]']	DOUBLE	CONSISTENT	Euclidean distance between two list points
+
+# ----------------------------------------------------------------------------
+# geo_distance_struct — Distance between two struct points
+# Parameters: p1 (STRUCT(lat DOUBLE, lon DOUBLE)), p2 (STRUCT(lat DOUBLE, lon DOUBLE)) → DOUBLE
+# ----------------------------------------------------------------------------
+
+query TTTTTT
+SELECT function_name, parameters, parameter_types, return_type, stability, description
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_name = 'geo_distance_struct';
+----
+geo_distance_struct	[p1, p2]	['STRUCT(lat DOUBLE, lon DOUBLE)', 'STRUCT(lat DOUBLE, lon DOUBLE)']	DOUBLE	CONSISTENT	Euclidean distance between two struct points
 
 # ----------------------------------------------------------------------------
 # format_number — Overloaded function with 3 variants (0, 1, 2 ConstParams)
@@ -242,14 +334,20 @@ upper_case	[value]	[VARCHAR]	VARCHAR	CONSISTENT	Converts string values to upperc
 
 # ============================================================================
 # Varargs
-# Only sum_values declares varargs (accepts variable number of ANY-typed args)
+# Functions with varargs
 # ============================================================================
 
 query TT
 SELECT function_name, varargs
 FROM duckdb_functions()
-WHERE database_name = 'example' AND function_type = 'scalar' AND varargs IS NOT NULL;
+WHERE database_name = 'example' AND function_type = 'scalar' AND varargs IS NOT NULL
+ORDER BY function_name, varargs;
 ----
+concat_values	BIGINT
+concat_values	VARCHAR
+geo_centroid_fixed	DOUBLE[2]
+geo_centroid_list	DOUBLE[]
+geo_centroid_struct	STRUCT(lat DOUBLE, lon DOUBLE)
 sum_values	ANY
 
 # Verify all other scalar functions have no varargs
@@ -258,7 +356,7 @@ SELECT COUNT(*)
 FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'scalar' AND varargs IS NULL;
 ----
-16
+31
 
 # ============================================================================
 # Stability
@@ -279,7 +377,7 @@ SELECT COUNT(*)
 FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'scalar' AND stability = 'CONSISTENT';
 ----
-15
+35
 
 # ============================================================================
 # Cleanup

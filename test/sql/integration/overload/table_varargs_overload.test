@@ -1,0 +1,45 @@
+# name: test/sql/integration/overload/table_varargs_overload.test
+# description: Validates table function overloading by varargs argument type
+# group: [vgi_integration_overload]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# repeat_value — varargs overloaded by argument type (int64 vs string)
+# ============================================================================
+
+# Integer overload: repeat_value(count, int_values...)
+query II
+SELECT * FROM example.repeat_value(3, 10, 20) ORDER BY v0;
+----
+10	20
+10	20
+10	20
+
+# String overload: repeat_value(count, string_values...)
+query TT
+SELECT * FROM example.repeat_value(2, 'a', 'b') ORDER BY v0;
+----
+a	b
+a	b
+
+# Integer overload with 3 values
+query III
+SELECT * FROM example.repeat_value(2, 1, 2, 3) ORDER BY v0;
+----
+1	2	3
+1	2	3
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;

@@ -20,7 +20,7 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
 # ============================================================================
 # Function Inventory
-# 18 pure table functions + 8 table-in-out functions = 26 total table-type functions
+# 23 pure table functions + 8 table-in-out functions = 31 total table-type functions
 # ============================================================================
 
 # Total table-type function count (includes table-in-out)
@@ -29,10 +29,11 @@ SELECT COUNT(*)
 FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'table';
 ----
-26
+31
 
-# The 18 pure table functions (no TABLE parameter type)
-# Note: make_series appears 3 times (3 overloads with different arg counts)
+# The 23 pure table functions (no TABLE parameter type)
+# Note: make_series appears 4 times (4 overloads), make_pairs appears 2 times,
+#       repeat_value appears 2 times
 query T
 SELECT function_name
 FROM duckdb_functions()
@@ -40,6 +41,7 @@ WHERE database_name = 'example' AND function_type = 'table'
 AND function_name IN (
     'constant_columns', 'double_sequence', 'filter_echo',
     'generator_exception', 'logging_generator', 'make_series',
+    'make_pairs', 'repeat_value',
     'named_params_echo', 'nested_sequence', 'partitioned_sequence',
     'projected_data', 'scoped_secret_demo', 'secret_demo', 'sequence',
     'settings_aware', 'struct_settings', 'ten_thousand'
@@ -51,6 +53,9 @@ double_sequence
 filter_echo
 generator_exception
 logging_generator
+make_pairs
+make_pairs
+make_series
 make_series
 make_series
 make_series
@@ -58,6 +63,8 @@ named_params_echo
 nested_sequence
 partitioned_sequence
 projected_data
+repeat_value
+repeat_value
 scoped_secret_demo
 secret_demo
 sequence
@@ -137,16 +144,17 @@ WHERE database_name = 'example' AND function_name = 'named_params_echo';
 named_params_echo	[count, enabled, greeting, multiplier, scale]	[BIGINT, BIGINT, BOOLEAN, DOUBLE, VARCHAR]	Echoes named parameter values in output columns
 
 # ----------------------------------------------------------------------------
-# make_series — Overloaded function with 3 variants (1, 2, 3 positional args)
+# make_series — Overloaded function with 4 variants (3 by arg count, 1 by type)
 # ----------------------------------------------------------------------------
 
 query TTTT
 SELECT function_name, parameters, parameter_types, description
 FROM duckdb_functions()
 WHERE database_name = 'example' AND function_name = 'make_series'
-ORDER BY length(parameters::VARCHAR);
+ORDER BY length(parameters::VARCHAR), parameter_types::VARCHAR;
 ----
 make_series	[count]	[BIGINT]	Generate integers from 0 to count-1
+make_series	[values]	[VARCHAR]	Parse comma-separated integers into rows
 make_series	[start, stop]	[BIGINT, BIGINT]	Generate integers from start to stop-1
 make_series	[start, stop, step]	[BIGINT, BIGINT, BIGINT]	Generate integers from start to stop-1 with step
 
@@ -249,12 +257,15 @@ WHERE database_name = 'example' AND function_type = 'table'
 AND function_name IN (
     'constant_columns', 'double_sequence', 'generator_exception',
     'logging_generator', 'named_params_echo', 'nested_sequence',
-    'partitioned_sequence', 'projected_data', 'sequence',
+    'partitioned_sequence', 'projected_data', 'repeat_value', 'sequence',
     'settings_aware', 'struct_settings', 'ten_thousand'
 )
-AND varargs IS NOT NULL;
+AND varargs IS NOT NULL
+ORDER BY function_name, varargs;
 ----
 constant_columns	ANY
+repeat_value	BIGINT
+repeat_value	VARCHAR
 
 # ============================================================================
 # Categories

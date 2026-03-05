@@ -1,0 +1,52 @@
+# name: test/sql/integration/overload/scalar_varargs_overload.test
+# description: Validates scalar function overloading by varargs column type
+# group: [vgi_integration_overload]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# concat_values — varargs overloaded by column type (int64 vs string)
+# ============================================================================
+
+# Integer columns: sums values and returns as string
+query T
+SELECT example.concat_values(a, b) FROM (VALUES (1, 10), (2, 20), (3, 30)) AS t(a, b) ORDER BY a;
+----
+11
+22
+33
+
+# String columns: concatenates strings
+query T
+SELECT example.concat_values(a, b) FROM (VALUES ('hello', ' world'), ('foo', 'bar')) AS t(a, b) ORDER BY a;
+----
+foobar
+hello world
+
+# Integer columns with 3+ varargs
+query T
+SELECT example.concat_values(a, b, c) FROM (VALUES (1, 10, 100), (2, 20, 200)) AS t(a, b, c) ORDER BY a;
+----
+111
+222
+
+# String columns with 3+ varargs
+query T
+SELECT example.concat_values(a, b, c) FROM (VALUES ('a', 'b', 'c'), ('x', 'y', 'z')) AS t(a, b, c) ORDER BY a;
+----
+abc
+xyz
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;

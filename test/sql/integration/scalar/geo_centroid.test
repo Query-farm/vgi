@@ -1,0 +1,121 @@
+# name: test/sql/integration/scalar/geo_centroid.test
+# description: Tests for VGI geo_centroid scalar functions (struct, list, fixed-size list varargs)
+# group: [vgi_integration_scalar]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# example.geo_centroid_struct — Centroid of N struct points
+# ============================================================================
+
+# Single point centroid (identity)
+query T
+SELECT example.geo_centroid_struct(
+    {lat: 3.0, lon: 4.0}::STRUCT(lat DOUBLE, lon DOUBLE)
+);
+----
+{'lat': 3.0, 'lon': 4.0}
+
+# Two-point centroid
+query T
+SELECT example.geo_centroid_struct(
+    {lat: 0.0, lon: 0.0}::STRUCT(lat DOUBLE, lon DOUBLE),
+    {lat: 4.0, lon: 6.0}::STRUCT(lat DOUBLE, lon DOUBLE)
+);
+----
+{'lat': 2.0, 'lon': 3.0}
+
+# Three-point centroid
+query T
+SELECT example.geo_centroid_struct(
+    {lat: 0.0, lon: 0.0}::STRUCT(lat DOUBLE, lon DOUBLE),
+    {lat: 3.0, lon: 0.0}::STRUCT(lat DOUBLE, lon DOUBLE),
+    {lat: 0.0, lon: 6.0}::STRUCT(lat DOUBLE, lon DOUBLE)
+);
+----
+{'lat': 1.0, 'lon': 2.0}
+
+# Multiple rows from table
+query T
+SELECT example.geo_centroid_struct(
+    {lat: a, lon: b}::STRUCT(lat DOUBLE, lon DOUBLE),
+    {lat: c, lon: d}::STRUCT(lat DOUBLE, lon DOUBLE)
+)
+FROM (VALUES (0.0, 0.0, 4.0, 6.0), (2.0, 2.0, 6.0, 10.0)) t(a, b, c, d);
+----
+{'lat': 2.0, 'lon': 3.0}
+{'lat': 4.0, 'lon': 6.0}
+
+# ============================================================================
+# example.geo_centroid_list — Centroid of N list points
+# ============================================================================
+
+# Single point centroid
+query T
+SELECT example.geo_centroid_list([3.0, 4.0]);
+----
+{'lat': 3.0, 'lon': 4.0}
+
+# Two-point centroid
+query T
+SELECT example.geo_centroid_list([0.0, 0.0], [4.0, 6.0]);
+----
+{'lat': 2.0, 'lon': 3.0}
+
+# Three-point centroid
+query T
+SELECT example.geo_centroid_list([0.0, 0.0], [3.0, 0.0], [0.0, 6.0]);
+----
+{'lat': 1.0, 'lon': 2.0}
+
+# Multiple rows from table
+query T
+SELECT example.geo_centroid_list([a, b], [c, d])
+FROM (VALUES (0.0, 0.0, 4.0, 6.0), (2.0, 2.0, 6.0, 10.0)) t(a, b, c, d);
+----
+{'lat': 2.0, 'lon': 3.0}
+{'lat': 4.0, 'lon': 6.0}
+
+# ============================================================================
+# example.geo_centroid_fixed — Centroid of N fixed-size list points
+# ============================================================================
+
+# Single point centroid
+query T
+SELECT example.geo_centroid_fixed([3.0, 4.0]::DOUBLE[2]);
+----
+{'lat': 3.0, 'lon': 4.0}
+
+# Two-point centroid
+query T
+SELECT example.geo_centroid_fixed([0.0, 0.0]::DOUBLE[2], [4.0, 6.0]::DOUBLE[2]);
+----
+{'lat': 2.0, 'lon': 3.0}
+
+# Three-point centroid
+query T
+SELECT example.geo_centroid_fixed([0.0, 0.0]::DOUBLE[2], [3.0, 0.0]::DOUBLE[2], [0.0, 6.0]::DOUBLE[2]);
+----
+{'lat': 1.0, 'lon': 2.0}
+
+# Multiple rows from table
+query T
+SELECT example.geo_centroid_fixed([a, b]::DOUBLE[2], [c, d]::DOUBLE[2])
+FROM (VALUES (0.0, 0.0, 4.0, 6.0), (2.0, 2.0, 6.0, 10.0)) t(a, b, c, d);
+----
+{'lat': 2.0, 'lon': 3.0}
+{'lat': 4.0, 'lon': 6.0}
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;

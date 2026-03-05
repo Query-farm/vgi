@@ -1,5 +1,5 @@
 # name: test/sql/integration/overload/scalar_overload.test
-# description: Validates scalar function overloading by ConstParam count
+# description: Validates scalar function overloading by ConstParam count and argument type
 # group: [vgi_integration_overload]
 
 require-env VGI_TEST_WORKER
@@ -146,6 +146,180 @@ SELECT example.format_number(2, '$', v) FROM (VALUES (1.5), (2.7), (3.9)) AS t(v
 $1.50
 $2.70
 $3.90
+
+# ============================================================================
+# type_info — column type dispatch (5 overloads, same arg count)
+# ============================================================================
+
+query T
+SELECT example.type_info(42::INTEGER);
+----
+int32
+
+query T
+SELECT example.type_info(42::BIGINT);
+----
+int64
+
+query T
+SELECT example.type_info(42::UINTEGER);
+----
+uint32
+
+query T
+SELECT example.type_info(42::UBIGINT);
+----
+uint64
+
+query T
+SELECT example.type_info('hello');
+----
+varchar
+
+# type_info — multi-row
+
+query T
+SELECT example.type_info(n::INTEGER) FROM example.sequence(3) ORDER BY n;
+----
+int32
+int32
+int32
+
+# type_info — NULL handling
+
+query T
+SELECT example.type_info(NULL::INTEGER);
+----
+NULL
+
+query T
+SELECT example.type_info(NULL::VARCHAR);
+----
+NULL
+
+# type_info — typeof()
+
+query T
+SELECT typeof(example.type_info(42::INTEGER));
+----
+VARCHAR
+
+# ============================================================================
+# smart_format — ConstParam type dispatch (int vs str, same count)
+# ============================================================================
+
+query T
+SELECT example.smart_format(10, 3.14);
+----
+      3.14
+
+query T
+SELECT example.smart_format('$', 3.14);
+----
+$3.14
+
+# smart_format — multi-row
+
+query T
+SELECT example.smart_format(5, n::DOUBLE) FROM example.sequence(3) ORDER BY n;
+----
+  0.0
+  1.0
+  2.0
+
+query T
+SELECT example.smart_format('>', n::DOUBLE) FROM example.sequence(3) ORDER BY n;
+----
+>0.0
+>1.0
+>2.0
+
+# smart_format — NULL handling
+
+query T
+SELECT example.smart_format(10, NULL::DOUBLE);
+----
+NULL
+
+query T
+SELECT example.smart_format('$', NULL::DOUBLE);
+----
+NULL
+
+# ============================================================================
+# pair_type — multi-column type dispatch (3 overloads)
+# ============================================================================
+
+query T
+SELECT example.pair_type(1::BIGINT, 2::BIGINT);
+----
+int+int
+
+query T
+SELECT example.pair_type('a', 'b');
+----
+str+str
+
+query T
+SELECT example.pair_type(1::BIGINT, 'b');
+----
+int+str
+
+# pair_type — multi-row
+
+query T
+SELECT example.pair_type(n, n) FROM example.sequence(3) ORDER BY n;
+----
+int+int
+int+int
+int+int
+
+# pair_type — NULL handling
+
+query T
+SELECT example.pair_type(NULL::BIGINT, 1::BIGINT);
+----
+NULL
+
+query T
+SELECT example.pair_type(NULL::VARCHAR, NULL::VARCHAR);
+----
+NULL
+
+# ============================================================================
+# any_mixed — AnyArrow + fixed type dispatch (2 overloads)
+# ============================================================================
+
+query T
+SELECT example.any_mixed(3.14, 42::BIGINT);
+----
+any+int: 42
+
+query T
+SELECT example.any_mixed(3.14, 'hello');
+----
+any+str: hello
+
+# any_mixed — multi-row
+
+query T
+SELECT example.any_mixed(n::DOUBLE, n) FROM example.sequence(3) ORDER BY n;
+----
+any+int: 0
+any+int: 1
+any+int: 2
+
+# any_mixed — NULL handling
+
+query T
+SELECT example.any_mixed(1.0, NULL::BIGINT);
+----
+NULL
+
+query T
+SELECT example.any_mixed(1.0, NULL::VARCHAR);
+----
+NULL
 
 # ============================================================================
 # Cleanup

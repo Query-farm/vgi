@@ -1,5 +1,5 @@
 # name: test/sql/integration/overload/table_overload.test
-# description: Validates table function overloading by positional arg count
+# description: Validates table function overloading by positional arg count and type
 # group: [vgi_integration_overload]
 
 require-env VGI_TEST_WORKER
@@ -115,6 +115,72 @@ query II
 SELECT COUNT(*), SUM(value) FROM example.make_series(2000);
 ----
 2000	1999000
+
+# ============================================================================
+# make_series — type dispatch: int(5) vs string('10,20,30')
+# Same 1-arg count, different arg type
+# ============================================================================
+
+# int arg → count overload
+query I
+SELECT * FROM example.make_series(3) ORDER BY value;
+----
+0
+1
+2
+
+# string arg → CSV overload
+query I
+SELECT * FROM example.make_series('10,20,30') ORDER BY value;
+----
+10
+20
+30
+
+query I
+SELECT * FROM example.make_series('100') ORDER BY value;
+----
+100
+
+query I
+SELECT COUNT(*) FROM example.make_series('1,2,3,4,5');
+----
+5
+
+# ============================================================================
+# make_pairs — type dispatch: int(start,stop) vs str(prefix,suffix)
+# Same 2-arg count, different arg types
+# ============================================================================
+
+# int args → integer pairs (i, i*2)
+query II
+SELECT * FROM example.make_pairs(1, 4) ORDER BY a;
+----
+1	2
+2	4
+3	6
+
+# string args → string pairs (prefix+i, suffix+i)
+query TT
+SELECT * FROM example.make_pairs('row_', '_end') ORDER BY a;
+----
+row_0	_end0
+row_1	_end1
+row_2	_end2
+row_3	_end3
+row_4	_end4
+
+# make_pairs int — edge case: empty range
+query I
+SELECT COUNT(*) FROM example.make_pairs(5, 5);
+----
+0
+
+# make_pairs int — aggregation
+query II
+SELECT SUM(a), SUM(b) FROM example.make_pairs(0, 5);
+----
+10	20
 
 # ============================================================================
 # Cleanup

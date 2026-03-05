@@ -337,9 +337,11 @@ FunctionArgumentTypes ParseFunctionArgumentSchema(ClientContext &context,
 		}
 
 		if (is_varargs) {
-			// Varargs field - set flag and type (varargs accepts ANY type)
+			// Varargs field - set flag and use declared type (or ANY for untyped/any)
 			result.has_varargs = true;
-			result.varargs_type = LogicalType::ANY;
+			result.varargs_type = (is_any_type || duckdb_type == LogicalType::SQLNULL)
+			                          ? LogicalType::ANY
+			                          : duckdb_type;
 			// Don't add varargs to positional_types - it's a sentinel
 		} else if (is_table_input) {
 			// Table input field - record position and name for table-in-out function registration
