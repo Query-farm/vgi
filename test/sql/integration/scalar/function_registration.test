@@ -17,7 +17,7 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
 # ============================================================================
 # Function Inventory
-# All 37 scalar functions must be registered (includes overloads)
+# All 38 scalar functions must be registered (includes overloads)
 # ============================================================================
 
 query I
@@ -25,7 +25,7 @@ SELECT COUNT(*)
 FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'scalar';
 ----
-37
+38
 
 query T
 SELECT function_name
@@ -70,6 +70,7 @@ type_info
 type_info
 type_info
 upper_case
+whoami
 
 # ============================================================================
 # Per-function Registration
@@ -356,7 +357,7 @@ SELECT COUNT(*)
 FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'scalar' AND varargs IS NULL;
 ----
-31
+32
 
 # ============================================================================
 # Stability
@@ -377,7 +378,7 @@ SELECT COUNT(*)
 FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'scalar' AND stability = 'CONSISTENT';
 ----
-35
+36
 
 # ============================================================================
 # Cleanup
