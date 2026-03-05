@@ -20,7 +20,7 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
 # ============================================================================
 # Function Inventory
-# 23 pure table functions + 8 table-in-out functions = 31 total table-type functions
+# 25 pure table functions + 8 table-in-out functions = 33 total table-type functions
 # ============================================================================
 
 # Total table-type function count (includes table-in-out)
@@ -29,10 +29,10 @@ SELECT COUNT(*)
 FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'table';
 ----
-31
+33
 
-# The 23 pure table functions (no TABLE parameter type)
-# Note: make_series appears 4 times (4 overloads), make_pairs appears 2 times,
+# The 25 pure table functions (no TABLE parameter type)
+# Note: make_series appears 5 times (5 overloads), make_pairs appears 3 times,
 #       repeat_value appears 2 times
 query T
 SELECT function_name
@@ -55,6 +55,8 @@ generator_exception
 logging_generator
 make_pairs
 make_pairs
+make_pairs
+make_series
 make_series
 make_series
 make_series
@@ -144,7 +146,7 @@ WHERE database_name = 'example' AND function_name = 'named_params_echo';
 named_params_echo	[count, enabled, greeting, multiplier, scale]	[BIGINT, BIGINT, BOOLEAN, DOUBLE, VARCHAR]	Echoes named parameter values in output columns
 
 # ----------------------------------------------------------------------------
-# make_series — Overloaded function with 4 variants (3 by arg count, 1 by type)
+# make_series — Overloaded function with 5 variants (3 by arg count, 2 by type)
 # ----------------------------------------------------------------------------
 
 query TTTT
@@ -153,10 +155,25 @@ FROM duckdb_functions()
 WHERE database_name = 'example' AND function_name = 'make_series'
 ORDER BY length(parameters::VARCHAR), parameter_types::VARCHAR;
 ----
+make_series	[step]	[DOUBLE]	Generate 10 float values with given step size
 make_series	[count]	[BIGINT]	Generate integers from 0 to count-1
 make_series	[values]	[VARCHAR]	Parse comma-separated integers into rows
 make_series	[start, stop]	[BIGINT, BIGINT]	Generate integers from start to stop-1
 make_series	[start, stop, step]	[BIGINT, BIGINT, BIGINT]	Generate integers from start to stop-1 with step
+
+# ----------------------------------------------------------------------------
+# make_pairs — Overloaded function with 3 variants (by argument type)
+# ----------------------------------------------------------------------------
+
+query TTTT
+SELECT function_name, parameters, parameter_types, description
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_name = 'make_pairs'
+ORDER BY parameter_types::VARCHAR;
+----
+make_pairs	[start, stop]	[BIGINT, BIGINT]	Generate integer pairs (i, i*2)
+make_pairs	[start, label]	[BIGINT, VARCHAR]	Generate mixed int/string pairs
+make_pairs	[prefix, suffix]	[VARCHAR, VARCHAR]	Generate string pairs with prefix and suffix
 
 # ----------------------------------------------------------------------------
 # nested_sequence — Struct and list output columns

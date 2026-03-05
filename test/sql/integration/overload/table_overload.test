@@ -183,6 +183,81 @@ SELECT SUM(a), SUM(b) FROM example.make_pairs(0, 5);
 10	20
 
 # ============================================================================
+# make_pairs — mixed-type dispatch: int + str (mirrors scalar pair_type int+str)
+# ============================================================================
+
+# int+str args → mixed pairs (a: int, b: labeled string)
+query IT
+SELECT * FROM example.make_pairs(10, 'item_') ORDER BY a;
+----
+10	item_0
+11	item_1
+12	item_2
+13	item_3
+14	item_4
+
+# Verify all three overloads still work (regression)
+query II
+SELECT * FROM example.make_pairs(1, 3) ORDER BY a;
+----
+1	2
+2	4
+
+query TT
+SELECT * FROM example.make_pairs('x_', '_y') ORDER BY a;
+----
+x_0	_y0
+x_1	_y1
+x_2	_y2
+x_3	_y3
+x_4	_y4
+
+# aggregation
+query I
+SELECT COUNT(*) FROM example.make_pairs(0, 'test_');
+----
+5
+
+# ============================================================================
+# make_series — 3-way type dispatch at 1-arg count: int, string, float
+# ============================================================================
+
+# float arg → step overload (10 values)
+query R
+SELECT * FROM example.make_series(0.5::DOUBLE) ORDER BY value;
+----
+0.0
+0.5
+1.0
+1.5
+2.0
+2.5
+3.0
+3.5
+4.0
+4.5
+
+query I
+SELECT COUNT(*) FROM example.make_series(2.5::DOUBLE);
+----
+10
+
+# Verify all three 1-arg overloads coexist
+query I
+SELECT * FROM example.make_series(3) ORDER BY value;
+----
+0
+1
+2
+
+query I
+SELECT * FROM example.make_series('10,20,30') ORDER BY value;
+----
+10
+20
+30
+
+# ============================================================================
 # Cleanup
 # ============================================================================
 
