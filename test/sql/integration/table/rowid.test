@@ -1,0 +1,126 @@
+# name: test/sql/integration/table/rowid.test
+# description: Test row_id column support for VGI tables
+# group: [vgi_integration_table]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# Column position tests — row_id at different positions
+# ============================================================================
+
+# rowid_first: row_id at column index 0
+query I
+SELECT rowid FROM example.data.rowid_first LIMIT 5;
+----
+0
+1
+2
+3
+4
+
+# rowid_middle: row_id at column index 1
+query I
+SELECT rowid FROM example.data.rowid_middle LIMIT 5;
+----
+0
+1
+2
+3
+4
+
+# rowid_last: row_id at column index 2
+query I
+SELECT rowid FROM example.data.rowid_last LIMIT 5;
+----
+0
+1
+2
+3
+4
+
+# ============================================================================
+# SELECT * should NOT include row_id
+# ============================================================================
+
+query TT
+SELECT * FROM example.data.rowid_first LIMIT 3;
+----
+item_0	val_0
+item_1	val_1
+item_2	val_2
+
+# ============================================================================
+# Mixed query: rowid + physical columns
+# ============================================================================
+
+query ITT
+SELECT rowid, name, value FROM example.data.rowid_first LIMIT 3;
+----
+0	item_0	val_0
+1	item_1	val_1
+2	item_2	val_2
+
+# ============================================================================
+# DESCRIBE should show only physical columns (not row_id)
+# ============================================================================
+
+query IIIIII
+DESCRIBE example.data.rowid_first;
+----
+name	VARCHAR	YES	NULL	NULL	NULL
+value	VARCHAR	YES	NULL	NULL	NULL
+
+# ============================================================================
+# Data type tests
+# ============================================================================
+
+# String-typed rowid
+query T
+SELECT rowid FROM example.data.rowid_string LIMIT 3;
+----
+rid_0
+rid_1
+rid_2
+
+# Struct-typed rowid
+query T
+SELECT rowid FROM example.data.rowid_struct LIMIT 3;
+----
+{'a': 0, 'b': s_0}
+{'a': 1, 'b': s_1}
+{'a': 2, 'b': s_2}
+
+# Access struct fields on rowid
+query IT
+SELECT rowid.a, rowid.b FROM example.data.rowid_struct LIMIT 3;
+----
+0	s_0
+1	s_1
+2	s_2
+
+# ============================================================================
+# Query operation tests
+# ============================================================================
+
+# Filter on rowid
+query I
+SELECT rowid FROM example.data.rowid_first WHERE rowid = 5;
+----
+5
+
+# Order by rowid DESC
+query I
+SELECT rowid FROM example.data.rowid_first ORDER BY rowid DESC LIMIT 5;
+----
+19
+18
+17
+16
+15

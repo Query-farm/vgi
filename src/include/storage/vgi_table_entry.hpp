@@ -22,8 +22,11 @@ public:
 
 	TableStorageInfo GetStorageInfo(ClientContext &context) override;
 
-	// VGI tables don't support rowid — return no virtual columns
+	// Virtual columns: return rowid if table has a row_id column
 	virtual_column_map_t GetVirtualColumns() const override;
+
+	// Row ID columns: return COLUMN_IDENTIFIER_ROW_ID if table has a row_id column
+	vector<column_t> GetRowIdColumns() const override;
 
 	const vgi::VgiTableInfo &GetTableInfo() const {
 		return table_info_;
@@ -36,6 +39,7 @@ public:
 private:
 	vgi::VgiTableInfo table_info_;
 	Catalog &catalog_;
+	LogicalType rowid_type_ = LogicalType::INVALID;
 };
 
 } // namespace duckdb

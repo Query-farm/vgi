@@ -20,7 +20,7 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
 # ============================================================================
 # Function Inventory
-# 25 pure table functions + 8 table-in-out functions = 33 total table-type functions
+# 26 pure table functions + 8 table-in-out functions = 34 total table-type functions
 # ============================================================================
 
 # Total table-type function count (includes table-in-out)
@@ -29,9 +29,9 @@ SELECT COUNT(*)
 FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'table';
 ----
-33
+34
 
-# The 25 pure table functions (no TABLE parameter type)
+# The 26 pure table functions (no TABLE parameter type)
 # Note: make_series appears 5 times (5 overloads), make_pairs appears 3 times,
 #       repeat_value appears 2 times
 query T
@@ -43,7 +43,7 @@ AND function_name IN (
     'generator_exception', 'logging_generator', 'make_series',
     'make_pairs', 'repeat_value',
     'named_params_echo', 'nested_sequence', 'partitioned_sequence',
-    'projected_data', 'scoped_secret_demo', 'secret_demo', 'sequence',
+    'projected_data', 'rowid_sequence', 'scoped_secret_demo', 'secret_demo', 'sequence',
     'settings_aware', 'struct_settings', 'ten_thousand'
 )
 ORDER BY function_name;
@@ -67,6 +67,7 @@ partitioned_sequence
 projected_data
 repeat_value
 repeat_value
+rowid_sequence
 scoped_secret_demo
 secret_demo
 sequence

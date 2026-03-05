@@ -117,6 +117,14 @@ struct VgiTableFunctionBindData : public TableFunctionData {
 
 	vector<string> all_column_names;
 
+	// Table entry reference (for get_bind_info callback; null for direct vgi_table_function)
+	optional_ptr<TableCatalogEntry> table_entry;
+
+	// Row ID column: index in worker's output schema marked is_row_id (-1 = none)
+	int rowid_worker_col_index = -1;
+	// DuckDB type for the row_id column (INVALID when rowid_worker_col_index == -1)
+	LogicalType rowid_type = LogicalType::INVALID;
+
 	// Cached bind request for lazy cardinality RPC (populated during bind)
 	std::vector<uint8_t> bind_request_bytes;
 	std::vector<uint8_t> bind_opaque_data;
@@ -232,6 +240,15 @@ double VgiTableFunctionProgress(ClientContext &context, const FunctionData *bind
 
 //! ToString function - returns info for EXPLAIN output
 InsertionOrderPreservingMap<string> VgiTableFunctionToString(TableFunctionToStringInput &input);
+
+//! Get bind info callback for returning table entry reference
+BindInfo VgiTableScanGetBindInfo(const optional_ptr<FunctionData> bind_data_p);
+
+//! Virtual column callback for row_id support on scan functions
+virtual_column_map_t VgiTableScanGetVirtualColumns(ClientContext &context, optional_ptr<FunctionData> bind_data_p);
+
+//! Row ID column callback for row_id support on scan functions
+vector<column_t> VgiTableScanGetRowIdColumns(ClientContext &context, optional_ptr<FunctionData> bind_data_p);
 
 } // namespace vgi
 } // namespace duckdb

@@ -60,5 +60,12 @@ constexpr const char *VGI_CONST_METADATA_KEY = "vgi_const";
 // Value for VGI_CONST_METADATA_KEY indicating the parameter is constant
 constexpr const char *VGI_CONST_TRUE_VALUE = "true";
 
+// ----------------------------------------------------------------------------
+// Row ID Metadata
+// ----------------------------------------------------------------------------
+// Arrow field metadata key indicating the field is the table's row identifier.
+// Presence of this key is sufficient — no value check needed.
+constexpr const char *VGI_ROW_ID_METADATA_KEY = "is_row_id";
+
 } // namespace vgi
 } // namespace duckdb

@@ -11,6 +11,7 @@
 #include "vgi_exception.hpp"
 #include "vgi_http_client.hpp"
 #include "vgi_logging.hpp"
+#include "vgi_protocol_constants.hpp"
 #include "vgi_rpc_client.hpp"
 #include "vgi_rpc_types.hpp"
 #include "vgi_transport.hpp"
@@ -704,6 +705,18 @@ VgiTableInfo ParseTableInfo(const std::shared_ptr<arrow::RecordBatch> &batch, in
 	auto columns_data = row["columns"].value_not_null<std::vector<uint8_t>>();
 	info.arrow_schema = DeserializeSchema(columns_data);
 
+	// Detect is_row_id field metadata
+	for (int i = 0; i < info.arrow_schema->num_fields(); i++) {
+		auto &field = info.arrow_schema->field(i);
+		if (field->HasMetadata() && field->metadata()->FindKey(VGI_ROW_ID_METADATA_KEY) >= 0) {
+			if (info.row_id_column >= 0) {
+				throw InvalidInputException("Table '%s' has multiple is_row_id columns — at most one is allowed",
+				                            info.name);
+			}
+			info.row_id_column = i;
+		}
+	}
+
 	// Parse constraints (non-nullable arrays per protocol)
 	auto not_null = row["not_null_constraints"].value_not_null<std::vector<int32_t>>();
 	info.not_null_constraints = std::vector<int>(not_null.begin(), not_null.end());
@@ -841,14 +854,36 @@ VgiScanFunctionResult ParseScanFunctionResult(ClientContext &context, const std:
 // DuckDB type conversion
 // ============================================================================
 
-CreateTableInfo CreateTableInfoFromVgiTable(ClientContext &context, const VgiTableInfo &table_info,
+CreateTableInfo CreateTableInfoFromVgiTable(ClientContext &context, VgiTableInfo &table_info,
                                             const std::string &schema_name) {
 	CreateTableInfo create_info;
 	create_info.table = table_info.name;
 	create_info.schema = schema_name;
 
 	if (table_info.arrow_schema) {
-		ArrowSchemaToColumnList(context, table_info.arrow_schema, create_info.columns);
+		if (table_info.row_id_column >= 0) {
+			// Convert the row_id field type to DuckDB LogicalType
+			auto rowid_field = table_info.arrow_schema->field(table_info.row_id_column);
+			auto rowid_schema = arrow::schema({rowid_field});
+			ArrowSchemaWrapper c_schema;
+			ArrowTableSchema arrow_table;
+			vector<LogicalType> types;
+			vector<string> names;
+			ArrowSchemaToDuckDBTypes(context, rowid_schema, c_schema, arrow_table, types, names);
+			table_info.rowid_type = types[0];
+
+			// Build filtered schema excluding the row_id field
+			std::vector<std::shared_ptr<arrow::Field>> filtered_fields;
+			for (int i = 0; i < table_info.arrow_schema->num_fields(); i++) {
+				if (i != table_info.row_id_column) {
+					filtered_fields.push_back(table_info.arrow_schema->field(i));
+				}
+			}
+			auto filtered_schema = arrow::schema(filtered_fields);
+			ArrowSchemaToColumnList(context, filtered_schema, create_info.columns);
+		} else {
+			ArrowSchemaToColumnList(context, table_info.arrow_schema, create_info.columns);
+		}
 	}
 
 	return create_info;

@@ -17,6 +17,9 @@ namespace duckdb {
 VgiTableEntry::VgiTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateTableInfo &info,
                              const vgi::VgiTableInfo &table_info)
     : TableCatalogEntry(catalog, schema, info), table_info_(table_info), catalog_(catalog) {
+	if (table_info_.row_id_column >= 0) {
+		rowid_type_ = table_info_.rowid_type;
+	}
 }
 
 VgiTableEntry::~VgiTableEntry() = default;
@@ -55,6 +58,14 @@ TableFunction VgiTableEntry::GetScanFunction(ClientContext &context, unique_ptr<
 	std::vector<vgi::VgiSecretRequirement> scan_required_secrets;
 	auto func_entry = catalog_.GetEntry<TableFunctionCatalogEntry>(
 	    context, ParentSchema().name, scan_result.function_name, OnEntryNotFound::RETURN_NULL);
+	if (!func_entry) {
+		// Function may be in a different schema (e.g., main) than the table's schema (e.g., data)
+		auto &default_schema = vgi_catalog.attach_result()->default_schema;
+		if (default_schema != ParentSchema().name) {
+			func_entry = catalog_.GetEntry<TableFunctionCatalogEntry>(
+			    context, default_schema, scan_result.function_name, OnEntryNotFound::RETURN_NULL);
+		}
+	}
 	if (func_entry) {
 		for (auto &tf : func_entry->functions.functions) {
 			has_projection_pushdown = has_projection_pushdown || tf.projection_pushdown;
@@ -78,6 +89,15 @@ TableFunction VgiTableEntry::GetScanFunction(ClientContext &context, unique_ptr<
 	scan_bind_data->projection_pushdown = has_projection_pushdown;
 	scan_bind_data->required_secrets = scan_required_secrets;
 
+	// Store table entry reference for get_bind_info callback
+	scan_bind_data->table_entry = this;
+
+	// Pass row_id info to bind data
+	if (table_info_.row_id_column >= 0) {
+		scan_bind_data->rowid_worker_col_index = table_info_.row_id_column;
+		scan_bind_data->rowid_type = table_info_.rowid_type;
+	}
+
 	// Perform bind handshake with the worker (discovers output schema)
 	vector<LogicalType> return_types;
 	vector<string> names;
@@ -93,6 +113,14 @@ TableFunction VgiTableEntry::GetScanFunction(ClientContext &context, unique_ptr<
 	func.cardinality = vgi::VgiTableFunctionCardinality;
 	func.table_scan_progress = vgi::VgiTableFunctionProgress;
 	func.to_string = vgi::VgiTableFunctionToString;
+	func.get_bind_info = vgi::VgiTableScanGetBindInfo;
+
+	// Set virtual column callbacks for row_id support
+	if (table_info_.row_id_column >= 0) {
+		func.get_virtual_columns = vgi::VgiTableScanGetVirtualColumns;
+		func.get_row_id_columns = vgi::VgiTableScanGetRowIdColumns;
+	}
+
 	return func;
 }
 
@@ -103,7 +131,18 @@ TableStorageInfo VgiTableEntry::GetStorageInfo(ClientContext &context) {
 }
 
 virtual_column_map_t VgiTableEntry::GetVirtualColumns() const {
-	// VGI tables are remote — they don't have a rowid or other virtual columns
+	if (rowid_type_ != LogicalType::INVALID) {
+		virtual_column_map_t result;
+		result.insert({COLUMN_IDENTIFIER_ROW_ID, TableColumn("rowid", rowid_type_)});
+		return result;
+	}
+	return {};
+}
+
+vector<column_t> VgiTableEntry::GetRowIdColumns() const {
+	if (rowid_type_ != LogicalType::INVALID) {
+		return {COLUMN_IDENTIFIER_ROW_ID};
+	}
 	return {};
 }
 

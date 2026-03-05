@@ -73,6 +73,16 @@ void PerformVgiTableFunctionBind(ClientContext &context, VgiTableFunctionBindDat
 		throw IOException("Failed to convert output schema for function '%s': %s", bind_data.function_name, e.what());
 	}
 
+	// Strip row_id column from return_types/names so DuckDB's physical column list excludes it.
+	// The full schema (including row_id) is retained in arrow_table/c_schema for ArrowToDuckDB.
+	if (bind_data.rowid_worker_col_index >= 0) {
+		auto idx = static_cast<size_t>(bind_data.rowid_worker_col_index);
+		if (idx < return_types.size()) {
+			return_types.erase(return_types.begin() + idx);
+			names.erase(names.begin() + idx);
+		}
+	}
+
 	bind_data.all_column_names = names;
 
 	VGI_LOG(context, "table_function.bind_result",
@@ -423,7 +433,17 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 	if (bind_data.projection_pushdown) {
 		projection_ids.reserve(input.column_ids.size());
 		for (auto col_id : input.column_ids) {
-			projection_ids.push_back(static_cast<int32_t>(col_id));
+			if (col_id == COLUMN_IDENTIFIER_ROW_ID && bind_data.rowid_worker_col_index >= 0) {
+				// Map rowid request to the actual worker column index
+				projection_ids.push_back(static_cast<int32_t>(bind_data.rowid_worker_col_index));
+			} else if (bind_data.rowid_worker_col_index >= 0 &&
+			           col_id != COLUMN_IDENTIFIER_ROW_ID &&
+			           col_id >= static_cast<idx_t>(bind_data.rowid_worker_col_index)) {
+				// Shift to account for the excluded row_id column in worker's schema
+				projection_ids.push_back(static_cast<int32_t>(col_id + 1));
+			} else {
+				projection_ids.push_back(static_cast<int32_t>(col_id));
+			}
 		}
 	}
 
@@ -484,6 +504,20 @@ unique_ptr<LocalTableFunctionState> VgiTableFunctionInitLocal(ExecutionContext &
 	// This tells ArrowToDuckDB which columns to extract from the Arrow arrays
 	if (bind_data.projection_pushdown) {
 		local_state->column_ids = input.column_ids;
+		// When a rowid column exists, remap column_ids to match the worker's full schema indices.
+		// COLUMN_IDENTIFIER_ROW_ID maps to the actual worker column index.
+		// Physical columns at or after the rowid position shift by +1.
+		// This allows ArrowToDuckDB to look up the correct type info in arrow_convert_data
+		// (which was built from the full worker schema including the rowid column).
+		if (bind_data.rowid_worker_col_index >= 0) {
+			for (auto &col_id : local_state->column_ids) {
+				if (col_id == COLUMN_IDENTIFIER_ROW_ID) {
+					col_id = static_cast<idx_t>(bind_data.rowid_worker_col_index);
+				} else if (col_id >= static_cast<idx_t>(bind_data.rowid_worker_col_index)) {
+					col_id += 1;
+				}
+			}
+		}
 	}
 
 	// Try to claim the primary connection from global_state (thread-safe check-and-move)
@@ -601,8 +635,16 @@ void VgiTableFunctionScan(ClientContext &context, TableFunctionInput &input, Dat
 	// Convert Arrow data to DuckDB using ArrowTableFunction::ArrowToDuckDB
 	// Pass true if projection pushdown is enabled (column_ids was set in InitLocal)
 	if (output_size > 0) {
+		// When projection pushdown is enabled, column_ids were already remapped in InitLocal
+		// to account for the rowid column gap. Don't pass rowid_column_index since the worker
+		// returns only the projected columns and ArrowToDuckDB would incorrectly shift array indices.
+		// When projection pushdown is disabled, the worker returns ALL columns (including rowid),
+		// so we pass rowid_column_index to let ArrowToDuckDB skip the rowid column.
+		idx_t rowid_col = (!bind_data.projection_pushdown && bind_data.rowid_worker_col_index >= 0)
+		                      ? static_cast<idx_t>(bind_data.rowid_worker_col_index)
+		                      : COLUMN_IDENTIFIER_ROW_ID;
 		ArrowTableFunction::ArrowToDuckDB(local_state, bind_data.arrow_table.GetColumns(), output,
-		                                  bind_data.projection_pushdown);
+		                                  bind_data.projection_pushdown, rowid_col);
 	}
 
 	local_state.chunk_offset += output.size();
@@ -681,6 +723,36 @@ InsertionOrderPreservingMap<string> VgiTableFunctionToString(TableFunctionToStri
 	result["Worker"] = bind_data.worker_path;
 	result["Function"] = bind_data.function_name;
 	return result;
+}
+
+// ============================================================================
+// Virtual Column Callbacks for Row ID Support
+// ============================================================================
+
+BindInfo VgiTableScanGetBindInfo(const optional_ptr<FunctionData> bind_data_p) {
+	auto &bind_data = bind_data_p->Cast<VgiTableFunctionBindData>();
+	if (bind_data.table_entry) {
+		return BindInfo(const_cast<TableCatalogEntry &>(*bind_data.table_entry));
+	}
+	return BindInfo(ScanType::EXTERNAL);
+}
+
+virtual_column_map_t VgiTableScanGetVirtualColumns(ClientContext &context, optional_ptr<FunctionData> bind_data_p) {
+	auto &bind_data = bind_data_p->Cast<VgiTableFunctionBindData>();
+	if (bind_data.rowid_worker_col_index < 0) {
+		return {};
+	}
+	virtual_column_map_t result;
+	result.insert({COLUMN_IDENTIFIER_ROW_ID, TableColumn("rowid", bind_data.rowid_type)});
+	return result;
+}
+
+vector<column_t> VgiTableScanGetRowIdColumns(ClientContext &context, optional_ptr<FunctionData> bind_data_p) {
+	auto &bind_data = bind_data_p->Cast<VgiTableFunctionBindData>();
+	if (bind_data.rowid_worker_col_index < 0) {
+		return {};
+	}
+	return {COLUMN_IDENTIFIER_ROW_ID};
 }
 
 } // namespace vgi

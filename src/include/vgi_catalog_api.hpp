@@ -117,6 +117,11 @@ struct VgiTableInfo {
 	std::shared_ptr<arrow::Schema> arrow_schema;
 	std::string comment;
 	std::map<std::string, std::string> tags;
+	// Row ID column: index in arrow_schema marked is_row_id (-1 = none)
+	int row_id_column = -1;
+	// DuckDB type for the row_id column (INVALID when row_id_column == -1)
+	LogicalType rowid_type = LogicalType::INVALID;
+
 	// Constraint indices
 	std::vector<int> not_null_constraints;
 	std::vector<std::vector<int>> unique_constraints;
@@ -369,7 +374,7 @@ std::map<std::string, std::map<std::string, Value>> ExtractVgiSecrets(
 
 // Convert VgiTableInfo to DuckDB CreateTableInfo.
 // This handles converting the Arrow schema to DuckDB column definitions.
-CreateTableInfo CreateTableInfoFromVgiTable(ClientContext &context, const VgiTableInfo &table_info,
+CreateTableInfo CreateTableInfoFromVgiTable(ClientContext &context, VgiTableInfo &table_info,
                                             const std::string &schema_name);
 
 } // namespace vgi
