@@ -137,6 +137,44 @@ SELECT * FROM example.sequence(10, batch_size := 1000) WHERE n > 5 AND n < 5;
 ----
 
 # ============================================================================
+# sequence - OR (disjunction) filters
+# ============================================================================
+
+# OR filter: n = 1 OR n = 9
+query I
+SELECT * FROM example.sequence(10, batch_size := 1000) WHERE n = 1 OR n = 9;
+----
+1
+9
+
+# OR filter: n < 2 OR n > 7
+query I
+SELECT * FROM example.sequence(10, batch_size := 1000) WHERE n < 2 OR n > 7;
+----
+0
+1
+8
+9
+
+# OR filter with three branches
+query I
+SELECT * FROM example.sequence(10, batch_size := 1000) WHERE n = 0 OR n = 5 OR n = 9;
+----
+0
+5
+9
+
+# ============================================================================
+# sequence - IS NULL filter
+# ============================================================================
+
+# IS NULL on non-nullable column (pushes down, evaluates to 0 rows)
+query I
+SELECT COUNT(*) FROM example.sequence(10, batch_size := 1000) WHERE n IS NULL;
+----
+0
+
+# ============================================================================
 # sequence - Combined with aggregations
 # ============================================================================
 
@@ -294,6 +332,19 @@ query II
 SELECT n, metadata.label FROM example.nested_sequence(10, batch_size := 1000) WHERE metadata.label = 'row_5';
 ----
 5	row_5
+
+# OR filter on struct.index
+query II
+SELECT n, metadata.index FROM example.nested_sequence(10, batch_size := 1000) WHERE metadata.index = 2 OR metadata.index = 8;
+----
+2	2
+8	8
+
+# IS NULL on struct field (non-nullable, 0 rows)
+query I
+SELECT COUNT(*) FROM example.nested_sequence(10, batch_size := 1000) WHERE metadata.index IS NULL;
+----
+0
 
 # Combined filters: top-level and struct field
 query II
