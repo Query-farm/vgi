@@ -9,6 +9,7 @@
 #include "yyjson.hpp"
 
 #include "vgi_logging.hpp"
+#include "duckdb/logging/logger.hpp"
 
 #include "duckdb/catalog/catalog_transaction.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
@@ -33,6 +34,9 @@ using namespace duckdb_yyjson; // NOLINT
 
 namespace duckdb {
 namespace vgi {
+
+// Forward declaration (defined later, used by both device code and PKCE flows)
+static std::string GetResourceDisplayName(const OAuthResourceMetadata &meta);
 
 //===--------------------------------------------------------------------===//
 // OAuthTokenSet
@@ -694,14 +698,14 @@ OAuthTokenSet VgiTokenManager::PerformDeviceCodeFlow(const OAuthChallenge &chall
 		interval = yyjson_get_int(iv_val);
 	}
 
-	// Step 2: Print user instructions (always to stderr, not gated by VGI_STDERR_LOG)
-	fprintf(stderr, "\n[VGI] Authentication required.\n");
-	fprintf(stderr, "[VGI] Visit: %s\n", verification_uri.c_str());
-	fprintf(stderr, "[VGI] Enter code: %s\n", user_code.c_str());
+	// Step 2: Print user instructions via DuckDB warning log
+	std::string auth_msg = "Authentication required for " + GetResourceDisplayName(resource_meta) + ".\n"
+	    "Visit: " + verification_uri + "\n"
+	    "Enter code: " + user_code;
 	if (!verification_uri_complete.empty()) {
-		fprintf(stderr, "[VGI] Or visit: %s\n", verification_uri_complete.c_str());
+		auth_msg += "\nOr visit: " + verification_uri_complete;
 	}
-	fprintf(stderr, "\n");
+	DUCKDB_LOG_WARNING(context, auth_msg);
 
 	// Step 3: Poll token endpoint
 	EnforceHttpsUrl(server_meta.token_endpoint, "token endpoint");
@@ -738,7 +742,7 @@ OAuthTokenSet VgiTokenManager::PerformDeviceCodeFlow(const OAuthChallenge &chall
 		auto now = std::chrono::steady_clock::now();
 		auto since_last = std::chrono::duration_cast<std::chrono::seconds>(now - last_status_print).count();
 		if (since_last >= 30) {
-			fprintf(stderr, "[VGI] Still waiting for authentication...\n");
+			DUCKDB_LOG_WARNING(context, "Still waiting for authentication...");
 			last_status_print = now;
 		}
 
@@ -764,7 +768,7 @@ OAuthTokenSet VgiTokenManager::PerformDeviceCodeFlow(const OAuthChallenge &chall
 			// Success
 			auto tokens = ParseTokenResponse(resp.body, "device code token response");
 			tokens.use_id_token = resource_meta.use_id_token_as_bearer;
-			fprintf(stderr, "[VGI] Authentication successful.\n");
+			DUCKDB_LOG_WARNING(context, "Authentication successful.");
 			return tokens;
 		}
 
@@ -1212,9 +1216,8 @@ OAuthTokenSet VgiTokenManager::PerformPKCEFlow(const OAuthChallenge &challenge,
 	}
 
 	// Always print the URL so user can manually navigate if browser fails
-	fprintf(stderr, "\n[VGI] Authentication required. Opening browser...\n");
-	fprintf(stderr, "[VGI] If the browser doesn't open, visit this URL:\n");
-	fprintf(stderr, "[VGI] %s\n\n", auth_url.c_str());
+	DUCKDB_LOG_WARNING(context, "Authentication required for " + GetResourceDisplayName(resource_meta) +
+	    ". Opening browser...\nIf the browser doesn't open, visit this URL:\n" + auth_url);
 
 	OpenBrowser(auth_url);
 
@@ -1249,7 +1252,7 @@ OAuthTokenSet VgiTokenManager::PerformPKCEFlow(const OAuthChallenge &challenge,
 
 	tokens.use_id_token = resource_meta.use_id_token_as_bearer;
 
-	fprintf(stderr, "[VGI] Authentication successful.\n");
+	DUCKDB_LOG_WARNING(context, "Authentication successful.");
 	return tokens;
 }
 
