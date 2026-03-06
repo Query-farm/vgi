@@ -277,6 +277,17 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "Timeout in seconds for VGI HTTP requests (catalog, init, and exchange operations)",
 	                          LogicalType::BIGINT, Value::BIGINT(300));
 
+	// Register OAuth settings
+	config.AddExtensionOption("vgi_oauth_timeout_seconds",
+	                          "Timeout in seconds for OAuth browser authentication flow",
+	                          LogicalType::BIGINT, Value::BIGINT(120));
+	config.AddExtensionOption("vgi_oauth_enabled",
+	                          "Enable OAuth PKCE authentication on HTTP 401 (set false to fail fast)",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
+	config.AddExtensionOption("vgi_oauth_flow",
+	                          "OAuth flow type: auto (default), device_code, or pkce",
+	                          LogicalType::VARCHAR, Value("auto"));
+
 	// Register worker pool settings
 	config.AddExtensionOption("vgi_worker_pool_idle_limit_seconds",
 	                          "Maximum idle time in seconds before pooled workers are removed", LogicalType::BIGINT,

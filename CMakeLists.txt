@@ -17,6 +17,7 @@ set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 
 project(${TARGET_NAME})
 include_directories(src/include)
+include_directories(duckdb/third_party/httplib)
 
 set(EXTENSION_SOURCES
 src/vgi_extension.cpp
@@ -31,6 +32,7 @@ src/vgi_bind_protocol.cpp
 src/vgi_transport.cpp
 src/vgi_http_client.cpp
 src/vgi_http_function_connection.cpp
+src/vgi_oauth.cpp
 src/vgi_catalogs.cpp
 src/vgi_table_function.cpp
 src/vgi_table_function_impl.cpp

@@ -1,0 +1,101 @@
+# name: test/sql/integration/table/projection_info.test
+# description: Additional projection pushdown tests for projected_data
+# group: [vgi_integration_table]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# SELECT * - all 4 columns returned
+# ============================================================================
+
+query IRTI
+SELECT * FROM example.projected_data(3);
+----
+0	item_0	0.0	0
+1	item_1	1.5	1
+2	item_2	3.0	4
+
+# ============================================================================
+# Column subset selections
+# ============================================================================
+
+# id and value (non-adjacent)
+query IR
+SELECT id, value FROM example.projected_data(5);
+----
+0	0.0
+1	1.5
+2	3.0
+3	4.5
+4	6.0
+
+# name and extra (non-adjacent)
+query TI
+SELECT name, extra FROM example.projected_data(5);
+----
+item_0	0
+item_1	1
+item_2	4
+item_3	9
+item_4	16
+
+# Single column
+query I
+SELECT id FROM example.projected_data(5);
+----
+0
+1
+2
+3
+4
+
+# ============================================================================
+# Aggregation (no projection pushdown - all columns read)
+# ============================================================================
+
+query I
+SELECT COUNT(*) FROM example.projected_data(100);
+----
+100
+
+query R
+SELECT SUM(value) FROM example.projected_data(100);
+----
+7425.0
+
+# ============================================================================
+# Large dataset with projection
+# ============================================================================
+
+query IIII
+SELECT COUNT(*), COUNT(DISTINCT id), MIN(id), MAX(id)
+FROM example.projected_data(5000);
+----
+5000	5000	0	4999
+
+query IR
+SELECT MIN(value), MAX(value) FROM example.projected_data(5000);
+----
+0.0	7498.5
+
+# Large dataset with column subset
+query II
+SELECT MIN(extra), MAX(extra) FROM (
+    SELECT extra FROM example.projected_data(5000)
+);
+----
+0	24990001
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;

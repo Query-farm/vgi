@@ -1,0 +1,29 @@
+# name: test/sql/integration/scalar/whoami.test
+# description: Tests for VGI whoami scalar function (auth context)
+# group: [vgi_integration_scalar]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# Over subprocess transport, auth is always anonymous
+query IT
+SELECT example.whoami(1), typeof(example.whoami(1));
+----
+anonymous	VARCHAR
+
+# Multiple rows
+query I
+SELECT example.whoami(x) FROM (VALUES (1), (2), (3)) t(x);
+----
+anonymous
+anonymous
+anonymous
+
+statement ok
+DETACH example;
