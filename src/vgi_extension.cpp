@@ -4,6 +4,7 @@
 
 #include <cerrno>
 #include <mutex>
+#include <set>
 #include <signal.h>
 
 #include "duckdb.hpp"
@@ -18,12 +19,17 @@
 #include "vgi_catalog_api.hpp"
 #include "vgi_catalogs.hpp"
 #include "vgi_logging.hpp"
+#include "vgi_oauth.hpp"
 #include "vgi_profiling.hpp"
 #include "vgi_subprocess.hpp"
 #include "vgi_table_function.hpp"
 #include "vgi_transport.hpp"
 #include "vgi_worker_pool.hpp"
 #include "vgi_worker_pool_functions.hpp"
+
+#include "duckdb/catalog/catalog_transaction.hpp"
+#include "duckdb/common/types/data_chunk.hpp"
+#include "duckdb/function/table_function.hpp"
 
 #define VGI_EXTENSION_VERSION "2026011201"
 
@@ -243,6 +249,260 @@ static unique_ptr<TransactionManager> CreateVgiTransactionManager(optional_ptr<S
 	return make_uniq<VgiTransactionManager>(db, vgi_catalog);
 }
 
+//===--------------------------------------------------------------------===//
+// vgi_oauth_logout() table function
+//===--------------------------------------------------------------------===//
+
+struct OAuthLogoutBindData : public TableFunctionData {
+	std::string target_origin; // empty = all origins
+	bool logout_all = false;
+};
+
+struct OAuthLogoutState : public GlobalTableFunctionState {
+	std::vector<std::string> logged_out_origins;
+	idx_t offset = 0;
+};
+
+static unique_ptr<FunctionData> OAuthLogoutBind(ClientContext &context, TableFunctionBindInput &input,
+                                                 vector<LogicalType> &return_types, vector<string> &names) {
+	auto bind_data = make_uniq<OAuthLogoutBindData>();
+	if (input.inputs.size() > 1) {
+		throw BinderException("vgi_oauth_logout expects 0 or 1 arguments, got %d", input.inputs.size());
+	}
+	if (!input.inputs.empty()) {
+		bind_data->target_origin = input.inputs[0].GetValue<string>();
+	} else {
+		bind_data->logout_all = true;
+	}
+	return_types.push_back(LogicalType::VARCHAR);
+	names.push_back("origin");
+	return_types.push_back(LogicalType::VARCHAR);
+	names.push_back("status");
+	return std::move(bind_data);
+}
+
+static unique_ptr<GlobalTableFunctionState> OAuthLogoutInit(ClientContext &context, TableFunctionInitInput &input) {
+	auto state = make_uniq<OAuthLogoutState>();
+	auto &bind_data = input.bind_data->Cast<OAuthLogoutBindData>();
+	auto &token_mgr = vgi::VgiTokenManager::Instance();
+
+	if (bind_data.logout_all) {
+		auto origins = token_mgr.GetAllOrigins();
+		// Also check persisted secrets for origins not in memory
+		try {
+			auto &secret_manager = SecretManager::Get(context);
+			auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
+			auto all_secrets = secret_manager.AllSecrets(transaction);
+			for (auto &entry : all_secrets) {
+				if (entry.secret->GetType() == "vgi_oauth_refresh_token") {
+					auto &kv = dynamic_cast<const KeyValueSecret &>(*entry.secret);
+					auto origin_val = kv.TryGetValue("origin");
+					if (!origin_val.IsNull()) {
+						auto o = origin_val.ToString();
+						bool found = false;
+						for (const auto &existing : origins) {
+							if (existing == o) { found = true; break; }
+						}
+						if (!found) {
+							origins.push_back(o);
+						}
+					}
+				}
+			}
+		} catch (...) {}
+
+		for (const auto &o : origins) {
+			token_mgr.ClearTokens(context, o);
+			state->logged_out_origins.push_back(o);
+		}
+	} else {
+		token_mgr.ClearTokens(context, bind_data.target_origin);
+		state->logged_out_origins.push_back(bind_data.target_origin);
+	}
+
+	return std::move(state);
+}
+
+static void OAuthLogoutFunction(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
+	auto &state = input.global_state->Cast<OAuthLogoutState>();
+	idx_t count = 0;
+	while (state.offset < state.logged_out_origins.size() && count < STANDARD_VECTOR_SIZE) {
+		output.SetValue(0, count, Value(state.logged_out_origins[state.offset]));
+		output.SetValue(1, count, Value("logged_out"));
+		state.offset++;
+		count++;
+	}
+	output.SetCardinality(count);
+}
+
+//===--------------------------------------------------------------------===//
+// vgi_oauth_tokens() table function
+//===--------------------------------------------------------------------===//
+
+struct OAuthTokensState : public GlobalTableFunctionState {
+	struct TokenRow {
+		std::string origin;
+		std::string status;
+		bool has_expires;
+		int64_t expires_in_seconds;
+		bool has_refresh_token;
+		std::string persisted;
+		std::string scope;
+	};
+	std::vector<TokenRow> rows;
+	idx_t offset = 0;
+};
+
+static LogicalType OAuthStatusEnumType() {
+	Vector values(LogicalType::VARCHAR, 3);
+	values.SetValue(0, Value("active"));
+	values.SetValue(1, Value("expired"));
+	values.SetValue(2, Value("persisted_only"));
+	return LogicalType::ENUM("vgi_oauth_status", values, 3);
+}
+
+static LogicalType OAuthPersistedEnumType() {
+	Vector values(LogicalType::VARCHAR, 3);
+	values.SetValue(0, Value("persistent"));
+	values.SetValue(1, Value("temporary"));
+	values.SetValue(2, Value("none"));
+	return LogicalType::ENUM("vgi_oauth_persisted", values, 3);
+}
+
+static unique_ptr<FunctionData> OAuthTokensBind(ClientContext &context, TableFunctionBindInput &input,
+                                                 vector<LogicalType> &return_types, vector<string> &names) {
+	return_types.push_back(LogicalType::VARCHAR);
+	names.push_back("origin");
+	return_types.push_back(OAuthStatusEnumType());
+	names.push_back("status");
+	return_types.push_back(LogicalType::INTERVAL);
+	names.push_back("expires_in");
+	return_types.push_back(LogicalType::BOOLEAN);
+	names.push_back("has_refresh_token");
+	return_types.push_back(OAuthPersistedEnumType());
+	names.push_back("persisted");
+	return_types.push_back(LogicalType::VARCHAR);
+	names.push_back("scope");
+	return nullptr;
+}
+
+static unique_ptr<GlobalTableFunctionState> OAuthTokensInit(ClientContext &context, TableFunctionInitInput &input) {
+	auto state = make_uniq<OAuthTokensState>();
+	auto &token_mgr = vgi::VgiTokenManager::Instance();
+	auto origins = token_mgr.GetAllOrigins();
+
+	// Track which origins we've seen (for merging persisted-only entries)
+	std::set<std::string> seen_origins;
+
+	// Get in-memory token states
+	for (const auto &origin : origins) {
+		seen_origins.insert(origin);
+		OAuthTokensState::TokenRow row;
+		row.origin = origin;
+
+		auto bearer = token_mgr.GetToken(origin);
+		if (!bearer.empty()) {
+			row.status = "active";
+		} else {
+			row.status = "expired";
+		}
+
+		// Get expiry and refresh token info from in-memory state
+		vgi::VgiTokenManager::TokenInfo token_info;
+		if (token_mgr.GetTokenInfo(origin, token_info)) {
+			row.has_refresh_token = token_info.has_refresh_token;
+			row.has_expires = token_info.has_expires;
+			row.expires_in_seconds = token_info.expires_in_seconds;
+		} else {
+			row.has_refresh_token = false;
+			row.has_expires = false;
+			row.expires_in_seconds = 0;
+		}
+		row.persisted = "none";
+		row.scope = "";
+
+		// Check persisted secret for this origin
+		try {
+			auto &secret_manager = SecretManager::Get(context);
+			auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
+			auto secret_name = vgi::VgiTokenManager::SecretNameForOrigin(origin);
+			auto entry = secret_manager.GetSecretByName(transaction, secret_name);
+			if (entry) {
+				auto &kv = dynamic_cast<const KeyValueSecret &>(*entry->secret);
+				auto rt = kv.TryGetValue("refresh_token");
+				row.has_refresh_token = !rt.IsNull() && !rt.ToString().empty();
+				auto sc = kv.TryGetValue("scope");
+				if (!sc.IsNull()) row.scope = sc.ToString();
+
+				if (entry->persist_type == SecretPersistType::PERSISTENT) {
+					row.persisted = "persistent";
+				} else {
+					row.persisted = "temporary";
+				}
+			}
+		} catch (...) {}
+
+		state->rows.push_back(std::move(row));
+	}
+
+	// Check for persisted-only entries (origins with secrets but no in-memory state)
+	try {
+		auto &secret_manager = SecretManager::Get(context);
+		auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
+		auto all_secrets = secret_manager.AllSecrets(transaction);
+		for (auto &entry : all_secrets) {
+			if (entry.secret->GetType() == "vgi_oauth_refresh_token") {
+				auto &kv = dynamic_cast<const KeyValueSecret &>(*entry.secret);
+				auto origin_val = kv.TryGetValue("origin");
+				if (origin_val.IsNull()) continue;
+				auto origin = origin_val.ToString();
+				if (seen_origins.count(origin)) continue;
+
+				OAuthTokensState::TokenRow row;
+				row.origin = origin;
+				row.status = "persisted_only";
+				row.has_expires = false;
+				row.expires_in_seconds = 0;
+
+				auto rt = kv.TryGetValue("refresh_token");
+				row.has_refresh_token = !rt.IsNull() && !rt.ToString().empty();
+				auto sc = kv.TryGetValue("scope");
+				row.scope = sc.IsNull() ? "" : sc.ToString();
+
+				if (entry.persist_type == SecretPersistType::PERSISTENT) {
+					row.persisted = "persistent";
+				} else {
+					row.persisted = "temporary";
+				}
+				state->rows.push_back(std::move(row));
+			}
+		}
+	} catch (...) {}
+
+	return std::move(state);
+}
+
+static void OAuthTokensFunction(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
+	auto &state = input.global_state->Cast<OAuthTokensState>();
+	idx_t count = 0;
+	while (state.offset < state.rows.size() && count < STANDARD_VECTOR_SIZE) {
+		auto &row = state.rows[state.offset];
+		output.SetValue(0, count, Value(row.origin));
+		output.SetValue(1, count, Value(row.status));
+		if (row.status == "active" && row.has_expires) {
+			output.SetValue(2, count, Value::INTERVAL(Interval::FromMicro(row.expires_in_seconds * Interval::MICROS_PER_SEC)));
+		} else {
+			output.SetValue(2, count, Value());
+		}
+		output.SetValue(3, count, Value::BOOLEAN(row.has_refresh_token));
+		output.SetValue(4, count, Value(row.persisted));
+		output.SetValue(5, count, Value(row.scope));
+		state.offset++;
+		count++;
+	}
+	output.SetCardinality(count);
+}
+
 static void LoadInternal(ExtensionLoader &loader) {
 	// Ignore SIGPIPE - we handle broken pipes via EPIPE error from write()
 	// This prevents the process from being killed when a worker dies unexpectedly
@@ -287,6 +547,48 @@ static void LoadInternal(ExtensionLoader &loader) {
 	config.AddExtensionOption("vgi_oauth_flow",
 	                          "OAuth flow type: auto (default), device_code, or pkce",
 	                          LogicalType::VARCHAR, Value("auto"));
+	config.AddExtensionOption("vgi_oauth_persist",
+	                          "Persist OAuth refresh tokens to disk via DuckDB SecretManager",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
+
+	// Register vgi_oauth_refresh_token secret type
+	{
+		auto &secret_manager = SecretManager::Get(loader.GetDatabaseInstance());
+		SecretType secret_type;
+		secret_type.name = "vgi_oauth_refresh_token";
+		secret_type.deserializer = KeyValueSecret::Deserialize<KeyValueSecret>;
+		secret_type.default_provider = "config";
+		secret_type.extension = "vgi";
+		try {
+			secret_manager.RegisterSecretType(secret_type);
+		} catch (const InternalException &) {
+			// Already registered — idempotent
+		}
+
+		// Register create function
+		CreateSecretFunction create_func;
+		create_func.secret_type = "vgi_oauth_refresh_token";
+		create_func.provider = "config";
+		create_func.function = VgiCreateSecret;
+		create_func.named_parameters["refresh_token"] = LogicalType::VARCHAR;
+		create_func.named_parameters["token_endpoint"] = LogicalType::VARCHAR;
+		create_func.named_parameters["client_id"] = LogicalType::VARCHAR;
+		create_func.named_parameters["client_secret"] = LogicalType::VARCHAR;
+		create_func.named_parameters["scope"] = LogicalType::VARCHAR;
+		create_func.named_parameters["use_id_token"] = LogicalType::VARCHAR;
+		create_func.named_parameters["resource_metadata_url"] = LogicalType::VARCHAR;
+		create_func.named_parameters["origin"] = LogicalType::VARCHAR;
+		secret_manager.RegisterSecretFunction(create_func, OnCreateConflict::IGNORE_ON_CONFLICT);
+
+		// Store redact keys
+		auto vgi_ext = StorageExtension::Find(config, "vgi");
+		if (vgi_ext) {
+			case_insensitive_set_t redact_keys;
+			redact_keys.insert("refresh_token");
+			redact_keys.insert("client_secret");
+			static_cast<VgiStorageExtension &>(*vgi_ext).SetRedactKeys("vgi_oauth_refresh_token", std::move(redact_keys));
+		}
+	}
 
 	// Register worker pool settings
 	config.AddExtensionOption("vgi_worker_pool_idle_limit_seconds",
@@ -307,6 +609,18 @@ static void LoadInternal(ExtensionLoader &loader) {
 	vgi::RegisterVgiWorkerPoolFunction(loader);
 	vgi::RegisterVgiWorkerPoolStatsFunction(loader);
 	vgi::RegisterVgiWorkerPoolFlushFunction(loader);
+
+	// Register OAuth diagnostic/management functions
+	{
+		// vgi_oauth_logout([origin])
+		TableFunction logout_func("vgi_oauth_logout", {}, OAuthLogoutFunction, OAuthLogoutBind, OAuthLogoutInit);
+		logout_func.varargs = LogicalType::VARCHAR;
+		loader.RegisterFunction(logout_func);
+
+		// vgi_oauth_tokens()
+		TableFunction tokens_func("vgi_oauth_tokens", {}, OAuthTokensFunction, OAuthTokensBind, OAuthTokensInit);
+		loader.RegisterFunction(tokens_func);
+	}
 }
 
 void VgiExtension::Load(ExtensionLoader &loader) {

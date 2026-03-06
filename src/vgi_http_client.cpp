@@ -62,8 +62,8 @@ static std::string HttpPostArrowIpcInternal(ClientContext &context,
 				auto error_result = ReadUnaryResponseFromBuffer(
 				    reinterpret_cast<const uint8_t *>(error_body.data()),
 				    error_body.size(), nullptr, url);
-			} catch (const IOException &e) {
-				throw;
+			} catch (const IOException &) {
+				// Not Arrow IPC — fall through to plain error
 			} catch (...) {
 			}
 		}
