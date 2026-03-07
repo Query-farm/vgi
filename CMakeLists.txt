@@ -18,6 +18,7 @@ set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 project(${TARGET_NAME})
 include_directories(src/include)
 include_directories(duckdb/third_party/httplib)
+include_directories(duckdb/third_party/zstd/include)
 
 set(EXTENSION_SOURCES
 src/vgi_extension.cpp

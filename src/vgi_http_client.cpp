@@ -3,13 +3,71 @@
 #include "duckdb.hpp"
 #include "duckdb/common/http_util.hpp"
 #include "duckdb/common/enums/http_status_code.hpp"
+#include "zstd.h"
 
 #include "vgi_logging.hpp"
 #include "vgi_oauth.hpp"
 #include "vgi_rpc_client.hpp"
 
+using namespace duckdb_zstd;
+
 namespace duckdb {
 namespace vgi {
+
+// Decompress a zstd-encoded buffer. Returns decompressed bytes.
+static std::string ZstdDecompress(const char *data, size_t size) {
+	auto frame_size = ZSTD_getFrameContentSize(data, size);
+	if (frame_size == ZSTD_CONTENTSIZE_ERROR) {
+		throw IOException("VGI zstd decompression failed: not valid zstd data");
+	}
+
+	if (frame_size != ZSTD_CONTENTSIZE_UNKNOWN) {
+		// Known size — single-call decompress
+		std::string decompressed(frame_size, '\0');
+		auto result = ZSTD_decompress(decompressed.data(), frame_size, data, size);
+		if (ZSTD_isError(result)) {
+			throw IOException("VGI zstd decompression failed: %s", ZSTD_getErrorName(result));
+		}
+		decompressed.resize(result);
+		return decompressed;
+	}
+
+	// Unknown size — streaming decompress
+	auto *dstream = ZSTD_createDStream();
+	if (!dstream) {
+		throw IOException("VGI zstd decompression failed: could not create stream");
+	}
+	ZSTD_initDStream(dstream);
+
+	std::string output;
+	ZSTD_inBuffer input_buf = {data, size, 0};
+	std::vector<char> tmp(ZSTD_DStreamOutSize());
+
+	while (input_buf.pos < input_buf.size) {
+		ZSTD_outBuffer output_buf = {tmp.data(), tmp.size(), 0};
+		auto result = ZSTD_decompressStream(dstream, &output_buf, &input_buf);
+		if (ZSTD_isError(result)) {
+			ZSTD_freeDStream(dstream);
+			throw IOException("VGI zstd decompression failed: %s", ZSTD_getErrorName(result));
+		}
+		output.append(tmp.data(), output_buf.pos);
+	}
+
+	ZSTD_freeDStream(dstream);
+	return output;
+}
+
+// Compress a buffer with zstd. Returns compressed bytes.
+static std::vector<uint8_t> ZstdCompress(const uint8_t *data, size_t size, int level = 3) {
+	auto bound = ZSTD_compressBound(size);
+	std::vector<uint8_t> compressed(bound);
+	auto result = ZSTD_compress(compressed.data(), bound, data, size, level);
+	if (ZSTD_isError(result)) {
+		throw IOException("VGI zstd compression failed: %s", ZSTD_getErrorName(result));
+	}
+	compressed.resize(result);
+	return compressed;
+}
 
 // Helper: strip trailing slash from a URL
 static std::string NormalizeBaseUrl(const std::string &url) {
@@ -37,15 +95,20 @@ static std::string HttpPostArrowIpcInternal(ClientContext &context,
 		params->timeout = 300; // fallback: 5 minutes
 	}
 
+	// Compress the request body with zstd
+	auto compressed_body = ZstdCompress(body.data(), body.size());
+
 	HTTPHeaders headers;
 	headers.Insert("Content-Type", ARROW_IPC_CONTENT_TYPE);
+	headers.Insert("Content-Encoding", "zstd");
+	headers.Insert("X-VGI-Accept-Encoding", "zstd");
 	if (!bearer_token.empty()) {
 		headers.Insert("Authorization", "Bearer " + bearer_token);
 	}
 
 	PostRequestInfo post(url, headers, *params,
-	                     reinterpret_cast<const_data_ptr_t>(body.data()),
-	                     static_cast<idx_t>(body.size()));
+	                     reinterpret_cast<const_data_ptr_t>(compressed_body.data()),
+	                     static_cast<idx_t>(compressed_body.size()));
 
 	out_response = http_util.Request(post);
 
@@ -70,6 +133,12 @@ static std::string HttpPostArrowIpcInternal(ClientContext &context,
 		throw IOException("VGI HTTP request failed (HTTP %d): %s [url: %s]",
 		                  static_cast<int>(out_response->status),
 		                  error_body.empty() ? out_response->GetError() : error_body, url);
+	}
+
+	// Decompress zstd response if server sent it
+	if (out_response->HasHeader("X-VGI-Content-Encoding") &&
+	    out_response->GetHeaderValue("X-VGI-Content-Encoding") == "zstd" && !post.buffer_out.empty()) {
+		post.buffer_out = ZstdDecompress(post.buffer_out.data(), post.buffer_out.size());
 	}
 
 	return std::move(post.buffer_out);
