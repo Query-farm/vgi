@@ -989,7 +989,9 @@ static const char *OAUTH_PAGE_STYLE = R"(
     align-items: center;
     gap: 2rem;
   }
-  .logo { width: 120px; height: 120px; flex-shrink: 0; }
+  .logos { display: flex; flex-direction: column; align-items: center; gap: 0.75rem; flex-shrink: 0; }
+  .logo { width: 120px; height: 120px; }
+  .logo-duckdb { width: 100px; }
   .content { text-align: left; }
   .status-row { display: flex; align-items: center; gap: 0.625rem; margin-bottom: 0.5rem; }
   .icon-circle {
@@ -1023,7 +1025,10 @@ static std::string OAuthSuccessPage(const std::string &resource_display, const s
 	       OAUTH_PAGE_STYLE +
 	       R"(</head><body>
 <div class="card">
-  <a href="https://query.farm"><img class="logo" src="https://vgi-rpc.query.farm/logo-hero.png" alt="VGI"></a>
+  <div class="logos">
+    <a href="https://query.farm"><img class="logo" src="https://vgi-rpc.query.farm/logo-hero.png" alt="VGI"></a>
+    <a href="https://duckdb.org"><img class="logo-duckdb" src="https://duckdb.org/images/logo-dl/DuckDB_Logo-horizontal.svg" alt="DuckDB"></a>
+  </div>
   <div class="content">
     <div class="status-row">
       <div class="icon-circle icon-circle-success">
@@ -1051,7 +1056,10 @@ static std::string OAuthErrorPage(const std::string &message, const std::string 
 	       OAUTH_PAGE_STYLE +
 	       R"(</head><body>
 <div class="card">
-  <a href="https://query.farm"><img class="logo" src="https://vgi-rpc.query.farm/logo-hero.png" alt="VGI"></a>
+  <div class="logos">
+    <a href="https://query.farm"><img class="logo" src="https://vgi-rpc.query.farm/logo-hero.png" alt="VGI"></a>
+    <a href="https://duckdb.org"><img class="logo-duckdb" src="https://duckdb.org/images/logo-dl/DuckDB_Logo-horizontal.svg" alt="DuckDB"></a>
+  </div>
   <div class="content">
     <div class="status-row">
       <div class="icon-circle icon-circle-error">
