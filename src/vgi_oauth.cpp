@@ -1039,7 +1039,7 @@ static std::string OAuthSuccessPage(const std::string &resource_display, const s
       <h1>Authentication Successful</h1>
     </div>
     <p class="subtitle">Connected to <span class="resource">)" + escaped + R"(</span></p>
-    <p class="subtitle" style="margin-top:0.25rem;font-size:0.8125rem;font-family:'JetBrains Mono','Fira Code',monospace;opacity:0.7;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title=")" + escaped_url + R"(">)" + escaped_url + R"(</p>
+    <p class="subtitle" style="margin-top:0.25rem;font-size:0.8125rem;font-family:'JetBrains Mono','Fira Code',monospace;opacity:0.7;word-break:break-all;" title=")" + escaped_url + R"(">)" + escaped_url + R"(</p>
     <p class="subtitle" style="margin-top:0.75rem;">You can close this window.</p>
   </div>
 </div>
@@ -1185,7 +1185,10 @@ OAuthTokenSet VgiTokenManager::PerformPKCEFlow(const OAuthChallenge &challenge,
 		throw IOException("VGI OAuth: failed to bind local callback server");
 	}
 
-	std::string redirect_uri = "http://127.0.0.1:" + std::to_string(port) + "/callback";
+	// Use "localhost" instead of "127.0.0.1" in the redirect URI. Azure AD
+	// treats http://localhost specially — matching any port — but does NOT
+	// extend that treatment to http://127.0.0.1.
+	std::string redirect_uri = "http://localhost:" + std::to_string(port) + "/callback";
 
 	// Start server in background thread
 	std::thread server_thread([&svr]() {
@@ -1218,10 +1221,11 @@ OAuthTokenSet VgiTokenManager::PerformPKCEFlow(const OAuthChallenge &challenge,
 		auth_url += "&scope=" + UrlEncode(scope_str);
 	}
 
-	// Add resource parameter if available
-	if (!resource_meta.resource.empty()) {
-		auth_url += "&resource=" + UrlEncode(resource_meta.resource);
-	}
+	// NOTE: Do NOT add a &resource= parameter here. The resource parameter is
+	// an OAuth 1.0/v1.0 concept (used by Azure AD v1.0 endpoints) and conflicts
+	// with the v2.0 scope-based model. Azure AD v2.0 returns AADSTS9010010
+	// ("resource parameter doesn't match requested scopes") when both are present.
+	// Google and other standard OAuth 2.0 providers don't use it either.
 
 	// Always print the URL so user can manually navigate if browser fails
 	DUCKDB_LOG_WARNING(context, "Authentication required for " + GetResourceDisplayName(resource_meta) +
