@@ -95,6 +95,10 @@ public:
 
 	static std::string ExtractOrigin(const std::string &url);
 
+	// Seed a refresh token for an origin (e.g., from ATTACH oauth_refresh_token option).
+	// Only sets the token if the origin is in IDLE state (not already authenticated).
+	void SeedRefreshToken(const std::string &origin, const std::string &refresh_token);
+
 	// Persistence helpers
 	OAuthTokenSet AttemptTokenRefresh(const OAuthRefreshContext &ctx, const std::string &refresh_token,
 	                                  ClientContext &context);
@@ -108,6 +112,8 @@ public:
 private:
 	mutable std::mutex mutex_;
 	std::map<std::string, AuthState> auth_states_;
+
+	OAuthRefreshContext DiscoverRefreshContext(const OAuthChallenge &challenge, ClientContext &context);
 
 	OAuthTokenSet PerformPKCEFlow(const OAuthChallenge &challenge,
 	                               const OAuthResourceMetadata &resource_meta,

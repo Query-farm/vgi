@@ -104,6 +104,7 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	bool use_pool = true;
 	int64_t pool_max_override = -1;      // -1 = not set
 	int64_t pool_timeout_override = -1;  // -1 = not set
+	string oauth_refresh_token;
 
 	// Extract options
 	for (auto &entry : info.options) {
@@ -120,6 +121,8 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 			pool_max_override = entry.second.GetValue<int64_t>();
 		} else if (lower_name == "pool_timeout") {
 			pool_timeout_override = entry.second.GetValue<int64_t>();
+		} else if (lower_name == "oauth_refresh_token") {
+			oauth_refresh_token = entry.second.ToString();
 		} else {
 			throw BinderException("Unrecognized option for VGI ATTACH: %s", entry.first);
 		}
@@ -141,6 +144,16 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 			                      "Install it with: INSTALL httpfs; LOAD httpfs;");
 		}
 		use_pool = false; // HTTP is stateless, no subprocess pooling
+	}
+
+	// Seed OAuth refresh token if provided
+	if (!oauth_refresh_token.empty()) {
+		if (!vgi::IsHttpTransport(worker_path)) {
+			throw BinderException("oauth_refresh_token is only valid for HTTP transport "
+			                      "(LOCATION must be an HTTP/HTTPS URL)");
+		}
+		auto origin = vgi::VgiTokenManager::ExtractOrigin(worker_path);
+		vgi::VgiTokenManager::Instance().SeedRefreshToken(origin, oauth_refresh_token);
 	}
 
 	// Call catalog_attach via RPC
@@ -550,6 +563,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	config.AddExtensionOption("vgi_oauth_persist",
 	                          "Persist OAuth refresh tokens to disk via DuckDB SecretManager",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
+	config.AddExtensionOption("vgi_oauth_prompt",
+	                          "OAuth prompt behavior: none (default), login, select_account, or consent",
+	                          LogicalType::VARCHAR, Value("none"));
 
 	// Register vgi_oauth_refresh_token secret type
 	{

@@ -131,6 +131,7 @@ Catalogs may register additional settings at `ATTACH` time (e.g., `greeting`, `m
 | `pool_max` | BIGINT | (global default) | Max pooled workers for this worker path (0 = disabled) |
 | `pool_timeout` | BIGINT | (global default) | Idle timeout in seconds before pooled workers are removed |
 | `worker_debug` | BOOLEAN | false | Enable worker debug output |
+| `oauth_refresh_token` | VARCHAR | (none) | Pre-seed OAuth refresh token for HTTP transport (skips interactive auth) |
 
 ## SQL Functions
 

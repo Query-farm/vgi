@@ -1308,6 +1308,44 @@ std::string VgiTokenManager::ExtractOrigin(const std::string &url) {
 	return url.substr(0, path_start);
 }
 
+void VgiTokenManager::SeedRefreshToken(const std::string &origin, const std::string &refresh_token) {
+	std::lock_guard<std::mutex> lock(mutex_);
+	auto &state = auth_states_[origin];
+	if (state.status == AuthState::Status::IDLE) {
+		state.token.refresh_token = refresh_token;
+	}
+	// If not IDLE (e.g., already authenticated), don't overwrite active state
+}
+
+OAuthRefreshContext VgiTokenManager::DiscoverRefreshContext(const OAuthChallenge &challenge, ClientContext &context) {
+	auto resource_meta = FetchResourceMetadata(context, challenge.resource_metadata_url);
+
+	std::string client_id = resource_meta.client_id.empty() ? challenge.client_id : resource_meta.client_id;
+	if (client_id.empty()) {
+		throw IOException("VGI OAuth: no client_id in challenge or resource metadata");
+	}
+
+	auto server_meta = FetchAuthServerMetadata(context, resource_meta.authorization_servers[0]);
+
+	OAuthRefreshContext ctx;
+	ctx.token_endpoint = server_meta.token_endpoint;
+	ctx.client_id = client_id;
+	ctx.client_secret = resource_meta.client_secret;
+	ctx.use_id_token = resource_meta.use_id_token_as_bearer;
+	ctx.resource_metadata_url = challenge.resource_metadata_url;
+	if (!resource_meta.scopes_supported.empty()) {
+		std::string scope_str;
+		for (size_t i = 0; i < resource_meta.scopes_supported.size(); i++) {
+			if (i > 0) scope_str += " ";
+			scope_str += resource_meta.scopes_supported[i];
+		}
+		ctx.scope = scope_str;
+	} else {
+		ctx.scope = "openid";
+	}
+	return ctx;
+}
+
 std::string VgiTokenManager::GetToken(const std::string &origin) {
 	std::lock_guard<std::mutex> lock(mutex_);
 	auto it = auth_states_.find(origin);
@@ -1371,19 +1409,34 @@ std::string VgiTokenManager::HandleUnauthorized(const std::string &origin,
 		}
 
 		// Attempt token refresh if we have a refresh_token
-		if (!refresh_token.empty() && !refresh_ctx.token_endpoint.empty()) {
-			try {
-				VGI_STDERR_DEBUG("[VGI] oauth.attempting_refresh origin=%s\n", origin.c_str());
-				auto tokens = AttemptTokenRefresh(refresh_ctx, refresh_token, context);
-				// Preserve old refresh_token if response omits new one (Google behavior)
-				if (tokens.refresh_token.empty()) {
-					tokens.refresh_token = refresh_token;
+		if (!refresh_token.empty()) {
+			// Discover metadata if we have a token but no refresh context
+			// (e.g., seeded via ATTACH oauth_refresh_token option)
+			if (refresh_ctx.token_endpoint.empty()) {
+				try {
+					refresh_ctx = DiscoverRefreshContext(challenge, context);
+					VGI_STDERR_DEBUG("[VGI] oauth.discovered_refresh_context origin=%s endpoint=%s\n",
+					                 origin.c_str(), refresh_ctx.token_endpoint.c_str());
+				} catch (const std::exception &e) {
+					DUCKDB_LOG_WARNING(context,
+					    "VGI OAuth: failed to discover auth server metadata for token refresh, "
+					    "falling back to interactive auth: " + std::string(e.what()));
 				}
-				lock.lock();
-				return StoreAndPersist(std::move(tokens), refresh_ctx);
-			} catch (const std::exception &e) {
-				VGI_STDERR_DEBUG("[VGI] oauth.refresh_failed origin=%s error=%s\n",
-				                 origin.c_str(), e.what());
+			}
+			if (!refresh_ctx.token_endpoint.empty()) {
+				try {
+					VGI_STDERR_DEBUG("[VGI] oauth.attempting_refresh origin=%s\n", origin.c_str());
+					auto tokens = AttemptTokenRefresh(refresh_ctx, refresh_token, context);
+					// Preserve old refresh_token if response omits new one (Google behavior)
+					if (tokens.refresh_token.empty()) {
+						tokens.refresh_token = refresh_token;
+					}
+					lock.lock();
+					return StoreAndPersist(std::move(tokens), refresh_ctx);
+				} catch (const std::exception &e) {
+					VGI_STDERR_DEBUG("[VGI] oauth.refresh_failed origin=%s error=%s\n",
+					                 origin.c_str(), e.what());
+				}
 			}
 		}
 
