@@ -1227,6 +1227,23 @@ OAuthTokenSet VgiTokenManager::PerformPKCEFlow(const OAuthChallenge &challenge,
 	// ("resource parameter doesn't match requested scopes") when both are present.
 	// Google and other standard OAuth 2.0 providers don't use it either.
 
+	// Add prompt parameter if configured (controls account picker / re-auth behavior).
+	// Valid values: none (default, omit parameter), login, select_account, consent.
+	// See: https://openid.net/specs/openid-connect-core-1_0.html#AuthRequest
+	{
+		std::string prompt = "none";
+		Value prompt_val;
+		if (context.TryGetCurrentSetting("vgi_oauth_prompt", prompt_val)) {
+			prompt = prompt_val.GetValue<std::string>();
+		}
+		if (prompt == "login" || prompt == "select_account" || prompt == "consent") {
+			auth_url += "&prompt=" + UrlEncode(prompt);
+		} else if (prompt != "none") {
+			throw InvalidInputException(
+			    "vgi_oauth_prompt must be 'none', 'login', 'select_account', or 'consent' (got '%s')", prompt);
+		}
+	}
+
 	// Always print the URL so user can manually navigate if browser fails
 	DUCKDB_LOG_WARNING(context, "Authentication required for " + GetResourceDisplayName(resource_meta) +
 	    ". Opening browser...\nIf the browser doesn't open, visit this URL:\n" + auth_url);
