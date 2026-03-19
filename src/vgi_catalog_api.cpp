@@ -274,6 +274,27 @@ std::optional<VgiTableInfo> InvokeCatalogTableGet(const std::string &worker_path
 	return ParseTableInfo(info_batch, worker_path);
 }
 
+std::optional<VgiTableInfo> InvokeCatalogTableGet(const std::string &worker_path,
+                                                   const std::vector<uint8_t> &attach_id,
+                                                   const std::string &schema_name, const std::string &table_name,
+                                                   ClientContext &context,
+                                                   const std::string &at_unit, const std::string &at_value,
+                                                   bool worker_debug, bool use_pool) {
+	auto params = BuildTableGetWithAtParams(attach_id, schema_name, table_name, at_unit, at_value);
+	auto response = InvokeRpcMethod(worker_path, "catalog_table_get", params, context, worker_debug, use_pool);
+	auto result_batch = ExtractAndDeserializeResult(response, "catalog_table_get", worker_path);
+	if (!result_batch) {
+		return std::nullopt;
+	}
+
+	auto item_bytes_list = UnwrapBinaryResponseItems(result_batch);
+	if (item_bytes_list.empty()) {
+		return std::nullopt;
+	}
+	auto info_batch = DeserializeFromIpcBytes(item_bytes_list[0]);
+	return ParseTableInfo(info_batch, worker_path);
+}
+
 std::optional<VgiViewInfo> InvokeCatalogViewGet(const std::string &worker_path, const std::vector<uint8_t> &attach_id,
                                                  const std::string &schema_name, const std::string &view_name,
                                                  ClientContext &context, bool worker_debug, bool use_pool) {

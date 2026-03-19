@@ -5,6 +5,7 @@
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/extension_helper.hpp"
+#include "duckdb/planner/tableref/bound_at_clause.hpp"
 #include "duckdb/storage/table_storage_info.hpp"
 
 #include "storage/vgi_catalog.hpp"
@@ -30,6 +31,22 @@ unique_ptr<BaseStatistics> VgiTableEntry::GetStatistics(ClientContext &context, 
 }
 
 TableFunction VgiTableEntry::GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data) {
+	return GetScanFunctionImpl(context, bind_data, "", "");
+}
+
+TableFunction VgiTableEntry::GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data, const EntryLookupInfo &lookup) {
+	string at_unit;
+	string at_value;
+	auto at = lookup.GetAtClause();
+	if (at) {
+		at_unit = at->Unit();
+		at_value = at->GetValue().ToString();
+	}
+	return GetScanFunctionImpl(context, bind_data, at_unit, at_value);
+}
+
+TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_ptr<FunctionData> &bind_data,
+                                                  const string &at_unit, const string &at_value) {
 	auto &vgi_catalog = catalog_.Cast<VgiCatalog>();
 	auto &attach_params = vgi_catalog.attach_parameters();
 	auto &attach_result = vgi_catalog.attach_result();
@@ -37,7 +54,7 @@ TableFunction VgiTableEntry::GetScanFunction(ClientContext &context, unique_ptr<
 	// Ask the worker which function to call to scan this table
 	auto scan_result = vgi::InvokeCatalogTableScanFunctionGet(
 	    attach_params->worker_path(), attach_result->attach_id,
-	    ParentSchema().name, name, context, "", "",
+	    ParentSchema().name, name, context, at_unit, at_value,
 	    attach_params->worker_debug(), attach_params->use_pool());
 
 	// Load any required extensions before scanning

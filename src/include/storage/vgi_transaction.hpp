@@ -28,6 +28,11 @@ public:
 		return access_mode_;
 	}
 
+	//! Temporary storage for point-in-time catalog entries (time travel).
+	//! These are created during GetEntry with an AT clause and must remain
+	//! alive until the query completes. Cleaned up when the transaction ends.
+	vector<unique_ptr<CatalogEntry>> point_in_time_entries;
+
 private:
 	VgiTransactionState transaction_state = VgiTransactionState::TRANSACTION_NOT_YET_STARTED;
 	AccessMode access_mode_;

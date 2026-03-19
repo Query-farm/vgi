@@ -1,6 +1,7 @@
 #pragma once
 
 #include "duckdb/common/types.hpp"
+#include "duckdb/catalog/entry_lookup_info.hpp"
 #include "storage/vgi_catalog_set.hpp"
 #include "vgi_catalog_api.hpp"
 
@@ -14,6 +15,9 @@ public:
 
 	// Override GetEntry to do on-demand loading
 	optional_ptr<CatalogEntry> GetEntry(ClientContext &context, const std::string &name);
+
+	// Override GetEntry with EntryLookupInfo to handle AT clause for time travel
+	optional_ptr<CatalogEntry> GetEntry(ClientContext &context, const EntryLookupInfo &lookup_info);
 
 protected:
 	void LoadEntries(ClientContext &context) override;

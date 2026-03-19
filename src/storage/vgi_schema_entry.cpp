@@ -117,7 +117,7 @@ optional_ptr<CatalogEntry> VgiSchemaEntry::LookupEntry(CatalogTransaction transa
 	switch (type) {
 	case CatalogType::TABLE_ENTRY: {
 		// DuckDB resolves FROM clauses as TABLE_ENTRY; fall back to views
-		auto result = tables_.GetEntry(context, entry_name);
+		auto result = tables_.GetEntry(context, lookup_info);
 		if (!result) {
 			result = views_.GetEntry(context, entry_name);
 		}

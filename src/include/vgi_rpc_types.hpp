@@ -214,6 +214,14 @@ std::shared_ptr<arrow::RecordBatch> BuildTableOrViewGetParams(const std::vector<
                                                                const std::string &name,
                                                                const std::vector<uint8_t> &transaction_id = {});
 
+// Build params for table_get with AT clause (time travel)
+std::shared_ptr<arrow::RecordBatch> BuildTableGetWithAtParams(const std::vector<uint8_t> &attach_id,
+                                                               const std::string &schema_name,
+                                                               const std::string &name,
+                                                               const std::string &at_unit,
+                                                               const std::string &at_value,
+                                                               const std::vector<uint8_t> &transaction_id = {});
+
 // Build params batch for catalog_table_scan_function_get:
 //   attach_id, schema_name, name, at_unit, at_value, transaction_id
 std::shared_ptr<arrow::RecordBatch> BuildTableScanFunctionGetParams(

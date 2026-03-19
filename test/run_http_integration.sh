@@ -46,5 +46,5 @@ fi
 echo "HTTP server running on port $PORT (pid $SERVER_PID)"
 
 # Run tests
-VGI_TEST_WORKER="http://localhost:$PORT/vgi" \
+VGI_TEST_WORKER="http://localhost:$PORT" \
     ./build/$BUILD_DIR/test/unittest "$FILTER" "$@"

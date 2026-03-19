@@ -1,6 +1,7 @@
 #pragma once
 
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/catalog/entry_lookup_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "vgi_catalog_api.hpp"
 
@@ -19,6 +20,7 @@ public:
 	unique_ptr<BaseStatistics> GetStatistics(ClientContext &context, column_t column_id) override;
 
 	TableFunction GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data) override;
+	TableFunction GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data, const EntryLookupInfo &lookup) override;
 
 	TableStorageInfo GetStorageInfo(ClientContext &context) override;
 
@@ -37,6 +39,9 @@ public:
 	}
 
 private:
+	TableFunction GetScanFunctionImpl(ClientContext &context, unique_ptr<FunctionData> &bind_data,
+	                                  const string &at_unit, const string &at_value);
+
 	vgi::VgiTableInfo table_info_;
 	Catalog &catalog_;
 	LogicalType rowid_type_ = LogicalType::INVALID;

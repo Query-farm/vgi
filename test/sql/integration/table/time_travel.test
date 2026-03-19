@@ -1,0 +1,129 @@
+# name: test/sql/integration/table/time_travel.test
+# description: Test time travel queries with schema evolution
+# group: [vgi_integration_table]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# VERSION-based time travel with schema evolution
+
+# Version 1: schema (id), 3 rows
+query I
+SELECT * FROM example.data.versioned_data AT (VERSION => 1) ORDER BY id;
+----
+1
+2
+3
+
+# Version 2: schema (id, name, score, active), 5 rows
+query ITRI
+SELECT * FROM example.data.versioned_data AT (VERSION => 2) ORDER BY id;
+----
+1	alice	10.0	true
+2	bob	20.0	false
+3	carol	30.0	true
+4	dave	40.0	false
+5	eve	50.0	true
+
+# Version 3 (current): schema (id, score), 4 rows
+query IR
+SELECT * FROM example.data.versioned_data AT (VERSION => 3) ORDER BY id;
+----
+1	15.0
+2	25.0
+3	35.0
+4	45.0
+
+# Default (no AT) = version 3
+query IR
+SELECT * FROM example.data.versioned_data ORDER BY id;
+----
+1	15.0
+2	25.0
+3	35.0
+4	45.0
+
+# Schema evolution: columns that don't exist at a version cause binder error
+statement error
+SELECT score FROM example.data.versioned_data AT (VERSION => 1);
+----
+Binder Error
+
+statement error
+SELECT name FROM example.data.versioned_data AT (VERSION => 3);
+----
+Binder Error
+
+# Column that exists in version 2
+query T
+SELECT name FROM example.data.versioned_data AT (VERSION => 2) ORDER BY name;
+----
+alice
+bob
+carol
+dave
+eve
+
+# TIMESTAMP-based time travel
+query I
+SELECT COUNT(*) FROM example.data.versioned_data AT (TIMESTAMP => TIMESTAMP '2020-06-15');
+----
+3
+
+query I
+SELECT COUNT(*) FROM example.data.versioned_data AT (TIMESTAMP => TIMESTAMP '2021-06-15');
+----
+5
+
+query I
+SELECT COUNT(*) FROM example.data.versioned_data AT (TIMESTAMP => TIMESTAMP '2022-06-15');
+----
+4
+
+# Error: version 0 does not exist
+statement error
+SELECT * FROM example.data.versioned_data AT (VERSION => 0);
+----
+Unknown version
+
+# Error: version 99 does not exist
+statement error
+SELECT * FROM example.data.versioned_data AT (VERSION => 99);
+----
+Unknown version
+
+# Error: negative version
+statement error
+SELECT * FROM example.data.versioned_data AT (VERSION => -1);
+----
+Unknown version
+
+# Timestamp boundary: exactly 2020-01-01 resolves to version 1
+query I
+SELECT COUNT(*) FROM example.data.versioned_data AT (TIMESTAMP => TIMESTAMP '2020-01-01');
+----
+3
+
+# Error: timestamp before the table existed
+statement error
+SELECT * FROM example.data.versioned_data AT (TIMESTAMP => TIMESTAMP '1990-01-01');
+----
+table did not exist before 2020
+
+# Timestamps far in the future resolve to current version
+query I
+SELECT COUNT(*) FROM example.data.versioned_data AT (TIMESTAMP => TIMESTAMP '2099-01-01');
+----
+4
+
+# Error: AT clause on non-time-travel table
+statement error
+SELECT * FROM example.data.numbers AT (VERSION => 1);
+----
+does not support time travel

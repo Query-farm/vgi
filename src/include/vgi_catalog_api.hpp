@@ -322,6 +322,17 @@ std::optional<VgiTableInfo> InvokeCatalogTableGet(const std::string &worker_path
                                                    ClientContext &context, bool worker_debug = false,
                                                    bool use_pool = true);
 
+// Invoke catalog_table_get with time-travel AT clause
+std::optional<VgiTableInfo> InvokeCatalogTableGet(const std::string &worker_path,
+                                                   const std::vector<uint8_t> &attach_id,
+                                                   const std::string &schema_name,
+                                                   const std::string &table_name,
+                                                   ClientContext &context,
+                                                   const std::string &at_unit,
+                                                   const std::string &at_value,
+                                                   bool worker_debug = false,
+                                                   bool use_pool = true);
+
 // Invoke catalog_view_get: get a specific view's metadata
 std::optional<VgiViewInfo> InvokeCatalogViewGet(const std::string &worker_path,
                                                  const std::vector<uint8_t> &attach_id,
