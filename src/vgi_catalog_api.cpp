@@ -6,6 +6,11 @@
 #include "duckdb/function/table/arrow/arrow_duck_schema.hpp"
 #include "duckdb/logging/log_manager.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
+#include "duckdb/parser/constraints/not_null_constraint.hpp"
+#include "duckdb/parser/constraints/unique_constraint.hpp"
+#include "duckdb/parser/constraints/check_constraint.hpp"
+#include "duckdb/parser/constraints/foreign_key_constraint.hpp"
+#include "duckdb/parser/parser.hpp"
 #include "vgi_arrow_ipc.hpp"
 #include "vgi_arrow_utils.hpp"
 #include "vgi_exception.hpp"
@@ -747,6 +752,31 @@ VgiTableInfo ParseTableInfo(const std::shared_ptr<arrow::RecordBatch> &batch, in
 	}
 	info.check_constraints = row["check_constraints"].value_not_null<std::vector<std::string>>();
 
+	// Parse primary_key_constraints (optional, backward-compatible)
+	auto pk = row["primary_key_constraints"].value_or(std::vector<std::vector<int32_t>>{});
+	for (const auto &p : pk) {
+		info.primary_key_constraints.push_back(std::vector<int>(p.begin(), p.end()));
+	}
+
+	// Parse foreign_key_constraints (optional, backward-compatible)
+	// Each element is IPC-serialized bytes containing fk_columns, pk_columns,
+	// referenced_table, referenced_schema
+	auto fk_bytes_list = row["foreign_key_constraints"].value_or(std::vector<std::vector<uint8_t>>{});
+	for (const auto &fk_bytes : fk_bytes_list) {
+		auto fk_batch = DeserializeFromIpcBytes(fk_bytes);
+		if (!fk_batch || fk_batch->num_rows() == 0) {
+			continue;
+		}
+		RecordBatchSingleRow fk_row(fk_batch, 0, "ForeignKeyInfo", worker_path);
+
+		VgiTableInfo::ForeignKey fk;
+		fk.fk_columns = fk_row["fk_columns"].value_not_null<std::vector<std::string>>();
+		fk.pk_columns = fk_row["pk_columns"].value_not_null<std::vector<std::string>>();
+		fk.referenced_table = fk_row["referenced_table"].value_not_null<std::string>();
+		fk.referenced_schema = fk_row["referenced_schema"].value_not_null<std::string>();
+		info.foreign_key_constraints.push_back(std::move(fk));
+	}
+
 	return info;
 }
 
@@ -905,6 +935,78 @@ CreateTableInfo CreateTableInfoFromVgiTable(ClientContext &context, VgiTableInfo
 		} else {
 			ArrowSchemaToColumnList(context, table_info.arrow_schema, create_info.columns);
 		}
+	}
+
+	// Apply NOT NULL constraints
+	for (auto idx : table_info.not_null_constraints) {
+		int adjusted = idx;
+		if (table_info.row_id_column >= 0) {
+			if (idx == table_info.row_id_column) {
+				continue; // Skip row_id column
+			}
+			if (idx > table_info.row_id_column) {
+				adjusted--;
+			}
+		}
+		create_info.constraints.push_back(make_uniq<NotNullConstraint>(LogicalIndex(adjusted)));
+	}
+
+	// Apply UNIQUE constraints
+	for (auto &cols : table_info.unique_constraints) {
+		vector<string> col_names;
+		for (auto idx : cols) {
+			int adjusted = idx;
+			if (table_info.row_id_column >= 0) {
+				if (idx == table_info.row_id_column) {
+					continue; // Skip row_id column
+				}
+				if (idx > table_info.row_id_column) {
+					adjusted--;
+				}
+			}
+			col_names.push_back(create_info.columns.GetColumn(LogicalIndex(adjusted)).Name());
+		}
+		create_info.constraints.push_back(make_uniq<UniqueConstraint>(std::move(col_names), false));
+	}
+
+	// Apply PRIMARY KEY constraints (UniqueConstraint with is_primary_key=true)
+	for (auto &cols : table_info.primary_key_constraints) {
+		vector<string> col_names;
+		for (auto idx : cols) {
+			int adjusted = idx;
+			if (table_info.row_id_column >= 0) {
+				if (idx == table_info.row_id_column) {
+					continue; // Skip row_id column
+				}
+				if (idx > table_info.row_id_column) {
+					adjusted--;
+				}
+			}
+			col_names.push_back(create_info.columns.GetColumn(LogicalIndex(adjusted)).Name());
+		}
+		create_info.constraints.push_back(make_uniq<UniqueConstraint>(std::move(col_names), true));
+	}
+
+	// Apply CHECK constraints
+	for (auto &expr_str : table_info.check_constraints) {
+		auto expressions = Parser::ParseExpressionList(expr_str);
+		if (!expressions.empty()) {
+			create_info.constraints.push_back(make_uniq<CheckConstraint>(expressions[0]->Copy()));
+		}
+	}
+
+	// Apply FOREIGN KEY constraints
+	for (auto &fk : table_info.foreign_key_constraints) {
+		ForeignKeyInfo fk_info;
+		fk_info.type = ForeignKeyType::FK_TYPE_FOREIGN_KEY_TABLE;
+		fk_info.schema = fk.referenced_schema;
+		fk_info.table = fk.referenced_table;
+		// Physical indices are not populated — VGI tables are read-only so
+		// DML enforcement is not needed. The constraint is metadata-only.
+		vector<string> pk_cols(fk.pk_columns.begin(), fk.pk_columns.end());
+		vector<string> fk_cols(fk.fk_columns.begin(), fk.fk_columns.end());
+		create_info.constraints.push_back(
+		    make_uniq<ForeignKeyConstraint>(std::move(pk_cols), std::move(fk_cols), std::move(fk_info)));
 	}
 
 	return create_info;

@@ -1,0 +1,207 @@
+# name: test/sql/integration/table/constraints.test
+# description: Test constraint metadata visibility via duckdb_constraints()
+# group: [vgi_integration_table]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# NOT NULL constraints
+# ============================================================================
+
+# departments: NOT NULL on id and name
+query TT
+SELECT table_name, constraint_column_names
+FROM duckdb_constraints()
+WHERE database_name = 'example' AND schema_name = 'data'
+  AND constraint_type = 'NOT NULL'
+  AND table_name = 'departments'
+ORDER BY constraint_column_names::VARCHAR;
+----
+departments	[id]
+departments	[name]
+
+# employees: NOT NULL on id, name, email
+query TT
+SELECT table_name, constraint_column_names
+FROM duckdb_constraints()
+WHERE database_name = 'example' AND schema_name = 'data'
+  AND constraint_type = 'NOT NULL'
+  AND table_name = 'employees'
+ORDER BY constraint_column_names::VARCHAR;
+----
+employees	[email]
+employees	[id]
+employees	[name]
+
+# projects: NOT NULL on department_id, project_code, title
+query TT
+SELECT table_name, constraint_column_names
+FROM duckdb_constraints()
+WHERE database_name = 'example' AND schema_name = 'data'
+  AND constraint_type = 'NOT NULL'
+  AND table_name = 'projects'
+ORDER BY constraint_column_names::VARCHAR;
+----
+projects	[department_id]
+projects	[project_code]
+projects	[title]
+
+# ============================================================================
+# PRIMARY KEY constraints (single column)
+# ============================================================================
+
+# departments: PK on (id)
+query TT
+SELECT table_name, constraint_column_names
+FROM duckdb_constraints()
+WHERE database_name = 'example' AND schema_name = 'data'
+  AND constraint_type = 'PRIMARY KEY'
+  AND table_name = 'departments';
+----
+departments	[id]
+
+# employees: PK on (id)
+query TT
+SELECT table_name, constraint_column_names
+FROM duckdb_constraints()
+WHERE database_name = 'example' AND schema_name = 'data'
+  AND constraint_type = 'PRIMARY KEY'
+  AND table_name = 'employees';
+----
+employees	[id]
+
+# ============================================================================
+# PRIMARY KEY constraints (composite / multi-column)
+# ============================================================================
+
+# projects: composite PK on (department_id, project_code)
+query TT
+SELECT table_name, constraint_column_names
+FROM duckdb_constraints()
+WHERE database_name = 'example' AND schema_name = 'data'
+  AND constraint_type = 'PRIMARY KEY'
+  AND table_name = 'projects';
+----
+projects	[department_id, project_code]
+
+# ============================================================================
+# UNIQUE constraints
+# ============================================================================
+
+# departments: UNIQUE on (name)
+query TT
+SELECT table_name, constraint_column_names
+FROM duckdb_constraints()
+WHERE database_name = 'example' AND schema_name = 'data'
+  AND constraint_type = 'UNIQUE'
+  AND table_name = 'departments';
+----
+departments	[name]
+
+# employees: UNIQUE on (email)
+query TT
+SELECT table_name, constraint_column_names
+FROM duckdb_constraints()
+WHERE database_name = 'example' AND schema_name = 'data'
+  AND constraint_type = 'UNIQUE'
+  AND table_name = 'employees';
+----
+employees	[email]
+
+# ============================================================================
+# CHECK constraints
+# ============================================================================
+
+# departments: CHECK (budget >= 0)
+query TT
+SELECT table_name, constraint_text
+FROM duckdb_constraints()
+WHERE database_name = 'example' AND schema_name = 'data'
+  AND constraint_type = 'CHECK'
+  AND table_name = 'departments';
+----
+departments	CHECK((budget >= 0))
+
+# ============================================================================
+# FOREIGN KEY constraints
+# ============================================================================
+
+# employees: FK department_id -> departments(id)
+query TTTT
+SELECT table_name, constraint_column_names, referenced_table, referenced_column_names
+FROM duckdb_constraints()
+WHERE database_name = 'example' AND schema_name = 'data'
+  AND constraint_type = 'FOREIGN KEY'
+  AND table_name = 'employees';
+----
+employees	[department_id]	departments	[id]
+
+# projects: FK department_id -> departments(id)
+query TTTT
+SELECT table_name, constraint_column_names, referenced_table, referenced_column_names
+FROM duckdb_constraints()
+WHERE database_name = 'example' AND schema_name = 'data'
+  AND constraint_type = 'FOREIGN KEY'
+  AND table_name = 'projects';
+----
+projects	[department_id]	departments	[id]
+
+# ============================================================================
+# Verify that data can still be queried from constrained tables
+# ============================================================================
+
+query IT
+SELECT id, name FROM example.data.departments ORDER BY id;
+----
+1	Engineering
+2	Sales
+3	HR
+
+query ITT
+SELECT id, name, email FROM example.data.employees ORDER BY id;
+----
+1	Alice	alice@co.com
+2	Bob	bob@co.com
+3	Carol	carol@co.com
+4	Dave	dave@co.com
+5	Eve	eve@co.com
+
+query ITT
+SELECT department_id, project_code, title FROM example.data.projects ORDER BY project_code;
+----
+1	P001	Backend API
+1	P002	Frontend UI
+2	P003	Sales Portal
+
+# ============================================================================
+# Constraint count summary
+# ============================================================================
+
+# Total constraints across constraint tables
+query TI
+SELECT constraint_type, COUNT(*)
+FROM duckdb_constraints()
+WHERE database_name = 'example' AND schema_name = 'data'
+  AND table_name IN ('departments', 'employees', 'projects')
+GROUP BY constraint_type
+ORDER BY constraint_type;
+----
+CHECK	1
+FOREIGN KEY	2
+NOT NULL	8
+PRIMARY KEY	3
+UNIQUE	2
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;

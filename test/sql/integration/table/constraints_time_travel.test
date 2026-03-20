@@ -1,0 +1,137 @@
+# name: test/sql/integration/table/constraints_time_travel.test
+# description: Test time travel queries on tables with constraints and constraint evolution
+# group: [vgi_integration_table]
+
+# The versioned_constraints table demonstrates constraint evolution:
+# Version 1: schema (id, name) — NOT NULL on id only
+# Version 2: schema (id, name, email) — NOT NULL on id+name, PK on id, UNIQUE on email
+# Version 3: schema (id, name, email, department_id) — V2 + FK department_id→departments.id
+#
+# duckdb_constraints() always reflects the default version's constraints (V3).
+# Time travel changes schema/data for queries but not the constraint metadata.
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# Time travel data queries work on the versioned_constraints table
+# ============================================================================
+
+# Version 1: (id, name) — 2 rows
+query IT
+SELECT * FROM example.data.versioned_constraints AT (VERSION => 1) ORDER BY id;
+----
+1	Alice
+2	Bob
+
+# Version 2: (id, name, email) — 3 rows
+query ITT
+SELECT * FROM example.data.versioned_constraints AT (VERSION => 2) ORDER BY id;
+----
+1	Alice	a@co
+2	Bob	b@co
+3	Carol	c@co
+
+# Version 3: (id, name, email, department_id) — 3 rows
+query ITTI
+SELECT * FROM example.data.versioned_constraints AT (VERSION => 3) ORDER BY id;
+----
+1	Alice	a@co	1
+2	Bob	b@co	2
+3	Carol	c@co	1
+
+# Default (no AT) = version 3
+query ITTI
+SELECT * FROM example.data.versioned_constraints ORDER BY id;
+----
+1	Alice	a@co	1
+2	Bob	b@co	2
+3	Carol	c@co	1
+
+# ============================================================================
+# Schema evolution: columns that don't exist at a version cause binder error
+# ============================================================================
+
+statement error
+SELECT email FROM example.data.versioned_constraints AT (VERSION => 1);
+----
+Binder Error
+
+statement error
+SELECT department_id FROM example.data.versioned_constraints AT (VERSION => 2);
+----
+Binder Error
+
+# ============================================================================
+# Default constraints visible via duckdb_constraints()
+# These reflect the current (V3) table definition
+# ============================================================================
+
+# The versioned_constraints table's default constraints (V3)
+query TT
+SELECT constraint_type, constraint_column_names
+FROM duckdb_constraints()
+WHERE database_name = 'example' AND schema_name = 'data'
+  AND table_name = 'versioned_constraints'
+ORDER BY constraint_type, constraint_column_names::VARCHAR;
+----
+FOREIGN KEY	[department_id]
+NOT NULL	[id]
+NOT NULL	[name]
+PRIMARY KEY	[id]
+UNIQUE	[email]
+
+# FK references are correct on the versioned_constraints table
+query TTT
+SELECT constraint_column_names, referenced_table, referenced_column_names
+FROM duckdb_constraints()
+WHERE database_name = 'example' AND schema_name = 'data'
+  AND table_name = 'versioned_constraints'
+  AND constraint_type = 'FOREIGN KEY';
+----
+[department_id]	departments	[id]
+
+# ============================================================================
+# Time travel queries on regular constrained tables work correctly
+# ============================================================================
+
+# departments table has constraints but no time travel
+statement error
+SELECT * FROM example.data.departments AT (VERSION => 1);
+----
+does not support time travel
+
+# Regular queries on constrained tables still work
+query IR
+SELECT id, budget FROM example.data.departments ORDER BY id;
+----
+1	500000.0
+2	300000.0
+3	200000.0
+
+# ============================================================================
+# Verify error for invalid versions
+# ============================================================================
+
+statement error
+SELECT * FROM example.data.versioned_constraints AT (VERSION => 0);
+----
+Unknown version
+
+statement error
+SELECT * FROM example.data.versioned_constraints AT (VERSION => 99);
+----
+Unknown version
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;

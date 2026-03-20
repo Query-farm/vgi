@@ -126,6 +126,16 @@ struct VgiTableInfo {
 	std::vector<int> not_null_constraints;
 	std::vector<std::vector<int>> unique_constraints;
 	std::vector<std::string> check_constraints;
+	std::vector<std::vector<int>> primary_key_constraints;
+
+	// Foreign key constraints (deserialized from IPC bytes)
+	struct ForeignKey {
+		std::vector<std::string> fk_columns;        // Column names in this table
+		std::vector<std::string> pk_columns;        // Column names in referenced table
+		std::string referenced_table;
+		std::string referenced_schema;
+	};
+	std::vector<ForeignKey> foreign_key_constraints;
 };
 
 // View metadata from the worker
