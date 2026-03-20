@@ -189,14 +189,14 @@ query TI
 SELECT constraint_type, COUNT(*)
 FROM duckdb_constraints()
 WHERE database_name = 'example' AND schema_name = 'data'
-  AND table_name IN ('departments', 'employees', 'projects')
+  AND table_name IN ('departments', 'employees', 'products', 'projects')
 GROUP BY constraint_type
 ORDER BY constraint_type;
 ----
 CHECK	1
 FOREIGN KEY	2
-NOT NULL	8
-PRIMARY KEY	3
+NOT NULL	9
+PRIMARY KEY	4
 UNIQUE	2
 
 # ============================================================================

@@ -1009,6 +1009,31 @@ CreateTableInfo CreateTableInfoFromVgiTable(ClientContext &context, VgiTableInfo
 		    make_uniq<ForeignKeyConstraint>(std::move(pk_cols), std::move(fk_cols), std::move(fk_info)));
 	}
 
+	// Apply column defaults from Arrow field metadata
+	if (table_info.arrow_schema) {
+		for (int i = 0; i < table_info.arrow_schema->num_fields(); i++) {
+			if (table_info.row_id_column >= 0 && i == table_info.row_id_column) {
+				continue;
+			}
+			auto &arrow_field = table_info.arrow_schema->field(i);
+			if (arrow_field->HasMetadata()) {
+				auto default_key_idx = arrow_field->metadata()->FindKey("default");
+				if (default_key_idx >= 0) {
+					auto default_expr = arrow_field->metadata()->value(default_key_idx);
+					auto expressions = Parser::ParseExpressionList(default_expr);
+					if (!expressions.empty()) {
+						int adjusted = i;
+						if (table_info.row_id_column >= 0 && i > table_info.row_id_column) {
+							adjusted--;
+						}
+						auto &col = create_info.columns.GetColumnMutable(LogicalIndex(adjusted));
+						col.SetDefaultValue(std::move(expressions[0]));
+					}
+				}
+			}
+		}
+	}
+
 	return create_info;
 }
 

@@ -1,0 +1,83 @@
+# name: test/sql/integration/table/defaults.test
+# description: Test default column value metadata visibility via duckdb_columns()
+# group: [vgi_integration_table]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# Column defaults on products table (multiple default types)
+# ============================================================================
+
+query TT
+SELECT column_name, column_default
+FROM duckdb_columns()
+WHERE database_name = 'example' AND schema_name = 'data'
+  AND table_name = 'products'
+  AND column_default IS NOT NULL
+ORDER BY column_name;
+----
+name	'unknown'
+price	9.99
+quantity	0
+
+# Columns without defaults have NULL column_default
+query TT
+SELECT column_name, column_default
+FROM duckdb_columns()
+WHERE database_name = 'example' AND schema_name = 'data'
+  AND table_name = 'products'
+  AND column_default IS NULL
+ORDER BY column_name;
+----
+id	NULL
+
+# ============================================================================
+# Column defaults on departments table (single default)
+# ============================================================================
+
+query TT
+SELECT column_name, column_default
+FROM duckdb_columns()
+WHERE database_name = 'example' AND schema_name = 'data'
+  AND table_name = 'departments'
+  AND column_default IS NOT NULL;
+----
+budget	0
+
+# ============================================================================
+# Tables without defaults have no column_default values
+# ============================================================================
+
+query I
+SELECT COUNT(*)
+FROM duckdb_columns()
+WHERE database_name = 'example' AND schema_name = 'data'
+  AND table_name = 'employees'
+  AND column_default IS NOT NULL;
+----
+0
+
+# ============================================================================
+# Data is still queryable from tables with defaults
+# ============================================================================
+
+query ITIR
+SELECT id, name, quantity, price FROM example.data.products ORDER BY id;
+----
+1	Widget	100	9.99
+2	Gadget	50	24.99
+3	Doohickey	200	4.99
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;
