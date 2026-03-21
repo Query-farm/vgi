@@ -32,5 +32,58 @@ std::string HttpPostArrowIpc(ClientContext &context,
                               const std::string &url,
                               const std::vector<uint8_t> &body);
 
+// HTTP GET raw bytes from a URL. Used for fetching externalized batches.
+// Handles X-VGI-Content-Encoding: zstd decompression. No auth headers sent.
+std::string HttpGetBytes(ClientContext &context, const std::string &url);
+
+// Resolve an external location pointer batch by fetching and parsing the URL.
+// Returns the resolved data batch. Throws on redirect loops or fetch failures.
+// worker_path, invocation_id_hex, attach_id_hex are passed to HandleBatchLogMessage
+// for any log batches embedded in the externalized IPC stream.
+UnaryResponseResult ResolveExternalLocation(ClientContext &context,
+                                             const std::string &location_url,
+                                             const std::string &worker_path = "",
+                                             const std::string &invocation_id_hex = "",
+                                             const std::string &attach_id_hex = "");
+
+// Check if a batch result is a pointer batch and resolve it if so.
+// Returns the original result if not a pointer batch, or the resolved result.
+// worker_path is forwarded to ResolveExternalLocation for log context.
+UnaryResponseResult MaybeResolveExternalLocation(ClientContext &context,
+                                                   UnaryResponseResult &result,
+                                                   const std::string &worker_path = "");
+
+// Server capabilities discovered via OPTIONS /__capabilities__
+struct ServerCapabilities {
+	bool discovered = false;
+	int64_t max_request_bytes = -1;   // -1 = no limit advertised
+	bool upload_url_support = false;
+	int64_t max_upload_bytes = -1;    // -1 = no limit advertised
+};
+
+// Upload URL returned by __upload_url__/init
+struct UploadUrl {
+	std::string upload_url;
+	std::string download_url;
+};
+
+// Discover server capabilities via OPTIONS request.
+ServerCapabilities HttpDiscoverCapabilities(ClientContext &context, const std::string &base_url);
+
+// Request upload URLs from the server. Posts to {base_url}/__upload_url__/init.
+std::vector<UploadUrl> HttpRequestUploadUrls(ClientContext &context,
+                                               const std::string &base_url,
+                                               int count);
+
+// HTTP PUT raw bytes to a URL with optional zstd compression.
+void HttpPutBytes(ClientContext &context, const std::string &url,
+                   const std::vector<uint8_t> &data, bool compress_zstd = false);
+
+// Serialize a pointer batch: zero-row batch with schema + vgi_rpc.location metadata.
+// Optionally includes stream_state token in metadata.
+std::vector<uint8_t> SerializePointerBatch(const std::shared_ptr<arrow::Schema> &schema,
+                                             const std::string &location_url,
+                                             const std::string &stream_state_token = "");
+
 } // namespace vgi
 } // namespace duckdb

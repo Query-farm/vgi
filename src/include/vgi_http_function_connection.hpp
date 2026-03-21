@@ -11,6 +11,7 @@
 #include "duckdb/main/client_context.hpp"
 
 #include "vgi_arrow_utils.hpp"
+#include "vgi_http_client.hpp"
 #include "vgi_ifunction_connection.hpp"
 #include "vgi_protocol.hpp"
 
@@ -96,6 +97,9 @@ private:
 
 	// Input schema for exchange mode
 	std::shared_ptr<arrow::Schema> input_schema_;
+
+	// Server capabilities (lazy-discovered)
+	ServerCapabilities capabilities_;
 
 	// HTTP streaming state
 	std::string stream_state_token_;

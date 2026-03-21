@@ -12,8 +12,19 @@ shift 2>/dev/null || true
 LOG_FILE="/tmp/vgi-http-test-server.log"
 
 # Start HTTP server with auto-selected port; stdout goes to a pipe so we can read PORT:XXXX
-uv run --project "$VGI_PYTHON_DIR" vgi-serve vgi.examples.worker:ExampleWorker \
-    --http --port 0 > "$LOG_FILE" 2>&1 &
+if [[ "${VGI_DEMO_STORAGE:-}" == "1" ]]; then
+    THRESHOLD="${VGI_EXTERNALIZE_THRESHOLD_BYTES:-1}"
+    COMPRESSION="${VGI_EXTERNALIZE_COMPRESSION:-none}"
+    echo "Demo storage mode: threshold=${THRESHOLD} compression=${COMPRESSION}"
+    uv run --project "$VGI_PYTHON_DIR" vgi-example-http \
+        --port 0 --demo-storage \
+        --externalize-threshold-bytes "$THRESHOLD" \
+        --externalize-compression "$COMPRESSION" \
+        > "$LOG_FILE" 2>&1 &
+else
+    uv run --project "$VGI_PYTHON_DIR" vgi-serve vgi.examples.worker:ExampleWorker \
+        --http --port 0 > "$LOG_FILE" 2>&1 &
+fi
 SERVER_PID=$!
 
 cleanup() {

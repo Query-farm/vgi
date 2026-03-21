@@ -32,6 +32,9 @@ constexpr const char *RPC_REQUEST_ID_KEY = "vgi_rpc.request_id";
 // HTTP streaming state token metadata key
 constexpr const char *RPC_STREAM_STATE_KEY = "vgi_rpc.stream_state#b64";
 
+// External location metadata key (pointer batch)
+constexpr const char *RPC_LOCATION_KEY = "vgi_rpc.location";
+
 // ============================================================================
 // Batch Classification
 // ============================================================================
@@ -44,7 +47,8 @@ constexpr const char *RPC_STREAM_STATE_KEY = "vgi_rpc.stream_state#b64";
 enum class RpcBatchType {
 	DATA,
 	LOG,
-	ERROR
+	ERROR,
+	EXTERNAL_LOCATION
 };
 
 // Classify a batch according to the vgi_rpc wire protocol.

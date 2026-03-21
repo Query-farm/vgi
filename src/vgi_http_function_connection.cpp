@@ -13,6 +13,18 @@
 namespace duckdb {
 namespace vgi {
 
+// Helper: extract stream_state token value from batch metadata, or return empty string.
+static std::string ExtractStreamStateValue(const std::shared_ptr<arrow::KeyValueMetadata> &metadata) {
+	if (!metadata) {
+		return "";
+	}
+	int idx = metadata->FindKey(RPC_STREAM_STATE_KEY);
+	if (idx >= 0) {
+		return metadata->value(idx);
+	}
+	return "";
+}
+
 // ============================================================================
 // Constructor
 // ============================================================================
@@ -151,14 +163,19 @@ void HttpFunctionConnection::BufferDataBatches(const std::string &response_body,
 			continue;
 		}
 
-		// Check for stream_state in the last batch
-		if (bwm.custom_metadata) {
-			int state_idx = bwm.custom_metadata->FindKey(RPC_STREAM_STATE_KEY);
-			if (state_idx >= 0) {
-				stream_state_token_ = bwm.custom_metadata->value(state_idx);
-			}
+		// Resolve external location pointer batches.
+		// Stream_state is inside the resolved data, not on the pointer batch itself.
+		if (batch_type == RpcBatchType::EXTERNAL_LOCATION) {
+			auto location_url = bwm.custom_metadata->value(bwm.custom_metadata->FindKey(RPC_LOCATION_KEY));
+			auto resolved = ResolveExternalLocation(context_, location_url,
+			                                         base_url_, GetExecutionIdHex(), GetAttachIdHex());
+			buffered_batches_.push_back(resolved.batch);
+			ExtractStreamState(resolved.batch, resolved.metadata);
+			continue;
 		}
 
+		// Extract stream_state from regular data batches
+		ExtractStreamState(bwm.batch, bwm.custom_metadata);
 		buffered_batches_.push_back(bwm.batch);
 	}
 }
@@ -281,6 +298,17 @@ InitResult HttpFunctionConnection::PerformInit(const std::vector<int32_t> &proje
 	auto header_result = ReadStreamHeaderFromBuffer(
 	    reinterpret_cast<const uint8_t *>(response_body.data()),
 	    response_body.size(), &context_, init_url);
+
+	// Resolve external location pointer batch in stream header if needed
+	if (header_result.header.header_batch && header_result.header.metadata) {
+		int loc_idx = header_result.header.metadata->FindKey(RPC_LOCATION_KEY);
+		if (loc_idx >= 0) {
+			auto location_url = header_result.header.metadata->value(loc_idx);
+			auto resolved = ResolveExternalLocation(context_, location_url, base_url_);
+			header_result.header.header_batch = resolved.batch;
+			header_result.header.metadata = resolved.metadata;
+		}
+	}
 
 	auto init_response = ParseGlobalInitResponse(header_result.header.header_batch, base_url_);
 	execution_id_ = init_response.execution_id;
@@ -439,6 +467,21 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 	// Serialize the input batch with stream_state token
 	auto body = SerializeBatchWithState(input_batch, input_schema_);
 
+	// Check if batch exceeds max_request_bytes and upload URL support is available
+	if (!capabilities_.discovered) {
+		capabilities_ = HttpDiscoverCapabilities(context_, base_url_);
+	}
+	if (capabilities_.max_request_bytes > 0 &&
+	    static_cast<int64_t>(body.size()) > capabilities_.max_request_bytes &&
+	    capabilities_.upload_url_support) {
+		// Upload via server-vended URL, send pointer batch instead
+		auto urls = HttpRequestUploadUrls(context_, base_url_, 1);
+		if (!urls.empty()) {
+			HttpPutBytes(context_, urls[0].upload_url, body, false);
+			body = SerializePointerBatch(input_schema_, urls[0].download_url, stream_state_token_);
+		}
+	}
+
 	std::string exchange_url = base_url_ + "/init/exchange";
 
 	auto response_body = HttpPostArrowIpc(context_, exchange_url, body);
@@ -477,14 +520,21 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 			continue;
 		}
 
-		// Check for stream_state
-		if (bwm.custom_metadata) {
-			int state_idx = bwm.custom_metadata->FindKey(RPC_STREAM_STATE_KEY);
-			if (state_idx >= 0) {
-				new_state_token = bwm.custom_metadata->value(state_idx);
+		// Resolve external location pointer batches.
+		// Stream_state is inside the resolved data, not on the pointer batch.
+		if (batch_type == RpcBatchType::EXTERNAL_LOCATION) {
+			auto location_url = bwm.custom_metadata->value(bwm.custom_metadata->FindKey(RPC_LOCATION_KEY));
+			auto resolved = ResolveExternalLocation(context_, location_url,
+			                                         base_url_, GetExecutionIdHex(), GetAttachIdHex());
+			if (!output_batch) {
+				output_batch = resolved.batch;
 			}
+			new_state_token = ExtractStreamStateValue(resolved.metadata);
+			continue;
 		}
 
+		// Data batch — extract stream_state
+		new_state_token = ExtractStreamStateValue(bwm.custom_metadata);
 		if (!output_batch) {
 			output_batch = bwm.batch;
 		}

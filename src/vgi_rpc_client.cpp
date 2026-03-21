@@ -39,6 +39,12 @@ RpcBatchType ClassifyBatch(const std::shared_ptr<arrow::RecordBatch> &batch,
 		}
 	}
 
+	// Check for external location (pointer batch)
+	int loc_idx = custom_metadata->FindKey(RPC_LOCATION_KEY);
+	if (loc_idx >= 0) {
+		return RpcBatchType::EXTERNAL_LOCATION;
+	}
+
 	// Zero-row batch with unrecognized metadata → DATA (void return, stream-finish)
 	return RpcBatchType::DATA;
 }

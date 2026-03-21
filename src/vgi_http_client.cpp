@@ -77,6 +77,16 @@ static std::string NormalizeBaseUrl(const std::string &url) {
 	return url;
 }
 
+// Helper: apply the configurable HTTP timeout setting to request params.
+static void ApplyHttpTimeout(ClientContext &context, HTTPParams &params) {
+	Value timeout_val;
+	if (context.TryGetCurrentSetting("vgi_http_timeout_seconds", timeout_val)) {
+		params.timeout = static_cast<uint64_t>(timeout_val.GetValue<int64_t>());
+	} else {
+		params.timeout = 300; // fallback: 5 minutes
+	}
+}
+
 // Internal: perform a single HTTP POST with optional auth header
 static std::string HttpPostArrowIpcInternal(ClientContext &context,
                                              const std::string &url,
@@ -87,13 +97,7 @@ static std::string HttpPostArrowIpcInternal(ClientContext &context,
 	auto &http_util = HTTPUtil::Get(db);
 	auto params = http_util.InitializeParameters(context, url);
 
-	// Use the configurable HTTP timeout setting (default 5 minutes)
-	Value timeout_val;
-	if (context.TryGetCurrentSetting("vgi_http_timeout_seconds", timeout_val)) {
-		params->timeout = static_cast<uint64_t>(timeout_val.GetValue<int64_t>());
-	} else {
-		params->timeout = 300; // fallback: 5 minutes
-	}
+	ApplyHttpTimeout(context, *params);
 
 	// Compress the request body with zstd
 	auto compressed_body = ZstdCompress(body.data(), body.size());
@@ -210,12 +214,316 @@ UnaryResponseResult HttpInvokeUnary(ClientContext &context,
 	    reinterpret_cast<const uint8_t *>(response_body.data()),
 	    response_body.size(), &context, url);
 
+	// Resolve external location pointer batches
+	result = MaybeResolveExternalLocation(context, result, base_url);
+
 	VGI_LOG(context, "http.invoke_unary_result",
 	        {{"url", url},
 	         {"method", method_name},
 	         {"has_batch", result.batch ? "true" : "false"}});
 
 	return result;
+}
+
+// ============================================================================
+// External Location Support
+// ============================================================================
+
+std::string HttpGetBytes(ClientContext &context, const std::string &url) {
+	auto &db = *context.db;
+	auto &http_util = HTTPUtil::Get(db);
+	auto params = http_util.InitializeParameters(context, url);
+
+	ApplyHttpTimeout(context, *params);
+
+	HTTPHeaders headers;
+	headers.Insert("X-VGI-Accept-Encoding", "zstd");
+	// No auth headers — pre-signed URLs break with extra Authorization headers
+
+	// Accumulate response body via content handler
+	std::string body;
+	auto response_handler = [](const HTTPResponse &) { return true; };
+	auto content_handler = [&body](const_data_ptr_t data, idx_t data_length) {
+		body.append(reinterpret_cast<const char *>(data), data_length);
+		return true;
+	};
+
+	GetRequestInfo get(url, headers, *params, response_handler, content_handler);
+	auto response = http_util.Request(get);
+
+	if (!response->Success()) {
+		throw IOException("VGI external location fetch failed (HTTP %d) [url: %s]",
+		                  static_cast<int>(response->status), url);
+	}
+
+	// Decompress zstd if server indicates it
+	if (response->HasHeader("X-VGI-Content-Encoding") &&
+	    response->GetHeaderValue("X-VGI-Content-Encoding") == "zstd" && !body.empty()) {
+		return ZstdDecompress(body.data(), body.size());
+	}
+
+	return body;
+}
+
+UnaryResponseResult ResolveExternalLocation(ClientContext &context,
+                                             const std::string &location_url,
+                                             const std::string &worker_path,
+                                             const std::string &invocation_id_hex,
+                                             const std::string &attach_id_hex) {
+	// Fetch the external data
+	auto body = HttpGetBytes(context, location_url);
+
+	if (body.empty()) {
+		throw IOException("VGI external location returned empty response [url: %s]", location_url);
+	}
+
+	// Parse the externalized IPC stream with proper log context.
+	// The stream may contain log batches (bundled by maybe_externalize_collector)
+	// followed by a data batch.
+	auto alloc_result = arrow::AllocateBuffer(static_cast<int64_t>(body.size()));
+	if (!alloc_result.ok()) {
+		throw IOException("Failed to allocate buffer for external location: %s",
+		                  alloc_result.status().ToString());
+	}
+	auto owned = std::shared_ptr<arrow::Buffer>(std::move(alloc_result).ValueUnsafe());
+	memcpy(const_cast<uint8_t *>(owned->data()), body.data(), body.size());
+
+	auto input = std::make_shared<arrow::io::BufferReader>(owned);
+	auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(input);
+	if (!reader_result.ok()) {
+		throw IOException("Failed to open external location IPC stream: %s [url: %s]",
+		                  reader_result.status().ToString(), location_url);
+	}
+	auto reader = reader_result.ValueUnsafe();
+
+	// Use the provided worker_path for log context, falling back to location_url
+	auto &log_worker_path = worker_path.empty() ? location_url : worker_path;
+
+	UnaryResponseResult result;
+	while (true) {
+		auto read_result = reader->ReadNext();
+		if (!read_result.ok() || !read_result.ValueUnsafe().batch) {
+			break;
+		}
+		auto &bwm = read_result.ValueUnsafe();
+		auto batch_type = ClassifyBatch(bwm.batch, bwm.custom_metadata);
+
+		if (batch_type == RpcBatchType::ERROR) {
+			HandleBatchLogMessage(bwm.batch, bwm.custom_metadata, &context, log_worker_path,
+			                     -1, invocation_id_hex, attach_id_hex);
+			throw IOException("VGI external location error [url: %s]", location_url);
+		}
+		if (batch_type == RpcBatchType::LOG) {
+			HandleBatchLogMessage(bwm.batch, bwm.custom_metadata, &context, log_worker_path,
+			                     -1, invocation_id_hex, attach_id_hex);
+			continue;
+		}
+		if (batch_type == RpcBatchType::EXTERNAL_LOCATION) {
+			throw IOException("VGI external location redirect loop: resolved batch from %s "
+			                  "contains another vgi_rpc.location", location_url);
+		}
+
+		// Data batch
+		result.batch = bwm.batch;
+		result.metadata = bwm.custom_metadata;
+		break;
+	}
+
+	// Drain remaining
+	while (true) {
+		auto drain_result = reader->ReadNext();
+		if (!drain_result.ok() || !drain_result.ValueUnsafe().batch) {
+			break;
+		}
+		auto &bwm = drain_result.ValueUnsafe();
+		auto bt = ClassifyBatch(bwm.batch, bwm.custom_metadata);
+		if (bt == RpcBatchType::LOG || bt == RpcBatchType::ERROR) {
+			HandleBatchLogMessage(bwm.batch, bwm.custom_metadata, &context, log_worker_path,
+			                     -1, invocation_id_hex, attach_id_hex);
+		}
+	}
+
+	if (!result.batch) {
+		throw IOException("VGI external location contained no data batch [url: %s]", location_url);
+	}
+
+	return result;
+}
+
+UnaryResponseResult MaybeResolveExternalLocation(ClientContext &context,
+                                                   UnaryResponseResult &result,
+                                                   const std::string &worker_path) {
+	if (!result.metadata) {
+		return std::move(result);
+	}
+	int loc_idx = result.metadata->FindKey(RPC_LOCATION_KEY);
+	if (loc_idx < 0) {
+		return std::move(result);
+	}
+
+	auto location_url = result.metadata->value(loc_idx);
+	return ResolveExternalLocation(context, location_url, worker_path);
+}
+
+// ============================================================================
+// Capability Discovery and Upload URLs
+// ============================================================================
+
+// Parse capability headers from an HTTP response (set by middleware on every response).
+static ServerCapabilities ParseCapabilityHeaders(const HTTPResponse &response) {
+	ServerCapabilities caps;
+	caps.discovered = true;
+
+	if (response.HasHeader("VGI-Max-Request-Bytes")) {
+		try {
+			caps.max_request_bytes = std::stoll(response.GetHeaderValue("VGI-Max-Request-Bytes"));
+		} catch (...) {}
+	}
+	if (response.HasHeader("VGI-Upload-URL-Support")) {
+		caps.upload_url_support = response.GetHeaderValue("VGI-Upload-URL-Support") == "true";
+	}
+	if (response.HasHeader("VGI-Max-Upload-Bytes")) {
+		try {
+			caps.max_upload_bytes = std::stoll(response.GetHeaderValue("VGI-Max-Upload-Bytes"));
+		} catch (...) {}
+	}
+
+	return caps;
+}
+
+ServerCapabilities HttpDiscoverCapabilities(ClientContext &context, const std::string &base_url) {
+	// Capability headers are set by middleware on ALL responses (including errors).
+	// Use a HEAD request to discover them cheaply. Append "/" to ensure a valid path.
+	auto url = NormalizeBaseUrl(base_url) + "/";
+
+	auto &db = *context.db;
+	auto &http_util = HTTPUtil::Get(db);
+	auto params = http_util.InitializeParameters(context, url);
+	ApplyHttpTimeout(context, *params);
+
+	HTTPHeaders headers;
+	HeadRequestInfo head(url, headers, *params);
+	auto response = http_util.Request(head);
+
+	// Parse capability headers regardless of status code — middleware adds them to all responses
+	return ParseCapabilityHeaders(*response);
+}
+
+std::vector<UploadUrl> HttpRequestUploadUrls(ClientContext &context,
+                                               const std::string &base_url,
+                                               int count) {
+	// Serialize Arrow batch {count: int64}
+	auto count_field = arrow::field("count", arrow::int64());
+	auto schema = arrow::schema({count_field});
+	auto count_array_result = arrow::MakeArrayFromScalar(arrow::Int64Scalar(count), 1);
+	if (!count_array_result.ok()) {
+		throw IOException("Failed to create count array for upload URL request");
+	}
+	auto batch = arrow::RecordBatch::Make(schema, 1, {count_array_result.ValueUnsafe()});
+
+	// POST to __upload_url__/init (HttpInvokeUnary normalizes base_url internally)
+	auto result = HttpInvokeUnary(context, base_url, "__upload_url__/init", batch);
+
+	if (!result.batch || result.batch->num_rows() == 0) {
+		throw IOException("VGI server returned no upload URLs [url: %s]", base_url);
+	}
+
+	// Parse response: {upload_url: utf8, download_url: utf8, expires_at: timestamp}
+	auto upload_col = std::static_pointer_cast<arrow::StringArray>(result.batch->GetColumnByName("upload_url"));
+	auto download_col = std::static_pointer_cast<arrow::StringArray>(result.batch->GetColumnByName("download_url"));
+
+	if (!upload_col || !download_col) {
+		throw IOException("VGI upload URL response missing required columns [url: %s]", base_url);
+	}
+
+	std::vector<UploadUrl> urls;
+	for (int64_t i = 0; i < result.batch->num_rows(); i++) {
+		urls.push_back({upload_col->GetString(i), download_col->GetString(i)});
+	}
+	return urls;
+}
+
+void HttpPutBytes(ClientContext &context, const std::string &url,
+                   const std::vector<uint8_t> &data, bool compress_zstd) {
+	auto &db = *context.db;
+	auto &http_util = HTTPUtil::Get(db);
+	auto params = http_util.InitializeParameters(context, url);
+	ApplyHttpTimeout(context, *params);
+
+	HTTPHeaders headers;
+	std::string content_type = "application/octet-stream";
+
+	const uint8_t *body_data = data.data();
+	size_t body_size = data.size();
+	std::vector<uint8_t> compressed;
+
+	if (compress_zstd) {
+		compressed = ZstdCompress(data.data(), data.size());
+		body_data = compressed.data();
+		body_size = compressed.size();
+		headers.Insert("Content-Encoding", "zstd");
+		headers.Insert("X-VGI-Content-Encoding", "zstd");
+	}
+
+	PutRequestInfo put(url, headers, *params,
+	                   reinterpret_cast<const_data_ptr_t>(body_data),
+	                   static_cast<idx_t>(body_size),
+	                   content_type);
+	auto response = http_util.Request(put);
+
+	if (!response->Success()) {
+		throw IOException("VGI upload failed (HTTP %d) [url: %s]",
+		                  static_cast<int>(response->status), url);
+	}
+}
+
+std::vector<uint8_t> SerializePointerBatch(const std::shared_ptr<arrow::Schema> &schema,
+                                             const std::string &location_url,
+                                             const std::string &stream_state_token) {
+	// Build zero-row batch with empty arrays matching the schema
+	std::vector<std::shared_ptr<arrow::Array>> empty_arrays;
+	for (int i = 0; i < schema->num_fields(); i++) {
+		auto empty_result = arrow::MakeEmptyArray(schema->field(i)->type());
+		if (!empty_result.ok()) {
+			throw IOException("Failed to create empty array for pointer batch: %s",
+			                  empty_result.status().ToString());
+		}
+		empty_arrays.push_back(empty_result.ValueUnsafe());
+	}
+	auto zero_batch = arrow::RecordBatch::Make(schema, 0, empty_arrays);
+
+	// Build metadata: location key + optional stream_state
+	auto metadata = arrow::KeyValueMetadata::Make({RPC_LOCATION_KEY}, {location_url});
+	if (!stream_state_token.empty()) {
+		metadata = metadata->Merge(*arrow::KeyValueMetadata::Make(
+		    {RPC_STREAM_STATE_KEY}, {stream_state_token}));
+	}
+
+	// Serialize as IPC stream
+	auto sink_result = arrow::io::BufferOutputStream::Create();
+	if (!sink_result.ok()) {
+		throw IOException("Failed to create buffer for pointer batch: %s", sink_result.status().ToString());
+	}
+	auto sink = sink_result.ValueUnsafe();
+	auto writer_result = arrow::ipc::MakeStreamWriter(sink, schema);
+	if (!writer_result.ok()) {
+		throw IOException("Failed to create IPC writer for pointer batch: %s", writer_result.status().ToString());
+	}
+	auto writer = writer_result.ValueUnsafe();
+	auto status = writer->WriteRecordBatch(*zero_batch, metadata);
+	if (!status.ok()) {
+		throw IOException("Failed to write pointer batch: %s", status.ToString());
+	}
+	status = writer->Close();
+	if (!status.ok()) {
+		throw IOException("Failed to close pointer batch writer: %s", status.ToString());
+	}
+	auto finish_result = sink->Finish();
+	if (!finish_result.ok()) {
+		throw IOException("Failed to finish pointer batch buffer: %s", finish_result.status().ToString());
+	}
+	auto buffer = finish_result.ValueUnsafe();
+	return std::vector<uint8_t>(buffer->data(), buffer->data() + buffer->size());
 }
 
 } // namespace vgi
