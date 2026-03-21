@@ -35,6 +35,9 @@ constexpr const char *RPC_STREAM_STATE_KEY = "vgi_rpc.stream_state#b64";
 // External location metadata key (pointer batch)
 constexpr const char *RPC_LOCATION_KEY = "vgi_rpc.location";
 
+// External location SHA-256 checksum metadata key (pointer batch)
+constexpr const char *RPC_LOCATION_SHA256_KEY = "vgi_rpc.location.sha256";
+
 // ============================================================================
 // Batch Classification
 // ============================================================================

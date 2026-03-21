@@ -40,11 +40,14 @@ std::string HttpGetBytes(ClientContext &context, const std::string &url);
 // Returns the resolved data batch. Throws on redirect loops or fetch failures.
 // worker_path, invocation_id_hex, attach_id_hex are passed to HandleBatchLogMessage
 // for any log batches embedded in the externalized IPC stream.
+// If pointer_metadata is provided and contains RPC_LOCATION_SHA256_KEY,
+// the fetched bytes are verified against the expected SHA-256 checksum.
 UnaryResponseResult ResolveExternalLocation(ClientContext &context,
                                              const std::string &location_url,
                                              const std::string &worker_path = "",
                                              const std::string &invocation_id_hex = "",
-                                             const std::string &attach_id_hex = "");
+                                             const std::string &attach_id_hex = "",
+                                             const std::shared_ptr<arrow::KeyValueMetadata> &pointer_metadata = nullptr);
 
 // Check if a batch result is a pointer batch and resolve it if so.
 // Returns the original result if not a pointer batch, or the resolved result.

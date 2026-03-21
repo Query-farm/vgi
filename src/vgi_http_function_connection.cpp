@@ -168,7 +168,8 @@ void HttpFunctionConnection::BufferDataBatches(const std::string &response_body,
 		if (batch_type == RpcBatchType::EXTERNAL_LOCATION) {
 			auto location_url = bwm.custom_metadata->value(bwm.custom_metadata->FindKey(RPC_LOCATION_KEY));
 			auto resolved = ResolveExternalLocation(context_, location_url,
-			                                         base_url_, GetExecutionIdHex(), GetAttachIdHex());
+			                                         base_url_, GetExecutionIdHex(), GetAttachIdHex(),
+			                                         bwm.custom_metadata);
 			buffered_batches_.push_back(resolved.batch);
 			ExtractStreamState(resolved.batch, resolved.metadata);
 			continue;
@@ -304,7 +305,8 @@ InitResult HttpFunctionConnection::PerformInit(const std::vector<int32_t> &proje
 		int loc_idx = header_result.header.metadata->FindKey(RPC_LOCATION_KEY);
 		if (loc_idx >= 0) {
 			auto location_url = header_result.header.metadata->value(loc_idx);
-			auto resolved = ResolveExternalLocation(context_, location_url, base_url_);
+			auto resolved = ResolveExternalLocation(context_, location_url, base_url_,
+			                                         "", "", header_result.header.metadata);
 			header_result.header.header_batch = resolved.batch;
 			header_result.header.metadata = resolved.metadata;
 		}
@@ -525,7 +527,8 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 		if (batch_type == RpcBatchType::EXTERNAL_LOCATION) {
 			auto location_url = bwm.custom_metadata->value(bwm.custom_metadata->FindKey(RPC_LOCATION_KEY));
 			auto resolved = ResolveExternalLocation(context_, location_url,
-			                                         base_url_, GetExecutionIdHex(), GetAttachIdHex());
+			                                         base_url_, GetExecutionIdHex(), GetAttachIdHex(),
+			                                         bwm.custom_metadata);
 			if (!output_batch) {
 				output_batch = resolved.batch;
 			}

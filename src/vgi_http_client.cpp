@@ -9,6 +9,8 @@
 #include "vgi_oauth.hpp"
 #include "vgi_rpc_client.hpp"
 
+#include "mbedtls_wrapper.hpp"
+
 using namespace duckdb_zstd;
 
 namespace duckdb {
@@ -269,12 +271,35 @@ UnaryResponseResult ResolveExternalLocation(ClientContext &context,
                                              const std::string &location_url,
                                              const std::string &worker_path,
                                              const std::string &invocation_id_hex,
-                                             const std::string &attach_id_hex) {
+                                             const std::string &attach_id_hex,
+                                             const std::shared_ptr<arrow::KeyValueMetadata> &pointer_metadata) {
 	// Fetch the external data
 	auto body = HttpGetBytes(context, location_url);
 
 	if (body.empty()) {
 		throw IOException("VGI external location returned empty response [url: %s]", location_url);
+	}
+
+	// Verify SHA-256 checksum if present in pointer batch metadata
+	if (pointer_metadata) {
+		int sha_idx = pointer_metadata->FindKey(RPC_LOCATION_SHA256_KEY);
+		if (sha_idx >= 0) {
+			auto expected_hex = pointer_metadata->value(sha_idx);
+			// Compute SHA-256 of the fetched body bytes
+			auto raw_hash = duckdb_mbedtls::MbedTlsWrapper::ComputeSha256Hash(body);
+			// Convert raw hash to hex string
+			char hex_buf[duckdb_mbedtls::MbedTlsWrapper::SHA256_HASH_LENGTH_TEXT + 1];
+			duckdb_mbedtls::MbedTlsWrapper::ToBase16(const_cast<char *>(raw_hash.data()), hex_buf,
+			                                          duckdb_mbedtls::MbedTlsWrapper::SHA256_HASH_LENGTH_BYTES);
+			hex_buf[duckdb_mbedtls::MbedTlsWrapper::SHA256_HASH_LENGTH_TEXT] = '\0';
+			std::string actual_hex(hex_buf, duckdb_mbedtls::MbedTlsWrapper::SHA256_HASH_LENGTH_TEXT);
+
+			if (actual_hex != expected_hex) {
+				throw IOException("VGI external location SHA-256 checksum mismatch [url: %s]: "
+				                  "expected %s, got %s",
+				                  location_url, expected_hex, actual_hex);
+			}
+		}
 	}
 
 	// Parse the externalized IPC stream with proper log context.
@@ -362,7 +387,7 @@ UnaryResponseResult MaybeResolveExternalLocation(ClientContext &context,
 	}
 
 	auto location_url = result.metadata->value(loc_idx);
-	return ResolveExternalLocation(context, location_url, worker_path);
+	return ResolveExternalLocation(context, location_url, worker_path, "", "", result.metadata);
 }
 
 // ============================================================================
