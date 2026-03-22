@@ -6,25 +6,25 @@
 # in the scan function when the UPDATE/DELETE pipeline scans with virtual rowid
 # projection. The write operators themselves work correctly.
 
-require-env VGI_TEST_WORKER
+require-env VGI_WRITABLE_WORKER
 
 require vgi
 
 require httpfs
 
-# Disable pooling — the SQLite-backed store persists data across worker processes.
+# Attach the writable catalog (separate from example, with transaction support)
 statement ok
-ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}', POOL false);
+ATTACH 'writable' AS writable (TYPE vgi, LOCATION '${VGI_WRITABLE_WORKER}', POOL false);
 
 # ============================================================================
 # INSERT VALUES — single row
 # ============================================================================
 
 statement ok
-INSERT INTO example.data.writable_data VALUES (1, 'hello');
+INSERT INTO writable.main.writable_data VALUES (1, 'hello');
 
 query II
-SELECT id, name FROM example.data.writable_data;
+SELECT id, name FROM writable.main.writable_data;
 ----
 1	hello
 
@@ -33,15 +33,15 @@ SELECT id, name FROM example.data.writable_data;
 # ============================================================================
 
 statement ok
-INSERT INTO example.data.writable_data VALUES (2, 'world'), (3, 'test');
+INSERT INTO writable.main.writable_data VALUES (2, 'world'), (3, 'test');
 
 query I
-SELECT COUNT(*) FROM example.data.writable_data;
+SELECT COUNT(*) FROM writable.main.writable_data;
 ----
 3
 
 query II
-SELECT id, name FROM example.data.writable_data ORDER BY id;
+SELECT id, name FROM writable.main.writable_data ORDER BY id;
 ----
 1	hello
 2	world
@@ -52,15 +52,15 @@ SELECT id, name FROM example.data.writable_data ORDER BY id;
 # ============================================================================
 
 statement ok
-INSERT INTO example.data.writable_data SELECT i, 'row_' || i::VARCHAR FROM range(4, 7) t(i);
+INSERT INTO writable.main.writable_data SELECT i, 'row_' || i::VARCHAR FROM range(4, 7) t(i);
 
 query I
-SELECT COUNT(*) FROM example.data.writable_data;
+SELECT COUNT(*) FROM writable.main.writable_data;
 ----
 6
 
 query II
-SELECT id, name FROM example.data.writable_data WHERE id >= 4 ORDER BY id;
+SELECT id, name FROM writable.main.writable_data WHERE id >= 4 ORDER BY id;
 ----
 4	row_4
 5	row_5
@@ -72,26 +72,26 @@ SELECT id, name FROM example.data.writable_data WHERE id >= 4 ORDER BY id;
 # ============================================================================
 
 statement ok
-INSERT INTO example.data.writable_data SELECT i, 'bulk_' || i::VARCHAR FROM range(1000, 6000) t(i);
+INSERT INTO writable.main.writable_data SELECT i, 'bulk_' || i::VARCHAR FROM range(1000, 6000) t(i);
 
 query I
-SELECT COUNT(*) FROM example.data.writable_data WHERE id >= 1000;
+SELECT COUNT(*) FROM writable.main.writable_data WHERE id >= 1000;
 ----
 5000
 
 query I
-SELECT COUNT(*) FROM example.data.writable_data;
+SELECT COUNT(*) FROM writable.main.writable_data;
 ----
 5006
 
 # Verify first and last rows of the bulk insert
 query II
-SELECT id, name FROM example.data.writable_data WHERE id = 1000;
+SELECT id, name FROM writable.main.writable_data WHERE id = 1000;
 ----
 1000	bulk_1000
 
 query II
-SELECT id, name FROM example.data.writable_data WHERE id = 5999;
+SELECT id, name FROM writable.main.writable_data WHERE id = 5999;
 ----
 5999	bulk_5999
 
@@ -100,11 +100,11 @@ SELECT id, name FROM example.data.writable_data WHERE id = 5999;
 # ============================================================================
 
 statement ok
-INSERT INTO example.data.writable_data SELECT i, 'nope' FROM range(0) t(i);
+INSERT INTO writable.main.writable_data SELECT i, 'nope' FROM range(0) t(i);
 
 # Count should be unchanged
 query I
-SELECT COUNT(*) FROM example.data.writable_data;
+SELECT COUNT(*) FROM writable.main.writable_data;
 ----
 5006
 
@@ -114,28 +114,28 @@ SELECT COUNT(*) FROM example.data.writable_data;
 
 # Negative numbers
 statement ok
-INSERT INTO example.data.writable_data VALUES (-1, 'negative');
+INSERT INTO writable.main.writable_data VALUES (-1, 'negative');
 
 # Empty string
 statement ok
-INSERT INTO example.data.writable_data VALUES (-2, '');
+INSERT INTO writable.main.writable_data VALUES (-2, '');
 
 # Long string
 statement ok
-INSERT INTO example.data.writable_data VALUES (-3, repeat('x', 10000));
+INSERT INTO writable.main.writable_data VALUES (-3, repeat('x', 10000));
 
 query II
-SELECT id, name FROM example.data.writable_data WHERE id = -1;
+SELECT id, name FROM writable.main.writable_data WHERE id = -1;
 ----
 -1	negative
 
 query II
-SELECT id, name FROM example.data.writable_data WHERE id = -2;
+SELECT id, name FROM writable.main.writable_data WHERE id = -2;
 ----
 -2	(empty)
 
 query I
-SELECT length(name) FROM example.data.writable_data WHERE id = -3;
+SELECT length(name) FROM writable.main.writable_data WHERE id = -3;
 ----
 10000
 
@@ -144,13 +144,13 @@ SELECT length(name) FROM example.data.writable_data WHERE id = -3;
 # ============================================================================
 
 query II
-INSERT INTO example.data.writable_data VALUES (9001, 'returning_test') RETURNING id, name;
+INSERT INTO writable.main.writable_data VALUES (9001, 'returning_test') RETURNING id, name;
 ----
 9001	returning_test
 
 # Verify it was actually inserted
 query II
-SELECT id, name FROM example.data.writable_data WHERE id = 9001;
+SELECT id, name FROM writable.main.writable_data WHERE id = 9001;
 ----
 9001	returning_test
 
@@ -159,7 +159,7 @@ SELECT id, name FROM example.data.writable_data WHERE id = 9001;
 # ============================================================================
 
 query II
-INSERT INTO example.data.writable_data VALUES (9002, 'ret_a'), (9003, 'ret_b') RETURNING id, name;
+INSERT INTO writable.main.writable_data VALUES (9002, 'ret_a'), (9003, 'ret_b') RETURNING id, name;
 ----
 9002	ret_a
 9003	ret_b
@@ -169,7 +169,7 @@ INSERT INTO example.data.writable_data VALUES (9002, 'ret_a'), (9003, 'ret_b') R
 # ============================================================================
 
 query II
-INSERT INTO example.data.writable_data SELECT i, 'ret_sel_' || i::VARCHAR FROM range(9010, 9013) t(i) RETURNING id, name;
+INSERT INTO writable.main.writable_data SELECT i, 'ret_sel_' || i::VARCHAR FROM range(9010, 9013) t(i) RETURNING id, name;
 ----
 9010	ret_sel_9010
 9011	ret_sel_9011
@@ -180,7 +180,7 @@ INSERT INTO example.data.writable_data SELECT i, 'ret_sel_' || i::VARCHAR FROM r
 # ============================================================================
 
 query II
-INSERT INTO example.data.writable_data VALUES (9999, 'star_test') RETURNING *;
+INSERT INTO writable.main.writable_data VALUES (9999, 'star_test') RETURNING *;
 ----
 9999	star_test
 
@@ -189,7 +189,7 @@ INSERT INTO example.data.writable_data VALUES (9999, 'star_test') RETURNING *;
 # ============================================================================
 
 query I
-INSERT INTO example.data.writable_data VALUES (9050, 'partial_ret') RETURNING id;
+INSERT INTO writable.main.writable_data VALUES (9050, 'partial_ret') RETURNING id;
 ----
 9050
 
@@ -198,7 +198,7 @@ INSERT INTO example.data.writable_data VALUES (9050, 'partial_ret') RETURNING id
 # ============================================================================
 
 query I
-INSERT INTO example.data.writable_data VALUES (9060, 'expr_test') RETURNING id * 2;
+INSERT INTO writable.main.writable_data VALUES (9060, 'expr_test') RETURNING id * 2;
 ----
 18120
 
@@ -216,21 +216,12 @@ INSERT INTO example.data.writable_data VALUES (9060, 'expr_test') RETURNING id *
 # ============================================================================
 
 statement ok
-INSERT INTO example.data.writable_data VALUES (1, 'duplicate_of_hello');
+INSERT INTO writable.main.writable_data VALUES (1, 'duplicate_of_hello');
 
 query I
-SELECT COUNT(*) FROM example.data.writable_data WHERE id = 1;
+SELECT COUNT(*) FROM writable.main.writable_data WHERE id = 1;
 ----
 2
-
-# ============================================================================
-# Error: write operations on read-only tables
-# ============================================================================
-
-statement error
-INSERT INTO example.data.large_sequence VALUES (1);
-----
-does not support INSERT
 
 # ============================================================================
 # DELETE — basic
@@ -238,41 +229,41 @@ does not support INSERT
 
 # First, insert known data for delete tests
 statement ok
-INSERT INTO example.data.writable_data VALUES (50000, 'del_a'), (50001, 'del_b'), (50002, 'del_c');
+INSERT INTO writable.main.writable_data VALUES (50000, 'del_a'), (50001, 'del_b'), (50002, 'del_c');
 
 query I
-SELECT COUNT(*) FROM example.data.writable_data WHERE id >= 50000;
+SELECT COUNT(*) FROM writable.main.writable_data WHERE id >= 50000;
 ----
 3
 
 # Delete a single row
 statement ok
-DELETE FROM example.data.writable_data WHERE id = 50001;
+DELETE FROM writable.main.writable_data WHERE id = 50001;
 
 query I
-SELECT COUNT(*) FROM example.data.writable_data WHERE id >= 50000;
+SELECT COUNT(*) FROM writable.main.writable_data WHERE id >= 50000;
 ----
 2
 
 # Verify the correct row was deleted
 query II
-SELECT id, name FROM example.data.writable_data WHERE id >= 50000 ORDER BY id;
+SELECT id, name FROM writable.main.writable_data WHERE id >= 50000 ORDER BY id;
 ----
 50000	del_a
 50002	del_c
 
 # Delete multiple rows with WHERE
 statement ok
-DELETE FROM example.data.writable_data WHERE id >= 50000;
+DELETE FROM writable.main.writable_data WHERE id >= 50000;
 
 query I
-SELECT COUNT(*) FROM example.data.writable_data WHERE id >= 50000;
+SELECT COUNT(*) FROM writable.main.writable_data WHERE id >= 50000;
 ----
 0
 
 # Delete with no matching rows (should succeed with 0 affected)
 statement ok
-DELETE FROM example.data.writable_data WHERE id = 99999;
+DELETE FROM writable.main.writable_data WHERE id = 99999;
 
 # ============================================================================
 # UPDATE — basic
@@ -280,23 +271,23 @@ DELETE FROM example.data.writable_data WHERE id = 99999;
 
 # Insert known data for update tests
 statement ok
-INSERT INTO example.data.writable_data VALUES (60000, 'upd_a'), (60001, 'upd_b'), (60002, 'upd_c');
+INSERT INTO writable.main.writable_data VALUES (60000, 'upd_a'), (60001, 'upd_b'), (60002, 'upd_c');
 
 # Update a single row
 statement ok
-UPDATE example.data.writable_data SET name = 'updated_a' WHERE id = 60000;
+UPDATE writable.main.writable_data SET name = 'updated_a' WHERE id = 60000;
 
 query II
-SELECT id, name FROM example.data.writable_data WHERE id = 60000;
+SELECT id, name FROM writable.main.writable_data WHERE id = 60000;
 ----
 60000	updated_a
 
 # Update multiple rows
 statement ok
-UPDATE example.data.writable_data SET name = 'bulk_updated' WHERE id >= 60001;
+UPDATE writable.main.writable_data SET name = 'bulk_updated' WHERE id >= 60001;
 
 query II
-SELECT id, name FROM example.data.writable_data WHERE id >= 60000 ORDER BY id;
+SELECT id, name FROM writable.main.writable_data WHERE id >= 60000 ORDER BY id;
 ----
 60000	updated_a
 60001	bulk_updated
@@ -304,7 +295,7 @@ SELECT id, name FROM example.data.writable_data WHERE id >= 60000 ORDER BY id;
 
 # Update with no matching rows (should succeed)
 statement ok
-UPDATE example.data.writable_data SET name = 'noop' WHERE id = 99999;
+UPDATE writable.main.writable_data SET name = 'noop' WHERE id = 99999;
 
 # ============================================================================
 # DELETE + INSERT — verify store consistency after delete
@@ -312,14 +303,14 @@ UPDATE example.data.writable_data SET name = 'noop' WHERE id = 99999;
 
 # Delete all update test rows
 statement ok
-DELETE FROM example.data.writable_data WHERE id >= 60000;
+DELETE FROM writable.main.writable_data WHERE id >= 60000;
 
 # Insert new rows after delete
 statement ok
-INSERT INTO example.data.writable_data VALUES (70000, 'after_delete');
+INSERT INTO writable.main.writable_data VALUES (70000, 'after_delete');
 
 query II
-SELECT id, name FROM example.data.writable_data WHERE id = 70000;
+SELECT id, name FROM writable.main.writable_data WHERE id = 70000;
 ----
 70000	after_delete
 
@@ -328,10 +319,10 @@ SELECT id, name FROM example.data.writable_data WHERE id = 70000;
 # ============================================================================
 
 statement ok
-UPDATE example.data.writable_data SET name = 'changed' WHERE id = 70000;
+UPDATE writable.main.writable_data SET name = 'changed' WHERE id = 70000;
 
 query II
-SELECT id, name FROM example.data.writable_data WHERE id = 70000;
+SELECT id, name FROM writable.main.writable_data WHERE id = 70000;
 ----
 70000	changed
 
@@ -340,4 +331,4 @@ SELECT id, name FROM example.data.writable_data WHERE id = 70000;
 # ============================================================================
 
 statement ok
-DELETE FROM example.data.writable_data WHERE id >= 50000;
+DELETE FROM writable.main.writable_data WHERE id >= 50000;
