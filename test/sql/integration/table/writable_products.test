@@ -2,14 +2,14 @@
 # description: Tests for INSERT with defaults, constraints, and RETURNING on writable_products
 # group: [vgi_integration_table]
 
-require-env VGI_WRITABLE_WORKER
+require-env VGI_TEST_WORKER
 
 require vgi
 
 require httpfs
 
 statement ok
-ATTACH 'writable' AS writable (TYPE vgi, LOCATION '${VGI_WRITABLE_WORKER}', POOL false);
+ATTACH 'writable' AS writable (TYPE vgi, LOCATION '${VGI_TEST_WORKER}', POOL false);
 
 # ============================================================================
 # Default resolution — column-subset INSERT (price, status, created_at have defaults)

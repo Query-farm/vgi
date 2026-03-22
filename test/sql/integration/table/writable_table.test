@@ -6,7 +6,7 @@
 # in the scan function when the UPDATE/DELETE pipeline scans with virtual rowid
 # projection. The write operators themselves work correctly.
 
-require-env VGI_WRITABLE_WORKER
+require-env VGI_TEST_WORKER
 
 require vgi
 
@@ -14,7 +14,7 @@ require httpfs
 
 # Attach the writable catalog (separate from example, with transaction support)
 statement ok
-ATTACH 'writable' AS writable (TYPE vgi, LOCATION '${VGI_WRITABLE_WORKER}', POOL false);
+ATTACH 'writable' AS writable (TYPE vgi, LOCATION '${VGI_TEST_WORKER}', POOL false);
 
 # ============================================================================
 # INSERT VALUES — single row
