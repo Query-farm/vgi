@@ -378,6 +378,28 @@ VgiWriteFunctionResult InvokeCatalogTableDeleteFunctionGet(
     const std::string &table_name, ClientContext &context, bool worker_debug = false, bool use_pool = true);
 
 // ============================================================================
+// Transaction Lifecycle
+// ============================================================================
+
+// Invoke catalog_transaction_begin: begin a new transaction.
+// Returns the transaction_id bytes from the worker (empty if not supported).
+std::vector<uint8_t> InvokeCatalogTransactionBegin(
+    const std::string &worker_path, const std::vector<uint8_t> &attach_id,
+    ClientContext &context, bool worker_debug = false, bool use_pool = true);
+
+// Invoke catalog_transaction_commit: commit a transaction.
+void InvokeCatalogTransactionCommit(
+    const std::string &worker_path, const std::vector<uint8_t> &attach_id,
+    const std::vector<uint8_t> &transaction_id,
+    ClientContext &context, bool worker_debug = false, bool use_pool = true);
+
+// Invoke catalog_transaction_rollback: rollback a transaction.
+void InvokeCatalogTransactionRollback(
+    const std::string &worker_path, const std::vector<uint8_t> &attach_id,
+    const std::vector<uint8_t> &transaction_id,
+    ClientContext &context, bool worker_debug = false, bool use_pool = true);
+
+// ============================================================================
 // Table Function Cardinality
 // ============================================================================
 

@@ -372,6 +372,40 @@ VgiWriteFunctionResult InvokeCatalogTableDeleteFunctionGet(
 }
 
 // ============================================================================
+// Transaction Lifecycle
+// ============================================================================
+
+std::vector<uint8_t> InvokeCatalogTransactionBegin(
+    const std::string &worker_path, const std::vector<uint8_t> &attach_id,
+    ClientContext &context, bool worker_debug, bool use_pool) {
+	auto params = BuildTransactionBeginParams(attach_id);
+	auto response = InvokeRpcMethod(worker_path, "catalog_transaction_begin", params, context, worker_debug, use_pool);
+	auto result_batch = ExtractAndDeserializeResult(response, "catalog_transaction_begin", worker_path);
+	if (!result_batch || result_batch->num_rows() == 0) {
+		return {};  // Transaction not supported
+	}
+
+	RecordBatchSingleRow row(result_batch, 0, "TransactionBeginResponse", worker_path);
+	return row["transaction_id"].value_or(std::vector<uint8_t>{});
+}
+
+void InvokeCatalogTransactionCommit(
+    const std::string &worker_path, const std::vector<uint8_t> &attach_id,
+    const std::vector<uint8_t> &transaction_id,
+    ClientContext &context, bool worker_debug, bool use_pool) {
+	auto params = BuildTransactionParams(attach_id, transaction_id);
+	InvokeRpcMethod(worker_path, "catalog_transaction_commit", params, context, worker_debug, use_pool);
+}
+
+void InvokeCatalogTransactionRollback(
+    const std::string &worker_path, const std::vector<uint8_t> &attach_id,
+    const std::vector<uint8_t> &transaction_id,
+    ClientContext &context, bool worker_debug, bool use_pool) {
+	auto params = BuildTransactionParams(attach_id, transaction_id);
+	InvokeRpcMethod(worker_path, "catalog_transaction_rollback", params, context, worker_debug, use_pool);
+}
+
+// ============================================================================
 // Table Function Cardinality
 // ============================================================================
 

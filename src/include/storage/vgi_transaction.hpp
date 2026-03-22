@@ -18,14 +18,19 @@ public:
 	VgiTransaction(VgiCatalog &vgi_catalog, TransactionManager &manager, ClientContext &context);
 	~VgiTransaction() override;
 
-	void Start();
-	void Commit();
-	void Rollback();
+	void Start(ClientContext &context);
+	void Commit(ClientContext &context);
+	void Rollback();  // Uses stored context_ from Start
 
 	static VgiTransaction &Get(ClientContext &context, Catalog &catalog);
 
 	AccessMode GetAccessMode() const {
 		return access_mode_;
+	}
+
+	//! Get the transaction ID assigned by the worker (empty if none).
+	const std::vector<uint8_t> &GetTransactionId() const {
+		return transaction_id_;
 	}
 
 	//! Temporary storage for point-in-time catalog entries (time travel).
@@ -36,6 +41,9 @@ public:
 private:
 	VgiTransactionState transaction_state = VgiTransactionState::TRANSACTION_NOT_YET_STARTED;
 	AccessMode access_mode_;
+	VgiCatalog &vgi_catalog_;
+	ClientContext &context_;                // Stored from StartTransaction for use in Rollback
+	std::vector<uint8_t> transaction_id_;   // Assigned by worker's catalog_transaction_begin
 };
 
 class VgiTransactionManager : public TransactionManager {

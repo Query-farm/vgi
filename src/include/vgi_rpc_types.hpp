@@ -235,5 +235,12 @@ std::shared_ptr<arrow::RecordBatch> BuildWriteFunctionGetParams(
     const std::vector<uint8_t> &attach_id, const std::string &schema_name,
     const std::string &name, const std::vector<uint8_t> &transaction_id = {});
 
+// Build params batch for catalog_transaction_begin: attach_id only
+std::shared_ptr<arrow::RecordBatch> BuildTransactionBeginParams(const std::vector<uint8_t> &attach_id);
+
+// Build params batch for catalog_transaction_commit/rollback: attach_id + transaction_id
+std::shared_ptr<arrow::RecordBatch> BuildTransactionParams(
+    const std::vector<uint8_t> &attach_id, const std::vector<uint8_t> &transaction_id);
+
 } // namespace vgi
 } // namespace duckdb

@@ -812,5 +812,38 @@ std::shared_ptr<arrow::RecordBatch> BuildWriteFunctionGetParams(const std::vecto
 	return arrow::RecordBatch::Make(schema, 1, arrays);
 }
 
+std::shared_ptr<arrow::RecordBatch> BuildTransactionBeginParams(const std::vector<uint8_t> &attach_id) {
+	auto schema = arrow::schema({
+	    arrow::field("attach_id", arrow::binary(), false),
+	});
+	std::vector<std::shared_ptr<arrow::Array>> arrays;
+
+	{
+		arrow::BinaryBuilder builder;
+		CheckStatus(builder.Append(attach_id.data(), attach_id.size()), "append attach_id");
+		arrays.push_back(FinishArray(builder, "attach_id"));
+	}
+
+	return arrow::RecordBatch::Make(schema, 1, arrays);
+}
+
+std::shared_ptr<arrow::RecordBatch> BuildTransactionParams(
+    const std::vector<uint8_t> &attach_id, const std::vector<uint8_t> &transaction_id) {
+	auto schema = arrow::schema({
+	    arrow::field("attach_id", arrow::binary(), false),
+	    arrow::field("transaction_id", arrow::binary(), true),
+	});
+	std::vector<std::shared_ptr<arrow::Array>> arrays;
+
+	{
+		arrow::BinaryBuilder builder;
+		CheckStatus(builder.Append(attach_id.data(), attach_id.size()), "append attach_id");
+		arrays.push_back(FinishArray(builder, "attach_id"));
+	}
+	arrays.push_back(BuildBinaryScalar(transaction_id));
+
+	return arrow::RecordBatch::Make(schema, 1, arrays);
+}
+
 } // namespace vgi
 } // namespace duckdb
