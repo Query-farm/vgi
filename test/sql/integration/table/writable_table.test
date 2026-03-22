@@ -231,3 +231,113 @@ statement error
 INSERT INTO example.data.large_sequence VALUES (1);
 ----
 does not support INSERT
+
+# ============================================================================
+# DELETE — basic
+# ============================================================================
+
+# First, insert known data for delete tests
+statement ok
+INSERT INTO example.data.writable_data VALUES (50000, 'del_a'), (50001, 'del_b'), (50002, 'del_c');
+
+query I
+SELECT COUNT(*) FROM example.data.writable_data WHERE id >= 50000;
+----
+3
+
+# Delete a single row
+statement ok
+DELETE FROM example.data.writable_data WHERE id = 50001;
+
+query I
+SELECT COUNT(*) FROM example.data.writable_data WHERE id >= 50000;
+----
+2
+
+# Verify the correct row was deleted
+query II
+SELECT id, name FROM example.data.writable_data WHERE id >= 50000 ORDER BY id;
+----
+50000	del_a
+50002	del_c
+
+# Delete multiple rows with WHERE
+statement ok
+DELETE FROM example.data.writable_data WHERE id >= 50000;
+
+query I
+SELECT COUNT(*) FROM example.data.writable_data WHERE id >= 50000;
+----
+0
+
+# Delete with no matching rows (should succeed with 0 affected)
+statement ok
+DELETE FROM example.data.writable_data WHERE id = 99999;
+
+# ============================================================================
+# UPDATE — basic
+# ============================================================================
+
+# Insert known data for update tests
+statement ok
+INSERT INTO example.data.writable_data VALUES (60000, 'upd_a'), (60001, 'upd_b'), (60002, 'upd_c');
+
+# Update a single row
+statement ok
+UPDATE example.data.writable_data SET name = 'updated_a' WHERE id = 60000;
+
+query II
+SELECT id, name FROM example.data.writable_data WHERE id = 60000;
+----
+60000	updated_a
+
+# Update multiple rows
+statement ok
+UPDATE example.data.writable_data SET name = 'bulk_updated' WHERE id >= 60001;
+
+query II
+SELECT id, name FROM example.data.writable_data WHERE id >= 60000 ORDER BY id;
+----
+60000	updated_a
+60001	bulk_updated
+60002	bulk_updated
+
+# Update with no matching rows (should succeed)
+statement ok
+UPDATE example.data.writable_data SET name = 'noop' WHERE id = 99999;
+
+# ============================================================================
+# DELETE + INSERT — verify store consistency after delete
+# ============================================================================
+
+# Delete all update test rows
+statement ok
+DELETE FROM example.data.writable_data WHERE id >= 60000;
+
+# Insert new rows after delete
+statement ok
+INSERT INTO example.data.writable_data VALUES (70000, 'after_delete');
+
+query II
+SELECT id, name FROM example.data.writable_data WHERE id = 70000;
+----
+70000	after_delete
+
+# ============================================================================
+# UPDATE + SELECT — verify update is visible immediately
+# ============================================================================
+
+statement ok
+UPDATE example.data.writable_data SET name = 'changed' WHERE id = 70000;
+
+query II
+SELECT id, name FROM example.data.writable_data WHERE id = 70000;
+----
+70000	changed
+
+# ============================================================================
+# Cleanup delete/update test data
+# ============================================================================
+
+statement ok
+DELETE FROM example.data.writable_data WHERE id >= 50000;

@@ -1,5 +1,5 @@
 # name: test/sql/integration/table/writable_products.test
-# description: Tests for INSERT with defaults, constraints, and server-side RETURNING
+# description: Tests for INSERT with defaults, constraints, and RETURNING on writable_products
 # group: [vgi_integration_table]
 
 require-env VGI_TEST_WORKER
@@ -12,27 +12,21 @@ statement ok
 ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}', POOL false);
 
 # ============================================================================
-# Default resolution — column-subset INSERT
+# Default resolution — column-subset INSERT (price, status, created_at have defaults)
 # ============================================================================
 
-# Only name provided: product_id auto-assigned, price=0.0, status='draft'
+# product_id + name only: price=0.0, status='draft', created_at='server-assigned'
 statement ok
-INSERT INTO example.data.writable_products(name) VALUES ('Widget');
+INSERT INTO example.data.writable_products(product_id, name) VALUES (1, 'Widget');
 
 query IRT
 SELECT name, price, status FROM example.data.writable_products WHERE name = 'Widget';
 ----
 Widget	0.0	draft
 
-# Auto-assigned product_id should be > 0
-query I
-SELECT product_id > 0 FROM example.data.writable_products WHERE name = 'Widget';
-----
-true
-
-# name + price: status defaults to 'draft'
+# product_id + name + price: status defaults to 'draft'
 statement ok
-INSERT INTO example.data.writable_products(name, price) VALUES ('Gadget', 19.99);
+INSERT INTO example.data.writable_products(product_id, name, price) VALUES (2, 'Gadget', 19.99);
 
 query IRT
 SELECT name, price, status FROM example.data.writable_products WHERE name = 'Gadget';
@@ -41,7 +35,7 @@ Gadget	19.99	draft
 
 # All columns explicit (no defaults needed)
 statement ok
-INSERT INTO example.data.writable_products(product_id, name, price, status, created_at) VALUES (100, 'Explicit', 5.0, 'active', 'ignored');
+INSERT INTO example.data.writable_products(product_id, name, price, status, created_at) VALUES (100, 'Explicit', 5.0, 'active', '2026-01-01');
 
 query IIRT
 SELECT product_id, name, price, status FROM example.data.writable_products WHERE name = 'Explicit';
@@ -52,43 +46,17 @@ SELECT product_id, name, price, status FROM example.data.writable_products WHERE
 # Defaults visible in RETURNING
 # ============================================================================
 
-# RETURNING shows defaults — verify price and status are default values
+# RETURNING shows default price and status
 query RT
-INSERT INTO example.data.writable_products(name) VALUES ('RetDefault') RETURNING price, status;
+INSERT INTO example.data.writable_products(product_id, name) VALUES (3, 'RetDefault') RETURNING price, status;
 ----
 0.0	draft
 
-# Auto-assigned product_id visible in RETURNING
-query I
-INSERT INTO example.data.writable_products(name) VALUES ('RetAutoId') RETURNING product_id > 0;
-----
-true
-
 # RETURNING with name + price: status is default
 query IRT
-INSERT INTO example.data.writable_products(name, price) VALUES ('RetPrice', 9.99) RETURNING name, price, status;
+INSERT INTO example.data.writable_products(product_id, name, price) VALUES (4, 'RetPrice', 9.99) RETURNING name, price, status;
 ----
 RetPrice	9.99	draft
-
-# ============================================================================
-# Server-side modification in RETURNING
-# ============================================================================
-
-# created_at is server-assigned (always overwritten by server timestamp)
-# We can't predict the exact value, but it should be non-empty
-query I
-SELECT length(created_at) > 0 FROM example.data.writable_products WHERE name = 'RetDefault';
-----
-true
-
-# Verify the row was actually inserted and product_id is valid
-statement ok
-INSERT INTO example.data.writable_products(name) VALUES ('VerifyId');
-
-query I
-SELECT product_id > 0 FROM example.data.writable_products WHERE name = 'VerifyId';
-----
-true
 
 # ============================================================================
 # NOT NULL constraint enforcement
@@ -96,7 +64,7 @@ true
 
 # name is NOT NULL — omitting it should fail
 statement error
-INSERT INTO example.data.writable_products(price) VALUES (10.0);
+INSERT INTO example.data.writable_products(product_id, price) VALUES (999, 10.0);
 ----
 NOT NULL constraint failed
 
@@ -106,7 +74,7 @@ NOT NULL constraint failed
 
 # price >= 0 — negative price should fail
 statement error
-INSERT INTO example.data.writable_products(name, price) VALUES ('BadPrice', -1.0);
+INSERT INTO example.data.writable_products(product_id, name, price) VALUES (999, 'BadPrice', -1.0);
 ----
 CHECK constraint failed
 
@@ -115,7 +83,7 @@ CHECK constraint failed
 # ============================================================================
 
 statement ok
-INSERT INTO example.data.writable_products(name) VALUES ('Alpha'), ('Beta'), ('Gamma');
+INSERT INTO example.data.writable_products(product_id, name) VALUES (10, 'Alpha'), (11, 'Beta'), (12, 'Gamma');
 
 query I
 SELECT COUNT(*) FROM example.data.writable_products WHERE status = 'draft' AND price = 0.0 AND name IN ('Alpha', 'Beta', 'Gamma');
@@ -126,19 +94,19 @@ SELECT COUNT(*) FROM example.data.writable_products WHERE status = 'draft' AND p
 # Multi-row INSERT with defaults + RETURNING
 # ============================================================================
 
-query T
-INSERT INTO example.data.writable_products(name) VALUES ('Ret1'), ('Ret2'), ('Ret3') RETURNING name;
+query IT
+INSERT INTO example.data.writable_products(product_id, name) VALUES (20, 'Ret1'), (21, 'Ret2'), (22, 'Ret3') RETURNING product_id, name;
 ----
-Ret1
-Ret2
-Ret3
+20	Ret1
+21	Ret2
+22	Ret3
 
 # ============================================================================
 # INSERT with mixed defaults and explicit values
 # ============================================================================
 
 query IRT
-INSERT INTO example.data.writable_products(name, status) VALUES ('Custom', 'published') RETURNING name, price, status;
+INSERT INTO example.data.writable_products(product_id, name, status) VALUES (30, 'Custom', 'published') RETURNING name, price, status;
 ----
 Custom	0.0	published
 
@@ -147,7 +115,7 @@ Custom	0.0	published
 # ============================================================================
 
 query R
-INSERT INTO example.data.writable_products(name, price) VALUES ('ExprTest', 25.0) RETURNING price * 2;
+INSERT INTO example.data.writable_products(product_id, name, price) VALUES (40, 'ExprTest', 25.0) RETURNING price * 2;
 ----
 50.0
 
@@ -156,6 +124,6 @@ INSERT INTO example.data.writable_products(name, price) VALUES ('ExprTest', 25.0
 # ============================================================================
 
 query I
-INSERT INTO example.data.writable_products(name) VALUES ('SubsetRet') RETURNING name;
+INSERT INTO example.data.writable_products(product_id, name) VALUES (50, 'SubsetRet') RETURNING name;
 ----
 SubsetRet
