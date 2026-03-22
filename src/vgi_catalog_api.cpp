@@ -334,6 +334,44 @@ VgiScanFunctionResult InvokeCatalogTableScanFunctionGet(
 }
 
 // ============================================================================
+// Table Write Function Get
+// ============================================================================
+
+static VgiWriteFunctionResult InvokeCatalogTableWriteFunctionGet(
+    const std::string &worker_path, const std::string &rpc_method,
+    const std::vector<uint8_t> &attach_id, const std::string &schema_name,
+    const std::string &table_name, ClientContext &context, bool worker_debug, bool use_pool) {
+	auto params = BuildWriteFunctionGetParams(attach_id, schema_name, table_name);
+	auto response = InvokeRpcMethod(worker_path, rpc_method, params, context, worker_debug, use_pool);
+	auto result_batch = ExtractAndDeserializeResult(response, rpc_method, worker_path);
+	if (!result_batch || result_batch->num_rows() == 0) {
+		throw IOException("Empty response from %s [worker: %s]", rpc_method, worker_path);
+	}
+	return ParseScanFunctionResult(context, result_batch, worker_path);
+}
+
+VgiWriteFunctionResult InvokeCatalogTableInsertFunctionGet(
+    const std::string &worker_path, const std::vector<uint8_t> &attach_id, const std::string &schema_name,
+    const std::string &table_name, ClientContext &context, bool worker_debug, bool use_pool) {
+	return InvokeCatalogTableWriteFunctionGet(worker_path, "catalog_table_insert_function_get",
+	                                          attach_id, schema_name, table_name, context, worker_debug, use_pool);
+}
+
+VgiWriteFunctionResult InvokeCatalogTableUpdateFunctionGet(
+    const std::string &worker_path, const std::vector<uint8_t> &attach_id, const std::string &schema_name,
+    const std::string &table_name, ClientContext &context, bool worker_debug, bool use_pool) {
+	return InvokeCatalogTableWriteFunctionGet(worker_path, "catalog_table_update_function_get",
+	                                          attach_id, schema_name, table_name, context, worker_debug, use_pool);
+}
+
+VgiWriteFunctionResult InvokeCatalogTableDeleteFunctionGet(
+    const std::string &worker_path, const std::vector<uint8_t> &attach_id, const std::string &schema_name,
+    const std::string &table_name, ClientContext &context, bool worker_debug, bool use_pool) {
+	return InvokeCatalogTableWriteFunctionGet(worker_path, "catalog_table_delete_function_get",
+	                                          attach_id, schema_name, table_name, context, worker_debug, use_pool);
+}
+
+// ============================================================================
 // Table Function Cardinality
 // ============================================================================
 
@@ -775,6 +813,19 @@ VgiTableInfo ParseTableInfo(const std::shared_ptr<arrow::RecordBatch> &batch, in
 		fk.referenced_table = fk_row["referenced_table"].value_not_null<std::string>();
 		fk.referenced_schema = fk_row["referenced_schema"].value_not_null<std::string>();
 		info.foreign_key_constraints.push_back(std::move(fk));
+	}
+
+	// Parse write support flags (optional, backward-compatible with old workers)
+	info.supports_insert = row["supports_insert"].value_or(false);
+	info.supports_update = row["supports_update"].value_or(false);
+	info.supports_delete = row["supports_delete"].value_or(false);
+
+	// Validate: UPDATE/DELETE require a row ID column
+	if ((info.supports_update || info.supports_delete) && info.row_id_column < 0) {
+		throw InvalidInputException(
+		    "Table '%s' declares update/delete support but has no row ID column "
+		    "(mark a column with is_row_id metadata)",
+		    info.name);
 	}
 
 	return info;

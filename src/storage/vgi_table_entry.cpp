@@ -144,6 +144,42 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 TableStorageInfo VgiTableEntry::GetStorageInfo(ClientContext &context) {
 	TableStorageInfo info;
 	info.cardinality = 0; // Unknown
+
+	// Expose PK and UNIQUE constraints as virtual index_info entries.
+	//
+	// DuckDB's binder requires matching index_info when validating ON CONFLICT clauses
+	// (see bind_insert.cpp — it iterates storage_info.index_info looking for UNIQUE indexes
+	// that match the conflict target columns). Without these entries, the binder rejects
+	// ON CONFLICT with "no UNIQUE/PRIMARY KEY constraints that refer to this table".
+	//
+	// These are NOT real indexes — VGI tables have no local storage or ART indexes.
+	// They exist solely to satisfy the binder's validation. Actual conflict detection
+	// is delegated to the worker, which owns the data and its constraints.
+	//
+	// Note: ON CONFLICT also requires PlanMergeInto support (DuckDB rewrites ON CONFLICT
+	// as MERGE INTO internally). Until VgiCatalog::PlanMergeInto is implemented, ON CONFLICT
+	// will still fail at the physical plan stage.
+	for (auto &pk : table_info_.primary_key_constraints) {
+		IndexInfo idx_info;
+		idx_info.is_unique = true;
+		idx_info.is_primary = true;
+		idx_info.is_foreign = false;
+		for (auto col : pk) {
+			idx_info.column_set.insert(NumericCast<column_t>(col));
+		}
+		info.index_info.push_back(std::move(idx_info));
+	}
+	for (auto &unique : table_info_.unique_constraints) {
+		IndexInfo idx_info;
+		idx_info.is_unique = true;
+		idx_info.is_primary = false;
+		idx_info.is_foreign = false;
+		for (auto col : unique) {
+			idx_info.column_set.insert(NumericCast<column_t>(col));
+		}
+		info.index_info.push_back(std::move(idx_info));
+	}
+
 	return info;
 }
 

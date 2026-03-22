@@ -53,7 +53,8 @@ src/storage/vgi_view_set.cpp
 src/storage/vgi_scalar_function_set.cpp
 src/storage/vgi_table_function_set.cpp
 src/storage/vgi_macro_set.cpp
-src/storage/vgi_transaction.cpp)
+src/storage/vgi_transaction.cpp
+src/storage/vgi_physical_write.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})

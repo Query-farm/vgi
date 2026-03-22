@@ -788,5 +788,29 @@ std::shared_ptr<arrow::RecordBatch> BuildTableScanFunctionGetParams(const std::v
 	return arrow::RecordBatch::Make(schema, 1, arrays);
 }
 
+std::shared_ptr<arrow::RecordBatch> BuildWriteFunctionGetParams(const std::vector<uint8_t> &attach_id,
+                                                                 const std::string &schema_name,
+                                                                 const std::string &name,
+                                                                 const std::vector<uint8_t> &transaction_id) {
+	auto schema = arrow::schema({
+	    arrow::field("attach_id", arrow::binary(), false),
+	    arrow::field("schema_name", arrow::utf8(), false),
+	    arrow::field("name", arrow::utf8(), false),
+	    arrow::field("transaction_id", arrow::binary(), true),
+	});
+	std::vector<std::shared_ptr<arrow::Array>> arrays;
+
+	{
+		arrow::BinaryBuilder builder;
+		CheckStatus(builder.Append(attach_id.data(), attach_id.size()), "append attach_id");
+		arrays.push_back(FinishArray(builder, "attach_id"));
+	}
+	arrays.push_back(BuildStringScalar(schema_name));
+	arrays.push_back(BuildStringScalar(name));
+	arrays.push_back(BuildBinaryScalar(transaction_id));
+
+	return arrow::RecordBatch::Make(schema, 1, arrays);
+}
+
 } // namespace vgi
 } // namespace duckdb

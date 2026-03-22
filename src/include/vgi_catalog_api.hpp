@@ -136,6 +136,11 @@ struct VgiTableInfo {
 		std::string referenced_schema;
 	};
 	std::vector<ForeignKey> foreign_key_constraints;
+
+	// Write support flags — indicate which DML operations the table supports
+	bool supports_insert = false;
+	bool supports_update = false;
+	bool supports_delete = false;
 };
 
 // View metadata from the worker
@@ -355,6 +360,22 @@ VgiScanFunctionResult InvokeCatalogTableScanFunctionGet(
     const std::string &worker_path, const std::vector<uint8_t> &attach_id, const std::string &schema_name,
     const std::string &table_name, ClientContext &context, const std::string &at_unit = "",
     const std::string &at_value = "", bool worker_debug = false, bool use_pool = true);
+
+// Write function discovery uses the same result type as scan function discovery.
+using VgiWriteFunctionResult = VgiScanFunctionResult;
+
+// Invoke catalog_table_{insert,update,delete}_function_get: get write function for a table
+VgiWriteFunctionResult InvokeCatalogTableInsertFunctionGet(
+    const std::string &worker_path, const std::vector<uint8_t> &attach_id, const std::string &schema_name,
+    const std::string &table_name, ClientContext &context, bool worker_debug = false, bool use_pool = true);
+
+VgiWriteFunctionResult InvokeCatalogTableUpdateFunctionGet(
+    const std::string &worker_path, const std::vector<uint8_t> &attach_id, const std::string &schema_name,
+    const std::string &table_name, ClientContext &context, bool worker_debug = false, bool use_pool = true);
+
+VgiWriteFunctionResult InvokeCatalogTableDeleteFunctionGet(
+    const std::string &worker_path, const std::vector<uint8_t> &attach_id, const std::string &schema_name,
+    const std::string &table_name, ClientContext &context, bool worker_debug = false, bool use_pool = true);
 
 // ============================================================================
 // Table Function Cardinality
