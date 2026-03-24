@@ -43,6 +43,7 @@ BindResult PerformBindProtocol(
     const std::shared_ptr<arrow::Array> &arguments_array,
     const std::shared_ptr<arrow::Schema> &input_schema,
     const std::vector<uint8_t> &attach_id,
+    const std::vector<uint8_t> &transaction_id,
     const std::map<std::string, Value> &settings,
     const std::vector<VgiSecretRequirement> &required_secrets,
     const std::string &worker_label,  // for error messages (worker_path or base_url)

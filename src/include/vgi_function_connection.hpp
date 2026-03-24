@@ -44,6 +44,7 @@ struct FunctionConnectionParams {
 	std::string function_name;
 	ArrowArguments arguments;
 	std::vector<uint8_t> attach_id;
+	std::vector<uint8_t> transaction_id;
 	std::vector<uint8_t> global_execution_id;  // Empty for primary workers
 	bool worker_debug = false;
 	std::map<std::string, Value> settings;
@@ -58,13 +59,15 @@ struct FunctionConnectionParams {
 	// Convenience constructor for common case
 	FunctionConnectionParams(const std::string &worker_path, const std::string &function_name,
 	                         const ArrowArguments &arguments, const std::vector<uint8_t> &attach_id,
+	                         const std::vector<uint8_t> &transaction_id,
 	                         const std::vector<uint8_t> &global_execution_id, bool worker_debug,
 	                         const std::map<std::string, Value> &settings, bool use_pool,
 	                         const std::string &phase, const std::string &function_type = "TABLE",
 	                         const std::vector<vgi::VgiSecretRequirement> &required_secrets = {})
 	    : worker_path(worker_path), function_name(function_name), arguments(arguments), attach_id(attach_id),
-	      global_execution_id(global_execution_id), worker_debug(worker_debug), settings(settings),
-	      required_secrets(required_secrets), use_pool(use_pool), phase(phase), function_type(function_type) {
+	      transaction_id(transaction_id), global_execution_id(global_execution_id), worker_debug(worker_debug),
+	      settings(settings), required_secrets(required_secrets), use_pool(use_pool), phase(phase),
+	      function_type(function_type) {
 	}
 };
 
@@ -115,7 +118,8 @@ public:
 	// function_type: "TABLE", "SCALAR", or "AGGREGATE" (for BindRequest)
 	// settings: Optional map of settings to pass to the worker (e.g., DuckDB pragmas)
 	FunctionConnection(const std::string &worker_path, const std::string &function_name,
-	                   const ArrowArguments &arguments, const std::vector<uint8_t> &attach_id, ClientContext &context,
+	                   const ArrowArguments &arguments, const std::vector<uint8_t> &attach_id,
+	                   const std::vector<uint8_t> &transaction_id, ClientContext &context,
 	                   const std::string &function_type = "TABLE",
 	                   const std::vector<uint8_t> &global_execution_id = {}, bool worker_debug = false,
 	                   const std::map<std::string, Value> &settings = {},
@@ -123,7 +127,8 @@ public:
 
 	// Create connection using a pooled worker (skips spawning new subprocess)
 	FunctionConnection(std::unique_ptr<PooledWorker> pooled_worker, const std::string &function_name,
-	                   const ArrowArguments &arguments, const std::vector<uint8_t> &attach_id, ClientContext &context,
+	                   const ArrowArguments &arguments, const std::vector<uint8_t> &attach_id,
+	                   const std::vector<uint8_t> &transaction_id, ClientContext &context,
 	                   const std::string &function_type = "TABLE",
 	                   const std::vector<uint8_t> &global_execution_id = {}, bool worker_debug = false,
 	                   const std::map<std::string, Value> &settings = {},
@@ -233,6 +238,7 @@ private:
 	std::shared_ptr<arrow::DataType> arguments_type_;
 	std::shared_ptr<arrow::Array> arguments_array_;
 	std::vector<uint8_t> attach_id_;
+	std::vector<uint8_t> transaction_id_;
 	std::vector<uint8_t> global_execution_id_;
 	ClientContext &context_;
 	bool worker_debug_;

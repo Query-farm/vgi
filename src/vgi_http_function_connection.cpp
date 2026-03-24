@@ -32,14 +32,15 @@ static std::string ExtractStreamStateValue(const std::shared_ptr<arrow::KeyValue
 HttpFunctionConnection::HttpFunctionConnection(
     const std::string &worker_path, const std::string &function_name,
     const ArrowArguments &arguments, const std::vector<uint8_t> &attach_id,
+    const std::vector<uint8_t> &transaction_id,
     ClientContext &context, const std::string &function_type,
     const std::vector<uint8_t> &global_execution_id,
     bool worker_debug, const std::map<std::string, Value> &settings,
     const std::vector<VgiSecretRequirement> &required_secrets)
     : base_url_(worker_path), function_name_(function_name), function_type_(function_type),
       arguments_type_(arguments.type), arguments_array_(arguments.array), attach_id_(attach_id),
-      global_execution_id_(global_execution_id), context_(context), worker_debug_(worker_debug), settings_(settings),
-      required_secrets_(required_secrets) {
+      transaction_id_(transaction_id), global_execution_id_(global_execution_id), context_(context),
+      worker_debug_(worker_debug), settings_(settings), required_secrets_(required_secrets) {
 	// Strip trailing slash from base URL
 	if (!base_url_.empty() && base_url_.back() == '/') {
 		base_url_.pop_back();
@@ -231,7 +232,8 @@ BindResult HttpFunctionConnection::PerformBindFull() {
 
 	bind_result_ = PerformBindProtocol(context_, function_name_, function_type_,
 	                                    arguments_array_, input_schema_, attach_id_,
-	                                    settings_, required_secrets_, base_url_, transport_fn);
+	                                    transaction_id_, settings_, required_secrets_,
+	                                    base_url_, transport_fn);
 	bind_done_ = true;
 
 	VGI_LOG(context_, "http_function_connection.bind_result",

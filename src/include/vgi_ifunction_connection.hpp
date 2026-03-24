@@ -78,6 +78,7 @@ public:
 std::unique_ptr<IFunctionConnection> CreateFunctionConnection(
     const std::string &worker_path, const std::string &function_name,
     const ArrowArguments &arguments, const std::vector<uint8_t> &attach_id,
+    const std::vector<uint8_t> &transaction_id,
     ClientContext &context, const std::string &function_type = "TABLE",
     const std::vector<uint8_t> &global_execution_id = {},
     bool worker_debug = false,
@@ -88,6 +89,7 @@ std::unique_ptr<IFunctionConnection> CreateFunctionConnection(
 std::unique_ptr<IFunctionConnection> CreateFunctionConnectionFromPool(
     std::unique_ptr<PooledWorker> pooled_worker, const std::string &function_name,
     const ArrowArguments &arguments, const std::vector<uint8_t> &attach_id,
+    const std::vector<uint8_t> &transaction_id,
     ClientContext &context, const std::string &function_type = "TABLE",
     const std::vector<uint8_t> &global_execution_id = {},
     bool worker_debug = false,

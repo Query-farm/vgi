@@ -15,6 +15,7 @@ BindResult PerformBindProtocol(
     const std::shared_ptr<arrow::Array> &arguments_array,
     const std::shared_ptr<arrow::Schema> &input_schema,
     const std::vector<uint8_t> &attach_id,
+    const std::vector<uint8_t> &transaction_id,
     const std::map<std::string, Value> &settings,
     const std::vector<VgiSecretRequirement> &required_secrets,
     const std::string &worker_label,
@@ -59,7 +60,7 @@ BindResult PerformBindProtocol(
 	// 5. Build BindRequest (first attempt, resolved_secrets_provided=false)
 	auto bind_request = BuildBindRequest(function_name, arguments_bytes, function_type,
 	                                     input_schema_bytes, settings_bytes, secrets_bytes,
-	                                     attach_id, {}, false);
+	                                     attach_id, transaction_id, false);
 	auto bind_request_bytes = SerializeToIpcBytes(bind_request);
 
 	// 6. Send first bind and read response
@@ -88,7 +89,7 @@ BindResult PerformBindProtocol(
 		secrets_bytes = BuildSecretsBatch(context, secrets);
 		bind_request = BuildBindRequest(function_name, arguments_bytes, function_type,
 		                                input_schema_bytes, settings_bytes, secrets_bytes,
-		                                attach_id, {}, true);
+		                                attach_id, transaction_id, true);
 		bind_request_bytes = SerializeToIpcBytes(bind_request);
 
 		// Send retry bind

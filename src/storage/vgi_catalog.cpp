@@ -6,9 +6,11 @@
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
 #include "duckdb/parser/parsed_data/drop_info.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/execution/operator/persistent/physical_merge_into.hpp"
 #include "duckdb/planner/operator/logical_create_table.hpp"
 #include "duckdb/planner/operator/logical_delete.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
+#include "duckdb/planner/operator/logical_merge_into.hpp"
 #include "duckdb/planner/operator/logical_update.hpp"
 
 #include "storage/vgi_physical_write.hpp"
@@ -69,13 +71,6 @@ PhysicalOperator &VgiCatalog::PlanInsert(ClientContext &context, PhysicalPlanGen
 	if (!table.GetTableInfo().supports_insert) {
 		throw BinderException("Table '%s' does not support INSERT", table.name);
 	}
-	// ON CONFLICT requires MERGE INTO support (DuckDB rewrites ON CONFLICT as MERGE INTO
-	// internally). VgiCatalog::PlanMergeInto is not yet implemented — once it is, the
-	// on_conflict_info fields (action_type, on_conflict_filter, etc.) are already plumbed
-	// through to VgiPhysicalInsert and passed to the worker via write_options.
-	if (op.on_conflict_info.action_type != OnConflictAction::THROW) {
-		throw BinderException("ON CONFLICT is not yet supported for VGI tables (requires MERGE INTO support)");
-	}
 	// Use DuckDB's built-in default resolution: insert a PhysicalProjection child
 	// that evaluates default expressions for omitted columns. This means Sink
 	// always receives full-width rows with defaults already filled in.
@@ -111,6 +106,94 @@ PhysicalOperator &VgiCatalog::PlanUpdate(ClientContext &context, PhysicalPlanGen
 	auto &upd = planner.Make<VgiPhysicalUpdate>(op, table, op.return_chunk);
 	upd.children.push_back(plan);
 	return upd;
+}
+
+// Helper: plan a single merge action using VGI physical operators
+static unique_ptr<MergeIntoOperator> VgiPlanMergeIntoAction(ClientContext &context, LogicalMergeInto &op,
+                                                             PhysicalPlanGenerator &planner,
+                                                             BoundMergeIntoAction &action) {
+	auto result = make_uniq<MergeIntoOperator>();
+	result->action_type = action.action_type;
+	result->condition = std::move(action.condition);
+
+	auto &table = op.table.Cast<VgiTableEntry>();
+
+	switch (action.action_type) {
+	case MergeActionType::MERGE_UPDATE: {
+		if (!table.GetTableInfo().supports_update) {
+			throw BinderException("Table '%s' does not support UPDATE", table.name);
+		}
+		auto &upd = planner.Make<VgiPhysicalUpdate>(op, table, op.return_chunk,
+		                                             std::move(action.columns), std::move(action.expressions));
+		result->op = upd;
+		break;
+	}
+	case MergeActionType::MERGE_DELETE: {
+		if (!table.GetTableInfo().supports_delete) {
+			throw BinderException("Table '%s' does not support DELETE", table.name);
+		}
+		auto &del = planner.Make<VgiPhysicalDelete>(op, table, op.return_chunk, op.row_id_start);
+		result->op = del;
+		break;
+	}
+	case MergeActionType::MERGE_INSERT: {
+		if (!table.GetTableInfo().supports_insert) {
+			throw BinderException("Table '%s' does not support INSERT", table.name);
+		}
+		auto &ins = planner.Make<VgiPhysicalInsert>(op, table, op.return_chunk);
+		if (!action.column_index_map.empty()) {
+			vector<unique_ptr<Expression>> new_expressions;
+			for (auto &col : op.table.GetColumns().Physical()) {
+				auto storage_idx = col.StorageOid();
+				auto mapped_index = action.column_index_map[col.Physical()];
+				if (mapped_index == DConstants::INVALID_INDEX) {
+					new_expressions.push_back(op.bound_defaults[storage_idx]->Copy());
+				} else {
+					new_expressions.push_back(std::move(action.expressions[mapped_index]));
+				}
+			}
+			action.expressions = std::move(new_expressions);
+		}
+		result->expressions = std::move(action.expressions);
+		result->op = ins;
+		break;
+	}
+	case MergeActionType::MERGE_ERROR:
+		result->expressions = std::move(action.expressions);
+		break;
+	case MergeActionType::MERGE_DO_NOTHING:
+		break;
+	default:
+		throw InternalException("Unsupported merge action");
+	}
+	return result;
+}
+
+PhysicalOperator &VgiCatalog::PlanMergeInto(ClientContext &context, PhysicalPlanGenerator &planner,
+                                             LogicalMergeInto &op, PhysicalOperator &plan) {
+	map<MergeActionCondition, vector<unique_ptr<MergeIntoOperator>>> actions;
+
+	idx_t append_count = 0;
+	for (auto &entry : op.actions) {
+		vector<unique_ptr<MergeIntoOperator>> planned_actions;
+		for (auto &action : entry.second) {
+			if (action->action_type == MergeActionType::MERGE_INSERT) {
+				append_count++;
+			}
+			if (action->action_type == MergeActionType::MERGE_UPDATE && action->update_is_del_and_insert) {
+				append_count++;
+			}
+			planned_actions.push_back(VgiPlanMergeIntoAction(context, op, planner, *action));
+		}
+		actions.emplace(entry.first, std::move(planned_actions));
+	}
+
+	bool parallel = append_count <= 1 && !op.return_chunk;
+
+	auto &result = planner.Make<PhysicalMergeInto>(op.types, std::move(actions), op.row_id_start, op.source_marker,
+	                                               parallel, op.return_chunk);
+	result.children.push_back(plan);
+	return result;
 }
 
 unique_ptr<LogicalOperator> VgiCatalog::BindCreateIndex(Binder &binder, CreateStatement &stmt, TableCatalogEntry &table,

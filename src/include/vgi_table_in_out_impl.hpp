@@ -36,6 +36,7 @@ struct VgiTableInOutBindData : public TableFunctionData {
 	// Connection parameters
 	std::string worker_path;
 	std::vector<uint8_t> attach_id;
+	std::vector<uint8_t> transaction_id;
 	bool worker_debug = false;
 	bool use_pool = false;
 	std::string function_name;
@@ -104,6 +105,7 @@ struct VgiTableInOutBindParams {
 	std::string worker_path;
 	std::string function_name;
 	std::vector<uint8_t> attach_id;
+	std::vector<uint8_t> transaction_id;
 	bool worker_debug = false;
 	bool use_pool = false;
 	std::map<std::string, Value> settings;

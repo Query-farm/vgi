@@ -9,6 +9,7 @@
 #include "duckdb/storage/table_storage_info.hpp"
 
 #include "storage/vgi_catalog.hpp"
+#include "storage/vgi_transaction.hpp"
 #include "vgi_catalog_api.hpp"
 #include "vgi_table_function_impl.hpp"
 #include "vgi_worker_pool.hpp"
@@ -99,6 +100,8 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 	auto scan_bind_data = make_uniq<vgi::VgiTableFunctionBindData>();
 	scan_bind_data->worker_path = attach_params->worker_path();
 	scan_bind_data->attach_id = attach_result->attach_id;
+	auto &vgi_tx = VgiTransaction::Get(context, catalog_);
+	scan_bind_data->transaction_id = vgi_tx.GetTransactionId();
 	scan_bind_data->worker_debug = attach_params->worker_debug();
 	scan_bind_data->use_pool = attach_params->use_pool();
 	scan_bind_data->function_name = scan_result.function_name;
@@ -156,16 +159,27 @@ TableStorageInfo VgiTableEntry::GetStorageInfo(ClientContext &context) {
 	// They exist solely to satisfy the binder's validation. Actual conflict detection
 	// is delegated to the worker, which owns the data and its constraints.
 	//
-	// Note: ON CONFLICT also requires PlanMergeInto support (DuckDB rewrites ON CONFLICT
-	// as MERGE INTO internally). Until VgiCatalog::PlanMergeInto is implemented, ON CONFLICT
-	// will still fail at the physical plan stage.
+	// Constraint indices from the worker are in Arrow schema space (which includes
+	// the row_id column). DuckDB's physical column space excludes virtual columns
+	// like row_id. Adjust by shifting indices down when they're after row_id.
+	auto adjust_col = [&](int col) -> column_t {
+		auto adjusted = col;
+		if (table_info_.row_id_column >= 0 && col > table_info_.row_id_column) {
+			adjusted--;
+		} else if (table_info_.row_id_column >= 0 && col == table_info_.row_id_column) {
+			// row_id itself should never be a constraint column
+			throw InternalException("row_id column cannot be part of a constraint");
+		}
+		return NumericCast<column_t>(adjusted);
+	};
+
 	for (auto &pk : table_info_.primary_key_constraints) {
 		IndexInfo idx_info;
 		idx_info.is_unique = true;
 		idx_info.is_primary = true;
 		idx_info.is_foreign = false;
 		for (auto col : pk) {
-			idx_info.column_set.insert(NumericCast<column_t>(col));
+			idx_info.column_set.insert(adjust_col(col));
 		}
 		info.index_info.push_back(std::move(idx_info));
 	}
@@ -175,7 +189,7 @@ TableStorageInfo VgiTableEntry::GetStorageInfo(ClientContext &context) {
 		idx_info.is_primary = false;
 		idx_info.is_foreign = false;
 		for (auto col : unique) {
-			idx_info.column_set.insert(NumericCast<column_t>(col));
+			idx_info.column_set.insert(adjust_col(col));
 		}
 		info.index_info.push_back(std::move(idx_info));
 	}

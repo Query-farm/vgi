@@ -28,6 +28,7 @@ unique_ptr<FunctionData> VgiTableInOutBindData::Copy() const {
 	auto copy = make_uniq<VgiTableInOutBindData>();
 	copy->worker_path = worker_path;
 	copy->attach_id = attach_id;
+	copy->transaction_id = transaction_id;
 	copy->worker_debug = worker_debug;
 	copy->use_pool = use_pool;
 	copy->function_name = function_name;
@@ -72,6 +73,7 @@ unique_ptr<FunctionData> VgiTableInOutBind(ClientContext &context, TableFunction
 	// Copy connection parameters
 	bind_data->worker_path = params.worker_path;
 	bind_data->attach_id = params.attach_id;
+	bind_data->transaction_id = params.transaction_id;
 	bind_data->worker_debug = params.worker_debug;
 	bind_data->use_pool = params.use_pool;
 	bind_data->function_name = params.function_name;
@@ -118,7 +120,8 @@ unique_ptr<FunctionData> VgiTableInOutBind(ClientContext &context, TableFunction
 			         {"from_pool", "true"},
 			         {"pid", std::to_string(pooled->GetPid())}});
 			connection = CreateFunctionConnectionFromPool(std::move(pooled), bind_data->function_name,
-			                                              bind_data->arguments, bind_data->attach_id, context,
+			                                              bind_data->arguments, bind_data->attach_id,
+			                                              bind_data->transaction_id, context,
 			                                              "TABLE", std::vector<uint8_t>{},
 			                                              bind_data->worker_debug, bind_data->settings,
 			                                              bind_data->required_secrets);
@@ -126,7 +129,8 @@ unique_ptr<FunctionData> VgiTableInOutBind(ClientContext &context, TableFunction
 	}
 	if (!connection) {
 		connection = CreateFunctionConnection(bind_data->worker_path, bind_data->function_name,
-		                                      bind_data->arguments, bind_data->attach_id, context,
+		                                      bind_data->arguments, bind_data->attach_id,
+		                                      bind_data->transaction_id, context,
 		                                      "TABLE", std::vector<uint8_t>{},
 		                                      bind_data->worker_debug, bind_data->settings,
 		                                      bind_data->required_secrets);

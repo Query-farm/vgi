@@ -11,6 +11,7 @@
 
 #include "storage/vgi_catalog.hpp"
 #include "storage/vgi_schema_entry.hpp"
+#include "storage/vgi_transaction.hpp"
 #include "vgi_arrow_utils.hpp"
 #include "vgi_catalog_api.hpp"
 #include "vgi_table_function_impl.hpp"
@@ -56,6 +57,8 @@ static unique_ptr<FunctionData> VgiCatalogTableFunctionBind(ClientContext &conte
 	// Copy connection information from the catalog function info
 	bind_data->worker_path = vgi_info.worker_path();
 	bind_data->attach_id = vgi_info.attach_id();
+	auto &vgi_tx = VgiTransaction::Get(context, vgi_info.catalog());
+	bind_data->transaction_id = vgi_tx.GetTransactionId();
 	bind_data->worker_debug = vgi_info.worker_debug();
 	bind_data->use_pool = vgi_info.use_pool();
 	bind_data->function_name = vgi_info.function_info().name;
@@ -129,6 +132,8 @@ static unique_ptr<FunctionData> VgiCatalogTableInOutFunctionBind(ClientContext &
 	params.worker_path = vgi_info.worker_path();
 	params.function_name = vgi_info.function_info().name;
 	params.attach_id = vgi_info.attach_id();
+	auto &tio_tx = VgiTransaction::Get(context, vgi_info.catalog());
+	params.transaction_id = tio_tx.GetTransactionId();
 	params.worker_debug = vgi_info.worker_debug();
 	params.use_pool = vgi_info.use_pool();
 	params.settings = ExtractVgiSettings(context, vgi_info.setting_names());
@@ -224,7 +229,7 @@ void VgiTableFunctionSet::LoadEntries(ClientContext &context) {
 
 				// Attach function info
 				table_func.function_info = make_uniq<vgi::VgiTableFunctionInfo>(
-				    worker_path, attach_result->attach_id, attach_params->worker_debug(),
+				    catalog_, worker_path, attach_result->attach_id, attach_params->worker_debug(),
 				    attach_params->use_pool(), func_info, setting_names);
 
 				func_set.AddFunction(table_func);
@@ -250,7 +255,7 @@ void VgiTableFunctionSet::LoadEntries(ClientContext &context) {
 
 				// Attach VgiTableFunctionInfo so the bind function can access worker_path and function metadata
 				table_func.function_info = make_uniq<vgi::VgiTableFunctionInfo>(
-				    worker_path, attach_result->attach_id, attach_params->worker_debug(),
+				    catalog_, worker_path, attach_result->attach_id, attach_params->worker_debug(),
 				    attach_params->use_pool(), func_info, setting_names);
 
 				func_set.AddFunction(table_func);

@@ -30,9 +30,9 @@ AcquireAndBindResult AcquireAndBindConnection(ClientContext &context, const Func
 	// Lambda to create a fresh connection (uses factory for HTTP/subprocess dispatch)
 	auto create_fresh_connection = [&]() {
 		return CreateFunctionConnection(params.worker_path, params.function_name, params.arguments,
-		                                params.attach_id, context, params.function_type,
-		                                params.global_execution_id, params.worker_debug,
-		                                params.settings, params.required_secrets);
+		                                params.attach_id, params.transaction_id, context,
+		                                params.function_type, params.global_execution_id,
+		                                params.worker_debug, params.settings, params.required_secrets);
 	};
 
 	// Lambda to attempt bind, returns true on success, false if retry needed
@@ -60,8 +60,8 @@ AcquireAndBindResult AcquireAndBindConnection(ClientContext &context, const Func
 		if (pooled) {
 			auto pooled_pid = pooled->GetPid();
 			conn = CreateFunctionConnectionFromPool(std::move(pooled), params.function_name, params.arguments,
-			                                        params.attach_id, context, params.function_type,
-			                                        params.global_execution_id,
+			                                        params.attach_id, params.transaction_id, context,
+			                                        params.function_type, params.global_execution_id,
 			                                        params.worker_debug, params.settings,
 			                                        params.required_secrets);
 			from_pool = true;
@@ -107,26 +107,28 @@ AcquireAndBindResult AcquireAndBindConnection(ClientContext &context, const Func
 
 FunctionConnection::FunctionConnection(const std::string &worker_path, const std::string &function_name,
                                        const ArrowArguments &arguments, const std::vector<uint8_t> &attach_id,
+                                       const std::vector<uint8_t> &transaction_id,
                                        ClientContext &context, const std::string &function_type,
                                        const std::vector<uint8_t> &global_execution_id,
                                        bool worker_debug, const std::map<std::string, Value> &settings,
                                        const std::vector<VgiSecretRequirement> &required_secrets)
     : worker_path_(worker_path), function_name_(function_name), function_type_(function_type),
       arguments_type_(arguments.type), arguments_array_(arguments.array), attach_id_(attach_id),
-      global_execution_id_(global_execution_id), context_(context), worker_debug_(worker_debug), settings_(settings),
-      required_secrets_(required_secrets) {
+      transaction_id_(transaction_id), global_execution_id_(global_execution_id), context_(context),
+      worker_debug_(worker_debug), settings_(settings), required_secrets_(required_secrets) {
 }
 
 FunctionConnection::FunctionConnection(std::unique_ptr<PooledWorker> pooled_worker, const std::string &function_name,
                                        const ArrowArguments &arguments, const std::vector<uint8_t> &attach_id,
+                                       const std::vector<uint8_t> &transaction_id,
                                        ClientContext &context, const std::string &function_type,
                                        const std::vector<uint8_t> &global_execution_id,
                                        bool worker_debug, const std::map<std::string, Value> &settings,
                                        const std::vector<VgiSecretRequirement> &required_secrets)
     : worker_path_(pooled_worker->GetWorkerPath()), function_name_(function_name), function_type_(function_type),
       arguments_type_(arguments.type), arguments_array_(arguments.array), attach_id_(attach_id),
-      global_execution_id_(global_execution_id), context_(context), worker_debug_(worker_debug), settings_(settings),
-      required_secrets_(required_secrets),
+      transaction_id_(transaction_id), global_execution_id_(global_execution_id), context_(context),
+      worker_debug_(worker_debug), settings_(settings), required_secrets_(required_secrets),
       proc_(pooled_worker->Release()), stderr_fd_(pooled_worker->ReleaseStderrFd()) {
 	// Start stderr reader thread for the existing subprocess (reusing the fd)
 	StartStderrReader();
@@ -203,7 +205,8 @@ BindResult FunctionConnection::PerformBindFull() {
 
 	bind_result_ = PerformBindProtocol(context_, function_name_, function_type_,
 	                                    arguments_array_, input_schema_, attach_id_,
-	                                    settings_, required_secrets_, worker_path_, transport_fn);
+	                                    transaction_id_, settings_, required_secrets_,
+	                                    worker_path_, transport_fn);
 	bind_done_ = true;
 
 	DrainStderrLog();
@@ -803,6 +806,7 @@ void FunctionConnection::DrainStderrLog() {
 std::unique_ptr<IFunctionConnection> CreateFunctionConnection(
     const std::string &worker_path, const std::string &function_name,
     const ArrowArguments &arguments, const std::vector<uint8_t> &attach_id,
+    const std::vector<uint8_t> &transaction_id,
     ClientContext &context, const std::string &function_type,
     const std::vector<uint8_t> &global_execution_id,
     bool worker_debug,
@@ -810,17 +814,18 @@ std::unique_ptr<IFunctionConnection> CreateFunctionConnection(
     const std::vector<VgiSecretRequirement> &required_secrets) {
 	if (IsHttpTransport(worker_path)) {
 		return std::make_unique<HttpFunctionConnection>(
-		    worker_path, function_name, arguments, attach_id, context,
+		    worker_path, function_name, arguments, attach_id, transaction_id, context,
 		    function_type, global_execution_id, worker_debug, settings, required_secrets);
 	}
 	return std::make_unique<FunctionConnection>(
-	    worker_path, function_name, arguments, attach_id, context,
+	    worker_path, function_name, arguments, attach_id, transaction_id, context,
 	    function_type, global_execution_id, worker_debug, settings, required_secrets);
 }
 
 std::unique_ptr<IFunctionConnection> CreateFunctionConnectionFromPool(
     std::unique_ptr<PooledWorker> pooled_worker, const std::string &function_name,
     const ArrowArguments &arguments, const std::vector<uint8_t> &attach_id,
+    const std::vector<uint8_t> &transaction_id,
     ClientContext &context, const std::string &function_type,
     const std::vector<uint8_t> &global_execution_id,
     bool worker_debug,
@@ -828,7 +833,7 @@ std::unique_ptr<IFunctionConnection> CreateFunctionConnectionFromPool(
     const std::vector<VgiSecretRequirement> &required_secrets) {
 	// Only subprocess connections use the pool
 	return std::make_unique<FunctionConnection>(
-	    std::move(pooled_worker), function_name, arguments, attach_id, context,
+	    std::move(pooled_worker), function_name, arguments, attach_id, transaction_id, context,
 	    function_type, global_execution_id, worker_debug, settings, required_secrets);
 }
 

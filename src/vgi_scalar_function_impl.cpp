@@ -1,4 +1,5 @@
 #include "vgi_scalar_function_impl.hpp"
+#include "storage/vgi_transaction.hpp"
 #include "vgi_arrow_utils.hpp"
 #include "vgi_catalog_api.hpp"
 #include "vgi_function_connection.hpp"
@@ -194,19 +195,24 @@ unique_ptr<FunctionData> VgiScalarFunctionBind(ClientContext &context, ScalarFun
 		output_schema = func_info.output_schema;
 	} else {
 		// Initial bind - call worker to get output schema
+		auto transaction_id = func_info.catalog
+		    ? VgiTransaction::Get(context, *func_info.catalog).GetTransactionId()
+		    : std::vector<uint8_t>{};
 		std::unique_ptr<IFunctionConnection> connection;
 		if (func_info.use_pool && !IsHttpTransport(func_info.worker_path)) {
 			auto pooled = VgiWorkerPool::Instance().TryAcquire(func_info.worker_path);
 			if (pooled) {
 				connection = CreateFunctionConnectionFromPool(
-				    std::move(pooled), func_info.function_name, arrow_arguments, func_info.attach_id, context,
+				    std::move(pooled), func_info.function_name, arrow_arguments, func_info.attach_id,
+				    transaction_id, context,
 				    "SCALAR", std::vector<uint8_t>{}, func_info.worker_debug, settings,
 				    func_info.required_secrets);
 			}
 		}
 		if (!connection) {
 			connection = CreateFunctionConnection(
-			    func_info.worker_path, func_info.function_name, arrow_arguments, func_info.attach_id, context,
+			    func_info.worker_path, func_info.function_name, arrow_arguments, func_info.attach_id,
+			    transaction_id, context,
 			    "SCALAR", std::vector<uint8_t>{}, func_info.worker_debug, settings,
 			    func_info.required_secrets);
 		}
@@ -333,13 +339,17 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 		}
 
 		// Fall back to pool or fresh connection
+		auto transaction_id = func_info.catalog
+		    ? VgiTransaction::Get(context, *func_info.catalog).GetTransactionId()
+		    : std::vector<uint8_t>{};
 		if (!connection && use_pool && !IsHttpTransport(worker_path)) {
 			auto pooled = VgiWorkerPool::Instance().TryAcquire(worker_path);
 			if (pooled) {
 				VGI_STDERR_DEBUG("[VGI] scalar.pool_acquire result=hit worker_path=%s pid=%d\n",
 				                 worker_path.c_str(), pooled->GetPid());
 				connection = CreateFunctionConnectionFromPool(
-				    std::move(pooled), function_name, arguments, attach_id, context,
+				    std::move(pooled), function_name, arguments, attach_id,
+				    transaction_id, context,
 				    "SCALAR", std::vector<uint8_t>{}, worker_debug, settings,
 				    required_secrets);
 			} else {
@@ -348,7 +358,8 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 		}
 		if (!connection) {
 			connection = CreateFunctionConnection(
-			    worker_path, function_name, arguments, attach_id, context,
+			    worker_path, function_name, arguments, attach_id,
+			    transaction_id, context,
 			    "SCALAR", std::vector<uint8_t>{}, worker_debug, settings,
 			    required_secrets);
 			VGI_STDERR_DEBUG("[VGI] scalar.new_connection worker_path=%s pid=%d\n",

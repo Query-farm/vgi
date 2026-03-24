@@ -31,6 +31,7 @@ class HttpFunctionConnection : public IFunctionConnection {
 public:
 	HttpFunctionConnection(const std::string &worker_path, const std::string &function_name,
 	                       const ArrowArguments &arguments, const std::vector<uint8_t> &attach_id,
+	                       const std::vector<uint8_t> &transaction_id,
 	                       ClientContext &context, const std::string &function_type = "TABLE",
 	                       const std::vector<uint8_t> &global_execution_id = {},
 	                       bool worker_debug = false,
@@ -82,6 +83,7 @@ private:
 	std::shared_ptr<arrow::DataType> arguments_type_;
 	std::shared_ptr<arrow::Array> arguments_array_;
 	std::vector<uint8_t> attach_id_;
+	std::vector<uint8_t> transaction_id_;
 	std::vector<uint8_t> global_execution_id_;
 	ClientContext &context_;
 	bool worker_debug_;

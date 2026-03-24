@@ -32,6 +32,7 @@ struct VgiScalarFunctionInfo : public ScalarFunctionInfo {
 	// Worker connection parameters
 	std::string worker_path;
 	std::vector<uint8_t> attach_id;
+	optional_ptr<Catalog> catalog;
 	std::string function_name;
 	bool worker_debug = false;
 	bool use_pool = false;

@@ -137,6 +137,7 @@ void VgiScalarFunctionSet::LoadEntries(ClientContext &context) {
 			auto scalar_func_info = make_shared_ptr<VgiScalarFunctionInfo>();
 			scalar_func_info->worker_path = worker_path;
 			scalar_func_info->attach_id = attach_result->attach_id;
+			scalar_func_info->catalog = &catalog_;
 			scalar_func_info->function_name = func_info.name;
 			scalar_func_info->worker_debug = attach_params->worker_debug();
 			scalar_func_info->use_pool = attach_params->use_pool();
