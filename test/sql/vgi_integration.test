@@ -53,7 +53,7 @@ DETACH vgi_test;
 statement error
 ATTACH 'nonexistent_catalog' AS vgi_bad (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 ----
-Unknown catalog: 'nonexistent_catalog'
+No worker handles catalog 'nonexistent_catalog'
 
 # ============================================================================
 # Test vgi_table_function with multi-worker execution and logging
