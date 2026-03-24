@@ -1,0 +1,113 @@
+# name: test/sql/integration/table/comments.test
+# description: Test comment metadata visibility on tables, views, and columns
+# group: [vgi_integration_table]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# Table comments (via duckdb_tables)
+# ============================================================================
+
+query TT
+SELECT table_name, comment
+FROM duckdb_tables()
+WHERE database_name = 'example' AND schema_name = 'data'
+  AND comment IS NOT NULL
+ORDER BY table_name;
+----
+departments	Department reference table
+employees	Employee table with FK to departments
+large_sequence	A large sequence of integers from 0 to 1,000,000
+numbers	First 100 integers (demonstrates explicit columns)
+products	Product table with column defaults
+projects	Projects with composite PK and FK to departments
+rowid_first	Table with row_id at column index 0
+rowid_last	Table with row_id at column index 2
+rowid_middle	Table with row_id at column index 1
+rowid_string	Table with string row_id
+rowid_struct	Table with struct row_id
+versioned_constraints	Table with constraints that evolve across versions
+versioned_data	Versioned data table demonstrating time travel with schema evolution
+
+# ============================================================================
+# View comments (via duckdb_views)
+# ============================================================================
+
+query TT
+SELECT view_name, comment
+FROM duckdb_views()
+WHERE database_name = 'example' AND schema_name = 'main'
+  AND comment IS NOT NULL
+ORDER BY view_name;
+----
+even_numbers	Even numbers from 0 to 98
+first_ten	First 10 integers
+
+# ============================================================================
+# Column comments on products table (via duckdb_columns)
+# ============================================================================
+
+query TT
+SELECT column_name, comment
+FROM duckdb_columns()
+WHERE database_name = 'example' AND schema_name = 'data'
+  AND table_name = 'products'
+  AND comment IS NOT NULL
+ORDER BY column_name;
+----
+id	Unique product identifier
+name	Product display name
+price	Unit price in USD
+
+# Columns without comments have NULL
+query TT
+SELECT column_name, comment
+FROM duckdb_columns()
+WHERE database_name = 'example' AND schema_name = 'data'
+  AND table_name = 'products'
+  AND comment IS NULL
+ORDER BY column_name;
+----
+quantity	NULL
+
+# ============================================================================
+# Column with both default AND comment (coexistence test)
+# ============================================================================
+
+query TTT
+SELECT column_name, column_default, comment
+FROM duckdb_columns()
+WHERE database_name = 'example' AND schema_name = 'data'
+  AND table_name = 'products'
+  AND column_default IS NOT NULL AND comment IS NOT NULL
+ORDER BY column_name;
+----
+name	'unknown'	Product display name
+price	9.99	Unit price in USD
+
+# ============================================================================
+# Tables without column comments have all NULL comments
+# ============================================================================
+
+query I
+SELECT COUNT(*)
+FROM duckdb_columns()
+WHERE database_name = 'example' AND schema_name = 'data'
+  AND table_name = 'departments'
+  AND comment IS NOT NULL;
+----
+0
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;

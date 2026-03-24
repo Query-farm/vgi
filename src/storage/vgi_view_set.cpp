@@ -35,6 +35,12 @@ void VgiViewSet::LoadEntries(ClientContext &context) {
 		CreateViewInfo info;
 		info.view_name = view_info.name;
 		info.sql = view_info.definition;
+		if (!view_info.comment.empty()) {
+			info.comment = Value(view_info.comment);
+		}
+		for (auto &[key, val] : view_info.tags) {
+			info.tags[key] = val;
+		}
 
 		// Parse the SQL to get the select statement
 		try {

@@ -995,6 +995,12 @@ CreateTableInfo CreateTableInfoFromVgiTable(ClientContext &context, VgiTableInfo
 	CreateTableInfo create_info;
 	create_info.table = table_info.name;
 	create_info.schema = schema_name;
+	if (!table_info.comment.empty()) {
+		create_info.comment = Value(table_info.comment);
+	}
+	for (auto &[key, val] : table_info.tags) {
+		create_info.tags[key] = val;
+	}
 
 	if (table_info.arrow_schema) {
 		if (table_info.row_id_column >= 0) {
@@ -1094,27 +1100,37 @@ CreateTableInfo CreateTableInfoFromVgiTable(ClientContext &context, VgiTableInfo
 		    make_uniq<ForeignKeyConstraint>(std::move(pk_cols), std::move(fk_cols), std::move(fk_info)));
 	}
 
-	// Apply column defaults from Arrow field metadata
+	// Apply column metadata (defaults, comments) from Arrow field metadata
 	if (table_info.arrow_schema) {
 		for (int i = 0; i < table_info.arrow_schema->num_fields(); i++) {
 			if (table_info.row_id_column >= 0 && i == table_info.row_id_column) {
 				continue;
 			}
 			auto &arrow_field = table_info.arrow_schema->field(i);
-			if (arrow_field->HasMetadata()) {
-				auto default_key_idx = arrow_field->metadata()->FindKey("default");
-				if (default_key_idx >= 0) {
-					auto default_expr = arrow_field->metadata()->value(default_key_idx);
-					auto expressions = Parser::ParseExpressionList(default_expr);
-					if (!expressions.empty()) {
-						int adjusted = i;
-						if (table_info.row_id_column >= 0 && i > table_info.row_id_column) {
-							adjusted--;
-						}
-						auto &col = create_info.columns.GetColumnMutable(LogicalIndex(adjusted));
-						col.SetDefaultValue(std::move(expressions[0]));
-					}
+			if (!arrow_field->HasMetadata()) {
+				continue;
+			}
+
+			int adjusted = i;
+			if (table_info.row_id_column >= 0 && i > table_info.row_id_column) {
+				adjusted--;
+			}
+			auto &col = create_info.columns.GetColumnMutable(LogicalIndex(adjusted));
+
+			// Default value
+			auto default_idx = arrow_field->metadata()->FindKey("default");
+			if (default_idx >= 0) {
+				auto default_expr = arrow_field->metadata()->value(default_idx);
+				auto expressions = Parser::ParseExpressionList(default_expr);
+				if (!expressions.empty()) {
+					col.SetDefaultValue(std::move(expressions[0]));
 				}
+			}
+
+			// Column comment
+			auto comment_idx = arrow_field->metadata()->FindKey("comment");
+			if (comment_idx >= 0) {
+				col.SetComment(Value(arrow_field->metadata()->value(comment_idx)));
 			}
 		}
 	}
