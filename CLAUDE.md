@@ -32,16 +32,18 @@ The extension supports two transports: **subprocess** (worker spawned as a child
 
 ### Subprocess Transport (default, faster)
 
+**Always use `tee` to capture output** so failures are easy to find afterwards:
+
 ```bash
 # Run all tests in release mode (subprocess)
-make test_subprocess
+make test_subprocess 2>&1 | tee /tmp/vgi-test.log
 
 # Run all tests in debug mode (subprocess)
-make test_subprocess_debug
+make test_subprocess_debug 2>&1 | tee /tmp/vgi-test-debug.log
 
 # The legacy `make test` / `make test_debug` also work (run all tests including non-integration)
-make test
-make test_debug
+make test 2>&1 | tee /tmp/vgi-test.log
+make test_debug 2>&1 | tee /tmp/vgi-test-debug.log
 
 # To see failures:
 make test_subprocess | grep -A 20 "FAILED"

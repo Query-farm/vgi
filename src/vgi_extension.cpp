@@ -606,6 +606,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 		}
 	}
 
+	// Register async prefetch setting
+	config.AddExtensionOption("vgi_async_prefetch",
+	                          "Enable async I/O prefetch for VGI table function scans",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
+
 	// Register worker pool settings
 	config.AddExtensionOption("vgi_worker_pool_idle_limit_seconds",
 	                          "Maximum idle time in seconds before pooled workers are removed", LogicalType::BIGINT,

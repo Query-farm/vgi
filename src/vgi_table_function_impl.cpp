@@ -47,7 +47,8 @@ void PerformVgiTableFunctionBind(ClientContext &context, VgiTableFunctionBindDat
 	// Connection is preserved in bind_data for reuse in InitGlobal.
 	// Uses helper that handles pool acquire and stale connection retry.
 	FunctionConnectionParams params(bind_data.worker_path, bind_data.function_name, bind_data.arguments,
-	                                bind_data.attach_id, {} /* primary worker, no global exec ID */,
+	                                bind_data.attach_id, bind_data.transaction_id,
+	                                {} /* primary worker, no global exec ID */,
 	                                bind_data.worker_debug, bind_data.settings, bind_data.use_pool, "bind", "TABLE",
 	                                bind_data.required_secrets);
 
@@ -545,7 +546,8 @@ unique_ptr<LocalTableFunctionState> VgiTableFunctionInitLocal(ExecutionContext &
 		// The global_execution_id is passed via FunctionConnectionParams, and
 		// PerformInit includes it in the InitRequest automatically.
 		FunctionConnectionParams params(bind_data.worker_path, bind_data.function_name, bind_data.arguments,
-		                                bind_data.attach_id, global_state.global_execution_id, bind_data.worker_debug,
+		                                bind_data.attach_id, bind_data.transaction_id,
+		                                global_state.global_execution_id, bind_data.worker_debug,
 		                                bind_data.settings, bind_data.use_pool, "init_local_secondary", "TABLE",
 		                                bind_data.required_secrets);
 
@@ -609,37 +611,68 @@ static bool GetNextBatch(ClientContext &context, const VgiTableFunctionBindData 
 }
 
 // ============================================================================
-// Scan Function
+// Async Prefetch Helpers
 // ============================================================================
 
-void VgiTableFunctionScan(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
-	auto &bind_data = input.bind_data->Cast<VgiTableFunctionBindData>();
-	auto &global_state = input.global_state->Cast<VgiTableFunctionGlobalState>();
-	auto &local_state = input.local_state->Cast<VgiTableFunctionLocalState>();
+void VgiPrefetchTask::Execute() {
+	try {
+		local_state_.prefetch_batch_ = local_state_.connection->ReadDataBatch();
+		local_state_.prefetch_state_.store(PrefetchState::READY);
+	} catch (...) {
+		local_state_.prefetch_exception_ = std::current_exception();
+		local_state_.prefetch_state_.store(PrefetchState::ERROR);
+	}
+}
 
-	// Get a batch if we don't have one or we've exhausted the current one
-	while (!local_state.chunk || !local_state.chunk->arrow_array.release ||
-	       local_state.chunk_offset >= static_cast<idx_t>(local_state.chunk->arrow_array.length)) {
-		if (!GetNextBatch(context, bind_data, local_state)) {
-			output.SetCardinality(0);
-			return;
-		}
+static void LaunchPrefetch(TableFunctionInput &input, VgiTableFunctionLocalState &local_state) {
+	local_state.prefetch_state_.store(PrefetchState::IN_FLIGHT);
+	vector<unique_ptr<AsyncTask>> tasks;
+	tasks.push_back(make_uniq<VgiPrefetchTask>(local_state));
+	input.async_result = AsyncResult(std::move(tasks));
+}
+
+static void ConsumePrefetchedBatch(ClientContext &context, const VgiTableFunctionBindData &bind_data,
+                                   VgiTableFunctionLocalState &local_state) {
+	auto arrow_batch = std::move(local_state.prefetch_batch_);
+	local_state.prefetch_batch_.reset();
+	local_state.prefetch_state_.store(PrefetchState::IDLE);
+
+	if (!arrow_batch) {
+		local_state.done = true;
+		VGI_LOG(context, "table_function.scan_complete",
+		        {{"worker_path", bind_data.worker_path},
+		         {"worker_pid", std::to_string(local_state.connection->GetPid())},
+		         {"function_name", bind_data.function_name}});
+		return;
 	}
 
-	// Calculate output size
+	auto chunk = make_uniq<ArrowArrayWrapper>();
+	ExportRecordBatch(arrow_batch, *chunk);
+
+	local_state.chunk = shared_ptr<ArrowArrayWrapper>(chunk.release());
+	local_state.chunk_offset = 0;
+	local_state.Reset();
+
+	VGI_LOG(context, "table_function.batch_received",
+	        {{"worker_path", bind_data.worker_path},
+	         {"worker_pid", std::to_string(local_state.connection->GetPid())},
+	         {"function_name", bind_data.function_name},
+	         {"batch_rows", std::to_string(arrow_batch->num_rows())}});
+}
+
+// ============================================================================
+// Helper: Convert current batch slice to DuckDB output
+// ============================================================================
+
+static void ConvertCurrentBatch(const VgiTableFunctionBindData &bind_data,
+                                VgiTableFunctionGlobalState &global_state,
+                                VgiTableFunctionLocalState &local_state, DataChunk &output) {
 	idx_t output_size =
 	    MinValue<idx_t>(STANDARD_VECTOR_SIZE, local_state.chunk->arrow_array.length - local_state.chunk_offset);
 
 	output.SetCardinality(output_size);
 
-	// Convert Arrow data to DuckDB using ArrowTableFunction::ArrowToDuckDB
-	// Pass true if projection pushdown is enabled (column_ids was set in InitLocal)
 	if (output_size > 0) {
-		// When projection pushdown is enabled, column_ids were already remapped in InitLocal
-		// to account for the rowid column gap. Don't pass rowid_column_index since the worker
-		// returns only the projected columns and ArrowToDuckDB would incorrectly shift array indices.
-		// When projection pushdown is disabled, the worker returns ALL columns (including rowid),
-		// so we pass rowid_column_index to let ArrowToDuckDB skip the rowid column.
 		idx_t rowid_col = (!bind_data.projection_pushdown && bind_data.rowid_worker_col_index >= 0)
 		                      ? static_cast<idx_t>(bind_data.rowid_worker_col_index)
 		                      : COLUMN_IDENTIFIER_ROW_ID;
@@ -650,6 +683,104 @@ void VgiTableFunctionScan(ClientContext &context, TableFunctionInput &input, Dat
 	local_state.chunk_offset += output.size();
 	global_state.rows_read.fetch_add(output.size(), std::memory_order_relaxed);
 	output.Verify();
+}
+
+//! Check whether the current batch has been fully consumed
+static bool BatchExhausted(const VgiTableFunctionLocalState &local_state) {
+	return !local_state.chunk || !local_state.chunk->arrow_array.release ||
+	       local_state.chunk_offset >= static_cast<idx_t>(local_state.chunk->arrow_array.length);
+}
+
+// ============================================================================
+// Scan Function
+// ============================================================================
+
+void VgiTableFunctionScan(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
+	auto &bind_data = input.bind_data->Cast<VgiTableFunctionBindData>();
+	auto &global_state = input.global_state->Cast<VgiTableFunctionGlobalState>();
+	auto &local_state = input.local_state->Cast<VgiTableFunctionLocalState>();
+
+	// Determine whether async prefetch is enabled for this scan
+	bool is_async = (input.results_execution_mode == AsyncResultsExecutionMode::TASK_EXECUTOR);
+	if (is_async) {
+		Value async_val;
+		if (context.TryGetCurrentSetting("vgi_async_prefetch", async_val)) {
+			is_async = async_val.GetValue<bool>();
+		}
+	}
+
+	// Fast path: current batch still has rows to consume
+	if (!BatchExhausted(local_state)) {
+		ConvertCurrentBatch(bind_data, global_state, local_state, output);
+		return;
+	}
+
+	// Need a new batch
+	if (local_state.done) {
+		output.SetCardinality(0);
+		return;
+	}
+
+	// Synchronous fallback: inline blocking I/O (original behavior)
+	if (!is_async) {
+		while (BatchExhausted(local_state)) {
+			if (!GetNextBatch(context, bind_data, local_state)) {
+				output.SetCardinality(0);
+				return;
+			}
+		}
+		ConvertCurrentBatch(bind_data, global_state, local_state, output);
+		return;
+	}
+
+	// --- Async path ---
+	auto state = local_state.prefetch_state_.load();
+
+	if (state == PrefetchState::ERROR) {
+		local_state.prefetch_state_.store(PrefetchState::IDLE);
+		std::rethrow_exception(local_state.prefetch_exception_);
+	}
+
+	if (state == PrefetchState::READY) {
+		ConsumePrefetchedBatch(context, bind_data, local_state);
+		if (local_state.done) {
+			output.SetCardinality(0);
+			return;
+		}
+		ConvertCurrentBatch(bind_data, global_state, local_state, output);
+		// Guard: if DuckDB-side filtering empties the chunk, IMPLICIT + empty = FINISHED.
+		// Signal HAVE_MORE_OUTPUT to prevent premature termination.
+		if (output.size() == 0) {
+			input.async_result = AsyncResultType::HAVE_MORE_OUTPUT;
+		}
+		return;
+	}
+
+	if (state == PrefetchState::IDLE) {
+		if (local_state.first_scan_call_) {
+			// First batch: fetch synchronously to avoid an extra BLOCKED round-trip
+			local_state.first_scan_call_ = false;
+			while (BatchExhausted(local_state)) {
+				if (!GetNextBatch(context, bind_data, local_state)) {
+					output.SetCardinality(0);
+					return;
+				}
+			}
+			ConvertCurrentBatch(bind_data, global_state, local_state, output);
+			if (output.size() == 0) {
+				input.async_result = AsyncResultType::HAVE_MORE_OUTPUT;
+			}
+			return;
+		}
+		// Subsequent batches: launch prefetch and return BLOCKED
+		LaunchPrefetch(input, local_state);
+		output.SetCardinality(0);
+		return;
+	}
+
+	// IN_FLIGHT: should be impossible — DuckDB won't call scan while task is running
+	D_ASSERT(state != PrefetchState::IN_FLIGHT);
+	throw InternalException("VgiTableFunctionScan: unexpected prefetch state IN_FLIGHT");
 }
 
 // ============================================================================

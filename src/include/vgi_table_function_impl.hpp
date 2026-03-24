@@ -8,6 +8,7 @@
 #include "duckdb/function/table/arrow.hpp"
 #include "duckdb/function/table/arrow/arrow_duck_schema.hpp"
 #include "duckdb/function/table_function.hpp"
+#include "duckdb/parallel/async_result.hpp"
 
 #include "vgi_arrow_utils.hpp"
 #include "vgi_catalog_api.hpp"
@@ -28,15 +29,20 @@ namespace vgi {
 //! accessed in the bind function via input.info->Cast<VgiTableFunctionInfo>().
 class VgiTableFunctionInfo final : public TableFunctionInfo {
 public:
-	VgiTableFunctionInfo(std::string worker_path, std::vector<uint8_t> attach_id, bool worker_debug,
-	                     bool use_pool, VgiFunctionInfo function_info,
+	VgiTableFunctionInfo(Catalog &catalog, std::string worker_path, std::vector<uint8_t> attach_id,
+	                     bool worker_debug, bool use_pool, VgiFunctionInfo function_info,
 	                     std::vector<std::string> setting_names)
-	    : worker_path_(std::move(worker_path)), attach_id_(std::move(attach_id)), worker_debug_(worker_debug),
-	      use_pool_(use_pool), function_info_(std::move(function_info)),
+	    : catalog_(catalog), worker_path_(std::move(worker_path)), attach_id_(std::move(attach_id)),
+	      worker_debug_(worker_debug), use_pool_(use_pool), function_info_(std::move(function_info)),
 	      setting_names_(std::move(setting_names)) {
 	}
 
 	~VgiTableFunctionInfo() override = default;
+
+	//! Catalog this function belongs to
+	Catalog &catalog() const {
+		return catalog_;
+	}
 
 	//! Path to the VGI worker executable
 	const std::string &worker_path() const {
@@ -69,6 +75,7 @@ public:
 	}
 
 private:
+	Catalog &catalog_;
 	std::string worker_path_;
 	std::vector<uint8_t> attach_id_;
 	bool worker_debug_;
@@ -87,6 +94,7 @@ struct VgiTableFunctionBindData : public TableFunctionData {
 	// Worker identification
 	std::string worker_path;
 	std::vector<uint8_t> attach_id;
+	std::vector<uint8_t> transaction_id;
 	bool worker_debug = false;
 	bool use_pool = false;
 
@@ -162,6 +170,38 @@ struct VgiTableFunctionGlobalState : public GlobalTableFunctionState {
 };
 
 // ============================================================================
+// Async Prefetch State
+// ============================================================================
+
+//! State machine for async I/O prefetch of VGI table function batches.
+enum class PrefetchState : uint8_t {
+	IDLE,      //! No prefetch in flight, no prefetched data
+	IN_FLIGHT, //! Prefetch task is running (scan returned BLOCKED)
+	READY,     //! Prefetch completed successfully, batch available
+	ERROR      //! Prefetch completed with an error
+};
+
+// Forward declaration
+struct VgiTableFunctionLocalState;
+
+// ============================================================================
+// VgiPrefetchTask - AsyncTask that prefetches the next batch from a VGI worker
+// ============================================================================
+
+//! Runs on a DuckDB worker thread while the scan is BLOCKED.
+//! Safe to access local_state_ because DuckDB guarantees the scan won't be
+//! called concurrently while the task is in flight.
+class VgiPrefetchTask : public AsyncTask {
+public:
+	explicit VgiPrefetchTask(VgiTableFunctionLocalState &local_state) : local_state_(local_state) {
+	}
+	void Execute() override;
+
+private:
+	VgiTableFunctionLocalState &local_state_;
+};
+
+// ============================================================================
 // VgiTableFunctionLocalState - Extends DuckDB's ArrowScanLocalState
 // ============================================================================
 
@@ -173,6 +213,7 @@ struct VgiTableFunctionLocalState : public ArrowScanLocalState {
 	}
 
 	~VgiTableFunctionLocalState() {
+		D_ASSERT(prefetch_state_.load() != PrefetchState::IN_FLIGHT);
 		// Return connection to pool if applicable
 		if (use_pool_ && connection && connection->CanBePooled()) {
 			auto worker_pid = connection->GetPid();
@@ -192,6 +233,12 @@ struct VgiTableFunctionLocalState : public ArrowScanLocalState {
 
 	// Completion tracking
 	bool done = false;
+
+	// --- Async prefetch state ---
+	std::atomic<PrefetchState> prefetch_state_ {PrefetchState::IDLE};
+	std::shared_ptr<arrow::RecordBatch> prefetch_batch_;
+	std::exception_ptr prefetch_exception_;
+	bool first_scan_call_ = true;
 
 private:
 	ClientContext &context_;
