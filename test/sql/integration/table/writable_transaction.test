@@ -1,0 +1,423 @@
+# name: test/sql/integration/table/writable_transaction.test
+# description: Transaction semantics (BEGIN/COMMIT/ROLLBACK, read-your-writes) on VGI writable tables
+# group: [vgi_integration_table]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'writable' AS writable (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+DELETE FROM writable.main.writable_data;
+
+query I
+SELECT COUNT(*) FROM writable.main.writable_data;
+----
+0
+
+# ============================================================================
+# BEGIN/COMMIT — INSERT persists
+# ============================================================================
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO writable.main.writable_data VALUES (80000, 'committed');
+
+statement ok
+COMMIT;
+
+query IT
+SELECT id, name FROM writable.main.writable_data WHERE id = 80000;
+----
+80000	committed
+
+# ============================================================================
+# BEGIN/ROLLBACK — INSERT discarded
+# ============================================================================
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO writable.main.writable_data VALUES (80001, 'rolled_back');
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT COUNT(*) FROM writable.main.writable_data WHERE id = 80001;
+----
+0
+
+# ============================================================================
+# BEGIN with INSERT + DELETE + COMMIT
+# ============================================================================
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO writable.main.writable_data VALUES (80002, 'then_delete');
+
+statement ok
+DELETE FROM writable.main.writable_data WHERE id = 80002;
+
+statement ok
+COMMIT;
+
+query I
+SELECT COUNT(*) FROM writable.main.writable_data WHERE id = 80002;
+----
+0
+
+# ============================================================================
+# BEGIN with INSERT + UPDATE + COMMIT
+# ============================================================================
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO writable.main.writable_data VALUES (80003, 'original');
+
+statement ok
+UPDATE writable.main.writable_data SET name = 'updated' WHERE id = 80003;
+
+statement ok
+COMMIT;
+
+query IT
+SELECT id, name FROM writable.main.writable_data WHERE id = 80003;
+----
+80003	updated
+
+# ============================================================================
+# ROLLBACK after DELETE — deleted rows reappear
+# ============================================================================
+
+statement ok
+INSERT INTO writable.main.writable_data VALUES (80004, 'preserved');
+
+statement ok
+BEGIN;
+
+statement ok
+DELETE FROM writable.main.writable_data WHERE id = 80004;
+
+query I
+SELECT COUNT(*) FROM writable.main.writable_data WHERE id = 80004;
+----
+0
+
+statement ok
+ROLLBACK;
+
+query IT
+SELECT id, name FROM writable.main.writable_data WHERE id = 80004;
+----
+80004	preserved
+
+# ============================================================================
+# ROLLBACK after UPDATE — value reverts
+# ============================================================================
+
+statement ok
+BEGIN;
+
+statement ok
+UPDATE writable.main.writable_data SET name = 'changed' WHERE id = 80004;
+
+query IT
+SELECT id, name FROM writable.main.writable_data WHERE id = 80004;
+----
+80004	changed
+
+statement ok
+ROLLBACK;
+
+query IT
+SELECT id, name FROM writable.main.writable_data WHERE id = 80004;
+----
+80004	preserved
+
+# ============================================================================
+# Multi-statement — multiple INSERTs in one transaction
+# ============================================================================
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO writable.main.writable_data VALUES (80010, 'multi_a');
+
+statement ok
+INSERT INTO writable.main.writable_data VALUES (80011, 'multi_b');
+
+statement ok
+INSERT INTO writable.main.writable_data VALUES (80012, 'multi_c');
+
+statement ok
+COMMIT;
+
+query I
+SELECT COUNT(*) FROM writable.main.writable_data WHERE id >= 80010 AND id <= 80012;
+----
+3
+
+# ============================================================================
+# Scan sees INSERT within same transaction (read-your-writes)
+# ============================================================================
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO writable.main.writable_data VALUES (80020, 'visible_in_tx');
+
+query IT
+SELECT id, name FROM writable.main.writable_data WHERE id = 80020;
+----
+80020	visible_in_tx
+
+statement ok
+COMMIT;
+
+# ============================================================================
+# Scan sees multiple INSERTs within same transaction
+# ============================================================================
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO writable.main.writable_data VALUES (80021, 'first');
+
+statement ok
+INSERT INTO writable.main.writable_data VALUES (80022, 'second');
+
+query I
+SELECT COUNT(*) FROM writable.main.writable_data WHERE id >= 80021 AND id <= 80022;
+----
+2
+
+statement ok
+COMMIT;
+
+# ============================================================================
+# Scan sees UPDATE within same transaction
+# ============================================================================
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO writable.main.writable_data VALUES (80030, 'before_update');
+
+statement ok
+UPDATE writable.main.writable_data SET name = 'after_update' WHERE id = 80030;
+
+query IT
+SELECT id, name FROM writable.main.writable_data WHERE id = 80030;
+----
+80030	after_update
+
+statement ok
+COMMIT;
+
+# ============================================================================
+# Scan sees DELETE within same transaction
+# ============================================================================
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO writable.main.writable_data VALUES (80040, 'will_vanish');
+
+query I
+SELECT COUNT(*) FROM writable.main.writable_data WHERE id = 80040;
+----
+1
+
+statement ok
+DELETE FROM writable.main.writable_data WHERE id = 80040;
+
+query I
+SELECT COUNT(*) FROM writable.main.writable_data WHERE id = 80040;
+----
+0
+
+statement ok
+COMMIT;
+
+# ============================================================================
+# ROLLBACK of multi-INSERT transaction — all discarded
+# ============================================================================
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO writable.main.writable_data VALUES (80050, 'rb_a');
+
+statement ok
+INSERT INTO writable.main.writable_data VALUES (80051, 'rb_b');
+
+statement ok
+INSERT INTO writable.main.writable_data VALUES (80052, 'rb_c');
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT COUNT(*) FROM writable.main.writable_data WHERE id >= 80050 AND id <= 80052;
+----
+0
+
+# ============================================================================
+# INSERT + UPDATE + DELETE on same row in one transaction
+# ============================================================================
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO writable.main.writable_data VALUES (88000, 'created');
+
+statement ok
+UPDATE writable.main.writable_data SET name = 'modified' WHERE id = 88000;
+
+query IT
+SELECT id, name FROM writable.main.writable_data WHERE id = 88000;
+----
+88000	modified
+
+statement ok
+DELETE FROM writable.main.writable_data WHERE id = 88000;
+
+query I
+SELECT COUNT(*) FROM writable.main.writable_data WHERE id = 88000;
+----
+0
+
+statement ok
+COMMIT;
+
+# ============================================================================
+# UPDATE/DELETE with no matching rows in a transaction
+# ============================================================================
+
+statement ok
+DELETE FROM writable.main.writable_data;
+
+query I
+SELECT COUNT(*) FROM writable.main.writable_data;
+----
+0
+
+statement ok
+INSERT INTO writable.main.writable_data VALUES (77001, 'stable');
+
+statement ok
+BEGIN;
+
+statement ok
+UPDATE writable.main.writable_data SET name = 'noop' WHERE id = 999999;
+
+statement ok
+DELETE FROM writable.main.writable_data WHERE id = 999999;
+
+query IT
+SELECT id, name FROM writable.main.writable_data WHERE id = 77001;
+----
+77001	stable
+
+statement ok
+COMMIT;
+
+# ============================================================================
+# ROLLBACK after large UPDATE — values revert
+# ============================================================================
+
+statement ok
+DELETE FROM writable.main.writable_data;
+
+query I
+SELECT COUNT(*) FROM writable.main.writable_data;
+----
+0
+
+statement ok
+INSERT INTO writable.main.writable_data SELECT i, 'original' FROM range(0, 5000) t(i);
+
+statement ok
+BEGIN;
+
+statement ok
+UPDATE writable.main.writable_data SET name = 'changed' WHERE id < 5000;
+
+query I
+SELECT COUNT(*) FROM writable.main.writable_data WHERE name = 'changed';
+----
+5000
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT COUNT(*) FROM writable.main.writable_data WHERE name = 'original';
+----
+5000
+
+query I
+SELECT COUNT(*) FROM writable.main.writable_data WHERE name = 'changed';
+----
+0
+
+# ============================================================================
+# Full DELETE then re-INSERT in same transaction
+# ============================================================================
+
+statement ok
+DELETE FROM writable.main.writable_data;
+
+query I
+SELECT COUNT(*) FROM writable.main.writable_data;
+----
+0
+
+statement ok
+INSERT INTO writable.main.writable_data SELECT i, 'old' FROM range(0, 50) t(i);
+
+statement ok
+BEGIN;
+
+statement ok
+DELETE FROM writable.main.writable_data;
+
+query I
+SELECT COUNT(*) FROM writable.main.writable_data;
+----
+0
+
+statement ok
+INSERT INTO writable.main.writable_data SELECT i, 'new' FROM range(100, 200) t(i);
+
+query I
+SELECT COUNT(*) FROM writable.main.writable_data;
+----
+100
+
+statement ok
+COMMIT;
+
+query I
+SELECT COUNT(*) FROM writable.main.writable_data WHERE name = 'new';
+----
+100

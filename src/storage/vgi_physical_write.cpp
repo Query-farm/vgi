@@ -7,6 +7,7 @@
 #include "duckdb/planner/operator/logical_delete.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
 #include "duckdb/planner/operator/logical_update.hpp"
+#include "storage/vgi_transaction.hpp"
 #include "vgi_catalog_api.hpp"
 #include "vgi_function_connection.hpp"
 #include "vgi_rpc_types.hpp"
@@ -37,8 +38,7 @@ static std::shared_ptr<arrow::RecordBatch> BuildWriteOptions(bool return_chunk,
 		action_str = "nothing";
 		break;
 	default:
-		action_str = "throw";
-		break;
+		throw InternalException("Unsupported OnConflictAction for VGI tables");
 	}
 	auto action_arr = arrow::MakeArrayFromScalar(*arrow::MakeScalar(action_str), 1).ValueOrDie();
 
@@ -63,7 +63,8 @@ static std::shared_ptr<arrow::RecordBatch> BuildWriteOptions(bool return_chunk,
 static std::unique_ptr<IFunctionConnection> SetupWriteConnection(ClientContext &context, VgiTableEntry &table,
                                                                   const VgiWriteFunctionResult &write_func,
                                                                   const std::shared_ptr<arrow::Schema> &input_schema,
-                                                                  const std::shared_ptr<arrow::RecordBatch> &write_options) {
+                                                                  const std::shared_ptr<arrow::RecordBatch> &write_options,
+                                                                  const std::vector<uint8_t> &transaction_id) {
 	auto &catalog = table.GetCatalog().Cast<VgiCatalog>();
 	auto &params = catalog.attach_parameters();
 	auto &attach_result = catalog.attach_result();
@@ -76,10 +77,21 @@ static std::unique_ptr<IFunctionConnection> SetupWriteConnection(ClientContext &
 	}
 	auto arguments = BuildArgumentsFromValues(context, {}, named_args);
 
-	// Always create a fresh connection for write operations.
-	auto connection = CreateFunctionConnection(params->worker_path(), write_func.function_name, arguments,
-	                                           attach_result->attach_id, context, "TABLE", {},
-	                                           params->worker_debug());
+	// Try to reuse a pooled worker connection (subprocess transport only).
+	std::unique_ptr<IFunctionConnection> connection;
+	if (!IsHttpTransport(params->worker_path())) {
+		auto pooled = VgiWorkerPool::Instance().TryAcquire(params->worker_path());
+		if (pooled) {
+			connection = CreateFunctionConnectionFromPool(std::move(pooled), write_func.function_name, arguments,
+			                                              attach_result->attach_id, transaction_id, context,
+			                                              "TABLE", {}, params->worker_debug());
+		}
+	}
+	if (!connection) {
+		connection = CreateFunctionConnection(params->worker_path(), write_func.function_name, arguments,
+		                                      attach_result->attach_id, transaction_id, context, "TABLE", {},
+		                                      params->worker_debug());
+	}
 
 	connection->SetInputSchema(input_schema);
 	connection->PerformBindFull();
@@ -171,6 +183,12 @@ VgiPhysicalInsert::VgiPhysicalInsert(PhysicalPlan &plan, LogicalInsert &op, VgiT
       return_chunk(return_chunk_p), action_type(action_type_p), on_conflict_filter(std::move(on_conflict_filter_p)) {
 }
 
+VgiPhysicalInsert::VgiPhysicalInsert(PhysicalPlan &plan, LogicalOperator &op, VgiTableEntry &table_p,
+                                     bool return_chunk_p)
+    : PhysicalOperator(plan, PhysicalOperatorType::EXTENSION, op.types, op.estimated_cardinality), table(table_p),
+      return_chunk(return_chunk_p), action_type(OnConflictAction::THROW) {
+}
+
 InsertionOrderPreservingMap<string> VgiPhysicalInsert::ParamsToString() const {
 	InsertionOrderPreservingMap<string> result;
 	result["Table"] = table.name;
@@ -203,9 +221,12 @@ unique_ptr<GlobalSinkState> VgiPhysicalInsert::GetGlobalSinkState(ClientContext 
 
 	auto write_options = BuildWriteOptions(return_chunk, action_type, conflict_columns);
 
+	auto &vgi_tx = VgiTransaction::Get(context, table.GetCatalog());
+
 	auto gstate = make_uniq<VgiWriteGlobalState>(context, GetTypes(), return_chunk);
 	gstate->send_schema = input_schema;
-	gstate->connection = SetupWriteConnection(context, table, write_func, input_schema, write_options);
+	gstate->connection = SetupWriteConnection(context, table, write_func, input_schema, write_options,
+	                                           vgi_tx.GetTransactionId());
 
 	return unique_ptr<GlobalSinkState>(gstate.release());
 }
@@ -263,7 +284,9 @@ SinkResultType VgiPhysicalInsert::Sink(ExecutionContext &context, DataChunk &chu
 SinkFinalizeType VgiPhysicalInsert::Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
                                               OperatorSinkFinalizeInput &input) const {
 	auto &gstate = input.global_state.Cast<VgiWriteGlobalState>();
-	gstate.changed_count += FinalizeWriteConnection(gstate);
+	auto finalize_count = FinalizeWriteConnection(gstate);
+	D_ASSERT(!gstate.return_chunk || finalize_count == 0);
+	gstate.changed_count += finalize_count;
 	return SinkFinalizeType::READY;
 }
 
@@ -288,6 +311,12 @@ VgiPhysicalDelete::VgiPhysicalDelete(PhysicalPlan &plan, LogicalDelete &op, VgiT
       return_chunk(return_chunk_p), rowid_index(rowid_index_p) {
 }
 
+VgiPhysicalDelete::VgiPhysicalDelete(PhysicalPlan &plan, LogicalOperator &op, VgiTableEntry &table_p,
+                                     bool return_chunk_p, idx_t rowid_index_p)
+    : PhysicalOperator(plan, PhysicalOperatorType::EXTENSION, op.types, op.estimated_cardinality), table(table_p),
+      return_chunk(return_chunk_p), rowid_index(rowid_index_p) {
+}
+
 InsertionOrderPreservingMap<string> VgiPhysicalDelete::ParamsToString() const {
 	InsertionOrderPreservingMap<string> result;
 	result["Table"] = table.name;
@@ -307,15 +336,27 @@ unique_ptr<GlobalSinkState> VgiPhysicalDelete::GetGlobalSinkState(ClientContext 
 	auto rowid_field = table_info.arrow_schema->field(table_info.row_id_column);
 	auto input_schema = arrow::schema({rowid_field});
 
+	auto &vgi_tx = VgiTransaction::Get(context, table.GetCatalog());
+
+	auto write_options = BuildWriteOptions(return_chunk, OnConflictAction::THROW, {});
+
 	auto gstate = make_uniq<VgiWriteGlobalState>(context, GetTypes(), return_chunk);
 	gstate->send_schema = input_schema;
-	gstate->connection = SetupWriteConnection(context, table, write_func, input_schema, nullptr);
+	gstate->connection = SetupWriteConnection(context, table, write_func, input_schema, write_options,
+	                                           vgi_tx.GetTransactionId());
 
 	return unique_ptr<GlobalSinkState>(gstate.release());
 }
 
 unique_ptr<LocalSinkState> VgiPhysicalDelete::GetLocalSinkState(ExecutionContext &context) const {
-	return make_uniq<LocalSinkState>();
+	auto &table_info = table.GetTableInfo();
+	auto response_schema = table_info.arrow_schema;
+	if (table_info.row_id_column >= 0) {
+		auto fields = response_schema->fields();
+		fields.erase(fields.begin() + table_info.row_id_column);
+		response_schema = arrow::schema(fields);
+	}
+	return make_uniq<VgiWriteLocalSinkState>(context.client, response_schema, GetTypes());
 }
 
 SinkResultType VgiPhysicalDelete::Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const {
@@ -334,7 +375,18 @@ SinkResultType VgiPhysicalDelete::Sink(ExecutionContext &context, DataChunk &chu
 
 		auto response = gstate.connection->ReadDataBatch();
 		if (response && response->num_rows() > 0) {
-			gstate.changed_count += ReadCountFromBatch(response);
+			if (gstate.return_chunk) {
+				auto &lstate = input.local_state.Cast<VgiWriteLocalSinkState>();
+				LoadResponseBatch(lstate.arrow_state, response);
+				lstate.returning_chunk.Reset();
+				lstate.returning_chunk.SetCardinality(NumericCast<idx_t>(response->num_rows()));
+				ArrowTableFunction::ArrowToDuckDB(lstate.arrow_state, lstate.response_arrow_table.GetColumns(),
+				                                  lstate.returning_chunk, false);
+				gstate.return_collection.Append(lstate.returning_chunk);
+				gstate.changed_count += NumericCast<idx_t>(response->num_rows());
+			} else {
+				gstate.changed_count += ReadCountFromBatch(response);
+			}
 		}
 	}
 
@@ -344,7 +396,9 @@ SinkResultType VgiPhysicalDelete::Sink(ExecutionContext &context, DataChunk &chu
 SinkFinalizeType VgiPhysicalDelete::Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
                                               OperatorSinkFinalizeInput &input) const {
 	auto &gstate = input.global_state.Cast<VgiWriteGlobalState>();
-	gstate.changed_count += FinalizeWriteConnection(gstate);
+	auto finalize_count = FinalizeWriteConnection(gstate);
+	D_ASSERT(!gstate.return_chunk || finalize_count == 0);
+	gstate.changed_count += finalize_count;
 	return SinkFinalizeType::READY;
 }
 
@@ -370,6 +424,13 @@ VgiPhysicalUpdate::VgiPhysicalUpdate(PhysicalPlan &plan, LogicalUpdate &op, VgiT
 	for (auto &expr : op.expressions) {
 		expressions.push_back(expr->Copy());
 	}
+}
+
+VgiPhysicalUpdate::VgiPhysicalUpdate(PhysicalPlan &plan, LogicalOperator &op, VgiTableEntry &table_p,
+                                     bool return_chunk_p, vector<PhysicalIndex> columns_p,
+                                     vector<unique_ptr<Expression>> expressions_p)
+    : PhysicalOperator(plan, PhysicalOperatorType::EXTENSION, op.types, op.estimated_cardinality), table(table_p),
+      return_chunk(return_chunk_p), columns(std::move(columns_p)), expressions(std::move(expressions_p)) {
 }
 
 InsertionOrderPreservingMap<string> VgiPhysicalUpdate::ParamsToString() const {
@@ -401,15 +462,27 @@ unique_ptr<GlobalSinkState> VgiPhysicalUpdate::GetGlobalSinkState(ClientContext 
 
 	auto input_schema = arrow::schema(send_fields);
 
+	auto &vgi_tx = VgiTransaction::Get(context, table.GetCatalog());
+
+	auto write_options = BuildWriteOptions(return_chunk, OnConflictAction::THROW, {});
+
 	auto gstate = make_uniq<VgiWriteGlobalState>(context, GetTypes(), return_chunk);
 	gstate->send_schema = input_schema;
-	gstate->connection = SetupWriteConnection(context, table, write_func, input_schema, nullptr);
+	gstate->connection = SetupWriteConnection(context, table, write_func, input_schema, write_options,
+	                                           vgi_tx.GetTransactionId());
 
 	return unique_ptr<GlobalSinkState>(gstate.release());
 }
 
 unique_ptr<LocalSinkState> VgiPhysicalUpdate::GetLocalSinkState(ExecutionContext &context) const {
-	return make_uniq<LocalSinkState>();
+	auto &table_info = table.GetTableInfo();
+	auto response_schema = table_info.arrow_schema;
+	if (table_info.row_id_column >= 0) {
+		auto fields = response_schema->fields();
+		fields.erase(fields.begin() + table_info.row_id_column);
+		response_schema = arrow::schema(fields);
+	}
+	return make_uniq<VgiWriteLocalSinkState>(context.client, response_schema, GetTypes());
 }
 
 SinkResultType VgiPhysicalUpdate::Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const {
@@ -440,7 +513,18 @@ SinkResultType VgiPhysicalUpdate::Sink(ExecutionContext &context, DataChunk &chu
 
 		auto response = gstate.connection->ReadDataBatch();
 		if (response && response->num_rows() > 0) {
-			gstate.changed_count += ReadCountFromBatch(response);
+			if (gstate.return_chunk) {
+				auto &lstate = input.local_state.Cast<VgiWriteLocalSinkState>();
+				LoadResponseBatch(lstate.arrow_state, response);
+				lstate.returning_chunk.Reset();
+				lstate.returning_chunk.SetCardinality(NumericCast<idx_t>(response->num_rows()));
+				ArrowTableFunction::ArrowToDuckDB(lstate.arrow_state, lstate.response_arrow_table.GetColumns(),
+				                                  lstate.returning_chunk, false);
+				gstate.return_collection.Append(lstate.returning_chunk);
+				gstate.changed_count += NumericCast<idx_t>(response->num_rows());
+			} else {
+				gstate.changed_count += ReadCountFromBatch(response);
+			}
 		}
 	}
 
@@ -450,7 +534,9 @@ SinkResultType VgiPhysicalUpdate::Sink(ExecutionContext &context, DataChunk &chu
 SinkFinalizeType VgiPhysicalUpdate::Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
                                               OperatorSinkFinalizeInput &input) const {
 	auto &gstate = input.global_state.Cast<VgiWriteGlobalState>();
-	gstate.changed_count += FinalizeWriteConnection(gstate);
+	auto finalize_count = FinalizeWriteConnection(gstate);
+	D_ASSERT(!gstate.return_chunk || finalize_count == 0);
+	gstate.changed_count += finalize_count;
 	return SinkFinalizeType::READY;
 }
 

@@ -9,7 +9,7 @@ require vgi
 require httpfs
 
 statement ok
-ATTACH 'writable' AS writable (TYPE vgi, LOCATION '${VGI_TEST_WORKER}', POOL false);
+ATTACH 'writable' AS writable (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
 # ============================================================================
 # Default resolution — column-subset INSERT (price, status, created_at have defaults)
@@ -111,3 +111,90 @@ query I
 INSERT INTO writable.main.writable_products(product_id, name) VALUES (50, 'SubsetRet') RETURNING name;
 ----
 SubsetRet
+
+# ============================================================================
+# Cleanup before default value tests
+# ============================================================================
+
+statement ok
+DELETE FROM writable.main.writable_products;
+
+query I
+SELECT COUNT(*) FROM writable.main.writable_products;
+----
+0
+
+# ============================================================================
+# Default values — INSERT with only required columns
+# ============================================================================
+
+statement ok
+INSERT INTO writable.main.writable_products(product_id, name) VALUES (100, 'DefaultsTest');
+
+query ITRTT
+SELECT product_id, name, price, status, created_at FROM writable.main.writable_products WHERE product_id = 100;
+----
+100	DefaultsTest	0.0	draft	server-assigned
+
+statement ok
+DELETE FROM writable.main.writable_products WHERE product_id = 100;
+
+# ============================================================================
+# Default values — INSERT overriding all defaults
+# ============================================================================
+
+statement ok
+INSERT INTO writable.main.writable_products(product_id, name, price, status, created_at) VALUES (101, 'OverrideTest', 49.99, 'active', '2026-01-01');
+
+query ITRTT
+SELECT product_id, name, price, status, created_at FROM writable.main.writable_products WHERE product_id = 101;
+----
+101	OverrideTest	49.99	active	2026-01-01
+
+statement ok
+DELETE FROM writable.main.writable_products WHERE product_id = 101;
+
+# ============================================================================
+# Default values — RETURNING shows defaults
+# ============================================================================
+
+query ITRTT
+INSERT INTO writable.main.writable_products(product_id, name) VALUES (102, 'RetDefaults') RETURNING *;
+----
+102	RetDefaults	0.0	draft	server-assigned
+
+statement ok
+DELETE FROM writable.main.writable_products WHERE product_id = 102;
+
+# ============================================================================
+# CHECK constraint — price >= 0 violation
+# ============================================================================
+
+statement error
+INSERT INTO writable.main.writable_products(product_id, name, price) VALUES (103, 'NegPrice', -1.0);
+----
+Constraint Error
+
+# ============================================================================
+# UNIQUE constraint — duplicate product_id
+# ============================================================================
+
+statement ok
+INSERT INTO writable.main.writable_products(product_id, name) VALUES (200, 'First');
+
+statement error
+INSERT INTO writable.main.writable_products(product_id, name) VALUES (200, 'Duplicate');
+----
+Constraint Error
+
+statement ok
+DELETE FROM writable.main.writable_products WHERE product_id = 200;
+
+# ============================================================================
+# NOT NULL constraint — missing required name
+# ============================================================================
+
+statement error
+INSERT INTO writable.main.writable_products(product_id, name) VALUES (201, NULL);
+----
+Constraint Error

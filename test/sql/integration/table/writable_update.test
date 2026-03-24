@@ -1,0 +1,205 @@
+# name: test/sql/integration/table/writable_update.test
+# description: UPDATE operations on VGI writable tables
+# group: [vgi_integration_table]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'writable' AS writable (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+DELETE FROM writable.main.writable_data;
+
+query I
+SELECT COUNT(*) FROM writable.main.writable_data;
+----
+0
+
+# ============================================================================
+# UPDATE — single row
+# ============================================================================
+
+statement ok
+INSERT INTO writable.main.writable_data VALUES (60000, 'upd_a'), (60001, 'upd_b'), (60002, 'upd_c');
+
+statement ok
+UPDATE writable.main.writable_data SET name = 'updated_a' WHERE id = 60000;
+
+query II
+SELECT id, name FROM writable.main.writable_data WHERE id = 60000;
+----
+60000	updated_a
+
+# ============================================================================
+# UPDATE — multiple rows
+# ============================================================================
+
+statement ok
+UPDATE writable.main.writable_data SET name = 'bulk_updated' WHERE id >= 60001;
+
+query II
+SELECT id, name FROM writable.main.writable_data WHERE id >= 60000 ORDER BY id;
+----
+60000	updated_a
+60001	bulk_updated
+60002	bulk_updated
+
+# ============================================================================
+# UPDATE — no matching rows (should succeed)
+# ============================================================================
+
+statement ok
+UPDATE writable.main.writable_data SET name = 'noop' WHERE id = 99999;
+
+# ============================================================================
+# UPDATE + SELECT — verify update is visible immediately
+# ============================================================================
+
+statement ok
+UPDATE writable.main.writable_data SET name = 'changed' WHERE id = 60000;
+
+query II
+SELECT id, name FROM writable.main.writable_data WHERE id = 60000;
+----
+60000	changed
+
+statement ok
+DELETE FROM writable.main.writable_data;
+
+query I
+SELECT COUNT(*) FROM writable.main.writable_data;
+----
+0
+
+# ============================================================================
+# UPDATE ... RETURNING — single row
+# ============================================================================
+
+statement ok
+INSERT INTO writable.main.writable_data VALUES (91000, 'before_upd');
+
+query II
+UPDATE writable.main.writable_data SET name = 'after_upd' WHERE id = 91000 RETURNING id, name;
+----
+91000	after_upd
+
+# ============================================================================
+# UPDATE ... RETURNING — with expression
+# ============================================================================
+
+query I
+UPDATE writable.main.writable_data SET name = 'expr_upd' WHERE id = 91000 RETURNING id * 3;
+----
+273000
+
+# ============================================================================
+# UPDATE ... RETURNING *
+# ============================================================================
+
+statement ok
+UPDATE writable.main.writable_data SET name = 'star_upd' WHERE id = 91000;
+
+query II
+UPDATE writable.main.writable_data SET name = 'star_ret' WHERE id = 91000 RETURNING *;
+----
+91000	star_ret
+
+statement ok
+DELETE FROM writable.main.writable_data;
+
+query I
+SELECT COUNT(*) FROM writable.main.writable_data;
+----
+0
+
+# ============================================================================
+# Large UPDATE ... RETURNING at scale (5000 rows)
+# ============================================================================
+
+statement ok
+INSERT INTO writable.main.writable_data SELECT i, 'orig' FROM range(0, 5000) t(i);
+
+statement ok
+UPDATE writable.main.writable_data SET name = 'ret_upd' WHERE id % 2 = 0;
+
+query I
+SELECT COUNT(*) FROM writable.main.writable_data WHERE name = 'ret_upd';
+----
+2500
+
+statement ok
+DELETE FROM writable.main.writable_data;
+
+query I
+SELECT COUNT(*) FROM writable.main.writable_data;
+----
+0
+
+# ============================================================================
+# UPDATE multiple columns at once
+# ============================================================================
+
+statement ok
+INSERT INTO writable.main.writable_data VALUES (1, 'alpha'), (2, 'beta'), (3, 'gamma');
+
+statement ok
+UPDATE writable.main.writable_data SET name = 'changed', id = 999 WHERE id = 1;
+
+query II
+SELECT id, name FROM writable.main.writable_data ORDER BY id;
+----
+2	beta
+3	gamma
+999	changed
+
+statement ok
+DELETE FROM writable.main.writable_data;
+
+query I
+SELECT COUNT(*) FROM writable.main.writable_data;
+----
+0
+
+# ============================================================================
+# UPDATE with expression
+# ============================================================================
+
+statement ok
+INSERT INTO writable.main.writable_data VALUES (1, 'hello'), (2, 'world'), (3, 'test');
+
+statement ok
+UPDATE writable.main.writable_data SET name = name || '_suffix' WHERE id < 3;
+
+query II
+SELECT id, name FROM writable.main.writable_data ORDER BY id;
+----
+1	hello_suffix
+2	world_suffix
+3	test
+
+statement ok
+DELETE FROM writable.main.writable_data;
+
+query I
+SELECT COUNT(*) FROM writable.main.writable_data;
+----
+0
+
+# ============================================================================
+# UPDATE/DELETE on empty table (should succeed with 0 affected)
+# ============================================================================
+
+statement ok
+UPDATE writable.main.writable_data SET name = 'noop' WHERE id = 1;
+
+statement ok
+DELETE FROM writable.main.writable_data WHERE id = 1;
+
+query I
+SELECT COUNT(*) FROM writable.main.writable_data;
+----
+0

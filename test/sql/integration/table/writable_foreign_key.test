@@ -1,0 +1,323 @@
+# name: test/sql/integration/table/writable_foreign_key.test
+# description: Foreign key constraint tests — writable_orders references writable_products
+# group: [vgi_integration_table]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'writable' AS writable (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+DELETE FROM writable.main.writable_orders;
+
+query I
+SELECT COUNT(*) FROM writable.main.writable_orders;
+----
+0
+
+statement ok
+DELETE FROM writable.main.writable_products;
+
+query I
+SELECT COUNT(*) FROM writable.main.writable_products;
+----
+0
+
+# ============================================================================
+# FK valid — insert product then order referencing it
+# ============================================================================
+
+statement ok
+INSERT INTO writable.main.writable_products(product_id, name) VALUES (1, 'Widget');
+
+statement ok
+INSERT INTO writable.main.writable_orders(order_id, product_id, quantity) VALUES (1, 1, 5);
+
+query III
+SELECT order_id, product_id, quantity FROM writable.main.writable_orders WHERE order_id = 1;
+----
+1	1	5
+
+# ============================================================================
+# FK violation — insert order referencing non-existent product
+# ============================================================================
+
+statement error
+INSERT INTO writable.main.writable_orders(order_id, product_id) VALUES (2, 999);
+----
+Constraint Error
+
+# ============================================================================
+# UPDATE order quantity
+# ============================================================================
+
+statement ok
+UPDATE writable.main.writable_orders SET quantity = 10 WHERE order_id = 1;
+
+query III
+SELECT order_id, product_id, quantity FROM writable.main.writable_orders WHERE order_id = 1;
+----
+1	1	10
+
+# ============================================================================
+# UPDATE order to reference a different valid product
+# ============================================================================
+
+statement ok
+INSERT INTO writable.main.writable_products(product_id, name) VALUES (2, 'Gadget');
+
+statement ok
+UPDATE writable.main.writable_orders SET product_id = 2 WHERE order_id = 1;
+
+query III
+SELECT order_id, product_id, quantity FROM writable.main.writable_orders WHERE order_id = 1;
+----
+1	2	10
+
+# ============================================================================
+# UPDATE order FK violation — reference non-existent product
+# ============================================================================
+
+statement error
+UPDATE writable.main.writable_orders SET product_id = 999 WHERE order_id = 1;
+----
+Constraint Error
+
+# Verify order unchanged
+query I
+SELECT product_id FROM writable.main.writable_orders WHERE order_id = 1;
+----
+2
+
+# ============================================================================
+# FK RESTRICT — delete product that has orders fails
+# ============================================================================
+
+statement error
+DELETE FROM writable.main.writable_products WHERE product_id = 2;
+----
+Constraint Error
+
+# Verify both still exist
+query I
+SELECT COUNT(*) FROM writable.main.writable_products WHERE product_id = 2;
+----
+1
+
+query I
+SELECT COUNT(*) FROM writable.main.writable_orders WHERE order_id = 1;
+----
+1
+
+# ============================================================================
+# FK valid — delete order first, then product succeeds
+# ============================================================================
+
+statement ok
+DELETE FROM writable.main.writable_orders WHERE order_id = 1;
+
+statement ok
+DELETE FROM writable.main.writable_products WHERE product_id = 2;
+
+statement ok
+DELETE FROM writable.main.writable_products WHERE product_id = 1;
+
+query I
+SELECT COUNT(*) FROM writable.main.writable_orders;
+----
+0
+
+query I
+SELECT COUNT(*) FROM writable.main.writable_products;
+----
+0
+
+# ============================================================================
+# FK with default quantity
+# ============================================================================
+
+statement ok
+INSERT INTO writable.main.writable_products(product_id, name) VALUES (20, 'Doohickey');
+
+statement ok
+INSERT INTO writable.main.writable_orders(order_id, product_id) VALUES (20, 20);
+
+query III
+SELECT order_id, product_id, quantity FROM writable.main.writable_orders WHERE order_id = 20;
+----
+20	20	1
+
+# ============================================================================
+# Cross-table JOIN queries
+# ============================================================================
+
+# Add more data for join tests
+statement ok
+INSERT INTO writable.main.writable_products(product_id, name, price) VALUES (21, 'Thingamajig', 9.99);
+
+statement ok
+INSERT INTO writable.main.writable_orders(order_id, product_id, quantity) VALUES (21, 20, 3);
+
+statement ok
+INSERT INTO writable.main.writable_orders(order_id, product_id, quantity) VALUES (22, 21, 2);
+
+# INNER JOIN — orders with product names
+query ITII
+SELECT o.order_id, p.name, o.quantity, o.product_id
+FROM writable.main.writable_orders o
+JOIN writable.main.writable_products p ON o.product_id = p.product_id
+ORDER BY o.order_id;
+----
+20	Doohickey	1	20
+21	Doohickey	3	20
+22	Thingamajig	2	21
+
+# Aggregate JOIN — total quantity per product
+query TI
+SELECT p.name, SUM(o.quantity) AS total_qty
+FROM writable.main.writable_products p
+JOIN writable.main.writable_orders o ON p.product_id = o.product_id
+GROUP BY p.name
+ORDER BY p.name;
+----
+Doohickey	4
+Thingamajig	2
+
+# LEFT JOIN — products with no orders
+statement ok
+INSERT INTO writable.main.writable_products(product_id, name) VALUES (22, 'Whatchamacallit');
+
+query TI
+SELECT p.name, COUNT(o.order_id) AS order_count
+FROM writable.main.writable_products p
+LEFT JOIN writable.main.writable_orders o ON p.product_id = o.product_id
+GROUP BY p.name
+ORDER BY p.name;
+----
+Doohickey	2
+Thingamajig	1
+Whatchamacallit	0
+
+# Subquery — products that have orders
+query IT
+SELECT product_id, name FROM writable.main.writable_products
+WHERE product_id IN (SELECT DISTINCT product_id FROM writable.main.writable_orders)
+ORDER BY product_id;
+----
+20	Doohickey
+21	Thingamajig
+
+# JOIN with filter — orders for expensive products only
+query II
+SELECT o.order_id, o.quantity
+FROM writable.main.writable_orders o
+JOIN writable.main.writable_products p ON o.product_id = p.product_id
+WHERE p.price > 5.0
+ORDER BY o.order_id;
+----
+22	2
+
+# ============================================================================
+# INSERT ... SELECT from another VGI table (cross-table INSERT)
+# ============================================================================
+
+# Create orders for every product with quantity = 100
+statement ok
+INSERT INTO writable.main.writable_orders(order_id, product_id, quantity)
+SELECT p.product_id + 1000, p.product_id, 100
+FROM writable.main.writable_products p;
+
+query I
+SELECT COUNT(*) FROM writable.main.writable_orders WHERE quantity = 100;
+----
+3
+
+query III
+SELECT order_id, product_id, quantity FROM writable.main.writable_orders WHERE quantity = 100 ORDER BY order_id;
+----
+1020	20	100
+1021	21	100
+1022	22	100
+
+# ============================================================================
+# UPDATE ... FROM another VGI table (cross-table UPDATE)
+# ============================================================================
+
+# Double the quantity for orders whose product price > 5
+statement ok
+UPDATE writable.main.writable_orders SET quantity = writable.main.writable_orders.quantity * 2
+FROM writable.main.writable_products p
+WHERE writable.main.writable_orders.product_id = p.product_id AND p.price > 5.0;
+
+# Only Thingamajig (product_id=21, price=9.99) matches
+query III
+SELECT order_id, product_id, quantity FROM writable.main.writable_orders WHERE order_id = 1021;
+----
+1021	21	200
+
+# Others unchanged
+query III
+SELECT order_id, product_id, quantity FROM writable.main.writable_orders WHERE order_id = 1020;
+----
+1020	20	100
+
+# ============================================================================
+# DELETE ... USING another VGI table (cross-table DELETE)
+# ============================================================================
+
+# Delete orders for products with default price (0.0)
+statement ok
+DELETE FROM writable.main.writable_orders
+USING writable.main.writable_products p
+WHERE writable.main.writable_orders.product_id = p.product_id AND p.price = 0.0;
+
+# Doohickey (product_id=20, price=0.0) and Whatchamacallit (product_id=22, price=0.0) orders deleted
+query I
+SELECT COUNT(*) FROM writable.main.writable_orders WHERE product_id IN (20, 22);
+----
+0
+
+# Thingamajig orders remain
+query I
+SELECT COUNT(*) FROM writable.main.writable_orders WHERE product_id = 21;
+----
+2
+
+# ============================================================================
+# INSERT ... SELECT with JOIN across VGI tables
+# ============================================================================
+
+# Insert an order for each product that currently has no orders
+statement ok
+INSERT INTO writable.main.writable_orders(order_id, product_id, quantity)
+SELECT p.product_id + 2000, p.product_id, 1
+FROM writable.main.writable_products p
+LEFT JOIN writable.main.writable_orders o ON p.product_id = o.product_id
+WHERE o.order_id IS NULL;
+
+query III
+SELECT order_id, product_id, quantity FROM writable.main.writable_orders WHERE order_id >= 2000 ORDER BY order_id;
+----
+2020	20	1
+2022	22	1
+
+# Cleanup: orders first, then products (FK order)
+statement ok
+DELETE FROM writable.main.writable_orders;
+
+query I
+SELECT COUNT(*) FROM writable.main.writable_orders;
+----
+0
+
+statement ok
+DELETE FROM writable.main.writable_products;
+
+query I
+SELECT COUNT(*) FROM writable.main.writable_products;
+----
+0

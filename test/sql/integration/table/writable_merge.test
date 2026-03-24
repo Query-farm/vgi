@@ -1,0 +1,129 @@
+# name: test/sql/integration/table/writable_merge.test
+# description: MERGE INTO and ON CONFLICT on VGI writable tables
+# group: [vgi_integration_table]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'writable' AS writable (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+DELETE FROM writable.main.writable_data;
+
+query I
+SELECT COUNT(*) FROM writable.main.writable_data;
+----
+0
+
+# ============================================================================
+# MERGE INTO — insert when not matched
+# ============================================================================
+
+statement ok
+MERGE INTO writable.main.writable_data AS t
+USING (VALUES (95000, 'merged')) AS s(id, name)
+ON t.id = s.id
+WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.name);
+
+query IT
+SELECT id, name FROM writable.main.writable_data WHERE id = 95000;
+----
+95000	merged
+
+# ============================================================================
+# MERGE INTO — update when matched
+# ============================================================================
+
+statement ok
+MERGE INTO writable.main.writable_data AS t
+USING (VALUES (95000, 'updated_merge')) AS s(id, name)
+ON t.id = s.id
+WHEN MATCHED THEN UPDATE SET name = s.name;
+
+query IT
+SELECT id, name FROM writable.main.writable_data WHERE id = 95000;
+----
+95000	updated_merge
+
+# ============================================================================
+# MERGE INTO — delete when matched
+# ============================================================================
+
+statement ok
+MERGE INTO writable.main.writable_data AS t
+USING (VALUES (95000, '')) AS s(id, name)
+ON t.id = s.id
+WHEN MATCHED THEN DELETE;
+
+query I
+SELECT COUNT(*) FROM writable.main.writable_data WHERE id = 95000;
+----
+0
+
+# ============================================================================
+# MERGE INTO — insert + update in one statement
+# ============================================================================
+
+statement ok
+INSERT INTO writable.main.writable_data VALUES (95001, 'existing');
+
+statement ok
+MERGE INTO writable.main.writable_data AS t
+USING (VALUES (95001, 'updated'), (95002, 'new_row')) AS s(id, name)
+ON t.id = s.id
+WHEN MATCHED THEN UPDATE SET name = s.name
+WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.name);
+
+query IT
+SELECT id, name FROM writable.main.writable_data WHERE id = 95001;
+----
+95001	updated
+
+query IT
+SELECT id, name FROM writable.main.writable_data WHERE id = 95002;
+----
+95002	new_row
+
+statement ok
+DELETE FROM writable.main.writable_data;
+
+query I
+SELECT COUNT(*) FROM writable.main.writable_data;
+----
+0
+
+# ============================================================================
+# ON CONFLICT DO NOTHING — conflict skipped
+# ============================================================================
+
+statement ok
+INSERT INTO writable.main.writable_products(product_id, name) VALUES (99001, 'Widget');
+
+statement ok
+INSERT INTO writable.main.writable_products(product_id, name) VALUES (99001, 'Duplicate') ON CONFLICT (product_id) DO NOTHING;
+
+query I
+SELECT COUNT(*) FROM writable.main.writable_products WHERE product_id = 99001;
+----
+1
+
+query T
+SELECT name FROM writable.main.writable_products WHERE product_id = 99001;
+----
+Widget
+
+# ============================================================================
+# ON CONFLICT DO NOTHING — no conflict (insert succeeds)
+# ============================================================================
+
+statement ok
+INSERT INTO writable.main.writable_products(product_id, name) VALUES (99002, 'Gadget') ON CONFLICT (product_id) DO NOTHING;
+
+query T
+SELECT name FROM writable.main.writable_products WHERE product_id = 99002;
+----
+Gadget

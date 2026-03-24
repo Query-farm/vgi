@@ -1,0 +1,124 @@
+# name: test/sql/integration/table/writable_scale.test
+# description: Large-scale write operations on VGI writable tables
+# group: [vgi_integration_table]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'writable' AS writable (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+DELETE FROM writable.main.writable_data;
+
+query I
+SELECT COUNT(*) FROM writable.main.writable_data;
+----
+0
+
+# ============================================================================
+# Large INSERT + UPDATE in single transaction (1M rows)
+# Tests that streaming scan survives interleaved DML at scale.
+# ============================================================================
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO writable.main.writable_data SELECT i, 'apple' FROM range(0, 1000000) t(i);
+
+query I
+SELECT COUNT(*) FROM writable.main.writable_data;
+----
+1000000
+
+statement ok
+UPDATE writable.main.writable_data SET name = 'banana' WHERE id % 2 = 0;
+
+query I
+SELECT COUNT(*) FROM writable.main.writable_data WHERE name = 'banana';
+----
+500000
+
+query I
+SELECT COUNT(*) FROM writable.main.writable_data WHERE name = 'apple';
+----
+500000
+
+statement ok
+COMMIT;
+
+statement ok
+DELETE FROM writable.main.writable_data;
+
+query I
+SELECT COUNT(*) FROM writable.main.writable_data;
+----
+0
+
+# ============================================================================
+# Large DELETE in single transaction (10K rows, delete half)
+# ============================================================================
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO writable.main.writable_data SELECT i, 'keep' FROM range(0, 10000) t(i);
+
+statement ok
+DELETE FROM writable.main.writable_data WHERE id % 2 = 0;
+
+query I
+SELECT COUNT(*) FROM writable.main.writable_data;
+----
+5000
+
+statement ok
+COMMIT;
+
+statement ok
+DELETE FROM writable.main.writable_data;
+
+query I
+SELECT COUNT(*) FROM writable.main.writable_data;
+----
+0
+
+# ============================================================================
+# Multi-operation transaction: INSERT → UPDATE → DELETE → verify
+# ============================================================================
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO writable.main.writable_data SELECT i, 'apple' FROM range(0, 10000) t(i);
+
+statement ok
+UPDATE writable.main.writable_data SET name = 'banana' WHERE id % 2 = 0;
+
+# id % 4 = 0 is a subset of id % 2 = 0 (all bananas), so delete 2,500
+statement ok
+DELETE FROM writable.main.writable_data WHERE id % 4 = 0;
+
+query I
+SELECT COUNT(*) FROM writable.main.writable_data WHERE name = 'banana';
+----
+2500
+
+query I
+SELECT COUNT(*) FROM writable.main.writable_data WHERE name = 'apple';
+----
+5000
+
+query I
+SELECT COUNT(*) FROM writable.main.writable_data;
+----
+7500
+
+statement ok
+COMMIT;

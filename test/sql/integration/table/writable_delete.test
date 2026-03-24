@@ -1,0 +1,197 @@
+# name: test/sql/integration/table/writable_delete.test
+# description: DELETE operations on VGI writable tables
+# group: [vgi_integration_table]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'writable' AS writable (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+DELETE FROM writable.main.writable_data;
+
+query I
+SELECT COUNT(*) FROM writable.main.writable_data;
+----
+0
+
+# ============================================================================
+# DELETE — single row
+# ============================================================================
+
+statement ok
+INSERT INTO writable.main.writable_data VALUES (50000, 'del_a'), (50001, 'del_b'), (50002, 'del_c');
+
+statement ok
+DELETE FROM writable.main.writable_data WHERE id = 50001;
+
+query I
+SELECT COUNT(*) FROM writable.main.writable_data WHERE id >= 50000;
+----
+2
+
+query II
+SELECT id, name FROM writable.main.writable_data WHERE id >= 50000 ORDER BY id;
+----
+50000	del_a
+50002	del_c
+
+# ============================================================================
+# DELETE — multiple rows with WHERE
+# ============================================================================
+
+statement ok
+DELETE FROM writable.main.writable_data WHERE id >= 50000;
+
+query I
+SELECT COUNT(*) FROM writable.main.writable_data WHERE id >= 50000;
+----
+0
+
+# ============================================================================
+# DELETE — no matching rows (should succeed)
+# ============================================================================
+
+statement ok
+DELETE FROM writable.main.writable_data WHERE id = 99999;
+
+# ============================================================================
+# DELETE + INSERT — verify store consistency after delete
+# ============================================================================
+
+statement ok
+INSERT INTO writable.main.writable_data VALUES (70000, 'after_delete');
+
+query II
+SELECT id, name FROM writable.main.writable_data WHERE id = 70000;
+----
+70000	after_delete
+
+statement ok
+DELETE FROM writable.main.writable_data;
+
+query I
+SELECT COUNT(*) FROM writable.main.writable_data;
+----
+0
+
+# ============================================================================
+# DELETE ... RETURNING — single row
+# ============================================================================
+
+statement ok
+INSERT INTO writable.main.writable_data VALUES (90000, 'del_ret');
+
+query II
+DELETE FROM writable.main.writable_data WHERE id = 90000 RETURNING id, name;
+----
+90000	del_ret
+
+# ============================================================================
+# DELETE ... RETURNING — multiple rows
+# ============================================================================
+
+statement ok
+INSERT INTO writable.main.writable_data VALUES (90001, 'dr_a'), (90002, 'dr_b');
+
+query II
+DELETE FROM writable.main.writable_data WHERE id >= 90001 AND id <= 90002 RETURNING id, name;
+----
+90001	dr_a
+90002	dr_b
+
+# ============================================================================
+# DELETE ... RETURNING — column subset
+# ============================================================================
+
+statement ok
+INSERT INTO writable.main.writable_data VALUES (90010, 'subset_del');
+
+query I
+DELETE FROM writable.main.writable_data WHERE id = 90010 RETURNING name;
+----
+subset_del
+
+# ============================================================================
+# DELETE ... RETURNING — with expression
+# ============================================================================
+
+statement ok
+INSERT INTO writable.main.writable_data VALUES (90020, 'expr_del');
+
+query I
+DELETE FROM writable.main.writable_data WHERE id = 90020 RETURNING id * 2;
+----
+180040
+
+# ============================================================================
+# DELETE ... RETURNING *
+# ============================================================================
+
+statement ok
+INSERT INTO writable.main.writable_data VALUES (90030, 'star_del');
+
+query II
+DELETE FROM writable.main.writable_data WHERE id = 90030 RETURNING *;
+----
+90030	star_del
+
+# ============================================================================
+# Large DELETE ... RETURNING at scale (5000 rows)
+# ============================================================================
+
+statement ok
+DELETE FROM writable.main.writable_data;
+
+query I
+SELECT COUNT(*) FROM writable.main.writable_data;
+----
+0
+
+statement ok
+INSERT INTO writable.main.writable_data SELECT i, 'del_me' FROM range(0, 5000) t(i);
+
+statement ok
+DELETE FROM writable.main.writable_data WHERE id < 2500;
+
+query I
+SELECT COUNT(*) FROM writable.main.writable_data;
+----
+2500
+
+statement ok
+DELETE FROM writable.main.writable_data;
+
+query I
+SELECT COUNT(*) FROM writable.main.writable_data;
+----
+0
+
+# ============================================================================
+# DELETE with complex WHERE (multiple conditions)
+# ============================================================================
+
+statement ok
+INSERT INTO writable.main.writable_data VALUES (1, 'apple'), (2, 'apple'), (3, 'banana'), (4, 'apple');
+
+statement ok
+DELETE FROM writable.main.writable_data WHERE id > 2 AND name = 'apple';
+
+query II
+SELECT id, name FROM writable.main.writable_data ORDER BY id;
+----
+1	apple
+2	apple
+3	banana
+
+statement ok
+DELETE FROM writable.main.writable_data;
+
+query I
+SELECT COUNT(*) FROM writable.main.writable_data;
+----
+0

@@ -73,6 +73,8 @@ class VgiPhysicalInsert : public PhysicalOperator {
 public:
 	VgiPhysicalInsert(PhysicalPlan &plan, LogicalInsert &op, VgiTableEntry &table, bool return_chunk,
 	                  OnConflictAction action_type, unordered_set<column_t> on_conflict_filter);
+	// Merge-compatible constructor (accepts any LogicalOperator)
+	VgiPhysicalInsert(PhysicalPlan &plan, LogicalOperator &op, VgiTableEntry &table, bool return_chunk);
 
 	bool IsSink() const override {
 		return true;
@@ -113,6 +115,9 @@ class VgiPhysicalDelete : public PhysicalOperator {
 public:
 	VgiPhysicalDelete(PhysicalPlan &plan, LogicalDelete &op, VgiTableEntry &table, bool return_chunk,
 	                  idx_t rowid_index);
+	// Merge-compatible constructor
+	VgiPhysicalDelete(PhysicalPlan &plan, LogicalOperator &op, VgiTableEntry &table, bool return_chunk,
+	                  idx_t rowid_index);
 
 	bool IsSink() const override {
 		return true;
@@ -151,6 +156,9 @@ private:
 class VgiPhysicalUpdate : public PhysicalOperator {
 public:
 	VgiPhysicalUpdate(PhysicalPlan &plan, LogicalUpdate &op, VgiTableEntry &table, bool return_chunk);
+	// Merge-compatible constructor (no columns/expressions — they come from the merge action)
+	VgiPhysicalUpdate(PhysicalPlan &plan, LogicalOperator &op, VgiTableEntry &table, bool return_chunk,
+	                  vector<PhysicalIndex> columns, vector<unique_ptr<Expression>> expressions);
 
 	bool IsSink() const override {
 		return true;

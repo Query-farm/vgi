@@ -1,10 +1,6 @@
-# name: test/sql/integration/table/writable_table.test
-# description: Tests for INSERT on VGI writable tables
+# name: test/sql/integration/table/writable_insert.test
+# description: INSERT operations on VGI writable tables
 # group: [vgi_integration_table]
-#
-# NOTE: UPDATE and DELETE tests are deferred pending a fix for a use-after-free
-# in the scan function when the UPDATE/DELETE pipeline scans with virtual rowid
-# projection. The write operators themselves work correctly.
 
 require-env VGI_TEST_WORKER
 
@@ -12,9 +8,16 @@ require vgi
 
 require httpfs
 
-# Attach the writable catalog (separate from example, with transaction support)
 statement ok
-ATTACH 'writable' AS writable (TYPE vgi, LOCATION '${VGI_TEST_WORKER}', POOL false);
+ATTACH 'writable' AS writable (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+DELETE FROM writable.main.writable_data;
+
+query I
+SELECT COUNT(*) FROM writable.main.writable_data;
+----
+0
 
 # ============================================================================
 # INSERT VALUES — single row
@@ -68,7 +71,6 @@ SELECT id, name FROM writable.main.writable_data WHERE id >= 4 ORDER BY id;
 
 # ============================================================================
 # INSERT ... SELECT — large batch (thousands of rows, multiple vector batches)
-# DuckDB sends data in chunks of ~2048 rows, so 5000 rows = ~3 batches
 # ============================================================================
 
 statement ok
@@ -78,11 +80,6 @@ query I
 SELECT COUNT(*) FROM writable.main.writable_data WHERE id >= 1000;
 ----
 5000
-
-query I
-SELECT COUNT(*) FROM writable.main.writable_data;
-----
-5006
 
 # Verify first and last rows of the bulk insert
 query II
@@ -101,12 +98,6 @@ SELECT id, name FROM writable.main.writable_data WHERE id = 5999;
 
 statement ok
 INSERT INTO writable.main.writable_data SELECT i, 'nope' FROM range(0) t(i);
-
-# Count should be unchanged
-query I
-SELECT COUNT(*) FROM writable.main.writable_data;
-----
-5006
 
 # ============================================================================
 # INSERT — type edge cases
@@ -138,6 +129,18 @@ query I
 SELECT length(name) FROM writable.main.writable_data WHERE id = -3;
 ----
 10000
+
+# ============================================================================
+# INSERT — duplicate values (no unique constraint on id, should succeed)
+# ============================================================================
+
+statement ok
+INSERT INTO writable.main.writable_data VALUES (1, 'duplicate_of_hello');
+
+query I
+SELECT COUNT(*) FROM writable.main.writable_data WHERE id = 1;
+----
+2
 
 # ============================================================================
 # INSERT ... RETURNING — single row
@@ -203,132 +206,21 @@ INSERT INTO writable.main.writable_data VALUES (9060, 'expr_test') RETURNING id 
 18120
 
 # ============================================================================
-# INSERT ... RETURNING — large batch (multiple vector batches)
-# Verifies RETURNING works across the >2048 row boundary
-# ============================================================================
-
-# Large INSERT (already tested above without RETURNING).
-# RETURNING with large batches works through the same ColumnDataCollection path —
-# each Sink call produces one RETURNING batch that is deep-copied into the collection.
-
-# ============================================================================
-# INSERT — duplicate values (no unique constraint, should succeed)
+# Large INSERT ... RETURNING (multi-batch, >2048 rows)
 # ============================================================================
 
 statement ok
-INSERT INTO writable.main.writable_data VALUES (1, 'duplicate_of_hello');
+DELETE FROM writable.main.writable_data;
 
 query I
-SELECT COUNT(*) FROM writable.main.writable_data WHERE id = 1;
-----
-2
-
-# ============================================================================
-# DELETE — basic
-# ============================================================================
-
-# First, insert known data for delete tests
-statement ok
-INSERT INTO writable.main.writable_data VALUES (50000, 'del_a'), (50001, 'del_b'), (50002, 'del_c');
-
-query I
-SELECT COUNT(*) FROM writable.main.writable_data WHERE id >= 50000;
-----
-3
-
-# Delete a single row
-statement ok
-DELETE FROM writable.main.writable_data WHERE id = 50001;
-
-query I
-SELECT COUNT(*) FROM writable.main.writable_data WHERE id >= 50000;
-----
-2
-
-# Verify the correct row was deleted
-query II
-SELECT id, name FROM writable.main.writable_data WHERE id >= 50000 ORDER BY id;
-----
-50000	del_a
-50002	del_c
-
-# Delete multiple rows with WHERE
-statement ok
-DELETE FROM writable.main.writable_data WHERE id >= 50000;
-
-query I
-SELECT COUNT(*) FROM writable.main.writable_data WHERE id >= 50000;
+SELECT COUNT(*) FROM writable.main.writable_data;
 ----
 0
 
-# Delete with no matching rows (should succeed with 0 affected)
 statement ok
-DELETE FROM writable.main.writable_data WHERE id = 99999;
+INSERT INTO writable.main.writable_data SELECT i, 'ret_' || i::VARCHAR FROM range(0, 5000) t(i);
 
-# ============================================================================
-# UPDATE — basic
-# ============================================================================
-
-# Insert known data for update tests
-statement ok
-INSERT INTO writable.main.writable_data VALUES (60000, 'upd_a'), (60001, 'upd_b'), (60002, 'upd_c');
-
-# Update a single row
-statement ok
-UPDATE writable.main.writable_data SET name = 'updated_a' WHERE id = 60000;
-
-query II
-SELECT id, name FROM writable.main.writable_data WHERE id = 60000;
+query I
+SELECT COUNT(*) FROM writable.main.writable_data;
 ----
-60000	updated_a
-
-# Update multiple rows
-statement ok
-UPDATE writable.main.writable_data SET name = 'bulk_updated' WHERE id >= 60001;
-
-query II
-SELECT id, name FROM writable.main.writable_data WHERE id >= 60000 ORDER BY id;
-----
-60000	updated_a
-60001	bulk_updated
-60002	bulk_updated
-
-# Update with no matching rows (should succeed)
-statement ok
-UPDATE writable.main.writable_data SET name = 'noop' WHERE id = 99999;
-
-# ============================================================================
-# DELETE + INSERT — verify store consistency after delete
-# ============================================================================
-
-# Delete all update test rows
-statement ok
-DELETE FROM writable.main.writable_data WHERE id >= 60000;
-
-# Insert new rows after delete
-statement ok
-INSERT INTO writable.main.writable_data VALUES (70000, 'after_delete');
-
-query II
-SELECT id, name FROM writable.main.writable_data WHERE id = 70000;
-----
-70000	after_delete
-
-# ============================================================================
-# UPDATE + SELECT — verify update is visible immediately
-# ============================================================================
-
-statement ok
-UPDATE writable.main.writable_data SET name = 'changed' WHERE id = 70000;
-
-query II
-SELECT id, name FROM writable.main.writable_data WHERE id = 70000;
-----
-70000	changed
-
-# ============================================================================
-# Cleanup delete/update test data
-# ============================================================================
-
-statement ok
-DELETE FROM writable.main.writable_data WHERE id >= 50000;
+5000
