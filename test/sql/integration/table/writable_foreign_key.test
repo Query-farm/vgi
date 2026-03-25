@@ -12,6 +12,12 @@ statement ok
 ATTACH 'writable' AS writable (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
 statement ok
+CREATE TABLE writable.main.writable_products (product_id BIGINT NOT NULL UNIQUE, name VARCHAR NOT NULL, price DOUBLE NOT NULL DEFAULT 0.0 CHECK(price >= 0), status VARCHAR NOT NULL DEFAULT 'draft', created_at VARCHAR NOT NULL DEFAULT 'server-assigned');
+
+statement ok
+CREATE TABLE writable.main.writable_orders (order_id BIGINT NOT NULL UNIQUE, product_id BIGINT NOT NULL REFERENCES writable_products(product_id), quantity BIGINT NOT NULL DEFAULT 1);
+
+statement ok
 DELETE FROM writable.main.writable_orders;
 
 query I
@@ -321,3 +327,9 @@ query I
 SELECT COUNT(*) FROM writable.main.writable_products;
 ----
 0
+
+statement ok
+DROP TABLE writable.main.writable_orders;
+
+statement ok
+DROP TABLE writable.main.writable_products;

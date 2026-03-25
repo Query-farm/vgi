@@ -12,6 +12,9 @@ statement ok
 ATTACH 'writable' AS writable (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
 statement ok
+CREATE TABLE writable.main.writable_data (id BIGINT NOT NULL, name VARCHAR NOT NULL);
+
+statement ok
 DELETE FROM writable.main.writable_data;
 
 query I
@@ -64,3 +67,6 @@ query I
 SELECT COUNT(*) FROM writable.main.writable_data WHERE id > 500 AND name = 'apple';
 ----
 167
+
+statement ok
+DROP TABLE writable.main.writable_data;

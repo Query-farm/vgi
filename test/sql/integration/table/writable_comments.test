@@ -11,6 +11,9 @@ require httpfs
 statement ok
 ATTACH 'writable' AS writable (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
+statement ok
+CREATE TABLE writable.main.writable_data (id BIGINT NOT NULL, name VARCHAR NOT NULL);
+
 # ============================================================================
 # COMMENT ON TABLE — set and clear on dynamic table
 # ============================================================================
@@ -100,3 +103,6 @@ COMMENT ON COLUMN writable.main.writable_data.name IS 'The name field';
 
 statement ok
 COMMENT ON COLUMN writable.main.writable_data.name IS NULL;
+
+statement ok
+DROP TABLE writable.main.writable_data;

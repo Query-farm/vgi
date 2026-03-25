@@ -12,6 +12,12 @@ statement ok
 ATTACH 'writable' AS writable (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
 statement ok
+CREATE TABLE writable.main.writable_data (id BIGINT NOT NULL, name VARCHAR NOT NULL);
+
+statement ok
+CREATE TABLE writable.main.writable_products (product_id BIGINT NOT NULL UNIQUE, name VARCHAR NOT NULL, price DOUBLE NOT NULL DEFAULT 0.0 CHECK(price >= 0), status VARCHAR NOT NULL DEFAULT 'draft', created_at VARCHAR NOT NULL DEFAULT 'server-assigned');
+
+statement ok
 DELETE FROM writable.main.writable_data;
 
 query I
@@ -127,3 +133,9 @@ query T
 SELECT name FROM writable.main.writable_products WHERE product_id = 99002;
 ----
 Gadget
+
+statement ok
+DROP TABLE writable.main.writable_products;
+
+statement ok
+DROP TABLE writable.main.writable_data;

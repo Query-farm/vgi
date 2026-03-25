@@ -308,31 +308,33 @@ statement ok
 DROP TABLE writable.main.test_multi;
 
 # ============================================================================
-# 7. FOREIGN KEY — tested on static tables (writable_orders → writable_products)
-# Note: DuckDB SQL parser cannot create cross-database FK references, so FK
-# between dynamic tables requires the Python Table descriptor. The static
-# writable_foreign_key.test covers FK enforcement comprehensively.
+# 7. FOREIGN KEY — create tables with FK, verify enforcement
 # ============================================================================
 
-# Verify FK enforcement on static tables
 statement ok
-INSERT INTO writable.main.writable_products(product_id, name) VALUES (77701, 'FK_Test_Product');
+CREATE TABLE writable.main.fk_products (product_id BIGINT NOT NULL UNIQUE, name VARCHAR NOT NULL);
 
 statement ok
-INSERT INTO writable.main.writable_orders VALUES (77701, 77701, 1);
+CREATE TABLE writable.main.fk_orders (order_id BIGINT NOT NULL, product_id BIGINT NOT NULL REFERENCES fk_products(product_id));
 
-# FK violation — non-existent product
+statement ok
+INSERT INTO writable.main.fk_products VALUES (1, 'Widget');
+
+statement ok
+INSERT INTO writable.main.fk_orders VALUES (1, 1);
+
+# FK violation
 statement error
-INSERT INTO writable.main.writable_orders VALUES (77702, 99999, 1);
+INSERT INTO writable.main.fk_orders VALUES (2, 999);
 ----
 Constraint Error
 
 # Cleanup
 statement ok
-DELETE FROM writable.main.writable_orders WHERE order_id = 77701;
+DROP TABLE writable.main.fk_orders;
 
 statement ok
-DELETE FROM writable.main.writable_products WHERE product_id = 77701;
+DROP TABLE writable.main.fk_products;
 
 # ============================================================================
 # 8. Simple defaults — VARCHAR, INTEGER, DOUBLE, BOOLEAN
@@ -611,18 +613,3 @@ SELECT COUNT(*) FROM writable.main.test_ctas_types;
 
 statement ok
 DROP TABLE writable.main.test_ctas_types;
-
-# ============================================================================
-# Regression: static tables still work
-# ============================================================================
-
-statement ok
-INSERT INTO writable.main.writable_data VALUES (99990, 'constraint_test_ok');
-
-query T
-SELECT name FROM writable.main.writable_data WHERE id = 99990;
-----
-constraint_test_ok
-
-statement ok
-DELETE FROM writable.main.writable_data WHERE id = 99990;

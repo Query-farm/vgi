@@ -247,18 +247,3 @@ DROP VIEW writable.main.meta_view;
 
 statement ok
 DROP TABLE writable.main.view_base;
-
-# ============================================================================
-# Static tables still work (regression)
-# ============================================================================
-
-statement ok
-INSERT INTO writable.main.writable_data VALUES (99985, 'view_test_ok');
-
-query T
-SELECT name FROM writable.main.writable_data WHERE id = 99985;
-----
-view_test_ok
-
-statement ok
-DELETE FROM writable.main.writable_data WHERE id = 99985;

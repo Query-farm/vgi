@@ -11,6 +11,9 @@ require httpfs
 statement ok
 ATTACH 'writable' AS writable (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
+statement ok
+CREATE TABLE writable.main.writable_products (product_id BIGINT NOT NULL UNIQUE, name VARCHAR NOT NULL, price DOUBLE NOT NULL DEFAULT 0.0 CHECK(price >= 0), status VARCHAR NOT NULL DEFAULT 'draft', created_at VARCHAR NOT NULL DEFAULT 'server-assigned');
+
 # ============================================================================
 # Default resolution — column-subset INSERT (price, status, created_at have defaults)
 # ============================================================================
@@ -198,3 +201,6 @@ statement error
 INSERT INTO writable.main.writable_products(product_id, name) VALUES (201, NULL);
 ----
 Constraint Error
+
+statement ok
+DROP TABLE writable.main.writable_products;

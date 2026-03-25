@@ -193,24 +193,5 @@ SELECT * FROM writable.main.tx_rollback;
 # ============================================================================
 
 statement error
-CREATE INDEX idx ON writable.main.writable_data (id);
-----
-
-statement error
 CREATE SEQUENCE writable.main.seq;
 ----
-
-# ============================================================================
-# Static tables still work (regression check)
-# ============================================================================
-
-statement ok
-INSERT INTO writable.main.writable_data VALUES (99998, 'static_ok');
-
-query T
-SELECT name FROM writable.main.writable_data WHERE id = 99998;
-----
-static_ok
-
-statement ok
-DELETE FROM writable.main.writable_data WHERE id = 99998;
