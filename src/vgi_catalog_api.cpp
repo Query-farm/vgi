@@ -447,9 +447,9 @@ void InvokeCatalogTableCreate(
 void InvokeCatalogTableDrop(
     const std::string &worker_path, const std::vector<uint8_t> &attach_id,
     const std::string &schema_name, const std::string &table_name,
-    bool ignore_not_found, const std::vector<uint8_t> &transaction_id,
+    bool ignore_not_found, bool cascade, const std::vector<uint8_t> &transaction_id,
     ClientContext &context, bool worker_debug, bool use_pool) {
-	auto params = BuildTableDropParams(attach_id, schema_name, table_name, ignore_not_found, transaction_id);
+	auto params = BuildTableDropParams(attach_id, schema_name, table_name, ignore_not_found, cascade, transaction_id);
 	InvokeRpcMethod(worker_path, "catalog_table_drop", params, context, worker_debug, use_pool);
 }
 
@@ -594,9 +594,9 @@ void InvokeCatalogViewCreate(
 void InvokeCatalogViewDrop(
     const std::string &worker_path, const std::vector<uint8_t> &attach_id,
     const std::string &schema_name, const std::string &view_name,
-    bool ignore_not_found, const std::vector<uint8_t> &transaction_id,
+    bool ignore_not_found, bool cascade, const std::vector<uint8_t> &transaction_id,
     ClientContext &context, bool worker_debug, bool use_pool) {
-	auto params = BuildViewDropParams(attach_id, schema_name, view_name, ignore_not_found, transaction_id);
+	auto params = BuildViewDropParams(attach_id, schema_name, view_name, ignore_not_found, cascade, transaction_id);
 	InvokeRpcMethod(worker_path, "catalog_view_drop", params, context, worker_debug, use_pool);
 }
 

@@ -1,0 +1,313 @@
+# name: test/sql/integration/table/writable_cascade.test
+# description: Tests for cascade parameter, FK dependency enforcement, and cache invalidation
+# group: [vgi_integration_table]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'writable' AS writable (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+USE writable;
+
+# ============================================================================
+# FK dependency enforcement: DROP TABLE blocked when FK child exists
+# ============================================================================
+
+statement ok
+CREATE TABLE main.fk_parent (id BIGINT PRIMARY KEY);
+
+statement ok
+INSERT INTO main.fk_parent VALUES (1), (2);
+
+statement ok
+CREATE TABLE main.fk_child (id BIGINT, parent_id BIGINT REFERENCES fk_parent(id));
+
+statement ok
+INSERT INTO main.fk_child VALUES (1, 1);
+
+# DROP without CASCADE should error — FK dependency
+statement error
+DROP TABLE main.fk_parent;
+----
+fk_child
+
+# Table still works
+query I
+SELECT COUNT(*) FROM main.fk_parent;
+----
+2
+
+# DROP with CASCADE also errors for FK in DuckDB (FK cascade not yet supported)
+statement error
+DROP TABLE main.fk_parent CASCADE;
+----
+fk_child
+
+# Cleanup: must drop child first, then parent
+statement ok
+DROP TABLE main.fk_child;
+
+statement ok
+DROP TABLE main.fk_parent;
+
+# ============================================================================
+# CASCADE parameter plumbing — verify no errors when no deps exist
+# ============================================================================
+
+statement ok
+CREATE TABLE main.cascade_t1 (id BIGINT);
+
+statement ok
+INSERT INTO main.cascade_t1 VALUES (1);
+
+# DROP TABLE CASCADE with no dependents succeeds
+statement ok
+DROP TABLE main.cascade_t1 CASCADE;
+
+statement error
+SELECT * FROM main.cascade_t1;
+----
+
+statement ok
+CREATE TABLE main.cascade_t2 (id BIGINT);
+
+statement ok
+CREATE VIEW main.cascade_v2 AS SELECT id FROM main.cascade_t2;
+
+# DROP VIEW CASCADE succeeds
+statement ok
+DROP VIEW main.cascade_v2 CASCADE;
+
+statement ok
+DROP TABLE main.cascade_t2;
+
+# ============================================================================
+# Cache invalidation: views refresh after table DROP
+# ============================================================================
+
+statement ok
+CREATE TABLE main.cache_t1 (id BIGINT, name VARCHAR);
+
+statement ok
+INSERT INTO main.cache_t1 VALUES (1, 'alice'), (2, 'bob');
+
+statement ok
+CREATE VIEW main.cache_v1 AS SELECT id, name FROM main.cache_t1;
+
+# Warm the cache by querying
+query I
+SELECT COUNT(*) FROM main.cache_v1;
+----
+2
+
+# Drop the table (views in DuckDB become broken, not cascade-dropped)
+statement ok
+DROP TABLE main.cache_t1;
+
+# View should error (table no longer exists)
+statement error
+SELECT * FROM main.cache_v1;
+----
+
+# Cleanup: drop the broken view
+statement ok
+DROP VIEW main.cache_v1;
+
+# ============================================================================
+# Cache invalidation: views refresh after ALTER TABLE RENAME
+# ============================================================================
+
+statement ok
+CREATE TABLE main.rename_t1 (id BIGINT, name VARCHAR);
+
+statement ok
+INSERT INTO main.rename_t1 VALUES (1, 'test');
+
+statement ok
+CREATE VIEW main.rename_v1 AS SELECT id, name FROM main.rename_t1;
+
+query I
+SELECT COUNT(*) FROM main.rename_v1;
+----
+1
+
+statement ok
+ALTER TABLE main.rename_t1 RENAME TO rename_t1_new;
+
+# View referencing old name should error (table was renamed)
+statement error
+SELECT * FROM main.rename_v1;
+----
+
+# Cleanup
+statement ok
+DROP VIEW main.rename_v1;
+
+statement ok
+DROP TABLE main.rename_t1_new;
+
+# ============================================================================
+# Cache invalidation: views refresh after ALTER TABLE RENAME COLUMN
+# ============================================================================
+
+statement ok
+CREATE TABLE main.rencol_t1 (id BIGINT, old_name VARCHAR);
+
+statement ok
+INSERT INTO main.rencol_t1 VALUES (1, 'alice');
+
+statement ok
+CREATE VIEW main.rencol_v1 AS SELECT id, old_name FROM main.rencol_t1;
+
+# Warm the cache
+query IT
+SELECT id, old_name FROM main.rencol_v1;
+----
+1	alice
+
+statement ok
+ALTER TABLE main.rencol_t1 RENAME COLUMN old_name TO new_name;
+
+# View references old_name which no longer exists — should error
+statement error
+SELECT * FROM main.rencol_v1;
+----
+
+# Table works with new column name
+query IT
+SELECT id, new_name FROM main.rencol_t1;
+----
+1	alice
+
+# Cleanup
+statement ok
+DROP VIEW main.rencol_v1;
+
+statement ok
+DROP TABLE main.rencol_t1;
+
+# ============================================================================
+# Cache invalidation: views refresh after ALTER TABLE ALTER COLUMN TYPE
+# ============================================================================
+
+statement ok
+CREATE TABLE main.coltype_t1 (id BIGINT, val VARCHAR);
+
+statement ok
+INSERT INTO main.coltype_t1 VALUES (1, '42');
+
+statement ok
+CREATE VIEW main.coltype_v1 AS SELECT id, val FROM main.coltype_t1;
+
+# Warm the cache — val is VARCHAR
+query IT
+SELECT id, val FROM main.coltype_v1;
+----
+1	42
+
+statement ok
+ALTER TABLE main.coltype_t1 ALTER COLUMN val TYPE BIGINT;
+
+# View should reflect the new column type (BIGINT, not VARCHAR)
+query II
+SELECT id, val FROM main.coltype_v1;
+----
+1	42
+
+# Cleanup
+statement ok
+DROP VIEW main.coltype_v1;
+
+statement ok
+DROP TABLE main.coltype_t1;
+
+# ============================================================================
+# Cache invalidation: views refresh after ALTER VIEW RENAME
+# ============================================================================
+
+statement ok
+CREATE TABLE main.viewren_t1 (id BIGINT, name VARCHAR);
+
+statement ok
+INSERT INTO main.viewren_t1 VALUES (1, 'test');
+
+statement ok
+CREATE VIEW main.viewren_v1 AS SELECT id, name FROM main.viewren_t1;
+
+statement ok
+CREATE VIEW main.viewren_v2 AS SELECT name FROM main.viewren_v1;
+
+# Warm caches
+query T
+SELECT name FROM main.viewren_v2;
+----
+test
+
+# Rename the base view
+statement ok
+ALTER VIEW main.viewren_v1 RENAME TO viewren_v1_new;
+
+# Old name should not resolve
+statement error
+SELECT * FROM main.viewren_v1;
+----
+
+# Renamed view works
+query IT
+SELECT id, name FROM main.viewren_v1_new;
+----
+1	test
+
+# Dependent view referencing old name should error
+statement error
+SELECT * FROM main.viewren_v2;
+----
+
+# Cleanup
+statement ok
+DROP VIEW main.viewren_v2;
+
+statement ok
+DROP VIEW main.viewren_v1_new;
+
+statement ok
+DROP TABLE main.viewren_t1;
+
+# ============================================================================
+# Cache invalidation: views refresh after table data changes
+# ============================================================================
+
+statement ok
+CREATE TABLE main.refresh_t1 (id BIGINT, name VARCHAR);
+
+statement ok
+INSERT INTO main.refresh_t1 VALUES (1, 'original');
+
+statement ok
+CREATE VIEW main.refresh_v1 AS SELECT id, name FROM main.refresh_t1;
+
+query T
+SELECT name FROM main.refresh_v1;
+----
+original
+
+# Insert more data — view should reflect it
+statement ok
+INSERT INTO main.refresh_t1 VALUES (2, 'added');
+
+query I
+SELECT COUNT(*) FROM main.refresh_v1;
+----
+2
+
+# Cleanup
+statement ok
+DROP VIEW main.refresh_v1;
+
+statement ok
+DROP TABLE main.refresh_t1;

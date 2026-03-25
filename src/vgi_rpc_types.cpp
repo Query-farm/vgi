@@ -1045,12 +1045,13 @@ std::shared_ptr<arrow::RecordBatch> BuildTableCreateParams(
 
 std::shared_ptr<arrow::RecordBatch> BuildTableDropParams(
     const std::vector<uint8_t> &attach_id, const std::string &schema_name, const std::string &name,
-    bool ignore_not_found, const std::vector<uint8_t> &transaction_id) {
+    bool ignore_not_found, bool cascade, const std::vector<uint8_t> &transaction_id) {
 	auto schema = arrow::schema({
 	    arrow::field("attach_id", arrow::binary(), false),
 	    arrow::field("schema_name", arrow::utf8(), false),
 	    arrow::field("name", arrow::utf8(), false),
 	    arrow::field("ignore_not_found", arrow::boolean(), false),
+	    arrow::field("cascade", arrow::boolean(), false),
 	    arrow::field("transaction_id", arrow::binary(), true),
 	});
 	std::vector<std::shared_ptr<arrow::Array>> arrays;
@@ -1066,6 +1067,11 @@ std::shared_ptr<arrow::RecordBatch> BuildTableDropParams(
 		arrow::BooleanBuilder builder;
 		CheckStatus(builder.Append(ignore_not_found), "append ignore_not_found");
 		arrays.push_back(FinishArray(builder, "ignore_not_found"));
+	}
+	{
+		arrow::BooleanBuilder builder;
+		CheckStatus(builder.Append(cascade), "append cascade");
+		arrays.push_back(FinishArray(builder, "cascade"));
 	}
 	arrays.push_back(BuildBinaryScalar(transaction_id));
 
@@ -1580,12 +1586,13 @@ std::shared_ptr<arrow::RecordBatch> BuildViewCreateParams(
 
 std::shared_ptr<arrow::RecordBatch> BuildViewDropParams(
     const std::vector<uint8_t> &attach_id, const std::string &schema_name, const std::string &name,
-    bool ignore_not_found, const std::vector<uint8_t> &transaction_id) {
+    bool ignore_not_found, bool cascade, const std::vector<uint8_t> &transaction_id) {
 	auto schema = arrow::schema({
 	    arrow::field("attach_id", arrow::binary(), false),
 	    arrow::field("schema_name", arrow::utf8(), false),
 	    arrow::field("name", arrow::utf8(), false),
 	    arrow::field("ignore_not_found", arrow::boolean(), false),
+	    arrow::field("cascade", arrow::boolean(), false),
 	    arrow::field("transaction_id", arrow::binary(), true),
 	});
 	std::vector<std::shared_ptr<arrow::Array>> arrays;
@@ -1601,6 +1608,11 @@ std::shared_ptr<arrow::RecordBatch> BuildViewDropParams(
 		arrow::BooleanBuilder builder;
 		CheckStatus(builder.Append(ignore_not_found), "append ignore_not_found");
 		arrays.push_back(FinishArray(builder, "ignore_not_found"));
+	}
+	{
+		arrow::BooleanBuilder builder;
+		CheckStatus(builder.Append(cascade), "append cascade");
+		arrays.push_back(FinishArray(builder, "cascade"));
 	}
 	arrays.push_back(BuildBinaryScalar(transaction_id));
 

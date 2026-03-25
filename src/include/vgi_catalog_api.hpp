@@ -452,7 +452,7 @@ void InvokeCatalogTableCreate(
 void InvokeCatalogTableDrop(
     const std::string &worker_path, const std::vector<uint8_t> &attach_id,
     const std::string &schema_name, const std::string &table_name,
-    bool ignore_not_found, const std::vector<uint8_t> &transaction_id,
+    bool ignore_not_found, bool cascade, const std::vector<uint8_t> &transaction_id,
     ClientContext &context, bool worker_debug = false, bool use_pool = true);
 
 // Invoke catalog_table_rename: rename a table in the catalog.
@@ -561,7 +561,7 @@ void InvokeCatalogViewCreate(
 void InvokeCatalogViewDrop(
     const std::string &worker_path, const std::vector<uint8_t> &attach_id,
     const std::string &schema_name, const std::string &view_name,
-    bool ignore_not_found, const std::vector<uint8_t> &transaction_id,
+    bool ignore_not_found, bool cascade, const std::vector<uint8_t> &transaction_id,
     ClientContext &context, bool worker_debug = false, bool use_pool = true);
 
 // Invoke catalog_view_rename: rename a view in the catalog.

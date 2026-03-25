@@ -273,10 +273,10 @@ std::shared_ptr<arrow::RecordBatch> BuildTableCreateParams(
     const std::vector<uint8_t> &transaction_id = {});
 
 // Build params batch for catalog_table_drop:
-//   attach_id, schema_name, name, ignore_not_found, transaction_id
+//   attach_id, schema_name, name, ignore_not_found, cascade, transaction_id
 std::shared_ptr<arrow::RecordBatch> BuildTableDropParams(
     const std::vector<uint8_t> &attach_id, const std::string &schema_name, const std::string &name,
-    bool ignore_not_found, const std::vector<uint8_t> &transaction_id = {});
+    bool ignore_not_found, bool cascade, const std::vector<uint8_t> &transaction_id = {});
 
 // Build params batch for catalog_table_rename:
 //   attach_id, schema_name, name, new_name, ignore_not_found, transaction_id
@@ -378,10 +378,10 @@ std::shared_ptr<arrow::RecordBatch> BuildViewCreateParams(
     const std::vector<uint8_t> &transaction_id = {});
 
 // Build params batch for catalog_view_drop:
-//   attach_id, schema_name, name, ignore_not_found, transaction_id
+//   attach_id, schema_name, name, ignore_not_found, cascade, transaction_id
 std::shared_ptr<arrow::RecordBatch> BuildViewDropParams(
     const std::vector<uint8_t> &attach_id, const std::string &schema_name, const std::string &name,
-    bool ignore_not_found, const std::vector<uint8_t> &transaction_id = {});
+    bool ignore_not_found, bool cascade, const std::vector<uint8_t> &transaction_id = {});
 
 // Build params batch for catalog_view_rename:
 //   attach_id, schema_name, name, new_name, ignore_not_found, transaction_id

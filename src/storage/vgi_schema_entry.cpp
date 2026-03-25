@@ -132,6 +132,10 @@ optional_ptr<CatalogEntry> VgiSchemaEntry::CreateTable(CatalogTransaction transa
 
 	// Invalidate table cache and re-fetch the newly created table
 	tables_.ClearEntries();
+	// REPLACE may have changed the table schema, invalidating dependent views
+	if (create_info.on_conflict == OnCreateConflict::REPLACE_ON_CONFLICT) {
+		views_.ClearEntries();
+	}
 	return tables_.GetEntry(context, create_info.table);
 }
 
@@ -270,7 +274,8 @@ void VgiSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 			throw BinderException("ALTER VIEW %s is not supported for VGI catalogs",
 			                       EnumUtil::ToString(alter_view.alter_view_type));
 		}
-		views_.DropEntry(alter_view.name);
+		// Dependent views may reference the old name, so clear the entire views cache
+		views_.ClearEntries();
 		return;
 	}
 
@@ -372,6 +377,19 @@ void VgiSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 
 	// Invalidate the specific table entry to force re-fetch
 	tables_.DropEntry(table_name);
+
+	// Structural changes (rename, drop/rename column, type change) can invalidate
+	// dependent views — clear view cache so stale definitions are re-fetched.
+	switch (alter_table.alter_table_type) {
+	case AlterTableType::RENAME_TABLE:
+	case AlterTableType::RENAME_COLUMN:
+	case AlterTableType::REMOVE_COLUMN:
+	case AlterTableType::ALTER_COLUMN_TYPE:
+		views_.ClearEntries();
+		break;
+	default:
+		break;
+	}
 }
 
 void VgiSchemaEntry::Scan(ClientContext &context, CatalogType type,
@@ -432,17 +450,25 @@ void VgiSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
 
 	if (info.type == CatalogType::VIEW_ENTRY) {
 		vgi::InvokeCatalogViewDrop(attach_params->worker_path(), attach_result->attach_id,
-		                            name, info.name, ignore_not_found, transaction_id,
+		                            name, info.name, ignore_not_found, info.cascade, transaction_id,
 		                            context, attach_params->worker_debug(), attach_params->use_pool());
-		views_.DropEntry(info.name);
+		if (info.cascade) {
+			// Cascade may have dropped views that depend on this view
+			views_.ClearEntries();
+		} else {
+			views_.DropEntry(info.name);
+		}
 		return;
 	}
 
 	vgi::InvokeCatalogTableDrop(attach_params->worker_path(), attach_result->attach_id,
-	                             name, info.name, ignore_not_found, transaction_id,
+	                             name, info.name, ignore_not_found, info.cascade, transaction_id,
 	                             context, attach_params->worker_debug(), attach_params->use_pool());
 
 	tables_.DropEntry(info.name);
+	// Views referencing the dropped table are now stale; clear to force re-fetch.
+	// With cascade, the worker may have also dropped dependent views.
+	views_.ClearEntries();
 }
 
 optional_ptr<CatalogEntry> VgiSchemaEntry::LookupEntry(CatalogTransaction transaction,
