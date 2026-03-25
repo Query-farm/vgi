@@ -364,6 +364,7 @@ std::shared_ptr<arrow::Schema> DeserializeSchema(const std::vector<uint8_t> &dat
 	if (!schema_result.ok()) {
 		throw IOException("Failed to deserialize Arrow schema: " + schema_result.status().ToString());
 	}
+
 	return ResolveDictionaryTypes(schema_result.ValueUnsafe());
 }
 

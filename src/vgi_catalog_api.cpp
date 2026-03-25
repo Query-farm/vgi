@@ -159,8 +159,10 @@ CatalogAttachResult InvokeCatalogAttach(const std::string &worker_path, const st
 }
 
 std::vector<VgiSchemaInfo> InvokeCatalogSchemas(const std::string &worker_path, const std::vector<uint8_t> &attach_id,
-                                                ClientContext &context, bool worker_debug, bool use_pool) {
-	auto params = BuildAttachIdParams(attach_id);
+                                                ClientContext &context,
+                                                const std::vector<uint8_t> &transaction_id,
+                                                bool worker_debug, bool use_pool) {
+	auto params = BuildAttachIdParams(attach_id, transaction_id);
 	auto response = InvokeRpcMethod(worker_path, "catalog_schemas", params, context, worker_debug, use_pool);
 	auto result_batch = ExtractAndDeserializeResult(response, "catalog_schemas", worker_path);
 	if (!result_batch) {
@@ -180,8 +182,9 @@ std::vector<VgiSchemaInfo> InvokeCatalogSchemas(const std::string &worker_path, 
 std::vector<VgiTableInfo> InvokeCatalogSchemaContentsTables(const std::string &worker_path,
                                                             const std::vector<uint8_t> &attach_id,
                                                             const std::string &schema_name, ClientContext &context,
+                                                            const std::vector<uint8_t> &transaction_id,
                                                             bool worker_debug, bool use_pool) {
-	auto params = BuildSchemaContentsParams(attach_id, schema_name);
+	auto params = BuildSchemaContentsParams(attach_id, schema_name, transaction_id);
 	auto response = InvokeRpcMethod(worker_path, "catalog_schema_contents_tables", params, context, worker_debug,
 	                                use_pool);
 	auto result_batch = ExtractAndDeserializeResult(response, "catalog_schema_contents_tables", worker_path);
@@ -201,8 +204,9 @@ std::vector<VgiTableInfo> InvokeCatalogSchemaContentsTables(const std::string &w
 std::vector<VgiViewInfo> InvokeCatalogSchemaContentsViews(const std::string &worker_path,
                                                           const std::vector<uint8_t> &attach_id,
                                                           const std::string &schema_name, ClientContext &context,
+                                                          const std::vector<uint8_t> &transaction_id,
                                                           bool worker_debug, bool use_pool) {
-	auto params = BuildSchemaContentsParams(attach_id, schema_name);
+	auto params = BuildSchemaContentsParams(attach_id, schema_name, transaction_id);
 	auto response =
 	    InvokeRpcMethod(worker_path, "catalog_schema_contents_views", params, context, worker_debug, use_pool);
 	auto result_batch = ExtractAndDeserializeResult(response, "catalog_schema_contents_views", worker_path);
@@ -221,8 +225,9 @@ std::vector<VgiViewInfo> InvokeCatalogSchemaContentsViews(const std::string &wor
 
 std::vector<VgiFunctionInfo> InvokeCatalogSchemaContentsFunctions(
     const std::string &worker_path, const std::vector<uint8_t> &attach_id, const std::string &schema_name,
-    const std::string &function_type, ClientContext &context, bool worker_debug, bool use_pool) {
-	auto params = BuildSchemaContentsFunctionsParams(attach_id, schema_name, function_type);
+    const std::string &function_type, ClientContext &context,
+    const std::vector<uint8_t> &transaction_id, bool worker_debug, bool use_pool) {
+	auto params = BuildSchemaContentsFunctionsParams(attach_id, schema_name, function_type, transaction_id);
 	auto response =
 	    InvokeRpcMethod(worker_path, "catalog_schema_contents_functions", params, context, worker_debug, use_pool);
 	auto result_batch = ExtractAndDeserializeResult(response, "catalog_schema_contents_functions", worker_path);
@@ -241,8 +246,9 @@ std::vector<VgiFunctionInfo> InvokeCatalogSchemaContentsFunctions(
 
 std::vector<VgiMacroInfo> InvokeCatalogSchemaContentsMacros(
     const std::string &worker_path, const std::vector<uint8_t> &attach_id, const std::string &schema_name,
-    const std::string &macro_type, ClientContext &context, bool worker_debug, bool use_pool) {
-	auto params = BuildSchemaContentsFunctionsParams(attach_id, schema_name, macro_type);
+    const std::string &macro_type, ClientContext &context,
+    const std::vector<uint8_t> &transaction_id, bool worker_debug, bool use_pool) {
+	auto params = BuildSchemaContentsFunctionsParams(attach_id, schema_name, macro_type, transaction_id);
 	auto response =
 	    InvokeRpcMethod(worker_path, "catalog_schema_contents_macros", params, context, worker_debug, use_pool);
 	auto result_batch = ExtractAndDeserializeResult(response, "catalog_schema_contents_macros", worker_path);
@@ -262,8 +268,10 @@ std::vector<VgiMacroInfo> InvokeCatalogSchemaContentsMacros(
 std::optional<VgiTableInfo> InvokeCatalogTableGet(const std::string &worker_path,
                                                    const std::vector<uint8_t> &attach_id,
                                                    const std::string &schema_name, const std::string &table_name,
-                                                   ClientContext &context, bool worker_debug, bool use_pool) {
-	auto params = BuildTableOrViewGetParams(attach_id, schema_name, table_name);
+                                                   ClientContext &context,
+                                                   const std::vector<uint8_t> &transaction_id,
+                                                   bool worker_debug, bool use_pool) {
+	auto params = BuildTableOrViewGetParams(attach_id, schema_name, table_name, transaction_id);
 	auto response = InvokeRpcMethod(worker_path, "catalog_table_get", params, context, worker_debug, use_pool);
 	auto result_batch = ExtractAndDeserializeResult(response, "catalog_table_get", worker_path);
 	if (!result_batch) {
@@ -284,8 +292,9 @@ std::optional<VgiTableInfo> InvokeCatalogTableGet(const std::string &worker_path
                                                    const std::string &schema_name, const std::string &table_name,
                                                    ClientContext &context,
                                                    const std::string &at_unit, const std::string &at_value,
+                                                   const std::vector<uint8_t> &transaction_id,
                                                    bool worker_debug, bool use_pool) {
-	auto params = BuildTableGetWithAtParams(attach_id, schema_name, table_name, at_unit, at_value);
+	auto params = BuildTableGetWithAtParams(attach_id, schema_name, table_name, at_unit, at_value, transaction_id);
 	auto response = InvokeRpcMethod(worker_path, "catalog_table_get", params, context, worker_debug, use_pool);
 	auto result_batch = ExtractAndDeserializeResult(response, "catalog_table_get", worker_path);
 	if (!result_batch) {
@@ -302,8 +311,9 @@ std::optional<VgiTableInfo> InvokeCatalogTableGet(const std::string &worker_path
 
 std::optional<VgiViewInfo> InvokeCatalogViewGet(const std::string &worker_path, const std::vector<uint8_t> &attach_id,
                                                  const std::string &schema_name, const std::string &view_name,
-                                                 ClientContext &context, bool worker_debug, bool use_pool) {
-	auto params = BuildTableOrViewGetParams(attach_id, schema_name, view_name);
+                                                 ClientContext &context, const std::vector<uint8_t> &transaction_id,
+                                                 bool worker_debug, bool use_pool) {
+	auto params = BuildTableOrViewGetParams(attach_id, schema_name, view_name, transaction_id);
 	auto response = InvokeRpcMethod(worker_path, "catalog_view_get", params, context, worker_debug, use_pool);
 	auto result_batch = ExtractAndDeserializeResult(response, "catalog_view_get", worker_path);
 	if (!result_batch) {
@@ -322,8 +332,8 @@ std::optional<VgiViewInfo> InvokeCatalogViewGet(const std::string &worker_path, 
 VgiScanFunctionResult InvokeCatalogTableScanFunctionGet(
     const std::string &worker_path, const std::vector<uint8_t> &attach_id, const std::string &schema_name,
     const std::string &table_name, ClientContext &context, const std::string &at_unit, const std::string &at_value,
-    bool worker_debug, bool use_pool) {
-	auto params = BuildTableScanFunctionGetParams(attach_id, schema_name, table_name, at_unit, at_value);
+    const std::vector<uint8_t> &transaction_id, bool worker_debug, bool use_pool) {
+	auto params = BuildTableScanFunctionGetParams(attach_id, schema_name, table_name, at_unit, at_value, transaction_id);
 	auto response =
 	    InvokeRpcMethod(worker_path, "catalog_table_scan_function_get", params, context, worker_debug, use_pool);
 	auto result_batch = ExtractAndDeserializeResult(response, "catalog_table_scan_function_get", worker_path);
@@ -340,8 +350,9 @@ VgiScanFunctionResult InvokeCatalogTableScanFunctionGet(
 static VgiWriteFunctionResult InvokeCatalogTableWriteFunctionGet(
     const std::string &worker_path, const std::string &rpc_method,
     const std::vector<uint8_t> &attach_id, const std::string &schema_name,
-    const std::string &table_name, ClientContext &context, bool worker_debug, bool use_pool) {
-	auto params = BuildWriteFunctionGetParams(attach_id, schema_name, table_name);
+    const std::string &table_name, ClientContext &context,
+    const std::vector<uint8_t> &transaction_id, bool worker_debug, bool use_pool) {
+	auto params = BuildWriteFunctionGetParams(attach_id, schema_name, table_name, transaction_id);
 	auto response = InvokeRpcMethod(worker_path, rpc_method, params, context, worker_debug, use_pool);
 	auto result_batch = ExtractAndDeserializeResult(response, rpc_method, worker_path);
 	if (!result_batch || result_batch->num_rows() == 0) {
@@ -352,23 +363,29 @@ static VgiWriteFunctionResult InvokeCatalogTableWriteFunctionGet(
 
 VgiWriteFunctionResult InvokeCatalogTableInsertFunctionGet(
     const std::string &worker_path, const std::vector<uint8_t> &attach_id, const std::string &schema_name,
-    const std::string &table_name, ClientContext &context, bool worker_debug, bool use_pool) {
+    const std::string &table_name, ClientContext &context,
+    const std::vector<uint8_t> &transaction_id, bool worker_debug, bool use_pool) {
 	return InvokeCatalogTableWriteFunctionGet(worker_path, "catalog_table_insert_function_get",
-	                                          attach_id, schema_name, table_name, context, worker_debug, use_pool);
+	                                          attach_id, schema_name, table_name, context, transaction_id,
+	                                          worker_debug, use_pool);
 }
 
 VgiWriteFunctionResult InvokeCatalogTableUpdateFunctionGet(
     const std::string &worker_path, const std::vector<uint8_t> &attach_id, const std::string &schema_name,
-    const std::string &table_name, ClientContext &context, bool worker_debug, bool use_pool) {
+    const std::string &table_name, ClientContext &context,
+    const std::vector<uint8_t> &transaction_id, bool worker_debug, bool use_pool) {
 	return InvokeCatalogTableWriteFunctionGet(worker_path, "catalog_table_update_function_get",
-	                                          attach_id, schema_name, table_name, context, worker_debug, use_pool);
+	                                          attach_id, schema_name, table_name, context, transaction_id,
+	                                          worker_debug, use_pool);
 }
 
 VgiWriteFunctionResult InvokeCatalogTableDeleteFunctionGet(
     const std::string &worker_path, const std::vector<uint8_t> &attach_id, const std::string &schema_name,
-    const std::string &table_name, ClientContext &context, bool worker_debug, bool use_pool) {
+    const std::string &table_name, ClientContext &context,
+    const std::vector<uint8_t> &transaction_id, bool worker_debug, bool use_pool) {
 	return InvokeCatalogTableWriteFunctionGet(worker_path, "catalog_table_delete_function_get",
-	                                          attach_id, schema_name, table_name, context, worker_debug, use_pool);
+	                                          attach_id, schema_name, table_name, context, transaction_id,
+	                                          worker_debug, use_pool);
 }
 
 // ============================================================================
@@ -403,6 +420,224 @@ void InvokeCatalogTransactionRollback(
     ClientContext &context, bool worker_debug, bool use_pool) {
 	auto params = BuildTransactionParams(attach_id, transaction_id);
 	InvokeRpcMethod(worker_path, "catalog_transaction_rollback", params, context, worker_debug, use_pool);
+}
+
+// ============================================================================
+// DDL Operations
+// ============================================================================
+
+void InvokeCatalogTableCreate(
+    const std::string &worker_path, const std::vector<uint8_t> &attach_id,
+    const std::string &schema_name, const std::string &table_name,
+    const std::shared_ptr<arrow::Schema> &columns_schema,
+    const std::string &on_conflict,
+    const std::vector<int> &not_null_constraints,
+    const std::vector<std::vector<int>> &unique_constraints,
+    const std::vector<std::string> &check_constraints,
+    const std::vector<std::vector<int>> &primary_key_constraints,
+    const std::vector<std::vector<uint8_t>> &foreign_key_constraints,
+    const std::vector<uint8_t> &transaction_id,
+    ClientContext &context, bool worker_debug, bool use_pool) {
+	auto params = BuildTableCreateParams(attach_id, schema_name, table_name, columns_schema, on_conflict,
+	                                     not_null_constraints, unique_constraints, check_constraints,
+	                                     primary_key_constraints, foreign_key_constraints, transaction_id);
+	InvokeRpcMethod(worker_path, "catalog_table_create", params, context, worker_debug, use_pool);
+}
+
+void InvokeCatalogTableDrop(
+    const std::string &worker_path, const std::vector<uint8_t> &attach_id,
+    const std::string &schema_name, const std::string &table_name,
+    bool ignore_not_found, const std::vector<uint8_t> &transaction_id,
+    ClientContext &context, bool worker_debug, bool use_pool) {
+	auto params = BuildTableDropParams(attach_id, schema_name, table_name, ignore_not_found, transaction_id);
+	InvokeRpcMethod(worker_path, "catalog_table_drop", params, context, worker_debug, use_pool);
+}
+
+void InvokeCatalogTableRename(
+    const std::string &worker_path, const std::vector<uint8_t> &attach_id,
+    const std::string &schema_name, const std::string &table_name,
+    const std::string &new_name, bool ignore_not_found,
+    const std::vector<uint8_t> &transaction_id,
+    ClientContext &context, bool worker_debug, bool use_pool) {
+	auto params = BuildTableRenameParams(attach_id, schema_name, table_name, new_name, ignore_not_found, transaction_id);
+	InvokeRpcMethod(worker_path, "catalog_table_rename", params, context, worker_debug, use_pool);
+}
+
+void InvokeCatalogTableColumnAdd(
+    const std::string &worker_path, const std::vector<uint8_t> &attach_id,
+    const std::string &schema_name, const std::string &table_name,
+    const std::shared_ptr<arrow::Schema> &column_definition,
+    bool if_column_not_exists, const std::vector<uint8_t> &transaction_id,
+    ClientContext &context, bool worker_debug, bool use_pool) {
+	auto column_bytes = SerializeSchemaToIpcBytes(column_definition);
+	auto params = BuildTableColumnAddParams(attach_id, schema_name, table_name, column_bytes,
+	                                        if_column_not_exists, false /* ignore_not_found */, transaction_id);
+	InvokeRpcMethod(worker_path, "catalog_table_column_add", params, context, worker_debug, use_pool);
+}
+
+void InvokeCatalogTableColumnDrop(
+    const std::string &worker_path, const std::vector<uint8_t> &attach_id,
+    const std::string &schema_name, const std::string &table_name,
+    const std::string &column_name, bool if_column_exists, bool cascade,
+    const std::vector<uint8_t> &transaction_id,
+    ClientContext &context, bool worker_debug, bool use_pool) {
+	auto params = BuildTableColumnDropParams(attach_id, schema_name, table_name, column_name,
+	                                         if_column_exists, false /* ignore_not_found */, cascade, transaction_id);
+	InvokeRpcMethod(worker_path, "catalog_table_column_drop", params, context, worker_debug, use_pool);
+}
+
+void InvokeCatalogTableColumnRename(
+    const std::string &worker_path, const std::vector<uint8_t> &attach_id,
+    const std::string &schema_name, const std::string &table_name,
+    const std::string &old_column_name, const std::string &new_column_name,
+    const std::vector<uint8_t> &transaction_id,
+    ClientContext &context, bool worker_debug, bool use_pool) {
+	auto params = BuildTableColumnRenameParams(attach_id, schema_name, table_name, old_column_name, new_column_name,
+	                                           false /* ignore_not_found */, transaction_id);
+	InvokeRpcMethod(worker_path, "catalog_table_column_rename", params, context, worker_debug, use_pool);
+}
+
+void InvokeCatalogTableCommentSet(
+    const std::string &worker_path, const std::vector<uint8_t> &attach_id,
+    const std::string &schema_name, const std::string &table_name,
+    const std::string &comment, bool comment_is_null,
+    bool ignore_not_found, const std::vector<uint8_t> &transaction_id,
+    ClientContext &context, bool worker_debug, bool use_pool) {
+	auto params = BuildTableCommentSetParams(attach_id, schema_name, table_name, comment, comment_is_null,
+	                                          ignore_not_found, transaction_id);
+	InvokeRpcMethod(worker_path, "catalog_table_comment_set", params, context, worker_debug, use_pool);
+}
+
+void InvokeCatalogTableColumnCommentSet(
+    const std::string &worker_path, const std::vector<uint8_t> &attach_id,
+    const std::string &schema_name, const std::string &table_name,
+    const std::string &column_name,
+    const std::string &comment, bool comment_is_null,
+    bool ignore_not_found, const std::vector<uint8_t> &transaction_id,
+    ClientContext &context, bool worker_debug, bool use_pool) {
+	auto params = BuildTableColumnCommentSetParams(attach_id, schema_name, table_name, column_name,
+	                                                comment, comment_is_null, ignore_not_found, transaction_id);
+	InvokeRpcMethod(worker_path, "catalog_table_column_comment_set", params, context, worker_debug, use_pool);
+}
+
+void InvokeCatalogTableColumnTypeChange(
+    const std::string &worker_path, const std::vector<uint8_t> &attach_id,
+    const std::string &schema_name, const std::string &table_name,
+    const std::shared_ptr<arrow::Schema> &column_definition,
+    const std::string &expression,
+    const std::vector<uint8_t> &transaction_id,
+    ClientContext &context, bool worker_debug, bool use_pool) {
+	auto column_bytes = SerializeSchemaToIpcBytes(column_definition);
+	auto params = BuildTableColumnTypeChangeParams(attach_id, schema_name, table_name, column_bytes,
+	                                               expression, false /* ignore_not_found */, transaction_id);
+	InvokeRpcMethod(worker_path, "catalog_table_column_type_change", params, context, worker_debug, use_pool);
+}
+
+void InvokeCatalogTableColumnDefaultSet(
+    const std::string &worker_path, const std::vector<uint8_t> &attach_id,
+    const std::string &schema_name, const std::string &table_name,
+    const std::string &column_name, const std::string &expression,
+    const std::vector<uint8_t> &transaction_id,
+    ClientContext &context, bool worker_debug, bool use_pool) {
+	auto params = BuildTableColumnDefaultSetParams(attach_id, schema_name, table_name, column_name,
+	                                               expression, false /* ignore_not_found */, transaction_id);
+	InvokeRpcMethod(worker_path, "catalog_table_column_default_set", params, context, worker_debug, use_pool);
+}
+
+void InvokeCatalogTableColumnDefaultDrop(
+    const std::string &worker_path, const std::vector<uint8_t> &attach_id,
+    const std::string &schema_name, const std::string &table_name,
+    const std::string &column_name,
+    const std::vector<uint8_t> &transaction_id,
+    ClientContext &context, bool worker_debug, bool use_pool) {
+	auto params = BuildTableColumnDefaultDropParams(attach_id, schema_name, table_name, column_name,
+	                                                false /* ignore_not_found */, transaction_id);
+	InvokeRpcMethod(worker_path, "catalog_table_column_default_drop", params, context, worker_debug, use_pool);
+}
+
+void InvokeCatalogTableNotNullSet(
+    const std::string &worker_path, const std::vector<uint8_t> &attach_id,
+    const std::string &schema_name, const std::string &table_name,
+    const std::string &column_name,
+    const std::vector<uint8_t> &transaction_id,
+    ClientContext &context, bool worker_debug, bool use_pool) {
+	auto params = BuildTableNotNullSetParams(attach_id, schema_name, table_name, column_name,
+	                                         false /* ignore_not_found */, transaction_id);
+	InvokeRpcMethod(worker_path, "catalog_table_not_null_set", params, context, worker_debug, use_pool);
+}
+
+void InvokeCatalogTableNotNullDrop(
+    const std::string &worker_path, const std::vector<uint8_t> &attach_id,
+    const std::string &schema_name, const std::string &table_name,
+    const std::string &column_name,
+    const std::vector<uint8_t> &transaction_id,
+    ClientContext &context, bool worker_debug, bool use_pool) {
+	auto params = BuildTableNotNullDropParams(attach_id, schema_name, table_name, column_name,
+	                                          false /* ignore_not_found */, transaction_id);
+	InvokeRpcMethod(worker_path, "catalog_table_not_null_drop", params, context, worker_debug, use_pool);
+}
+
+// ============================================================================
+// View DDL Operations
+// ============================================================================
+
+void InvokeCatalogViewCreate(
+    const std::string &worker_path, const std::vector<uint8_t> &attach_id,
+    const std::string &schema_name, const std::string &view_name,
+    const std::string &definition, const std::string &on_conflict,
+    const std::vector<uint8_t> &transaction_id,
+    ClientContext &context, bool worker_debug, bool use_pool) {
+	auto params = BuildViewCreateParams(attach_id, schema_name, view_name, definition, on_conflict, transaction_id);
+	InvokeRpcMethod(worker_path, "catalog_view_create", params, context, worker_debug, use_pool);
+}
+
+void InvokeCatalogViewDrop(
+    const std::string &worker_path, const std::vector<uint8_t> &attach_id,
+    const std::string &schema_name, const std::string &view_name,
+    bool ignore_not_found, const std::vector<uint8_t> &transaction_id,
+    ClientContext &context, bool worker_debug, bool use_pool) {
+	auto params = BuildViewDropParams(attach_id, schema_name, view_name, ignore_not_found, transaction_id);
+	InvokeRpcMethod(worker_path, "catalog_view_drop", params, context, worker_debug, use_pool);
+}
+
+void InvokeCatalogViewRename(
+    const std::string &worker_path, const std::vector<uint8_t> &attach_id,
+    const std::string &schema_name, const std::string &view_name,
+    const std::string &new_name, bool ignore_not_found,
+    const std::vector<uint8_t> &transaction_id,
+    ClientContext &context, bool worker_debug, bool use_pool) {
+	auto params = BuildViewRenameParams(attach_id, schema_name, view_name, new_name, ignore_not_found, transaction_id);
+	InvokeRpcMethod(worker_path, "catalog_view_rename", params, context, worker_debug, use_pool);
+}
+
+void InvokeCatalogViewCommentSet(
+    const std::string &worker_path, const std::vector<uint8_t> &attach_id,
+    const std::string &schema_name, const std::string &view_name,
+    const std::string &comment, bool comment_is_null,
+    bool ignore_not_found, const std::vector<uint8_t> &transaction_id,
+    ClientContext &context, bool worker_debug, bool use_pool) {
+	auto params = BuildViewCommentSetParams(attach_id, schema_name, view_name, comment, comment_is_null,
+	                                         ignore_not_found, transaction_id);
+	InvokeRpcMethod(worker_path, "catalog_view_comment_set", params, context, worker_debug, use_pool);
+}
+
+void InvokeCatalogSchemaCreate(
+    const std::string &worker_path, const std::vector<uint8_t> &attach_id,
+    const std::string &schema_name, const std::string &on_conflict,
+    const std::vector<uint8_t> &transaction_id,
+    ClientContext &context, bool worker_debug, bool use_pool) {
+	auto params = BuildSchemaCreateParams(attach_id, schema_name, on_conflict,
+	                                       "" /* comment */, true /* comment_is_null */, transaction_id);
+	InvokeRpcMethod(worker_path, "catalog_schema_create", params, context, worker_debug, use_pool);
+}
+
+void InvokeCatalogSchemaDrop(
+    const std::string &worker_path, const std::vector<uint8_t> &attach_id,
+    const std::string &schema_name, bool ignore_not_found, bool cascade,
+    const std::vector<uint8_t> &transaction_id,
+    ClientContext &context, bool worker_debug, bool use_pool) {
+	auto params = BuildSchemaDropParams(attach_id, schema_name, ignore_not_found, cascade, transaction_id);
+	InvokeRpcMethod(worker_path, "catalog_schema_drop", params, context, worker_debug, use_pool);
 }
 
 // ============================================================================

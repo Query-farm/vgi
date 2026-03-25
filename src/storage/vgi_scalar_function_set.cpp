@@ -11,6 +11,7 @@
 
 #include "storage/vgi_catalog.hpp"
 #include "storage/vgi_schema_entry.hpp"
+#include "storage/vgi_transaction.hpp"
 #include "vgi_arrow_utils.hpp"
 #include "vgi_catalog_api.hpp"
 #include "vgi_scalar_function_impl.hpp"
@@ -39,8 +40,10 @@ void VgiScalarFunctionSet::LoadEntries(ClientContext &context) {
 
 	// Call catalog_schema_contents_functions via RPC for scalar functions
 	auto worker_path = attach_params->worker_path();
+	auto &vgi_tx_load = VgiTransaction::Get(context, catalog_);
 	auto function_list = vgi::InvokeCatalogSchemaContentsFunctions(worker_path, attach_result->attach_id, schema_.name,
 	                                                               "SCALAR_FUNCTION", context,
+	                                                               vgi_tx_load.GetTransactionId(),
 	                                                               attach_params->worker_debug(),
 	                                                               attach_params->use_pool());
 

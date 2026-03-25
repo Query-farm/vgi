@@ -1,0 +1,264 @@
+# name: test/sql/integration/table/writable_view.test
+# description: Tests for CREATE VIEW, DROP VIEW, ALTER VIEW RENAME, COMMENT ON VIEW
+# group: [vgi_integration_table]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'writable' AS writable (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# Setup: base table for views
+# ============================================================================
+
+statement ok
+CREATE TABLE writable.main.view_base (id BIGINT, name VARCHAR, score DOUBLE);
+
+statement ok
+INSERT INTO writable.main.view_base VALUES (1, 'alice', 95.0), (2, 'bob', 80.0), (3, 'charlie', 70.0);
+
+# ============================================================================
+# CREATE VIEW — verify data is queryable through the view
+# ============================================================================
+
+statement ok
+CREATE VIEW writable.main.test_view AS SELECT id, name FROM writable.main.view_base WHERE score >= 80;
+
+query IT
+SELECT id, name FROM writable.main.test_view ORDER BY id;
+----
+1	alice
+2	bob
+
+query I
+SELECT COUNT(*) FROM writable.main.test_view;
+----
+2
+
+# ============================================================================
+# View reflects live data — insert into base table, verify view updates
+# ============================================================================
+
+statement ok
+INSERT INTO writable.main.view_base VALUES (4, 'diana', 90.0);
+
+query I
+SELECT COUNT(*) FROM writable.main.test_view;
+----
+3
+
+# ============================================================================
+# CREATE VIEW IF NOT EXISTS — no error on duplicate, view unchanged
+# ============================================================================
+
+statement ok
+CREATE VIEW IF NOT EXISTS writable.main.test_view AS SELECT 1;
+
+# View is unchanged (still the original definition)
+query I
+SELECT COUNT(*) FROM writable.main.test_view;
+----
+3
+
+# ============================================================================
+# CREATE OR REPLACE VIEW — verify definition changes
+# ============================================================================
+
+statement ok
+CREATE OR REPLACE VIEW writable.main.test_view AS SELECT name, score FROM writable.main.view_base ORDER BY score DESC;
+
+query T
+SELECT name FROM writable.main.test_view LIMIT 1;
+----
+alice
+
+# All 4 rows visible (no filter in new definition)
+query I
+SELECT COUNT(*) FROM writable.main.test_view;
+----
+4
+
+# ============================================================================
+# ALTER VIEW RENAME — accessible under new name, old name errors
+# ============================================================================
+
+statement ok
+ALTER VIEW writable.main.test_view RENAME TO renamed_view;
+
+query I
+SELECT COUNT(*) FROM writable.main.renamed_view;
+----
+4
+
+statement error
+SELECT * FROM writable.main.test_view;
+----
+
+# ============================================================================
+# DROP VIEW — verify gone
+# ============================================================================
+
+statement ok
+DROP VIEW writable.main.renamed_view;
+
+statement error
+SELECT * FROM writable.main.renamed_view;
+----
+
+# ============================================================================
+# DROP VIEW IF EXISTS — no error on nonexistent
+# ============================================================================
+
+statement ok
+DROP VIEW IF EXISTS writable.main.nonexistent_view;
+
+# ============================================================================
+# COMMENT ON VIEW — set and clear, view still works
+# ============================================================================
+
+statement ok
+CREATE VIEW writable.main.comment_view AS SELECT id FROM writable.main.view_base;
+
+statement ok
+COMMENT ON VIEW writable.main.comment_view IS 'A commented view';
+
+statement ok
+COMMENT ON VIEW writable.main.comment_view IS NULL;
+
+query I
+SELECT COUNT(*) FROM writable.main.comment_view;
+----
+4
+
+statement ok
+DROP VIEW writable.main.comment_view;
+
+# ============================================================================
+# Nested views — view on a view
+# ============================================================================
+
+statement ok
+CREATE VIEW writable.main.v1 AS SELECT id, name FROM writable.main.view_base;
+
+statement ok
+CREATE VIEW writable.main.v2 AS SELECT name FROM writable.main.v1 WHERE id <= 2;
+
+query I
+SELECT COUNT(*) FROM writable.main.v2;
+----
+2
+
+query T
+SELECT name FROM writable.main.v2 ORDER BY name;
+----
+alice
+bob
+
+statement ok
+DROP VIEW writable.main.v2;
+
+statement ok
+DROP VIEW writable.main.v1;
+
+# ============================================================================
+# View with aggregation
+# ============================================================================
+
+statement ok
+CREATE VIEW writable.main.agg_view AS SELECT COUNT(*) AS cnt, AVG(score) AS avg_score FROM writable.main.view_base;
+
+query I
+SELECT cnt FROM writable.main.agg_view;
+----
+4
+
+statement ok
+DROP VIEW writable.main.agg_view;
+
+# ============================================================================
+# View with expressions and aliases
+# ============================================================================
+
+statement ok
+CREATE VIEW writable.main.expr_view AS SELECT id, name, score * 2 AS double_score, score >= 80 AS passing FROM writable.main.view_base;
+
+query ITRT
+SELECT id, name, double_score, passing FROM writable.main.expr_view WHERE id = 1;
+----
+1	alice	190.0	true
+
+statement ok
+DROP VIEW writable.main.expr_view;
+
+# ============================================================================
+# Multiple views on same table — independent lifecycle
+# ============================================================================
+
+statement ok
+CREATE VIEW writable.main.v_names AS SELECT name FROM writable.main.view_base;
+
+statement ok
+CREATE VIEW writable.main.v_scores AS SELECT id, score FROM writable.main.view_base;
+
+query I
+SELECT COUNT(*) FROM writable.main.v_names;
+----
+4
+
+query I
+SELECT COUNT(*) FROM writable.main.v_scores;
+----
+4
+
+# Drop one, other still works
+statement ok
+DROP VIEW writable.main.v_names;
+
+query I
+SELECT COUNT(*) FROM writable.main.v_scores;
+----
+4
+
+statement ok
+DROP VIEW writable.main.v_scores;
+
+# ============================================================================
+# View metadata visible in duckdb_views()
+# ============================================================================
+
+statement ok
+CREATE VIEW writable.main.meta_view AS SELECT id, name FROM writable.main.view_base;
+
+query T
+SELECT view_name FROM duckdb_views() WHERE database_name = 'writable' AND view_name = 'meta_view';
+----
+meta_view
+
+statement ok
+DROP VIEW writable.main.meta_view;
+
+# ============================================================================
+# Cleanup base table
+# ============================================================================
+
+statement ok
+DROP TABLE writable.main.view_base;
+
+# ============================================================================
+# Static tables still work (regression)
+# ============================================================================
+
+statement ok
+INSERT INTO writable.main.writable_data VALUES (99985, 'view_test_ok');
+
+query T
+SELECT name FROM writable.main.writable_data WHERE id = 99985;
+----
+view_test_ok
+
+statement ok
+DELETE FROM writable.main.writable_data WHERE id = 99985;

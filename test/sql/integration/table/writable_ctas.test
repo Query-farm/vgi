@@ -1,0 +1,69 @@
+# name: test/sql/integration/table/writable_ctas.test
+# description: Tests for CREATE TABLE AS SELECT on VGI writable catalogs
+# group: [vgi_integration_table]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'writable' AS writable (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# CREATE TABLE AS SELECT — from values
+# ============================================================================
+
+statement ok
+CREATE TABLE writable.main.ctas_test AS SELECT 42 AS val, 'hello' AS label;
+
+query I
+SELECT COUNT(*) FROM writable.main.ctas_test;
+----
+1
+
+# CTAS table supports INSERT
+statement ok
+INSERT INTO writable.main.ctas_test VALUES (99, 'world');
+
+query I
+SELECT COUNT(*) FROM writable.main.ctas_test;
+----
+2
+
+statement ok
+DROP TABLE writable.main.ctas_test;
+
+# ============================================================================
+# CREATE TABLE AS SELECT — from range
+# ============================================================================
+
+statement ok
+CREATE TABLE writable.main.ctas_range AS SELECT i AS id, 'row_' || i::VARCHAR AS name FROM range(1, 6) t(i);
+
+query I
+SELECT COUNT(*) FROM writable.main.ctas_range;
+----
+5
+
+statement ok
+DROP TABLE writable.main.ctas_range;
+
+# ============================================================================
+# CTAS IF NOT EXISTS — table exists, no data inserted
+# ============================================================================
+
+statement ok
+CREATE TABLE writable.main.ctas_exists (id BIGINT);
+
+statement ok
+CREATE TABLE IF NOT EXISTS writable.main.ctas_exists AS SELECT 42 AS id;
+
+query I
+SELECT COUNT(*) FROM writable.main.ctas_exists;
+----
+0
+
+statement ok
+DROP TABLE writable.main.ctas_exists;

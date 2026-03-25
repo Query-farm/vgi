@@ -93,6 +93,18 @@ void ArrowSchemaToColumnList(ClientContext &context, const std::shared_ptr<arrow
 	}
 }
 
+std::shared_ptr<arrow::Schema> DuckDBColumnsToArrowSchema(ClientContext &context, const ColumnList &columns) {
+	vector<LogicalType> types;
+	vector<string> names;
+
+	for (auto &col : columns.Logical()) {
+		types.push_back(col.GetType());
+		names.push_back(col.GetName());
+	}
+
+	return BuildArrowSchemaFromDuckDB(context, types, names);
+}
+
 // ============================================================================
 // DuckDB DataChunk / Type to Arrow Conversion
 // ============================================================================

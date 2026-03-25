@@ -8,13 +8,76 @@
 #include "duckdb/parser/parser.hpp"
 
 #include "storage/vgi_catalog.hpp"
+#include "storage/vgi_transaction.hpp"
 #include "storage/vgi_schema_entry.hpp"
 #include "vgi_catalog_api.hpp"
 #include "vgi_logging.hpp"
 
 namespace duckdb {
 
+static unique_ptr<ViewCatalogEntry> CreateViewEntryFromInfo(Catalog &catalog, SchemaCatalogEntry &schema,
+                                                             const vgi::VgiViewInfo &view_info) {
+	CreateViewInfo info;
+	info.view_name = view_info.name;
+	info.sql = view_info.definition;
+	if (!view_info.comment.empty()) {
+		info.comment = Value(view_info.comment);
+	}
+	for (auto &[key, val] : view_info.tags) {
+		info.tags[key] = val;
+	}
+	// Parse SQL to get SelectStatement
+	try {
+		Parser parser;
+		parser.ParseQuery(view_info.definition);
+		if (!parser.statements.empty() && parser.statements[0]->type == StatementType::SELECT_STATEMENT) {
+			info.query = unique_ptr_cast<SQLStatement, SelectStatement>(std::move(parser.statements[0]));
+		}
+	} catch (const std::exception &e) {
+		VGI_STDERR_DEBUG("[VGI] view.parse_warning name=%s error=%s\n", view_info.name.c_str(), e.what());
+	} catch (...) {
+		VGI_STDERR_DEBUG("[VGI] view.parse_warning name=%s error=unknown\n", view_info.name.c_str());
+	}
+	return make_uniq<ViewCatalogEntry>(catalog, schema, info);
+}
+
 VgiViewSet::VgiViewSet(Catalog &catalog, VgiSchemaEntry &schema) : VgiCatalogSet(catalog), schema_(schema) {
+}
+
+optional_ptr<CatalogEntry> VgiViewSet::GetEntry(ClientContext &context, const std::string &name) {
+	std::lock_guard<std::mutex> lock(entry_lock_);
+
+	// Check if we have the entry cached
+	auto it = GetEntries().find(name);
+	if (it != GetEntries().end()) {
+		return it->second.get();
+	}
+
+	// Load this specific view from the worker
+	auto &vgi_catalog = catalog_.Cast<VgiCatalog>();
+	auto &attach_params = vgi_catalog.attach_parameters();
+	auto &attach_result = vgi_catalog.attach_result();
+
+	if (!attach_params || !attach_result) {
+		return nullptr;
+	}
+
+	auto &vgi_tx = VgiTransaction::Get(context, catalog_);
+	auto view_info_opt = vgi::InvokeCatalogViewGet(attach_params->worker_path(), attach_result->attach_id,
+	                                                schema_.name, name, context, vgi_tx.GetTransactionId(),
+	                                                attach_params->worker_debug(),
+	                                                attach_params->use_pool());
+
+	if (!view_info_opt) {
+		return nullptr;
+	}
+
+	auto &view_info = *view_info_opt;
+	auto view_entry = CreateViewEntryFromInfo(catalog_, schema_, view_info);
+	auto result = view_entry.get();
+	GetEntries()[name] = std::move(view_entry);
+
+	return result;
 }
 
 void VgiViewSet::LoadEntries(ClientContext &context) {
@@ -27,37 +90,14 @@ void VgiViewSet::LoadEntries(ClientContext &context) {
 	}
 
 	// Call catalog_schema_contents_views via RPC
+	auto &vgi_tx_load = VgiTransaction::Get(context, catalog_);
 	auto views = vgi::InvokeCatalogSchemaContentsViews(attach_params->worker_path(), attach_result->attach_id,
-	                                                   schema_.name, context, attach_params->worker_debug(),
+	                                                   schema_.name, context, vgi_tx_load.GetTransactionId(),
+	                                                   attach_params->worker_debug(),
 	                                                   attach_params->use_pool());
 
 	for (auto &view_info : views) {
-		CreateViewInfo info;
-		info.view_name = view_info.name;
-		info.sql = view_info.definition;
-		if (!view_info.comment.empty()) {
-			info.comment = Value(view_info.comment);
-		}
-		for (auto &[key, val] : view_info.tags) {
-			info.tags[key] = val;
-		}
-
-		// Parse the SQL to get the select statement
-		try {
-			Parser parser;
-			parser.ParseQuery(view_info.definition);
-			if (!parser.statements.empty() && parser.statements[0]->type == StatementType::SELECT_STATEMENT) {
-				info.query = unique_ptr_cast<SQLStatement, SelectStatement>(std::move(parser.statements[0]));
-			}
-		} catch (const std::exception &e) {
-			VGI_STDERR_DEBUG("[VGI] view.parse_warning name=%s error=%s\n",
-			                 view_info.name.c_str(), e.what());
-		} catch (...) {
-			VGI_STDERR_DEBUG("[VGI] view.parse_warning name=%s error=unknown\n",
-			                 view_info.name.c_str());
-		}
-
-		auto view_entry = make_uniq<ViewCatalogEntry>(catalog_, schema_, info);
+		auto view_entry = CreateViewEntryFromInfo(catalog_, schema_, view_info);
 		CreateEntryLocked(std::move(view_entry));
 	}
 }

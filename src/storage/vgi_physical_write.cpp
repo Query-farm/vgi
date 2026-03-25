@@ -70,12 +70,16 @@ static std::unique_ptr<IFunctionConnection> SetupWriteConnection(ClientContext &
 	auto &attach_result = catalog.attach_result();
 
 	// Pass write_options as a named argument (serialized as binary)
+	// Include positional arguments from the write function result (e.g., table_name for generic functions)
 	vector<std::pair<string, Value>> named_args;
 	if (write_options) {
 		auto options_bytes = SerializeToIpcBytes(write_options);
 		named_args.emplace_back("write_options", Value::BLOB(options_bytes.data(), options_bytes.size()));
 	}
-	auto arguments = BuildArgumentsFromValues(context, {}, named_args);
+	for (auto &[k, v] : write_func.named_arguments) {
+		named_args.emplace_back(k, v);
+	}
+	auto arguments = BuildArgumentsFromValues(context, write_func.positional_arguments, named_args);
 
 	// Try to reuse a pooled worker connection (subprocess transport only).
 	std::unique_ptr<IFunctionConnection> connection;
@@ -125,8 +129,11 @@ static idx_t FinalizeWriteConnection(VgiWriteGlobalState &gstate) {
 	idx_t total = 0;
 	while (true) {
 		auto batch = gstate.connection->ReadDataBatch();
-		if (!batch || batch->num_rows() == 0) {
-			break;
+		if (!batch) {
+			break; // EOS = null batch from IPC reader
+		}
+		if (batch->num_rows() == 0) {
+			continue; // 0-row batch = valid "no output", not EOS
 		}
 		total += ReadCountFromBatch(batch);
 	}
@@ -179,33 +186,65 @@ static SourceResultType WriteGetDataInternal(VgiWriteGlobalState &gstate, VgiWri
 VgiPhysicalInsert::VgiPhysicalInsert(PhysicalPlan &plan, LogicalInsert &op, VgiTableEntry &table_p,
                                      bool return_chunk_p, OnConflictAction action_type_p,
                                      unordered_set<column_t> on_conflict_filter_p)
-    : PhysicalOperator(plan, PhysicalOperatorType::EXTENSION, op.types, op.estimated_cardinality), table(table_p),
+    : PhysicalOperator(plan, PhysicalOperatorType::EXTENSION, op.types, op.estimated_cardinality),
+      insert_table(&table_p),
       return_chunk(return_chunk_p), action_type(action_type_p), on_conflict_filter(std::move(on_conflict_filter_p)) {
 }
 
 VgiPhysicalInsert::VgiPhysicalInsert(PhysicalPlan &plan, LogicalOperator &op, VgiTableEntry &table_p,
                                      bool return_chunk_p)
-    : PhysicalOperator(plan, PhysicalOperatorType::EXTENSION, op.types, op.estimated_cardinality), table(table_p),
+    : PhysicalOperator(plan, PhysicalOperatorType::EXTENSION, op.types, op.estimated_cardinality),
+      insert_table(&table_p),
       return_chunk(return_chunk_p), action_type(OnConflictAction::THROW) {
+}
+
+VgiPhysicalInsert::VgiPhysicalInsert(PhysicalPlan &plan, LogicalOperator &op, SchemaCatalogEntry &schema_p,
+                                     unique_ptr<BoundCreateTableInfo> create_info_p)
+    : PhysicalOperator(plan, PhysicalOperatorType::CREATE_TABLE_AS, op.types, op.estimated_cardinality),
+      schema(&schema_p), create_info(std::move(create_info_p)),
+      return_chunk(false), action_type(OnConflictAction::THROW) {
 }
 
 InsertionOrderPreservingMap<string> VgiPhysicalInsert::ParamsToString() const {
 	InsertionOrderPreservingMap<string> result;
-	result["Table"] = table.name;
+	if (insert_table) {
+		result["Table"] = insert_table->name;
+	} else if (create_info) {
+		result["Table"] = create_info->base->Cast<CreateTableInfo>().table;
+	}
 	return result;
 }
 
 unique_ptr<GlobalSinkState> VgiPhysicalInsert::GetGlobalSinkState(ClientContext &context) const {
-	auto &catalog = table.GetCatalog().Cast<VgiCatalog>();
+	optional_ptr<VgiTableEntry> table;
+	if (create_info) {
+		// CREATE TABLE AS: create the table now (inside the transaction)
+		auto &schema_ref = *schema.get_mutable();
+		auto result = schema_ref.CreateTable(schema_ref.GetCatalogTransaction(context), *create_info);
+		if (!result) {
+			// IF NOT EXISTS and table already exists — return empty result
+			auto gstate = make_uniq<VgiWriteGlobalState>(context, GetTypes(), false);
+			gstate->changed_count = 0;
+			return unique_ptr<GlobalSinkState>(gstate.release());
+		}
+		table = &result->Cast<VgiTableEntry>();
+	} else {
+		D_ASSERT(insert_table);
+		table = insert_table;
+	}
+
+	auto &catalog = table->GetCatalog().Cast<VgiCatalog>();
 	auto &params = catalog.attach_parameters();
 	auto &attach_result = catalog.attach_result();
 
+	auto &vgi_tx = VgiTransaction::Get(context, table->GetCatalog());
 	auto write_func = InvokeCatalogTableInsertFunctionGet(params->worker_path(), attach_result->attach_id,
-	                                                      table.GetTableInfo().schema_name, table.GetTableInfo().name,
-	                                                      context, params->worker_debug(), params->use_pool());
+	                                                      table->GetTableInfo().schema_name, table->GetTableInfo().name,
+	                                                      context, vgi_tx.GetTransactionId(),
+	                                                      params->worker_debug(), params->use_pool());
 
 	// Build input schema (table columns minus row_id)
-	auto &table_info = table.GetTableInfo();
+	auto &table_info = table->GetTableInfo();
 	auto input_schema = table_info.arrow_schema;
 	if (table_info.row_id_column >= 0) {
 		auto fields = input_schema->fields();
@@ -216,16 +255,14 @@ unique_ptr<GlobalSinkState> VgiPhysicalInsert::GetGlobalSinkState(ClientContext 
 	// Build conflict target column names from column IDs
 	vector<string> conflict_columns;
 	for (auto col_id : on_conflict_filter) {
-		conflict_columns.push_back(table.GetColumns().GetColumn(PhysicalIndex(col_id)).Name());
+		conflict_columns.push_back(table->GetColumns().GetColumn(PhysicalIndex(col_id)).Name());
 	}
 
 	auto write_options = BuildWriteOptions(return_chunk, action_type, conflict_columns);
 
-	auto &vgi_tx = VgiTransaction::Get(context, table.GetCatalog());
-
 	auto gstate = make_uniq<VgiWriteGlobalState>(context, GetTypes(), return_chunk);
 	gstate->send_schema = input_schema;
-	gstate->connection = SetupWriteConnection(context, table, write_func, input_schema, write_options,
+	gstate->connection = SetupWriteConnection(context, *table, write_func, input_schema, write_options,
 	                                           vgi_tx.GetTransactionId());
 
 	return unique_ptr<GlobalSinkState>(gstate.release());
@@ -233,18 +270,29 @@ unique_ptr<GlobalSinkState> VgiPhysicalInsert::GetGlobalSinkState(ClientContext 
 
 unique_ptr<LocalSinkState> VgiPhysicalInsert::GetLocalSinkState(ExecutionContext &context) const {
 	// Build response schema (table columns sans row_id) for RETURNING Arrow→DuckDB conversion
-	auto &table_info = table.GetTableInfo();
-	auto response_schema = table_info.arrow_schema;
-	if (table_info.row_id_column >= 0) {
-		auto fields = response_schema->fields();
-		fields.erase(fields.begin() + table_info.row_id_column);
-		response_schema = arrow::schema(fields);
+	// For CTAS, insert_table may be null (table created in GetGlobalSinkState), but
+	// return_chunk is always false so the response schema is only used for count output.
+	if (insert_table) {
+		auto &table_info = insert_table->GetTableInfo();
+		auto response_schema = table_info.arrow_schema;
+		if (table_info.row_id_column >= 0) {
+			auto fields = response_schema->fields();
+			fields.erase(fields.begin() + table_info.row_id_column);
+			response_schema = arrow::schema(fields);
+		}
+		return make_uniq<VgiWriteLocalSinkState>(context.client, response_schema, GetTypes());
 	}
-	return make_uniq<VgiWriteLocalSinkState>(context.client, response_schema, GetTypes());
+	// CTAS: use a minimal schema — RETURNING is never used for CTAS
+	auto empty_schema = arrow::schema({});
+	return make_uniq<VgiWriteLocalSinkState>(context.client, empty_schema, GetTypes());
 }
 
 SinkResultType VgiPhysicalInsert::Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const {
 	auto &gstate = input.global_state.Cast<VgiWriteGlobalState>();
+	if (!gstate.connection) {
+		// CTAS with IF NOT EXISTS and table already exists — discard input
+		return SinkResultType::FINISHED;
+	}
 	// Defaults are already resolved by DuckDB's PhysicalProjection child
 	// (inserted by ResolveDefaultsProjection in PlanInsert). The chunk
 	// arriving here has the full table column set with defaults filled in.
@@ -284,9 +332,11 @@ SinkResultType VgiPhysicalInsert::Sink(ExecutionContext &context, DataChunk &chu
 SinkFinalizeType VgiPhysicalInsert::Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
                                               OperatorSinkFinalizeInput &input) const {
 	auto &gstate = input.global_state.Cast<VgiWriteGlobalState>();
-	auto finalize_count = FinalizeWriteConnection(gstate);
-	D_ASSERT(!gstate.return_chunk || finalize_count == 0);
-	gstate.changed_count += finalize_count;
+	if (gstate.connection) {
+		auto finalize_count = FinalizeWriteConnection(gstate);
+		D_ASSERT(!gstate.return_chunk || finalize_count == 0);
+		gstate.changed_count += finalize_count;
+	}
 	return SinkFinalizeType::READY;
 }
 
@@ -328,15 +378,15 @@ unique_ptr<GlobalSinkState> VgiPhysicalDelete::GetGlobalSinkState(ClientContext 
 	auto &params = catalog.attach_parameters();
 	auto &attach_result = catalog.attach_result();
 
+	auto &vgi_tx = VgiTransaction::Get(context, table.GetCatalog());
 	auto write_func = InvokeCatalogTableDeleteFunctionGet(params->worker_path(), attach_result->attach_id,
 	                                                      table.GetTableInfo().schema_name, table.GetTableInfo().name,
-	                                                      context, params->worker_debug(), params->use_pool());
+	                                                      context, vgi_tx.GetTransactionId(),
+	                                                      params->worker_debug(), params->use_pool());
 
 	auto &table_info = table.GetTableInfo();
 	auto rowid_field = table_info.arrow_schema->field(table_info.row_id_column);
 	auto input_schema = arrow::schema({rowid_field});
-
-	auto &vgi_tx = VgiTransaction::Get(context, table.GetCatalog());
 
 	auto write_options = BuildWriteOptions(return_chunk, OnConflictAction::THROW, {});
 
@@ -444,9 +494,11 @@ unique_ptr<GlobalSinkState> VgiPhysicalUpdate::GetGlobalSinkState(ClientContext 
 	auto &params = catalog.attach_parameters();
 	auto &attach_result = catalog.attach_result();
 
+	auto &vgi_tx = VgiTransaction::Get(context, table.GetCatalog());
 	auto write_func = InvokeCatalogTableUpdateFunctionGet(params->worker_path(), attach_result->attach_id,
 	                                                      table.GetTableInfo().schema_name, table.GetTableInfo().name,
-	                                                      context, params->worker_debug(), params->use_pool());
+	                                                      context, vgi_tx.GetTransactionId(),
+	                                                      params->worker_debug(), params->use_pool());
 
 	auto &table_info = table.GetTableInfo();
 	auto &table_columns = table.GetColumns();
@@ -461,8 +513,6 @@ unique_ptr<GlobalSinkState> VgiPhysicalUpdate::GetGlobalSinkState(ClientContext 
 	send_fields.push_back(rowid_field);
 
 	auto input_schema = arrow::schema(send_fields);
-
-	auto &vgi_tx = VgiTransaction::Get(context, table.GetCatalog());
 
 	auto write_options = BuildWriteOptions(return_chunk, OnConflictAction::THROW, {});
 

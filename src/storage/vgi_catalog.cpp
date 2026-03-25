@@ -3,8 +3,11 @@
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/storage/database_size.hpp"
+#include "duckdb/catalog/catalog_transaction.hpp"
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
+#include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/parser/parsed_data/drop_info.hpp"
+#include "duckdb/planner/parsed_data/bound_create_table_info.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/execution/operator/persistent/physical_merge_into.hpp"
 #include "duckdb/planner/operator/logical_create_table.hpp"
@@ -16,6 +19,8 @@
 #include "storage/vgi_physical_write.hpp"
 #include "storage/vgi_schema_entry.hpp"
 #include "storage/vgi_table_entry.hpp"
+#include "storage/vgi_transaction.hpp"
+#include "vgi_catalog_api.hpp"
 
 namespace duckdb {
 
@@ -40,7 +45,23 @@ std::string VgiCatalog::GetDefaultSchema() const {
 }
 
 optional_ptr<CatalogEntry> VgiCatalog::CreateSchema(CatalogTransaction transaction, CreateSchemaInfo &info) {
-	throw BinderException("VGI catalogs are read-only");
+	if (access_mode_ == AccessMode::READ_ONLY) {
+		throw BinderException("Cannot CREATE SCHEMA in read-only VGI catalog '%s'", GetName());
+	}
+
+	auto &context = transaction.GetContext();
+	auto &vgi_tx = VgiTransaction::Get(context, *this);
+	auto transaction_id = vgi_tx.GetTransactionId();
+
+	auto on_conflict = vgi::MapOnConflict(info.on_conflict);
+
+	vgi::InvokeCatalogSchemaCreate(attach_parameters_->worker_path(), attach_result_->attach_id,
+	                                info.schema, on_conflict, transaction_id, context,
+	                                attach_parameters_->worker_debug(), attach_parameters_->use_pool());
+
+	// Invalidate schema cache so re-fetch picks up the new schema
+	schemas.ClearEntries();
+	return nullptr;
 }
 
 void VgiCatalog::ScanSchemas(ClientContext &context, std::function<void(SchemaCatalogEntry &)> callback) {
@@ -62,7 +83,11 @@ optional_ptr<SchemaCatalogEntry> VgiCatalog::LookupSchema(CatalogTransaction tra
 
 PhysicalOperator &VgiCatalog::PlanCreateTableAs(ClientContext &context, PhysicalPlanGenerator &planner,
                                                 LogicalCreateTable &op, PhysicalOperator &plan) {
-	throw BinderException("VGI catalogs are read-only");
+	// CREATE TABLE AS SELECT: create table at execution time (inside the transaction),
+	// then insert the SELECT results. Follows the Airport extension pattern.
+	auto &insert = planner.Make<VgiPhysicalInsert>(op, op.schema, std::move(op.info));
+	insert.children.push_back(plan);
+	return insert;
 }
 
 PhysicalOperator &VgiCatalog::PlanInsert(ClientContext &context, PhysicalPlanGenerator &planner, LogicalInsert &op,
@@ -224,7 +249,22 @@ void VgiCatalog::ClearCache() {
 }
 
 void VgiCatalog::DropSchema(ClientContext &context, DropInfo &info) {
-	throw BinderException("VGI catalogs are read-only");
+	if (access_mode_ == AccessMode::READ_ONLY) {
+		throw BinderException("Cannot DROP SCHEMA in read-only VGI catalog '%s'", GetName());
+	}
+
+	bool ignore_not_found = (info.if_not_found == OnEntryNotFound::RETURN_NULL);
+	bool cascade = (info.cascade);
+
+	auto &vgi_tx = VgiTransaction::Get(context, *this);
+	auto transaction_id = vgi_tx.GetTransactionId();
+
+	vgi::InvokeCatalogSchemaDrop(attach_parameters_->worker_path(), attach_result_->attach_id,
+	                              info.name, ignore_not_found, cascade, transaction_id,
+	                              context, attach_parameters_->worker_debug(), attach_parameters_->use_pool());
+
+	// Invalidate schema cache
+	schemas.ClearEntries();
 }
 
 } // namespace duckdb

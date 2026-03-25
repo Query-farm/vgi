@@ -120,6 +120,58 @@ std::vector<uint8_t> SerializeSchemaToIpcBytes(const std::shared_ptr<arrow::Sche
 	return std::vector<uint8_t>(buffer->data(), buffer->data() + buffer->size());
 }
 
+std::vector<uint8_t> SerializeForeignKeyToIpcBytes(const std::vector<std::string> &fk_columns,
+                                                    const std::vector<std::string> &pk_columns,
+                                                    const std::string &referenced_table,
+                                                    const std::string &referenced_schema) {
+	// Build a single-row batch matching the Python FK format:
+	// fk_columns: list<utf8>, pk_columns: list<utf8>, referenced_table: utf8, referenced_schema: utf8
+	auto fk_schema = arrow::schema({
+	    arrow::field("fk_columns", arrow::list(arrow::utf8())),
+	    arrow::field("pk_columns", arrow::list(arrow::utf8())),
+	    arrow::field("referenced_table", arrow::utf8()),
+	    arrow::field("referenced_schema", arrow::utf8()),
+	});
+
+	// Build fk_columns array
+	auto fk_builder = std::make_shared<arrow::ListBuilder>(arrow::default_memory_pool(),
+	                                                        std::make_shared<arrow::StringBuilder>());
+	auto fk_val_builder = dynamic_cast<arrow::StringBuilder *>(fk_builder->value_builder());
+	CheckStatus(fk_builder->Append(), "fk list append");
+	for (auto &col : fk_columns) {
+		CheckStatus(fk_val_builder->Append(col), "fk col append");
+	}
+	auto fk_arr_result = fk_builder->Finish();
+	CheckStatus(fk_arr_result.status(), "fk finish");
+
+	// Build pk_columns array
+	auto pk_builder = std::make_shared<arrow::ListBuilder>(arrow::default_memory_pool(),
+	                                                        std::make_shared<arrow::StringBuilder>());
+	auto pk_val_builder = dynamic_cast<arrow::StringBuilder *>(pk_builder->value_builder());
+	CheckStatus(pk_builder->Append(), "pk list append");
+	for (auto &col : pk_columns) {
+		CheckStatus(pk_val_builder->Append(col), "pk col append");
+	}
+	auto pk_arr_result = pk_builder->Finish();
+	CheckStatus(pk_arr_result.status(), "pk finish");
+
+	// Build scalar string arrays
+	arrow::StringBuilder ref_table_builder;
+	CheckStatus(ref_table_builder.Append(referenced_table), "ref table");
+	auto ref_table_result = ref_table_builder.Finish();
+	CheckStatus(ref_table_result.status(), "ref table finish");
+
+	arrow::StringBuilder ref_schema_builder;
+	CheckStatus(ref_schema_builder.Append(referenced_schema), "ref schema");
+	auto ref_schema_result = ref_schema_builder.Finish();
+	CheckStatus(ref_schema_result.status(), "ref schema finish");
+
+	auto batch = arrow::RecordBatch::Make(fk_schema, 1,
+	    {fk_arr_result.ValueUnsafe(), pk_arr_result.ValueUnsafe(),
+	     ref_table_result.ValueUnsafe(), ref_schema_result.ValueUnsafe()});
+	return SerializeToIpcBytes(batch);
+}
+
 // ============================================================================
 // Enum Serialization
 // ============================================================================
@@ -839,6 +891,788 @@ std::shared_ptr<arrow::RecordBatch> BuildTransactionParams(
 		arrow::BinaryBuilder builder;
 		CheckStatus(builder.Append(attach_id.data(), attach_id.size()), "append attach_id");
 		arrays.push_back(FinishArray(builder, "attach_id"));
+	}
+	arrays.push_back(BuildBinaryScalar(transaction_id));
+
+	return arrow::RecordBatch::Make(schema, 1, arrays);
+}
+
+// ============================================================================
+// DDL Params Builders
+// ============================================================================
+
+std::shared_ptr<arrow::RecordBatch> BuildTableCreateRequest(
+    const std::vector<uint8_t> &attach_id, const std::string &schema_name, const std::string &name,
+    const std::shared_ptr<arrow::Schema> &columns_schema, const std::string &on_conflict,
+    const std::vector<int> &not_null_constraints, const std::vector<std::vector<int>> &unique_constraints,
+    const std::vector<std::string> &check_constraints, const std::vector<std::vector<int>> &primary_key_constraints,
+    const std::vector<std::vector<uint8_t>> &foreign_key_constraints, const std::vector<uint8_t> &transaction_id) {
+	static const std::vector<std::string> on_conflict_values = {"ERROR", "IGNORE", "REPLACE"};
+
+	// Serialize the columns schema to IPC bytes
+	auto columns_bytes = SerializeSchemaToIpcBytes(columns_schema);
+
+	auto batch_schema = arrow::schema({
+	    arrow::field("attach_id", arrow::binary(), false),
+	    arrow::field("schema_name", arrow::utf8(), false),
+	    arrow::field("name", arrow::utf8(), false),
+	    arrow::field("columns", arrow::binary(), false),
+	    arrow::field("on_conflict", arrow::dictionary(arrow::int16(), arrow::utf8()), false),
+	    arrow::field("not_null_constraints", arrow::list(arrow::int32()), false),
+	    arrow::field("unique_constraints", arrow::list(arrow::list(arrow::int32())), false),
+	    arrow::field("check_constraints", arrow::list(arrow::utf8()), false),
+	    arrow::field("primary_key_constraints", arrow::list(arrow::list(arrow::int32())), false),
+	    arrow::field("foreign_key_constraints", arrow::list(arrow::binary()), false),
+	    arrow::field("transaction_id", arrow::binary(), true),
+	});
+
+	std::vector<std::shared_ptr<arrow::Array>> arrays;
+
+	// attach_id: binary (required)
+	{
+		arrow::BinaryBuilder builder;
+		CheckStatus(builder.Append(attach_id.data(), attach_id.size()), "append attach_id");
+		arrays.push_back(FinishArray(builder, "attach_id"));
+	}
+
+	// schema_name: utf8
+	arrays.push_back(BuildStringScalar(schema_name));
+
+	// name: utf8
+	arrays.push_back(BuildStringScalar(name));
+
+	// columns: binary (serialized Arrow schema)
+	{
+		arrow::BinaryBuilder builder;
+		CheckStatus(builder.Append(columns_bytes.data(), columns_bytes.size()), "append columns");
+		arrays.push_back(FinishArray(builder, "columns"));
+	}
+
+	// on_conflict: dictionary(int16, utf8)
+	arrays.push_back(BuildEnumArray(on_conflict, on_conflict_values));
+
+	// not_null_constraints: list<int32> — always non-null (empty list for no constraints)
+	{
+		auto value_builder = std::make_shared<arrow::Int32Builder>();
+		arrow::ListBuilder list_builder(arrow::default_memory_pool(), value_builder);
+		CheckStatus(list_builder.Append(), "start not_null_constraints list");
+		for (int idx : not_null_constraints) {
+			CheckStatus(value_builder->Append(static_cast<int32_t>(idx)), "append not_null index");
+		}
+		arrays.push_back(FinishArray(list_builder, "not_null_constraints"));
+	}
+
+	// unique_constraints: list<list<int32>> — always non-null
+	{
+		auto inner_value_builder = std::make_shared<arrow::Int32Builder>();
+		auto inner_list_builder = std::make_shared<arrow::ListBuilder>(arrow::default_memory_pool(), inner_value_builder);
+		arrow::ListBuilder outer_list_builder(arrow::default_memory_pool(), inner_list_builder);
+		CheckStatus(outer_list_builder.Append(), "start unique_constraints outer list");
+		for (const auto &constraint : unique_constraints) {
+			CheckStatus(inner_list_builder->Append(), "start unique_constraints inner list");
+			for (int idx : constraint) {
+				CheckStatus(inner_value_builder->Append(static_cast<int32_t>(idx)), "append unique index");
+			}
+		}
+		arrays.push_back(FinishArray(outer_list_builder, "unique_constraints"));
+	}
+
+	// check_constraints: list<utf8> — always non-null
+	{
+		auto value_builder = std::make_shared<arrow::StringBuilder>();
+		arrow::ListBuilder list_builder(arrow::default_memory_pool(), value_builder);
+		CheckStatus(list_builder.Append(), "start check_constraints list");
+		for (const auto &expr : check_constraints) {
+			CheckStatus(value_builder->Append(expr), "append check constraint");
+		}
+		arrays.push_back(FinishArray(list_builder, "check_constraints"));
+	}
+
+	// primary_key_constraints: list<list<int32>> — always non-null
+	{
+		auto inner_value_builder = std::make_shared<arrow::Int32Builder>();
+		auto inner_list_builder = std::make_shared<arrow::ListBuilder>(arrow::default_memory_pool(), inner_value_builder);
+		arrow::ListBuilder outer_list_builder(arrow::default_memory_pool(), inner_list_builder);
+		CheckStatus(outer_list_builder.Append(), "start primary_key_constraints outer list");
+		for (const auto &constraint : primary_key_constraints) {
+			CheckStatus(inner_list_builder->Append(), "start primary_key_constraints inner list");
+			for (int idx : constraint) {
+				CheckStatus(inner_value_builder->Append(static_cast<int32_t>(idx)), "append pk index");
+			}
+		}
+		arrays.push_back(FinishArray(outer_list_builder, "primary_key_constraints"));
+	}
+
+	// foreign_key_constraints: list<binary> — always non-null
+	{
+		auto value_builder = std::make_shared<arrow::BinaryBuilder>();
+		arrow::ListBuilder list_builder(arrow::default_memory_pool(), value_builder);
+		CheckStatus(list_builder.Append(), "start foreign_key_constraints list");
+		for (const auto &fk_bytes : foreign_key_constraints) {
+			CheckStatus(value_builder->Append(fk_bytes.data(), fk_bytes.size()), "append fk bytes");
+		}
+		arrays.push_back(FinishArray(list_builder, "foreign_key_constraints"));
+	}
+
+	// transaction_id: binary (nullable)
+	arrays.push_back(BuildBinaryScalar(transaction_id));
+
+	return arrow::RecordBatch::Make(batch_schema, 1, arrays);
+}
+
+std::shared_ptr<arrow::RecordBatch> BuildTableCreateParams(
+    const std::vector<uint8_t> &attach_id, const std::string &schema_name, const std::string &name,
+    const std::shared_ptr<arrow::Schema> &columns_schema, const std::string &on_conflict,
+    const std::vector<int> &not_null_constraints, const std::vector<std::vector<int>> &unique_constraints,
+    const std::vector<std::string> &check_constraints, const std::vector<std::vector<int>> &primary_key_constraints,
+    const std::vector<std::vector<uint8_t>> &foreign_key_constraints, const std::vector<uint8_t> &transaction_id) {
+	// Build inner TableCreateRequest batch
+	auto request_batch = BuildTableCreateRequest(attach_id, schema_name, name, columns_schema, on_conflict,
+	                                             not_null_constraints, unique_constraints, check_constraints,
+	                                             primary_key_constraints, foreign_key_constraints, transaction_id);
+
+	// Serialize to IPC bytes
+	auto request_bytes = SerializeToIpcBytes(request_batch);
+
+	// Wrap in params batch with single "request" column
+	auto params_schema = arrow::schema({
+	    arrow::field("request", arrow::binary(), false),
+	});
+	std::vector<std::shared_ptr<arrow::Array>> params_arrays;
+	params_arrays.push_back(BuildBinaryScalar(request_bytes));
+	return arrow::RecordBatch::Make(params_schema, 1, params_arrays);
+}
+
+std::shared_ptr<arrow::RecordBatch> BuildTableDropParams(
+    const std::vector<uint8_t> &attach_id, const std::string &schema_name, const std::string &name,
+    bool ignore_not_found, const std::vector<uint8_t> &transaction_id) {
+	auto schema = arrow::schema({
+	    arrow::field("attach_id", arrow::binary(), false),
+	    arrow::field("schema_name", arrow::utf8(), false),
+	    arrow::field("name", arrow::utf8(), false),
+	    arrow::field("ignore_not_found", arrow::boolean(), false),
+	    arrow::field("transaction_id", arrow::binary(), true),
+	});
+	std::vector<std::shared_ptr<arrow::Array>> arrays;
+
+	{
+		arrow::BinaryBuilder builder;
+		CheckStatus(builder.Append(attach_id.data(), attach_id.size()), "append attach_id");
+		arrays.push_back(FinishArray(builder, "attach_id"));
+	}
+	arrays.push_back(BuildStringScalar(schema_name));
+	arrays.push_back(BuildStringScalar(name));
+	{
+		arrow::BooleanBuilder builder;
+		CheckStatus(builder.Append(ignore_not_found), "append ignore_not_found");
+		arrays.push_back(FinishArray(builder, "ignore_not_found"));
+	}
+	arrays.push_back(BuildBinaryScalar(transaction_id));
+
+	return arrow::RecordBatch::Make(schema, 1, arrays);
+}
+
+std::shared_ptr<arrow::RecordBatch> BuildTableRenameParams(
+    const std::vector<uint8_t> &attach_id, const std::string &schema_name, const std::string &name,
+    const std::string &new_name, bool ignore_not_found, const std::vector<uint8_t> &transaction_id) {
+	auto schema = arrow::schema({
+	    arrow::field("attach_id", arrow::binary(), false),
+	    arrow::field("schema_name", arrow::utf8(), false),
+	    arrow::field("name", arrow::utf8(), false),
+	    arrow::field("new_name", arrow::utf8(), false),
+	    arrow::field("ignore_not_found", arrow::boolean(), false),
+	    arrow::field("transaction_id", arrow::binary(), true),
+	});
+	std::vector<std::shared_ptr<arrow::Array>> arrays;
+
+	{
+		arrow::BinaryBuilder builder;
+		CheckStatus(builder.Append(attach_id.data(), attach_id.size()), "append attach_id");
+		arrays.push_back(FinishArray(builder, "attach_id"));
+	}
+	arrays.push_back(BuildStringScalar(schema_name));
+	arrays.push_back(BuildStringScalar(name));
+	arrays.push_back(BuildStringScalar(new_name));
+	{
+		arrow::BooleanBuilder builder;
+		CheckStatus(builder.Append(ignore_not_found), "append ignore_not_found");
+		arrays.push_back(FinishArray(builder, "ignore_not_found"));
+	}
+	arrays.push_back(BuildBinaryScalar(transaction_id));
+
+	return arrow::RecordBatch::Make(schema, 1, arrays);
+}
+
+std::shared_ptr<arrow::RecordBatch> BuildTableColumnAddParams(
+    const std::vector<uint8_t> &attach_id, const std::string &schema_name, const std::string &name,
+    const std::vector<uint8_t> &column_definition, bool if_column_not_exists, bool ignore_not_found,
+    const std::vector<uint8_t> &transaction_id) {
+	auto schema = arrow::schema({
+	    arrow::field("attach_id", arrow::binary(), false),
+	    arrow::field("schema_name", arrow::utf8(), false),
+	    arrow::field("name", arrow::utf8(), false),
+	    arrow::field("column_definition", arrow::binary(), false),
+	    arrow::field("if_column_not_exists", arrow::boolean(), false),
+	    arrow::field("ignore_not_found", arrow::boolean(), false),
+	    arrow::field("transaction_id", arrow::binary(), true),
+	});
+	std::vector<std::shared_ptr<arrow::Array>> arrays;
+
+	{
+		arrow::BinaryBuilder builder;
+		CheckStatus(builder.Append(attach_id.data(), attach_id.size()), "append attach_id");
+		arrays.push_back(FinishArray(builder, "attach_id"));
+	}
+	arrays.push_back(BuildStringScalar(schema_name));
+	arrays.push_back(BuildStringScalar(name));
+	{
+		arrow::BinaryBuilder builder;
+		CheckStatus(builder.Append(column_definition.data(), column_definition.size()), "append column_definition");
+		arrays.push_back(FinishArray(builder, "column_definition"));
+	}
+	{
+		arrow::BooleanBuilder builder;
+		CheckStatus(builder.Append(if_column_not_exists), "append if_column_not_exists");
+		arrays.push_back(FinishArray(builder, "if_column_not_exists"));
+	}
+	{
+		arrow::BooleanBuilder builder;
+		CheckStatus(builder.Append(ignore_not_found), "append ignore_not_found");
+		arrays.push_back(FinishArray(builder, "ignore_not_found"));
+	}
+	arrays.push_back(BuildBinaryScalar(transaction_id));
+
+	return arrow::RecordBatch::Make(schema, 1, arrays);
+}
+
+std::shared_ptr<arrow::RecordBatch> BuildTableColumnDropParams(
+    const std::vector<uint8_t> &attach_id, const std::string &schema_name, const std::string &name,
+    const std::string &column_name, bool if_column_exists, bool ignore_not_found, bool cascade,
+    const std::vector<uint8_t> &transaction_id) {
+	auto schema = arrow::schema({
+	    arrow::field("attach_id", arrow::binary(), false),
+	    arrow::field("schema_name", arrow::utf8(), false),
+	    arrow::field("name", arrow::utf8(), false),
+	    arrow::field("column_name", arrow::utf8(), false),
+	    arrow::field("if_column_exists", arrow::boolean(), false),
+	    arrow::field("ignore_not_found", arrow::boolean(), false),
+	    arrow::field("cascade", arrow::boolean(), false),
+	    arrow::field("transaction_id", arrow::binary(), true),
+	});
+	std::vector<std::shared_ptr<arrow::Array>> arrays;
+
+	{
+		arrow::BinaryBuilder builder;
+		CheckStatus(builder.Append(attach_id.data(), attach_id.size()), "append attach_id");
+		arrays.push_back(FinishArray(builder, "attach_id"));
+	}
+	arrays.push_back(BuildStringScalar(schema_name));
+	arrays.push_back(BuildStringScalar(name));
+	arrays.push_back(BuildStringScalar(column_name));
+	{
+		arrow::BooleanBuilder builder;
+		CheckStatus(builder.Append(if_column_exists), "append if_column_exists");
+		arrays.push_back(FinishArray(builder, "if_column_exists"));
+	}
+	{
+		arrow::BooleanBuilder builder;
+		CheckStatus(builder.Append(ignore_not_found), "append ignore_not_found");
+		arrays.push_back(FinishArray(builder, "ignore_not_found"));
+	}
+	{
+		arrow::BooleanBuilder builder;
+		CheckStatus(builder.Append(cascade), "append cascade");
+		arrays.push_back(FinishArray(builder, "cascade"));
+	}
+	arrays.push_back(BuildBinaryScalar(transaction_id));
+
+	return arrow::RecordBatch::Make(schema, 1, arrays);
+}
+
+std::shared_ptr<arrow::RecordBatch> BuildTableColumnRenameParams(
+    const std::vector<uint8_t> &attach_id, const std::string &schema_name, const std::string &name,
+    const std::string &column_name, const std::string &new_column_name, bool ignore_not_found,
+    const std::vector<uint8_t> &transaction_id) {
+	auto schema = arrow::schema({
+	    arrow::field("attach_id", arrow::binary(), false),
+	    arrow::field("schema_name", arrow::utf8(), false),
+	    arrow::field("name", arrow::utf8(), false),
+	    arrow::field("column_name", arrow::utf8(), false),
+	    arrow::field("new_column_name", arrow::utf8(), false),
+	    arrow::field("ignore_not_found", arrow::boolean(), false),
+	    arrow::field("transaction_id", arrow::binary(), true),
+	});
+	std::vector<std::shared_ptr<arrow::Array>> arrays;
+
+	{
+		arrow::BinaryBuilder builder;
+		CheckStatus(builder.Append(attach_id.data(), attach_id.size()), "append attach_id");
+		arrays.push_back(FinishArray(builder, "attach_id"));
+	}
+	arrays.push_back(BuildStringScalar(schema_name));
+	arrays.push_back(BuildStringScalar(name));
+	arrays.push_back(BuildStringScalar(column_name));
+	arrays.push_back(BuildStringScalar(new_column_name));
+	{
+		arrow::BooleanBuilder builder;
+		CheckStatus(builder.Append(ignore_not_found), "append ignore_not_found");
+		arrays.push_back(FinishArray(builder, "ignore_not_found"));
+	}
+	arrays.push_back(BuildBinaryScalar(transaction_id));
+
+	return arrow::RecordBatch::Make(schema, 1, arrays);
+}
+
+std::shared_ptr<arrow::RecordBatch> BuildTableCommentSetParams(
+    const std::vector<uint8_t> &attach_id, const std::string &schema_name, const std::string &name,
+    const std::string &comment, bool comment_is_null, bool ignore_not_found,
+    const std::vector<uint8_t> &transaction_id) {
+	auto schema = arrow::schema({
+	    arrow::field("attach_id", arrow::binary(), false),
+	    arrow::field("schema_name", arrow::utf8(), false),
+	    arrow::field("name", arrow::utf8(), false),
+	    arrow::field("comment", arrow::utf8(), true),
+	    arrow::field("ignore_not_found", arrow::boolean(), false),
+	    arrow::field("transaction_id", arrow::binary(), true),
+	});
+	std::vector<std::shared_ptr<arrow::Array>> arrays;
+
+	{
+		arrow::BinaryBuilder builder;
+		CheckStatus(builder.Append(attach_id.data(), attach_id.size()), "append attach_id");
+		arrays.push_back(FinishArray(builder, "attach_id"));
+	}
+	arrays.push_back(BuildStringScalar(schema_name));
+	arrays.push_back(BuildStringScalar(name));
+	// comment: nullable utf8
+	{
+		arrow::StringBuilder builder;
+		if (comment_is_null) {
+			CheckStatus(builder.AppendNull(), "append null comment");
+		} else {
+			CheckStatus(builder.Append(comment), "append comment");
+		}
+		arrays.push_back(FinishArray(builder, "comment"));
+	}
+	{
+		arrow::BooleanBuilder builder;
+		CheckStatus(builder.Append(ignore_not_found), "append ignore_not_found");
+		arrays.push_back(FinishArray(builder, "ignore_not_found"));
+	}
+	arrays.push_back(BuildBinaryScalar(transaction_id));
+
+	return arrow::RecordBatch::Make(schema, 1, arrays);
+}
+
+std::shared_ptr<arrow::RecordBatch> BuildTableColumnCommentSetParams(
+    const std::vector<uint8_t> &attach_id, const std::string &schema_name, const std::string &name,
+    const std::string &column_name, const std::string &comment, bool comment_is_null,
+    bool ignore_not_found, const std::vector<uint8_t> &transaction_id) {
+	auto schema = arrow::schema({
+	    arrow::field("attach_id", arrow::binary(), false),
+	    arrow::field("schema_name", arrow::utf8(), false),
+	    arrow::field("name", arrow::utf8(), false),
+	    arrow::field("column_name", arrow::utf8(), false),
+	    arrow::field("comment", arrow::utf8(), true),
+	    arrow::field("ignore_not_found", arrow::boolean(), false),
+	    arrow::field("transaction_id", arrow::binary(), true),
+	});
+	std::vector<std::shared_ptr<arrow::Array>> arrays;
+
+	{
+		arrow::BinaryBuilder builder;
+		CheckStatus(builder.Append(attach_id.data(), attach_id.size()), "append attach_id");
+		arrays.push_back(FinishArray(builder, "attach_id"));
+	}
+	arrays.push_back(BuildStringScalar(schema_name));
+	arrays.push_back(BuildStringScalar(name));
+	arrays.push_back(BuildStringScalar(column_name));
+	// comment: nullable utf8
+	{
+		arrow::StringBuilder builder;
+		if (comment_is_null) {
+			CheckStatus(builder.AppendNull(), "append null comment");
+		} else {
+			CheckStatus(builder.Append(comment), "append comment");
+		}
+		arrays.push_back(FinishArray(builder, "comment"));
+	}
+	{
+		arrow::BooleanBuilder builder;
+		CheckStatus(builder.Append(ignore_not_found), "append ignore_not_found");
+		arrays.push_back(FinishArray(builder, "ignore_not_found"));
+	}
+	arrays.push_back(BuildBinaryScalar(transaction_id));
+
+	return arrow::RecordBatch::Make(schema, 1, arrays);
+}
+
+std::shared_ptr<arrow::RecordBatch> BuildTableColumnTypeChangeParams(
+    const std::vector<uint8_t> &attach_id, const std::string &schema_name, const std::string &name,
+    const std::vector<uint8_t> &column_definition, const std::string &expression,
+    bool ignore_not_found, const std::vector<uint8_t> &transaction_id) {
+	auto schema = arrow::schema({
+	    arrow::field("attach_id", arrow::binary(), false),
+	    arrow::field("schema_name", arrow::utf8(), false),
+	    arrow::field("name", arrow::utf8(), false),
+	    arrow::field("column_definition", arrow::binary(), false),
+	    arrow::field("expression", arrow::utf8(), true),
+	    arrow::field("ignore_not_found", arrow::boolean(), false),
+	    arrow::field("transaction_id", arrow::binary(), true),
+	});
+	std::vector<std::shared_ptr<arrow::Array>> arrays;
+
+	{
+		arrow::BinaryBuilder builder;
+		CheckStatus(builder.Append(attach_id.data(), attach_id.size()), "append attach_id");
+		arrays.push_back(FinishArray(builder, "attach_id"));
+	}
+	arrays.push_back(BuildStringScalar(schema_name));
+	arrays.push_back(BuildStringScalar(name));
+	{
+		arrow::BinaryBuilder builder;
+		CheckStatus(builder.Append(column_definition.data(), column_definition.size()), "append column_definition");
+		arrays.push_back(FinishArray(builder, "column_definition"));
+	}
+	arrays.push_back(BuildNullableStringScalar(expression));
+	{
+		arrow::BooleanBuilder builder;
+		CheckStatus(builder.Append(ignore_not_found), "append ignore_not_found");
+		arrays.push_back(FinishArray(builder, "ignore_not_found"));
+	}
+	arrays.push_back(BuildBinaryScalar(transaction_id));
+
+	return arrow::RecordBatch::Make(schema, 1, arrays);
+}
+
+std::shared_ptr<arrow::RecordBatch> BuildTableColumnDefaultSetParams(
+    const std::vector<uint8_t> &attach_id, const std::string &schema_name, const std::string &name,
+    const std::string &column_name, const std::string &expression, bool ignore_not_found,
+    const std::vector<uint8_t> &transaction_id) {
+	auto schema = arrow::schema({
+	    arrow::field("attach_id", arrow::binary(), false),
+	    arrow::field("schema_name", arrow::utf8(), false),
+	    arrow::field("name", arrow::utf8(), false),
+	    arrow::field("column_name", arrow::utf8(), false),
+	    arrow::field("expression", arrow::utf8(), false),
+	    arrow::field("ignore_not_found", arrow::boolean(), false),
+	    arrow::field("transaction_id", arrow::binary(), true),
+	});
+	std::vector<std::shared_ptr<arrow::Array>> arrays;
+
+	{
+		arrow::BinaryBuilder builder;
+		CheckStatus(builder.Append(attach_id.data(), attach_id.size()), "append attach_id");
+		arrays.push_back(FinishArray(builder, "attach_id"));
+	}
+	arrays.push_back(BuildStringScalar(schema_name));
+	arrays.push_back(BuildStringScalar(name));
+	arrays.push_back(BuildStringScalar(column_name));
+	arrays.push_back(BuildStringScalar(expression));
+	{
+		arrow::BooleanBuilder builder;
+		CheckStatus(builder.Append(ignore_not_found), "append ignore_not_found");
+		arrays.push_back(FinishArray(builder, "ignore_not_found"));
+	}
+	arrays.push_back(BuildBinaryScalar(transaction_id));
+
+	return arrow::RecordBatch::Make(schema, 1, arrays);
+}
+
+std::shared_ptr<arrow::RecordBatch> BuildTableColumnDefaultDropParams(
+    const std::vector<uint8_t> &attach_id, const std::string &schema_name, const std::string &name,
+    const std::string &column_name, bool ignore_not_found,
+    const std::vector<uint8_t> &transaction_id) {
+	auto schema = arrow::schema({
+	    arrow::field("attach_id", arrow::binary(), false),
+	    arrow::field("schema_name", arrow::utf8(), false),
+	    arrow::field("name", arrow::utf8(), false),
+	    arrow::field("column_name", arrow::utf8(), false),
+	    arrow::field("ignore_not_found", arrow::boolean(), false),
+	    arrow::field("transaction_id", arrow::binary(), true),
+	});
+	std::vector<std::shared_ptr<arrow::Array>> arrays;
+
+	{
+		arrow::BinaryBuilder builder;
+		CheckStatus(builder.Append(attach_id.data(), attach_id.size()), "append attach_id");
+		arrays.push_back(FinishArray(builder, "attach_id"));
+	}
+	arrays.push_back(BuildStringScalar(schema_name));
+	arrays.push_back(BuildStringScalar(name));
+	arrays.push_back(BuildStringScalar(column_name));
+	{
+		arrow::BooleanBuilder builder;
+		CheckStatus(builder.Append(ignore_not_found), "append ignore_not_found");
+		arrays.push_back(FinishArray(builder, "ignore_not_found"));
+	}
+	arrays.push_back(BuildBinaryScalar(transaction_id));
+
+	return arrow::RecordBatch::Make(schema, 1, arrays);
+}
+
+std::shared_ptr<arrow::RecordBatch> BuildTableNotNullSetParams(
+    const std::vector<uint8_t> &attach_id, const std::string &schema_name, const std::string &name,
+    const std::string &column_name, bool ignore_not_found,
+    const std::vector<uint8_t> &transaction_id) {
+	auto schema = arrow::schema({
+	    arrow::field("attach_id", arrow::binary(), false),
+	    arrow::field("schema_name", arrow::utf8(), false),
+	    arrow::field("name", arrow::utf8(), false),
+	    arrow::field("column_name", arrow::utf8(), false),
+	    arrow::field("ignore_not_found", arrow::boolean(), false),
+	    arrow::field("transaction_id", arrow::binary(), true),
+	});
+	std::vector<std::shared_ptr<arrow::Array>> arrays;
+
+	{
+		arrow::BinaryBuilder builder;
+		CheckStatus(builder.Append(attach_id.data(), attach_id.size()), "append attach_id");
+		arrays.push_back(FinishArray(builder, "attach_id"));
+	}
+	arrays.push_back(BuildStringScalar(schema_name));
+	arrays.push_back(BuildStringScalar(name));
+	arrays.push_back(BuildStringScalar(column_name));
+	{
+		arrow::BooleanBuilder builder;
+		CheckStatus(builder.Append(ignore_not_found), "append ignore_not_found");
+		arrays.push_back(FinishArray(builder, "ignore_not_found"));
+	}
+	arrays.push_back(BuildBinaryScalar(transaction_id));
+
+	return arrow::RecordBatch::Make(schema, 1, arrays);
+}
+
+std::shared_ptr<arrow::RecordBatch> BuildTableNotNullDropParams(
+    const std::vector<uint8_t> &attach_id, const std::string &schema_name, const std::string &name,
+    const std::string &column_name, bool ignore_not_found,
+    const std::vector<uint8_t> &transaction_id) {
+	auto schema = arrow::schema({
+	    arrow::field("attach_id", arrow::binary(), false),
+	    arrow::field("schema_name", arrow::utf8(), false),
+	    arrow::field("name", arrow::utf8(), false),
+	    arrow::field("column_name", arrow::utf8(), false),
+	    arrow::field("ignore_not_found", arrow::boolean(), false),
+	    arrow::field("transaction_id", arrow::binary(), true),
+	});
+	std::vector<std::shared_ptr<arrow::Array>> arrays;
+
+	{
+		arrow::BinaryBuilder builder;
+		CheckStatus(builder.Append(attach_id.data(), attach_id.size()), "append attach_id");
+		arrays.push_back(FinishArray(builder, "attach_id"));
+	}
+	arrays.push_back(BuildStringScalar(schema_name));
+	arrays.push_back(BuildStringScalar(name));
+	arrays.push_back(BuildStringScalar(column_name));
+	{
+		arrow::BooleanBuilder builder;
+		CheckStatus(builder.Append(ignore_not_found), "append ignore_not_found");
+		arrays.push_back(FinishArray(builder, "ignore_not_found"));
+	}
+	arrays.push_back(BuildBinaryScalar(transaction_id));
+
+	return arrow::RecordBatch::Make(schema, 1, arrays);
+}
+
+std::shared_ptr<arrow::RecordBatch> BuildSchemaCreateParams(
+    const std::vector<uint8_t> &attach_id, const std::string &name,
+    const std::string &on_conflict, const std::string &comment, bool comment_is_null,
+    const std::vector<uint8_t> &transaction_id) {
+	static const std::vector<std::string> on_conflict_values = {"ERROR", "IGNORE", "REPLACE"};
+	auto schema = arrow::schema({
+	    arrow::field("attach_id", arrow::binary(), false),
+	    arrow::field("name", arrow::utf8(), false),
+	    arrow::field("on_conflict", arrow::dictionary(arrow::int16(), arrow::utf8()), false),
+	    arrow::field("comment", arrow::utf8(), true),
+	    arrow::field("transaction_id", arrow::binary(), true),
+	});
+	std::vector<std::shared_ptr<arrow::Array>> arrays;
+
+	{
+		arrow::BinaryBuilder builder;
+		CheckStatus(builder.Append(attach_id.data(), attach_id.size()), "append attach_id");
+		arrays.push_back(FinishArray(builder, "attach_id"));
+	}
+	arrays.push_back(BuildStringScalar(name));
+	arrays.push_back(BuildEnumArray(on_conflict, on_conflict_values));
+	// comment: nullable utf8
+	{
+		arrow::StringBuilder builder;
+		if (comment_is_null) {
+			CheckStatus(builder.AppendNull(), "append null comment");
+		} else {
+			CheckStatus(builder.Append(comment), "append comment");
+		}
+		arrays.push_back(FinishArray(builder, "comment"));
+	}
+	arrays.push_back(BuildBinaryScalar(transaction_id));
+
+	return arrow::RecordBatch::Make(schema, 1, arrays);
+}
+
+std::shared_ptr<arrow::RecordBatch> BuildSchemaDropParams(
+    const std::vector<uint8_t> &attach_id, const std::string &name,
+    bool ignore_not_found, bool cascade,
+    const std::vector<uint8_t> &transaction_id) {
+	auto schema = arrow::schema({
+	    arrow::field("attach_id", arrow::binary(), false),
+	    arrow::field("name", arrow::utf8(), false),
+	    arrow::field("ignore_not_found", arrow::boolean(), false),
+	    arrow::field("cascade", arrow::boolean(), false),
+	    arrow::field("transaction_id", arrow::binary(), true),
+	});
+	std::vector<std::shared_ptr<arrow::Array>> arrays;
+
+	{
+		arrow::BinaryBuilder builder;
+		CheckStatus(builder.Append(attach_id.data(), attach_id.size()), "append attach_id");
+		arrays.push_back(FinishArray(builder, "attach_id"));
+	}
+	arrays.push_back(BuildStringScalar(name));
+	{
+		arrow::BooleanBuilder builder;
+		CheckStatus(builder.Append(ignore_not_found), "append ignore_not_found");
+		arrays.push_back(FinishArray(builder, "ignore_not_found"));
+	}
+	{
+		arrow::BooleanBuilder builder;
+		CheckStatus(builder.Append(cascade), "append cascade");
+		arrays.push_back(FinishArray(builder, "cascade"));
+	}
+	arrays.push_back(BuildBinaryScalar(transaction_id));
+
+	return arrow::RecordBatch::Make(schema, 1, arrays);
+}
+
+// ============================================================================
+// View DDL Params Builders
+// ============================================================================
+
+std::shared_ptr<arrow::RecordBatch> BuildViewCreateParams(
+    const std::vector<uint8_t> &attach_id, const std::string &schema_name, const std::string &name,
+    const std::string &definition, const std::string &on_conflict,
+    const std::vector<uint8_t> &transaction_id) {
+	static const std::vector<std::string> on_conflict_values = {"ERROR", "IGNORE", "REPLACE"};
+	auto schema = arrow::schema({
+	    arrow::field("attach_id", arrow::binary(), false),
+	    arrow::field("schema_name", arrow::utf8(), false),
+	    arrow::field("name", arrow::utf8(), false),
+	    arrow::field("definition", arrow::utf8(), false),
+	    arrow::field("on_conflict", arrow::dictionary(arrow::int16(), arrow::utf8()), false),
+	    arrow::field("transaction_id", arrow::binary(), true),
+	});
+	std::vector<std::shared_ptr<arrow::Array>> arrays;
+
+	{
+		arrow::BinaryBuilder builder;
+		CheckStatus(builder.Append(attach_id.data(), attach_id.size()), "append attach_id");
+		arrays.push_back(FinishArray(builder, "attach_id"));
+	}
+	arrays.push_back(BuildStringScalar(schema_name));
+	arrays.push_back(BuildStringScalar(name));
+	arrays.push_back(BuildStringScalar(definition));
+	arrays.push_back(BuildEnumArray(on_conflict, on_conflict_values));
+	arrays.push_back(BuildBinaryScalar(transaction_id));
+
+	return arrow::RecordBatch::Make(schema, 1, arrays);
+}
+
+std::shared_ptr<arrow::RecordBatch> BuildViewDropParams(
+    const std::vector<uint8_t> &attach_id, const std::string &schema_name, const std::string &name,
+    bool ignore_not_found, const std::vector<uint8_t> &transaction_id) {
+	auto schema = arrow::schema({
+	    arrow::field("attach_id", arrow::binary(), false),
+	    arrow::field("schema_name", arrow::utf8(), false),
+	    arrow::field("name", arrow::utf8(), false),
+	    arrow::field("ignore_not_found", arrow::boolean(), false),
+	    arrow::field("transaction_id", arrow::binary(), true),
+	});
+	std::vector<std::shared_ptr<arrow::Array>> arrays;
+
+	{
+		arrow::BinaryBuilder builder;
+		CheckStatus(builder.Append(attach_id.data(), attach_id.size()), "append attach_id");
+		arrays.push_back(FinishArray(builder, "attach_id"));
+	}
+	arrays.push_back(BuildStringScalar(schema_name));
+	arrays.push_back(BuildStringScalar(name));
+	{
+		arrow::BooleanBuilder builder;
+		CheckStatus(builder.Append(ignore_not_found), "append ignore_not_found");
+		arrays.push_back(FinishArray(builder, "ignore_not_found"));
+	}
+	arrays.push_back(BuildBinaryScalar(transaction_id));
+
+	return arrow::RecordBatch::Make(schema, 1, arrays);
+}
+
+std::shared_ptr<arrow::RecordBatch> BuildViewRenameParams(
+    const std::vector<uint8_t> &attach_id, const std::string &schema_name, const std::string &name,
+    const std::string &new_name, bool ignore_not_found, const std::vector<uint8_t> &transaction_id) {
+	auto schema = arrow::schema({
+	    arrow::field("attach_id", arrow::binary(), false),
+	    arrow::field("schema_name", arrow::utf8(), false),
+	    arrow::field("name", arrow::utf8(), false),
+	    arrow::field("new_name", arrow::utf8(), false),
+	    arrow::field("ignore_not_found", arrow::boolean(), false),
+	    arrow::field("transaction_id", arrow::binary(), true),
+	});
+	std::vector<std::shared_ptr<arrow::Array>> arrays;
+
+	{
+		arrow::BinaryBuilder builder;
+		CheckStatus(builder.Append(attach_id.data(), attach_id.size()), "append attach_id");
+		arrays.push_back(FinishArray(builder, "attach_id"));
+	}
+	arrays.push_back(BuildStringScalar(schema_name));
+	arrays.push_back(BuildStringScalar(name));
+	arrays.push_back(BuildStringScalar(new_name));
+	{
+		arrow::BooleanBuilder builder;
+		CheckStatus(builder.Append(ignore_not_found), "append ignore_not_found");
+		arrays.push_back(FinishArray(builder, "ignore_not_found"));
+	}
+	arrays.push_back(BuildBinaryScalar(transaction_id));
+
+	return arrow::RecordBatch::Make(schema, 1, arrays);
+}
+
+std::shared_ptr<arrow::RecordBatch> BuildViewCommentSetParams(
+    const std::vector<uint8_t> &attach_id, const std::string &schema_name, const std::string &name,
+    const std::string &comment, bool comment_is_null, bool ignore_not_found,
+    const std::vector<uint8_t> &transaction_id) {
+	auto schema = arrow::schema({
+	    arrow::field("attach_id", arrow::binary(), false),
+	    arrow::field("schema_name", arrow::utf8(), false),
+	    arrow::field("name", arrow::utf8(), false),
+	    arrow::field("comment", arrow::utf8(), true),
+	    arrow::field("ignore_not_found", arrow::boolean(), false),
+	    arrow::field("transaction_id", arrow::binary(), true),
+	});
+	std::vector<std::shared_ptr<arrow::Array>> arrays;
+
+	{
+		arrow::BinaryBuilder builder;
+		CheckStatus(builder.Append(attach_id.data(), attach_id.size()), "append attach_id");
+		arrays.push_back(FinishArray(builder, "attach_id"));
+	}
+	arrays.push_back(BuildStringScalar(schema_name));
+	arrays.push_back(BuildStringScalar(name));
+	// comment: nullable utf8
+	{
+		arrow::StringBuilder builder;
+		if (comment_is_null) {
+			CheckStatus(builder.AppendNull(), "append null comment");
+		} else {
+			CheckStatus(builder.Append(comment), "append comment");
+		}
+		arrays.push_back(FinishArray(builder, "comment"));
+	}
+	{
+		arrow::BooleanBuilder builder;
+		CheckStatus(builder.Append(ignore_not_found), "append ignore_not_found");
+		arrays.push_back(FinishArray(builder, "ignore_not_found"));
 	}
 	arrays.push_back(BuildBinaryScalar(transaction_id));
 

@@ -53,10 +53,11 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 	auto &attach_result = vgi_catalog.attach_result();
 
 	// Ask the worker which function to call to scan this table
+	auto &vgi_tx_scan = VgiTransaction::Get(context, catalog_);
 	auto scan_result = vgi::InvokeCatalogTableScanFunctionGet(
 	    attach_params->worker_path(), attach_result->attach_id,
 	    ParentSchema().name, name, context, at_unit, at_value,
-	    attach_params->worker_debug(), attach_params->use_pool());
+	    vgi_tx_scan.GetTransactionId(), attach_params->worker_debug(), attach_params->use_pool());
 
 	// Load any required extensions before scanning
 	for (auto &ext : scan_result.required_extensions) {

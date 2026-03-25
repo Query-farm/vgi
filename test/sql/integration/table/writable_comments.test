@@ -1,0 +1,102 @@
+# name: test/sql/integration/table/writable_comments.test
+# description: Tests for COMMENT ON TABLE and COMMENT ON COLUMN on VGI writable catalogs
+# group: [vgi_integration_table]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'writable' AS writable (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# COMMENT ON TABLE — set and clear on dynamic table
+# ============================================================================
+
+statement ok
+CREATE TABLE writable.main.test_comment (id BIGINT, val VARCHAR);
+
+statement ok
+COMMENT ON TABLE writable.main.test_comment IS 'This is a test table';
+
+statement ok
+COMMENT ON TABLE writable.main.test_comment IS NULL;
+
+# Table still works after comment operations
+statement ok
+INSERT INTO writable.main.test_comment VALUES (1, 'ok');
+
+query I
+SELECT COUNT(*) FROM writable.main.test_comment;
+----
+1
+
+statement ok
+DROP TABLE writable.main.test_comment;
+
+# ============================================================================
+# COMMENT ON TABLE — static table
+# ============================================================================
+
+statement ok
+COMMENT ON TABLE writable.main.writable_data IS 'Updated comment';
+
+statement ok
+COMMENT ON TABLE writable.main.writable_data IS NULL;
+
+# ============================================================================
+# COMMENT ON COLUMN — dynamic table, set/clear/verify
+# ============================================================================
+
+statement ok
+CREATE TABLE writable.main.test_col_comment (id BIGINT, val VARCHAR);
+
+# Set a column comment
+statement ok
+COMMENT ON COLUMN writable.main.test_col_comment.val IS 'A value column';
+
+# Verify the comment is readable via duckdb_columns()
+query T
+SELECT comment FROM duckdb_columns() WHERE database_name = 'writable' AND table_name = 'test_col_comment' AND column_name = 'val';
+----
+A value column
+
+# The other column should have no comment
+query T
+SELECT comment FROM duckdb_columns() WHERE database_name = 'writable' AND table_name = 'test_col_comment' AND column_name = 'id';
+----
+NULL
+
+# Clear the column comment
+statement ok
+COMMENT ON COLUMN writable.main.test_col_comment.val IS NULL;
+
+# Verify it's cleared
+query T
+SELECT comment FROM duckdb_columns() WHERE database_name = 'writable' AND table_name = 'test_col_comment' AND column_name = 'val';
+----
+NULL
+
+# Table still works after column comment operations
+statement ok
+INSERT INTO writable.main.test_col_comment VALUES (1, 'ok');
+
+query I
+SELECT COUNT(*) FROM writable.main.test_col_comment;
+----
+1
+
+statement ok
+DROP TABLE writable.main.test_col_comment;
+
+# ============================================================================
+# COMMENT ON COLUMN — static table
+# ============================================================================
+
+statement ok
+COMMENT ON COLUMN writable.main.writable_data.name IS 'The name field';
+
+statement ok
+COMMENT ON COLUMN writable.main.writable_data.name IS NULL;

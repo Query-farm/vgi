@@ -28,8 +28,10 @@ void VgiTableSet::LoadEntries(ClientContext &context) {
 	}
 
 	// Call catalog_schema_contents_tables via RPC
+	auto &vgi_tx_load = VgiTransaction::Get(context, catalog_);
 	auto tables = vgi::InvokeCatalogSchemaContentsTables(attach_params->worker_path(), attach_result->attach_id,
-	                                                     schema_.name, context, attach_params->worker_debug(),
+	                                                     schema_.name, context, vgi_tx_load.GetTransactionId(),
+	                                                     attach_params->worker_debug(),
 	                                                     attach_params->use_pool());
 
 	for (auto &table_info : tables) {
@@ -58,9 +60,11 @@ optional_ptr<CatalogEntry> VgiTableSet::GetEntry(ClientContext &context, const s
 		return nullptr;
 	}
 
-	// Call catalog_table_get via RPC
+	// Call catalog_table_get via RPC, passing transaction_id for visibility of in-transaction DDL
+	auto &vgi_tx = VgiTransaction::Get(context, catalog_);
 	auto table_info_opt = vgi::InvokeCatalogTableGet(attach_params->worker_path(), attach_result->attach_id,
-	                                                  schema_.name, name, context, attach_params->worker_debug(),
+	                                                  schema_.name, name, context, vgi_tx.GetTransactionId(),
+	                                                  attach_params->worker_debug(),
 	                                                  attach_params->use_pool());
 
 	if (!table_info_opt) {
@@ -101,9 +105,10 @@ optional_ptr<CatalogEntry> VgiTableSet::GetEntry(ClientContext &context, const E
 	auto at_value = at->GetValue().ToString();
 
 	// Call catalog_table_get with AT params via RPC
+	auto &vgi_tx_at = VgiTransaction::Get(context, catalog_);
 	auto table_info_opt = vgi::InvokeCatalogTableGet(attach_params->worker_path(), attach_result->attach_id,
 	                                                  schema_.name, entry_name, context,
-	                                                  at_unit, at_value,
+	                                                  at_unit, at_value, vgi_tx_at.GetTransactionId(),
 	                                                  attach_params->worker_debug(),
 	                                                  attach_params->use_pool());
 

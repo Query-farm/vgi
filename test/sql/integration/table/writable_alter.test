@@ -1,0 +1,191 @@
+# name: test/sql/integration/table/writable_alter.test
+# description: Tests for ALTER TABLE on VGI writable catalogs
+# group: [vgi_integration_table]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'writable' AS writable (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# Setup
+# ============================================================================
+
+statement ok
+CREATE TABLE writable.main.test_alter (id BIGINT, name VARCHAR);
+
+statement ok
+INSERT INTO writable.main.test_alter VALUES (1, 'alice');
+
+# ============================================================================
+# ALTER TABLE ADD COLUMN
+# ============================================================================
+
+statement ok
+ALTER TABLE writable.main.test_alter ADD COLUMN score DOUBLE;
+
+statement ok
+INSERT INTO writable.main.test_alter (id, name, score) VALUES (2, 'bob', 95.0);
+
+query I
+SELECT COUNT(*) FROM writable.main.test_alter;
+----
+2
+
+# ============================================================================
+# ALTER TABLE DROP COLUMN
+# ============================================================================
+
+statement ok
+ALTER TABLE writable.main.test_alter DROP COLUMN score;
+
+query I
+SELECT COUNT(*) FROM writable.main.test_alter;
+----
+2
+
+# ============================================================================
+# ALTER TABLE RENAME COLUMN
+# ============================================================================
+
+statement ok
+ALTER TABLE writable.main.test_alter RENAME COLUMN name TO label;
+
+query I
+SELECT COUNT(*) FROM writable.main.test_alter;
+----
+2
+
+# ============================================================================
+# ALTER TABLE RENAME TABLE
+# ============================================================================
+
+statement ok
+ALTER TABLE writable.main.test_alter RENAME TO test_renamed;
+
+query I
+SELECT COUNT(*) FROM writable.main.test_renamed;
+----
+2
+
+statement ok
+DROP TABLE writable.main.test_renamed;
+
+# ============================================================================
+# ALTER COLUMN TYPE — verify the new type accepts larger values
+# ============================================================================
+
+statement ok
+CREATE TABLE writable.main.test_types (id BIGINT, val INTEGER);
+
+statement ok
+INSERT INTO writable.main.test_types VALUES (1, 42);
+
+statement ok
+ALTER TABLE writable.main.test_types ALTER val TYPE BIGINT;
+
+# This value exceeds INTEGER range — proves column is now BIGINT
+statement ok
+INSERT INTO writable.main.test_types VALUES (2, 2147483648);
+
+query I
+SELECT val FROM writable.main.test_types WHERE id = 2;
+----
+2147483648
+
+statement ok
+DROP TABLE writable.main.test_types;
+
+# ============================================================================
+# SET DEFAULT — verify new default is used when column omitted
+# ============================================================================
+
+statement ok
+CREATE TABLE writable.main.test_defaults (id BIGINT, val VARCHAR);
+
+statement ok
+ALTER TABLE writable.main.test_defaults ALTER val SET DEFAULT 'auto_value';
+
+statement ok
+INSERT INTO writable.main.test_defaults (id) VALUES (1);
+
+query T
+SELECT val FROM writable.main.test_defaults WHERE id = 1;
+----
+auto_value
+
+# Change default and verify new value
+statement ok
+ALTER TABLE writable.main.test_defaults ALTER val SET DEFAULT 'changed';
+
+statement ok
+INSERT INTO writable.main.test_defaults (id) VALUES (2);
+
+query T
+SELECT val FROM writable.main.test_defaults WHERE id = 2;
+----
+changed
+
+# ============================================================================
+# DROP DEFAULT — verify NULL is used when column omitted
+# ============================================================================
+
+statement ok
+ALTER TABLE writable.main.test_defaults ALTER val DROP DEFAULT;
+
+statement ok
+INSERT INTO writable.main.test_defaults (id) VALUES (3);
+
+query T
+SELECT val FROM writable.main.test_defaults WHERE id = 3;
+----
+NULL
+
+statement ok
+DROP TABLE writable.main.test_defaults;
+
+# ============================================================================
+# SET NOT NULL — verify constraint is enforced
+# ============================================================================
+
+statement ok
+CREATE TABLE writable.main.test_notnull (id BIGINT, val VARCHAR);
+
+statement ok
+INSERT INTO writable.main.test_notnull VALUES (1, 'ok');
+
+statement ok
+ALTER TABLE writable.main.test_notnull ALTER val SET NOT NULL;
+
+# This should fail — NULL violates NOT NULL constraint
+statement error
+INSERT INTO writable.main.test_notnull VALUES (2, NULL);
+----
+
+# Only the valid row should exist
+query I
+SELECT COUNT(*) FROM writable.main.test_notnull;
+----
+1
+
+# ============================================================================
+# DROP NOT NULL — verify NULL is now allowed
+# ============================================================================
+
+statement ok
+ALTER TABLE writable.main.test_notnull ALTER val DROP NOT NULL;
+
+statement ok
+INSERT INTO writable.main.test_notnull VALUES (3, NULL);
+
+query I
+SELECT COUNT(*) FROM writable.main.test_notnull;
+----
+2
+
+statement ok
+DROP TABLE writable.main.test_notnull;

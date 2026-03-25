@@ -13,6 +13,7 @@
 #include "duckdb.hpp"
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/function/table/arrow.hpp"
+#include "duckdb/planner/parsed_data/bound_create_table_info.hpp"
 #include "storage/vgi_catalog.hpp"
 #include "storage/vgi_table_entry.hpp"
 #include "vgi_arrow_utils.hpp"
@@ -75,6 +76,9 @@ public:
 	                  OnConflictAction action_type, unordered_set<column_t> on_conflict_filter);
 	// Merge-compatible constructor (accepts any LogicalOperator)
 	VgiPhysicalInsert(PhysicalPlan &plan, LogicalOperator &op, VgiTableEntry &table, bool return_chunk);
+	// CREATE TABLE AS constructor — table is created during execution, not planning
+	VgiPhysicalInsert(PhysicalPlan &plan, LogicalOperator &op, SchemaCatalogEntry &schema,
+	                  unique_ptr<BoundCreateTableInfo> create_info);
 
 	bool IsSink() const override {
 		return true;
@@ -101,7 +105,9 @@ public:
 	                                 OperatorSourceInput &input) const override;
 
 private:
-	VgiTableEntry &table;
+	optional_ptr<VgiTableEntry> insert_table;   // set for regular INSERT
+	optional_ptr<SchemaCatalogEntry> schema;     // set for CTAS
+	unique_ptr<BoundCreateTableInfo> create_info; // set for CTAS
 	bool return_chunk;
 	OnConflictAction action_type;
 	unordered_set<column_t> on_conflict_filter; // conflict target column IDs

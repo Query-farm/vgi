@@ -28,6 +28,13 @@ std::shared_ptr<arrow::RecordBatch> DeserializeFromIpcBytes(const uint8_t *data,
 // Serialize an Arrow Schema to IPC bytes.
 std::vector<uint8_t> SerializeSchemaToIpcBytes(const std::shared_ptr<arrow::Schema> &schema);
 
+// Serialize a foreign key constraint to IPC bytes.
+// The format matches the Python ForeignKeyDef serialization used by TableInfo.
+std::vector<uint8_t> SerializeForeignKeyToIpcBytes(const std::vector<std::string> &fk_columns,
+                                                    const std::vector<std::string> &pk_columns,
+                                                    const std::string &referenced_table,
+                                                    const std::string &referenced_schema);
+
 // ============================================================================
 // Enum Serialization (dictionary(int16, utf8))
 // ============================================================================
@@ -241,6 +248,153 @@ std::shared_ptr<arrow::RecordBatch> BuildTransactionBeginParams(const std::vecto
 // Build params batch for catalog_transaction_commit/rollback: attach_id + transaction_id
 std::shared_ptr<arrow::RecordBatch> BuildTransactionParams(
     const std::vector<uint8_t> &attach_id, const std::vector<uint8_t> &transaction_id);
+
+// ============================================================================
+// DDL Params Builders
+// ============================================================================
+
+// Build a TableCreateRequest inner batch (serialized as IPC bytes in the outer params).
+// Fields match Python TableCreateRequest dataclass.
+std::shared_ptr<arrow::RecordBatch> BuildTableCreateRequest(
+    const std::vector<uint8_t> &attach_id, const std::string &schema_name, const std::string &name,
+    const std::shared_ptr<arrow::Schema> &columns_schema, const std::string &on_conflict,
+    const std::vector<int> &not_null_constraints, const std::vector<std::vector<int>> &unique_constraints,
+    const std::vector<std::string> &check_constraints, const std::vector<std::vector<int>> &primary_key_constraints,
+    const std::vector<std::vector<uint8_t>> &foreign_key_constraints,
+    const std::vector<uint8_t> &transaction_id = {});
+
+// Build params batch for catalog_table_create: wraps inner request as {request: binary}
+std::shared_ptr<arrow::RecordBatch> BuildTableCreateParams(
+    const std::vector<uint8_t> &attach_id, const std::string &schema_name, const std::string &name,
+    const std::shared_ptr<arrow::Schema> &columns_schema, const std::string &on_conflict,
+    const std::vector<int> &not_null_constraints, const std::vector<std::vector<int>> &unique_constraints,
+    const std::vector<std::string> &check_constraints, const std::vector<std::vector<int>> &primary_key_constraints,
+    const std::vector<std::vector<uint8_t>> &foreign_key_constraints,
+    const std::vector<uint8_t> &transaction_id = {});
+
+// Build params batch for catalog_table_drop:
+//   attach_id, schema_name, name, ignore_not_found, transaction_id
+std::shared_ptr<arrow::RecordBatch> BuildTableDropParams(
+    const std::vector<uint8_t> &attach_id, const std::string &schema_name, const std::string &name,
+    bool ignore_not_found, const std::vector<uint8_t> &transaction_id = {});
+
+// Build params batch for catalog_table_rename:
+//   attach_id, schema_name, name, new_name, ignore_not_found, transaction_id
+std::shared_ptr<arrow::RecordBatch> BuildTableRenameParams(
+    const std::vector<uint8_t> &attach_id, const std::string &schema_name, const std::string &name,
+    const std::string &new_name, bool ignore_not_found, const std::vector<uint8_t> &transaction_id = {});
+
+// Build params batch for catalog_table_column_add:
+//   attach_id, schema_name, name, column_definition (single-field Arrow schema IPC bytes),
+//   if_column_not_exists, ignore_not_found, transaction_id
+std::shared_ptr<arrow::RecordBatch> BuildTableColumnAddParams(
+    const std::vector<uint8_t> &attach_id, const std::string &schema_name, const std::string &name,
+    const std::vector<uint8_t> &column_definition, bool if_column_not_exists, bool ignore_not_found,
+    const std::vector<uint8_t> &transaction_id = {});
+
+// Build params batch for catalog_table_column_drop:
+//   attach_id, schema_name, name, column_name, if_column_exists, ignore_not_found, cascade, transaction_id
+std::shared_ptr<arrow::RecordBatch> BuildTableColumnDropParams(
+    const std::vector<uint8_t> &attach_id, const std::string &schema_name, const std::string &name,
+    const std::string &column_name, bool if_column_exists, bool ignore_not_found, bool cascade,
+    const std::vector<uint8_t> &transaction_id = {});
+
+// Build params batch for catalog_table_column_rename:
+//   attach_id, schema_name, name, column_name, new_column_name, ignore_not_found, transaction_id
+std::shared_ptr<arrow::RecordBatch> BuildTableColumnRenameParams(
+    const std::vector<uint8_t> &attach_id, const std::string &schema_name, const std::string &name,
+    const std::string &column_name, const std::string &new_column_name, bool ignore_not_found,
+    const std::vector<uint8_t> &transaction_id = {});
+
+std::shared_ptr<arrow::RecordBatch> BuildTableCommentSetParams(
+    const std::vector<uint8_t> &attach_id, const std::string &schema_name, const std::string &name,
+    const std::string &comment, bool comment_is_null, bool ignore_not_found,
+    const std::vector<uint8_t> &transaction_id = {});
+
+std::shared_ptr<arrow::RecordBatch> BuildTableColumnCommentSetParams(
+    const std::vector<uint8_t> &attach_id, const std::string &schema_name, const std::string &name,
+    const std::string &column_name, const std::string &comment, bool comment_is_null,
+    bool ignore_not_found, const std::vector<uint8_t> &transaction_id = {});
+
+// Build params batch for catalog_table_column_type_change:
+//   attach_id, schema_name, name, column_definition (single-field Arrow schema IPC bytes),
+//   expression (nullable utf8 — optional USING expression), ignore_not_found, transaction_id
+std::shared_ptr<arrow::RecordBatch> BuildTableColumnTypeChangeParams(
+    const std::vector<uint8_t> &attach_id, const std::string &schema_name, const std::string &name,
+    const std::vector<uint8_t> &column_definition, const std::string &expression,
+    bool ignore_not_found, const std::vector<uint8_t> &transaction_id = {});
+
+// Build params batch for catalog_table_column_default_set:
+//   attach_id, schema_name, name, column_name, expression (utf8), ignore_not_found, transaction_id
+std::shared_ptr<arrow::RecordBatch> BuildTableColumnDefaultSetParams(
+    const std::vector<uint8_t> &attach_id, const std::string &schema_name, const std::string &name,
+    const std::string &column_name, const std::string &expression, bool ignore_not_found,
+    const std::vector<uint8_t> &transaction_id = {});
+
+// Build params batch for catalog_table_column_default_drop:
+//   attach_id, schema_name, name, column_name, ignore_not_found, transaction_id
+std::shared_ptr<arrow::RecordBatch> BuildTableColumnDefaultDropParams(
+    const std::vector<uint8_t> &attach_id, const std::string &schema_name, const std::string &name,
+    const std::string &column_name, bool ignore_not_found,
+    const std::vector<uint8_t> &transaction_id = {});
+
+// Build params batch for catalog_table_not_null_set:
+//   attach_id, schema_name, name, column_name, ignore_not_found, transaction_id
+std::shared_ptr<arrow::RecordBatch> BuildTableNotNullSetParams(
+    const std::vector<uint8_t> &attach_id, const std::string &schema_name, const std::string &name,
+    const std::string &column_name, bool ignore_not_found,
+    const std::vector<uint8_t> &transaction_id = {});
+
+// Build params batch for catalog_table_not_null_drop:
+//   attach_id, schema_name, name, column_name, ignore_not_found, transaction_id
+std::shared_ptr<arrow::RecordBatch> BuildTableNotNullDropParams(
+    const std::vector<uint8_t> &attach_id, const std::string &schema_name, const std::string &name,
+    const std::string &column_name, bool ignore_not_found,
+    const std::vector<uint8_t> &transaction_id = {});
+
+// Build params batch for catalog_schema_create:
+//   attach_id, name, on_conflict (enum), comment (nullable), transaction_id (nullable)
+std::shared_ptr<arrow::RecordBatch> BuildSchemaCreateParams(
+    const std::vector<uint8_t> &attach_id, const std::string &name,
+    const std::string &on_conflict, const std::string &comment, bool comment_is_null,
+    const std::vector<uint8_t> &transaction_id = {});
+
+// Build params batch for catalog_schema_drop:
+//   attach_id, name, ignore_not_found, cascade, transaction_id (nullable)
+std::shared_ptr<arrow::RecordBatch> BuildSchemaDropParams(
+    const std::vector<uint8_t> &attach_id, const std::string &name,
+    bool ignore_not_found, bool cascade,
+    const std::vector<uint8_t> &transaction_id = {});
+
+// ============================================================================
+// View DDL Params Builders
+// ============================================================================
+
+// Build params batch for catalog_view_create:
+//   attach_id, schema_name, name, definition, on_conflict (enum), transaction_id
+std::shared_ptr<arrow::RecordBatch> BuildViewCreateParams(
+    const std::vector<uint8_t> &attach_id, const std::string &schema_name, const std::string &name,
+    const std::string &definition, const std::string &on_conflict,
+    const std::vector<uint8_t> &transaction_id = {});
+
+// Build params batch for catalog_view_drop:
+//   attach_id, schema_name, name, ignore_not_found, transaction_id
+std::shared_ptr<arrow::RecordBatch> BuildViewDropParams(
+    const std::vector<uint8_t> &attach_id, const std::string &schema_name, const std::string &name,
+    bool ignore_not_found, const std::vector<uint8_t> &transaction_id = {});
+
+// Build params batch for catalog_view_rename:
+//   attach_id, schema_name, name, new_name, ignore_not_found, transaction_id
+std::shared_ptr<arrow::RecordBatch> BuildViewRenameParams(
+    const std::vector<uint8_t> &attach_id, const std::string &schema_name, const std::string &name,
+    const std::string &new_name, bool ignore_not_found, const std::vector<uint8_t> &transaction_id = {});
+
+// Build params batch for catalog_view_comment_set:
+//   attach_id, schema_name, name, comment (nullable), ignore_not_found, transaction_id
+std::shared_ptr<arrow::RecordBatch> BuildViewCommentSetParams(
+    const std::vector<uint8_t> &attach_id, const std::string &schema_name, const std::string &name,
+    const std::string &comment, bool comment_is_null, bool ignore_not_found,
+    const std::vector<uint8_t> &transaction_id = {});
 
 } // namespace vgi
 } // namespace duckdb

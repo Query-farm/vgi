@@ -7,6 +7,7 @@
 
 #include "storage/vgi_catalog.hpp"
 #include "storage/vgi_schema_entry.hpp"
+#include "storage/vgi_transaction.hpp"
 #include "vgi_catalog_api.hpp"
 
 namespace duckdb {
@@ -34,7 +35,9 @@ void VgiSchemaSet::LoadEntries(ClientContext &context) {
 	}
 
 	// Call catalog_schemas via RPC
+	auto &vgi_tx_load = VgiTransaction::Get(context, catalog_);
 	auto schema_list = vgi::InvokeCatalogSchemas(attach_params->worker_path(), attach_result->attach_id, context,
+	                                             vgi_tx_load.GetTransactionId(),
 	                                             attach_params->worker_debug(), attach_params->use_pool());
 
 	// Create schema entries

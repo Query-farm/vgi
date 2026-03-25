@@ -1,0 +1,628 @@
+# name: test/sql/integration/table/writable_ddl_constraints.test
+# description: Exhaustive tests for constraints, defaults, and ALTER on dynamic VGI writable tables
+# group: [vgi_integration_table]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'writable' AS writable (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# 1. NOT NULL — enforcement and metadata
+# ============================================================================
+
+statement ok
+CREATE TABLE writable.main.test_nn (id BIGINT NOT NULL, name VARCHAR NOT NULL, optional_col VARCHAR);
+
+# Valid insert
+statement ok
+INSERT INTO writable.main.test_nn VALUES (1, 'alice', NULL);
+
+# NULL in NOT NULL column fails
+statement error
+INSERT INTO writable.main.test_nn VALUES (NULL, 'bob', 'ok');
+----
+Constraint Error
+
+statement error
+INSERT INTO writable.main.test_nn VALUES (2, NULL, 'ok');
+----
+Constraint Error
+
+# Only the valid row exists
+query I
+SELECT COUNT(*) FROM writable.main.test_nn;
+----
+1
+
+statement ok
+DROP TABLE writable.main.test_nn;
+
+# ============================================================================
+# 2. PRIMARY KEY — single column
+# ============================================================================
+
+statement ok
+CREATE TABLE writable.main.test_pk (id BIGINT PRIMARY KEY, val VARCHAR);
+
+statement ok
+INSERT INTO writable.main.test_pk VALUES (1, 'first');
+
+# Duplicate PK fails
+statement error
+INSERT INTO writable.main.test_pk VALUES (1, 'duplicate');
+----
+Constraint Error
+
+# Only original row exists
+query IT
+SELECT id, val FROM writable.main.test_pk;
+----
+1	first
+
+statement ok
+DROP TABLE writable.main.test_pk;
+
+# ============================================================================
+# 3. PRIMARY KEY — composite
+# ============================================================================
+
+statement ok
+CREATE TABLE writable.main.test_cpk (dept_id BIGINT, project_code VARCHAR, title VARCHAR, PRIMARY KEY (dept_id, project_code));
+
+statement ok
+INSERT INTO writable.main.test_cpk VALUES (1, 'P1', 'Alpha');
+
+statement ok
+INSERT INTO writable.main.test_cpk VALUES (1, 'P2', 'Beta');
+
+statement ok
+INSERT INTO writable.main.test_cpk VALUES (2, 'P1', 'Gamma');
+
+# Duplicate composite key fails
+statement error
+INSERT INTO writable.main.test_cpk VALUES (1, 'P1', 'Duplicate');
+----
+Constraint Error
+
+query I
+SELECT COUNT(*) FROM writable.main.test_cpk;
+----
+3
+
+# Verify all rows are correct
+query ITT
+SELECT dept_id, project_code, title FROM writable.main.test_cpk ORDER BY dept_id, project_code;
+----
+1	P1	Alpha
+1	P2	Beta
+2	P1	Gamma
+
+# DELETE then re-insert same key succeeds
+statement ok
+DELETE FROM writable.main.test_cpk WHERE dept_id = 2 AND project_code = 'P1';
+
+statement ok
+INSERT INTO writable.main.test_cpk VALUES (2, 'P1', 'Gamma_reinserted');
+
+query T
+SELECT title FROM writable.main.test_cpk WHERE dept_id = 2 AND project_code = 'P1';
+----
+Gamma_reinserted
+
+statement ok
+DROP TABLE writable.main.test_cpk;
+
+# ============================================================================
+# 3b. Composite PRIMARY KEY — three columns
+# ============================================================================
+
+statement ok
+CREATE TABLE writable.main.test_cpk3 (year INTEGER, region VARCHAR, product_id BIGINT, revenue DOUBLE, PRIMARY KEY (year, region, product_id));
+
+statement ok
+INSERT INTO writable.main.test_cpk3 VALUES (2024, 'US', 1, 100.0);
+
+statement ok
+INSERT INTO writable.main.test_cpk3 VALUES (2024, 'US', 2, 200.0);
+
+statement ok
+INSERT INTO writable.main.test_cpk3 VALUES (2024, 'EU', 1, 150.0);
+
+statement ok
+INSERT INTO writable.main.test_cpk3 VALUES (2025, 'US', 1, 120.0);
+
+# All four differ in at least one PK column — all valid
+query I
+SELECT COUNT(*) FROM writable.main.test_cpk3;
+----
+4
+
+# Exact duplicate of all three PK columns fails
+statement error
+INSERT INTO writable.main.test_cpk3 VALUES (2024, 'US', 1, 999.0);
+----
+Constraint Error
+
+# Two of three match but third differs — succeeds
+statement ok
+INSERT INTO writable.main.test_cpk3 VALUES (2024, 'US', 3, 300.0);
+
+query I
+SELECT COUNT(*) FROM writable.main.test_cpk3;
+----
+5
+
+# Verify data integrity with ordered select
+query ITIR
+SELECT year, region, product_id, revenue FROM writable.main.test_cpk3 ORDER BY year, region, product_id;
+----
+2024	EU	1	150.0
+2024	US	1	100.0
+2024	US	2	200.0
+2024	US	3	300.0
+2025	US	1	120.0
+
+statement ok
+DROP TABLE writable.main.test_cpk3;
+
+# ============================================================================
+# 3c. Composite PRIMARY KEY with mixed types
+# ============================================================================
+
+statement ok
+CREATE TABLE writable.main.test_cpk_mixed (date_col DATE, category VARCHAR, seq BIGINT, value DOUBLE, PRIMARY KEY (date_col, category));
+
+statement ok
+INSERT INTO writable.main.test_cpk_mixed VALUES (DATE '2024-01-01', 'A', 1, 10.0);
+
+statement ok
+INSERT INTO writable.main.test_cpk_mixed VALUES (DATE '2024-01-01', 'B', 2, 20.0);
+
+statement ok
+INSERT INTO writable.main.test_cpk_mixed VALUES (DATE '2024-01-02', 'A', 3, 30.0);
+
+# Same date + category fails
+statement error
+INSERT INTO writable.main.test_cpk_mixed VALUES (DATE '2024-01-01', 'A', 4, 40.0);
+----
+Constraint Error
+
+query I
+SELECT COUNT(*) FROM writable.main.test_cpk_mixed;
+----
+3
+
+statement ok
+DROP TABLE writable.main.test_cpk_mixed;
+
+# ============================================================================
+# 4. UNIQUE constraint
+# ============================================================================
+
+statement ok
+CREATE TABLE writable.main.test_uq (id BIGINT, email VARCHAR UNIQUE);
+
+statement ok
+INSERT INTO writable.main.test_uq VALUES (1, 'alice@example.com');
+
+# Duplicate unique value fails
+statement error
+INSERT INTO writable.main.test_uq VALUES (2, 'alice@example.com');
+----
+Constraint Error
+
+# Multiple NULLs are allowed in UNIQUE columns
+statement ok
+INSERT INTO writable.main.test_uq VALUES (3, NULL);
+
+statement ok
+INSERT INTO writable.main.test_uq VALUES (4, NULL);
+
+query I
+SELECT COUNT(*) FROM writable.main.test_uq;
+----
+3
+
+statement ok
+DROP TABLE writable.main.test_uq;
+
+# ============================================================================
+# 5. CHECK constraint
+# ============================================================================
+
+statement ok
+CREATE TABLE writable.main.test_chk (id BIGINT, score DOUBLE CHECK (score >= 0 AND score <= 100));
+
+statement ok
+INSERT INTO writable.main.test_chk VALUES (1, 95.5);
+
+# Value outside range fails
+statement error
+INSERT INTO writable.main.test_chk VALUES (2, -1.0);
+----
+Constraint Error
+
+statement error
+INSERT INTO writable.main.test_chk VALUES (3, 101.0);
+----
+Constraint Error
+
+# Only valid row exists
+query I
+SELECT COUNT(*) FROM writable.main.test_chk;
+----
+1
+
+statement ok
+DROP TABLE writable.main.test_chk;
+
+# ============================================================================
+# 6. Multiple constraints on one table
+# ============================================================================
+
+statement ok
+CREATE TABLE writable.main.test_multi (id BIGINT PRIMARY KEY, name VARCHAR NOT NULL UNIQUE, score DOUBLE CHECK (score >= 0));
+
+statement ok
+INSERT INTO writable.main.test_multi VALUES (1, 'alice', 90.0);
+
+# PK violation
+statement error
+INSERT INTO writable.main.test_multi VALUES (1, 'bob', 80.0);
+----
+Constraint Error
+
+# NOT NULL violation
+statement error
+INSERT INTO writable.main.test_multi VALUES (2, NULL, 80.0);
+----
+Constraint Error
+
+# UNIQUE violation
+statement error
+INSERT INTO writable.main.test_multi VALUES (2, 'alice', 80.0);
+----
+Constraint Error
+
+# CHECK violation
+statement error
+INSERT INTO writable.main.test_multi VALUES (2, 'bob', -1.0);
+----
+Constraint Error
+
+# Valid second row
+statement ok
+INSERT INTO writable.main.test_multi VALUES (2, 'bob', 80.0);
+
+query I
+SELECT COUNT(*) FROM writable.main.test_multi;
+----
+2
+
+statement ok
+DROP TABLE writable.main.test_multi;
+
+# ============================================================================
+# 7. FOREIGN KEY — tested on static tables (writable_orders → writable_products)
+# Note: DuckDB SQL parser cannot create cross-database FK references, so FK
+# between dynamic tables requires the Python Table descriptor. The static
+# writable_foreign_key.test covers FK enforcement comprehensively.
+# ============================================================================
+
+# Verify FK enforcement on static tables
+statement ok
+INSERT INTO writable.main.writable_products(product_id, name) VALUES (77701, 'FK_Test_Product');
+
+statement ok
+INSERT INTO writable.main.writable_orders VALUES (77701, 77701, 1);
+
+# FK violation — non-existent product
+statement error
+INSERT INTO writable.main.writable_orders VALUES (77702, 99999, 1);
+----
+Constraint Error
+
+# Cleanup
+statement ok
+DELETE FROM writable.main.writable_orders WHERE order_id = 77701;
+
+statement ok
+DELETE FROM writable.main.writable_products WHERE product_id = 77701;
+
+# ============================================================================
+# 8. Simple defaults — VARCHAR, INTEGER, DOUBLE, BOOLEAN
+# ============================================================================
+
+statement ok
+CREATE TABLE writable.main.test_simple_def (id BIGINT, name VARCHAR DEFAULT 'unnamed', count BIGINT DEFAULT 42, score DOUBLE DEFAULT 9.99, active BOOLEAN DEFAULT true);
+
+# Insert omitting all defaulted columns
+statement ok
+INSERT INTO writable.main.test_simple_def (id) VALUES (1);
+
+query ITIRT
+SELECT id, name, count, score, active FROM writable.main.test_simple_def WHERE id = 1;
+----
+1	unnamed	42	9.99	true
+
+# Insert with explicit values overriding defaults
+statement ok
+INSERT INTO writable.main.test_simple_def VALUES (2, 'alice', 100, 50.0, false);
+
+query ITIRT
+SELECT id, name, count, score, active FROM writable.main.test_simple_def WHERE id = 2;
+----
+2	alice	100	50.0	false
+
+# Verify defaults in metadata
+query TT
+SELECT column_name, column_default FROM duckdb_columns() WHERE database_name = 'writable' AND table_name = 'test_simple_def' AND column_default IS NOT NULL ORDER BY column_name;
+----
+active	CAST('t' AS BOOLEAN)
+count	42
+name	'unnamed'
+score	9.99
+
+statement ok
+DROP TABLE writable.main.test_simple_def;
+
+# ============================================================================
+# 9. DATE default
+# ============================================================================
+
+statement ok
+CREATE TABLE writable.main.test_date_def (id BIGINT, created DATE DEFAULT DATE '2024-01-01');
+
+statement ok
+INSERT INTO writable.main.test_date_def (id) VALUES (1);
+
+query IT
+SELECT id, created FROM writable.main.test_date_def WHERE id = 1;
+----
+1	2024-01-01
+
+statement ok
+DROP TABLE writable.main.test_date_def;
+
+# ============================================================================
+# 10. LIST default
+# ============================================================================
+
+statement ok
+CREATE TABLE writable.main.test_list_def (id BIGINT, tags VARCHAR[] DEFAULT ['untagged']);
+
+statement ok
+INSERT INTO writable.main.test_list_def (id) VALUES (1);
+
+query IT
+SELECT id, tags FROM writable.main.test_list_def WHERE id = 1;
+----
+1	[untagged]
+
+# Explicit list overrides default
+statement ok
+INSERT INTO writable.main.test_list_def VALUES (2, ['a', 'b', 'c']);
+
+query IT
+SELECT id, tags FROM writable.main.test_list_def WHERE id = 2;
+----
+2	[a, b, c]
+
+statement ok
+DROP TABLE writable.main.test_list_def;
+
+# ============================================================================
+# 11. STRUCT default
+# ============================================================================
+
+statement ok
+CREATE TABLE writable.main.test_struct_def (id BIGINT, info STRUCT(name VARCHAR, age INTEGER) DEFAULT {'name': 'unknown', 'age': 0});
+
+statement ok
+INSERT INTO writable.main.test_struct_def (id) VALUES (1);
+
+query IT
+SELECT id, info FROM writable.main.test_struct_def WHERE id = 1;
+----
+1	{'name': unknown, 'age': 0}
+
+# Explicit struct overrides default
+statement ok
+INSERT INTO writable.main.test_struct_def VALUES (2, {'name': 'alice', 'age': 30});
+
+query IT
+SELECT id, info FROM writable.main.test_struct_def WHERE id = 2;
+----
+2	{'name': alice, 'age': 30}
+
+statement ok
+DROP TABLE writable.main.test_struct_def;
+
+# ============================================================================
+# 12. Combined defaults and constraints
+# ============================================================================
+
+# NOT NULL + DEFAULT: default fills omitted values, explicit NULL still fails
+statement ok
+CREATE TABLE writable.main.test_def_nn (id BIGINT, status VARCHAR NOT NULL DEFAULT 'active');
+
+statement ok
+INSERT INTO writable.main.test_def_nn (id) VALUES (1);
+
+query IT
+SELECT id, status FROM writable.main.test_def_nn WHERE id = 1;
+----
+1	active
+
+statement error
+INSERT INTO writable.main.test_def_nn VALUES (2, NULL);
+----
+Constraint Error
+
+# CHECK + DEFAULT: default satisfies check, explicit violation fails
+statement ok
+CREATE TABLE writable.main.test_def_chk (id BIGINT, price DOUBLE DEFAULT 10.0 CHECK (price >= 0));
+
+statement ok
+INSERT INTO writable.main.test_def_chk (id) VALUES (1);
+
+query IR
+SELECT id, price FROM writable.main.test_def_chk WHERE id = 1;
+----
+1	10.0
+
+statement error
+INSERT INTO writable.main.test_def_chk VALUES (2, -5.0);
+----
+Constraint Error
+
+statement ok
+DROP TABLE writable.main.test_def_nn;
+
+statement ok
+DROP TABLE writable.main.test_def_chk;
+
+# ============================================================================
+# 13. ALTER to add/remove NOT NULL and defaults
+# ============================================================================
+
+statement ok
+CREATE TABLE writable.main.test_alter_constraints (id BIGINT, val VARCHAR);
+
+statement ok
+INSERT INTO writable.main.test_alter_constraints VALUES (1, 'initial');
+
+# SET NOT NULL — should be enforced after
+statement ok
+ALTER TABLE writable.main.test_alter_constraints ALTER val SET NOT NULL;
+
+statement error
+INSERT INTO writable.main.test_alter_constraints VALUES (2, NULL);
+----
+Constraint Error
+
+# DROP NOT NULL — NULL now allowed
+statement ok
+ALTER TABLE writable.main.test_alter_constraints ALTER val DROP NOT NULL;
+
+statement ok
+INSERT INTO writable.main.test_alter_constraints VALUES (3, NULL);
+
+query I
+SELECT COUNT(*) FROM writable.main.test_alter_constraints;
+----
+2
+
+# SET DEFAULT — verify default applied
+statement ok
+ALTER TABLE writable.main.test_alter_constraints ALTER val SET DEFAULT 'auto';
+
+statement ok
+INSERT INTO writable.main.test_alter_constraints (id) VALUES (4);
+
+query T
+SELECT val FROM writable.main.test_alter_constraints WHERE id = 4;
+----
+auto
+
+# Change default — verify new value
+statement ok
+ALTER TABLE writable.main.test_alter_constraints ALTER val SET DEFAULT 'changed';
+
+statement ok
+INSERT INTO writable.main.test_alter_constraints (id) VALUES (5);
+
+query T
+SELECT val FROM writable.main.test_alter_constraints WHERE id = 5;
+----
+changed
+
+# DROP DEFAULT — verify NULL used
+statement ok
+ALTER TABLE writable.main.test_alter_constraints ALTER val DROP DEFAULT;
+
+statement ok
+INSERT INTO writable.main.test_alter_constraints (id) VALUES (6);
+
+query T
+SELECT val FROM writable.main.test_alter_constraints WHERE id = 6;
+----
+NULL
+
+statement ok
+DROP TABLE writable.main.test_alter_constraints;
+
+# ============================================================================
+# 14. ALTER column type
+# ============================================================================
+
+statement ok
+CREATE TABLE writable.main.test_alter_type (id BIGINT, val INTEGER DEFAULT 42);
+
+statement ok
+INSERT INTO writable.main.test_alter_type (id) VALUES (1);
+
+query I
+SELECT val FROM writable.main.test_alter_type WHERE id = 1;
+----
+42
+
+# Change type to BIGINT
+statement ok
+ALTER TABLE writable.main.test_alter_type ALTER val TYPE BIGINT;
+
+# Insert value exceeding INTEGER range — proves type is now BIGINT
+statement ok
+INSERT INTO writable.main.test_alter_type VALUES (2, 2147483648);
+
+query I
+SELECT val FROM writable.main.test_alter_type WHERE id = 2;
+----
+2147483648
+
+statement ok
+DROP TABLE writable.main.test_alter_type;
+
+# ============================================================================
+# 15. CREATE TABLE AS SELECT preserves types
+# ============================================================================
+
+statement ok
+CREATE TABLE writable.main.test_ctas_types AS SELECT 1::BIGINT AS id, 'hello'::VARCHAR AS name, 3.14::DOUBLE AS score, true::BOOLEAN AS active, DATE '2024-06-15' AS created;
+
+query ITRTT
+SELECT id, name, score, active, created FROM writable.main.test_ctas_types;
+----
+1	hello	3.14	true	2024-06-15
+
+# CTAS table is writable
+statement ok
+INSERT INTO writable.main.test_ctas_types VALUES (2, 'world', 2.72, false, DATE '2025-01-01');
+
+query I
+SELECT COUNT(*) FROM writable.main.test_ctas_types;
+----
+2
+
+statement ok
+DROP TABLE writable.main.test_ctas_types;
+
+# ============================================================================
+# Regression: static tables still work
+# ============================================================================
+
+statement ok
+INSERT INTO writable.main.writable_data VALUES (99990, 'constraint_test_ok');
+
+query T
+SELECT name FROM writable.main.writable_data WHERE id = 99990;
+----
+constraint_test_ok
+
+statement ok
+DELETE FROM writable.main.writable_data WHERE id = 99990;

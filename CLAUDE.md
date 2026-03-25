@@ -207,7 +207,7 @@ Always use `ArrowSchemaToDuckDBTypes()` (from `vgi_arrow_utils.hpp`) to convert 
 
 ### Function Protocol
 
-VGI uses `vgi_rpc` for RPC over subprocess stdin/stdout using Arrow IPC streams:
+VGI uses `vgi_rpc` for RPC over subprocess stdin/stdout or HTTP using Arrow IPC streams:
 
 - **Table functions** — Producer mode: client sends tick (0-row) batches, worker produces output
 - **Scalar functions** — Exchange mode: client sends input batches, worker returns 1:1 output

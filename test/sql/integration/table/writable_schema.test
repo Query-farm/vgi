@@ -1,0 +1,164 @@
+# name: test/sql/integration/table/writable_schema.test
+# description: Tests for CREATE SCHEMA and DROP SCHEMA on VGI writable catalogs
+# group: [vgi_integration_table]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'writable' AS writable (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# CREATE SCHEMA — basic
+# ============================================================================
+
+statement ok
+CREATE SCHEMA writable.test_schema;
+
+# Create a table in the new schema
+statement ok
+CREATE TABLE writable.test_schema.t1 (id BIGINT, val VARCHAR);
+
+statement ok
+INSERT INTO writable.test_schema.t1 VALUES (1, 'hello');
+
+query I
+SELECT COUNT(*) FROM writable.test_schema.t1;
+----
+1
+
+# ============================================================================
+# UPDATE in custom schema
+# ============================================================================
+
+statement ok
+UPDATE writable.test_schema.t1 SET val = 'updated' WHERE id = 1;
+
+query IT
+SELECT id, val FROM writable.test_schema.t1 WHERE id = 1;
+----
+1	updated
+
+# ============================================================================
+# DELETE in custom schema
+# ============================================================================
+
+statement ok
+INSERT INTO writable.test_schema.t1 VALUES (2, 'to_delete');
+
+statement ok
+DELETE FROM writable.test_schema.t1 WHERE id = 2;
+
+query I
+SELECT COUNT(*) FROM writable.test_schema.t1;
+----
+1
+
+# ============================================================================
+# ALTER TABLE in custom schema
+# ============================================================================
+
+statement ok
+ALTER TABLE writable.test_schema.t1 ADD COLUMN extra INTEGER;
+
+statement ok
+UPDATE writable.test_schema.t1 SET extra = 42 WHERE id = 1;
+
+query III
+SELECT id, extra, length(val) FROM writable.test_schema.t1 WHERE id = 1;
+----
+1	42	7
+
+# ============================================================================
+# CTAS in custom schema
+# ============================================================================
+
+statement ok
+CREATE TABLE writable.test_schema.t2 AS SELECT * FROM writable.test_schema.t1;
+
+query I
+SELECT COUNT(*) FROM writable.test_schema.t2;
+----
+1
+
+# ============================================================================
+# View in custom schema
+# ============================================================================
+
+statement ok
+CREATE VIEW writable.test_schema.v1 AS SELECT id, val FROM writable.test_schema.t1;
+
+query IT
+SELECT id, val FROM writable.test_schema.v1;
+----
+1	updated
+
+statement ok
+DROP VIEW writable.test_schema.v1;
+
+# ============================================================================
+# DROP TABLE in custom schema, then DROP SCHEMA
+# ============================================================================
+
+statement ok
+DROP TABLE writable.test_schema.t2;
+
+statement ok
+DROP TABLE writable.test_schema.t1;
+
+statement ok
+DROP SCHEMA writable.test_schema;
+
+# ============================================================================
+# CREATE SCHEMA IF NOT EXISTS
+# ============================================================================
+
+statement ok
+CREATE SCHEMA writable.s2;
+
+statement ok
+CREATE SCHEMA IF NOT EXISTS writable.s2;
+
+statement ok
+DROP SCHEMA writable.s2;
+
+# ============================================================================
+# DROP SCHEMA IF NOT EXISTS — no error on nonexistent
+# ============================================================================
+
+statement ok
+DROP SCHEMA IF EXISTS writable.nonexistent_schema;
+
+# ============================================================================
+# DROP SCHEMA CASCADE
+# ============================================================================
+
+statement ok
+CREATE SCHEMA writable.cascade_test;
+
+statement ok
+CREATE TABLE writable.cascade_test.t1 (id BIGINT);
+
+statement ok
+INSERT INTO writable.cascade_test.t1 VALUES (1);
+
+statement ok
+DROP SCHEMA writable.cascade_test CASCADE;
+
+# ============================================================================
+# Main schema still works (regression)
+# ============================================================================
+
+statement ok
+INSERT INTO writable.main.writable_data VALUES (99997, 'schema_test_ok');
+
+query T
+SELECT name FROM writable.main.writable_data WHERE id = 99997;
+----
+schema_test_ok
+
+statement ok
+DELETE FROM writable.main.writable_data WHERE id = 99997;

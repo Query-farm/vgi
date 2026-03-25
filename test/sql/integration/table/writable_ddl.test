@@ -1,0 +1,216 @@
+# name: test/sql/integration/table/writable_ddl.test
+# description: Tests for CREATE TABLE and DROP TABLE on VGI writable catalogs
+# group: [vgi_integration_table]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'writable' AS writable (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# CREATE TABLE — basic
+# ============================================================================
+
+statement ok
+CREATE TABLE writable.main.test_dynamic (id BIGINT, name VARCHAR, score DOUBLE);
+
+query I
+SELECT COUNT(*) FROM writable.main.test_dynamic;
+----
+0
+
+# ============================================================================
+# INSERT into dynamic table
+# ============================================================================
+
+statement ok
+INSERT INTO writable.main.test_dynamic VALUES (1, 'alice', 95.5);
+
+statement ok
+INSERT INTO writable.main.test_dynamic VALUES (2, 'bob', 87.3), (3, 'charlie', 91.0);
+
+query I
+SELECT COUNT(*) FROM writable.main.test_dynamic;
+----
+3
+
+# ============================================================================
+# UPDATE and DELETE on dynamic table
+# ============================================================================
+
+statement ok
+UPDATE writable.main.test_dynamic SET name = 'updated' WHERE id = 1;
+
+query T
+SELECT name FROM writable.main.test_dynamic WHERE id = 1;
+----
+updated
+
+statement ok
+DELETE FROM writable.main.test_dynamic WHERE id = 2;
+
+query I
+SELECT COUNT(*) FROM writable.main.test_dynamic;
+----
+2
+
+# ============================================================================
+# CREATE TABLE IF NOT EXISTS — no error on duplicate
+# ============================================================================
+
+statement ok
+CREATE TABLE IF NOT EXISTS writable.main.test_dynamic (x INT);
+
+query I
+SELECT COUNT(*) FROM writable.main.test_dynamic;
+----
+2
+
+# ============================================================================
+# DROP TABLE
+# ============================================================================
+
+statement ok
+DROP TABLE writable.main.test_dynamic;
+
+# ============================================================================
+# DROP TABLE IF EXISTS — no error on nonexistent
+# ============================================================================
+
+statement ok
+DROP TABLE IF EXISTS writable.main.nonexistent_table;
+
+# ============================================================================
+# CREATE TABLE with constraints
+# ============================================================================
+
+statement ok
+CREATE TABLE writable.main.test_nn (id BIGINT NOT NULL, val VARCHAR);
+
+statement ok
+INSERT INTO writable.main.test_nn VALUES (1, 'ok');
+
+query I
+SELECT COUNT(*) FROM writable.main.test_nn;
+----
+1
+
+statement ok
+DROP TABLE writable.main.test_nn;
+
+statement ok
+CREATE TABLE writable.main.test_pk (id BIGINT PRIMARY KEY, val VARCHAR);
+
+statement ok
+INSERT INTO writable.main.test_pk VALUES (1, 'first');
+
+query I
+SELECT COUNT(*) FROM writable.main.test_pk;
+----
+1
+
+statement ok
+DROP TABLE writable.main.test_pk;
+
+statement ok
+CREATE TABLE writable.main.test_uq (id BIGINT, code VARCHAR UNIQUE);
+
+statement ok
+INSERT INTO writable.main.test_uq VALUES (1, 'A');
+
+query I
+SELECT COUNT(*) FROM writable.main.test_uq;
+----
+1
+
+statement ok
+DROP TABLE writable.main.test_uq;
+
+statement ok
+CREATE TABLE writable.main.test_chk (id BIGINT, score DOUBLE CHECK (score >= 0));
+
+statement ok
+INSERT INTO writable.main.test_chk VALUES (1, 42.0);
+
+query I
+SELECT COUNT(*) FROM writable.main.test_chk;
+----
+1
+
+statement ok
+DROP TABLE writable.main.test_chk;
+
+# ============================================================================
+# Transactional DDL: CREATE + INSERT + COMMIT
+# ============================================================================
+
+statement ok
+BEGIN;
+
+statement ok
+CREATE TABLE writable.main.tx_test (id BIGINT, val VARCHAR);
+
+statement ok
+INSERT INTO writable.main.tx_test VALUES (1, 'committed');
+
+statement ok
+COMMIT;
+
+query I
+SELECT COUNT(*) FROM writable.main.tx_test;
+----
+1
+
+statement ok
+DROP TABLE writable.main.tx_test;
+
+# ============================================================================
+# Transactional DDL: CREATE + ROLLBACK — table should not exist
+# ============================================================================
+
+statement ok
+BEGIN;
+
+statement ok
+CREATE TABLE writable.main.tx_rollback (id BIGINT, val VARCHAR);
+
+statement ok
+INSERT INTO writable.main.tx_rollback VALUES (1, 'should_disappear');
+
+statement ok
+ROLLBACK;
+
+statement error
+SELECT * FROM writable.main.tx_rollback;
+----
+
+# ============================================================================
+# Unsupported DDL produces clear errors
+# ============================================================================
+
+statement error
+CREATE INDEX idx ON writable.main.writable_data (id);
+----
+
+statement error
+CREATE SEQUENCE writable.main.seq;
+----
+
+# ============================================================================
+# Static tables still work (regression check)
+# ============================================================================
+
+statement ok
+INSERT INTO writable.main.writable_data VALUES (99998, 'static_ok');
+
+query T
+SELECT name FROM writable.main.writable_data WHERE id = 99998;
+----
+static_ok
+
+statement ok
+DELETE FROM writable.main.writable_data WHERE id = 99998;

@@ -15,6 +15,7 @@
 
 #include "storage/vgi_catalog.hpp"
 #include "storage/vgi_schema_entry.hpp"
+#include "storage/vgi_transaction.hpp"
 #include "vgi_catalog_api.hpp"
 #include "vgi_logging.hpp"
 #include "vgi_rpc_types.hpp"
@@ -78,8 +79,10 @@ void VgiMacroSet::LoadEntries(ClientContext &context) {
 	// Determine the RPC type string based on catalog type
 	std::string rpc_type = (macro_catalog_type_ == CatalogType::MACRO_ENTRY) ? "SCALAR_MACRO" : "TABLE_MACRO";
 
+	auto &vgi_tx_load = VgiTransaction::Get(context, catalog_);
 	auto macros = vgi::InvokeCatalogSchemaContentsMacros(attach_params->worker_path(), attach_result->attach_id,
 	                                                     schema_.name, rpc_type, context,
+	                                                     vgi_tx_load.GetTransactionId(),
 	                                                     attach_params->worker_debug(), attach_params->use_pool());
 
 	for (auto &macro_info : macros) {

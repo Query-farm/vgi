@@ -41,6 +41,10 @@ void VgiTransaction::Commit(ClientContext &context) {
 		    context, params->worker_debug(), params->use_pool());
 	}
 	transaction_state = VgiTransactionState::TRANSACTION_FINISHED;
+	// Clear catalog cache to ensure post-transaction state is fresh.
+	// This handles DDL rollback/commit correctly — without this, a CREATE TABLE
+	// followed by ROLLBACK would leave stale entries in the cache.
+	vgi_catalog_.ClearCache();
 }
 
 void VgiTransaction::Rollback() {
@@ -52,6 +56,8 @@ void VgiTransaction::Rollback() {
 		    context_, params->worker_debug(), params->use_pool());
 	}
 	transaction_state = VgiTransactionState::TRANSACTION_FINISHED;
+	// Clear catalog cache after rollback (see Commit comment above)
+	vgi_catalog_.ClearCache();
 }
 
 VgiTransaction &VgiTransaction::Get(ClientContext &context, Catalog &catalog) {

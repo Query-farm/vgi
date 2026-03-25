@@ -14,6 +14,7 @@
 #include "duckdb/function/function.hpp"
 #include "vgi_rpc_types.hpp"
 
+#include "duckdb/common/enums/on_create_conflict.hpp"
 #include "vgi_arrow_utils.hpp"
 #include "vgi_protocol.hpp"
 
@@ -28,6 +29,20 @@ class ClientContext;
 struct CreateTableInfo;
 
 namespace vgi {
+
+// Convert DuckDB OnCreateConflict enum to the string expected by VGI RPC protocol.
+inline std::string MapOnConflict(OnCreateConflict conflict) {
+	switch (conflict) {
+	case OnCreateConflict::ERROR_ON_CONFLICT:
+		return "ERROR";
+	case OnCreateConflict::IGNORE_ON_CONFLICT:
+		return "IGNORE";
+	case OnCreateConflict::REPLACE_ON_CONFLICT:
+		return "REPLACE";
+	default:
+		return "ERROR";
+	}
+}
 
 // Parameters for connecting to a VGI worker
 struct VgiAttachParameters {
@@ -303,38 +318,47 @@ CatalogAttachResult InvokeCatalogAttach(const std::string &worker_path, const st
 // Invoke catalog_schemas: list schemas in an attached catalog
 std::vector<VgiSchemaInfo> InvokeCatalogSchemas(const std::string &worker_path,
                                                 const std::vector<uint8_t> &attach_id, ClientContext &context,
+                                                const std::vector<uint8_t> &transaction_id,
                                                 bool worker_debug = false, bool use_pool = true);
 
 // Invoke catalog_schema_contents_tables: list tables in a schema
 std::vector<VgiTableInfo> InvokeCatalogSchemaContentsTables(const std::string &worker_path,
                                                             const std::vector<uint8_t> &attach_id,
                                                             const std::string &schema_name, ClientContext &context,
+                                                            const std::vector<uint8_t> &transaction_id,
                                                             bool worker_debug = false, bool use_pool = true);
 
 // Invoke catalog_schema_contents_views: list views in a schema
 std::vector<VgiViewInfo> InvokeCatalogSchemaContentsViews(const std::string &worker_path,
                                                           const std::vector<uint8_t> &attach_id,
                                                           const std::string &schema_name, ClientContext &context,
+                                                          const std::vector<uint8_t> &transaction_id,
                                                           bool worker_debug = false, bool use_pool = true);
 
 // Invoke catalog_schema_contents_macros: list macros in a schema
 // macro_type: "SCALAR_MACRO" or "TABLE_MACRO"
 std::vector<VgiMacroInfo> InvokeCatalogSchemaContentsMacros(
     const std::string &worker_path, const std::vector<uint8_t> &attach_id, const std::string &schema_name,
-    const std::string &macro_type, ClientContext &context, bool worker_debug = false, bool use_pool = true);
+    const std::string &macro_type, ClientContext &context,
+    const std::vector<uint8_t> &transaction_id,
+    bool worker_debug = false, bool use_pool = true);
 
 // Invoke catalog_schema_contents_functions: list functions in a schema
 // function_type: "SCALAR_FUNCTION" or "TABLE_FUNCTION"
 std::vector<VgiFunctionInfo> InvokeCatalogSchemaContentsFunctions(
     const std::string &worker_path, const std::vector<uint8_t> &attach_id, const std::string &schema_name,
-    const std::string &function_type, ClientContext &context, bool worker_debug = false, bool use_pool = true);
+    const std::string &function_type, ClientContext &context,
+    const std::vector<uint8_t> &transaction_id,
+    bool worker_debug = false, bool use_pool = true);
 
 // Invoke catalog_table_get: get a specific table's metadata
 // Returns nullopt if table not found (empty response)
 std::optional<VgiTableInfo> InvokeCatalogTableGet(const std::string &worker_path,
                                                    const std::vector<uint8_t> &attach_id,
                                                    const std::string &schema_name, const std::string &table_name,
-                                                   ClientContext &context, bool worker_debug = false,
+                                                   ClientContext &context,
+                                                   const std::vector<uint8_t> &transaction_id,
+                                                   bool worker_debug = false,
                                                    bool use_pool = true);
 
 // Invoke catalog_table_get with time-travel AT clause
@@ -345,6 +369,7 @@ std::optional<VgiTableInfo> InvokeCatalogTableGet(const std::string &worker_path
                                                    ClientContext &context,
                                                    const std::string &at_unit,
                                                    const std::string &at_value,
+                                                   const std::vector<uint8_t> &transaction_id,
                                                    bool worker_debug = false,
                                                    bool use_pool = true);
 
@@ -352,14 +377,17 @@ std::optional<VgiTableInfo> InvokeCatalogTableGet(const std::string &worker_path
 std::optional<VgiViewInfo> InvokeCatalogViewGet(const std::string &worker_path,
                                                  const std::vector<uint8_t> &attach_id,
                                                  const std::string &schema_name, const std::string &view_name,
-                                                 ClientContext &context, bool worker_debug = false,
+                                                 ClientContext &context,
+                                                 const std::vector<uint8_t> &transaction_id = {},
+                                                 bool worker_debug = false,
                                                  bool use_pool = true);
 
 // Invoke catalog_table_scan_function_get: get scan function for a table
 VgiScanFunctionResult InvokeCatalogTableScanFunctionGet(
     const std::string &worker_path, const std::vector<uint8_t> &attach_id, const std::string &schema_name,
-    const std::string &table_name, ClientContext &context, const std::string &at_unit = "",
-    const std::string &at_value = "", bool worker_debug = false, bool use_pool = true);
+    const std::string &table_name, ClientContext &context, const std::string &at_unit,
+    const std::string &at_value, const std::vector<uint8_t> &transaction_id,
+    bool worker_debug = false, bool use_pool = true);
 
 // Write function discovery uses the same result type as scan function discovery.
 using VgiWriteFunctionResult = VgiScanFunctionResult;
@@ -367,15 +395,18 @@ using VgiWriteFunctionResult = VgiScanFunctionResult;
 // Invoke catalog_table_{insert,update,delete}_function_get: get write function for a table
 VgiWriteFunctionResult InvokeCatalogTableInsertFunctionGet(
     const std::string &worker_path, const std::vector<uint8_t> &attach_id, const std::string &schema_name,
-    const std::string &table_name, ClientContext &context, bool worker_debug = false, bool use_pool = true);
+    const std::string &table_name, ClientContext &context, const std::vector<uint8_t> &transaction_id,
+    bool worker_debug = false, bool use_pool = true);
 
 VgiWriteFunctionResult InvokeCatalogTableUpdateFunctionGet(
     const std::string &worker_path, const std::vector<uint8_t> &attach_id, const std::string &schema_name,
-    const std::string &table_name, ClientContext &context, bool worker_debug = false, bool use_pool = true);
+    const std::string &table_name, ClientContext &context, const std::vector<uint8_t> &transaction_id,
+    bool worker_debug = false, bool use_pool = true);
 
 VgiWriteFunctionResult InvokeCatalogTableDeleteFunctionGet(
     const std::string &worker_path, const std::vector<uint8_t> &attach_id, const std::string &schema_name,
-    const std::string &table_name, ClientContext &context, bool worker_debug = false, bool use_pool = true);
+    const std::string &table_name, ClientContext &context, const std::vector<uint8_t> &transaction_id,
+    bool worker_debug = false, bool use_pool = true);
 
 // ============================================================================
 // Transaction Lifecycle
@@ -396,6 +427,170 @@ void InvokeCatalogTransactionCommit(
 // Invoke catalog_transaction_rollback: rollback a transaction.
 void InvokeCatalogTransactionRollback(
     const std::string &worker_path, const std::vector<uint8_t> &attach_id,
+    const std::vector<uint8_t> &transaction_id,
+    ClientContext &context, bool worker_debug = false, bool use_pool = true);
+
+// ============================================================================
+// DDL Operations
+// ============================================================================
+
+// Invoke catalog_table_create: create a new table in the catalog.
+void InvokeCatalogTableCreate(
+    const std::string &worker_path, const std::vector<uint8_t> &attach_id,
+    const std::string &schema_name, const std::string &table_name,
+    const std::shared_ptr<arrow::Schema> &columns_schema,
+    const std::string &on_conflict,
+    const std::vector<int> &not_null_constraints,
+    const std::vector<std::vector<int>> &unique_constraints,
+    const std::vector<std::string> &check_constraints,
+    const std::vector<std::vector<int>> &primary_key_constraints,
+    const std::vector<std::vector<uint8_t>> &foreign_key_constraints,
+    const std::vector<uint8_t> &transaction_id,
+    ClientContext &context, bool worker_debug = false, bool use_pool = true);
+
+// Invoke catalog_table_drop: drop a table from the catalog.
+void InvokeCatalogTableDrop(
+    const std::string &worker_path, const std::vector<uint8_t> &attach_id,
+    const std::string &schema_name, const std::string &table_name,
+    bool ignore_not_found, const std::vector<uint8_t> &transaction_id,
+    ClientContext &context, bool worker_debug = false, bool use_pool = true);
+
+// Invoke catalog_table_rename: rename a table in the catalog.
+void InvokeCatalogTableRename(
+    const std::string &worker_path, const std::vector<uint8_t> &attach_id,
+    const std::string &schema_name, const std::string &table_name,
+    const std::string &new_name, bool ignore_not_found,
+    const std::vector<uint8_t> &transaction_id,
+    ClientContext &context, bool worker_debug = false, bool use_pool = true);
+
+// Invoke catalog_table_column_add: add a column to a table.
+void InvokeCatalogTableColumnAdd(
+    const std::string &worker_path, const std::vector<uint8_t> &attach_id,
+    const std::string &schema_name, const std::string &table_name,
+    const std::shared_ptr<arrow::Schema> &column_definition,
+    bool if_column_not_exists, const std::vector<uint8_t> &transaction_id,
+    ClientContext &context, bool worker_debug = false, bool use_pool = true);
+
+// Invoke catalog_table_column_drop: drop a column from a table.
+void InvokeCatalogTableColumnDrop(
+    const std::string &worker_path, const std::vector<uint8_t> &attach_id,
+    const std::string &schema_name, const std::string &table_name,
+    const std::string &column_name, bool if_column_exists, bool cascade,
+    const std::vector<uint8_t> &transaction_id,
+    ClientContext &context, bool worker_debug = false, bool use_pool = true);
+
+// Invoke catalog_table_column_rename: rename a column in a table.
+void InvokeCatalogTableColumnRename(
+    const std::string &worker_path, const std::vector<uint8_t> &attach_id,
+    const std::string &schema_name, const std::string &table_name,
+    const std::string &old_column_name, const std::string &new_column_name,
+    const std::vector<uint8_t> &transaction_id,
+    ClientContext &context, bool worker_debug = false, bool use_pool = true);
+
+// Set or clear the comment on a table
+void InvokeCatalogTableCommentSet(
+    const std::string &worker_path, const std::vector<uint8_t> &attach_id,
+    const std::string &schema_name, const std::string &table_name,
+    const std::string &comment, bool comment_is_null,
+    bool ignore_not_found, const std::vector<uint8_t> &transaction_id,
+    ClientContext &context, bool worker_debug = false, bool use_pool = true);
+
+// Set or clear the comment on a table column
+void InvokeCatalogTableColumnCommentSet(
+    const std::string &worker_path, const std::vector<uint8_t> &attach_id,
+    const std::string &schema_name, const std::string &table_name,
+    const std::string &column_name,
+    const std::string &comment, bool comment_is_null,
+    bool ignore_not_found, const std::vector<uint8_t> &transaction_id,
+    ClientContext &context, bool worker_debug = false, bool use_pool = true);
+
+// Invoke catalog_table_column_type_change: change a column's type in a table.
+void InvokeCatalogTableColumnTypeChange(
+    const std::string &worker_path, const std::vector<uint8_t> &attach_id,
+    const std::string &schema_name, const std::string &table_name,
+    const std::shared_ptr<arrow::Schema> &column_definition,
+    const std::string &expression,
+    const std::vector<uint8_t> &transaction_id,
+    ClientContext &context, bool worker_debug = false, bool use_pool = true);
+
+// Invoke catalog_table_column_default_set: set a column's default expression.
+void InvokeCatalogTableColumnDefaultSet(
+    const std::string &worker_path, const std::vector<uint8_t> &attach_id,
+    const std::string &schema_name, const std::string &table_name,
+    const std::string &column_name, const std::string &expression,
+    const std::vector<uint8_t> &transaction_id,
+    ClientContext &context, bool worker_debug = false, bool use_pool = true);
+
+// Invoke catalog_table_column_default_drop: drop a column's default expression.
+void InvokeCatalogTableColumnDefaultDrop(
+    const std::string &worker_path, const std::vector<uint8_t> &attach_id,
+    const std::string &schema_name, const std::string &table_name,
+    const std::string &column_name,
+    const std::vector<uint8_t> &transaction_id,
+    ClientContext &context, bool worker_debug = false, bool use_pool = true);
+
+// Invoke catalog_table_not_null_set: set NOT NULL constraint on a column.
+void InvokeCatalogTableNotNullSet(
+    const std::string &worker_path, const std::vector<uint8_t> &attach_id,
+    const std::string &schema_name, const std::string &table_name,
+    const std::string &column_name,
+    const std::vector<uint8_t> &transaction_id,
+    ClientContext &context, bool worker_debug = false, bool use_pool = true);
+
+// Invoke catalog_table_not_null_drop: drop NOT NULL constraint from a column.
+void InvokeCatalogTableNotNullDrop(
+    const std::string &worker_path, const std::vector<uint8_t> &attach_id,
+    const std::string &schema_name, const std::string &table_name,
+    const std::string &column_name,
+    const std::vector<uint8_t> &transaction_id,
+    ClientContext &context, bool worker_debug = false, bool use_pool = true);
+
+// ============================================================================
+// View DDL Operations
+// ============================================================================
+
+// Invoke catalog_view_create: create a new view in the catalog.
+void InvokeCatalogViewCreate(
+    const std::string &worker_path, const std::vector<uint8_t> &attach_id,
+    const std::string &schema_name, const std::string &view_name,
+    const std::string &definition, const std::string &on_conflict,
+    const std::vector<uint8_t> &transaction_id,
+    ClientContext &context, bool worker_debug = false, bool use_pool = true);
+
+// Invoke catalog_view_drop: drop a view from the catalog.
+void InvokeCatalogViewDrop(
+    const std::string &worker_path, const std::vector<uint8_t> &attach_id,
+    const std::string &schema_name, const std::string &view_name,
+    bool ignore_not_found, const std::vector<uint8_t> &transaction_id,
+    ClientContext &context, bool worker_debug = false, bool use_pool = true);
+
+// Invoke catalog_view_rename: rename a view in the catalog.
+void InvokeCatalogViewRename(
+    const std::string &worker_path, const std::vector<uint8_t> &attach_id,
+    const std::string &schema_name, const std::string &view_name,
+    const std::string &new_name, bool ignore_not_found,
+    const std::vector<uint8_t> &transaction_id,
+    ClientContext &context, bool worker_debug = false, bool use_pool = true);
+
+// Set or clear the comment on a view
+void InvokeCatalogViewCommentSet(
+    const std::string &worker_path, const std::vector<uint8_t> &attach_id,
+    const std::string &schema_name, const std::string &view_name,
+    const std::string &comment, bool comment_is_null,
+    bool ignore_not_found, const std::vector<uint8_t> &transaction_id,
+    ClientContext &context, bool worker_debug = false, bool use_pool = true);
+
+// Invoke catalog_schema_create: create a new schema in the catalog.
+void InvokeCatalogSchemaCreate(
+    const std::string &worker_path, const std::vector<uint8_t> &attach_id,
+    const std::string &schema_name, const std::string &on_conflict,
+    const std::vector<uint8_t> &transaction_id,
+    ClientContext &context, bool worker_debug = false, bool use_pool = true);
+
+// Invoke catalog_schema_drop: drop a schema from the catalog.
+void InvokeCatalogSchemaDrop(
+    const std::string &worker_path, const std::vector<uint8_t> &attach_id,
+    const std::string &schema_name, bool ignore_not_found, bool cascade,
     const std::vector<uint8_t> &transaction_id,
     ClientContext &context, bool worker_debug = false, bool use_pool = true);
 
