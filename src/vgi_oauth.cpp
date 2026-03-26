@@ -4,7 +4,8 @@
 #include <future>
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
-#include <unistd.h>  // usleep
+#include <unistd.h>   // usleep
+#include <random>     // std::random_device for PKCE
 #else
 #include <thread>
 #endif
@@ -123,23 +124,25 @@ std::string Base64UrlEncode(const unsigned char *data, size_t len) {
 }
 
 #ifdef __EMSCRIPTEN__
-// WASM: use crypto.getRandomValues for entropy + DuckDB's MbedTlsWrapper for SHA-256.
+// WASM: use DuckDB's MbedTlsWrapper for SHA-256 + C++ random_device for entropy.
+// EM_ASM doesn't work reliably in WASM side modules (extensions) so we use pure C++.
 
 std::string GenerateCodeVerifier() {
 	unsigned char buf[32];
-	// clang-format off
-	EM_ASM({ crypto.getRandomValues(Module.HEAPU8.subarray($0, $0 + 32)); }, buf);
-	// clang-format on
+	std::random_device rd;
+	for (size_t i = 0; i < sizeof(buf); i += sizeof(unsigned int)) {
+		auto val = rd();
+		auto n = std::min(sizeof(buf) - i, sizeof(unsigned int));
+		memcpy(buf + i, &val, n);
+	}
 	return Base64UrlEncode(buf, sizeof(buf));
 }
 
 std::string ComputeCodeChallenge(const std::string &verifier) {
-	// Use DuckDB's bundled mbedTLS SHA-256 (available in the main WASM module)
 	duckdb_mbedtls::MbedTlsWrapper::SHA256State state;
 	state.AddString(verifier);
 	char hex_hash[duckdb_mbedtls::MbedTlsWrapper::SHA256_HASH_LENGTH_TEXT];
 	state.FinishHex(hex_hash);
-	// Convert hex string to raw bytes for base64url encoding
 	unsigned char hash[32];
 	for (int i = 0; i < 32; i++) {
 		auto hi = hex_hash[i * 2], lo = hex_hash[i * 2 + 1];
@@ -152,9 +155,12 @@ std::string ComputeCodeChallenge(const std::string &verifier) {
 
 std::string GenerateState() {
 	unsigned char buf[16];
-	// clang-format off
-	EM_ASM({ crypto.getRandomValues(Module.HEAPU8.subarray($0, $0 + 16)); }, buf);
-	// clang-format on
+	std::random_device rd;
+	for (size_t i = 0; i < sizeof(buf); i += sizeof(unsigned int)) {
+		auto val = rd();
+		auto n = std::min(sizeof(buf) - i, sizeof(unsigned int));
+		memcpy(buf + i, &val, n);
+	}
 	std::string result;
 	result.reserve(32);
 	static const char hex[] = "0123456789abcdef";

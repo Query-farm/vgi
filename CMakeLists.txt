@@ -9,14 +9,28 @@ set(CMAKE_CXX_STANDARD_REQUIRED 1)
 # DuckDB's extension distribution supports vcpkg. As such, dependencies can be added in ./vcpkg.json and then
 # used in cmake with find_package. Feel free to remove or replace with other dependencies.
 # Note that it should also be removed from vcpkg.json to prevent needlessly installing it..
-find_package(OpenSSL REQUIRED)
-find_package(Arrow REQUIRED)
+if(DEFINED DUCKDB_WASM_ARROW_PREFIX)
+    # WASM build: use Arrow from duckdb-wasm's vendored build
+    message(STATUS "VGI: Using duckdb-wasm Arrow from ${DUCKDB_WASM_ARROW_PREFIX}")
+    include_directories(${DUCKDB_WASM_ARROW_PREFIX}/include)
+    add_library(arrow_wasm STATIC IMPORTED)
+    set_target_properties(arrow_wasm PROPERTIES IMPORTED_LOCATION ${DUCKDB_WASM_ARROW_PREFIX}/lib/libarrow.a)
+    set(VGI_ARROW_LIB arrow_wasm)
+    # OpenSSL not needed in WASM (emscripten handles TLS via XHR)
+    set(VGI_SSL_LIBS "")
+else()
+    find_package(OpenSSL REQUIRED)
+    find_package(Arrow REQUIRED)
+    set(VGI_ARROW_LIB Arrow::arrow_static)
+    set(VGI_SSL_LIBS OpenSSL::SSL OpenSSL::Crypto)
+endif()
 
 set(EXTENSION_NAME ${TARGET_NAME}_extension)
 set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 
 project(${TARGET_NAME})
 include_directories(src/include)
+include_directories(duckdb/third_party/mbedtls/include)
 include_directories(duckdb/third_party/httplib)
 include_directories(duckdb/third_party/zstd/include)
 
@@ -60,8 +74,8 @@ build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 
 # Link OpenSSL in both the static library as the loadable extension
-target_link_libraries(${EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto Arrow::arrow_static)
-target_link_libraries(${LOADABLE_EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto Arrow::arrow_static)
+target_link_libraries(${EXTENSION_NAME} ${VGI_SSL_LIBS} ${VGI_ARROW_LIB})
+target_link_libraries(${LOADABLE_EXTENSION_NAME} ${VGI_SSL_LIBS} ${VGI_ARROW_LIB})
 
 install(
   TARGETS ${EXTENSION_NAME}

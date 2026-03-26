@@ -1,0 +1,67 @@
+# name: test/sql/integration/table/writable_index.test
+# description: Tests for index catalog support on VGI catalogs
+# group: [vgi_integration_table]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+# ============================================================================
+# Test: Declarative indexes visible in duckdb_indexes()
+# ============================================================================
+
+statement ok
+ATTACH 'example' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# The example worker defines two indexes on data.numbers:
+#   idx_numbers_value (regular) and idx_numbers_value_unique (unique)
+query ITTT rowsort
+SELECT index_name, table_name, is_unique, is_primary FROM duckdb_indexes() WHERE database_name = 'ex';
+----
+idx_numbers_value	numbers	false	false
+idx_numbers_value_unique	numbers	true	false
+
+# Verify schema_name is correct
+query TT
+SELECT index_name, schema_name FROM duckdb_indexes() WHERE database_name = 'ex' AND index_name = 'idx_numbers_value';
+----
+idx_numbers_value	data
+
+# ============================================================================
+# Test: CREATE INDEX on read-only catalog returns error
+# ============================================================================
+
+statement error
+CREATE INDEX idx_test ON ex.data.numbers (value);
+----
+Cannot create index: catalog is read-only
+
+# ============================================================================
+# Test: DROP INDEX on read-only catalog returns error
+# ============================================================================
+
+statement error
+DROP INDEX ex.data.idx_numbers_value;
+----
+Cannot drop index: catalog is read-only
+
+# ============================================================================
+# Test: DROP INDEX IF EXISTS on read-only catalog returns error
+# ============================================================================
+
+statement error
+DROP INDEX IF EXISTS ex.data.idx_numbers_value;
+----
+Cannot drop index: catalog is read-only
+
+# ============================================================================
+# Test: CREATE UNIQUE INDEX on read-only catalog returns error
+# ============================================================================
+
+statement error
+CREATE UNIQUE INDEX idx_test_unique ON ex.data.numbers (value);
+----
+Cannot create index: catalog is read-only
+
+statement ok
+DETACH ex;

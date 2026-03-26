@@ -83,8 +83,10 @@ void VgiWorkerPool::SetDefaultSettings(const PoolSettings &settings) {
 }
 
 VgiWorkerPool::VgiWorkerPool() {
-	// Start the cleanup thread
+#ifndef __EMSCRIPTEN__
+	// Start the cleanup thread (not available in WASM single-threaded mode)
 	cleanup_thread_ = std::thread(&VgiWorkerPool::CleanupThread, this);
+#endif
 }
 
 VgiWorkerPool::~VgiWorkerPool() {
@@ -92,10 +94,12 @@ VgiWorkerPool::~VgiWorkerPool() {
 	shutdown_.store(true);
 	cleanup_cv_.notify_all();
 
+#ifndef __EMSCRIPTEN__
 	// Wait for cleanup thread
 	if (cleanup_thread_.joinable()) {
 		cleanup_thread_.join();
 	}
+#endif
 
 	// Clear all pools (workers will be destroyed)
 	std::lock_guard<std::mutex> lock(mutex_);
