@@ -21,7 +21,9 @@
 #include "vgi_logging.hpp"
 #include "vgi_oauth.hpp"
 #include "vgi_profiling.hpp"
+#ifndef __EMSCRIPTEN__
 #include "vgi_subprocess.hpp"
+#endif
 #include "vgi_table_function.hpp"
 #include "vgi_transport.hpp"
 #include "vgi_worker_pool.hpp"
@@ -132,6 +134,15 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 		throw BinderException("VGI ATTACH requires LOCATION option specifying the worker path");
 	}
 
+#ifdef __EMSCRIPTEN__
+	// WASM: only HTTP transport is supported (no subprocess/fork)
+	if (!vgi::IsHttpTransport(worker_path)) {
+		throw BinderException("VGI in WASM only supports HTTP transport. "
+		                      "LOCATION must be an HTTP/HTTPS URL.");
+	}
+	use_pool = false;
+	// HTTP in WASM goes through duckdb-wasm's XHR layer, not httpfs
+#else
 	// HTTP transport: require httpfs for POST support, disable subprocess pooling
 	if (vgi::IsHttpTransport(worker_path)) {
 		try {
@@ -145,6 +156,7 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 		}
 		use_pool = false; // HTTP is stateless, no subprocess pooling
 	}
+#endif
 
 	// Seed OAuth refresh token if provided
 	if (!oauth_refresh_token.empty()) {
