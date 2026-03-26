@@ -39,6 +39,9 @@
 #ifndef __EMSCRIPTEN__
 // DuckDB-vendored httplib for the local callback server (PKCE flow only)
 #include "httplib.hpp"
+#else
+// DuckDB's bundled mbedTLS for SHA-256 (PKCE code challenge)
+#include "mbedtls_wrapper.hpp"
 #endif
 
 using namespace duckdb_yyjson; // NOLINT
@@ -120,10 +123,47 @@ std::string Base64UrlEncode(const unsigned char *data, size_t len) {
 }
 
 #ifdef __EMSCRIPTEN__
-// PKCE crypto not needed in WASM (device flow only)
-std::string GenerateCodeVerifier() { throw IOException("VGI OAuth: PKCE not available in WASM"); }
-std::string ComputeCodeChallenge(const std::string &) { throw IOException("VGI OAuth: PKCE not available in WASM"); }
-std::string GenerateState() { throw IOException("VGI OAuth: PKCE not available in WASM"); }
+// WASM: use crypto.getRandomValues for entropy + DuckDB's MbedTlsWrapper for SHA-256.
+
+std::string GenerateCodeVerifier() {
+	unsigned char buf[32];
+	// clang-format off
+	EM_ASM({ crypto.getRandomValues(Module.HEAPU8.subarray($0, $0 + 32)); }, buf);
+	// clang-format on
+	return Base64UrlEncode(buf, sizeof(buf));
+}
+
+std::string ComputeCodeChallenge(const std::string &verifier) {
+	// Use DuckDB's bundled mbedTLS SHA-256 (available in the main WASM module)
+	duckdb_mbedtls::MbedTlsWrapper::SHA256State state;
+	state.AddString(verifier);
+	char hex_hash[duckdb_mbedtls::MbedTlsWrapper::SHA256_HASH_LENGTH_TEXT];
+	state.FinishHex(hex_hash);
+	// Convert hex string to raw bytes for base64url encoding
+	unsigned char hash[32];
+	for (int i = 0; i < 32; i++) {
+		auto hi = hex_hash[i * 2], lo = hex_hash[i * 2 + 1];
+		hash[i] = static_cast<unsigned char>(
+		    ((hi >= 'a' ? hi - 'a' + 10 : hi - '0') << 4) |
+		     (lo >= 'a' ? lo - 'a' + 10 : lo - '0'));
+	}
+	return Base64UrlEncode(hash, sizeof(hash));
+}
+
+std::string GenerateState() {
+	unsigned char buf[16];
+	// clang-format off
+	EM_ASM({ crypto.getRandomValues(Module.HEAPU8.subarray($0, $0 + 16)); }, buf);
+	// clang-format on
+	std::string result;
+	result.reserve(32);
+	static const char hex[] = "0123456789abcdef";
+	for (size_t i = 0; i < sizeof(buf); i++) {
+		result += hex[(buf[i] >> 4) & 0xF];
+		result += hex[buf[i] & 0xF];
+	}
+	return result;
+}
 #else
 std::string GenerateCodeVerifier() {
 	unsigned char buf[32];
