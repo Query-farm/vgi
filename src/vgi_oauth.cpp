@@ -2,7 +2,12 @@
 
 #include <cctype>
 #include <future>
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#include <unistd.h>  // usleep
+#else
 #include <thread>
+#endif
 
 #include "duckdb.hpp"
 #include "duckdb/common/http_util.hpp"
@@ -14,10 +19,13 @@
 #include "duckdb/catalog/catalog_transaction.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
 
+#ifndef __EMSCRIPTEN__
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 #include <openssl/sha.h>
+#endif
 
+#ifndef __EMSCRIPTEN__
 #if defined(__APPLE__) || defined(__linux__)
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -26,9 +34,12 @@
 #include <windows.h>
 #include <shellapi.h>
 #endif
+#endif
 
-// DuckDB-vendored httplib for the local callback server
+#ifndef __EMSCRIPTEN__
+// DuckDB-vendored httplib for the local callback server (PKCE flow only)
 #include "httplib.hpp"
+#endif
 
 using namespace duckdb_yyjson; // NOLINT
 
@@ -108,9 +119,13 @@ std::string Base64UrlEncode(const unsigned char *data, size_t len) {
 	return result;
 }
 
+#ifdef __EMSCRIPTEN__
+// PKCE crypto not needed in WASM (device flow only)
+std::string GenerateCodeVerifier() { throw IOException("VGI OAuth: PKCE not available in WASM"); }
+std::string ComputeCodeChallenge(const std::string &) { throw IOException("VGI OAuth: PKCE not available in WASM"); }
+std::string GenerateState() { throw IOException("VGI OAuth: PKCE not available in WASM"); }
+#else
 std::string GenerateCodeVerifier() {
-	// RFC 7636: 43-128 characters from unreserved set [A-Z] / [a-z] / [0-9] / "-" / "." / "_" / "~"
-	// Generate 32 random bytes and base64url-encode them (gives 43 chars)
 	unsigned char buf[32];
 	if (RAND_bytes(buf, sizeof(buf)) != 1) {
 		throw IOException("VGI OAuth: failed to generate random bytes for code verifier");
@@ -119,14 +134,11 @@ std::string GenerateCodeVerifier() {
 }
 
 std::string ComputeCodeChallenge(const std::string &verifier) {
-	// S256: BASE64URL(SHA256(code_verifier))
 	unsigned char hash[EVP_MAX_MD_SIZE];
 	unsigned int hash_len = 0;
-
 	if (EVP_Digest(verifier.data(), verifier.size(), hash, &hash_len, EVP_sha256(), nullptr) != 1) {
 		throw IOException("VGI OAuth: SHA256 computation failed");
 	}
-
 	return Base64UrlEncode(hash, hash_len);
 }
 
@@ -146,6 +158,7 @@ std::string GenerateState() {
 	}
 	return result;
 }
+#endif // !__EMSCRIPTEN__
 
 std::string UrlEncode(const std::string &str) {
 	std::string result;
@@ -398,7 +411,10 @@ OAuthServerMetadata FetchAuthServerMetadata(ClientContext &context, const std::s
 //===--------------------------------------------------------------------===//
 
 void OpenBrowser(const std::string &url) {
-#if defined(__APPLE__)
+#if defined(__EMSCRIPTEN__)
+	// In WASM, we can't open a browser from a Worker — the URL is printed to stderr for the user
+	fprintf(stderr, "[VGI] Please open this URL in your browser: %s\n", url.c_str());
+#elif defined(__APPLE__)
 	pid_t pid = fork();
 	if (pid == 0) {
 		execlp("open", "open", url.c_str(), nullptr);
@@ -706,6 +722,10 @@ OAuthTokenSet VgiTokenManager::PerformDeviceCodeFlow(const OAuthChallenge &chall
 		auth_msg += "\nOr visit: " + verification_uri_complete;
 	}
 	DUCKDB_LOG_WARNING(context, auth_msg);
+#ifdef __EMSCRIPTEN__
+	// Post auth message to main thread so it appears in the terminal UI
+	EM_ASM({ postMessage({ type: 'log', msg: UTF8ToString($0), cls: 'info' }); }, auth_msg.c_str());
+#endif
 
 	// Step 3: Poll token endpoint
 	EnforceHttpsUrl(server_meta.token_endpoint, "token endpoint");
@@ -722,16 +742,24 @@ OAuthTokenSet VgiTokenManager::PerformDeviceCodeFlow(const OAuthChallenge &chall
 		poll_body += "&client_secret=" + UrlEncode(client_secret);
 	}
 
-	// Use condition_variable for interruptible sleep
+#ifndef __EMSCRIPTEN__
+	// Use condition_variable for interruptible sleep (not available in WASM)
 	std::mutex poll_mutex;
 	std::condition_variable poll_cv;
+#endif
 
 	while (true) {
-		// Interruptible sleep
+		// Sleep between poll attempts.
+		// In WASM Workers, duckdb-wasm overrides _emscripten_yield with Atomics.wait,
+		// so standard sleep functions block properly instead of busy-spinning.
+#ifndef __EMSCRIPTEN__
 		{
 			std::unique_lock<std::mutex> lock(poll_mutex);
 			poll_cv.wait_for(lock, std::chrono::seconds(interval));
 		}
+#else
+		usleep(static_cast<useconds_t>(interval * 1000000));
+#endif
 
 		// Check timeout
 		if (std::chrono::steady_clock::now() >= deadline) {
@@ -783,8 +811,8 @@ OAuthTokenSet VgiTokenManager::PerformDeviceCodeFlow(const OAuthChallenge &chall
 			continue;
 		}
 
-		// Parse error JSON from any non-200 response (RFC 8628 says 400, but
-		// some servers like Google use 428 for authorization_pending)
+		// Parse error JSON BEFORE checking status code — servers may use non-standard
+		// status codes (e.g., 403 with slow_down, 428 with authorization_pending)
 		std::string error_code;
 		std::string error_desc;
 		auto err_doc = yyjson_read(resp.body.c_str(), resp.body.size(), 0);
@@ -876,6 +904,14 @@ OAuthTokenSet VgiTokenManager::PerformAuthFlow(const OAuthChallenge &challenge,
 	bool has_device_ep = !server_meta.device_authorization_endpoint.empty() &&
 	                     server_meta.SupportsGrantType("urn:ietf:params:oauth:grant-type:device_code");
 	bool has_auth_ep = !server_meta.authorization_endpoint.empty();
+
+#ifdef __EMSCRIPTEN__
+	// WASM: always use device code flow (PKCE requires local HTTP server + browser redirect)
+	if (has_device_ep) {
+		return PerformDeviceCodeFlow(challenge, resource_meta, server_meta, context);
+	}
+	throw IOException("VGI OAuth: device code flow required in WASM but server does not support it");
+#endif
 
 	if (flow == "device_code") {
 		return PerformDeviceCodeFlow(challenge, resource_meta, server_meta, context);
@@ -1103,6 +1139,12 @@ static std::string GetResourceDisplayName(const OAuthResourceMetadata &meta) {
 // PKCE Flow
 //===--------------------------------------------------------------------===//
 
+#ifdef __EMSCRIPTEN__
+OAuthTokenSet VgiTokenManager::PerformPKCEFlow(const OAuthChallenge &, const OAuthResourceMetadata &,
+                                                const OAuthServerMetadata &, ClientContext &) {
+	throw IOException("VGI OAuth: PKCE flow not available in WASM — use device code flow");
+}
+#else
 OAuthTokenSet VgiTokenManager::PerformPKCEFlow(const OAuthChallenge &challenge,
                                                 const OAuthResourceMetadata &resource_meta,
                                                 const OAuthServerMetadata &server_meta,
@@ -1284,6 +1326,7 @@ OAuthTokenSet VgiTokenManager::PerformPKCEFlow(const OAuthChallenge &challenge,
 	DUCKDB_LOG_WARNING(context, "Authentication successful.");
 	return tokens;
 }
+#endif // !__EMSCRIPTEN__
 
 //===--------------------------------------------------------------------===//
 // VgiTokenManager
@@ -1608,8 +1651,16 @@ OAuthTokenSet VgiTokenManager::AttemptTokenRefresh(const OAuthRefreshContext &ct
 //===--------------------------------------------------------------------===//
 
 std::string VgiTokenManager::SecretNameForOrigin(const std::string &origin) {
+#ifdef __EMSCRIPTEN__
+	// Simple FNV-1a hash (no OpenSSL in WASM)
+	uint64_t h1 = 14695981039346656037ULL, h2 = 6231912018660862937ULL;
+	for (auto c : origin) { h1 ^= c; h1 *= 1099511628211ULL; h2 ^= c; h2 *= 1099511628211ULL; h2 = (h2 << 7) | (h2 >> 57); }
+	unsigned char hash[16];
+	memcpy(hash, &h1, 8); memcpy(hash + 8, &h2, 8);
+#else
 	unsigned char hash[SHA256_DIGEST_LENGTH];
 	SHA256(reinterpret_cast<const unsigned char *>(origin.data()), origin.size(), hash);
+#endif
 
 	// Take first 16 bytes → 32 hex chars
 	static const char hex[] = "0123456789abcdef";
