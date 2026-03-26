@@ -946,11 +946,16 @@ OAuthTokenSet VgiTokenManager::PerformAuthFlow(const OAuthChallenge &challenge,
 	bool has_auth_ep = !server_meta.authorization_endpoint.empty();
 
 #ifdef __EMSCRIPTEN__
-	// WASM: always use device code flow (PKCE requires local HTTP server + browser redirect)
+	// WASM: prefer PKCE (popup-based) if server supports it, fall back to device code.
+	// PKCE in WASM uses a popup window opened by the main thread, with the auth code
+	// flowing back via SharedArrayBuffer.
+	if (has_auth_ep) {
+		return PerformPKCEFlow(challenge, resource_meta, server_meta, context);
+	}
 	if (has_device_ep) {
 		return PerformDeviceCodeFlow(challenge, resource_meta, server_meta, context);
 	}
-	throw IOException("VGI OAuth: device code flow required in WASM but server does not support it");
+	throw IOException("VGI OAuth: server supports neither authorization_endpoint (PKCE) nor device_authorization_endpoint");
 #endif
 
 	if (flow == "device_code") {
@@ -1180,9 +1185,126 @@ static std::string GetResourceDisplayName(const OAuthResourceMetadata &meta) {
 //===--------------------------------------------------------------------===//
 
 #ifdef __EMSCRIPTEN__
-OAuthTokenSet VgiTokenManager::PerformPKCEFlow(const OAuthChallenge &, const OAuthResourceMetadata &,
-                                                const OAuthServerMetadata &, ClientContext &) {
-	throw IOException("VGI OAuth: PKCE flow not available in WASM — use device code flow");
+OAuthTokenSet VgiTokenManager::PerformPKCEFlow(const OAuthChallenge &challenge,
+                                                const OAuthResourceMetadata &resource_meta,
+                                                const OAuthServerMetadata &server_meta,
+                                                ClientContext &context) {
+	// WASM PKCE: VGI does all crypto and URL construction. The main thread
+	// just opens a popup and passes back the auth code via SharedArrayBuffer.
+
+	std::string client_id = resource_meta.client_id.empty() ? challenge.client_id : resource_meta.client_id;
+	if (client_id.empty()) {
+		throw IOException("VGI OAuth: no client_id found in WWW-Authenticate header or resource metadata");
+	}
+	std::string client_secret = resource_meta.client_secret;
+
+	// Generate PKCE parameters
+	auto code_verifier = GenerateCodeVerifier();
+	auto code_challenge = ComputeCodeChallenge(code_verifier);
+	auto state = GenerateState();
+
+	// The redirect_uri points to our oauth-callback.html on the same origin
+	std::string redirect_uri = std::string(
+	    // clang-format off
+	    (const char *)EM_ASM_PTR({
+	        var url = location.origin + '/oauth-callback.html';
+	        var len = lengthBytesUTF8(url) + 1;
+	        var buf = _malloc(len);
+	        stringToUTF8(url, buf, len);
+	        return buf;
+	    })
+	    // clang-format on
+	);
+
+	// Build authorization URL
+	std::string auth_url = server_meta.authorization_endpoint +
+	    "?response_type=code"
+	    "&client_id=" + UrlEncode(client_id) +
+	    "&redirect_uri=" + UrlEncode(redirect_uri) +
+	    "&code_challenge=" + UrlEncode(code_challenge) +
+	    "&code_challenge_method=S256"
+	    "&state=" + UrlEncode(state);
+
+	// Add scopes
+	{
+		std::string scope_str;
+		if (!resource_meta.scopes_supported.empty()) {
+			for (size_t i = 0; i < resource_meta.scopes_supported.size(); i++) {
+				if (i > 0) scope_str += " ";
+				scope_str += resource_meta.scopes_supported[i];
+			}
+		} else {
+			scope_str = "openid";
+		}
+		auth_url += "&scope=" + UrlEncode(scope_str);
+	}
+
+	// Post the auth URL to the main thread and block until the auth code comes back.
+	// The main thread opens a popup, the popup redirects to oauth-callback.html which
+	// posts the code back, and the main thread writes it to the SharedArrayBuffer.
+	//
+	// SharedArrayBuffer layout: [flag:Int32][dataLen:Int32][data:UTF-8]
+	// flag: 0=waiting, 1=code ready, -1=auth failed
+	// The SAB is stored as a global `oauthSAB` in the Worker (set by test-worker.js).
+
+	// clang-format off
+	EM_ASM({
+		// Reset the SAB flag to 0 (waiting)
+		if (typeof oauthInt32 !== 'undefined' && oauthInt32) {
+			Atomics.store(oauthInt32, 0, 0);
+		}
+		// Post auth URL to main thread
+		postMessage({ type: 'open-auth-url', url: UTF8ToString($0) });
+	}, auth_url.c_str());
+
+	// Block until main thread signals (code ready or auth failed)
+	int flag = (int)EM_ASM_INT({
+		if (typeof oauthInt32 === 'undefined' || !oauthInt32) {
+			return -1; // No SAB — can't do PKCE in this environment
+		}
+		Atomics.wait(oauthInt32, 0, 0); // blocks until flag != 0
+		return Atomics.load(oauthInt32, 0);
+	});
+
+	// Read the data from the SAB
+	std::string sab_data;
+	{
+		char *data_ptr = (char *)EM_ASM_PTR({
+			if (typeof oauthBytes === 'undefined' || !oauthBytes) return 0;
+			var dv = new DataView(oauthSAB);
+			var len = dv.getInt32(4, true);
+			if (len <= 0) return 0;
+			var buf = _malloc(len + 1);
+			for (var i = 0; i < len; i++) Module.HEAPU8[buf + i] = oauthBytes[8 + i];
+			Module.HEAPU8[buf + len] = 0;
+			return buf;
+		});
+		if (data_ptr) {
+			sab_data = std::string(data_ptr);
+			free(data_ptr);
+		}
+	}
+	// clang-format on
+
+	if (flag == -1) {
+		throw IOException("VGI OAuth: %s", sab_data.empty() ? "authentication failed or cancelled" : sab_data);
+	}
+
+	// sab_data contains the authorization code
+	auto code = sab_data;
+	if (code.empty()) {
+		throw IOException("VGI OAuth: no authorization code received");
+	}
+
+	VGI_STDERR_DEBUG("[VGI] oauth.pkce_wasm code_received\n");
+
+	// Exchange code for tokens (uses DuckDB-WASM's HTTP layer)
+	auto tokens = ExchangeCodeForTokens(context, server_meta.token_endpoint,
+	                                     code, redirect_uri, code_verifier, client_id, client_secret);
+	tokens.use_id_token = resource_meta.use_id_token_as_bearer;
+
+	DUCKDB_LOG_WARNING(context, "Authentication successful.");
+	return tokens;
 }
 #else
 OAuthTokenSet VgiTokenManager::PerformPKCEFlow(const OAuthChallenge &challenge,
