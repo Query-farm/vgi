@@ -30,9 +30,23 @@ struct VgiSecretRequirement;
 // Both subprocess (FunctionConnection) and HTTP (HttpFunctionConnection) implement
 // this interface. All call sites store unique_ptr<IFunctionConnection>.
 
+// Shared state for dynamic filter values that tighten during execution.
+// Written by the table scan (after Top-N sink updates), read by the connection (before tick).
+struct TickFilterState {
+	mutex lock;
+	//! Base64-encoded Arrow IPC bytes of the complete filter set (static + dynamic merged)
+	string encoded_filters;
+	//! True if encoded_filters has been set at least once
+	bool has_filters = false;
+};
+
 class IFunctionConnection {
 public:
 	virtual ~IFunctionConnection() = default;
+
+	// Tick metadata: set shared state for dynamic filter pushdown via tick batches.
+	// The connection reads this before each tick and includes it as custom metadata.
+	virtual void SetTickFilterState(shared_ptr<TickFilterState> state) = 0;
 
 	// Phase 1: Bind
 	virtual BindResult PerformBindFull() = 0;

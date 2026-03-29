@@ -476,7 +476,20 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 	// Send one tick OUTSIDE the loop (only once per call).
 	if (is_producer_mode_ && input_writer_ && !input_writer_closed_) {
 		auto tick_batch = arrow::RecordBatch::Make(tick_schema_, 0, std::vector<std::shared_ptr<arrow::Array>>{});
-		auto write_status = input_writer_->WriteRecordBatch(*tick_batch);
+
+		// Attach dynamic filter metadata as IPC custom metadata if available
+		std::shared_ptr<const arrow::KeyValueMetadata> tick_metadata;
+		if (tick_filter_state_) {
+			lock_guard<mutex> l(tick_filter_state_->lock);
+			if (tick_filter_state_->has_filters) {
+				tick_metadata = arrow::KeyValueMetadata::Make(
+				    {"vgi_pushdown_filters"}, {tick_filter_state_->encoded_filters});
+			}
+		}
+
+		auto write_status = tick_metadata
+		    ? input_writer_->WriteRecordBatch(*tick_batch, tick_metadata)
+		    : input_writer_->WriteRecordBatch(*tick_batch);
 		if (!write_status.ok()) {
 			// Tick write can fail with EPIPE/broken pipe if the server has already
 			// finished (e.g., finalize with no output). This is not an error — just

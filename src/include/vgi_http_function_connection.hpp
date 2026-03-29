@@ -40,6 +40,11 @@ public:
 
 	~HttpFunctionConnection() override = default;
 
+	// Set shared state for dynamic filter pushdown via tick batches
+	void SetTickFilterState(shared_ptr<TickFilterState> state) override {
+		tick_filter_state_ = std::move(state);
+	}
+
 	// Phase 1: Bind
 	BindResult PerformBindFull() override;
 	void SetInputSchema(const std::shared_ptr<arrow::Schema> &input_schema) override;
@@ -113,6 +118,9 @@ private:
 	std::shared_ptr<arrow::RecordBatch> pending_input_;
 	bool input_writer_opened_ = false;
 	bool input_writer_closed_ = false;
+
+	// Dynamic filter state for tick-based pushdown
+	shared_ptr<TickFilterState> tick_filter_state_;
 
 	// Helper: serialize a batch with optional stream_state token as metadata
 	std::vector<uint8_t> SerializeBatchWithState(const std::shared_ptr<arrow::RecordBatch> &batch,

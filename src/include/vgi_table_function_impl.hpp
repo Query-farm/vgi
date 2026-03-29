@@ -9,6 +9,7 @@
 #include "duckdb/function/table/arrow/arrow_duck_schema.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/parallel/async_result.hpp"
+#include "duckdb/planner/filter/dynamic_filter.hpp"
 
 #include "vgi_arrow_utils.hpp"
 #include "vgi_catalog_api.hpp"
@@ -152,6 +153,20 @@ struct VgiTableFunctionBindData : public TableFunctionData {
 // VgiTableFunctionGlobalState - Shared global state for progress tracking
 // ============================================================================
 
+// Info about a captured DynamicFilter for tick-based pushdown
+struct VgiDynamicFilterInfo {
+	//! The shared dynamic filter data (holds the mutable ConstantFilter value)
+	shared_ptr<DynamicFilterData> filter_data;
+	//! Column index in the projected column list
+	idx_t column_index;
+	//! Column name for serialization
+	string column_name;
+	//! The comparison type (from the ConstantFilter inside DynamicFilterData)
+	ExpressionType comparison_type;
+	//! Whether this filter is wrapped in ConjunctionOr with IsNull (NULLS_FIRST)
+	bool nulls_first = false;
+};
+
 struct VgiTableFunctionGlobalState : public GlobalTableFunctionState {
 	// Global execution identifier for multi-worker coordination
 	std::vector<uint8_t> global_execution_id;
@@ -166,6 +181,15 @@ struct VgiTableFunctionGlobalState : public GlobalTableFunctionState {
 	// Protected by mutex for thread-safe handoff to first InitLocal caller.
 	std::mutex connection_mutex;
 	std::unique_ptr<IFunctionConnection> primary_connection;
+
+	// Dynamic filter info captured at init time (for tick-based pushdown)
+	vector<VgiDynamicFilterInfo> dynamic_filters;
+
+	// Cached static filter bytes (serialized once, reused on every tick)
+	std::shared_ptr<arrow::Buffer> static_filter_bytes;
+
+	// Shared tick filter state (updated by scan, read by connection for tick metadata)
+	shared_ptr<TickFilterState> tick_filter_state;
 
 	idx_t MaxThreads() const override {
 		return max_processes;

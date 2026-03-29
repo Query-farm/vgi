@@ -136,6 +136,11 @@ public:
 
 	~FunctionConnection() override;
 
+	// Set shared state for dynamic filter pushdown via tick batches
+	void SetTickFilterState(shared_ptr<TickFilterState> state) override {
+		tick_filter_state_ = std::move(state);
+	}
+
 	// Phase 1: Perform bind via vgi_rpc "bind" RPC call
 	// Spawns worker if needed, sends BindRequest, reads BindResponse
 	// Returns BindResult with output schema and opaque data
@@ -274,6 +279,9 @@ private:
 	std::shared_ptr<arrow::ipc::RecordBatchWriter> input_writer_;
 	bool input_writer_opened_ = false;
 	bool input_writer_closed_ = false;
+
+	// Dynamic filter state for tick-based pushdown (shared with the scan operator)
+	shared_ptr<TickFilterState> tick_filter_state_;
 
 	// Stderr reader thread - reads stderr and buffers lines for main thread to log
 	std::thread stderr_thread_;

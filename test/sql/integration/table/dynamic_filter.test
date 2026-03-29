@@ -1,0 +1,160 @@
+# name: test/sql/integration/table/dynamic_filter.test
+# description: Tests dynamic filter pushdown via tick batches for Top-N queries.
+#              DynamicFilter from ORDER BY ... LIMIT is sent to the worker on each
+#              tick batch's custom metadata, tightening as the Top-N heap improves.
+# group: [vgi_integration_table]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# EXPLAIN shows Dynamic Filter in the scan node
+# ============================================================================
+
+query II
+EXPLAIN SELECT n FROM example.sequence(10000) ORDER BY n LIMIT 5;
+----
+physical_plan	<REGEX>:.*Dynamic Filter.*
+
+# ============================================================================
+# ASC LIMIT — correct results
+# ============================================================================
+
+query I
+SELECT n FROM example.sequence(10000, batch_size := 100) ORDER BY n LIMIT 5;
+----
+0
+1
+2
+3
+4
+
+# ============================================================================
+# DESC LIMIT — correct results
+# ============================================================================
+
+query I
+SELECT n FROM example.sequence(10000, batch_size := 100) ORDER BY n DESC LIMIT 5;
+----
+9999
+9998
+9997
+9996
+9995
+
+# ============================================================================
+# LIMIT with OFFSET
+# ============================================================================
+
+query I
+SELECT n FROM example.sequence(10000, batch_size := 100) ORDER BY n LIMIT 5 OFFSET 10;
+----
+10
+11
+12
+13
+14
+
+# ============================================================================
+# LIMIT 1 — tightest possible filter
+# ============================================================================
+
+query I
+SELECT n FROM example.sequence(10000, batch_size := 100) ORDER BY n LIMIT 1;
+----
+0
+
+# ============================================================================
+# LIMIT larger than table — all rows returned
+# ============================================================================
+
+query I
+SELECT COUNT(*) FROM (SELECT * FROM example.sequence(10) ORDER BY n LIMIT 100);
+----
+10
+
+# ============================================================================
+# VARCHAR ordering (also supported by DynamicFilter)
+# ============================================================================
+
+query I
+SELECT s FROM example.filter_echo(100) ORDER BY s LIMIT 3;
+----
+row_0
+row_1
+row_10
+
+# ============================================================================
+# Multi-key ORDER BY (inclusive <= on first key)
+# ============================================================================
+
+query III
+SELECT n, s, pushed_filters FROM example.filter_echo(100) ORDER BY n, s LIMIT 3;
+----
+0	row_0	(none)
+1	row_1	(none)
+2	row_2	(none)
+
+# ============================================================================
+# Regression: compare VGI result to local table
+# ============================================================================
+
+statement ok
+CREATE TABLE local_seq AS SELECT * FROM example.sequence(10000);
+
+query I
+(SELECT n FROM example.sequence(10000) ORDER BY n LIMIT 5)
+EXCEPT
+(SELECT n FROM local_seq ORDER BY n LIMIT 5);
+----
+
+query I
+(SELECT n FROM example.sequence(10000) ORDER BY n DESC LIMIT 5)
+EXCEPT
+(SELECT n FROM local_seq ORDER BY n DESC LIMIT 5);
+----
+
+statement ok
+DROP TABLE local_seq;
+
+# ============================================================================
+# Dynamic filter echo — proves filter tightens over time
+# Data is descending (9999, 9998, ..., 0), ORDER BY n ASC LIMIT 500
+# forces Top-N to tighten the boundary each batch.
+# With batch_size=100, each batch shifts the boundary by ~100.
+# ============================================================================
+
+# Multiple distinct filter values prove the filter tightened
+query I
+SELECT COUNT(DISTINCT pushed_filters) > 1 AS filter_tightened FROM (
+    SELECT * FROM example.dynamic_filter_echo(10000, batch_size := 100)
+    ORDER BY n LIMIT 500
+);
+----
+true
+
+# Correct results despite dynamic filtering
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM example.dynamic_filter_echo(10000, batch_size := 100) ORDER BY n LIMIT 5
+);
+----
+5
+
+query I
+SELECT MIN(n) FROM (
+    SELECT * FROM example.dynamic_filter_echo(10000, batch_size := 100) ORDER BY n LIMIT 5
+);
+----
+0
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;

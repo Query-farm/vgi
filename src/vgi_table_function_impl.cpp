@@ -11,9 +11,11 @@
 #include "duckdb/function/table/arrow.hpp"
 #include "duckdb/planner/filter/conjunction_filter.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
+#include "duckdb/planner/filter/dynamic_filter.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/planner/filter/in_filter.hpp"
 #include "duckdb/planner/filter/null_filter.hpp"
+#include "duckdb/common/types/blob.hpp"
 #include "duckdb/planner/filter/optional_filter.hpp"
 #include "duckdb/planner/filter/struct_filter.hpp"
 #include "duckdb/planner/table_filter.hpp"
@@ -638,6 +640,82 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 		filter_bytes = nullptr;
 	}
 
+	// Capture DynamicFilter references for tick-based pushdown.
+	// Walk the filter set looking for OptionalFilter → DynamicFilter (from Top-N)
+	// or OptionalFilter → ConjunctionOrFilter → DynamicFilter (nulls_first case).
+	vector<VgiDynamicFilterInfo> dynamic_filters;
+	if (input.filters) {
+		for (auto &entry : input.filters->filters) {
+			auto col_idx = entry.first;
+			auto &filter = *entry.second;
+			if (filter.filter_type != TableFilterType::OPTIONAL_FILTER) {
+				continue;
+			}
+			auto &opt = filter.Cast<OptionalFilter>();
+			if (!opt.child_filter) {
+				continue;
+			}
+			// Map through column_ids to get original schema column index
+			idx_t original_col_idx = col_idx < input.column_ids.size() ? input.column_ids[col_idx] : col_idx;
+			string col_name = original_col_idx < bind_data.all_column_names.size()
+			                      ? bind_data.all_column_names[original_col_idx]
+			                      : std::to_string(original_col_idx);
+
+			if (opt.child_filter->filter_type == TableFilterType::DYNAMIC_FILTER) {
+				auto &df = opt.child_filter->Cast<DynamicFilter>();
+				if (df.filter_data && df.filter_data->filter) {
+					VgiDynamicFilterInfo info;
+					info.filter_data = df.filter_data;
+					info.column_index = col_idx;
+					info.column_name = col_name;
+					info.comparison_type = df.filter_data->filter->comparison_type;
+					info.nulls_first = false;
+					dynamic_filters.push_back(std::move(info));
+				}
+			} else if (opt.child_filter->filter_type == TableFilterType::CONJUNCTION_OR) {
+				// NULLS_FIRST case: OptionalFilter(ConjunctionOr(IsNull, DynamicFilter))
+				auto &conj = opt.child_filter->Cast<ConjunctionOrFilter>();
+				for (auto &child : conj.child_filters) {
+					if (child->filter_type == TableFilterType::DYNAMIC_FILTER) {
+						auto &df = child->Cast<DynamicFilter>();
+						if (df.filter_data && df.filter_data->filter) {
+							VgiDynamicFilterInfo info;
+							info.filter_data = df.filter_data;
+							info.column_index = col_idx;
+							info.column_name = col_name;
+							info.comparison_type = df.filter_data->filter->comparison_type;
+							info.nulls_first = true;
+							dynamic_filters.push_back(std::move(info));
+						}
+					}
+				}
+			}
+		}
+	}
+
+	if (!dynamic_filters.empty()) {
+		VGI_LOG(context, "table_function.dynamic_filters_captured",
+		        {{"function_name", bind_data.function_name},
+		         {"count", std::to_string(dynamic_filters.size())}});
+	}
+
+	// Create shared tick filter state if we have dynamic filters.
+	// This is shared between the global state (which updates it from DynamicFilterData)
+	// and the connection (which reads it when building tick batches).
+	shared_ptr<TickFilterState> tick_filter_state;
+	if (!dynamic_filters.empty()) {
+		tick_filter_state = make_shared_ptr<TickFilterState>();
+		// If we have static filters, pre-populate with those (they'll be merged with dynamic on each update)
+		if (filter_bytes) {
+			// Base64-encode the static filter bytes for the initial tick state
+			auto encoded = Blob::ToBase64(string_t(reinterpret_cast<const char *>(filter_bytes->data()),
+			                                       static_cast<idx_t>(filter_bytes->size())));
+			tick_filter_state->encoded_filters = encoded;
+			tick_filter_state->has_filters = true;
+		}
+		connection->SetTickFilterState(tick_filter_state);
+	}
+
 	// Perform init phase via vgi_rpc with projection and filter pushdown
 	auto init_result = connection->PerformInit(projection_ids, filter_bytes);
 
@@ -645,6 +723,9 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 	global_state->global_execution_id = std::move(init_result.execution_id);
 	global_state->max_processes = static_cast<idx_t>(init_result.max_workers);
 	global_state->primary_connection = std::move(connection);
+	global_state->dynamic_filters = std::move(dynamic_filters);
+	global_state->static_filter_bytes = filter_bytes;
+	global_state->tick_filter_state = tick_filter_state;
 
 	VGI_LOG(context, "table_function.init_global",
 	        {{"worker_path", bind_data.worker_path},
@@ -741,11 +822,74 @@ unique_ptr<LocalTableFunctionState> VgiTableFunctionInitLocal(ExecutionContext &
 // Helper: Get next batch from worker and convert to Arrow C ABI
 // ============================================================================
 
+//! Update the TickFilterState with current DynamicFilter values.
+//! Called before each ReadDataBatch to ensure the tick carries the latest filter.
+static void UpdateDynamicFilterState(VgiTableFunctionGlobalState &global_state, ClientContext &context,
+                                     const VgiTableFunctionBindData &bind_data) {
+	if (global_state.dynamic_filters.empty() || !global_state.tick_filter_state) {
+		return;
+	}
+
+	// Build a merged TableFilterSet with static + current dynamic filters
+	TableFilterSet merged;
+
+	// Add all static filters (from init-time serialization)
+	// We need to re-create them from the original input.filters that were serialized.
+	// For now, we serialize just the dynamic filters as ConstantFilters.
+	// The static filters were already sent at init time — the worker has them.
+
+	bool any_initialized = false;
+	for (auto &df : global_state.dynamic_filters) {
+		if (!df.filter_data->initialized.load()) {
+			continue;
+		}
+		any_initialized = true;
+
+		// Read the current value under lock
+		lock_guard<mutex> l(df.filter_data->lock);
+		auto &const_filter = *df.filter_data->filter;
+		auto filter_copy = make_uniq<ConstantFilter>(const_filter.comparison_type, const_filter.constant);
+
+		unique_ptr<TableFilter> pushed;
+		if (df.nulls_first) {
+			auto or_filter = make_uniq<ConjunctionOrFilter>();
+			or_filter->child_filters.push_back(make_uniq<IsNullFilter>());
+			or_filter->child_filters.push_back(std::move(filter_copy));
+			pushed = std::move(or_filter);
+		} else {
+			pushed = std::move(filter_copy);
+		}
+
+		merged.filters[df.column_index] = std::move(pushed);
+	}
+
+	if (!any_initialized) {
+		return; // No dynamic filters initialized yet — skip
+	}
+
+	// Serialize the merged filters
+	try {
+		auto filter_bytes = VgiSerializeFilters(context, {}, &merged, bind_data.all_column_names, bind_data.worker_path);
+		if (filter_bytes) {
+			auto encoded = Blob::ToBase64(string_t(reinterpret_cast<const char *>(filter_bytes->data()),
+			                                       static_cast<idx_t>(filter_bytes->size())));
+			lock_guard<mutex> l(global_state.tick_filter_state->lock);
+			global_state.tick_filter_state->encoded_filters = encoded;
+			global_state.tick_filter_state->has_filters = true;
+		}
+	} catch (...) {
+		// Serialization failure is not fatal — the filter is optional
+	}
+}
+
 static bool GetNextBatch(ClientContext &context, const VgiTableFunctionBindData &bind_data,
+                         VgiTableFunctionGlobalState &global_state,
                          VgiTableFunctionLocalState &local_state) {
 	if (local_state.done) {
 		return false;
 	}
+	// Update dynamic filter state before the tick is sent
+	UpdateDynamicFilterState(global_state, context, bind_data);
 
 	// Read next Arrow C++ batch from connection
 	auto worker_pid = local_state.connection->GetPid();
@@ -893,7 +1037,7 @@ void VgiTableFunctionScan(ClientContext &context, TableFunctionInput &input, Dat
 	// Synchronous fallback: inline blocking I/O (original behavior)
 	if (!is_async) {
 		while (BatchExhausted(local_state)) {
-			if (!GetNextBatch(context, bind_data, local_state)) {
+			if (!GetNextBatch(context, bind_data, global_state, local_state)) {
 				output.SetCardinality(0);
 				return;
 			}
@@ -930,7 +1074,7 @@ void VgiTableFunctionScan(ClientContext &context, TableFunctionInput &input, Dat
 			// First batch: fetch synchronously to avoid an extra BLOCKED round-trip
 			local_state.first_scan_call_ = false;
 			while (BatchExhausted(local_state)) {
-				if (!GetNextBatch(context, bind_data, local_state)) {
+				if (!GetNextBatch(context, bind_data, global_state, local_state)) {
 					output.SetCardinality(0);
 					return;
 				}
@@ -941,6 +1085,8 @@ void VgiTableFunctionScan(ClientContext &context, TableFunctionInput &input, Dat
 			}
 			return;
 		}
+		// Update dynamic filter state before the prefetch task sends a tick
+		UpdateDynamicFilterState(global_state, context, bind_data);
 		// Subsequent batches: launch prefetch and return BLOCKED
 		LaunchPrefetch(input, local_state);
 		output.SetCardinality(0);

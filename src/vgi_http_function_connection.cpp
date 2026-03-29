@@ -84,11 +84,23 @@ std::vector<uint8_t> HttpFunctionConnection::SerializeBatchWithState(
 	}
 	auto writer = writer_result.ValueUnsafe();
 
-	// Build metadata with stream_state if we have one
-	std::shared_ptr<arrow::KeyValueMetadata> metadata;
+	// Build metadata with stream_state and optional dynamic filters
+	std::vector<std::string> meta_keys;
+	std::vector<std::string> meta_values;
 	if (!stream_state_token_.empty()) {
-		metadata = arrow::KeyValueMetadata::Make(
-		    {RPC_STREAM_STATE_KEY}, {stream_state_token_});
+		meta_keys.push_back(RPC_STREAM_STATE_KEY);
+		meta_values.push_back(stream_state_token_);
+	}
+	if (tick_filter_state_) {
+		lock_guard<mutex> l(tick_filter_state_->lock);
+		if (tick_filter_state_->has_filters) {
+			meta_keys.push_back("vgi_pushdown_filters");
+			meta_values.push_back(tick_filter_state_->encoded_filters);
+		}
+	}
+	std::shared_ptr<arrow::KeyValueMetadata> metadata;
+	if (!meta_keys.empty()) {
+		metadata = arrow::KeyValueMetadata::Make(meta_keys, meta_values);
 	}
 
 	auto status = writer->WriteRecordBatch(*batch, metadata);
@@ -430,6 +442,7 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 		// Continuation: POST exchange with state token to get more data
 		auto tick_schema = arrow::schema({});
 		auto tick_batch = arrow::RecordBatch::Make(tick_schema, 0, std::vector<std::shared_ptr<arrow::Array>>{});
+
 		auto body = SerializeBatchWithState(tick_batch, tick_schema);
 
 		std::string exchange_url = base_url_ + "/init/exchange";
