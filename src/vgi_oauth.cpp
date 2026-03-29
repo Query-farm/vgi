@@ -3,9 +3,13 @@
 #include <cctype>
 #include <future>
 #ifdef __EMSCRIPTEN__
-#include <emscripten.h>
-#include <unistd.h>   // usleep
-#include <random>     // std::random_device for PKCE
+#include <unistd.h>  // usleep
+// duckdb-wasm js-stubs — callable from WASM side modules (extensions)
+extern "C" void duckdb_wasm_crypto_random(void *buf, int len);
+extern "C" void duckdb_wasm_sha256(const void *data, int len, void *out_hash);
+extern "C" char *duckdb_wasm_open_auth_url(const char *url, int timeout_ms);
+extern "C" char *duckdb_wasm_get_auth_error(int unused);
+extern "C" char *duckdb_wasm_get_page_origin(void);
 #else
 #include <thread>
 #endif
@@ -40,9 +44,6 @@
 #ifndef __EMSCRIPTEN__
 // DuckDB-vendored httplib for the local callback server (PKCE flow only)
 #include "httplib.hpp"
-#else
-// DuckDB's bundled mbedTLS for SHA-256 (PKCE code challenge)
-#include "mbedtls_wrapper.hpp"
 #endif
 
 using namespace duckdb_yyjson; // NOLINT
@@ -124,43 +125,24 @@ std::string Base64UrlEncode(const unsigned char *data, size_t len) {
 }
 
 #ifdef __EMSCRIPTEN__
-// WASM: use DuckDB's MbedTlsWrapper for SHA-256 + C++ random_device for entropy.
-// EM_ASM doesn't work reliably in WASM side modules (extensions) so we use pure C++.
+// WASM: use duckdb-wasm js-stubs for crypto (Web Crypto random + JS SHA-256).
+// These are callable from side modules via standard WASM imports — no EM_ASM needed.
 
 std::string GenerateCodeVerifier() {
 	unsigned char buf[32];
-	std::random_device rd;
-	for (size_t i = 0; i < sizeof(buf); i += sizeof(unsigned int)) {
-		auto val = rd();
-		auto n = std::min(sizeof(buf) - i, sizeof(unsigned int));
-		memcpy(buf + i, &val, n);
-	}
+	duckdb_wasm_crypto_random(buf, sizeof(buf));
 	return Base64UrlEncode(buf, sizeof(buf));
 }
 
 std::string ComputeCodeChallenge(const std::string &verifier) {
-	duckdb_mbedtls::MbedTlsWrapper::SHA256State state;
-	state.AddString(verifier);
-	char hex_hash[duckdb_mbedtls::MbedTlsWrapper::SHA256_HASH_LENGTH_TEXT];
-	state.FinishHex(hex_hash);
 	unsigned char hash[32];
-	for (int i = 0; i < 32; i++) {
-		auto hi = hex_hash[i * 2], lo = hex_hash[i * 2 + 1];
-		hash[i] = static_cast<unsigned char>(
-		    ((hi >= 'a' ? hi - 'a' + 10 : hi - '0') << 4) |
-		     (lo >= 'a' ? lo - 'a' + 10 : lo - '0'));
-	}
+	duckdb_wasm_sha256(verifier.data(), static_cast<int>(verifier.size()), hash);
 	return Base64UrlEncode(hash, sizeof(hash));
 }
 
 std::string GenerateState() {
 	unsigned char buf[16];
-	std::random_device rd;
-	for (size_t i = 0; i < sizeof(buf); i += sizeof(unsigned int)) {
-		auto val = rd();
-		auto n = std::min(sizeof(buf) - i, sizeof(unsigned int));
-		memcpy(buf + i, &val, n);
-	}
+	duckdb_wasm_crypto_random(buf, sizeof(buf));
 	std::string result;
 	result.reserve(32);
 	static const char hex[] = "0123456789abcdef";
@@ -768,10 +750,9 @@ OAuthTokenSet VgiTokenManager::PerformDeviceCodeFlow(const OAuthChallenge &chall
 		auth_msg += "\nOr visit: " + verification_uri_complete;
 	}
 	DUCKDB_LOG_WARNING(context, auth_msg);
-#ifdef __EMSCRIPTEN__
-	// Post auth message to main thread so it appears in the terminal UI
-	EM_ASM({ postMessage({ type: 'log', msg: UTF8ToString($0), cls: 'info' }); }, auth_msg.c_str());
-#endif
+	// Note: in WASM, EM_ASM can't be used from side modules (extensions).
+	// The auth message is logged via DUCKDB_LOG_WARNING. The terminal UI
+	// should display DuckDB warning-level logs to show the user code.
 
 	// Step 3: Poll token endpoint
 	EnforceHttpsUrl(server_meta.token_endpoint, "token endpoint");
@@ -1195,8 +1176,10 @@ OAuthTokenSet VgiTokenManager::PerformPKCEFlow(const OAuthChallenge &challenge,
                                                 const OAuthResourceMetadata &resource_meta,
                                                 const OAuthServerMetadata &server_meta,
                                                 ClientContext &context) {
-	// WASM PKCE: VGI does all crypto and URL construction. The main thread
-	// just opens a popup and passes back the auth code via SharedArrayBuffer.
+	// WASM PKCE: all crypto and URL construction happens here in C++.
+	// The only JS interaction is duckdb_wasm_open_auth_url() which opens a popup
+	// on the main thread and blocks until the auth code comes back via SharedArrayBuffer.
+	// No EM_ASM needed — all JS stubs are in duckdb-wasm's js-stubs.js.
 
 	std::string client_id = resource_meta.client_id.empty() ? challenge.client_id : resource_meta.client_id;
 	if (client_id.empty()) {
@@ -1204,23 +1187,19 @@ OAuthTokenSet VgiTokenManager::PerformPKCEFlow(const OAuthChallenge &challenge,
 	}
 	std::string client_secret = resource_meta.client_secret;
 
-	// Generate PKCE parameters
+	// Generate PKCE parameters (uses duckdb_wasm_crypto_random + duckdb_wasm_sha256)
 	auto code_verifier = GenerateCodeVerifier();
 	auto code_challenge = ComputeCodeChallenge(code_verifier);
 	auto state = GenerateState();
 
-	// The redirect_uri points to our oauth-callback.html on the same origin
-	std::string redirect_uri = std::string(
-	    // clang-format off
-	    (const char *)EM_ASM_PTR({
-	        var url = location.origin + '/oauth-callback.html';
-	        var len = lengthBytesUTF8(url) + 1;
-	        var buf = _malloc(len);
-	        stringToUTF8(url, buf, len);
-	        return buf;
-	    })
-	    // clang-format on
-	);
+	// The redirect_uri must be on the same origin as the page hosting duckdb-wasm.
+	char *origin_ptr = duckdb_wasm_get_page_origin();
+	if (!origin_ptr) {
+		throw IOException("Cannot determine page origin for OAuth redirect URI. "
+		                  "Set globalThis._duckdb_page_origin in the worker before loading extensions.");
+	}
+	std::string redirect_uri = std::string(origin_ptr) + "/oauth-callback.html";
+	free(origin_ptr);
 
 	// Build authorization URL
 	std::string auth_url = server_meta.authorization_endpoint +
@@ -1245,66 +1224,32 @@ OAuthTokenSet VgiTokenManager::PerformPKCEFlow(const OAuthChallenge &challenge,
 		auth_url += "&scope=" + UrlEncode(scope_str);
 	}
 
-	// Post the auth URL to the main thread and block until the auth code comes back.
-	// The main thread opens a popup, the popup redirects to oauth-callback.html which
-	// posts the code back, and the main thread writes it to the SharedArrayBuffer.
-	//
-	// SharedArrayBuffer layout: [flag:Int32][dataLen:Int32][data:UTF-8]
-	// flag: 0=waiting, 1=code ready, -1=auth failed
-	// The SAB is stored as a global `oauthSAB` in the Worker (set by test-worker.js).
+	DUCKDB_LOG_WARNING(context, "Authentication required for " + GetResourceDisplayName(resource_meta) +
+	    ". Opening browser...");
 
-	// clang-format off
-	EM_ASM({
-		// Reset the SAB flag to 0 (waiting)
-		if (typeof oauthInt32 !== 'undefined' && oauthInt32) {
-			Atomics.store(oauthInt32, 0, 0);
-		}
-		// Post auth URL to main thread
-		postMessage({ type: 'open-auth-url', url: UTF8ToString($0) });
-	}, auth_url.c_str());
-
-	// Block until main thread signals (code ready or auth failed)
-	int flag = (int)EM_ASM_INT({
-		if (typeof oauthInt32 === 'undefined' || !oauthInt32) {
-			return -1; // No SAB — can't do PKCE in this environment
-		}
-		Atomics.wait(oauthInt32, 0, 0); // blocks until flag != 0
-		return Atomics.load(oauthInt32, 0);
-	});
-
-	// Read the data from the SAB
-	std::string sab_data;
-	{
-		char *data_ptr = (char *)EM_ASM_PTR({
-			if (typeof oauthBytes === 'undefined' || !oauthBytes) return 0;
-			var dv = new DataView(oauthSAB);
-			var len = dv.getInt32(4, true);
-			if (len <= 0) return 0;
-			var buf = _malloc(len + 1);
-			for (var i = 0; i < len; i++) Module.HEAPU8[buf + i] = oauthBytes[8 + i];
-			Module.HEAPU8[buf + len] = 0;
-			return buf;
-		});
-		if (data_ptr) {
-			sab_data = std::string(data_ptr);
-			free(data_ptr);
-		}
-	}
-	// clang-format on
-
-	if (flag == -1) {
-		throw IOException("VGI OAuth: %s", sab_data.empty() ? "authentication failed or cancelled" : sab_data);
+	// Get timeout setting
+	int64_t timeout_seconds = 120;
+	Value timeout_val;
+	if (context.TryGetCurrentSetting("vgi_oauth_timeout_seconds", timeout_val)) {
+		timeout_seconds = timeout_val.GetValue<int64_t>();
 	}
 
-	// sab_data contains the authorization code
-	auto code = sab_data;
-	if (code.empty()) {
-		throw IOException("VGI OAuth: no authorization code received");
+	// Open popup and block until auth code comes back (or timeout)
+	char *code_ptr = duckdb_wasm_open_auth_url(auth_url.c_str(), static_cast<int>(timeout_seconds * 1000));
+	if (!code_ptr) {
+		// Auth failed or cancelled — get error message
+		char *err_ptr = duckdb_wasm_get_auth_error(0);
+		std::string err_msg = err_ptr ? std::string(err_ptr) : "authentication failed or cancelled";
+		if (err_ptr) free(err_ptr);
+		throw IOException("VGI OAuth: %s", err_msg);
 	}
+
+	std::string code(code_ptr);
+	free(code_ptr);
 
 	VGI_STDERR_DEBUG("[VGI] oauth.pkce_wasm code_received\n");
 
-	// Exchange code for tokens (uses DuckDB-WASM's HTTP layer)
+	// Exchange code for tokens (uses duckdb-wasm's HTTP layer)
 	auto tokens = ExchangeCodeForTokens(context, server_meta.token_endpoint,
 	                                     code, redirect_uri, code_verifier, client_id, client_secret);
 	tokens.use_id_token = resource_meta.use_id_token_as_bearer;
