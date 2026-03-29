@@ -8,10 +8,8 @@ duckdb_extension_load(vgi
 
 duckdb_extension_load(httpfs
     LOAD_TESTS
-#    INCLUDE_DIR extension/httpfs/include
-    LOAD_TESTS
     GIT_URL https://github.com/duckdb/duckdb-httpfs
-    GIT_TAG c5a73542cfa9d4b2be73670e5ff0ab973f7a9b27
+    GIT_TAG 0de1997810f22888511efd277ed4775ece295561
 )
 
 # Any extra extensions that should be built
@@ -20,5 +18,6 @@ duckdb_extension_load(json)
 duckdb_extension_load(spatial
     GIT_URL https://github.com/duckdb/duckdb_spatial
     GIT_TAG 4295b9b9a1b5a16b0a6c07880356ff3c4a21e676
+    INCLUDE_DIR src/spatial
     LOAD_TESTS
 )

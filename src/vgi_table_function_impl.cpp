@@ -11,11 +11,21 @@
 #include "duckdb/function/table/arrow.hpp"
 #include "duckdb/planner/filter/conjunction_filter.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
+#include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/planner/filter/in_filter.hpp"
 #include "duckdb/planner/filter/null_filter.hpp"
 #include "duckdb/planner/filter/optional_filter.hpp"
 #include "duckdb/planner/filter/struct_filter.hpp"
 #include "duckdb/planner/table_filter.hpp"
+
+#include "duckdb/planner/expression/bound_cast_expression.hpp"
+#include "duckdb/planner/expression/bound_comparison_expression.hpp"
+#include "duckdb/planner/expression/bound_conjunction_expression.hpp"
+#include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
+#include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
 
 #include "yyjson.hpp"
 
@@ -91,6 +101,86 @@ void PerformVgiTableFunctionBind(ClientContext &context, VgiTableFunctionBindDat
 	         {"worker_pid", std::to_string(bind_data.bind_connection->GetPid())},
 	         {"function_name", bind_data.function_name},
 	         {"num_columns", std::to_string(bind_result.output_schema->num_fields())}});
+}
+
+// ============================================================================
+// Expression Filter Pushdown Support
+// ============================================================================
+
+namespace {
+
+//! Recursively check whether an expression tree only contains functions
+//! that the worker has declared support for.
+//! Returns false if any unsupported function or unsupported node type is found.
+bool ExpressionTreeIsSupported(const Expression &expr, const std::vector<std::string> &supported_functions) {
+	switch (expr.GetExpressionClass()) {
+	case ExpressionClass::BOUND_REF:
+	case ExpressionClass::BOUND_COLUMN_REF:
+		return true;
+	case ExpressionClass::BOUND_CONSTANT:
+		return true;
+	case ExpressionClass::BOUND_FUNCTION: {
+		auto &func_expr = expr.Cast<BoundFunctionExpression>();
+		bool found = false;
+		for (auto &s : supported_functions) {
+			if (s == func_expr.function.name) {
+				found = true;
+				break;
+			}
+		}
+		if (!found) {
+			return false;
+		}
+		for (auto &child : func_expr.children) {
+			if (!ExpressionTreeIsSupported(*child, supported_functions)) {
+				return false;
+			}
+		}
+		return true;
+	}
+	case ExpressionClass::BOUND_COMPARISON: {
+		auto &comp_expr = expr.Cast<BoundComparisonExpression>();
+		return ExpressionTreeIsSupported(*comp_expr.left, supported_functions) &&
+		       ExpressionTreeIsSupported(*comp_expr.right, supported_functions);
+	}
+	case ExpressionClass::BOUND_CONJUNCTION: {
+		auto &conj_expr = expr.Cast<BoundConjunctionExpression>();
+		for (auto &child : conj_expr.children) {
+			if (!ExpressionTreeIsSupported(*child, supported_functions)) {
+				return false;
+			}
+		}
+		return true;
+	}
+	case ExpressionClass::BOUND_CAST:
+		// v1: reject casts rather than serializing them
+		return false;
+	default:
+		return false;
+	}
+}
+
+} // anonymous namespace
+
+bool VgiPushdownExpression(ClientContext &context, const LogicalGet &get, Expression &expr) {
+	if (!get.bind_data) {
+		return false;
+	}
+	auto &bind_data = get.bind_data->Cast<VgiTableFunctionBindData>();
+	if (bind_data.supported_expression_filters.empty()) {
+		return false;
+	}
+	bool supported = ExpressionTreeIsSupported(expr, bind_data.supported_expression_filters);
+	if (supported) {
+		VGI_LOG(context, "table_function.expression_filter_accepted",
+		        {{"function_name", bind_data.function_name}, {"expression", expr.ToString()}});
+	} else {
+		VGI_LOG(context, "table_function.expression_filter_rejected",
+		        {{"function_name", bind_data.function_name},
+		         {"expression", expr.ToString()},
+		         {"reason", "expression tree contains unsupported function or node type"}});
+	}
+	return supported;
 }
 
 // ============================================================================
@@ -238,10 +328,11 @@ private:
 			    worker_path_);
 		}
 		case TableFilterType::EXPRESSION_FILTER: {
-			throw InvalidInputException(
-			    "VGI filter pushdown failed for worker '%s': ExpressionFilter cannot be serialized because it "
-			    "contains an expression tree that may reference functions unavailable in the worker",
-			    worker_path_);
+			auto &expr_filter = filter.Cast<ExpressionFilter>();
+			yyjson_mut_obj_add_str(doc_, obj, "type", "expression");
+			auto expr_json = SerializeExpression(*expr_filter.expr);
+			yyjson_mut_obj_add_val(doc_, obj, "expr", expr_json);
+			break;
 		}
 		case TableFilterType::BLOOM_FILTER: {
 			throw InvalidInputException(
@@ -283,6 +374,73 @@ private:
 		values_.push_back(list_value);
 		value_types_.push_back(list_type);
 		return ref;
+	}
+
+	//! Recursively serialize a bound expression tree to JSON
+	yyjson_mut_val *SerializeExpression(const Expression &expr) {
+		auto obj = yyjson_mut_obj(doc_);
+
+		switch (expr.GetExpressionClass()) {
+		case ExpressionClass::BOUND_REF: {
+			auto &ref_expr = expr.Cast<BoundReferenceExpression>();
+			yyjson_mut_obj_add_str(doc_, obj, "expr_type", "column_ref");
+			yyjson_mut_obj_add_uint(doc_, obj, "index", ref_expr.index);
+			break;
+		}
+		case ExpressionClass::BOUND_COLUMN_REF: {
+			// BOUND_COLUMN_REF is replaced with BOUND_REF by ReplaceWithBoundReference
+			// before ExpressionFilter is created, so this case should not be reached.
+			// Handle it defensively by serializing as column_ref with index 0.
+			yyjson_mut_obj_add_str(doc_, obj, "expr_type", "column_ref");
+			yyjson_mut_obj_add_uint(doc_, obj, "index", 0);
+			break;
+		}
+		case ExpressionClass::BOUND_CONSTANT: {
+			auto &const_expr = expr.Cast<BoundConstantExpression>();
+			yyjson_mut_obj_add_str(doc_, obj, "expr_type", "constant");
+			yyjson_mut_obj_add_uint(doc_, obj, "value_ref", AddValue(const_expr.value));
+			break;
+		}
+		case ExpressionClass::BOUND_FUNCTION: {
+			auto &func_expr = expr.Cast<BoundFunctionExpression>();
+			yyjson_mut_obj_add_str(doc_, obj, "expr_type", "function");
+			yyjson_mut_obj_add_strcpy(doc_, obj, "function_name", func_expr.function.name.c_str());
+			auto children = yyjson_mut_arr(doc_);
+			for (auto &child : func_expr.children) {
+				yyjson_mut_arr_append(children, SerializeExpression(*child));
+			}
+			yyjson_mut_obj_add_val(doc_, obj, "children", children);
+			break;
+		}
+		case ExpressionClass::BOUND_COMPARISON: {
+			auto &comp_expr = expr.Cast<BoundComparisonExpression>();
+			yyjson_mut_obj_add_str(doc_, obj, "expr_type", "comparison");
+			yyjson_mut_obj_add_str(doc_, obj, "op", ExpressionTypeToOp(comp_expr.GetExpressionType()));
+			yyjson_mut_obj_add_val(doc_, obj, "left", SerializeExpression(*comp_expr.left));
+			yyjson_mut_obj_add_val(doc_, obj, "right", SerializeExpression(*comp_expr.right));
+			break;
+		}
+		case ExpressionClass::BOUND_CONJUNCTION: {
+			auto &conj_expr = expr.Cast<BoundConjunctionExpression>();
+			yyjson_mut_obj_add_str(doc_, obj, "expr_type", "conjunction");
+			yyjson_mut_obj_add_str(
+			    doc_, obj, "conjunction_type",
+			    conj_expr.GetExpressionType() == ExpressionType::CONJUNCTION_AND ? "and" : "or");
+			auto children = yyjson_mut_arr(doc_);
+			for (auto &child : conj_expr.children) {
+				yyjson_mut_arr_append(children, SerializeExpression(*child));
+			}
+			yyjson_mut_obj_add_val(doc_, obj, "children", children);
+			break;
+		}
+		default: {
+			throw InvalidInputException(
+			    "VGI expression filter serialization failed for worker '%s': unsupported expression class %d",
+			    worker_path_, static_cast<int>(expr.GetExpressionClass()));
+		}
+		}
+
+		return obj;
 	}
 
 	yyjson_mut_doc *doc_;

@@ -123,6 +123,9 @@ struct VgiTableFunctionBindData : public TableFunctionData {
 	// Whether this function supports projection pushdown (from FunctionInfo)
 	bool projection_pushdown = false;
 
+	// Expression filter function names the worker supports (e.g., ["&&", "st_intersects_extent"])
+	std::vector<std::string> supported_expression_filters;
+
 	vector<string> all_column_names;
 
 	// Table entry reference (for get_bind_info callback; null for direct vgi_table_function)
@@ -267,6 +270,9 @@ void PerformVgiTableFunctionBind(ClientContext &context, VgiTableFunctionBindDat
 std::shared_ptr<arrow::Buffer> VgiSerializeFilters(ClientContext &context, const vector<column_t> &column_ids,
                                                    optional_ptr<TableFilterSet> filters,
                                                    const vector<string> &column_names, const string &worker_path);
+
+//! Expression pushdown callback: checks if the expression tree only uses functions the worker supports
+bool VgiPushdownExpression(ClientContext &context, const LogicalGet &get, Expression &expr);
 
 //! Init global function - creates primary connection and performs init handshake
 unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &context, TableFunctionInitInput &input);

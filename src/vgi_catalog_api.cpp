@@ -1460,6 +1460,7 @@ VgiFunctionInfo ParseFunctionInfo(const std::shared_ptr<arrow::RecordBatch> &bat
 	// Table function capabilities (nullable booleans, stored as optional)
 	info.projection_pushdown = row["projection_pushdown"].as<bool>();
 	info.filter_pushdown = row["filter_pushdown"].as<bool>();
+	info.supported_expression_filters = row["supported_expression_filters"].value_or(std::vector<std::string> {});
 
 	// max_workers (nullable int, stored as optional)
 	info.max_workers = row["max_workers"].as<int32_t>();

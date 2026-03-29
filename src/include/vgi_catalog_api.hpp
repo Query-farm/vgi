@@ -247,6 +247,9 @@ struct VgiFunctionInfo {
 	std::optional<VgiOrderPreservation> order_preservation;
 	std::optional<int32_t> max_workers;
 
+	// Expression filter function names the worker can evaluate (e.g., ["&&", "st_intersects_extent"])
+	std::vector<std::string> supported_expression_filters;
+
 	// Aggregate function fields - uses DuckDB's enums
 	AggregateOrderDependent order_dependent = AggregateOrderDependent::NOT_ORDER_DEPENDENT;
 	AggregateDistinctDependent distinct_dependent = AggregateDistinctDependent::NOT_DISTINCT_DEPENDENT;

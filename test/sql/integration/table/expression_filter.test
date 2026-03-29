@@ -1,0 +1,221 @@
+# name: test/sql/integration/table/expression_filter.test
+# description: Tests expression filter pushdown for spatial and non-spatial functions.
+#
+#              SpatialFilterExampleFunction: 10x10 grid of points in [0,1)x[0,1) for count=100.
+#              Point i: x=(i%10)/10, y=(i//10)/10, so x,y ∈ {0.0, 0.1, ..., 0.9}.
+#
+#              ExpressionFilterTestFunction: rows with id, name='item_<i>',
+#              tags=['tag_<i%5>', 'tag_<(i+1)%5>'], score=i*1.1.
+#
+# group: [vgi_integration_table]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require spatial
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# SPATIAL: Baseline — no filter
+# ============================================================================
+
+query I
+SELECT COUNT(*) FROM example.spatial_filter_example(100);
+----
+100
+
+# ============================================================================
+# SPATIAL: Prove && is pushed down (no standalone FILTER node in plan)
+# ============================================================================
+
+query II
+EXPLAIN SELECT * FROM example.spatial_filter_example(100)
+WHERE geom && ST_MakeEnvelope(0, 0, 0.5, 0.5);
+----
+physical_plan	<!REGEX>:.*FILTER.*SPATIAL_FILTER_EXAMPLE.*
+
+# ============================================================================
+# SPATIAL: && bbox filter
+# Points with x in {0.0..0.5} AND y in {0.0..0.5} = 6 * 6 = 36
+# ============================================================================
+
+query I
+SELECT COUNT(*) FROM example.spatial_filter_example(100)
+WHERE geom && ST_MakeEnvelope(0, 0, 0.5, 0.5);
+----
+36
+
+# Verify bounds of filtered results
+query II
+SELECT MIN(x), MAX(x) FROM example.spatial_filter_example(100)
+WHERE geom && ST_MakeEnvelope(0, 0, 0.5, 0.5);
+----
+0.0	0.5
+
+query II
+SELECT MIN(y), MAX(y) FROM example.spatial_filter_example(100)
+WHERE geom && ST_MakeEnvelope(0, 0, 0.5, 0.5);
+----
+0.0	0.5
+
+# ============================================================================
+# SPATIAL: st_intersects_extent (same semantics as &&)
+# ============================================================================
+
+query I
+SELECT COUNT(*) FROM example.spatial_filter_example(100)
+WHERE st_intersects_extent(geom, ST_MakeEnvelope(0, 0, 0.5, 0.5));
+----
+36
+
+# ============================================================================
+# SPATIAL: tight bbox — only the origin point (0,0)
+# ============================================================================
+
+query I
+SELECT COUNT(*) FROM example.spatial_filter_example(100)
+WHERE geom && ST_MakeEnvelope(0, 0, 0.05, 0.05);
+----
+1
+
+# ============================================================================
+# SPATIAL: empty result — bbox outside all points
+# ============================================================================
+
+query I
+SELECT COUNT(*) FROM example.spatial_filter_example(100)
+WHERE geom && ST_MakeEnvelope(2, 2, 3, 3);
+----
+0
+
+# ============================================================================
+# SPATIAL + constant filter combined
+# n < 50 → rows 0-49, y in {0.0..0.4} (5 values), x in {0.0..0.5} (6 values) = 30
+# ============================================================================
+
+query I
+SELECT COUNT(*) FROM example.spatial_filter_example(100)
+WHERE n < 50 AND geom && ST_MakeEnvelope(0, 0, 0.5, 0.5);
+----
+30
+
+# ============================================================================
+# NON-SPATIAL: Baseline — no filter
+# ============================================================================
+
+query I
+SELECT COUNT(*) FROM example.expression_filter_test(100);
+----
+100
+
+# ============================================================================
+# NON-SPATIAL: Prove list_contains is pushed down
+# ============================================================================
+
+query II
+EXPLAIN SELECT * FROM example.expression_filter_test(100)
+WHERE list_contains(tags, 'tag_0');
+----
+physical_plan	<!REGEX>:.*FILTER.*EXPRESSION_FILTER_TEST.*
+
+# ============================================================================
+# NON-SPATIAL: Prove unsupported function is NOT pushed (FILTER node exists)
+# ============================================================================
+
+query II
+EXPLAIN SELECT * FROM example.expression_filter_test(100)
+WHERE length(name) > 7;
+----
+physical_plan	<REGEX>:.*FILTER.*EXPRESSION_FILTER_TEST.*
+
+# ============================================================================
+# NON-SPATIAL: list_contains
+# tags cycle mod 5: tag_0 appears for i where i%5==0 or (i+1)%5==0
+# i%5==0: i in {0,5,10,...,95} = 20 rows
+# (i+1)%5==0: i%5==4, i in {4,9,14,...,99} = 20 rows
+# Total unique: 40 (no overlap since i%5 can't be both 0 and 4)
+# ============================================================================
+
+query I
+SELECT COUNT(*) FROM example.expression_filter_test(100)
+WHERE list_contains(tags, 'tag_0');
+----
+40
+
+# ============================================================================
+# NON-SPATIAL: starts_with
+# 'item_9' matches item_9, item_90..item_99 = 11 rows
+# ============================================================================
+
+query I
+SELECT COUNT(*) FROM example.expression_filter_test(100)
+WHERE starts_with(name, 'item_9');
+----
+11
+
+# ============================================================================
+# NON-SPATIAL: contains (substring match)
+# contains(name, '_5') matches: item_5, item_50..item_59 = 11 rows
+# (item_15 etc. contain '_15' not '_5')
+# ============================================================================
+
+query I
+SELECT COUNT(*) FROM example.expression_filter_test(100)
+WHERE contains(name, '_5');
+----
+11
+
+# ============================================================================
+# NON-SPATIAL: list_contains + constant filter combined
+# list_contains(tags, 'tag_0') → 40 rows (see above), AND id >= 50
+# Of those 40: i%5==0 AND i>=50: {50,55,60,...,95} = 10 rows
+#              (i+1)%5==0 AND i>=50: i%5==4 AND i>=50: {54,59,64,...,99} = 10 rows
+# Total: 20
+# ============================================================================
+
+query I
+SELECT COUNT(*) FROM example.expression_filter_test(100)
+WHERE list_contains(tags, 'tag_0') AND id >= 50;
+----
+20
+
+# ============================================================================
+# NON-SPATIAL: empty result from expression filter
+# ============================================================================
+
+query I
+SELECT COUNT(*) FROM example.expression_filter_test(100)
+WHERE list_contains(tags, 'nonexistent_tag');
+----
+0
+
+# ============================================================================
+# NON-SPATIAL: expression filter that matches all rows
+# ============================================================================
+
+query I
+SELECT COUNT(*) FROM example.expression_filter_test(100)
+WHERE starts_with(name, 'item_');
+----
+100
+
+# ============================================================================
+# NON-SPATIAL: large dataset
+# 10k rows, tag_2 appears 40% (i%5==2 or (i+1)%5==2 → i%5==1)
+# ============================================================================
+
+query I
+SELECT COUNT(*) FROM example.expression_filter_test(10000)
+WHERE list_contains(tags, 'tag_2');
+----
+4000
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;

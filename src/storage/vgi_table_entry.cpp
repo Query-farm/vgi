@@ -74,6 +74,7 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 	// (e.g., filter_pushdown, projection_pushdown)
 	bool has_projection_pushdown = false;
 	bool has_filter_pushdown = false;
+	std::vector<std::string> scan_supported_expression_filters;
 	std::vector<vgi::VgiSecretRequirement> scan_required_secrets;
 	auto func_entry = catalog_.GetEntry<TableFunctionCatalogEntry>(
 	    context, ParentSchema().name, scan_result.function_name, OnEntryNotFound::RETURN_NULL);
@@ -93,6 +94,7 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 			if (tf.function_info) {
 				auto &vgi_tf_info = tf.function_info->Cast<vgi::VgiTableFunctionInfo>();
 				scan_required_secrets = vgi_tf_info.function_info().required_secrets;
+				scan_supported_expression_filters = vgi_tf_info.function_info().supported_expression_filters;
 			}
 		}
 	}
@@ -108,6 +110,7 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 	scan_bind_data->function_name = scan_result.function_name;
 	scan_bind_data->arguments = vgi::BuildArgumentsFromValues(context, scan_result.positional_arguments, named_args_vec);
 	scan_bind_data->projection_pushdown = has_projection_pushdown;
+	scan_bind_data->supported_expression_filters = scan_supported_expression_filters;
 	scan_bind_data->required_secrets = scan_required_secrets;
 
 	// Store table entry reference for get_bind_info callback
@@ -131,6 +134,9 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 	                   vgi::VgiTableFunctionInitGlobal, vgi::VgiTableFunctionInitLocal);
 	func.projection_pushdown = has_projection_pushdown;
 	func.filter_pushdown = has_filter_pushdown;
+	if (!scan_supported_expression_filters.empty()) {
+		func.pushdown_expression = vgi::VgiPushdownExpression;
+	}
 	func.cardinality = vgi::VgiTableFunctionCardinality;
 	func.table_scan_progress = vgi::VgiTableFunctionProgress;
 	func.to_string = vgi::VgiTableFunctionToString;

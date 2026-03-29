@@ -63,6 +63,7 @@ static unique_ptr<FunctionData> VgiCatalogTableFunctionBind(ClientContext &conte
 	bind_data->use_pool = vgi_info.use_pool();
 	bind_data->function_name = vgi_info.function_info().name;
 	bind_data->projection_pushdown = vgi_info.function_info().projection_pushdown.value_or(false);
+	bind_data->supported_expression_filters = vgi_info.function_info().supported_expression_filters;
 
 	// Build Arrow arguments from the function call inputs
 	// input.inputs contains positional arguments passed to the function
@@ -243,6 +244,9 @@ void VgiTableFunctionSet::LoadEntries(ClientContext &context) {
 				                         vgi::VgiTableFunctionInitLocal);
 				table_func.projection_pushdown = func_info.projection_pushdown.value_or(false);
 				table_func.filter_pushdown = func_info.filter_pushdown.value_or(false);
+				if (!func_info.supported_expression_filters.empty()) {
+					table_func.pushdown_expression = vgi::VgiPushdownExpression;
+				}
 				table_func.cardinality = vgi::VgiTableFunctionCardinality;
 				table_func.table_scan_progress = vgi::VgiTableFunctionProgress;
 				table_func.to_string = vgi::VgiTableFunctionToString;

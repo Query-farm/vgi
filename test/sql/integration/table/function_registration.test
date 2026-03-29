@@ -20,7 +20,7 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
 # ============================================================================
 # Function Inventory
-# 32 pure table functions + 8 table-in-out functions = 40 total table-type functions
+# 34 pure table functions + 8 table-in-out functions = 42 total table-type functions
 # ============================================================================
 
 # Total table-type function count (includes table-in-out)
@@ -29,9 +29,9 @@ SELECT COUNT(*)
 FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'table';
 ----
-40
+42
 
-# The 27 pure table functions (no TABLE parameter type)
+# The 29 pure table functions (no TABLE parameter type)
 # Note: make_series appears 5 times (5 overloads), make_pairs appears 3 times,
 #       repeat_value appears 2 times
 query T
@@ -39,17 +39,18 @@ SELECT function_name
 FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'table'
 AND function_name IN (
-    'constant_columns', 'double_sequence', 'filter_echo',
+    'constant_columns', 'double_sequence', 'expression_filter_test', 'filter_echo',
     'generator_exception', 'logging_generator', 'make_series',
     'make_pairs', 'repeat_value',
     'named_params_echo', 'nested_sequence', 'partitioned_sequence',
     'projected_data', 'rowid_sequence', 'scoped_secret_demo', 'secret_demo', 'sequence',
-    'settings_aware', 'struct_settings', 'ten_thousand', 'versioned_data_scan'
+    'settings_aware', 'spatial_filter_example', 'struct_settings', 'ten_thousand', 'versioned_data_scan'
 )
 ORDER BY function_name;
 ----
 constant_columns
 double_sequence
+expression_filter_test
 filter_echo
 generator_exception
 logging_generator
@@ -72,6 +73,7 @@ scoped_secret_demo
 secret_demo
 sequence
 settings_aware
+spatial_filter_example
 struct_settings
 ten_thousand
 versioned_data_scan
