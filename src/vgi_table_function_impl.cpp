@@ -864,7 +864,14 @@ static void UpdateDynamicFilterState(VgiTableFunctionGlobalState &global_state, 
 	}
 
 	if (!any_initialized) {
-		return; // No dynamic filters initialized yet — skip
+		// No dynamic filters initialized yet (or Reset was called for recursive CTEs).
+		// Clear any stale filter state from a previous iteration.
+		lock_guard<mutex> l(global_state.tick_filter_state->lock);
+		if (global_state.tick_filter_state->has_filters) {
+			global_state.tick_filter_state->encoded_filters.clear();
+			global_state.tick_filter_state->has_filters = false;
+		}
+		return;
 	}
 
 	// Serialize the merged filters
