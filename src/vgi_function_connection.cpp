@@ -223,6 +223,7 @@ BindResult FunctionConnection::PerformBindFull() {
 
 InitResult FunctionConnection::PerformInit(const std::vector<int32_t> &projection_ids,
                                            std::shared_ptr<arrow::Buffer> pushdown_filters,
+                                           std::shared_ptr<arrow::Buffer> join_keys,
                                            const std::string &phase) {
 	if (!bind_done_) {
 		ThrowVgiIOException("FunctionConnection::PerformInit called before PerformBind", worker_path_,
@@ -240,23 +241,17 @@ InitResult FunctionConnection::PerformInit(const std::vector<int32_t> &projectio
 		projection_ids_64.push_back(static_cast<int64_t>(id));
 	}
 
-	// Serialize pushdown_filters if present
-	std::vector<uint8_t> pushdown_filters_bytes;
-	if (pushdown_filters) {
-		pushdown_filters_bytes.assign(pushdown_filters->data(),
-		                              pushdown_filters->data() + pushdown_filters->size());
-	}
-
 	// Determine execution_id: use global_execution_id_ for secondary workers
 	auto &execution_id = global_execution_id_;
 
-	// Build InitRequest
+	// Build InitRequest — pass arrow::Buffer directly to avoid copying
 	auto init_request = BuildInitRequest(
 	    bind_result_.bind_request_bytes,
 	    bind_result_.output_schema_bytes,
 	    bind_result_.opaque_data,
 	    projection_ids_64,
-	    pushdown_filters_bytes,
+	    pushdown_filters,
+	    join_keys,
 	    phase,
 	    execution_id);
 	auto init_request_bytes = SerializeToIpcBytes(init_request);
@@ -442,7 +437,7 @@ void FunctionConnection::PerformFinalizeInit() {
 	} guard{input_schema_, global_execution_id_, std::move(saved_input_schema), std::move(saved_global_exec_id)};
 
 	// Call PerformInit with phase=FINALIZE and the stored execution_id
-	PerformInit({}, nullptr, "FINALIZE");
+	PerformInit({}, nullptr, nullptr, "FINALIZE");
 }
 
 std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {

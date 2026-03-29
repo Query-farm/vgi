@@ -211,10 +211,22 @@ const char *ExpressionTypeToOp(ExpressionType type) {
 	}
 }
 
+//! Info about a join key column to be serialized as a flat Arrow batch.
+//! Holds a non-owning pointer to the InFilter::values vector.
+//! Lifetime contract: the TableFilterSet passed to VgiSerializeFilters must outlive the FilterSerializer.
+struct JoinKeysInfo {
+	string column_name;
+	idx_t column_index;
+	LogicalType type;
+	const vector<Value> *values; // borrowed from InFilter::values
+};
+
 //! FilterSerializer walks the filter tree, builds JSON, and collects values
 class FilterSerializer {
 public:
-	FilterSerializer(const string &worker_path) : doc_(yyjson_mut_doc_new(nullptr)), worker_path_(worker_path) {
+	FilterSerializer(const string &worker_path, idx_t join_keys_max_bytes = 0)
+	    : doc_(yyjson_mut_doc_new(nullptr)), worker_path_(worker_path),
+	      join_keys_max_bytes_(join_keys_max_bytes) {
 	}
 
 	~FilterSerializer() {
@@ -223,13 +235,16 @@ public:
 		}
 	}
 
-	//! Serialize a single filter for a column
+	//! Serialize a single filter for a column. Returns nullptr if the filter was skipped
+	//! (e.g., join keys exceeded byte-size limit).
 	yyjson_mut_val *SerializeColumnFilter(idx_t column_index, const string &column_name, const TableFilter &filter) {
 		auto obj = yyjson_mut_obj(doc_);
 		yyjson_mut_obj_add_strcpy(doc_, obj, "column_name", column_name.c_str());
 		yyjson_mut_obj_add_uint(doc_, obj, "column_index", column_index);
 
-		SerializeFilterInto(obj, filter, column_index, column_name);
+		if (!SerializeFilterInto(obj, filter, column_index, column_name)) {
+			return nullptr; // filter was skipped
+		}
 		return obj;
 	}
 
@@ -253,10 +268,21 @@ public:
 		return doc_;
 	}
 
+	//! Whether any join key columns were accumulated
+	bool HasJoinKeys() const {
+		return !join_key_columns_.empty();
+	}
+
+	//! Get the accumulated join key columns
+	const vector<JoinKeysInfo> &GetJoinKeyColumns() const {
+		return join_key_columns_;
+	}
+
 private:
-	//! Serialize filter fields into an existing object
+	//! Serialize filter fields into an existing object. Returns false if the filter was
+	//! skipped (e.g., join keys exceeded byte-size limit), in which case the obj should be discarded.
 	//! column_index and column_name are passed through for child filters in conjunctions
-	void SerializeFilterInto(yyjson_mut_val *obj, const TableFilter &filter, idx_t column_index,
+	bool SerializeFilterInto(yyjson_mut_val *obj, const TableFilter &filter, idx_t column_index,
 	                         const string &column_name) {
 		switch (filter.filter_type) {
 		case TableFilterType::CONSTANT_COMPARISON: {
@@ -276,8 +302,19 @@ private:
 		}
 		case TableFilterType::IN_FILTER: {
 			auto &in_filter = filter.Cast<InFilter>();
-			yyjson_mut_obj_add_str(doc_, obj, "type", "in");
-			yyjson_mut_obj_add_uint(doc_, obj, "value_ref", AddListValue(in_filter.values));
+			if (in_filter.values.empty()) {
+				return false; // empty IN filter — skip
+			}
+			// Estimate serialized byte size to decide whether to push join keys
+			auto estimated_bytes = EstimateJoinKeyBytes(in_filter.values);
+			if (join_keys_max_bytes_ > 0 && estimated_bytes > join_keys_max_bytes_) {
+				// Too large — skip this filter. DuckDB still applies it client-side.
+				return false;
+			}
+			// Emit as join_keys type — values go into a separate flat Arrow batch
+			yyjson_mut_obj_add_str(doc_, obj, "type", "join_keys");
+			yyjson_mut_obj_add_strcpy(doc_, obj, "keys_column", column_name.c_str());
+			join_key_columns_.push_back({column_name, column_index, in_filter.values[0].type(), &in_filter.values});
 			break;
 		}
 		case TableFilterType::CONJUNCTION_AND: {
@@ -345,9 +382,9 @@ private:
 		case TableFilterType::OPTIONAL_FILTER: {
 			auto &optional_filter = filter.Cast<OptionalFilter>();
 			if (optional_filter.child_filter) {
-				SerializeFilterInto(obj, *optional_filter.child_filter, column_index, column_name);
+				return SerializeFilterInto(obj, *optional_filter.child_filter, column_index, column_name);
 			}
-			break;
+			return false; // no child filter
 		}
 		default: {
 			throw InvalidInputException(
@@ -355,6 +392,7 @@ private:
 			    worker_path_, static_cast<int>(filter.filter_type));
 		}
 		}
+		return true;
 	}
 
 	//! Add a value and return its reference index
@@ -362,19 +400,6 @@ private:
 		idx_t ref = values_.size();
 		values_.push_back(value);
 		value_types_.push_back(value.type());
-		return ref;
-	}
-
-	//! Add a list value from multiple values (for IN filters) and return its reference index
-	idx_t AddListValue(const vector<Value> &list_values) {
-		// All values in an IN filter have the same type
-		auto element_type = list_values[0].type();
-		auto list_type = LogicalType::LIST(element_type);
-		auto list_value = Value::LIST(element_type, list_values);
-
-		idx_t ref = values_.size();
-		values_.push_back(list_value);
-		value_types_.push_back(list_type);
 		return ref;
 	}
 
@@ -445,10 +470,38 @@ private:
 		return obj;
 	}
 
+	//! Estimate the serialized byte size of join key values.
+	//! For fixed-width types this is exact; for strings, samples the first 64 values.
+	static idx_t EstimateJoinKeyBytes(const vector<Value> &values) {
+		if (values.empty()) {
+			return 0;
+		}
+		auto internal_type = values[0].type().InternalType();
+		if (internal_type == PhysicalType::VARCHAR) {
+			// Sample first N values to estimate average string length
+			constexpr idx_t SAMPLE_SIZE = 64;
+			idx_t sample_count = MinValue<idx_t>(SAMPLE_SIZE, values.size());
+			idx_t total_sample_bytes = 0;
+			idx_t non_null_count = 0;
+			for (idx_t i = 0; i < sample_count; i++) {
+				if (!values[i].IsNull()) {
+					total_sample_bytes += StringValue::Get(values[i]).size();
+					non_null_count++;
+				}
+			}
+			idx_t avg_len = non_null_count > 0 ? total_sample_bytes / non_null_count : 0;
+			return values.size() * (avg_len + 4); // +4 for Arrow string offsets
+		}
+		// Fixed-width: exact calculation
+		return values.size() * GetTypeIdSize(internal_type);
+	}
+
 	yyjson_mut_doc *doc_;
 	string worker_path_;
+	idx_t join_keys_max_bytes_;
 	vector<Value> values_;
 	vector<LogicalType> value_types_;
+	vector<JoinKeysInfo> join_key_columns_;
 };
 
 } // anonymous namespace
@@ -457,16 +510,23 @@ private:
 // Serialize Filters - Convert TableFilterSet to Arrow IPC bytes for worker
 // ============================================================================
 
-std::shared_ptr<arrow::Buffer> VgiSerializeFilters(ClientContext &context, const vector<column_t> &column_ids,
-                                                   optional_ptr<TableFilterSet> filters,
-                                                   const vector<string> &column_names, const string &worker_path) {
-	// Return nullptr if no filters
+SerializedFilters VgiSerializeFilters(ClientContext &context, const vector<column_t> &column_ids,
+                                      optional_ptr<TableFilterSet> filters,
+                                      const vector<string> &column_names, const string &worker_path) {
+	// Return empty if no filters
 	if (!filters || filters->filters.empty()) {
-		return nullptr;
+		return {nullptr, nullptr};
+	}
+
+	// Read byte size limit for join keys from settings
+	idx_t join_keys_max_bytes = 0;
+	Value max_bytes_val;
+	if (context.TryGetCurrentSetting("vgi_join_keys_max_bytes", max_bytes_val) && !max_bytes_val.IsNull()) {
+		join_keys_max_bytes = max_bytes_val.GetValue<idx_t>();
 	}
 
 	// Build JSON filter structure and collect values
-	FilterSerializer serializer(worker_path);
+	FilterSerializer serializer(worker_path, join_keys_max_bytes);
 	auto filter_array = yyjson_mut_arr(serializer.GetDoc());
 
 	for (auto &entry : filters->filters) {
@@ -485,13 +545,17 @@ std::shared_ptr<arrow::Buffer> VgiSerializeFilters(ClientContext &context, const
 			// children. Skip them rather than failing the entire filter set.
 			try {
 				auto filter_obj = serializer.SerializeColumnFilter(col_idx, col_name, filter);
-				yyjson_mut_arr_append(filter_array, filter_obj);
+				if (filter_obj) {
+					yyjson_mut_arr_append(filter_array, filter_obj);
+				}
 			} catch (const InvalidInputException &) {
 				continue;
 			}
 		} else {
 			auto filter_obj = serializer.SerializeColumnFilter(col_idx, col_name, filter);
-			yyjson_mut_arr_append(filter_array, filter_obj);
+			if (filter_obj) {
+				yyjson_mut_arr_append(filter_array, filter_obj);
+			}
 		}
 	}
 
@@ -588,7 +652,85 @@ std::shared_ptr<arrow::Buffer> VgiSerializeFilters(ClientContext &context, const
 		throw IOException("Failed to finish filter IPC buffer: %s", finish_result.status().ToString());
 	}
 
-	return finish_result.ValueUnsafe();
+	auto filter_bytes = finish_result.ValueUnsafe();
+
+	// Build the join keys batch if any InFilter values were accumulated
+	std::shared_ptr<arrow::Buffer> join_keys_bytes;
+	if (serializer.HasJoinKeys()) {
+		auto &key_columns = serializer.GetJoinKeyColumns();
+
+		// Build types/names for the keys batch
+		vector<LogicalType> key_types;
+		vector<string> key_names;
+		idx_t total_count = key_columns[0].values->size();
+		for (auto &kc : key_columns) {
+			key_types.push_back(kc.type);
+			key_names.push_back(kc.column_name);
+		}
+
+		// Create DataChunk sized to fit all values and populate
+		DataChunk key_chunk;
+		key_chunk.Initialize(Allocator::DefaultAllocator(), key_types, total_count);
+		key_chunk.SetCardinality(total_count);
+		for (idx_t col = 0; col < key_columns.size(); col++) {
+			for (idx_t row = 0; row < total_count; row++) {
+				key_chunk.SetValue(col, row, (*key_columns[col].values)[row]);
+			}
+		}
+
+		// Convert to Arrow via ArrowAppender (preserves extension type metadata)
+		ArrowAppender key_appender(key_types, total_count, client_props,
+		                           ArrowTypeExtensionData::GetExtensionTypes(context, key_types));
+		key_appender.Append(key_chunk, 0, total_count, total_count);
+		ArrowArray key_arr = key_appender.Finalize();
+
+		// Build Arrow C schema
+		ArrowSchema key_c_schema;
+		ArrowConverter::ToArrowSchema(&key_c_schema, key_types, key_names, client_props);
+
+		// Import to Arrow C++ RecordBatch
+		auto key_import = arrow::ImportRecordBatch(&key_arr, &key_c_schema);
+		if (!key_import.ok()) {
+			throw IOException("Failed to import join keys RecordBatch: %s", key_import.status().ToString());
+		}
+		auto key_batch = key_import.ValueUnsafe();
+
+		// Add version metadata to schema
+		auto key_metadata = arrow::KeyValueMetadata::Make({"vgi_join_keys_version"}, {"1"});
+		key_batch = key_batch->ReplaceSchemaMetadata(key_metadata);
+
+		// Serialize to Arrow IPC
+		auto key_buf_result = arrow::io::BufferOutputStream::Create();
+		if (!key_buf_result.ok()) {
+			throw IOException("Failed to create buffer for join keys IPC: %s", key_buf_result.status().ToString());
+		}
+		auto key_buf_stream = key_buf_result.ValueUnsafe();
+
+		auto key_writer_result = arrow::ipc::MakeStreamWriter(key_buf_stream, key_batch->schema());
+		if (!key_writer_result.ok()) {
+			throw IOException("Failed to create IPC writer for join keys: %s", key_writer_result.status().ToString());
+		}
+		auto key_writer = key_writer_result.ValueUnsafe();
+
+		auto key_write_status = key_writer->WriteRecordBatch(*key_batch);
+		if (!key_write_status.ok()) {
+			throw IOException("Failed to write join keys RecordBatch: %s", key_write_status.ToString());
+		}
+
+		auto key_close = key_writer->Close();
+		if (!key_close.ok()) {
+			throw IOException("Failed to close join keys IPC writer: %s", key_close.ToString());
+		}
+
+		auto key_finish = key_buf_stream->Finish();
+		if (!key_finish.ok()) {
+			throw IOException("Failed to finish join keys IPC buffer: %s", key_finish.status().ToString());
+		}
+
+		join_keys_bytes = key_finish.ValueUnsafe();
+	}
+
+	return {std::move(filter_bytes), std::move(join_keys_bytes)};
 }
 
 // ============================================================================
@@ -622,23 +764,29 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 	// Move connection from bind phase (bind already completed, skip redundant handshake)
 	auto connection = std::move(bind_data.bind_connection);
 
-	// Serialize the filters (returns nullptr if no filters or if serialization fails)
-	std::shared_ptr<arrow::Buffer> filter_bytes;
+	// Serialize the filters (returns empty if no filters or if serialization fails)
+	SerializedFilters serialized_filters;
 	try {
-		filter_bytes =
+		serialized_filters =
 		    VgiSerializeFilters(context, input.column_ids, input.filters, bind_data.all_column_names, bind_data.worker_path);
-		if (filter_bytes) {
+		if (serialized_filters.filter_bytes) {
 			VGI_LOG(context, "table_function.filters_serialized",
 			        {{"function_name", bind_data.function_name},
-			         {"filter_bytes_size", std::to_string(filter_bytes->size())}});
+			         {"filter_bytes_size", std::to_string(serialized_filters.filter_bytes->size())}});
+		}
+		if (serialized_filters.join_keys_bytes) {
+			VGI_LOG(context, "table_function.join_keys_serialized",
+			        {{"function_name", bind_data.function_name},
+			         {"join_keys_bytes_size", std::to_string(serialized_filters.join_keys_bytes->size())}});
 		}
 	} catch (const InvalidInputException &e) {
 		// Filter contains unsupported types - skip pushdown, let DuckDB filter locally
 		VGI_LOG(context, "table_function.filter_pushdown_skipped",
 		        {{"function_name", bind_data.function_name},
 		         {"reason", e.what()}});
-		filter_bytes = nullptr;
 	}
+	auto &filter_bytes = serialized_filters.filter_bytes;
+	auto &join_keys_bytes = serialized_filters.join_keys_bytes;
 
 	// Capture DynamicFilter references for tick-based pushdown.
 	// Walk the filter set looking for OptionalFilter → DynamicFilter (from Top-N)
@@ -666,7 +814,7 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 				if (df.filter_data && df.filter_data->filter) {
 					VgiDynamicFilterInfo info;
 					info.filter_data = df.filter_data;
-					info.column_index = col_idx;
+					info.column_index = original_col_idx;
 					info.column_name = col_name;
 					info.comparison_type = df.filter_data->filter->comparison_type;
 					info.nulls_first = false;
@@ -681,7 +829,7 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 						if (df.filter_data && df.filter_data->filter) {
 							VgiDynamicFilterInfo info;
 							info.filter_data = df.filter_data;
-							info.column_index = col_idx;
+							info.column_index = original_col_idx;
 							info.column_name = col_name;
 							info.comparison_type = df.filter_data->filter->comparison_type;
 							info.nulls_first = true;
@@ -716,8 +864,8 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 		connection->SetTickFilterState(tick_filter_state);
 	}
 
-	// Perform init phase via vgi_rpc with projection and filter pushdown
-	auto init_result = connection->PerformInit(projection_ids, filter_bytes);
+	// Perform init phase via vgi_rpc with projection, filter, and join key pushdown
+	auto init_result = connection->PerformInit(projection_ids, filter_bytes, join_keys_bytes);
 
 	auto global_state = make_uniq<VgiTableFunctionGlobalState>();
 	global_state->global_execution_id = std::move(init_result.execution_id);
@@ -876,10 +1024,11 @@ static void UpdateDynamicFilterState(VgiTableFunctionGlobalState &global_state, 
 
 	// Serialize the merged filters
 	try {
-		auto filter_bytes = VgiSerializeFilters(context, {}, &merged, bind_data.all_column_names, bind_data.worker_path);
-		if (filter_bytes) {
-			auto encoded = Blob::ToBase64(string_t(reinterpret_cast<const char *>(filter_bytes->data()),
-			                                       static_cast<idx_t>(filter_bytes->size())));
+		auto serialized = VgiSerializeFilters(context, {}, &merged, bind_data.all_column_names, bind_data.worker_path);
+		if (serialized.filter_bytes) {
+			auto &fb = serialized.filter_bytes;
+			auto encoded = Blob::ToBase64(string_t(reinterpret_cast<const char *>(fb->data()),
+			                                       static_cast<idx_t>(fb->size())));
 			lock_guard<mutex> l(global_state.tick_filter_state->lock);
 			global_state.tick_filter_state->encoded_filters = encoded;
 			global_state.tick_filter_state->has_filters = true;

@@ -12,6 +12,10 @@
 #include "duckdb/main/extension_helper.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
 #include "duckdb/parser/parsed_data/attach_info.hpp"
+#include "duckdb/main/client_config.hpp"
+#include "duckdb/main/settings.hpp"
+#include "duckdb/optimizer/optimizer_extension.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/storage/storage_extension.hpp"
 #include "query_farm_telemetry.hpp"
 #include "storage/vgi_catalog.hpp"
@@ -25,6 +29,7 @@
 #include "vgi_subprocess.hpp"
 #endif
 #include "vgi_table_function.hpp"
+#include "vgi_table_function_impl.hpp"
 #include "vgi_transport.hpp"
 #include "vgi_worker_pool.hpp"
 #include "vgi_worker_pool_functions.hpp"
@@ -44,6 +49,87 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
                                             AttachOptions &options);
 static unique_ptr<TransactionManager> CreateVgiTransactionManager(optional_ptr<StorageExtensionInfo> storage_info,
                                                                   AttachedDatabase &db, Catalog &catalog);
+
+// ============================================================================
+// VgiJoinOptimizer — auto-raise InFilter threshold for queries with VGI scans
+// ============================================================================
+// When DuckDB joins a local table against a VGI remote table, the hash join
+// can push an InFilter containing the build-side's distinct key values to the
+// probe-side scan. DuckDB's default threshold (dynamic_or_filter_threshold=50)
+// is too low for remote scans where network savings justify sending more keys.
+// This optimizer raises the threshold to vgi_join_keys_limit when a VGI scan
+// is detected in the plan.
+
+class VgiJoinOptimizer : public OptimizerExtension {
+public:
+	VgiJoinOptimizer() {
+		pre_optimize_function = Optimize;
+	}
+
+private:
+	static bool IsVgiScan(LogicalOperator &op) {
+		if (op.type == LogicalOperatorType::LOGICAL_GET) {
+			auto &get = op.Cast<LogicalGet>();
+			return get.function.function == vgi::VgiTableFunctionScan;
+		}
+		return false;
+	}
+
+	static bool SubtreeContainsVgiScan(LogicalOperator &op) {
+		if (IsVgiScan(op)) {
+			return true;
+		}
+		for (auto &child : op.children) {
+			if (SubtreeContainsVgiScan(*child)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	//! Check if the plan has a comparison join where any child subtree contains a VGI scan.
+	//! Only raises the threshold when there's an actual join involving VGI — a plain
+	//! SELECT * FROM vgi_table doesn't trigger it.
+	static bool HasJoinWithVgiScan(LogicalOperator &op) {
+		if (op.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
+		    op.type == LogicalOperatorType::LOGICAL_ANY_JOIN) {
+			for (auto &child : op.children) {
+				if (SubtreeContainsVgiScan(*child)) {
+					return true;
+				}
+			}
+		}
+		for (auto &child : op.children) {
+			if (HasJoinWithVgiScan(*child)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	static void Optimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
+		if (!HasJoinWithVgiScan(*plan)) {
+			return;
+		}
+
+		Value limit_val;
+		if (!input.context.TryGetCurrentSetting("vgi_join_keys_limit", limit_val) || limit_val.IsNull()) {
+			return;
+		}
+		auto vgi_limit = limit_val.GetValue<idx_t>();
+		if (vgi_limit == 0) {
+			return; // disabled
+		}
+
+		// Only raise, never lower a user-set threshold
+		auto current = Settings::Get<DynamicOrFilterThresholdSetting>(input.context);
+		if (current < vgi_limit) {
+			auto &client_config = ClientConfig::GetConfig(input.context);
+			client_config.user_settings.SetUserSetting(DynamicOrFilterThresholdSetting::SettingIndex,
+			                                           Value::UBIGINT(vgi_limit));
+		}
+	}
+};
 
 // Storage extension for VGI — also holds per-secret-type redact keys
 class VgiStorageExtension : public StorageExtension {
@@ -622,6 +708,15 @@ static void LoadInternal(ExtensionLoader &loader) {
 	config.AddExtensionOption("vgi_async_prefetch",
 	                          "Enable async I/O prefetch for VGI table function scans",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
+
+	// Register join key pushdown settings + optimizer
+	config.AddExtensionOption("vgi_join_keys_limit",
+	                          "Max distinct join key values to push to VGI workers (0 = disabled)",
+	                          LogicalType::UBIGINT, Value::UBIGINT(100000));
+	config.AddExtensionOption("vgi_join_keys_max_bytes",
+	                          "Max estimated byte size for join keys batch (skip pushdown if exceeded)",
+	                          LogicalType::UBIGINT, Value::UBIGINT(67108864)); // 64MB
+	OptimizerExtension::Register(config, VgiJoinOptimizer());
 
 	// Register worker pool settings
 	config.AddExtensionOption("vgi_worker_pool_idle_limit_seconds",

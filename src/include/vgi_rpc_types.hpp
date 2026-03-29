@@ -110,6 +110,7 @@ std::optional<BindSecretScopeResponseResult> TryParseBindSecretScopeResponse(
 //   bind_opaque_data: binary|null
 //   projection_ids: list<int64>|null
 //   pushdown_filters: binary|null
+//   join_keys: binary|null
 //   phase: dictionary(int16, utf8)|null ("INPUT", "FINALIZE")
 //   execution_id: binary|null
 //   init_opaque_data: binary|null
@@ -118,7 +119,8 @@ std::shared_ptr<arrow::RecordBatch> BuildInitRequest(
     const std::vector<uint8_t> &output_schema_bytes,
     const std::vector<uint8_t> &bind_opaque_data = {},
     const std::vector<int64_t> &projection_ids = {},
-    const std::vector<uint8_t> &pushdown_filters_bytes = {},
+    std::shared_ptr<arrow::Buffer> pushdown_filters = nullptr,
+    std::shared_ptr<arrow::Buffer> join_keys = nullptr,
     const std::string &phase = "",          // Empty = null, "INPUT", "FINALIZE"
     const std::vector<uint8_t> &execution_id = {},
     const std::vector<uint8_t> &init_opaque_data = {});

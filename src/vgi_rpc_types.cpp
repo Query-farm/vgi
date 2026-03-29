@@ -36,6 +36,7 @@ std::shared_ptr<arrow::Array> BuildBinaryScalar(const std::vector<uint8_t> &byte
 	return FinishArray(builder, "binary");
 }
 
+
 // Helper to build a utf8 array with a single value
 std::shared_ptr<arrow::Array> BuildStringScalar(const std::string &value) {
 	arrow::StringBuilder builder;
@@ -380,7 +381,9 @@ std::optional<BindSecretScopeResponseResult> TryParseBindSecretScopeResponse(
 std::shared_ptr<arrow::RecordBatch>
 BuildInitRequest(const std::vector<uint8_t> &bind_call_bytes, const std::vector<uint8_t> &output_schema_bytes,
                  const std::vector<uint8_t> &bind_opaque_data, const std::vector<int64_t> &projection_ids,
-                 const std::vector<uint8_t> &pushdown_filters_bytes, const std::string &phase,
+                 std::shared_ptr<arrow::Buffer> pushdown_filters,
+                 std::shared_ptr<arrow::Buffer> join_keys,
+                 const std::string &phase,
                  const std::vector<uint8_t> &execution_id, const std::vector<uint8_t> &init_opaque_data) {
 	static const std::vector<std::string> phase_values = {"INPUT", "FINALIZE"};
 
@@ -391,7 +394,8 @@ BuildInitRequest(const std::vector<uint8_t> &bind_call_bytes, const std::vector<
 	    arrow::field("output_schema", arrow::binary(), false),
 	    arrow::field("bind_opaque_data", arrow::binary(), true),
 	    arrow::field("projection_ids", arrow::list(arrow::int64()), true),
-	    arrow::field("pushdown_filters", arrow::binary(), true),
+	    arrow::field("pushdown_filters", arrow::large_binary(), true),
+	    arrow::field("join_keys", arrow::large_binary(), true),
 	    arrow::field("phase", phase_type, true),
 	    arrow::field("execution_id", arrow::binary(), true),
 	    arrow::field("init_opaque_data", arrow::binary(), true),
@@ -423,8 +427,29 @@ BuildInitRequest(const std::vector<uint8_t> &bind_call_bytes, const std::vector<
 		arrays.push_back(FinishArray(list_builder, "projection_ids"));
 	}
 
-	// pushdown_filters: binary|null
-	arrays.push_back(BuildBinaryScalar(pushdown_filters_bytes));
+	// pushdown_filters: large_binary|null (zero-copy from arrow::Buffer, int64 offsets)
+	{
+		arrow::LargeBinaryBuilder builder;
+		if (!pushdown_filters || pushdown_filters->size() == 0) {
+			CheckStatus(builder.AppendNull(), "append null pushdown_filters");
+		} else {
+			CheckStatus(builder.Append(pushdown_filters->data(), static_cast<int64_t>(pushdown_filters->size())),
+			            "append pushdown_filters");
+		}
+		arrays.push_back(FinishArray(builder, "pushdown_filters"));
+	}
+
+	// join_keys: large_binary|null (zero-copy from arrow::Buffer, int64 offsets)
+	{
+		arrow::LargeBinaryBuilder builder;
+		if (!join_keys || join_keys->size() == 0) {
+			CheckStatus(builder.AppendNull(), "append null join_keys");
+		} else {
+			CheckStatus(builder.Append(join_keys->data(), static_cast<int64_t>(join_keys->size())),
+			            "append join_keys");
+		}
+		arrays.push_back(FinishArray(builder, "join_keys"));
+	}
 
 	// phase: dictionary(int16, utf8)|null
 	if (phase.empty()) {

@@ -99,7 +99,7 @@ static std::unique_ptr<IFunctionConnection> SetupWriteConnection(ClientContext &
 
 	connection->SetInputSchema(input_schema);
 	connection->PerformBindFull();
-	connection->PerformInit({}, nullptr, "INPUT");
+	connection->PerformInit({}, nullptr, nullptr, "INPUT");
 	connection->OpenInputWriter();
 
 	return connection;

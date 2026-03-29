@@ -161,6 +161,7 @@ public:
 	// Optional phase parameter for FINALIZE init calls
 	InitResult PerformInit(const std::vector<int32_t> &projection_ids = {},
 	                       std::shared_ptr<arrow::Buffer> pushdown_filters = nullptr,
+	                       std::shared_ptr<arrow::Buffer> join_keys = nullptr,
 	                       const std::string &phase = "") override;
 
 	// Perform finalize init for table-in-out functions
