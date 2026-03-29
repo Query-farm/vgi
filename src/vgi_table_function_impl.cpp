@@ -320,8 +320,19 @@ std::shared_ptr<arrow::Buffer> VgiSerializeFilters(ClientContext &context, const
 		string col_name =
 		    original_col_idx < column_names.size() ? column_names[original_col_idx] : std::to_string(original_col_idx);
 
-		auto filter_obj = serializer.SerializeColumnFilter(col_idx, col_name, filter);
-		yyjson_mut_arr_append(filter_array, filter_obj);
+		if (filter.filter_type == TableFilterType::OPTIONAL_FILTER) {
+			// Optional filters (e.g., DynamicFilter from TOP-N) may contain unserializable
+			// children. Skip them rather than failing the entire filter set.
+			try {
+				auto filter_obj = serializer.SerializeColumnFilter(col_idx, col_name, filter);
+				yyjson_mut_arr_append(filter_array, filter_obj);
+			} catch (const InvalidInputException &) {
+				continue;
+			}
+		} else {
+			auto filter_obj = serializer.SerializeColumnFilter(col_idx, col_name, filter);
+			yyjson_mut_arr_append(filter_array, filter_obj);
+		}
 	}
 
 	// Write JSON string

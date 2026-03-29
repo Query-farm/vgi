@@ -8,3 +8,8 @@ duckdb_extension_load(vgi
 )
 
 duckdb_extension_load(json)
+
+duckdb_extension_load(spatial
+    GIT_URL https://github.com/duckdb/duckdb_spatial
+    GIT_TAG 4295b9b9a1b5a16b0a6c07880356ff3c4a21e676
+)

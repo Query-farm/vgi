@@ -32,7 +32,7 @@ The extension supports two transports: **subprocess** (worker spawned as a child
 
 ### Subprocess Transport (default, faster)
 
-**Always use `tee` to capture output** so failures are easy to find afterwards:
+**Always use `tee` to capture output when running tests and analyze that output** so failures are easy to find afterwards, if you don't use tee it means the tests are run twice.:
 
 ```bash
 # Run all tests in release mode (subprocess)
