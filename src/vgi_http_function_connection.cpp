@@ -262,7 +262,7 @@ BindResult HttpFunctionConnection::PerformBindFull() {
 
 InitResult HttpFunctionConnection::PerformInit(const std::vector<int32_t> &projection_ids,
                                                 std::shared_ptr<arrow::Buffer> pushdown_filters,
-                                                std::shared_ptr<arrow::Buffer> join_keys,
+                                                std::vector<std::shared_ptr<arrow::Buffer>> join_keys,
                                                 const std::string &phase) {
 	if (!bind_done_) {
 		throw IOException("HttpFunctionConnection::PerformInit called before PerformBind [url: %s]", base_url_);
@@ -387,7 +387,7 @@ void HttpFunctionConnection::PerformFinalizeInit() {
 		}
 	} guard{input_schema_, global_execution_id_, std::move(saved_input_schema), std::move(saved_global_exec_id)};
 
-	PerformInit({}, nullptr, nullptr, "FINALIZE");
+	PerformInit({}, nullptr, {}, "FINALIZE");
 }
 
 // ============================================================================

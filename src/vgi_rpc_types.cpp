@@ -382,7 +382,7 @@ std::shared_ptr<arrow::RecordBatch>
 BuildInitRequest(const std::vector<uint8_t> &bind_call_bytes, const std::vector<uint8_t> &output_schema_bytes,
                  const std::vector<uint8_t> &bind_opaque_data, const std::vector<int64_t> &projection_ids,
                  std::shared_ptr<arrow::Buffer> pushdown_filters,
-                 std::shared_ptr<arrow::Buffer> join_keys,
+                 std::vector<std::shared_ptr<arrow::Buffer>> join_keys,
                  const std::string &phase,
                  const std::vector<uint8_t> &execution_id, const std::vector<uint8_t> &init_opaque_data) {
 	static const std::vector<std::string> phase_values = {"INPUT", "FINALIZE"};
@@ -395,7 +395,7 @@ BuildInitRequest(const std::vector<uint8_t> &bind_call_bytes, const std::vector<
 	    arrow::field("bind_opaque_data", arrow::binary(), true),
 	    arrow::field("projection_ids", arrow::list(arrow::int64()), true),
 	    arrow::field("pushdown_filters", arrow::large_binary(), true),
-	    arrow::field("join_keys", arrow::large_binary(), true),
+	    arrow::field("join_keys", arrow::list(arrow::large_binary()), true),
 	    arrow::field("phase", phase_type, true),
 	    arrow::field("execution_id", arrow::binary(), true),
 	    arrow::field("init_opaque_data", arrow::binary(), true),
@@ -439,16 +439,20 @@ BuildInitRequest(const std::vector<uint8_t> &bind_call_bytes, const std::vector<
 		arrays.push_back(FinishArray(builder, "pushdown_filters"));
 	}
 
-	// join_keys: large_binary|null (zero-copy from arrow::Buffer, int64 offsets)
+	// join_keys: list<large_binary>|null (one entry per IN filter column)
 	{
-		arrow::LargeBinaryBuilder builder;
-		if (!join_keys || join_keys->size() == 0) {
-			CheckStatus(builder.AppendNull(), "append null join_keys");
+		auto value_builder = std::make_shared<arrow::LargeBinaryBuilder>();
+		arrow::ListBuilder list_builder(arrow::default_memory_pool(), value_builder);
+		if (join_keys.empty()) {
+			CheckStatus(list_builder.AppendNull(), "append null join_keys");
 		} else {
-			CheckStatus(builder.Append(join_keys->data(), static_cast<int64_t>(join_keys->size())),
-			            "append join_keys");
+			CheckStatus(list_builder.Append(), "start join_keys list");
+			for (auto &buf : join_keys) {
+				CheckStatus(value_builder->Append(buf->data(), static_cast<int64_t>(buf->size())),
+				            "append join_keys buffer");
+			}
 		}
-		arrays.push_back(FinishArray(builder, "join_keys"));
+		arrays.push_back(FinishArray(list_builder, "join_keys"));
 	}
 
 	// phase: dictionary(int16, utf8)|null

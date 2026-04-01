@@ -289,8 +289,8 @@ void PerformVgiTableFunctionBind(ClientContext &context, VgiTableFunctionBindDat
 //! Throws InvalidInputException if filters contain unsupported types (e.g., DynamicFilter, BloomFilter).
 //! Result of filter serialization — contains the filter batch and optional join keys batch.
 struct SerializedFilters {
-	std::shared_ptr<arrow::Buffer> filter_bytes;     //! Arrow IPC bytes of the filter RecordBatch (or nullptr)
-	std::shared_ptr<arrow::Buffer> join_keys_bytes;  //! Arrow IPC bytes of the flat join keys batch (or nullptr)
+	std::shared_ptr<arrow::Buffer> filter_bytes;                    //! Arrow IPC bytes of the filter RecordBatch (or nullptr)
+	std::vector<std::shared_ptr<arrow::Buffer>> join_keys_buffers;  //! Arrow IPC bytes per join key column (one single-column batch each)
 };
 
 //! Serialize a TableFilterSet into Arrow IPC bytes for the VGI worker.
@@ -299,8 +299,8 @@ struct SerializedFilters {
 //!   - Columns 1..N: Values referenced by filters, with exact Arrow types
 //! Version is stored in Arrow schema metadata on filter_spec field: {"vgi_filter_version": "1"}
 //!
-//! If InFilter values are present and within size limits, a separate flat join keys
-//! RecordBatch is built (one row per key value) and returned in join_keys_bytes.
+//! If InFilter values are present and within size limits, each IN filter's values are
+//! serialized as a separate single-column Arrow IPC RecordBatch in join_keys_buffers.
 SerializedFilters VgiSerializeFilters(ClientContext &context, const vector<column_t> &column_ids,
                                       optional_ptr<TableFilterSet> filters,
                                       const vector<string> &column_names, const string &worker_path);

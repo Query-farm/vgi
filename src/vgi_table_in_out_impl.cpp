@@ -183,7 +183,7 @@ unique_ptr<GlobalTableFunctionState> VgiTableInOutInitGlobal(ClientContext &cont
 	}
 
 	// Perform init with phase=INPUT for table-in-out functions
-	auto init_result = connection->PerformInit({}, nullptr, nullptr, "INPUT");
+	auto init_result = connection->PerformInit({}, nullptr, {}, "INPUT");
 	global_state->global_execution_id = std::move(init_result.execution_id);
 
 	// Open the input writer for Stream 5

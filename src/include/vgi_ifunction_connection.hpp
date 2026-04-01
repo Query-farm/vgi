@@ -59,7 +59,7 @@ public:
 	// Phase 2: Init
 	virtual InitResult PerformInit(const std::vector<int32_t> &projection_ids = {},
 	                               std::shared_ptr<arrow::Buffer> pushdown_filters = nullptr,
-	                               std::shared_ptr<arrow::Buffer> join_keys = nullptr,
+	                               std::vector<std::shared_ptr<arrow::Buffer>> join_keys = {},
 	                               const std::string &phase = "") = 0;
 	virtual void PerformFinalizeInit() = 0;
 

@@ -53,7 +53,7 @@ public:
 	// Phase 2: Init
 	InitResult PerformInit(const std::vector<int32_t> &projection_ids = {},
 	                       std::shared_ptr<arrow::Buffer> pushdown_filters = nullptr,
-	                       std::shared_ptr<arrow::Buffer> join_keys = nullptr,
+	                       std::vector<std::shared_ptr<arrow::Buffer>> join_keys = {},
 	                       const std::string &phase = "") override;
 	void PerformFinalizeInit() override;
 

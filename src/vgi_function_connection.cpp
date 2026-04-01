@@ -223,7 +223,7 @@ BindResult FunctionConnection::PerformBindFull() {
 
 InitResult FunctionConnection::PerformInit(const std::vector<int32_t> &projection_ids,
                                            std::shared_ptr<arrow::Buffer> pushdown_filters,
-                                           std::shared_ptr<arrow::Buffer> join_keys,
+                                           std::vector<std::shared_ptr<arrow::Buffer>> join_keys,
                                            const std::string &phase) {
 	if (!bind_done_) {
 		ThrowVgiIOException("FunctionConnection::PerformInit called before PerformBind", worker_path_,
@@ -437,7 +437,7 @@ void FunctionConnection::PerformFinalizeInit() {
 	} guard{input_schema_, global_execution_id_, std::move(saved_input_schema), std::move(saved_global_exec_id)};
 
 	// Call PerformInit with phase=FINALIZE and the stored execution_id
-	PerformInit({}, nullptr, nullptr, "FINALIZE");
+	PerformInit({}, nullptr, {}, "FINALIZE");
 }
 
 std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
