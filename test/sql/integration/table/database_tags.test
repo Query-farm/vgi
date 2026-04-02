@@ -1,0 +1,55 @@
+# name: test/sql/integration/table/database_tags.test
+# description: Test database-level comment and tags metadata via duckdb_databases()
+# group: [vgi_integration_table]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# Database comment (via duckdb_databases)
+# ============================================================================
+
+query TT
+SELECT database_name, comment
+FROM duckdb_databases()
+WHERE database_name = 'example';
+----
+example	Example VGI catalog for testing
+
+# ============================================================================
+# Database tags (via duckdb_databases)
+# ============================================================================
+
+query TT
+SELECT database_name, tags
+FROM duckdb_databases()
+WHERE database_name = 'example';
+----
+example	{source=vgi-example-worker, version=1}
+
+# ============================================================================
+# Schema comments visible via duckdb_schemas (bonus: schema propagation fix)
+# ============================================================================
+
+query TT
+SELECT schema_name, comment
+FROM duckdb_schemas()
+WHERE database_name = 'example'
+  AND comment IS NOT NULL
+ORDER BY schema_name;
+----
+data	Example tables backed by functions
+main	Example functions for testing VGI
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;

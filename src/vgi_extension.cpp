@@ -346,6 +346,14 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	}
 	vgi::VgiWorkerPool::Instance().ConfigurePath(worker_path, pool_settings);
 
+	// Set database-level comment and tags from worker metadata
+	if (!attach_result.comment.empty()) {
+		db.comment = Value(attach_result.comment);
+	}
+	for (auto &[key, val] : attach_result.tags) {
+		db.tags[key] = val;
+	}
+
 	// Create attach parameters
 	auto attach_params = std::make_shared<vgi::VgiAttachParameters>(worker_path, catalog_name, worker_debug, use_pool);
 	auto attach_result_ptr = std::make_shared<vgi::CatalogAttachResult>(std::move(attach_result));

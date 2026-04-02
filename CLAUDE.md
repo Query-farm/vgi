@@ -9,6 +9,8 @@ Reference implementations:
 The Makefile auto-detects `VCPKG_TOOLCHAIN_PATH` from `vcpkg/` in the project tree.
 No need to set it manually.
 
+You need to set USE_MERGED_VCPKG_MANIFEST=1 to include all vcpkg manifests since this extension is now built with multiple modules.
+
 
 ## Build
 

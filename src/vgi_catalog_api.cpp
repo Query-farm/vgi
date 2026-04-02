@@ -998,6 +998,10 @@ CatalogAttachResult ParseCatalogAttachResult(const std::shared_ptr<arrow::Record
 		result.secret_types.push_back(ParseVgiSecretType(st_bytes, worker_path, context));
 	}
 
+	// Parse optional comment and tags (backward-compatible with older workers)
+	result.comment = row["comment"].value_or(std::string(""));
+	result.tags = row["tags"].value_or(std::map<std::string, std::string> {});
+
 	return result;
 }
 

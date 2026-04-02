@@ -44,6 +44,12 @@ void VgiSchemaSet::LoadEntries(ClientContext &context) {
 	for (auto &schema_info : schema_list) {
 		CreateSchemaInfo info;
 		info.schema = schema_info.name;
+		if (!schema_info.comment.empty()) {
+			info.comment = Value(schema_info.comment);
+		}
+		for (auto &[key, val] : schema_info.tags) {
+			info.tags[key] = val;
+		}
 
 		auto schema_entry = make_uniq<VgiSchemaEntry>(catalog_, info, schema_info);
 		CreateEntryLocked(std::move(schema_entry));

@@ -116,6 +116,8 @@ struct CatalogAttachResult {
 	std::string default_schema = "main";
 	std::vector<VgiSetting> settings;             // Extension options exposed by this catalog
 	std::vector<VgiSecretType> secret_types;      // Secret types exposed by this catalog
+	std::string comment;                          // Optional comment describing this catalog
+	std::map<std::string, std::string> tags;      // Optional key-value tags for this catalog
 };
 
 // Schema metadata from the worker

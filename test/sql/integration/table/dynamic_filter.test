@@ -153,6 +153,86 @@ SELECT MIN(n) FROM (
 0
 
 # ============================================================================
+# Combined static filter + dynamic filter on the SAME column
+# DuckDB creates ConjunctionAnd(ConstantFilter(n>=500), OptionalFilter(DynamicFilter(n)))
+# Both the static filter and the dynamic filter must work correctly.
+# ============================================================================
+
+# Static filter must be pushed — verify the filter text contains "n >= 500"
+query I
+SELECT pushed_filters FROM example.filter_echo(1000)
+WHERE n >= 500
+ORDER BY n LIMIT 1;
+----
+(n >= 500)
+
+# Correct results: static filter narrows to [500, 999], Top-N takes first 5
+query I
+SELECT n FROM example.filter_echo(1000) WHERE n >= 500 ORDER BY n LIMIT 5;
+----
+500
+501
+502
+503
+504
+
+# DESC with static filter
+query I
+SELECT n FROM example.filter_echo(1000) WHERE n >= 500 ORDER BY n DESC LIMIT 5;
+----
+999
+998
+997
+996
+995
+
+# ============================================================================
+# Static filter on one column, dynamic filter on another
+# The s='row_5' filter must be pushed despite DynamicFilter on n
+# ============================================================================
+
+query I
+SELECT pushed_filters LIKE '%row_5%' FROM example.filter_echo(100)
+WHERE s = 'row_5'
+ORDER BY n LIMIT 1;
+----
+true
+
+# ============================================================================
+# Dynamic filter tightening works alongside a static WHERE filter
+#
+# This is the critical test: when DuckDB creates
+#   ConjunctionAnd(ConstantFilter(n >= 5000), OptionalFilter(DynamicFilter(n)))
+# both the static filter (init-time) and the dynamic filter (per-tick) must
+# reach the worker. The tick filters show ConstantFilter(n < ...) values
+# that tighten as the Top-N heap improves.
+# ============================================================================
+
+# Multiple distinct dynamic filter values prove the per-tick filter is working
+query I
+SELECT COUNT(DISTINCT pushed_filters) > 1 AS filter_tightened FROM (
+    SELECT * FROM example.dynamic_filter_echo(10000, batch_size := 100)
+    WHERE n >= 5000
+    ORDER BY n LIMIT 500
+);
+----
+true
+
+# The dynamic filter values must contain "ConstantFilter(n <" — proving
+# the DynamicFilter was captured from inside the ConjunctionAndFilter
+query I
+SELECT bool_and(pushed_filters LIKE '%ConstantFilter(n <%') AS has_dynamic_bound FROM (
+    SELECT DISTINCT pushed_filters FROM (
+        SELECT * FROM example.dynamic_filter_echo(10000, batch_size := 100)
+        WHERE n >= 5000
+        ORDER BY n LIMIT 500
+    )
+    WHERE pushed_filters != '(none)'
+);
+----
+true
+
+# ============================================================================
 # Cleanup
 # ============================================================================
 

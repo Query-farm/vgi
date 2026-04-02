@@ -132,8 +132,9 @@ static std::string HttpPostArrowIpcInternal(ClientContext &context,
 				    reinterpret_cast<const uint8_t *>(error_body.data()),
 				    error_body.size(), nullptr, url);
 			} catch (const IOException &) {
-				// Not Arrow IPC — fall through to plain error
+				throw; // Worker error — propagate with the original message
 			} catch (...) {
+				// Not Arrow IPC — fall through to plain error
 			}
 		}
 		throw IOException("VGI HTTP request failed (HTTP %d): %s [url: %s]",
@@ -145,6 +146,23 @@ static std::string HttpPostArrowIpcInternal(ClientContext &context,
 	if (out_response->HasHeader("X-VGI-Content-Encoding") &&
 	    out_response->GetHeaderValue("X-VGI-Content-Encoding") == "zstd" && !post.buffer_out.empty()) {
 		post.buffer_out = ZstdDecompress(post.buffer_out.data(), post.buffer_out.size());
+	}
+
+	// Server errors are sent as HTTP 200 with X-VGI-RPC-Error: true header
+	// (so that clients which discard response bodies on 5xx still receive
+	// the Arrow IPC error metadata). Parse the error batch and throw.
+	if (out_response->HasHeader("X-VGI-RPC-Error") &&
+	    out_response->GetHeaderValue("X-VGI-RPC-Error") == "true") {
+		auto &error_body = post.buffer_out;
+		if (!error_body.empty()) {
+			// ReadUnaryResponseFromBuffer dispatches the error batch which
+			// calls HandleBatchLogMessage → ThrowVgiIOException with the
+			// worker's original error message.
+			ReadUnaryResponseFromBuffer(
+			    reinterpret_cast<const uint8_t *>(error_body.data()),
+			    error_body.size(), nullptr, url);
+		}
+		throw IOException("VGI HTTP RPC error [url: %s]", url);
 	}
 
 	return std::move(post.buffer_out);
