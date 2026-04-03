@@ -24,6 +24,7 @@ ORDER BY table_name;
 ----
 departments	Department reference table
 employees	Employee table with FK to departments
+generated_sequence	Table with generated columns backed by sequence(10)
 large_sequence	A large sequence of integers from 0 to 1,000,000
 numbers	First 100 integers (demonstrates explicit columns)
 products	Product table with column defaults

@@ -20,7 +20,7 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
 # ============================================================================
 # Function Inventory
-# 35 pure table functions + 8 table-in-out functions = 43 total table-type functions
+# 36 pure table functions + 8 table-in-out functions = 44 total table-type functions
 # ============================================================================
 
 # Total table-type function count (includes table-in-out)
@@ -29,9 +29,9 @@ SELECT COUNT(*)
 FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'table';
 ----
-43
+44
 
-# The 30 pure table functions (no TABLE parameter type)
+# The 31 pure table functions (no TABLE parameter type)
 # Note: make_series appears 5 times (5 overloads), make_pairs appears 3 times,
 #       repeat_value appears 2 times
 query T
@@ -41,7 +41,7 @@ WHERE database_name = 'example' AND function_type = 'table'
 AND function_name IN (
     'constant_columns', 'double_sequence', 'dynamic_filter_echo', 'expression_filter_test', 'filter_echo',
     'generator_exception', 'logging_generator', 'make_series',
-    'make_pairs', 'repeat_value',
+    'make_pairs', 'order_echo', 'repeat_value',
     'named_params_echo', 'nested_sequence', 'partitioned_sequence',
     'projected_data', 'rowid_sequence', 'scoped_secret_demo', 'secret_demo', 'sequence',
     'settings_aware', 'spatial_filter_example', 'struct_settings', 'ten_thousand', 'versioned_data_scan'
@@ -65,6 +65,7 @@ make_series
 make_series
 named_params_echo
 nested_sequence
+order_echo
 partitioned_sequence
 projected_data
 repeat_value

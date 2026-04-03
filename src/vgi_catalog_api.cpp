@@ -1356,17 +1356,27 @@ CreateTableInfo CreateTableInfoFromVgiTable(ClientContext &context, VgiTableInfo
 			}
 			auto &col = create_info.columns.GetColumnMutable(LogicalIndex(adjusted));
 
-			// Default value
-			auto default_idx = arrow_field->metadata()->FindKey("default");
-			if (default_idx >= 0) {
-				auto default_expr = arrow_field->metadata()->value(default_idx);
-				auto expressions = Parser::ParseExpressionList(default_expr);
-				if (!expressions.empty()) {
-					col.SetDefaultValue(std::move(expressions[0]));
+			// Generated expression (mutually exclusive with default)
+			auto gen_idx = arrow_field->metadata()->FindKey(VGI_GENERATED_EXPRESSION_METADATA_KEY);
+			if (gen_idx >= 0) {
+				auto gen_expr_str = arrow_field->metadata()->value(gen_idx);
+				auto gen_expressions = Parser::ParseExpressionList(gen_expr_str);
+				if (!gen_expressions.empty()) {
+					col.SetGeneratedExpression(std::move(gen_expressions[0]));
+				}
+			} else {
+				// Default value (only for non-generated columns)
+				auto default_idx = arrow_field->metadata()->FindKey("default");
+				if (default_idx >= 0) {
+					auto default_expr = arrow_field->metadata()->value(default_idx);
+					auto expressions = Parser::ParseExpressionList(default_expr);
+					if (!expressions.empty()) {
+						col.SetDefaultValue(std::move(expressions[0]));
+					}
 				}
 			}
 
-			// Column comment
+			// Column comment (applies to both generated and non-generated)
 			auto comment_idx = arrow_field->metadata()->FindKey("comment");
 			if (comment_idx >= 0) {
 				col.SetComment(Value(arrow_field->metadata()->value(comment_idx)));

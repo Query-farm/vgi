@@ -1,0 +1,97 @@
+# name: test/sql/integration/table/generated_columns.test
+# description: Test generated (virtual) column support on VGI tables
+# group: [vgi_integration_table]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# SELECT * includes generated columns with correct computed values
+# ============================================================================
+
+query IIT
+SELECT * FROM example.data.generated_sequence ORDER BY n;
+----
+0	0	item_0
+1	2	item_1
+2	4	item_2
+3	6	item_3
+4	8	item_4
+5	10	item_5
+6	12	item_6
+7	14	item_7
+8	16	item_8
+9	18	item_9
+
+# ============================================================================
+# SELECT physical columns only
+# ============================================================================
+
+query I
+SELECT n FROM example.data.generated_sequence ORDER BY n LIMIT 3;
+----
+0
+1
+2
+
+# ============================================================================
+# SELECT generated columns only (DuckDB expands expressions)
+# ============================================================================
+
+query IT
+SELECT doubled, label FROM example.data.generated_sequence ORDER BY doubled LIMIT 3;
+----
+0	item_0
+2	item_1
+4	item_2
+
+# ============================================================================
+# WHERE on generated column
+# ============================================================================
+
+query I
+SELECT n FROM example.data.generated_sequence WHERE doubled > 10 ORDER BY n;
+----
+6
+7
+8
+9
+
+# ============================================================================
+# ORDER BY on generated column
+# ============================================================================
+
+query IT
+SELECT n, label FROM example.data.generated_sequence ORDER BY doubled DESC LIMIT 3;
+----
+9	item_9
+8	item_8
+7	item_7
+
+# ============================================================================
+# Generated column metadata in duckdb_columns()
+# ============================================================================
+
+query TT
+SELECT column_name, column_default
+FROM duckdb_columns()
+WHERE database_name = 'example' AND schema_name = 'data'
+  AND table_name = 'generated_sequence'
+ORDER BY column_name;
+----
+doubled	CAST((n * 2) AS BIGINT)
+label	CAST(('item_' || CAST(n AS VARCHAR)) AS VARCHAR)
+n	NULL
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;

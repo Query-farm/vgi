@@ -67,5 +67,12 @@ constexpr const char *VGI_CONST_TRUE_VALUE = "true";
 // Presence of this key is sufficient — no value check needed.
 constexpr const char *VGI_ROW_ID_METADATA_KEY = "is_row_id";
 
+// ----------------------------------------------------------------------------
+// Generated Column Metadata
+// ----------------------------------------------------------------------------
+// Arrow field metadata key indicating the field is a generated (virtual) column.
+// Value is a SQL expression string (e.g., "x + y") that DuckDB evaluates on read.
+constexpr const char *VGI_GENERATED_EXPRESSION_METADATA_KEY = "generated_expression";
+
 } // namespace vgi
 } // namespace duckdb
