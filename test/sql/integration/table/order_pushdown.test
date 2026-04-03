@@ -1,0 +1,165 @@
+# name: test/sql/integration/table/order_pushdown.test
+# description: Verify ORDER BY + LIMIT pushdown via set_scan_order.
+#              These tests depend on DuckDB's RowGroupPruner optimizer behavior
+#              and may need updating on DuckDB version upgrades.
+# group: [vgi_integration_table]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# 1. No ORDER BY — no hint pushed
+# ============================================================================
+
+query ITTTII
+SELECT * FROM example.order_echo(3);
+----
+0	row_0	(none)	(none)	(none)	-1
+1	row_1	(none)	(none)	(none)	-1
+2	row_2	(none)	(none)	(none)	-1
+
+# ============================================================================
+# 2. ORDER BY + LIMIT ASC — basic pushdown
+# ============================================================================
+
+query ITTTII
+SELECT * FROM example.order_echo(100) ORDER BY n LIMIT 3;
+----
+0	row_0	n	ASC	NULLS_LAST	3
+1	row_1	n	ASC	NULLS_LAST	3
+2	row_2	n	ASC	NULLS_LAST	3
+
+# ============================================================================
+# 3. ORDER BY + LIMIT DESC — verify direction.
+#    DuckDB default null order is NULLS_LAST unconditionally (not
+#    postgres-style NULLS_FIRST for DESC).
+# ============================================================================
+
+query ITTTII
+SELECT * FROM example.order_echo(100) ORDER BY n DESC LIMIT 2;
+----
+99	row_99	n	DESC	NULLS_LAST	2
+98	row_98	n	DESC	NULLS_LAST	2
+
+# ============================================================================
+# 4. ORDER BY + LIMIT + OFFSET — row_limit = limit + offset = 3 + 2 = 5
+# ============================================================================
+
+query ITTTII
+SELECT * FROM example.order_echo(100) ORDER BY n LIMIT 3 OFFSET 2;
+----
+2	row_2	n	ASC	NULLS_LAST	5
+3	row_3	n	ASC	NULLS_LAST	5
+4	row_4	n	ASC	NULLS_LAST	5
+
+# ============================================================================
+# 5. ORDER BY on string column — verify column name mapping works
+#    for non-first columns. count=5 so lexicographic order matches
+#    numeric order (row_0 < row_1 < row_2 < row_3 < row_4).
+# ============================================================================
+
+query ITTTII
+SELECT * FROM example.order_echo(5) ORDER BY s LIMIT 2;
+----
+0	row_0	s	ASC	NULLS_LAST	2
+1	row_1	s	ASC	NULLS_LAST	2
+
+# ============================================================================
+# 6. ORDER BY ASC with explicit NULLS LAST — same as default but explicit
+#    Note: NULLS FIRST triggers DuckDB's Top-N DynamicFilter which interacts
+#    with auto_apply_filters; not tested here.
+# ============================================================================
+
+query ITTTII
+SELECT * FROM example.order_echo(100) ORDER BY n ASC NULLS LAST LIMIT 2;
+----
+0	row_0	n	ASC	NULLS_LAST	2
+1	row_1	n	ASC	NULLS_LAST	2
+
+# ============================================================================
+# 7. ORDER BY DESC with explicit NULLS LAST
+# ============================================================================
+
+query ITTTII
+SELECT * FROM example.order_echo(100) ORDER BY n DESC NULLS LAST LIMIT 2;
+----
+99	row_99	n	DESC	NULLS_LAST	2
+98	row_98	n	DESC	NULLS_LAST	2
+
+# ============================================================================
+# 8. LIMIT without ORDER BY — RowGroupPruner requires ORDER BY node
+#    between LIMIT and scan; doesn't trigger without it
+# ============================================================================
+
+query ITTTII
+SELECT * FROM example.order_echo(5) LIMIT 2;
+----
+0	row_0	(none)	(none)	(none)	-1
+1	row_1	(none)	(none)	(none)	-1
+
+# ============================================================================
+# 9. ORDER BY without LIMIT — RowGroupPruner requires LOGICAL_LIMIT
+#    as entry point; never called without it
+# ============================================================================
+
+query ITTTII
+SELECT * FROM example.order_echo(3) ORDER BY n;
+----
+0	row_0	(none)	(none)	(none)	-1
+1	row_1	(none)	(none)	(none)	-1
+2	row_2	(none)	(none)	(none)	-1
+
+# ============================================================================
+# 10. ORDER BY + WHERE + LIMIT — optimizer invalidates row_limit when
+#     table_filters is non-empty, but order direction and null_order
+#     are still pushed (row_group_pruner.cpp:72-76).
+#     order_echo has filter_pushdown=True + auto_apply_filters=True,
+#     so WHERE becomes a table_filter on the scan.
+# ============================================================================
+
+query ITTTII
+SELECT * FROM example.order_echo(100) WHERE n < 10 ORDER BY n LIMIT 3;
+----
+0	row_0	n	ASC	NULLS_LAST	-1
+1	row_1	n	ASC	NULLS_LAST	-1
+2	row_2	n	ASC	NULLS_LAST	-1
+
+# ============================================================================
+# 11. Multi-column ORDER BY — optimizer uses first column only
+# ============================================================================
+
+query ITTTII
+SELECT * FROM example.order_echo(100) ORDER BY n, s LIMIT 2;
+----
+0	row_0	n	ASC	NULLS_LAST	2
+1	row_1	n	ASC	NULLS_LAST	2
+
+# ============================================================================
+# 12. ORDER BY on expression — should NOT trigger (RowGroupPruner requires
+#     BoundColumnRefExpression, not a computed expression)
+# ============================================================================
+
+query ITTTII
+SELECT * FROM example.order_echo(5) ORDER BY n + 1 LIMIT 2;
+----
+0	row_0	(none)	(none)	(none)	-1
+1	row_1	(none)	(none)	(none)	-1
+
+# ============================================================================
+# 13. Projected subset + ORDER BY — verify pushdown works when PROJECTION
+#     sits between LIMIT and ORDER BY (FindLogicalOrder walks through
+#     LOGICAL_PROJECTION nodes — row_group_pruner.cpp:107)
+# ============================================================================
+
+query ITI
+SELECT n, order_column, order_limit FROM example.order_echo(100) ORDER BY n LIMIT 3;
+----
+0	n	3
+1	n	3
+2	n	3

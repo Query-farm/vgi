@@ -29,5 +29,15 @@ struct InitResult {
 	std::vector<uint8_t> opaque_data;
 };
 
+// ORDER BY + LIMIT hint from DuckDB's RowGroupPruner optimizer.
+// Passed to worker as nullable fields on the InitRequest.
+// Workers may use this to optimize server-side ordering and early termination.
+struct OrderByHint {
+	std::string column_name;  // Column name to order by
+	std::string direction;    // "ASC" or "DESC"
+	std::string null_order;   // "NULLS_FIRST" or "NULLS_LAST"
+	int64_t row_limit = -1;   // Combined limit+offset, -1 = no limit
+};
+
 } // namespace vgi
 } // namespace duckdb

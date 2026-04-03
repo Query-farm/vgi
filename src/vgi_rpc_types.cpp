@@ -55,6 +55,25 @@ std::shared_ptr<arrow::Array> BuildNullableStringScalar(const std::string &value
 	return FinishArray(builder, "nullable_string");
 }
 
+// Helper to build a null dictionary(int16, utf8) array
+std::shared_ptr<arrow::Array> BuildNullDictionaryArray(
+    const std::shared_ptr<arrow::DataType> &dict_type,
+    const std::vector<std::string> &dictionary_values) {
+	arrow::Int16Builder index_builder;
+	CheckStatus(index_builder.AppendNull(), "append null dict index");
+	auto index_arr = FinishArray(index_builder, "null_dict_index");
+	arrow::StringBuilder dict_builder;
+	for (const auto &v : dictionary_values) {
+		CheckStatus(dict_builder.Append(v), "append dict value");
+	}
+	auto dict_arr = FinishArray(dict_builder, "dict_values");
+	auto result = arrow::DictionaryArray::FromArrays(dict_type, index_arr, dict_arr);
+	if (!result.ok()) {
+		throw IOException("Failed to create null dictionary array: " + result.status().ToString());
+	}
+	return result.ValueUnsafe();
+}
+
 } // namespace
 
 // ============================================================================
@@ -384,10 +403,15 @@ BuildInitRequest(const std::vector<uint8_t> &bind_call_bytes, const std::vector<
                  std::shared_ptr<arrow::Buffer> pushdown_filters,
                  std::vector<std::shared_ptr<arrow::Buffer>> join_keys,
                  const std::string &phase,
-                 const std::vector<uint8_t> &execution_id, const std::vector<uint8_t> &init_opaque_data) {
+                 const std::vector<uint8_t> &execution_id, const std::vector<uint8_t> &init_opaque_data,
+                 const std::string &order_by_column_name, const std::string &order_by_direction,
+                 const std::string &order_by_null_order, int64_t order_by_limit) {
 	static const std::vector<std::string> phase_values = {"INPUT", "FINALIZE"};
 
 	auto phase_type = arrow::dictionary(arrow::int16(), arrow::utf8());
+
+	auto order_direction_type = arrow::dictionary(arrow::int16(), arrow::utf8());
+	auto order_null_order_type = arrow::dictionary(arrow::int16(), arrow::utf8());
 
 	auto schema = arrow::schema({
 	    arrow::field("bind_call", arrow::binary(), false),
@@ -399,6 +423,10 @@ BuildInitRequest(const std::vector<uint8_t> &bind_call_bytes, const std::vector<
 	    arrow::field("phase", phase_type, true),
 	    arrow::field("execution_id", arrow::binary(), true),
 	    arrow::field("init_opaque_data", arrow::binary(), true),
+	    arrow::field("order_by_column_name", arrow::utf8(), true),
+	    arrow::field("order_by_direction", order_direction_type, true),
+	    arrow::field("order_by_null_order", order_null_order_type, true),
+	    arrow::field("order_by_limit", arrow::int64(), true),
 	});
 
 	std::vector<std::shared_ptr<arrow::Array>> arrays;
@@ -457,28 +485,7 @@ BuildInitRequest(const std::vector<uint8_t> &bind_call_bytes, const std::vector<
 
 	// phase: dictionary(int16, utf8)|null
 	if (phase.empty()) {
-		// Build a null dictionary array
-		arrow::Int16Builder index_builder;
-		CheckStatus(index_builder.AppendNull(), "append null phase index");
-		auto index_result = index_builder.Finish();
-		if (!index_result.ok()) {
-			throw IOException("Failed to build null phase index: " + index_result.status().ToString());
-		}
-		// Build empty dictionary
-		arrow::StringBuilder dict_builder;
-		for (const auto &v : phase_values) {
-			CheckStatus(dict_builder.Append(v), "append phase dict value");
-		}
-		auto dict_result = dict_builder.Finish();
-		if (!dict_result.ok()) {
-			throw IOException("Failed to build phase dictionary: " + dict_result.status().ToString());
-		}
-		auto dict_array_result =
-		    arrow::DictionaryArray::FromArrays(phase_type, index_result.ValueUnsafe(), dict_result.ValueUnsafe());
-		if (!dict_array_result.ok()) {
-			throw IOException("Failed to create null phase array: " + dict_array_result.status().ToString());
-		}
-		arrays.push_back(dict_array_result.ValueUnsafe());
+		arrays.push_back(BuildNullDictionaryArray(phase_type, phase_values));
 	} else {
 		arrays.push_back(BuildEnumArray(phase, phase_values));
 	}
@@ -488,6 +495,40 @@ BuildInitRequest(const std::vector<uint8_t> &bind_call_bytes, const std::vector<
 
 	// init_opaque_data: binary|null
 	arrays.push_back(BuildBinaryScalar(init_opaque_data));
+
+	// order_by_column_name: utf8|null
+	arrays.push_back(BuildNullableStringScalar(order_by_column_name));
+
+	// order_by_direction: dictionary(int16, utf8)|null — "ASC" or "DESC"
+	{
+		static const std::vector<std::string> direction_values = {"ASC", "DESC"};
+		if (order_by_direction.empty()) {
+			arrays.push_back(BuildNullDictionaryArray(order_direction_type, direction_values));
+		} else {
+			arrays.push_back(BuildEnumArray(order_by_direction, direction_values));
+		}
+	}
+
+	// order_by_null_order: dictionary(int16, utf8)|null — "NULLS_FIRST" or "NULLS_LAST"
+	{
+		static const std::vector<std::string> null_order_values = {"NULLS_FIRST", "NULLS_LAST"};
+		if (order_by_null_order.empty()) {
+			arrays.push_back(BuildNullDictionaryArray(order_null_order_type, null_order_values));
+		} else {
+			arrays.push_back(BuildEnumArray(order_by_null_order, null_order_values));
+		}
+	}
+
+	// order_by_limit: int64|null — combined limit+offset, -1 = null
+	{
+		arrow::Int64Builder builder;
+		if (order_by_limit < 0) {
+			CheckStatus(builder.AppendNull(), "append null order_by_limit");
+		} else {
+			CheckStatus(builder.Append(order_by_limit), "append order_by_limit");
+		}
+		arrays.push_back(FinishArray(builder, "order_by_limit"));
+	}
 
 	return arrow::RecordBatch::Make(schema, 1, arrays);
 }

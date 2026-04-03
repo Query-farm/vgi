@@ -263,7 +263,8 @@ BindResult HttpFunctionConnection::PerformBindFull() {
 InitResult HttpFunctionConnection::PerformInit(const std::vector<int32_t> &projection_ids,
                                                 std::shared_ptr<arrow::Buffer> pushdown_filters,
                                                 std::vector<std::shared_ptr<arrow::Buffer>> join_keys,
-                                                const std::string &phase) {
+                                                const std::string &phase,
+                                                const std::optional<OrderByHint> &order_by) {
 	if (!bind_done_) {
 		throw IOException("HttpFunctionConnection::PerformInit called before PerformBind [url: %s]", base_url_);
 	}
@@ -280,6 +281,16 @@ InitResult HttpFunctionConnection::PerformInit(const std::vector<int32_t> &proje
 
 	auto &execution_id = global_execution_id_;
 
+	// Extract order hint fields (empty strings / -1 when no hint)
+	std::string ob_col, ob_dir, ob_null;
+	int64_t ob_limit = -1;
+	if (order_by.has_value()) {
+		ob_col = order_by->column_name;
+		ob_dir = order_by->direction;
+		ob_null = order_by->null_order;
+		ob_limit = order_by->row_limit;
+	}
+
 	// Build InitRequest — pass arrow::Buffer directly to avoid copying
 	auto init_request = BuildInitRequest(
 	    bind_result_.bind_request_bytes,
@@ -289,7 +300,9 @@ InitResult HttpFunctionConnection::PerformInit(const std::vector<int32_t> &proje
 	    pushdown_filters,
 	    join_keys,
 	    phase,
-	    execution_id);
+	    execution_id,
+	    {},  // init_opaque_data
+	    ob_col, ob_dir, ob_null, ob_limit);
 	auto init_request_bytes = SerializeToIpcBytes(init_request);
 	auto rpc_params = BuildInitRpcParams(init_request_bytes);
 

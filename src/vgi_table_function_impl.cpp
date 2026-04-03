@@ -893,8 +893,9 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 		connection->SetTickFilterState(tick_filter_state);
 	}
 
-	// Perform init phase via vgi_rpc with projection, filter, and join key pushdown
-	auto init_result = connection->PerformInit(projection_ids, filter_bytes, join_keys_buffers);
+	// Perform init phase via vgi_rpc with projection, filter, join key, and order pushdown
+	auto init_result = connection->PerformInit(projection_ids, filter_bytes, join_keys_buffers, "",
+	                                           bind_data.order_by_hint);
 
 	auto global_state = make_uniq<VgiTableFunctionGlobalState>();
 	global_state->global_execution_id = std::move(init_result.execution_id);
@@ -911,6 +912,15 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 	         {"global_execution_id", BytesToHex(global_state->global_execution_id)},
 	         {"max_processes", std::to_string(global_state->max_processes)},
 	         {"num_projection_columns", std::to_string(projection_ids.size())}});
+
+	if (bind_data.order_by_hint) {
+		VGI_LOG(context, "table_function.order_pushdown",
+		        {{"function_name", bind_data.function_name},
+		         {"order_column", bind_data.order_by_hint->column_name},
+		         {"direction", bind_data.order_by_hint->direction},
+		         {"null_order", bind_data.order_by_hint->null_order},
+		         {"row_limit", std::to_string(bind_data.order_by_hint->row_limit)}});
+	}
 
 	return global_state;
 }
@@ -1353,6 +1363,13 @@ InsertionOrderPreservingMap<string> VgiTableFunctionToString(TableFunctionToStri
 	auto &bind_data = input.bind_data->Cast<VgiTableFunctionBindData>();
 	result["Worker"] = bind_data.worker_path;
 	result["Function"] = bind_data.function_name;
+	if (bind_data.order_by_hint) {
+		result["Order Hint"] = bind_data.order_by_hint->column_name + " " +
+		                       bind_data.order_by_hint->direction;
+		if (bind_data.order_by_hint->row_limit >= 0) {
+			result["Row Limit Hint"] = std::to_string(bind_data.order_by_hint->row_limit);
+		}
+	}
 	return result;
 }
 
@@ -1384,6 +1401,64 @@ vector<column_t> VgiTableScanGetRowIdColumns(ClientContext &context, optional_pt
 		return {};
 	}
 	return {COLUMN_IDENTIFIER_ROW_ID};
+}
+
+// ============================================================================
+// set_scan_order callback — captures ORDER BY + LIMIT hint from optimizer
+// ============================================================================
+
+void VgiSetScanOrder(unique_ptr<RowGroupOrderOptions> order_options, optional_ptr<FunctionData> bind_data_p) {
+	auto &bind_data = bind_data_p->Cast<VgiTableFunctionBindData>();
+
+	// Bounds-check column index against known column names
+	auto col_idx = order_options->column_idx.GetPrimaryIndex();
+	if (col_idx >= bind_data.all_column_names.size()) {
+		return;
+	}
+
+	// Map OrderType to string
+	std::string direction;
+	switch (order_options->order_type) {
+	case OrderType::ASCENDING:
+		direction = "ASC";
+		break;
+	case OrderType::DESCENDING:
+		direction = "DESC";
+		break;
+	default:
+		// ORDER_DEFAULT or INVALID — skip (planner should resolve before optimizer)
+		return;
+	}
+
+	// Map OrderByNullType to string
+	std::string null_order;
+	switch (order_options->null_order) {
+	case OrderByNullType::NULLS_FIRST:
+		null_order = "NULLS_FIRST";
+		break;
+	case OrderByNullType::NULLS_LAST:
+		null_order = "NULLS_LAST";
+		break;
+	case OrderByNullType::ORDER_DEFAULT:
+		// DuckDB default is NULLS_LAST unconditionally
+		null_order = "NULLS_LAST";
+		break;
+	default:
+		return;
+	}
+
+	// Extract row_limit (combined limit+offset, or -1 if invalid)
+	int64_t row_limit = -1;
+	if (order_options->row_limit.IsValid()) {
+		row_limit = static_cast<int64_t>(order_options->row_limit.GetIndex());
+	}
+
+	bind_data.order_by_hint = OrderByHint {
+	    bind_data.all_column_names[col_idx],
+	    std::move(direction),
+	    std::move(null_order),
+	    row_limit
+	};
 }
 
 } // namespace vgi

@@ -141,6 +141,7 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 	func.table_scan_progress = vgi::VgiTableFunctionProgress;
 	func.to_string = vgi::VgiTableFunctionToString;
 	func.get_bind_info = vgi::VgiTableScanGetBindInfo;
+	func.set_scan_order = vgi::VgiSetScanOrder;
 
 	// Set virtual column callbacks for row_id support
 	if (table_info_.row_id_column >= 0) {

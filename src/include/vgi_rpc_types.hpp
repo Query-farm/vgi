@@ -123,7 +123,11 @@ std::shared_ptr<arrow::RecordBatch> BuildInitRequest(
     std::vector<std::shared_ptr<arrow::Buffer>> join_keys = {},
     const std::string &phase = "",          // Empty = null, "INPUT", "FINALIZE"
     const std::vector<uint8_t> &execution_id = {},
-    const std::vector<uint8_t> &init_opaque_data = {});
+    const std::vector<uint8_t> &init_opaque_data = {},
+    const std::string &order_by_column_name = {},   // Empty = null
+    const std::string &order_by_direction = {},      // "ASC" or "DESC", empty = null
+    const std::string &order_by_null_order = {},     // "NULLS_FIRST" or "NULLS_LAST", empty = null
+    int64_t order_by_limit = -1);                    // -1 = null
 
 // ============================================================================
 // GlobalInitResponse
