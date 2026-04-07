@@ -1592,6 +1592,13 @@ std::string VgiTokenManager::HandleUnauthorized(const std::string &origin,
 				} catch (const std::exception &e) {
 					VGI_STDERR_DEBUG("[VGI] oauth.refresh_failed origin=%s error=%s\n",
 					                 origin.c_str(), e.what());
+					// Remove stale persisted token on invalid_grant (revoked/expired)
+					std::string refresh_err = e.what();
+					if (refresh_err.find("invalid_grant") != std::string::npos) {
+						VGI_STDERR_DEBUG("[VGI] oauth.removing_stale_persisted_token origin=%s\n",
+						                 origin.c_str());
+						try { RemovePersistedToken(context, origin); } catch (...) {}
+					}
 				}
 			}
 		}

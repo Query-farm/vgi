@@ -58,6 +58,7 @@ src/vgi_function_connection.cpp
 src/vgi_worker_pool.cpp
 src/vgi_worker_pool_functions.cpp
 src/vgi_table_statistics_function.cpp
+src/vgi_clear_cache.cpp
 src/storage/vgi_catalog.cpp
 src/storage/vgi_catalog_set.cpp
 src/storage/vgi_schema_set.cpp

@@ -146,6 +146,7 @@ Catalogs may register additional settings at `ATTACH` time (e.g., `greeting`, `m
 | `vgi_worker_pool()` | Table | Diagnostic: list pooled workers (worker_path, pid, age_seconds) |
 | `vgi_worker_pool_stats()` | Table | Diagnostic: hit/miss statistics by worker_path |
 | `vgi_worker_pool_flush()` | Scalar | Clear all pooled workers (returns count flushed) |
+| `vgi_clear_cache()` | Table | Clear cached catalog metadata (schemas, tables, functions, statistics) for all attached VGI catalogs |
 
 ## Key Source Files
 
@@ -169,6 +170,7 @@ Catalogs may register additional settings at `ATTACH` time (e.g., `greeting`, `m
 | `vgi_arrow_utils.cpp` | Arrow-to-DuckDB type conversion |
 | `vgi_logging.cpp` | `VgiLogType`, `VgiStderrLogEnabled()`, `VgiLogToStderr()` |
 | `vgi_catalogs.cpp` | `vgi_catalogs()` SQL function |
+| `vgi_clear_cache.cpp` | `vgi_clear_cache()` SQL function — clears all VGI catalog caches |
 
 ### Storage Layer (`src/storage/`)
 

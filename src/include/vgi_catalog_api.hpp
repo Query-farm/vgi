@@ -424,6 +424,14 @@ VgiWriteFunctionResult InvokeCatalogTableDeleteFunctionGet(
 // Transaction Lifecycle
 // ============================================================================
 
+// Invoke catalog_version: query the current catalog version from the worker.
+// Returns the version number (int64). Returns 0 if the RPC is not implemented
+// or fails (graceful fallback for older workers).
+int64_t InvokeCatalogVersion(
+    const std::string &worker_path, const std::vector<uint8_t> &attach_id,
+    const std::vector<uint8_t> &transaction_id,
+    ClientContext &context, bool worker_debug = false, bool use_pool = true);
+
 // Invoke catalog_transaction_begin: begin a new transaction.
 // Returns the transaction_id bytes from the worker (empty if not supported).
 std::vector<uint8_t> InvokeCatalogTransactionBegin(

@@ -21,6 +21,10 @@ VgiTransaction::~VgiTransaction() = default;
 void VgiTransaction::Start(ClientContext &context) {
 	transaction_state = VgiTransactionState::TRANSACTION_STARTED;
 
+	// Check catalog version — clear cache if metadata changed since last query.
+	// This catches DDL changes from other sessions between queries.
+	vgi_catalog_.CheckAndInvalidateCache(context, /*transaction_id=*/{});
+
 	// Call the worker's catalog_transaction_begin RPC if transactions are supported
 	auto &attach_result = vgi_catalog_.attach_result();
 	if (attach_result && attach_result->supports_transactions) {
@@ -41,10 +45,12 @@ void VgiTransaction::Commit(ClientContext &context) {
 		    context, params->worker_debug(), params->use_pool());
 	}
 	transaction_state = VgiTransactionState::TRANSACTION_FINISHED;
-	// Clear catalog cache to ensure post-transaction state is fresh.
-	// This handles DDL rollback/commit correctly — without this, a CREATE TABLE
-	// followed by ROLLBACK would leave stale entries in the cache.
-	vgi_catalog_.ClearCache();
+
+	// Check catalog version — clear cache only if metadata actually changed.
+	// For DDL transactions (CREATE TABLE, DROP, etc.), the worker's version
+	// will have incremented. For read-only queries, version stays the same
+	// and the cache is preserved.
+	vgi_catalog_.CheckAndInvalidateCache(context, /*transaction_id=*/{});
 }
 
 void VgiTransaction::Rollback() {
@@ -56,8 +62,9 @@ void VgiTransaction::Rollback() {
 		    context_, params->worker_debug(), params->use_pool());
 	}
 	transaction_state = VgiTransactionState::TRANSACTION_FINISHED;
-	// Clear catalog cache after rollback (see Commit comment above)
-	vgi_catalog_.ClearCache();
+
+	// Check catalog version — clear cache only if metadata actually changed.
+	vgi_catalog_.CheckAndInvalidateCache(context_, /*transaction_id=*/{});
 }
 
 VgiTransaction &VgiTransaction::Get(ClientContext &context, Catalog &catalog) {

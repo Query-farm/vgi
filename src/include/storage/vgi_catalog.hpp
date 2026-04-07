@@ -1,5 +1,7 @@
 #pragma once
 
+#include <atomic>
+
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/enums/access_mode.hpp"
 
@@ -59,6 +61,11 @@ public:
 
 	void ClearCache();
 
+	/// Check the worker's catalog version; clear cache only if it has changed.
+	/// No-op if catalog_version_frozen is true.
+	/// Returns true if cache was cleared.
+	bool CheckAndInvalidateCache(ClientContext &context, const std::vector<uint8_t> &transaction_id);
+
 	const std::string &internal_name() const {
 		return internal_name_;
 	}
@@ -85,6 +92,10 @@ private:
 	std::string internal_name_;
 	std::string default_schema_;
 	VgiSchemaSet schemas;
+
+	/// Last known catalog version from the worker. Initialized from attach_result.
+	/// Atomic since it can be read/written from concurrent transactions.
+	std::atomic<int64_t> last_known_catalog_version_{0};
 };
 
 } // namespace duckdb

@@ -396,6 +396,26 @@ VgiWriteFunctionResult InvokeCatalogTableDeleteFunctionGet(
 // Transaction Lifecycle
 // ============================================================================
 
+int64_t InvokeCatalogVersion(
+    const std::string &worker_path, const std::vector<uint8_t> &attach_id,
+    const std::vector<uint8_t> &transaction_id,
+    ClientContext &context, bool worker_debug, bool use_pool) {
+	auto params = BuildAttachIdParams(attach_id, transaction_id);
+	try {
+		auto response = InvokeRpcMethod(worker_path, "catalog_version", params, context, worker_debug, use_pool);
+		auto result_batch = ExtractAndDeserializeResult(response, "catalog_version", worker_path);
+		if (!result_batch || result_batch->num_rows() == 0) {
+			return 0;  // Not implemented by worker
+		}
+		RecordBatchSingleRow row(result_batch, 0, "CatalogVersionResponse", worker_path);
+		return row["version"].value_not_null<int64_t>();
+	} catch (...) {
+		// RPC failure (e.g., older worker that doesn't implement catalog_version).
+		// Return 0 to signal unknown version — caller will clear cache as a safe fallback.
+		return 0;
+	}
+}
+
 std::vector<uint8_t> InvokeCatalogTransactionBegin(
     const std::string &worker_path, const std::vector<uint8_t> &attach_id,
     ClientContext &context, bool worker_debug, bool use_pool) {

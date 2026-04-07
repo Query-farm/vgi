@@ -29,6 +29,9 @@ VgiCatalog::VgiCatalog(AttachedDatabase &db_p, const std::string &internal_name,
                        std::shared_ptr<vgi::CatalogAttachResult> attach_result)
     : Catalog(db_p), access_mode_(access_mode), attach_parameters_(std::move(attach_params)),
       attach_result_(std::move(attach_result)), internal_name_(internal_name), schemas(*this) {
+	if (attach_result_) {
+		last_known_catalog_version_.store(attach_result_->catalog_version);
+	}
 }
 
 VgiCatalog::~VgiCatalog() = default;
@@ -246,6 +249,36 @@ std::string VgiCatalog::GetDBPath() {
 
 void VgiCatalog::ClearCache() {
 	schemas.ClearEntries();
+}
+
+bool VgiCatalog::CheckAndInvalidateCache(ClientContext &context, const std::vector<uint8_t> &transaction_id) {
+	// Frozen catalogs never change metadata — skip version check entirely
+	if (attach_result_ && attach_result_->catalog_version_frozen) {
+		return false;
+	}
+
+	// Query current version from the worker
+	int64_t current_version = vgi::InvokeCatalogVersion(
+	    attach_parameters_->worker_path(), attach_result_->attach_id,
+	    transaction_id, context,
+	    attach_parameters_->worker_debug(), attach_parameters_->use_pool());
+
+	// Version 0 means "unimplemented" or "unknown" — always clear for safety
+	// (preserves existing behavior for workers that don't support catalog_version)
+	if (current_version == 0) {
+		ClearCache();
+		return true;
+	}
+
+	// Compare with last known version
+	int64_t last_version = last_known_catalog_version_.load();
+	if (current_version != last_version) {
+		last_known_catalog_version_.store(current_version);
+		ClearCache();
+		return true;
+	}
+
+	return false;
 }
 
 void VgiCatalog::DropSchema(ClientContext &context, DropInfo &info) {
