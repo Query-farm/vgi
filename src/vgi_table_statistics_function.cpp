@@ -128,8 +128,11 @@ static unique_ptr<FunctionData> VgiTableStatisticsBind(ClientContext &context, T
 	    LogicalType::BOOLEAN,     // has_null
 	    LogicalType::BOOLEAN,     // has_not_null
 	    LogicalType::BIGINT,      // distinct_count
+	    LogicalType::BOOLEAN,     // contains_unicode
+	    LogicalType::UBIGINT,     // max_string_length
 	};
-	names = {"column_name", "column_type", "min", "max", "has_null", "has_not_null", "distinct_count"};
+	names = {"column_name", "column_type", "min", "max", "has_null", "has_not_null", "distinct_count",
+	         "contains_unicode", "max_string_length"};
 
 	return data;
 }
@@ -187,6 +190,19 @@ static void VgiTableStatisticsScan(ClientContext &context, TableFunctionInput &i
 		// Distinct count
 		auto dc = cs.stats->GetDistinctCount();
 		output.SetValue(6, count, Value::BIGINT(static_cast<int64_t>(dc)));
+
+		// String-specific fields: contains_unicode and max_string_length
+		if (cs.stats->GetStatsType() == StatisticsType::STRING_STATS) {
+			output.SetValue(7, count, Value::BOOLEAN(StringStats::CanContainUnicode(*cs.stats)));
+			if (StringStats::HasMaxStringLength(*cs.stats)) {
+				output.SetValue(8, count, Value::UBIGINT(StringStats::MaxStringLength(*cs.stats)));
+			} else {
+				output.SetValue(8, count, Value());
+			}
+		} else {
+			output.SetValue(7, count, Value());
+			output.SetValue(8, count, Value());
+		}
 
 		count++;
 	}

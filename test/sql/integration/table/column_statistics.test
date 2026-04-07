@@ -35,6 +35,12 @@ SELECT count(*) FROM example.data.products;
 ----
 3
 
+# Table with statistics: colors (ENUM-derived string stats)
+query I
+SELECT count(*) FROM example.data.colors;
+----
+3
+
 # ============================================================================
 # Verify optimizer uses statistics for filter elimination
 # The departments table has stats: id min=1, max=10
@@ -77,6 +83,18 @@ EXPLAIN SELECT * FROM example.data.departments WHERE budget > 1000000;
 ----
 physical_plan	<REGEX>:.*EMPTY_RESULT.*
 
+# budget < 10000 is outside [50000, 500000] — should also be eliminated
+query II
+EXPLAIN SELECT * FROM example.data.departments WHERE budget < 10000;
+----
+physical_plan	<REGEX>:.*EMPTY_RESULT.*
+
+# budget >= 50000 is within range — should NOT be eliminated
+query II
+EXPLAIN SELECT * FROM example.data.departments WHERE budget >= 50000;
+----
+physical_plan	<REGEX>:.*VGI_TABLE_SCAN.*
+
 # ============================================================================
 # Tables WITHOUT statistics should work normally (no elimination)
 # versioned_data has supports_column_statistics=false
@@ -104,6 +122,29 @@ SELECT count(*) FROM example.data.products WHERE quantity IS NOT NULL;
 3
 
 # ============================================================================
+# Products table — filter elimination
+# id: min=1, max=100; quantity: min=0, max=10000; price: min=0.99, max=999.99
+# ============================================================================
+
+# id > 200 is outside [1, 100] — should be eliminated
+query II
+EXPLAIN SELECT * FROM example.data.products WHERE id > 200;
+----
+physical_plan	<REGEX>:.*EMPTY_RESULT.*
+
+# price > 2000 is outside [0.99, 999.99] — should be eliminated
+query II
+EXPLAIN SELECT * FROM example.data.products WHERE price > 2000;
+----
+physical_plan	<REGEX>:.*EMPTY_RESULT.*
+
+# quantity < -1 is outside [0, 10000] — should be eliminated
+query II
+EXPLAIN SELECT * FROM example.data.products WHERE quantity < -1;
+----
+physical_plan	<REGEX>:.*EMPTY_RESULT.*
+
+# ============================================================================
 # DuckDB-extracted statistics: the 'numbers' table uses statistics_from_duckdb()
 # to extract real stats from a DuckDB in-memory table (value 0-99).
 # Verify these real stats enable filter elimination.
@@ -112,6 +153,12 @@ SELECT count(*) FROM example.data.products WHERE quantity IS NOT NULL;
 # value > 200 is outside [0, 99] — should be eliminated
 query II
 EXPLAIN SELECT * FROM example.data.numbers WHERE value > 200;
+----
+physical_plan	<REGEX>:.*EMPTY_RESULT.*
+
+# value < -1 is outside [0, 99] — should also be eliminated
+query II
+EXPLAIN SELECT * FROM example.data.numbers WHERE value < -1;
 ----
 physical_plan	<REGEX>:.*EMPTY_RESULT.*
 
@@ -134,7 +181,7 @@ budget	DOUBLE
 id	BIGINT
 name	VARCHAR
 
-# Verify has_null flags
+# Verify has_null flags (all columns are NOT NULL in departments)
 query TT
 SELECT column_name, has_null::VARCHAR FROM vgi_table_statistics('example', 'data', 'departments') ORDER BY column_name;
 ----
@@ -142,17 +189,255 @@ budget	false
 id	false
 name	false
 
+# Verify has_not_null flags (all columns have values)
+query TT
+SELECT column_name, has_not_null::VARCHAR FROM vgi_table_statistics('example', 'data', 'departments') ORDER BY column_name;
+----
+budget	true
+id	true
+name	true
+
+# Verify distinct_count values
+query TI
+SELECT column_name, distinct_count FROM vgi_table_statistics('example', 'data', 'departments') ORDER BY column_name;
+----
+budget	10
+id	10
+name	10
+
 # Tables without statistics return no rows
 query I
 SELECT count(*) FROM vgi_table_statistics('example', 'data', 'versioned_data');
 ----
 0
 
-# Verify min/max values are returned (UNION type)
+# ============================================================================
+# Verify min/max values for ALL column types in departments
+# ============================================================================
+
+# Integer min/max (id: min=1, max=10)
 query TT
 SELECT column_name, min::VARCHAR FROM vgi_table_statistics('example', 'data', 'departments') WHERE column_name = 'id';
 ----
 id	1
+
+query TT
+SELECT column_name, max::VARCHAR FROM vgi_table_statistics('example', 'data', 'departments') WHERE column_name = 'id';
+----
+id	10
+
+# Float min/max (budget: min=50000, max=500000)
+query TT
+SELECT column_name, min::VARCHAR FROM vgi_table_statistics('example', 'data', 'departments') WHERE column_name = 'budget';
+----
+budget	50000.0
+
+query TT
+SELECT column_name, max::VARCHAR FROM vgi_table_statistics('example', 'data', 'departments') WHERE column_name = 'budget';
+----
+budget	500000.0
+
+# String min/max (name: min=Accounting, max=Sales)
+# DuckDB truncates strings to 8 bytes for stats, so these may be truncated.
+# "Accounti" (8 chars) for min, "Sales" (5 chars) fits fully for max.
+query TT
+SELECT column_name, min::VARCHAR FROM vgi_table_statistics('example', 'data', 'departments') WHERE column_name = 'name';
+----
+name	Accounti
+
+query TT
+SELECT column_name, max::VARCHAR FROM vgi_table_statistics('example', 'data', 'departments') WHERE column_name = 'name';
+----
+name	Sales
+
+# ============================================================================
+# Verify min/max values for products table
+# ============================================================================
+
+# Products id: min=1, max=100
+query TT
+SELECT column_name, min::VARCHAR FROM vgi_table_statistics('example', 'data', 'products') WHERE column_name = 'id';
+----
+id	1
+
+query TT
+SELECT column_name, max::VARCHAR FROM vgi_table_statistics('example', 'data', 'products') WHERE column_name = 'id';
+----
+id	100
+
+# Products price: min=0.99, max=999.99
+query TT
+SELECT column_name, min::VARCHAR FROM vgi_table_statistics('example', 'data', 'products') WHERE column_name = 'price';
+----
+price	0.99
+
+query TT
+SELECT column_name, max::VARCHAR FROM vgi_table_statistics('example', 'data', 'products') WHERE column_name = 'price';
+----
+price	999.99
+
+# Products name: string column (min=Anvil, max=Zebra Tape)
+# "Anvil" (5 chars) fits fully, "Zebra Ta" (8 chars truncated)
+query TT
+SELECT column_name, min::VARCHAR FROM vgi_table_statistics('example', 'data', 'products') WHERE column_name = 'name';
+----
+name	Anvil
+
+query TT
+SELECT column_name, max::VARCHAR FROM vgi_table_statistics('example', 'data', 'products') WHERE column_name = 'name';
+----
+name	Zebra Ta
+
+# Products quantity: nullable integer (min=0, max=10000, has_null=true)
+query TT
+SELECT column_name, has_null::VARCHAR FROM vgi_table_statistics('example', 'data', 'products') WHERE column_name = 'quantity';
+----
+quantity	true
+
+query TT
+SELECT column_name, has_not_null::VARCHAR FROM vgi_table_statistics('example', 'data', 'products') WHERE column_name = 'quantity';
+----
+quantity	true
+
+query TT
+SELECT column_name, min::VARCHAR FROM vgi_table_statistics('example', 'data', 'products') WHERE column_name = 'quantity';
+----
+quantity	0
+
+query TT
+SELECT column_name, max::VARCHAR FROM vgi_table_statistics('example', 'data', 'products') WHERE column_name = 'quantity';
+----
+quantity	10000
+
+# ============================================================================
+# String statistics: contains_unicode and max_string_length
+# departments.name: contains_unicode=false, max_string_length=20
+# ============================================================================
+
+query TT
+SELECT column_name, contains_unicode::VARCHAR FROM vgi_table_statistics('example', 'data', 'departments') WHERE column_name = 'name';
+----
+name	false
+
+query TI
+SELECT column_name, max_string_length::BIGINT FROM vgi_table_statistics('example', 'data', 'departments') WHERE column_name = 'name';
+----
+name	20
+
+# products.name: contains_unicode=false, max_string_length=30
+query TT
+SELECT column_name, contains_unicode::VARCHAR FROM vgi_table_statistics('example', 'data', 'products') WHERE column_name = 'name';
+----
+name	false
+
+query TI
+SELECT column_name, max_string_length::BIGINT FROM vgi_table_statistics('example', 'data', 'products') WHERE column_name = 'name';
+----
+name	30
+
+# Non-string columns should have NULL for contains_unicode and max_string_length
+query TT
+SELECT column_name, contains_unicode::VARCHAR FROM vgi_table_statistics('example', 'data', 'departments') WHERE column_name = 'id';
+----
+id	NULL
+
+query TT
+SELECT column_name, max_string_length::VARCHAR FROM vgi_table_statistics('example', 'data', 'departments') WHERE column_name = 'id';
+----
+id	NULL
+
+# ============================================================================
+# ENUM (dictionary-encoded) column statistics — regression test
+# The colors table has statistics extracted via statistics_from_duckdb() from
+# a DuckDB table with an ENUM column. Verifies that actual string values
+# (not dictionary indices) are reported as min/max.
+#
+# ENUM ordering is by ordinal position: red=0, green=1, blue=2
+# So min()='red' (ordinal 0) and max()='blue' (ordinal 2).
+# These values are unwrapped from dictionary encoding to plain strings.
+# ============================================================================
+
+# colors has 3 columns with statistics (id, color, hex_code)
+query I
+SELECT count(*) FROM vgi_table_statistics('example', 'data', 'colors');
+----
+3
+
+query TT
+SELECT column_name, column_type FROM vgi_table_statistics('example', 'data', 'colors') ORDER BY column_name;
+----
+color	VARCHAR
+hex_code	VARCHAR
+id	BIGINT
+
+# Verify the ENUM column reports actual string values as min/max
+# Python extracts min='red', max='blue' (ENUM ordinal ordering), but
+# the C++ StringStats uses lexicographic comparison, so after
+# FromConstant + Merge: min='blue', max='red' (alphabetic).
+# The key thing: these are real string values, not dictionary indices (0, 1, 2).
+query TT
+SELECT column_name, min::VARCHAR FROM vgi_table_statistics('example', 'data', 'colors') WHERE column_name = 'color';
+----
+color	blue
+
+query TT
+SELECT column_name, max::VARCHAR FROM vgi_table_statistics('example', 'data', 'colors') WHERE column_name = 'color';
+----
+color	red
+
+# hex_code is a regular string column: min='#0000FF', max='#FF0000'
+query TT
+SELECT column_name, min::VARCHAR FROM vgi_table_statistics('example', 'data', 'colors') WHERE column_name = 'hex_code';
+----
+hex_code	#0000FF
+
+query TT
+SELECT column_name, max::VARCHAR FROM vgi_table_statistics('example', 'data', 'colors') WHERE column_name = 'hex_code';
+----
+hex_code	#FF0000
+
+# ENUM-derived column should have max_string_length and contains_unicode
+query TI
+SELECT column_name, max_string_length::BIGINT FROM vgi_table_statistics('example', 'data', 'colors') WHERE column_name = 'color';
+----
+color	5
+
+query TT
+SELECT column_name, contains_unicode::VARCHAR FROM vgi_table_statistics('example', 'data', 'colors') WHERE column_name = 'color';
+----
+color	false
+
+# hex_code max_string_length=7 (e.g. "#FF0000")
+query TI
+SELECT column_name, max_string_length::BIGINT FROM vgi_table_statistics('example', 'data', 'colors') WHERE column_name = 'hex_code';
+----
+hex_code	7
+
+# Verify has_null/has_not_null for colors
+query TT
+SELECT column_name, has_null::VARCHAR FROM vgi_table_statistics('example', 'data', 'colors') WHERE column_name = 'color';
+----
+color	false
+
+query TT
+SELECT column_name, has_not_null::VARCHAR FROM vgi_table_statistics('example', 'data', 'colors') WHERE column_name = 'color';
+----
+color	true
+
+# Filter elimination works with ENUM-derived stats
+# id > 100 is outside [1, 3]
+query II
+EXPLAIN SELECT * FROM example.data.colors WHERE id > 100;
+----
+physical_plan	<REGEX>:.*EMPTY_RESULT.*
+
+# Verify data is readable
+query ITT
+SELECT * FROM example.data.colors ORDER BY id;
+----
+1	blue	#0000FF
+2	green	#00FF00
+3	red	#FF0000
 
 # ============================================================================
 # Geometry column statistics
@@ -184,6 +469,47 @@ query TT
 SELECT column_name, min::VARCHAR FROM vgi_table_statistics('example', 'data', 'geo_points') WHERE column_name = 'id';
 ----
 id	1
+
+# ============================================================================
+# DuckDB-extracted statistics: numbers table
+# Extracted via statistics_from_duckdb() — value range [0, 99]
+# ============================================================================
+
+query I
+SELECT count(*) FROM vgi_table_statistics('example', 'data', 'numbers');
+----
+1
+
+query TT
+SELECT column_name, min::VARCHAR FROM vgi_table_statistics('example', 'data', 'numbers') WHERE column_name = 'value';
+----
+value	0
+
+query TT
+SELECT column_name, max::VARCHAR FROM vgi_table_statistics('example', 'data', 'numbers') WHERE column_name = 'value';
+----
+value	99
+
+query TT
+SELECT column_name, has_null::VARCHAR FROM vgi_table_statistics('example', 'data', 'numbers') WHERE column_name = 'value';
+----
+value	false
+
+query TT
+SELECT column_name, has_not_null::VARCHAR FROM vgi_table_statistics('example', 'data', 'numbers') WHERE column_name = 'value';
+----
+value	true
+
+# Non-string column: contains_unicode and max_string_length should be NULL
+query TT
+SELECT column_name, contains_unicode::VARCHAR FROM vgi_table_statistics('example', 'data', 'numbers') WHERE column_name = 'value';
+----
+value	NULL
+
+query TT
+SELECT column_name, max_string_length::VARCHAR FROM vgi_table_statistics('example', 'data', 'numbers') WHERE column_name = 'value';
+----
+value	NULL
 
 # ============================================================================
 # Cache TTL test: volatile_numbers has cache_max_age_seconds=0

@@ -23,6 +23,7 @@ WHERE database_name = 'example' AND schema_name = 'data'
   AND table_name != 'geo_points'  -- geo_points requires spatial extension
 ORDER BY table_name;
 ----
+colors	Colors table with ENUM-derived statistics
 departments	Department reference table
 employees	Employee table with FK to departments
 generated_sequence	Table with generated columns backed by sequence(10)
