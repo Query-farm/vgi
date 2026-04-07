@@ -750,6 +750,14 @@ SerializedFilters VgiSerializeFilters(ClientContext &context, const vector<colum
 unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
 	auto &bind_data = input.bind_data->Cast<VgiTableFunctionBindData>();
 
+	// Read TABLESAMPLE pushdown from DuckDB optimizer (SYSTEM_SAMPLE percentage only)
+	if (input.sample_options) {
+		double pct = input.sample_options->sample_size.GetValue<double>();
+		int64_t seed = input.sample_options->seed.IsValid()
+		    ? static_cast<int64_t>(input.sample_options->seed.GetIndex()) : -1;
+		bind_data.table_sample_hint = TableSampleHint{pct, seed};
+	}
+
 	// Extract projection IDs from input.column_ids for the worker.
 	// Only send projection IDs when the function supports projection pushdown.
 	// When unsupported, send empty list (meaning "all columns" in the protocol).
@@ -894,9 +902,9 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 		connection->SetTickFilterState(tick_filter_state);
 	}
 
-	// Perform init phase via vgi_rpc with projection, filter, join key, and order pushdown
+	// Perform init phase via vgi_rpc with projection, filter, join key, order, and sample pushdown
 	auto init_result = connection->PerformInit(projection_ids, filter_bytes, join_keys_buffers, "",
-	                                           bind_data.order_by_hint);
+	                                           bind_data.order_by_hint, bind_data.table_sample_hint);
 
 	auto global_state = make_uniq<VgiTableFunctionGlobalState>();
 	global_state->global_execution_id = std::move(init_result.execution_id);
@@ -921,6 +929,13 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 		         {"direction", bind_data.order_by_hint->direction},
 		         {"null_order", bind_data.order_by_hint->null_order},
 		         {"row_limit", std::to_string(bind_data.order_by_hint->row_limit)}});
+	}
+
+	if (bind_data.table_sample_hint) {
+		VGI_LOG(context, "table_function.sample_pushdown",
+		        {{"function_name", bind_data.function_name},
+		         {"percentage", std::to_string(bind_data.table_sample_hint->sample_percentage)},
+		         {"seed", std::to_string(bind_data.table_sample_hint->seed)}});
 	}
 
 	return global_state;
@@ -1369,6 +1384,12 @@ InsertionOrderPreservingMap<string> VgiTableFunctionToString(TableFunctionToStri
 		                       bind_data.order_by_hint->direction;
 		if (bind_data.order_by_hint->row_limit >= 0) {
 			result["Row Limit Hint"] = std::to_string(bind_data.order_by_hint->row_limit);
+		}
+	}
+	if (bind_data.table_sample_hint) {
+		result["Sample Hint"] = std::to_string(bind_data.table_sample_hint->sample_percentage) + "%";
+		if (bind_data.table_sample_hint->seed >= 0) {
+			result["Sample Seed"] = std::to_string(bind_data.table_sample_hint->seed);
 		}
 	}
 	return result;

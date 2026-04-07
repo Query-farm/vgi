@@ -136,7 +136,9 @@ std::shared_ptr<arrow::RecordBatch> BuildInitRequest(
     const std::string &order_by_column_name = {},   // Empty = null
     const std::string &order_by_direction = {},      // "ASC" or "DESC", empty = null
     const std::string &order_by_null_order = {},     // "NULLS_FIRST" or "NULLS_LAST", empty = null
-    int64_t order_by_limit = -1);                    // -1 = null
+    int64_t order_by_limit = -1,                     // -1 = null
+    double tablesample_percentage = -1.0,            // -1.0 = null (no sample)
+    int64_t tablesample_seed = -1);                  // -1 = null (no seed)
 
 // ============================================================================
 // GlobalInitResponse

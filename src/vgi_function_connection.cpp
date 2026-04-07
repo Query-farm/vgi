@@ -225,7 +225,8 @@ InitResult FunctionConnection::PerformInit(const std::vector<int32_t> &projectio
                                            std::shared_ptr<arrow::Buffer> pushdown_filters,
                                            std::vector<std::shared_ptr<arrow::Buffer>> join_keys,
                                            const std::string &phase,
-                                           const std::optional<OrderByHint> &order_by) {
+                                           const std::optional<OrderByHint> &order_by,
+                                           const std::optional<TableSampleHint> &table_sample) {
 	if (!bind_done_) {
 		ThrowVgiIOException("FunctionConnection::PerformInit called before PerformBind", worker_path_,
 		                    proc_ ? proc_->GetPid() : -1, GetExecutionIdHex());
@@ -255,6 +256,14 @@ InitResult FunctionConnection::PerformInit(const std::vector<int32_t> &projectio
 		ob_limit = order_by->row_limit;
 	}
 
+	// Extract table sample hint fields (-1.0 / -1 when no hint)
+	double ts_percentage = -1.0;
+	int64_t ts_seed = -1;
+	if (table_sample.has_value()) {
+		ts_percentage = table_sample->sample_percentage;
+		ts_seed = table_sample->seed;
+	}
+
 	// Build InitRequest — pass arrow::Buffer directly to avoid copying
 	auto init_request = BuildInitRequest(
 	    bind_result_.bind_request_bytes,
@@ -266,7 +275,8 @@ InitResult FunctionConnection::PerformInit(const std::vector<int32_t> &projectio
 	    phase,
 	    execution_id,
 	    {},  // init_opaque_data
-	    ob_col, ob_dir, ob_null, ob_limit);
+	    ob_col, ob_dir, ob_null, ob_limit,
+	    ts_percentage, ts_seed);
 	auto init_request_bytes = SerializeToIpcBytes(init_request);
 
 	// Build RPC params and send request

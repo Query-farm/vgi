@@ -1,0 +1,110 @@
+# name: test/sql/integration/table/tablesample.test
+# description: Verify TABLESAMPLE SYSTEM pushdown via sampling_pushdown.
+#              Only SYSTEM_SAMPLE with percentage is pushed down by DuckDB's
+#              SamplingPushdown optimizer. Bernoulli and Reservoir are always
+#              handled by DuckDB's physical operators.
+# group: [vgi_integration_table]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# 1. No TABLESAMPLE — no hint pushed
+# ============================================================================
+
+query ITRI
+SELECT * FROM example.sample_echo(3);
+----
+0	row_0	-1.0	-1
+1	row_1	-1.0	-1
+2	row_2	-1.0	-1
+
+# ============================================================================
+# 2. TABLESAMPLE SYSTEM(10%) — percentage pushed down
+# ============================================================================
+
+query ITRI
+SELECT * FROM example.sample_echo(3) TABLESAMPLE SYSTEM(10%);
+----
+0	row_0	10.0	-1
+1	row_1	10.0	-1
+2	row_2	10.0	-1
+
+# ============================================================================
+# 3. TABLESAMPLE SYSTEM(50%) REPEATABLE(42) — seed pushed
+# ============================================================================
+
+query ITRI
+SELECT * FROM example.sample_echo(3) TABLESAMPLE SYSTEM(50%) REPEATABLE(42);
+----
+0	row_0	50.0	42
+1	row_1	50.0	42
+2	row_2	50.0	42
+
+# ============================================================================
+# 4. TABLESAMPLE BERNOULLI(100%) — NOT pushed down (DuckDB handles it)
+#    Using 100% ensures all rows pass the Bernoulli filter while verifying
+#    that the hint is NOT pushed to the worker.
+# ============================================================================
+
+query ITRI
+SELECT * FROM example.sample_echo(3) TABLESAMPLE BERNOULLI(100%);
+----
+0	row_0	-1.0	-1
+1	row_1	-1.0	-1
+2	row_2	-1.0	-1
+
+# ============================================================================
+# 5. TABLESAMPLE SYSTEM(100%) — all rows, hint still pushed
+# ============================================================================
+
+query ITRI
+SELECT * FROM example.sample_echo(3) TABLESAMPLE SYSTEM(100%);
+----
+0	row_0	100.0	-1
+1	row_1	100.0	-1
+2	row_2	100.0	-1
+
+# ============================================================================
+# 6. Combined with WHERE filter — verify both work together
+# ============================================================================
+
+query ITRI
+SELECT * FROM example.sample_echo(5) TABLESAMPLE SYSTEM(50%) WHERE n < 3;
+----
+0	row_0	50.0	-1
+1	row_1	50.0	-1
+2	row_2	50.0	-1
+
+# ============================================================================
+# 7. Projected subset — verify pushdown works with projection
+# ============================================================================
+
+query IR
+SELECT n, sample_percentage FROM example.sample_echo(3) TABLESAMPLE SYSTEM(25%);
+----
+0	25.0
+1	25.0
+2	25.0
+
+# ============================================================================
+# 8. EXPLAIN — verify STREAMING_SAMPLE node is NOT in plan (pushdown absorbed it)
+# ============================================================================
+
+query II
+EXPLAIN SELECT * FROM example.sample_echo(10) TABLESAMPLE SYSTEM(10%);
+----
+physical_plan	<!REGEX>:.*STREAMING_SAMPLE.*
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;

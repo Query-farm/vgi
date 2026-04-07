@@ -152,6 +152,10 @@ struct VgiTableFunctionBindData : public TableFunctionData {
 	// Order pushdown hint from DuckDB optimizer (set by set_scan_order callback).
 	// Mutable because set_scan_order is called during optimization (after bind, before execution).
 	mutable std::optional<OrderByHint> order_by_hint;
+
+	// TABLESAMPLE SYSTEM hint from DuckDB optimizer (read from input.sample_options in InitGlobal).
+	// Mutable because InitGlobal receives const bind_data.
+	mutable std::optional<TableSampleHint> table_sample_hint;
 };
 
 // ============================================================================

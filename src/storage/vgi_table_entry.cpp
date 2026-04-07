@@ -54,8 +54,21 @@ unique_ptr<BaseStatistics> VgiTableEntry::GetStatistics(ClientContext &context, 
 
 	// Thread-safe lazy fetch + lookup under single lock scope
 	std::lock_guard<std::mutex> lock(stats_cache_.mutex);
-	if (stats_cache_.IsStale()) {
+	bool was_stale = stats_cache_.IsStale();
+	if (was_stale) {
+		VGI_LOG(context, "column_statistics.cache_miss",
+		        {{"table", ParentSchema().name + "." + name},
+		         {"column", column_name},
+		         {"fetched", stats_cache_.fetched ? "true" : "false"},
+		         {"max_age_seconds", std::to_string(stats_cache_.max_age_seconds)},
+		         {"entry_ptr", std::to_string(reinterpret_cast<uintptr_t>(this))}});
 		FetchColumnStatistics(context);
+	} else {
+		VGI_LOG(context, "column_statistics.cache_hit",
+		        {{"table", ParentSchema().name + "." + name},
+		         {"column", column_name},
+		         {"max_age_seconds", std::to_string(stats_cache_.max_age_seconds)},
+		         {"entry_ptr", std::to_string(reinterpret_cast<uintptr_t>(this))}});
 	}
 
 	auto it = stats_cache_.entries.find(column_name);
@@ -115,6 +128,12 @@ void VgiTableEntry::FetchColumnStatistics(ClientContext &context) const {
 
 	stats_cache_.fetched = true;
 	stats_cache_.fetched_at = std::chrono::steady_clock::now();
+
+	VGI_LOG(context, "column_statistics.fetched",
+	        {{"table", ParentSchema().name + "." + name},
+	         {"columns", std::to_string(stats_cache_.entries.size())},
+	         {"max_age_seconds", std::to_string(stats_cache_.max_age_seconds)},
+	         {"entry_ptr", std::to_string(reinterpret_cast<uintptr_t>(this))}});
 }
 
 TableFunction VgiTableEntry::GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data) {
@@ -160,6 +179,7 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 	// (e.g., filter_pushdown, projection_pushdown)
 	bool has_projection_pushdown = false;
 	bool has_filter_pushdown = false;
+	bool has_sampling_pushdown = false;
 	std::vector<std::string> scan_supported_expression_filters;
 	std::vector<vgi::VgiSecretRequirement> scan_required_secrets;
 	auto func_entry = catalog_.GetEntry<TableFunctionCatalogEntry>(
@@ -176,6 +196,7 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 		for (auto &tf : func_entry->functions.functions) {
 			has_projection_pushdown = has_projection_pushdown || tf.projection_pushdown;
 			has_filter_pushdown = has_filter_pushdown || tf.filter_pushdown;
+			has_sampling_pushdown = has_sampling_pushdown || tf.sampling_pushdown;
 			// Extract required_secrets from the VgiTableFunctionInfo
 			if (tf.function_info) {
 				auto &vgi_tf_info = tf.function_info->Cast<vgi::VgiTableFunctionInfo>();
@@ -220,6 +241,7 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 	                   vgi::VgiTableFunctionInitGlobal, vgi::VgiTableFunctionInitLocal);
 	func.projection_pushdown = has_projection_pushdown;
 	func.filter_pushdown = has_filter_pushdown;
+	func.sampling_pushdown = has_sampling_pushdown;
 	if (!scan_supported_expression_filters.empty()) {
 		func.pushdown_expression = vgi::VgiPushdownExpression;
 	}

@@ -62,7 +62,8 @@ public:
 	                               std::shared_ptr<arrow::Buffer> pushdown_filters = nullptr,
 	                               std::vector<std::shared_ptr<arrow::Buffer>> join_keys = {},
 	                               const std::string &phase = "",
-	                               const std::optional<OrderByHint> &order_by = std::nullopt) = 0;
+	                               const std::optional<OrderByHint> &order_by = std::nullopt,
+	                               const std::optional<TableSampleHint> &table_sample = std::nullopt) = 0;
 	virtual void PerformFinalizeInit() = 0;
 
 	// Phase 3: Data exchange

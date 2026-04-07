@@ -264,7 +264,8 @@ InitResult HttpFunctionConnection::PerformInit(const std::vector<int32_t> &proje
                                                 std::shared_ptr<arrow::Buffer> pushdown_filters,
                                                 std::vector<std::shared_ptr<arrow::Buffer>> join_keys,
                                                 const std::string &phase,
-                                                const std::optional<OrderByHint> &order_by) {
+                                                const std::optional<OrderByHint> &order_by,
+                                                const std::optional<TableSampleHint> &table_sample) {
 	if (!bind_done_) {
 		throw IOException("HttpFunctionConnection::PerformInit called before PerformBind [url: %s]", base_url_);
 	}
@@ -291,6 +292,14 @@ InitResult HttpFunctionConnection::PerformInit(const std::vector<int32_t> &proje
 		ob_limit = order_by->row_limit;
 	}
 
+	// Extract table sample hint fields (-1.0 / -1 when no hint)
+	double ts_percentage = -1.0;
+	int64_t ts_seed = -1;
+	if (table_sample.has_value()) {
+		ts_percentage = table_sample->sample_percentage;
+		ts_seed = table_sample->seed;
+	}
+
 	// Build InitRequest — pass arrow::Buffer directly to avoid copying
 	auto init_request = BuildInitRequest(
 	    bind_result_.bind_request_bytes,
@@ -302,7 +311,8 @@ InitResult HttpFunctionConnection::PerformInit(const std::vector<int32_t> &proje
 	    phase,
 	    execution_id,
 	    {},  // init_opaque_data
-	    ob_col, ob_dir, ob_null, ob_limit);
+	    ob_col, ob_dir, ob_null, ob_limit,
+	    ts_percentage, ts_seed);
 	auto init_request_bytes = SerializeToIpcBytes(init_request);
 	auto rpc_params = BuildInitRpcParams(init_request_bytes);
 

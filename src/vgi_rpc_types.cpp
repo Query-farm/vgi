@@ -429,7 +429,8 @@ BuildInitRequest(const std::vector<uint8_t> &bind_call_bytes, const std::vector<
                  const std::string &phase,
                  const std::vector<uint8_t> &execution_id, const std::vector<uint8_t> &init_opaque_data,
                  const std::string &order_by_column_name, const std::string &order_by_direction,
-                 const std::string &order_by_null_order, int64_t order_by_limit) {
+                 const std::string &order_by_null_order, int64_t order_by_limit,
+                 double tablesample_percentage, int64_t tablesample_seed) {
 	static const std::vector<std::string> phase_values = {"INPUT", "FINALIZE"};
 
 	auto phase_type = arrow::dictionary(arrow::int16(), arrow::utf8());
@@ -451,6 +452,8 @@ BuildInitRequest(const std::vector<uint8_t> &bind_call_bytes, const std::vector<
 	    arrow::field("order_by_direction", order_direction_type, true),
 	    arrow::field("order_by_null_order", order_null_order_type, true),
 	    arrow::field("order_by_limit", arrow::int64(), true),
+	    arrow::field("tablesample_percentage", arrow::float64(), true),
+	    arrow::field("tablesample_seed", arrow::int64(), true),
 	});
 
 	std::vector<std::shared_ptr<arrow::Array>> arrays;
@@ -552,6 +555,28 @@ BuildInitRequest(const std::vector<uint8_t> &bind_call_bytes, const std::vector<
 			CheckStatus(builder.Append(order_by_limit), "append order_by_limit");
 		}
 		arrays.push_back(FinishArray(builder, "order_by_limit"));
+	}
+
+	// tablesample_percentage: float64|null — -1.0 = null (no sample)
+	{
+		arrow::DoubleBuilder builder;
+		if (tablesample_percentage < 0.0) {
+			CheckStatus(builder.AppendNull(), "append null tablesample_percentage");
+		} else {
+			CheckStatus(builder.Append(tablesample_percentage), "append tablesample_percentage");
+		}
+		arrays.push_back(FinishArray(builder, "tablesample_percentage"));
+	}
+
+	// tablesample_seed: int64|null — -1 = null (no seed)
+	{
+		arrow::Int64Builder builder;
+		if (tablesample_seed < 0) {
+			CheckStatus(builder.AppendNull(), "append null tablesample_seed");
+		} else {
+			CheckStatus(builder.Append(tablesample_seed), "append tablesample_seed");
+		}
+		arrays.push_back(FinishArray(builder, "tablesample_seed"));
 	}
 
 	return arrow::RecordBatch::Make(schema, 1, arrays);

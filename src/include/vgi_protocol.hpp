@@ -39,5 +39,13 @@ struct OrderByHint {
 	int64_t row_limit = -1;   // Combined limit+offset, -1 = no limit
 };
 
+// TABLESAMPLE SYSTEM hint from DuckDB's SamplingPushdown optimizer.
+// Only SYSTEM_SAMPLE with percentage is pushed down; Bernoulli and Reservoir
+// are always handled by DuckDB's physical operators.
+struct TableSampleHint {
+	double sample_percentage;  // 0.0 to 100.0
+	int64_t seed;              // -1 = no seed specified
+};
+
 } // namespace vgi
 } // namespace duckdb

@@ -244,6 +244,7 @@ void VgiTableFunctionSet::LoadEntries(ClientContext &context) {
 				                         vgi::VgiTableFunctionInitLocal);
 				table_func.projection_pushdown = func_info.projection_pushdown.value_or(false);
 				table_func.filter_pushdown = func_info.filter_pushdown.value_or(false);
+				table_func.sampling_pushdown = func_info.sampling_pushdown.value_or(false);
 				if (!func_info.supported_expression_filters.empty()) {
 					table_func.pushdown_expression = vgi::VgiPushdownExpression;
 				}

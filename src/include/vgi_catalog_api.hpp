@@ -252,6 +252,7 @@ struct VgiFunctionInfo {
 	// Table function capabilities (nullopt if not applicable)
 	std::optional<bool> projection_pushdown;
 	std::optional<bool> filter_pushdown;
+	std::optional<bool> sampling_pushdown;
 	std::optional<VgiOrderPreservation> order_preservation;
 	std::optional<int32_t> max_workers;
 
