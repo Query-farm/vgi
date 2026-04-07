@@ -5,6 +5,10 @@
 #include "duckdb/main/secret/secret_manager.hpp"
 #include "duckdb/function/table/arrow/arrow_duck_schema.hpp"
 #include "duckdb/logging/log_manager.hpp"
+#include "duckdb/common/types/value.hpp"
+#include "duckdb/function/table/arrow.hpp"
+#include "duckdb/storage/statistics/numeric_stats.hpp"
+#include "duckdb/storage/statistics/string_stats.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/parser/constraints/not_null_constraint.hpp"
 #include "duckdb/parser/constraints/unique_constraint.hpp"
@@ -664,6 +668,264 @@ TableFunctionCardinalityResult InvokeTableFunctionCardinality(
 }
 
 // ============================================================================
+// Column Statistics
+// ============================================================================
+
+// Build DuckDB BaseStatistics from min/max Values and metadata.
+// Uses DuckDB's BaseStatistics::FromConstantType + Merge to handle all types
+// (numeric, string, decimal, list, struct, etc.) without manual type dispatch.
+static unique_ptr<BaseStatistics> BuildColumnStatistics(
+    const LogicalType &duck_type, const Value &min_val, const Value &max_val,
+    bool has_null, bool has_not_null, int64_t distinct_count,
+    bool has_contains_unicode, bool contains_unicode,
+    bool has_max_string_length, uint64_t max_string_length) {
+
+	// Use DuckDB's FromConstant to build stats from min, then Merge with max to
+	// expand the range. This delegates all type-specific logic (NumericStats,
+	// StringStats, ListStats, etc.) to DuckDB internals — no manual type dispatch.
+	if (min_val.IsNull() && max_val.IsNull()) {
+		return make_uniq<BaseStatistics>(BaseStatistics::CreateUnknown(duck_type));
+	}
+
+	// Cast values to the target type so FromConstant dispatches to the correct
+	// stats type (e.g., GEOMETRY_STATS for geometry columns). For types that
+	// share the same physical representation but have no registered cast
+	// (e.g., BLOB → GEOMETRY), reinterpret the value with the target type.
+	auto cast_value = [&](const Value &val) -> Value {
+		if (val.IsNull()) {
+			return val;
+		}
+		if (val.type() == duck_type) {
+			return val;
+		}
+		try {
+			return val.DefaultCastAs(duck_type);
+		} catch (...) {
+			// Cast not available — if the physical types match, reinterpret
+			// the value with the target logical type (e.g., BLOB → GEOMETRY)
+			if (val.type().InternalType() == duck_type.InternalType()) {
+				auto reinterpreted = val;
+				reinterpreted.Reinterpret(duck_type);
+				return reinterpreted;
+			}
+			return val;
+		}
+	};
+
+	BaseStatistics result = !min_val.IsNull()
+	    ? BaseStatistics::FromConstant(cast_value(min_val))
+	    : BaseStatistics::FromConstant(cast_value(max_val));
+
+	if (!min_val.IsNull() && !max_val.IsNull()) {
+		result.Merge(BaseStatistics::FromConstant(cast_value(max_val)));
+	}
+
+	// Override null/valid flags (FromConstantType sets CANNOT_HAVE_NULL by default)
+	if (has_null) {
+		result.SetHasNull();
+	}
+	if (has_not_null) {
+		result.SetHasNoNull();
+	}
+	if (distinct_count >= 0) {
+		result.SetDistinctCount(static_cast<idx_t>(distinct_count));
+	}
+
+	// String-specific fields — must guard with type check to avoid accessing
+	// the wrong union member (UB if called on NUMERIC_STATS etc.)
+	if (result.GetStatsType() == StatisticsType::STRING_STATS) {
+		if (has_contains_unicode && contains_unicode) {
+			StringStats::SetContainsUnicode(result);
+		}
+		if (has_max_string_length) {
+			StringStats::SetMaxStringLength(result, static_cast<uint32_t>(max_string_length));
+		}
+	}
+
+	return result.ToUnique();
+}
+
+ColumnStatisticsRpcResult InvokeCatalogTableColumnStatisticsGet(
+    const std::string &worker_path, const std::vector<uint8_t> &attach_id,
+    const std::string &schema_name, const std::string &table_name,
+    const std::vector<LogicalType> &column_types,
+    const std::vector<std::string> &column_names,
+    ClientContext &context, const std::vector<uint8_t> &transaction_id,
+    bool worker_debug, bool use_pool) {
+
+	ColumnStatisticsRpcResult rpc_result;
+
+	auto params = BuildTableColumnStatisticsGetParams(attach_id, schema_name, table_name, transaction_id);
+	auto response = InvokeRpcMethod(worker_path, "catalog_table_column_statistics_get", params, context,
+	                                worker_debug, use_pool);
+
+	// Extract and deserialize the inner result bytes, preserving custom_metadata
+	// (cache_max_age_seconds is carried as IPC batch custom_metadata, not schema metadata)
+	if (!response.batch || response.batch->num_rows() == 0) {
+		return rpc_result;
+	}
+	auto result_col = response.batch->GetColumnByName("result");
+	if (!result_col) {
+		return rpc_result;
+	}
+	auto binary_array = std::dynamic_pointer_cast<arrow::BinaryArray>(result_col);
+	if (!binary_array || binary_array->IsNull(0)) {
+		return rpc_result;
+	}
+	auto view = binary_array->GetView(0);
+	auto deserialized = DeserializeFromIpcBytesWithMetadata(
+	    reinterpret_cast<const uint8_t *>(view.data()), view.size());
+	auto &result_batch = deserialized.batch;
+	if (!result_batch || result_batch->num_rows() == 0) {
+		return rpc_result;
+	}
+
+	// Extract cache_max_age_seconds from IPC batch custom_metadata
+	if (deserialized.custom_metadata) {
+		int key_idx = deserialized.custom_metadata->FindKey("cache_max_age_seconds");
+		if (key_idx >= 0) {
+			try {
+				rpc_result.cache_max_age_seconds = std::stoll(deserialized.custom_metadata->value(key_idx));
+			} catch (const std::exception &e) {
+				VGI_LOG(context, "column_statistics.invalid_cache_ttl",
+				        {{"worker_path", worker_path},
+				         {"value", deserialized.custom_metadata->value(key_idx)},
+				         {"error", e.what()}});
+			}
+		}
+	}
+
+	// -----------------------------------------------------------------------
+	// Convert Arrow RecordBatch → DuckDB DataChunk using DuckDB's Arrow scanner.
+	// This correctly handles all types (string, decimal, timestamp, union, etc.)
+	// without manual per-type conversion.
+	// -----------------------------------------------------------------------
+
+	// Export Arrow schema to C ABI and build ArrowTableSchema
+	ArrowSchemaWrapper schema_root;
+	ExportSchema(result_batch->schema(), schema_root);
+
+	vector<LogicalType> all_types;
+	ArrowTableSchema arrow_table;
+	std::unordered_map<std::string, idx_t> name_indexes;
+
+	for (idx_t col_idx = 0; col_idx < static_cast<idx_t>(schema_root.arrow_schema.n_children); col_idx++) {
+		auto &schema_item = *schema_root.arrow_schema.children[col_idx];
+		auto arrow_type = ArrowType::GetArrowLogicalType(context, schema_item);
+		all_types.push_back(arrow_type->GetDuckType());
+		arrow_table.AddColumn(col_idx, std::move(arrow_type), schema_item.name);
+		name_indexes[schema_item.name] = col_idx;
+	}
+
+	// Export RecordBatch to C ABI
+	auto current_chunk = make_uniq<ArrowArrayWrapper>();
+	ExportRecordBatch(result_batch, *current_chunk);
+
+	// Convert Arrow → DuckDB DataChunk
+	DataChunk stats_chunk;
+	stats_chunk.Initialize(Allocator::Get(context), all_types,
+	                        static_cast<idx_t>(current_chunk->arrow_array.length));
+	stats_chunk.SetCardinality(static_cast<idx_t>(current_chunk->arrow_array.length));
+
+	ArrowScanLocalState fake_local_state(std::move(current_chunk), context);
+	ArrowTableFunction::ArrowToDuckDB(fake_local_state, arrow_table.GetColumns(), stats_chunk, false);
+	stats_chunk.Verify();
+
+	// -----------------------------------------------------------------------
+	// Validate required columns exist
+	// -----------------------------------------------------------------------
+	for (const auto &field : {"column_name", "min", "max", "has_null", "has_not_null", "distinct_count"}) {
+		if (name_indexes.find(field) == name_indexes.end()) {
+			VGI_LOG(context, "column_statistics.missing_fields",
+			        {{"worker_path", worker_path},
+			         {"table", schema_name + "." + table_name},
+			         {"missing_field", field}});
+			return rpc_result;
+		}
+	}
+
+	// Build column name → type lookup
+	std::unordered_map<std::string, LogicalType> col_type_map;
+	for (size_t i = 0; i < column_names.size(); i++) {
+		col_type_map[column_names[i]] = column_types[i];
+	}
+
+	// Optional string-specific column indexes
+	bool has_contains_unicode_col = name_indexes.count("contains_unicode") > 0;
+	bool has_max_string_length_col = name_indexes.count("max_string_length") > 0;
+
+	// -----------------------------------------------------------------------
+	// Extract values from the DataChunk and build BaseStatistics per column
+	// -----------------------------------------------------------------------
+	for (idx_t i = 0; i < stats_chunk.size(); i++) {
+		try {
+			auto column_name = stats_chunk.data[name_indexes["column_name"]].GetValue(i).GetValue<string>();
+
+			// Look up the DuckDB type for this column
+			auto type_it = col_type_map.find(column_name);
+			if (type_it == col_type_map.end()) {
+				continue; // Unknown column — skip
+			}
+			auto &duck_type = type_it->second;
+
+			// Extract min/max from the UNION-typed columns.
+			// DuckDB's ArrowToDuckDB converts sparse unions to DuckDB UNION type.
+			// Use UnionValue::GetValue to extract the inner typed value.
+			auto min_union_val = stats_chunk.data[name_indexes["min"]].GetValue(i);
+			auto max_union_val = stats_chunk.data[name_indexes["max"]].GetValue(i);
+
+			Value min_val, max_val;
+			if (!min_union_val.IsNull()) {
+				min_val = UnionValue::GetValue(min_union_val);
+			}
+			if (!max_union_val.IsNull()) {
+				max_val = UnionValue::GetValue(max_union_val);
+			}
+
+			bool has_null = stats_chunk.data[name_indexes["has_null"]].GetValue(i).GetValue<bool>();
+			bool has_not_null = stats_chunk.data[name_indexes["has_not_null"]].GetValue(i).GetValue<bool>();
+			auto dc_val = stats_chunk.data[name_indexes["distinct_count"]].GetValue(i);
+			int64_t distinct_count = dc_val.IsNull() ? -1 : dc_val.GetValue<int64_t>();
+
+			bool has_unicode_flag = false;
+			bool unicode_val = false;
+			if (has_contains_unicode_col) {
+				auto cu_val = stats_chunk.data[name_indexes["contains_unicode"]].GetValue(i);
+				if (!cu_val.IsNull()) {
+					has_unicode_flag = true;
+					unicode_val = cu_val.GetValue<bool>();
+				}
+			}
+			bool has_max_str_len = false;
+			uint64_t max_str_len = 0;
+			if (has_max_string_length_col) {
+				auto msl_val = stats_chunk.data[name_indexes["max_string_length"]].GetValue(i);
+				if (!msl_val.IsNull()) {
+					has_max_str_len = true;
+					max_str_len = msl_val.GetValue<uint64_t>();
+				}
+			}
+
+			auto stats = BuildColumnStatistics(duck_type, min_val, max_val, has_null, has_not_null,
+			                                    distinct_count, has_unicode_flag, unicode_val,
+			                                    has_max_str_len, max_str_len);
+			if (stats) {
+				rpc_result.stats[column_name] = std::move(stats);
+			}
+		} catch (const std::exception &e) {
+			// One bad column shouldn't fail the rest
+			VGI_LOG(context, "column_statistics.parse_error",
+			        {{"worker_path", worker_path},
+			         {"table", schema_name + "." + table_name},
+			         {"row", std::to_string(i)},
+			         {"error", e.what()}});
+		}
+	}
+
+	return rpc_result;
+}
+
+// ============================================================================
 // Enum parsing functions
 // ============================================================================
 
@@ -1002,6 +1264,9 @@ CatalogAttachResult ParseCatalogAttachResult(const std::shared_ptr<arrow::Record
 	result.comment = row["comment"].value_or(std::string(""));
 	result.tags = row["tags"].value_or(std::map<std::string, std::string> {});
 
+	// Parse column statistics capability flag (backward-compatible)
+	result.supports_column_statistics = row["supports_column_statistics"].value_or(false);
+
 	return result;
 }
 
@@ -1092,6 +1357,9 @@ VgiTableInfo ParseTableInfo(const std::shared_ptr<arrow::RecordBatch> &batch, in
 	info.supports_insert = row["supports_insert"].value_or(false);
 	info.supports_update = row["supports_update"].value_or(false);
 	info.supports_delete = row["supports_delete"].value_or(false);
+
+	// Parse column statistics capability flag (backward-compatible)
+	info.supports_column_statistics = row["supports_column_statistics"].value_or(false);
 
 	// Validate: UPDATE/DELETE require a row ID column
 	if ((info.supports_update || info.supports_delete) && info.row_id_column < 0) {

@@ -1,0 +1,209 @@
+# name: test/sql/integration/table/column_statistics.test
+# description: Tests for VGI column-level statistics
+# group: [vgi_integration_table]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# Smoke test: queries on tables with statistics work correctly
+# These tables have supports_column_statistics=true and return statistics
+# via catalog_table_column_statistics_get RPC.
+# ============================================================================
+
+# Table with statistics: numbers (int64, explicit columns)
+query I
+SELECT count(*) FROM example.data.numbers;
+----
+100
+
+# Table with statistics: departments (int64, varchar, float64)
+query I
+SELECT count(*) FROM example.data.departments;
+----
+3
+
+# Table with statistics: products (int64, varchar, int64, float64)
+query I
+SELECT count(*) FROM example.data.products;
+----
+3
+
+# ============================================================================
+# Verify optimizer uses statistics for filter elimination
+# The departments table has stats: id min=1, max=10
+# A filter outside this range should produce EMPTY_RESULT in the plan
+# ============================================================================
+
+# id > 100 is outside [1, 10] — optimizer should eliminate entire scan
+query II
+EXPLAIN SELECT * FROM example.data.departments WHERE id > 100;
+----
+physical_plan	<REGEX>:.*EMPTY_RESULT.*
+
+# id >= 1 is within [1, 10] — optimizer should NOT eliminate scan
+query II
+EXPLAIN SELECT * FROM example.data.departments WHERE id >= 1;
+----
+physical_plan	<REGEX>:.*VGI_TABLE_SCAN.*
+
+# ============================================================================
+# Verify statistics on string columns (departments.name: min=Accounting, max=Sales)
+# DuckDB truncates string stats to 8 bytes, so filter elimination is conservative.
+# Short strings (< 8 bytes) can't reliably eliminate — the optimizer accounts for
+# the possibility that the full max string extends beyond the truncated prefix.
+# But the statistics ARE being fetched and set (verified by numeric elimination above).
+# ============================================================================
+
+# String filter: verify the query still works (stats don't break anything)
+query I
+SELECT count(*) FROM example.data.departments WHERE name > 'ZZZZZ';
+----
+0
+
+# ============================================================================
+# Verify statistics on float64 columns (departments.budget: min=50000, max=500000)
+# ============================================================================
+
+# budget > 1000000 is outside [50000, 500000] — should be eliminated
+query II
+EXPLAIN SELECT * FROM example.data.departments WHERE budget > 1000000;
+----
+physical_plan	<REGEX>:.*EMPTY_RESULT.*
+
+# ============================================================================
+# Tables WITHOUT statistics should work normally (no elimination)
+# versioned_data has supports_column_statistics=false
+# ============================================================================
+
+query I
+SELECT count(*) FROM example.data.versioned_data;
+----
+4
+
+# Without stats, optimizer cannot eliminate even impossible filters
+query II
+EXPLAIN SELECT * FROM example.data.versioned_data WHERE id > 100;
+----
+physical_plan	<REGEX>:.*VGI_TABLE_SCAN.*
+
+# ============================================================================
+# Nullable columns (products.quantity: has_null=true, has_not_null=true)
+# The optimizer should know NULLs are possible
+# ============================================================================
+
+query I
+SELECT count(*) FROM example.data.products WHERE quantity IS NOT NULL;
+----
+3
+
+# ============================================================================
+# DuckDB-extracted statistics: the 'numbers' table uses statistics_from_duckdb()
+# to extract real stats from a DuckDB in-memory table (value 0-99).
+# Verify these real stats enable filter elimination.
+# ============================================================================
+
+# value > 200 is outside [0, 99] — should be eliminated
+query II
+EXPLAIN SELECT * FROM example.data.numbers WHERE value > 200;
+----
+physical_plan	<REGEX>:.*EMPTY_RESULT.*
+
+# ============================================================================
+# vgi_table_statistics() diagnostic function
+# Returns per-column statistics with UNION-typed min/max
+# ============================================================================
+
+# departments has 3 columns with statistics (id, name, budget)
+query I
+SELECT count(*) FROM vgi_table_statistics('example', 'data', 'departments');
+----
+3
+
+# Verify column names and types are returned correctly
+query TT
+SELECT column_name, column_type FROM vgi_table_statistics('example', 'data', 'departments') ORDER BY column_name;
+----
+budget	DOUBLE
+id	BIGINT
+name	VARCHAR
+
+# Verify has_null flags
+query TT
+SELECT column_name, has_null::VARCHAR FROM vgi_table_statistics('example', 'data', 'departments') ORDER BY column_name;
+----
+budget	false
+id	false
+name	false
+
+# Tables without statistics return no rows
+query I
+SELECT count(*) FROM vgi_table_statistics('example', 'data', 'versioned_data');
+----
+0
+
+# Verify min/max values are returned (UNION type)
+query TT
+SELECT column_name, min::VARCHAR FROM vgi_table_statistics('example', 'data', 'departments') WHERE column_name = 'id';
+----
+id	1
+
+# ============================================================================
+# Geometry column statistics
+# geo_points has a GEOMETRY column with spatial bounding box statistics
+# extracted via statistics_from_duckdb() using ST_Point corner points.
+# ============================================================================
+
+# geo_points has 2 columns (id + geom), both with stats
+query I
+SELECT count(*) FROM vgi_table_statistics('example', 'data', 'geo_points');
+----
+2
+
+# Verify column types include GEOMETRY
+query TT
+SELECT column_name, column_type FROM vgi_table_statistics('example', 'data', 'geo_points') ORDER BY column_name;
+----
+geom	GEOMETRY
+id	BIGINT
+
+# Verify the geometry column shows bounding box extent
+query TT
+SELECT column_name, min::VARCHAR FROM vgi_table_statistics('example', 'data', 'geo_points') WHERE column_name = 'geom';
+----
+geom	BOX(0 0, 4 4)
+
+# The id column (BIGINT) should have proper numeric stats
+query TT
+SELECT column_name, min::VARCHAR FROM vgi_table_statistics('example', 'data', 'geo_points') WHERE column_name = 'id';
+----
+id	1
+
+# ============================================================================
+# Cache TTL test: volatile_numbers has cache_max_age_seconds=0
+# Stats should be re-fetched on every query, but still work correctly
+# ============================================================================
+
+# First query — stats fetched, filter elimination works
+query II
+EXPLAIN SELECT * FROM example.data.volatile_numbers WHERE value > 200;
+----
+physical_plan	<REGEX>:.*EMPTY_RESULT.*
+
+# Second query — stats re-fetched (TTL=0), filter elimination still works
+query II
+EXPLAIN SELECT * FROM example.data.volatile_numbers WHERE value > 200;
+----
+physical_plan	<REGEX>:.*EMPTY_RESULT.*
+
+# Verify data is actually readable
+query I
+SELECT count(*) FROM example.data.volatile_numbers;
+----
+100

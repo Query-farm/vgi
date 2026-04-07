@@ -1,8 +1,13 @@
 #pragma once
 
+#include <chrono>
+#include <mutex>
+#include <unordered_map>
+
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/catalog/entry_lookup_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
+#include "duckdb/storage/statistics/base_statistics.hpp"
 #include "vgi_catalog_api.hpp"
 
 namespace duckdb {
@@ -42,9 +47,25 @@ private:
 	TableFunction GetScanFunctionImpl(ClientContext &context, unique_ptr<FunctionData> &bind_data,
 	                                  const string &at_unit, const string &at_value);
 
+	void FetchColumnStatistics(ClientContext &context) const;
+
 	vgi::VgiTableInfo table_info_;
 	Catalog &catalog_;
 	LogicalType rowid_type_ = LogicalType::INVALID;
+
+	// Column statistics cache: lazy-fetched via RPC, TTL-based expiry, thread-safe.
+	// Mutable because GetStatistics() is const in the DuckDB interface but we
+	// need to populate the cache on first access.
+	struct StatsCache {
+		std::mutex mutex;
+		std::unordered_map<std::string, unique_ptr<BaseStatistics>> entries;
+		bool fetched = false;
+		std::chrono::steady_clock::time_point fetched_at;
+		int64_t max_age_seconds = -1; // -1 = never expires, 0 = don't cache
+
+		bool IsStale() const;
+	};
+	mutable StatsCache stats_cache_;
 };
 
 } // namespace duckdb

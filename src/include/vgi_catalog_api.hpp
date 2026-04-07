@@ -5,6 +5,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <arrow/api.h>
@@ -12,6 +13,7 @@
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/function/aggregate_state.hpp"
 #include "duckdb/function/function.hpp"
+#include "duckdb/storage/statistics/base_statistics.hpp"
 #include "vgi_rpc_types.hpp"
 
 #include "duckdb/common/enums/on_create_conflict.hpp"
@@ -118,6 +120,7 @@ struct CatalogAttachResult {
 	std::vector<VgiSecretType> secret_types;      // Secret types exposed by this catalog
 	std::string comment;                          // Optional comment describing this catalog
 	std::map<std::string, std::string> tags;      // Optional key-value tags for this catalog
+	bool supports_column_statistics = false;      // Whether any tables provide column statistics
 };
 
 // Schema metadata from the worker
@@ -158,6 +161,9 @@ struct VgiTableInfo {
 	bool supports_insert = false;
 	bool supports_update = false;
 	bool supports_delete = false;
+
+	// Column statistics capability — indicates this table can provide column-level statistics
+	bool supports_column_statistics = false;
 };
 
 // View metadata from the worker
@@ -598,6 +604,26 @@ void InvokeCatalogSchemaDrop(
     const std::string &schema_name, bool ignore_not_found, bool cascade,
     const std::vector<uint8_t> &transaction_id,
     ClientContext &context, bool worker_debug = false, bool use_pool = true);
+
+// ============================================================================
+// Column Statistics
+// ============================================================================
+
+// Invoke catalog_table_column_statistics_get: fetch column statistics for a table.
+// Returns a map from column_name to BaseStatistics, empty map on failure.
+// Also returns the cache_max_age_seconds via the output parameter (-1 = cache forever).
+struct ColumnStatisticsRpcResult {
+	std::unordered_map<std::string, unique_ptr<BaseStatistics>> stats;
+	int64_t cache_max_age_seconds = -1;  // -1 = cache forever, 0 = don't cache
+};
+
+ColumnStatisticsRpcResult InvokeCatalogTableColumnStatisticsGet(
+    const std::string &worker_path, const std::vector<uint8_t> &attach_id,
+    const std::string &schema_name, const std::string &table_name,
+    const std::vector<LogicalType> &column_types,
+    const std::vector<std::string> &column_names,
+    ClientContext &context, const std::vector<uint8_t> &transaction_id,
+    bool worker_debug = false, bool use_pool = true);
 
 // ============================================================================
 // Table Function Cardinality

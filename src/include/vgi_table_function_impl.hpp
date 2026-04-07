@@ -345,5 +345,10 @@ vector<column_t> VgiTableScanGetRowIdColumns(ClientContext &context, optional_pt
 //! set_scan_order callback - captures ORDER BY + LIMIT hint from RowGroupPruner optimizer
 void VgiSetScanOrder(unique_ptr<RowGroupOrderOptions> order_options, optional_ptr<FunctionData> bind_data_p);
 
+//! Statistics callback - returns column statistics from VgiTableEntry (for catalog scans)
+//! or nullptr (for direct vgi_table_function calls)
+unique_ptr<BaseStatistics> VgiTableFunctionStatistics(ClientContext &context, const FunctionData *bind_data_p,
+                                                       column_t column_index);
+
 } // namespace vgi
 } // namespace duckdb

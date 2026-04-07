@@ -25,6 +25,15 @@ std::vector<uint8_t> SerializeToIpcBytes(const std::shared_ptr<arrow::RecordBatc
 std::shared_ptr<arrow::RecordBatch> DeserializeFromIpcBytes(const std::vector<uint8_t> &bytes);
 std::shared_ptr<arrow::RecordBatch> DeserializeFromIpcBytes(const uint8_t *data, size_t len);
 
+// Deserialized batch with optional custom metadata from the IPC message.
+struct DeserializedBatch {
+	std::shared_ptr<arrow::RecordBatch> batch;
+	std::shared_ptr<arrow::KeyValueMetadata> custom_metadata;
+};
+
+// Deserialize a RecordBatch from IPC bytes, preserving custom metadata.
+DeserializedBatch DeserializeFromIpcBytesWithMetadata(const uint8_t *data, size_t len);
+
 // Serialize an Arrow Schema to IPC bytes.
 std::vector<uint8_t> SerializeSchemaToIpcBytes(const std::shared_ptr<arrow::Schema> &schema);
 
@@ -245,6 +254,12 @@ std::shared_ptr<arrow::RecordBatch> BuildTableScanFunctionGetParams(
 // Build params batch for catalog_table_{insert,update,delete}_function_get:
 //   attach_id, schema_name, name, transaction_id
 std::shared_ptr<arrow::RecordBatch> BuildWriteFunctionGetParams(
+    const std::vector<uint8_t> &attach_id, const std::string &schema_name,
+    const std::string &name, const std::vector<uint8_t> &transaction_id = {});
+
+// Build params batch for catalog_table_column_statistics_get:
+//   attach_id, schema_name, name, transaction_id
+std::shared_ptr<arrow::RecordBatch> BuildTableColumnStatisticsGetParams(
     const std::vector<uint8_t> &attach_id, const std::string &schema_name,
     const std::string &name, const std::vector<uint8_t> &transaction_id = {});
 

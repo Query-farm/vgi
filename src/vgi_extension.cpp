@@ -32,6 +32,7 @@
 #include "vgi_table_function_impl.hpp"
 #include "vgi_transport.hpp"
 #include "vgi_worker_pool.hpp"
+#include "vgi_table_statistics_function.hpp"
 #include "vgi_worker_pool_functions.hpp"
 
 #include "duckdb/catalog/catalog_transaction.hpp"
@@ -745,6 +746,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	vgi::RegisterVgiWorkerPoolFunction(loader);
 	vgi::RegisterVgiWorkerPoolStatsFunction(loader);
 	vgi::RegisterVgiWorkerPoolFlushFunction(loader);
+
+	// Register table statistics diagnostic function
+	vgi::RegisterVgiTableStatisticsFunction(loader);
 
 	// Register OAuth diagnostic/management functions
 	{

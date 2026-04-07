@@ -5,6 +5,7 @@
 #include "vgi_logging.hpp"
 #include "vgi_protocol.hpp"
 
+#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/arrow/arrow_appender.hpp"
 #include "duckdb/common/arrow/arrow_converter.hpp"
 #include "duckdb/common/exception.hpp"
@@ -1459,6 +1460,23 @@ void VgiSetScanOrder(unique_ptr<RowGroupOrderOptions> order_options, optional_pt
 	    std::move(null_order),
 	    row_limit
 	};
+}
+
+// ============================================================================
+// Statistics Callback — returns column statistics from VgiTableEntry
+// ============================================================================
+
+unique_ptr<BaseStatistics> VgiTableFunctionStatistics(ClientContext &context, const FunctionData *bind_data_p,
+                                                       column_t column_index) {
+	auto &bind_data = bind_data_p->Cast<VgiTableFunctionBindData>();
+	// For catalog-backed scans, delegate to VgiTableEntry::GetStatistics
+	if (bind_data.table_entry) {
+		// table_entry is optional_ptr<const TableCatalogEntry>; GetStatistics is non-const
+		auto &entry = const_cast<TableCatalogEntry &>(*bind_data.table_entry);
+		return entry.GetStatistics(context, column_index);
+	}
+	// For direct vgi_table_function() calls: no statistics available
+	return nullptr;
 }
 
 } // namespace vgi

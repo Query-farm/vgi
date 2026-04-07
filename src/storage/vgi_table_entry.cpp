@@ -11,6 +11,7 @@
 #include "storage/vgi_catalog.hpp"
 #include "storage/vgi_transaction.hpp"
 #include "vgi_catalog_api.hpp"
+#include "vgi_logging.hpp"
 #include "vgi_table_function_impl.hpp"
 #include "vgi_worker_pool.hpp"
 
@@ -27,8 +28,93 @@ VgiTableEntry::VgiTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, Creat
 VgiTableEntry::~VgiTableEntry() = default;
 
 unique_ptr<BaseStatistics> VgiTableEntry::GetStatistics(ClientContext &context, column_t column_id) {
-	// No statistics available for VGI tables
+	if (column_id == COLUMN_IDENTIFIER_ROW_ID || column_id == COLUMN_IDENTIFIER_EMPTY) {
+		return nullptr;
+	}
+
+	// Check catalog-level capability flag
+	auto &vgi_catalog = catalog_.Cast<VgiCatalog>();
+	auto &attach_result = vgi_catalog.attach_result();
+	if (!attach_result->supports_column_statistics) {
+		return nullptr;
+	}
+
+	// Check table-level capability flag
+	if (!table_info_.supports_column_statistics) {
+		return nullptr;
+	}
+
+	// Map column_id to column name before acquiring lock
+	auto &columns = GetColumns();
+	if (column_id >= columns.PhysicalColumnCount()) {
+		return nullptr;
+	}
+	auto &col_def = columns.GetColumn(PhysicalIndex(column_id));
+	auto column_name = col_def.GetName();
+
+	// Thread-safe lazy fetch + lookup under single lock scope
+	std::lock_guard<std::mutex> lock(stats_cache_.mutex);
+	if (stats_cache_.IsStale()) {
+		FetchColumnStatistics(context);
+	}
+
+	auto it = stats_cache_.entries.find(column_name);
+	if (it != stats_cache_.entries.end() && it->second) {
+		return it->second->ToUnique();
+	}
 	return nullptr;
+}
+
+bool VgiTableEntry::StatsCache::IsStale() const {
+	if (!fetched) {
+		return true;
+	}
+	if (max_age_seconds < 0) {
+		return false; // Never expires
+	}
+	if (max_age_seconds == 0) {
+		return true; // Always re-fetch
+	}
+	auto elapsed = std::chrono::steady_clock::now() - fetched_at;
+	return elapsed > std::chrono::seconds(max_age_seconds);
+}
+
+void VgiTableEntry::FetchColumnStatistics(ClientContext &context) const {
+	auto &vgi_catalog = catalog_.Cast<VgiCatalog>();
+	auto &attach_params = vgi_catalog.attach_parameters();
+	auto &attach_result_data = vgi_catalog.attach_result();
+
+	// Build column name/type vectors from the table's schema
+	auto &columns = GetColumns();
+	std::vector<LogicalType> col_types;
+	std::vector<std::string> col_names;
+	for (idx_t i = 0; i < columns.PhysicalColumnCount(); i++) {
+		auto &col = columns.GetColumn(PhysicalIndex(i));
+		col_types.push_back(col.GetType());
+		col_names.push_back(col.GetName());
+	}
+
+	auto &vgi_tx = VgiTransaction::Get(context, catalog_);
+
+	try {
+		auto rpc_result = vgi::InvokeCatalogTableColumnStatisticsGet(
+		    attach_params->worker_path(), attach_result_data->attach_id,
+		    ParentSchema().name, name, col_types, col_names,
+		    context, vgi_tx.GetTransactionId(),
+		    attach_params->worker_debug(), attach_params->use_pool());
+
+		stats_cache_.entries = std::move(rpc_result.stats);
+		stats_cache_.max_age_seconds = rpc_result.cache_max_age_seconds;
+	} catch (const std::exception &e) {
+		VGI_LOG(context, "column_statistics.fetch_error",
+		        {{"worker_path", attach_params->worker_path()},
+		         {"table", ParentSchema().name + "." + name},
+		         {"error", e.what()}});
+		stats_cache_.entries.clear();
+	}
+
+	stats_cache_.fetched = true;
+	stats_cache_.fetched_at = std::chrono::steady_clock::now();
 }
 
 TableFunction VgiTableEntry::GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data) {
@@ -142,6 +228,7 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 	func.to_string = vgi::VgiTableFunctionToString;
 	func.get_bind_info = vgi::VgiTableScanGetBindInfo;
 	func.set_scan_order = vgi::VgiSetScanOrder;
+	func.statistics = vgi::VgiTableFunctionStatistics;
 
 	// Set virtual column callbacks for row_id support
 	if (table_info_.row_id_column >= 0) {

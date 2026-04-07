@@ -131,6 +131,30 @@ std::shared_ptr<arrow::RecordBatch> DeserializeFromIpcBytes(const std::vector<ui
 	return DeserializeFromIpcBytes(bytes.data(), bytes.size());
 }
 
+DeserializedBatch DeserializeFromIpcBytesWithMetadata(const uint8_t *data, size_t len) {
+	auto alloc_result = arrow::AllocateBuffer(static_cast<int64_t>(len));
+	if (!alloc_result.ok()) {
+		throw IOException("Failed to allocate buffer for IPC deserialization: %s",
+		                  alloc_result.status().ToString());
+	}
+	auto buffer = std::shared_ptr<arrow::Buffer>(std::move(alloc_result).ValueUnsafe());
+	memcpy(const_cast<uint8_t *>(buffer->data()), data, len);
+	auto buffer_reader = std::make_shared<arrow::io::BufferReader>(buffer);
+	auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(buffer_reader);
+	if (!reader_result.ok()) {
+		throw IOException("Failed to open IPC stream from bytes: %s", reader_result.status().ToString());
+	}
+	auto reader = reader_result.ValueUnsafe();
+
+	// ReadNext() returns RecordBatchWithMetadata including custom metadata
+	auto result = reader->ReadNext();
+	if (!result.ok()) {
+		throw IOException("Failed to read batch from IPC bytes: %s", result.status().ToString());
+	}
+	auto bwm = result.ValueUnsafe();
+	return {bwm.batch, bwm.custom_metadata};
+}
+
 std::vector<uint8_t> SerializeSchemaToIpcBytes(const std::shared_ptr<arrow::Schema> &schema) {
 	auto serialize_result = arrow::ipc::SerializeSchema(*schema);
 	if (!serialize_result.ok()) {
@@ -914,6 +938,31 @@ std::shared_ptr<arrow::RecordBatch> BuildWriteFunctionGetParams(const std::vecto
                                                                  const std::string &schema_name,
                                                                  const std::string &name,
                                                                  const std::vector<uint8_t> &transaction_id) {
+	auto schema = arrow::schema({
+	    arrow::field("attach_id", arrow::binary(), false),
+	    arrow::field("schema_name", arrow::utf8(), false),
+	    arrow::field("name", arrow::utf8(), false),
+	    arrow::field("transaction_id", arrow::binary(), true),
+	});
+	std::vector<std::shared_ptr<arrow::Array>> arrays;
+
+	{
+		arrow::BinaryBuilder builder;
+		CheckStatus(builder.Append(attach_id.data(), attach_id.size()), "append attach_id");
+		arrays.push_back(FinishArray(builder, "attach_id"));
+	}
+	arrays.push_back(BuildStringScalar(schema_name));
+	arrays.push_back(BuildStringScalar(name));
+	arrays.push_back(BuildBinaryScalar(transaction_id));
+
+	return arrow::RecordBatch::Make(schema, 1, arrays);
+}
+
+std::shared_ptr<arrow::RecordBatch> BuildTableColumnStatisticsGetParams(const std::vector<uint8_t> &attach_id,
+                                                                         const std::string &schema_name,
+                                                                         const std::string &name,
+                                                                         const std::vector<uint8_t> &transaction_id) {
+	// Same fields as BuildWriteFunctionGetParams: attach_id, schema_name, name, transaction_id
 	auto schema = arrow::schema({
 	    arrow::field("attach_id", arrow::binary(), false),
 	    arrow::field("schema_name", arrow::utf8(), false),

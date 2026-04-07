@@ -20,6 +20,7 @@ SELECT table_name, comment
 FROM duckdb_tables()
 WHERE database_name = 'example' AND schema_name = 'data'
   AND comment IS NOT NULL
+  AND table_name != 'geo_points'  -- geo_points requires spatial extension
 ORDER BY table_name;
 ----
 departments	Department reference table
@@ -36,6 +37,7 @@ rowid_string	Table with string row_id
 rowid_struct	Table with struct row_id
 versioned_constraints	Table with constraints that evolve across versions
 versioned_data	Versioned data table demonstrating time travel with schema evolution
+volatile_numbers	Numbers with volatile stats (TTL=0, always re-fetched)
 
 # ============================================================================
 # View comments (via duckdb_views)

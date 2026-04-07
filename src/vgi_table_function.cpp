@@ -76,6 +76,7 @@ void RegisterVgiTableFunction(ExtensionLoader &loader) {
 		func.table_scan_progress = vgi::VgiTableFunctionProgress;
 		func.to_string = vgi::VgiTableFunctionToString;
 		func.set_scan_order = vgi::VgiSetScanOrder;
+		func.statistics = vgi::VgiTableFunctionStatistics;
 	};
 
 	// Overload 1: vgi_table_function(worker_path, function_name, positional_args)
