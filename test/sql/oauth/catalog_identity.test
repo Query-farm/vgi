@@ -1,0 +1,74 @@
+# name: test/sql/oauth/catalog_identity.test
+# description: test vgi_catalog_identity() table function
+# group: [vgi]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+# ============================================================================
+# Schema: the function takes no arguments and returns 8 columns. The last
+# column is a JSON blob carrying the raw decoded JWT payload so downstream
+# SQL can reach provider-specific claims (Entra preferred_username/oid/tid,
+# group/role arrays, custom attributes) via JSON path expressions.
+# ============================================================================
+
+query IIIIIIII
+SELECT * FROM vgi_catalog_identity() LIMIT 0;
+----
+
+query IIIIII
+DESCRIBE SELECT * FROM vgi_catalog_identity() LIMIT 0;
+----
+catalog_name	VARCHAR	YES	NULL	NULL	NULL
+origin	VARCHAR	YES	NULL	NULL	NULL
+authenticated	BOOLEAN	YES	NULL	NULL	NULL
+sub	VARCHAR	YES	NULL	NULL	NULL
+email	VARCHAR	YES	NULL	NULL	NULL
+name	VARCHAR	YES	NULL	NULL	NULL
+issuer	VARCHAR	YES	NULL	NULL	NULL
+claims	JSON	YES	NULL	NULL	NULL
+
+# ============================================================================
+# With no attached VGI catalogs, the function returns 0 rows
+# ============================================================================
+
+query I
+SELECT count(*) FROM vgi_catalog_identity();
+----
+0
+
+# ============================================================================
+# After attaching a subprocess VGI catalog (no OAuth), a row appears with
+# authenticated=false and NULL identity fields
+# ============================================================================
+
+statement ok
+ATTACH 'example' AS vgi_identity_test (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+query I
+SELECT count(*) FROM vgi_catalog_identity() WHERE catalog_name = 'vgi_identity_test';
+----
+1
+
+query IIIIIIII
+SELECT authenticated, sub, email, name, issuer, claims, origin IS NOT NULL, claims IS NULL
+FROM vgi_catalog_identity()
+WHERE catalog_name = 'vgi_identity_test';
+----
+false	NULL	NULL	NULL	NULL	NULL	true	true
+
+# Filter by catalog name works
+query I
+SELECT count(*) FROM vgi_catalog_identity() WHERE catalog_name = 'no_such_catalog';
+----
+0
+
+statement ok
+DETACH vgi_identity_test;
+
+# After detach, the catalog no longer appears
+query I
+SELECT count(*) FROM vgi_catalog_identity() WHERE catalog_name = 'vgi_identity_test';
+----
+0

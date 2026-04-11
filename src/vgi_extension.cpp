@@ -8,7 +8,9 @@
 #include <signal.h>
 
 #include "duckdb.hpp"
+#include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/config.hpp"
+#include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/extension_helper.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
 #include "duckdb/parser/parsed_data/attach_info.hpp"
@@ -627,6 +629,114 @@ static void OAuthTokensFunction(ClientContext &context, TableFunctionInput &inpu
 	output.SetCardinality(count);
 }
 
+//===--------------------------------------------------------------------===//
+// vgi_catalog_identity() table function
+//===--------------------------------------------------------------------===//
+//
+// Emits one row per attached VGI catalog showing the OIDC identity parsed
+// from the OAuth id_token (if any). Catalogs without OAuth state appear
+// with authenticated=false and NULL identity fields.
+
+struct CatalogIdentityState : public GlobalTableFunctionState {
+	struct IdentityRow {
+		std::string catalog_name;
+		std::string origin;
+		bool authenticated = false;
+		bool has_identity = false;
+		std::string sub;
+		std::string email;
+		std::string name;
+		std::string issuer;
+		std::string claims_json;  // empty when no id_token was parsed
+	};
+	std::vector<IdentityRow> rows;
+	idx_t offset = 0;
+};
+
+static unique_ptr<FunctionData> CatalogIdentityBind(ClientContext &context, TableFunctionBindInput &input,
+                                                    vector<LogicalType> &return_types, vector<string> &names) {
+	return_types.push_back(LogicalType::VARCHAR);
+	names.push_back("catalog_name");
+	return_types.push_back(LogicalType::VARCHAR);
+	names.push_back("origin");
+	return_types.push_back(LogicalType::BOOLEAN);
+	names.push_back("authenticated");
+	return_types.push_back(LogicalType::VARCHAR);
+	names.push_back("sub");
+	return_types.push_back(LogicalType::VARCHAR);
+	names.push_back("email");
+	return_types.push_back(LogicalType::VARCHAR);
+	names.push_back("name");
+	return_types.push_back(LogicalType::VARCHAR);
+	names.push_back("issuer");
+	// Raw decoded JWT payload — provider-specific claims (Entra preferred_username/oid/tid,
+	// group/role arrays, custom attributes) reachable via JSON path expressions.
+	return_types.push_back(LogicalType::JSON());
+	names.push_back("claims");
+	return nullptr;
+}
+
+static unique_ptr<GlobalTableFunctionState> CatalogIdentityInit(ClientContext &context, TableFunctionInitInput &input) {
+	auto state = make_uniq<CatalogIdentityState>();
+	auto &token_mgr = vgi::VgiTokenManager::Instance();
+
+	auto databases = DatabaseManager::Get(context).GetDatabases(context);
+	for (auto &db : databases) {
+		auto &catalog = db->GetCatalog();
+		if (catalog.GetCatalogType() != "vgi") {
+			continue;
+		}
+		auto &vgi_catalog = catalog.Cast<VgiCatalog>();
+		const auto &params = vgi_catalog.attach_parameters();
+		if (!params) {
+			continue;
+		}
+
+		CatalogIdentityState::IdentityRow row;
+		row.catalog_name = catalog.GetName();
+		row.origin = vgi::VgiTokenManager::ExtractOrigin(params->worker_path());
+
+		vgi::OAuthTokenSet token_copy;
+		if (token_mgr.GetTokenSetCopy(row.origin, token_copy)) {
+			row.authenticated = token_copy.IsValid();
+			if (token_copy.identity.present) {
+				row.has_identity = true;
+				row.sub = token_copy.identity.sub;
+				row.email = token_copy.identity.email;
+				row.name = token_copy.identity.name;
+				row.issuer = token_copy.identity.issuer;
+				row.claims_json = token_copy.identity.claims_json;
+			}
+		}
+
+		state->rows.push_back(std::move(row));
+	}
+
+	return std::move(state);
+}
+
+static void CatalogIdentityFunction(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
+	auto &state = input.global_state->Cast<CatalogIdentityState>();
+	idx_t count = 0;
+	while (state.offset < state.rows.size() && count < STANDARD_VECTOR_SIZE) {
+		auto &row = state.rows[state.offset];
+		output.SetValue(0, count, Value(row.catalog_name));
+		output.SetValue(1, count, Value(row.origin));
+		output.SetValue(2, count, Value::BOOLEAN(row.authenticated));
+		output.SetValue(3, count, row.has_identity && !row.sub.empty() ? Value(row.sub) : Value());
+		output.SetValue(4, count, row.has_identity && !row.email.empty() ? Value(row.email) : Value());
+		output.SetValue(5, count, row.has_identity && !row.name.empty() ? Value(row.name) : Value());
+		output.SetValue(6, count, row.has_identity && !row.issuer.empty() ? Value(row.issuer) : Value());
+		// The claims column is typed JSON — DuckDB stores JSON as VARCHAR with an alias,
+		// so a plain Value(string) lands correctly and returns as JSON on read.
+		output.SetValue(7, count,
+		                row.has_identity && !row.claims_json.empty() ? Value(row.claims_json) : Value());
+		state.offset++;
+		count++;
+	}
+	output.SetCardinality(count);
+}
+
 static void LoadInternal(ExtensionLoader &loader) {
 	// Ignore SIGPIPE - we handle broken pipes via EPIPE error from write()
 	// This prevents the process from being killed when a worker dies unexpectedly
@@ -833,6 +943,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 		// vgi_oauth_tokens()
 		TableFunction tokens_func("vgi_oauth_tokens", {}, OAuthTokensFunction, OAuthTokensBind, OAuthTokensInit);
 		loader.RegisterFunction(tokens_func);
+
+		// vgi_catalog_identity() — surfaces OIDC identity claims per attached VGI catalog
+		TableFunction identity_func("vgi_catalog_identity", {}, CatalogIdentityFunction, CatalogIdentityBind,
+		                            CatalogIdentityInit);
+		loader.RegisterFunction(identity_func);
 	}
 }
 

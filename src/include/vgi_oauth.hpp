@@ -39,6 +39,25 @@ struct OAuthServerMetadata {
 	bool SupportsGrantType(const std::string &grant_type) const;
 };
 
+// Parsed OIDC id_token claims. Populated from the JWT payload at token
+// ingestion. Not cryptographically verified — the id_token arrived over TLS
+// from our own OAuth exchange, so we trust it as an identity hint, not a
+// security boundary.
+//
+// Only the universal OIDC claims (sub, iss, email, name) are lifted into
+// dedicated fields. Everything else — provider-specific claims like Entra's
+// preferred_username/oid/tid, Google's custom attributes, group/role arrays —
+// stays in claims_json verbatim so downstream SQL can reach it via JSON path
+// expressions without the extension needing to know each provider's quirks.
+struct OAuthIdentity {
+	bool present = false;     // true iff parse succeeded and payload was valid JSON
+	std::string sub;          // "sub" claim — subject / user id
+	std::string email;        // "email" claim
+	std::string name;         // "name" claim
+	std::string issuer;       // "iss" claim
+	std::string claims_json;  // Raw decoded JWT payload (valid JSON)
+};
+
 struct OAuthTokenSet {
 	std::string access_token;
 	std::string refresh_token;
@@ -46,6 +65,7 @@ struct OAuthTokenSet {
 	std::string scope;
 	std::chrono::steady_clock::time_point expires_at;
 	bool use_id_token = false; // If true, BearerToken() returns id_token instead of access_token
+	OAuthIdentity identity;    // Parsed claims from id_token (present=false if unavailable)
 
 	bool IsValid() const;
 	// Returns access_token by default; id_token if use_id_token is set
@@ -93,6 +113,10 @@ public:
 	};
 	bool GetTokenInfo(const std::string &origin, TokenInfo &info);
 
+	// Diagnostic: copy the full token set (including parsed identity) for an origin.
+	// Returns true iff the origin has a COMPLETE auth state. Thread-safe.
+	bool GetTokenSetCopy(const std::string &origin, OAuthTokenSet &out);
+
 	static std::string ExtractOrigin(const std::string &url);
 
 	// Seed a refresh token for an origin (e.g., from ATTACH oauth_refresh_token option).
@@ -137,6 +161,12 @@ std::string GenerateCodeVerifier();
 std::string ComputeCodeChallenge(const std::string &verifier);
 std::string GenerateState();
 std::string Base64UrlEncode(const unsigned char *data, size_t len);
+// Decodes a base64url-encoded string (RFC 4648 §5) — accepts missing padding.
+// Returns empty string on malformed input.
+std::string Base64UrlDecode(const std::string &input);
+// Parse an OIDC id_token JWT and extract identity claims. No signature
+// verification — see OAuthIdentity doc.
+OAuthIdentity ParseIdTokenClaims(const std::string &id_token);
 std::string UrlEncode(const std::string &str);
 void OpenBrowser(const std::string &url);
 

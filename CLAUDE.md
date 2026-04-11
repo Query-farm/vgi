@@ -147,6 +147,7 @@ Catalogs may register additional settings at `ATTACH` time (e.g., `greeting`, `m
 | `vgi_worker_pool_stats()` | Table | Diagnostic: hit/miss statistics by worker_path |
 | `vgi_worker_pool_flush()` | Scalar | Clear all pooled workers (returns count flushed) |
 | `vgi_clear_cache()` | Table | Clear cached catalog metadata (schemas, tables, functions, statistics) for all attached VGI catalogs |
+| `vgi_catalog_identity()` | Table | OIDC identity per attached VGI catalog: `catalog_name`, `origin`, `authenticated`, `sub`, `email`, `name`, `issuer`, `claims` (JSON). Claims carry the full decoded id_token payload — reach provider-specific fields via e.g. `claims->>'$.preferred_username'` for Entra, `claims->>'$.hd'` for Google Workspace, etc. |
 
 ## Key Source Files
 

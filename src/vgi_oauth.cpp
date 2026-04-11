@@ -124,6 +124,106 @@ std::string Base64UrlEncode(const unsigned char *data, size_t len) {
 	return result;
 }
 
+std::string Base64UrlDecode(const std::string &input) {
+	// Map base64url alphabet -> value. Returns 0xFF for non-alphabet bytes.
+	auto val = [](unsigned char c) -> int {
+		if (c >= 'A' && c <= 'Z') return c - 'A';
+		if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+		if (c >= '0' && c <= '9') return c - '0' + 52;
+		if (c == '-' || c == '+') return 62;
+		if (c == '_' || c == '/') return 63;
+		return -1;
+	};
+
+	// Strip any accidental padding / whitespace
+	std::string clean;
+	clean.reserve(input.size());
+	for (unsigned char c : input) {
+		if (c == '=' || c == '\n' || c == '\r' || c == ' ' || c == '\t') continue;
+		clean.push_back(static_cast<char>(c));
+	}
+
+	std::string out;
+	out.reserve((clean.size() * 3) / 4);
+	uint32_t buf = 0;
+	int bits = 0;
+	for (unsigned char c : clean) {
+		int v = val(c);
+		if (v < 0) {
+			return ""; // malformed
+		}
+		buf = (buf << 6) | static_cast<uint32_t>(v);
+		bits += 6;
+		if (bits >= 8) {
+			bits -= 8;
+			out.push_back(static_cast<char>((buf >> bits) & 0xFF));
+		}
+	}
+	return out;
+}
+
+OAuthIdentity ParseIdTokenClaims(const std::string &id_token) {
+	// Not cryptographically verified — id_token arrived over TLS from our own OAuth exchange.
+	OAuthIdentity identity;
+	if (id_token.empty()) {
+		return identity;
+	}
+
+	// JWT = header.payload.signature — we only need the payload.
+	auto first_dot = id_token.find('.');
+	if (first_dot == std::string::npos) {
+		return identity;
+	}
+	auto second_dot = id_token.find('.', first_dot + 1);
+	if (second_dot == std::string::npos) {
+		return identity;
+	}
+	auto payload_b64 = id_token.substr(first_dot + 1, second_dot - first_dot - 1);
+	auto payload_json = Base64UrlDecode(payload_b64);
+	if (payload_json.empty()) {
+		return identity;
+	}
+
+	auto doc = yyjson_read(payload_json.c_str(), payload_json.size(), 0);
+	if (!doc) {
+		return identity;
+	}
+	// Manual RAII: YyjsonDocGuard is defined later in this file.
+	struct DocFree {
+		yyjson_doc *d;
+		~DocFree() { if (d) yyjson_doc_free(d); }
+	} doc_guard{doc};
+	auto root = yyjson_doc_get_root(doc);
+	if (!root || !yyjson_is_obj(root)) {
+		return identity;
+	}
+
+	// Lift the four universal OIDC claims into dedicated fields for SQL ergonomics.
+	auto sub = yyjson_obj_get(root, "sub");
+	if (sub && yyjson_is_str(sub)) {
+		identity.sub = yyjson_get_str(sub);
+	}
+	auto email = yyjson_obj_get(root, "email");
+	if (email && yyjson_is_str(email)) {
+		identity.email = yyjson_get_str(email);
+	}
+	auto name = yyjson_obj_get(root, "name");
+	if (name && yyjson_is_str(name)) {
+		identity.name = yyjson_get_str(name);
+	}
+	auto iss = yyjson_obj_get(root, "iss");
+	if (iss && yyjson_is_str(iss)) {
+		identity.issuer = yyjson_get_str(iss);
+	}
+
+	// Stash the raw decoded payload — caller exposes it as a JSON column so
+	// provider-specific claims (Entra preferred_username/oid/tid, group/role
+	// arrays, custom attributes) are reachable without hardcoding keys here.
+	identity.claims_json = payload_json;
+	identity.present = true;
+	return identity;
+}
+
 #ifdef __EMSCRIPTEN__
 // WASM: use duckdb-wasm js-stubs for crypto (Web Crypto random + JS SHA-256).
 // These are callable from side modules via standard WASM imports — no EM_ASM needed.
@@ -520,6 +620,7 @@ static OAuthTokenSet ParseTokenResponse(const std::string &json_body, const std:
 	auto it = yyjson_obj_get(root, "id_token");
 	if (it && yyjson_is_str(it)) {
 		tokens.id_token = yyjson_get_str(it);
+		tokens.identity = ParseIdTokenClaims(tokens.id_token);
 	}
 
 	auto sc = yyjson_obj_get(root, "scope");
@@ -1752,6 +1853,16 @@ bool VgiTokenManager::GetTokenInfo(const std::string &origin, TokenInfo &info) {
 		info.has_expires = false;
 		info.expires_in_seconds = 0;
 	}
+	return true;
+}
+
+bool VgiTokenManager::GetTokenSetCopy(const std::string &origin, OAuthTokenSet &out) {
+	std::lock_guard<std::mutex> lock(mutex_);
+	auto it = auth_states_.find(origin);
+	if (it == auth_states_.end() || it->second.status != AuthState::Status::COMPLETE) {
+		return false;
+	}
+	out = it->second.token;
 	return true;
 }
 
