@@ -1,0 +1,57 @@
+--- a/src/spatial/modules/gdal/gdal_module.cpp
++++ b/src/spatial/modules/gdal/gdal_module.cpp
+@@ -152,8 +152,13 @@ public:
+ 		return client_prefix + value;
+ 	}
+
++#if GDAL_VERSION_NUM >= GDAL_COMPUTE_VERSION(3, 10, 0)
++	VSIVirtualHandleUniquePtr Open(const char *gdal_file_path, const char *access, bool set_error,
++	                               CSLConstList /*papszoptions */) override {
++#else
+ 	VSIVirtualHandle *Open(const char *gdal_file_path, const char *access, bool set_error,
+ 	                       CSLConstList /*papszoptions */) override {
++#endif
+
+ 		// Strip the prefix to get the real file path
+ 		const auto real_file_path = StripPrefix(gdal_file_path);
+@@ -198,7 +203,11 @@ public:
+
+ 		try {
+ 			auto file = fs.OpenFile(real_file_path, flags | FileCompressionType::AUTO_DETECT);
++#if GDAL_VERSION_NUM >= GDAL_COMPUTE_VERSION(3, 10, 0)
++			return VSIVirtualHandleUniquePtr(new DuckDBFileHandle(std::move(file)));
++#else
+ 			return new DuckDBFileHandle(std::move(file));
++#endif
+
+ 		} catch (std::exception &ex) {
+
+@@ -293,8 +302,13 @@ public:
+ 		return result_len;
+ 	}
+
++#if GDAL_VERSION_NUM >= GDAL_COMPUTE_VERSION(3, 10, 0)
++	int Rename(const char *oldpath, const char *newpath, GDALProgressFunc, void*) override {
++		return -1;
++	}
++#else
+ 	int Rename(const char *oldpath, const char *newpath) override {
+ 		return -1;
+ 	}
++#endif
+
+ 	int Mkdir(const char *file_name, long n_mode) override {
+@@ -380,8 +394,13 @@ public:
+ 		return nullptr;
+ 	}
+
++#if GDAL_VERSION_NUM >= GDAL_COMPUTE_VERSION(3, 10, 0)
++	int Rmdir(const char *file_name, GDALProgressFunc, void*) override {
++		return -1;
++	}
++#else
+ 	int Rmdir(const char *file_name) override {
+ 		return -1;
+ 	}
++#endif
+ };
