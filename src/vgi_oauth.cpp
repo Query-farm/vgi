@@ -204,6 +204,19 @@ std::string UrlEncode(const std::string &str) {
 	return result;
 }
 
+// Render a secret for inclusion in debug error messages. We intentionally
+// log the ENTIRE value right now — debugging Microsoft Entra's AADSTS9002313
+// "Invalid request" wall needs to compare the actual bytes of the code,
+// code_verifier, refresh_token, etc. against the app registration and the
+// state stored on the VGI server. Redacted prefixes are not enough.
+//
+// This output only appears inside IOExceptions thrown on OAuth failure, so
+// it surfaces through the normal user-visible error path (shell modal) and
+// does NOT get written anywhere else.
+static std::string DebugSecret(const std::string &secret) {
+	return "(" + std::to_string(secret.size()) + " chars) " + secret;
+}
+
 //===--------------------------------------------------------------------===//
 // WWW-Authenticate Header Parsing
 //===--------------------------------------------------------------------===//
@@ -290,6 +303,20 @@ static void EnforceHttpsUrl(const std::string &url, const std::string &context_n
 	    url.substr(0, 16) != "http://localhost") {
 		throw IOException("VGI OAuth: %s URL must use HTTPS: %s", context_name, url);
 	}
+}
+
+// Join scopes_supported with spaces, falling back to "openid" when the
+// resource metadata didn't advertise any scopes.
+static std::string BuildScopeString(const OAuthResourceMetadata &resource_meta) {
+	if (resource_meta.scopes_supported.empty()) {
+		return "openid";
+	}
+	std::string scope_str;
+	for (size_t i = 0; i < resource_meta.scopes_supported.size(); i++) {
+		if (i > 0) scope_str += " ";
+		scope_str += resource_meta.scopes_supported[i];
+	}
+	return scope_str;
 }
 
 OAuthResourceMetadata FetchResourceMetadata(ClientContext &context, const std::string &url) {
@@ -584,8 +611,35 @@ static OAuthTokenSet ExchangeCodeForTokens(ClientContext &context,
 		body += "&client_secret=" + UrlEncode(client_secret);
 	}
 
-	auto resp = PostTokenRequest(context, token_endpoint, body, "token exchange");
-	return ParseTokenResponse(resp, "token response");
+	auto resp = PostTokenRequestRaw(context, token_endpoint, body);
+	if (resp.status_code != 200) {
+		// Surface the full request shape through the exception so IdP-specific
+		// failures (Microsoft Entra "AADSTS9002313: Invalid request") are
+		// diagnosable from the user-visible error alone — no JS console digging
+		// required. Secrets are logged in full here: `code` and `code_verifier`
+		// are single-use and already burned by this request, and the refresh
+		// flow needs comparable visibility.
+		throw IOException(
+		    "VGI OAuth: token exchange failed (HTTP %d): %s\n"
+		    "  request:\n"
+		    "    token_endpoint=%s\n"
+		    "    grant_type=authorization_code\n"
+		    "    code=%s\n"
+		    "    redirect_uri=%s\n"
+		    "    code_verifier=%s\n"
+		    "    client_id=%s\n"
+		    "    client_secret=%s\n"
+		    "  raw_body=%s",
+		    resp.status_code, resp.body,
+		    token_endpoint,
+		    DebugSecret(code),
+		    redirect_uri.empty() ? "<empty>" : redirect_uri,
+		    DebugSecret(code_verifier),
+		    client_id.empty() ? "<empty>" : client_id,
+		    client_secret.empty() ? "<not sent>" : DebugSecret(client_secret),
+		    body);
+	}
+	return ParseTokenResponse(resp.body, "token response");
 }
 
 //===--------------------------------------------------------------------===//
@@ -668,15 +722,7 @@ OAuthTokenSet VgiTokenManager::PerformDeviceCodeFlow(const OAuthChallenge &chall
 	}
 
 	// Build scope string
-	std::string scope_str;
-	if (!resource_meta.scopes_supported.empty()) {
-		for (size_t i = 0; i < resource_meta.scopes_supported.size(); i++) {
-			if (i > 0) scope_str += " ";
-			scope_str += resource_meta.scopes_supported[i];
-		}
-	} else {
-		scope_str = "openid";
-	}
+	std::string scope_str = BuildScopeString(resource_meta);
 
 	// Step 1: POST to device_authorization_endpoint
 	EnforceHttpsUrl(server_meta.device_authorization_endpoint, "device authorization endpoint");
@@ -916,17 +962,7 @@ OAuthTokenSet VgiTokenManager::PerformAuthFlow(const OAuthChallenge &challenge,
 	refresh_ctx_out.client_secret = resource_meta.client_secret;
 	refresh_ctx_out.use_id_token = resource_meta.use_id_token_as_bearer;
 	refresh_ctx_out.resource_metadata_url = challenge.resource_metadata_url;
-	// Build scope string
-	if (!resource_meta.scopes_supported.empty()) {
-		std::string scope_str;
-		for (size_t i = 0; i < resource_meta.scopes_supported.size(); i++) {
-			if (i > 0) scope_str += " ";
-			scope_str += resource_meta.scopes_supported[i];
-		}
-		refresh_ctx_out.scope = scope_str;
-	} else {
-		refresh_ctx_out.scope = "openid";
-	}
+	refresh_ctx_out.scope = BuildScopeString(resource_meta);
 
 	bool has_device_ep = !server_meta.device_authorization_endpoint.empty() &&
 	                     server_meta.SupportsGrantType("urn:ietf:params:oauth:grant-type:device_code");
@@ -1211,18 +1247,7 @@ OAuthTokenSet VgiTokenManager::PerformPKCEFlow(const OAuthChallenge &challenge,
 	    "&state=" + UrlEncode(state);
 
 	// Add scopes
-	{
-		std::string scope_str;
-		if (!resource_meta.scopes_supported.empty()) {
-			for (size_t i = 0; i < resource_meta.scopes_supported.size(); i++) {
-				if (i > 0) scope_str += " ";
-				scope_str += resource_meta.scopes_supported[i];
-			}
-		} else {
-			scope_str = "openid";
-		}
-		auth_url += "&scope=" + UrlEncode(scope_str);
-	}
+	auth_url += "&scope=" + UrlEncode(BuildScopeString(resource_meta));
 
 	DUCKDB_LOG_WARNING(context, "Authentication required for " + GetResourceDisplayName(resource_meta) +
 	    ". Opening browser...");
@@ -1363,18 +1388,7 @@ OAuthTokenSet VgiTokenManager::PerformPKCEFlow(const OAuthChallenge &challenge,
 	    "&state=" + UrlEncode(state);
 
 	// Add scopes (default to "openid" if resource metadata doesn't specify any)
-	{
-		std::string scope_str;
-		if (!resource_meta.scopes_supported.empty()) {
-			for (size_t i = 0; i < resource_meta.scopes_supported.size(); i++) {
-				if (i > 0) scope_str += " ";
-				scope_str += resource_meta.scopes_supported[i];
-			}
-		} else {
-			scope_str = "openid";
-		}
-		auth_url += "&scope=" + UrlEncode(scope_str);
-	}
+	auth_url += "&scope=" + UrlEncode(BuildScopeString(resource_meta));
 
 	// NOTE: Do NOT add a &resource= parameter here. The resource parameter is
 	// an OAuth 1.0/v1.0 concept (used by Azure AD v1.0 endpoints) and conflicts
@@ -1489,16 +1503,7 @@ OAuthRefreshContext VgiTokenManager::DiscoverRefreshContext(const OAuthChallenge
 	ctx.client_secret = resource_meta.client_secret;
 	ctx.use_id_token = resource_meta.use_id_token_as_bearer;
 	ctx.resource_metadata_url = challenge.resource_metadata_url;
-	if (!resource_meta.scopes_supported.empty()) {
-		std::string scope_str;
-		for (size_t i = 0; i < resource_meta.scopes_supported.size(); i++) {
-			if (i > 0) scope_str += " ";
-			scope_str += resource_meta.scopes_supported[i];
-		}
-		ctx.scope = scope_str;
-	} else {
-		ctx.scope = "openid";
-	}
+	ctx.scope = BuildScopeString(resource_meta);
 	return ctx;
 }
 
@@ -1590,20 +1595,34 @@ std::string VgiTokenManager::HandleUnauthorized(const std::string &origin,
 					lock.lock();
 					return StoreAndPersist(std::move(tokens), refresh_ctx);
 				} catch (const std::exception &e) {
-					VGI_STDERR_DEBUG("[VGI] oauth.refresh_failed origin=%s error=%s\n",
-					                 origin.c_str(), e.what());
-					// Remove stale persisted token on invalid_grant (revoked/expired)
+					// Do NOT silently fall through to PerformAuthFlow. Previously
+					// this caught refresh failures and tried interactive auth,
+					// which in WASM/cupola always hits a broken code-exchange
+					// path (cupola's origin isn't a registered OAuth client).
+					// The fall-through masked the real refresh error behind a
+					// misleading "token exchange failed" message.
+					//
+					// Rethrow immediately so the caller sees the actual refresh
+					// failure — including the full request body, token endpoint,
+					// and redacted refresh_token details from AttemptTokenRefresh's
+					// enriched IOException. On invalid_grant, also clean up any
+					// persisted stale token on the way out.
 					std::string refresh_err = e.what();
 					if (refresh_err.find("invalid_grant") != std::string::npos) {
 						VGI_STDERR_DEBUG("[VGI] oauth.removing_stale_persisted_token origin=%s\n",
 						                 origin.c_str());
 						try { RemovePersistedToken(context, origin); } catch (...) {}
 					}
+					lock.lock();
+					StoreFailed(refresh_err);
+					throw;
 				}
 			}
 		}
 
-		// Full auth flow
+		// Full auth flow — only reached when no refresh_token was available
+		// to try in the first place (neither seeded via ATTACH nor loaded
+		// from persistent storage).
 		try {
 			OAuthRefreshContext new_refresh_ctx;
 			auto tokens = PerformAuthFlow(challenge, context, new_refresh_ctx);
@@ -1757,8 +1776,32 @@ OAuthTokenSet VgiTokenManager::AttemptTokenRefresh(const OAuthRefreshContext &ct
 
 	auto resp = PostTokenRequestRaw(context, ctx.token_endpoint, body);
 	if (resp.status_code != 200) {
-		throw IOException("VGI OAuth: token refresh failed (HTTP %d): %s",
-		                  resp.status_code, resp.body);
+		// Surface the full request shape through the exception. The IdP's
+		// "invalid_grant" / "AADSTS9002313" body doesn't tell you which
+		// parameter is wrong; the request shape does. Secrets are logged in
+		// full here — debugging visibility beats hygiene while we're still
+		// in "why does this never work" territory.
+		throw IOException(
+		    "VGI OAuth: token refresh failed (HTTP %d): %s\n"
+		    "  request:\n"
+		    "    token_endpoint=%s\n"
+		    "    grant_type=refresh_token\n"
+		    "    refresh_token=%s\n"
+		    "    client_id=%s\n"
+		    "    client_secret=%s\n"
+		    "    scope=%s\n"
+		    "    resource_metadata_url=%s\n"
+		    "    use_id_token_as_bearer=%s\n"
+		    "  raw_body=%s",
+		    resp.status_code, resp.body,
+		    ctx.token_endpoint,
+		    DebugSecret(refresh_token),
+		    ctx.client_id.empty() ? "<empty>" : ctx.client_id,
+		    ctx.client_secret.empty() ? "<not sent>" : DebugSecret(ctx.client_secret),
+		    ctx.scope.empty() ? "<not sent>" : ctx.scope,
+		    ctx.resource_metadata_url.empty() ? "<not set>" : ctx.resource_metadata_url,
+		    ctx.use_id_token ? "true" : "false",
+		    body);
 	}
 
 	auto tokens = ParseTokenResponse(resp.body, "refresh token response");
