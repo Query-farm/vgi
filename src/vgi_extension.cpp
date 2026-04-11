@@ -17,6 +17,9 @@
 #include "duckdb/optimizer/optimizer_extension.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/storage/storage_extension.hpp"
+#include "duckdb/common/arrow/arrow_type_extension.hpp"
+#include "duckdb/common/types/geometry.hpp"
+#include "duckdb/function/cast/cast_function_set.hpp"
 #include "query_farm_telemetry.hpp"
 #include "storage/vgi_catalog.hpp"
 #include "storage/vgi_transaction.hpp"
@@ -647,6 +650,72 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// Register VGI storage extension
 	auto &config = DBConfig::GetConfig(loader.GetDatabaseInstance());
 	StorageExtension::Register(config, "vgi", make_shared_ptr<VgiStorageExtension>());
+
+	// -------------------------------------------------------------------------
+	// Register native GeoArrow Arrow extension types
+	// -------------------------------------------------------------------------
+	// Enable round-tripping GEOMETRY through Arrow IPC as native struct/list
+	// layouts instead of opaque WKB blobs.  Each entry maps a GeoArrow
+	// extension name to a DuckDB struct type and a GeometryStorageType used
+	// by the spatial extension's Geometry::ToVectorizedFormat /
+	// FromVectorizedFormat for conversion.
+	//
+	// ArrowToDuck (worker → client): struct vector → GEOMETRY via cast
+	// DuckToArrow (client → worker): GEOMETRY → struct vector via ToVectorizedFormat
+	{
+		auto xy = LogicalType::STRUCT({{"x", LogicalType::DOUBLE}, {"y", LogicalType::DOUBLE}});
+
+		struct NativeGeoArrow {
+			static void ArrowToDuck(ClientContext &context, Vector &source, Vector &result, idx_t count) {
+				auto &cast_set = CastFunctionSet::Get(context);
+				GetCastFunctionInput cast_input(context);
+				auto info = cast_set.GetCastFunction(source.GetType(), result.GetType(), cast_input);
+				CastParameters params(info.cast_data.get(), false, nullptr, nullptr);
+				info.function(source, result, count, params);
+			}
+		};
+
+		// DuckToArrow closures per geometry storage type
+		// Each lambda captures the storage type for ToVectorizedFormat
+#define VGI_GEOARROW_DUCK_TO_ARROW(STORAGE_TYPE)                                                                       \
+	[](ClientContext &, Vector &source, Vector &result, idx_t count) {                                                 \
+		Geometry::ToVectorizedFormat(source, result, count, STORAGE_TYPE);                                              \
+	}
+
+		struct GeoArrowEntry {
+			const char *name;
+			LogicalType arrow_type;
+			cast_duck_arrow_t duck_to_arrow;
+		};
+
+		GeoArrowEntry entries[] = {
+		    {"geoarrow.point", xy,
+		     VGI_GEOARROW_DUCK_TO_ARROW(GeometryStorageType::POINT_XY)},
+		    {"geoarrow.linestring", LogicalType::LIST(xy),
+		     VGI_GEOARROW_DUCK_TO_ARROW(GeometryStorageType::LINESTRING_XY)},
+		    {"geoarrow.polygon", LogicalType::LIST(LogicalType::LIST(xy)),
+		     VGI_GEOARROW_DUCK_TO_ARROW(GeometryStorageType::POLYGON_XY)},
+		    {"geoarrow.multipoint", LogicalType::LIST(xy),
+		     VGI_GEOARROW_DUCK_TO_ARROW(GeometryStorageType::MULTIPOINT_XY)},
+		    {"geoarrow.multilinestring", LogicalType::LIST(LogicalType::LIST(xy)),
+		     VGI_GEOARROW_DUCK_TO_ARROW(GeometryStorageType::MULTILINESTRING_XY)},
+		    {"geoarrow.multipolygon", LogicalType::LIST(LogicalType::LIST(LogicalType::LIST(xy))),
+		     VGI_GEOARROW_DUCK_TO_ARROW(GeometryStorageType::MULTIPOLYGON_XY)},
+		};
+
+#undef VGI_GEOARROW_DUCK_TO_ARROW
+
+		for (auto &entry : entries) {
+			try {
+				config.RegisterArrowExtension(
+				    {entry.name, nullptr, nullptr,
+				     make_shared_ptr<ArrowTypeExtensionData>(LogicalType::GEOMETRY(), entry.arrow_type,
+				                                             NativeGeoArrow::ArrowToDuck, entry.duck_to_arrow)});
+			} catch (...) {
+				// Extension may already be registered (e.g., by spatial extension in a future version)
+			}
+		}
+	}
 
 	// Register catalog timeout setting (used for subprocess transport)
 	config.AddExtensionOption("vgi_catalog_timeout_seconds",
