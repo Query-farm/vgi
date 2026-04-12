@@ -26,11 +26,9 @@ VgiTableInOutBindData::~VgiTableInOutBindData() = default;
 
 unique_ptr<FunctionData> VgiTableInOutBindData::Copy() const {
 	auto copy = make_uniq<VgiTableInOutBindData>();
-	copy->worker_path = worker_path;
+	copy->attach_params = attach_params;
 	copy->attach_id = attach_id;
 	copy->transaction_id = transaction_id;
-	copy->worker_debug = worker_debug;
-	copy->use_pool = use_pool;
 	copy->function_name = function_name;
 	copy->settings = settings;
 	copy->arguments = arguments;
@@ -44,7 +42,7 @@ unique_ptr<FunctionData> VgiTableInOutBindData::Copy() const {
 
 bool VgiTableInOutBindData::Equals(const FunctionData &other_p) const {
 	auto &other = other_p.Cast<VgiTableInOutBindData>();
-	return worker_path == other.worker_path && function_name == other.function_name && attach_id == other.attach_id;
+	return worker_path() == other.worker_path() && function_name == other.function_name && attach_id == other.attach_id;
 }
 
 // ============================================================================
@@ -71,11 +69,9 @@ unique_ptr<FunctionData> VgiTableInOutBind(ClientContext &context, TableFunction
 	auto bind_data = make_uniq<VgiTableInOutBindData>();
 
 	// Copy connection parameters
-	bind_data->worker_path = params.worker_path;
+	bind_data->attach_params = params.attach_params;
 	bind_data->attach_id = params.attach_id;
 	bind_data->transaction_id = params.transaction_id;
-	bind_data->worker_debug = params.worker_debug;
-	bind_data->use_pool = params.use_pool;
 	bind_data->function_name = params.function_name;
 	bind_data->settings = params.settings;
 	bind_data->required_secrets = params.required_secrets;
@@ -102,7 +98,7 @@ unique_ptr<FunctionData> VgiTableInOutBind(ClientContext &context, TableFunction
 	bind_data->input_schema = BuildArrowSchemaFromDuckDB(context, input.input_table_types, input.input_table_names);
 
 	VGI_LOG(context, "table_in_out.bind",
-	        {{"worker_path", bind_data->worker_path},
+	        {{"worker_path", bind_data->worker_path()},
 	         {"function_name", bind_data->function_name},
 	         {"input_columns", std::to_string(input.input_table_types.size())}});
 
@@ -110,12 +106,12 @@ unique_ptr<FunctionData> VgiTableInOutBind(ClientContext &context, TableFunction
 	// Try pool first (only for subprocess transport)
 	std::unique_ptr<IFunctionConnection> connection;
 	bool from_pool = false;
-	if (bind_data->use_pool && !IsHttpTransport(bind_data->worker_path)) {
-		auto pooled = VgiWorkerPool::Instance().TryAcquire(bind_data->worker_path);
+	if (bind_data->use_pool() && !IsHttpTransport(bind_data->worker_path())) {
+		auto pooled = VgiWorkerPool::Instance().TryAcquire(bind_data->worker_path());
 		if (pooled) {
 			from_pool = true;
 			VGI_LOG(context, "table_in_out.pool_acquire",
-			        {{"worker_path", bind_data->worker_path},
+			        {{"worker_path", bind_data->worker_path()},
 			         {"function_name", bind_data->function_name},
 			         {"from_pool", "true"},
 			         {"pid", std::to_string(pooled->GetPid())}});
@@ -123,20 +119,20 @@ unique_ptr<FunctionData> VgiTableInOutBind(ClientContext &context, TableFunction
 			                                              bind_data->arguments, bind_data->attach_id,
 			                                              bind_data->transaction_id, context,
 			                                              "TABLE", std::vector<uint8_t>{},
-			                                              bind_data->worker_debug, bind_data->settings,
+			                                              bind_data->worker_debug(), bind_data->settings,
 			                                              bind_data->required_secrets);
 		}
 	}
 	if (!connection) {
-		connection = CreateFunctionConnection(bind_data->worker_path, bind_data->function_name,
+		connection = CreateFunctionConnection(bind_data->worker_path(), bind_data->function_name,
 		                                      bind_data->arguments, bind_data->attach_id,
 		                                      bind_data->transaction_id, context,
 		                                      "TABLE", std::vector<uint8_t>{},
-		                                      bind_data->worker_debug, bind_data->settings,
-		                                      bind_data->required_secrets);
+		                                      bind_data->worker_debug(), bind_data->settings,
+		                                      bind_data->required_secrets, bind_data->attach_params);
 		if (!from_pool) {
 			VGI_LOG(context, "table_in_out.pool_acquire",
-			        {{"worker_path", bind_data->worker_path},
+			        {{"worker_path", bind_data->worker_path()},
 			         {"function_name", bind_data->function_name},
 			         {"from_pool", "false"}});
 		}
@@ -161,7 +157,7 @@ unique_ptr<FunctionData> VgiTableInOutBind(ClientContext &context, TableFunction
 	bind_data->bind_connection = std::move(connection);
 
 	VGI_LOG(context, "table_in_out.bind_complete",
-	        {{"worker_path", bind_data->worker_path},
+	        {{"worker_path", bind_data->worker_path()},
 	         {"function_name", bind_data->function_name},
 	         {"output_columns", std::to_string(return_types.size())}});
 
@@ -193,7 +189,7 @@ unique_ptr<GlobalTableFunctionState> VgiTableInOutInitGlobal(ClientContext &cont
 	global_state->connection = std::move(connection);
 
 	VGI_LOG(context, "table_in_out.init_global",
-	        {{"worker_path", bind_data.worker_path}, {"function_name", bind_data.function_name}});
+	        {{"worker_path", bind_data.worker_path()}, {"function_name", bind_data.function_name}});
 
 	return global_state;
 }
@@ -257,7 +253,7 @@ OperatorResultType VgiTableInOutFunction(ExecutionContext &context, TableFunctio
 	if (HasRemainingBatchData(local_state)) {
 		idx_t rows_copied = ProduceOutputFromBatch(local_state, bind_data.arrow_table, output);
 		VGI_LOG(client_context, "table_in_out.read_output",
-		        {{"worker_path", bind_data.worker_path},
+		        {{"worker_path", bind_data.worker_path()},
 		         {"function_name", bind_data.function_name},
 		         {"output_rows", std::to_string(rows_copied)}});
 		return HasRemainingBatchData(local_state) ? OperatorResultType::HAVE_MORE_OUTPUT
@@ -268,7 +264,7 @@ OperatorResultType VgiTableInOutFunction(ExecutionContext &context, TableFunctio
 	auto input_batch = DataChunkToArrow(client_context, input, bind_data.input_schema);
 
 	VGI_LOG(client_context, "table_in_out.write_input",
-	        {{"worker_path", bind_data.worker_path},
+	        {{"worker_path", bind_data.worker_path()},
 	         {"function_name", bind_data.function_name},
 	         {"input_rows", std::to_string(input_batch->num_rows())}});
 
@@ -295,7 +291,7 @@ OperatorResultType VgiTableInOutFunction(ExecutionContext &context, TableFunctio
 	idx_t rows_copied = ProduceOutputFromBatch(local_state, bind_data.arrow_table, output);
 
 	VGI_LOG(client_context, "table_in_out.read_output",
-	        {{"worker_path", bind_data.worker_path},
+	        {{"worker_path", bind_data.worker_path()},
 	         {"function_name", bind_data.function_name},
 	         {"output_rows", std::to_string(rows_copied)}});
 
@@ -325,14 +321,14 @@ OperatorFinalizeResultType VgiTableInOutFinalize(ExecutionContext &context, Tabl
 		global_state.finalize_sent = true;
 
 		VGI_LOG(client_context, "table_in_out.finalize",
-		        {{"worker_path", bind_data.worker_path}, {"function_name", bind_data.function_name}});
+		        {{"worker_path", bind_data.worker_path()}, {"function_name", bind_data.function_name}});
 	}
 
 	// Continue producing rows from a batch that exceeded STANDARD_VECTOR_SIZE
 	if (HasRemainingBatchData(local_state)) {
 		idx_t rows_copied = ProduceOutputFromBatch(local_state, bind_data.arrow_table, output);
 		VGI_LOG(client_context, "table_in_out.finalize_output",
-		        {{"worker_path", bind_data.worker_path},
+		        {{"worker_path", bind_data.worker_path()},
 		         {"function_name", bind_data.function_name},
 		         {"output_rows", std::to_string(rows_copied)}});
 		// Always return HAVE_MORE_OUTPUT — next call will either continue this batch
@@ -342,16 +338,16 @@ OperatorFinalizeResultType VgiTableInOutFinalize(ExecutionContext &context, Tabl
 
 	// Read next output batch from worker
 	VGI_LOG(client_context, "table_in_out.finalize_reading",
-	        {{"worker_path", bind_data.worker_path}, {"function_name", bind_data.function_name}});
+	        {{"worker_path", bind_data.worker_path()}, {"function_name", bind_data.function_name}});
 	auto output_batch = global_state.connection->ReadDataBatch();
 
 	if (!output_batch || output_batch->num_rows() == 0) {
 		// No more output - clean up
-		if (bind_data.use_pool && global_state.connection && global_state.connection->CanBePooled()) {
+		if (bind_data.use_pool() && global_state.connection && global_state.connection->CanBePooled()) {
 			auto pooled = global_state.connection->ReleaseForPooling();
 			if (pooled) {
 				VGI_LOG(client_context, "table_in_out.pool_release",
-				        {{"worker_path", bind_data.worker_path},
+				        {{"worker_path", bind_data.worker_path()},
 				         {"function_name", bind_data.function_name},
 				         {"pid", std::to_string(pooled->GetPid())}});
 				VgiWorkerPool::Instance().Release(std::move(pooled));
@@ -365,17 +361,17 @@ OperatorFinalizeResultType VgiTableInOutFinalize(ExecutionContext &context, Tabl
 	idx_t rows_copied = ProduceOutputFromBatch(local_state, bind_data.arrow_table, output);
 
 	VGI_LOG(client_context, "table_in_out.finalize_output",
-	        {{"worker_path", bind_data.worker_path},
+	        {{"worker_path", bind_data.worker_path()},
 	         {"function_name", bind_data.function_name},
 	         {"output_rows", std::to_string(rows_copied)}});
 
 	// Check if worker is finished and we've exhausted the current batch
 	if (!HasRemainingBatchData(local_state) && global_state.connection->IsFinished()) {
-		if (bind_data.use_pool && global_state.connection->CanBePooled()) {
+		if (bind_data.use_pool() && global_state.connection->CanBePooled()) {
 			auto pooled = global_state.connection->ReleaseForPooling();
 			if (pooled) {
 				VGI_LOG(client_context, "table_in_out.pool_release",
-				        {{"worker_path", bind_data.worker_path},
+				        {{"worker_path", bind_data.worker_path()},
 				         {"function_name", bind_data.function_name},
 				         {"pid", std::to_string(pooled->GetPid())}});
 				VgiWorkerPool::Instance().Release(std::move(pooled));

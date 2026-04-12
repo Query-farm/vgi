@@ -36,11 +36,13 @@ HttpFunctionConnection::HttpFunctionConnection(
     ClientContext &context, const std::string &function_type,
     const std::vector<uint8_t> &global_execution_id,
     bool worker_debug, const std::map<std::string, Value> &settings,
-    const std::vector<VgiSecretRequirement> &required_secrets)
+    const std::vector<VgiSecretRequirement> &required_secrets,
+    const std::shared_ptr<VgiAttachParameters> &attach_params)
     : base_url_(worker_path), function_name_(function_name), function_type_(function_type),
       arguments_type_(arguments.type), arguments_array_(arguments.array), attach_id_(attach_id),
       transaction_id_(transaction_id), global_execution_id_(global_execution_id), context_(context),
-      worker_debug_(worker_debug), settings_(settings), required_secrets_(required_secrets) {
+      worker_debug_(worker_debug), settings_(settings), required_secrets_(required_secrets),
+      attach_params_(attach_params) {
 	// Strip trailing slash from base URL
 	if (!base_url_.empty() && base_url_.back() == '/') {
 		base_url_.pop_back();
@@ -226,7 +228,8 @@ BindResult HttpFunctionConnection::PerformBindFull() {
 	// Transport: send bind via HTTP
 	auto transport_fn = [&](const std::vector<uint8_t> &request_bytes) -> std::shared_ptr<arrow::RecordBatch> {
 		auto rpc_params = BuildBindRpcParams(request_bytes);
-		auto resp = HttpInvokeUnary(context_, base_url_, "bind", rpc_params);
+		auto auth = attach_params_ ? attach_params_->auth() : nullptr;
+		auto resp = HttpInvokeUnary(context_, base_url_, "bind", rpc_params, auth);
 		if (!resp.batch || resp.batch->num_rows() == 0) {
 			throw IOException("Empty bind response from HTTP server [url: %s]", base_url_);
 		}
@@ -327,7 +330,8 @@ InitResult HttpFunctionConnection::PerformInit(const std::vector<int32_t> &proje
 	         {"function_name", function_name_},
 	         {"phase", phase.empty() ? "default" : phase}});
 
-	auto response_body = HttpPostArrowIpc(context_, init_url, body);
+	auto auth = attach_params_ ? attach_params_->auth() : nullptr;
+	auto response_body = HttpPostArrowIpc(context_, init_url, body, auth);
 
 	// Parse response: header IPC stream + data IPC stream
 	auto header_result = ReadStreamHeaderFromBuffer(
@@ -470,7 +474,8 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 		VGI_LOG(context_, "http_function_connection.producer_exchange",
 		        {{"url", exchange_url}, {"function_name", function_name_}});
 
-		auto response_body = HttpPostArrowIpc(context_, exchange_url, body);
+		auto p_auth = attach_params_ ? attach_params_->auth() : nullptr;
+		auto response_body = HttpPostArrowIpc(context_, exchange_url, body, p_auth);
 
 		// Parse response — buffer new data batches
 		BufferDataBatches(response_body);
@@ -512,7 +517,8 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 	    static_cast<int64_t>(body.size()) > capabilities_.max_request_bytes &&
 	    capabilities_.upload_url_support) {
 		// Upload via server-vended URL, send pointer batch instead
-		auto urls = HttpRequestUploadUrls(context_, base_url_, 1);
+		auto e_auth = attach_params_ ? attach_params_->auth() : nullptr;
+		auto urls = HttpRequestUploadUrls(context_, base_url_, 1, e_auth);
 		if (!urls.empty()) {
 			HttpPutBytes(context_, urls[0].upload_url, body, false);
 			body = SerializePointerBatch(input_schema_, urls[0].download_url, stream_state_token_);
@@ -521,7 +527,8 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 
 	std::string exchange_url = base_url_ + "/init/exchange";
 
-	auto response_body = HttpPostArrowIpc(context_, exchange_url, body);
+	auto x_auth = attach_params_ ? attach_params_->auth() : nullptr;
+	auto response_body = HttpPostArrowIpc(context_, exchange_url, body, x_auth);
 
 	// Parse response — copy into owning buffer since Arrow IPC reads zero-copy reference it
 	auto buffer = arrow::Buffer::FromString(std::move(response_body));

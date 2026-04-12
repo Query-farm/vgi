@@ -11,6 +11,7 @@
 #include "duckdb/main/client_context.hpp"
 
 #include "vgi_arrow_utils.hpp"
+#include "vgi_catalog_api.hpp"
 #include "vgi_http_client.hpp"
 #include "vgi_ifunction_connection.hpp"
 #include "vgi_protocol.hpp"
@@ -36,7 +37,8 @@ public:
 	                       const std::vector<uint8_t> &global_execution_id = {},
 	                       bool worker_debug = false,
 	                       const std::map<std::string, Value> &settings = {},
-	                       const std::vector<VgiSecretRequirement> &required_secrets = {});
+	                       const std::vector<VgiSecretRequirement> &required_secrets = {},
+	                       const std::shared_ptr<VgiAttachParameters> &attach_params = nullptr);
 
 	~HttpFunctionConnection() override = default;
 
@@ -97,6 +99,7 @@ private:
 	bool worker_debug_;
 	std::map<std::string, Value> settings_;
 	std::vector<VgiSecretRequirement> required_secrets_;
+	std::shared_ptr<VgiAttachParameters> attach_params_;  // for auth()
 
 	// State tracking
 	bool bind_done_ = false;

@@ -49,7 +49,7 @@ void PerformVgiTableFunctionBind(ClientContext &context, VgiTableFunctionBindDat
                                  vector<LogicalType> &return_types, vector<string> &names) {
 	// Log the invocation
 	VGI_LOG(context, "table_function.bind",
-	        {{"worker_path", bind_data.worker_path},
+	        {{"worker_path", bind_data.worker_path()},
 	         {"function_name", bind_data.function_name},
 	         {"num_args", bind_data.arguments.array ? std::to_string(bind_data.arguments.array->length()) : "0"}});
 
@@ -59,11 +59,16 @@ void PerformVgiTableFunctionBind(ClientContext &context, VgiTableFunctionBindDat
 	// Create connection to worker and perform bind handshake.
 	// Connection is preserved in bind_data for reuse in InitGlobal.
 	// Uses helper that handles pool acquire and stale connection retry.
-	FunctionConnectionParams params(bind_data.worker_path, bind_data.function_name, bind_data.arguments,
-	                                bind_data.attach_id, bind_data.transaction_id,
-	                                {} /* primary worker, no global exec ID */,
-	                                bind_data.worker_debug, bind_data.settings, bind_data.use_pool, "bind", "TABLE",
-	                                bind_data.required_secrets);
+	FunctionConnectionParams params;
+	params.attach_params = bind_data.attach_params;
+	params.attach_id = bind_data.attach_id;
+	params.function_name = bind_data.function_name;
+	params.arguments = bind_data.arguments;
+	params.transaction_id = bind_data.transaction_id;
+	params.settings = bind_data.settings;
+	params.required_secrets = bind_data.required_secrets;
+	params.phase = "bind";
+	params.function_type = "TABLE";
 
 	auto result = AcquireAndBindConnection(context, params);
 	bind_data.bind_connection = std::move(result.connection);
@@ -100,7 +105,7 @@ void PerformVgiTableFunctionBind(ClientContext &context, VgiTableFunctionBindDat
 	bind_data.all_column_names = names;
 
 	VGI_LOG(context, "table_function.bind_result",
-	        {{"worker_path", bind_data.worker_path},
+	        {{"worker_path", bind_data.worker_path()},
 	         {"worker_pid", std::to_string(bind_data.bind_connection->GetPid())},
 	         {"function_name", bind_data.function_name},
 	         {"num_columns", std::to_string(bind_result.output_schema->num_fields())}});
@@ -786,7 +791,7 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 	SerializedFilters serialized_filters;
 	try {
 		serialized_filters =
-		    VgiSerializeFilters(context, input.column_ids, input.filters, bind_data.all_column_names, bind_data.worker_path);
+		    VgiSerializeFilters(context, input.column_ids, input.filters, bind_data.all_column_names, bind_data.worker_path());
 		if (serialized_filters.filter_bytes) {
 			VGI_LOG(context, "table_function.filters_serialized",
 			        {{"function_name", bind_data.function_name},
@@ -915,7 +920,7 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 	global_state->tick_filter_state = tick_filter_state;
 
 	VGI_LOG(context, "table_function.init_global",
-	        {{"worker_path", bind_data.worker_path},
+	        {{"worker_path", bind_data.worker_path()},
 	         {"worker_pid", std::to_string(global_state->primary_connection->GetPid())},
 	         {"function_name", bind_data.function_name},
 	         {"global_execution_id", BytesToHex(global_state->global_execution_id)},
@@ -952,7 +957,7 @@ unique_ptr<LocalTableFunctionState> VgiTableFunctionInitLocal(ExecutionContext &
 
 	auto current_chunk = make_uniq<ArrowArrayWrapper>();
 	auto local_state = make_uniq<VgiTableFunctionLocalState>(std::move(current_chunk), context.client,
-	                                                         bind_data.use_pool, bind_data.worker_path);
+	                                                         bind_data.attach_params);
 
 	// Set column_ids for ArrowToDuckDB projection support if function supports it
 	// This tells ArrowToDuckDB which columns to extract from the Arrow arrays
@@ -986,7 +991,7 @@ unique_ptr<LocalTableFunctionState> VgiTableFunctionInitLocal(ExecutionContext &
 	if (primary_connection) {
 		// Primary worker: use connection from bind phase
 		VGI_LOG(context.client, "table_function.init_local",
-		        {{"worker_path", bind_data.worker_path},
+		        {{"worker_path", bind_data.worker_path()},
 		         {"worker_pid", std::to_string(primary_connection->GetPid())},
 		         {"function_name", bind_data.function_name},
 		         {"global_execution_id", BytesToHex(global_state.global_execution_id)},
@@ -998,11 +1003,17 @@ unique_ptr<LocalTableFunctionState> VgiTableFunctionInitLocal(ExecutionContext &
 		// Uses helper that handles pool acquire and stale connection retry.
 		// The global_execution_id is passed via FunctionConnectionParams, and
 		// PerformInit includes it in the InitRequest automatically.
-		FunctionConnectionParams params(bind_data.worker_path, bind_data.function_name, bind_data.arguments,
-		                                bind_data.attach_id, bind_data.transaction_id,
-		                                global_state.global_execution_id, bind_data.worker_debug,
-		                                bind_data.settings, bind_data.use_pool, "init_local_secondary", "TABLE",
-		                                bind_data.required_secrets);
+		FunctionConnectionParams params;
+		params.attach_params = bind_data.attach_params;
+		params.attach_id = bind_data.attach_id;
+		params.function_name = bind_data.function_name;
+		params.arguments = bind_data.arguments;
+		params.transaction_id = bind_data.transaction_id;
+		params.global_execution_id = global_state.global_execution_id;
+		params.settings = bind_data.settings;
+		params.required_secrets = bind_data.required_secrets;
+		params.phase = "init_local_secondary";
+		params.function_type = "TABLE";
 
 		auto result = AcquireAndBindConnection(context.client, params);
 		local_state->connection = std::move(result.connection);
@@ -1011,7 +1022,7 @@ unique_ptr<LocalTableFunctionState> VgiTableFunctionInitLocal(ExecutionContext &
 		local_state->connection->PerformInit();
 
 		VGI_LOG(context.client, "table_function.init_local",
-		        {{"worker_path", bind_data.worker_path},
+		        {{"worker_path", bind_data.worker_path()},
 		         {"worker_pid", std::to_string(local_state->connection->GetPid())},
 		         {"function_name", bind_data.function_name},
 		         {"global_execution_id", BytesToHex(global_state.global_execution_id)},
@@ -1079,7 +1090,7 @@ static void UpdateDynamicFilterState(VgiTableFunctionGlobalState &global_state, 
 
 	// Serialize the merged filters
 	try {
-		auto serialized = VgiSerializeFilters(context, {}, &merged, bind_data.all_column_names, bind_data.worker_path);
+		auto serialized = VgiSerializeFilters(context, {}, &merged, bind_data.all_column_names, bind_data.worker_path());
 		if (serialized.filter_bytes) {
 			auto &fb = serialized.filter_bytes;
 			auto encoded = Blob::ToBase64(string_t(reinterpret_cast<const char *>(fb->data()),
@@ -1108,7 +1119,7 @@ static bool GetNextBatch(ClientContext &context, const VgiTableFunctionBindData 
 	if (!arrow_batch) {
 		local_state.done = true;
 		VGI_LOG(context, "table_function.scan_complete",
-		        {{"worker_path", bind_data.worker_path},
+		        {{"worker_path", bind_data.worker_path()},
 		         {"worker_pid", std::to_string(worker_pid)},
 		         {"function_name", bind_data.function_name}});
 		return false;
@@ -1126,7 +1137,7 @@ static bool GetNextBatch(ClientContext &context, const VgiTableFunctionBindData 
 	local_state.Reset();
 
 	VGI_LOG(context, "table_function.batch_received",
-	        {{"worker_path", bind_data.worker_path},
+	        {{"worker_path", bind_data.worker_path()},
 	         {"worker_pid", std::to_string(local_state.connection->GetPid())},
 	         {"function_name", bind_data.function_name},
 	         {"batch_rows", std::to_string(arrow_batch->num_rows())}});
@@ -1164,7 +1175,7 @@ static void ConsumePrefetchedBatch(ClientContext &context, const VgiTableFunctio
 	if (!arrow_batch) {
 		local_state.done = true;
 		VGI_LOG(context, "table_function.scan_complete",
-		        {{"worker_path", bind_data.worker_path},
+		        {{"worker_path", bind_data.worker_path()},
 		         {"worker_pid", std::to_string(local_state.connection->GetPid())},
 		         {"function_name", bind_data.function_name}});
 		return;
@@ -1178,7 +1189,7 @@ static void ConsumePrefetchedBatch(ClientContext &context, const VgiTableFunctio
 	local_state.Reset();
 
 	VGI_LOG(context, "table_function.batch_received",
-	        {{"worker_path", bind_data.worker_path},
+	        {{"worker_path", bind_data.worker_path()},
 	         {"worker_pid", std::to_string(local_state.connection->GetPid())},
 	         {"function_name", bind_data.function_name},
 	         {"batch_rows", std::to_string(arrow_batch->num_rows())}});
@@ -1320,14 +1331,16 @@ unique_ptr<NodeStatistics> VgiTableFunctionCardinality(ClientContext &context, c
 	if (!bind_data.cardinality_fetched && !bind_data.bind_request_bytes.empty()) {
 		bind_data.cardinality_fetched = true;
 		try {
-			auto result = InvokeTableFunctionCardinality(bind_data.worker_path, bind_data.bind_request_bytes,
-			                                             bind_data.bind_opaque_data, context, bind_data.worker_debug,
-			                                             bind_data.use_pool);
+			auto rpc_params = bind_data.attach_params ? bind_data.attach_params
+			    : std::make_shared<VgiAttachParameters>(bind_data.worker_path(), "", bind_data.worker_debug(), bind_data.use_pool());
+			CatalogRpcContext rpc_ctx{rpc_params, bind_data.attach_id, bind_data.transaction_id};
+			auto result = InvokeTableFunctionCardinality(rpc_ctx, bind_data.bind_request_bytes,
+			                                             bind_data.bind_opaque_data, context);
 			bind_data.cardinality_estimate = result.estimate;
 		} catch (const std::exception &e) {
 			// Not critical — continue with unknown cardinality
 			VGI_LOG(context, "table_function.cardinality_error",
-			        {{"worker_path", bind_data.worker_path},
+			        {{"worker_path", bind_data.worker_path()},
 			         {"function_name", bind_data.function_name},
 			         {"error", e.what()}});
 		}
@@ -1335,14 +1348,14 @@ unique_ptr<NodeStatistics> VgiTableFunctionCardinality(ClientContext &context, c
 
 	if (bind_data.cardinality_estimate >= 0) {
 		VGI_LOG(context, "table_function.cardinality",
-		        {{"worker_path", bind_data.worker_path},
+		        {{"worker_path", bind_data.worker_path()},
 		         {"function_name", bind_data.function_name},
 		         {"cardinality_estimate", std::to_string(bind_data.cardinality_estimate)}});
 		return make_uniq<NodeStatistics>(static_cast<idx_t>(bind_data.cardinality_estimate));
 	}
 
 	VGI_LOG(context, "table_function.cardinality",
-	        {{"worker_path", bind_data.worker_path},
+	        {{"worker_path", bind_data.worker_path()},
 	         {"function_name", bind_data.function_name},
 	         {"cardinality_estimate", "unknown"}});
 	// No estimate available
@@ -1377,7 +1390,7 @@ double VgiTableFunctionProgress(ClientContext &context, const FunctionData *bind
 InsertionOrderPreservingMap<string> VgiTableFunctionToString(TableFunctionToStringInput &input) {
 	InsertionOrderPreservingMap<string> result;
 	auto &bind_data = input.bind_data->Cast<VgiTableFunctionBindData>();
-	result["Worker"] = bind_data.worker_path;
+	result["Worker"] = bind_data.worker_path();
 	result["Function"] = bind_data.function_name;
 	if (bind_data.order_by_hint) {
 		result["Order Hint"] = bind_data.order_by_hint->column_name + " " +

@@ -90,67 +90,88 @@ struct AuthState {
 	std::condition_variable cv;
 };
 
-class VgiTokenManager {
+// ============================================================================
+// Per-Catalog Authentication
+// ============================================================================
+
+// Abstract base class for catalog authentication.
+// Each attached VGI catalog owns its own CatalogAuth instance, ensuring
+// independent auth state even when multiple catalogs point to the same origin.
+class CatalogAuth {
 public:
-	static VgiTokenManager &Instance();
+	virtual ~CatalogAuth() = default;
 
-	std::string GetToken(const std::string &origin);
-	std::string HandleUnauthorized(const std::string &origin,
-	                               const OAuthChallenge &challenge,
-	                               ClientContext &context);
-	void ClearTokens(const std::string &origin);
-	void ClearTokens(ClientContext &context, const std::string &origin);
-	void ClearAllTokens(ClientContext &context);
+	// Get current bearer token (empty string if none available)
+	virtual std::string GetToken() = 0;
 
-	// Diagnostic: get all origins with auth state
-	std::vector<std::string> GetAllOrigins();
+	// Handle a 401 response — attempt to obtain a valid token.
+	// Returns the new bearer token. Throws if auth fails irrecoverably.
+	virtual std::string HandleUnauthorized(const OAuthChallenge &challenge, ClientContext &context) = 0;
 
-	// Diagnostic: get token info for an origin (returns false if not found/not complete)
+	// Clear any cached tokens (resets to unauthenticated state)
+	virtual void ClearTokens() = 0;
+
+	// Diagnostics
 	struct TokenInfo {
-		bool has_refresh_token;
-		int64_t expires_in_seconds; // negative if expired, 0 if unknown
-		bool has_expires;
+		bool has_refresh_token = false;
+		int64_t expires_in_seconds = 0;
+		bool has_expires = false;
 	};
-	bool GetTokenInfo(const std::string &origin, TokenInfo &info);
+	virtual bool GetTokenInfo(TokenInfo &info) { return false; }
+	virtual bool GetTokenSetCopy(OAuthTokenSet &out) { return false; }
+};
 
-	// Diagnostic: copy the full token set (including parsed identity) for an origin.
-	// Returns true iff the origin has a COMPLETE auth state. Thread-safe.
-	bool GetTokenSetCopy(const std::string &origin, OAuthTokenSet &out);
+// Static bearer token auth (API keys, service account tokens, pre-obtained JWTs).
+// GetToken() returns the static token. HandleUnauthorized() throws — a rejected
+// static token has no recovery mechanism.
+class BearerTokenCatalogAuth : public CatalogAuth {
+public:
+	explicit BearerTokenCatalogAuth(std::string token);
 
-	static std::string ExtractOrigin(const std::string &url);
-
-	// Seed a refresh token for an origin (e.g., from ATTACH oauth_refresh_token option).
-	// Only sets the token if the origin is in IDLE state (not already authenticated).
-	void SeedRefreshToken(const std::string &origin, const std::string &refresh_token);
-
-	// Persistence helpers
-	OAuthTokenSet AttemptTokenRefresh(const OAuthRefreshContext &ctx, const std::string &refresh_token,
-	                                  ClientContext &context);
-	void PersistRefreshToken(ClientContext &context, const std::string &origin, const OAuthTokenSet &tokens,
-	                         const OAuthRefreshContext &ctx);
-	bool LoadPersistedRefreshToken(ClientContext &context, const std::string &origin, OAuthRefreshContext &ctx_out,
-	                               std::string &refresh_token_out);
-	void RemovePersistedToken(ClientContext &context, const std::string &origin);
-	static std::string SecretNameForOrigin(const std::string &origin);
+	std::string GetToken() override;
+	std::string HandleUnauthorized(const OAuthChallenge &challenge, ClientContext &context) override;
+	void ClearTokens() override;
 
 private:
 	mutable std::mutex mutex_;
-	std::map<std::string, AuthState> auth_states_;
-
-	OAuthRefreshContext DiscoverRefreshContext(const OAuthChallenge &challenge, ClientContext &context);
-
-	OAuthTokenSet PerformPKCEFlow(const OAuthChallenge &challenge,
-	                               const OAuthResourceMetadata &resource_meta,
-	                               const OAuthServerMetadata &server_meta,
-	                               ClientContext &context);
-	OAuthTokenSet PerformDeviceCodeFlow(const OAuthChallenge &challenge,
-	                                     const OAuthResourceMetadata &resource_meta,
-	                                     const OAuthServerMetadata &server_meta,
-	                                     ClientContext &context);
-	OAuthTokenSet PerformAuthFlow(const OAuthChallenge &challenge,
-	                               ClientContext &context,
-	                               OAuthRefreshContext &refresh_ctx_out);
+	std::string token_;
 };
+
+// Full OAuth flow auth (PKCE, device code, token refresh).
+// Per-catalog version of the former VgiTokenManager singleton — same flow logic,
+// same thread synchronization, but operating on a single AuthState.
+class OAuthCatalogAuth : public CatalogAuth {
+public:
+	OAuthCatalogAuth();
+
+	std::string GetToken() override;
+	std::string HandleUnauthorized(const OAuthChallenge &challenge, ClientContext &context) override;
+	void ClearTokens() override;
+
+	// Seed a refresh token (e.g., from ATTACH oauth_refresh_token option).
+	// Only sets the token if auth state is IDLE (not already authenticated).
+	void SeedRefreshToken(const std::string &refresh_token);
+
+	bool GetTokenInfo(TokenInfo &info) override;
+	bool GetTokenSetCopy(OAuthTokenSet &out) override;
+
+private:
+	mutable std::mutex mutex_;
+	AuthState state_;
+};
+
+// ============================================================================
+// Free-function auth flow helpers (stateless — used by OAuthCatalogAuth)
+// ============================================================================
+
+OAuthRefreshContext DiscoverRefreshContext(const OAuthChallenge &challenge, ClientContext &context);
+
+OAuthTokenSet AttemptTokenRefresh(const OAuthRefreshContext &ctx, const std::string &refresh_token,
+                                  ClientContext &context);
+
+OAuthTokenSet PerformAuthFlow(const OAuthChallenge &challenge, ClientContext &context,
+                               OAuthRefreshContext &refresh_ctx_out);
+
 
 // Environment detection
 bool IsHeadlessEnvironment();
@@ -176,6 +197,9 @@ std::string HttpGet(ClientContext &context, const std::string &url);
 // Metadata discovery
 OAuthResourceMetadata FetchResourceMetadata(ClientContext &context, const std::string &url);
 OAuthServerMetadata FetchAuthServerMetadata(ClientContext &context, const std::string &server_url);
+
+// Extract scheme://host:port from a URL
+std::string ExtractOrigin(const std::string &url);
 
 } // namespace vgi
 } // namespace duckdb

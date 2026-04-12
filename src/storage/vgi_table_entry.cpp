@@ -95,13 +95,11 @@ void VgiTableEntry::FetchColumnStatistics(ClientContext &context) const {
 	}
 
 	auto &vgi_tx = VgiTransaction::Get(context, catalog_);
+	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result_data->attach_id, vgi_tx.GetTransactionId()};
 
 	try {
 		auto rpc_result = vgi::InvokeCatalogTableColumnStatisticsGet(
-		    attach_params->worker_path(), attach_result_data->attach_id,
-		    ParentSchema().name, name, col_types, col_names,
-		    context, vgi_tx.GetTransactionId(),
-		    attach_params->worker_debug(), attach_params->use_pool());
+		    rpc_ctx, ParentSchema().name, name, col_types, col_names, context);
 
 		stats_cache_.entries = std::move(rpc_result.stats);
 		stats_cache_.max_age_seconds = rpc_result.cache_max_age_seconds;
@@ -140,10 +138,9 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 
 	// Ask the worker which function to call to scan this table
 	auto &vgi_tx_scan = VgiTransaction::Get(context, catalog_);
-	auto scan_result = vgi::InvokeCatalogTableScanFunctionGet(
-	    attach_params->worker_path(), attach_result->attach_id,
-	    ParentSchema().name, name, context, at_unit, at_value,
-	    vgi_tx_scan.GetTransactionId(), attach_params->worker_debug(), attach_params->use_pool());
+	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_id, vgi_tx_scan.GetTransactionId()};
+	auto scan_result = vgi::InvokeCatalogTableScanFunctionGet(rpc_ctx, ParentSchema().name, name, context,
+	                                                           at_unit, at_value);
 
 	// Load any required extensions before scanning
 	for (auto &ext : scan_result.required_extensions) {
@@ -189,12 +186,10 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 
 	// Build shared bind data
 	auto scan_bind_data = make_uniq<vgi::VgiTableFunctionBindData>();
-	scan_bind_data->worker_path = attach_params->worker_path();
+	scan_bind_data->attach_params = attach_params;
 	scan_bind_data->attach_id = attach_result->attach_id;
 	auto &vgi_tx = VgiTransaction::Get(context, catalog_);
 	scan_bind_data->transaction_id = vgi_tx.GetTransactionId();
-	scan_bind_data->worker_debug = attach_params->worker_debug();
-	scan_bind_data->use_pool = attach_params->use_pool();
 	scan_bind_data->function_name = scan_result.function_name;
 	scan_bind_data->arguments = vgi::BuildArgumentsFromValues(context, scan_result.positional_arguments, named_args_vec);
 	scan_bind_data->projection_pushdown = has_projection_pushdown;

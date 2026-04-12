@@ -200,6 +200,7 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	int64_t pool_max_override = -1;      // -1 = not set
 	int64_t pool_timeout_override = -1;  // -1 = not set
 	string oauth_refresh_token;
+	string bearer_token;
 
 	// Extract options
 	for (auto &entry : info.options) {
@@ -218,9 +219,16 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 			pool_timeout_override = entry.second.GetValue<int64_t>();
 		} else if (lower_name == "oauth_refresh_token") {
 			oauth_refresh_token = entry.second.ToString();
+		} else if (lower_name == "bearer_token") {
+			bearer_token = entry.second.ToString();
 		} else {
 			throw BinderException("Unrecognized option for VGI ATTACH: %s", entry.first);
 		}
+	}
+
+	// Validate mutual exclusivity of auth options
+	if (!bearer_token.empty() && !oauth_refresh_token.empty()) {
+		throw BinderException("Cannot specify both bearer_token and oauth_refresh_token");
 	}
 
 	if (worker_path.empty()) {
@@ -251,18 +259,28 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	}
 #endif
 
-	// Seed OAuth refresh token if provided
-	if (!oauth_refresh_token.empty()) {
+	// Create per-catalog auth state
+	std::shared_ptr<vgi::CatalogAuth> auth;
+	if (!bearer_token.empty()) {
 		if (!vgi::IsHttpTransport(worker_path)) {
-			throw BinderException("oauth_refresh_token is only valid for HTTP transport "
+			throw BinderException("bearer_token is only valid for HTTP transport "
 			                      "(LOCATION must be an HTTP/HTTPS URL)");
 		}
-		auto origin = vgi::VgiTokenManager::ExtractOrigin(worker_path);
-		vgi::VgiTokenManager::Instance().SeedRefreshToken(origin, oauth_refresh_token);
+		auth = std::make_shared<vgi::BearerTokenCatalogAuth>(bearer_token);
+	} else {
+		auto oauth_auth = std::make_shared<vgi::OAuthCatalogAuth>();
+		if (!oauth_refresh_token.empty()) {
+			if (!vgi::IsHttpTransport(worker_path)) {
+				throw BinderException("oauth_refresh_token is only valid for HTTP transport "
+				                      "(LOCATION must be an HTTP/HTTPS URL)");
+			}
+			oauth_auth->SeedRefreshToken(oauth_refresh_token);
+		}
+		auth = std::move(oauth_auth);
 	}
 
-	// Call catalog_attach via RPC
-	auto attach_result = vgi::InvokeCatalogAttach(worker_path, catalog_name, context, worker_debug, use_pool);
+	// Call catalog_attach via RPC (auth is used for HTTP 401 handling)
+	auto attach_result = vgi::InvokeCatalogAttach(worker_path, catalog_name, context, worker_debug, use_pool, auth);
 
 	// Register extension options for settings exposed by this catalog
 	// Check for type conflicts with existing settings
@@ -361,8 +379,8 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 		db.tags[key] = val;
 	}
 
-	// Create attach parameters
-	auto attach_params = std::make_shared<vgi::VgiAttachParameters>(worker_path, catalog_name, worker_debug, use_pool);
+	// Create attach parameters (auth is embedded for per-catalog authentication)
+	auto attach_params = std::make_shared<vgi::VgiAttachParameters>(worker_path, catalog_name, worker_debug, use_pool, auth);
 	auto attach_result_ptr = std::make_shared<vgi::CatalogAttachResult>(std::move(attach_result));
 
 	return make_uniq<VgiCatalog>(db, name, options.access_mode, std::move(attach_params), std::move(attach_result_ptr));
@@ -380,12 +398,16 @@ static unique_ptr<TransactionManager> CreateVgiTransactionManager(optional_ptr<S
 //===--------------------------------------------------------------------===//
 
 struct OAuthLogoutBindData : public TableFunctionData {
-	std::string target_origin; // empty = all origins
+	std::string target_catalog; // empty = all catalogs
 	bool logout_all = false;
 };
 
 struct OAuthLogoutState : public GlobalTableFunctionState {
-	std::vector<std::string> logged_out_origins;
+	struct LogoutRow {
+		std::string catalog_name;
+		std::string status;
+	};
+	std::vector<LogoutRow> rows;
 	idx_t offset = 0;
 };
 
@@ -393,15 +415,15 @@ static unique_ptr<FunctionData> OAuthLogoutBind(ClientContext &context, TableFun
                                                  vector<LogicalType> &return_types, vector<string> &names) {
 	auto bind_data = make_uniq<OAuthLogoutBindData>();
 	if (input.inputs.size() > 1) {
-		throw BinderException("vgi_oauth_logout expects 0 or 1 arguments, got %d", input.inputs.size());
+		throw BinderException("vgi_oauth_logout expects 0 or 1 arguments (catalog name), got %d", input.inputs.size());
 	}
 	if (!input.inputs.empty()) {
-		bind_data->target_origin = input.inputs[0].GetValue<string>();
+		bind_data->target_catalog = input.inputs[0].GetValue<string>();
 	} else {
 		bind_data->logout_all = true;
 	}
 	return_types.push_back(LogicalType::VARCHAR);
-	names.push_back("origin");
+	names.push_back("catalog_name");
 	return_types.push_back(LogicalType::VARCHAR);
 	names.push_back("status");
 	return std::move(bind_data);
@@ -410,40 +432,24 @@ static unique_ptr<FunctionData> OAuthLogoutBind(ClientContext &context, TableFun
 static unique_ptr<GlobalTableFunctionState> OAuthLogoutInit(ClientContext &context, TableFunctionInitInput &input) {
 	auto state = make_uniq<OAuthLogoutState>();
 	auto &bind_data = input.bind_data->Cast<OAuthLogoutBindData>();
-	auto &token_mgr = vgi::VgiTokenManager::Instance();
 
-	if (bind_data.logout_all) {
-		auto origins = token_mgr.GetAllOrigins();
-		// Also check persisted secrets for origins not in memory
-		try {
-			auto &secret_manager = SecretManager::Get(context);
-			auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
-			auto all_secrets = secret_manager.AllSecrets(transaction);
-			for (auto &entry : all_secrets) {
-				if (entry.secret->GetType() == "vgi_oauth_refresh_token") {
-					auto &kv = dynamic_cast<const KeyValueSecret &>(*entry.secret);
-					auto origin_val = kv.TryGetValue("origin");
-					if (!origin_val.IsNull()) {
-						auto o = origin_val.ToString();
-						bool found = false;
-						for (const auto &existing : origins) {
-							if (existing == o) { found = true; break; }
-						}
-						if (!found) {
-							origins.push_back(o);
-						}
-					}
-				}
-			}
-		} catch (...) {}
-
-		for (const auto &o : origins) {
-			token_mgr.ClearTokens(context, o);
-			state->logged_out_origins.push_back(o);
+	auto databases = DatabaseManager::Get(context).GetDatabases(context);
+	for (auto &db : databases) {
+		auto &catalog = db->GetCatalog();
+		if (catalog.GetCatalogType() != "vgi") {
+			continue;
 		}
-	} else {
-		token_mgr.ClearTokens(context, bind_data.target_origin);
-		state->logged_out_origins.push_back(bind_data.target_origin);
+		auto catalog_name = catalog.GetName();
+		if (!bind_data.logout_all && catalog_name != bind_data.target_catalog) {
+			continue;
+		}
+
+		auto &vgi_catalog = catalog.Cast<VgiCatalog>();
+		const auto &params = vgi_catalog.attach_parameters();
+		if (params && params->auth()) {
+			params->auth()->ClearTokens();
+			state->rows.push_back({catalog_name, "logged_out"});
+		}
 	}
 
 	return std::move(state);
@@ -452,9 +458,10 @@ static unique_ptr<GlobalTableFunctionState> OAuthLogoutInit(ClientContext &conte
 static void OAuthLogoutFunction(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
 	auto &state = input.global_state->Cast<OAuthLogoutState>();
 	idx_t count = 0;
-	while (state.offset < state.logged_out_origins.size() && count < STANDARD_VECTOR_SIZE) {
-		output.SetValue(0, count, Value(state.logged_out_origins[state.offset]));
-		output.SetValue(1, count, Value("logged_out"));
+	while (state.offset < state.rows.size() && count < STANDARD_VECTOR_SIZE) {
+		auto &row = state.rows[state.offset];
+		output.SetValue(0, count, Value(row.catalog_name));
+		output.SetValue(1, count, Value(row.status));
 		state.offset++;
 		count++;
 	}
@@ -467,13 +474,12 @@ static void OAuthLogoutFunction(ClientContext &context, TableFunctionInput &inpu
 
 struct OAuthTokensState : public GlobalTableFunctionState {
 	struct TokenRow {
+		std::string catalog_name;
 		std::string origin;
 		std::string status;
 		bool has_expires;
 		int64_t expires_in_seconds;
 		bool has_refresh_token;
-		std::string persisted;
-		std::string scope;
 	};
 	std::vector<TokenRow> rows;
 	idx_t offset = 0;
@@ -483,20 +489,14 @@ static LogicalType OAuthStatusEnumType() {
 	Vector values(LogicalType::VARCHAR, 3);
 	values.SetValue(0, Value("active"));
 	values.SetValue(1, Value("expired"));
-	values.SetValue(2, Value("persisted_only"));
-	return LogicalType::ENUM("vgi_oauth_status", values, 3);
-}
-
-static LogicalType OAuthPersistedEnumType() {
-	Vector values(LogicalType::VARCHAR, 3);
-	values.SetValue(0, Value("persistent"));
-	values.SetValue(1, Value("temporary"));
 	values.SetValue(2, Value("none"));
-	return LogicalType::ENUM("vgi_oauth_persisted", values, 3);
+	return LogicalType::ENUM("vgi_oauth_status", values, 3);
 }
 
 static unique_ptr<FunctionData> OAuthTokensBind(ClientContext &context, TableFunctionBindInput &input,
                                                  vector<LogicalType> &return_types, vector<string> &names) {
+	return_types.push_back(LogicalType::VARCHAR);
+	names.push_back("catalog_name");
 	return_types.push_back(LogicalType::VARCHAR);
 	names.push_back("origin");
 	return_types.push_back(OAuthStatusEnumType());
@@ -505,105 +505,56 @@ static unique_ptr<FunctionData> OAuthTokensBind(ClientContext &context, TableFun
 	names.push_back("expires_in");
 	return_types.push_back(LogicalType::BOOLEAN);
 	names.push_back("has_refresh_token");
-	return_types.push_back(OAuthPersistedEnumType());
-	names.push_back("persisted");
-	return_types.push_back(LogicalType::VARCHAR);
-	names.push_back("scope");
 	return nullptr;
 }
 
 static unique_ptr<GlobalTableFunctionState> OAuthTokensInit(ClientContext &context, TableFunctionInitInput &input) {
 	auto state = make_uniq<OAuthTokensState>();
-	auto &token_mgr = vgi::VgiTokenManager::Instance();
-	auto origins = token_mgr.GetAllOrigins();
 
-	// Track which origins we've seen (for merging persisted-only entries)
-	std::set<std::string> seen_origins;
-
-	// Get in-memory token states
-	for (const auto &origin : origins) {
-		seen_origins.insert(origin);
-		OAuthTokensState::TokenRow row;
-		row.origin = origin;
-
-		auto bearer = token_mgr.GetToken(origin);
-		if (!bearer.empty()) {
-			row.status = "active";
-		} else {
-			row.status = "expired";
+	auto databases = DatabaseManager::Get(context).GetDatabases(context);
+	for (auto &db : databases) {
+		auto &catalog = db->GetCatalog();
+		if (catalog.GetCatalogType() != "vgi") {
+			continue;
+		}
+		auto &vgi_catalog = catalog.Cast<VgiCatalog>();
+		const auto &params = vgi_catalog.attach_parameters();
+		if (!params) {
+			continue;
 		}
 
-		// Get expiry and refresh token info from in-memory state
-		vgi::VgiTokenManager::TokenInfo token_info;
-		if (token_mgr.GetTokenInfo(origin, token_info)) {
-			row.has_refresh_token = token_info.has_refresh_token;
-			row.has_expires = token_info.has_expires;
-			row.expires_in_seconds = token_info.expires_in_seconds;
-		} else {
-			row.has_refresh_token = false;
+		OAuthTokensState::TokenRow row;
+		row.catalog_name = catalog.GetName();
+		row.origin = vgi::ExtractOrigin(params->worker_path());
+
+		auto &auth = params->auth();
+		if (!auth) {
+			row.status = "none";
 			row.has_expires = false;
 			row.expires_in_seconds = 0;
-		}
-		row.persisted = "none";
-		row.scope = "";
-
-		// Check persisted secret for this origin
-		try {
-			auto &secret_manager = SecretManager::Get(context);
-			auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
-			auto secret_name = vgi::VgiTokenManager::SecretNameForOrigin(origin);
-			auto entry = secret_manager.GetSecretByName(transaction, secret_name);
-			if (entry) {
-				auto &kv = dynamic_cast<const KeyValueSecret &>(*entry->secret);
-				auto rt = kv.TryGetValue("refresh_token");
-				row.has_refresh_token = !rt.IsNull() && !rt.ToString().empty();
-				auto sc = kv.TryGetValue("scope");
-				if (!sc.IsNull()) row.scope = sc.ToString();
-
-				if (entry->persist_type == SecretPersistType::PERSISTENT) {
-					row.persisted = "persistent";
-				} else {
-					row.persisted = "temporary";
-				}
+			row.has_refresh_token = false;
+		} else {
+			auto bearer = auth->GetToken();
+			if (!bearer.empty()) {
+				row.status = "active";
+			} else {
+				row.status = "expired";
 			}
-		} catch (...) {}
+
+			vgi::CatalogAuth::TokenInfo token_info;
+			if (auth->GetTokenInfo(token_info)) {
+				row.has_refresh_token = token_info.has_refresh_token;
+				row.has_expires = token_info.has_expires;
+				row.expires_in_seconds = token_info.expires_in_seconds;
+			} else {
+				row.has_refresh_token = false;
+				row.has_expires = false;
+				row.expires_in_seconds = 0;
+			}
+		}
 
 		state->rows.push_back(std::move(row));
 	}
-
-	// Check for persisted-only entries (origins with secrets but no in-memory state)
-	try {
-		auto &secret_manager = SecretManager::Get(context);
-		auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
-		auto all_secrets = secret_manager.AllSecrets(transaction);
-		for (auto &entry : all_secrets) {
-			if (entry.secret->GetType() == "vgi_oauth_refresh_token") {
-				auto &kv = dynamic_cast<const KeyValueSecret &>(*entry.secret);
-				auto origin_val = kv.TryGetValue("origin");
-				if (origin_val.IsNull()) continue;
-				auto origin = origin_val.ToString();
-				if (seen_origins.count(origin)) continue;
-
-				OAuthTokensState::TokenRow row;
-				row.origin = origin;
-				row.status = "persisted_only";
-				row.has_expires = false;
-				row.expires_in_seconds = 0;
-
-				auto rt = kv.TryGetValue("refresh_token");
-				row.has_refresh_token = !rt.IsNull() && !rt.ToString().empty();
-				auto sc = kv.TryGetValue("scope");
-				row.scope = sc.IsNull() ? "" : sc.ToString();
-
-				if (entry.persist_type == SecretPersistType::PERSISTENT) {
-					row.persisted = "persistent";
-				} else {
-					row.persisted = "temporary";
-				}
-				state->rows.push_back(std::move(row));
-			}
-		}
-	} catch (...) {}
 
 	return std::move(state);
 }
@@ -613,16 +564,15 @@ static void OAuthTokensFunction(ClientContext &context, TableFunctionInput &inpu
 	idx_t count = 0;
 	while (state.offset < state.rows.size() && count < STANDARD_VECTOR_SIZE) {
 		auto &row = state.rows[state.offset];
-		output.SetValue(0, count, Value(row.origin));
-		output.SetValue(1, count, Value(row.status));
+		output.SetValue(0, count, Value(row.catalog_name));
+		output.SetValue(1, count, Value(row.origin));
+		output.SetValue(2, count, Value(row.status));
 		if (row.status == "active" && row.has_expires) {
-			output.SetValue(2, count, Value::INTERVAL(Interval::FromMicro(row.expires_in_seconds * Interval::MICROS_PER_SEC)));
+			output.SetValue(3, count, Value::INTERVAL(Interval::FromMicro(row.expires_in_seconds * Interval::MICROS_PER_SEC)));
 		} else {
-			output.SetValue(2, count, Value());
+			output.SetValue(3, count, Value());
 		}
-		output.SetValue(3, count, Value::BOOLEAN(row.has_refresh_token));
-		output.SetValue(4, count, Value(row.persisted));
-		output.SetValue(5, count, Value(row.scope));
+		output.SetValue(4, count, Value::BOOLEAN(row.has_refresh_token));
 		state.offset++;
 		count++;
 	}
@@ -678,7 +628,6 @@ static unique_ptr<FunctionData> CatalogIdentityBind(ClientContext &context, Tabl
 
 static unique_ptr<GlobalTableFunctionState> CatalogIdentityInit(ClientContext &context, TableFunctionInitInput &input) {
 	auto state = make_uniq<CatalogIdentityState>();
-	auto &token_mgr = vgi::VgiTokenManager::Instance();
 
 	auto databases = DatabaseManager::Get(context).GetDatabases(context);
 	for (auto &db : databases) {
@@ -694,18 +643,22 @@ static unique_ptr<GlobalTableFunctionState> CatalogIdentityInit(ClientContext &c
 
 		CatalogIdentityState::IdentityRow row;
 		row.catalog_name = catalog.GetName();
-		row.origin = vgi::VgiTokenManager::ExtractOrigin(params->worker_path());
+		row.origin = vgi::ExtractOrigin(params->worker_path());
 
-		vgi::OAuthTokenSet token_copy;
-		if (token_mgr.GetTokenSetCopy(row.origin, token_copy)) {
-			row.authenticated = token_copy.IsValid();
-			if (token_copy.identity.present) {
-				row.has_identity = true;
-				row.sub = token_copy.identity.sub;
-				row.email = token_copy.identity.email;
-				row.name = token_copy.identity.name;
-				row.issuer = token_copy.identity.issuer;
-				row.claims_json = token_copy.identity.claims_json;
+		// Get identity from per-catalog auth state
+		auto &auth = params->auth();
+		if (auth) {
+			vgi::OAuthTokenSet token_copy;
+			if (auth->GetTokenSetCopy(token_copy)) {
+				row.authenticated = token_copy.IsValid();
+				if (token_copy.identity.present) {
+					row.has_identity = true;
+					row.sub = token_copy.identity.sub;
+					row.email = token_copy.identity.email;
+					row.name = token_copy.identity.name;
+					row.issuer = token_copy.identity.issuer;
+					row.claims_json = token_copy.identity.claims_json;
+				}
 			}
 		}
 
@@ -847,51 +800,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	config.AddExtensionOption("vgi_oauth_flow",
 	                          "OAuth flow type: auto (default), device_code, or pkce",
 	                          LogicalType::VARCHAR, Value("auto"));
-	config.AddExtensionOption("vgi_oauth_persist",
-	                          "Persist OAuth refresh tokens to disk via DuckDB SecretManager",
-	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
 	config.AddExtensionOption("vgi_oauth_prompt",
 	                          "OAuth prompt behavior: none (default), login, select_account, or consent",
 	                          LogicalType::VARCHAR, Value("none"));
-
-	// Register vgi_oauth_refresh_token secret type
-	{
-		auto &secret_manager = SecretManager::Get(loader.GetDatabaseInstance());
-		SecretType secret_type;
-		secret_type.name = "vgi_oauth_refresh_token";
-		secret_type.deserializer = KeyValueSecret::Deserialize<KeyValueSecret>;
-		secret_type.default_provider = "config";
-		secret_type.extension = "vgi";
-		try {
-			secret_manager.RegisterSecretType(secret_type);
-		} catch (const InternalException &) {
-			// Already registered — idempotent
-		}
-
-		// Register create function
-		CreateSecretFunction create_func;
-		create_func.secret_type = "vgi_oauth_refresh_token";
-		create_func.provider = "config";
-		create_func.function = VgiCreateSecret;
-		create_func.named_parameters["refresh_token"] = LogicalType::VARCHAR;
-		create_func.named_parameters["token_endpoint"] = LogicalType::VARCHAR;
-		create_func.named_parameters["client_id"] = LogicalType::VARCHAR;
-		create_func.named_parameters["client_secret"] = LogicalType::VARCHAR;
-		create_func.named_parameters["scope"] = LogicalType::VARCHAR;
-		create_func.named_parameters["use_id_token"] = LogicalType::VARCHAR;
-		create_func.named_parameters["resource_metadata_url"] = LogicalType::VARCHAR;
-		create_func.named_parameters["origin"] = LogicalType::VARCHAR;
-		secret_manager.RegisterSecretFunction(create_func, OnCreateConflict::IGNORE_ON_CONFLICT);
-
-		// Store redact keys
-		auto vgi_ext = StorageExtension::Find(config, "vgi");
-		if (vgi_ext) {
-			case_insensitive_set_t redact_keys;
-			redact_keys.insert("refresh_token");
-			redact_keys.insert("client_secret");
-			static_cast<VgiStorageExtension &>(*vgi_ext).SetRedactKeys("vgi_oauth_refresh_token", std::move(redact_keys));
-		}
-	}
 
 	// Register async prefetch setting
 	config.AddExtensionOption("vgi_async_prefetch",

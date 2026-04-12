@@ -23,6 +23,7 @@ class ClientContext;
 namespace vgi {
 
 class PooledWorker;
+struct VgiAttachParameters;
 struct VgiSecretRequirement;
 
 // ============================================================================
@@ -101,7 +102,8 @@ std::unique_ptr<IFunctionConnection> CreateFunctionConnection(
     const std::vector<uint8_t> &global_execution_id = {},
     bool worker_debug = false,
     const std::map<std::string, Value> &settings = {},
-    const std::vector<VgiSecretRequirement> &required_secrets = {});
+    const std::vector<VgiSecretRequirement> &required_secrets = {},
+    const std::shared_ptr<VgiAttachParameters> &attach_params = nullptr);
 
 // Create from a pooled worker (subprocess only — HTTP connections are never pooled).
 std::unique_ptr<IFunctionConnection> CreateFunctionConnectionFromPool(

@@ -21,11 +21,12 @@ static unique_ptr<FunctionData> VgiTableFunctionBind(ClientContext &context, Tab
                                                      vector<LogicalType> &return_types, vector<string> &names) {
 	auto bind_data = make_uniq<VgiTableFunctionBindData>();
 	Value max_pool_val;
-	bind_data->use_pool = context.TryGetCurrentSetting("vgi_worker_pool_max", max_pool_val)
-	                          && max_pool_val.GetValue<int64_t>() > 0;
+	bool use_pool = context.TryGetCurrentSetting("vgi_worker_pool_max", max_pool_val)
+	                    && max_pool_val.GetValue<int64_t>() > 0;
 
 	// Extract required parameters from vgi_table_function(worker_path, function_name, args, named_args)
-	bind_data->worker_path = input.inputs[0].GetValue<string>();
+	auto worker_path = input.inputs[0].GetValue<string>();
+	bind_data->attach_params = std::make_shared<vgi::VgiAttachParameters>(worker_path, "", false, use_pool);
 	bind_data->function_name = input.inputs[1].GetValue<string>();
 
 	// Extract positional arguments from the LIST parameter

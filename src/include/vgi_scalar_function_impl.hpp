@@ -30,15 +30,18 @@ struct VgiScalarFunctionInfo : public ScalarFunctionInfo {
 	~VgiScalarFunctionInfo() override = default;
 
 	// Worker connection parameters
-	std::string worker_path;
+	std::shared_ptr<vgi::VgiAttachParameters> attach_params;  // replaces worker_path, worker_debug, use_pool
 	std::vector<uint8_t> attach_id;
 	optional_ptr<Catalog> catalog;
 	std::string function_name;
-	bool worker_debug = false;
-	bool use_pool = false;
 	std::map<std::string, Value> settings;
 	std::vector<std::string> setting_names;
 	std::vector<vgi::VgiSecretRequirement> required_secrets;
+
+	// Convenience accessors
+	const std::string &worker_path() const { return attach_params->worker_path(); }
+	bool worker_debug() const { return attach_params->worker_debug(); }
+	bool use_pool() const { return attach_params->use_pool(); }
 
 	// Schema info from catalog registration
 	std::shared_ptr<arrow::Schema> output_schema;  // Single "result" column
@@ -60,13 +63,16 @@ struct VgiScalarFunctionBindData : public FunctionData {
 	~VgiScalarFunctionBindData() override = default;
 
 	// Copy of function info for execution
-	std::string worker_path;
+	std::shared_ptr<vgi::VgiAttachParameters> attach_params;  // replaces worker_path, worker_debug, use_pool
 	std::vector<uint8_t> attach_id;
 	std::string function_name;
-	bool worker_debug = false;
-	bool use_pool = false;
 	std::map<std::string, Value> settings;
 	std::vector<vgi::VgiSecretRequirement> required_secrets;
+
+	// Convenience accessors
+	const std::string &worker_path() const { return attach_params->worker_path(); }
+	bool worker_debug() const { return attach_params->worker_debug(); }
+	bool use_pool() const { return attach_params->use_pool(); }
 
 	// Actual output schema resolved during bind (with concrete types)
 	std::shared_ptr<arrow::Schema> resolved_output_schema;
@@ -86,11 +92,9 @@ struct VgiScalarFunctionBindData : public FunctionData {
 
 	unique_ptr<FunctionData> Copy() const override {
 		auto copy = make_uniq<VgiScalarFunctionBindData>();
-		copy->worker_path = worker_path;
+		copy->attach_params = attach_params;
 		copy->attach_id = attach_id;
 		copy->function_name = function_name;
-		copy->worker_debug = worker_debug;
-		copy->use_pool = use_pool;
 		copy->settings = settings;
 		copy->required_secrets = required_secrets;
 		copy->resolved_output_schema = resolved_output_schema;
@@ -104,9 +108,9 @@ struct VgiScalarFunctionBindData : public FunctionData {
 	// because they are deterministic given the identity fields and argument types.
 	bool Equals(const FunctionData &other_p) const override {
 		auto &other = other_p.Cast<VgiScalarFunctionBindData>();
-		return worker_path == other.worker_path && attach_id == other.attach_id &&
-		       function_name == other.function_name && worker_debug == other.worker_debug &&
-		       use_pool == other.use_pool;
+		return worker_path() == other.worker_path() && attach_id == other.attach_id &&
+		       function_name == other.function_name && worker_debug() == other.worker_debug() &&
+		       use_pool() == other.use_pool();
 	}
 };
 

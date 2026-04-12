@@ -199,22 +199,22 @@ unique_ptr<FunctionData> VgiScalarFunctionBind(ClientContext &context, ScalarFun
 		    ? VgiTransaction::Get(context, *func_info.catalog).GetTransactionId()
 		    : std::vector<uint8_t>{};
 		std::unique_ptr<IFunctionConnection> connection;
-		if (func_info.use_pool && !IsHttpTransport(func_info.worker_path)) {
-			auto pooled = VgiWorkerPool::Instance().TryAcquire(func_info.worker_path);
+		if (func_info.use_pool() && !IsHttpTransport(func_info.worker_path())) {
+			auto pooled = VgiWorkerPool::Instance().TryAcquire(func_info.worker_path());
 			if (pooled) {
 				connection = CreateFunctionConnectionFromPool(
 				    std::move(pooled), func_info.function_name, arrow_arguments, func_info.attach_id,
 				    transaction_id, context,
-				    "SCALAR", std::vector<uint8_t>{}, func_info.worker_debug, settings,
+				    "SCALAR", std::vector<uint8_t>{}, func_info.worker_debug(), settings,
 				    func_info.required_secrets);
 			}
 		}
 		if (!connection) {
 			connection = CreateFunctionConnection(
-			    func_info.worker_path, func_info.function_name, arrow_arguments, func_info.attach_id,
+			    func_info.worker_path(), func_info.function_name, arrow_arguments, func_info.attach_id,
 			    transaction_id, context,
-			    "SCALAR", std::vector<uint8_t>{}, func_info.worker_debug, settings,
-			    func_info.required_secrets);
+			    "SCALAR", std::vector<uint8_t>{}, func_info.worker_debug(), settings,
+			    func_info.required_secrets, func_info.attach_params);
 		}
 
 		// Set input schema and perform bind to get actual output schema
@@ -253,11 +253,9 @@ unique_ptr<FunctionData> VgiScalarFunctionBind(ClientContext &context, ScalarFun
 	// Phase 6: Create bind data with resolved information
 	// ========================================================================
 	auto bind_data = make_uniq<VgiScalarFunctionBindData>();
-	bind_data->worker_path = func_info.worker_path;
+	bind_data->attach_params = func_info.attach_params;
 	bind_data->attach_id = func_info.attach_id;
 	bind_data->function_name = func_info.function_name;
-	bind_data->worker_debug = func_info.worker_debug;
-	bind_data->use_pool = func_info.use_pool;
 	bind_data->settings = settings;
 	bind_data->required_secrets = func_info.required_secrets;
 	bind_data->resolved_output_schema = output_schema;
@@ -318,14 +316,15 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 		// Acquire connection: reuse bind connection, try pool, or spawn fresh
 		std::unique_ptr<IFunctionConnection> connection;
 		bool reused_bind_connection = false;
-		bool use_pool = bind_data ? bind_data->use_pool : func_info.use_pool;
-		const auto &worker_path = bind_data ? bind_data->worker_path : func_info.worker_path;
+		bool use_pool = bind_data ? bind_data->use_pool() : func_info.use_pool();
+		const auto &worker_path = bind_data ? bind_data->worker_path() : func_info.worker_path();
 		const auto &attach_id = bind_data ? bind_data->attach_id : func_info.attach_id;
 		const auto &function_name = bind_data ? bind_data->function_name : func_info.function_name;
-		bool worker_debug = bind_data ? bind_data->worker_debug : func_info.worker_debug;
+		bool worker_debug = bind_data ? bind_data->worker_debug() : func_info.worker_debug();
 		// Extract settings: from bind_data if available, otherwise extract fresh from context
 		auto settings = bind_data ? bind_data->settings : ExtractVgiSettings(context, func_info.setting_names);
 		const auto &required_secrets = bind_data ? bind_data->required_secrets : func_info.required_secrets;
+		const auto &attach_params = bind_data ? bind_data->attach_params : func_info.attach_params;
 
 		// Try to reuse the bind-phase connection (avoids spawning a second worker)
 		if (bind_data) {
@@ -361,7 +360,7 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 			    worker_path, function_name, arguments, attach_id,
 			    transaction_id, context,
 			    "SCALAR", std::vector<uint8_t>{}, worker_debug, settings,
-			    required_secrets);
+			    required_secrets, attach_params);
 			VGI_STDERR_DEBUG("[VGI] scalar.new_connection worker_path=%s pid=%d\n",
 			                 worker_path.c_str(), connection->GetPid());
 		}

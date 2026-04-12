@@ -41,11 +41,9 @@ void VgiScalarFunctionSet::LoadEntries(ClientContext &context) {
 	// Call catalog_schema_contents_functions via RPC for scalar functions
 	auto worker_path = attach_params->worker_path();
 	auto &vgi_tx_load = VgiTransaction::Get(context, catalog_);
-	auto function_list = vgi::InvokeCatalogSchemaContentsFunctions(worker_path, attach_result->attach_id, schema_.name,
-	                                                               "SCALAR_FUNCTION", context,
-	                                                               vgi_tx_load.GetTransactionId(),
-	                                                               attach_params->worker_debug(),
-	                                                               attach_params->use_pool());
+	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_id, vgi_tx_load.GetTransactionId()};
+	auto function_list = vgi::InvokeCatalogSchemaContentsFunctions(rpc_ctx, schema_.name,
+	                                                               "SCALAR_FUNCTION", context);
 
 	// Group functions by name (overloads)
 	std::unordered_map<std::string, std::vector<vgi::VgiFunctionInfo>> functions_by_name;
@@ -138,12 +136,10 @@ void VgiScalarFunctionSet::LoadEntries(ClientContext &context) {
 
 			// Create VgiScalarFunctionInfo with worker connection details
 			auto scalar_func_info = make_shared_ptr<VgiScalarFunctionInfo>();
-			scalar_func_info->worker_path = worker_path;
+			scalar_func_info->attach_params = attach_params;
 			scalar_func_info->attach_id = attach_result->attach_id;
 			scalar_func_info->catalog = &catalog_;
 			scalar_func_info->function_name = func_info.name;
-			scalar_func_info->worker_debug = attach_params->worker_debug();
-			scalar_func_info->use_pool = attach_params->use_pool();
 			scalar_func_info->output_schema = func_info.output_schema;
 			scalar_func_info->has_dynamic_return_type = is_any_output;
 			scalar_func_info->positional_is_const = arg_types.positional_is_const;

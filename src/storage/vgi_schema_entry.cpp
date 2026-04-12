@@ -118,17 +118,14 @@ optional_ptr<CatalogEntry> VgiSchemaEntry::CreateTable(CatalogTransaction transa
 
 	// Get transaction ID
 	auto &vgi_tx = VgiTransaction::Get(context, catalog);
-	auto transaction_id = vgi_tx.GetTransactionId();
 
 	// Send DDL RPC
 	auto &attach_params = vgi_catalog.attach_parameters();
 	auto &attach_result = vgi_catalog.attach_result();
-	vgi::InvokeCatalogTableCreate(attach_params->worker_path(), attach_result->attach_id,
-	                               name, create_info.table, columns_schema, on_conflict,
+	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_id, vgi_tx.GetTransactionId()};
+	vgi::InvokeCatalogTableCreate(rpc_ctx, name, create_info.table, columns_schema, on_conflict,
 	                               not_null_constraints, unique_constraints, check_constraints,
-	                               primary_key_constraints, foreign_key_constraints,
-	                               transaction_id, context, attach_params->worker_debug(),
-	                               attach_params->use_pool());
+	                               primary_key_constraints, foreign_key_constraints, context);
 
 	// Invalidate table cache and re-fetch the newly created table
 	tables_.ClearEntries();
@@ -166,15 +163,12 @@ optional_ptr<CatalogEntry> VgiSchemaEntry::CreateView(CatalogTransaction transac
 
 	// Get transaction ID
 	auto &vgi_tx = VgiTransaction::Get(context, catalog);
-	auto transaction_id = vgi_tx.GetTransactionId();
 
 	// Send DDL RPC
 	auto &attach_params = vgi_catalog.attach_parameters();
 	auto &attach_result = vgi_catalog.attach_result();
-	vgi::InvokeCatalogViewCreate(attach_params->worker_path(), attach_result->attach_id,
-	                              name, info.view_name, definition, on_conflict,
-	                              transaction_id, context, attach_params->worker_debug(),
-	                              attach_params->use_pool());
+	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_id, vgi_tx.GetTransactionId()};
+	vgi::InvokeCatalogViewCreate(rpc_ctx, name, info.view_name, definition, on_conflict, context);
 
 	// Invalidate view cache
 	views_.ClearEntries();
@@ -218,7 +212,7 @@ void VgiSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 	auto &attach_params = vgi_catalog.attach_parameters();
 	auto &attach_result = vgi_catalog.attach_result();
 	auto &vgi_tx = VgiTransaction::Get(context, catalog);
-	auto transaction_id = vgi_tx.GetTransactionId();
+	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_id, vgi_tx.GetTransactionId()};
 
 	// Handle COMMENT ON table or view
 	if (info.type == AlterType::SET_COMMENT) {
@@ -226,20 +220,16 @@ void VgiSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 		if (comment_info.entry_catalog_type == CatalogType::TABLE_ENTRY) {
 			bool is_null = comment_info.comment_value.IsNull();
 			auto comment_str = is_null ? "" : comment_info.comment_value.ToString();
-			vgi::InvokeCatalogTableCommentSet(attach_params->worker_path(), attach_result->attach_id,
-			                                   name, comment_info.name, comment_str, is_null,
-			                                   false, transaction_id, context,
-			                                   attach_params->worker_debug(), attach_params->use_pool());
+			vgi::InvokeCatalogTableCommentSet(rpc_ctx, name, comment_info.name, comment_str, is_null,
+			                                   false, context);
 			tables_.DropEntry(comment_info.name);
 			return;
 		}
 		if (comment_info.entry_catalog_type == CatalogType::VIEW_ENTRY) {
 			bool is_null = comment_info.comment_value.IsNull();
 			auto comment_str = is_null ? "" : comment_info.comment_value.ToString();
-			vgi::InvokeCatalogViewCommentSet(attach_params->worker_path(), attach_result->attach_id,
-			                                  name, comment_info.name, comment_str, is_null,
-			                                  false, transaction_id, context,
-			                                  attach_params->worker_debug(), attach_params->use_pool());
+			vgi::InvokeCatalogViewCommentSet(rpc_ctx, name, comment_info.name, comment_str, is_null,
+			                                  false, context);
 			views_.DropEntry(comment_info.name);
 			return;
 		}
@@ -252,11 +242,8 @@ void VgiSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 		auto &col_comment = info.Cast<SetColumnCommentInfo>();
 		bool is_null = col_comment.comment_value.IsNull();
 		auto comment_str = is_null ? "" : col_comment.comment_value.ToString();
-		vgi::InvokeCatalogTableColumnCommentSet(
-		    attach_params->worker_path(), attach_result->attach_id,
-		    name, col_comment.name, col_comment.column_name,
-		    comment_str, is_null, false, transaction_id, context,
-		    attach_params->worker_debug(), attach_params->use_pool());
+		vgi::InvokeCatalogTableColumnCommentSet(rpc_ctx, name, col_comment.name, col_comment.column_name,
+		                                         comment_str, is_null, false, context);
 		tables_.DropEntry(col_comment.name);
 		return;
 	}
@@ -266,10 +253,8 @@ void VgiSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 		auto &alter_view = info.Cast<AlterViewInfo>();
 		if (alter_view.alter_view_type == AlterViewType::RENAME_VIEW) {
 			auto &rename = alter_view.Cast<RenameViewInfo>();
-			vgi::InvokeCatalogViewRename(attach_params->worker_path(), attach_result->attach_id,
-			                              name, alter_view.name, rename.new_view_name,
-			                              false, transaction_id, context,
-			                              attach_params->worker_debug(), attach_params->use_pool());
+			vgi::InvokeCatalogViewRename(rpc_ctx, name, alter_view.name, rename.new_view_name,
+			                              false, context);
 		} else {
 			throw BinderException("ALTER VIEW %s is not supported for VGI catalogs",
 			                       EnumUtil::ToString(alter_view.alter_view_type));
@@ -294,34 +279,26 @@ void VgiSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 		ColumnList single_col;
 		single_col.AddColumn(add_col.new_column.Copy());
 		auto col_schema = vgi::DuckDBColumnsToArrowSchema(context, single_col);
-		vgi::InvokeCatalogTableColumnAdd(attach_params->worker_path(), attach_result->attach_id,
-		                                  schema_name, table_name, col_schema,
-		                                  add_col.if_column_not_exists, transaction_id,
-		                                  context, attach_params->worker_debug(), attach_params->use_pool());
+		vgi::InvokeCatalogTableColumnAdd(rpc_ctx, schema_name, table_name, col_schema,
+		                                  add_col.if_column_not_exists, context);
 		break;
 	}
 	case AlterTableType::REMOVE_COLUMN: {
 		auto &rem_col = alter_table.Cast<RemoveColumnInfo>();
-		vgi::InvokeCatalogTableColumnDrop(attach_params->worker_path(), attach_result->attach_id,
-		                                   schema_name, table_name, rem_col.removed_column,
-		                                   rem_col.if_column_exists, rem_col.cascade, transaction_id,
-		                                   context, attach_params->worker_debug(), attach_params->use_pool());
+		vgi::InvokeCatalogTableColumnDrop(rpc_ctx, schema_name, table_name, rem_col.removed_column,
+		                                   rem_col.if_column_exists, rem_col.cascade, context);
 		break;
 	}
 	case AlterTableType::RENAME_COLUMN: {
 		auto &ren_col = alter_table.Cast<RenameColumnInfo>();
-		vgi::InvokeCatalogTableColumnRename(attach_params->worker_path(), attach_result->attach_id,
-		                                     schema_name, table_name,
-		                                     ren_col.old_name, ren_col.new_name, transaction_id,
-		                                     context, attach_params->worker_debug(), attach_params->use_pool());
+		vgi::InvokeCatalogTableColumnRename(rpc_ctx, schema_name, table_name,
+		                                     ren_col.old_name, ren_col.new_name, context);
 		break;
 	}
 	case AlterTableType::RENAME_TABLE: {
 		auto &ren_tbl = alter_table.Cast<RenameTableInfo>();
-		vgi::InvokeCatalogTableRename(attach_params->worker_path(), attach_result->attach_id,
-		                               schema_name, table_name, ren_tbl.new_table_name,
-		                               false, transaction_id,
-		                               context, attach_params->worker_debug(), attach_params->use_pool());
+		vgi::InvokeCatalogTableRename(rpc_ctx, schema_name, table_name, ren_tbl.new_table_name,
+		                               false, context);
 		break;
 	}
 	case AlterTableType::ALTER_COLUMN_TYPE: {
@@ -331,43 +308,31 @@ void VgiSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 		single_col.AddColumn(ColumnDefinition(change_type.column_name, change_type.target_type));
 		auto col_schema = vgi::DuckDBColumnsToArrowSchema(context, single_col);
 		auto expression_str = change_type.expression ? change_type.expression->ToString() : "";
-		vgi::InvokeCatalogTableColumnTypeChange(attach_params->worker_path(), attach_result->attach_id,
-		                                         schema_name, table_name, col_schema, expression_str,
-		                                         transaction_id, context,
-		                                         attach_params->worker_debug(), attach_params->use_pool());
+		vgi::InvokeCatalogTableColumnTypeChange(rpc_ctx, schema_name, table_name, col_schema,
+		                                         expression_str, context);
 		break;
 	}
 	case AlterTableType::SET_DEFAULT: {
 		auto &set_def = alter_table.Cast<SetDefaultInfo>();
 		if (set_def.expression) {
 			// SET DEFAULT
-			vgi::InvokeCatalogTableColumnDefaultSet(attach_params->worker_path(), attach_result->attach_id,
-			                                         schema_name, table_name, set_def.column_name,
-			                                         set_def.expression->ToString(), transaction_id, context,
-			                                         attach_params->worker_debug(), attach_params->use_pool());
+			vgi::InvokeCatalogTableColumnDefaultSet(rpc_ctx, schema_name, table_name, set_def.column_name,
+			                                         set_def.expression->ToString(), context);
 		} else {
 			// DROP DEFAULT (null expression)
-			vgi::InvokeCatalogTableColumnDefaultDrop(attach_params->worker_path(), attach_result->attach_id,
-			                                          schema_name, table_name, set_def.column_name,
-			                                          transaction_id, context,
-			                                          attach_params->worker_debug(), attach_params->use_pool());
+			vgi::InvokeCatalogTableColumnDefaultDrop(rpc_ctx, schema_name, table_name, set_def.column_name,
+			                                          context);
 		}
 		break;
 	}
 	case AlterTableType::SET_NOT_NULL: {
 		auto &set_nn = alter_table.Cast<SetNotNullInfo>();
-		vgi::InvokeCatalogTableNotNullSet(attach_params->worker_path(), attach_result->attach_id,
-		                                   schema_name, table_name, set_nn.column_name,
-		                                   transaction_id, context,
-		                                   attach_params->worker_debug(), attach_params->use_pool());
+		vgi::InvokeCatalogTableNotNullSet(rpc_ctx, schema_name, table_name, set_nn.column_name, context);
 		break;
 	}
 	case AlterTableType::DROP_NOT_NULL: {
 		auto &drop_nn = alter_table.Cast<DropNotNullInfo>();
-		vgi::InvokeCatalogTableNotNullDrop(attach_params->worker_path(), attach_result->attach_id,
-		                                    schema_name, table_name, drop_nn.column_name,
-		                                    transaction_id, context,
-		                                    attach_params->worker_debug(), attach_params->use_pool());
+		vgi::InvokeCatalogTableNotNullDrop(rpc_ctx, schema_name, table_name, drop_nn.column_name, context);
 		break;
 	}
 	default:
@@ -443,15 +408,13 @@ void VgiSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
 	bool ignore_not_found = (info.if_not_found == OnEntryNotFound::RETURN_NULL);
 
 	auto &vgi_tx = VgiTransaction::Get(context, catalog);
-	auto transaction_id = vgi_tx.GetTransactionId();
 
 	auto &attach_params = vgi_catalog.attach_parameters();
 	auto &attach_result = vgi_catalog.attach_result();
+	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_id, vgi_tx.GetTransactionId()};
 
 	if (info.type == CatalogType::VIEW_ENTRY) {
-		vgi::InvokeCatalogViewDrop(attach_params->worker_path(), attach_result->attach_id,
-		                            name, info.name, ignore_not_found, info.cascade, transaction_id,
-		                            context, attach_params->worker_debug(), attach_params->use_pool());
+		vgi::InvokeCatalogViewDrop(rpc_ctx, name, info.name, ignore_not_found, info.cascade, context);
 		if (info.cascade) {
 			// Cascade may have dropped views that depend on this view
 			views_.ClearEntries();
@@ -461,9 +424,7 @@ void VgiSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
 		return;
 	}
 
-	vgi::InvokeCatalogTableDrop(attach_params->worker_path(), attach_result->attach_id,
-	                             name, info.name, ignore_not_found, info.cascade, transaction_id,
-	                             context, attach_params->worker_debug(), attach_params->use_pool());
+	vgi::InvokeCatalogTableDrop(rpc_ctx, name, info.name, ignore_not_found, info.cascade, context);
 
 	tables_.DropEntry(info.name);
 	// Views referencing the dropped table are now stale; clear to force re-fetch.

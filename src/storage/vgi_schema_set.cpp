@@ -36,9 +36,8 @@ void VgiSchemaSet::LoadEntries(ClientContext &context) {
 
 	// Call catalog_schemas via RPC
 	auto &vgi_tx_load = VgiTransaction::Get(context, catalog_);
-	auto schema_list = vgi::InvokeCatalogSchemas(attach_params->worker_path(), attach_result->attach_id, context,
-	                                             vgi_tx_load.GetTransactionId(),
-	                                             attach_params->worker_debug(), attach_params->use_pool());
+	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_id, vgi_tx_load.GetTransactionId()};
+	auto schema_list = vgi::InvokeCatalogSchemas(rpc_ctx, context);
 
 	// Create schema entries
 	for (auto &schema_info : schema_list) {

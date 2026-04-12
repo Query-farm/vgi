@@ -19,6 +19,14 @@ namespace duckdb {
 namespace vgi {
 
 // ============================================================================
+// FunctionConnectionParams Accessors (out-of-line, needs VgiAttachParameters)
+// ============================================================================
+
+const std::string &FunctionConnectionParams::worker_path() const { return attach_params->worker_path(); }
+bool FunctionConnectionParams::worker_debug() const { return attach_params->worker_debug(); }
+bool FunctionConnectionParams::use_pool() const { return attach_params->use_pool(); }
+
+// ============================================================================
 // Connection Acquisition with Retry
 // ============================================================================
 
@@ -29,10 +37,11 @@ AcquireAndBindResult AcquireAndBindConnection(ClientContext &context, const Func
 
 	// Lambda to create a fresh connection (uses factory for HTTP/subprocess dispatch)
 	auto create_fresh_connection = [&]() {
-		return CreateFunctionConnection(params.worker_path, params.function_name, params.arguments,
+		return CreateFunctionConnection(params.worker_path(), params.function_name, params.arguments,
 		                                params.attach_id, params.transaction_id, context,
 		                                params.function_type, params.global_execution_id,
-		                                params.worker_debug, params.settings, params.required_secrets);
+		                                params.worker_debug(), params.settings, params.required_secrets,
+		                                params.attach_params);
 	};
 
 	// Lambda to attempt bind, returns true on success, false if retry needed
@@ -44,7 +53,7 @@ AcquireAndBindResult AcquireAndBindConnection(ClientContext &context, const Func
 			if (!is_retry && from_pool) {
 				// Pooled worker was stale, signal retry needed
 				VGI_LOG(context, "worker_pool.stale",
-				        {{"worker_path", params.worker_path},
+				        {{"worker_path", params.worker_path()},
 				         {"worker_pid", std::to_string(conn->GetPid())},
 				         {"error", e.what()},
 				         {"phase", params.phase}});
@@ -55,18 +64,18 @@ AcquireAndBindResult AcquireAndBindConnection(ClientContext &context, const Func
 	};
 
 	// Try pool first (only for subprocess transport)
-	if (params.use_pool && !IsHttpTransport(params.worker_path)) {
-		auto pooled = VgiWorkerPool::Instance().TryAcquire(params.worker_path);
+	if (params.use_pool() && !IsHttpTransport(params.worker_path())) {
+		auto pooled = VgiWorkerPool::Instance().TryAcquire(params.worker_path());
 		if (pooled) {
 			auto pooled_pid = pooled->GetPid();
 			conn = CreateFunctionConnectionFromPool(std::move(pooled), params.function_name, params.arguments,
 			                                        params.attach_id, params.transaction_id, context,
 			                                        params.function_type, params.global_execution_id,
-			                                        params.worker_debug, params.settings,
+			                                        params.worker_debug(), params.settings,
 			                                        params.required_secrets);
 			from_pool = true;
 			VGI_LOG(context, "worker_pool.acquire",
-			        {{"worker_path", params.worker_path},
+			        {{"worker_path", params.worker_path()},
 			         {"worker_pid", std::to_string(pooled_pid)},
 			         {"result", "hit"},
 			         {"phase", params.phase}});
@@ -76,13 +85,13 @@ AcquireAndBindResult AcquireAndBindConnection(ClientContext &context, const Func
 	// Create fresh if pool miss
 	if (!conn) {
 		conn = create_fresh_connection();
-		if (params.use_pool && !IsHttpTransport(params.worker_path)) {
-			VgiWorkerPool::Instance().RecordMiss(params.worker_path);
+		if (params.use_pool() && !IsHttpTransport(params.worker_path())) {
+			VgiWorkerPool::Instance().RecordMiss(params.worker_path());
 		}
 		VGI_LOG(context, "worker_pool.acquire",
-		        {{"worker_path", params.worker_path},
+		        {{"worker_path", params.worker_path()},
 		         {"worker_pid", std::to_string(conn->GetPid())},
-		         {"result", params.use_pool ? "miss" : "disabled"},
+		         {"result", params.use_pool() ? "miss" : "disabled"},
 		         {"phase", params.phase}});
 	}
 
@@ -91,7 +100,7 @@ AcquireAndBindResult AcquireAndBindConnection(ClientContext &context, const Func
 		// Pooled worker was stale, retry with fresh
 		conn = create_fresh_connection();
 		VGI_LOG(context, "worker_pool.acquire",
-		        {{"worker_path", params.worker_path},
+		        {{"worker_path", params.worker_path()},
 		         {"worker_pid", std::to_string(conn->GetPid())},
 		         {"result", "retry_after_stale"},
 		         {"phase", params.phase}});
@@ -842,11 +851,13 @@ std::unique_ptr<IFunctionConnection> CreateFunctionConnection(
     const std::vector<uint8_t> &global_execution_id,
     bool worker_debug,
     const std::map<std::string, Value> &settings,
-    const std::vector<VgiSecretRequirement> &required_secrets) {
+    const std::vector<VgiSecretRequirement> &required_secrets,
+    const std::shared_ptr<VgiAttachParameters> &attach_params) {
 	if (IsHttpTransport(worker_path)) {
 		return std::make_unique<HttpFunctionConnection>(
 		    worker_path, function_name, arguments, attach_id, transaction_id, context,
-		    function_type, global_execution_id, worker_debug, settings, required_secrets);
+		    function_type, global_execution_id, worker_debug, settings, required_secrets,
+		    attach_params);
 	}
 	return std::make_unique<FunctionConnection>(
 	    worker_path, function_name, arguments, attach_id, transaction_id, context,

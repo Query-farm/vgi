@@ -14,23 +14,30 @@
 namespace duckdb {
 namespace vgi {
 
+// Forward declaration — full definition in vgi_oauth.hpp
+class CatalogAuth;
+
 // Content type for Arrow IPC streams over HTTP
 constexpr const char *ARROW_IPC_CONTENT_TYPE = "application/vnd.apache.arrow.stream";
 
 // Invoke a unary RPC method over HTTP.
 // worker_path includes the prefix, e.g. "http://localhost:8000/vgi".
 // Posts to {worker_path}/{method_name}.
+// auth: per-catalog auth state for bearer token injection and 401 handling.
 UnaryResponseResult HttpInvokeUnary(ClientContext &context,
                                      const std::string &worker_path,
                                      const std::string &method_name,
-                                     const std::shared_ptr<arrow::RecordBatch> &params);
+                                     const std::shared_ptr<arrow::RecordBatch> &params,
+                                     const std::shared_ptr<CatalogAuth> &auth = nullptr);
 
 // POST Arrow IPC bytes to a URL, return raw response body bytes.
 // Used for catalog, stream init, and exchange operations.
 // Timeout is controlled by the vgi_http_timeout_seconds setting (default 300s).
+// auth: per-catalog auth state for bearer token injection and 401 handling.
 std::string HttpPostArrowIpc(ClientContext &context,
                               const std::string &url,
-                              const std::vector<uint8_t> &body);
+                              const std::vector<uint8_t> &body,
+                              const std::shared_ptr<CatalogAuth> &auth = nullptr);
 
 // HTTP GET raw bytes from a URL. Used for fetching externalized batches.
 // Handles X-VGI-Content-Encoding: zstd decompression. No auth headers sent.
@@ -76,7 +83,8 @@ ServerCapabilities HttpDiscoverCapabilities(ClientContext &context, const std::s
 // Request upload URLs from the server. Posts to {base_url}/__upload_url__/init.
 std::vector<UploadUrl> HttpRequestUploadUrls(ClientContext &context,
                                                const std::string &base_url,
-                                               int count);
+                                               int count,
+                                               const std::shared_ptr<CatalogAuth> &auth = nullptr);
 
 // HTTP PUT raw bytes to a URL with optional zstd compression.
 void HttpPutBytes(ClientContext &context, const std::string &url,

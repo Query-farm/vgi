@@ -21,9 +21,6 @@ extern "C" char *duckdb_wasm_get_page_origin(void);
 #include "vgi_logging.hpp"
 #include "duckdb/logging/logger.hpp"
 
-#include "duckdb/catalog/catalog_transaction.hpp"
-#include "duckdb/main/secret/secret_manager.hpp"
-
 #ifndef __EMSCRIPTEN__
 #include <openssl/evp.h>
 #include <openssl/rand.h>
@@ -788,7 +785,7 @@ bool IsHeadlessEnvironment() {
 // Device Code Flow (RFC 8628)
 //===--------------------------------------------------------------------===//
 
-OAuthTokenSet VgiTokenManager::PerformDeviceCodeFlow(const OAuthChallenge &challenge,
+static OAuthTokenSet PerformDeviceCodeFlowImpl(const OAuthChallenge &challenge,
                                                       const OAuthResourceMetadata &resource_meta,
                                                       const OAuthServerMetadata &server_meta,
                                                       ClientContext &context) {
@@ -1025,13 +1022,21 @@ OAuthTokenSet VgiTokenManager::PerformDeviceCodeFlow(const OAuthChallenge &chall
 	}
 }
 
+// Forward declarations for platform-specific flow implementations
+#ifndef __EMSCRIPTEN__
+static OAuthTokenSet PerformPKCEFlowImpl(const OAuthChallenge &challenge,
+                                          const OAuthResourceMetadata &resource_meta,
+                                          const OAuthServerMetadata &server_meta,
+                                          ClientContext &context);
+#endif
+
 //===--------------------------------------------------------------------===//
 // Auth Flow Orchestrator
 //===--------------------------------------------------------------------===//
 
-OAuthTokenSet VgiTokenManager::PerformAuthFlow(const OAuthChallenge &challenge,
-                                                ClientContext &context,
-                                                OAuthRefreshContext &refresh_ctx_out) {
+OAuthTokenSet PerformAuthFlow(const OAuthChallenge &challenge,
+                               ClientContext &context,
+                               OAuthRefreshContext &refresh_ctx_out) {
 	// Read flow setting
 	std::string flow = "auto";
 	Value flow_val;
@@ -1074,48 +1079,48 @@ OAuthTokenSet VgiTokenManager::PerformAuthFlow(const OAuthChallenge &challenge,
 	// PKCE in WASM uses a popup window opened by the main thread, with the auth code
 	// flowing back via SharedArrayBuffer.
 	if (has_auth_ep) {
-		return PerformPKCEFlow(challenge, resource_meta, server_meta, context);
+		return PerformPKCEFlowImpl(challenge, resource_meta, server_meta, context);
 	}
 	if (has_device_ep) {
-		return PerformDeviceCodeFlow(challenge, resource_meta, server_meta, context);
+		return PerformDeviceCodeFlowImpl(challenge, resource_meta, server_meta, context);
 	}
 	throw IOException("VGI OAuth: server supports neither authorization_endpoint (PKCE) nor device_authorization_endpoint");
 #endif
 
 	if (flow == "device_code") {
-		return PerformDeviceCodeFlow(challenge, resource_meta, server_meta, context);
+		return PerformDeviceCodeFlowImpl(challenge, resource_meta, server_meta, context);
 	}
 
 	if (flow == "pkce") {
 		if (!has_auth_ep) {
 			throw IOException("VGI OAuth: PKCE flow requested but server has no authorization_endpoint");
 		}
-		return PerformPKCEFlow(challenge, resource_meta, server_meta, context);
+		return PerformPKCEFlowImpl(challenge, resource_meta, server_meta, context);
 	}
 
 	// Auto mode
 	// Server only has device endpoint
 	if (!has_auth_ep && has_device_ep) {
 		VGI_STDERR_DEBUG("[VGI] oauth.auto_flow chose=device_code reason=no_authorization_endpoint\n");
-		return PerformDeviceCodeFlow(challenge, resource_meta, server_meta, context);
+		return PerformDeviceCodeFlowImpl(challenge, resource_meta, server_meta, context);
 	}
 
 	// Headless environment
 	if (has_device_ep && IsHeadlessEnvironment()) {
 		VGI_STDERR_DEBUG("[VGI] oauth.auto_flow chose=device_code reason=headless_environment\n");
-		return PerformDeviceCodeFlow(challenge, resource_meta, server_meta, context);
+		return PerformDeviceCodeFlowImpl(challenge, resource_meta, server_meta, context);
 	}
 
 	// Try PKCE, fallback to device code on socket bind failure
 	if (has_auth_ep) {
 		try {
-			return PerformPKCEFlow(challenge, resource_meta, server_meta, context);
+			return PerformPKCEFlowImpl(challenge, resource_meta, server_meta, context);
 		} catch (const IOException &e) {
 			// Only fallback on socket bind/listen failures
 			std::string msg = e.what();
 			if (has_device_ep && msg.find("failed to bind local callback server") != std::string::npos) {
 				VGI_STDERR_DEBUG("[VGI] oauth.auto_flow chose=device_code reason=pkce_bind_failed\n");
-				return PerformDeviceCodeFlow(challenge, resource_meta, server_meta, context);
+				return PerformDeviceCodeFlowImpl(challenge, resource_meta, server_meta, context);
 			}
 			throw;
 		}
@@ -1309,7 +1314,7 @@ static std::string GetResourceDisplayName(const OAuthResourceMetadata &meta) {
 //===--------------------------------------------------------------------===//
 
 #ifdef __EMSCRIPTEN__
-OAuthTokenSet VgiTokenManager::PerformPKCEFlow(const OAuthChallenge &challenge,
+static OAuthTokenSet PerformPKCEFlowImpl(const OAuthChallenge &challenge,
                                                 const OAuthResourceMetadata &resource_meta,
                                                 const OAuthServerMetadata &server_meta,
                                                 ClientContext &context) {
@@ -1384,7 +1389,7 @@ OAuthTokenSet VgiTokenManager::PerformPKCEFlow(const OAuthChallenge &challenge,
 	return tokens;
 }
 #else
-OAuthTokenSet VgiTokenManager::PerformPKCEFlow(const OAuthChallenge &challenge,
+static OAuthTokenSet PerformPKCEFlowImpl(const OAuthChallenge &challenge,
                                                 const OAuthResourceMetadata &resource_meta,
                                                 const OAuthServerMetadata &server_meta,
                                                 ClientContext &context) {
@@ -1557,15 +1562,219 @@ OAuthTokenSet VgiTokenManager::PerformPKCEFlow(const OAuthChallenge &challenge,
 #endif // !__EMSCRIPTEN__
 
 //===--------------------------------------------------------------------===//
-// VgiTokenManager
+// BearerTokenCatalogAuth
 //===--------------------------------------------------------------------===//
 
-VgiTokenManager &VgiTokenManager::Instance() {
-	static VgiTokenManager instance;
-	return instance;
+BearerTokenCatalogAuth::BearerTokenCatalogAuth(std::string token) : token_(std::move(token)) {
 }
 
-std::string VgiTokenManager::ExtractOrigin(const std::string &url) {
+std::string BearerTokenCatalogAuth::GetToken() {
+	std::lock_guard<std::mutex> lock(mutex_);
+	return token_;
+}
+
+std::string BearerTokenCatalogAuth::HandleUnauthorized(const OAuthChallenge &challenge, ClientContext &context) {
+	throw IOException("VGI HTTP authentication failed (HTTP 401): bearer token was rejected by the server. "
+	                  "The static bearer_token provided at ATTACH time is not valid or has expired.");
+}
+
+void BearerTokenCatalogAuth::ClearTokens() {
+	std::lock_guard<std::mutex> lock(mutex_);
+	token_.clear();
+}
+
+//===--------------------------------------------------------------------===//
+// OAuthCatalogAuth
+//===--------------------------------------------------------------------===//
+
+OAuthCatalogAuth::OAuthCatalogAuth() {
+}
+
+std::string OAuthCatalogAuth::GetToken() {
+	std::lock_guard<std::mutex> lock(mutex_);
+	if (state_.status != AuthState::Status::COMPLETE || !state_.token.IsValid()) {
+		return "";
+	}
+	return state_.token.BearerToken();
+}
+
+void OAuthCatalogAuth::SeedRefreshToken(const std::string &refresh_token) {
+	std::lock_guard<std::mutex> lock(mutex_);
+	if (state_.status == AuthState::Status::IDLE) {
+		state_.token.refresh_token = refresh_token;
+	}
+}
+
+std::string OAuthCatalogAuth::HandleUnauthorized(const OAuthChallenge &challenge, ClientContext &context) {
+	// Check if OAuth is enabled
+	Value oauth_enabled_val;
+	if (context.TryGetCurrentSetting("vgi_oauth_enabled", oauth_enabled_val)) {
+		if (!oauth_enabled_val.GetValue<bool>()) {
+			throw IOException("VGI HTTP authentication required (HTTP 401) but vgi_oauth_enabled is false. "
+			                  "Set vgi_oauth_enabled=true to enable OAuth authentication.");
+		}
+	}
+
+	std::unique_lock<std::mutex> lock(mutex_);
+
+	// Helper: store successful auth result in state (must hold lock).
+	auto StoreSuccess = [&](OAuthTokenSet tokens, const OAuthRefreshContext &rctx) -> std::string {
+		state_.token = std::move(tokens);
+		state_.refresh_ctx = rctx;
+		state_.status = AuthState::Status::COMPLETE;
+		state_.cv.notify_all();
+		return state_.token.BearerToken();
+	};
+
+	// Helper: store failure in state (must hold lock).
+	auto StoreFailed = [&](const std::string &error_msg) {
+		state_.status = AuthState::Status::FAILED;
+		state_.error_message = error_msg;
+		state_.cv.notify_all();
+	};
+
+	// Helper: attempt refresh, then fall back to full auth flow.
+	// Called with lock released. Re-acquires lock on success/failure.
+	auto RefreshOrFullAuth = [&](std::string refresh_token, OAuthRefreshContext refresh_ctx) -> std::string {
+		// Attempt token refresh if we have a refresh_token
+		if (!refresh_token.empty()) {
+			// Discover metadata if we have a token but no refresh context
+			// (e.g., seeded via ATTACH oauth_refresh_token option)
+			if (refresh_ctx.token_endpoint.empty()) {
+				try {
+					refresh_ctx = DiscoverRefreshContext(challenge, context);
+					VGI_STDERR_DEBUG("[VGI] oauth.discovered_refresh_context endpoint=%s\n",
+					                 refresh_ctx.token_endpoint.c_str());
+				} catch (const std::exception &e) {
+					DUCKDB_LOG_WARNING(context,
+					    "VGI OAuth: failed to discover auth server metadata for token refresh, "
+					    "falling back to interactive auth: " + std::string(e.what()));
+				}
+			}
+			if (!refresh_ctx.token_endpoint.empty()) {
+				try {
+					VGI_STDERR_DEBUG("[VGI] oauth.attempting_refresh\n");
+					auto tokens = AttemptTokenRefresh(refresh_ctx, refresh_token, context);
+					// Preserve old refresh_token if response omits new one (Google behavior)
+					if (tokens.refresh_token.empty()) {
+						tokens.refresh_token = refresh_token;
+					}
+					lock.lock();
+					return StoreSuccess(std::move(tokens), refresh_ctx);
+				} catch (const std::exception &e) {
+					// Do NOT silently fall through to PerformAuthFlow.
+					// When token refresh fails (e.g., invalid_grant), rethrow
+					// immediately so the caller sees the actual refresh failure.
+					// This is critical for WASM/cupola where the origin isn't a
+					// registered OAuth client — falling through would mask the
+					// real error behind a misleading "token exchange failed" message.
+					std::string refresh_err = e.what();
+					if (refresh_err.find("invalid_grant") != std::string::npos) {
+						VGI_STDERR_DEBUG("[VGI] oauth.clearing_stale_refresh_token\n");
+					}
+					lock.lock();
+					// Clear stale refresh token on invalid_grant
+					if (refresh_err.find("invalid_grant") != std::string::npos) {
+						state_.token.refresh_token.clear();
+					}
+					StoreFailed(refresh_err);
+					throw;
+				}
+			}
+		}
+
+		// Full auth flow — only reached when no refresh_token was available
+		try {
+			OAuthRefreshContext new_refresh_ctx;
+			auto tokens = PerformAuthFlow(challenge, context, new_refresh_ctx);
+			lock.lock();
+			return StoreSuccess(std::move(tokens), new_refresh_ctx);
+		} catch (const std::exception &e) {
+			lock.lock();
+			StoreFailed(e.what());
+			throw;
+		}
+	};
+
+	switch (state_.status) {
+	case AuthState::Status::IDLE:
+	case AuthState::Status::FAILED: {
+		state_.status = AuthState::Status::IN_PROGRESS;
+		state_.error_message.clear();
+		std::string refresh_token = state_.token.refresh_token;
+		OAuthRefreshContext refresh_ctx = state_.refresh_ctx;
+		lock.unlock();
+		return RefreshOrFullAuth(std::move(refresh_token), std::move(refresh_ctx));
+	}
+
+	case AuthState::Status::IN_PROGRESS: {
+		// Another thread is already doing the auth flow — wait
+		VGI_STDERR_DEBUG("[VGI] oauth.waiting_for_auth\n");
+		state_.cv.wait(lock, [this]() {
+			return state_.status != AuthState::Status::IN_PROGRESS;
+		});
+
+		if (state_.status == AuthState::Status::COMPLETE && state_.token.IsValid()) {
+			return state_.token.BearerToken();
+		}
+		if (state_.status == AuthState::Status::IDLE) {
+			throw IOException("VGI OAuth: tokens were cleared during authentication, please retry");
+		}
+		throw IOException("VGI OAuth: authentication failed: %s", state_.error_message);
+	}
+
+	case AuthState::Status::COMPLETE: {
+		// Token exists but server returned 401 — token may be stale.
+		state_.status = AuthState::Status::IN_PROGRESS;
+		state_.error_message.clear();
+		std::string refresh_token = state_.token.refresh_token;
+		OAuthRefreshContext refresh_ctx = state_.refresh_ctx;
+		lock.unlock();
+		return RefreshOrFullAuth(std::move(refresh_token), std::move(refresh_ctx));
+	}
+	}
+
+	return "";
+}
+
+void OAuthCatalogAuth::ClearTokens() {
+	std::lock_guard<std::mutex> lock(mutex_);
+	state_.token = OAuthTokenSet();
+	state_.refresh_ctx = OAuthRefreshContext();
+	state_.status = AuthState::Status::IDLE;
+	state_.error_message.clear();
+	state_.cv.notify_all();
+}
+
+bool OAuthCatalogAuth::GetTokenInfo(TokenInfo &info) {
+	std::lock_guard<std::mutex> lock(mutex_);
+	if (state_.status != AuthState::Status::COMPLETE) {
+		return false;
+	}
+	info.has_refresh_token = !state_.token.refresh_token.empty();
+	auto now = std::chrono::steady_clock::now();
+	if (state_.token.expires_at > std::chrono::steady_clock::time_point()) {
+		info.has_expires = true;
+		info.expires_in_seconds = std::chrono::duration_cast<std::chrono::seconds>(
+		    state_.token.expires_at - now).count();
+	} else {
+		info.has_expires = false;
+		info.expires_in_seconds = 0;
+	}
+	return true;
+}
+
+bool OAuthCatalogAuth::GetTokenSetCopy(OAuthTokenSet &out) {
+	std::lock_guard<std::mutex> lock(mutex_);
+	if (state_.status != AuthState::Status::COMPLETE) {
+		return false;
+	}
+	out = state_.token;
+	return true;
+}
+
+
+std::string ExtractOrigin(const std::string &url) {
 	// Extract scheme://host:port from a URL
 	auto scheme_end = url.find("://");
 	if (scheme_end == std::string::npos) {
@@ -1579,16 +1788,7 @@ std::string VgiTokenManager::ExtractOrigin(const std::string &url) {
 	return url.substr(0, path_start);
 }
 
-void VgiTokenManager::SeedRefreshToken(const std::string &origin, const std::string &refresh_token) {
-	std::lock_guard<std::mutex> lock(mutex_);
-	auto &state = auth_states_[origin];
-	if (state.status == AuthState::Status::IDLE) {
-		state.token.refresh_token = refresh_token;
-	}
-	// If not IDLE (e.g., already authenticated), don't overwrite active state
-}
-
-OAuthRefreshContext VgiTokenManager::DiscoverRefreshContext(const OAuthChallenge &challenge, ClientContext &context) {
+OAuthRefreshContext DiscoverRefreshContext(const OAuthChallenge &challenge, ClientContext &context) {
 	auto resource_meta = FetchResourceMetadata(context, challenge.resource_metadata_url);
 
 	std::string client_id = resource_meta.client_id.empty() ? challenge.client_id : resource_meta.client_id;
@@ -1608,271 +1808,13 @@ OAuthRefreshContext VgiTokenManager::DiscoverRefreshContext(const OAuthChallenge
 	return ctx;
 }
 
-std::string VgiTokenManager::GetToken(const std::string &origin) {
-	std::lock_guard<std::mutex> lock(mutex_);
-	auto it = auth_states_.find(origin);
-	if (it == auth_states_.end()) {
-		return "";
-	}
-
-	auto &state = it->second;
-	if (state.status != AuthState::Status::COMPLETE || !state.token.IsValid()) {
-		return "";
-	}
-
-	return state.token.BearerToken();
-}
-
-std::string VgiTokenManager::HandleUnauthorized(const std::string &origin,
-                                                 const OAuthChallenge &challenge,
-                                                 ClientContext &context) {
-	// Check if OAuth is enabled
-	Value oauth_enabled_val;
-	if (context.TryGetCurrentSetting("vgi_oauth_enabled", oauth_enabled_val)) {
-		if (!oauth_enabled_val.GetValue<bool>()) {
-			throw IOException("VGI HTTP authentication required (HTTP 401) but vgi_oauth_enabled is false. "
-			                  "Set vgi_oauth_enabled=true to enable OAuth authentication.");
-		}
-	}
-
-	std::unique_lock<std::mutex> lock(mutex_);
-
-	// Helper: store successful auth result in state (must hold lock), then persist.
-	// Returns bearer token. Unlocks, persists, and returns.
-	auto StoreAndPersist = [&](OAuthTokenSet tokens, const OAuthRefreshContext &rctx) -> std::string {
-		auto &s = auth_states_[origin]; // re-lookup: map entry may have been recreated
-		s.token = std::move(tokens);
-		s.refresh_ctx = rctx;
-		s.status = AuthState::Status::COMPLETE;
-		s.cv.notify_all();
-		auto bearer = s.token.BearerToken();
-		auto persist_tokens = s.token;
-		lock.unlock();
-		PersistRefreshToken(context, origin, persist_tokens, rctx);
-		return bearer;
-	};
-
-	// Helper: store failure in state (must hold lock).
-	auto StoreFailed = [&](const std::string &error_msg) {
-		auto &s = auth_states_[origin]; // re-lookup
-		s.status = AuthState::Status::FAILED;
-		s.error_message = error_msg;
-		s.cv.notify_all();
-	};
-
-	// Helper: attempt refresh, then fall back to full auth flow.
-	// Called with lock released. Re-acquires lock on success/failure.
-	auto RefreshOrFullAuth = [&](std::string refresh_token, OAuthRefreshContext refresh_ctx) -> std::string {
-		// Try loading persisted refresh token if we don't have one in memory
-		if (refresh_token.empty()) {
-			try {
-				LoadPersistedRefreshToken(context, origin, refresh_ctx, refresh_token);
-			} catch (...) {}
-		}
-
-		// Attempt token refresh if we have a refresh_token
-		if (!refresh_token.empty()) {
-			// Discover metadata if we have a token but no refresh context
-			// (e.g., seeded via ATTACH oauth_refresh_token option)
-			if (refresh_ctx.token_endpoint.empty()) {
-				try {
-					refresh_ctx = DiscoverRefreshContext(challenge, context);
-					VGI_STDERR_DEBUG("[VGI] oauth.discovered_refresh_context origin=%s endpoint=%s\n",
-					                 origin.c_str(), refresh_ctx.token_endpoint.c_str());
-				} catch (const std::exception &e) {
-					DUCKDB_LOG_WARNING(context,
-					    "VGI OAuth: failed to discover auth server metadata for token refresh, "
-					    "falling back to interactive auth: " + std::string(e.what()));
-				}
-			}
-			if (!refresh_ctx.token_endpoint.empty()) {
-				try {
-					VGI_STDERR_DEBUG("[VGI] oauth.attempting_refresh origin=%s\n", origin.c_str());
-					auto tokens = AttemptTokenRefresh(refresh_ctx, refresh_token, context);
-					// Preserve old refresh_token if response omits new one (Google behavior)
-					if (tokens.refresh_token.empty()) {
-						tokens.refresh_token = refresh_token;
-					}
-					lock.lock();
-					return StoreAndPersist(std::move(tokens), refresh_ctx);
-				} catch (const std::exception &e) {
-					// Do NOT silently fall through to PerformAuthFlow. Previously
-					// this caught refresh failures and tried interactive auth,
-					// which in WASM/cupola always hits a broken code-exchange
-					// path (cupola's origin isn't a registered OAuth client).
-					// The fall-through masked the real refresh error behind a
-					// misleading "token exchange failed" message.
-					//
-					// Rethrow immediately so the caller sees the actual refresh
-					// failure — including the full request body, token endpoint,
-					// and redacted refresh_token details from AttemptTokenRefresh's
-					// enriched IOException. On invalid_grant, also clean up any
-					// persisted stale token on the way out.
-					std::string refresh_err = e.what();
-					if (refresh_err.find("invalid_grant") != std::string::npos) {
-						VGI_STDERR_DEBUG("[VGI] oauth.removing_stale_persisted_token origin=%s\n",
-						                 origin.c_str());
-						try { RemovePersistedToken(context, origin); } catch (...) {}
-					}
-					lock.lock();
-					StoreFailed(refresh_err);
-					throw;
-				}
-			}
-		}
-
-		// Full auth flow — only reached when no refresh_token was available
-		// to try in the first place (neither seeded via ATTACH nor loaded
-		// from persistent storage).
-		try {
-			OAuthRefreshContext new_refresh_ctx;
-			auto tokens = PerformAuthFlow(challenge, context, new_refresh_ctx);
-			lock.lock();
-			return StoreAndPersist(std::move(tokens), new_refresh_ctx);
-		} catch (const std::exception &e) {
-			lock.lock();
-			StoreFailed(e.what());
-			throw;
-		}
-	};
-	auto &state = auth_states_[origin];
-
-	switch (state.status) {
-	case AuthState::Status::IDLE:
-	case AuthState::Status::FAILED: {
-		state.status = AuthState::Status::IN_PROGRESS;
-		state.error_message.clear();
-		std::string refresh_token = state.token.refresh_token;
-		OAuthRefreshContext refresh_ctx = state.refresh_ctx;
-		lock.unlock();
-		return RefreshOrFullAuth(std::move(refresh_token), std::move(refresh_ctx));
-	}
-
-	case AuthState::Status::IN_PROGRESS: {
-		// Another thread is already doing the auth flow — wait
-		VGI_STDERR_DEBUG("[VGI] oauth.waiting_for_auth origin=%s\n", origin.c_str());
-		state.cv.wait(lock, [&state]() {
-			return state.status != AuthState::Status::IN_PROGRESS;
-		});
-
-		if (state.status == AuthState::Status::COMPLETE && state.token.IsValid()) {
-			return state.token.BearerToken();
-		}
-		if (state.status == AuthState::Status::IDLE) {
-			// Tokens were cleared while we were waiting — caller should retry
-			throw IOException("VGI OAuth: tokens were cleared for %s, please retry", origin);
-		}
-		throw IOException("VGI OAuth: authentication failed for %s: %s",
-		                  origin, state.error_message);
-	}
-
-	case AuthState::Status::COMPLETE: {
-		// Token exists but server returned 401 — token may be stale.
-		state.status = AuthState::Status::IN_PROGRESS;
-		state.error_message.clear();
-		std::string refresh_token = state.token.refresh_token;
-		OAuthRefreshContext refresh_ctx = state.refresh_ctx;
-		lock.unlock();
-		return RefreshOrFullAuth(std::move(refresh_token), std::move(refresh_ctx));
-	}
-	}
-
-	return "";
-}
-
-void VgiTokenManager::ClearTokens(const std::string &origin) {
-	std::lock_guard<std::mutex> lock(mutex_);
-	auto it = auth_states_.find(origin);
-	if (it != auth_states_.end()) {
-		// Reset to IDLE so next request triggers fresh auth.
-		// Don't erase — other threads may hold references to the CV.
-		it->second.token = OAuthTokenSet();
-		it->second.refresh_ctx = OAuthRefreshContext();
-		it->second.status = AuthState::Status::IDLE;
-		it->second.error_message.clear();
-		it->second.cv.notify_all();
-	}
-}
-
-void VgiTokenManager::ClearTokens(ClientContext &context, const std::string &origin) {
-	{
-		std::lock_guard<std::mutex> lock(mutex_);
-		auto it = auth_states_.find(origin);
-		if (it != auth_states_.end()) {
-			it->second.token = OAuthTokenSet();
-			it->second.refresh_ctx = OAuthRefreshContext();
-			it->second.status = AuthState::Status::IDLE;
-			it->second.error_message.clear();
-			it->second.cv.notify_all();
-		}
-	}
-	RemovePersistedToken(context, origin);
-}
-
-void VgiTokenManager::ClearAllTokens(ClientContext &context) {
-	std::vector<std::string> origins;
-	{
-		std::lock_guard<std::mutex> lock(mutex_);
-		for (auto &entry : auth_states_) {
-			origins.push_back(entry.first);
-			entry.second.token = OAuthTokenSet();
-			entry.second.refresh_ctx = OAuthRefreshContext();
-			entry.second.status = AuthState::Status::IDLE;
-			entry.second.error_message.clear();
-			entry.second.cv.notify_all();
-		}
-	}
-	for (const auto &o : origins) {
-		RemovePersistedToken(context, o);
-	}
-}
-
-std::vector<std::string> VgiTokenManager::GetAllOrigins() {
-	std::lock_guard<std::mutex> lock(mutex_);
-	std::vector<std::string> origins;
-	for (const auto &entry : auth_states_) {
-		origins.push_back(entry.first);
-	}
-	return origins;
-}
-
-bool VgiTokenManager::GetTokenInfo(const std::string &origin, TokenInfo &info) {
-	std::lock_guard<std::mutex> lock(mutex_);
-	auto it = auth_states_.find(origin);
-	if (it == auth_states_.end() || it->second.status != AuthState::Status::COMPLETE) {
-		return false;
-	}
-	auto &state = it->second;
-	info.has_refresh_token = !state.token.refresh_token.empty();
-	auto now = std::chrono::steady_clock::now();
-	if (state.token.expires_at > std::chrono::steady_clock::time_point()) {
-		info.has_expires = true;
-		info.expires_in_seconds = std::chrono::duration_cast<std::chrono::seconds>(
-		    state.token.expires_at - now).count();
-	} else {
-		info.has_expires = false;
-		info.expires_in_seconds = 0;
-	}
-	return true;
-}
-
-bool VgiTokenManager::GetTokenSetCopy(const std::string &origin, OAuthTokenSet &out) {
-	std::lock_guard<std::mutex> lock(mutex_);
-	auto it = auth_states_.find(origin);
-	if (it == auth_states_.end() || it->second.status != AuthState::Status::COMPLETE) {
-		return false;
-	}
-	out = it->second.token;
-	return true;
-}
-
 //===--------------------------------------------------------------------===//
 // Token Refresh
 //===--------------------------------------------------------------------===//
 
-OAuthTokenSet VgiTokenManager::AttemptTokenRefresh(const OAuthRefreshContext &ctx,
-                                                    const std::string &refresh_token,
-                                                    ClientContext &context) {
+OAuthTokenSet AttemptTokenRefresh(const OAuthRefreshContext &ctx,
+                                  const std::string &refresh_token,
+                                  ClientContext &context) {
 	EnforceHttpsUrl(ctx.token_endpoint, "token endpoint (refresh)");
 
 	std::string body = "grant_type=refresh_token"
@@ -1918,152 +1860,6 @@ OAuthTokenSet VgiTokenManager::AttemptTokenRefresh(const OAuthRefreshContext &ct
 	auto tokens = ParseTokenResponse(resp.body, "refresh token response");
 	tokens.use_id_token = ctx.use_id_token;
 	return tokens;
-}
-
-//===--------------------------------------------------------------------===//
-// Secret Persistence
-//===--------------------------------------------------------------------===//
-
-std::string VgiTokenManager::SecretNameForOrigin(const std::string &origin) {
-#ifdef __EMSCRIPTEN__
-	// Simple FNV-1a hash (no OpenSSL in WASM)
-	uint64_t h1 = 14695981039346656037ULL, h2 = 6231912018660862937ULL;
-	for (auto c : origin) { h1 ^= c; h1 *= 1099511628211ULL; h2 ^= c; h2 *= 1099511628211ULL; h2 = (h2 << 7) | (h2 >> 57); }
-	unsigned char hash[16];
-	memcpy(hash, &h1, 8); memcpy(hash + 8, &h2, 8);
-#else
-	unsigned char hash[SHA256_DIGEST_LENGTH];
-	SHA256(reinterpret_cast<const unsigned char *>(origin.data()), origin.size(), hash);
-#endif
-
-	// Take first 16 bytes → 32 hex chars
-	static const char hex[] = "0123456789abcdef";
-	std::string hex_str;
-	hex_str.reserve(32);
-	for (int i = 0; i < 16; i++) {
-		hex_str += hex[(hash[i] >> 4) & 0xF];
-		hex_str += hex[hash[i] & 0xF];
-	}
-	return "vgi_oauth_" + hex_str;
-}
-
-void VgiTokenManager::PersistRefreshToken(ClientContext &context, const std::string &origin,
-                                           const OAuthTokenSet &tokens, const OAuthRefreshContext &ctx) {
-	if (tokens.refresh_token.empty()) {
-		return;
-	}
-
-	try {
-		// Check vgi_oauth_persist setting
-		Value persist_val;
-		if (context.TryGetCurrentSetting("vgi_oauth_persist", persist_val)) {
-			if (!persist_val.GetValue<bool>()) {
-				return;
-			}
-		}
-
-		auto &secret_manager = SecretManager::Get(context);
-		auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
-
-		auto secret_name = SecretNameForOrigin(origin);
-		vector<string> scope_vec = {origin};
-
-		auto BuildSecret = [&]() {
-			auto s = make_uniq<KeyValueSecret>(scope_vec, "vgi_oauth_refresh_token", "config", secret_name);
-			s->secret_map["refresh_token"] = Value(tokens.refresh_token);
-			s->secret_map["token_endpoint"] = Value(ctx.token_endpoint);
-			s->secret_map["client_id"] = Value(ctx.client_id);
-			s->secret_map["client_secret"] = Value(ctx.client_secret);
-			s->secret_map["scope"] = Value(ctx.scope);
-			s->secret_map["use_id_token"] = Value(ctx.use_id_token ? "true" : "false");
-			s->secret_map["resource_metadata_url"] = Value(ctx.resource_metadata_url);
-			s->secret_map["origin"] = Value(origin);
-			s->redact_keys.insert("refresh_token");
-			s->redact_keys.insert("client_secret");
-			return s;
-		};
-
-		// Try persistent first, fall back to temporary
-		try {
-			if (secret_manager.PersistentSecretsEnabled()) {
-				secret_manager.RegisterSecret(transaction, BuildSecret(),
-				                              OnCreateConflict::REPLACE_ON_CONFLICT,
-				                              SecretPersistType::PERSISTENT);
-				VGI_STDERR_DEBUG("[VGI] oauth.persisted_refresh_token origin=%s type=persistent\n", origin.c_str());
-				return;
-			}
-		} catch (const std::exception &e) {
-			VGI_STDERR_DEBUG("[VGI] oauth.persist_failed origin=%s error=%s (trying temporary)\n",
-			                 origin.c_str(), e.what());
-		}
-
-		secret_manager.RegisterSecret(transaction, BuildSecret(),
-		                              OnCreateConflict::REPLACE_ON_CONFLICT,
-		                              SecretPersistType::TEMPORARY);
-		VGI_STDERR_DEBUG("[VGI] oauth.persisted_refresh_token origin=%s type=temporary\n", origin.c_str());
-	} catch (const std::exception &e) {
-		VGI_STDERR_DEBUG("[VGI] oauth.persist_refresh_token_failed origin=%s error=%s\n",
-		                 origin.c_str(), e.what());
-	}
-}
-
-bool VgiTokenManager::LoadPersistedRefreshToken(ClientContext &context, const std::string &origin,
-                                                 OAuthRefreshContext &ctx_out, std::string &refresh_token_out) {
-	try {
-		auto &secret_manager = SecretManager::Get(context);
-		auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
-		auto secret_name = SecretNameForOrigin(origin);
-
-		auto entry = secret_manager.GetSecretByName(transaction, secret_name);
-		if (!entry) {
-			return false;
-		}
-
-		auto &kv_secret = dynamic_cast<const KeyValueSecret &>(*entry->secret);
-
-		auto rt = kv_secret.TryGetValue("refresh_token");
-		if (rt.IsNull() || rt.ToString().empty()) {
-			return false;
-		}
-		refresh_token_out = rt.ToString();
-
-		auto te = kv_secret.TryGetValue("token_endpoint");
-		if (!te.IsNull()) ctx_out.token_endpoint = te.ToString();
-
-		auto ci = kv_secret.TryGetValue("client_id");
-		if (!ci.IsNull()) ctx_out.client_id = ci.ToString();
-
-		auto cs = kv_secret.TryGetValue("client_secret");
-		if (!cs.IsNull()) ctx_out.client_secret = cs.ToString();
-
-		auto sc = kv_secret.TryGetValue("scope");
-		if (!sc.IsNull()) ctx_out.scope = sc.ToString();
-
-		auto ui = kv_secret.TryGetValue("use_id_token");
-		if (!ui.IsNull()) ctx_out.use_id_token = (ui.ToString() == "true");
-
-		auto rm = kv_secret.TryGetValue("resource_metadata_url");
-		if (!rm.IsNull()) ctx_out.resource_metadata_url = rm.ToString();
-
-		VGI_STDERR_DEBUG("[VGI] oauth.loaded_persisted_token origin=%s\n", origin.c_str());
-		return true;
-	} catch (const std::exception &e) {
-		VGI_STDERR_DEBUG("[VGI] oauth.load_persisted_token_failed origin=%s error=%s\n",
-		                 origin.c_str(), e.what());
-		return false;
-	}
-}
-
-void VgiTokenManager::RemovePersistedToken(ClientContext &context, const std::string &origin) {
-	try {
-		auto &secret_manager = SecretManager::Get(context);
-		auto secret_name = SecretNameForOrigin(origin);
-		secret_manager.DropSecretByName(context, secret_name, OnEntryNotFound::RETURN_NULL);
-		VGI_STDERR_DEBUG("[VGI] oauth.removed_persisted_token origin=%s\n", origin.c_str());
-	} catch (const std::exception &e) {
-		VGI_STDERR_DEBUG("[VGI] oauth.remove_persisted_token_failed origin=%s error=%s\n",
-		                 origin.c_str(), e.what());
-	}
 }
 
 } // namespace vgi

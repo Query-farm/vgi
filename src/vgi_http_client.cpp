@@ -170,12 +170,14 @@ static std::string HttpPostArrowIpcInternal(ClientContext &context,
 
 std::string HttpPostArrowIpc(ClientContext &context,
                               const std::string &url,
-                              const std::vector<uint8_t> &body) {
-	auto origin = VgiTokenManager::ExtractOrigin(url);
-	auto &token_manager = VgiTokenManager::Instance();
+                              const std::vector<uint8_t> &body,
+                              const std::shared_ptr<CatalogAuth> &auth) {
+	// Get cached token from per-catalog auth (if any)
+	std::string token;
+	if (auth) {
+		token = auth->GetToken();
+	}
 
-	// Try with cached token (if any)
-	auto token = token_manager.GetToken(origin);
 	std::unique_ptr<HTTPResponse> response;
 	auto result = HttpPostArrowIpcInternal(context, url, body, token, response);
 
@@ -183,7 +185,24 @@ std::string HttpPostArrowIpc(ClientContext &context,
 		return result;
 	}
 
-	// Got 401 — try OAuth PKCE flow
+	// Got 401 — need auth to handle it
+	if (!auth) {
+		throw IOException("VGI HTTP authentication required (HTTP 401) but no auth configured for this catalog "
+		                  "[url: %s]. Use bearer_token or oauth_refresh_token in ATTACH options.",
+		                  url);
+	}
+
+	// Check for WWW-Authenticate header (OAuth discovery). If absent, the server
+	// rejected the token outright (e.g., static bearer auth) — let the auth handler decide.
+	if (!response->HasHeader("WWW-Authenticate")) {
+		// No WWW-Authenticate: let auth->HandleUnauthorized decide. For bearer tokens
+		// this throws immediately. For OAuth without a challenge, we provide an empty one.
+		OAuthChallenge empty_challenge;
+		auth->HandleUnauthorized(empty_challenge, context);
+		// If HandleUnauthorized didn't throw (shouldn't happen), surface a generic error
+		throw IOException("VGI HTTP authentication failed (HTTP 401) [url: %s]", url);
+	}
+
 	auto www_auth = response->GetHeaderValue("WWW-Authenticate");
 	auto challenge = ParseWWWAuthenticate(www_auth);
 	if (!challenge.has_value()) {
@@ -195,13 +214,13 @@ std::string HttpPostArrowIpc(ClientContext &context,
 	VGI_STDERR_DEBUG("[VGI] http.401_received url=%s resource_metadata=%s\n",
 	                 url.c_str(), challenge->resource_metadata_url.c_str());
 
-	// Perform or wait for OAuth flow
-	auto new_token = token_manager.HandleUnauthorized(origin, *challenge, context);
+	// Perform or wait for auth flow (OAuth PKCE/device code)
+	auto new_token = auth->HandleUnauthorized(*challenge, context);
 
 	// Retry with new token
 	result = HttpPostArrowIpcInternal(context, url, body, new_token, response);
 	if (response->status == HTTPStatusCode::Unauthorized_401) {
-		throw IOException("VGI HTTP authentication failed after OAuth flow (HTTP 401) [url: %s]. "
+		throw IOException("VGI HTTP authentication failed after auth flow (HTTP 401) [url: %s]. "
 		                  "Response: %s", url, response->body);
 	}
 
@@ -211,7 +230,8 @@ std::string HttpPostArrowIpc(ClientContext &context,
 UnaryResponseResult HttpInvokeUnary(ClientContext &context,
                                      const std::string &worker_path,
                                      const std::string &method_name,
-                                     const std::shared_ptr<arrow::RecordBatch> &params) {
+                                     const std::shared_ptr<arrow::RecordBatch> &params,
+                                     const std::shared_ptr<CatalogAuth> &auth) {
 	std::string base_url = NormalizeBaseUrl(worker_path);
 	std::string url = base_url + "/" + method_name;
 
@@ -227,7 +247,7 @@ UnaryResponseResult HttpInvokeUnary(ClientContext &context,
 	}
 
 	// POST to {worker_path}/{method_name} using standard HTTP timeout
-	auto response_body = HttpPostArrowIpc(context, url, body);
+	auto response_body = HttpPostArrowIpc(context, url, body, auth);
 
 	// Parse the Arrow IPC response
 	auto result = ReadUnaryResponseFromBuffer(
@@ -454,7 +474,8 @@ ServerCapabilities HttpDiscoverCapabilities(ClientContext &context, const std::s
 
 std::vector<UploadUrl> HttpRequestUploadUrls(ClientContext &context,
                                                const std::string &base_url,
-                                               int count) {
+                                               int count,
+                                               const std::shared_ptr<CatalogAuth> &auth) {
 	// Serialize Arrow batch {count: int64}
 	auto count_field = arrow::field("count", arrow::int64());
 	auto schema = arrow::schema({count_field});
@@ -465,7 +486,7 @@ std::vector<UploadUrl> HttpRequestUploadUrls(ClientContext &context,
 	auto batch = arrow::RecordBatch::Make(schema, 1, {count_array_result.ValueUnsafe()});
 
 	// POST to __upload_url__/init (HttpInvokeUnary normalizes base_url internally)
-	auto result = HttpInvokeUnary(context, base_url, "__upload_url__/init", batch);
+	auto result = HttpInvokeUnary(context, base_url, "__upload_url__/init", batch, auth);
 
 	if (!result.batch || result.batch->num_rows() == 0) {
 		throw IOException("VGI server returned no upload URLs [url: %s]", base_url);

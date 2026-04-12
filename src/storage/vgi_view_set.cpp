@@ -63,10 +63,8 @@ optional_ptr<CatalogEntry> VgiViewSet::GetEntry(ClientContext &context, const st
 	}
 
 	auto &vgi_tx = VgiTransaction::Get(context, catalog_);
-	auto view_info_opt = vgi::InvokeCatalogViewGet(attach_params->worker_path(), attach_result->attach_id,
-	                                                schema_.name, name, context, vgi_tx.GetTransactionId(),
-	                                                attach_params->worker_debug(),
-	                                                attach_params->use_pool());
+	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_id, vgi_tx.GetTransactionId()};
+	auto view_info_opt = vgi::InvokeCatalogViewGet(rpc_ctx, schema_.name, name, context);
 
 	if (!view_info_opt) {
 		return nullptr;
@@ -91,10 +89,8 @@ void VgiViewSet::LoadEntries(ClientContext &context) {
 
 	// Call catalog_schema_contents_views via RPC
 	auto &vgi_tx_load = VgiTransaction::Get(context, catalog_);
-	auto views = vgi::InvokeCatalogSchemaContentsViews(attach_params->worker_path(), attach_result->attach_id,
-	                                                   schema_.name, context, vgi_tx_load.GetTransactionId(),
-	                                                   attach_params->worker_debug(),
-	                                                   attach_params->use_pool());
+	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_id, vgi_tx_load.GetTransactionId()};
+	auto views = vgi::InvokeCatalogSchemaContentsViews(rpc_ctx, schema_.name, context);
 
 	for (auto &view_info : views) {
 		auto view_entry = CreateViewEntryFromInfo(catalog_, schema_, view_info);

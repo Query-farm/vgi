@@ -85,10 +85,8 @@ optional_ptr<CatalogEntry> VgiIndexSet::GetEntry(ClientContext &context, const s
 	}
 
 	auto &vgi_tx = VgiTransaction::Get(context, catalog_);
-	auto index_info_opt = vgi::InvokeCatalogIndexGet(attach_params->worker_path(), attach_result->attach_id,
-	                                                  schema_.name, name, context, vgi_tx.GetTransactionId(),
-	                                                  attach_params->worker_debug(),
-	                                                  attach_params->use_pool());
+	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_id, vgi_tx.GetTransactionId()};
+	auto index_info_opt = vgi::InvokeCatalogIndexGet(rpc_ctx, schema_.name, name, context);
 
 	if (!index_info_opt) {
 		return nullptr;
@@ -113,10 +111,8 @@ void VgiIndexSet::LoadEntries(ClientContext &context) {
 
 	// Call catalog_schema_contents_indexes via RPC
 	auto &vgi_tx_load = VgiTransaction::Get(context, catalog_);
-	auto indexes = vgi::InvokeCatalogSchemaContentsIndexes(attach_params->worker_path(), attach_result->attach_id,
-	                                                       schema_.name, context, vgi_tx_load.GetTransactionId(),
-	                                                       attach_params->worker_debug(),
-	                                                       attach_params->use_pool());
+	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_id, vgi_tx_load.GetTransactionId()};
+	auto indexes = vgi::InvokeCatalogSchemaContentsIndexes(rpc_ctx, schema_.name, context);
 
 	for (auto &index_info : indexes) {
 		auto index_entry = CreateIndexEntryFromInfo(catalog_, schema_, index_info);

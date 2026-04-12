@@ -27,7 +27,8 @@ class ClientContext;
 
 namespace vgi {
 
-// Forward declaration — full definition in vgi_catalog_api.hpp
+// Forward declarations — full definitions in vgi_catalog_api.hpp
+struct VgiAttachParameters;
 struct VgiSecretRequirement;
 
 // ============================================================================
@@ -40,35 +41,23 @@ class FunctionConnection;
 // Parameters for creating a FunctionConnection
 // Used with AcquireAndBindConnection to handle pool acquire + stale connection retry
 struct FunctionConnectionParams {
-	std::string worker_path;
+	std::shared_ptr<VgiAttachParameters> attach_params;  // replaces worker_path, worker_debug, use_pool
+	std::vector<uint8_t> attach_id;
 	std::string function_name;
 	ArrowArguments arguments;
-	std::vector<uint8_t> attach_id;
 	std::vector<uint8_t> transaction_id;
 	std::vector<uint8_t> global_execution_id;  // Empty for primary workers
-	bool worker_debug = false;
 	std::map<std::string, Value> settings;
 	std::vector<vgi::VgiSecretRequirement> required_secrets;
-	bool use_pool = false;
 	std::string phase;  // For logging (e.g., "bind", "init_local_secondary")
 	std::string function_type = "TABLE";  // "TABLE", "SCALAR", "AGGREGATE"
 
-	// Default constructor
-	FunctionConnectionParams() = default;
+	// Convenience accessors (defined out-of-line in vgi_function_connection.cpp)
+	const std::string &worker_path() const;
+	bool worker_debug() const;
+	bool use_pool() const;
 
-	// Convenience constructor for common case
-	FunctionConnectionParams(const std::string &worker_path, const std::string &function_name,
-	                         const ArrowArguments &arguments, const std::vector<uint8_t> &attach_id,
-	                         const std::vector<uint8_t> &transaction_id,
-	                         const std::vector<uint8_t> &global_execution_id, bool worker_debug,
-	                         const std::map<std::string, Value> &settings, bool use_pool,
-	                         const std::string &phase, const std::string &function_type = "TABLE",
-	                         const std::vector<vgi::VgiSecretRequirement> &required_secrets = {})
-	    : worker_path(worker_path), function_name(function_name), arguments(arguments), attach_id(attach_id),
-	      transaction_id(transaction_id), global_execution_id(global_execution_id), worker_debug(worker_debug),
-	      settings(settings), required_secrets(required_secrets), use_pool(use_pool), phase(phase),
-	      function_type(function_type) {
-	}
+	FunctionConnectionParams() = default;
 };
 
 // Result of AcquireAndBindConnection

@@ -29,7 +29,14 @@ test_http:
 test_http_debug:
 	BUILD_DIR=debug ./test/run_http_integration.sh "test/sql/integration/*"
 
-# Run both transports
-test_all: test_subprocess test_http
+# HTTP bearer auth tests
+test_http_bearer:
+	./test/run_http_bearer_integration.sh "test/sql/integration/bearer_auth/*"
 
-test_all_debug: test_subprocess_debug test_http_debug
+test_http_bearer_debug:
+	BUILD_DIR=debug ./test/run_http_bearer_integration.sh "test/sql/integration/bearer_auth/*"
+
+# Run all transports
+test_all: test_subprocess test_http test_http_bearer
+
+test_all_debug: test_subprocess_debug test_http_debug test_http_bearer_debug

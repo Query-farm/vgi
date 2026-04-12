@@ -34,14 +34,17 @@ struct VgiTableInOutBindData : public TableFunctionData {
 	bool Equals(const FunctionData &other) const override;
 
 	// Connection parameters
-	std::string worker_path;
+	std::shared_ptr<VgiAttachParameters> attach_params;  // replaces worker_path, worker_debug, use_pool
 	std::vector<uint8_t> attach_id;
 	std::vector<uint8_t> transaction_id;
-	bool worker_debug = false;
-	bool use_pool = false;
 	std::string function_name;
 	std::map<std::string, Value> settings;
 	std::vector<vgi::VgiSecretRequirement> required_secrets;
+
+	// Convenience accessors
+	const std::string &worker_path() const { return attach_params->worker_path(); }
+	bool worker_debug() const { return attach_params->worker_debug(); }
+	bool use_pool() const { return attach_params->use_pool(); }
 
 	// Arguments (excluding TABLE input)
 	ArrowArguments arguments;
@@ -102,14 +105,17 @@ struct VgiTableInOutLocalState : public ArrowScanLocalState {
 // ============================================================================
 
 struct VgiTableInOutBindParams {
-	std::string worker_path;
+	std::shared_ptr<VgiAttachParameters> attach_params;  // replaces worker_path, worker_debug, use_pool
 	std::string function_name;
 	std::vector<uint8_t> attach_id;
 	std::vector<uint8_t> transaction_id;
-	bool worker_debug = false;
-	bool use_pool = false;
 	std::map<std::string, Value> settings;
 	std::vector<vgi::VgiSecretRequirement> required_secrets;
+
+	// Convenience accessors
+	const std::string &worker_path() const { return attach_params->worker_path(); }
+	bool worker_debug() const { return attach_params->worker_debug(); }
+	bool use_pool() const { return attach_params->use_pool(); }
 };
 
 // ============================================================================

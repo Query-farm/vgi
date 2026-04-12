@@ -29,9 +29,8 @@ void VgiTransaction::Start(ClientContext &context) {
 	auto &attach_result = vgi_catalog_.attach_result();
 	if (attach_result && attach_result->supports_transactions) {
 		auto &params = vgi_catalog_.attach_parameters();
-		transaction_id_ = vgi::InvokeCatalogTransactionBegin(
-		    params->worker_path(), attach_result->attach_id, context,
-		    params->worker_debug(), params->use_pool());
+		vgi::CatalogRpcContext rpc_ctx{params, attach_result->attach_id, {}};
+		transaction_id_ = vgi::InvokeCatalogTransactionBegin(rpc_ctx, context);
 	}
 }
 
@@ -40,9 +39,8 @@ void VgiTransaction::Commit(ClientContext &context) {
 	if (!transaction_id_.empty()) {
 		auto &params = vgi_catalog_.attach_parameters();
 		auto &attach_result = vgi_catalog_.attach_result();
-		vgi::InvokeCatalogTransactionCommit(
-		    params->worker_path(), attach_result->attach_id, transaction_id_,
-		    context, params->worker_debug(), params->use_pool());
+		vgi::CatalogRpcContext rpc_ctx{params, attach_result->attach_id, transaction_id_};
+		vgi::InvokeCatalogTransactionCommit(rpc_ctx, context);
 	}
 	transaction_state = VgiTransactionState::TRANSACTION_FINISHED;
 
@@ -57,9 +55,8 @@ void VgiTransaction::Rollback() {
 	if (!transaction_id_.empty()) {
 		auto &params = vgi_catalog_.attach_parameters();
 		auto &attach_result = vgi_catalog_.attach_result();
-		vgi::InvokeCatalogTransactionRollback(
-		    params->worker_path(), attach_result->attach_id, transaction_id_,
-		    context_, params->worker_debug(), params->use_pool());
+		vgi::CatalogRpcContext rpc_ctx{params, attach_result->attach_id, transaction_id_};
+		vgi::InvokeCatalogTransactionRollback(rpc_ctx, context_);
 	}
 	transaction_state = VgiTransactionState::TRANSACTION_FINISHED;
 

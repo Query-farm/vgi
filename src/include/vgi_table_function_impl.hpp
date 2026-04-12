@@ -31,12 +31,11 @@ namespace vgi {
 //! accessed in the bind function via input.info->Cast<VgiTableFunctionInfo>().
 class VgiTableFunctionInfo final : public TableFunctionInfo {
 public:
-	VgiTableFunctionInfo(Catalog &catalog, std::string worker_path, std::vector<uint8_t> attach_id,
-	                     bool worker_debug, bool use_pool, VgiFunctionInfo function_info,
+	VgiTableFunctionInfo(Catalog &catalog, std::shared_ptr<VgiAttachParameters> attach_params,
+	                     std::vector<uint8_t> attach_id, VgiFunctionInfo function_info,
 	                     std::vector<std::string> setting_names)
-	    : catalog_(catalog), worker_path_(std::move(worker_path)), attach_id_(std::move(attach_id)),
-	      worker_debug_(worker_debug), use_pool_(use_pool), function_info_(std::move(function_info)),
-	      setting_names_(std::move(setting_names)) {
+	    : catalog_(catalog), attach_params_(std::move(attach_params)), attach_id_(std::move(attach_id)),
+	      function_info_(std::move(function_info)), setting_names_(std::move(setting_names)) {
 	}
 
 	~VgiTableFunctionInfo() override = default;
@@ -46,9 +45,14 @@ public:
 		return catalog_;
 	}
 
+	//! Attach parameters for this catalog
+	const std::shared_ptr<VgiAttachParameters> &attach_params() const {
+		return attach_params_;
+	}
+
 	//! Path to the VGI worker executable
 	const std::string &worker_path() const {
-		return worker_path_;
+		return attach_params_->worker_path();
 	}
 
 	//! Attach ID for the catalog connection
@@ -58,12 +62,12 @@ public:
 
 	//! Whether to enable worker debug output
 	bool worker_debug() const {
-		return worker_debug_;
+		return attach_params_->worker_debug();
 	}
 
 	//! Whether pooling is enabled for this function's workers
 	bool use_pool() const {
-		return use_pool_;
+		return attach_params_->use_pool();
 	}
 
 	//! Full function metadata from the worker
@@ -78,10 +82,8 @@ public:
 
 private:
 	Catalog &catalog_;
-	std::string worker_path_;
+	std::shared_ptr<VgiAttachParameters> attach_params_;
 	std::vector<uint8_t> attach_id_;
-	bool worker_debug_;
-	bool use_pool_;
 	VgiFunctionInfo function_info_;
 	std::vector<std::string> setting_names_;
 };
@@ -94,11 +96,14 @@ private:
 //! and catalog-based VGI table functions.
 struct VgiTableFunctionBindData : public TableFunctionData {
 	// Worker identification
-	std::string worker_path;
+	std::shared_ptr<VgiAttachParameters> attach_params;  // replaces worker_path, worker_debug, use_pool
 	std::vector<uint8_t> attach_id;
 	std::vector<uint8_t> transaction_id;
-	bool worker_debug = false;
-	bool use_pool = false;
+
+	// Convenience accessors
+	const std::string &worker_path() const { return attach_params->worker_path(); }
+	bool worker_debug() const { return attach_params->worker_debug(); }
+	bool use_pool() const { return attach_params->use_pool(); }
 
 	// Function identification
 	std::string function_name;
@@ -242,22 +247,22 @@ private:
 // ============================================================================
 
 struct VgiTableFunctionLocalState : public ArrowScanLocalState {
-	VgiTableFunctionLocalState(unique_ptr<ArrowArrayWrapper> current_chunk, ClientContext &ctx, bool use_pool,
-	                           const std::string &worker_path)
-	    : ArrowScanLocalState(std::move(current_chunk), ctx), context_(ctx), use_pool_(use_pool),
-	      worker_path_(worker_path) {
+	VgiTableFunctionLocalState(unique_ptr<ArrowArrayWrapper> current_chunk, ClientContext &ctx,
+	                           std::shared_ptr<VgiAttachParameters> attach_params)
+	    : ArrowScanLocalState(std::move(current_chunk), ctx), context_(ctx),
+	      attach_params_(std::move(attach_params)) {
 	}
 
 	~VgiTableFunctionLocalState() {
 		D_ASSERT(prefetch_state_.load() != PrefetchState::IN_FLIGHT);
 		// Return connection to pool if applicable
-		if (use_pool_ && connection && connection->CanBePooled()) {
+		if (attach_params_ && attach_params_->use_pool() && connection && connection->CanBePooled()) {
 			auto worker_pid = connection->GetPid();
 			auto pooled = connection->ReleaseForPooling();
 			if (pooled) {
 				VgiWorkerPool::Instance().Release(std::move(pooled));
 				VGI_LOG(context_, "worker_pool.release",
-				        {{"worker_path", worker_path_},
+				        {{"worker_path", attach_params_->worker_path()},
 				         {"worker_pid", std::to_string(worker_pid)},
 				         {"use_pool", "true"}});
 			}
@@ -278,8 +283,7 @@ struct VgiTableFunctionLocalState : public ArrowScanLocalState {
 
 private:
 	ClientContext &context_;
-	bool use_pool_;
-	std::string worker_path_;
+	std::shared_ptr<VgiAttachParameters> attach_params_;
 };
 
 // ============================================================================

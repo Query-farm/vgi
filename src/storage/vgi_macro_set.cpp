@@ -80,10 +80,8 @@ void VgiMacroSet::LoadEntries(ClientContext &context) {
 	std::string rpc_type = (macro_catalog_type_ == CatalogType::MACRO_ENTRY) ? "SCALAR_MACRO" : "TABLE_MACRO";
 
 	auto &vgi_tx_load = VgiTransaction::Get(context, catalog_);
-	auto macros = vgi::InvokeCatalogSchemaContentsMacros(attach_params->worker_path(), attach_result->attach_id,
-	                                                     schema_.name, rpc_type, context,
-	                                                     vgi_tx_load.GetTransactionId(),
-	                                                     attach_params->worker_debug(), attach_params->use_pool());
+	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_id, vgi_tx_load.GetTransactionId()};
+	auto macros = vgi::InvokeCatalogSchemaContentsMacros(rpc_ctx, schema_.name, rpc_type, context);
 
 	for (auto &macro_info : macros) {
 		try {

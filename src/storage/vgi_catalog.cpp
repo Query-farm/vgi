@@ -54,13 +54,11 @@ optional_ptr<CatalogEntry> VgiCatalog::CreateSchema(CatalogTransaction transacti
 
 	auto &context = transaction.GetContext();
 	auto &vgi_tx = VgiTransaction::Get(context, *this);
-	auto transaction_id = vgi_tx.GetTransactionId();
 
 	auto on_conflict = vgi::MapOnConflict(info.on_conflict);
 
-	vgi::InvokeCatalogSchemaCreate(attach_parameters_->worker_path(), attach_result_->attach_id,
-	                                info.schema, on_conflict, transaction_id, context,
-	                                attach_parameters_->worker_debug(), attach_parameters_->use_pool());
+	vgi::CatalogRpcContext rpc_ctx{attach_parameters_, attach_result_->attach_id, vgi_tx.GetTransactionId()};
+	vgi::InvokeCatalogSchemaCreate(rpc_ctx, info.schema, on_conflict, context);
 
 	// Invalidate schema cache so re-fetch picks up the new schema
 	schemas.ClearEntries();
@@ -258,10 +256,8 @@ bool VgiCatalog::CheckAndInvalidateCache(ClientContext &context, const std::vect
 	}
 
 	// Query current version from the worker
-	int64_t current_version = vgi::InvokeCatalogVersion(
-	    attach_parameters_->worker_path(), attach_result_->attach_id,
-	    transaction_id, context,
-	    attach_parameters_->worker_debug(), attach_parameters_->use_pool());
+	vgi::CatalogRpcContext rpc_ctx{attach_parameters_, attach_result_->attach_id, transaction_id};
+	int64_t current_version = vgi::InvokeCatalogVersion(rpc_ctx, context);
 
 	// Version 0 means "unimplemented" or "unknown" — always clear for safety
 	// (preserves existing behavior for workers that don't support catalog_version)
@@ -290,11 +286,9 @@ void VgiCatalog::DropSchema(ClientContext &context, DropInfo &info) {
 	bool cascade = (info.cascade);
 
 	auto &vgi_tx = VgiTransaction::Get(context, *this);
-	auto transaction_id = vgi_tx.GetTransactionId();
 
-	vgi::InvokeCatalogSchemaDrop(attach_parameters_->worker_path(), attach_result_->attach_id,
-	                              info.name, ignore_not_found, cascade, transaction_id,
-	                              context, attach_parameters_->worker_debug(), attach_parameters_->use_pool());
+	vgi::CatalogRpcContext rpc_ctx{attach_parameters_, attach_result_->attach_id, vgi_tx.GetTransactionId()};
+	vgi::InvokeCatalogSchemaDrop(rpc_ctx, info.name, ignore_not_found, cascade, context);
 
 	// Invalidate schema cache
 	schemas.ClearEntries();

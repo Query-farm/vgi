@@ -29,10 +29,8 @@ void VgiTableSet::LoadEntries(ClientContext &context) {
 
 	// Call catalog_schema_contents_tables via RPC
 	auto &vgi_tx_load = VgiTransaction::Get(context, catalog_);
-	auto tables = vgi::InvokeCatalogSchemaContentsTables(attach_params->worker_path(), attach_result->attach_id,
-	                                                     schema_.name, context, vgi_tx_load.GetTransactionId(),
-	                                                     attach_params->worker_debug(),
-	                                                     attach_params->use_pool());
+	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_id, vgi_tx_load.GetTransactionId()};
+	auto tables = vgi::InvokeCatalogSchemaContentsTables(rpc_ctx, schema_.name, context);
 
 	for (auto &table_info : tables) {
 		auto create_info = vgi::CreateTableInfoFromVgiTable(context, table_info, schema_.name);
@@ -62,10 +60,8 @@ optional_ptr<CatalogEntry> VgiTableSet::GetEntry(ClientContext &context, const s
 
 	// Call catalog_table_get via RPC, passing transaction_id for visibility of in-transaction DDL
 	auto &vgi_tx = VgiTransaction::Get(context, catalog_);
-	auto table_info_opt = vgi::InvokeCatalogTableGet(attach_params->worker_path(), attach_result->attach_id,
-	                                                  schema_.name, name, context, vgi_tx.GetTransactionId(),
-	                                                  attach_params->worker_debug(),
-	                                                  attach_params->use_pool());
+	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_id, vgi_tx.GetTransactionId()};
+	auto table_info_opt = vgi::InvokeCatalogTableGet(rpc_ctx, schema_.name, name, context);
 
 	if (!table_info_opt) {
 		return nullptr;
@@ -106,11 +102,9 @@ optional_ptr<CatalogEntry> VgiTableSet::GetEntry(ClientContext &context, const E
 
 	// Call catalog_table_get with AT params via RPC
 	auto &vgi_tx_at = VgiTransaction::Get(context, catalog_);
-	auto table_info_opt = vgi::InvokeCatalogTableGet(attach_params->worker_path(), attach_result->attach_id,
-	                                                  schema_.name, entry_name, context,
-	                                                  at_unit, at_value, vgi_tx_at.GetTransactionId(),
-	                                                  attach_params->worker_debug(),
-	                                                  attach_params->use_pool());
+	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_id, vgi_tx_at.GetTransactionId()};
+	auto table_info_opt = vgi::InvokeCatalogTableGet(rpc_ctx, schema_.name, entry_name, context,
+	                                                  at_unit, at_value);
 
 	if (!table_info_opt) {
 		return nullptr;
