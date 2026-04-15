@@ -1,0 +1,73 @@
+# name: test/sql/integration/aggregate/parallel.test
+# description: Multi-threaded aggregate tests (exercises combine path)
+# group: [vgi_integration_aggregate]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+USE example;
+
+# ============================================================================
+# Multi-threaded ungrouped sum
+# ============================================================================
+
+statement ok
+SET threads=4;
+
+query I
+SELECT vgi_sum(i::BIGINT) FROM range(100000) t(i);
+----
+4999950000
+
+# ============================================================================
+# Multi-threaded GROUP BY (small dataset — tests combine correctness)
+# ============================================================================
+
+statement ok
+SET threads=2;
+
+query II
+SELECT i % 3 AS grp, vgi_sum(i::BIGINT) FROM range(9) t(i) GROUP BY grp ORDER BY grp;
+----
+0	9
+1	12
+2	15
+
+# ============================================================================
+# Multi-threaded GROUP BY (larger dataset)
+# ============================================================================
+
+statement ok
+SET threads=4;
+
+query II
+SELECT i % 10 AS grp, vgi_sum(i::BIGINT) FROM range(10000) t(i)
+GROUP BY grp ORDER BY grp;
+----
+0	4995000
+1	4996000
+2	4997000
+3	4998000
+4	4999000
+5	5000000
+6	5001000
+7	5002000
+8	5003000
+9	5004000
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+USE memory;
+
+statement ok
+DETACH example;

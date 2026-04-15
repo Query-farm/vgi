@@ -1,0 +1,74 @@
+# name: test/sql/integration/aggregate/varargs.test
+# description: Test varargs aggregate functions
+# group: [vgi_integration_aggregate]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+USE example;
+
+# ============================================================================
+# Basic varargs: sum all columns
+# ============================================================================
+
+# Single column
+query I
+SELECT vgi_sum_all(i::BIGINT)::BIGINT FROM range(1, 6) t(i);
+----
+15
+
+# Two columns
+query I
+SELECT vgi_sum_all(i::BIGINT, i::BIGINT)::BIGINT FROM range(1, 6) t(i);
+----
+30
+
+# Three columns with different values
+query I
+SELECT vgi_sum_all(a, b, c)::BIGINT
+FROM (VALUES (1.0, 2.0, 3.0), (4.0, 5.0, 6.0)) AS t(a, b, c);
+----
+21
+
+# ============================================================================
+# Varargs with GROUP BY
+# ============================================================================
+
+query II rowsort
+SELECT category, vgi_sum_all(a, b)::BIGINT AS total
+FROM (VALUES
+    ('x', 1.0, 10.0),
+    ('y', 2.0, 20.0),
+    ('x', 3.0, 30.0),
+    ('y', 4.0, 40.0)
+) AS t(category, a, b)
+GROUP BY category;
+----
+x	44
+y	66
+
+# ============================================================================
+# Edge case: many columns
+# ============================================================================
+
+query I
+SELECT vgi_sum_all(1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0)::BIGINT;
+----
+55
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+USE memory;
+
+statement ok
+DETACH example;

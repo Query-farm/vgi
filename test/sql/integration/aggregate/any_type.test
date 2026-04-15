@@ -1,0 +1,77 @@
+# name: test/sql/integration/aggregate/any_type.test
+# description: Aggregate functions with ANY input/output types (dynamic return type)
+# group: [vgi_integration_aggregate]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+USE example;
+
+# ============================================================================
+# Dynamic return type — output type matches input type
+# ============================================================================
+
+# BIGINT input → BIGINT output
+query I
+SELECT vgi_generic_sum(i::BIGINT) FROM range(10) t(i);
+----
+45
+
+query T
+SELECT typeof(vgi_generic_sum(i::BIGINT)) FROM range(10) t(i);
+----
+BIGINT
+
+# DOUBLE input → DOUBLE output
+query R
+SELECT vgi_generic_sum(i::DOUBLE) FROM range(10) t(i);
+----
+45.0
+
+query T
+SELECT typeof(vgi_generic_sum(i::DOUBLE)) FROM range(10) t(i);
+----
+DOUBLE
+
+# INTEGER input → INTEGER output
+query I
+SELECT vgi_generic_sum(i::INTEGER) FROM range(10) t(i);
+----
+45
+
+query T
+SELECT typeof(vgi_generic_sum(i::INTEGER)) FROM range(10) t(i);
+----
+INTEGER
+
+# ============================================================================
+# Dynamic type with GROUP BY
+# ============================================================================
+
+statement ok
+SET threads=1;
+
+query II
+SELECT i % 3 AS grp, vgi_generic_sum(i::BIGINT)
+FROM range(9) t(i) GROUP BY grp ORDER BY grp;
+----
+0	9
+1	12
+2	15
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+USE memory;
+
+statement ok
+DETACH example;

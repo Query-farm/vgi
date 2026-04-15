@@ -1,0 +1,110 @@
+# name: test/sql/integration/aggregate/const_param.test
+# description: ConstParam (constant parameter folding) on aggregate functions
+# group: [vgi_integration_aggregate]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+USE example;
+
+# ============================================================================
+# Basic ConstParam — vgi_percentile(value, percentile)
+# percentile is constant-folded at bind time
+# ============================================================================
+
+query R
+SELECT vgi_percentile(i::DOUBLE, 0.0) FROM range(10) t(i);
+----
+0.0
+
+query R
+SELECT vgi_percentile(i::DOUBLE, 0.5) FROM range(10) t(i);
+----
+5.0
+
+query R
+SELECT vgi_percentile(i::DOUBLE, 0.9) FROM range(10) t(i);
+----
+9.0
+
+# ============================================================================
+# ConstParam with GROUP BY
+# ============================================================================
+
+statement ok
+SET threads=1;
+
+query IR
+SELECT i % 3 AS grp, vgi_percentile(i::DOUBLE, 0.5)
+FROM range(9) t(i)
+GROUP BY grp ORDER BY grp;
+----
+0	3.0
+1	4.0
+2	5.0
+
+# ============================================================================
+# ConstParam with expression (const folding of non-literal expression)
+# ============================================================================
+
+query R
+SELECT vgi_percentile(i::DOUBLE, 0.25 + 0.25) FROM range(10) t(i);
+----
+5.0
+
+# ============================================================================
+# ConstParam with HAVING
+# ============================================================================
+
+query IR
+SELECT i % 3 AS grp, vgi_percentile(i::DOUBLE, 0.5)
+FROM range(9) t(i)
+GROUP BY grp
+HAVING vgi_percentile(i::DOUBLE, 0.5) > 3.5
+ORDER BY grp;
+----
+1	4.0
+2	5.0
+
+# ============================================================================
+# Phase-aware ConstParam (phase="finalize")
+# vgi_percentile declares percentile with phase="finalize" — the const value
+# is NOT passed to update() (uses default), only available in finalize via
+# params.args. Different percentile values produce different results.
+# ============================================================================
+
+query R
+SELECT vgi_percentile(i::DOUBLE, 0.0) FROM range(10) t(i);
+----
+0.0
+
+query R
+SELECT vgi_percentile(i::DOUBLE, 0.9) FROM range(10) t(i);
+----
+9.0
+
+# Grouped with phase="finalize" ConstParam
+query IR
+SELECT i % 2 AS grp, vgi_percentile(i::DOUBLE, 0.0)
+FROM range(10) t(i)
+GROUP BY grp ORDER BY grp;
+----
+0	0.0
+1	1.0
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+USE memory;
+
+statement ok
+DETACH example;

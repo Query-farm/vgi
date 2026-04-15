@@ -1,0 +1,67 @@
+# name: test/sql/integration/aggregate/listagg.test
+# description: Order-dependent string aggregate tests
+# group: [vgi_integration_aggregate]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+USE example;
+
+statement ok
+SET threads=1;
+
+# ============================================================================
+# Basic listagg — concatenates strings with comma
+# ============================================================================
+
+query T
+SELECT vgi_listagg(x) FROM (VALUES ('a'), ('b'), ('c')) t(x);
+----
+a,b,c
+
+# ============================================================================
+# Listagg with GROUP BY
+# ============================================================================
+
+query IT
+SELECT grp, vgi_listagg(val)
+FROM (VALUES (1, 'x'), (1, 'y'), (2, 'a'), (2, 'b'), (2, 'c')) t(grp, val)
+GROUP BY grp ORDER BY grp;
+----
+1	x,y
+2	a,b,c
+
+# ============================================================================
+# Listagg with NULLs skipped (DEFAULT null handling)
+# ============================================================================
+
+query T
+SELECT vgi_listagg(x) FROM (VALUES ('a'), (NULL), ('c')) t(x);
+----
+a,c
+
+# ============================================================================
+# Single value
+# ============================================================================
+
+query T
+SELECT vgi_listagg('hello');
+----
+hello
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+USE memory;
+
+statement ok
+DETACH example;

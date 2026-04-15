@@ -1,0 +1,72 @@
+# name: test/sql/integration/aggregate/grouped.test
+# description: Aggregate functions with GROUP BY
+# group: [vgi_integration_aggregate]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+USE example;
+
+# Force single-threaded to test basic GROUP BY without combine
+statement ok
+SET threads=1;
+
+# ============================================================================
+# vgi_sum with GROUP BY
+# ============================================================================
+
+query II
+SELECT i % 3 AS grp, vgi_sum(i::BIGINT) FROM range(9) t(i) GROUP BY grp ORDER BY grp;
+----
+0	9
+1	12
+2	15
+
+# ============================================================================
+# vgi_count with GROUP BY
+# ============================================================================
+
+query II
+SELECT i % 3 AS grp, vgi_count() FROM range(9) t(i) GROUP BY grp ORDER BY grp;
+----
+0	3
+1	3
+2	3
+
+# ============================================================================
+# vgi_avg with GROUP BY
+# ============================================================================
+
+query IR
+SELECT i % 2 AS grp, vgi_avg(i::BIGINT) FROM range(6) t(i) GROUP BY grp ORDER BY grp;
+----
+0	2.0
+1	3.0
+
+# ============================================================================
+# Many groups
+# ============================================================================
+
+query I
+SELECT count(DISTINCT grp) FROM (
+    SELECT i % 100 AS grp, vgi_sum(i::BIGINT) FROM range(1000) t(i) GROUP BY grp
+);
+----
+100
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+USE memory;
+
+statement ok
+DETACH example;

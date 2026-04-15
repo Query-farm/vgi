@@ -1,0 +1,98 @@
+# name: test/sql/integration/aggregate/basic.test
+# description: Basic aggregate function tests (ungrouped)
+# group: [vgi_integration_aggregate]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+USE example;
+
+# ============================================================================
+# vgi_sum — single int64 input
+# ============================================================================
+
+query I
+SELECT vgi_sum(i::BIGINT) FROM range(10) t(i);
+----
+45
+
+query I
+SELECT vgi_sum(i::BIGINT) FROM range(100) t(i);
+----
+4950
+
+# ============================================================================
+# vgi_count — nullary aggregate (no input columns)
+# ============================================================================
+
+query I
+SELECT vgi_count() FROM range(100) t(i);
+----
+100
+
+query I
+SELECT vgi_count() FROM range(1) t(i);
+----
+1
+
+# ============================================================================
+# vgi_avg — two-field state (sum + count)
+# ============================================================================
+
+query R
+SELECT vgi_avg(i::BIGINT) FROM range(10) t(i);
+----
+4.5
+
+query R
+SELECT vgi_avg(i::BIGINT) FROM range(4) t(i);
+----
+1.5
+
+# ============================================================================
+# NULL handling — NullHandling.DEFAULT skips NULLs
+# ============================================================================
+
+query I
+SELECT vgi_sum(x) FROM (VALUES (1::BIGINT), (NULL), (3::BIGINT)) t(x);
+----
+4
+
+# All-NULL SUM returns NULL (SQL standard). With NullHandling.DEFAULT, DuckDB
+# skips all NULL rows, so update() is never called. The framework passes None
+# for the state in finalize(), and the function returns NULL.
+query I
+SELECT vgi_sum(x) FROM (VALUES (NULL::BIGINT), (NULL), (NULL)) t(x);
+----
+NULL
+
+# ============================================================================
+# Empty table — no rows at all
+# ============================================================================
+
+query I
+SELECT vgi_sum(i::BIGINT) FROM range(0) t(i);
+----
+NULL
+
+query I
+SELECT vgi_count() FROM range(0) t(i);
+----
+0
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+USE memory;
+
+statement ok
+DETACH example;

@@ -1,0 +1,126 @@
+# name: test/sql/integration/aggregate/advanced.test
+# description: Advanced aggregate tests — HAVING, multi-arg, high cardinality, expressions
+# group: [vgi_integration_aggregate]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+USE example;
+
+# ============================================================================
+# HAVING clause
+# ============================================================================
+
+query II
+SELECT i % 5 AS grp, vgi_sum(i::BIGINT)
+FROM range(20) t(i)
+GROUP BY grp
+HAVING vgi_sum(i::BIGINT) > 30
+ORDER BY grp;
+----
+1	34
+2	38
+3	42
+4	46
+
+query II
+SELECT i % 3 AS grp, vgi_count()
+FROM range(100) t(i)
+GROUP BY grp
+HAVING vgi_count() > 33
+ORDER BY grp;
+----
+0	34
+
+# ============================================================================
+# Multi-argument aggregate: vgi_weighted_sum(value, weight)
+# ============================================================================
+
+query R
+SELECT vgi_weighted_sum(v::DOUBLE, w::DOUBLE)
+FROM (VALUES (1.0, 2.0), (3.0, 4.0), (5.0, 6.0)) t(v, w);
+----
+44.0
+
+query IR
+SELECT grp, vgi_weighted_sum(v::DOUBLE, w::DOUBLE)
+FROM (
+    VALUES (1, 10.0, 1.0), (1, 20.0, 2.0), (2, 30.0, 3.0), (2, 40.0, 4.0)
+) t(grp, v, w)
+GROUP BY grp ORDER BY grp;
+----
+1	50.0
+2	250.0
+
+# ============================================================================
+# Aggregate on expressions (not just bare columns)
+# ============================================================================
+
+query I
+SELECT vgi_sum((i * 2)::BIGINT) FROM range(5) t(i);
+----
+20
+
+query I
+SELECT vgi_sum((i + 100)::BIGINT) FROM range(10) t(i);
+----
+1045
+
+# ============================================================================
+# ORDER BY aggregate result
+# ============================================================================
+
+query II
+SELECT i % 4 AS grp, vgi_sum(i::BIGINT)
+FROM range(16) t(i)
+GROUP BY grp
+ORDER BY vgi_sum(i::BIGINT) DESC;
+----
+3	36
+2	32
+1	28
+0	24
+
+# ============================================================================
+# Aggregate in subquery
+# ============================================================================
+
+query I
+SELECT max(s) FROM (
+    SELECT vgi_sum(i::BIGINT) AS s
+    FROM range(100) t(i)
+    GROUP BY i % 10
+);
+----
+540
+
+# ============================================================================
+# Single row input
+# ============================================================================
+
+query I
+SELECT vgi_sum(42::BIGINT);
+----
+42
+
+query I
+SELECT vgi_count();
+----
+1
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+USE memory;
+
+statement ok
+DETACH example;

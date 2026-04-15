@@ -1,0 +1,46 @@
+# name: test/sql/integration/aggregate/function_registration.test
+# description: Validates aggregate function registration metadata
+# group: [vgi_integration_aggregate]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# Function Inventory
+# All 5 aggregate functions must be registered
+# ============================================================================
+
+query I
+SELECT COUNT(*)
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_type = 'aggregate';
+----
+8
+
+query TT
+SELECT function_name, return_type
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_type = 'aggregate'
+ORDER BY function_name;
+----
+vgi_avg	DOUBLE
+vgi_count	BIGINT
+vgi_generic_sum	ANY
+vgi_listagg	VARCHAR
+vgi_percentile	DOUBLE
+vgi_sum	BIGINT
+vgi_sum_all	DOUBLE
+vgi_weighted_sum	DOUBLE
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;

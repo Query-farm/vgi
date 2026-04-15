@@ -53,6 +53,7 @@ src/vgi_table_function.cpp
 src/vgi_table_function_impl.cpp
 src/vgi_table_in_out_impl.cpp
 src/vgi_scalar_function_impl.cpp
+src/vgi_aggregate_function_impl.cpp
 src/vgi_catalog_api.cpp
 src/vgi_function_connection.cpp
 src/vgi_worker_pool.cpp
@@ -67,6 +68,7 @@ src/storage/vgi_table_set.cpp
 src/storage/vgi_table_entry.cpp
 src/storage/vgi_view_set.cpp
 src/storage/vgi_scalar_function_set.cpp
+src/storage/vgi_aggregate_function_set.cpp
 src/storage/vgi_table_function_set.cpp
 src/storage/vgi_macro_set.cpp
 src/storage/vgi_transaction.cpp

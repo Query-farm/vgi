@@ -1,0 +1,100 @@
+# name: test/sql/integration/aggregate/high_cardinality.test
+# description: High cardinality GROUP BY tests — many groups, large data
+# group: [vgi_integration_aggregate]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+USE example;
+
+# ============================================================================
+# 1000 groups — verifies per-group-id storage at scale
+# ============================================================================
+
+statement ok
+SET threads=1;
+
+query I
+SELECT count(*) FROM (
+    SELECT i % 1000 AS grp, vgi_sum(i::BIGINT) AS s
+    FROM range(100000) t(i)
+    GROUP BY grp
+) sub WHERE s > 0;
+----
+1000
+
+# Verify a specific group's sum is correct
+# Group 0: 0+1000+2000+...+99000 = 1000 * (0+1+2+...+99) = 1000*4950 = 4950000
+query I
+SELECT s FROM (
+    SELECT i % 1000 AS grp, vgi_sum(i::BIGINT) AS s
+    FROM range(100000) t(i)
+    GROUP BY grp
+) sub WHERE grp = 0;
+----
+4950000
+
+# ============================================================================
+# 10000 groups — high cardinality, single-threaded
+# ============================================================================
+
+query I
+SELECT count(*) FROM (
+    SELECT i % 10000 AS grp, vgi_sum(i::BIGINT)
+    FROM range(100000) t(i)
+    GROUP BY grp
+);
+----
+10000
+
+# ============================================================================
+# High cardinality with multiple threads
+# ============================================================================
+
+statement ok
+SET threads=4;
+
+query I
+SELECT count(*) FROM (
+    SELECT i % 1000 AS grp, vgi_sum(i::BIGINT) AS s
+    FROM range(100000) t(i)
+    GROUP BY grp
+) sub WHERE s > 0;
+----
+1000
+
+# Same group 0 check with parallelism
+query I
+SELECT s FROM (
+    SELECT i % 1000 AS grp, vgi_sum(i::BIGINT) AS s
+    FROM range(100000) t(i)
+    GROUP BY grp
+) sub WHERE grp = 0;
+----
+4950000
+
+# ============================================================================
+# Large ungrouped sum with many batches (forces multiple update calls)
+# ============================================================================
+
+query I
+SELECT vgi_sum(i::BIGINT) FROM range(1000000) t(i);
+----
+499999500000
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+USE memory;
+
+statement ok
+DETACH example;

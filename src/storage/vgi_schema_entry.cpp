@@ -25,7 +25,8 @@ namespace duckdb {
 
 VgiSchemaEntry::VgiSchemaEntry(Catalog &catalog, CreateSchemaInfo &info, const vgi::VgiSchemaInfo &schema_info)
     : SchemaCatalogEntry(catalog, info), schema_info_(schema_info), tables_(catalog, *this), views_(catalog, *this),
-      scalar_functions_(catalog, *this), table_functions_(catalog, *this),
+      scalar_functions_(catalog, *this), aggregate_functions_(catalog, *this),
+      table_functions_(catalog, *this),
       scalar_macros_(catalog, *this, CatalogType::MACRO_ENTRY),
       table_macros_(catalog, *this, CatalogType::TABLE_MACRO_ENTRY) {
 }
@@ -367,11 +368,15 @@ void VgiSchemaEntry::Scan(ClientContext &context, CatalogType type,
 		views_.Scan(context, callback);
 		break;
 	case CatalogType::SCALAR_FUNCTION_ENTRY:
-		// DuckDB's duckdb_functions() only scans SCALAR_FUNCTION_ENTRY, not MACRO_ENTRY.
-		// In DuckDB's default catalog, macros and functions share the same set.
-		// We need to include scalar macros here so they appear in duckdb_functions().
+		// DuckDB's duckdb_functions() only scans SCALAR_FUNCTION_ENTRY, not separate
+		// AGGREGATE or MACRO entries. Include all function types here so they appear
+		// in duckdb_functions().
 		scalar_functions_.Scan(context, callback);
+		aggregate_functions_.Scan(context, callback);
 		scalar_macros_.Scan(context, callback);
+		break;
+	case CatalogType::AGGREGATE_FUNCTION_ENTRY:
+		aggregate_functions_.Scan(context, callback);
 		break;
 	case CatalogType::TABLE_FUNCTION_ENTRY:
 		// Same pattern: table macros must be included in TABLE_FUNCTION_ENTRY scan.
@@ -450,14 +455,20 @@ optional_ptr<CatalogEntry> VgiSchemaEntry::LookupEntry(CatalogTransaction transa
 	case CatalogType::VIEW_ENTRY:
 		return views_.GetEntry(context, entry_name);
 	case CatalogType::SCALAR_FUNCTION_ENTRY: {
-		// DuckDB looks up scalar macros via SCALAR_FUNCTION_ENTRY (they share a set
-		// in the default catalog). Fall back to scalar macros.
+		// DuckDB resolves all function calls via SCALAR_FUNCTION_ENTRY first.
+		// Fall back to aggregate functions and macros (they share a set in the
+		// default catalog).
 		auto result = scalar_functions_.GetEntry(context, entry_name);
+		if (!result) {
+			result = aggregate_functions_.GetEntry(context, entry_name);
+		}
 		if (!result) {
 			result = scalar_macros_.GetEntry(context, entry_name);
 		}
 		return result;
 	}
+	case CatalogType::AGGREGATE_FUNCTION_ENTRY:
+		return aggregate_functions_.GetEntry(context, entry_name);
 	case CatalogType::TABLE_FUNCTION_ENTRY: {
 		// Same pattern: table macros are looked up via TABLE_FUNCTION_ENTRY.
 		auto result = table_functions_.GetEntry(context, entry_name);
@@ -484,6 +495,8 @@ VgiCatalogSet &VgiSchemaEntry::GetCatalogSet(CatalogType type) {
 		return views_;
 	case CatalogType::SCALAR_FUNCTION_ENTRY:
 		return scalar_functions_;
+	case CatalogType::AGGREGATE_FUNCTION_ENTRY:
+		return aggregate_functions_;
 	case CatalogType::TABLE_FUNCTION_ENTRY:
 		return table_functions_;
 	case CatalogType::MACRO_ENTRY:

@@ -857,6 +857,7 @@ std::shared_ptr<arrow::RecordBatch> BuildSchemaContentsFunctionsParams(const std
                                                                        const std::vector<uint8_t> &transaction_id) {
 	static const std::vector<std::string> schema_object_type_values = {"TABLE",          "VIEW",
 	                                                                   "SCALAR_FUNCTION", "TABLE_FUNCTION",
+	                                                                   "AGGREGATE_FUNCTION",
 	                                                                   "SCALAR_MACRO",    "TABLE_MACRO"};
 
 	auto schema = arrow::schema({
