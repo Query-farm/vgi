@@ -183,7 +183,10 @@ bool HandleBatchLogMessage(const std::shared_ptr<arrow::RecordBatch> &batch,
 		if (!traceback.empty()) {
 			full_message += "\n" + traceback;
 		}
-		vgi::ThrowVgiIOException(full_message, worker_path, worker_pid, invocation_id_hex);
+		// Throw InvalidInputException (not IOException) so the retry logic in
+		// InvokePooledUnaryRpc does NOT retry user-code errors. Retrying is
+		// unsafe for stateful aggregate operations and masks the real error.
+		vgi::ThrowVgiUserException(full_message, worker_path, worker_pid, invocation_id_hex);
 	}
 
 	// For non-exception log levels, log to DuckDB if we have a context

@@ -1,0 +1,285 @@
+# name: test/sql/integration/aggregate/dynamic.test
+# description: Dynamic aggregate function — behavior defined by Python code string
+# group: [vgi_integration_aggregate]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+USE example;
+
+statement ok
+SET threads=1;
+
+# ============================================================================
+# Basic sum — finalize receives a pyarrow Table with columns c0, c1, ...
+# ============================================================================
+
+query R
+SELECT vgi_dynamic_agg(
+  'class Aggregate:
+    @staticmethod
+    def finalize(table):
+        return pa.compute.sum(table.column("c0")).as_py()',
+  i::DOUBLE
+) FROM range(1, 11) t(i);
+----
+55.0
+
+# ============================================================================
+# Basic average
+# ============================================================================
+
+query R
+SELECT vgi_dynamic_agg(
+  'class Aggregate:
+    @staticmethod
+    def finalize(table):
+        total = pa.compute.sum(table.column("c0")).as_py()
+        count = table.num_rows
+        return total / count if count > 0 else None',
+  i::DOUBLE
+) FROM range(1, 11) t(i);
+----
+5.5
+
+# ============================================================================
+# Max
+# ============================================================================
+
+query R
+SELECT vgi_dynamic_agg(
+  'class Aggregate:
+    @staticmethod
+    def finalize(table):
+        return pa.compute.max(table.column("c0")).as_py()',
+  i::DOUBLE
+) FROM range(1, 11) t(i);
+----
+10.0
+
+# ============================================================================
+# GROUP BY
+# ============================================================================
+
+query IR
+SELECT i % 3 AS grp, vgi_dynamic_agg(
+  'class Aggregate:
+    @staticmethod
+    def finalize(table):
+        return pa.compute.sum(table.column("c0")).as_py()',
+  i::DOUBLE
+) FROM range(9) t(i)
+GROUP BY grp ORDER BY grp;
+----
+0	9.0
+1	12.0
+2	15.0
+
+# ============================================================================
+# Multi-column: weighted sum (value * weight)
+# ============================================================================
+
+query R
+SELECT vgi_dynamic_agg(
+  'class Aggregate:
+    @staticmethod
+    def finalize(table):
+        value = table.column("c0")
+        weight = table.column("c1")
+        return pa.compute.sum(pa.compute.multiply(value, weight)).as_py()',
+  i::DOUBLE, (i * 0.1)::DOUBLE
+) FROM range(1, 6) t(i);
+----
+5.5
+
+# ============================================================================
+# Multi-column: dot product with GROUP BY
+# ============================================================================
+
+query IR
+SELECT grp, vgi_dynamic_agg(
+  'class Aggregate:
+    @staticmethod
+    def finalize(table):
+        a = table.column("c0")
+        b = table.column("c1")
+        return pa.compute.sum(pa.compute.multiply(a, b)).as_py()',
+  a, b
+) FROM (
+  SELECT unnest([1,1,2,2]) AS grp,
+         unnest([1.0, 2.0, 3.0, 4.0])::DOUBLE AS a,
+         unnest([10.0, 20.0, 30.0, 40.0])::DOUBLE AS b
+)
+GROUP BY grp ORDER BY grp;
+----
+1	50.0
+2	250.0
+
+# ============================================================================
+# Three columns: weighted average (value, weight, count)
+# ============================================================================
+
+query R
+SELECT vgi_dynamic_agg(
+  'class Aggregate:
+    @staticmethod
+    def finalize(table):
+        val = table.column("c0")
+        wt = table.column("c1")
+        cnt = table.column("c2")
+        weighted_sum = pa.compute.sum(pa.compute.multiply(val, wt)).as_py()
+        total_count = pa.compute.sum(cnt).as_py()
+        return weighted_sum / total_count if total_count > 0 else None',
+  val, wt, cnt
+) FROM (
+  SELECT unnest([10.0, 20.0, 30.0])::DOUBLE AS val,
+         unnest([1.0, 2.0, 3.0])::DOUBLE AS wt,
+         unnest([5.0, 5.0, 5.0])::DOUBLE AS cnt
+);
+----
+9.333333333333334
+
+# ============================================================================
+# vgi_dynamic_ml_agg — window aggregate with MLPRegressor and seed parameter.
+# Code stored in a table, seed passed via MAP(VARCHAR, DOUBLE) params arg.
+# Tests 4 series × 4 seeds to verify predictions aren't seed-dependent.
+# ============================================================================
+
+# Store the MLP aggregate code once — finalize(table, params) receives the params dict.
+# NOTE: no blank lines inside statement (sqllogictest delimiter).
+
+statement ok
+USE memory;
+
+statement ok
+CREATE TABLE agg_defs(name VARCHAR, code VARCHAR);
+
+statement ok
+INSERT INTO agg_defs VALUES ('mlp_predict',
+'from sklearn.neural_network import MLPRegressor
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+class Aggregate:
+    @staticmethod
+    def finalize(table, params):
+        if table.num_rows == 0:
+            return None
+        values = table.column("c0").to_pylist()
+        if len(values) < 6:
+            return None
+        seed = int(params.get("seed", 0))
+        X = [[values[i-5], values[i-4], values[i-3], values[i-2], values[i-1]] for i in range(5, len(values))]
+        y = [values[i] for i in range(5, len(values))]
+        model = make_pipeline(StandardScaler(), MLPRegressor(hidden_layer_sizes=(10, 5), solver="lbfgs", max_iter=2000, random_state=seed))
+        model.fit(X, y)
+        return float(model.predict([values[-5:]])[0])');
+
+# Generate test series
+statement ok
+CREATE TABLE sine_series AS SELECT i AS t, sin(i * 0.314159)::DOUBLE AS value FROM range(100) tbl(i);
+
+statement ok
+CREATE TABLE trend_series AS SELECT i AS t, (sin(i * 0.314159) + i * 0.1)::DOUBLE AS value FROM range(100) tbl(i);
+
+statement ok
+CREATE TABLE two_sine_series AS SELECT i AS t, (sin(i * 0.314159) + 0.5 * sin(i * 0.942478))::DOUBLE AS value FROM range(100) tbl(i);
+
+statement ok
+CREATE TABLE sawtooth_series AS SELECT i AS t, (i % 10)::DOUBLE AS value FROM range(100) tbl(i);
+
+# --- Sine × 4 seeds: all predictions within 0.5 for last 20 rows ---
+
+query IIII
+SELECT
+  count(*) FILTER (WHERE s=1 AND abs(pred-value)<0.5) AS seed1,
+  count(*) FILTER (WHERE s=42 AND abs(pred-value)<0.5) AS seed42,
+  count(*) FILTER (WHERE s=123 AND abs(pred-value)<0.5) AS seed123,
+  count(*) FILTER (WHERE s=999 AND abs(pred-value)<0.5) AS seed999
+FROM (
+  SELECT 1 AS s, t, value, example.main.vgi_dynamic_ml_agg((SELECT code FROM agg_defs WHERE name='mlp_predict'), MAP {'seed': 1.0}, value) OVER (ORDER BY t ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS pred FROM sine_series
+  UNION ALL
+  SELECT 42, t, value, example.main.vgi_dynamic_ml_agg((SELECT code FROM agg_defs WHERE name='mlp_predict'), MAP {'seed': 42.0}, value) OVER (ORDER BY t ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) FROM sine_series
+  UNION ALL
+  SELECT 123, t, value, example.main.vgi_dynamic_ml_agg((SELECT code FROM agg_defs WHERE name='mlp_predict'), MAP {'seed': 123.0}, value) OVER (ORDER BY t ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) FROM sine_series
+  UNION ALL
+  SELECT 999, t, value, example.main.vgi_dynamic_ml_agg((SELECT code FROM agg_defs WHERE name='mlp_predict'), MAP {'seed': 999.0}, value) OVER (ORDER BY t ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) FROM sine_series
+) WHERE t >= 80;
+----
+20	20	20	20
+
+# --- Sine + trend × 4 seeds ---
+
+query IIII
+SELECT
+  count(*) FILTER (WHERE s=1 AND abs(pred-value)<0.5) AS seed1,
+  count(*) FILTER (WHERE s=42 AND abs(pred-value)<0.5) AS seed42,
+  count(*) FILTER (WHERE s=123 AND abs(pred-value)<0.5) AS seed123,
+  count(*) FILTER (WHERE s=999 AND abs(pred-value)<0.5) AS seed999
+FROM (
+  SELECT 1 AS s, t, value, example.main.vgi_dynamic_ml_agg((SELECT code FROM agg_defs WHERE name='mlp_predict'), MAP {'seed': 1.0}, value) OVER (ORDER BY t ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS pred FROM trend_series
+  UNION ALL
+  SELECT 42, t, value, example.main.vgi_dynamic_ml_agg((SELECT code FROM agg_defs WHERE name='mlp_predict'), MAP {'seed': 42.0}, value) OVER (ORDER BY t ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) FROM trend_series
+  UNION ALL
+  SELECT 123, t, value, example.main.vgi_dynamic_ml_agg((SELECT code FROM agg_defs WHERE name='mlp_predict'), MAP {'seed': 123.0}, value) OVER (ORDER BY t ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) FROM trend_series
+  UNION ALL
+  SELECT 999, t, value, example.main.vgi_dynamic_ml_agg((SELECT code FROM agg_defs WHERE name='mlp_predict'), MAP {'seed': 999.0}, value) OVER (ORDER BY t ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) FROM trend_series
+) WHERE t >= 80;
+----
+20	20	20	20
+
+# --- Two superimposed sines × 4 seeds ---
+
+query IIII
+SELECT
+  count(*) FILTER (WHERE s=1 AND abs(pred-value)<0.5) AS seed1,
+  count(*) FILTER (WHERE s=42 AND abs(pred-value)<0.5) AS seed42,
+  count(*) FILTER (WHERE s=123 AND abs(pred-value)<0.5) AS seed123,
+  count(*) FILTER (WHERE s=999 AND abs(pred-value)<0.5) AS seed999
+FROM (
+  SELECT 1 AS s, t, value, example.main.vgi_dynamic_ml_agg((SELECT code FROM agg_defs WHERE name='mlp_predict'), MAP {'seed': 1.0}, value) OVER (ORDER BY t ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS pred FROM two_sine_series
+  UNION ALL
+  SELECT 42, t, value, example.main.vgi_dynamic_ml_agg((SELECT code FROM agg_defs WHERE name='mlp_predict'), MAP {'seed': 42.0}, value) OVER (ORDER BY t ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) FROM two_sine_series
+  UNION ALL
+  SELECT 123, t, value, example.main.vgi_dynamic_ml_agg((SELECT code FROM agg_defs WHERE name='mlp_predict'), MAP {'seed': 123.0}, value) OVER (ORDER BY t ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) FROM two_sine_series
+  UNION ALL
+  SELECT 999, t, value, example.main.vgi_dynamic_ml_agg((SELECT code FROM agg_defs WHERE name='mlp_predict'), MAP {'seed': 999.0}, value) OVER (ORDER BY t ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) FROM two_sine_series
+) WHERE t >= 80;
+----
+20	20	20	20
+
+# --- Sawtooth × 4 seeds (sharp discontinuities — allow ≥15/20 accurate) ---
+
+query IIII
+SELECT
+  (count(*) FILTER (WHERE s=1 AND abs(pred-value)<0.5) >= 15)::INT AS seed1,
+  (count(*) FILTER (WHERE s=42 AND abs(pred-value)<0.5) >= 15)::INT AS seed42,
+  (count(*) FILTER (WHERE s=123 AND abs(pred-value)<0.5) >= 15)::INT AS seed123,
+  (count(*) FILTER (WHERE s=999 AND abs(pred-value)<0.5) >= 15)::INT AS seed999
+FROM (
+  SELECT 1 AS s, t, value, example.main.vgi_dynamic_ml_agg((SELECT code FROM agg_defs WHERE name='mlp_predict'), MAP {'seed': 1.0}, value) OVER (ORDER BY t ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS pred FROM sawtooth_series
+  UNION ALL
+  SELECT 42, t, value, example.main.vgi_dynamic_ml_agg((SELECT code FROM agg_defs WHERE name='mlp_predict'), MAP {'seed': 42.0}, value) OVER (ORDER BY t ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) FROM sawtooth_series
+  UNION ALL
+  SELECT 123, t, value, example.main.vgi_dynamic_ml_agg((SELECT code FROM agg_defs WHERE name='mlp_predict'), MAP {'seed': 123.0}, value) OVER (ORDER BY t ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) FROM sawtooth_series
+  UNION ALL
+  SELECT 999, t, value, example.main.vgi_dynamic_ml_agg((SELECT code FROM agg_defs WHERE name='mlp_predict'), MAP {'seed': 999.0}, value) OVER (ORDER BY t ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) FROM sawtooth_series
+) WHERE t >= 80;
+----
+1	1	1	1
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+USE memory;
+
+statement ok
+DETACH example;

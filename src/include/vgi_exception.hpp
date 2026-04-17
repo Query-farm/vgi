@@ -75,6 +75,19 @@ template <typename... ARGS>
 	throw IOException(extra_info, full_msg);
 }
 
+// Throw an InvalidInputException for user-code exceptions bubbling out of worker
+// Python code. This is distinct from IOException (transport failures) so that
+// retry logic in InvokePooledUnaryRpc does NOT retry user-code errors —
+// retrying them on a fresh worker is unsafe for stateful operations (the fresh
+// worker has no state populated by previous update/combine calls) and also
+// masks the real user-code error behind a silent NULL result.
+[[noreturn]] inline void ThrowVgiUserException(const std::string &msg, const std::string &worker_path,
+                                                pid_t worker_pid, const std::string &invocation_id_hex = "") {
+	auto extra_info = BuildExtraInfo(worker_path, worker_pid, invocation_id_hex);
+	auto full_msg = BuildMessageWithContext(msg, worker_path);
+	throw InvalidInputException(extra_info, full_msg);
+}
+
 // Check if a worker process exited with an error and throw appropriate exception.
 // Returns true if the process has exited, false if still running.
 // Throws VgiIOException for exit codes 127 (not found), 126 (permission denied), or other non-zero.
