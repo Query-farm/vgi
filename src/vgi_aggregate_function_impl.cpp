@@ -8,6 +8,7 @@
 #include "vgi_rpc_types.hpp"
 #include "vgi_subprocess.hpp"
 #include "vgi_transport.hpp"
+#include "vgi_unary_rpc.hpp"
 #include "vgi_worker_pool.hpp"
 
 #include "duckdb/common/arrow/arrow_appender.hpp"
@@ -315,55 +316,13 @@ struct AggregateRpcResult {
 AggregateRpcResult InvokeAggregateRpc(ClientContext &context, const vgi::VgiAggregateBindData &bind_data,
                                        const std::string &method_name,
                                        const std::shared_ptr<arrow::RecordBatch> &params) {
-	auto &worker_path = bind_data.attach_params->worker_path();
-	auto worker_debug = bind_data.attach_params->worker_debug();
-	auto use_pool = bind_data.attach_params->use_pool();
-	auto &auth = bind_data.attach_params->auth();
-
-	// HTTP transport
-	if (vgi::IsHttpTransport(worker_path)) {
-		auto response = vgi::HttpInvokeUnary(context, worker_path, method_name, params, auth);
-		return {response.batch};
-	}
-
-	// Subprocess transport: acquire from pool or spawn fresh
-	std::unique_ptr<vgi::SubProcess> proc;
-	if (use_pool) {
-		auto pooled = vgi::VgiWorkerPool::Instance().TryAcquire(worker_path);
-		if (pooled) {
-			proc = pooled->Release();
-		}
-	}
-	if (!proc) {
-		proc = std::make_unique<vgi::SubProcess>(worker_path, worker_debug);
-	}
-
-	// Send RPC request
-	try {
-		vgi::WriteRpcRequest(proc->GetStdinFd(), method_name, params);
-	} catch (const IOException &e) {
-		vgi::CheckWorkerExitStatus(*proc, worker_path, "failed during aggregate RPC request");
-		throw;
-	}
-
-	// Read response
-	vgi::UnaryResponseResult response;
-	try {
-		response = vgi::ReadUnaryResponse(proc->GetStdoutFd(), &context, worker_path, proc->GetPid());
-	} catch (const IOException &e) {
-		vgi::CheckWorkerExitStatus(*proc, worker_path, "failed during aggregate RPC response");
-		throw;
-	}
-
-	// Return worker to pool if still alive
-	if (use_pool) {
-		int exit_status = 0;
-		if (!proc->TryWait(&exit_status)) {
-			auto to_pool = std::make_unique<vgi::PooledWorker>(std::move(proc), worker_path, -1);
-			vgi::VgiWorkerPool::Instance().Release(std::move(to_pool));
-		}
-	}
-
+	vgi::UnaryRpcOptions opts {context,
+	                           bind_data.attach_params->worker_path(),
+	                           bind_data.attach_params->worker_debug(),
+	                           bind_data.attach_params->use_pool(),
+	                           "rpc_aggregate",
+	                           bind_data.attach_params->auth()};
+	auto response = vgi::InvokePooledUnaryRpc(opts, method_name, params);
 	return {response.batch};
 }
 

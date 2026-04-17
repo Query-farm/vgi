@@ -1,7 +1,5 @@
 #include "vgi_function_connection.hpp"
 
-#include <poll.h>
-
 #include "duckdb.hpp"
 #include "duckdb/logging/log_manager.hpp"
 
@@ -138,23 +136,16 @@ FunctionConnection::FunctionConnection(std::unique_ptr<PooledWorker> pooled_work
       arguments_type_(arguments.type), arguments_array_(arguments.array), attach_id_(attach_id),
       transaction_id_(transaction_id), global_execution_id_(global_execution_id), context_(context),
       worker_debug_(worker_debug), settings_(settings), required_secrets_(required_secrets),
-      proc_(pooled_worker->Release()), stderr_fd_(pooled_worker->ReleaseStderrFd()) {
-	// Start stderr reader thread for the existing subprocess (reusing the fd)
-	StartStderrReader();
+      proc_(pooled_worker->Release()) {
+	// Adopt the pooled worker's stderr fd and start draining it.
+	stderr_drainer_ = std::make_unique<StderrDrainer>(pooled_worker->ReleaseStderrFd());
 }
 
 FunctionConnection::~FunctionConnection() {
-	// Terminate the subprocess first - this causes EOF on stderr which unblocks
-	// the stderr reader thread. Without this, StopStderrReader() would block forever
-	// waiting for the thread that's blocked on read().
+	// Terminate the subprocess first — EOF on stderr unblocks the drainer's
+	// blocking read(), so the drainer's destructor can join its thread quickly.
 	proc_.reset();
-	// Now stop stderr reader thread (should exit quickly due to EOF)
-	StopStderrReader();
-	// Drain any remaining stderr (can't log without context, just discard)
-	{
-		std::lock_guard<std::mutex> lock(stderr_mutex_);
-		stderr_lines_.clear();
-	}
+	stderr_drainer_.reset();
 }
 
 BindResult FunctionConnection::PerformBindFull() {
@@ -731,12 +722,11 @@ std::unique_ptr<PooledWorker> FunctionConnection::ReleaseForPooling() {
 	data_reader_.reset();
 	data_stream_.reset();
 
-	// Stop stderr thread but keep the fd open for reuse
-	StopStderrReader(false);
+	// Stop the drainer's thread but keep the fd open so the pool can reuse it.
+	int stderr_fd = ReleaseStderrReaderFd();
 
 	// Create pooled worker with our subprocess and stderr fd
-	auto pooled = std::make_unique<PooledWorker>(std::move(proc_), worker_path_, stderr_fd_);
-	stderr_fd_ = -1; // Ownership transferred to pooled worker
+	auto pooled = std::make_unique<PooledWorker>(std::move(proc_), worker_path_, stderr_fd);
 
 	// Clear our state so destructor doesn't try to use proc_
 	proc_.reset();
@@ -745,98 +735,34 @@ std::unique_ptr<PooledWorker> FunctionConnection::ReleaseForPooling() {
 }
 
 void FunctionConnection::StartStderrReader() {
-	// If we don't have an fd yet, try to get one from the subprocess
-	if (stderr_fd_ < 0) {
-		if (!proc_ || proc_->GetStderrFd() < 0) {
-			return; // No stderr to read (passthrough mode or no process)
-		}
-		stderr_fd_ = proc_->ReleaseStderrFd();
+	if (stderr_drainer_) {
+		return; // Already running
 	}
-
-	// Reset stop flag for new thread
-	stderr_stop_.store(false, std::memory_order_relaxed);
-
-	stderr_thread_ = std::thread([this]() {
-		char buffer[4096];
-		std::string line_buffer;
-
-		struct pollfd pfd;
-		pfd.fd = stderr_fd_;
-		pfd.events = POLLIN;
-
-		while (!stderr_stop_.load(std::memory_order_relaxed)) {
-			// Use poll() with timeout to allow periodic checking of stderr_stop_
-			// This avoids blocking indefinitely on read() which could cause
-			// the destructor to hang waiting for the thread to join
-			int poll_result = poll(&pfd, 1, 100); // 100ms timeout
-			if (poll_result < 0) {
-				if (errno == EINTR) {
-					continue; // Interrupted by signal, retry
-				}
-				break; // Error
-			}
-			if (poll_result == 0) {
-				continue; // Timeout, check stop flag and poll again
-			}
-
-			// Data available or hangup - read what's available
-			ssize_t bytes_read = read(stderr_fd_, buffer, sizeof(buffer) - 1);
-			if (bytes_read <= 0) {
-				break; // EOF or error
-			}
-			buffer[bytes_read] = '\0';
-
-			// Append to line buffer and process complete lines
-			line_buffer.append(buffer, bytes_read);
-			size_t pos;
-			while ((pos = line_buffer.find('\n')) != std::string::npos) {
-				std::string line = line_buffer.substr(0, pos);
-				line_buffer.erase(0, pos + 1);
-
-				// Trim trailing \r if present
-				if (!line.empty() && line.back() == '\r') {
-					line.pop_back();
-				}
-				if (!line.empty()) {
-					std::lock_guard<std::mutex> lock(stderr_mutex_);
-					stderr_lines_.push_back(std::move(line));
-				}
-			}
-		}
-
-		// Buffer any remaining partial line
-		if (!line_buffer.empty()) {
-			std::lock_guard<std::mutex> lock(stderr_mutex_);
-			stderr_lines_.push_back(std::move(line_buffer));
-		}
-
-		// Note: fd is NOT closed here - it's owned by the class and closed in StopStderrReader(true)
-	});
+	if (!proc_ || proc_->GetStderrFd() < 0) {
+		return; // No stderr pipe (passthrough mode or no process)
+	}
+	stderr_drainer_ = std::make_unique<StderrDrainer>(proc_->ReleaseStderrFd());
 }
 
-void FunctionConnection::StopStderrReader(bool close_fd) {
-	stderr_stop_.store(true, std::memory_order_relaxed);
-	if (stderr_thread_.joinable()) {
-		stderr_thread_.join();
+int FunctionConnection::ReleaseStderrReaderFd() {
+	if (!stderr_drainer_) {
+		return -1;
 	}
-	if (close_fd && stderr_fd_ >= 0) {
-		close(stderr_fd_);
-		stderr_fd_ = -1;
-	}
+	int fd = stderr_drainer_->ReleaseFd();
+	stderr_drainer_.reset();
+	return fd;
+}
+
+void FunctionConnection::StopStderrReader() {
+	// Dropping the drainer joins the thread and closes the fd.
+	stderr_drainer_.reset();
 }
 
 void FunctionConnection::DrainStderrLog() {
-	std::vector<std::string> lines;
-	{
-		std::lock_guard<std::mutex> lock(stderr_mutex_);
-		lines.swap(stderr_lines_);
+	if (!stderr_drainer_) {
+		return;
 	}
-
-	pid_t worker_pid = proc_ ? proc_->GetPid() : -1;
-	for (const auto &line : lines) {
-		VGI_LOG(context_, "worker.stderr",
-		        {{"worker_path", worker_path_}, {"worker_pid", std::to_string(worker_pid)}, {"message", line}});
-	}
+	stderr_drainer_->DrainToLog(context_, worker_path_, proc_ ? proc_->GetPid() : -1);
 }
 
 // ============================================================================

@@ -18,6 +18,7 @@
 #include "vgi_arrow_utils.hpp"
 #include "vgi_ifunction_connection.hpp"
 #include "vgi_protocol.hpp"
+#include "vgi_stderr_drainer.hpp"
 #include "vgi_subprocess.hpp"
 #include "vgi_worker_pool.hpp"
 
@@ -275,20 +276,20 @@ private:
 	// Dynamic filter state for tick-based pushdown (shared with the scan operator)
 	shared_ptr<TickFilterState> tick_filter_state_;
 
-	// Stderr reader thread - reads stderr and buffers lines for main thread to log
-	std::thread stderr_thread_;
-	std::atomic<bool> stderr_stop_{false};
-	std::mutex stderr_mutex_;
-	std::vector<std::string> stderr_lines_;
-	int stderr_fd_ = -1; // Stderr fd, owned by this class after release from SubProcess
+	// Stderr reader: owned drainer that spawns a background thread for the
+	// lifetime of this connection. ReleaseFd() transfers fd ownership to the
+	// pool on ReleaseForPooling() so the cleanup thread can close it later.
+	std::unique_ptr<StderrDrainer> stderr_drainer_;
 
-	// Start stderr reader thread (called after spawning worker)
+	// Start stderr reader (called after spawning worker or taking over from a
+	// pooled worker). No-op if the subprocess has no stderr pipe.
 	void StartStderrReader();
-	// Stop stderr reader thread (called in destructor or before pooling)
-	// If close_fd is true, also closes the stderr fd (use in destructor)
-	// If false, keeps fd open for reuse (use when pooling)
-	void StopStderrReader(bool close_fd = true);
-	// Drain buffered stderr lines and log them via VGI_LOG (call from main thread)
+	// Stop the reader and return the fd for pool reuse (keeps fd open).
+	// Returns -1 if no fd was held.
+	int ReleaseStderrReaderFd();
+	// Stop the reader and close the fd (destructor path).
+	void StopStderrReader();
+	// Forward buffered stderr lines to VGI_LOG (main thread).
 	void DrainStderrLog();
 };
 

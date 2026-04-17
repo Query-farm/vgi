@@ -43,6 +43,8 @@ src/vgi_arrow_ipc.cpp
 src/vgi_arrow_utils.cpp
 src/vgi_rpc_client.cpp
 src/vgi_rpc_types.cpp
+src/vgi_stderr_drainer.cpp
+src/vgi_unary_rpc.cpp
 src/vgi_bind_protocol.cpp
 src/vgi_transport.cpp
 src/vgi_http_client.cpp

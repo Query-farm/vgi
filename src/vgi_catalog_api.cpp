@@ -24,6 +24,7 @@
 #include "vgi_rpc_client.hpp"
 #include "vgi_rpc_types.hpp"
 #include "vgi_transport.hpp"
+#include "vgi_unary_rpc.hpp"
 #include "yyjson.hpp"
 
 using namespace duckdb_yyjson; // NOLINT
@@ -36,86 +37,21 @@ namespace vgi {
 // ============================================================================
 
 // Invoke a unary RPC catalog method and return the raw unary response.
-// Handles worker lifecycle: acquire from pool, send request, read response, return to pool.
-// For HTTP transport, dispatches to HttpInvokeUnary instead.
+// Delegates to InvokePooledUnaryRpc which handles pool acquire/release, stderr
+// draining (critical — without it, long-running catalogs hang when the worker
+// stderr pipe buffer fills), and stale-pool retry.
 static UnaryResponseResult InvokeRpcMethod(const CatalogRpcContext &ctx, const std::string &method_name,
                                             const std::shared_ptr<arrow::RecordBatch> &params, ClientContext &context) {
-	auto &worker_path = ctx.params->worker_path();
-	auto worker_debug = ctx.params->worker_debug();
-	auto use_pool = ctx.params->use_pool();
-	auto &auth = ctx.params->auth();
-
-	// HTTP transport: dispatch to HttpInvokeUnary
-	if (IsHttpTransport(worker_path)) {
-		return HttpInvokeUnary(context, worker_path, method_name, params, auth);
-	}
-
-	// Subprocess transport: acquire worker from pool or spawn fresh
-	std::unique_ptr<SubProcess> proc;
-
-	if (use_pool) {
-		auto pooled = VgiWorkerPool::Instance().TryAcquire(worker_path);
-		if (pooled) {
-			proc = pooled->Release();
-			VGI_LOG(context, "worker_pool.acquire",
-			        {{"worker_path", worker_path},
-			         {"worker_pid", std::to_string(proc->GetPid())},
-			         {"result", "hit"},
-			         {"phase", "rpc_catalog"}});
-		}
-	}
-
-	if (!proc) {
-		proc = std::make_unique<SubProcess>(worker_path, worker_debug);
-		if (use_pool) {
-			VgiWorkerPool::Instance().RecordMiss(worker_path);
-		}
-		VGI_LOG(context, "worker_pool.acquire",
-		        {{"worker_path", worker_path},
-		         {"worker_pid", std::to_string(proc->GetPid())},
-		         {"result", use_pool ? "miss" : "disabled"},
-		         {"phase", "rpc_catalog"}});
-	}
-
 	VGI_LOG(context, "rpc.invoke",
-	        {{"worker_path", worker_path}, {"worker_pid", std::to_string(proc->GetPid())}, {"method", method_name}});
+	        {{"worker_path", ctx.params->worker_path()}, {"method", method_name}});
 
-	// Send RPC request
-	try {
-		if (params) {
-			WriteRpcRequest(proc->GetStdinFd(), method_name, params);
-		} else {
-			WriteEmptyRpcRequest(proc->GetStdinFd(), method_name);
-		}
-	} catch (const IOException &e) {
-		CheckWorkerExitStatus(*proc, worker_path, "failed to start");
-		throw;
-	}
-
-	// Read response
-	UnaryResponseResult response;
-	try {
-		response = ReadUnaryResponse(proc->GetStdoutFd(), &context, worker_path, proc->GetPid());
-	} catch (const IOException &e) {
-		CheckWorkerExitStatus(*proc, worker_path, "failed during read");
-		throw;
-	}
-
-	// Return worker to pool if still alive
-	if (use_pool) {
-		int exit_status = 0;
-		if (!proc->TryWait(&exit_status)) {
-			auto to_pool = std::make_unique<PooledWorker>(std::move(proc), worker_path, -1);
-			VGI_LOG(context, "worker_pool.release",
-			        {{"worker_path", worker_path},
-			         {"worker_pid", std::to_string(to_pool->GetPid())},
-			         {"method_name", method_name},
-			         {"phase", "rpc_catalog"}});
-			VgiWorkerPool::Instance().Release(std::move(to_pool));
-		}
-	}
-
-	return response;
+	UnaryRpcOptions opts {context,
+	                      ctx.params->worker_path(),
+	                      ctx.params->worker_debug(),
+	                      ctx.params->use_pool(),
+	                      "rpc_catalog",
+	                      ctx.params->auth()};
+	return InvokePooledUnaryRpc(opts, method_name, params);
 }
 
 // Extract result binary bytes from a unary RPC response batch,
