@@ -1,6 +1,6 @@
-# name: test/sql/integration/table/writable_ctas.test
+# name: test/sql/integration/writable/ctas.test
 # description: Tests for CREATE TABLE AS SELECT on VGI writable catalogs
-# group: [vgi_integration_table]
+# group: [vgi_integration_writable]
 
 require-env VGI_TEST_WORKER
 

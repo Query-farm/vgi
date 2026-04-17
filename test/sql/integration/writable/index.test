@@ -1,6 +1,6 @@
-# name: test/sql/integration/table/writable_index.test
+# name: test/sql/integration/writable/index.test
 # description: Tests for index catalog support on VGI catalogs
-# group: [vgi_integration_table]
+# group: [vgi_integration_writable]
 
 require-env VGI_TEST_WORKER
 

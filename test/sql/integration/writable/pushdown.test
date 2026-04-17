@@ -1,6 +1,6 @@
-# name: test/sql/integration/table/writable_pushdown.test
+# name: test/sql/integration/writable/pushdown.test
 # description: Filter and projection pushdown on VGI writable tables
-# group: [vgi_integration_table]
+# group: [vgi_integration_writable]
 
 require-env VGI_TEST_WORKER
 

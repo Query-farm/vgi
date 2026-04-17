@@ -1,6 +1,6 @@
-# name: test/sql/integration/table/writable_alter.test
+# name: test/sql/integration/writable/alter.test
 # description: Tests for ALTER TABLE on VGI writable catalogs
-# group: [vgi_integration_table]
+# group: [vgi_integration_writable]
 
 require-env VGI_TEST_WORKER
 

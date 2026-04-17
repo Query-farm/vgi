@@ -1,6 +1,6 @@
-# name: test/sql/integration/table/writable_foreign_key.test
+# name: test/sql/integration/writable/foreign_key.test
 # description: Foreign key constraint tests — writable_orders references writable_products
-# group: [vgi_integration_table]
+# group: [vgi_integration_writable]
 
 require-env VGI_TEST_WORKER
 

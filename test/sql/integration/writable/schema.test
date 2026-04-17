@@ -1,6 +1,6 @@
-# name: test/sql/integration/table/writable_schema.test
+# name: test/sql/integration/writable/schema.test
 # description: Tests for CREATE SCHEMA and DROP SCHEMA on VGI writable catalogs
-# group: [vgi_integration_table]
+# group: [vgi_integration_writable]
 
 require-env VGI_TEST_WORKER
 

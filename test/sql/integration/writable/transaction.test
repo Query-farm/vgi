@@ -1,6 +1,6 @@
-# name: test/sql/integration/table/writable_transaction.test
+# name: test/sql/integration/writable/transaction.test
 # description: Transaction semantics (BEGIN/COMMIT/ROLLBACK, read-your-writes) on VGI writable tables
-# group: [vgi_integration_table]
+# group: [vgi_integration_writable]
 
 require-env VGI_TEST_WORKER
 
