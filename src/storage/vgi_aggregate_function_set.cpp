@@ -13,6 +13,7 @@
 #include "storage/vgi_schema_entry.hpp"
 #include "storage/vgi_transaction.hpp"
 #include "vgi_aggregate_function_impl.hpp"
+#include "vgi_aggregate_window_impl.hpp"
 #include "vgi_arrow_utils.hpp"
 #include "vgi_catalog_api.hpp"
 
@@ -130,6 +131,19 @@ void VgiAggregateFunctionSet::LoadEntries(ClientContext &context) {
 			agg_func.SetOrderDependent(func_info.order_dependent);
 			agg_func.SetDistinctDependent(func_info.distinct_dependent);
 
+			// Wire the optional window callbacks when the worker advertises
+			// supports_window. DuckDB's WindowCustomAggregator::CanAggregate
+			// picks the window path automatically for OVER queries; the
+			// standard update/combine/finalize path remains for GROUP BY.
+			if (func_info.supports_window) {
+				agg_func.SetWindowInitCallback(vgi::VgiAggregateWindowInit);
+				// Prefer the batched variant — one RPC per Evaluate() instead of
+				// one per output row. SetWindowCallback is still wired as a
+				// fallback for builds where the batch callback isn't honored.
+				agg_func.SetWindowBatchCallback(vgi::VgiAggregateWindowBatch);
+				agg_func.SetWindowCallback(vgi::VgiAggregateWindow);
+			}
+
 			// Create and attach VgiAggregateFunctionInfo
 			auto agg_func_info = make_shared_ptr<vgi::VgiAggregateFunctionInfo>();
 			agg_func_info->attach_params = attach_params;
@@ -141,6 +155,7 @@ void VgiAggregateFunctionSet::LoadEntries(ClientContext &context) {
 			agg_func_info->positional_names = arg_types.positional_names;
 			agg_func_info->setting_names = setting_names;
 			agg_func_info->required_secrets = func_info.required_secrets;
+			agg_func_info->supports_window = func_info.supports_window;
 
 			agg_func.function_info = agg_func_info;
 

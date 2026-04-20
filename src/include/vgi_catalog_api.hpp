@@ -279,6 +279,9 @@ struct VgiFunctionInfo {
 	// Aggregate function fields - uses DuckDB's enums
 	AggregateOrderDependent order_dependent = AggregateOrderDependent::NOT_ORDER_DEPENDENT;
 	AggregateDistinctDependent distinct_dependent = AggregateDistinctDependent::NOT_DISTINCT_DEPENDENT;
+	// True when the aggregate implements the window() callback (enables
+	// DuckDB's custom-window aggregator path with partition caching).
+	bool supports_window = false;
 
 	// Settings required by this function (must be set before invocation)
 	std::vector<std::string> required_settings;

@@ -137,8 +137,13 @@ FunctionConnection::FunctionConnection(std::unique_ptr<PooledWorker> pooled_work
       transaction_id_(transaction_id), global_execution_id_(global_execution_id), context_(context),
       worker_debug_(worker_debug), settings_(settings), required_secrets_(required_secrets),
       proc_(pooled_worker->Release()) {
-	// Adopt the pooled worker's stderr fd and start draining it.
-	stderr_drainer_ = std::make_unique<StderrDrainer>(pooled_worker->ReleaseStderrFd());
+	// Adopt the drainer that was kept running while the worker was idle
+	// in the pool. Falling back to a fresh drainer is unexpected (pool
+	// invariant: workers always carry a drainer), but cheap if needed.
+	stderr_drainer_ = pooled_worker->ReleaseDrainer();
+	if (!stderr_drainer_ && proc_ && proc_->GetStderrFd() >= 0) {
+		stderr_drainer_ = std::make_unique<StderrDrainer>(proc_->ReleaseStderrFd());
+	}
 }
 
 FunctionConnection::~FunctionConnection() {
@@ -722,11 +727,13 @@ std::unique_ptr<PooledWorker> FunctionConnection::ReleaseForPooling() {
 	data_reader_.reset();
 	data_stream_.reset();
 
-	// Stop the drainer's thread but keep the fd open so the pool can reuse it.
-	int stderr_fd = ReleaseStderrReaderFd();
+	// Hand the (still-running) drainer off to the pool so it keeps consuming
+	// stderr while the worker is idle. This prevents the Python worker from
+	// blocking on a full stderr pipe buffer between RPCs.
+	auto drainer = std::move(stderr_drainer_);
 
-	// Create pooled worker with our subprocess and stderr fd
-	auto pooled = std::make_unique<PooledWorker>(std::move(proc_), worker_path_, stderr_fd);
+	// Create pooled worker with our subprocess and the live drainer.
+	auto pooled = std::make_unique<PooledWorker>(std::move(proc_), worker_path_, std::move(drainer));
 
 	// Clear our state so destructor doesn't try to use proc_
 	proc_.reset();

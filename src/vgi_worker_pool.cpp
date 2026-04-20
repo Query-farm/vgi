@@ -2,8 +2,6 @@
 
 #include "vgi_logging.hpp"
 
-#include <unistd.h>
-
 namespace duckdb {
 namespace vgi {
 
@@ -11,36 +9,28 @@ namespace vgi {
 // PooledWorker
 //===--------------------------------------------------------------------===//
 
-PooledWorker::PooledWorker(std::unique_ptr<SubProcess> proc, const std::string &worker_path, int stderr_fd)
+PooledWorker::PooledWorker(std::unique_ptr<SubProcess> proc, const std::string &worker_path,
+                            std::unique_ptr<StderrDrainer> drainer)
     : proc_(std::move(proc)), worker_path_(worker_path), pooled_at_(std::chrono::steady_clock::now()),
-      stderr_fd_(stderr_fd) {
+      drainer_(std::move(drainer)) {
 }
 
 PooledWorker::~PooledWorker() {
-	// Close stderr fd if still owned
-	if (stderr_fd_ >= 0) {
-		close(stderr_fd_);
-	}
-	// SubProcess destructor handles the rest
+	// drainer_ destructor stops the reader thread and closes the stderr fd.
+	// SubProcess destructor handles process cleanup.
 }
 
 PooledWorker::PooledWorker(PooledWorker &&other) noexcept
     : proc_(std::move(other.proc_)), worker_path_(std::move(other.worker_path_)), pooled_at_(other.pooled_at_),
-      stderr_fd_(other.stderr_fd_) {
-	other.stderr_fd_ = -1; // Transfer ownership
+      drainer_(std::move(other.drainer_)) {
 }
 
 PooledWorker &PooledWorker::operator=(PooledWorker &&other) noexcept {
 	if (this != &other) {
-		// Close our existing stderr fd if any
-		if (stderr_fd_ >= 0) {
-			close(stderr_fd_);
-		}
 		proc_ = std::move(other.proc_);
 		worker_path_ = std::move(other.worker_path_);
 		pooled_at_ = other.pooled_at_;
-		stderr_fd_ = other.stderr_fd_;
-		other.stderr_fd_ = -1; // Transfer ownership
+		drainer_ = std::move(other.drainer_);
 	}
 	return *this;
 }
@@ -58,10 +48,8 @@ std::unique_ptr<SubProcess> PooledWorker::Release() {
 	return std::move(proc_);
 }
 
-int PooledWorker::ReleaseStderrFd() {
-	int fd = stderr_fd_;
-	stderr_fd_ = -1;
-	return fd;
+std::unique_ptr<StderrDrainer> PooledWorker::ReleaseDrainer() {
+	return std::move(drainer_);
 }
 
 pid_t PooledWorker::GetPid() const {

@@ -1,0 +1,415 @@
+# name: test/sql/integration/aggregate/window.test
+# description: VGI windowed aggregate callbacks (aggregate_window_init / aggregate_window / aggregate_window_destructor)
+# group: [vgi_integration_aggregate]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+USE example;
+
+# ============================================================================
+# Simple running-sum via OVER (ORDER BY ...)
+# ============================================================================
+
+query II
+SELECT x, vgi_window_sum(x) OVER (ORDER BY x ROWS BETWEEN 2 PRECEDING AND CURRENT ROW)
+FROM (VALUES (1), (2), (3), (4), (5)) t(x)
+ORDER BY x;
+----
+1	1
+2	3
+3	6
+4	9
+5	12
+
+# Compare to DuckDB's built-in sum() for correctness
+query II
+SELECT
+  x,
+  vgi_window_sum(x::BIGINT) OVER (ORDER BY x ROWS BETWEEN 2 PRECEDING AND CURRENT ROW)
+  = sum(x::BIGINT) OVER (ORDER BY x ROWS BETWEEN 2 PRECEDING AND CURRENT ROW)
+FROM (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)) t(x)
+ORDER BY x;
+----
+1	true
+2	true
+3	true
+4	true
+5	true
+6	true
+7	true
+8	true
+9	true
+10	true
+
+# ============================================================================
+# Sliding frame: ROWS BETWEEN N PRECEDING AND N FOLLOWING
+# ============================================================================
+
+query II
+SELECT
+  x,
+  vgi_window_sum(x::BIGINT) OVER (ORDER BY x ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING)
+  = sum(x::BIGINT) OVER (ORDER BY x ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING)
+FROM generate_series(1, 20) t(x)
+ORDER BY x;
+----
+1	true
+2	true
+3	true
+4	true
+5	true
+6	true
+7	true
+8	true
+9	true
+10	true
+11	true
+12	true
+13	true
+14	true
+15	true
+16	true
+17	true
+18	true
+19	true
+20	true
+
+# ============================================================================
+# EXCLUDE CURRENT ROW — exercises the multi-subframe path
+# ============================================================================
+
+query II
+SELECT
+  x,
+  vgi_window_sum(x::BIGINT) OVER (ORDER BY x ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING EXCLUDE CURRENT ROW)
+  = sum(x::BIGINT) OVER (ORDER BY x ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING EXCLUDE CURRENT ROW)
+FROM generate_series(1, 10) t(x)
+ORDER BY x;
+----
+1	true
+2	true
+3	true
+4	true
+5	true
+6	true
+7	true
+8	true
+9	true
+10	true
+
+# ============================================================================
+# Multi-partition queries — verify partition_id cache keying & destructor cleanup
+# ============================================================================
+
+query III
+SELECT
+  g,
+  x,
+  vgi_window_sum(x::BIGINT) OVER (PARTITION BY g ORDER BY x ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+FROM (VALUES
+  ('a', 1), ('a', 2), ('a', 3),
+  ('b', 10), ('b', 20), ('b', 30)
+) t(g, x)
+ORDER BY g, x;
+----
+a	1	1
+a	2	3
+a	3	6
+b	10	10
+b	20	30
+b	30	60
+
+# ============================================================================
+# Windowed median — non-incremental aggregate benefits from partition caching
+# ============================================================================
+
+query RR
+SELECT
+  x,
+  vgi_window_median(x::DOUBLE) OVER (ORDER BY x ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING)
+FROM generate_series(1, 7) t(x)
+ORDER BY x;
+----
+1.0	2.0
+2.0	2.5
+3.0	3.0
+4.0	4.0
+5.0	5.0
+6.0	5.5
+7.0	6.0
+
+# ============================================================================
+# EXCLUDE TIES — emits 2 subframes (before + row itself) per call
+# EXCLUDE GROUP — emits 2 subframes (strictly before and strictly after peers)
+# ============================================================================
+
+query I
+SELECT
+  COUNT(*) FILTER (WHERE NOT match)
+FROM (
+  SELECT
+    x,
+    vgi_window_sum(x::BIGINT) OVER (ORDER BY x ROWS BETWEEN 3 PRECEDING AND 3 FOLLOWING EXCLUDE TIES)
+    = sum(x::BIGINT) OVER (ORDER BY x ROWS BETWEEN 3 PRECEDING AND 3 FOLLOWING EXCLUDE TIES) AS match
+  FROM generate_series(1, 10) t(x)
+);
+----
+0
+
+query I
+SELECT
+  COUNT(*) FILTER (WHERE NOT match)
+FROM (
+  SELECT
+    x,
+    vgi_window_sum(x::BIGINT) OVER (ORDER BY x ROWS BETWEEN 3 PRECEDING AND 3 FOLLOWING EXCLUDE GROUP)
+    = sum(x::BIGINT) OVER (ORDER BY x ROWS BETWEEN 3 PRECEDING AND 3 FOLLOWING EXCLUDE GROUP) AS match
+  FROM generate_series(1, 10) t(x)
+);
+----
+0
+
+# ============================================================================
+# ORDER BY DESC — frame ordering reversed; partition data shipment unchanged
+# ============================================================================
+
+query II
+SELECT
+  x,
+  vgi_window_sum(x::BIGINT) OVER (ORDER BY x DESC ROWS BETWEEN 2 PRECEDING AND CURRENT ROW)
+  = sum(x::BIGINT) OVER (ORDER BY x DESC ROWS BETWEEN 2 PRECEDING AND CURRENT ROW)
+FROM generate_series(1, 10) t(x)
+ORDER BY x;
+----
+1	true
+2	true
+3	true
+4	true
+5	true
+6	true
+7	true
+8	true
+9	true
+10	true
+
+# ============================================================================
+# FILTER (WHERE ...) combined with OVER — exercises the filter_mask plumbing.
+# NULL-safe comparison (IS NOT DISTINCT FROM) because the running sum of evens
+# is NULL for early rows where no even values have been seen yet.
+# ============================================================================
+
+query I
+SELECT
+  COUNT(*) FILTER (WHERE NOT match)
+FROM (
+  SELECT
+    (vgi_window_sum(x::BIGINT) FILTER (WHERE x % 2 = 0)
+       OVER (ORDER BY x ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW))
+    IS NOT DISTINCT FROM
+    (sum(x::BIGINT) FILTER (WHERE x % 2 = 0)
+       OVER (ORDER BY x ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)) AS match
+  FROM generate_series(1, 10) t(x)
+);
+----
+0
+
+# ============================================================================
+# Multiple window aggregates in a single query — each gets its own
+# partition_id space and independent cache entry.
+# ============================================================================
+
+query I
+SELECT
+  COUNT(*) FILTER (WHERE NOT (a_ok AND b_ok))
+FROM (
+  SELECT
+    x,
+    vgi_window_sum(x::BIGINT) OVER (ORDER BY x ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)
+      = sum(x::BIGINT) OVER (ORDER BY x ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS a_ok,
+    vgi_window_sum(x::BIGINT) OVER (ORDER BY x ROWS BETWEEN CURRENT ROW AND 2 FOLLOWING)
+      = sum(x::BIGINT) OVER (ORDER BY x ROWS BETWEEN CURRENT ROW AND 2 FOLLOWING) AS b_ok
+  FROM generate_series(1, 20) t(x)
+);
+----
+0
+
+# ============================================================================
+# Large partition — exceeds STANDARD_VECTOR_SIZE (2048) to ensure
+# PartitionToArrow handles multi-chunk materialisation correctly.
+# ============================================================================
+
+query I
+SELECT
+  COUNT(*) FILTER (WHERE NOT match)
+FROM (
+  SELECT
+    x,
+    vgi_window_sum(x::BIGINT) OVER (ORDER BY x ROWS BETWEEN 5 PRECEDING AND 5 FOLLOWING)
+    = sum(x::BIGINT) OVER (ORDER BY x ROWS BETWEEN 5 PRECEDING AND 5 FOLLOWING) AS match
+  FROM generate_series(1, 5000) t(x)
+);
+----
+0
+
+# ============================================================================
+# Many partitions — cache-key isolation and destructor cleanup under load.
+# 100 partitions × 20 rows each.
+# ============================================================================
+
+query I
+SELECT
+  COUNT(*) FILTER (WHERE NOT match)
+FROM (
+  SELECT
+    g, x,
+    vgi_window_sum(x::BIGINT) OVER (PARTITION BY g ORDER BY x ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+    = sum(x::BIGINT) OVER (PARTITION BY g ORDER BY x ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS match
+  FROM (
+    SELECT (i % 100) AS g, i AS x FROM generate_series(1, 2000) t(i)
+  )
+);
+----
+0
+
+# ============================================================================
+# Window inside a CTE
+# ============================================================================
+
+query II
+WITH windowed AS (
+  SELECT
+    x,
+    vgi_window_sum(x::BIGINT) OVER (ORDER BY x ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS s
+  FROM generate_series(1, 5) t(x)
+)
+SELECT x, s FROM windowed ORDER BY x;
+----
+1	1
+2	3
+3	5
+4	7
+5	9
+
+# ============================================================================
+# Dynamic aggregate with window support (vgi_dynamic_agg + supports_window)
+# Falls back to Aggregate.finalize(table) when the user's class does NOT
+# define a window() method.
+# ============================================================================
+
+query R
+SELECT vgi_dynamic_agg(
+  'class Aggregate:
+    @staticmethod
+    def finalize(table):
+        return pa.compute.sum(table.column("c0")).as_py()',
+  i::DOUBLE
+) OVER (ORDER BY i ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)
+FROM range(1, 6) t(i)
+ORDER BY i LIMIT 1;
+----
+1.0
+
+# ============================================================================
+# Dynamic aggregate with a user-defined window() method — exercised per frame.
+# ============================================================================
+
+query RRRR
+SELECT
+  MIN(w), MAX(w), SUM(w), COUNT(*)
+FROM (
+  SELECT vgi_dynamic_agg(
+    'class Aggregate:
+      @staticmethod
+      def finalize(table):
+          return pa.compute.sum(table.column("c0")).as_py()
+      @staticmethod
+      def window(table):
+          vals = table.column("c0").to_pylist()
+          return max(vals) - min(vals) if vals else None',
+    i::DOUBLE
+  ) OVER (ORDER BY i ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING) AS w
+  FROM range(1, 11) t(i)
+);
+----
+2.0	4.0	34.0	10
+
+# ============================================================================
+# Dynamic ML aggregate (params dict) with window support — falls back to
+# Aggregate.finalize(table, params) in the window path.
+# ============================================================================
+
+query R
+SELECT vgi_dynamic_ml_agg(
+  'class Aggregate:
+    @staticmethod
+    def finalize(table, params):
+        n = table.num_rows
+        scale = float(params.get("scale", 1.0))
+        return scale * pa.compute.sum(table.column("c0")).as_py() if n > 0 else None',
+  MAP {'scale': 2.0},
+  i::DOUBLE
+) OVER (ORDER BY i ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+FROM range(1, 6) t(i)
+ORDER BY i
+LIMIT 1;
+----
+2.0
+
+# ============================================================================
+# Order-dependent windowed aggregate via the window() callback
+# OVER (ORDER BY x) — window() IS called (arg_orders is empty).
+# ============================================================================
+
+query IT
+SELECT
+  x,
+  vgi_window_listagg(s) OVER (ORDER BY x ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)
+FROM (VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')) t(x, s)
+ORDER BY x;
+----
+1	a
+2	a,b
+3	b,c
+4	c,d
+
+# ============================================================================
+# Fallback handoff — agg(x ORDER BY y) OVER (...) for an ORDER_DEPENDENT
+# aggregate. DuckDB's CanAggregate rejects the window path (arg_orders is
+# non-empty); falls back to update/combine/finalize. Result must still be
+# correct — we only care that the handoff is clean, not which path ran.
+# ============================================================================
+
+query T
+SELECT vgi_window_listagg(s ORDER BY x)
+  OVER (ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
+FROM (VALUES (1, 'a'), (2, 'b'), (3, 'c')) t(x, s)
+LIMIT 1;
+----
+a,b,c
+
+# ============================================================================
+# Fallback path — GROUP BY still works for window-capable functions.
+# DuckDB's CanAggregate picks the window path only for OVER queries.
+# ============================================================================
+
+query I
+SELECT vgi_window_sum(x::BIGINT) FROM (VALUES (1), (2), (3), (4), (5)) t(x);
+----
+15
+
+query II
+SELECT g, vgi_window_sum(x::BIGINT)
+FROM (VALUES ('a', 1), ('a', 2), ('b', 3), ('b', 4)) t(g, x)
+GROUP BY g
+ORDER BY g;
+----
+a	3
+b	7

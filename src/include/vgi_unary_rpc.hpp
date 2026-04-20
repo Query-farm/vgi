@@ -28,6 +28,13 @@ struct UnaryRpcOptions {
 	std::string phase;
 	// Forwarded to HttpInvokeUnary for HTTP transport. Ignored for subprocess.
 	std::shared_ptr<CatalogAuth> auth;
+	// When false, the RPC path skips all VGI_LOG calls (pool acquire/release,
+	// stale events) and skips StderrDrainer::DrainToLog. Set false only for
+	// best-effort calls that run off the main thread during pipeline teardown
+	// (aggregate destructors), where DuckDB's ClientContext-backed logger is
+	// not guaranteed safe to invoke. Buffered stderr stays on the drainer and
+	// will be drained the next time the pooled worker is used.
+	bool enable_logging = true;
 };
 
 // Send a single unary RPC and return the response.

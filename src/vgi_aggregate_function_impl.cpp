@@ -1,4 +1,5 @@
 #include "vgi_aggregate_function_impl.hpp"
+#include "vgi_aggregate_window_impl.hpp"
 #include "vgi_arrow_utils.hpp"
 #include "vgi_catalog_api.hpp"
 #include "vgi_exception.hpp"
@@ -43,22 +44,6 @@ void ThrowOnArrowError(const arrow::Status &status) {
 	if (!status.ok()) {
 		throw IOException("Arrow error in VGI aggregate: %s", status.ToString());
 	}
-}
-
-// ============================================================================
-// Aggregate RPC request builders
-// ============================================================================
-// Each builds the request dataclass as a RecordBatch, serializes to IPC bytes,
-// and wraps in the standard vgi_rpc params format: {request: binary}.
-
-std::shared_ptr<arrow::RecordBatch> WrapAsRpcParams(const std::shared_ptr<arrow::RecordBatch> &request_batch) {
-	auto request_bytes = vgi::SerializeToIpcBytes(request_batch);
-	auto schema = arrow::schema({arrow::field("request", arrow::binary(), false)});
-	arrow::BinaryBuilder builder;
-	ThrowOnArrowError(builder.Append(request_bytes.data(), request_bytes.size()));
-	std::shared_ptr<arrow::Array> arr;
-	ThrowOnArrowError(builder.Finish(&arr));
-	return arrow::RecordBatch::Make(schema, 1, {arr});
 }
 
 std::shared_ptr<arrow::RecordBatch> BuildAggregateBindRequest(
@@ -143,7 +128,7 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateBindRequest(
 	ThrowOnArrowError(secrets_builder.Finish(&secrets_arr));
 	ThrowOnArrowError(aid_builder.Finish(&aid_arr));
 
-	return WrapAsRpcParams(arrow::RecordBatch::Make(schema, 1, {fn_arr, args_arr, schema_arr, settings_arr, secrets_arr, aid_arr}));
+	return vgi::WrapAsRpcParams(arrow::RecordBatch::Make(schema, 1, {fn_arr, args_arr, schema_arr, settings_arr, secrets_arr, aid_arr}));
 }
 
 std::shared_ptr<arrow::RecordBatch> BuildAggregateUpdateRequest(
@@ -180,7 +165,7 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateUpdateRequest(
 	ThrowOnArrowError(batch_builder.Finish(&batch_arr));
 	ThrowOnArrowError(aid_builder.Finish(&aid_arr));
 
-	return WrapAsRpcParams(arrow::RecordBatch::Make(schema, 1, {fn_arr, eid_arr, batch_arr, aid_arr}));
+	return vgi::WrapAsRpcParams(arrow::RecordBatch::Make(schema, 1, {fn_arr, eid_arr, batch_arr, aid_arr}));
 }
 
 std::shared_ptr<arrow::RecordBatch> BuildAggregateCombineRequest(
@@ -217,7 +202,7 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateCombineRequest(
 	ThrowOnArrowError(batch_builder.Finish(&batch_arr));
 	ThrowOnArrowError(aid_builder.Finish(&aid_arr));
 
-	return WrapAsRpcParams(arrow::RecordBatch::Make(schema, 1, {fn_arr, eid_arr, batch_arr, aid_arr}));
+	return vgi::WrapAsRpcParams(arrow::RecordBatch::Make(schema, 1, {fn_arr, eid_arr, batch_arr, aid_arr}));
 }
 
 std::shared_ptr<arrow::RecordBatch> BuildAggregateFinalizeRequest(
@@ -263,7 +248,7 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateFinalizeRequest(
 	ThrowOnArrowError(os_builder.Finish(&os_arr));
 	ThrowOnArrowError(aid_builder.Finish(&aid_arr));
 
-	return WrapAsRpcParams(arrow::RecordBatch::Make(schema, 1, {fn_arr, eid_arr, gid_arr, os_arr, aid_arr}));
+	return vgi::WrapAsRpcParams(arrow::RecordBatch::Make(schema, 1, {fn_arr, eid_arr, gid_arr, os_arr, aid_arr}));
 }
 
 std::shared_ptr<arrow::RecordBatch> BuildAggregateDestructorRequest(
@@ -300,35 +285,43 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateDestructorRequest(
 	ThrowOnArrowError(gid_builder.Finish(&gid_arr));
 	ThrowOnArrowError(aid_builder.Finish(&aid_arr));
 
-	return WrapAsRpcParams(arrow::RecordBatch::Make(schema, 1, {fn_arr, eid_arr, gid_arr, aid_arr}));
-}
-
-// ============================================================================
-// Unary RPC helper — same pattern as catalog RPC calls
-// ============================================================================
-// Spawns a subprocess (or uses pool), sends a unary RPC request,
-// reads the response, returns the worker to pool.
-
-struct AggregateRpcResult {
-	std::shared_ptr<arrow::RecordBatch> response_batch;
-};
-
-AggregateRpcResult InvokeAggregateRpc(ClientContext &context, const vgi::VgiAggregateBindData &bind_data,
-                                       const std::string &method_name,
-                                       const std::shared_ptr<arrow::RecordBatch> &params) {
-	vgi::UnaryRpcOptions opts {context,
-	                           bind_data.attach_params->worker_path(),
-	                           bind_data.attach_params->worker_debug(),
-	                           bind_data.attach_params->use_pool(),
-	                           "rpc_aggregate",
-	                           bind_data.attach_params->auth()};
-	auto response = vgi::InvokePooledUnaryRpc(opts, method_name, params);
-	return {response.batch};
+	return vgi::WrapAsRpcParams(arrow::RecordBatch::Make(schema, 1, {fn_arr, eid_arr, gid_arr, aid_arr}));
 }
 
 } // anonymous namespace
 
 namespace vgi {
+
+// ============================================================================
+// Shared RPC envelope + invoker
+// ============================================================================
+// Moved out of the anonymous namespace so aggregate_window_impl.cpp can share
+// the same connection-pool / subprocess / HTTP transport plumbing.
+
+std::shared_ptr<arrow::RecordBatch> WrapAsRpcParams(const std::shared_ptr<arrow::RecordBatch> &request_batch) {
+	auto request_bytes = SerializeToIpcBytes(request_batch);
+	auto schema = arrow::schema({arrow::field("request", arrow::binary(), false)});
+	arrow::BinaryBuilder builder;
+	ThrowOnArrowError(builder.Append(request_bytes.data(), request_bytes.size()));
+	std::shared_ptr<arrow::Array> arr;
+	ThrowOnArrowError(builder.Finish(&arr));
+	return arrow::RecordBatch::Make(schema, 1, {arr});
+}
+
+AggregateRpcResult InvokeAggregateRpc(ClientContext &context, const VgiAggregateBindData &bind_data,
+                                      const std::string &method_name,
+                                      const std::shared_ptr<arrow::RecordBatch> &params,
+                                      bool enable_logging) {
+	UnaryRpcOptions opts {context,
+	                      bind_data.attach_params->worker_path(),
+	                      bind_data.attach_params->worker_debug(),
+	                      bind_data.attach_params->use_pool(),
+	                      "rpc_aggregate",
+	                      bind_data.attach_params->auth(),
+	                      enable_logging};
+	auto response = InvokePooledUnaryRpc(opts, method_name, params);
+	return {response.batch};
+}
 
 // ============================================================================
 // VgiAggregateBindData
@@ -361,14 +354,21 @@ bool VgiAggregateBindData::Equals(const FunctionData &other_p) const {
 // ============================================================================
 
 idx_t VgiAggregateStateSize(const AggregateFunction &function) {
-	return sizeof(VgiAggregateState);
+	// The same buffer serves both the standard aggregate path and the
+	// windowed aggregate path — size it for the larger of the two. The
+	// tag field at offset 0 (shared layout) discriminates at teardown time.
+	idx_t agg_size = sizeof(VgiAggregateState);
+	idx_t win_size = sizeof(VgiAggregateWindowLocalState);
+	return agg_size > win_size ? agg_size : win_size;
 }
 
 void VgiAggregateInitialize(const AggregateFunction &function, data_ptr_t state) {
 	new (state) VgiAggregateState();
-	// group_id stays -1 because initialize() doesn't receive AggregateInputData,
-	// so we can't access the per-query ExecState::group_id_counter here.
-	// Assignment happens lazily in update/combine/finalize which do have bind_data.
+	// tag stays UNSET, group_id stays -1. The first-use site (update/combine/
+	// finalize for the aggregate path, or VgiAggregateWindowInit for the
+	// window path) is responsible for setting the tag. Initialize doesn't
+	// receive AggregateInputData, so we can't access the per-query ExecState
+	// counters here anyway.
 }
 
 void VgiAggregateUpdate(Vector inputs[], AggregateInputData &aggr_input_data, idx_t input_count, Vector &state_vector,
@@ -387,6 +387,7 @@ void VgiAggregateUpdate(Vector inputs[], AggregateInputData &aggr_input_data, id
 		if (agg_state.group_id == -1) {
 			agg_state.group_id = bind_data.exec_state->group_id_counter.fetch_add(1);
 		}
+		agg_state.tag = VgiAggregateStateTag::AGGREGATE;
 	}
 
 	// Build group_id column
@@ -469,6 +470,8 @@ void VgiAggregateCombine(Vector &source, Vector &combined, AggregateInputData &a
 		if (tgt_states[tgt_idx]->group_id == -1) {
 			tgt_states[tgt_idx]->group_id = bind_data.exec_state->group_id_counter.fetch_add(1);
 		}
+		src_states[src_idx]->tag = VgiAggregateStateTag::AGGREGATE;
+		tgt_states[tgt_idx]->tag = VgiAggregateStateTag::AGGREGATE;
 	}
 
 	// Build merge batch: (source_group_id, target_group_id)
@@ -512,6 +515,7 @@ void VgiAggregateFinalize(Vector &state_vector, AggregateInputData &aggr_input_d
 		if (states[idx]->group_id == -1) {
 			states[idx]->group_id = bind_data.exec_state->group_id_counter.fetch_add(1);
 		}
+		states[idx]->tag = VgiAggregateStateTag::AGGREGATE;
 	}
 
 	auto gid_builder = arrow::Int64Builder();
@@ -591,41 +595,70 @@ void VgiAggregateFinalize(Vector &state_vector, AggregateInputData &aggr_input_d
 	VectorOperations::Copy(temp_output.data[0], result, count, 0, offset);
 }
 
+// Forward-declared here so VgiAggregateDestroy can dispatch to the window
+// destructor path. Defined in vgi_aggregate_window_impl.cpp.
+void SendAggregateWindowDestructorRpc(ClientContext &context, const VgiAggregateBindData &bind_data,
+                                       int64_t partition_id);
+
 void VgiAggregateDestroy(Vector &state_vector, AggregateInputData &aggr_input_data, idx_t count) {
 	// Best-effort cleanup — must not throw
 	try {
 		auto &bind_data = aggr_input_data.bind_data->Cast<VgiAggregateBindData>();
 
-		// Count only states that were actually assigned a group_id (not -1).
-		// States with group_id == -1 were allocated by DuckDB but never used
-		// (never passed through update/combine/finalize), so they have no
-		// corresponding state in Python's FunctionStorage.
 		UnifiedVectorFormat sdata;
 		state_vector.ToUnifiedFormat(count, sdata);
-		auto states = UnifiedVectorFormat::GetData<VgiAggregateState *>(sdata);
-		int64_t initialized_count = 0;
+
+		// The l_state buffer is shared between the aggregate path (VgiAggregateState)
+		// and the window path (VgiAggregateWindowLocalState). The tag field at
+		// offset 0 is part of both struct layouts; inspect it through a
+		// VgiAggregateState* view (safe because layout compatibility is
+		// guaranteed for the tag field).
+		auto raw_states = UnifiedVectorFormat::GetData<VgiAggregateState *>(sdata);
+
+		int64_t aggregate_initialized = 0;
+		// Window states — dispatch destructor RPC per partition_id. Only the
+		// GLOBAL state of a window aggregator carries a real partition_id;
+		// per-thread LOCAL states stay at partition_id == -1 and are skipped.
+		std::vector<int64_t> window_partition_ids;
+
 		for (idx_t i = 0; i < count; i++) {
 			auto idx = sdata.sel->get_index(i);
-			if (states[idx]->group_id != -1) {
-				initialized_count++;
+			auto tag = raw_states[idx]->tag;
+			if (tag == VgiAggregateStateTag::AGGREGATE) {
+				if (raw_states[idx]->group_id != -1) {
+					aggregate_initialized++;
+				}
+			} else if (tag == VgiAggregateStateTag::WINDOW) {
+				auto *win = reinterpret_cast<VgiAggregateWindowLocalState *>(raw_states[idx]);
+				if (win->partition_id != -1) {
+					window_partition_ids.push_back(win->partition_id);
+				}
+			}
+			// UNSET: state was never touched — nothing to clean up.
+		}
+
+		auto &context = *bind_data.context;
+
+		// --- Window destructor path ---
+		for (auto pid : window_partition_ids) {
+			try {
+				SendAggregateWindowDestructorRpc(context, bind_data, pid);
+			} catch (...) {
+				// Swallow — best-effort; the safety sweep in aggregate_destructor
+				// will clear any residual partitions for this execution_id.
 			}
 		}
 
-		if (initialized_count == 0) {
-			return; // No initialized states in this batch
+		// --- Aggregate destructor path (unchanged semantics) ---
+		if (aggregate_initialized == 0) {
+			return;
 		}
-
-		// Track destroyed states. Only send cleanup RPC when ALL states are destroyed.
-		auto prev = bind_data.exec_state->destroy_counter.fetch_add(initialized_count);
+		auto prev = bind_data.exec_state->destroy_counter.fetch_add(aggregate_initialized);
 		auto total_created = bind_data.exec_state->group_id_counter.load();
-		if (prev + initialized_count < total_created) {
+		if (prev + aggregate_initialized < total_created) {
 			return; // Not the last batch — skip RPC
 		}
 
-		// Last batch — send cleanup RPC
-		auto &context = *bind_data.context;
-
-		// Send a single cleanup RPC — Python side clears all state for this execution_id
 		auto gid_builder = arrow::Int64Builder();
 		ThrowOnArrowError(gid_builder.Append(0));
 		std::shared_ptr<arrow::Array> gid_array;
@@ -635,7 +668,10 @@ void VgiAggregateDestroy(Vector &state_vector, AggregateInputData &aggr_input_da
 
 		auto request = BuildAggregateDestructorRequest(bind_data.function_name, bind_data.exec_state->execution_id,
 		                                                bind_data.attach_id, gid_batch);
-		InvokeAggregateRpc(context, bind_data, "aggregate_destructor", request);
+		// enable_logging=false: this path runs on task-scheduler threads during
+		// pipeline teardown. VGI_LOG / DrainToLog are unsafe there (crash #A in
+		// the shutdown stacks). Worker stderr stays buffered on the drainer.
+		InvokeAggregateRpc(context, bind_data, "aggregate_destructor", request, /*enable_logging=*/false);
 	} catch (...) {
 		// Swallow all exceptions — destructor must not throw
 	}

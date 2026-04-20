@@ -21,7 +21,7 @@ SELECT COUNT(*)
 FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'aggregate';
 ----
-12
+15
 
 query TT
 SELECT function_name, return_type
@@ -41,6 +41,9 @@ vgi_percentile	DOUBLE
 vgi_sum	BIGINT
 vgi_sum_all	DOUBLE
 vgi_weighted_sum	DOUBLE
+vgi_window_listagg	VARCHAR
+vgi_window_median	DOUBLE
+vgi_window_sum	BIGINT
 
 # ============================================================================
 # Cleanup

@@ -15,10 +15,27 @@ namespace duckdb {
 namespace vgi {
 
 // ============================================================================
+// State tag - discriminates which code path owns the l_state buffer
+// ============================================================================
+// DuckDB allocates one l_state buffer per aggregate state, whose size is
+// determined by VgiAggregateStateSize(). The same buffer can hold either a
+// VgiAggregateState (for update/combine/finalize) or a
+// VgiAggregateWindowLocalState (for the window callback). The tag lets the
+// shared destructor pick the right cleanup flow.
+enum class VgiAggregateStateTag : uint8_t {
+	UNSET = 0,
+	AGGREGATE = 1,
+	WINDOW = 2,
+};
+
+// ============================================================================
 // VgiAggregateState - trivial C++ state stored in DuckDB's hash table
 // ============================================================================
 
 struct VgiAggregateState {
+	// Tag MUST be the first field so it can be read via a
+	// reinterpret_cast<uint8_t *> regardless of which variant owns the buffer.
+	VgiAggregateStateTag tag = VgiAggregateStateTag::UNSET;
 	int64_t group_id = -1;
 };
 
@@ -39,6 +56,10 @@ struct VgiAggregateFunctionInfo : public AggregateFunctionInfo {
 	// Const parameter support (same pattern as scalar functions)
 	std::vector<bool> positional_is_const;
 	std::vector<std::string> positional_names;
+
+	// True if the worker implements the window() callback — enables
+	// DuckDB's WindowCustomAggregator path.
+	bool supports_window = false;
 
 	const std::string &worker_path() const {
 		return attach_params->worker_path();
@@ -72,6 +93,9 @@ struct VgiAggregateBindData : public FunctionData {
 	struct ExecState {
 		std::atomic<int64_t> group_id_counter{0};
 		std::atomic<int64_t> destroy_counter{0};
+		// Incremented in VgiAggregateWindowInit to assign a unique partition_id
+		// per OVER partition. Used as the storage cache key on the worker.
+		std::atomic<int64_t> partition_id_counter{0};
 		std::vector<uint8_t> execution_id;
 	};
 	std::shared_ptr<ExecState> exec_state = std::make_shared<ExecState>();
@@ -95,6 +119,32 @@ void VgiAggregateDestroy(Vector &state, AggregateInputData &aggr_input_data, idx
 
 unique_ptr<FunctionData> VgiAggregateFunctionBind(ClientContext &context, AggregateFunction &function,
                                                    vector<unique_ptr<Expression>> &arguments);
+
+// ============================================================================
+// Internal RPC helpers (exposed so aggregate_window_impl can share the same
+// connection-pool plumbing as the standard aggregate callbacks).
+// ============================================================================
+
+struct AggregateRpcResult {
+	std::shared_ptr<arrow::RecordBatch> response_batch;
+};
+
+// Wrap a request batch in the standard vgi_rpc envelope: {request: binary}.
+std::shared_ptr<arrow::RecordBatch> WrapAsRpcParams(const std::shared_ptr<arrow::RecordBatch> &request_batch);
+
+// Dispatch an aggregate-flavored unary RPC. Handles subprocess or HTTP
+// transport, pool reuse, stale-pool retry — same path as the standard
+// aggregate_{bind,update,combine,finalize,destructor} callbacks.
+//
+// enable_logging: set to false for RPCs dispatched from aggregate destructors
+// that run on task-scheduler threads during pipeline teardown. The RPC path
+// will then skip VGI_LOG calls and StderrDrainer::DrainToLog — both of which
+// reach into ClientContext-backed logging that is not safe off the main
+// thread during teardown.
+AggregateRpcResult InvokeAggregateRpc(ClientContext &context, const VgiAggregateBindData &bind_data,
+                                      const std::string &method_name,
+                                      const std::shared_ptr<arrow::RecordBatch> &params,
+                                      bool enable_logging = true);
 
 } // namespace vgi
 } // namespace duckdb

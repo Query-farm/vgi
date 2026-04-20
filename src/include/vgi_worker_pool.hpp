@@ -1,5 +1,6 @@
 #pragma once
 
+#include "vgi_stderr_drainer.hpp"
 #include "vgi_subprocess.hpp"
 
 #include <atomic>
@@ -24,12 +25,21 @@ struct PoolSettings {
 
 // Represents a pooled worker subprocess ready for reuse.
 // Holds a subprocess that has completed an invocation and is waiting for the next one.
+//
+// The pooled worker owns a live StderrDrainer — its reader thread keeps
+// consuming the worker's stderr pipe while the worker sits idle in the
+// pool. This prevents the pipe buffer from filling (~16KB on macOS), which
+// would block the Python worker mid-log and appear as a stalled RPC on the
+// next acquisition. The drainer is handed off on Acquire and moved into a
+// fresh drainer on Release — it's always running whenever a worker is idle.
 class PooledWorker {
 public:
-	// Create a pooled worker from an existing subprocess.
-	// The subprocess should have completed an invocation and be ready for reuse.
-	// stderr_fd is the stderr file descriptor (owned by this object, will be closed on destroy)
-	PooledWorker(std::unique_ptr<SubProcess> proc, const std::string &worker_path, int stderr_fd = -1);
+	// Create a pooled worker from an existing subprocess + running drainer.
+	// The drainer (if non-null) should already be attached to the worker's
+	// stderr fd; it will keep draining while the worker is idle in the pool.
+	// Destroying the PooledWorker stops the drainer and closes the fd.
+	PooledWorker(std::unique_ptr<SubProcess> proc, const std::string &worker_path,
+	             std::unique_ptr<StderrDrainer> drainer);
 	~PooledWorker();
 
 	// Move-only (owns subprocess)
@@ -44,8 +54,10 @@ public:
 	// Get the subprocess (releases ownership)
 	std::unique_ptr<SubProcess> Release();
 
-	// Get and release the stderr fd (releases ownership, returns -1 if none)
-	int ReleaseStderrFd();
+	// Transfer ownership of the (still-running) stderr drainer. Returns
+	// nullptr if none was held. Callers use the returned drainer for their
+	// RPC lifetime, then hand it back to a new PooledWorker on release.
+	std::unique_ptr<StderrDrainer> ReleaseDrainer();
 
 	// Get worker path
 	const std::string &GetWorkerPath() const {
@@ -72,7 +84,11 @@ private:
 	std::unique_ptr<SubProcess> proc_;
 	std::string worker_path_;
 	std::chrono::steady_clock::time_point pooled_at_;
-	int stderr_fd_ = -1;                            // Stderr file descriptor (owned)
+	// Keeps draining stderr while the worker is idle in the pool — ownership
+	// moves back to the RPC caller on Acquire, and a fresh drainer comes back
+	// on Release. Never nullptr during a worker's pooled lifetime (unless
+	// passthrough mode). Destructor stops the thread and closes the fd.
+	std::unique_ptr<StderrDrainer> drainer_;
 	std::chrono::seconds idle_timeout_ {5};          // Default 5s, overridden by per-path config
 };
 
