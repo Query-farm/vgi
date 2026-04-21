@@ -1,0 +1,132 @@
+# name: test/sql/integration/attach/versioned_tables_http.test
+# description: HTTP-transport mirror of versioned_tables.test — per-version table visibility over HTTP
+# group: [vgi_integration_attach_http]
+
+# Requires an HTTP server for the versioned-tables-example worker, e.g.:
+#   uv run --project ~/Development/vgi-python \
+#       vgi-example-versioned-tables-worker --http --port 0
+# Set VGI_VERSIONED_TABLES_HTTP_WORKER to its base URL before running.
+require-env VGI_VERSIONED_TABLES_HTTP_WORKER
+
+require vgi
+
+require httpfs
+
+# Discovery over HTTP
+query TTT
+SELECT catalog, implementation_version, data_version_spec
+FROM vgi_catalogs('${VGI_VERSIONED_TABLES_HTTP_WORKER}');
+----
+versioned_tables	1.0.0	>=1.0.0,<4.0.0
+
+# ============================================================================
+# data_version 1.0.0 exposes animals only. The follow-up SELECTs also exercise
+# cookie stickiness — catalog_version() on the worker raises if the vgi_sticky
+# cookie isn't echoed on subsequent RPCs.
+# ============================================================================
+
+statement ok
+ATTACH 'versioned_tables' AS v1 (
+    TYPE vgi,
+    LOCATION '${VGI_VERSIONED_TABLES_HTTP_WORKER}',
+    data_version_spec '1.0.0'
+);
+
+query T
+SELECT tags['vgi_resolved_data_version'] FROM duckdb_databases() WHERE database_name='v1';
+----
+1.0.0
+
+query T
+SELECT table_name FROM information_schema.tables
+WHERE table_catalog='v1' AND table_schema='main'
+ORDER BY table_name;
+----
+animals
+
+query ITT
+SELECT legs, name, sound FROM v1.main.animals ORDER BY name;
+----
+2	chicken	cluck
+4	cow	moo
+4	horse	neigh
+4	pig	oink
+4	sheep	baa
+
+statement error
+SELECT * FROM v1.main.plants;
+----
+plants
+
+statement ok
+DETACH v1;
+
+# ============================================================================
+# data_version 2.0.0 exposes both animals and plants.
+# ============================================================================
+
+statement ok
+ATTACH 'versioned_tables' AS v2 (
+    TYPE vgi,
+    LOCATION '${VGI_VERSIONED_TABLES_HTTP_WORKER}',
+    data_version_spec '2.0.0'
+);
+
+query T
+SELECT table_name FROM information_schema.tables
+WHERE table_catalog='v2' AND table_schema='main'
+ORDER BY table_name;
+----
+animals
+plants
+
+query TTR
+SELECT name, kind, height_m FROM v2.main.plants ORDER BY name;
+----
+oak	tree	20.0
+pine	tree	25.0
+rose	flower	0.6
+tomato	vegetable	1.5
+wheat	grass	1.0
+
+statement ok
+DETACH v2;
+
+# ============================================================================
+# data_version 3.0.0 exposes plants only.
+# ============================================================================
+
+statement ok
+ATTACH 'versioned_tables' AS v3 (
+    TYPE vgi,
+    LOCATION '${VGI_VERSIONED_TABLES_HTTP_WORKER}',
+    data_version_spec '3.0.0'
+);
+
+query T
+SELECT table_name FROM information_schema.tables
+WHERE table_catalog='v3' AND table_schema='main'
+ORDER BY table_name;
+----
+plants
+
+statement error
+SELECT * FROM v3.main.animals;
+----
+animals
+
+statement ok
+DETACH v3;
+
+# ============================================================================
+# Unsatisfiable version still fails over HTTP.
+# ============================================================================
+
+statement error
+ATTACH 'versioned_tables' AS v_bad (
+    TYPE vgi,
+    LOCATION '${VGI_VERSIONED_TABLES_HTTP_WORKER}',
+    data_version_spec '9.9.9'
+);
+----
+Unsupported data_version_spec

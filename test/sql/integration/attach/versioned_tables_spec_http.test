@@ -1,0 +1,156 @@
+# name: test/sql/integration/attach/versioned_tables_spec_http.test
+# description: HTTP-transport mirror of versioned_tables_spec.test — npm-style spec matching + 1.1.0 schema evolution
+# group: [vgi_integration_attach_http]
+
+# Requires the same HTTP server as versioned_tables_http.test:
+#   uv run --project ~/Development/vgi-python \
+#       vgi-example-versioned-tables-worker --http --port 0
+# Set VGI_VERSIONED_TABLES_HTTP_WORKER to its base URL before running.
+require-env VGI_VERSIONED_TABLES_HTTP_WORKER
+
+require vgi
+
+require httpfs
+
+# ============================================================================
+# Exact 1.0.0: pre-evolution animals schema (3 columns, no color).
+# ============================================================================
+
+statement ok
+ATTACH 'versioned_tables' AS v_exact (
+    TYPE vgi,
+    LOCATION '${VGI_VERSIONED_TABLES_HTTP_WORKER}',
+    data_version_spec '1.0.0'
+);
+
+query T
+SELECT tags['vgi_resolved_data_version'] FROM duckdb_databases() WHERE database_name='v_exact';
+----
+1.0.0
+
+query T
+SELECT column_name FROM information_schema.columns
+WHERE table_catalog='v_exact' AND table_schema='main' AND table_name='animals'
+ORDER BY ordinal_position;
+----
+name
+legs
+sound
+
+statement ok
+DETACH v_exact;
+
+# ============================================================================
+# Caret ^1.0.0: latest 1.x.x → 1.1.0 (animals gains `color`).
+# ============================================================================
+
+statement ok
+ATTACH 'versioned_tables' AS v_caret (
+    TYPE vgi,
+    LOCATION '${VGI_VERSIONED_TABLES_HTTP_WORKER}',
+    data_version_spec '^1.0.0'
+);
+
+query T
+SELECT tags['vgi_resolved_data_version'] FROM duckdb_databases() WHERE database_name='v_caret';
+----
+1.1.0
+
+query T
+SELECT column_name FROM information_schema.columns
+WHERE table_catalog='v_caret' AND table_schema='main' AND table_name='animals'
+ORDER BY ordinal_position;
+----
+name
+legs
+sound
+color
+
+query T
+SELECT color FROM v_caret.main.animals WHERE name='cow';
+----
+brown
+
+statement ok
+DETACH v_caret;
+
+# ============================================================================
+# Tilde, bare-major, bare-major.minor.
+# ============================================================================
+
+statement ok
+ATTACH 'versioned_tables' AS v_tilde (
+    TYPE vgi,
+    LOCATION '${VGI_VERSIONED_TABLES_HTTP_WORKER}',
+    data_version_spec '~1.0.0'
+);
+
+query T
+SELECT tags['vgi_resolved_data_version'] FROM duckdb_databases() WHERE database_name='v_tilde';
+----
+1.0.0
+
+statement ok
+DETACH v_tilde;
+
+statement ok
+ATTACH 'versioned_tables' AS v_major (
+    TYPE vgi,
+    LOCATION '${VGI_VERSIONED_TABLES_HTTP_WORKER}',
+    data_version_spec '1'
+);
+
+query T
+SELECT tags['vgi_resolved_data_version'] FROM duckdb_databases() WHERE database_name='v_major';
+----
+1.1.0
+
+statement ok
+DETACH v_major;
+
+statement ok
+ATTACH 'versioned_tables' AS v_mm (
+    TYPE vgi,
+    LOCATION '${VGI_VERSIONED_TABLES_HTTP_WORKER}',
+    data_version_spec '1.0'
+);
+
+query T
+SELECT tags['vgi_resolved_data_version'] FROM duckdb_databases() WHERE database_name='v_mm';
+----
+1.0.0
+
+statement ok
+DETACH v_mm;
+
+# ============================================================================
+# ^2.0.0 → 2.0.0.
+# ============================================================================
+
+statement ok
+ATTACH 'versioned_tables' AS v_caret2 (
+    TYPE vgi,
+    LOCATION '${VGI_VERSIONED_TABLES_HTTP_WORKER}',
+    data_version_spec '^2.0.0'
+);
+
+query T
+SELECT tags['vgi_resolved_data_version'] FROM duckdb_databases() WHERE database_name='v_caret2';
+----
+2.0.0
+
+statement ok
+DETACH v_caret2;
+
+# ============================================================================
+# Unsatisfiable spec: no 2.5.x exists.
+# ============================================================================
+
+statement error
+ATTACH 'versioned_tables' AS v_bad (
+    TYPE vgi,
+    LOCATION '${VGI_VERSIONED_TABLES_HTTP_WORKER}',
+    data_version_spec '~2.5.0'
+);
+----
+Unsupported data_version_spec

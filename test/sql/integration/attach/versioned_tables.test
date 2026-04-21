@@ -1,0 +1,150 @@
+# name: test/sql/integration/attach/versioned_tables.test
+# description: ATTACH-time data_version_spec shapes the visible table set (1.0=animals, 2.0=animals+plants, 3.0=plants)
+# group: [vgi_integration_attach]
+
+require-env VGI_VERSIONED_TABLES_WORKER
+
+require vgi
+
+require httpfs
+
+# ============================================================================
+# Discovery: the worker advertises the versioned_tables catalog with a
+# data_version_spec range that covers major versions 1–3.
+# ============================================================================
+
+query TTT
+SELECT catalog, implementation_version, data_version_spec
+FROM vgi_catalogs('${VGI_VERSIONED_TABLES_WORKER}');
+----
+versioned_tables	1.0.0	>=1.0.0,<4.0.0
+
+# ============================================================================
+# data_version 1.0.0 exposes `animals` only.
+# ============================================================================
+
+statement ok
+ATTACH 'versioned_tables' AS v1 (
+    TYPE vgi,
+    LOCATION '${VGI_VERSIONED_TABLES_WORKER}',
+    data_version_spec '1.0.0'
+);
+
+query T
+SELECT tags['vgi_resolved_data_version'] FROM duckdb_databases() WHERE database_name='v1';
+----
+1.0.0
+
+query T
+SELECT table_name FROM information_schema.tables
+WHERE table_catalog='v1' AND table_schema='main'
+ORDER BY table_name;
+----
+animals
+
+query ITT
+SELECT legs, name, sound FROM v1.main.animals ORDER BY name;
+----
+2	chicken	cluck
+4	cow	moo
+4	horse	neigh
+4	pig	oink
+4	sheep	baa
+
+statement error
+SELECT * FROM v1.main.plants;
+----
+plants
+
+statement ok
+DETACH v1;
+
+# ============================================================================
+# data_version 2.0.0 exposes both animals and plants.
+# ============================================================================
+
+statement ok
+ATTACH 'versioned_tables' AS v2 (
+    TYPE vgi,
+    LOCATION '${VGI_VERSIONED_TABLES_WORKER}',
+    data_version_spec '2.0.0'
+);
+
+query T
+SELECT tags['vgi_resolved_data_version'] FROM duckdb_databases() WHERE database_name='v2';
+----
+2.0.0
+
+query T
+SELECT table_name FROM information_schema.tables
+WHERE table_catalog='v2' AND table_schema='main'
+ORDER BY table_name;
+----
+animals
+plants
+
+query I
+SELECT COUNT(*) FROM v2.main.animals;
+----
+5
+
+query TTR
+SELECT name, kind, height_m FROM v2.main.plants ORDER BY name;
+----
+oak	tree	20.0
+pine	tree	25.0
+rose	flower	0.6
+tomato	vegetable	1.5
+wheat	grass	1.0
+
+statement ok
+DETACH v2;
+
+# ============================================================================
+# data_version 3.0.0 exposes plants only — animals is hidden.
+# ============================================================================
+
+statement ok
+ATTACH 'versioned_tables' AS v3 (
+    TYPE vgi,
+    LOCATION '${VGI_VERSIONED_TABLES_WORKER}',
+    data_version_spec '3.0.0'
+);
+
+query T
+SELECT tags['vgi_resolved_data_version'] FROM duckdb_databases() WHERE database_name='v3';
+----
+3.0.0
+
+query T
+SELECT table_name FROM information_schema.tables
+WHERE table_catalog='v3' AND table_schema='main'
+ORDER BY table_name;
+----
+plants
+
+query I
+SELECT COUNT(*) FROM v3.main.plants;
+----
+5
+
+statement error
+SELECT * FROM v3.main.animals;
+----
+animals
+
+statement ok
+DETACH v3;
+
+# ============================================================================
+# Unsatisfiable data_version_spec: worker rejects, ATTACH fails.
+# ============================================================================
+
+statement error
+ATTACH 'versioned_tables' AS v_bad (
+    TYPE vgi,
+    LOCATION '${VGI_VERSIONED_TABLES_WORKER}',
+    data_version_spec '9.9.9'
+);
+----
+Unsupported data_version_spec
