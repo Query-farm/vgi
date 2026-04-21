@@ -196,6 +196,20 @@ TableFunctionCardinalityResult ParseTableFunctionCardinalityResult(
     const std::string &worker_path = "");
 
 // ============================================================================
+// TableFunctionStatisticsRequest
+// ============================================================================
+
+// Build a TableFunctionStatisticsRequest as a RecordBatch (for serialization to IPC bytes).
+// Wire shape matches TableFunctionCardinalityRequest — the Python worker reconstructs
+// BindParams[TArgs] from bind_call and forwards it to the function's statistics() method,
+// so the worker sees the user's original arguments (e.g. count=10000).
+//   bind_call: binary (BindRequest as IPC bytes)
+//   bind_opaque_data: binary|null
+std::shared_ptr<arrow::RecordBatch> BuildTableFunctionStatisticsRequest(
+    const std::vector<uint8_t> &bind_call_bytes,
+    const std::vector<uint8_t> &bind_opaque_data = {});
+
+// ============================================================================
 // RPC Params Builders for Catalog Methods
 // ============================================================================
 

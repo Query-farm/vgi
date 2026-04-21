@@ -666,6 +666,18 @@ TableFunctionCardinalityResult InvokeTableFunctionCardinality(
     const CatalogRpcContext &ctx, const std::vector<uint8_t> &bind_request_bytes,
     const std::vector<uint8_t> &bind_opaque_data, ClientContext &context);
 
+// Invoke table_function_statistics RPC: get per-output-column statistics for a table function.
+// Wire shape mirrors table_function_cardinality — the worker receives a full copy of the
+// BindRequest (with parsed user arguments) and returns per-column stats in the same shape
+// as catalog_table_column_statistics_get. Returns an empty map if the worker returns null
+// (stats unknown) or on parse errors; no cache_max_age_seconds — bind-lifetime cache only.
+std::unordered_map<std::string, unique_ptr<BaseStatistics>> InvokeTableFunctionStatistics(
+    const CatalogRpcContext &ctx, const std::vector<uint8_t> &bind_request_bytes,
+    const std::vector<uint8_t> &bind_opaque_data,
+    const std::vector<LogicalType> &column_types,
+    const std::vector<std::string> &column_names,
+    const std::string &function_name, ClientContext &context);
+
 // ============================================================================
 // Function Invocation API
 // ============================================================================

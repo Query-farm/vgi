@@ -242,6 +242,7 @@ void VgiTableFunctionSet::LoadEntries(ClientContext &context) {
 					table_func.pushdown_expression = vgi::VgiPushdownExpression;
 				}
 				table_func.cardinality = vgi::VgiTableFunctionCardinality;
+				table_func.statistics = vgi::VgiTableFunctionStatistics;
 				table_func.table_scan_progress = vgi::VgiTableFunctionProgress;
 				table_func.to_string = vgi::VgiTableFunctionToString;
 				table_func.set_scan_order = vgi::VgiSetScanOrder;

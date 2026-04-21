@@ -716,6 +716,18 @@ std::shared_ptr<arrow::RecordBatch> BuildTableFunctionCardinalityRequest(const s
 	return arrow::RecordBatch::Make(schema, 1, arrays);
 }
 
+std::shared_ptr<arrow::RecordBatch> BuildTableFunctionStatisticsRequest(const std::vector<uint8_t> &bind_call_bytes,
+                                                                        const std::vector<uint8_t> &bind_opaque_data) {
+	auto schema = arrow::schema({
+	    arrow::field("bind_call", arrow::binary(), false),
+	    arrow::field("bind_opaque_data", arrow::binary(), true),
+	});
+	std::vector<std::shared_ptr<arrow::Array>> arrays;
+	arrays.push_back(BuildBinaryScalar(bind_call_bytes));
+	arrays.push_back(BuildBinaryScalar(bind_opaque_data));
+	return arrow::RecordBatch::Make(schema, 1, arrays);
+}
+
 TableFunctionCardinalityResult ParseTableFunctionCardinalityResult(const std::shared_ptr<arrow::RecordBatch> &batch,
                                                                    const std::string &worker_path) {
 	TableFunctionCardinalityResult result;

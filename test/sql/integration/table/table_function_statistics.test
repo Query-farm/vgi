@@ -1,0 +1,144 @@
+# name: test/sql/integration/table/table_function_statistics.test
+# description: Tests for per-column statistics on VGI table functions
+# group: [vgi_integration_table]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# Basic sanity: statistics() on SequenceFunction yields correct bounds.
+# example.sequence(N) produces n in [0, N-1] so:
+#   - Filters outside [0, N-1] must fold to EMPTY_RESULT.
+#   - Filters inside the range must retain VGI_TABLE_SCAN.
+# ============================================================================
+
+# Out of range above the max → EMPTY_RESULT
+query II
+EXPLAIN SELECT * FROM example.sequence(10000) WHERE n > 100000;
+----
+physical_plan	<REGEX>:.*EMPTY_RESULT.*
+
+# Out of range below the min → EMPTY_RESULT
+query II
+EXPLAIN SELECT * FROM example.sequence(10000) WHERE n < -1;
+----
+physical_plan	<REGEX>:.*EMPTY_RESULT.*
+
+# In-range filter → scan retained
+query II
+EXPLAIN SELECT * FROM example.sequence(10000) WHERE n > 5000;
+----
+physical_plan	<!REGEX>:.*EMPTY_RESULT.*
+
+# Exactly the max → within bounds, scan retained
+query II
+EXPLAIN SELECT * FROM example.sequence(10) WHERE n = 9;
+----
+physical_plan	<!REGEX>:.*EMPTY_RESULT.*
+
+# One past the max → eliminated
+query II
+EXPLAIN SELECT * FROM example.sequence(10) WHERE n = 10;
+----
+physical_plan	<REGEX>:.*EMPTY_RESULT.*
+
+# ============================================================================
+# Actual execution still works — stats are additive, not destructive.
+# ============================================================================
+
+query I
+SELECT count(*) FROM example.sequence(10000) WHERE n > 5000;
+----
+4999
+
+query I
+SELECT count(*) FROM example.sequence(10000) WHERE n > 100000;
+----
+0
+
+# ============================================================================
+# Double-typed output column (DoubleSequenceFunction inherits stats from
+# _BaseSequenceFunction, with STATS_ARROW_TYPE overridden to float64).
+# double_sequence(N) covers n in [0.0, (N-1)*increment].
+# ============================================================================
+
+# Out of range above → eliminated
+query II
+EXPLAIN SELECT * FROM example.double_sequence(100) WHERE n > 1000.0;
+----
+physical_plan	<REGEX>:.*EMPTY_RESULT.*
+
+# In range → scan retained
+query II
+EXPLAIN SELECT * FROM example.double_sequence(100) WHERE n > 50.0;
+----
+physical_plan	<!REGEX>:.*EMPTY_RESULT.*
+
+# With increment: double_sequence(5, increment:=0.5) → n in [0.0, 2.0]
+# So WHERE n > 10.0 must be eliminated.
+query II
+EXPLAIN SELECT * FROM example.double_sequence(5, increment := 0.5) WHERE n > 10.0;
+----
+physical_plan	<REGEX>:.*EMPTY_RESULT.*
+
+# ============================================================================
+# Negative control: a function without a statistics() override must NOT
+# have its scans eliminated — the optimizer falls back to today's behavior.
+# GeneratorExceptionFunction doesn't override statistics(); its output can
+# be filtered but not stats-pruned at plan time.
+# ============================================================================
+
+# fail_after large enough to avoid the exception in planning (we only EXPLAIN,
+# so generation never runs). The important assertion is that impossible
+# filters do NOT collapse to EMPTY_RESULT for functions without stats.
+query II
+EXPLAIN SELECT * FROM example.generator_exception(100) WHERE n > 999999;
+----
+physical_plan	<!REGEX>:.*EMPTY_RESULT.*
+
+# ============================================================================
+# Catalog table with stats provided by the scan function (not the catalog).
+# example.data.funny_numbers declares NO statistics on the Table descriptor.
+# Its scan resolves to sequence(123456), so the stats the optimizer sees must
+# come from SequenceFunction.statistics() via table_function_statistics RPC.
+# Proves the catalog-table path falls back to function-level stats when the
+# catalog declines to answer.
+# ============================================================================
+
+# Row count matches the 123456 the catalog wires the scan to produce.
+query I
+SELECT count(*) FROM example.data.funny_numbers;
+----
+123456
+
+# Out of range above max (123455) — must fold to EMPTY_RESULT using function stats.
+query II
+EXPLAIN SELECT * FROM example.data.funny_numbers WHERE n > 200000;
+----
+physical_plan	<REGEX>:.*EMPTY_RESULT.*
+
+# Below min — eliminated.
+query II
+EXPLAIN SELECT * FROM example.data.funny_numbers WHERE n < 0;
+----
+physical_plan	<REGEX>:.*EMPTY_RESULT.*
+
+# In range — scan retained.
+query II
+EXPLAIN SELECT * FROM example.data.funny_numbers WHERE n > 50000;
+----
+physical_plan	<!REGEX>:.*EMPTY_RESULT.*
+
+# The catalog helper vgi_table_statistics() returns 0 rows for funny_numbers
+# because the Table descriptor declares no column statistics. This proves the
+# filter elimination above is NOT sourced from the catalog path.
+query I
+SELECT count(*) FROM vgi_table_statistics('example', 'data', 'funny_numbers');
+----
+0

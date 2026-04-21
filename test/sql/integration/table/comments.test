@@ -26,6 +26,7 @@ ORDER BY table_name;
 colors	Colors table with ENUM-derived statistics
 departments	Department reference table
 employees	Employee table with FK to departments
+funny_numbers	123456 integers; stats served by the sequence function, not the table
 generated_sequence	Table with generated columns backed by sequence(10)
 large_sequence	A large sequence of integers from 0 to 1,000,000
 numbers	First 100 integers (demonstrates explicit columns)

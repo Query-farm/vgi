@@ -134,6 +134,10 @@ struct VgiTableFunctionBindData : public TableFunctionData {
 	std::vector<std::string> supported_expression_filters;
 
 	vector<string> all_column_names;
+	// Parallel to all_column_names — populated during bind for the stats callback so it
+	// can ask InvokeTableFunctionStatistics for typed per-column stats without re-walking
+	// the Arrow schema.
+	vector<LogicalType> all_column_types;
 
 	// Table entry reference (for get_bind_info callback; null for direct vgi_table_function)
 	optional_ptr<TableCatalogEntry> table_entry;
@@ -149,6 +153,14 @@ struct VgiTableFunctionBindData : public TableFunctionData {
 
 	// Lazy cardinality fetching flag (mutable for const callback access)
 	mutable bool cardinality_fetched = false;
+
+	// Lazy per-column stats cache for the direct table-function path. The catalog-table
+	// path delegates to VgiTableEntry::GetStatistics instead and never touches these.
+	// `statistics_mutex` guards both `statistics_fetched` and `statistics_cache`, since
+	// DuckDB may call the stats callback from multiple optimizer threads concurrently.
+	mutable std::mutex statistics_mutex;
+	mutable bool statistics_fetched = false;
+	mutable std::unordered_map<std::string, unique_ptr<BaseStatistics>> statistics_cache;
 
 	// Order pushdown hint from DuckDB optimizer (set by set_scan_order callback).
 	// Mutable because set_scan_order is called during optimization (after bind, before execution).

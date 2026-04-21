@@ -117,6 +117,7 @@ void PerformVgiTableFunctionBind(ClientContext &context, VgiTableFunctionBindDat
 	}
 
 	bind_data.all_column_names = names;
+	bind_data.all_column_types = return_types;
 
 	VGI_LOG(context, "table_function.bind_result",
 	        {{"worker_path", bind_data.worker_path()},
@@ -1532,20 +1533,74 @@ void VgiSetScanOrder(unique_ptr<RowGroupOrderOptions> order_options, optional_pt
 }
 
 // ============================================================================
-// Statistics Callback — returns column statistics from VgiTableEntry
+// Statistics Callback — column stats per column
 // ============================================================================
+//
+// Two sources, in order of preference:
+//   1. Catalog-declared stats via VgiTableEntry::GetStatistics (table_entry path).
+//      These are cached on the table entry and shared across queries.
+//   2. Function-level stats via table_function_statistics RPC (direct path). These
+//      are cached on the bind data for the lifetime of the query.
+//
+// For catalog-backed scans, the entry path is tried first. If it returns null
+// (e.g. `supports_column_statistics=False`, or the column just isn't declared
+// in the catalog stats), we fall back to asking the scan function for its own
+// stats. This lets a catalog-registered table declare "my rows come from
+// sequence(123456)" without also having to repeat the sequence's stats — the
+// function computes them from its bind arguments.
+
+static unique_ptr<BaseStatistics> FetchFunctionStatistics(ClientContext &context,
+                                                          const VgiTableFunctionBindData &bind_data,
+                                                          const std::string &col_name) {
+	if (bind_data.bind_request_bytes.empty()) {
+		return nullptr;
+	}
+
+	std::lock_guard<std::mutex> lock(bind_data.statistics_mutex);
+	if (!bind_data.statistics_fetched) {
+		bind_data.statistics_fetched = true;
+		try {
+			auto rpc_params = bind_data.attach_params
+			    ? bind_data.attach_params
+			    : std::make_shared<VgiAttachParameters>(bind_data.worker_path(), "",
+			                                             bind_data.worker_debug(), bind_data.use_pool());
+			CatalogRpcContext rpc_ctx{rpc_params, bind_data.attach_id, bind_data.transaction_id};
+			bind_data.statistics_cache = InvokeTableFunctionStatistics(
+			    rpc_ctx, bind_data.bind_request_bytes, bind_data.bind_opaque_data,
+			    bind_data.all_column_types, bind_data.all_column_names,
+			    bind_data.function_name, context);
+		} catch (const std::exception &e) {
+			VGI_LOG(context, "table_function.statistics_error",
+			        {{"worker_path", bind_data.worker_path()},
+			         {"function_name", bind_data.function_name},
+			         {"error", e.what()}});
+		}
+	}
+
+	auto it = bind_data.statistics_cache.find(col_name);
+	if (it != bind_data.statistics_cache.end() && it->second) {
+		return it->second->ToUnique();
+	}
+	return nullptr;
+}
 
 unique_ptr<BaseStatistics> VgiTableFunctionStatistics(ClientContext &context, const FunctionData *bind_data_p,
                                                        column_t column_index) {
 	auto &bind_data = bind_data_p->Cast<VgiTableFunctionBindData>();
-	// For catalog-backed scans, delegate to VgiTableEntry::GetStatistics
+
 	if (bind_data.table_entry) {
-		// table_entry is optional_ptr<const TableCatalogEntry>; GetStatistics is non-const
 		auto &entry = const_cast<TableCatalogEntry &>(*bind_data.table_entry);
-		return entry.GetStatistics(context, column_index);
+		auto entry_stats = entry.GetStatistics(context, column_index);
+		if (entry_stats) {
+			return entry_stats;
+		}
+		// Fall through to function-level stats if the catalog declined to answer.
 	}
-	// For direct vgi_table_function() calls: no statistics available
-	return nullptr;
+
+	if (column_index >= bind_data.all_column_names.size()) {
+		return nullptr;
+	}
+	return FetchFunctionStatistics(context, bind_data, bind_data.all_column_names[column_index]);
 }
 
 } // namespace vgi

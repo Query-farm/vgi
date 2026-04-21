@@ -693,62 +693,26 @@ static unique_ptr<BaseStatistics> BuildColumnStatistics(
 	return result.ToUnique();
 }
 
-ColumnStatisticsRpcResult InvokeCatalogTableColumnStatisticsGet(
-    const CatalogRpcContext &ctx,
-    const std::string &schema_name, const std::string &table_name,
+// Convert a deserialized ColumnStatistics RecordBatch into a name → BaseStatistics map.
+// Shared by `catalog_table_column_statistics_get` and `table_function_statistics`, which
+// use the same wire shape (columns: column_name, min [union], max [union], has_null,
+// has_not_null, distinct_count, contains_unicode?, max_string_length?).
+// `log_source_key` / `log_source_value` identify the RPC source in log records
+// (e.g. {"table", "public.users"} or {"function_name", "sequence"}).
+static std::unordered_map<std::string, unique_ptr<BaseStatistics>> ParseColumnStatisticsBatch(
+    const std::shared_ptr<arrow::RecordBatch> &result_batch,
     const std::vector<LogicalType> &column_types,
     const std::vector<std::string> &column_names,
-    ClientContext &context) {
-	auto &worker_path = ctx.params->worker_path();
-
-	ColumnStatisticsRpcResult rpc_result;
-
-	auto params = BuildTableColumnStatisticsGetParams(ctx.attach_id, schema_name, table_name, ctx.transaction_id);
-	auto response = InvokeRpcMethod(ctx, "catalog_table_column_statistics_get", params, context);
-
-	// Extract and deserialize the inner result bytes, preserving custom_metadata
-	// (cache_max_age_seconds is carried as IPC batch custom_metadata, not schema metadata)
-	if (!response.batch || response.batch->num_rows() == 0) {
-		return rpc_result;
-	}
-	auto result_col = response.batch->GetColumnByName("result");
-	if (!result_col) {
-		return rpc_result;
-	}
-	auto binary_array = std::dynamic_pointer_cast<arrow::BinaryArray>(result_col);
-	if (!binary_array || binary_array->IsNull(0)) {
-		return rpc_result;
-	}
-	auto view = binary_array->GetView(0);
-	auto deserialized = DeserializeFromIpcBytesWithMetadata(
-	    reinterpret_cast<const uint8_t *>(view.data()), view.size());
-	auto &result_batch = deserialized.batch;
+    const std::string &worker_path, const std::string &log_source_key,
+    const std::string &log_source_value, ClientContext &context) {
+	std::unordered_map<std::string, unique_ptr<BaseStatistics>> out;
 	if (!result_batch || result_batch->num_rows() == 0) {
-		return rpc_result;
+		return out;
 	}
 
-	// Extract cache_max_age_seconds from IPC batch custom_metadata
-	if (deserialized.custom_metadata) {
-		int key_idx = deserialized.custom_metadata->FindKey("cache_max_age_seconds");
-		if (key_idx >= 0) {
-			try {
-				rpc_result.cache_max_age_seconds = std::stoll(deserialized.custom_metadata->value(key_idx));
-			} catch (const std::exception &e) {
-				VGI_LOG(context, "column_statistics.invalid_cache_ttl",
-				        {{"worker_path", worker_path},
-				         {"value", deserialized.custom_metadata->value(key_idx)},
-				         {"error", e.what()}});
-			}
-		}
-	}
-
-	// -----------------------------------------------------------------------
 	// Convert Arrow RecordBatch → DuckDB DataChunk using DuckDB's Arrow scanner.
-	// This correctly handles all types (string, decimal, timestamp, union, etc.)
+	// Correctly handles all types (string, decimal, timestamp, union, etc.)
 	// without manual per-type conversion.
-	// -----------------------------------------------------------------------
-
-	// Export Arrow schema to C ABI and build ArrowTableSchema
 	ArrowSchemaWrapper schema_root;
 	ExportSchema(result_batch->schema(), schema_root);
 
@@ -764,11 +728,9 @@ ColumnStatisticsRpcResult InvokeCatalogTableColumnStatisticsGet(
 		name_indexes[schema_item.name] = col_idx;
 	}
 
-	// Export RecordBatch to C ABI
 	auto current_chunk = make_uniq<ArrowArrayWrapper>();
 	ExportRecordBatch(result_batch, *current_chunk);
 
-	// Convert Arrow → DuckDB DataChunk
 	DataChunk stats_chunk;
 	stats_chunk.Initialize(Allocator::Get(context), all_types,
 	                        static_cast<idx_t>(current_chunk->arrow_array.length));
@@ -778,46 +740,35 @@ ColumnStatisticsRpcResult InvokeCatalogTableColumnStatisticsGet(
 	ArrowTableFunction::ArrowToDuckDB(fake_local_state, arrow_table.GetColumns(), stats_chunk, false);
 	stats_chunk.Verify();
 
-	// -----------------------------------------------------------------------
-	// Validate required columns exist
-	// -----------------------------------------------------------------------
 	for (const auto &field : {"column_name", "min", "max", "has_null", "has_not_null", "distinct_count"}) {
 		if (name_indexes.find(field) == name_indexes.end()) {
 			VGI_LOG(context, "column_statistics.missing_fields",
 			        {{"worker_path", worker_path},
-			         {"table", schema_name + "." + table_name},
+			         {log_source_key, log_source_value},
 			         {"missing_field", field}});
-			return rpc_result;
+			return out;
 		}
 	}
 
-	// Build column name → type lookup
 	std::unordered_map<std::string, LogicalType> col_type_map;
 	for (size_t i = 0; i < column_names.size(); i++) {
 		col_type_map[column_names[i]] = column_types[i];
 	}
 
-	// Optional string-specific column indexes
 	bool has_contains_unicode_col = name_indexes.count("contains_unicode") > 0;
 	bool has_max_string_length_col = name_indexes.count("max_string_length") > 0;
 
-	// -----------------------------------------------------------------------
-	// Extract values from the DataChunk and build BaseStatistics per column
-	// -----------------------------------------------------------------------
 	for (idx_t i = 0; i < stats_chunk.size(); i++) {
 		try {
 			auto column_name = stats_chunk.data[name_indexes["column_name"]].GetValue(i).GetValue<string>();
 
-			// Look up the DuckDB type for this column
 			auto type_it = col_type_map.find(column_name);
 			if (type_it == col_type_map.end()) {
-				continue; // Unknown column — skip
+				continue;
 			}
 			auto &duck_type = type_it->second;
 
 			// Extract min/max from the UNION-typed columns.
-			// DuckDB's ArrowToDuckDB converts sparse unions to DuckDB UNION type.
-			// Use UnionValue::GetValue to extract the inner typed value.
 			auto min_union_val = stats_chunk.data[name_indexes["min"]].GetValue(i);
 			auto max_union_val = stats_chunk.data[name_indexes["max"]].GetValue(i);
 
@@ -857,19 +808,102 @@ ColumnStatisticsRpcResult InvokeCatalogTableColumnStatisticsGet(
 			                                    distinct_count, has_unicode_flag, unicode_val,
 			                                    has_max_str_len, max_str_len);
 			if (stats) {
-				rpc_result.stats[column_name] = std::move(stats);
+				out[column_name] = std::move(stats);
 			}
 		} catch (const std::exception &e) {
-			// One bad column shouldn't fail the rest
 			VGI_LOG(context, "column_statistics.parse_error",
 			        {{"worker_path", worker_path},
-			         {"table", schema_name + "." + table_name},
+			         {log_source_key, log_source_value},
 			         {"row", std::to_string(i)},
 			         {"error", e.what()}});
 		}
 	}
 
+	return out;
+}
+
+ColumnStatisticsRpcResult InvokeCatalogTableColumnStatisticsGet(
+    const CatalogRpcContext &ctx,
+    const std::string &schema_name, const std::string &table_name,
+    const std::vector<LogicalType> &column_types,
+    const std::vector<std::string> &column_names,
+    ClientContext &context) {
+	auto &worker_path = ctx.params->worker_path();
+
+	ColumnStatisticsRpcResult rpc_result;
+
+	auto params = BuildTableColumnStatisticsGetParams(ctx.attach_id, schema_name, table_name, ctx.transaction_id);
+	auto response = InvokeRpcMethod(ctx, "catalog_table_column_statistics_get", params, context);
+
+	// Extract and deserialize the inner result bytes, preserving custom_metadata
+	// (cache_max_age_seconds is carried as IPC batch custom_metadata, not schema metadata)
+	if (!response.batch || response.batch->num_rows() == 0) {
+		return rpc_result;
+	}
+	auto result_col = response.batch->GetColumnByName("result");
+	if (!result_col) {
+		return rpc_result;
+	}
+	auto binary_array = std::dynamic_pointer_cast<arrow::BinaryArray>(result_col);
+	if (!binary_array || binary_array->IsNull(0)) {
+		return rpc_result;
+	}
+	auto view = binary_array->GetView(0);
+	auto deserialized = DeserializeFromIpcBytesWithMetadata(
+	    reinterpret_cast<const uint8_t *>(view.data()), view.size());
+
+	// Extract cache_max_age_seconds from IPC batch custom_metadata
+	if (deserialized.custom_metadata) {
+		int key_idx = deserialized.custom_metadata->FindKey("cache_max_age_seconds");
+		if (key_idx >= 0) {
+			try {
+				rpc_result.cache_max_age_seconds = std::stoll(deserialized.custom_metadata->value(key_idx));
+			} catch (const std::exception &e) {
+				VGI_LOG(context, "column_statistics.invalid_cache_ttl",
+				        {{"worker_path", worker_path},
+				         {"value", deserialized.custom_metadata->value(key_idx)},
+				         {"error", e.what()}});
+			}
+		}
+	}
+
+	rpc_result.stats = ParseColumnStatisticsBatch(deserialized.batch, column_types, column_names,
+	                                               worker_path, "table", schema_name + "." + table_name, context);
 	return rpc_result;
+}
+
+std::unordered_map<std::string, unique_ptr<BaseStatistics>> InvokeTableFunctionStatistics(
+    const CatalogRpcContext &ctx, const std::vector<uint8_t> &bind_request_bytes,
+    const std::vector<uint8_t> &bind_opaque_data,
+    const std::vector<LogicalType> &column_types,
+    const std::vector<std::string> &column_names,
+    const std::string &function_name, ClientContext &context) {
+	auto &worker_path = ctx.params->worker_path();
+
+	auto request_batch = BuildTableFunctionStatisticsRequest(bind_request_bytes, bind_opaque_data);
+	auto request_bytes = SerializeToIpcBytes(request_batch);
+	auto params = BuildBindRpcParams(request_bytes);
+
+	auto response = InvokeRpcMethod(ctx, "table_function_statistics", params, context);
+
+	// Response envelope: {result: binary|null}. Null result → no stats available.
+	if (!response.batch || response.batch->num_rows() == 0) {
+		return {};
+	}
+	auto result_col = response.batch->GetColumnByName("result");
+	if (!result_col) {
+		return {};
+	}
+	auto binary_array = std::dynamic_pointer_cast<arrow::BinaryArray>(result_col);
+	if (!binary_array || binary_array->IsNull(0)) {
+		return {};
+	}
+	auto view = binary_array->GetView(0);
+	auto result_batch = DeserializeFromIpcBytes(
+	    reinterpret_cast<const uint8_t *>(view.data()), view.size());
+
+	return ParseColumnStatisticsBatch(result_batch, column_types, column_names,
+	                                   worker_path, "function_name", function_name, context);
 }
 
 // ============================================================================
