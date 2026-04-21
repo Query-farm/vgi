@@ -1,7 +1,6 @@
 #pragma once
 
 #include <memory>
-#include <mutex>
 #include <string>
 #include <vector>
 #include <map>
@@ -86,13 +85,6 @@ struct VgiScalarFunctionBindData : public FunctionData {
 
 	// Extracted constant values (from const parameters erased at bind time)
 	vector<Value> const_values;
-
-	// Connection from bind phase, persisted for reuse in execute.
-	// Mutable because bind_data is const during execute; we move it out on first use.
-	// Copies (plan caching) get nullptr — execute falls back to pool/fresh.
-	// Protected by bind_connection_mutex for thread-safe move in execute.
-	mutable std::mutex bind_connection_mutex;
-	mutable std::unique_ptr<vgi::IFunctionConnection> bind_connection;
 
 	unique_ptr<FunctionData> Copy() const override {
 		auto copy = make_uniq<VgiScalarFunctionBindData>();

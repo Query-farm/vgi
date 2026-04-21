@@ -4,6 +4,7 @@
 #include "vgi_exception.hpp"
 #include "vgi_logging.hpp"
 #include "vgi_protocol.hpp"
+#include "vgi_worker_pool.hpp"
 
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/arrow/arrow_appender.hpp"
@@ -57,7 +58,6 @@ void PerformVgiTableFunctionBind(ClientContext &context, VgiTableFunctionBindDat
 	D_ASSERT(!bind_data.arguments.type || bind_data.arguments.type->id() == arrow::Type::STRUCT);
 
 	// Create connection to worker and perform bind handshake.
-	// Connection is preserved in bind_data for reuse in InitGlobal.
 	// Uses helper that handles pool acquire and stale connection retry.
 	FunctionConnectionParams params;
 	params.attach_params = bind_data.attach_params;
@@ -71,8 +71,8 @@ void PerformVgiTableFunctionBind(ClientContext &context, VgiTableFunctionBindDat
 	params.function_type = "TABLE";
 
 	auto result = AcquireAndBindConnection(context, params);
-	bind_data.bind_connection = std::move(result.connection);
 	auto &bind_result = result.bind_result;
+	auto bind_worker_pid = result.connection ? result.connection->GetPid() : -1;
 
 	// At bind time, max_processes is unknown (updated after init)
 	bind_data.max_processes = 1;
@@ -82,7 +82,22 @@ void PerformVgiTableFunctionBind(ClientContext &context, VgiTableFunctionBindDat
 	bind_data.bind_request_bytes = bind_result.bind_request_bytes;
 	bind_data.bind_opaque_data = bind_result.opaque_data;
 
-	// bind_connection is preserved for reuse in InitGlobal
+	// Release the bind worker to the pool. Bind is a unary RPC; the worker
+	// has looped back to its accept loop and is available to serve other
+	// planner RPCs (e.g. table_function_cardinality) and the eventual init
+	// in InitGlobal. Init re-binds on whichever pooled worker it acquires —
+	// the bind RPC is cheap relative to a fresh spawn.
+	if (bind_data.use_pool() && result.connection && result.connection->CanBePooled()) {
+		auto pooled = result.connection->ReleaseForPooling();
+		result.connection.reset();
+		if (pooled) {
+			VgiWorkerPool::Instance().Release(std::move(pooled));
+			VGI_LOG(context, "worker_pool.release",
+			        {{"worker_path", bind_data.worker_path()},
+			         {"worker_pid", std::to_string(bind_worker_pid)},
+			         {"phase", "bind"}});
+		}
+	}
 
 	// Convert Arrow schema to DuckDB types using centralized utility
 	try {
@@ -106,7 +121,7 @@ void PerformVgiTableFunctionBind(ClientContext &context, VgiTableFunctionBindDat
 
 	VGI_LOG(context, "table_function.bind_result",
 	        {{"worker_path", bind_data.worker_path()},
-	         {"worker_pid", std::to_string(bind_data.bind_connection->GetPid())},
+	         {"worker_pid", std::to_string(bind_worker_pid)},
 	         {"function_name", bind_data.function_name},
 	         {"num_columns", std::to_string(bind_result.output_schema->num_fields())}});
 }
@@ -784,8 +799,21 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 		}
 	}
 
-	// Move connection from bind phase (bind already completed, skip redundant handshake)
-	auto connection = std::move(bind_data.bind_connection);
+	// Acquire a fresh connection for the init/scan phase. The bind worker was
+	// released to the pool, so this will typically pool-hit (often the same
+	// worker) and pay only a cheap bind RPC — no fresh spawn.
+	FunctionConnectionParams acquire_params;
+	acquire_params.attach_params = bind_data.attach_params;
+	acquire_params.attach_id = bind_data.attach_id;
+	acquire_params.function_name = bind_data.function_name;
+	acquire_params.arguments = bind_data.arguments;
+	acquire_params.transaction_id = bind_data.transaction_id;
+	acquire_params.settings = bind_data.settings;
+	acquire_params.required_secrets = bind_data.required_secrets;
+	acquire_params.phase = "init_global";
+	acquire_params.function_type = "TABLE";
+	auto acquire_result = AcquireAndBindConnection(context, acquire_params);
+	auto connection = std::move(acquire_result.connection);
 
 	// Serialize the filters (returns empty if no filters or if serialization fails)
 	SerializedFilters serialized_filters;

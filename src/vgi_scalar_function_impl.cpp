@@ -184,7 +184,6 @@ unique_ptr<FunctionData> VgiScalarFunctionBind(ClientContext &context, ScalarFun
 	// Phase 5: Connect to worker and perform bind to get output schema
 	// ========================================================================
 	std::shared_ptr<arrow::Schema> output_schema;
-	std::unique_ptr<IFunctionConnection> bind_connection;
 
 	// Skip the worker call on re-bind when const values were already extracted
 	bool skip_worker_call = const_args_already_erased;
@@ -226,8 +225,22 @@ unique_ptr<FunctionData> VgiScalarFunctionBind(ClientContext &context, ScalarFun
 		// Get the output schema from bind result
 		output_schema = bind_result.output_schema;
 
-		// Persist bind connection for reuse in execute (avoids spawning a second worker)
-		bind_connection = std::move(connection);
+		// Release the bind worker back to the pool. The worker finished a
+		// unary RPC and is idle in its accept-loop; execute will pool-hit
+		// and pay one cheap bind RPC instead of holding this worker hostage
+		// from other concurrent planner/catalog RPCs.
+		if (func_info.use_pool() && connection->CanBePooled()) {
+			auto bind_worker_pid = connection->GetPid();
+			auto pooled = connection->ReleaseForPooling();
+			connection.reset();
+			if (pooled) {
+				VgiWorkerPool::Instance().Release(std::move(pooled));
+				VGI_LOG(context, "worker_pool.release",
+				        {{"worker_path", func_info.worker_path()},
+				         {"worker_pid", std::to_string(bind_worker_pid)},
+				         {"phase", "bind"}});
+			}
+		}
 	}
 
 	if (!output_schema || output_schema->num_fields() != 1) {
@@ -263,11 +276,6 @@ unique_ptr<FunctionData> VgiScalarFunctionBind(ClientContext &context, ScalarFun
 	bind_data->resolved_output_schema = output_schema;
 	bind_data->input_schema = input_schema;
 	bind_data->const_values = const_values;
-
-	// Persist the bind connection for reuse in execute.
-	// The connection is post-bind, pre-init; execute will call PerformInit() + OpenInputWriter().
-	// Copy() leaves bind_connection as nullptr, so copies fall back to pool/fresh connection.
-	bind_data->bind_connection = std::move(bind_connection);
 
 	return bind_data;
 }
@@ -315,9 +323,10 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 		}
 		ArrowArguments arguments = BuildArgumentsFromValues(context, positional_args, {});
 
-		// Acquire connection: reuse bind connection, try pool, or spawn fresh
+		// Acquire connection from the pool (or spawn fresh) and do a fresh
+		// bind. The bind worker was released to the pool at bind time, so
+		// this typically pool-hits and pays only the cheap bind RPC.
 		std::unique_ptr<IFunctionConnection> connection;
-		bool reused_bind_connection = false;
 		bool use_pool = bind_data ? bind_data->use_pool() : func_info.use_pool();
 		const auto &worker_path = bind_data ? bind_data->worker_path() : func_info.worker_path();
 		const auto &attach_id = bind_data ? bind_data->attach_id : func_info.attach_id;
@@ -328,22 +337,10 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 		const auto &required_secrets = bind_data ? bind_data->required_secrets : func_info.required_secrets;
 		const auto &attach_params = bind_data ? bind_data->attach_params : func_info.attach_params;
 
-		// Try to reuse the bind-phase connection (avoids spawning a second worker)
-		if (bind_data) {
-			std::lock_guard<std::mutex> lock(bind_data->bind_connection_mutex);
-			if (bind_data->bind_connection) {
-				connection = std::move(bind_data->bind_connection);
-				reused_bind_connection = true;
-				VGI_STDERR_DEBUG("[VGI] scalar.reuse_bind_connection worker_path=%s pid=%d\n",
-				                 worker_path.c_str(), connection->GetPid());
-			}
-		}
-
-		// Fall back to pool or fresh connection
 		auto transaction_id = func_info.catalog
 		    ? VgiTransaction::Get(context, *func_info.catalog).GetTransactionId()
 		    : std::vector<uint8_t>{};
-		if (!connection && use_pool && !IsHttpTransport(worker_path)) {
+		if (use_pool && !IsHttpTransport(worker_path)) {
 			PoolKey exec_pool_key {worker_path, attach_params ? attach_params->data_version_spec() : std::string(),
 			                       attach_params ? attach_params->implementation_version() : std::string()};
 			auto pooled = VgiWorkerPool::Instance().TryAcquire(exec_pool_key);
@@ -369,16 +366,15 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 			                 worker_path.c_str(), connection->GetPid());
 		}
 
-		if (reused_bind_connection) {
-			// Update connection's input schema to match actual DataChunk types.
-			// Bind-time expression types may differ from execute-time DataChunk types
-			// (e.g., DOUBLE from function signature vs DECIMAL from VALUES clause).
-			// The IPC writer uses this schema, so it must match the actual batch.
+		// Bind with bind-time input types (preserves output-schema stability
+		// for polymorphic workers where output depends on input precision —
+		// e.g. the return type DuckDB committed to at plan time was derived
+		// from expression-signature types). Then update the IPC writer to
+		// the actual DataChunk types before opening.
+		connection->SetInputSchema(bind_data ? bind_data->input_schema : local_state.input_schema);
+		connection->PerformBindFull();
+		if (bind_data && bind_data->input_schema.get() != local_state.input_schema.get()) {
 			connection->UpdateInputSchemaForExecution(local_state.input_schema);
-		} else {
-			// New connection needs input schema set and full bind handshake.
-			connection->SetInputSchema(local_state.input_schema);
-			connection->PerformBindFull();
 		}
 		connection->PerformInit();
 		connection->OpenInputWriter();

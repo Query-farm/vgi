@@ -36,7 +36,6 @@ unique_ptr<FunctionData> VgiTableInOutBindData::Copy() const {
 	copy->input_schema = input_schema;
 	copy->max_processes = max_processes;
 	copy->cardinality_estimate = cardinality_estimate;
-	// Note: bind_connection is not copied (each execution gets its own)
 	return copy;
 }
 
@@ -155,8 +154,22 @@ unique_ptr<FunctionData> VgiTableInOutBind(ClientContext &context, TableFunction
 	ArrowSchemaToDuckDBTypes(context, bind_data->output_schema, bind_data->c_schema, bind_data->arrow_table,
 	                         return_types, names);
 
-	// Store the connection for use in init
-	bind_data->bind_connection = std::move(connection);
+	// Release the bind worker back to the pool. InitGlobal will re-acquire
+	// (typically pool-hit, paying only a cheap bind RPC) and then call
+	// PerformInit(phase=INPUT). Holding the worker through init would force
+	// ancillary planner RPCs to spawn fresh workers.
+	if (bind_data->use_pool() && connection->CanBePooled()) {
+		auto bind_worker_pid = connection->GetPid();
+		auto pooled = connection->ReleaseForPooling();
+		connection.reset();
+		if (pooled) {
+			VgiWorkerPool::Instance().Release(std::move(pooled));
+			VGI_LOG(context, "worker_pool.release",
+			        {{"worker_path", bind_data->worker_path()},
+			         {"worker_pid", std::to_string(bind_worker_pid)},
+			         {"phase", "bind"}});
+		}
+	}
 
 	VGI_LOG(context, "table_in_out.bind_complete",
 	        {{"worker_path", bind_data->worker_path()},
@@ -174,11 +187,21 @@ unique_ptr<GlobalTableFunctionState> VgiTableInOutInitGlobal(ClientContext &cont
 	auto &bind_data = input.bind_data->Cast<VgiTableInOutBindData>();
 	auto global_state = make_uniq<VgiTableInOutGlobalState>();
 
-	// Move the connection from bind_data
-	auto connection = std::move(bind_data.bind_connection);
-	if (!connection) {
-		throw InternalException("VgiTableInOutInitGlobal: bind_connection is null");
-	}
+	// Acquire a fresh connection (pool-hit typical) and do a fresh bind.
+	// The bind worker was released to the pool at bind time.
+	FunctionConnectionParams acquire_params;
+	acquire_params.attach_params = bind_data.attach_params;
+	acquire_params.attach_id = bind_data.attach_id;
+	acquire_params.function_name = bind_data.function_name;
+	acquire_params.arguments = bind_data.arguments;
+	acquire_params.transaction_id = bind_data.transaction_id;
+	acquire_params.settings = bind_data.settings;
+	acquire_params.required_secrets = bind_data.required_secrets;
+	acquire_params.phase = "init_global";
+	acquire_params.function_type = "TABLE";
+	acquire_params.input_schema = bind_data.input_schema;
+	auto acquire_result = AcquireAndBindConnection(context, acquire_params);
+	auto connection = std::move(acquire_result.connection);
 
 	// Perform init with phase=INPUT for table-in-out functions
 	auto init_result = connection->PerformInit({}, nullptr, {}, "INPUT");

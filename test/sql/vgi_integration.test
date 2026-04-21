@@ -88,11 +88,13 @@ SELECT COUNT(*) > 0 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%bat
 ----
 true
 
-# Verify multiple workers produced batches (multi-worker execution)
+# Verify multi-worker execution was attempted (at least one secondary worker spawned).
+# Asserting on init_local rather than batch_received avoids a timing race where the
+# primary can drain a small work queue before a freshly-spawned secondary picks up
+# any chunks — the secondary still exists, it just didn't win any work items.
 query I
-SELECT COUNT(DISTINCT regexp_extract(message, 'worker_pid=(\d+)', 1)) > 1
-FROM duckdb_logs()
-WHERE type = 'VGI' AND message LIKE '%batch_received%';
+SELECT COUNT(*) > 0 FROM duckdb_logs()
+WHERE type = 'VGI' AND message LIKE '%table_function.init_local%worker_type=secondary%';
 ----
 true
 

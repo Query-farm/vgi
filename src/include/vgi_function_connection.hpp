@@ -53,6 +53,11 @@ struct FunctionConnectionParams {
 	std::string phase;  // For logging (e.g., "bind", "init_local_secondary")
 	std::string function_type = "TABLE";  // "TABLE", "SCALAR", "AGGREGATE"
 
+	// Optional input schema, required for function types that bind with a
+	// typed input stream (table-in-out, scalar). If set, AcquireAndBindConnection
+	// calls SetInputSchema before PerformBindFull.
+	std::shared_ptr<arrow::Schema> input_schema;
+
 	// Convenience accessors (defined out-of-line in vgi_function_connection.cpp)
 	const std::string &worker_path() const;
 	bool worker_debug() const;

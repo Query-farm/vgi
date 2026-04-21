@@ -64,9 +64,6 @@ struct VgiTableInOutBindData : public TableFunctionData {
 	// Worker capabilities
 	int32_t max_processes = 1;
 	int64_t cardinality_estimate = -1;
-
-	// Connection created during bind, moved to global state during init
-	mutable std::unique_ptr<IFunctionConnection> bind_connection;
 };
 
 // ============================================================================

@@ -51,6 +51,9 @@ AcquireAndBindResult AcquireAndBindConnection(ClientContext &context, const Func
 	// Lambda to attempt bind, returns true on success, false if retry needed
 	auto try_bind = [&](bool is_retry) -> bool {
 		try {
+			if (params.input_schema) {
+				conn->SetInputSchema(params.input_schema);
+			}
 			bind_result = conn->PerformBindFull();
 			return true; // Success
 		} catch (const IOException &e) {
@@ -703,10 +706,16 @@ int FunctionConnection::Wait() {
 }
 
 bool FunctionConnection::CanBePooled() const {
-	// Can only pool if:
-	// 1. Data phase completed (data_finished_ is true)
-	// 2. Subprocess is still alive
-	if (!data_finished_ || !proc_) {
+	// Can only pool if the worker is idle in its RPC accept-loop and alive.
+	// Two idle states qualify:
+	//   1. Data phase completed (scan/exchange drained to EOS).
+	//   2. Bind completed but init never started — the worker handled the
+	//      bind unary RPC and looped back, ready for another RPC.
+	if (!proc_) {
+		return false;
+	}
+	bool idle = data_finished_ || (bind_done_ && !init_done_);
+	if (!idle) {
 		return false;
 	}
 	return !proc_->TryWait(); // TryWait returns true if process exited

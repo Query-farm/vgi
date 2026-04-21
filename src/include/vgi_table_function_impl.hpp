@@ -150,10 +150,6 @@ struct VgiTableFunctionBindData : public TableFunctionData {
 	// Lazy cardinality fetching flag (mutable for const callback access)
 	mutable bool cardinality_fetched = false;
 
-	// Connection from bind phase, persisted for reuse in InitGlobal.
-	// Mutable to allow InitGlobal to move it out (bind_data is const after bind).
-	mutable std::unique_ptr<IFunctionConnection> bind_connection;
-
 	// Order pushdown hint from DuckDB optimizer (set by set_scan_order callback).
 	// Mutable because set_scan_order is called during optimization (after bind, before execution).
 	mutable std::optional<OrderByHint> order_by_hint;
