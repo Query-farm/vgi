@@ -1,0 +1,194 @@
+# name: test/sql/integration/attach/versioned_tables_resolved.test
+# description: duckdb_databases() always reflects the concrete resolved version — never the spec string — even when ATTACH uses ^/~/bare specs
+# group: [vgi_integration_attach]
+
+require-env VGI_VERSIONED_TABLES_WORKER
+
+require vgi
+
+require httpfs
+
+# ============================================================================
+# Single-ATTACH check: a spec input (``^1.0.0``) must appear in duckdb_databases()
+# as the CONCRETE resolved version (``1.1.0``), not as the literal spec. The
+# spec string MUST NOT leak through.
+# ============================================================================
+
+statement ok
+ATTACH 'versioned_tables' AS v_caret (
+    TYPE vgi,
+    LOCATION '${VGI_VERSIONED_TABLES_WORKER}',
+    data_version_spec '^1.0.0',
+    implementation_version '^10.0.0'
+);
+
+# Positive: concrete resolved versions are what's reported.
+query TT
+SELECT tags['vgi_resolved_data_version'],
+       tags['vgi_resolved_implementation_version']
+FROM duckdb_databases()
+WHERE database_name = 'v_caret';
+----
+1.1.0	10.1.0
+
+# Negative: neither spec string ever appears in duckdb_databases(), in any
+# field — it would indicate the extension stored the spec verbatim rather
+# than the worker-resolved concrete version.
+query I
+SELECT COUNT(*)
+FROM duckdb_databases()
+WHERE database_name = 'v_caret'
+  AND (tags['vgi_resolved_data_version'] = '^1.0.0'
+    OR tags['vgi_resolved_implementation_version'] = '^10.0.0');
+----
+0
+
+# The database's type is reported as 'vgi' — if this ever regressed, every
+# assertion above could still pass vacuously, so we anchor it here.
+query T
+SELECT type FROM duckdb_databases() WHERE database_name = 'v_caret';
+----
+vgi
+
+statement ok
+DETACH v_caret;
+
+# ============================================================================
+# Multi-ATTACH: six catalogs, each with a different spec form, all live at
+# once. A single duckdb_databases() scan sees every concrete resolved version
+# correctly and independently — nothing cross-contaminates. This proves the
+# pool key (worker_path, resolved_data_version, resolved_implementation_version)
+# keeps per-attach state isolated even though the catalogs share a worker path.
+# ============================================================================
+
+statement ok
+ATTACH 'versioned_tables' AS v_a (
+    TYPE vgi, LOCATION '${VGI_VERSIONED_TABLES_WORKER}',
+    data_version_spec '1.0.0'
+);
+
+statement ok
+ATTACH 'versioned_tables' AS v_b (
+    TYPE vgi, LOCATION '${VGI_VERSIONED_TABLES_WORKER}',
+    data_version_spec '^1.0.0'
+);
+
+statement ok
+ATTACH 'versioned_tables' AS v_c (
+    TYPE vgi, LOCATION '${VGI_VERSIONED_TABLES_WORKER}',
+    data_version_spec '~1.0.0'
+);
+
+statement ok
+ATTACH 'versioned_tables' AS v_d (
+    TYPE vgi, LOCATION '${VGI_VERSIONED_TABLES_WORKER}',
+    data_version_spec '1'
+);
+
+statement ok
+ATTACH 'versioned_tables' AS v_e (
+    TYPE vgi, LOCATION '${VGI_VERSIONED_TABLES_WORKER}',
+    data_version_spec '2.0'
+);
+
+statement ok
+ATTACH 'versioned_tables' AS v_f (
+    TYPE vgi, LOCATION '${VGI_VERSIONED_TABLES_WORKER}',
+    data_version_spec '^2.0.0'
+);
+
+# All six resolved versions visible simultaneously in a single duckdb_databases()
+# scan. Each row shows the concrete version the worker picked, not the spec.
+query TT
+SELECT database_name, tags['vgi_resolved_data_version']
+FROM duckdb_databases()
+WHERE database_name IN ('v_a', 'v_b', 'v_c', 'v_d', 'v_e', 'v_f')
+ORDER BY database_name;
+----
+v_a	1.0.0
+v_b	1.1.0
+v_c	1.0.0
+v_d	1.1.0
+v_e	2.0.0
+v_f	2.0.0
+
+# No row has a spec-like value in its resolved-version tag.
+query I
+SELECT COUNT(*) FROM duckdb_databases()
+WHERE database_name IN ('v_a', 'v_b', 'v_c', 'v_d', 'v_e', 'v_f')
+  AND (tags['vgi_resolved_data_version'] LIKE '^%'
+    OR tags['vgi_resolved_data_version'] LIKE '~%'
+    OR tags['vgi_resolved_data_version'] NOT LIKE '_._._');
+----
+0
+
+# Every catalog carries the resolved implementation_version tag even when
+# only data_version_spec was passed — the worker's default (11.0.0) fills in.
+query I
+SELECT COUNT(DISTINCT tags['vgi_resolved_implementation_version'])
+FROM duckdb_databases()
+WHERE database_name IN ('v_a', 'v_b', 'v_c', 'v_d', 'v_e', 'v_f');
+----
+1
+
+query T
+SELECT DISTINCT tags['vgi_resolved_implementation_version']
+FROM duckdb_databases()
+WHERE database_name IN ('v_a', 'v_b', 'v_c', 'v_d', 'v_e', 'v_f');
+----
+11.0.0
+
+statement ok
+DETACH v_a;
+
+statement ok
+DETACH v_b;
+
+statement ok
+DETACH v_c;
+
+statement ok
+DETACH v_d;
+
+statement ok
+DETACH v_e;
+
+statement ok
+DETACH v_f;
+
+# ============================================================================
+# Re-attach determinism: the same spec resolves to the same concrete version
+# every time. duckdb_databases() is the source of truth — if the worker ever
+# resolved non-deterministically (e.g. by picking randomly among candidates),
+# this pair of assertions would diverge.
+# ============================================================================
+
+statement ok
+ATTACH 'versioned_tables' AS v_r1 (
+    TYPE vgi, LOCATION '${VGI_VERSIONED_TABLES_WORKER}',
+    data_version_spec '^1.0.0'
+);
+
+query T
+SELECT tags['vgi_resolved_data_version']
+FROM duckdb_databases() WHERE database_name = 'v_r1';
+----
+1.1.0
+
+statement ok
+DETACH v_r1;
+
+statement ok
+ATTACH 'versioned_tables' AS v_r2 (
+    TYPE vgi, LOCATION '${VGI_VERSIONED_TABLES_WORKER}',
+    data_version_spec '^1.0.0'
+);
+
+query T
+SELECT tags['vgi_resolved_data_version']
+FROM duckdb_databases() WHERE database_name = 'v_r2';
+----
+1.1.0
+
+statement ok
+DETACH v_r2;

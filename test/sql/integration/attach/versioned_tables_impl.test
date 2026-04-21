@@ -1,0 +1,238 @@
+# name: test/sql/integration/attach/versioned_tables_impl.test
+# description: implementation_version ATTACH option with npm-style spec matching (exact, ^, ~, bare)
+# group: [vgi_integration_attach]
+
+require-env VGI_VERSIONED_TABLES_WORKER
+
+require vgi
+
+require httpfs
+
+# ============================================================================
+# Worker advertises 11.0.0 as its current (newest) implementation. Supported
+# impl versions are 10.0.0, 10.1.0, 11.0.0 — distinct from data versions
+# (1.x / 2.x / 3.x) so test assertions can't confuse the two dimensions.
+# ============================================================================
+
+# Omitted implementation_version: resolves to the default (newest, 11.0.0).
+statement ok
+ATTACH 'versioned_tables' AS i_default (
+    TYPE vgi,
+    LOCATION '${VGI_VERSIONED_TABLES_WORKER}'
+);
+
+query T
+SELECT tags['vgi_resolved_implementation_version']
+FROM duckdb_databases() WHERE database_name='i_default';
+----
+11.0.0
+
+statement ok
+DETACH i_default;
+
+# ============================================================================
+# Exact match: implementation_version '10.0.0' resolves verbatim.
+# ============================================================================
+
+statement ok
+ATTACH 'versioned_tables' AS i_exact (
+    TYPE vgi,
+    LOCATION '${VGI_VERSIONED_TABLES_WORKER}',
+    implementation_version '10.0.0'
+);
+
+query T
+SELECT tags['vgi_resolved_implementation_version']
+FROM duckdb_databases() WHERE database_name='i_exact';
+----
+10.0.0
+
+statement ok
+DETACH i_exact;
+
+# ============================================================================
+# Caret ^10.0.0: latest 10.y.z → 10.1.0.
+# ============================================================================
+
+statement ok
+ATTACH 'versioned_tables' AS i_caret (
+    TYPE vgi,
+    LOCATION '${VGI_VERSIONED_TABLES_WORKER}',
+    implementation_version '^10.0.0'
+);
+
+query T
+SELECT tags['vgi_resolved_implementation_version']
+FROM duckdb_databases() WHERE database_name='i_caret';
+----
+10.1.0
+
+statement ok
+DETACH i_caret;
+
+# ============================================================================
+# Tilde ~10.0.0: pin to 10.0.x (only 10.0.0 exists).
+# ============================================================================
+
+statement ok
+ATTACH 'versioned_tables' AS i_tilde (
+    TYPE vgi,
+    LOCATION '${VGI_VERSIONED_TABLES_WORKER}',
+    implementation_version '~10.0.0'
+);
+
+query T
+SELECT tags['vgi_resolved_implementation_version']
+FROM duckdb_databases() WHERE database_name='i_tilde';
+----
+10.0.0
+
+statement ok
+DETACH i_tilde;
+
+# ============================================================================
+# Bare major `10`: latest in major 10 → 10.1.0.
+# Bare major `11`: latest in major 11 → 11.0.0.
+# ============================================================================
+
+statement ok
+ATTACH 'versioned_tables' AS i_major10 (
+    TYPE vgi,
+    LOCATION '${VGI_VERSIONED_TABLES_WORKER}',
+    implementation_version '10'
+);
+
+query T
+SELECT tags['vgi_resolved_implementation_version']
+FROM duckdb_databases() WHERE database_name='i_major10';
+----
+10.1.0
+
+statement ok
+DETACH i_major10;
+
+statement ok
+ATTACH 'versioned_tables' AS i_major11 (
+    TYPE vgi,
+    LOCATION '${VGI_VERSIONED_TABLES_WORKER}',
+    implementation_version '11'
+);
+
+query T
+SELECT tags['vgi_resolved_implementation_version']
+FROM duckdb_databases() WHERE database_name='i_major11';
+----
+11.0.0
+
+statement ok
+DETACH i_major11;
+
+# ============================================================================
+# Bare major.minor `10.0`: pinned to 10.0.0.
+# ============================================================================
+
+statement ok
+ATTACH 'versioned_tables' AS i_mm (
+    TYPE vgi,
+    LOCATION '${VGI_VERSIONED_TABLES_WORKER}',
+    implementation_version '10.0'
+);
+
+query T
+SELECT tags['vgi_resolved_implementation_version']
+FROM duckdb_databases() WHERE database_name='i_mm';
+----
+10.0.0
+
+statement ok
+DETACH i_mm;
+
+# ============================================================================
+# Unsatisfiable impl version: error message names `implementation_version`,
+# not `data_version_spec` — so clients can tell the two apart.
+# ============================================================================
+
+statement error
+ATTACH 'versioned_tables' AS i_bad (
+    TYPE vgi,
+    LOCATION '${VGI_VERSIONED_TABLES_WORKER}',
+    implementation_version '99.9.9'
+);
+----
+Unsupported implementation_version
+
+statement error
+ATTACH 'versioned_tables' AS i_bad_tilde (
+    TYPE vgi,
+    LOCATION '${VGI_VERSIONED_TABLES_WORKER}',
+    implementation_version '~10.5.0'
+);
+----
+Unsupported implementation_version
+
+# ============================================================================
+# Both dimensions compose: data_version_spec and implementation_version can
+# be specified together and each resolves independently.
+# ============================================================================
+
+statement ok
+ATTACH 'versioned_tables' AS i_both (
+    TYPE vgi,
+    LOCATION '${VGI_VERSIONED_TABLES_WORKER}',
+    data_version_spec '^1.0.0',
+    implementation_version '^10.0.0'
+);
+
+query TT
+SELECT tags['vgi_resolved_data_version'],
+       tags['vgi_resolved_implementation_version']
+FROM duckdb_databases() WHERE database_name='i_both';
+----
+1.1.0	10.1.0
+
+statement ok
+DETACH i_both;
+
+# ============================================================================
+# Pool isolation on impl_version: two attaches with identical data_version
+# but different resolved impl versions must not share a pooled worker.
+# ============================================================================
+
+statement ok
+ATTACH 'versioned_tables' AS i_pool_a (
+    TYPE vgi,
+    LOCATION '${VGI_VERSIONED_TABLES_WORKER}',
+    data_version_spec '1.0.0',
+    implementation_version '10.0.0'
+);
+
+statement ok
+ATTACH 'versioned_tables' AS i_pool_b (
+    TYPE vgi,
+    LOCATION '${VGI_VERSIONED_TABLES_WORKER}',
+    data_version_spec '1.0.0',
+    implementation_version '11.0.0'
+);
+
+query TT
+SELECT database_name, tags['vgi_resolved_implementation_version']
+FROM duckdb_databases()
+WHERE database_name IN ('i_pool_a', 'i_pool_b')
+ORDER BY database_name;
+----
+i_pool_a	10.0.0
+i_pool_b	11.0.0
+
+# Pool diagnostics show distinct (worker_path, data_version_spec, impl_version) keys.
+query I
+SELECT COUNT(DISTINCT implementation_version)
+FROM vgi_worker_pool()
+WHERE data_version_spec = '1.0.0';
+----
+2
+
+statement ok
+DETACH i_pool_a;
+
+statement ok
+DETACH i_pool_b;

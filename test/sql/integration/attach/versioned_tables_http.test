@@ -17,7 +17,7 @@ query TTT
 SELECT catalog, implementation_version, data_version_spec
 FROM vgi_catalogs('${VGI_VERSIONED_TABLES_HTTP_WORKER}');
 ----
-versioned_tables	1.0.0	>=1.0.0,<4.0.0
+versioned_tables	11.0.0	>=1.0.0,<4.0.0
 
 # ============================================================================
 # data_version 1.0.0 exposes animals only. The follow-up SELECTs also exercise

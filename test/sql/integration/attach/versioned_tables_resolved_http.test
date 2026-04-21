@@ -1,0 +1,136 @@
+# name: test/sql/integration/attach/versioned_tables_resolved_http.test
+# description: HTTP-transport mirror of versioned_tables_resolved.test — duckdb_databases() carries concrete resolved versions over HTTP too
+# group: [vgi_integration_attach_http]
+
+# Requires the same HTTP server as the other versioned_tables_*_http tests.
+# Set VGI_VERSIONED_TABLES_HTTP_WORKER to its base URL before running.
+require-env VGI_VERSIONED_TABLES_HTTP_WORKER
+
+require vgi
+
+require httpfs
+
+# ============================================================================
+# Single-ATTACH: spec input → concrete resolved version in duckdb_databases().
+# ============================================================================
+
+statement ok
+ATTACH 'versioned_tables' AS v_caret (
+    TYPE vgi,
+    LOCATION '${VGI_VERSIONED_TABLES_HTTP_WORKER}',
+    data_version_spec '^1.0.0',
+    implementation_version '^10.0.0'
+);
+
+query TT
+SELECT tags['vgi_resolved_data_version'],
+       tags['vgi_resolved_implementation_version']
+FROM duckdb_databases()
+WHERE database_name = 'v_caret';
+----
+1.1.0	10.1.0
+
+query I
+SELECT COUNT(*)
+FROM duckdb_databases()
+WHERE database_name = 'v_caret'
+  AND (tags['vgi_resolved_data_version'] = '^1.0.0'
+    OR tags['vgi_resolved_implementation_version'] = '^10.0.0');
+----
+0
+
+query T
+SELECT type FROM duckdb_databases() WHERE database_name = 'v_caret';
+----
+vgi
+
+statement ok
+DETACH v_caret;
+
+# ============================================================================
+# Multi-ATTACH: six spec forms live simultaneously. One scan proves every
+# row carries its own concrete resolved version — no cross-contamination.
+# ============================================================================
+
+statement ok
+ATTACH 'versioned_tables' AS v_a (
+    TYPE vgi, LOCATION '${VGI_VERSIONED_TABLES_HTTP_WORKER}',
+    data_version_spec '1.0.0'
+);
+
+statement ok
+ATTACH 'versioned_tables' AS v_b (
+    TYPE vgi, LOCATION '${VGI_VERSIONED_TABLES_HTTP_WORKER}',
+    data_version_spec '^1.0.0'
+);
+
+statement ok
+ATTACH 'versioned_tables' AS v_c (
+    TYPE vgi, LOCATION '${VGI_VERSIONED_TABLES_HTTP_WORKER}',
+    data_version_spec '~1.0.0'
+);
+
+statement ok
+ATTACH 'versioned_tables' AS v_d (
+    TYPE vgi, LOCATION '${VGI_VERSIONED_TABLES_HTTP_WORKER}',
+    data_version_spec '1'
+);
+
+statement ok
+ATTACH 'versioned_tables' AS v_e (
+    TYPE vgi, LOCATION '${VGI_VERSIONED_TABLES_HTTP_WORKER}',
+    data_version_spec '2.0'
+);
+
+statement ok
+ATTACH 'versioned_tables' AS v_f (
+    TYPE vgi, LOCATION '${VGI_VERSIONED_TABLES_HTTP_WORKER}',
+    data_version_spec '^2.0.0'
+);
+
+query TT
+SELECT database_name, tags['vgi_resolved_data_version']
+FROM duckdb_databases()
+WHERE database_name IN ('v_a', 'v_b', 'v_c', 'v_d', 'v_e', 'v_f')
+ORDER BY database_name;
+----
+v_a	1.0.0
+v_b	1.1.0
+v_c	1.0.0
+v_d	1.1.0
+v_e	2.0.0
+v_f	2.0.0
+
+query I
+SELECT COUNT(*) FROM duckdb_databases()
+WHERE database_name IN ('v_a', 'v_b', 'v_c', 'v_d', 'v_e', 'v_f')
+  AND (tags['vgi_resolved_data_version'] LIKE '^%'
+    OR tags['vgi_resolved_data_version'] LIKE '~%'
+    OR tags['vgi_resolved_data_version'] NOT LIKE '_._._');
+----
+0
+
+query T
+SELECT DISTINCT tags['vgi_resolved_implementation_version']
+FROM duckdb_databases()
+WHERE database_name IN ('v_a', 'v_b', 'v_c', 'v_d', 'v_e', 'v_f');
+----
+11.0.0
+
+statement ok
+DETACH v_a;
+
+statement ok
+DETACH v_b;
+
+statement ok
+DETACH v_c;
+
+statement ok
+DETACH v_d;
+
+statement ok
+DETACH v_e;
+
+statement ok
+DETACH v_f;

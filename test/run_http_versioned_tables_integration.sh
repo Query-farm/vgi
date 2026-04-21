@@ -50,8 +50,8 @@ if [[ -n "$OVERRIDE_FILTER" ]]; then
     VGI_VERSIONED_TABLES_HTTP_WORKER="http://localhost:$PORT" \
         ./build/$BUILD_DIR/test/unittest "$OVERRIDE_FILTER"
 else
-    VGI_VERSIONED_TABLES_HTTP_WORKER="http://localhost:$PORT" \
-        ./build/$BUILD_DIR/test/unittest "test/sql/integration/attach/versioned_tables_http.test"
-    VGI_VERSIONED_TABLES_HTTP_WORKER="http://localhost:$PORT" \
-        ./build/$BUILD_DIR/test/unittest "test/sql/integration/attach/versioned_tables_spec_http.test"
+    for t in versioned_tables_http versioned_tables_spec_http versioned_tables_impl_http versioned_tables_resolved_http; do
+        VGI_VERSIONED_TABLES_HTTP_WORKER="http://localhost:$PORT" \
+            ./build/$BUILD_DIR/test/unittest "test/sql/integration/attach/${t}.test"
+    done
 fi

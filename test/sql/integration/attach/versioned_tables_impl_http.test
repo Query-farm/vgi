@@ -1,0 +1,135 @@
+# name: test/sql/integration/attach/versioned_tables_impl_http.test
+# description: HTTP-transport mirror of versioned_tables_impl.test — implementation_version spec matching
+# group: [vgi_integration_attach_http]
+
+# Requires the same HTTP server as the other versioned_tables_*_http tests:
+#   uv run --project ~/Development/vgi-python \
+#       vgi-example-versioned-tables-worker --http --port 0
+# Set VGI_VERSIONED_TABLES_HTTP_WORKER to its base URL before running.
+require-env VGI_VERSIONED_TABLES_HTTP_WORKER
+
+require vgi
+
+require httpfs
+
+# ============================================================================
+# Omitted → default (11.0.0).
+# ============================================================================
+
+statement ok
+ATTACH 'versioned_tables' AS i_default (
+    TYPE vgi,
+    LOCATION '${VGI_VERSIONED_TABLES_HTTP_WORKER}'
+);
+
+query T
+SELECT tags['vgi_resolved_implementation_version']
+FROM duckdb_databases() WHERE database_name='i_default';
+----
+11.0.0
+
+statement ok
+DETACH i_default;
+
+# ============================================================================
+# Exact / ^ / ~ / bare.
+# ============================================================================
+
+statement ok
+ATTACH 'versioned_tables' AS i_exact (
+    TYPE vgi,
+    LOCATION '${VGI_VERSIONED_TABLES_HTTP_WORKER}',
+    implementation_version '10.0.0'
+);
+
+query T
+SELECT tags['vgi_resolved_implementation_version']
+FROM duckdb_databases() WHERE database_name='i_exact';
+----
+10.0.0
+
+statement ok
+DETACH i_exact;
+
+statement ok
+ATTACH 'versioned_tables' AS i_caret (
+    TYPE vgi,
+    LOCATION '${VGI_VERSIONED_TABLES_HTTP_WORKER}',
+    implementation_version '^10.0.0'
+);
+
+query T
+SELECT tags['vgi_resolved_implementation_version']
+FROM duckdb_databases() WHERE database_name='i_caret';
+----
+10.1.0
+
+statement ok
+DETACH i_caret;
+
+statement ok
+ATTACH 'versioned_tables' AS i_tilde (
+    TYPE vgi,
+    LOCATION '${VGI_VERSIONED_TABLES_HTTP_WORKER}',
+    implementation_version '~10.0.0'
+);
+
+query T
+SELECT tags['vgi_resolved_implementation_version']
+FROM duckdb_databases() WHERE database_name='i_tilde';
+----
+10.0.0
+
+statement ok
+DETACH i_tilde;
+
+statement ok
+ATTACH 'versioned_tables' AS i_major (
+    TYPE vgi,
+    LOCATION '${VGI_VERSIONED_TABLES_HTTP_WORKER}',
+    implementation_version '10'
+);
+
+query T
+SELECT tags['vgi_resolved_implementation_version']
+FROM duckdb_databases() WHERE database_name='i_major';
+----
+10.1.0
+
+statement ok
+DETACH i_major;
+
+# ============================================================================
+# Unsatisfiable → error message names `implementation_version`.
+# ============================================================================
+
+statement error
+ATTACH 'versioned_tables' AS i_bad (
+    TYPE vgi,
+    LOCATION '${VGI_VERSIONED_TABLES_HTTP_WORKER}',
+    implementation_version '99.9.9'
+);
+----
+Unsupported implementation_version
+
+# ============================================================================
+# Both dimensions compose independently over HTTP too.
+# ============================================================================
+
+statement ok
+ATTACH 'versioned_tables' AS i_both (
+    TYPE vgi,
+    LOCATION '${VGI_VERSIONED_TABLES_HTTP_WORKER}',
+    data_version_spec '^1.0.0',
+    implementation_version '^10.0.0'
+);
+
+query TT
+SELECT tags['vgi_resolved_data_version'],
+       tags['vgi_resolved_implementation_version']
+FROM duckdb_databases() WHERE database_name='i_both';
+----
+1.1.0	10.1.0
+
+statement ok
+DETACH i_both;
