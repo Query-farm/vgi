@@ -69,14 +69,12 @@ VgiScalarFunctionLocalState::~VgiScalarFunctionLocalState() {
 			}
 		}
 
-		VGI_STDERR_DEBUG("[VGI] scalar.destructor can_be_pooled=%s pid=%d\n",
-		                 connection->CanBePooled() ? "true" : "false", connection->GetPid());
-
-		if (use_pool && connection->CanBePooled()) {
-			auto pooled = connection->ReleaseForPooling();
-			if (pooled) {
+		if (use_pool) {
+			if (auto pooled = connection->ReleaseForPooling()) {
 				VGI_STDERR_DEBUG("[VGI] scalar.destructor pooled pid=%d\n", pooled->GetPid());
 				vgi::VgiWorkerPool::Instance().Release(std::move(pooled));
+			} else {
+				VGI_STDERR_DEBUG("[VGI] scalar.destructor not_pooled pid=%d\n", connection->GetPid());
 			}
 		}
 	}
@@ -229,17 +227,16 @@ unique_ptr<FunctionData> VgiScalarFunctionBind(ClientContext &context, ScalarFun
 		// unary RPC and is idle in its accept-loop; execute will pool-hit
 		// and pay one cheap bind RPC instead of holding this worker hostage
 		// from other concurrent planner/catalog RPCs.
-		if (func_info.use_pool() && connection->CanBePooled()) {
+		if (func_info.use_pool()) {
 			auto bind_worker_pid = connection->GetPid();
-			auto pooled = connection->ReleaseForPooling();
-			connection.reset();
-			if (pooled) {
+			if (auto pooled = connection->ReleaseForPooling()) {
 				VgiWorkerPool::Instance().Release(std::move(pooled));
 				VGI_LOG(context, "worker_pool.release",
 				        {{"worker_path", func_info.worker_path()},
 				         {"worker_pid", std::to_string(bind_worker_pid)},
 				         {"phase", "bind"}});
 			}
+			connection.reset();
 		}
 	}
 

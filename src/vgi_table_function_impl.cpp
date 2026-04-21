@@ -87,16 +87,15 @@ void PerformVgiTableFunctionBind(ClientContext &context, VgiTableFunctionBindDat
 	// planner RPCs (e.g. table_function_cardinality) and the eventual init
 	// in InitGlobal. Init re-binds on whichever pooled worker it acquires —
 	// the bind RPC is cheap relative to a fresh spawn.
-	if (bind_data.use_pool() && result.connection && result.connection->CanBePooled()) {
-		auto pooled = result.connection->ReleaseForPooling();
-		result.connection.reset();
-		if (pooled) {
+	if (bind_data.use_pool() && result.connection) {
+		if (auto pooled = result.connection->ReleaseForPooling()) {
 			VgiWorkerPool::Instance().Release(std::move(pooled));
 			VGI_LOG(context, "worker_pool.release",
 			        {{"worker_path", bind_data.worker_path()},
 			         {"worker_pid", std::to_string(bind_worker_pid)},
 			         {"phase", "bind"}});
 		}
+		result.connection.reset();
 	}
 
 	// Convert Arrow schema to DuckDB types using centralized utility

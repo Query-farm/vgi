@@ -223,13 +223,10 @@ public:
 	// Wait for worker process to exit
 	int Wait() override;
 
-	// Check if this connection can be returned to the pool
-	// Returns true if data finished and subprocess is still alive
-	bool CanBePooled() const override;
-
-	// Release the subprocess for pooling (transfers ownership)
-	// Returns nullptr if cannot be pooled
-	// Stops stderr thread and releases subprocess ownership
+	// Release the subprocess for pooling (transfers ownership).
+	// Returns nullptr if the worker isn't parked at its RPC accept-loop
+	// (streaming data phase in-flight) or if the process has exited.
+	// Stops stderr thread and releases subprocess ownership on success.
 	std::unique_ptr<PooledWorker> ReleaseForPooling() override;
 
 	// Non-copyable and non-movable (contains reference)

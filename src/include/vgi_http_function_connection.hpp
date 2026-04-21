@@ -77,9 +77,8 @@ public:
 	std::string GetExecutionIdHex() const override;
 	std::string GetAttachIdHex() const override;
 
-	// Lifecycle (no-ops for HTTP)
+	// Lifecycle (no-ops for HTTP — no subprocess to pool)
 	int Wait() override { return 0; }
-	bool CanBePooled() const override { return false; }
 	std::unique_ptr<PooledWorker> ReleaseForPooling() override { return nullptr; }
 
 	// Non-copyable

@@ -85,7 +85,9 @@ public:
 
 	// Lifecycle
 	virtual int Wait() = 0;
-	virtual bool CanBePooled() const = 0;
+	// ReleaseForPooling hands the worker process back to the pool if the
+	// connection is in a poolable state (worker alive and parked at its
+	// RPC accept-loop). Returns nullptr otherwise.
 	virtual std::unique_ptr<PooledWorker> ReleaseForPooling() = 0;
 };
 

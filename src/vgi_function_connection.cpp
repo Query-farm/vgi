@@ -705,24 +705,17 @@ int FunctionConnection::Wait() {
 	return proc_->Wait();
 }
 
-bool FunctionConnection::CanBePooled() const {
-	// Can only pool if the worker is idle in its RPC accept-loop and alive.
-	// Two idle states qualify:
-	//   1. Data phase completed (scan/exchange drained to EOS).
-	//   2. Bind completed but init never started — the worker handled the
-	//      bind unary RPC and looped back, ready for another RPC.
-	if (!proc_) {
-		return false;
-	}
-	bool idle = data_finished_ || (bind_done_ && !init_done_);
-	if (!idle) {
-		return false;
-	}
-	return !proc_->TryWait(); // TryWait returns true if process exited
-}
-
 std::unique_ptr<PooledWorker> FunctionConnection::ReleaseForPooling() {
-	if (!CanBePooled()) {
+	// The worker can be handed back to the pool only if it's parked at its
+	// RPC accept-loop and the process is still alive. A streaming data
+	// phase is in-flight iff init was sent and we haven't seen EOS. Every
+	// other state — never-bound, post-bind pre-init, or post-EOS — means
+	// the worker has looped back and is ready to accept another RPC.
+	if (!proc_ || proc_->TryWait()) {
+		return nullptr; // process missing or exited
+	}
+	bool streaming_in_flight = init_done_ && !data_finished_;
+	if (streaming_in_flight) {
 		return nullptr;
 	}
 

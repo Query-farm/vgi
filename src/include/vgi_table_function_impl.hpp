@@ -252,10 +252,9 @@ struct VgiTableFunctionLocalState : public ArrowScanLocalState {
 	~VgiTableFunctionLocalState() {
 		D_ASSERT(prefetch_state_.load() != PrefetchState::IN_FLIGHT);
 		// Return connection to pool if applicable
-		if (attach_params_ && attach_params_->use_pool() && connection && connection->CanBePooled()) {
+		if (attach_params_ && attach_params_->use_pool() && connection) {
 			auto worker_pid = connection->GetPid();
-			auto pooled = connection->ReleaseForPooling();
-			if (pooled) {
+			if (auto pooled = connection->ReleaseForPooling()) {
 				VgiWorkerPool::Instance().Release(std::move(pooled));
 				VGI_LOG(context_, "worker_pool.release",
 				        {{"worker_path", attach_params_->worker_path()},

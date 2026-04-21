@@ -158,17 +158,16 @@ unique_ptr<FunctionData> VgiTableInOutBind(ClientContext &context, TableFunction
 	// (typically pool-hit, paying only a cheap bind RPC) and then call
 	// PerformInit(phase=INPUT). Holding the worker through init would force
 	// ancillary planner RPCs to spawn fresh workers.
-	if (bind_data->use_pool() && connection->CanBePooled()) {
+	if (bind_data->use_pool()) {
 		auto bind_worker_pid = connection->GetPid();
-		auto pooled = connection->ReleaseForPooling();
-		connection.reset();
-		if (pooled) {
+		if (auto pooled = connection->ReleaseForPooling()) {
 			VgiWorkerPool::Instance().Release(std::move(pooled));
 			VGI_LOG(context, "worker_pool.release",
 			        {{"worker_path", bind_data->worker_path()},
 			         {"worker_pid", std::to_string(bind_worker_pid)},
 			         {"phase", "bind"}});
 		}
+		connection.reset();
 	}
 
 	VGI_LOG(context, "table_in_out.bind_complete",
@@ -368,9 +367,8 @@ OperatorFinalizeResultType VgiTableInOutFinalize(ExecutionContext &context, Tabl
 
 	if (!output_batch || output_batch->num_rows() == 0) {
 		// No more output - clean up
-		if (bind_data.use_pool() && global_state.connection && global_state.connection->CanBePooled()) {
-			auto pooled = global_state.connection->ReleaseForPooling();
-			if (pooled) {
+		if (bind_data.use_pool() && global_state.connection) {
+			if (auto pooled = global_state.connection->ReleaseForPooling()) {
 				VGI_LOG(client_context, "table_in_out.pool_release",
 				        {{"worker_path", bind_data.worker_path()},
 				         {"function_name", bind_data.function_name},
@@ -392,9 +390,8 @@ OperatorFinalizeResultType VgiTableInOutFinalize(ExecutionContext &context, Tabl
 
 	// Check if worker is finished and we've exhausted the current batch
 	if (!HasRemainingBatchData(local_state) && global_state.connection->IsFinished()) {
-		if (bind_data.use_pool() && global_state.connection->CanBePooled()) {
-			auto pooled = global_state.connection->ReleaseForPooling();
-			if (pooled) {
+		if (bind_data.use_pool()) {
+			if (auto pooled = global_state.connection->ReleaseForPooling()) {
 				VGI_LOG(client_context, "table_in_out.pool_release",
 				        {{"worker_path", bind_data.worker_path()},
 				         {"function_name", bind_data.function_name},
