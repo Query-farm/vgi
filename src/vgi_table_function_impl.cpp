@@ -1104,28 +1104,21 @@ static void UpdateDynamicFilterState(VgiTableFunctionGlobalState &global_state, 
 	}
 }
 
-static bool GetNextBatch(ClientContext &context, const VgiTableFunctionBindData &bind_data,
-                         VgiTableFunctionGlobalState &global_state,
-                         VgiTableFunctionLocalState &local_state) {
-	if (local_state.done) {
-		return false;
-	}
-	// Update dynamic filter state before the tick is sent
-	UpdateDynamicFilterState(global_state, context, bind_data);
-
-	// Read next Arrow C++ batch from connection
-	auto worker_pid = local_state.connection->GetPid();
-	auto arrow_batch = local_state.connection->ReadDataBatch();
+//! Install arrow_batch as the active chunk. Returns false on EOS (null batch).
+//! Caller is responsible for having already obtained arrow_batch either
+//! synchronously (via ReadDataBatch) or from the prefetch slot.
+static bool InstallBatch(ClientContext &context, const VgiTableFunctionBindData &bind_data,
+                         VgiTableFunctionLocalState &local_state,
+                         std::shared_ptr<arrow::RecordBatch> arrow_batch) {
 	if (!arrow_batch) {
 		local_state.done = true;
 		VGI_LOG(context, "table_function.scan_complete",
 		        {{"worker_path", bind_data.worker_path()},
-		         {"worker_pid", std::to_string(worker_pid)},
+		         {"worker_pid", std::to_string(local_state.connection->GetPid())},
 		         {"function_name", bind_data.function_name}});
 		return false;
 	}
 
-	// Export batch to C ABI format using centralized utility
 	auto chunk = make_uniq<ArrowArrayWrapper>();
 	ExportRecordBatch(arrow_batch, *chunk);
 
@@ -1145,13 +1138,50 @@ static bool GetNextBatch(ClientContext &context, const VgiTableFunctionBindData 
 	return true;
 }
 
+static bool GetNextBatch(ClientContext &context, const VgiTableFunctionBindData &bind_data,
+                         VgiTableFunctionGlobalState &global_state,
+                         VgiTableFunctionLocalState &local_state) {
+	if (local_state.done) {
+		return false;
+	}
+	// Read from the worker, skipping empty non-log batches. Log batches
+	// (vgi_rpc.log_* metadata) are already consumed inside ReadDataBatch via
+	// HandleBatchLogMessage, so any 0-row batch surfaced here is a real empty
+	// response from the worker — pointless for producer-mode table functions.
+	while (true) {
+		// Update dynamic filter state before each tick is sent
+		UpdateDynamicFilterState(global_state, context, bind_data);
+		auto arrow_batch = local_state.connection->ReadDataBatch();
+		if (!arrow_batch) {
+			return InstallBatch(context, bind_data, local_state, nullptr);
+		}
+		if (arrow_batch->num_rows() == 0) {
+			VGI_LOG(context, "table_function.batch_empty_skipped",
+			        {{"worker_path", bind_data.worker_path()},
+			         {"worker_pid", std::to_string(local_state.connection->GetPid())},
+			         {"function_name", bind_data.function_name}});
+			continue;
+		}
+		return InstallBatch(context, bind_data, local_state, std::move(arrow_batch));
+	}
+}
+
 // ============================================================================
 // Async Prefetch Helpers
 // ============================================================================
 
 void VgiPrefetchTask::Execute() {
 	try {
-		local_state_.prefetch_batch_ = local_state_.connection->ReadDataBatch();
+		// Skip 0-row batches here so the consumer always sees either EOS or a
+		// non-empty batch, matching the sync path's invariant.
+		std::shared_ptr<arrow::RecordBatch> batch;
+		while (true) {
+			batch = local_state_.connection->ReadDataBatch();
+			if (!batch || batch->num_rows() > 0) {
+				break;
+			}
+		}
+		local_state_.prefetch_batch_ = std::move(batch);
 		local_state_.prefetch_state_.store(PrefetchState::READY);
 	} catch (...) {
 		local_state_.prefetch_exception_ = std::current_exception();
@@ -1171,28 +1201,7 @@ static void ConsumePrefetchedBatch(ClientContext &context, const VgiTableFunctio
 	auto arrow_batch = std::move(local_state.prefetch_batch_);
 	local_state.prefetch_batch_.reset();
 	local_state.prefetch_state_.store(PrefetchState::IDLE);
-
-	if (!arrow_batch) {
-		local_state.done = true;
-		VGI_LOG(context, "table_function.scan_complete",
-		        {{"worker_path", bind_data.worker_path()},
-		         {"worker_pid", std::to_string(local_state.connection->GetPid())},
-		         {"function_name", bind_data.function_name}});
-		return;
-	}
-
-	auto chunk = make_uniq<ArrowArrayWrapper>();
-	ExportRecordBatch(arrow_batch, *chunk);
-
-	local_state.chunk = shared_ptr<ArrowArrayWrapper>(chunk.release());
-	local_state.chunk_offset = 0;
-	local_state.Reset();
-
-	VGI_LOG(context, "table_function.batch_received",
-	        {{"worker_path", bind_data.worker_path()},
-	         {"worker_pid", std::to_string(local_state.connection->GetPid())},
-	         {"function_name", bind_data.function_name},
-	         {"batch_rows", std::to_string(arrow_batch->num_rows())}});
+	InstallBatch(context, bind_data, local_state, std::move(arrow_batch));
 }
 
 // ============================================================================
@@ -1256,13 +1265,13 @@ void VgiTableFunctionScan(ClientContext &context, TableFunctionInput &input, Dat
 		return;
 	}
 
-	// Synchronous fallback: inline blocking I/O (original behavior)
+	// Synchronous fallback: inline blocking I/O (original behavior).
+	// GetNextBatch now guarantees a non-empty batch on success, so a single
+	// call is sufficient — it internally loops past any empty worker batches.
 	if (!is_async) {
-		while (BatchExhausted(local_state)) {
-			if (!GetNextBatch(context, bind_data, global_state, local_state)) {
-				output.SetCardinality(0);
-				return;
-			}
+		if (!GetNextBatch(context, bind_data, global_state, local_state)) {
+			output.SetCardinality(0);
+			return;
 		}
 		ConvertCurrentBatch(bind_data, global_state, local_state, output);
 		return;
@@ -1293,13 +1302,12 @@ void VgiTableFunctionScan(ClientContext &context, TableFunctionInput &input, Dat
 
 	if (state == PrefetchState::IDLE) {
 		if (local_state.first_scan_call_) {
-			// First batch: fetch synchronously to avoid an extra BLOCKED round-trip
+			// First batch: fetch synchronously to avoid an extra BLOCKED round-trip.
+			// GetNextBatch loops past empty batches internally.
 			local_state.first_scan_call_ = false;
-			while (BatchExhausted(local_state)) {
-				if (!GetNextBatch(context, bind_data, global_state, local_state)) {
-					output.SetCardinality(0);
-					return;
-				}
+			if (!GetNextBatch(context, bind_data, global_state, local_state)) {
+				output.SetCardinality(0);
+				return;
 			}
 			ConvertCurrentBatch(bind_data, global_state, local_state, output);
 			if (output.size() == 0) {
