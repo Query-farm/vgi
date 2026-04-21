@@ -23,9 +23,10 @@ UnaryResponseResult AttemptUnaryRpc(const UnaryRpcOptions &opts, const std::stri
 	std::unique_ptr<SubProcess> proc;
 	std::unique_ptr<StderrDrainer> drainer;
 	bool from_pool = false;
+	PoolKey pool_key {opts.worker_path, opts.data_version_spec, opts.implementation_version};
 
 	if (!force_fresh && opts.use_pool) {
-		auto pooled = VgiWorkerPool::Instance().TryAcquire(opts.worker_path);
+		auto pooled = VgiWorkerPool::Instance().TryAcquire(pool_key);
 		if (pooled) {
 			// Take over the drainer that's been keeping stderr empty while
 			// the worker sat idle; its reader thread is already running.
@@ -92,7 +93,7 @@ UnaryResponseResult AttemptUnaryRpc(const UnaryRpcOptions &opts, const std::stri
 		int exit_status = 0;
 		if (!proc->TryWait(&exit_status)) {
 			// Keep the drainer alive across the pool idle period.
-			auto to_pool = std::make_unique<PooledWorker>(std::move(proc), opts.worker_path, std::move(drainer));
+			auto to_pool = std::make_unique<PooledWorker>(std::move(proc), pool_key, std::move(drainer));
 			if (opts.enable_logging) {
 				VGI_LOG(opts.context, "worker_pool.release",
 				        {{"worker_path", opts.worker_path},
@@ -112,7 +113,8 @@ UnaryResponseResult AttemptUnaryRpc(const UnaryRpcOptions &opts, const std::stri
 UnaryResponseResult InvokePooledUnaryRpc(const UnaryRpcOptions &opts, const std::string &method_name,
                                           const std::shared_ptr<arrow::RecordBatch> &params) {
 	if (IsHttpTransport(opts.worker_path)) {
-		return HttpInvokeUnary(opts.context, opts.worker_path, method_name, params, opts.auth);
+		return HttpInvokeUnary(opts.context, opts.worker_path, method_name, params, opts.auth,
+		                        opts.cookie_jar);
 	}
 
 	try {

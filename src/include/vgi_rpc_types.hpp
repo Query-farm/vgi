@@ -207,9 +207,12 @@ std::shared_ptr<arrow::RecordBatch> BuildBindRpcParams(const std::vector<uint8_t
 // The init RPC has a single "request" field containing the serialized InitRequest.
 std::shared_ptr<arrow::RecordBatch> BuildInitRpcParams(const std::vector<uint8_t> &init_request_bytes);
 
-// Build params batch for catalog_attach: name: utf8, options: binary|null
+// Build params batch for catalog_attach matching the vgi-python
+// CatalogAttachRequest: name + empty options + data_version_spec +
+// implementation_version. Empty version strings mean "no client constraint".
 std::shared_ptr<arrow::RecordBatch> BuildCatalogAttachParams(const std::string &name,
-                                                              const std::vector<uint8_t> &options_bytes = {});
+                                                              const std::string &data_version_spec = "",
+                                                              const std::string &implementation_version = "");
 
 // Build params batch for methods with just attach_id and optional transaction_id
 std::shared_ptr<arrow::RecordBatch> BuildAttachIdParams(const std::vector<uint8_t> &attach_id,

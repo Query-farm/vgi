@@ -49,12 +49,18 @@ inline std::string MapOnConflict(OnCreateConflict conflict) {
 	}
 }
 
+// Forward declaration for SessionCookieJar; full definition in vgi_cookie_jar.hpp.
+class SessionCookieJar;
+
 // Parameters for connecting to a VGI worker
 struct VgiAttachParameters {
 	VgiAttachParameters(const std::string &worker_path, const std::string &catalog_name, bool worker_debug = false,
-	                    bool use_pool = true, std::shared_ptr<CatalogAuth> auth = nullptr)
+	                    bool use_pool = true, std::shared_ptr<CatalogAuth> auth = nullptr,
+	                    std::string data_version_spec = "", std::string implementation_version = "",
+	                    std::shared_ptr<SessionCookieJar> cookie_jar = nullptr)
 	    : worker_path_(worker_path), catalog_name_(catalog_name), worker_debug_(worker_debug), use_pool_(use_pool),
-	      auth_(std::move(auth)) {
+	      auth_(std::move(auth)), data_version_spec_(std::move(data_version_spec)),
+	      implementation_version_(std::move(implementation_version)), cookie_jar_(std::move(cookie_jar)) {
 	}
 
 	const std::string &worker_path() const {
@@ -77,12 +83,33 @@ struct VgiAttachParameters {
 		return auth_;
 	}
 
+	// Requested semver constraint for the catalog's data version. Empty string
+	// means the client did not constrain. Pooled worker lookup uses this as
+	// part of the key so mismatched versions never share a process.
+	const std::string &data_version_spec() const {
+		return data_version_spec_;
+	}
+
+	// Requested semver constraint for the worker's implementation version.
+	// Empty string means unconstrained.
+	const std::string &implementation_version() const {
+		return implementation_version_;
+	}
+
+	// HTTP cookie jar for this catalog. Null on subprocess transport.
+	const std::shared_ptr<SessionCookieJar> &cookie_jar() const {
+		return cookie_jar_;
+	}
+
 private:
 	std::string worker_path_;
 	std::string catalog_name_;
 	bool worker_debug_;
 	bool use_pool_;
 	std::shared_ptr<CatalogAuth> auth_;
+	std::string data_version_spec_;
+	std::string implementation_version_;
+	std::shared_ptr<SessionCookieJar> cookie_jar_;
 };
 
 // Bundles all catalog state needed for an RPC call.
@@ -138,6 +165,19 @@ struct CatalogAttachResult {
 	std::string comment;                          // Optional comment describing this catalog
 	std::map<std::string, std::string> tags;      // Optional key-value tags for this catalog
 	bool supports_column_statistics = false;      // Whether any tables provide column statistics
+	// Concrete data version the worker resolved for this attach. Empty = worker
+	// has no version opinion. Surfaced via duckdb_databases().
+	std::string resolved_data_version;
+	// Concrete implementation version the worker resolved for this attach.
+	std::string resolved_implementation_version;
+};
+
+// Discovery record for a catalog returned by catalog_catalogs(). Matches the
+// vgi-python CatalogInfo dataclass on the wire.
+struct VgiCatalogInfo {
+	std::string name;
+	std::string implementation_version;  // empty = worker has no opinion
+	std::string data_version_spec;       // empty = worker has no opinion
 };
 
 // Schema metadata from the worker
@@ -339,15 +379,28 @@ VgiScanFunctionResult ParseScanFunctionResult(ClientContext &context, const std:
 // Typed Catalog RPC Functions (vgi_rpc protocol)
 // ============================================================================
 
-// Invoke catalog_catalogs: list available catalogs from a worker
-std::vector<std::string> InvokeCatalogCatalogs(const std::string &worker_path, ClientContext &context,
-                                                bool worker_debug = false, bool use_pool = true);
-
 // Invoke catalog_attach: attach to a catalog and get configuration
 // Called BEFORE a catalog exists — takes individual parameters, not CatalogRpcContext.
+//
+// ``data_version_spec`` and ``implementation_version`` are pass-through semver
+// strings the user supplied at ATTACH time (empty = unconstrained); the worker
+// validates them and returns the resolved concrete versions in the result.
+// ``cookie_jar`` is the per-catalog HTTP session cookie store (null for
+// subprocess transport); if present, Set-Cookie response headers are captured
+// into it and Cookie request headers are read from it on subsequent RPCs.
 CatalogAttachResult InvokeCatalogAttach(const std::string &worker_path, const std::string &catalog_name,
                                         ClientContext &context, bool worker_debug = false, bool use_pool = true,
-                                        const std::shared_ptr<CatalogAuth> &auth = nullptr);
+                                        const std::shared_ptr<CatalogAuth> &auth = nullptr,
+                                        const std::string &data_version_spec = "",
+                                        const std::string &implementation_version = "",
+                                        const std::shared_ptr<SessionCookieJar> &cookie_jar = nullptr);
+
+// List catalogs exposed by a worker. Returns per-catalog discovery records
+// carrying implementation_version and data_version_spec metadata alongside the
+// catalog name.
+std::vector<VgiCatalogInfo> InvokeCatalogs(const std::string &worker_path, ClientContext &context,
+                                           bool worker_debug = false, bool use_pool = true,
+                                           const std::shared_ptr<CatalogAuth> &auth = nullptr);
 
 // Invoke catalog_schemas: list schemas in an attached catalog
 std::vector<VgiSchemaInfo> InvokeCatalogSchemas(const CatalogRpcContext &ctx, ClientContext &context);

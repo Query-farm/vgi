@@ -1,0 +1,128 @@
+# name: test/sql/integration/attach/versioning.test
+# description: ATTACH-time data_version_spec / implementation_version validation + discovery
+# group: [vgi_integration_attach]
+
+require-env VGI_VERSIONED_WORKER
+
+require vgi
+
+require httpfs
+
+# ============================================================================
+# Discovery: vgi_catalogs() exposes implementation_version + data_version_spec
+# ============================================================================
+
+query TTT
+SELECT catalog, implementation_version, data_version_spec
+FROM vgi_catalogs('${VGI_VERSIONED_WORKER}');
+----
+versioned	1.0.0	>=1.0.0,<2.0.0
+
+# ============================================================================
+# Omitted versions: ATTACH succeeds, worker fills in default resolved values
+# ============================================================================
+
+statement ok
+ATTACH 'versioned' AS v_default (TYPE vgi, LOCATION '${VGI_VERSIONED_WORKER}');
+
+query T
+SELECT tags['vgi_resolved_implementation_version']
+FROM duckdb_databases()
+WHERE database_name = 'v_default';
+----
+1.0.0
+
+query T
+SELECT tags['vgi_resolved_data_version']
+FROM duckdb_databases()
+WHERE database_name = 'v_default';
+----
+1.2.0
+
+statement ok
+DETACH v_default;
+
+# ============================================================================
+# Matching versions: ATTACH succeeds, resolved values echoed back
+# ============================================================================
+
+statement ok
+ATTACH 'versioned' AS v_good (
+    TYPE vgi,
+    LOCATION '${VGI_VERSIONED_WORKER}',
+    data_version_spec '1.1.0',
+    implementation_version '1.0.0'
+);
+
+query T
+SELECT tags['vgi_resolved_data_version']
+FROM duckdb_databases()
+WHERE database_name = 'v_good';
+----
+1.1.0
+
+statement ok
+DETACH v_good;
+
+# ============================================================================
+# Unsatisfiable data_version_spec: ATTACH fails with worker message
+# ============================================================================
+
+statement error
+ATTACH 'versioned' AS v_bad_data (
+    TYPE vgi,
+    LOCATION '${VGI_VERSIONED_WORKER}',
+    data_version_spec '9.9.9'
+);
+----
+Unsupported data_version_spec
+
+# ============================================================================
+# Unsatisfiable implementation_version: ATTACH fails
+# ============================================================================
+
+statement error
+ATTACH 'versioned' AS v_bad_impl (
+    TYPE vgi,
+    LOCATION '${VGI_VERSIONED_WORKER}',
+    implementation_version '9.9.9'
+);
+----
+Unsupported implementation_version
+
+# ============================================================================
+# Pool isolation: two attaches at different data_version_spec values must not
+# share a pooled worker. vgi_worker_pool() shows distinct (worker_path,
+# data_version_spec, implementation_version) keys.
+# ============================================================================
+
+statement ok
+ATTACH 'versioned' AS v_pool_a (
+    TYPE vgi,
+    LOCATION '${VGI_VERSIONED_WORKER}',
+    data_version_spec '1.0.0'
+);
+
+statement ok
+ATTACH 'versioned' AS v_pool_b (
+    TYPE vgi,
+    LOCATION '${VGI_VERSIONED_WORKER}',
+    data_version_spec '1.1.0'
+);
+
+# Verify each catalog kept its own resolved version — a shared pooled worker
+# would cause cross-contamination.
+query TT
+SELECT database_name, tags['vgi_resolved_data_version']
+FROM duckdb_databases()
+WHERE database_name IN ('v_pool_a', 'v_pool_b')
+ORDER BY database_name;
+----
+v_pool_a	1.0.0
+v_pool_b	1.1.0
+
+statement ok
+DETACH v_pool_a;
+
+statement ok
+DETACH v_pool_b;

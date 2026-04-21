@@ -768,15 +768,23 @@ std::shared_ptr<arrow::RecordBatch> BuildInitRpcParams(const std::vector<uint8_t
 }
 
 std::shared_ptr<arrow::RecordBatch> BuildCatalogAttachParams(const std::string &name,
-                                                             const std::vector<uint8_t> &options_bytes) {
-	// Build the CatalogAttachRequest dataclass batch (fields: name, options)
+                                                             const std::string &data_version_spec,
+                                                             const std::string &implementation_version) {
+	// Build the CatalogAttachRequest dataclass batch matching the vgi-python
+	// definition: name, options, data_version_spec, implementation_version.
+	// options is always null here — catalog-specific options use a separate
+	// path that hasn't been wired from the extension yet.
 	auto request_schema = arrow::schema({
 	    arrow::field("name", arrow::utf8(), false),
 	    arrow::field("options", arrow::binary(), true),
+	    arrow::field("data_version_spec", arrow::utf8(), false),
+	    arrow::field("implementation_version", arrow::utf8(), false),
 	});
 	std::vector<std::shared_ptr<arrow::Array>> request_arrays;
 	request_arrays.push_back(BuildStringScalar(name));
-	request_arrays.push_back(BuildBinaryScalar(options_bytes));
+	request_arrays.push_back(BuildBinaryScalar({}));
+	request_arrays.push_back(BuildStringScalar(data_version_spec));
+	request_arrays.push_back(BuildStringScalar(implementation_version));
 	auto request_batch = arrow::RecordBatch::Make(request_schema, 1, request_arrays);
 
 	// Serialize to IPC bytes (matching ArrowSerializableDataclass.serialize_to_bytes())

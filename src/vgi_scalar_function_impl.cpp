@@ -200,7 +200,9 @@ unique_ptr<FunctionData> VgiScalarFunctionBind(ClientContext &context, ScalarFun
 		    : std::vector<uint8_t>{};
 		std::unique_ptr<IFunctionConnection> connection;
 		if (func_info.use_pool() && !IsHttpTransport(func_info.worker_path())) {
-			auto pooled = VgiWorkerPool::Instance().TryAcquire(func_info.worker_path());
+			PoolKey bind_pool_key {func_info.worker_path(), func_info.data_version_spec(),
+			                       func_info.implementation_version()};
+			auto pooled = VgiWorkerPool::Instance().TryAcquire(bind_pool_key);
 			if (pooled) {
 				connection = CreateFunctionConnectionFromPool(
 				    std::move(pooled), func_info.function_name, arrow_arguments, func_info.attach_id,
@@ -342,7 +344,9 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 		    ? VgiTransaction::Get(context, *func_info.catalog).GetTransactionId()
 		    : std::vector<uint8_t>{};
 		if (!connection && use_pool && !IsHttpTransport(worker_path)) {
-			auto pooled = VgiWorkerPool::Instance().TryAcquire(worker_path);
+			PoolKey exec_pool_key {worker_path, attach_params ? attach_params->data_version_spec() : std::string(),
+			                       attach_params ? attach_params->implementation_version() : std::string()};
+			auto pooled = VgiWorkerPool::Instance().TryAcquire(exec_pool_key);
 			if (pooled) {
 				VGI_STDERR_DEBUG("[VGI] scalar.pool_acquire result=hit worker_path=%s pid=%d\n",
 				                 worker_path.c_str(), pooled->GetPid());

@@ -27,6 +27,7 @@
 #include "storage/vgi_transaction.hpp"
 #include "vgi_catalog_api.hpp"
 #include "vgi_catalogs.hpp"
+#include "vgi_cookie_jar.hpp"
 #include "vgi_logging.hpp"
 #include "vgi_oauth.hpp"
 #include "vgi_profiling.hpp"
@@ -201,6 +202,8 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	int64_t pool_timeout_override = -1;  // -1 = not set
 	string oauth_refresh_token;
 	string bearer_token;
+	string data_version_spec;
+	string implementation_version;
 
 	// Extract options
 	for (auto &entry : info.options) {
@@ -221,6 +224,10 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 			oauth_refresh_token = entry.second.ToString();
 		} else if (lower_name == "bearer_token") {
 			bearer_token = entry.second.ToString();
+		} else if (lower_name == "data_version_spec") {
+			data_version_spec = entry.second.ToString();
+		} else if (lower_name == "implementation_version") {
+			implementation_version = entry.second.ToString();
 		} else {
 			throw BinderException("Unrecognized option for VGI ATTACH: %s", entry.first);
 		}
@@ -279,8 +286,18 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 		auth = std::move(oauth_auth);
 	}
 
-	// Call catalog_attach via RPC (auth is used for HTTP 401 handling)
-	auto attach_result = vgi::InvokeCatalogAttach(worker_path, catalog_name, context, worker_debug, use_pool, auth);
+	// HTTP cookie jar — carries proxy-issued Set-Cookie / Cookie headers for
+	// sticky version-aware routing. Subprocess transport doesn't use this.
+	std::shared_ptr<vgi::SessionCookieJar> cookie_jar;
+	if (vgi::IsHttpTransport(worker_path)) {
+		cookie_jar = std::make_shared<vgi::SessionCookieJar>();
+	}
+
+	// Call catalog_attach via RPC. The worker validates data_version_spec and
+	// implementation_version and throws with a human-readable message on
+	// unsatisfiable requests; that surfaces as the ATTACH failure.
+	auto attach_result = vgi::InvokeCatalogAttach(worker_path, catalog_name, context, worker_debug, use_pool, auth,
+	                                              data_version_spec, implementation_version, cookie_jar);
 
 	// Register extension options for settings exposed by this catalog
 	// Check for type conflicts with existing settings
@@ -379,8 +396,22 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 		db.tags[key] = val;
 	}
 
-	// Create attach parameters (auth is embedded for per-catalog authentication)
-	auto attach_params = std::make_shared<vgi::VgiAttachParameters>(worker_path, catalog_name, worker_debug, use_pool, auth);
+	// Surface resolved versions via duckdb_databases().tags so users can verify
+	// what the worker actually picked. Namespaced with vgi_ to avoid clashing
+	// with any worker-declared tags.
+	if (!attach_result.resolved_data_version.empty()) {
+		db.tags["vgi_resolved_data_version"] = attach_result.resolved_data_version;
+	}
+	if (!attach_result.resolved_implementation_version.empty()) {
+		db.tags["vgi_resolved_implementation_version"] = attach_result.resolved_implementation_version;
+	}
+
+	// Create attach parameters. Resolved versions are what the worker picked;
+	// they're used by the pool key so catalogs attached at different versions
+	// never share a subprocess worker.
+	auto attach_params = std::make_shared<vgi::VgiAttachParameters>(
+	    worker_path, catalog_name, worker_debug, use_pool, auth, attach_result.resolved_data_version,
+	    attach_result.resolved_implementation_version, cookie_jar);
 	auto attach_result_ptr = std::make_shared<vgi::CatalogAttachResult>(std::move(attach_result));
 
 	return make_uniq<VgiCatalog>(db, name, options.access_mode, std::move(attach_params), std::move(attach_result_ptr));

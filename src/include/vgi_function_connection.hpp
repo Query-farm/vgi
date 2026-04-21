@@ -57,6 +57,8 @@ struct FunctionConnectionParams {
 	const std::string &worker_path() const;
 	bool worker_debug() const;
 	bool use_pool() const;
+	const std::string &data_version_spec() const;
+	const std::string &implementation_version() const;
 
 	FunctionConnectionParams() = default;
 };
@@ -113,7 +115,9 @@ public:
 	                   const std::string &function_type = "TABLE",
 	                   const std::vector<uint8_t> &global_execution_id = {}, bool worker_debug = false,
 	                   const std::map<std::string, Value> &settings = {},
-	                   const std::vector<VgiSecretRequirement> &required_secrets = {});
+	                   const std::vector<VgiSecretRequirement> &required_secrets = {},
+	                   const std::string &data_version_spec = "",
+	                   const std::string &implementation_version = "");
 
 	// Create connection using a pooled worker (skips spawning new subprocess)
 	FunctionConnection(std::unique_ptr<PooledWorker> pooled_worker, const std::string &function_name,
@@ -231,6 +235,11 @@ public:
 
 private:
 	std::string worker_path_;
+	// Pool-key dimensions. Populated from VgiAttachParameters when the
+	// connection is created so ReleaseForPooling can route the worker back
+	// to the same version-specific bucket it came from.
+	std::string data_version_spec_;
+	std::string implementation_version_;
 	std::string function_name_;
 	std::string function_type_;  // "TABLE", "SCALAR", "AGGREGATE"
 	std::shared_ptr<arrow::DataType> arguments_type_;

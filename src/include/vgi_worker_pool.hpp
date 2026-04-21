@@ -12,6 +12,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 namespace duckdb {
@@ -21,6 +22,26 @@ namespace vgi {
 struct PoolSettings {
 	size_t max_pool_size = 0;        // 0 = pool disabled
 	size_t idle_timeout_seconds = 5; // How long idle workers survive
+};
+
+// Pool key: workers are only reused when all three dimensions match.
+// ``worker_path`` alone would be unsafe — a worker spawned for one
+// ``data_version_spec`` must never serve a query from a differently-versioned
+// attach. Empty strings (unconstrained requests) form their own pool bucket.
+struct PoolKey {
+	std::string worker_path;
+	std::string data_version_spec;
+	std::string implementation_version;
+
+	bool operator<(const PoolKey &other) const {
+		return std::tie(worker_path, data_version_spec, implementation_version) <
+		       std::tie(other.worker_path, other.data_version_spec, other.implementation_version);
+	}
+
+	bool operator==(const PoolKey &other) const {
+		return worker_path == other.worker_path && data_version_spec == other.data_version_spec &&
+		       implementation_version == other.implementation_version;
+	}
 };
 
 // Represents a pooled worker subprocess ready for reuse.
@@ -38,7 +59,10 @@ public:
 	// The drainer (if non-null) should already be attached to the worker's
 	// stderr fd; it will keep draining while the worker is idle in the pool.
 	// Destroying the PooledWorker stops the drainer and closes the fd.
-	PooledWorker(std::unique_ptr<SubProcess> proc, const std::string &worker_path,
+	//
+	// The three-string key is stored so the worker returns to the same pool
+	// bucket on Release as it came from on Acquire.
+	PooledWorker(std::unique_ptr<SubProcess> proc, PoolKey key,
 	             std::unique_ptr<StderrDrainer> drainer);
 	~PooledWorker();
 
@@ -59,9 +83,14 @@ public:
 	// RPC lifetime, then hand it back to a new PooledWorker on release.
 	std::unique_ptr<StderrDrainer> ReleaseDrainer();
 
-	// Get worker path
+	// Get pool key (worker_path + data_version_spec + implementation_version)
+	const PoolKey &GetKey() const {
+		return key_;
+	}
+
+	// Convenience — worker_path dimension of the pool key.
 	const std::string &GetWorkerPath() const {
-		return worker_path_;
+		return key_.worker_path;
 	}
 
 	// Get time when this worker was added to the pool
@@ -82,7 +111,7 @@ public:
 
 private:
 	std::unique_ptr<SubProcess> proc_;
-	std::string worker_path_;
+	PoolKey key_;
 	std::chrono::steady_clock::time_point pooled_at_;
 	// Keeps draining stderr while the worker is idle in the pool — ownership
 	// moves back to the RPC caller on Acquire, and a fresh drainer comes back
@@ -100,13 +129,15 @@ public:
 	// Get the singleton instance
 	static VgiWorkerPool &Instance();
 
-	// Acquire a worker from the pool for the given worker_path.
-	// Returns nullptr if no worker is available (never blocks).
-	// The returned worker is guaranteed to be alive.
-	std::unique_ptr<PooledWorker> TryAcquire(const std::string &worker_path);
+	// Acquire a worker from the pool for the given key. Returns nullptr if no
+	// worker is available (never blocks). The returned worker is guaranteed to
+	// be alive. Workers are only reused when the full key matches; different
+	// version constraints form separate pool buckets.
+	std::unique_ptr<PooledWorker> TryAcquire(const PoolKey &key);
 
-	// Return a worker to the pool for reuse.
-	// Uses per-path config (from ConfigurePath) if available, otherwise default settings.
+	// Return a worker to the pool for reuse. Uses per-path config (from
+	// ConfigurePath) if available, otherwise default settings. Release routes
+	// back to the bucket identified by ``worker->GetKey()``.
 	void Release(std::unique_ptr<PooledWorker> worker);
 
 	// Set default pool settings for paths without explicit per-path config
@@ -120,6 +151,8 @@ public:
 	// Pool entry info for diagnostics
 	struct PoolEntry {
 		std::string worker_path;
+		std::string data_version_spec;
+		std::string implementation_version;
 		pid_t pid;
 		int64_t age_seconds;
 	};
@@ -163,7 +196,7 @@ private:
 	size_t TotalPoolSizeLocked() const;
 
 	mutable std::mutex mutex_;
-	std::map<std::string, std::deque<std::unique_ptr<PooledWorker>>> pools_;
+	std::map<PoolKey, std::deque<std::unique_ptr<PooledWorker>>> pools_;
 
 	// Per-path pool configuration (set at ATTACH time)
 	std::map<std::string, PoolSettings> path_configs_;

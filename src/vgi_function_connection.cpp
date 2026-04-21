@@ -23,6 +23,12 @@ namespace vgi {
 const std::string &FunctionConnectionParams::worker_path() const { return attach_params->worker_path(); }
 bool FunctionConnectionParams::worker_debug() const { return attach_params->worker_debug(); }
 bool FunctionConnectionParams::use_pool() const { return attach_params->use_pool(); }
+const std::string &FunctionConnectionParams::data_version_spec() const {
+	return attach_params->data_version_spec();
+}
+const std::string &FunctionConnectionParams::implementation_version() const {
+	return attach_params->implementation_version();
+}
 
 // ============================================================================
 // Connection Acquisition with Retry
@@ -63,7 +69,8 @@ AcquireAndBindResult AcquireAndBindConnection(ClientContext &context, const Func
 
 	// Try pool first (only for subprocess transport)
 	if (params.use_pool() && !IsHttpTransport(params.worker_path())) {
-		auto pooled = VgiWorkerPool::Instance().TryAcquire(params.worker_path());
+		PoolKey pool_key {params.worker_path(), params.data_version_spec(), params.implementation_version()};
+		auto pooled = VgiWorkerPool::Instance().TryAcquire(pool_key);
 		if (pooled) {
 			auto pooled_pid = pooled->GetPid();
 			conn = CreateFunctionConnectionFromPool(std::move(pooled), params.function_name, params.arguments,
@@ -118,8 +125,11 @@ FunctionConnection::FunctionConnection(const std::string &worker_path, const std
                                        ClientContext &context, const std::string &function_type,
                                        const std::vector<uint8_t> &global_execution_id,
                                        bool worker_debug, const std::map<std::string, Value> &settings,
-                                       const std::vector<VgiSecretRequirement> &required_secrets)
-    : worker_path_(worker_path), function_name_(function_name), function_type_(function_type),
+                                       const std::vector<VgiSecretRequirement> &required_secrets,
+                                       const std::string &data_version_spec,
+                                       const std::string &implementation_version)
+    : worker_path_(worker_path), data_version_spec_(data_version_spec),
+      implementation_version_(implementation_version), function_name_(function_name), function_type_(function_type),
       arguments_type_(arguments.type), arguments_array_(arguments.array), attach_id_(attach_id),
       transaction_id_(transaction_id), global_execution_id_(global_execution_id), context_(context),
       worker_debug_(worker_debug), settings_(settings), required_secrets_(required_secrets) {
@@ -132,7 +142,10 @@ FunctionConnection::FunctionConnection(std::unique_ptr<PooledWorker> pooled_work
                                        const std::vector<uint8_t> &global_execution_id,
                                        bool worker_debug, const std::map<std::string, Value> &settings,
                                        const std::vector<VgiSecretRequirement> &required_secrets)
-    : worker_path_(pooled_worker->GetWorkerPath()), function_name_(function_name), function_type_(function_type),
+    : worker_path_(pooled_worker->GetKey().worker_path),
+      data_version_spec_(pooled_worker->GetKey().data_version_spec),
+      implementation_version_(pooled_worker->GetKey().implementation_version),
+      function_name_(function_name), function_type_(function_type),
       arguments_type_(arguments.type), arguments_array_(arguments.array), attach_id_(attach_id),
       transaction_id_(transaction_id), global_execution_id_(global_execution_id), context_(context),
       worker_debug_(worker_debug), settings_(settings), required_secrets_(required_secrets),
@@ -733,7 +746,8 @@ std::unique_ptr<PooledWorker> FunctionConnection::ReleaseForPooling() {
 	auto drainer = std::move(stderr_drainer_);
 
 	// Create pooled worker with our subprocess and the live drainer.
-	auto pooled = std::make_unique<PooledWorker>(std::move(proc_), worker_path_, std::move(drainer));
+	PoolKey pool_key {worker_path_, data_version_spec_, implementation_version_};
+	auto pooled = std::make_unique<PooledWorker>(std::move(proc_), pool_key, std::move(drainer));
 
 	// Clear our state so destructor doesn't try to use proc_
 	proc_.reset();
@@ -792,9 +806,18 @@ std::unique_ptr<IFunctionConnection> CreateFunctionConnection(
 		    function_type, global_execution_id, worker_debug, settings, required_secrets,
 		    attach_params);
 	}
+	// Forward version-key fields so ReleaseForPooling routes this worker back
+	// to the same pool bucket on next release.
+	std::string data_version_spec;
+	std::string implementation_version;
+	if (attach_params) {
+		data_version_spec = attach_params->data_version_spec();
+		implementation_version = attach_params->implementation_version();
+	}
 	return std::make_unique<FunctionConnection>(
 	    worker_path, function_name, arguments, attach_id, transaction_id, context,
-	    function_type, global_execution_id, worker_debug, settings, required_secrets);
+	    function_type, global_execution_id, worker_debug, settings, required_secrets,
+	    data_version_spec, implementation_version);
 }
 
 std::unique_ptr<IFunctionConnection> CreateFunctionConnectionFromPool(

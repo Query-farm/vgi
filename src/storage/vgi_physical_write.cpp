@@ -84,7 +84,8 @@ static std::unique_ptr<IFunctionConnection> SetupWriteConnection(ClientContext &
 	// Try to reuse a pooled worker connection (subprocess transport only).
 	std::unique_ptr<IFunctionConnection> connection;
 	if (!IsHttpTransport(params->worker_path())) {
-		auto pooled = VgiWorkerPool::Instance().TryAcquire(params->worker_path());
+		PoolKey pool_key {params->worker_path(), params->data_version_spec(), params->implementation_version()};
+		auto pooled = VgiWorkerPool::Instance().TryAcquire(pool_key);
 		if (pooled) {
 			connection = CreateFunctionConnectionFromPool(std::move(pooled), write_func.function_name, arguments,
 			                                              attach_result->attach_id, transaction_id, context,

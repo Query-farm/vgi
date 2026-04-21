@@ -15,20 +15,12 @@ namespace duckdb {
 
 namespace {
 
-// ============================================================================
-// Bind Data
-// ============================================================================
-
 struct VgiCatalogsBindData : public TableFunctionData {
 	std::string worker_path;
 };
 
-// ============================================================================
-// Global State
-// ============================================================================
-
 struct VgiCatalogsGlobalState : public GlobalTableFunctionState {
-	std::vector<std::string> catalogs;
+	std::vector<vgi::VgiCatalogInfo> catalogs;
 	idx_t current_idx = 0;
 	bool done = false;
 
@@ -37,17 +29,12 @@ struct VgiCatalogsGlobalState : public GlobalTableFunctionState {
 	}
 };
 
-// ============================================================================
-// Bind Function
-// ============================================================================
-
 static unique_ptr<FunctionData> VgiCatalogsBind(ClientContext &context, TableFunctionBindInput &input,
                                                 vector<LogicalType> &return_types, vector<string> &names) {
 	auto bind_data = make_uniq<VgiCatalogsBindData>();
 
 	bind_data->worker_path = input.inputs[0].GetValue<string>();
 
-	// HTTP transport: require httpfs for POST support
 	if (vgi::IsHttpTransport(bind_data->worker_path)) {
 		auto &db = DatabaseInstance::GetDatabase(context);
 		try {
@@ -63,34 +50,28 @@ static unique_ptr<FunctionData> VgiCatalogsBind(ClientContext &context, TableFun
 
 	VGI_LOG(context, "vgi_catalogs.bind", {{"worker_path", bind_data->worker_path}});
 
-	// Return type is a single column "catalog" of type VARCHAR
 	return_types.push_back(LogicalType::VARCHAR);
 	names.push_back("catalog");
+	return_types.push_back(LogicalType::VARCHAR);
+	names.push_back("implementation_version");
+	return_types.push_back(LogicalType::VARCHAR);
+	names.push_back("data_version_spec");
 
 	return bind_data;
 }
-
-// ============================================================================
-// Init Global Function
-// ============================================================================
 
 static unique_ptr<GlobalTableFunctionState> VgiCatalogsInitGlobal(ClientContext &context,
                                                                    TableFunctionInitInput &input) {
 	auto &bind_data = input.bind_data->Cast<VgiCatalogsBindData>();
 	auto state = make_uniq<VgiCatalogsGlobalState>();
 
-	// Invoke catalog_catalogs via RPC
-	state->catalogs = vgi::InvokeCatalogCatalogs(bind_data.worker_path, context);
+	state->catalogs = vgi::InvokeCatalogs(bind_data.worker_path, context);
 
 	VGI_LOG(context, "vgi_catalogs.init",
 	        {{"worker_path", bind_data.worker_path}, {"num_catalogs", std::to_string(state->catalogs.size())}});
 
 	return state;
 }
-
-// ============================================================================
-// Scan Function
-// ============================================================================
 
 static void VgiCatalogsScan(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
 	auto &state = input.global_state->Cast<VgiCatalogsGlobalState>();
@@ -104,7 +85,10 @@ static void VgiCatalogsScan(ClientContext &context, TableFunctionInput &input, D
 	idx_t max_count = STANDARD_VECTOR_SIZE;
 
 	while (state.current_idx < state.catalogs.size() && count < max_count) {
-		output.data[0].SetValue(count, Value(state.catalogs[state.current_idx]));
+		const auto &info = state.catalogs[state.current_idx];
+		output.data[0].SetValue(count, Value(info.name));
+		output.data[1].SetValue(count, Value(info.implementation_version));
+		output.data[2].SetValue(count, Value(info.data_version_spec));
 		count++;
 		state.current_idx++;
 	}
@@ -116,10 +100,6 @@ static void VgiCatalogsScan(ClientContext &context, TableFunctionInput &input, D
 	output.SetCardinality(count);
 }
 
-// ============================================================================
-// ToString Function - Returns info for EXPLAIN output
-// ============================================================================
-
 static InsertionOrderPreservingMap<string> VgiCatalogsToString(TableFunctionToStringInput &input) {
 	InsertionOrderPreservingMap<string> result;
 	auto &bind_data = input.bind_data->Cast<VgiCatalogsBindData>();
@@ -128,10 +108,6 @@ static InsertionOrderPreservingMap<string> VgiCatalogsToString(TableFunctionToSt
 }
 
 } // anonymous namespace
-
-// ============================================================================
-// Registration
-// ============================================================================
 
 void RegisterVgiCatalogsFunction(ExtensionLoader &loader) {
 	TableFunction func("vgi_catalogs", {LogicalType::VARCHAR}, VgiCatalogsScan, VgiCatalogsBind, VgiCatalogsInitGlobal);

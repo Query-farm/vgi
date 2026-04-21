@@ -45,6 +45,8 @@ struct VgiTableInOutBindData : public TableFunctionData {
 	const std::string &worker_path() const { return attach_params->worker_path(); }
 	bool worker_debug() const { return attach_params->worker_debug(); }
 	bool use_pool() const { return attach_params->use_pool(); }
+	const std::string &data_version_spec() const { return attach_params->data_version_spec(); }
+	const std::string &implementation_version() const { return attach_params->implementation_version(); }
 
 	// Arguments (excluding TABLE input)
 	ArrowArguments arguments;
@@ -116,6 +118,8 @@ struct VgiTableInOutBindParams {
 	const std::string &worker_path() const { return attach_params->worker_path(); }
 	bool worker_debug() const { return attach_params->worker_debug(); }
 	bool use_pool() const { return attach_params->use_pool(); }
+	const std::string &data_version_spec() const { return attach_params->data_version_spec(); }
+	const std::string &implementation_version() const { return attach_params->implementation_version(); }
 };
 
 // ============================================================================

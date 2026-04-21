@@ -107,7 +107,9 @@ unique_ptr<FunctionData> VgiTableInOutBind(ClientContext &context, TableFunction
 	std::unique_ptr<IFunctionConnection> connection;
 	bool from_pool = false;
 	if (bind_data->use_pool() && !IsHttpTransport(bind_data->worker_path())) {
-		auto pooled = VgiWorkerPool::Instance().TryAcquire(bind_data->worker_path());
+		PoolKey pool_key {bind_data->worker_path(), bind_data->data_version_spec(),
+		                  bind_data->implementation_version()};
+		auto pooled = VgiWorkerPool::Instance().TryAcquire(pool_key);
 		if (pooled) {
 			from_pool = true;
 			VGI_LOG(context, "table_in_out.pool_acquire",

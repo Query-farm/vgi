@@ -1,0 +1,60 @@
+# name: test/sql/integration/attach/versioning_http.test
+# description: HTTP-transport ATTACH versioning + cookie roundtrip
+# group: [vgi_integration_attach_http]
+
+# Requires an HTTP server for the versioned-example worker, e.g.:
+#   uv run --project ~/Development/vgi-python \
+#       vgi-example-versioned-worker --http --port 0
+# Set VGI_VERSIONED_HTTP_WORKER to its base URL before running.
+require-env VGI_VERSIONED_HTTP_WORKER
+
+require vgi
+
+require httpfs
+
+# Discovery over HTTP
+query TTT
+SELECT catalog, implementation_version, data_version_spec
+FROM vgi_catalogs('${VGI_VERSIONED_HTTP_WORKER}');
+----
+versioned	1.0.0	>=1.0.0,<2.0.0
+
+# ATTACH with matching versions; worker sets a sticky cookie on the attach
+# response and asserts the cookie on every subsequent catalog_version RPC
+# (any query triggers at least one). If the C++ cookie jar doesn't plumb
+# Set-Cookie → Cookie back on the next request, this ATTACH succeeds but the
+# first follow-up raises.
+statement ok
+ATTACH 'versioned' AS v_http (
+    TYPE vgi,
+    LOCATION '${VGI_VERSIONED_HTTP_WORKER}',
+    data_version_spec '1.1.0'
+);
+
+query T
+SELECT tags['vgi_resolved_data_version']
+FROM duckdb_databases()
+WHERE database_name = 'v_http';
+----
+1.1.0
+
+# Touch the catalog to force a follow-up RPC that will include the Cookie
+# header. The versioned worker's catalog_version() raises if vgi_sticky
+# is missing, surfacing here as an error.
+query I
+SELECT COUNT(*) FROM duckdb_schemas() WHERE database_name = 'v_http';
+----
+1
+
+statement ok
+DETACH v_http;
+
+# Unsatisfiable version still fails hard over HTTP
+statement error
+ATTACH 'versioned' AS v_http_bad (
+    TYPE vgi,
+    LOCATION '${VGI_VERSIONED_HTTP_WORKER}',
+    data_version_spec '9.9.9'
+);
+----
+Unsupported data_version_spec

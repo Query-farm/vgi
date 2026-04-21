@@ -316,8 +316,11 @@ AggregateRpcResult InvokeAggregateRpc(ClientContext &context, const VgiAggregate
 	                      bind_data.attach_params->worker_path(),
 	                      bind_data.attach_params->worker_debug(),
 	                      bind_data.attach_params->use_pool(),
+	                      bind_data.attach_params->data_version_spec(),
+	                      bind_data.attach_params->implementation_version(),
 	                      "rpc_aggregate",
 	                      bind_data.attach_params->auth(),
+	                      bind_data.attach_params->cookie_jar(),
 	                      enable_logging};
 	auto response = InvokePooledUnaryRpc(opts, method_name, params);
 	return {response.batch};

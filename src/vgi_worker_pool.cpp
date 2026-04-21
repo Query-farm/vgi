@@ -9,9 +9,9 @@ namespace vgi {
 // PooledWorker
 //===--------------------------------------------------------------------===//
 
-PooledWorker::PooledWorker(std::unique_ptr<SubProcess> proc, const std::string &worker_path,
+PooledWorker::PooledWorker(std::unique_ptr<SubProcess> proc, PoolKey key,
                             std::unique_ptr<StderrDrainer> drainer)
-    : proc_(std::move(proc)), worker_path_(worker_path), pooled_at_(std::chrono::steady_clock::now()),
+    : proc_(std::move(proc)), key_(std::move(key)), pooled_at_(std::chrono::steady_clock::now()),
       drainer_(std::move(drainer)) {
 }
 
@@ -21,14 +21,14 @@ PooledWorker::~PooledWorker() {
 }
 
 PooledWorker::PooledWorker(PooledWorker &&other) noexcept
-    : proc_(std::move(other.proc_)), worker_path_(std::move(other.worker_path_)), pooled_at_(other.pooled_at_),
+    : proc_(std::move(other.proc_)), key_(std::move(other.key_)), pooled_at_(other.pooled_at_),
       drainer_(std::move(other.drainer_)) {
 }
 
 PooledWorker &PooledWorker::operator=(PooledWorker &&other) noexcept {
 	if (this != &other) {
 		proc_ = std::move(other.proc_);
-		worker_path_ = std::move(other.worker_path_);
+		key_ = std::move(other.key_);
 		pooled_at_ = other.pooled_at_;
 		drainer_ = std::move(other.drainer_);
 	}
@@ -94,15 +94,17 @@ VgiWorkerPool::~VgiWorkerPool() {
 	pools_.clear();
 }
 
-std::unique_ptr<PooledWorker> VgiWorkerPool::TryAcquire(const std::string &worker_path) {
+std::unique_ptr<PooledWorker> VgiWorkerPool::TryAcquire(const PoolKey &key) {
 	std::lock_guard<std::mutex> lock(mutex_);
 
-	VGI_STDERR_DEBUG("[VGI] pool.try_acquire worker_path=%s total_pool_size=%zu\n",
-	                 worker_path.c_str(), TotalPoolSizeLocked());
+	VGI_STDERR_DEBUG("[VGI] pool.try_acquire worker_path=%s data=%s impl=%s total_pool_size=%zu\n",
+	                 key.worker_path.c_str(), key.data_version_spec.c_str(),
+	                 key.implementation_version.c_str(), TotalPoolSizeLocked());
 
-	auto it = pools_.find(worker_path);
+	auto it = pools_.find(key);
 	if (it == pools_.end() || it->second.empty()) {
-		VGI_STDERR_DEBUG("[VGI] pool.try_acquire path_not_found_or_empty worker_path=%s\n", worker_path.c_str());
+		VGI_STDERR_DEBUG("[VGI] pool.try_acquire path_not_found_or_empty worker_path=%s\n",
+		                 key.worker_path.c_str());
 		return nullptr;
 	}
 
@@ -113,8 +115,8 @@ std::unique_ptr<PooledWorker> VgiWorkerPool::TryAcquire(const std::string &worke
 		pool.pop_front();
 
 		if (worker->IsAlive()) {
-			// Record hit
-			stats_[worker_path].first++;
+			// Record hit (stats keyed by worker_path for backward-compatible display)
+			stats_[key.worker_path].first++;
 			VGI_STDERR_DEBUG("[VGI] pool.try_acquire found_alive pid=%d\n", worker->GetPid());
 			return worker;
 		}
@@ -136,9 +138,12 @@ void VgiWorkerPool::Release(std::unique_ptr<PooledWorker> worker) {
 
 	std::lock_guard<std::mutex> lock(mutex_);
 
-	const std::string &path = worker->GetWorkerPath();
+	const auto &key = worker->GetKey();
+	const std::string &path = key.worker_path;
 
-	// Resolve settings: per-path config if available (from ATTACH), otherwise default settings
+	// Resolve settings: per-path config if available (from ATTACH), otherwise default settings.
+	// Pool-size/timeout settings are still per-path — a worker's version is
+	// orthogonal to its pool sizing.
 	auto config_it = path_configs_.find(path);
 	const auto &settings = (config_it != path_configs_.end()) ? config_it->second : default_settings_;
 
@@ -147,16 +152,17 @@ void VgiWorkerPool::Release(std::unique_ptr<PooledWorker> worker) {
 		                 worker->GetPid(), path.c_str());
 		return;
 	}
-	if (pools_[path].size() >= settings.max_pool_size) {
+	auto &bucket = pools_[key];
+	if (bucket.size() >= settings.max_pool_size) {
 		VGI_STDERR_DEBUG("[VGI] pool.release path_pool_full pid=%d path=%s size=%zu max=%zu\n",
-		                 worker->GetPid(), path.c_str(), pools_[path].size(), settings.max_pool_size);
+		                 worker->GetPid(), path.c_str(), bucket.size(), settings.max_pool_size);
 		return;
 	}
 
 	worker->SetIdleTimeout(std::chrono::seconds(settings.idle_timeout_seconds));
-	pools_[path].push_back(std::move(worker));
+	bucket.push_back(std::move(worker));
 	VGI_STDERR_DEBUG("[VGI] pool.release added worker_path=%s pool_size=%zu total=%zu\n",
-	                 path.c_str(), pools_[path].size(), TotalPoolSizeLocked());
+	                 path.c_str(), bucket.size(), TotalPoolSizeLocked());
 }
 
 size_t VgiWorkerPool::Flush() {
@@ -173,10 +179,11 @@ std::vector<VgiWorkerPool::PoolEntry> VgiWorkerPool::GetPoolEntries() const {
 	std::vector<PoolEntry> entries;
 	auto now = std::chrono::steady_clock::now();
 
-	for (const auto &[path, pool] : pools_) {
+	for (const auto &[key, pool] : pools_) {
 		for (const auto &worker : pool) {
 			auto age = std::chrono::duration_cast<std::chrono::seconds>(now - worker->GetPooledAt());
-			entries.push_back({path, worker->GetPid(), age.count()});
+			entries.push_back({key.worker_path, key.data_version_spec, key.implementation_version,
+			                   worker->GetPid(), age.count()});
 		}
 	}
 
@@ -216,7 +223,8 @@ void VgiWorkerPool::CleanupThread() {
 void VgiWorkerPool::RemoveStaleWorkersLocked() {
 	auto now = std::chrono::steady_clock::now();
 
-	for (auto &[path, pool] : pools_) {
+	for (auto &[key, pool] : pools_) {
+		(void)key;
 		// Remove dead or stale workers
 		auto it = pool.begin();
 		while (it != pool.end()) {
@@ -242,7 +250,8 @@ void VgiWorkerPool::RemoveStaleWorkersLocked() {
 
 size_t VgiWorkerPool::TotalPoolSizeLocked() const {
 	size_t total = 0;
-	for (const auto &[path, pool] : pools_) {
+	for (const auto &[key, pool] : pools_) {
+		(void)key;
 		total += pool.size();
 	}
 	return total;

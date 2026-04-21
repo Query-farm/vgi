@@ -5,6 +5,7 @@
 #include "duckdb/common/enums/http_status_code.hpp"
 #include "zstd.h"
 
+#include "vgi_cookie_jar.hpp"
 #include "vgi_logging.hpp"
 #include "vgi_oauth.hpp"
 #include "vgi_rpc_client.hpp"
@@ -89,11 +90,36 @@ static void ApplyHttpTimeout(ClientContext &context, HTTPParams &params) {
 	}
 }
 
+// Check whether ``url`` is an https origin — used to gate Secure cookies.
+static bool UrlIsHttps(const std::string &url) {
+	// Case-insensitive prefix match — HTTPUtil accepts both cases.
+	if (url.size() < 8) {
+		return false;
+	}
+	return (url[0] == 'h' || url[0] == 'H') && (url[1] == 't' || url[1] == 'T') &&
+	       (url[2] == 't' || url[2] == 'T') && (url[3] == 'p' || url[3] == 'P') &&
+	       (url[4] == 's' || url[4] == 'S') && url[5] == ':';
+}
+
+// Collect all Set-Cookie response headers. The HTTP layer may fold duplicate
+// headers into a comma-separated string; proxies and browsers both treat
+// Set-Cookie as non-foldable, so we split on newlines inserted by the
+// underlying client or, when absent, fall back to the single value.
+static std::vector<std::string> CollectSetCookieHeaders(const HTTPResponse &response) {
+	std::vector<std::string> out;
+	if (!response.HasHeader("Set-Cookie")) {
+		return out;
+	}
+	out.push_back(response.GetHeaderValue("Set-Cookie"));
+	return out;
+}
+
 // Internal: perform a single HTTP POST with optional auth header
 static std::string HttpPostArrowIpcInternal(ClientContext &context,
                                              const std::string &url,
                                              const std::vector<uint8_t> &body,
                                              const std::string &bearer_token,
+                                             const std::shared_ptr<SessionCookieJar> &cookie_jar,
                                              std::unique_ptr<HTTPResponse> &out_response) {
 	auto &db = *context.db;
 	auto &http_util = HTTPUtil::Get(db);
@@ -111,12 +137,25 @@ static std::string HttpPostArrowIpcInternal(ClientContext &context,
 	if (!bearer_token.empty()) {
 		headers.Insert("Authorization", "Bearer " + bearer_token);
 	}
+	if (cookie_jar) {
+		auto cookie_header = cookie_jar->BuildCookieHeader();
+		if (!cookie_header.empty()) {
+			headers.Insert("Cookie", cookie_header);
+		}
+	}
 
 	PostRequestInfo post(url, headers, *params,
 	                     reinterpret_cast<const_data_ptr_t>(compressed_body.data()),
 	                     static_cast<idx_t>(compressed_body.size()));
 
 	out_response = http_util.Request(post);
+
+	if (cookie_jar && out_response) {
+		auto set_cookie_headers = CollectSetCookieHeaders(*out_response);
+		if (!set_cookie_headers.empty()) {
+			cookie_jar->UpdateFromSetCookie(set_cookie_headers, UrlIsHttps(url));
+		}
+	}
 
 	if (out_response->status == HTTPStatusCode::Unauthorized_401) {
 		// Return empty — caller handles 401
@@ -171,7 +210,8 @@ static std::string HttpPostArrowIpcInternal(ClientContext &context,
 std::string HttpPostArrowIpc(ClientContext &context,
                               const std::string &url,
                               const std::vector<uint8_t> &body,
-                              const std::shared_ptr<CatalogAuth> &auth) {
+                              const std::shared_ptr<CatalogAuth> &auth,
+                              const std::shared_ptr<SessionCookieJar> &cookie_jar) {
 	// Get cached token from per-catalog auth (if any)
 	std::string token;
 	if (auth) {
@@ -179,7 +219,7 @@ std::string HttpPostArrowIpc(ClientContext &context,
 	}
 
 	std::unique_ptr<HTTPResponse> response;
-	auto result = HttpPostArrowIpcInternal(context, url, body, token, response);
+	auto result = HttpPostArrowIpcInternal(context, url, body, token, cookie_jar, response);
 
 	if (response->status != HTTPStatusCode::Unauthorized_401) {
 		return result;
@@ -218,7 +258,7 @@ std::string HttpPostArrowIpc(ClientContext &context,
 	auto new_token = auth->HandleUnauthorized(*challenge, context);
 
 	// Retry with new token
-	result = HttpPostArrowIpcInternal(context, url, body, new_token, response);
+	result = HttpPostArrowIpcInternal(context, url, body, new_token, cookie_jar, response);
 	if (response->status == HTTPStatusCode::Unauthorized_401) {
 		throw IOException("VGI HTTP authentication failed after auth flow (HTTP 401) [url: %s]. "
 		                  "Response: %s", url, response->body);
@@ -231,7 +271,8 @@ UnaryResponseResult HttpInvokeUnary(ClientContext &context,
                                      const std::string &worker_path,
                                      const std::string &method_name,
                                      const std::shared_ptr<arrow::RecordBatch> &params,
-                                     const std::shared_ptr<CatalogAuth> &auth) {
+                                     const std::shared_ptr<CatalogAuth> &auth,
+                                     const std::shared_ptr<SessionCookieJar> &cookie_jar) {
 	std::string base_url = NormalizeBaseUrl(worker_path);
 	std::string url = base_url + "/" + method_name;
 
@@ -247,7 +288,7 @@ UnaryResponseResult HttpInvokeUnary(ClientContext &context,
 	}
 
 	// POST to {worker_path}/{method_name} using standard HTTP timeout
-	auto response_body = HttpPostArrowIpc(context, url, body, auth);
+	auto response_body = HttpPostArrowIpc(context, url, body, auth, cookie_jar);
 
 	// Parse the Arrow IPC response
 	auto result = ReadUnaryResponseFromBuffer(

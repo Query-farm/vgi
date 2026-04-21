@@ -42,6 +42,8 @@ struct VgiScalarFunctionInfo : public ScalarFunctionInfo {
 	const std::string &worker_path() const { return attach_params->worker_path(); }
 	bool worker_debug() const { return attach_params->worker_debug(); }
 	bool use_pool() const { return attach_params->use_pool(); }
+	const std::string &data_version_spec() const { return attach_params->data_version_spec(); }
+	const std::string &implementation_version() const { return attach_params->implementation_version(); }
 
 	// Schema info from catalog registration
 	std::shared_ptr<arrow::Schema> output_schema;  // Single "result" column
@@ -73,6 +75,8 @@ struct VgiScalarFunctionBindData : public FunctionData {
 	const std::string &worker_path() const { return attach_params->worker_path(); }
 	bool worker_debug() const { return attach_params->worker_debug(); }
 	bool use_pool() const { return attach_params->use_pool(); }
+	const std::string &data_version_spec() const { return attach_params->data_version_spec(); }
+	const std::string &implementation_version() const { return attach_params->implementation_version(); }
 
 	// Actual output schema resolved during bind (with concrete types)
 	std::shared_ptr<arrow::Schema> resolved_output_schema;

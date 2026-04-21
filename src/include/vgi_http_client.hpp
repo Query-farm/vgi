@@ -16,6 +16,8 @@ namespace vgi {
 
 // Forward declaration — full definition in vgi_oauth.hpp
 class CatalogAuth;
+// Forward declaration — full definition in vgi_cookie_jar.hpp
+class SessionCookieJar;
 
 // Content type for Arrow IPC streams over HTTP
 constexpr const char *ARROW_IPC_CONTENT_TYPE = "application/vnd.apache.arrow.stream";
@@ -24,20 +26,26 @@ constexpr const char *ARROW_IPC_CONTENT_TYPE = "application/vnd.apache.arrow.str
 // worker_path includes the prefix, e.g. "http://localhost:8000/vgi".
 // Posts to {worker_path}/{method_name}.
 // auth: per-catalog auth state for bearer token injection and 401 handling.
+// cookie_jar: per-catalog HTTP cookie store. Null skips Cookie / Set-Cookie
+// handling entirely. Non-null means request carries a Cookie header built
+// from the jar, and any Set-Cookie response headers update the jar.
 UnaryResponseResult HttpInvokeUnary(ClientContext &context,
                                      const std::string &worker_path,
                                      const std::string &method_name,
                                      const std::shared_ptr<arrow::RecordBatch> &params,
-                                     const std::shared_ptr<CatalogAuth> &auth = nullptr);
+                                     const std::shared_ptr<CatalogAuth> &auth = nullptr,
+                                     const std::shared_ptr<SessionCookieJar> &cookie_jar = nullptr);
 
 // POST Arrow IPC bytes to a URL, return raw response body bytes.
 // Used for catalog, stream init, and exchange operations.
 // Timeout is controlled by the vgi_http_timeout_seconds setting (default 300s).
 // auth: per-catalog auth state for bearer token injection and 401 handling.
+// cookie_jar: per-catalog HTTP cookie store (see HttpInvokeUnary).
 std::string HttpPostArrowIpc(ClientContext &context,
                               const std::string &url,
                               const std::vector<uint8_t> &body,
-                              const std::shared_ptr<CatalogAuth> &auth = nullptr);
+                              const std::shared_ptr<CatalogAuth> &auth = nullptr,
+                              const std::shared_ptr<SessionCookieJar> &cookie_jar = nullptr);
 
 // HTTP GET raw bytes from a URL. Used for fetching externalized batches.
 // Handles X-VGI-Content-Encoding: zstd decompression. No auth headers sent.

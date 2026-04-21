@@ -49,8 +49,11 @@ static UnaryResponseResult InvokeRpcMethod(const CatalogRpcContext &ctx, const s
 	                      ctx.params->worker_path(),
 	                      ctx.params->worker_debug(),
 	                      ctx.params->use_pool(),
+	                      ctx.params->data_version_spec(),
+	                      ctx.params->implementation_version(),
 	                      "rpc_catalog",
-	                      ctx.params->auth()};
+	                      ctx.params->auth(),
+	                      ctx.params->cookie_jar()};
 	return InvokePooledUnaryRpc(opts, method_name, params);
 }
 
@@ -80,25 +83,48 @@ static std::shared_ptr<arrow::RecordBatch> ExtractAndDeserializeResult(
 // Typed Catalog RPC Functions
 // ============================================================================
 
-std::vector<std::string> InvokeCatalogCatalogs(const std::string &worker_path, ClientContext &context,
-                                                bool worker_debug, bool use_pool) {
-	auto temp_params = std::make_shared<VgiAttachParameters>(worker_path, "", worker_debug, use_pool);
+std::vector<VgiCatalogInfo> InvokeCatalogs(const std::string &worker_path, ClientContext &context,
+                                            bool worker_debug, bool use_pool,
+                                            const std::shared_ptr<CatalogAuth> &auth) {
+	auto temp_params = std::make_shared<VgiAttachParameters>(worker_path, "", worker_debug, use_pool, auth);
 	CatalogRpcContext ctx{temp_params, {}, {}};
 	auto response = InvokeRpcMethod(ctx, "catalog_catalogs", nullptr, context);
 	auto result_batch = ExtractAndDeserializeResult(response, "catalog_catalogs", worker_path);
 	if (!result_batch) {
 		return {};
 	}
-	// Result is CatalogsResponse with items: list<utf8>
-	return UnwrapStringResponseItems(result_batch);
+
+	// Matches vgi-python's CatalogsResponse = _catalog_items_response(CatalogInfo):
+	// items is a list<binary>, each element is an IPC-serialized CatalogInfo batch
+	// with fields (name, implementation_version, data_version_spec).
+	auto item_bytes_list = UnwrapBinaryResponseItems(result_batch);
+	std::vector<VgiCatalogInfo> out;
+	out.reserve(item_bytes_list.size());
+	for (const auto &item_bytes : item_bytes_list) {
+		auto info_batch = DeserializeFromIpcBytes(item_bytes);
+		if (!info_batch || info_batch->num_rows() == 0) {
+			continue;
+		}
+		RecordBatchSingleRow row(info_batch, 0, "CatalogInfo", worker_path);
+		VgiCatalogInfo info;
+		info.name = row["name"].value_not_null<std::string>();
+		info.implementation_version = row["implementation_version"].value_or(std::string(""));
+		info.data_version_spec = row["data_version_spec"].value_or(std::string(""));
+		out.push_back(std::move(info));
+	}
+	return out;
 }
 
 CatalogAttachResult InvokeCatalogAttach(const std::string &worker_path, const std::string &catalog_name,
                                         ClientContext &context, bool worker_debug, bool use_pool,
-                                        const std::shared_ptr<CatalogAuth> &auth) {
-	auto temp_params = std::make_shared<VgiAttachParameters>(worker_path, "", worker_debug, use_pool, auth);
+                                        const std::shared_ptr<CatalogAuth> &auth,
+                                        const std::string &data_version_spec,
+                                        const std::string &implementation_version,
+                                        const std::shared_ptr<SessionCookieJar> &cookie_jar) {
+	auto temp_params = std::make_shared<VgiAttachParameters>(worker_path, "", worker_debug, use_pool, auth,
+	                                                         data_version_spec, implementation_version, cookie_jar);
 	CatalogRpcContext ctx{temp_params, {}, {}};
-	auto params = BuildCatalogAttachParams(catalog_name);
+	auto params = BuildCatalogAttachParams(catalog_name, data_version_spec, implementation_version);
 	auto response = InvokeRpcMethod(ctx, "catalog_attach", params, context);
 	auto result_batch = ExtractAndDeserializeResult(response, "catalog_attach", worker_path);
 	if (!result_batch) {
@@ -1187,6 +1213,11 @@ CatalogAttachResult ParseCatalogAttachResult(const std::shared_ptr<arrow::Record
 
 	// Parse column statistics capability flag (backward-compatible)
 	result.supports_column_statistics = row["supports_column_statistics"].value_or(false);
+
+	// Resolved versions (empty when the worker has no opinion or the request
+	// omitted a constraint)
+	result.resolved_data_version = row["resolved_data_version"].value_or(std::string(""));
+	result.resolved_implementation_version = row["resolved_implementation_version"].value_or(std::string(""));
 
 	return result;
 }

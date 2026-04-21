@@ -49,6 +49,7 @@ src/vgi_bind_protocol.cpp
 src/vgi_transport.cpp
 src/vgi_http_client.cpp
 src/vgi_http_function_connection.cpp
+src/vgi_cookie_jar.cpp
 src/vgi_oauth.cpp
 src/vgi_catalogs.cpp
 src/vgi_table_function.cpp

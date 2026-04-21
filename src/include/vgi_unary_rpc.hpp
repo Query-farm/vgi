@@ -14,6 +14,8 @@ namespace vgi {
 
 // Forward declaration — full definition in vgi_oauth.hpp
 class CatalogAuth;
+// Forward declaration — full definition in vgi_cookie_jar.hpp
+class SessionCookieJar;
 
 // Options for a pooled unary RPC invocation.
 // context outlives the call; worker_path/phase may be string_view-like but we
@@ -23,11 +25,20 @@ struct UnaryRpcOptions {
 	std::string worker_path;
 	bool worker_debug = false;
 	bool use_pool = true;
+	// Additional pool-key dimensions. A pooled worker may only be reused when
+	// all three of (worker_path, data_version_spec, implementation_version)
+	// match — otherwise a worker attached at one version could silently serve
+	// another version's query.
+	std::string data_version_spec;
+	std::string implementation_version;
 	// Logged via VGI_LOG on acquire/release events (e.g. "rpc_catalog",
 	// "aggregate_update"). Helps distinguish pool traffic by caller.
 	std::string phase;
 	// Forwarded to HttpInvokeUnary for HTTP transport. Ignored for subprocess.
 	std::shared_ptr<CatalogAuth> auth;
+	// HTTP cookie jar for sticky-session routing. Null on subprocess transport
+	// and for pre-attach RPCs that have no per-catalog state yet.
+	std::shared_ptr<SessionCookieJar> cookie_jar;
 	// When false, the RPC path skips all VGI_LOG calls (pool acquire/release,
 	// stale events) and skips StderrDrainer::DrainToLog. Set false only for
 	// best-effort calls that run off the main thread during pipeline teardown
