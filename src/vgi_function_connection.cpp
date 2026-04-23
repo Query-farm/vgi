@@ -307,6 +307,7 @@ InitResult FunctionConnection::PerformInit(const std::vector<int32_t> &projectio
 
 	// Build RPC params and send request
 	auto rpc_params = BuildInitRpcParams(init_request_bytes);
+	ValidateRequestSchema(rpc_params, "init", worker_path_);
 	try {
 		WriteRpcRequest(proc_->GetStdinFd(), "init", rpc_params);
 	} catch (const IOException &e) {

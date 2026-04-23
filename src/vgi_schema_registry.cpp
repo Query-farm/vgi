@@ -138,6 +138,9 @@ const std::unordered_map<std::string, ResponseSchema> &Registry() {
 		     "raw IPC sparse-union min/max batch; schema varies per column type"},
 		    {"table_function_statistics",
 		     "Optional[bytes] of per-function IPC statistics; schema is function-specific"},
+		    {"init",
+		     "stream method; response framed as a stream header plus data frames, "
+		     "not a single unary result batch"},
 		};
 		for (const auto &entry : kDynamicResponses) {
 			m[entry.name] = ResponseSchema{nullptr, nullptr, true, entry.reason};
@@ -201,6 +204,7 @@ const std::unordered_map<std::string, ResponseSchema> &Registry() {
 		    {"catalog_index_create", &CatalogIndexCreateParamsSchema},
 		    {"catalog_index_drop", &CatalogIndexDropParamsSchema},
 		    {"bind", &BindParamsSchema},
+		    {"init", &InitParamsSchema},
 		    {"table_function_cardinality", &TableFunctionCardinalityParamsSchema},
 		    {"table_function_statistics", &TableFunctionStatisticsParamsSchema},
 		    {"aggregate_bind", &AggregateBindParamsSchema},
