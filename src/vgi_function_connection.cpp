@@ -11,6 +11,7 @@
 #include "vgi_logging.hpp"
 #include "vgi_rpc_client.hpp"
 #include "vgi_rpc_types.hpp"
+#include "vgi_schema_registry.hpp"
 #include "vgi_transport.hpp"
 
 namespace duckdb {
@@ -221,7 +222,9 @@ BindResult FunctionConnection::PerformBindFull() {
 		}
 
 		auto v = bin_array->GetView(0);
-		return DeserializeFromIpcBytes(reinterpret_cast<const uint8_t *>(v.data()), v.size());
+		auto bind_batch = DeserializeFromIpcBytes(reinterpret_cast<const uint8_t *>(v.data()), v.size());
+		ValidateResponseSchema(bind_batch, "bind", worker_path_);
+		return bind_batch;
 	};
 
 	bind_result_ = PerformBindProtocol(context_, function_name_, function_type_,

@@ -679,16 +679,6 @@ std::unordered_map<std::string, unique_ptr<BaseStatistics>> InvokeTableFunctionS
     const std::string &function_name, ClientContext &context);
 
 // ============================================================================
-// Function Invocation API
-// ============================================================================
-
-// Get function metadata from a VGI worker.
-// Calls the "catalog_function_get" RPC method and parses the result.
-VgiFunctionInfo GetFunctionInfo(const CatalogRpcContext &ctx,
-                                const std::string &schema_name, const std::string &function_name,
-                                ClientContext &context);
-
-// ============================================================================
 // Secret Extraction from DuckDB SecretManager
 // ============================================================================
 

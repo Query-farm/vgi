@@ -126,7 +126,13 @@ unique_ptr<FunctionData> VgiAggregateFunctionBind(ClientContext &context, Aggreg
 // ============================================================================
 
 struct AggregateRpcResult {
+	// Outer vgi_rpc unary envelope: {result: Binary}. Legacy callers still use
+	// this and manually unwrap.
 	std::shared_ptr<arrow::RecordBatch> response_batch;
+	// Inner response batch, already unwrapped from the envelope and validated
+	// against the method's registered schema. May be null if the envelope's
+	// result column is null or the batch is empty. New code should prefer this.
+	std::shared_ptr<arrow::RecordBatch> inner_batch;
 };
 
 // Wrap a request batch in the standard vgi_rpc envelope: {request: binary}.

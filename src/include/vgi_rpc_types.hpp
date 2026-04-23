@@ -167,6 +167,15 @@ std::vector<std::vector<uint8_t>> UnwrapBinaryResponseItems(const std::shared_pt
 // Unwrap string items (for CatalogsResponse which has items: list<str>)
 std::vector<std::string> UnwrapStringResponseItems(const std::shared_ptr<arrow::RecordBatch> &batch);
 
+// Unwrap items, deserialize each to a RecordBatch, and validate each item's
+// schema against the registered item_schema for `method_name`. Zero-row items
+// are skipped. Throws IOException on item schema mismatch (see
+// ValidateItemSchema in vgi_schema_registry.hpp for the error format).
+std::vector<std::shared_ptr<arrow::RecordBatch>>
+UnwrapAndValidateItems(const std::shared_ptr<arrow::RecordBatch> &batch,
+                       const std::string &method_name,
+                       const std::string &worker_path);
+
 // ============================================================================
 // RPC Params Builders for Catalog Methods
 // ============================================================================

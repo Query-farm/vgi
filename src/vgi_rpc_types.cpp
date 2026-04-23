@@ -2,6 +2,7 @@
 
 #include "duckdb/common/exception.hpp"
 #include "vgi_arrow_ipc.hpp"
+#include "vgi_schema_registry.hpp"
 
 namespace duckdb {
 namespace vgi {
@@ -640,33 +641,9 @@ std::vector<std::vector<uint8_t>> UnwrapBinaryResponseItems(const std::shared_pt
 		return items;
 	}
 
-	auto items_col = batch->GetColumnByName("items");
-	if (!items_col) {
-		throw IOException(
-		    "RPC response batch is missing required 'items' column (schema=%s). "
-		    "Expected a column of type List<Binary> where each element is an IPC-serialized info batch.",
-		    batch->schema()->ToString());
-	}
-
-	auto list_array = std::dynamic_pointer_cast<arrow::ListArray>(items_col);
-	if (!list_array) {
-		throw IOException(
-		    "RPC response 'items' column has type %s, expected List<Binary>. "
-		    "Each element must be an IPC-serialized info batch. This usually indicates the worker "
-		    "returned an out-of-date response shape.",
-		    items_col->type()->ToString());
-	}
+	auto list_array = std::static_pointer_cast<arrow::ListArray>(batch->GetColumnByName("items"));
 	if (list_array->IsNull(0)) {
 		return items;
-	}
-
-	auto inner_type_id = list_array->values()->type()->id();
-	if (inner_type_id != arrow::Type::BINARY) {
-		throw IOException(
-		    "RPC response 'items' column has inner type %s, expected Binary. "
-		    "Each element must be an IPC-serialized info batch (List<Binary>). This usually indicates "
-		    "the worker returned an out-of-date response shape (e.g. List<Utf8> of names only).",
-		    list_array->values()->type()->ToString());
 	}
 
 	auto start = list_array->value_offset(0);
@@ -683,6 +660,23 @@ std::vector<std::vector<uint8_t>> UnwrapBinaryResponseItems(const std::shared_pt
 	return items;
 }
 
+std::vector<std::shared_ptr<arrow::RecordBatch>>
+UnwrapAndValidateItems(const std::shared_ptr<arrow::RecordBatch> &batch, const std::string &method_name,
+                       const std::string &worker_path) {
+	auto bytes_list = UnwrapBinaryResponseItems(batch);
+	std::vector<std::shared_ptr<arrow::RecordBatch>> items;
+	items.reserve(bytes_list.size());
+	for (size_t i = 0; i < bytes_list.size(); i++) {
+		auto info_batch = DeserializeFromIpcBytes(bytes_list[i]);
+		if (!info_batch || info_batch->num_rows() == 0) {
+			continue;
+		}
+		ValidateItemSchema(info_batch, method_name, worker_path, i);
+		items.push_back(std::move(info_batch));
+	}
+	return items;
+}
+
 std::vector<std::string> UnwrapStringResponseItems(const std::shared_ptr<arrow::RecordBatch> &batch) {
 	std::vector<std::string> items;
 
@@ -690,27 +684,9 @@ std::vector<std::string> UnwrapStringResponseItems(const std::shared_ptr<arrow::
 		return items;
 	}
 
-	auto items_col = batch->GetColumnByName("items");
-	if (!items_col) {
-		throw IOException(
-		    "RPC response batch is missing required 'items' column (schema=%s). "
-		    "Expected a column of type List<Utf8>.",
-		    batch->schema()->ToString());
-	}
-
-	auto list_array = std::dynamic_pointer_cast<arrow::ListArray>(items_col);
-	if (!list_array) {
-		throw IOException("RPC response 'items' column has type %s, expected List<Utf8>.",
-		                  items_col->type()->ToString());
-	}
+	auto list_array = std::static_pointer_cast<arrow::ListArray>(batch->GetColumnByName("items"));
 	if (list_array->IsNull(0)) {
 		return items;
-	}
-
-	auto inner_type_id = list_array->values()->type()->id();
-	if (inner_type_id != arrow::Type::STRING) {
-		throw IOException("RPC response 'items' column has inner type %s, expected Utf8.",
-		                  list_array->values()->type()->ToString());
 	}
 
 	auto start = list_array->value_offset(0);
@@ -808,21 +784,23 @@ std::shared_ptr<arrow::RecordBatch> BuildInitRpcParams(const std::vector<uint8_t
 std::shared_ptr<arrow::RecordBatch> BuildCatalogAttachParams(const std::string &name,
                                                              const std::string &data_version_spec,
                                                              const std::string &implementation_version) {
-	// Build the CatalogAttachRequest dataclass batch matching the vgi-python
-	// definition: name, options, data_version_spec, implementation_version.
-	// options is always null here — catalog-specific options use a separate
-	// path that hasn't been wired from the extension yet.
+	// Matches vgi-python's CatalogAttachRequest (vgi/protocol.py:193). The
+	// pyarrow-inferred wire schema marks `options` as not null (even though
+	// the dataclass defaults it to None) and `data_version_spec` /
+	// `implementation_version` as nullable. Empty caller-supplied strings
+	// must be encoded as null — the worker treats None as "unconstrained",
+	// while "" is a concrete (and invalid) version string.
 	auto request_schema = arrow::schema({
 	    arrow::field("name", arrow::utf8(), false),
-	    arrow::field("options", arrow::binary(), true),
-	    arrow::field("data_version_spec", arrow::utf8(), false),
-	    arrow::field("implementation_version", arrow::utf8(), false),
+	    arrow::field("options", arrow::binary(), false),
+	    arrow::field("data_version_spec", arrow::utf8(), true),
+	    arrow::field("implementation_version", arrow::utf8(), true),
 	});
 	std::vector<std::shared_ptr<arrow::Array>> request_arrays;
 	request_arrays.push_back(BuildStringScalar(name));
 	request_arrays.push_back(BuildBinaryScalar({}));
-	request_arrays.push_back(BuildStringScalar(data_version_spec));
-	request_arrays.push_back(BuildStringScalar(implementation_version));
+	request_arrays.push_back(BuildNullableStringScalar(data_version_spec));
+	request_arrays.push_back(BuildNullableStringScalar(implementation_version));
 	auto request_batch = arrow::RecordBatch::Make(request_schema, 1, request_arrays);
 
 	// Serialize to IPC bytes (matching ArrowSerializableDataclass.serialize_to_bytes())

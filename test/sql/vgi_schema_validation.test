@@ -1,0 +1,36 @@
+# name: test/sql/vgi_schema_validation.test
+# description: Regression sentinel for the RPC response-schema registry
+#              (src/vgi_schema_registry.cpp). Every method listed below
+#              has a strict schema in the registry; if a schema definition
+#              drifts from vgi-python's Protocol, one of these statements
+#              will fail with a "RPC response schema mismatch" IOException.
+# group: [vgi]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+# --- List-of-binary responses (12 methods share this shape) -----------------
+# Exercises: catalog_catalogs
+query I
+SELECT count(*) >= 0 FROM vgi_catalogs('${VGI_TEST_WORKER}');
+----
+true
+
+# ATTACH exercises: catalog_attach (14-field struct with Map<Utf8,Utf8> tags),
+# catalog_version (Int64), catalog_schemas (List<Binary>).
+statement ok
+ATTACH 'example' AS vgi_schema_test (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# catalog_schema_contents_tables / _views / _functions / _macros flow through
+# information_schema and the catalog binder.
+query II rowsort
+SELECT catalog_name, schema_name
+FROM information_schema.schemata
+WHERE catalog_name = 'vgi_schema_test';
+----
+vgi_schema_test	data
+vgi_schema_test	main
+
+statement ok
+DETACH vgi_schema_test;

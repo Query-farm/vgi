@@ -7,6 +7,7 @@
 #include "vgi_logging.hpp"
 #include "vgi_rpc_client.hpp"
 #include "vgi_rpc_types.hpp"
+#include "vgi_schema_registry.hpp"
 #include "vgi_subprocess.hpp"
 #include "vgi_transport.hpp"
 #include "vgi_unary_rpc.hpp"
@@ -323,7 +324,37 @@ AggregateRpcResult InvokeAggregateRpc(ClientContext &context, const VgiAggregate
 	                      bind_data.attach_params->cookie_jar(),
 	                      enable_logging};
 	auto response = InvokePooledUnaryRpc(opts, method_name, params);
-	return {response.batch};
+
+	// Outer envelope unwrap + schema validation against the registry.
+	// The registered schema for aggregate_* methods follows vgi-python's
+	// Aggregate*Response dataclasses.
+	std::shared_ptr<arrow::RecordBatch> inner;
+	const auto &worker_path = bind_data.attach_params->worker_path();
+	if (response.batch && response.batch->num_rows() > 0) {
+		auto result_col = response.batch->GetColumnByName("result");
+		if (!result_col) {
+			throw IOException("Response missing 'result' column from %s [worker: %s]", method_name,
+			                  worker_path);
+		}
+		if (result_col->type()->id() != arrow::Type::BINARY) {
+			throw IOException(
+			    "Response 'result' column from %s has type %s, expected Binary [worker: %s]",
+			    method_name, result_col->type()->ToString(), worker_path);
+		}
+		auto bin = std::static_pointer_cast<arrow::BinaryArray>(result_col);
+		if (!bin->IsNull(0)) {
+			auto v = bin->GetView(0);
+			try {
+				inner = DeserializeFromIpcBytes(reinterpret_cast<const uint8_t *>(v.data()),
+				                                v.size());
+			} catch (const std::exception &e) {
+				throw IOException("Failed to deserialize IPC response for %s [worker: %s]: %s",
+				                  method_name, worker_path, e.what());
+			}
+		}
+	}
+	ValidateResponseSchema(inner, method_name, worker_path);
+	return {response.batch, inner};
 }
 
 // ============================================================================

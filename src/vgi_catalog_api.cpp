@@ -23,6 +23,7 @@
 #include "vgi_protocol_constants.hpp"
 #include "vgi_rpc_client.hpp"
 #include "vgi_rpc_types.hpp"
+#include "vgi_schema_registry.hpp"
 #include "vgi_transport.hpp"
 #include "vgi_unary_rpc.hpp"
 #include "yyjson.hpp"
@@ -61,29 +62,51 @@ static UnaryResponseResult InvokeRpcMethod(const CatalogRpcContext &ctx, const s
 // then deserialize to a RecordBatch.
 static std::shared_ptr<arrow::RecordBatch> ExtractAndDeserializeResult(
     const UnaryResponseResult &response, const std::string &method_name, const std::string &worker_path) {
-	if (!response.batch || response.batch->num_rows() == 0) {
-		return nullptr;
+	std::shared_ptr<arrow::RecordBatch> result;
+
+	if (response.batch && response.batch->num_rows() != 0) {
+		auto result_col = response.batch->GetColumnByName("result");
+		if (!result_col) {
+			throw IOException("Response missing 'result' column from %s [worker: %s]", method_name, worker_path);
+		}
+		// The outer envelope column must be Binary (not Utf8 or any other type).
+		// Use type-id comparison instead of dynamic_pointer_cast<BinaryArray>:
+		// arrow::StringArray derives from arrow::BinaryArray, so the cast would
+		// silently accept a String-typed column and feed raw UTF-8 bytes into
+		// DeserializeFromIpcBytes — an invariant we must enforce here.
+		if (result_col->type()->id() != arrow::Type::BINARY) {
+			throw IOException(
+			    "Response 'result' column from %s has type %s, expected Binary [worker: %s]. "
+			    "The vgi-rpc unary envelope must wrap the inner IPC payload in a Binary column.",
+			    method_name, result_col->type()->ToString(), worker_path);
+		}
+		auto binary_array = std::static_pointer_cast<arrow::BinaryArray>(result_col);
+		if (!binary_array->IsNull(0)) {
+			auto view = binary_array->GetView(0);
+			try {
+				result =
+				    DeserializeFromIpcBytes(reinterpret_cast<const uint8_t *>(view.data()), view.size());
+			} catch (const std::exception &e) {
+				throw IOException(
+				    "Failed to deserialize IPC response for %s from worker [worker: %s]: %s. "
+				    "The worker likely returned a malformed or out-of-date response shape for this method.",
+				    method_name, worker_path, e.what());
+			}
+		}
 	}
 
-	auto result_col = response.batch->GetColumnByName("result");
-	if (!result_col) {
-		throw IOException("Response missing 'result' column from %s [worker: %s]", method_name, worker_path);
-	}
+	ValidateResponseSchema(result, method_name, worker_path);
+	return result;
+}
 
-	auto binary_array = std::dynamic_pointer_cast<arrow::BinaryArray>(result_col);
-	if (!binary_array || binary_array->IsNull(0)) {
-		return nullptr;
-	}
-
-	auto view = binary_array->GetView(0);
-	try {
-		return DeserializeFromIpcBytes(reinterpret_cast<const uint8_t *>(view.data()), view.size());
-	} catch (const std::exception &e) {
-		throw IOException(
-		    "Failed to deserialize IPC response for %s from worker [worker: %s]: %s. "
-		    "The worker likely returned a malformed or out-of-date response shape for this method.",
-		    method_name, worker_path, e.what());
-	}
+// Invoke a void-response RPC. After dispatch, run the response through the
+// schema registry to catch drift: the worker must return an empty envelope
+// (or empty inner batch) for methods registered as void. Any payload triggers
+// a clear mismatch error instead of being silently discarded.
+static void InvokeVoidRpc(const CatalogRpcContext &ctx, const std::string &method_name,
+                          const std::shared_ptr<arrow::RecordBatch> &params, ClientContext &context) {
+	auto response = InvokeRpcMethod(ctx, method_name, params, context);
+	ExtractAndDeserializeResult(response, method_name, ctx.params->worker_path());
 }
 
 // ============================================================================
@@ -101,17 +124,13 @@ std::vector<VgiCatalogInfo> InvokeCatalogs(const std::string &worker_path, Clien
 		return {};
 	}
 
-	// Matches vgi-python's CatalogsResponse = _catalog_items_response(CatalogInfo):
-	// items is a list<binary>, each element is an IPC-serialized CatalogInfo batch
-	// with fields (name, implementation_version, data_version_spec).
-	auto item_bytes_list = UnwrapBinaryResponseItems(result_batch);
+	// CatalogsResponse = {items: List<Binary>} — each item is an IPC-serialized
+	// CatalogInfo batch. Both outer and item schemas are validated by the
+	// schema registry; see vgi-python/vgi/catalog/catalog_interface.py:CatalogInfo.
+	auto info_batches = UnwrapAndValidateItems(result_batch, "catalog_catalogs", worker_path);
 	std::vector<VgiCatalogInfo> out;
-	out.reserve(item_bytes_list.size());
-	for (const auto &item_bytes : item_bytes_list) {
-		auto info_batch = DeserializeFromIpcBytes(item_bytes);
-		if (!info_batch || info_batch->num_rows() == 0) {
-			continue;
-		}
+	out.reserve(info_batches.size());
+	for (const auto &info_batch : info_batches) {
 		RecordBatchSingleRow row(info_batch, 0, "CatalogInfo", worker_path);
 		VgiCatalogInfo info;
 		info.name = row["name"].value_not_null<std::string>();
@@ -149,11 +168,10 @@ std::vector<VgiSchemaInfo> InvokeCatalogSchemas(const CatalogRpcContext &ctx, Cl
 		return {};
 	}
 
-	// Result is a SchemasResponse with items: list<binary>
-	auto item_bytes_list = UnwrapBinaryResponseItems(result_batch);
+	auto info_batches = UnwrapAndValidateItems(result_batch, "catalog_schemas", worker_path);
 	std::vector<VgiSchemaInfo> schemas;
-	for (const auto &item_bytes : item_bytes_list) {
-		auto info_batch = DeserializeFromIpcBytes(item_bytes);
+	schemas.reserve(info_batches.size());
+	for (const auto &info_batch : info_batches) {
 		schemas.push_back(ParseSchemaInfo(info_batch, worker_path));
 	}
 	return schemas;
@@ -169,10 +187,10 @@ std::vector<VgiTableInfo> InvokeCatalogSchemaContentsTables(const CatalogRpcCont
 		return {};
 	}
 
-	auto item_bytes_list = UnwrapBinaryResponseItems(result_batch);
+	auto info_batches = UnwrapAndValidateItems(result_batch, "catalog_schema_contents_tables", worker_path);
 	std::vector<VgiTableInfo> tables;
-	for (const auto &item_bytes : item_bytes_list) {
-		auto info_batch = DeserializeFromIpcBytes(item_bytes);
+	tables.reserve(info_batches.size());
+	for (const auto &info_batch : info_batches) {
 		tables.push_back(ParseTableInfo(info_batch, worker_path));
 	}
 	return tables;
@@ -188,10 +206,10 @@ std::vector<VgiViewInfo> InvokeCatalogSchemaContentsViews(const CatalogRpcContex
 		return {};
 	}
 
-	auto item_bytes_list = UnwrapBinaryResponseItems(result_batch);
+	auto info_batches = UnwrapAndValidateItems(result_batch, "catalog_schema_contents_views", worker_path);
 	std::vector<VgiViewInfo> views;
-	for (const auto &item_bytes : item_bytes_list) {
-		auto info_batch = DeserializeFromIpcBytes(item_bytes);
+	views.reserve(info_batches.size());
+	for (const auto &info_batch : info_batches) {
 		views.push_back(ParseViewInfo(info_batch, worker_path));
 	}
 	return views;
@@ -208,10 +226,10 @@ std::vector<VgiFunctionInfo> InvokeCatalogSchemaContentsFunctions(
 		return {};
 	}
 
-	auto item_bytes_list = UnwrapBinaryResponseItems(result_batch);
+	auto info_batches = UnwrapAndValidateItems(result_batch, "catalog_schema_contents_functions", worker_path);
 	std::vector<VgiFunctionInfo> functions;
-	for (const auto &item_bytes : item_bytes_list) {
-		auto info_batch = DeserializeFromIpcBytes(item_bytes);
+	functions.reserve(info_batches.size());
+	for (const auto &info_batch : info_batches) {
 		functions.push_back(ParseFunctionInfo(info_batch, 0, worker_path));
 	}
 	return functions;
@@ -228,10 +246,10 @@ std::vector<VgiMacroInfo> InvokeCatalogSchemaContentsMacros(
 		return {};
 	}
 
-	auto item_bytes_list = UnwrapBinaryResponseItems(result_batch);
+	auto info_batches = UnwrapAndValidateItems(result_batch, "catalog_schema_contents_macros", worker_path);
 	std::vector<VgiMacroInfo> macros;
-	for (const auto &item_bytes : item_bytes_list) {
-		auto info_batch = DeserializeFromIpcBytes(item_bytes);
+	macros.reserve(info_batches.size());
+	for (const auto &info_batch : info_batches) {
 		macros.push_back(ParseMacroInfo(info_batch, worker_path));
 	}
 	return macros;
@@ -249,12 +267,11 @@ std::optional<VgiTableInfo> InvokeCatalogTableGet(const CatalogRpcContext &ctx,
 	}
 
 	// Result is TablesResponse with items: list<binary> (0 or 1 items)
-	auto item_bytes_list = UnwrapBinaryResponseItems(result_batch);
-	if (item_bytes_list.empty()) {
+	auto info_batches = UnwrapAndValidateItems(result_batch, "catalog_table_get", worker_path);
+	if (info_batches.empty()) {
 		return std::nullopt;
 	}
-	auto info_batch = DeserializeFromIpcBytes(item_bytes_list[0]);
-	return ParseTableInfo(info_batch, worker_path);
+	return ParseTableInfo(info_batches[0], worker_path);
 }
 
 std::optional<VgiTableInfo> InvokeCatalogTableGet(const CatalogRpcContext &ctx,
@@ -269,12 +286,11 @@ std::optional<VgiTableInfo> InvokeCatalogTableGet(const CatalogRpcContext &ctx,
 		return std::nullopt;
 	}
 
-	auto item_bytes_list = UnwrapBinaryResponseItems(result_batch);
-	if (item_bytes_list.empty()) {
+	auto info_batches = UnwrapAndValidateItems(result_batch, "catalog_table_get", worker_path);
+	if (info_batches.empty()) {
 		return std::nullopt;
 	}
-	auto info_batch = DeserializeFromIpcBytes(item_bytes_list[0]);
-	return ParseTableInfo(info_batch, worker_path);
+	return ParseTableInfo(info_batches[0], worker_path);
 }
 
 std::optional<VgiViewInfo> InvokeCatalogViewGet(const CatalogRpcContext &ctx,
@@ -289,12 +305,11 @@ std::optional<VgiViewInfo> InvokeCatalogViewGet(const CatalogRpcContext &ctx,
 	}
 
 	// Result is ViewsResponse with items: list<binary> (0 or 1 items)
-	auto item_bytes_list = UnwrapBinaryResponseItems(result_batch);
-	if (item_bytes_list.empty()) {
+	auto info_batches = UnwrapAndValidateItems(result_batch, "catalog_view_get", worker_path);
+	if (info_batches.empty()) {
 		return std::nullopt;
 	}
-	auto info_batch = DeserializeFromIpcBytes(item_bytes_list[0]);
-	return ParseViewInfo(info_batch, worker_path);
+	return ParseViewInfo(info_batches[0], worker_path);
 }
 
 VgiScanFunctionResult InvokeCatalogTableScanFunctionGet(
@@ -385,12 +400,12 @@ std::vector<uint8_t> InvokeCatalogTransactionBegin(const CatalogRpcContext &ctx,
 
 void InvokeCatalogTransactionCommit(const CatalogRpcContext &ctx, ClientContext &context) {
 	auto params = BuildTransactionParams(ctx.attach_id, ctx.transaction_id);
-	InvokeRpcMethod(ctx, "catalog_transaction_commit", params, context);
+	InvokeVoidRpc(ctx, "catalog_transaction_commit", params, context);
 }
 
 void InvokeCatalogTransactionRollback(const CatalogRpcContext &ctx, ClientContext &context) {
 	auto params = BuildTransactionParams(ctx.attach_id, ctx.transaction_id);
-	InvokeRpcMethod(ctx, "catalog_transaction_rollback", params, context);
+	InvokeVoidRpc(ctx, "catalog_transaction_rollback", params, context);
 }
 
 // ============================================================================
@@ -411,7 +426,7 @@ void InvokeCatalogTableCreate(
 	auto params = BuildTableCreateParams(ctx.attach_id, schema_name, table_name, columns_schema, on_conflict,
 	                                     not_null_constraints, unique_constraints, check_constraints,
 	                                     primary_key_constraints, foreign_key_constraints, ctx.transaction_id);
-	InvokeRpcMethod(ctx, "catalog_table_create", params, context);
+	InvokeVoidRpc(ctx, "catalog_table_create", params, context);
 }
 
 void InvokeCatalogTableDrop(
@@ -420,7 +435,7 @@ void InvokeCatalogTableDrop(
     bool ignore_not_found, bool cascade,
     ClientContext &context) {
 	auto params = BuildTableDropParams(ctx.attach_id, schema_name, table_name, ignore_not_found, cascade, ctx.transaction_id);
-	InvokeRpcMethod(ctx, "catalog_table_drop", params, context);
+	InvokeVoidRpc(ctx, "catalog_table_drop", params, context);
 }
 
 void InvokeCatalogTableRename(
@@ -429,7 +444,7 @@ void InvokeCatalogTableRename(
     const std::string &new_name, bool ignore_not_found,
     ClientContext &context) {
 	auto params = BuildTableRenameParams(ctx.attach_id, schema_name, table_name, new_name, ignore_not_found, ctx.transaction_id);
-	InvokeRpcMethod(ctx, "catalog_table_rename", params, context);
+	InvokeVoidRpc(ctx, "catalog_table_rename", params, context);
 }
 
 void InvokeCatalogTableColumnAdd(
@@ -441,7 +456,7 @@ void InvokeCatalogTableColumnAdd(
 	auto column_bytes = SerializeSchemaToIpcBytes(column_definition);
 	auto params = BuildTableColumnAddParams(ctx.attach_id, schema_name, table_name, column_bytes,
 	                                        if_column_not_exists, false /* ignore_not_found */, ctx.transaction_id);
-	InvokeRpcMethod(ctx, "catalog_table_column_add", params, context);
+	InvokeVoidRpc(ctx, "catalog_table_column_add", params, context);
 }
 
 void InvokeCatalogTableColumnDrop(
@@ -451,7 +466,7 @@ void InvokeCatalogTableColumnDrop(
     ClientContext &context) {
 	auto params = BuildTableColumnDropParams(ctx.attach_id, schema_name, table_name, column_name,
 	                                         if_column_exists, false /* ignore_not_found */, cascade, ctx.transaction_id);
-	InvokeRpcMethod(ctx, "catalog_table_column_drop", params, context);
+	InvokeVoidRpc(ctx, "catalog_table_column_drop", params, context);
 }
 
 void InvokeCatalogTableColumnRename(
@@ -461,7 +476,7 @@ void InvokeCatalogTableColumnRename(
     ClientContext &context) {
 	auto params = BuildTableColumnRenameParams(ctx.attach_id, schema_name, table_name, old_column_name, new_column_name,
 	                                           false /* ignore_not_found */, ctx.transaction_id);
-	InvokeRpcMethod(ctx, "catalog_table_column_rename", params, context);
+	InvokeVoidRpc(ctx, "catalog_table_column_rename", params, context);
 }
 
 void InvokeCatalogTableCommentSet(
@@ -472,7 +487,7 @@ void InvokeCatalogTableCommentSet(
     ClientContext &context) {
 	auto params = BuildTableCommentSetParams(ctx.attach_id, schema_name, table_name, comment, comment_is_null,
 	                                          ignore_not_found, ctx.transaction_id);
-	InvokeRpcMethod(ctx, "catalog_table_comment_set", params, context);
+	InvokeVoidRpc(ctx, "catalog_table_comment_set", params, context);
 }
 
 void InvokeCatalogTableColumnCommentSet(
@@ -484,7 +499,7 @@ void InvokeCatalogTableColumnCommentSet(
     ClientContext &context) {
 	auto params = BuildTableColumnCommentSetParams(ctx.attach_id, schema_name, table_name, column_name,
 	                                                comment, comment_is_null, ignore_not_found, ctx.transaction_id);
-	InvokeRpcMethod(ctx, "catalog_table_column_comment_set", params, context);
+	InvokeVoidRpc(ctx, "catalog_table_column_comment_set", params, context);
 }
 
 void InvokeCatalogTableColumnTypeChange(
@@ -496,7 +511,7 @@ void InvokeCatalogTableColumnTypeChange(
 	auto column_bytes = SerializeSchemaToIpcBytes(column_definition);
 	auto params = BuildTableColumnTypeChangeParams(ctx.attach_id, schema_name, table_name, column_bytes,
 	                                               expression, false /* ignore_not_found */, ctx.transaction_id);
-	InvokeRpcMethod(ctx, "catalog_table_column_type_change", params, context);
+	InvokeVoidRpc(ctx, "catalog_table_column_type_change", params, context);
 }
 
 void InvokeCatalogTableColumnDefaultSet(
@@ -506,7 +521,7 @@ void InvokeCatalogTableColumnDefaultSet(
     ClientContext &context) {
 	auto params = BuildTableColumnDefaultSetParams(ctx.attach_id, schema_name, table_name, column_name,
 	                                               expression, false /* ignore_not_found */, ctx.transaction_id);
-	InvokeRpcMethod(ctx, "catalog_table_column_default_set", params, context);
+	InvokeVoidRpc(ctx, "catalog_table_column_default_set", params, context);
 }
 
 void InvokeCatalogTableColumnDefaultDrop(
@@ -516,7 +531,7 @@ void InvokeCatalogTableColumnDefaultDrop(
     ClientContext &context) {
 	auto params = BuildTableColumnDefaultDropParams(ctx.attach_id, schema_name, table_name, column_name,
 	                                                false /* ignore_not_found */, ctx.transaction_id);
-	InvokeRpcMethod(ctx, "catalog_table_column_default_drop", params, context);
+	InvokeVoidRpc(ctx, "catalog_table_column_default_drop", params, context);
 }
 
 void InvokeCatalogTableNotNullSet(
@@ -526,7 +541,7 @@ void InvokeCatalogTableNotNullSet(
     ClientContext &context) {
 	auto params = BuildTableNotNullSetParams(ctx.attach_id, schema_name, table_name, column_name,
 	                                         false /* ignore_not_found */, ctx.transaction_id);
-	InvokeRpcMethod(ctx, "catalog_table_not_null_set", params, context);
+	InvokeVoidRpc(ctx, "catalog_table_not_null_set", params, context);
 }
 
 void InvokeCatalogTableNotNullDrop(
@@ -536,7 +551,7 @@ void InvokeCatalogTableNotNullDrop(
     ClientContext &context) {
 	auto params = BuildTableNotNullDropParams(ctx.attach_id, schema_name, table_name, column_name,
 	                                          false /* ignore_not_found */, ctx.transaction_id);
-	InvokeRpcMethod(ctx, "catalog_table_not_null_drop", params, context);
+	InvokeVoidRpc(ctx, "catalog_table_not_null_drop", params, context);
 }
 
 // ============================================================================
@@ -549,7 +564,7 @@ void InvokeCatalogViewCreate(
     const std::string &definition, const std::string &on_conflict,
     ClientContext &context) {
 	auto params = BuildViewCreateParams(ctx.attach_id, schema_name, view_name, definition, on_conflict, ctx.transaction_id);
-	InvokeRpcMethod(ctx, "catalog_view_create", params, context);
+	InvokeVoidRpc(ctx, "catalog_view_create", params, context);
 }
 
 void InvokeCatalogViewDrop(
@@ -558,7 +573,7 @@ void InvokeCatalogViewDrop(
     bool ignore_not_found, bool cascade,
     ClientContext &context) {
 	auto params = BuildViewDropParams(ctx.attach_id, schema_name, view_name, ignore_not_found, cascade, ctx.transaction_id);
-	InvokeRpcMethod(ctx, "catalog_view_drop", params, context);
+	InvokeVoidRpc(ctx, "catalog_view_drop", params, context);
 }
 
 void InvokeCatalogViewRename(
@@ -567,7 +582,7 @@ void InvokeCatalogViewRename(
     const std::string &new_name, bool ignore_not_found,
     ClientContext &context) {
 	auto params = BuildViewRenameParams(ctx.attach_id, schema_name, view_name, new_name, ignore_not_found, ctx.transaction_id);
-	InvokeRpcMethod(ctx, "catalog_view_rename", params, context);
+	InvokeVoidRpc(ctx, "catalog_view_rename", params, context);
 }
 
 void InvokeCatalogViewCommentSet(
@@ -578,7 +593,7 @@ void InvokeCatalogViewCommentSet(
     ClientContext &context) {
 	auto params = BuildViewCommentSetParams(ctx.attach_id, schema_name, view_name, comment, comment_is_null,
 	                                         ignore_not_found, ctx.transaction_id);
-	InvokeRpcMethod(ctx, "catalog_view_comment_set", params, context);
+	InvokeVoidRpc(ctx, "catalog_view_comment_set", params, context);
 }
 
 void InvokeCatalogSchemaCreate(
@@ -587,7 +602,7 @@ void InvokeCatalogSchemaCreate(
     ClientContext &context) {
 	auto params = BuildSchemaCreateParams(ctx.attach_id, schema_name, on_conflict,
 	                                       "" /* comment */, true /* comment_is_null */, ctx.transaction_id);
-	InvokeRpcMethod(ctx, "catalog_schema_create", params, context);
+	InvokeVoidRpc(ctx, "catalog_schema_create", params, context);
 }
 
 void InvokeCatalogSchemaDrop(
@@ -595,7 +610,7 @@ void InvokeCatalogSchemaDrop(
     const std::string &schema_name, bool ignore_not_found, bool cascade,
     ClientContext &context) {
 	auto params = BuildSchemaDropParams(ctx.attach_id, schema_name, ignore_not_found, cascade, ctx.transaction_id);
-	InvokeRpcMethod(ctx, "catalog_schema_drop", params, context);
+	InvokeVoidRpc(ctx, "catalog_schema_drop", params, context);
 }
 
 // ============================================================================
@@ -840,24 +855,36 @@ ColumnStatisticsRpcResult InvokeCatalogTableColumnStatisticsGet(
 	ColumnStatisticsRpcResult rpc_result;
 
 	auto params = BuildTableColumnStatisticsGetParams(ctx.attach_id, schema_name, table_name, ctx.transaction_id);
-	auto response = InvokeRpcMethod(ctx, "catalog_table_column_statistics_get", params, context);
+	const char *method_name = "catalog_table_column_statistics_get";
+	auto response = InvokeRpcMethod(ctx, method_name, params, context);
 
-	// Extract and deserialize the inner result bytes, preserving custom_metadata
-	// (cache_max_age_seconds is carried as IPC batch custom_metadata, not schema metadata)
+	// Custom decode path (uses DeserializeFromIpcBytesWithMetadata to preserve
+	// IPC batch custom_metadata, where cache_max_age_seconds lives). The outer
+	// envelope is validated here with the same rigor as ExtractAndDeserializeResult,
+	// then ValidateResponseSchema is a no-op (method is registered dynamic) but we
+	// keep it for symmetry with the rest of the codebase.
 	if (!response.batch || response.batch->num_rows() == 0) {
+		ValidateResponseSchema(nullptr, method_name, worker_path);
 		return rpc_result;
 	}
 	auto result_col = response.batch->GetColumnByName("result");
 	if (!result_col) {
-		return rpc_result;
+		throw IOException("Response missing 'result' column from %s [worker: %s]", method_name, worker_path);
 	}
-	auto binary_array = std::dynamic_pointer_cast<arrow::BinaryArray>(result_col);
-	if (!binary_array || binary_array->IsNull(0)) {
+	if (result_col->type()->id() != arrow::Type::BINARY) {
+		throw IOException(
+		    "Response 'result' column from %s has type %s, expected Binary [worker: %s]",
+		    method_name, result_col->type()->ToString(), worker_path);
+	}
+	auto binary_array = std::static_pointer_cast<arrow::BinaryArray>(result_col);
+	if (binary_array->IsNull(0)) {
+		ValidateResponseSchema(nullptr, method_name, worker_path);
 		return rpc_result;
 	}
 	auto view = binary_array->GetView(0);
 	auto deserialized = DeserializeFromIpcBytesWithMetadata(
 	    reinterpret_cast<const uint8_t *>(view.data()), view.size());
+	ValidateResponseSchema(deserialized.batch, method_name, worker_path);
 
 	// Extract cache_max_age_seconds from IPC batch custom_metadata
 	if (deserialized.custom_metadata) {
@@ -891,23 +918,34 @@ std::unordered_map<std::string, unique_ptr<BaseStatistics>> InvokeTableFunctionS
 	auto request_bytes = SerializeToIpcBytes(request_batch);
 	auto params = BuildBindRpcParams(request_bytes);
 
-	auto response = InvokeRpcMethod(ctx, "table_function_statistics", params, context);
+	const char *method_name = "table_function_statistics";
+	auto response = InvokeRpcMethod(ctx, method_name, params, context);
 
-	// Response envelope: {result: binary|null}. Null result → no stats available.
+	// Response envelope: {result: binary|null}. Null result → no stats available
+	// (method returns Optional[bytes] in vgi-python; shape of the bytes varies
+	// per function and is validated by ParseColumnStatisticsBatch downstream).
 	if (!response.batch || response.batch->num_rows() == 0) {
+		ValidateResponseSchema(nullptr, method_name, worker_path);
 		return {};
 	}
 	auto result_col = response.batch->GetColumnByName("result");
 	if (!result_col) {
-		return {};
+		throw IOException("Response missing 'result' column from %s [worker: %s]", method_name, worker_path);
 	}
-	auto binary_array = std::dynamic_pointer_cast<arrow::BinaryArray>(result_col);
-	if (!binary_array || binary_array->IsNull(0)) {
+	if (result_col->type()->id() != arrow::Type::BINARY) {
+		throw IOException(
+		    "Response 'result' column from %s has type %s, expected Binary [worker: %s]",
+		    method_name, result_col->type()->ToString(), worker_path);
+	}
+	auto binary_array = std::static_pointer_cast<arrow::BinaryArray>(result_col);
+	if (binary_array->IsNull(0)) {
+		ValidateResponseSchema(nullptr, method_name, worker_path);
 		return {};
 	}
 	auto view = binary_array->GetView(0);
 	auto result_batch = DeserializeFromIpcBytes(
 	    reinterpret_cast<const uint8_t *>(view.data()), view.size());
+	ValidateResponseSchema(result_batch, method_name, worker_path);
 
 	return ParseColumnStatisticsBatch(result_batch, column_types, column_names,
 	                                   worker_path, "function_name", function_name, context);
@@ -1791,24 +1829,6 @@ VgiFunctionInfo ParseFunctionInfo(const std::shared_ptr<arrow::RecordBatch> &bat
 	}
 
 	return info;
-}
-
-// ============================================================================
-// Function Invocation API
-// ============================================================================
-
-VgiFunctionInfo GetFunctionInfo(const CatalogRpcContext &ctx,
-                                const std::string &schema_name, const std::string &function_name,
-                                ClientContext &context) {
-	auto &worker_path = ctx.params->worker_path();
-	auto params = BuildTableOrViewGetParams(ctx.attach_id, schema_name, function_name);
-	auto response = InvokeRpcMethod(ctx, "catalog_function_get", params, context);
-	auto result_batch = ExtractAndDeserializeResult(response, "catalog_function_get", worker_path);
-	if (!result_batch || result_batch->num_rows() == 0) {
-		throw IOException("Empty response from catalog_function_get for function '%s' [worker: %s]", function_name,
-		                  worker_path);
-	}
-	return ParseFunctionInfo(result_batch, 0, worker_path);
 }
 
 // ============================================================================
