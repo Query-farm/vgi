@@ -46,6 +46,12 @@ static UnaryResponseResult InvokeRpcMethod(const CatalogRpcContext &ctx, const s
 	VGI_LOG(context, "rpc.invoke",
 	        {{"worker_path", ctx.params->worker_path()}, {"method", method_name}});
 
+	// Validate the outgoing request against the registered params schema.
+	// Catches encoder drift in BuildXxxParams (e.g. flipped nullability,
+	// missing fields) at the C++ boundary, before it turns into an opaque
+	// failure on the worker side.
+	ValidateRequestSchema(params, method_name, ctx.params->worker_path());
+
 	UnaryRpcOptions opts {context,
 	                      ctx.params->worker_path(),
 	                      ctx.params->worker_debug(),
@@ -259,7 +265,11 @@ std::optional<VgiTableInfo> InvokeCatalogTableGet(const CatalogRpcContext &ctx,
                                                    const std::string &schema_name, const std::string &table_name,
                                                    ClientContext &context) {
 	auto &worker_path = ctx.params->worker_path();
-	auto params = BuildTableOrViewGetParams(ctx.attach_id, schema_name, table_name, ctx.transaction_id);
+	// catalog_table_get's Protocol schema always includes at_unit/at_value (nullable);
+	// the overload without time-travel passes empty strings, which BuildNullableStringScalar
+	// serializes as nulls.
+	auto params = BuildTableGetWithAtParams(ctx.attach_id, schema_name, table_name,
+	                                        /*at_unit=*/"", /*at_value=*/"", ctx.transaction_id);
 	auto response = InvokeRpcMethod(ctx, "catalog_table_get", params, context);
 	auto result_batch = ExtractAndDeserializeResult(response, "catalog_table_get", worker_path);
 	if (!result_batch) {

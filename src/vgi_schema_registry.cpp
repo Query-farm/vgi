@@ -17,40 +17,7 @@ namespace {
 // classification, per-method `dynamic_reason` strings, which methods share a
 // `List<Binary>` outer + inner-item schema) — not contract.
 
-using generated::AggregateBindResultSchema;
-using generated::AggregateCombineResultSchema;
-using generated::AggregateDestructorResultSchema;
-using generated::AggregateFinalizeResultSchema;
-using generated::AggregateUpdateResultSchema;
-using generated::AggregateWindowBatchResultSchema;
-using generated::AggregateWindowDestructorResultSchema;
-using generated::AggregateWindowInitResultSchema;
-using generated::AggregateWindowResultSchema;
-using generated::BindResultSchema;
-using generated::CatalogAttachResultSchema;
-using generated::CatalogCatalogsResultSchema;
-using generated::CatalogInfoSchema;
-using generated::CatalogIndexGetResultSchema;
-using generated::CatalogMacroGetResultSchema;
-using generated::CatalogSchemaContentsFunctionsResultSchema;
-using generated::CatalogSchemaContentsIndexesResultSchema;
-using generated::CatalogSchemaContentsMacrosResultSchema;
-using generated::CatalogSchemaContentsTablesResultSchema;
-using generated::CatalogSchemaContentsViewsResultSchema;
-using generated::CatalogSchemaGetResultSchema;
-using generated::CatalogSchemasResultSchema;
-using generated::CatalogTableGetResultSchema;
-using generated::CatalogTransactionBeginResultSchema;
-using generated::CatalogVersionResultSchema;
-using generated::CatalogViewGetResultSchema;
-using generated::FunctionInfoSchema;
-using generated::IndexInfoSchema;
-using generated::MacroInfoSchema;
-using generated::ScanFunctionResultSchema;
-using generated::SchemaInfoSchema;
-using generated::TableFunctionCardinalityResultSchema;
-using generated::TableInfoSchema;
-using generated::ViewInfoSchema;
+using namespace generated;
 
 // ============================================================================
 // Registry
@@ -176,6 +143,83 @@ const std::unordered_map<std::string, ResponseSchema> &Registry() {
 			m[entry.name] = ResponseSchema{nullptr, nullptr, true, entry.reason};
 		}
 
+		// --- Per-method request schemas -----------------------------------
+		// Every method in the registry also has an outgoing request-schema
+		// contract generated from the Protocol. Attaching it to the existing
+		// entry keeps validation symmetric (ValidateRequestSchema uses this).
+		struct RequestSchemaEntry {
+			const char *name;
+			const std::shared_ptr<arrow::Schema> &(*request)();
+		};
+		const RequestSchemaEntry kRequestSchemas[] = {
+		    {"catalog_catalogs", &CatalogCatalogsParamsSchema},
+		    {"catalog_attach", &CatalogAttachParamsSchema},
+		    {"catalog_detach", &CatalogDetachParamsSchema},
+		    {"catalog_create", &CatalogCreateParamsSchema},
+		    {"catalog_drop", &CatalogDropParamsSchema},
+		    {"catalog_version", &CatalogVersionParamsSchema},
+		    {"catalog_transaction_begin", &CatalogTransactionBeginParamsSchema},
+		    {"catalog_transaction_commit", &CatalogTransactionCommitParamsSchema},
+		    {"catalog_transaction_rollback", &CatalogTransactionRollbackParamsSchema},
+		    {"catalog_schemas", &CatalogSchemasParamsSchema},
+		    {"catalog_schema_get", &CatalogSchemaGetParamsSchema},
+		    {"catalog_schema_create", &CatalogSchemaCreateParamsSchema},
+		    {"catalog_schema_drop", &CatalogSchemaDropParamsSchema},
+		    {"catalog_schema_contents_tables", &CatalogSchemaContentsTablesParamsSchema},
+		    {"catalog_schema_contents_views", &CatalogSchemaContentsViewsParamsSchema},
+		    {"catalog_schema_contents_functions", &CatalogSchemaContentsFunctionsParamsSchema},
+		    {"catalog_schema_contents_macros", &CatalogSchemaContentsMacrosParamsSchema},
+		    {"catalog_schema_contents_indexes", &CatalogSchemaContentsIndexesParamsSchema},
+		    {"catalog_table_get", &CatalogTableGetParamsSchema},
+		    {"catalog_table_create", &CatalogTableCreateParamsSchema},
+		    {"catalog_table_drop", &CatalogTableDropParamsSchema},
+		    {"catalog_table_rename", &CatalogTableRenameParamsSchema},
+		    {"catalog_table_scan_function_get", &CatalogTableScanFunctionGetParamsSchema},
+		    {"catalog_table_insert_function_get", &CatalogTableInsertFunctionGetParamsSchema},
+		    {"catalog_table_update_function_get", &CatalogTableUpdateFunctionGetParamsSchema},
+		    {"catalog_table_delete_function_get", &CatalogTableDeleteFunctionGetParamsSchema},
+		    {"catalog_table_column_statistics_get", &CatalogTableColumnStatisticsGetParamsSchema},
+		    {"catalog_table_comment_set", &CatalogTableCommentSetParamsSchema},
+		    {"catalog_table_column_comment_set", &CatalogTableColumnCommentSetParamsSchema},
+		    {"catalog_table_column_add", &CatalogTableColumnAddParamsSchema},
+		    {"catalog_table_column_drop", &CatalogTableColumnDropParamsSchema},
+		    {"catalog_table_column_rename", &CatalogTableColumnRenameParamsSchema},
+		    {"catalog_table_column_default_set", &CatalogTableColumnDefaultSetParamsSchema},
+		    {"catalog_table_column_default_drop", &CatalogTableColumnDefaultDropParamsSchema},
+		    {"catalog_table_column_type_change", &CatalogTableColumnTypeChangeParamsSchema},
+		    {"catalog_table_not_null_set", &CatalogTableNotNullSetParamsSchema},
+		    {"catalog_table_not_null_drop", &CatalogTableNotNullDropParamsSchema},
+		    {"catalog_view_get", &CatalogViewGetParamsSchema},
+		    {"catalog_view_create", &CatalogViewCreateParamsSchema},
+		    {"catalog_view_drop", &CatalogViewDropParamsSchema},
+		    {"catalog_view_rename", &CatalogViewRenameParamsSchema},
+		    {"catalog_view_comment_set", &CatalogViewCommentSetParamsSchema},
+		    {"catalog_macro_get", &CatalogMacroGetParamsSchema},
+		    {"catalog_macro_create", &CatalogMacroCreateParamsSchema},
+		    {"catalog_macro_drop", &CatalogMacroDropParamsSchema},
+		    {"catalog_index_get", &CatalogIndexGetParamsSchema},
+		    {"catalog_index_create", &CatalogIndexCreateParamsSchema},
+		    {"catalog_index_drop", &CatalogIndexDropParamsSchema},
+		    {"bind", &BindParamsSchema},
+		    {"table_function_cardinality", &TableFunctionCardinalityParamsSchema},
+		    {"table_function_statistics", &TableFunctionStatisticsParamsSchema},
+		    {"aggregate_bind", &AggregateBindParamsSchema},
+		    {"aggregate_update", &AggregateUpdateParamsSchema},
+		    {"aggregate_combine", &AggregateCombineParamsSchema},
+		    {"aggregate_finalize", &AggregateFinalizeParamsSchema},
+		    {"aggregate_destructor", &AggregateDestructorParamsSchema},
+		    {"aggregate_window_init", &AggregateWindowInitParamsSchema},
+		    {"aggregate_window", &AggregateWindowParamsSchema},
+		    {"aggregate_window_destructor", &AggregateWindowDestructorParamsSchema},
+		    {"aggregate_window_batch", &AggregateWindowBatchParamsSchema},
+		};
+		for (const auto &e : kRequestSchemas) {
+			auto it = m.find(e.name);
+			if (it != m.end()) {
+				it->second.request_schema = e.request();
+			}
+		}
+
 		return m;
 	}();
 	return kRegistry;
@@ -249,6 +293,46 @@ void ValidateResponseSchema(const std::shared_ptr<arrow::RecordBatch> &batch, co
 		throw IOException("RPC response schema mismatch for '%s' [worker: %s]\n%s"
 		                  "This usually indicates the worker returned an out-of-date response shape.",
 		                  method_name, worker_path, DiffSchemas(*entry->schema, *batch->schema()));
+	}
+}
+
+void ValidateRequestSchema(const std::shared_ptr<arrow::RecordBatch> &batch, const std::string &method_name,
+                           const std::string &worker_path) {
+	const auto *entry = LookupResponseSchema(method_name);
+	if (!entry) {
+		throw IOException("RPC method '%s' has no registered response schema [worker: %s]. "
+		                  "Add an entry to vgi_schema_registry.cpp.",
+		                  method_name, worker_path);
+	}
+	if (!entry->request_schema) {
+		// Method registered but no request schema captured — registry bug.
+		throw IOException(
+		    "RPC method '%s' has no registered request schema [worker: %s]. "
+		    "Add the method name to kRequestSchemas in vgi_schema_registry.cpp.",
+		    method_name, worker_path);
+	}
+	const auto &expected = *entry->request_schema;
+	// An empty schema means the method takes no params (e.g. catalog_catalogs).
+	// The C++ callers pass `nullptr` in that case; accept either nullptr or an
+	// empty batch.
+	if (expected.num_fields() == 0) {
+		if (batch && batch->schema()->num_fields() > 0) {
+			throw IOException(
+			    "RPC method '%s' request has %d fields, but the wire contract is parameterless [worker: %s]",
+			    method_name, batch->schema()->num_fields(), worker_path);
+		}
+		return;
+	}
+	if (!batch) {
+		throw IOException("RPC method '%s' called with no request batch, but the wire contract requires "
+		                  "schema: %s [worker: %s]",
+		                  method_name, expected.ToString(), worker_path);
+	}
+	if (!batch->schema()->Equals(expected, /*check_metadata=*/false)) {
+		throw IOException("RPC request schema mismatch for '%s' [worker: %s]\n%s"
+		                  "This usually indicates a bug in the C++ request builder — the outgoing "
+		                  "params batch doesn't match vgi-python's Protocol.",
+		                  method_name, worker_path, DiffSchemas(expected, *batch->schema()));
 	}
 }
 

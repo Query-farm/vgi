@@ -28,6 +28,10 @@ struct ResponseSchema {
 	// validate this method's response, and which component owns validation
 	// instead. nullptr for non-dynamic entries.
 	const char *dynamic_reason = nullptr;
+	// Outer wire schema for this method's request batch (what C++ writes to
+	// the worker's stdin). Matches the `params_schema` vgi-rpc expects.
+	// Empty schema for parameter-less methods.
+	std::shared_ptr<arrow::Schema> request_schema = nullptr;
 };
 
 // Look up a method's registered response contract. Returns nullptr when the
@@ -52,6 +56,18 @@ void ValidateItemSchema(const std::shared_ptr<arrow::RecordBatch> &item_batch,
                         const std::string &method_name,
                         const std::string &worker_path,
                         size_t item_index);
+
+// Validate an outgoing request batch against the registered per-method params
+// schema before it's written to the wire. Catches encoder drift (wrong field
+// order, wrong nullability, missing fields) in C++ BuildXxxParams functions at
+// the boundary where it happens — before the worker has to diagnose it.
+//
+// `batch` may be null for methods that take no params (e.g. catalog_catalogs,
+// whose request has an empty schema). If `method_name` has no registered
+// params schema, throws — every invoked method must be registered.
+void ValidateRequestSchema(const std::shared_ptr<arrow::RecordBatch> &batch,
+                           const std::string &method_name,
+                           const std::string &worker_path);
 
 } // namespace vgi
 } // namespace duckdb

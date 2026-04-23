@@ -192,6 +192,7 @@ BindResult FunctionConnection::PerformBindFull() {
 	// Transport: send bind via subprocess stdin/stdout
 	auto transport_fn = [&](const std::vector<uint8_t> &request_bytes) -> std::shared_ptr<arrow::RecordBatch> {
 		auto rpc_params = BuildBindRpcParams(request_bytes);
+		ValidateRequestSchema(rpc_params, "bind", worker_path_);
 		try {
 			WriteRpcRequest(proc_->GetStdinFd(), "bind", rpc_params);
 		} catch (const IOException &e) {

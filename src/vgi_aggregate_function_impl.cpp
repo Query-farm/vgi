@@ -313,6 +313,9 @@ AggregateRpcResult InvokeAggregateRpc(ClientContext &context, const VgiAggregate
                                       const std::string &method_name,
                                       const std::shared_ptr<arrow::RecordBatch> &params,
                                       bool enable_logging) {
+	// Validate the outgoing request batch before dispatch (catches encoder drift).
+	ValidateRequestSchema(params, method_name, bind_data.attach_params->worker_path());
+
 	UnaryRpcOptions opts {context,
 	                      bind_data.attach_params->worker_path(),
 	                      bind_data.attach_params->worker_debug(),
