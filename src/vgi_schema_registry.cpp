@@ -1,6 +1,7 @@
 #include "vgi_schema_registry.hpp"
 
 #include "duckdb/common/exception.hpp"
+#include "generated/vgi_protocol_schemas.hpp"
 
 #include <sstream>
 #include <unordered_map>
@@ -10,260 +11,46 @@ namespace vgi {
 
 namespace {
 
-// ============================================================================
-// Schema helpers
-// ============================================================================
-//
-// The authoritative definitions live in vgi-python. To audit or regenerate
-// these schemas, run:
-//
-//   .venv/bin/python -c "from vgi.<module> import <Class>; print(<Class>.ARROW_SCHEMA)"
-//
-// See `/Users/rusty/Development/vgi-python/vgi/protocol.py`,
-// `/Users/rusty/Development/vgi-python/vgi/catalog/catalog_interface.py`, and
-// `/Users/rusty/Development/vgi-python/vgi/invocation.py`.
+// All schemas this registry references live in
+// `src/generated/vgi_protocol_schemas.hpp`, emitted by vgi-python's
+// `vgi-gen-cpp-schemas`. This file owns **policy** (void vs dynamic vs strict
+// classification, per-method `dynamic_reason` strings, which methods share a
+// `List<Binary>` outer + inner-item schema) — not contract.
 
-// Common sub-type factories --------------------------------------------------
-
-std::shared_ptr<arrow::DataType> Utf8StringMap() {
-	// pyarrow `pa.map_(pa.string(), pa.string())` — default child struct name
-	// "entries", keys non-null, values nullable. arrow::map matches.
-	return arrow::map(arrow::utf8(), arrow::utf8());
-}
-
-// Enum serialization (vgi-rpc _infer_arrow_type):
-// Enum subclasses become dictionary<int16, string>.
-std::shared_ptr<arrow::DataType> EnumType() {
-	return arrow::dictionary(arrow::int16(), arrow::utf8());
-}
-
-// CatalogObject inheritance: parent's dataclass fields come FIRST.
-// CatalogObject = {comment: str|None, tags: dict[str,str]}
-// CatalogSchemaObject(CatalogObject) adds {name, schema_name}.
-
-// ============================================================================
-// Inner info-batch schemas (per-item in {items: List<Binary>} responses)
-// ============================================================================
-
-std::shared_ptr<arrow::Schema> CatalogInfoSchema() {
-	static const auto schema = arrow::schema({
-	    arrow::field("name", arrow::utf8(), false),
-	    arrow::field("implementation_version", arrow::utf8(), true),
-	    arrow::field("data_version_spec", arrow::utf8(), true),
-	});
-	return schema;
-}
-
-std::shared_ptr<arrow::Schema> SchemaInfoSchema() {
-	static const auto schema = arrow::schema({
-	    arrow::field("comment", arrow::utf8(), true),
-	    arrow::field("tags", Utf8StringMap(), false),
-	    arrow::field("attach_id", arrow::binary(), false),
-	    arrow::field("name", arrow::utf8(), false),
-	});
-	return schema;
-}
-
-std::shared_ptr<arrow::Schema> TableInfoSchema() {
-	static const auto schema = arrow::schema({
-	    arrow::field("comment", arrow::utf8(), true),
-	    arrow::field("tags", Utf8StringMap(), false),
-	    arrow::field("name", arrow::utf8(), false),
-	    arrow::field("schema_name", arrow::utf8(), false),
-	    arrow::field("columns", arrow::binary(), false),
-	    arrow::field("not_null_constraints", arrow::list(arrow::int32()), false),
-	    arrow::field("unique_constraints", arrow::list(arrow::list(arrow::int32())), false),
-	    arrow::field("check_constraints", arrow::list(arrow::utf8()), false),
-	    arrow::field("primary_key_constraints", arrow::list(arrow::list(arrow::int32())), false),
-	    arrow::field("foreign_key_constraints", arrow::list(arrow::binary()), false),
-	    arrow::field("supports_insert", arrow::boolean(), false),
-	    arrow::field("supports_update", arrow::boolean(), false),
-	    arrow::field("supports_delete", arrow::boolean(), false),
-	    arrow::field("supports_column_statistics", arrow::boolean(), false),
-	});
-	return schema;
-}
-
-std::shared_ptr<arrow::Schema> ViewInfoSchema() {
-	static const auto schema = arrow::schema({
-	    arrow::field("comment", arrow::utf8(), true),
-	    arrow::field("tags", Utf8StringMap(), false),
-	    arrow::field("name", arrow::utf8(), false),
-	    arrow::field("schema_name", arrow::utf8(), false),
-	    arrow::field("definition", arrow::utf8(), false),
-	});
-	return schema;
-}
-
-std::shared_ptr<arrow::Schema> MacroInfoSchema() {
-	static const auto schema = arrow::schema({
-	    arrow::field("comment", arrow::utf8(), true),
-	    arrow::field("tags", Utf8StringMap(), false),
-	    arrow::field("name", arrow::utf8(), false),
-	    arrow::field("schema_name", arrow::utf8(), false),
-	    arrow::field("macro_type", EnumType(), false),
-	    arrow::field("parameters", arrow::list(arrow::utf8()), false),
-	    arrow::field("parameter_default_values", arrow::binary(), false),
-	    arrow::field("definition", arrow::utf8(), false),
-	});
-	return schema;
-}
-
-std::shared_ptr<arrow::Schema> IndexInfoSchema() {
-	static const auto schema = arrow::schema({
-	    arrow::field("comment", arrow::utf8(), true),
-	    arrow::field("tags", Utf8StringMap(), false),
-	    arrow::field("name", arrow::utf8(), false),
-	    arrow::field("schema_name", arrow::utf8(), false),
-	    arrow::field("table_name", arrow::utf8(), false),
-	    arrow::field("index_type", arrow::utf8(), false),
-	    arrow::field("constraint_type", EnumType(), false),
-	    arrow::field("expressions", arrow::list(arrow::utf8()), false),
-	    arrow::field("options", Utf8StringMap(), false),
-	});
-	return schema;
-}
-
-std::shared_ptr<arrow::Schema> FunctionInfoSchema() {
-	// CatalogExample struct: {sql: Utf8, description: Utf8, expected_output: Utf8?}
-	auto example_struct =
-	    arrow::struct_({arrow::field("sql", arrow::utf8(), false),
-	                    arrow::field("description", arrow::utf8(), false),
-	                    arrow::field("expected_output", arrow::utf8(), true)});
-	// SecretLookupEntry struct: {secret_type: Utf8, scope: Utf8?, secret_name: Utf8?}
-	auto secret_struct =
-	    arrow::struct_({arrow::field("secret_type", arrow::utf8(), false),
-	                    arrow::field("scope", arrow::utf8(), true),
-	                    arrow::field("secret_name", arrow::utf8(), true)});
-
-	static const auto schema = arrow::schema({
-	    arrow::field("comment", arrow::utf8(), true),
-	    arrow::field("tags", Utf8StringMap(), false),
-	    arrow::field("name", arrow::utf8(), false),
-	    arrow::field("schema_name", arrow::utf8(), false),
-	    arrow::field("function_type", EnumType(), false),
-	    arrow::field("arguments", arrow::binary(), false),
-	    arrow::field("output_schema", arrow::binary(), false),
-	    arrow::field("stability", EnumType(), true),
-	    arrow::field("null_handling", EnumType(), true),
-	    arrow::field("description", arrow::utf8(), false),
-	    arrow::field("examples", arrow::list(example_struct), false),
-	    arrow::field("categories", arrow::list(arrow::utf8()), false),
-	    arrow::field("projection_pushdown", arrow::boolean(), true),
-	    arrow::field("filter_pushdown", arrow::boolean(), true),
-	    arrow::field("sampling_pushdown", arrow::boolean(), true),
-	    arrow::field("supported_expression_filters", arrow::list(arrow::utf8()), false),
-	    arrow::field("order_preservation", EnumType(), true),
-	    arrow::field("max_workers", arrow::int32(), false),
-	    arrow::field("order_dependent", EnumType(), false),
-	    arrow::field("distinct_dependent", EnumType(), false),
-	    arrow::field("supports_window", arrow::boolean(), false),
-	    arrow::field("required_settings", arrow::list(arrow::utf8()), false),
-	    arrow::field("required_secrets", arrow::list(secret_struct), false),
-	});
-	return schema;
-}
-
-// ============================================================================
-// Outer response schemas
-// ============================================================================
-
-// Shared: `{items: List<Binary>}` — every *Response wrapper from
-// vgi-python's `_catalog_items_response`.
-std::shared_ptr<arrow::Schema> ListBinaryItemsSchema() {
-	static const auto schema =
-	    arrow::schema({arrow::field("items", arrow::list(arrow::binary()), false)});
-	return schema;
-}
-
-// CatalogAttachResult — catalog_interface.py:114-157.
-std::shared_ptr<arrow::Schema> CatalogAttachResultSchema() {
-	static const auto schema = arrow::schema({
-	    arrow::field("attach_id", arrow::binary(), false),
-	    arrow::field("supports_transactions", arrow::boolean(), false),
-	    arrow::field("supports_time_travel", arrow::boolean(), false),
-	    arrow::field("catalog_version_frozen", arrow::boolean(), false),
-	    arrow::field("catalog_version", arrow::int64(), false),
-	    arrow::field("attach_id_required", arrow::boolean(), false),
-	    arrow::field("default_schema", arrow::utf8(), false),
-	    arrow::field("settings", arrow::list(arrow::binary()), false),
-	    arrow::field("secret_types", arrow::list(arrow::binary()), false),
-	    arrow::field("comment", arrow::utf8(), true),
-	    arrow::field("tags", Utf8StringMap(), false),
-	    arrow::field("supports_column_statistics", arrow::boolean(), false),
-	    arrow::field("resolved_data_version", arrow::utf8(), true),
-	    arrow::field("resolved_implementation_version", arrow::utf8(), true),
-	});
-	return schema;
-}
-
-// CatalogVersionResponse — protocol.py:249-252.
-std::shared_ptr<arrow::Schema> CatalogVersionSchema() {
-	static const auto schema = arrow::schema({arrow::field("version", arrow::int64(), false)});
-	return schema;
-}
-
-// TransactionBeginResponse — protocol.py:255-259.
-std::shared_ptr<arrow::Schema> TransactionBeginSchema() {
-	static const auto schema =
-	    arrow::schema({arrow::field("transaction_id", arrow::binary(), true)});
-	return schema;
-}
-
-// TableCardinality — table_function.py:60-74.
-std::shared_ptr<arrow::Schema> TableCardinalitySchema() {
-	static const auto schema = arrow::schema({
-	    arrow::field("estimate", arrow::int64(), true),
-	    arrow::field("max", arrow::int64(), true),
-	});
-	return schema;
-}
-
-// BindResponse — invocation.py:49 (scalar/table/table-in-out function bind).
-std::shared_ptr<arrow::Schema> BindResponseSchema() {
-	static const auto schema = arrow::schema({
-	    arrow::field("output_schema", arrow::binary(), false),
-	    arrow::field("opaque_data", arrow::binary(), false),
-	    arrow::field("lookup_secret_types", arrow::list(arrow::utf8()), false),
-	    arrow::field("lookup_scopes", arrow::list(arrow::utf8()), false),
-	    arrow::field("lookup_names", arrow::list(arrow::utf8()), false),
-	});
-	return schema;
-}
-
-// AggregateBindResponse — protocol.py:854.
-std::shared_ptr<arrow::Schema> AggregateBindResponseSchema() {
-	static const auto schema = arrow::schema({
-	    arrow::field("output_schema", arrow::binary(), false),
-	    arrow::field("execution_id", arrow::binary(), false),
-	});
-	return schema;
-}
-
-// Empty-struct ack: AggregateUpdateResponse, AggregateCombineResponse,
-// AggregateDestructorResponse, AggregateWindowInitResponse,
-// AggregateWindowDestructorResponse — all zero-field schemas.
-std::shared_ptr<arrow::Schema> EmptyStructSchema() {
-	static const auto schema = arrow::schema({});
-	return schema;
-}
-
-// AggregateFinalizeResponse / AggregateWindowResponse / AggregateWindowBatchResponse.
-std::shared_ptr<arrow::Schema> ResultBatchSchema() {
-	static const auto schema =
-	    arrow::schema({arrow::field("result_batch", arrow::binary(), false)});
-	return schema;
-}
-
-// ScanFunctionResult / WriteFunctionResult — catalog_interface.py:369-398.
-std::shared_ptr<arrow::Schema> ScanFunctionResultSchema() {
-	static const auto schema = arrow::schema({
-	    arrow::field("function_name", arrow::utf8(), false),
-	    arrow::field("arguments", arrow::binary(), false),
-	    arrow::field("required_extensions", arrow::list(arrow::utf8()), false),
-	});
-	return schema;
-}
+using generated::AggregateBindResultSchema;
+using generated::AggregateCombineResultSchema;
+using generated::AggregateDestructorResultSchema;
+using generated::AggregateFinalizeResultSchema;
+using generated::AggregateUpdateResultSchema;
+using generated::AggregateWindowBatchResultSchema;
+using generated::AggregateWindowDestructorResultSchema;
+using generated::AggregateWindowInitResultSchema;
+using generated::AggregateWindowResultSchema;
+using generated::BindResultSchema;
+using generated::CatalogAttachResultSchema;
+using generated::CatalogCatalogsResultSchema;
+using generated::CatalogInfoSchema;
+using generated::CatalogIndexGetResultSchema;
+using generated::CatalogMacroGetResultSchema;
+using generated::CatalogSchemaContentsFunctionsResultSchema;
+using generated::CatalogSchemaContentsIndexesResultSchema;
+using generated::CatalogSchemaContentsMacrosResultSchema;
+using generated::CatalogSchemaContentsTablesResultSchema;
+using generated::CatalogSchemaContentsViewsResultSchema;
+using generated::CatalogSchemaGetResultSchema;
+using generated::CatalogSchemasResultSchema;
+using generated::CatalogTableGetResultSchema;
+using generated::CatalogTransactionBeginResultSchema;
+using generated::CatalogVersionResultSchema;
+using generated::CatalogViewGetResultSchema;
+using generated::FunctionInfoSchema;
+using generated::IndexInfoSchema;
+using generated::MacroInfoSchema;
+using generated::ScanFunctionResultSchema;
+using generated::SchemaInfoSchema;
+using generated::TableFunctionCardinalityResultSchema;
+using generated::TableInfoSchema;
+using generated::ViewInfoSchema;
 
 // ============================================================================
 // Registry
@@ -280,29 +67,35 @@ const std::unordered_map<std::string, ResponseSchema> &Registry() {
 		std::unordered_map<std::string, ResponseSchema> m;
 
 		// --- List-of-binary responses with per-item inner schemas ---------
+		// All catalog discovery methods wrap IPC-serialized info batches in
+		// {items: List<Binary>}. Outer + inner schemas generated from the
+		// vgi-python Protocol; see src/generated/vgi_protocol_schemas.hpp.
 		struct ItemsMethod {
 			const char *name;
-			std::shared_ptr<arrow::Schema> item_schema;
+			const std::shared_ptr<arrow::Schema> &(*outer)();
+			const std::shared_ptr<arrow::Schema> &(*item)();
 		};
 		const ItemsMethod kItemsResponses[] = {
-		    {"catalog_catalogs", CatalogInfoSchema()},
-		    {"catalog_schemas", SchemaInfoSchema()},
-		    {"catalog_schema_get", SchemaInfoSchema()},
-		    {"catalog_schema_contents_tables", TableInfoSchema()},
-		    {"catalog_schema_contents_views", ViewInfoSchema()},
-		    {"catalog_schema_contents_functions", FunctionInfoSchema()},
-		    {"catalog_schema_contents_macros", MacroInfoSchema()},
-		    {"catalog_schema_contents_indexes", IndexInfoSchema()},
-		    {"catalog_table_get", TableInfoSchema()},
-		    {"catalog_view_get", ViewInfoSchema()},
-		    {"catalog_macro_get", MacroInfoSchema()},
-		    {"catalog_index_get", IndexInfoSchema()},
+		    {"catalog_catalogs", &CatalogCatalogsResultSchema, &CatalogInfoSchema},
+		    {"catalog_schemas", &CatalogSchemasResultSchema, &SchemaInfoSchema},
+		    {"catalog_schema_get", &CatalogSchemaGetResultSchema, &SchemaInfoSchema},
+		    {"catalog_schema_contents_tables", &CatalogSchemaContentsTablesResultSchema, &TableInfoSchema},
+		    {"catalog_schema_contents_views", &CatalogSchemaContentsViewsResultSchema, &ViewInfoSchema},
+		    {"catalog_schema_contents_functions", &CatalogSchemaContentsFunctionsResultSchema,
+		     &FunctionInfoSchema},
+		    {"catalog_schema_contents_macros", &CatalogSchemaContentsMacrosResultSchema, &MacroInfoSchema},
+		    {"catalog_schema_contents_indexes", &CatalogSchemaContentsIndexesResultSchema, &IndexInfoSchema},
+		    {"catalog_table_get", &CatalogTableGetResultSchema, &TableInfoSchema},
+		    {"catalog_view_get", &CatalogViewGetResultSchema, &ViewInfoSchema},
+		    {"catalog_macro_get", &CatalogMacroGetResultSchema, &MacroInfoSchema},
+		    {"catalog_index_get", &CatalogIndexGetResultSchema, &IndexInfoSchema},
 		};
 		for (const auto &e : kItemsResponses) {
-			m[e.name] = ResponseSchema{ListBinaryItemsSchema(), e.item_schema, false, nullptr};
+			m[e.name] = ResponseSchema{e.outer(), e.item(), false, nullptr};
 		}
 
 		// --- Void responses -----------------------------------------------
+		// Mutation methods return None; a non-empty batch is a protocol violation.
 		const char *kVoidResponses[] = {
 		    "catalog_detach",
 		    "catalog_create",
@@ -339,16 +132,17 @@ const std::unordered_map<std::string, ResponseSchema> &Registry() {
 
 		// --- Strictly-typed single-struct responses -----------------------
 		m["catalog_attach"] = ResponseSchema{CatalogAttachResultSchema(), nullptr, false, nullptr};
-		m["catalog_version"] = ResponseSchema{CatalogVersionSchema(), nullptr, false, nullptr};
+		m["catalog_version"] = ResponseSchema{CatalogVersionResultSchema(), nullptr, false, nullptr};
 		m["catalog_transaction_begin"] =
-		    ResponseSchema{TransactionBeginSchema(), nullptr, false, nullptr};
+		    ResponseSchema{CatalogTransactionBeginResultSchema(), nullptr, false, nullptr};
 		m["table_function_cardinality"] =
-		    ResponseSchema{TableCardinalitySchema(), nullptr, false, nullptr};
-		m["bind"] = ResponseSchema{BindResponseSchema(), nullptr, false, nullptr};
-		m["aggregate_bind"] = ResponseSchema{AggregateBindResponseSchema(), nullptr, false, nullptr};
-		m["aggregate_finalize"] = ResponseSchema{ResultBatchSchema(), nullptr, false, nullptr};
-		m["aggregate_window"] = ResponseSchema{ResultBatchSchema(), nullptr, false, nullptr};
-		m["aggregate_window_batch"] = ResponseSchema{ResultBatchSchema(), nullptr, false, nullptr};
+		    ResponseSchema{TableFunctionCardinalityResultSchema(), nullptr, false, nullptr};
+		m["bind"] = ResponseSchema{BindResultSchema(), nullptr, false, nullptr};
+		m["aggregate_bind"] = ResponseSchema{AggregateBindResultSchema(), nullptr, false, nullptr};
+		m["aggregate_finalize"] = ResponseSchema{AggregateFinalizeResultSchema(), nullptr, false, nullptr};
+		m["aggregate_window"] = ResponseSchema{AggregateWindowResultSchema(), nullptr, false, nullptr};
+		m["aggregate_window_batch"] =
+		    ResponseSchema{AggregateWindowBatchResultSchema(), nullptr, false, nullptr};
 		m["catalog_table_scan_function_get"] =
 		    ResponseSchema{ScanFunctionResultSchema(), nullptr, false, nullptr};
 		m["catalog_table_insert_function_get"] =
@@ -359,18 +153,15 @@ const std::unordered_map<std::string, ResponseSchema> &Registry() {
 		    ResponseSchema{ScanFunctionResultSchema(), nullptr, false, nullptr};
 
 		// --- Zero-field ("empty struct") ack responses --------------------
-		// These ARE concrete 0-column batches on the wire, distinct from void
-		// (which has no batch at all). Mismatch = worker drift.
-		const char *kEmptyStructResponses[] = {
-		    "aggregate_update",
-		    "aggregate_combine",
-		    "aggregate_destructor",
-		    "aggregate_window_init",
-		    "aggregate_window_destructor",
-		};
-		for (const char *name : kEmptyStructResponses) {
-			m[name] = ResponseSchema{EmptyStructSchema(), nullptr, false, nullptr};
-		}
+		// These are concrete 0-column batches on the wire, distinct from void.
+		m["aggregate_update"] = ResponseSchema{AggregateUpdateResultSchema(), nullptr, false, nullptr};
+		m["aggregate_combine"] = ResponseSchema{AggregateCombineResultSchema(), nullptr, false, nullptr};
+		m["aggregate_destructor"] =
+		    ResponseSchema{AggregateDestructorResultSchema(), nullptr, false, nullptr};
+		m["aggregate_window_init"] =
+		    ResponseSchema{AggregateWindowInitResultSchema(), nullptr, false, nullptr};
+		m["aggregate_window_destructor"] =
+		    ResponseSchema{AggregateWindowDestructorResultSchema(), nullptr, false, nullptr};
 
 		// --- Dynamic / genuinely per-call responses -----------------------
 		// Only methods whose response shape is not expressible as a single
