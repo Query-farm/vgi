@@ -59,11 +59,10 @@ AcquireAndBindResult AcquireAndBindConnection(ClientContext &context, const Func
 		} catch (const IOException &e) {
 			if (!is_retry && from_pool) {
 				// Pooled worker was stale, signal retry needed
-				VGI_LOG(context, "worker_pool.stale",
-				        {{"worker_path", params.worker_path()},
-				         {"worker_pid", std::to_string(conn->GetPid())},
-				         {"error", e.what()},
-				         {"phase", params.phase}});
+				auto fields = BuildConnLogFields(*conn);
+				fields.emplace_back("error", e.what());
+				fields.emplace_back("phase", params.phase);
+				VGI_LOG(context, "worker_pool.stale", fields);
 				return false; // Trigger retry
 			}
 			throw; // Fresh connection or retry failed, propagate
@@ -75,18 +74,17 @@ AcquireAndBindResult AcquireAndBindConnection(ClientContext &context, const Func
 		PoolKey pool_key {params.worker_path(), params.data_version_spec(), params.implementation_version()};
 		auto pooled = VgiWorkerPool::Instance().TryAcquire(pool_key);
 		if (pooled) {
-			auto pooled_pid = pooled->GetPid();
 			conn = CreateFunctionConnectionFromPool(std::move(pooled), params.function_name, params.arguments,
 			                                        params.attach_id, params.transaction_id, context,
 			                                        params.function_type, params.global_execution_id,
 			                                        params.worker_debug(), params.settings,
 			                                        params.required_secrets);
 			from_pool = true;
-			VGI_LOG(context, "worker_pool.acquire",
-			        {{"worker_path", params.worker_path()},
-			         {"worker_pid", std::to_string(pooled_pid)},
-			         {"result", "hit"},
-			         {"phase", params.phase}});
+			auto fields = BuildConnLogFields(*conn);
+			fields.emplace_back("worker_path", params.worker_path());
+			fields.emplace_back("result", "hit");
+			fields.emplace_back("phase", params.phase);
+			VGI_LOG(context, "worker_pool.acquire", fields);
 		}
 	}
 
@@ -96,22 +94,22 @@ AcquireAndBindResult AcquireAndBindConnection(ClientContext &context, const Func
 		if (params.use_pool() && !IsHttpTransport(params.worker_path())) {
 			VgiWorkerPool::Instance().RecordMiss(params.worker_path());
 		}
-		VGI_LOG(context, "worker_pool.acquire",
-		        {{"worker_path", params.worker_path()},
-		         {"worker_pid", std::to_string(conn->GetPid())},
-		         {"result", params.use_pool() ? "miss" : "disabled"},
-		         {"phase", params.phase}});
+		auto fields = BuildConnLogFields(*conn);
+		fields.emplace_back("worker_path", params.worker_path());
+		fields.emplace_back("result", params.use_pool() ? "miss" : "disabled");
+		fields.emplace_back("phase", params.phase);
+		VGI_LOG(context, "worker_pool.acquire", fields);
 	}
 
 	// Attempt bind with single retry for stale pool connections
 	if (!try_bind(false)) {
 		// Pooled worker was stale, retry with fresh
 		conn = create_fresh_connection();
-		VGI_LOG(context, "worker_pool.acquire",
-		        {{"worker_path", params.worker_path()},
-		         {"worker_pid", std::to_string(conn->GetPid())},
-		         {"result", "retry_after_stale"},
-		         {"phase", params.phase}});
+		auto fields = BuildConnLogFields(*conn);
+		fields.emplace_back("worker_path", params.worker_path());
+		fields.emplace_back("result", "retry_after_stale");
+		fields.emplace_back("phase", params.phase);
+		VGI_LOG(context, "worker_pool.acquire", fields);
 		try_bind(true); // Throws if fails, no more retries
 	}
 
@@ -131,7 +129,7 @@ FunctionConnection::FunctionConnection(const std::string &worker_path, const std
                                        const std::vector<VgiSecretRequirement> &required_secrets,
                                        const std::string &data_version_spec,
                                        const std::string &implementation_version)
-    : worker_path_(worker_path), data_version_spec_(data_version_spec),
+    : conn_id_hex_(VgiGenerateConnId()), worker_path_(worker_path), data_version_spec_(data_version_spec),
       implementation_version_(implementation_version), function_name_(function_name), function_type_(function_type),
       arguments_type_(arguments.type), arguments_array_(arguments.array), attach_id_(attach_id),
       transaction_id_(transaction_id), global_execution_id_(global_execution_id), context_(context),
@@ -145,7 +143,8 @@ FunctionConnection::FunctionConnection(std::unique_ptr<PooledWorker> pooled_work
                                        const std::vector<uint8_t> &global_execution_id,
                                        bool worker_debug, const std::map<std::string, Value> &settings,
                                        const std::vector<VgiSecretRequirement> &required_secrets)
-    : worker_path_(pooled_worker->GetKey().worker_path),
+    : conn_id_hex_(VgiGenerateConnId()),
+      worker_path_(pooled_worker->GetKey().worker_path),
       data_version_spec_(pooled_worker->GetKey().data_version_spec),
       implementation_version_(pooled_worker->GetKey().implementation_version),
       function_name_(function_name), function_type_(function_type),
@@ -181,12 +180,13 @@ BindResult FunctionConnection::PerformBindFull() {
 	}
 
 	int64_t num_args = arguments_array_ ? arguments_array_->length() : 0;
-	VGI_LOG(context_, "function_connection.bind",
-	        {{"worker_path", worker_path_},
-	         {"worker_pid", std::to_string(proc_->GetPid())},
-	         {"function_name", function_name_},
-	         {"function_type", function_type_},
-	         {"num_args", std::to_string(num_args)}});
+	{
+		auto fields = BuildConnLogFields(*this);
+		fields.emplace_back("function_name", function_name_);
+		fields.emplace_back("function_type", function_type_);
+		fields.emplace_back("num_args", std::to_string(num_args));
+		VGI_LOG(context_, "function_connection.bind", fields);
+	}
 
 	// Transport: send bind via subprocess stdin/stdout
 	auto transport_fn = [&](const std::vector<uint8_t> &request_bytes) -> std::shared_ptr<arrow::RecordBatch> {
@@ -232,12 +232,13 @@ BindResult FunctionConnection::PerformBindFull() {
 
 	DrainStderrLog();
 
-	VGI_LOG(context_, "function_connection.bind_result",
-	        {{"worker_path", worker_path_},
-	         {"worker_pid", std::to_string(proc_->GetPid())},
-	         {"function_name", function_name_},
-	         {"num_output_columns", std::to_string(bind_result_.output_schema->num_fields())},
-	         {"has_opaque_data", bind_result_.opaque_data.empty() ? "false" : "true"}});
+	{
+		auto fields = BuildConnLogFields(*this);
+		fields.emplace_back("function_name", function_name_);
+		fields.emplace_back("num_output_columns", std::to_string(bind_result_.output_schema->num_fields()));
+		fields.emplace_back("has_opaque_data", bind_result_.opaque_data.empty() ? "false" : "true");
+		VGI_LOG(context_, "function_connection.bind_result", fields);
+	}
 
 	return bind_result_;
 }
@@ -398,14 +399,14 @@ InitResult FunctionConnection::PerformInit(const std::vector<int32_t> &projectio
 	// Drain any buffered stderr from init phase
 	DrainStderrLog();
 
-	VGI_LOG(context_, "function_connection.init_result",
-	        {{"worker_path", worker_path_},
-	         {"worker_pid", std::to_string(proc_->GetPid())},
-	         {"function_name", function_name_},
-	         {"execution_id", BytesToHex(execution_id_)},
-	         {"max_workers", std::to_string(init_response.max_workers)},
-	         {"is_producer_mode", is_producer_mode_ ? "true" : "false"},
-	         {"phase", phase.empty() ? "default" : phase}});
+	{
+		auto fields = BuildConnLogFields(*this);
+		fields.emplace_back("function_name", function_name_);
+		fields.emplace_back("max_workers", std::to_string(init_response.max_workers));
+		fields.emplace_back("is_producer_mode", is_producer_mode_ ? "true" : "false");
+		fields.emplace_back("phase", phase.empty() ? "default" : phase);
+		VGI_LOG(context_, "function_connection.init_result", fields);
+	}
 
 	return InitResult {init_response.execution_id, init_response.max_workers, init_response.opaque_data};
 }
@@ -416,11 +417,11 @@ void FunctionConnection::PerformFinalizeInit() {
 		                    proc_ ? proc_->GetPid() : -1, GetExecutionIdHex());
 	}
 
-	VGI_LOG(context_, "function_connection.finalize_init",
-	        {{"worker_path", worker_path_},
-	         {"worker_pid", std::to_string(proc_->GetPid())},
-	         {"function_name", function_name_},
-	         {"execution_id", GetExecutionIdHex()}});
+	{
+		auto fields = BuildConnLogFields(*this);
+		fields.emplace_back("function_name", function_name_);
+		VGI_LOG(context_, "function_connection.finalize_init", fields);
+	}
 
 	// Close current data exchange streams
 	if (input_writer_ && !input_writer_closed_) {
@@ -589,6 +590,13 @@ std::string FunctionConnection::GetAttachIdHex() const {
 	return BytesToHex(attach_id_);
 }
 
+std::string FunctionConnection::GetTransactionIdHex() const {
+	if (transaction_id_.empty()) {
+		return "";
+	}
+	return BytesToHex(transaction_id_);
+}
+
 void FunctionConnection::SetInputSchema(const std::shared_ptr<arrow::Schema> &input_schema) {
 	if (bind_done_) {
 		ThrowVgiIOException("FunctionConnection::SetInputSchema called after bind", worker_path_,
@@ -633,12 +641,12 @@ void FunctionConnection::OpenInputWriter() {
 	input_writer_ = writer_result.ValueUnsafe();
 	input_writer_opened_ = true;
 
-	VGI_LOG(context_, "function_connection.input_writer_opened",
-	        {{"worker_path", worker_path_},
-	         {"worker_pid", std::to_string(proc_->GetPid())},
-	         {"execution_id", GetExecutionIdHex()},
-	         {"function_name", function_name_},
-	         {"input_schema_fields", std::to_string(input_schema_->num_fields())}});
+	{
+		auto fields = BuildConnLogFields(*this);
+		fields.emplace_back("function_name", function_name_);
+		fields.emplace_back("input_schema_fields", std::to_string(input_schema_->num_fields()));
+		VGI_LOG(context_, "function_connection.input_writer_opened", fields);
+	}
 }
 
 void FunctionConnection::WriteInputBatch(const std::shared_ptr<arrow::RecordBatch> &batch) {
@@ -658,12 +666,12 @@ void FunctionConnection::WriteInputBatch(const std::shared_ptr<arrow::RecordBatc
 		                    GetExecutionIdHex(), write_status.ToString());
 	}
 
-	VGI_LOG(context_, "function_connection.input_batch_written",
-	        {{"worker_path", worker_path_},
-	         {"worker_pid", std::to_string(proc_->GetPid())},
-	         {"execution_id", GetExecutionIdHex()},
-	         {"function_name", function_name_},
-	         {"batch_rows", std::to_string(batch->num_rows())}});
+	{
+		auto fields = BuildConnLogFields(*this);
+		fields.emplace_back("function_name", function_name_);
+		fields.emplace_back("batch_rows", std::to_string(batch->num_rows()));
+		VGI_LOG(context_, "function_connection.input_batch_written", fields);
+	}
 
 	// Drain any buffered stderr
 	DrainStderrLog();
@@ -688,11 +696,11 @@ void FunctionConnection::CloseInputWriter() {
 	input_writer_.reset();
 	input_writer_closed_ = true;
 
-	VGI_LOG(context_, "function_connection.input_writer_closed",
-	        {{"worker_path", worker_path_},
-	         {"worker_pid", std::to_string(proc_->GetPid())},
-	         {"execution_id", GetExecutionIdHex()},
-	         {"function_name", function_name_}});
+	{
+		auto fields = BuildConnLogFields(*this);
+		fields.emplace_back("function_name", function_name_);
+		VGI_LOG(context_, "function_connection.input_writer_closed", fields);
+	}
 
 	// Drain any buffered stderr
 	DrainStderrLog();

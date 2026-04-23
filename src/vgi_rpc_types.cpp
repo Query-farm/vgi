@@ -642,20 +642,36 @@ std::vector<std::vector<uint8_t>> UnwrapBinaryResponseItems(const std::shared_pt
 
 	auto items_col = batch->GetColumnByName("items");
 	if (!items_col) {
-		return items;
+		throw IOException(
+		    "RPC response batch is missing required 'items' column (schema=%s). "
+		    "Expected a column of type List<Binary> where each element is an IPC-serialized info batch.",
+		    batch->schema()->ToString());
 	}
 
 	auto list_array = std::dynamic_pointer_cast<arrow::ListArray>(items_col);
-	if (!list_array || list_array->IsNull(0)) {
+	if (!list_array) {
+		throw IOException(
+		    "RPC response 'items' column has type %s, expected List<Binary>. "
+		    "Each element must be an IPC-serialized info batch. This usually indicates the worker "
+		    "returned an out-of-date response shape.",
+		    items_col->type()->ToString());
+	}
+	if (list_array->IsNull(0)) {
 		return items;
+	}
+
+	auto inner_type_id = list_array->values()->type()->id();
+	if (inner_type_id != arrow::Type::BINARY) {
+		throw IOException(
+		    "RPC response 'items' column has inner type %s, expected Binary. "
+		    "Each element must be an IPC-serialized info batch (List<Binary>). This usually indicates "
+		    "the worker returned an out-of-date response shape (e.g. List<Utf8> of names only).",
+		    list_array->values()->type()->ToString());
 	}
 
 	auto start = list_array->value_offset(0);
 	auto end = list_array->value_offset(1);
-	auto values = std::dynamic_pointer_cast<arrow::BinaryArray>(list_array->values());
-	if (!values) {
-		return items;
-	}
+	auto values = std::static_pointer_cast<arrow::BinaryArray>(list_array->values());
 
 	for (int64_t i = start; i < end; i++) {
 		if (!values->IsNull(i)) {
@@ -676,20 +692,30 @@ std::vector<std::string> UnwrapStringResponseItems(const std::shared_ptr<arrow::
 
 	auto items_col = batch->GetColumnByName("items");
 	if (!items_col) {
-		return items;
+		throw IOException(
+		    "RPC response batch is missing required 'items' column (schema=%s). "
+		    "Expected a column of type List<Utf8>.",
+		    batch->schema()->ToString());
 	}
 
 	auto list_array = std::dynamic_pointer_cast<arrow::ListArray>(items_col);
-	if (!list_array || list_array->IsNull(0)) {
+	if (!list_array) {
+		throw IOException("RPC response 'items' column has type %s, expected List<Utf8>.",
+		                  items_col->type()->ToString());
+	}
+	if (list_array->IsNull(0)) {
 		return items;
+	}
+
+	auto inner_type_id = list_array->values()->type()->id();
+	if (inner_type_id != arrow::Type::STRING) {
+		throw IOException("RPC response 'items' column has inner type %s, expected Utf8.",
+		                  list_array->values()->type()->ToString());
 	}
 
 	auto start = list_array->value_offset(0);
 	auto end = list_array->value_offset(1);
-	auto values = std::dynamic_pointer_cast<arrow::StringArray>(list_array->values());
-	if (!values) {
-		return items;
-	}
+	auto values = std::static_pointer_cast<arrow::StringArray>(list_array->values());
 
 	for (int64_t i = start; i < end; i++) {
 		if (!values->IsNull(i)) {

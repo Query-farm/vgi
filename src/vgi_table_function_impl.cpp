@@ -73,6 +73,7 @@ void PerformVgiTableFunctionBind(ClientContext &context, VgiTableFunctionBindDat
 	auto result = AcquireAndBindConnection(context, params);
 	auto &bind_result = result.bind_result;
 	auto bind_worker_pid = result.connection ? result.connection->GetPid() : -1;
+	auto bind_conn_id = result.connection ? result.connection->GetConnIdHex() : "";
 
 	// At bind time, max_processes is unknown (updated after init)
 	bind_data.max_processes = 1;
@@ -89,11 +90,19 @@ void PerformVgiTableFunctionBind(ClientContext &context, VgiTableFunctionBindDat
 	// the bind RPC is cheap relative to a fresh spawn.
 	if (bind_data.use_pool() && result.connection) {
 		if (auto pooled = result.connection->ReleaseForPooling()) {
-			VgiWorkerPool::Instance().Release(std::move(pooled));
-			VGI_LOG(context, "worker_pool.release",
-			        {{"worker_path", bind_data.worker_path()},
-			         {"worker_pid", std::to_string(bind_worker_pid)},
-			         {"phase", "bind"}});
+			auto rr = VgiWorkerPool::Instance().Release(std::move(pooled));
+			vector<pair<string, string>> fields;
+			fields.emplace_back("conn", bind_conn_id);
+			fields.emplace_back("worker_path", bind_data.worker_path());
+			fields.emplace_back("worker_pid", std::to_string(bind_worker_pid));
+			fields.emplace_back("phase", "bind");
+			fields.emplace_back("pooled", rr.pooled ? "true" : "false");
+			if (!rr.skip_reason.empty()) {
+				fields.emplace_back("skip_reason", rr.skip_reason);
+			}
+			fields.emplace_back("pool_size", std::to_string(rr.pool_size));
+			fields.emplace_back("total", std::to_string(rr.total_pool_size));
+			VGI_LOG(context, "worker_pool.release", fields);
 		}
 		result.connection.reset();
 	}
@@ -120,7 +129,8 @@ void PerformVgiTableFunctionBind(ClientContext &context, VgiTableFunctionBindDat
 	bind_data.all_column_types = return_types;
 
 	VGI_LOG(context, "table_function.bind_result",
-	        {{"worker_path", bind_data.worker_path()},
+	        {{"conn", bind_conn_id},
+	         {"worker_path", bind_data.worker_path()},
 	         {"worker_pid", std::to_string(bind_worker_pid)},
 	         {"function_name", bind_data.function_name},
 	         {"num_columns", std::to_string(bind_result.output_schema->num_fields())}});
@@ -948,7 +958,8 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 	global_state->tick_filter_state = tick_filter_state;
 
 	VGI_LOG(context, "table_function.init_global",
-	        {{"worker_path", bind_data.worker_path()},
+	        {{"conn", global_state->primary_connection->GetConnIdHex()},
+	         {"worker_path", bind_data.worker_path()},
 	         {"worker_pid", std::to_string(global_state->primary_connection->GetPid())},
 	         {"function_name", bind_data.function_name},
 	         {"global_execution_id", BytesToHex(global_state->global_execution_id)},
@@ -1019,7 +1030,8 @@ unique_ptr<LocalTableFunctionState> VgiTableFunctionInitLocal(ExecutionContext &
 	if (primary_connection) {
 		// Primary worker: use connection from bind phase
 		VGI_LOG(context.client, "table_function.init_local",
-		        {{"worker_path", bind_data.worker_path()},
+		        {{"conn", primary_connection->GetConnIdHex()},
+		         {"worker_path", bind_data.worker_path()},
 		         {"worker_pid", std::to_string(primary_connection->GetPid())},
 		         {"function_name", bind_data.function_name},
 		         {"global_execution_id", BytesToHex(global_state.global_execution_id)},
@@ -1050,7 +1062,8 @@ unique_ptr<LocalTableFunctionState> VgiTableFunctionInitLocal(ExecutionContext &
 		local_state->connection->PerformInit();
 
 		VGI_LOG(context.client, "table_function.init_local",
-		        {{"worker_path", bind_data.worker_path()},
+		        {{"conn", local_state->connection->GetConnIdHex()},
+		         {"worker_path", bind_data.worker_path()},
 		         {"worker_pid", std::to_string(local_state->connection->GetPid())},
 		         {"function_name", bind_data.function_name},
 		         {"global_execution_id", BytesToHex(global_state.global_execution_id)},
@@ -1158,7 +1171,8 @@ static bool InstallBatch(ClientContext &context, const VgiTableFunctionBindData 
 	local_state.Reset();
 
 	VGI_LOG(context, "table_function.batch_received",
-	        {{"worker_path", bind_data.worker_path()},
+	        {{"conn", local_state.connection->GetConnIdHex()},
+	         {"worker_path", bind_data.worker_path()},
 	         {"worker_pid", std::to_string(local_state.connection->GetPid())},
 	         {"function_name", bind_data.function_name},
 	         {"batch_rows", std::to_string(arrow_batch->num_rows())}});

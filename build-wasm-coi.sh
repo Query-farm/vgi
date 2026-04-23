@@ -161,7 +161,12 @@ emmake make -C"$BUILD_DIR" -j8
 
 # ── Deploy ───────────────────────────────────────────────────────────────
 mkdir -p "$DEPLOY_DIR"
-cp "$BUILD_DIR"/repository/v1.5.1/wasm_threads/*.duckdb_extension.wasm "$DEPLOY_DIR/"
+REPO_VERSION_DIR=$(ls -d "$BUILD_DIR"/repository/*/wasm_threads 2>/dev/null | head -n1)
+if [ -z "$REPO_VERSION_DIR" ] || ! compgen -G "$REPO_VERSION_DIR/*.duckdb_extension.wasm" > /dev/null; then
+  echo "ERROR: no built wasm extensions found under $BUILD_DIR/repository/*/wasm_threads" >&2
+  exit 1
+fi
+cp "$REPO_VERSION_DIR"/*.duckdb_extension.wasm "$DEPLOY_DIR/"
 
 echo ""
 echo "Deployed to $DEPLOY_DIR:"

@@ -1023,12 +1023,10 @@ static OAuthTokenSet PerformDeviceCodeFlowImpl(const OAuthChallenge &challenge,
 }
 
 // Forward declarations for platform-specific flow implementations
-#ifndef __EMSCRIPTEN__
 static OAuthTokenSet PerformPKCEFlowImpl(const OAuthChallenge &challenge,
                                           const OAuthResourceMetadata &resource_meta,
                                           const OAuthServerMetadata &server_meta,
                                           ClientContext &context);
-#endif
 
 //===--------------------------------------------------------------------===//
 // Auth Flow Orchestrator

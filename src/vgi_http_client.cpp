@@ -163,22 +163,84 @@ static std::string HttpPostArrowIpcInternal(ClientContext &context,
 	}
 
 	if (!out_response->Success()) {
-		// Try to parse Arrow IPC error batch from the response body
-		auto &error_body = post.buffer_out.empty() ? out_response->body : post.buffer_out;
-		if (!error_body.empty()) {
+		std::string error_body = post.buffer_out.empty() ? out_response->body
+		                                                 : std::string(post.buffer_out.data(),
+		                                                               post.buffer_out.data() + post.buffer_out.size());
+		// Decompress if the server advertised zstd — otherwise Arrow IPC parsing
+		// would see a zstd magic number and throw "negative continuation token".
+		if (!error_body.empty() && out_response->HasHeader("X-VGI-Content-Encoding") &&
+		    out_response->GetHeaderValue("X-VGI-Content-Encoding") == "zstd") {
+			try {
+				error_body = ZstdDecompress(error_body.data(), error_body.size());
+			} catch (...) {
+				// Leave body as-is; the raw bytes will appear in the preview.
+			}
+		}
+		std::string content_type = out_response->HasHeader("Content-Type")
+		                               ? out_response->GetHeaderValue("Content-Type")
+		                               : std::string();
+		bool is_arrow_ipc = content_type.find(ARROW_IPC_CONTENT_TYPE) != std::string::npos;
+
+		// If the body looks like Arrow IPC, parse it. Two outcomes:
+		// 1) ReadUnaryResponseFromBuffer dispatches a VGI-protocol error batch and throws
+		//    an IOException with the worker's original message — we re-throw.
+		// 2) It returns a data batch (e.g., a server-specific error representation
+		//    carrying fields like {"exception_type", "exception_message", "traceback"}).
+		//    Extract textual columns as a readable preview.
+		std::string body_preview;
+		if (is_arrow_ipc && !error_body.empty()) {
 			try {
 				auto error_result = ReadUnaryResponseFromBuffer(
 				    reinterpret_cast<const uint8_t *>(error_body.data()),
 				    error_body.size(), nullptr, url);
-			} catch (const IOException &) {
-				throw; // Worker error — propagate with the original message
+				if (error_result.batch) {
+					const auto &batch = error_result.batch;
+					for (int c = 0; c < batch->num_columns() && body_preview.size() < 1024; ++c) {
+						auto col = batch->column(c);
+						auto name = batch->schema()->field(c)->name();
+						auto str = std::dynamic_pointer_cast<arrow::StringArray>(col);
+						auto lstr = std::dynamic_pointer_cast<arrow::LargeStringArray>(col);
+						auto bin = std::dynamic_pointer_cast<arrow::BinaryArray>(col);
+						auto lbin = std::dynamic_pointer_cast<arrow::LargeBinaryArray>(col);
+						for (int64_t i = 0; i < col->length() && body_preview.size() < 1024; ++i) {
+							std::string val;
+							if (str && !str->IsNull(i)) {
+								val = str->GetString(i);
+							} else if (lstr && !lstr->IsNull(i)) {
+								val = lstr->GetString(i);
+							} else if (bin && !bin->IsNull(i)) {
+								auto view = bin->GetView(i);
+								val = std::string(view.data(), view.size());
+							} else if (lbin && !lbin->IsNull(i)) {
+								auto view = lbin->GetView(i);
+								val = std::string(view.data(), view.size());
+							} else {
+								continue;
+							}
+							if (!body_preview.empty()) body_preview += "; ";
+							body_preview += name + "=" + val;
+						}
+					}
+				}
+			} catch (const Exception &) {
+				throw; // VGI worker error (IOException, InvalidInputException, etc.) — propagate
 			} catch (...) {
-				// Not Arrow IPC — fall through to plain error
+				// Not Arrow IPC despite the header — fall through.
 			}
 		}
-		throw IOException("VGI HTTP request failed (HTTP %d): %s [url: %s]",
-		                  static_cast<int>(out_response->status),
-		                  error_body.empty() ? out_response->GetError() : error_body, url);
+		if (body_preview.empty() && !error_body.empty()) {
+			body_preview = error_body;
+		}
+		if (body_preview.size() > 1024) {
+			body_preview.resize(1024);
+			body_preview += "...<truncated>";
+		}
+		throw IOException(
+		    "VGI HTTP request failed (HTTP %d)%s%s: %s [url: %s]",
+		    static_cast<int>(out_response->status),
+		    content_type.empty() ? "" : " Content-Type=",
+		    content_type,
+		    body_preview.empty() ? out_response->GetError() : body_preview, url);
 	}
 
 	// Decompress zstd response if server sent it

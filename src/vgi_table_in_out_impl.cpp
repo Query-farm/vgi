@@ -160,12 +160,21 @@ unique_ptr<FunctionData> VgiTableInOutBind(ClientContext &context, TableFunction
 	// ancillary planner RPCs to spawn fresh workers.
 	if (bind_data->use_pool()) {
 		auto bind_worker_pid = connection->GetPid();
+		auto bind_conn_id = connection->GetConnIdHex();
 		if (auto pooled = connection->ReleaseForPooling()) {
-			VgiWorkerPool::Instance().Release(std::move(pooled));
-			VGI_LOG(context, "worker_pool.release",
-			        {{"worker_path", bind_data->worker_path()},
-			         {"worker_pid", std::to_string(bind_worker_pid)},
-			         {"phase", "bind"}});
+			auto rr = VgiWorkerPool::Instance().Release(std::move(pooled));
+			vector<pair<string, string>> fields;
+			fields.emplace_back("conn", bind_conn_id);
+			fields.emplace_back("worker_path", bind_data->worker_path());
+			fields.emplace_back("worker_pid", std::to_string(bind_worker_pid));
+			fields.emplace_back("phase", "bind");
+			fields.emplace_back("pooled", rr.pooled ? "true" : "false");
+			if (!rr.skip_reason.empty()) {
+				fields.emplace_back("skip_reason", rr.skip_reason);
+			}
+			fields.emplace_back("pool_size", std::to_string(rr.pool_size));
+			fields.emplace_back("total", std::to_string(rr.total_pool_size));
+			VGI_LOG(context, "worker_pool.release", fields);
 		}
 		connection.reset();
 	}
@@ -277,7 +286,8 @@ OperatorResultType VgiTableInOutFunction(ExecutionContext &context, TableFunctio
 	if (HasRemainingBatchData(local_state)) {
 		idx_t rows_copied = ProduceOutputFromBatch(local_state, bind_data.arrow_table, output);
 		VGI_LOG(client_context, "table_in_out.read_output",
-		        {{"worker_path", bind_data.worker_path()},
+		        {{"conn", global_state.connection->GetConnIdHex()},
+		         {"worker_path", bind_data.worker_path()},
 		         {"function_name", bind_data.function_name},
 		         {"output_rows", std::to_string(rows_copied)}});
 		return HasRemainingBatchData(local_state) ? OperatorResultType::HAVE_MORE_OUTPUT
@@ -288,7 +298,8 @@ OperatorResultType VgiTableInOutFunction(ExecutionContext &context, TableFunctio
 	auto input_batch = DataChunkToArrow(client_context, input, bind_data.input_schema);
 
 	VGI_LOG(client_context, "table_in_out.write_input",
-	        {{"worker_path", bind_data.worker_path()},
+	        {{"conn", global_state.connection->GetConnIdHex()},
+	         {"worker_path", bind_data.worker_path()},
 	         {"function_name", bind_data.function_name},
 	         {"input_rows", std::to_string(input_batch->num_rows())}});
 
@@ -315,7 +326,8 @@ OperatorResultType VgiTableInOutFunction(ExecutionContext &context, TableFunctio
 	idx_t rows_copied = ProduceOutputFromBatch(local_state, bind_data.arrow_table, output);
 
 	VGI_LOG(client_context, "table_in_out.read_output",
-	        {{"worker_path", bind_data.worker_path()},
+	        {{"conn", global_state.connection->GetConnIdHex()},
+	         {"worker_path", bind_data.worker_path()},
 	         {"function_name", bind_data.function_name},
 	         {"output_rows", std::to_string(rows_copied)}});
 
@@ -345,14 +357,17 @@ OperatorFinalizeResultType VgiTableInOutFinalize(ExecutionContext &context, Tabl
 		global_state.finalize_sent = true;
 
 		VGI_LOG(client_context, "table_in_out.finalize",
-		        {{"worker_path", bind_data.worker_path()}, {"function_name", bind_data.function_name}});
+		        {{"conn", global_state.connection->GetConnIdHex()},
+		         {"worker_path", bind_data.worker_path()},
+		         {"function_name", bind_data.function_name}});
 	}
 
 	// Continue producing rows from a batch that exceeded STANDARD_VECTOR_SIZE
 	if (HasRemainingBatchData(local_state)) {
 		idx_t rows_copied = ProduceOutputFromBatch(local_state, bind_data.arrow_table, output);
 		VGI_LOG(client_context, "table_in_out.finalize_output",
-		        {{"worker_path", bind_data.worker_path()},
+		        {{"conn", global_state.connection->GetConnIdHex()},
+		         {"worker_path", bind_data.worker_path()},
 		         {"function_name", bind_data.function_name},
 		         {"output_rows", std::to_string(rows_copied)}});
 		// Always return HAVE_MORE_OUTPUT — next call will either continue this batch
@@ -362,18 +377,30 @@ OperatorFinalizeResultType VgiTableInOutFinalize(ExecutionContext &context, Tabl
 
 	// Read next output batch from worker
 	VGI_LOG(client_context, "table_in_out.finalize_reading",
-	        {{"worker_path", bind_data.worker_path()}, {"function_name", bind_data.function_name}});
+	        {{"conn", global_state.connection->GetConnIdHex()},
+	         {"worker_path", bind_data.worker_path()},
+	         {"function_name", bind_data.function_name}});
 	auto output_batch = global_state.connection->ReadDataBatch();
 
 	if (!output_batch || output_batch->num_rows() == 0) {
 		// No more output - clean up
 		if (bind_data.use_pool() && global_state.connection) {
+			auto release_conn_id = global_state.connection->GetConnIdHex();
 			if (auto pooled = global_state.connection->ReleaseForPooling()) {
-				VGI_LOG(client_context, "table_in_out.pool_release",
-				        {{"worker_path", bind_data.worker_path()},
-				         {"function_name", bind_data.function_name},
-				         {"pid", std::to_string(pooled->GetPid())}});
-				VgiWorkerPool::Instance().Release(std::move(pooled));
+				auto released_pid = pooled->GetPid();
+				auto rr = VgiWorkerPool::Instance().Release(std::move(pooled));
+				vector<pair<string, string>> fields;
+				fields.emplace_back("conn", release_conn_id);
+				fields.emplace_back("worker_path", bind_data.worker_path());
+				fields.emplace_back("function_name", bind_data.function_name);
+				fields.emplace_back("worker_pid", std::to_string(released_pid));
+				fields.emplace_back("pooled", rr.pooled ? "true" : "false");
+				if (!rr.skip_reason.empty()) {
+					fields.emplace_back("skip_reason", rr.skip_reason);
+				}
+				fields.emplace_back("pool_size", std::to_string(rr.pool_size));
+				fields.emplace_back("total", std::to_string(rr.total_pool_size));
+				VGI_LOG(client_context, "table_in_out.pool_release", fields);
 			}
 		}
 		return OperatorFinalizeResultType::FINISHED;
@@ -384,19 +411,30 @@ OperatorFinalizeResultType VgiTableInOutFinalize(ExecutionContext &context, Tabl
 	idx_t rows_copied = ProduceOutputFromBatch(local_state, bind_data.arrow_table, output);
 
 	VGI_LOG(client_context, "table_in_out.finalize_output",
-	        {{"worker_path", bind_data.worker_path()},
+	        {{"conn", global_state.connection->GetConnIdHex()},
+	         {"worker_path", bind_data.worker_path()},
 	         {"function_name", bind_data.function_name},
 	         {"output_rows", std::to_string(rows_copied)}});
 
 	// Check if worker is finished and we've exhausted the current batch
 	if (!HasRemainingBatchData(local_state) && global_state.connection->IsFinished()) {
 		if (bind_data.use_pool()) {
+			auto release_conn_id = global_state.connection->GetConnIdHex();
 			if (auto pooled = global_state.connection->ReleaseForPooling()) {
-				VGI_LOG(client_context, "table_in_out.pool_release",
-				        {{"worker_path", bind_data.worker_path()},
-				         {"function_name", bind_data.function_name},
-				         {"pid", std::to_string(pooled->GetPid())}});
-				VgiWorkerPool::Instance().Release(std::move(pooled));
+				auto released_pid = pooled->GetPid();
+				auto rr = VgiWorkerPool::Instance().Release(std::move(pooled));
+				vector<pair<string, string>> fields;
+				fields.emplace_back("conn", release_conn_id);
+				fields.emplace_back("worker_path", bind_data.worker_path());
+				fields.emplace_back("function_name", bind_data.function_name);
+				fields.emplace_back("worker_pid", std::to_string(released_pid));
+				fields.emplace_back("pooled", rr.pooled ? "true" : "false");
+				if (!rr.skip_reason.empty()) {
+					fields.emplace_back("skip_reason", rr.skip_reason);
+				}
+				fields.emplace_back("pool_size", std::to_string(rr.pool_size));
+				fields.emplace_back("total", std::to_string(rr.total_pool_size));
+				VGI_LOG(client_context, "table_in_out.pool_release", fields);
 			}
 		}
 		return OperatorFinalizeResultType::FINISHED;

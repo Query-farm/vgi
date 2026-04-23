@@ -1,13 +1,18 @@
 #include "vgi_logging.hpp"
 #include "duckdb.hpp"
 #include "vgi_exception.hpp"
+#include "vgi_ifunction_connection.hpp"
 #include "yyjson.hpp"
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
+#include <ctime>
 #include <iostream>
 #include <mutex>
+#include <random>
 
 using namespace duckdb_yyjson; // NOLINT
 
@@ -54,15 +59,70 @@ bool VgiStderrLogPrettyEnabled() {
 	return enabled;
 }
 
+// Format current wall-clock time as YYYY-MM-DDTHH:MM:SS.mmm (local time, 23 chars).
+string VgiStderrTimestampPrefix() {
+	auto now = std::chrono::system_clock::now();
+	auto secs = std::chrono::system_clock::to_time_t(now);
+	auto millis = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count() % 1000;
+
+	std::tm tm_buf {};
+#ifdef _WIN32
+	localtime_s(&tm_buf, &secs);
+#else
+	localtime_r(&secs, &tm_buf);
+#endif
+
+	char buf[32];
+	size_t n = std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S", &tm_buf);
+	std::snprintf(buf + n, sizeof(buf) - n, ".%03d", static_cast<int>(millis));
+	return string(buf);
+}
+
+string VgiGenerateConnId() {
+	// Thread-local generator seeded once from random_device. 32 bits → 8 hex chars.
+	static thread_local std::mt19937 rng([] {
+		std::random_device rd;
+		return rd();
+	}());
+	uint32_t v = rng();
+	char buf[9];
+	std::snprintf(buf, sizeof(buf), "%08x", v);
+	return string(buf);
+}
+
+vector<pair<string, string>> BuildConnLogFields(const vgi::IFunctionConnection &conn) {
+	vector<pair<string, string>> fields;
+	fields.emplace_back("conn", conn.GetConnIdHex());
+	auto attach = conn.GetAttachIdHex();
+	if (!attach.empty()) {
+		fields.emplace_back("attach_id", attach);
+	}
+	auto pid = conn.GetPid();
+	if (pid > 0) {
+		fields.emplace_back("worker_pid", std::to_string(pid));
+	}
+	auto exec = conn.GetExecutionIdHex();
+	if (!exec.empty()) {
+		fields.emplace_back("execution_id", exec);
+	}
+	auto tx = conn.GetTransactionIdHex();
+	if (!tx.empty()) {
+		fields.emplace_back("transaction_id", tx);
+	}
+	return fields;
+}
+
 // Write log message to stderr in human-readable format
 void VgiLogToStderr(const string &event, const vector<pair<string, string>> &info) {
 	// Mutex to prevent interleaved output from multiple threads
 	static std::mutex stderr_mutex;
 	std::lock_guard<std::mutex> lock(stderr_mutex);
 
+	auto ts = VgiStderrTimestampPrefix();
+
 	if (VgiStderrLogPrettyEnabled()) {
 		// Pretty format: sorted keys with indentation
-		std::cerr << "[VGI] " << event << std::endl;
+		std::cerr << ts << " [VGI] " << event << std::endl;
 
 		// Sort key-value pairs alphabetically by key
 		auto sorted_info = info;
@@ -74,7 +134,7 @@ void VgiLogToStderr(const string &event, const vector<pair<string, string>> &inf
 		}
 	} else {
 		// Compact format: single line
-		std::cerr << "[VGI] " << event;
+		std::cerr << ts << " [VGI] " << event;
 		for (const auto &kv : info) {
 			std::cerr << " " << kv.first << "=" << kv.second;
 		}

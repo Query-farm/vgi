@@ -37,8 +37,26 @@ bool VgiStderrLogEnabled();
 bool VgiStderrLogPrettyEnabled();
 
 //! Write a log message to stderr in human-readable format.
-//! Format: [VGI] event key1=value1 key2=value2 ...
+//! Format: YYYY-MM-DDTHH:MM:SS.mmm [VGI] event key1=value1 key2=value2 ...
 void VgiLogToStderr(const string &event, const vector<pair<string, string>> &info);
+
+//! Return a millisecond-precision local timestamp prefix (23 chars, no trailing space).
+//! Used by both VgiLogToStderr and the VGI_STDERR_DEBUG macro to prefix every stderr line.
+string VgiStderrTimestampPrefix();
+
+//! Generate a random 8-char hex id. Used as the stable correlation key for a single
+//! IFunctionConnection checkout — see IFunctionConnection::GetConnIdHex().
+string VgiGenerateConnId();
+
+// Forward-declare so we don't need to include the full connection header.
+namespace vgi {
+class IFunctionConnection;
+}
+
+//! Build the standard set of connection-scoped log fields from an IFunctionConnection.
+//! Fields returned (when non-empty): conn, attach_id, worker_pid (only if >0 — omitted for HTTP),
+//! execution_id (once init has run), transaction_id. Call sites append event-specific fields on top.
+vector<pair<string, string>> BuildConnLogFields(const vgi::IFunctionConnection &conn);
 
 //! VGI_LOG - logs to DuckDB and optionally to stderr if VGI_STDERR_LOG=1
 //! Usage: VGI_LOG(context, "event_name", {{"key1", "val1"}, {"key2", "val2"}});
@@ -90,13 +108,15 @@ bool HandleBatchLogMessage(const std::shared_ptr<arrow::RecordBatch> &batch,
                            const std::string &transaction_id_hex = "");
 
 //! VGI_STDERR_DEBUG - lightweight stderr debug logging without requiring a ClientContext.
-//! Uses the same VGI_STDERR_LOG env var as VGI_LOG.
+//! Uses the same VGI_STDERR_LOG env var as VGI_LOG. A millisecond-precision timestamp
+//! is prepended automatically so call sites just pass the event line.
 //! Usage: VGI_STDERR_DEBUG("[VGI] pool.acquire worker=%s\n", path.c_str());
-#define VGI_STDERR_DEBUG(fmt, ...)                          \
-    do {                                                     \
-        if (VgiStderrLogEnabled()) {                         \
-            fprintf(stderr, fmt __VA_OPT__(,) __VA_ARGS__);  \
-        }                                                    \
+#define VGI_STDERR_DEBUG(fmt, ...)                                              \
+    do {                                                                         \
+        if (VgiStderrLogEnabled()) {                                             \
+            fprintf(stderr, "%s " fmt, VgiStderrTimestampPrefix().c_str()        \
+                    __VA_OPT__(,) __VA_ARGS__);                                  \
+        }                                                                        \
     } while (0)
 
 } // namespace duckdb

@@ -266,12 +266,20 @@ struct VgiTableFunctionLocalState : public ArrowScanLocalState {
 		// Return connection to pool if applicable
 		if (attach_params_ && attach_params_->use_pool() && connection) {
 			auto worker_pid = connection->GetPid();
+			auto conn_id = connection->GetConnIdHex();
 			if (auto pooled = connection->ReleaseForPooling()) {
-				VgiWorkerPool::Instance().Release(std::move(pooled));
-				VGI_LOG(context_, "worker_pool.release",
-				        {{"worker_path", attach_params_->worker_path()},
-				         {"worker_pid", std::to_string(worker_pid)},
-				         {"use_pool", "true"}});
+				auto rr = VgiWorkerPool::Instance().Release(std::move(pooled));
+				vector<pair<string, string>> fields;
+				fields.emplace_back("conn", conn_id);
+				fields.emplace_back("worker_path", attach_params_->worker_path());
+				fields.emplace_back("worker_pid", std::to_string(worker_pid));
+				fields.emplace_back("pooled", rr.pooled ? "true" : "false");
+				if (!rr.skip_reason.empty()) {
+					fields.emplace_back("skip_reason", rr.skip_reason);
+				}
+				fields.emplace_back("pool_size", std::to_string(rr.pool_size));
+				fields.emplace_back("total", std::to_string(rr.total_pool_size));
+				VGI_LOG(context_, "worker_pool.release", fields);
 			}
 		}
 	}

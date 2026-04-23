@@ -94,14 +94,22 @@ UnaryResponseResult AttemptUnaryRpc(const UnaryRpcOptions &opts, const std::stri
 		if (!proc->TryWait(&exit_status)) {
 			// Keep the drainer alive across the pool idle period.
 			auto to_pool = std::make_unique<PooledWorker>(std::move(proc), pool_key, std::move(drainer));
+			auto released_pid = to_pool->GetPid();
+			auto rr = VgiWorkerPool::Instance().Release(std::move(to_pool));
 			if (opts.enable_logging) {
-				VGI_LOG(opts.context, "worker_pool.release",
-				        {{"worker_path", opts.worker_path},
-				         {"worker_pid", std::to_string(to_pool->GetPid())},
-				         {"method_name", method_name},
-				         {"phase", opts.phase}});
+				vector<pair<string, string>> fields;
+				fields.emplace_back("worker_path", opts.worker_path);
+				fields.emplace_back("worker_pid", std::to_string(released_pid));
+				fields.emplace_back("method_name", method_name);
+				fields.emplace_back("phase", opts.phase);
+				fields.emplace_back("pooled", rr.pooled ? "true" : "false");
+				if (!rr.skip_reason.empty()) {
+					fields.emplace_back("skip_reason", rr.skip_reason);
+				}
+				fields.emplace_back("pool_size", std::to_string(rr.pool_size));
+				fields.emplace_back("total", std::to_string(rr.total_pool_size));
+				VGI_LOG(opts.context, "worker_pool.release", fields);
 			}
-			VgiWorkerPool::Instance().Release(std::move(to_pool));
 		}
 	}
 

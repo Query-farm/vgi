@@ -70,11 +70,16 @@ VgiScalarFunctionLocalState::~VgiScalarFunctionLocalState() {
 		}
 
 		if (use_pool) {
+			auto conn_id = connection->GetConnIdHex();
 			if (auto pooled = connection->ReleaseForPooling()) {
-				VGI_STDERR_DEBUG("[VGI] scalar.destructor pooled pid=%d\n", pooled->GetPid());
-				vgi::VgiWorkerPool::Instance().Release(std::move(pooled));
+				auto released_pid = pooled->GetPid();
+				auto rr = vgi::VgiWorkerPool::Instance().Release(std::move(pooled));
+				VGI_STDERR_DEBUG("[VGI] scalar.destructor conn=%s worker_pid=%d pooled=%s pool_size=%zu total=%zu\n",
+				                 conn_id.c_str(), released_pid, rr.pooled ? "true" : "false",
+				                 rr.pool_size, rr.total_pool_size);
 			} else {
-				VGI_STDERR_DEBUG("[VGI] scalar.destructor not_pooled pid=%d\n", connection->GetPid());
+				VGI_STDERR_DEBUG("[VGI] scalar.destructor conn=%s worker_pid=%d pooled=false skip_reason=not_poolable\n",
+				                 conn_id.c_str(), connection->GetPid());
 			}
 		}
 	}
@@ -229,12 +234,21 @@ unique_ptr<FunctionData> VgiScalarFunctionBind(ClientContext &context, ScalarFun
 		// from other concurrent planner/catalog RPCs.
 		if (func_info.use_pool()) {
 			auto bind_worker_pid = connection->GetPid();
+			auto bind_conn_id = connection->GetConnIdHex();
 			if (auto pooled = connection->ReleaseForPooling()) {
-				VgiWorkerPool::Instance().Release(std::move(pooled));
-				VGI_LOG(context, "worker_pool.release",
-				        {{"worker_path", func_info.worker_path()},
-				         {"worker_pid", std::to_string(bind_worker_pid)},
-				         {"phase", "bind"}});
+				auto rr = VgiWorkerPool::Instance().Release(std::move(pooled));
+				vector<pair<string, string>> fields;
+				fields.emplace_back("conn", bind_conn_id);
+				fields.emplace_back("worker_path", func_info.worker_path());
+				fields.emplace_back("worker_pid", std::to_string(bind_worker_pid));
+				fields.emplace_back("phase", "bind");
+				fields.emplace_back("pooled", rr.pooled ? "true" : "false");
+				if (!rr.skip_reason.empty()) {
+					fields.emplace_back("skip_reason", rr.skip_reason);
+				}
+				fields.emplace_back("pool_size", std::to_string(rr.pool_size));
+				fields.emplace_back("total", std::to_string(rr.total_pool_size));
+				VGI_LOG(context, "worker_pool.release", fields);
 			}
 			connection.reset();
 		}
@@ -383,7 +397,8 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 		local_state.use_pool = use_pool;
 
 		VGI_LOG(context, "scalar.init",
-		        {{"worker_path", worker_path},
+		        {{"conn", local_state.connection->GetConnIdHex()},
+		         {"worker_path", worker_path},
 		         {"function_name", function_name},
 		         {"input_columns", std::to_string(args.ColumnCount())},
 		         {"const_values", std::to_string(positional_args.size())}});
@@ -400,7 +415,9 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 	auto input_batch = DataChunkToArrow(context, args, local_state.input_schema);
 
 	VGI_LOG(context, "scalar.write_input",
-	        {{"function_name", func_info.function_name}, {"input_rows", std::to_string(input_batch->num_rows())}});
+	        {{"conn", local_state.connection->GetConnIdHex()},
+	         {"function_name", func_info.function_name},
+	         {"input_rows", std::to_string(input_batch->num_rows())}});
 
 	// Write input and read output
 	local_state.connection->WriteInputBatch(input_batch);
@@ -422,7 +439,9 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 	}
 
 	VGI_LOG(context, "scalar.read_output",
-	        {{"function_name", func_info.function_name}, {"output_rows", std::to_string(output_batch->num_rows())}});
+	        {{"conn", local_state.connection->GetConnIdHex()},
+	         {"function_name", func_info.function_name},
+	         {"output_rows", std::to_string(output_batch->num_rows())}});
 
 	// Convert Arrow result to DuckDB Vector using DuckDB's built-in ArrowToDuckDB
 	// This supports all DuckDB types (including dates, timestamps, lists, structs, etc.)

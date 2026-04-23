@@ -127,13 +127,16 @@ std::unique_ptr<PooledWorker> VgiWorkerPool::TryAcquire(const PoolKey &key) {
 	return nullptr;
 }
 
-void VgiWorkerPool::Release(std::unique_ptr<PooledWorker> worker) {
+VgiWorkerPool::ReleaseResult VgiWorkerPool::Release(std::unique_ptr<PooledWorker> worker) {
+	ReleaseResult result;
 	if (!worker) {
-		return;
+		return result;
 	}
+	result.pid = worker->GetPid();
+
 	if (!worker->IsAlive()) {
-		VGI_STDERR_DEBUG("[VGI] pool.release worker_not_alive pid=%d\n", worker->GetPid());
-		return; // Don't pool dead workers
+		result.skip_reason = "dead";
+		return result; // Don't pool dead workers
 	}
 
 	std::lock_guard<std::mutex> lock(mutex_);
@@ -148,21 +151,24 @@ void VgiWorkerPool::Release(std::unique_ptr<PooledWorker> worker) {
 	const auto &settings = (config_it != path_configs_.end()) ? config_it->second : default_settings_;
 
 	if (settings.max_pool_size == 0) {
-		VGI_STDERR_DEBUG("[VGI] pool.release pool_disabled pid=%d path=%s\n",
-		                 worker->GetPid(), path.c_str());
-		return;
+		result.skip_reason = "disabled";
+		result.total_pool_size = TotalPoolSizeLocked();
+		return result;
 	}
 	auto &bucket = pools_[key];
 	if (bucket.size() >= settings.max_pool_size) {
-		VGI_STDERR_DEBUG("[VGI] pool.release path_pool_full pid=%d path=%s size=%zu max=%zu\n",
-		                 worker->GetPid(), path.c_str(), bucket.size(), settings.max_pool_size);
-		return;
+		result.skip_reason = "path_full";
+		result.pool_size = bucket.size();
+		result.total_pool_size = TotalPoolSizeLocked();
+		return result;
 	}
 
 	worker->SetIdleTimeout(std::chrono::seconds(settings.idle_timeout_seconds));
 	bucket.push_back(std::move(worker));
-	VGI_STDERR_DEBUG("[VGI] pool.release added worker_path=%s pool_size=%zu total=%zu\n",
-	                 path.c_str(), bucket.size(), TotalPoolSizeLocked());
+	result.pooled = true;
+	result.pool_size = bucket.size();
+	result.total_pool_size = TotalPoolSizeLocked();
+	return result;
 }
 
 size_t VgiWorkerPool::Flush() {

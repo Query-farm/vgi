@@ -220,6 +220,14 @@ public:
 	// Get the attach ID as hex string (empty if no attach_id)
 	std::string GetAttachIdHex() const override;
 
+	// Get the transaction ID as hex string (empty if no transaction_id)
+	std::string GetTransactionIdHex() const override;
+
+	// Stable 8-hex correlation id for this connection checkout
+	std::string GetConnIdHex() const override {
+		return conn_id_hex_;
+	}
+
 	// Wait for worker process to exit
 	int Wait() override;
 
@@ -236,6 +244,8 @@ public:
 	FunctionConnection &operator=(FunctionConnection &&) = delete;
 
 private:
+	// Per-checkout correlation id (8 hex). Generated at construction.
+	std::string conn_id_hex_;
 	std::string worker_path_;
 	// Pool-key dimensions. Populated from VgiAttachParameters when the
 	// connection is created so ReleaseForPooling can route the worker back

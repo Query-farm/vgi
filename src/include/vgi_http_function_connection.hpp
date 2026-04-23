@@ -76,6 +76,8 @@ public:
 	pid_t GetPid() const override { return -1; }
 	std::string GetExecutionIdHex() const override;
 	std::string GetAttachIdHex() const override;
+	std::string GetTransactionIdHex() const override;
+	std::string GetConnIdHex() const override { return conn_id_hex_; }
 
 	// Lifecycle (no-ops for HTTP — no subprocess to pool)
 	int Wait() override { return 0; }
@@ -86,6 +88,8 @@ public:
 	HttpFunctionConnection &operator=(const HttpFunctionConnection &) = delete;
 
 private:
+	// Per-checkout correlation id (8 hex). Generated at construction.
+	std::string conn_id_hex_;
 	std::string base_url_;  // e.g. "http://localhost:8000/vgi"
 	std::string function_name_;
 	std::string function_type_;

@@ -38,7 +38,8 @@ HttpFunctionConnection::HttpFunctionConnection(
     bool worker_debug, const std::map<std::string, Value> &settings,
     const std::vector<VgiSecretRequirement> &required_secrets,
     const std::shared_ptr<VgiAttachParameters> &attach_params)
-    : base_url_(worker_path), function_name_(function_name), function_type_(function_type),
+    : conn_id_hex_(VgiGenerateConnId()), base_url_(worker_path),
+      function_name_(function_name), function_type_(function_type),
       arguments_type_(arguments.type), arguments_array_(arguments.array), attach_id_(attach_id),
       transaction_id_(transaction_id), global_execution_id_(global_execution_id), context_(context),
       worker_debug_(worker_debug), settings_(settings), required_secrets_(required_secrets),
@@ -65,6 +66,13 @@ std::string HttpFunctionConnection::GetAttachIdHex() const {
 		return "";
 	}
 	return BytesToHex(attach_id_);
+}
+
+std::string HttpFunctionConnection::GetTransactionIdHex() const {
+	if (transaction_id_.empty()) {
+		return "";
+	}
+	return BytesToHex(transaction_id_);
 }
 
 // ============================================================================
@@ -220,10 +228,13 @@ BindResult HttpFunctionConnection::PerformBindFull() {
 		return bind_result_;
 	}
 
-	VGI_LOG(context_, "http_function_connection.bind",
-	        {{"url", base_url_},
-	         {"function_name", function_name_},
-	         {"function_type", function_type_}});
+	{
+		auto fields = BuildConnLogFields(*this);
+		fields.emplace_back("url", base_url_);
+		fields.emplace_back("function_name", function_name_);
+		fields.emplace_back("function_type", function_type_);
+		VGI_LOG(context_, "http_function_connection.bind", fields);
+	}
 
 	// Transport: send bind via HTTP
 	auto transport_fn = [&](const std::vector<uint8_t> &request_bytes) -> std::shared_ptr<arrow::RecordBatch> {
@@ -251,10 +262,12 @@ BindResult HttpFunctionConnection::PerformBindFull() {
 	                                    base_url_, transport_fn);
 	bind_done_ = true;
 
-	VGI_LOG(context_, "http_function_connection.bind_result",
-	        {{"url", base_url_},
-	         {"function_name", function_name_},
-	         {"num_output_columns", std::to_string(bind_result_.output_schema->num_fields())}});
+	{
+		auto fields = BuildConnLogFields(*this);
+		fields.emplace_back("function_name", function_name_);
+		fields.emplace_back("num_output_columns", std::to_string(bind_result_.output_schema->num_fields()));
+		VGI_LOG(context_, "http_function_connection.bind_result", fields);
+	}
 
 	return bind_result_;
 }
@@ -325,10 +338,13 @@ InitResult HttpFunctionConnection::PerformInit(const std::vector<int32_t> &proje
 	// POST to {base_url}/init/init
 	std::string init_url = base_url_ + "/init/init";
 
-	VGI_LOG(context_, "http_function_connection.init",
-	        {{"url", init_url},
-	         {"function_name", function_name_},
-	         {"phase", phase.empty() ? "default" : phase}});
+	{
+		auto fields = BuildConnLogFields(*this);
+		fields.emplace_back("url", init_url);
+		fields.emplace_back("function_name", function_name_);
+		fields.emplace_back("phase", phase.empty() ? "default" : phase);
+		VGI_LOG(context_, "http_function_connection.init", fields);
+	}
 
 	auto auth = attach_params_ ? attach_params_->auth() : nullptr;
 	auto response_body = HttpPostArrowIpc(context_, init_url, body, auth);
@@ -365,14 +381,15 @@ InitResult HttpFunctionConnection::PerformInit(const std::vector<int32_t> &proje
 
 	init_done_ = true;
 
-	VGI_LOG(context_, "http_function_connection.init_result",
-	        {{"url", base_url_},
-	         {"function_name", function_name_},
-	         {"execution_id", BytesToHex(execution_id_)},
-	         {"max_workers", std::to_string(init_response.max_workers)},
-	         {"is_producer_mode", is_producer_mode_ ? "true" : "false"},
-	         {"buffered_batches", std::to_string(buffered_batches_.size())},
-	         {"has_state_token", stream_state_token_.empty() ? "false" : "true"}});
+	{
+		auto fields = BuildConnLogFields(*this);
+		fields.emplace_back("function_name", function_name_);
+		fields.emplace_back("max_workers", std::to_string(init_response.max_workers));
+		fields.emplace_back("is_producer_mode", is_producer_mode_ ? "true" : "false");
+		fields.emplace_back("buffered_batches", std::to_string(buffered_batches_.size()));
+		fields.emplace_back("has_state_token", stream_state_token_.empty() ? "false" : "true");
+		VGI_LOG(context_, "http_function_connection.init_result", fields);
+	}
 
 	return InitResult {init_response.execution_id, init_response.max_workers, init_response.opaque_data};
 }
@@ -382,10 +399,11 @@ void HttpFunctionConnection::PerformFinalizeInit() {
 		throw IOException("HttpFunctionConnection::PerformFinalizeInit called before PerformInit [url: %s]", base_url_);
 	}
 
-	VGI_LOG(context_, "http_function_connection.finalize_init",
-	        {{"url", base_url_},
-	         {"function_name", function_name_},
-	         {"execution_id", GetExecutionIdHex()}});
+	{
+		auto fields = BuildConnLogFields(*this);
+		fields.emplace_back("function_name", function_name_);
+		VGI_LOG(context_, "http_function_connection.finalize_init", fields);
+	}
 
 	// Reset state for the FINALIZE phase
 	init_done_ = false;
@@ -471,8 +489,11 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 
 		std::string exchange_url = base_url_ + "/init/exchange";
 
-		VGI_LOG(context_, "http_function_connection.producer_exchange",
-		        {{"url", exchange_url}, {"function_name", function_name_}});
+		{
+			auto fields = BuildConnLogFields(*this);
+			fields.emplace_back("function_name", function_name_);
+			VGI_LOG(context_, "http_function_connection.producer_exchange", fields);
+		}
 
 		auto p_auth = attach_params_ ? attach_params_->auth() : nullptr;
 		auto response_body = HttpPostArrowIpc(context_, exchange_url, body, p_auth);

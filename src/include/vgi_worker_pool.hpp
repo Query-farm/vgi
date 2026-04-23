@@ -135,10 +135,22 @@ public:
 	// version constraints form separate pool buckets.
 	std::unique_ptr<PooledWorker> TryAcquire(const PoolKey &key);
 
+	// Outcome of a Release() call. Callers use this to emit a single unified
+	// log line covering both the outer "worker_pool.release" event and the
+	// resulting pool state (pool_size / total), instead of stacking multiple
+	// near-identical lines at different layers.
+	struct ReleaseResult {
+		bool pooled = false;         // True if the worker was added to the pool
+		pid_t pid = -1;              // PID of the released worker (-1 if input was null)
+		std::string skip_reason;     // Populated when pooled=false: "dead", "disabled", "path_full"
+		size_t pool_size = 0;        // Size of this key's bucket after the release
+		size_t total_pool_size = 0;  // Total pooled workers across all buckets after the release
+	};
+
 	// Return a worker to the pool for reuse. Uses per-path config (from
 	// ConfigurePath) if available, otherwise default settings. Release routes
 	// back to the bucket identified by ``worker->GetKey()``.
-	void Release(std::unique_ptr<PooledWorker> worker);
+	ReleaseResult Release(std::unique_ptr<PooledWorker> worker);
 
 	// Set default pool settings for paths without explicit per-path config
 	// (e.g., direct vgi_table_function() calls that don't go through ATTACH).

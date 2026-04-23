@@ -76,7 +76,14 @@ static std::shared_ptr<arrow::RecordBatch> ExtractAndDeserializeResult(
 	}
 
 	auto view = binary_array->GetView(0);
-	return DeserializeFromIpcBytes(reinterpret_cast<const uint8_t *>(view.data()), view.size());
+	try {
+		return DeserializeFromIpcBytes(reinterpret_cast<const uint8_t *>(view.data()), view.size());
+	} catch (const std::exception &e) {
+		throw IOException(
+		    "Failed to deserialize IPC response for %s from worker [worker: %s]: %s. "
+		    "The worker likely returned a malformed or out-of-date response shape for this method.",
+		    method_name, worker_path, e.what());
+	}
 }
 
 // ============================================================================

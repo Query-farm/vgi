@@ -82,6 +82,12 @@ public:
 	virtual pid_t GetPid() const = 0;
 	virtual std::string GetExecutionIdHex() const = 0;
 	virtual std::string GetAttachIdHex() const = 0;
+	virtual std::string GetTransactionIdHex() const = 0;
+	//! Stable short hex id for this connection checkout. Generated at construction,
+	//! unique per IFunctionConnection instance regardless of transport. Use as the
+	//! primary correlation key in log lines: one `conn=<hex>` covers the full
+	//! bind → init → data → release lifecycle for a single checkout.
+	virtual std::string GetConnIdHex() const = 0;
 
 	// Lifecycle
 	virtual int Wait() = 0;
