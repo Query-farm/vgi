@@ -122,7 +122,7 @@ UnaryResponseResult InvokePooledUnaryRpc(const UnaryRpcOptions &opts, const std:
                                           const std::shared_ptr<arrow::RecordBatch> &params) {
 	if (IsHttpTransport(opts.worker_path)) {
 		return HttpInvokeUnary(opts.context, opts.worker_path, method_name, params, opts.auth,
-		                        opts.cookie_jar);
+		                        opts.cookie_jar, opts.cached_http_params);
 	}
 
 	try {

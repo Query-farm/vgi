@@ -34,6 +34,37 @@ namespace duckdb {
 namespace vgi {
 
 // ============================================================================
+// VgiAttachParameters — HTTPParams cache accessor
+// ============================================================================
+
+// See the comment on GetOrInitHttpParams in vgi_catalog_api.hpp for the
+// rationale. Initialization happens once per catalog; subsequent RPCs reuse
+// the same HTTPParams, which is how we avoid re-entering the secret manager
+// (and its MetaTransaction mutex) from under VgiTransaction::Start on HTTP
+// transport.
+std::shared_ptr<HTTPParams> VgiAttachParameters::GetOrInitHttpParams(
+    ClientContext &context, const std::string &url) const {
+	std::lock_guard<std::mutex> lock(http_params_mutex_);
+	if (!cached_http_params_) {
+		auto &db = *context.db;
+		auto &http_util = HTTPUtil::Get(db);
+		auto owned = http_util.InitializeParameters(context, url);
+		cached_http_params_ = std::shared_ptr<HTTPParams>(owned.release());
+		// Mirror the per-call ApplyHttpTimeout that HttpPostArrowIpcInternal
+		// used to do. Captured once at cache-init time — vgi_http_timeout_seconds
+		// changes won't be picked up without re-ATTACH. See the TODO on the
+		// method declaration.
+		Value timeout_val;
+		if (context.TryGetCurrentSetting("vgi_http_timeout_seconds", timeout_val)) {
+			cached_http_params_->timeout = static_cast<uint64_t>(timeout_val.GetValue<int64_t>());
+		} else {
+			cached_http_params_->timeout = 300;
+		}
+	}
+	return cached_http_params_;
+}
+
+// ============================================================================
 // RPC-based Catalog API Helper
 // ============================================================================
 
@@ -61,6 +92,13 @@ static UnaryResponseResult InvokeRpcMethod(const CatalogRpcContext &ctx, const s
 	                      "rpc_catalog",
 	                      ctx.params->auth(),
 	                      ctx.params->cookie_jar()};
+	// Cache-hit on the HTTP path: avoids re-entering the secret manager (and
+	// thus the MetaTransaction mutex) for RPCs invoked from inside
+	// VgiTransaction::Start. No-op for subprocess transport. See the TODO on
+	// VgiAttachParameters::GetOrInitHttpParams.
+	if (IsHttpTransport(ctx.params->worker_path())) {
+		opts.cached_http_params = ctx.params->GetOrInitHttpParams(context, ctx.params->worker_path());
+	}
 	return InvokePooledUnaryRpc(opts, method_name, params);
 }
 

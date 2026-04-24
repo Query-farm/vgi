@@ -7,6 +7,7 @@
 
 #include <arrow/api.h>
 
+#include "duckdb/common/http_util.hpp"
 #include "duckdb/main/client_context.hpp"
 
 #include "vgi_rpc_client.hpp"
@@ -29,12 +30,19 @@ constexpr const char *ARROW_IPC_CONTENT_TYPE = "application/vnd.apache.arrow.str
 // cookie_jar: per-catalog HTTP cookie store. Null skips Cookie / Set-Cookie
 // handling entirely. Non-null means request carries a Cookie header built
 // from the jar, and any Set-Cookie response headers update the jar.
+// cached_http_params: optional per-catalog HTTPParams cache. When non-null,
+// HttpPostArrowIpcInternal will reuse it instead of calling
+// HTTPUtil::InitializeParameters, which would otherwise re-enter the secret
+// manager on every RPC (deadlock hazard under the MetaTransaction mutex — see
+// https://github.com/duckdb/duckdb/issues/22258). Callers that have a
+// VgiAttachParameters should pass params->GetOrInitHttpParams(context, url).
 UnaryResponseResult HttpInvokeUnary(ClientContext &context,
                                      const std::string &worker_path,
                                      const std::string &method_name,
                                      const std::shared_ptr<arrow::RecordBatch> &params,
                                      const std::shared_ptr<CatalogAuth> &auth = nullptr,
-                                     const std::shared_ptr<SessionCookieJar> &cookie_jar = nullptr);
+                                     const std::shared_ptr<SessionCookieJar> &cookie_jar = nullptr,
+                                     const std::shared_ptr<HTTPParams> &cached_http_params = nullptr);
 
 // POST Arrow IPC bytes to a URL, return raw response body bytes.
 // Used for catalog, stream init, and exchange operations.
@@ -45,7 +53,8 @@ std::string HttpPostArrowIpc(ClientContext &context,
                               const std::string &url,
                               const std::vector<uint8_t> &body,
                               const std::shared_ptr<CatalogAuth> &auth = nullptr,
-                              const std::shared_ptr<SessionCookieJar> &cookie_jar = nullptr);
+                              const std::shared_ptr<SessionCookieJar> &cookie_jar = nullptr,
+                              const std::shared_ptr<HTTPParams> &cached_http_params = nullptr);
 
 // HTTP GET raw bytes from a URL. Used for fetching externalized batches.
 // Handles X-VGI-Content-Encoding: zstd decompression. No auth headers sent.

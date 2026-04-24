@@ -5,6 +5,7 @@
 
 #include <arrow/api.h>
 
+#include "duckdb/common/http_util.hpp"
 #include "duckdb/main/client_context.hpp"
 
 #include "vgi_rpc_client.hpp"
@@ -39,6 +40,12 @@ struct UnaryRpcOptions {
 	// HTTP cookie jar for sticky-session routing. Null on subprocess transport
 	// and for pre-attach RPCs that have no per-catalog state yet.
 	std::shared_ptr<SessionCookieJar> cookie_jar;
+	// Per-catalog HTTPParams cache. Populated at ATTACH (or lazily on first
+	// HTTP RPC) and reused by all subsequent HTTP requests for this catalog —
+	// avoids re-entering the secret manager (and its MetaTransaction mutex) on
+	// each call. TODO(#22258): drop this field once the upstream DuckDB bug is
+	// fixed (https://github.com/duckdb/duckdb/issues/22258).
+	std::shared_ptr<HTTPParams> cached_http_params;
 	// When false, the RPC path skips all VGI_LOG calls (pool acquire/release,
 	// stale events) and skips StderrDrainer::DrainToLog. Set false only for
 	// best-effort calls that run off the main thread during pipeline teardown

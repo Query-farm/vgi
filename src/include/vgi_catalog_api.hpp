@@ -3,10 +3,13 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+#include "duckdb/common/http_util.hpp"
 
 #include <arrow/api.h>
 
@@ -63,6 +66,24 @@ struct VgiAttachParameters {
 	      implementation_version_(std::move(implementation_version)), cookie_jar_(std::move(cookie_jar)) {
 	}
 
+	// Lazy-initialized, per-catalog HTTPParams cache.
+	//
+	// TODO(#22258): revisit once the upstream DuckDB issue is resolved. We cache
+	// HTTPParams because HTTPFSUtil::InitializeParameters reaches into the secret
+	// manager, which takes the MetaTransaction mutex. Calling it from inside
+	// VgiTransaction::Start (which already holds that mutex) deadlocks on HTTP
+	// transport — see https://github.com/duckdb/duckdb/issues/22258. Priming the
+	// cache during ATTACH (outside any transaction) avoids the reentrancy.
+	//
+	// Side effect: session settings like vgi_http_timeout_seconds,
+	// http_proxy, bearer_token secrets, extra_http_headers, TLS options etc. are
+	// captured once per catalog and never refreshed. If the user mutates them
+	// mid-session they won't take effect until re-ATTACH. Acceptable short-term;
+	// a proper fix is to make the upstream secret read lock-free, or to move
+	// CheckAndInvalidateCache off the Transaction::Start hot path so HTTP I/O
+	// never happens under the MetaTransaction lock in the first place.
+	std::shared_ptr<HTTPParams> GetOrInitHttpParams(ClientContext &context, const std::string &url) const;
+
 	const std::string &worker_path() const {
 		return worker_path_;
 	}
@@ -110,6 +131,10 @@ private:
 	std::string data_version_spec_;
 	std::string implementation_version_;
 	std::shared_ptr<SessionCookieJar> cookie_jar_;
+
+	// See GetOrInitHttpParams above for the rationale behind caching these.
+	mutable std::mutex http_params_mutex_;
+	mutable std::shared_ptr<HTTPParams> cached_http_params_;
 };
 
 // Bundles all catalog state needed for an RPC call.

@@ -240,7 +240,10 @@ BindResult HttpFunctionConnection::PerformBindFull() {
 	auto transport_fn = [&](const std::vector<uint8_t> &request_bytes) -> std::shared_ptr<arrow::RecordBatch> {
 		auto rpc_params = BuildBindRpcParams(request_bytes);
 		auto auth = attach_params_ ? attach_params_->auth() : nullptr;
-		auto resp = HttpInvokeUnary(context_, base_url_, "bind", rpc_params, auth);
+		auto cached_params = attach_params_
+		    ? attach_params_->GetOrInitHttpParams(context_, base_url_) : nullptr;
+		auto resp = HttpInvokeUnary(context_, base_url_, "bind", rpc_params, auth,
+		                             /*cookie_jar=*/nullptr, cached_params);
 		if (!resp.batch || resp.batch->num_rows() == 0) {
 			throw IOException("Empty bind response from HTTP server [url: %s]", base_url_);
 		}
@@ -347,7 +350,10 @@ InitResult HttpFunctionConnection::PerformInit(const std::vector<int32_t> &proje
 	}
 
 	auto auth = attach_params_ ? attach_params_->auth() : nullptr;
-	auto response_body = HttpPostArrowIpc(context_, init_url, body, auth);
+	auto cached_params_init = attach_params_
+	    ? attach_params_->GetOrInitHttpParams(context_, init_url) : nullptr;
+	auto response_body = HttpPostArrowIpc(context_, init_url, body, auth,
+	                                        /*cookie_jar=*/nullptr, cached_params_init);
 
 	// Parse response: header IPC stream + data IPC stream
 	auto header_result = ReadStreamHeaderFromBuffer(
@@ -496,7 +502,10 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 		}
 
 		auto p_auth = attach_params_ ? attach_params_->auth() : nullptr;
-		auto response_body = HttpPostArrowIpc(context_, exchange_url, body, p_auth);
+		auto p_cached_params = attach_params_
+		    ? attach_params_->GetOrInitHttpParams(context_, exchange_url) : nullptr;
+		auto response_body = HttpPostArrowIpc(context_, exchange_url, body, p_auth,
+		                                        /*cookie_jar=*/nullptr, p_cached_params);
 
 		// Parse response — buffer new data batches
 		BufferDataBatches(response_body);
@@ -549,7 +558,10 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 	std::string exchange_url = base_url_ + "/init/exchange";
 
 	auto x_auth = attach_params_ ? attach_params_->auth() : nullptr;
-	auto response_body = HttpPostArrowIpc(context_, exchange_url, body, x_auth);
+	auto x_cached_params = attach_params_
+	    ? attach_params_->GetOrInitHttpParams(context_, exchange_url) : nullptr;
+	auto response_body = HttpPostArrowIpc(context_, exchange_url, body, x_auth,
+	                                        /*cookie_jar=*/nullptr, x_cached_params);
 
 	// Parse response — copy into owning buffer since Arrow IPC reads zero-copy reference it
 	auto buffer = arrow::Buffer::FromString(std::move(response_body));

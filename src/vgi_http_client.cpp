@@ -114,18 +114,33 @@ static std::vector<std::string> CollectSetCookieHeaders(const HTTPResponse &resp
 	return out;
 }
 
-// Internal: perform a single HTTP POST with optional auth header
+// Internal: perform a single HTTP POST with optional auth header.
+//
+// cached_http_params: when non-null, use it instead of calling
+// HTTPUtil::InitializeParameters. The cached path avoids re-entering the
+// secret manager (which takes the MetaTransaction mutex) on every request —
+// required for HTTP RPCs invoked from VgiTransaction::Start to not deadlock.
+// TODO(#22258): drop when https://github.com/duckdb/duckdb/issues/22258 is fixed.
 static std::string HttpPostArrowIpcInternal(ClientContext &context,
                                              const std::string &url,
                                              const std::vector<uint8_t> &body,
                                              const std::string &bearer_token,
                                              const std::shared_ptr<SessionCookieJar> &cookie_jar,
-                                             std::unique_ptr<HTTPResponse> &out_response) {
+                                             std::unique_ptr<HTTPResponse> &out_response,
+                                             const std::shared_ptr<HTTPParams> &cached_http_params = nullptr) {
 	auto &db = *context.db;
 	auto &http_util = HTTPUtil::Get(db);
-	auto params = http_util.InitializeParameters(context, url);
 
-	ApplyHttpTimeout(context, *params);
+	// Reuse the cached HTTPParams when available (see cache rationale above);
+	// otherwise fall back to a per-request InitializeParameters (still used by
+	// call sites that don't have a VgiAttachParameters to cache on, e.g. the
+	// very first catalog_attach before we have an attach handle).
+	std::shared_ptr<HTTPParams> params = cached_http_params;
+	if (!params) {
+		auto owned = http_util.InitializeParameters(context, url);
+		params = std::shared_ptr<HTTPParams>(owned.release());
+		ApplyHttpTimeout(context, *params);
+	}
 
 	// Compress the request body with zstd
 	auto compressed_body = ZstdCompress(body.data(), body.size());
@@ -273,7 +288,8 @@ std::string HttpPostArrowIpc(ClientContext &context,
                               const std::string &url,
                               const std::vector<uint8_t> &body,
                               const std::shared_ptr<CatalogAuth> &auth,
-                              const std::shared_ptr<SessionCookieJar> &cookie_jar) {
+                              const std::shared_ptr<SessionCookieJar> &cookie_jar,
+                              const std::shared_ptr<HTTPParams> &cached_http_params) {
 	// Get cached token from per-catalog auth (if any)
 	std::string token;
 	if (auth) {
@@ -281,7 +297,7 @@ std::string HttpPostArrowIpc(ClientContext &context,
 	}
 
 	std::unique_ptr<HTTPResponse> response;
-	auto result = HttpPostArrowIpcInternal(context, url, body, token, cookie_jar, response);
+	auto result = HttpPostArrowIpcInternal(context, url, body, token, cookie_jar, response, cached_http_params);
 
 	if (response->status != HTTPStatusCode::Unauthorized_401) {
 		return result;
@@ -320,7 +336,7 @@ std::string HttpPostArrowIpc(ClientContext &context,
 	auto new_token = auth->HandleUnauthorized(*challenge, context);
 
 	// Retry with new token
-	result = HttpPostArrowIpcInternal(context, url, body, new_token, cookie_jar, response);
+	result = HttpPostArrowIpcInternal(context, url, body, new_token, cookie_jar, response, cached_http_params);
 	if (response->status == HTTPStatusCode::Unauthorized_401) {
 		throw IOException("VGI HTTP authentication failed after auth flow (HTTP 401) [url: %s]. "
 		                  "Response: %s", url, response->body);
@@ -334,7 +350,8 @@ UnaryResponseResult HttpInvokeUnary(ClientContext &context,
                                      const std::string &method_name,
                                      const std::shared_ptr<arrow::RecordBatch> &params,
                                      const std::shared_ptr<CatalogAuth> &auth,
-                                     const std::shared_ptr<SessionCookieJar> &cookie_jar) {
+                                     const std::shared_ptr<SessionCookieJar> &cookie_jar,
+                                     const std::shared_ptr<HTTPParams> &cached_http_params) {
 	std::string base_url = NormalizeBaseUrl(worker_path);
 	std::string url = base_url + "/" + method_name;
 
@@ -350,7 +367,7 @@ UnaryResponseResult HttpInvokeUnary(ClientContext &context,
 	}
 
 	// POST to {worker_path}/{method_name} using standard HTTP timeout
-	auto response_body = HttpPostArrowIpc(context, url, body, auth, cookie_jar);
+	auto response_body = HttpPostArrowIpc(context, url, body, auth, cookie_jar, cached_http_params);
 
 	// Parse the Arrow IPC response
 	auto result = ReadUnaryResponseFromBuffer(
