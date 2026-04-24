@@ -230,24 +230,53 @@ enum class PrefetchState : uint8_t {
 	ERROR      //! Prefetch completed with an error
 };
 
-// Forward declaration
-struct VgiTableFunctionLocalState;
+// ============================================================================
+// VgiPrefetchSlot - Shared ownership of connection + prefetch state
+// ============================================================================
+
+//! Holds the pieces that a VgiPrefetchTask needs (connection + prefetch
+//! result slots) as an independently-owned shared object. The local state
+//! holds a shared_ptr to the slot; each scheduled VgiPrefetchTask takes its
+//! own shared_ptr copy.
+//!
+//! Why shared ownership: under query cancellation DuckDB's
+//! ``Executor::CancelTasks`` clears pipelines (destroying the
+//! ``VgiTableFunctionLocalState``) BEFORE draining the scheduler's pending
+//! task queue. If the task held a raw reference to the local state, its
+//! ``connection->ReadDataBatch()`` call would dereference freed memory.
+//! With the connection living inside this slot, the task's shared_ptr keeps
+//! it alive until the task finishes; the ``cancelled`` flag lets the task
+//! short-circuit instead of doing real I/O when the local state is gone.
+struct VgiPrefetchSlot {
+	// Connection to the VGI worker — owned here so slot lifetime governs it.
+	std::unique_ptr<IFunctionConnection> connection;
+	// Prefetch state machine (see ``PrefetchState`` above).
+	std::atomic<PrefetchState> state {PrefetchState::IDLE};
+	// The batch produced by the prefetch (valid when state == READY).
+	std::shared_ptr<arrow::RecordBatch> batch;
+	// Any exception thrown by the prefetch (valid when state == ERROR).
+	std::exception_ptr exception;
+	// Set by the local-state destructor. A task that sees this flag must not
+	// issue new RPCs on ``connection``; the data is no longer needed.
+	std::atomic<bool> cancelled {false};
+};
 
 // ============================================================================
 // VgiPrefetchTask - AsyncTask that prefetches the next batch from a VGI worker
 // ============================================================================
 
 //! Runs on a DuckDB worker thread while the scan is BLOCKED.
-//! Safe to access local_state_ because DuckDB guarantees the scan won't be
-//! called concurrently while the task is in flight.
+//! Holds a shared_ptr to ``VgiPrefetchSlot`` so it can safely complete (or
+//! bail out) even if the owning ``VgiTableFunctionLocalState`` was destroyed
+//! by query cancellation before the scheduler got to us.
 class VgiPrefetchTask : public AsyncTask {
 public:
-	explicit VgiPrefetchTask(VgiTableFunctionLocalState &local_state) : local_state_(local_state) {
+	explicit VgiPrefetchTask(std::shared_ptr<VgiPrefetchSlot> slot) : slot_(std::move(slot)) {
 	}
 	void Execute() override;
 
 private:
-	VgiTableFunctionLocalState &local_state_;
+	std::shared_ptr<VgiPrefetchSlot> slot_;
 };
 
 // ============================================================================
@@ -258,12 +287,25 @@ struct VgiTableFunctionLocalState : public ArrowScanLocalState {
 	VgiTableFunctionLocalState(unique_ptr<ArrowArrayWrapper> current_chunk, ClientContext &ctx,
 	                           std::shared_ptr<VgiAttachParameters> attach_params)
 	    : ArrowScanLocalState(std::move(current_chunk), ctx), context_(ctx),
-	      attach_params_(std::move(attach_params)) {
+	      attach_params_(std::move(attach_params)), prefetch_slot_(std::make_shared<VgiPrefetchSlot>()) {
 	}
 
 	~VgiTableFunctionLocalState() {
-		D_ASSERT(prefetch_state_.load() != PrefetchState::IN_FLIGHT);
-		// Return connection to pool if applicable
+		// Signal any in-flight prefetch task to discard its result once it
+		// wakes up. It's racy by design: if the task already produced a
+		// batch, we simply let it drop when the slot's shared_ptr refcount
+		// hits zero.
+		prefetch_slot_->cancelled.store(true, std::memory_order_release);
+
+		// Return connection to pool if applicable. The connection is owned
+		// by the slot, so if a task still holds a reference we must leave
+		// the connection there — releasing while the task is mid-RPC would
+		// corrupt the subprocess stream. Only attempt pool release when we
+		// hold the sole strong reference to the slot (i.e. no task is live).
+		if (prefetch_slot_.use_count() != 1) {
+			return;
+		}
+		auto &connection = prefetch_slot_->connection;
 		if (attach_params_ && attach_params_->use_pool() && connection) {
 			auto worker_pid = connection->GetPid();
 			auto conn_id = connection->GetConnIdHex();
@@ -284,17 +326,20 @@ struct VgiTableFunctionLocalState : public ArrowScanLocalState {
 		}
 	}
 
-	// Connection to worker (owns the subprocess or HTTP state)
-	std::unique_ptr<IFunctionConnection> connection;
+	//! Shortcut accessor: the worker connection lives inside the slot.
+	IFunctionConnection *connection() {
+		return prefetch_slot_->connection.get();
+	}
+	const IFunctionConnection *connection() const {
+		return prefetch_slot_->connection.get();
+	}
 
 	// Completion tracking
 	bool done = false;
-
-	// --- Async prefetch state ---
-	std::atomic<PrefetchState> prefetch_state_ {PrefetchState::IDLE};
-	std::shared_ptr<arrow::RecordBatch> prefetch_batch_;
-	std::exception_ptr prefetch_exception_;
 	bool first_scan_call_ = true;
+
+	// Shared prefetch state (see VgiPrefetchSlot docstring).
+	std::shared_ptr<VgiPrefetchSlot> prefetch_slot_;
 
 private:
 	ClientContext &context_;

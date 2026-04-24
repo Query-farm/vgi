@@ -1037,7 +1037,7 @@ unique_ptr<LocalTableFunctionState> VgiTableFunctionInitLocal(ExecutionContext &
 		         {"global_execution_id", BytesToHex(global_state.global_execution_id)},
 		         {"worker_type", "primary"}});
 
-		local_state->connection = std::move(primary_connection);
+		local_state->prefetch_slot_->connection = std::move(primary_connection);
 	} else {
 		// Secondary worker: create new connection with global_execution_id
 		// Uses helper that handles pool acquire and stale connection retry.
@@ -1056,15 +1056,15 @@ unique_ptr<LocalTableFunctionState> VgiTableFunctionInitLocal(ExecutionContext &
 		params.function_type = "TABLE";
 
 		auto result = AcquireAndBindConnection(context.client, params);
-		local_state->connection = std::move(result.connection);
+		local_state->prefetch_slot_->connection = std::move(result.connection);
 
 		// Secondary workers do a normal PerformInit with execution_id set in InitRequest
-		local_state->connection->PerformInit();
+		local_state->connection()->PerformInit();
 
 		VGI_LOG(context.client, "table_function.init_local",
-		        {{"conn", local_state->connection->GetConnIdHex()},
+		        {{"conn", local_state->connection()->GetConnIdHex()},
 		         {"worker_path", bind_data.worker_path()},
-		         {"worker_pid", std::to_string(local_state->connection->GetPid())},
+		         {"worker_pid", std::to_string(local_state->connection()->GetPid())},
 		         {"function_name", bind_data.function_name},
 		         {"global_execution_id", BytesToHex(global_state.global_execution_id)},
 		         {"worker_type", "secondary"}});
@@ -1155,7 +1155,7 @@ static bool InstallBatch(ClientContext &context, const VgiTableFunctionBindData 
 		local_state.done = true;
 		VGI_LOG(context, "table_function.scan_complete",
 		        {{"worker_path", bind_data.worker_path()},
-		         {"worker_pid", std::to_string(local_state.connection->GetPid())},
+		         {"worker_pid", std::to_string(local_state.connection()->GetPid())},
 		         {"function_name", bind_data.function_name}});
 		return false;
 	}
@@ -1171,9 +1171,9 @@ static bool InstallBatch(ClientContext &context, const VgiTableFunctionBindData 
 	local_state.Reset();
 
 	VGI_LOG(context, "table_function.batch_received",
-	        {{"conn", local_state.connection->GetConnIdHex()},
+	        {{"conn", local_state.connection()->GetConnIdHex()},
 	         {"worker_path", bind_data.worker_path()},
-	         {"worker_pid", std::to_string(local_state.connection->GetPid())},
+	         {"worker_pid", std::to_string(local_state.connection()->GetPid())},
 	         {"function_name", bind_data.function_name},
 	         {"batch_rows", std::to_string(arrow_batch->num_rows())}});
 
@@ -1193,14 +1193,14 @@ static bool GetNextBatch(ClientContext &context, const VgiTableFunctionBindData 
 	while (true) {
 		// Update dynamic filter state before each tick is sent
 		UpdateDynamicFilterState(global_state, context, bind_data);
-		auto arrow_batch = local_state.connection->ReadDataBatch();
+		auto arrow_batch = local_state.connection()->ReadDataBatch();
 		if (!arrow_batch) {
 			return InstallBatch(context, bind_data, local_state, nullptr);
 		}
 		if (arrow_batch->num_rows() == 0) {
 			VGI_LOG(context, "table_function.batch_empty_skipped",
 			        {{"worker_path", bind_data.worker_path()},
-			         {"worker_pid", std::to_string(local_state.connection->GetPid())},
+			         {"worker_pid", std::to_string(local_state.connection()->GetPid())},
 			         {"function_name", bind_data.function_name}});
 			continue;
 		}
@@ -1213,36 +1213,44 @@ static bool GetNextBatch(ClientContext &context, const VgiTableFunctionBindData 
 // ============================================================================
 
 void VgiPrefetchTask::Execute() {
+	// If the local_state was torn down (query cancellation) before we ran,
+	// the cancelled flag is set. We skip the RPC and let the slot — which we
+	// still hold via shared_ptr — go out of scope normally, releasing the
+	// connection at the end. We leave the state as IN_FLIGHT since nothing
+	// is going to read it.
+	if (slot_->cancelled.load(std::memory_order_acquire)) {
+		return;
+	}
 	try {
 		// Skip 0-row batches here so the consumer always sees either EOS or a
 		// non-empty batch, matching the sync path's invariant.
 		std::shared_ptr<arrow::RecordBatch> batch;
 		while (true) {
-			batch = local_state_.connection->ReadDataBatch();
+			batch = slot_->connection->ReadDataBatch();
 			if (!batch || batch->num_rows() > 0) {
 				break;
 			}
 		}
-		local_state_.prefetch_batch_ = std::move(batch);
-		local_state_.prefetch_state_.store(PrefetchState::READY);
+		slot_->batch = std::move(batch);
+		slot_->state.store(PrefetchState::READY);
 	} catch (...) {
-		local_state_.prefetch_exception_ = std::current_exception();
-		local_state_.prefetch_state_.store(PrefetchState::ERROR);
+		slot_->exception = std::current_exception();
+		slot_->state.store(PrefetchState::ERROR);
 	}
 }
 
 static void LaunchPrefetch(TableFunctionInput &input, VgiTableFunctionLocalState &local_state) {
-	local_state.prefetch_state_.store(PrefetchState::IN_FLIGHT);
+	local_state.prefetch_slot_->state.store(PrefetchState::IN_FLIGHT);
 	vector<unique_ptr<AsyncTask>> tasks;
-	tasks.push_back(make_uniq<VgiPrefetchTask>(local_state));
+	tasks.push_back(make_uniq<VgiPrefetchTask>(local_state.prefetch_slot_));
 	input.async_result = AsyncResult(std::move(tasks));
 }
 
 static void ConsumePrefetchedBatch(ClientContext &context, const VgiTableFunctionBindData &bind_data,
                                    VgiTableFunctionLocalState &local_state) {
-	auto arrow_batch = std::move(local_state.prefetch_batch_);
-	local_state.prefetch_batch_.reset();
-	local_state.prefetch_state_.store(PrefetchState::IDLE);
+	auto arrow_batch = std::move(local_state.prefetch_slot_->batch);
+	local_state.prefetch_slot_->batch.reset();
+	local_state.prefetch_slot_->state.store(PrefetchState::IDLE);
 	InstallBatch(context, bind_data, local_state, std::move(arrow_batch));
 }
 
@@ -1320,11 +1328,11 @@ void VgiTableFunctionScan(ClientContext &context, TableFunctionInput &input, Dat
 	}
 
 	// --- Async path ---
-	auto state = local_state.prefetch_state_.load();
+	auto state = local_state.prefetch_slot_->state.load();
 
 	if (state == PrefetchState::ERROR) {
-		local_state.prefetch_state_.store(PrefetchState::IDLE);
-		std::rethrow_exception(local_state.prefetch_exception_);
+		local_state.prefetch_slot_->state.store(PrefetchState::IDLE);
+		std::rethrow_exception(local_state.prefetch_slot_->exception);
 	}
 
 	if (state == PrefetchState::READY) {

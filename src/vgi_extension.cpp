@@ -848,10 +848,18 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "OAuth prompt behavior: none (default), login, select_account, or consent",
 	                          LogicalType::VARCHAR, Value("none"));
 
-	// Register async prefetch setting
+	// Register async prefetch setting. Default is off: async prefetch returns
+	// SourceResultType::BLOCKED from table-scan sources, which DuckDB's
+	// PositionalTableScanner operator does not handle (it throws
+	// NotImplementedException). Other join forms (CROSS / NATURAL / ASOF /
+	// LATERAL / INNER / HASH) route through PipelineExecutor and suspend
+	// correctly on BLOCKED, so users running queries without POSITIONAL JOIN
+	// can opt in via ``SET vgi_async_prefetch=true;`` to reclaim the
+	// subprocess-RPC latency hiding.
 	config.AddExtensionOption("vgi_async_prefetch",
-	                          "Enable async I/O prefetch for VGI table function scans",
-	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
+	                          "Enable async I/O prefetch for VGI table function scans (default off: "
+	                          "DuckDB's POSITIONAL JOIN operator does not handle BLOCKED sources)",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
 
 	// Register join key pushdown settings + optimizer
 	config.AddExtensionOption("vgi_join_keys_limit",

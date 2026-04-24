@@ -1,0 +1,226 @@
+# name: test/sql/integration/table/joins.test
+# description: Coverage for VGI table functions under non-pipeline join forms
+#              (POSITIONAL / CROSS / NATURAL / ASOF).
+# group: [vgi_integration_table]
+
+# These tests guard against regressions in two areas:
+#   1. The async prefetch lifetime fix (shared VgiPrefetchSlot) — under
+#      POSITIONAL JOIN, query teardown used to free the local state before
+#      the prefetch task drained, producing a SIGSEGV. That's fixed
+#      independently of the async-default change.
+#   2. The ``vgi_async_prefetch`` default. POSITIONAL JOIN uses DuckDB's
+#      PositionalTableScanner operator, which does not handle
+#      SourceResultType::BLOCKED. With async prefetch ON, the query throws
+#      NotImplementedException; with the default (OFF) every join form below
+#      must work cleanly. The regression tests cover both defaults and the
+#      opt-in toggle.
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+USE example;
+
+statement ok
+SET threads=1;
+
+# ============================================================================
+# POSITIONAL JOIN — default (vgi_async_prefetch=off)
+# ============================================================================
+
+query II
+SELECT r.range, s.n FROM range(3) r POSITIONAL JOIN sequence(3) s
+ORDER BY r.range;
+----
+0	0
+1	1
+2	2
+
+query II
+SELECT s1.n AS a, s2.n AS b
+FROM sequence(3) s1 POSITIONAL JOIN sequence(3) s2
+ORDER BY a;
+----
+0	0
+1	1
+2	2
+
+# Uneven lengths: the shorter side pads with NULL.
+query II
+SELECT r.range, s.n FROM range(5) r POSITIONAL JOIN sequence(3) s
+ORDER BY r.range;
+----
+0	0
+1	1
+2	2
+3	NULL
+4	NULL
+
+# ============================================================================
+# POSITIONAL JOIN — async prefetch ON (reproduces the DuckDB TODO throw)
+# ============================================================================
+
+statement ok
+SET vgi_async_prefetch=true;
+
+statement error
+SELECT s1.n AS a, s2.n AS b FROM sequence(3) s1 POSITIONAL JOIN sequence(3) s2;
+----
+Unexpected interrupt from table Source in PositionalTableScanner refill
+
+statement ok
+SET vgi_async_prefetch=false;
+
+# ============================================================================
+# CROSS JOIN — works with either prefetch setting, check both.
+# ============================================================================
+
+query II
+SELECT r.range, s.n FROM range(3) r CROSS JOIN sequence(3) s
+ORDER BY r.range, s.n;
+----
+0	0
+0	1
+0	2
+1	0
+1	1
+1	2
+2	0
+2	1
+2	2
+
+query II
+SELECT s1.n AS a, s2.n AS b FROM sequence(3) s1 CROSS JOIN sequence(3) s2
+ORDER BY a, b;
+----
+0	0
+0	1
+0	2
+1	0
+1	1
+1	2
+2	0
+2	1
+2	2
+
+statement ok
+SET vgi_async_prefetch=true;
+
+query II
+SELECT r.range, s.n FROM range(3) r CROSS JOIN sequence(3) s
+ORDER BY r.range, s.n;
+----
+0	0
+0	1
+0	2
+1	0
+1	1
+1	2
+2	0
+2	1
+2	2
+
+statement ok
+SET vgi_async_prefetch=false;
+
+# ============================================================================
+# NATURAL JOIN — column n is shared between sequence() outputs
+# ============================================================================
+
+query I
+SELECT n FROM sequence(5) NATURAL JOIN (SELECT unnest([0, 2, 4])::BIGINT AS n)
+ORDER BY n;
+----
+0
+2
+4
+
+query I
+SELECT n FROM sequence(5) s1 NATURAL JOIN sequence(3) s2 ORDER BY n;
+----
+0
+1
+2
+
+statement ok
+SET vgi_async_prefetch=true;
+
+query I
+SELECT n FROM sequence(5) s1 NATURAL JOIN sequence(3) s2 ORDER BY n;
+----
+0
+1
+2
+
+statement ok
+SET vgi_async_prefetch=false;
+
+# ============================================================================
+# ASOF JOIN — inequality-indexed timestamp-style join
+# ============================================================================
+
+query II
+SELECT r.range AS probe, s.n AS matched
+FROM (SELECT * FROM range(5)) r
+ASOF JOIN sequence(5) s ON r.range >= s.n
+ORDER BY probe;
+----
+0	0
+1	1
+2	2
+3	3
+4	4
+
+query II
+SELECT s1.n AS probe, s2.n AS matched
+FROM sequence(5) s1
+ASOF JOIN sequence(5) s2 ON s1.n >= s2.n
+ORDER BY probe;
+----
+0	0
+1	1
+2	2
+3	3
+4	4
+
+statement ok
+SET vgi_async_prefetch=true;
+
+query II
+SELECT s1.n AS probe, s2.n AS matched
+FROM sequence(5) s1
+ASOF JOIN sequence(5) s2 ON s1.n >= s2.n
+ORDER BY probe;
+----
+0	0
+1	1
+2	2
+3	3
+4	4
+
+statement ok
+SET vgi_async_prefetch=false;
+
+# ============================================================================
+# POSITIONAL JOIN composed with CROSS / NATURAL / ASOF — ensures the fix
+# holds when POSITIONAL is nested inside other operators.
+# ============================================================================
+
+query III
+SELECT p.range, p.n, c.a
+FROM (SELECT r.range, s.n FROM range(3) r POSITIONAL JOIN sequence(3) s) p
+CROSS JOIN (VALUES (10), (20)) c(a)
+ORDER BY p.range, c.a;
+----
+0	0	10
+0	0	20
+1	1	10
+1	1	20
+2	2	10
+2	2	20
