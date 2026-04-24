@@ -83,6 +83,14 @@ struct VgiScalarFunctionBindData : public FunctionData {
 	// Input schema built from argument types during bind (after const params erased)
 	std::shared_ptr<arrow::Schema> input_schema;
 
+	// DuckDB-side input types corresponding to `input_schema`, captured at
+	// bind time. Used at execute time to cast incoming DataChunk columns back
+	// to the bind-promised types before serializing to Arrow — DuckDB's
+	// optimizer may elide the Cast it inserted at bind time (e.g. skipping a
+	// DECIMAL(3,2)→DOUBLE cast in the physical plan), so args.data[i] can
+	// arrive with a narrower type than the worker was told to expect.
+	vector<LogicalType> input_duckdb_types;
+
 	// Extracted constant values (from const parameters erased at bind time)
 	vector<Value> const_values;
 
@@ -95,6 +103,7 @@ struct VgiScalarFunctionBindData : public FunctionData {
 		copy->required_secrets = required_secrets;
 		copy->resolved_output_schema = resolved_output_schema;
 		copy->input_schema = input_schema;
+		copy->input_duckdb_types = input_duckdb_types;
 		copy->const_values = const_values;
 		return copy;
 	}

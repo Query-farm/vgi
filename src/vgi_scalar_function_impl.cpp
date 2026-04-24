@@ -10,6 +10,7 @@
 
 #include "duckdb/common/arrow/arrow_appender.hpp"
 #include "duckdb/common/arrow/arrow_converter.hpp"
+#include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/function/table/arrow.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -161,12 +162,29 @@ unique_ptr<FunctionData> VgiScalarFunctionBind(ClientContext &context, ScalarFun
 	}
 
 	// ========================================================================
-	// Phase 3: Build input schema from remaining (non-const) arguments
-	// ========================================================================
+	// Phase 3: Build input schema from the function's DECLARED arg types
+	// where concrete, falling back to the caller-site expression type where
+	// the function accepts ANY (polymorphic). DuckDB's binder may leave a
+	// narrower caller type in place (e.g. DECIMAL(3,2) literals against a
+	// DOUBLE-declared param) without inserting an explicit Cast because it
+	// treats decimal→float as lossless promotion. The worker still needs to
+	// receive the declared type — otherwise its function metadata and the
+	// wire disagree. We cast the DataChunk back up to these types at execute
+	// time (see VgiScalarFunctionExecute).
 	vector<LogicalType> input_types;
 	vector<string> input_names;
 	for (idx_t i = 0; i < arguments.size(); i++) {
-		input_types.push_back(arguments[i]->return_type);
+		// For fixed positional params, bound_function.arguments holds the
+		// declared type; beyond that we're in the varargs tail and fall back
+		// to bound_function.varargs. In either case, ANY means polymorphic
+		// and we surface the caller's concrete type instead.
+		const bool is_vararg_tail = i >= bound_function.arguments.size();
+		LogicalType declared = is_vararg_tail ? bound_function.varargs
+		                                       : bound_function.arguments[i];
+		if (declared.id() == LogicalTypeId::ANY || declared.id() == LogicalTypeId::INVALID) {
+			declared = arguments[i]->return_type;
+		}
+		input_types.push_back(declared);
 		input_names.push_back("col_" + std::to_string(i));
 	}
 	auto input_schema = BuildArrowSchemaFromDuckDB(context, input_types, input_names);
@@ -286,6 +304,7 @@ unique_ptr<FunctionData> VgiScalarFunctionBind(ClientContext &context, ScalarFun
 	bind_data->required_secrets = func_info.required_secrets;
 	bind_data->resolved_output_schema = output_schema;
 	bind_data->input_schema = input_schema;
+	bind_data->input_duckdb_types = input_types;
 	bind_data->const_values = const_values;
 
 	return bind_data;
@@ -315,15 +334,26 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 
 	// Initialize connection on first call
 	if (!local_state.initialized) {
-		// Build input schema from DataChunk column types
-		// (args only contains non-const columns after EraseArgument in bind)
-		vector<LogicalType> input_types;
-		vector<string> input_names;
-		for (idx_t i = 0; i < args.ColumnCount(); i++) {
-			input_types.push_back(args.data[i].GetType());
-			input_names.push_back("col_" + std::to_string(i));
+		// Reuse the bind-time input schema when available. Previously we
+		// re-derived the schema from `args.data[i].GetType()` here and then
+		// swapped it back onto the IPC writer mid-stream — that created wire
+		// drift whenever DuckDB's physical planner elided a Cast the binder
+		// had inserted (e.g. DECIMAL(3,2)→DOUBLE on numeric literals), because
+		// args.data can arrive narrower than what the worker was told to
+		// expect at bind. Casting the DataChunk back up before serialization
+		// (see castChunkToBindTypes below) keeps the wire in sync with the
+		// worker's bind contract.
+		if (bind_data && bind_data->input_schema) {
+			local_state.input_schema = bind_data->input_schema;
+		} else {
+			vector<LogicalType> input_types;
+			vector<string> input_names;
+			for (idx_t i = 0; i < args.ColumnCount(); i++) {
+				input_types.push_back(args.data[i].GetType());
+				input_names.push_back("col_" + std::to_string(i));
+			}
+			local_state.input_schema = BuildArrowSchemaFromDuckDB(context, input_types, input_names);
 		}
-		local_state.input_schema = BuildArrowSchemaFromDuckDB(context, input_types, input_names);
 
 		// Build invocation arguments: pass const values (const params were erased at bind time)
 		vector<Value> positional_args;
@@ -377,16 +407,13 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 			                 worker_path.c_str(), connection->GetPid());
 		}
 
-		// Bind with bind-time input types (preserves output-schema stability
-		// for polymorphic workers where output depends on input precision —
-		// e.g. the return type DuckDB committed to at plan time was derived
-		// from expression-signature types). Then update the IPC writer to
-		// the actual DataChunk types before opening.
-		connection->SetInputSchema(bind_data ? bind_data->input_schema : local_state.input_schema);
+		// Bind and open the IPC writer with a single schema — the bind-time
+		// one. Previously we'd swap to an execute-time schema derived from
+		// args.data, which could narrower than the bind-promised types;
+		// casting the DataChunk (below, in the per-batch path) keeps the
+		// wire in sync with what the worker is expecting.
+		connection->SetInputSchema(local_state.input_schema);
 		connection->PerformBindFull();
-		if (bind_data && bind_data->input_schema.get() != local_state.input_schema.get()) {
-			connection->UpdateInputSchemaForExecution(local_state.input_schema);
-		}
 		connection->PerformInit();
 		connection->OpenInputWriter();
 
@@ -411,8 +438,44 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 		return;
 	}
 
-	// Convert input DataChunk to Arrow RecordBatch
-	auto input_batch = DataChunkToArrow(context, args, local_state.input_schema);
+	// Cast args to bind-time DuckDB types, then convert to Arrow. DuckDB's
+	// binder may resolve a DOUBLE-declared param against a DECIMAL literal
+	// without inserting an explicit Cast (it treats the promotion as
+	// lossless). Re-applying it here guarantees the wire matches
+	// bind_data->input_schema — which is what the worker was told to expect
+	// at bind. When types already match (fast path) DefaultCast is a
+	// near-zero-cost identity clone. ANY-declared params keep the raw
+	// caller type and are skipped.
+	DataChunk casted_chunk;
+	DataChunk *to_serialize = &args;
+	if (bind_data && !bind_data->input_duckdb_types.empty() &&
+	    bind_data->input_duckdb_types.size() == args.ColumnCount()) {
+		vector<LogicalType> target_types;
+		target_types.reserve(args.ColumnCount());
+		bool needs_cast = false;
+		for (idx_t i = 0; i < args.ColumnCount(); i++) {
+			const auto &declared = bind_data->input_duckdb_types[i];
+			const bool declared_is_any = declared.id() == LogicalTypeId::ANY;
+			const auto &target = declared_is_any ? args.data[i].GetType() : declared;
+			target_types.push_back(target);
+			if (!declared_is_any && args.data[i].GetType() != declared) {
+				needs_cast = true;
+			}
+		}
+		if (needs_cast) {
+			casted_chunk.Initialize(Allocator::Get(context), target_types, args.size());
+			casted_chunk.SetCardinality(args.size());
+			for (idx_t i = 0; i < args.ColumnCount(); i++) {
+				if (args.data[i].GetType() == target_types[i]) {
+					casted_chunk.data[i].Reference(args.data[i]);
+				} else {
+					VectorOperations::DefaultCast(args.data[i], casted_chunk.data[i], args.size());
+				}
+			}
+			to_serialize = &casted_chunk;
+		}
+	}
+	auto input_batch = DataChunkToArrow(context, *to_serialize, local_state.input_schema);
 
 	VGI_LOG(context, "scalar.write_input",
 	        {{"conn", local_state.connection->GetConnIdHex()},
