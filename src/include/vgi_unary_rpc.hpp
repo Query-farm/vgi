@@ -40,12 +40,6 @@ struct UnaryRpcOptions {
 	// HTTP cookie jar for sticky-session routing. Null on subprocess transport
 	// and for pre-attach RPCs that have no per-catalog state yet.
 	std::shared_ptr<SessionCookieJar> cookie_jar;
-	// Per-catalog HTTPParams cache. Populated at ATTACH (or lazily on first
-	// HTTP RPC) and reused by all subsequent HTTP requests for this catalog —
-	// avoids re-entering the secret manager (and its MetaTransaction mutex) on
-	// each call. TODO(#22258): drop this field once the upstream DuckDB bug is
-	// fixed (https://github.com/duckdb/duckdb/issues/22258).
-	std::shared_ptr<HTTPParams> cached_http_params;
 	// When false, the RPC path skips all VGI_LOG calls (pool acquire/release,
 	// stale events) and skips StderrDrainer::DrainToLog. Set false only for
 	// best-effort calls that run off the main thread during pipeline teardown
@@ -53,6 +47,14 @@ struct UnaryRpcOptions {
 	// not guaranteed safe to invoke. Buffered stderr stays on the drainer and
 	// will be drained the next time the pooled worker is used.
 	bool enable_logging = true;
+	// Per-catalog HTTPParams cache. Populated at ATTACH (or lazily on first
+	// HTTP RPC) and reused by all subsequent HTTP requests for this catalog —
+	// avoids re-entering the secret manager (and its MetaTransaction mutex) on
+	// each call. TODO(#22258): drop this field once the upstream DuckDB bug is
+	// fixed (https://github.com/duckdb/duckdb/issues/22258). Placed last so
+	// that positional aggregate-init call sites (see vgi_aggregate_function_impl)
+	// don't need changes.
+	std::shared_ptr<HTTPParams> cached_http_params;
 };
 
 // Send a single unary RPC and return the response.

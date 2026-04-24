@@ -412,6 +412,19 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	auto attach_params = std::make_shared<vgi::VgiAttachParameters>(
 	    worker_path, catalog_name, worker_debug, use_pool, auth, attach_result.resolved_data_version,
 	    attach_result.resolved_implementation_version, cookie_jar);
+
+	// Prime the HTTPParams cache while we're outside any VGI catalog
+	// transaction. HTTPFSUtil::InitializeParameters pulls settings/secrets
+	// through KeyValueSecretReader, which takes the MetaTransaction mutex —
+	// doing it lazily from inside VgiTransaction::Start would self-deadlock
+	// (the surrounding MetaTransaction::GetTransaction call already holds that
+	// mutex). Doing it here, during ATTACH handling and before any VGI
+	// transaction exists, avoids the reentrancy. TODO(#22258): remove once
+	// https://github.com/duckdb/duckdb/issues/22258 is fixed.
+	if (vgi::IsHttpTransport(worker_path)) {
+		attach_params->GetOrInitHttpParams(context, worker_path);
+	}
+
 	auto attach_result_ptr = std::make_shared<vgi::CatalogAttachResult>(std::move(attach_result));
 
 	return make_uniq<VgiCatalog>(db, name, options.access_mode, std::move(attach_params), std::move(attach_result_ptr));
