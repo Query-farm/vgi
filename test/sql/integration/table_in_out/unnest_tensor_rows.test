@@ -1,0 +1,232 @@
+# name: test/sql/integration/table_in_out/unnest_tensor_rows.test
+# description: Tests for unnest_tensor_rows (table-in-out variant of unnest_tensor) and LATERAL joins
+# group: [vgi_integration_table_in_out]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+USE example;
+
+statement ok
+SET threads=1;
+
+# ============================================================================
+# Basic use with a scalar subquery input (no correlation)
+# ============================================================================
+
+query II
+SELECT u.value, u.axes.i
+FROM unnest_tensor_rows((
+  SELECT nest_tensor(v, {i: i})
+  FROM (VALUES (10, 0), (20, 1), (30, 2)) t(v, i)
+)) u
+ORDER BY u.axes.i;
+----
+10	0
+20	1
+30	2
+
+# ============================================================================
+# 2D via subquery input
+# ============================================================================
+
+query III
+SELECT u.axes.x, u.axes.y, u.value
+FROM unnest_tensor_rows((
+  SELECT nest_tensor(v, {x: x, y: y})
+  FROM (VALUES (1,0,0),(2,0,1),(3,1,0),(4,1,1)) d(v, x, y)
+)) u
+ORDER BY u.axes.x, u.axes.y;
+----
+0	0	1
+0	1	2
+1	0	3
+1	1	4
+
+# ============================================================================
+# LATERAL: correlated per-row invocation — the whole point of table-in-out
+# ============================================================================
+
+# 1D per group via LATERAL
+query III
+WITH grouped AS (
+  SELECT g, nest_tensor(v, {i: i}) AS t
+  FROM (VALUES (0, 10, 0), (0, 20, 1), (1, 100, 0), (1, 200, 1)) d(g, v, i)
+  GROUP BY g
+)
+SELECT grouped.g, u.axes.i, u.value
+FROM grouped, LATERAL unnest_tensor_rows((SELECT grouped.t)) u
+ORDER BY grouped.g, u.axes.i;
+----
+0	0	10
+0	1	20
+1	0	100
+1	1	200
+
+# 2D per group via LATERAL, with a sparse group to exercise null cells
+query IIII
+WITH grouped AS (
+  SELECT g, nest_tensor(v, {x: x, y: y}) AS t
+  FROM (VALUES (0,1,0,0),(0,2,0,1),(0,3,1,0),(0,4,1,1),
+               (1,10,0,0),(1,20,1,1)) d(g, v, x, y)
+  GROUP BY g
+)
+SELECT grouped.g, u.axes.x, u.axes.y, u.value
+FROM grouped, LATERAL unnest_tensor_rows((SELECT grouped.t)) u
+ORDER BY grouped.g, u.axes.x, u.axes.y;
+----
+0	0	0	1
+0	0	1	2
+0	1	0	3
+0	1	1	4
+1	0	0	10
+1	0	1	NULL
+1	1	0	NULL
+1	1	1	20
+
+# 3D round-trip: nest then unnest_tensor_rows via LATERAL — multiset equality with original dense input
+query IIII
+WITH source AS (
+  SELECT g, v, x, y, z
+  FROM (VALUES
+    (1, 100, 0, 0, 0), (1, 101, 0, 0, 1),
+    (1, 110, 0, 1, 0), (1, 111, 0, 1, 1),
+    (1, 200, 1, 0, 0), (1, 201, 1, 0, 1),
+    (1, 210, 1, 1, 0), (1, 211, 1, 1, 1)
+  ) d(g, v, x, y, z)
+),
+grouped AS (
+  SELECT g, nest_tensor(v, {x: x, y: y, z: z}) AS t
+  FROM source GROUP BY g
+)
+SELECT grouped.g, u.axes.x, u.axes.y, u.axes.z
+FROM grouped, LATERAL unnest_tensor_rows((SELECT grouped.t)) u
+WHERE u.value IS NOT NULL
+ORDER BY grouped.g, u.axes.x, u.axes.y, u.axes.z;
+----
+1	0	0	0
+1	0	0	1
+1	0	1	0
+1	0	1	1
+1	1	0	0
+1	1	0	1
+1	1	1	0
+1	1	1	1
+
+# ============================================================================
+# Multi-group LATERAL with sparse fills — validates correlated rebinding per
+# outer row, which was the original motivation for conditional finalize.
+# ============================================================================
+
+query III
+WITH grouped AS (
+  SELECT g, nest_tensor(v, {k: k}) AS t
+  FROM (VALUES
+    (1, 7, 'a'),
+    (2, 8, 'b'), (2, 9, 'c'),
+    (3, 1, 'a'), (3, 2, 'b'), (3, 3, 'c')
+  ) d(g, v, k)
+  GROUP BY g
+)
+SELECT grouped.g, u.axes.k, u.value
+FROM grouped, LATERAL unnest_tensor_rows((SELECT grouped.t)) u
+ORDER BY grouped.g, u.axes.k;
+----
+1	a	7
+2	b	8
+2	c	9
+3	a	1
+3	b	2
+3	c	3
+
+# ============================================================================
+# String axis coords under LATERAL
+# ============================================================================
+
+query IITI
+WITH grouped AS (
+  SELECT g, nest_tensor(v, {kind: kind, idx: idx}) AS t
+  FROM (VALUES
+    (1, 100, 'alpha', 0), (1, 101, 'alpha', 1),
+    (1, 200, 'beta',  0), (1, 201, 'beta',  1)
+  ) d(g, v, kind, idx)
+  GROUP BY g
+)
+SELECT grouped.g, u.axes.idx, u.axes.kind, u.value
+FROM grouped, LATERAL unnest_tensor_rows((SELECT grouped.t)) u
+ORDER BY grouped.g, u.axes.kind, u.axes.idx;
+----
+1	0	alpha	100
+1	1	alpha	101
+1	0	beta	200
+1	1	beta	201
+
+# ============================================================================
+# Null tensor column under LATERAL — function receives a null struct row and
+# should emit zero output rows for that outer row.
+# ============================================================================
+
+query II
+WITH outer_tbl AS (
+  SELECT 1 AS g, {tensor: [10, 20], axes: {i: [0, 1]}}::STRUCT(tensor INTEGER[], axes STRUCT(i INTEGER[])) AS t
+  UNION ALL
+  SELECT 2 AS g, NULL
+)
+SELECT outer_tbl.g, u.value
+FROM outer_tbl, LATERAL unnest_tensor_rows((SELECT outer_tbl.t)) u
+ORDER BY outer_tbl.g, u.axes.i;
+----
+1	10
+1	20
+
+# ============================================================================
+# Multi-column LATERAL: echo (no finalize, >1 output column) exercises the
+# scratch-chunk path where n_children > 1 and we must preserve DuckDB's
+# pre-filled correlated columns while writing multiple function outputs.
+# ============================================================================
+
+query IIIT
+WITH t(a, b) AS (VALUES (1, 'x'), (2, 'y'), (3, 'z'))
+SELECT t.a, e.a AS echo_a, t.a, e.b AS echo_b
+FROM t, LATERAL echo((SELECT t.a AS a, t.b AS b)) e
+ORDER BY t.a;
+----
+1	1	1	x
+2	2	2	y
+3	3	3	z
+
+# Three-column echo LATERAL — further wides the scratch-chunk interleave.
+query IIIII
+WITH src(a, b, c) AS (VALUES (1, 2, 3), (10, 20, 30), (100, 200, 300))
+SELECT src.a, e.a, e.b, e.c, src.c
+FROM src, LATERAL echo((SELECT src.a AS a, src.b AS b, src.c AS c)) e
+ORDER BY src.a;
+----
+1	1	2	3	3
+10	10	20	30	30
+100	100	200	300	300
+
+# ============================================================================
+# Regression guard: has_finalize=True functions (sum_all_columns) must still
+# run their finalize callback under non-LATERAL use after the conditional
+# registration change.
+# ============================================================================
+
+query II
+SELECT * FROM sum_all_columns((SELECT unnest(range(5))::BIGINT AS x, (unnest(range(5)) * 2)::BIGINT AS y));
+----
+10	20
+
+# And buffer_input (another has_finalize=True) must still flush its buffer at
+# finalize.
+query I
+SELECT COUNT(*) FROM buffer_input((SELECT unnest(range(7)) AS n));
+----
+7

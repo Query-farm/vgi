@@ -13,28 +13,33 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
 # ============================================================================
 # Function Inventory
-# All 5 aggregate functions must be registered
+# All aggregate functions must be registered
 # ============================================================================
+
+# Exclude dynamic-code aggregates (vgi_dynamic_agg, vgi_dynamic_ml_agg) —
+# those are only registered by workers that support dynamic language
+# interpretation (Python / JavaScript). See function_registration_dynamic.test.
 
 query I
 SELECT COUNT(*)
 FROM duckdb_functions()
-WHERE database_name = 'example' AND function_type = 'aggregate';
+WHERE database_name = 'example' AND function_type = 'aggregate'
+  AND function_name NOT IN ('vgi_dynamic_agg', 'vgi_dynamic_ml_agg');
 ----
-15
+14
 
 query TT
 SELECT function_name, return_type
 FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'aggregate'
+  AND function_name NOT IN ('vgi_dynamic_agg', 'vgi_dynamic_ml_agg')
 ORDER BY function_name;
 ----
+nest_tensor	ANY
 qf_llm_distill	VARCHAR
 qf_llm_summarize	VARCHAR
 vgi_avg	DOUBLE
 vgi_count	BIGINT
-vgi_dynamic_agg	DOUBLE
-vgi_dynamic_ml_agg	DOUBLE
 vgi_generic_sum	ANY
 vgi_listagg	VARCHAR
 vgi_percentile	DOUBLE

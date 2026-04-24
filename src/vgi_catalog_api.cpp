@@ -1839,6 +1839,11 @@ VgiFunctionInfo ParseFunctionInfo(const std::shared_ptr<arrow::RecordBatch> &bat
 	// supports_window — optional bool (defaults to false for older workers).
 	info.supports_window = row["supports_window"].value_or(false);
 
+	// has_finalize — optional bool (defaults to false for older workers).
+	// When false, the table-in-out registration omits in_out_function_final,
+	// which lets the function be used under LATERAL with correlated input.
+	info.has_finalize = row["has_finalize"].value_or(false);
+
 	// Required settings for this function (list of strings)
 	info.required_settings = row["required_settings"].value_or(std::vector<std::string> {});
 

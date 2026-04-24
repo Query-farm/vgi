@@ -1,0 +1,162 @@
+# name: test/sql/integration/scalar/unnest_tensor.test
+# description: Tests for the unnest_tensor scalar function (companion to nest_tensor)
+# group: [vgi_integration_scalar]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+USE example;
+
+statement ok
+SET threads=1;
+
+# ============================================================================
+# Return type: list<struct<value, axes>>
+# ============================================================================
+
+# 1D input yields a list of 3 struct elements.
+query T
+SELECT length(unnest_tensor({tensor: [10, 20, 30], axes: {i: [0, 1, 2]}}));
+----
+3
+
+# Element shape: {value, axes}.
+query II
+SELECT cell.value, cell.axes.i
+FROM UNNEST(unnest_tensor({tensor: [10, 20, 30], axes: {i: [0, 1, 2]}})) u(cell)
+ORDER BY cell.axes.i;
+----
+10	0
+20	1
+30	2
+
+# ============================================================================
+# 2D: emits full Cartesian product
+# ============================================================================
+
+query III
+SELECT cell.axes.x, cell.axes.y, cell.value
+FROM UNNEST(unnest_tensor(
+  {tensor: [[1, 2], [3, 4]], axes: {x: [0, 1], y: [0, 1]}}
+)) u(cell)
+ORDER BY cell.axes.x, cell.axes.y;
+----
+0	0	1
+0	1	2
+1	0	3
+1	1	4
+
+# Sparse input: null cells are emitted.
+query III
+SELECT cell.axes.x, cell.axes.y, cell.value
+FROM UNNEST(unnest_tensor(
+  {tensor: [[10, NULL], [NULL, 20]], axes: {x: [0, 1], y: [0, 1]}}
+)) u(cell)
+ORDER BY cell.axes.x, cell.axes.y;
+----
+0	0	10
+0	1	NULL
+1	0	NULL
+1	1	20
+
+# ============================================================================
+# 3D round-trip
+# ============================================================================
+
+statement ok
+CREATE TEMP TABLE grid3 AS
+SELECT 100 * x + 10 * y + z AS v, x, y, z
+FROM range(2) tx(x), range(3) ty(y), range(2) tz(z);
+
+query IIII
+SELECT cell.axes.x, cell.axes.y, cell.axes.z, cell.value
+FROM (SELECT nest_tensor(v, {x: x, y: y, z: z}) AS t FROM grid3) r,
+     UNNEST(unnest_tensor(r.t)) u(cell)
+ORDER BY cell.axes.x, cell.axes.y, cell.axes.z;
+----
+0	0	0	0
+0	0	1	1
+0	1	0	10
+0	1	1	11
+0	2	0	20
+0	2	1	21
+1	0	0	100
+1	0	1	101
+1	1	0	110
+1	1	1	111
+1	2	0	120
+1	2	1	121
+
+# ============================================================================
+# String axis coordinates round-trip
+# ============================================================================
+
+query TTT
+SELECT cell.axes.x, cell.axes.y, cell.value
+FROM UNNEST(unnest_tensor(
+  {tensor: [[1, 2], [3, 4]], axes: {x: ['a', 'b'], y: ['c', 'd']}}
+)) u(cell)
+ORDER BY cell.axes.x, cell.axes.y;
+----
+a	c	1
+a	d	2
+b	c	3
+b	d	4
+
+# ============================================================================
+# Lateral use via correlated subquery (as a scalar, this is OK)
+# ============================================================================
+
+query III
+SELECT g, cell.axes.i, cell.value
+FROM (
+  SELECT g, nest_tensor(v, {i: i}) AS t
+  FROM (VALUES (0, 1, 0), (0, 2, 1), (1, 10, 0), (1, 20, 1)) d(g, v, i)
+  GROUP BY g
+) r,
+UNNEST(unnest_tensor(r.t)) u(cell)
+ORDER BY g, cell.axes.i;
+----
+0	0	1
+0	1	2
+1	0	10
+1	1	20
+
+# ============================================================================
+# Bind-time validation
+# ============================================================================
+
+# Non-struct input rejected.
+statement error
+SELECT unnest_tensor(42);
+----
+must be a struct
+
+# Missing 'axes' field rejected.
+statement error
+SELECT unnest_tensor({tensor: [1, 2, 3]});
+----
+'tensor' and 'axes'
+
+# Nesting depth mismatch rejected (tensor depth 1, axes has 2 fields).
+statement error
+SELECT unnest_tensor({tensor: [1, 2], axes: {x: [0, 1], y: [0]}});
+----
+nesting depth
+
+# ============================================================================
+# NULL input row
+# ============================================================================
+
+query T
+SELECT unnest_tensor(CAST(NULL AS STRUCT(tensor INTEGER[], axes STRUCT(i INTEGER[]))));
+----
+NULL
+

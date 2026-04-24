@@ -217,9 +217,18 @@ void VgiTableFunctionSet::LoadEntries(ClientContext &context) {
 				TableFunction table_func(arg_types.positional_types, nullptr, VgiCatalogTableInOutFunctionBind,
 				                         vgi::VgiTableInOutInitGlobal, vgi::VgiTableInOutInitLocal);
 
-				// Set the in_out_function for processing streaming input
+				// Set the in_out_function for processing streaming input.
 				table_func.in_out_function = vgi::VgiTableInOutFunction;
-				table_func.in_out_function_final = vgi::VgiTableInOutFinalize;
+				// Only register the finalize callback when the worker declares
+				// a finalize/finish stage. DuckDB's PhysicalTableInOutFunction
+				// throws "FinalExecute not supported for project_input" when
+				// both in_out_function_final and projected_input (LATERAL with
+				// correlated columns) are set, so leaving it unset for
+				// stateless transforms lets those functions participate in
+				// lateral joins.
+				if (func_info.has_finalize) {
+					table_func.in_out_function_final = vgi::VgiTableInOutFinalize;
+				}
 
 				// Register named parameters
 				table_func.named_parameters = arg_types.named_parameters;

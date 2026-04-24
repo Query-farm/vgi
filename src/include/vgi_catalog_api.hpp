@@ -348,6 +348,11 @@ struct VgiFunctionInfo {
 	// DuckDB's custom-window aggregator path with partition caching).
 	bool supports_window = false;
 
+	// True when a table-in-out function declares a finalize/finish stage.
+	// DuckDB rejects ``in_out_function_final`` alongside LATERAL-projected
+	// input; we only register the finalize callback when this is set.
+	bool has_finalize = false;
+
 	// Settings required by this function (must be set before invocation)
 	std::vector<std::string> required_settings;
 

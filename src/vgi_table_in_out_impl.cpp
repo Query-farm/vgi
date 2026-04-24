@@ -257,12 +257,56 @@ static bool HasRemainingBatchData(const VgiTableInOutLocalState &local_state) {
 
 //! Produce one DataChunk (up to STANDARD_VECTOR_SIZE rows) from the current batch,
 //! advancing chunk_offset. Returns the number of rows produced.
+//!
+//! The destination ``output`` chunk may have MORE columns than the worker's
+//! output (e.g., under LATERAL, DuckDB's PhysicalTableInOutFunction appends
+//! correlated/projected-input columns to the chunk and expects the table
+//! in-out function to leave them alone). ``ArrowTableFunction::ArrowToDuckDB``
+//! iterates all of ``output.ColumnCount()`` columns, which would walk off the
+//! end of the Arrow batch's child array. To handle that, we build a temporary
+//! ``DataChunk`` that references only the first ``n_children`` vectors of
+//! ``output`` and convert into that. Writes land in the shared underlying
+//! vector buffers; the trailing correlated columns stay untouched.
 static idx_t ProduceOutputFromBatch(VgiTableInOutLocalState &local_state, const ArrowTableSchema &arrow_table,
                                     DataChunk &output) {
 	idx_t remaining = static_cast<idx_t>(local_state.chunk->arrow_array.length) - local_state.chunk_offset;
 	idx_t output_size = MinValue<idx_t>(STANDARD_VECTOR_SIZE, remaining);
 	output.SetCardinality(output_size);
-	ArrowTableFunction::ArrowToDuckDB(local_state, arrow_table.GetColumns(), output, false);
+
+	idx_t fn_columns = static_cast<idx_t>(local_state.chunk->arrow_array.n_children);
+	D_ASSERT(fn_columns <= output.ColumnCount());
+	if (fn_columns == output.ColumnCount()) {
+		ArrowTableFunction::ArrowToDuckDB(local_state, arrow_table.GetColumns(), output, false);
+	} else {
+		// LATERAL / projected-input path: DuckDB's PhysicalTableInOutFunction
+		// appended correlated outer columns at ``[fn_columns, ColumnCount)``
+		// and pre-filled them before calling us. ``ArrowToDuckDB`` iterates
+		// ``output.ColumnCount()`` and during zero-copy conversion *rebinds*
+		// each destination Vector's buffer (see
+		// ``duckdb/src/function/table/arrow_conversion.cpp``), so a
+		// ``Reference``-based view over the leading columns of ``output``
+		// would leave ``output.data[c]`` unchanged — the rebind would land on
+		// the view's Vector object and never propagate back.
+		//
+		// Instead, convert into a freshly-allocated scratch chunk and then
+		// ``output.data[c].Reference(scratch.data[c])``. Vector buffer
+		// refcounting keeps the Arrow data alive after ``scratch`` goes out
+		// of scope, and the trailing LATERAL-projected columns are
+		// untouched.
+		DataChunk scratch;
+		vector<LogicalType> scratch_types;
+		scratch_types.reserve(fn_columns);
+		for (idx_t c = 0; c < fn_columns; c++) {
+			scratch_types.push_back(output.data[c].GetType());
+		}
+		scratch.Initialize(BufferAllocator::Get(local_state.context), scratch_types, output_size);
+		scratch.SetCardinality(output_size);
+		ArrowTableFunction::ArrowToDuckDB(local_state, arrow_table.GetColumns(), scratch, false);
+		for (idx_t c = 0; c < fn_columns; c++) {
+			output.data[c].Reference(scratch.data[c]);
+		}
+	}
+
 	local_state.chunk_offset += output.size();
 	return output.size();
 }
