@@ -224,10 +224,14 @@ i_pool_a	10.0.0
 i_pool_b	11.0.0
 
 # Pool diagnostics show distinct (worker_path, data_version_spec, impl_version) keys.
+# Scope the predicate to the two impl_version values THIS block created so the
+# assertion is insensitive to stale pool rows left behind by earlier .test files
+# in the same unittest process (the pool is a process-global singleton whose
+# idle-timeout eviction is racy with fast workers).
 query I
-SELECT COUNT(DISTINCT implementation_version)
-FROM vgi_worker_pool()
-WHERE data_version_spec = '1.0.0';
+SELECT COUNT(*) FROM vgi_worker_pool()
+WHERE data_version_spec = '1.0.0'
+  AND implementation_version IN ('10.0.0', '11.0.0');
 ----
 2
 
