@@ -1,0 +1,236 @@
+# name: test/sql/integration/table/set_operations_and_subqueries.test
+# description: Coverage for VGI table functions under set operations,
+#              subqueries (IN / NOT IN / EXISTS / scalar / correlated), CTEs,
+#              and semi/anti joins.
+# group: [vgi_integration_table]
+
+# These paths run VGI-backed sources through DuckDB's standard pipeline
+# machinery. They're not expected to have the same edge cases as POSITIONAL
+# JOIN (which has its own test file), but regression coverage is cheap and
+# catches any future pipeline-scheduling surprises the way the
+# has_finalize / async-prefetch fixes did.
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+USE example;
+
+statement ok
+SET threads=1;
+
+# ============================================================================
+# UNION / UNION ALL
+# ============================================================================
+
+# Deduping UNION
+query I
+SELECT n FROM sequence(3) UNION SELECT n FROM sequence(5) ORDER BY n;
+----
+0
+1
+2
+3
+4
+
+# UNION ALL: preserves duplicates
+query I
+SELECT n FROM sequence(3) UNION ALL SELECT n FROM sequence(3) ORDER BY n;
+----
+0
+0
+1
+1
+2
+2
+
+# Mixed VGI + builtin
+query I
+SELECT n FROM sequence(3) UNION ALL SELECT unnest([100, 101])::BIGINT ORDER BY n;
+----
+0
+1
+2
+100
+101
+
+# Three-way UNION ALL
+query I
+SELECT n FROM sequence(2)
+UNION ALL SELECT n FROM sequence(2)
+UNION ALL SELECT n FROM sequence(2)
+ORDER BY n;
+----
+0
+0
+0
+1
+1
+1
+
+# ============================================================================
+# INTERSECT / INTERSECT ALL / EXCEPT / EXCEPT ALL
+# ============================================================================
+
+query I
+SELECT n FROM sequence(5) INTERSECT SELECT n FROM sequence(3) ORDER BY n;
+----
+0
+1
+2
+
+query I
+SELECT n FROM sequence(5) EXCEPT SELECT n FROM sequence(3) ORDER BY n;
+----
+3
+4
+
+# INTERSECT ALL pairs up duplicates from the two sides.
+query I
+SELECT n FROM sequence(5)
+INTERSECT ALL
+SELECT * FROM (VALUES (1::BIGINT), (2::BIGINT), (1::BIGINT)) v(n)
+ORDER BY n;
+----
+1
+2
+
+query I
+SELECT n FROM sequence(5)
+EXCEPT ALL
+SELECT * FROM (VALUES (1::BIGINT), (2::BIGINT)) v(n)
+ORDER BY n;
+----
+0
+3
+4
+
+# Chained set ops: (a UNION b) INTERSECT c
+query I
+SELECT n FROM (
+  SELECT n FROM sequence(5) UNION SELECT n FROM sequence(10)
+) INTERSECT SELECT n FROM sequence(3)
+ORDER BY n;
+----
+0
+1
+2
+
+# ============================================================================
+# Subqueries: IN / NOT IN / EXISTS
+# ============================================================================
+
+query I
+SELECT n FROM sequence(5) WHERE n IN (SELECT n FROM sequence(3)) ORDER BY n;
+----
+0
+1
+2
+
+query I
+SELECT n FROM sequence(5) WHERE n NOT IN (SELECT n FROM sequence(3)) ORDER BY n;
+----
+3
+4
+
+query I
+SELECT s1.n FROM sequence(5) s1
+WHERE EXISTS (SELECT 1 FROM sequence(3) s2 WHERE s2.n = s1.n)
+ORDER BY s1.n;
+----
+0
+1
+2
+
+query I
+SELECT s1.n FROM sequence(5) s1
+WHERE NOT EXISTS (SELECT 1 FROM sequence(3) s2 WHERE s2.n = s1.n)
+ORDER BY s1.n;
+----
+3
+4
+
+# ============================================================================
+# Scalar subquery in SELECT list
+# ============================================================================
+
+query II
+SELECT n, (SELECT vgi_count() FROM sequence(3)) AS c FROM sequence(3) ORDER BY n;
+----
+0	3
+1	3
+2	3
+
+# Correlated scalar subquery with VGI aggregate: sum of sequence values up to
+# the outer t.x. The subquery is invoked once per outer row.
+query II
+SELECT t.x, (SELECT vgi_sum(s.n) FROM sequence(5) s WHERE s.n <= t.x) AS partial_sum
+FROM (VALUES (0::BIGINT), (2::BIGINT), (4::BIGINT)) t(x)
+ORDER BY t.x;
+----
+0	NULL
+2	3
+4	10
+
+# ============================================================================
+# CTEs
+# ============================================================================
+
+# Simple (non-recursive) CTE with a VGI source.
+query II
+WITH odd AS (SELECT n FROM sequence(10) WHERE n % 2 = 1)
+SELECT COUNT(*) AS c, SUM(n) AS s FROM odd;
+----
+5	25
+
+# Two CTEs, one VGI-sourced, joined together.
+query II
+WITH evens AS (SELECT n FROM sequence(10) WHERE n % 2 = 0),
+     pair AS (SELECT n, n * 10 AS tens FROM evens)
+SELECT n, tens FROM pair ORDER BY n;
+----
+0	0
+2	20
+4	40
+6	60
+8	80
+
+# ============================================================================
+# SEMI / ANTI join
+# ============================================================================
+
+query I
+SELECT s1.n FROM sequence(5) s1 SEMI JOIN sequence(3) s2 ON s1.n = s2.n ORDER BY s1.n;
+----
+0
+1
+2
+
+query I
+SELECT s1.n FROM sequence(5) s1 ANTI JOIN sequence(3) s2 ON s1.n = s2.n ORDER BY s1.n;
+----
+3
+4
+
+# SEMI with VGI on probe side, builtin on build side
+query I
+SELECT s.n FROM sequence(5) s SEMI JOIN (VALUES (2::BIGINT), (4::BIGINT)) v(n) ON s.n = v.n
+ORDER BY s.n;
+----
+2
+4
+
+# ANTI with builtin probe, VGI build
+query I
+SELECT v.n FROM (VALUES (0::BIGINT), (10::BIGINT), (1::BIGINT), (20::BIGINT)) v(n)
+ANTI JOIN sequence(3) s ON s.n = v.n
+ORDER BY v.n;
+----
+10
+20
