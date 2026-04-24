@@ -180,6 +180,14 @@ std::vector<VgiCatalogInfo> InvokeCatalogs(const std::string &worker_path, Clien
 		info.name = row["name"].value_not_null<std::string>();
 		info.implementation_version = row["implementation_version"].value_or(std::string(""));
 		info.data_version_spec = row["data_version_spec"].value_or(std::string(""));
+
+		// Parse attach_option_specs (list[bytes] of serialized AttachOptionSpec).
+		// Older workers that predate attach-option discovery omit this field — treat as empty.
+		auto spec_bytes_list = row["attach_option_specs"].value_or(std::vector<std::vector<uint8_t>> {});
+		for (const auto &spec_bytes : spec_bytes_list) {
+			info.attach_option_specs.push_back(ParseAttachOptionSpec(spec_bytes, worker_path, context));
+		}
+
 		out.push_back(std::move(info));
 	}
 	return out;
@@ -190,11 +198,19 @@ CatalogAttachResult InvokeCatalogAttach(const std::string &worker_path, const st
                                         const std::shared_ptr<CatalogAuth> &auth,
                                         const std::string &data_version_spec,
                                         const std::string &implementation_version,
-                                        const std::shared_ptr<SessionCookieJar> &cookie_jar) {
+                                        const std::shared_ptr<SessionCookieJar> &cookie_jar,
+                                        const std::map<std::string, Value> &attach_options) {
 	auto temp_params = std::make_shared<VgiAttachParameters>(worker_path, "", worker_debug, use_pool, auth,
 	                                                         data_version_spec, implementation_version, cookie_jar);
 	CatalogRpcContext ctx{temp_params, {}, {}};
-	auto params = BuildCatalogAttachParams(catalog_name, data_version_spec, implementation_version);
+
+	std::vector<uint8_t> options_ipc_bytes;
+	if (!attach_options.empty()) {
+		auto options_batch = BuildSettingsBatch(context, attach_options);
+		options_ipc_bytes = SerializeToIpcBytes(options_batch);
+	}
+
+	auto params = BuildCatalogAttachParams(catalog_name, options_ipc_bytes, data_version_spec, implementation_version);
 	auto response = InvokeRpcMethod(ctx, "catalog_attach", params, context);
 	auto result_batch = ExtractAndDeserializeResult(response, "catalog_attach", worker_path);
 	if (!result_batch) {
@@ -1246,6 +1262,54 @@ VgiSetting ParseVgiSetting(const std::vector<uint8_t> &bytes, const std::string 
 	}
 
 	return setting;
+}
+
+VgiAttachOptionSpec ParseAttachOptionSpec(const std::vector<uint8_t> &bytes, const std::string &worker_path,
+                                          ClientContext &context) {
+	auto batch = DeserializeFromIpcBytes(bytes);
+	if (!batch || batch->num_rows() == 0) {
+		throw IOException("Empty AttachOptionSpec batch from worker: %s", worker_path);
+	}
+
+	RecordBatchSingleRow row(batch, 0, "AttachOptionSpec", worker_path);
+
+	VgiAttachOptionSpec spec;
+	spec.name = row["name"].value_not_null<std::string>();
+	spec.description = row["description"].value_not_null<std::string>();
+
+	auto type_bytes = row["type"].value_not_null<std::vector<uint8_t>>();
+	auto type_buffer = arrow::Buffer::Wrap(type_bytes.data(), type_bytes.size());
+	auto type_stream = std::make_shared<arrow::io::BufferReader>(type_buffer);
+	arrow::ipc::DictionaryMemo type_dict_memo;
+	auto type_schema_result = arrow::ipc::ReadSchema(type_stream.get(), &type_dict_memo);
+	if (!type_schema_result.ok()) {
+		throw IOException("Failed to read type schema for attach option '%s': %s", spec.name,
+		                  type_schema_result.status().ToString());
+	}
+	auto type_schema = type_schema_result.ValueUnsafe();
+
+	{
+		ArrowSchemaWrapper c_schema;
+		ArrowTableSchema arrow_table;
+		vector<LogicalType> types;
+		vector<string> names;
+		ArrowSchemaToDuckDBTypes(context, type_schema, c_schema, arrow_table, types, names);
+		spec.type = types[0];
+	}
+
+	auto default_bytes_opt = row["default_value"].as<std::vector<uint8_t>>();
+	if (default_bytes_opt && !default_bytes_opt->empty()) {
+		auto default_batch = DeserializeFromIpcBytes(*default_bytes_opt);
+		if (default_batch && default_batch->num_rows() > 0 && default_batch->num_columns() > 0) {
+			spec.default_value = ExtractArrowValue(default_batch->column(0), 0, spec.type);
+		} else {
+			spec.default_value = Value(spec.type);
+		}
+	} else {
+		spec.default_value = Value(spec.type);
+	}
+
+	return spec;
 }
 
 VgiSecretType ParseVgiSecretType(const std::vector<uint8_t> &bytes, const std::string &worker_path,

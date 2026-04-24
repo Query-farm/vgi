@@ -204,6 +204,10 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	string bearer_token;
 	string data_version_spec;
 	string implementation_version;
+	// Unknown-to-the-extension options are forwarded to the worker as
+	// attach-time options after validation against the catalog's declared
+	// AttachOptionSpec list (fetched via InvokeCatalogs when present).
+	std::map<std::string, Value> attach_options;
 
 	// Extract options
 	for (auto &entry : info.options) {
@@ -229,7 +233,8 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 		} else if (lower_name == "implementation_version") {
 			implementation_version = entry.second.ToString();
 		} else {
-			throw BinderException("Unrecognized option for VGI ATTACH: %s", entry.first);
+			// Collect for validation + forwarding to the worker.
+			attach_options.emplace(lower_name, entry.second);
 		}
 	}
 
@@ -293,11 +298,64 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 		cookie_jar = std::make_shared<vgi::SessionCookieJar>();
 	}
 
+	// If the user passed attach-time options, validate them against the
+	// catalog's declared AttachOptionSpec list. Skip the extra RPC when
+	// attach_options is empty — catalogs without options pay no overhead.
+	if (!attach_options.empty()) {
+		auto catalogs = vgi::InvokeCatalogs(worker_path, context, worker_debug, use_pool, auth);
+		const vgi::VgiCatalogInfo *matching_info = nullptr;
+		for (const auto &info_entry : catalogs) {
+			if (info_entry.name == catalog_name) {
+				matching_info = &info_entry;
+				break;
+			}
+		}
+		if (!matching_info) {
+			throw BinderException("Worker at '%s' exposes no catalog named '%s'", worker_path, catalog_name);
+		}
+
+		auto build_accepted_list = [&]() {
+			std::string joined;
+			for (const auto &spec : matching_info->attach_option_specs) {
+				if (!joined.empty()) {
+					joined += ", ";
+				}
+				joined += spec.name;
+			}
+			return joined.empty() ? std::string("(none)") : joined;
+		};
+
+		std::map<std::string, Value> validated_options;
+		for (const auto &opt : attach_options) {
+			const vgi::VgiAttachOptionSpec *matching_spec = nullptr;
+			for (const auto &spec : matching_info->attach_option_specs) {
+				if (StringUtil::Lower(spec.name) == opt.first) {
+					matching_spec = &spec;
+					break;
+				}
+			}
+			if (!matching_spec) {
+				throw BinderException("Unknown ATTACH option '%s' for catalog '%s'. Accepted options: %s",
+				                      opt.first, catalog_name, build_accepted_list());
+			}
+
+			Value casted;
+			std::string cast_error;
+			if (!opt.second.DefaultTryCastAs(matching_spec->type, casted, &cast_error)) {
+				throw BinderException("Cannot cast ATTACH option '%s' to declared type %s: %s", matching_spec->name,
+				                      matching_spec->type.ToString(), cast_error);
+			}
+			validated_options.emplace(matching_spec->name, std::move(casted));
+		}
+		attach_options = std::move(validated_options);
+	}
+
 	// Call catalog_attach via RPC. The worker validates data_version_spec and
 	// implementation_version and throws with a human-readable message on
 	// unsatisfiable requests; that surfaces as the ATTACH failure.
 	auto attach_result = vgi::InvokeCatalogAttach(worker_path, catalog_name, context, worker_debug, use_pool, auth,
-	                                              data_version_spec, implementation_version, cookie_jar);
+	                                              data_version_spec, implementation_version, cookie_jar,
+	                                              attach_options);
 
 	// Register extension options for settings exposed by this catalog
 	// Check for type conflicts with existing settings

@@ -57,6 +57,16 @@ static unique_ptr<FunctionData> VgiCatalogsBind(ClientContext &context, TableFun
 	return_types.push_back(LogicalType::VARCHAR);
 	names.push_back("data_version_spec");
 
+	// Attach-time options declared by this catalog (for pre-attach discovery).
+	// Each element describes one option; type/default rendered as VARCHAR for display.
+	child_list_t<LogicalType> option_fields;
+	option_fields.emplace_back("name", LogicalType::VARCHAR);
+	option_fields.emplace_back("description", LogicalType::VARCHAR);
+	option_fields.emplace_back("type", LogicalType::VARCHAR);
+	option_fields.emplace_back("default_value", LogicalType::VARCHAR);
+	return_types.push_back(LogicalType::LIST(LogicalType::STRUCT(std::move(option_fields))));
+	names.push_back("attach_options");
+
 	return bind_data;
 }
 
@@ -89,6 +99,29 @@ static void VgiCatalogsScan(ClientContext &context, TableFunctionInput &input, D
 		output.data[0].SetValue(count, Value(info.name));
 		output.data[1].SetValue(count, Value(info.implementation_version));
 		output.data[2].SetValue(count, Value(info.data_version_spec));
+
+		// Build LIST(STRUCT(...)) of attach options.
+		child_list_t<LogicalType> struct_child_types;
+		struct_child_types.emplace_back("name", LogicalType::VARCHAR);
+		struct_child_types.emplace_back("description", LogicalType::VARCHAR);
+		struct_child_types.emplace_back("type", LogicalType::VARCHAR);
+		struct_child_types.emplace_back("default_value", LogicalType::VARCHAR);
+		auto struct_type = LogicalType::STRUCT(struct_child_types);
+
+		std::vector<Value> option_values;
+		option_values.reserve(info.attach_option_specs.size());
+		for (const auto &spec : info.attach_option_specs) {
+			child_list_t<Value> struct_values;
+			struct_values.emplace_back("name", Value(spec.name));
+			struct_values.emplace_back("description", Value(spec.description));
+			struct_values.emplace_back("type", Value(spec.type.ToString()));
+			struct_values.emplace_back("default_value",
+			                           spec.default_value.IsNull() ? Value(LogicalType::VARCHAR)
+			                                                       : Value(spec.default_value.ToString()));
+			option_values.push_back(Value::STRUCT(std::move(struct_values)));
+		}
+		output.data[3].SetValue(count, Value::LIST(struct_type, std::move(option_values)));
+
 		count++;
 		state.current_idx++;
 	}

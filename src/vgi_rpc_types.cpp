@@ -782,6 +782,7 @@ std::shared_ptr<arrow::RecordBatch> BuildInitRpcParams(const std::vector<uint8_t
 }
 
 std::shared_ptr<arrow::RecordBatch> BuildCatalogAttachParams(const std::string &name,
+                                                             const std::vector<uint8_t> &options_ipc_bytes,
                                                              const std::string &data_version_spec,
                                                              const std::string &implementation_version) {
 	// Matches vgi-python's CatalogAttachRequest (vgi/protocol.py:193). The
@@ -798,7 +799,7 @@ std::shared_ptr<arrow::RecordBatch> BuildCatalogAttachParams(const std::string &
 	});
 	std::vector<std::shared_ptr<arrow::Array>> request_arrays;
 	request_arrays.push_back(BuildStringScalar(name));
-	request_arrays.push_back(BuildBinaryScalar({}));
+	request_arrays.push_back(BuildBinaryScalar(options_ipc_bytes));
 	request_arrays.push_back(BuildNullableStringScalar(data_version_spec));
 	request_arrays.push_back(BuildNullableStringScalar(implementation_version));
 	auto request_batch = arrow::RecordBatch::Make(request_schema, 1, request_arrays);

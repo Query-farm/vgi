@@ -1,0 +1,166 @@
+# name: test/sql/integration/attach/attach_options_echo.test
+# description: ATTACH-time options of all supported types round-trip to the worker via attach_id
+# group: [vgi_integration_attach]
+
+require-env VGI_ATTACH_OPTIONS_WORKER
+
+require vgi
+
+require httpfs
+
+# ============================================================================
+# Pre-attach discovery: vgi_catalogs() surfaces declared options
+# ============================================================================
+
+query II
+SELECT opt.name, opt.type
+FROM (
+    SELECT UNNEST(attach_options) AS opt
+    FROM vgi_catalogs('${VGI_ATTACH_OPTIONS_WORKER}')
+    WHERE catalog = 'attach_options'
+)
+ORDER BY opt.name;
+----
+opt_blob	BLOB
+opt_bool	BOOLEAN
+opt_date	DATE
+opt_decimal	DECIMAL(18,4)
+opt_float32	FLOAT
+opt_float64	DOUBLE
+opt_int16	SMALLINT
+opt_int32	INTEGER
+opt_int64	BIGINT
+opt_int8	TINYINT
+opt_list	BIGINT[]
+opt_string	VARCHAR
+opt_struct	STRUCT(a BIGINT, b VARCHAR)
+opt_time	TIME
+opt_timestamp	TIMESTAMP
+opt_timestamp_tz	TIMESTAMP WITH TIME ZONE
+opt_uint16	USMALLINT
+opt_uint32	UINTEGER
+opt_uint64	UBIGINT
+opt_uint8	UTINYINT
+
+# ============================================================================
+# Bind-time validation
+# ============================================================================
+
+# Unknown option → clear error listing accepted options
+statement error
+ATTACH 'attach_options' AS bad (
+    TYPE vgi,
+    LOCATION '${VGI_ATTACH_OPTIONS_WORKER}',
+    not_a_thing 1
+);
+----
+Unknown ATTACH option 'not_a_thing'
+
+# Wrong-type option → clear error naming the declared type
+statement error
+ATTACH 'attach_options' AS bad (
+    TYPE vgi,
+    LOCATION '${VGI_ATTACH_OPTIONS_WORKER}',
+    opt_bool 'not a bool'
+);
+----
+Cannot cast ATTACH option 'opt_bool'
+
+# ============================================================================
+# Round-trip: every declared type, user-supplied values
+# ============================================================================
+
+statement ok
+ATTACH 'attach_options' AS ao (
+    TYPE vgi,
+    LOCATION '${VGI_ATTACH_OPTIONS_WORKER}',
+    opt_bool false,
+    opt_int8 -1,
+    opt_int16 -1000,
+    opt_int32 7,
+    opt_int64 9999999999,
+    opt_uint8 200,
+    opt_uint16 60000,
+    opt_uint32 4000000000,
+    opt_uint64 18000000000,
+    opt_float32 1.25,
+    opt_float64 3.25,
+    opt_string 'world',
+    opt_blob '\xDE\xAD\xBE\xEF'::BLOB,
+    opt_date DATE '2025-01-02',
+    opt_time TIME '12:34:56',
+    opt_timestamp TIMESTAMP '2025-01-02 03:04:05',
+    opt_timestamp_tz TIMESTAMPTZ '2025-01-02 03:04:05Z',
+    opt_decimal 12.3400::DECIMAL(18,4),
+    opt_list [10, 20, 30],
+    opt_struct {'a': 42, 'b': 'hi'}
+);
+
+query IIIIIIIIIIIII
+SELECT opt_bool, opt_int8, opt_int16, opt_int32, opt_int64,
+       opt_uint8, opt_uint16, opt_uint32, opt_uint64,
+       opt_float32, opt_float64,
+       opt_string, opt_blob
+FROM ao.echo_attach_options();
+----
+false	-1	-1000	7	9999999999	200	60000	4000000000	18000000000	1.25	3.25	world	\xDE\xAD\xBE\xEF
+
+query TTTTT
+SELECT opt_date, opt_time, opt_timestamp, opt_timestamp_tz, opt_decimal
+FROM ao.echo_attach_options();
+----
+2025-01-02	12:34:56	2025-01-02 03:04:05	2025-01-02 03:04:05+00	12.3400
+
+query TT
+SELECT opt_list, opt_struct
+FROM ao.echo_attach_options();
+----
+[10, 20, 30]	{'a': 42, 'b': hi}
+
+# ============================================================================
+# Defaults: ATTACH without overrides yields declared defaults
+# ============================================================================
+
+statement ok
+ATTACH 'attach_options' AS ao_defaults (
+    TYPE vgi,
+    LOCATION '${VGI_ATTACH_OPTIONS_WORKER}'
+);
+
+query TIITTT
+SELECT opt_bool, opt_int32, opt_int64, opt_string, opt_list, opt_struct
+FROM ao_defaults.echo_attach_options();
+----
+true	-32	-64	hello	[1, 2, 3]	{'a': 1, 'b': x}
+
+# ============================================================================
+# Pool / HTTP safety: two distinct ATTACHes carry per-attach state
+# ============================================================================
+
+statement ok
+ATTACH 'attach_options' AS ao_other (
+    TYPE vgi,
+    LOCATION '${VGI_ATTACH_OPTIONS_WORKER}',
+    opt_int32 999,
+    opt_string 'other'
+);
+
+query IT
+SELECT opt_int32, opt_string FROM ao_other.echo_attach_options();
+----
+999	other
+
+# The first attach must still see its own values after ao_other was attached
+query IT
+SELECT opt_int32, opt_string FROM ao.echo_attach_options();
+----
+7	world
+
+statement ok
+DETACH ao;
+
+statement ok
+DETACH ao_defaults;
+
+statement ok
+DETACH ao_other;

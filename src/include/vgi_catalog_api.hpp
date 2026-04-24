@@ -154,6 +154,16 @@ struct VgiSetting {
 	Value default_value;                  // Default value (may be NULL if required)
 };
 
+// An attach-time option declared by a VGI catalog.
+// Same wire format as VgiSetting; semantic difference is that attach options
+// are delivered once during catalog_attach, not resent per call.
+struct VgiAttachOptionSpec {
+	std::string name;
+	std::string description;
+	LogicalType type;
+	Value default_value;
+};
+
 // A parameter definition for a VGI secret type
 struct VgiSecretTypeParam {
 	std::string name;       // Key name (e.g., "secret_string")
@@ -203,6 +213,9 @@ struct VgiCatalogInfo {
 	std::string name;
 	std::string implementation_version;  // empty = worker has no opinion
 	std::string data_version_spec;       // empty = worker has no opinion
+	// Attach-time options this catalog accepts. Used for pre-attach discovery
+	// and for bind-time validation in VgiCatalogAttach.
+	std::vector<VgiAttachOptionSpec> attach_option_specs;
 };
 
 // Schema metadata from the worker
@@ -365,6 +378,11 @@ struct VgiFunctionInfo {
 VgiSetting ParseVgiSetting(const std::vector<uint8_t> &bytes, const std::string &worker_path,
                            ClientContext &context);
 
+// Parse a VgiAttachOptionSpec from serialized bytes (Arrow IPC format).
+// Wire format matches VgiSetting: name, description, type, default_value.
+VgiAttachOptionSpec ParseAttachOptionSpec(const std::vector<uint8_t> &bytes, const std::string &worker_path,
+                                          ClientContext &context);
+
 // Parse a VgiSecretType from serialized bytes (Arrow IPC format)
 // The bytes contain a single-row RecordBatch with: name, description, parameters_schema
 // parameters_schema is an IPC-serialized Arrow schema where each field defines a secret parameter
@@ -423,7 +441,8 @@ CatalogAttachResult InvokeCatalogAttach(const std::string &worker_path, const st
                                         const std::shared_ptr<CatalogAuth> &auth = nullptr,
                                         const std::string &data_version_spec = "",
                                         const std::string &implementation_version = "",
-                                        const std::shared_ptr<SessionCookieJar> &cookie_jar = nullptr);
+                                        const std::shared_ptr<SessionCookieJar> &cookie_jar = nullptr,
+                                        const std::map<std::string, Value> &attach_options = {});
 
 // List catalogs exposed by a worker. Returns per-catalog discovery records
 // carrying implementation_version and data_version_spec metadata alongside the

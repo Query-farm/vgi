@@ -17,6 +17,7 @@ VGI_TEST_WORKER ?= uv run --project $(HOME)/Development/vgi-python vgi-example-w
 # defaults so `require-env` gates pass under `make test_subprocess` by default.
 VGI_VERSIONED_WORKER ?= uv run --project $(HOME)/Development/vgi-python vgi-example-versioned-worker
 VGI_VERSIONED_TABLES_WORKER ?= uv run --project $(HOME)/Development/vgi-python vgi-example-versioned-tables-worker
+VGI_ATTACH_OPTIONS_WORKER ?= uv run --project $(HOME)/Development/vgi-python vgi-example-attach-options-worker
 
 # Subprocess transport tests.
 # Writable tests are excluded from the default targets because they require
@@ -24,6 +25,7 @@ VGI_VERSIONED_TABLES_WORKER ?= uv run --project $(HOME)/Development/vgi-python v
 # explicitly via `make test_writable` when that worker is available.
 .PHONY: test_subprocess test_subprocess_debug test_http test_http_debug \
 	test_http_versioned_tables test_http_versioned_tables_debug \
+	test_http_attach_options test_http_attach_options_debug \
 	test_writable test_writable_debug test_all test_all_debug
 
 test_subprocess:
@@ -31,6 +33,7 @@ test_subprocess:
 	VGI_TEST_WORKER="$(VGI_TEST_WORKER)" \
 	VGI_VERSIONED_WORKER="$(VGI_VERSIONED_WORKER)" \
 	VGI_VERSIONED_TABLES_WORKER="$(VGI_VERSIONED_TABLES_WORKER)" \
+	VGI_ATTACH_OPTIONS_WORKER="$(VGI_ATTACH_OPTIONS_WORKER)" \
 	./build/release/test/unittest "test/*" "~test/sql/integration/writable/*"
 
 test_subprocess_debug:
@@ -38,6 +41,7 @@ test_subprocess_debug:
 	VGI_TEST_WORKER="$(VGI_TEST_WORKER)" \
 	VGI_VERSIONED_WORKER="$(VGI_VERSIONED_WORKER)" \
 	VGI_VERSIONED_TABLES_WORKER="$(VGI_VERSIONED_TABLES_WORKER)" \
+	VGI_ATTACH_OPTIONS_WORKER="$(VGI_ATTACH_OPTIONS_WORKER)" \
 	./build/debug/test/unittest "test/*" "~test/sql/integration/writable/*"
 
 # HTTP transport tests (uses test/run_http_integration.sh)
@@ -62,6 +66,14 @@ test_http_versioned_tables:
 test_http_versioned_tables_debug:
 	BUILD_DIR=debug ./test/run_http_versioned_tables_integration.sh
 
+# HTTP attach-options tests (runs against the vgi-example-attach-options-worker
+# in HTTP mode). Separate from test_http because it needs its own server.
+test_http_attach_options:
+	./test/run_http_attach_options_integration.sh
+
+test_http_attach_options_debug:
+	BUILD_DIR=debug ./test/run_http_attach_options_integration.sh
+
 # Writable catalog tests (subprocess transport) — opt-in, require a worker
 # with writable-catalog support.
 test_writable:
@@ -71,9 +83,9 @@ test_writable_debug:
 	VGI_TRANSACTOR_DB_DIR="$$(mktemp -d)" VGI_TEST_WORKER="$(VGI_TEST_WORKER)" ./build/debug/test/unittest "test/sql/integration/writable/*"
 
 # Run all transports
-test_all: test_subprocess test_http test_http_bearer test_http_versioned_tables
+test_all: test_subprocess test_http test_http_bearer test_http_versioned_tables test_http_attach_options
 
-test_all_debug: test_subprocess_debug test_http_debug test_http_bearer_debug test_http_versioned_tables_debug
+test_all_debug: test_subprocess_debug test_http_debug test_http_bearer_debug test_http_versioned_tables_debug test_http_attach_options_debug
 
 # Interactive DuckDB shell with the vgi extension loaded and the example
 # python worker pre-attached as the `example` catalog. Use `make shell`
