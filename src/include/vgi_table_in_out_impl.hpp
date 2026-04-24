@@ -17,6 +17,9 @@
 #include "vgi_catalog_api.hpp"
 
 namespace duckdb {
+
+class DatabaseInstance;
+
 namespace vgi {
 
 // Forward declaration
@@ -71,7 +74,7 @@ struct VgiTableInOutBindData : public TableFunctionData {
 // ============================================================================
 
 struct VgiTableInOutGlobalState : public GlobalTableFunctionState {
-	VgiTableInOutGlobalState();
+	explicit VgiTableInOutGlobalState(DatabaseInstance *db = nullptr);
 	~VgiTableInOutGlobalState() override;
 
 	// Primary connection for this execution
@@ -82,6 +85,23 @@ struct VgiTableInOutGlobalState : public GlobalTableFunctionState {
 
 	// Whether finalize signal has been sent to the worker
 	bool finalize_sent = false;
+
+	// Set when the stream reaches a natural end (worker returned
+	// FINISHED or Finalize drained). The destructor uses this to
+	// decide between cancel-dispatch and plain connection drop.
+	bool stream_finished = false;
+
+	// Captured at InitGlobal from the ClientContext setting.
+	bool cancel_enabled = true;
+
+	// Most recent HTTP stream-state token seen on exchange responses.
+	// Empty for subprocess. Used to address the right worker on cancel
+	// when HTTP max_workers > 1.
+	std::vector<uint8_t> last_state_token;
+
+	// DatabaseInstance used to locate the per-instance cancel
+	// dispatcher. nullptr is valid (cancel dispatch is skipped).
+	DatabaseInstance *db = nullptr;
 
 	idx_t MaxThreads() const override {
 		return 1; // Table-in-out functions are single-threaded for now

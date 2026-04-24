@@ -6,6 +6,7 @@
 #include "vgi_arrow_ipc.hpp"
 #include "vgi_bind_protocol.hpp"
 #include "vgi_catalog_api.hpp"
+#include "generated/vgi_protocol_constants.hpp"
 #include "vgi_exception.hpp"
 #include "vgi_http_function_connection.hpp"
 #include "vgi_logging.hpp"
@@ -680,6 +681,33 @@ void FunctionConnection::WriteInputBatch(const std::shared_ptr<arrow::RecordBatc
 
 	// Drain any buffered stderr
 	DrainStderrLog();
+}
+
+void FunctionConnection::CancelStream(const std::vector<uint8_t> &state_token) {
+	(void)state_token;
+	// Best-effort: if the writer isn't open or is already closed, the
+	// worker has already learned the stream is done via EOS or pipe
+	// close; no cancel is needed.
+	if (!input_writer_opened_ || input_writer_closed_ || !input_writer_) {
+		return;
+	}
+	// Cancel is only supported for producer mode (table function). In
+	// producer mode tick_schema_ is an empty schema and a zero-row
+	// batch with no arrays is well-formed. In exchange mode
+	// (scalar / table-in-out input phase), input_schema_ has fields —
+	// a zero-array batch would mismatch the writer's opened schema and
+	// trip Arrow DCHECKs. For those callers the worker already learns
+	// about teardown via pipe close on the next batch boundary.
+	if (!tick_schema_) {
+		return;
+	}
+	auto cancel_batch = arrow::RecordBatch::Make(tick_schema_, 0, std::vector<std::shared_ptr<arrow::Array>>{});
+	auto metadata = arrow::KeyValueMetadata::Make(
+	    {std::string(generated::VGI_RPC_CANCEL_KEY)}, {"1"});
+	auto write_status = input_writer_->WriteRecordBatch(*cancel_batch, metadata);
+	// Best-effort — dispatcher catches any throw; here we just swallow
+	// to keep the signature simple (status itself isn't an exception).
+	(void)write_status;
 }
 
 void FunctionConnection::CloseInputWriter() {

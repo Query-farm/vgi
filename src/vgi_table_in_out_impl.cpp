@@ -1,5 +1,6 @@
 #include "vgi_table_in_out_impl.hpp"
 #include "vgi_arrow_utils.hpp"
+#include "vgi_cancel_dispatcher.hpp"
 #include "vgi_catalog_api.hpp"
 #include "vgi_function_connection.hpp"
 #include "vgi_ifunction_connection.hpp"
@@ -48,9 +49,33 @@ bool VgiTableInOutBindData::Equals(const FunctionData &other_p) const {
 // Global State for Table-In-Out Functions
 // ============================================================================
 
-VgiTableInOutGlobalState::VgiTableInOutGlobalState() = default;
+VgiTableInOutGlobalState::VgiTableInOutGlobalState(DatabaseInstance *db_p) : db(db_p) {
+}
 
-VgiTableInOutGlobalState::~VgiTableInOutGlobalState() = default;
+VgiTableInOutGlobalState::~VgiTableInOutGlobalState() {
+	if (!connection) {
+		return;
+	}
+	// Stream reached a natural end or cancel was already sent —
+	// no further action needed. connection drops via unique_ptr.
+	if (stream_finished || !cancel_enabled || !db) {
+		return;
+	}
+	auto *dispatcher = FindVgiCancelDispatcher(*db);
+	if (!dispatcher) {
+		return;
+	}
+	// Snapshot the token from the connection before moving it; HTTP
+	// tracks state-tokens internally per exchange.
+	auto token = connection->GetLastStateToken();
+	CancelRequest req;
+	req.connection = std::move(connection);
+	req.state_token = !token.empty() ? std::move(token) : last_state_token;
+	if (!dispatcher->Enqueue(std::move(req))) {
+		// Saturation: let the unique_ptr (still in req) drop the
+		// connection; cancel is best-effort.
+	}
+}
 
 // ============================================================================
 // Local State for Table-In-Out Functions
@@ -163,18 +188,12 @@ unique_ptr<FunctionData> VgiTableInOutBind(ClientContext &context, TableFunction
 		auto bind_conn_id = connection->GetConnIdHex();
 		if (auto pooled = connection->ReleaseForPooling()) {
 			auto rr = VgiWorkerPool::Instance().Release(std::move(pooled));
-			vector<pair<string, string>> fields;
-			fields.emplace_back("conn", bind_conn_id);
-			fields.emplace_back("worker_path", bind_data->worker_path());
-			fields.emplace_back("worker_pid", std::to_string(bind_worker_pid));
-			fields.emplace_back("phase", "bind");
-			fields.emplace_back("pooled", rr.pooled ? "true" : "false");
-			if (!rr.skip_reason.empty()) {
-				fields.emplace_back("skip_reason", rr.skip_reason);
-			}
-			fields.emplace_back("pool_size", std::to_string(rr.pool_size));
-			fields.emplace_back("total", std::to_string(rr.total_pool_size));
-			VGI_LOG(context, "worker_pool.release", fields);
+			PoolReleaseLogFields lf;
+			lf.conn_id = bind_conn_id;
+			lf.worker_path = bind_data->worker_path();
+			lf.worker_pid = bind_worker_pid;
+			lf.phase = "bind";
+			LogWorkerPoolRelease(context, lf, rr.pooled, rr.skip_reason, rr.pool_size, rr.total_pool_size);
 		}
 		connection.reset();
 	}
@@ -193,7 +212,13 @@ unique_ptr<FunctionData> VgiTableInOutBind(ClientContext &context, TableFunction
 
 unique_ptr<GlobalTableFunctionState> VgiTableInOutInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
 	auto &bind_data = input.bind_data->Cast<VgiTableInOutBindData>();
-	auto global_state = make_uniq<VgiTableInOutGlobalState>();
+	auto global_state = make_uniq<VgiTableInOutGlobalState>(context.db.get());
+	{
+		Value v;
+		if (context.TryGetCurrentSetting("vgi_cancel_enabled", v)) {
+			global_state->cancel_enabled = v.GetValue<bool>();
+		}
+	}
 
 	// Acquire a fresh connection (pool-hit typical) and do a fresh bind.
 	// The bind worker was released to the pool at bind time.
@@ -356,6 +381,7 @@ OperatorResultType VgiTableInOutFunction(ExecutionContext &context, TableFunctio
 	if (!output_batch) {
 		// EOS - stream exhausted
 		output.SetCardinality(0);
+		global_state.stream_finished = true;
 		return OperatorResultType::FINISHED;
 	}
 
@@ -390,6 +416,7 @@ OperatorFinalizeResultType VgiTableInOutFinalize(ExecutionContext &context, Tabl
 	auto &client_context = context.client;
 
 	if (!global_state.connection) {
+		global_state.stream_finished = true;
 		return OperatorFinalizeResultType::FINISHED;
 	}
 
@@ -433,20 +460,17 @@ OperatorFinalizeResultType VgiTableInOutFinalize(ExecutionContext &context, Tabl
 			if (auto pooled = global_state.connection->ReleaseForPooling()) {
 				auto released_pid = pooled->GetPid();
 				auto rr = VgiWorkerPool::Instance().Release(std::move(pooled));
-				vector<pair<string, string>> fields;
-				fields.emplace_back("conn", release_conn_id);
-				fields.emplace_back("worker_path", bind_data.worker_path());
-				fields.emplace_back("function_name", bind_data.function_name);
-				fields.emplace_back("worker_pid", std::to_string(released_pid));
-				fields.emplace_back("pooled", rr.pooled ? "true" : "false");
-				if (!rr.skip_reason.empty()) {
-					fields.emplace_back("skip_reason", rr.skip_reason);
-				}
-				fields.emplace_back("pool_size", std::to_string(rr.pool_size));
-				fields.emplace_back("total", std::to_string(rr.total_pool_size));
-				VGI_LOG(client_context, "table_in_out.pool_release", fields);
+				PoolReleaseLogFields lf;
+				lf.conn_id = release_conn_id;
+				lf.worker_path = bind_data.worker_path();
+				lf.function_name = bind_data.function_name;
+				lf.worker_pid = released_pid;
+				lf.event_name = "table_in_out.pool_release";
+				LogWorkerPoolRelease(client_context, lf, rr.pooled, rr.skip_reason, rr.pool_size,
+				                     rr.total_pool_size);
 			}
 		}
+		global_state.stream_finished = true;
 		return OperatorFinalizeResultType::FINISHED;
 	}
 
@@ -467,20 +491,17 @@ OperatorFinalizeResultType VgiTableInOutFinalize(ExecutionContext &context, Tabl
 			if (auto pooled = global_state.connection->ReleaseForPooling()) {
 				auto released_pid = pooled->GetPid();
 				auto rr = VgiWorkerPool::Instance().Release(std::move(pooled));
-				vector<pair<string, string>> fields;
-				fields.emplace_back("conn", release_conn_id);
-				fields.emplace_back("worker_path", bind_data.worker_path());
-				fields.emplace_back("function_name", bind_data.function_name);
-				fields.emplace_back("worker_pid", std::to_string(released_pid));
-				fields.emplace_back("pooled", rr.pooled ? "true" : "false");
-				if (!rr.skip_reason.empty()) {
-					fields.emplace_back("skip_reason", rr.skip_reason);
-				}
-				fields.emplace_back("pool_size", std::to_string(rr.pool_size));
-				fields.emplace_back("total", std::to_string(rr.total_pool_size));
-				VGI_LOG(client_context, "table_in_out.pool_release", fields);
+				PoolReleaseLogFields lf;
+				lf.conn_id = release_conn_id;
+				lf.worker_path = bind_data.worker_path();
+				lf.function_name = bind_data.function_name;
+				lf.worker_pid = released_pid;
+				lf.event_name = "table_in_out.pool_release";
+				LogWorkerPoolRelease(client_context, lf, rr.pooled, rr.skip_reason, rr.pool_size,
+				                     rr.total_pool_size);
 			}
 		}
+		global_state.stream_finished = true;
 		return OperatorFinalizeResultType::FINISHED;
 	}
 

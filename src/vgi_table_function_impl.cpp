@@ -1,7 +1,9 @@
 #include "vgi_table_function_impl.hpp"
 
+#include "vgi_cancel_dispatcher.hpp"
 #include "vgi_catalog_api.hpp"
 #include "vgi_exception.hpp"
+#include "vgi_extension.hpp"
 #include "vgi_logging.hpp"
 #include "vgi_protocol.hpp"
 #include "vgi_worker_pool.hpp"
@@ -41,6 +43,89 @@ using namespace duckdb_yyjson; // NOLINT
 
 namespace duckdb {
 namespace vgi {
+
+// ============================================================================
+// VgiTableFunctionLocalState out-of-line definitions
+// ============================================================================
+
+namespace {
+
+bool ReadCancelEnabledSetting(ClientContext &ctx) {
+	Value v;
+	if (ctx.TryGetCurrentSetting("vgi_cancel_enabled", v)) {
+		return v.GetValue<bool>();
+	}
+	return true;
+}
+
+} // namespace
+
+VgiTableFunctionLocalState::VgiTableFunctionLocalState(
+    unique_ptr<ArrowArrayWrapper> current_chunk, ClientContext &ctx,
+    std::shared_ptr<VgiAttachParameters> attach_params)
+    : ArrowScanLocalState(std::move(current_chunk), ctx),
+      cancel_enabled(ReadCancelEnabledSetting(ctx)),
+      prefetch_slot_(std::make_shared<VgiPrefetchSlot>()),
+      db_(*ctx.db),
+      context_(ctx),
+      attach_params_(std::move(attach_params)) {
+}
+
+VgiTableFunctionLocalState::~VgiTableFunctionLocalState() noexcept {
+	// Signal any in-flight prefetch task to discard its result once it
+	// wakes up. Racy by design — a task already mid-RPC will finish;
+	// the slot's shared_ptr keeps the connection alive for it.
+	prefetch_slot_->cancelled.store(true, std::memory_order_release);
+
+	// If a prefetch task still holds a reference, we can't touch the
+	// connection without corrupting the subprocess stream. Defer all
+	// further work — pool release and cancel alike.
+	if (prefetch_slot_.use_count() != 1) {
+		return;
+	}
+
+	auto &connection = prefetch_slot_->connection;
+	if (!connection) {
+		return;
+	}
+
+	// Early-exit path: stream is not done and cancel is enabled —
+	// hand the connection to the dispatcher instead of returning it
+	// to the pool. A cancelled connection's state is unsafe to reuse.
+	if (!done && cancel_enabled) {
+		if (auto *dispatcher = FindVgiCancelDispatcher(db_)) {
+			auto token = connection->GetLastStateToken();
+			CancelRequest req;
+			req.connection = std::move(connection);
+			req.state_token = !token.empty() ? std::move(token) : prefetch_slot_->last_state_token;
+			if (dispatcher->Enqueue(std::move(req))) {
+				return;
+			}
+			// Saturation: fall back to normal pool-release below so the
+			// connection is not leaked. req.connection holds the unique_ptr
+			// only if Enqueue returned false — move it back.
+			connection = std::move(req.connection);
+		}
+	}
+
+	// Natural-end or cancel-disabled: return to pool as before.
+	if (attach_params_ && attach_params_->use_pool() && connection) {
+		auto worker_pid = connection->GetPid();
+		auto conn_id = connection->GetConnIdHex();
+		if (auto pooled = connection->ReleaseForPooling()) {
+			try {
+				auto rr = VgiWorkerPool::Instance().Release(std::move(pooled));
+				PoolReleaseLogFields lf;
+				lf.conn_id = conn_id;
+				lf.worker_path = attach_params_->worker_path();
+				lf.worker_pid = worker_pid;
+				LogWorkerPoolRelease(context_, lf, rr.pooled, rr.skip_reason, rr.pool_size, rr.total_pool_size);
+			} catch (...) {
+				// noexcept destructor; swallow.
+			}
+		}
+	}
+}
 
 // ============================================================================
 // Perform Bind - Common bind logic for VGI table functions

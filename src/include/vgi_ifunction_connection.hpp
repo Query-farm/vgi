@@ -73,6 +73,19 @@ public:
 	virtual void CloseInputWriter() = 0;
 	virtual std::shared_ptr<arrow::RecordBatch> ReadDataBatch() = 0;
 
+	// Most recent stream-state token observed on this connection
+	// (HTTP only). Returns empty on subprocess. Used by the cancel
+	// dispatcher to address the right worker under HTTP pooling.
+	virtual std::vector<uint8_t> GetLastStateToken() const = 0;
+
+	// Cancel the current stream. Called off-thread by VgiCancelDispatcher
+	// from a destructor-triggered teardown; may throw (dispatcher catches).
+	// - Subprocess: writes a zero-row batch with VGI_RPC_CANCEL_KEY custom
+	//   metadata on the input writer. state_token is ignored.
+	// - HTTP: POSTs {state, cancel} to /{method}/exchange addressed by
+	//   state_token (the most recent token seen on the stream).
+	virtual void CancelStream(const std::vector<uint8_t> &state_token) = 0;
+
 	// State queries
 	virtual bool IsTableInOut() const = 0;
 	virtual bool IsFinished() const = 0;

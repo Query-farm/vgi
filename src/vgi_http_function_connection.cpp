@@ -4,6 +4,7 @@
 
 #include "vgi_bind_protocol.hpp"
 #include "vgi_catalog_api.hpp"
+#include "generated/vgi_protocol_constants.hpp"
 #include "vgi_exception.hpp"
 #include "vgi_http_client.hpp"
 #include "vgi_logging.hpp"
@@ -628,6 +629,62 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 	}
 
 	return output_batch;
+}
+
+void HttpFunctionConnection::CancelStream(const std::vector<uint8_t> &state_token) {
+	// Need a state-token to address the server-side stream. Prefer the
+	// caller-supplied token (captured at the call site, immune to
+	// concurrent mutation); fall back to the live member for paths that
+	// don't propagate it through.
+	std::string token;
+	if (!state_token.empty()) {
+		token.assign(state_token.begin(), state_token.end());
+	} else if (!stream_state_token_.empty()) {
+		token = stream_state_token_;
+	} else {
+		// No stream established — nothing to cancel.
+		return;
+	}
+
+	auto schema = arrow::schema({});
+	auto cancel_batch = arrow::RecordBatch::Make(schema, 0, std::vector<std::shared_ptr<arrow::Array>>{});
+
+	auto sink_result = arrow::io::BufferOutputStream::Create();
+	if (!sink_result.ok()) {
+		return;
+	}
+	auto sink = sink_result.ValueUnsafe();
+	auto writer_result = arrow::ipc::MakeStreamWriter(sink, schema);
+	if (!writer_result.ok()) {
+		return;
+	}
+	auto writer = writer_result.ValueUnsafe();
+
+	auto metadata = arrow::KeyValueMetadata::Make(
+	    {RPC_STREAM_STATE_KEY, std::string(generated::VGI_RPC_CANCEL_KEY)},
+	    {token, "1"});
+	auto write_status = writer->WriteRecordBatch(*cancel_batch, metadata);
+	if (!write_status.ok()) {
+		return;
+	}
+	auto close_status = writer->Close();
+	if (!close_status.ok()) {
+		return;
+	}
+	auto finish_result = sink->Finish();
+	if (!finish_result.ok()) {
+		return;
+	}
+	auto buffer = finish_result.ValueUnsafe();
+	std::vector<uint8_t> body(buffer->data(), buffer->data() + buffer->size());
+
+	std::string exchange_url = base_url_ + "/init/exchange";
+	auto c_auth = attach_params_ ? attach_params_->auth() : nullptr;
+	auto c_cached_params = attach_params_
+	    ? attach_params_->GetOrInitHttpParams(context_, exchange_url) : nullptr;
+	// Best-effort: dispatcher catches any thrown exception.
+	(void)HttpPostArrowIpc(context_, exchange_url, body, c_auth,
+	                        /*cookie_jar=*/nullptr, c_cached_params);
 }
 
 } // namespace vgi

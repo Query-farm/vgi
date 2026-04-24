@@ -66,6 +66,10 @@ public:
 	void WriteInputBatch(const std::shared_ptr<arrow::RecordBatch> &batch) override;
 	void CloseInputWriter() override;
 	std::shared_ptr<arrow::RecordBatch> ReadDataBatch() override;
+	void CancelStream(const std::vector<uint8_t> &state_token) override;
+	std::vector<uint8_t> GetLastStateToken() const override {
+		return std::vector<uint8_t>(stream_state_token_.begin(), stream_state_token_.end());
+	}
 
 	// State queries
 	bool IsTableInOut() const override { return input_schema_ != nullptr; }

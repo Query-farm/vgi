@@ -29,8 +29,8 @@ FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'table'
 AND function_name IN (
     'buffer_input', 'echo', 'exception_finalize', 'exception_process',
-    'filter_by_setting', 'repeat_inputs', 'sum_all_columns',
-    'sum_all_columns_simple_distributed', 'unnest_tensor_rows'
+    'filter_by_setting', 'repeat_inputs', 'slow_cancellable_inout',
+    'sum_all_columns', 'sum_all_columns_simple_distributed', 'unnest_tensor_rows'
 )
 ORDER BY function_name;
 ----
@@ -40,6 +40,7 @@ exception_finalize
 exception_process
 filter_by_setting
 repeat_inputs
+slow_cancellable_inout
 sum_all_columns
 sum_all_columns_simple_distributed
 unnest_tensor_rows
@@ -51,7 +52,7 @@ FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'table'
 AND list_contains(parameter_types, 'TABLE');
 ----
-9
+10
 
 # ============================================================================
 # Per-function Registration

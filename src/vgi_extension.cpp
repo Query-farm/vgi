@@ -25,6 +25,7 @@
 #include "query_farm_telemetry.hpp"
 #include "storage/vgi_catalog.hpp"
 #include "storage/vgi_transaction.hpp"
+#include "vgi_cancel_dispatcher.hpp"
 #include "vgi_catalog_api.hpp"
 #include "vgi_catalogs.hpp"
 #include "vgi_cookie_jar.hpp"
@@ -142,9 +143,24 @@ private:
 // Storage extension for VGI — also holds per-secret-type redact keys
 class VgiStorageExtension : public StorageExtension {
 public:
-	VgiStorageExtension() {
+	explicit VgiStorageExtension(DatabaseInstance &db) : dispatcher_(db) {
 		attach = VgiCatalogAttach;
 		create_transaction_manager = CreateVgiTransactionManager;
+	}
+
+	vgi::VgiCancelDispatcher &GetCancelDispatcher() {
+		return dispatcher_;
+	}
+
+	// Convenience: locate the VGI extension on a DatabaseInstance and
+	// return its dispatcher. nullptr if the extension isn't registered.
+	static vgi::VgiCancelDispatcher *FindCancelDispatcher(DatabaseInstance &db) {
+		auto &config = DBConfig::GetConfig(db);
+		auto ext = StorageExtension::Find(config, "vgi");
+		if (!ext) {
+			return nullptr;
+		}
+		return &static_cast<VgiStorageExtension &>(*ext).dispatcher_;
 	}
 
 	// Thread-safe registry of redact keys per secret type name.
@@ -166,6 +182,7 @@ public:
 private:
 	mutable std::mutex redact_mutex_;
 	std::unordered_map<std::string, case_insensitive_set_t> redact_keys_;
+	vgi::VgiCancelDispatcher dispatcher_;
 };
 
 // Create function for VGI secrets — builds a KeyValueSecret from config options.
@@ -814,7 +831,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	// Register VGI storage extension
 	auto &config = DBConfig::GetConfig(loader.GetDatabaseInstance());
-	StorageExtension::Register(config, "vgi", make_shared_ptr<VgiStorageExtension>());
+	StorageExtension::Register(config, "vgi", make_shared_ptr<VgiStorageExtension>(loader.GetDatabaseInstance()));
 
 	// -------------------------------------------------------------------------
 	// Register native GeoArrow Arrow extension types
@@ -918,6 +935,12 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "Enable async I/O prefetch for VGI table function scans (default off: "
 	                          "DuckDB's POSITIONAL JOIN operator does not handle BLOCKED sources)",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
+	config.AddExtensionOption("vgi_cancel_enabled",
+	                          "Notify VGI workers (on both subprocess and HTTP transports) when a stream is torn "
+	                          "down early so their on_cancel hook can release resources. Set to false to disable: "
+	                          "destructors skip the cancel dispatch entirely, on_cancel is never invoked, and "
+	                          "workers learn the stream is gone only via normal stream-close / HTTP TTL.",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
 
 	// Register join key pushdown settings + optimizer
 	config.AddExtensionOption("vgi_join_keys_limit",
@@ -982,6 +1005,13 @@ std::string VgiExtension::Name() {
 std::string VgiExtension::Version() const {
 	return VGI_EXTENSION_VERSION;
 }
+
+namespace vgi {
+VgiCancelDispatcher *FindVgiCancelDispatcher(DatabaseInstance &db) {
+	return ::duckdb::VgiStorageExtension::FindCancelDispatcher(db);
+}
+} // namespace vgi
+
 } // namespace duckdb
 
 extern "C" {

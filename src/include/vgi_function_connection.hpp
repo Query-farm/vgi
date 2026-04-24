@@ -183,6 +183,13 @@ public:
 	// Must be called after OpenInputWriter()
 	void WriteInputBatch(const std::shared_ptr<arrow::RecordBatch> &batch) override;
 
+	// Cancel the current stream by writing a zero-row batch tagged with
+	// VGI_RPC_CANCEL_KEY custom metadata. state_token unused (ignored).
+	void CancelStream(const std::vector<uint8_t> &state_token) override;
+
+	// Subprocess: no state token (the lockstep stream is self-addressing).
+	std::vector<uint8_t> GetLastStateToken() const override { return {}; }
+
 	// Close input writer (signals end of input to the worker)
 	// After this, the worker will send EOS on the output stream
 	void CloseInputWriter() override;

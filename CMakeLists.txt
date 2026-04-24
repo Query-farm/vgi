@@ -61,6 +61,7 @@ src/vgi_aggregate_function_impl.cpp
 src/vgi_aggregate_window_impl.cpp
 src/vgi_catalog_api.cpp
 src/vgi_function_connection.cpp
+src/vgi_cancel_dispatcher.cpp
 src/vgi_worker_pool.cpp
 src/vgi_worker_pool_functions.cpp
 src/vgi_table_statistics_function.cpp

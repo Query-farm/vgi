@@ -1,0 +1,72 @@
+# name: test/sql/integration/table/cancel_on_limit.test
+# description: Verify on_cancel fires when a VGI table function scan is torn
+#              down early by a LIMIT clause. Uses the slow_cancellable fixture
+#              in the example worker: its on_cancel appends a line to a file
+#              whose path is passed as a constant argument.
+# group: [vgi]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS vgi_test (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# Use a unique probe path per run. mktemp -u avoids creating the file
+# (the worker's on_cancel uses "a" mode, so no pre-existence required).
+statement ok
+SET vgi_cancel_enabled = true;
+
+# Ensure the probe file does not exist — every previous run writes to
+# a different tempdir entry when DuckDB is restarted, but within a
+# single test invocation we need a clean slate.
+statement ok
+COPY (SELECT '' AS _ WHERE 1=0) TO '/tmp/vgi_cancel_probe.txt' (HEADER false);
+
+# LIMIT triggers pipeline teardown on the producing table-function scan.
+# The local-state destructor enqueues a cancel; the dispatcher runs
+# it on its thread; the worker's on_cancel appends to probe_path.
+query I
+SELECT n FROM vgi_test.slow_cancellable('/tmp/vgi_cancel_probe.txt', sleep_ms := 0) LIMIT 2;
+----
+0
+1
+
+# Give the dispatcher time to drain (async thread). 250ms is ample
+# for a local subprocess cancel; the write is synchronous.
+statement ok
+SELECT count(*) FROM range(5000000);
+
+# Assert the file has at least one on_cancel line.
+query I
+SELECT count(*) >= 1
+FROM read_text('/tmp/vgi_cancel_probe.txt')
+WHERE position('emitted=' IN content) > 0;
+----
+true
+
+# Negative-contract companion: with cancel disabled, on_cancel must
+# NOT fire on the same LIMIT path. (Use a fresh probe file.)
+statement ok
+COPY (SELECT '' AS _ WHERE 1=0) TO '/tmp/vgi_cancel_probe_disabled.txt' (HEADER false);
+
+statement ok
+SET vgi_cancel_enabled = false;
+
+query I
+SELECT n FROM vgi_test.slow_cancellable('/tmp/vgi_cancel_probe_disabled.txt', sleep_ms := 0) LIMIT 2;
+----
+0
+1
+
+# Wait briefly to give any (erroneous) dispatch a chance. Then assert
+# nothing was written.
+statement ok
+SELECT count(*) FROM range(5000000);
+
+query I
+SELECT count(*)
+FROM read_text('/tmp/vgi_cancel_probe_disabled.txt')
+WHERE position('emitted=' IN content) > 0;
+----
+0
