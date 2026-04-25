@@ -26,26 +26,11 @@
 
 namespace duckdb {
 
+using vgi::ExtractVgiSettings;
+using vgi::ThrowOnArrowError;
+using vgi::AppendBytesOrNull;
+
 namespace {
-
-std::map<std::string, Value> ExtractVgiSettings(ClientContext &context,
-                                                const std::vector<std::string> &setting_names) {
-	std::map<std::string, Value> settings;
-	for (const auto &name : setting_names) {
-		Value value;
-		if (context.TryGetCurrentSetting(name, value)) {
-			settings[name] = value;
-		}
-	}
-	return settings;
-}
-
-// Helper: throw if an Arrow Status is not OK
-void ThrowOnArrowError(const arrow::Status &status) {
-	if (!status.ok()) {
-		throw IOException("Arrow error in VGI aggregate: %s", status.ToString());
-	}
-}
 
 std::shared_ptr<arrow::RecordBatch> BuildAggregateBindRequest(
     const std::string &function_name, const std::vector<uint8_t> &attach_id,
@@ -95,41 +80,14 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateBindRequest(
 	    arrow::field("attach_id", arrow::binary(), true),
 	});
 
-	auto fn_builder = arrow::StringBuilder();
-	auto args_builder = arrow::BinaryBuilder();
-	auto schema_builder = arrow::BinaryBuilder();
-	auto settings_builder = arrow::BinaryBuilder();
-	auto secrets_builder = arrow::BinaryBuilder();
-	auto aid_builder = arrow::BinaryBuilder();
-
-	ThrowOnArrowError(fn_builder.Append(function_name));
-	ThrowOnArrowError(args_builder.Append(arguments_bytes.data(), arguments_bytes.size()));
-	ThrowOnArrowError(schema_builder.Append(schema_bytes.data(), schema_bytes.size()));
-	if (settings_bytes.empty()) {
-		ThrowOnArrowError(settings_builder.AppendNull());
-	} else {
-		ThrowOnArrowError(settings_builder.Append(settings_bytes.data(), settings_bytes.size()));
-	}
-	if (secrets_ipc_bytes.empty()) {
-		ThrowOnArrowError(secrets_builder.AppendNull());
-	} else {
-		ThrowOnArrowError(secrets_builder.Append(secrets_ipc_bytes.data(), secrets_ipc_bytes.size()));
-	}
-	if (attach_id.empty()) {
-		ThrowOnArrowError(aid_builder.AppendNull());
-	} else {
-		ThrowOnArrowError(aid_builder.Append(attach_id.data(), attach_id.size()));
-	}
-
-	std::shared_ptr<arrow::Array> fn_arr, args_arr, schema_arr, settings_arr, secrets_arr, aid_arr;
-	ThrowOnArrowError(fn_builder.Finish(&fn_arr));
-	ThrowOnArrowError(args_builder.Finish(&args_arr));
-	ThrowOnArrowError(schema_builder.Finish(&schema_arr));
-	ThrowOnArrowError(settings_builder.Finish(&settings_arr));
-	ThrowOnArrowError(secrets_builder.Finish(&secrets_arr));
-	ThrowOnArrowError(aid_builder.Finish(&aid_arr));
-
-	return vgi::WrapAsRpcParams(arrow::RecordBatch::Make(schema, 1, {fn_arr, args_arr, schema_arr, settings_arr, secrets_arr, aid_arr}));
+	return vgi::WrapAsRpcParams(arrow::RecordBatch::Make(schema, 1, {
+	    vgi::MakeSingleStringArray(function_name),
+	    vgi::MakeSingleBinaryArray(arguments_bytes),
+	    vgi::MakeSingleBinaryArray(schema_bytes),
+	    vgi::MakeSingleBinaryArrayOrNull(settings_bytes),
+	    vgi::MakeSingleBinaryArrayOrNull(secrets_ipc_bytes),
+	    vgi::MakeSingleBinaryArrayOrNull(attach_id),
+	}));
 }
 
 std::shared_ptr<arrow::RecordBatch> BuildAggregateUpdateRequest(
@@ -146,27 +104,12 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateUpdateRequest(
 	    arrow::field("attach_id", arrow::binary(), true),
 	});
 
-	auto fn_builder = arrow::StringBuilder();
-	auto eid_builder = arrow::BinaryBuilder();
-	auto batch_builder = arrow::BinaryBuilder();
-	auto aid_builder = arrow::BinaryBuilder();
-
-	ThrowOnArrowError(fn_builder.Append(function_name));
-	ThrowOnArrowError(eid_builder.Append(execution_id.data(), execution_id.size()));
-	ThrowOnArrowError(batch_builder.Append(batch_bytes.data(), batch_bytes.size()));
-	if (attach_id.empty()) {
-		ThrowOnArrowError(aid_builder.AppendNull());
-	} else {
-		ThrowOnArrowError(aid_builder.Append(attach_id.data(), attach_id.size()));
-	}
-
-	std::shared_ptr<arrow::Array> fn_arr, eid_arr, batch_arr, aid_arr;
-	ThrowOnArrowError(fn_builder.Finish(&fn_arr));
-	ThrowOnArrowError(eid_builder.Finish(&eid_arr));
-	ThrowOnArrowError(batch_builder.Finish(&batch_arr));
-	ThrowOnArrowError(aid_builder.Finish(&aid_arr));
-
-	return vgi::WrapAsRpcParams(arrow::RecordBatch::Make(schema, 1, {fn_arr, eid_arr, batch_arr, aid_arr}));
+	return vgi::WrapAsRpcParams(arrow::RecordBatch::Make(schema, 1, {
+	    vgi::MakeSingleStringArray(function_name),
+	    vgi::MakeSingleBinaryArray(execution_id),
+	    vgi::MakeSingleBinaryArray(batch_bytes),
+	    vgi::MakeSingleBinaryArrayOrNull(attach_id),
+	}));
 }
 
 std::shared_ptr<arrow::RecordBatch> BuildAggregateCombineRequest(
@@ -183,27 +126,12 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateCombineRequest(
 	    arrow::field("attach_id", arrow::binary(), true),
 	});
 
-	auto fn_builder = arrow::StringBuilder();
-	auto eid_builder = arrow::BinaryBuilder();
-	auto batch_builder = arrow::BinaryBuilder();
-	auto aid_builder = arrow::BinaryBuilder();
-
-	ThrowOnArrowError(fn_builder.Append(function_name));
-	ThrowOnArrowError(eid_builder.Append(execution_id.data(), execution_id.size()));
-	ThrowOnArrowError(batch_builder.Append(batch_bytes.data(), batch_bytes.size()));
-	if (attach_id.empty()) {
-		ThrowOnArrowError(aid_builder.AppendNull());
-	} else {
-		ThrowOnArrowError(aid_builder.Append(attach_id.data(), attach_id.size()));
-	}
-
-	std::shared_ptr<arrow::Array> fn_arr, eid_arr, batch_arr, aid_arr;
-	ThrowOnArrowError(fn_builder.Finish(&fn_arr));
-	ThrowOnArrowError(eid_builder.Finish(&eid_arr));
-	ThrowOnArrowError(batch_builder.Finish(&batch_arr));
-	ThrowOnArrowError(aid_builder.Finish(&aid_arr));
-
-	return vgi::WrapAsRpcParams(arrow::RecordBatch::Make(schema, 1, {fn_arr, eid_arr, batch_arr, aid_arr}));
+	return vgi::WrapAsRpcParams(arrow::RecordBatch::Make(schema, 1, {
+	    vgi::MakeSingleStringArray(function_name),
+	    vgi::MakeSingleBinaryArray(execution_id),
+	    vgi::MakeSingleBinaryArray(batch_bytes),
+	    vgi::MakeSingleBinaryArrayOrNull(attach_id),
+	}));
 }
 
 std::shared_ptr<arrow::RecordBatch> BuildAggregateFinalizeRequest(
@@ -226,30 +154,13 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateFinalizeRequest(
 	    arrow::field("attach_id", arrow::binary(), true),
 	});
 
-	auto fn_builder = arrow::StringBuilder();
-	auto eid_builder = arrow::BinaryBuilder();
-	auto gid_builder = arrow::BinaryBuilder();
-	auto os_builder = arrow::BinaryBuilder();
-	auto aid_builder = arrow::BinaryBuilder();
-
-	ThrowOnArrowError(fn_builder.Append(function_name));
-	ThrowOnArrowError(eid_builder.Append(execution_id.data(), execution_id.size()));
-	ThrowOnArrowError(gid_builder.Append(gid_bytes.data(), gid_bytes.size()));
-	ThrowOnArrowError(os_builder.Append(schema_bytes.data(), schema_bytes.size()));
-	if (attach_id.empty()) {
-		ThrowOnArrowError(aid_builder.AppendNull());
-	} else {
-		ThrowOnArrowError(aid_builder.Append(attach_id.data(), attach_id.size()));
-	}
-
-	std::shared_ptr<arrow::Array> fn_arr, eid_arr, gid_arr, os_arr, aid_arr;
-	ThrowOnArrowError(fn_builder.Finish(&fn_arr));
-	ThrowOnArrowError(eid_builder.Finish(&eid_arr));
-	ThrowOnArrowError(gid_builder.Finish(&gid_arr));
-	ThrowOnArrowError(os_builder.Finish(&os_arr));
-	ThrowOnArrowError(aid_builder.Finish(&aid_arr));
-
-	return vgi::WrapAsRpcParams(arrow::RecordBatch::Make(schema, 1, {fn_arr, eid_arr, gid_arr, os_arr, aid_arr}));
+	return vgi::WrapAsRpcParams(arrow::RecordBatch::Make(schema, 1, {
+	    vgi::MakeSingleStringArray(function_name),
+	    vgi::MakeSingleBinaryArray(execution_id),
+	    vgi::MakeSingleBinaryArray(gid_bytes),
+	    vgi::MakeSingleBinaryArray(schema_bytes),
+	    vgi::MakeSingleBinaryArrayOrNull(attach_id),
+	}));
 }
 
 std::shared_ptr<arrow::RecordBatch> BuildAggregateDestructorRequest(
@@ -266,27 +177,12 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateDestructorRequest(
 	    arrow::field("attach_id", arrow::binary(), true),
 	});
 
-	auto fn_builder = arrow::StringBuilder();
-	auto eid_builder = arrow::BinaryBuilder();
-	auto gid_builder = arrow::BinaryBuilder();
-	auto aid_builder = arrow::BinaryBuilder();
-
-	ThrowOnArrowError(fn_builder.Append(function_name));
-	ThrowOnArrowError(eid_builder.Append(execution_id.data(), execution_id.size()));
-	ThrowOnArrowError(gid_builder.Append(gid_bytes.data(), gid_bytes.size()));
-	if (attach_id.empty()) {
-		ThrowOnArrowError(aid_builder.AppendNull());
-	} else {
-		ThrowOnArrowError(aid_builder.Append(attach_id.data(), attach_id.size()));
-	}
-
-	std::shared_ptr<arrow::Array> fn_arr, eid_arr, gid_arr, aid_arr;
-	ThrowOnArrowError(fn_builder.Finish(&fn_arr));
-	ThrowOnArrowError(eid_builder.Finish(&eid_arr));
-	ThrowOnArrowError(gid_builder.Finish(&gid_arr));
-	ThrowOnArrowError(aid_builder.Finish(&aid_arr));
-
-	return vgi::WrapAsRpcParams(arrow::RecordBatch::Make(schema, 1, {fn_arr, eid_arr, gid_arr, aid_arr}));
+	return vgi::WrapAsRpcParams(arrow::RecordBatch::Make(schema, 1, {
+	    vgi::MakeSingleStringArray(function_name),
+	    vgi::MakeSingleBinaryArray(execution_id),
+	    vgi::MakeSingleBinaryArray(gid_bytes),
+	    vgi::MakeSingleBinaryArrayOrNull(attach_id),
+	}));
 }
 
 } // anonymous namespace
@@ -302,11 +198,7 @@ namespace vgi {
 std::shared_ptr<arrow::RecordBatch> WrapAsRpcParams(const std::shared_ptr<arrow::RecordBatch> &request_batch) {
 	auto request_bytes = SerializeToIpcBytes(request_batch);
 	auto schema = arrow::schema({arrow::field("request", arrow::binary(), false)});
-	arrow::BinaryBuilder builder;
-	ThrowOnArrowError(builder.Append(request_bytes.data(), request_bytes.size()));
-	std::shared_ptr<arrow::Array> arr;
-	ThrowOnArrowError(builder.Finish(&arr));
-	return arrow::RecordBatch::Make(schema, 1, {arr});
+	return arrow::RecordBatch::Make(schema, 1, {MakeSingleBinaryArray(request_bytes)});
 }
 
 AggregateRpcResult InvokeAggregateRpc(ClientContext &context, const VgiAggregateBindData &bind_data,

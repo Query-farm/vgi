@@ -58,6 +58,24 @@ class IFunctionConnection;
 //! execution_id (once init has run), transaction_id. Call sites append event-specific fields on top.
 vector<pair<string, string>> BuildConnLogFields(const vgi::IFunctionConnection &conn);
 
+//! Optional string — empty string ⇒ field omitted. Fields are emitted in construction order.
+struct PoolReleaseLogFields {
+	string conn_id;        // omit if empty
+	string worker_path;
+	pid_t worker_pid = -1; // omit if <=0
+	string phase;          // omit if empty
+	string function_name;  // omit if empty
+	string method_name;    // omit if empty
+	string event_name = "worker_pool.release";
+};
+
+//! Emit the standard worker_pool release log line. Replaces the ~12-line
+//! field-building block previously duplicated across scalar/table/table-in-out/unary_rpc.
+//! Pass the fields off of VgiWorkerPool::ReleaseResult directly — the helper exists in
+//! a header that does not (and should not) include the full worker pool definitions.
+void LogWorkerPoolRelease(ClientContext &context, const PoolReleaseLogFields &fields, bool pooled,
+                          const string &skip_reason, size_t pool_size, size_t total_pool_size);
+
 //! VGI_LOG - logs to DuckDB and optionally to stderr if VGI_STDERR_LOG=1
 //! Usage: VGI_LOG(context, "event_name", {{"key1", "val1"}, {"key2", "val2"}});
 //! Implemented as inline function to handle initializer list arguments properly.

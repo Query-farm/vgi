@@ -23,6 +23,34 @@ constexpr LogLevel VgiLogType::LEVEL;
 VgiLogType::VgiLogType() : LogType(NAME, LEVEL, GetLogType()) {
 }
 
+void LogWorkerPoolRelease(ClientContext &context, const PoolReleaseLogFields &f, bool pooled,
+                          const string &skip_reason, size_t pool_size, size_t total_pool_size) {
+	vector<pair<string, string>> fields;
+	if (!f.conn_id.empty()) {
+		fields.emplace_back("conn", f.conn_id);
+	}
+	fields.emplace_back("worker_path", f.worker_path);
+	if (f.worker_pid > 0) {
+		fields.emplace_back("worker_pid", std::to_string(f.worker_pid));
+	}
+	if (!f.function_name.empty()) {
+		fields.emplace_back("function_name", f.function_name);
+	}
+	if (!f.method_name.empty()) {
+		fields.emplace_back("method_name", f.method_name);
+	}
+	if (!f.phase.empty()) {
+		fields.emplace_back("phase", f.phase);
+	}
+	fields.emplace_back("pooled", pooled ? "true" : "false");
+	if (!skip_reason.empty()) {
+		fields.emplace_back("skip_reason", skip_reason);
+	}
+	fields.emplace_back("pool_size", std::to_string(pool_size));
+	fields.emplace_back("total", std::to_string(total_pool_size));
+	VGI_LOG(context, f.event_name, fields);
+}
+
 // Cached check for VGI_STDERR_LOG environment variable
 bool VgiStderrLogEnabled() {
 	// Use a static atomic to cache the result after first check

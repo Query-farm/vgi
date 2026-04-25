@@ -97,18 +97,13 @@ UnaryResponseResult AttemptUnaryRpc(const UnaryRpcOptions &opts, const std::stri
 			auto released_pid = to_pool->GetPid();
 			auto rr = VgiWorkerPool::Instance().Release(std::move(to_pool));
 			if (opts.enable_logging) {
-				vector<pair<string, string>> fields;
-				fields.emplace_back("worker_path", opts.worker_path);
-				fields.emplace_back("worker_pid", std::to_string(released_pid));
-				fields.emplace_back("method_name", method_name);
-				fields.emplace_back("phase", opts.phase);
-				fields.emplace_back("pooled", rr.pooled ? "true" : "false");
-				if (!rr.skip_reason.empty()) {
-					fields.emplace_back("skip_reason", rr.skip_reason);
-				}
-				fields.emplace_back("pool_size", std::to_string(rr.pool_size));
-				fields.emplace_back("total", std::to_string(rr.total_pool_size));
-				VGI_LOG(opts.context, "worker_pool.release", fields);
+				PoolReleaseLogFields lf;
+				lf.worker_path = opts.worker_path;
+				lf.worker_pid = released_pid;
+				lf.method_name = method_name;
+				lf.phase = opts.phase;
+				LogWorkerPoolRelease(opts.context, lf, rr.pooled, rr.skip_reason, rr.pool_size,
+				                     rr.total_pool_size);
 			}
 		}
 	}

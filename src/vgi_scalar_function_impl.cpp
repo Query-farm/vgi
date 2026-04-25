@@ -21,22 +21,7 @@
 
 namespace duckdb {
 
-namespace {
-
-// Extract settings from client context given a list of setting names
-std::map<std::string, Value> ExtractVgiSettings(ClientContext &context,
-                                                const std::vector<std::string> &setting_names) {
-	std::map<std::string, Value> settings;
-	for (const auto &name : setting_names) {
-		Value value;
-		if (context.TryGetCurrentSetting(name, value)) {
-			settings[name] = value;
-		}
-	}
-	return settings;
-}
-
-} // anonymous namespace
+using vgi::ExtractVgiSettings;
 
 // ============================================================================
 // Local State Constructor/Destructor
@@ -255,18 +240,12 @@ unique_ptr<FunctionData> VgiScalarFunctionBind(ClientContext &context, ScalarFun
 			auto bind_conn_id = connection->GetConnIdHex();
 			if (auto pooled = connection->ReleaseForPooling()) {
 				auto rr = VgiWorkerPool::Instance().Release(std::move(pooled));
-				vector<pair<string, string>> fields;
-				fields.emplace_back("conn", bind_conn_id);
-				fields.emplace_back("worker_path", func_info.worker_path());
-				fields.emplace_back("worker_pid", std::to_string(bind_worker_pid));
-				fields.emplace_back("phase", "bind");
-				fields.emplace_back("pooled", rr.pooled ? "true" : "false");
-				if (!rr.skip_reason.empty()) {
-					fields.emplace_back("skip_reason", rr.skip_reason);
-				}
-				fields.emplace_back("pool_size", std::to_string(rr.pool_size));
-				fields.emplace_back("total", std::to_string(rr.total_pool_size));
-				VGI_LOG(context, "worker_pool.release", fields);
+				PoolReleaseLogFields lf;
+				lf.conn_id = bind_conn_id;
+				lf.worker_path = func_info.worker_path();
+				lf.worker_pid = bind_worker_pid;
+				lf.phase = "bind";
+				LogWorkerPoolRelease(context, lf, rr.pooled, rr.skip_reason, rr.pool_size, rr.total_pool_size);
 			}
 			connection.reset();
 		}

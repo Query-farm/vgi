@@ -16,6 +16,46 @@ namespace duckdb {
 namespace vgi {
 
 // ============================================================================
+// Settings Extraction
+// ============================================================================
+
+std::map<std::string, Value> ExtractVgiSettings(ClientContext &context,
+                                                const std::vector<std::string> &setting_names) {
+	std::map<std::string, Value> settings;
+	for (const auto &name : setting_names) {
+		Value value;
+		if (context.TryGetCurrentSetting(name, value)) {
+			settings[name] = value;
+		}
+	}
+	return settings;
+}
+
+std::shared_ptr<arrow::Array> MakeSingleStringArray(const std::string &value) {
+	arrow::StringBuilder builder;
+	ThrowOnArrowError(builder.Append(value));
+	std::shared_ptr<arrow::Array> arr;
+	ThrowOnArrowError(builder.Finish(&arr));
+	return arr;
+}
+
+std::shared_ptr<arrow::Array> MakeSingleBinaryArray(const std::vector<uint8_t> &bytes) {
+	arrow::BinaryBuilder builder;
+	ThrowOnArrowError(builder.Append(bytes.data(), static_cast<int32_t>(bytes.size())));
+	std::shared_ptr<arrow::Array> arr;
+	ThrowOnArrowError(builder.Finish(&arr));
+	return arr;
+}
+
+std::shared_ptr<arrow::Array> MakeSingleBinaryArrayOrNull(const std::vector<uint8_t> &bytes) {
+	arrow::BinaryBuilder builder;
+	AppendBytesOrNull(builder, bytes);
+	std::shared_ptr<arrow::Array> arr;
+	ThrowOnArrowError(builder.Finish(&arr));
+	return arr;
+}
+
+// ============================================================================
 // Schema Conversions
 // ============================================================================
 

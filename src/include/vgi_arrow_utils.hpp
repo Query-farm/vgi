@@ -2,9 +2,15 @@
 
 #include <map>
 #include <optional>
+#include <string>
 #include <vector>
 
 #include <arrow/api.h>
+#include <arrow/builder.h>
+#include <arrow/status.h>
+
+#include "duckdb/common/exception.hpp"
+#include "duckdb/common/types/value.hpp"
 
 #include "duckdb/common/arrow/arrow_wrapper.hpp"
 #include "duckdb/function/table/arrow/arrow_duck_schema.hpp"
@@ -13,6 +19,46 @@
 
 namespace duckdb {
 namespace vgi {
+
+// ============================================================================
+// Arrow Status / Builder Helpers
+// ============================================================================
+
+// Throw an IOException if an Arrow Status is not OK.
+// Use at RPC/IPC boundaries where an arrow::Status must not silently fail.
+inline void ThrowOnArrowError(const arrow::Status &status) {
+	if (!status.ok()) {
+		throw IOException("Arrow error in VGI: %s", status.ToString());
+	}
+}
+
+// Append a byte vector to a BinaryBuilder, or AppendNull if empty.
+// Throws IOException on builder failure.
+inline void AppendBytesOrNull(arrow::BinaryBuilder &builder, const std::vector<uint8_t> &bytes) {
+	if (bytes.empty()) {
+		ThrowOnArrowError(builder.AppendNull());
+	} else {
+		ThrowOnArrowError(builder.Append(bytes.data(), static_cast<int32_t>(bytes.size())));
+	}
+}
+
+// Build a single-row arrow::StringArray holding the given value.
+// Throws IOException on builder failure.
+std::shared_ptr<arrow::Array> MakeSingleStringArray(const std::string &value);
+
+// Build a single-row arrow::BinaryArray holding the given bytes (always non-null).
+std::shared_ptr<arrow::Array> MakeSingleBinaryArray(const std::vector<uint8_t> &bytes);
+
+// Build a single-row arrow::BinaryArray; null if bytes is empty.
+std::shared_ptr<arrow::Array> MakeSingleBinaryArrayOrNull(const std::vector<uint8_t> &bytes);
+
+// ============================================================================
+// Settings Extraction
+// ============================================================================
+
+// Fetch the named settings from the client context, skipping any that are unset.
+std::map<std::string, Value> ExtractVgiSettings(ClientContext &context,
+                                                const std::vector<std::string> &setting_names);
 
 // ============================================================================
 // Schema Conversions (Arrow C++ -> Arrow C ABI)
