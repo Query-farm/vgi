@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -80,12 +81,21 @@ UnaryResponseResult MaybeResolveExternalLocation(ClientContext &context,
                                                    UnaryResponseResult &result,
                                                    const std::string &worker_path = "");
 
-// Server capabilities discovered via OPTIONS /__capabilities__
+// Server capabilities discovered via HEAD /health.
+// Capability headers (VGI-Max-Request-Bytes, VGI-Upload-URL-Support,
+// VGI-Max-Upload-Bytes) are emitted by the server middleware on every
+// response; /health is the canonical discovery target since it is
+// mandatory and exempt from auth.
 struct ServerCapabilities {
 	bool discovered = false;
 	int64_t max_request_bytes = -1;   // -1 = no limit advertised
 	bool upload_url_support = false;
 	int64_t max_upload_bytes = -1;    // -1 = no limit advertised
+	// Steady-clock time after which this snapshot should be re-probed.
+	// Populated from the response's Cache-Control: max-age=N header.
+	// epoch (default-constructed) means "no expiry hint" -> valid for
+	// the lifetime of the connection.
+	std::chrono::steady_clock::time_point cache_expires_at{};
 };
 
 // Upload URL returned by __upload_url__/init
@@ -94,7 +104,10 @@ struct UploadUrl {
 	std::string download_url;
 };
 
-// Discover server capabilities via OPTIONS request.
+// Discover server capabilities via HEAD {base_url}/health.
+// Capability headers are returned on every response; /health is the
+// canonical mandatory, auth-exempt target. Honours Cache-Control:
+// max-age=N to schedule a future re-probe via cache_expires_at.
 ServerCapabilities HttpDiscoverCapabilities(ClientContext &context, const std::string &base_url);
 
 // Request upload URLs from the server. Posts to {base_url}/__upload_url__/init.

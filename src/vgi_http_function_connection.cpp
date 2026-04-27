@@ -540,8 +540,13 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 	// Serialize the input batch with stream_state token
 	auto body = SerializeBatchWithState(input_batch, input_schema_);
 
-	// Check if batch exceeds max_request_bytes and upload URL support is available
-	if (!capabilities_.discovered) {
+	// Check if batch exceeds max_request_bytes and upload URL support is available.
+	// Re-probe when we have never discovered yet, or when the cached snapshot's
+	// Cache-Control max-age has elapsed (cache_expires_at == time_point{} means
+	// "no expiry advertised" — treat as valid for the connection's lifetime).
+	if (!capabilities_.discovered ||
+	    (capabilities_.cache_expires_at != std::chrono::steady_clock::time_point{} &&
+	     std::chrono::steady_clock::now() >= capabilities_.cache_expires_at)) {
 		capabilities_ = HttpDiscoverCapabilities(context_, base_url_);
 	}
 	if (capabilities_.max_request_bytes > 0 &&

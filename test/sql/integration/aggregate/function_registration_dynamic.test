@@ -1,0 +1,28 @@
+# name: test/sql/integration/aggregate/function_registration_dynamic.test
+# description: Registration metadata for dynamic-code aggregate functions (Python/JS workers only)
+# group: [vgi_integration_aggregate]
+
+require-env VGI_TEST_WORKER
+
+# Gated on worker support for dynamic language interpretation (Python / JavaScript).
+require-env VGI_WORKER_SUPPORTS_DYNAMIC_CODE
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+query TT
+SELECT function_name, return_type
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_type = 'aggregate'
+  AND function_name IN ('vgi_dynamic_agg', 'vgi_dynamic_ml_agg')
+ORDER BY function_name;
+----
+vgi_dynamic_agg	DOUBLE
+vgi_dynamic_ml_agg	DOUBLE
+
+statement ok
+DETACH example;

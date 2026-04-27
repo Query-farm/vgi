@@ -1,0 +1,83 @@
+# name: test/sql/integration/aggregate/window_dynamic.test
+# description: VGI windowed aggregate callbacks using dynamic (Python/JS) worker code
+# group: [vgi_integration_aggregate]
+
+require-env VGI_TEST_WORKER
+
+# Gated on worker support for dynamic language interpretation (Python / JavaScript).
+require-env VGI_WORKER_SUPPORTS_DYNAMIC_CODE
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+USE example;
+
+# ============================================================================
+# Dynamic aggregate with window support (vgi_dynamic_agg + supports_window)
+# Falls back to Aggregate.finalize(table) when the user's class does NOT
+# define a window() method.
+# ============================================================================
+
+query R
+SELECT vgi_dynamic_agg(
+  'class Aggregate:
+    @staticmethod
+    def finalize(table):
+        return pa.compute.sum(table.column("c0")).as_py()',
+  i::DOUBLE
+) OVER (ORDER BY i ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)
+FROM range(1, 6) t(i)
+ORDER BY i LIMIT 1;
+----
+1.0
+
+# ============================================================================
+# Dynamic aggregate with a user-defined window() method — exercised per frame.
+# ============================================================================
+
+query RRRR
+SELECT
+  MIN(w), MAX(w), SUM(w), COUNT(*)
+FROM (
+  SELECT vgi_dynamic_agg(
+    'class Aggregate:
+      @staticmethod
+      def finalize(table):
+          return pa.compute.sum(table.column("c0")).as_py()
+      @staticmethod
+      def window(table):
+          vals = table.column("c0").to_pylist()
+          return max(vals) - min(vals) if vals else None',
+    i::DOUBLE
+  ) OVER (ORDER BY i ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING) AS w
+  FROM range(1, 11) t(i)
+);
+----
+2.0	4.0	34.0	10
+
+# ============================================================================
+# Dynamic ML aggregate (params dict) with window support — falls back to
+# Aggregate.finalize(table, params) in the window path.
+# ============================================================================
+
+query R
+SELECT vgi_dynamic_ml_agg(
+  'class Aggregate:
+    @staticmethod
+    def finalize(table, params):
+        n = table.num_rows
+        scale = float(params.get("scale", 1.0))
+        return scale * pa.compute.sum(table.column("c0")).as_py() if n > 0 else None',
+  MAP {'scale': 2.0},
+  i::DOUBLE
+) OVER (ORDER BY i ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+FROM range(1, 6) t(i)
+ORDER BY i
+LIMIT 1;
+----
+2.0

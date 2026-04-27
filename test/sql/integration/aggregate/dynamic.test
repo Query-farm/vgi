@@ -4,6 +4,9 @@
 
 require-env VGI_TEST_WORKER
 
+# Gated on worker support for dynamic language interpretation (Python / JavaScript).
+require-env VGI_WORKER_SUPPORTS_DYNAMIC_CODE
+
 require vgi
 
 require httpfs

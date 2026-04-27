@@ -1,5 +1,8 @@
 #include "vgi_http_client.hpp"
 
+#include <cctype>
+#include <cstring>
+
 #include "duckdb.hpp"
 #include "duckdb/common/http_util.hpp"
 #include "duckdb/common/enums/http_status_code.hpp"
@@ -552,6 +555,56 @@ UnaryResponseResult MaybeResolveExternalLocation(ClientContext &context,
 // Capability Discovery and Upload URLs
 // ============================================================================
 
+// Parse "Cache-Control: max-age=N" (seconds) from a response, if present.
+// Returns 0 seconds when no max-age directive is found or it does not parse.
+static std::chrono::seconds ParseCacheControlMaxAge(const HTTPResponse &response) {
+	const char *header_names[] = {"Cache-Control", "cache-control"};
+	for (const char *name : header_names) {
+		if (!response.HasHeader(name)) {
+			continue;
+		}
+		auto value = response.GetHeaderValue(name);
+		// Tokenise on commas, look for "max-age=N" (case-insensitive, trimmed).
+		size_t pos = 0;
+		while (pos < value.size()) {
+			size_t comma = value.find(',', pos);
+			std::string token = value.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+			// trim
+			size_t a = token.find_first_not_of(" \t");
+			size_t b = token.find_last_not_of(" \t");
+			if (a != std::string::npos) {
+				token = token.substr(a, b - a + 1);
+			} else {
+				token.clear();
+			}
+			// lowercase prefix check
+			std::string lower;
+			lower.reserve(token.size());
+			for (char c : token) {
+				lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+			}
+			constexpr const char *kMaxAge = "max-age=";
+			if (lower.rfind(kMaxAge, 0) == 0) {
+				try {
+					int64_t secs = std::stoll(lower.substr(std::strlen(kMaxAge)));
+					if (secs < 0) {
+						secs = 0;
+					}
+					return std::chrono::seconds(secs);
+				} catch (...) {
+					return std::chrono::seconds(0);
+				}
+			}
+			if (comma == std::string::npos) {
+				break;
+			}
+			pos = comma + 1;
+		}
+		break;
+	}
+	return std::chrono::seconds(0);
+}
+
 // Parse capability headers from an HTTP response (set by middleware on every response).
 static ServerCapabilities ParseCapabilityHeaders(const HTTPResponse &response) {
 	ServerCapabilities caps;
@@ -571,13 +624,19 @@ static ServerCapabilities ParseCapabilityHeaders(const HTTPResponse &response) {
 		} catch (...) {}
 	}
 
+	auto max_age = ParseCacheControlMaxAge(response);
+	if (max_age.count() > 0) {
+		caps.cache_expires_at = std::chrono::steady_clock::now() + max_age;
+	}
+
 	return caps;
 }
 
 ServerCapabilities HttpDiscoverCapabilities(ClientContext &context, const std::string &base_url) {
-	// Capability headers are set by middleware on ALL responses (including errors).
-	// Use a HEAD request to discover them cheaply. Append "/" to ensure a valid path.
-	auto url = NormalizeBaseUrl(base_url) + "/";
+	// Capability headers are emitted by middleware on every response. Probe
+	// {base_url}/health: it is mandatory in every implementation and exempt
+	// from auth, matching the Python reference client.
+	auto url = NormalizeBaseUrl(base_url) + "/health";
 
 	auto &db = *context.db;
 	auto &http_util = HTTPUtil::Get(db);
