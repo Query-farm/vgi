@@ -28,6 +28,15 @@ struct OAuthResourceMetadata {
 	std::string resource;
 	std::string resource_name;
 	bool use_id_token_as_bearer = false; // If true, send id_token as Bearer instead of access_token
+	// Non-standard RFC 9728 extension: when set, this URL points at the VGI
+	// server's PKCE token-exchange proxy. The proxy injects the configured
+	// server-side client_secret before forwarding to the IdP, which is
+	// required for IdPs (notably Google) that reject token-endpoint
+	// requests from "Web application" clients without a secret. When
+	// present, prefer this over the IdP's discovered token_endpoint so the
+	// extension can complete token exchanges without holding the secret
+	// locally — this is what makes secret-less PKCE work in the WASM build.
+	std::string token_endpoint;
 };
 
 struct OAuthServerMetadata {

@@ -495,6 +495,16 @@ OAuthResourceMetadata FetchResourceMetadata(ClientContext &context, const std::s
 		meta.use_id_token_as_bearer = yyjson_get_bool(use_id);
 	}
 
+	// token_endpoint (string, optional — non-standard RFC 9728 extension)
+	// When set, this is the VGI server's PKCE token-exchange proxy URL.
+	// Use it instead of the IdP's discovered token_endpoint so the extension
+	// doesn't have to hold the IdP's client_secret. See the comment on
+	// OAuthResourceMetadata::token_endpoint for the security rationale.
+	auto token_ep = yyjson_obj_get(root, "token_endpoint");
+	if (token_ep && yyjson_is_str(token_ep)) {
+		meta.token_endpoint = yyjson_get_str(token_ep);
+	}
+
 	if (meta.authorization_servers.empty()) {
 		throw IOException("VGI OAuth: resource metadata at %s has no authorization_servers", url);
 	}
@@ -556,6 +566,22 @@ OAuthServerMetadata FetchAuthServerMetadata(ClientContext &context, const std::s
 	}
 
 	return meta;
+}
+
+// Resolve the token endpoint to use for token-exchange / refresh requests.
+//
+// When the VGI server's resource metadata advertises its own token_endpoint
+// (a non-standard RFC 9728 extension), prefer it over the IdP's discovered
+// endpoint. The advertised URL points at the server's PKCE token-exchange
+// proxy, which injects the configured server-side client_secret before
+// forwarding to the IdP. This lets the WASM build complete token exchanges
+// without holding the IdP's client_secret locally — which matters for IdPs
+// (notably Google) that reject token-endpoint requests from "Web
+// application" clients without a secret.
+static std::string ResolveTokenEndpoint(const OAuthResourceMetadata &resource_meta,
+                                         const OAuthServerMetadata &server_meta) {
+	return resource_meta.token_endpoint.empty() ? server_meta.token_endpoint
+	                                              : resource_meta.token_endpoint;
 }
 
 //===--------------------------------------------------------------------===//
@@ -1061,9 +1087,11 @@ OAuthTokenSet PerformAuthFlow(const OAuthChallenge &challenge,
 	auto server_meta = FetchAuthServerMetadata(context, resource_meta.authorization_servers[0]);
 
 	// Populate refresh context for future token refresh
-	refresh_ctx_out.token_endpoint = server_meta.token_endpoint;
+	refresh_ctx_out.token_endpoint = ResolveTokenEndpoint(resource_meta, server_meta);
 	refresh_ctx_out.client_id = client_id;
-	refresh_ctx_out.client_secret = resource_meta.client_secret;
+	// When the proxy is in use the server injects client_secret upstream, so
+	// we don't need to store one locally. Only carry it when no proxy is set.
+	refresh_ctx_out.client_secret = resource_meta.token_endpoint.empty() ? resource_meta.client_secret : std::string();
 	refresh_ctx_out.use_id_token = resource_meta.use_id_token_as_bearer;
 	refresh_ctx_out.resource_metadata_url = challenge.resource_metadata_url;
 	refresh_ctx_out.scope = BuildScopeString(resource_meta);
@@ -1325,7 +1353,11 @@ static OAuthTokenSet PerformPKCEFlowImpl(const OAuthChallenge &challenge,
 	if (client_id.empty()) {
 		throw IOException("VGI OAuth: no client_id found in WWW-Authenticate header or resource metadata");
 	}
-	std::string client_secret = resource_meta.client_secret;
+	// When the resource advertises its own token_endpoint (the server's PKCE
+	// proxy), the proxy injects the configured client_secret upstream — we
+	// must not also pass our local copy, since echoing it back over CORS
+	// would defeat the purpose. Only carry the secret when no proxy is set.
+	std::string client_secret = resource_meta.token_endpoint.empty() ? resource_meta.client_secret : std::string();
 
 	// Generate PKCE parameters (uses duckdb_wasm_crypto_random + duckdb_wasm_sha256)
 	auto code_verifier = GenerateCodeVerifier();
@@ -1378,8 +1410,10 @@ static OAuthTokenSet PerformPKCEFlowImpl(const OAuthChallenge &challenge,
 
 	VGI_STDERR_DEBUG("[VGI] oauth.pkce_wasm code_received\n");
 
-	// Exchange code for tokens (uses duckdb-wasm's HTTP layer)
-	auto tokens = ExchangeCodeForTokens(context, server_meta.token_endpoint,
+	// Exchange code for tokens (uses duckdb-wasm's HTTP layer).
+	// Use the server's token-proxy URL when advertised so the WASM build
+	// doesn't need to hold the IdP's client_secret to satisfy Google.
+	auto tokens = ExchangeCodeForTokens(context, ResolveTokenEndpoint(resource_meta, server_meta),
 	                                     code, redirect_uri, code_verifier, client_id, client_secret);
 	tokens.use_id_token = resource_meta.use_id_token_as_bearer;
 
@@ -1406,7 +1440,9 @@ static OAuthTokenSet PerformPKCEFlowImpl(const OAuthChallenge &challenge,
 	if (client_id.empty()) {
 		throw IOException("VGI OAuth: no client_id found in WWW-Authenticate header or resource metadata");
 	}
-	std::string client_secret = resource_meta.client_secret;
+	// When the proxy is in use, don't echo our local client_secret upstream —
+	// the proxy injects the configured one server-side.
+	std::string client_secret = resource_meta.token_endpoint.empty() ? resource_meta.client_secret : std::string();
 
 	// Step 3: Generate PKCE parameters
 	auto code_verifier = GenerateCodeVerifier();
@@ -1541,8 +1577,8 @@ static OAuthTokenSet PerformPKCEFlowImpl(const OAuthChallenge &challenge,
 
 		VGI_STDERR_DEBUG("[VGI] oauth.code_received\n");
 
-		// Step 7: Exchange code for tokens
-		tokens = ExchangeCodeForTokens(context, server_meta.token_endpoint,
+		// Step 7: Exchange code for tokens (via proxy if advertised)
+		tokens = ExchangeCodeForTokens(context, ResolveTokenEndpoint(resource_meta, server_meta),
 		                                code, redirect_uri, code_verifier, client_id, client_secret);
 	} catch (...) {
 		svr.stop();
@@ -1797,9 +1833,11 @@ OAuthRefreshContext DiscoverRefreshContext(const OAuthChallenge &challenge, Clie
 	auto server_meta = FetchAuthServerMetadata(context, resource_meta.authorization_servers[0]);
 
 	OAuthRefreshContext ctx;
-	ctx.token_endpoint = server_meta.token_endpoint;
+	ctx.token_endpoint = ResolveTokenEndpoint(resource_meta, server_meta);
 	ctx.client_id = client_id;
-	ctx.client_secret = resource_meta.client_secret;
+	// See refresh_ctx_out comment in PerformAuthFlow: skip the local secret
+	// when the server's token-proxy is in use.
+	ctx.client_secret = resource_meta.token_endpoint.empty() ? resource_meta.client_secret : std::string();
 	ctx.use_id_token = resource_meta.use_id_token_as_bearer;
 	ctx.resource_metadata_url = challenge.resource_metadata_url;
 	ctx.scope = BuildScopeString(resource_meta);
