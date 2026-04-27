@@ -31,7 +31,7 @@ SELECT database_name, tags
 FROM duckdb_databases()
 WHERE database_name = 'example';
 ----
-example	{source=vgi-example-worker, version=1}
+example	{source=vgi-fixture-worker, version=1}
 
 # ============================================================================
 # Schema comments visible via duckdb_schemas (bonus: schema propagation fix)

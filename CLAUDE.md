@@ -52,7 +52,7 @@ make test_subprocess | grep -A 20 "FAILED"
 ```
 
 The `VGI_TEST_WORKER` env var controls which worker is used. It defaults to
-`uv run --project ~/Development/vgi-python vgi-example-worker` and can be overridden.
+`uv run --project ~/Development/vgi-python vgi-fixture-worker` and can be overridden.
 
 ### HTTP Transport
 
@@ -87,11 +87,11 @@ After a full test run shows failures, re-run only the failed tests instead of th
 
 ```bash
 # Run a single test file (subprocess)
-VGI_TEST_WORKER="uv run --project ~/Development/vgi-python vgi-example-worker" \
+VGI_TEST_WORKER="uv run --project ~/Development/vgi-python vgi-fixture-worker" \
     ./build/release/test/unittest "test/sql/integration/scalar/double.test"
 
 # Run a test directory (subprocess)
-VGI_TEST_WORKER="uv run --project ~/Development/vgi-python vgi-example-worker" \
+VGI_TEST_WORKER="uv run --project ~/Development/vgi-python vgi-fixture-worker" \
     ./build/release/test/unittest "test/sql/integration/scalar/*"
 
 # Run a single test file (HTTP)
