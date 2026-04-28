@@ -39,6 +39,14 @@ struct VgiWriteGlobalState : public GlobalSinkState {
 
 	// Arrow schema for converting DuckDB DataChunks → Arrow batches (input to worker)
 	std::shared_ptr<arrow::Schema> send_schema;
+
+	// True if the write function declared has_finalize=true on its catalog
+	// metadata. When set, ``FinalizeWriteConnection`` invokes
+	// ``PerformFinalizeInit`` so the worker's ``cls.finalize(params)``
+	// runs and gets one statement-final pass to drain async state and
+	// surface partial-failure errors. False: the legacy close-and-drain
+	// path runs (no finalize callback fires on the worker).
+	bool has_finalize = false;
 };
 
 // Local sink state for RETURNING — holds persistent ArrowScanLocalState so that

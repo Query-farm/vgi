@@ -1,6 +1,7 @@
 #include "storage/vgi_physical_write.hpp"
 
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
@@ -11,12 +12,41 @@
 #include "vgi_catalog_api.hpp"
 #include "vgi_function_connection.hpp"
 #include "vgi_rpc_types.hpp"
+#include "vgi_table_function_impl.hpp"
 #include "vgi_transport.hpp"
 #include "vgi_worker_pool.hpp"
 
 namespace duckdb {
 
 using namespace vgi;
+
+// Look up the write function's ``has_finalize`` flag on its
+// ``VgiTableFunctionInfo`` (attached when the catalog loaded the function;
+// see ``vgi_table_function_set.cpp::LoadEntries``). The write function may
+// live in a different schema than the table being written to (e.g., a
+// virtual ``topics.<topic>`` table routes INSERT to ``main.kafka_topic_insert``),
+// so we try the table's schema first, then the catalog's default schema.
+// Returns false if not found or if the function isn't a VGI function —
+// preserving the legacy close-and-drain behavior for workers that don't opt in.
+static bool WriteFunctionHasFinalize(ClientContext &context, Catalog &catalog,
+                                      const string &table_schema, const string &function_name) {
+	auto entry = catalog.GetEntry(context, CatalogType::TABLE_FUNCTION_ENTRY, table_schema, function_name,
+	                              OnEntryNotFound::RETURN_NULL);
+	if (!entry) {
+		entry = catalog.GetEntry(context, CatalogType::TABLE_FUNCTION_ENTRY, catalog.GetDefaultSchema(),
+		                         function_name, OnEntryNotFound::RETURN_NULL);
+	}
+	if (!entry) {
+		return false;
+	}
+	for (auto &overload : entry->Cast<TableFunctionCatalogEntry>().functions.functions) {
+		if (auto info = dynamic_cast<vgi::VgiTableFunctionInfo *>(overload.function_info.get())) {
+			return info->function_info().has_finalize;
+		}
+	}
+	return false;
+}
+
 
 // ============================================================================
 // Helper: Set up a write connection to a VGI worker function
@@ -123,9 +153,23 @@ static idx_t ReadCountFromBatch(const std::shared_ptr<arrow::RecordBatch> &batch
 	return total;
 }
 
-// Helper: Finalize a write connection — read remaining responses, destroy connection
+// Helper: Finalize a write connection — read remaining responses, destroy connection.
+//
+// When ``gstate.has_finalize`` is true (worker declared has_finalize on the
+// write function's metadata), invoke ``PerformFinalizeInit`` instead of a
+// plain ``CloseInputWriter`` — that triggers the worker's
+// ``cls.finalize(params)`` classmethod and lets it stream a final batch (or
+// raise) for end-of-statement reconciliation. The standard ReadDataBatch
+// loop below picks up the finalize-phase output the same way it picks up
+// per-Sink response batches.
 static idx_t FinalizeWriteConnection(VgiWriteGlobalState &gstate) {
-	gstate.connection->CloseInputWriter();
+	if (gstate.has_finalize) {
+		// PerformFinalizeInit closes the input writer internally and re-runs
+		// init on the worker with phase=FINALIZE.
+		gstate.connection->PerformFinalizeInit();
+	} else {
+		gstate.connection->CloseInputWriter();
+	}
 
 	idx_t total = 0;
 	while (true) {
@@ -262,6 +306,9 @@ unique_ptr<GlobalSinkState> VgiPhysicalInsert::GetGlobalSinkState(ClientContext 
 
 	auto gstate = make_uniq<VgiWriteGlobalState>(context, GetTypes(), return_chunk);
 	gstate->send_schema = input_schema;
+	gstate->has_finalize =
+	    WriteFunctionHasFinalize(context, table->GetCatalog(), table->GetTableInfo().schema_name,
+	                             write_func.function_name);
 	gstate->connection = SetupWriteConnection(context, *table, write_func, input_schema, write_options,
 	                                           vgi_tx.GetTransactionId());
 
@@ -391,6 +438,9 @@ unique_ptr<GlobalSinkState> VgiPhysicalDelete::GetGlobalSinkState(ClientContext 
 
 	auto gstate = make_uniq<VgiWriteGlobalState>(context, GetTypes(), return_chunk);
 	gstate->send_schema = input_schema;
+	gstate->has_finalize = WriteFunctionHasFinalize(context, table.GetCatalog(),
+	                                                 table.GetTableInfo().schema_name,
+	                                                 write_func.function_name);
 	gstate->connection = SetupWriteConnection(context, table, write_func, input_schema, write_options,
 	                                           vgi_tx.GetTransactionId());
 
@@ -527,6 +577,9 @@ unique_ptr<GlobalSinkState> VgiPhysicalUpdate::GetGlobalSinkState(ClientContext 
 
 	auto gstate = make_uniq<VgiWriteGlobalState>(context, GetTypes(), return_chunk);
 	gstate->send_schema = input_schema;
+	gstate->has_finalize = WriteFunctionHasFinalize(context, table.GetCatalog(),
+	                                                 table.GetTableInfo().schema_name,
+	                                                 write_func.function_name);
 	gstate->connection = SetupWriteConnection(context, table, write_func, input_schema, write_options,
 	                                           vgi_tx.GetTransactionId());
 
