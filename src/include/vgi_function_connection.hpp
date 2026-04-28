@@ -304,6 +304,16 @@ private:
 	// Dynamic filter state for tick-based pushdown (shared with the scan operator)
 	shared_ptr<TickFilterState> tick_filter_state_;
 
+	// Optional shared-memory segment for zero-copy batch transfer.
+	// When non-null, the segment name + size are advertised to the worker
+	// in PerformInit's request metadata, and ReadDataBatch resolves
+	// pointer batches against it. Reset between requests.
+	std::unique_ptr<class VgiShmSegment> shm_segment_;
+	// Offset of the most-recently-resolved shm batch. Freed when the next
+	// ReadDataBatch is called (lockstep: DuckDB has finished with the
+	// previous chunk before requesting the next), and on connection close.
+	int64_t shm_last_offset_ = -1;
+
 	// Stderr reader: owned drainer that spawns a background thread for the
 	// lifetime of this connection. ReleaseFd() transfers fd ownership to the
 	// pool on ReleaseForPooling() so the cleanup thread can close it later.

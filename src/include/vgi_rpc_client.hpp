@@ -38,6 +38,19 @@ constexpr const char *RPC_LOCATION_KEY = "vgi_rpc.location";
 // External location SHA-256 checksum metadata key (pointer batch)
 constexpr const char *RPC_LOCATION_SHA256_KEY = "vgi_rpc.location.sha256";
 
+// Shared-memory transport keys (mirror vgi_rpc/metadata.py).
+// Set on the *request batch* to advertise a client-allocated segment to the
+// worker; the worker may then write its response batches into the segment
+// and emit "pointer batches" carrying offset/length per batch.
+constexpr const char *SHM_SEGMENT_NAME_KEY = "vgi_rpc.shm_segment_name";
+constexpr const char *SHM_SEGMENT_SIZE_KEY = "vgi_rpc.shm_segment_size";
+// Set on response *pointer batches* (zero-row data batches with these
+// metadata keys instead of vgi_rpc.log_level): the real batch lives at
+// [shm_offset, shm_offset+shm_length) inside the segment.
+constexpr const char *SHM_OFFSET_KEY = "vgi_rpc.shm_offset";
+constexpr const char *SHM_LENGTH_KEY = "vgi_rpc.shm_length";
+constexpr const char *SHM_SOURCE_KEY = "vgi_rpc.shm_source";
+
 // ============================================================================
 // Batch Classification
 // ============================================================================
@@ -67,7 +80,8 @@ RpcBatchType ClassifyBatch(const std::shared_ptr<arrow::RecordBatch> &batch,
 // Creates an IPC stream: schema (from params_batch) + 1-row batch with method metadata + EOS.
 // The params_batch must have exactly 1 row with one field per method parameter.
 void WriteRpcRequest(int fd, const std::string &method_name,
-                     const std::shared_ptr<arrow::RecordBatch> &params_batch);
+                     const std::shared_ptr<arrow::RecordBatch> &params_batch,
+                     const std::shared_ptr<arrow::KeyValueMetadata> &extra_metadata = nullptr);
 
 // Write an RPC request with no parameters (zero-field schema, 1-row batch).
 // Used for parameterless methods like catalog_catalogs.

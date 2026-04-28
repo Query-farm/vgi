@@ -83,7 +83,8 @@ static bool DispatchBatch(const std::shared_ptr<arrow::RecordBatch> &batch,
 // ============================================================================
 
 void WriteRpcRequest(int fd, const std::string &method_name,
-                     const std::shared_ptr<arrow::RecordBatch> &params_batch) {
+                     const std::shared_ptr<arrow::RecordBatch> &params_batch,
+                     const std::shared_ptr<arrow::KeyValueMetadata> &extra_metadata) {
 	// Create an IPC stream writer with the params schema
 	auto sink = std::make_shared<FdOutputStream>(fd);
 	auto writer_result = arrow::ipc::MakeStreamWriter(sink, params_batch->schema());
@@ -92,10 +93,17 @@ void WriteRpcRequest(int fd, const std::string &method_name,
 	}
 	auto writer = writer_result.ValueUnsafe();
 
-	// Create custom metadata with method and version
-	auto metadata = arrow::KeyValueMetadata::Make(
-	    {RPC_METHOD_KEY, RPC_REQUEST_VERSION_KEY},
-	    {method_name, RPC_REQUEST_VERSION_VALUE});
+	// Create custom metadata with method and version, plus any caller-provided
+	// extras (e.g. shm segment advertisement on init requests).
+	std::vector<std::string> keys = {RPC_METHOD_KEY, RPC_REQUEST_VERSION_KEY};
+	std::vector<std::string> values = {method_name, RPC_REQUEST_VERSION_VALUE};
+	if (extra_metadata) {
+		for (int64_t i = 0; i < extra_metadata->size(); ++i) {
+			keys.push_back(extra_metadata->key(i));
+			values.push_back(extra_metadata->value(i));
+		}
+	}
+	auto metadata = arrow::KeyValueMetadata::Make(keys, values);
 
 	// Write the single-row batch with metadata
 	auto status = writer->WriteRecordBatch(*params_batch, metadata);

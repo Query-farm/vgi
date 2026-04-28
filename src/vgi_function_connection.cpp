@@ -13,6 +13,7 @@
 #include "vgi_rpc_client.hpp"
 #include "vgi_rpc_types.hpp"
 #include "vgi_schema_registry.hpp"
+#include "vgi_shm_segment.hpp"
 #include "vgi_transport.hpp"
 
 namespace duckdb {
@@ -306,11 +307,44 @@ InitResult FunctionConnection::PerformInit(const std::vector<int32_t> &projectio
 	    ts_percentage, ts_seed);
 	auto init_request_bytes = SerializeToIpcBytes(init_request);
 
-	// Build RPC params and send request
+	// Build RPC params and send request. If shm transport is enabled,
+	// lazily create a segment on first init (per-connection) and advertise
+	// it on every init request via custom_metadata; the worker (Python)
+	// reads SHM_SEGMENT_NAME_KEY / SHM_SEGMENT_SIZE_KEY in
+	// _maybe_attach_shm and writes batches into it. Reset the allocator
+	// before each request so the worker starts fresh.
 	auto rpc_params = BuildInitRpcParams(init_request_bytes);
 	ValidateRequestSchema(rpc_params, "init", worker_path_);
+	std::shared_ptr<arrow::KeyValueMetadata> shm_metadata;
+	if (const char *env = std::getenv("VGI_RPC_SHM_SIZE_BYTES"); env && *env) {
+		try {
+			size_t shm_size = static_cast<size_t>(std::stoull(env));
+			if (!shm_segment_) {
+				shm_segment_ = VgiShmSegment::Create(shm_size);
+			} else {
+				shm_segment_->ResetAllocator();
+			}
+			// All prior allocations were just invalidated by the reset.
+			shm_last_offset_ = -1;
+			// Python's multiprocessing.shared_memory prepends '/' itself
+			// (controlled by _prepend_leading_slash), so we advertise the
+			// posix-shm name WITHOUT the leading slash. shm_open is fine
+			// with the slash on the C++ side.
+			std::string py_name = shm_segment_->name();
+			if (!py_name.empty() && py_name[0] == '/') {
+				py_name.erase(0, 1);
+			}
+			shm_metadata = arrow::KeyValueMetadata::Make(
+			    {SHM_SEGMENT_NAME_KEY, SHM_SEGMENT_SIZE_KEY},
+			    {py_name, std::to_string(shm_segment_->size())});
+		} catch (const std::exception &e) {
+			// Best-effort: fall back to inline transport if shm setup fails.
+			shm_segment_.reset();
+			shm_metadata.reset();
+		}
+	}
 	try {
-		WriteRpcRequest(proc_->GetStdinFd(), "init", rpc_params);
+		WriteRpcRequest(proc_->GetStdinFd(), "init", rpc_params, shm_metadata);
 	} catch (const IOException &e) {
 		CheckWorkerExitStatus(*proc_, worker_path_, "failed during init request");
 		throw;
@@ -573,6 +607,33 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 		if (HandleBatchLogMessage(result.batch, result.custom_metadata, &context_, worker_path_, proc_->GetPid(),
 		                          GetExecutionIdHex(), GetAttachIdHex(), "")) {
 			continue;  // Skip log batch, read next
+		}
+
+		// shm pointer batches: 0-row batches with shm_offset/shm_length in
+		// custom_metadata. Resolve to the actual batch from the segment.
+		// Free the prior batch's slot first — the lockstep RPC protocol
+		// guarantees DuckDB has fully consumed the previous chunk by the
+		// time it asks us for the next one. Without this, the allocator
+		// fills monotonically and the worker silently falls back to inline.
+		if (shm_segment_) {
+			if (shm_last_offset_ >= 0) {
+				shm_segment_->FreeAllocation(static_cast<uint64_t>(shm_last_offset_));
+				shm_last_offset_ = -1;
+			}
+			int64_t resolved_offset = -1;
+			auto resolved =
+			    shm_segment_->MaybeResolveBatch(result.batch, result.custom_metadata, &resolved_offset);
+			if (resolved) {
+				shm_last_offset_ = resolved_offset;
+				if (std::getenv("VGI_RPC_SHM_DEBUG")) {
+					fprintf(stderr, "[shm] resolved batch off=%lld len=%lld\n",
+					        (long long)resolved_offset, (long long)resolved->num_rows());
+				}
+				return resolved;
+			}
+			if (std::getenv("VGI_RPC_SHM_DEBUG") && result.batch && result.batch->num_rows() > 0) {
+				fprintf(stderr, "[shm] inline fallback (rows=%lld)\n", (long long)result.batch->num_rows());
+			}
 		}
 
 		// In the vgi_rpc protocol, EOS is signaled by the IPC stream closing (null
