@@ -1,0 +1,135 @@
+# name: test/sql/integration/projection_pushdown_repro.test
+# description: Reproducer — value-correctness across projection pushdown.
+#   Worker fixture proj_repro_full_schema emits the full 12-col WIDE_SCHEMA
+#   per row with value_schema_id INT32 set to NULL for every row. When
+#   DuckDB pushes down a projection picking only that column, the
+#   resulting rows should still be all-NULL. Originally observed in
+#   vgi-kafka where count(*) WHERE value_schema_id IS NOT NULL returned
+#   non-zero on a topic where the worker emitted all-NULL value_schema_ids.
+# group: [vgi_integration]
+
+require-env VGI_PROJECTION_REPRO_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'projection_repro' AS p (TYPE vgi, LOCATION '${VGI_PROJECTION_REPRO_WORKER}');
+
+# ---------------------------------------------------------------------------
+# Sanity — without projection, value_schema_id is all NULL (the worker's
+# _build_row_dict sets it to None for every row).
+# ---------------------------------------------------------------------------
+
+query I
+SELECT count(*) FROM p.proj_repro_full_schema(8) WHERE value_schema_id IS NOT NULL;
+----
+0
+
+query I
+SELECT count(*) FROM p.proj_repro_full_schema(8) WHERE value_schema_id IS NULL;
+----
+8
+
+# ---------------------------------------------------------------------------
+# Projection-only column read. DuckDB pushes projection_ids=[10] (the
+# value_schema_id column position in WIDE_SCHEMA). Worker still emits
+# the full 12-col batch; framework selects down to one column. The
+# projected column must remain all-NULL — anything else means the C++
+# extension's column-id mapping is reading from the wrong wire position.
+# ---------------------------------------------------------------------------
+
+query I
+SELECT count(*) FROM (SELECT value_schema_id FROM p.proj_repro_full_schema(8)) WHERE value_schema_id IS NOT NULL;
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT value_schema_id FROM p.proj_repro_full_schema(100)) WHERE value_schema_id IS NOT NULL;
+----
+0
+
+# A direct SELECT of the column should return all NULL.
+query I
+SELECT DISTINCT value_schema_id FROM p.proj_repro_full_schema(8);
+----
+NULL
+
+# ---------------------------------------------------------------------------
+# Cross-check on a different all-NULL int32 column (key_schema_id at idx 7).
+# Same shape, different position.
+# ---------------------------------------------------------------------------
+
+query I
+SELECT count(*) FROM (SELECT key_schema_id FROM p.proj_repro_full_schema(8)) WHERE key_schema_id IS NOT NULL;
+----
+0
+
+# ---------------------------------------------------------------------------
+# Cross-check on a non-null column — partition (int32, idx 1) is set to
+# i % 4 for each row, so 8 rows → distinct values {0,1,2,3}.
+# ---------------------------------------------------------------------------
+
+query I
+SELECT count(DISTINCT partition) FROM p.proj_repro_full_schema(8);
+----
+4
+
+# ---------------------------------------------------------------------------
+# Multi-tick variant — emits one tiny batch (2 rows) per process() call.
+# Mirrors kafka_consume's shard-queue pattern where the bug was first seen.
+# ---------------------------------------------------------------------------
+
+query I
+SELECT count(*) FROM (SELECT value_schema_id FROM p.proj_repro_chunked(8)) WHERE value_schema_id IS NOT NULL;
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT value_schema_id FROM p.proj_repro_chunked(100)) WHERE value_schema_id IS NOT NULL;
+----
+0
+
+query I
+SELECT DISTINCT value_schema_id FROM p.proj_repro_chunked(8);
+----
+NULL
+
+# Multi-worker variant — 4 worker subprocesses, each chunked. This is the
+# closest analogue to kafka_consume's 4-partition × shard-queue layout
+# where the bug originally surfaced.
+query I
+SELECT count(*) FROM (SELECT value_schema_id FROM p.proj_repro_multi_worker(8)) WHERE value_schema_id IS NOT NULL;
+----
+0
+
+query I
+SELECT DISTINCT value_schema_id FROM p.proj_repro_multi_worker(8);
+----
+NULL
+
+# count(DISTINCT) on a string column across multiple chunks — kafka
+# regression showed count(DISTINCT key_string)=2501 instead of 5000 on a
+# 5000-row bulk insert. Here key_string is unique per row, so 100 rows
+# across 50 batches must yield 100 distinct values.
+query I
+SELECT count(DISTINCT key_string) FROM p.proj_repro_chunked(100);
+----
+100
+
+# ---------------------------------------------------------------------------
+# Same checks against the strict variant (worker observes
+# params.output_schema and emits only what was projected). This is the
+# canonical projection-aware path; should match.
+# ---------------------------------------------------------------------------
+
+query I
+SELECT count(*) FROM (SELECT value_schema_id FROM p.proj_repro_strict(8)) WHERE value_schema_id IS NOT NULL;
+----
+0
+
+query I
+SELECT DISTINCT value_schema_id FROM p.proj_repro_strict(8);
+----
+NULL

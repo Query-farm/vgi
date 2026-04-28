@@ -216,6 +216,17 @@ struct VgiTableFunctionGlobalState : public GlobalTableFunctionState {
 	// Shared tick filter state (updated by scan, read by connection for tick metadata)
 	shared_ptr<TickFilterState> tick_filter_state;
 
+	// Init-phase pushdown data captured by InitGlobal so secondary workers
+	// see the same projection / filters / hints as the primary worker. Without
+	// these, secondary workers emit the full unprojected schema while the
+	// primary emits projected batches, and the per-batch ArrowToDuckDB read
+	// (which assumes projected layout when projection_pushdown=true) reads
+	// the wrong column position.
+	std::vector<int32_t> projection_ids;
+	std::vector<std::shared_ptr<arrow::Buffer>> join_keys_buffers;
+	std::optional<OrderByHint> order_by_hint;
+	std::optional<TableSampleHint> table_sample_hint;
+
 	idx_t MaxThreads() const override {
 		return max_processes;
 	}

@@ -1041,6 +1041,10 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 	global_state->dynamic_filters = std::move(dynamic_filters);
 	global_state->static_filter_bytes = filter_bytes;
 	global_state->tick_filter_state = tick_filter_state;
+	global_state->projection_ids = projection_ids;
+	global_state->join_keys_buffers = join_keys_buffers;
+	global_state->order_by_hint = bind_data.order_by_hint;
+	global_state->table_sample_hint = bind_data.table_sample_hint;
 
 	VGI_LOG(context, "table_function.init_global",
 	        {{"conn", global_state->primary_connection->GetConnIdHex()},
@@ -1143,8 +1147,22 @@ unique_ptr<LocalTableFunctionState> VgiTableFunctionInitLocal(ExecutionContext &
 		auto result = AcquireAndBindConnection(context.client, params);
 		local_state->prefetch_slot_->connection = std::move(result.connection);
 
-		// Secondary workers do a normal PerformInit with execution_id set in InitRequest
-		local_state->connection()->PerformInit();
+		// Secondary workers must receive the same projection / filter / hint
+		// pushdown info as the primary so they emit batches with a matching
+		// shape. Without this, secondary workers emit the full unprojected
+		// schema while the primary emits projected batches, and ArrowToDuckDB
+		// (which assumes projected layout when projection_pushdown=true)
+		// reads the wrong column positions from the unprojected secondary
+		// batches.
+		if (bind_data.projection_pushdown) {
+			local_state->connection()->SetTickFilterState(global_state.tick_filter_state);
+			local_state->connection()->PerformInit(
+			    global_state.projection_ids, global_state.static_filter_bytes,
+			    global_state.join_keys_buffers, "", global_state.order_by_hint,
+			    global_state.table_sample_hint);
+		} else {
+			local_state->connection()->PerformInit();
+		}
 
 		VGI_LOG(context.client, "table_function.init_local",
 		        {{"conn", local_state->connection()->GetConnIdHex()},
