@@ -665,8 +665,22 @@ void FunctionConnection::WriteInputBatch(const std::shared_ptr<arrow::RecordBatc
 		                    proc_ ? proc_->GetPid() : -1, GetExecutionIdHex());
 	}
 
+	// Reconcile the batch's schema to the writer's declared (worker-facing)
+	// schema. DuckDB's ArrowConverter::ToArrowSchema can't preserve every
+	// Arrow attribute on its types (notably nullability flags and
+	// TIMESTAMP_TZ unit/tz), so a batch produced by DataChunkToArrow may not
+	// match the schema the IPC stream was opened with even when the data
+	// would round-trip cleanly. ReconcileBatchToSchema handles the metadata
+	// reshape (no copy) and any genuine type cast (arrow::compute::Cast)
+	// recursively into nested types. Fast-path returns the batch unchanged
+	// when schemas already match.
+	auto reconciled = batch;
+	if (input_schema_) {
+		reconciled = ReconcileBatchToSchema(batch, input_schema_);
+	}
+
 	// Write the batch (no protocol state metadata in vgi_rpc protocol)
-	auto write_status = input_writer_->WriteRecordBatch(*batch);
+	auto write_status = input_writer_->WriteRecordBatch(*reconciled);
 	if (!write_status.ok()) {
 		ThrowVgiIOException("Failed to write input batch: %s", worker_path_, proc_ ? proc_->GetPid() : -1,
 		                    GetExecutionIdHex(), write_status.ToString());

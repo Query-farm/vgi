@@ -3,6 +3,7 @@
 #include "vgi_rpc_types.hpp"
 
 #include <arrow/c/bridge.h>
+#include <arrow/compute/cast.h>
 
 #include "duckdb/common/arrow/arrow_appender.hpp"
 #include "duckdb/common/arrow/arrow_converter.hpp"
@@ -867,6 +868,141 @@ RecordBatchSingleRow::RecordBatchSingleRow(const std::shared_ptr<arrow::RecordBa
 
 ColumnValue RecordBatchSingleRow::operator[](const std::string &column_name) const {
 	return ColumnValue(batch_, column_name, row_idx_, batch_description_, worker_path_);
+}
+
+// ============================================================================
+// Schema Reconciliation
+// ============================================================================
+
+namespace {
+
+// Forward decl — recursion target.
+std::shared_ptr<arrow::ArrayData> ReshapeArrayData(const std::shared_ptr<arrow::ArrayData> &source,
+                                                    const std::shared_ptr<arrow::Field> &target_field);
+
+// Cast a leaf primitive Array to target_type, returning the underlying ArrayData.
+// Caller has already verified that source.type != target_type.
+std::shared_ptr<arrow::ArrayData> CastPrimitive(const std::shared_ptr<arrow::ArrayData> &source,
+                                                 const std::shared_ptr<arrow::DataType> &target_type) {
+	auto array = arrow::MakeArray(source);
+	auto result = arrow::compute::Cast(*array, target_type);
+	if (!result.ok()) {
+		throw IOException("VGI schema reconciliation: failed to cast %s -> %s: %s",
+		                  array->type()->ToString(), target_type->ToString(), result.status().ToString());
+	}
+	return result.ValueOrDie()->data();
+}
+
+// Build a new ArrayData with the same buffers/length/null_count as `source`
+// but using `target_type` and the reshaped child ArrayData list.
+// Used for nested-type reshape paths where children change but the parent
+// layout (offsets, null bitmap) is preserved verbatim.
+std::shared_ptr<arrow::ArrayData> RewrapArrayData(const std::shared_ptr<arrow::ArrayData> &source,
+                                                   const std::shared_ptr<arrow::DataType> &target_type,
+                                                   std::vector<std::shared_ptr<arrow::ArrayData>> reshaped_children) {
+	auto out = arrow::ArrayData::Make(target_type, source->length, source->buffers, std::move(reshaped_children),
+	                                  source->null_count, source->offset);
+	if (source->dictionary) {
+		out->dictionary = source->dictionary;
+	}
+	return out;
+}
+
+std::shared_ptr<arrow::ArrayData> ReshapeStruct(const std::shared_ptr<arrow::ArrayData> &source,
+                                                 const std::shared_ptr<arrow::DataType> &target_type) {
+	const auto &target_struct = arrow::internal::checked_cast<const arrow::StructType &>(*target_type);
+	if (NumericCast<int>(source->child_data.size()) != target_struct.num_fields()) {
+		throw IOException("VGI schema reconciliation: struct child count mismatch (source=%d target=%d)",
+		                  static_cast<int>(source->child_data.size()), target_struct.num_fields());
+	}
+	std::vector<std::shared_ptr<arrow::ArrayData>> reshaped;
+	reshaped.reserve(source->child_data.size());
+	for (size_t i = 0; i < source->child_data.size(); i++) {
+		reshaped.push_back(ReshapeArrayData(source->child_data[i], target_struct.field(NumericCast<int>(i))));
+	}
+	return RewrapArrayData(source, target_type, std::move(reshaped));
+}
+
+std::shared_ptr<arrow::ArrayData> ReshapeListLike(const std::shared_ptr<arrow::ArrayData> &source,
+                                                   const std::shared_ptr<arrow::DataType> &target_type,
+                                                   const std::shared_ptr<arrow::Field> &target_value_field) {
+	if (source->child_data.size() != 1) {
+		throw IOException("VGI schema reconciliation: list-like ArrayData expected 1 child, got %d",
+		                  static_cast<int>(source->child_data.size()));
+	}
+	std::vector<std::shared_ptr<arrow::ArrayData>> reshaped;
+	reshaped.reserve(1);
+	reshaped.push_back(ReshapeArrayData(source->child_data[0], target_value_field));
+	return RewrapArrayData(source, target_type, std::move(reshaped));
+}
+
+std::shared_ptr<arrow::ArrayData> ReshapeArrayData(const std::shared_ptr<arrow::ArrayData> &source,
+                                                    const std::shared_ptr<arrow::Field> &target_field) {
+	const auto &target_type = target_field->type();
+	const bool same_type = source->type->Equals(*target_type);
+
+	switch (target_type->id()) {
+	case arrow::Type::STRUCT: {
+		// Even if the struct types compare unequal at the top level (e.g.,
+		// child nullability flags differ), the data layout matches; rebuild
+		// the struct with reshaped children. If they're already equal we
+		// still need to descend in case child fields' metadata differs at
+		// deeper levels — the source.type->Equals check above catches the
+		// fully-equal case at this exact node and short-circuits via
+		// `same_type` below; struct children always need a recursive walk.
+		return ReshapeStruct(source, target_type);
+	}
+	case arrow::Type::LIST:
+	case arrow::Type::LARGE_LIST:
+	case arrow::Type::FIXED_SIZE_LIST: {
+		const auto &list_type = arrow::internal::checked_cast<const arrow::BaseListType &>(*target_type);
+		return ReshapeListLike(source, target_type, list_type.value_field());
+	}
+	case arrow::Type::MAP: {
+		// Map is List<Struct<key, value>> — recurse into the entries struct.
+		const auto &map_type = arrow::internal::checked_cast<const arrow::MapType &>(*target_type);
+		return ReshapeListLike(source, target_type, map_type.value_field());
+	}
+	default:
+		break;
+	}
+
+	if (same_type) {
+		// Leaf primitive whose type already matches: reuse buffers verbatim.
+		// (The caller's RecordBatch::Make will pick up the target field's
+		// nullable/metadata flags from the schema we hand it.)
+		return source;
+	}
+
+	// Leaf primitive whose Arrow type differs (e.g., timestamp[us, tz=session]
+	// vs target timestamp[ms, tz=UTC]) — invoke the Arrow cast kernel.
+	return CastPrimitive(source, target_type);
+}
+
+} // namespace
+
+std::shared_ptr<arrow::RecordBatch> ReconcileBatchToSchema(
+    const std::shared_ptr<arrow::RecordBatch> &batch,
+    const std::shared_ptr<arrow::Schema> &target_schema) {
+	if (!batch || !target_schema) {
+		return batch;
+	}
+	// Fast path: schemas already equal (excluding metadata, since
+	// ArrowConverter doesn't preserve it).
+	if (batch->schema()->Equals(*target_schema, /*check_metadata=*/false)) {
+		return batch;
+	}
+	if (batch->num_columns() != target_schema->num_fields()) {
+		throw IOException("VGI schema reconciliation: column count mismatch (batch=%d target=%d)",
+		                  batch->num_columns(), target_schema->num_fields());
+	}
+	std::vector<std::shared_ptr<arrow::ArrayData>> columns;
+	columns.reserve(NumericCast<size_t>(batch->num_columns()));
+	for (int i = 0; i < batch->num_columns(); i++) {
+		const auto &target_field = target_schema->field(i);
+		columns.push_back(ReshapeArrayData(batch->column_data(i), target_field));
+	}
+	return arrow::RecordBatch::Make(target_schema, batch->num_rows(), std::move(columns));
 }
 
 } // namespace vgi

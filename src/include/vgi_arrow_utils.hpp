@@ -129,6 +129,36 @@ std::shared_ptr<arrow::Schema> BuildArrowSchemaFromDuckDB(ClientContext &context
                                                             const vector<string> &names);
 
 // ============================================================================
+// Schema Reconciliation
+// ============================================================================
+
+// Reconcile a RecordBatch produced by DuckDB to the schema a worker declared.
+//
+// DuckDB's LogicalType system can't preserve every Arrow attribute on the
+// round-trip:
+//   * nullability flags (LogicalType has no nullable bit; ArrowConverter
+//     always emits nullable=true)
+//   * TIMESTAMP_TZ unit/tz collapses to us-precision + session timezone
+//   * decimal precision/scale shifts in some narrow cases
+//
+// This helper takes a batch DataChunkToArrow produced and returns a new batch
+// whose schema is bit-for-bit equal to ``target_schema`` — recasting columns
+// where Arrow types differ (via arrow::compute::Cast) and reshaping fields
+// (nullability/metadata) where only field flags differ. Recurses into struct,
+// list, list-of-struct, fixed-size-list, large-list, and map types so child
+// fields' nullability is reconciled too.
+//
+// Fast path: when batch->schema()->Equals(*target_schema, /*check_metadata=*/false)
+// returns true (nested structure included), the input batch is returned
+// unchanged — zero allocations, zero kernel calls.
+//
+// Throws IOException if a column's Arrow type cannot be cast to the target
+// type (e.g., genuinely incompatible logical types).
+std::shared_ptr<arrow::RecordBatch> ReconcileBatchToSchema(
+    const std::shared_ptr<arrow::RecordBatch> &batch,
+    const std::shared_ptr<arrow::Schema> &target_schema);
+
+// ============================================================================
 // DuckDB Value to Arrow Conversion
 // ============================================================================
 

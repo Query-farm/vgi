@@ -1,0 +1,243 @@
+# name: test/sql/integration/schema_reconcile.test
+# description: Verifies the C++ ReconcileBatchToSchema helper reshapes and casts
+#              every batch DuckDB hands the worker so that the worker sees its
+#              declared schema bit-for-bit. Drives the schema_reconcile fixture
+#              whose handlers strict-assert on the Arrow schema of each
+#              INSERT/UPDATE/DELETE batch — a regression in the C++ helper
+#              would surface as a worker-side ValueError, not silent corruption.
+# group: [vgi_schema_reconcile]
+
+require-env VGI_SCHEMA_RECONCILE_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'schema_reconcile' AS sr (TYPE vgi, LOCATION '${VGI_SCHEMA_RECONCILE_WORKER}');
+
+# Topic table is exposed at sr.main.demo with a deliberately quirky schema:
+#   id        BIGINT          NOT NULL
+#   ts        TIMESTAMPTZ     NOT NULL  (declared timestamp[ms, tz=UTC])
+#   nested    STRUCT(...)     NOT NULL  (NOT NULL int32 leaf, ts2 timestamp[ms, tz=UTC])
+#   tags      LIST(STRUCT)    NOT NULL  (NOT NULL k string leaf inside list-of-struct)
+#   rowid     BIGINT          NOT NULL  (DuckDB pseudocolumn)
+#
+# DuckDB's ArrowConverter cannot preserve any of those flags or the
+# ms+UTC timestamp on the round trip. Every assertion below depends on
+# the C++ ReconcileBatchToSchema helper to bridge the gap.
+
+# ============================================================================
+# INSERT — covers top-level NOT NULL primitives, TZ-aware timestamps,
+# nested struct with NOT NULL leaves, and list-of-struct with NOT NULL items.
+# ============================================================================
+
+statement ok
+INSERT INTO sr.main.demo (id, ts, nested, tags) VALUES
+    (1,
+     TIMESTAMPTZ '2026-04-27 12:00:00+00',
+     {'a': 10, 'b': 'one',  'ts2': TIMESTAMPTZ '2026-04-27 12:00:00+00'},
+     [{'k': 'env', 'v': 'prod'::BLOB}, {'k': 'tier', 'v': NULL}]),
+    (2,
+     TIMESTAMPTZ '2026-04-27 13:00:00+00',
+     {'a': 20, 'b': NULL,    'ts2': NULL},
+     [{'k': 'env', 'v': 'dev'::BLOB}]);
+
+query I
+SELECT count(*) FROM sr.main.demo;
+----
+2
+
+# Verify timestamps round-trip — the original UTC instant is preserved through
+# the worker (where the cast lands in timestamp[ms, tz=UTC]) and back to
+# DuckDB on SELECT.
+query T
+SELECT ts FROM sr.main.demo WHERE id = 1;
+----
+2026-04-27 12:00:00+00
+
+# Nested struct fields preserved through reconciliation.
+query II
+SELECT nested.a, nested.b FROM sr.main.demo ORDER BY id;
+----
+10	one
+20	NULL
+
+# List-of-struct preserved (k field NOT NULL, v field nullable).
+query I
+SELECT count(*) FROM sr.main.demo WHERE tags[1].k = 'env';
+----
+2
+
+# ============================================================================
+# UPDATE — exercises rowid + selected-column reshape on a partial column set.
+# Both top-level (id) and nested (ts2 inside the struct) update paths matter.
+# ============================================================================
+
+statement ok
+UPDATE sr.main.demo SET id = 100 WHERE id = 1;
+
+query I
+SELECT id FROM sr.main.demo WHERE nested.a = 10;
+----
+100
+
+statement ok
+UPDATE sr.main.demo
+SET nested = {'a': 99, 'b': 'updated', 'ts2': TIMESTAMPTZ '2026-05-01 00:00:00+00'}
+WHERE id = 100;
+
+query II
+SELECT nested.a, nested.b FROM sr.main.demo WHERE id = 100;
+----
+99	updated
+
+# ============================================================================
+# DELETE — exercises the rowid-only reshape path. The fixture's DELETE
+# handler strict-asserts the input batch is exactly (rowid: int64 NOT NULL).
+# ============================================================================
+
+statement ok
+DELETE FROM sr.main.demo WHERE id = 100;
+
+query I
+SELECT count(*) FROM sr.main.demo;
+----
+1
+
+statement ok
+DELETE FROM sr.main.demo;
+
+query I
+SELECT count(*) FROM sr.main.demo;
+----
+0
+
+# ============================================================================
+# Bulk INSERT from SELECT — multi-row batch path, same reshape/cast.
+# ============================================================================
+
+statement ok
+INSERT INTO sr.main.demo (id, ts, nested, tags)
+SELECT
+    i,
+    TIMESTAMPTZ '2026-04-27 00:00:00+00',
+    {'a': i::INTEGER, 'b': 'row_' || i::VARCHAR, 'ts2': NULL},
+    [{'k': 'idx', 'v': CAST(i::VARCHAR AS BLOB)}]
+FROM range(10) t(i);
+
+query I
+SELECT count(*) FROM sr.main.demo;
+----
+10
+
+query II
+SELECT id, nested.a FROM sr.main.demo ORDER BY id LIMIT 3;
+----
+0	0
+1	1
+2	2
+
+statement ok
+DELETE FROM sr.main.demo;
+
+# ============================================================================
+# ts_demo — rowid type is timestamp[ms, tz=UTC] NOT NULL.
+# Exercises the TIMESTAMP_TZ unit/tz cast on the rowid itself: DuckDB
+# collapses it to timestamp[us, tz=session] internally, and the
+# C++ ReconcileBatchToSchema must cast back to ms+UTC on UPDATE/DELETE.
+# ============================================================================
+
+statement ok
+INSERT INTO sr.main.ts_demo (id, ts, nested, tags) VALUES
+    (1,
+     TIMESTAMPTZ '2026-04-27 10:00:00+00',
+     {'a': 11, 'b': 'a',  'ts2': NULL},
+     [{'k': 'env', 'v': 'prod'::BLOB}]),
+    (2,
+     TIMESTAMPTZ '2026-04-27 11:00:00+00',
+     {'a': 22, 'b': 'b',  'ts2': NULL},
+     [{'k': 'env', 'v': 'dev'::BLOB}]);
+
+query I
+SELECT count(*) FROM sr.main.ts_demo;
+----
+2
+
+# UPDATE addressed by the timestamp-rowid: pick the row whose id is 1 and
+# update its ``id`` field. The rowid travels through DuckDB and back; the
+# fixture's UPDATE handler asserts the rowid arrives as
+# timestamp[ms, tz=UTC] NOT NULL.
+statement ok
+UPDATE sr.main.ts_demo SET id = 1001 WHERE id = 1;
+
+query I
+SELECT id FROM sr.main.ts_demo WHERE nested.a = 11;
+----
+1001
+
+# DELETE addressed by the timestamp-rowid. The fixture's DELETE handler
+# strict-asserts the input batch is exactly
+# (rowid: timestamp[ms, tz=UTC] NOT NULL).
+statement ok
+DELETE FROM sr.main.ts_demo WHERE id = 2;
+
+query I
+SELECT count(*) FROM sr.main.ts_demo;
+----
+1
+
+statement ok
+DELETE FROM sr.main.ts_demo;
+
+# ============================================================================
+# struct_demo — rowid is a STRUCT with a NOT NULL leaf and a nullable leaf.
+# Exercises recursive nested-type reshape on the rowid pseudocolumn:
+# DuckDB will emit the struct rowid with all-nullable children;
+# ReconcileBatchToSchema must descend and restore ``a``'s NOT NULL flag.
+# ============================================================================
+
+statement ok
+INSERT INTO sr.main.struct_demo (id, ts, nested, tags) VALUES
+    (10,
+     TIMESTAMPTZ '2026-04-27 12:00:00+00',
+     {'a': 1,  'b': 'first',   'ts2': NULL},
+     [{'k': 'env', 'v': 'prod'::BLOB}]),
+    (20,
+     TIMESTAMPTZ '2026-04-27 13:00:00+00',
+     {'a': 2,  'b': NULL,      'ts2': NULL},
+     [{'k': 'env', 'v': 'dev'::BLOB}]);
+
+query I
+SELECT count(*) FROM sr.main.struct_demo;
+----
+2
+
+# UPDATE with a struct rowid: the SET-clause batch arrives as
+# (id: int64 NOT NULL, rowid: struct<a int64 NOT NULL, b string nullable>).
+# The struct child ``a`` must come back NOT NULL after reconciliation.
+statement ok
+UPDATE sr.main.struct_demo SET id = 9999 WHERE nested.a = 2;
+
+query II
+SELECT id, nested.a FROM sr.main.struct_demo ORDER BY id;
+----
+10	1
+9999	2
+
+# DELETE with a struct rowid: the input batch is just
+# (rowid: struct<a NOT NULL, b nullable> NOT NULL). Verifies recursive
+# reshape on a struct passed in the rowid-only DELETE path.
+statement ok
+DELETE FROM sr.main.struct_demo WHERE nested.a = 1;
+
+query I
+SELECT count(*) FROM sr.main.struct_demo;
+----
+1
+
+statement ok
+DELETE FROM sr.main.struct_demo;
+
+statement ok
+DETACH sr;

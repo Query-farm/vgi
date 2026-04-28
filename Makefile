@@ -19,6 +19,11 @@ VGI_VERSIONED_WORKER ?= uv run --project $(HOME)/Development/vgi-python vgi-exam
 VGI_VERSIONED_TABLES_WORKER ?= uv run --project $(HOME)/Development/vgi-python vgi-example-versioned-tables-worker
 VGI_ATTACH_OPTIONS_WORKER ?= uv run --project $(HOME)/Development/vgi-python vgi-example-attach-options-worker
 
+# Schema-reconcile fixture worker — used by test/sql/integration/schema_reconcile.test
+# to verify ReconcileBatchToSchema reshapes/casts every batch DuckDB sends so the
+# worker sees its declared schema bit-for-bit.
+VGI_SCHEMA_RECONCILE_WORKER ?= uv run --project $(HOME)/Development/vgi-python vgi-fixture-schema-reconcile-worker
+
 # Subprocess transport tests.
 # Writable tests are excluded from the default targets because they require
 # a vgi-python worker with writable-catalog support enabled; run them
@@ -34,6 +39,8 @@ test_subprocess:
 	VGI_VERSIONED_WORKER="$(VGI_VERSIONED_WORKER)" \
 	VGI_VERSIONED_TABLES_WORKER="$(VGI_VERSIONED_TABLES_WORKER)" \
 	VGI_ATTACH_OPTIONS_WORKER="$(VGI_ATTACH_OPTIONS_WORKER)" \
+	VGI_SCHEMA_RECONCILE_WORKER="$(VGI_SCHEMA_RECONCILE_WORKER)" \
+	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
 	./build/release/test/unittest "test/*" "~test/sql/integration/writable/*"
 
 test_subprocess_debug:
@@ -42,6 +49,8 @@ test_subprocess_debug:
 	VGI_VERSIONED_WORKER="$(VGI_VERSIONED_WORKER)" \
 	VGI_VERSIONED_TABLES_WORKER="$(VGI_VERSIONED_TABLES_WORKER)" \
 	VGI_ATTACH_OPTIONS_WORKER="$(VGI_ATTACH_OPTIONS_WORKER)" \
+	VGI_SCHEMA_RECONCILE_WORKER="$(VGI_SCHEMA_RECONCILE_WORKER)" \
+	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
 	./build/debug/test/unittest "test/*" "~test/sql/integration/writable/*"
 
 # HTTP transport tests (uses test/run_http_integration.sh)

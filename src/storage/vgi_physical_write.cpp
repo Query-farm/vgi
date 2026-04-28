@@ -501,11 +501,22 @@ unique_ptr<GlobalSinkState> VgiPhysicalUpdate::GetGlobalSinkState(ClientContext 
 	auto &table_info = table.GetTableInfo();
 	auto &table_columns = table.GetColumns();
 
+	// For each updated column, look the field up by name in the worker's
+	// declared table schema rather than re-deriving via DuckDB's Arrow
+	// converter — that converter always emits nullable=true and would
+	// silently widen the worker's contract. The C++
+	// ReconcileBatchToSchema helper reshapes incoming batches to match
+	// this declared schema before they hit the IPC writer.
 	std::vector<std::shared_ptr<arrow::Field>> send_fields;
 	for (auto &col_idx : columns) {
 		auto &col = table_columns.GetColumn(col_idx);
-		auto arrow_type = BuildArrowSchemaFromDuckDB(context, {col.Type()}, {col.Name()});
-		send_fields.push_back(arrow_type->field(0));
+		auto declared_idx = table_info.arrow_schema->GetFieldIndex(col.Name());
+		if (declared_idx >= 0) {
+			send_fields.push_back(table_info.arrow_schema->field(declared_idx));
+		} else {
+			auto arrow_type = BuildArrowSchemaFromDuckDB(context, {col.Type()}, {col.Name()});
+			send_fields.push_back(arrow_type->field(0));
+		}
 	}
 	auto rowid_field = table_info.arrow_schema->field(table_info.row_id_column);
 	send_fields.push_back(rowid_field);
