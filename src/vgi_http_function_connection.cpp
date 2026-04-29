@@ -2,6 +2,7 @@
 
 #include "duckdb.hpp"
 
+#include "vgi_arrow_utils.hpp"
 #include "vgi_bind_protocol.hpp"
 #include "vgi_catalog_api.hpp"
 #include "generated/vgi_protocol_constants.hpp"
@@ -116,7 +117,19 @@ std::vector<uint8_t> HttpFunctionConnection::SerializeBatchWithState(
 
 	auto status = writer->WriteRecordBatch(*batch, metadata);
 	if (!status.ok()) {
-		throw IOException("Failed to write batch: %s", status.ToString());
+		// Arrow's IPC writer rejects any batch whose schema differs from the
+		// writer's schema (down to per-field nullable flags and metadata).
+		// The bare status string ("Tried to write record batch with
+		// different schema") is useless for debugging. Diff both schemas
+		// inline so an operator can see exactly which field changed.
+		std::string writer_schema_str = schema ? schema->ToString(/*show_metadata=*/true) : "<null>";
+		std::string batch_schema_str = batch && batch->schema()
+		    ? batch->schema()->ToString(/*show_metadata=*/true) : "<null>";
+		throw IOException(
+		    "Failed to write batch: %s\n"
+		    "  writer schema (advertised at bind):\n%s\n"
+		    "  batch schema (received from caller):\n%s",
+		    status.ToString(), writer_schema_str, batch_schema_str);
 	}
 
 	status = writer->Close();
@@ -167,6 +180,12 @@ void HttpFunctionConnection::BufferDataBatches(const std::string &response_body,
 	}
 	auto reader = reader_result.ValueUnsafe();
 
+	// Per-response counters surfaced via VGI_LOG below.  Useful to confirm
+	// the server's batch-bundling (``max_stream_response_bytes``) is taking
+	// effect end-to-end on the C++ client.
+	int64_t spike_data_batches = 0;
+	int64_t spike_log_batches = 0;
+	int64_t spike_external_batches = 0;
 	while (true) {
 		auto read_result = reader->ReadNext();
 		if (!read_result.ok() || !read_result.ValueUnsafe().batch) {
@@ -184,6 +203,7 @@ void HttpFunctionConnection::BufferDataBatches(const std::string &response_body,
 		if (batch_type == RpcBatchType::LOG) {
 			HandleBatchLogMessage(bwm.batch, bwm.custom_metadata, &context_, base_url_,
 			                     -1, GetExecutionIdHex(), GetAttachIdHex());
+			++spike_log_batches;
 			continue;
 		}
 
@@ -196,12 +216,23 @@ void HttpFunctionConnection::BufferDataBatches(const std::string &response_body,
 			                                         bwm.custom_metadata);
 			buffered_batches_.push_back(resolved.batch);
 			ExtractStreamState(resolved.batch, resolved.metadata);
+			++spike_external_batches;
 			continue;
 		}
 
 		// Extract stream_state from regular data batches
 		ExtractStreamState(bwm.batch, bwm.custom_metadata);
 		buffered_batches_.push_back(bwm.batch);
+		++spike_data_batches;
+	}
+
+	{
+		auto fields = BuildConnLogFields(*this);
+		fields.emplace_back("data_batches", std::to_string(spike_data_batches));
+		fields.emplace_back("log_batches", std::to_string(spike_log_batches));
+		fields.emplace_back("external_batches", std::to_string(spike_external_batches));
+		fields.emplace_back("response_bytes", std::to_string(response_body.size() - offset));
+		VGI_LOG(context_, "http_function_connection.buffer_data_batches", fields);
 	}
 }
 
@@ -458,7 +489,22 @@ void HttpFunctionConnection::WriteInputBatch(const std::shared_ptr<arrow::Record
 	if (input_writer_closed_) {
 		throw IOException("HttpFunctionConnection::WriteInputBatch called after CloseInputWriter [url: %s]", base_url_);
 	}
-	pending_input_ = batch;
+	// Reconcile to the writer's declared (worker-facing) schema before
+	// buffering. DuckDB's ArrowConverter::ToArrowSchema can't preserve every
+	// Arrow attribute on its types (notably nullability flags and
+	// TIMESTAMP_TZ unit/tz), so a batch produced by DataChunkToArrow may
+	// not match the schema the IPC stream was opened with even when the
+	// data would round-trip cleanly. ReconcileBatchToSchema handles the
+	// metadata reshape (no copy) and any genuine type cast
+	// (arrow::compute::Cast) recursively into nested types. Fast-path
+	// returns the batch unchanged when schemas already match. This mirrors
+	// FunctionConnection::WriteInputBatch (subprocess transport) which
+	// gained the same call in commit ca8ad96.
+	auto reconciled = batch;
+	if (input_schema_) {
+		reconciled = ReconcileBatchToSchema(batch, input_schema_);
+	}
+	pending_input_ = reconciled;
 }
 
 void HttpFunctionConnection::CloseInputWriter() {
