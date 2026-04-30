@@ -567,6 +567,17 @@ statement ok
 DROP TABLE large_double_triplets;
 
 # ============================================================================
+# Regression: zero-arg call to a varargs Param scalar must return a clear
+# ArgumentValidationError instead of crashing on_bind with IndexError when
+# the user code reads arguments_schema.field(0).
+# ============================================================================
+
+statement error
+SELECT example.sum_values();
+----
+requires at least 1 value
+
+# ============================================================================
 # Cleanup
 # ============================================================================
 

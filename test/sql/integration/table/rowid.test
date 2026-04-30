@@ -124,3 +124,26 @@ SELECT rowid FROM example.data.rowid_first ORDER BY rowid DESC LIMIT 5;
 17
 16
 15
+
+# ============================================================================
+# Regression: rowid_sequence used to silently fall through to default values
+# when given an unrecognized layout or row_id_type — the worker accepted
+# 'invalid' and emitted the int64/first variant. Arg(choices=...) now
+# rejects bogus values up-front with a clear ArgumentValidationError.
+# ============================================================================
+
+statement error
+SELECT * FROM example.rowid_sequence(5, layout := 'invalid');
+----
+must be one of the allowed choices
+
+statement error
+SELECT * FROM example.rowid_sequence(5, row_id_type := 'invalid');
+----
+must be one of the allowed choices
+
+statement ok
+SELECT * FROM example.rowid_sequence(5, layout := 'middle');
+
+statement ok
+SELECT * FROM example.rowid_sequence(5, row_id_type := 'string');

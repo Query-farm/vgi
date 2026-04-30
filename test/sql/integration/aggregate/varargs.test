@@ -64,6 +64,18 @@ SELECT vgi_sum_all(1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0)::BIGINT;
 55
 
 # ============================================================================
+# Regression: zero-arg call to a varargs aggregate must surface a clear
+# ArgumentValidationError instead of crashing with
+# "TypeError: SumAllFunction.update() missing 1 required positional
+# argument: 'columns'". Mirrors the equivalent guard for varargs scalars.
+# ============================================================================
+
+statement error
+SELECT vgi_sum_all() FROM range(5);
+----
+requires at least 1 value
+
+# ============================================================================
 # Cleanup
 # ============================================================================
 

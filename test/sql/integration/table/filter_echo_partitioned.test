@@ -1,0 +1,158 @@
+# name: test/sql/integration/table/filter_echo_partitioned.test
+# description: Predicate pushdown across multiple parallel workers (queue-distributed)
+# group: [vgi_integration_table]
+
+# FilterEchoPartitionedFunction has filter_pushdown=True, auto_apply_filters=True,
+# projection_pushdown=True, and uses a shared work queue so DuckDB can drive it
+# with multiple parallel workers. Each worker independently:
+#   - receives the same pushed filter spec at init
+#   - deserializes the filter via pushdown_filters(...)
+#   - emits batches that the framework auto-applies the filter to
+# The pushed_filters column echoes the SQL-like filter each worker observed,
+# and worker_pid carries os.getpid() so multi-worker engagement is visible
+# under subprocess transport.
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# Baseline (no filter): correctness + pushed_filters is "(none)"
+# ============================================================================
+
+query I
+SELECT COUNT(*) FROM example.filter_echo_partitioned(1000);
+----
+1000
+
+query III
+SELECT COUNT(*), COUNT(DISTINCT n), MIN(n)
+FROM example.filter_echo_partitioned(1000);
+----
+1000	1000	0
+
+query I
+SELECT MAX(n) FROM example.filter_echo_partitioned(1000);
+----
+999
+
+query T
+SELECT DISTINCT pushed_filters FROM example.filter_echo_partitioned(100);
+----
+(none)
+
+# ============================================================================
+# Correctness under filter + parallelism — every worker applies the filter
+# ============================================================================
+
+# Single equality
+query I
+SELECT n FROM example.filter_echo_partitioned(10000) WHERE n = 4321;
+----
+4321
+
+# Range filter at the high end (forces multiple chunks before the matching one)
+query I
+SELECT n FROM example.filter_echo_partitioned(10000) WHERE n >= 9995 ORDER BY n;
+----
+9995
+9996
+9997
+9998
+9999
+
+# Range filter spanning chunk boundaries
+query III
+SELECT COUNT(*), MIN(n), MAX(n)
+FROM example.filter_echo_partitioned(10000)
+WHERE n BETWEEN 100 AND 199;
+----
+100	100	199
+
+# IN filter
+query I
+SELECT n FROM example.filter_echo_partitioned(10000)
+WHERE n IN (0, 999, 5000, 9999) ORDER BY n;
+----
+0
+999
+5000
+9999
+
+# IS NOT NULL — passes everything
+query I
+SELECT COUNT(*) FROM example.filter_echo_partitioned(5000) WHERE n IS NOT NULL;
+----
+5000
+
+# ============================================================================
+# Filter reached every engaged worker — every batch's pushed_filters is the
+# same SQL-like representation. Use COUNT to be order-insensitive.
+# ============================================================================
+
+query I
+SELECT COUNT(DISTINCT pushed_filters)
+FROM example.filter_echo_partitioned(10000) WHERE n >= 9995;
+----
+1
+
+query T
+SELECT DISTINCT pushed_filters
+FROM example.filter_echo_partitioned(10000) WHERE n >= 9995;
+----
+n >= 9995
+
+query T
+SELECT DISTINCT pushed_filters
+FROM example.filter_echo_partitioned(10000) WHERE n BETWEEN 100 AND 199;
+----
+(n >= 100 AND n <= 199)
+
+# ============================================================================
+# Multi-worker engagement — subprocess transport spawns one OS process per
+# worker, so COUNT(DISTINCT worker_pid) > 1 confirms parallel scan happened.
+# 20000 rows × 1000-row chunks = 20 chunks, plenty for the planner to split.
+# ============================================================================
+
+query I
+SELECT COUNT(DISTINCT worker_pid) > 1
+FROM example.filter_echo_partitioned(20000) WHERE n >= 1000;
+----
+true
+
+# ============================================================================
+# Cardinality / no-duplicate / no-gap invariants under filter + parallelism
+# ============================================================================
+
+query III
+SELECT COUNT(*), COUNT(DISTINCT n), SUM(n)
+FROM example.filter_echo_partitioned(10000) WHERE n < 100;
+----
+100	100	4950
+
+# Sum of all matching rows = (lo+hi)*(count)/2
+query I
+SELECT SUM(n) = (5000::BIGINT + 5999) * 1000 / 2
+FROM example.filter_echo_partitioned(10000) WHERE n BETWEEN 5000 AND 5999;
+----
+true
+
+# ============================================================================
+# Projection pushdown still works alongside filter pushdown
+# ============================================================================
+
+query I
+SELECT COUNT(n) FROM example.filter_echo_partitioned(1000) WHERE n >= 900;
+----
+100
+
+# count(*) shape — empty projection
+query I
+SELECT COUNT(*) FROM example.filter_echo_partitioned(1000) WHERE n >= 900;
+----
+100

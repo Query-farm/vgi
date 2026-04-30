@@ -42,6 +42,25 @@ SELECT * FROM example.exception_process((
 Intentional exception on batch 2
 
 # ============================================================================
+# Regression: ExceptionProcessFunction inherits SumAllColumnsFunction but
+# overrides process() to raise on every-second batch and never calls
+# super().process() — so storage is empty even on the first batch. The
+# parent finalize() then called pa.Table.from_batches([]) without a schema
+# and crashed with "Must pass schema, or at least one RecordBatch" *even
+# when no exception was triggered yet*. finalize() now passes the schema
+# explicitly so empty storage produces a clean zero-sum row.
+# ============================================================================
+
+# Single batch (under 2048 rows) — process never trips the every-second-batch
+# rule, no exception raised, finalize() must succeed and emit zero sums.
+query II
+SELECT * FROM example.exception_process((
+    SELECT unnest(generate_series(1, 100)) AS a, unnest(generate_series(1, 100)) AS b
+));
+----
+0	0
+
+# ============================================================================
 # Cleanup
 # ============================================================================
 

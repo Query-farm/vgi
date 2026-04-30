@@ -19,15 +19,9 @@ VGI_VERSIONED_WORKER ?= uv run --project $(HOME)/Development/vgi-python vgi-exam
 VGI_VERSIONED_TABLES_WORKER ?= uv run --project $(HOME)/Development/vgi-python vgi-example-versioned-tables-worker
 VGI_ATTACH_OPTIONS_WORKER ?= uv run --project $(HOME)/Development/vgi-python vgi-example-attach-options-worker
 
-# Schema-reconcile fixture worker — used by test/sql/integration/schema_reconcile.test
-# to verify ReconcileBatchToSchema reshapes/casts every batch DuckDB sends so the
-# worker sees its declared schema bit-for-bit.
-VGI_SCHEMA_RECONCILE_WORKER ?= uv run --project $(HOME)/Development/vgi-python vgi-fixture-schema-reconcile-worker
-
-# Projection-pushdown reproducer fixture worker — drives
-# test/sql/integration/projection_pushdown_repro.test, which exercises the
-# C++ extension's projection_ids → wire-batch column mapping.
-VGI_PROJECTION_REPRO_WORKER ?= uv run --project $(HOME)/Development/vgi-python vgi-fixture-projection-repro-worker
+# The schema_reconcile and projection_pushdown_repro fixtures are now
+# hosted inside vgi-fixture-worker (VGI_TEST_WORKER) — no separate worker
+# binaries are needed.
 
 # Subprocess transport tests.
 # Writable tests are excluded from the default targets because they require
@@ -44,9 +38,7 @@ test_subprocess:
 	VGI_VERSIONED_WORKER="$(VGI_VERSIONED_WORKER)" \
 	VGI_VERSIONED_TABLES_WORKER="$(VGI_VERSIONED_TABLES_WORKER)" \
 	VGI_ATTACH_OPTIONS_WORKER="$(VGI_ATTACH_OPTIONS_WORKER)" \
-	VGI_SCHEMA_RECONCILE_WORKER="$(VGI_SCHEMA_RECONCILE_WORKER)" \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
-	VGI_PROJECTION_REPRO_WORKER="$(VGI_PROJECTION_REPRO_WORKER)" \
 	./build/release/test/unittest "test/*" "~test/sql/integration/writable/*"
 
 test_subprocess_debug:
@@ -55,9 +47,7 @@ test_subprocess_debug:
 	VGI_VERSIONED_WORKER="$(VGI_VERSIONED_WORKER)" \
 	VGI_VERSIONED_TABLES_WORKER="$(VGI_VERSIONED_TABLES_WORKER)" \
 	VGI_ATTACH_OPTIONS_WORKER="$(VGI_ATTACH_OPTIONS_WORKER)" \
-	VGI_SCHEMA_RECONCILE_WORKER="$(VGI_SCHEMA_RECONCILE_WORKER)" \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
-	VGI_PROJECTION_REPRO_WORKER="$(VGI_PROJECTION_REPRO_WORKER)" \
 	./build/debug/test/unittest "test/*" "~test/sql/integration/writable/*"
 
 # HTTP transport tests (uses test/run_http_integration.sh)

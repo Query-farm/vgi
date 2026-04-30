@@ -15,7 +15,7 @@ BEARER_TOKEN="test-bearer-token-vgi-integration"
 
 # Start HTTP server with bearer auth enabled and auto-selected port
 VGI_BEARER_TOKENS="${BEARER_TOKEN}=test-principal" \
-    uv run --project "$VGI_PYTHON_DIR" vgi-serve vgi.examples.worker:ExampleWorker \
+    uv run --project "$VGI_PYTHON_DIR" vgi-serve vgi._test_fixtures.worker:ExampleWorker \
         --http --port 0 > "$LOG_FILE" 2>&1 &
 SERVER_PID=$!
 

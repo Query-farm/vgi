@@ -1,0 +1,68 @@
+# name: test/sql/integration/table/arg_validation.test
+# description: Arg constraint validation (ge/le) is enforced for table-function args
+# group: [vgi_integration_table]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# Regression: Arg(ge=...) constraints on table-function arguments must be
+# enforced during bind. Previously _parse_arguments bypassed Arg._validate(),
+# so batch_size=0 produced an infinite loop in the worker (0-row batches
+# decremented `remaining` by 0) and increment=0 raised ZeroDivisionError
+# from numpy instead of a clear ArgumentValidationError.
+# ============================================================================
+
+# batch_size must be >= 1 — would otherwise hang the worker.
+statement error
+SELECT * FROM example.main.sequence(10, batch_size := 0);
+----
+must be >= 1
+
+# Negative batch_size is also rejected.
+statement error
+SELECT * FROM example.main.sequence(10, batch_size := -1);
+----
+must be >= 1
+
+# increment must be >= 1 — previously crashed with ZeroDivisionError.
+statement error
+SELECT * FROM example.main.sequence(5, increment := 0);
+----
+must be >= 1
+
+statement error
+SELECT * FROM example.main.sequence(5, increment := -3);
+----
+must be >= 1
+
+# Valid calls continue to work.
+query I
+SELECT COUNT(*) FROM example.main.sequence(10);
+----
+10
+
+query I
+SELECT COUNT(*) FROM example.main.sequence(20, batch_size := 5);
+----
+20
+
+query I
+SELECT COUNT(*) FROM example.main.sequence(5, batch_size := 100, increment := 10);
+----
+5
+
+# Default values still apply when args omitted.
+query I
+SELECT MAX(n) FROM example.main.sequence(5);
+----
+4
+
+statement ok
+DETACH example;

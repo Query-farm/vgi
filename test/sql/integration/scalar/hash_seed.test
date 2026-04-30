@@ -136,6 +136,32 @@ SELECT COUNT(DISTINCT example.hash_seed(7)) FROM (SELECT unnest(generate_series(
 ----
 1
 
+# ============================================================================
+# Regression: ConstParam values must be cast to the function's declared
+# argument type at bind time. Previously the C++ extension shipped the raw
+# Value through BuildArgumentsFromValues using value.type(), so a VARCHAR
+# literal in a BIGINT-declared ConstParam slot reached the worker as a
+# string and crashed compute() with "can only concatenate str (not 'int') to
+# str". hash_seed declares seed: int via ConstParam — passing '5' must
+# cast to BIGINT 5, and 'foo' must surface a clean BinderException
+# instead of crashing the worker.
+# ============================================================================
+
+query I
+SELECT example.hash_seed('5');
+----
+5
+
+query I
+SELECT example.hash_seed('42');
+----
+42
+
+statement error
+SELECT example.hash_seed('foo');
+----
+cannot cast VARCHAR to BIGINT
+
 # ----------------------------------------------------------------------------
 # Cleanup
 # ----------------------------------------------------------------------------

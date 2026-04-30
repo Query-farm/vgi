@@ -20,7 +20,7 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
 # ============================================================================
 # Function Inventory
-# 39 pure table functions + 9 table-in-out functions = 48 total table-type functions (+1 overload of an existing group = 49)
+# 40 pure table functions + 9 table-in-out functions = 49 total table-type functions (+1 overload of an existing group = 50)
 # ============================================================================
 
 # Total table-type function count (includes table-in-out)
@@ -29,9 +29,9 @@ SELECT COUNT(*)
 FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'table';
 ----
-49
+50
 
-# The 32 pure table functions (no TABLE parameter type)
+# The 33 pure table functions (no TABLE parameter type)
 # Note: make_series appears 5 times (5 overloads), make_pairs appears 3 times,
 #       repeat_value appears 2 times
 query T
@@ -40,6 +40,7 @@ FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'table'
 AND function_name IN (
     'constant_columns', 'double_sequence', 'dynamic_filter_echo', 'expression_filter_test', 'filter_echo',
+    'filter_echo_partitioned',
     'generator_exception', 'logging_generator', 'make_series',
     'make_pairs', 'order_echo', 'repeat_value',
     'named_params_echo', 'nested_sequence', 'partitioned_sequence',
@@ -53,6 +54,7 @@ double_sequence
 dynamic_filter_echo
 expression_filter_test
 filter_echo
+filter_echo_partitioned
 generator_exception
 logging_generator
 make_pairs
@@ -205,6 +207,18 @@ FROM duckdb_functions()
 WHERE database_name = 'example' AND function_name = 'partitioned_sequence';
 ----
 partitioned_sequence	[count, increment]	[BIGINT, BIGINT]	Generates a partitioned sequence for multi-worker execution
+
+# ----------------------------------------------------------------------------
+# filter_echo_partitioned — Multi-worker filter pushdown via work queue
+# Parameters: count (BIGINT)
+# ----------------------------------------------------------------------------
+
+query TTTT
+SELECT function_name, parameters, parameter_types, description
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_name = 'filter_echo_partitioned';
+----
+filter_echo_partitioned	[count]	[BIGINT]	Multi-worker partitioned sequence that echoes pushed-down filters
 
 # ----------------------------------------------------------------------------
 # projected_data — 4-column output with projection pushdown

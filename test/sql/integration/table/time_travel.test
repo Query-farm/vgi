@@ -127,3 +127,18 @@ statement error
 SELECT * FROM example.data.numbers AT (VERSION => 1);
 ----
 does not support time travel
+
+# Regression: AT (... => NULL) used to ship the literal string "NULL" to
+# the worker (Value::ToString() on a NULL Value emits the text "NULL"),
+# which the worker then tried to parse as a version and failed with
+# "invalid literal for int(): 'NULL'". The C++ extension now rejects NULL
+# at bind with a clear BinderException.
+statement error
+SELECT * FROM example.data.versioned_data AT (VERSION => NULL);
+----
+value must not be NULL
+
+statement error
+SELECT * FROM example.data.versioned_data AT (TIMESTAMP => NULL);
+----
+value must not be NULL

@@ -7,14 +7,14 @@
 #              would surface as a worker-side ValueError, not silent corruption.
 # group: [vgi_schema_reconcile]
 
-require-env VGI_SCHEMA_RECONCILE_WORKER
+require-env VGI_TEST_WORKER
 
 require vgi
 
 require httpfs
 
 statement ok
-ATTACH 'schema_reconcile' AS sr (TYPE vgi, LOCATION '${VGI_SCHEMA_RECONCILE_WORKER}');
+ATTACH 'schema_reconcile' AS sr (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
 # Topic table is exposed at sr.main.demo with a deliberately quirky schema:
 #   id        BIGINT          NOT NULL

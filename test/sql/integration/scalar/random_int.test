@@ -189,6 +189,18 @@ SELECT COUNT(*) FROM (
 5000
 
 # ============================================================================
+# Regression: random_int(0, INT64_MAX) used to crash with "ValueError:
+# high <= 0" because the fixture computed `max_val + 1` to make the range
+# inclusive — INT64_MAX + 1 wraps to a negative int64 and numpy rejects
+# negative `high`. Switched to np.random.default_rng().integers(endpoint=True).
+# ============================================================================
+
+query I
+SELECT CASE WHEN example.random_int(0::BIGINT, 9223372036854775807::BIGINT) >= 0 THEN 1 ELSE 0 END;
+----
+1
+
+# ============================================================================
 # Cleanup
 # ============================================================================
 

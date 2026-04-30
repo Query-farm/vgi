@@ -22,7 +22,7 @@ if [[ "${VGI_DEMO_STORAGE:-}" == "1" ]]; then
         --externalize-compression "$COMPRESSION" \
         > "$LOG_FILE" 2>&1 &
 else
-    uv run --project "$VGI_PYTHON_DIR" vgi-serve vgi.examples.worker:ExampleWorker \
+    uv run --project "$VGI_PYTHON_DIR" vgi-serve vgi._test_fixtures.worker:ExampleWorker \
         --http --port 0 > "$LOG_FILE" 2>&1 &
 fi
 SERVER_PID=$!

@@ -1051,9 +1051,17 @@ std::shared_ptr<arrow::RecordBatch> BuildTransactionBeginParams(const std::vecto
 
 std::shared_ptr<arrow::RecordBatch> BuildTransactionParams(
     const std::vector<uint8_t> &attach_id, const std::vector<uint8_t> &transaction_id) {
+	// transaction_id is non-nullable on the wire: catalog_transaction_commit
+	// and catalog_transaction_rollback are only invoked with a real
+	// transaction id (the framework's begin handshake already produced one).
+	// The schema registry (CatalogTransactionCommitParamsSchema in
+	// generated/vgi_protocol_schemas.hpp) declares it ``nullable=false``;
+	// mismatching it here triggered an RPC schema-validation IOException
+	// at every COMMIT for catalogs that returned
+	// ``supports_transactions=True``.
 	auto schema = arrow::schema({
 	    arrow::field("attach_id", arrow::binary(), false),
-	    arrow::field("transaction_id", arrow::binary(), true),
+	    arrow::field("transaction_id", arrow::binary(), false),
 	});
 	std::vector<std::shared_ptr<arrow::Array>> arrays;
 
@@ -1062,7 +1070,11 @@ std::shared_ptr<arrow::RecordBatch> BuildTransactionParams(
 		CheckStatus(builder.Append(attach_id.data(), attach_id.size()), "append attach_id");
 		arrays.push_back(FinishArray(builder, "attach_id"));
 	}
-	arrays.push_back(BuildBinaryScalar(transaction_id));
+	{
+		arrow::BinaryBuilder builder;
+		CheckStatus(builder.Append(transaction_id.data(), transaction_id.size()), "append transaction_id");
+		arrays.push_back(FinishArray(builder, "transaction_id"));
+	}
 
 	return arrow::RecordBatch::Make(schema, 1, arrays);
 }

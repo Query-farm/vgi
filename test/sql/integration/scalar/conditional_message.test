@@ -173,6 +173,24 @@ SELECT LENGTH(example.conditional_message(5, 'abc', true));
 15
 
 # ============================================================================
+# Regression: ConstParam type coercion. conditional_message has two
+# ConstParams (repeat_count: BIGINT, message: VARCHAR). When the user
+# passes a VARCHAR literal where BIGINT is declared, the extension must
+# cast at bind time — previously the raw VARCHAR reached the worker and
+# crashed compute() with "can't multiply sequence by non-int of type 'str'".
+# ============================================================================
+
+query I
+SELECT LENGTH(example.conditional_message('5', 'X', true));
+----
+5
+
+statement error
+SELECT example.conditional_message('foo', 'X', true);
+----
+cannot cast VARCHAR to BIGINT
+
+# ============================================================================
 # Cleanup
 # ============================================================================
 

@@ -98,7 +98,15 @@ optional_ptr<CatalogEntry> VgiTableSet::GetEntry(ClientContext &context, const E
 	}
 
 	auto at_unit = at->Unit();
-	auto at_value = at->GetValue().ToString();
+	auto at_raw = at->GetValue();
+	if (at_raw.IsNull()) {
+		// AT (... => NULL) cannot reach the worker as a meaningful version
+		// string — Value::ToString() on a NULL Value emits the literal text
+		// "NULL", which the worker then tries to parse as a version and
+		// fails with "invalid literal for int(): 'NULL'". Reject at bind.
+		throw BinderException("Time travel AT clause (%s) value must not be NULL", at_unit);
+	}
+	auto at_value = at_raw.ToString();
 
 	// Call catalog_table_get with AT params via RPC
 	auto &vgi_tx_at = VgiTransaction::Get(context, catalog_);

@@ -100,6 +100,38 @@ GROUP BY grp ORDER BY grp;
 1	1.0
 
 # ============================================================================
+# Regression: vgi_percentile previously accepted any constant for `percentile`
+# and crashed late inside finalize() with raw TypeError/ValueError when the
+# value was NULL, NaN, or out of [0, 1]. The fixture now validates the
+# constant up-front and raises a clear, descriptive error.
+# ============================================================================
+
+statement error
+SELECT vgi_percentile(i::DOUBLE, NULL) FROM range(10) t(i);
+----
+percentile must not be NULL
+
+statement error
+SELECT vgi_percentile(i::DOUBLE, 'nan'::DOUBLE) FROM range(10) t(i);
+----
+percentile must be a finite number
+
+statement error
+SELECT vgi_percentile(i::DOUBLE, 'inf'::DOUBLE) FROM range(10) t(i);
+----
+percentile must be a finite number
+
+statement error
+SELECT vgi_percentile(i::DOUBLE, -0.1) FROM range(10) t(i);
+----
+percentile must be in [0, 1]
+
+statement error
+SELECT vgi_percentile(i::DOUBLE, 1.5) FROM range(10) t(i);
+----
+percentile must be in [0, 1]
+
+# ============================================================================
 # Cleanup
 # ============================================================================
 

@@ -8,14 +8,14 @@
 #   non-zero on a topic where the worker emitted all-NULL value_schema_ids.
 # group: [vgi_integration]
 
-require-env VGI_PROJECTION_REPRO_WORKER
+require-env VGI_TEST_WORKER
 
 require vgi
 
 require httpfs
 
 statement ok
-ATTACH 'projection_repro' AS p (TYPE vgi, LOCATION '${VGI_PROJECTION_REPRO_WORKER}');
+ATTACH 'projection_repro' AS p (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
 # ---------------------------------------------------------------------------
 # Sanity — without projection, value_schema_id is all NULL (the worker's

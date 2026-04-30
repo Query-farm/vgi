@@ -330,6 +330,60 @@ SELECT example.double(x), typeof(example.double(x)) FROM (VALUES (-5), (0), (5),
 20	BIGINT
 
 # ============================================================================
+# Regression: doubling a wide decimal (or HUGEINT, which crosses the wire as
+# decimal128(38, 0)) must not blow precision. pyarrow's pc.multiply follows
+# the SQL rule decimal(p1,s1)*decimal(p2,s2) -> decimal(p1+p2+1, s1+s2), so
+# multiplying by the literal 2 (decimal128(19,0)) would have demanded
+# precision 58 — past decimal128's 38-digit cap, raising
+# "Decimal precision out of range [1, 38]: 58". The fixture now computes
+# value+value (precision +1) and casts back, so small values double cleanly.
+# ============================================================================
+
+query I
+SELECT example.double(100::HUGEINT);
+----
+200
+
+query I
+SELECT example.double(100::DECIMAL(38, 0));
+----
+200
+
+query I
+SELECT example.double(123.45::DECIMAL(20, 2));
+----
+246.90
+
+# Doubling at the precision-38 cap when the actual value would overflow the
+# capped output should raise a clear "does not fit in precision 38".
+statement error
+SELECT example.double(50000000000000000000000000000000000000::DECIMAL(38,0));
+----
+does not fit in precision 38
+
+# ============================================================================
+# Regression: temporal types (date/time/timestamp/interval) must be rejected
+# at bind time with a clear SchemaValidationError. Previously the type_bound
+# allowed them through and pc.multiply crashed inside compute() with an
+# opaque ArrowNotImplementedError ("multiply has no kernel matching ...").
+# ============================================================================
+
+statement error
+SELECT example.double(DATE '2024-01-01');
+----
+_is_multipliable_type
+
+statement error
+SELECT example.double(TIMESTAMP '2024-01-01 00:00:00');
+----
+_is_multipliable_type
+
+statement error
+SELECT example.double(INTERVAL '1' DAY);
+----
+_is_multipliable_type
+
+# ============================================================================
 # Cleanup
 # ============================================================================
 

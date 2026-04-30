@@ -17,7 +17,7 @@ LOG_FILE="/tmp/vgi-http-test-server.log"
 # Start HTTP server under coverage with auto-selected port
 cd "$VGI_PYTHON_DIR"
 uv run coverage run --parallel-mode -m vgi.serve \
-    vgi.examples.worker:ExampleWorker \
+    vgi._test_fixtures.worker:ExampleWorker \
     --http --port 0 > "$LOG_FILE" 2>&1 &
 SERVER_PID=$!
 cd - > /dev/null

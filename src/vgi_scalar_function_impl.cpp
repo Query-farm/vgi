@@ -133,6 +133,32 @@ unique_ptr<FunctionData> VgiScalarFunctionBind(ClientContext &context, ScalarFun
 				}
 				// Evaluate the foldable expression to get the constant value
 				Value val = ExpressionExecutor::EvaluateScalar(context, *expr);
+				// DuckDB's binder may not insert an implicit cast on the
+				// foldable arg expression (e.g. hash_seed('5') still has a
+				// VARCHAR literal node even though the signature is
+				// hash_seed(BIGINT)). Without an explicit cast here we ship
+				// the raw VARCHAR value and the worker crashes with a
+				// type-mismatch deep inside compute(). Cast to the function's
+				// declared positional type when concrete; ANY/INVALID stays
+				// polymorphic and we let the worker resolve it.
+				if (i < bound_function.arguments.size()) {
+					const auto &declared = bound_function.arguments[i];
+					if (declared.id() != LogicalTypeId::ANY && declared.id() != LogicalTypeId::INVALID &&
+					    val.type() != declared) {
+						string cast_error;
+						Value casted;
+						if (!val.DefaultTryCastAs(declared, casted, &cast_error)) {
+							string param_name = i < func_info.positional_names.size()
+							                        ? func_info.positional_names[i]
+							                        : "parameter " + std::to_string(i);
+							throw BinderException(
+							    "Constant argument '%s' of function '%s': cannot cast %s to %s: %s",
+							    param_name, func_info.function_name, val.type().ToString(),
+							    declared.ToString(), cast_error);
+						}
+						val = std::move(casted);
+					}
+				}
 				const_values.push_back(val);
 				const_indices.push_back(i);
 			}
