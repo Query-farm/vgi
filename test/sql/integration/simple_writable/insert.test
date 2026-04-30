@@ -1,0 +1,62 @@
+# name: test/sql/integration/simple_writable/insert.test
+# description: INSERT against the simple in-memory writable VGI fixture
+# group: [vgi_integration_simple_writable]
+
+require-env VGI_SIMPLE_WRITABLE_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'simple_writable' AS w (TYPE vgi, LOCATION '${VGI_SIMPLE_WRITABLE_WORKER}');
+
+# ============================================================================
+# Single-row INSERT (no RETURNING)
+# ============================================================================
+
+statement ok
+INSERT INTO w.main.items VALUES (1, 'foo', 10);
+
+query III
+SELECT id, name, qty FROM w.main.items ORDER BY id;
+----
+1	foo	10
+
+# ============================================================================
+# Multi-row INSERT (no RETURNING)
+# ============================================================================
+
+statement ok
+INSERT INTO w.main.items VALUES (2, 'bar', 20), (3, 'baz', 30);
+
+query III
+SELECT id, name, qty FROM w.main.items ORDER BY id;
+----
+1	foo	10
+2	bar	20
+3	baz	30
+
+# ============================================================================
+# INSERT ... SELECT
+# ============================================================================
+
+statement ok
+INSERT INTO w.main.items SELECT 100 + i, 'gen' || i::VARCHAR, i FROM range(3) t(i);
+
+query III
+SELECT id, name, qty FROM w.main.items WHERE id >= 100 ORDER BY id;
+----
+100	gen0	0
+101	gen1	1
+102	gen2	2
+
+# ============================================================================
+# INSERT with NULL values
+# ============================================================================
+
+statement ok
+INSERT INTO w.main.items VALUES (NULL, NULL, NULL);
+
+query I
+SELECT COUNT(*) FILTER (WHERE id IS NULL AND name IS NULL AND qty IS NULL) FROM w.main.items;
+----
+1

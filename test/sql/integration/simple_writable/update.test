@@ -1,0 +1,76 @@
+# name: test/sql/integration/simple_writable/update.test
+# description: UPDATE (with and without RETURNING) against the simple writable fixture
+# group: [vgi_integration_simple_writable]
+
+require-env VGI_SIMPLE_WRITABLE_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'simple_writable' AS w (TYPE vgi, LOCATION '${VGI_SIMPLE_WRITABLE_WORKER}');
+
+statement ok
+INSERT INTO w.main.items VALUES (1, 'a', 10), (2, 'b', 20), (3, 'c', 30);
+
+# ============================================================================
+# UPDATE without RETURNING
+# ============================================================================
+
+statement ok
+UPDATE w.main.items SET qty = qty + 1 WHERE id = 1;
+
+query III
+SELECT id, name, qty FROM w.main.items ORDER BY id;
+----
+1	a	11
+2	b	20
+3	c	30
+
+# ============================================================================
+# UPDATE ... RETURNING
+# ============================================================================
+
+query II
+UPDATE w.main.items SET qty = qty * 10 WHERE id < 3 RETURNING id, qty;
+----
+1	110
+2	200
+
+# ============================================================================
+# UPDATE ... RETURNING * — all user columns of the updated row
+# ============================================================================
+
+query III
+UPDATE w.main.items SET name = 'updated' WHERE id = 3 RETURNING *;
+----
+3	updated	30
+
+# ============================================================================
+# supports_returning=False — UPDATE ... RETURNING must be rejected
+# ============================================================================
+
+statement ok
+INSERT INTO w.main.items_no_returning VALUES (10, 'x', 100);
+
+statement error
+UPDATE w.main.items_no_returning SET qty = 1 WHERE id = 10 RETURNING *;
+----
+does not support RETURNING on UPDATE
+
+# Without RETURNING the UPDATE goes through.
+statement ok
+UPDATE w.main.items_no_returning SET qty = 1 WHERE id = 10;
+
+query III
+SELECT id, name, qty FROM w.main.items_no_returning WHERE id = 10;
+----
+10	x	1
+
+# ============================================================================
+# UPDATE on a table that doesn't support UPDATE
+# ============================================================================
+
+statement error
+UPDATE w.main.items_insert_only SET name = 'x' WHERE id = 1;
+----
+does not support UPDATE

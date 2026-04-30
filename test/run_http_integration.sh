@@ -22,8 +22,8 @@ if [[ "${VGI_DEMO_STORAGE:-}" == "1" ]]; then
         --externalize-compression "$COMPRESSION" \
         > "$LOG_FILE" 2>&1 &
 else
-    uv run --project "$VGI_PYTHON_DIR" vgi-serve vgi._test_fixtures.worker:ExampleWorker \
-        --http --port 0 > "$LOG_FILE" 2>&1 &
+    uv run --project "$VGI_PYTHON_DIR" vgi-fixture-http \
+        --port 0 > "$LOG_FILE" 2>&1 &
 fi
 SERVER_PID=$!
 
@@ -58,4 +58,4 @@ echo "HTTP server running on port $PORT (pid $SERVER_PID)"
 
 # Run tests
 VGI_TEST_WORKER="http://localhost:$PORT" \
-    ./build/$BUILD_DIR/test/unittest "$FILTER" "$@"
+    ./build/$BUILD_DIR/test/unittest -j8 "$FILTER" "$@"

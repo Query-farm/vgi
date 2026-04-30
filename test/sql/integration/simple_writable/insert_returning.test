@@ -1,0 +1,79 @@
+# name: test/sql/integration/simple_writable/insert_returning.test
+# description: INSERT ... RETURNING against the simple writable fixture
+# group: [vgi_integration_simple_writable]
+
+require-env VGI_SIMPLE_WRITABLE_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'simple_writable' AS w (TYPE vgi, LOCATION '${VGI_SIMPLE_WRITABLE_WORKER}');
+
+# ============================================================================
+# Single-row INSERT ... RETURNING
+# ============================================================================
+
+query II
+INSERT INTO w.main.items VALUES (1, 'foo', 10) RETURNING id, name;
+----
+1	foo
+
+# ============================================================================
+# RETURNING * (all user columns)
+# ============================================================================
+
+query III
+INSERT INTO w.main.items VALUES (2, 'bar', 20) RETURNING *;
+----
+2	bar	20
+
+# ============================================================================
+# Multi-row INSERT ... RETURNING
+# ============================================================================
+
+query III
+INSERT INTO w.main.items VALUES (3, 'a', 30), (4, 'b', 40), (5, 'c', 50) RETURNING id, name, qty;
+----
+3	a	30
+4	b	40
+5	c	50
+
+# ============================================================================
+# INSERT ... SELECT with RETURNING
+# ============================================================================
+
+query I rowsort
+INSERT INTO w.main.items SELECT 100 + i, 'gen' || i::VARCHAR, i FROM range(5) t(i) RETURNING id;
+----
+100
+101
+102
+103
+104
+
+# ============================================================================
+# RETURNING expressions (column projection + computed values)
+# ============================================================================
+
+query II
+INSERT INTO w.main.items VALUES (200, 'z', 99) RETURNING id + 1, upper(name);
+----
+201	Z
+
+# ============================================================================
+# supports_returning=False — INSERT ... RETURNING must be rejected at plan time
+# ============================================================================
+
+statement error
+INSERT INTO w.main.items_no_returning VALUES (1, 'a', 10) RETURNING *;
+----
+does not support RETURNING on INSERT
+
+# Without RETURNING, INSERT into the same table works.
+statement ok
+INSERT INTO w.main.items_no_returning VALUES (1, 'a', 10);
+
+query III
+SELECT id, name, qty FROM w.main.items_no_returning ORDER BY id;
+----
+1	a	10

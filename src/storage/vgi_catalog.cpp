@@ -97,6 +97,9 @@ PhysicalOperator &VgiCatalog::PlanInsert(ClientContext &context, PhysicalPlanGen
 	if (!table.GetTableInfo().supports_insert) {
 		throw BinderException("Table '%s' does not support INSERT", table.name);
 	}
+	if (op.return_chunk && !table.GetTableInfo().supports_returning) {
+		throw BinderException("Table '%s' does not support RETURNING on INSERT", table.name);
+	}
 	// Use DuckDB's built-in default resolution: insert a PhysicalProjection child
 	// that evaluates default expressions for omitted columns. This means Sink
 	// always receives full-width rows with defaults already filled in.
@@ -117,6 +120,9 @@ PhysicalOperator &VgiCatalog::PlanDelete(ClientContext &context, PhysicalPlanGen
 	if (!table.GetTableInfo().supports_delete) {
 		throw BinderException("Table '%s' does not support DELETE", table.name);
 	}
+	if (op.return_chunk && !table.GetTableInfo().supports_returning) {
+		throw BinderException("Table '%s' does not support RETURNING on DELETE", table.name);
+	}
 	auto &bound_ref = op.expressions[0]->Cast<BoundReferenceExpression>();
 	auto &del = planner.Make<VgiPhysicalDelete>(op, table, op.return_chunk, bound_ref.index);
 	del.children.push_back(plan);
@@ -128,6 +134,9 @@ PhysicalOperator &VgiCatalog::PlanUpdate(ClientContext &context, PhysicalPlanGen
 	auto &table = op.table.Cast<VgiTableEntry>();
 	if (!table.GetTableInfo().supports_update) {
 		throw BinderException("Table '%s' does not support UPDATE", table.name);
+	}
+	if (op.return_chunk && !table.GetTableInfo().supports_returning) {
+		throw BinderException("Table '%s' does not support RETURNING on UPDATE", table.name);
 	}
 	auto &upd = planner.Make<VgiPhysicalUpdate>(op, table, op.return_chunk);
 	upd.children.push_back(plan);
@@ -197,6 +206,11 @@ static unique_ptr<MergeIntoOperator> VgiPlanMergeIntoAction(ClientContext &conte
 
 PhysicalOperator &VgiCatalog::PlanMergeInto(ClientContext &context, PhysicalPlanGenerator &planner,
                                              LogicalMergeInto &op, PhysicalOperator &plan) {
+	auto &table_for_returning = op.table.Cast<VgiTableEntry>();
+	if (op.return_chunk && !table_for_returning.GetTableInfo().supports_returning) {
+		throw BinderException("Table '%s' does not support RETURNING on MERGE",
+		                      table_for_returning.name);
+	}
 	map<MergeActionCondition, vector<unique_ptr<MergeIntoOperator>>> actions;
 
 	idx_t append_count = 0;

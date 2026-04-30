@@ -1,0 +1,57 @@
+# name: test/sql/integration/simple_writable/returning_validation.test
+# description: Worker that lies about RETURNING shape gets a clean IOException, not SIGSEGV
+# group: [vgi_integration_simple_writable]
+
+require-env VGI_SIMPLE_WRITABLE_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'simple_writable' AS w (TYPE vgi, LOCATION '${VGI_SIMPLE_WRITABLE_WORKER}');
+
+# items_broken_returning: catalog advertises supports_returning=true, but the
+# insert function always emits a (count BIGINT) batch — the same shape that
+# triggered the SIGSEGV in the kafka topics-insert path. The C++ extension
+# should now reject that batch with an IOException at runtime instead of
+# walking off the end of ArrowToDuckDB's column metadata.
+
+# ============================================================================
+# Without RETURNING — count surface is fine.
+# ============================================================================
+
+statement ok
+INSERT INTO w.main.items_broken_returning VALUES (1, 'a');
+
+query II
+SELECT id, name FROM w.main.items_broken_returning ORDER BY id;
+----
+1	a
+
+# ============================================================================
+# With RETURNING — runtime validator catches the mismatched batch.
+# ============================================================================
+
+statement error
+INSERT INTO w.main.items_broken_returning VALUES (2, 'b') RETURNING *;
+----
+incompatible RETURNING batch
+
+statement error
+INSERT INTO w.main.items_broken_returning VALUES (3, 'c') RETURNING id;
+----
+incompatible RETURNING batch
+
+# Failure must not poison the connection — subsequent non-RETURNING inserts
+# continue to work. (The broken function still wrote rows 2 and 3 to the
+# SQLite store before the C++ validator caught the mismatch — this fixture
+# explicitly disregards transactional rules so the rows are visible here.)
+statement ok
+INSERT INTO w.main.items_broken_returning VALUES (4, 'd');
+
+query II
+SELECT id, name FROM w.main.items_broken_returning ORDER BY id;
+----
+1	a
+2	b
+3	c
+4	d

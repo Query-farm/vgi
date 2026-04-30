@@ -40,6 +40,14 @@ struct VgiWriteGlobalState : public GlobalSinkState {
 	// Arrow schema for converting DuckDB DataChunks → Arrow batches (input to worker)
 	std::shared_ptr<arrow::Schema> send_schema;
 
+	// Expected schema for RETURNING-mode response batches (table user-column
+	// schema, sans rowid). Sink validates each non-empty worker response against
+	// this before handing it to ArrowToDuckDB — a worker that emits a count
+	// batch instead of the table-row schema would otherwise read past the end
+	// of the conversion column metadata and crash.
+	// Only set when return_chunk is true.
+	std::shared_ptr<arrow::Schema> expected_returning_schema;
+
 	// True if the write function declared has_finalize=true on its catalog
 	// metadata. When set, ``FinalizeWriteConnection`` invokes
 	// ``PerformFinalizeInit`` so the worker's ``cls.finalize(params)``

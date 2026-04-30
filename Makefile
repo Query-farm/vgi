@@ -19,6 +19,12 @@ VGI_VERSIONED_WORKER ?= uv run --project $(HOME)/Development/vgi-python vgi-exam
 VGI_VERSIONED_TABLES_WORKER ?= uv run --project $(HOME)/Development/vgi-python vgi-example-versioned-tables-worker
 VGI_ATTACH_OPTIONS_WORKER ?= uv run --project $(HOME)/Development/vgi-python vgi-example-attach-options-worker
 
+# Minimal SQLite-backed writable fixture: exercises the INSERT/UPDATE/DELETE wire
+# path without requiring duckdb-python's subcursor() (which the production
+# writable fixture uses). Skips real transactional semantics; tests under
+# test/sql/integration/simple_writable/ assume that.
+VGI_SIMPLE_WRITABLE_WORKER ?= uv run --project $(HOME)/Development/vgi-python vgi-fixture-simple-writable-worker
+
 # The schema_reconcile and projection_pushdown_repro fixtures are now
 # hosted inside vgi-fixture-worker (VGI_TEST_WORKER) — no separate worker
 # binaries are needed.
@@ -30,7 +36,9 @@ VGI_ATTACH_OPTIONS_WORKER ?= uv run --project $(HOME)/Development/vgi-python vgi
 .PHONY: test_subprocess test_subprocess_debug test_http test_http_debug \
 	test_http_versioned_tables test_http_versioned_tables_debug \
 	test_http_attach_options test_http_attach_options_debug \
-	test_writable test_writable_debug test_all test_all_debug
+	test_writable test_writable_debug \
+	test_simple_writable test_simple_writable_debug \
+	test_all test_all_debug
 
 test_subprocess:
 	VGI_TRANSACTOR_DB_DIR="$$(mktemp -d)" \
@@ -38,8 +46,9 @@ test_subprocess:
 	VGI_VERSIONED_WORKER="$(VGI_VERSIONED_WORKER)" \
 	VGI_VERSIONED_TABLES_WORKER="$(VGI_VERSIONED_TABLES_WORKER)" \
 	VGI_ATTACH_OPTIONS_WORKER="$(VGI_ATTACH_OPTIONS_WORKER)" \
+	VGI_SIMPLE_WRITABLE_WORKER="$(VGI_SIMPLE_WRITABLE_WORKER)" \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
-	./build/release/test/unittest "test/*" "~test/sql/integration/writable/*"
+	./build/release/test/unittest -j 8 "test/*" "~test/sql/integration/writable/*"
 
 test_subprocess_debug:
 	VGI_TRANSACTOR_DB_DIR="$$(mktemp -d)" \
@@ -47,8 +56,9 @@ test_subprocess_debug:
 	VGI_VERSIONED_WORKER="$(VGI_VERSIONED_WORKER)" \
 	VGI_VERSIONED_TABLES_WORKER="$(VGI_VERSIONED_TABLES_WORKER)" \
 	VGI_ATTACH_OPTIONS_WORKER="$(VGI_ATTACH_OPTIONS_WORKER)" \
+	VGI_SIMPLE_WRITABLE_WORKER="$(VGI_SIMPLE_WRITABLE_WORKER)" \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
-	./build/debug/test/unittest "test/*" "~test/sql/integration/writable/*"
+	./build/debug/test/unittest -j 8 "test/*" "~test/sql/integration/writable/*"
 
 # HTTP transport tests (uses test/run_http_integration.sh)
 test_http:
@@ -87,6 +97,15 @@ test_writable:
 
 test_writable_debug:
 	VGI_TRANSACTOR_DB_DIR="$$(mktemp -d)" VGI_TEST_WORKER="$(VGI_TEST_WORKER)" ./build/debug/test/unittest "test/sql/integration/writable/*"
+
+# Minimal-writable tests run by default through test_subprocess (the env var is
+# already wired there); this target is for running just the simple-writable
+# sqllogictests in isolation.
+test_simple_writable:
+	VGI_SIMPLE_WRITABLE_WORKER="$(VGI_SIMPLE_WRITABLE_WORKER)" ./build/release/test/unittest "test/sql/integration/simple_writable/*"
+
+test_simple_writable_debug:
+	VGI_SIMPLE_WRITABLE_WORKER="$(VGI_SIMPLE_WRITABLE_WORKER)" ./build/debug/test/unittest "test/sql/integration/simple_writable/*"
 
 # Run all transports
 test_all: test_subprocess test_http test_http_bearer test_http_versioned_tables test_http_attach_options

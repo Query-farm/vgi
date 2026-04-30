@@ -136,6 +136,48 @@ static std::unique_ptr<IFunctionConnection> SetupWriteConnection(ClientContext &
 	return connection;
 }
 
+// Helper: Validate that a worker-emitted RETURNING batch matches the table's
+// user-column schema. Without this, a worker that mistakenly emits a
+// (count BIGINT) batch (or any wrong shape) for a RETURNING write triggers
+// a SIGSEGV inside ArrowTableFunction::ArrowToDuckDB — that converter
+// dereferences ArrowTableSchema metadata for each input column position and
+// trusts the caller to have aligned the schema.
+//
+// We compare field count + per-field name + type. Nullability is intentionally
+// ignored because DuckDB's Arrow exporter forces nullable=true on every field.
+static void ValidateReturningSchema(const std::shared_ptr<arrow::Schema> &expected,
+                                     const std::shared_ptr<arrow::Schema> &actual,
+                                     const string &op_name, const string &table_name) {
+	if (!expected) {
+		throw InternalException("ValidateReturningSchema called without expected schema (op=%s table=%s)",
+		                        op_name, table_name);
+	}
+	auto fail = [&](const string &reason) {
+		throw IOException(
+		    "VGI worker emitted an incompatible RETURNING batch for %s on table '%s': %s. "
+		    "Expected schema: %s. Actual schema: %s. "
+		    "If this worker doesn't support RETURNING, advertise supports_returning=false on the table.",
+		    op_name, table_name, reason, expected->ToString(), actual ? actual->ToString() : "<null>");
+	};
+	if (!actual) {
+		fail("response had no schema");
+	}
+	if (expected->num_fields() != actual->num_fields()) {
+		fail(StringUtil::Format("expected %d field(s), got %d", expected->num_fields(), actual->num_fields()));
+	}
+	for (int i = 0; i < expected->num_fields(); i++) {
+		auto &ef = expected->field(i);
+		auto &af = actual->field(i);
+		if (ef->name() != af->name()) {
+			fail(StringUtil::Format("field %d name mismatch (expected '%s', got '%s')", i, ef->name(), af->name()));
+		}
+		if (!ef->type()->Equals(*af->type())) {
+			fail(StringUtil::Format("field '%s' type mismatch (expected %s, got %s)", ef->name(),
+			                        ef->type()->ToString(), af->type()->ToString()));
+		}
+	}
+}
+
 // Helper: Read the count from a response batch (count column)
 static idx_t ReadCountFromBatch(const std::shared_ptr<arrow::RecordBatch> &batch) {
 	if (!batch || batch->num_rows() == 0) {
@@ -306,6 +348,11 @@ unique_ptr<GlobalSinkState> VgiPhysicalInsert::GetGlobalSinkState(ClientContext 
 
 	auto gstate = make_uniq<VgiWriteGlobalState>(context, GetTypes(), return_chunk);
 	gstate->send_schema = input_schema;
+	if (return_chunk) {
+		// RETURNING expects the worker to emit batches with the table's
+		// user-column schema (sans rowid). Same shape used by GetLocalSinkState.
+		gstate->expected_returning_schema = input_schema;
+	}
 	gstate->has_finalize =
 	    WriteFunctionHasFinalize(context, table->GetCatalog(), table->GetTableInfo().schema_name,
 	                             write_func.function_name);
@@ -355,6 +402,9 @@ SinkResultType VgiPhysicalInsert::Sink(ExecutionContext &context, DataChunk &chu
 				// For DO NOTHING, response may have fewer rows than input (conflicts skipped)
 				D_ASSERT(NumericCast<idx_t>(response->num_rows()) <= chunk.size());
 				D_ASSERT(NumericCast<idx_t>(response->num_rows()) <= STANDARD_VECTOR_SIZE);
+
+				ValidateReturningSchema(gstate.expected_returning_schema, response->schema(), "INSERT",
+				                         insert_table ? insert_table->name : create_info->base->Cast<CreateTableInfo>().table);
 
 				auto &lstate = input.local_state.Cast<VgiWriteLocalSinkState>();
 
@@ -438,6 +488,17 @@ unique_ptr<GlobalSinkState> VgiPhysicalDelete::GetGlobalSinkState(ClientContext 
 
 	auto gstate = make_uniq<VgiWriteGlobalState>(context, GetTypes(), return_chunk);
 	gstate->send_schema = input_schema;
+	if (return_chunk) {
+		// DELETE RETURNING surfaces the deleted rows in the table's user-column
+		// schema (sans rowid). Same shape used by GetLocalSinkState below.
+		auto response_schema = table_info.arrow_schema;
+		if (table_info.row_id_column >= 0) {
+			auto fields = response_schema->fields();
+			fields.erase(fields.begin() + table_info.row_id_column);
+			response_schema = arrow::schema(fields);
+		}
+		gstate->expected_returning_schema = response_schema;
+	}
 	gstate->has_finalize = WriteFunctionHasFinalize(context, table.GetCatalog(),
 	                                                 table.GetTableInfo().schema_name,
 	                                                 write_func.function_name);
@@ -475,6 +536,7 @@ SinkResultType VgiPhysicalDelete::Sink(ExecutionContext &context, DataChunk &chu
 		auto response = gstate.connection->ReadDataBatch();
 		if (response && response->num_rows() > 0) {
 			if (gstate.return_chunk) {
+				ValidateReturningSchema(gstate.expected_returning_schema, response->schema(), "DELETE", table.name);
 				auto &lstate = input.local_state.Cast<VgiWriteLocalSinkState>();
 				LoadResponseBatch(lstate.arrow_state, response);
 				lstate.returning_chunk.Reset();
@@ -577,6 +639,17 @@ unique_ptr<GlobalSinkState> VgiPhysicalUpdate::GetGlobalSinkState(ClientContext 
 
 	auto gstate = make_uniq<VgiWriteGlobalState>(context, GetTypes(), return_chunk);
 	gstate->send_schema = input_schema;
+	if (return_chunk) {
+		// UPDATE RETURNING surfaces the updated rows in the table's user-column
+		// schema (sans rowid). Same shape used by GetLocalSinkState below.
+		auto response_schema = table_info.arrow_schema;
+		if (table_info.row_id_column >= 0) {
+			auto fields = response_schema->fields();
+			fields.erase(fields.begin() + table_info.row_id_column);
+			response_schema = arrow::schema(fields);
+		}
+		gstate->expected_returning_schema = response_schema;
+	}
 	gstate->has_finalize = WriteFunctionHasFinalize(context, table.GetCatalog(),
 	                                                 table.GetTableInfo().schema_name,
 	                                                 write_func.function_name);
@@ -626,6 +699,7 @@ SinkResultType VgiPhysicalUpdate::Sink(ExecutionContext &context, DataChunk &chu
 		auto response = gstate.connection->ReadDataBatch();
 		if (response && response->num_rows() > 0) {
 			if (gstate.return_chunk) {
+				ValidateReturningSchema(gstate.expected_returning_schema, response->schema(), "UPDATE", table.name);
 				auto &lstate = input.local_state.Cast<VgiWriteLocalSinkState>();
 				LoadResponseBatch(lstate.arrow_state, response);
 				lstate.returning_chunk.Reset();

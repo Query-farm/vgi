@@ -1,0 +1,86 @@
+# name: test/sql/integration/simple_writable/delete.test
+# description: DELETE (with and without RETURNING) against the simple writable fixture
+# group: [vgi_integration_simple_writable]
+
+require-env VGI_SIMPLE_WRITABLE_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'simple_writable' AS w (TYPE vgi, LOCATION '${VGI_SIMPLE_WRITABLE_WORKER}');
+
+statement ok
+INSERT INTO w.main.items VALUES (1, 'a', 10), (2, 'b', 20), (3, 'c', 30), (4, 'd', 40);
+
+# ============================================================================
+# DELETE without RETURNING
+# ============================================================================
+
+statement ok
+DELETE FROM w.main.items WHERE id = 1;
+
+query III
+SELECT id, name, qty FROM w.main.items ORDER BY id;
+----
+2	b	20
+3	c	30
+4	d	40
+
+# ============================================================================
+# DELETE ... RETURNING
+# ============================================================================
+
+query I rowsort
+DELETE FROM w.main.items WHERE id IN (2, 3) RETURNING id;
+----
+2
+3
+
+query III
+SELECT id, name, qty FROM w.main.items ORDER BY id;
+----
+4	d	40
+
+# ============================================================================
+# DELETE ... RETURNING *
+# ============================================================================
+
+query III
+DELETE FROM w.main.items WHERE id = 4 RETURNING *;
+----
+4	d	40
+
+query I
+SELECT COUNT(*) FROM w.main.items;
+----
+0
+
+# ============================================================================
+# supports_returning=False — DELETE ... RETURNING must be rejected
+# ============================================================================
+
+statement ok
+INSERT INTO w.main.items_no_returning VALUES (10, 'x', 100), (11, 'y', 200);
+
+statement error
+DELETE FROM w.main.items_no_returning WHERE id = 10 RETURNING *;
+----
+does not support RETURNING on DELETE
+
+# Without RETURNING the DELETE goes through.
+statement ok
+DELETE FROM w.main.items_no_returning WHERE id = 10;
+
+query III
+SELECT id, name, qty FROM w.main.items_no_returning ORDER BY id;
+----
+11	y	200
+
+# ============================================================================
+# DELETE on a table that doesn't support DELETE
+# ============================================================================
+
+statement error
+DELETE FROM w.main.items_insert_only WHERE id = 1;
+----
+does not support DELETE

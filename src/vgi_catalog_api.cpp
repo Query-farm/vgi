@@ -1500,6 +1500,10 @@ VgiTableInfo ParseTableInfo(const std::shared_ptr<arrow::RecordBatch> &batch, in
 	info.supports_insert = row["supports_insert"].value_or(false);
 	info.supports_update = row["supports_update"].value_or(false);
 	info.supports_delete = row["supports_delete"].value_or(false);
+	// Workers must opt in: defaults to false so a worker that supports
+	// INSERT/UPDATE/DELETE but never wired up RETURNING handling doesn't get
+	// surprised by a planner that sends RETURNING through.
+	info.supports_returning = row["supports_returning"].value_or(false);
 
 	// Parse column statistics capability flag (backward-compatible)
 	info.supports_column_statistics = row["supports_column_statistics"].value_or(false);
