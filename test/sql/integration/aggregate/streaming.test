@@ -1,0 +1,184 @@
+# name: test/sql/integration/aggregate/streaming.test
+# description: VGI streaming-partitioned aggregate (aggregate_streaming_open / _chunk / _close)
+# group: [vgi_integration_aggregate]
+#
+# Exercises the streaming-partitioned protocol via vgi_streaming_sum
+# (defined in vgi-python's _test_fixtures/aggregate/streaming.py).
+#
+# When the optimizer rule replaces a LogicalWindow with the custom
+# LogicalVgiStreamingWindow, the operator pipes input chunks straight to
+# the worker via streaming_chunk RPCs — no DuckDB-side partition
+# materialisation. State lives on the worker, bounded by partitions ×
+# per-partition state, not by row count.
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+USE example;
+
+# ============================================================================
+# Cumulative running sum via OVER (PARTITION BY ... ORDER BY ...)
+# Eligible for the streaming path: cumulative frame, no EXCLUDE/DISTINCT/FILTER.
+# ============================================================================
+
+query III
+SELECT k, x, vgi_streaming_sum(x) OVER (PARTITION BY k ORDER BY x) AS running
+FROM (VALUES
+  ('a', 1), ('a', 2), ('a', 3),
+  ('b', 10), ('b', 20), ('b', 30)
+) t(k, x)
+ORDER BY k, x;
+----
+a	1	1
+a	2	3
+a	3	6
+b	10	10
+b	20	30
+b	30	60
+
+# Cross-check: agreed with DuckDB's built-in sum() OVER (...) on the same query
+query IIII
+SELECT k, x,
+       vgi_streaming_sum(x::BIGINT) OVER (PARTITION BY k ORDER BY x) AS vgi_running,
+       sum(x::BIGINT)                OVER (PARTITION BY k ORDER BY x) AS builtin_running
+FROM (VALUES
+  ('a', 1), ('a', 2), ('a', 3),
+  ('b', 10), ('b', 20), ('b', 30)
+) t(k, x)
+ORDER BY k, x;
+----
+a	1	1	1
+a	2	3	3
+a	3	6	6
+b	10	10	10
+b	20	30	30
+b	30	60	60
+
+# ============================================================================
+# Carry-forward across partition rows (the running sum's whole point):
+# the value at row N reflects ALL prior rows in the partition, including
+# rows in earlier chunks the operator shipped via streaming_chunk.
+# ============================================================================
+
+query II
+SELECT idx, vgi_streaming_sum(idx) OVER (ORDER BY idx) AS running
+FROM range(1, 6) t(idx)
+ORDER BY idx;
+----
+1	1
+2	3
+3	6
+4	10
+5	15
+
+# Multiple partitions interleaved — exercises the worker's hash-map of
+# concurrent partition states. Each partition's running sum is independent.
+query III
+SELECT k, x,
+       vgi_streaming_sum(x::BIGINT) OVER (PARTITION BY k ORDER BY x) AS running
+FROM (VALUES
+  ('a', 1), ('b', 10), ('a', 2), ('b', 20), ('a', 3), ('b', 30)
+) t(k, x)
+ORDER BY k, x;
+----
+a	1	1
+a	2	3
+a	3	6
+b	10	10
+b	20	30
+b	30	60
+
+# ============================================================================
+# Multiple streaming-eligible window expressions in a single SELECT — both
+# get their own session ship into the same operator, results joined column-wise.
+# ============================================================================
+
+query IIII
+SELECT k, x,
+       vgi_streaming_sum(x::BIGINT) OVER (PARTITION BY k ORDER BY x) AS s1,
+       vgi_streaming_sum(x::BIGINT) OVER (PARTITION BY k ORDER BY x) AS s2
+FROM (VALUES ('a', 1), ('a', 2), ('a', 3)) t(k, x)
+ORDER BY k, x;
+----
+a	1	1	1
+a	2	3	3
+a	3	6	6
+
+# ============================================================================
+# Same function in a plain GROUP BY query — falls through to the
+# update/combine/finalize path, NOT the streaming path. The fixture
+# implements both, so the function works in both shapes.
+# ============================================================================
+
+query II
+SELECT k, vgi_streaming_sum(x) AS total
+FROM (VALUES
+  ('a', 1), ('a', 2), ('a', 3),
+  ('b', 10), ('b', 20), ('b', 30)
+) t(k, x)
+GROUP BY k
+ORDER BY k;
+----
+a	6
+b	60
+
+# ============================================================================
+# Disable the streaming optimizer rule and confirm the same query still
+# runs correctly via the standard windowed path. Output must match.
+# ============================================================================
+
+statement ok
+SET vgi_streaming_window = false;
+
+query III
+SELECT k, x, vgi_streaming_sum(x) OVER (PARTITION BY k ORDER BY x) AS running
+FROM (VALUES
+  ('a', 1), ('a', 2), ('a', 3),
+  ('b', 10), ('b', 20), ('b', 30)
+) t(k, x)
+ORDER BY k, x;
+----
+a	1	1
+a	2	3
+a	3	6
+b	10	10
+b	20	30
+b	30	60
+
+statement ok
+SET vgi_streaming_window = true;
+
+# ============================================================================
+# Ineligibility fallthrough — these query shapes don't match the streaming
+# operator's eligibility rules, so the optimizer must leave them as
+# LogicalWindow → PhysicalWindow. Function must still be invocable.
+# ============================================================================
+
+# Sliding frame (ROWS BETWEEN N PRECEDING AND M FOLLOWING) — not cumulative.
+# Ineligible; falls back to standard windowed path. The fixture's
+# update/combine/finalize is used by the segment tree.
+query II
+SELECT x, vgi_streaming_sum(x) OVER (
+  ORDER BY x ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING
+) AS rolling
+FROM (VALUES (1), (2), (3), (4), (5)) t(x)
+ORDER BY x;
+----
+1	3
+2	6
+3	9
+4	12
+5	9
+
+# Plan check (manual): for the eligible query above, EXPLAIN should show
+# VGI_STREAMING_WINDOW in the operator tree; for the sliding-frame query
+# it should show WINDOW. Run interactively to verify:
+#
+#   EXPLAIN SELECT x, vgi_streaming_sum(x) OVER (PARTITION BY x % 2 ORDER BY x) FROM range(10) t(x);
