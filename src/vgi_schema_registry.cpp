@@ -245,8 +245,10 @@ std::string DiffSchemas(const arrow::Schema &expected, const arrow::Schema &actu
 	const auto nA = actual.num_fields();
 	if (nE != nA) {
 		out << "  (field count differs: expected " << nE << ", actual " << nA << ")\n"
-		    << "  expected schema: " << expected.ToString() << "\n"
-		    << "  actual schema:   " << actual.ToString();
+		    << "  expected schema:\n"
+		    << expected.ToString() << "\n"
+		    << "  actual schema:\n"
+		    << actual.ToString() << "\n";
 		return out.str();
 	}
 	for (int i = 0; i < nE; i++) {
@@ -294,8 +296,8 @@ void ValidateResponseSchema(const std::shared_ptr<arrow::RecordBatch> &batch, co
 		                  method_name, entry->schema->ToString(), worker_path);
 	}
 	if (!batch->schema()->Equals(*entry->schema, /*check_metadata=*/false)) {
-		throw IOException("RPC response schema mismatch for '%s' [worker: %s]\n%s"
-		                  "This usually indicates the worker returned an out-of-date response shape.",
+		throw IOException("Worker returned an out-of-date Apache Arrow schema. "
+		                  "RPC response schema mismatch for '%s' [worker: %s]\n%s",
 		                  method_name, worker_path, DiffSchemas(*entry->schema, *batch->schema()));
 	}
 }
@@ -333,9 +335,8 @@ void ValidateRequestSchema(const std::shared_ptr<arrow::RecordBatch> &batch, con
 		                  method_name, expected.ToString(), worker_path);
 	}
 	if (!batch->schema()->Equals(expected, /*check_metadata=*/false)) {
-		throw IOException("RPC request schema mismatch for '%s' [worker: %s]\n%s"
-		                  "This usually indicates a bug in the C++ request builder — the outgoing "
-		                  "params batch doesn't match vgi-python's Protocol.",
+		throw IOException("Outgoing request batch does not match the wire contract — likely a bug in the "
+		                  "C++ request builder. RPC request schema mismatch for '%s' [worker: %s]\n%s",
 		                  method_name, worker_path, DiffSchemas(expected, *batch->schema()));
 	}
 }
@@ -353,8 +354,8 @@ void ValidateItemSchema(const std::shared_ptr<arrow::RecordBatch> &item_batch, c
 		                  worker_path);
 	}
 	if (!item_batch->schema()->Equals(*entry->item_schema, /*check_metadata=*/false)) {
-		throw IOException("RPC item schema mismatch for '%s' item[%llu] [worker: %s]\n%s"
-		                  "This usually indicates the worker returned an out-of-date info shape.",
+		throw IOException("Worker returned an out-of-date Apache Arrow schema. "
+		                  "RPC item schema mismatch for '%s' item[%llu] [worker: %s]\n%s",
 		                  method_name, (unsigned long long)item_index, worker_path,
 		                  DiffSchemas(*entry->item_schema, *item_batch->schema()));
 	}
