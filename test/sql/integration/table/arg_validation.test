@@ -64,5 +64,35 @@ SELECT MAX(n) FROM example.main.sequence(5);
 ----
 4
 
+# ============================================================================
+# Regression: SQL NULL passed to a non-Optional Arg must surface as a clean
+# ArgumentValidationError. Previously NULL silently propagated past validation
+# and crashed in user process()/update() with an opaque Python TypeError
+# (e.g. "'<=' not supported between instances of NoneType and int") that
+# surfaced in the C++ extension as a generic worker exception.
+# ============================================================================
+
+# NULL as positional arg — rejected with structured error.
+statement error
+SELECT * FROM example.main.sequence(NULL);
+----
+cannot be NULL
+
+statement error
+SELECT * FROM example.main.sequence(NULL::BIGINT);
+----
+cannot be NULL
+
+# NULL as named arg — same behavior, both for constrained and unconstrained args.
+statement error
+SELECT * FROM example.main.sequence(5, batch_size := NULL);
+----
+cannot be NULL
+
+statement error
+SELECT * FROM example.main.sequence(5, increment := NULL);
+----
+cannot be NULL
+
 statement ok
 DETACH example;

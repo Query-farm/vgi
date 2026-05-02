@@ -168,13 +168,14 @@ SELECT n, (SELECT vgi_count() FROM sequence(3)) AS c FROM sequence(3) ORDER BY n
 2	3
 
 # Correlated scalar subquery with VGI aggregate: sum of sequence values up to
-# the outer t.x. The subquery is invoked once per outer row.
+# the outer t.x. The subquery is invoked once per outer row. For t.x=0 the
+# subquery sees one row (s.n=0), so vgi_sum returns 0 (matching built-in sum).
 query II
 SELECT t.x, (SELECT vgi_sum(s.n) FROM sequence(5) s WHERE s.n <= t.x) AS partial_sum
 FROM (VALUES (0::BIGINT), (2::BIGINT), (4::BIGINT)) t(x)
 ORDER BY t.x;
 ----
-0	NULL
+0	0
 2	3
 4	10
 
