@@ -88,6 +88,37 @@ SELECT vgi_count() FROM range(0) t(i);
 0
 
 # ============================================================================
+# Regression: vgi_sum where the per-group post-update state happens to be
+# byte-equal to the initial state. Earlier the framework optimised away the
+# storage write for such groups, conflating "no rows" with "rows whose
+# update was a no-op (all NULL inputs)" — so SUM of zeros returned NULL
+# instead of 0. ``vgi_sum(0)`` must now return 0 just like the built-in.
+# ============================================================================
+
+query I
+SELECT vgi_sum(0::BIGINT) FROM range(5) t(i);
+----
+0
+
+query I
+SELECT vgi_sum(x) FROM (VALUES (0::BIGINT), (0::BIGINT), (0::BIGINT)) t(x);
+----
+0
+
+# Same regression manifests as a window aggregate, where every frame
+# produces a state byte-equal to initial: built-in ``sum`` returns 0
+# for the single-row frame at row 0, and ``vgi_sum`` must too.
+query II
+SELECT i, vgi_sum(i::BIGINT) OVER (ORDER BY i ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)
+FROM range(5) t(i);
+----
+0	0
+1	1
+2	3
+3	5
+4	7
+
+# ============================================================================
 # Cleanup
 # ============================================================================
 
