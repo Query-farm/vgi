@@ -61,6 +61,12 @@ struct VgiAggregateFunctionInfo : public AggregateFunctionInfo {
 	// DuckDB's WindowCustomAggregator path.
 	bool supports_window = false;
 
+	// True if the worker opts into the streaming-partitioned protocol —
+	// the optimizer rule swaps LogicalWindow for a streaming operator that
+	// pipes input chunks straight to the worker (no DuckDB-side partition
+	// materialisation).
+	bool streaming_partitioned = false;
+
 	const std::string &worker_path() const {
 		return attach_params->worker_path();
 	}

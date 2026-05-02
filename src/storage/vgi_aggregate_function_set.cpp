@@ -16,6 +16,7 @@
 #include "vgi_aggregate_window_impl.hpp"
 #include "vgi_arrow_utils.hpp"
 #include "vgi_catalog_api.hpp"
+#include "vgi_logging.hpp"
 
 namespace duckdb {
 
@@ -156,6 +157,11 @@ void VgiAggregateFunctionSet::LoadEntries(ClientContext &context) {
 			agg_func_info->setting_names = setting_names;
 			agg_func_info->required_secrets = func_info.required_secrets;
 			agg_func_info->supports_window = func_info.supports_window;
+			agg_func_info->streaming_partitioned = func_info.streaming_partitioned;
+			if (func_info.streaming_partitioned) {
+				VGI_STDERR_DEBUG("[VGI] streaming_partitioned aggregate registered: %s\n",
+				                 func_info.name.c_str());
+			}
 
 			agg_func.function_info = agg_func_info;
 

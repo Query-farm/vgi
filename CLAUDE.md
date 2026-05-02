@@ -172,6 +172,9 @@ plus the shm-aware code paths in `src/vgi_function_connection.cpp`
 | `vgi_catalog_timeout_seconds` | BIGINT | 5 | Timeout for catalog RPC operations |
 | `vgi_worker_pool_idle_limit_seconds` | BIGINT | 5 | Max idle time before pooled workers are removed |
 | `vgi_worker_pool_max` | BIGINT | 256 | Max workers in pool (0 = disabled) |
+| `vgi_join_keys_limit` | UBIGINT | 100000 | Max distinct join key values pushed to VGI workers (0 = disabled) |
+| `vgi_join_keys_max_bytes` | UBIGINT | 67108864 | Max estimated byte size for join keys batch |
+| `vgi_streaming_window` | BOOLEAN | true | Route eligible `OVER (...)` queries against VGI aggregates with `streaming_partitioned=true` through the custom streaming operator. Set to false to fall back to `PhysicalWindow` |
 
 Catalogs may register additional settings at `ATTACH` time (e.g., `greeting`, `multiplier`).
 
@@ -215,6 +218,10 @@ Catalogs may register additional settings at `ATTACH` time (e.g., `greeting`, `m
 | `vgi_table_function.cpp` | Direct `vgi_table_function()` SQL function |
 | `vgi_table_function_impl.cpp` | Shared table function logic (bind/init/scan) |
 | `vgi_scalar_function_impl.cpp` | Scalar function bind/execute with dynamic types and const params |
+| `vgi_aggregate_function_impl.cpp` | Aggregate function bind / update / combine / finalize / destructor RPC client |
+| `vgi_aggregate_window_impl.cpp` | Aggregate window callbacks (`window_init` / `window` / `window_batch`) for `OVER (...)` queries; partition is materialised + shipped once, frames evaluated per output row |
+| `vgi_aggregate_streaming_impl.cpp` | Streaming-partitioned aggregate RPC client (`streaming_open` / `_chunk` / `_close`) — pipes input chunks straight to the worker without DuckDB-side partition materialisation |
+| `vgi_streaming_window_operator.cpp` | `LogicalVgiStreamingWindow` + `PhysicalVgiStreamingWindow` — custom `LogicalExtensionOperator` / pipeline `PhysicalOperator` pair that replaces eligible `LogicalWindow` nodes when the worker opts into the streaming protocol; lives in the extension, no DuckDB-core changes |
 | `vgi_table_in_out_impl.cpp` | Table-in-out function implementation |
 | `vgi_arrow_ipc.cpp` | Arrow IPC stream I/O: `FdInputStream`, `FdOutputStream`, `ReadRecordBatch` |
 | `vgi_arrow_utils.cpp` | Arrow-to-DuckDB type conversion |

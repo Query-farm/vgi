@@ -366,6 +366,12 @@ struct VgiFunctionInfo {
 	// DuckDB's custom-window aggregator path with partition caching).
 	bool supports_window = false;
 
+	// True when the aggregate opts into the streaming-partitioned protocol
+	// (aggregate_streaming_open/_chunk/_close). The optimizer rule replaces
+	// LogicalWindow with a custom streaming operator when this is set and
+	// the query shape is compatible (cumulative frame, sorted input).
+	bool streaming_partitioned = false;
+
 	// True when a table-in-out function declares a finalize/finish stage.
 	// DuckDB rejects ``in_out_function_final`` alongside LATERAL-projected
 	// input; we only register the finalize callback when this is set.

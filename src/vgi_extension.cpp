@@ -17,7 +17,10 @@
 #include "duckdb/main/client_config.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/optimizer/optimizer_extension.hpp"
+#include "duckdb/parser/expression/window_expression.hpp"
+#include "duckdb/planner/expression/bound_window_expression.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/planner/operator/logical_window.hpp"
 #include "duckdb/storage/storage_extension.hpp"
 #include "duckdb/common/arrow/arrow_type_extension.hpp"
 #include "duckdb/common/types/geometry.hpp"
@@ -30,8 +33,10 @@
 #include "vgi_catalogs.hpp"
 #include "vgi_cookie_jar.hpp"
 #include "vgi_logging.hpp"
+#include "vgi_aggregate_function_impl.hpp"
 #include "vgi_oauth.hpp"
 #include "vgi_profiling.hpp"
+#include "vgi_streaming_window_operator.hpp"
 #ifndef __EMSCRIPTEN__
 #include "vgi_subprocess.hpp"
 #endif
@@ -137,6 +142,112 @@ private:
 			client_config.user_settings.SetUserSetting(DynamicOrFilterThresholdSetting::SettingIndex,
 			                                           Value::UBIGINT(vgi_limit));
 		}
+	}
+};
+
+// ============================================================================
+// VgiStreamingWindowOptimizer — rewrite eligible LogicalWindow → streaming op
+// ============================================================================
+// Walks the plan post-optimize. For each LogicalWindow whose every window
+// expression is a VGI aggregate with streaming_partitioned=true and a
+// cumulative frame (UNBOUNDED PRECEDING -> CURRENT ROW), replace with our
+// custom LogicalVgiStreamingWindow. Otherwise leave the LogicalWindow alone
+// (it falls through to PhysicalWindow as today).
+//
+// All-or-nothing in v1: if any expression is ineligible, the whole node
+// stays a regular LogicalWindow. Mixed-eligibility splitting is a v2 task.
+
+class VgiStreamingWindowOptimizer : public OptimizerExtension {
+public:
+	VgiStreamingWindowOptimizer() {
+		optimize_function = Optimize;
+	}
+
+private:
+	static bool IsCumulativeFrame(const BoundWindowExpression &wexpr) {
+		if (wexpr.start != WindowBoundary::UNBOUNDED_PRECEDING) {
+			return false;
+		}
+		switch (wexpr.end) {
+		case WindowBoundary::CURRENT_ROW_RANGE:
+		case WindowBoundary::CURRENT_ROW_ROWS:
+		case WindowBoundary::CURRENT_ROW_GROUPS:
+			return true;
+		default:
+			return false;
+		}
+	}
+
+	static bool IsStreamingEligible(const Expression &expr) {
+		if (expr.GetExpressionClass() != ExpressionClass::BOUND_WINDOW) {
+			return false;
+		}
+		auto &wexpr = expr.Cast<BoundWindowExpression>();
+		if (!wexpr.aggregate) {
+			return false;
+		}
+		auto info = wexpr.aggregate->function_info.get();
+		if (!info) {
+			return false;
+		}
+		auto vgi_info = dynamic_cast<vgi::VgiAggregateFunctionInfo *>(info);
+		if (!vgi_info || !vgi_info->streaming_partitioned) {
+			return false;
+		}
+		if (!IsCumulativeFrame(wexpr)) {
+			return false;
+		}
+		// EXCLUDE clauses produce multiple subframes per row — punt for v1.
+		if (wexpr.exclude_clause != WindowExcludeMode::NO_OTHER) {
+			return false;
+		}
+		// DISTINCT, FILTER, ORDER BY in args — punt for v1, fall through to
+		// PhysicalWindow which handles them.
+		if (wexpr.distinct || wexpr.filter_expr || !wexpr.arg_orders.empty()) {
+			return false;
+		}
+		return true;
+	}
+
+	static void Rewrite(unique_ptr<LogicalOperator> &op) {
+		// Recurse first so children are rewritten before we look at this node.
+		for (auto &child : op->children) {
+			Rewrite(child);
+		}
+		if (op->type != LogicalOperatorType::LOGICAL_WINDOW) {
+			return;
+		}
+		auto &window = op->Cast<LogicalWindow>();
+		if (window.expressions.empty()) {
+			return;
+		}
+		for (auto &expr : window.expressions) {
+			if (!IsStreamingEligible(*expr)) {
+				return; // leave the LogicalWindow alone
+			}
+		}
+
+		// All expressions eligible — swap in the streaming operator.
+		auto streaming_op = make_uniq<vgi::LogicalVgiStreamingWindow>(window.window_index);
+		streaming_op->expressions = std::move(window.expressions);
+		streaming_op->children = std::move(window.children);
+		streaming_op->ResolveOperatorTypes();
+
+		VGI_STDERR_DEBUG("[VGI] LogicalWindow rewritten -> LogicalVgiStreamingWindow "
+		                 "(window_index=%llu, %zu expression(s))\n",
+		                 static_cast<unsigned long long>(window.window_index),
+		                 streaming_op->expressions.size());
+
+		op = std::move(streaming_op);
+	}
+
+	static void Optimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
+		Value enabled_val;
+		if (!input.context.TryGetCurrentSetting("vgi_streaming_window", enabled_val) ||
+		    enabled_val.IsNull() || !enabled_val.GetValue<bool>()) {
+			return;
+		}
+		Rewrite(plan);
 	}
 };
 
@@ -950,6 +1061,16 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "Max estimated byte size for join keys batch (skip pushdown if exceeded)",
 	                          LogicalType::UBIGINT, Value::UBIGINT(67108864)); // 64MB
 	OptimizerExtension::Register(config, VgiJoinOptimizer());
+
+	// Streaming-window optimizer rule: rewrite eligible LogicalWindow ->
+	// LogicalVgiStreamingWindow. Gate on a session setting so benchmarks /
+	// fallback paths can disable it without recompiling.
+	config.AddExtensionOption("vgi_streaming_window",
+	                          "Route eligible OVER (...) queries against VGI aggregates with "
+	                          "streaming_partitioned=true through the custom streaming operator. "
+	                          "Set to false to fall back to PhysicalWindow / WindowCustomAggregator.",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
+	OptimizerExtension::Register(config, VgiStreamingWindowOptimizer());
 
 	// Register worker pool settings
 	config.AddExtensionOption("vgi_worker_pool_idle_limit_seconds",

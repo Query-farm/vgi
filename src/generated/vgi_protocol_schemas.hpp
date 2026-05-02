@@ -98,6 +98,7 @@ inline const std::shared_ptr<arrow::Schema> &FunctionInfoSchema() {
 	    arrow::field("order_dependent", arrow::dictionary(arrow::int16(), arrow::utf8()), /*nullable=*/false),
 	    arrow::field("distinct_dependent", arrow::dictionary(arrow::int16(), arrow::utf8()), /*nullable=*/false),
 	    arrow::field("supports_window", arrow::boolean(), /*nullable=*/false),
+	    arrow::field("streaming_partitioned", arrow::boolean(), /*nullable=*/false),
 	    arrow::field("has_finalize", arrow::boolean(), /*nullable=*/false),
 	    arrow::field("required_settings", arrow::list(arrow::utf8()), /*nullable=*/false),
 	    arrow::field("required_secrets", arrow::list(arrow::struct_({arrow::field("secret_type", arrow::utf8(), /*nullable=*/false), arrow::field("scope", arrow::utf8(), /*nullable=*/true), arrow::field("secret_name", arrow::utf8(), /*nullable=*/true)})), /*nullable=*/false),
@@ -205,6 +206,28 @@ inline const std::shared_ptr<arrow::Schema> &AggregateWindowDestructorResultSche
 
 // Origin: method 'aggregate_window_init' result
 inline const std::shared_ptr<arrow::Schema> &AggregateWindowInitResultSchema() {
+	static const auto schema = arrow::schema({});
+	return schema;
+}
+
+// Origin: method 'aggregate_streaming_open' result
+inline const std::shared_ptr<arrow::Schema> &AggregateStreamingOpenResultSchema() {
+	static const auto schema = arrow::schema({
+	    arrow::field("execution_id", arrow::binary(), /*nullable=*/false),
+	});
+	return schema;
+}
+
+// Origin: method 'aggregate_streaming_chunk' result
+inline const std::shared_ptr<arrow::Schema> &AggregateStreamingChunkResultSchema() {
+	static const auto schema = arrow::schema({
+	    arrow::field("result_batch", arrow::binary(), /*nullable=*/false),
+	});
+	return schema;
+}
+
+// Origin: method 'aggregate_streaming_close' result
+inline const std::shared_ptr<arrow::Schema> &AggregateStreamingCloseResultSchema() {
 	static const auto schema = arrow::schema({});
 	return schema;
 }
@@ -429,6 +452,30 @@ inline const std::shared_ptr<arrow::Schema> &AggregateWindowDestructorParamsSche
 
 // Origin: method 'aggregate_window_init' params
 inline const std::shared_ptr<arrow::Schema> &AggregateWindowInitParamsSchema() {
+	static const auto schema = arrow::schema({
+	    arrow::field("request", arrow::binary(), /*nullable=*/false),
+	});
+	return schema;
+}
+
+// Origin: method 'aggregate_streaming_open' params
+inline const std::shared_ptr<arrow::Schema> &AggregateStreamingOpenParamsSchema() {
+	static const auto schema = arrow::schema({
+	    arrow::field("request", arrow::binary(), /*nullable=*/false),
+	});
+	return schema;
+}
+
+// Origin: method 'aggregate_streaming_chunk' params
+inline const std::shared_ptr<arrow::Schema> &AggregateStreamingChunkParamsSchema() {
+	static const auto schema = arrow::schema({
+	    arrow::field("request", arrow::binary(), /*nullable=*/false),
+	});
+	return schema;
+}
+
+// Origin: method 'aggregate_streaming_close' params
+inline const std::shared_ptr<arrow::Schema> &AggregateStreamingCloseParamsSchema() {
 	static const auto schema = arrow::schema({
 	    arrow::field("request", arrow::binary(), /*nullable=*/false),
 	});

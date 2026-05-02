@@ -110,6 +110,10 @@ const std::unordered_map<std::string, ResponseSchema> &Registry() {
 		m["aggregate_window"] = ResponseSchema{AggregateWindowResultSchema(), nullptr, false, nullptr};
 		m["aggregate_window_batch"] =
 		    ResponseSchema{AggregateWindowBatchResultSchema(), nullptr, false, nullptr};
+		m["aggregate_streaming_open"] =
+		    ResponseSchema{AggregateStreamingOpenResultSchema(), nullptr, false, nullptr};
+		m["aggregate_streaming_chunk"] =
+		    ResponseSchema{AggregateStreamingChunkResultSchema(), nullptr, false, nullptr};
 		m["catalog_table_scan_function_get"] =
 		    ResponseSchema{ScanFunctionResultSchema(), nullptr, false, nullptr};
 		m["catalog_table_insert_function_get"] =
@@ -129,6 +133,8 @@ const std::unordered_map<std::string, ResponseSchema> &Registry() {
 		    ResponseSchema{AggregateWindowInitResultSchema(), nullptr, false, nullptr};
 		m["aggregate_window_destructor"] =
 		    ResponseSchema{AggregateWindowDestructorResultSchema(), nullptr, false, nullptr};
+		m["aggregate_streaming_close"] =
+		    ResponseSchema{AggregateStreamingCloseResultSchema(), nullptr, false, nullptr};
 
 		// --- Dynamic / genuinely per-call responses -----------------------
 		// Only methods whose response shape is not expressible as a single
@@ -216,6 +222,9 @@ const std::unordered_map<std::string, ResponseSchema> &Registry() {
 		    {"aggregate_window", &AggregateWindowParamsSchema},
 		    {"aggregate_window_destructor", &AggregateWindowDestructorParamsSchema},
 		    {"aggregate_window_batch", &AggregateWindowBatchParamsSchema},
+		    {"aggregate_streaming_open", &AggregateStreamingOpenParamsSchema},
+		    {"aggregate_streaming_chunk", &AggregateStreamingChunkParamsSchema},
+		    {"aggregate_streaming_close", &AggregateStreamingCloseParamsSchema},
 		};
 		for (const auto &e : kRequestSchemas) {
 			auto it = m.find(e.name);

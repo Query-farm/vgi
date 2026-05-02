@@ -58,7 +58,9 @@ src/vgi_table_function_impl.cpp
 src/vgi_table_in_out_impl.cpp
 src/vgi_scalar_function_impl.cpp
 src/vgi_aggregate_function_impl.cpp
+src/vgi_aggregate_streaming_impl.cpp
 src/vgi_aggregate_window_impl.cpp
+src/vgi_streaming_window_operator.cpp
 src/vgi_catalog_api.cpp
 src/vgi_function_connection.cpp
 src/vgi_shm_segment.cpp
