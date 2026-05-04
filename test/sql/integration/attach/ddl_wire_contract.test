@@ -1,0 +1,86 @@
+# name: test/sql/integration/attach/ddl_wire_contract.test
+# description: Pin the wire contract for catalog DDL RPCs that the C++ extension
+#              hand-codes in vgi/src/vgi_rpc_types.cpp. Hand-coded
+#              ``Build*Params`` functions and the generated
+#              ``CatalogXxxParamsSchema`` in vgi_protocol_schemas.hpp drift
+#              independently and the runtime validator catches the drift, but
+#              that only fires when these RPCs are actually sent.
+#
+#              The example worker is read-only — every successful DDL call
+#              ends in CatalogReadOnlyError on the worker side. That's the
+#              tell: if you see ``catalog is read-only`` the wire contract is
+#              intact (the request was accepted into the worker and dispatched
+#              to the catalog handler). If the contract drifts, the C++
+#              validator rejects the outgoing batch up front with
+#              ``Outgoing request batch does not match the wire contract``
+#              and these assertions flip red.
+# group: [vgi_integration_attach]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ----------------------------------------------------------------------------
+# CREATE SCHEMA — pins catalog_schema_create. Earlier the C++ builder sent
+# 5 fields (attach_id, name, on_conflict, comment, transaction_id) while the
+# generated schema declared 6 (with a nullable ``tags: map<string, string>``
+# between comment and transaction_id), so any worker that uses the generated
+# schemas for validation rejected every CREATE SCHEMA attempt with a wire
+# contract error before the read-only error could fire.
+# ----------------------------------------------------------------------------
+
+statement error
+CREATE SCHEMA example.s1;
+----
+catalog is read-only
+
+statement error
+CREATE SCHEMA IF NOT EXISTS example.s2;
+----
+catalog is read-only
+
+statement error
+CREATE OR REPLACE SCHEMA example.s3;
+----
+catalog is read-only
+
+# ----------------------------------------------------------------------------
+# ALTER TABLE ... ADD COLUMN — pins catalog_table_column_add. The hand-coded
+# builder had fields 4 (``ignore_not_found``) and 5 (``if_column_not_exists``)
+# in the opposite order from the generated schema; the validator caught it
+# unambiguously since both fields are non-nullable bools.
+# ----------------------------------------------------------------------------
+
+statement error
+ALTER TABLE example.main.even_numbers ADD COLUMN x INT;
+----
+catalog is read-only
+
+statement error
+ALTER TABLE example.main.even_numbers ADD COLUMN IF NOT EXISTS y INT;
+----
+catalog is read-only
+
+# ----------------------------------------------------------------------------
+# ALTER TABLE ... DROP COLUMN — pins catalog_table_column_drop. Same field-
+# order trap as ADD COLUMN: ``ignore_not_found`` and ``if_column_exists``
+# were swapped in the hand-coded builder.
+# ----------------------------------------------------------------------------
+
+statement error
+ALTER TABLE example.main.even_numbers DROP COLUMN n;
+----
+catalog is read-only
+
+statement error
+ALTER TABLE example.main.even_numbers DROP COLUMN IF EXISTS no_such_col;
+----
+catalog is read-only
+
+statement ok
+DETACH example;

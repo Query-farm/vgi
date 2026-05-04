@@ -1295,13 +1295,19 @@ std::shared_ptr<arrow::RecordBatch> BuildTableColumnAddParams(
     const std::vector<uint8_t> &attach_id, const std::string &schema_name, const std::string &name,
     const std::vector<uint8_t> &column_definition, bool if_column_not_exists, bool ignore_not_found,
     const std::vector<uint8_t> &transaction_id) {
+	// Field order must match CatalogTableColumnAddParamsSchema() in
+	// generated/vgi_protocol_schemas.hpp: ignore_not_found precedes
+	// if_column_not_exists. The runtime wire-contract validator catches
+	// drift at request-send time, so swapping these here also fixes the
+	// "RPC request schema mismatch for 'catalog_table_column_add'" error
+	// against any worker that uses the generated schemas.
 	auto schema = arrow::schema({
 	    arrow::field("attach_id", arrow::binary(), false),
 	    arrow::field("schema_name", arrow::utf8(), false),
 	    arrow::field("name", arrow::utf8(), false),
 	    arrow::field("column_definition", arrow::binary(), false),
-	    arrow::field("if_column_not_exists", arrow::boolean(), false),
 	    arrow::field("ignore_not_found", arrow::boolean(), false),
+	    arrow::field("if_column_not_exists", arrow::boolean(), false),
 	    arrow::field("transaction_id", arrow::binary(), true),
 	});
 	std::vector<std::shared_ptr<arrow::Array>> arrays;
@@ -1320,13 +1326,13 @@ std::shared_ptr<arrow::RecordBatch> BuildTableColumnAddParams(
 	}
 	{
 		arrow::BooleanBuilder builder;
-		CheckStatus(builder.Append(if_column_not_exists), "append if_column_not_exists");
-		arrays.push_back(FinishArray(builder, "if_column_not_exists"));
+		CheckStatus(builder.Append(ignore_not_found), "append ignore_not_found");
+		arrays.push_back(FinishArray(builder, "ignore_not_found"));
 	}
 	{
 		arrow::BooleanBuilder builder;
-		CheckStatus(builder.Append(ignore_not_found), "append ignore_not_found");
-		arrays.push_back(FinishArray(builder, "ignore_not_found"));
+		CheckStatus(builder.Append(if_column_not_exists), "append if_column_not_exists");
+		arrays.push_back(FinishArray(builder, "if_column_not_exists"));
 	}
 	arrays.push_back(BuildBinaryScalar(transaction_id));
 
@@ -1337,13 +1343,16 @@ std::shared_ptr<arrow::RecordBatch> BuildTableColumnDropParams(
     const std::vector<uint8_t> &attach_id, const std::string &schema_name, const std::string &name,
     const std::string &column_name, bool if_column_exists, bool ignore_not_found, bool cascade,
     const std::vector<uint8_t> &transaction_id) {
+	// Field order must match CatalogTableColumnDropParamsSchema() in
+	// generated/vgi_protocol_schemas.hpp: ignore_not_found precedes
+	// if_column_exists. See BuildTableColumnAddParams for the same trap.
 	auto schema = arrow::schema({
 	    arrow::field("attach_id", arrow::binary(), false),
 	    arrow::field("schema_name", arrow::utf8(), false),
 	    arrow::field("name", arrow::utf8(), false),
 	    arrow::field("column_name", arrow::utf8(), false),
-	    arrow::field("if_column_exists", arrow::boolean(), false),
 	    arrow::field("ignore_not_found", arrow::boolean(), false),
+	    arrow::field("if_column_exists", arrow::boolean(), false),
 	    arrow::field("cascade", arrow::boolean(), false),
 	    arrow::field("transaction_id", arrow::binary(), true),
 	});
@@ -1359,13 +1368,13 @@ std::shared_ptr<arrow::RecordBatch> BuildTableColumnDropParams(
 	arrays.push_back(BuildStringScalar(column_name));
 	{
 		arrow::BooleanBuilder builder;
-		CheckStatus(builder.Append(if_column_exists), "append if_column_exists");
-		arrays.push_back(FinishArray(builder, "if_column_exists"));
+		CheckStatus(builder.Append(ignore_not_found), "append ignore_not_found");
+		arrays.push_back(FinishArray(builder, "ignore_not_found"));
 	}
 	{
 		arrow::BooleanBuilder builder;
-		CheckStatus(builder.Append(ignore_not_found), "append ignore_not_found");
-		arrays.push_back(FinishArray(builder, "ignore_not_found"));
+		CheckStatus(builder.Append(if_column_exists), "append if_column_exists");
+		arrays.push_back(FinishArray(builder, "if_column_exists"));
 	}
 	{
 		arrow::BooleanBuilder builder;
@@ -1667,12 +1676,20 @@ std::shared_ptr<arrow::RecordBatch> BuildSchemaCreateParams(
     const std::vector<uint8_t> &attach_id, const std::string &name,
     const std::string &on_conflict, const std::string &comment, bool comment_is_null,
     const std::vector<uint8_t> &transaction_id) {
+	// Field order must match CatalogSchemaCreateParamsSchema() in
+	// generated/vgi_protocol_schemas.hpp: a nullable ``tags`` map sits
+	// between ``comment`` and ``transaction_id``. The C++ extension does
+	// not currently expose CREATE SCHEMA ... TAGS (...) options, so we
+	// always send a null tags map; the wire shape still has to match or
+	// the runtime validator rejects the entire request before the worker
+	// sees it.
 	static const std::vector<std::string> on_conflict_values = {"ERROR", "IGNORE", "REPLACE"};
 	auto schema = arrow::schema({
 	    arrow::field("attach_id", arrow::binary(), false),
 	    arrow::field("name", arrow::utf8(), false),
 	    arrow::field("on_conflict", arrow::dictionary(arrow::int16(), arrow::utf8()), false),
 	    arrow::field("comment", arrow::utf8(), true),
+	    arrow::field("tags", arrow::map(arrow::utf8(), arrow::utf8()), true),
 	    arrow::field("transaction_id", arrow::binary(), true),
 	});
 	std::vector<std::shared_ptr<arrow::Array>> arrays;
@@ -1693,6 +1710,15 @@ std::shared_ptr<arrow::RecordBatch> BuildSchemaCreateParams(
 			CheckStatus(builder.Append(comment), "append comment");
 		}
 		arrays.push_back(FinishArray(builder, "comment"));
+	}
+	// tags: always-null map<string, string> until the C++ extension forwards
+	// CREATE SCHEMA ... TAGS (...). One row, one null map entry.
+	{
+		auto tags_type = arrow::map(arrow::utf8(), arrow::utf8());
+		arrow::MapBuilder builder(arrow::default_memory_pool(), std::make_shared<arrow::StringBuilder>(),
+		                          std::make_shared<arrow::StringBuilder>());
+		CheckStatus(builder.AppendNull(), "append null tags");
+		arrays.push_back(FinishArray(builder, "tags"));
 	}
 	arrays.push_back(BuildBinaryScalar(transaction_id));
 
