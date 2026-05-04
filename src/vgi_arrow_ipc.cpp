@@ -1,7 +1,9 @@
 #include "vgi_arrow_ipc.hpp"
 
 #include <cerrno>
+#include <chrono>
 #include <cstring>
+#include <sys/select.h>
 #include <unistd.h>
 
 #include "duckdb/common/exception.hpp"
@@ -165,7 +167,50 @@ arrow::Status FdOutputStream::Write(const void *data, int64_t nbytes) {
 	const uint8_t *bytes = static_cast<const uint8_t *>(data);
 	int64_t total_written = 0;
 
+	// Bound: an unresponsive worker that fills its kernel pipe buffer
+	// would otherwise block write() forever. 60s is well above any
+	// realistic RPC payload write time on a healthy worker. Same
+	// pattern as WaitForReadable on the read side.
+	constexpr int kWriteTimeoutSeconds = 60;
+	const auto deadline =
+	    std::chrono::steady_clock::now() + std::chrono::seconds(kWriteTimeoutSeconds);
+
 	while (total_written < nbytes) {
+		// Wait for the fd to become writable before each write call so
+		// we never block indefinitely on a kernel-pipe-buffer-full
+		// scenario where the worker is hung. If the deadline has passed
+		// before select() returns writable, surface a clean IOError
+		// instead of hanging the calling query forever.
+		fd_set write_fds;
+		FD_ZERO(&write_fds);
+		FD_SET(fd_, &write_fds);
+
+		auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(
+		    deadline - std::chrono::steady_clock::now());
+		if (remaining.count() <= 0) {
+			return arrow::Status::IOError(
+			    "Write to worker timed out after ", std::to_string(kWriteTimeoutSeconds),
+			    "s (worker unresponsive); ", std::to_string(total_written), " of ",
+			    std::to_string(nbytes), " bytes written");
+		}
+		struct timeval tv;
+		tv.tv_sec = remaining.count() / 1000000;
+		tv.tv_usec = remaining.count() % 1000000;
+
+		int sel = select(fd_ + 1, nullptr, &write_fds, nullptr, &tv);
+		if (sel < 0) {
+			if (errno == EINTR) {
+				continue;
+			}
+			return arrow::Status::IOError("select() error during write: ", strerror(errno));
+		}
+		if (sel == 0) {
+			return arrow::Status::IOError(
+			    "Write to worker timed out after ", std::to_string(kWriteTimeoutSeconds),
+			    "s (worker unresponsive); ", std::to_string(total_written), " of ",
+			    std::to_string(nbytes), " bytes written");
+		}
+
 		ssize_t written = write(fd_, bytes + total_written, nbytes - total_written);
 		if (written < 0) {
 			if (errno == EINTR) {

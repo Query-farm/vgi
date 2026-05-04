@@ -25,18 +25,20 @@ RpcBatchType ClassifyBatch(const std::shared_ptr<arrow::RecordBatch> &batch,
 		return RpcBatchType::DATA;
 	}
 
-	// num_rows == 0 with metadata: check for log_level
+	// num_rows == 0 with metadata: check for log_level. The presence of
+	// log_level is authoritative — a worker that emits log_level without
+	// log_message is buggy, but we still classify as LOG/ERROR so the
+	// signal reaches the user (HandleBatchLogMessage tolerates the
+	// missing message field). Previously we required both keys for non-
+	// EXCEPTION levels, silently swallowing the LOG as a 0-row data
+	// batch — making the worker bug invisible at this layer.
 	int level_idx = custom_metadata->FindKey(RPC_LOG_LEVEL_KEY);
 	if (level_idx >= 0) {
 		std::string level = custom_metadata->value(level_idx);
 		if (level == "EXCEPTION") {
 			return RpcBatchType::ERROR;
 		}
-		// Any other log level with log_message present → LOG
-		int msg_idx = custom_metadata->FindKey(RPC_LOG_MESSAGE_KEY);
-		if (msg_idx >= 0) {
-			return RpcBatchType::LOG;
-		}
+		return RpcBatchType::LOG;
 	}
 
 	// Check for external location (pointer batch)

@@ -234,12 +234,16 @@ bool HandleBatchLogMessage(const std::shared_ptr<arrow::RecordBatch> &batch,
 		message_idx = custom_metadata->FindKey("vgi.log_message");
 	}
 
-	if (level_idx < 0 || message_idx < 0) {
+	// log_level is the authoritative signal. log_message MAY be absent
+	// (buggy worker, or future protocol where the level alone is the
+	// event). Treat missing message as empty string so we still surface
+	// the event instead of swallowing it.
+	if (level_idx < 0) {
 		return false;
 	}
 
 	std::string log_level = custom_metadata->value(level_idx);
-	std::string log_message = custom_metadata->value(message_idx);
+	std::string log_message = (message_idx >= 0) ? custom_metadata->value(message_idx) : std::string();
 
 	// Parse vgi_rpc.log_extra if present (contains traceback for exceptions)
 	// Also check legacy vgi.log_extra for backwards compatibility
