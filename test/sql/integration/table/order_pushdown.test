@@ -72,8 +72,6 @@ SELECT * FROM example.order_echo(5) ORDER BY s LIMIT 2;
 
 # ============================================================================
 # 6. ORDER BY ASC with explicit NULLS LAST — same as default but explicit
-#    Note: NULLS FIRST triggers DuckDB's Top-N DynamicFilter which interacts
-#    with auto_apply_filters; not tested here.
 # ============================================================================
 
 query ITTTII
@@ -91,6 +89,47 @@ SELECT * FROM example.order_echo(100) ORDER BY n DESC NULLS LAST LIMIT 2;
 ----
 99	row_99	n	DESC	NULLS_LAST	2
 98	row_98	n	DESC	NULLS_LAST	2
+
+# ============================================================================
+# 7a. NULLS FIRST + LIMIT — regression for the silent-data-loss bug.
+#     DuckDB's Top-N attaches OptionalFilter(ConjunctionOr(IsNull, DynamicFilter))
+#     to the scan when ORDER BY ... NULLS FIRST LIMIT N is in play. The OR's
+#     DynamicFilter child has no value at init time (Top-N hasn't seen any
+#     rows yet) and was elided by the OR-serializer, leaving a one-child
+#     OR(IsNull). Combined with column statistics indicating no NULLs, the
+#     optimizer folded the partial filter to always-false and skipped the
+#     scan entirely — process() was never called, the function returned 0
+#     rows, and the test author at the time noted this and skipped coverage.
+#     The C++ extension now skips OptionalFilters whose subtree contains a
+#     DynamicFilter; the dynamic-filter mechanism still pushes the filter
+#     per-tick once the Top-N heap establishes its threshold.
+# ============================================================================
+
+query ITTTII
+SELECT * FROM example.order_echo(100) ORDER BY n ASC NULLS FIRST LIMIT 3;
+----
+0	row_0	n	ASC	NULLS_FIRST	3
+1	row_1	n	ASC	NULLS_FIRST	3
+2	row_2	n	ASC	NULLS_FIRST	3
+
+query ITTTII
+SELECT * FROM example.order_echo(100) ORDER BY n DESC NULLS FIRST LIMIT 3;
+----
+99	row_99	n	DESC	NULLS_FIRST	3
+98	row_98	n	DESC	NULLS_FIRST	3
+97	row_97	n	DESC	NULLS_FIRST	3
+
+# Sanity: NULLS FIRST without LIMIT still works (no Top-N pushdown engaged).
+query I
+SELECT count(*) FROM (SELECT n FROM example.order_echo(10) ORDER BY n NULLS FIRST);
+----
+10
+
+# Sanity: the same regression applies to any function with filter_pushdown.
+query I
+SELECT count(*) FROM (SELECT n FROM example.sequence(50) ORDER BY n NULLS FIRST LIMIT 5);
+----
+5
 
 # ============================================================================
 # 8. LIMIT without ORDER BY — RowGroupPruner requires ORDER BY node
