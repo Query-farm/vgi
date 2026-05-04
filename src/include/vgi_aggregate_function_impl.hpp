@@ -92,7 +92,14 @@ struct VgiAggregateBindData : public FunctionData {
 	std::shared_ptr<arrow::Schema> resolved_output_schema;
 	std::shared_ptr<arrow::Schema> input_schema;
 	optional_ptr<Catalog> catalog;
-	ClientContext *context = nullptr;
+	// Weak reference to the ClientContext that produced this bind_data.
+	// Used by the destructor RPC path: late-firing destructors on a
+	// task-scheduler thread may run after the originating session has
+	// gone, which would dangle a raw pointer. Lock at use-site; if the
+	// context is gone, skip the RPC. Uses duckdb::weak_ptr so it pairs
+	// with shared_from_this() on ClientContext (which is built around
+	// duckdb::enable_shared_from_this).
+	weak_ptr<ClientContext> context;
 	vector<Value> const_values;
 
 	// Shared execution state across bind_data copies (DuckDB may copy during planning)

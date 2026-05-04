@@ -303,7 +303,11 @@ void VgiAggregateInitialize(const AggregateFunction &function, data_ptr_t state)
 void VgiAggregateUpdate(Vector inputs[], AggregateInputData &aggr_input_data, idx_t input_count, Vector &state_vector,
                         idx_t count) {
 	auto &bind_data = aggr_input_data.bind_data->Cast<VgiAggregateBindData>();
-	auto &context = *bind_data.context;
+	auto context_lock = bind_data.context.lock();
+	if (!context_lock) {
+		throw IOException("VGI aggregate update: ClientContext is gone");
+	}
+	auto &context = *context_lock;
 
 	// Get state pointers and assign group_ids to uninitialized states
 	UnifiedVectorFormat sdata;
@@ -381,7 +385,11 @@ void VgiAggregateUpdate(Vector inputs[], AggregateInputData &aggr_input_data, id
 
 void VgiAggregateCombine(Vector &source, Vector &combined, AggregateInputData &aggr_input_data, idx_t count) {
 	auto &bind_data = aggr_input_data.bind_data->Cast<VgiAggregateBindData>();
-	auto &context = *bind_data.context;
+	auto context_lock = bind_data.context.lock();
+	if (!context_lock) {
+		throw IOException("VGI aggregate combine: ClientContext is gone");
+	}
+	auto &context = *context_lock;
 
 	UnifiedVectorFormat sdata, cdata;
 	source.ToUnifiedFormat(count, sdata);
@@ -433,7 +441,11 @@ void VgiAggregateCombine(Vector &source, Vector &combined, AggregateInputData &a
 void VgiAggregateFinalize(Vector &state_vector, AggregateInputData &aggr_input_data, Vector &result, idx_t count,
                           idx_t offset) {
 	auto &bind_data = aggr_input_data.bind_data->Cast<VgiAggregateBindData>();
-	auto &context = *bind_data.context;
+	auto context_lock = bind_data.context.lock();
+	if (!context_lock) {
+		throw IOException("VGI aggregate finalize: ClientContext is gone");
+	}
+	auto &context = *context_lock;
 
 	// Build group_ids batch, assigning ids to any uninitialized states
 	UnifiedVectorFormat sdata;
@@ -566,7 +578,16 @@ void VgiAggregateDestroy(Vector &state_vector, AggregateInputData &aggr_input_da
 			// UNSET: state was never touched — nothing to clean up.
 		}
 
-		auto &context = *bind_data.context;
+		// Lock the weak_ptr<ClientContext>. If the originating session has
+		// gone away (destructor firing on a task-scheduler thread during
+		// shutdown after the session tore down), we have no context to
+		// dispatch RPCs on — surrender silently. Worker-side state will
+		// be reclaimed by execution_id timeout / pool eviction.
+		auto context_lock = bind_data.context.lock();
+		if (!context_lock) {
+			return;
+		}
+		auto &context = *context_lock;
 
 		// --- Window destructor path ---
 		for (auto pid : window_partition_ids) {
@@ -698,7 +719,8 @@ unique_ptr<FunctionData> VgiAggregateFunctionBind(ClientContext &context, Aggreg
 	bind_data->resolved_output_schema = func_info.output_schema;
 	bind_data->input_schema = input_schema;
 	bind_data->catalog = func_info.catalog;
-	bind_data->context = &context;
+	// shared_from_this on ClientContext is safe — DuckDB owns it via shared_ptr.
+	bind_data->context = context.shared_from_this();
 	bind_data->const_values = const_values;
 
 	// Call aggregate_bind to get execution_id

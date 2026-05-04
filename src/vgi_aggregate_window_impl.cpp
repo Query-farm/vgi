@@ -357,7 +357,11 @@ void SendAggregateWindowDestructorRpc(ClientContext &context, const VgiAggregate
 void VgiAggregateWindowInit(AggregateInputData &aggr_input_data, const WindowPartitionInput &partition,
                              data_ptr_t g_state) {
 	auto &bind_data = aggr_input_data.bind_data->Cast<VgiAggregateBindData>();
-	auto &context = *bind_data.context;
+	auto context_lock = bind_data.context.lock();
+	if (!context_lock) {
+		throw IOException("VGI aggregate window: ClientContext is gone");
+	}
+	auto &context = *context_lock;
 
 	// Initialize the buffer as a window state (overwrites whatever
 	// VgiAggregateInitialize left there; VgiAggregateState is trivially
@@ -397,7 +401,11 @@ void VgiAggregateWindow(AggregateInputData &aggr_input_data, const WindowPartiti
 	}
 
 	auto &bind_data = aggr_input_data.bind_data->Cast<VgiAggregateBindData>();
-	auto &context = *bind_data.context;
+	auto context_lock = bind_data.context.lock();
+	if (!context_lock) {
+		throw IOException("VGI aggregate window: ClientContext is gone");
+	}
+	auto &context = *context_lock;
 
 	auto request = BuildAggregateWindowRequest(
 	    bind_data.function_name, bind_data.exec_state->execution_id, bind_data.attach_id,
@@ -477,7 +485,11 @@ void VgiAggregateWindowBatch(AggregateInputData &aggr_input_data, const WindowPa
 	}
 
 	auto &bind_data = aggr_input_data.bind_data->Cast<VgiAggregateBindData>();
-	auto &context = *bind_data.context;
+	auto context_lock = bind_data.context.lock();
+	if (!context_lock) {
+		throw IOException("VGI aggregate window: ClientContext is gone");
+	}
+	auto &context = *context_lock;
 
 	auto request = BuildAggregateWindowBatchRequest(
 	    bind_data.function_name, bind_data.exec_state->execution_id, bind_data.attach_id,
