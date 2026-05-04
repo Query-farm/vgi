@@ -1081,28 +1081,5 @@ std::shared_ptr<arrow::RecordBatch> BuildTableCreateRequest(
 	return arrow::RecordBatch::Make(batch_schema, 1, arrays);
 }
 
-std::shared_ptr<arrow::RecordBatch> BuildTableCreateParams(
-    const std::vector<uint8_t> &attach_id, const std::string &schema_name, const std::string &name,
-    const std::shared_ptr<arrow::Schema> &columns_schema, const std::string &on_conflict,
-    const std::vector<int> &not_null_constraints, const std::vector<std::vector<int>> &unique_constraints,
-    const std::vector<std::string> &check_constraints, const std::vector<std::vector<int>> &primary_key_constraints,
-    const std::vector<std::vector<uint8_t>> &foreign_key_constraints, const std::vector<uint8_t> &transaction_id) {
-	// Build inner TableCreateRequest batch
-	auto request_batch = BuildTableCreateRequest(attach_id, schema_name, name, columns_schema, on_conflict,
-	                                             not_null_constraints, unique_constraints, check_constraints,
-	                                             primary_key_constraints, foreign_key_constraints, transaction_id);
-
-	// Serialize to IPC bytes
-	auto request_bytes = SerializeToIpcBytes(request_batch);
-
-	// Wrap in params batch with single "request" column
-	auto params_schema = arrow::schema({
-	    arrow::field("request", arrow::binary(), false),
-	});
-	std::vector<std::shared_ptr<arrow::Array>> params_arrays;
-	params_arrays.push_back(BuildBinaryScalar(request_bytes));
-	return arrow::RecordBatch::Make(params_schema, 1, params_arrays);
-}
-
 } // namespace vgi
 } // namespace duckdb

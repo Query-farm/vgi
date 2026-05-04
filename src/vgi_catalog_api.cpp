@@ -527,9 +527,11 @@ void InvokeCatalogTableCreate(
     const std::vector<std::vector<int>> &primary_key_constraints,
     const std::vector<std::vector<uint8_t>> &foreign_key_constraints,
     ClientContext &context) {
-	auto params = BuildTableCreateParams(ctx.attach_id, schema_name, table_name, columns_schema, on_conflict,
-	                                     not_null_constraints, unique_constraints, check_constraints,
-	                                     primary_key_constraints, foreign_key_constraints, ctx.transaction_id);
+	auto request_batch = BuildTableCreateRequest(ctx.attach_id, schema_name, table_name, columns_schema, on_conflict,
+	                                             not_null_constraints, unique_constraints, check_constraints,
+	                                             primary_key_constraints, foreign_key_constraints, ctx.transaction_id);
+	auto request_bytes = SerializeToIpcBytes(request_batch);
+	auto params = generated::BuildCatalogTableCreateParams(request_bytes);
 	InvokeVoidRpc(ctx, "catalog_table_create", params, context);
 }
 

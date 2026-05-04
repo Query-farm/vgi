@@ -260,29 +260,18 @@ std::shared_ptr<arrow::RecordBatch> BuildTableFunctionStatisticsRequest(
     const std::vector<uint8_t> &bind_opaque_data = {});
 
 // ============================================================================
-// Hand-coded inner request builders (Complex bucket)
+// Hand-coded inner request builders
 // ============================================================================
 //
-// Simple/Container catalog method *Params are generated into
-// ``generated/vgi_request_builders.hpp`` (see ``vgi.codegen.cpp_request_builders``
-// in the sibling vgi-python repo). The hand-coded survivors below carry shapes
-// the generator does not yet emit. They build the inner request batch only;
-// the caller serialises with ``SerializeToIpcBytes`` and passes the bytes
-// through ``generated::BuildXxxParams(...)`` to produce the wire-shape RPC
-// params batch:
-//   - ``BuildCatalogAttachRequest``: catalog_attach's CatalogAttachRequest
-//     dataclass — fields ``name`` / ``options`` / nullable version strings.
-//     The generator could in principle emit an outer-only
-//     ``BuildCatalogAttachParams(bytes)`` (and does, in the generated header)
-//     but the inner shape is only ever needed at this one call site so it
-//     stays here rather than forming a second generator pass.
-//   - ``BuildTableCreateRequest`` / ``BuildTableCreateParams``: catalog_table_create
-//     params carry ``list<list<int32>>`` (unique/PK column groups) and
-//     ``list<binary>`` (foreign-key constraints) — the Complex bucket the
-//     generator skips via ``COMPLEX_METHODS``. ``BuildTableCreateParams`` is
-//     the still-in-one-shot form (Request + serialise + outer wrap); the
-//     remaining caller (vgi_catalog_api.cpp:528) hasn't been split because
-//     no generated alternative exists yet.
+// Every catalog method's outer ``*Params`` shape is now generated into
+// ``generated/vgi_request_builders.hpp`` from the Python ``VgiProtocol``
+// (see ``vgi.codegen.cpp_request_builders`` in the sibling vgi-python repo).
+// The hand-coded builders below produce the *inner* request batches that some
+// of those generated outer wrappers expect — the caller serialises an inner
+// batch with ``SerializeToIpcBytes`` and passes the bytes through
+// ``generated::BuildXxxParams(bytes)`` to get the wire-shape outer params.
+// Inner shapes carry list<list<int32>>, list<binary>, embedded Arrow schemas,
+// or other fields the generator does not yet emit.
 
 // Build the inner CatalogAttachRequest batch. Caller serialises and wraps
 // with ``generated::BuildCatalogAttachParams`` to produce the wire params.
@@ -293,18 +282,10 @@ std::shared_ptr<arrow::RecordBatch> BuildCatalogAttachRequest(
     const std::string &implementation_version = "");
 
 
-// Build a TableCreateRequest inner batch (serialized as IPC bytes in the outer params).
-// Fields match Python TableCreateRequest dataclass.
+// Build the inner TableCreateRequest batch (catalog_table_create's payload).
+// Fields match Python TableCreateRequest dataclass; serialise + wrap with
+// ``generated::BuildCatalogTableCreateParams`` for the wire params.
 std::shared_ptr<arrow::RecordBatch> BuildTableCreateRequest(
-    const std::vector<uint8_t> &attach_id, const std::string &schema_name, const std::string &name,
-    const std::shared_ptr<arrow::Schema> &columns_schema, const std::string &on_conflict,
-    const std::vector<int> &not_null_constraints, const std::vector<std::vector<int>> &unique_constraints,
-    const std::vector<std::string> &check_constraints, const std::vector<std::vector<int>> &primary_key_constraints,
-    const std::vector<std::vector<uint8_t>> &foreign_key_constraints,
-    const std::vector<uint8_t> &transaction_id = {});
-
-// Build params batch for catalog_table_create: wraps inner request as {request: binary}
-std::shared_ptr<arrow::RecordBatch> BuildTableCreateParams(
     const std::vector<uint8_t> &attach_id, const std::string &schema_name, const std::string &name,
     const std::shared_ptr<arrow::Schema> &columns_schema, const std::string &on_conflict,
     const std::vector<int> &not_null_constraints, const std::vector<std::vector<int>> &unique_constraints,
