@@ -4,6 +4,12 @@
 #include "vgi_arrow_ipc.hpp"
 #include "vgi_schema_registry.hpp"
 
+// Generated request builders — exposes ``duckdb::vgi::generated::Build<Name>Params(...)``
+// definitions that mirror the schemas in ``generated/vgi_protocol_schemas.hpp``.
+// Including here is the only TU that pulls them in; the file is header-only
+// inline functions, so ODR is satisfied by the single inclusion.
+#include "generated/vgi_request_builders.hpp"
+
 namespace duckdb {
 namespace vgi {
 
@@ -26,36 +32,6 @@ std::shared_ptr<arrow::Array> FinishArray(BuilderType &builder, const char *name
 	return result.ValueUnsafe();
 }
 
-// Helper to build a binary array with a single value (or null if empty)
-std::shared_ptr<arrow::Array> BuildBinaryScalar(const std::vector<uint8_t> &bytes) {
-	arrow::BinaryBuilder builder;
-	if (bytes.empty()) {
-		CheckStatus(builder.AppendNull(), "append null binary");
-	} else {
-		CheckStatus(builder.Append(bytes.data(), bytes.size()), "append binary");
-	}
-	return FinishArray(builder, "binary");
-}
-
-
-// Helper to build a utf8 array with a single value
-std::shared_ptr<arrow::Array> BuildStringScalar(const std::string &value) {
-	arrow::StringBuilder builder;
-	CheckStatus(builder.Append(value), "append string");
-	return FinishArray(builder, "string");
-}
-
-// Helper to build a nullable utf8 array (null if empty string)
-std::shared_ptr<arrow::Array> BuildNullableStringScalar(const std::string &value) {
-	arrow::StringBuilder builder;
-	if (value.empty()) {
-		CheckStatus(builder.AppendNull(), "append null string");
-	} else {
-		CheckStatus(builder.Append(value), "append string");
-	}
-	return FinishArray(builder, "nullable_string");
-}
-
 // Helper to build a null dictionary(int16, utf8) array
 std::shared_ptr<arrow::Array> BuildNullDictionaryArray(
     const std::shared_ptr<arrow::DataType> &dict_type,
@@ -76,6 +52,204 @@ std::shared_ptr<arrow::Array> BuildNullDictionaryArray(
 }
 
 } // namespace
+
+// ============================================================================
+// Single-row builders (declared in vgi_rpc_types.hpp).
+// ============================================================================
+//
+// "Required" non-Optional helpers always emit a non-null entry; the existing
+// "empty == null" helpers (BuildBinaryScalar, BuildNullableStringScalar) are
+// retained inside this TU for the legacy hand-coded BuildXxxParams that still
+// rely on the empty-vector-as-null convention. The Optional helpers below are
+// what the codegen calls into.
+
+std::shared_ptr<arrow::Array> BuildBinaryScalarRequired(const std::vector<uint8_t> &value) {
+	arrow::BinaryBuilder builder;
+	CheckStatus(builder.Append(value.data(), value.size()), "append binary required");
+	return FinishArray(builder, "binary");
+}
+
+std::shared_ptr<arrow::Array> BuildOptionalBinaryScalar(const std::optional<std::vector<uint8_t>> &value) {
+	arrow::BinaryBuilder builder;
+	if (!value.has_value()) {
+		CheckStatus(builder.AppendNull(), "append null binary");
+	} else {
+		CheckStatus(builder.Append(value->data(), value->size()), "append binary");
+	}
+	return FinishArray(builder, "optional_binary");
+}
+
+std::shared_ptr<arrow::Array> BuildStringScalar(const std::string &value) {
+	arrow::StringBuilder builder;
+	CheckStatus(builder.Append(value), "append string");
+	return FinishArray(builder, "string");
+}
+
+std::shared_ptr<arrow::Array> BuildOptionalStringScalar(const std::optional<std::string> &value) {
+	arrow::StringBuilder builder;
+	if (!value.has_value()) {
+		CheckStatus(builder.AppendNull(), "append null string");
+	} else {
+		CheckStatus(builder.Append(*value), "append string");
+	}
+	return FinishArray(builder, "optional_string");
+}
+
+std::shared_ptr<arrow::Array> BuildBoolScalar(bool value) {
+	arrow::BooleanBuilder builder;
+	CheckStatus(builder.Append(value), "append bool");
+	return FinishArray(builder, "bool");
+}
+
+std::shared_ptr<arrow::Array> BuildOptionalBoolScalar(std::optional<bool> value) {
+	arrow::BooleanBuilder builder;
+	if (!value.has_value()) {
+		CheckStatus(builder.AppendNull(), "append null bool");
+	} else {
+		CheckStatus(builder.Append(*value), "append bool");
+	}
+	return FinishArray(builder, "optional_bool");
+}
+
+std::shared_ptr<arrow::Array> BuildInt32Scalar(int32_t value) {
+	arrow::Int32Builder builder;
+	CheckStatus(builder.Append(value), "append int32");
+	return FinishArray(builder, "int32");
+}
+
+std::shared_ptr<arrow::Array> BuildOptionalInt32Scalar(std::optional<int32_t> value) {
+	arrow::Int32Builder builder;
+	if (!value.has_value()) {
+		CheckStatus(builder.AppendNull(), "append null int32");
+	} else {
+		CheckStatus(builder.Append(*value), "append int32");
+	}
+	return FinishArray(builder, "optional_int32");
+}
+
+std::shared_ptr<arrow::Array> BuildInt64Scalar(int64_t value) {
+	arrow::Int64Builder builder;
+	CheckStatus(builder.Append(value), "append int64");
+	return FinishArray(builder, "int64");
+}
+
+std::shared_ptr<arrow::Array> BuildOptionalInt64Scalar(std::optional<int64_t> value) {
+	arrow::Int64Builder builder;
+	if (!value.has_value()) {
+		CheckStatus(builder.AppendNull(), "append null int64");
+	} else {
+		CheckStatus(builder.Append(*value), "append int64");
+	}
+	return FinishArray(builder, "optional_int64");
+}
+
+std::shared_ptr<arrow::Array> BuildOptionalEnumArray(const std::optional<std::string> &value,
+                                                      const std::vector<std::string> &dictionary_values) {
+	if (!value.has_value()) {
+		auto dict_type = arrow::dictionary(arrow::int16(), arrow::utf8());
+		return BuildNullDictionaryArray(dict_type, dictionary_values);
+	}
+	return BuildEnumArray(*value, dictionary_values);
+}
+
+namespace {
+// "Empty == null" legacy variants used by hand-coded BuildXxxParams in the
+// Complex bucket and a handful of older call sites. New code goes through
+// the explicit-optional helpers above.
+std::shared_ptr<arrow::Array> BuildBinaryScalar(const std::vector<uint8_t> &bytes) {
+	arrow::BinaryBuilder builder;
+	if (bytes.empty()) {
+		CheckStatus(builder.AppendNull(), "append null binary");
+	} else {
+		CheckStatus(builder.Append(bytes.data(), bytes.size()), "append binary");
+	}
+	return FinishArray(builder, "binary");
+}
+
+std::shared_ptr<arrow::Array> BuildNullableStringScalar(const std::string &value) {
+	arrow::StringBuilder builder;
+	if (value.empty()) {
+		CheckStatus(builder.AppendNull(), "append null string");
+	} else {
+		CheckStatus(builder.Append(value), "append string");
+	}
+	return FinishArray(builder, "nullable_string");
+}
+} // namespace
+
+// list<T> single-row builders.
+
+std::shared_ptr<arrow::Array> BuildStringListScalar(const std::vector<std::string> &values) {
+	auto value_builder = std::make_shared<arrow::StringBuilder>();
+	arrow::ListBuilder list_builder(arrow::default_memory_pool(), value_builder);
+	CheckStatus(list_builder.Append(), "start string list");
+	for (const auto &v : values) {
+		CheckStatus(value_builder->Append(v), "append string item");
+	}
+	return FinishArray(list_builder, "string_list");
+}
+
+std::shared_ptr<arrow::Array> BuildBinaryListScalar(const std::vector<std::vector<uint8_t>> &values) {
+	auto value_builder = std::make_shared<arrow::BinaryBuilder>();
+	arrow::ListBuilder list_builder(arrow::default_memory_pool(), value_builder);
+	CheckStatus(list_builder.Append(), "start binary list");
+	for (const auto &v : values) {
+		CheckStatus(value_builder->Append(v.data(), v.size()), "append binary item");
+	}
+	return FinishArray(list_builder, "binary_list");
+}
+
+std::shared_ptr<arrow::Array> BuildInt32ListScalar(const std::vector<int32_t> &values) {
+	auto value_builder = std::make_shared<arrow::Int32Builder>();
+	arrow::ListBuilder list_builder(arrow::default_memory_pool(), value_builder);
+	CheckStatus(list_builder.Append(), "start int32 list");
+	for (auto v : values) {
+		CheckStatus(value_builder->Append(v), "append int32 item");
+	}
+	return FinishArray(list_builder, "int32_list");
+}
+
+std::shared_ptr<arrow::Array> BuildInt64ListScalar(const std::vector<int64_t> &values) {
+	auto value_builder = std::make_shared<arrow::Int64Builder>();
+	arrow::ListBuilder list_builder(arrow::default_memory_pool(), value_builder);
+	CheckStatus(list_builder.Append(), "start int64 list");
+	for (auto v : values) {
+		CheckStatus(value_builder->Append(v), "append int64 item");
+	}
+	return FinishArray(list_builder, "int64_list");
+}
+
+// map<utf8, utf8> single-row builders.
+
+std::shared_ptr<arrow::Array>
+BuildStringMapScalar(const std::vector<std::pair<std::string, std::string>> &entries) {
+	auto key_builder = std::make_shared<arrow::StringBuilder>();
+	auto value_builder = std::make_shared<arrow::StringBuilder>();
+	arrow::MapBuilder builder(arrow::default_memory_pool(), key_builder, value_builder);
+	CheckStatus(builder.Append(), "start string map");
+	for (const auto &[k, v] : entries) {
+		CheckStatus(key_builder->Append(k), "append map key");
+		CheckStatus(value_builder->Append(v), "append map value");
+	}
+	return FinishArray(builder, "string_map");
+}
+
+std::shared_ptr<arrow::Array>
+BuildOptionalStringMapScalar(const std::optional<std::vector<std::pair<std::string, std::string>>> &entries) {
+	auto key_builder = std::make_shared<arrow::StringBuilder>();
+	auto value_builder = std::make_shared<arrow::StringBuilder>();
+	arrow::MapBuilder builder(arrow::default_memory_pool(), key_builder, value_builder);
+	if (!entries.has_value()) {
+		CheckStatus(builder.AppendNull(), "append null map");
+	} else {
+		CheckStatus(builder.Append(), "start string map");
+		for (const auto &[k, v] : *entries) {
+			CheckStatus(key_builder->Append(k), "append map key");
+			CheckStatus(value_builder->Append(v), "append map value");
+		}
+	}
+	return FinishArray(builder, "optional_string_map");
+}
 
 // ============================================================================
 // IPC Bytes Serialization

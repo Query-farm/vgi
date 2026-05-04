@@ -260,6 +260,32 @@ Catalogs may register additional settings at `ATTACH` time (e.g., `greeting`, `m
 | `vgi_scalar_function_impl.hpp` | `VgiScalarFunctionInfo`, `VgiScalarFunctionBindData` |
 | `storage/vgi_catalog_set.hpp` | `VgiCatalogSet` with `CreateEntryLocked()` (requires lock held) |
 
+### Generated Code (`src/generated/`)
+
+These headers are produced by generators in the sibling `vgi-python` repo from
+the `VgiProtocol` Protocol class — they are the single source of truth for the
+RPC wire shape, so hand-coding the C++ side leaves room for drift bugs. Do not
+edit these files by hand; regenerate.
+
+| File | Generator | Purpose |
+|------|-----------|---------|
+| `vgi_protocol_schemas.hpp` | `python -m vgi.codegen.cpp_schemas` | One `XxxParamsSchema()` / `XxxResponseSchema()` factory per RPC method |
+| `vgi_request_builders.hpp` | `python -m vgi.codegen.cpp_request_builders` | One `BuildXxxParams(...)` builder per RPC method, taking `std::optional<T>` for nullable fields |
+
+Regenerate after changing `VgiProtocol`:
+
+```bash
+cd ~/Development/vgi-python
+uv run python -m vgi.codegen.cpp_schemas \
+    > ~/Development/vgi/src/generated/vgi_protocol_schemas.hpp
+uv run python -m vgi.codegen.cpp_request_builders \
+    > ~/Development/vgi/src/generated/vgi_request_builders.hpp
+```
+
+Drift is enforced by `tests/test_generated_cpp_schemas.py` and
+`tests/test_generated_cpp_request_builders.py` in `vgi-python` (CI fails if the
+checked-in headers diverge from the generators).
+
 ## Coding Conventions
 
 ### Arrow-to-DuckDB Type Conversion

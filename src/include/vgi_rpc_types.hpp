@@ -54,6 +54,51 @@ std::vector<uint8_t> SerializeForeignKeyToIpcBytes(const std::vector<std::string
 std::shared_ptr<arrow::Array> BuildEnumArray(const std::string &value,
                                               const std::vector<std::string> &dictionary_values);
 
+// Optional variant: when ``value`` is std::nullopt, emits a single-row null
+// dictionary array; otherwise identical to ``BuildEnumArray``.
+std::shared_ptr<arrow::Array> BuildOptionalEnumArray(const std::optional<std::string> &value,
+                                                      const std::vector<std::string> &dictionary_values);
+
+// ============================================================================
+// Single-row scalar/list/map builders for the codegen'd request builders.
+// ============================================================================
+//
+// These are public-API helpers consumed by ``vgi/src/generated/vgi_request_builders.hpp``
+// (whose generator lives in vgi-python ``vgi/codegen/cpp_request_builders.py``).
+// Every helper appends exactly one element to a new builder and returns a
+// single-row Array. The non-Optional variants always emit a non-null entry
+// (use them for fields the schema declares ``nullable=false``); the Optional
+// variants emit a null entry when the input is std::nullopt.
+//
+// The generator picks helper names from a fixed mapping; if you change a
+// helper signature here, regenerate the header and re-build.
+
+std::shared_ptr<arrow::Array> BuildBinaryScalarRequired(const std::vector<uint8_t> &value);
+std::shared_ptr<arrow::Array> BuildOptionalBinaryScalar(const std::optional<std::vector<uint8_t>> &value);
+
+std::shared_ptr<arrow::Array> BuildStringScalar(const std::string &value);
+std::shared_ptr<arrow::Array> BuildOptionalStringScalar(const std::optional<std::string> &value);
+
+std::shared_ptr<arrow::Array> BuildBoolScalar(bool value);
+std::shared_ptr<arrow::Array> BuildOptionalBoolScalar(std::optional<bool> value);
+
+std::shared_ptr<arrow::Array> BuildInt32Scalar(int32_t value);
+std::shared_ptr<arrow::Array> BuildOptionalInt32Scalar(std::optional<int32_t> value);
+
+std::shared_ptr<arrow::Array> BuildInt64Scalar(int64_t value);
+std::shared_ptr<arrow::Array> BuildOptionalInt64Scalar(std::optional<int64_t> value);
+
+// list<utf8>, list<binary>, list<int32>, list<int64> — single-row lists, always non-null.
+std::shared_ptr<arrow::Array> BuildStringListScalar(const std::vector<std::string> &values);
+std::shared_ptr<arrow::Array> BuildBinaryListScalar(const std::vector<std::vector<uint8_t>> &values);
+std::shared_ptr<arrow::Array> BuildInt32ListScalar(const std::vector<int32_t> &values);
+std::shared_ptr<arrow::Array> BuildInt64ListScalar(const std::vector<int64_t> &values);
+
+// map<utf8, utf8> single-row scalars.
+std::shared_ptr<arrow::Array> BuildStringMapScalar(const std::vector<std::pair<std::string, std::string>> &entries);
+std::shared_ptr<arrow::Array>
+BuildOptionalStringMapScalar(const std::optional<std::vector<std::pair<std::string, std::string>>> &entries);
+
 // ============================================================================
 // BindRequest / BindResponse
 // ============================================================================
