@@ -43,8 +43,9 @@ void VgiAggregateFunctionSet::LoadEntries(ClientContext &context) {
 	auto function_list = vgi::InvokeCatalogSchemaContentsFunctions(rpc_ctx, schema_.name,
 	                                                               "AGGREGATE_FUNCTION", context);
 
-	// Group functions by name (overloads)
-	std::unordered_map<std::string, std::vector<vgi::VgiFunctionInfo>> functions_by_name;
+	// Group functions by name (overloads). std::map (not unordered_map)
+	// for stable iteration order — see B43 note in vgi_table_function_set.cpp.
+	std::map<std::string, std::vector<vgi::VgiFunctionInfo>> functions_by_name;
 	for (auto &func_info : function_list) {
 		if (func_info.function_type != vgi::VgiFunctionType::Aggregate) {
 			throw IOException("VGI worker returned '%s' function_type when 'aggregate' was requested (function: %s)",

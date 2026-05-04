@@ -185,8 +185,13 @@ void VgiTableFunctionSet::LoadEntries(ClientContext &context) {
 	auto function_list = vgi::InvokeCatalogSchemaContentsFunctions(rpc_ctx, schema_.name,
 	                                                               "TABLE_FUNCTION", context);
 
-	// Group functions by name (overloads)
-	std::unordered_map<std::string, std::vector<vgi::VgiFunctionInfo>> functions_by_name;
+	// Group functions by name (overloads). std::map (not unordered_map) so
+	// the iteration order over `functions_by_name` is stable across runs
+	// and stdlib versions — overload resolution treats the order in which
+	// signatures are added to a TableFunctionSet as significant for
+	// ambiguous matches, and we don't want non-determinism from libstdc++
+	// hash-bucket order leaking into user-visible function dispatch.
+	std::map<std::string, std::vector<vgi::VgiFunctionInfo>> functions_by_name;
 	for (auto &func_info : function_list) {
 		if (func_info.function_type != vgi::VgiFunctionType::Table) {
 			throw IOException("VGI worker returned '%s' function_type when 'table' was requested (function: %s)",

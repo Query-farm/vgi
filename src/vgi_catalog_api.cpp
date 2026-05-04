@@ -1850,25 +1850,38 @@ VgiFunctionInfo ParseFunctionInfo(const std::shared_ptr<arrow::RecordBatch> &bat
 	}
 
 	// Documentation fields
-	// examples is a list of structs with {sql, description, expected_output} - extract sql strings
+	// examples is a list of structs with {sql, description, expected_output} - extract sql strings.
+	// Some Arrow producers (depending on version / language binding) emit
+	// LargeListArray instead of ListArray; handle both so a wire-format
+	// drift doesn't silently drop the examples list.
 	auto examples_col = batch->GetColumnByName("examples");
-	if (examples_col) {
-		auto list_array = std::dynamic_pointer_cast<arrow::ListArray>(examples_col);
-		if (list_array && !list_array->IsNull(row_idx)) {
-			auto start = list_array->value_offset(row_idx);
-			auto end = list_array->value_offset(row_idx + 1);
-			auto struct_array = std::dynamic_pointer_cast<arrow::StructArray>(list_array->values());
-			if (struct_array) {
-				auto sql_field = struct_array->GetFieldByName("sql");
-				auto sql_array = std::dynamic_pointer_cast<arrow::StringArray>(sql_field);
-				if (sql_array) {
-					for (int64_t i = start; i < end; i++) {
-						if (!sql_array->IsNull(i)) {
-							info.examples.push_back(sql_array->GetString(i));
-						}
-					}
-				}
+	auto extract_examples = [&](auto list_array) {
+		if (!list_array || list_array->IsNull(row_idx)) {
+			return;
+		}
+		auto start = list_array->value_offset(row_idx);
+		auto end = list_array->value_offset(row_idx + 1);
+		auto struct_array = std::dynamic_pointer_cast<arrow::StructArray>(list_array->values());
+		if (!struct_array) {
+			return;
+		}
+		auto sql_field = struct_array->GetFieldByName("sql");
+		auto sql_array = std::dynamic_pointer_cast<arrow::StringArray>(sql_field);
+		if (!sql_array) {
+			return;
+		}
+		for (auto i = start; i < end; i++) {
+			if (!sql_array->IsNull(i)) {
+				info.examples.push_back(sql_array->GetString(i));
 			}
+		}
+	};
+	if (examples_col) {
+		if (auto list_array = std::dynamic_pointer_cast<arrow::ListArray>(examples_col)) {
+			extract_examples(list_array);
+		} else if (auto large_list_array =
+		               std::dynamic_pointer_cast<arrow::LargeListArray>(examples_col)) {
+			extract_examples(large_list_array);
 		}
 	}
 	// categories is a simple list of strings
