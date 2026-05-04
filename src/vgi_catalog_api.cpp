@@ -240,7 +240,9 @@ CatalogAttachResult InvokeCatalogAttach(const std::string &worker_path, const st
 		options_ipc_bytes = SerializeToIpcBytes(options_batch);
 	}
 
-	auto params = BuildCatalogAttachParams(catalog_name, options_ipc_bytes, data_version_spec, implementation_version);
+	auto request_batch = BuildCatalogAttachRequest(catalog_name, options_ipc_bytes, data_version_spec, implementation_version);
+	auto request_bytes = SerializeToIpcBytes(request_batch);
+	auto params = generated::BuildCatalogAttachParams(request_bytes);
 	auto response = InvokeRpcMethod(ctx, "catalog_attach", params, context);
 	auto result_batch = ExtractAndDeserializeResult(response, "catalog_attach", worker_path);
 	if (!result_batch) {

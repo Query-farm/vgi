@@ -934,13 +934,14 @@ TableFunctionCardinalityResult ParseTableFunctionCardinalityResult(const std::sh
 }
 
 // ============================================================================
-// RPC Params Builders
+// Inner request builders (Complex bucket — kept hand-coded)
 // ============================================================================
 
-std::shared_ptr<arrow::RecordBatch> BuildCatalogAttachParams(const std::string &name,
-                                                             const std::vector<uint8_t> &options_ipc_bytes,
-                                                             const std::string &data_version_spec,
-                                                             const std::string &implementation_version) {
+std::shared_ptr<arrow::RecordBatch> BuildCatalogAttachRequest(
+    const std::string &name,
+    const std::vector<uint8_t> &options_ipc_bytes,
+    const std::string &data_version_spec,
+    const std::string &implementation_version) {
 	// Matches vgi-python's CatalogAttachRequest (vgi/protocol.py:193). The
 	// pyarrow-inferred wire schema marks `options` as not null (even though
 	// the dataclass defaults it to None) and `data_version_spec` /
@@ -958,23 +959,8 @@ std::shared_ptr<arrow::RecordBatch> BuildCatalogAttachParams(const std::string &
 	request_arrays.push_back(BuildBinaryScalar(options_ipc_bytes));
 	request_arrays.push_back(BuildNullableStringScalar(data_version_spec));
 	request_arrays.push_back(BuildNullableStringScalar(implementation_version));
-	auto request_batch = arrow::RecordBatch::Make(request_schema, 1, request_arrays);
-
-	// Serialize to IPC bytes (matching ArrowSerializableDataclass.serialize_to_bytes())
-	auto request_bytes = SerializeToIpcBytes(request_batch);
-
-	// Wrap in params batch with single "request" column (matching method signature)
-	auto params_schema = arrow::schema({
-	    arrow::field("request", arrow::binary(), false),
-	});
-	std::vector<std::shared_ptr<arrow::Array>> params_arrays;
-	params_arrays.push_back(BuildBinaryScalar(request_bytes));
-	return arrow::RecordBatch::Make(params_schema, 1, params_arrays);
+	return arrow::RecordBatch::Make(request_schema, 1, request_arrays);
 }
-
-// ============================================================================
-// DDL Params Builders (Complex bucket — kept hand-coded)
-// ============================================================================
 
 std::shared_ptr<arrow::RecordBatch> BuildTableCreateRequest(
     const std::vector<uint8_t> &attach_id, const std::string &schema_name, const std::string &name,

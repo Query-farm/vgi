@@ -260,29 +260,37 @@ std::shared_ptr<arrow::RecordBatch> BuildTableFunctionStatisticsRequest(
     const std::vector<uint8_t> &bind_opaque_data = {});
 
 // ============================================================================
-// Hand-coded RPC Params Builders (Complex bucket)
+// Hand-coded inner request builders (Complex bucket)
 // ============================================================================
 //
-// All Simple/Container catalog method params are now generated into
+// Simple/Container catalog method *Params are generated into
 // ``generated/vgi_request_builders.hpp`` (see ``vgi.codegen.cpp_request_builders``
-// in the sibling vgi-python repo). The two hand-coded survivors below carry
-// shapes the generator does not yet emit:
-//   - ``BuildCatalogAttachParams``: builds the inner CatalogAttachRequest *and*
-//     wraps it as ``{request: binary}``. The generated version takes only the
-//     pre-serialized bytes; splitting this into a Request+Params pair is
-//     follow-up work.
-//   - ``BuildTableCreate{Request,Params}``: catalog_table_create's params carry
-//     ``list<list<int32>>`` (unique/PK column groups) and ``list<binary>``
-//     (foreign-key constraints) — the Complex bucket the generator skips.
+// in the sibling vgi-python repo). The hand-coded survivors below carry shapes
+// the generator does not yet emit. They build the inner request batch only;
+// the caller serialises with ``SerializeToIpcBytes`` and passes the bytes
+// through ``generated::BuildXxxParams(...)`` to produce the wire-shape RPC
+// params batch:
+//   - ``BuildCatalogAttachRequest``: catalog_attach's CatalogAttachRequest
+//     dataclass — fields ``name`` / ``options`` / nullable version strings.
+//     The generator could in principle emit an outer-only
+//     ``BuildCatalogAttachParams(bytes)`` (and does, in the generated header)
+//     but the inner shape is only ever needed at this one call site so it
+//     stays here rather than forming a second generator pass.
+//   - ``BuildTableCreateRequest`` / ``BuildTableCreateParams``: catalog_table_create
+//     params carry ``list<list<int32>>`` (unique/PK column groups) and
+//     ``list<binary>`` (foreign-key constraints) — the Complex bucket the
+//     generator skips via ``COMPLEX_METHODS``. ``BuildTableCreateParams`` is
+//     the still-in-one-shot form (Request + serialise + outer wrap); the
+//     remaining caller (vgi_catalog_api.cpp:528) hasn't been split because
+//     no generated alternative exists yet.
 
-// Build params batch for catalog_attach matching the vgi-python
-// CatalogAttachRequest. ``options_ipc_bytes`` carries an IPC-serialized
-// one-row RecordBatch of user-supplied attach options (empty = None on the
-// wire). Empty version strings mean "no client constraint".
-std::shared_ptr<arrow::RecordBatch> BuildCatalogAttachParams(const std::string &name,
-                                                             const std::vector<uint8_t> &options_ipc_bytes = {},
-                                                             const std::string &data_version_spec = "",
-                                                             const std::string &implementation_version = "");
+// Build the inner CatalogAttachRequest batch. Caller serialises and wraps
+// with ``generated::BuildCatalogAttachParams`` to produce the wire params.
+std::shared_ptr<arrow::RecordBatch> BuildCatalogAttachRequest(
+    const std::string &name,
+    const std::vector<uint8_t> &options_ipc_bytes = {},
+    const std::string &data_version_spec = "",
+    const std::string &implementation_version = "");
 
 
 // Build a TableCreateRequest inner batch (serialized as IPC bytes in the outer params).
