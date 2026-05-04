@@ -11,6 +11,7 @@
 #include "vgi_logging.hpp"
 #include "vgi_rpc_client.hpp"
 #include "vgi_rpc_types.hpp"
+#include "generated/vgi_request_builders.hpp"
 
 namespace duckdb {
 namespace vgi {
@@ -270,7 +271,7 @@ BindResult HttpFunctionConnection::PerformBindFull() {
 
 	// Transport: send bind via HTTP
 	auto transport_fn = [&](const std::vector<uint8_t> &request_bytes) -> std::shared_ptr<arrow::RecordBatch> {
-		auto rpc_params = BuildBindRpcParams(request_bytes);
+		auto rpc_params = ::duckdb::vgi::generated::BuildBindParams(request_bytes);
 		auto auth = attach_params_ ? attach_params_->auth() : nullptr;
 		auto cached_params = attach_params_
 		    ? attach_params_->GetOrInitHttpParams(context_, base_url_) : nullptr;
@@ -365,7 +366,7 @@ InitResult HttpFunctionConnection::PerformInit(const std::vector<int32_t> &proje
 	    ob_col, ob_dir, ob_null, ob_limit,
 	    ts_percentage, ts_seed);
 	auto init_request_bytes = SerializeToIpcBytes(init_request);
-	auto rpc_params = BuildInitRpcParams(init_request_bytes);
+	auto rpc_params = ::duckdb::vgi::generated::BuildInitParams(init_request_bytes);
 
 	// Serialize the init RPC request to Arrow IPC
 	auto body = SerializeRpcRequest("init", rpc_params);

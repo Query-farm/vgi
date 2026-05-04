@@ -12,6 +12,7 @@
 #include "vgi_logging.hpp"
 #include "vgi_rpc_client.hpp"
 #include "vgi_rpc_types.hpp"
+#include "generated/vgi_request_builders.hpp"
 #include "vgi_schema_registry.hpp"
 #include "vgi_shm_segment.hpp"
 #include "vgi_transport.hpp"
@@ -193,7 +194,7 @@ BindResult FunctionConnection::PerformBindFull() {
 
 	// Transport: send bind via subprocess stdin/stdout
 	auto transport_fn = [&](const std::vector<uint8_t> &request_bytes) -> std::shared_ptr<arrow::RecordBatch> {
-		auto rpc_params = BuildBindRpcParams(request_bytes);
+		auto rpc_params = generated::BuildBindParams(request_bytes);
 		ValidateRequestSchema(rpc_params, "bind", worker_path_);
 		try {
 			WriteRpcRequest(proc_->GetStdinFd(), "bind", rpc_params);
@@ -313,7 +314,7 @@ InitResult FunctionConnection::PerformInit(const std::vector<int32_t> &projectio
 	// reads SHM_SEGMENT_NAME_KEY / SHM_SEGMENT_SIZE_KEY in
 	// _maybe_attach_shm and writes batches into it. Reset the allocator
 	// before each request so the worker starts fresh.
-	auto rpc_params = BuildInitRpcParams(init_request_bytes);
+	auto rpc_params = generated::BuildInitParams(init_request_bytes);
 	ValidateRequestSchema(rpc_params, "init", worker_path_);
 	std::shared_ptr<arrow::KeyValueMetadata> shm_metadata;
 	if (const char *env = std::getenv("VGI_RPC_SHM_SIZE_BYTES"); env && *env) {

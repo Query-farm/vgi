@@ -23,6 +23,7 @@
 #include "vgi_protocol_constants.hpp"
 #include "vgi_rpc_client.hpp"
 #include "vgi_rpc_types.hpp"
+#include "generated/vgi_request_builders.hpp"
 #include "vgi_schema_registry.hpp"
 #include "vgi_transport.hpp"
 #include "vgi_unary_rpc.hpp"
@@ -32,6 +33,35 @@ using namespace duckdb_yyjson; // NOLINT
 
 namespace duckdb {
 namespace vgi {
+
+namespace {
+
+// Adapt CatalogRpcContext::transaction_id (`std::vector<uint8_t>`, empty == none)
+// to the std::optional<std::vector<uint8_t>> shape the generated request builders
+// expect. The empty-as-absent convention predates the generators; rather than
+// thread std::optional through every storage-layer ctx construction, we wrap
+// here at the catalog-API boundary.
+inline std::optional<std::vector<uint8_t>> OptTxn(const CatalogRpcContext &ctx) {
+	return ctx.transaction_id.empty()
+	           ? std::nullopt
+	           : std::optional<std::vector<uint8_t>>(ctx.transaction_id);
+}
+
+// Adapt empty-string-as-absent strings (e.g. at_unit/at_value time-travel args)
+// to std::optional<std::string>. Mirrors the legacy BuildNullableStringScalar
+// behaviour the hand-coded builders relied on.
+inline std::optional<std::string> OptStrIfNonEmpty(const std::string &s) {
+	return s.empty() ? std::nullopt : std::optional<std::string>(s);
+}
+
+// Adapt explicit (value, is_null) pairs from the existing Invoke* signatures
+// to std::optional<std::string>. Used for COMMENT ON ... and similar where the
+// caller carries an out-of-band null flag.
+inline std::optional<std::string> OptStrNullable(const std::string &s, bool is_null) {
+	return is_null ? std::nullopt : std::optional<std::string>(s);
+}
+
+}  // namespace
 
 // ============================================================================
 // VgiAttachParameters — HTTPParams cache accessor
@@ -221,7 +251,7 @@ CatalogAttachResult InvokeCatalogAttach(const std::string &worker_path, const st
 
 std::vector<VgiSchemaInfo> InvokeCatalogSchemas(const CatalogRpcContext &ctx, ClientContext &context) {
 	auto &worker_path = ctx.params->worker_path();
-	auto params = BuildAttachIdParams(ctx.attach_id, ctx.transaction_id);
+	auto params = generated::BuildCatalogSchemasParams(ctx.attach_id, OptTxn(ctx));
 	auto response = InvokeRpcMethod(ctx, "catalog_schemas", params, context);
 	auto result_batch = ExtractAndDeserializeResult(response, "catalog_schemas", worker_path);
 	if (!result_batch) {
@@ -240,7 +270,7 @@ std::vector<VgiSchemaInfo> InvokeCatalogSchemas(const CatalogRpcContext &ctx, Cl
 std::vector<VgiTableInfo> InvokeCatalogSchemaContentsTables(const CatalogRpcContext &ctx,
                                                             const std::string &schema_name, ClientContext &context) {
 	auto &worker_path = ctx.params->worker_path();
-	auto params = BuildSchemaContentsParams(ctx.attach_id, schema_name, ctx.transaction_id);
+	auto params = generated::BuildCatalogSchemaContentsTablesParams(ctx.attach_id, schema_name, OptTxn(ctx));
 	auto response = InvokeRpcMethod(ctx, "catalog_schema_contents_tables", params, context);
 	auto result_batch = ExtractAndDeserializeResult(response, "catalog_schema_contents_tables", worker_path);
 	if (!result_batch) {
@@ -259,7 +289,7 @@ std::vector<VgiTableInfo> InvokeCatalogSchemaContentsTables(const CatalogRpcCont
 std::vector<VgiViewInfo> InvokeCatalogSchemaContentsViews(const CatalogRpcContext &ctx,
                                                           const std::string &schema_name, ClientContext &context) {
 	auto &worker_path = ctx.params->worker_path();
-	auto params = BuildSchemaContentsParams(ctx.attach_id, schema_name, ctx.transaction_id);
+	auto params = generated::BuildCatalogSchemaContentsViewsParams(ctx.attach_id, schema_name, OptTxn(ctx));
 	auto response = InvokeRpcMethod(ctx, "catalog_schema_contents_views", params, context);
 	auto result_batch = ExtractAndDeserializeResult(response, "catalog_schema_contents_views", worker_path);
 	if (!result_batch) {
@@ -279,7 +309,7 @@ std::vector<VgiFunctionInfo> InvokeCatalogSchemaContentsFunctions(
     const CatalogRpcContext &ctx, const std::string &schema_name,
     const std::string &function_type, ClientContext &context) {
 	auto &worker_path = ctx.params->worker_path();
-	auto params = BuildSchemaContentsFunctionsParams(ctx.attach_id, schema_name, function_type, ctx.transaction_id);
+	auto params = generated::BuildCatalogSchemaContentsFunctionsParams(ctx.attach_id, schema_name, function_type, OptTxn(ctx));
 	auto response = InvokeRpcMethod(ctx, "catalog_schema_contents_functions", params, context);
 	auto result_batch = ExtractAndDeserializeResult(response, "catalog_schema_contents_functions", worker_path);
 	if (!result_batch) {
@@ -299,7 +329,7 @@ std::vector<VgiMacroInfo> InvokeCatalogSchemaContentsMacros(
     const CatalogRpcContext &ctx, const std::string &schema_name,
     const std::string &macro_type, ClientContext &context) {
 	auto &worker_path = ctx.params->worker_path();
-	auto params = BuildSchemaContentsFunctionsParams(ctx.attach_id, schema_name, macro_type, ctx.transaction_id);
+	auto params = generated::BuildCatalogSchemaContentsMacrosParams(ctx.attach_id, schema_name, macro_type, OptTxn(ctx));
 	auto response = InvokeRpcMethod(ctx, "catalog_schema_contents_macros", params, context);
 	auto result_batch = ExtractAndDeserializeResult(response, "catalog_schema_contents_macros", worker_path);
 	if (!result_batch) {
@@ -320,10 +350,9 @@ std::optional<VgiTableInfo> InvokeCatalogTableGet(const CatalogRpcContext &ctx,
                                                    ClientContext &context) {
 	auto &worker_path = ctx.params->worker_path();
 	// catalog_table_get's Protocol schema always includes at_unit/at_value (nullable);
-	// the overload without time-travel passes empty strings, which BuildNullableStringScalar
-	// serializes as nulls.
-	auto params = BuildTableGetWithAtParams(ctx.attach_id, schema_name, table_name,
-	                                        /*at_unit=*/"", /*at_value=*/"", ctx.transaction_id);
+	// the overload without time-travel passes std::nullopt for both.
+	auto params = generated::BuildCatalogTableGetParams(ctx.attach_id, schema_name, table_name,
+	                                                    /*at_unit=*/std::nullopt, /*at_value=*/std::nullopt, OptTxn(ctx));
 	auto response = InvokeRpcMethod(ctx, "catalog_table_get", params, context);
 	auto result_batch = ExtractAndDeserializeResult(response, "catalog_table_get", worker_path);
 	if (!result_batch) {
@@ -343,7 +372,8 @@ std::optional<VgiTableInfo> InvokeCatalogTableGet(const CatalogRpcContext &ctx,
                                                    ClientContext &context,
                                                    const std::string &at_unit, const std::string &at_value) {
 	auto &worker_path = ctx.params->worker_path();
-	auto params = BuildTableGetWithAtParams(ctx.attach_id, schema_name, table_name, at_unit, at_value, ctx.transaction_id);
+	auto params = generated::BuildCatalogTableGetParams(ctx.attach_id, schema_name, table_name,
+	                                                    OptStrIfNonEmpty(at_unit), OptStrIfNonEmpty(at_value), OptTxn(ctx));
 	auto response = InvokeRpcMethod(ctx, "catalog_table_get", params, context);
 	auto result_batch = ExtractAndDeserializeResult(response, "catalog_table_get", worker_path);
 	if (!result_batch) {
@@ -361,7 +391,7 @@ std::optional<VgiViewInfo> InvokeCatalogViewGet(const CatalogRpcContext &ctx,
                                                  const std::string &schema_name, const std::string &view_name,
                                                  ClientContext &context) {
 	auto &worker_path = ctx.params->worker_path();
-	auto params = BuildTableOrViewGetParams(ctx.attach_id, schema_name, view_name, ctx.transaction_id);
+	auto params = generated::BuildCatalogViewGetParams(ctx.attach_id, schema_name, view_name, OptTxn(ctx));
 	auto response = InvokeRpcMethod(ctx, "catalog_view_get", params, context);
 	auto result_batch = ExtractAndDeserializeResult(response, "catalog_view_get", worker_path);
 	if (!result_batch) {
@@ -380,7 +410,8 @@ VgiScanFunctionResult InvokeCatalogTableScanFunctionGet(
     const CatalogRpcContext &ctx, const std::string &schema_name,
     const std::string &table_name, ClientContext &context, const std::string &at_unit, const std::string &at_value) {
 	auto &worker_path = ctx.params->worker_path();
-	auto params = BuildTableScanFunctionGetParams(ctx.attach_id, schema_name, table_name, at_unit, at_value, ctx.transaction_id);
+	auto params = generated::BuildCatalogTableScanFunctionGetParams(ctx.attach_id, schema_name, table_name,
+	                                                                OptStrIfNonEmpty(at_unit), OptStrIfNonEmpty(at_value), OptTxn(ctx));
 	auto response = InvokeRpcMethod(ctx, "catalog_table_scan_function_get", params, context);
 	auto result_batch = ExtractAndDeserializeResult(response, "catalog_table_scan_function_get", worker_path);
 	if (!result_batch || result_batch->num_rows() == 0) {
@@ -397,7 +428,14 @@ static VgiWriteFunctionResult InvokeCatalogTableWriteFunctionGet(
     const CatalogRpcContext &ctx, const std::string &rpc_method,
     const std::string &schema_name, const std::string &table_name, ClientContext &context) {
 	auto &worker_path = ctx.params->worker_path();
-	auto params = BuildWriteFunctionGetParams(ctx.attach_id, schema_name, table_name, ctx.transaction_id);
+	std::shared_ptr<arrow::RecordBatch> params;
+	if (rpc_method == "catalog_table_insert_function_get") {
+		params = generated::BuildCatalogTableInsertFunctionGetParams(ctx.attach_id, schema_name, table_name, OptTxn(ctx));
+	} else if (rpc_method == "catalog_table_update_function_get") {
+		params = generated::BuildCatalogTableUpdateFunctionGetParams(ctx.attach_id, schema_name, table_name, OptTxn(ctx));
+	} else {
+		params = generated::BuildCatalogTableDeleteFunctionGetParams(ctx.attach_id, schema_name, table_name, OptTxn(ctx));
+	}
 	auto response = InvokeRpcMethod(ctx, rpc_method, params, context);
 	auto result_batch = ExtractAndDeserializeResult(response, rpc_method, worker_path);
 	if (!result_batch || result_batch->num_rows() == 0) {
@@ -433,7 +471,7 @@ VgiWriteFunctionResult InvokeCatalogTableDeleteFunctionGet(
 
 int64_t InvokeCatalogVersion(const CatalogRpcContext &ctx, ClientContext &context) {
 	auto &worker_path = ctx.params->worker_path();
-	auto params = BuildAttachIdParams(ctx.attach_id, ctx.transaction_id);
+	auto params = generated::BuildCatalogVersionParams(ctx.attach_id, OptTxn(ctx));
 	try {
 		auto response = InvokeRpcMethod(ctx, "catalog_version", params, context);
 		auto result_batch = ExtractAndDeserializeResult(response, "catalog_version", worker_path);
@@ -451,7 +489,7 @@ int64_t InvokeCatalogVersion(const CatalogRpcContext &ctx, ClientContext &contex
 
 std::vector<uint8_t> InvokeCatalogTransactionBegin(const CatalogRpcContext &ctx, ClientContext &context) {
 	auto &worker_path = ctx.params->worker_path();
-	auto params = BuildTransactionBeginParams(ctx.attach_id);
+	auto params = generated::BuildCatalogTransactionBeginParams(ctx.attach_id);
 	auto response = InvokeRpcMethod(ctx, "catalog_transaction_begin", params, context);
 	auto result_batch = ExtractAndDeserializeResult(response, "catalog_transaction_begin", worker_path);
 	if (!result_batch || result_batch->num_rows() == 0) {
@@ -463,12 +501,12 @@ std::vector<uint8_t> InvokeCatalogTransactionBegin(const CatalogRpcContext &ctx,
 }
 
 void InvokeCatalogTransactionCommit(const CatalogRpcContext &ctx, ClientContext &context) {
-	auto params = BuildTransactionParams(ctx.attach_id, ctx.transaction_id);
+	auto params = generated::BuildCatalogTransactionCommitParams(ctx.attach_id, ctx.transaction_id);
 	InvokeVoidRpc(ctx, "catalog_transaction_commit", params, context);
 }
 
 void InvokeCatalogTransactionRollback(const CatalogRpcContext &ctx, ClientContext &context) {
-	auto params = BuildTransactionParams(ctx.attach_id, ctx.transaction_id);
+	auto params = generated::BuildCatalogTransactionRollbackParams(ctx.attach_id, ctx.transaction_id);
 	InvokeVoidRpc(ctx, "catalog_transaction_rollback", params, context);
 }
 
@@ -498,7 +536,7 @@ void InvokeCatalogTableDrop(
     const std::string &schema_name, const std::string &table_name,
     bool ignore_not_found, bool cascade,
     ClientContext &context) {
-	auto params = BuildTableDropParams(ctx.attach_id, schema_name, table_name, ignore_not_found, cascade, ctx.transaction_id);
+	auto params = generated::BuildCatalogTableDropParams(ctx.attach_id, schema_name, table_name, ignore_not_found, cascade, OptTxn(ctx));
 	InvokeVoidRpc(ctx, "catalog_table_drop", params, context);
 }
 
@@ -507,7 +545,7 @@ void InvokeCatalogTableRename(
     const std::string &schema_name, const std::string &table_name,
     const std::string &new_name, bool ignore_not_found,
     ClientContext &context) {
-	auto params = BuildTableRenameParams(ctx.attach_id, schema_name, table_name, new_name, ignore_not_found, ctx.transaction_id);
+	auto params = generated::BuildCatalogTableRenameParams(ctx.attach_id, schema_name, table_name, new_name, ignore_not_found, OptTxn(ctx));
 	InvokeVoidRpc(ctx, "catalog_table_rename", params, context);
 }
 
@@ -518,8 +556,8 @@ void InvokeCatalogTableColumnAdd(
     bool if_column_not_exists,
     ClientContext &context) {
 	auto column_bytes = SerializeSchemaToIpcBytes(column_definition);
-	auto params = BuildTableColumnAddParams(ctx.attach_id, schema_name, table_name, column_bytes,
-	                                        if_column_not_exists, false /* ignore_not_found */, ctx.transaction_id);
+	auto params = generated::BuildCatalogTableColumnAddParams(ctx.attach_id, schema_name, table_name, column_bytes,
+	                                                          /*ignore_not_found=*/false, if_column_not_exists, OptTxn(ctx));
 	InvokeVoidRpc(ctx, "catalog_table_column_add", params, context);
 }
 
@@ -528,8 +566,8 @@ void InvokeCatalogTableColumnDrop(
     const std::string &schema_name, const std::string &table_name,
     const std::string &column_name, bool if_column_exists, bool cascade,
     ClientContext &context) {
-	auto params = BuildTableColumnDropParams(ctx.attach_id, schema_name, table_name, column_name,
-	                                         if_column_exists, false /* ignore_not_found */, cascade, ctx.transaction_id);
+	auto params = generated::BuildCatalogTableColumnDropParams(ctx.attach_id, schema_name, table_name, column_name,
+	                                                           /*ignore_not_found=*/false, if_column_exists, cascade, OptTxn(ctx));
 	InvokeVoidRpc(ctx, "catalog_table_column_drop", params, context);
 }
 
@@ -538,8 +576,8 @@ void InvokeCatalogTableColumnRename(
     const std::string &schema_name, const std::string &table_name,
     const std::string &old_column_name, const std::string &new_column_name,
     ClientContext &context) {
-	auto params = BuildTableColumnRenameParams(ctx.attach_id, schema_name, table_name, old_column_name, new_column_name,
-	                                           false /* ignore_not_found */, ctx.transaction_id);
+	auto params = generated::BuildCatalogTableColumnRenameParams(ctx.attach_id, schema_name, table_name, old_column_name, new_column_name,
+	                                                             /*ignore_not_found=*/false, OptTxn(ctx));
 	InvokeVoidRpc(ctx, "catalog_table_column_rename", params, context);
 }
 
@@ -549,8 +587,8 @@ void InvokeCatalogTableCommentSet(
     const std::string &comment, bool comment_is_null,
     bool ignore_not_found,
     ClientContext &context) {
-	auto params = BuildTableCommentSetParams(ctx.attach_id, schema_name, table_name, comment, comment_is_null,
-	                                          ignore_not_found, ctx.transaction_id);
+	auto params = generated::BuildCatalogTableCommentSetParams(ctx.attach_id, schema_name, table_name,
+	                                                           OptStrNullable(comment, comment_is_null), ignore_not_found, OptTxn(ctx));
 	InvokeVoidRpc(ctx, "catalog_table_comment_set", params, context);
 }
 
@@ -561,8 +599,8 @@ void InvokeCatalogTableColumnCommentSet(
     const std::string &comment, bool comment_is_null,
     bool ignore_not_found,
     ClientContext &context) {
-	auto params = BuildTableColumnCommentSetParams(ctx.attach_id, schema_name, table_name, column_name,
-	                                                comment, comment_is_null, ignore_not_found, ctx.transaction_id);
+	auto params = generated::BuildCatalogTableColumnCommentSetParams(ctx.attach_id, schema_name, table_name, column_name,
+	                                                                 OptStrNullable(comment, comment_is_null), ignore_not_found, OptTxn(ctx));
 	InvokeVoidRpc(ctx, "catalog_table_column_comment_set", params, context);
 }
 
@@ -573,8 +611,8 @@ void InvokeCatalogTableColumnTypeChange(
     const std::string &expression,
     ClientContext &context) {
 	auto column_bytes = SerializeSchemaToIpcBytes(column_definition);
-	auto params = BuildTableColumnTypeChangeParams(ctx.attach_id, schema_name, table_name, column_bytes,
-	                                               expression, false /* ignore_not_found */, ctx.transaction_id);
+	auto params = generated::BuildCatalogTableColumnTypeChangeParams(ctx.attach_id, schema_name, table_name, column_bytes,
+	                                                                 OptStrIfNonEmpty(expression), /*ignore_not_found=*/false, OptTxn(ctx));
 	InvokeVoidRpc(ctx, "catalog_table_column_type_change", params, context);
 }
 
@@ -583,8 +621,8 @@ void InvokeCatalogTableColumnDefaultSet(
     const std::string &schema_name, const std::string &table_name,
     const std::string &column_name, const std::string &expression,
     ClientContext &context) {
-	auto params = BuildTableColumnDefaultSetParams(ctx.attach_id, schema_name, table_name, column_name,
-	                                               expression, false /* ignore_not_found */, ctx.transaction_id);
+	auto params = generated::BuildCatalogTableColumnDefaultSetParams(ctx.attach_id, schema_name, table_name, column_name,
+	                                                                 expression, /*ignore_not_found=*/false, OptTxn(ctx));
 	InvokeVoidRpc(ctx, "catalog_table_column_default_set", params, context);
 }
 
@@ -593,8 +631,8 @@ void InvokeCatalogTableColumnDefaultDrop(
     const std::string &schema_name, const std::string &table_name,
     const std::string &column_name,
     ClientContext &context) {
-	auto params = BuildTableColumnDefaultDropParams(ctx.attach_id, schema_name, table_name, column_name,
-	                                                false /* ignore_not_found */, ctx.transaction_id);
+	auto params = generated::BuildCatalogTableColumnDefaultDropParams(ctx.attach_id, schema_name, table_name, column_name,
+	                                                                  /*ignore_not_found=*/false, OptTxn(ctx));
 	InvokeVoidRpc(ctx, "catalog_table_column_default_drop", params, context);
 }
 
@@ -603,8 +641,8 @@ void InvokeCatalogTableNotNullSet(
     const std::string &schema_name, const std::string &table_name,
     const std::string &column_name,
     ClientContext &context) {
-	auto params = BuildTableNotNullSetParams(ctx.attach_id, schema_name, table_name, column_name,
-	                                         false /* ignore_not_found */, ctx.transaction_id);
+	auto params = generated::BuildCatalogTableNotNullSetParams(ctx.attach_id, schema_name, table_name, column_name,
+	                                                           /*ignore_not_found=*/false, OptTxn(ctx));
 	InvokeVoidRpc(ctx, "catalog_table_not_null_set", params, context);
 }
 
@@ -613,8 +651,8 @@ void InvokeCatalogTableNotNullDrop(
     const std::string &schema_name, const std::string &table_name,
     const std::string &column_name,
     ClientContext &context) {
-	auto params = BuildTableNotNullDropParams(ctx.attach_id, schema_name, table_name, column_name,
-	                                          false /* ignore_not_found */, ctx.transaction_id);
+	auto params = generated::BuildCatalogTableNotNullDropParams(ctx.attach_id, schema_name, table_name, column_name,
+	                                                            /*ignore_not_found=*/false, OptTxn(ctx));
 	InvokeVoidRpc(ctx, "catalog_table_not_null_drop", params, context);
 }
 
@@ -627,7 +665,7 @@ void InvokeCatalogViewCreate(
     const std::string &schema_name, const std::string &view_name,
     const std::string &definition, const std::string &on_conflict,
     ClientContext &context) {
-	auto params = BuildViewCreateParams(ctx.attach_id, schema_name, view_name, definition, on_conflict, ctx.transaction_id);
+	auto params = generated::BuildCatalogViewCreateParams(ctx.attach_id, schema_name, view_name, definition, on_conflict, OptTxn(ctx));
 	InvokeVoidRpc(ctx, "catalog_view_create", params, context);
 }
 
@@ -636,7 +674,7 @@ void InvokeCatalogViewDrop(
     const std::string &schema_name, const std::string &view_name,
     bool ignore_not_found, bool cascade,
     ClientContext &context) {
-	auto params = BuildViewDropParams(ctx.attach_id, schema_name, view_name, ignore_not_found, cascade, ctx.transaction_id);
+	auto params = generated::BuildCatalogViewDropParams(ctx.attach_id, schema_name, view_name, ignore_not_found, cascade, OptTxn(ctx));
 	InvokeVoidRpc(ctx, "catalog_view_drop", params, context);
 }
 
@@ -645,7 +683,7 @@ void InvokeCatalogViewRename(
     const std::string &schema_name, const std::string &view_name,
     const std::string &new_name, bool ignore_not_found,
     ClientContext &context) {
-	auto params = BuildViewRenameParams(ctx.attach_id, schema_name, view_name, new_name, ignore_not_found, ctx.transaction_id);
+	auto params = generated::BuildCatalogViewRenameParams(ctx.attach_id, schema_name, view_name, new_name, ignore_not_found, OptTxn(ctx));
 	InvokeVoidRpc(ctx, "catalog_view_rename", params, context);
 }
 
@@ -655,8 +693,8 @@ void InvokeCatalogViewCommentSet(
     const std::string &comment, bool comment_is_null,
     bool ignore_not_found,
     ClientContext &context) {
-	auto params = BuildViewCommentSetParams(ctx.attach_id, schema_name, view_name, comment, comment_is_null,
-	                                         ignore_not_found, ctx.transaction_id);
+	auto params = generated::BuildCatalogViewCommentSetParams(ctx.attach_id, schema_name, view_name,
+	                                                          OptStrNullable(comment, comment_is_null), ignore_not_found, OptTxn(ctx));
 	InvokeVoidRpc(ctx, "catalog_view_comment_set", params, context);
 }
 
@@ -664,8 +702,11 @@ void InvokeCatalogSchemaCreate(
     const CatalogRpcContext &ctx,
     const std::string &schema_name, const std::string &on_conflict,
     ClientContext &context) {
-	auto params = BuildSchemaCreateParams(ctx.attach_id, schema_name, on_conflict,
-	                                       "" /* comment */, true /* comment_is_null */, ctx.transaction_id);
+	// CREATE SCHEMA ... TAGS (...) is not yet exposed by the C++ extension; we
+	// always send std::nullopt for tags. catalog_schema_create's wire shape requires
+	// the field, but the value is always absent until we plumb it through DDL parsing.
+	auto params = generated::BuildCatalogSchemaCreateParams(ctx.attach_id, schema_name, on_conflict,
+	                                                        /*comment=*/std::nullopt, /*tags=*/std::nullopt, OptTxn(ctx));
 	InvokeVoidRpc(ctx, "catalog_schema_create", params, context);
 }
 
@@ -673,7 +714,7 @@ void InvokeCatalogSchemaDrop(
     const CatalogRpcContext &ctx,
     const std::string &schema_name, bool ignore_not_found, bool cascade,
     ClientContext &context) {
-	auto params = BuildSchemaDropParams(ctx.attach_id, schema_name, ignore_not_found, cascade, ctx.transaction_id);
+	auto params = generated::BuildCatalogSchemaDropParams(ctx.attach_id, schema_name, ignore_not_found, cascade, OptTxn(ctx));
 	InvokeVoidRpc(ctx, "catalog_schema_drop", params, context);
 }
 
@@ -690,8 +731,8 @@ TableFunctionCardinalityResult InvokeTableFunctionCardinality(
 	auto request_batch = BuildTableFunctionCardinalityRequest(bind_request_bytes, bind_opaque_data);
 	auto request_bytes = SerializeToIpcBytes(request_batch);
 
-	// Wrap in params batch with {request: binary} (reuses bind pattern)
-	auto params = BuildBindRpcParams(request_bytes);
+	// Wrap in {request: binary} (the protocol's TableFunctionCardinalityParams shape)
+	auto params = generated::BuildTableFunctionCardinalityParams(request_bytes);
 
 	auto response = InvokeRpcMethod(ctx, "table_function_cardinality", params, context);
 	auto result_batch = ExtractAndDeserializeResult(response, "table_function_cardinality", worker_path);
@@ -918,7 +959,7 @@ ColumnStatisticsRpcResult InvokeCatalogTableColumnStatisticsGet(
 
 	ColumnStatisticsRpcResult rpc_result;
 
-	auto params = BuildTableColumnStatisticsGetParams(ctx.attach_id, schema_name, table_name, ctx.transaction_id);
+	auto params = generated::BuildCatalogTableColumnStatisticsGetParams(ctx.attach_id, schema_name, table_name, OptTxn(ctx));
 	const char *method_name = "catalog_table_column_statistics_get";
 	auto response = InvokeRpcMethod(ctx, method_name, params, context);
 
@@ -980,7 +1021,7 @@ std::unordered_map<std::string, unique_ptr<BaseStatistics>> InvokeTableFunctionS
 
 	auto request_batch = BuildTableFunctionStatisticsRequest(bind_request_bytes, bind_opaque_data);
 	auto request_bytes = SerializeToIpcBytes(request_batch);
-	auto params = BuildBindRpcParams(request_bytes);
+	auto params = generated::BuildTableFunctionStatisticsParams(request_bytes);
 
 	const char *method_name = "table_function_statistics";
 	auto response = InvokeRpcMethod(ctx, method_name, params, context);
