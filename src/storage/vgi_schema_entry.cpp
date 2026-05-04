@@ -33,6 +33,27 @@ VgiSchemaEntry::VgiSchemaEntry(Catalog &catalog, CreateSchemaInfo &info, const v
 
 VgiSchemaEntry::~VgiSchemaEntry() = default;
 
+namespace {
+// Push the harvested entries from a child catalog set into the parent
+// VgiCatalog's deferred-drop graveyard so any raw CatalogEntry* held by a
+// bound query/prepared statement stays valid until the catalog itself is
+// destroyed (or vgi_clear_cache() is called explicitly). Without this,
+// schema-level DDL (DROP TABLE, ALTER, etc.) yanks pointers that DuckDB's
+// optimizer/binder may still be holding from a previous LookupEntry.
+void DeferDrop(Catalog &catalog, std::vector<unique_ptr<CatalogEntry>> entries) {
+	if (entries.empty()) {
+		return;
+	}
+	catalog.Cast<VgiCatalog>().AbsorbDroppedEntries(std::move(entries));
+}
+void DeferDrop(Catalog &catalog, unique_ptr<CatalogEntry> entry) {
+	if (!entry) {
+		return;
+	}
+	catalog.Cast<VgiCatalog>().AbsorbDroppedEntry(std::move(entry));
+}
+} // namespace
+
 optional_ptr<CatalogEntry> VgiSchemaEntry::CreateTable(CatalogTransaction transaction, BoundCreateTableInfo &info) {
 	auto &vgi_catalog = catalog.Cast<VgiCatalog>();
 	if (vgi_catalog.GetAccessMode() == AccessMode::READ_ONLY) {
@@ -129,10 +150,10 @@ optional_ptr<CatalogEntry> VgiSchemaEntry::CreateTable(CatalogTransaction transa
 	                               primary_key_constraints, foreign_key_constraints, context);
 
 	// Invalidate table cache and re-fetch the newly created table
-	tables_.ClearEntries();
+	DeferDrop(catalog, tables_.HarvestEntries());
 	// REPLACE may have changed the table schema, invalidating dependent views
 	if (create_info.on_conflict == OnCreateConflict::REPLACE_ON_CONFLICT) {
-		views_.ClearEntries();
+		DeferDrop(catalog, views_.HarvestEntries());
 	}
 	return tables_.GetEntry(context, create_info.table);
 }
@@ -172,7 +193,7 @@ optional_ptr<CatalogEntry> VgiSchemaEntry::CreateView(CatalogTransaction transac
 	vgi::InvokeCatalogViewCreate(rpc_ctx, name, info.view_name, definition, on_conflict, context);
 
 	// Invalidate view cache
-	views_.ClearEntries();
+	DeferDrop(catalog, views_.HarvestEntries());
 	return nullptr;
 }
 
@@ -223,7 +244,7 @@ void VgiSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 			auto comment_str = is_null ? "" : comment_info.comment_value.ToString();
 			vgi::InvokeCatalogTableCommentSet(rpc_ctx, name, comment_info.name, comment_str, is_null,
 			                                   false, context);
-			tables_.DropEntry(comment_info.name);
+			DeferDrop(catalog, tables_.HarvestEntry(comment_info.name));
 			return;
 		}
 		if (comment_info.entry_catalog_type == CatalogType::VIEW_ENTRY) {
@@ -231,7 +252,7 @@ void VgiSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 			auto comment_str = is_null ? "" : comment_info.comment_value.ToString();
 			vgi::InvokeCatalogViewCommentSet(rpc_ctx, name, comment_info.name, comment_str, is_null,
 			                                  false, context);
-			views_.DropEntry(comment_info.name);
+			DeferDrop(catalog, views_.HarvestEntry(comment_info.name));
 			return;
 		}
 		throw BinderException("COMMENT ON %s is not supported for VGI catalogs",
@@ -245,7 +266,7 @@ void VgiSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 		auto comment_str = is_null ? "" : col_comment.comment_value.ToString();
 		vgi::InvokeCatalogTableColumnCommentSet(rpc_ctx, name, col_comment.name, col_comment.column_name,
 		                                         comment_str, is_null, false, context);
-		tables_.DropEntry(col_comment.name);
+		DeferDrop(catalog, tables_.HarvestEntry(col_comment.name));
 		return;
 	}
 
@@ -261,7 +282,7 @@ void VgiSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 			                       EnumUtil::ToString(alter_view.alter_view_type));
 		}
 		// Dependent views may reference the old name, so clear the entire views cache
-		views_.ClearEntries();
+		DeferDrop(catalog, views_.HarvestEntries());
 		return;
 	}
 
@@ -342,7 +363,7 @@ void VgiSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 	}
 
 	// Invalidate the specific table entry to force re-fetch
-	tables_.DropEntry(table_name);
+	DeferDrop(catalog, tables_.HarvestEntry(table_name));
 
 	// Structural changes (rename, drop/rename column, type change) can invalidate
 	// dependent views — clear view cache so stale definitions are re-fetched.
@@ -351,7 +372,7 @@ void VgiSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 	case AlterTableType::RENAME_COLUMN:
 	case AlterTableType::REMOVE_COLUMN:
 	case AlterTableType::ALTER_COLUMN_TYPE:
-		views_.ClearEntries();
+		DeferDrop(catalog, views_.HarvestEntries());
 		break;
 	default:
 		break;
@@ -422,19 +443,19 @@ void VgiSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
 		vgi::InvokeCatalogViewDrop(rpc_ctx, name, info.name, ignore_not_found, info.cascade, context);
 		if (info.cascade) {
 			// Cascade may have dropped views that depend on this view
-			views_.ClearEntries();
+			DeferDrop(catalog, views_.HarvestEntries());
 		} else {
-			views_.DropEntry(info.name);
+			DeferDrop(catalog, views_.HarvestEntry(info.name));
 		}
 		return;
 	}
 
 	vgi::InvokeCatalogTableDrop(rpc_ctx, name, info.name, ignore_not_found, info.cascade, context);
 
-	tables_.DropEntry(info.name);
+	DeferDrop(catalog, tables_.HarvestEntry(info.name));
 	// Views referencing the dropped table are now stale; clear to force re-fetch.
 	// With cascade, the worker may have also dropped dependent views.
-	views_.ClearEntries();
+	DeferDrop(catalog, views_.HarvestEntries());
 }
 
 optional_ptr<CatalogEntry> VgiSchemaEntry::LookupEntry(CatalogTransaction transaction,

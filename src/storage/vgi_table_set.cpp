@@ -39,17 +39,26 @@ void VgiTableSet::LoadEntries(ClientContext &context) {
 	}
 }
 
-// Override GetEntry to do on-demand loading for individual tables
+// Override GetEntry to do on-demand loading for individual tables.
+//
+// Pattern (mirrors VgiTableEntry::GetStatistics' two-phase fetch): hold the
+// mutex only for state inspection, drop it during the worker RPC, then
+// re-acquire to publish. The generation counter on VgiCatalogSet is bumped
+// by every mutation; a concurrent DropEntry / ClearEntries / HarvestEntries
+// during our RPC moves it forward, and we re-check on the way out so a
+// dropped table can't be silently resurrected as a "ghost" entry.
 optional_ptr<CatalogEntry> VgiTableSet::GetEntry(ClientContext &context, const std::string &name) {
-	std::lock_guard<std::mutex> lock(entry_lock_);
-
-	// Check if we have the entry cached
-	auto it = GetEntries().find(name);
-	if (it != GetEntries().end()) {
-		return it->second.get();
+	uint64_t pre_gen;
+	{
+		std::lock_guard<std::mutex> lock(entry_lock_);
+		auto it = GetEntries().find(name);
+		if (it != GetEntries().end()) {
+			return it->second.get();
+		}
+		pre_gen = generation_.load(std::memory_order_acquire);
 	}
 
-	// Load this specific table from the worker
+	// Load this specific table from the worker (no lock held — long RPC).
 	auto &vgi_catalog = catalog_.Cast<VgiCatalog>();
 	auto &attach_params = vgi_catalog.attach_parameters();
 	auto &attach_result = vgi_catalog.attach_result();
@@ -58,7 +67,6 @@ optional_ptr<CatalogEntry> VgiTableSet::GetEntry(ClientContext &context, const s
 		return nullptr;
 	}
 
-	// Call catalog_table_get via RPC, passing transaction_id for visibility of in-transaction DDL
 	auto &vgi_tx = VgiTransaction::Get(context, catalog_);
 	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_id, vgi_tx.GetTransactionId()};
 	auto table_info_opt = vgi::InvokeCatalogTableGet(rpc_ctx, schema_.name, name, context);
@@ -70,9 +78,24 @@ optional_ptr<CatalogEntry> VgiTableSet::GetEntry(ClientContext &context, const s
 	auto &table_info = *table_info_opt;
 	auto create_info = vgi::CreateTableInfoFromVgiTable(context, table_info, schema_.name);
 	auto table_entry = make_uniq<VgiTableEntry>(catalog_, schema_, create_info, table_info);
+
+	std::lock_guard<std::mutex> lock(entry_lock_);
+	// Generation moved while our RPC was in flight — concurrent DDL touched
+	// this set. Don't publish: the worker may report `name` exists but
+	// another thread just dropped it locally. Caller will re-fetch on its
+	// next attempt against a clean state.
+	if (generation_.load(std::memory_order_acquire) != pre_gen) {
+		return nullptr;
+	}
+	// Another thread may have published while we were RPCing — return its
+	// entry instead of overwriting (LoadEntries / parallel GetEntry).
+	auto it = GetEntries().find(name);
+	if (it != GetEntries().end()) {
+		return it->second.get();
+	}
 	auto result = table_entry.get();
 	GetEntries()[name] = std::move(table_entry);
-
+	generation_.fetch_add(1, std::memory_order_release);
 	return result;
 }
 

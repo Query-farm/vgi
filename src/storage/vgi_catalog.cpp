@@ -275,14 +275,30 @@ void VgiCatalog::ClearCache(bool force) {
 		// `harvested` falls out of scope here and is destroyed.
 		return;
 	}
-	// Defer the drop: move harvested entries into the graveyard. Bound at
-	// kGraveyardLimit; on overflow we drop the oldest (front) entries to
-	// keep memory in check. Anyone holding raw pointers to those oldest
-	// entries (very long-lived prepared statements across many catalog
-	// version flips) loses; in practice DDL pressure is low.
+	AbsorbDroppedEntries(std::move(harvested));
+}
+
+void VgiCatalog::AbsorbDroppedEntry(unique_ptr<CatalogEntry> entry) {
+	if (!entry) {
+		return;
+	}
 	std::lock_guard<std::mutex> lk(graveyard_mutex_);
-	for (auto &entry : harvested) {
-		deferred_dropped_entries_.push_back(std::move(entry));
+	deferred_dropped_entries_.push_back(std::move(entry));
+	while (deferred_dropped_entries_.size() > kGraveyardLimit) {
+		deferred_dropped_entries_.erase(deferred_dropped_entries_.begin());
+		graveyard_drops_since_last_log_++;
+	}
+}
+
+void VgiCatalog::AbsorbDroppedEntries(std::vector<unique_ptr<CatalogEntry>> entries) {
+	if (entries.empty()) {
+		return;
+	}
+	std::lock_guard<std::mutex> lk(graveyard_mutex_);
+	for (auto &entry : entries) {
+		if (entry) {
+			deferred_dropped_entries_.push_back(std::move(entry));
+		}
 	}
 	while (deferred_dropped_entries_.size() > kGraveyardLimit) {
 		deferred_dropped_entries_.erase(deferred_dropped_entries_.begin());

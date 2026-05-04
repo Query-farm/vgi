@@ -72,6 +72,13 @@ public:
 	/// table function — the user accepts that bound queries may break.
 	void ClearCache(bool force = false);
 
+	/// Push entries that a *child* set just harvested into the graveyard.
+	/// Called from VgiSchemaEntry's DDL paths so a single dropped/altered
+	/// table or view doesn't yank a CatalogEntry* pointer that a bound
+	/// query is still holding. Bounded by kGraveyardLimit.
+	void AbsorbDroppedEntry(unique_ptr<CatalogEntry> entry);
+	void AbsorbDroppedEntries(std::vector<unique_ptr<CatalogEntry>> entries);
+
 	/// Check the worker's catalog version; clear cache only if it has changed.
 	/// No-op if catalog_version_frozen is true.
 	/// Returns true if cache was cleared.
