@@ -3,6 +3,7 @@
 #include <functional>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #include "duckdb/catalog/catalog_entry.hpp"
 #include "duckdb/common/case_insensitive_map.hpp"
@@ -32,8 +33,17 @@ public:
 	// Scan all entries in the set
 	void Scan(ClientContext &context, const std::function<void(CatalogEntry &)> &callback);
 
-	// Clear all cached entries
+	// Clear all cached entries — destroys the unique_ptrs in place. Any
+	// outstanding raw CatalogEntry* held by a bound query/prepared
+	// statement dangles after this call. Prefer HarvestEntries() at
+	// callsites where the entries should outlive the clear.
 	void ClearEntries();
+
+	// Move all cached entries out of the set into the returned vector and
+	// reset is_loaded_. Used by VgiCatalog's deferred-drop graveyard to
+	// preserve entry pointers held by bound queries until either the
+	// catalog is destroyed or vgi_clear_cache() is called explicitly.
+	std::vector<unique_ptr<CatalogEntry>> HarvestEntries();
 
 	Catalog &GetCatalog() {
 		return catalog_;

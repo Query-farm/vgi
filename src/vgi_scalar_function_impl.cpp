@@ -33,24 +33,24 @@ VgiScalarFunctionLocalState::~VgiScalarFunctionLocalState() {
 	// Clean up connection - try to return to pool if possible
 	if (connection && initialized) {
 		VGI_STDERR_DEBUG("[VGI] scalar.destructor is_finished=%s pid=%d\n",
-		                 connection->IsFinished() ? "true" : "false", connection->GetPid());
+		                 connection->IsFinished() ? "true" : "false", connection->GetSubprocessPid().value_or(-1));
 
 		if (!connection->IsFinished()) {
 			try {
 				// Close input stream to signal worker we're done
 				connection->CloseInputWriter();
-				VGI_STDERR_DEBUG("[VGI] scalar.destructor closed_input_writer pid=%d\n", connection->GetPid());
+				VGI_STDERR_DEBUG("[VGI] scalar.destructor closed_input_writer pid=%d\n", connection->GetSubprocessPid().value_or(-1));
 				// Read the output EOS to complete the IPC stream protocol
 				// Worker sends EOS immediately after seeing input close
 				auto batch = connection->ReadDataBatch();
 				VGI_STDERR_DEBUG("[VGI] scalar.destructor read_eos batch=%s is_finished=%s pid=%d\n",
 				                 batch ? "non-null" : "null", connection->IsFinished() ? "true" : "false",
-				                 connection->GetPid());
+				                 connection->GetSubprocessPid().value_or(-1));
 			} catch (const std::exception &e) {
-				VGI_STDERR_DEBUG("[VGI] scalar.destructor exception=%s pid=%d\n", e.what(), connection->GetPid());
+				VGI_STDERR_DEBUG("[VGI] scalar.destructor exception=%s pid=%d\n", e.what(), connection->GetSubprocessPid().value_or(-1));
 				return;
 			} catch (...) {
-				VGI_STDERR_DEBUG("[VGI] scalar.destructor unknown_exception pid=%d\n", connection->GetPid());
+				VGI_STDERR_DEBUG("[VGI] scalar.destructor unknown_exception pid=%d\n", connection->GetSubprocessPid().value_or(-1));
 				return;
 			}
 		}
@@ -65,7 +65,7 @@ VgiScalarFunctionLocalState::~VgiScalarFunctionLocalState() {
 				                 rr.pool_size, rr.total_pool_size);
 			} else {
 				VGI_STDERR_DEBUG("[VGI] scalar.destructor conn=%s worker_pid=%d pooled=false skip_reason=not_poolable\n",
-				                 conn_id.c_str(), connection->GetPid());
+				                 conn_id.c_str(), connection->GetSubprocessPid().value_or(-1));
 			}
 		}
 	}
@@ -262,7 +262,7 @@ unique_ptr<FunctionData> VgiScalarFunctionBind(ClientContext &context, ScalarFun
 		// and pay one cheap bind RPC instead of holding this worker hostage
 		// from other concurrent planner/catalog RPCs.
 		if (func_info.use_pool()) {
-			auto bind_worker_pid = connection->GetPid();
+			auto bind_worker_pid = connection->GetSubprocessPid().value_or(-1);
 			auto bind_conn_id = connection->GetConnIdHex();
 			if (auto pooled = connection->ReleaseForPooling()) {
 				auto rr = VgiWorkerPool::Instance().Release(std::move(pooled));
@@ -409,7 +409,7 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 			    "SCALAR", std::vector<uint8_t>{}, worker_debug, settings,
 			    required_secrets, attach_params);
 			VGI_STDERR_DEBUG("[VGI] scalar.new_connection worker_path=%s pid=%d\n",
-			                 worker_path.c_str(), connection->GetPid());
+			                 worker_path.c_str(), connection->GetSubprocessPid().value_or(-1));
 		}
 
 		// Bind and open the IPC writer with a single schema — the bind-time

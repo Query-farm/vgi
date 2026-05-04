@@ -110,7 +110,7 @@ VgiTableFunctionLocalState::~VgiTableFunctionLocalState() noexcept {
 
 	// Natural-end or cancel-disabled: return to pool as before.
 	if (attach_params_ && attach_params_->use_pool() && connection) {
-		auto worker_pid = connection->GetPid();
+		auto worker_pid = connection->GetSubprocessPid().value_or(-1);
 		auto conn_id = connection->GetConnIdHex();
 		if (auto pooled = connection->ReleaseForPooling()) {
 			try {
@@ -157,7 +157,7 @@ void PerformVgiTableFunctionBind(ClientContext &context, VgiTableFunctionBindDat
 
 	auto result = AcquireAndBindConnection(context, params);
 	auto &bind_result = result.bind_result;
-	auto bind_worker_pid = result.connection ? result.connection->GetPid() : -1;
+	auto bind_worker_pid = result.connection ? result.connection->GetSubprocessPid().value_or(-1) : -1;
 	auto bind_conn_id = result.connection ? result.connection->GetConnIdHex() : "";
 
 	// At bind time, max_processes is unknown (updated after init)
@@ -179,7 +179,9 @@ void PerformVgiTableFunctionBind(ClientContext &context, VgiTableFunctionBindDat
 			vector<pair<string, string>> fields;
 			fields.emplace_back("conn", bind_conn_id);
 			fields.emplace_back("worker_path", bind_data.worker_path());
-			fields.emplace_back("worker_pid", std::to_string(bind_worker_pid));
+			if (bind_worker_pid > 0) {
+				fields.emplace_back("worker_pid", std::to_string(bind_worker_pid));
+			}
 			fields.emplace_back("phase", "bind");
 			fields.emplace_back("pooled", rr.pooled ? "true" : "false");
 			if (!rr.skip_reason.empty()) {
@@ -213,12 +215,17 @@ void PerformVgiTableFunctionBind(ClientContext &context, VgiTableFunctionBindDat
 	bind_data.all_column_names = names;
 	bind_data.all_column_types = return_types;
 
-	VGI_LOG(context, "table_function.bind_result",
-	        {{"conn", bind_conn_id},
-	         {"worker_path", bind_data.worker_path()},
-	         {"worker_pid", std::to_string(bind_worker_pid)},
-	         {"function_name", bind_data.function_name},
-	         {"num_columns", std::to_string(bind_result.output_schema->num_fields())}});
+	{
+		vector<pair<string, string>> fields;
+		fields.emplace_back("conn", bind_conn_id);
+		fields.emplace_back("worker_path", bind_data.worker_path());
+		if (bind_worker_pid > 0) {
+			fields.emplace_back("worker_pid", std::to_string(bind_worker_pid));
+		}
+		fields.emplace_back("function_name", bind_data.function_name);
+		fields.emplace_back("num_columns", std::to_string(bind_result.output_schema->num_fields()));
+		VGI_LOG(context, "table_function.bind_result", fields);
+	}
 }
 
 // ============================================================================
@@ -1103,14 +1110,18 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 	global_state->order_by_hint = bind_data.order_by_hint;
 	global_state->table_sample_hint = bind_data.table_sample_hint;
 
-	VGI_LOG(context, "table_function.init_global",
-	        {{"conn", global_state->primary_connection->GetConnIdHex()},
-	         {"worker_path", bind_data.worker_path()},
-	         {"worker_pid", std::to_string(global_state->primary_connection->GetPid())},
-	         {"function_name", bind_data.function_name},
-	         {"global_execution_id", BytesToHex(global_state->global_execution_id)},
-	         {"max_processes", std::to_string(global_state->max_processes)},
-	         {"num_projection_columns", std::to_string(projection_ids.size())}});
+	{
+		auto &conn = *global_state->primary_connection;
+		vector<pair<string, string>> fields;
+		fields.emplace_back("conn", conn.GetConnIdHex());
+		fields.emplace_back("worker_path", bind_data.worker_path());
+		AppendSubprocessPidField(fields, conn);
+		fields.emplace_back("function_name", bind_data.function_name);
+		fields.emplace_back("global_execution_id", BytesToHex(global_state->global_execution_id));
+		fields.emplace_back("max_processes", std::to_string(global_state->max_processes));
+		fields.emplace_back("num_projection_columns", std::to_string(projection_ids.size()));
+		VGI_LOG(context, "table_function.init_global", fields);
+	}
 
 	if (bind_data.order_by_hint) {
 		VGI_LOG(context, "table_function.order_pushdown",
@@ -1175,13 +1186,17 @@ unique_ptr<LocalTableFunctionState> VgiTableFunctionInitLocal(ExecutionContext &
 
 	if (primary_connection) {
 		// Primary worker: use connection from bind phase
-		VGI_LOG(context.client, "table_function.init_local",
-		        {{"conn", primary_connection->GetConnIdHex()},
-		         {"worker_path", bind_data.worker_path()},
-		         {"worker_pid", std::to_string(primary_connection->GetPid())},
-		         {"function_name", bind_data.function_name},
-		         {"global_execution_id", BytesToHex(global_state.global_execution_id)},
-		         {"worker_type", "primary"}});
+		{
+			auto &conn = *primary_connection;
+			vector<pair<string, string>> fields;
+			fields.emplace_back("conn", conn.GetConnIdHex());
+			fields.emplace_back("worker_path", bind_data.worker_path());
+			AppendSubprocessPidField(fields, conn);
+			fields.emplace_back("function_name", bind_data.function_name);
+			fields.emplace_back("global_execution_id", BytesToHex(global_state.global_execution_id));
+			fields.emplace_back("worker_type", "primary");
+			VGI_LOG(context.client, "table_function.init_local", fields);
+		}
 
 		local_state->prefetch_slot_->connection = std::move(primary_connection);
 	} else {
@@ -1221,13 +1236,17 @@ unique_ptr<LocalTableFunctionState> VgiTableFunctionInitLocal(ExecutionContext &
 			local_state->connection()->PerformInit();
 		}
 
-		VGI_LOG(context.client, "table_function.init_local",
-		        {{"conn", local_state->connection()->GetConnIdHex()},
-		         {"worker_path", bind_data.worker_path()},
-		         {"worker_pid", std::to_string(local_state->connection()->GetPid())},
-		         {"function_name", bind_data.function_name},
-		         {"global_execution_id", BytesToHex(global_state.global_execution_id)},
-		         {"worker_type", "secondary"}});
+		{
+			auto &conn = *local_state->connection();
+			vector<pair<string, string>> fields;
+			fields.emplace_back("conn", conn.GetConnIdHex());
+			fields.emplace_back("worker_path", bind_data.worker_path());
+			AppendSubprocessPidField(fields, conn);
+			fields.emplace_back("function_name", bind_data.function_name);
+			fields.emplace_back("global_execution_id", BytesToHex(global_state.global_execution_id));
+			fields.emplace_back("worker_type", "secondary");
+			VGI_LOG(context.client, "table_function.init_local", fields);
+		}
 	}
 
 	return local_state;
@@ -1313,10 +1332,15 @@ static bool InstallBatch(ClientContext &context, const VgiTableFunctionBindData 
                          std::shared_ptr<arrow::RecordBatch> arrow_batch) {
 	if (!arrow_batch) {
 		local_state.done = true;
-		VGI_LOG(context, "table_function.scan_complete",
-		        {{"worker_path", bind_data.worker_path()},
-		         {"worker_pid", std::to_string(local_state.connection()->GetPid())},
-		         {"function_name", bind_data.function_name}});
+		{
+			auto &conn = *local_state.connection();
+			vector<pair<string, string>> fields;
+			fields.emplace_back("conn", conn.GetConnIdHex());
+			fields.emplace_back("worker_path", bind_data.worker_path());
+			AppendSubprocessPidField(fields, conn);
+			fields.emplace_back("function_name", bind_data.function_name);
+			VGI_LOG(context, "table_function.scan_complete", fields);
+		}
 		return false;
 	}
 
@@ -1330,12 +1354,16 @@ static bool InstallBatch(ClientContext &context, const VgiTableFunctionBindData 
 	// points to the previous chunk, and when that chunk is released, the data becomes invalid.
 	local_state.Reset();
 
-	VGI_LOG(context, "table_function.batch_received",
-	        {{"conn", local_state.connection()->GetConnIdHex()},
-	         {"worker_path", bind_data.worker_path()},
-	         {"worker_pid", std::to_string(local_state.connection()->GetPid())},
-	         {"function_name", bind_data.function_name},
-	         {"batch_rows", std::to_string(arrow_batch->num_rows())}});
+	{
+		auto &conn = *local_state.connection();
+		vector<pair<string, string>> fields;
+		fields.emplace_back("conn", conn.GetConnIdHex());
+		fields.emplace_back("worker_path", bind_data.worker_path());
+		AppendSubprocessPidField(fields, conn);
+		fields.emplace_back("function_name", bind_data.function_name);
+		fields.emplace_back("batch_rows", std::to_string(arrow_batch->num_rows()));
+		VGI_LOG(context, "table_function.batch_received", fields);
+	}
 
 	return true;
 }
@@ -1358,10 +1386,13 @@ static bool GetNextBatch(ClientContext &context, const VgiTableFunctionBindData 
 			return InstallBatch(context, bind_data, local_state, nullptr);
 		}
 		if (arrow_batch->num_rows() == 0) {
-			VGI_LOG(context, "table_function.batch_empty_skipped",
-			        {{"worker_path", bind_data.worker_path()},
-			         {"worker_pid", std::to_string(local_state.connection()->GetPid())},
-			         {"function_name", bind_data.function_name}});
+			auto &conn = *local_state.connection();
+			vector<pair<string, string>> fields;
+			fields.emplace_back("conn", conn.GetConnIdHex());
+			fields.emplace_back("worker_path", bind_data.worker_path());
+			AppendSubprocessPidField(fields, conn);
+			fields.emplace_back("function_name", bind_data.function_name);
+			VGI_LOG(context, "table_function.batch_empty_skipped", fields);
 			continue;
 		}
 		return InstallBatch(context, bind_data, local_state, std::move(arrow_batch));

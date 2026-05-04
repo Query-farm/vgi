@@ -1,6 +1,7 @@
 #pragma once
 
 #include <chrono>
+#include <condition_variable>
 #include <mutex>
 #include <unordered_map>
 
@@ -56,10 +57,20 @@ private:
 	// Column statistics cache: lazy-fetched via RPC, TTL-based expiry, thread-safe.
 	// Mutable because GetStatistics() is const in the DuckDB interface but we
 	// need to populate the cache on first access.
+	//
+	// Concurrency: the worker RPC runs *outside* the mutex, gated by a
+	// `loading` flag + condition_variable. Holding the mutex across an RPC
+	// would self-deadlock if any code path on the RPC stack re-enters
+	// GetStatistics on the same table (e.g., logging path that touches
+	// catalog metadata, optimizer fanout that revisits this entry). Other
+	// callers that arrive while a fetch is in flight wait on the cv and
+	// then read the populated entries — no duplicate RPC.
 	struct StatsCache {
 		std::mutex mutex;
+		std::condition_variable cv;
 		std::unordered_map<std::string, unique_ptr<BaseStatistics>> entries;
 		bool fetched = false;
+		bool loading = false;
 		std::chrono::steady_clock::time_point fetched_at;
 		int64_t max_age_seconds = -1; // -1 = never expires, 0 = don't cache
 

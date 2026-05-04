@@ -1,6 +1,8 @@
 #pragma once
 
 #include <atomic>
+#include <mutex>
+#include <vector>
 
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/enums/access_mode.hpp"
@@ -59,7 +61,16 @@ public:
 	bool InMemory() override;
 	std::string GetDBPath() override;
 
-	void ClearCache();
+	/// Default behaviour (force=false): move the cached schema entries into
+	/// a deferred-drop graveyard so any raw CatalogEntry* pointers held by
+	/// bound prepared statements remain valid until the catalog is
+	/// destroyed. The graveyard is bounded; once it fills the oldest entries
+	/// are dropped (logged).
+	///
+	/// Force-clear (force=true): purge the graveyard along with the live
+	/// entries. Used by the explicit user-facing `vgi_clear_cache()`
+	/// table function — the user accepts that bound queries may break.
+	void ClearCache(bool force = false);
 
 	/// Check the worker's catalog version; clear cache only if it has changed.
 	/// No-op if catalog_version_frozen is true.
@@ -96,6 +107,16 @@ private:
 	/// Last known catalog version from the worker. Initialized from attach_result.
 	/// Atomic since it can be read/written from concurrent transactions.
 	std::atomic<int64_t> last_known_catalog_version_{0};
+
+	/// Deferred-drop graveyard. Each ClearCache() (non-force) moves the
+	/// schema set's entries here so any bound query holding a raw pointer
+	/// stays alive. Bounded so a long-lived catalog with frequent DDL
+	/// doesn't grow forever — when the bound is hit we drop the oldest
+	/// entries (with a warning log on the next ClearCache).
+	mutable std::mutex graveyard_mutex_;
+	std::vector<unique_ptr<CatalogEntry>> deferred_dropped_entries_;
+	size_t graveyard_drops_since_last_log_ = 0;
+	static constexpr size_t kGraveyardLimit = 1024;
 };
 
 } // namespace duckdb

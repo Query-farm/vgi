@@ -120,8 +120,11 @@ arrow::Result<int64_t> FdInputStream::Read(int64_t nbytes, void *out) {
 			return arrow::Status::IOError("Read error: ", strerror(errno));
 		}
 		if (bytes_read == 0) {
-			// EOF
-			return 0;
+			// EOF reached partway through. Return the bytes we did read —
+			// returning 0 here would discard them and surface as "stream
+			// ended" to Arrow's IPC reader, after which any subsequent
+			// reads start mid-frame and produce corrupt batches.
+			break;
 		}
 		total_bytes_read += bytes_read;
 	}

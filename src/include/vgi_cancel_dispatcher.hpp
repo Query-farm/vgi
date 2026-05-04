@@ -21,6 +21,7 @@ namespace vgi {
 class IFunctionConnection;
 class CatalogAuth;
 class SessionCookieJar;
+struct VgiAttachParameters;
 
 // One cancellation request draining through the dispatcher. Built
 // inside a noexcept destructor and handed off to the worker thread;
@@ -35,6 +36,18 @@ struct CancelRequest {
 	// HTTP-only: the most recent state-token seen on the stream. Used
 	// to address the right server-side session. Empty on subprocess.
 	std::vector<uint8_t> state_token;
+};
+
+// One streaming-close request. Used by the streaming-window operator
+// state's destructor to surrender a worker-side aggregate_streaming
+// session without requiring a ClientContext on the destruction thread.
+// The dispatcher synthesises a minimal VgiAggregateBindData from these
+// fields and dispatches aggregate_streaming_close on its bot Connection.
+struct StreamingCloseRequest {
+	std::shared_ptr<VgiAttachParameters> attach_params;
+	std::string function_name;
+	std::vector<uint8_t> execution_id;
+	std::vector<uint8_t> attach_id;
 };
 
 // Process-wide (per-DatabaseInstance) background thread that drains
@@ -55,11 +68,19 @@ public:
 	// saturation or after shutdown; caller should not retry.
 	bool Enqueue(CancelRequest req) noexcept;
 
+	// Enqueue a streaming-close request. Same noexcept / saturation
+	// contract as Enqueue. Used by the streaming-window operator state's
+	// destructor to surrender a worker-side session without needing a
+	// ClientContext on the destruction thread.
+	bool EnqueueStreamingClose(StreamingCloseRequest req) noexcept;
+
 	// Test-only: synchronously drain pending work on the caller's
 	// thread. Does not interact with the worker thread.
 	void DrainForTesting();
 
-	// Test-only: accessor used to confirm destructors enqueue.
+	// Test-only: accessor used to confirm destructors enqueue. Combined
+	// across both queues; tests inspecting one queue type alone are not
+	// supported.
 	size_t PendingCountForTesting() const noexcept {
 		return pending_count_.load(std::memory_order_relaxed);
 	}
@@ -68,6 +89,7 @@ private:
 	void EnsureWorkerStarted();
 	void WorkerLoop();
 	void ProcessOne(CancelRequest &req) noexcept;
+	void ProcessStreamingClose(StreamingCloseRequest &req) noexcept;
 
 	DatabaseInstance &db_;
 
@@ -76,6 +98,7 @@ private:
 	std::unique_ptr<duckdb::Connection> conn_;
 
 	duckdb_moodycamel::ConcurrentQueue<CancelRequest> queue_;
+	duckdb_moodycamel::ConcurrentQueue<StreamingCloseRequest> streaming_close_queue_;
 	std::atomic<size_t> pending_count_{0};
 
 	std::thread worker_;

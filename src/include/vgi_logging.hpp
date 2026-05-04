@@ -54,9 +54,16 @@ class IFunctionConnection;
 }
 
 //! Build the standard set of connection-scoped log fields from an IFunctionConnection.
-//! Fields returned (when non-empty): conn, attach_id, worker_pid (only if >0 — omitted for HTTP),
-//! execution_id (once init has run), transaction_id. Call sites append event-specific fields on top.
+//! Fields returned (when non-empty): conn, attach_id, worker_pid (only for subprocess
+//! transport — HTTP connections have no OS pid), execution_id (once init has run),
+//! transaction_id. Call sites append event-specific fields on top.
 vector<pair<string, string>> BuildConnLogFields(const vgi::IFunctionConnection &conn);
+
+//! Append a `worker_pid=<pid>` field to `fields` when the connection has a
+//! subprocess pid (>0). No-op for HTTP connections. Used by inline VGI_LOG
+//! sites that already emit `conn=` and want to additionally surface the OS
+//! pid when the transport is subprocess.
+void AppendSubprocessPidField(vector<pair<string, string>> &fields, const vgi::IFunctionConnection &conn);
 
 //! Optional string — empty string ⇒ field omitted. Fields are emitted in construction order.
 struct PoolReleaseLogFields {
@@ -123,7 +130,7 @@ bool HandleBatchLogMessage(const std::shared_ptr<arrow::RecordBatch> &batch,
                            const std::shared_ptr<arrow::KeyValueMetadata> &custom_metadata, ClientContext *context,
                            const std::string &worker_path, pid_t worker_pid = -1,
                            const std::string &invocation_id_hex = "", const std::string &attach_id_hex = "",
-                           const std::string &transaction_id_hex = "");
+                           const std::string &transaction_id_hex = "", const std::string &conn_id_hex = "");
 
 //! VGI_STDERR_DEBUG - lightweight stderr debug logging without requiring a ClientContext.
 //! Uses the same VGI_STDERR_LOG env var as VGI_LOG. A millisecond-precision timestamp

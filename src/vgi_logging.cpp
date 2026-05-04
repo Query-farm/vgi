@@ -118,6 +118,12 @@ string VgiGenerateConnId() {
 	return string(buf);
 }
 
+void AppendSubprocessPidField(vector<pair<string, string>> &fields, const vgi::IFunctionConnection &conn) {
+	if (auto pid = conn.GetSubprocessPid(); pid && *pid > 0) {
+		fields.emplace_back("worker_pid", std::to_string(*pid));
+	}
+}
+
 vector<pair<string, string>> BuildConnLogFields(const vgi::IFunctionConnection &conn) {
 	vector<pair<string, string>> fields;
 	fields.emplace_back("conn", conn.GetConnIdHex());
@@ -125,10 +131,7 @@ vector<pair<string, string>> BuildConnLogFields(const vgi::IFunctionConnection &
 	if (!attach.empty()) {
 		fields.emplace_back("attach_id", attach);
 	}
-	auto pid = conn.GetPid();
-	if (pid > 0) {
-		fields.emplace_back("worker_pid", std::to_string(pid));
-	}
+	AppendSubprocessPidField(fields, conn);
 	auto exec = conn.GetExecutionIdHex();
 	if (!exec.empty()) {
 		fields.emplace_back("execution_id", exec);
@@ -209,7 +212,8 @@ string VgiLogType::ConstructLogMessage(const string &event, const vector<pair<st
 bool HandleBatchLogMessage(const std::shared_ptr<arrow::RecordBatch> &batch,
                            const std::shared_ptr<arrow::KeyValueMetadata> &custom_metadata, ClientContext *context,
                            const std::string &worker_path, pid_t worker_pid, const std::string &invocation_id_hex,
-                           const std::string &attach_id_hex, const std::string &transaction_id_hex) {
+                           const std::string &attach_id_hex, const std::string &transaction_id_hex,
+                           const std::string &conn_id_hex) {
 	if (!batch || batch->num_rows() != 0) {
 		return false;
 	}
@@ -281,8 +285,13 @@ bool HandleBatchLogMessage(const std::shared_ptr<arrow::RecordBatch> &batch,
 	if (context) {
 		// Create log info with worker context and level for debugging
 		vector<pair<string, string>> info;
+		if (!conn_id_hex.empty()) {
+			info.emplace_back("conn", conn_id_hex);
+		}
 		info.emplace_back("worker_path", worker_path);
-		info.emplace_back("worker_pid", std::to_string(worker_pid));
+		if (worker_pid > 0) {
+			info.emplace_back("worker_pid", std::to_string(worker_pid));
+		}
 		info.emplace_back("level", log_level);
 		if (!invocation_id_hex.empty()) {
 			info.emplace_back("invocation_id", invocation_id_hex);

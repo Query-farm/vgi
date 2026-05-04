@@ -5,7 +5,11 @@
 
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/connection.hpp"
+#include "duckdb/main/client_context.hpp"
 
+#include "vgi_aggregate_function_impl.hpp"
+#include "vgi_aggregate_streaming_impl.hpp"
+#include "vgi_catalog_api.hpp"
 #include "vgi_ifunction_connection.hpp"
 #include "vgi_logging.hpp"
 
@@ -18,7 +22,8 @@ constexpr auto kShutdownJoinDeadline = std::chrono::seconds(2);
 
 } // namespace
 
-VgiCancelDispatcher::VgiCancelDispatcher(DatabaseInstance &db) : db_(db), queue_(1024) {
+VgiCancelDispatcher::VgiCancelDispatcher(DatabaseInstance &db)
+    : db_(db), queue_(1024), streaming_close_queue_(1024) {
 }
 
 VgiCancelDispatcher::~VgiCancelDispatcher() {
@@ -87,6 +92,26 @@ bool VgiCancelDispatcher::Enqueue(CancelRequest req) noexcept {
 	return true;
 }
 
+bool VgiCancelDispatcher::EnqueueStreamingClose(StreamingCloseRequest req) noexcept {
+	if (shutdown_.load(std::memory_order_acquire)) {
+		return false;
+	}
+	try {
+		EnsureWorkerStarted();
+	} catch (...) {
+		return false;
+	}
+	if (!streaming_close_queue_.try_enqueue(std::move(req))) {
+		return false;
+	}
+	pending_count_.fetch_add(1, std::memory_order_relaxed);
+	{
+		std::lock_guard<std::mutex> lock(cv_mutex_);
+		cv_.notify_one();
+	}
+	return true;
+}
+
 void VgiCancelDispatcher::EnsureWorkerStarted() {
 	if (worker_started_.load(std::memory_order_acquire)) {
 		return;
@@ -109,6 +134,12 @@ void VgiCancelDispatcher::WorkerLoop() {
 		if (queue_.try_dequeue(req)) {
 			pending_count_.fetch_sub(1, std::memory_order_relaxed);
 			ProcessOne(req);
+			continue;
+		}
+		StreamingCloseRequest sreq;
+		if (streaming_close_queue_.try_dequeue(sreq)) {
+			pending_count_.fetch_sub(1, std::memory_order_relaxed);
+			ProcessStreamingClose(sreq);
 			continue;
 		}
 		std::unique_lock<std::mutex> lock(cv_mutex_);
@@ -139,11 +170,50 @@ void VgiCancelDispatcher::ProcessOne(CancelRequest &req) noexcept {
 	}
 }
 
+void VgiCancelDispatcher::ProcessStreamingClose(StreamingCloseRequest &req) noexcept {
+	try {
+		if (!req.attach_params || !conn_ || !conn_->context) {
+			return;
+		}
+		// Synthesise the minimum bind data InvokeAggregateRpc needs:
+		// attach_params (worker_path / debug / pool / version / auth /
+		// cookies), function_name, attach_id. Other fields are unused
+		// by the streaming_close path.
+		VgiAggregateBindData synth_bind;
+		synth_bind.attach_params = req.attach_params;
+		synth_bind.attach_id = req.attach_id;
+		synth_bind.function_name = req.function_name;
+
+		VgiStreamingSession session;
+		session.function_name = std::move(req.function_name);
+		session.execution_id = std::move(req.execution_id);
+		session.attach_id = std::move(req.attach_id);
+
+		VgiAggregateStreamingClose(*conn_->context, synth_bind, session,
+		                            /*enable_logging=*/false);
+	} catch (const std::exception &e) {
+		try {
+			VGI_STDERR_DEBUG("[VGI] cancel_dispatcher.streaming_close.error what=%s\n", e.what());
+		} catch (...) {
+		}
+	} catch (...) {
+		try {
+			VGI_STDERR_DEBUG("[VGI] cancel_dispatcher.streaming_close.error what=unknown\n");
+		} catch (...) {
+		}
+	}
+}
+
 void VgiCancelDispatcher::DrainForTesting() {
 	CancelRequest req;
 	while (queue_.try_dequeue(req)) {
 		pending_count_.fetch_sub(1, std::memory_order_relaxed);
 		ProcessOne(req);
+	}
+	StreamingCloseRequest sreq;
+	while (streaming_close_queue_.try_dequeue(sreq)) {
+		pending_count_.fetch_sub(1, std::memory_order_relaxed);
+		ProcessStreamingClose(sreq);
 	}
 }
 

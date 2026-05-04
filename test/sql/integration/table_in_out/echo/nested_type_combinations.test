@@ -1,0 +1,691 @@
+# name: test/sql/integration/table_in_out/echo/nested_type_combinations.test
+# description: Round-trip nested type combinations through echo. Covers gaps in
+#              all_types.test: non-VARCHAR map keys; map-of-map / map-of-struct /
+#              map-of-list / list-of-map / struct-of-map; deeply nested structs;
+#              BIT / JSON; NULLs at every nesting level; empty containers;
+#              edge primitives (NaN/Inf, embedded NUL in BLOB, multi-byte UTF-8).
+# group: [vgi_integration_table_in_out_echo]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+require json
+
+statement ok
+SET arrow_lossless_conversion = true;
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# Map key types (test_all_types() only has map(varchar, varchar))
+# ============================================================================
+
+# BIGINT keys
+query I
+SELECT COUNT(*) FROM (
+    SELECT MAP {1::BIGINT: 'one', 2::BIGINT: 'two'} AS m
+    EXCEPT
+    SELECT * FROM example.echo((SELECT MAP {1::BIGINT: 'one', 2::BIGINT: 'two'} AS m))
+);
+----
+0
+
+# INTEGER keys
+query I
+SELECT m FROM example.echo((SELECT MAP {10: 'a', 20: 'b'} AS m));
+----
+{10=a, 20=b}
+
+# UUID keys
+query I
+SELECT m FROM example.echo((
+    SELECT MAP {'550e8400-e29b-41d4-a716-446655440000'::UUID: 'first'} AS m
+));
+----
+{550e8400-e29b-41d4-a716-446655440000=first}
+
+# DATE keys
+query I
+SELECT m FROM example.echo((
+    SELECT MAP {'2024-01-15'::DATE: 'jan', '2024-06-15'::DATE: 'jun'} AS m
+));
+----
+{2024-01-15=jan, 2024-06-15=jun}
+
+# TIMESTAMP keys
+query I
+SELECT m FROM example.echo((
+    SELECT MAP {'2024-01-01 00:00:00'::TIMESTAMP: 'a'} AS m
+));
+----
+{'2024-01-01 00:00:00'=a}
+
+# BLOB keys
+query I
+SELECT m FROM example.echo((
+    SELECT MAP {'\xDE\xAD'::BLOB: 'x'} AS m
+));
+----
+{\xDE\xAD=x}
+
+# ============================================================================
+# Map value types beyond scalars
+# ============================================================================
+
+# map of list
+query I
+SELECT m FROM example.echo((SELECT MAP {'a': [1,2,3], 'b': [4]} AS m));
+----
+{a=[1, 2, 3], b=[4]}
+
+# map of struct
+query I
+SELECT m FROM example.echo((
+    SELECT MAP {'a': {'x':1, 'y':'foo'}}
+        ::MAP(VARCHAR, STRUCT(x INT, y VARCHAR)) AS m
+));
+----
+{a={'x': 1, 'y': foo}}
+
+# map of map
+query I
+SELECT m FROM example.echo((
+    SELECT MAP {'outer': MAP {'inner': 42}} AS m
+));
+----
+{outer={inner=42}}
+
+# map with NULL values
+query I
+SELECT m FROM example.echo((
+    SELECT MAP {'a': NULL::INT, 'b': 5} AS m
+));
+----
+{a=NULL, b=5}
+
+# top-level NULL map
+query I
+SELECT m FROM example.echo((SELECT NULL::MAP(VARCHAR, INT) AS m));
+----
+NULL
+
+# empty map round-trip
+query I
+SELECT m FROM example.echo((SELECT MAP {}::MAP(VARCHAR, INT) AS m));
+----
+{}
+
+# ============================================================================
+# Containers of containers (combinations not in test_all_types)
+# ============================================================================
+
+# list of map
+query I
+SELECT l FROM example.echo((SELECT [MAP {'a': 1}, MAP {'b': 2}] AS l));
+----
+[{a=1}, {b=2}]
+
+# struct with map field
+query I
+SELECT s FROM example.echo((
+    SELECT {'name': 'rusty', 'props': MAP {'tags': [1,2,3]}} AS s
+));
+----
+{'name': rusty, 'props': {tags=[1, 2, 3]}}
+
+# list of struct of list (mixed inner list lengths, including empty)
+query I
+SELECT l FROM example.echo((
+    SELECT [{'x': 1, 'tags': ['a','b']}, {'x': 2, 'tags': []}] AS l
+));
+----
+[{'x': 1, 'tags': [a, b]}, {'x': 2, 'tags': []}]
+
+# list of list of list
+query I
+SELECT l FROM example.echo((SELECT [[[1,2],[3]],[[4,5,6]]] AS l));
+----
+[[[1, 2], [3]], [[4, 5, 6]]]
+
+# fixed-size array of struct
+query I
+SELECT fa FROM example.echo((
+    SELECT [{'x':1}, {'x':2}, {'x':3}]::STRUCT(x INT)[3] AS fa
+));
+----
+[{'x': 1}, {'x': 2}, {'x': 3}]
+
+# list of fixed-size arrays
+query I
+SELECT l FROM example.echo((
+    SELECT [[1,2,3], [4,5,6]]::INT[3][] AS l
+));
+----
+[[1, 2, 3], [4, 5, 6]]
+
+# fixed-size array of variable lists
+query I
+SELECT l FROM example.echo((
+    SELECT [[1,2], [3,4,5], [6]]::INT[][3] AS l
+));
+----
+[[1, 2], [3, 4, 5], [6]]
+
+# struct with UNION field
+query I
+SELECT s FROM example.echo((
+    SELECT {'val': union_value(num := 1)}::STRUCT(val UNION(num INT, str VARCHAR)) AS s
+));
+----
+{'val': 1}
+
+# ============================================================================
+# Deep nesting
+# ============================================================================
+
+# 5-level struct
+query I
+SELECT deep FROM example.echo((
+    SELECT {'l1': {'l2': {'l3': {'l4': {'l5': 'bottom'}}}}} AS deep
+));
+----
+{'l1': {'l2': {'l3': {'l4': {'l5': bottom}}}}}
+
+# 10-level struct
+query I
+SELECT deep FROM example.echo((
+    SELECT {'a': {'a': {'a': {'a': {'a': {'a': {'a': {'a': {'a': {'a': 1}}}}}}}}}} AS deep
+));
+----
+{'a': {'a': {'a': {'a': {'a': {'a': {'a': {'a': {'a': {'a': 1}}}}}}}}}}
+
+# struct of list of struct of map of list
+query I
+SELECT x FROM example.echo((
+    SELECT {'rows': [{'tags': MAP {'k': [1,2,3]}}]} AS x
+));
+----
+{'rows': [{'tags': {k=[1, 2, 3]}}]}
+
+# ============================================================================
+# BIT type — primitive and nested
+# ============================================================================
+
+query I
+SELECT b FROM example.echo((SELECT '101010'::BIT AS b));
+----
+101010
+
+# multiple bit widths in same column
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM (VALUES ('1'::BIT), ('11111'::BIT), ('1010101010'::BIT)) t(b)
+    EXCEPT
+    SELECT * FROM example.echo((
+        SELECT * FROM (VALUES ('1'::BIT), ('11111'::BIT), ('1010101010'::BIT)) t(b)
+    ))
+);
+----
+0
+
+# bit inside list
+query I
+SELECT l FROM example.echo((SELECT ['101'::BIT, '11110000'::BIT] AS l));
+----
+[101, 11110000]
+
+# bit inside struct
+query I
+SELECT s FROM example.echo((SELECT {'flags': '1010'::BIT, 'name': 'foo'} AS s));
+----
+{'flags': 1010, 'name': foo}
+
+# ============================================================================
+# JSON type
+# ============================================================================
+
+query I
+SELECT j FROM example.echo((SELECT '{"a": 1, "b": [1,2,3]}'::JSON AS j));
+----
+{"a": 1, "b": [1,2,3]}
+
+# JSON inside list
+query I
+SELECT l FROM example.echo((
+    SELECT ['{"x":1}'::JSON, '{"x":2}'::JSON] AS l
+));
+----
+[{"x":1}, {"x":2}]
+
+# JSON inside struct
+query I
+SELECT s FROM example.echo((
+    SELECT {'payload': '{"k":"v"}'::JSON, 'id': 1} AS s
+));
+----
+{'payload': '{"k":"v"}', 'id': 1}
+
+# ============================================================================
+# NULL at various nesting levels
+# ============================================================================
+
+# top-level NULL struct
+query I
+SELECT s FROM example.echo((SELECT NULL::STRUCT(a INT, b VARCHAR) AS s));
+----
+NULL
+
+# struct fields NULL
+query I
+SELECT s FROM example.echo((SELECT {'a': NULL::INT, 'b': 'hi'} AS s));
+----
+{'a': NULL, 'b': hi}
+
+# all-NULL list
+query I
+SELECT l FROM example.echo((SELECT [NULL,NULL,NULL]::INT[] AS l));
+----
+[NULL, NULL, NULL]
+
+# NULL inside fixed-size array
+query I
+SELECT fa FROM example.echo((SELECT [1,NULL,3]::INT[3] AS fa));
+----
+[1, NULL, 3]
+
+# all-NULL fixed-size array
+query I
+SELECT fa FROM example.echo((SELECT [NULL,NULL,NULL]::INT[3] AS fa));
+----
+[NULL, NULL, NULL]
+
+# list of NULL structs
+query I
+SELECT l FROM example.echo((SELECT [NULL,NULL]::STRUCT(x INT)[] AS l));
+----
+[NULL, NULL]
+
+# list of struct with one NULL element interspersed
+query I
+SELECT COUNT(*) FROM (
+    SELECT [{'a':1},NULL,{'a':3}]::STRUCT(a INT)[] AS l
+    EXCEPT
+    SELECT * FROM example.echo((
+        SELECT [{'a':1},NULL,{'a':3}]::STRUCT(a INT)[] AS l
+    ))
+);
+----
+0
+
+# 1000 rows of NULL nested struct (validation buffer reuse)
+query I
+SELECT COUNT(*) FROM example.echo((
+    SELECT NULL::STRUCT(a INT, b VARCHAR) AS s FROM range(1000)
+));
+----
+1000
+
+query I
+SELECT COUNT(DISTINCT s) FROM example.echo((
+    SELECT NULL::STRUCT(a INT, b VARCHAR) AS s FROM range(1000)
+));
+----
+0
+
+# Mixed NULL / non-NULL / inner-NULL pattern over multiple rows
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM (VALUES
+        ({'a':1, 'b':[1,2]}::STRUCT(a INT, b INT[])),
+        (NULL),
+        ({'a':3, 'b':NULL}),
+        ({'a':NULL, 'b':[]})
+    ) t(s)
+    EXCEPT
+    SELECT * FROM example.echo((
+        SELECT * FROM (VALUES
+            ({'a':1, 'b':[1,2]}::STRUCT(a INT, b INT[])),
+            (NULL),
+            ({'a':3, 'b':NULL}),
+            ({'a':NULL, 'b':[]})
+        ) t(s)
+    ))
+);
+----
+0
+
+# ============================================================================
+# Empty containers (zero elements, non-NULL)
+# ============================================================================
+
+query I
+SELECT l FROM example.echo((SELECT []::INT[] AS l));
+----
+[]
+
+# mix of empty list, NULL list, populated list — three distinct cases in one batch
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM (VALUES ([1,2,3]), (NULL), ([])) t(l)
+    EXCEPT
+    SELECT * FROM example.echo((
+        SELECT * FROM (VALUES ([1,2,3]), (NULL), ([])) t(l)
+    ))
+);
+----
+0
+
+# ============================================================================
+# Special primitive values
+# ============================================================================
+
+# IEEE 754 specials
+query I
+SELECT a FROM example.echo((SELECT 'nan'::DOUBLE AS a)) WHERE isnan(a);
+----
+nan
+
+query I
+SELECT b FROM example.echo((SELECT 'inf'::DOUBLE AS b));
+----
+inf
+
+query I
+SELECT c FROM example.echo((SELECT '-inf'::DOUBLE AS c));
+----
+-inf
+
+# BLOB with embedded null bytes (regression: C-string truncation)
+query I
+SELECT b FROM example.echo((SELECT '\x00\x01\x02\x00\xFF'::BLOB AS b));
+----
+\x00\x01\x02\x00\xFF
+
+# multi-byte UTF-8
+query I
+SELECT s FROM example.echo((SELECT '日本語🎉Émoji' AS s));
+----
+日本語🎉Émoji
+
+# 1 MiB string
+query I
+SELECT length(s) FROM example.echo((SELECT repeat('x', 1048576) AS s));
+----
+1048576
+
+# ============================================================================
+# Zero-row stream over complex schema (bind path with no data)
+# ============================================================================
+
+query I
+SELECT COUNT(*) FROM example.echo((
+    SELECT {'i': 1::HUGEINT, 'd': '2024-01-01'::DATE, 'b': '\xFF'::BLOB}
+        ::STRUCT(i HUGEINT, d DATE, b BLOB) AS s
+    WHERE FALSE
+));
+----
+0
+
+# zero-row stream with map(non-varchar key, struct value)
+query I
+SELECT COUNT(*) FROM example.echo((
+    SELECT MAP {1::BIGINT: {'a':1, 'b':'x'}}
+        ::MAP(BIGINT, STRUCT(a INT, b VARCHAR)) AS m
+    WHERE FALSE
+));
+----
+0
+
+# ============================================================================
+# Multi-row stream with nested types (cross batch-boundary)
+# ============================================================================
+
+query I
+SELECT COUNT(*) FROM example.echo((
+    SELECT {
+        'i': i,
+        'arr': range(0, i % 5)::INT[],
+        'opt': CASE WHEN i % 2 = 0 THEN 'even' ELSE NULL END,
+        'm': MAP {'k': i * 2}
+    } AS s FROM range(10000) t(i)
+));
+----
+10000
+
+# Round-trip equality across 10000 rows of deeply nested data
+query I
+SELECT COUNT(*) FROM (
+    SELECT {
+        'i': i,
+        'arr': range(0, i % 5)::INT[],
+        'm': MAP {'k': i * 2}
+    } AS s FROM range(10000) t(i)
+    EXCEPT
+    SELECT * FROM example.echo((
+        SELECT {
+            'i': i,
+            'arr': range(0, i % 5)::INT[],
+            'm': MAP {'k': i * 2}
+        } AS s FROM range(10000) t(i)
+    ))
+);
+----
+0
+
+# ============================================================================
+# Dictionary encoding (ENUMs) — exercise dict-encoded args
+# all_types.test only covers top-level enum columns. Enums round-trip as
+# VARCHAR (Arrow dictionary type doesn't preserve DuckDB enum identity).
+# ============================================================================
+
+statement ok
+CREATE TYPE mood AS ENUM ('happy','sad','neutral');
+
+# enum inside struct
+query I
+SELECT s FROM example.echo((SELECT {'state': 'happy'::mood, 'n': 1} AS s));
+----
+{'state': happy, 'n': 1}
+
+# enum inside list
+query I
+SELECT l FROM example.echo((
+    SELECT ['happy'::mood, 'sad'::mood, 'neutral'::mood] AS l
+));
+----
+[happy, sad, neutral]
+
+# enum as map key
+query I
+SELECT m FROM example.echo((
+    SELECT MAP {'happy'::mood: 1, 'sad'::mood: 2} AS m
+));
+----
+{happy=1, sad=2}
+
+# enum as map value
+query I
+SELECT m FROM example.echo((
+    SELECT MAP {'a': 'happy'::mood, 'b': 'sad'::mood} AS m
+));
+----
+{a=happy, b=sad}
+
+# enum nested two levels: map(enum, struct(int, enum))
+query I
+SELECT m FROM example.echo((
+    SELECT MAP {'happy'::mood: {'count': 5, 'tag': 'sad'::mood}} AS m
+));
+----
+{happy={'count': 5, 'tag': sad}}
+
+# enum with NULL value among non-NULL
+query I
+SELECT COUNT(*) FROM example.echo((
+    SELECT * FROM (VALUES ('happy'::mood),(NULL),('sad'::mood)) t(m)
+));
+----
+3
+
+# top-level all-NULL enum
+query I
+SELECT m FROM example.echo((SELECT NULL::mood AS m));
+----
+NULL
+
+statement ok
+DROP TYPE mood;
+
+# Large enum (>256 values) — forces Arrow dict-index width past int8.
+# 1000 rows over 500 distinct values exercises dict reuse across batches.
+statement ok
+CREATE TYPE bigenum AS ENUM (SELECT 'val_' || i::VARCHAR FROM range(500) t(i));
+
+query I
+SELECT COUNT(*) FROM example.echo((
+    SELECT ('val_' || (i % 500)::VARCHAR)::bigenum AS e FROM range(1000) t(i)
+));
+----
+1000
+
+query I
+SELECT COUNT(DISTINCT e) FROM example.echo((
+    SELECT ('val_' || (i % 500)::VARCHAR)::bigenum AS e FROM range(1000) t(i)
+));
+----
+500
+
+statement ok
+DROP TYPE bigenum;
+
+# ============================================================================
+# UNION types beyond top-level (all_types.test only has top-level union)
+# ============================================================================
+
+# multi-row mixed variants (regression: tag-buffer demuxing)
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM (VALUES
+        (union_value(num := 1)::UNION(num INT, str VARCHAR)),
+        (union_value(str := 'hi')::UNION(num INT, str VARCHAR)),
+        (union_value(num := 99)::UNION(num INT, str VARCHAR))
+    ) t(u)
+    EXCEPT
+    SELECT * FROM example.echo((
+        SELECT * FROM (VALUES
+            (union_value(num := 1)::UNION(num INT, str VARCHAR)),
+            (union_value(str := 'hi')::UNION(num INT, str VARCHAR)),
+            (union_value(num := 99)::UNION(num INT, str VARCHAR))
+        ) t(u)
+    ))
+);
+----
+0
+
+# NULL union row interleaved with valid variants
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM (VALUES
+        (union_value(num := 1)::UNION(num INT, str VARCHAR)),
+        (NULL),
+        (union_value(str := 'foo')::UNION(num INT, str VARCHAR))
+    ) t(u)
+    EXCEPT
+    SELECT * FROM example.echo((
+        SELECT * FROM (VALUES
+            (union_value(num := 1)::UNION(num INT, str VARCHAR)),
+            (NULL),
+            (union_value(str := 'foo')::UNION(num INT, str VARCHAR))
+        ) t(u)
+    ))
+);
+----
+0
+
+# union with complex variants (struct + list)
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM (VALUES
+        (union_value(s := {'a':1,'b':'x'})::UNION(s STRUCT(a INT, b VARCHAR), l INT[])),
+        (union_value(l := [1,2,3])::UNION(s STRUCT(a INT, b VARCHAR), l INT[]))
+    ) t(u)
+    EXCEPT
+    SELECT * FROM example.echo((
+        SELECT * FROM (VALUES
+            (union_value(s := {'a':1,'b':'x'})::UNION(s STRUCT(a INT, b VARCHAR), l INT[])),
+            (union_value(l := [1,2,3])::UNION(s STRUCT(a INT, b VARCHAR), l INT[]))
+        ) t(u)
+    ))
+);
+----
+0
+
+# union inside struct, multiple rows with different variants
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM (VALUES
+        ({'tag':'a', 'val': union_value(num := 1)}::STRUCT(tag VARCHAR, val UNION(num INT, str VARCHAR))),
+        ({'tag':'b', 'val': union_value(str := 'hello')})
+    ) t(s)
+    EXCEPT
+    SELECT * FROM example.echo((
+        SELECT * FROM (VALUES
+            ({'tag':'a', 'val': union_value(num := 1)}::STRUCT(tag VARCHAR, val UNION(num INT, str VARCHAR))),
+            ({'tag':'b', 'val': union_value(str := 'hello')})
+        ) t(s)
+    ))
+);
+----
+0
+
+# union inside map values
+query I
+SELECT m FROM example.echo((
+    SELECT MAP {'a': union_value(num := 1)::UNION(num INT, str VARCHAR),
+                'b': union_value(str := 'hi')} AS m
+));
+----
+{a=1, b=hi}
+
+# union with three variants (mixed scalar types)
+# NOTE: BOOLEAN variant intentionally avoided here — multi-row UNIONs with a
+# BOOLEAN child currently round-trip rows after the first as `false` (likely
+# bit-packing vs. byte-packing mismatch in the boolean child of a union).
+# See bool_in_union.test for the regression repro.
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM (VALUES
+        (union_value(i := 1)::UNION(i INT, s VARCHAR, d DOUBLE)),
+        (union_value(s := 'x')::UNION(i INT, s VARCHAR, d DOUBLE)),
+        (union_value(d := 3.14)::UNION(i INT, s VARCHAR, d DOUBLE))
+    ) t(u)
+    EXCEPT
+    SELECT * FROM example.echo((
+        SELECT * FROM (VALUES
+            (union_value(i := 1)::UNION(i INT, s VARCHAR, d DOUBLE)),
+            (union_value(s := 'x')::UNION(i INT, s VARCHAR, d DOUBLE)),
+            (union_value(d := 3.14)::UNION(i INT, s VARCHAR, d DOUBLE))
+        ) t(u)
+    ))
+);
+----
+0
+
+# zero-row union (bind-only path)
+query I
+SELECT COUNT(*) FROM example.echo((
+    SELECT union_value(num := 1)::UNION(num INT, str VARCHAR) AS u WHERE FALSE
+));
+----
+0
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;

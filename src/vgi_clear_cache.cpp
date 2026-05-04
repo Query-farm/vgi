@@ -33,7 +33,10 @@ static void VgiClearCacheScan(ClientContext &context, TableFunctionInput &data_p
 		if (catalog.GetCatalogType() != "vgi") {
 			continue;
 		}
-		catalog.Cast<VgiCatalog>().ClearCache();
+		// User-initiated; force-purge the deferred-drop graveyard too.
+		// Documented to invalidate any in-flight bound queries against
+		// VGI catalogs.
+		catalog.Cast<VgiCatalog>().ClearCache(/*force=*/true);
 	}
 
 	data.finished = true;

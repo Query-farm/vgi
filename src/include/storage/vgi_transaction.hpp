@@ -42,7 +42,8 @@ private:
 	VgiTransactionState transaction_state = VgiTransactionState::TRANSACTION_NOT_YET_STARTED;
 	AccessMode access_mode_;
 	VgiCatalog &vgi_catalog_;
-	ClientContext &context_;                // Stored from StartTransaction for use in Rollback
+	// (Rollback uses the base class's `Transaction::context` weak_ptr to
+	// safely reach a ClientContext if one is still alive at rollback time.)
 	std::vector<uint8_t> transaction_id_;   // Assigned by worker's catalog_transaction_begin
 };
 

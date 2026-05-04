@@ -61,4 +61,18 @@ void VgiCatalogSet::ClearEntries() {
 	is_loaded_ = false;
 }
 
+std::vector<unique_ptr<CatalogEntry>> VgiCatalogSet::HarvestEntries() {
+	std::lock_guard<std::mutex> lock(entry_lock_);
+	std::vector<unique_ptr<CatalogEntry>> harvested;
+	harvested.reserve(entries_.size());
+	for (auto &kv : entries_) {
+		if (kv.second) {
+			harvested.push_back(std::move(kv.second));
+		}
+	}
+	entries_.clear();
+	is_loaded_ = false;
+	return harvested;
+}
+
 } // namespace duckdb

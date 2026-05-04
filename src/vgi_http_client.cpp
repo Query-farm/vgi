@@ -20,6 +20,13 @@ using namespace duckdb_zstd;
 namespace duckdb {
 namespace vgi {
 
+// Cap on the maximum decompressed size we'll accept, in bytes. The frame_size
+// field of a zstd frame is attacker-controllable from the worker side; without
+// a cap, a malicious or buggy worker could declare frame_size = 1 << 60 and
+// trigger an exabyte allocation -> OOM crash. 1 GiB is generous for any
+// realistic VGI RPC response.
+static constexpr size_t kMaxDecompressedBytes = 1ULL << 30;  // 1 GiB
+
 // Decompress a zstd-encoded buffer. Returns decompressed bytes.
 static std::string ZstdDecompress(const char *data, size_t size) {
 	auto frame_size = ZSTD_getFrameContentSize(data, size);
@@ -28,6 +35,12 @@ static std::string ZstdDecompress(const char *data, size_t size) {
 	}
 
 	if (frame_size != ZSTD_CONTENTSIZE_UNKNOWN) {
+		if (frame_size > kMaxDecompressedBytes) {
+			throw IOException(
+			    "VGI zstd decompression rejected: declared frame size %llu bytes exceeds %llu byte cap",
+			    static_cast<unsigned long long>(frame_size),
+			    static_cast<unsigned long long>(kMaxDecompressedBytes));
+		}
 		// Known size — single-call decompress
 		std::string decompressed(frame_size, '\0');
 		auto result = ZSTD_decompress(decompressed.data(), frame_size, data, size);
@@ -38,7 +51,8 @@ static std::string ZstdDecompress(const char *data, size_t size) {
 		return decompressed;
 	}
 
-	// Unknown size — streaming decompress
+	// Unknown size — streaming decompress, also bounded by kMaxDecompressedBytes
+	// so a decompression bomb (small input, gigabyte output) can't OOM us.
 	auto *dstream = ZSTD_createDStream();
 	if (!dstream) {
 		throw IOException("VGI zstd decompression failed: could not create stream");
@@ -55,6 +69,12 @@ static std::string ZstdDecompress(const char *data, size_t size) {
 		if (ZSTD_isError(result)) {
 			ZSTD_freeDStream(dstream);
 			throw IOException("VGI zstd decompression failed: %s", ZSTD_getErrorName(result));
+		}
+		if (output.size() + output_buf.pos > kMaxDecompressedBytes) {
+			ZSTD_freeDStream(dstream);
+			throw IOException(
+			    "VGI zstd decompression rejected: streamed output exceeded %llu byte cap",
+			    static_cast<unsigned long long>(kMaxDecompressedBytes));
 		}
 		output.append(tmp.data(), output_buf.pos);
 	}
@@ -104,16 +124,43 @@ static bool UrlIsHttps(const std::string &url) {
 	       (url[4] == 's' || url[4] == 'S') && url[5] == ':';
 }
 
-// Collect all Set-Cookie response headers. The HTTP layer may fold duplicate
-// headers into a comma-separated string; proxies and browsers both treat
-// Set-Cookie as non-foldable, so we split on newlines inserted by the
-// underlying client or, when absent, fall back to the single value.
+// Collect all Set-Cookie response headers.
+//
+// Caveat: DuckDB's HTTPHeaders is a single-value map keyed on header name
+// (case_insensitive_map_t<string>), and the upstream Set-Cookie spec is
+// explicitly non-foldable (RFC 6265 §3). When a server emits N Set-Cookie
+// headers, DuckDB's wire→HTTPHeaders adapter chooses one of:
+//   (a) keep the last (most underlying clients on a plain map[k]=v assignment),
+//   (b) join with "\r\n" or "\n" between values,
+//   (c) join with ", " (the generic header-folding rule, broken for cookies
+//       whose Expires attribute legitimately contains commas).
+// We can't tell which path the underlying client took, but newline-joins are
+// safely splittable. Splitting on commas is unsafe and is intentionally not
+// attempted — at worst we recover one cookie under (a)/(c), which matches the
+// pre-fix behavior, and recover all of them under (b).
 static std::vector<std::string> CollectSetCookieHeaders(const HTTPResponse &response) {
 	std::vector<std::string> out;
 	if (!response.HasHeader("Set-Cookie")) {
 		return out;
 	}
-	out.push_back(response.GetHeaderValue("Set-Cookie"));
+	const std::string raw = response.GetHeaderValue("Set-Cookie");
+	// Split on \n; tolerate \r\n by trimming trailing \r.
+	size_t start = 0;
+	while (start < raw.size()) {
+		size_t end = raw.find('\n', start);
+		size_t len = (end == std::string::npos) ? raw.size() - start : end - start;
+		std::string line = raw.substr(start, len);
+		if (!line.empty() && line.back() == '\r') {
+			line.pop_back();
+		}
+		if (!line.empty()) {
+			out.push_back(std::move(line));
+		}
+		if (end == std::string::npos) {
+			break;
+		}
+		start = end + 1;
+	}
 	return out;
 }
 
@@ -142,8 +189,11 @@ static std::string HttpPostArrowIpcInternal(ClientContext &context,
 	if (!params) {
 		auto owned = http_util.InitializeParameters(context, url);
 		params = std::shared_ptr<HTTPParams>(owned.release());
-		ApplyHttpTimeout(context, *params);
 	}
+	// Always re-apply the timeout from the current setting. The cached path
+	// was previously skipping this, so users who tweaked vgi_http_timeout_seconds
+	// to debug a stuck endpoint saw no effect until re-ATTACH.
+	ApplyHttpTimeout(context, *params);
 
 	// Compress the request body with zstd
 	auto compressed_body = ZstdCompress(body.data(), body.size());
@@ -167,8 +217,11 @@ static std::string HttpPostArrowIpcInternal(ClientContext &context,
 	                     static_cast<idx_t>(compressed_body.size()));
 
 	out_response = http_util.Request(post);
+	if (!out_response) {
+		throw IOException("VGI HTTP POST returned no response (transport failure) [url: %s]", url);
+	}
 
-	if (cookie_jar && out_response) {
+	if (cookie_jar) {
 		auto set_cookie_headers = CollectSetCookieHeaders(*out_response);
 		if (!set_cookie_headers.empty()) {
 			cookie_jar->UpdateFromSetCookie(set_cookie_headers, UrlIsHttps(url));
@@ -259,6 +312,30 @@ static std::string HttpPostArrowIpcInternal(ClientContext &context,
 		    content_type.empty() ? "" : " Content-Type=",
 		    content_type,
 		    body_preview.empty() ? out_response->GetError() : body_preview, url);
+	}
+
+	// Defensive: if the server sent a Content-Length header, ensure the
+	// buffered body matches. Truncated responses (mid-stream proxy timeout,
+	// dropped connection on a chunked transfer that the underlying client
+	// silently swallows) would otherwise be parsed as a valid empty result
+	// — silent wrong-result. Arrow IPC tolerates a truncated body by
+	// returning Invalid which we'd previously treat as EOS.
+	if (out_response->HasHeader("Content-Length")) {
+		const auto content_length_str = out_response->GetHeaderValue("Content-Length");
+		try {
+			auto declared = std::stoull(content_length_str);
+			if (declared != post.buffer_out.size()) {
+				throw IOException(
+				    "VGI HTTP response body size mismatch: Content-Length=%llu, got %llu bytes [url: %s]",
+				    static_cast<unsigned long long>(declared),
+				    static_cast<unsigned long long>(post.buffer_out.size()), url);
+			}
+		} catch (const std::invalid_argument &) {
+			// Malformed Content-Length — let the caller's Arrow parser
+			// decide whether the body is intelligible.
+		} catch (const std::out_of_range &) {
+			// Same.
+		}
 	}
 
 	// Decompress zstd response if server sent it
@@ -413,6 +490,10 @@ std::string HttpGetBytes(ClientContext &context, const std::string &url) {
 
 	GetRequestInfo get(url, headers, *params, response_handler, content_handler);
 	auto response = http_util.Request(get);
+	if (!response) {
+		throw IOException("VGI external location fetch returned no response (transport failure) [url: %s]",
+		                  url);
+	}
 
 	if (!response->Success()) {
 		throw IOException("VGI external location fetch failed (HTTP %d) [url: %s]",
@@ -646,6 +727,11 @@ ServerCapabilities HttpDiscoverCapabilities(ClientContext &context, const std::s
 	HTTPHeaders headers;
 	HeadRequestInfo head(url, headers, *params);
 	auto response = http_util.Request(head);
+	if (!response) {
+		// Transport failure — treat as "no capabilities discovered" rather
+		// than crashing. Caller's defaults apply.
+		return ServerCapabilities{};
+	}
 
 	// Parse capability headers regardless of status code — middleware adds them to all responses
 	return ParseCapabilityHeaders(*response);
@@ -713,6 +799,9 @@ void HttpPutBytes(ClientContext &context, const std::string &url,
 	                   static_cast<idx_t>(body_size),
 	                   content_type);
 	auto response = http_util.Request(put);
+	if (!response) {
+		throw IOException("VGI upload returned no response (transport failure) [url: %s]", url);
+	}
 
 	if (!response->Success()) {
 		throw IOException("VGI upload failed (HTTP %d) [url: %s]",

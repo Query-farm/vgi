@@ -301,17 +301,24 @@ std::string UrlEncode(const std::string &str) {
 	return result;
 }
 
-// Render a secret for inclusion in debug error messages. We intentionally
-// log the ENTIRE value right now — debugging Microsoft Entra's AADSTS9002313
-// "Invalid request" wall needs to compare the actual bytes of the code,
-// code_verifier, refresh_token, etc. against the app registration and the
-// state stored on the VGI server. Redacted prefixes are not enough.
-//
-// This output only appears inside IOExceptions thrown on OAuth failure, so
-// it surfaces through the normal user-visible error path (shell modal) and
-// does NOT get written anywhere else.
+// Render a secret for inclusion in debug error messages. The previous version
+// echoed the full secret to keep IdP-failure debugging tractable, but
+// IOException messages travel further than "the user's shell" — DuckDB's log
+// manager, telemetry, JDBC clients, and any caller that catches IOException
+// and forwards .what() to logs all see them. A leaked refresh_token is
+// effectively account compromise. Render a fingerprint instead: length plus
+// 4-char prefix/suffix is enough to correlate against IdP logs without
+// exposing the bytes.
 static std::string DebugSecret(const std::string &secret) {
-	return "(" + std::to_string(secret.size()) + " chars) " + secret;
+	if (secret.empty()) {
+		return "(empty)";
+	}
+	std::string fingerprint = "(" + std::to_string(secret.size()) + " chars)";
+	if (secret.size() <= 8) {
+		// Short enough that prefix+suffix overlap; just say redacted.
+		return fingerprint + " <redacted>";
+	}
+	return fingerprint + " " + secret.substr(0, 4) + "..." + secret.substr(secret.size() - 4);
 }
 
 //===--------------------------------------------------------------------===//
@@ -737,12 +744,12 @@ static OAuthTokenSet ExchangeCodeForTokens(ClientContext &context,
 
 	auto resp = PostTokenRequestRaw(context, token_endpoint, body);
 	if (resp.status_code != 200) {
-		// Surface the full request shape through the exception so IdP-specific
+		// Surface the request shape through the exception so IdP-specific
 		// failures (Microsoft Entra "AADSTS9002313: Invalid request") are
-		// diagnosable from the user-visible error alone — no JS console digging
-		// required. Secrets are logged in full here: `code` and `code_verifier`
-		// are single-use and already burned by this request, and the refresh
-		// flow needs comparable visibility.
+		// diagnosable from the user-visible error alone. Secrets are
+		// fingerprinted (length + first/last 4 chars) so server-side IdP
+		// logs can be correlated without leaking the bytes — IOException
+		// messages travel to log manager / telemetry / JDBC clients.
 		throw IOException(
 		    "VGI OAuth: token exchange failed (HTTP %d): %s\n"
 		    "  request:\n"
@@ -752,16 +759,14 @@ static OAuthTokenSet ExchangeCodeForTokens(ClientContext &context,
 		    "    redirect_uri=%s\n"
 		    "    code_verifier=%s\n"
 		    "    client_id=%s\n"
-		    "    client_secret=%s\n"
-		    "  raw_body=%s",
+		    "    client_secret=%s",
 		    resp.status_code, resp.body,
 		    token_endpoint,
 		    DebugSecret(code),
 		    redirect_uri.empty() ? "<empty>" : redirect_uri,
 		    DebugSecret(code_verifier),
 		    client_id.empty() ? "<empty>" : client_id,
-		    client_secret.empty() ? "<not sent>" : DebugSecret(client_secret),
-		    body);
+		    client_secret.empty() ? "<not sent>" : DebugSecret(client_secret));
 	}
 	return ParseTokenResponse(resp.body, "token response");
 }
@@ -1865,11 +1870,12 @@ OAuthTokenSet AttemptTokenRefresh(const OAuthRefreshContext &ctx,
 
 	auto resp = PostTokenRequestRaw(context, ctx.token_endpoint, body);
 	if (resp.status_code != 200) {
-		// Surface the full request shape through the exception. The IdP's
+		// Surface the request shape through the exception. The IdP's
 		// "invalid_grant" / "AADSTS9002313" body doesn't tell you which
-		// parameter is wrong; the request shape does. Secrets are logged in
-		// full here — debugging visibility beats hygiene while we're still
-		// in "why does this never work" territory.
+		// parameter is wrong; the request shape does. Refresh tokens are
+		// fingerprinted (length + first/last 4 chars) — IOException text
+		// travels to log manager / telemetry / JDBC clients, so a leaked
+		// refresh_token is a credential leak.
 		throw IOException(
 		    "VGI OAuth: token refresh failed (HTTP %d): %s\n"
 		    "  request:\n"
@@ -1880,8 +1886,7 @@ OAuthTokenSet AttemptTokenRefresh(const OAuthRefreshContext &ctx,
 		    "    client_secret=%s\n"
 		    "    scope=%s\n"
 		    "    resource_metadata_url=%s\n"
-		    "    use_id_token_as_bearer=%s\n"
-		    "  raw_body=%s",
+		    "    use_id_token_as_bearer=%s",
 		    resp.status_code, resp.body,
 		    ctx.token_endpoint,
 		    DebugSecret(refresh_token),
@@ -1889,8 +1894,7 @@ OAuthTokenSet AttemptTokenRefresh(const OAuthRefreshContext &ctx,
 		    ctx.client_secret.empty() ? "<not sent>" : DebugSecret(ctx.client_secret),
 		    ctx.scope.empty() ? "<not sent>" : ctx.scope,
 		    ctx.resource_metadata_url.empty() ? "<not set>" : ctx.resource_metadata_url,
-		    ctx.use_id_token ? "true" : "false",
-		    body);
+		    ctx.use_id_token ? "true" : "false");
 	}
 
 	auto tokens = ParseTokenResponse(resp.body, "refresh token response");

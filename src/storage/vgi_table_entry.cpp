@@ -35,7 +35,7 @@ unique_ptr<BaseStatistics> VgiTableEntry::GetStatistics(ClientContext &context, 
 	// Check catalog-level capability flag
 	auto &vgi_catalog = catalog_.Cast<VgiCatalog>();
 	auto &attach_result = vgi_catalog.attach_result();
-	if (!attach_result->supports_column_statistics) {
+	if (!attach_result || !attach_result->supports_column_statistics) {
 		return nullptr;
 	}
 
@@ -52,12 +52,31 @@ unique_ptr<BaseStatistics> VgiTableEntry::GetStatistics(ClientContext &context, 
 	auto &col_def = columns.GetColumn(PhysicalIndex(column_id));
 	auto column_name = col_def.GetName();
 
-	// Thread-safe lazy fetch + lookup under single lock scope
-	std::lock_guard<std::mutex> lock(stats_cache_.mutex);
-	if (stats_cache_.IsStale()) {
+	// Two-phase: decide whether *this* call has to fetch, drop the mutex,
+	// run the RPC, then re-acquire to publish + look up. Holding the mutex
+	// across the RPC would self-deadlock on any path that re-enters
+	// GetStatistics on the same table from inside the RPC (logging,
+	// optimizer fanout, secret-manager reentry, etc.).
+	bool must_fetch = false;
+	{
+		std::unique_lock<std::mutex> lk(stats_cache_.mutex);
+		// Wait out a concurrent fetch. The waiter then sees the freshly
+		// populated cache and skips fetching.
+		stats_cache_.cv.wait(lk, [this] { return !stats_cache_.loading; });
+		if (stats_cache_.IsStale()) {
+			stats_cache_.loading = true;
+			must_fetch = true;
+		}
+	}
+
+	if (must_fetch) {
+		// FetchColumnStatistics handles its own publish + cv notify. It
+		// must clear stats_cache_.loading on every exit path (success,
+		// thrown exception, or caught error).
 		FetchColumnStatistics(context);
 	}
 
+	std::lock_guard<std::mutex> lk(stats_cache_.mutex);
 	auto it = stats_cache_.entries.find(column_name);
 	if (it != stats_cache_.entries.end() && it->second) {
 		return it->second->ToUnique();
@@ -79,40 +98,74 @@ bool VgiTableEntry::StatsCache::IsStale() const {
 	return elapsed > std::chrono::seconds(max_age_seconds);
 }
 
+// Caller must have set stats_cache_.loading = true under the mutex; this
+// method runs the worker RPC with the mutex *released* and is responsible
+// for clearing the loading flag (and notifying waiters) on every exit.
 void VgiTableEntry::FetchColumnStatistics(ClientContext &context) const {
-	auto &vgi_catalog = catalog_.Cast<VgiCatalog>();
-	auto &attach_params = vgi_catalog.attach_parameters();
-	auto &attach_result_data = vgi_catalog.attach_result();
-
-	// Build column name/type vectors from the table's schema
-	auto &columns = GetColumns();
-	std::vector<LogicalType> col_types;
-	std::vector<std::string> col_names;
-	for (idx_t i = 0; i < columns.PhysicalColumnCount(); i++) {
-		auto &col = columns.GetColumn(PhysicalIndex(i));
-		col_types.push_back(col.GetType());
-		col_names.push_back(col.GetName());
-	}
-
-	auto &vgi_tx = VgiTransaction::Get(context, catalog_);
-	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result_data->attach_id, vgi_tx.GetTransactionId()};
+	std::unordered_map<std::string, unique_ptr<BaseStatistics>> fetched_entries;
+	int64_t fetched_max_age = -1;
+	bool ok = false;
 
 	try {
+		auto &vgi_catalog = catalog_.Cast<VgiCatalog>();
+		auto &attach_params = vgi_catalog.attach_parameters();
+		auto &attach_result_data = vgi_catalog.attach_result();
+
+		// Build column name/type vectors from the table's schema
+		auto &columns = GetColumns();
+		std::vector<LogicalType> col_types;
+		std::vector<std::string> col_names;
+		for (idx_t i = 0; i < columns.PhysicalColumnCount(); i++) {
+			auto &col = columns.GetColumn(PhysicalIndex(i));
+			col_types.push_back(col.GetType());
+			col_names.push_back(col.GetName());
+		}
+
+		auto &vgi_tx = VgiTransaction::Get(context, catalog_);
+		vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result_data->attach_id,
+		                                vgi_tx.GetTransactionId()};
+
 		auto rpc_result = vgi::InvokeCatalogTableColumnStatisticsGet(
 		    rpc_ctx, ParentSchema().name, name, col_types, col_names, context);
 
-		stats_cache_.entries = std::move(rpc_result.stats);
-		stats_cache_.max_age_seconds = rpc_result.cache_max_age_seconds;
+		fetched_entries = std::move(rpc_result.stats);
+		fetched_max_age = rpc_result.cache_max_age_seconds;
+		ok = true;
 	} catch (const std::exception &e) {
-		VGI_LOG(context, "column_statistics.fetch_error",
-		        {{"worker_path", attach_params->worker_path()},
-		         {"table", ParentSchema().name + "." + name},
-		         {"error", e.what()}});
-		stats_cache_.entries.clear();
+		// Best-effort logging; never propagate. We must always reach the
+		// publish-and-clear block below or other callers wedge forever
+		// waiting on stats_cache_.cv.
+		try {
+			auto &vgi_catalog = catalog_.Cast<VgiCatalog>();
+			VGI_LOG(context, "column_statistics.fetch_error",
+			        {{"worker_path", vgi_catalog.attach_parameters()->worker_path()},
+			         {"table", ParentSchema().name + "." + name},
+			         {"error", e.what()}});
+		} catch (...) {
+			// swallow
+		}
+	} catch (...) {
+		// unknown — likewise, must reach publish-and-clear below
 	}
 
-	stats_cache_.fetched = true;
-	stats_cache_.fetched_at = std::chrono::steady_clock::now();
+	// Publish results under the mutex. Even on failure we mark the cache as
+	// "fetched" so subsequent callers don't pile up retries; max_age=-1
+	// keeps the empty cache effectively pinned, which matches the previous
+	// behaviour. The next CheckAndInvalidateCache / explicit clear will
+	// reset.
+	{
+		std::lock_guard<std::mutex> lk(stats_cache_.mutex);
+		if (ok) {
+			stats_cache_.entries = std::move(fetched_entries);
+			stats_cache_.max_age_seconds = fetched_max_age;
+		} else {
+			stats_cache_.entries.clear();
+		}
+		stats_cache_.fetched = true;
+		stats_cache_.fetched_at = std::chrono::steady_clock::now();
+		stats_cache_.loading = false;
+	}
+	stats_cache_.cv.notify_all();
 }
 
 TableFunction VgiTableEntry::GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data) {

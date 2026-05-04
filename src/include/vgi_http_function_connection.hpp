@@ -77,7 +77,6 @@ public:
 	void MarkDataFinished() override { data_finished_ = true; }
 
 	// Identity/diagnostics
-	pid_t GetPid() const override { return -1; }
 	std::string GetExecutionIdHex() const override;
 	std::string GetAttachIdHex() const override;
 	std::string GetTransactionIdHex() const override;

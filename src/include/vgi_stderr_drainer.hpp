@@ -44,11 +44,19 @@ public:
 	void DrainToLog(ClientContext &context, const std::string &worker_path, pid_t worker_pid);
 
 private:
+	// Bound on the buffered-lines queue. Pooled workers can sit idle for
+	// long periods between queries; a chatty worker would otherwise grow
+	// lines_ unboundedly. When the cap is hit we drop the oldest line and
+	// remember that we did so, surfacing a single "[truncated]" marker on
+	// the next DrainToLog so users notice they lost stderr.
+	static constexpr size_t kMaxBufferedLines = 1024;
+
 	int fd_ = -1;
 	std::thread thread_;
 	std::atomic<bool> stop_ {false};
 	std::mutex mutex_;
 	std::vector<std::string> lines_;
+	size_t dropped_lines_ = 0;
 
 	void ThreadLoop();
 };

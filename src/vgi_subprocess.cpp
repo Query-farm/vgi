@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <sys/select.h>
+#include <thread>
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -129,16 +130,36 @@ SubProcess::~SubProcess() {
 		close(stderr_fd_);
 	}
 	if (pid_ > 0) {
-		// First check if the process has already exited (non-blocking)
+		// Fast path: process already exited.
 		int status;
 		pid_t result = waitpid(pid_, &status, WNOHANG);
-		if (result == 0) {
-			// Process still running, send SIGTERM and wait
-			kill(pid_, SIGTERM);
-			waitpid(pid_, &status, 0);
+		if (result != 0) {
+			// result > 0: already reaped. result < 0: gone (errno=ECHILD).
+			return;
 		}
-		// If result > 0, process already exited, nothing more to do
-		// If result < 0, error (process doesn't exist), nothing to do
+
+		// Still running — escalate. SIGTERM first, give it ~2 s to exit;
+		// then SIGKILL (uncatchable, so the second wait is bounded). The
+		// previous code did an unbounded blocking waitpid here, so a
+		// worker that ignored SIGTERM could hang the destructor (and any
+		// caller — pool teardown, FunctionConnection cleanup, the host
+		// process exit) indefinitely.
+		kill(pid_, SIGTERM);
+		constexpr auto kSigtermGrace = std::chrono::milliseconds(2000);
+		constexpr auto kPollInterval = std::chrono::milliseconds(50);
+		auto deadline = std::chrono::steady_clock::now() + kSigtermGrace;
+		while (std::chrono::steady_clock::now() < deadline) {
+			result = waitpid(pid_, &status, WNOHANG);
+			if (result != 0) {
+				return; // exited (>0) or already gone (<0)
+			}
+			std::this_thread::sleep_for(kPollInterval);
+		}
+
+		// SIGTERM grace expired — escalate.
+		kill(pid_, SIGKILL);
+		// SIGKILL cannot be caught/blocked/ignored, so this returns promptly.
+		waitpid(pid_, &status, 0);
 	}
 }
 

@@ -216,13 +216,24 @@ public:
 		data_finished_ = true;
 	}
 
-	// Get the worker process PID (returns -1 if not yet spawned)
-	pid_t GetPid() const override {
-		return proc_ ? proc_->GetPid() : -1;
-	}
-
 	// Get the execution ID as hex string (empty if init not done)
 	std::string GetExecutionIdHex() const override;
+
+	// Subprocess transport: return the spawned worker's OS pid (or nullopt
+	// before the process exists). Used for diagnostics — log emitters call
+	// this to add a worker_pid= field alongside conn= for subprocess
+	// connections; HTTP connections inherit the default nullopt.
+	std::optional<pid_t> GetSubprocessPid() const override {
+		return proc_ ? std::make_optional(proc_->GetPid()) : std::nullopt;
+	}
+
+	// Internal subprocess accessor — same value as GetSubprocessPid() but
+	// returns -1 when no process exists. Use this only inside subprocess
+	// implementation files where the concrete type is known and the
+	// optional unwrapping noise is unwelcome.
+	pid_t GetPid() const {
+		return proc_ ? proc_->GetPid() : -1;
+	}
 
 	// Get the attach ID as hex string (empty if no attach_id)
 	std::string GetAttachIdHex() const override;

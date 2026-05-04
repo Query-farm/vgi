@@ -12,8 +12,10 @@ namespace duckdb {
 // VgiTransaction implementation
 
 VgiTransaction::VgiTransaction(VgiCatalog &vgi_catalog, TransactionManager &manager, ClientContext &context)
-    : Transaction(manager, context), access_mode_(vgi_catalog.GetAccessMode()), vgi_catalog_(vgi_catalog),
-      context_(context) {
+    : Transaction(manager, context), access_mode_(vgi_catalog.GetAccessMode()), vgi_catalog_(vgi_catalog) {
+	// The base class stores `context` as a weak_ptr<ClientContext>; we
+	// reach it via that weak_ptr in Rollback() so we never deref a freed
+	// ClientContext during cross-session/shutdown rollback paths.
 }
 
 VgiTransaction::~VgiTransaction() = default;
@@ -52,16 +54,30 @@ void VgiTransaction::Commit(ClientContext &context) {
 }
 
 void VgiTransaction::Rollback() {
+	transaction_state = VgiTransactionState::TRANSACTION_FINISHED;
+
+	// Lock the base class's weak_ptr<ClientContext>. If the original session
+	// has gone away (cross-session rollback during shutdown reconciliation,
+	// extension teardown, etc.), we have no context to dispatch on — skip
+	// the worker RPC and the cache-version probe. The cache will be
+	// rechecked on the next Start anyway, and the worker's transaction will
+	// be reaped by its idle timeout / pool eviction.
+	auto ctx = context.lock();
+	if (!ctx) {
+		return;
+	}
+
 	if (!transaction_id_.empty()) {
 		auto &params = vgi_catalog_.attach_parameters();
 		auto &attach_result = vgi_catalog_.attach_result();
-		vgi::CatalogRpcContext rpc_ctx{params, attach_result->attach_id, transaction_id_};
-		vgi::InvokeCatalogTransactionRollback(rpc_ctx, context_);
+		if (attach_result) {
+			vgi::CatalogRpcContext rpc_ctx{params, attach_result->attach_id, transaction_id_};
+			vgi::InvokeCatalogTransactionRollback(rpc_ctx, *ctx);
+		}
 	}
-	transaction_state = VgiTransactionState::TRANSACTION_FINISHED;
 
 	// Check catalog version — clear cache only if metadata actually changed.
-	vgi_catalog_.CheckAndInvalidateCache(context_, /*transaction_id=*/{});
+	vgi_catalog_.CheckAndInvalidateCache(*ctx, /*transaction_id=*/{});
 }
 
 VgiTransaction &VgiTransaction::Get(ClientContext &context, Catalog &catalog) {

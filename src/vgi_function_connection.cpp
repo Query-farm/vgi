@@ -587,8 +587,38 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 		auto read_result = data_reader_->ReadNext();
 		if (!read_result.ok()) {
 			auto status = read_result.status();
-			// Invalid status from IPC reader typically indicates end-of-stream
+			// Arrow's IPC stream uses an explicit EOS marker (0xFFFFFFFF +
+			// 0-length); a clean stream-end surfaces *below* as Status::OK
+			// + batch == nullptr. A non-OK status here means the bytes
+			// were truncated — almost always because the worker died or
+			// closed stdout *before* writing the EOS marker.
+			//
+			// We can't entirely abandon the tolerant behaviour: some HTTP
+			// paths (proc_ null) and some workers historically end their
+			// stream by closing stdout without an EOS marker after a
+			// clean exit. So: if we can prove the worker died unexpectedly
+			// (killed by signal, or exited non-zero), surface a real
+			// error. Otherwise fall through to the legacy tolerant path
+			// so we don't regress healthy producers.
 			if (status.IsInvalid()) {
+				int exit_status = 0;
+				if (proc_ && proc_->TryWait(&exit_status)) {
+					if (exit_status < 0) {
+						ThrowVgiIOException(
+						    "Worker killed by signal %d before EOS marker; result was truncated: %s",
+						    worker_path_, proc_->GetPid(), GetExecutionIdHex(), -exit_status,
+						    status.ToString());
+					}
+					if (exit_status != 0) {
+						ThrowVgiIOException(
+						    "Worker exited with status %d before EOS marker; result was truncated: %s",
+						    worker_path_, proc_->GetPid(), GetExecutionIdHex(), exit_status,
+						    status.ToString());
+					}
+					// exit_status == 0: worker exited cleanly without EOS.
+				}
+				// HTTP transport (no proc_) or worker still running: keep
+				// legacy tolerant behaviour.
 				data_finished_ = true;
 				return nullptr;
 			}
@@ -597,15 +627,38 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 		}
 		auto result = read_result.ValueUnsafe();
 
-		// Null batch means end of stream (EOS)
+		// Null batch means end of stream (EOS). Apply the same liveness
+		// probe as the Invalid-status branch above: some Arrow versions
+		// treat EOF-at-message-boundary as silent EOS, so a SIGKILL'd
+		// worker's truncated stream can surface here too.
+		//
+		// Limitation: if the user's LOCATION wraps the worker behind a
+		// shell or launcher (e.g., ``uv run ...``), proc_ is the wrapper,
+		// not the worker. The wrapper may stay alive briefly after the
+		// worker dies, so TryWait returns false and we fall through. For
+		// LOCATION pointing directly at the worker binary we surface
+		// signal/non-zero exits cleanly.
 		if (!result.batch) {
+			int exit_status = 0;
+			if (proc_ && proc_->TryWait(&exit_status)) {
+				if (exit_status < 0) {
+					ThrowVgiIOException(
+					    "Worker killed by signal %d before EOS marker; result was truncated",
+					    worker_path_, proc_->GetPid(), GetExecutionIdHex(), -exit_status);
+				}
+				if (exit_status != 0) {
+					ThrowVgiIOException(
+					    "Worker exited with status %d before EOS marker; result was truncated",
+					    worker_path_, proc_->GetPid(), GetExecutionIdHex(), exit_status);
+				}
+			}
 			data_finished_ = true;
 			return nullptr;
 		}
 
 		// Check for log/error batches via HandleBatchLogMessage
 		if (HandleBatchLogMessage(result.batch, result.custom_metadata, &context_, worker_path_, proc_->GetPid(),
-		                          GetExecutionIdHex(), GetAttachIdHex(), "")) {
+		                          GetExecutionIdHex(), GetAttachIdHex(), "", GetConnIdHex())) {
 			continue;  // Skip log batch, read next
 		}
 

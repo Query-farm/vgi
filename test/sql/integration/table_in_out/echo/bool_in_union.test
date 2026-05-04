@@ -1,0 +1,124 @@
+# name: test/sql/integration/table_in_out/echo/bool_in_union.test
+# description: Regression repro — BOOLEAN variant in a multi-row UNION corrupts
+#              after the first row through the VGI Arrow IPC round-trip.
+#              Single-row bool-in-union, top-level BOOLEAN, and BOOLEAN inside
+#              list/struct all survive correctly. Only the multi-row union
+#              child path is broken — likely a bit-packed (BOOLEAN child of
+#              union) vs. byte-packed densification on Arrow rebuild.
+# group: [vgi_integration_table_in_out_echo]
+#
+# This test asserts the OBSERVED (buggy) behavior so failures here flag a
+# *change* (either a fix or a regression). Once the underlying bug is fixed,
+# update the expected outputs to the correct values.
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+SET arrow_lossless_conversion = true;
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ----------------------------------------------------------------------------
+# Sanity: top-level BOOLEAN is fine — only union-wrapped BOOLEAN is broken.
+# ----------------------------------------------------------------------------
+
+query I
+SELECT u FROM example.echo((SELECT true AS u));
+----
+true
+
+query I
+SELECT u FROM example.echo((SELECT false AS u));
+----
+false
+
+# ----------------------------------------------------------------------------
+# BUG: BOOLEAN variant inside a UNION returns `true` for the first row
+# regardless of the input value, and `false` for every subsequent row.
+# Likely cause: the BOOLEAN child of a dense-union is bit-packed (1 bit per
+# value) but on rebuild it's being read as byte-packed (or vice versa), so
+# row 0 always reads bit 0 of byte 0 (=1 if any bit is set, else 0), and
+# rows ≥1 read into uninitialized/zero territory.
+# ----------------------------------------------------------------------------
+
+# Single-row union with `false` — should return false, returns true.
+query I
+SELECT u FROM example.echo((
+    SELECT union_value(b := false)::UNION(i INT, b BOOLEAN) AS u
+));
+----
+true
+
+# Single-row union with `true` — happens to round-trip "correctly" by accident.
+query I
+SELECT u FROM example.echo((
+    SELECT union_value(b := true)::UNION(i INT, b BOOLEAN) AS u
+));
+----
+true
+
+# ----------------------------------------------------------------------------
+# Multi-row UNION with BOOLEAN variant — first row reads true, rest read false.
+# ----------------------------------------------------------------------------
+
+# 4 rows of `true` in a 2-variant union → first row preserved, rest become false.
+# CORRECT result would be (true, true, true, true).
+query I
+SELECT u FROM example.echo((
+    SELECT * FROM (VALUES
+        (union_value(b := true)::UNION(i INT, b BOOLEAN)),
+        (union_value(b := true)),
+        (union_value(b := true)),
+        (union_value(b := true))
+    ) t(u)
+));
+----
+true
+false
+false
+false
+
+# Alternating true/false in a 3-variant union → all rows after row 1 become false.
+# CORRECT result would be (true, false, true, false, true).
+query I
+SELECT u FROM example.echo((
+    SELECT * FROM (VALUES
+        (union_value(b := true)::UNION(i INT, s VARCHAR, b BOOLEAN)),
+        (union_value(b := false)),
+        (union_value(b := true)),
+        (union_value(b := false)),
+        (union_value(b := true))
+    ) t(u)
+));
+----
+true
+false
+false
+false
+false
+
+# Mixed variants — non-bool variants pass through fine; bool variants after the
+# first one are still corrupted to false.
+# CORRECT result would be (1, true, x, true).
+query I
+SELECT u FROM example.echo((
+    SELECT * FROM (VALUES
+        (union_value(i := 1)::UNION(i INT, s VARCHAR, b BOOLEAN)),
+        (union_value(b := true)),
+        (union_value(s := 'x')),
+        (union_value(b := true))
+    ) t(u)
+));
+----
+1
+false
+x
+false
+
+statement ok
+DETACH example;

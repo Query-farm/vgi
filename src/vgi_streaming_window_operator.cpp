@@ -17,6 +17,8 @@
 #include "vgi_aggregate_function_impl.hpp"
 #include "vgi_aggregate_streaming_impl.hpp"
 #include "vgi_arrow_utils.hpp"
+#include "vgi_cancel_dispatcher.hpp"
+#include "vgi_catalog_api.hpp"
 #include "vgi_logging.hpp"
 
 namespace duckdb {
@@ -84,12 +86,28 @@ PhysicalOperator &LogicalVgiStreamingWindow::CreatePlan(ClientContext &context, 
 namespace {
 
 // One streaming session per window expression in the operator. Created
-// lazily on the first Execute call once we know the input schema. Closed
-// in FinalExecute (and again, defensively, in the destructor).
+// lazily on the first Execute call once we know the input schema.
+//
+// Cleanup paths:
+//   - Success path: FinalExecute() runs aggregate_streaming_close
+//     synchronously through the active ClientContext and clears
+//     sessions_opened.
+//   - Cancel / error path: FinalExecute() never runs, only the destructor
+//     does. The destructor cannot reach a ClientContext (may run on a
+//     task-scheduler thread mid-teardown), so it hands each open session
+//     to VgiCancelDispatcher which dispatches aggregate_streaming_close
+//     off-thread on its bot Connection. Without this, every cancelled /
+//     errored streaming-window query would leak per-session state on a
+//     pooled subprocess worker.
 struct VgiStreamingWindowOperatorState : public OperatorState {
 	bool sessions_opened = false;
 	vector<VgiStreamingSession> sessions;        // parallel to select_list
 	vector<const VgiAggregateBindData *> bind_datas; // pointer aliases; lifetime owned by Expressions
+	// Keep-alive of the per-session attach parameters for the destructor.
+	// Parallel to sessions: attach_params_per_expr[i] backs sessions[i].
+	// Captured at OpenSessions time because by destructor time the
+	// owning bind_data may already be gone.
+	vector<std::shared_ptr<VgiAttachParameters>> attach_params_per_expr;
 	// Per-expression Arrow input schema:
 	//   [partition keys..., order keys..., value cols-for-this-expr...]
 	// All expressions in the same operator share the same partition/order
@@ -98,15 +116,32 @@ struct VgiStreamingWindowOperatorState : public OperatorState {
 	vector<std::shared_ptr<arrow::Schema>> chunk_input_schema_per_expr;
 	idx_t partition_key_count = 0;
 	idx_t order_key_count = 0;
+	// DatabaseInstance pointer captured at OpenSessions time so the
+	// destructor can locate the cancel dispatcher without a ClientContext.
+	// Plain pointer is safe: DatabaseInstance outlives all queries running
+	// against it, and OperatorState is destroyed before DatabaseInstance.
+	DatabaseInstance *db = nullptr;
 
 	~VgiStreamingWindowOperatorState() override {
-		// Best-effort close. Real close fires in FinalExecute; this is a
-		// safety net for abnormal teardown. enable_logging=false because
-		// this destructor may run on a task-scheduler thread.
-		// We can't reach back to a ClientContext here, so we deliberately
-		// leak the worker-side state in this fallback path. The worker's
-		// session map cleans up on process exit; in HTTP pool mode, idle
-		// timeout reaps stale sessions.
+		// FinalExecute clears sessions_opened on the success path; if it's
+		// still true here we're tearing down via a cancel / error path.
+		if (!sessions_opened || !db) {
+			return;
+		}
+		auto *dispatcher = vgi::FindVgiCancelDispatcher(*db);
+		if (!dispatcher) {
+			return;
+		}
+		for (idx_t i = 0; i < sessions.size(); i++) {
+			vgi::StreamingCloseRequest req;
+			req.attach_params = attach_params_per_expr[i];
+			req.function_name = std::move(sessions[i].function_name);
+			req.execution_id = std::move(sessions[i].execution_id);
+			req.attach_id = std::move(sessions[i].attach_id);
+			// Saturation / shutdown returns false; nothing actionable here.
+			(void)dispatcher->EnqueueStreamingClose(std::move(req));
+		}
+		sessions_opened = false;
 	}
 };
 
@@ -136,53 +171,99 @@ PhysicalVgiStreamingWindow::PhysicalVgiStreamingWindow(PhysicalPlan &physical_pl
 
 // Open one streaming session per window expression. Called on the first
 // Execute call so we know the input chunk's schema.
+//
+// Partial-failure handling: if VgiAggregateStreamingOpen throws on the Nth
+// expression, the [0..N-1] sessions are already open on the worker. The
+// catch block closes them synchronously (best-effort, logging suppressed)
+// and rethrows; the worker's per-session state never leaks here.
 static void OpenSessions(ClientContext &context, const PhysicalVgiStreamingWindow &op,
                           DataChunk &first_input, VgiStreamingWindowOperatorState &state) {
 	state.sessions.reserve(op.select_list.size());
 	state.bind_datas.reserve(op.select_list.size());
+	state.attach_params_per_expr.reserve(op.select_list.size());
 	state.chunk_input_schema_per_expr.reserve(op.select_list.size());
+	// Capture DatabaseInstance for the destructor's dispatcher lookup.
+	state.db = context.db.get();
 
-	for (idx_t expr_idx = 0; expr_idx < op.select_list.size(); expr_idx++) {
-		auto &wexpr = op.select_list[expr_idx]->Cast<BoundWindowExpression>();
-		if (!wexpr.bind_info) {
-			throw IOException("VGI streaming window: window expression has no bind_info");
+	try {
+		for (idx_t expr_idx = 0; expr_idx < op.select_list.size(); expr_idx++) {
+			auto &wexpr = op.select_list[expr_idx]->Cast<BoundWindowExpression>();
+			if (!wexpr.bind_info) {
+				throw IOException("VGI streaming window: window expression has no bind_info");
+			}
+			auto &bind_data = wexpr.bind_info->Cast<VgiAggregateBindData>();
+
+			const idx_t pkc = wexpr.partitions.size();
+			const idx_t okc = wexpr.orders.size();
+			// Planner groups expressions sharing partition/order keys into
+			// the same LogicalWindow node, so all expressions in one operator
+			// see the same (pkc, okc). Assert defensively.
+			if (expr_idx == 0) {
+				state.partition_key_count = pkc;
+				state.order_key_count = okc;
+			} else if (state.partition_key_count != pkc || state.order_key_count != okc) {
+				throw InternalException(
+				    "VGI streaming window: planner produced expressions with mismatched "
+				    "partition/order key counts in the same node "
+				    "(expr 0: pkc=%llu okc=%llu, expr %llu: pkc=%llu okc=%llu)",
+				    (unsigned long long)state.partition_key_count,
+				    (unsigned long long)state.order_key_count,
+				    (unsigned long long)expr_idx, (unsigned long long)pkc,
+				    (unsigned long long)okc);
+			}
+
+			// Build input_schema describing the columns shipped per chunk for
+			// THIS expression: partition keys, order keys, this expr's value cols.
+			vector<LogicalType> col_types;
+			vector<string> col_names;
+			col_types.reserve(pkc + okc + wexpr.children.size());
+			col_names.reserve(pkc + okc + wexpr.children.size());
+
+			for (idx_t i = 0; i < pkc; i++) {
+				col_types.push_back(wexpr.partitions[i]->return_type);
+				col_names.push_back(StringUtil::Format("__pk_%llu", static_cast<unsigned long long>(i)));
+			}
+			for (idx_t i = 0; i < okc; i++) {
+				col_types.push_back(wexpr.orders[i].expression->return_type);
+				col_names.push_back(StringUtil::Format("__ok_%llu", static_cast<unsigned long long>(i)));
+			}
+			for (idx_t i = 0; i < wexpr.children.size(); i++) {
+				col_types.push_back(wexpr.children[i]->return_type);
+				col_names.push_back(StringUtil::Format("__val_%llu", static_cast<unsigned long long>(i)));
+			}
+
+			auto input_schema = BuildArrowSchemaFromDuckDB(context, col_types, col_names);
+
+			// Open BEFORE pushing the bookkeeping vectors so that on throw
+			// the size of state.sessions == size of state.bind_datas ==
+			// size of state.chunk_input_schema_per_expr, and the catch
+			// block can iterate state.sessions to close exactly what's open.
+			auto session = VgiAggregateStreamingOpen(context, bind_data, input_schema,
+			                                          static_cast<int64_t>(pkc),
+			                                          static_cast<int64_t>(okc));
+			state.bind_datas.push_back(&bind_data);
+			state.attach_params_per_expr.push_back(bind_data.attach_params);
+			state.chunk_input_schema_per_expr.push_back(std::move(input_schema));
+			state.sessions.push_back(std::move(session));
 		}
-		auto &bind_data = wexpr.bind_info->Cast<VgiAggregateBindData>();
-		state.bind_datas.push_back(&bind_data);
-
-		const idx_t pkc = wexpr.partitions.size();
-		const idx_t okc = wexpr.orders.size();
-		// All expressions in one operator share the same partition/order
-		// keys (planner enforces). Setting these once is correct.
-		state.partition_key_count = pkc;
-		state.order_key_count = okc;
-
-		// Build input_schema describing the columns shipped per chunk for
-		// THIS expression: partition keys, order keys, this expr's value cols.
-		vector<LogicalType> col_types;
-		vector<string> col_names;
-		col_types.reserve(pkc + okc + wexpr.children.size());
-		col_names.reserve(pkc + okc + wexpr.children.size());
-
-		for (idx_t i = 0; i < pkc; i++) {
-			col_types.push_back(wexpr.partitions[i]->return_type);
-			col_names.push_back(StringUtil::Format("__pk_%llu", static_cast<unsigned long long>(i)));
+	} catch (...) {
+		// Close anything we already opened. Best-effort; logging disabled
+		// because we may be unwinding through a logging-aware path. Each
+		// individual close is wrapped so one failure doesn't strand others.
+		for (idx_t i = 0; i < state.sessions.size(); i++) {
+			try {
+				VgiAggregateStreamingClose(context, *state.bind_datas[i],
+				                            state.sessions[i],
+				                            /*enable_logging=*/false);
+			} catch (...) {
+				// swallow; rethrow original below
+			}
 		}
-		for (idx_t i = 0; i < okc; i++) {
-			col_types.push_back(wexpr.orders[i].expression->return_type);
-			col_names.push_back(StringUtil::Format("__ok_%llu", static_cast<unsigned long long>(i)));
-		}
-		for (idx_t i = 0; i < wexpr.children.size(); i++) {
-			col_types.push_back(wexpr.children[i]->return_type);
-			col_names.push_back(StringUtil::Format("__val_%llu", static_cast<unsigned long long>(i)));
-		}
-
-		auto input_schema = BuildArrowSchemaFromDuckDB(context, col_types, col_names);
-		state.chunk_input_schema_per_expr.push_back(input_schema);
-
-		auto session = VgiAggregateStreamingOpen(context, bind_data, input_schema,
-		                                          static_cast<int64_t>(pkc), static_cast<int64_t>(okc));
-		state.sessions.push_back(std::move(session));
+		state.sessions.clear();
+		state.bind_datas.clear();
+		state.attach_params_per_expr.clear();
+		state.chunk_input_schema_per_expr.clear();
+		throw;
 	}
 
 	state.sessions_opened = true;
@@ -285,7 +366,11 @@ OperatorResultType PhysicalVgiStreamingWindow::Execute(ExecutionContext &context
 		result_chunk.SetCardinality(input.size());
 		ArrowTableFunction::ArrowToDuckDB(scan_state, arrow_table.GetColumns(), result_chunk, false);
 
-		chunk.data[input_width + expr_idx].Reference(result_chunk.data[0]);
+		// Physical copy (mirrors aggregate_window_impl.cpp). Avoids any
+		// shared-lifetime question between scan_state's arrow buffers and
+		// the outgoing ``chunk`` once this iteration goes out of scope.
+		VectorOperations::Copy(result_chunk.data[0], chunk.data[input_width + expr_idx],
+		                       input.size(), 0, 0);
 	}
 
 	return OperatorResultType::NEED_MORE_INPUT;

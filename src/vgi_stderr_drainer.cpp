@@ -39,9 +39,18 @@ int StderrDrainer::ReleaseFd() {
 
 void StderrDrainer::DrainToLog(ClientContext &context, const std::string &worker_path, pid_t worker_pid) {
 	std::vector<std::string> lines;
+	size_t dropped = 0;
 	{
 		std::lock_guard<std::mutex> lock(mutex_);
 		lines.swap(lines_);
+		dropped = dropped_lines_;
+		dropped_lines_ = 0;
+	}
+	if (dropped > 0) {
+		VGI_LOG(context, "worker.stderr.truncated",
+		        {{"worker_path", worker_path},
+		         {"worker_pid", std::to_string(worker_pid)},
+		         {"dropped_lines", std::to_string(dropped)}});
 	}
 	for (const auto &line : lines) {
 		VGI_LOG(context, "worker.stderr",
@@ -87,6 +96,13 @@ void StderrDrainer::ThreadLoop() {
 			}
 			if (!line.empty()) {
 				std::lock_guard<std::mutex> lock(mutex_);
+				if (lines_.size() >= kMaxBufferedLines) {
+					// Drop the oldest line. erase(begin) is O(n) but at
+					// 1024 it's a few microseconds and only happens when
+					// the consumer is slow.
+					lines_.erase(lines_.begin());
+					dropped_lines_++;
+				}
 				lines_.push_back(std::move(line));
 			}
 		}
@@ -94,6 +110,10 @@ void StderrDrainer::ThreadLoop() {
 
 	if (!line_buffer.empty()) {
 		std::lock_guard<std::mutex> lock(mutex_);
+		if (lines_.size() >= kMaxBufferedLines) {
+			lines_.erase(lines_.begin());
+			dropped_lines_++;
+		}
 		lines_.push_back(std::move(line_buffer));
 	}
 

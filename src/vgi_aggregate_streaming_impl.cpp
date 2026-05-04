@@ -260,10 +260,15 @@ std::shared_ptr<arrow::RecordBatch> VgiAggregateStreamingChunk(
 	auto result_batch = DeserializeFromIpcBytes(
 	    reinterpret_cast<const uint8_t *>(rb_view.data()), rb_view.size());
 
-	if (!result_batch || result_batch->num_rows() != input_batch->num_rows()) {
+	if (!result_batch) {
+		throw IOException(
+		    "VGI aggregate_streaming_chunk returned no result batch for %lld input rows",
+		    static_cast<long long>(input_batch->num_rows()));
+	}
+	if (result_batch->num_rows() != input_batch->num_rows()) {
 		throw IOException(
 		    "VGI aggregate_streaming_chunk returned %lld rows for %lld input rows",
-		    result_batch ? static_cast<long long>(result_batch->num_rows()) : 0LL,
+		    static_cast<long long>(result_batch->num_rows()),
 		    static_cast<long long>(input_batch->num_rows()));
 	}
 	return result_batch;

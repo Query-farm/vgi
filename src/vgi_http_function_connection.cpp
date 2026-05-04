@@ -197,12 +197,12 @@ void HttpFunctionConnection::BufferDataBatches(const std::string &response_body,
 		auto batch_type = ClassifyBatch(bwm.batch, bwm.custom_metadata);
 		if (batch_type == RpcBatchType::ERROR) {
 			HandleBatchLogMessage(bwm.batch, bwm.custom_metadata, &context_, base_url_,
-			                     -1, GetExecutionIdHex(), GetAttachIdHex());
+			                     -1, GetExecutionIdHex(), GetAttachIdHex(), "", GetConnIdHex());
 			throw IOException("VGI HTTP error from server [url: %s]", base_url_);
 		}
 		if (batch_type == RpcBatchType::LOG) {
 			HandleBatchLogMessage(bwm.batch, bwm.custom_metadata, &context_, base_url_,
-			                     -1, GetExecutionIdHex(), GetAttachIdHex());
+			                     -1, GetExecutionIdHex(), GetAttachIdHex(), "", GetConnIdHex());
 			++spike_log_batches;
 			continue;
 		}
@@ -640,12 +640,12 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 		auto batch_type = ClassifyBatch(bwm.batch, bwm.custom_metadata);
 		if (batch_type == RpcBatchType::ERROR) {
 			HandleBatchLogMessage(bwm.batch, bwm.custom_metadata, &context_, base_url_,
-			                     -1, GetExecutionIdHex(), GetAttachIdHex());
+			                     -1, GetExecutionIdHex(), GetAttachIdHex(), "", GetConnIdHex());
 			throw IOException("VGI HTTP error from server [url: %s]", base_url_);
 		}
 		if (batch_type == RpcBatchType::LOG) {
 			HandleBatchLogMessage(bwm.batch, bwm.custom_metadata, &context_, base_url_,
-			                     -1, GetExecutionIdHex(), GetAttachIdHex());
+			                     -1, GetExecutionIdHex(), GetAttachIdHex(), "", GetConnIdHex());
 			continue;
 		}
 

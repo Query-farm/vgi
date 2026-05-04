@@ -184,7 +184,7 @@ unique_ptr<FunctionData> VgiTableInOutBind(ClientContext &context, TableFunction
 	// PerformInit(phase=INPUT). Holding the worker through init would force
 	// ancillary planner RPCs to spawn fresh workers.
 	if (bind_data->use_pool()) {
-		auto bind_worker_pid = connection->GetPid();
+		auto bind_worker_pid = connection->GetSubprocessPid().value_or(-1);
 		auto bind_conn_id = connection->GetConnIdHex();
 		if (auto pooled = connection->ReleaseForPooling()) {
 			auto rr = VgiWorkerPool::Instance().Release(std::move(pooled));

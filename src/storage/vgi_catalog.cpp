@@ -53,6 +53,9 @@ optional_ptr<CatalogEntry> VgiCatalog::CreateSchema(CatalogTransaction transacti
 	}
 
 	auto &context = transaction.GetContext();
+	if (!attach_result_) {
+		throw IOException("VGI CREATE SCHEMA: catalog '%s' has no attach_result_", GetName());
+	}
 	auto &vgi_tx = VgiTransaction::Get(context, *this);
 
 	auto on_conflict = vgi::MapOnConflict(info.on_conflict);
@@ -60,8 +63,10 @@ optional_ptr<CatalogEntry> VgiCatalog::CreateSchema(CatalogTransaction transacti
 	vgi::CatalogRpcContext rpc_ctx{attach_parameters_, attach_result_->attach_id, vgi_tx.GetTransactionId()};
 	vgi::InvokeCatalogSchemaCreate(rpc_ctx, info.schema, on_conflict, context);
 
-	// Invalidate schema cache so re-fetch picks up the new schema
-	schemas.ClearEntries();
+	// Invalidate schema cache so re-fetch picks up the new schema. Use the
+	// deferred path so any bound query holding a CatalogEntry* doesn't
+	// dangle.
+	ClearCache(/*force=*/false);
 	return nullptr;
 }
 
@@ -259,13 +264,41 @@ std::string VgiCatalog::GetDBPath() {
 	return attach_parameters_ ? attach_parameters_->worker_path() : "";
 }
 
-void VgiCatalog::ClearCache() {
-	schemas.ClearEntries();
+void VgiCatalog::ClearCache(bool force) {
+	auto harvested = schemas.HarvestEntries();
+	if (force) {
+		// User-facing vgi_clear_cache(): purge the graveyard too. Bound
+		// prepared statements may now dangle — caller's choice.
+		std::lock_guard<std::mutex> lk(graveyard_mutex_);
+		deferred_dropped_entries_.clear();
+		graveyard_drops_since_last_log_ = 0;
+		// `harvested` falls out of scope here and is destroyed.
+		return;
+	}
+	// Defer the drop: move harvested entries into the graveyard. Bound at
+	// kGraveyardLimit; on overflow we drop the oldest (front) entries to
+	// keep memory in check. Anyone holding raw pointers to those oldest
+	// entries (very long-lived prepared statements across many catalog
+	// version flips) loses; in practice DDL pressure is low.
+	std::lock_guard<std::mutex> lk(graveyard_mutex_);
+	for (auto &entry : harvested) {
+		deferred_dropped_entries_.push_back(std::move(entry));
+	}
+	while (deferred_dropped_entries_.size() > kGraveyardLimit) {
+		deferred_dropped_entries_.erase(deferred_dropped_entries_.begin());
+		graveyard_drops_since_last_log_++;
+	}
 }
 
 bool VgiCatalog::CheckAndInvalidateCache(ClientContext &context, const std::vector<uint8_t> &transaction_id) {
+	// No attach_result_ means we never completed catalog_attach (e.g., the
+	// constructor allows it for in-progress / restored states). With no
+	// attach_id we can't address the worker, so skip the probe.
+	if (!attach_result_) {
+		return false;
+	}
 	// Frozen catalogs never change metadata — skip version check entirely
-	if (attach_result_ && attach_result_->catalog_version_frozen) {
+	if (attach_result_->catalog_version_frozen) {
 		return false;
 	}
 
@@ -299,13 +332,17 @@ void VgiCatalog::DropSchema(ClientContext &context, DropInfo &info) {
 	bool ignore_not_found = (info.if_not_found == OnEntryNotFound::RETURN_NULL);
 	bool cascade = (info.cascade);
 
+	if (!attach_result_) {
+		throw IOException("VGI DROP SCHEMA: catalog '%s' has no attach_result_", GetName());
+	}
 	auto &vgi_tx = VgiTransaction::Get(context, *this);
 
 	vgi::CatalogRpcContext rpc_ctx{attach_parameters_, attach_result_->attach_id, vgi_tx.GetTransactionId()};
 	vgi::InvokeCatalogSchemaDrop(rpc_ctx, info.name, ignore_not_found, cascade, context);
 
-	// Invalidate schema cache
-	schemas.ClearEntries();
+	// Invalidate schema cache via the deferred path so any bound query
+	// holding a CatalogEntry* doesn't dangle.
+	ClearCache(/*force=*/false);
 }
 
 } // namespace duckdb

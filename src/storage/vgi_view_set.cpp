@@ -15,6 +15,10 @@
 
 namespace duckdb {
 
+// Returns nullptr if the view's SQL fails to parse or is not a SELECT.
+// ViewCatalogEntry derefs info.query in DuckDB's binder, so registering an
+// entry whose query is null crashes any subsequent SELECT * FROM v. Skipping
+// the entry instead surfaces a clean "view not found" error to the user.
 static unique_ptr<ViewCatalogEntry> CreateViewEntryFromInfo(Catalog &catalog, SchemaCatalogEntry &schema,
                                                              const vgi::VgiViewInfo &view_info) {
 	CreateViewInfo info;
@@ -30,13 +34,18 @@ static unique_ptr<ViewCatalogEntry> CreateViewEntryFromInfo(Catalog &catalog, Sc
 	try {
 		Parser parser;
 		parser.ParseQuery(view_info.definition);
-		if (!parser.statements.empty() && parser.statements[0]->type == StatementType::SELECT_STATEMENT) {
-			info.query = unique_ptr_cast<SQLStatement, SelectStatement>(std::move(parser.statements[0]));
+		if (parser.statements.empty() || parser.statements[0]->type != StatementType::SELECT_STATEMENT) {
+			VGI_STDERR_DEBUG("[VGI] view.skipped name=%s reason=not_a_select_statement\n",
+			                  view_info.name.c_str());
+			return nullptr;
 		}
+		info.query = unique_ptr_cast<SQLStatement, SelectStatement>(std::move(parser.statements[0]));
 	} catch (const std::exception &e) {
-		VGI_STDERR_DEBUG("[VGI] view.parse_warning name=%s error=%s\n", view_info.name.c_str(), e.what());
+		VGI_STDERR_DEBUG("[VGI] view.skipped name=%s parse_error=%s\n", view_info.name.c_str(), e.what());
+		return nullptr;
 	} catch (...) {
-		VGI_STDERR_DEBUG("[VGI] view.parse_warning name=%s error=unknown\n", view_info.name.c_str());
+		VGI_STDERR_DEBUG("[VGI] view.skipped name=%s parse_error=unknown\n", view_info.name.c_str());
+		return nullptr;
 	}
 	return make_uniq<ViewCatalogEntry>(catalog, schema, info);
 }
@@ -72,6 +81,10 @@ optional_ptr<CatalogEntry> VgiViewSet::GetEntry(ClientContext &context, const st
 
 	auto &view_info = *view_info_opt;
 	auto view_entry = CreateViewEntryFromInfo(catalog_, schema_, view_info);
+	if (!view_entry) {
+		// Parse failure — surface as "view not found" to the caller.
+		return nullptr;
+	}
 	auto result = view_entry.get();
 	GetEntries()[name] = std::move(view_entry);
 
@@ -94,6 +107,9 @@ void VgiViewSet::LoadEntries(ClientContext &context) {
 
 	for (auto &view_info : views) {
 		auto view_entry = CreateViewEntryFromInfo(catalog_, schema_, view_info);
+		if (!view_entry) {
+			continue; // skip un-parseable views; CreateViewEntryFromInfo logged it
+		}
 		CreateEntryLocked(std::move(view_entry));
 	}
 }

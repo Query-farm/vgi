@@ -194,6 +194,15 @@ private:
 		if (!vgi_info || !vgi_info->streaming_partitioned) {
 			return false;
 		}
+		// Streaming-open currently ships an empty Arguments envelope; any
+		// const positional would be silently dropped on the wire. Punt
+		// these to PhysicalWindow until the const-arg pass-through is
+		// wired (see comment in BuildStreamingOpenRequest).
+		for (bool is_const : vgi_info->positional_is_const) {
+			if (is_const) {
+				return false;
+			}
+		}
 		if (!IsCumulativeFrame(wexpr)) {
 			return false;
 		}
@@ -354,8 +363,16 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 			pool_timeout_override = entry.second.GetValue<int64_t>();
 		} else if (lower_name == "oauth_refresh_token") {
 			oauth_refresh_token = entry.second.ToString();
+			// Wipe the value out of the parsed AttachInfo so it can't be
+			// echoed by any DuckDB introspection path that reflects the
+			// original ATTACH options (catalog logging, prepared-statement
+			// dumps, telemetry). The CatalogAuth holds the live token from
+			// here on; the parsed option is no longer needed. Recommend
+			// CREATE SECRET for non-ephemeral storage.
+			entry.second = Value("<redacted>");
 		} else if (lower_name == "bearer_token") {
 			bearer_token = entry.second.ToString();
+			entry.second = Value("<redacted>");
 		} else if (lower_name == "data_version_spec") {
 			data_version_spec = entry.second.ToString();
 		} else if (lower_name == "implementation_version") {

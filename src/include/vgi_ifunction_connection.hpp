@@ -92,7 +92,6 @@ public:
 	virtual void MarkDataFinished() = 0;
 
 	// Identity/diagnostics
-	virtual pid_t GetPid() const = 0;
 	virtual std::string GetExecutionIdHex() const = 0;
 	virtual std::string GetAttachIdHex() const = 0;
 	virtual std::string GetTransactionIdHex() const = 0;
@@ -101,6 +100,15 @@ public:
 	//! primary correlation key in log lines: one `conn=<hex>` covers the full
 	//! bind → init → data → release lifecycle for a single checkout.
 	virtual std::string GetConnIdHex() const = 0;
+	//! OS process id of the worker, only meaningful for subprocess transport.
+	//! Returns std::nullopt for HTTP (the C++ client does not own the worker
+	//! process and cannot know its pid). Subprocess implementations return
+	//! the spawned worker's pid. Use this only for human-readable diagnostics
+	//! (debugger attach, stderr correlation); use GetConnIdHex() for the
+	//! transport-neutral connection identifier in log fields.
+	virtual std::optional<pid_t> GetSubprocessPid() const {
+		return std::nullopt;
+	}
 
 	// Lifecycle
 	virtual int Wait() = 0;
