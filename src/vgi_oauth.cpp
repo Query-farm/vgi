@@ -1657,10 +1657,13 @@ std::string OAuthCatalogAuth::HandleUnauthorized(const OAuthChallenge &challenge
 	std::unique_lock<std::mutex> lock(mutex_);
 
 	// Helper: store successful auth result in state (must hold lock).
+	// Helpers below assume `lock` is HELD when called. They publish the
+	// new state, clear the IN_PROGRESS owner, and notify all waiters.
 	auto StoreSuccess = [&](OAuthTokenSet tokens, const OAuthRefreshContext &rctx) -> std::string {
 		state_.token = std::move(tokens);
 		state_.refresh_ctx = rctx;
 		state_.status = AuthState::Status::COMPLETE;
+		state_.owner = std::thread::id();
 		state_.cv.notify_all();
 		return state_.token.BearerToken();
 	};
@@ -1669,6 +1672,7 @@ std::string OAuthCatalogAuth::HandleUnauthorized(const OAuthChallenge &challenge
 	auto StoreFailed = [&](const std::string &error_msg) {
 		state_.status = AuthState::Status::FAILED;
 		state_.error_message = error_msg;
+		state_.owner = std::thread::id();
 		state_.cv.notify_all();
 	};
 
@@ -1718,6 +1722,14 @@ std::string OAuthCatalogAuth::HandleUnauthorized(const OAuthChallenge &challenge
 					}
 					StoreFailed(refresh_err);
 					throw;
+				} catch (...) {
+					// Non-std::exception throw (rare, but possible from
+					// nested code). Without this catch the IN_PROGRESS
+					// state would never be cleared and cv.notify_all
+					// never fires — every waiter hangs forever.
+					lock.lock();
+					StoreFailed("unknown error during token refresh");
+					throw;
 				}
 			}
 		}
@@ -1732,13 +1744,21 @@ std::string OAuthCatalogAuth::HandleUnauthorized(const OAuthChallenge &challenge
 			lock.lock();
 			StoreFailed(e.what());
 			throw;
+		} catch (...) {
+			// Same hang-prevention as the refresh catch above.
+			lock.lock();
+			StoreFailed("unknown error during interactive auth flow");
+			throw;
 		}
 	};
+
+	const auto this_thread = std::this_thread::get_id();
 
 	switch (state_.status) {
 	case AuthState::Status::IDLE:
 	case AuthState::Status::FAILED: {
 		state_.status = AuthState::Status::IN_PROGRESS;
+		state_.owner = this_thread;
 		state_.error_message.clear();
 		std::string refresh_token = state_.token.refresh_token;
 		OAuthRefreshContext refresh_ctx = state_.refresh_ctx;
@@ -1747,6 +1767,18 @@ std::string OAuthCatalogAuth::HandleUnauthorized(const OAuthChallenge &challenge
 	}
 
 	case AuthState::Status::IN_PROGRESS: {
+		// Same-thread re-entry: the auth flow itself produced a 401 that
+		// landed back in *this* HandleUnauthorized (e.g., the discovery
+		// endpoint requires auth from this same auth object, or the token
+		// endpoint host returns 401 mid-refresh). Waiting on cv would
+		// deadlock against ourselves. Throw cleanly instead.
+		if (state_.owner == this_thread) {
+			throw IOException(
+			    "VGI OAuth: nested 401 inside the auth flow on the same thread; aborting "
+			    "to avoid self-deadlock. Likely cause: the token-endpoint or "
+			    "discovery endpoint also returned 401.");
+		}
+
 		// Another thread is already doing the auth flow — wait
 		VGI_STDERR_DEBUG("[VGI] oauth.waiting_for_auth\n");
 		state_.cv.wait(lock, [this]() {
@@ -1765,6 +1797,7 @@ std::string OAuthCatalogAuth::HandleUnauthorized(const OAuthChallenge &challenge
 	case AuthState::Status::COMPLETE: {
 		// Token exists but server returned 401 — token may be stale.
 		state_.status = AuthState::Status::IN_PROGRESS;
+		state_.owner = this_thread;
 		state_.error_message.clear();
 		std::string refresh_token = state_.token.refresh_token;
 		OAuthRefreshContext refresh_ctx = state_.refresh_ctx;
@@ -1781,6 +1814,7 @@ void OAuthCatalogAuth::ClearTokens() {
 	state_.token = OAuthTokenSet();
 	state_.refresh_ctx = OAuthRefreshContext();
 	state_.status = AuthState::Status::IDLE;
+	state_.owner = std::thread::id();
 	state_.error_message.clear();
 	state_.cv.notify_all();
 }

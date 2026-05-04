@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <condition_variable>
+#include <thread>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -97,6 +98,12 @@ struct AuthState {
 	OAuthRefreshContext refresh_ctx;
 	std::string error_message;
 	std::condition_variable cv;
+	// Thread that owns the IN_PROGRESS state. If a 401 from the auth flow
+	// itself (e.g., the discovery endpoint or token endpoint requires
+	// auth that 401s back into this same auth object) re-enters
+	// HandleUnauthorized on the same thread, we'd self-wait on cv
+	// forever. This lets us throw cleanly instead.
+	std::thread::id owner;
 };
 
 // ============================================================================
