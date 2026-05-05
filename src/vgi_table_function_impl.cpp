@@ -1686,11 +1686,15 @@ InsertionOrderPreservingMap<string> VgiTableFunctionDynamicToString(TableFunctio
 	auto &bind_data = input.bind_data->Cast<VgiTableFunctionBindData>();
 	auto &global_state = input.global_state->Cast<VgiTableFunctionGlobalState>();
 
-	// Intrinsic keys, cheap and always available.
+	// Intrinsic keys, cheap and always available. ``Rows Read`` and
+	// ``Threads`` are deliberately omitted: DuckDB already prints the
+	// operator's row count in the profile box ("N rows"), and the
+	// worker-advertised ``max_workers`` is an upper bound rather than the
+	// actual concurrency DuckDB used — both add noise without insight.
+	// Workers that want a specific row count or thread/worker view can
+	// return one from their own ``dynamic_to_string``.
 	result["Worker"] = bind_data.worker_path();
 	result["Function"] = bind_data.function_name;
-	result["Rows Read"] = std::to_string(global_state.rows_read.load());
-	result["Threads"] = std::to_string(global_state.max_processes);
 
 	// User-defined diagnostics via worker RPC. Skip if we don't have enough
 	// context to make the call — happens for direct vgi_table_function() invocations
