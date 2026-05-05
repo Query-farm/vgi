@@ -116,14 +116,24 @@ FROM example.filter_echo_partitioned(10000) WHERE n BETWEEN 100 AND 199;
 # ============================================================================
 # Multi-worker engagement — subprocess transport spawns one OS process per
 # worker, so COUNT(DISTINCT worker_pid) > 1 confirms parallel scan happened.
-# 20000 rows × 1000-row chunks = 20 chunks, plenty for the planner to split.
+# 200000 rows × 1000-row chunks = 200 chunks, enough work that the queue
+# race can't be drained by a single worker before others register, even
+# under heavy CPU contention (e.g. the integration suite running with
+# unittest -j 8). Pinning threads=4 keeps the assertion deterministic
+# regardless of the host's core count.
 # ============================================================================
+
+statement ok
+SET threads=4;
 
 query I
 SELECT COUNT(DISTINCT worker_pid) > 1
-FROM example.filter_echo_partitioned(20000) WHERE n >= 1000;
+FROM example.filter_echo_partitioned(200000) WHERE n >= 1000;
 ----
 true
+
+statement ok
+RESET threads;
 
 # ============================================================================
 # Cardinality / no-duplicate / no-gap invariants under filter + parallelism
