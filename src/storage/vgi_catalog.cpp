@@ -21,6 +21,7 @@
 #include "storage/vgi_table_entry.hpp"
 #include "storage/vgi_transaction.hpp"
 #include "vgi_catalog_api.hpp"
+#include "vgi_logging.hpp"
 
 namespace duckdb {
 
@@ -311,32 +312,46 @@ bool VgiCatalog::CheckAndInvalidateCache(ClientContext &context, const std::vect
 	// constructor allows it for in-progress / restored states). With no
 	// attach_id we can't address the worker, so skip the probe.
 	if (!attach_result_) {
+		VGI_LOG(context, "catalog.invalidate.skip", {{"reason", "no_attach_result"}});
 		return false;
 	}
 	// Frozen catalogs never change metadata — skip version check entirely
 	if (attach_result_->catalog_version_frozen) {
+		VGI_LOG(context, "catalog.invalidate.skip", {{"reason", "frozen"}});
 		return false;
 	}
 
 	// Query current version from the worker
 	vgi::CatalogRpcContext rpc_ctx{attach_parameters_, attach_result_->attach_id, transaction_id};
 	int64_t current_version = vgi::InvokeCatalogVersion(rpc_ctx, context);
+	int64_t last_version = last_known_catalog_version_.load();
 
 	// Version 0 means "unimplemented" or "unknown" — always clear for safety
 	// (preserves existing behavior for workers that don't support catalog_version)
 	if (current_version == 0) {
+		VGI_LOG(context, "catalog.invalidate",
+		        {{"current_version", std::to_string(current_version)},
+		         {"last_version", std::to_string(last_version)},
+		         {"action", "clear_unknown"}});
 		ClearCache();
 		return true;
 	}
 
 	// Compare with last known version
-	int64_t last_version = last_known_catalog_version_.load();
 	if (current_version != last_version) {
+		VGI_LOG(context, "catalog.invalidate",
+		        {{"current_version", std::to_string(current_version)},
+		         {"last_version", std::to_string(last_version)},
+		         {"action", "clear_changed"}});
 		last_known_catalog_version_.store(current_version);
 		ClearCache();
 		return true;
 	}
 
+	VGI_LOG(context, "catalog.invalidate",
+	        {{"current_version", std::to_string(current_version)},
+	         {"last_version", std::to_string(last_version)},
+	         {"action", "noop"}});
 	return false;
 }
 
