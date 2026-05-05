@@ -1102,6 +1102,7 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 	global_state->global_execution_id = std::move(init_result.execution_id);
 	global_state->max_processes = static_cast<idx_t>(init_result.max_workers);
 	global_state->primary_connection = std::move(connection);
+	global_state->client_context_for_explain = &context;
 	global_state->dynamic_filters = std::move(dynamic_filters);
 	global_state->static_filter_bytes = filter_bytes;
 	global_state->tick_filter_state = tick_filter_state;
@@ -1653,6 +1654,71 @@ InsertionOrderPreservingMap<string> VgiTableFunctionToString(TableFunctionToStri
 		if (bind_data.table_sample_hint->seed >= 0) {
 			result["Sample Seed"] = std::to_string(bind_data.table_sample_hint->seed);
 		}
+	}
+	return result;
+}
+
+// ============================================================================
+// DynamicToString Function - Returns post-execution diagnostics for EXPLAIN ANALYZE
+// ============================================================================
+//
+// DuckDB calls this once per parallel scan thread inside
+// `OperatorProfiler::FinishSource`. We always emit the intrinsic keys
+// (`Worker`, `Function`, `Rows Read`, `Threads`) cheap from gstate, and
+// additionally issue a unary RPC asking the worker to surface user-defined
+// diagnostics under the global execution id. The RPC goes through the worker
+// pool — same path `cardinality` and `statistics` use — so we don't have to
+// multiplex on the per-stream `IFunctionConnection`.
+//
+// DuckDB merges per-thread maps with last-write-wins semantics, so doing this
+// on every thread is fine: every call returns the same intrinsic values, and
+// the user keys reflect whatever the user persisted up to that thread's
+// FinishSource (the *last* finisher will have the most complete view).
+
+InsertionOrderPreservingMap<string> VgiTableFunctionDynamicToString(TableFunctionDynamicToStringInput &input) {
+	InsertionOrderPreservingMap<string> result;
+	if (!input.bind_data || !input.global_state) {
+		return result;
+	}
+	auto &bind_data = input.bind_data->Cast<VgiTableFunctionBindData>();
+	auto &global_state = input.global_state->Cast<VgiTableFunctionGlobalState>();
+
+	// Intrinsic keys, cheap and always available.
+	result["Worker"] = bind_data.worker_path();
+	result["Function"] = bind_data.function_name;
+	result["Rows Read"] = std::to_string(global_state.rows_read.load());
+	result["Threads"] = std::to_string(global_state.max_processes);
+
+	// User-defined diagnostics via worker RPC. Skip if we don't have enough
+	// context to make the call — happens for direct vgi_table_function() invocations
+	// before bind has populated bind_request_bytes, or if InitGlobal wasn't
+	// reached (cached ClientContext is null).
+	if (bind_data.bind_request_bytes.empty() || global_state.global_execution_id.empty() ||
+	    global_state.client_context_for_explain == nullptr) {
+		return result;
+	}
+
+	try {
+		auto rpc_params = bind_data.attach_params
+		    ? bind_data.attach_params
+		    : std::make_shared<VgiAttachParameters>(bind_data.worker_path(), "",
+		                                            bind_data.worker_debug(), bind_data.use_pool());
+		CatalogRpcContext rpc_ctx{rpc_params, bind_data.attach_id, bind_data.transaction_id};
+		auto user_map = InvokeTableFunctionDynamicToString(
+		    rpc_ctx, bind_data.bind_request_bytes, bind_data.bind_opaque_data,
+		    global_state.global_execution_id, *global_state.client_context_for_explain);
+		// Merge user keys after intrinsics — user can override an intrinsic by
+		// returning the same key (DuckDB's map semantics for duplicate keys
+		// is "replace existing", which is what we want here).
+		for (const auto &it : user_map) {
+			result[it.first] = it.second;
+		}
+	} catch (const std::exception &e) {
+		// Best-effort: any failure surfaces only the intrinsic keys.
+		VGI_LOG(*global_state.client_context_for_explain, "table_function.dynamic_to_string_error",
+		        {{"worker_path", bind_data.worker_path()},
+		         {"function_name", bind_data.function_name},
+		         {"error", e.what()}});
 	}
 	return result;
 }

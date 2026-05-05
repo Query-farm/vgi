@@ -196,6 +196,12 @@ struct VgiTableFunctionGlobalState : public GlobalTableFunctionState {
 	// Global execution identifier for multi-worker coordination
 	std::vector<uint8_t> global_execution_id;
 
+	// Captured at InitGlobal so the post-execution dynamic_to_string callback
+	// can issue an RPC. The DuckDB callback signature does not pass a
+	// ClientContext, but the gstate is owned by the same pipeline that owns
+	// the ClientContext, so this stays valid until the query tears down.
+	ClientContext *client_context_for_explain = nullptr;
+
 	// Maximum number of worker processes (from OutputSpec)
 	idx_t max_processes = 1;
 
@@ -391,6 +397,14 @@ double VgiTableFunctionProgress(ClientContext &context, const FunctionData *bind
 
 //! ToString function - returns info for EXPLAIN output
 InsertionOrderPreservingMap<string> VgiTableFunctionToString(TableFunctionToStringInput &input);
+
+//! DynamicToString function - returns post-execution diagnostics for EXPLAIN ANALYZE Extra Info.
+//! Fired once per parallel scan thread at end-of-stream. Issues a unary RPC to the worker pool
+//! with the global execution_id; the worker hands it to the user's dynamic_to_string hook so
+//! the function can return diagnostics it persisted during process(). Always also surfaces
+//! intrinsic keys (Worker, Function, Rows Read, Threads). Best-effort: any RPC failure is
+//! logged and degrades to just the intrinsic keys.
+InsertionOrderPreservingMap<string> VgiTableFunctionDynamicToString(TableFunctionDynamicToStringInput &input);
 
 //! Get bind info callback for returning table entry reference
 BindInfo VgiTableScanGetBindInfo(const optional_ptr<FunctionData> bind_data_p);

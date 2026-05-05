@@ -904,6 +904,58 @@ std::shared_ptr<arrow::RecordBatch> BuildTableFunctionStatisticsRequest(const st
 	return arrow::RecordBatch::Make(schema, 1, arrays);
 }
 
+// ============================================================================
+// TableFunctionDynamicToStringRequest / Response
+// ============================================================================
+
+std::shared_ptr<arrow::RecordBatch>
+BuildTableFunctionDynamicToStringRequest(const std::vector<uint8_t> &bind_call_bytes,
+                                         const std::vector<uint8_t> &bind_opaque_data,
+                                         const std::vector<uint8_t> &global_execution_id) {
+	auto schema = arrow::schema({
+	    arrow::field("bind_call", arrow::binary(), false),
+	    arrow::field("bind_opaque_data", arrow::binary(), true),
+	    arrow::field("global_execution_id", arrow::binary(), false),
+	});
+	std::vector<std::shared_ptr<arrow::Array>> arrays;
+	arrays.push_back(BuildBinaryScalar(bind_call_bytes));
+	arrays.push_back(BuildBinaryScalar(bind_opaque_data));
+	arrays.push_back(BuildBinaryScalarRequired(global_execution_id));
+	return arrow::RecordBatch::Make(schema, 1, arrays);
+}
+
+InsertionOrderPreservingMap<std::string>
+ParseTableFunctionDynamicToStringResult(const std::shared_ptr<arrow::RecordBatch> &batch,
+                                        const std::string &worker_path) {
+	(void)worker_path; // for parity with sibling parsers; reserved for richer error context
+	InsertionOrderPreservingMap<std::string> result;
+	if (!batch || batch->num_rows() == 0) {
+		return result;
+	}
+	auto keys_col = std::dynamic_pointer_cast<arrow::ListArray>(batch->GetColumnByName("keys"));
+	auto values_col = std::dynamic_pointer_cast<arrow::ListArray>(batch->GetColumnByName("values"));
+	if (!keys_col || !values_col || keys_col->IsNull(0) || values_col->IsNull(0)) {
+		return result;
+	}
+	auto keys_strings = std::dynamic_pointer_cast<arrow::StringArray>(keys_col->values());
+	auto values_strings = std::dynamic_pointer_cast<arrow::StringArray>(values_col->values());
+	if (!keys_strings || !values_strings) {
+		return result;
+	}
+	auto k_off = keys_col->value_offset(0);
+	auto k_len = keys_col->value_length(0);
+	auto v_off = values_col->value_offset(0);
+	auto v_len = values_col->value_length(0);
+	auto pairs = std::min(k_len, v_len);
+	for (int64_t i = 0; i < pairs; ++i) {
+		if (keys_strings->IsNull(k_off + i) || values_strings->IsNull(v_off + i)) {
+			continue;
+		}
+		result.insert(keys_strings->GetString(k_off + i), values_strings->GetString(v_off + i));
+	}
+	return result;
+}
+
 TableFunctionCardinalityResult ParseTableFunctionCardinalityResult(const std::shared_ptr<arrow::RecordBatch> &batch,
                                                                    const std::string &worker_path) {
 	TableFunctionCardinalityResult result;

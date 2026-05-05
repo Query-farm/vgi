@@ -259,6 +259,7 @@ void VgiTableFunctionSet::LoadEntries(ClientContext &context) {
 				table_func.statistics = vgi::VgiTableFunctionStatistics;
 				table_func.table_scan_progress = vgi::VgiTableFunctionProgress;
 				table_func.to_string = vgi::VgiTableFunctionToString;
+				table_func.dynamic_to_string = vgi::VgiTableFunctionDynamicToString;
 				table_func.set_scan_order = vgi::VgiSetScanOrder;
 
 				// Register named parameters so DuckDB knows how to handle them

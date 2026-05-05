@@ -1061,6 +1061,39 @@ std::unordered_map<std::string, unique_ptr<BaseStatistics>> InvokeTableFunctionS
 }
 
 // ============================================================================
+// Table Function dynamic_to_string
+// ============================================================================
+
+InsertionOrderPreservingMap<std::string> InvokeTableFunctionDynamicToString(
+    const CatalogRpcContext &ctx, const std::vector<uint8_t> &bind_request_bytes,
+    const std::vector<uint8_t> &bind_opaque_data,
+    const std::vector<uint8_t> &global_execution_id,
+    ClientContext &context) {
+	auto &worker_path = ctx.params->worker_path();
+
+	try {
+		auto request_batch = BuildTableFunctionDynamicToStringRequest(
+		    bind_request_bytes, bind_opaque_data, global_execution_id);
+		auto request_bytes = SerializeToIpcBytes(request_batch);
+		auto params = generated::BuildTableFunctionDynamicToStringParams(request_bytes);
+
+		auto response = InvokeRpcMethod(ctx, "table_function_dynamic_to_string", params, context);
+		auto result_batch = ExtractAndDeserializeResult(response, "table_function_dynamic_to_string", worker_path);
+		if (!result_batch) {
+			return {};
+		}
+		return ParseTableFunctionDynamicToStringResult(result_batch, worker_path);
+	} catch (const std::exception &e) {
+		// EXPLAIN ANALYZE must never fail because of a profiler-only RPC.
+		// Log and surface an empty map; the caller will append the intrinsic
+		// keys it knows from the global state.
+		VGI_LOG(context, "table_function.dynamic_to_string_error",
+		        {{"worker_path", worker_path}, {"error", e.what()}});
+		return {};
+	}
+}
+
+// ============================================================================
 // Enum parsing functions
 // ============================================================================
 

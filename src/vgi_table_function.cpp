@@ -76,6 +76,7 @@ void RegisterVgiTableFunction(ExtensionLoader &loader) {
 		func.cardinality = vgi::VgiTableFunctionCardinality;
 		func.table_scan_progress = vgi::VgiTableFunctionProgress;
 		func.to_string = vgi::VgiTableFunctionToString;
+		func.dynamic_to_string = vgi::VgiTableFunctionDynamicToString;
 		func.set_scan_order = vgi::VgiSetScanOrder;
 		func.statistics = vgi::VgiTableFunctionStatistics;
 	};

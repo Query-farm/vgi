@@ -10,6 +10,8 @@
 #include <string>
 #include <vector>
 
+#include "duckdb/common/insertion_order_preserving_map.hpp"
+
 namespace duckdb {
 namespace vgi {
 
@@ -258,6 +260,28 @@ TableFunctionCardinalityResult ParseTableFunctionCardinalityResult(
 std::shared_ptr<arrow::RecordBatch> BuildTableFunctionStatisticsRequest(
     const std::vector<uint8_t> &bind_call_bytes,
     const std::vector<uint8_t> &bind_opaque_data = {});
+
+// ============================================================================
+// TableFunctionDynamicToStringRequest / Response
+// ============================================================================
+
+// Build a TableFunctionDynamicToStringRequest inner batch. Caller serialises and
+// wraps with ``generated::BuildTableFunctionDynamicToStringParams`` to produce the
+// wire params. Fields match Python TableFunctionDynamicToStringRequest:
+//   bind_call: binary (BindRequest as IPC bytes)
+//   bind_opaque_data: binary|null
+//   global_execution_id: binary
+std::shared_ptr<arrow::RecordBatch> BuildTableFunctionDynamicToStringRequest(
+    const std::vector<uint8_t> &bind_call_bytes,
+    const std::vector<uint8_t> &bind_opaque_data,
+    const std::vector<uint8_t> &global_execution_id);
+
+// Parse the response into an InsertionOrderPreservingMap<string>. The wire schema
+// is parallel ``keys: list<utf8>`` / ``values: list<utf8>`` — order on the wire is
+// the order the user emitted from their dynamic_to_string hook.
+InsertionOrderPreservingMap<std::string> ParseTableFunctionDynamicToStringResult(
+    const std::shared_ptr<arrow::RecordBatch> &batch,
+    const std::string &worker_path = "");
 
 // ============================================================================
 // Hand-coded inner request builders

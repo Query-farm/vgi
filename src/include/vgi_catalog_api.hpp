@@ -738,6 +738,17 @@ std::unordered_map<std::string, unique_ptr<BaseStatistics>> InvokeTableFunctionS
     const std::vector<std::string> &column_names,
     const std::string &function_name, ClientContext &context);
 
+// Invoke table_function_dynamic_to_string RPC: ask the worker for diagnostics that should
+// surface as Extra Info under EXPLAIN ANALYZE. Fired once per parallel scan thread at
+// end-of-stream; the user implementation is responsible for persisting whatever metrics
+// it cares about and retrieving them by ``global_execution_id``. Catches and logs any
+// exception; returns an empty map so EXPLAIN ANALYZE never aborts the query.
+InsertionOrderPreservingMap<std::string> InvokeTableFunctionDynamicToString(
+    const CatalogRpcContext &ctx, const std::vector<uint8_t> &bind_request_bytes,
+    const std::vector<uint8_t> &bind_opaque_data,
+    const std::vector<uint8_t> &global_execution_id,
+    ClientContext &context);
+
 // ============================================================================
 // Secret Extraction from DuckDB SecretManager
 // ============================================================================
