@@ -129,6 +129,10 @@ struct VgiTableFunctionBindData : public TableFunctionData {
 	// Execution hints (defaults at bind, updated after init)
 	int32_t max_processes = 1;
 	mutable int64_t cardinality_estimate = -1;
+	// Optional max-cardinality, surfaced into DuckDB's NodeStatistics.
+	// -1 = unknown. Populated either from the inlined ``TableInfo``
+	// (catalog table path) or from ``table_function_cardinality`` (RPC path).
+	mutable int64_t cardinality_max = -1;
 
 	// Whether this function supports projection pushdown (from FunctionInfo)
 	bool projection_pushdown = false;

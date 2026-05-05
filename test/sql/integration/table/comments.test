@@ -23,6 +23,7 @@ WHERE database_name = 'example' AND schema_name = 'data'
   AND table_name != 'geo_points'  -- geo_points requires spatial extension
 ORDER BY table_name;
 ----
+cardinality_inlined_table	Function-backed table with inlined cardinality (10000 rows)
 colors	Colors table with ENUM-derived statistics
 departments	Department reference table
 employees	Employee table with FK to departments
@@ -37,6 +38,7 @@ rowid_last	Table with row_id at column index 2
 rowid_middle	Table with row_id at column index 1
 rowid_string	Table with string row_id
 rowid_struct	Table with struct row_id
+ten_thousand_table	Function-backed table over the no-arg ten_thousand function
 versioned_constraints	Table with constraints that evolve across versions
 versioned_data	Versioned data table demonstrating time travel with schema evolution
 volatile_numbers	Numbers with volatile stats (TTL=0, always re-fetched)

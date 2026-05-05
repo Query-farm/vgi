@@ -11,12 +11,32 @@
 #include "storage/vgi_transaction.hpp"
 #include "vgi_catalog_api.hpp"
 #include "vgi_function_connection.hpp"
+#include "vgi_logging.hpp"
 #include "vgi_rpc_types.hpp"
 #include "vgi_table_function_impl.hpp"
 #include "vgi_transport.hpp"
 #include "vgi_worker_pool.hpp"
 
 namespace duckdb {
+
+// Resolve a write-function discovery result, preferring the inlined value on
+// VgiTableInfo when the worker populated it (skips the corresponding
+// catalog_table_*_function_get RPC). The trampoline parameter dispatches to
+// InvokeCatalogTableInsert/Update/DeleteFunctionGet on cache miss.
+template <typename FetchFn>
+static vgi::VgiScanFunctionResult ResolveWriteFunction(
+    ClientContext &context, VgiTableEntry &table, const char *operation,
+    const std::optional<vgi::VgiScanFunctionResult> &inlined, FetchFn &&fetch) {
+	if (inlined.has_value()) {
+		VGI_LOG(context, "vgi.write_function.inlined",
+		        {{"schema", table.GetTableInfo().schema_name},
+		         {"table", table.GetTableInfo().name},
+		         {"operation", operation},
+		         {"function", inlined->function_name}});
+		return *inlined;
+	}
+	return fetch();
+}
 
 using namespace vgi;
 
@@ -331,8 +351,12 @@ unique_ptr<GlobalSinkState> VgiPhysicalInsert::GetGlobalSinkState(ClientContext 
 
 	auto &vgi_tx = VgiTransaction::Get(context, table->GetCatalog());
 	CatalogRpcContext rpc_ctx{params, attach_result->attach_id, vgi_tx.GetTransactionId()};
-	auto write_func = InvokeCatalogTableInsertFunctionGet(rpc_ctx, table->GetTableInfo().schema_name,
-	                                                      table->GetTableInfo().name, context);
+	auto write_func = ResolveWriteFunction(
+	    context, *table, "insert", table->GetTableInfo().insert_function,
+	    [&]() {
+		    return InvokeCatalogTableInsertFunctionGet(rpc_ctx, table->GetTableInfo().schema_name,
+		                                                table->GetTableInfo().name, context);
+	    });
 
 	// Build input schema (table columns minus row_id)
 	auto &table_info = table->GetTableInfo();
@@ -486,8 +510,12 @@ unique_ptr<GlobalSinkState> VgiPhysicalDelete::GetGlobalSinkState(ClientContext 
 
 	auto &vgi_tx = VgiTransaction::Get(context, table.GetCatalog());
 	CatalogRpcContext rpc_ctx{params, attach_result->attach_id, vgi_tx.GetTransactionId()};
-	auto write_func = InvokeCatalogTableDeleteFunctionGet(rpc_ctx, table.GetTableInfo().schema_name,
-	                                                      table.GetTableInfo().name, context);
+	auto write_func = ResolveWriteFunction(
+	    context, table, "delete", table.GetTableInfo().delete_function,
+	    [&]() {
+		    return InvokeCatalogTableDeleteFunctionGet(rpc_ctx, table.GetTableInfo().schema_name,
+		                                                table.GetTableInfo().name, context);
+	    });
 
 	auto &table_info = table.GetTableInfo();
 	auto rowid_field = table_info.arrow_schema->field(table_info.row_id_column);
@@ -620,8 +648,12 @@ unique_ptr<GlobalSinkState> VgiPhysicalUpdate::GetGlobalSinkState(ClientContext 
 
 	auto &vgi_tx = VgiTransaction::Get(context, table.GetCatalog());
 	CatalogRpcContext rpc_ctx{params, attach_result->attach_id, vgi_tx.GetTransactionId()};
-	auto write_func = InvokeCatalogTableUpdateFunctionGet(rpc_ctx, table.GetTableInfo().schema_name,
-	                                                      table.GetTableInfo().name, context);
+	auto write_func = ResolveWriteFunction(
+	    context, table, "update", table.GetTableInfo().update_function,
+	    [&]() {
+		    return InvokeCatalogTableUpdateFunctionGet(rpc_ctx, table.GetTableInfo().schema_name,
+		                                                table.GetTableInfo().name, context);
+	    });
 
 	auto &table_info = table.GetTableInfo();
 	auto &table_columns = table.GetColumns();

@@ -1590,6 +1590,7 @@ unique_ptr<NodeStatistics> VgiTableFunctionCardinality(ClientContext &context, c
 			auto result = InvokeTableFunctionCardinality(rpc_ctx, bind_data.bind_request_bytes,
 			                                             bind_data.bind_opaque_data, context);
 			bind_data.cardinality_estimate = result.estimate;
+			bind_data.cardinality_max = result.max;
 		} catch (const std::exception &e) {
 			// Not critical — continue with unknown cardinality
 			VGI_LOG(context, "table_function.cardinality_error",
@@ -1599,19 +1600,30 @@ unique_ptr<NodeStatistics> VgiTableFunctionCardinality(ClientContext &context, c
 		}
 	}
 
-	if (bind_data.cardinality_estimate >= 0) {
-		VGI_LOG(context, "table_function.cardinality",
-		        {{"worker_path", bind_data.worker_path()},
-		         {"function_name", bind_data.function_name},
-		         {"cardinality_estimate", std::to_string(bind_data.cardinality_estimate)}});
-		return make_uniq<NodeStatistics>(static_cast<idx_t>(bind_data.cardinality_estimate));
-	}
-
+	const bool have_est = bind_data.cardinality_estimate >= 0;
+	const bool have_max = bind_data.cardinality_max >= 0;
 	VGI_LOG(context, "table_function.cardinality",
 	        {{"worker_path", bind_data.worker_path()},
 	         {"function_name", bind_data.function_name},
-	         {"cardinality_estimate", "unknown"}});
-	// No estimate available
+	         {"cardinality_estimate", have_est ? std::to_string(bind_data.cardinality_estimate) : "unknown"},
+	         {"cardinality_max", have_max ? std::to_string(bind_data.cardinality_max) : "unknown"}});
+
+	if (have_est && have_max) {
+		// NodeStatistics(idx_t estimated, idx_t max) sets both flags.
+		return make_uniq<NodeStatistics>(static_cast<idx_t>(bind_data.cardinality_estimate),
+		                                  static_cast<idx_t>(bind_data.cardinality_max));
+	}
+	if (have_est) {
+		return make_uniq<NodeStatistics>(static_cast<idx_t>(bind_data.cardinality_estimate));
+	}
+	if (have_max) {
+		// max-only: build NodeStatistics manually so the optimizer can use the
+		// upper bound even without a point estimate.
+		auto stats = make_uniq<NodeStatistics>();
+		stats->has_max_cardinality = true;
+		stats->max_cardinality = static_cast<idx_t>(bind_data.cardinality_max);
+		return stats;
+	}
 	return make_uniq<NodeStatistics>();
 }
 

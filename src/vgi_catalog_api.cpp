@@ -373,7 +373,7 @@ std::vector<VgiTableInfo> InvokeCatalogSchemaContentsTables(const CatalogRpcCont
 	std::vector<VgiTableInfo> tables;
 	tables.reserve(info_batches.size());
 	for (const auto &info_batch : info_batches) {
-		tables.push_back(ParseTableInfo(info_batch, worker_path));
+		tables.push_back(ParseTableInfo(context, info_batch, worker_path));
 	}
 	return tables;
 }
@@ -456,7 +456,7 @@ std::optional<VgiTableInfo> InvokeCatalogTableGet(const CatalogRpcContext &ctx,
 	if (info_batches.empty()) {
 		return std::nullopt;
 	}
-	return ParseTableInfo(info_batches[0], worker_path);
+	return ParseTableInfo(context, info_batches[0], worker_path);
 }
 
 std::optional<VgiTableInfo> InvokeCatalogTableGet(const CatalogRpcContext &ctx,
@@ -476,7 +476,7 @@ std::optional<VgiTableInfo> InvokeCatalogTableGet(const CatalogRpcContext &ctx,
 	if (info_batches.empty()) {
 		return std::nullopt;
 	}
-	return ParseTableInfo(info_batches[0], worker_path);
+	return ParseTableInfo(context, info_batches[0], worker_path);
 }
 
 std::optional<VgiViewInfo> InvokeCatalogViewGet(const CatalogRpcContext &ctx,
@@ -1596,8 +1596,8 @@ VgiSchemaInfo ParseSchemaInfo(const std::shared_ptr<arrow::RecordBatch> &batch, 
 	return info;
 }
 
-VgiTableInfo ParseTableInfo(const std::shared_ptr<arrow::RecordBatch> &batch, int64_t row_idx,
-                            const std::string &worker_path) {
+VgiTableInfo ParseTableInfo(ClientContext &context, const std::shared_ptr<arrow::RecordBatch> &batch,
+                            int64_t row_idx, const std::string &worker_path) {
 	VgiTableInfo info;
 
 	if (!batch || batch->num_rows() == 0) {
@@ -1676,6 +1676,31 @@ VgiTableInfo ParseTableInfo(const std::shared_ptr<arrow::RecordBatch> &batch, in
 	// Parse column statistics capability flag (backward-compatible)
 	info.supports_column_statistics = row["supports_column_statistics"].value_or(false);
 
+	// Parse optional inlined function-discovery results (backward-compatible).
+	// When present, the extension uses these directly and skips the
+	// corresponding catalog_table_*_function_get RPC.
+	auto decode_inlined = [&](const char *field_name) -> std::optional<VgiScanFunctionResult> {
+		auto bytes = row[field_name].value_or(std::vector<uint8_t>{});
+		if (bytes.empty()) {
+			return std::nullopt;
+		}
+		auto sf_batch = DeserializeFromIpcBytes(bytes);
+		if (!sf_batch || sf_batch->num_rows() == 0) {
+			return std::nullopt;
+		}
+		return ParseScanFunctionResult(context, sf_batch, worker_path);
+	};
+	info.scan_function = decode_inlined("scan_function");
+	info.insert_function = decode_inlined("insert_function");
+	info.update_function = decode_inlined("update_function");
+	info.delete_function = decode_inlined("delete_function");
+
+	// Parse optional inlined cardinality (backward-compatible). When present,
+	// the extension uses these values instead of firing the per-bind
+	// table_function_cardinality RPC.
+	info.cardinality_estimate = row["cardinality_estimate"].as<int64_t>();
+	info.cardinality_max = row["cardinality_max"].as<int64_t>();
+
 	// Validate: UPDATE/DELETE require a row ID column
 	if ((info.supports_update || info.supports_delete) && info.row_id_column < 0) {
 		throw InvalidInputException(
@@ -1687,8 +1712,9 @@ VgiTableInfo ParseTableInfo(const std::shared_ptr<arrow::RecordBatch> &batch, in
 	return info;
 }
 
-VgiTableInfo ParseTableInfo(const std::shared_ptr<arrow::RecordBatch> &batch, const std::string &worker_path) {
-	return ParseTableInfo(batch, 0, worker_path);
+VgiTableInfo ParseTableInfo(ClientContext &context, const std::shared_ptr<arrow::RecordBatch> &batch,
+                            const std::string &worker_path) {
+	return ParseTableInfo(context, batch, 0, worker_path);
 }
 
 std::vector<VgiSchemaInfo> ParseSchemaList(const std::shared_ptr<arrow::RecordBatch> &batch,

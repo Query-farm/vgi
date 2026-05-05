@@ -231,6 +231,15 @@ struct VgiSchemaInfo {
 	std::map<std::string, std::string> tags;
 };
 
+// Result of table_scan_function_get - tells DuckDB which function to call to scan a table
+// This enables catalogs to delegate scanning to any DuckDB function (e.g., read_parquet, iceberg_scan)
+struct VgiScanFunctionResult {
+	std::string function_name;                              // The DuckDB function to call (e.g., "read_parquet")
+	duckdb::vector<Value> positional_arguments;             // Positional arguments for the function
+	std::map<std::string, Value> named_arguments;           // Named arguments for the function
+	std::vector<std::string> required_extensions;           // Extensions to load before calling
+};
+
 // Table metadata from the worker
 struct VgiTableInfo {
 	std::string name;
@@ -270,6 +279,26 @@ struct VgiTableInfo {
 
 	// Column statistics capability — indicates this table can provide column-level statistics
 	bool supports_column_statistics = false;
+
+	// Optional inlined function-discovery results. When populated, the
+	// extension uses the cached value and skips the corresponding
+	// catalog_table_{scan,insert,update,delete}_function_get RPC. Workers
+	// whose function args change more frequently than catalog_version
+	// (rotating credentials, presigned URLs, per-transaction snapshots)
+	// must leave these unset so the per-bind RPC continues to fire.
+	std::optional<VgiScanFunctionResult> scan_function;
+	std::optional<VgiScanFunctionResult> insert_function;
+	std::optional<VgiScanFunctionResult> update_function;
+	std::optional<VgiScanFunctionResult> delete_function;
+
+	// Optional inlined cardinality. When populated, the extension uses
+	// these directly and skips the per-bind ``table_function_cardinality``
+	// RPC. Use for read-only or slow-changing tables. Workers whose
+	// cardinality changes faster than ``catalog_version`` (e.g. live
+	// counters) must leave these unset so the per-bind RPC continues to
+	// fire.
+	std::optional<int64_t> cardinality_estimate;
+	std::optional<int64_t> cardinality_max;
 };
 
 // View metadata from the worker
@@ -291,15 +320,6 @@ struct VgiMacroInfo {
 	std::vector<std::string> parameters;
 	std::vector<uint8_t> parameter_default_values_bytes;  // IPC-serialized defaults batch
 	std::map<std::string, std::string> tags;
-};
-
-// Result of table_scan_function_get - tells DuckDB which function to call to scan a table
-// This enables catalogs to delegate scanning to any DuckDB function (e.g., read_parquet, iceberg_scan)
-struct VgiScanFunctionResult {
-	std::string function_name;                              // The DuckDB function to call (e.g., "read_parquet")
-	duckdb::vector<Value> positional_arguments;             // Positional arguments for the function
-	std::map<std::string, Value> named_arguments;           // Named arguments for the function
-	std::vector<std::string> required_extensions;           // Extensions to load before calling
 };
 
 // ============================================================================
@@ -414,12 +434,15 @@ CatalogAttachResult ParseCatalogAttachResult(const std::shared_ptr<arrow::Record
 // Parse a VgiSchemaInfo from an Arrow RecordBatch (single row)
 VgiSchemaInfo ParseSchemaInfo(const std::shared_ptr<arrow::RecordBatch> &batch, const std::string &worker_path);
 
-// Parse a VgiTableInfo from an Arrow RecordBatch (single row)
-VgiTableInfo ParseTableInfo(const std::shared_ptr<arrow::RecordBatch> &batch, const std::string &worker_path);
+// Parse a VgiTableInfo from an Arrow RecordBatch (single row).
+// `context` is required to decode optional inlined ScanFunctionResults
+// (their nested IPC arguments need ArrowBatchToValues).
+VgiTableInfo ParseTableInfo(ClientContext &context, const std::shared_ptr<arrow::RecordBatch> &batch,
+                            const std::string &worker_path);
 
 // Parse a VgiTableInfo from an Arrow RecordBatch at a specific row (for multi-row batches)
-VgiTableInfo ParseTableInfo(const std::shared_ptr<arrow::RecordBatch> &batch, int64_t row_idx,
-                            const std::string &worker_path);
+VgiTableInfo ParseTableInfo(ClientContext &context, const std::shared_ptr<arrow::RecordBatch> &batch,
+                            int64_t row_idx, const std::string &worker_path);
 
 // Parse multiple schemas from a batch (for schemas() call)
 std::vector<VgiSchemaInfo> ParseSchemaList(const std::shared_ptr<arrow::RecordBatch> &batch,

@@ -1,0 +1,76 @@
+# name: test/sql/integration/table/inlined_scan_function.test
+# description: When TableInfo.scan_function is inlined, the extension skips
+#              catalog_table_scan_function_get and emits the
+#              "vgi.scan_function.inlined" trace instead.
+# group: [vgi_integration_table]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# ============================================================================
+# Function-backed table: declarative ``Table(function=TenThousandFunction)``
+# auto-populates ``TableInfo.scan_function``. The C++ extension uses the
+# inlined value and emits a single ``vgi.scan_function.inlined`` log line.
+# ============================================================================
+
+query I
+SELECT count(*) FROM example.data.ten_thousand_table;
+----
+10000
+
+# The inlined-trace event must fire — proves the cache path was taken.
+query I
+SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI'
+  AND message LIKE '%vgi.scan_function.inlined%'
+  AND message LIKE '%ten_thousand_table%';
+----
+true
+
+# Conversely, the per-bind RPC must NOT fire for this table — there should be
+# zero ``catalog_table_scan_function_get`` calls in the access log for it.
+# (The chokepoint logs every catalog RPC under the ``catalog.rpc`` event.)
+query I
+SELECT COUNT(*) = 0 FROM duckdb_logs() WHERE type = 'VGI'
+  AND message LIKE '%catalog_table_scan_function_get%'
+  AND message LIKE '%ten_thousand_table%';
+----
+true
+
+# ============================================================================
+# Explicit-columns table: ``Table(columns=...)`` leaves ``scan_function``
+# null. The legacy ``catalog_table_scan_function_get`` RPC still fires.
+# ============================================================================
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT count(*) FROM example.data.numbers;
+----
+100
+
+# No inlined-trace event for the legacy path.
+query I
+SELECT COUNT(*) = 0 FROM duckdb_logs() WHERE type = 'VGI'
+  AND message LIKE '%vgi.scan_function.inlined%'
+  AND message LIKE '%numbers%';
+----
+true
+
+# The legacy RPC must fire at least once.
+query I
+SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI'
+  AND message LIKE '%catalog_table_scan_function_get%'
+  AND message LIKE '%numbers%';
+----
+true

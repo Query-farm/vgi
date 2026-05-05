@@ -218,13 +218,23 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 	auto &attach_params = vgi_catalog.attach_parameters();
 	auto &attach_result = vgi_catalog.attach_result();
 
-	// Ask the worker which function to call to scan this table
-	auto &vgi_tx_scan = VgiTransaction::Get(context, catalog_);
-	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_id, vgi_tx_scan.GetTransactionId()};
-	rpc_ctx.entity_kind = "table";
-	rpc_ctx.entity_qualifier = ParentSchema().name + "." + name;
-	auto scan_result = vgi::InvokeCatalogTableScanFunctionGet(rpc_ctx, ParentSchema().name, name, context,
-	                                                           at_unit, at_value);
+	// Use the inlined scan_function carried on TableInfo when present, else
+	// fall back to the per-bind RPC. Workers opt in by populating
+	// ``TableInfo.scan_function`` in their catalog_table_get / schema_contents
+	// responses; this skips a 50–80ms RTT per bind on remote HTTP transports.
+	vgi::VgiScanFunctionResult scan_result;
+	if (table_info_.scan_function.has_value()) {
+		scan_result = *table_info_.scan_function;
+		VGI_LOG(context, "vgi.scan_function.inlined",
+		        {{"schema", ParentSchema().name}, {"table", name}, {"function", scan_result.function_name}});
+	} else {
+		auto &vgi_tx_scan = VgiTransaction::Get(context, catalog_);
+		vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_id, vgi_tx_scan.GetTransactionId()};
+		rpc_ctx.entity_kind = "table";
+		rpc_ctx.entity_qualifier = ParentSchema().name + "." + name;
+		scan_result = vgi::InvokeCatalogTableScanFunctionGet(rpc_ctx, ParentSchema().name, name, context,
+		                                                      at_unit, at_value);
+	}
 
 	// Load any required extensions before scanning
 	for (auto &ext : scan_result.required_extensions) {
@@ -293,6 +303,29 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 	vector<LogicalType> return_types;
 	vector<string> names;
 	vgi::PerformVgiTableFunctionBind(context, *scan_bind_data, return_types, names);
+
+	// Use inlined cardinality from TableInfo when present, skipping the
+	// per-bind table_function_cardinality RPC. Saves 50–80ms RTT on remote
+	// HTTP transports for read-only / slow-changing tables. Workers opt in
+	// by setting Table.cardinality_estimate / cardinality_max.
+	//
+	// MUST run AFTER PerformVgiTableFunctionBind, which resets
+	// ``cardinality_estimate = -1`` on the bind data unconditionally.
+	if (table_info_.cardinality_estimate.has_value() || table_info_.cardinality_max.has_value()) {
+		if (table_info_.cardinality_estimate.has_value()) {
+			scan_bind_data->cardinality_estimate = *table_info_.cardinality_estimate;
+		}
+		if (table_info_.cardinality_max.has_value()) {
+			scan_bind_data->cardinality_max = *table_info_.cardinality_max;
+		}
+		// Mark fetched so VgiTableFunctionCardinality skips the RPC.
+		scan_bind_data->cardinality_fetched = true;
+		VGI_LOG(context, "vgi.cardinality.inlined",
+		        {{"schema", ParentSchema().name},
+		         {"table", name},
+		         {"estimate", std::to_string(scan_bind_data->cardinality_estimate)},
+		         {"max", std::to_string(scan_bind_data->cardinality_max)}});
+	}
 
 	bind_data = std::move(scan_bind_data);
 
