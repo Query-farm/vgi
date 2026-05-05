@@ -58,9 +58,11 @@ SELECT COUNT(*) > 0 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%Sta
 ----
 true
 
-# Check worker_pid is present in in-band messages
+# Check conn (transport-neutral connection id) is present in in-band messages.
+# worker_pid was the old field but only exists for subprocess transport — conn=
+# is emitted for both subprocess and HTTP.
 query I
-SELECT COUNT(*) > 0 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%Starting generation%' AND message LIKE '%worker_pid=%';
+SELECT COUNT(*) > 0 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%Starting generation%' AND message LIKE '%conn=%';
 ----
 true
 

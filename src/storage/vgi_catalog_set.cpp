@@ -33,6 +33,17 @@ optional_ptr<CatalogEntry> VgiCatalogSet::GetEntry(ClientContext &context, const
 
 void VgiCatalogSet::CreateEntryLocked(unique_ptr<CatalogEntry> entry) {
 	// Called from LoadEntries while entry_lock_ is held by GetEntry/Scan.
+	//
+	// Skip if a same-named entry already exists. DuckDB's binder retains raw
+	// CatalogEntry* values across the bind, and a re-entrant Scan triggered
+	// from inside that bind (e.g. Catalog::GetAllSchemas walking sibling
+	// catalogs) would otherwise destroy entries the bind is still using —
+	// see ColumnIsGenerated → ColumnList::GetColumn(0) UAF that surfaces as
+	// "Logical column index 0 out of range". Refresh goes through
+	// ClearEntries() / vgi_clear_cache() at safe points instead.
+	if (entries_.find(entry->name) != entries_.end()) {
+		return;
+	}
 	entries_[entry->name] = std::move(entry);
 	generation_.fetch_add(1, std::memory_order_release);
 }

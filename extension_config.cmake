@@ -15,9 +15,20 @@ duckdb_extension_load(httpfs
 # Any extra extensions that should be built
 duckdb_extension_load(json)
 duckdb_extension_load(icu)
-duckdb_extension_load(spatial
-    GIT_URL https://github.com/duckdb/duckdb_spatial
-    GIT_TAG 4295b9b9a1b5a16b0a6c07880356ff3c4a21e676
-    INCLUDE_DIR src/spatial
+
+
+duckdb_extension_load(ducklake
+    GIT_URL https://github.com/Query-farm/ducklake
+    GIT_TAG 6b16f9866db28a6dd1aaba56a7ff478f09a22dc6
+#    INCLUDE_DIR src/ducklake
     LOAD_TESTS
 )
+
+
+
+#duckdb_extension_load(spatial
+#    GIT_URL https://github.com/duckdb/duckdb_spatial
+#    GIT_TAG 4295b9b9a1b5a16b0a6c07880356ff3c4a21e676
+#    INCLUDE_DIR src/spatial
+#    LOAD_TESTS
+#)

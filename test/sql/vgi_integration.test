@@ -82,9 +82,10 @@ SELECT COUNT(*) > 0 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%tab
 ----
 true
 
-# Verify batch_received events contain worker_pid
+# Verify batch_received events contain conn= (transport-neutral connection id;
+# worker_pid is subprocess-only and absent under HTTP transport).
 query I
-SELECT COUNT(*) > 0 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%batch_received%worker_pid=%';
+SELECT COUNT(*) > 0 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%batch_received%conn=%';
 ----
 true
 

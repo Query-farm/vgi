@@ -335,9 +335,11 @@ FROM example.partitioned_sequence(10000);
 ----
 10000	10000	0	9999
 
-# Verify only one worker was used (single PID in batch_received logs)
+# Verify only one worker was used (single conn= in batch_received logs).
+# Uses conn= (transport-neutral, present for both subprocess and HTTP) rather
+# than worker_pid= (subprocess-only — HTTP has no OS pid for the remote worker).
 query I
-SELECT COUNT(DISTINCT regexp_extract(message, 'worker_pid=(\d+)', 1)) = 1
+SELECT COUNT(DISTINCT regexp_extract(message, 'conn=([0-9a-f]+)', 1)) = 1
 FROM duckdb_logs()
 WHERE type = 'VGI' AND message LIKE '%batch_received%';
 ----
@@ -358,9 +360,12 @@ FROM example.partitioned_sequence(100000);
 ----
 100000	100000	0	99999
 
-# Verify multiple workers were used (at least 2 PIDs in batch_received logs)
+# Verify multiple workers were used (at least 2 distinct conn= in
+# batch_received logs). conn= is the transport-neutral per-connection id —
+# under subprocess each conn maps to a distinct worker pid; under HTTP each
+# conn is a distinct logical worker checkout against the remote server.
 query I
-SELECT COUNT(DISTINCT regexp_extract(message, 'worker_pid=(\d+)', 1)) >= 2
+SELECT COUNT(DISTINCT regexp_extract(message, 'conn=([0-9a-f]+)', 1)) >= 2
 FROM duckdb_logs()
 WHERE type = 'VGI' AND message LIKE '%batch_received%';
 ----

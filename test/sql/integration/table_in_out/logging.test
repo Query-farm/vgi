@@ -73,8 +73,10 @@ SELECT COUNT(*) > 0 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%Pro
 ----
 true
 
+# conn= is the transport-neutral per-connection identifier (emitted for both
+# subprocess and HTTP); worker_pid= only appears under subprocess transport.
 query I
-SELECT COUNT(*) > 0 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%Processing batch with%' AND message LIKE '%worker_pid=%';
+SELECT COUNT(*) > 0 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%Processing batch with%' AND message LIKE '%conn=%';
 ----
 true
 

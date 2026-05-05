@@ -108,11 +108,14 @@ std::unique_ptr<PooledWorker> VgiWorkerPool::TryAcquire(const PoolKey &key) {
 		return nullptr;
 	}
 
-	// Try to find a live worker (check from front, oldest first)
+	// MRU affinity: pop from the back so the most-recently-released worker
+	// is reused first. Keeps expensive per-process state warm (e.g. Kafka
+	// librdkafka Consumer + TLS+SASL connection, Schema Registry HTTP
+	// client). Fall through to the next-newest if the MRU has died.
 	auto &pool = it->second;
 	while (!pool.empty()) {
-		auto worker = std::move(pool.front());
-		pool.pop_front();
+		auto worker = std::move(pool.back());
+		pool.pop_back();
 
 		if (worker->IsAlive()) {
 			// Record hit (stats keyed by worker_path for backward-compatible display)
