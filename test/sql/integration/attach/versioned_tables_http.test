@@ -4,7 +4,7 @@
 
 # Requires an HTTP server for the versioned-tables-example worker, e.g.:
 #   uv run --project ~/Development/vgi-python \
-#       vgi-example-versioned-tables-worker --http --port 0
+#       vgi-fixture-versioned-tables-worker --http --port 0
 # Set VGI_VERSIONED_TABLES_HTTP_WORKER to its base URL before running.
 require-env VGI_VERSIONED_TABLES_HTTP_WORKER
 

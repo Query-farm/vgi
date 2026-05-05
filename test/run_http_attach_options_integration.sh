@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run attach-options integration tests against the vgi-example-attach-options-worker
+# Run attach-options integration tests against the vgi-fixture-attach-options-worker
 # in HTTP mode. Exercises ATTACH-time option forwarding + attach_id round-trip
 # end-to-end through the HTTP transport.
 #
@@ -12,7 +12,7 @@ OVERRIDE_FILTER="${1:-}"
 
 LOG_FILE="/tmp/vgi-http-attach-options-server.log"
 
-uv run --project "$VGI_PYTHON_DIR" vgi-example-attach-options-worker \
+uv run --project "$VGI_PYTHON_DIR" vgi-fixture-attach-options-worker \
     --http --port 0 > "$LOG_FILE" 2>&1 &
 SERVER_PID=$!
 

@@ -16,14 +16,14 @@ if [[ "${VGI_DEMO_STORAGE:-}" == "1" ]]; then
     THRESHOLD="${VGI_EXTERNALIZE_THRESHOLD_BYTES:-1}"
     COMPRESSION="${VGI_EXTERNALIZE_COMPRESSION:-none}"
     echo "Demo storage mode: threshold=${THRESHOLD} compression=${COMPRESSION}"
-    uv run --project "$VGI_PYTHON_DIR" vgi-example-http \
+    uv run --project "$VGI_PYTHON_DIR" vgi-fixture-http \
         --port 0 --demo-storage \
         --externalize-threshold-bytes "$THRESHOLD" \
         --externalize-compression "$COMPRESSION" \
         > "$LOG_FILE" 2>&1 &
 else
     uv run --project "$VGI_PYTHON_DIR" vgi-fixture-http \
-        --port 0 > "$LOG_FILE" 2>&1 &
+        --port 0 --log-format json > "$LOG_FILE" 2>&1 &
 fi
 SERVER_PID=$!
 
@@ -58,4 +58,4 @@ echo "HTTP server running on port $PORT (pid $SERVER_PID)"
 
 # Run tests
 VGI_TEST_WORKER="http://localhost:$PORT" \
-    ./build/$BUILD_DIR/test/unittest -j8 "$FILTER" "$@"
+    ./build/$BUILD_DIR/test/unittest -j 8 "$FILTER" "$@"

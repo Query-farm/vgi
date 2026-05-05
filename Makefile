@@ -11,13 +11,13 @@ VCPKG_TOOLCHAIN_PATH ?= $(wildcard ${PROJ_DIR}vcpkg/scripts/buildsystems/vcpkg.c
 include extension-ci-tools/makefiles/duckdb_extension.Makefile
 
 # VGI test worker (subprocess transport)
-VGI_TEST_WORKER ?= uv run --project $(HOME)/Development/vgi-python vgi-example-worker
+VGI_TEST_WORKER ?= uv run --project $(HOME)/Development/vgi-python vgi-fixture-worker
 
-# Versioned example workers for attach/versioning*.test. Set to overrideable
+# Versioned fixture workers for attach/versioning*.test. Set to overrideable
 # defaults so `require-env` gates pass under `make test_subprocess` by default.
-VGI_VERSIONED_WORKER ?= uv run --project $(HOME)/Development/vgi-python vgi-example-versioned-worker
-VGI_VERSIONED_TABLES_WORKER ?= uv run --project $(HOME)/Development/vgi-python vgi-example-versioned-tables-worker
-VGI_ATTACH_OPTIONS_WORKER ?= uv run --project $(HOME)/Development/vgi-python vgi-example-attach-options-worker
+VGI_VERSIONED_WORKER ?= uv run --project $(HOME)/Development/vgi-python vgi-fixture-versioned-worker
+VGI_VERSIONED_TABLES_WORKER ?= uv run --project $(HOME)/Development/vgi-python vgi-fixture-versioned-tables-worker
+VGI_ATTACH_OPTIONS_WORKER ?= uv run --project $(HOME)/Development/vgi-python vgi-fixture-attach-options-worker
 
 # Minimal SQLite-backed writable fixture: exercises the INSERT/UPDATE/DELETE wire
 # path without requiring duckdb-python's subcursor() (which the production
@@ -61,11 +61,22 @@ test_subprocess_debug:
 	./build/debug/test/unittest -j 8 "test/*" "~test/sql/integration/writable/*"
 
 # HTTP transport tests (uses test/run_http_integration.sh)
+#
+# projection_pushdown_repro.test is excluded: its fixtures use chunk=2 to
+# emit one tiny batch per process() tick, which over HTTP becomes one POST
+# round-trip per pair of rows. The test is checking projection-id → wire
+# column mapping in the C++ extension — that's transport-agnostic, fully
+# covered by the subprocess run, and HTTP transport adds no signal here
+# while inflating the test by 50× in round-trips.
 test_http:
-	./test/run_http_integration.sh "test/sql/integration/*" "~test/sql/integration/writable/*"
+	./test/run_http_integration.sh "test/sql/integration/*" \
+	    "~test/sql/integration/writable/*" \
+	    "~test/sql/integration/projection_pushdown_repro.test"
 
 test_http_debug:
-	BUILD_DIR=debug ./test/run_http_integration.sh "test/sql/integration/*" "~test/sql/integration/writable/*"
+	BUILD_DIR=debug ./test/run_http_integration.sh "test/sql/integration/*" \
+	    "~test/sql/integration/writable/*" \
+	    "~test/sql/integration/projection_pushdown_repro.test"
 
 # HTTP bearer auth tests
 test_http_bearer:
@@ -74,7 +85,7 @@ test_http_bearer:
 test_http_bearer_debug:
 	BUILD_DIR=debug ./test/run_http_bearer_integration.sh "test/sql/integration/bearer_auth/*"
 
-# HTTP versioned-tables tests (runs against the vgi-example-versioned-tables-worker
+# HTTP versioned-tables tests (runs against the vgi-fixture-versioned-tables-worker
 # in HTTP mode). Separate from test_http because it needs its own server.
 test_http_versioned_tables:
 	./test/run_http_versioned_tables_integration.sh
@@ -82,7 +93,7 @@ test_http_versioned_tables:
 test_http_versioned_tables_debug:
 	BUILD_DIR=debug ./test/run_http_versioned_tables_integration.sh
 
-# HTTP attach-options tests (runs against the vgi-example-attach-options-worker
+# HTTP attach-options tests (runs against the vgi-fixture-attach-options-worker
 # in HTTP mode). Separate from test_http because it needs its own server.
 test_http_attach_options:
 	./test/run_http_attach_options_integration.sh

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run versioned-tables integration tests against the vgi-example-versioned-tables-worker
+# Run versioned-tables integration tests against the vgi-fixture-versioned-tables-worker
 # in HTTP mode. Exercises ATTACH-time data_version_spec + npm-style spec matching
 # end-to-end through the HTTP transport (including the cookie jar).
 #
@@ -13,7 +13,7 @@ OVERRIDE_FILTER="${1:-}"
 
 LOG_FILE="/tmp/vgi-http-versioned-tables-server.log"
 
-uv run --project "$VGI_PYTHON_DIR" vgi-example-versioned-tables-worker \
+uv run --project "$VGI_PYTHON_DIR" vgi-fixture-versioned-tables-worker \
     --http --port 0 > "$LOG_FILE" 2>&1 &
 SERVER_PID=$!
 

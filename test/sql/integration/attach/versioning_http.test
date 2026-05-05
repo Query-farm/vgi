@@ -4,7 +4,7 @@
 
 # Requires an HTTP server for the versioned-example worker, e.g.:
 #   uv run --project ~/Development/vgi-python \
-#       vgi-example-versioned-worker --http --port 0
+#       vgi-fixture-versioned-worker --http --port 0
 # Set VGI_VERSIONED_HTTP_WORKER to its base URL before running.
 require-env VGI_VERSIONED_HTTP_WORKER
 
