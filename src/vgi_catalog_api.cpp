@@ -20,7 +20,10 @@
 #include "vgi_exception.hpp"
 #include "vgi_http_client.hpp"
 #include "vgi_logging.hpp"
+#include "vgi_profiling.hpp"
 #include "vgi_protocol_constants.hpp"
+
+#include <typeinfo>
 #include "vgi_rpc_client.hpp"
 #include "vgi_rpc_types.hpp"
 #include "generated/vgi_request_builders.hpp"
@@ -60,6 +63,85 @@ inline std::optional<std::string> OptStrIfNonEmpty(const std::string &s) {
 inline std::optional<std::string> OptStrNullable(const std::string &s, bool is_null) {
 	return is_null ? std::nullopt : std::optional<std::string>(s);
 }
+
+// Wraps every catalog RPC dispatch with an `outcome=ok|error` `catalog.rpc`
+// log carrying duration_ms + the entity context callers have populated on
+// CatalogRpcContext. Replaces the older start-side `rpc.invoke` log so each
+// dispatch produces exactly one event with the answer to "did it succeed and
+// how long did it take", which is what timeline analysis actually wants.
+//
+// The caller calls MarkOk() on the success path; the destructor distinguishes
+// normal-return vs. exception-unwind and logs accordingly. Also doubles as a
+// ScopedTimer so VGI_PROFILE=1 runs aggregate per-method totals at exit.
+class CatalogRpcInstrumentation {
+public:
+	CatalogRpcInstrumentation(ClientContext &context, const CatalogRpcContext &ctx,
+	                          const std::string &method_name)
+	    : context_(context),
+	      ctx_(ctx),
+	      method_name_(method_name),
+	      timer_("catalog." + method_name),
+	      start_(std::chrono::steady_clock::now()) {
+	}
+
+	void MarkOk() {
+		ok_ = true;
+	}
+
+	// Stash the exception type/message we caught so the destructor can include
+	// them. Used by the explicit catch-then-rethrow path; std::current_exception
+	// is unreliable to inspect during stack unwind without a catch.
+	void NoteException(const std::string &kind, const std::string &what) {
+		err_kind_ = kind;
+		err_what_ = what;
+	}
+
+	~CatalogRpcInstrumentation() {
+		auto end = std::chrono::steady_clock::now();
+		double duration_ms = std::chrono::duration<double, std::milli>(end - start_).count();
+		vector<pair<string, string>> info;
+		info.reserve(8);
+		info.emplace_back("method", method_name_);
+		info.emplace_back("worker_path", ctx_.params->worker_path());
+		auto attach_hex = BytesToHex(ctx_.attach_id);
+		if (!attach_hex.empty()) {
+			info.emplace_back("attach_id", attach_hex);
+		}
+		auto txn_hex = BytesToHex(ctx_.transaction_id);
+		if (!txn_hex.empty()) {
+			info.emplace_back("transaction_id", txn_hex);
+		}
+		if (!ctx_.entity_kind.empty()) {
+			info.emplace_back("entity_kind", ctx_.entity_kind);
+		}
+		if (!ctx_.entity_qualifier.empty()) {
+			info.emplace_back("entity_qualifier", ctx_.entity_qualifier);
+		}
+		info.emplace_back("duration_ms", std::to_string(duration_ms));
+		if (ok_) {
+			info.emplace_back("outcome", "ok");
+		} else {
+			info.emplace_back("outcome", "error");
+			if (!err_kind_.empty()) {
+				info.emplace_back("error_kind", err_kind_);
+			}
+			if (!err_what_.empty()) {
+				info.emplace_back("error_message", err_what_);
+			}
+		}
+		VGI_LOG(context_, "catalog.rpc", info);
+	}
+
+private:
+	ClientContext &context_;
+	const CatalogRpcContext &ctx_;
+	std::string method_name_;
+	vgi::ScopedTimer timer_;
+	std::chrono::steady_clock::time_point start_;
+	bool ok_ = false;
+	std::string err_kind_;
+	std::string err_what_;
+};
 
 }  // namespace
 
@@ -104,32 +186,40 @@ std::shared_ptr<HTTPParams> VgiAttachParameters::GetOrInitHttpParams(
 // stderr pipe buffer fills), and stale-pool retry.
 static UnaryResponseResult InvokeRpcMethod(const CatalogRpcContext &ctx, const std::string &method_name,
                                             const std::shared_ptr<arrow::RecordBatch> &params, ClientContext &context) {
-	VGI_LOG(context, "rpc.invoke",
-	        {{"worker_path", ctx.params->worker_path()}, {"method", method_name}});
+	CatalogRpcInstrumentation instr(context, ctx, method_name);
+	try {
+		// Validate the outgoing request against the registered params schema.
+		// Catches encoder drift in BuildXxxParams (e.g. flipped nullability,
+		// missing fields) at the C++ boundary, before it turns into an opaque
+		// failure on the worker side.
+		ValidateRequestSchema(params, method_name, ctx.params->worker_path());
 
-	// Validate the outgoing request against the registered params schema.
-	// Catches encoder drift in BuildXxxParams (e.g. flipped nullability,
-	// missing fields) at the C++ boundary, before it turns into an opaque
-	// failure on the worker side.
-	ValidateRequestSchema(params, method_name, ctx.params->worker_path());
-
-	UnaryRpcOptions opts {context,
-	                      ctx.params->worker_path(),
-	                      ctx.params->worker_debug(),
-	                      ctx.params->use_pool(),
-	                      ctx.params->data_version_spec(),
-	                      ctx.params->implementation_version(),
-	                      "rpc_catalog",
-	                      ctx.params->auth(),
-	                      ctx.params->cookie_jar()};
-	// Cache-hit on the HTTP path: avoids re-entering the secret manager (and
-	// thus the MetaTransaction mutex) for RPCs invoked from inside
-	// VgiTransaction::Start. No-op for subprocess transport. See the TODO on
-	// VgiAttachParameters::GetOrInitHttpParams.
-	if (IsHttpTransport(ctx.params->worker_path())) {
-		opts.cached_http_params = ctx.params->GetOrInitHttpParams(context, ctx.params->worker_path());
+		UnaryRpcOptions opts {context,
+		                      ctx.params->worker_path(),
+		                      ctx.params->worker_debug(),
+		                      ctx.params->use_pool(),
+		                      ctx.params->data_version_spec(),
+		                      ctx.params->implementation_version(),
+		                      "rpc_catalog",
+		                      ctx.params->auth(),
+		                      ctx.params->cookie_jar()};
+		// Cache-hit on the HTTP path: avoids re-entering the secret manager (and
+		// thus the MetaTransaction mutex) for RPCs invoked from inside
+		// VgiTransaction::Start. No-op for subprocess transport. See the TODO on
+		// VgiAttachParameters::GetOrInitHttpParams.
+		if (IsHttpTransport(ctx.params->worker_path())) {
+			opts.cached_http_params = ctx.params->GetOrInitHttpParams(context, ctx.params->worker_path());
+		}
+		auto result = InvokePooledUnaryRpc(opts, method_name, params);
+		instr.MarkOk();
+		return result;
+	} catch (const std::exception &e) {
+		// typeid().name() gives the demangled-or-mangled C++ type — close enough
+		// for triage. The full message goes in error_message; consumers that need
+		// the DuckDB ExceptionType can re-parse there.
+		instr.NoteException(typeid(e).name(), e.what());
+		throw;
 	}
-	return InvokePooledUnaryRpc(opts, method_name, params);
 }
 
 // Extract result binary bytes from a unary RPC response batch,

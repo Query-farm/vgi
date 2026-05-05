@@ -69,6 +69,14 @@ protected:
 	// Override to load entries from the remote source
 	virtual void LoadEntries(ClientContext &context) = 0;
 
+	// Short tag identifying this set's contents for instrumentation logs
+	// (e.g. "table", "schema", "view", "function", "macro", "index"). The
+	// base returns empty so subclasses opt in; the catalog.entry_cache event
+	// uses this as the `set_kind` field.
+	virtual std::string CacheKindName() const {
+		return "";
+	}
+
 	// Check if entries have been loaded
 	bool IsLoaded() const {
 		return is_loaded_;

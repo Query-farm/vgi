@@ -6,6 +6,7 @@
 #include "duckdb/main/extension/extension_loader.hpp"
 
 #include "storage/vgi_catalog.hpp"
+#include "vgi_logging.hpp"
 
 namespace duckdb {
 namespace vgi {
@@ -28,6 +29,7 @@ static void VgiClearCacheScan(ClientContext &context, TableFunctionInput &data_p
 	}
 
 	auto databases = DatabaseManager::Get(context).GetDatabases(context);
+	idx_t catalogs_cleared = 0;
 	for (auto &db : databases) {
 		auto &catalog = db->GetCatalog();
 		if (catalog.GetCatalogType() != "vgi") {
@@ -37,7 +39,12 @@ static void VgiClearCacheScan(ClientContext &context, TableFunctionInput &data_p
 		// Documented to invalidate any in-flight bound queries against
 		// VGI catalogs.
 		catalog.Cast<VgiCatalog>().ClearCache(/*force=*/true);
+		VGI_LOG(context, "catalog.cache_clear",
+		        {{"catalog", catalog.GetName()}, {"trigger", "vgi_clear_cache"}});
+		++catalogs_cleared;
 	}
+	VGI_LOG(context, "catalog.cache_clear_summary",
+	        {{"catalogs_cleared", std::to_string(catalogs_cleared)}});
 
 	data.finished = true;
 }

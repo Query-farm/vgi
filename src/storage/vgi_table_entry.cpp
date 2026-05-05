@@ -58,23 +58,50 @@ unique_ptr<BaseStatistics> VgiTableEntry::GetStatistics(ClientContext &context, 
 	// GetStatistics on the same table from inside the RPC (logging,
 	// optimizer fanout, secret-manager reentry, etc.).
 	bool must_fetch = false;
+	bool concurrent_wait = false;
+	double wait_ms = 0.0;
+	auto qualifier = ParentSchema().name + "." + name;
 	{
 		std::unique_lock<std::mutex> lk(stats_cache_.mutex);
 		// Wait out a concurrent fetch. The waiter then sees the freshly
 		// populated cache and skips fetching.
-		stats_cache_.cv.wait(lk, [this] { return !stats_cache_.loading; });
+		if (stats_cache_.loading) {
+			concurrent_wait = true;
+			auto wait_start = std::chrono::steady_clock::now();
+			stats_cache_.cv.wait(lk, [this] { return !stats_cache_.loading; });
+			auto wait_end = std::chrono::steady_clock::now();
+			wait_ms = std::chrono::duration<double, std::milli>(wait_end - wait_start).count();
+		}
 		if (stats_cache_.IsStale()) {
 			stats_cache_.loading = true;
 			must_fetch = true;
 		}
 	}
 
+	double fetch_ms = 0.0;
 	if (must_fetch) {
 		// FetchColumnStatistics handles its own publish + cv notify. It
 		// must clear stats_cache_.loading on every exit path (success,
 		// thrown exception, or caught error).
+		auto fetch_start = std::chrono::steady_clock::now();
 		FetchColumnStatistics(context);
+		auto fetch_end = std::chrono::steady_clock::now();
+		fetch_ms = std::chrono::duration<double, std::milli>(fetch_end - fetch_start).count();
 	}
+
+	std::string outcome = must_fetch ? "fetched" : (concurrent_wait ? "concurrent_wait" : "fresh_hit");
+	vector<pair<string, string>> info{
+	    {"qualifier", qualifier},
+	    {"column", column_name},
+	    {"outcome", outcome},
+	};
+	if (concurrent_wait) {
+		info.emplace_back("wait_ms", std::to_string(wait_ms));
+	}
+	if (must_fetch) {
+		info.emplace_back("fetch_ms", std::to_string(fetch_ms));
+	}
+	VGI_LOG(context, "catalog.stats_cache", info);
 
 	std::lock_guard<std::mutex> lk(stats_cache_.mutex);
 	auto it = stats_cache_.entries.find(column_name);
@@ -124,6 +151,8 @@ void VgiTableEntry::FetchColumnStatistics(ClientContext &context) const {
 		auto &vgi_tx = VgiTransaction::Get(context, catalog_);
 		vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result_data->attach_id,
 		                                vgi_tx.GetTransactionId()};
+		rpc_ctx.entity_kind = "table";
+		rpc_ctx.entity_qualifier = ParentSchema().name + "." + name;
 
 		auto rpc_result = vgi::InvokeCatalogTableColumnStatisticsGet(
 		    rpc_ctx, ParentSchema().name, name, col_types, col_names, context);
@@ -192,6 +221,8 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 	// Ask the worker which function to call to scan this table
 	auto &vgi_tx_scan = VgiTransaction::Get(context, catalog_);
 	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_id, vgi_tx_scan.GetTransactionId()};
+	rpc_ctx.entity_kind = "table";
+	rpc_ctx.entity_qualifier = ParentSchema().name + "." + name;
 	auto scan_result = vgi::InvokeCatalogTableScanFunctionGet(rpc_ctx, ParentSchema().name, name, context,
 	                                                           at_unit, at_value);
 

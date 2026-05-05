@@ -1,6 +1,7 @@
 #include "storage/vgi_catalog_set.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
+#include "vgi_logging.hpp"
 
 namespace duckdb {
 
@@ -13,11 +14,18 @@ optional_ptr<CatalogEntry> VgiCatalogSet::GetEntry(ClientContext &context, const
 	// Check if we have the entry cached
 	auto it = entries_.find(name);
 	if (it != entries_.end()) {
+		VGI_LOG(context, "catalog.entry_cache",
+		        {{"set_kind", CacheKindName()},
+		         {"name", name},
+		         {"outcome", "hit"},
+		         {"triggered_load", "false"}});
 		return it->second.get();
 	}
 
 	// Load entries if not yet loaded
+	bool triggered_load = false;
 	if (!is_loaded_) {
+		triggered_load = true;
 		LoadEntries(context);
 		is_loaded_ = true;
 	}
@@ -25,9 +33,19 @@ optional_ptr<CatalogEntry> VgiCatalogSet::GetEntry(ClientContext &context, const
 	// Check again after loading
 	it = entries_.find(name);
 	if (it != entries_.end()) {
+		VGI_LOG(context, "catalog.entry_cache",
+		        {{"set_kind", CacheKindName()},
+		         {"name", name},
+		         {"outcome", "miss_loaded"},
+		         {"triggered_load", triggered_load ? "true" : "false"}});
 		return it->second.get();
 	}
 
+	VGI_LOG(context, "catalog.entry_cache",
+	        {{"set_kind", CacheKindName()},
+	         {"name", name},
+	         {"outcome", "miss_not_found"},
+	         {"triggered_load", triggered_load ? "true" : "false"}});
 	return nullptr;
 }
 

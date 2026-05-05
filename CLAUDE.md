@@ -115,6 +115,56 @@ For debugging failures, write standalone `.sql` files in `/tmp/` and run with `.
 | `VGI_WORKER_DEBUG=1` | Same as PASSTHROUGH + sets `VGI_IPC_DEBUG=1` in worker |
 | `VGI_RPC_SHM_SIZE_BYTES=N` | Enable shared-memory transport on subprocess workers (segment size N bytes; opt-in, see *Shared-Memory Transport* below) |
 | `VGI_RPC_SHM_DEBUG=1` | Log each resolved / fallback batch to stderr (requires `VGI_RPC_SHM_SIZE_BYTES`) |
+| `VGI_PROFILE=1` | Enable RAII timer scopes (`ScopedTimer` / `ProfileStats`) and print a per-name aggregate summary to stderr at process exit. Now also covers every catalog RPC method (see *Catalog Profiling*). |
+
+`VGI_STDERR_LOG=1` also surfaces the catalog instrumentation events (`catalog.rpc`, `catalog.entry_cache`, `catalog.stats_cache`, `catalog.cache_clear`) on stderr.
+
+## Catalog Profiling
+
+Every catalog RPC method (`catalog_*`) and the local entry / statistics caches are instrumented for latency and call-pattern analysis. Use this to answer questions like:
+
+- "How many `catalog_table_get` calls did a single `SELECT` issue, and how many were cache hits?"
+- "What's p50 / p99 of `catalog_table_column_statistics_get` per worker?"
+- "Did `vgi_clear_cache()` help — how cold are catalog reads after a clear?"
+
+The instrumentation reuses `VGI_LOG` (so events flow through DuckDB's log manager and stderr) and `ScopedTimer` (so `VGI_PROFILE=1` produces an exit summary). No new env vars.
+
+### Events emitted
+
+| Event | Fields | Emitted from |
+|-------|--------|--------------|
+| `catalog.rpc` | `method`, `worker_path`, `attach_id`, `transaction_id`, `entity_kind`, `entity_qualifier`, `duration_ms`, `outcome` (`ok`/`error`), `error_kind`, `error_message` | `vgi_catalog_api.cpp` chokepoint — wraps every `InvokeCatalog*` |
+| `catalog.entry_cache` | `set_kind`, `name`, `qualifier`, `outcome` (`hit` / `miss_loaded` / `miss_not_found` / `rpc_fetched` / `concurrent_published` / `generation_raced` / `not_found` / `at_clause_rpc` / `at_clause_not_found` / `not_attached`), `triggered_load`, `duration_ms`, `at_unit`, `at_value` | `vgi_catalog_set.cpp` (base) and `vgi_table_set.cpp` (table-specific override) |
+| `catalog.stats_cache` | `qualifier`, `column`, `outcome` (`fresh_hit` / `concurrent_wait` / `fetched`), `wait_ms`, `fetch_ms` | `vgi_table_entry.cpp` `GetStatistics` |
+| `catalog.cache_clear`, `catalog.cache_clear_summary` | `catalog`, `trigger`; `catalogs_cleared` | `vgi_clear_cache.cpp` |
+
+`entity_kind` and `entity_qualifier` on `catalog.rpc` are populated opportunistically by hot read-path callers (table/view/function `LoadEntries`, `GetEntry`, statistics fetch, scan-function fetch). DDL and transaction methods omit them — `method` + `attach_id` is enough to tell those apart.
+
+### Enabling
+
+DuckDB log manager (queryable via `duckdb_logs`):
+
+```sql
+SET enable_logging=true;
+SET enable_log_types='VGI';
+-- ... run your workload ...
+SELECT timestamp, message FROM duckdb_logs WHERE type='VGI' ORDER BY timestamp;
+```
+
+Stderr passthrough (no SQL setup):
+
+```bash
+VGI_STDERR_LOG=1 ./build/release/duckdb -f workload.sql 2>&1 | grep '\[VGI\] catalog\.'
+```
+
+Aggregate exit summary (per-method totals, call counts, avg ms):
+
+```bash
+VGI_PROFILE=1 ./build/release/duckdb -f workload.sql
+# prints [VGI PROFILE SUMMARY] table to stderr at exit
+```
+
+See `docs/catalog_profiling.md` for example `duckdb_logs` queries and a coverage map.
 
 ## Shared-Memory Transport
 

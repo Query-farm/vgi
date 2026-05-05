@@ -17,6 +17,10 @@ public:
 
 protected:
 	void LoadEntries(ClientContext &context) override;
+
+	std::string CacheKindName() const override {
+		return "schema";
+	}
 };
 
 } // namespace duckdb

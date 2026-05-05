@@ -143,6 +143,12 @@ struct CatalogRpcContext {
 	std::shared_ptr<VgiAttachParameters> params;
 	std::vector<uint8_t> attach_id;       // from CatalogAttachResult
 	std::vector<uint8_t> transaction_id;  // from VgiTransaction (empty if N/A)
+
+	// Optional entity context for instrumentation. When populated, the RPC
+	// chokepoint logs them on every catalog.rpc event so analyses can group
+	// latency by which entity DuckDB was resolving. Empty values are omitted.
+	std::string entity_kind;       // "table" | "schema" | "view" | "function" | "macro" | ""
+	std::string entity_qualifier;  // e.g. "schema.table" or just "schema"
 };
 
 // A setting exposed by a VGI worker

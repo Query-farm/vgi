@@ -12,6 +12,9 @@
 #include "storage/vgi_table_entry.hpp"
 #include "storage/vgi_transaction.hpp"
 #include "vgi_catalog_api.hpp"
+#include "vgi_logging.hpp"
+
+#include <chrono>
 
 namespace duckdb {
 
@@ -30,6 +33,8 @@ void VgiTableSet::LoadEntries(ClientContext &context) {
 	// Call catalog_schema_contents_tables via RPC
 	auto &vgi_tx_load = VgiTransaction::Get(context, catalog_);
 	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_id, vgi_tx_load.GetTransactionId()};
+	rpc_ctx.entity_kind = "schema";
+	rpc_ctx.entity_qualifier = schema_.name;
 	auto tables = vgi::InvokeCatalogSchemaContentsTables(rpc_ctx, schema_.name, context);
 
 	for (auto &table_info : tables) {
@@ -48,11 +53,18 @@ void VgiTableSet::LoadEntries(ClientContext &context) {
 // during our RPC moves it forward, and we re-check on the way out so a
 // dropped table can't be silently resurrected as a "ghost" entry.
 optional_ptr<CatalogEntry> VgiTableSet::GetEntry(ClientContext &context, const std::string &name) {
+	auto rpc_start = std::chrono::steady_clock::now();
 	uint64_t pre_gen;
+	std::string qualifier = schema_.name + "." + name;
 	{
 		std::lock_guard<std::mutex> lock(entry_lock_);
 		auto it = GetEntries().find(name);
 		if (it != GetEntries().end()) {
+			VGI_LOG(context, "catalog.entry_cache",
+			        {{"set_kind", CacheKindName()},
+			         {"name", name},
+			         {"qualifier", qualifier},
+			         {"outcome", "hit"}});
 			return it->second.get();
 		}
 		pre_gen = generation_.load(std::memory_order_acquire);
@@ -64,14 +76,30 @@ optional_ptr<CatalogEntry> VgiTableSet::GetEntry(ClientContext &context, const s
 	auto &attach_result = vgi_catalog.attach_result();
 
 	if (!attach_params || !attach_result) {
+		VGI_LOG(context, "catalog.entry_cache",
+		        {{"set_kind", CacheKindName()},
+		         {"name", name},
+		         {"qualifier", qualifier},
+		         {"outcome", "not_attached"}});
 		return nullptr;
 	}
 
 	auto &vgi_tx = VgiTransaction::Get(context, catalog_);
 	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_id, vgi_tx.GetTransactionId()};
+	rpc_ctx.entity_kind = "table";
+	rpc_ctx.entity_qualifier = qualifier;
 	auto table_info_opt = vgi::InvokeCatalogTableGet(rpc_ctx, schema_.name, name, context);
 
+	auto rpc_end = std::chrono::steady_clock::now();
+	double rpc_ms = std::chrono::duration<double, std::milli>(rpc_end - rpc_start).count();
+
 	if (!table_info_opt) {
+		VGI_LOG(context, "catalog.entry_cache",
+		        {{"set_kind", CacheKindName()},
+		         {"name", name},
+		         {"qualifier", qualifier},
+		         {"outcome", "not_found"},
+		         {"duration_ms", std::to_string(rpc_ms)}});
 		return nullptr;
 	}
 
@@ -85,17 +113,35 @@ optional_ptr<CatalogEntry> VgiTableSet::GetEntry(ClientContext &context, const s
 	// another thread just dropped it locally. Caller will re-fetch on its
 	// next attempt against a clean state.
 	if (generation_.load(std::memory_order_acquire) != pre_gen) {
+		VGI_LOG(context, "catalog.entry_cache",
+		        {{"set_kind", CacheKindName()},
+		         {"name", name},
+		         {"qualifier", qualifier},
+		         {"outcome", "generation_raced"},
+		         {"duration_ms", std::to_string(rpc_ms)}});
 		return nullptr;
 	}
 	// Another thread may have published while we were RPCing — return its
 	// entry instead of overwriting (LoadEntries / parallel GetEntry).
 	auto it = GetEntries().find(name);
 	if (it != GetEntries().end()) {
+		VGI_LOG(context, "catalog.entry_cache",
+		        {{"set_kind", CacheKindName()},
+		         {"name", name},
+		         {"qualifier", qualifier},
+		         {"outcome", "concurrent_published"},
+		         {"duration_ms", std::to_string(rpc_ms)}});
 		return it->second.get();
 	}
 	auto result = table_entry.get();
 	GetEntries()[name] = std::move(table_entry);
 	generation_.fetch_add(1, std::memory_order_release);
+	VGI_LOG(context, "catalog.entry_cache",
+	        {{"set_kind", CacheKindName()},
+	         {"name", name},
+	         {"qualifier", qualifier},
+	         {"outcome", "rpc_fetched"},
+	         {"duration_ms", std::to_string(rpc_ms)}});
 	return result;
 }
 
@@ -132,12 +178,25 @@ optional_ptr<CatalogEntry> VgiTableSet::GetEntry(ClientContext &context, const E
 	auto at_value = at_raw.ToString();
 
 	// Call catalog_table_get with AT params via RPC
+	auto rpc_start = std::chrono::steady_clock::now();
 	auto &vgi_tx_at = VgiTransaction::Get(context, catalog_);
 	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_id, vgi_tx_at.GetTransactionId()};
+	rpc_ctx.entity_kind = "table";
+	rpc_ctx.entity_qualifier = schema_.name + "." + entry_name;
 	auto table_info_opt = vgi::InvokeCatalogTableGet(rpc_ctx, schema_.name, entry_name, context,
 	                                                  at_unit, at_value);
+	auto rpc_end = std::chrono::steady_clock::now();
+	double rpc_ms = std::chrono::duration<double, std::milli>(rpc_end - rpc_start).count();
 
 	if (!table_info_opt) {
+		VGI_LOG(context, "catalog.entry_cache",
+		        {{"set_kind", CacheKindName()},
+		         {"name", entry_name},
+		         {"qualifier", rpc_ctx.entity_qualifier},
+		         {"outcome", "at_clause_not_found"},
+		         {"at_unit", at_unit},
+		         {"at_value", at_value},
+		         {"duration_ms", std::to_string(rpc_ms)}});
 		return nullptr;
 	}
 
@@ -149,6 +208,14 @@ optional_ptr<CatalogEntry> VgiTableSet::GetEntry(ClientContext &context, const E
 	// and gets cleaned up when the transaction ends.
 	auto &transaction = VgiTransaction::Get(context, catalog_);
 	auto &result = transaction.point_in_time_entries.emplace_back(std::move(table_entry));
+	VGI_LOG(context, "catalog.entry_cache",
+	        {{"set_kind", CacheKindName()},
+	         {"name", entry_name},
+	         {"qualifier", rpc_ctx.entity_qualifier},
+	         {"outcome", "at_clause_rpc"},
+	         {"at_unit", at_unit},
+	         {"at_value", at_value},
+	         {"duration_ms", std::to_string(rpc_ms)}});
 	return result;
 }
 

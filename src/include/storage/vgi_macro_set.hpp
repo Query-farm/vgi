@@ -16,6 +16,10 @@ public:
 protected:
 	void LoadEntries(ClientContext &context) override;
 
+	std::string CacheKindName() const override {
+		return "macro";
+	}
+
 private:
 	VgiSchemaEntry &schema_;
 	CatalogType macro_catalog_type_;  // MACRO_ENTRY or TABLE_MACRO_ENTRY

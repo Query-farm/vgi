@@ -40,6 +40,8 @@ void VgiAggregateFunctionSet::LoadEntries(ClientContext &context) {
 
 	auto &vgi_tx_load = VgiTransaction::Get(context, catalog_);
 	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_id, vgi_tx_load.GetTransactionId()};
+	rpc_ctx.entity_kind = "schema";
+	rpc_ctx.entity_qualifier = schema_.name;
 	auto function_list = vgi::InvokeCatalogSchemaContentsFunctions(rpc_ctx, schema_.name,
 	                                                               "AGGREGATE_FUNCTION", context);
 

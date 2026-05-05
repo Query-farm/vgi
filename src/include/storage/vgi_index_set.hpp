@@ -18,6 +18,10 @@ public:
 protected:
 	void LoadEntries(ClientContext &context) override;
 
+	std::string CacheKindName() const override {
+		return "index";
+	}
+
 private:
 	VgiSchemaEntry &schema_;
 };

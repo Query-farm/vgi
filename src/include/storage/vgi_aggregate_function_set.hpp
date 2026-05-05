@@ -15,6 +15,10 @@ public:
 protected:
 	void LoadEntries(ClientContext &context) override;
 
+	std::string CacheKindName() const override {
+		return "aggregate_function";
+	}
+
 private:
 	VgiSchemaEntry &schema_;
 };
