@@ -90,11 +90,16 @@ static std::shared_ptr<arrow::RecordBatch> BuildWriteOptions(bool return_chunk,
 	return arrow::RecordBatch::Make(schema, 1, {return_chunks_arr, action_arr, conflict_cols_arr});
 }
 
-static std::unique_ptr<IFunctionConnection> SetupWriteConnection(ClientContext &context, VgiTableEntry &table,
-                                                                  const VgiWriteFunctionResult &write_func,
-                                                                  const std::shared_ptr<arrow::Schema> &input_schema,
-                                                                  const std::shared_ptr<arrow::RecordBatch> &write_options,
-                                                                  const std::vector<uint8_t> &transaction_id) {
+struct SetupWriteResult {
+	std::unique_ptr<IFunctionConnection> connection;
+	BindResult bind_result;
+};
+
+static SetupWriteResult SetupWriteConnection(ClientContext &context, VgiTableEntry &table,
+                                              const VgiWriteFunctionResult &write_func,
+                                              const std::shared_ptr<arrow::Schema> &input_schema,
+                                              const std::shared_ptr<arrow::RecordBatch> &write_options,
+                                              const std::vector<uint8_t> &transaction_id) {
 	auto &catalog = table.GetCatalog().Cast<VgiCatalog>();
 	auto &params = catalog.attach_parameters();
 	auto &attach_result = catalog.attach_result();
@@ -129,11 +134,11 @@ static std::unique_ptr<IFunctionConnection> SetupWriteConnection(ClientContext &
 	}
 
 	connection->SetInputSchema(input_schema);
-	connection->PerformBindFull();
-	connection->PerformInit({}, nullptr, {}, "INPUT");
+	auto bind_result = connection->PerformBindRpc();
+	connection->PerformInit(bind_result, {}, nullptr, {}, "INPUT");
 	connection->OpenInputWriter();
 
-	return connection;
+	return SetupWriteResult{std::move(connection), std::move(bind_result)};
 }
 
 // Helper: Validate that a worker-emitted RETURNING batch matches the table's
@@ -208,7 +213,7 @@ static idx_t FinalizeWriteConnection(VgiWriteGlobalState &gstate) {
 	if (gstate.has_finalize) {
 		// PerformFinalizeInit closes the input writer internally and re-runs
 		// init on the worker with phase=FINALIZE.
-		gstate.connection->PerformFinalizeInit();
+		gstate.connection->PerformFinalizeInit(gstate.bind_result);
 	} else {
 		gstate.connection->CloseInputWriter();
 	}
@@ -356,8 +361,12 @@ unique_ptr<GlobalSinkState> VgiPhysicalInsert::GetGlobalSinkState(ClientContext 
 	gstate->has_finalize =
 	    WriteFunctionHasFinalize(context, table->GetCatalog(), table->GetTableInfo().schema_name,
 	                             write_func.function_name);
-	gstate->connection = SetupWriteConnection(context, *table, write_func, input_schema, write_options,
-	                                           vgi_tx.GetTransactionId());
+	{
+		auto setup = SetupWriteConnection(context, *table, write_func, input_schema, write_options,
+		                                   vgi_tx.GetTransactionId());
+		gstate->connection = std::move(setup.connection);
+		gstate->bind_result = std::move(setup.bind_result);
+	}
 
 	return unique_ptr<GlobalSinkState>(gstate.release());
 }
@@ -502,8 +511,12 @@ unique_ptr<GlobalSinkState> VgiPhysicalDelete::GetGlobalSinkState(ClientContext 
 	gstate->has_finalize = WriteFunctionHasFinalize(context, table.GetCatalog(),
 	                                                 table.GetTableInfo().schema_name,
 	                                                 write_func.function_name);
-	gstate->connection = SetupWriteConnection(context, table, write_func, input_schema, write_options,
-	                                           vgi_tx.GetTransactionId());
+	{
+		auto setup = SetupWriteConnection(context, table, write_func, input_schema, write_options,
+		                                   vgi_tx.GetTransactionId());
+		gstate->connection = std::move(setup.connection);
+		gstate->bind_result = std::move(setup.bind_result);
+	}
 
 	return unique_ptr<GlobalSinkState>(gstate.release());
 }
@@ -653,8 +666,12 @@ unique_ptr<GlobalSinkState> VgiPhysicalUpdate::GetGlobalSinkState(ClientContext 
 	gstate->has_finalize = WriteFunctionHasFinalize(context, table.GetCatalog(),
 	                                                 table.GetTableInfo().schema_name,
 	                                                 write_func.function_name);
-	gstate->connection = SetupWriteConnection(context, table, write_func, input_schema, write_options,
-	                                           vgi_tx.GetTransactionId());
+	{
+		auto setup = SetupWriteConnection(context, table, write_func, input_schema, write_options,
+		                                   vgi_tx.GetTransactionId());
+		gstate->connection = std::move(setup.connection);
+		gstate->bind_result = std::move(setup.bind_result);
+	}
 
 	return unique_ptr<GlobalSinkState>(gstate.release());
 }

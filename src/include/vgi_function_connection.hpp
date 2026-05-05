@@ -55,7 +55,7 @@ struct FunctionConnectionParams {
 
 	// Optional input schema, required for function types that bind with a
 	// typed input stream (table-in-out, scalar). If set, AcquireAndBindConnection
-	// calls SetInputSchema before PerformBindFull.
+	// calls SetInputSchema before PerformBindRpc.
 	std::shared_ptr<arrow::Schema> input_schema;
 
 	// Convenience accessors (defined out-of-line in vgi_function_connection.cpp)
@@ -79,7 +79,7 @@ struct AcquireAndBindResult {
 // This helper encapsulates the common pattern of:
 // 1. Try to acquire a pooled worker
 // 2. Create FunctionConnection (from pool or fresh)
-// 3. Attempt PerformBindFull()
+// 3. Attempt PerformBindRpc()
 // 4. If bind fails and connection was from pool, retry with fresh connection
 //
 // The retry handles the case where a pooled worker died while idle. If the
@@ -93,15 +93,18 @@ AcquireAndBindResult AcquireAndBindConnection(ClientContext &context, const Func
 // Function Connection - vgi_rpc Protocol
 // ============================================================================
 
-// FunctionConnection implements the VGI function protocol using vgi_rpc:
-// Phase 1: bind RPC (unary) - send BindRequest, receive BindResponse
-// Phase 2: init RPC (streaming) - send InitRequest, receive GlobalInitResponse + data streams
-// Phase 3: data exchange - lockstep IPC streams (client sends → server responds)
+// FunctionConnection implements the VGI function protocol using vgi_rpc.
+// It is a thin transport channel: the worker exposes several unary/streaming
+// RPCs (bind, init, cardinality, ...), and the methods on this class invoke
+// them. The class itself only tracks streaming state — init_done_ once init
+// has opened the data streams, data_finished_ once they're drained — and
+// does not cache any RPC results. Callers thread bind→init data through
+// themselves by passing the BindResult from PerformBindRpc into PerformInit.
 //
-// State machine with validation:
-// - Created → bind_done_ (via PerformBindFull)
-// - bind_done_ → init_done_ (via PerformInit)
-// - init_done_ → data_finished_ (via ReadDataBatch returning nullptr)
+// PerformBindRpc lazily spawns the worker subprocess on first call (or
+// adopts a pooled one); subsequent RPCs share that process. Calling
+// PerformBindRpc twice on the same connection sends two bind RPCs (the
+// worker will reject the second).
 //
 // For table functions (producer mode):
 //   Client sends 0-row "tick" batches, server responds with output batches
@@ -140,35 +143,41 @@ public:
 		tick_filter_state_ = std::move(state);
 	}
 
-	// Phase 1: Perform bind via vgi_rpc "bind" RPC call
-	// Spawns worker if needed, sends BindRequest, reads BindResponse
-	// Returns BindResult with output schema and opaque data
-	BindResult PerformBindFull() override;
+	// Send the VGI "bind" RPC. Spawns the worker subprocess on first call
+	// (unless adopted from the pool), runs the bind protocol — including
+	// the optional secret-scope retry — and returns the resulting BindResult
+	// by value. The connection does NOT cache the result; callers thread it
+	// into the matching PerformInit / PerformFinalizeInit.
+	BindResult PerformBindRpc() override;
 
 	// Set the input schema for table-in-out/scalar functions
-	// Must be called before PerformBindFull() for table-in-out functions
+	// Must be called before PerformBindRpc() for table-in-out functions
 	// input_schema: Arrow schema describing the input data
 	void SetInputSchema(const std::shared_ptr<arrow::Schema> &input_schema) override;
 
 	// Update input schema for execution phase (when DataChunk types differ from bind types)
 	void UpdateInputSchemaForExecution(const std::shared_ptr<arrow::Schema> &input_schema) override;
 
-	// Phase 2: Perform init via vgi_rpc "init" RPC call
-	// Sends InitRequest, reads GlobalInitResponse, opens data streams
+	// Send the VGI "init" RPC. Opens the data streams and returns the
+	// init response. The bind_result must come from a prior PerformBindRpc
+	// on this connection — its bind_request_bytes, output_schema_bytes, and
+	// opaque_data are folded into the InitRequest.
 	// For table functions: enters producer mode (tick-based)
 	// For scalar/table-in-out: enters exchange mode
 	// Optional phase parameter for FINALIZE init calls
-	InitResult PerformInit(const std::vector<int32_t> &projection_ids = {},
+	InitResult PerformInit(const BindResult &bind_result,
+	                       const std::vector<int32_t> &projection_ids = {},
 	                       std::shared_ptr<arrow::Buffer> pushdown_filters = nullptr,
 	                       std::vector<std::shared_ptr<arrow::Buffer>> join_keys = {},
 	                       const std::string &phase = "",
 	                       const std::optional<OrderByHint> &order_by = std::nullopt,
 	                       const std::optional<TableSampleHint> &table_sample = std::nullopt) override;
 
-	// Perform finalize init for table-in-out functions
-	// Closes current data streams, sends new init RPC with phase=FINALIZE
-	// Opens new data streams in producer mode (tick-based)
-	void PerformFinalizeInit() override;
+	// Re-init for table-in-out FINALIZE: closes the current data streams
+	// and sends a new init RPC with phase="FINALIZE" that references the
+	// original bind via bind_result. Opens new data streams in producer
+	// mode (tick-based).
+	void PerformFinalizeInit(const BindResult &bind_result) override;
 
 	// ========================================================================
 	// Input Data (Scalar and Table-In-Out Functions)
@@ -282,16 +291,15 @@ private:
 	std::map<std::string, Value> settings_;
 	std::vector<VgiSecretRequirement> required_secrets_;
 
-	// Worker process (created during bind)
+	// Worker process (spawned lazily by PerformBindRpc, or adopted from the
+	// pool). Used as the spawn-once flag too: a non-null proc_ means the
+	// worker exists and at least bind has been attempted.
 	std::unique_ptr<SubProcess> proc_;
 
-	// State tracking
-	bool bind_done_ = false;
+	// Streaming-state flags. Bind is just an RPC; no state is tracked for
+	// it on the connection.
 	bool init_done_ = false;
 	bool data_finished_ = false;
-
-	// Cached bind results (vgi_rpc BindResult)
-	BindResult bind_result_;
 
 	// Execution ID from GlobalInitResponse
 	std::vector<uint8_t> execution_id_;

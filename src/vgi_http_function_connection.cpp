@@ -242,9 +242,11 @@ void HttpFunctionConnection::BufferDataBatches(const std::string &response_body,
 // ============================================================================
 
 void HttpFunctionConnection::SetInputSchema(const std::shared_ptr<arrow::Schema> &input_schema) {
-	if (bind_done_) {
-		throw IOException("HttpFunctionConnection::SetInputSchema called after bind [url: %s]", base_url_);
-	}
+	// HTTP has no "worker spawned" lifecycle marker (every RPC is its own
+	// POST), so we don't gate this. The schema is captured into the bind
+	// RPC payload at the time PerformBindRpc runs; calling SetInputSchema
+	// after that would silently desync caller and server, but it's a
+	// programmer error, not protected against here.
 	input_schema_ = input_schema;
 }
 
@@ -256,11 +258,7 @@ void HttpFunctionConnection::UpdateInputSchemaForExecution(const std::shared_ptr
 	input_schema_ = input_schema;
 }
 
-BindResult HttpFunctionConnection::PerformBindFull() {
-	if (bind_done_) {
-		return bind_result_;
-	}
-
+BindResult HttpFunctionConnection::PerformBindRpc() {
 	{
 		auto fields = BuildConnLogFields(*this);
 		fields.emplace_back("url", base_url_);
@@ -292,35 +290,32 @@ BindResult HttpFunctionConnection::PerformBindFull() {
 		return DeserializeFromIpcBytes(reinterpret_cast<const uint8_t *>(v.data()), v.size());
 	};
 
-	bind_result_ = PerformBindProtocol(context_, function_name_, function_type_,
-	                                    arguments_array_, input_schema_, attach_id_,
-	                                    transaction_id_, settings_, required_secrets_,
-	                                    base_url_, transport_fn);
-	bind_done_ = true;
+	auto bind_result = PerformBindProtocol(context_, function_name_, function_type_,
+	                                        arguments_array_, input_schema_, attach_id_,
+	                                        transaction_id_, settings_, required_secrets_,
+	                                        base_url_, transport_fn);
 
 	{
 		auto fields = BuildConnLogFields(*this);
 		fields.emplace_back("function_name", function_name_);
-		fields.emplace_back("num_output_columns", std::to_string(bind_result_.output_schema->num_fields()));
+		fields.emplace_back("num_output_columns", std::to_string(bind_result.output_schema->num_fields()));
 		VGI_LOG(context_, "http_function_connection.bind_result", fields);
 	}
 
-	return bind_result_;
+	return bind_result;
 }
 
 // ============================================================================
 // Phase 2: Init
 // ============================================================================
 
-InitResult HttpFunctionConnection::PerformInit(const std::vector<int32_t> &projection_ids,
+InitResult HttpFunctionConnection::PerformInit(const BindResult &bind_result,
+                                                const std::vector<int32_t> &projection_ids,
                                                 std::shared_ptr<arrow::Buffer> pushdown_filters,
                                                 std::vector<std::shared_ptr<arrow::Buffer>> join_keys,
                                                 const std::string &phase,
                                                 const std::optional<OrderByHint> &order_by,
                                                 const std::optional<TableSampleHint> &table_sample) {
-	if (!bind_done_) {
-		throw IOException("HttpFunctionConnection::PerformInit called before PerformBind [url: %s]", base_url_);
-	}
 	if (init_done_) {
 		throw IOException("HttpFunctionConnection::PerformInit called twice [url: %s]", base_url_);
 	}
@@ -354,9 +349,9 @@ InitResult HttpFunctionConnection::PerformInit(const std::vector<int32_t> &proje
 
 	// Build InitRequest — pass arrow::Buffer directly to avoid copying
 	auto init_request = BuildInitRequest(
-	    bind_result_.bind_request_bytes,
-	    bind_result_.output_schema_bytes,
-	    bind_result_.opaque_data,
+	    bind_result.bind_request_bytes,
+	    bind_result.output_schema_bytes,
+	    bind_result.opaque_data,
 	    projection_ids_64,
 	    pushdown_filters,
 	    join_keys,
@@ -408,6 +403,9 @@ InitResult HttpFunctionConnection::PerformInit(const std::vector<int32_t> &proje
 	auto init_response = ParseGlobalInitResponse(header_result.header.header_batch, base_url_);
 	execution_id_ = init_response.execution_id;
 
+	// Capture the output schema for empty-response fallback in ReadDataBatch.
+	cached_output_schema_ = bind_result.output_schema;
+
 	// Determine mode based on input_schema presence
 	if (!input_schema_) {
 		is_producer_mode_ = true;
@@ -433,7 +431,7 @@ InitResult HttpFunctionConnection::PerformInit(const std::vector<int32_t> &proje
 	return InitResult {init_response.execution_id, init_response.max_workers, init_response.opaque_data};
 }
 
-void HttpFunctionConnection::PerformFinalizeInit() {
+void HttpFunctionConnection::PerformFinalizeInit(const BindResult &bind_result) {
 	if (!init_done_) {
 		throw IOException("HttpFunctionConnection::PerformFinalizeInit called before PerformInit [url: %s]", base_url_);
 	}
@@ -471,7 +469,7 @@ void HttpFunctionConnection::PerformFinalizeInit() {
 		}
 	} guard{input_schema_, global_execution_id_, std::move(saved_input_schema), std::move(saved_global_exec_id)};
 
-	PerformInit({}, nullptr, {}, "FINALIZE");
+	PerformInit(bind_result, {}, nullptr, {}, "FINALIZE");
 }
 
 // ============================================================================
@@ -623,7 +621,7 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 	if (!reader_result.ok()) {
 		// Empty response in exchange mode means no output for this input
 		return arrow::RecordBatch::Make(
-		    bind_result_.output_schema, 0, std::vector<std::shared_ptr<arrow::Array>>{});
+		    cached_output_schema_, 0, std::vector<std::shared_ptr<arrow::Array>>{});
 	}
 	auto reader = reader_result.ValueUnsafe();
 

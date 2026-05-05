@@ -168,7 +168,7 @@ unique_ptr<FunctionData> VgiTableInOutBind(ClientContext &context, TableFunction
 	connection->SetInputSchema(bind_data->input_schema);
 
 	// Perform bind
-	auto bind_result = connection->PerformBindFull();
+	auto bind_result = connection->PerformBindRpc();
 
 	// Store output schema (max_processes and cardinality_estimate set from init result later)
 	bind_data->output_schema = bind_result.output_schema;
@@ -235,9 +235,10 @@ unique_ptr<GlobalTableFunctionState> VgiTableInOutInitGlobal(ClientContext &cont
 	acquire_params.input_schema = bind_data.input_schema;
 	auto acquire_result = AcquireAndBindConnection(context, acquire_params);
 	auto connection = std::move(acquire_result.connection);
+	global_state->bind_result = std::move(acquire_result.bind_result);
 
 	// Perform init with phase=INPUT for table-in-out functions
-	auto init_result = connection->PerformInit({}, nullptr, {}, "INPUT");
+	auto init_result = connection->PerformInit(global_state->bind_result, {}, nullptr, {}, "INPUT");
 	global_state->global_execution_id = std::move(init_result.execution_id);
 
 	// Open the input writer for Stream 5
@@ -424,7 +425,7 @@ OperatorFinalizeResultType VgiTableInOutFinalize(ExecutionContext &context, Tabl
 	// This closes current data streams and opens new init with phase=FINALIZE
 	// The worker enters producer mode (tick-based) to emit any finalize output
 	if (global_state.connection->IsTableInOut() && !global_state.connection->IsFinished() && !global_state.finalize_sent) {
-		global_state.connection->PerformFinalizeInit();
+		global_state.connection->PerformFinalizeInit(global_state.bind_result);
 		global_state.finalize_sent = true;
 
 		VGI_LOG(client_context, "table_in_out.finalize",

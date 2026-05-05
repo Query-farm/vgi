@@ -973,6 +973,7 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 	acquire_params.function_type = "TABLE";
 	auto acquire_result = AcquireAndBindConnection(context, acquire_params);
 	auto connection = std::move(acquire_result.connection);
+	auto bind_result = std::move(acquire_result.bind_result);
 
 	// Serialize the filters (returns empty if no filters or if serialization fails)
 	SerializedFilters serialized_filters;
@@ -1095,8 +1096,8 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 	}
 
 	// Perform init phase via vgi_rpc with projection, filter, join key, order, and sample pushdown
-	auto init_result = connection->PerformInit(projection_ids, filter_bytes, join_keys_buffers, "",
-	                                           bind_data.order_by_hint, bind_data.table_sample_hint);
+	auto init_result = connection->PerformInit(bind_result, projection_ids, filter_bytes, join_keys_buffers,
+	                                           "", bind_data.order_by_hint, bind_data.table_sample_hint);
 
 	auto global_state = make_uniq<VgiTableFunctionGlobalState>();
 	global_state->global_execution_id = std::move(init_result.execution_id);
@@ -1218,6 +1219,7 @@ unique_ptr<LocalTableFunctionState> VgiTableFunctionInitLocal(ExecutionContext &
 		params.function_type = "TABLE";
 
 		auto result = AcquireAndBindConnection(context.client, params);
+		auto secondary_bind_result = std::move(result.bind_result);
 		local_state->prefetch_slot_->connection = std::move(result.connection);
 
 		// Secondary workers must receive the same projection / filter / hint
@@ -1230,11 +1232,12 @@ unique_ptr<LocalTableFunctionState> VgiTableFunctionInitLocal(ExecutionContext &
 		if (bind_data.projection_pushdown) {
 			local_state->connection()->SetTickFilterState(global_state.tick_filter_state);
 			local_state->connection()->PerformInit(
+			    secondary_bind_result,
 			    global_state.projection_ids, global_state.static_filter_bytes,
 			    global_state.join_keys_buffers, "", global_state.order_by_hint,
 			    global_state.table_sample_hint);
 		} else {
-			local_state->connection()->PerformInit();
+			local_state->connection()->PerformInit(secondary_bind_result);
 		}
 
 		{

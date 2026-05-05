@@ -252,7 +252,7 @@ unique_ptr<FunctionData> VgiScalarFunctionBind(ClientContext &context, ScalarFun
 
 		// Set input schema and perform bind to get actual output schema
 		connection->SetInputSchema(input_schema);
-		auto bind_result = connection->PerformBindFull();
+		auto bind_result = connection->PerformBindRpc();
 
 		// Get the output schema from bind result
 		output_schema = bind_result.output_schema;
@@ -418,8 +418,8 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 		// casting the DataChunk (below, in the per-batch path) keeps the
 		// wire in sync with what the worker is expecting.
 		connection->SetInputSchema(local_state.input_schema);
-		connection->PerformBindFull();
-		connection->PerformInit();
+		auto bind_result = connection->PerformBindRpc();
+		connection->PerformInit(bind_result);
 		connection->OpenInputWriter();
 
 		local_state.connection = std::move(connection);

@@ -80,6 +80,12 @@ struct VgiTableInOutGlobalState : public GlobalTableFunctionState {
 	// Primary connection for this execution
 	std::unique_ptr<IFunctionConnection> connection;
 
+	// BindResult from the bind RPC sent at InitGlobal time. Held here so
+	// that the later PerformInit (INPUT phase, called below at InitGlobal)
+	// and PerformFinalizeInit (called from VgiTableInOutFunction at the
+	// end of the input stream) can both reference the same bind.
+	BindResult bind_result;
+
 	// Global execution ID for multi-worker coordination
 	std::vector<uint8_t> global_execution_id;
 

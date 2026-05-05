@@ -32,6 +32,9 @@ struct VgiWriteGlobalState : public GlobalSinkState {
 	}
 
 	std::unique_ptr<vgi::IFunctionConnection> connection;
+	// BindResult from the bind RPC sent at GetWriteConnection time. Held so
+	// the FINALIZE phase (PerformFinalizeInit) can reference the same bind.
+	vgi::BindResult bind_result;
 	mutex write_lock;
 	bool return_chunk;
 	ColumnDataCollection return_collection; // deep-copies RETURNING rows in Sink

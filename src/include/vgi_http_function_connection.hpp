@@ -47,19 +47,20 @@ public:
 		tick_filter_state_ = std::move(state);
 	}
 
-	// Phase 1: Bind
-	BindResult PerformBindFull() override;
+	// Bind RPC. See IFunctionConnection::PerformBindRpc.
+	BindResult PerformBindRpc() override;
 	void SetInputSchema(const std::shared_ptr<arrow::Schema> &input_schema) override;
 	void UpdateInputSchemaForExecution(const std::shared_ptr<arrow::Schema> &input_schema) override;
 
-	// Phase 2: Init
-	InitResult PerformInit(const std::vector<int32_t> &projection_ids = {},
+	// Init RPC. bind_result must come from a prior PerformBindRpc.
+	InitResult PerformInit(const BindResult &bind_result,
+	                       const std::vector<int32_t> &projection_ids = {},
 	                       std::shared_ptr<arrow::Buffer> pushdown_filters = nullptr,
 	                       std::vector<std::shared_ptr<arrow::Buffer>> join_keys = {},
 	                       const std::string &phase = "",
 	                       const std::optional<OrderByHint> &order_by = std::nullopt,
 	                       const std::optional<TableSampleHint> &table_sample = std::nullopt) override;
-	void PerformFinalizeInit() override;
+	void PerformFinalizeInit(const BindResult &bind_result) override;
 
 	// Phase 3: Data exchange
 	void OpenInputWriter() override;
@@ -107,12 +108,17 @@ private:
 	std::vector<VgiSecretRequirement> required_secrets_;
 	std::shared_ptr<VgiAttachParameters> attach_params_;  // for auth()
 
-	// State tracking
-	bool bind_done_ = false;
+	// State tracking. Bind is just an RPC; nothing tracked on the connection.
 	bool init_done_ = false;
 	bool data_finished_ = false;
-	BindResult bind_result_;
 	std::vector<uint8_t> execution_id_;
+
+	// Output schema captured at PerformInit time (from the BindResult passed
+	// in). Used purely as a fallback during exchange-mode reads when the
+	// server returns no batches: we synthesize a 0-row batch with this
+	// schema rather than nullptr, so downstream callers see an empty result
+	// instead of EOS. Not bind state — just streaming-shape data.
+	std::shared_ptr<arrow::Schema> cached_output_schema_;
 
 	// Input schema for exchange mode
 	std::shared_ptr<arrow::Schema> input_schema_;

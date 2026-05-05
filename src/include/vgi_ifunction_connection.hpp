@@ -50,22 +50,32 @@ public:
 	// The connection reads this before each tick and includes it as custom metadata.
 	virtual void SetTickFilterState(shared_ptr<TickFilterState> state) = 0;
 
-	// Phase 1: Bind
-	virtual BindResult PerformBindFull() = 0;
+	// Send the VGI bind RPC. Spawns the worker subprocess on first call
+	// (subprocess transport only) and runs the bind protocol — including
+	// any secret-scope retry — returning the resulting BindResult by value.
+	// The connection does NOT cache the result; callers thread it into the
+	// matching PerformInit / PerformFinalizeInit call.
+	virtual BindResult PerformBindRpc() = 0;
 	virtual void SetInputSchema(const std::shared_ptr<arrow::Schema> &input_schema) = 0;
 
 	// Update input schema for execute phase (after bind, before OpenInputWriter)
 	// Used when reusing bind connection and actual DataChunk types differ from bind types
 	virtual void UpdateInputSchemaForExecution(const std::shared_ptr<arrow::Schema> &input_schema) = 0;
 
-	// Phase 2: Init
-	virtual InitResult PerformInit(const std::vector<int32_t> &projection_ids = {},
+	// Send the VGI init RPC. The bind_result must come from a prior
+	// PerformBindRpc on this connection — its bind_request_bytes,
+	// output_schema_bytes, and opaque_data are folded into the InitRequest.
+	virtual InitResult PerformInit(const BindResult &bind_result,
+	                               const std::vector<int32_t> &projection_ids = {},
 	                               std::shared_ptr<arrow::Buffer> pushdown_filters = nullptr,
 	                               std::vector<std::shared_ptr<arrow::Buffer>> join_keys = {},
 	                               const std::string &phase = "",
 	                               const std::optional<OrderByHint> &order_by = std::nullopt,
 	                               const std::optional<TableSampleHint> &table_sample = std::nullopt) = 0;
-	virtual void PerformFinalizeInit() = 0;
+	// Re-init the connection in FINALIZE mode (table-in-out). Closes the
+	// current data streams and sends a new init RPC that references the
+	// original bind via bind_result.
+	virtual void PerformFinalizeInit(const BindResult &bind_result) = 0;
 
 	// Phase 3: Data exchange
 	virtual void OpenInputWriter() = 0;
