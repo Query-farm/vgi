@@ -7,6 +7,7 @@
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/enums/access_mode.hpp"
 
+#include "storage/vgi_object_counts.hpp"
 #include "storage/vgi_schema_set.hpp"
 #include "vgi_catalog_api.hpp"
 
@@ -18,7 +19,8 @@ class VgiCatalog : public Catalog {
 public:
 	VgiCatalog(AttachedDatabase &db_p, const std::string &internal_name, AccessMode access_mode,
 	           std::shared_ptr<vgi::VgiAttachParameters> attach_params,
-	           std::shared_ptr<vgi::CatalogAttachResult> attach_result);
+	           std::shared_ptr<vgi::CatalogAttachResult> attach_result,
+	           VgiObjectCounts eager_load_thresholds);
 	~VgiCatalog() override;
 
 public:
@@ -100,6 +102,10 @@ public:
 		return access_mode_;
 	}
 
+	const VgiObjectCounts &EagerLoadThresholds() const {
+		return eager_load_thresholds_;
+	}
+
 private:
 	void DropSchema(ClientContext &context, DropInfo &info) override;
 
@@ -109,6 +115,7 @@ private:
 	std::shared_ptr<vgi::CatalogAttachResult> attach_result_;
 	std::string internal_name_;
 	std::string default_schema_;
+	VgiObjectCounts eager_load_thresholds_;
 	VgiSchemaSet schemas;
 
 	/// Last known catalog version from the worker. Initialized from attach_result.

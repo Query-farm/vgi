@@ -255,6 +255,7 @@ public:
 	operator std::optional<std::vector<int32_t>>() const;
 	operator std::optional<std::vector<std::vector<int32_t>>>() const;
 	operator std::optional<std::map<std::string, std::string>>() const;
+	operator std::optional<std::map<std::string, int64_t>>() const;
 
 	// ========================================================================
 	// value_or() - returns value or default if null/missing
@@ -271,6 +272,7 @@ public:
 	std::vector<int32_t> value_or(std::vector<int32_t> default_val) const;
 	std::vector<std::vector<int32_t>> value_or(std::vector<std::vector<int32_t>> default_val) const;
 	std::map<std::string, std::string> value_or(std::map<std::string, std::string> default_val) const;
+	std::map<std::string, int64_t> value_or(std::map<std::string, int64_t> default_val) const;
 
 	// ========================================================================
 	// value_not_null<T>() - returns value, throws InvalidInputException if null or missing

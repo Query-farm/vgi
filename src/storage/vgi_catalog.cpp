@@ -27,9 +27,11 @@ namespace duckdb {
 
 VgiCatalog::VgiCatalog(AttachedDatabase &db_p, const std::string &internal_name, AccessMode access_mode,
                        std::shared_ptr<vgi::VgiAttachParameters> attach_params,
-                       std::shared_ptr<vgi::CatalogAttachResult> attach_result)
+                       std::shared_ptr<vgi::CatalogAttachResult> attach_result,
+                       VgiObjectCounts eager_load_thresholds)
     : Catalog(db_p), access_mode_(access_mode), attach_parameters_(std::move(attach_params)),
-      attach_result_(std::move(attach_result)), internal_name_(internal_name), schemas(*this) {
+      attach_result_(std::move(attach_result)), internal_name_(internal_name),
+      eager_load_thresholds_(eager_load_thresholds), schemas(*this) {
 	if (attach_result_) {
 		last_known_catalog_version_.store(attach_result_->catalog_version);
 	}

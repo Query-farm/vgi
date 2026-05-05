@@ -229,6 +229,12 @@ struct VgiSchemaInfo {
 	std::string name;
 	std::string comment;
 	std::map<std::string, std::string> tags;
+	// Approximate population per object kind, keyed by VgiCatalogSet::CacheKindName()
+	// ("table", "view", "scalar_function", "aggregate_function", "table_function",
+	// "macro", "index"). Empty when the worker doesn't populate the field; missing
+	// keys mean "no opinion" — the eager-load threshold treats them as 1, biasing
+	// toward bulk LoadEntries() for unspecified populations.
+	std::map<std::string, int64_t> estimated_object_count;
 };
 
 // Result of table_scan_function_get - tells DuckDB which function to call to scan a table

@@ -40,7 +40,7 @@ std::map<std::string, Value> ExtractVgiSettings(ClientContext &context,
 } // anonymous namespace
 
 VgiTableFunctionSet::VgiTableFunctionSet(Catalog &catalog, VgiSchemaEntry &schema)
-    : VgiCatalogSet(catalog), schema_(schema) {
+    : VgiCatalogSet(catalog, &schema), schema_(schema) {
 }
 
 // ============================================================================

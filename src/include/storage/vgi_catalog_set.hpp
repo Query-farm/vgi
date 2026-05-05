@@ -14,11 +14,19 @@ namespace duckdb {
 class Catalog;
 class ClientContext;
 class DatabaseInstance;
+class VgiSchemaEntry;
 
 // Base class for managing a set of catalog entries with lazy loading
 class VgiCatalogSet {
 public:
-	explicit VgiCatalogSet(Catalog &catalog);
+	// `schema` may be nullptr for sets that live directly on the catalog
+	// (e.g. VgiSchemaSet). When non-null, the base class lazily resolves
+	// per-kind eager-load parameters from the schema's
+	// estimated_object_count map and the catalog's eager-load thresholds —
+	// keyed by CacheKindName(). Resolution happens on first cache miss
+	// inside GetEntry(), so the virtual CacheKindName() override is safely
+	// observable (not callable from a constructor).
+	VgiCatalogSet(Catalog &catalog, VgiSchemaEntry *schema);
 	virtual ~VgiCatalogSet() = default;
 
 	// Get an entry by name, loading if necessary
@@ -92,12 +100,32 @@ protected:
 		return entries_;
 	}
 
+	// Eager-load gate. Returns true when GetEntry() should call LoadEntries()
+	// once instead of falling through to a single-entry RPC override:
+	// estimated_count_ <= threshold_ and the set is not yet loaded. Caller
+	// must hold entry_lock_.
+	bool ShouldEagerLoadLocked();
+
+	// Resolve estimated_count_ and threshold_ once from the catalog/schema,
+	// keyed by CacheKindName(). Idempotent. Called from ShouldEagerLoadLocked.
+	void ResolveEagerLoadParamsLocked();
+
 protected:
 	Catalog &catalog_;
+	VgiSchemaEntry *schema_entry_ = nullptr;
 	case_insensitive_map_t<unique_ptr<CatalogEntry>> entries_;
 	bool is_loaded_ = false;
 	std::mutex entry_lock_;
 	std::atomic<uint64_t> generation_{0};
+
+	// Eager-load gate. estimated_count_ is the worker's reported population
+	// for this set's kind (defaulted to 1 when absent). threshold_ is the
+	// catalog-snapshotted cutoff (default 1000). Both are read on the hot
+	// path — no string lookups, no map traversals — but resolved lazily
+	// once via ResolveEagerLoadParamsLocked the first time it matters.
+	int64_t estimated_count_ = 1;
+	int64_t threshold_ = 1000;
+	bool eager_load_resolved_ = false;
 };
 
 } // namespace duckdb

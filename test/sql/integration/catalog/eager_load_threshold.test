@@ -1,0 +1,131 @@
+# name: test/sql/integration/catalog/eager_load_threshold.test
+# description: estimated_object_count + vgi_eager_load_threshold drive whether
+#              the first GetEntry on a schema's table/view set triggers a
+#              single bulk LoadEntries (below threshold) or per-name
+#              single-entry RPCs (above threshold).
+# group: [vgi_integration_catalog]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+# ============================================================================
+# Below-threshold path: the example fixture's ``data`` schema has only a
+# handful of tables; with the default threshold of 1000 they all qualify for
+# eager-load. First GetEntry must record loaded_reason=below_threshold and
+# zero per-name catalog_table_get RPCs should fire.
+# ============================================================================
+
+statement ok
+ATTACH 'example' AS example_below (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# Touch a single table via EXPLAIN — triggers bind (and thus the catalog
+# lookup) without execution.
+statement ok
+EXPLAIN SELECT * FROM example_below.data.ten_thousand_table;
+
+# loaded_reason=below_threshold appears at least once.
+query I
+SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI'
+  AND message LIKE '%catalog.entry_cache%'
+  AND message LIKE '%below_threshold%';
+----
+true
+
+# No per-name catalog_table_get RPCs fired (the bulk path covered everything).
+query I
+SELECT COUNT(*) = 0 FROM duckdb_logs() WHERE type = 'VGI'
+  AND message LIKE '%catalog.rpc%'
+  AND message LIKE '%method=catalog_table_get%';
+----
+true
+
+# ============================================================================
+# Above-threshold path: SET vgi_eager_load_threshold to force the same schema
+# above its threshold — first GetEntry must fall back to single-entry RPC.
+# Re-ATTACH is required because the threshold is snapshotted at attach time.
+# ============================================================================
+
+statement ok
+DETACH example_below;
+
+statement ok
+SET vgi_eager_load_threshold = MAP {'table': 0};
+
+statement ok
+ATTACH 'example' AS example_above (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+EXPLAIN SELECT * FROM example_above.data.ten_thousand_table;
+
+# below_threshold did NOT fire — table threshold of 0 means population (>= 1)
+# is above threshold, so the per-name path runs instead.
+query I
+SELECT COUNT(*) = 0 FROM duckdb_logs() WHERE type = 'VGI'
+  AND message LIKE '%catalog.entry_cache%'
+  AND message LIKE '%below_threshold%';
+----
+true
+
+# A catalog_table_get RPC fired for the per-name fetch.
+query I
+SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI'
+  AND message LIKE '%catalog.rpc%'
+  AND message LIKE '%method=catalog_table_get%';
+----
+true
+
+# ============================================================================
+# Mid-session SET does NOT affect already-attached catalogs (the threshold is
+# snapshotted at ATTACH). Flipping the table threshold back to 1000 mid-flight
+# should leave example_above on the per-name path until re-ATTACH.
+# ============================================================================
+
+statement ok
+SET vgi_eager_load_threshold = MAP {'table': 1000};
+
+statement ok
+CALL vgi_clear_cache();
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+EXPLAIN SELECT * FROM example_above.data.ten_thousand_table;
+
+# Still no below_threshold — the snapshot from ATTACH (threshold=0) governs.
+query I
+SELECT COUNT(*) = 0 FROM duckdb_logs() WHERE type = 'VGI'
+  AND message LIKE '%catalog.entry_cache%'
+  AND message LIKE '%below_threshold%';
+----
+true
+
+# Re-ATTACH picks up the new threshold.
+statement ok
+DETACH example_above;
+
+statement ok
+ATTACH 'example' AS example_reattached (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+EXPLAIN SELECT * FROM example_reattached.data.ten_thousand_table;
+
+query I
+SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI'
+  AND message LIKE '%catalog.entry_cache%'
+  AND message LIKE '%below_threshold%';
+----
+true

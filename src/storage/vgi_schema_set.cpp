@@ -12,7 +12,13 @@
 
 namespace duckdb {
 
-VgiSchemaSet::VgiSchemaSet(Catalog &catalog) : VgiCatalogSet(catalog) {
+// Schemas live directly on the catalog (no parent VgiSchemaEntry), so we pass
+// nullptr for the schema reference. The base class treats that as "no
+// estimated_object_count available" and falls back to the default count of 1.
+// The threshold has no behavioral effect on VgiSchemaSet anyway — schemas
+// have no single-entry override, so first GetEntry always triggers
+// LoadEntries regardless of threshold.
+VgiSchemaSet::VgiSchemaSet(Catalog &catalog) : VgiCatalogSet(catalog, nullptr) {
 }
 
 std::string VgiSchemaSet::GetDefaultSchema(ClientContext &context) {

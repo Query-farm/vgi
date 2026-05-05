@@ -1,11 +1,38 @@
 #include "storage/vgi_catalog_set.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
+#include "storage/vgi_catalog.hpp"
+#include "storage/vgi_object_counts.hpp"
+#include "storage/vgi_schema_entry.hpp"
 #include "vgi_logging.hpp"
 
 namespace duckdb {
 
-VgiCatalogSet::VgiCatalogSet(Catalog &catalog) : catalog_(catalog) {
+VgiCatalogSet::VgiCatalogSet(Catalog &catalog, VgiSchemaEntry *schema) : catalog_(catalog), schema_entry_(schema) {
+}
+
+void VgiCatalogSet::ResolveEagerLoadParamsLocked() {
+	if (eager_load_resolved_) {
+		return;
+	}
+	auto kind = CacheKindName();
+	threshold_ = ObjectCountFor(catalog_.Cast<VgiCatalog>().EagerLoadThresholds(), kind);
+	if (schema_entry_) {
+		estimated_count_ = ObjectCountFor(schema_entry_->GetEstimatedCounts(), kind);
+	}
+	// else: schema_entry_ is null (e.g. VgiSchemaSet) — leave estimated_count_
+	// at its default of 1 so any threshold >= 1 trivially eager-loads. Sets
+	// without a single-entry override would already eager-load on first
+	// GetEntry anyway, so this is just for symmetry.
+	eager_load_resolved_ = true;
+}
+
+bool VgiCatalogSet::ShouldEagerLoadLocked() {
+	if (is_loaded_) {
+		return false;
+	}
+	ResolveEagerLoadParamsLocked();
+	return estimated_count_ <= threshold_;
 }
 
 optional_ptr<CatalogEntry> VgiCatalogSet::GetEntry(ClientContext &context, const std::string &name) {
@@ -22,7 +49,11 @@ optional_ptr<CatalogEntry> VgiCatalogSet::GetEntry(ClientContext &context, const
 		return it->second.get();
 	}
 
-	// Load entries if not yet loaded
+	// Load entries if not yet loaded. Sets without a single-entry override
+	// (this base class) always do a full LoadEntries on first miss, so the
+	// threshold doesn't gate them — but we still record loaded_reason for
+	// log symmetry with the threshold-driven overrides in VgiTableSet /
+	// VgiViewSet.
 	bool triggered_load = false;
 	if (!is_loaded_) {
 		triggered_load = true;
@@ -37,7 +68,8 @@ optional_ptr<CatalogEntry> VgiCatalogSet::GetEntry(ClientContext &context, const
 		        {{"set_kind", CacheKindName()},
 		         {"name", name},
 		         {"outcome", "miss_loaded"},
-		         {"triggered_load", triggered_load ? "true" : "false"}});
+		         {"triggered_load", triggered_load ? "true" : "false"},
+		         {"loaded_reason", "first_miss"}});
 		return it->second.get();
 	}
 

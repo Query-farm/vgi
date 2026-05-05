@@ -799,6 +799,35 @@ ColumnValue::operator std::optional<std::map<std::string, std::string>>() const 
 	return result;
 }
 
+ColumnValue::operator std::optional<std::map<std::string, int64_t>>() const {
+	auto column = batch_ ? batch_->GetColumnByName(column_name_) : nullptr;
+	if (!column) {
+		return std::nullopt;
+	}
+	auto map_array = std::dynamic_pointer_cast<arrow::MapArray>(column);
+	if (!map_array || map_array->IsNull(row_idx_)) {
+		return std::nullopt;
+	}
+
+	int64_t start = map_array->value_offset(row_idx_);
+	int64_t end = map_array->value_offset(row_idx_ + 1);
+
+	auto keys = std::dynamic_pointer_cast<arrow::StringArray>(map_array->keys());
+	auto values = std::dynamic_pointer_cast<arrow::Int64Array>(map_array->items());
+
+	if (!keys || !values) {
+		return std::nullopt;
+	}
+
+	std::map<std::string, int64_t> result;
+	for (int64_t i = start; i < end; i++) {
+		if (!keys->IsNull(i) && !values->IsNull(i)) {
+			result[keys->GetString(i)] = values->Value(i);
+		}
+	}
+	return result;
+}
+
 // ============================================================================
 // ColumnValue value_or() Methods
 // ============================================================================
@@ -854,6 +883,11 @@ std::vector<std::vector<uint8_t>> ColumnValue::value_or(std::vector<std::vector<
 
 std::map<std::string, std::string> ColumnValue::value_or(std::map<std::string, std::string> default_val) const {
 	auto opt = static_cast<std::optional<std::map<std::string, std::string>>>(*this);
+	return opt.value_or(std::move(default_val));
+}
+
+std::map<std::string, int64_t> ColumnValue::value_or(std::map<std::string, int64_t> default_val) const {
+	auto opt = static_cast<std::optional<std::map<std::string, int64_t>>>(*this);
 	return opt.value_or(std::move(default_val));
 }
 

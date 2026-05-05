@@ -24,9 +24,12 @@
 namespace duckdb {
 
 VgiSchemaEntry::VgiSchemaEntry(Catalog &catalog, CreateSchemaInfo &info, const vgi::VgiSchemaInfo &schema_info)
-    : SchemaCatalogEntry(catalog, info), schema_info_(schema_info), tables_(catalog, *this), views_(catalog, *this),
-      scalar_functions_(catalog, *this), aggregate_functions_(catalog, *this),
-      table_functions_(catalog, *this),
+    : SchemaCatalogEntry(catalog, info), schema_info_(schema_info),
+      // Default missing keys to 1: workers that don't populate the field bias toward
+      // eager bulk-load, matching the semantics described on VgiSchemaInfo.
+      estimated_counts_(ObjectCountsFromMap(schema_info.estimated_object_count, /*default_value=*/1)),
+      tables_(catalog, *this), views_(catalog, *this), scalar_functions_(catalog, *this),
+      aggregate_functions_(catalog, *this), table_functions_(catalog, *this),
       scalar_macros_(catalog, *this, CatalogType::MACRO_ENTRY),
       table_macros_(catalog, *this, CatalogType::TABLE_MACRO_ENTRY) {
 }

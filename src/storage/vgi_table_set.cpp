@@ -18,7 +18,7 @@
 
 namespace duckdb {
 
-VgiTableSet::VgiTableSet(Catalog &catalog, VgiSchemaEntry &schema) : VgiCatalogSet(catalog), schema_(schema) {
+VgiTableSet::VgiTableSet(Catalog &catalog, VgiSchemaEntry &schema) : VgiCatalogSet(catalog, &schema), schema_(schema) {
 }
 
 void VgiTableSet::LoadEntries(ClientContext &context) {
@@ -56,6 +56,7 @@ optional_ptr<CatalogEntry> VgiTableSet::GetEntry(ClientContext &context, const s
 	auto rpc_start = std::chrono::steady_clock::now();
 	uint64_t pre_gen;
 	std::string qualifier = schema_.name + "." + name;
+	bool eager_path = false;
 	{
 		std::lock_guard<std::mutex> lock(entry_lock_);
 		auto it = GetEntries().find(name);
@@ -67,7 +68,55 @@ optional_ptr<CatalogEntry> VgiTableSet::GetEntry(ClientContext &context, const s
 			         {"outcome", "hit"}});
 			return it->second.get();
 		}
+		// Eager-load gate: snapshot the generation, then drop the lock to do
+		// the bulk RPC. The post-RPC publish goes through the same generation
+		// re-check as the per-name path below — concurrent DDL still wins.
+		eager_path = ShouldEagerLoadLocked();
 		pre_gen = generation_.load(std::memory_order_acquire);
+	}
+
+	if (eager_path) {
+		// Bulk fetch outside the lock. LoadEntries() is implemented to do
+		// the RPC + CreateEntryLocked() under the assumption it's already
+		// holding entry_lock_; here we re-implement that with explicit
+		// generation-check publish so multi-thread DDL doesn't resurrect
+		// a dropped table.
+		auto &vgi_catalog = catalog_.Cast<VgiCatalog>();
+		auto &attach_params = vgi_catalog.attach_parameters();
+		auto &attach_result = vgi_catalog.attach_result();
+		if (attach_params && attach_result) {
+			auto &vgi_tx = VgiTransaction::Get(context, catalog_);
+			vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_id, vgi_tx.GetTransactionId()};
+			rpc_ctx.entity_kind = "schema";
+			rpc_ctx.entity_qualifier = schema_.name;
+			auto tables = vgi::InvokeCatalogSchemaContentsTables(rpc_ctx, schema_.name, context);
+
+			std::lock_guard<std::mutex> lock(entry_lock_);
+			if (generation_.load(std::memory_order_acquire) == pre_gen && !is_loaded_) {
+				for (auto &table_info : tables) {
+					auto create_info = vgi::CreateTableInfoFromVgiTable(context, table_info, schema_.name);
+					auto table_entry = make_uniq<VgiTableEntry>(catalog_, schema_, create_info, table_info);
+					CreateEntryLocked(std::move(table_entry));
+				}
+				is_loaded_ = true;
+			}
+			auto it = GetEntries().find(name);
+			if (it != GetEntries().end()) {
+				VGI_LOG(context, "catalog.entry_cache",
+				        {{"set_kind", CacheKindName()},
+				         {"name", name},
+				         {"qualifier", qualifier},
+				         {"outcome", "miss_loaded"},
+				         {"triggered_load", "true"},
+				         {"loaded_reason", "below_threshold"}});
+				return it->second.get();
+			}
+			// Bulk listing didn't include this name — fall through to a
+			// per-name single-entry RPC (race window between bulk listing
+			// and our fetch, or a known stale-listing case). Refresh
+			// pre_gen for the publish-side re-check.
+			pre_gen = generation_.load(std::memory_order_acquire);
+		}
 	}
 
 	// Load this specific table from the worker (no lock held — long RPC).

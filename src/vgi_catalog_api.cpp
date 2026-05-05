@@ -1592,6 +1592,8 @@ VgiSchemaInfo ParseSchemaInfo(const std::shared_ptr<arrow::RecordBatch> &batch, 
 	info.name = row["name"].value_not_null<std::string>();
 	info.comment = row["comment"].value_or("");
 	info.tags = row["tags"].value_not_null<std::map<std::string, std::string>>();
+	// nullable map — workers may omit it entirely; downstream defaults missing keys to 1
+	info.estimated_object_count = row["estimated_object_count"].value_or(std::map<std::string, int64_t>{});
 
 	return info;
 }

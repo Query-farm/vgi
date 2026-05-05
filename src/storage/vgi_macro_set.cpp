@@ -23,7 +23,7 @@
 namespace duckdb {
 
 VgiMacroSet::VgiMacroSet(Catalog &catalog, VgiSchemaEntry &schema, CatalogType macro_type)
-    : VgiCatalogSet(catalog), schema_(schema), macro_catalog_type_(macro_type) {
+    : VgiCatalogSet(catalog, &schema), schema_(schema), macro_catalog_type_(macro_type) {
 }
 
 // Helper to extract a DuckDB Value from an Arrow array at a given row index

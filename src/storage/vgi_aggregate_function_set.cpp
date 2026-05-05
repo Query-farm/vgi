@@ -21,7 +21,7 @@
 namespace duckdb {
 
 VgiAggregateFunctionSet::VgiAggregateFunctionSet(Catalog &catalog, VgiSchemaEntry &schema)
-    : VgiCatalogSet(catalog), schema_(schema) {
+    : VgiCatalogSet(catalog, &schema), schema_(schema) {
 }
 
 void VgiAggregateFunctionSet::LoadEntries(ClientContext &context) {

@@ -50,7 +50,7 @@ static unique_ptr<ViewCatalogEntry> CreateViewEntryFromInfo(Catalog &catalog, Sc
 	return make_uniq<ViewCatalogEntry>(catalog, schema, info);
 }
 
-VgiViewSet::VgiViewSet(Catalog &catalog, VgiSchemaEntry &schema) : VgiCatalogSet(catalog), schema_(schema) {
+VgiViewSet::VgiViewSet(Catalog &catalog, VgiSchemaEntry &schema) : VgiCatalogSet(catalog, &schema), schema_(schema) {
 }
 
 optional_ptr<CatalogEntry> VgiViewSet::GetEntry(ClientContext &context, const std::string &name) {
@@ -60,6 +60,31 @@ optional_ptr<CatalogEntry> VgiViewSet::GetEntry(ClientContext &context, const st
 	auto it = GetEntries().find(name);
 	if (it != GetEntries().end()) {
 		return it->second.get();
+	}
+
+	// Eager-load gate: when the worker reports a small enough population for
+	// this kind, do a single bulk LoadEntries instead of N single-view RPCs.
+	// View loading holds the lock across the RPC anyway (see existing pattern
+	// below), so we just call LoadEntries directly under the same lock — this
+	// is intentional and not a candidate for "harmonising" with the
+	// VgiTableSet lock-drop pattern: views don't need per-name parallelism
+	// because the bulk path is the cheap one when this branch fires.
+	if (ShouldEagerLoadLocked()) {
+		LoadEntries(context);
+		is_loaded_ = true;
+		auto found = GetEntries().find(name);
+		if (found != GetEntries().end()) {
+			VGI_LOG(context, "catalog.entry_cache",
+			        {{"set_kind", CacheKindName()},
+			         {"name", name},
+			         {"outcome", "miss_loaded"},
+			         {"triggered_load", "true"},
+			         {"loaded_reason", "below_threshold"}});
+			return found->second.get();
+		}
+		// Worker omitted this view from the bulk listing — fall through to
+		// single-entry RPC (it might have appeared between the bulk fetch
+		// and this lookup, or it's a known stale-listing case).
 	}
 
 	// Load this specific view from the worker

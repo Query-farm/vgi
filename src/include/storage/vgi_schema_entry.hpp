@@ -3,6 +3,7 @@
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "storage/vgi_aggregate_function_set.hpp"
 #include "storage/vgi_macro_set.hpp"
+#include "storage/vgi_object_counts.hpp"
 #include "storage/vgi_scalar_function_set.hpp"
 #include "storage/vgi_table_function_set.hpp"
 #include "storage/vgi_table_set.hpp"
@@ -45,10 +46,20 @@ public:
 		return schema_info_;
 	}
 
+	// Estimated per-kind populations from the worker. Built once at
+	// construction from ``schema_info_.estimated_object_count`` (a
+	// map<string,int64>). Read by VgiCatalogSet::ResolveEagerLoadParamsLocked
+	// to pick the eager-vs-lazy load policy for each child set without
+	// re-walking the wire-format map.
+	const VgiObjectCounts &GetEstimatedCounts() const {
+		return estimated_counts_;
+	}
+
 private:
 	VgiCatalogSet &GetCatalogSet(CatalogType type);
 
 	vgi::VgiSchemaInfo schema_info_;
+	VgiObjectCounts estimated_counts_;
 	VgiTableSet tables_;
 	VgiViewSet views_;
 	VgiScalarFunctionSet scalar_functions_;

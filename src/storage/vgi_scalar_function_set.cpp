@@ -20,7 +20,7 @@
 namespace duckdb {
 
 VgiScalarFunctionSet::VgiScalarFunctionSet(Catalog &catalog, VgiSchemaEntry &schema)
-    : VgiCatalogSet(catalog), schema_(schema) {
+    : VgiCatalogSet(catalog, &schema), schema_(schema) {
 }
 
 void VgiScalarFunctionSet::LoadEntries(ClientContext &context) {

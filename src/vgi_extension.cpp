@@ -630,7 +630,28 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 
 	auto attach_result_ptr = std::make_shared<vgi::CatalogAttachResult>(std::move(attach_result));
 
-	return make_uniq<VgiCatalog>(db, name, options.access_mode, std::move(attach_params), std::move(attach_result_ptr));
+	// Snapshot eager-load thresholds at attach time. The runtime form is a
+	// fixed struct of int64s; we never re-parse the map on the hot path.
+	VgiObjectCounts eager_thresholds;
+	{
+		Value threshold_val;
+		std::map<std::string, int64_t> threshold_map;
+		if (context.TryGetCurrentSetting("vgi_eager_load_threshold", threshold_val) && !threshold_val.IsNull()) {
+			auto &child_values = MapValue::GetChildren(threshold_val);
+			for (auto &kv : child_values) {
+				auto &kv_struct = StructValue::GetChildren(kv);
+				if (kv_struct.size() != 2 || kv_struct[0].IsNull() || kv_struct[1].IsNull()) {
+					continue;
+				}
+				threshold_map[kv_struct[0].GetValue<std::string>()] = kv_struct[1].GetValue<int64_t>();
+			}
+		}
+		// Default for missing keys is 1000 (per setting docs); ObjectCountsFromMap fills in.
+		eager_thresholds = ObjectCountsFromMap(threshold_map, 1000);
+	}
+
+	return make_uniq<VgiCatalog>(db, name, options.access_mode, std::move(attach_params),
+	                              std::move(attach_result_ptr), eager_thresholds);
 }
 
 // Create transaction manager for VGI catalog
@@ -1095,6 +1116,31 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          Value::BIGINT(5));
 	config.AddExtensionOption("vgi_worker_pool_max", "Default per-path pool limit for VGI workers (0 = disabled)",
 	                          LogicalType::BIGINT, Value::BIGINT(256));
+
+	// Eager-load thresholds. Per-kind: a schema's estimated_object_count[kind]
+	// is compared against the corresponding value here; below or equal triggers
+	// a single bulk LoadEntries() instead of per-name single-entry RPCs. Read
+	// once at ATTACH time and snapshotted onto the VgiCatalog — mid-session SET
+	// changes do NOT affect already-attached catalogs.
+	{
+		vector<Value> threshold_keys;
+		vector<Value> threshold_values;
+		for (const char *kind : {"table", "view", "index", "scalar_function", "aggregate_function",
+		                         "table_function", "macro"}) {
+			threshold_keys.emplace_back(kind);
+			threshold_values.emplace_back(Value::BIGINT(1000));
+		}
+		auto default_threshold = Value::MAP(LogicalType::VARCHAR, LogicalType::BIGINT,
+		                                    std::move(threshold_keys), std::move(threshold_values));
+		config.AddExtensionOption(
+		    "vgi_eager_load_threshold",
+		    "Per-object-kind threshold (keyed by VgiCatalogSet::CacheKindName: table, view, index, "
+		    "scalar_function, aggregate_function, table_function, macro). When a schema's "
+		    "estimated_object_count[kind] is <= the threshold, the first GetEntry() triggers a single "
+		    "bulk LoadEntries() instead of N per-name RPCs. Read at ATTACH; mid-session SET requires "
+		    "re-ATTACH to take effect.",
+		    LogicalType::MAP(LogicalType::VARCHAR, LogicalType::BIGINT), std::move(default_threshold));
+	}
 
 	// Set default pool settings for paths without explicit per-path config
 	// (e.g., direct vgi_table_function() calls that don't go through ATTACH)
