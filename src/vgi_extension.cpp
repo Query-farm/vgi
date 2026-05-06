@@ -1142,6 +1142,20 @@ static void LoadInternal(ExtensionLoader &loader) {
 		    LogicalType::MAP(LogicalType::VARCHAR, LogicalType::BIGINT), std::move(default_threshold));
 	}
 
+	// When a worker reports estimated_object_count[kind] == 0, the client
+	// treats it as a hard guarantee and skips both the bulk
+	// catalog_schema_contents_* RPC and the per-name single-entry RPCs for
+	// that kind (table/view/index). Set this to false to disable the bypass —
+	// every elided RPC will fire instead. Used by support engineers to rule
+	// the bypass in/out without restarting the worker; read per-call so it
+	// takes effect immediately (no re-attach needed).
+	config.AddExtensionOption(
+	    "vgi_trust_empty_kinds",
+	    "Trust worker assertions that estimated_object_count[kind] == 0 means the kind is empty "
+	    "(skip catalog_schema_contents_* RPC). Set to false to force every RPC to fire even when "
+	    "the worker reports zero — debug escape hatch for diagnosing worker bugs.",
+	    LogicalType::BOOLEAN, Value::BOOLEAN(true));
+
 	// Set default pool settings for paths without explicit per-path config
 	// (e.g., direct vgi_table_function() calls that don't go through ATTACH)
 	vgi::VgiWorkerPool::Instance().SetDefaultSettings({256, 5});

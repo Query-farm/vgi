@@ -1,0 +1,152 @@
+# name: test/sql/integration/catalog/zero_count_bypass.test
+# description: When a worker reports estimated_object_count[kind] == 0, the
+#              client treats it as a hard guarantee and skips both the bulk
+#              catalog_schema_contents_* RPC and per-name single-entry RPCs
+#              for that kind. vgi_trust_empty_kinds = false disables the
+#              bypass for diagnostics. Bypass survives vgi_clear_cache().
+# group: [vgi_integration_catalog]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+# ============================================================================
+# Empty-kind GetEntry bypass: ``data`` schema in the example catalog declares
+# no macros (Schema.to_schema_info auto-populates macro=0). Touching any
+# function name in the schema falls through SCALAR → AGGREGATE → MACRO; the
+# macro lookup must short-circuit with outcome=kind_empty and zero
+# catalog_schema_contents_macros RPCs.
+# ============================================================================
+
+statement ok
+ATTACH 'example' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# Touching a table forces function-name resolution at bind time (the table
+# function on the back side falls through to macro lookup), exercising the
+# macro-set bypass.
+statement ok
+EXPLAIN SELECT * FROM ex.data.ten_thousand_table;
+
+# kind_empty fired for the macro lookup.
+query I
+SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI'
+  AND message LIKE '%catalog.entry_cache%'
+  AND message LIKE '%set_kind=macro%'
+  AND message LIKE '%kind_empty%';
+----
+true
+
+# Zero catalog_schema_contents_macros RPCs against the data schema.
+query I
+SELECT COUNT(*) FROM duckdb_logs() WHERE type = 'VGI'
+  AND message LIKE '%catalog.rpc%'
+  AND message LIKE '%method=catalog_schema_contents_macros%'
+  AND message LIKE '%entity_qualifier=data%';
+----
+0
+
+# ============================================================================
+# Non-empty kind unchanged: tables exist in data schema (count > 0).
+# ============================================================================
+
+query I
+SELECT COUNT(*) = 0 FROM duckdb_logs() WHERE type = 'VGI'
+  AND message LIKE '%catalog.entry_cache%'
+  AND message LIKE '%set_kind=table%'
+  AND message LIKE '%kind_empty%';
+----
+true
+
+# ============================================================================
+# Trust setting toggle: SET vgi_trust_empty_kinds = false forces every RPC
+# to fire even when the worker reports 0. Per-call read — applies to the
+# already-attached catalog without re-attach.
+# ============================================================================
+
+statement ok
+SET vgi_trust_empty_kinds = false;
+
+statement ok
+CALL vgi_clear_cache();
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+EXPLAIN SELECT * FROM ex.data.ten_thousand_table;
+
+# With trust=false, no kind_empty for the macro lookup (the bulk RPC fired).
+query I
+SELECT COUNT(*) = 0 FROM duckdb_logs() WHERE type = 'VGI'
+  AND message LIKE '%catalog.entry_cache%'
+  AND message LIKE '%set_kind=macro%'
+  AND message LIKE '%kind_empty%';
+----
+true
+
+# The macro bulk RPC fired exactly because the bypass was disabled.
+query I
+SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI'
+  AND message LIKE '%catalog.rpc%'
+  AND message LIKE '%method=catalog_schema_contents_macros%'
+  AND message LIKE '%entity_qualifier=data%';
+----
+true
+
+# Restore trust; bypass returns immediately (no re-attach needed).
+statement ok
+SET vgi_trust_empty_kinds = true;
+
+statement ok
+CALL vgi_clear_cache();
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+EXPLAIN SELECT * FROM ex.data.ten_thousand_table;
+
+query I
+SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI'
+  AND message LIKE '%catalog.entry_cache%'
+  AND message LIKE '%set_kind=macro%'
+  AND message LIKE '%kind_empty%';
+----
+true
+
+# ============================================================================
+# vgi_clear_cache() round-trip: schema entry survives the clear (its
+# estimated_object_count comes from immutable schema_info_), so the second
+# touch after clearing also hits kind_empty without an RPC.
+# ============================================================================
+
+statement ok
+CALL vgi_clear_cache();
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+EXPLAIN SELECT * FROM ex.data.ten_thousand_table;
+
+query I
+SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI'
+  AND message LIKE '%catalog.entry_cache%'
+  AND message LIKE '%set_kind=macro%'
+  AND message LIKE '%kind_empty%';
+----
+true
+
+query I
+SELECT COUNT(*) FROM duckdb_logs() WHERE type = 'VGI'
+  AND message LIKE '%catalog.rpc%'
+  AND message LIKE '%method=catalog_schema_contents_macros%'
+  AND message LIKE '%entity_qualifier=data%';
+----
+0

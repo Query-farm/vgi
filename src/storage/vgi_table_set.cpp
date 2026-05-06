@@ -68,6 +68,19 @@ optional_ptr<CatalogEntry> VgiTableSet::GetEntry(ClientContext &context, const s
 			         {"outcome", "hit"}});
 			return it->second.get();
 		}
+		// Zero-count RPC bypass: skip both the bulk and the per-name RPC
+		// when the worker asserts estimated_object_count[table] == 0.
+		// Defended by vgi_trust_empty_kinds.
+		if (ShouldBypassRpcLocked(context)) {
+			is_loaded_ = true;
+			VGI_LOG(context, "catalog.entry_cache",
+			        {{"set_kind", CacheKindName()},
+			         {"name", name},
+			         {"qualifier", qualifier},
+			         {"outcome", "kind_empty"},
+			         {"triggered_load", "false"}});
+			return nullptr;
+		}
 		// Eager-load gate: snapshot the generation, then drop the lock to do
 		// the bulk RPC. The post-RPC publish goes through the same generation
 		// re-check as the per-name path below — concurrent DDL still wins.

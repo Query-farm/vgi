@@ -154,6 +154,11 @@ optional_ptr<CatalogEntry> VgiSchemaEntry::CreateTable(CatalogTransaction transa
 
 	// Invalidate table cache and re-fetch the newly created table
 	DeferDrop(catalog, tables_.HarvestEntries());
+	// Worker may have reported estimated_object_count[table] == 0 at attach
+	// time; CREATE TABLE just falsified that. Flip the cached count so the
+	// zero-count RPC bypass on the next GetEntry doesn't short-circuit and
+	// silently report "table not found" for the row we just created.
+	tables_.MarkPopulatedLocked();
 	// REPLACE may have changed the table schema, invalidating dependent views
 	if (create_info.on_conflict == OnCreateConflict::REPLACE_ON_CONFLICT) {
 		DeferDrop(catalog, views_.HarvestEntries());
@@ -197,6 +202,9 @@ optional_ptr<CatalogEntry> VgiSchemaEntry::CreateView(CatalogTransaction transac
 
 	// Invalidate view cache
 	DeferDrop(catalog, views_.HarvestEntries());
+	// Same DDL safety net as CreateTable: clear any cached zero-count
+	// emptiness so the next view lookup doesn't get short-circuited.
+	views_.MarkPopulatedLocked();
 	return nullptr;
 }
 

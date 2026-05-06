@@ -35,6 +35,36 @@ bool VgiCatalogSet::ShouldEagerLoadLocked() {
 	return estimated_count_ <= threshold_;
 }
 
+bool VgiCatalogSet::ShouldBypassRpcLocked(ClientContext &context) {
+	if (is_loaded_) {
+		return false;
+	}
+	ResolveEagerLoadParamsLocked();
+	if (estimated_count_ != 0) {
+		return false;
+	}
+	// Trust setting is read per-call so toggling vgi_trust_empty_kinds takes
+	// effect immediately without re-attaching catalogs.
+	Value trust_val;
+	if (context.TryGetCurrentSetting("vgi_trust_empty_kinds", trust_val) && !trust_val.IsNull()) {
+		if (!trust_val.GetValue<bool>()) {
+			return false;
+		}
+	}
+	return true;
+}
+
+void VgiCatalogSet::MarkPopulatedLocked() {
+	std::lock_guard<std::mutex> lock(entry_lock_);
+	// Clobber the count to a non-zero value so ShouldBypassRpcLocked stops
+	// firing. We do NOT reset eager_load_resolved_: re-resolution would
+	// re-read GetEstimatedCounts() from the immutable schema_info_ and
+	// re-set estimated_count_=0, undoing the flip. The asymmetry is
+	// deliberate.
+	estimated_count_ = 1;
+	eager_load_resolved_ = true;
+}
+
 optional_ptr<CatalogEntry> VgiCatalogSet::GetEntry(ClientContext &context, const std::string &name) {
 	std::lock_guard<std::mutex> lock(entry_lock_);
 
@@ -47,6 +77,20 @@ optional_ptr<CatalogEntry> VgiCatalogSet::GetEntry(ClientContext &context, const
 		         {"outcome", "hit"},
 		         {"triggered_load", "false"}});
 		return it->second.get();
+	}
+
+	// Zero-count RPC bypass: worker asserted this kind is empty
+	// (estimated_object_count == 0). Skip LoadEntries entirely, mark loaded,
+	// and surface "not found" without any RPC. Defended by
+	// vgi_trust_empty_kinds (default true).
+	if (ShouldBypassRpcLocked(context)) {
+		is_loaded_ = true;
+		VGI_LOG(context, "catalog.entry_cache",
+		        {{"set_kind", CacheKindName()},
+		         {"name", name},
+		         {"outcome", "kind_empty"},
+		         {"triggered_load", "false"}});
+		return nullptr;
 	}
 
 	// Load entries if not yet loaded. Sets without a single-entry override
@@ -107,6 +151,19 @@ void VgiCatalogSet::DropEntry(const std::string &name) {
 
 void VgiCatalogSet::Scan(ClientContext &context, const std::function<void(CatalogEntry &)> &callback) {
 	std::lock_guard<std::mutex> lock(entry_lock_);
+
+	// Zero-count RPC bypass: skip LoadEntries entirely when the worker has
+	// asserted this kind is empty. Scan completes with zero callbacks —
+	// correct: there's nothing to iterate.
+	if (ShouldBypassRpcLocked(context)) {
+		is_loaded_ = true;
+		VGI_LOG(context, "catalog.entry_cache",
+		        {{"set_kind", CacheKindName()},
+		         {"name", "*scan*"},
+		         {"outcome", "kind_empty"},
+		         {"triggered_load", "false"}});
+		return;
+	}
 
 	// Load entries if not yet loaded
 	if (!is_loaded_) {

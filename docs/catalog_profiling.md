@@ -51,6 +51,7 @@ Emitted by the catalog set's `GetEntry` paths — both the base `VgiCatalogSet::
 - **`at_clause_rpc`** — `AT (...)` time-travel lookup; never consults the cache because cached entries aren't versioned. The result is stored on `VgiTransaction::point_in_time_entries` for the query's lifetime, not the shared set.
 - **`at_clause_not_found`** — same path, no result.
 - **`not_attached`** — catalog is in a transient unattached state (no `attach_params` / `attach_result`); no RPC issued.
+- **`kind_empty`** — worker asserted `estimated_object_count[kind] == 0` and the `vgi_trust_empty_kinds` setting is true (default), so the bulk + per-name RPCs were skipped entirely. Returns "not found" without a round trip. Disable the bypass for diagnostics with `SET vgi_trust_empty_kinds = false`.
 
 ### `catalog.stats_cache`
 

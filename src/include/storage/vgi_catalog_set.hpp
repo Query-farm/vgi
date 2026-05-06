@@ -73,6 +73,12 @@ public:
 		return catalog_;
 	}
 
+	// Defensive flip after local DDL that adds an entry of this kind. Clears
+	// the cached zero-count emptiness signal so the next GetEntry() does not
+	// short-circuit. Public because it's called from VgiSchemaEntry's DDL
+	// paths. See implementation comment for the asymmetric-flip rationale.
+	void MarkPopulatedLocked();
+
 protected:
 	// Override to load entries from the remote source
 	virtual void LoadEntries(ClientContext &context) = 0;
@@ -105,6 +111,14 @@ protected:
 	// estimated_count_ <= threshold_ and the set is not yet loaded. Caller
 	// must hold entry_lock_.
 	bool ShouldEagerLoadLocked();
+
+	// Zero-count RPC bypass. Returns true when the bulk + per-name RPCs for
+	// this kind should be skipped entirely because the worker has asserted
+	// estimated_object_count[kind] == 0 AND the user trusts the assertion
+	// (vgi_trust_empty_kinds setting, default true). Caller must hold
+	// entry_lock_. Reads the trust setting per call so SET takes effect
+	// immediately. Triggers ResolveEagerLoadParamsLocked exactly once.
+	bool ShouldBypassRpcLocked(ClientContext &context);
 
 	// Resolve estimated_count_ and threshold_ once from the catalog/schema,
 	// keyed by CacheKindName(). Idempotent. Called from ShouldEagerLoadLocked.

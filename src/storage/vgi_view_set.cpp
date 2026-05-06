@@ -62,6 +62,19 @@ optional_ptr<CatalogEntry> VgiViewSet::GetEntry(ClientContext &context, const st
 		return it->second.get();
 	}
 
+	// Zero-count RPC bypass: skip both bulk and per-name RPCs when the
+	// worker asserts estimated_object_count[view] == 0. Defended by
+	// vgi_trust_empty_kinds.
+	if (ShouldBypassRpcLocked(context)) {
+		is_loaded_ = true;
+		VGI_LOG(context, "catalog.entry_cache",
+		        {{"set_kind", CacheKindName()},
+		         {"name", name},
+		         {"outcome", "kind_empty"},
+		         {"triggered_load", "false"}});
+		return nullptr;
+	}
+
 	// Eager-load gate: when the worker reports a small enough population for
 	// this kind, do a single bulk LoadEntries instead of N single-view RPCs.
 	// View loading holds the lock across the RPC anyway (see existing pattern

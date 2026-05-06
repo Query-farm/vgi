@@ -126,6 +126,7 @@ Every catalog RPC method (`catalog_*`) and the local entry / statistics caches a
 - "How many `catalog_table_get` calls did a single `SELECT` issue, and how many were cache hits?"
 - "What's p50 / p99 of `catalog_table_column_statistics_get` per worker?"
 - "Did `vgi_clear_cache()` help — how cold are catalog reads after a clear?"
+- "Did `estimated_object_count[kind] = 0` skip the `catalog_schema_contents_*` RPC for that kind?" (Look for `outcome=kind_empty`; the `vgi_trust_empty_kinds` setting disables the bypass for debugging.)
 
 The instrumentation reuses `VGI_LOG` (so events flow through DuckDB's log manager and stderr) and `ScopedTimer` (so `VGI_PROFILE=1` produces an exit summary). No new env vars.
 
@@ -134,7 +135,7 @@ The instrumentation reuses `VGI_LOG` (so events flow through DuckDB's log manage
 | Event | Fields | Emitted from |
 |-------|--------|--------------|
 | `catalog.rpc` | `method`, `worker_path`, `attach_id`, `transaction_id`, `entity_kind`, `entity_qualifier`, `duration_ms`, `outcome` (`ok`/`error`), `error_kind`, `error_message` | `vgi_catalog_api.cpp` chokepoint — wraps every `InvokeCatalog*` |
-| `catalog.entry_cache` | `set_kind`, `name`, `qualifier`, `outcome` (`hit` / `miss_loaded` / `miss_not_found` / `rpc_fetched` / `concurrent_published` / `generation_raced` / `not_found` / `at_clause_rpc` / `at_clause_not_found` / `not_attached`), `triggered_load`, `duration_ms`, `at_unit`, `at_value` | `vgi_catalog_set.cpp` (base) and `vgi_table_set.cpp` (table-specific override) |
+| `catalog.entry_cache` | `set_kind`, `name`, `qualifier`, `outcome` (`hit` / `miss_loaded` / `miss_not_found` / `rpc_fetched` / `concurrent_published` / `generation_raced` / `not_found` / `at_clause_rpc` / `at_clause_not_found` / `not_attached` / `kind_empty`), `triggered_load`, `duration_ms`, `at_unit`, `at_value`, `loaded_reason` | `vgi_catalog_set.cpp` (base) and `vgi_table_set.cpp` (table-specific override) |
 | `catalog.stats_cache` | `qualifier`, `column`, `outcome` (`fresh_hit` / `concurrent_wait` / `fetched`), `wait_ms`, `fetch_ms` | `vgi_table_entry.cpp` `GetStatistics` |
 | `catalog.cache_clear`, `catalog.cache_clear_summary` | `catalog`, `trigger`; `catalogs_cleared` | `vgi_clear_cache.cpp` |
 
@@ -225,6 +226,7 @@ plus the shm-aware code paths in `src/vgi_function_connection.cpp`
 | `vgi_join_keys_limit` | UBIGINT | 100000 | Max distinct join key values pushed to VGI workers (0 = disabled) |
 | `vgi_join_keys_max_bytes` | UBIGINT | 67108864 | Max estimated byte size for join keys batch |
 | `vgi_streaming_window` | BOOLEAN | true | Route eligible `OVER (...)` queries against VGI aggregates with `streaming_partitioned=true` through the custom streaming operator. Set to false to fall back to `PhysicalWindow` |
+| `vgi_trust_empty_kinds` | BOOLEAN | true | Trust worker assertions that `estimated_object_count[kind] == 0` means the kind is empty (skip `catalog_schema_contents_*` RPC). Set to false to force every RPC to fire — debug escape hatch for diagnosing worker bugs |
 
 Catalogs may register additional settings at `ATTACH` time (e.g., `greeting`, `multiplier`).
 
