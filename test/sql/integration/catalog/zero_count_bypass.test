@@ -58,7 +58,7 @@ SELECT COUNT(*) FROM duckdb_logs() WHERE type = 'VGI'
 query I
 SELECT COUNT(*) = 0 FROM duckdb_logs() WHERE type = 'VGI'
   AND message LIKE '%catalog.entry_cache%'
-  AND message LIKE '%set_kind=table%'
+  AND message LIKE '%set_kind=table,%'
   AND message LIKE '%kind_empty%';
 ----
 true
