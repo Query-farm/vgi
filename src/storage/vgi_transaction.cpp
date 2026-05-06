@@ -46,11 +46,26 @@ void VgiTransaction::Commit(ClientContext &context) {
 	}
 	transaction_state = VgiTransactionState::TRANSACTION_FINISHED;
 
-	// Check catalog version — clear cache only if metadata actually changed.
-	// For DDL transactions (CREATE TABLE, DROP, etc.), the worker's version
-	// will have incremented. For read-only queries, version stays the same
-	// and the cache is preserved.
-	vgi_catalog_.CheckAndInvalidateCache(context, /*transaction_id=*/{});
+	// We deliberately do NOT call CheckAndInvalidateCache here. Rationale:
+	//
+	//   - DDL paths (CreateSchema, DropSchema, CreateTable, …) call
+	//     ClearCache eagerly inside their RPC handlers, before Commit runs.
+	//     By the time we reach this point in those flows, the cache is
+	//     already invalidated.
+	//
+	//   - Other-session changes that bumped the worker's catalog_version
+	//     during this transaction are caught at the next Transaction::Start
+	//     (one transaction late, but no in-flight query observes stale
+	//     metadata because the next query polls before it executes).
+	//
+	//   - For read-only sessions (the common case), no work in this
+	//     transaction could have moved the worker's version, so polling
+	//     here can only ever return noop. Removing the call drops two
+	//     catalog_version RPCs per query (Commit + Rollback paths).
+	//
+	// If a future write path forgets to ClearCache after a worker
+	// mutation, the next Start probe still catches it — staleness is
+	// bounded to one transaction.
 }
 
 void VgiTransaction::Rollback() {
@@ -76,8 +91,10 @@ void VgiTransaction::Rollback() {
 		}
 	}
 
-	// Check catalog version — clear cache only if metadata actually changed.
-	vgi_catalog_.CheckAndInvalidateCache(*ctx, /*transaction_id=*/{});
+	// Same rationale as Commit: skip CheckAndInvalidateCache. A rollback
+	// undoes any pending writes, so the worker's version cannot have moved
+	// because of this session's actions. Other-session changes are caught
+	// at the next Transaction::Start.
 }
 
 VgiTransaction &VgiTransaction::Get(ClientContext &context, Catalog &catalog) {
