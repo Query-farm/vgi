@@ -1715,6 +1715,17 @@ VgiTableInfo ParseTableInfo(ClientContext &context, const std::shared_ptr<arrow:
 		    stats_bytes.empty() ? std::nullopt : std::make_optional(std::move(stats_bytes));
 	}
 
+	// Parse optional inlined bind result (backward-compatible). The bytes
+	// are the IPC payload of `BindResponse.serialize_to_bytes()` — same wire
+	// shape a worker's `bind` RPC returns. PerformVgiTableFunctionBind
+	// short-circuits when this is set and feeds the bytes through
+	// `BuildBindResultFromInlinedBytes`.
+	{
+		auto bind_bytes = row["bind_result"].value_or(std::vector<uint8_t>{});
+		info.bind_result =
+		    bind_bytes.empty() ? std::nullopt : std::make_optional(std::move(bind_bytes));
+	}
+
 	// Validate: UPDATE/DELETE require a row ID column
 	if ((info.supports_update || info.supports_delete) && info.row_id_column < 0) {
 		throw InvalidInputException(

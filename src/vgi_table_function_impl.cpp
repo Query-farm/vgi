@@ -1,6 +1,7 @@
 #include "vgi_table_function_impl.hpp"
 
 #include "storage/vgi_table_entry.hpp"
+#include "vgi_bind_protocol.hpp"
 #include "vgi_cancel_dispatcher.hpp"
 #include "vgi_catalog_api.hpp"
 #include "vgi_exception.hpp"
@@ -132,6 +133,51 @@ VgiTableFunctionLocalState::~VgiTableFunctionLocalState() noexcept {
 // Perform Bind - Common bind logic for VGI table functions
 // ============================================================================
 
+// Apply a freshly-built BindResult to bind_data and derive return_types /
+// names. Shared by the on-demand RPC path and the inline-bind short-circuit
+// so both populate bind_data identically. `conn_id` and `worker_pid` are
+// included on the table_function.bind_result log for parity with downstream
+// trace tooling; the inline path passes empty/-1.
+static void ApplyBindResultToBindData(ClientContext &context, VgiTableFunctionBindData &bind_data,
+                                       BindResult bind_result, const std::string &conn_id,
+                                       int worker_pid, vector<LogicalType> &return_types,
+                                       vector<string> &names) {
+	bind_data.max_processes = 1;
+	bind_data.cardinality_estimate = -1;
+	bind_data.bind_result = std::move(bind_result);
+
+	try {
+		ArrowSchemaToDuckDBTypes(context, bind_data.bind_result.output_schema, bind_data.c_schema,
+		                         bind_data.arrow_table, return_types, names);
+	} catch (const std::exception &e) {
+		throw IOException("Failed to convert output schema for function '%s': %s",
+		                  bind_data.function_name, e.what());
+	}
+
+	if (bind_data.rowid_worker_col_index >= 0) {
+		auto idx = static_cast<size_t>(bind_data.rowid_worker_col_index);
+		if (idx < return_types.size()) {
+			return_types.erase(return_types.begin() + idx);
+			names.erase(names.begin() + idx);
+		}
+	}
+
+	bind_data.all_column_names = names;
+	bind_data.all_column_types = return_types;
+
+	{
+		vector<pair<string, string>> fields;
+		fields.emplace_back("conn", conn_id);
+		fields.emplace_back("worker_path", bind_data.worker_path());
+		if (worker_pid > 0) {
+			fields.emplace_back("worker_pid", std::to_string(worker_pid));
+		}
+		fields.emplace_back("function_name", bind_data.function_name);
+		fields.emplace_back("num_columns", std::to_string(bind_data.bind_result.output_schema->num_fields()));
+		VGI_LOG(context, "table_function.bind_result", fields);
+	}
+}
+
 void PerformVgiTableFunctionBind(ClientContext &context, VgiTableFunctionBindData &bind_data,
                                  vector<LogicalType> &return_types, vector<string> &names) {
 	// Log the invocation
@@ -142,6 +188,46 @@ void PerformVgiTableFunctionBind(ClientContext &context, VgiTableFunctionBindDat
 
 	// Validate that arguments type is a struct (defensive check)
 	D_ASSERT(!bind_data.arguments.type || bind_data.arguments.type->id() == arrow::Type::STRUCT);
+
+	// Inline-bind short-circuit: when the catalog-routed scan has a
+	// `bind_result` carried on TableInfo (worker pre-bound at
+	// schema_contents time), build equivalent bind_request_bytes locally
+	// and skip the bind RPC entirely. Cardinality / statistics / init all
+	// read through bind_data.bind_result.* — same shape as the RPC path.
+	// On any deserialize/parse error, fall through to the on-demand RPC.
+	if (bind_data.table_entry) {
+		auto &tinfo = bind_data.table_entry->Cast<VgiTableEntry>().GetTableInfo();
+		if (tinfo.bind_result.has_value()) {
+			try {
+				auto resolved_secrets = vgi::ExtractVgiSecrets(context, bind_data.required_secrets);
+				auto bind_request_bytes = vgi::BuildBindRequestBytes(
+				    context, bind_data.function_name, "TABLE",
+				    bind_data.arguments.array, /*input_schema=*/nullptr,
+				    bind_data.attach_id, bind_data.transaction_id,
+				    bind_data.settings, resolved_secrets,
+				    /*resolved_secrets_provided=*/false,
+				    bind_data.worker_path());
+				auto bind_result = vgi::BuildBindResultFromInlinedBytes(
+				    std::move(bind_request_bytes), *tinfo.bind_result,
+				    bind_data.worker_path());
+
+				VGI_LOG(context, "table_function.inline_bind_used",
+				        {{"worker_path", bind_data.worker_path()},
+				         {"function_name", bind_data.function_name}});
+
+				ApplyBindResultToBindData(context, bind_data, std::move(bind_result),
+				                          /*conn_id=*/"", /*worker_pid=*/-1,
+				                          return_types, names);
+				return;
+			} catch (const std::exception &e) {
+				VGI_LOG(context, "table_function.inline_bind_error",
+				        {{"worker_path", bind_data.worker_path()},
+				         {"function_name", bind_data.function_name},
+				         {"error", e.what()}});
+				// fall through to AcquireAndBindConnection
+			}
+		}
+	}
 
 	// Create connection to worker and perform bind handshake.
 	// Uses helper that handles pool acquire and stale connection retry.
@@ -157,20 +243,8 @@ void PerformVgiTableFunctionBind(ClientContext &context, VgiTableFunctionBindDat
 	params.function_type = "TABLE";
 
 	auto result = AcquireAndBindConnection(context, params);
-	auto &bind_result = result.bind_result;
 	auto bind_worker_pid = result.connection ? result.connection->GetSubprocessPid().value_or(-1) : -1;
 	auto bind_conn_id = result.connection ? result.connection->GetConnIdHex() : "";
-
-	// At bind time, max_processes is unknown (updated after init)
-	bind_data.max_processes = 1;
-	bind_data.cardinality_estimate = -1;
-
-	// Retain the full BindResult so InitGlobal / init_local_secondary thread
-	// it into PerformInit without firing a redundant bind RPC, and so the
-	// cardinality / statistics callbacks can replay bind_request_bytes +
-	// opaque_data. Copied (not moved) because bind_result remains valid for
-	// the rest of this function.
-	bind_data.bind_result = bind_result;
 
 	// Release the bind worker to the pool. Bind is a unary RPC; the worker
 	// has looped back to its accept loop and is available to serve other
@@ -198,38 +272,8 @@ void PerformVgiTableFunctionBind(ClientContext &context, VgiTableFunctionBindDat
 		result.connection.reset();
 	}
 
-	// Convert Arrow schema to DuckDB types using centralized utility
-	try {
-		ArrowSchemaToDuckDBTypes(context, bind_result.output_schema, bind_data.c_schema, bind_data.arrow_table,
-		                         return_types, names);
-	} catch (const std::exception &e) {
-		throw IOException("Failed to convert output schema for function '%s': %s", bind_data.function_name, e.what());
-	}
-
-	// Strip row_id column from return_types/names so DuckDB's physical column list excludes it.
-	// The full schema (including row_id) is retained in arrow_table/c_schema for ArrowToDuckDB.
-	if (bind_data.rowid_worker_col_index >= 0) {
-		auto idx = static_cast<size_t>(bind_data.rowid_worker_col_index);
-		if (idx < return_types.size()) {
-			return_types.erase(return_types.begin() + idx);
-			names.erase(names.begin() + idx);
-		}
-	}
-
-	bind_data.all_column_names = names;
-	bind_data.all_column_types = return_types;
-
-	{
-		vector<pair<string, string>> fields;
-		fields.emplace_back("conn", bind_conn_id);
-		fields.emplace_back("worker_path", bind_data.worker_path());
-		if (bind_worker_pid > 0) {
-			fields.emplace_back("worker_pid", std::to_string(bind_worker_pid));
-		}
-		fields.emplace_back("function_name", bind_data.function_name);
-		fields.emplace_back("num_columns", std::to_string(bind_result.output_schema->num_fields()));
-		VGI_LOG(context, "table_function.bind_result", fields);
-	}
+	ApplyBindResultToBindData(context, bind_data, std::move(result.bind_result),
+	                          bind_conn_id, bind_worker_pid, return_types, names);
 }
 
 // ============================================================================

@@ -318,6 +318,17 @@ struct VgiTableInfo {
 	// live counters) must leave this unset so the on-demand RPC continues
 	// to fire.
 	std::optional<std::vector<uint8_t>> column_statistics;
+
+	// Optional inlined bind result. Bytes are the IPC payload of
+	// `BindResponse.serialize_to_bytes()` — same wire shape the worker would
+	// have returned from a `bind` RPC. When populated,
+	// `PerformVgiTableFunctionBind` builds equivalent bind_request_bytes via
+	// `BuildBindRequestBytes` and constructs a `BindResult` directly via
+	// `BuildBindResultFromInlinedBytes`, skipping the on-wire bind RPC.
+	// Only set by workers using vgi-python's `Table(inline_bind=True)`
+	// declarative path (which is restricted to `@bind_fixed_schema`-decorated
+	// functions whose bind output is a pure function of `cls.FIXED_SCHEMA`).
+	std::optional<std::vector<uint8_t>> bind_result;
 };
 
 // View metadata from the worker
