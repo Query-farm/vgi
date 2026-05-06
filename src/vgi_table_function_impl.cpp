@@ -1,5 +1,6 @@
 #include "vgi_table_function_impl.hpp"
 
+#include "storage/vgi_table_entry.hpp"
 #include "vgi_cancel_dispatcher.hpp"
 #include "vgi_catalog_api.hpp"
 #include "vgi_exception.hpp"
@@ -1938,6 +1939,14 @@ unique_ptr<BaseStatistics> VgiTableFunctionStatistics(ClientContext &context, co
 		auto entry_stats = entry.GetStatistics(context, column_index);
 		if (entry_stats) {
 			return entry_stats;
+		}
+		// When the catalog inlined column_statistics on TableInfo, the entry
+		// path is authoritative — a per-column null means "no stats for this
+		// column", not "ask the function". Skip the function-level fallback
+		// to avoid one table_function_statistics RPC per scan.
+		auto *vgi_entry = dynamic_cast<VgiTableEntry *>(&entry);
+		if (vgi_entry && vgi_entry->GetTableInfo().column_statistics.has_value()) {
+			return nullptr;
 		}
 		// Fall through to function-level stats if the catalog declined to answer.
 	}
