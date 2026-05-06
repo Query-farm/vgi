@@ -64,12 +64,11 @@ struct VgiTableInOutBindData : public TableFunctionData {
 	// Input schema (built from table input types/names)
 	std::shared_ptr<arrow::Schema> input_schema;
 
-	// Full BindResult cached at planner-phase bind so InitGlobal can call
-	// PerformInit without firing a redundant on-wire bind. The init payload
-	// (BuildInitRequest) carries bind_request_bytes + output_schema_bytes +
-	// opaque_data inline, so the worker reconstructs bind context entirely
-	// from the init request.
-	BindResult cached_bind_result;
+	// Bind output retained for init phase. The init payload (BuildInitRequest)
+	// carries bind_request_bytes + output_schema_bytes + opaque_data inline, so
+	// the worker reconstructs bind context entirely from the init request — no
+	// second on-wire bind needed.
+	BindResult bind_result;
 
 	// Worker capabilities
 	int32_t max_processes = 1;

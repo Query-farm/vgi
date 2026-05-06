@@ -154,18 +154,11 @@ struct VgiTableFunctionBindData : public TableFunctionData {
 	// DuckDB type for the row_id column (INVALID when rowid_worker_col_index == -1)
 	LogicalType rowid_type = LogicalType::INVALID;
 
-	// Cached bind request for lazy cardinality RPC (populated during bind)
-	std::vector<uint8_t> bind_request_bytes;
-	std::vector<uint8_t> bind_opaque_data;
-
-	// Full BindResult cached at planner-phase bind so InitGlobal /
-	// init_local_secondary can call PerformInit without re-running a redundant
-	// bind RPC. The init payload (BuildInitRequest) carries bind_request_bytes,
-	// output_schema_bytes, and opaque_data inline; with these cached we never
-	// need a second on-wire bind. Populated alongside bind_request_bytes /
-	// bind_opaque_data above; those fields stay independently maintained for
-	// the cardinality / statistics call sites that read them directly.
-	BindResult cached_bind_result;
+	// Bind output retained for init phase and lazy cardinality / statistics
+	// RPCs. The init payload (BuildInitRequest) carries bind_request_bytes,
+	// output_schema_bytes, and opaque_data inline, so InitGlobal /
+	// init_local_secondary never need a second on-wire bind.
+	BindResult bind_result;
 
 	// Lazy cardinality fetching flag (mutable for const callback access)
 	mutable bool cardinality_fetched = false;

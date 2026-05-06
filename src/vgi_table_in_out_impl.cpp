@@ -35,7 +35,7 @@ unique_ptr<FunctionData> VgiTableInOutBindData::Copy() const {
 	copy->arguments = arguments;
 	copy->output_schema = output_schema;
 	copy->input_schema = input_schema;
-	copy->cached_bind_result = cached_bind_result;
+	copy->bind_result = bind_result;
 	copy->max_processes = max_processes;
 	copy->cardinality_estimate = cardinality_estimate;
 	return copy;
@@ -176,9 +176,9 @@ unique_ptr<FunctionData> VgiTableInOutBind(ClientContext &context, TableFunction
 	bind_data->max_processes = 1;
 	bind_data->cardinality_estimate = -1;
 
-	// Cache the full BindResult so InitGlobal can call PerformInit without
+	// Retain the full BindResult so InitGlobal can call PerformInit without
 	// re-running a redundant bind RPC.
-	bind_data->cached_bind_result = bind_result;
+	bind_data->bind_result = bind_result;
 
 	// Convert Arrow schema to DuckDB return types (stored for ArrowToDuckDB in scan)
 	ArrowSchemaToDuckDBTypes(context, bind_data->output_schema, bind_data->c_schema, bind_data->arrow_table,
@@ -243,7 +243,7 @@ unique_ptr<GlobalTableFunctionState> VgiTableInOutInitGlobal(ClientContext &cont
 	acquire_params.input_schema = bind_data.input_schema;
 	auto acquired = AcquireConnectionForInit(context, acquire_params);
 	auto connection = std::move(acquired.connection);
-	global_state->bind_result = bind_data.cached_bind_result;
+	global_state->bind_result = bind_data.bind_result;
 
 	// Perform init with phase=INPUT for table-in-out functions. Init is the
 	// first RPC after acquire, so stale-pool detection lives here: a pooled

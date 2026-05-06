@@ -165,14 +165,12 @@ void PerformVgiTableFunctionBind(ClientContext &context, VgiTableFunctionBindDat
 	bind_data.max_processes = 1;
 	bind_data.cardinality_estimate = -1;
 
-	// Cache bind request bytes for lazy cardinality RPC in the cardinality callback
-	bind_data.bind_request_bytes = bind_result.bind_request_bytes;
-	bind_data.bind_opaque_data = bind_result.opaque_data;
-
-	// Cache the full BindResult so InitGlobal / init_local_secondary can thread
-	// it into PerformInit without firing a redundant bind RPC. Copied (not
-	// moved) because bind_result remains valid for the rest of this function.
-	bind_data.cached_bind_result = bind_result;
+	// Retain the full BindResult so InitGlobal / init_local_secondary thread
+	// it into PerformInit without firing a redundant bind RPC, and so the
+	// cardinality / statistics callbacks can replay bind_request_bytes +
+	// opaque_data. Copied (not moved) because bind_result remains valid for
+	// the rest of this function.
+	bind_data.bind_result = bind_result;
 
 	// Release the bind worker to the pool. Bind is a unary RPC; the worker
 	// has looped back to its accept loop and is available to serve other
@@ -980,7 +978,7 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 	acquire_params.function_type = "TABLE";
 	auto acquired = AcquireConnectionForInit(context, acquire_params);
 	auto connection = std::move(acquired.connection);
-	const auto &bind_result = bind_data.cached_bind_result;
+	const auto &bind_result = bind_data.bind_result;
 
 	// Serialize the filters (returns empty if no filters or if serialization fails)
 	SerializedFilters serialized_filters;
@@ -1251,7 +1249,7 @@ unique_ptr<LocalTableFunctionState> VgiTableFunctionInitLocal(ExecutionContext &
 
 		auto acquired = AcquireConnectionForInit(context.client, params);
 		local_state->prefetch_slot_->connection = std::move(acquired.connection);
-		const auto &secondary_bind_result = bind_data.cached_bind_result;
+		const auto &secondary_bind_result = bind_data.bind_result;
 
 		// Secondary workers must receive the same projection / filter / hint
 		// pushdown info as the primary so they emit batches with a matching
@@ -1629,14 +1627,14 @@ unique_ptr<NodeStatistics> VgiTableFunctionCardinality(ClientContext &context, c
 	auto &bind_data = bind_data_p->Cast<VgiTableFunctionBindData>();
 
 	// Lazy fetch: make a single table_function_cardinality RPC call on first invocation
-	if (!bind_data.cardinality_fetched && !bind_data.bind_request_bytes.empty()) {
+	if (!bind_data.cardinality_fetched && !bind_data.bind_result.bind_request_bytes.empty()) {
 		bind_data.cardinality_fetched = true;
 		try {
 			auto rpc_params = bind_data.attach_params ? bind_data.attach_params
 			    : std::make_shared<VgiAttachParameters>(bind_data.worker_path(), "", bind_data.worker_debug(), bind_data.use_pool());
 			CatalogRpcContext rpc_ctx{rpc_params, bind_data.attach_id, bind_data.transaction_id};
-			auto result = InvokeTableFunctionCardinality(rpc_ctx, bind_data.bind_request_bytes,
-			                                             bind_data.bind_opaque_data, context);
+			auto result = InvokeTableFunctionCardinality(rpc_ctx, bind_data.bind_result.bind_request_bytes,
+			                                             bind_data.bind_result.opaque_data, context);
 			bind_data.cardinality_estimate = result.estimate;
 			bind_data.cardinality_max = result.max;
 		} catch (const std::exception &e) {
@@ -1760,7 +1758,7 @@ InsertionOrderPreservingMap<string> VgiTableFunctionDynamicToString(TableFunctio
 	// context to make the call — happens for direct vgi_table_function() invocations
 	// before bind has populated bind_request_bytes, or if InitGlobal wasn't
 	// reached (cached ClientContext is null).
-	if (bind_data.bind_request_bytes.empty() || global_state.global_execution_id.empty() ||
+	if (bind_data.bind_result.bind_request_bytes.empty() || global_state.global_execution_id.empty() ||
 	    global_state.client_context_for_explain == nullptr) {
 		return result;
 	}
@@ -1772,7 +1770,7 @@ InsertionOrderPreservingMap<string> VgiTableFunctionDynamicToString(TableFunctio
 		                                            bind_data.worker_debug(), bind_data.use_pool());
 		CatalogRpcContext rpc_ctx{rpc_params, bind_data.attach_id, bind_data.transaction_id};
 		auto user_map = InvokeTableFunctionDynamicToString(
-		    rpc_ctx, bind_data.bind_request_bytes, bind_data.bind_opaque_data,
+		    rpc_ctx, bind_data.bind_result.bind_request_bytes, bind_data.bind_result.opaque_data,
 		    global_state.global_execution_id, *global_state.client_context_for_explain);
 		// Merge user keys after intrinsics — user can override an intrinsic by
 		// returning the same key (DuckDB's map semantics for duplicate keys
@@ -1898,7 +1896,7 @@ void VgiSetScanOrder(unique_ptr<RowGroupOrderOptions> order_options, optional_pt
 static unique_ptr<BaseStatistics> FetchFunctionStatistics(ClientContext &context,
                                                           const VgiTableFunctionBindData &bind_data,
                                                           const std::string &col_name) {
-	if (bind_data.bind_request_bytes.empty()) {
+	if (bind_data.bind_result.bind_request_bytes.empty()) {
 		return nullptr;
 	}
 
@@ -1912,7 +1910,7 @@ static unique_ptr<BaseStatistics> FetchFunctionStatistics(ClientContext &context
 			                                             bind_data.worker_debug(), bind_data.use_pool());
 			CatalogRpcContext rpc_ctx{rpc_params, bind_data.attach_id, bind_data.transaction_id};
 			bind_data.statistics_cache = InvokeTableFunctionStatistics(
-			    rpc_ctx, bind_data.bind_request_bytes, bind_data.bind_opaque_data,
+			    rpc_ctx, bind_data.bind_result.bind_request_bytes, bind_data.bind_result.opaque_data,
 			    bind_data.all_column_types, bind_data.all_column_names,
 			    bind_data.function_name, context);
 		} catch (const std::exception &e) {
