@@ -4,8 +4,10 @@
 
 # DuckDB calls TableFunction::dynamic_to_string() once per parallel scan
 # thread inside OperatorProfiler::FinishSource. The VGI extension surfaces:
-#   - intrinsic keys (Worker, Function, Rows Read, Threads) read from
-#     gstate without an RPC
+#   - intrinsic keys (Worker, Function) read from gstate without an RPC.
+#     "Rows Read" and "Threads" were intentionally removed: DuckDB already
+#     prints the operator row count in the profile box, and Threads was
+#     init_response.max_workers (an upper bound, not realised concurrency).
 #   - user-defined keys returned by the function class's dynamic_to_string
 #     hook, fetched via a unary RPC carrying the global execution_id
 #
@@ -28,12 +30,12 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 query II
 EXPLAIN ANALYZE SELECT count(*) FROM example.sequence(1000);
 ----
-analyzed_plan	<REGEX>:.*Rows Read: 1000.*
+analyzed_plan	<REGEX>:.*Function: sequence.*
 
 query II
 EXPLAIN ANALYZE SELECT count(*) FROM example.sequence(1000);
 ----
-analyzed_plan	<REGEX>:.*Function: sequence.*
+analyzed_plan	<REGEX>:.*Worker: .*
 
 # ============================================================================
 # 2. Function WITH override: user keys appear post-execution.
