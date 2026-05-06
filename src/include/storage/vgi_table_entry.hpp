@@ -50,6 +50,13 @@ private:
 
 	void FetchColumnStatistics(ClientContext &context) const;
 
+	// Populate stats_cache_ from the inlined `column_statistics` bytes carried
+	// on table_info_. Called from GetStatistics under the same loading-flag
+	// discipline as FetchColumnStatistics — same publish/clear/notify
+	// contract. Used when the worker pre-shipped stats via
+	// catalog_schema_contents_tables, eliminating the per-table RPC.
+	void PopulateStatsCacheFromInline(ClientContext &context) const;
+
 	vgi::VgiTableInfo table_info_;
 	Catalog &catalog_;
 	LogicalType rowid_type_ = LogicalType::INVALID;

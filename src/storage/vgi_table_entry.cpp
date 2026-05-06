@@ -80,11 +80,16 @@ unique_ptr<BaseStatistics> VgiTableEntry::GetStatistics(ClientContext &context, 
 
 	double fetch_ms = 0.0;
 	if (must_fetch) {
-		// FetchColumnStatistics handles its own publish + cv notify. It
+		// Both populate paths handle their own publish + cv notify. They
 		// must clear stats_cache_.loading on every exit path (success,
-		// thrown exception, or caught error).
+		// thrown exception, or caught error). Prefer the inline-blob path
+		// when the worker pre-shipped stats — no RPC needed.
 		auto fetch_start = std::chrono::steady_clock::now();
-		FetchColumnStatistics(context);
+		if (table_info_.column_statistics.has_value()) {
+			PopulateStatsCacheFromInline(context);
+		} else {
+			FetchColumnStatistics(context);
+		}
 		auto fetch_end = std::chrono::steady_clock::now();
 		fetch_ms = std::chrono::duration<double, std::milli>(fetch_end - fetch_start).count();
 	}
@@ -190,6 +195,75 @@ void VgiTableEntry::FetchColumnStatistics(ClientContext &context) const {
 		} else {
 			stats_cache_.entries.clear();
 		}
+		stats_cache_.fetched = true;
+		stats_cache_.fetched_at = std::chrono::steady_clock::now();
+		stats_cache_.loading = false;
+	}
+	stats_cache_.cv.notify_all();
+}
+
+// Caller must have set stats_cache_.loading = true under the mutex. This
+// runs the deserialize *outside* the mutex (matching FetchColumnStatistics)
+// because Arrow→DuckDB conversion can re-enter logging / catalog paths,
+// and is responsible for clearing the loading flag and notifying waiters
+// on every exit path.
+void VgiTableEntry::PopulateStatsCacheFromInline(ClientContext &context) const {
+	std::unordered_map<std::string, unique_ptr<BaseStatistics>> parsed_entries;
+	bool ok = false;
+
+	try {
+		auto &vgi_catalog = catalog_.Cast<VgiCatalog>();
+		(void)vgi_catalog; // (referenced below in error path)
+
+		// Build column name/type vectors from the table's schema — same
+		// derivation as the on-demand fetch path so the two routes produce
+		// identical BaseStatistics shapes.
+		auto &columns = GetColumns();
+		std::vector<LogicalType> col_types;
+		std::vector<std::string> col_names;
+		for (idx_t i = 0; i < columns.PhysicalColumnCount(); i++) {
+			auto &col = columns.GetColumn(PhysicalIndex(i));
+			col_types.push_back(col.GetType());
+			col_names.push_back(col.GetName());
+		}
+
+		const auto &bytes = *table_info_.column_statistics;
+		auto batch = vgi::DeserializeFromIpcBytes(bytes.data(), bytes.size());
+		if (batch && batch->num_rows() > 0) {
+			parsed_entries = vgi::ParseColumnStatisticsBatch(
+			    batch, col_types, col_names,
+			    vgi_catalog.attach_parameters()->worker_path(),
+			    "table", ParentSchema().name + "." + name, context);
+		}
+		ok = true;
+	} catch (const std::exception &e) {
+		try {
+			auto &vgi_catalog = catalog_.Cast<VgiCatalog>();
+			VGI_LOG(context, "column_statistics.inline_parse_error",
+			        {{"worker_path", vgi_catalog.attach_parameters()->worker_path()},
+			         {"table", ParentSchema().name + "." + name},
+			         {"error", e.what()}});
+		} catch (...) {
+			// swallow
+		}
+	} catch (...) {
+		// unknown — likewise, must reach publish-and-clear below
+	}
+
+	// Publish results. Mark `fetched=true` even on parse failure so callers
+	// don't pile up retries; max_age_seconds = -1 means "never expires within
+	// this catalog_version" — cache invalidation evicts on version bump.
+	// This is the right TTL for inlined stats: the worker built them at some
+	// past instant we don't know, but the version-bump path is what reliably
+	// signals freshness, not steady_clock since attach.
+	{
+		std::lock_guard<std::mutex> lk(stats_cache_.mutex);
+		if (ok) {
+			stats_cache_.entries = std::move(parsed_entries);
+		} else {
+			stats_cache_.entries.clear();
+		}
+		stats_cache_.max_age_seconds = -1;
 		stats_cache_.fetched = true;
 		stats_cache_.fetched_at = std::chrono::steady_clock::now();
 		stats_cache_.loading = false;

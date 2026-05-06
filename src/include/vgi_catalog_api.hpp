@@ -305,6 +305,19 @@ struct VgiTableInfo {
 	// fire.
 	std::optional<int64_t> cardinality_estimate;
 	std::optional<int64_t> cardinality_max;
+
+	// Optional inlined column statistics. When populated, the extension
+	// pre-populates VgiTableEntry's stats cache from these bytes (lazily,
+	// at first GetStatistics call) and skips both the per-scan
+	// `table_function_statistics` RPC and the per-table
+	// `catalog_table_column_statistics_get` RPC. Bytes are the IPC payload
+	// produced by `serialize_column_statistics(stats, cache_max_age_seconds)`
+	// on the worker — same wire shape as the on-demand RPC's response, so the
+	// existing `ParseColumnStatisticsBatch` deserializer is reused verbatim.
+	// Workers whose statistics change faster than `catalog_version` (e.g.
+	// live counters) must leave this unset so the on-demand RPC continues
+	// to fire.
+	std::optional<std::vector<uint8_t>> column_statistics;
 };
 
 // View metadata from the worker
@@ -749,6 +762,23 @@ ColumnStatisticsRpcResult InvokeCatalogTableColumnStatisticsGet(
     const std::vector<LogicalType> &column_types,
     const std::vector<std::string> &column_names,
     ClientContext &context);
+
+// Deserialize a column-statistics IPC RecordBatch into a per-column
+// `BaseStatistics` map. Reused on three paths:
+//   - the on-demand `catalog_table_column_statistics_get` RPC response
+//     (`vgi_table_entry.cpp`)
+//   - the per-bind `table_function_statistics` RPC response
+//     (`vgi_table_function_impl.cpp`)
+//   - inlined `column_statistics` bytes carried on `VgiTableInfo`, parsed at
+//     first `GetStatistics` call by `VgiTableEntry`
+// Throws on malformed input; callers wrap in try/catch when fail-soft is
+// desired (the inline-blob path leaves the cache empty + marks fetched).
+std::unordered_map<std::string, unique_ptr<BaseStatistics>> ParseColumnStatisticsBatch(
+    const std::shared_ptr<arrow::RecordBatch> &result_batch,
+    const std::vector<LogicalType> &column_types,
+    const std::vector<std::string> &column_names,
+    const std::string &worker_path, const std::string &log_source_key,
+    const std::string &log_source_value, ClientContext &context);
 
 // ============================================================================
 // Table Function Cardinality

@@ -920,7 +920,7 @@ static unique_ptr<BaseStatistics> BuildColumnStatistics(
 // has_not_null, distinct_count, contains_unicode?, max_string_length?).
 // `log_source_key` / `log_source_value` identify the RPC source in log records
 // (e.g. {"table", "public.users"} or {"function_name", "sequence"}).
-static std::unordered_map<std::string, unique_ptr<BaseStatistics>> ParseColumnStatisticsBatch(
+std::unordered_map<std::string, unique_ptr<BaseStatistics>> ParseColumnStatisticsBatch(
     const std::shared_ptr<arrow::RecordBatch> &result_batch,
     const std::vector<LogicalType> &column_types,
     const std::vector<std::string> &column_names,
@@ -1702,6 +1702,18 @@ VgiTableInfo ParseTableInfo(ClientContext &context, const std::shared_ptr<arrow:
 	// table_function_cardinality RPC.
 	info.cardinality_estimate = row["cardinality_estimate"].as<int64_t>();
 	info.cardinality_max = row["cardinality_max"].as<int64_t>();
+
+	// Parse optional inlined column statistics (backward-compatible). The
+	// bytes are the IPC payload of `serialize_column_statistics` from the
+	// worker — same wire shape as the on-demand catalog_table_column_statistics_get
+	// RPC's response. We hold the raw bytes here and let
+	// VgiTableEntry::GetStatistics deserialize lazily on first call (it has a
+	// ClientContext &; this code path doesn't).
+	{
+		auto stats_bytes = row["column_statistics"].value_or(std::vector<uint8_t>{});
+		info.column_statistics =
+		    stats_bytes.empty() ? std::nullopt : std::make_optional(std::move(stats_bytes));
+	}
 
 	// Validate: UPDATE/DELETE require a row ID column
 	if ((info.supports_update || info.supports_delete) && info.row_id_column < 0) {
