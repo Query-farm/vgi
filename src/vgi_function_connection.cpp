@@ -38,19 +38,72 @@ const std::string &FunctionConnectionParams::implementation_version() const {
 // Connection Acquisition with Retry
 // ============================================================================
 
-AcquireAndBindResult AcquireAndBindConnection(ClientContext &context, const FunctionConnectionParams &params) {
-	std::unique_ptr<IFunctionConnection> conn;
-	BindResult bind_result;
-	bool from_pool = false;
+namespace {
 
-	// Lambda to create a fresh connection (uses factory for HTTP/subprocess dispatch)
-	auto create_fresh_connection = [&]() {
-		return CreateFunctionConnection(params.worker_path(), params.function_name, params.arguments,
-		                                params.attach_id, params.transaction_id, context,
-		                                params.function_type, params.global_execution_id,
-		                                params.worker_debug(), params.settings, params.required_secrets,
-		                                params.attach_params);
-	};
+// Internal: build a fresh FunctionConnection using the HTTP/subprocess factory.
+std::unique_ptr<IFunctionConnection> CreateFreshConnection(ClientContext &context,
+                                                            const FunctionConnectionParams &params) {
+	return CreateFunctionConnection(params.worker_path(), params.function_name, params.arguments,
+	                                params.attach_id, params.transaction_id, context,
+	                                params.function_type, params.global_execution_id,
+	                                params.worker_debug(), params.settings, params.required_secrets,
+	                                params.attach_params);
+}
+
+// Internal: pool-or-spawn a connection. Sets `from_pool` to true when the
+// connection came from VgiWorkerPool (subprocess only). HTTP transport never
+// pools, so HTTP callers always see from_pool == false. When `force_fresh` is
+// true the pool fast-path is skipped and we always spawn — used by the
+// stale-retry path so a sick pool doesn't hand back another dead worker.
+//
+// Logs `worker_pool.acquire` with the result tag so the existing observability
+// surface stays identical for both AcquireAndBindConnection and
+// AcquireConnectionForInit.
+std::unique_ptr<IFunctionConnection> AcquireConnection(ClientContext &context,
+                                                        const FunctionConnectionParams &params,
+                                                        bool &from_pool,
+                                                        bool force_fresh = false) {
+	std::unique_ptr<IFunctionConnection> conn;
+	from_pool = false;
+
+	if (!force_fresh && params.use_pool() && !IsHttpTransport(params.worker_path())) {
+		PoolKey pool_key {params.worker_path(), params.data_version_spec(), params.implementation_version()};
+		auto pooled = VgiWorkerPool::Instance().TryAcquire(pool_key);
+		if (pooled) {
+			conn = CreateFunctionConnectionFromPool(std::move(pooled), params.function_name, params.arguments,
+			                                        params.attach_id, params.transaction_id, context,
+			                                        params.function_type, params.global_execution_id,
+			                                        params.worker_debug(), params.settings,
+			                                        params.required_secrets);
+			from_pool = true;
+			auto fields = BuildConnLogFields(*conn);
+			fields.emplace_back("worker_path", params.worker_path());
+			fields.emplace_back("result", "hit");
+			fields.emplace_back("phase", params.phase);
+			VGI_LOG(context, "worker_pool.acquire", fields);
+			return conn;
+		}
+	}
+
+	conn = CreateFreshConnection(context, params);
+	if (params.use_pool() && !IsHttpTransport(params.worker_path())) {
+		VgiWorkerPool::Instance().RecordMiss(params.worker_path());
+	}
+	const char *result_tag = force_fresh ? "retry_after_stale" : (params.use_pool() ? "miss" : "disabled");
+	auto fields = BuildConnLogFields(*conn);
+	fields.emplace_back("worker_path", params.worker_path());
+	fields.emplace_back("result", result_tag);
+	fields.emplace_back("phase", params.phase);
+	VGI_LOG(context, "worker_pool.acquire", fields);
+	return conn;
+}
+
+} // anonymous namespace
+
+AcquireAndBindResult AcquireAndBindConnection(ClientContext &context, const FunctionConnectionParams &params) {
+	bool from_pool = false;
+	auto conn = AcquireConnection(context, params, from_pool);
+	BindResult bind_result;
 
 	// Lambda to attempt bind, returns true on success, false if retry needed
 	auto try_bind = [&](bool is_retry) -> bool {
@@ -73,42 +126,11 @@ AcquireAndBindResult AcquireAndBindConnection(ClientContext &context, const Func
 		}
 	};
 
-	// Try pool first (only for subprocess transport)
-	if (params.use_pool() && !IsHttpTransport(params.worker_path())) {
-		PoolKey pool_key {params.worker_path(), params.data_version_spec(), params.implementation_version()};
-		auto pooled = VgiWorkerPool::Instance().TryAcquire(pool_key);
-		if (pooled) {
-			conn = CreateFunctionConnectionFromPool(std::move(pooled), params.function_name, params.arguments,
-			                                        params.attach_id, params.transaction_id, context,
-			                                        params.function_type, params.global_execution_id,
-			                                        params.worker_debug(), params.settings,
-			                                        params.required_secrets);
-			from_pool = true;
-			auto fields = BuildConnLogFields(*conn);
-			fields.emplace_back("worker_path", params.worker_path());
-			fields.emplace_back("result", "hit");
-			fields.emplace_back("phase", params.phase);
-			VGI_LOG(context, "worker_pool.acquire", fields);
-		}
-	}
-
-	// Create fresh if pool miss
-	if (!conn) {
-		conn = create_fresh_connection();
-		if (params.use_pool() && !IsHttpTransport(params.worker_path())) {
-			VgiWorkerPool::Instance().RecordMiss(params.worker_path());
-		}
-		auto fields = BuildConnLogFields(*conn);
-		fields.emplace_back("worker_path", params.worker_path());
-		fields.emplace_back("result", params.use_pool() ? "miss" : "disabled");
-		fields.emplace_back("phase", params.phase);
-		VGI_LOG(context, "worker_pool.acquire", fields);
-	}
-
 	// Attempt bind with single retry for stale pool connections
 	if (!try_bind(false)) {
 		// Pooled worker was stale, retry with fresh
-		conn = create_fresh_connection();
+		conn = CreateFreshConnection(context, params);
+		from_pool = false;
 		auto fields = BuildConnLogFields(*conn);
 		fields.emplace_back("worker_path", params.worker_path());
 		fields.emplace_back("result", "retry_after_stale");
@@ -118,6 +140,30 @@ AcquireAndBindResult AcquireAndBindConnection(ClientContext &context, const Func
 	}
 
 	return AcquireAndBindResult {std::move(conn), std::move(bind_result)};
+}
+
+AcquireForInitResult AcquireConnectionForInit(ClientContext &context, const FunctionConnectionParams &params,
+                                                bool force_fresh) {
+	bool from_pool = false;
+	auto conn = AcquireConnection(context, params, from_pool, force_fresh);
+
+	// PerformBindRpc has historically been the lazy-spawn hook for subprocess
+	// transport — fresh-constructed connections defer spawning their worker
+	// until the first wire RPC. We're skipping that bind, so the spawn must
+	// happen explicitly here; otherwise PerformInit fails its proc_ guard.
+	// HTTP transport implements this as a no-op.
+	conn->EnsureWorkerSpawned();
+
+	// The caller already holds a BindResult and will call PerformInit directly.
+	// SetInputSchema must still be wired up here for table-in-out / scalar
+	// functions whose first RPC consumes a typed input stream — input_schema_
+	// has to be set before the connection sees any data. PerformBindRpc would
+	// have done this; in the no-bind path we replicate it.
+	if (params.input_schema) {
+		conn->SetInputSchema(params.input_schema);
+	}
+
+	return AcquireForInitResult {std::move(conn), from_pool};
 }
 
 // ============================================================================
@@ -172,14 +218,21 @@ FunctionConnection::~FunctionConnection() {
 	stderr_drainer_.reset();
 }
 
-BindResult FunctionConnection::PerformBindRpc() {
-	// Spawn the worker process (unless we already have one from the pool).
-	// First-RPC-spawns-the-worker is the only lifecycle hook on this method;
-	// nothing else is cached or tracked beyond the proc_ handle.
+void FunctionConnection::EnsureWorkerSpawned() {
+	// Lazy-spawn for subprocess transport. Pool-acquired connections arrive
+	// with proc_ already set; fresh constructions defer the spawn until the
+	// first RPC needs it. PerformBindRpc has historically been that hook;
+	// callers that skip the on-wire bind (cached BindResult → straight to
+	// PerformInit) call this directly so proc_ exists before the init write.
 	if (!proc_) {
 		proc_ = std::make_unique<SubProcess>(worker_path_, worker_debug_);
 		StartStderrReader();
 	}
+}
+
+BindResult FunctionConnection::PerformBindRpc() {
+	// Spawn the worker process (unless we already have one from the pool).
+	EnsureWorkerSpawned();
 
 	int64_t num_args = arguments_array_ ? arguments_array_->length() : 0;
 	{

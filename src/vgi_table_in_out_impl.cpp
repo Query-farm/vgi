@@ -35,6 +35,7 @@ unique_ptr<FunctionData> VgiTableInOutBindData::Copy() const {
 	copy->arguments = arguments;
 	copy->output_schema = output_schema;
 	copy->input_schema = input_schema;
+	copy->cached_bind_result = cached_bind_result;
 	copy->max_processes = max_processes;
 	copy->cardinality_estimate = cardinality_estimate;
 	return copy;
@@ -175,6 +176,10 @@ unique_ptr<FunctionData> VgiTableInOutBind(ClientContext &context, TableFunction
 	bind_data->max_processes = 1;
 	bind_data->cardinality_estimate = -1;
 
+	// Cache the full BindResult so InitGlobal can call PerformInit without
+	// re-running a redundant bind RPC.
+	bind_data->cached_bind_result = bind_result;
+
 	// Convert Arrow schema to DuckDB return types (stored for ArrowToDuckDB in scan)
 	ArrowSchemaToDuckDBTypes(context, bind_data->output_schema, bind_data->c_schema, bind_data->arrow_table,
 	                         return_types, names);
@@ -220,8 +225,11 @@ unique_ptr<GlobalTableFunctionState> VgiTableInOutInitGlobal(ClientContext &cont
 		}
 	}
 
-	// Acquire a fresh connection (pool-hit typical) and do a fresh bind.
-	// The bind worker was released to the pool at bind time.
+	// Acquire a connection without firing a redundant bind RPC. The
+	// planner-phase BindResult is already cached on bind_data; PerformInit's
+	// payload carries it inline. AcquireConnectionForInit pool-hits when
+	// possible (subprocess) or constructs a fresh HTTP connection, and wires
+	// SetInputSchema for the typed-input-stream protocol.
 	FunctionConnectionParams acquire_params;
 	acquire_params.attach_params = bind_data.attach_params;
 	acquire_params.attach_id = bind_data.attach_id;
@@ -233,12 +241,31 @@ unique_ptr<GlobalTableFunctionState> VgiTableInOutInitGlobal(ClientContext &cont
 	acquire_params.phase = "init_global";
 	acquire_params.function_type = "TABLE";
 	acquire_params.input_schema = bind_data.input_schema;
-	auto acquire_result = AcquireAndBindConnection(context, acquire_params);
-	auto connection = std::move(acquire_result.connection);
-	global_state->bind_result = std::move(acquire_result.bind_result);
+	auto acquired = AcquireConnectionForInit(context, acquire_params);
+	auto connection = std::move(acquired.connection);
+	global_state->bind_result = bind_data.cached_bind_result;
 
-	// Perform init with phase=INPUT for table-in-out functions
-	auto init_result = connection->PerformInit(global_state->bind_result, {}, nullptr, {}, "INPUT");
+	// Perform init with phase=INPUT for table-in-out functions. Init is the
+	// first RPC after acquire, so stale-pool detection lives here: a pooled
+	// subprocess that died while idle surfaces as IOException, and we retry
+	// once with a forced-fresh connection. HTTP transport never enters the
+	// retry branch (from_pool is always false there).
+	InitResult init_result;
+	try {
+		init_result = connection->PerformInit(global_state->bind_result, {}, nullptr, {}, "INPUT");
+	} catch (const IOException &e) {
+		if (!acquired.from_pool) {
+			throw;
+		}
+		VGI_LOG(context, "worker_pool.stale",
+		        {{"worker_path", bind_data.worker_path()},
+		         {"function_name", bind_data.function_name},
+		         {"phase", "init_global"},
+		         {"error", e.what()}});
+		acquired = AcquireConnectionForInit(context, acquire_params, /*force_fresh=*/true);
+		connection = std::move(acquired.connection);
+		init_result = connection->PerformInit(global_state->bind_result, {}, nullptr, {}, "INPUT");
+	}
 	global_state->global_execution_id = std::move(init_result.execution_id);
 
 	// Open the input writer for Stream 5

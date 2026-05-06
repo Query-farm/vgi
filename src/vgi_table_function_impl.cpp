@@ -168,6 +168,11 @@ void PerformVgiTableFunctionBind(ClientContext &context, VgiTableFunctionBindDat
 	bind_data.bind_request_bytes = bind_result.bind_request_bytes;
 	bind_data.bind_opaque_data = bind_result.opaque_data;
 
+	// Cache the full BindResult so InitGlobal / init_local_secondary can thread
+	// it into PerformInit without firing a redundant bind RPC. Copied (not
+	// moved) because bind_result remains valid for the rest of this function.
+	bind_data.cached_bind_result = bind_result;
+
 	// Release the bind worker to the pool. Bind is a unary RPC; the worker
 	// has looped back to its accept loop and is available to serve other
 	// planner RPCs (e.g. table_function_cardinality) and the eventual init
@@ -958,9 +963,10 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 		}
 	}
 
-	// Acquire a fresh connection for the init/scan phase. The bind worker was
-	// released to the pool, so this will typically pool-hit (often the same
-	// worker) and pay only a cheap bind RPC — no fresh spawn.
+	// Acquire a connection for the init/scan phase. The planner-phase BindResult
+	// is already cached on bind_data; PerformInit's payload carries it inline,
+	// so no second on-wire bind is needed. AcquireConnectionForInit pool-hits
+	// when possible (subprocess) or constructs a fresh HTTP connection.
 	FunctionConnectionParams acquire_params;
 	acquire_params.attach_params = bind_data.attach_params;
 	acquire_params.attach_id = bind_data.attach_id;
@@ -971,9 +977,9 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 	acquire_params.required_secrets = bind_data.required_secrets;
 	acquire_params.phase = "init_global";
 	acquire_params.function_type = "TABLE";
-	auto acquire_result = AcquireAndBindConnection(context, acquire_params);
-	auto connection = std::move(acquire_result.connection);
-	auto bind_result = std::move(acquire_result.bind_result);
+	auto acquired = AcquireConnectionForInit(context, acquire_params);
+	auto connection = std::move(acquired.connection);
+	const auto &bind_result = bind_data.cached_bind_result;
 
 	// Serialize the filters (returns empty if no filters or if serialization fails)
 	SerializedFilters serialized_filters;
@@ -1095,9 +1101,32 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 		connection->SetTickFilterState(tick_filter_state);
 	}
 
-	// Perform init phase via vgi_rpc with projection, filter, join key, order, and sample pushdown
-	auto init_result = connection->PerformInit(bind_result, projection_ids, filter_bytes, join_keys_buffers,
-	                                           "", bind_data.order_by_hint, bind_data.table_sample_hint);
+	// Perform init phase via vgi_rpc with projection, filter, join key, order,
+	// and sample pushdown. Init is the first RPC after acquire (we skipped the
+	// historic redundant bind), so it's where stale-pool detection lives:
+	// IOException from a pool-acquired connection means the pooled subprocess
+	// died while idle, and we retry once with a fresh connection. HTTP
+	// transport never enters this branch (from_pool is always false).
+	auto perform_init = [&](IFunctionConnection &c) {
+		return c.PerformInit(bind_result, projection_ids, filter_bytes, join_keys_buffers,
+		                     "", bind_data.order_by_hint, bind_data.table_sample_hint);
+	};
+	InitResult init_result;
+	try {
+		init_result = perform_init(*connection);
+	} catch (const IOException &e) {
+		if (!acquired.from_pool) {
+			throw;
+		}
+		VGI_LOG(context, "worker_pool.stale",
+		        {{"worker_path", bind_data.worker_path()},
+		         {"function_name", bind_data.function_name},
+		         {"phase", "init_global"},
+		         {"error", e.what()}});
+		acquired = AcquireConnectionForInit(context, acquire_params, /*force_fresh=*/true);
+		connection = std::move(acquired.connection);
+		init_result = perform_init(*connection);
+	}
 
 	auto global_state = make_uniq<VgiTableFunctionGlobalState>();
 	global_state->global_execution_id = std::move(init_result.execution_id);
@@ -1202,10 +1231,11 @@ unique_ptr<LocalTableFunctionState> VgiTableFunctionInitLocal(ExecutionContext &
 
 		local_state->prefetch_slot_->connection = std::move(primary_connection);
 	} else {
-		// Secondary worker: create new connection with global_execution_id
-		// Uses helper that handles pool acquire and stale connection retry.
-		// The global_execution_id is passed via FunctionConnectionParams, and
-		// PerformInit includes it in the InitRequest automatically.
+		// Secondary worker: acquire a connection without firing a redundant
+		// bind RPC. The cached planner-phase BindResult on bind_data is what
+		// PerformInit needs; the global_execution_id is threaded via
+		// FunctionConnectionParams and PerformInit places it in the
+		// InitRequest. Stale-pool detection lives on the init RPC.
 		FunctionConnectionParams params;
 		params.attach_params = bind_data.attach_params;
 		params.attach_id = bind_data.attach_id;
@@ -1218,9 +1248,9 @@ unique_ptr<LocalTableFunctionState> VgiTableFunctionInitLocal(ExecutionContext &
 		params.phase = "init_local_secondary";
 		params.function_type = "TABLE";
 
-		auto result = AcquireAndBindConnection(context.client, params);
-		auto secondary_bind_result = std::move(result.bind_result);
-		local_state->prefetch_slot_->connection = std::move(result.connection);
+		auto acquired = AcquireConnectionForInit(context.client, params);
+		local_state->prefetch_slot_->connection = std::move(acquired.connection);
+		const auto &secondary_bind_result = bind_data.cached_bind_result;
 
 		// Secondary workers must receive the same projection / filter / hint
 		// pushdown info as the primary so they emit batches with a matching
@@ -1229,15 +1259,32 @@ unique_ptr<LocalTableFunctionState> VgiTableFunctionInitLocal(ExecutionContext &
 		// (which assumes projected layout when projection_pushdown=true)
 		// reads the wrong column positions from the unprojected secondary
 		// batches.
-		if (bind_data.projection_pushdown) {
-			local_state->connection()->SetTickFilterState(global_state.tick_filter_state);
-			local_state->connection()->PerformInit(
-			    secondary_bind_result,
-			    global_state.projection_ids, global_state.static_filter_bytes,
-			    global_state.join_keys_buffers, "", global_state.order_by_hint,
-			    global_state.table_sample_hint);
-		} else {
-			local_state->connection()->PerformInit(secondary_bind_result);
+		auto secondary_init = [&]() {
+			if (bind_data.projection_pushdown) {
+				local_state->connection()->SetTickFilterState(global_state.tick_filter_state);
+				local_state->connection()->PerformInit(
+				    secondary_bind_result,
+				    global_state.projection_ids, global_state.static_filter_bytes,
+				    global_state.join_keys_buffers, "", global_state.order_by_hint,
+				    global_state.table_sample_hint);
+			} else {
+				local_state->connection()->PerformInit(secondary_bind_result);
+			}
+		};
+		try {
+			secondary_init();
+		} catch (const IOException &e) {
+			if (!acquired.from_pool) {
+				throw;
+			}
+			VGI_LOG(context.client, "worker_pool.stale",
+			        {{"worker_path", bind_data.worker_path()},
+			         {"function_name", bind_data.function_name},
+			         {"phase", "init_local_secondary"},
+			         {"error", e.what()}});
+			acquired = AcquireConnectionForInit(context.client, params, /*force_fresh=*/true);
+			local_state->prefetch_slot_->connection = std::move(acquired.connection);
+			secondary_init();
 		}
 
 		{

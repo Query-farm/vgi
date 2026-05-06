@@ -49,6 +49,8 @@ public:
 
 	// Bind RPC. See IFunctionConnection::PerformBindRpc.
 	BindResult PerformBindRpc() override;
+	// HTTP has no spawn step; this is a no-op satisfying the interface.
+	void EnsureWorkerSpawned() override {}
 	void SetInputSchema(const std::shared_ptr<arrow::Schema> &input_schema) override;
 	void UpdateInputSchemaForExecution(const std::shared_ptr<arrow::Schema> &input_schema) override;
 

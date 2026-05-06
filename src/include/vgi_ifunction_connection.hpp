@@ -56,6 +56,15 @@ public:
 	// The connection does NOT cache the result; callers thread it into the
 	// matching PerformInit / PerformFinalizeInit call.
 	virtual BindResult PerformBindRpc() = 0;
+
+	// Ensure the underlying worker is ready to receive RPCs. PerformBindRpc
+	// has historically been the lazy-spawn hook for subprocess transport
+	// (proc_ was created on first bind); call sites that skip the on-wire
+	// bind — they have a cached BindResult and go straight to PerformInit —
+	// must invoke this to materialize the subprocess before issuing init.
+	// HTTP transport has no spawn step; this is a no-op there.
+	virtual void EnsureWorkerSpawned() = 0;
+
 	virtual void SetInputSchema(const std::shared_ptr<arrow::Schema> &input_schema) = 0;
 
 	// Update input schema for execute phase (after bind, before OpenInputWriter)

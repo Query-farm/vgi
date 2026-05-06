@@ -89,6 +89,29 @@ struct AcquireAndBindResult {
 // Throws IOException if bind fails (after retry if applicable).
 AcquireAndBindResult AcquireAndBindConnection(ClientContext &context, const FunctionConnectionParams &params);
 
+// Result of AcquireConnectionForInit — the caller already has a usable BindResult
+// (from a prior planner-phase bind) and is going straight to PerformInit.
+struct AcquireForInitResult {
+	std::unique_ptr<IFunctionConnection> connection;
+	// True when the connection came from the worker pool (subprocess only).
+	// Caller uses this to decide whether to retry with a fresh connection if
+	// the first RPC after acquire — typically PerformInit — throws IOException
+	// (a stale-pool indicator). Always false for HTTP transport.
+	bool from_pool = false;
+};
+
+// Acquire a FunctionConnection without firing a bind RPC. Use when the caller
+// has a cached BindResult from an earlier planner-phase bind and is about to
+// call PerformInit directly. The init RPC's payload carries bind_request_bytes
+// + opaque_data inline, so the worker reconstructs bind context from the init
+// request alone — a wire-level second bind is redundant.
+//
+// The caller is responsible for stale-pool retry around the first RPC on the
+// returned connection: catch IOException, and if from_pool, call this helper
+// again with `force_fresh = true` to bypass the pool and retry.
+AcquireForInitResult AcquireConnectionForInit(ClientContext &context, const FunctionConnectionParams &params,
+                                                bool force_fresh = false);
+
 // ============================================================================
 // Function Connection - vgi_rpc Protocol
 // ============================================================================
@@ -149,6 +172,7 @@ public:
 	// by value. The connection does NOT cache the result; callers thread it
 	// into the matching PerformInit / PerformFinalizeInit.
 	BindResult PerformBindRpc() override;
+	void EnsureWorkerSpawned() override;
 
 	// Set the input schema for table-in-out/scalar functions
 	// Must be called before PerformBindRpc() for table-in-out functions
