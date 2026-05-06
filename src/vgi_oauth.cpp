@@ -1464,7 +1464,7 @@ static OAuthTokenSet PerformPKCEFlowImpl(const OAuthChallenge &challenge,
 	auto resource_display = GetResourceDisplayName(resource_meta);
 	auto resource_url = resource_meta.resource;
 
-	svr.Get("/callback", [&code_promise, &expected_state, resource_display, resource_url](const CPPHTTPLIB_NAMESPACE::Request &req,
+	svr.Get("/oauth-callback.html", [&code_promise, &expected_state, resource_display, resource_url](const CPPHTTPLIB_NAMESPACE::Request &req,
 	                                                                         CPPHTTPLIB_NAMESPACE::Response &res) {
 		auto state_param = req.get_param_value("state");
 		auto code_param = req.get_param_value("code");
@@ -1513,7 +1513,7 @@ static OAuthTokenSet PerformPKCEFlowImpl(const OAuthChallenge &challenge,
 	// Use "localhost" instead of "127.0.0.1" in the redirect URI. Azure AD
 	// treats http://localhost specially — matching any port — but does NOT
 	// extend that treatment to http://127.0.0.1.
-	std::string redirect_uri = "http://localhost:" + std::to_string(port) + "/callback";
+	std::string redirect_uri = "http://localhost:" + std::to_string(port) + "/oauth-callback.html";
 
 	// Start server in background thread
 	std::thread server_thread([&svr]() {
