@@ -4,10 +4,13 @@
 
 #include "vgi_exception.hpp"
 #include "vgi_http_client.hpp"
+#include "vgi_launcher_cache.hpp"
 #include "vgi_logging.hpp"
 #include "vgi_stderr_drainer.hpp"
 #include "vgi_subprocess.hpp"
 #include "vgi_transport.hpp"
+#include "vgi_unix_socket.hpp"
+#include "vgi_unix_socket_worker.hpp"
 #include "vgi_worker_pool.hpp"
 
 namespace duckdb {
@@ -118,6 +121,29 @@ UnaryResponseResult InvokePooledUnaryRpc(const UnaryRpcOptions &opts, const std:
 	if (IsHttpTransport(opts.worker_path)) {
 		return HttpInvokeUnary(opts.context, opts.worker_path, method_name, params, opts.auth,
 		                        opts.cookie_jar, opts.cached_http_params);
+	}
+
+	if (IsLaunchLocation(opts.worker_path) || IsUnixLocation(opts.worker_path)) {
+		// AF_UNIX path: resolve socket via the launcher cache (which fires
+		// the launcher on first call per process), open a fresh AF_UNIX
+		// connection, drive the same WriteRpcRequest / ReadUnaryResponse
+		// wire-protocol code through a UnixSocketWorker.  No pooling — the
+		// long-lived worker behind the socket is itself the pool.
+		//
+		// ``ResolveAndConnect`` does a single-retry dance through the cache:
+		// if the cached worker has idle-shut-down between calls, the connect
+		// fails, the cache is invalidated, the launcher fires fresh, and we
+		// reconnect.  Without this, every idle-timeout would surface as a
+		// query error.
+		auto sock = ResolveAndConnect(opts.worker_path);
+		UnixSocketWorker worker(sock.Release());
+		if (params) {
+			WriteRpcRequest(worker.GetStdinFd(), method_name, params);
+		} else {
+			WriteEmptyRpcRequest(worker.GetStdinFd(), method_name);
+		}
+		auto *log_ctx = opts.enable_logging ? &opts.context : nullptr;
+		return ReadUnaryResponse(worker.GetStdoutFd(), log_ctx, opts.worker_path, /*pid=*/-1);
 	}
 
 	try {

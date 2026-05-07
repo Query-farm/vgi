@@ -9,6 +9,7 @@
 #include "generated/vgi_protocol_constants.hpp"
 #include "vgi_exception.hpp"
 #include "vgi_http_function_connection.hpp"
+#include "vgi_launcher_cache.hpp"
 #include "vgi_logging.hpp"
 #include "vgi_rpc_client.hpp"
 #include "vgi_rpc_types.hpp"
@@ -16,6 +17,8 @@
 #include "vgi_schema_registry.hpp"
 #include "vgi_shm_segment.hpp"
 #include "vgi_transport.hpp"
+#include "vgi_unix_socket.hpp"
+#include "vgi_unix_socket_worker.hpp"
 
 namespace duckdb {
 namespace vgi {
@@ -207,6 +210,27 @@ FunctionConnection::FunctionConnection(std::unique_ptr<PooledWorker> pooled_work
 	// invariant: workers always carry a drainer), but cheap if needed.
 	stderr_drainer_ = pooled_worker->ReleaseDrainer();
 	if (!stderr_drainer_ && proc_ && proc_->GetStderrFd() >= 0) {
+		stderr_drainer_ = std::make_unique<StderrDrainer>(proc_->ReleaseStderrFd());
+	}
+}
+
+FunctionConnection::FunctionConnection(std::unique_ptr<SubProcess> proc, const std::string &worker_path,
+                                       const std::string &function_name, const ArrowArguments &arguments,
+                                       const std::vector<uint8_t> &attach_id,
+                                       const std::vector<uint8_t> &transaction_id,
+                                       ClientContext &context, const std::string &function_type,
+                                       const std::vector<uint8_t> &global_execution_id, bool worker_debug,
+                                       const std::map<std::string, Value> &settings,
+                                       const std::vector<VgiSecretRequirement> &required_secrets)
+    : conn_id_hex_(VgiGenerateConnId()), worker_path_(worker_path), function_name_(function_name),
+      function_type_(function_type), arguments_type_(arguments.type), arguments_array_(arguments.array),
+      attach_id_(attach_id), transaction_id_(transaction_id), global_execution_id_(global_execution_id),
+      context_(context), worker_debug_(worker_debug), settings_(settings),
+      required_secrets_(required_secrets), proc_(std::move(proc)) {
+	// AF_UNIX-backed workers (UnixSocketWorker) report stderr_fd_ == -1, so
+	// the drainer attach below is a no-op.  Subprocess-backed adopters do
+	// get a drainer.
+	if (proc_ && proc_->GetStderrFd() >= 0) {
 		stderr_drainer_ = std::make_unique<StderrDrainer>(proc_->ReleaseStderrFd());
 	}
 }
@@ -936,6 +960,13 @@ std::unique_ptr<PooledWorker> FunctionConnection::ReleaseForPooling() {
 	if (!proc_ || proc_->TryWait()) {
 		return nullptr; // process missing or exited
 	}
+	if (!proc_->IsPoolable()) {
+		// AF_UNIX-backed workers are shared via the launcher's socket, not
+		// via DuckDB's per-process worker pool.  The connection just
+		// closes its socket on destruction; the worker keeps running for
+		// the next caller.
+		return nullptr;
+	}
 	bool streaming_in_flight = init_done_ && !data_finished_;
 	if (streaming_in_flight) {
 		return nullptr;
@@ -1029,6 +1060,25 @@ std::unique_ptr<IFunctionConnection> CreateFunctionConnection(
 		    worker_path, function_name, arguments, attach_id, transaction_id, context,
 		    function_type, global_execution_id, worker_debug, settings, required_secrets,
 		    attach_params);
+	}
+	if (IsLaunchLocation(worker_path) || IsUnixLocation(worker_path)) {
+		// AF_UNIX path: resolve the socket via the launcher cache (which
+		// invokes vgi::Launch() on first call per process), open a fresh
+		// AF_UNIX connection, wrap it in a UnixSocketWorker so the
+		// existing FunctionConnection wire-protocol code drives it
+		// without modification.
+		//
+		// ResolveAndConnect handles the cache-staleness retry: if the
+		// cached worker has idle-shut-down between calls, the first
+		// connect fails, the cache is invalidated, the launcher fires
+		// fresh, and we reconnect.  Without this, long-lived DuckDB
+		// sessions would see ECONNREFUSED every time an idle worker times
+		// out (default 300 s).
+		auto sock = ResolveAndConnect(worker_path);
+		auto worker = std::make_unique<UnixSocketWorker>(sock.Release());
+		return std::make_unique<FunctionConnection>(
+		    std::move(worker), worker_path, function_name, arguments, attach_id, transaction_id,
+		    context, function_type, global_execution_id, worker_debug, settings, required_secrets);
 	}
 	// Forward version-key fields so ReleaseForPooling routes this worker back
 	// to the same pool bucket on next release.

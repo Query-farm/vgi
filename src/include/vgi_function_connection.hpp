@@ -159,6 +159,19 @@ public:
 	                   const std::map<std::string, Value> &settings = {},
 	                   const std::vector<VgiSecretRequirement> &required_secrets = {});
 
+	// Adopt a pre-built SubProcess (typically a ``UnixSocketWorker`` from
+	// the AF_UNIX launcher path).  Skips both spawning and the per-path
+	// pool — the SubProcess is treated as already-connected.  ``worker_path``
+	// is for diagnostics only; AF_UNIX workers don't go through the pool.
+	FunctionConnection(std::unique_ptr<SubProcess> proc, const std::string &worker_path,
+	                   const std::string &function_name, const ArrowArguments &arguments,
+	                   const std::vector<uint8_t> &attach_id,
+	                   const std::vector<uint8_t> &transaction_id, ClientContext &context,
+	                   const std::string &function_type = "TABLE",
+	                   const std::vector<uint8_t> &global_execution_id = {}, bool worker_debug = false,
+	                   const std::map<std::string, Value> &settings = {},
+	                   const std::vector<VgiSecretRequirement> &required_secrets = {});
+
 	~FunctionConnection() override;
 
 	// Set shared state for dynamic filter pushdown via tick batches

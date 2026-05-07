@@ -1,0 +1,57 @@
+// © Copyright 2025-2026, Query.Farm LLC - https://query.farm
+// SPDX-License-Identifier: Apache-2.0
+//
+// Per-DuckDB-process cache of resolved launcher socket paths.
+//
+// Without this, every RPC call from a `LOCATION 'launch:…'` ATTACH would
+// re-invoke the full discover-or-spawn dance (probe → flock → maybe spawn
+// → wait for UNIX:<path>).  The first call genuinely needs that work; every
+// subsequent call should just connect AF_UNIX directly to the previously-
+// resolved path.
+
+#pragma once
+
+#include "vgi_unix_socket.hpp"
+
+#include <chrono>
+#include <string>
+
+namespace duckdb {
+namespace vgi {
+
+// Resolve `location` (which must be a "launch:…" or "unix://…" string) to
+// an absolute AF_UNIX socket path.  The first call per `(location, process)`
+// pays the launcher cost; subsequent calls return the cached path until
+// either (a) the cache is explicitly evicted or (b) a probe in this layer
+// detects the worker is gone (caller's responsibility — the cache itself
+// trusts entries until told otherwise).
+//
+// Thread-safe.  Callers that detect a stale cache entry (e.g. AF_UNIX
+// connect refused on the cached path) should call ``InvalidateLauncherSocketCache``
+// so the next caller does the probe-or-spawn dance.
+//
+// Throws ``IOException`` / ``InvalidInputException`` on launcher failure.
+std::string ResolveLauncherSocketPath(const std::string &location);
+
+// Drop the cached socket path for `location`.  Idempotent.
+void InvalidateLauncherSocketCache(const std::string &location);
+
+// Drop every cached entry.  Diagnostic / test helper.
+void ClearLauncherSocketCache();
+
+// Resolve the socket path for *location* and connect via AF_UNIX.  On a
+// connect failure (the cached worker has idle-shut-down or been killed),
+// invalidate the cache, re-resolve (which fires the launcher to spawn a
+// fresh worker), and retry once.  Mirrors the subprocess transport's
+// force_fresh retry policy and is the missing piece that lets long-lived
+// DuckDB sessions survive worker idle-timeouts without manual cache flushes.
+//
+// ``connect_timeout`` defaults to 10s — generous enough to absorb GIL
+// contention and accept-queue delays under burst load.  Throws
+// ``IOException`` on a second consecutive connect failure.
+UnixSocket ResolveAndConnect(
+    const std::string &location,
+    std::chrono::milliseconds connect_timeout = std::chrono::seconds(10));
+
+} // namespace vgi
+} // namespace duckdb

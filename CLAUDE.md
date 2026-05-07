@@ -241,15 +241,28 @@ Catalogs may register additional settings at `ATTACH` time (e.g., `greeting`, `m
 | `worker_debug` | BOOLEAN | false | Enable worker debug output |
 | `oauth_refresh_token` | VARCHAR | (none) | Pre-seed OAuth refresh token for HTTP transport (skips interactive auth) |
 
+## Transports
+
+`LOCATION` accepts four schemes:
+
+- bare command path → **subprocess** transport (default; pooled per-DuckDB-process)
+- `http://...` / `https://...` → **HTTP** transport
+- `unix:///path/to/sock` → **AF_UNIX** transport against a worker started out-of-band
+- `launch:<argv>` → **AF_UNIX** transport with the worker spawned via the launcher
+
+The `launch:` and `unix://` paths share one warm worker process across every DuckDB instance that points at the same `(cmd, args, cwd, VGI_RPC_*-env)` tuple — coordinated system-wide via per-hash flock + AF_UNIX socket.  See `docs/launcher-protocol.md` for the wire-protocol contract (state-dir layout, hash inputs, lockfile semantics) shared with the Python reference launcher in `vgi-rpc/vgi_rpc/launcher.py`.
+
+**Pool diagnostics are subprocess-only.**  `vgi_worker_pool()`, `vgi_worker_pool_stats()`, and `vgi_worker_pool_flush()` operate exclusively on the per-DuckDB-process subprocess pool; they return zero rows for `LAUNCH` / `UNIX` transports because workers there are pooled by the OS-level AF_UNIX socket (one shared process serves every concurrent caller via internal threading), not by DuckDB.  Capacity-planning queries against `vgi_worker_pool()` on a launcher-fronted catalog will look "broken" if you don't know to expect this — it isn't.  Idle launcher workers self-shutdown via the `--idle-timeout` flag (default 300 s); to inspect them, list `${XDG_RUNTIME_DIR:-$TMPDIR}/vgi-rpc[-$UID]/*.meta`.
+
 ## SQL Functions
 
 | Function | Type | Description |
 |----------|------|-------------|
 | `vgi_table_function(worker_path, function_name, args)` | Table | Direct table function execution |
 | `vgi_catalogs(worker_path)` | Table | List available catalogs from a worker |
-| `vgi_worker_pool()` | Table | Diagnostic: list pooled workers (worker_path, pid, age_seconds) |
-| `vgi_worker_pool_stats()` | Table | Diagnostic: hit/miss statistics by worker_path |
-| `vgi_worker_pool_flush()` | Scalar | Clear all pooled workers (returns count flushed) |
+| `vgi_worker_pool()` | Table | Diagnostic: list **subprocess**-pooled workers (worker_path, pid, age_seconds). Returns no rows for `launch:` / `unix://` transports — see *Transports* section. |
+| `vgi_worker_pool_stats()` | Table | Diagnostic: hit/miss statistics by worker_path. Subprocess pool only. |
+| `vgi_worker_pool_flush()` | Scalar | Clear all subprocess-pooled workers (returns count flushed). Has no effect on `launch:` / `unix://` workers. |
 | `vgi_clear_cache()` | Table | Clear cached catalog metadata (schemas, tables, functions, statistics) for all attached VGI catalogs |
 | `vgi_catalog_identity()` | Table | OIDC identity per attached VGI catalog: `catalog_name`, `origin`, `authenticated`, `sub`, `email`, `name`, `issuer`, `claims` (JSON). Claims carry the full decoded id_token payload — reach provider-specific fields via e.g. `claims->>'$.preferred_username'` for Entra, `claims->>'$.hd'` for Google Workspace, etc. |
 

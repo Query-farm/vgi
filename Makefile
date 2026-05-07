@@ -34,6 +34,7 @@ VGI_SIMPLE_WRITABLE_WORKER ?= uv run --project $(HOME)/Development/vgi-python vg
 # a vgi-python worker with writable-catalog support enabled; run them
 # explicitly via `make test_writable` when that worker is available.
 .PHONY: test_subprocess test_subprocess_debug test_http test_http_debug \
+	test_launcher test_launcher_debug \
 	test_http_versioned_tables test_http_versioned_tables_debug \
 	test_http_attach_options test_http_attach_options_debug \
 	test_writable test_writable_debug \
@@ -59,6 +60,55 @@ test_subprocess_debug:
 	VGI_SIMPLE_WRITABLE_WORKER="$(VGI_SIMPLE_WRITABLE_WORKER)" \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
 	./build/debug/test/unittest -j 8 "test/*" "~test/sql/integration/writable/*"
+
+# Launcher transport tests — runs the same .test suite as test_subprocess but
+# with each worker fronted by `launch:` so traffic flows through the C++
+# launcher: ResolveLauncherSocketPath → AF_UNIX → UnixSocketWorker.  Validates
+# that the launcher path produces identical query results to the subprocess
+# path.  Idle workers self-shutdown after the configured timeout (default
+# 300s), so concurrent test runs don't pile up — each unique worker argv
+# gets one warm process shared across every test that uses it.
+#
+# Three tests are excluded from this target because their assertions are
+# subprocess-pool-specific:
+# - vgi_worker_pool.test                          — asserts pool count >= 1
+# - integration/table/filter_echo_partitioned     — asserts >1 distinct
+#                                                   worker_pid across parallel
+#                                                   partitions
+# - integration/attach/versioned_tables_impl      — asserts pool rows for
+#                                                   specific data_version_spec
+#                                                   pairs
+# AF_UNIX workers are pooled by the OS socket (one shared warm worker
+# serves every concurrent caller via internal threading) rather than by
+# DuckDB's per-process subprocess pool; all three assertions are incidental
+# to that, not regressions.
+test_launcher:
+	VGI_TRANSACTOR_DB_DIR="$$(mktemp -d)" \
+	VGI_TEST_WORKER="launch:$(VGI_TEST_WORKER)" \
+	VGI_VERSIONED_WORKER="launch:$(VGI_VERSIONED_WORKER)" \
+	VGI_VERSIONED_TABLES_WORKER="launch:$(VGI_VERSIONED_TABLES_WORKER)" \
+	VGI_ATTACH_OPTIONS_WORKER="launch:$(VGI_ATTACH_OPTIONS_WORKER)" \
+	VGI_SIMPLE_WRITABLE_WORKER="launch:$(VGI_SIMPLE_WRITABLE_WORKER)" \
+	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
+	./build/release/test/unittest -j 8 "test/*" \
+	    "~test/sql/integration/writable/*" \
+	    "~test/sql/vgi_worker_pool.test" \
+	    "~test/sql/integration/table/filter_echo_partitioned.test" \
+	    "~test/sql/integration/attach/versioned_tables_impl.test"
+
+test_launcher_debug:
+	VGI_TRANSACTOR_DB_DIR="$$(mktemp -d)" \
+	VGI_TEST_WORKER="launch:$(VGI_TEST_WORKER)" \
+	VGI_VERSIONED_WORKER="launch:$(VGI_VERSIONED_WORKER)" \
+	VGI_VERSIONED_TABLES_WORKER="launch:$(VGI_VERSIONED_TABLES_WORKER)" \
+	VGI_ATTACH_OPTIONS_WORKER="launch:$(VGI_ATTACH_OPTIONS_WORKER)" \
+	VGI_SIMPLE_WRITABLE_WORKER="launch:$(VGI_SIMPLE_WRITABLE_WORKER)" \
+	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
+	./build/debug/test/unittest -j 8 "test/*" \
+	    "~test/sql/integration/writable/*" \
+	    "~test/sql/vgi_worker_pool.test" \
+	    "~test/sql/integration/table/filter_echo_partitioned.test" \
+	    "~test/sql/integration/attach/versioned_tables_impl.test"
 
 # HTTP transport tests (uses test/run_http_integration.sh)
 #

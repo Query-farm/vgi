@@ -37,6 +37,11 @@ include_directories(duckdb/third_party/zstd/include)
 set(EXTENSION_SOURCES
 src/vgi_extension.cpp
 src/query_farm_telemetry.cpp
+src/vgi_launcher_internal.cpp
+src/vgi_launcher.cpp
+src/vgi_launcher_cache.cpp
+src/vgi_unix_socket.cpp
+src/vgi_unix_socket_worker.cpp
 src/vgi_logging.cpp
 src/vgi_subprocess.cpp
 src/vgi_arrow_ipc.cpp
@@ -96,3 +101,51 @@ install(
   EXPORT "${DUCKDB_EXPORT_SET}"
   LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
   ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
+
+# Optional C++ unit-test binary for the launcher's pure helpers.  Built when
+# ``BUILD_VGI_UNIT_TESTS=ON`` is passed to CMake (or as an env var).  Pure
+# helpers are intentionally DuckDB-free (they throw std::invalid_argument and
+# get translated by the orchestration layer), so the test binary only needs
+# duckdb_mbedtls for SHA-256 — no libduckdb_static, no extension stubs.
+# Run via:
+#     cmake --build build/<config> --target vgi_unit_tests
+#     ./build/<config>/extension/vgi/vgi_unit_tests
+if(BUILD_VGI_UNIT_TESTS OR DEFINED ENV{BUILD_VGI_UNIT_TESTS})
+  add_executable(vgi_unit_tests
+    test/cpp/test_main.cpp
+    test/cpp/test_launcher_internal.cpp
+    test/cpp/test_launcher_python_parity.cpp
+    test/cpp/test_launcher_e2e.cpp
+    test/cpp/test_launcher_flock_parity.cpp
+    test/cpp/test_transport_detection.cpp
+    src/vgi_launcher_internal.cpp
+    src/vgi_unix_socket.cpp
+    src/vgi_launcher.cpp
+    src/vgi_launcher_cache.cpp
+    src/vgi_transport.cpp)
+  target_include_directories(vgi_unit_tests PRIVATE
+    src/include
+    duckdb/src/include
+    duckdb/third_party/catch
+    duckdb/third_party/mbedtls/include)
+  # Layer-3 integration tests in test_launcher_e2e.cpp link against the real
+  # launcher orchestration (which uses duckdb::IOException), so we now do
+  # need libduckdb_static plus the dummy static-extension loader stub that
+  # satisfies the LoadAllExtensions symbol DuckDB references.  The Layer-1 /
+  # Layer-2 helpers themselves stay DuckDB-free but link into the same binary
+  # for convenience.
+  target_link_libraries(vgi_unit_tests
+    duckdb_static
+    dummy_static_extension_loader
+    duckdb_mbedtls)
+
+  # Standalone test worker — tiny AF_UNIX server that satisfies the launcher
+  # contract.  Used by test_launcher_e2e.cpp; no Python required.
+  add_executable(launcher_test_worker test/support/launcher_test_worker.cpp)
+
+  # Inject the worker's absolute path into the test binary so the
+  # integration tests can find it regardless of the cwd they're run from.
+  # ``$<TARGET_FILE:…>`` resolves at generate time to the real on-disk path.
+  target_compile_definitions(vgi_unit_tests PRIVATE
+    "VGI_LAUNCHER_TEST_WORKER_PATH=\"$<TARGET_FILE:launcher_test_worker>\"")
+endif()
