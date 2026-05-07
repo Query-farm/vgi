@@ -1,0 +1,139 @@
+# name: test/sql/integration/filter_pushdown/uuid.test
+# description: Differential filter-pushdown tests for the UUID type.
+#   DuckDB serialises UUID columns and literals through the canonical
+#   `arrow.uuid` extension type
+#   (vgi/duckdb/src/common/arrow/arrow_type_extension.cpp:551). The
+#   worker had no kernel for `equal(extension<arrow.uuid>,
+#   extension<arrow.uuid>)`; the normalisation in
+#   vgi-python/vgi/table_filter_pushdown.py strips the wrapper before
+#   dispatch. This test pins that behavior.
+#
+#   Coverage: =, !=, IS NULL, IS NOT NULL, IN, AND, OR — UUIDs are
+#   commonly used as primary keys, so equality + membership are the
+#   filters that matter. Range comparisons are technically valid but
+#   rarely used in practice, so we don't exercise them here.
+#
+# group: [vgi_integration_filter_pushdown]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# Equality
+# ============================================================================
+
+query II
+SELECT n, u FROM (VALUES
+  (1, '00000000-0000-0000-0000-000000000001'::UUID),
+  (2, '00000000-0000-0000-0000-000000000002'::UUID),
+  (3, NULL::UUID),
+  (4, 'ffffffff-ffff-ffff-ffff-ffffffffffff'::UUID)
+) t(n, u)
+WHERE u = '00000000-0000-0000-0000-000000000002'::UUID
+ORDER BY n;
+----
+2	00000000-0000-0000-0000-000000000002
+
+query II
+SELECT n, u FROM example.echo((SELECT * FROM (VALUES
+  (1, '00000000-0000-0000-0000-000000000001'::UUID),
+  (2, '00000000-0000-0000-0000-000000000002'::UUID),
+  (3, NULL::UUID),
+  (4, 'ffffffff-ffff-ffff-ffff-ffffffffffff'::UUID)
+) v(n, u)))
+WHERE u = '00000000-0000-0000-0000-000000000002'::UUID
+ORDER BY n;
+----
+2	00000000-0000-0000-0000-000000000002
+
+# ============================================================================
+# Inequality
+# ============================================================================
+
+query II
+SELECT n, u FROM (VALUES
+  (1, '00000000-0000-0000-0000-000000000001'::UUID),
+  (2, '00000000-0000-0000-0000-000000000002'::UUID),
+  (3, NULL::UUID),
+  (4, 'ffffffff-ffff-ffff-ffff-ffffffffffff'::UUID)
+) t(n, u)
+WHERE u != '00000000-0000-0000-0000-000000000002'::UUID
+ORDER BY n;
+----
+1	00000000-0000-0000-0000-000000000001
+4	ffffffff-ffff-ffff-ffff-ffffffffffff
+
+query II
+SELECT n, u FROM example.echo((SELECT * FROM (VALUES
+  (1, '00000000-0000-0000-0000-000000000001'::UUID),
+  (2, '00000000-0000-0000-0000-000000000002'::UUID),
+  (3, NULL::UUID),
+  (4, 'ffffffff-ffff-ffff-ffff-ffffffffffff'::UUID)
+) v(n, u)))
+WHERE u != '00000000-0000-0000-0000-000000000002'::UUID
+ORDER BY n;
+----
+1	00000000-0000-0000-0000-000000000001
+4	ffffffff-ffff-ffff-ffff-ffffffffffff
+
+# ============================================================================
+# IS NULL / IS NOT NULL
+# ============================================================================
+
+query II
+SELECT n, u FROM (VALUES
+  (1, '00000000-0000-0000-0000-000000000001'::UUID),
+  (2, NULL::UUID)
+) t(n, u)
+WHERE u IS NULL ORDER BY n;
+----
+2	NULL
+
+query II
+SELECT n, u FROM example.echo((SELECT * FROM (VALUES
+  (1, '00000000-0000-0000-0000-000000000001'::UUID),
+  (2, NULL::UUID)
+) v(n, u)))
+WHERE u IS NULL ORDER BY n;
+----
+2	NULL
+
+# ============================================================================
+# IN
+# ============================================================================
+
+query II
+SELECT n, u FROM (VALUES
+  (1, '00000000-0000-0000-0000-000000000001'::UUID),
+  (2, '00000000-0000-0000-0000-000000000002'::UUID),
+  (3, 'ffffffff-ffff-ffff-ffff-ffffffffffff'::UUID)
+) t(n, u)
+WHERE u IN (
+  '00000000-0000-0000-0000-000000000001'::UUID,
+  'ffffffff-ffff-ffff-ffff-ffffffffffff'::UUID
+)
+ORDER BY n;
+----
+1	00000000-0000-0000-0000-000000000001
+3	ffffffff-ffff-ffff-ffff-ffffffffffff
+
+query II
+SELECT n, u FROM example.echo((SELECT * FROM (VALUES
+  (1, '00000000-0000-0000-0000-000000000001'::UUID),
+  (2, '00000000-0000-0000-0000-000000000002'::UUID),
+  (3, 'ffffffff-ffff-ffff-ffff-ffffffffffff'::UUID)
+) v(n, u)))
+WHERE u IN (
+  '00000000-0000-0000-0000-000000000001'::UUID,
+  'ffffffff-ffff-ffff-ffff-ffffffffffff'::UUID
+)
+ORDER BY n;
+----
+1	00000000-0000-0000-0000-000000000001
+3	ffffffff-ffff-ffff-ffff-ffffffffffff

@@ -1,0 +1,72 @@
+# name: test/sql/integration/filter_pushdown/time_tz.test
+# description: Differential filter-pushdown tests for TIME WITH TIME ZONE.
+#   TIMETZ wraps to the canonical `DuckDB.time_tz` extension type
+#   (vgi/duckdb/src/common/arrow/arrow_type_extension.cpp:561-562).
+#   Same kernel-mismatch failure mode as bool8/UUID; same
+#   normalisation in the worker fixes it.
+#
+#   Scope: only same-offset comparisons. There is a known semantic
+#   divergence between the worker (compares as absolute UTC instant
+#   after stripping the extension wrapper to fixed_size_binary(8))
+#   and DuckDB-native (compares as wall+offset tuple) for TIMETZ
+#   values across different offsets. That is independent of the
+#   kernel-pair fix this test pins; tracking separately.
+#
+# group: [vgi_integration_filter_pushdown]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# Equality (same offset throughout — kernel-pair sanity)
+#
+# We select only the row id, not the TIMETZ value itself, because the
+# example.echo path drops the offset on the return serialisation
+# (`12:00:00+00` round-trips as `12:00:00`). That's a separate display-
+# path bug; it doesn't affect filter pushdown semantics, which is what
+# this test pins.
+# ============================================================================
+
+query I
+SELECT n FROM (VALUES
+  (1, '08:00:00+00'::TIMETZ),
+  (2, '12:00:00+00'::TIMETZ),
+  (3, NULL::TIMETZ),
+  (4, '18:00:00+00'::TIMETZ)
+) t(n, t)
+WHERE t = '12:00:00+00'::TIMETZ ORDER BY n;
+----
+2
+
+query I
+SELECT n FROM example.echo((SELECT * FROM (VALUES
+  (1, '08:00:00+00'::TIMETZ),
+  (2, '12:00:00+00'::TIMETZ),
+  (3, NULL::TIMETZ),
+  (4, '18:00:00+00'::TIMETZ)
+) v(n, t)))
+WHERE t = '12:00:00+00'::TIMETZ ORDER BY n;
+----
+2
+
+# ============================================================================
+# IS NULL
+# ============================================================================
+
+query I
+SELECT n FROM (VALUES (1, '12:00:00+00'::TIMETZ), (2, NULL::TIMETZ)) t(n, t)
+WHERE t IS NULL ORDER BY n;
+----
+2
+
+query I
+SELECT n FROM example.echo((SELECT * FROM (VALUES (1, '12:00:00+00'::TIMETZ), (2, NULL::TIMETZ)) v(n, t)))
+WHERE t IS NULL ORDER BY n;
+----
+2

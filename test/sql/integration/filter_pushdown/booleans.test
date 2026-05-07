@@ -1,0 +1,184 @@
+# name: test/sql/integration/filter_pushdown/booleans.test
+# description: Differential filter-pushdown tests for the BOOLEAN type.
+#   DuckDB serialises filter literals through the canonical Arrow
+#   extension type table — for BOOLEAN that's `arrow.bool8`
+#   (vgi/duckdb/src/common/arrow/arrow_type_extension.cpp:553-555).
+#   That used to trip PyArrow's binary kernels in the worker
+#   (`equal(bool, extension<arrow.bool8>)` has no kernel) and silently
+#   no booleans test existed in this directory. Coverage gap closed
+#   by adding this file — see also
+#   tests/test_filter_pushdown_extension.py in vgi-python.
+#
+#   Each predicate is exercised twice with identical expected rows:
+#
+#     1. Reference query against a DuckDB-native VALUES source.
+#        DuckDB plans + evaluates the filter in-process — no worker.
+#
+#     2. Pushdown query through example.echo (table-in-out passthrough,
+#        filter_pushdown=true, auto_apply_filters=true). DuckDB
+#        serialises the predicate, the worker evaluates it. A
+#        divergence means the worker disagrees with DuckDB on the
+#        predicate's truth value for at least one row.
+#
+#   Coverage: =, !=, IS NULL, IS NOT NULL, IN, AND, OR — covering both
+#   true and false literals against a column with NULLs to exercise
+#   three-valued logic at the boolean kernel boundary.
+#
+# group: [vgi_integration_filter_pushdown]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# Equality with TRUE
+# ============================================================================
+
+query II
+SELECT n, b FROM (VALUES (1, true), (2, false), (3, NULL), (4, true)) t(n, b)
+WHERE b = true ORDER BY n;
+----
+1	true
+4	true
+
+query II
+SELECT n, b FROM example.echo((SELECT * FROM (VALUES (1, true), (2, false), (3, NULL), (4, true)) v(n, b)))
+WHERE b = true ORDER BY n;
+----
+1	true
+4	true
+
+# ============================================================================
+# Equality with FALSE
+# ============================================================================
+
+query II
+SELECT n, b FROM (VALUES (1, true), (2, false), (3, NULL), (4, true)) t(n, b)
+WHERE b = false ORDER BY n;
+----
+2	false
+
+query II
+SELECT n, b FROM example.echo((SELECT * FROM (VALUES (1, true), (2, false), (3, NULL), (4, true)) v(n, b)))
+WHERE b = false ORDER BY n;
+----
+2	false
+
+# ============================================================================
+# Inequality
+# ============================================================================
+
+query II
+SELECT n, b FROM (VALUES (1, true), (2, false), (3, NULL), (4, true)) t(n, b)
+WHERE b != true ORDER BY n;
+----
+2	false
+
+query II
+SELECT n, b FROM example.echo((SELECT * FROM (VALUES (1, true), (2, false), (3, NULL), (4, true)) v(n, b)))
+WHERE b != true ORDER BY n;
+----
+2	false
+
+# ============================================================================
+# IS NULL / IS NOT NULL
+# ============================================================================
+
+query II
+SELECT n, b FROM (VALUES (1, true), (2, false), (3, NULL), (4, true)) t(n, b)
+WHERE b IS NULL ORDER BY n;
+----
+3	NULL
+
+query II
+SELECT n, b FROM example.echo((SELECT * FROM (VALUES (1, true), (2, false), (3, NULL), (4, true)) v(n, b)))
+WHERE b IS NULL ORDER BY n;
+----
+3	NULL
+
+query II
+SELECT n, b FROM (VALUES (1, true), (2, false), (3, NULL), (4, true)) t(n, b)
+WHERE b IS NOT NULL ORDER BY n;
+----
+1	true
+2	false
+4	true
+
+query II
+SELECT n, b FROM example.echo((SELECT * FROM (VALUES (1, true), (2, false), (3, NULL), (4, true)) v(n, b)))
+WHERE b IS NOT NULL ORDER BY n;
+----
+1	true
+2	false
+4	true
+
+# ============================================================================
+# IN / NOT IN
+# ============================================================================
+
+query II
+SELECT n, b FROM (VALUES (1, true), (2, false), (3, NULL), (4, true)) t(n, b)
+WHERE b IN (true) ORDER BY n;
+----
+1	true
+4	true
+
+query II
+SELECT n, b FROM example.echo((SELECT * FROM (VALUES (1, true), (2, false), (3, NULL), (4, true)) v(n, b)))
+WHERE b IN (true) ORDER BY n;
+----
+1	true
+4	true
+
+query II
+SELECT n, b FROM (VALUES (1, true), (2, false), (3, NULL), (4, true)) t(n, b)
+WHERE b IN (true, false) ORDER BY n;
+----
+1	true
+2	false
+4	true
+
+query II
+SELECT n, b FROM example.echo((SELECT * FROM (VALUES (1, true), (2, false), (3, NULL), (4, true)) v(n, b)))
+WHERE b IN (true, false) ORDER BY n;
+----
+1	true
+2	false
+4	true
+
+# ============================================================================
+# AND / OR — boolean column inside compound predicates
+# ============================================================================
+
+query II
+SELECT n, b FROM (VALUES (1, true), (2, false), (3, NULL), (4, true)) t(n, b)
+WHERE b = true AND n > 2 ORDER BY n;
+----
+4	true
+
+query II
+SELECT n, b FROM example.echo((SELECT * FROM (VALUES (1, true), (2, false), (3, NULL), (4, true)) v(n, b)))
+WHERE b = true AND n > 2 ORDER BY n;
+----
+4	true
+
+query II
+SELECT n, b FROM (VALUES (1, true), (2, false), (3, NULL), (4, true)) t(n, b)
+WHERE b = true OR n = 2 ORDER BY n;
+----
+1	true
+2	false
+4	true
+
+query II
+SELECT n, b FROM example.echo((SELECT * FROM (VALUES (1, true), (2, false), (3, NULL), (4, true)) v(n, b)))
+WHERE b = true OR n = 2 ORDER BY n;
+----
+1	true
+2	false
+4	true

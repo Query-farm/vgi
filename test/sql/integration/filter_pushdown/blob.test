@@ -1,0 +1,56 @@
+# name: test/sql/integration/filter_pushdown/blob.test
+# description: Differential filter-pushdown tests for the BLOB type.
+#   BLOBs map to plain Arrow `binary` (no extension wrapping). Pin
+#   equality, IN, and IS NULL behavior, including embedded null bytes
+#   that string types would mishandle.
+#
+# group: [vgi_integration_filter_pushdown]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# Equality with embedded null byte
+# ============================================================================
+
+query II
+SELECT n, b FROM (VALUES
+  (1, '\x00\x01\x02'::BLOB),
+  (2, '\xff\xee\xdd'::BLOB),
+  (3, NULL::BLOB)
+) t(n, b)
+WHERE b = '\xff\xee\xdd'::BLOB ORDER BY n;
+----
+2	\xFF\xEE\xDD
+
+query II
+SELECT n, b FROM example.echo((SELECT * FROM (VALUES
+  (1, '\x00\x01\x02'::BLOB),
+  (2, '\xff\xee\xdd'::BLOB),
+  (3, NULL::BLOB)
+) v(n, b)))
+WHERE b = '\xff\xee\xdd'::BLOB ORDER BY n;
+----
+2	\xFF\xEE\xDD
+
+# ============================================================================
+# IS NULL
+# ============================================================================
+
+query II
+SELECT n, b FROM (VALUES (1, 'data'::BLOB), (2, NULL::BLOB)) t(n, b)
+WHERE b IS NULL ORDER BY n;
+----
+2	NULL
+
+query II
+SELECT n, b FROM example.echo((SELECT * FROM (VALUES (1, 'data'::BLOB), (2, NULL::BLOB)) v(n, b)))
+WHERE b IS NULL ORDER BY n;
+----
+2	NULL

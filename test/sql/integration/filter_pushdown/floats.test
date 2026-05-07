@@ -1,0 +1,99 @@
+# name: test/sql/integration/filter_pushdown/floats.test
+# description: Differential filter-pushdown tests for FLOAT and DOUBLE.
+#   Floating-point types are not extension-wrapped — straight `float` /
+#   `double` Arrow primitives — so the kernel-pair issue from
+#   bool8/UUID doesn't apply. The reason coverage matters here is the
+#   ergonomic edge cases of float comparison: equality on floats is
+#   famously fraught, NaN is unequal to itself, infinities sort by
+#   magnitude. We pin DuckDB-and-worker agreement on each.
+#
+# group: [vgi_integration_filter_pushdown]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# DOUBLE — equality + range
+# ============================================================================
+
+query II
+SELECT n, x FROM (VALUES (1, 1.5::DOUBLE), (2, 2.5::DOUBLE), (3, NULL::DOUBLE), (4, 3.5::DOUBLE)) t(n, x)
+WHERE x = 2.5::DOUBLE ORDER BY n;
+----
+2	2.5
+
+query II
+SELECT n, x FROM example.echo((SELECT * FROM (VALUES (1, 1.5::DOUBLE), (2, 2.5::DOUBLE), (3, NULL::DOUBLE), (4, 3.5::DOUBLE)) v(n, x)))
+WHERE x = 2.5::DOUBLE ORDER BY n;
+----
+2	2.5
+
+query II
+SELECT n, x FROM (VALUES (1, 0.0::DOUBLE), (2, 1.5::DOUBLE), (3, 2.5::DOUBLE)) t(n, x)
+WHERE x > 1.0::DOUBLE ORDER BY n;
+----
+2	1.5
+3	2.5
+
+query II
+SELECT n, x FROM example.echo((SELECT * FROM (VALUES (1, 0.0::DOUBLE), (2, 1.5::DOUBLE), (3, 2.5::DOUBLE)) v(n, x)))
+WHERE x > 1.0::DOUBLE ORDER BY n;
+----
+2	1.5
+3	2.5
+
+# ============================================================================
+# FLOAT
+# ============================================================================
+
+query II
+SELECT n, x FROM (VALUES (1, 1.5::FLOAT), (2, 2.5::FLOAT), (3, 3.5::FLOAT)) t(n, x)
+WHERE x = 2.5::FLOAT ORDER BY n;
+----
+2	2.5
+
+query II
+SELECT n, x FROM example.echo((SELECT * FROM (VALUES (1, 1.5::FLOAT), (2, 2.5::FLOAT), (3, 3.5::FLOAT)) v(n, x)))
+WHERE x = 2.5::FLOAT ORDER BY n;
+----
+2	2.5
+
+# ============================================================================
+# Special values: NaN, ±Infinity
+#
+# DuckDB normalises NaN ordering so `NaN = NaN` returns TRUE — this is a
+# deliberate divergence from IEEE 754 and from most SQL engines, intended
+# to keep aggregations and ORDER BY total. The pushdown path must agree.
+# ============================================================================
+
+query II
+SELECT n, x FROM (VALUES (1, 'nan'::DOUBLE), (2, 1.0::DOUBLE), (3, 'nan'::DOUBLE)) t(n, x)
+WHERE x = 'nan'::DOUBLE ORDER BY n;
+----
+1	nan
+3	nan
+
+query II
+SELECT n, x FROM example.echo((SELECT * FROM (VALUES (1, 'nan'::DOUBLE), (2, 1.0::DOUBLE), (3, 'nan'::DOUBLE)) v(n, x)))
+WHERE x = 'nan'::DOUBLE ORDER BY n;
+----
+1	nan
+3	nan
+
+query II
+SELECT n, x FROM (VALUES (1, '-inf'::DOUBLE), (2, 0.0::DOUBLE), (3, 'inf'::DOUBLE)) t(n, x)
+WHERE x > 1.0::DOUBLE ORDER BY n;
+----
+3	inf
+
+query II
+SELECT n, x FROM example.echo((SELECT * FROM (VALUES (1, '-inf'::DOUBLE), (2, 0.0::DOUBLE), (3, 'inf'::DOUBLE)) v(n, x)))
+WHERE x > 1.0::DOUBLE ORDER BY n;
+----
+3	inf

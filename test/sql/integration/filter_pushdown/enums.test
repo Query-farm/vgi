@@ -1,0 +1,74 @@
+# name: test/sql/integration/filter_pushdown/enums.test
+# description: Differential filter-pushdown tests for ENUM (Arrow
+#   Dictionary) columns. ENUMs are not extension-wrapped — they map to
+#   `dictionary<int8/16/32, utf8>` — but the kernel-pair concern is
+#   different: PyArrow has to dispatch `equal(dict<int, utf8>, utf8)`
+#   which exists, but is easy to miss when implementing custom
+#   filter evaluators. Pin the working behavior.
+#
+# group: [vgi_integration_filter_pushdown]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+CREATE TYPE color AS ENUM ('red', 'green', 'blue');
+
+# ============================================================================
+# Equality
+# ============================================================================
+
+query II
+SELECT n, c FROM (VALUES (1, 'red'::color), (2, 'green'::color), (3, NULL::color), (4, 'blue'::color)) t(n, c)
+WHERE c = 'green'::color ORDER BY n;
+----
+2	green
+
+query II
+SELECT n, c FROM example.echo((SELECT * FROM (VALUES (1, 'red'::color), (2, 'green'::color), (3, NULL::color), (4, 'blue'::color)) v(n, c)))
+WHERE c = 'green'::color ORDER BY n;
+----
+2	green
+
+# ============================================================================
+# IN — multiple enum members
+# ============================================================================
+
+query II
+SELECT n, c FROM (VALUES (1, 'red'::color), (2, 'green'::color), (3, 'blue'::color)) t(n, c)
+WHERE c IN ('red'::color, 'blue'::color) ORDER BY n;
+----
+1	red
+3	blue
+
+query II
+SELECT n, c FROM example.echo((SELECT * FROM (VALUES (1, 'red'::color), (2, 'green'::color), (3, 'blue'::color)) v(n, c)))
+WHERE c IN ('red'::color, 'blue'::color) ORDER BY n;
+----
+1	red
+3	blue
+
+# ============================================================================
+# IS NULL
+# ============================================================================
+
+query II
+SELECT n, c FROM (VALUES (1, 'red'::color), (2, NULL::color)) t(n, c)
+WHERE c IS NULL ORDER BY n;
+----
+2	NULL
+
+query II
+SELECT n, c FROM example.echo((SELECT * FROM (VALUES (1, 'red'::color), (2, NULL::color)) v(n, c)))
+WHERE c IS NULL ORDER BY n;
+----
+2	NULL
+
+statement ok
+DROP TYPE color;

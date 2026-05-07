@@ -1,0 +1,203 @@
+# name: test/sql/integration/filter_pushdown/temporal.test
+# description: Differential filter-pushdown tests for non-extension temporal
+#   types: DATE, TIME, TIMESTAMP, TIMESTAMP_S, TIMESTAMP_MS, TIMESTAMP_NS,
+#   TIMESTAMPTZ. None of these are wrapped in canonical Arrow extension
+#   types, so the kernel-pair issue from bool8/UUID doesn't apply here.
+#   What can go wrong instead is unit/timezone semantics — DuckDB stores
+#   TIMESTAMP at microsecond precision but TIMESTAMP_NS at nanosecond,
+#   and the worker must compare in the column's native unit. These tests
+#   pin that.
+#
+# group: [vgi_integration_filter_pushdown]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# DATE
+# ============================================================================
+
+query II
+SELECT n, d FROM (VALUES
+  (1, '2026-01-01'::DATE),
+  (2, '2026-05-06'::DATE),
+  (3, NULL::DATE),
+  (4, '2027-01-01'::DATE)
+) t(n, d)
+WHERE d = '2026-05-06'::DATE ORDER BY n;
+----
+2	2026-05-06
+
+query II
+SELECT n, d FROM example.echo((SELECT * FROM (VALUES
+  (1, '2026-01-01'::DATE),
+  (2, '2026-05-06'::DATE),
+  (3, NULL::DATE),
+  (4, '2027-01-01'::DATE)
+) v(n, d)))
+WHERE d = '2026-05-06'::DATE ORDER BY n;
+----
+2	2026-05-06
+
+query II
+SELECT n, d FROM (VALUES
+  (1, '2026-01-01'::DATE),
+  (2, '2026-05-06'::DATE),
+  (3, '2027-01-01'::DATE)
+) t(n, d)
+WHERE d > '2026-03-01'::DATE ORDER BY n;
+----
+2	2026-05-06
+3	2027-01-01
+
+query II
+SELECT n, d FROM example.echo((SELECT * FROM (VALUES
+  (1, '2026-01-01'::DATE),
+  (2, '2026-05-06'::DATE),
+  (3, '2027-01-01'::DATE)
+) v(n, d)))
+WHERE d > '2026-03-01'::DATE ORDER BY n;
+----
+2	2026-05-06
+3	2027-01-01
+
+# ============================================================================
+# TIME
+# ============================================================================
+
+query II
+SELECT n, t FROM (VALUES (1, '08:00:00'::TIME), (2, '12:34:56'::TIME), (3, '18:00:00'::TIME)) tab(n, t)
+WHERE t = '12:34:56'::TIME ORDER BY n;
+----
+2	12:34:56
+
+query II
+SELECT n, t FROM example.echo((SELECT * FROM (VALUES (1, '08:00:00'::TIME), (2, '12:34:56'::TIME), (3, '18:00:00'::TIME)) v(n, t)))
+WHERE t = '12:34:56'::TIME ORDER BY n;
+----
+2	12:34:56
+
+# ============================================================================
+# TIMESTAMP (default = TIMESTAMP_US)
+# ============================================================================
+
+query II
+SELECT n, ts FROM (VALUES
+  (1, '2026-05-06 08:00:00'::TIMESTAMP),
+  (2, '2026-05-06 12:34:56.123456'::TIMESTAMP),
+  (3, '2026-05-06 18:00:00'::TIMESTAMP)
+) t(n, ts)
+WHERE ts = '2026-05-06 12:34:56.123456'::TIMESTAMP ORDER BY n;
+----
+2	2026-05-06 12:34:56.123456
+
+query II
+SELECT n, ts FROM example.echo((SELECT * FROM (VALUES
+  (1, '2026-05-06 08:00:00'::TIMESTAMP),
+  (2, '2026-05-06 12:34:56.123456'::TIMESTAMP),
+  (3, '2026-05-06 18:00:00'::TIMESTAMP)
+) v(n, ts)))
+WHERE ts = '2026-05-06 12:34:56.123456'::TIMESTAMP ORDER BY n;
+----
+2	2026-05-06 12:34:56.123456
+
+# Range
+query II
+SELECT n, ts FROM (VALUES
+  (1, '2026-05-06 08:00:00'::TIMESTAMP),
+  (2, '2026-05-06 12:00:00'::TIMESTAMP),
+  (3, '2026-05-06 18:00:00'::TIMESTAMP)
+) t(n, ts)
+WHERE ts > '2026-05-06 10:00:00'::TIMESTAMP ORDER BY n;
+----
+2	2026-05-06 12:00:00
+3	2026-05-06 18:00:00
+
+query II
+SELECT n, ts FROM example.echo((SELECT * FROM (VALUES
+  (1, '2026-05-06 08:00:00'::TIMESTAMP),
+  (2, '2026-05-06 12:00:00'::TIMESTAMP),
+  (3, '2026-05-06 18:00:00'::TIMESTAMP)
+) v(n, ts)))
+WHERE ts > '2026-05-06 10:00:00'::TIMESTAMP ORDER BY n;
+----
+2	2026-05-06 12:00:00
+3	2026-05-06 18:00:00
+
+# ============================================================================
+# TIMESTAMPTZ — timezone-bearing comparisons
+# ============================================================================
+
+query II
+SELECT n, ts FROM (VALUES
+  (1, '2026-05-06 12:00:00+00'::TIMESTAMPTZ),
+  (2, '2026-05-06 13:00:00+01'::TIMESTAMPTZ),
+  (3, '2026-05-06 14:00:00+02'::TIMESTAMPTZ)
+) t(n, ts)
+WHERE ts = '2026-05-06 12:00:00+00'::TIMESTAMPTZ ORDER BY n;
+----
+1	2026-05-06 12:00:00+00
+2	2026-05-06 12:00:00+00
+3	2026-05-06 12:00:00+00
+
+query II
+SELECT n, ts FROM example.echo((SELECT * FROM (VALUES
+  (1, '2026-05-06 12:00:00+00'::TIMESTAMPTZ),
+  (2, '2026-05-06 13:00:00+01'::TIMESTAMPTZ),
+  (3, '2026-05-06 14:00:00+02'::TIMESTAMPTZ)
+) v(n, ts)))
+WHERE ts = '2026-05-06 12:00:00+00'::TIMESTAMPTZ ORDER BY n;
+----
+1	2026-05-06 12:00:00+00
+2	2026-05-06 12:00:00+00
+3	2026-05-06 12:00:00+00
+
+# ============================================================================
+# TIMESTAMP_MS — millisecond precision
+# ============================================================================
+
+query II
+SELECT n, ts FROM (VALUES
+  (1, '2026-05-06 12:00:00.123'::TIMESTAMP_MS),
+  (2, '2026-05-06 12:00:00.456'::TIMESTAMP_MS)
+) t(n, ts)
+WHERE ts = '2026-05-06 12:00:00.456'::TIMESTAMP_MS ORDER BY n;
+----
+2	2026-05-06 12:00:00.456
+
+query II
+SELECT n, ts FROM example.echo((SELECT * FROM (VALUES
+  (1, '2026-05-06 12:00:00.123'::TIMESTAMP_MS),
+  (2, '2026-05-06 12:00:00.456'::TIMESTAMP_MS)
+) v(n, ts)))
+WHERE ts = '2026-05-06 12:00:00.456'::TIMESTAMP_MS ORDER BY n;
+----
+2	2026-05-06 12:00:00.456
+
+# ============================================================================
+# TIMESTAMP_NS — nanosecond precision
+# ============================================================================
+
+query II
+SELECT n, ts FROM (VALUES
+  (1, '2026-05-06 12:00:00.000000001'::TIMESTAMP_NS),
+  (2, '2026-05-06 12:00:00.000000002'::TIMESTAMP_NS)
+) t(n, ts)
+WHERE ts = '2026-05-06 12:00:00.000000002'::TIMESTAMP_NS ORDER BY n;
+----
+2	2026-05-06 12:00:00.000000002
+
+query II
+SELECT n, ts FROM example.echo((SELECT * FROM (VALUES
+  (1, '2026-05-06 12:00:00.000000001'::TIMESTAMP_NS),
+  (2, '2026-05-06 12:00:00.000000002'::TIMESTAMP_NS)
+) v(n, ts)))
+WHERE ts = '2026-05-06 12:00:00.000000002'::TIMESTAMP_NS ORDER BY n;
+----
+2	2026-05-06 12:00:00.000000002
