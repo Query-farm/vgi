@@ -1,5 +1,9 @@
 // © Copyright 2025-2026, Query.Farm LLC - https://query.farm
 // SPDX-License-Identifier: Apache-2.0
+//
+// POSIX-only — see vgi_launcher.cpp's banner for the WASM exclusion policy.
+
+#ifndef __EMSCRIPTEN__
 
 #include "vgi_unix_socket_worker.hpp"
 
@@ -76,3 +80,5 @@ bool UnixSocketWorker::IsLikelyAlive() const {
 
 } // namespace vgi
 } // namespace duckdb
+
+#endif // !__EMSCRIPTEN__

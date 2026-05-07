@@ -1,6 +1,12 @@
 // © Copyright 2025-2026, Query.Farm LLC - https://query.farm
 // SPDX-License-Identifier: Apache-2.0
 
+// AF_UNIX worker launcher — POSIX-only.  Under emscripten the entire
+// translation unit collapses to nothing; LAUNCH/UNIX LOCATION schemes
+// surface a clear "not supported in WASM" error at the dispatch layer
+// (see vgi_function_connection.cpp, vgi_unary_rpc.cpp).
+#ifndef __EMSCRIPTEN__
+
 #include "vgi_launcher.hpp"
 
 #include "duckdb/common/exception.hpp"
@@ -531,3 +537,5 @@ std::string Launch(const LaunchConfig &cfg) {
 
 } // namespace vgi
 } // namespace duckdb
+
+#endif // !__EMSCRIPTEN__

@@ -4,13 +4,18 @@
 
 #include "vgi_exception.hpp"
 #include "vgi_http_client.hpp"
-#include "vgi_launcher_cache.hpp"
 #include "vgi_logging.hpp"
 #include "vgi_stderr_drainer.hpp"
 #include "vgi_subprocess.hpp"
 #include "vgi_transport.hpp"
+#ifndef __EMSCRIPTEN__
+// Launcher / AF_UNIX transport — POSIX only.  Under emscripten the
+// dispatch path short-circuits with InvalidInputException; these
+// supporting headers' .cpp counterparts are empty translation units.
+#include "vgi_launcher_cache.hpp"
 #include "vgi_unix_socket.hpp"
 #include "vgi_unix_socket_worker.hpp"
+#endif
 #include "vgi_worker_pool.hpp"
 
 namespace duckdb {
@@ -124,6 +129,12 @@ UnaryResponseResult InvokePooledUnaryRpc(const UnaryRpcOptions &opts, const std:
 	}
 
 	if (IsLaunchLocation(opts.worker_path) || IsUnixLocation(opts.worker_path)) {
+#ifdef __EMSCRIPTEN__
+		throw InvalidInputException(
+		    "vgi: launch:/unix:// LOCATION schemes require fork()/AF_UNIX and are "
+		    "not supported in WASM builds (worker_path=%s); use http://… instead",
+		    opts.worker_path);
+#else
 		// AF_UNIX path: resolve socket via the launcher cache (which fires
 		// the launcher on first call per process), open a fresh AF_UNIX
 		// connection, drive the same WriteRpcRequest / ReadUnaryResponse
@@ -144,6 +155,7 @@ UnaryResponseResult InvokePooledUnaryRpc(const UnaryRpcOptions &opts, const std:
 		}
 		auto *log_ctx = opts.enable_logging ? &opts.context : nullptr;
 		return ReadUnaryResponse(worker.GetStdoutFd(), log_ctx, opts.worker_path, /*pid=*/-1);
+#endif
 	}
 
 	try {

@@ -1,5 +1,10 @@
 // © Copyright 2025-2026, Query.Farm LLC - https://query.farm
 // SPDX-License-Identifier: Apache-2.0
+//
+// POSIX-only — under emscripten this translation unit is empty.  See
+// vgi_launcher.cpp's banner comment for the policy.
+
+#ifndef __EMSCRIPTEN__
 
 #include "vgi_unix_socket.hpp"
 
@@ -169,3 +174,5 @@ UnixSocket UnixSocket::Connect(const std::string &path, std::chrono::millisecond
 
 } // namespace vgi
 } // namespace duckdb
+
+#endif // !__EMSCRIPTEN__

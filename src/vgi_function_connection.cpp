@@ -9,7 +9,6 @@
 #include "generated/vgi_protocol_constants.hpp"
 #include "vgi_exception.hpp"
 #include "vgi_http_function_connection.hpp"
-#include "vgi_launcher_cache.hpp"
 #include "vgi_logging.hpp"
 #include "vgi_rpc_client.hpp"
 #include "vgi_rpc_types.hpp"
@@ -17,8 +16,14 @@
 #include "vgi_schema_registry.hpp"
 #include "vgi_shm_segment.hpp"
 #include "vgi_transport.hpp"
+#ifndef __EMSCRIPTEN__
+// Launcher / AF_UNIX transport — POSIX only.  Under emscripten the
+// dispatch path below short-circuits with InvalidInputException; the
+// supporting .cpp files are empty translation units.
+#include "vgi_launcher_cache.hpp"
 #include "vgi_unix_socket.hpp"
 #include "vgi_unix_socket_worker.hpp"
+#endif
 
 namespace duckdb {
 namespace vgi {
@@ -1062,6 +1067,12 @@ std::unique_ptr<IFunctionConnection> CreateFunctionConnection(
 		    attach_params);
 	}
 	if (IsLaunchLocation(worker_path) || IsUnixLocation(worker_path)) {
+#ifdef __EMSCRIPTEN__
+		throw InvalidInputException(
+		    "vgi: launch:/unix:// LOCATION schemes require fork()/AF_UNIX and are "
+		    "not supported in WASM builds (worker_path=%s); use http://… instead",
+		    worker_path);
+#else
 		// AF_UNIX path: resolve the socket via the launcher cache (which
 		// invokes vgi::Launch() on first call per process), open a fresh
 		// AF_UNIX connection, wrap it in a UnixSocketWorker so the
@@ -1079,6 +1090,7 @@ std::unique_ptr<IFunctionConnection> CreateFunctionConnection(
 		return std::make_unique<FunctionConnection>(
 		    std::move(worker), worker_path, function_name, arguments, attach_id, transaction_id,
 		    context, function_type, global_execution_id, worker_debug, settings, required_secrets);
+#endif
 	}
 	// Forward version-key fields so ReleaseForPooling routes this worker back
 	// to the same pool bucket on next release.

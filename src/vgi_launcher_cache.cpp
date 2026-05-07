@@ -1,5 +1,13 @@
 // © Copyright 2025-2026, Query.Farm LLC - https://query.farm
 // SPDX-License-Identifier: Apache-2.0
+//
+// POSIX-only — depends on vgi_launcher (fork/exec) and vgi_unix_socket
+// (AF_UNIX).  Under emscripten this translation unit is empty; the
+// dispatch sites in vgi_function_connection / vgi_unary_rpc gate on the
+// same macro and surface a clear error if launch:/unix:// LOCATIONs are
+// used in a WASM build.
+
+#ifndef __EMSCRIPTEN__
 
 #include "vgi_launcher_cache.hpp"
 
@@ -102,3 +110,5 @@ UnixSocket ResolveAndConnect(const std::string &location,
 
 } // namespace vgi
 } // namespace duckdb
+
+#endif // !__EMSCRIPTEN__
