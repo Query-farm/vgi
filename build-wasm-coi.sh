@@ -4,6 +4,26 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# ── Flags ────────────────────────────────────────────────────────────────
+# Spatial is disabled by default; pass --with-spatial to include it.
+WITH_SPATIAL=0
+for arg in "$@"; do
+  case "$arg" in
+    --with-spatial) WITH_SPATIAL=1 ;;
+    --no-spatial)   WITH_SPATIAL=0 ;;
+    -h|--help)
+      echo "Usage: $0 [--with-spatial|--no-spatial]"
+      echo "  --with-spatial  Build the spatial extension (default: off)"
+      echo "  --no-spatial    Skip the spatial extension (default)"
+      exit 0
+      ;;
+    *)
+      echo "Unknown argument: $arg" >&2
+      exit 1
+      ;;
+  esac
+done
+
 # ── Paths ────────────────────────────────────────────────────────────────
 EMSDK_DIR=~/Development/wasm-upgrades/emsdk
 DUCKDB_WASM_DIR=~/Development/wasm-upgrades/duckdb-wasm
@@ -24,8 +44,16 @@ mkdir -p "$BUILD_DIR"
 ln -s ../../vcpkg_installed "$BUILD_DIR/vcpkg_installed"
 
 # ── Configure ────────────────────────────────────────────────────────────
+EXTENSION_CONFIGS="$SCRIPT_DIR/extension_config_wasm.cmake"
+if [ "$WITH_SPATIAL" = "1" ]; then
+  EXTENSION_CONFIGS="$EXTENSION_CONFIGS;$SCRIPT_DIR/extension_config_wasm_spatial.cmake"
+  echo "Spatial extension: ENABLED"
+else
+  echo "Spatial extension: DISABLED (pass --with-spatial to enable)"
+fi
+
 emcmake cmake \
-  -DDUCKDB_EXTENSION_CONFIGS="$SCRIPT_DIR/extension_config_wasm.cmake" \
+  -DDUCKDB_EXTENSION_CONFIGS="$EXTENSION_CONFIGS" \
   -DWASM_LOADABLE_EXTENSIONS=1 \
   -DBUILD_EXTENSIONS_ONLY=1 \
   -DEXTENSION_STATIC_BUILD=1 \
@@ -43,7 +71,7 @@ emcmake cmake \
 
 # ── Patch spatial extension for GDAL 3.10+ API changes ──────────────────
 GDAL_MODULE="$BUILD_DIR/_deps/spatial_extension_fc-src/src/spatial/modules/gdal/gdal_module.cpp"
-if [ -f "$GDAL_MODULE" ]; then
+if [ "$WITH_SPATIAL" = "1" ] && [ -f "$GDAL_MODULE" ]; then
   sed -i '' \
     -e 's/VSIVirtualHandle \*Open(const char \*gdal_file_path, const char \*access, bool set_error,/VSIVirtualHandleUniquePtr Open(const char *gdal_file_path, const char *access, bool set_error,/' \
     -e 's/return new DuckDBFileHandle(std::move(file));/return VSIVirtualHandleUniquePtr(new DuckDBFileHandle(std::move(file)));/' \
@@ -151,7 +179,7 @@ fi
 
 # Fix spatial extension's vcpkg libs: use threads triplet, exclude libcrypto/libssl/libcurl
 SPATIAL_CMAKE="$BUILD_DIR/_deps/spatial_extension_fc-src/CMakeLists.txt"
-if [ -f "$SPATIAL_CMAKE" ]; then
+if [ "$WITH_SPATIAL" = "1" ] && [ -f "$SPATIAL_CMAKE" ]; then
   sed -i '' 's|"../../vcpkg_installed/wasm32-emscripten/lib/lib\*.a"|"../../vcpkg_installed/wasm32-emscripten-threads/lib/libgdal.a" "../../vcpkg_installed/wasm32-emscripten-threads/lib/libproj.a" "../../vcpkg_installed/wasm32-emscripten-threads/lib/libgeos.a" "../../vcpkg_installed/wasm32-emscripten-threads/lib/libgeos_c.a" "../../vcpkg_installed/wasm32-emscripten-threads/lib/libgeotiff.a" "../../vcpkg_installed/wasm32-emscripten-threads/lib/libtiff.a" "../../vcpkg_installed/wasm32-emscripten-threads/lib/libjpeg.a" "../../vcpkg_installed/wasm32-emscripten-threads/lib/libjson-c.a" "../../vcpkg_installed/wasm32-emscripten-threads/lib/liblzma.a" "../../vcpkg_installed/wasm32-emscripten-threads/lib/libexpat.a" "../../vcpkg_installed/wasm32-emscripten-threads/lib/libz.a" "../../vcpkg_installed/wasm32-emscripten-threads/lib/libsqlite3.a"|' "$SPATIAL_CMAKE"
   echo "Patched spatial vcpkg libs (explicit list, threads triplet)"
 fi

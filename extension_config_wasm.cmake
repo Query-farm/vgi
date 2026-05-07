@@ -10,7 +10,3 @@ duckdb_extension_load(vgi
 duckdb_extension_load(json)
 duckdb_extension_load(icu)
 duckdb_extension_load(autocomplete)
-duckdb_extension_load(spatial
-    GIT_URL https://github.com/duckdb/duckdb_spatial
-    GIT_TAG b5ea138
-)
