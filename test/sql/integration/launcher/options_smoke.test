@@ -1,0 +1,65 @@
+# name: test/sql/integration/launcher/options_smoke.test
+# description: launcher_idle_timeout + launcher_state_dir round-trip through ATTACH and the cache
+# group: [vgi_integration_launcher]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+# Skipped under the subprocess transport (where VGI_TEST_WORKER is a bare
+# command, not a `launch:` LOCATION).  The launcher options only apply to
+# the launch: dispatch path and are rejected for any other transport.
+require-env VGI_REQUIRE_LAUNCHER_TRANSPORT
+
+# ============================================================================
+# ATTACH with launcher_idle_timeout — query round-trip succeeds
+# ============================================================================
+
+statement ok
+ATTACH 'example' AS svc (TYPE vgi,
+                         LOCATION '${VGI_TEST_WORKER} --describe',
+                         launcher_idle_timeout 60);
+
+query I
+SELECT count(*) > 0 FROM duckdb_schemas WHERE database_name = 'svc';
+----
+true
+
+statement ok
+DETACH svc;
+
+# ============================================================================
+# Conflict semantics — same LOCATION re-ATTACHed with a different
+# launcher_idle_timeout fails fast (the cache pin fires).  Uses
+# ``--quiet --debug`` to give this test a *different* launch: argv (and
+# therefore a different cache entry) than the basic smoke test above —
+# the unittest binary runs many tests in one process, so the launcher
+# cache persists across .test files.  Without this trick, the first
+# ATTACH below would conflict with whatever a prior test recorded.
+# ============================================================================
+
+statement ok
+ATTACH 'example' AS svc1 (TYPE vgi,
+                          LOCATION '${VGI_TEST_WORKER} --describe --threaded',
+                          launcher_idle_timeout 60);
+
+# Force at least one RPC so the cache entry is fully primed.
+query I
+SELECT count(*) > 0 FROM duckdb_schemas WHERE database_name = 'svc1';
+----
+true
+
+# Now attach the same LOCATION as a different catalog name with a
+# *different* idle_timeout.  This is the conflict the senior review
+# pivoted on — fail-loud, not silent inheritance.
+statement error
+ATTACH 'example' AS svc2 (TYPE vgi,
+                          LOCATION '${VGI_TEST_WORKER} --describe --threaded',
+                          launcher_idle_timeout 120);
+----
+already attached with launcher overrides
+
+statement ok
+DETACH svc1;

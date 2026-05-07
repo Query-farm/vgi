@@ -55,15 +55,53 @@ inline std::string MapOnConflict(OnCreateConflict conflict) {
 // Forward declaration for SessionCookieJar; full definition in vgi_cookie_jar.hpp.
 class SessionCookieJar;
 
+// POD constructor argument for ``VgiAttachParameters``.  Replaces the
+// 8-positional-default-param constructor that previous versions of this
+// struct used — adding the launcher overrides pushed it into the
+// "constructor smell" zone.  All fields default-construct sensibly so
+// callers only set what they care about.  See ``VgiAttachParameters``
+// below for accessor docs.
+struct VgiAttachParametersConfig {
+	std::string worker_path;
+	std::string catalog_name;
+	bool worker_debug = false;
+	bool use_pool = true;
+	std::shared_ptr<CatalogAuth> auth;
+	std::string data_version_spec;
+	std::string implementation_version;
+	std::shared_ptr<SessionCookieJar> cookie_jar;
+	// Per-LOCATION launcher overrides.  Both nullopt by default; when set,
+	// they're applied to the spawn-time ``LaunchConfig`` for `launch:`
+	// LOCATIONs and rejected at parse time for any other transport.
+	std::optional<int64_t> launcher_idle_timeout_seconds;
+	std::optional<std::string> launcher_state_dir;
+};
+
 // Parameters for connecting to a VGI worker
 struct VgiAttachParameters {
+	// Preferred constructor — takes a config struct.  All fields default to
+	// the config's defaults; callers only specify what they care about.
+	explicit VgiAttachParameters(VgiAttachParametersConfig cfg)
+	    : worker_path_(std::move(cfg.worker_path)), catalog_name_(std::move(cfg.catalog_name)),
+	      worker_debug_(cfg.worker_debug), use_pool_(cfg.use_pool), auth_(std::move(cfg.auth)),
+	      data_version_spec_(std::move(cfg.data_version_spec)),
+	      implementation_version_(std::move(cfg.implementation_version)),
+	      cookie_jar_(std::move(cfg.cookie_jar)),
+	      launcher_idle_timeout_seconds_(cfg.launcher_idle_timeout_seconds),
+	      launcher_state_dir_(std::move(cfg.launcher_state_dir)) {
+	}
+
+	// Legacy constructor — thin wrapper for in-tree call sites that haven't
+	// migrated yet.  Forwards to the config-struct constructor.  Will be
+	// removed in a follow-up after every caller is migrated.
 	VgiAttachParameters(const std::string &worker_path, const std::string &catalog_name, bool worker_debug = false,
 	                    bool use_pool = true, std::shared_ptr<CatalogAuth> auth = nullptr,
 	                    std::string data_version_spec = "", std::string implementation_version = "",
 	                    std::shared_ptr<SessionCookieJar> cookie_jar = nullptr)
-	    : worker_path_(worker_path), catalog_name_(catalog_name), worker_debug_(worker_debug), use_pool_(use_pool),
-	      auth_(std::move(auth)), data_version_spec_(std::move(data_version_spec)),
-	      implementation_version_(std::move(implementation_version)), cookie_jar_(std::move(cookie_jar)) {
+	    : VgiAttachParameters(VgiAttachParametersConfig {worker_path, catalog_name, worker_debug, use_pool,
+	                                                     std::move(auth), std::move(data_version_spec),
+	                                                     std::move(implementation_version), std::move(cookie_jar),
+	                                                     std::nullopt, std::nullopt}) {
 	}
 
 	// Lazy-initialized, per-catalog HTTPParams cache.
@@ -122,6 +160,19 @@ struct VgiAttachParameters {
 		return cookie_jar_;
 	}
 
+	// Per-LOCATION launcher overrides — only meaningful when
+	// ``IsLaunchLocation(worker_path())`` is true.  Validation (range,
+	// transport-gating) happens at ATTACH parse time; the cache layer
+	// pins these values to the worker's lifetime and throws
+	// ``BinderException`` on a second ATTACH that disagrees.
+	const std::optional<int64_t> &launcher_idle_timeout_seconds() const {
+		return launcher_idle_timeout_seconds_;
+	}
+
+	const std::optional<std::string> &launcher_state_dir() const {
+		return launcher_state_dir_;
+	}
+
 private:
 	std::string worker_path_;
 	std::string catalog_name_;
@@ -131,6 +182,8 @@ private:
 	std::string data_version_spec_;
 	std::string implementation_version_;
 	std::shared_ptr<SessionCookieJar> cookie_jar_;
+	std::optional<int64_t> launcher_idle_timeout_seconds_;
+	std::optional<std::string> launcher_state_dir_;
 
 	// See GetOrInitHttpParams above for the rationale behind caching these.
 	mutable std::mutex http_params_mutex_;
@@ -512,7 +565,9 @@ CatalogAttachResult InvokeCatalogAttach(const std::string &worker_path, const st
                                         const std::string &data_version_spec = "",
                                         const std::string &implementation_version = "",
                                         const std::shared_ptr<SessionCookieJar> &cookie_jar = nullptr,
-                                        const std::map<std::string, Value> &attach_options = {});
+                                        const std::map<std::string, Value> &attach_options = {},
+                                        std::optional<int64_t> launcher_idle_timeout_seconds = std::nullopt,
+                                        std::optional<std::string> launcher_state_dir = std::nullopt);
 
 // List catalogs exposed by a worker. Returns per-catalog discovery records
 // carrying implementation_version and data_version_spec metadata alongside the

@@ -240,6 +240,8 @@ Catalogs may register additional settings at `ATTACH` time (e.g., `greeting`, `m
 | `pool_timeout` | BIGINT | (global default) | Idle timeout in seconds before pooled workers are removed |
 | `worker_debug` | BOOLEAN | false | Enable worker debug output |
 | `oauth_refresh_token` | VARCHAR | (none) | Pre-seed OAuth refresh token for HTTP transport (skips interactive auth) |
+| `launcher_idle_timeout` | BIGINT seconds | (uses launcher default of 300) | Self-shutdown idle timeout for `launch:` LOCATIONs. Pinned per-LOCATION; conflicting subsequent ATTACHes throw `BinderException`. See [`docs/launcher-tutorial.md`](docs/launcher-tutorial.md). |
+| `launcher_state_dir` | VARCHAR (path) | OS-derived (`$XDG_RUNTIME_DIR/vgi-rpc/` etc.) | Override the launcher's state directory. Escape valve only — does NOT isolate workers from other DuckDB processes with the same `launch:` argv. See [`docs/launcher-options.md`](docs/launcher-options.md). |
 
 ## Transports
 

@@ -28,7 +28,8 @@ namespace {
 [[noreturn]] void Usage(int rc) {
 	std::fprintf(stderr,
 	              "usage: launcher_test_worker --unix PATH [--idle-timeout SEC] "
-	              "[--noisy-prefix N] [--no-bind] [--exit-with N]\n");
+	              "[--noisy-prefix N] [--no-bind] [--exit-with N] "
+	              "[--dump-argv-to FILE]\n");
 	std::exit(rc);
 }
 
@@ -38,6 +39,9 @@ struct Args {
 	int noisy_prefix_lines = 0;  // emit N pre-`UNIX:` noise lines
 	bool no_bind = false;        // skip binding entirely (used to test startup-timeout)
 	int exit_with = -1;          // if >=0, exit immediately with this code
+	std::string dump_argv_path;  // if set, write full argv (one token per line) here
+	                             // before doing anything else.  Used by tests to
+	                             // verify the launcher passed the expected args.
 };
 
 Args ParseArgs(int argc, char **argv) {
@@ -54,6 +58,8 @@ Args ParseArgs(int argc, char **argv) {
 			a.no_bind = true;
 		} else if (s == "--exit-with" && i + 1 < argc) {
 			a.exit_with = std::atoi(argv[++i]);
+		} else if (s == "--dump-argv-to" && i + 1 < argc) {
+			a.dump_argv_path = argv[++i];
 		} else if (s == "-h" || s == "--help") {
 			Usage(0);
 		} else {
@@ -68,6 +74,16 @@ Args ParseArgs(int argc, char **argv) {
 
 int main(int argc, char **argv) {
 	Args args = ParseArgs(argc, argv);
+
+	if (!args.dump_argv_path.empty()) {
+		FILE *f = std::fopen(args.dump_argv_path.c_str(), "w");
+		if (f) {
+			for (int i = 0; i < argc; ++i) {
+				std::fprintf(f, "%s\n", argv[i]);
+			}
+			std::fclose(f);
+		}
+	}
 
 	if (args.exit_with >= 0) {
 		// Test scenario: worker exits before readiness.

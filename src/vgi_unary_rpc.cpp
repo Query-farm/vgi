@@ -146,7 +146,14 @@ UnaryResponseResult InvokePooledUnaryRpc(const UnaryRpcOptions &opts, const std:
 		// fails, the cache is invalidated, the launcher fires fresh, and we
 		// reconnect.  Without this, every idle-timeout would surface as a
 		// query error.
-		auto sock = ResolveAndConnect(opts.worker_path);
+		LaunchOverrides overrides;
+		if (opts.launcher_idle_timeout.has_value()) {
+			overrides.idle_timeout = *opts.launcher_idle_timeout;
+		}
+		if (opts.launcher_state_dir.has_value()) {
+			overrides.state_dir = *opts.launcher_state_dir;
+		}
+		auto sock = ResolveAndConnect(opts.worker_path, std::chrono::seconds(10), overrides);
 		UnixSocketWorker worker(sock.Release());
 		if (params) {
 			WriteRpcRequest(worker.GetStdinFd(), method_name, params);

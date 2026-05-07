@@ -218,6 +218,14 @@ AggregateRpcResult InvokeAggregateRpc(ClientContext &context, const VgiAggregate
 	                      bind_data.attach_params->auth(),
 	                      bind_data.attach_params->cookie_jar(),
 	                      enable_logging};
+	// Forward launcher overrides for `launch:` LOCATIONs (no-op for other transports).
+	if (bind_data.attach_params->launcher_idle_timeout_seconds().has_value()) {
+		opts.launcher_idle_timeout =
+		    std::chrono::seconds(*bind_data.attach_params->launcher_idle_timeout_seconds());
+	}
+	if (bind_data.attach_params->launcher_state_dir().has_value()) {
+		opts.launcher_state_dir = *bind_data.attach_params->launcher_state_dir();
+	}
 	auto response = InvokePooledUnaryRpc(opts, method_name, params);
 
 	// Outer envelope unwrap + schema validation against the registry.

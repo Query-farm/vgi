@@ -89,6 +89,7 @@ test_launcher:
 	VGI_VERSIONED_TABLES_WORKER="launch:$(VGI_VERSIONED_TABLES_WORKER)" \
 	VGI_ATTACH_OPTIONS_WORKER="launch:$(VGI_ATTACH_OPTIONS_WORKER)" \
 	VGI_SIMPLE_WRITABLE_WORKER="launch:$(VGI_SIMPLE_WRITABLE_WORKER)" \
+	VGI_REQUIRE_LAUNCHER_TRANSPORT=1 \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
 	./build/release/test/unittest -j 8 "test/*" \
 	    "~test/sql/integration/writable/*" \
@@ -103,6 +104,7 @@ test_launcher_debug:
 	VGI_VERSIONED_TABLES_WORKER="launch:$(VGI_VERSIONED_TABLES_WORKER)" \
 	VGI_ATTACH_OPTIONS_WORKER="launch:$(VGI_ATTACH_OPTIONS_WORKER)" \
 	VGI_SIMPLE_WRITABLE_WORKER="launch:$(VGI_SIMPLE_WRITABLE_WORKER)" \
+	VGI_REQUIRE_LAUNCHER_TRANSPORT=1 \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
 	./build/debug/test/unittest -j 8 "test/*" \
 	    "~test/sql/integration/writable/*" \

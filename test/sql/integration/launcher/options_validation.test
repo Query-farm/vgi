@@ -1,0 +1,63 @@
+# name: test/sql/integration/launcher/options_validation.test
+# description: ATTACH-time validation matrix for launcher_idle_timeout / launcher_state_dir
+# group: [vgi_integration_launcher]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+# ============================================================================
+# Negative idle timeout — rejected at parse, value-domain check
+# ============================================================================
+
+statement error
+ATTACH 'example' AS svc (TYPE vgi, LOCATION '${VGI_TEST_WORKER}',
+                         launcher_idle_timeout -1);
+----
+launcher_idle_timeout must be >= 0
+
+# ============================================================================
+# Empty state_dir string — rejected at parse
+# ============================================================================
+
+statement error
+ATTACH 'example' AS svc (TYPE vgi, LOCATION '${VGI_TEST_WORKER}',
+                         launcher_state_dir '');
+----
+launcher_state_dir, if set, must not be empty
+
+# ============================================================================
+# Transport-gating — the launcher options are launch:-only.  HTTP, unix://,
+# bare-subprocess LOCATIONs all reject them at parse time with a clear
+# user-facing error.
+# ============================================================================
+
+# HTTP LOCATION + launcher option → BinderException
+statement error
+ATTACH 'example' AS svc (TYPE vgi,
+                         LOCATION 'http://localhost:65535/should-not-resolve',
+                         launcher_idle_timeout 60);
+----
+launcher_idle_timeout / launcher_state_dir are only valid for `launch:` LOCATIONs
+
+# unix:// LOCATION + launcher option → BinderException
+statement error
+ATTACH 'example' AS svc (TYPE vgi,
+                         LOCATION 'unix:///tmp/should-not-exist.sock',
+                         launcher_state_dir '/tmp/some-dir');
+----
+launcher_idle_timeout / launcher_state_dir are only valid for `launch:` LOCATIONs
+
+# Bare subprocess LOCATION (the existing default transport) + launcher option
+# → BinderException.  Uses VGI_TEST_WORKER which test_subprocess passes as a
+# bare command and test_launcher passes prefixed with `launch:` — we only
+# exercise the rejection path here, which fires regardless of whether the
+# command is otherwise a valid worker path.
+statement error
+ATTACH 'example' AS svc (TYPE vgi,
+                         LOCATION '/usr/bin/env',
+                         launcher_idle_timeout 60);
+----
+launcher_idle_timeout / launcher_state_dir are only valid for `launch:` LOCATIONs

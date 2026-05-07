@@ -16,6 +16,9 @@
 #include "vgi_unix_socket.hpp"
 
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/exception/binder_exception.hpp"
+
+#include <fstream>
 
 #include <atomic>
 #include <chrono>
@@ -362,4 +365,157 @@ TEST_CASE("Launch acquires lock with bounded timeout under contention",
 
 	::flock(fd, LOCK_UN);
 	::close(fd);
+}
+
+// ---------------------------------------------------------------------------
+// LaunchOverrides — ATTACH-options pin & conflict semantics (the design
+// pivot from the senior-review pass).
+// ---------------------------------------------------------------------------
+
+TEST_CASE("LaunchOverrides::idle_timeout reaches the worker's argv",
+          "[launcher][overrides]") {
+	IsolatedStateDir dir;
+	auto argv_dump = dir.path() + "/argv.txt";
+
+	// Tell the test worker to dump its received argv to a file we can read.
+	auto cfg = BaselineConfig(dir.path(), {"--dump-argv-to", argv_dump});
+	cfg.idle_timeout = 7s;
+	auto path = duckdb::vgi::Launch(cfg);
+	REQUIRE(!path.empty());
+
+	// Connect once so the worker fully wakes up + writes argv to disk
+	// (the dump happens before bind, but join-with-fs to be safe).
+	{
+		auto sock = UnixSocket::Connect(path);
+		REQUIRE(sock.IsOpen());
+	}
+
+	// Wait briefly for the file to materialise (fork/exec is async).
+	auto deadline = std::chrono::steady_clock::now() + 1s;
+	while (std::chrono::steady_clock::now() < deadline) {
+		struct stat st;
+		if (::stat(argv_dump.c_str(), &st) == 0 && st.st_size > 0) {
+			break;
+		}
+		std::this_thread::sleep_for(20ms);
+	}
+
+	std::ifstream f(argv_dump);
+	std::string line;
+	std::vector<std::string> argv_lines;
+	while (std::getline(f, line)) {
+		argv_lines.push_back(line);
+	}
+	INFO("argv_dump contents:\n" << [&]() {
+		std::string joined;
+		for (auto &l : argv_lines) {
+			joined += l + "\n";
+		}
+		return joined;
+	}());
+	// We expect the launcher to have appended `--idle-timeout 7` (the
+	// %.3f formatter strips the trailing zeros so it's literally "7").
+	bool found_flag = false;
+	bool found_value = false;
+	for (size_t i = 0; i + 1 < argv_lines.size(); ++i) {
+		if (argv_lines[i] == "--idle-timeout") {
+			found_flag = true;
+			if (argv_lines[i + 1] == "7") {
+				found_value = true;
+			}
+		}
+	}
+	REQUIRE(found_flag);
+	REQUIRE(found_value);
+}
+
+TEST_CASE("ResolveAndConnect with overrides pins them on first cache miss",
+          "[launcher][overrides]") {
+	IsolatedStateDir dir;
+	std::string location = "launch:" + TestWorkerPath();
+
+	// Make sure no prior cache state from other tests leaks in.
+	duckdb::vgi::ClearLauncherSocketCache();
+
+	duckdb::vgi::LaunchOverrides ov;
+	ov.idle_timeout = 30s;
+	ov.state_dir = dir.path();
+
+	auto sock1 = duckdb::vgi::ResolveAndConnect(location, std::chrono::seconds(10), ov);
+	REQUIRE(sock1.IsOpen());
+
+	// Same overrides → cache hit, succeeds.
+	auto sock2 = duckdb::vgi::ResolveAndConnect(location, std::chrono::seconds(10), ov);
+	REQUIRE(sock2.IsOpen());
+
+	// Different idle_timeout → BinderException (the pin fires).
+	duckdb::vgi::LaunchOverrides ov2 = ov;
+	ov2.idle_timeout = 60s;
+	REQUIRE_THROWS_AS(duckdb::vgi::ResolveAndConnect(location, std::chrono::seconds(10), ov2),
+	                   duckdb::BinderException);
+
+	// Different state_dir → also BinderException.
+	duckdb::vgi::LaunchOverrides ov3 = ov;
+	ov3.state_dir = "/tmp/some-other-state-dir";
+	REQUIRE_THROWS_AS(duckdb::vgi::ResolveAndConnect(location, std::chrono::seconds(10), ov3),
+	                   duckdb::BinderException);
+
+	duckdb::vgi::ClearLauncherSocketCache();
+}
+
+TEST_CASE("Cache invalidation resets the override pin",
+          "[launcher][overrides]") {
+	IsolatedStateDir dir;
+	std::string location = "launch:" + TestWorkerPath();
+	duckdb::vgi::ClearLauncherSocketCache();
+
+	// First ATTACH with overrides A.
+	duckdb::vgi::LaunchOverrides ov_a;
+	ov_a.idle_timeout = 30s;
+	ov_a.state_dir = dir.path();
+	{
+		auto sock = duckdb::vgi::ResolveAndConnect(location, std::chrono::seconds(10), ov_a);
+		REQUIRE(sock.IsOpen());
+	}
+
+	// Simulate worker being gone (eg idle-shut-down) by clearing the cache —
+	// equivalent to the ResolveAndConnect retry path's invalidation step.
+	duckdb::vgi::InvalidateLauncherSocketCache(location);
+
+	// Now overrides B should be accepted (the pin was reset with the
+	// cache entry).
+	IsolatedStateDir dir_b;
+	duckdb::vgi::LaunchOverrides ov_b;
+	ov_b.idle_timeout = 60s;
+	ov_b.state_dir = dir_b.path();
+	{
+		auto sock = duckdb::vgi::ResolveAndConnect(location, std::chrono::seconds(10), ov_b);
+		REQUIRE(sock.IsOpen());
+	}
+
+	duckdb::vgi::ClearLauncherSocketCache();
+}
+
+TEST_CASE("LaunchOverrides::state_dir routes the worker into the requested directory",
+          "[launcher][overrides]") {
+	IsolatedStateDir dir_x;
+	std::string location = "launch:" + TestWorkerPath();
+	duckdb::vgi::ClearLauncherSocketCache();
+
+	duckdb::vgi::LaunchOverrides ov;
+	ov.state_dir = dir_x.path();
+	auto sock = duckdb::vgi::ResolveAndConnect(location, std::chrono::seconds(10), ov);
+	REQUIRE(sock.IsOpen());
+
+	// Find at least one .sock file under dir_x — proves the override flowed
+	// through to the launcher's spawn-time state dir.
+	int sock_count = 0;
+	for (const auto &entry : std::filesystem::directory_iterator(dir_x.path())) {
+		if (entry.path().extension() == ".sock") {
+			++sock_count;
+		}
+	}
+	REQUIRE(sock_count == 1);
+
+	duckdb::vgi::ClearLauncherSocketCache();
 }

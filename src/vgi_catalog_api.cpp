@@ -210,6 +210,15 @@ static UnaryResponseResult InvokeRpcMethod(const CatalogRpcContext &ctx, const s
 		if (IsHttpTransport(ctx.params->worker_path())) {
 			opts.cached_http_params = ctx.params->GetOrInitHttpParams(context, ctx.params->worker_path());
 		}
+		// Forward launcher overrides for `launch:` LOCATIONs.  Empty
+		// optionals on every other transport — no per-call cost.
+		if (ctx.params->launcher_idle_timeout_seconds().has_value()) {
+			opts.launcher_idle_timeout =
+			    std::chrono::seconds(*ctx.params->launcher_idle_timeout_seconds());
+		}
+		if (ctx.params->launcher_state_dir().has_value()) {
+			opts.launcher_state_dir = *ctx.params->launcher_state_dir();
+		}
 		auto result = InvokePooledUnaryRpc(opts, method_name, params);
 		instr.MarkOk();
 		return result;
@@ -319,9 +328,25 @@ CatalogAttachResult InvokeCatalogAttach(const std::string &worker_path, const st
                                         const std::string &data_version_spec,
                                         const std::string &implementation_version,
                                         const std::shared_ptr<SessionCookieJar> &cookie_jar,
-                                        const std::map<std::string, Value> &attach_options) {
-	auto temp_params = std::make_shared<VgiAttachParameters>(worker_path, "", worker_debug, use_pool, auth,
-	                                                         data_version_spec, implementation_version, cookie_jar);
+                                        const std::map<std::string, Value> &attach_options,
+                                        std::optional<int64_t> launcher_idle_timeout_seconds,
+                                        std::optional<std::string> launcher_state_dir) {
+	// Use the config struct so launcher overrides flow into the temp_params.
+	// Without these, the catalog_attach RPC would prime the launcher cache
+	// with [defaults]; the subsequent real ATTACH (carrying overrides) would
+	// then trip the cache pin's BinderException, breaking even one-shot
+	// queries with custom launcher options.
+	VgiAttachParametersConfig temp_cfg;
+	temp_cfg.worker_path = worker_path;
+	temp_cfg.worker_debug = worker_debug;
+	temp_cfg.use_pool = use_pool;
+	temp_cfg.auth = auth;
+	temp_cfg.data_version_spec = data_version_spec;
+	temp_cfg.implementation_version = implementation_version;
+	temp_cfg.cookie_jar = cookie_jar;
+	temp_cfg.launcher_idle_timeout_seconds = launcher_idle_timeout_seconds;
+	temp_cfg.launcher_state_dir = launcher_state_dir;
+	auto temp_params = std::make_shared<VgiAttachParameters>(std::move(temp_cfg));
 	CatalogRpcContext ctx{temp_params, {}, {}};
 
 	std::vector<uint8_t> options_ipc_bytes;

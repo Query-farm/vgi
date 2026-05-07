@@ -341,6 +341,11 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	string bearer_token;
 	string data_version_spec;
 	string implementation_version;
+	// Per-LOCATION launcher overrides — only valid with ``launch:`` LOCATIONs;
+	// rejected at parse time for any other transport.  -1 sentinel for "unset"
+	// on the integer; std::nullopt-equivalent on the string is empty.
+	int64_t launcher_idle_timeout_seconds = -1;
+	string launcher_state_dir;
 	// Unknown-to-the-extension options are forwarded to the worker as
 	// attach-time options after validation against the catalog's declared
 	// AttachOptionSpec list (fetched via InvokeCatalogs when present).
@@ -377,6 +382,18 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 			data_version_spec = entry.second.ToString();
 		} else if (lower_name == "implementation_version") {
 			implementation_version = entry.second.ToString();
+		} else if (lower_name == "launcher_idle_timeout") {
+			launcher_idle_timeout_seconds = entry.second.GetValue<int64_t>();
+			if (launcher_idle_timeout_seconds < 0) {
+				throw BinderException(
+				    "launcher_idle_timeout must be >= 0 (got %lld); use 0 for no timeout",
+				    static_cast<long long>(launcher_idle_timeout_seconds));
+			}
+		} else if (lower_name == "launcher_state_dir") {
+			launcher_state_dir = entry.second.ToString();
+			if (launcher_state_dir.empty()) {
+				throw BinderException("launcher_state_dir, if set, must not be empty");
+			}
 		} else {
 			// Collect for validation + forwarding to the worker.
 			attach_options.emplace(lower_name, entry.second);
@@ -390,6 +407,19 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 
 	if (worker_path.empty()) {
 		throw BinderException("VGI ATTACH requires LOCATION option specifying the worker path");
+	}
+
+	// Launcher overrides are only meaningful for ``launch:`` LOCATIONs.
+	// ``unix://`` connects to an externally-managed worker (we don't spawn,
+	// don't manage state); HTTP and bare-subprocess transports don't go
+	// through the launcher at all.  Reject loudly so users catch typos
+	// or wrong-transport mistakes before they hit the worker.
+	if ((launcher_idle_timeout_seconds >= 0 || !launcher_state_dir.empty()) &&
+	    !vgi::IsLaunchLocation(worker_path)) {
+		throw BinderException(
+		    "launcher_idle_timeout / launcher_state_dir are only valid for `launch:` "
+		    "LOCATIONs (got LOCATION=%s)",
+		    worker_path);
 	}
 
 #ifdef __EMSCRIPTEN__
@@ -498,9 +528,18 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	// Call catalog_attach via RPC. The worker validates data_version_spec and
 	// implementation_version and throws with a human-readable message on
 	// unsatisfiable requests; that surfaces as the ATTACH failure.
+	std::optional<int64_t> launcher_idle_for_attach;
+	std::optional<std::string> launcher_state_dir_for_attach;
+	if (launcher_idle_timeout_seconds >= 0) {
+		launcher_idle_for_attach = launcher_idle_timeout_seconds;
+	}
+	if (!launcher_state_dir.empty()) {
+		launcher_state_dir_for_attach = launcher_state_dir;
+	}
 	auto attach_result = vgi::InvokeCatalogAttach(worker_path, catalog_name, context, worker_debug, use_pool, auth,
 	                                              data_version_spec, implementation_version, cookie_jar,
-	                                              attach_options);
+	                                              attach_options, launcher_idle_for_attach,
+	                                              launcher_state_dir_for_attach);
 
 	// Register extension options for settings exposed by this catalog
 	// Check for type conflicts with existing settings
@@ -611,10 +650,24 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 
 	// Create attach parameters. Resolved versions are what the worker picked;
 	// they're used by the pool key so catalogs attached at different versions
-	// never share a subprocess worker.
-	auto attach_params = std::make_shared<vgi::VgiAttachParameters>(
-	    worker_path, catalog_name, worker_debug, use_pool, auth, attach_result.resolved_data_version,
-	    attach_result.resolved_implementation_version, cookie_jar);
+	// never share a subprocess worker.  Launcher overrides flow through to
+	// the cache layer where they're pinned to the worker's lifetime.
+	vgi::VgiAttachParametersConfig attach_cfg;
+	attach_cfg.worker_path = worker_path;
+	attach_cfg.catalog_name = catalog_name;
+	attach_cfg.worker_debug = worker_debug;
+	attach_cfg.use_pool = use_pool;
+	attach_cfg.auth = auth;
+	attach_cfg.data_version_spec = attach_result.resolved_data_version;
+	attach_cfg.implementation_version = attach_result.resolved_implementation_version;
+	attach_cfg.cookie_jar = cookie_jar;
+	if (launcher_idle_timeout_seconds >= 0) {
+		attach_cfg.launcher_idle_timeout_seconds = launcher_idle_timeout_seconds;
+	}
+	if (!launcher_state_dir.empty()) {
+		attach_cfg.launcher_state_dir = launcher_state_dir;
+	}
+	auto attach_params = std::make_shared<vgi::VgiAttachParameters>(std::move(attach_cfg));
 
 	// Prime the HTTPParams cache while we're outside any VGI catalog
 	// transaction. HTTPFSUtil::InitializeParameters pulls settings/secrets

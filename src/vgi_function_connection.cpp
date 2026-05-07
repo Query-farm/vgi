@@ -1085,7 +1085,19 @@ std::unique_ptr<IFunctionConnection> CreateFunctionConnection(
 		// fresh, and we reconnect.  Without this, long-lived DuckDB
 		// sessions would see ECONNREFUSED every time an idle worker times
 		// out (default 300 s).
-		auto sock = ResolveAndConnect(worker_path);
+		//
+		// Launcher overrides (idle_timeout, state_dir) come from ATTACH
+		// options on attach_params; the cache pins them per-location so
+		// a second ATTACH with conflicting overrides fails fast.
+		LaunchOverrides overrides;
+		if (attach_params && attach_params->launcher_idle_timeout_seconds().has_value()) {
+			overrides.idle_timeout =
+			    std::chrono::seconds(*attach_params->launcher_idle_timeout_seconds());
+		}
+		if (attach_params && attach_params->launcher_state_dir().has_value()) {
+			overrides.state_dir = *attach_params->launcher_state_dir();
+		}
+		auto sock = ResolveAndConnect(worker_path, std::chrono::seconds(10), overrides);
 		auto worker = std::make_unique<UnixSocketWorker>(sock.Release());
 		return std::make_unique<FunctionConnection>(
 		    std::move(worker), worker_path, function_name, arguments, attach_id, transaction_id,

@@ -1,6 +1,8 @@
 #pragma once
 
+#include <chrono>
 #include <memory>
+#include <optional>
 #include <string>
 
 #include <arrow/api.h>
@@ -55,6 +57,13 @@ struct UnaryRpcOptions {
 	// that positional aggregate-init call sites (see vgi_aggregate_function_impl)
 	// don't need changes.
 	std::shared_ptr<HTTPParams> cached_http_params;
+	// Per-LOCATION launcher overrides — only meaningful when ``worker_path``
+	// is a ``launch:`` URL.  Forwarded into ``ResolveAndConnect`` where the
+	// cache layer pins them to the worker's lifetime and throws
+	// ``BinderException`` on conflicting subsequent ATTACHes.  Both nullopt
+	// → use ``LaunchConfig`` defaults.
+	std::optional<std::chrono::milliseconds> launcher_idle_timeout;
+	std::optional<std::string> launcher_state_dir;
 };
 
 // Send a single unary RPC and return the response.
