@@ -1,0 +1,34 @@
+# name: test/sql/integration/aggregate/large_ungrouped.test
+# description: Ungrouped vgi_sum over 1M rows — exercises many update batches
+# group: [vgi_integration_aggregate]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+USE example;
+
+# ============================================================================
+# Large ungrouped sum with many batches (forces multiple update calls)
+# ============================================================================
+
+query I
+SELECT vgi_sum(i::BIGINT) FROM range(1000000) t(i);
+----
+499999500000
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+USE memory;
+
+statement ok
+DETACH example;

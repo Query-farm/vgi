@@ -1,0 +1,41 @@
+# name: test/sql/integration/aggregate/high_cardinality_10k.test
+# description: GROUP BY with 10000 groups, single-threaded
+# group: [vgi_integration_aggregate]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+USE example;
+
+statement ok
+SET threads=1;
+
+# ============================================================================
+# 10000 groups, single-threaded
+# ============================================================================
+
+query I
+SELECT count(*) FROM (
+    SELECT i % 10000 AS grp, vgi_sum(i::BIGINT)
+    FROM range(100000) t(i)
+    GROUP BY grp
+);
+----
+10000
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+USE memory;
+
+statement ok
+DETACH example;

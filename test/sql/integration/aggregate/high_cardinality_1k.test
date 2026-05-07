@@ -1,5 +1,5 @@
-# name: test/sql/integration/aggregate/high_cardinality.test
-# description: High cardinality GROUP BY tests — many groups, large data
+# name: test/sql/integration/aggregate/high_cardinality_1k.test
+# description: GROUP BY with 1000 groups, single- and multi-threaded
 # group: [vgi_integration_aggregate]
 
 require-env VGI_TEST_WORKER
@@ -15,7 +15,7 @@ statement ok
 USE example;
 
 # ============================================================================
-# 1000 groups — verifies per-group-id storage at scale
+# 1000 groups, single-threaded
 # ============================================================================
 
 statement ok
@@ -42,20 +42,7 @@ SELECT s FROM (
 4950000
 
 # ============================================================================
-# 10000 groups — high cardinality, single-threaded
-# ============================================================================
-
-query I
-SELECT count(*) FROM (
-    SELECT i % 10000 AS grp, vgi_sum(i::BIGINT)
-    FROM range(100000) t(i)
-    GROUP BY grp
-);
-----
-10000
-
-# ============================================================================
-# High cardinality with multiple threads
+# 1000 groups, multi-threaded
 # ============================================================================
 
 statement ok
@@ -79,15 +66,6 @@ SELECT s FROM (
 ) sub WHERE grp = 0;
 ----
 4950000
-
-# ============================================================================
-# Large ungrouped sum with many batches (forces multiple update calls)
-# ============================================================================
-
-query I
-SELECT vgi_sum(i::BIGINT) FROM range(1000000) t(i);
-----
-499999500000
 
 # ============================================================================
 # Cleanup
