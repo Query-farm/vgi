@@ -1,0 +1,97 @@
+# name: test/sql/integration/table/order_preservation_modes.test
+# description: Verifies that Meta.preserves_order on a VGI worker function flows
+#              end-to-end onto DuckDB's TableFunction::order_preservation_type.
+#              FIXED_ORDER must collapse multi-worker execution to a single
+#              worker (DuckDB's Pipeline::IsOrderDependent() forces serialisation);
+#              the other two values let the planner parallelise.
+#
+# NOTE: The "FIXED_ORDER -> 1 distinct conn=" assertion is meaningful on the
+# subprocess transport only. Under HTTP transport, DuckDB allocates one
+# FunctionConnection per worker thread eagerly during InitLocalState, so all
+# N pre-allocated connections show up in the per-batch logs even though only
+# one of them actually pulls work from the queue. See "Known HTTP limitations"
+# in CLAUDE.md. The COUNT/SUM correctness checks still hold under both
+# transports.
+# group: [vgi_integration_table]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+require json
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# Need >1 thread for parallelism to be a meaningful signal — single-thread
+# execution is uniformly serialised regardless of order_preservation_type.
+statement ok
+SET threads=4;
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+# ----------------------------------------------------------------------------
+# FIXED_ORDER: planner must serialise → exactly one distinct conn=
+# ----------------------------------------------------------------------------
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# Sanity: full set produced (sum check is order-independent).
+query II
+SELECT COUNT(*), SUM(n)
+FROM example.partitioned_fixed_order(100000);
+----
+100000	4999950000
+
+# The dramatic, deterministic signal: FIXED_ORDER forces the entire pipeline
+# onto a single worker no matter how many threads DuckDB has available.
+query I
+SELECT COUNT(DISTINCT regexp_extract(message, 'conn=([0-9a-f]+)', 1)) = 1
+FROM duckdb_logs()
+WHERE type = 'VGI' AND message LIKE '%batch_received%';
+----
+true
+
+# ----------------------------------------------------------------------------
+# PRESERVES_ORDER: maps to INSERTION_ORDER → planner is free to parallelise
+# ----------------------------------------------------------------------------
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query II
+SELECT COUNT(*), SUM(n)
+FROM example.partitioned_preserves_order(100000);
+----
+100000	4999950000
+
+query I
+SELECT COUNT(DISTINCT regexp_extract(message, 'conn=([0-9a-f]+)', 1)) >= 2
+FROM duckdb_logs()
+WHERE type = 'VGI' AND message LIKE '%batch_received%';
+----
+true
+
+# ----------------------------------------------------------------------------
+# NO_ORDER_GUARANTEE: maps to NO_ORDER → planner is free to parallelise
+# ----------------------------------------------------------------------------
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query II
+SELECT COUNT(*), SUM(n)
+FROM example.partitioned_no_order_guarantee(100000);
+----
+100000	4999950000
+
+query I
+SELECT COUNT(DISTINCT regexp_extract(message, 'conn=([0-9a-f]+)', 1)) >= 2
+FROM duckdb_logs()
+WHERE type = 'VGI' AND message LIKE '%batch_received%';
+----
+true

@@ -37,6 +37,25 @@ std::map<std::string, Value> ExtractVgiSettings(ClientContext &context,
 	return settings;
 }
 
+// Map the wire-format VgiOrderPreservation to DuckDB's OrderPreservationType.
+// Unset (nullopt) collapses to INSERTION_ORDER, matching DuckDB's TableFunction
+// default; FixedOrder forces Pipeline::IsOrderDependent() -> true so the planner
+// serialises the pipeline (single worker emits all rows).
+OrderPreservationType MapOrderPreservation(std::optional<vgi::VgiOrderPreservation> v) {
+	if (!v) {
+		return OrderPreservationType::INSERTION_ORDER;
+	}
+	switch (*v) {
+	case vgi::VgiOrderPreservation::PreservesOrder:
+		return OrderPreservationType::INSERTION_ORDER;
+	case vgi::VgiOrderPreservation::NoOrderGuarantee:
+		return OrderPreservationType::NO_ORDER;
+	case vgi::VgiOrderPreservation::FixedOrder:
+		return OrderPreservationType::FIXED_ORDER;
+	}
+	return OrderPreservationType::INSERTION_ORDER;
+}
+
 } // anonymous namespace
 
 VgiTableFunctionSet::VgiTableFunctionSet(Catalog &catalog, VgiSchemaEntry &schema)
@@ -236,6 +255,7 @@ void VgiTableFunctionSet::LoadEntries(ClientContext &context) {
 				if (func_info.has_finalize) {
 					table_func.in_out_function_final = vgi::VgiTableInOutFinalize;
 				}
+				table_func.order_preservation_type = MapOrderPreservation(func_info.order_preservation);
 
 				// Register named parameters
 				table_func.named_parameters = arg_types.named_parameters;
@@ -254,6 +274,7 @@ void VgiTableFunctionSet::LoadEntries(ClientContext &context) {
 				table_func.projection_pushdown = func_info.projection_pushdown.value_or(false);
 				table_func.filter_pushdown = func_info.filter_pushdown.value_or(false);
 				table_func.sampling_pushdown = func_info.sampling_pushdown.value_or(false);
+				table_func.order_preservation_type = MapOrderPreservation(func_info.order_preservation);
 				if (!func_info.supported_expression_filters.empty()) {
 					table_func.pushdown_expression = vgi::VgiPushdownExpression;
 				}

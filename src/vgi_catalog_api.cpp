@@ -1266,6 +1266,8 @@ std::optional<VgiOrderPreservation> ParseVgiOrderPreservation(const std::string 
 		return VgiOrderPreservation::PreservesOrder;
 	} else if (value == "NO_ORDER_GUARANTEE") {
 		return VgiOrderPreservation::NoOrderGuarantee;
+	} else if (value == "FIXED_ORDER") {
+		return VgiOrderPreservation::FixedOrder;
 	}
 	return std::nullopt;
 }

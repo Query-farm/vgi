@@ -70,6 +70,7 @@ This uses `test/run_http_integration.sh` which starts an HTTP server (`vgi-serve
 - `logging_generator.test` — inline log streaming not supported over HTTP
 - `partitioned_sequence.test` — partition-local state not preserved across HTTP exchanges
 - `buffer_input/sizes.test`, `buffer_input/scale.test_slow` — input buffering semantics differ
+- `order_preservation_modes.test` — under HTTP, DuckDB allocates one `FunctionConnection` per worker thread eagerly, so `FIXED_ORDER` (which serializes the pipeline source to a single thread of *execution*) still surfaces N distinct `conn=` ids in the per-batch logs. Subprocess transport collapses to 1 distinct `conn=` because only one worker is actually acquired from the pool. The assertion is meaningful on subprocess only.
 
 ### Both Transports
 

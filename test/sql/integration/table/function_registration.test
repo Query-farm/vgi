@@ -20,7 +20,8 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
 # ============================================================================
 # Function Inventory
-# 41 pure table functions + 9 table-in-out functions = 50 total table-type functions (+1 overload of an existing group = 51)
+# 44 pure table functions + 9 table-in-out functions = 53 total table-type functions (+1 overload of an existing group = 54)
+# (44 includes the 3 partitioned_*_order fixtures used by order_preservation_modes.test)
 # ============================================================================
 
 # Total table-type function count (includes table-in-out)
@@ -29,7 +30,7 @@ SELECT COUNT(*)
 FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'table';
 ----
-51
+54
 
 # The 33 pure table functions (no TABLE parameter type)
 # Note: make_series appears 5 times (5 overloads), make_pairs appears 3 times,

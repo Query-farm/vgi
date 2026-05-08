@@ -424,11 +424,16 @@ std::optional<VgiFunctionType> ParseVgiFunctionType(const std::string &value);
 // Convert VgiFunctionType to string for error messages
 std::string VgiFunctionTypeToString(VgiFunctionType type);
 
-// Row order preservation behavior for table functions
-// Wire format: uppercase enum name ("PRESERVES_ORDER", "NO_ORDER_GUARANTEE")
+// Row order preservation behavior for table functions.
+// Wire format: uppercase enum name. Maps to DuckDB's OrderPreservationType:
+//   "PRESERVES_ORDER"    -> OrderPreservationType::INSERTION_ORDER (DuckDB default)
+//   "NO_ORDER_GUARANTEE" -> OrderPreservationType::NO_ORDER
+//   "FIXED_ORDER"        -> OrderPreservationType::FIXED_ORDER
+//                           (DuckDB serializes the pipeline -> single worker)
 enum class VgiOrderPreservation {
-	PreservesOrder,    // Output rows are in same order as input rows
-	NoOrderGuarantee   // Output order is undefined (may be reordered)
+	PreservesOrder,    // Output rows preserve insertion order of inputs
+	NoOrderGuarantee,  // Output order is undefined (may be reordered)
+	FixedOrder         // Output is in a fixed mandatory order; DuckDB serializes
 };
 
 // Parse VgiOrderPreservation from wire format string
