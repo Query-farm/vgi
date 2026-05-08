@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <fcntl.h>
 #include <sys/select.h>
 #include <thread>
 
@@ -21,6 +22,28 @@ Pipe::Pipe() {
 	}
 	read_fd = fds[0];
 	write_fd = fds[1];
+	// Mark both ends close-on-exec so subsequent fork+execs in the parent
+	// don't leak this pipe into sibling worker processes.
+	//
+	// Why this matters: SubProcess keeps the parent-side FDs (write end of the
+	// child's stdin, read ends of stdout/stderr) for the lifetime of the worker.
+	// When DuckDB's subprocess pool spawns a SECOND worker via fork+execl,
+	// without CLOEXEC the new child inherits the previous worker's pipe FDs.
+	// Then if DuckDB exits abnormally and every worker reparents to init,
+	// none of them ever sees EOF on its stdin — sibling workers are still
+	// holding the write end alive — and the orphaned cohort lives forever.
+	//
+	// In the child, dup2() onto STDIN/STDOUT/STDERR clears the FD_CLOEXEC flag
+	// on the destination FD, so the worker's stdio survives execl normally.
+	// macOS lacks pipe2(), so we set the flag explicitly via fcntl after pipe().
+	if (::fcntl(read_fd, F_SETFD, FD_CLOEXEC) != 0 || ::fcntl(write_fd, F_SETFD, FD_CLOEXEC) != 0) {
+		int saved = errno;
+		::close(read_fd);
+		::close(write_fd);
+		read_fd = -1;
+		write_fd = -1;
+		throw IOException("Failed to set FD_CLOEXEC on pipe: %s", std::strerror(saved));
+	}
 }
 
 Pipe::~Pipe() {

@@ -290,6 +290,16 @@ SpawnResult SpawnWorker(const std::vector<std::string> &final_argv,
 	if (::pipe(pipefd) != 0) {
 		throw IOException("vgi launcher: pipe() failed: %s", std::strerror(errno));
 	}
+	// CLOEXEC the parent-retained read end so it doesn't leak into any
+	// later fork+exec in the host process.  The child clears CLOEXEC on
+	// pipefd[1] via dup2() onto STDOUT_FILENO before exec.  macOS lacks
+	// pipe2(), so we set both flags explicitly here.
+	if (::fcntl(pipefd[0], F_SETFD, FD_CLOEXEC) != 0 || ::fcntl(pipefd[1], F_SETFD, FD_CLOEXEC) != 0) {
+		int saved = errno;
+		::close(pipefd[0]);
+		::close(pipefd[1]);
+		throw IOException("vgi launcher: fcntl(FD_CLOEXEC) failed: %s", std::strerror(saved));
+	}
 
 	pid_t pid = ::fork();
 	if (pid < 0) {
