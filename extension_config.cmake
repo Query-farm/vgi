@@ -19,7 +19,7 @@ duckdb_extension_load(icu)
 
 duckdb_extension_load(ducklake
     GIT_URL https://github.com/Query-farm/ducklake
-    GIT_TAG 6b16f9866db28a6dd1aaba56a7ff478f09a22dc6
+    GIT_TAG 1f3a722f7ba4bd81bbd1ec51e35a740bc601cc18
 #    INCLUDE_DIR src/ducklake
     LOAD_TESTS
 )

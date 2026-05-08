@@ -326,6 +326,15 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 	bool has_projection_pushdown = false;
 	bool has_filter_pushdown = false;
 	bool has_sampling_pushdown = false;
+	// Default to INSERTION_ORDER (same as DuckDB's TableFunction default).
+	// Overridden below to the resolved function's declared preservation when
+	// at least one overload of the bound function pins it — required so the
+	// virtual-table form (e.g. ``SELECT … FROM k.topics.<topic>``) honours
+	// ``preserves_order = NO_ORDER_GUARANTEE`` declared by the worker.
+	// Without this the planner kept seeing INSERTION_ORDER and forced
+	// CTAS / parallel-friendly insertion paths to serialise.
+	OrderPreservationType resolved_order_preservation = OrderPreservationType::INSERTION_ORDER;
+	bool order_preservation_set = false;
 	std::vector<std::string> scan_supported_expression_filters;
 	std::vector<vgi::VgiSecretRequirement> scan_required_secrets;
 	auto func_entry = catalog_.GetEntry<TableFunctionCatalogEntry>(
@@ -343,6 +352,13 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 			has_projection_pushdown = has_projection_pushdown || tf.projection_pushdown;
 			has_filter_pushdown = has_filter_pushdown || tf.filter_pushdown;
 			has_sampling_pushdown = has_sampling_pushdown || tf.sampling_pushdown;
+			// First overload's order_preservation_type wins. Different overloads
+			// of one function name share the same row-ordering semantics in
+			// practice — the field is per-FunctionInfo, not per-overload.
+			if (!order_preservation_set) {
+				resolved_order_preservation = tf.order_preservation_type;
+				order_preservation_set = true;
+			}
 			// Extract required_secrets from the VgiTableFunctionInfo
 			if (tf.function_info) {
 				auto &vgi_tf_info = tf.function_info->Cast<vgi::VgiTableFunctionInfo>();
@@ -409,6 +425,13 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 	func.projection_pushdown = has_projection_pushdown;
 	func.filter_pushdown = has_filter_pushdown;
 	func.sampling_pushdown = has_sampling_pushdown;
+	// Propagate the worker's declared order preservation to the synthetic
+	// TableFunction so DuckDB's planner sees the right SourceOrder() for
+	// virtual-table scans (e.g. ``k.topics.<topic>``). Without this the
+	// dynamic-catalog path always advertised INSERTION_ORDER and CTAS over
+	// a virtual table forcibly serialised even when the underlying function
+	// is NO_ORDER_GUARANTEE.
+	func.order_preservation_type = resolved_order_preservation;
 	if (!scan_supported_expression_filters.empty()) {
 		func.pushdown_expression = vgi::VgiPushdownExpression;
 	}
