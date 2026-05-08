@@ -971,6 +971,33 @@ SerializedFilters VgiSerializeFilters(ClientContext &context, const vector<colum
 }
 
 // ============================================================================
+// VgiTableFunctionGlobalState::EnsureInitApplied
+// ============================================================================
+// Folds the deferred init RPC's result back into the gstate. Called from
+// init_local (and any other code that needs `global_execution_id` /
+// `primary_connection` populated). First caller pays the wait; the rest
+// see `init_applied=true` and return immediately.
+void VgiTableFunctionGlobalState::EnsureInitApplied() {
+	if (init_applied.load(std::memory_order_acquire)) {
+		return;
+	}
+	std::lock_guard<std::mutex> lk(init_apply_mutex);
+	if (init_applied.load(std::memory_order_relaxed)) {
+		return;
+	}
+	if (pending_init.valid()) {
+		auto applied = pending_init.get();  // blocks until RPC completes
+		global_execution_id = std::move(applied.first.execution_id);
+		max_processes = static_cast<idx_t>(applied.first.max_workers);
+		// primary_connection is uninitialized when async init kicks off —
+		// the lambda returns the connection alongside the InitResult.
+		std::lock_guard<std::mutex> conn_lk(connection_mutex);
+		primary_connection = std::move(applied.second);
+	}
+	init_applied.store(true, std::memory_order_release);
+}
+
+// ============================================================================
 // Init Global Function - Performs init handshake with existing connection
 // ============================================================================
 
@@ -1144,37 +1171,11 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 		connection->SetTickFilterState(tick_filter_state);
 	}
 
-	// Perform init phase via vgi_rpc with projection, filter, join key, order,
-	// and sample pushdown. Init is the first RPC after acquire (we skipped the
-	// historic redundant bind), so it's where stale-pool detection lives:
-	// IOException from a pool-acquired connection means the pooled subprocess
-	// died while idle, and we retry once with a fresh connection. HTTP
-	// transport never enters this branch (from_pool is always false).
-	auto perform_init = [&](IFunctionConnection &c) {
-		return c.PerformInit(bind_result, projection_ids, filter_bytes, join_keys_buffers,
-		                     "", bind_data.order_by_hint, bind_data.table_sample_hint);
-	};
-	InitResult init_result;
-	try {
-		init_result = perform_init(*connection);
-	} catch (const IOException &e) {
-		if (!acquired.from_pool) {
-			throw;
-		}
-		VGI_LOG(context, "worker_pool.stale",
-		        {{"worker_path", bind_data.worker_path()},
-		         {"function_name", bind_data.function_name},
-		         {"phase", "init_global"},
-		         {"error", e.what()}});
-		acquired = AcquireConnectionForInit(context, acquire_params, /*force_fresh=*/true);
-		connection = std::move(acquired.connection);
-		init_result = perform_init(*connection);
-	}
-
+	// Build the gstate up front (everything that doesn't depend on the init
+	// RPC result) and defer PerformInit to a background thread. The
+	// VGI_SYNC_INIT_GLOBAL env var force-disables this fast-path for
+	// regression bisecting.
 	auto global_state = make_uniq<VgiTableFunctionGlobalState>();
-	global_state->global_execution_id = std::move(init_result.execution_id);
-	global_state->max_processes = static_cast<idx_t>(init_result.max_workers);
-	global_state->primary_connection = std::move(connection);
 	global_state->client_context_for_explain = &context;
 	global_state->dynamic_filters = std::move(dynamic_filters);
 	global_state->static_filter_bytes = filter_bytes;
@@ -1183,17 +1184,76 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 	global_state->join_keys_buffers = join_keys_buffers;
 	global_state->order_by_hint = bind_data.order_by_hint;
 	global_state->table_sample_hint = bind_data.table_sample_hint;
+	// Provisional max_processes — actual value is folded in by
+	// EnsureInitApplied once the init future resolves. Setting 1 here
+	// matches the conservative default; for fan-outs of small metadata
+	// reads (Ducklake bind-time scan plan) it has no observable effect.
+	global_state->max_processes = 1;
+
+	const char *sync_env = std::getenv("VGI_SYNC_INIT_GLOBAL");
+	const bool force_sync = sync_env && *sync_env && std::string(sync_env) != "0";
+
+	auto perform_init_with_retry =
+	    [acquire_params, &context_ref = context,
+	     bind_result, projection_ids, filter_bytes, join_keys_buffers,
+	     order_by_hint = bind_data.order_by_hint,
+	     table_sample_hint = bind_data.table_sample_hint,
+	     worker_path = bind_data.worker_path(),
+	     function_name = bind_data.function_name](
+	        std::unique_ptr<IFunctionConnection> conn,
+	        bool from_pool) mutable
+	    -> std::pair<InitResult, std::unique_ptr<IFunctionConnection>> {
+		auto run = [&](IFunctionConnection &c) {
+			return c.PerformInit(bind_result, projection_ids, filter_bytes, join_keys_buffers,
+			                     "", order_by_hint, table_sample_hint);
+		};
+		try {
+			auto r = run(*conn);
+			return std::make_pair(std::move(r), std::move(conn));
+		} catch (const IOException &e) {
+			if (!from_pool) {
+				throw;
+			}
+			VGI_LOG(context_ref, "worker_pool.stale",
+			        {{"worker_path", worker_path},
+			         {"function_name", function_name},
+			         {"phase", "init_global"},
+			         {"error", e.what()}});
+			auto fresh = AcquireConnectionForInit(context_ref, acquire_params, /*force_fresh=*/true);
+			auto fresh_conn = std::move(fresh.connection);
+			auto r = run(*fresh_conn);
+			return std::make_pair(std::move(r), std::move(fresh_conn));
+		}
+	};
+
+	if (force_sync) {
+		auto applied = perform_init_with_retry(std::move(connection), acquired.from_pool);
+		global_state->global_execution_id = std::move(applied.first.execution_id);
+		global_state->max_processes = static_cast<idx_t>(applied.first.max_workers);
+		global_state->primary_connection = std::move(applied.second);
+		global_state->init_applied.store(true, std::memory_order_release);
+	} else {
+		// Hot path: kick off PerformInit on a background thread. The lambda
+		// owns the connection until init returns (then EnsureInitApplied
+		// folds the result + connection back into gstate). Multiple
+		// pipelines hit this path back-to-back during scheduling and run
+		// their RPCs concurrently instead of serializing on the main
+		// thread.
+		global_state->pending_init = std::async(std::launch::async,
+		                                          [run = std::move(perform_init_with_retry),
+		                                           conn = std::move(connection),
+		                                           from_pool = acquired.from_pool]() mutable {
+			                                          return run(std::move(conn), from_pool);
+		                                          });
+	}
 
 	{
-		auto &conn = *global_state->primary_connection;
 		vector<pair<string, string>> fields;
-		fields.emplace_back("conn", conn.GetConnIdHex());
 		fields.emplace_back("worker_path", bind_data.worker_path());
-		AppendSubprocessPidField(fields, conn);
 		fields.emplace_back("function_name", bind_data.function_name);
-		fields.emplace_back("global_execution_id", BytesToHex(global_state->global_execution_id));
 		fields.emplace_back("max_processes", std::to_string(global_state->max_processes));
 		fields.emplace_back("num_projection_columns", std::to_string(projection_ids.size()));
+		fields.emplace_back("init_mode", force_sync ? "sync" : "async");
 		VGI_LOG(context, "table_function.init_global", fields);
 	}
 
@@ -1224,6 +1284,13 @@ unique_ptr<LocalTableFunctionState> VgiTableFunctionInitLocal(ExecutionContext &
                                                               GlobalTableFunctionState *global_state_p) {
 	auto &bind_data = input.bind_data->Cast<VgiTableFunctionBindData>();
 	auto &global_state = global_state_p->Cast<VgiTableFunctionGlobalState>();
+
+	// Block on the deferred init RPC if init_global hand-off was async.
+	// This is the latest point we can wait — running on a task-scheduler
+	// worker thread, not the main thread that schedules events. Multiple
+	// pipelines reach here concurrently so their RPCs effectively ran in
+	// parallel.
+	global_state.EnsureInitApplied();
 
 	auto current_chunk = make_uniq<ArrowArrayWrapper>();
 	auto local_state = make_uniq<VgiTableFunctionLocalState>(std::move(current_chunk), context.client,

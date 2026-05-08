@@ -1,9 +1,11 @@
 #pragma once
 
 #include <atomic>
+#include <future>
 #include <map>
 #include <mutex>
 #include <optional>
+#include <utility>
 
 #include "duckdb/common/arrow/arrow_wrapper.hpp"
 #include "duckdb/function/table/arrow.hpp"
@@ -199,6 +201,30 @@ struct VgiDynamicFilterInfo {
 };
 
 struct VgiTableFunctionGlobalState : public GlobalTableFunctionState {
+	// --- Async init plumbing ----------------------------------------------
+	// DuckDB schedules independent pipelines' `init_global` serially on the
+	// main thread (Executor::ScheduleEventsInternal), so a synchronous HTTP
+	// init RPC blocks every other pipeline's init too. We move the RPC onto
+	// a background thread, return this gstate immediately, and wait on the
+	// future from the worker-thread init_local path before any consumer
+	// touches the connection or execution id. For a fan-out of N independent
+	// metadata reads (typical of a Ducklake bind-time scan plan) this
+	// collapses N × RTT serial latency into a single concurrent batch.
+	using InitFuture = std::future<std::pair<InitResult, std::unique_ptr<IFunctionConnection>>>;
+	// Guarded by `init_apply_mutex`; a single thread (the one that flips
+	// `init_applied` from false to true) calls `.get()` and consumes the
+	// future — every other waiter sees `init_applied == true` and skips.
+	InitFuture pending_init;
+	std::mutex init_apply_mutex;
+	std::atomic<bool> init_applied {false};
+
+	// Block until the deferred init RPC has completed and its result has
+	// been folded into this gstate. Idempotent + thread-safe; safe to call
+	// from any number of init_local / scan threads. After the first call
+	// returns, `global_execution_id`, `max_processes`, and
+	// `primary_connection` are populated and ready to use.
+	void EnsureInitApplied();
+
 	// Global execution identifier for multi-worker coordination
 	std::vector<uint8_t> global_execution_id;
 

@@ -442,6 +442,13 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 	func.get_bind_info = vgi::VgiTableScanGetBindInfo;
 	func.set_scan_order = vgi::VgiSetScanOrder;
 	func.statistics = vgi::VgiTableFunctionStatistics;
+	// INITIALIZE_ON_SCHEDULE moves init_global into Executor::ScheduleEvents'
+	// eager-init loop so all pipelines' init_globals fire from a single
+	// site at scheduling time. Combined with the async kickoff in
+	// VgiTableFunctionInitGlobal this puts every pending RPC in flight
+	// before any pipeline blocks on init_local — collapsing N sequential
+	// RTTs into one parallel batch when the pipelines are independent.
+	func.global_initialization = TableFunctionInitialization::INITIALIZE_ON_SCHEDULE;
 
 	// Set virtual column callbacks for row_id support
 	if (table_info_.row_id_column >= 0) {

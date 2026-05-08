@@ -284,6 +284,14 @@ void VgiTableFunctionSet::LoadEntries(ClientContext &context) {
 				table_func.to_string = vgi::VgiTableFunctionToString;
 				table_func.dynamic_to_string = vgi::VgiTableFunctionDynamicToString;
 				table_func.set_scan_order = vgi::VgiSetScanOrder;
+				// INITIALIZE_ON_SCHEDULE moves init_global into
+				// `Executor::ScheduleEventsInternal`'s eager-init loop so the
+				// pipelines' init_globals all fire from the same site at
+				// scheduling time. Combined with the async kickoff in
+				// VgiTableFunctionInitGlobal, every pending RPC is in flight
+				// before any pipeline blocks on init_local — collapsing N
+				// sequential RTTs into one parallel batch.
+				table_func.global_initialization = TableFunctionInitialization::INITIALIZE_ON_SCHEDULE;
 
 				// Register named parameters so DuckDB knows how to handle them
 				table_func.named_parameters = arg_types.named_parameters;
