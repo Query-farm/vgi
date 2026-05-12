@@ -27,13 +27,25 @@ done
 # ── Paths ────────────────────────────────────────────────────────────────
 EMSDK_DIR=~/Development/wasm-upgrades/emsdk
 DUCKDB_WASM_DIR=~/Development/wasm-upgrades/duckdb-wasm
-DUCKDB_WASM_ARROW="$DUCKDB_WASM_DIR/build/relsize/coi/third_party/arrow/install"
+DUCKDB_WASM_ARROW="$DUCKDB_WASM_DIR/build/relperf/coi/third_party/arrow/install"
 VCPKG_INSTALLED="$SCRIPT_DIR/vcpkg_installed/wasm32-emscripten-threads"
 DEPLOY_DIR="$DUCKDB_WASM_DIR/extensions/v1.5.1/wasm_threads"
 BUILD_DIR="$SCRIPT_DIR/build/wasm_threads"
 
 # ── Activate emsdk ───────────────────────────────────────────────────────
 EMSDK_QUIET=1 source "$EMSDK_DIR/emsdk_env.sh"
+
+# Locate Emscripten's CMake toolchain so vcpkg can chainload to it for the
+# user project (vcpkg's wasm32-emscripten-threads triplet only chainloads for
+# port builds — without VCPKG_CHAINLOAD_TOOLCHAIN_FILE the duckdb project
+# itself falls back to the host /usr/bin/c++).
+: "${EMSCRIPTEN_ROOT:=${EMSDK:-$EMSDK_DIR}/upstream/emscripten}"
+EMSCRIPTEN_TOOLCHAIN="$EMSCRIPTEN_ROOT/cmake/Modules/Platform/Emscripten.cmake"
+if [ ! -f "$EMSCRIPTEN_TOOLCHAIN" ]; then
+  echo "ERROR: Emscripten.cmake not found at $EMSCRIPTEN_TOOLCHAIN" >&2
+  exit 1
+fi
+export EMSCRIPTEN_ROOT
 
 # ── Clean & prepare build directory ──────────────────────────────────────
 rm -rf "$BUILD_DIR"
@@ -42,6 +54,138 @@ mkdir -p "$BUILD_DIR"
 # Symlink vcpkg_installed into build dir so spatial extension's relative
 # glob path (../../vcpkg_installed/...) resolves correctly at link time
 ln -s ../../vcpkg_installed "$BUILD_DIR/vcpkg_installed"
+
+# Merge vcpkg deps from every loaded extension. Each fetched extension
+# (httpfs→openssl+curl, ducklake→roaring, vgi→arrow+openssl, …) declares
+# its own vcpkg.json; cmake's EXTENSION_CONFIG_BUILD pass runs
+# merge_vcpkg_deps.py and writes the combined manifest. Arrow is satisfied
+# at vcpkg-port level via our overlay at vcpkg_overlay_ports/arrow.
+#
+# We invoke cmake directly (rather than `make extension_configuration_wasm`)
+# because that target tail-calls `emmake make` on what was generated as a
+# Ninja build, which fails harmlessly after the merge has already written
+# the manifest.
+echo "Merging vcpkg manifests (cmake EXTENSION_CONFIG_BUILD pass)..."
+rm -rf "$SCRIPT_DIR/build/extension_configuration" "$SCRIPT_DIR/duckdb/build/extension_configuration"
+mkdir -p "$SCRIPT_DIR/build/extension_configuration" "$SCRIPT_DIR/duckdb/build/extension_configuration"
+emcmake cmake \
+  -DDUCKDB_EXTENSION_CONFIGS="$SCRIPT_DIR/extension_config_wasm.cmake" \
+  -DEXTENSION_CONFIG_BUILD=TRUE \
+  -B"$SCRIPT_DIR/build/extension_configuration" \
+  -S"$SCRIPT_DIR/duckdb"
+# merge_vcpkg_deps.py runs as a build-time custom_target. Use cmake --build
+# so we don't care whether the generator is ninja or make. The merge writes
+# to <duckdb>/build/extension_configuration/vcpkg.json (relative to its
+# WORKING_DIRECTORY = PROJECT_SOURCE_DIR = the duckdb submodule).
+cmake --build "$SCRIPT_DIR/build/extension_configuration" --target duckdb_merge_vcpkg_manifests
+cp "$SCRIPT_DIR/duckdb/build/extension_configuration/vcpkg.json" \
+   "$SCRIPT_DIR/build/extension_configuration/vcpkg.json"
+WASM_MANIFEST_DIR="$SCRIPT_DIR/build/extension_configuration"
+
+# Patch cloned httpfs source: make find_package(OpenSSL/CURL) conditional on
+# NOT EMSCRIPTEN. Upstream's httpfs/CMakeLists.txt only links these on
+# non-EMSCRIPTEN; under EMSCRIPTEN it links duckdb_mbedtls instead. The
+# unconditional REQUIRED find_package is a configure-time wart — upstream's
+# shipped 356 KB wasm httpfs.duckdb_extension.wasm contains no openssl/curl
+# symbols, confirming neither is actually used. Skipping find_package avoids
+# building openssl-from-source for wasm32-emscripten-threads (~10 min).
+# httpfs has its own pinned duckdb submodule (8a585197...). FetchContent
+# leaves it empty, but the build can still consult httpfs/duckdb/ for ancillary
+# files (scripts, append_metadata.cmake, third_party paths) — and any mismatch
+# vs the duckdb that built duckdb-coi.wasm shows up at runtime as
+# "function signature mismatch" inside HTTP code paths. Force httpfs/duckdb to
+# be the same tree (and same patches) we built duckdb-coi.wasm from.
+HTTPFS_FC_SRC="$SCRIPT_DIR/build/extension_configuration/_deps/httpfs_extension_fc-src"
+DUCKDB_WASM_DUCKDB="$DUCKDB_WASM_DIR/submodules/duckdb"
+if [ -d "$HTTPFS_FC_SRC" ] && [ -d "$DUCKDB_WASM_DUCKDB" ]; then
+  if [ -L "$HTTPFS_FC_SRC/duckdb" ] || [ -d "$HTTPFS_FC_SRC/duckdb" ]; then
+    rm -rf "$HTTPFS_FC_SRC/duckdb"
+  fi
+  ln -s "$DUCKDB_WASM_DUCKDB" "$HTTPFS_FC_SRC/duckdb"
+  echo "Linked httpfs/duckdb -> $DUCKDB_WASM_DUCKDB (matches the duckdb that built duckdb-coi.wasm)"
+fi
+
+HTTPFS_CMAKE="$SCRIPT_DIR/build/extension_configuration/_deps/httpfs_extension_fc-src/CMakeLists.txt"
+if [ -f "$HTTPFS_CMAKE" ]; then
+  python3 - "$HTTPFS_CMAKE" <<'PYEOF'
+import pathlib, sys
+p = pathlib.Path(sys.argv[1])
+s = p.read_text()
+old = """find_package(OpenSSL REQUIRED)
+find_package(CURL REQUIRED)
+include_directories(${OPENSSL_INCLUDE_DIR})
+include_directories(${CURL_INCLUDE_DIRS})"""
+new = """if(NOT EMSCRIPTEN)
+  find_package(OpenSSL REQUIRED)
+  find_package(CURL REQUIRED)
+  include_directories(${OPENSSL_INCLUDE_DIR})
+  include_directories(${CURL_INCLUDE_DIRS})
+endif()"""
+if old in s:
+    p.write_text(s.replace(old, new))
+    print("Patched httpfs CMakeLists.txt: find_package(OpenSSL/CURL) now guarded by NOT EMSCRIPTEN")
+elif new in s:
+    print("httpfs CMakeLists.txt already patched")
+else:
+    print("WARNING: httpfs CMakeLists.txt patch target not found — has upstream changed?")
+PYEOF
+fi
+
+# Also patch src/CMakeLists.txt: crypto.cpp is in the base HTTPFS_SOURCES list
+# *before* the EMSCRIPTEN branch, so it builds on every platform. crypto.cpp
+# uses openssl headers — should only build on non-EMSCRIPTEN, where the
+# NOT-EMSCRIPTEN branch already adds it (so removing from base is a no-op for
+# native builds and a fix for wasm builds).
+HTTPFS_SRC_CMAKE="$SCRIPT_DIR/build/extension_configuration/_deps/httpfs_extension_fc-src/src/CMakeLists.txt"
+if [ -f "$HTTPFS_SRC_CMAKE" ]; then
+  python3 - "$HTTPFS_SRC_CMAKE" <<'PYEOF'
+import pathlib, sys
+p = pathlib.Path(sys.argv[1])
+s = p.read_text()
+old = """set(HTTPFS_SOURCES
+    hffs.cpp
+    s3fs.cpp
+    httpfs.cpp
+    http_state.cpp
+    crypto.cpp
+    hash_functions.cpp
+    create_secret_functions.cpp
+    httpfs_extension.cpp
+    s3_multi_part_upload.cpp)"""
+new = """set(HTTPFS_SOURCES
+    hffs.cpp
+    s3fs.cpp
+    httpfs.cpp
+    http_state.cpp
+    hash_functions.cpp
+    create_secret_functions.cpp
+    httpfs_extension.cpp
+    s3_multi_part_upload.cpp)"""
+if old in s:
+    p.write_text(s.replace(old, new))
+    print("Patched httpfs src/CMakeLists.txt: removed crypto.cpp from base HTTPFS_SOURCES (now only in NOT EMSCRIPTEN branch)")
+elif new in s:
+    print("httpfs src/CMakeLists.txt already patched")
+else:
+    print("WARNING: httpfs src/CMakeLists.txt patch target not found — has upstream changed?")
+PYEOF
+fi
+
+# Strip openssl/curl from the merged vcpkg manifest: httpfs's vcpkg.json
+# declares them, but under EMSCRIPTEN they are unused (see patch above).
+python3 - "$WASM_MANIFEST_DIR/vcpkg.json" <<'PYEOF'
+import json, pathlib, sys
+p = pathlib.Path(sys.argv[1])
+data = json.loads(p.read_text())
+before = [d if isinstance(d, str) else d.get("name") for d in data["dependencies"]]
+data["dependencies"] = [
+    d for d in data["dependencies"]
+    if (d if isinstance(d, str) else d.get("name")) not in ("openssl", "curl")
+]
+after = [d if isinstance(d, str) else d.get("name") for d in data["dependencies"]]
+p.write_text(json.dumps(data, indent=4))
+print(f"vcpkg deps: {before} -> {after}")
+PYEOF
 
 # ── Configure ────────────────────────────────────────────────────────────
 EXTENSION_CONFIGS="$SCRIPT_DIR/extension_config_wasm.cmake"
@@ -54,6 +198,7 @@ fi
 
 emcmake cmake \
   -DDUCKDB_EXTENSION_CONFIGS="$EXTENSION_CONFIGS" \
+  -DFETCHCONTENT_SOURCE_DIR_HTTPFS_EXTENSION_FC="$SCRIPT_DIR/build/extension_configuration/_deps/httpfs_extension_fc-src" \
   -DWASM_LOADABLE_EXTENSIONS=1 \
   -DBUILD_EXTENSIONS_ONLY=1 \
   -DEXTENSION_STATIC_BUILD=1 \
@@ -61,9 +206,17 @@ emcmake cmake \
   -DCMAKE_C_COMPILER_LAUNCHER=ccache \
   -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
   -DUSE_WASM_THREADS=TRUE \
-  -DCMAKE_CXX_FLAGS="-fwasm-exceptions -DWEBDB_FAST_EXCEPTIONS=1 -msimd128 -DWEBDB_SIMD=1 -mbulk-memory -DWEBDB_BULK_MEMORY=1 -pthread -sUSE_PTHREADS=1 -sSHARED_MEMORY=1 -DWEBDB_THREADS=1" \
+  -DCMAKE_CXX_STANDARD=17 \
+  -DCMAKE_CXX_FLAGS="-fwasm-exceptions -DWEBDB_FAST_EXCEPTIONS=1 -msimd128 -DWEBDB_SIMD=1 -mbulk-memory -DWEBDB_BULK_MEMORY=1 -pthread -sUSE_PTHREADS=1 -sSHARED_MEMORY=1 -DWEBDB_THREADS=1 -DEMSCRIPTEN" \
   -DCMAKE_PREFIX_PATH="$VCPKG_INSTALLED" \
   -DCMAKE_FIND_ROOT_PATH="$VCPKG_INSTALLED" \
+  -DVCPKG_BUILD=1 \
+  -DCMAKE_TOOLCHAIN_FILE="$SCRIPT_DIR/vcpkg/scripts/buildsystems/vcpkg.cmake" \
+  -DVCPKG_TARGET_TRIPLET=wasm32-emscripten-threads \
+  -DVCPKG_MANIFEST_DIR="$WASM_MANIFEST_DIR" \
+  -DVCPKG_OVERLAY_TRIPLETS="$SCRIPT_DIR/extension-ci-tools/toolchains" \
+  -DVCPKG_OVERLAY_PORTS="$SCRIPT_DIR/extension-ci-tools/vcpkg_ports;$SCRIPT_DIR/vcpkg_overlay_ports" \
+  -DVCPKG_CHAINLOAD_TOOLCHAIN_FILE="$EMSCRIPTEN_TOOLCHAIN" \
   -B"$BUILD_DIR" \
   -S./duckdb \
   -DDUCKDB_EXPLICIT_PLATFORM=wasm_threads \
