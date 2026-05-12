@@ -17,6 +17,8 @@
 #include "vgi_table_function_impl.hpp"
 #include "vgi_table_in_out_impl.hpp"
 
+#include <cstdint>
+
 namespace duckdb {
 
 namespace {
@@ -182,7 +184,7 @@ static unique_ptr<FunctionData> VgiCatalogTableInOutFunctionBind(ClientContext &
 	return vgi::VgiTableInOutBind(context, input, return_types, names, params);
 }
 
-void VgiTableFunctionSet::LoadEntries(ClientContext &context) {
+void VgiTableFunctionSet::LoadEntries(ClientContext &context, const std::lock_guard<std::mutex> &/*_load_lock*/) {
 	auto &vgi_catalog = catalog_.Cast<VgiCatalog>();
 	auto &attach_params = vgi_catalog.attach_parameters();
 	auto &attach_result = vgi_catalog.attach_result();
@@ -203,6 +205,7 @@ void VgiTableFunctionSet::LoadEntries(ClientContext &context) {
 	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_id, vgi_tx_load.GetTransactionId()};
 	rpc_ctx.entity_kind = "schema";
 	rpc_ctx.entity_qualifier = schema_.name;
+
 	auto function_list = vgi::InvokeCatalogSchemaContentsFunctions(rpc_ctx, schema_.name,
 	                                                               "TABLE_FUNCTION", context);
 
@@ -338,7 +341,7 @@ void VgiTableFunctionSet::LoadEntries(ClientContext &context) {
 		auto function_entry = make_uniq_base<StandardEntry, TableFunctionCatalogEntry>(
 		    catalog_, schema_, info.Cast<CreateTableFunctionInfo>());
 
-		CreateEntryLocked(std::move(function_entry));
+		{ std::lock_guard<std::mutex> __entry_lk(entry_lock_); CreateEntryLocked(std::move(function_entry)); }
 	}
 }
 

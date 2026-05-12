@@ -1,6 +1,9 @@
 #include "vgi_http_function_connection.hpp"
 
 #include "duckdb.hpp"
+#ifdef __EMSCRIPTEN__
+#include <pthread.h>
+#endif
 
 #include "vgi_arrow_utils.hpp"
 #include "vgi_bind_protocol.hpp"
@@ -316,6 +319,8 @@ InitResult HttpFunctionConnection::PerformInit(const BindResult &bind_result,
                                                 const std::string &phase,
                                                 const std::optional<OrderByHint> &order_by,
                                                 const std::optional<TableSampleHint> &table_sample) {
+#ifdef __EMSCRIPTEN__
+#endif
 	if (init_done_) {
 		throw IOException("HttpFunctionConnection::PerformInit called twice [url: %s]", base_url_);
 	}
@@ -361,10 +366,16 @@ InitResult HttpFunctionConnection::PerformInit(const BindResult &bind_result,
 	    ob_col, ob_dir, ob_null, ob_limit,
 	    ts_percentage, ts_seed);
 	auto init_request_bytes = SerializeToIpcBytes(init_request);
+#ifdef __EMSCRIPTEN__
+#endif
 	auto rpc_params = ::duckdb::vgi::generated::BuildInitParams(init_request_bytes);
+#ifdef __EMSCRIPTEN__
+#endif
 
 	// Serialize the init RPC request to Arrow IPC
 	auto body = SerializeRpcRequest("init", rpc_params);
+#ifdef __EMSCRIPTEN__
+#endif
 
 	// POST to {base_url}/init/init
 	std::string init_url = base_url_ + "/init/init";
@@ -374,14 +385,24 @@ InitResult HttpFunctionConnection::PerformInit(const BindResult &bind_result,
 		fields.emplace_back("url", init_url);
 		fields.emplace_back("function_name", function_name_);
 		fields.emplace_back("phase", phase.empty() ? "default" : phase);
+#ifdef __EMSCRIPTEN__
+#endif
 		VGI_LOG(context_, "http_function_connection.init", fields);
+#ifdef __EMSCRIPTEN__
+#endif
 	}
 
 	auto auth = attach_params_ ? attach_params_->auth() : nullptr;
+#ifdef __EMSCRIPTEN__
+#endif
 	auto cached_params_init = attach_params_
 	    ? attach_params_->GetOrInitHttpParams(context_, init_url) : nullptr;
+#ifdef __EMSCRIPTEN__
+#endif
 	auto response_body = HttpPostArrowIpc(context_, init_url, body, auth,
 	                                        /*cookie_jar=*/nullptr, cached_params_init);
+#ifdef __EMSCRIPTEN__
+#endif
 
 	// Parse response: header IPC stream + data IPC stream
 	auto header_result = ReadStreamHeaderFromBuffer(

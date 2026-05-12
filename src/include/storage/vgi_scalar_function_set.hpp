@@ -13,7 +13,7 @@ public:
 	VgiScalarFunctionSet(Catalog &catalog, VgiSchemaEntry &schema);
 
 protected:
-	void LoadEntries(ClientContext &context) override;
+	void LoadEntries(ClientContext &context, const std::lock_guard<std::mutex> &_load_lock) override;
 
 	std::string CacheKindName() const override {
 		return "scalar_function";

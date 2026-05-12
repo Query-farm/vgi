@@ -54,19 +54,29 @@ VgiViewSet::VgiViewSet(Catalog &catalog, VgiSchemaEntry &schema) : VgiCatalogSet
 }
 
 optional_ptr<CatalogEntry> VgiViewSet::GetEntry(ClientContext &context, const std::string &name) {
-	std::lock_guard<std::mutex> lock(entry_lock_);
+	// Pre-read settings outside any lock — see VgiCatalogSet::GetEntry.
+	const bool trust_empty_kinds = ReadTrustEmptyKinds(context);
 
-	// Check if we have the entry cached
-	auto it = GetEntries().find(name);
-	if (it != GetEntries().end()) {
-		return it->second.get();
+	// Fast path: cache hit / bypass. Hold entry_lock_ only briefly.
+	bool eager = false;
+	optional_ptr<CatalogEntry> cached_result = nullptr;
+	bool bypassed = false;
+	{
+		std::lock_guard<std::mutex> lock(entry_lock_);
+		auto it = GetEntries().find(name);
+		if (it != GetEntries().end()) {
+			cached_result = it->second.get();
+		} else if (ShouldBypassRpcLocked(context, trust_empty_kinds)) {
+			is_loaded_ = true;
+			bypassed = true;
+		} else {
+			eager = ShouldEagerLoadLocked();
+		}
 	}
-
-	// Zero-count RPC bypass: skip both bulk and per-name RPCs when the
-	// worker asserts estimated_object_count[view] == 0. Defended by
-	// vgi_trust_empty_kinds.
-	if (ShouldBypassRpcLocked(context)) {
-		is_loaded_ = true;
+	if (cached_result) {
+		return cached_result;
+	}
+	if (bypassed) {
 		VGI_LOG(context, "catalog.entry_cache",
 		        {{"set_kind", CacheKindName()},
 		         {"name", name},
@@ -75,16 +85,11 @@ optional_ptr<CatalogEntry> VgiViewSet::GetEntry(ClientContext &context, const st
 		return nullptr;
 	}
 
-	// Eager-load gate: when the worker reports a small enough population for
-	// this kind, do a single bulk LoadEntries instead of N single-view RPCs.
-	// View loading holds the lock across the RPC anyway (see existing pattern
-	// below), so we just call LoadEntries directly under the same lock — this
-	// is intentional and not a candidate for "harmonising" with the
-	// VgiTableSet lock-drop pattern: views don't need per-name parallelism
-	// because the bulk path is the cheap one when this branch fires.
-	if (ShouldEagerLoadLocked()) {
-		LoadEntries(context);
-		is_loaded_ = true;
+	// Eager-load gate: when count is below threshold, bulk LoadEntries
+	// via EnsureLoaded (single-flight via load_lock_, RPC NOT under entry_lock_).
+	if (eager) {
+		EnsureLoaded(context);
+		std::lock_guard<std::mutex> lock(entry_lock_);
 		auto found = GetEntries().find(name);
 		if (found != GetEntries().end()) {
 			VGI_LOG(context, "catalog.entry_cache",
@@ -95,12 +100,10 @@ optional_ptr<CatalogEntry> VgiViewSet::GetEntry(ClientContext &context, const st
 			         {"loaded_reason", "below_threshold"}});
 			return found->second.get();
 		}
-		// Worker omitted this view from the bulk listing — fall through to
-		// single-entry RPC (it might have appeared between the bulk fetch
-		// and this lookup, or it's a known stale-listing case).
+		// fall through to single-entry RPC
 	}
 
-	// Load this specific view from the worker
+	// Load this specific view from the worker — no lock held during RPC.
 	auto &vgi_catalog = catalog_.Cast<VgiCatalog>();
 	auto &attach_params = vgi_catalog.attach_parameters();
 	auto &attach_result = vgi_catalog.attach_result();
@@ -113,6 +116,7 @@ optional_ptr<CatalogEntry> VgiViewSet::GetEntry(ClientContext &context, const st
 	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_id, vgi_tx.GetTransactionId()};
 	rpc_ctx.entity_kind = "view";
 	rpc_ctx.entity_qualifier = schema_.name + "." + name;
+
 	auto view_info_opt = vgi::InvokeCatalogViewGet(rpc_ctx, schema_.name, name, context);
 
 	if (!view_info_opt) {
@@ -122,16 +126,22 @@ optional_ptr<CatalogEntry> VgiViewSet::GetEntry(ClientContext &context, const st
 	auto &view_info = *view_info_opt;
 	auto view_entry = CreateViewEntryFromInfo(catalog_, schema_, view_info);
 	if (!view_entry) {
-		// Parse failure — surface as "view not found" to the caller.
 		return nullptr;
 	}
 	auto result = view_entry.get();
-	GetEntries()[name] = std::move(view_entry);
-
+	{
+		std::lock_guard<std::mutex> lock(entry_lock_);
+		// Re-check: another thread may have raced us. Don't overwrite.
+		auto existing = GetEntries().find(name);
+		if (existing != GetEntries().end()) {
+			return existing->second.get();
+		}
+		GetEntries()[name] = std::move(view_entry);
+	}
 	return result;
 }
 
-void VgiViewSet::LoadEntries(ClientContext &context) {
+void VgiViewSet::LoadEntries(ClientContext &context, const std::lock_guard<std::mutex> &/*_load_lock*/) {
 	auto &vgi_catalog = catalog_.Cast<VgiCatalog>();
 	auto &attach_params = vgi_catalog.attach_parameters();
 	auto &attach_result = vgi_catalog.attach_result();
@@ -152,7 +162,7 @@ void VgiViewSet::LoadEntries(ClientContext &context) {
 		if (!view_entry) {
 			continue; // skip un-parseable views; CreateViewEntryFromInfo logged it
 		}
-		CreateEntryLocked(std::move(view_entry));
+		{ std::lock_guard<std::mutex> __entry_lk(entry_lock_); CreateEntryLocked(std::move(view_entry)); }
 	}
 }
 

@@ -16,7 +16,7 @@ public:
 	optional_ptr<CatalogEntry> GetEntry(ClientContext &context, const std::string &name);
 
 protected:
-	void LoadEntries(ClientContext &context) override;
+	void LoadEntries(ClientContext &context, const std::lock_guard<std::mutex> &_load_lock) override;
 
 	std::string CacheKindName() const override {
 		return "view";

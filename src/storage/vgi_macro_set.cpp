@@ -67,7 +67,7 @@ static Value ExtractDefaultValue(const std::shared_ptr<arrow::Array> &array, int
 	}
 }
 
-void VgiMacroSet::LoadEntries(ClientContext &context) {
+void VgiMacroSet::LoadEntries(ClientContext &context, const std::lock_guard<std::mutex> &/*_load_lock*/) {
 	auto &vgi_catalog = catalog_.Cast<VgiCatalog>();
 	auto &attach_params = vgi_catalog.attach_parameters();
 	auto &attach_result = vgi_catalog.attach_result();
@@ -83,6 +83,7 @@ void VgiMacroSet::LoadEntries(ClientContext &context) {
 	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_id, vgi_tx_load.GetTransactionId()};
 	rpc_ctx.entity_kind = "schema";
 	rpc_ctx.entity_qualifier = schema_.name;
+
 	auto macros = vgi::InvokeCatalogSchemaContentsMacros(rpc_ctx, schema_.name, rpc_type, context);
 
 	for (auto &macro_info : macros) {
@@ -145,7 +146,7 @@ void VgiMacroSet::LoadEntries(ClientContext &context) {
 				entry = make_uniq<TableMacroCatalogEntry>(catalog_, schema_, info);
 			}
 
-			CreateEntryLocked(std::move(entry));
+			{ std::lock_guard<std::mutex> __entry_lk(entry_lock_); CreateEntryLocked(std::move(entry)); }
 		} catch (const std::exception &e) {
 			VGI_STDERR_DEBUG("[VGI] macro.parse_error name=%s error=%s\n", macro_info.name.c_str(), e.what());
 		} catch (...) {

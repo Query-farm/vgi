@@ -20,7 +20,8 @@ public:
 	optional_ptr<CatalogEntry> GetEntry(ClientContext &context, const EntryLookupInfo &lookup_info);
 
 protected:
-	void LoadEntries(ClientContext &context) override;
+	void LoadEntries(ClientContext &context,
+	                  const std::lock_guard<std::mutex> &_load_lock) override;
 
 	std::string CacheKindName() const override {
 		return "table";

@@ -1,4 +1,9 @@
 #include "vgi_table_function_impl.hpp"
+#ifdef __EMSCRIPTEN__
+#include <pthread.h>
+#include <unistd.h>
+#include "vgi_wasm_async_pool.hpp"
+#endif
 
 #include "storage/vgi_table_entry.hpp"
 #include "vgi_bind_protocol.hpp"
@@ -1203,9 +1208,16 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 	        std::unique_ptr<IFunctionConnection> conn,
 	        bool from_pool) mutable
 	    -> std::pair<InitResult, std::unique_ptr<IFunctionConnection>> {
+#ifdef __EMSCRIPTEN__
+#endif
 		auto run = [&](IFunctionConnection &c) {
-			return c.PerformInit(bind_result, projection_ids, filter_bytes, join_keys_buffers,
-			                     "", order_by_hint, table_sample_hint);
+#ifdef __EMSCRIPTEN__
+#endif
+			auto rr = c.PerformInit(bind_result, projection_ids, filter_bytes, join_keys_buffers,
+			                        "", order_by_hint, table_sample_hint);
+#ifdef __EMSCRIPTEN__
+#endif
+			return rr;
 		};
 		try {
 			auto r = run(*conn);
@@ -1239,12 +1251,25 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 		// pipelines hit this path back-to-back during scheduling and run
 		// their RPCs concurrently instead of serializing on the main
 		// thread.
+#ifdef __EMSCRIPTEN__
+		// Dispatch onto the pre-spawned VgiWasmAsyncPool. pthread_create
+		// after side modules are dlopen'd is unreliable in MAIN_MODULE=1
+		// builds, so std::async(launch::async) would crash; the pool's
+		// workers were spawned once at extension load.
+		global_state->pending_init = duckdb::vgi::VgiWasmAsyncPool::Instance().Submit(
+		    [run = std::move(perform_init_with_retry),
+		     conn = std::move(connection),
+		     from_pool = acquired.from_pool]() mutable {
+			    return run(std::move(conn), from_pool);
+		    });
+#else
 		global_state->pending_init = std::async(std::launch::async,
 		                                          [run = std::move(perform_init_with_retry),
 		                                           conn = std::move(connection),
 		                                           from_pool = acquired.from_pool]() mutable {
 			                                          return run(std::move(conn), from_pool);
 		                                          });
+#endif
 	}
 
 	{

@@ -26,6 +26,9 @@
 #include "duckdb/common/types/geometry.hpp"
 #include "duckdb/function/cast/cast_function_set.hpp"
 #include "query_farm_telemetry.hpp"
+#ifdef __EMSCRIPTEN__
+#include "vgi_wasm_async_pool.hpp"
+#endif
 #include "storage/vgi_catalog.hpp"
 #include "storage/vgi_transaction.hpp"
 #include "vgi_cancel_dispatcher.hpp"
@@ -1012,6 +1015,15 @@ static void CatalogIdentityFunction(ClientContext &context, TableFunctionInput &
 }
 
 static void LoadInternal(ExtensionLoader &loader) {
+#ifdef __EMSCRIPTEN__
+	// Pre-spawn a bounded pool of background workers at extension load. Required
+	// under MAIN_MODULE=1 + pthreads: pthread_create after side-modules are
+	// dlopen'd is unreliable (emsdk #19425/#19199/#13303), so we spawn once at
+	// load time and keep the workers parked in cv_.wait() until tasks arrive.
+	// Pool size must fit within PTHREAD_POOL_SIZE alongside DuckDB's worker
+	// threads — see duckdb-wasm/lib/CMakeLists.txt.
+	duckdb::vgi::VgiWasmAsyncPool::Instance().EnsureStarted(3);
+#endif
 	// Ignore SIGPIPE - we handle broken pipes via EPIPE error from write()
 	// This prevents the process from being killed when a worker dies unexpectedly
 	struct sigaction sa;

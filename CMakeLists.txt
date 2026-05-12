@@ -72,6 +72,7 @@ src/vgi_shm_segment.cpp
 src/vgi_cancel_dispatcher.cpp
 src/vgi_worker_pool.cpp
 src/vgi_worker_pool_functions.cpp
+src/vgi_wasm_async_pool.cpp
 src/vgi_table_statistics_function.cpp
 src/vgi_clear_cache.cpp
 src/storage/vgi_catalog.cpp

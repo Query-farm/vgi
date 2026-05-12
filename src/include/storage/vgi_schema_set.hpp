@@ -16,7 +16,7 @@ public:
 	std::string GetDefaultSchema(ClientContext &context);
 
 protected:
-	void LoadEntries(ClientContext &context) override;
+	void LoadEntries(ClientContext &context, const std::lock_guard<std::mutex> &_load_lock) override;
 
 	std::string CacheKindName() const override {
 		return "schema";

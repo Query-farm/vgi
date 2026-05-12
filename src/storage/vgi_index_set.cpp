@@ -86,6 +86,7 @@ optional_ptr<CatalogEntry> VgiIndexSet::GetEntry(ClientContext &context, const s
 
 	auto &vgi_tx = VgiTransaction::Get(context, catalog_);
 	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_id, vgi_tx.GetTransactionId()};
+
 	auto index_info_opt = vgi::InvokeCatalogIndexGet(rpc_ctx, schema_.name, name, context);
 
 	if (!index_info_opt) {
@@ -100,7 +101,7 @@ optional_ptr<CatalogEntry> VgiIndexSet::GetEntry(ClientContext &context, const s
 	return result;
 }
 
-void VgiIndexSet::LoadEntries(ClientContext &context) {
+void VgiIndexSet::LoadEntries(ClientContext &context, const std::lock_guard<std::mutex> &/*_load_lock*/) {
 	auto &vgi_catalog = catalog_.Cast<VgiCatalog>();
 	auto &attach_params = vgi_catalog.attach_parameters();
 	auto &attach_result = vgi_catalog.attach_result();
@@ -116,7 +117,7 @@ void VgiIndexSet::LoadEntries(ClientContext &context) {
 
 	for (auto &index_info : indexes) {
 		auto index_entry = CreateIndexEntryFromInfo(catalog_, schema_, index_info);
-		CreateEntryLocked(std::move(index_entry));
+		{ std::lock_guard<std::mutex> __entry_lk(entry_lock_); CreateEntryLocked(std::move(index_entry)); }
 	}
 }
 

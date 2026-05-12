@@ -24,7 +24,7 @@ VgiAggregateFunctionSet::VgiAggregateFunctionSet(Catalog &catalog, VgiSchemaEntr
     : VgiCatalogSet(catalog, &schema), schema_(schema) {
 }
 
-void VgiAggregateFunctionSet::LoadEntries(ClientContext &context) {
+void VgiAggregateFunctionSet::LoadEntries(ClientContext &context, const std::lock_guard<std::mutex> &/*_load_lock*/) {
 	auto &vgi_catalog = catalog_.Cast<VgiCatalog>();
 	auto &attach_params = vgi_catalog.attach_parameters();
 	auto &attach_result = vgi_catalog.attach_result();
@@ -42,6 +42,7 @@ void VgiAggregateFunctionSet::LoadEntries(ClientContext &context) {
 	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_id, vgi_tx_load.GetTransactionId()};
 	rpc_ctx.entity_kind = "schema";
 	rpc_ctx.entity_qualifier = schema_.name;
+
 	auto function_list = vgi::InvokeCatalogSchemaContentsFunctions(rpc_ctx, schema_.name,
 	                                                               "AGGREGATE_FUNCTION", context);
 
@@ -141,10 +142,12 @@ void VgiAggregateFunctionSet::LoadEntries(ClientContext &context) {
 			// standard update/combine/finalize path remains for GROUP BY.
 			if (func_info.supports_window) {
 				agg_func.SetWindowInitCallback(vgi::VgiAggregateWindowInit);
-				// Prefer the batched variant — one RPC per Evaluate() instead of
-				// one per output row. SetWindowCallback is still wired as a
-				// fallback for builds where the batch callback isn't honored.
+				// SetWindowBatchCallback is a post-v1.5.2 addition (DuckDB main
+				// commit 9677176756 "Add aggregate_window_batch_t"). On v1.5.2
+				// we fall back to the per-row SetWindowCallback path.
+#ifdef DUCKDB_HAS_AGGREGATE_WINDOW_BATCH
 				agg_func.SetWindowBatchCallback(vgi::VgiAggregateWindowBatch);
+#endif
 				agg_func.SetWindowCallback(vgi::VgiAggregateWindow);
 			}
 
@@ -192,7 +195,7 @@ void VgiAggregateFunctionSet::LoadEntries(ClientContext &context) {
 		auto function_entry = make_uniq_base<StandardEntry, AggregateFunctionCatalogEntry>(
 		    catalog_, schema_, info.Cast<CreateAggregateFunctionInfo>());
 
-		CreateEntryLocked(std::move(function_entry));
+		{ std::lock_guard<std::mutex> __entry_lk(entry_lock_); CreateEntryLocked(std::move(function_entry)); }
 	}
 }
 

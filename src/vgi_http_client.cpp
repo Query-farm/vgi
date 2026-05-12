@@ -1,6 +1,7 @@
 #include "vgi_http_client.hpp"
 
 #include <cctype>
+#include <chrono>
 #include <cstring>
 
 #include "duckdb.hpp"

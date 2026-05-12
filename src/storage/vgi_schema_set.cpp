@@ -31,7 +31,7 @@ std::string VgiSchemaSet::GetDefaultSchema(ClientContext &context) {
 	return "main";
 }
 
-void VgiSchemaSet::LoadEntries(ClientContext &context) {
+void VgiSchemaSet::LoadEntries(ClientContext &context, const std::lock_guard<std::mutex> &/*_load_lock*/) {
 	auto &vgi_catalog = catalog_.Cast<VgiCatalog>();
 	auto &attach_params = vgi_catalog.attach_parameters();
 	auto &attach_result = vgi_catalog.attach_result();
@@ -43,6 +43,7 @@ void VgiSchemaSet::LoadEntries(ClientContext &context) {
 	// Call catalog_schemas via RPC
 	auto &vgi_tx_load = VgiTransaction::Get(context, catalog_);
 	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_id, vgi_tx_load.GetTransactionId()};
+
 	auto schema_list = vgi::InvokeCatalogSchemas(rpc_ctx, context);
 
 	// Create schema entries
@@ -57,7 +58,7 @@ void VgiSchemaSet::LoadEntries(ClientContext &context) {
 		}
 
 		auto schema_entry = make_uniq<VgiSchemaEntry>(catalog_, info, schema_info);
-		CreateEntryLocked(std::move(schema_entry));
+		{ std::lock_guard<std::mutex> __entry_lk(entry_lock_); CreateEntryLocked(std::move(schema_entry)); }
 	}
 }
 

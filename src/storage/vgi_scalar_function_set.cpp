@@ -23,7 +23,7 @@ VgiScalarFunctionSet::VgiScalarFunctionSet(Catalog &catalog, VgiSchemaEntry &sch
     : VgiCatalogSet(catalog, &schema), schema_(schema) {
 }
 
-void VgiScalarFunctionSet::LoadEntries(ClientContext &context) {
+void VgiScalarFunctionSet::LoadEntries(ClientContext &context, const std::lock_guard<std::mutex> &/*_load_lock*/) {
 	auto &vgi_catalog = catalog_.Cast<VgiCatalog>();
 	auto &attach_params = vgi_catalog.attach_parameters();
 	auto &attach_result = vgi_catalog.attach_result();
@@ -44,6 +44,7 @@ void VgiScalarFunctionSet::LoadEntries(ClientContext &context) {
 	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_id, vgi_tx_load.GetTransactionId()};
 	rpc_ctx.entity_kind = "schema";
 	rpc_ctx.entity_qualifier = schema_.name;
+
 	auto function_list = vgi::InvokeCatalogSchemaContentsFunctions(rpc_ctx, schema_.name,
 	                                                               "SCALAR_FUNCTION", context);
 
@@ -187,7 +188,7 @@ void VgiScalarFunctionSet::LoadEntries(ClientContext &context) {
 		auto function_entry = make_uniq_base<StandardEntry, ScalarFunctionCatalogEntry>(
 		    catalog_, schema_, info.Cast<CreateScalarFunctionInfo>());
 
-		CreateEntryLocked(std::move(function_entry));
+		{ std::lock_guard<std::mutex> __entry_lk(entry_lock_); CreateEntryLocked(std::move(function_entry)); }
 	}
 }
 

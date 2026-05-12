@@ -4,7 +4,6 @@
 #include <functional>
 #include <mutex>
 #include <string>
-#include <vector>
 
 #include "duckdb/catalog/catalog_entry.hpp"
 #include "duckdb/common/case_insensitive_map.hpp"
@@ -33,8 +32,16 @@ public:
 	optional_ptr<CatalogEntry> GetEntry(ClientContext &context, const std::string &name);
 
 	// Create a new entry and add it to the set.
-	// PRECONDITION: Caller must hold entry_lock_ (called from LoadEntries under lock).
+	// PRECONDITION: Caller must hold entry_lock_. Used from paths that already
+	// hold the lock (e.g. VgiTableSet::GetEntry eager-publish under re-acquired
+	// lock). Prefer AddEntry() from LoadEntries() — LoadEntries no longer runs
+	// under entry_lock_ to avoid re-entrant catalog-walk deadlocks.
 	void CreateEntryLocked(unique_ptr<CatalogEntry> entry);
+
+	// Same semantics as CreateEntryLocked, but acquires entry_lock_ internally.
+	// Use this from LoadEntries() implementations, which run WITHOUT the
+	// caller's lock held (see vgi_catalog_set.cpp GetEntry/Scan refactor).
+	void AddEntry(unique_ptr<CatalogEntry> entry);
 
 	// Drop an entry from the set
 	void DropEntry(const std::string &name);
@@ -80,8 +87,31 @@ public:
 	void MarkPopulatedLocked();
 
 protected:
-	// Override to load entries from the remote source
-	virtual void LoadEntries(ClientContext &context) = 0;
+	// Override to load entries from the remote source.
+	//
+	// CONTRACT: the caller holds `load_lock_` (passed as proof-token). The
+	// implementation MUST do its RPC OUTSIDE of `entry_lock_` — only acquire
+	// `entry_lock_` briefly per-entry-insertion (typically via
+	// `CreateEntryLocked` wrapped in a short `lock_guard<mutex>(entry_lock_)`
+	// scope inside the for-loop). This mirrors UnityCatalog's UCTableSet
+	// pattern (see `~/Development/unity_catalog/src/storage/uc_table_set.cpp`)
+	// and prevents the entry_lock_-held-across-RPC deadlock that hangs WASM.
+	//
+	// `_load_lock` is unused inside LoadEntries; it's a compile-time proof
+	// that the caller is holding load_lock_, so concurrent LoadEntries
+	// invocations are serialized (single-flight) and we don't fire duplicate
+	// RPCs.
+	virtual void LoadEntries(ClientContext &context,
+	                          const std::lock_guard<std::mutex> &_load_lock) = 0;
+
+	// Serialize concurrent loads. Used by GetEntry and Scan: first caller
+	// acquires load_lock_ and fires LoadEntries; concurrent callers wait on
+	// load_lock_ (cheap — no entry_lock_ held during the wait), see
+	// is_loaded_=true after the first finishes, and skip the load. No RPC
+	// duplication, no thundering herd.
+	void EnsureLoaded(ClientContext &context);
+
+	std::mutex load_lock_;
 
 	// Short tag identifying this set's contents for instrumentation logs
 	// (e.g. "table", "schema", "view", "function", "macro", "index"). The
@@ -116,9 +146,20 @@ protected:
 	// this kind should be skipped entirely because the worker has asserted
 	// estimated_object_count[kind] == 0 AND the user trusts the assertion
 	// (vgi_trust_empty_kinds setting, default true). Caller must hold
-	// entry_lock_. Reads the trust setting per call so SET takes effect
-	// immediately. Triggers ResolveEagerLoadParamsLocked exactly once.
+	// entry_lock_.
+	//
+	// PREFERRED form: pre-read the trust setting via ReadTrustEmptyKinds()
+	// OUTSIDE the lock and pass it in. Going through TryGetCurrentSetting
+	// while holding entry_lock_ creates a lock-order inversion (DuckDB's
+	// settings registry has its own mutex; some setting paths can re-enter
+	// VGI catalog code).
+	bool ShouldBypassRpcLocked(ClientContext &context, bool trust_empty_kinds);
+	// Legacy overload — reads the setting itself. Avoid in new code.
 	bool ShouldBypassRpcLocked(ClientContext &context);
+
+	// Reads the vgi_trust_empty_kinds setting WITHOUT holding entry_lock_.
+	// Safe to call before acquiring the lock.
+	static bool ReadTrustEmptyKinds(ClientContext &context);
 
 	// Resolve estimated_count_ and threshold_ once from the catalog/schema,
 	// keyed by CacheKindName(). Idempotent. Called from ShouldEagerLoadLocked.
