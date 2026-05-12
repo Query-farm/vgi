@@ -49,7 +49,7 @@ test_subprocess:
 	VGI_ATTACH_OPTIONS_WORKER="$(VGI_ATTACH_OPTIONS_WORKER)" \
 	VGI_SIMPLE_WRITABLE_WORKER="$(VGI_SIMPLE_WRITABLE_WORKER)" \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
-	./build/release/test/unittest -j 8 "test/*" "~test/sql/integration/writable/*"
+	./build/release/test/unittest "test/*" "~test/sql/integration/writable/*"
 
 test_subprocess_debug:
 	VGI_TRANSACTOR_DB_DIR="$$(mktemp -d)" \
@@ -59,7 +59,7 @@ test_subprocess_debug:
 	VGI_ATTACH_OPTIONS_WORKER="$(VGI_ATTACH_OPTIONS_WORKER)" \
 	VGI_SIMPLE_WRITABLE_WORKER="$(VGI_SIMPLE_WRITABLE_WORKER)" \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
-	./build/debug/test/unittest -j 8 "test/*" "~test/sql/integration/writable/*"
+	./build/debug/test/unittest "test/*" "~test/sql/integration/writable/*"
 
 # Launcher transport tests — runs the same .test suite as test_subprocess but
 # with each worker fronted by `launch:` so traffic flows through the C++
@@ -91,7 +91,7 @@ test_launcher:
 	VGI_SIMPLE_WRITABLE_WORKER="launch:$(VGI_SIMPLE_WRITABLE_WORKER)" \
 	VGI_REQUIRE_LAUNCHER_TRANSPORT=1 \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
-	./build/release/test/unittest -j 8 "test/*" \
+	./build/release/test/unittest "test/*" \
 	    "~test/sql/integration/writable/*" \
 	    "~test/sql/vgi_worker_pool.test" \
 	    "~test/sql/integration/table/filter_echo_partitioned.test" \
@@ -106,7 +106,7 @@ test_launcher_debug:
 	VGI_SIMPLE_WRITABLE_WORKER="launch:$(VGI_SIMPLE_WRITABLE_WORKER)" \
 	VGI_REQUIRE_LAUNCHER_TRANSPORT=1 \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
-	./build/debug/test/unittest -j 8 "test/*" \
+	./build/debug/test/unittest "test/*" \
 	    "~test/sql/integration/writable/*" \
 	    "~test/sql/vgi_worker_pool.test" \
 	    "~test/sql/integration/table/filter_echo_partitioned.test" \
