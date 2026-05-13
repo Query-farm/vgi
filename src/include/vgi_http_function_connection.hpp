@@ -74,6 +74,9 @@ public:
 	std::vector<uint8_t> GetLastStateToken() const override {
 		return std::vector<uint8_t>(stream_state_token_.begin(), stream_state_token_.end());
 	}
+	idx_t GetLastBatchIndex() const override {
+		return last_batch_index_;
+	}
 
 	// State queries
 	bool IsTableInOut() const override { return input_schema_ != nullptr; }
@@ -131,6 +134,10 @@ private:
 
 	// HTTP streaming state
 	std::string stream_state_token_;
+	// Raw vgi_batch_index value parsed off the most recent data batch's
+	// custom_metadata, or INVALID if absent. Validated in
+	// VgiTableFunctionImpl's InstallBatch on the consumer thread.
+	idx_t last_batch_index_ = DConstants::INVALID_INDEX;
 	std::vector<std::shared_ptr<arrow::RecordBatch>> buffered_batches_;
 	size_t buffered_batch_index_ = 0;
 	bool is_producer_mode_ = false;

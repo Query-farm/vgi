@@ -1,0 +1,156 @@
+# name: test/sql/integration/table/batch_index_pushdown.test
+# description: batch_index interactions with pushdown features —
+#              filter pushdown, TABLESAMPLE, ORDER BY hint pushdown,
+#              and (critically) hash-join dynamic-filter pushdown.
+#
+# The hash-join case is the most interesting: with INITIALIZE_ON_SCHEDULE
+# previously disabled in 342f8f1, dynamic filters now make it into
+# init_global. With batch_index now also wired, both features must
+# coexist on the same scan.
+# group: [vgi_integration_table]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+require json
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# Filter pushdown on the _marked fixture (projection_pushdown=False on the
+# fixture so partition_id survives any column selection).
+# ============================================================================
+
+# Filter applied; remaining rows still ordered by partition_id then seq.
+query III
+SELECT COUNT(*), MIN(seq), MAX(seq)
+FROM example.partitioned_batch_index_marked(1000, chunk_size := 100)
+WHERE partition_id < 3;
+----
+300	0	99
+
+# First 5 rows after WHERE — must still be from partition 0.
+query II
+SELECT partition_id, seq
+FROM example.partitioned_batch_index_marked(1000, chunk_size := 100)
+WHERE partition_id < 3
+LIMIT 5;
+----
+0	0
+0	1
+0	2
+0	3
+0	4
+
+# ============================================================================
+# TABLESAMPLE — order is irrelevant for sampling; just confirm the
+# function still runs end-to-end with batch_index emission and a sampling
+# predicate.
+# ============================================================================
+
+# Use the single-column fixture so projection pushdown is allowed. The
+# SAMPLE result is a non-empty subset; we only assert it doesn't crash
+# and produces results in the expected range.
+query III
+SELECT COUNT(*) > 0, COUNT(*) <= 10000, MIN(n) >= 0
+FROM example.partitioned_batch_index(10000) USING SAMPLE 10 PERCENT;
+----
+true	true	true
+
+# ============================================================================
+# ORDER BY hint pushdown — RowGroupPruner can pass an ordering hint to
+# the worker. batch_index emission must still work alongside.
+# ============================================================================
+
+# ORDER BY + LIMIT is the canonical pushdown shape.
+query I
+SELECT n FROM example.partitioned_batch_index(10000) ORDER BY n LIMIT 5;
+----
+0
+1
+2
+3
+4
+
+query I
+SELECT n FROM example.partitioned_batch_index(10000) ORDER BY n DESC LIMIT 3;
+----
+9999
+9998
+9997
+
+# ============================================================================
+# Hash-join dynamic-filter pushdown + batch_index together
+# ============================================================================
+
+# Set the join_keys threshold above DuckDB's default so the optimizer
+# pushes the InFilter through. Mirrors the pattern from
+# join_keys_pushdown.test.
+
+statement ok
+SET threads=4;
+
+statement ok
+CREATE TEMP TABLE small_keys AS SELECT * FROM generate_series(0, 9) t(id);
+
+# Trigger the VgiJoinOptimizer to raise dynamic_or_filter_threshold for
+# this session (the optimizer extension does this when a join touches a
+# VGI scan).
+statement ok
+SELECT COUNT(*) FROM small_keys l JOIN example.partitioned_batch_index(20) s ON l.id = s.n;
+
+query I
+SELECT CURRENT_SETTING('dynamic_or_filter_threshold')::BIGINT >= 100;
+----
+true
+
+# 200 sparse keys — DuckDB's hash join builds the InFilter and pushes it
+# into the probe-side VGI scan's init. The scan still emits batch_index;
+# downstream sink (BatchCollector here) reassembles in partition order.
+statement ok
+CREATE TEMP TABLE large_keys AS SELECT * FROM generate_series(0, 999, 5) t(id);
+
+# Result count must match the standalone join: only the 200 sparse keys
+# appear in the partitioned_batch_index(10000) range.
+query I
+SELECT COUNT(*) FROM large_keys l
+JOIN example.partitioned_batch_index(10000) s ON l.id = s.n;
+----
+200
+
+# Min/max as a sanity check on the joined result.
+query II
+SELECT MIN(s.n), MAX(s.n)
+FROM large_keys l JOIN example.partitioned_batch_index(10000) s ON l.id = s.n;
+----
+0	995
+
+statement ok
+DROP TABLE small_keys;
+
+statement ok
+DROP TABLE large_keys;
+
+# ============================================================================
+# Projection pushdown on the single-column fixture (which DOES support it)
+# ============================================================================
+
+# Just a count — fixture's projection should produce the same numerical
+# answer as no-projection. The _marked fixture has projection_pushdown
+# disabled deliberately; the single-column fixture has it enabled
+# (default).
+query I
+SELECT COUNT(n) FROM example.partitioned_batch_index(5000);
+----
+5000
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;

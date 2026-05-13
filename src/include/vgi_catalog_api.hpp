@@ -470,6 +470,16 @@ struct VgiFunctionInfo {
 	std::optional<VgiOrderPreservation> order_preservation;
 	std::optional<int32_t> max_workers;
 
+	// True when the function opts in to per-batch ``vgi_batch_index`` tagging
+	// (Meta.supports_batch_index = True on the worker side). Triggers two
+	// registration-time effects in vgi_table_function_set.cpp:
+	//   1. ``table_func.get_partition_data = VgiGetPartitionData`` so ordered
+	//      sinks (BatchCollector, BatchInsert, BatchCopyToFile, Limit) can
+	//      reassemble parallel output in partition-id order.
+	//   2. The FIXED_ORDER ``MaxThreads()=1`` clamp is skipped; the source
+	//      stays parallel and the sink does the ordering.
+	bool supports_batch_index = false;
+
 	// Expression filter function names the worker can evaluate (e.g., ["&&", "st_intersects_extent"])
 	std::vector<std::string> supported_expression_filters;
 

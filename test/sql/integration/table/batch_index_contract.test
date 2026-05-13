@@ -1,0 +1,70 @@
+# name: test/sql/integration/table/batch_index_contract.test
+# description: Verifies the C++ extension's contract checks for
+#              ``supports_batch_index = True`` functions. All three
+#              violations are caught by VGI-side raises (not by DuckDB's
+#              own debug-only assertions), so the tests fire on RELEASE
+#              builds too.
+#
+# Each test calls a deliberately-broken fixture from
+# vgi/_test_fixtures/table/batch_index_broken.py and asserts the typed
+# ``IOException`` message produced by ``InstallBatch`` in
+# vgi/src/vgi_table_function_impl.cpp.
+# group: [vgi_integration_table]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+require json
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# Missing-tag violation
+# ============================================================================
+# Fixture: declares supports_batch_index=True but emits a data batch via
+# the inner OutputCollector directly, bypassing the framework wrapper's
+# kwarg validation. The C++ side checks ``custom_metadata`` for
+# ``vgi_batch_index`` and raises when absent.
+
+statement error
+SELECT * FROM example.broken_missing_batch_index_tag(5);
+----
+without vgi_batch_index metadata
+
+# ============================================================================
+# Non-monotone violation
+# ============================================================================
+# Fixture: emits a batch tagged batch_index=10, then a batch tagged
+# batch_index=3 on the same stream. The C++ ``InstallBatch`` enforces
+# per-stream monotonicity; DuckDB's own ``BatchedDataCollection::Append``
+# assertion at the same level is debug-only.
+
+statement error
+SELECT COUNT(*) FROM example.broken_non_monotone_batch_index(5);
+----
+batch_index must be monotone non-decreasing
+
+# ============================================================================
+# Overflow violation
+# ============================================================================
+# Fixture: emits a batch tagged batch_index = 2^60 (well above DuckDB's
+# BATCH_INCREMENT = 10^13 per-pipeline cap). The C++ side rejects at
+# parse time with a typed error; without this, the worker would surface
+# an opaque DuckDB InternalException from the pipeline executor's
+# NextBatch shift (pipeline_executor.cpp:140-143).
+
+statement error
+SELECT COUNT(*) FROM example.broken_batch_index_overflow(5);
+----
+exceeds DuckDB's per-pipeline cap
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;

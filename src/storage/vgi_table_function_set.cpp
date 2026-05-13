@@ -83,14 +83,28 @@ static unique_ptr<FunctionData> VgiCatalogTableFunctionBind(ClientContext &conte
 	bind_data->function_name = vgi_info.function_info().name;
 	bind_data->projection_pushdown = vgi_info.function_info().projection_pushdown.value_or(false);
 	bind_data->supported_expression_filters = vgi_info.function_info().supported_expression_filters;
+	// Carry the wire flag onto bind_data so InstallBatch knows whether to
+	// require/parse vgi_batch_index from each Arrow record-batch's
+	// KeyValueMetadata.
+	bind_data->supports_batch_index = vgi_info.function_info().supports_batch_index;
 	// FIXED_ORDER: clamps MaxThreads to 1 so DuckDB schedules the source
 	// onto a single thread. ``TableFunction::order_preservation_type`` is
 	// already set at function-registration time (see ``AddFunction`` calls
 	// below) and drives the planner's ``Pipeline::IsOrderDependent()``;
 	// the boolean here is what actually serialises the source.
-	bind_data->fixed_order =
-	    MapOrderPreservation(vgi_info.function_info().order_preservation) ==
-	    OrderPreservationType::FIXED_ORDER;
+	//
+	// EXCEPT when the function opts in to batch_index: ordered sinks
+	// (BatchCollector, BatchInsert, BatchCopyToFile, Limit) reassemble
+	// output via ``TableFunction::get_partition_data``, so the source
+	// can stay parallel. Skipping the clamp here is the entire point of
+	// the batch_index feature.
+	if (vgi_info.function_info().supports_batch_index) {
+		bind_data->fixed_order = false;
+	} else {
+		bind_data->fixed_order =
+		    MapOrderPreservation(vgi_info.function_info().order_preservation) ==
+		    OrderPreservationType::FIXED_ORDER;
+	}
 
 	// Build Arrow arguments from the function call inputs
 	// input.inputs contains positional arguments passed to the function
@@ -295,6 +309,17 @@ void VgiTableFunctionSet::LoadEntries(ClientContext &context, const std::lock_gu
 				table_func.to_string = vgi::VgiTableFunctionToString;
 				table_func.dynamic_to_string = vgi::VgiTableFunctionDynamicToString;
 				table_func.set_scan_order = vgi::VgiSetScanOrder;
+				// batch_index opt-in: install the partition-data callback so
+				// ordered sinks (BatchCollector, BatchInsert,
+				// BatchCopyToFile, Limit) can reassemble parallel output via
+				// ``OperatorPartitionData{batch_index}``. The matching skip
+				// of the ``fixed_order -> MaxThreads=1`` clamp lives in
+				// VgiCatalogTableFunctionBind above. Each emitted Arrow
+				// batch carries ``vgi_batch_index`` in KeyValueMetadata —
+				// see ``InstallBatch`` for the parse + monotonicity check.
+				if (func_info.supports_batch_index) {
+					table_func.get_partition_data = vgi::VgiGetPartitionData;
+				}
 				// INITIALIZE_ON_SCHEDULE would move init_global into
 				// `Executor::ScheduleEventsInternal`'s eager-init loop so the
 				// pipelines' init_globals all fire from the same site at

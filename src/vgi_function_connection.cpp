@@ -771,6 +771,38 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 			}
 		}
 
+		// Parse vgi_batch_index off the wire metadata, if present. Validation
+		// (missing-tag / cap / monotonicity) happens in VgiTableFunctionImpl's
+		// InstallBatch on the consumer thread — here we just stash the raw
+		// uint64. INVALID_INDEX means "no key on this batch" — InstallBatch
+		// converts that into a typed IOException when the function opted in.
+		last_batch_index_ = DConstants::INVALID_INDEX;
+		if (result.custom_metadata) {
+			int bi_idx = result.custom_metadata->FindKey("vgi_batch_index");
+			if (bi_idx >= 0) {
+				const std::string &value = result.custom_metadata->value(bi_idx);
+				try {
+					size_t pos = 0;
+					uint64_t parsed = std::stoull(value, &pos);
+					if (pos != value.size()) {
+						throw IOException("VGI worker emitted invalid vgi_batch_index '%s' "
+						                  "(trailing characters; expected decimal uint64) "
+						                  "[worker: %s, pid: %d]",
+						                  value, worker_path_, proc_ ? proc_->GetPid() : 0);
+					}
+					last_batch_index_ = static_cast<idx_t>(parsed);
+				} catch (const std::invalid_argument &) {
+					throw IOException("VGI worker emitted invalid vgi_batch_index '%s' "
+					                  "(expected decimal uint64) [worker: %s, pid: %d]",
+					                  value, worker_path_, proc_ ? proc_->GetPid() : 0);
+				} catch (const std::out_of_range &) {
+					throw IOException("VGI worker emitted vgi_batch_index '%s' that exceeds "
+					                  "uint64 range [worker: %s, pid: %d]",
+					                  value, worker_path_, proc_ ? proc_->GetPid() : 0);
+				}
+			}
+		}
+
 		// In the vgi_rpc protocol, EOS is signaled by the IPC stream closing (null
 		// batch from ReadNext above), not by 0-row batches. 0-row batches are valid
 		// responses in exchange mode (e.g., function buffered input without output).

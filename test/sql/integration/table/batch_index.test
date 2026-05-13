@@ -1,0 +1,382 @@
+# name: test/sql/integration/table/batch_index.test
+# description: Verifies the supports_batch_index opt-in. Workers tag each
+#              emitted Arrow batch with a per-partition vgi_batch_index;
+#              the extension threads it through TableFunction::get_partition_data
+#              so ordered sinks (BatchCollector, BatchInsert,
+#              BatchCopyToFile, Limit) reassemble parallel output in
+#              partition_id order. Drops the FIXED_ORDER MaxThreads=1
+#              clamp for opted-in functions.
+#
+# NOTE: the ">=2 distinct conn=" parallelism assertion is meaningful on
+# subprocess transport only — under HTTP each pipeline task allocates its
+# own logical worker, so the conn count is always >=N regardless of
+# whether the source actually parallelised. See CLAUDE.md's "Known HTTP
+# limitations". Correctness assertions (count/sum/ordering) hold under
+# both transports.
+# group: [vgi_integration_table]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+require json
+
+require parquet
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+SET threads=4;
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+# Pool warmup — same pattern as the order_preservation_modes fix from dbb86a8.
+# Without warm secondaries, the cold-spawn cost beats the ~3 ms primary scan
+# and the parallelism assertion below becomes a race.
+statement ok
+SELECT COUNT(*) FROM example.partitioned_batch_index(100000);
+
+# ============================================================================
+# Correctness invariants across sizes
+# ============================================================================
+
+# Empty
+query IIII
+SELECT COUNT(*), COUNT(DISTINCT n), MIN(n), MAX(n)
+FROM example.partitioned_batch_index(0);
+----
+0	0	NULL	NULL
+
+# Single row
+query IIII
+SELECT COUNT(*), COUNT(DISTINCT n), MIN(n), MAX(n)
+FROM example.partitioned_batch_index(1);
+----
+1	1	0	0
+
+# Two rows
+query IIII
+SELECT COUNT(*), COUNT(DISTINCT n), MIN(n), MAX(n)
+FROM example.partitioned_batch_index(2);
+----
+2	2	0	1
+
+# Vector size boundary (DuckDB STANDARD_VECTOR_SIZE = 2048).
+query IIII
+SELECT COUNT(*), COUNT(DISTINCT n), MIN(n), MAX(n)
+FROM example.partitioned_batch_index(2048);
+----
+2048	2048	0	2047
+
+# Just over the vector boundary
+query IIII
+SELECT COUNT(*), COUNT(DISTINCT n), MIN(n), MAX(n)
+FROM example.partitioned_batch_index(2049);
+----
+2049	2049	0	2048
+
+# Just under the partition boundary (CHUNK_SIZE = 1000)
+query IIII
+SELECT COUNT(*), COUNT(DISTINCT n), MIN(n), MAX(n)
+FROM example.partitioned_batch_index(999);
+----
+999	999	0	998
+
+# Exact partition boundary
+query IIII
+SELECT COUNT(*), COUNT(DISTINCT n), MIN(n), MAX(n)
+FROM example.partitioned_batch_index(1000);
+----
+1000	1000	0	999
+
+# Multiple partitions
+query IIII
+SELECT COUNT(*), COUNT(DISTINCT n), MIN(n), MAX(n)
+FROM example.partitioned_batch_index(20000);
+----
+20000	20000	0	19999
+
+# 100k — large enough that parallelism is meaningful
+query IIII
+SELECT COUNT(*), COUNT(DISTINCT n), MIN(n), MAX(n)
+FROM example.partitioned_batch_index(100000);
+----
+100000	100000	0	99999
+
+# Closed-form sum check — catches silent row loss / duplication in the
+# batch_index reassembly path.
+query I
+SELECT SUM(n) = (100000::BIGINT * 99999 / 2)
+FROM example.partitioned_batch_index(100000);
+----
+true
+
+# ============================================================================
+# Ordering invariant — THE central test
+# ============================================================================
+# PhysicalBatchCollector reassembles by batch_index. Output of a parallel
+# scan must match the single-threaded order: row N has value N.
+
+query I
+SELECT n FROM example.partitioned_batch_index(20) LIMIT 5;
+----
+0
+1
+2
+3
+4
+
+query I
+SELECT n FROM example.partitioned_batch_index(20) OFFSET 15 LIMIT 5;
+----
+15
+16
+17
+18
+19
+
+# Direct boundary observation via the _marked fixture. Without batch_index
+# reassembly, parallel workers could interleave partitions (row with
+# partition_id=2 appearing before partition_id=1's rows).
+query II
+SELECT partition_id, seq
+FROM example.partitioned_batch_index_marked(40, chunk_size := 10)
+LIMIT 22;
+----
+0	0
+0	1
+0	2
+0	3
+0	4
+0	5
+0	6
+0	7
+0	8
+0	9
+1	0
+1	1
+1	2
+1	3
+1	4
+1	5
+1	6
+1	7
+1	8
+1	9
+2	0
+2	1
+
+# Programmatic check: count inversions in partition_id order across the
+# full materialised result. Zero means batch_index reassembly is correct.
+query I
+WITH ordered AS (
+    SELECT row_number() OVER () AS rn, partition_id
+    FROM example.partitioned_batch_index_marked(10000, chunk_size := 100)
+)
+SELECT COUNT(*)
+FROM ordered a JOIN ordered b ON a.rn = b.rn + 1
+WHERE a.partition_id < b.partition_id;
+----
+0
+
+# ============================================================================
+# Parallelism — subprocess-only assertion (see file header)
+# ============================================================================
+
+# Re-warm the pool immediately before the assertion. Intervening
+# correctness queries above can let the idle-timeout reap secondaries.
+statement ok
+SELECT COUNT(*) FROM example.partitioned_batch_index(100000);
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query II
+SELECT COUNT(*), SUM(n) FROM example.partitioned_batch_index(100000);
+----
+100000	4999950000
+
+query I
+SELECT COUNT(DISTINCT regexp_extract(message, 'conn=([0-9a-f]+)', 1)) >= 2
+FROM duckdb_logs()
+WHERE type = 'VGI' AND message LIKE '%batch_received%';
+----
+true
+
+# ============================================================================
+# threads=1 baseline — same results from the single-thread path
+# ============================================================================
+
+statement ok
+SET threads=1;
+
+query II
+SELECT COUNT(*), SUM(n) FROM example.partitioned_batch_index(100000);
+----
+100000	4999950000
+
+query I
+SELECT n FROM example.partitioned_batch_index(20) LIMIT 5;
+----
+0
+1
+2
+3
+4
+
+statement ok
+SET threads=4;
+
+# ============================================================================
+# LIMIT without ORDER BY — PhysicalLimit requests BatchIndex
+# ============================================================================
+
+query I
+SELECT COUNT(*) FROM (SELECT * FROM example.partitioned_batch_index(20000) LIMIT 10);
+----
+10
+
+# With batch_index, LIMIT 10 returns the first 10 partition-0 rows.
+query I
+SELECT * FROM example.partitioned_batch_index(20000) LIMIT 10;
+----
+0
+1
+2
+3
+4
+5
+6
+7
+8
+9
+
+# ============================================================================
+# ORDER BY — explicit sort still works
+# ============================================================================
+
+query I
+SELECT n FROM example.partitioned_batch_index(100) ORDER BY n DESC LIMIT 3;
+----
+99
+98
+97
+
+# ============================================================================
+# WHERE filter — predicate evaluation still correct
+# ============================================================================
+
+query III
+SELECT COUNT(*), MIN(n), MAX(n)
+FROM example.partitioned_batch_index(10000) WHERE n >= 5000;
+----
+5000	5000	9999
+
+query I
+SELECT n FROM example.partitioned_batch_index(10000) WHERE n >= 5000 LIMIT 5;
+----
+5000
+5001
+5002
+5003
+5004
+
+# ============================================================================
+# CTAS — PhysicalBatchInsert requests BatchIndex
+# ============================================================================
+
+statement ok
+CREATE TABLE batch_index_ctas AS
+SELECT * FROM example.partitioned_batch_index(10000);
+
+# Rowids assigned by the insert path should follow source-emission order.
+# rowid 0 -> n=0, rowid N-1 -> n=N-1.
+query II
+SELECT MIN(rowid), MIN(n) FROM batch_index_ctas;
+----
+0	0
+
+query II
+SELECT MAX(rowid), MAX(n) FROM batch_index_ctas;
+----
+9999	9999
+
+# Sanity: same content, same count
+query II
+SELECT COUNT(*), SUM(n) FROM batch_index_ctas;
+----
+10000	49995000
+
+statement ok
+DROP TABLE batch_index_ctas;
+
+# ============================================================================
+# COPY TO file — PhysicalBatchCopyToFile requests BatchIndex
+# ============================================================================
+
+statement ok
+COPY (SELECT * FROM example.partitioned_batch_index(1000))
+TO '__TEST_DIR__/batch_index_out.csv' (HEADER true);
+
+# Re-read in file order; first row is n=0, ordering is preserved by CSV writer.
+query I
+SELECT n FROM read_csv('__TEST_DIR__/batch_index_out.csv') LIMIT 5;
+----
+0
+1
+2
+3
+4
+
+query II
+SELECT COUNT(*), MAX(n) FROM read_csv('__TEST_DIR__/batch_index_out.csv');
+----
+1000	999
+
+# Parquet variant — different writer code path.
+statement ok
+COPY (SELECT * FROM example.partitioned_batch_index(1000))
+TO '__TEST_DIR__/batch_index_out.parquet';
+
+query I
+SELECT n FROM read_parquet('__TEST_DIR__/batch_index_out.parquet') LIMIT 5;
+----
+0
+1
+2
+3
+4
+
+# ============================================================================
+# GROUP BY — order-agnostic sink ignores batch_index but stays correct
+# ============================================================================
+
+# Hash aggregate doesn't care about source order; batch_index just rides along.
+query II
+SELECT n % 100 AS bucket, COUNT(*) AS c
+FROM example.partitioned_batch_index(10000)
+GROUP BY bucket ORDER BY bucket LIMIT 3;
+----
+0	100
+1	100
+2	100
+
+query I
+SELECT SUM(c) FROM (
+  SELECT COUNT(*) AS c
+  FROM example.partitioned_batch_index(10000)
+  GROUP BY (n % 100)
+);
+----
+10000
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;

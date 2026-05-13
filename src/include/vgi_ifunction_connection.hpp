@@ -107,6 +107,19 @@ public:
 	// dispatcher to address the right worker under HTTP pooling.
 	virtual std::vector<uint8_t> GetLastStateToken() const = 0;
 
+	// Most recent ``vgi_batch_index`` value observed in the data batch's
+	// wire custom_metadata. Set inside ``ReadDataBatch`` immediately after
+	// the metadata is parsed; read by ``InstallBatch`` on the consumer
+	// thread to populate ``VgiTableFunctionLocalState::current_batch_index``.
+	// Returns ``DConstants::INVALID_INDEX`` for connections whose worker
+	// did not opt in to batch_index (no metadata key present). Default
+	// implementation returns INVALID so transports that don't yet
+	// implement parse (e.g. legacy connection types) safely report
+	// "no batch_index seen."
+	virtual idx_t GetLastBatchIndex() const {
+		return duckdb::DConstants::INVALID_INDEX;
+	}
+
 	// Cancel the current stream. Called off-thread by VgiCancelDispatcher
 	// from a destructor-triggered teardown; may throw (dispatcher catches).
 	// - Subprocess: writes a zero-row batch with VGI_RPC_CANCEL_KEY custom

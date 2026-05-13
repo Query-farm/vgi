@@ -1,0 +1,103 @@
+# name: test/sql/integration/table/batch_index_stress.test_slow
+# description: Stress tests for batch_index — high fanout (many small
+#              partitions) and large partitions (one batch_index emits
+#              many Arrow batches). Excluded from the fast suite by the
+#              ``.test_slow`` suffix.
+# group: [vgi_integration_table]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+require json
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+SET threads=4;
+
+# ============================================================================
+# Many small partitions — exercises multiset bookkeeping
+# ============================================================================
+# 5000 rows × chunk_size=1 = 5000 partitions. Each partition emits one
+# Arrow batch. Stresses Pipeline::batch_indexes (the multiset that
+# tracks live batch_indexes across threads).
+
+query III
+SELECT COUNT(*), MIN(partition_id), MAX(partition_id)
+FROM example.partitioned_batch_index_marked(5000, chunk_size := 1);
+----
+5000	0	4999
+
+# Ordering invariant still holds at high fanout.
+query I
+WITH ordered AS (
+    SELECT row_number() OVER () AS rn, partition_id
+    FROM example.partitioned_batch_index_marked(5000, chunk_size := 1)
+)
+SELECT COUNT(*)
+FROM ordered a JOIN ordered b ON a.rn = b.rn + 1
+WHERE a.partition_id < b.partition_id;
+----
+0
+
+# ============================================================================
+# Large partitions — one batch_index spans many Arrow batches
+# ============================================================================
+# 10 partitions × 100_000 rows each. With BATCH_SIZE = 256 in the
+# fixture, one partition emits ~390 Arrow batches; they all share one
+# batch_index value and DuckDB's BatchedDataCollection appends them into
+# a single ColumnDataCollection.
+
+query III
+SELECT COUNT(*), MIN(seq), MAX(seq)
+FROM example.partitioned_batch_index_marked(1000000, chunk_size := 100000);
+----
+1000000	0	99999
+
+# Partition boundaries are sharp — partition_id transitions exactly when
+# seq wraps back to 0.
+query II
+SELECT partition_id, seq
+FROM example.partitioned_batch_index_marked(1000000, chunk_size := 100000)
+WHERE seq = 99999 OR seq = 0
+LIMIT 4;
+----
+0	0
+0	99999
+1	0
+1	99999
+
+# ============================================================================
+# 10M-row CTAS — PhysicalBatchInsert at scale
+# ============================================================================
+
+statement ok
+CREATE TABLE batch_index_10m AS
+SELECT * FROM example.partitioned_batch_index(10000000);
+
+query II
+SELECT MIN(n), MAX(n) FROM batch_index_10m;
+----
+0	9999999
+
+# rowid order matches n order — insertion-order preservation across 10M
+# rows under parallel scan.
+query II
+SELECT (SELECT n FROM batch_index_10m WHERE rowid = 0),
+       (SELECT n FROM batch_index_10m WHERE rowid = 9999999);
+----
+0	9999999
+
+statement ok
+DROP TABLE batch_index_10m;
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;

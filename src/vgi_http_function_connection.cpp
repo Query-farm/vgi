@@ -686,6 +686,34 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 
 		// Data batch — extract stream_state
 		new_state_token = ExtractStreamStateValue(bwm.custom_metadata);
+		// Parse vgi_batch_index off the wire if present. Validation happens
+		// in VgiTableFunctionImpl's InstallBatch on the consumer thread.
+		last_batch_index_ = DConstants::INVALID_INDEX;
+		if (bwm.custom_metadata) {
+			int bi_idx = bwm.custom_metadata->FindKey("vgi_batch_index");
+			if (bi_idx >= 0) {
+				const std::string &value = bwm.custom_metadata->value(bi_idx);
+				try {
+					size_t pos = 0;
+					uint64_t parsed = std::stoull(value, &pos);
+					if (pos != value.size()) {
+						throw IOException("VGI worker emitted invalid vgi_batch_index '%s' "
+						                  "(trailing characters; expected decimal uint64) "
+						                  "[url: %s]",
+						                  value, base_url_);
+					}
+					last_batch_index_ = static_cast<idx_t>(parsed);
+				} catch (const std::invalid_argument &) {
+					throw IOException("VGI worker emitted invalid vgi_batch_index '%s' "
+					                  "(expected decimal uint64) [url: %s]",
+					                  value, base_url_);
+				} catch (const std::out_of_range &) {
+					throw IOException("VGI worker emitted vgi_batch_index '%s' that exceeds "
+					                  "uint64 range [url: %s]",
+					                  value, base_url_);
+				}
+			}
+		}
 		if (!output_batch) {
 			output_batch = bwm.batch;
 		}

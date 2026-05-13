@@ -361,6 +361,19 @@ private:
 	// Dynamic filter state for tick-based pushdown (shared with the scan operator)
 	shared_ptr<TickFilterState> tick_filter_state_;
 
+	// Raw ``vgi_batch_index`` value parsed off the most recent data
+	// batch's custom_metadata, or INVALID if the worker did not emit the
+	// key. Set inside ``ReadDataBatch`` on the prefetch / connection
+	// thread; read by ``VgiTableFunctionInstallBatch`` on the consumer
+	// thread BEFORE the next ReadDataBatch can fire (lockstep RPC
+	// protocol), so there is no aliasing race with the writer.
+	idx_t last_batch_index_ = DConstants::INVALID_INDEX;
+public:
+	idx_t GetLastBatchIndex() const override {
+		return last_batch_index_;
+	}
+private:
+
 	// Optional shared-memory segment for zero-copy batch transfer.
 	// When non-null, the segment name + size are advertised to the worker
 	// in PerformInit's request metadata, and ReadDataBatch resolves

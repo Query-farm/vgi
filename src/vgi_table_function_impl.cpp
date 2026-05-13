@@ -1504,6 +1504,16 @@ static void UpdateDynamicFilterState(VgiTableFunctionGlobalState &global_state, 
 	}
 }
 
+//! Per-DuckDB-pipeline cap on the batch_index space. Lives at
+//! ``duckdb/src/include/duckdb/parallel/pipeline.hpp:51`` (``BATCH_INCREMENT``).
+//! Returning a source-side index ``>= BATCH_INCREMENT - 1`` triggers an
+//! ``InternalException`` from ``Pipeline::ScheduleEventsInternal``'s
+//! ``NextBatch`` shift (see ``pipeline_executor.cpp:140-143``). We reject
+//! before threading the value into ``GetPartitionData`` so the error
+//! names the worker contract directly instead of surfacing as an opaque
+//! DuckDB internal error.
+static constexpr idx_t VGI_BATCH_INDEX_CAP = 10000000000000ULL;  // 10^13
+
 //! Install arrow_batch as the active chunk. Returns false on EOS (null batch).
 //! Caller is responsible for having already obtained arrow_batch either
 //! synchronously (via ReadDataBatch) or from the prefetch slot.
@@ -1523,6 +1533,40 @@ static bool InstallBatch(ClientContext &context, const VgiTableFunctionBindData 
 		}
 		return false;
 	}
+
+	// batch_index validation + monotonicity check. The raw uint64 was
+	// parsed off the wire's custom_metadata inside ``ReadDataBatch`` and
+	// stashed on the connection; here on the consumer thread we apply the
+	// contract (missing-tag, cap, monotonicity) and only then assign to
+	// local_state. Writing inside ReadDataBatch / VgiPrefetchTask::Execute
+	// would race with VgiGetPartitionData on the pipeline-executor thread.
+	const idx_t parsed_index = local_state.connection()->GetLastBatchIndex();
+	if (bind_data.supports_batch_index) {
+		if (parsed_index == DConstants::INVALID_INDEX) {
+			throw IOException("VGI function '%s' with supports_batch_index=true emitted a data "
+			                  "batch without vgi_batch_index metadata",
+			                  bind_data.function_name);
+		}
+		if (parsed_index >= VGI_BATCH_INDEX_CAP - 1) {
+			throw IOException("VGI function '%s' emitted vgi_batch_index %llu that exceeds DuckDB's "
+			                  "per-pipeline cap (%llu); choose a smaller index space",
+			                  bind_data.function_name, static_cast<unsigned long long>(parsed_index),
+			                  static_cast<unsigned long long>(VGI_BATCH_INDEX_CAP));
+		}
+		if (local_state.current_batch_index != DConstants::INVALID_INDEX &&
+		    parsed_index < local_state.current_batch_index) {
+			throw IOException("VGI function '%s' emitted vgi_batch_index %llu after %llu on the "
+			                  "same stream — batch_index must be monotone non-decreasing per "
+			                  "worker / per stream",
+			                  bind_data.function_name, static_cast<unsigned long long>(parsed_index),
+			                  static_cast<unsigned long long>(local_state.current_batch_index));
+		}
+		local_state.current_batch_index = parsed_index;
+	}
+	// If the function did not opt in but the worker emitted vgi_batch_index
+	// anyway, we silently ignore — non-opted-in functions shouldn't be
+	// tagging, but the harmless-passthrough behaviour matches our other
+	// metadata keys.
 
 	auto chunk = make_uniq<ArrowArrayWrapper>();
 	ExportRecordBatch(arrow_batch, *chunk);
@@ -2004,6 +2048,37 @@ void VgiSetScanOrder(unique_ptr<RowGroupOrderOptions> order_options, optional_pt
 	    std::move(null_order),
 	    row_limit
 	};
+}
+
+// ============================================================================
+// get_partition_data callback — batch_index for ordered-sink reassembly
+// ============================================================================
+//
+// Registered ONLY for table functions that opt in to
+// ``Meta.supports_batch_index = True`` on the worker side (see
+// ``vgi_table_function_set.cpp`` for the registration site). Called by
+// ``PhysicalTableScan::GetPartitionData`` once per source chunk pulled by
+// the pipeline executor; ordered sinks
+// (BatchCollector / BatchInsert / BatchCopyToFile / Limit) use the
+// returned batch_index to reassemble parallel output in worker-defined
+// partition order.
+//
+// ``local_state.current_batch_index`` was set by ``InstallBatch`` on the
+// consumer thread when the corresponding data batch arrived — see the
+// ``current_batch_index`` field comment in vgi_table_function_impl.hpp
+// for the thread-safety rationale.
+//
+// INVALID is unreachable here. DuckDB's
+// ``pipeline_executor.cpp:130`` gates ``GetPartitionData`` on
+// ``source_chunk.size() > 0``, which means ``InstallBatch`` already fired
+// at least once with a tagged data batch.
+//
+// ``partition_data`` left empty: v1 only handles BatchIndex() mode, not
+// PartitionColumns() (the latter would require per-column min/max from
+// the chunk for ``PhysicalPartitionedAggregate``).
+OperatorPartitionData VgiGetPartitionData(ClientContext &, TableFunctionGetPartitionInput &input) {
+	auto &local_state = input.local_state->Cast<VgiTableFunctionLocalState>();
+	return OperatorPartitionData(local_state.current_batch_index);
 }
 
 // ============================================================================

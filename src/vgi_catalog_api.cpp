@@ -2154,6 +2154,14 @@ VgiFunctionInfo ParseFunctionInfo(const std::shared_ptr<arrow::RecordBatch> &bat
 	// max_workers (nullable int, stored as optional)
 	info.max_workers = row["max_workers"].as<int32_t>();
 
+	// supports_batch_index — optional bool (defaults to false for older
+	// workers). When true, the function emits ``vgi_batch_index`` in each
+	// Arrow batch's KeyValueMetadata; the extension threads the value
+	// through ``TableFunction::get_partition_data`` so ordered sinks can
+	// reassemble parallel output. Also skips the FIXED_ORDER MaxThreads=1
+	// clamp — see vgi_table_function_set.cpp.
+	info.supports_batch_index = row["supports_batch_index"].value_or(false);
+
 	// Aggregate function fields (non-nullable with defaults)
 	auto order_dependent_str = row["order_dependent"].value_or(std::string {"NOT_ORDER_DEPENDENT"});
 	auto order_dependent = ParseAggregateOrderDependent(order_dependent_str);

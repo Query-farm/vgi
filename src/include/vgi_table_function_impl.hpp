@@ -139,6 +139,20 @@ struct VgiTableFunctionBindData : public TableFunctionData {
 	// is mirrored onto ``VgiTableFunctionGlobalState::fixed_order`` at
 	// init-global time; ``MaxThreads()`` clamps to 1 when set.
 	bool fixed_order = false;
+
+	// True iff the worker declared ``Meta.supports_batch_index = True``.
+	// When set, the function registration at vgi_table_function_set.cpp
+	// installs ``VgiGetPartitionData`` AND skips the ``fixed_order ->
+	// MaxThreads=1`` clamp above (the source stays parallel and the sink
+	// reassembles via batch_index). Each emitted Arrow data batch MUST
+	// carry ``vgi_batch_index`` in KeyValueMetadata; ``InstallBatch``
+	// parses it on the consumer thread and stashes it on
+	// ``VgiTableFunctionLocalState::current_batch_index`` for
+	// ``VgiGetPartitionData`` to return. Per-stream monotonicity is
+	// enforced in ``InstallBatch`` (DuckDB's release-build checks are
+	// global-uniqueness-only).
+	bool supports_batch_index = false;
+
 	mutable int64_t cardinality_estimate = -1;
 	// Optional max-cardinality, surfaced into DuckDB's NodeStatistics.
 	// -1 = unknown. Populated either from the inlined ``TableInfo``
@@ -412,6 +426,24 @@ struct VgiTableFunctionLocalState : public ArrowScanLocalState {
 	bool done = false;
 	bool first_scan_call_ = true;
 
+	// batch_index emitted by the most recent data batch from the worker
+	// (read out of the Arrow record-batch KeyValueMetadata in InstallBatch,
+	// see vgi_table_function_impl.cpp). Threaded into ``VgiGetPartitionData``
+	// so DuckDB's ordered sinks can reassemble parallel output. INVALID
+	// until the first data batch arrives — safe because ``GetPartitionData``
+	// is only called when ``source_chunk.size() > 0`` (see
+	// duckdb/src/parallel/pipeline_executor.cpp:130-149), which means a
+	// data batch already landed via ``InstallBatch``.
+	//
+	// CRITICAL: this field is written ONLY by ``InstallBatch`` on the
+	// consumer (pipeline-executor) thread. NEVER written inside
+	// ``VgiPrefetchTask::Execute`` / ``ReadDataBatch`` — those run on
+	// scheduler worker threads and a write there would race with
+	// ``VgiGetPartitionData`` on the pipeline thread. Per-batch
+	// monotonicity is also checked in ``InstallBatch`` (DuckDB's
+	// ``BatchedDataCollection::Append`` assertion is debug-only).
+	idx_t current_batch_index = DConstants::INVALID_INDEX;
+
 	// Captured at init-local time; read by the destructor (which has no
 	// ClientContext available). Setting changes mid-query do not
 	// affect in-flight streams.
@@ -504,6 +536,17 @@ vector<column_t> VgiTableScanGetRowIdColumns(ClientContext &context, optional_pt
 
 //! set_scan_order callback - captures ORDER BY + LIMIT hint from RowGroupPruner optimizer
 void VgiSetScanOrder(unique_ptr<RowGroupOrderOptions> order_options, optional_ptr<FunctionData> bind_data_p);
+
+//! get_partition_data callback — returns the batch_index of the most
+//! recent data batch on this local source state. Registered ONLY for
+//! functions that opt in via ``Meta.supports_batch_index = True``
+//! (see vgi_table_function_set.cpp). DuckDB calls this per source chunk
+//! when an ordered sink (BatchCollector, BatchInsert, BatchCopyToFile,
+//! Limit) is in the pipeline. The returned ``OperatorPartitionData`` has
+//! empty ``partition_data`` — v1 only supports ``BatchIndex()`` mode, not
+//! ``PartitionColumns()`` (Hive-style routing into
+//! ``PhysicalPartitionedAggregate``).
+OperatorPartitionData VgiGetPartitionData(ClientContext &context, TableFunctionGetPartitionInput &input);
 
 //! Statistics callback - returns column statistics from VgiTableEntry (for catalog scans)
 //! or nullptr (for direct vgi_table_function calls)
