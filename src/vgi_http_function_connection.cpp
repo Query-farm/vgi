@@ -19,6 +19,41 @@
 namespace duckdb {
 namespace vgi {
 
+// Helper: parse ``vgi_batch_index`` off Arrow custom_metadata.
+// Returns INVALID_INDEX when the key is absent. Raises IOException
+// when present but un-parseable. The cap and monotonicity checks
+// live downstream in VgiTableFunctionImpl::InstallBatch — we only
+// extract the raw uint64 here.
+static idx_t ParseVgiBatchIndex(const std::shared_ptr<arrow::KeyValueMetadata> &custom_metadata,
+                                const std::string &base_url) {
+	if (!custom_metadata) {
+		return DConstants::INVALID_INDEX;
+	}
+	int idx = custom_metadata->FindKey("vgi_batch_index");
+	if (idx < 0) {
+		return DConstants::INVALID_INDEX;
+	}
+	const std::string &value = custom_metadata->value(idx);
+	try {
+		size_t pos = 0;
+		uint64_t parsed = std::stoull(value, &pos);
+		if (pos != value.size()) {
+			throw IOException("VGI worker emitted invalid vgi_batch_index '%s' "
+			                  "(trailing characters; expected decimal uint64) [url: %s]",
+			                  value, base_url);
+		}
+		return static_cast<idx_t>(parsed);
+	} catch (const std::invalid_argument &) {
+		throw IOException("VGI worker emitted invalid vgi_batch_index '%s' "
+		                  "(expected decimal uint64) [url: %s]",
+		                  value, base_url);
+	} catch (const std::out_of_range &) {
+		throw IOException("VGI worker emitted vgi_batch_index '%s' that exceeds uint64 range "
+		                  "[url: %s]",
+		                  value, base_url);
+	}
+}
+
 // Helper: extract stream_state token value from batch metadata, or return empty string.
 static std::string ExtractStreamStateValue(const std::shared_ptr<arrow::KeyValueMetadata> &metadata) {
 	if (!metadata) {
@@ -166,6 +201,7 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ExtractStreamState(
 
 void HttpFunctionConnection::BufferDataBatches(const std::string &response_body, size_t offset) {
 	buffered_batches_.clear();
+	buffered_batch_indexes_.clear();
 	buffered_batch_index_ = 0;
 	stream_state_token_.clear();
 
@@ -219,14 +255,16 @@ void HttpFunctionConnection::BufferDataBatches(const std::string &response_body,
 			                                         base_url_, GetExecutionIdHex(), GetAttachIdHex(),
 			                                         bwm.custom_metadata);
 			buffered_batches_.push_back(resolved.batch);
+			buffered_batch_indexes_.push_back(ParseVgiBatchIndex(resolved.metadata, base_url_));
 			ExtractStreamState(resolved.batch, resolved.metadata);
 			++spike_external_batches;
 			continue;
 		}
 
-		// Extract stream_state from regular data batches
+		// Extract stream_state from regular data batches.
 		ExtractStreamState(bwm.batch, bwm.custom_metadata);
 		buffered_batches_.push_back(bwm.batch);
+		buffered_batch_indexes_.push_back(ParseVgiBatchIndex(bwm.custom_metadata, base_url_));
 		++spike_data_batches;
 	}
 
@@ -546,6 +584,7 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 	if (is_producer_mode_) {
 		// Return next buffered batch if available
 		if (buffered_batch_index_ < buffered_batches_.size()) {
+			last_batch_index_ = buffered_batch_indexes_[buffered_batch_index_];
 			return buffered_batches_[buffered_batch_index_++];
 		}
 
@@ -579,6 +618,7 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 		BufferDataBatches(response_body);
 
 		if (buffered_batch_index_ < buffered_batches_.size()) {
+			last_batch_index_ = buffered_batch_indexes_[buffered_batch_index_];
 			return buffered_batches_[buffered_batch_index_++];
 		}
 
@@ -649,6 +689,11 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 
 	std::shared_ptr<arrow::RecordBatch> output_batch;
 	std::string new_state_token;
+	// Reset batch_index BEFORE the loop. The HTTP response may contain a
+	// data batch followed by a 0-row continuation batch carrying only
+	// STATE_KEY; resetting inside the loop would let the continuation
+	// batch's pass clear a value parsed from the data batch.
+	last_batch_index_ = DConstants::INVALID_INDEX;
 
 	while (true) {
 		auto read_result = reader->ReadNext();
@@ -686,32 +731,15 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 
 		// Data batch — extract stream_state
 		new_state_token = ExtractStreamStateValue(bwm.custom_metadata);
-		// Parse vgi_batch_index off the wire if present. Validation happens
-		// in VgiTableFunctionImpl's InstallBatch on the consumer thread.
-		last_batch_index_ = DConstants::INVALID_INDEX;
-		if (bwm.custom_metadata) {
-			int bi_idx = bwm.custom_metadata->FindKey("vgi_batch_index");
-			if (bi_idx >= 0) {
-				const std::string &value = bwm.custom_metadata->value(bi_idx);
-				try {
-					size_t pos = 0;
-					uint64_t parsed = std::stoull(value, &pos);
-					if (pos != value.size()) {
-						throw IOException("VGI worker emitted invalid vgi_batch_index '%s' "
-						                  "(trailing characters; expected decimal uint64) "
-						                  "[url: %s]",
-						                  value, base_url_);
-					}
-					last_batch_index_ = static_cast<idx_t>(parsed);
-				} catch (const std::invalid_argument &) {
-					throw IOException("VGI worker emitted invalid vgi_batch_index '%s' "
-					                  "(expected decimal uint64) [url: %s]",
-					                  value, base_url_);
-				} catch (const std::out_of_range &) {
-					throw IOException("VGI worker emitted vgi_batch_index '%s' that exceeds "
-					                  "uint64 range [url: %s]",
-					                  value, base_url_);
-				}
+		// Parse vgi_batch_index off the wire if present. Only update on a
+		// positive match — a subsequent continuation batch carrying
+		// STATE_KEY but no vgi_batch_index must NOT clobber the value
+		// parsed from the upstream data batch. Validation (cap/monotonicity)
+		// happens in VgiTableFunctionImpl::InstallBatch on the consumer.
+		{
+			const idx_t parsed = ParseVgiBatchIndex(bwm.custom_metadata, base_url_);
+			if (parsed != DConstants::INVALID_INDEX) {
+				last_batch_index_ = parsed;
 			}
 		}
 		if (!output_batch) {

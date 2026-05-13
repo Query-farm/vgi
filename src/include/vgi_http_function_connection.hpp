@@ -139,6 +139,11 @@ private:
 	// VgiTableFunctionImpl's InstallBatch on the consumer thread.
 	idx_t last_batch_index_ = DConstants::INVALID_INDEX;
 	std::vector<std::shared_ptr<arrow::RecordBatch>> buffered_batches_;
+	// Parallel to ``buffered_batches_``: ``vgi_batch_index`` parsed off
+	// each batch's custom_metadata at buffer time (or INVALID if absent).
+	// We must capture this here because ``ReadDataBatch`` later returns
+	// batches from the buffer WITHOUT the original wire metadata.
+	std::vector<idx_t> buffered_batch_indexes_;
 	size_t buffered_batch_index_ = 0;
 	bool is_producer_mode_ = false;
 

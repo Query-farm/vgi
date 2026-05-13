@@ -52,14 +52,17 @@ LIMIT 5;
 # predicate.
 # ============================================================================
 
-# Use the single-column fixture so projection pushdown is allowed. The
-# SAMPLE result is a non-empty subset; we only assert it doesn't crash
-# and produces results in the expected range.
-query III
-SELECT COUNT(*) > 0, COUNT(*) <= 10000, MIN(n) >= 0
+# Use the single-column fixture so projection pushdown is allowed.
+# Under parallel chunked execution, the row count from a percentage
+# sample is genuinely variable (rolls per chunk), so we only assert
+# that the scan completes without error and produces values in range —
+# not a specific row count.
+query II
+SELECT COUNT(*) <= 10000,
+       COUNT(*) = 0 OR (MIN(n) >= 0 AND MAX(n) <= 9999)
 FROM example.partitioned_batch_index(10000) USING SAMPLE 10 PERCENT;
 ----
-true	true	true
+true	true
 
 # ============================================================================
 # ORDER BY hint pushdown — RowGroupPruner can pass an ordering hint to
