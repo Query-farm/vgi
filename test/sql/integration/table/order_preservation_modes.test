@@ -33,6 +33,20 @@ SET threads=4;
 statement ok
 CALL enable_logging(level := 'debug');
 
+# Pool warmup. Each `partitioned_*` scan spawns up to ``threads`` Python
+# workers via the worker pool, but a fresh worker process takes ~500 ms to
+# come online (uv + Python interpreter startup). The primary worker, which
+# is already pooled from the catalog-attach phase, drains the work queue in
+# a couple of ms — long before the cold secondaries finish init_local. The
+# downstream "≥2 distinct conn=" assertions then see only the primary's
+# conn even though DuckDB *did* schedule N parallel tasks.
+#
+# Run a throwaway parallel scan up front so the pool retains warm workers
+# for the assertion-bearing scans below. Without this, the test is racy on
+# any subprocess transport.
+statement ok
+SELECT COUNT(*) FROM example.partitioned_preserves_order(100000);
+
 # ----------------------------------------------------------------------------
 # FIXED_ORDER: planner must serialise → exactly one distinct conn=
 # ----------------------------------------------------------------------------
