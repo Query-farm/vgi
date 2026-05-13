@@ -394,8 +394,25 @@ std::string HttpPostArrowIpc(ClientContext &context,
 	// Check for WWW-Authenticate header (OAuth discovery). If absent, the server
 	// rejected the token outright (e.g., static bearer auth) — let the auth handler decide.
 	if (!response->HasHeader("WWW-Authenticate")) {
-		// No WWW-Authenticate: let auth->HandleUnauthorized decide. For bearer tokens
-		// this throws immediately. For OAuth without a challenge, we provide an empty one.
+		// Special case: the default auth handler when the user supplied
+		// neither bearer_token nor oauth_refresh_token is an empty
+		// OAuthCatalogAuth. Feeding an empty OAuthChallenge into its
+		// HandleUnauthorized would eventually call FetchResourceMetadata("")
+		// and surface "VGI OAuth: resource metadata URL must use HTTPS:"
+		// — a confusing diagnostic for a non-OAuth situation. Catch it
+		// here while we still have the URL in scope and produce an
+		// actionable error that names the fix.
+		if (!auth->IsExplicitlyConfigured()) {
+			throw IOException(
+			    "VGI HTTP authentication failed (HTTP 401) [url: %s]. The server requires "
+			    "authentication but advertised no OAuth challenge (no WWW-Authenticate "
+			    "header). Pass bearer_token in ATTACH options, or oauth_refresh_token if "
+			    "the server uses OAuth without challenge advertising.",
+			    url);
+		}
+		// User opted into auth (bearer_token or oauth_refresh_token) — let
+		// the handler decide. BearerTokenCatalogAuth throws a token-rejected
+		// error; a seeded OAuthCatalogAuth attempts refresh.
 		OAuthChallenge empty_challenge;
 		auth->HandleUnauthorized(empty_challenge, context);
 		// If HandleUnauthorized didn't throw (shouldn't happen), surface a generic error

@@ -403,6 +403,14 @@ struct YyjsonDocGuard {
 //===--------------------------------------------------------------------===//
 
 static void EnforceHttpsUrl(const std::string &url, const std::string &context_name) {
+	// Belt-and-suspenders: the upstream caller in vgi_http_client.cpp now
+	// short-circuits on an empty challenge URL with a clean "no credential"
+	// error, so a non-empty URL is expected here. If anything else ever
+	// feeds an empty URL into the OAuth path, surface a readable message
+	// rather than the trailing-whitespace "must use HTTPS: " confusion.
+	if (url.empty()) {
+		throw IOException("VGI OAuth: %s URL is empty (no OAuth challenge from server)", context_name);
+	}
 	if (url.substr(0, 8) != "https://" && url.substr(0, 16) != "http://127.0.0.1" &&
 	    url.substr(0, 16) != "http://localhost") {
 		throw IOException("VGI OAuth: %s URL must use HTTPS: %s", context_name, url);
@@ -1642,6 +1650,24 @@ void OAuthCatalogAuth::SeedRefreshToken(const std::string &refresh_token) {
 	if (state_.status == AuthState::Status::IDLE) {
 		state_.token.refresh_token = refresh_token;
 	}
+}
+
+bool OAuthCatalogAuth::IsExplicitlyConfigured() const {
+	// OAuth is "configured" only when the user supplied a refresh token at
+	// ATTACH time (oauth_refresh_token option) OR has already completed an
+	// auth flow. A freshly-constructed default OAuthCatalogAuth — the
+	// fallback path when neither bearer_token nor oauth_refresh_token was
+	// set — returns false so the 401-handler in vgi_http_client.cpp can
+	// surface a clean "no credential" diagnostic instead of launching an
+	// OAuth discovery flow against an empty challenge URL.
+	std::lock_guard<std::mutex> lock(mutex_);
+	if (!state_.token.refresh_token.empty()) {
+		return true;
+	}
+	if (state_.status == AuthState::Status::COMPLETE && state_.token.IsValid()) {
+		return true;
+	}
+	return false;
 }
 
 std::string OAuthCatalogAuth::HandleUnauthorized(const OAuthChallenge &challenge, ClientContext &context) {

@@ -135,6 +135,14 @@ public:
 	};
 	virtual bool GetTokenInfo(TokenInfo &info) { return false; }
 	virtual bool GetTokenSetCopy(OAuthTokenSet &out) { return false; }
+
+	// True iff the user explicitly opted into this auth flow at ATTACH time.
+	// Bearer auth: always true once the bearer_token option was supplied.
+	// OAuth: true only when oauth_refresh_token was seeded — a default
+	// OAuthCatalogAuth (no user opt-in) returns false so HttpPostArrowIpc
+	// can produce a "no credential" diagnostic rather than launching an
+	// OAuth discovery flow on an empty challenge.
+	virtual bool IsExplicitlyConfigured() const = 0;
 };
 
 // Static bearer token auth (API keys, service account tokens, pre-obtained JWTs).
@@ -147,6 +155,7 @@ public:
 	std::string GetToken() override;
 	std::string HandleUnauthorized(const OAuthChallenge &challenge, ClientContext &context) override;
 	void ClearTokens() override;
+	bool IsExplicitlyConfigured() const override { return true; }
 
 private:
 	mutable std::mutex mutex_;
@@ -170,6 +179,7 @@ public:
 
 	bool GetTokenInfo(TokenInfo &info) override;
 	bool GetTokenSetCopy(OAuthTokenSet &out) override;
+	bool IsExplicitlyConfigured() const override;
 
 private:
 	mutable std::mutex mutex_;
