@@ -442,13 +442,18 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 	func.get_bind_info = vgi::VgiTableScanGetBindInfo;
 	func.set_scan_order = vgi::VgiSetScanOrder;
 	func.statistics = vgi::VgiTableFunctionStatistics;
-	// INITIALIZE_ON_SCHEDULE moves init_global into Executor::ScheduleEvents'
-	// eager-init loop so all pipelines' init_globals fire from a single
-	// site at scheduling time. Combined with the async kickoff in
-	// VgiTableFunctionInitGlobal this puts every pending RPC in flight
-	// before any pipeline blocks on init_local — collapsing N sequential
-	// RTTs into one parallel batch when the pipelines are independent.
-	func.global_initialization = TableFunctionInitialization::INITIALIZE_ON_SCHEDULE;
+	// INITIALIZE_ON_SCHEDULE would move init_global into
+	// Executor::ScheduleEvents' eager-init loop, collapsing N sequential
+	// metadata RTTs into one parallel batch — but it fires init_global
+	// before any sibling build pipeline has populated
+	// PhysicalTableScan::dynamic_filters via JoinFilterPushdownInfo::PushInFilter.
+	// A VGI catalog table on the probe side of a hash join would never
+	// see the build-side InFilter, breaking join key pushdown for the
+	// `SELECT … FROM catalog.schema.table` form. The same fix already lives
+	// in vgi_table_function_set.cpp for the function-call form; mirror it
+	// here. See that file's comment block for the full rationale and the
+	// TODO about a deferred-filter-capture refactor that could restore the
+	// eager flag without sacrificing join pushdown.
 
 	// Set virtual column callbacks for row_id support
 	if (table_info_.row_id_column >= 0) {
