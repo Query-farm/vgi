@@ -130,6 +130,15 @@ struct VgiTableFunctionBindData : public TableFunctionData {
 
 	// Execution hints (defaults at bind, updated after init)
 	int32_t max_processes = 1;
+	// True iff the worker declared this function as FIXED_ORDER. DuckDB's
+	// ``Pipeline::IsOrderDependent()`` controls *operator caching* but does
+	// NOT force a single-threaded source — ``PhysicalTableScan::ParallelSource()``
+	// unconditionally returns true, so without this flag a FIXED_ORDER scan
+	// would still fan out to ``max_processes`` workers (and produce
+	// non-deterministic emit order despite the "fixed" promise). The flag
+	// is mirrored onto ``VgiTableFunctionGlobalState::fixed_order`` at
+	// init-global time; ``MaxThreads()`` clamps to 1 when set.
+	bool fixed_order = false;
 	mutable int64_t cardinality_estimate = -1;
 	// Optional max-cardinality, surfaced into DuckDB's NodeStatistics.
 	// -1 = unknown. Populated either from the inlined ``TableInfo``
@@ -281,6 +290,12 @@ struct VgiTableFunctionGlobalState : public GlobalTableFunctionState {
 	std::optional<OrderByHint> order_by_hint;
 	std::optional<TableSampleHint> table_sample_hint;
 
+	// Mirrored from ``VgiTableFunctionBindData::fixed_order`` at init-global
+	// time. When set, ``MaxThreads()`` clamps to 1 so DuckDB's pipeline
+	// scheduler runs the source on a single thread. See the bind-data
+	// comment for why ``Pipeline::IsOrderDependent()`` alone is insufficient.
+	bool fixed_order = false;
+
 	idx_t MaxThreads() const override {
 		// Called from Pipeline::ScheduleParallel on the main scheduling
 		// thread, BEFORE init_local. With async init_global, max_processes
@@ -299,6 +314,13 @@ struct VgiTableFunctionGlobalState : public GlobalTableFunctionState {
 		// scheduled in waves (CTE materialization, join build vs. probe)
 		// pay one wait per wave. Most queries are one wave.
 		EnsureInitApplied();
+		// FIXED_ORDER functions must serialize the source — see field
+		// comment above. The worker may still advertise max_workers > 1
+		// (it's allowed to *support* multi-worker; the planner is the one
+		// promising ordered emission to downstream operators).
+		if (fixed_order) {
+			return 1;
+		}
 		return max_processes;
 	}
 };

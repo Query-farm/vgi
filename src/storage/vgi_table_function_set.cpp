@@ -83,6 +83,14 @@ static unique_ptr<FunctionData> VgiCatalogTableFunctionBind(ClientContext &conte
 	bind_data->function_name = vgi_info.function_info().name;
 	bind_data->projection_pushdown = vgi_info.function_info().projection_pushdown.value_or(false);
 	bind_data->supported_expression_filters = vgi_info.function_info().supported_expression_filters;
+	// FIXED_ORDER: clamps MaxThreads to 1 so DuckDB schedules the source
+	// onto a single thread. ``TableFunction::order_preservation_type`` is
+	// already set at function-registration time (see ``AddFunction`` calls
+	// below) and drives the planner's ``Pipeline::IsOrderDependent()``;
+	// the boolean here is what actually serialises the source.
+	bind_data->fixed_order =
+	    MapOrderPreservation(vgi_info.function_info().order_preservation) ==
+	    OrderPreservationType::FIXED_ORDER;
 
 	// Build Arrow arguments from the function call inputs
 	// input.inputs contains positional arguments passed to the function

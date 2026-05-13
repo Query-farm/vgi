@@ -1192,6 +1192,10 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 	global_state->join_keys_buffers = join_keys_buffers;
 	global_state->order_by_hint = bind_data.order_by_hint;
 	global_state->table_sample_hint = bind_data.table_sample_hint;
+	// Propagated from bind so MaxThreads() can clamp the source to one
+	// thread for FIXED_ORDER functions even after EnsureInitApplied folds
+	// in the worker's max_workers.
+	global_state->fixed_order = bind_data.fixed_order;
 	// Provisional max_processes — actual value is folded in by
 	// EnsureInitApplied once the init future resolves. Setting 1 here
 	// matches the conservative default; for fan-outs of small metadata
