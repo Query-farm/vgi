@@ -295,14 +295,37 @@ void VgiTableFunctionSet::LoadEntries(ClientContext &context, const std::lock_gu
 				table_func.to_string = vgi::VgiTableFunctionToString;
 				table_func.dynamic_to_string = vgi::VgiTableFunctionDynamicToString;
 				table_func.set_scan_order = vgi::VgiSetScanOrder;
-				// INITIALIZE_ON_SCHEDULE moves init_global into
+				// INITIALIZE_ON_SCHEDULE would move init_global into
 				// `Executor::ScheduleEventsInternal`'s eager-init loop so the
 				// pipelines' init_globals all fire from the same site at
-				// scheduling time. Combined with the async kickoff in
-				// VgiTableFunctionInitGlobal, every pending RPC is in flight
-				// before any pipeline blocks on init_local — collapsing N
-				// sequential RTTs into one parallel batch.
-				table_func.global_initialization = TableFunctionInitialization::INITIALIZE_ON_SCHEDULE;
+				// scheduling time — combined with the async kickoff in
+				// VgiTableFunctionInitGlobal, this collapses N sequential
+				// metadata RTTs into one parallel batch (the Ducklake
+				// `SELECT *` 25-table planner case).
+				//
+				// However, INITIALIZE_ON_SCHEDULE fires init_global *before*
+				// any sibling build pipeline has populated
+				// `PhysicalTableScan::dynamic_filters` (the hash join's
+				// `JoinFilterPushdownInfo::PushInFilter` only runs at build
+				// finalize). With the flag on, a VGI scan sitting on the
+				// probe side of a hash join sees an empty
+				// `op.dynamic_filters` at init and never receives the
+				// build-side InFilter — breaking join key pushdown
+				// (join_keys_pushdown.test). DuckDB's
+				// `TableScanGlobalSourceState` only combines dynamic_filters
+				// into the init_input when `HasFilters()` is already true,
+				// so there is no in-DuckDB hook to refresh the captured
+				// filter set later.
+				//
+				// Correctness wins over the Ducklake fan-out optimization.
+				// Leaving the flag off means each `Pipeline::Schedule` does
+				// kickoff + block sequentially, so 25-table metadata reads
+				// pay sum(RTT) instead of max(RTT). The async kickoff
+				// inside `VgiTableFunctionInitGlobal` still lets the
+				// pre-init connection acquire run on a background thread.
+				// TODO: a deferred-filter-capture refactor (split init
+				// into "establish session" + "set filters") could restore
+				// INITIALIZE_ON_SCHEDULE without sacrificing join pushdown.
 
 				// Register named parameters so DuckDB knows how to handle them
 				table_func.named_parameters = arg_types.named_parameters;
