@@ -35,6 +35,7 @@ VGI_SIMPLE_WRITABLE_WORKER ?= uv run --project $(HOME)/Development/vgi-python vg
 # explicitly via `make test_writable` when that worker is available.
 .PHONY: test_subprocess test_subprocess_debug test_http test_http_debug \
 	test_launcher test_launcher_debug \
+	test_launcher_cloudflare_do test_launcher_cloudflare_do_debug \
 	test_http_versioned_tables test_http_versioned_tables_debug \
 	test_http_attach_options test_http_attach_options_debug \
 	test_writable test_writable_debug \
@@ -107,6 +108,63 @@ test_launcher_debug:
 	VGI_REQUIRE_LAUNCHER_TRANSPORT=1 \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
 	./build/debug/test/unittest "test/*" \
+	    "~test/sql/integration/writable/*" \
+	    "~test/sql/vgi_worker_pool.test" \
+	    "~test/sql/integration/table/filter_echo_partitioned.test" \
+	    "~test/sql/integration/attach/versioned_tables_impl.test"
+
+# Same test suite as test_launcher but with the fixture worker configured
+# to use the Cloudflare Durable Object storage backend
+# (VGI_WORKER_SHARED_STORAGE=cloudflare-do) instead of the default SQLite.
+# Exercises the production path against the deployed sharded DO at
+# vgi-cloudflare-durable-object-storage.<account>.workers.dev.
+#
+# Credentials live in .cloudflare-do.env (gitignored) — see that file's
+# header for the format and rotation steps.
+#
+# Routes through scripts/run_tests.py so per-test cold-start latency
+# (~600 ms to spin up a fresh CF DO per attach) overlaps across N
+# concurrent unittest processes instead of serializing. Override the
+# parallelism with VGI_RUN_TESTS_JOBS=N (default 8).
+test_launcher_cloudflare_do:
+	@if [ ! -f .cloudflare-do.env ]; then \
+		echo "ERROR: .cloudflare-do.env not found in $(PROJ_DIR)" >&2; \
+		echo "Create it with the format described in its header." >&2; \
+		exit 1; \
+	fi
+	set -a && . ./.cloudflare-do.env && set +a && \
+	VGI_TRANSACTOR_DB_DIR="$$(mktemp -d)" \
+	VGI_TEST_WORKER="launch:$(VGI_TEST_WORKER)" \
+	VGI_VERSIONED_WORKER="launch:$(VGI_VERSIONED_WORKER)" \
+	VGI_VERSIONED_TABLES_WORKER="launch:$(VGI_VERSIONED_TABLES_WORKER)" \
+	VGI_ATTACH_OPTIONS_WORKER="launch:$(VGI_ATTACH_OPTIONS_WORKER)" \
+	VGI_SIMPLE_WRITABLE_WORKER="launch:$(VGI_SIMPLE_WRITABLE_WORKER)" \
+	VGI_REQUIRE_LAUNCHER_TRANSPORT=1 \
+	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
+	VGI_WORKER_SHARED_STORAGE=cloudflare-do \
+	python3 scripts/run_tests.py --build release "test/*" \
+	    "~test/sql/integration/writable/*" \
+	    "~test/sql/vgi_worker_pool.test" \
+	    "~test/sql/integration/table/filter_echo_partitioned.test" \
+	    "~test/sql/integration/attach/versioned_tables_impl.test"
+
+test_launcher_cloudflare_do_debug:
+	@if [ ! -f .cloudflare-do.env ]; then \
+		echo "ERROR: .cloudflare-do.env not found in $(PROJ_DIR)" >&2; \
+		echo "Create it with the format described in its header." >&2; \
+		exit 1; \
+	fi
+	set -a && . ./.cloudflare-do.env && set +a && \
+	VGI_TRANSACTOR_DB_DIR="$$(mktemp -d)" \
+	VGI_TEST_WORKER="launch:$(VGI_TEST_WORKER)" \
+	VGI_VERSIONED_WORKER="launch:$(VGI_VERSIONED_WORKER)" \
+	VGI_VERSIONED_TABLES_WORKER="launch:$(VGI_VERSIONED_TABLES_WORKER)" \
+	VGI_ATTACH_OPTIONS_WORKER="launch:$(VGI_ATTACH_OPTIONS_WORKER)" \
+	VGI_SIMPLE_WRITABLE_WORKER="launch:$(VGI_SIMPLE_WRITABLE_WORKER)" \
+	VGI_REQUIRE_LAUNCHER_TRANSPORT=1 \
+	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
+	VGI_WORKER_SHARED_STORAGE=cloudflare-do \
+	python3 scripts/run_tests.py --build debug "test/*" \
 	    "~test/sql/integration/writable/*" \
 	    "~test/sql/vgi_worker_pool.test" \
 	    "~test/sql/integration/table/filter_echo_partitioned.test" \
