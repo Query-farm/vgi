@@ -61,7 +61,8 @@ public:
 	                       std::vector<std::shared_ptr<arrow::Buffer>> join_keys = {},
 	                       const std::string &phase = "",
 	                       const std::optional<OrderByHint> &order_by = std::nullopt,
-	                       const std::optional<TableSampleHint> &table_sample = std::nullopt) override;
+	                       const std::optional<TableSampleHint> &table_sample = std::nullopt,
+	                       const std::vector<uint8_t> &init_opaque_data = {}) override;
 	void PerformFinalizeInit(const BindResult &bind_result) override;
 
 	// Phase 3: Data exchange

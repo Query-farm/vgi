@@ -982,7 +982,7 @@ SerializedFilters VgiSerializeFilters(ClientContext &context, const vector<colum
 // init_local (and any other code that needs `global_execution_id` /
 // `primary_connection` populated). First caller pays the wait; the rest
 // see `init_applied=true` and return immediately.
-void VgiTableFunctionGlobalState::EnsureInitApplied() {
+void VgiTableFunctionGlobalState::EnsureInitApplied() const {
 	if (init_applied.load(std::memory_order_acquire)) {
 		return;
 	}
@@ -994,6 +994,9 @@ void VgiTableFunctionGlobalState::EnsureInitApplied() {
 		auto applied = pending_init.get();  // blocks until RPC completes
 		global_execution_id = std::move(applied.first.execution_id);
 		max_processes = static_cast<idx_t>(applied.first.max_workers);
+		// Captured for forwarding to secondary inits — see init_opaque_data
+		// field comment for why this matters.
+		init_opaque_data = std::move(applied.first.opaque_data);
 		// primary_connection is uninitialized when async init kicks off —
 		// the lambda returns the connection alongside the InitResult.
 		std::lock_guard<std::mutex> conn_lk(connection_mutex);
@@ -1177,9 +1180,9 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 	}
 
 	// Build the gstate up front (everything that doesn't depend on the init
-	// RPC result) and defer PerformInit to a background thread. The
-	// VGI_SYNC_INIT_GLOBAL env var force-disables this fast-path for
-	// regression bisecting.
+	// RPC result) and defer PerformInit to a background thread. The future
+	// is awaited lazily by EnsureInitApplied (driven by MaxThreads() and
+	// init_local).
 	auto global_state = make_uniq<VgiTableFunctionGlobalState>();
 	global_state->client_context_for_explain = &context;
 	global_state->dynamic_filters = std::move(dynamic_filters);
@@ -1195,9 +1198,6 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 	// reads (Ducklake bind-time scan plan) it has no observable effect.
 	global_state->max_processes = 1;
 
-	const char *sync_env = std::getenv("VGI_SYNC_INIT_GLOBAL");
-	const bool force_sync = sync_env && *sync_env && std::string(sync_env) != "0";
-
 	auto perform_init_with_retry =
 	    [acquire_params, &context_ref = context,
 	     bind_result, projection_ids, filter_bytes, join_keys_buffers,
@@ -1208,16 +1208,9 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 	        std::unique_ptr<IFunctionConnection> conn,
 	        bool from_pool) mutable
 	    -> std::pair<InitResult, std::unique_ptr<IFunctionConnection>> {
-#ifdef __EMSCRIPTEN__
-#endif
 		auto run = [&](IFunctionConnection &c) {
-#ifdef __EMSCRIPTEN__
-#endif
-			auto rr = c.PerformInit(bind_result, projection_ids, filter_bytes, join_keys_buffers,
-			                        "", order_by_hint, table_sample_hint);
-#ifdef __EMSCRIPTEN__
-#endif
-			return rr;
+			return c.PerformInit(bind_result, projection_ids, filter_bytes, join_keys_buffers,
+			                     "", order_by_hint, table_sample_hint);
 		};
 		try {
 			auto r = run(*conn);
@@ -1238,39 +1231,30 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 		}
 	};
 
-	if (force_sync) {
-		auto applied = perform_init_with_retry(std::move(connection), acquired.from_pool);
-		global_state->global_execution_id = std::move(applied.first.execution_id);
-		global_state->max_processes = static_cast<idx_t>(applied.first.max_workers);
-		global_state->primary_connection = std::move(applied.second);
-		global_state->init_applied.store(true, std::memory_order_release);
-	} else {
-		// Hot path: kick off PerformInit on a background thread. The lambda
-		// owns the connection until init returns (then EnsureInitApplied
-		// folds the result + connection back into gstate). Multiple
-		// pipelines hit this path back-to-back during scheduling and run
-		// their RPCs concurrently instead of serializing on the main
-		// thread.
+	// Kick off PerformInit on a background thread. The lambda owns the
+	// connection until init returns (then EnsureInitApplied folds the
+	// result + connection back into gstate). Multiple pipelines hit this
+	// path back-to-back during scheduling and run their RPCs concurrently
+	// instead of serializing on the main thread.
 #ifdef __EMSCRIPTEN__
-		// Dispatch onto the pre-spawned VgiWasmAsyncPool. pthread_create
-		// after side modules are dlopen'd is unreliable in MAIN_MODULE=1
-		// builds, so std::async(launch::async) would crash; the pool's
-		// workers were spawned once at extension load.
-		global_state->pending_init = duckdb::vgi::VgiWasmAsyncPool::Instance().Submit(
-		    [run = std::move(perform_init_with_retry),
-		     conn = std::move(connection),
-		     from_pool = acquired.from_pool]() mutable {
-			    return run(std::move(conn), from_pool);
-		    });
+	// Dispatch onto the pre-spawned VgiWasmAsyncPool. pthread_create after
+	// side modules are dlopen'd is unreliable in MAIN_MODULE=1 builds, so
+	// std::async(launch::async) would crash; the pool's workers were
+	// spawned once at extension load.
+	global_state->pending_init = duckdb::vgi::VgiWasmAsyncPool::Instance().Submit(
+	    [run = std::move(perform_init_with_retry),
+	     conn = std::move(connection),
+	     from_pool = acquired.from_pool]() mutable {
+		    return run(std::move(conn), from_pool);
+	    });
 #else
-		global_state->pending_init = std::async(std::launch::async,
-		                                          [run = std::move(perform_init_with_retry),
-		                                           conn = std::move(connection),
-		                                           from_pool = acquired.from_pool]() mutable {
-			                                          return run(std::move(conn), from_pool);
-		                                          });
+	global_state->pending_init = std::async(std::launch::async,
+	                                          [run = std::move(perform_init_with_retry),
+	                                           conn = std::move(connection),
+	                                           from_pool = acquired.from_pool]() mutable {
+		                                          return run(std::move(conn), from_pool);
+	                                          });
 #endif
-	}
 
 	{
 		vector<pair<string, string>> fields;
@@ -1278,7 +1262,6 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 		fields.emplace_back("function_name", bind_data.function_name);
 		fields.emplace_back("max_processes", std::to_string(global_state->max_processes));
 		fields.emplace_back("num_projection_columns", std::to_string(projection_ids.size()));
-		fields.emplace_back("init_mode", force_sync ? "sync" : "async");
 		VGI_LOG(context, "table_function.init_global", fields);
 	}
 
@@ -1394,6 +1377,11 @@ unique_ptr<LocalTableFunctionState> VgiTableFunctionInitLocal(ExecutionContext &
 		// (which assumes projected layout when projection_pushdown=true)
 		// reads the wrong column positions from the unprojected secondary
 		// batches.
+		// Forward the primary's init_response.opaque_data so the worker's
+		// secondary-init branch (which echoes init_opaque_data straight into
+		// the response and skips on_init) sees the same bytes the primary's
+		// on_init produced — required by any function that round-trips state
+		// through init opaque data (e.g. tx_cached_value).
 		auto secondary_init = [&]() {
 			if (bind_data.projection_pushdown) {
 				local_state->connection()->SetTickFilterState(global_state.tick_filter_state);
@@ -1401,9 +1389,11 @@ unique_ptr<LocalTableFunctionState> VgiTableFunctionInitLocal(ExecutionContext &
 				    secondary_bind_result,
 				    global_state.projection_ids, global_state.static_filter_bytes,
 				    global_state.join_keys_buffers, "", global_state.order_by_hint,
-				    global_state.table_sample_hint);
+				    global_state.table_sample_hint, global_state.init_opaque_data);
 			} else {
-				local_state->connection()->PerformInit(secondary_bind_result);
+				local_state->connection()->PerformInit(
+				    secondary_bind_result, {}, nullptr, {}, "",
+				    std::nullopt, std::nullopt, global_state.init_opaque_data);
 			}
 		};
 		try {

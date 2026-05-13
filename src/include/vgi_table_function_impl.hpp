@@ -214,19 +214,33 @@ struct VgiTableFunctionGlobalState : public GlobalTableFunctionState {
 	// Guarded by `init_apply_mutex`; a single thread (the one that flips
 	// `init_applied` from false to true) calls `.get()` and consumes the
 	// future — every other waiter sees `init_applied == true` and skips.
-	InitFuture pending_init;
-	std::mutex init_apply_mutex;
-	std::atomic<bool> init_applied {false};
+	// `mutable` so MaxThreads() (declared `const` by DuckDB) can drive
+	// EnsureInitApplied() — lazy init of fields populated by the async
+	// init RPC.
+	mutable InitFuture pending_init;
+	mutable std::mutex init_apply_mutex;
+	mutable std::atomic<bool> init_applied {false};
 
 	// Block until the deferred init RPC has completed and its result has
 	// been folded into this gstate. Idempotent + thread-safe; safe to call
 	// from any number of init_local / scan threads. After the first call
 	// returns, `global_execution_id`, `max_processes`, and
 	// `primary_connection` are populated and ready to use.
-	void EnsureInitApplied();
+	void EnsureInitApplied() const;
 
 	// Global execution identifier for multi-worker coordination
-	std::vector<uint8_t> global_execution_id;
+	mutable std::vector<uint8_t> global_execution_id;
+
+	// Opaque data returned by the worker's primary init RPC
+	// (`GlobalInitResponse.opaque_data`). Forwarded to every secondary init
+	// as `init_opaque_data` so the worker's secondary-init branch — which
+	// echoes `init_opaque_data` straight into the response and skips
+	// `on_init` — sees the same bytes the primary's `on_init` produced.
+	// Without this, secondaries always send `None` and any function that
+	// round-trips state through init opaque data (e.g. `tx_cached_value`
+	// shipping a cached value bind→init→process) breaks the moment a
+	// parallel scan launches more than one worker.
+	mutable std::vector<uint8_t> init_opaque_data;
 
 	// Captured at InitGlobal so the post-execution dynamic_to_string callback
 	// can issue an RPC. The DuckDB callback signature does not pass a
@@ -234,16 +248,18 @@ struct VgiTableFunctionGlobalState : public GlobalTableFunctionState {
 	// the ClientContext, so this stays valid until the query tears down.
 	ClientContext *client_context_for_explain = nullptr;
 
-	// Maximum number of worker processes (from OutputSpec)
-	idx_t max_processes = 1;
+	// Maximum number of worker processes (from OutputSpec).
+	// `mutable` so EnsureInitApplied() can populate it from MaxThreads().
+	mutable idx_t max_processes = 1;
 
 	// Progress tracking (atomic for thread safety with progress callback)
 	std::atomic<idx_t> rows_read {0};
 
 	// Primary connection (moved from bind_data during InitGlobal)
 	// Protected by mutex for thread-safe handoff to first InitLocal caller.
-	std::mutex connection_mutex;
-	std::unique_ptr<IFunctionConnection> primary_connection;
+	// `mutable` so EnsureInitApplied() can install it from MaxThreads().
+	mutable std::mutex connection_mutex;
+	mutable std::unique_ptr<IFunctionConnection> primary_connection;
 
 	// Dynamic filter info captured at init time (for tick-based pushdown)
 	vector<VgiDynamicFilterInfo> dynamic_filters;
@@ -266,6 +282,23 @@ struct VgiTableFunctionGlobalState : public GlobalTableFunctionState {
 	std::optional<TableSampleHint> table_sample_hint;
 
 	idx_t MaxThreads() const override {
+		// Called from Pipeline::ScheduleParallel on the main scheduling
+		// thread, BEFORE init_local. With async init_global, max_processes
+		// is the provisional 1 until the future resolves — without this
+		// wait, ScheduleParallel sees max_threads<=1 and falls back to a
+		// sequential task, silently single-threading parallel scans on
+		// workers that advertise max_workers > 1.
+		//
+		// Wall cost: bounded by max(RTT) across the in-flight init batch.
+		// Every sibling pipeline's init RPC was kicked off in
+		// Executor::SchedulePipeline's eager ResetSource(true) loop before
+		// any Schedule() runs, so the first MaxThreads() wait absorbs the
+		// longest RPC and subsequent ones see resolved futures.
+		//
+		// This holds within ONE ScheduleEventsInternal invocation. Queries
+		// scheduled in waves (CTE materialization, join build vs. probe)
+		// pay one wait per wave. Most queries are one wave.
+		EnsureInitApplied();
 		return max_processes;
 	}
 };

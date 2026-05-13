@@ -335,7 +335,8 @@ InitResult FunctionConnection::PerformInit(const BindResult &bind_result,
                                            std::vector<std::shared_ptr<arrow::Buffer>> join_keys,
                                            const std::string &phase,
                                            const std::optional<OrderByHint> &order_by,
-                                           const std::optional<TableSampleHint> &table_sample) {
+                                           const std::optional<TableSampleHint> &table_sample,
+                                           const std::vector<uint8_t> &init_opaque_data) {
 	if (!proc_) {
 		ThrowVgiIOException("FunctionConnection::PerformInit called before PerformBindRpc", worker_path_,
 		                    -1, GetExecutionIdHex());
@@ -383,7 +384,7 @@ InitResult FunctionConnection::PerformInit(const BindResult &bind_result,
 	    join_keys,
 	    phase,
 	    execution_id,
-	    {},  // init_opaque_data
+	    init_opaque_data,
 	    ob_col, ob_dir, ob_null, ob_limit,
 	    ts_percentage, ts_seed);
 	auto init_request_bytes = SerializeToIpcBytes(init_request);

@@ -74,13 +74,23 @@ public:
 	// Send the VGI init RPC. The bind_result must come from a prior
 	// PerformBindRpc on this connection — its bind_request_bytes,
 	// output_schema_bytes, and opaque_data are folded into the InitRequest.
+	//
+	// `init_opaque_data` is the opaque blob returned by the worker's
+	// primary init (`InitResult::opaque_data`). For secondary inits — those
+	// against a connection constructed with a non-empty `global_execution_id`
+	// — pass the primary's opaque bytes here so the worker echoes them in
+	// `init_response.opaque_data`. The worker's secondary-init branch reads
+	// this field directly and skips `on_init`; without it, secondaries
+	// always see `None` and break any function that uses init opaque data.
+	// Empty `{}` for primary inits.
 	virtual InitResult PerformInit(const BindResult &bind_result,
 	                               const std::vector<int32_t> &projection_ids = {},
 	                               std::shared_ptr<arrow::Buffer> pushdown_filters = nullptr,
 	                               std::vector<std::shared_ptr<arrow::Buffer>> join_keys = {},
 	                               const std::string &phase = "",
 	                               const std::optional<OrderByHint> &order_by = std::nullopt,
-	                               const std::optional<TableSampleHint> &table_sample = std::nullopt) = 0;
+	                               const std::optional<TableSampleHint> &table_sample = std::nullopt,
+	                               const std::vector<uint8_t> &init_opaque_data = {}) = 0;
 	// Re-init the connection in FINALIZE mode (table-in-out). Closes the
 	// current data streams and sends a new init RPC that references the
 	// original bind via bind_result.

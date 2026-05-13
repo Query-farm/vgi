@@ -208,7 +208,8 @@ public:
 	                       std::vector<std::shared_ptr<arrow::Buffer>> join_keys = {},
 	                       const std::string &phase = "",
 	                       const std::optional<OrderByHint> &order_by = std::nullopt,
-	                       const std::optional<TableSampleHint> &table_sample = std::nullopt) override;
+	                       const std::optional<TableSampleHint> &table_sample = std::nullopt,
+	                       const std::vector<uint8_t> &init_opaque_data = {}) override;
 
 	// Re-init for table-in-out FINALIZE: closes the current data streams
 	// and sends a new init RPC with phase="FINALIZE" that references the
