@@ -1,0 +1,89 @@
+# name: test/sql/integration/table_in_out/buffered_sink_order.test
+# description: Buffered table function with Meta.sink_order_dependent=True
+#   forces ParallelSink=false on the C++ operator. Every process() call lands
+#   on the same worker connection in source order. Verified via duckdb_logs
+#   conn= count == 1 even with threads=4 and a parallel-scannable input.
+# group: [vgi_integration_table_in_out]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ----------------------------------------------------------------------------
+# Basic correctness — single-thread sink still produces all rows.
+# ----------------------------------------------------------------------------
+
+query I
+SELECT count(*) FROM example.ordered_buffer_input((SELECT v FROM range(100) AS t(v)));
+----
+100
+
+# ----------------------------------------------------------------------------
+# UNION ALL — the original bug's reproducer. Single-thread sink still has
+# to honor the once-per-GlobalSinkState contract under UNION ALL.
+# ----------------------------------------------------------------------------
+
+query I
+SELECT count(*) FROM example.ordered_buffer_input((
+    SELECT v FROM range(50) AS t(v)
+    UNION ALL
+    SELECT v FROM range(50, 100) AS t(v)
+));
+----
+100
+
+# ----------------------------------------------------------------------------
+# Single-thread invariant — even with threads=4 set and a TEMP TABLE input
+# (which DuckDB can scan in parallel), sink_order_dependent=True forces
+# ParallelSink=false, so every process() call runs on one worker
+# connection. Assert COUNT(DISTINCT conn=) == 1 in process events.
+# ----------------------------------------------------------------------------
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+statement ok
+SET threads=4;
+
+statement ok
+CREATE TEMP TABLE parallel_input AS SELECT v FROM range(50000) AS t(v);
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT count(*) FROM example.ordered_buffer_input((SELECT * FROM parallel_input));
+----
+50000
+
+query I
+SELECT COUNT(DISTINCT regexp_extract(message, 'conn=([0-9a-f]+)', 1))
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'buffered_table.process';
+----
+1
+
+# ----------------------------------------------------------------------------
+# Per-thread state_id invariant: with one Sink thread there's exactly one
+# state_id, so combine sees [0] and finalize_queue is [0].
+# ----------------------------------------------------------------------------
+
+query I
+SELECT COUNT(DISTINCT regexp_extract(message, 'state_id=([0-9]+)', 1))
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'buffered_table.process';
+----
+1
+
+statement ok
+RESET threads;
+
+statement ok
+DETACH example;

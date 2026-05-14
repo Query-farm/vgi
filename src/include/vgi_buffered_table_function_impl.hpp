@@ -103,6 +103,7 @@ public:
 	PhysicalVgiBufferedTableFunction(PhysicalPlan &physical_plan, vector<LogicalType> return_types_p,
 	                                  vector<string> return_names_p,
 	                                  unique_ptr<FunctionData> bind_data_p, bool source_order_dependent_p,
+	                                  bool sink_order_dependent_p, bool requires_input_batch_index_p,
 	                                  idx_t estimated_cardinality);
 
 	// Owned bind data. The physical operator is the sole long-lived holder
@@ -111,6 +112,11 @@ public:
 	unique_ptr<FunctionData> bind_data;
 	vector<string> return_names;
 	bool source_order_dependent;
+	// Sink-side ordering knobs (mutually exclusive — see metadata.py
+	// validation). sink_order_dependent → ParallelSink=false (single thread).
+	// requires_input_batch_index → RequiredPartitionInfo()=BatchIndex().
+	bool sink_order_dependent;
+	bool requires_input_batch_index;
 
 public:
 	// ========== Sink Interface ==========
@@ -120,15 +126,29 @@ public:
 	SinkCombineResultType Combine(ExecutionContext &context, OperatorSinkCombineInput &input) const override;
 	SinkFinalizeType Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
 	                          OperatorSinkFinalizeInput &input) const override;
+	// NextBatch is invoked by DuckDB when batch_index advances. We don't
+	// need to flush anything — workers receive batch_index per process()
+	// call and handle ordering themselves. Required when
+	// RequiredPartitionInfo()=BatchIndex(); no-op otherwise.
+	SinkNextBatchType NextBatch(ExecutionContext &context, OperatorSinkNextBatchInput &input) const override;
 
 	bool IsSink() const override {
 		return true;
 	}
 	bool ParallelSink() const override {
-		return true;
+		return !sink_order_dependent;
 	}
 	bool SinkOrderDependent() const override {
-		return false;
+		// Distinct from ParallelSink: SinkOrderDependent affects the
+		// optimizer's right-of-join placement etc., and we want the planner
+		// to know that order matters when sink_order_dependent is set so
+		// it doesn't reorder the input pipeline arbitrarily.
+		return sink_order_dependent;
+	}
+	OperatorPartitionInfo RequiredPartitionInfo() const override {
+		return requires_input_batch_index
+		    ? OperatorPartitionInfo::BatchIndex()
+		    : OperatorPartitionInfo::NoPartitionInfo();
 	}
 
 	// ========== Source Interface ==========

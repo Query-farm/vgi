@@ -111,10 +111,17 @@ public:
 	// The C++ side assigns state_ids from an atomic counter — one per Sink
 	// thread. Multiple chunks for the same state_id accumulate into the same
 	// worker-side state instance.
+	//
+	// `batch_index` is forwarded only when the operator declared
+	// RequiredPartitionInfo()=BatchIndex() (because the worker's
+	// Meta.requires_input_batch_index=True). Pass nullopt otherwise. Workers
+	// that need source ordering accumulate (batch_index, payload) tuples and
+	// sort in combine().
 	virtual void RpcBufferedTableProcess(const std::string &function_name,
 	                                     const std::vector<uint8_t> &execution_id,
 	                                     int64_t state_id,
-	                                     const std::shared_ptr<arrow::RecordBatch> &input_batch) = 0;
+	                                     const std::shared_ptr<arrow::RecordBatch> &input_batch,
+	                                     std::optional<int64_t> batch_index = std::nullopt) = 0;
 
 	// Once-per-query end-of-input signal. The worker may coordinate with
 	// peer workers (e.g. via shared BoundStorage) and returns partition

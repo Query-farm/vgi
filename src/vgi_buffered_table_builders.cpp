@@ -11,24 +11,39 @@ std::shared_ptr<arrow::RecordBatch>
 BuildBufferedTableProcessInner(const std::string &function_name,
                                 const std::vector<uint8_t> &execution_id, int64_t state_id,
                                 const std::vector<uint8_t> &input_batch_bytes,
-                                const std::vector<uint8_t> &attach_opaque_data) {
+                                const std::vector<uint8_t> &attach_opaque_data,
+                                std::optional<int64_t> batch_index) {
+	// `batch_index` is a nullable int64 — present iff the function declared
+	// Meta.requires_input_batch_index = True; absent (NULL) otherwise. The
+	// schema field is always present so the worker's deserializer can rely
+	// on the column shape regardless of whether any value is set.
 	auto inner_schema = arrow::schema({
 	    arrow::field("function_name", arrow::utf8(), false),
 	    arrow::field("execution_id", arrow::binary(), false),
 	    arrow::field("state_id", arrow::int64(), false),
 	    arrow::field("input_batch", arrow::binary(), false),
 	    arrow::field("attach_opaque_data", arrow::binary(), true),
+	    arrow::field("batch_index", arrow::int64(), true),
 	});
 	arrow::Int64Builder sid_builder;
 	(void)sid_builder.Append(state_id);
 	std::shared_ptr<arrow::Array> sid_array;
 	(void)sid_builder.Finish(&sid_array);
+	arrow::Int64Builder bi_builder;
+	if (batch_index.has_value()) {
+		(void)bi_builder.Append(*batch_index);
+	} else {
+		(void)bi_builder.AppendNull();
+	}
+	std::shared_ptr<arrow::Array> bi_array;
+	(void)bi_builder.Finish(&bi_array);
 	auto inner = arrow::RecordBatch::Make(inner_schema, 1, {
 	    vgi::MakeSingleStringArray(function_name),
 	    vgi::MakeSingleBinaryArray(execution_id),
 	    sid_array,
 	    vgi::MakeSingleBinaryArray(input_batch_bytes),
 	    vgi::MakeSingleBinaryArrayOrNull(attach_opaque_data),
+	    bi_array,
 	});
 	auto inner_bytes = vgi::SerializeToIpcBytes(inner);
 	return vgi::generated::BuildBufferedTableProcessParams(inner_bytes);

@@ -40,6 +40,8 @@ unique_ptr<FunctionData> VgiTableInOutBindData::Copy() const {
 	copy->cardinality_estimate = cardinality_estimate;
 	copy->buffered_table = buffered_table;
 	copy->source_order_dependent = source_order_dependent;
+	copy->sink_order_dependent = sink_order_dependent;
+	copy->requires_input_batch_index = requires_input_batch_index;
 	return copy;
 }
 
@@ -104,6 +106,8 @@ unique_ptr<FunctionData> VgiTableInOutBind(ClientContext &context, TableFunction
 	bind_data->required_secrets = params.required_secrets;
 	bind_data->buffered_table = params.buffered_table;
 	bind_data->source_order_dependent = params.source_order_dependent;
+	bind_data->sink_order_dependent = params.sink_order_dependent;
+	bind_data->requires_input_batch_index = params.requires_input_batch_index;
 
 	// Build arguments from the regular (non-TABLE) inputs
 	// input.inputs contains positional arguments, but TABLE arguments are represented as NULL

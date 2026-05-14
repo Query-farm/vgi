@@ -555,6 +555,19 @@ struct VgiFunctionInfo {
 	// combine-returned order. Default False enables parallel finalize.
 	bool source_order_dependent = false;
 
+	// Only meaningful when ``buffered_table`` is True. When True, the SINK
+	// phase runs single-threaded — every process() call arrives in source
+	// order on one worker. Mutually exclusive with requires_input_batch_index.
+	bool sink_order_dependent = false;
+
+	// Only meaningful when ``buffered_table`` is True. When True, the C++
+	// Sink operator declares RequiredPartitionInfo()=BatchIndex() so DuckDB
+	// threads a globally-unique monotonic batch_index from the source into
+	// every process() RPC. Workers can sort by it in combine() to
+	// reconstruct source order under parallel ingest. Mutually exclusive
+	// with sink_order_dependent.
+	bool requires_input_batch_index = false;
+
 	// Settings required by this function (must be set before invocation)
 	std::vector<std::string> required_settings;
 

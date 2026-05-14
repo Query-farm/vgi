@@ -220,6 +220,8 @@ static unique_ptr<FunctionData> VgiCatalogTableInOutFunctionBind(ClientContext &
 	params.required_secrets = vgi_info.function_info().required_secrets;
 	params.buffered_table = vgi_info.function_info().buffered_table;
 	params.source_order_dependent = vgi_info.function_info().source_order_dependent;
+	params.sink_order_dependent = vgi_info.function_info().sink_order_dependent;
+	params.requires_input_batch_index = vgi_info.function_info().requires_input_batch_index;
 
 	// Validate required settings
 	const auto &required_settings = vgi_info.function_info().required_settings;

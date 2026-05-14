@@ -71,15 +71,19 @@ PhysicalOperator &LogicalVgiBufferedTableFunction::CreatePlan(ClientContext &con
 
 	auto &child_plan = planner.CreatePlan(*children[0]);
 
-	// Cast bind_data to read the source_order_dependent flag for the
-	// PhysicalOperator's ParallelSource/SourceOrder advertisement.
+	// Cast bind_data to read the ordering flags for the PhysicalOperator's
+	// ParallelSource/SourceOrder + ParallelSink/RequiredPartitionInfo
+	// advertisement.
 	auto &bd = bind_data->Cast<VgiTableInOutBindData>();
 	const bool source_order_dependent = bd.source_order_dependent;
+	const bool sink_order_dependent = bd.sink_order_dependent;
+	const bool requires_input_batch_index = bd.requires_input_batch_index;
 
 	auto types_copy = return_types;
 	auto names_copy = return_names;
 	auto &op = planner.Make<PhysicalVgiBufferedTableFunction>(std::move(types_copy), std::move(names_copy),
 	                                                            std::move(bind_data), source_order_dependent,
+	                                                            sink_order_dependent, requires_input_batch_index,
 	                                                            estimated_cardinality);
 	op.children.push_back(child_plan);
 	return op;
@@ -94,12 +98,16 @@ PhysicalVgiBufferedTableFunction::PhysicalVgiBufferedTableFunction(PhysicalPlan 
                                                                     vector<string> return_names_p,
                                                                     unique_ptr<FunctionData> bind_data_p,
                                                                     bool source_order_dependent_p,
+                                                                    bool sink_order_dependent_p,
+                                                                    bool requires_input_batch_index_p,
                                                                     idx_t estimated_cardinality)
     : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, std::move(return_types_p),
                        estimated_cardinality),
       bind_data(std::move(bind_data_p)),
       return_names(std::move(return_names_p)),
-      source_order_dependent(source_order_dependent_p) {
+      source_order_dependent(source_order_dependent_p),
+      sink_order_dependent(sink_order_dependent_p),
+      requires_input_batch_index(requires_input_batch_index_p) {
 }
 
 string PhysicalVgiBufferedTableFunction::GetName() const {
@@ -494,21 +502,62 @@ SinkResultType PhysicalVgiBufferedTableFunction::Sink(ExecutionContext &context,
 
 	// Convert DuckDB chunk → Arrow batch and ship to worker.
 	auto input_batch = DataChunkToArrow(context.client, chunk, bd.input_schema);
+
+	// batch_index plumbing: when the operator declared
+	// RequiredPartitionInfo()=BatchIndex(), DuckDB threads a globally-
+	// unique monotonic batch_index into lstate.partition_info. If the
+	// source can't supply it (e.g. range() — single-thread TABLE_SCAN
+	// without batch_index support) the optional_idx is INVALID and we
+	// fail loudly: workers that opted in to ordering depend on having
+	// batch_index per call; silently passing nullopt would result in
+	// quiet wrong answers. Conservative bind-time alternative would
+	// require knowing the source plan — easier to fail at first chunk.
+	std::optional<int64_t> batch_index;
+	if (requires_input_batch_index) {
+		// partition_info is on the LocalSinkState BASE, not our subclass.
+		const auto &bi = input.local_state.partition_info.batch_index;
+		if (!bi.IsValid()) {
+			throw IOException(
+			    "VGI buffered table function '%s' declared "
+			    "Meta.requires_input_batch_index=True but the source for this "
+			    "query does not support batch_index. Wrap input in a TEMP "
+			    "TABLE / parquet scan, or remove the metadata flag.",
+			    bd.function_name);
+		}
+		batch_index = static_cast<int64_t>(bi.GetIndex());
+	}
+
 	// Per-chunk log gated on VgiInfoLogActive so the info-vector construction
 	// (std::to_string, GetConnIdHex) is skipped in the steady-state /
 	// logging-disabled case. Sink() runs once per DataChunk — without this
 	// gate a 1M-row workload spends measurable time in string formatting
 	// before the DUCKDB_LOG_INTERNAL ShouldLog check elides the actual write.
 	if (VgiInfoLogActive(context.client)) {
-		VGI_LOG(context.client, "buffered_table.process",
-		        {{"conn", lstate.connection->GetConnIdHex()},
-		         {"function_name", bd.function_name},
-		         {"state_id", std::to_string(lstate.state_id)},
-		         {"input_rows", std::to_string(input_batch->num_rows())}});
+		vector<std::pair<string, string>> info {
+		    {"conn", lstate.connection->GetConnIdHex()},
+		    {"function_name", bd.function_name},
+		    {"state_id", std::to_string(lstate.state_id)},
+		    {"input_rows", std::to_string(input_batch->num_rows())},
+		};
+		if (batch_index.has_value()) {
+			info.emplace_back("batch_index", std::to_string(*batch_index));
+		}
+		VGI_LOG(context.client, "buffered_table.process", info);
 	}
 	lstate.connection->RpcBufferedTableProcess(gstate.function_name, gstate.execution_id, lstate.state_id,
-	                                            input_batch);
+	                                            input_batch, batch_index);
 	return SinkResultType::NEED_MORE_INPUT;
+}
+
+SinkNextBatchType
+PhysicalVgiBufferedTableFunction::NextBatch(ExecutionContext & /*context*/,
+                                              OperatorSinkNextBatchInput & /*input*/) const {
+	// Required to be implementable for sinks that declare
+	// RequiredPartitionInfo()=BatchIndex(). DuckDB invokes this when the
+	// per-thread batch_index advances. We don't need to flush anything —
+	// workers receive batch_index per process() call and own their own
+	// ordering logic. PhysicalBatchInsert does the same (no-op).
+	return SinkNextBatchType::READY;
 }
 
 SinkCombineResultType

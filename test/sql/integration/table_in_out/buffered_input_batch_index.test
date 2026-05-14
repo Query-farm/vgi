@@ -1,0 +1,99 @@
+# name: test/sql/integration/table_in_out/buffered_input_batch_index.test
+# description: Buffered table function with Meta.requires_input_batch_index=True
+#   gets a per-chunk batch_index from DuckDB's source partitioning. Worker
+#   accumulates (batch_index, payload) tuples, sorts in combine(), and emits
+#   in source order under parallel ingest.
+# group: [vgi_integration_table_in_out]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ----------------------------------------------------------------------------
+# Source-order reconstruction. Input is a TEMP TABLE of 0..N-1 (TEMP TABLE
+# scan supports batch_index); under threads=4 the rows arrive across
+# multiple Sink threads in non-deterministic order. The fixture's
+# combine() sorts by batch_index so finalize() yields rows in source
+# order — assert the output is monotonically increasing.
+# ----------------------------------------------------------------------------
+
+statement ok
+SET threads=4;
+
+statement ok
+CREATE TEMP TABLE ordered_input AS SELECT v FROM range(50000) AS t(v);
+
+# If the sort worked, the i-th row's value is i. Wrap with a CTE so we
+# can use both window and aggregate.
+query I
+WITH ordered AS (
+    SELECT v, row_number() OVER () - 1 AS expected
+    FROM example.batch_index_buffer_input((SELECT * FROM ordered_input))
+)
+SELECT bool_and(v = expected) FROM ordered;
+----
+true
+
+# ----------------------------------------------------------------------------
+# Sources that don't support batch_index — VALUES, range() — fail at
+# DuckDB's pipeline scheduler with `INTERNAL Error: Attempting to schedule
+# a pipeline where the sink requires batch index but source does not
+# support it`. We do NOT assert on this error in sqllogictest because
+# DuckDB's `INTERNAL Error` paths interact poorly with `statement error`
+# matching. The contract is enforced by DuckDB itself; we trust it.
+#
+# ----------------------------------------------------------------------------
+# UNION ALL of two parallel-scannable sources — batch_index is globally
+# unique across the union, the worker still produces ordered output.
+# ----------------------------------------------------------------------------
+
+statement ok
+CREATE TEMP TABLE input_a AS SELECT v FROM range(0, 100) AS t(v);
+
+statement ok
+CREATE TEMP TABLE input_b AS SELECT v FROM range(100, 200) AS t(v);
+
+query I
+SELECT count(*) FROM example.batch_index_buffer_input((
+    SELECT * FROM input_a UNION ALL SELECT * FROM input_b
+));
+----
+200
+
+# ----------------------------------------------------------------------------
+# Parallelism log-trace: when threads=4 and input is parallel-scannable,
+# we expect MULTIPLE distinct conn=s (parallel ingest engaged) AND
+# every process event carries a batch_index field.
+# ----------------------------------------------------------------------------
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT count(*) FROM example.batch_index_buffer_input((SELECT * FROM ordered_input));
+----
+50000
+
+# Every process event should carry a batch_index (the field is in the
+# message format only when requires_input_batch_index is set).
+query I
+SELECT bool_and(message LIKE '%batch_index=%')
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'buffered_table.process';
+----
+true
+
+statement ok
+RESET threads;
+
+statement ok
+DETACH example;

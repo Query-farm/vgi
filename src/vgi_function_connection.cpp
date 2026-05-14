@@ -1053,10 +1053,11 @@ std::shared_ptr<arrow::RecordBatch> DecodeOuterResponse(const UnaryResponseResul
 void FunctionConnection::RpcBufferedTableProcess(const std::string &function_name,
                                                   const std::vector<uint8_t> &execution_id,
                                                   int64_t state_id,
-                                                  const std::shared_ptr<arrow::RecordBatch> &input_batch) {
+                                                  const std::shared_ptr<arrow::RecordBatch> &input_batch,
+                                                  std::optional<int64_t> batch_index) {
 	auto batch_bytes = vgi::SerializeToIpcBytes(input_batch);
 	auto rpc_params = vgi::BuildBufferedTableProcessInner(function_name, execution_id, state_id, batch_bytes,
-	                                                        attach_opaque_data_);
+	                                                        attach_opaque_data_, batch_index);
 	vgi::ValidateRequestSchema(rpc_params, "buffered_table_process", worker_path_);
 	vgi::WriteRpcRequest(proc_->GetStdinFd(), "buffered_table_process", rpc_params);
 	auto response = vgi::ReadUnaryResponse(proc_->GetStdoutFd(), &context_, worker_path_, proc_->GetPid(),

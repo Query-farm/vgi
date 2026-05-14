@@ -400,10 +400,23 @@ once per `GlobalSinkState`, even under `UNION ALL`) calls
 unchanged). `Source` threads pop finalize-state-ids from the queue and call
 `buffered_table_finalize(finalize_state_id)` repeatedly until `has_more=False`.
 
-**Output ordering.** Source is parallel by default (`ParallelSource=true`).
-Set `Meta.source_order_dependent = True` to force `FIXED_ORDER` / serial
-drain (rare — only when the worker yields finalize output in a meaningful
-order).
+**Ordering knobs.** Two orthogonal axes — input (Sink) and output (Source) —
+expressed as a 2×2 in worker `Meta`:
+
+| `sink_order_dependent` | `source_order_dependent` | `requires_input_batch_index` | Behavior |
+|:--:|:--:|:--:|---|
+| F (default) | F (default) | F (default) | Parallel ingest + parallel drain. No ordering guarantees in either direction. |
+| **T** | F | F | `ParallelSink=false`. All `process()` calls land on one worker in source order; `combine()` sees one `state_id`. Source still parallel. |
+| F | **T** | F | Source phase serial in `finalize_queue` order (`SourceOrder=FIXED_ORDER`). Useful when `combine()` returns finalize keys in a meaningful order. |
+| F | F | **T** | Parallel ingest with a globally-unique monotonic `batch_index` threaded into every `process()` call. Worker accumulates `(batch_index, payload)` tuples and sorts in `combine()` to reconstruct source order. Requires the source to support `batch_index` (TEMP TABLE / parquet / CSV); range() / VALUES don't, and DuckDB throws `INTERNAL Error: ... sink requires batch index but source does not support it` at scheduling time. |
+| **T** | * | **T** | Mutually exclusive — single-thread sink already orders; rejected at metadata-resolve time with a clear `TypeError`. |
+
+`Meta.requires_input_batch_index` makes the operator declare
+`RequiredPartitionInfo()=BatchIndex()`, which surfaces the per-chunk
+`batch_index` on `OperatorSinkInput.partition_info`. Same mechanism DuckDB's
+`PhysicalBatchInsert` uses for ordered parallel ingest into row-group-
+ordered tables. The C++ Sink reads it via `input.local_state.partition_info.batch_index.GetIndex()` and forwards through the
+`buffered_table_process` RPC to the worker as `params.batch_index: int`.
 
 **Cross-worker state.** State merging is the worker library's job, not the
 C++ side's. Workers coordinate via `BoundStorage.aggregate_get/put` keyed by

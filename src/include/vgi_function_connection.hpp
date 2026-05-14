@@ -245,7 +245,8 @@ public:
 	void RpcBufferedTableProcess(const std::string &function_name,
 	                             const std::vector<uint8_t> &execution_id,
 	                             int64_t state_id,
-	                             const std::shared_ptr<arrow::RecordBatch> &input_batch) override;
+	                             const std::shared_ptr<arrow::RecordBatch> &input_batch,
+	                             std::optional<int64_t> batch_index = std::nullopt) override;
 	std::vector<int64_t> RpcBufferedTableCombine(const std::string &function_name,
 	                                             const std::vector<uint8_t> &execution_id,
 	                                             const std::vector<int64_t> &state_ids) override;

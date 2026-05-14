@@ -81,6 +81,13 @@ struct VgiTableInOutBindData : public TableFunctionData {
 	// flag set (loud-failure assertion at their entry).
 	bool buffered_table = false;
 	bool source_order_dependent = false;
+	// Sink-side ordering knobs — only meaningful with buffered_table=true.
+	// sink_order_dependent → ParallelSink=false (single-thread ingest).
+	// requires_input_batch_index → operator declares
+	// RequiredPartitionInfo()=BatchIndex(); per-chunk batch_index flows
+	// through to the worker's process() params. Mutually exclusive.
+	bool sink_order_dependent = false;
+	bool requires_input_batch_index = false;
 };
 
 // ============================================================================
@@ -155,6 +162,8 @@ struct VgiTableInOutBindParams {
 	// LogicalGet of a buffered table function and rewrite it.
 	bool buffered_table = false;
 	bool source_order_dependent = false;
+	bool sink_order_dependent = false;
+	bool requires_input_batch_index = false;
 
 	// Convenience accessors
 	const std::string &worker_path() const { return attach_params->worker_path(); }

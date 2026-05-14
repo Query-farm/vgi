@@ -2219,6 +2219,15 @@ VgiFunctionInfo ParseFunctionInfo(const std::shared_ptr<arrow::RecordBatch> &bat
 	// buffered_table is true; controls ParallelSource on the buffered op.
 	info.source_order_dependent = row["source_order_dependent"].value_or(false);
 
+	// sink_order_dependent — optional bool. Only meaningful when
+	// buffered_table is true; controls ParallelSink (single-thread ingest).
+	info.sink_order_dependent = row["sink_order_dependent"].value_or(false);
+
+	// requires_input_batch_index — optional bool. Only meaningful when
+	// buffered_table is true; advertises RequiredPartitionInfo()=BatchIndex()
+	// so DuckDB threads source-position metadata to every Sink call.
+	info.requires_input_batch_index = row["requires_input_batch_index"].value_or(false);
+
 	// Required settings for this function (list of strings)
 	info.required_settings = row["required_settings"].value_or(std::vector<std::string> {});
 
