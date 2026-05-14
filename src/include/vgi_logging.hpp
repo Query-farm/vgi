@@ -93,12 +93,17 @@ inline void VGI_LOG(ClientContext &context, const string &event, const vector<pa
 	DUCKDB_LOG(context, VgiLogType, event, info);
 }
 
-//! VgiLogActive - cheap check (one atomic load + one virtual call) for whether
-//! any logging sink is currently listening for VGI events. Use this to gate
-//! hot-path VGI_LOG call sites (per-chunk events) so the info-vector
-//! construction (std::to_string, GetConnIdHex(), etc.) is skipped when
-//! nothing would consume the event.
-inline bool VgiLogActive(ClientContext &context) {
+//! VgiInfoLogActive - cheap check (one atomic load + one virtual call) for
+//! whether any logging sink is listening for VGI events at INFO level
+//! (the level VGI_LOG emits at). Use this to gate hot-path VGI_LOG call
+//! sites (per-chunk events) so the info-vector construction
+//! (std::to_string, GetConnIdHex(), etc.) is skipped when nothing would
+//! consume the event.
+//!
+//! NOTE: pairs with VGI_LOG only. For VGI_LOG_LEVEL call sites (workers
+//! emit at DEBUG/WARNING/ERROR), build the equivalent check with the
+//! actual level, or just skip gating since those are typically rare.
+inline bool VgiInfoLogActive(ClientContext &context) {
 	if (VgiStderrLogEnabled()) {
 		return true;
 	}

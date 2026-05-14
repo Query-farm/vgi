@@ -200,6 +200,22 @@ SELECT * FROM example.sum_all_columns((
 ----
 3	30
 
+# ----------------------------------------------------------------------------
+# DECIMAL input — sums are promoted to FLOAT64 in the output, matching
+# the existing FLOAT/DOUBLE behavior. DECIMAL is a numeric type by the
+# standard SQL definition; the previous behavior of silently dropping
+# DECIMAL columns surprised users.
+# ----------------------------------------------------------------------------
+
+query II
+SELECT * FROM example.sum_all_columns((
+    SELECT 1.5::DECIMAL(10, 2) AS a, 10::INT AS b
+    UNION ALL SELECT 2.5::DECIMAL(10, 2), 20
+    UNION ALL SELECT 3.0::DECIMAL(10, 2), 30
+));
+----
+7.0	60
+
 # ============================================================================
 # Cleanup
 # ============================================================================

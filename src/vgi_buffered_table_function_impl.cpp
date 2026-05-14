@@ -377,12 +377,13 @@ SinkResultType PhysicalVgiBufferedTableFunction::Sink(ExecutionContext &context,
 
 		{
 			std::unique_lock<std::mutex> lk(gstate.init_mutex);
-			// `init_done` loads use memory_order_acquire to pair with the
-			// release store at the end of the runner branch. The mutex
-			// itself provides synchronizes-with for these specific reads
-			// (they're under the lock), but the acquire load also makes
-			// the protocol correct against any future caller that reads
-			// init_done outside the lock.
+			// All reads of init_done / init_started / init_failed below
+			// happen under init_mutex, so the mutex provides synchronizes-
+			// with. The release/acquire on init_done is therefore redundant
+			// — kept as documentation that init_done's intent is a one-way
+			// latch, not because it's load-bearing here. If a future caller
+			// reads init_done OUTSIDE the lock they'd also need atomic
+			// access to init_started/init_failed (currently plain bools).
 			if (gstate.init_done.load(std::memory_order_acquire)) {
 				// Init already published — secondary acquire path.
 				exec_id = gstate.execution_id;
@@ -408,16 +409,39 @@ SinkResultType PhysicalVgiBufferedTableFunction::Sink(ExecutionContext &context,
 			}
 		}
 
+		// Cache the gstate/db pointers immediately so the lstate destructor
+		// can cancel-dispatch if anything in the init flow below throws
+		// AFTER the connection is acquired but BEFORE the success path
+		// publishes execution_id. Without this, an exception in PerformInit
+		// (or drain_init_stream) would leave the connection owned by lstate
+		// but its destructor sees `db == nullptr` and falls back to a raw
+		// drop, which closes stdin without giving the worker a chance to
+		// shut down cleanly.
+		lstate.gstate_ptr = &gstate;
+		lstate.db = gstate.db;
+
 		if (i_am_runner) {
 			// Acquire MY worker (no global_execution_id; we mint one) and run
 			// init on it. This worker then becomes my per-thread worker —
 			// state_id is assigned exactly as a secondary's would be. No
 			// dedicated coordinator process exists.
+			//
+			// TODO: AcquireConnectionForInit can block in non-interruptible
+			// steps (posix_spawn, worker-pool mutex contention) before
+			// reaching the first fd-based read. Runner cancellation latency
+			// is bounded by the longest such step; peer threads waiting on
+			// init_cv poll interrupted every 250ms, but the runner itself
+			// only checks interrupted at fd-read boundaries. Acceptable
+			// because the steps are short in practice; flagged for future
+			// work if a slow worker spawn becomes a real problem.
 			std::vector<uint8_t> minted_exec_id;
 			try {
 				auto params = BuildAcquireParams(bd, /*global_execution_id=*/{});
 				auto acquired = AcquireConnectionForInit(context.client, params);
 				lstate.connection = std::move(acquired.connection);
+				// Register as in-flight as soon as we own a connection so a
+				// peer-thread exception path can see us and cancel-dispatch.
+				gstate.TrackInFlight(lstate.connection.get());
 				auto init_result = lstate.connection->PerformInit(bd.bind_result, /*projection_ids=*/{},
 				                                                    /*pushdown_filters=*/nullptr,
 				                                                    /*join_keys=*/{},
@@ -425,11 +449,13 @@ SinkResultType PhysicalVgiBufferedTableFunction::Sink(ExecutionContext &context,
 				minted_exec_id = std::move(init_result.execution_id);
 				drain_init_stream(*lstate.connection);
 				lstate.state_id = gstate.state_id_counter.fetch_add(1);
-				VGI_LOG(context.client, "buffered_table.init",
-				        {{"conn", lstate.connection->GetConnIdHex()},
-				         {"function_name", bd.function_name},
-				         {"role", "init_runner"},
-				         {"state_id", std::to_string(lstate.state_id)}});
+				if (VgiInfoLogActive(context.client)) {
+					VGI_LOG(context.client, "buffered_table.init",
+					        {{"conn", lstate.connection->GetConnIdHex()},
+					         {"function_name", bd.function_name},
+					         {"role", "init_runner"},
+					         {"state_id", std::to_string(lstate.state_id)}});
+				}
 			} catch (...) {
 				{
 					std::lock_guard<std::mutex> lk(gstate.init_mutex);
@@ -449,36 +475,31 @@ SinkResultType PhysicalVgiBufferedTableFunction::Sink(ExecutionContext &context,
 			auto params = BuildAcquireParams(bd, exec_id);
 			auto acquired = AcquireConnectionForInit(context.client, params);
 			lstate.connection = std::move(acquired.connection);
+			gstate.TrackInFlight(lstate.connection.get());
 			lstate.connection->PerformInit(bd.bind_result, /*projection_ids=*/{},
 			                                /*pushdown_filters=*/nullptr,
 			                                /*join_keys=*/{},
 			                                /*phase=*/"BUFFERED_TABLE");
 			drain_init_stream(*lstate.connection);
 			lstate.state_id = gstate.state_id_counter.fetch_add(1);
-			VGI_LOG(context.client, "buffered_table.init",
-			        {{"conn", lstate.connection->GetConnIdHex()},
-			         {"function_name", bd.function_name},
-			         {"role", "secondary"},
-			         {"state_id", std::to_string(lstate.state_id)}});
+			if (VgiInfoLogActive(context.client)) {
+				VGI_LOG(context.client, "buffered_table.init",
+				        {{"conn", lstate.connection->GetConnIdHex()},
+				         {"function_name", bd.function_name},
+				         {"role", "secondary"},
+				         {"state_id", std::to_string(lstate.state_id)}});
+			}
 		}
-
-		// Cache pointers so lstate's destructor can cancel-dispatch on error,
-		// and register ourselves as in-flight so the gstate teardown path
-		// knows about us. Combine will remove us when it hands the connection
-		// over to gstate.workers[].
-		lstate.gstate_ptr = &gstate;
-		lstate.db = gstate.db;
-		gstate.TrackInFlight(lstate.connection.get());
 	}
 
 	// Convert DuckDB chunk → Arrow batch and ship to worker.
 	auto input_batch = DataChunkToArrow(context.client, chunk, bd.input_schema);
-	// Per-chunk log gated on VgiLogActive so the info-vector construction
+	// Per-chunk log gated on VgiInfoLogActive so the info-vector construction
 	// (std::to_string, GetConnIdHex) is skipped in the steady-state /
 	// logging-disabled case. Sink() runs once per DataChunk — without this
 	// gate a 1M-row workload spends measurable time in string formatting
 	// before the DUCKDB_LOG_INTERNAL ShouldLog check elides the actual write.
-	if (VgiLogActive(context.client)) {
+	if (VgiInfoLogActive(context.client)) {
 		VGI_LOG(context.client, "buffered_table.process",
 		        {{"conn", lstate.connection->GetConnIdHex()},
 		         {"function_name", bd.function_name},
@@ -637,7 +658,7 @@ SourceResultType PhysicalVgiBufferedTableFunction::GetDataInternal(ExecutionCont
 		gstate.finalize_queue.pop_front();
 	}
 
-	if (VgiLogActive(context.client)) {
+	if (VgiInfoLogActive(context.client)) {
 		VGI_LOG(context.client, "buffered_table.finalize",
 		        {{"conn", lstate.worker->GetConnIdHex()},
 		         {"function_name", gstate.function_name},

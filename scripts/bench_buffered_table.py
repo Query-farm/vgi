@@ -38,38 +38,34 @@ def run_one(
     shape: str, rows: int, threads: int, value_size_bytes: int,
 ) -> float:
     """Run one timed query; return wall time in seconds."""
-    # We build an input row of approximately `value_size_bytes` by repeating
-    # a string and casting to BLOB-equivalent. Simpler: a repeat() of length B.
-    # Exception: sum_all_columns only accepts numeric columns, so for the
-    # buffered_agg shape the value column is always BIGINT regardless of the
-    # value_size axis. That axis is meaningful for streaming + buffered_pass
-    # only — measuring IPC payload size impact.
-    if value_size_bytes <= 8:
-        value_expr = "i::BIGINT AS v"
-    else:
-        # repeat() makes a STRING of N chars; works in input via VARCHAR.
-        value_expr = f"repeat('x', {value_size_bytes}) AS v"
-
+    # Per-shape function + input-column expression. Dispatching here (not
+    # constructing value_expr generically and then overriding) keeps the
+    # shape-specific input choices co-located with their function choice,
+    # avoiding the trap where a future shape inherits the wrong base
+    # value_expr.
+    #
     # Three shapes:
     #   streaming     — echo (passthrough TableInOut)
-    #   buffered_pass — buffer_input (TIO + per-batch IPC serialization into
-    #                   Python bytes; dominates measurements at large value
-    #                   sizes — that's fixture cost, not operator cost)
+    #   buffered_pass — buffer_input (TIO + per-batch IPC serialization
+    #                   into Python bytes; dominates measurements at large
+    #                   value sizes — that's fixture cost, not operator cost)
     #   buffered_agg  — sum_all_columns (constant-size state; the operator-
-    #                   only signal). The buffered_agg ↔ streaming delta is
-    #                   the cleanest measure of per-chunk RPC overhead.
-    func_map = {
-        "streaming":     "echo",
-        "buffered_pass": "buffer_input",
-        "buffered_agg":  "sum_all_columns",
-    }
-    func = func_map[shape]
-    # sum_all_columns can't process string values; override to numeric input
-    # for the agg shape regardless of value_size_bytes. (The buffered_agg
-    # measurement is operator-overhead-only and intentionally doesn't scale
-    # with payload size.)
-    if shape == "buffered_agg":
-        value_expr = "i::BIGINT AS v"
+    #                   only signal). Must use BIGINT regardless of the
+    #                   value_size axis because sum_all_columns rejects
+    #                   non-numeric input at bind time.
+    if shape == "streaming":
+        func = "echo"
+        value_expr = "i::BIGINT AS v" if value_size_bytes <= 8 \
+            else f"repeat('x', {value_size_bytes}) AS v"
+    elif shape == "buffered_pass":
+        func = "buffer_input"
+        value_expr = "i::BIGINT AS v" if value_size_bytes <= 8 \
+            else f"repeat('x', {value_size_bytes}) AS v"
+    elif shape == "buffered_agg":
+        func = "sum_all_columns"
+        value_expr = "i::BIGINT AS v"  # ignores value_size axis intentionally
+    else:
+        raise ValueError(f"unknown shape: {shape}")
 
     sql = f"""
 LOAD '{ext}';

@@ -111,7 +111,8 @@ SELECT
   COUNT(DISTINCT regexp_extract(message, 'conn=([0-9a-f]+)', 1)) =
   COUNT(DISTINCT regexp_extract(message, 'state_id=([0-9]+)', 1))
 FROM duckdb_logs()
-WHERE type = 'VGI' AND message LIKE '%buffered_table.process%';
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'buffered_table.process';
 ----
 true
 
@@ -129,7 +130,8 @@ query I
 SELECT
   COUNT(DISTINCT regexp_extract(message, 'conn=([0-9a-f]+)', 1)) BETWEEN 1 AND 4
 FROM duckdb_logs()
-WHERE type = 'VGI' AND message LIKE '%buffered_table.process%';
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'buffered_table.process';
 ----
 true
 
@@ -146,8 +148,8 @@ SELECT
   COUNT(DISTINCT regexp_extract(message, 'conn=([0-9a-f]+)', 1)) =
   COUNT(DISTINCT regexp_extract(message, 'finalize_state_id=([0-9]+)', 1))
 FROM duckdb_logs()
-WHERE type = 'VGI' AND message LIKE '%buffered_table.finalize%'
-  AND message NOT LIKE '%combine%';
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'buffered_table.finalize';
 ----
 true
 
@@ -169,7 +171,8 @@ SELECT
   COUNT(DISTINCT regexp_extract(message, 'conn=([0-9a-f]+)', 1)) =
   COUNT(DISTINCT regexp_extract(message, 'state_id=([0-9]+)', 1))
 FROM duckdb_logs()
-WHERE type = 'VGI' AND message LIKE '%buffered_table.process%';
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'buffered_table.process';
 ----
 true
 
