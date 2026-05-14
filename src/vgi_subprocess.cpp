@@ -347,5 +347,60 @@ int GetCatalogTimeout(ClientContext *context) {
 	return CATALOG_OPERATION_TIMEOUT_SECONDS;
 }
 
+int GetBufferedTableTimeout(ClientContext *context) {
+	if (context) {
+		Value val;
+		if (context->TryGetCurrentSetting("vgi_buffered_table_timeout_seconds", val)) {
+			return static_cast<int>(val.GetValue<int64_t>());
+		}
+	}
+	return 300; // 5 minutes default for data-phase buffered_table RPCs
+}
+
+void WaitForReadableInterruptible(int fd, ClientContext *context, int timeout_seconds) {
+	auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout_seconds);
+
+	while (true) {
+		auto now = std::chrono::steady_clock::now();
+		auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(deadline - now);
+		if (remaining.count() <= 0) {
+			throw IOException("VGI buffered_table operation timed out after %d seconds", timeout_seconds);
+		}
+
+		// Check the context's interrupt flag before every select. ClientContext
+		// sets this on Ctrl-C / query cancel; we don't want to block past the
+		// next poll window after that flips.
+		if (context && context->interrupted) {
+			throw IOException("VGI buffered_table operation interrupted (query cancelled)");
+		}
+
+		// Cap each select to 250ms so we re-poll the interrupt flag frequently
+		// even on very long-running combines.
+		constexpr int64_t kPollIntervalUs = 250 * 1000;
+		auto interval_us = std::min<int64_t>(remaining.count(), kPollIntervalUs);
+
+		fd_set read_fds;
+		FD_ZERO(&read_fds);
+		FD_SET(fd, &read_fds);
+
+		struct timeval tv;
+		tv.tv_sec = interval_us / 1000000;
+		tv.tv_usec = interval_us % 1000000;
+
+		int result = select(fd + 1, &read_fds, nullptr, nullptr, &tv);
+		if (result < 0) {
+			if (errno == EINTR) {
+				continue;
+			}
+			throw IOException("VGI buffered_table operation failed: select error: %s", strerror(errno));
+		}
+		if (result == 0) {
+			// Timeout on this poll interval — loop and re-check interrupted.
+			continue;
+		}
+		return;
+	}
+}
+
 } // namespace vgi
 } // namespace duckdb

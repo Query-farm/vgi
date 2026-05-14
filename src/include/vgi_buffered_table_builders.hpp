@@ -1,0 +1,41 @@
+#pragma once
+
+#include <memory>
+#include <string>
+#include <vector>
+
+#include <arrow/api.h>
+
+namespace duckdb {
+namespace vgi {
+
+// ============================================================================
+// Buffered-table RPC inner-request builders + outer-response decoder
+// ============================================================================
+// Shared between FunctionConnection (subprocess) and HttpFunctionConnection.
+// Each Build*Inner function constructs the inner RecordBatch matching the
+// worker's expected schema, serializes it to IPC bytes, and wraps the bytes
+// in the outer RPC envelope (BuildBufferedTable*Params from the generated
+// header). Callers serialize the resulting outer batch with WriteRpcRequest
+// (subprocess) or HttpInvokeUnary (HTTP).
+
+std::shared_ptr<arrow::RecordBatch>
+BuildBufferedTableProcessInner(const std::string &function_name,
+                                const std::vector<uint8_t> &execution_id, int64_t state_id,
+                                const std::vector<uint8_t> &input_batch_bytes,
+                                const std::vector<uint8_t> &attach_opaque_data);
+
+std::shared_ptr<arrow::RecordBatch>
+BuildBufferedTableCombineInner(const std::string &function_name,
+                                const std::vector<uint8_t> &execution_id,
+                                const std::vector<int64_t> &state_ids,
+                                const std::vector<uint8_t> &attach_opaque_data);
+
+std::shared_ptr<arrow::RecordBatch>
+BuildBufferedTableFinalizeInner(const std::string &function_name,
+                                 const std::vector<uint8_t> &execution_id,
+                                 int64_t finalize_state_id,
+                                 const std::vector<uint8_t> &attach_opaque_data);
+
+} // namespace vgi
+} // namespace duckdb

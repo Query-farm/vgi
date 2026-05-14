@@ -102,13 +102,18 @@ struct UnaryResponseResult {
 // Throws IOException on EXCEPTION-level log batches.
 // The response stream has schema with "result" column (or empty for void methods).
 // worker_path/worker_pid are for error context.
+// timeout_seconds < 0 → use the catalog timeout (default).
+// timeout_seconds >= 0 → use that many seconds and poll the context's
+// `interrupted` flag every 250ms so user Ctrl-C unblocks long reads
+// (used by buffered_table RPCs which are data-phase, not catalog).
 UnaryResponseResult ReadUnaryResponse(int fd, ClientContext *context,
                                       const std::string &worker_path = "",
                                       pid_t worker_pid = -1,
                                       const std::string &invocation_id_hex = "",
                                       const std::string &attach_opaque_data_hex = "",
                                       const std::string &transaction_opaque_data_hex = "",
-                                      const std::string &conn_id_hex = "");
+                                      const std::string &conn_id_hex = "",
+                                      int timeout_seconds = -1);
 
 // Result from reading a stream header
 struct StreamHeaderResult {
@@ -138,9 +143,16 @@ std::vector<uint8_t> SerializeEmptyRpcRequest(const std::string &method_name);
 
 // Parse a unary response from bytes (same logic as ReadUnaryResponse but from buffer).
 // url is used for error context (replaces worker_path in fd-based version).
+// The four *_hex parameters are forwarded to HandleBatchLogMessage so log
+// batches embedded in unary RPC responses carry the same diagnostic fields
+// that the streaming data path emits (conn=, attach=, etc.).
 UnaryResponseResult ReadUnaryResponseFromBuffer(const uint8_t *data, size_t len,
                                                  ClientContext *context,
-                                                 const std::string &url = "");
+                                                 const std::string &url = "",
+                                                 const std::string &invocation_id_hex = "",
+                                                 const std::string &attach_opaque_data_hex = "",
+                                                 const std::string &transaction_opaque_data_hex = "",
+                                                 const std::string &conn_id_hex = "");
 
 // Result from reading a stream header from a buffer.
 // For HTTP init responses: the response body contains header IPC stream + data IPC stream.

@@ -306,6 +306,23 @@ private:
 		// in-out function. Move it into our new extension op.
 		D_ASSERT(get.children.size() <= 1);
 
+		// Belt-and-suspenders: buffered table-in-out functions don't support
+		// projection-pushdown or filter-pushdown today (the catalog registers
+		// them with neither flag), so the bound LogicalGet should carry no
+		// such state. If a future binder change pushes projections/filters in
+		// without updating us, we'd silently lose them by dropping get on the
+		// floor. Fail loudly here instead.
+		if (!get.projection_ids.empty()) {
+			throw InternalException(
+			    "VgiBufferedTableRewriter: LogicalGet has non-empty projection_ids — "
+			    "buffered table functions don't support projection pushdown");
+		}
+		if (get.table_filters.filters.size() > 0) {
+			throw InternalException(
+			    "VgiBufferedTableRewriter: LogicalGet has table_filters — "
+			    "buffered table functions don't support filter pushdown");
+		}
+
 		auto rewritten = make_uniq<vgi::LogicalVgiBufferedTableFunction>(
 		    get.table_index, get.returned_types, get.names, std::move(get.bind_data));
 		rewritten->children = std::move(get.children);
@@ -319,7 +336,17 @@ private:
 		op = std::move(rewritten);
 	}
 
-	static void Optimize(OptimizerExtensionInput & /*input*/, unique_ptr<LogicalOperator> &plan) {
+	static void Optimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
+		// Gated on a session setting so an emergency-rollback path exists if
+		// the rewriter regresses against a real workload. When disabled, the
+		// loud-failure asserts in VgiTableInOutFunction/VgiTableInOutFinalize
+		// will catch any buffered_table function call so users see a clear
+		// error rather than the pre-fix UNION-ALL corruption.
+		Value enabled_val;
+		if (!input.context.TryGetCurrentSetting("vgi_buffered_table", enabled_val) ||
+		    enabled_val.IsNull() || !enabled_val.GetValue<bool>()) {
+			return;
+		}
 		Rewrite(plan);
 	}
 };
@@ -1238,8 +1265,22 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	// Buffered table function rewriter — replace LogicalGet of any
 	// Meta.buffered_table=True function with our Sink+Source physical op.
-	// Always-on; no setting to disable (the corresponding fixtures depend
-	// on it for correctness once they opt in via the metadata flag).
+	// Gated on a session setting so a regression has an emergency rollback
+	// path. When disabled, the loud-failure asserts in VgiTableInOutFunction /
+	// VgiTableInOutFinalize will surface a clear error rather than the
+	// pre-fix UNION-ALL corruption.
+	config.AddExtensionOption("vgi_buffered_table",
+	                          "Rewrite calls to Meta.buffered_table=True functions through "
+	                          "the Sink+Source PhysicalVgiBufferedTableFunction operator. "
+	                          "Set to false to disable the rewrite — buffered_table queries "
+	                          "will then throw a clear InternalException instead of running.",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
+	config.AddExtensionOption("vgi_buffered_table_timeout_seconds",
+	                          "Timeout (seconds) for buffered_table_process / _combine / _finalize RPCs. "
+	                          "These are data-phase calls and can legitimately run for minutes, so the "
+	                          "default is longer than vgi_catalog_timeout_seconds. The read also polls "
+	                          "the query's interrupted flag every 250ms so Ctrl-C still works.",
+	                          LogicalType::BIGINT, Value::BIGINT(300));
 	OptimizerExtension::Register(config, VgiBufferedTableRewriter());
 
 	// Register worker pool settings

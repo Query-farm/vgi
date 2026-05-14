@@ -147,9 +147,17 @@ UnaryResponseResult ReadUnaryResponse(int fd, ClientContext *context,
                                       const std::string &invocation_id_hex,
                                       const std::string &attach_opaque_data_hex,
                                       const std::string &transaction_opaque_data_hex,
-                                      const std::string &conn_id_hex) {
-	// Wait for data to be available
-	WaitForReadable(fd, GetCatalogTimeout(context));
+                                      const std::string &conn_id_hex,
+                                      int timeout_seconds) {
+	// Wait for data to be available. A caller-supplied timeout (>= 0) signals
+	// this is a data-phase call (e.g. buffered_table_*) where the catalog
+	// timeout is wrong and we should also poll the interrupted flag so
+	// cancellation works during long blocking reads.
+	if (timeout_seconds >= 0) {
+		WaitForReadableInterruptible(fd, context, timeout_seconds);
+	} else {
+		WaitForReadable(fd, GetCatalogTimeout(context));
+	}
 
 	auto input = std::make_shared<FdInputStream>(fd);
 	auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(input);
@@ -368,7 +376,11 @@ static std::shared_ptr<arrow::Buffer> CopyToOwnedBuffer(const uint8_t *data, siz
 
 UnaryResponseResult ReadUnaryResponseFromBuffer(const uint8_t *data, size_t len,
                                                  ClientContext *context,
-                                                 const std::string &url) {
+                                                 const std::string &url,
+                                                 const std::string &invocation_id_hex,
+                                                 const std::string &attach_opaque_data_hex,
+                                                 const std::string &transaction_opaque_data_hex,
+                                                 const std::string &conn_id_hex) {
 	auto buffer = CopyToOwnedBuffer(data, len);
 	auto input = std::make_shared<arrow::io::BufferReader>(buffer);
 	auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(input);
@@ -401,7 +413,9 @@ UnaryResponseResult ReadUnaryResponseFromBuffer(const uint8_t *data, size_t len,
 		}
 
 		if (DispatchBatch(batch_with_metadata.batch, batch_with_metadata.custom_metadata,
-		                  context, url, -1)) {
+		                  context, url, -1,
+		                  invocation_id_hex, attach_opaque_data_hex,
+		                  transaction_opaque_data_hex, conn_id_hex)) {
 			continue;
 		}
 
@@ -417,7 +431,9 @@ UnaryResponseResult ReadUnaryResponseFromBuffer(const uint8_t *data, size_t len,
 			break;
 		}
 		auto &bwm = drain_result.ValueUnsafe();
-		DispatchBatch(bwm.batch, bwm.custom_metadata, context, url, -1);
+		DispatchBatch(bwm.batch, bwm.custom_metadata, context, url, -1,
+		              invocation_id_hex, attach_opaque_data_hex,
+		              transaction_opaque_data_hex, conn_id_hex);
 	}
 
 	return result;

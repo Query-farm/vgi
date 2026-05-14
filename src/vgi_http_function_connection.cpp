@@ -6,8 +6,10 @@
 #include <pthread.h>
 #endif
 
+#include "vgi_arrow_ipc.hpp"
 #include "vgi_arrow_utils.hpp"
 #include "vgi_bind_protocol.hpp"
+#include "vgi_buffered_table_builders.hpp"
 #include "vgi_catalog_api.hpp"
 #include "generated/vgi_protocol_constants.hpp"
 #include "vgi_exception.hpp"
@@ -608,32 +610,107 @@ void HttpFunctionConnection::CloseInputWriter() {
 // ============================================================================
 // Buffered Table Function RPCs — HTTP transport
 // ============================================================================
-// v1 throws NotImplementedException so calls land loudly rather than silently
-// returning wrong results. Filling these in is straightforward (use the same
-// inner-schema builders FunctionConnection uses, route to /buffered_table_*
-// HTTP endpoints) but is deferred until the subprocess path is proven.
+// Mirror the subprocess path: build the inner-schema RecordBatch using the
+// shared builders in vgi_buffered_table_builders.cpp, POST it to the
+// /buffered_table_* HTTP endpoint via HttpInvokeUnary, then decode the outer
+// envelope's "result" column (an IPC-serialized inner batch).
+//
+// Errors and log batches flow through HttpInvokeUnary → ReadUnaryResponseFromBuffer
+// which dispatches log batches with the connection's conn=/attach=/execution=
+// hex fields, matching the subprocess path.
 
-void HttpFunctionConnection::RpcBufferedTableProcess(const std::string & /*function_name*/,
-                                                      const std::vector<uint8_t> & /*execution_id*/,
-                                                      int64_t /*state_id*/,
-                                                      const std::shared_ptr<arrow::RecordBatch> & /*input_batch*/) {
-	throw NotImplementedException(
-	    "Buffered table functions are not yet supported over HTTP transport. "
-	    "Use subprocess transport (LOCATION 'path/to/worker') for now.");
+namespace {
+
+// Decode the outer envelope's 'result' column (binary blob containing
+// IPC bytes of the inner response batch). Returns nullptr if 'result' is null
+// (used for void-style methods like buffered_table_process).
+std::shared_ptr<arrow::RecordBatch> DecodeHttpOuterResponse(const UnaryResponseResult &response,
+                                                              const std::string &method_name,
+                                                              const std::string &base_url) {
+	if (!response.batch || response.batch->num_rows() == 0) {
+		throw IOException("Empty response from %s [url: %s]", method_name, base_url);
+	}
+	auto result_col = response.batch->GetColumnByName("result");
+	if (!result_col) {
+		throw IOException("Response missing 'result' column from %s [url: %s]", method_name, base_url);
+	}
+	if (result_col->type()->id() != arrow::Type::BINARY) {
+		throw IOException("Response 'result' column has wrong type from %s [url: %s]", method_name, base_url);
+	}
+	auto bin = std::static_pointer_cast<arrow::BinaryArray>(result_col);
+	if (bin->IsNull(0)) {
+		return nullptr;
+	}
+	auto v = bin->GetView(0);
+	return vgi::DeserializeFromIpcBytes(reinterpret_cast<const uint8_t *>(v.data()), v.size());
 }
 
-std::vector<int64_t> HttpFunctionConnection::RpcBufferedTableCombine(const std::string & /*function_name*/,
-                                                                     const std::vector<uint8_t> & /*execution_id*/,
-                                                                     const std::vector<int64_t> & /*state_ids*/) {
-	throw NotImplementedException(
-	    "Buffered table functions are not yet supported over HTTP transport.");
+} // namespace
+
+void HttpFunctionConnection::RpcBufferedTableProcess(const std::string &function_name,
+                                                      const std::vector<uint8_t> &execution_id,
+                                                      int64_t state_id,
+                                                      const std::shared_ptr<arrow::RecordBatch> &input_batch) {
+	auto batch_bytes = vgi::SerializeToIpcBytes(input_batch);
+	auto rpc_params = vgi::BuildBufferedTableProcessInner(function_name, execution_id, state_id, batch_bytes,
+	                                                        attach_opaque_data_);
+	auto auth = attach_params_ ? attach_params_->auth() : nullptr;
+	auto cached_params = attach_params_
+	    ? attach_params_->GetOrInitHttpParams(context_, base_url_) : nullptr;
+	auto resp = HttpInvokeUnary(context_, base_url_, "buffered_table_process", rpc_params, auth,
+	                             /*cookie_jar=*/nullptr, cached_params,
+	                             GetExecutionIdHex(), GetAttachOpaqueDataHex(), "", GetConnIdHex());
+	(void)DecodeHttpOuterResponse(resp, "buffered_table_process", base_url_);
+}
+
+std::vector<int64_t> HttpFunctionConnection::RpcBufferedTableCombine(const std::string &function_name,
+                                                                     const std::vector<uint8_t> &execution_id,
+                                                                     const std::vector<int64_t> &state_ids) {
+	auto rpc_params = vgi::BuildBufferedTableCombineInner(function_name, execution_id, state_ids,
+	                                                       attach_opaque_data_);
+	auto auth = attach_params_ ? attach_params_->auth() : nullptr;
+	auto cached_params = attach_params_
+	    ? attach_params_->GetOrInitHttpParams(context_, base_url_) : nullptr;
+	auto resp = HttpInvokeUnary(context_, base_url_, "buffered_table_combine", rpc_params, auth,
+	                             /*cookie_jar=*/nullptr, cached_params,
+	                             GetExecutionIdHex(), GetAttachOpaqueDataHex(), "", GetConnIdHex());
+	auto inner = DecodeHttpOuterResponse(resp, "buffered_table_combine", base_url_);
+	if (!inner || inner->num_rows() == 0) {
+		throw IOException("buffered_table_combine response missing data [url: %s]", base_url_);
+	}
+	auto col = inner->GetColumnByName("finalize_state_ids");
+	auto list_array = std::static_pointer_cast<arrow::ListArray>(col);
+	auto values = std::static_pointer_cast<arrow::Int64Array>(list_array->values());
+	auto offset = list_array->value_offset(0);
+	auto length = list_array->value_length(0);
+	std::vector<int64_t> result;
+	result.reserve(length);
+	for (int64_t i = 0; i < length; ++i) {
+		result.push_back(values->Value(offset + i));
+	}
+	return result;
 }
 
 IFunctionConnection::BufferedTableFinalizeResult HttpFunctionConnection::RpcBufferedTableFinalize(
-    const std::string & /*function_name*/, const std::vector<uint8_t> & /*execution_id*/,
-    int64_t /*finalize_state_id*/) {
-	throw NotImplementedException(
-	    "Buffered table functions are not yet supported over HTTP transport.");
+    const std::string &function_name, const std::vector<uint8_t> &execution_id,
+    int64_t finalize_state_id) {
+	auto rpc_params = vgi::BuildBufferedTableFinalizeInner(function_name, execution_id, finalize_state_id,
+	                                                        attach_opaque_data_);
+	auto auth = attach_params_ ? attach_params_->auth() : nullptr;
+	auto cached_params = attach_params_
+	    ? attach_params_->GetOrInitHttpParams(context_, base_url_) : nullptr;
+	auto resp = HttpInvokeUnary(context_, base_url_, "buffered_table_finalize", rpc_params, auth,
+	                             /*cookie_jar=*/nullptr, cached_params,
+	                             GetExecutionIdHex(), GetAttachOpaqueDataHex(), "", GetConnIdHex());
+	auto inner = DecodeHttpOuterResponse(resp, "buffered_table_finalize", base_url_);
+	if (!inner || inner->num_rows() == 0) {
+		throw IOException("buffered_table_finalize response missing data [url: %s]", base_url_);
+	}
+	auto batch_col = std::static_pointer_cast<arrow::BinaryArray>(inner->GetColumnByName("output_batch"));
+	auto has_more_col = std::static_pointer_cast<arrow::BooleanArray>(inner->GetColumnByName("has_more"));
+	auto v = batch_col->GetView(0);
+	auto batch = vgi::DeserializeFromIpcBytes(reinterpret_cast<const uint8_t *>(v.data()), v.size());
+	return BufferedTableFinalizeResult{batch, has_more_col->Value(0)};
 }
 
 std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {

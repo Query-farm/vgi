@@ -43,7 +43,11 @@ UnaryResponseResult HttpInvokeUnary(ClientContext &context,
                                      const std::shared_ptr<arrow::RecordBatch> &params,
                                      const std::shared_ptr<CatalogAuth> &auth = nullptr,
                                      const std::shared_ptr<SessionCookieJar> &cookie_jar = nullptr,
-                                     const std::shared_ptr<HTTPParams> &cached_http_params = nullptr);
+                                     const std::shared_ptr<HTTPParams> &cached_http_params = nullptr,
+                                     const std::string &invocation_id_hex = "",
+                                     const std::string &attach_opaque_data_hex = "",
+                                     const std::string &transaction_opaque_data_hex = "",
+                                     const std::string &conn_id_hex = "");
 
 // POST Arrow IPC bytes to a URL, return raw response body bytes.
 // Used for catalog, stream init, and exchange operations.

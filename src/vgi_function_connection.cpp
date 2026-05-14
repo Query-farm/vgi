@@ -6,6 +6,7 @@
 
 #include "vgi_arrow_ipc.hpp"
 #include "vgi_bind_protocol.hpp"
+#include "vgi_buffered_table_builders.hpp"
 #include "vgi_catalog_api.hpp"
 #include "generated/vgi_protocol_constants.hpp"
 #include "vgi_exception.hpp"
@@ -1018,83 +1019,8 @@ void FunctionConnection::CloseInputWriter() {
 
 namespace {
 
-// Build the inner RecordBatch for a buffered_table_process request and
-// wrap it as the outer RPC envelope.
-std::shared_ptr<arrow::RecordBatch> BuildBufferedTableProcessInner(
-    const std::string &function_name, const std::vector<uint8_t> &execution_id,
-    int64_t state_id, const std::vector<uint8_t> &input_batch_bytes,
-    const std::vector<uint8_t> &attach_opaque_data) {
-	auto inner_schema = arrow::schema({
-	    arrow::field("function_name", arrow::utf8(), false),
-	    arrow::field("execution_id", arrow::binary(), false),
-	    arrow::field("state_id", arrow::int64(), false),
-	    arrow::field("input_batch", arrow::binary(), false),
-	    arrow::field("attach_opaque_data", arrow::binary(), true),
-	});
-	arrow::Int64Builder sid_builder;
-	(void)sid_builder.Append(state_id);
-	std::shared_ptr<arrow::Array> sid_array;
-	(void)sid_builder.Finish(&sid_array);
-	auto inner = arrow::RecordBatch::Make(inner_schema, 1, {
-	    vgi::MakeSingleStringArray(function_name),
-	    vgi::MakeSingleBinaryArray(execution_id),
-	    sid_array,
-	    vgi::MakeSingleBinaryArray(input_batch_bytes),
-	    vgi::MakeSingleBinaryArrayOrNull(attach_opaque_data),
-	});
-	auto inner_bytes = vgi::SerializeToIpcBytes(inner);
-	return vgi::generated::BuildBufferedTableProcessParams(inner_bytes);
-}
-
-std::shared_ptr<arrow::RecordBatch> BuildBufferedTableCombineInner(
-    const std::string &function_name, const std::vector<uint8_t> &execution_id,
-    const std::vector<int64_t> &state_ids, const std::vector<uint8_t> &attach_opaque_data) {
-	auto inner_schema = arrow::schema({
-	    arrow::field("function_name", arrow::utf8(), false),
-	    arrow::field("execution_id", arrow::binary(), false),
-	    arrow::field("state_ids", arrow::list(arrow::int64()), false),
-	    arrow::field("attach_opaque_data", arrow::binary(), true),
-	});
-	arrow::ListBuilder list_builder(arrow::default_memory_pool(), std::make_shared<arrow::Int64Builder>());
-	auto *value_builder = static_cast<arrow::Int64Builder *>(list_builder.value_builder());
-	(void)list_builder.Append();
-	for (auto v : state_ids) {
-		(void)value_builder->Append(v);
-	}
-	std::shared_ptr<arrow::Array> state_ids_array;
-	(void)list_builder.Finish(&state_ids_array);
-	auto inner = arrow::RecordBatch::Make(inner_schema, 1, {
-	    vgi::MakeSingleStringArray(function_name),
-	    vgi::MakeSingleBinaryArray(execution_id),
-	    state_ids_array,
-	    vgi::MakeSingleBinaryArrayOrNull(attach_opaque_data),
-	});
-	auto inner_bytes = vgi::SerializeToIpcBytes(inner);
-	return vgi::generated::BuildBufferedTableCombineParams(inner_bytes);
-}
-
-std::shared_ptr<arrow::RecordBatch> BuildBufferedTableFinalizeInner(
-    const std::string &function_name, const std::vector<uint8_t> &execution_id,
-    int64_t finalize_state_id, const std::vector<uint8_t> &attach_opaque_data) {
-	auto inner_schema = arrow::schema({
-	    arrow::field("function_name", arrow::utf8(), false),
-	    arrow::field("execution_id", arrow::binary(), false),
-	    arrow::field("finalize_state_id", arrow::int64(), false),
-	    arrow::field("attach_opaque_data", arrow::binary(), true),
-	});
-	arrow::Int64Builder sid_builder;
-	(void)sid_builder.Append(finalize_state_id);
-	std::shared_ptr<arrow::Array> sid_array;
-	(void)sid_builder.Finish(&sid_array);
-	auto inner = arrow::RecordBatch::Make(inner_schema, 1, {
-	    vgi::MakeSingleStringArray(function_name),
-	    vgi::MakeSingleBinaryArray(execution_id),
-	    sid_array,
-	    vgi::MakeSingleBinaryArrayOrNull(attach_opaque_data),
-	});
-	auto inner_bytes = vgi::SerializeToIpcBytes(inner);
-	return vgi::generated::BuildBufferedTableFinalizeParams(inner_bytes);
-}
+// Inner-request builders live in vgi_buffered_table_builders.cpp and are
+// shared with the HTTP transport. We reach them through ::duckdb::vgi::.
 
 // Decode the outer-envelope response into the registered result schema.
 // The 'result' column of the outer envelope is a binary blob containing
@@ -1129,23 +1055,25 @@ void FunctionConnection::RpcBufferedTableProcess(const std::string &function_nam
                                                   int64_t state_id,
                                                   const std::shared_ptr<arrow::RecordBatch> &input_batch) {
 	auto batch_bytes = vgi::SerializeToIpcBytes(input_batch);
-	auto rpc_params = BuildBufferedTableProcessInner(function_name, execution_id, state_id, batch_bytes,
-	                                                   attach_opaque_data_);
+	auto rpc_params = vgi::BuildBufferedTableProcessInner(function_name, execution_id, state_id, batch_bytes,
+	                                                        attach_opaque_data_);
 	vgi::ValidateRequestSchema(rpc_params, "buffered_table_process", worker_path_);
 	vgi::WriteRpcRequest(proc_->GetStdinFd(), "buffered_table_process", rpc_params);
 	auto response = vgi::ReadUnaryResponse(proc_->GetStdoutFd(), &context_, worker_path_, proc_->GetPid(),
-	                                       GetExecutionIdHex(), GetAttachOpaqueDataHex(), "", GetConnIdHex());
+	                                       GetExecutionIdHex(), GetAttachOpaqueDataHex(), "", GetConnIdHex(),
+	                                       vgi::GetBufferedTableTimeout(&context_));
 	(void)DecodeOuterResponse(response, "buffered_table_process", worker_path_);
 }
 
 std::vector<int64_t> FunctionConnection::RpcBufferedTableCombine(const std::string &function_name,
                                                                   const std::vector<uint8_t> &execution_id,
                                                                   const std::vector<int64_t> &state_ids) {
-	auto rpc_params = BuildBufferedTableCombineInner(function_name, execution_id, state_ids, attach_opaque_data_);
+	auto rpc_params = vgi::BuildBufferedTableCombineInner(function_name, execution_id, state_ids, attach_opaque_data_);
 	vgi::ValidateRequestSchema(rpc_params, "buffered_table_combine", worker_path_);
 	vgi::WriteRpcRequest(proc_->GetStdinFd(), "buffered_table_combine", rpc_params);
 	auto response = vgi::ReadUnaryResponse(proc_->GetStdoutFd(), &context_, worker_path_, proc_->GetPid(),
-	                                       GetExecutionIdHex(), GetAttachOpaqueDataHex(), "", GetConnIdHex());
+	                                       GetExecutionIdHex(), GetAttachOpaqueDataHex(), "", GetConnIdHex(),
+	                                       vgi::GetBufferedTableTimeout(&context_));
 	auto inner = DecodeOuterResponse(response, "buffered_table_combine", worker_path_);
 	vgi::ValidateResponseSchema(inner, "buffered_table_combine", worker_path_);
 	if (!inner || inner->num_rows() == 0) {
@@ -1166,12 +1094,13 @@ std::vector<int64_t> FunctionConnection::RpcBufferedTableCombine(const std::stri
 
 IFunctionConnection::BufferedTableFinalizeResult FunctionConnection::RpcBufferedTableFinalize(
     const std::string &function_name, const std::vector<uint8_t> &execution_id, int64_t finalize_state_id) {
-	auto rpc_params = BuildBufferedTableFinalizeInner(function_name, execution_id, finalize_state_id,
+	auto rpc_params = vgi::BuildBufferedTableFinalizeInner(function_name, execution_id, finalize_state_id,
 	                                                    attach_opaque_data_);
 	vgi::ValidateRequestSchema(rpc_params, "buffered_table_finalize", worker_path_);
 	vgi::WriteRpcRequest(proc_->GetStdinFd(), "buffered_table_finalize", rpc_params);
 	auto response = vgi::ReadUnaryResponse(proc_->GetStdoutFd(), &context_, worker_path_, proc_->GetPid(),
-	                                       GetExecutionIdHex(), GetAttachOpaqueDataHex(), "", GetConnIdHex());
+	                                       GetExecutionIdHex(), GetAttachOpaqueDataHex(), "", GetConnIdHex(),
+	                                       vgi::GetBufferedTableTimeout(&context_));
 	auto inner = DecodeOuterResponse(response, "buffered_table_finalize", worker_path_);
 	vgi::ValidateResponseSchema(inner, "buffered_table_finalize", worker_path_);
 	if (!inner || inner->num_rows() == 0) {

@@ -50,10 +50,14 @@ SELECT count(*) FROM example.buffer_input((SELECT i::BIGINT FROM range(50000) t(
 ----
 50000
 
-# Pool may briefly hold workers between queries — assertion is that none of the
-# pooled workers are stale (i.e. they're alive and ready for reuse).
+# Pool count is bounded by `threads` (one secondary worker per DuckDB sink
+# thread) plus one for the coordinator, with no leaks from prior queries.
+# Asserting `<= 16` catches a regression where pool entries grow unboundedly
+# across queries. Over HTTP transport this is trivially true (the pool is
+# always empty per CLAUDE.md's "Pool diagnostics are subprocess-only" note);
+# the meaningful coverage is on subprocess.
 query I
-SELECT count(*) >= 0 FROM vgi_worker_pool();
+SELECT count(*) <= 16 FROM vgi_worker_pool();
 ----
 true
 

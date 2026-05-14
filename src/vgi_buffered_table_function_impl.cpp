@@ -6,6 +6,7 @@
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/function/table/arrow.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/database.hpp"
 
 #include "vgi_arrow_utils.hpp"
 #include "vgi_cancel_dispatcher.hpp"
@@ -121,8 +122,14 @@ namespace {
 
 class VgiBufferedTableFunctionGlobalSinkState : public GlobalSinkState {
 public:
-	VgiBufferedTableFunctionGlobalSinkState() = default;
+	explicit VgiBufferedTableFunctionGlobalSinkState(DatabaseInstance *db_p) : db(db_p) {
+	}
 	~VgiBufferedTableFunctionGlobalSinkState() override;
+
+	// DatabaseInstance is captured at construction so the destructor can
+	// route any still-live connections through the global cancel-dispatcher
+	// (same pattern the streaming InOut path uses on its error path).
+	DatabaseInstance *db = nullptr;
 
 	// The coordinator worker (set on the first Sink call). Used to send the
 	// combine RPC, then handed off into the workers list to also serve as a
@@ -132,12 +139,28 @@ public:
 	std::vector<uint8_t> execution_id;
 	std::atomic<int64_t> state_id_counter {0};
 
+	// Sentinel flag for the coordinator-init double-checked-lock at the top
+	// of Sink. Reading `execution_id.empty()` without the mutex is a data
+	// race on std::vector; this atomic gives us release/acquire ordering
+	// against the store in the slow path so the fast path is safe.
+	std::atomic<bool> coordinator_inited {false};
+
 	// Per-thread workers handed off from Combine. Available for the source
 	// phase to grab via GetData. Also: state_ids[] runs parallel to workers[]
 	// and is what we ship to the combine RPC.
 	std::mutex workers_mutex;
 	std::vector<std::unique_ptr<IFunctionConnection>> workers;
 	std::vector<int64_t> state_ids;
+
+	// Tracks every per-thread sink worker that is currently in-flight (between
+	// `lstate.connection = std::move(...)` and the Combine handoff). On the
+	// error path we want to cancel-dispatch every in-flight peer so its
+	// blocking RPC unblocks promptly rather than waiting for the worker's own
+	// idle path. Stored as raw pointers (the unique_ptr is owned by the
+	// LocalSinkState); LocalSinkState's destructor calls UntrackInFlight to
+	// remove itself before dropping the connection.
+	std::mutex in_flight_mutex;
+	std::vector<IFunctionConnection *> in_flight_workers;
 
 	// Populated by Sink::Finalize after combine returns. Drained by the
 	// source phase under finalize_queue_mutex.
@@ -152,53 +175,112 @@ public:
 
 	// True once Sink::Finalize has fired (mirrors aggregate gstates).
 	std::atomic<bool> finalized {false};
+
+	void TrackInFlight(IFunctionConnection *conn) {
+		std::lock_guard<std::mutex> lk(in_flight_mutex);
+		in_flight_workers.push_back(conn);
+	}
+	void UntrackInFlight(IFunctionConnection *conn) {
+		std::lock_guard<std::mutex> lk(in_flight_mutex);
+		auto it = std::find(in_flight_workers.begin(), in_flight_workers.end(), conn);
+		if (it != in_flight_workers.end()) {
+			in_flight_workers.erase(it);
+		}
+	}
 };
 
 VgiBufferedTableFunctionGlobalSinkState::~VgiBufferedTableFunctionGlobalSinkState() {
-	// Best-effort cancel-dispatch on early teardown. Mirrors the streaming
-	// in-out path at vgi_table_in_out_impl.cpp:56-79, but iterates every
-	// connection we still own (coordinator + workers[]). Any per-thread
-	// LocalSinkState that errored mid-flight has already dropped its
-	// connection via its own destructor, so we don't need to chase those.
-	// Cancel is best-effort — the dispatcher may saturate; that's OK.
-	auto release_all = [&](std::unique_ptr<IFunctionConnection> conn) {
+	// Two cases:
+	//
+	// 1) Happy path — finalize ran cleanly. By the time we reach here every
+	//    worker has returned to its idle accept loop on its own thread (the
+	//    source loop releases-for-pooling on FINISHED). `workers` and
+	//    `coordinator` are empty.
+	//
+	// 2) Error path — some Sink, Combine, Finalize, or Source RPC threw. Any
+	//    connection still alive may be parked inside a blocking syscall on a
+	//    worker thread we no longer control. Dispatch a cancel through the
+	//    global VgiCancelDispatcher (same machinery the streaming InOut path
+	//    uses at vgi_table_in_out_impl.cpp:58-81) so the worker unblocks and
+	//    is reclaimable rather than forced-killed.
+	auto *dispatcher = db ? FindVgiCancelDispatcher(*db) : nullptr;
+	auto reclaim_or_cancel = [&](std::unique_ptr<IFunctionConnection> conn) {
 		if (!conn) {
 			return;
 		}
-		// If finalize ran cleanly, the connections were left behind for the
-		// source phase to pool-release at end. Anything still here at this
-		// destructor is uncompleted state — return to pool best-effort.
-		auto pooled = conn->ReleaseForPooling();
-		if (pooled) {
-			VgiWorkerPool::Instance().Release(std::move(pooled));
+		if (dispatcher) {
+			auto token = conn->GetLastStateToken();
+			CancelRequest req;
+			req.connection = std::move(conn);
+			req.state_token = std::move(token);
+			(void)dispatcher->Enqueue(std::move(req));
 		}
+		// `conn` (if not moved into req) drops here — best-effort.
 	};
 	if (coordinator) {
-		release_all(std::move(coordinator));
+		reclaim_or_cancel(std::move(coordinator));
 	}
 	for (auto &w : workers) {
-		release_all(std::move(w));
+		reclaim_or_cancel(std::move(w));
 	}
 	workers.clear();
+	state_ids.clear();
+
+	// Any in-flight LocalSinkState connections will see `db == nullptr` cannot
+	// be set by us (we'd race their thread). Their own destructor handles
+	// cancel-dispatch via UntrackInFlight + the dispatcher pointer they cached.
 }
 
 class VgiBufferedTableFunctionLocalSinkState : public LocalSinkState {
 public:
 	// Per-thread worker connection. Acquired lazily on the thread's first
-	// Sink call (which assigns state_id from the global atomic).
+	// Sink call (which assigns state_id from the global atomic). On the error
+	// path the destructor routes the connection through the cancel-dispatcher
+	// so the worker unblocks instead of being abandoned mid-RPC.
 	std::unique_ptr<IFunctionConnection> connection;
 	int64_t state_id = -1;
+
+	// Pointers cached at Sink-time so the destructor (which runs on this
+	// thread, possibly after another thread's exception has torn down the
+	// pipeline) can dispatch a cancel without re-walking the operator.
+	VgiBufferedTableFunctionGlobalSinkState *gstate_ptr = nullptr;
+	DatabaseInstance *db = nullptr;
+
+	~VgiBufferedTableFunctionLocalSinkState() override {
+		if (!connection) {
+			return;
+		}
+		// Tell gstate we're no longer in-flight; if Combine already moved us
+		// to workers[], this is a no-op.
+		if (gstate_ptr) {
+			gstate_ptr->UntrackInFlight(connection.get());
+		}
+		// Cancel-dispatch the connection so a blocked process call (e.g. a
+		// worker thread parked in select() waiting for the next request) gets
+		// woken up promptly.
+		auto *dispatcher = db ? FindVgiCancelDispatcher(*db) : nullptr;
+		if (!dispatcher) {
+			return;
+		}
+		auto token = connection->GetLastStateToken();
+		CancelRequest req;
+		req.connection = std::move(connection);
+		req.state_token = std::move(token);
+		(void)dispatcher->Enqueue(std::move(req));
+	}
 };
 
 class VgiBufferedTableFunctionGlobalSourceState : public GlobalSourceState {
 public:
+	// Cap reported back to DuckDB's scheduler. Populated by GetGlobalSourceState
+	// from the worker count handed to source — there is no point scheduling
+	// more drainer threads than we have workers. When source_order_dependent
+	// is true the operator also declares ParallelSource()=false, so DuckDB
+	// clamps to 1 regardless.
+	idx_t worker_count = 0;
+
 	idx_t MaxThreads() override {
-		// One drainer per worker, capped by partition keys. We can't access
-		// the global sink state from here (different lifecycle), so report
-		// "many" and let DuckDB's scheduler do the right thing under
-		// ParallelSource. When source_order_dependent is true we declared
-		// ParallelSource()=false in the op, so DuckDB clamps to 1 anyway.
-		return std::numeric_limits<idx_t>::max();
+		return worker_count > 0 ? worker_count : 1;
 	}
 };
 
@@ -241,8 +323,9 @@ FunctionConnectionParams BuildAcquireParams(const VgiTableInOutBindData &bd,
 // ============================================================================
 
 unique_ptr<GlobalSinkState>
-PhysicalVgiBufferedTableFunction::GetGlobalSinkState(ClientContext & /*context*/) const {
-	auto gstate = make_uniq<VgiBufferedTableFunctionGlobalSinkState>();
+PhysicalVgiBufferedTableFunction::GetGlobalSinkState(ClientContext &context) const {
+	auto *db = &DatabaseInstance::GetDatabase(context);
+	auto gstate = make_uniq<VgiBufferedTableFunctionGlobalSinkState>(db);
 	auto &bd = bind_data->Cast<VgiTableInOutBindData>();
 	gstate->function_name = bd.function_name;
 	gstate->attach_opaque_data = bd.attach_opaque_data;
@@ -292,11 +375,13 @@ SinkResultType PhysicalVgiBufferedTableFunction::Sink(ExecutionContext &context,
 		}
 	};
 
-	if (!gstate.execution_id.empty()) {
-		// Fast path — coordinator already exists.
-	} else {
+	// Coordinator-init double-checked lock. We read coordinator_inited with
+	// acquire ordering so the matching store-release at the end of the slow
+	// path synchronizes the fast-path's view of execution_id. Without this,
+	// the fast path's read of `execution_id` is a data race on std::vector.
+	if (!gstate.coordinator_inited.load(std::memory_order_acquire)) {
 		std::lock_guard<std::mutex> lk(gstate.coordinator_mutex);
-		if (gstate.execution_id.empty()) {
+		if (!gstate.coordinator_inited.load(std::memory_order_relaxed)) {
 			auto params = BuildAcquireParams(bd, /*global_execution_id=*/{});
 			auto acquired = AcquireConnectionForInit(context.client, params);
 			gstate.coordinator = std::move(acquired.connection);
@@ -306,6 +391,7 @@ SinkResultType PhysicalVgiBufferedTableFunction::Sink(ExecutionContext &context,
 			                                                    /*phase=*/"BUFFERED_TABLE");
 			gstate.execution_id = std::move(init_result.execution_id);
 			drain_init_stream(*gstate.coordinator);
+			gstate.coordinator_inited.store(true, std::memory_order_release);
 		}
 	}
 
@@ -322,6 +408,14 @@ SinkResultType PhysicalVgiBufferedTableFunction::Sink(ExecutionContext &context,
 		                                /*phase=*/"BUFFERED_TABLE");
 		drain_init_stream(*lstate.connection);
 		lstate.state_id = gstate.state_id_counter.fetch_add(1);
+
+		// Cache pointers so lstate's destructor can cancel-dispatch on error,
+		// and register ourselves as in-flight so the gstate teardown path
+		// knows about us. Combine will remove us when it hands the connection
+		// over to gstate.workers[].
+		lstate.gstate_ptr = &gstate;
+		lstate.db = gstate.db;
+		gstate.TrackInFlight(lstate.connection.get());
 	}
 
 	// Convert DuckDB chunk → Arrow batch and ship to worker.
@@ -342,6 +436,9 @@ PhysicalVgiBufferedTableFunction::Combine(ExecutionContext & /*context*/,
 		return SinkCombineResultType::FINISHED;
 	}
 
+	// Untrack first so the lstate dtor doesn't try to cancel-dispatch the
+	// connection after Combine has moved it into gstate.workers[].
+	gstate.UntrackInFlight(lstate.connection.get());
 	{
 		std::lock_guard<std::mutex> lk(gstate.workers_mutex);
 		gstate.workers.push_back(std::move(lstate.connection));
@@ -355,9 +452,21 @@ SinkFinalizeType PhysicalVgiBufferedTableFunction::Finalize(Pipeline & /*pipelin
                                                               OperatorSinkFinalizeInput &input) const {
 	auto &gstate = input.global_state.Cast<VgiBufferedTableFunctionGlobalSinkState>();
 
+	// Snapshot state_ids and check emptiness under workers_mutex (not just
+	// "implied happens-before from Combine returning" — that's not a real
+	// synchronizes-with relationship on weakly-ordered hardware).
+	std::vector<int64_t> state_ids_snapshot;
+	bool no_input;
+	{
+		std::lock_guard<std::mutex> lk(gstate.workers_mutex);
+		no_input = gstate.workers.empty();
+		state_ids_snapshot = gstate.state_ids;
+	}
+
 	// No input ever arrived. Tear down the coordinator (if we even had one)
 	// and skip the combine RPC.
-	if (gstate.workers.empty()) {
+	if (no_input) {
+		std::lock_guard<std::mutex> lk(gstate.coordinator_mutex);
 		if (gstate.coordinator) {
 			auto pooled = gstate.coordinator->ReleaseForPooling();
 			gstate.coordinator.reset();
@@ -370,11 +479,11 @@ SinkFinalizeType PhysicalVgiBufferedTableFunction::Finalize(Pipeline & /*pipelin
 	}
 
 	// Send combine to the coordinator. The worker may coordinate with peer
-	// workers (shared BoundStorage etc.) and returns the partition keys
+	// workers (shared BoundStorage etc.) and returns the finalize state IDs
 	// for the source phase.
 	auto finalize_state_ids =
 	    gstate.coordinator->RpcBufferedTableCombine(gstate.function_name, gstate.execution_id,
-	                                                  gstate.state_ids);
+	                                                  state_ids_snapshot);
 	{
 		std::lock_guard<std::mutex> lk(gstate.finalize_queue_mutex);
 		for (auto id : finalize_state_ids) {
@@ -385,10 +494,12 @@ SinkFinalizeType PhysicalVgiBufferedTableFunction::Finalize(Pipeline & /*pipelin
 	// The coordinator now joins the source-phase worker pool. (Any worker
 	// can serve any finalize_state_id — the worker library handles peer
 	// coordination internally; from C++'s point of view they're equivalent.)
+	// We don't push a parallel entry into state_ids[] — that vector tracked
+	// sink-side state IDs to ship to combine, and combine has already run.
+	// Source-phase routing uses finalize_queue exclusively.
 	{
 		std::lock_guard<std::mutex> lk(gstate.workers_mutex);
 		gstate.workers.push_back(std::move(gstate.coordinator));
-		gstate.state_ids.push_back(-1); // placeholder; coordinator wasn't a sink state_id
 	}
 	gstate.finalized.store(true);
 	return SinkFinalizeType::READY;
@@ -400,7 +511,17 @@ SinkFinalizeType PhysicalVgiBufferedTableFunction::Finalize(Pipeline & /*pipelin
 
 unique_ptr<GlobalSourceState>
 PhysicalVgiBufferedTableFunction::GetGlobalSourceState(ClientContext & /*context*/) const {
-	return make_uniq<VgiBufferedTableFunctionGlobalSourceState>();
+	auto gss = make_uniq<VgiBufferedTableFunctionGlobalSourceState>();
+	// sink_state is populated by the time GetGlobalSourceState runs (the
+	// pipeline executor materializes the sink before scheduling the source).
+	// Read the worker count *now* so MaxThreads can return a sensible cap and
+	// DuckDB doesn't oversubscribe drainer threads.
+	if (sink_state) {
+		auto &gstate = sink_state->Cast<VgiBufferedTableFunctionGlobalSinkState>();
+		std::lock_guard<std::mutex> lk(gstate.workers_mutex);
+		gss->worker_count = gstate.workers.size();
+	}
+	return std::move(gss);
 }
 
 unique_ptr<LocalSourceState>

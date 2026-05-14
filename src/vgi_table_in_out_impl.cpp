@@ -386,10 +386,15 @@ OperatorResultType VgiTableInOutFunction(ExecutionContext &context, TableFunctio
 	// Catch this loudly rather than silently regressing to the broken
 	// per-pipeline-finalize semantics that the buffered path is meant to fix.
 	if (bind_data.buffered_table) {
-		throw InternalException(
-		    "VgiTableInOutFunction: bind_data.buffered_table is true — "
-		    "the OptimizerExtension rewrite to PhysicalVgiBufferedTableFunction "
-		    "did not fire. This indicates a planner/optimizer regression.");
+		// `vgi_buffered_table=false` deliberately routes us here so users can
+		// roll back to the streaming path if the rewriter has a bug. Throw an
+		// `InvalidInputException` (recoverable; doesn't kill the session)
+		// instead of `InternalException`.
+		throw InvalidInputException(
+		    "Function '%s' is registered with Meta.buffered_table=True but the "
+		    "vgi_buffered_table rewriter did not fire (likely SET vgi_buffered_table=false). "
+		    "Re-enable with `SET vgi_buffered_table=true` or upgrade the worker to a "
+		    "non-buffered shape.", bind_data.function_name);
 	}
 
 	if (!global_state.connection) {
@@ -464,10 +469,11 @@ OperatorFinalizeResultType VgiTableInOutFinalize(ExecutionContext &context, Tabl
 	// function reaching the streaming finalize callback would re-introduce
 	// the per-pipeline-finalize bug — fail loudly.
 	if (bind_data.buffered_table) {
-		throw InternalException(
-		    "VgiTableInOutFinalize: bind_data.buffered_table is true — "
-		    "the OptimizerExtension rewrite to PhysicalVgiBufferedTableFunction "
-		    "did not fire. This indicates a planner/optimizer regression.");
+		throw InvalidInputException(
+		    "Function '%s' is registered with Meta.buffered_table=True but the "
+		    "vgi_buffered_table rewriter did not fire (likely SET vgi_buffered_table=false). "
+		    "Re-enable with `SET vgi_buffered_table=true` or upgrade the worker to a "
+		    "non-buffered shape.", bind_data.function_name);
 	}
 
 	if (!global_state.connection) {

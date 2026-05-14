@@ -449,7 +449,11 @@ UnaryResponseResult HttpInvokeUnary(ClientContext &context,
                                      const std::shared_ptr<arrow::RecordBatch> &params,
                                      const std::shared_ptr<CatalogAuth> &auth,
                                      const std::shared_ptr<SessionCookieJar> &cookie_jar,
-                                     const std::shared_ptr<HTTPParams> &cached_http_params) {
+                                     const std::shared_ptr<HTTPParams> &cached_http_params,
+                                     const std::string &invocation_id_hex,
+                                     const std::string &attach_opaque_data_hex,
+                                     const std::string &transaction_opaque_data_hex,
+                                     const std::string &conn_id_hex) {
 	std::string base_url = NormalizeBaseUrl(worker_path);
 	std::string url = base_url + "/" + method_name;
 
@@ -470,7 +474,9 @@ UnaryResponseResult HttpInvokeUnary(ClientContext &context,
 	// Parse the Arrow IPC response
 	auto result = ReadUnaryResponseFromBuffer(
 	    reinterpret_cast<const uint8_t *>(response_body.data()),
-	    response_body.size(), &context, url);
+	    response_body.size(), &context, url,
+	    invocation_id_hex, attach_opaque_data_hex,
+	    transaction_opaque_data_hex, conn_id_hex);
 
 	// Resolve external location pointer batches
 	result = MaybeResolveExternalLocation(context, result, base_url);
