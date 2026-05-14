@@ -93,6 +93,19 @@ inline void VGI_LOG(ClientContext &context, const string &event, const vector<pa
 	DUCKDB_LOG(context, VgiLogType, event, info);
 }
 
+//! VgiLogActive - cheap check (one atomic load + one virtual call) for whether
+//! any logging sink is currently listening for VGI events. Use this to gate
+//! hot-path VGI_LOG call sites (per-chunk events) so the info-vector
+//! construction (std::to_string, GetConnIdHex(), etc.) is skipped when
+//! nothing would consume the event.
+inline bool VgiLogActive(ClientContext &context) {
+	if (VgiStderrLogEnabled()) {
+		return true;
+	}
+	auto &logger = Logger::Get(context);
+	return logger.ShouldLog(VgiLogType::NAME, VgiLogType::LEVEL);
+}
+
 //! VGI_LOG_LEVEL - logs to DuckDB at a specific level
 //! Used for in-band log messages from workers where the worker specifies the log level
 inline void VGI_LOG_LEVEL(ClientContext &context, LogLevel level, const string &event,

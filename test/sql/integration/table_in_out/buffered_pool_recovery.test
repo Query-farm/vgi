@@ -37,10 +37,29 @@ SELECT count(*) FROM example.buffer_input((SELECT * FROM range(20) AS t(v)));
 20
 
 # Pool diagnostics: any pooled worker still around must be a fresh one (not
-# the killed PIDs). We can't reliably enumerate them across HTTP, so just
-# check count is bounded — proves we're not leaking entries unbounded.
+# the killed PIDs). Bounded-count check proves we're not leaking entries.
 query I
 SELECT count(*) <= 32 FROM vgi_worker_pool();
+----
+true
+
+# Positive freshness check: every pooled PID must be valid (>0). A stale
+# entry referring to a dead worker would have its PID set to whatever the
+# subprocess wrapper had at acquire time — still >0 — so this is a sanity
+# check, not a freshness proof. The real freshness signal is the misses
+# counter below.
+query I
+SELECT count(*) = 0 FROM vgi_worker_pool() WHERE pid <= 0;
+----
+true
+
+# Misses counter — every crash forces the next ATTACH+Sink to fail its
+# pool acquire (stale EPIPE) and spawn a fresh worker. After 2 crashes
+# plus 3 subsequent queries we expect at least 2 misses on this worker
+# path (the post-crash queries). This is the actual proof that the pool
+# survived crashes by replacing dead entries.
+query I
+SELECT SUM(misses) >= 2 FROM vgi_worker_pool_stats();
 ----
 true
 

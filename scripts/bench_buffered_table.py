@@ -40,15 +40,36 @@ def run_one(
     """Run one timed query; return wall time in seconds."""
     # We build an input row of approximately `value_size_bytes` by repeating
     # a string and casting to BLOB-equivalent. Simpler: a repeat() of length B.
+    # Exception: sum_all_columns only accepts numeric columns, so for the
+    # buffered_agg shape the value column is always BIGINT regardless of the
+    # value_size axis. That axis is meaningful for streaming + buffered_pass
+    # only — measuring IPC payload size impact.
     if value_size_bytes <= 8:
         value_expr = "i::BIGINT AS v"
     else:
         # repeat() makes a STRING of N chars; works in input via VARCHAR.
         value_expr = f"repeat('x', {value_size_bytes}) AS v"
 
-    # The buffered shape reads `count` from buffer_input output (rows match
-    # input rows). The streaming shape reads `count` from echo output.
-    func = "buffer_input" if shape == "buffered" else "echo"
+    # Three shapes:
+    #   streaming     — echo (passthrough TableInOut)
+    #   buffered_pass — buffer_input (TIO + per-batch IPC serialization into
+    #                   Python bytes; dominates measurements at large value
+    #                   sizes — that's fixture cost, not operator cost)
+    #   buffered_agg  — sum_all_columns (constant-size state; the operator-
+    #                   only signal). The buffered_agg ↔ streaming delta is
+    #                   the cleanest measure of per-chunk RPC overhead.
+    func_map = {
+        "streaming":     "echo",
+        "buffered_pass": "buffer_input",
+        "buffered_agg":  "sum_all_columns",
+    }
+    func = func_map[shape]
+    # sum_all_columns can't process string values; override to numeric input
+    # for the agg shape regardless of value_size_bytes. (The buffered_agg
+    # measurement is operator-overhead-only and intentionally doesn't scale
+    # with payload size.)
+    if shape == "buffered_agg":
+        value_expr = "i::BIGINT AS v"
 
     sql = f"""
 LOAD '{ext}';
@@ -110,7 +131,7 @@ def main() -> int:
         rows_set = [1_000, 100_000, 1_000_000]
         threads_set = [1, 4, 8]
         value_sizes = [8, 1024, 65536]
-    shapes = ["streaming", "buffered"]
+    shapes = ["streaming", "buffered_pass", "buffered_agg"]
 
     rows_out: list[dict] = []
     for rows in rows_set:
@@ -129,18 +150,22 @@ def main() -> int:
                         for _ in range(3)
                     )
                     row[f"{shape}_sec"] = timings[1]
-                if not (row["streaming_sec"] != row["streaming_sec"]  # nan check
-                        or row["buffered_sec"] != row["buffered_sec"]):
-                    row["overhead_ratio"] = row["buffered_sec"] / row["streaming_sec"]
-                else:
-                    row["overhead_ratio"] = float("nan")
+                # Two ratios — pass exposes fixture cost, agg the operator only.
+                def _safe(num: float, den: float) -> float:
+                    if num != num or den != den or den == 0:
+                        return float("nan")
+                    return num / den
+                row["pass_ratio"] = _safe(row["buffered_pass_sec"], row["streaming_sec"])
+                row["agg_ratio"]  = _safe(row["buffered_agg_sec"],  row["streaming_sec"])
                 rows_out.append(row)
                 print(f"rows={rows:>9} threads={threads} value={vsize:>5}B  "
-                      f"streaming={row['streaming_sec']:.3f}s  "
-                      f"buffered={row['buffered_sec']:.3f}s  "
-                      f"ratio={row['overhead_ratio']:.2f}x")
+                      f"stream={row['streaming_sec']:.3f}s  "
+                      f"buf_pass={row['buffered_pass_sec']:.3f}s({row['pass_ratio']:.2f}x)  "
+                      f"buf_agg={row['buffered_agg_sec']:.3f}s({row['agg_ratio']:.2f}x)")
 
-    cols = ["rows", "threads", "value_size_bytes", "streaming_sec", "buffered_sec", "overhead_ratio"]
+    cols = ["rows", "threads", "value_size_bytes",
+            "streaming_sec", "buffered_pass_sec", "buffered_agg_sec",
+            "pass_ratio", "agg_ratio"]
     with open(args.out, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=cols)
         w.writeheader()
