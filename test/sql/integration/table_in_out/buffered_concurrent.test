@@ -1,0 +1,44 @@
+# name: test/sql/integration/table_in_out/buffered_concurrent.test
+# description: Two buffered queries in the same session over a long-ish input —
+#   verifies that execution_id is reset between queries and worker pool
+#   coordinates cleanly across queries.
+# group: [vgi_integration_table_in_out]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+SET threads=4;
+
+# Two queries back-to-back must each return the right answer — if execution_id
+# leaks, second-query workers find the prior query's state.
+
+query I
+SELECT count(*) FROM example.buffer_input((SELECT i::BIGINT FROM range(10000) t(i)));
+----
+10000
+
+query I
+SELECT count(*) FROM example.buffer_input((SELECT i::BIGINT FROM range(5000) t(i)));
+----
+5000
+
+# Interleaved sum aggregations
+query I
+SELECT * FROM example.sum_all_columns((SELECT i::BIGINT FROM range(1000) t(i)));
+----
+499500
+
+query I
+SELECT * FROM example.sum_all_columns((SELECT i::BIGINT FROM range(100) t(i)));
+----
+4950
+
+statement ok
+DETACH example;

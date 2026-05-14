@@ -2209,6 +2209,16 @@ VgiFunctionInfo ParseFunctionInfo(const std::shared_ptr<arrow::RecordBatch> &bat
 	// which lets the function be used under LATERAL with correlated input.
 	info.has_finalize = row["has_finalize"].value_or(false);
 
+	// buffered_table — optional bool (defaults to false for older workers).
+	// When true, the table-in-out function is rewritten in the optimizer
+	// extension into PhysicalVgiBufferedTableFunction (Sink+Source) — the
+	// fix for upstream DuckDB issue #18222.
+	info.buffered_table = row["buffered_table"].value_or(false);
+
+	// source_order_dependent — optional bool. Only meaningful when
+	// buffered_table is true; controls ParallelSource on the buffered op.
+	info.source_order_dependent = row["source_order_dependent"].value_or(false);
+
 	// Required settings for this function (list of strings)
 	info.required_settings = row["required_settings"].value_or(std::vector<std::string> {});
 

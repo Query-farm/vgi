@@ -1,0 +1,33 @@
+# name: test/sql/integration/table_in_out/buffered_lateral.test
+# description: Characterize buffered table functions inside LATERAL subqueries.
+#   DuckDB's decorrelator (flatten_dependent_join.cpp) rewrites LATERAL into
+#   DELIM_JOIN before our optimizer pass runs. Non-correlated LATERAL works;
+#   correlated LATERAL is whatever the decorrelator produces.
+# group: [vgi_integration_table_in_out]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ----------------------------------------------------------------------------
+# Non-correlated LATERAL: inner table is constant, must work cleanly.
+# ----------------------------------------------------------------------------
+
+query II
+SELECT *
+FROM (VALUES (1), (2)) AS t(outer_val),
+     LATERAL (SELECT * FROM example.buffer_input((SELECT 100::BIGINT AS v UNION ALL SELECT 200::BIGINT))) AS b
+ORDER BY 1, 2;
+----
+1	100
+1	200
+2	100
+2	200
+
+statement ok
+DETACH example;

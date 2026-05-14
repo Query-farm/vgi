@@ -241,6 +241,18 @@ public:
 	// After this, the worker will send EOS on the output stream
 	void CloseInputWriter() override;
 
+	// ========== Buffered Table Function RPCs ==========
+	void RpcBufferedTableProcess(const std::string &function_name,
+	                             const std::vector<uint8_t> &execution_id,
+	                             int64_t state_id,
+	                             const std::shared_ptr<arrow::RecordBatch> &input_batch) override;
+	std::vector<int64_t> RpcBufferedTableCombine(const std::string &function_name,
+	                                             const std::vector<uint8_t> &execution_id,
+	                                             const std::vector<int64_t> &state_ids) override;
+	BufferedTableFinalizeResult RpcBufferedTableFinalize(const std::string &function_name,
+	                                                      const std::vector<uint8_t> &execution_id,
+	                                                      int64_t finalize_state_id) override;
+
 	// Check if this is a table-in-out function (has input schema)
 	bool IsTableInOut() const override {
 		return input_schema_ != nullptr;

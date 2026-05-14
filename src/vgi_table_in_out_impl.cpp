@@ -38,6 +38,8 @@ unique_ptr<FunctionData> VgiTableInOutBindData::Copy() const {
 	copy->bind_result = bind_result;
 	copy->max_processes = max_processes;
 	copy->cardinality_estimate = cardinality_estimate;
+	copy->buffered_table = buffered_table;
+	copy->source_order_dependent = source_order_dependent;
 	return copy;
 }
 
@@ -100,6 +102,8 @@ unique_ptr<FunctionData> VgiTableInOutBind(ClientContext &context, TableFunction
 	bind_data->function_name = params.function_name;
 	bind_data->settings = params.settings;
 	bind_data->required_secrets = params.required_secrets;
+	bind_data->buffered_table = params.buffered_table;
+	bind_data->source_order_dependent = params.source_order_dependent;
 
 	// Build arguments from the regular (non-TABLE) inputs
 	// input.inputs contains positional arguments, but TABLE arguments are represented as NULL
@@ -375,6 +379,19 @@ OperatorResultType VgiTableInOutFunction(ExecutionContext &context, TableFunctio
 	auto &local_state = data.local_state->Cast<VgiTableInOutLocalState>();
 	auto &client_context = context.client;
 
+	// Loud-failure guard: a buffered_table function should never reach the
+	// streaming in_out_function callback. The optimizer extension rewrites
+	// LogicalGet → LogicalVgiBufferedTableFunction at optimize_function
+	// time, so reaching here means the rewriter was disabled or buggy.
+	// Catch this loudly rather than silently regressing to the broken
+	// per-pipeline-finalize semantics that the buffered path is meant to fix.
+	if (bind_data.buffered_table) {
+		throw InternalException(
+		    "VgiTableInOutFunction: bind_data.buffered_table is true — "
+		    "the OptimizerExtension rewrite to PhysicalVgiBufferedTableFunction "
+		    "did not fire. This indicates a planner/optimizer regression.");
+	}
+
 	if (!global_state.connection) {
 		throw InternalException("VgiTableInOutFunction: connection is null");
 	}
@@ -442,6 +459,16 @@ OperatorFinalizeResultType VgiTableInOutFinalize(ExecutionContext &context, Tabl
 	auto &global_state = data.global_state->Cast<VgiTableInOutGlobalState>();
 	auto &local_state = data.local_state->Cast<VgiTableInOutLocalState>();
 	auto &client_context = context.client;
+
+	// See the matching guard in VgiTableInOutFunction. A buffered_table
+	// function reaching the streaming finalize callback would re-introduce
+	// the per-pipeline-finalize bug — fail loudly.
+	if (bind_data.buffered_table) {
+		throw InternalException(
+		    "VgiTableInOutFinalize: bind_data.buffered_table is true — "
+		    "the OptimizerExtension rewrite to PhysicalVgiBufferedTableFunction "
+		    "did not fire. This indicates a planner/optimizer regression.");
+	}
 
 	if (!global_state.connection) {
 		global_state.stream_finished = true;

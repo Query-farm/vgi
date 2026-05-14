@@ -71,6 +71,18 @@ public:
 	void CloseInputWriter() override;
 	std::shared_ptr<arrow::RecordBatch> ReadDataBatch() override;
 	void CancelStream(const std::vector<uint8_t> &state_token) override;
+
+	// ========== Buffered Table Function RPCs ==========
+	void RpcBufferedTableProcess(const std::string &function_name,
+	                             const std::vector<uint8_t> &execution_id,
+	                             int64_t state_id,
+	                             const std::shared_ptr<arrow::RecordBatch> &input_batch) override;
+	std::vector<int64_t> RpcBufferedTableCombine(const std::string &function_name,
+	                                             const std::vector<uint8_t> &execution_id,
+	                                             const std::vector<int64_t> &state_ids) override;
+	BufferedTableFinalizeResult RpcBufferedTableFinalize(const std::string &function_name,
+	                                                      const std::vector<uint8_t> &execution_id,
+	                                                      int64_t finalize_state_id) override;
 	std::vector<uint8_t> GetLastStateToken() const override {
 		return std::vector<uint8_t>(stream_state_token_.begin(), stream_state_token_.end());
 	}

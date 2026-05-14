@@ -605,6 +605,37 @@ void HttpFunctionConnection::CloseInputWriter() {
 	input_writer_closed_ = true;
 }
 
+// ============================================================================
+// Buffered Table Function RPCs — HTTP transport
+// ============================================================================
+// v1 throws NotImplementedException so calls land loudly rather than silently
+// returning wrong results. Filling these in is straightforward (use the same
+// inner-schema builders FunctionConnection uses, route to /buffered_table_*
+// HTTP endpoints) but is deferred until the subprocess path is proven.
+
+void HttpFunctionConnection::RpcBufferedTableProcess(const std::string & /*function_name*/,
+                                                      const std::vector<uint8_t> & /*execution_id*/,
+                                                      int64_t /*state_id*/,
+                                                      const std::shared_ptr<arrow::RecordBatch> & /*input_batch*/) {
+	throw NotImplementedException(
+	    "Buffered table functions are not yet supported over HTTP transport. "
+	    "Use subprocess transport (LOCATION 'path/to/worker') for now.");
+}
+
+std::vector<int64_t> HttpFunctionConnection::RpcBufferedTableCombine(const std::string & /*function_name*/,
+                                                                     const std::vector<uint8_t> & /*execution_id*/,
+                                                                     const std::vector<int64_t> & /*state_ids*/) {
+	throw NotImplementedException(
+	    "Buffered table functions are not yet supported over HTTP transport.");
+}
+
+IFunctionConnection::BufferedTableFinalizeResult HttpFunctionConnection::RpcBufferedTableFinalize(
+    const std::string & /*function_name*/, const std::vector<uint8_t> & /*execution_id*/,
+    int64_t /*finalize_state_id*/) {
+	throw NotImplementedException(
+	    "Buffered table functions are not yet supported over HTTP transport.");
+}
+
 std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 	if (!init_done_) {
 		throw IOException("HttpFunctionConnection::ReadDataBatch called before PerformInit [url: %s]", base_url_);

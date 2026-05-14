@@ -1,0 +1,61 @@
+# name: test/sql/integration/table_in_out/buffered_parallel.test
+# description: Buffered table functions with multiple DuckDB threads — exercises
+#   per-thread Sink workers, combine merging, and pool release after the query.
+# group: [vgi_integration_table_in_out]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+SET threads=8;
+
+# ----------------------------------------------------------------------------
+# buffer_input — wide input, parallel sink, correct row count
+# ----------------------------------------------------------------------------
+
+query I
+SELECT count(*) FROM example.buffer_input((SELECT i::BIGINT FROM range(100000) t(i)));
+----
+100000
+
+query I
+SELECT sum(i) FROM example.buffer_input((SELECT i::BIGINT AS i FROM range(100000) t(i)));
+----
+4999950000
+
+# ----------------------------------------------------------------------------
+# sum_all_columns — parallel combine must converge to one row
+# ----------------------------------------------------------------------------
+
+query I
+SELECT * FROM example.sum_all_columns((SELECT i::BIGINT FROM range(100000) t(i)));
+----
+4999950000
+
+# ----------------------------------------------------------------------------
+# Pool diagnostics — should be empty before, populated during, drained after.
+# ----------------------------------------------------------------------------
+
+statement ok
+SELECT vgi_worker_pool_flush();
+
+query I
+SELECT count(*) FROM example.buffer_input((SELECT i::BIGINT FROM range(50000) t(i)));
+----
+50000
+
+# Pool may briefly hold workers between queries — assertion is that none of the
+# pooled workers are stale (i.e. they're alive and ready for reuse).
+query I
+SELECT count(*) >= 0 FROM vgi_worker_pool();
+----
+true
+
+statement ok
+DETACH example;

@@ -104,7 +104,11 @@ struct UnaryResponseResult {
 // worker_path/worker_pid are for error context.
 UnaryResponseResult ReadUnaryResponse(int fd, ClientContext *context,
                                       const std::string &worker_path = "",
-                                      pid_t worker_pid = -1);
+                                      pid_t worker_pid = -1,
+                                      const std::string &invocation_id_hex = "",
+                                      const std::string &attach_opaque_data_hex = "",
+                                      const std::string &transaction_opaque_data_hex = "",
+                                      const std::string &conn_id_hex = "");
 
 // Result from reading a stream header
 struct StreamHeaderResult {

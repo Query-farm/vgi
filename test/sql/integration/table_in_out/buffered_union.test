@@ -1,0 +1,83 @@
+# name: test/sql/integration/table_in_out/buffered_union.test
+# description: Buffered table functions across UNION ALL inputs — regression
+#   for upstream DuckDB issue #18222 where PhysicalTableInOutFunction.FinalExecute
+#   fires per source sub-pipeline and corrupts stateful workers like buffer_input.
+# group: [vgi_integration_table_in_out]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ----------------------------------------------------------------------------
+# buffer_input — two-branch UNION ALL must emit all rows
+# ----------------------------------------------------------------------------
+
+query I
+SELECT * FROM example.buffer_input((SELECT 1::BIGINT UNION ALL SELECT 2::BIGINT)) ORDER BY 1;
+----
+1
+2
+
+# ----------------------------------------------------------------------------
+# buffer_input — three-branch UNION ALL
+# ----------------------------------------------------------------------------
+
+query I
+SELECT * FROM example.buffer_input((
+    SELECT i::BIGINT FROM range(0, 5) t(i)
+    UNION ALL
+    SELECT i::BIGINT FROM range(5, 10) t(i)
+    UNION ALL
+    SELECT i::BIGINT FROM range(10, 15) t(i)
+)) ORDER BY 1;
+----
+0
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+
+# ----------------------------------------------------------------------------
+# sum_all_columns — UNION ALL of two ranges must produce one row holding the
+# total sum across both branches
+# ----------------------------------------------------------------------------
+
+query I
+SELECT * FROM example.sum_all_columns((
+    SELECT i::BIGINT FROM range(10) t(i)
+    UNION ALL
+    SELECT i::BIGINT FROM range(10, 20) t(i)
+));
+----
+190
+
+# ----------------------------------------------------------------------------
+# Nested under an outer aggregate
+# ----------------------------------------------------------------------------
+
+query I
+SELECT count(*) FROM example.buffer_input((
+    SELECT i::BIGINT FROM range(100) t(i)
+    UNION ALL
+    SELECT i::BIGINT FROM range(100) t(i)
+));
+----
+200
+
+statement ok
+DETACH example;

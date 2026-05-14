@@ -290,7 +290,8 @@ The `launch:` and `unix://` paths share one warm worker process across every Duc
 | `vgi_aggregate_window_impl.cpp` | Aggregate window callbacks (`window_init` / `window` / `window_batch`) for `OVER (...)` queries; partition is materialised + shipped once, frames evaluated per output row |
 | `vgi_aggregate_streaming_impl.cpp` | Streaming-partitioned aggregate RPC client (`streaming_open` / `_chunk` / `_close`) — pipes input chunks straight to the worker without DuckDB-side partition materialisation |
 | `vgi_streaming_window_operator.cpp` | `LogicalVgiStreamingWindow` + `PhysicalVgiStreamingWindow` — custom `LogicalExtensionOperator` / pipeline `PhysicalOperator` pair that replaces eligible `LogicalWindow` nodes when the worker opts into the streaming protocol; lives in the extension, no DuckDB-core changes |
-| `vgi_table_in_out_impl.cpp` | Table-in-out function implementation |
+| `vgi_table_in_out_impl.cpp` | Table-in-out function implementation (streaming shape — `Meta.buffered_table=False`) |
+| `vgi_buffered_table_function_impl.cpp` | `LogicalVgiBufferedTableFunction` + `PhysicalVgiBufferedTableFunction` — Sink+Source operator for buffered table functions (`Meta.buffered_table=True`); per-thread worker fan-out via `execution_id` |
 | `vgi_arrow_ipc.cpp` | Arrow IPC stream I/O: `FdInputStream`, `FdOutputStream`, `ReadRecordBatch` |
 | `vgi_arrow_utils.cpp` | Arrow-to-DuckDB type conversion |
 | `vgi_logging.cpp` | `VgiLogType`, `VgiStderrLogEnabled()`, `VgiLogToStderr()` |
@@ -369,6 +370,50 @@ VGI uses `vgi_rpc` for RPC over subprocess stdin/stdout or HTTP using Arrow IPC 
 - **Table functions** — Producer mode: client sends tick (0-row) batches, worker produces output
 - **Scalar functions** — Exchange mode: client sends input batches, worker returns 1:1 output
 - **Table-in-out functions** — Exchange mode for INPUT phase, producer mode for FINALIZE phase
+- **Buffered table functions** — Sink+Source PhysicalOperator (see below); INPUT batches go to per-thread workers via the `buffered_table_process` RPC, `buffered_table_combine` collapses worker state IDs after Sink, `buffered_table_finalize` drains output per finalize-state-id
+
+### Buffered Table Functions
+
+A second registration shape for table-in-out functions that need to **see every
+input row before producing output** (e.g. `buffer_input`, `sum_all_columns`).
+Routes the query through a custom Sink+Source `PhysicalOperator`
+(`PhysicalVgiBufferedTableFunction`) instead of `PhysicalTableInOutFunction`,
+which fixes upstream DuckDB issue #18222 where `FinalExecute` fires per source
+sub-pipeline and corrupts stateful workers under `UNION ALL`.
+
+**Opt-in.** Set `Meta.buffered_table = True` on a `TableInOutGenerator`
+subclass in vgi-python. The catalog flag propagates through `VgiFunctionInfo` →
+`VgiTableInOutBindData`; `VgiBufferedTableRewriter` (an `OptimizerExtension`)
+rewrites the `LogicalGet` to `LogicalVgiBufferedTableFunction` after built-in
+passes have run (so LATERAL has already been decorrelated). Loud-failure
+asserts in the streaming `VgiTableInOutFunction` / `VgiTableInOutFinalize`
+catch missed rewrites.
+
+**Lifecycle.** First `Sink` per query acquires the *coordinator* worker and
+captures its `execution_id`. Each DuckDB thread acquires a *secondary* worker
+keyed by `execution_id` (so workers can coordinate via shared `BoundStorage`)
+and gets a unique `state_id` from an atomic counter. `Sink::Finalize` (fires
+once per `GlobalSinkState`, even under `UNION ALL`) calls
+`buffered_table_combine(state_ids[])` on the coordinator; the worker returns
+`finalize_state_ids[]` (often `[0]` after merging, or the input list
+unchanged). `Source` threads pop finalize-state-ids from the queue and call
+`buffered_table_finalize(finalize_state_id)` repeatedly until `has_more=False`.
+
+**Output ordering.** Source is parallel by default (`ParallelSource=true`).
+Set `Meta.source_order_dependent = True` to force `FIXED_ORDER` / serial
+drain (rare — only when the worker yields finalize output in a meaningful
+order).
+
+**Cross-worker state.** State merging is the worker library's job, not the
+C++ side's. Workers coordinate via `BoundStorage.aggregate_get/put` keyed by
+`(execution_id, state_id)`. C++ never ships state bytes between workers.
+
+**Compatibility.** Plain calls, `UNION ALL`, non-correlated `LATERAL`, anchor
+of recursive CTEs, and nesting under outer Sinks (ORDER BY, hash aggregate)
+all work. Correlated LATERAL / correlated subqueries go through DuckDB's
+decorrelator first — behavior follows whatever `flatten_dependent_join.cpp`
+produces and is codified by `buffered_lateral.test` /
+`buffered_recursive_cte.test` so upstream changes are CI-visible.
 
 ### Catalog Integration
 

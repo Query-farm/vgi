@@ -102,6 +102,37 @@ public:
 	virtual void CloseInputWriter() = 0;
 	virtual std::shared_ptr<arrow::RecordBatch> ReadDataBatch() = 0;
 
+	// ========== Buffered Table Function RPCs ==========
+	// Used only when the function declared Meta.buffered_table = True. The
+	// connection must have been initialized via PerformInit(..., phase="BUFFERED_TABLE")
+	// before any of these are called.
+
+	// Sink one input batch into the worker's per-(execution_id, state_id) state.
+	// The C++ side assigns state_ids from an atomic counter — one per Sink
+	// thread. Multiple chunks for the same state_id accumulate into the same
+	// worker-side state instance.
+	virtual void RpcBufferedTableProcess(const std::string &function_name,
+	                                     const std::vector<uint8_t> &execution_id,
+	                                     int64_t state_id,
+	                                     const std::shared_ptr<arrow::RecordBatch> &input_batch) = 0;
+
+	// Once-per-query end-of-input signal. The worker may coordinate with
+	// peer workers (e.g. via shared BoundStorage) and returns partition
+	// keys (finalize_state_ids) that the C++ source phase will iterate.
+	virtual std::vector<int64_t> RpcBufferedTableCombine(const std::string &function_name,
+	                                                     const std::vector<uint8_t> &execution_id,
+	                                                     const std::vector<int64_t> &state_ids) = 0;
+
+	// Pull one output batch from the worker's generator for finalize_state_id.
+	// has_more indicates whether further calls on the same id will yield more.
+	struct BufferedTableFinalizeResult {
+		std::shared_ptr<arrow::RecordBatch> batch;
+		bool has_more = false;
+	};
+	virtual BufferedTableFinalizeResult RpcBufferedTableFinalize(const std::string &function_name,
+	                                                              const std::vector<uint8_t> &execution_id,
+	                                                              int64_t finalize_state_id) = 0;
+
 	// Most recent stream-state token observed on this connection
 	// (HTTP only). Returns empty on subprocess. Used by the cancel
 	// dispatcher to address the right worker under HTTP pooling.

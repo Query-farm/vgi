@@ -218,6 +218,8 @@ static unique_ptr<FunctionData> VgiCatalogTableInOutFunctionBind(ClientContext &
 	params.transaction_opaque_data = tio_tx.GetTransactionOpaqueData();
 	params.settings = ExtractVgiSettings(context, vgi_info.setting_names());
 	params.required_secrets = vgi_info.function_info().required_secrets;
+	params.buffered_table = vgi_info.function_info().buffered_table;
+	params.source_order_dependent = vgi_info.function_info().source_order_dependent;
 
 	// Validate required settings
 	const auto &required_settings = vgi_info.function_info().required_settings;
@@ -317,7 +319,15 @@ void VgiTableFunctionSet::LoadEntries(ClientContext &context, const std::lock_gu
 				// correlated columns) are set, so leaving it unset for
 				// stateless transforms lets those functions participate in
 				// lateral joins.
-				if (func_info.has_finalize) {
+				//
+				// When buffered_table is set, we deliberately *omit*
+				// in_out_function_final — the OptimizerExtension rewrites the
+				// LogicalGet into PhysicalVgiBufferedTableFunction, which
+				// handles finalize through its Sink+Source lifecycle. If the
+				// rewrite is somehow missed, the operator falls back to
+				// VgiTableInOutFunction, which asserts loudly on bind_data
+				// with buffered_table=true.
+				if (func_info.has_finalize && !func_info.buffered_table) {
 					table_func.in_out_function_final = vgi::VgiTableInOutFinalize;
 				}
 				table_func.order_preservation_type = MapOrderPreservation(func_info.order_preservation);

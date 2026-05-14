@@ -40,6 +40,8 @@
 #include "vgi_oauth.hpp"
 #include "vgi_profiling.hpp"
 #include "vgi_streaming_window_operator.hpp"
+#include "vgi_buffered_table_function_impl.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
 #ifndef __EMSCRIPTEN__
 #include "vgi_subprocess.hpp"
 #endif
@@ -259,6 +261,65 @@ private:
 		    enabled_val.IsNull() || !enabled_val.GetValue<bool>()) {
 			return;
 		}
+		Rewrite(plan);
+	}
+};
+
+// ============================================================================
+// VgiBufferedTableRewriter — rewrite LogicalGet → LogicalVgiBufferedTableFunction
+// ============================================================================
+// Walks the plan post-built-in-optimizers. For each LogicalGet whose bind_data
+// is a VgiTableInOutBindData with buffered_table=true, replaces it with a
+// LogicalVgiBufferedTableFunction carrying the same return types/names and
+// the bind_data ownership. The LATERAL decorrelation pass has already run by
+// this point, so any correlated subqueries are already DELIM_JOINs and our
+// LogicalGet appears as a plain (non-projected_input) node.
+
+class VgiBufferedTableRewriter : public OptimizerExtension {
+public:
+	VgiBufferedTableRewriter() {
+		optimize_function = Optimize;
+	}
+
+private:
+	static bool IsBufferedTableInOutGet(LogicalGet &get) {
+		if (!get.bind_data) {
+			return false;
+		}
+		auto *bd = dynamic_cast<vgi::VgiTableInOutBindData *>(get.bind_data.get());
+		return bd && bd->buffered_table;
+	}
+
+	static void Rewrite(unique_ptr<LogicalOperator> &op) {
+		// Recurse first so leaf-level rewrites finish before we look at this node.
+		for (auto &child : op->children) {
+			Rewrite(child);
+		}
+		if (op->type != LogicalOperatorType::LOGICAL_GET) {
+			return;
+		}
+		auto &get = op->Cast<LogicalGet>();
+		if (!IsBufferedTableInOutGet(get)) {
+			return;
+		}
+		// The LogicalGet's child carries the table-input subquery for an
+		// in-out function. Move it into our new extension op.
+		D_ASSERT(get.children.size() <= 1);
+
+		auto rewritten = make_uniq<vgi::LogicalVgiBufferedTableFunction>(
+		    get.table_index, get.returned_types, get.names, std::move(get.bind_data));
+		rewritten->children = std::move(get.children);
+		rewritten->ResolveOperatorTypes();
+
+		VGI_STDERR_DEBUG(
+		    "[VGI] LogicalGet rewritten -> LogicalVgiBufferedTableFunction "
+		    "(table_index=%llu, %zu output column(s))\n",
+		    static_cast<unsigned long long>(get.table_index), get.returned_types.size());
+
+		op = std::move(rewritten);
+	}
+
+	static void Optimize(OptimizerExtensionInput & /*input*/, unique_ptr<LogicalOperator> &plan) {
 		Rewrite(plan);
 	}
 };
@@ -1174,6 +1235,12 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "Set to false to fall back to PhysicalWindow / WindowCustomAggregator.",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
 	OptimizerExtension::Register(config, VgiStreamingWindowOptimizer());
+
+	// Buffered table function rewriter — replace LogicalGet of any
+	// Meta.buffered_table=True function with our Sink+Source physical op.
+	// Always-on; no setting to disable (the corresponding fixtures depend
+	// on it for correctness once they opt in via the metadata flag).
+	OptimizerExtension::Register(config, VgiBufferedTableRewriter());
 
 	// Register worker pool settings
 	config.AddExtensionOption("vgi_worker_pool_idle_limit_seconds",

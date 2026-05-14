@@ -109,6 +109,10 @@ const std::unordered_map<std::string, ResponseSchema> &Registry() {
 		m["bind"] = ResponseSchema{BindResultSchema(), nullptr, false, nullptr};
 		m["aggregate_bind"] = ResponseSchema{AggregateBindResultSchema(), nullptr, false, nullptr};
 		m["aggregate_finalize"] = ResponseSchema{AggregateFinalizeResultSchema(), nullptr, false, nullptr};
+		m["buffered_table_combine"] =
+		    ResponseSchema{BufferedTableCombineResultSchema(), nullptr, false, nullptr};
+		m["buffered_table_finalize"] =
+		    ResponseSchema{BufferedTableFinalizeResultSchema(), nullptr, false, nullptr};
 		m["aggregate_window"] = ResponseSchema{AggregateWindowResultSchema(), nullptr, false, nullptr};
 		m["aggregate_window_batch"] =
 		    ResponseSchema{AggregateWindowBatchResultSchema(), nullptr, false, nullptr};
@@ -131,6 +135,8 @@ const std::unordered_map<std::string, ResponseSchema> &Registry() {
 		m["aggregate_combine"] = ResponseSchema{AggregateCombineResultSchema(), nullptr, false, nullptr};
 		m["aggregate_destructor"] =
 		    ResponseSchema{AggregateDestructorResultSchema(), nullptr, false, nullptr};
+		m["buffered_table_process"] =
+		    ResponseSchema{BufferedTableProcessResultSchema(), nullptr, false, nullptr};
 		m["aggregate_window_init"] =
 		    ResponseSchema{AggregateWindowInitResultSchema(), nullptr, false, nullptr};
 		m["aggregate_window_destructor"] =
@@ -228,6 +234,9 @@ const std::unordered_map<std::string, ResponseSchema> &Registry() {
 		    {"aggregate_streaming_open", &AggregateStreamingOpenParamsSchema},
 		    {"aggregate_streaming_chunk", &AggregateStreamingChunkParamsSchema},
 		    {"aggregate_streaming_close", &AggregateStreamingCloseParamsSchema},
+		    {"buffered_table_process", &BufferedTableProcessParamsSchema},
+		    {"buffered_table_combine", &BufferedTableCombineParamsSchema},
+		    {"buffered_table_finalize", &BufferedTableFinalizeParamsSchema},
 		};
 		for (const auto &e : kRequestSchemas) {
 			auto it = m.find(e.name);

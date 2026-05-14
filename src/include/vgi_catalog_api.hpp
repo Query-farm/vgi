@@ -542,6 +542,19 @@ struct VgiFunctionInfo {
 	// input; we only register the finalize callback when this is set.
 	bool has_finalize = false;
 
+	// Buffered table function path (Sink+Source PhysicalOperator).
+	// When True, the function is rewritten in the optimizer extension into
+	// ``PhysicalVgiBufferedTableFunction`` instead of registering through
+	// DuckDB's ``in_out_function``/``in_out_function_final`` — needed so that
+	// finalize sees the complete input stream (e.g. under UNION ALL — see
+	// DuckDB issue #18222).
+	bool buffered_table = false;
+
+	// Only meaningful when ``buffered_table`` is True. When True, the
+	// source phase is single-threaded and ``finalize_state_ids`` drain in
+	// combine-returned order. Default False enables parallel finalize.
+	bool source_order_dependent = false;
+
 	// Settings required by this function (must be set before invocation)
 	std::vector<std::string> required_settings;
 

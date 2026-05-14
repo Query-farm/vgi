@@ -606,7 +606,7 @@ BuildInitRequest(const std::vector<uint8_t> &bind_call_bytes, const std::vector<
                  const std::string &order_by_column_name, const std::string &order_by_direction,
                  const std::string &order_by_null_order, int64_t order_by_limit,
                  double tablesample_percentage, int64_t tablesample_seed) {
-	static const std::vector<std::string> phase_values = {"INPUT", "FINALIZE"};
+	static const std::vector<std::string> phase_values = {"INPUT", "FINALIZE", "BUFFERED_TABLE"};
 
 	auto phase_type = arrow::dictionary(arrow::int16(), arrow::utf8());
 

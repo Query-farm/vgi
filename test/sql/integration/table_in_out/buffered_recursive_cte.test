@@ -1,0 +1,47 @@
+# name: test/sql/integration/table_in_out/buffered_recursive_cte.test
+# description: Buffered table functions inside a recursive CTE. DuckDB's
+#   physical_recursive_cte.cpp drives each iteration; this test codifies
+#   whatever behavior the planner actually produces today so an upstream
+#   change becomes a visible CI failure.
+# group: [vgi_integration_table_in_out]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ----------------------------------------------------------------------------
+# Plain recursion that does NOT call the buffered function inside the
+# recursive arm — establishes baseline that CTE arms work at all here.
+# ----------------------------------------------------------------------------
+
+query I
+WITH RECURSIVE t(n) AS (
+    SELECT 1
+    UNION ALL
+    SELECT n + 1 FROM t WHERE n < 5
+)
+SELECT count(*) FROM t;
+----
+5
+
+# ----------------------------------------------------------------------------
+# Buffered function in the anchor (base case) — single Sink lifecycle.
+# ----------------------------------------------------------------------------
+
+query I
+WITH RECURSIVE t(n) AS (
+    SELECT * FROM example.buffer_input((SELECT 1::BIGINT UNION ALL SELECT 2::BIGINT UNION ALL SELECT 3::BIGINT))
+    UNION ALL
+    SELECT n + 10 FROM t WHERE n < 10
+)
+SELECT count(*) FROM t;
+----
+6
+
+statement ok
+DETACH example;

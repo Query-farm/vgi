@@ -73,6 +73,14 @@ struct VgiTableInOutBindData : public TableFunctionData {
 	// Worker capabilities
 	int32_t max_processes = 1;
 	int64_t cardinality_estimate = -1;
+
+	// Buffered table function path (Sink+Source PhysicalOperator). When true,
+	// the OptimizerExtension rewrites the LogicalGet to
+	// LogicalVgiBufferedTableFunction; the streaming in_out_function /
+	// in_out_function_final callbacks must never see a bind_data with this
+	// flag set (loud-failure assertion at their entry).
+	bool buffered_table = false;
+	bool source_order_dependent = false;
 };
 
 // ============================================================================
@@ -142,6 +150,11 @@ struct VgiTableInOutBindParams {
 	std::vector<uint8_t> transaction_opaque_data;
 	std::map<std::string, Value> settings;
 	std::vector<vgi::VgiSecretRequirement> required_secrets;
+
+	// Routes through to bind_data so the OptimizerExtension can recognize a
+	// LogicalGet of a buffered table function and rewrite it.
+	bool buffered_table = false;
+	bool source_order_dependent = false;
 
 	// Convenience accessors
 	const std::string &worker_path() const { return attach_params->worker_path(); }

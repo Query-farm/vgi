@@ -59,19 +59,27 @@ RpcBatchType ClassifyBatch(const std::shared_ptr<arrow::RecordBatch> &batch,
 // false if it's a data batch that the caller should process.
 static bool DispatchBatch(const std::shared_ptr<arrow::RecordBatch> &batch,
                           const std::shared_ptr<arrow::KeyValueMetadata> &custom_metadata,
-                          ClientContext *context, const std::string &worker_path, pid_t worker_pid) {
+                          ClientContext *context, const std::string &worker_path, pid_t worker_pid,
+                          const std::string &invocation_id_hex = "",
+                          const std::string &attach_opaque_data_hex = "",
+                          const std::string &transaction_opaque_data_hex = "",
+                          const std::string &conn_id_hex = "") {
 	auto type = ClassifyBatch(batch, custom_metadata);
 
 	switch (type) {
 	case RpcBatchType::ERROR: {
 		// Extract error details and throw
-		HandleBatchLogMessage(batch, custom_metadata, context, worker_path, worker_pid);
+		HandleBatchLogMessage(batch, custom_metadata, context, worker_path, worker_pid,
+		                      invocation_id_hex, attach_opaque_data_hex,
+		                      transaction_opaque_data_hex, conn_id_hex);
 		// HandleBatchLogMessage throws for EXCEPTION level, but just in case:
 		throw IOException("VGI RPC error from worker [worker: %s]", worker_path);
 	}
 	case RpcBatchType::LOG: {
 		// Forward to logger
-		HandleBatchLogMessage(batch, custom_metadata, context, worker_path, worker_pid);
+		HandleBatchLogMessage(batch, custom_metadata, context, worker_path, worker_pid,
+		                      invocation_id_hex, attach_opaque_data_hex,
+		                      transaction_opaque_data_hex, conn_id_hex);
 		return true; // Handled, caller should read next batch
 	}
 	case RpcBatchType::DATA:
@@ -135,7 +143,11 @@ void WriteEmptyRpcRequest(int fd, const std::string &method_name) {
 // ============================================================================
 
 UnaryResponseResult ReadUnaryResponse(int fd, ClientContext *context,
-                                      const std::string &worker_path, pid_t worker_pid) {
+                                      const std::string &worker_path, pid_t worker_pid,
+                                      const std::string &invocation_id_hex,
+                                      const std::string &attach_opaque_data_hex,
+                                      const std::string &transaction_opaque_data_hex,
+                                      const std::string &conn_id_hex) {
 	// Wait for data to be available
 	WaitForReadable(fd, GetCatalogTimeout(context));
 
@@ -173,7 +185,9 @@ UnaryResponseResult ReadUnaryResponse(int fd, ClientContext *context,
 
 		// Dispatch log/error batches
 		if (DispatchBatch(batch_with_metadata.batch, batch_with_metadata.custom_metadata,
-		                  context, worker_path, worker_pid)) {
+		                  context, worker_path, worker_pid,
+		                  invocation_id_hex, attach_opaque_data_hex,
+		                  transaction_opaque_data_hex, conn_id_hex)) {
 			continue; // Was a log batch, read next
 		}
 
@@ -191,7 +205,9 @@ UnaryResponseResult ReadUnaryResponse(int fd, ClientContext *context,
 		}
 		// Dispatch any remaining log batches after the data batch
 		auto &bwm = drain_result.ValueUnsafe();
-		DispatchBatch(bwm.batch, bwm.custom_metadata, context, worker_path, worker_pid);
+		DispatchBatch(bwm.batch, bwm.custom_metadata, context, worker_path, worker_pid,
+		              invocation_id_hex, attach_opaque_data_hex,
+		              transaction_opaque_data_hex, conn_id_hex);
 	}
 
 	return result;

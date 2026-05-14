@@ -61,6 +61,36 @@ SELECT * FROM example.exception_process((
 0	0
 
 # ============================================================================
+# Buffered-table failure modes
+# ============================================================================
+
+# Multi-threaded process exception — every secondary sink is its own worker.
+# Whichever one trips the every-second-batch rule first must propagate.
+statement ok
+SET threads=4;
+
+statement error
+SELECT * FROM example.exception_process((
+    SELECT unnest(generate_series(1, 5000)) AS a, unnest(generate_series(1, 5000)) AS b
+));
+----
+Intentional exception on batch 2
+
+statement ok
+RESET threads;
+
+# Finalize exception on a UNION ALL input — exercises the bug-fix path: one
+# Sink lifecycle across multiple sub-pipelines.
+statement error
+SELECT * FROM example.exception_finalize((
+    SELECT 1::BIGINT AS a, 2::BIGINT AS b
+    UNION ALL
+    SELECT 3::BIGINT AS a, 4::BIGINT AS b
+));
+----
+Intentional exception during finalize()
+
+# ============================================================================
 # Cleanup
 # ============================================================================
 
