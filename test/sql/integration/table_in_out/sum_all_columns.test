@@ -170,6 +170,36 @@ SELECT * FROM example.sum_all_columns((
 ----
 11	22	33	44	55	66
 
+# ----------------------------------------------------------------------------
+# Bind-time rejection of all-non-numeric input — sum_all_columns has nothing
+# to sum if the input has no integer/float columns. Bind raises ValueError
+# with a clear message instead of producing an empty output schema (which
+# previously crashed downstream with an internal assertion).
+# ----------------------------------------------------------------------------
+
+statement error
+SELECT * FROM example.sum_all_columns((SELECT 'hello' AS s));
+----
+requires at least one numeric
+
+statement error
+SELECT * FROM example.sum_all_columns((SELECT 'a' AS x, 'b' AS y, [1, 2, 3] AS arr));
+----
+requires at least one numeric
+
+# ----------------------------------------------------------------------------
+# Mixed input — numeric and non-numeric columns. Non-numeric columns are
+# dropped from the output (existing behavior); only the numeric columns
+# appear in the sum.
+# ----------------------------------------------------------------------------
+
+query II
+SELECT * FROM example.sum_all_columns((
+    SELECT * FROM (VALUES (1, 'a', 10), (2, 'b', 20)) t(n1, label, n2)
+));
+----
+3	30
+
 # ============================================================================
 # Cleanup
 # ============================================================================
