@@ -113,8 +113,8 @@ BuildOptionalStringMapScalar(const std::optional<std::vector<std::pair<std::stri
 //   input_schema: binary|null (serialized Arrow schema)
 //   settings: binary|null (settings RecordBatch as IPC bytes)
 //   secrets: binary|null (secrets RecordBatch as IPC bytes, one struct column per secret)
-//   attach_id: binary|null
-//   transaction_id: binary|null
+//   attach_opaque_data: binary|null
+//   transaction_opaque_data: binary|null
 //   resolved_secrets_provided: bool (true when scoped secrets have been resolved)
 std::shared_ptr<arrow::RecordBatch> BuildBindRequest(
     const std::string &function_name,
@@ -123,8 +123,8 @@ std::shared_ptr<arrow::RecordBatch> BuildBindRequest(
     const std::vector<uint8_t> &input_schema_bytes = {},   // Empty = null
     const std::vector<uint8_t> &settings_bytes = {},       // Empty = null
     const std::vector<uint8_t> &secrets_bytes = {},        // Empty = null
-    const std::vector<uint8_t> &attach_id = {},
-    const std::vector<uint8_t> &transaction_id = {},
+    const std::vector<uint8_t> &attach_opaque_data = {},
+    const std::vector<uint8_t> &transaction_opaque_data = {},
     bool resolved_secrets_provided = false);
 
 // Parsed BindResponse
@@ -310,12 +310,12 @@ std::shared_ptr<arrow::RecordBatch> BuildCatalogAttachRequest(
 // Fields match Python TableCreateRequest dataclass; serialise + wrap with
 // ``generated::BuildCatalogTableCreateParams`` for the wire params.
 std::shared_ptr<arrow::RecordBatch> BuildTableCreateRequest(
-    const std::vector<uint8_t> &attach_id, const std::string &schema_name, const std::string &name,
+    const std::vector<uint8_t> &attach_opaque_data, const std::string &schema_name, const std::string &name,
     const std::shared_ptr<arrow::Schema> &columns_schema, const std::string &on_conflict,
     const std::vector<int> &not_null_constraints, const std::vector<std::vector<int>> &unique_constraints,
     const std::vector<std::string> &check_constraints, const std::vector<std::vector<int>> &primary_key_constraints,
     const std::vector<std::vector<uint8_t>> &foreign_key_constraints,
-    const std::vector<uint8_t> &transaction_id = {});
+    const std::vector<uint8_t> &transaction_opaque_data = {});
 
 
 } // namespace vgi

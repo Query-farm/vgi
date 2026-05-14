@@ -42,7 +42,7 @@ void VgiSchemaSet::LoadEntries(ClientContext &context, const std::lock_guard<std
 
 	// Call catalog_schemas via RPC
 	auto &vgi_tx_load = VgiTransaction::Get(context, catalog_);
-	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_id, vgi_tx_load.GetTransactionId()};
+	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_opaque_data, vgi_tx_load.GetTransactionOpaqueData()};
 
 	auto schema_list = vgi::InvokeCatalogSchemas(rpc_ctx, context);
 

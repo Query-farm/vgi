@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Run attach-options integration tests against the vgi-fixture-attach-options-worker
-# in HTTP mode. Exercises ATTACH-time option forwarding + attach_id round-trip
+# in HTTP mode. Exercises ATTACH-time option forwarding + attach_opaque_data round-trip
 # end-to-end through the HTTP transport.
 #
 # Usage: ./test/run_http_attach_options_integration.sh [unittest-args...]

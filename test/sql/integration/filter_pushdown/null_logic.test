@@ -1,0 +1,238 @@
+# name: test/sql/integration/filter_pushdown/null_logic.test
+# description: Differential filter-pushdown tests for SQL three-valued logic.
+#   Catches divergences between naive boolean masks and SQL's NULL
+#   semantics (TRUE AND NULL = NULL, TRUE OR NULL = TRUE,
+#   NOT NULL = NULL, comparison-against-NULL = NULL). For WHERE-clause
+#   filtering NULL evaluates as "not selected", so the surviving row
+#   set is what we differentially compare.
+#
+#   Coverage:
+#     - comparison against NULL never matches (=, !=, <, >, all return NULL)
+#     - NOT (filter) inverts but preserves NULLs in the false bucket
+#     - AND and OR three-valued logic
+#     - mixed NULL/non-NULL on both sides of compound predicates
+#
+# group: [vgi_integration_filter_pushdown]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# Comparison against NULL never selects the NULL row, regardless of operator.
+# Even `NULL != 5` returns NULL (≠ TRUE).
+# ============================================================================
+
+query I
+SELECT n FROM (VALUES (1::BIGINT), (NULL::BIGINT), (5::BIGINT), (NULL::BIGINT)) v(n)
+WHERE n = 5 ORDER BY n;
+----
+5
+
+query I
+SELECT n FROM example.echo((
+  SELECT n FROM (VALUES (1::BIGINT), (NULL::BIGINT), (5::BIGINT), (NULL::BIGINT)) v(n)
+)) WHERE n = 5 ORDER BY n;
+----
+5
+
+query I
+SELECT n FROM (VALUES (1::BIGINT), (NULL::BIGINT), (5::BIGINT), (NULL::BIGINT)) v(n)
+WHERE n != 5 ORDER BY n;
+----
+1
+
+query I
+SELECT n FROM example.echo((
+  SELECT n FROM (VALUES (1::BIGINT), (NULL::BIGINT), (5::BIGINT), (NULL::BIGINT)) v(n)
+)) WHERE n != 5 ORDER BY n;
+----
+1
+
+query I
+SELECT n FROM (VALUES (1::BIGINT), (NULL::BIGINT), (5::BIGINT)) v(n)
+WHERE n > 0 ORDER BY n;
+----
+1
+5
+
+query I
+SELECT n FROM example.echo((
+  SELECT n FROM (VALUES (1::BIGINT), (NULL::BIGINT), (5::BIGINT)) v(n)
+)) WHERE n > 0 ORDER BY n;
+----
+1
+5
+
+# ============================================================================
+# AND three-valued logic. Truth table:
+#   TRUE  AND TRUE  = TRUE
+#   TRUE  AND NULL  = NULL  (treated as not-selected)
+#   FALSE AND *     = FALSE
+#   NULL  AND NULL  = NULL
+# ============================================================================
+
+# All four combinations on the same input set.
+query II
+SELECT n, t FROM (VALUES (1::BIGINT, 1::BIGINT),     -- TRUE AND TRUE  -> selected
+                         (1::BIGINT, NULL::BIGINT),  -- TRUE AND NULL  -> not selected
+                         (5::BIGINT, 1::BIGINT),     -- FALSE AND TRUE -> not selected
+                         (5::BIGINT, NULL::BIGINT),  -- FALSE AND NULL -> not selected
+                         (NULL::BIGINT, 1::BIGINT),  -- NULL AND TRUE  -> not selected
+                         (NULL::BIGINT, NULL::BIGINT))-- NULL AND NULL -> not selected
+                  v(n, t)
+WHERE n = 1 AND t = 1 ORDER BY n;
+----
+1	1
+
+query II
+SELECT n, t FROM example.echo((
+  SELECT n, t FROM (VALUES (1::BIGINT, 1::BIGINT),
+                           (1::BIGINT, NULL::BIGINT),
+                           (5::BIGINT, 1::BIGINT),
+                           (5::BIGINT, NULL::BIGINT),
+                           (NULL::BIGINT, 1::BIGINT),
+                           (NULL::BIGINT, NULL::BIGINT))
+                    v(n, t)
+)) WHERE n = 1 AND t = 1 ORDER BY n;
+----
+1	1
+
+# ============================================================================
+# OR three-valued logic. Truth table:
+#   TRUE  OR *      = TRUE
+#   FALSE OR TRUE   = TRUE
+#   FALSE OR NULL   = NULL  (not selected)
+#   NULL  OR TRUE   = TRUE
+#   NULL  OR NULL   = NULL  (not selected)
+# ============================================================================
+
+query II
+SELECT n, t FROM (VALUES (1::BIGINT, 1::BIGINT),     -- TRUE OR TRUE   -> selected
+                         (1::BIGINT, NULL::BIGINT),  -- TRUE OR NULL   -> selected
+                         (5::BIGINT, 1::BIGINT),     -- FALSE OR TRUE  -> selected
+                         (5::BIGINT, NULL::BIGINT),  -- FALSE OR NULL  -> not selected
+                         (NULL::BIGINT, 1::BIGINT),  -- NULL OR TRUE   -> selected
+                         (NULL::BIGINT, 5::BIGINT),  -- NULL OR FALSE  -> not selected
+                         (NULL::BIGINT, NULL::BIGINT))-- NULL OR NULL  -> not selected
+                  v(n, t)
+WHERE n = 1 OR t = 1 ORDER BY n NULLS LAST, t NULLS LAST;
+----
+1	1
+1	NULL
+5	1
+NULL	1
+
+query II
+SELECT n, t FROM example.echo((
+  SELECT n, t FROM (VALUES (1::BIGINT, 1::BIGINT),
+                           (1::BIGINT, NULL::BIGINT),
+                           (5::BIGINT, 1::BIGINT),
+                           (5::BIGINT, NULL::BIGINT),
+                           (NULL::BIGINT, 1::BIGINT),
+                           (NULL::BIGINT, 5::BIGINT),
+                           (NULL::BIGINT, NULL::BIGINT))
+                    v(n, t)
+)) WHERE n = 1 OR t = 1 ORDER BY n NULLS LAST, t NULLS LAST;
+----
+1	1
+1	NULL
+5	1
+NULL	1
+
+# ============================================================================
+# NOT (filter). NOT TRUE = FALSE, NOT FALSE = TRUE, NOT NULL = NULL.
+# So `WHERE NOT (n = 5)` selects rows where n is non-NULL and != 5.
+# DuckDB may push this as an ExpressionFilter, AndFilter with NOT, or
+# rewrite to `n != 5` — whichever it chooses, the row set must match.
+# ============================================================================
+
+query I
+SELECT n FROM (VALUES (1::BIGINT), (5::BIGINT), (NULL::BIGINT), (10::BIGINT)) v(n)
+WHERE NOT (n = 5) ORDER BY n;
+----
+1
+10
+
+query I
+SELECT n FROM example.echo((
+  SELECT n FROM (VALUES (1::BIGINT), (5::BIGINT), (NULL::BIGINT), (10::BIGINT)) v(n)
+)) WHERE NOT (n = 5) ORDER BY n;
+----
+1
+10
+
+# ============================================================================
+# IN list with NULL needle. SQL: `x IN (NULL, ...)` returns NULL when
+# x doesn't equal any non-NULL element (because comparison against NULL
+# is NULL and OR'd with FALSE remains NULL). Our InFilter materializes
+# the list as a Set; if NULL is in the set, equality-against-NULL must
+# still yield NULL not TRUE.
+# ============================================================================
+
+query I
+SELECT n FROM (VALUES (1::BIGINT), (2::BIGINT), (3::BIGINT)) v(n)
+WHERE n IN (1, NULL, 3) ORDER BY n;
+----
+1
+3
+
+query I
+SELECT n FROM example.echo((
+  SELECT n FROM (VALUES (1::BIGINT), (2::BIGINT), (3::BIGINT)) v(n)
+)) WHERE n IN (1, NULL, 3) ORDER BY n;
+----
+1
+3
+
+# IN list against a column with a NULL row.
+query I
+SELECT n FROM (VALUES (1::BIGINT), (NULL::BIGINT), (3::BIGINT)) v(n)
+WHERE n IN (1, 3) ORDER BY n;
+----
+1
+3
+
+query I
+SELECT n FROM example.echo((
+  SELECT n FROM (VALUES (1::BIGINT), (NULL::BIGINT), (3::BIGINT)) v(n)
+)) WHERE n IN (1, 3) ORDER BY n;
+----
+1
+3
+
+# ============================================================================
+# Compound — equality on one column AND IS NULL on another. Forces both
+# the filter evaluator and the validity-bitmap path to agree.
+# ============================================================================
+
+query II
+SELECT n, t FROM (VALUES (1::BIGINT, 'a'),
+                         (1::BIGINT, NULL),
+                         (2::BIGINT, 'b'),
+                         (2::BIGINT, NULL)) v(n, t)
+WHERE n = 1 AND t IS NULL ORDER BY n, t;
+----
+1	NULL
+
+query II
+SELECT n, t FROM example.echo((
+  SELECT n, t FROM (VALUES (1::BIGINT, 'a'),
+                           (1::BIGINT, NULL),
+                           (2::BIGINT, 'b'),
+                           (2::BIGINT, NULL)) v(n, t)
+)) WHERE n = 1 AND t IS NULL ORDER BY n, t;
+----
+1	NULL
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;

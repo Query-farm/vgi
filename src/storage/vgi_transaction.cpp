@@ -25,23 +25,23 @@ void VgiTransaction::Start(ClientContext &context) {
 
 	// Check catalog version — clear cache if metadata changed since last query.
 	// This catches DDL changes from other sessions between queries.
-	vgi_catalog_.CheckAndInvalidateCache(context, /*transaction_id=*/{});
+	vgi_catalog_.CheckAndInvalidateCache(context, /*transaction_opaque_data=*/{});
 
 	// Call the worker's catalog_transaction_begin RPC if transactions are supported
 	auto &attach_result = vgi_catalog_.attach_result();
 	if (attach_result && attach_result->supports_transactions) {
 		auto &params = vgi_catalog_.attach_parameters();
-		vgi::CatalogRpcContext rpc_ctx{params, attach_result->attach_id, {}};
-		transaction_id_ = vgi::InvokeCatalogTransactionBegin(rpc_ctx, context);
+		vgi::CatalogRpcContext rpc_ctx{params, attach_result->attach_opaque_data, {}};
+		transaction_opaque_data_ = vgi::InvokeCatalogTransactionBegin(rpc_ctx, context);
 	}
 }
 
 void VgiTransaction::Commit(ClientContext &context) {
 	// Call the worker's catalog_transaction_commit RPC
-	if (!transaction_id_.empty()) {
+	if (!transaction_opaque_data_.empty()) {
 		auto &params = vgi_catalog_.attach_parameters();
 		auto &attach_result = vgi_catalog_.attach_result();
-		vgi::CatalogRpcContext rpc_ctx{params, attach_result->attach_id, transaction_id_};
+		vgi::CatalogRpcContext rpc_ctx{params, attach_result->attach_opaque_data, transaction_opaque_data_};
 		vgi::InvokeCatalogTransactionCommit(rpc_ctx, context);
 	}
 	transaction_state = VgiTransactionState::TRANSACTION_FINISHED;
@@ -82,11 +82,11 @@ void VgiTransaction::Rollback() {
 		return;
 	}
 
-	if (!transaction_id_.empty()) {
+	if (!transaction_opaque_data_.empty()) {
 		auto &params = vgi_catalog_.attach_parameters();
 		auto &attach_result = vgi_catalog_.attach_result();
 		if (attach_result) {
-			vgi::CatalogRpcContext rpc_ctx{params, attach_result->attach_id, transaction_id_};
+			vgi::CatalogRpcContext rpc_ctx{params, attach_result->attach_opaque_data, transaction_opaque_data_};
 			vgi::InvokeCatalogTransactionRollback(rpc_ctx, *ctx);
 		}
 	}

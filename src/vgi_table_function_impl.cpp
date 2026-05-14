@@ -208,7 +208,7 @@ void PerformVgiTableFunctionBind(ClientContext &context, VgiTableFunctionBindDat
 				auto bind_request_bytes = vgi::BuildBindRequestBytes(
 				    context, bind_data.function_name, "TABLE",
 				    bind_data.arguments.array, /*input_schema=*/nullptr,
-				    bind_data.attach_id, bind_data.transaction_id,
+				    bind_data.attach_opaque_data, bind_data.transaction_opaque_data,
 				    bind_data.settings, resolved_secrets,
 				    /*resolved_secrets_provided=*/false,
 				    bind_data.worker_path());
@@ -238,10 +238,10 @@ void PerformVgiTableFunctionBind(ClientContext &context, VgiTableFunctionBindDat
 	// Uses helper that handles pool acquire and stale connection retry.
 	FunctionConnectionParams params;
 	params.attach_params = bind_data.attach_params;
-	params.attach_id = bind_data.attach_id;
+	params.attach_opaque_data = bind_data.attach_opaque_data;
 	params.function_name = bind_data.function_name;
 	params.arguments = bind_data.arguments;
-	params.transaction_id = bind_data.transaction_id;
+	params.transaction_opaque_data = bind_data.transaction_opaque_data;
 	params.settings = bind_data.settings;
 	params.required_secrets = bind_data.required_secrets;
 	params.phase = "bind";
@@ -1047,10 +1047,10 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 	// when possible (subprocess) or constructs a fresh HTTP connection.
 	FunctionConnectionParams acquire_params;
 	acquire_params.attach_params = bind_data.attach_params;
-	acquire_params.attach_id = bind_data.attach_id;
+	acquire_params.attach_opaque_data = bind_data.attach_opaque_data;
 	acquire_params.function_name = bind_data.function_name;
 	acquire_params.arguments = bind_data.arguments;
-	acquire_params.transaction_id = bind_data.transaction_id;
+	acquire_params.transaction_opaque_data = bind_data.transaction_opaque_data;
 	acquire_params.settings = bind_data.settings;
 	acquire_params.required_secrets = bind_data.required_secrets;
 	acquire_params.phase = "init_global";
@@ -1360,10 +1360,10 @@ unique_ptr<LocalTableFunctionState> VgiTableFunctionInitLocal(ExecutionContext &
 		// InitRequest. Stale-pool detection lives on the init RPC.
 		FunctionConnectionParams params;
 		params.attach_params = bind_data.attach_params;
-		params.attach_id = bind_data.attach_id;
+		params.attach_opaque_data = bind_data.attach_opaque_data;
 		params.function_name = bind_data.function_name;
 		params.arguments = bind_data.arguments;
-		params.transaction_id = bind_data.transaction_id;
+		params.transaction_opaque_data = bind_data.transaction_opaque_data;
 		params.global_execution_id = global_state.global_execution_id;
 		params.settings = bind_data.settings;
 		params.required_secrets = bind_data.required_secrets;
@@ -1967,7 +1967,7 @@ unique_ptr<NodeStatistics> VgiTableFunctionCardinality(ClientContext &context, c
 		try {
 			auto rpc_params = bind_data.attach_params ? bind_data.attach_params
 			    : std::make_shared<VgiAttachParameters>(bind_data.worker_path(), "", bind_data.worker_debug(), bind_data.use_pool());
-			CatalogRpcContext rpc_ctx{rpc_params, bind_data.attach_id, bind_data.transaction_id};
+			CatalogRpcContext rpc_ctx{rpc_params, bind_data.attach_opaque_data, bind_data.transaction_opaque_data};
 			auto result = InvokeTableFunctionCardinality(rpc_ctx, bind_data.bind_result.bind_request_bytes,
 			                                             bind_data.bind_result.opaque_data, context);
 			bind_data.cardinality_estimate = result.estimate;
@@ -2103,7 +2103,7 @@ InsertionOrderPreservingMap<string> VgiTableFunctionDynamicToString(TableFunctio
 		    ? bind_data.attach_params
 		    : std::make_shared<VgiAttachParameters>(bind_data.worker_path(), "",
 		                                            bind_data.worker_debug(), bind_data.use_pool());
-		CatalogRpcContext rpc_ctx{rpc_params, bind_data.attach_id, bind_data.transaction_id};
+		CatalogRpcContext rpc_ctx{rpc_params, bind_data.attach_opaque_data, bind_data.transaction_opaque_data};
 		auto user_map = InvokeTableFunctionDynamicToString(
 		    rpc_ctx, bind_data.bind_result.bind_request_bytes, bind_data.bind_result.opaque_data,
 		    global_state.global_execution_id, *global_state.client_context_for_explain);
@@ -2354,7 +2354,7 @@ static unique_ptr<BaseStatistics> FetchFunctionStatistics(ClientContext &context
 			    ? bind_data.attach_params
 			    : std::make_shared<VgiAttachParameters>(bind_data.worker_path(), "",
 			                                             bind_data.worker_debug(), bind_data.use_pool());
-			CatalogRpcContext rpc_ctx{rpc_params, bind_data.attach_id, bind_data.transaction_id};
+			CatalogRpcContext rpc_ctx{rpc_params, bind_data.attach_opaque_data, bind_data.transaction_opaque_data};
 			bind_data.statistics_cache = InvokeTableFunctionStatistics(
 			    rpc_ctx, bind_data.bind_result.bind_request_bytes, bind_data.bind_result.opaque_data,
 			    bind_data.all_column_types, bind_data.all_column_names,

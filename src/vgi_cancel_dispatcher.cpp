@@ -177,17 +177,17 @@ void VgiCancelDispatcher::ProcessStreamingClose(StreamingCloseRequest &req) noex
 		}
 		// Synthesise the minimum bind data InvokeAggregateRpc needs:
 		// attach_params (worker_path / debug / pool / version / auth /
-		// cookies), function_name, attach_id. Other fields are unused
+		// cookies), function_name, attach_opaque_data. Other fields are unused
 		// by the streaming_close path.
 		VgiAggregateBindData synth_bind;
 		synth_bind.attach_params = req.attach_params;
-		synth_bind.attach_id = req.attach_id;
+		synth_bind.attach_opaque_data = req.attach_opaque_data;
 		synth_bind.function_name = req.function_name;
 
 		VgiStreamingSession session;
 		session.function_name = std::move(req.function_name);
 		session.execution_id = std::move(req.execution_id);
-		session.attach_id = std::move(req.attach_id);
+		session.attach_opaque_data = std::move(req.attach_opaque_data);
 
 		VgiAggregateStreamingClose(*conn_->context, synth_bind, session,
 		                            /*enable_logging=*/false);

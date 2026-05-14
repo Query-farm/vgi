@@ -29,8 +29,8 @@ public:
 	}
 
 	//! Get the transaction ID assigned by the worker (empty if none).
-	const std::vector<uint8_t> &GetTransactionId() const {
-		return transaction_id_;
+	const std::vector<uint8_t> &GetTransactionOpaqueData() const {
+		return transaction_opaque_data_;
 	}
 
 	//! Temporary storage for point-in-time catalog entries (time travel).
@@ -44,7 +44,7 @@ private:
 	VgiCatalog &vgi_catalog_;
 	// (Rollback uses the base class's `Transaction::context` weak_ptr to
 	// safely reach a ClientContext if one is still alive at rollback time.)
-	std::vector<uint8_t> transaction_id_;   // Assigned by worker's catalog_transaction_begin
+	std::vector<uint8_t> transaction_opaque_data_;   // Assigned by worker's catalog_transaction_begin
 };
 
 class VgiTransactionManager : public TransactionManager {

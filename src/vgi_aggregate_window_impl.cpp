@@ -123,7 +123,7 @@ std::shared_ptr<arrow::RecordBatch> PartitionToArrow(ClientContext &context,
 
 std::shared_ptr<arrow::RecordBatch> BuildAggregateWindowInitRequest(
     const std::string &function_name, const std::vector<uint8_t> &execution_id,
-    const std::vector<uint8_t> &attach_id, int64_t partition_id, int64_t row_count,
+    const std::vector<uint8_t> &attach_opaque_data, int64_t partition_id, int64_t row_count,
     const std::shared_ptr<arrow::RecordBatch> &partition_batch,
     const std::shared_ptr<arrow::Schema> &output_schema,
     const std::vector<uint8_t> &filter_mask_bytes,
@@ -142,7 +142,7 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateWindowInitRequest(
 	    arrow::field("filter_mask", arrow::binary(), false),
 	    arrow::field("frame_stats", arrow::binary(), false),
 	    arrow::field("all_valid", arrow::binary(), false),
-	    arrow::field("attach_id", arrow::binary(), true),
+	    arrow::field("attach_opaque_data", arrow::binary(), true),
 	});
 
 	arrow::StringBuilder fn_b;
@@ -158,10 +158,10 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateWindowInitRequest(
 	ThrowOnArrowError(fm_b.Append(filter_mask_bytes.data(), filter_mask_bytes.size()));
 	ThrowOnArrowError(fs_b.Append(frame_stats_bytes.data(), frame_stats_bytes.size()));
 	ThrowOnArrowError(av_b.Append(all_valid_bytes.data(), all_valid_bytes.size()));
-	if (attach_id.empty()) {
+	if (attach_opaque_data.empty()) {
 		ThrowOnArrowError(aid_b.AppendNull());
 	} else {
-		ThrowOnArrowError(aid_b.Append(attach_id.data(), attach_id.size()));
+		ThrowOnArrowError(aid_b.Append(attach_opaque_data.data(), attach_opaque_data.size()));
 	}
 
 	std::shared_ptr<arrow::Array> fn_a, eid_a, pid_a, rc_a, batch_a, os_a, fm_a, fs_a, av_a, aid_a;
@@ -182,7 +182,7 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateWindowInitRequest(
 
 std::shared_ptr<arrow::RecordBatch> BuildAggregateWindowRequest(
     const std::string &function_name, const std::vector<uint8_t> &execution_id,
-    const std::vector<uint8_t> &attach_id, int64_t partition_id, int64_t rid,
+    const std::vector<uint8_t> &attach_opaque_data, int64_t partition_id, int64_t rid,
     const SubFrames &subframes) {
 	auto schema = arrow::schema({
 	    arrow::field("function_name", arrow::utf8(), false),
@@ -191,7 +191,7 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateWindowRequest(
 	    arrow::field("rid", arrow::int64(), false),
 	    arrow::field("frame_starts", arrow::list(arrow::field("item", arrow::int64(), true)), false),
 	    arrow::field("frame_ends", arrow::list(arrow::field("item", arrow::int64(), true)), false),
-	    arrow::field("attach_id", arrow::binary(), true),
+	    arrow::field("attach_opaque_data", arrow::binary(), true),
 	});
 
 	arrow::StringBuilder fn_b;
@@ -214,10 +214,10 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateWindowRequest(
 		ThrowOnArrowError(ends_values->Append(static_cast<int64_t>(fb.end)));
 	}
 
-	if (attach_id.empty()) {
+	if (attach_opaque_data.empty()) {
 		ThrowOnArrowError(aid_b.AppendNull());
 	} else {
-		ThrowOnArrowError(aid_b.Append(attach_id.data(), attach_id.size()));
+		ThrowOnArrowError(aid_b.Append(attach_opaque_data.data(), attach_opaque_data.size()));
 	}
 
 	std::shared_ptr<arrow::Array> fn_a, eid_a, pid_a, rid_a, starts_a, ends_a, aid_a;
@@ -239,7 +239,7 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateWindowRequest(
 // frame_ends (flat arrays of length sum(frames_per_row)).
 std::shared_ptr<arrow::RecordBatch> BuildAggregateWindowBatchRequest(
     const std::string &function_name, const std::vector<uint8_t> &execution_id,
-    const std::vector<uint8_t> &attach_id, int64_t partition_id,
+    const std::vector<uint8_t> &attach_opaque_data, int64_t partition_id,
     const SubFrames *subframes_per_row, idx_t count, idx_t row_idx) {
 	auto schema = arrow::schema({
 	    arrow::field("function_name", arrow::utf8(), false),
@@ -250,7 +250,7 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateWindowBatchRequest(
 	    arrow::field("frames_per_row", arrow::list(arrow::field("item", arrow::int64(), true)), false),
 	    arrow::field("frame_starts", arrow::list(arrow::field("item", arrow::int64(), true)), false),
 	    arrow::field("frame_ends", arrow::list(arrow::field("item", arrow::int64(), true)), false),
-	    arrow::field("attach_id", arrow::binary(), true),
+	    arrow::field("attach_opaque_data", arrow::binary(), true),
 	});
 
 	arrow::StringBuilder fn_b;
@@ -281,10 +281,10 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateWindowBatchRequest(
 		}
 	}
 
-	if (attach_id.empty()) {
+	if (attach_opaque_data.empty()) {
 		ThrowOnArrowError(aid_b.AppendNull());
 	} else {
-		ThrowOnArrowError(aid_b.Append(attach_id.data(), attach_id.size()));
+		ThrowOnArrowError(aid_b.Append(attach_opaque_data.data(), attach_opaque_data.size()));
 	}
 
 	std::shared_ptr<arrow::Array> fn_a, eid_a, pid_a, row_idx_a, count_a, fpr_a, starts_a, ends_a, aid_a;
@@ -304,12 +304,12 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateWindowBatchRequest(
 
 std::shared_ptr<arrow::RecordBatch> BuildAggregateWindowDestructorRequest(
     const std::string &function_name, const std::vector<uint8_t> &execution_id,
-    const std::vector<uint8_t> &attach_id, int64_t partition_id) {
+    const std::vector<uint8_t> &attach_opaque_data, int64_t partition_id) {
 	auto schema = arrow::schema({
 	    arrow::field("function_name", arrow::utf8(), false),
 	    arrow::field("execution_id", arrow::binary(), false),
 	    arrow::field("partition_id", arrow::int64(), false),
-	    arrow::field("attach_id", arrow::binary(), true),
+	    arrow::field("attach_opaque_data", arrow::binary(), true),
 	});
 
 	arrow::StringBuilder fn_b;
@@ -319,10 +319,10 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateWindowDestructorRequest(
 	ThrowOnArrowError(fn_b.Append(function_name));
 	ThrowOnArrowError(eid_b.Append(execution_id.data(), execution_id.size()));
 	ThrowOnArrowError(pid_b.Append(partition_id));
-	if (attach_id.empty()) {
+	if (attach_opaque_data.empty()) {
 		ThrowOnArrowError(aid_b.AppendNull());
 	} else {
-		ThrowOnArrowError(aid_b.Append(attach_id.data(), attach_id.size()));
+		ThrowOnArrowError(aid_b.Append(attach_opaque_data.data(), attach_opaque_data.size()));
 	}
 
 	std::shared_ptr<arrow::Array> fn_a, eid_a, pid_a, aid_a;
@@ -344,7 +344,7 @@ void SendAggregateWindowDestructorRpc(ClientContext &context, const VgiAggregate
                                        int64_t partition_id) {
 	auto request = BuildAggregateWindowDestructorRequest(
 	    bind_data.function_name, bind_data.exec_state->execution_id,
-	    bind_data.attach_id, partition_id);
+	    bind_data.attach_opaque_data, partition_id);
 	// enable_logging=false: this path runs on task-scheduler threads during
 	// pipeline teardown. VGI_LOG / DrainToLog are unsafe there.
 	InvokeAggregateRpc(context, bind_data, "aggregate_window_destructor", request, /*enable_logging=*/false);
@@ -377,7 +377,7 @@ void VgiAggregateWindowInit(AggregateInputData &aggr_input_data, const WindowPar
 	auto filter_mask_bytes = PackValidityMask(partition.filter_mask, partition.count);
 
 	auto request = BuildAggregateWindowInitRequest(
-	    bind_data.function_name, bind_data.exec_state->execution_id, bind_data.attach_id,
+	    bind_data.function_name, bind_data.exec_state->execution_id, bind_data.attach_opaque_data,
 	    ls->partition_id, static_cast<int64_t>(partition.count), partition_batch,
 	    bind_data.resolved_output_schema, filter_mask_bytes, frame_stats_bytes, all_valid_bytes);
 
@@ -408,7 +408,7 @@ void VgiAggregateWindow(AggregateInputData &aggr_input_data, const WindowPartiti
 	auto &context = *context_lock;
 
 	auto request = BuildAggregateWindowRequest(
-	    bind_data.function_name, bind_data.exec_state->execution_id, bind_data.attach_id,
+	    bind_data.function_name, bind_data.exec_state->execution_id, bind_data.attach_opaque_data,
 	    global->partition_id, static_cast<int64_t>(rid), subframes);
 
 	auto rpc_result = InvokeAggregateRpc(context, bind_data, "aggregate_window", request);
@@ -492,7 +492,7 @@ void VgiAggregateWindowBatch(AggregateInputData &aggr_input_data, const WindowPa
 	auto &context = *context_lock;
 
 	auto request = BuildAggregateWindowBatchRequest(
-	    bind_data.function_name, bind_data.exec_state->execution_id, bind_data.attach_id,
+	    bind_data.function_name, bind_data.exec_state->execution_id, bind_data.attach_opaque_data,
 	    global->partition_id, subframes_per_row, count, row_idx);
 
 	auto rpc_result = InvokeAggregateRpc(context, bind_data, "aggregate_window_batch", request);

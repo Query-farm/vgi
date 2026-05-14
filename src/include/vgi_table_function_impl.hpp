@@ -37,9 +37,9 @@ namespace vgi {
 class VgiTableFunctionInfo final : public TableFunctionInfo {
 public:
 	VgiTableFunctionInfo(Catalog &catalog, std::shared_ptr<VgiAttachParameters> attach_params,
-	                     std::vector<uint8_t> attach_id, VgiFunctionInfo function_info,
+	                     std::vector<uint8_t> attach_opaque_data, VgiFunctionInfo function_info,
 	                     std::vector<std::string> setting_names)
-	    : catalog_(catalog), attach_params_(std::move(attach_params)), attach_id_(std::move(attach_id)),
+	    : catalog_(catalog), attach_params_(std::move(attach_params)), attach_opaque_data_(std::move(attach_opaque_data)),
 	      function_info_(std::move(function_info)), setting_names_(std::move(setting_names)) {
 	}
 
@@ -61,8 +61,8 @@ public:
 	}
 
 	//! Attach ID for the catalog connection
-	const std::vector<uint8_t> &attach_id() const {
-		return attach_id_;
+	const std::vector<uint8_t> &attach_opaque_data() const {
+		return attach_opaque_data_;
 	}
 
 	//! Whether to enable worker debug output
@@ -88,7 +88,7 @@ public:
 private:
 	Catalog &catalog_;
 	std::shared_ptr<VgiAttachParameters> attach_params_;
-	std::vector<uint8_t> attach_id_;
+	std::vector<uint8_t> attach_opaque_data_;
 	VgiFunctionInfo function_info_;
 	std::vector<std::string> setting_names_;
 };
@@ -102,8 +102,8 @@ private:
 struct VgiTableFunctionBindData : public TableFunctionData {
 	// Worker identification
 	std::shared_ptr<VgiAttachParameters> attach_params;  // replaces worker_path, worker_debug, use_pool
-	std::vector<uint8_t> attach_id;
-	std::vector<uint8_t> transaction_id;
+	std::vector<uint8_t> attach_opaque_data;
+	std::vector<uint8_t> transaction_opaque_data;
 
 	// Convenience accessors
 	const std::string &worker_path() const { return attach_params->worker_path(); }
@@ -502,7 +502,7 @@ private:
 // ============================================================================
 
 //! Perform the bind handshake with the worker and populate bind_data.
-//! The bind_data must have worker_path, function_name, arguments, and attach_id already set.
+//! The bind_data must have worker_path, function_name, arguments, and attach_opaque_data already set.
 //! This function creates a temporary connection, performs bind, and stores the results.
 //! Returns the output schema from the worker.
 void PerformVgiTableFunctionBind(ClientContext &context, VgiTableFunctionBindData &bind_data,

@@ -84,7 +84,7 @@ public:
 	/// Check the worker's catalog version; clear cache only if it has changed.
 	/// No-op if catalog_version_frozen is true.
 	/// Returns true if cache was cleared.
-	bool CheckAndInvalidateCache(ClientContext &context, const std::vector<uint8_t> &transaction_id);
+	bool CheckAndInvalidateCache(ClientContext &context, const std::vector<uint8_t> &transaction_opaque_data);
 
 	const std::string &internal_name() const {
 		return internal_name_;

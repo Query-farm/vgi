@@ -32,7 +32,7 @@ namespace vgi {
 struct VgiStreamingSession {
 	std::vector<uint8_t> execution_id;
 	std::string function_name;
-	std::vector<uint8_t> attach_id;
+	std::vector<uint8_t> attach_opaque_data;
 };
 
 // Open a streaming-partitioned session. Sends AggregateStreamingOpenRequest

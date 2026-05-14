@@ -113,7 +113,7 @@ optional_ptr<CatalogEntry> VgiViewSet::GetEntry(ClientContext &context, const st
 	}
 
 	auto &vgi_tx = VgiTransaction::Get(context, catalog_);
-	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_id, vgi_tx.GetTransactionId()};
+	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_opaque_data, vgi_tx.GetTransactionOpaqueData()};
 	rpc_ctx.entity_kind = "view";
 	rpc_ctx.entity_qualifier = schema_.name + "." + name;
 
@@ -152,7 +152,7 @@ void VgiViewSet::LoadEntries(ClientContext &context, const std::lock_guard<std::
 
 	// Call catalog_schema_contents_views via RPC
 	auto &vgi_tx_load = VgiTransaction::Get(context, catalog_);
-	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_id, vgi_tx_load.GetTransactionId()};
+	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_opaque_data, vgi_tx_load.GetTransactionOpaqueData()};
 	rpc_ctx.entity_kind = "schema";
 	rpc_ctx.entity_qualifier = schema_.name;
 	auto views = vgi::InvokeCatalogSchemaContentsViews(rpc_ctx, schema_.name, context);

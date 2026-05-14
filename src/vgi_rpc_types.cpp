@@ -445,7 +445,7 @@ std::shared_ptr<arrow::RecordBatch>
 BuildBindRequest(const std::string &function_name, const std::vector<uint8_t> &arguments_ipc_bytes,
                  const std::string &function_type, const std::vector<uint8_t> &input_schema_bytes,
                  const std::vector<uint8_t> &settings_bytes, const std::vector<uint8_t> &secrets_bytes,
-                 const std::vector<uint8_t> &attach_id, const std::vector<uint8_t> &transaction_id,
+                 const std::vector<uint8_t> &attach_opaque_data, const std::vector<uint8_t> &transaction_opaque_data,
                  bool resolved_secrets_provided) {
 	// FunctionType enum: SCALAR, TABLE, AGGREGATE
 	static const std::vector<std::string> function_type_values = {"SCALAR", "TABLE", "AGGREGATE"};
@@ -457,8 +457,8 @@ BuildBindRequest(const std::string &function_name, const std::vector<uint8_t> &a
 	    arrow::field("input_schema", arrow::binary(), true),
 	    arrow::field("settings", arrow::binary(), true),
 	    arrow::field("secrets", arrow::binary(), true),
-	    arrow::field("attach_id", arrow::binary(), true),
-	    arrow::field("transaction_id", arrow::binary(), true),
+	    arrow::field("attach_opaque_data", arrow::binary(), true),
+	    arrow::field("transaction_opaque_data", arrow::binary(), true),
 	    arrow::field("resolved_secrets_provided", arrow::boolean(), false),
 	});
 
@@ -469,8 +469,8 @@ BuildBindRequest(const std::string &function_name, const std::vector<uint8_t> &a
 	arrays.push_back(BuildBinaryScalar(input_schema_bytes));
 	arrays.push_back(BuildBinaryScalar(settings_bytes));
 	arrays.push_back(BuildBinaryScalar(secrets_bytes));
-	arrays.push_back(BuildBinaryScalar(attach_id));
-	arrays.push_back(BuildBinaryScalar(transaction_id));
+	arrays.push_back(BuildBinaryScalar(attach_opaque_data));
+	arrays.push_back(BuildBinaryScalar(transaction_opaque_data));
 
 	// resolved_secrets_provided: bool
 	{
@@ -1015,18 +1015,18 @@ std::shared_ptr<arrow::RecordBatch> BuildCatalogAttachRequest(
 }
 
 std::shared_ptr<arrow::RecordBatch> BuildTableCreateRequest(
-    const std::vector<uint8_t> &attach_id, const std::string &schema_name, const std::string &name,
+    const std::vector<uint8_t> &attach_opaque_data, const std::string &schema_name, const std::string &name,
     const std::shared_ptr<arrow::Schema> &columns_schema, const std::string &on_conflict,
     const std::vector<int> &not_null_constraints, const std::vector<std::vector<int>> &unique_constraints,
     const std::vector<std::string> &check_constraints, const std::vector<std::vector<int>> &primary_key_constraints,
-    const std::vector<std::vector<uint8_t>> &foreign_key_constraints, const std::vector<uint8_t> &transaction_id) {
+    const std::vector<std::vector<uint8_t>> &foreign_key_constraints, const std::vector<uint8_t> &transaction_opaque_data) {
 	static const std::vector<std::string> on_conflict_values = {"ERROR", "IGNORE", "REPLACE"};
 
 	// Serialize the columns schema to IPC bytes
 	auto columns_bytes = SerializeSchemaToIpcBytes(columns_schema);
 
 	auto batch_schema = arrow::schema({
-	    arrow::field("attach_id", arrow::binary(), false),
+	    arrow::field("attach_opaque_data", arrow::binary(), false),
 	    arrow::field("schema_name", arrow::utf8(), false),
 	    arrow::field("name", arrow::utf8(), false),
 	    arrow::field("columns", arrow::binary(), false),
@@ -1036,16 +1036,16 @@ std::shared_ptr<arrow::RecordBatch> BuildTableCreateRequest(
 	    arrow::field("check_constraints", arrow::list(arrow::utf8()), false),
 	    arrow::field("primary_key_constraints", arrow::list(arrow::list(arrow::int32())), false),
 	    arrow::field("foreign_key_constraints", arrow::list(arrow::binary()), false),
-	    arrow::field("transaction_id", arrow::binary(), true),
+	    arrow::field("transaction_opaque_data", arrow::binary(), true),
 	});
 
 	std::vector<std::shared_ptr<arrow::Array>> arrays;
 
-	// attach_id: binary (required)
+	// attach_opaque_data: binary (required)
 	{
 		arrow::BinaryBuilder builder;
-		CheckStatus(builder.Append(attach_id.data(), attach_id.size()), "append attach_id");
-		arrays.push_back(FinishArray(builder, "attach_id"));
+		CheckStatus(builder.Append(attach_opaque_data.data(), attach_opaque_data.size()), "append attach_opaque_data");
+		arrays.push_back(FinishArray(builder, "attach_opaque_data"));
 	}
 
 	// schema_name: utf8
@@ -1127,8 +1127,8 @@ std::shared_ptr<arrow::RecordBatch> BuildTableCreateRequest(
 		arrays.push_back(FinishArray(list_builder, "foreign_key_constraints"));
 	}
 
-	// transaction_id: binary (nullable)
-	arrays.push_back(BuildBinaryScalar(transaction_id));
+	// transaction_opaque_data: binary (nullable)
+	arrays.push_back(BuildBinaryScalar(transaction_opaque_data));
 
 	return arrow::RecordBatch::Make(batch_schema, 1, arrays);
 }

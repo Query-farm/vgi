@@ -127,18 +127,18 @@ void AppendSubprocessPidField(vector<pair<string, string>> &fields, const vgi::I
 vector<pair<string, string>> BuildConnLogFields(const vgi::IFunctionConnection &conn) {
 	vector<pair<string, string>> fields;
 	fields.emplace_back("conn", conn.GetConnIdHex());
-	auto attach = conn.GetAttachIdHex();
+	auto attach = conn.GetAttachOpaqueDataHex();
 	if (!attach.empty()) {
-		fields.emplace_back("attach_id", attach);
+		fields.emplace_back("attach_opaque_data", attach);
 	}
 	AppendSubprocessPidField(fields, conn);
 	auto exec = conn.GetExecutionIdHex();
 	if (!exec.empty()) {
 		fields.emplace_back("execution_id", exec);
 	}
-	auto tx = conn.GetTransactionIdHex();
+	auto tx = conn.GetTransactionOpaqueDataHex();
 	if (!tx.empty()) {
-		fields.emplace_back("transaction_id", tx);
+		fields.emplace_back("transaction_opaque_data", tx);
 	}
 	return fields;
 }
@@ -212,7 +212,7 @@ string VgiLogType::ConstructLogMessage(const string &event, const vector<pair<st
 bool HandleBatchLogMessage(const std::shared_ptr<arrow::RecordBatch> &batch,
                            const std::shared_ptr<arrow::KeyValueMetadata> &custom_metadata, ClientContext *context,
                            const std::string &worker_path, pid_t worker_pid, const std::string &invocation_id_hex,
-                           const std::string &attach_id_hex, const std::string &transaction_id_hex,
+                           const std::string &attach_opaque_data_hex, const std::string &transaction_opaque_data_hex,
                            const std::string &conn_id_hex) {
 	if (!batch || batch->num_rows() != 0) {
 		return false;
@@ -300,11 +300,11 @@ bool HandleBatchLogMessage(const std::shared_ptr<arrow::RecordBatch> &batch,
 		if (!invocation_id_hex.empty()) {
 			info.emplace_back("invocation_id", invocation_id_hex);
 		}
-		if (!attach_id_hex.empty()) {
-			info.emplace_back("attach_id", attach_id_hex);
+		if (!attach_opaque_data_hex.empty()) {
+			info.emplace_back("attach_opaque_data", attach_opaque_data_hex);
 		}
-		if (!transaction_id_hex.empty()) {
-			info.emplace_back("transaction_id", transaction_id_hex);
+		if (!transaction_opaque_data_hex.empty()) {
+			info.emplace_back("transaction_opaque_data", transaction_opaque_data_hex);
 		}
 		if (!exception_type.empty()) {
 			info.emplace_back("exception_type", exception_type);

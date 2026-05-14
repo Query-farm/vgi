@@ -194,8 +194,8 @@ private:
 // Eliminates the 5-6 individual catalog parameters that every InvokeCatalog* function used to take.
 struct CatalogRpcContext {
 	std::shared_ptr<VgiAttachParameters> params;
-	std::vector<uint8_t> attach_id;       // from CatalogAttachResult
-	std::vector<uint8_t> transaction_id;  // from VgiTransaction (empty if N/A)
+	std::vector<uint8_t> attach_opaque_data;       // from CatalogAttachResult
+	std::vector<uint8_t> transaction_opaque_data;  // from VgiTransaction (empty if N/A)
 
 	// Optional entity context for instrumentation. When populated, the RPC
 	// chokepoint logs them on every catalog.rpc event so analyses can group
@@ -247,12 +247,12 @@ struct VgiSecretRequirement {
 
 // Result of catalog_attach call
 struct CatalogAttachResult {
-	std::vector<uint8_t> attach_id;
+	std::vector<uint8_t> attach_opaque_data;
 	bool supports_transactions = false;
 	bool supports_time_travel = false;
 	bool catalog_version_frozen = false;
 	int64_t catalog_version = 0;
-	bool attach_id_required = false;
+	bool attach_opaque_data_required = false;
 	std::string default_schema = "main";
 	std::vector<VgiSetting> settings;             // Extension options exposed by this catalog
 	std::vector<VgiSecretType> secret_types;      // Secret types exposed by this catalog
@@ -706,7 +706,7 @@ VgiWriteFunctionResult InvokeCatalogTableDeleteFunctionGet(
 int64_t InvokeCatalogVersion(const CatalogRpcContext &ctx, ClientContext &context);
 
 // Invoke catalog_transaction_begin: begin a new transaction.
-// Returns the transaction_id bytes from the worker (empty if not supported).
+// Returns the transaction_opaque_data bytes from the worker (empty if not supported).
 std::vector<uint8_t> InvokeCatalogTransactionBegin(const CatalogRpcContext &ctx, ClientContext &context);
 
 // Invoke catalog_transaction_commit: commit a transaction.

@@ -147,7 +147,7 @@ optional_ptr<CatalogEntry> VgiSchemaEntry::CreateTable(CatalogTransaction transa
 	// Send DDL RPC
 	auto &attach_params = vgi_catalog.attach_parameters();
 	auto &attach_result = vgi_catalog.attach_result();
-	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_id, vgi_tx.GetTransactionId()};
+	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_opaque_data, vgi_tx.GetTransactionOpaqueData()};
 	vgi::InvokeCatalogTableCreate(rpc_ctx, name, create_info.table, columns_schema, on_conflict,
 	                               not_null_constraints, unique_constraints, check_constraints,
 	                               primary_key_constraints, foreign_key_constraints, context);
@@ -197,7 +197,7 @@ optional_ptr<CatalogEntry> VgiSchemaEntry::CreateView(CatalogTransaction transac
 	// Send DDL RPC
 	auto &attach_params = vgi_catalog.attach_parameters();
 	auto &attach_result = vgi_catalog.attach_result();
-	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_id, vgi_tx.GetTransactionId()};
+	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_opaque_data, vgi_tx.GetTransactionOpaqueData()};
 	vgi::InvokeCatalogViewCreate(rpc_ctx, name, info.view_name, definition, on_conflict, context);
 
 	// Invalidate view cache
@@ -245,7 +245,7 @@ void VgiSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 	auto &attach_params = vgi_catalog.attach_parameters();
 	auto &attach_result = vgi_catalog.attach_result();
 	auto &vgi_tx = VgiTransaction::Get(context, catalog);
-	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_id, vgi_tx.GetTransactionId()};
+	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_opaque_data, vgi_tx.GetTransactionOpaqueData()};
 
 	// Handle COMMENT ON table or view
 	if (info.type == AlterType::SET_COMMENT) {
@@ -448,7 +448,7 @@ void VgiSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
 
 	auto &attach_params = vgi_catalog.attach_parameters();
 	auto &attach_result = vgi_catalog.attach_result();
-	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_id, vgi_tx.GetTransactionId()};
+	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_opaque_data, vgi_tx.GetTransactionOpaqueData()};
 
 	if (info.type == CatalogType::VIEW_ENTRY) {
 		vgi::InvokeCatalogViewDrop(rpc_ctx, name, info.name, ignore_not_found, info.cascade, context);

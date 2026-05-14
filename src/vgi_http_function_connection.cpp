@@ -102,8 +102,8 @@ static std::string ExtractStreamStateValue(const std::shared_ptr<arrow::KeyValue
 
 HttpFunctionConnection::HttpFunctionConnection(
     const std::string &worker_path, const std::string &function_name,
-    const ArrowArguments &arguments, const std::vector<uint8_t> &attach_id,
-    const std::vector<uint8_t> &transaction_id,
+    const ArrowArguments &arguments, const std::vector<uint8_t> &attach_opaque_data,
+    const std::vector<uint8_t> &transaction_opaque_data,
     ClientContext &context, const std::string &function_type,
     const std::vector<uint8_t> &global_execution_id,
     bool worker_debug, const std::map<std::string, Value> &settings,
@@ -111,8 +111,8 @@ HttpFunctionConnection::HttpFunctionConnection(
     const std::shared_ptr<VgiAttachParameters> &attach_params)
     : conn_id_hex_(VgiGenerateConnId()), base_url_(worker_path),
       function_name_(function_name), function_type_(function_type),
-      arguments_type_(arguments.type), arguments_array_(arguments.array), attach_id_(attach_id),
-      transaction_id_(transaction_id), global_execution_id_(global_execution_id), context_(context),
+      arguments_type_(arguments.type), arguments_array_(arguments.array), attach_opaque_data_(attach_opaque_data),
+      transaction_opaque_data_(transaction_opaque_data), global_execution_id_(global_execution_id), context_(context),
       worker_debug_(worker_debug), settings_(settings), required_secrets_(required_secrets),
       attach_params_(attach_params) {
 	// Strip trailing slash from base URL
@@ -132,18 +132,18 @@ std::string HttpFunctionConnection::GetExecutionIdHex() const {
 	return BytesToHex(execution_id_);
 }
 
-std::string HttpFunctionConnection::GetAttachIdHex() const {
-	if (attach_id_.empty()) {
+std::string HttpFunctionConnection::GetAttachOpaqueDataHex() const {
+	if (attach_opaque_data_.empty()) {
 		return "";
 	}
-	return BytesToHex(attach_id_);
+	return BytesToHex(attach_opaque_data_);
 }
 
-std::string HttpFunctionConnection::GetTransactionIdHex() const {
-	if (transaction_id_.empty()) {
+std::string HttpFunctionConnection::GetTransactionOpaqueDataHex() const {
+	if (transaction_opaque_data_.empty()) {
 		return "";
 	}
-	return BytesToHex(transaction_id_);
+	return BytesToHex(transaction_opaque_data_);
 }
 
 // ============================================================================
@@ -268,12 +268,12 @@ void HttpFunctionConnection::BufferDataBatches(const std::string &response_body,
 		auto batch_type = ClassifyBatch(bwm.batch, bwm.custom_metadata);
 		if (batch_type == RpcBatchType::ERROR) {
 			HandleBatchLogMessage(bwm.batch, bwm.custom_metadata, &context_, base_url_,
-			                     -1, GetExecutionIdHex(), GetAttachIdHex(), "", GetConnIdHex());
+			                     -1, GetExecutionIdHex(), GetAttachOpaqueDataHex(), "", GetConnIdHex());
 			throw IOException("VGI HTTP error from server [url: %s]", base_url_);
 		}
 		if (batch_type == RpcBatchType::LOG) {
 			HandleBatchLogMessage(bwm.batch, bwm.custom_metadata, &context_, base_url_,
-			                     -1, GetExecutionIdHex(), GetAttachIdHex(), "", GetConnIdHex());
+			                     -1, GetExecutionIdHex(), GetAttachOpaqueDataHex(), "", GetConnIdHex());
 			++spike_log_batches;
 			continue;
 		}
@@ -283,7 +283,7 @@ void HttpFunctionConnection::BufferDataBatches(const std::string &response_body,
 		if (batch_type == RpcBatchType::EXTERNAL_LOCATION) {
 			auto location_url = bwm.custom_metadata->value(bwm.custom_metadata->FindKey(RPC_LOCATION_KEY));
 			auto resolved = ResolveExternalLocation(context_, location_url,
-			                                         base_url_, GetExecutionIdHex(), GetAttachIdHex(),
+			                                         base_url_, GetExecutionIdHex(), GetAttachOpaqueDataHex(),
 			                                         bwm.custom_metadata);
 			buffered_batches_.push_back(resolved.batch);
 			buffered_batch_indexes_.push_back(ParseVgiBatchIndex(resolved.metadata, base_url_));
@@ -367,8 +367,8 @@ BindResult HttpFunctionConnection::PerformBindRpc() {
 	};
 
 	auto bind_result = PerformBindProtocol(context_, function_name_, function_type_,
-	                                        arguments_array_, input_schema_, attach_id_,
-	                                        transaction_id_, settings_, required_secrets_,
+	                                        arguments_array_, input_schema_, attach_opaque_data_,
+	                                        transaction_opaque_data_, settings_, required_secrets_,
 	                                        base_url_, transport_fn);
 
 	{
@@ -745,12 +745,12 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 		auto batch_type = ClassifyBatch(bwm.batch, bwm.custom_metadata);
 		if (batch_type == RpcBatchType::ERROR) {
 			HandleBatchLogMessage(bwm.batch, bwm.custom_metadata, &context_, base_url_,
-			                     -1, GetExecutionIdHex(), GetAttachIdHex(), "", GetConnIdHex());
+			                     -1, GetExecutionIdHex(), GetAttachOpaqueDataHex(), "", GetConnIdHex());
 			throw IOException("VGI HTTP error from server [url: %s]", base_url_);
 		}
 		if (batch_type == RpcBatchType::LOG) {
 			HandleBatchLogMessage(bwm.batch, bwm.custom_metadata, &context_, base_url_,
-			                     -1, GetExecutionIdHex(), GetAttachIdHex(), "", GetConnIdHex());
+			                     -1, GetExecutionIdHex(), GetAttachOpaqueDataHex(), "", GetConnIdHex());
 			continue;
 		}
 
@@ -759,7 +759,7 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 		if (batch_type == RpcBatchType::EXTERNAL_LOCATION) {
 			auto location_url = bwm.custom_metadata->value(bwm.custom_metadata->FindKey(RPC_LOCATION_KEY));
 			auto resolved = ResolveExternalLocation(context_, location_url,
-			                                         base_url_, GetExecutionIdHex(), GetAttachIdHex(),
+			                                         base_url_, GetExecutionIdHex(), GetAttachOpaqueDataHex(),
 			                                         bwm.custom_metadata);
 			if (!output_batch) {
 				output_batch = resolved.batch;

@@ -1,0 +1,155 @@
+# name: test/sql/integration/table/transaction_storage.test
+# description: TableFunctionGenerator.BindParams.transaction_storage caches values per (transaction_opaque_data, key)
+# group: [vgi_integration_table]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+# ============================================================================
+# Fixture overview
+# ============================================================================
+# ``example.main.tx_cached_value(key, seed)`` is a single-row table function
+# whose bind() phase reads ``params.transaction_storage`` to look up a value
+# keyed by the caller-supplied ``key``. On a cache miss the supplied
+# ``seed`` is stored and emitted; on a cache hit the previously-stored value
+# is emitted instead and ``seed`` is ignored. The resolved value is shipped
+# from bind→init→process via BindResponse.opaque_data so any worker in the
+# pool produces the same answer.
+#
+# Outside a SQL transaction ``params.transaction_storage`` is ``None`` and
+# every call is a fresh seed (no caching is possible).
+#
+# Set up the attached catalog. ExampleCatalog declares
+# supports_transactions=True so the C++ extension populates
+# BindRequest.transaction_opaque_data when SQL is wrapped in BEGIN/COMMIT, which is
+# what makes ``BindParams.transaction_storage`` non-None.
+
+statement ok
+ATTACH 'example' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# Autocommit path: no transaction → every call uses its own seed
+# ============================================================================
+# Each SELECT runs as its own implicit DuckDB transaction, but because
+# different statements get different transaction_opaque_datas the cache is never
+# reused — the seed always wins.
+
+query I
+SELECT v FROM ex.main.tx_cached_value('autocommit_key', 100);
+----
+100
+
+query I
+SELECT v FROM ex.main.tx_cached_value('autocommit_key', 200);
+----
+200
+
+query I
+SELECT v FROM ex.main.tx_cached_value('autocommit_key', 300);
+----
+300
+
+# ============================================================================
+# Explicit transaction: same key, same transaction → cached value wins
+# ============================================================================
+# First call inside BEGIN seeds the cache; subsequent calls within the same
+# transaction see the cached value and ignore their own seed argument.
+
+statement ok
+BEGIN;
+
+query I
+SELECT v FROM ex.main.tx_cached_value('cached', 111);
+----
+111
+
+# Seed is 222 but transaction_storage already has 111 for this key.
+query I
+SELECT v FROM ex.main.tx_cached_value('cached', 222);
+----
+111
+
+# Seed is 333; still 111.
+query I
+SELECT v FROM ex.main.tx_cached_value('cached', 333);
+----
+111
+
+# A different key in the same transaction starts fresh.
+query I
+SELECT v FROM ex.main.tx_cached_value('other_key', 999);
+----
+999
+
+# And caches independently.
+query I
+SELECT v FROM ex.main.tx_cached_value('other_key', 1);
+----
+999
+
+# Both keys round-trip in a single multi-row query (cardinality 2).
+query I
+SELECT v FROM ex.main.tx_cached_value('cached', 444)
+UNION ALL
+SELECT v FROM ex.main.tx_cached_value('other_key', 555)
+ORDER BY v;
+----
+111
+999
+
+statement ok
+COMMIT;
+
+# ============================================================================
+# After commit: cache is gone, a new transaction starts fresh
+# ============================================================================
+# catalog_transaction_commit clears transaction_state for the committed
+# transaction_opaque_data. The next BEGIN gets a new id whose storage is empty.
+
+statement ok
+BEGIN;
+
+# Same key as before but new transaction → seed wins again.
+query I
+SELECT v FROM ex.main.tx_cached_value('cached', 777);
+----
+777
+
+query I
+SELECT v FROM ex.main.tx_cached_value('cached', 888);
+----
+777
+
+statement ok
+COMMIT;
+
+# ============================================================================
+# Rollback also resets the cache
+# ============================================================================
+
+statement ok
+BEGIN;
+
+query I
+SELECT v FROM ex.main.tx_cached_value('rollback_key', 42);
+----
+42
+
+statement ok
+ROLLBACK;
+
+statement ok
+BEGIN;
+
+# New transaction after rollback — cache empty again.
+query I
+SELECT v FROM ex.main.tx_cached_value('rollback_key', 7);
+----
+7
+
+statement ok
+COMMIT;
+
+statement ok
+DETACH ex;

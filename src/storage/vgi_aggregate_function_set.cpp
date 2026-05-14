@@ -39,7 +39,7 @@ void VgiAggregateFunctionSet::LoadEntries(ClientContext &context, const std::loc
 	}
 
 	auto &vgi_tx_load = VgiTransaction::Get(context, catalog_);
-	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_id, vgi_tx_load.GetTransactionId()};
+	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_opaque_data, vgi_tx_load.GetTransactionOpaqueData()};
 	rpc_ctx.entity_kind = "schema";
 	rpc_ctx.entity_qualifier = schema_.name;
 
@@ -154,7 +154,7 @@ void VgiAggregateFunctionSet::LoadEntries(ClientContext &context, const std::loc
 			// Create and attach VgiAggregateFunctionInfo
 			auto agg_func_info = make_shared_ptr<vgi::VgiAggregateFunctionInfo>();
 			agg_func_info->attach_params = attach_params;
-			agg_func_info->attach_id = attach_result->attach_id;
+			agg_func_info->attach_opaque_data = attach_result->attach_opaque_data;
 			agg_func_info->catalog = &catalog_;
 			agg_func_info->function_name = func_info.name;
 			agg_func_info->output_schema = func_info.output_schema;

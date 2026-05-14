@@ -30,7 +30,7 @@ struct VgiScalarFunctionInfo : public ScalarFunctionInfo {
 
 	// Worker connection parameters
 	std::shared_ptr<vgi::VgiAttachParameters> attach_params;  // replaces worker_path, worker_debug, use_pool
-	std::vector<uint8_t> attach_id;
+	std::vector<uint8_t> attach_opaque_data;
 	optional_ptr<Catalog> catalog;
 	std::string function_name;
 	std::map<std::string, Value> settings;
@@ -65,7 +65,7 @@ struct VgiScalarFunctionBindData : public FunctionData {
 
 	// Copy of function info for execution
 	std::shared_ptr<vgi::VgiAttachParameters> attach_params;  // replaces worker_path, worker_debug, use_pool
-	std::vector<uint8_t> attach_id;
+	std::vector<uint8_t> attach_opaque_data;
 	std::string function_name;
 	std::map<std::string, Value> settings;
 	std::vector<vgi::VgiSecretRequirement> required_secrets;
@@ -97,7 +97,7 @@ struct VgiScalarFunctionBindData : public FunctionData {
 	unique_ptr<FunctionData> Copy() const override {
 		auto copy = make_uniq<VgiScalarFunctionBindData>();
 		copy->attach_params = attach_params;
-		copy->attach_id = attach_id;
+		copy->attach_opaque_data = attach_opaque_data;
 		copy->function_name = function_name;
 		copy->settings = settings;
 		copy->required_secrets = required_secrets;
@@ -108,12 +108,12 @@ struct VgiScalarFunctionBindData : public FunctionData {
 		return copy;
 	}
 
-	// Intentionally compares only identity fields (worker_path, attach_id, function_name, etc.)
+	// Intentionally compares only identity fields (worker_path, attach_opaque_data, function_name, etc.)
 	// for DuckDB plan cache matching. Derived fields like schemas and constants are excluded
 	// because they are deterministic given the identity fields and argument types.
 	bool Equals(const FunctionData &other_p) const override {
 		auto &other = other_p.Cast<VgiScalarFunctionBindData>();
-		return worker_path() == other.worker_path() && attach_id == other.attach_id &&
+		return worker_path() == other.worker_path() && attach_opaque_data == other.attach_opaque_data &&
 		       function_name == other.function_name && worker_debug() == other.worker_debug() &&
 		       use_pool() == other.use_pool();
 	}

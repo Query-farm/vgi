@@ -27,9 +27,9 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
 # ----------------------------------------------------------------------------
 # CREATE SCHEMA — pins catalog_schema_create. Earlier the C++ builder sent
-# 5 fields (attach_id, name, on_conflict, comment, transaction_id) while the
+# 5 fields (attach_opaque_data, name, on_conflict, comment, transaction_opaque_data) while the
 # generated schema declared 6 (with a nullable ``tags: map<string, string>``
-# between comment and transaction_id), so any worker that uses the generated
+# between comment and transaction_opaque_data), so any worker that uses the generated
 # schemas for validation rejected every CREATE SCHEMA attempt with a wire
 # contract error before the read-only error could fire.
 # ----------------------------------------------------------------------------

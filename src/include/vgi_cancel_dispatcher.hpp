@@ -47,7 +47,7 @@ struct StreamingCloseRequest {
 	std::shared_ptr<VgiAttachParameters> attach_params;
 	std::string function_name;
 	std::vector<uint8_t> execution_id;
-	std::vector<uint8_t> attach_id;
+	std::vector<uint8_t> attach_opaque_data;
 };
 
 // Process-wide (per-DatabaseInstance) background thread that drains

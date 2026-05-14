@@ -85,7 +85,7 @@ optional_ptr<CatalogEntry> VgiIndexSet::GetEntry(ClientContext &context, const s
 	}
 
 	auto &vgi_tx = VgiTransaction::Get(context, catalog_);
-	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_id, vgi_tx.GetTransactionId()};
+	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_opaque_data, vgi_tx.GetTransactionOpaqueData()};
 
 	auto index_info_opt = vgi::InvokeCatalogIndexGet(rpc_ctx, schema_.name, name, context);
 
@@ -112,7 +112,7 @@ void VgiIndexSet::LoadEntries(ClientContext &context, const std::lock_guard<std:
 
 	// Call catalog_schema_contents_indexes via RPC
 	auto &vgi_tx_load = VgiTransaction::Get(context, catalog_);
-	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_id, vgi_tx_load.GetTransactionId()};
+	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_opaque_data, vgi_tx_load.GetTransactionOpaqueData()};
 	auto indexes = vgi::InvokeCatalogSchemaContentsIndexes(rpc_ctx, schema_.name, context);
 
 	for (auto &index_info : indexes) {

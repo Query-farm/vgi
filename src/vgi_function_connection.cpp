@@ -53,7 +53,7 @@ namespace {
 std::unique_ptr<IFunctionConnection> CreateFreshConnection(ClientContext &context,
                                                             const FunctionConnectionParams &params) {
 	return CreateFunctionConnection(params.worker_path(), params.function_name, params.arguments,
-	                                params.attach_id, params.transaction_id, context,
+	                                params.attach_opaque_data, params.transaction_opaque_data, context,
 	                                params.function_type, params.global_execution_id,
 	                                params.worker_debug(), params.settings, params.required_secrets,
 	                                params.attach_params);
@@ -80,7 +80,7 @@ std::unique_ptr<IFunctionConnection> AcquireConnection(ClientContext &context,
 		auto pooled = VgiWorkerPool::Instance().TryAcquire(pool_key);
 		if (pooled) {
 			conn = CreateFunctionConnectionFromPool(std::move(pooled), params.function_name, params.arguments,
-			                                        params.attach_id, params.transaction_id, context,
+			                                        params.attach_opaque_data, params.transaction_opaque_data, context,
 			                                        params.function_type, params.global_execution_id,
 			                                        params.worker_debug(), params.settings,
 			                                        params.required_secrets);
@@ -180,8 +180,8 @@ AcquireForInitResult AcquireConnectionForInit(ClientContext &context, const Func
 // ============================================================================
 
 FunctionConnection::FunctionConnection(const std::string &worker_path, const std::string &function_name,
-                                       const ArrowArguments &arguments, const std::vector<uint8_t> &attach_id,
-                                       const std::vector<uint8_t> &transaction_id,
+                                       const ArrowArguments &arguments, const std::vector<uint8_t> &attach_opaque_data,
+                                       const std::vector<uint8_t> &transaction_opaque_data,
                                        ClientContext &context, const std::string &function_type,
                                        const std::vector<uint8_t> &global_execution_id,
                                        bool worker_debug, const std::map<std::string, Value> &settings,
@@ -190,14 +190,14 @@ FunctionConnection::FunctionConnection(const std::string &worker_path, const std
                                        const std::string &implementation_version)
     : conn_id_hex_(VgiGenerateConnId()), worker_path_(worker_path), data_version_spec_(data_version_spec),
       implementation_version_(implementation_version), function_name_(function_name), function_type_(function_type),
-      arguments_type_(arguments.type), arguments_array_(arguments.array), attach_id_(attach_id),
-      transaction_id_(transaction_id), global_execution_id_(global_execution_id), context_(context),
+      arguments_type_(arguments.type), arguments_array_(arguments.array), attach_opaque_data_(attach_opaque_data),
+      transaction_opaque_data_(transaction_opaque_data), global_execution_id_(global_execution_id), context_(context),
       worker_debug_(worker_debug), settings_(settings), required_secrets_(required_secrets) {
 }
 
 FunctionConnection::FunctionConnection(std::unique_ptr<PooledWorker> pooled_worker, const std::string &function_name,
-                                       const ArrowArguments &arguments, const std::vector<uint8_t> &attach_id,
-                                       const std::vector<uint8_t> &transaction_id,
+                                       const ArrowArguments &arguments, const std::vector<uint8_t> &attach_opaque_data,
+                                       const std::vector<uint8_t> &transaction_opaque_data,
                                        ClientContext &context, const std::string &function_type,
                                        const std::vector<uint8_t> &global_execution_id,
                                        bool worker_debug, const std::map<std::string, Value> &settings,
@@ -207,8 +207,8 @@ FunctionConnection::FunctionConnection(std::unique_ptr<PooledWorker> pooled_work
       data_version_spec_(pooled_worker->GetKey().data_version_spec),
       implementation_version_(pooled_worker->GetKey().implementation_version),
       function_name_(function_name), function_type_(function_type),
-      arguments_type_(arguments.type), arguments_array_(arguments.array), attach_id_(attach_id),
-      transaction_id_(transaction_id), global_execution_id_(global_execution_id), context_(context),
+      arguments_type_(arguments.type), arguments_array_(arguments.array), attach_opaque_data_(attach_opaque_data),
+      transaction_opaque_data_(transaction_opaque_data), global_execution_id_(global_execution_id), context_(context),
       worker_debug_(worker_debug), settings_(settings), required_secrets_(required_secrets),
       proc_(pooled_worker->Release()) {
 	// Adopt the drainer that was kept running while the worker was idle
@@ -222,15 +222,15 @@ FunctionConnection::FunctionConnection(std::unique_ptr<PooledWorker> pooled_work
 
 FunctionConnection::FunctionConnection(std::unique_ptr<SubProcess> proc, const std::string &worker_path,
                                        const std::string &function_name, const ArrowArguments &arguments,
-                                       const std::vector<uint8_t> &attach_id,
-                                       const std::vector<uint8_t> &transaction_id,
+                                       const std::vector<uint8_t> &attach_opaque_data,
+                                       const std::vector<uint8_t> &transaction_opaque_data,
                                        ClientContext &context, const std::string &function_type,
                                        const std::vector<uint8_t> &global_execution_id, bool worker_debug,
                                        const std::map<std::string, Value> &settings,
                                        const std::vector<VgiSecretRequirement> &required_secrets)
     : conn_id_hex_(VgiGenerateConnId()), worker_path_(worker_path), function_name_(function_name),
       function_type_(function_type), arguments_type_(arguments.type), arguments_array_(arguments.array),
-      attach_id_(attach_id), transaction_id_(transaction_id), global_execution_id_(global_execution_id),
+      attach_opaque_data_(attach_opaque_data), transaction_opaque_data_(transaction_opaque_data), global_execution_id_(global_execution_id),
       context_(context), worker_debug_(worker_debug), settings_(settings),
       required_secrets_(required_secrets), proc_(std::move(proc)) {
 	// AF_UNIX-backed workers (UnixSocketWorker) report stderr_fd_ == -1, so
@@ -313,8 +313,8 @@ BindResult FunctionConnection::PerformBindRpc() {
 	};
 
 	auto bind_result = PerformBindProtocol(context_, function_name_, function_type_,
-	                                        arguments_array_, input_schema_, attach_id_,
-	                                        transaction_id_, settings_, required_secrets_,
+	                                        arguments_array_, input_schema_, attach_opaque_data_,
+	                                        transaction_opaque_data_, settings_, required_secrets_,
 	                                        worker_path_, transport_fn);
 
 	DrainStderrLog();
@@ -741,7 +741,7 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 
 		// Check for log/error batches via HandleBatchLogMessage
 		if (HandleBatchLogMessage(result.batch, result.custom_metadata, &context_, worker_path_, proc_->GetPid(),
-		                          GetExecutionIdHex(), GetAttachIdHex(), "", GetConnIdHex())) {
+		                          GetExecutionIdHex(), GetAttachOpaqueDataHex(), "", GetConnIdHex())) {
 			continue;  // Skip log batch, read next
 		}
 
@@ -841,18 +841,18 @@ std::string FunctionConnection::GetExecutionIdHex() const {
 	return BytesToHex(execution_id_);
 }
 
-std::string FunctionConnection::GetAttachIdHex() const {
-	if (attach_id_.empty()) {
+std::string FunctionConnection::GetAttachOpaqueDataHex() const {
+	if (attach_opaque_data_.empty()) {
 		return "";
 	}
-	return BytesToHex(attach_id_);
+	return BytesToHex(attach_opaque_data_);
 }
 
-std::string FunctionConnection::GetTransactionIdHex() const {
-	if (transaction_id_.empty()) {
+std::string FunctionConnection::GetTransactionOpaqueDataHex() const {
+	if (transaction_opaque_data_.empty()) {
 		return "";
 	}
-	return BytesToHex(transaction_id_);
+	return BytesToHex(transaction_opaque_data_);
 }
 
 void FunctionConnection::SetInputSchema(const std::shared_ptr<arrow::Schema> &input_schema) {
@@ -1109,8 +1109,8 @@ void FunctionConnection::DrainStderrLog() {
 
 std::unique_ptr<IFunctionConnection> CreateFunctionConnection(
     const std::string &worker_path, const std::string &function_name,
-    const ArrowArguments &arguments, const std::vector<uint8_t> &attach_id,
-    const std::vector<uint8_t> &transaction_id,
+    const ArrowArguments &arguments, const std::vector<uint8_t> &attach_opaque_data,
+    const std::vector<uint8_t> &transaction_opaque_data,
     ClientContext &context, const std::string &function_type,
     const std::vector<uint8_t> &global_execution_id,
     bool worker_debug,
@@ -1119,7 +1119,7 @@ std::unique_ptr<IFunctionConnection> CreateFunctionConnection(
     const std::shared_ptr<VgiAttachParameters> &attach_params) {
 	if (IsHttpTransport(worker_path)) {
 		return std::make_unique<HttpFunctionConnection>(
-		    worker_path, function_name, arguments, attach_id, transaction_id, context,
+		    worker_path, function_name, arguments, attach_opaque_data, transaction_opaque_data, context,
 		    function_type, global_execution_id, worker_debug, settings, required_secrets,
 		    attach_params);
 	}
@@ -1157,7 +1157,7 @@ std::unique_ptr<IFunctionConnection> CreateFunctionConnection(
 		auto sock = ResolveAndConnect(worker_path, std::chrono::seconds(10), overrides);
 		auto worker = std::make_unique<UnixSocketWorker>(sock.Release());
 		return std::make_unique<FunctionConnection>(
-		    std::move(worker), worker_path, function_name, arguments, attach_id, transaction_id,
+		    std::move(worker), worker_path, function_name, arguments, attach_opaque_data, transaction_opaque_data,
 		    context, function_type, global_execution_id, worker_debug, settings, required_secrets);
 #endif
 	}
@@ -1170,15 +1170,15 @@ std::unique_ptr<IFunctionConnection> CreateFunctionConnection(
 		implementation_version = attach_params->implementation_version();
 	}
 	return std::make_unique<FunctionConnection>(
-	    worker_path, function_name, arguments, attach_id, transaction_id, context,
+	    worker_path, function_name, arguments, attach_opaque_data, transaction_opaque_data, context,
 	    function_type, global_execution_id, worker_debug, settings, required_secrets,
 	    data_version_spec, implementation_version);
 }
 
 std::unique_ptr<IFunctionConnection> CreateFunctionConnectionFromPool(
     std::unique_ptr<PooledWorker> pooled_worker, const std::string &function_name,
-    const ArrowArguments &arguments, const std::vector<uint8_t> &attach_id,
-    const std::vector<uint8_t> &transaction_id,
+    const ArrowArguments &arguments, const std::vector<uint8_t> &attach_opaque_data,
+    const std::vector<uint8_t> &transaction_opaque_data,
     ClientContext &context, const std::string &function_type,
     const std::vector<uint8_t> &global_execution_id,
     bool worker_debug,
@@ -1186,7 +1186,7 @@ std::unique_ptr<IFunctionConnection> CreateFunctionConnectionFromPool(
     const std::vector<VgiSecretRequirement> &required_secrets) {
 	// Only subprocess connections use the pool
 	return std::make_unique<FunctionConnection>(
-	    std::move(pooled_worker), function_name, arguments, attach_id, transaction_id, context,
+	    std::move(pooled_worker), function_name, arguments, attach_opaque_data, transaction_opaque_data, context,
 	    function_type, global_execution_id, worker_debug, settings, required_secrets);
 }
 

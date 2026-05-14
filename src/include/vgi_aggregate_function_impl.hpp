@@ -45,7 +45,7 @@ struct VgiAggregateState {
 
 struct VgiAggregateFunctionInfo : public AggregateFunctionInfo {
 	std::shared_ptr<VgiAttachParameters> attach_params;
-	std::vector<uint8_t> attach_id;
+	std::vector<uint8_t> attach_opaque_data;
 	optional_ptr<Catalog> catalog;
 	std::string function_name;
 	std::map<std::string, Value> settings;
@@ -85,7 +85,7 @@ struct VgiAggregateFunctionInfo : public AggregateFunctionInfo {
 struct VgiAggregateBindData : public FunctionData {
 	// Identity fields
 	std::shared_ptr<VgiAttachParameters> attach_params;
-	std::vector<uint8_t> attach_id;
+	std::vector<uint8_t> attach_opaque_data;
 	std::string function_name;
 	std::map<std::string, Value> settings;
 	std::vector<VgiSecretRequirement> required_secrets;

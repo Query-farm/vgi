@@ -154,8 +154,8 @@ void VgiTableEntry::FetchColumnStatistics(ClientContext &context) const {
 		}
 
 		auto &vgi_tx = VgiTransaction::Get(context, catalog_);
-		vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result_data->attach_id,
-		                                vgi_tx.GetTransactionId()};
+		vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result_data->attach_opaque_data,
+		                                vgi_tx.GetTransactionOpaqueData()};
 		rpc_ctx.entity_kind = "table";
 		rpc_ctx.entity_qualifier = ParentSchema().name + "." + name;
 
@@ -303,7 +303,7 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 		        {{"schema", ParentSchema().name}, {"table", name}, {"function", scan_result.function_name}});
 	} else {
 		auto &vgi_tx_scan = VgiTransaction::Get(context, catalog_);
-		vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_id, vgi_tx_scan.GetTransactionId()};
+		vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_opaque_data, vgi_tx_scan.GetTransactionOpaqueData()};
 		rpc_ctx.entity_kind = "table";
 		rpc_ctx.entity_qualifier = ParentSchema().name + "." + name;
 		scan_result = vgi::InvokeCatalogTableScanFunctionGet(rpc_ctx, ParentSchema().name, name, context,
@@ -371,9 +371,9 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 	// Build shared bind data
 	auto scan_bind_data = make_uniq<vgi::VgiTableFunctionBindData>();
 	scan_bind_data->attach_params = attach_params;
-	scan_bind_data->attach_id = attach_result->attach_id;
+	scan_bind_data->attach_opaque_data = attach_result->attach_opaque_data;
 	auto &vgi_tx = VgiTransaction::Get(context, catalog_);
-	scan_bind_data->transaction_id = vgi_tx.GetTransactionId();
+	scan_bind_data->transaction_opaque_data = vgi_tx.GetTransactionOpaqueData();
 	scan_bind_data->function_name = scan_result.function_name;
 	scan_bind_data->arguments = vgi::BuildArgumentsFromValues(context, scan_result.positional_arguments, named_args_vec);
 	scan_bind_data->projection_pushdown = has_projection_pushdown;

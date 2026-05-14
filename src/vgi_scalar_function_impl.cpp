@@ -226,8 +226,8 @@ unique_ptr<FunctionData> VgiScalarFunctionBind(ClientContext &context, ScalarFun
 		output_schema = func_info.output_schema;
 	} else {
 		// Initial bind - call worker to get output schema
-		auto transaction_id = func_info.catalog
-		    ? VgiTransaction::Get(context, *func_info.catalog).GetTransactionId()
+		auto transaction_opaque_data = func_info.catalog
+		    ? VgiTransaction::Get(context, *func_info.catalog).GetTransactionOpaqueData()
 		    : std::vector<uint8_t>{};
 		std::unique_ptr<IFunctionConnection> connection;
 		if (func_info.use_pool() && !IsHttpTransport(func_info.worker_path())) {
@@ -236,16 +236,16 @@ unique_ptr<FunctionData> VgiScalarFunctionBind(ClientContext &context, ScalarFun
 			auto pooled = VgiWorkerPool::Instance().TryAcquire(bind_pool_key);
 			if (pooled) {
 				connection = CreateFunctionConnectionFromPool(
-				    std::move(pooled), func_info.function_name, arrow_arguments, func_info.attach_id,
-				    transaction_id, context,
+				    std::move(pooled), func_info.function_name, arrow_arguments, func_info.attach_opaque_data,
+				    transaction_opaque_data, context,
 				    "SCALAR", std::vector<uint8_t>{}, func_info.worker_debug(), settings,
 				    func_info.required_secrets);
 			}
 		}
 		if (!connection) {
 			connection = CreateFunctionConnection(
-			    func_info.worker_path(), func_info.function_name, arrow_arguments, func_info.attach_id,
-			    transaction_id, context,
+			    func_info.worker_path(), func_info.function_name, arrow_arguments, func_info.attach_opaque_data,
+			    transaction_opaque_data, context,
 			    "SCALAR", std::vector<uint8_t>{}, func_info.worker_debug(), settings,
 			    func_info.required_secrets, func_info.attach_params);
 		}
@@ -303,7 +303,7 @@ unique_ptr<FunctionData> VgiScalarFunctionBind(ClientContext &context, ScalarFun
 	// ========================================================================
 	auto bind_data = make_uniq<VgiScalarFunctionBindData>();
 	bind_data->attach_params = func_info.attach_params;
-	bind_data->attach_id = func_info.attach_id;
+	bind_data->attach_opaque_data = func_info.attach_opaque_data;
 	bind_data->function_name = func_info.function_name;
 	bind_data->settings = settings;
 	bind_data->required_secrets = func_info.required_secrets;
@@ -375,7 +375,7 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 		std::unique_ptr<IFunctionConnection> connection;
 		bool use_pool = bind_data ? bind_data->use_pool() : func_info.use_pool();
 		const auto &worker_path = bind_data ? bind_data->worker_path() : func_info.worker_path();
-		const auto &attach_id = bind_data ? bind_data->attach_id : func_info.attach_id;
+		const auto &attach_opaque_data = bind_data ? bind_data->attach_opaque_data : func_info.attach_opaque_data;
 		const auto &function_name = bind_data ? bind_data->function_name : func_info.function_name;
 		bool worker_debug = bind_data ? bind_data->worker_debug() : func_info.worker_debug();
 		// Extract settings: from bind_data if available, otherwise extract fresh from context
@@ -383,8 +383,8 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 		const auto &required_secrets = bind_data ? bind_data->required_secrets : func_info.required_secrets;
 		const auto &attach_params = bind_data ? bind_data->attach_params : func_info.attach_params;
 
-		auto transaction_id = func_info.catalog
-		    ? VgiTransaction::Get(context, *func_info.catalog).GetTransactionId()
+		auto transaction_opaque_data = func_info.catalog
+		    ? VgiTransaction::Get(context, *func_info.catalog).GetTransactionOpaqueData()
 		    : std::vector<uint8_t>{};
 		if (use_pool && !IsHttpTransport(worker_path)) {
 			PoolKey exec_pool_key {worker_path, attach_params ? attach_params->data_version_spec() : std::string(),
@@ -394,8 +394,8 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 				VGI_STDERR_DEBUG("[VGI] scalar.pool_acquire result=hit worker_path=%s pid=%d\n",
 				                 worker_path.c_str(), pooled->GetPid());
 				connection = CreateFunctionConnectionFromPool(
-				    std::move(pooled), function_name, arguments, attach_id,
-				    transaction_id, context,
+				    std::move(pooled), function_name, arguments, attach_opaque_data,
+				    transaction_opaque_data, context,
 				    "SCALAR", std::vector<uint8_t>{}, worker_debug, settings,
 				    required_secrets);
 			} else {
@@ -404,8 +404,8 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 		}
 		if (!connection) {
 			connection = CreateFunctionConnection(
-			    worker_path, function_name, arguments, attach_id,
-			    transaction_id, context,
+			    worker_path, function_name, arguments, attach_opaque_data,
+			    transaction_opaque_data, context,
 			    "SCALAR", std::vector<uint8_t>{}, worker_debug, settings,
 			    required_secrets, attach_params);
 			VGI_STDERR_DEBUG("[VGI] scalar.new_connection worker_path=%s pid=%d\n",

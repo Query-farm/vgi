@@ -137,7 +137,7 @@ struct VgiStreamingWindowOperatorState : public OperatorState {
 			req.attach_params = attach_params_per_expr[i];
 			req.function_name = std::move(sessions[i].function_name);
 			req.execution_id = std::move(sessions[i].execution_id);
-			req.attach_id = std::move(sessions[i].attach_id);
+			req.attach_opaque_data = std::move(sessions[i].attach_opaque_data);
 			// Saturation / shutdown returns false; nothing actionable here.
 			(void)dispatcher->EnqueueStreamingClose(std::move(req));
 		}

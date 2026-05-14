@@ -1,5 +1,5 @@
 # name: test/sql/integration/attach/attach_options_echo.test
-# description: ATTACH-time options of all supported types round-trip to the worker via attach_id
+# description: ATTACH-time options of all supported types round-trip to the worker via attach_opaque_data
 # group: [vgi_integration_attach]
 
 require-env VGI_ATTACH_OPTIONS_WORKER

@@ -34,7 +34,7 @@ void VgiTableSet::LoadEntries(ClientContext &context,
 	// Call catalog_schema_contents_tables via RPC — entry_lock_ is NOT held
 	// here. load_lock_ (held by caller) serializes concurrent loaders.
 	auto &vgi_tx_load = VgiTransaction::Get(context, catalog_);
-	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_id, vgi_tx_load.GetTransactionId()};
+	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_opaque_data, vgi_tx_load.GetTransactionOpaqueData()};
 	rpc_ctx.entity_kind = "schema";
 	rpc_ctx.entity_qualifier = schema_.name;
 	auto tables = vgi::InvokeCatalogSchemaContentsTables(rpc_ctx, schema_.name, context);
@@ -106,7 +106,7 @@ optional_ptr<CatalogEntry> VgiTableSet::GetEntry(ClientContext &context, const s
 		auto &attach_result = vgi_catalog.attach_result();
 		if (attach_params && attach_result) {
 			auto &vgi_tx = VgiTransaction::Get(context, catalog_);
-			vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_id, vgi_tx.GetTransactionId()};
+			vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_opaque_data, vgi_tx.GetTransactionOpaqueData()};
 			rpc_ctx.entity_kind = "schema";
 			rpc_ctx.entity_qualifier = schema_.name;
 			auto tables = vgi::InvokeCatalogSchemaContentsTables(rpc_ctx, schema_.name, context);
@@ -169,7 +169,7 @@ optional_ptr<CatalogEntry> VgiTableSet::GetEntry(ClientContext &context, const s
 	}
 
 	auto &vgi_tx = VgiTransaction::Get(context, catalog_);
-	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_id, vgi_tx.GetTransactionId()};
+	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_opaque_data, vgi_tx.GetTransactionOpaqueData()};
 	rpc_ctx.entity_kind = "table";
 	rpc_ctx.entity_qualifier = qualifier;
 	auto table_info_opt = vgi::InvokeCatalogTableGet(rpc_ctx, schema_.name, name, context);
@@ -255,7 +255,7 @@ optional_ptr<CatalogEntry> VgiTableSet::GetEntry(ClientContext &context, const E
 	// Call catalog_table_get with AT params via RPC
 	auto rpc_start = std::chrono::steady_clock::now();
 	auto &vgi_tx_at = VgiTransaction::Get(context, catalog_);
-	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_id, vgi_tx_at.GetTransactionId()};
+	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_opaque_data, vgi_tx_at.GetTransactionOpaqueData()};
 	rpc_ctx.entity_kind = "table";
 	rpc_ctx.entity_qualifier = schema_.name + "." + entry_name;
 	auto table_info_opt = vgi::InvokeCatalogTableGet(rpc_ctx, schema_.name, entry_name, context,

@@ -14,8 +14,8 @@ std::vector<uint8_t> BuildBindRequestBytes(
     const std::string &function_type,
     const std::shared_ptr<arrow::Array> &arguments_array,
     const std::shared_ptr<arrow::Schema> &input_schema,
-    const std::vector<uint8_t> &attach_id,
-    const std::vector<uint8_t> &transaction_id,
+    const std::vector<uint8_t> &attach_opaque_data,
+    const std::vector<uint8_t> &transaction_opaque_data,
     const std::map<std::string, Value> &settings,
     const std::map<std::string, std::map<std::string, Value>> &resolved_secrets,
     bool resolved_secrets_provided,
@@ -59,7 +59,7 @@ std::vector<uint8_t> BuildBindRequestBytes(
 	// 5. Build BindRequest and serialize.
 	auto bind_request = BuildBindRequest(function_name, arguments_bytes, function_type,
 	                                     input_schema_bytes, settings_bytes, secrets_bytes,
-	                                     attach_id, transaction_id, resolved_secrets_provided);
+	                                     attach_opaque_data, transaction_opaque_data, resolved_secrets_provided);
 	return SerializeToIpcBytes(bind_request);
 }
 
@@ -105,8 +105,8 @@ BindResult PerformBindProtocol(
     const std::string &function_type,
     const std::shared_ptr<arrow::Array> &arguments_array,
     const std::shared_ptr<arrow::Schema> &input_schema,
-    const std::vector<uint8_t> &attach_id,
-    const std::vector<uint8_t> &transaction_id,
+    const std::vector<uint8_t> &attach_opaque_data,
+    const std::vector<uint8_t> &transaction_opaque_data,
     const std::map<std::string, Value> &settings,
     const std::vector<VgiSecretRequirement> &required_secrets,
     const std::string &worker_label,
@@ -119,7 +119,7 @@ BindResult PerformBindProtocol(
 	// First-attempt request bytes (resolved_secrets_provided=false).
 	auto bind_request_bytes = BuildBindRequestBytes(
 	    context, function_name, function_type, arguments_array, input_schema,
-	    attach_id, transaction_id, settings, secrets,
+	    attach_opaque_data, transaction_opaque_data, settings, secrets,
 	    /*resolved_secrets_provided=*/false, worker_label);
 
 	// Send first bind and read response.
@@ -145,7 +145,7 @@ BindResult PerformBindProtocol(
 
 		bind_request_bytes = BuildBindRequestBytes(
 		    context, function_name, function_type, arguments_array, input_schema,
-		    attach_id, transaction_id, settings, secrets,
+		    attach_opaque_data, transaction_opaque_data, settings, secrets,
 		    /*resolved_secrets_provided=*/true, worker_label);
 
 		bind_response_batch = transport_fn(bind_request_bytes);

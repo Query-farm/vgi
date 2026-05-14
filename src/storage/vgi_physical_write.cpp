@@ -119,7 +119,7 @@ static SetupWriteResult SetupWriteConnection(ClientContext &context, VgiTableEnt
                                               const VgiWriteFunctionResult &write_func,
                                               const std::shared_ptr<arrow::Schema> &input_schema,
                                               const std::shared_ptr<arrow::RecordBatch> &write_options,
-                                              const std::vector<uint8_t> &transaction_id) {
+                                              const std::vector<uint8_t> &transaction_opaque_data) {
 	auto &catalog = table.GetCatalog().Cast<VgiCatalog>();
 	auto &params = catalog.attach_parameters();
 	auto &attach_result = catalog.attach_result();
@@ -143,13 +143,13 @@ static SetupWriteResult SetupWriteConnection(ClientContext &context, VgiTableEnt
 		auto pooled = VgiWorkerPool::Instance().TryAcquire(pool_key);
 		if (pooled) {
 			connection = CreateFunctionConnectionFromPool(std::move(pooled), write_func.function_name, arguments,
-			                                              attach_result->attach_id, transaction_id, context,
+			                                              attach_result->attach_opaque_data, transaction_opaque_data, context,
 			                                              "TABLE", {}, params->worker_debug());
 		}
 	}
 	if (!connection) {
 		connection = CreateFunctionConnection(params->worker_path(), write_func.function_name, arguments,
-		                                      attach_result->attach_id, transaction_id, context, "TABLE", {},
+		                                      attach_result->attach_opaque_data, transaction_opaque_data, context, "TABLE", {},
 		                                      params->worker_debug(), {}, {}, params);
 	}
 
@@ -350,7 +350,7 @@ unique_ptr<GlobalSinkState> VgiPhysicalInsert::GetGlobalSinkState(ClientContext 
 	auto &attach_result = catalog.attach_result();
 
 	auto &vgi_tx = VgiTransaction::Get(context, table->GetCatalog());
-	CatalogRpcContext rpc_ctx{params, attach_result->attach_id, vgi_tx.GetTransactionId()};
+	CatalogRpcContext rpc_ctx{params, attach_result->attach_opaque_data, vgi_tx.GetTransactionOpaqueData()};
 	auto write_func = ResolveWriteFunction(
 	    context, *table, "insert", table->GetTableInfo().insert_function,
 	    [&]() {
@@ -387,7 +387,7 @@ unique_ptr<GlobalSinkState> VgiPhysicalInsert::GetGlobalSinkState(ClientContext 
 	                             write_func.function_name);
 	{
 		auto setup = SetupWriteConnection(context, *table, write_func, input_schema, write_options,
-		                                   vgi_tx.GetTransactionId());
+		                                   vgi_tx.GetTransactionOpaqueData());
 		gstate->connection = std::move(setup.connection);
 		gstate->bind_result = std::move(setup.bind_result);
 	}
@@ -509,7 +509,7 @@ unique_ptr<GlobalSinkState> VgiPhysicalDelete::GetGlobalSinkState(ClientContext 
 	auto &attach_result = catalog.attach_result();
 
 	auto &vgi_tx = VgiTransaction::Get(context, table.GetCatalog());
-	CatalogRpcContext rpc_ctx{params, attach_result->attach_id, vgi_tx.GetTransactionId()};
+	CatalogRpcContext rpc_ctx{params, attach_result->attach_opaque_data, vgi_tx.GetTransactionOpaqueData()};
 	auto write_func = ResolveWriteFunction(
 	    context, table, "delete", table.GetTableInfo().delete_function,
 	    [&]() {
@@ -541,7 +541,7 @@ unique_ptr<GlobalSinkState> VgiPhysicalDelete::GetGlobalSinkState(ClientContext 
 	                                                 write_func.function_name);
 	{
 		auto setup = SetupWriteConnection(context, table, write_func, input_schema, write_options,
-		                                   vgi_tx.GetTransactionId());
+		                                   vgi_tx.GetTransactionOpaqueData());
 		gstate->connection = std::move(setup.connection);
 		gstate->bind_result = std::move(setup.bind_result);
 	}
@@ -647,7 +647,7 @@ unique_ptr<GlobalSinkState> VgiPhysicalUpdate::GetGlobalSinkState(ClientContext 
 	auto &attach_result = catalog.attach_result();
 
 	auto &vgi_tx = VgiTransaction::Get(context, table.GetCatalog());
-	CatalogRpcContext rpc_ctx{params, attach_result->attach_id, vgi_tx.GetTransactionId()};
+	CatalogRpcContext rpc_ctx{params, attach_result->attach_opaque_data, vgi_tx.GetTransactionOpaqueData()};
 	auto write_func = ResolveWriteFunction(
 	    context, table, "update", table.GetTableInfo().update_function,
 	    [&]() {
@@ -700,7 +700,7 @@ unique_ptr<GlobalSinkState> VgiPhysicalUpdate::GetGlobalSinkState(ClientContext 
 	                                                 write_func.function_name);
 	{
 		auto setup = SetupWriteConnection(context, table, write_func, input_schema, write_options,
-		                                   vgi_tx.GetTransactionId());
+		                                   vgi_tx.GetTransactionOpaqueData());
 		gstate->connection = std::move(setup.connection);
 		gstate->bind_result = std::move(setup.bind_result);
 	}

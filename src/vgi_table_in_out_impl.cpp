@@ -28,8 +28,8 @@ VgiTableInOutBindData::~VgiTableInOutBindData() = default;
 unique_ptr<FunctionData> VgiTableInOutBindData::Copy() const {
 	auto copy = make_uniq<VgiTableInOutBindData>();
 	copy->attach_params = attach_params;
-	copy->attach_id = attach_id;
-	copy->transaction_id = transaction_id;
+	copy->attach_opaque_data = attach_opaque_data;
+	copy->transaction_opaque_data = transaction_opaque_data;
 	copy->function_name = function_name;
 	copy->settings = settings;
 	copy->arguments = arguments;
@@ -43,7 +43,7 @@ unique_ptr<FunctionData> VgiTableInOutBindData::Copy() const {
 
 bool VgiTableInOutBindData::Equals(const FunctionData &other_p) const {
 	auto &other = other_p.Cast<VgiTableInOutBindData>();
-	return worker_path() == other.worker_path() && function_name == other.function_name && attach_id == other.attach_id;
+	return worker_path() == other.worker_path() && function_name == other.function_name && attach_opaque_data == other.attach_opaque_data;
 }
 
 // ============================================================================
@@ -95,8 +95,8 @@ unique_ptr<FunctionData> VgiTableInOutBind(ClientContext &context, TableFunction
 
 	// Copy connection parameters
 	bind_data->attach_params = params.attach_params;
-	bind_data->attach_id = params.attach_id;
-	bind_data->transaction_id = params.transaction_id;
+	bind_data->attach_opaque_data = params.attach_opaque_data;
+	bind_data->transaction_opaque_data = params.transaction_opaque_data;
 	bind_data->function_name = params.function_name;
 	bind_data->settings = params.settings;
 	bind_data->required_secrets = params.required_secrets;
@@ -143,8 +143,8 @@ unique_ptr<FunctionData> VgiTableInOutBind(ClientContext &context, TableFunction
 			         {"from_pool", "true"},
 			         {"pid", std::to_string(pooled->GetPid())}});
 			connection = CreateFunctionConnectionFromPool(std::move(pooled), bind_data->function_name,
-			                                              bind_data->arguments, bind_data->attach_id,
-			                                              bind_data->transaction_id, context,
+			                                              bind_data->arguments, bind_data->attach_opaque_data,
+			                                              bind_data->transaction_opaque_data, context,
 			                                              "TABLE", std::vector<uint8_t>{},
 			                                              bind_data->worker_debug(), bind_data->settings,
 			                                              bind_data->required_secrets);
@@ -152,8 +152,8 @@ unique_ptr<FunctionData> VgiTableInOutBind(ClientContext &context, TableFunction
 	}
 	if (!connection) {
 		connection = CreateFunctionConnection(bind_data->worker_path(), bind_data->function_name,
-		                                      bind_data->arguments, bind_data->attach_id,
-		                                      bind_data->transaction_id, context,
+		                                      bind_data->arguments, bind_data->attach_opaque_data,
+		                                      bind_data->transaction_opaque_data, context,
 		                                      "TABLE", std::vector<uint8_t>{},
 		                                      bind_data->worker_debug(), bind_data->settings,
 		                                      bind_data->required_secrets, bind_data->attach_params);
@@ -232,10 +232,10 @@ unique_ptr<GlobalTableFunctionState> VgiTableInOutInitGlobal(ClientContext &cont
 	// SetInputSchema for the typed-input-stream protocol.
 	FunctionConnectionParams acquire_params;
 	acquire_params.attach_params = bind_data.attach_params;
-	acquire_params.attach_id = bind_data.attach_id;
+	acquire_params.attach_opaque_data = bind_data.attach_opaque_data;
 	acquire_params.function_name = bind_data.function_name;
 	acquire_params.arguments = bind_data.arguments;
-	acquire_params.transaction_id = bind_data.transaction_id;
+	acquire_params.transaction_opaque_data = bind_data.transaction_opaque_data;
 	acquire_params.settings = bind_data.settings;
 	acquire_params.required_secrets = bind_data.required_secrets;
 	acquire_params.phase = "init_global";

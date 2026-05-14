@@ -150,8 +150,8 @@ public:
 
 	// Identity/diagnostics
 	virtual std::string GetExecutionIdHex() const = 0;
-	virtual std::string GetAttachIdHex() const = 0;
-	virtual std::string GetTransactionIdHex() const = 0;
+	virtual std::string GetAttachOpaqueDataHex() const = 0;
+	virtual std::string GetTransactionOpaqueDataHex() const = 0;
 	//! Stable short hex id for this connection checkout. Generated at construction,
 	//! unique per IFunctionConnection instance regardless of transport. Use as the
 	//! primary correlation key in log lines: one `conn=<hex>` covers the full
@@ -182,8 +182,8 @@ public:
 // Create a connection of the appropriate type (subprocess or HTTP) based on worker_path.
 std::unique_ptr<IFunctionConnection> CreateFunctionConnection(
     const std::string &worker_path, const std::string &function_name,
-    const ArrowArguments &arguments, const std::vector<uint8_t> &attach_id,
-    const std::vector<uint8_t> &transaction_id,
+    const ArrowArguments &arguments, const std::vector<uint8_t> &attach_opaque_data,
+    const std::vector<uint8_t> &transaction_opaque_data,
     ClientContext &context, const std::string &function_type = "TABLE",
     const std::vector<uint8_t> &global_execution_id = {},
     bool worker_debug = false,
@@ -194,8 +194,8 @@ std::unique_ptr<IFunctionConnection> CreateFunctionConnection(
 // Create from a pooled worker (subprocess only — HTTP connections are never pooled).
 std::unique_ptr<IFunctionConnection> CreateFunctionConnectionFromPool(
     std::unique_ptr<PooledWorker> pooled_worker, const std::string &function_name,
-    const ArrowArguments &arguments, const std::vector<uint8_t> &attach_id,
-    const std::vector<uint8_t> &transaction_id,
+    const ArrowArguments &arguments, const std::vector<uint8_t> &attach_opaque_data,
+    const std::vector<uint8_t> &transaction_opaque_data,
     ClientContext &context, const std::string &function_type = "TABLE",
     const std::vector<uint8_t> &global_execution_id = {},
     bool worker_debug = false,

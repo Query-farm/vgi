@@ -43,10 +43,10 @@ class FunctionConnection;
 // Used with AcquireAndBindConnection to handle pool acquire + stale connection retry
 struct FunctionConnectionParams {
 	std::shared_ptr<VgiAttachParameters> attach_params;  // replaces worker_path, worker_debug, use_pool
-	std::vector<uint8_t> attach_id;
+	std::vector<uint8_t> attach_opaque_data;
 	std::string function_name;
 	ArrowArguments arguments;
-	std::vector<uint8_t> transaction_id;
+	std::vector<uint8_t> transaction_opaque_data;
 	std::vector<uint8_t> global_execution_id;  // Empty for primary workers
 	std::map<std::string, Value> settings;
 	std::vector<vgi::VgiSecretRequirement> required_secrets;
@@ -141,8 +141,8 @@ public:
 	// function_type: "TABLE", "SCALAR", or "AGGREGATE" (for BindRequest)
 	// settings: Optional map of settings to pass to the worker (e.g., DuckDB pragmas)
 	FunctionConnection(const std::string &worker_path, const std::string &function_name,
-	                   const ArrowArguments &arguments, const std::vector<uint8_t> &attach_id,
-	                   const std::vector<uint8_t> &transaction_id, ClientContext &context,
+	                   const ArrowArguments &arguments, const std::vector<uint8_t> &attach_opaque_data,
+	                   const std::vector<uint8_t> &transaction_opaque_data, ClientContext &context,
 	                   const std::string &function_type = "TABLE",
 	                   const std::vector<uint8_t> &global_execution_id = {}, bool worker_debug = false,
 	                   const std::map<std::string, Value> &settings = {},
@@ -152,8 +152,8 @@ public:
 
 	// Create connection using a pooled worker (skips spawning new subprocess)
 	FunctionConnection(std::unique_ptr<PooledWorker> pooled_worker, const std::string &function_name,
-	                   const ArrowArguments &arguments, const std::vector<uint8_t> &attach_id,
-	                   const std::vector<uint8_t> &transaction_id, ClientContext &context,
+	                   const ArrowArguments &arguments, const std::vector<uint8_t> &attach_opaque_data,
+	                   const std::vector<uint8_t> &transaction_opaque_data, ClientContext &context,
 	                   const std::string &function_type = "TABLE",
 	                   const std::vector<uint8_t> &global_execution_id = {}, bool worker_debug = false,
 	                   const std::map<std::string, Value> &settings = {},
@@ -165,8 +165,8 @@ public:
 	// is for diagnostics only; AF_UNIX workers don't go through the pool.
 	FunctionConnection(std::unique_ptr<SubProcess> proc, const std::string &worker_path,
 	                   const std::string &function_name, const ArrowArguments &arguments,
-	                   const std::vector<uint8_t> &attach_id,
-	                   const std::vector<uint8_t> &transaction_id, ClientContext &context,
+	                   const std::vector<uint8_t> &attach_opaque_data,
+	                   const std::vector<uint8_t> &transaction_opaque_data, ClientContext &context,
 	                   const std::string &function_type = "TABLE",
 	                   const std::vector<uint8_t> &global_execution_id = {}, bool worker_debug = false,
 	                   const std::map<std::string, Value> &settings = {},
@@ -282,11 +282,11 @@ public:
 		return proc_ ? proc_->GetPid() : -1;
 	}
 
-	// Get the attach ID as hex string (empty if no attach_id)
-	std::string GetAttachIdHex() const override;
+	// Get the attach ID as hex string (empty if no attach_opaque_data)
+	std::string GetAttachOpaqueDataHex() const override;
 
-	// Get the transaction ID as hex string (empty if no transaction_id)
-	std::string GetTransactionIdHex() const override;
+	// Get the transaction ID as hex string (empty if no transaction_opaque_data)
+	std::string GetTransactionOpaqueDataHex() const override;
 
 	// Stable 8-hex correlation id for this connection checkout
 	std::string GetConnIdHex() const override {
@@ -321,8 +321,8 @@ private:
 	std::string function_type_;  // "TABLE", "SCALAR", "AGGREGATE"
 	std::shared_ptr<arrow::DataType> arguments_type_;
 	std::shared_ptr<arrow::Array> arguments_array_;
-	std::vector<uint8_t> attach_id_;
-	std::vector<uint8_t> transaction_id_;
+	std::vector<uint8_t> attach_opaque_data_;
+	std::vector<uint8_t> transaction_opaque_data_;
 	std::vector<uint8_t> global_execution_id_;
 	ClientContext &context_;
 	bool worker_debug_;

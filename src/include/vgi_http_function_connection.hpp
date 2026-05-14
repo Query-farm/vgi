@@ -31,8 +31,8 @@ struct VgiSecretRequirement;
 class HttpFunctionConnection : public IFunctionConnection {
 public:
 	HttpFunctionConnection(const std::string &worker_path, const std::string &function_name,
-	                       const ArrowArguments &arguments, const std::vector<uint8_t> &attach_id,
-	                       const std::vector<uint8_t> &transaction_id,
+	                       const ArrowArguments &arguments, const std::vector<uint8_t> &attach_opaque_data,
+	                       const std::vector<uint8_t> &transaction_opaque_data,
 	                       ClientContext &context, const std::string &function_type = "TABLE",
 	                       const std::vector<uint8_t> &global_execution_id = {},
 	                       bool worker_debug = false,
@@ -88,8 +88,8 @@ public:
 
 	// Identity/diagnostics
 	std::string GetExecutionIdHex() const override;
-	std::string GetAttachIdHex() const override;
-	std::string GetTransactionIdHex() const override;
+	std::string GetAttachOpaqueDataHex() const override;
+	std::string GetTransactionOpaqueDataHex() const override;
 	std::string GetConnIdHex() const override { return conn_id_hex_; }
 
 	// Lifecycle (no-ops for HTTP — no subprocess to pool)
@@ -108,8 +108,8 @@ private:
 	std::string function_type_;
 	std::shared_ptr<arrow::DataType> arguments_type_;
 	std::shared_ptr<arrow::Array> arguments_array_;
-	std::vector<uint8_t> attach_id_;
-	std::vector<uint8_t> transaction_id_;
+	std::vector<uint8_t> attach_opaque_data_;
+	std::vector<uint8_t> transaction_opaque_data_;
 	std::vector<uint8_t> global_execution_id_;
 	ClientContext &context_;
 	bool worker_debug_;

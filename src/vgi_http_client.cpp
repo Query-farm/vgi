@@ -531,7 +531,7 @@ UnaryResponseResult ResolveExternalLocation(ClientContext &context,
                                              const std::string &location_url,
                                              const std::string &worker_path,
                                              const std::string &invocation_id_hex,
-                                             const std::string &attach_id_hex,
+                                             const std::string &attach_opaque_data_hex,
                                              const std::shared_ptr<arrow::KeyValueMetadata> &pointer_metadata) {
 	// Fetch the external data
 	auto body = HttpGetBytes(context, location_url);
@@ -595,12 +595,12 @@ UnaryResponseResult ResolveExternalLocation(ClientContext &context,
 
 		if (batch_type == RpcBatchType::ERROR) {
 			HandleBatchLogMessage(bwm.batch, bwm.custom_metadata, &context, log_worker_path,
-			                     -1, invocation_id_hex, attach_id_hex);
+			                     -1, invocation_id_hex, attach_opaque_data_hex);
 			throw IOException("VGI external location error [url: %s]", location_url);
 		}
 		if (batch_type == RpcBatchType::LOG) {
 			HandleBatchLogMessage(bwm.batch, bwm.custom_metadata, &context, log_worker_path,
-			                     -1, invocation_id_hex, attach_id_hex);
+			                     -1, invocation_id_hex, attach_opaque_data_hex);
 			continue;
 		}
 		if (batch_type == RpcBatchType::EXTERNAL_LOCATION) {
@@ -624,7 +624,7 @@ UnaryResponseResult ResolveExternalLocation(ClientContext &context,
 		auto bt = ClassifyBatch(bwm.batch, bwm.custom_metadata);
 		if (bt == RpcBatchType::LOG || bt == RpcBatchType::ERROR) {
 			HandleBatchLogMessage(bwm.batch, bwm.custom_metadata, &context, log_worker_path,
-			                     -1, invocation_id_hex, attach_id_hex);
+			                     -1, invocation_id_hex, attach_opaque_data_hex);
 		}
 	}
 

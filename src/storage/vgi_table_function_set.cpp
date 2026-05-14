@@ -77,9 +77,9 @@ static unique_ptr<FunctionData> VgiCatalogTableFunctionBind(ClientContext &conte
 
 	// Copy connection information from the catalog function info
 	bind_data->attach_params = vgi_info.attach_params();
-	bind_data->attach_id = vgi_info.attach_id();
+	bind_data->attach_opaque_data = vgi_info.attach_opaque_data();
 	auto &vgi_tx = VgiTransaction::Get(context, vgi_info.catalog());
-	bind_data->transaction_id = vgi_tx.GetTransactionId();
+	bind_data->transaction_opaque_data = vgi_tx.GetTransactionOpaqueData();
 	bind_data->function_name = vgi_info.function_info().name;
 	bind_data->projection_pushdown = vgi_info.function_info().projection_pushdown.value_or(false);
 	bind_data->supported_expression_filters = vgi_info.function_info().supported_expression_filters;
@@ -213,9 +213,9 @@ static unique_ptr<FunctionData> VgiCatalogTableInOutFunctionBind(ClientContext &
 	vgi::VgiTableInOutBindParams params;
 	params.attach_params = vgi_info.attach_params();
 	params.function_name = vgi_info.function_info().name;
-	params.attach_id = vgi_info.attach_id();
+	params.attach_opaque_data = vgi_info.attach_opaque_data();
 	auto &tio_tx = VgiTransaction::Get(context, vgi_info.catalog());
-	params.transaction_id = tio_tx.GetTransactionId();
+	params.transaction_opaque_data = tio_tx.GetTransactionOpaqueData();
 	params.settings = ExtractVgiSettings(context, vgi_info.setting_names());
 	params.required_secrets = vgi_info.function_info().required_secrets;
 
@@ -264,7 +264,7 @@ void VgiTableFunctionSet::LoadEntries(ClientContext &context, const std::lock_gu
 	// Call catalog_schema_contents_functions via RPC for table functions
 	auto worker_path = attach_params->worker_path();
 	auto &vgi_tx_load = VgiTransaction::Get(context, catalog_);
-	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_id, vgi_tx_load.GetTransactionId()};
+	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_opaque_data, vgi_tx_load.GetTransactionOpaqueData()};
 	rpc_ctx.entity_kind = "schema";
 	rpc_ctx.entity_qualifier = schema_.name;
 
@@ -327,7 +327,7 @@ void VgiTableFunctionSet::LoadEntries(ClientContext &context, const std::lock_gu
 
 				// Attach function info
 				table_func.function_info = make_uniq<vgi::VgiTableFunctionInfo>(
-				    catalog_, attach_params, attach_result->attach_id, func_info, setting_names);
+				    catalog_, attach_params, attach_result->attach_opaque_data, func_info, setting_names);
 
 				func_set.AddFunction(table_func);
 			} else {
@@ -413,7 +413,7 @@ void VgiTableFunctionSet::LoadEntries(ClientContext &context, const std::lock_gu
 
 				// Attach VgiTableFunctionInfo so the bind function can access worker_path and function metadata
 				table_func.function_info = make_uniq<vgi::VgiTableFunctionInfo>(
-				    catalog_, attach_params, attach_result->attach_id, func_info, setting_names);
+				    catalog_, attach_params, attach_result->attach_opaque_data, func_info, setting_names);
 
 				func_set.AddFunction(table_func);
 			}

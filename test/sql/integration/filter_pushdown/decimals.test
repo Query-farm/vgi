@@ -1,0 +1,255 @@
+# name: test/sql/integration/filter_pushdown/decimals.test
+# description: Differential filter-pushdown tests for DECIMAL.
+#   DuckDB stores DECIMAL(p,s) as the unscaled int (s digits past the
+#   decimal point). On the worker side, our filter evaluator receives
+#   the value as either a JS bigint (≤ 18 digits) or a DecimalBigNum
+#   (Uint32Array) for HUGEINT-range. The wire literal in the WHERE
+#   clause arrives the same way.
+#
+#   The differential pattern catches divergences in:
+#     - JS Number ↔ BigInt comparison ("1n === 1" is false)
+#     - DecimalBigNum.valueOf() (overflows for huge values)
+#     - scale-aware comparison (1.00 should equal 1)
+#
+# group: [vgi_integration_filter_pushdown]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# DECIMAL(10,2) — small Int64-backed decimal. Most common shape.
+# ============================================================================
+
+query R
+SELECT v FROM (VALUES (1.00::DECIMAL(10,2)),
+                      (2.50::DECIMAL(10,2)),
+                      (3.14::DECIMAL(10,2)),
+                      (10.00::DECIMAL(10,2))) t(v)
+WHERE v = 2.50 ORDER BY v;
+----
+2.50
+
+query R
+SELECT v FROM example.echo((
+  SELECT v FROM (VALUES (1.00::DECIMAL(10,2)),
+                        (2.50::DECIMAL(10,2)),
+                        (3.14::DECIMAL(10,2)),
+                        (10.00::DECIMAL(10,2))) t(v)
+)) WHERE v = 2.50 ORDER BY v;
+----
+2.50
+
+# Range comparison
+query R
+SELECT v FROM (VALUES (1.00::DECIMAL(10,2)),
+                      (2.50::DECIMAL(10,2)),
+                      (3.14::DECIMAL(10,2)),
+                      (10.00::DECIMAL(10,2))) t(v)
+WHERE v >= 2.50 AND v < 10.00 ORDER BY v;
+----
+2.50
+3.14
+
+query R
+SELECT v FROM example.echo((
+  SELECT v FROM (VALUES (1.00::DECIMAL(10,2)),
+                        (2.50::DECIMAL(10,2)),
+                        (3.14::DECIMAL(10,2)),
+                        (10.00::DECIMAL(10,2))) t(v)
+)) WHERE v >= 2.50 AND v < 10.00 ORDER BY v;
+----
+2.50
+3.14
+
+# Equality across scale: 1.00 and 1 should compare equal even though
+# the literal '1' may parse as INTEGER initially.
+query R
+SELECT v FROM (VALUES (1.00::DECIMAL(10,2)), (2.00::DECIMAL(10,2))) t(v) WHERE v = 1 ORDER BY v;
+----
+1.00
+
+query R
+SELECT v FROM example.echo((
+  SELECT v FROM (VALUES (1.00::DECIMAL(10,2)), (2.00::DECIMAL(10,2))) t(v)
+)) WHERE v = 1 ORDER BY v;
+----
+1.00
+
+# Negative decimals — sign-aware comparison.
+query R
+SELECT v FROM (VALUES ((-3.14)::DECIMAL(10,2)),
+                      (0.00::DECIMAL(10,2)),
+                      (3.14::DECIMAL(10,2))) t(v)
+WHERE v < 0 ORDER BY v;
+----
+-3.14
+
+query R
+SELECT v FROM example.echo((
+  SELECT v FROM (VALUES ((-3.14)::DECIMAL(10,2)),
+                        (0.00::DECIMAL(10,2)),
+                        (3.14::DECIMAL(10,2))) t(v)
+)) WHERE v < 0 ORDER BY v;
+----
+-3.14
+
+# ============================================================================
+# DECIMAL(20,2) — Int128-backed (HUGEINT). Values arrive as DecimalBigNum
+# (Uint32Array) on our side; valueOf() works up to JS Number.MAX_SAFE_INTEGER
+# but breaks past that. Equality and range still need to round-trip.
+# ============================================================================
+
+query R
+SELECT v FROM (VALUES (123.45::DECIMAL(20,2)),
+                      (678.90::DECIMAL(20,2)),
+                      (1234567890.12::DECIMAL(20,2))) t(v)
+WHERE v = 678.90 ORDER BY v;
+----
+678.90
+
+query R
+SELECT v FROM example.echo((
+  SELECT v FROM (VALUES (123.45::DECIMAL(20,2)),
+                        (678.90::DECIMAL(20,2)),
+                        (1234567890.12::DECIMAL(20,2))) t(v)
+)) WHERE v = 678.90 ORDER BY v;
+----
+678.90
+
+query R
+SELECT v FROM (VALUES (123.45::DECIMAL(20,2)),
+                      (678.90::DECIMAL(20,2)),
+                      (1234567890.12::DECIMAL(20,2))) t(v)
+WHERE v > 1000 ORDER BY v;
+----
+1234567890.12
+
+query R
+SELECT v FROM example.echo((
+  SELECT v FROM (VALUES (123.45::DECIMAL(20,2)),
+                        (678.90::DECIMAL(20,2)),
+                        (1234567890.12::DECIMAL(20,2))) t(v)
+)) WHERE v > 1000 ORDER BY v;
+----
+1234567890.12
+
+# ============================================================================
+# DECIMAL(38,0) near precision-cap. Values exceed JS Number.MAX_SAFE_INTEGER
+# (2^53), so DecimalBigNum.valueOf() throws. The evaluator must coerce
+# both sides to BigInt before comparison.
+# ============================================================================
+
+query R
+SELECT v FROM (VALUES (10000000000000000000000000000000000000::DECIMAL(38,0)),
+                      (20000000000000000000000000000000000000::DECIMAL(38,0)),
+                      (30000000000000000000000000000000000000::DECIMAL(38,0))) t(v)
+WHERE v = 20000000000000000000000000000000000000 ORDER BY v;
+----
+20000000000000000000000000000000000000
+
+query R
+SELECT v FROM example.echo((
+  SELECT v FROM (VALUES (10000000000000000000000000000000000000::DECIMAL(38,0)),
+                        (20000000000000000000000000000000000000::DECIMAL(38,0)),
+                        (30000000000000000000000000000000000000::DECIMAL(38,0))) t(v)
+)) WHERE v = 20000000000000000000000000000000000000 ORDER BY v;
+----
+20000000000000000000000000000000000000
+
+query R
+SELECT v FROM (VALUES (10000000000000000000000000000000000000::DECIMAL(38,0)),
+                      (20000000000000000000000000000000000000::DECIMAL(38,0)),
+                      (30000000000000000000000000000000000000::DECIMAL(38,0))) t(v)
+WHERE v > 15000000000000000000000000000000000000 ORDER BY v;
+----
+20000000000000000000000000000000000000
+30000000000000000000000000000000000000
+
+query R
+SELECT v FROM example.echo((
+  SELECT v FROM (VALUES (10000000000000000000000000000000000000::DECIMAL(38,0)),
+                        (20000000000000000000000000000000000000::DECIMAL(38,0)),
+                        (30000000000000000000000000000000000000::DECIMAL(38,0))) t(v)
+)) WHERE v > 15000000000000000000000000000000000000 ORDER BY v;
+----
+20000000000000000000000000000000000000
+30000000000000000000000000000000000000
+
+# ============================================================================
+# IS NULL / IS NOT NULL — null bitmap on a Decimal column must round-trip
+# through the wire and the filter evaluator.
+# ============================================================================
+
+query R
+SELECT v FROM (VALUES (1.00::DECIMAL(10,2)),
+                      (NULL::DECIMAL(10,2)),
+                      (3.00::DECIMAL(10,2))) t(v)
+WHERE v IS NULL ORDER BY v NULLS FIRST;
+----
+NULL
+
+query R
+SELECT v FROM example.echo((
+  SELECT v FROM (VALUES (1.00::DECIMAL(10,2)),
+                        (NULL::DECIMAL(10,2)),
+                        (3.00::DECIMAL(10,2))) t(v)
+)) WHERE v IS NULL ORDER BY v NULLS FIRST;
+----
+NULL
+
+query R
+SELECT v FROM (VALUES (1.00::DECIMAL(10,2)),
+                      (NULL::DECIMAL(10,2)),
+                      (3.00::DECIMAL(10,2))) t(v)
+WHERE v IS NOT NULL ORDER BY v;
+----
+1.00
+3.00
+
+query R
+SELECT v FROM example.echo((
+  SELECT v FROM (VALUES (1.00::DECIMAL(10,2)),
+                        (NULL::DECIMAL(10,2)),
+                        (3.00::DECIMAL(10,2))) t(v)
+)) WHERE v IS NOT NULL ORDER BY v;
+----
+1.00
+3.00
+
+# ============================================================================
+# IN list with decimals — values are scaled int internally.
+# ============================================================================
+
+query R
+SELECT v FROM (VALUES (1.00::DECIMAL(10,2)),
+                      (2.50::DECIMAL(10,2)),
+                      (3.14::DECIMAL(10,2)),
+                      (10.00::DECIMAL(10,2))) t(v)
+WHERE v IN (1.00, 3.14, 99.99) ORDER BY v;
+----
+1.00
+3.14
+
+query R
+SELECT v FROM example.echo((
+  SELECT v FROM (VALUES (1.00::DECIMAL(10,2)),
+                        (2.50::DECIMAL(10,2)),
+                        (3.14::DECIMAL(10,2)),
+                        (10.00::DECIMAL(10,2))) t(v)
+)) WHERE v IN (1.00, 3.14, 99.99) ORDER BY v;
+----
+1.00
+3.14
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;

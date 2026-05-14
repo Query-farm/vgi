@@ -1,0 +1,588 @@
+# name: test/sql/integration/filter_pushdown/integers.test
+# description: Differential filter-pushdown tests for integer types.
+#   Each predicate is exercised twice with identical expected rows:
+#
+#     1. Reference query against DuckDB-native source (range / VALUES).
+#        DuckDB plans and evaluates the filter in-process — no worker
+#        involvement. This is the source of truth.
+#
+#     2. Pushdown query through example.echo (table-in-out passthrough,
+#        filter_pushdown=true, auto_apply_filters=true). DuckDB pushes
+#        the predicate over the wire as a serialized FilterSerializer
+#        AST; the worker's TS filter-pushdown evaluator resolves it
+#        against each batch. A divergence means the worker disagrees
+#        with DuckDB on the predicate's truth value for at least one
+#        row — a correctness regression in the worker's
+#        src/filter-pushdown/evaluate.ts.
+#
+#   Coverage: every comparison op (=, !=, <, >, <=, >=), IS NULL,
+#   IS NOT NULL, IN, AND, OR, plus boundary values (negative, zero,
+#   Int64 edges that exceed JS Number.MAX_SAFE_INTEGER, and large
+#   IN-lists that would normally promote to a hash-join filter).
+#
+#   Every query uses ORDER BY rather than `rowsort` because sqllogictest's
+#   rowsort compares results lexicographically as strings, which doesn't
+#   match the numeric ordering we want for negative numbers and multi-
+#   digit integers (lex puts "13" before "3").
+#
+# group: [vgi_integration_filter_pushdown]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# Equality
+# ============================================================================
+
+query I
+SELECT n FROM range(0, 100) t(n) WHERE n = 42 ORDER BY n;
+----
+42
+
+query I
+SELECT n FROM example.echo((SELECT range AS n FROM range(0, 100))) WHERE n = 42 ORDER BY n;
+----
+42
+
+# ============================================================================
+# Inequality
+# ============================================================================
+
+query I
+SELECT n FROM range(0, 5) t(n) WHERE n != 2 ORDER BY n;
+----
+0
+1
+3
+4
+
+query I
+SELECT n FROM example.echo((SELECT range AS n FROM range(0, 5))) WHERE n != 2 ORDER BY n;
+----
+0
+1
+3
+4
+
+# ============================================================================
+# Less than
+# ============================================================================
+
+query I
+SELECT n FROM range(0, 10) t(n) WHERE n < 3 ORDER BY n;
+----
+0
+1
+2
+
+query I
+SELECT n FROM example.echo((SELECT range AS n FROM range(0, 10))) WHERE n < 3 ORDER BY n;
+----
+0
+1
+2
+
+# ============================================================================
+# Greater than
+# ============================================================================
+
+query I
+SELECT n FROM range(0, 10) t(n) WHERE n > 7 ORDER BY n;
+----
+8
+9
+
+query I
+SELECT n FROM example.echo((SELECT range AS n FROM range(0, 10))) WHERE n > 7 ORDER BY n;
+----
+8
+9
+
+# ============================================================================
+# Less than or equal
+# ============================================================================
+
+query I
+SELECT n FROM range(0, 10) t(n) WHERE n <= 3 ORDER BY n;
+----
+0
+1
+2
+3
+
+query I
+SELECT n FROM example.echo((SELECT range AS n FROM range(0, 10))) WHERE n <= 3 ORDER BY n;
+----
+0
+1
+2
+3
+
+# ============================================================================
+# Greater than or equal
+# ============================================================================
+
+query I
+SELECT n FROM range(0, 10) t(n) WHERE n >= 7 ORDER BY n;
+----
+7
+8
+9
+
+query I
+SELECT n FROM example.echo((SELECT range AS n FROM range(0, 10))) WHERE n >= 7 ORDER BY n;
+----
+7
+8
+9
+
+# ============================================================================
+# Negative comparisons (signed Int64). VALUES literals ensure DuckDB
+# infers BIGINT, not UBIGINT, and exercises sign-aware comparison.
+# ============================================================================
+
+query I
+SELECT n FROM (VALUES (-3::BIGINT), (-1::BIGINT), (0::BIGINT), (1::BIGINT), (3::BIGINT)) t(n) WHERE n < 0 ORDER BY n;
+----
+-3
+-1
+
+query I
+SELECT n FROM example.echo((
+  SELECT n FROM (VALUES (-3::BIGINT), (-1::BIGINT), (0::BIGINT), (1::BIGINT), (3::BIGINT)) t(n)
+)) WHERE n < 0 ORDER BY n;
+----
+-3
+-1
+
+query I
+SELECT n FROM (VALUES (-3::BIGINT), (-1::BIGINT), (0::BIGINT), (1::BIGINT), (3::BIGINT)) t(n) WHERE n >= -1 ORDER BY n;
+----
+-1
+0
+1
+3
+
+query I
+SELECT n FROM example.echo((
+  SELECT n FROM (VALUES (-3::BIGINT), (-1::BIGINT), (0::BIGINT), (1::BIGINT), (3::BIGINT)) t(n)
+)) WHERE n >= -1 ORDER BY n;
+----
+-1
+0
+1
+3
+
+# ============================================================================
+# BigInt vs Number boundary. JS's Number.MAX_SAFE_INTEGER is 2^53-1 =
+# 9007199254740991. Values above that arrive as JS bigint over the wire;
+# the literal in the WHERE clause is also serialized as a bigint scalar.
+# A naive `BigInt === Number` comparison would silently mismatch.
+# ============================================================================
+
+query I
+SELECT n FROM (VALUES (9007199254740991::BIGINT),
+                      (9007199254740992::BIGINT),
+                      (9007199254740993::BIGINT),
+                      (9007199254740994::BIGINT)) t(n)
+WHERE n = 9007199254740993 ORDER BY n;
+----
+9007199254740993
+
+query I
+SELECT n FROM example.echo((
+  SELECT n FROM (VALUES (9007199254740991::BIGINT),
+                        (9007199254740992::BIGINT),
+                        (9007199254740993::BIGINT),
+                        (9007199254740994::BIGINT)) t(n)
+)) WHERE n = 9007199254740993 ORDER BY n;
+----
+9007199254740993
+
+query I
+SELECT n FROM (VALUES (9007199254740991::BIGINT),
+                      (9007199254740992::BIGINT),
+                      (9007199254740993::BIGINT),
+                      (9007199254740994::BIGINT)) t(n)
+WHERE n > 9007199254740992 ORDER BY n;
+----
+9007199254740993
+9007199254740994
+
+query I
+SELECT n FROM example.echo((
+  SELECT n FROM (VALUES (9007199254740991::BIGINT),
+                        (9007199254740992::BIGINT),
+                        (9007199254740993::BIGINT),
+                        (9007199254740994::BIGINT)) t(n)
+)) WHERE n > 9007199254740992 ORDER BY n;
+----
+9007199254740993
+9007199254740994
+
+# ============================================================================
+# Int64 near-extremes. INT64 MIN (-2^63) overflows DuckDB's literal parser
+# (treated as INT128); use INT64 MIN + 1 instead.
+# ============================================================================
+
+query I
+SELECT n FROM (VALUES ((-9223372036854775807)::BIGINT),
+                      (0::BIGINT),
+                      (9223372036854775807::BIGINT)) t(n)
+WHERE n < 0 ORDER BY n;
+----
+-9223372036854775807
+
+query I
+SELECT n FROM example.echo((
+  SELECT n FROM (VALUES ((-9223372036854775807)::BIGINT),
+                        (0::BIGINT),
+                        (9223372036854775807::BIGINT)) t(n)
+)) WHERE n < 0 ORDER BY n;
+----
+-9223372036854775807
+
+query I
+SELECT n FROM (VALUES ((-9223372036854775807)::BIGINT),
+                      (0::BIGINT),
+                      (9223372036854775807::BIGINT)) t(n)
+WHERE n = 9223372036854775807 ORDER BY n;
+----
+9223372036854775807
+
+query I
+SELECT n FROM example.echo((
+  SELECT n FROM (VALUES ((-9223372036854775807)::BIGINT),
+                        (0::BIGINT),
+                        (9223372036854775807::BIGINT)) t(n)
+)) WHERE n = 9223372036854775807 ORDER BY n;
+----
+9223372036854775807
+
+# ============================================================================
+# Smaller integer widths. DuckDB usually upcasts these for comparison
+# against literals; pushed-down filter values arrive as bigint from
+# arrow-js regardless of declared width.
+# ============================================================================
+
+query I
+SELECT n FROM (VALUES (10::INTEGER), (20::INTEGER), (30::INTEGER), (40::INTEGER)) t(n) WHERE n > 20 ORDER BY n;
+----
+30
+40
+
+query I
+SELECT n FROM example.echo((
+  SELECT n FROM (VALUES (10::INTEGER), (20::INTEGER), (30::INTEGER), (40::INTEGER)) t(n)
+)) WHERE n > 20 ORDER BY n;
+----
+30
+40
+
+query I
+SELECT n FROM (VALUES (1::SMALLINT), (2::SMALLINT), (3::SMALLINT)) t(n) WHERE n <= 2 ORDER BY n;
+----
+1
+2
+
+query I
+SELECT n FROM example.echo((
+  SELECT n FROM (VALUES (1::SMALLINT), (2::SMALLINT), (3::SMALLINT)) t(n)
+)) WHERE n <= 2 ORDER BY n;
+----
+1
+2
+
+query I
+SELECT n FROM (VALUES (1::TINYINT), (2::TINYINT), (3::TINYINT)) t(n) WHERE n != 2 ORDER BY n;
+----
+1
+3
+
+query I
+SELECT n FROM example.echo((
+  SELECT n FROM (VALUES (1::TINYINT), (2::TINYINT), (3::TINYINT)) t(n)
+)) WHERE n != 2 ORDER BY n;
+----
+1
+3
+
+# ============================================================================
+# IS NULL / IS NOT NULL. The reference uses VALUES; pushdown receives
+# arrow validity bitmaps. A bitmap-vs-value drift would diverge here.
+# ORDER BY needs to put NULLs in a stable position — DuckDB's default is
+# NULLS LAST, but be explicit so both sides agree.
+# ============================================================================
+
+query I
+SELECT n FROM (VALUES (1::BIGINT), (NULL::BIGINT), (3::BIGINT), (NULL::BIGINT), (5::BIGINT)) t(n)
+WHERE n IS NULL ORDER BY n NULLS FIRST;
+----
+NULL
+NULL
+
+query I
+SELECT n FROM example.echo((
+  SELECT n FROM (VALUES (1::BIGINT), (NULL::BIGINT), (3::BIGINT), (NULL::BIGINT), (5::BIGINT)) t(n)
+)) WHERE n IS NULL ORDER BY n NULLS FIRST;
+----
+NULL
+NULL
+
+query I
+SELECT n FROM (VALUES (1::BIGINT), (NULL::BIGINT), (3::BIGINT), (NULL::BIGINT), (5::BIGINT)) t(n)
+WHERE n IS NOT NULL ORDER BY n;
+----
+1
+3
+5
+
+query I
+SELECT n FROM example.echo((
+  SELECT n FROM (VALUES (1::BIGINT), (NULL::BIGINT), (3::BIGINT), (NULL::BIGINT), (5::BIGINT)) t(n)
+)) WHERE n IS NOT NULL ORDER BY n;
+----
+1
+3
+5
+
+# Three-valued logic: equality against NULL never matches.
+query I
+SELECT n FROM (VALUES (1::BIGINT), (NULL::BIGINT), (3::BIGINT)) t(n) WHERE n = 1 ORDER BY n;
+----
+1
+
+query I
+SELECT n FROM example.echo((
+  SELECT n FROM (VALUES (1::BIGINT), (NULL::BIGINT), (3::BIGINT)) t(n)
+)) WHERE n = 1 ORDER BY n;
+----
+1
+
+# ============================================================================
+# IN — small list (typically lowered to OR-of-equals on the wire).
+# ============================================================================
+
+query I
+SELECT n FROM range(0, 20) t(n) WHERE n IN (3, 7, 13) ORDER BY n;
+----
+3
+7
+13
+
+query I
+SELECT n FROM example.echo((SELECT range AS n FROM range(0, 20))) WHERE n IN (3, 7, 13) ORDER BY n;
+----
+3
+7
+13
+
+# IN with negatives, edges, and a value not in the source.
+query I
+SELECT n FROM (VALUES (-1::BIGINT), (0::BIGINT), (1::BIGINT), (2::BIGINT)) t(n)
+WHERE n IN (-1, 1, 99) ORDER BY n;
+----
+-1
+1
+
+query I
+SELECT n FROM example.echo((
+  SELECT n FROM (VALUES (-1::BIGINT), (0::BIGINT), (1::BIGINT), (2::BIGINT)) t(n)
+)) WHERE n IN (-1, 1, 99) ORDER BY n;
+----
+-1
+1
+
+# IN — large list (>20 elements). DuckDB may promote to dynamic_or_filter
+# / join_keys. Our parseFilter materialises join_keys back into an
+# InFilter; this asserts that path.
+query I
+SELECT n FROM range(0, 200) t(n) WHERE n IN (
+  1, 5, 7, 11, 13, 17, 19, 23, 29, 31,
+  37, 41, 43, 47, 53, 59, 61, 67, 71, 73,
+  79, 83, 89, 97, 101, 103
+) ORDER BY n;
+----
+1
+5
+7
+11
+13
+17
+19
+23
+29
+31
+37
+41
+43
+47
+53
+59
+61
+67
+71
+73
+79
+83
+89
+97
+101
+103
+
+query I
+SELECT n FROM example.echo((SELECT range AS n FROM range(0, 200))) WHERE n IN (
+  1, 5, 7, 11, 13, 17, 19, 23, 29, 31,
+  37, 41, 43, 47, 53, 59, 61, 67, 71, 73,
+  79, 83, 89, 97, 101, 103
+) ORDER BY n;
+----
+1
+5
+7
+11
+13
+17
+19
+23
+29
+31
+37
+41
+43
+47
+53
+59
+61
+67
+71
+73
+79
+83
+89
+97
+101
+103
+
+# ============================================================================
+# AND
+# ============================================================================
+
+query I
+SELECT n FROM range(0, 100) t(n) WHERE n >= 50 AND n < 55 ORDER BY n;
+----
+50
+51
+52
+53
+54
+
+query I
+SELECT n FROM example.echo((SELECT range AS n FROM range(0, 100))) WHERE n >= 50 AND n < 55 ORDER BY n;
+----
+50
+51
+52
+53
+54
+
+# AND with NULL on one side: SQL three-valued logic — TRUE AND NULL = NULL,
+# which evaluates as "false" for WHERE-clause filtering. Result: only the
+# row where both operands are TRUE survives.
+query II
+SELECT n, t FROM (VALUES (1::BIGINT, 'x'),
+                         (2::BIGINT, NULL),
+                         (3::BIGINT, 'y'),
+                         (4::BIGINT, NULL)) v(n, t)
+WHERE n > 1 AND t IS NOT NULL ORDER BY n;
+----
+3	y
+
+query II
+SELECT n, t FROM example.echo((
+  SELECT n, t FROM (VALUES (1::BIGINT, 'x'),
+                           (2::BIGINT, NULL),
+                           (3::BIGINT, 'y'),
+                           (4::BIGINT, NULL)) v(n, t)
+)) WHERE n > 1 AND t IS NOT NULL ORDER BY n;
+----
+3	y
+
+# ============================================================================
+# OR
+# ============================================================================
+
+query I
+SELECT n FROM range(0, 20) t(n) WHERE n < 3 OR n > 17 ORDER BY n;
+----
+0
+1
+2
+18
+19
+
+query I
+SELECT n FROM example.echo((SELECT range AS n FROM range(0, 20))) WHERE n < 3 OR n > 17 ORDER BY n;
+----
+0
+1
+2
+18
+19
+
+# OR with NULL: NULL OR TRUE = TRUE, so a row with NULL on one side and
+# matching the other survives.
+query II
+SELECT n, t FROM (VALUES (1::BIGINT, 'a'),
+                         (2::BIGINT, NULL),
+                         (3::BIGINT, 'c')) v(n, t)
+WHERE n = 2 OR t = 'c' ORDER BY n;
+----
+2	NULL
+3	c
+
+query II
+SELECT n, t FROM example.echo((
+  SELECT n, t FROM (VALUES (1::BIGINT, 'a'),
+                           (2::BIGINT, NULL),
+                           (3::BIGINT, 'c')) v(n, t)
+)) WHERE n = 2 OR t = 'c' ORDER BY n;
+----
+2	NULL
+3	c
+
+# ============================================================================
+# Compound — equality on one column AND range on another.
+# ============================================================================
+
+query II
+SELECT n, m FROM (VALUES (1::BIGINT, 100::BIGINT),
+                         (2::BIGINT, 200::BIGINT),
+                         (2::BIGINT, 300::BIGINT),
+                         (3::BIGINT, 400::BIGINT)) v(n, m)
+WHERE n = 2 AND m >= 250 ORDER BY n, m;
+----
+2	300
+
+query II
+SELECT n, m FROM example.echo((
+  SELECT n, m FROM (VALUES (1::BIGINT, 100::BIGINT),
+                           (2::BIGINT, 200::BIGINT),
+                           (2::BIGINT, 300::BIGINT),
+                           (3::BIGINT, 400::BIGINT)) v(n, m)
+)) WHERE n = 2 AND m >= 250 ORDER BY n, m;
+----
+2	300
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;

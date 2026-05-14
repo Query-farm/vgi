@@ -1,0 +1,342 @@
+# name: test/sql/integration/filter_pushdown/strings.test
+# description: Differential filter-pushdown tests for VARCHAR.
+#   Each predicate is run twice: once against a DuckDB-native source
+#   (VALUES) so DuckDB evaluates the filter in-process, and once
+#   through example.echo (filter_pushdown=true, auto_apply_filters=true)
+#   so the worker's TS filter-pushdown evaluator handles it.
+#   Identical row sets ⇒ the worker matches DuckDB on this predicate.
+#
+#   Coverage: =, !=, <, >, <=, >=, IS NULL, IS NOT NULL, IN, AND, OR,
+#   plus the LIKE-prefix path that DuckDB lowers to starts_with for
+#   pushdown (driven through the ExpressionFilter codepath).
+#
+# group: [vgi_integration_filter_pushdown]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# Helper data — eight rows with a mix of common, unicode, empty, and case
+# variations. Used as the input to every echo() pushdown query.
+# ============================================================================
+# Use a CTE inside the input subquery so the same eight rows feed both
+# the reference and the pushdown variant of each test.
+
+# ============================================================================
+# Equality
+# ============================================================================
+
+query T
+SELECT s FROM (VALUES ('alpha'), ('beta'), ('gamma'), ('delta')) v(s) WHERE s = 'beta' ORDER BY s;
+----
+beta
+
+query T
+SELECT s FROM example.echo((
+  SELECT s FROM (VALUES ('alpha'), ('beta'), ('gamma'), ('delta')) v(s)
+)) WHERE s = 'beta' ORDER BY s;
+----
+beta
+
+# Empty string
+query T
+SELECT s FROM (VALUES (''), ('a'), ('')) v(s) WHERE s = '' ORDER BY s;
+----
+(empty)
+(empty)
+
+query T
+SELECT s FROM example.echo((
+  SELECT s FROM (VALUES (''), ('a'), ('')) v(s)
+)) WHERE s = '' ORDER BY s;
+----
+(empty)
+(empty)
+
+# Case sensitivity — DuckDB compares VARCHAR byte-by-byte. Mismatched case
+# must NOT match.
+query T
+SELECT s FROM (VALUES ('Beta'), ('beta'), ('BETA')) v(s) WHERE s = 'beta' ORDER BY s;
+----
+beta
+
+query T
+SELECT s FROM example.echo((
+  SELECT s FROM (VALUES ('Beta'), ('beta'), ('BETA')) v(s)
+)) WHERE s = 'beta' ORDER BY s;
+----
+beta
+
+# Unicode — multi-byte characters must round-trip and compare correctly.
+query T
+SELECT s FROM (VALUES ('café'), ('cafe'), ('café'), ('日本語')) v(s) WHERE s = 'café' ORDER BY s;
+----
+café
+café
+
+query T
+SELECT s FROM example.echo((
+  SELECT s FROM (VALUES ('café'), ('cafe'), ('café'), ('日本語')) v(s)
+)) WHERE s = 'café' ORDER BY s;
+----
+café
+café
+
+# ============================================================================
+# Inequality
+# ============================================================================
+
+query T
+SELECT s FROM (VALUES ('a'), ('b'), ('c'), ('d')) v(s) WHERE s != 'b' ORDER BY s;
+----
+a
+c
+d
+
+query T
+SELECT s FROM example.echo((
+  SELECT s FROM (VALUES ('a'), ('b'), ('c'), ('d')) v(s)
+)) WHERE s != 'b' ORDER BY s;
+----
+a
+c
+d
+
+# ============================================================================
+# Lexicographic ordering. DuckDB sorts VARCHAR by byte, not by collation —
+# 'AB' < 'B' but 'a' > 'B' (lowercase a is 0x61, uppercase B is 0x42).
+# ============================================================================
+
+query T
+SELECT s FROM (VALUES ('AB'), ('B'), ('a')) v(s) WHERE s < 'B' ORDER BY s;
+----
+AB
+
+query T
+SELECT s FROM example.echo((
+  SELECT s FROM (VALUES ('AB'), ('B'), ('a')) v(s)
+)) WHERE s < 'B' ORDER BY s;
+----
+AB
+
+query T
+SELECT s FROM (VALUES ('apple'), ('banana'), ('cherry')) v(s) WHERE s >= 'banana' ORDER BY s;
+----
+banana
+cherry
+
+query T
+SELECT s FROM example.echo((
+  SELECT s FROM (VALUES ('apple'), ('banana'), ('cherry')) v(s)
+)) WHERE s >= 'banana' ORDER BY s;
+----
+banana
+cherry
+
+query T
+SELECT s FROM (VALUES ('apple'), ('banana'), ('cherry')) v(s) WHERE s <= 'banana' ORDER BY s;
+----
+apple
+banana
+
+query T
+SELECT s FROM example.echo((
+  SELECT s FROM (VALUES ('apple'), ('banana'), ('cherry')) v(s)
+)) WHERE s <= 'banana' ORDER BY s;
+----
+apple
+banana
+
+# ============================================================================
+# IS NULL / IS NOT NULL
+# ============================================================================
+
+query T
+SELECT s FROM (VALUES ('x'), (NULL::VARCHAR), ('y'), (NULL::VARCHAR)) v(s)
+WHERE s IS NULL ORDER BY s NULLS FIRST;
+----
+NULL
+NULL
+
+query T
+SELECT s FROM example.echo((
+  SELECT s FROM (VALUES ('x'), (NULL::VARCHAR), ('y'), (NULL::VARCHAR)) v(s)
+)) WHERE s IS NULL ORDER BY s NULLS FIRST;
+----
+NULL
+NULL
+
+query T
+SELECT s FROM (VALUES ('x'), (NULL::VARCHAR), ('y'), (NULL::VARCHAR)) v(s)
+WHERE s IS NOT NULL ORDER BY s;
+----
+x
+y
+
+query T
+SELECT s FROM example.echo((
+  SELECT s FROM (VALUES ('x'), (NULL::VARCHAR), ('y'), (NULL::VARCHAR)) v(s)
+)) WHERE s IS NOT NULL ORDER BY s;
+----
+x
+y
+
+# Three-valued logic: equality against NULL never matches. The empty
+# string and NULL are distinct.
+query T
+SELECT s FROM (VALUES (''), (NULL::VARCHAR), ('x')) v(s) WHERE s = '' ORDER BY s;
+----
+(empty)
+
+query T
+SELECT s FROM example.echo((
+  SELECT s FROM (VALUES (''), (NULL::VARCHAR), ('x')) v(s)
+)) WHERE s = '' ORDER BY s;
+----
+(empty)
+
+# ============================================================================
+# IN — small list (typically lowered to OR-of-equals).
+# ============================================================================
+
+query T
+SELECT s FROM (VALUES ('apple'), ('banana'), ('cherry'), ('date')) v(s)
+WHERE s IN ('apple', 'cherry') ORDER BY s;
+----
+apple
+cherry
+
+query T
+SELECT s FROM example.echo((
+  SELECT s FROM (VALUES ('apple'), ('banana'), ('cherry'), ('date')) v(s)
+)) WHERE s IN ('apple', 'cherry') ORDER BY s;
+----
+apple
+cherry
+
+# Empty string and unicode in IN list
+query T
+SELECT s FROM (VALUES (''), ('a'), ('café'), ('z')) v(s)
+WHERE s IN ('', 'café') ORDER BY s;
+----
+(empty)
+café
+
+query T
+SELECT s FROM example.echo((
+  SELECT s FROM (VALUES (''), ('a'), ('café'), ('z')) v(s)
+)) WHERE s IN ('', 'café') ORDER BY s;
+----
+(empty)
+café
+
+# IN list with no matches.
+query T
+SELECT s FROM (VALUES ('a'), ('b'), ('c')) v(s) WHERE s IN ('x', 'y', 'z') ORDER BY s;
+----
+
+query T
+SELECT s FROM example.echo((
+  SELECT s FROM (VALUES ('a'), ('b'), ('c')) v(s)
+)) WHERE s IN ('x', 'y', 'z') ORDER BY s;
+----
+
+# ============================================================================
+# LIKE 'prefix%' — DuckDB lowers to starts_with for pushdown when supported.
+# Only the worker's `supportedExpressionFilters` opts in; example.echo does.
+# ============================================================================
+
+query T
+SELECT s FROM (VALUES ('apple'), ('app'), ('apricot'), ('banana')) v(s)
+WHERE s LIKE 'app%' ORDER BY s;
+----
+app
+apple
+
+query T
+SELECT s FROM example.echo((
+  SELECT s FROM (VALUES ('apple'), ('app'), ('apricot'), ('banana')) v(s)
+)) WHERE s LIKE 'app%' ORDER BY s;
+----
+app
+apple
+
+# Empty prefix — degenerate but should pass everything (well, modulo NULL).
+query T
+SELECT s FROM (VALUES ('a'), ('b')) v(s) WHERE s LIKE '%' ORDER BY s;
+----
+a
+b
+
+query T
+SELECT s FROM example.echo((
+  SELECT s FROM (VALUES ('a'), ('b')) v(s)
+)) WHERE s LIKE '%' ORDER BY s;
+----
+a
+b
+
+# ============================================================================
+# AND / OR
+# ============================================================================
+
+query T
+SELECT s FROM (VALUES ('apple'), ('banana'), ('cherry'), ('date')) v(s)
+WHERE s >= 'b' AND s < 'd' ORDER BY s;
+----
+banana
+cherry
+
+query T
+SELECT s FROM example.echo((
+  SELECT s FROM (VALUES ('apple'), ('banana'), ('cherry'), ('date')) v(s)
+)) WHERE s >= 'b' AND s < 'd' ORDER BY s;
+----
+banana
+cherry
+
+query T
+SELECT s FROM (VALUES ('apple'), ('banana'), ('cherry')) v(s)
+WHERE s = 'apple' OR s = 'cherry' ORDER BY s;
+----
+apple
+cherry
+
+query T
+SELECT s FROM example.echo((
+  SELECT s FROM (VALUES ('apple'), ('banana'), ('cherry')) v(s)
+)) WHERE s = 'apple' OR s = 'cherry' ORDER BY s;
+----
+apple
+cherry
+
+# AND with NULL on the unfiltered column — three-valued logic.
+query TT
+SELECT s, t FROM (VALUES ('a', 1::BIGINT),
+                         ('b', NULL::BIGINT),
+                         ('c', 3::BIGINT)) v(s, t)
+WHERE s >= 'b' AND t IS NOT NULL ORDER BY s;
+----
+c	3
+
+query TT
+SELECT s, t FROM example.echo((
+  SELECT s, t FROM (VALUES ('a', 1::BIGINT),
+                           ('b', NULL::BIGINT),
+                           ('c', 3::BIGINT)) v(s, t)
+)) WHERE s >= 'b' AND t IS NOT NULL ORDER BY s;
+----
+c	3
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;

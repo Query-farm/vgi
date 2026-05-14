@@ -38,8 +38,8 @@ struct VgiTableInOutBindData : public TableFunctionData {
 
 	// Connection parameters
 	std::shared_ptr<VgiAttachParameters> attach_params;  // replaces worker_path, worker_debug, use_pool
-	std::vector<uint8_t> attach_id;
-	std::vector<uint8_t> transaction_id;
+	std::vector<uint8_t> attach_opaque_data;
+	std::vector<uint8_t> transaction_opaque_data;
 	std::string function_name;
 	std::map<std::string, Value> settings;
 	std::vector<vgi::VgiSecretRequirement> required_secrets;
@@ -138,8 +138,8 @@ struct VgiTableInOutLocalState : public ArrowScanLocalState {
 struct VgiTableInOutBindParams {
 	std::shared_ptr<VgiAttachParameters> attach_params;  // replaces worker_path, worker_debug, use_pool
 	std::string function_name;
-	std::vector<uint8_t> attach_id;
-	std::vector<uint8_t> transaction_id;
+	std::vector<uint8_t> attach_opaque_data;
+	std::vector<uint8_t> transaction_opaque_data;
 	std::map<std::string, Value> settings;
 	std::vector<vgi::VgiSecretRequirement> required_secrets;
 

@@ -63,7 +63,7 @@ optional_ptr<CatalogEntry> VgiCatalog::CreateSchema(CatalogTransaction transacti
 
 	auto on_conflict = vgi::MapOnConflict(info.on_conflict);
 
-	vgi::CatalogRpcContext rpc_ctx{attach_parameters_, attach_result_->attach_id, vgi_tx.GetTransactionId()};
+	vgi::CatalogRpcContext rpc_ctx{attach_parameters_, attach_result_->attach_opaque_data, vgi_tx.GetTransactionOpaqueData()};
 	vgi::InvokeCatalogSchemaCreate(rpc_ctx, info.schema, on_conflict, context);
 
 	// Invalidate schema cache so re-fetch picks up the new schema. Use the
@@ -309,10 +309,10 @@ void VgiCatalog::AbsorbDroppedEntries(std::vector<unique_ptr<CatalogEntry>> entr
 	}
 }
 
-bool VgiCatalog::CheckAndInvalidateCache(ClientContext &context, const std::vector<uint8_t> &transaction_id) {
+bool VgiCatalog::CheckAndInvalidateCache(ClientContext &context, const std::vector<uint8_t> &transaction_opaque_data) {
 	// No attach_result_ means we never completed catalog_attach (e.g., the
 	// constructor allows it for in-progress / restored states). With no
-	// attach_id we can't address the worker, so skip the probe.
+	// attach_opaque_data we can't address the worker, so skip the probe.
 	if (!attach_result_) {
 		VGI_LOG(context, "catalog.invalidate.skip", {{"reason", "no_attach_result"}});
 		return false;
@@ -324,7 +324,7 @@ bool VgiCatalog::CheckAndInvalidateCache(ClientContext &context, const std::vect
 	}
 
 	// Query current version from the worker
-	vgi::CatalogRpcContext rpc_ctx{attach_parameters_, attach_result_->attach_id, transaction_id};
+	vgi::CatalogRpcContext rpc_ctx{attach_parameters_, attach_result_->attach_opaque_data, transaction_opaque_data};
 	int64_t current_version = vgi::InvokeCatalogVersion(rpc_ctx, context);
 	int64_t last_version = last_known_catalog_version_.load();
 
@@ -370,7 +370,7 @@ void VgiCatalog::DropSchema(ClientContext &context, DropInfo &info) {
 	}
 	auto &vgi_tx = VgiTransaction::Get(context, *this);
 
-	vgi::CatalogRpcContext rpc_ctx{attach_parameters_, attach_result_->attach_id, vgi_tx.GetTransactionId()};
+	vgi::CatalogRpcContext rpc_ctx{attach_parameters_, attach_result_->attach_opaque_data, vgi_tx.GetTransactionOpaqueData()};
 	vgi::InvokeCatalogSchemaDrop(rpc_ctx, info.name, ignore_not_found, cascade, context);
 
 	// Invalidate schema cache via the deferred path so any bound query
