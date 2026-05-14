@@ -1,0 +1,41 @@
+# name: test/sql/integration/table_in_out/buffered_finalize_crash.test
+# description: Worker raises during buffered_table_finalize — verify error
+#   propagates from the source phase; gstate teardown handles remaining
+#   workers; next query on the same catalog succeeds.
+# group: [vgi_integration_table_in_out]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ----------------------------------------------------------------------------
+# Finalize raises on the first yield — GetDataInternal's RpcBufferedTableFinalize
+# throws; the source pipeline tears down. Other workers in gstate.workers[]
+# are still in flight; the gstate destructor cancel-dispatches them.
+# ----------------------------------------------------------------------------
+
+statement error
+SELECT * FROM example.crash_on_finalize((SELECT 1::BIGINT AS v));
+----
+Intentional exception during finalize()
+
+# Wider input — multiple state_ids enter finalize; the first one to be
+# drained throws, the rest are abandoned.
+statement error
+SELECT * FROM example.crash_on_finalize((SELECT * FROM range(50) AS t(v)));
+----
+Intentional exception during finalize()
+
+# Recovery
+query I
+SELECT count(*) FROM example.buffer_input((SELECT * FROM range(25) AS t(v)));
+----
+25
+
+statement ok
+DETACH example;

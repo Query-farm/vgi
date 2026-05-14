@@ -1,0 +1,49 @@
+# name: test/sql/integration/table_in_out/buffered_large_state.test
+# description: Buffer ~50 MB of state per state_id through buffered_table_combine
+#   / _finalize — exercises Arrow IPC large-message handling on the response
+#   path. The function appends 1 MB per process() call; total payload is
+#   `(num_batches * 1 MB)`, where num_batches = ceil(N / STANDARD_VECTOR_SIZE).
+# group: [vgi_integration_table_in_out]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ----------------------------------------------------------------------------
+# Single-thread baseline — 100k rows ≈ 49 batches × 1 MB ≈ ~50 MB payload.
+# The function emits one row carrying the byte count; we assert non-zero +
+# above 32 MB so we know IPC chunking actually fired.
+# ----------------------------------------------------------------------------
+
+statement ok
+SET threads=1;
+
+query I
+SELECT v >= 32 * 1024 * 1024 FROM example.large_state((SELECT * FROM range(100000) AS t(v)));
+----
+true
+
+# ----------------------------------------------------------------------------
+# Parallel sink — each thread's state_id accumulates independently; finalize
+# emits one row per state_id; the total bytes across all rows should still
+# meet the lower-bound.
+# ----------------------------------------------------------------------------
+
+statement ok
+SET threads=4;
+
+query I
+SELECT sum(v) >= 32 * 1024 * 1024 FROM example.large_state((SELECT * FROM range(100000) AS t(v)));
+----
+true
+
+statement ok
+RESET threads;
+
+statement ok
+DETACH example;

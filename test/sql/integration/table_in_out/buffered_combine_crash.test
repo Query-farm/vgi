@@ -1,0 +1,43 @@
+# name: test/sql/integration/table_in_out/buffered_combine_crash.test
+# description: Worker raises Python exception during buffered_table_combine —
+#   verify the error propagates as IOException, the combine_worker is dropped
+#   (not pushed back), and the pool drains so the next query succeeds.
+# group: [vgi_integration_table_in_out]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ----------------------------------------------------------------------------
+# Combine raises — Sink::Finalize unwinds; the popped combine_worker is
+# destroyed (its unique_ptr drops); peer workers in gstate.workers[] are
+# released by the gstate destructor via cancel-dispatcher.
+# ----------------------------------------------------------------------------
+
+statement error
+SELECT * FROM example.crash_on_combine((SELECT 1::BIGINT AS v));
+----
+Intentional exception during combine()
+
+# Same again on a multi-row input — exercises combine with multiple state_ids.
+statement error
+SELECT * FROM example.crash_on_combine((SELECT * FROM range(100) AS t(v)));
+----
+Intentional exception during combine()
+
+# ----------------------------------------------------------------------------
+# Recovery: same catalog, clean buffered query must succeed.
+# ----------------------------------------------------------------------------
+
+query I
+SELECT count(*) FROM example.buffer_input((SELECT * FROM range(50) AS t(v)));
+----
+50
+
+statement ok
+DETACH example;

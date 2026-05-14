@@ -1,0 +1,45 @@
+# name: test/sql/integration/table_in_out/buffered_worker_crash.test
+# description: Worker SIGKILLs itself during buffered_table_process —
+#   verify the C++ side surfaces a clean error and the pool recovers so
+#   the next query against the same catalog succeeds on a fresh worker.
+# group: [vgi_integration_table_in_out]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ----------------------------------------------------------------------------
+# Worker SIGKILL mid-process — the unary RPC's response stream ends without
+# a schema; ReadUnaryResponse throws IOException. Sub-pipeline tears down
+# and any peer/in-flight workers are cancel-dispatched.
+# ----------------------------------------------------------------------------
+
+statement error
+SELECT * FROM example.crash_on_process((SELECT 1::BIGINT AS v));
+----
+RPC response stream EOF
+
+# ----------------------------------------------------------------------------
+# Recovery: pool entries should not be poisoned. A subsequent buffered query
+# against the same catalog must succeed — this proves the operator's error
+# path did not leak in-flight workers and that the pool's stale-conn retry
+# (AcquireAndBindConnection) gets a fresh worker.
+# ----------------------------------------------------------------------------
+
+query I
+SELECT count(*) FROM example.buffer_input((SELECT * FROM range(100) AS t(v)));
+----
+100
+
+query I
+SELECT * FROM example.sum_all_columns((SELECT * FROM range(10) AS t(v)));
+----
+45
+
+statement ok
+DETACH example;

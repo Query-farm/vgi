@@ -131,19 +131,19 @@ public:
 	// (same pattern the streaming InOut path uses on its error path).
 	DatabaseInstance *db = nullptr;
 
-	// The coordinator worker (set on the first Sink call). Used to send the
-	// combine RPC, then handed off into the workers list to also serve as a
-	// source-phase worker. Held under coordinator_mutex during init only.
-	std::mutex coordinator_mutex;
-	std::unique_ptr<IFunctionConnection> coordinator;
+	// Init coordination. The first Sink thread to arrive runs PerformInit on
+	// its own per-thread worker (no separate coordinator); peer threads wait
+	// here for execution_id to be published, then run their own secondary
+	// inits in parallel. `init_started` is the "someone is running init"
+	// latch; `init_done` flips to true once execution_id is publishable;
+	// `init_failed` lets waiters bail when the init runner threw.
+	std::mutex init_mutex;
+	std::condition_variable init_cv;
+	bool init_started = false;
+	bool init_failed = false;
+	std::atomic<bool> init_done {false};
 	std::vector<uint8_t> execution_id;
 	std::atomic<int64_t> state_id_counter {0};
-
-	// Sentinel flag for the coordinator-init double-checked-lock at the top
-	// of Sink. Reading `execution_id.empty()` without the mutex is a data
-	// race on std::vector; this atomic gives us release/acquire ordering
-	// against the store in the slow path so the fast path is safe.
-	std::atomic<bool> coordinator_inited {false};
 
 	// Per-thread workers handed off from Combine. Available for the source
 	// phase to grab via GetData. Also: state_ids[] runs parallel to workers[]
@@ -217,18 +217,14 @@ VgiBufferedTableFunctionGlobalSinkState::~VgiBufferedTableFunctionGlobalSinkStat
 		}
 		// `conn` (if not moved into req) drops here — best-effort.
 	};
-	if (coordinator) {
-		reclaim_or_cancel(std::move(coordinator));
-	}
 	for (auto &w : workers) {
 		reclaim_or_cancel(std::move(w));
 	}
 	workers.clear();
 	state_ids.clear();
 
-	// Any in-flight LocalSinkState connections will see `db == nullptr` cannot
-	// be set by us (we'd race their thread). Their own destructor handles
-	// cancel-dispatch via UntrackInFlight + the dispatcher pointer they cached.
+	// Any in-flight LocalSinkState connections handle their own cancel-dispatch
+	// via their destructor's cached gstate pointer + UntrackInFlight.
 }
 
 class VgiBufferedTableFunctionLocalSinkState : public LocalSinkState {
@@ -354,18 +350,18 @@ SinkResultType PhysicalVgiBufferedTableFunction::Sink(ExecutionContext &context,
 		    "the strict once-per-GlobalSinkState invariant has been violated.");
 	}
 
-	// First Sink call across the whole query acquires the coordinator and
-	// runs init with phase=BUFFERED_TABLE. Other threads block on the
-	// mutex briefly, then see gstate.execution_id populated and proceed.
+	// Init protocol — symmetric, no coordinator. The first Sink thread to
+	// arrive runs PerformInit on its OWN per-thread worker; that init mints
+	// the execution_id. Other threads wait on a CV until execution_id is
+	// publishable, then run their own per-thread secondary inits in parallel.
 	//
 	// The init RPC opens a Stream on the wire; for BUFFERED_TABLE we don't
-	// use that stream (all subsequent traffic is unary RPCs). The worker's
-	// stream-state is an empty TableInOutFinalizeState, but in exchange-
-	// mode (which is selected because we pass a non-null input_schema at
-	// bind), the worker is blocked waiting for input. Open the input writer
-	// and close it (sends EOS) so the worker's exchange loop completes,
-	// then drain ReadDataBatch to EOS. After that stdin/stdout are free for
-	// the unary buffered_table_* RPCs.
+	// use it (all subsequent traffic is unary RPCs). In exchange-mode (which
+	// is selected because we pass a non-null input_schema at bind), the
+	// worker is blocked waiting for input. Open the input writer and close
+	// it (sends EOS) so the worker's exchange loop completes, then drain
+	// ReadDataBatch to EOS. After that stdin/stdout are free for the unary
+	// buffered_table_* RPCs.
 	auto drain_init_stream = [](IFunctionConnection &conn) {
 		conn.OpenInputWriter();
 		conn.CloseInputWriter();
@@ -375,39 +371,74 @@ SinkResultType PhysicalVgiBufferedTableFunction::Sink(ExecutionContext &context,
 		}
 	};
 
-	// Coordinator-init double-checked lock. We read coordinator_inited with
-	// acquire ordering so the matching store-release at the end of the slow
-	// path synchronizes the fast-path's view of execution_id. Without this,
-	// the fast path's read of `execution_id` is a data race on std::vector.
-	if (!gstate.coordinator_inited.load(std::memory_order_acquire)) {
-		std::lock_guard<std::mutex> lk(gstate.coordinator_mutex);
-		if (!gstate.coordinator_inited.load(std::memory_order_relaxed)) {
-			auto params = BuildAcquireParams(bd, /*global_execution_id=*/{});
-			auto acquired = AcquireConnectionForInit(context.client, params);
-			gstate.coordinator = std::move(acquired.connection);
-			auto init_result = gstate.coordinator->PerformInit(bd.bind_result, /*projection_ids=*/{},
-			                                                    /*pushdown_filters=*/nullptr,
-			                                                    /*join_keys=*/{},
-			                                                    /*phase=*/"BUFFERED_TABLE");
-			gstate.execution_id = std::move(init_result.execution_id);
-			drain_init_stream(*gstate.coordinator);
-			gstate.coordinator_inited.store(true, std::memory_order_release);
-		}
-	}
-
-	// Per-thread acquisition: secondary init, reusing the coordinator's
-	// execution_id so the worker library treats the per-thread worker as
-	// "join this exec" (mirrors the parallel-aggregate is_secondary path).
 	if (!lstate.connection) {
-		auto params = BuildAcquireParams(bd, /*global_execution_id=*/gstate.execution_id);
-		auto acquired = AcquireConnectionForInit(context.client, params);
-		lstate.connection = std::move(acquired.connection);
-		lstate.connection->PerformInit(bd.bind_result, /*projection_ids=*/{},
-		                                /*pushdown_filters=*/nullptr,
-		                                /*join_keys=*/{},
-		                                /*phase=*/"BUFFERED_TABLE");
-		drain_init_stream(*lstate.connection);
-		lstate.state_id = gstate.state_id_counter.fetch_add(1);
+		bool i_am_runner = false;
+		std::vector<uint8_t> exec_id;
+
+		{
+			std::unique_lock<std::mutex> lk(gstate.init_mutex);
+			if (gstate.init_done.load(std::memory_order_relaxed)) {
+				// Init already published — secondary acquire path.
+				exec_id = gstate.execution_id;
+			} else if (!gstate.init_started) {
+				// First arrival — I will run init.
+				gstate.init_started = true;
+				i_am_runner = true;
+			} else {
+				// Init is in flight on another thread — wait it out.
+				gstate.init_cv.wait(lk, [&] {
+					return gstate.init_done.load(std::memory_order_relaxed) || gstate.init_failed;
+				});
+				if (gstate.init_failed) {
+					throw IOException("buffered_table init failed on peer thread");
+				}
+				exec_id = gstate.execution_id;
+			}
+		}
+
+		if (i_am_runner) {
+			// Acquire MY worker (no global_execution_id; we mint one) and run
+			// init on it. This worker then becomes my per-thread worker —
+			// state_id is assigned exactly as a secondary's would be. No
+			// dedicated coordinator process exists.
+			std::vector<uint8_t> minted_exec_id;
+			try {
+				auto params = BuildAcquireParams(bd, /*global_execution_id=*/{});
+				auto acquired = AcquireConnectionForInit(context.client, params);
+				lstate.connection = std::move(acquired.connection);
+				auto init_result = lstate.connection->PerformInit(bd.bind_result, /*projection_ids=*/{},
+				                                                    /*pushdown_filters=*/nullptr,
+				                                                    /*join_keys=*/{},
+				                                                    /*phase=*/"BUFFERED_TABLE");
+				minted_exec_id = std::move(init_result.execution_id);
+				drain_init_stream(*lstate.connection);
+				lstate.state_id = gstate.state_id_counter.fetch_add(1);
+			} catch (...) {
+				{
+					std::lock_guard<std::mutex> lk(gstate.init_mutex);
+					gstate.init_failed = true;
+				}
+				gstate.init_cv.notify_all();
+				throw;
+			}
+			{
+				std::lock_guard<std::mutex> lk(gstate.init_mutex);
+				gstate.execution_id = std::move(minted_exec_id);
+				gstate.init_done.store(true, std::memory_order_release);
+			}
+			gstate.init_cv.notify_all();
+		} else {
+			// Secondary acquire — runs in parallel with peer secondaries.
+			auto params = BuildAcquireParams(bd, exec_id);
+			auto acquired = AcquireConnectionForInit(context.client, params);
+			lstate.connection = std::move(acquired.connection);
+			lstate.connection->PerformInit(bd.bind_result, /*projection_ids=*/{},
+			                                /*pushdown_filters=*/nullptr,
+			                                /*join_keys=*/{},
+			                                /*phase=*/"BUFFERED_TABLE");
+			drain_init_stream(*lstate.connection);
+			lstate.state_id = gstate.state_id_counter.fetch_add(1);
+		}
 
 		// Cache pointers so lstate's destructor can cancel-dispatch on error,
 		// and register ourselves as in-flight so the gstate teardown path
@@ -452,54 +483,46 @@ SinkFinalizeType PhysicalVgiBufferedTableFunction::Finalize(Pipeline & /*pipelin
                                                               OperatorSinkFinalizeInput &input) const {
 	auto &gstate = input.global_state.Cast<VgiBufferedTableFunctionGlobalSinkState>();
 
-	// Snapshot state_ids and check emptiness under workers_mutex (not just
-	// "implied happens-before from Combine returning" — that's not a real
-	// synchronizes-with relationship on weakly-ordered hardware).
+	// Snapshot state_ids and pop one worker for the combine RPC, all under
+	// workers_mutex. No special "coordinator" — combine reads peer state
+	// through shared BoundStorage in the worker library, so any worker that
+	// finished init can serve. We pop one to avoid running combine and
+	// source-drain concurrently on the same connection.
 	std::vector<int64_t> state_ids_snapshot;
-	bool no_input;
+	std::unique_ptr<IFunctionConnection> combine_worker;
 	{
 		std::lock_guard<std::mutex> lk(gstate.workers_mutex);
-		no_input = gstate.workers.empty();
-		state_ids_snapshot = gstate.state_ids;
-	}
-
-	// No input ever arrived. Tear down the coordinator (if we even had one)
-	// and skip the combine RPC.
-	if (no_input) {
-		std::lock_guard<std::mutex> lk(gstate.coordinator_mutex);
-		if (gstate.coordinator) {
-			auto pooled = gstate.coordinator->ReleaseForPooling();
-			gstate.coordinator.reset();
-			if (pooled) {
-				VgiWorkerPool::Instance().Release(std::move(pooled));
-			}
+		if (gstate.workers.empty()) {
+			// No Sink thread ever ran process() — no input arrived. Skip
+			// combine entirely.
+			gstate.finalized.store(true);
+			return SinkFinalizeType::READY;
 		}
-		gstate.finalized.store(true);
-		return SinkFinalizeType::READY;
+		state_ids_snapshot = gstate.state_ids;
+		combine_worker = std::move(gstate.workers.back());
+		gstate.workers.pop_back();
 	}
 
-	// Send combine to the coordinator. The worker may coordinate with peer
-	// workers (shared BoundStorage etc.) and returns the finalize state IDs
-	// for the source phase.
+	// Run combine outside the lock — it's a network round-trip. Cleanup of a
+	// failed combine_worker is handled by its unique_ptr: it drops here and
+	// the gstate destructor will cancel-dispatch any workers still in
+	// gstate.workers[]. The combine_worker connection itself, if it throws,
+	// is destroyed at this scope's exit which releases its own pid/fd.
 	auto finalize_state_ids =
-	    gstate.coordinator->RpcBufferedTableCombine(gstate.function_name, gstate.execution_id,
-	                                                  state_ids_snapshot);
+	    combine_worker->RpcBufferedTableCombine(gstate.function_name, gstate.execution_id,
+	                                              state_ids_snapshot);
+
+	// Combine succeeded — push the worker back into the pool so source threads
+	// can use it like any other worker.
+	{
+		std::lock_guard<std::mutex> lk(gstate.workers_mutex);
+		gstate.workers.push_back(std::move(combine_worker));
+	}
 	{
 		std::lock_guard<std::mutex> lk(gstate.finalize_queue_mutex);
 		for (auto id : finalize_state_ids) {
 			gstate.finalize_queue.push_back(id);
 		}
-	}
-
-	// The coordinator now joins the source-phase worker pool. (Any worker
-	// can serve any finalize_state_id — the worker library handles peer
-	// coordination internally; from C++'s point of view they're equivalent.)
-	// We don't push a parallel entry into state_ids[] — that vector tracked
-	// sink-side state IDs to ship to combine, and combine has already run.
-	// Source-phase routing uses finalize_queue exclusively.
-	{
-		std::lock_guard<std::mutex> lk(gstate.workers_mutex);
-		gstate.workers.push_back(std::move(gstate.coordinator));
 	}
 	gstate.finalized.store(true);
 	return SinkFinalizeType::READY;
