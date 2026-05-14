@@ -18,6 +18,8 @@ require vgi
 
 require httpfs
 
+require json
+
 statement ok
 ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
@@ -114,8 +116,12 @@ FROM example.filter_echo_partitioned(10000) WHERE n BETWEEN 100 AND 199;
 (n >= 100 AND n <= 199)
 
 # ============================================================================
-# Multi-worker engagement — subprocess transport spawns one OS process per
-# worker, so COUNT(DISTINCT worker_pid) > 1 confirms parallel scan happened.
+# Multi-worker engagement — verify the parallel scan actually engaged more
+# than one worker. Counts distinct transport-neutral conn= ids in the
+# batch_received logs (the worker_pid output column is subprocess-only —
+# HTTP workers share one OS process — whereas conn= is present on both:
+# under subprocess each conn maps to a distinct worker pid, under HTTP each
+# conn is a distinct logical worker checkout against the remote server).
 # 200000 rows × 1000-row chunks = 200 chunks, enough work that the queue
 # race can't be drained by a single worker before others register, even
 # under heavy CPU contention (e.g. the integration suite running with
@@ -124,11 +130,21 @@ FROM example.filter_echo_partitioned(10000) WHERE n BETWEEN 100 AND 199;
 # ============================================================================
 
 statement ok
+CALL enable_logging(level := 'debug');
+
+statement ok
 SET threads=4;
 
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+SELECT COUNT(*) FROM example.filter_echo_partitioned(200000) WHERE n >= 1000;
+
 query I
-SELECT COUNT(DISTINCT worker_pid) > 1
-FROM example.filter_echo_partitioned(200000) WHERE n >= 1000;
+SELECT COUNT(DISTINCT regexp_extract(message, 'conn=([0-9a-f]+)', 1)) >= 2
+FROM duckdb_logs()
+WHERE type = 'VGI' AND message LIKE '%batch_received%';
 ----
 true
 
