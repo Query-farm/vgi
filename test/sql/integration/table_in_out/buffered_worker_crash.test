@@ -2,6 +2,12 @@
 # description: Worker SIGKILLs itself during buffered_table_process —
 #   verify the C++ side surfaces a clean error and the pool recovers so
 #   the next query against the same catalog succeeds on a fresh worker.
+#
+# Subprocess-only: SIGKILLing a worker in subprocess mode kills only that
+# child process; under HTTP transport the "worker" is the shared HTTP server,
+# so SIGKILL would tear down the entire test harness. Auto-skipped on HTTP
+# via the "skip on error_message matching 'HTTP'" rule (the first error
+# message contains [url: http://...] when running against HTTP).
 # group: [vgi_integration_table_in_out]
 
 require-env VGI_TEST_WORKER

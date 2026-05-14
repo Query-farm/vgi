@@ -413,6 +413,11 @@ SinkResultType PhysicalVgiBufferedTableFunction::Sink(ExecutionContext &context,
 				minted_exec_id = std::move(init_result.execution_id);
 				drain_init_stream(*lstate.connection);
 				lstate.state_id = gstate.state_id_counter.fetch_add(1);
+				VGI_LOG(context.client, "buffered_table.init",
+				        {{"conn", lstate.connection->GetConnIdHex()},
+				         {"function_name", bd.function_name},
+				         {"role", "init_runner"},
+				         {"state_id", std::to_string(lstate.state_id)}});
 			} catch (...) {
 				{
 					std::lock_guard<std::mutex> lk(gstate.init_mutex);
@@ -438,6 +443,11 @@ SinkResultType PhysicalVgiBufferedTableFunction::Sink(ExecutionContext &context,
 			                                /*phase=*/"BUFFERED_TABLE");
 			drain_init_stream(*lstate.connection);
 			lstate.state_id = gstate.state_id_counter.fetch_add(1);
+			VGI_LOG(context.client, "buffered_table.init",
+			        {{"conn", lstate.connection->GetConnIdHex()},
+			         {"function_name", bd.function_name},
+			         {"role", "secondary"},
+			         {"state_id", std::to_string(lstate.state_id)}});
 		}
 
 		// Cache pointers so lstate's destructor can cancel-dispatch on error,
@@ -451,6 +461,11 @@ SinkResultType PhysicalVgiBufferedTableFunction::Sink(ExecutionContext &context,
 
 	// Convert DuckDB chunk → Arrow batch and ship to worker.
 	auto input_batch = DataChunkToArrow(context.client, chunk, bd.input_schema);
+	VGI_LOG(context.client, "buffered_table.process",
+	        {{"conn", lstate.connection->GetConnIdHex()},
+	         {"function_name", bd.function_name},
+	         {"state_id", std::to_string(lstate.state_id)},
+	         {"input_rows", std::to_string(input_batch->num_rows())}});
 	lstate.connection->RpcBufferedTableProcess(gstate.function_name, gstate.execution_id, lstate.state_id,
 	                                            input_batch);
 	return SinkResultType::NEED_MORE_INPUT;
@@ -479,7 +494,7 @@ PhysicalVgiBufferedTableFunction::Combine(ExecutionContext & /*context*/,
 }
 
 SinkFinalizeType PhysicalVgiBufferedTableFunction::Finalize(Pipeline & /*pipeline*/, Event & /*event*/,
-                                                              ClientContext & /*context*/,
+                                                              ClientContext &context,
                                                               OperatorSinkFinalizeInput &input) const {
 	auto &gstate = input.global_state.Cast<VgiBufferedTableFunctionGlobalSinkState>();
 
@@ -508,9 +523,17 @@ SinkFinalizeType PhysicalVgiBufferedTableFunction::Finalize(Pipeline & /*pipelin
 	// the gstate destructor will cancel-dispatch any workers still in
 	// gstate.workers[]. The combine_worker connection itself, if it throws,
 	// is destroyed at this scope's exit which releases its own pid/fd.
+	VGI_LOG(context, "buffered_table.combine",
+	        {{"conn", combine_worker->GetConnIdHex()},
+	         {"function_name", gstate.function_name},
+	         {"num_state_ids", std::to_string(state_ids_snapshot.size())}});
 	auto finalize_state_ids =
 	    combine_worker->RpcBufferedTableCombine(gstate.function_name, gstate.execution_id,
 	                                              state_ids_snapshot);
+	VGI_LOG(context, "buffered_table.combine_result",
+	        {{"conn", combine_worker->GetConnIdHex()},
+	         {"function_name", gstate.function_name},
+	         {"num_finalize_state_ids", std::to_string(finalize_state_ids.size())}});
 
 	// Combine succeeded — push the worker back into the pool so source threads
 	// can use it like any other worker.
@@ -590,6 +613,10 @@ SourceResultType PhysicalVgiBufferedTableFunction::GetDataInternal(ExecutionCont
 		gstate.finalize_queue.pop_front();
 	}
 
+	VGI_LOG(context.client, "buffered_table.finalize",
+	        {{"conn", lstate.worker->GetConnIdHex()},
+	         {"function_name", gstate.function_name},
+	         {"finalize_state_id", std::to_string(lstate.current_finalize_state_id)}});
 	auto resp = lstate.worker->RpcBufferedTableFinalize(gstate.function_name, gstate.execution_id,
 	                                                     lstate.current_finalize_state_id);
 	lstate.has_more = resp.has_more;

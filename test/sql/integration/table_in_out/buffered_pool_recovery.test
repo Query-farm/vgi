@@ -3,6 +3,9 @@
 #   really it just exits), the next ATTACH+query gets a fresh worker. Exercises
 #   AcquireAndBindConnection's stale-conn EPIPE retry on the buffered path,
 #   and proves the pool doesn't retain dead PIDs.
+#
+# Subprocess-only — see buffered_worker_crash.test header for the explanation
+# of why SIGKILL semantics aren't testable through a shared HTTP server.
 # group: [vgi_integration_table_in_out]
 
 require-env VGI_TEST_WORKER
