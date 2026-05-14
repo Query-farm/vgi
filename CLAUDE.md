@@ -228,7 +228,6 @@ plus the shm-aware code paths in `src/vgi_function_connection.cpp`
 | `vgi_join_keys_max_bytes` | UBIGINT | 67108864 | Max estimated byte size for join keys batch |
 | `vgi_streaming_window` | BOOLEAN | true | Route eligible `OVER (...)` queries against VGI aggregates with `streaming_partitioned=true` through the custom streaming operator. Set to false to fall back to `PhysicalWindow` |
 | `vgi_buffered_table` | BOOLEAN | true | Rewrite calls to `Meta.buffered_table=True` functions through the Sink+Source `PhysicalVgiBufferedTableFunction` operator. Set to false to disable the rewrite — buffered queries then throw `InvalidInputException` instead of running (emergency-rollback path; not generally useful) |
-| `vgi_buffered_table_timeout_seconds` | BIGINT | 300 | Timeout for `buffered_table_process` / `_combine` / `_finalize` RPCs. These are data-phase calls (can run for minutes); separated from `vgi_catalog_timeout_seconds`. The read also polls the query's `interrupted` flag every 250 ms so Ctrl-C unblocks long reads |
 | `vgi_trust_empty_kinds` | BOOLEAN | true | Trust worker assertions that `estimated_object_count[kind] == 0` means the kind is empty (skip `catalog_schema_contents_*` RPC). Set to false to force every RPC to fire — debug escape hatch for diagnosing worker bugs |
 
 Catalogs may register additional settings at `ATTACH` time (e.g., `greeting`, `multiplier`).

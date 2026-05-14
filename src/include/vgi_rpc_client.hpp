@@ -102,10 +102,12 @@ struct UnaryResponseResult {
 // Throws IOException on EXCEPTION-level log batches.
 // The response stream has schema with "result" column (or empty for void methods).
 // worker_path/worker_pid are for error context.
-// timeout_seconds < 0 → use the catalog timeout (default).
-// timeout_seconds >= 0 → use that many seconds and poll the context's
-// `interrupted` flag every 250ms so user Ctrl-C unblocks long reads
-// (used by buffered_table RPCs which are data-phase, not catalog).
+// block_until_cancel=false → use the catalog timeout (default; bounds wait).
+// block_until_cancel=true  → block indefinitely, polling the context's
+//   `interrupted` flag every 250ms (used by data-phase RPCs like
+//   buffered_table_* that can legitimately run for arbitrary durations).
+//   Cleanup of an interrupted-mid-RPC connection is the caller's
+//   responsibility (route through VgiCancelDispatcher).
 UnaryResponseResult ReadUnaryResponse(int fd, ClientContext *context,
                                       const std::string &worker_path = "",
                                       pid_t worker_pid = -1,
@@ -113,7 +115,7 @@ UnaryResponseResult ReadUnaryResponse(int fd, ClientContext *context,
                                       const std::string &attach_opaque_data_hex = "",
                                       const std::string &transaction_opaque_data_hex = "",
                                       const std::string &conn_id_hex = "",
-                                      int timeout_seconds = -1);
+                                      bool block_until_cancel = false);
 
 // Result from reading a stream header
 struct StreamHeaderResult {

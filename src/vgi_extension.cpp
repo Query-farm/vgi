@@ -1275,12 +1275,6 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "Set to false to disable the rewrite — buffered_table queries "
 	                          "will then throw a clear InternalException instead of running.",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
-	config.AddExtensionOption("vgi_buffered_table_timeout_seconds",
-	                          "Timeout (seconds) for buffered_table_process / _combine / _finalize RPCs. "
-	                          "These are data-phase calls and can legitimately run for minutes, so the "
-	                          "default is longer than vgi_catalog_timeout_seconds. The read also polls "
-	                          "the query's interrupted flag every 250ms so Ctrl-C still works.",
-	                          LogicalType::BIGINT, Value::BIGINT(300));
 	OptimizerExtension::Register(config, VgiBufferedTableRewriter());
 
 	// Register worker pool settings

@@ -156,16 +156,13 @@ namespace vgi {
 // Returns CATALOG_OPERATION_TIMEOUT_SECONDS if context is null or setting is not found.
 int GetCatalogTimeout(ClientContext *context);
 
-// Get the buffered-table operation timeout from client context settings.
-// This is the timeout for buffered_table_process / _combine / _finalize RPCs,
-// which are data-phase calls and can legitimately run for minutes.
-// Returns 300 seconds if context is null or setting is not found.
-int GetBufferedTableTimeout(ClientContext *context);
-
 // Wait for a file descriptor to become readable, polling the context's
 // `interrupted` flag every 250ms so a user Ctrl-C breaks out of long blocking
-// reads instead of waiting for the deadline.
-void WaitForReadableInterruptible(int fd, ClientContext *context, int timeout_seconds);
+// reads. No deadline — used by data-phase RPCs (buffered_table_*) that can
+// legitimately run for arbitrary durations. Cleanup of an interrupted-mid-RPC
+// connection is the caller's responsibility (route through
+// VgiCancelDispatcher so the worker unblocks).
+void WaitForReadableUntilCancel(int fd, ClientContext *context);
 } // namespace vgi
 
 } // namespace duckdb

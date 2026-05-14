@@ -1061,7 +1061,7 @@ void FunctionConnection::RpcBufferedTableProcess(const std::string &function_nam
 	vgi::WriteRpcRequest(proc_->GetStdinFd(), "buffered_table_process", rpc_params);
 	auto response = vgi::ReadUnaryResponse(proc_->GetStdoutFd(), &context_, worker_path_, proc_->GetPid(),
 	                                       GetExecutionIdHex(), GetAttachOpaqueDataHex(), "", GetConnIdHex(),
-	                                       vgi::GetBufferedTableTimeout(&context_));
+	                                       /*block_until_cancel=*/true);
 	(void)DecodeOuterResponse(response, "buffered_table_process", worker_path_);
 }
 
@@ -1073,7 +1073,7 @@ std::vector<int64_t> FunctionConnection::RpcBufferedTableCombine(const std::stri
 	vgi::WriteRpcRequest(proc_->GetStdinFd(), "buffered_table_combine", rpc_params);
 	auto response = vgi::ReadUnaryResponse(proc_->GetStdoutFd(), &context_, worker_path_, proc_->GetPid(),
 	                                       GetExecutionIdHex(), GetAttachOpaqueDataHex(), "", GetConnIdHex(),
-	                                       vgi::GetBufferedTableTimeout(&context_));
+	                                       /*block_until_cancel=*/true);
 	auto inner = DecodeOuterResponse(response, "buffered_table_combine", worker_path_);
 	vgi::ValidateResponseSchema(inner, "buffered_table_combine", worker_path_);
 	if (!inner || inner->num_rows() == 0) {
@@ -1100,7 +1100,7 @@ IFunctionConnection::BufferedTableFinalizeResult FunctionConnection::RpcBuffered
 	vgi::WriteRpcRequest(proc_->GetStdinFd(), "buffered_table_finalize", rpc_params);
 	auto response = vgi::ReadUnaryResponse(proc_->GetStdoutFd(), &context_, worker_path_, proc_->GetPid(),
 	                                       GetExecutionIdHex(), GetAttachOpaqueDataHex(), "", GetConnIdHex(),
-	                                       vgi::GetBufferedTableTimeout(&context_));
+	                                       /*block_until_cancel=*/true);
 	auto inner = DecodeOuterResponse(response, "buffered_table_finalize", worker_path_);
 	vgi::ValidateResponseSchema(inner, "buffered_table_finalize", worker_path_);
 	if (!inner || inner->num_rows() == 0) {

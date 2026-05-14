@@ -148,13 +148,13 @@ UnaryResponseResult ReadUnaryResponse(int fd, ClientContext *context,
                                       const std::string &attach_opaque_data_hex,
                                       const std::string &transaction_opaque_data_hex,
                                       const std::string &conn_id_hex,
-                                      int timeout_seconds) {
-	// Wait for data to be available. A caller-supplied timeout (>= 0) signals
-	// this is a data-phase call (e.g. buffered_table_*) where the catalog
-	// timeout is wrong and we should also poll the interrupted flag so
-	// cancellation works during long blocking reads.
-	if (timeout_seconds >= 0) {
-		WaitForReadableInterruptible(fd, context, timeout_seconds);
+                                      bool block_until_cancel) {
+	// Data-phase callers (buffered_table_*) block until either the worker
+	// speaks or the query is cancelled — no wall-clock deadline. Catalog
+	// callers use the bounded catalog timeout so a wedged worker doesn't
+	// hang the planner.
+	if (block_until_cancel) {
+		WaitForReadableUntilCancel(fd, context);
 	} else {
 		WaitForReadable(fd, GetCatalogTimeout(context));
 	}
