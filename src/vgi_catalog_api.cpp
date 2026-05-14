@@ -1272,6 +1272,19 @@ std::optional<VgiOrderPreservation> ParseVgiOrderPreservation(const std::string 
 	return std::nullopt;
 }
 
+std::optional<VgiPartitionKind> ParseVgiPartitionKind(const std::string &value) {
+	if (value == "NOT_PARTITIONED") {
+		return VgiPartitionKind::NotPartitioned;
+	} else if (value == "SINGLE_VALUE_PARTITIONS") {
+		return VgiPartitionKind::SingleValuePartitions;
+	} else if (value == "OVERLAPPING_PARTITIONS") {
+		return VgiPartitionKind::OverlappingPartitions;
+	} else if (value == "DISJOINT_PARTITIONS") {
+		return VgiPartitionKind::DisjointPartitions;
+	}
+	return std::nullopt;
+}
+
 // Parse AggregateOrderDependent from wire format (Python enum .name)
 // Wire format: "ORDER_DEPENDENT", "NOT_ORDER_DEPENDENT"
 static std::optional<AggregateOrderDependent> ParseAggregateOrderDependent(const std::string &value) {
@@ -2161,6 +2174,17 @@ VgiFunctionInfo ParseFunctionInfo(const std::shared_ptr<arrow::RecordBatch> &bat
 	// reassemble parallel output. Also skips the FIXED_ORDER MaxThreads=1
 	// clamp — see vgi_table_function_set.cpp.
 	info.supports_batch_index = row["supports_batch_index"].value_or(false);
+
+	// partition_kind — optional string mirroring DuckDB's
+	// TablePartitionInfo enum. Defaults to NOT_PARTITIONED for older
+	// workers. When non-default, vgi_table_function_set.cpp installs
+	// ``TableFunction::get_partition_info`` returning the corresponding
+	// value so the planner can pick PhysicalPartitionedAggregate for
+	// matching GROUP BY queries. Only ``SINGLE_VALUE_PARTITIONS``
+	// materially affects planner behavior today.
+	auto partition_kind_str = row["partition_kind"].value_or(std::string {"NOT_PARTITIONED"});
+	info.partition_kind =
+	    ParseVgiPartitionKind(partition_kind_str).value_or(VgiPartitionKind::NotPartitioned);
 
 	// Aggregate function fields (non-nullable with defaults)
 	auto order_dependent_str = row["order_dependent"].value_or(std::string {"NOT_ORDER_DEPENDENT"});

@@ -77,6 +77,9 @@ public:
 	idx_t GetLastBatchIndex() const override {
 		return last_batch_index_;
 	}
+	const std::string &GetLastPartitionValuesBytes() const override {
+		return last_partition_values_bytes_;
+	}
 
 	// State queries
 	bool IsTableInOut() const override { return input_schema_ != nullptr; }
@@ -138,12 +141,21 @@ private:
 	// custom_metadata, or INVALID if absent. Validated in
 	// VgiTableFunctionImpl's InstallBatch on the consumer thread.
 	idx_t last_batch_index_ = DConstants::INVALID_INDEX;
+	// Base64-decoded raw IPC bytes from the most recent data batch's
+	// ``vgi_partition_values#b64`` metadata. Empty when the key is
+	// absent. IPC decode happens in InstallBatch on the consumer thread.
+	std::string last_partition_values_bytes_;
 	std::vector<std::shared_ptr<arrow::RecordBatch>> buffered_batches_;
 	// Parallel to ``buffered_batches_``: ``vgi_batch_index`` parsed off
 	// each batch's custom_metadata at buffer time (or INVALID if absent).
 	// We must capture this here because ``ReadDataBatch`` later returns
 	// batches from the buffer WITHOUT the original wire metadata.
 	std::vector<idx_t> buffered_batch_indexes_;
+	// Parallel to ``buffered_batches_``: ``vgi_partition_values#b64``
+	// base64-decoded bytes per batch (empty when absent). Same reason
+	// as ``buffered_batch_indexes_``: the buffered path returns batches
+	// without their wire metadata, so we stash the bytes here.
+	std::vector<std::string> buffered_partition_values_bytes_;
 	size_t buffered_batch_index_ = 0;
 	bool is_producer_mode_ = false;
 

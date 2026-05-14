@@ -1,0 +1,80 @@
+# name: test/sql/integration/table/partition_columns_contract.test
+# description: PartitionColumns contract enforcement. All four failure
+#              modes raise typed errors — two from the framework (worker-
+#              side, before the wire) and two from the C++ extension's
+#              InstallBatch (release-build enforcement of contract clauses
+#              that DuckDB's own assertions only check in debug).
+#
+# The ``broken_partition_min_neq_max`` test is the load-bearing one — it
+# proves the C++ defense-in-depth fires in release builds where DuckDB's
+# ``physical_partitioned_aggregate.cpp:104`` ``D_ASSERT`` is compiled out.
+# Without this, a worker emitting min != max would silently produce
+# wrong aggregate results.
+# group: [vgi_integration_table]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+require json
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# Missing vgi_partition_values metadata (C++ InstallBatch raises)
+# ============================================================================
+# Fixture bypasses the framework's wrapper validation by reaching into
+# the inner OutputCollector. The C++ side's InstallBatch checks for the
+# metadata key on non-empty data batches and raises when absent.
+
+statement error
+SELECT * FROM example.broken_missing_partition_values(5);
+----
+without vgi_partition_values metadata
+
+# ============================================================================
+# SINGLE_VALUE_PARTITIONS with min != max (C++ defense-in-depth raises)
+# ============================================================================
+# DuckDB's own ``Value::NotDistinctFrom(min, max)`` assertion at
+# ``physical_partitioned_aggregate.cpp:104`` is ``D_ASSERT`` (debug
+# only). The C++ extension's ``InstallBatch`` re-checks in release.
+# This test proves the release-build defense fires.
+#
+# Without GROUP BY the planner doesn't request PartitionColumns and
+# InstallBatch won't bother to validate. Trigger the path by adding
+# GROUP BY country.
+
+statement error
+SELECT country, COUNT(*) FROM example.broken_partition_min_neq_max(5)
+GROUP BY country;
+----
+SINGLE_VALUE_PARTITIONS contract violated
+
+# ============================================================================
+# partition_values kwarg without annotated fields (worker-side raise)
+# ============================================================================
+# Caught client-side; the wire is never reached.
+
+statement error
+SELECT * FROM example.broken_partition_values_no_annotation(5);
+----
+requires partition-annotated fields
+
+# ============================================================================
+# Annotated column absent from batch, no override (worker-side raise)
+# ============================================================================
+
+statement error
+SELECT * FROM example.broken_partition_column_absent_from_batch(5);
+----
+is partition-annotated but absent from emitted batch
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;

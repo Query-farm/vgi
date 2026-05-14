@@ -440,6 +440,31 @@ enum class VgiOrderPreservation {
 // Returns nullopt for unrecognized values
 std::optional<VgiOrderPreservation> ParseVgiOrderPreservation(const std::string &value);
 
+// Partition shape declared by a table function over its
+// vgi.partition_column-annotated bind-schema fields. Mirrors DuckDB's
+// duckdb::TablePartitionInfo enum (partition_stats.hpp:20).
+//
+//   "NOT_PARTITIONED"          -> TablePartitionInfo::NOT_PARTITIONED
+//   "SINGLE_VALUE_PARTITIONS"  -> TablePartitionInfo::SINGLE_VALUE_PARTITIONS
+//                                 (unlocks PhysicalPartitionedAggregate)
+//   "OVERLAPPING_PARTITIONS"   -> TablePartitionInfo::OVERLAPPING_PARTITIONS
+//                                 (wire-level declarable; no consumer in
+//                                 upstream DuckDB today)
+//   "DISJOINT_PARTITIONS"      -> TablePartitionInfo::DISJOINT_PARTITIONS
+//                                 (wire-level declarable; no consumer in
+//                                 upstream DuckDB today)
+enum class VgiPartitionKind {
+	NotPartitioned,
+	SingleValuePartitions,
+	OverlappingPartitions,
+	DisjointPartitions,
+};
+
+// Parse VgiPartitionKind from wire format string. Returns nullopt for
+// unrecognized values (treated as NotPartitioned by callers, matching
+// older-worker compatibility).
+std::optional<VgiPartitionKind> ParseVgiPartitionKind(const std::string &value);
+
 // ============================================================================
 // Function metadata from the worker (matches Python FunctionInfo)
 struct VgiFunctionInfo {
@@ -479,6 +504,22 @@ struct VgiFunctionInfo {
 	//   2. The FIXED_ORDER ``MaxThreads()=1`` clamp is skipped; the source
 	//      stays parallel and the sink does the ordering.
 	bool supports_batch_index = false;
+
+	// Partition shape declared by the function over its
+	// ``vgi.partition_column``-annotated bind-schema fields
+	// (Meta.partition_kind on the worker side). When non-NotPartitioned,
+	// vgi_table_function_set.cpp installs:
+	//   - ``table_func.get_partition_info = VgiGetPartitionInfo``
+	//     so DuckDB's planner can pick PhysicalPartitionedAggregate for
+	//     matching GROUP BY queries (today, only SINGLE_VALUE_PARTITIONS
+	//     materially changes planner behavior).
+	//   - ``table_func.get_partition_data = VgiGetPartitionData`` (also
+	//     installed for supports_batch_index; idempotent).
+	// Per-column annotation lives in the bind schema's per-field
+	// KeyValueMetadata (``vgi.partition_column == "true"``); the C++
+	// extension walks the output_schema once at bind time and stashes
+	// the matching column indices on bind_data.
+	VgiPartitionKind partition_kind = VgiPartitionKind::NotPartitioned;
 
 	// Expression filter function names the worker can evaluate (e.g., ["&&", "st_intersects_extent"])
 	std::vector<std::string> supported_expression_filters;

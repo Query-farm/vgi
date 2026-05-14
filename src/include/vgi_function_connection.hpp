@@ -368,9 +368,18 @@ private:
 	// thread BEFORE the next ReadDataBatch can fire (lockstep RPC
 	// protocol), so there is no aliasing race with the writer.
 	idx_t last_batch_index_ = DConstants::INVALID_INDEX;
+
+	// Base64-decoded raw IPC bytes from the most recent data batch's
+	// ``vgi_partition_values#b64`` metadata. Empty when the key is
+	// absent. IPC decode + validation happen in ``InstallBatch`` on
+	// the consumer thread (uniform across transports).
+	std::string last_partition_values_bytes_;
 public:
 	idx_t GetLastBatchIndex() const override {
 		return last_batch_index_;
+	}
+	const std::string &GetLastPartitionValuesBytes() const override {
+		return last_partition_values_bytes_;
 	}
 private:
 

@@ -1,6 +1,7 @@
 #include "vgi_http_function_connection.hpp"
 
 #include "duckdb.hpp"
+#include "duckdb/common/types/blob.hpp"
 #ifdef __EMSCRIPTEN__
 #include <pthread.h>
 #endif
@@ -51,6 +52,35 @@ static idx_t ParseVgiBatchIndex(const std::shared_ptr<arrow::KeyValueMetadata> &
 		throw IOException("VGI worker emitted vgi_batch_index '%s' that exceeds uint64 range "
 		                  "[url: %s]",
 		                  value, base_url);
+	}
+}
+
+// Helper: base64-decode the ``vgi_partition_values#b64`` payload into
+// raw Arrow IPC bytes. Returns empty string when the key is absent.
+// Raises IOException when present but the base64 is invalid. IPC
+// decode + validation happen downstream in InstallBatch.
+static std::string ParseVgiPartitionValuesBytes(
+    const std::shared_ptr<arrow::KeyValueMetadata> &custom_metadata,
+    const std::string &base_url) {
+	if (!custom_metadata) {
+		return "";
+	}
+	int idx = custom_metadata->FindKey("vgi_partition_values#b64");
+	if (idx < 0) {
+		return "";
+	}
+	const std::string &b64_value = custom_metadata->value(idx);
+	try {
+		string_t b64_str(b64_value.data(), static_cast<uint32_t>(b64_value.size()));
+		idx_t decoded_size = Blob::FromBase64Size(b64_str);
+		std::string out;
+		out.resize(decoded_size);
+		Blob::FromBase64(b64_str, data_ptr_cast(out.data()), decoded_size);
+		return out;
+	} catch (const std::exception &e) {
+		throw IOException("VGI worker emitted invalid base64 payload in "
+		                  "vgi_partition_values#b64: %s [url: %s]",
+		                  e.what(), base_url);
 	}
 }
 
@@ -202,6 +232,7 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ExtractStreamState(
 void HttpFunctionConnection::BufferDataBatches(const std::string &response_body, size_t offset) {
 	buffered_batches_.clear();
 	buffered_batch_indexes_.clear();
+	buffered_partition_values_bytes_.clear();
 	buffered_batch_index_ = 0;
 	stream_state_token_.clear();
 
@@ -256,6 +287,8 @@ void HttpFunctionConnection::BufferDataBatches(const std::string &response_body,
 			                                         bwm.custom_metadata);
 			buffered_batches_.push_back(resolved.batch);
 			buffered_batch_indexes_.push_back(ParseVgiBatchIndex(resolved.metadata, base_url_));
+			buffered_partition_values_bytes_.push_back(
+			    ParseVgiPartitionValuesBytes(resolved.metadata, base_url_));
 			ExtractStreamState(resolved.batch, resolved.metadata);
 			++spike_external_batches;
 			continue;
@@ -265,6 +298,8 @@ void HttpFunctionConnection::BufferDataBatches(const std::string &response_body,
 		ExtractStreamState(bwm.batch, bwm.custom_metadata);
 		buffered_batches_.push_back(bwm.batch);
 		buffered_batch_indexes_.push_back(ParseVgiBatchIndex(bwm.custom_metadata, base_url_));
+		buffered_partition_values_bytes_.push_back(
+		    ParseVgiPartitionValuesBytes(bwm.custom_metadata, base_url_));
 		++spike_data_batches;
 	}
 
@@ -585,6 +620,7 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 		// Return next buffered batch if available
 		if (buffered_batch_index_ < buffered_batches_.size()) {
 			last_batch_index_ = buffered_batch_indexes_[buffered_batch_index_];
+			last_partition_values_bytes_ = buffered_partition_values_bytes_[buffered_batch_index_];
 			return buffered_batches_[buffered_batch_index_++];
 		}
 
@@ -619,6 +655,7 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 
 		if (buffered_batch_index_ < buffered_batches_.size()) {
 			last_batch_index_ = buffered_batch_indexes_[buffered_batch_index_];
+			last_partition_values_bytes_ = buffered_partition_values_bytes_[buffered_batch_index_];
 			return buffered_batches_[buffered_batch_index_++];
 		}
 
@@ -689,11 +726,13 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 
 	std::shared_ptr<arrow::RecordBatch> output_batch;
 	std::string new_state_token;
-	// Reset batch_index BEFORE the loop. The HTTP response may contain a
-	// data batch followed by a 0-row continuation batch carrying only
-	// STATE_KEY; resetting inside the loop would let the continuation
-	// batch's pass clear a value parsed from the data batch.
+	// Reset batch_index + partition_values BEFORE the loop. The HTTP
+	// response may contain a data batch followed by a 0-row continuation
+	// batch carrying only STATE_KEY; resetting inside the loop would let
+	// the continuation batch's pass clear values parsed from the data
+	// batch.
 	last_batch_index_ = DConstants::INVALID_INDEX;
+	last_partition_values_bytes_.clear();
 
 	while (true) {
 		auto read_result = reader->ReadNext();
@@ -731,15 +770,19 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 
 		// Data batch — extract stream_state
 		new_state_token = ExtractStreamStateValue(bwm.custom_metadata);
-		// Parse vgi_batch_index off the wire if present. Only update on a
-		// positive match — a subsequent continuation batch carrying
-		// STATE_KEY but no vgi_batch_index must NOT clobber the value
-		// parsed from the upstream data batch. Validation (cap/monotonicity)
+		// Parse vgi_batch_index + vgi_partition_values#b64 off the wire
+		// if present. Only update on positive matches — a subsequent
+		// continuation batch carrying STATE_KEY but no values must NOT
+		// clobber values parsed from the upstream data batch. Validation
 		// happens in VgiTableFunctionImpl::InstallBatch on the consumer.
 		{
 			const idx_t parsed = ParseVgiBatchIndex(bwm.custom_metadata, base_url_);
 			if (parsed != DConstants::INVALID_INDEX) {
 				last_batch_index_ = parsed;
+			}
+			std::string pv = ParseVgiPartitionValuesBytes(bwm.custom_metadata, base_url_);
+			if (!pv.empty()) {
+				last_partition_values_bytes_ = std::move(pv);
 			}
 		}
 		if (!output_batch) {

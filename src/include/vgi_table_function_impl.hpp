@@ -153,6 +153,24 @@ struct VgiTableFunctionBindData : public TableFunctionData {
 	// global-uniqueness-only).
 	bool supports_batch_index = false;
 
+	// Partition shape declared by the worker over its annotated bind
+	// schema fields (Meta.partition_kind on the Python side). When non-
+	// ``NotPartitioned``, vgi_table_function_set.cpp installs
+	// ``table_func.get_partition_info`` returning the matching
+	// ``TablePartitionInfo`` value so the planner can pick
+	// PhysicalPartitionedAggregate for matching GROUP BY queries.
+	VgiPartitionKind partition_kind = VgiPartitionKind::NotPartitioned;
+
+	// Base column indices into the bind output schema for fields that
+	// carry the ``vgi.partition_column == "true"`` metadata marker.
+	// Resolved ONCE at bind by walking ``bind_result.output_schema``;
+	// stored here so ``VgiGetPartitionInfo`` does an O(P) membership
+	// check rather than re-walking the schema per planner call.
+	// Empty when ``partition_kind == NotPartitioned``; non-empty
+	// otherwise (registration-time check enforces this invariant via
+	// BinderException).
+	std::vector<idx_t> partition_column_indices;
+
 	mutable int64_t cardinality_estimate = -1;
 	// Optional max-cardinality, surfaced into DuckDB's NodeStatistics.
 	// -1 = unknown. Populated either from the inlined ``TableInfo``
@@ -444,6 +462,23 @@ struct VgiTableFunctionLocalState : public ArrowScanLocalState {
 	// ``BatchedDataCollection::Append`` assertion is debug-only).
 	idx_t current_batch_index = DConstants::INVALID_INDEX;
 
+	// Per-partition-column (min, max) ``duckdb::Value`` pairs decoded
+	// from the most recent data batch's ``vgi_partition_values#b64``
+	// metadata, in the order declared by
+	// ``VgiTableFunctionBindData::partition_column_indices``.
+	// Threaded into ``VgiGetPartitionData``'s
+	// ``OperatorPartitionData::partition_data`` so partition-aware
+	// sinks (today only ``PhysicalPartitionedAggregate``) can route
+	// chunks by min/max value.
+	//
+	// Same thread-safety contract as ``current_batch_index``: written
+	// ONLY by ``InstallBatch`` on the consumer thread. Empty until the
+	// first data batch decodes; cleared at scan setup. Used only when
+	// ``bind_data.partition_kind != NotPartitioned``.
+	// (Uses ``duckdb::vector`` to match
+	// ``OperatorPartitionData::partition_data``'s type alias.)
+	duckdb::vector<ColumnPartitionData> current_partition_data;
+
 	// Captured at init-local time; read by the destructor (which has no
 	// ClientContext available). Setting changes mid-query do not
 	// affect in-flight streams.
@@ -537,16 +572,32 @@ vector<column_t> VgiTableScanGetRowIdColumns(ClientContext &context, optional_pt
 //! set_scan_order callback - captures ORDER BY + LIMIT hint from RowGroupPruner optimizer
 void VgiSetScanOrder(unique_ptr<RowGroupOrderOptions> order_options, optional_ptr<FunctionData> bind_data_p);
 
-//! get_partition_data callback — returns the batch_index of the most
-//! recent data batch on this local source state. Registered ONLY for
-//! functions that opt in via ``Meta.supports_batch_index = True``
-//! (see vgi_table_function_set.cpp). DuckDB calls this per source chunk
-//! when an ordered sink (BatchCollector, BatchInsert, BatchCopyToFile,
-//! Limit) is in the pipeline. The returned ``OperatorPartitionData`` has
-//! empty ``partition_data`` — v1 only supports ``BatchIndex()`` mode, not
-//! ``PartitionColumns()`` (Hive-style routing into
-//! ``PhysicalPartitionedAggregate``).
+//! get_partition_data callback — returns the batch_index AND the
+//! per-column ``(min, max)`` ``ColumnPartitionData`` of the most recent
+//! data batch on this local source state. Both halves coexist; sinks
+//! consume whichever their ``RequiredPartitionInfo()`` requests:
+//!
+//!   * ``BatchIndex()`` sinks (BatchCollector, BatchInsert,
+//!     BatchCopyToFile, Limit) read ``batch_index``, ignore
+//!     ``partition_data``.
+//!   * ``PartitionColumns()`` sinks (PhysicalPartitionedAggregate)
+//!     read ``partition_data``, ignore ``batch_index``.
+//!
+//! Installed conditionally in vgi_table_function_set.cpp when the
+//! function opts in to either feature.
 OperatorPartitionData VgiGetPartitionData(ClientContext &context, TableFunctionGetPartitionInput &input);
+
+//! get_partition_info callback — reports the function's declared
+//! ``TablePartitionInfo`` over ``input.partition_ids`` (the column
+//! indices the planner is asking about). Returns ``NOT_PARTITIONED``
+//! when any requested column is NOT in the function's declared
+//! partition set; otherwise returns the mapped ``VgiPartitionKind``.
+//! Registered ONLY for functions whose worker declared
+//! ``Meta.partition_kind != NOT_PARTITIONED`` (see
+//! vgi_table_function_set.cpp). Today DuckDB's planner consumes only
+//! ``SINGLE_VALUE_PARTITIONS`` (at plan_aggregate.cpp:109); the other
+//! kinds are reported faithfully but fall back to ``HASH_GROUP_BY``.
+TablePartitionInfo VgiGetPartitionInfo(ClientContext &context, TableFunctionPartitionInput &input);
 
 //! Statistics callback - returns column statistics from VgiTableEntry (for catalog scans)
 //! or nullptr (for direct vgi_table_function calls)

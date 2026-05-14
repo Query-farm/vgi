@@ -1,0 +1,92 @@
+# name: test/sql/integration/table/partition_columns_stress.test_slow
+# description: Stress tests for PartitionColumns mode. Excluded from the
+#              fast suite by the ``.test_slow`` suffix.
+# group: [vgi_integration_table]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+require json
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+SET threads=4;
+
+# ============================================================================
+# High fanout — many partitions with the DISJOINT fixture
+# ============================================================================
+# ``disjoint_range_partitioned(N)`` emits N partitions of ``rows_per_partition``
+# rows each. With 1000 partitions × 100 rows = 100k rows total, the C++ side
+# decodes 1000 partition_values batches through the established
+# ArrowSchemaToDuckDBTypes + ArrowToDuckDB path.
+
+query I
+SELECT COUNT(*)
+FROM example.disjoint_range_partitioned(1000, rows_per_partition := 100);
+----
+100000
+
+# Min / max sanity: partition idx i emits keys in [i*1000, i*1000+rpp).
+# For 1000 partitions × 100 rows, max key = 999*1000 + 99 = 999099.
+query II
+SELECT MIN(key), MAX(key)
+FROM example.disjoint_range_partitioned(1000, rows_per_partition := 100);
+----
+0	999099
+
+# ============================================================================
+# Large per-partition chunks — 10 partitions × 100k rows
+# ============================================================================
+# Stresses the per-chunk metadata decode cost relative to row payload.
+
+query I
+SELECT COUNT(*)
+FROM example.disjoint_range_partitioned(10, rows_per_partition := 100000);
+----
+1000000
+
+# ============================================================================
+# Large GROUP BY scale on SINGLE_VALUE_PARTITIONS
+# ============================================================================
+# 5 countries × 100k rows. PARTITIONED_AGGREGATE path; result must
+# match the byte-identical expected sums.
+
+query II rowsort
+SELECT country, SUM(sales)
+FROM example.country_partitioned_sales(100000) GROUP BY country;
+----
+AU	4999950000
+BR	104999950000
+CA	204999950000
+FR	304999950000
+US	404999950000
+
+query II
+SELECT COUNT(*), COUNT(DISTINCT country)
+FROM example.country_partitioned_sales(100000);
+----
+500000	5
+
+# ============================================================================
+# Multi-column at scale
+# ============================================================================
+# 6 (region, year) tuples × 100k rows.
+
+query III rowsort
+SELECT region, year, COUNT(*)
+FROM example.region_year_partitioned(100000) GROUP BY region, year;
+----
+AMER	2023	100000
+AMER	2024	100000
+APAC	2023	100000
+APAC	2024	100000
+EMEA	2023	100000
+EMEA	2024	100000
+
+statement ok
+DETACH example;

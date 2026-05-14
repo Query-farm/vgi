@@ -120,6 +120,21 @@ public:
 		return duckdb::DConstants::INVALID_INDEX;
 	}
 
+	// Most recent ``vgi_partition_values#b64`` payload observed in the
+	// data batch's wire custom_metadata, base64-decoded into raw Arrow
+	// IPC stream bytes. Empty string when the metadata key is absent.
+	// Decoding the bytes into a 2-row RecordBatch + validation happens
+	// in ``InstallBatch`` on the consumer (pipeline-executor) thread,
+	// NOT here — uniform error reporting across transports, and the
+	// HTTP buffer path stashes raw bytes alongside batches without
+	// paying for the IPC decode until the consumer asks.
+	// Default returns empty so connections that don't yet implement
+	// the parse safely report "no partition_values seen."
+	virtual const std::string &GetLastPartitionValuesBytes() const {
+		static const std::string kEmpty;
+		return kEmpty;
+	}
+
 	// Cancel the current stream. Called off-thread by VgiCancelDispatcher
 	// from a destructor-triggered teardown; may throw (dispatcher catches).
 	// - Subprocess: writes a zero-row batch with VGI_RPC_CANCEL_KEY custom

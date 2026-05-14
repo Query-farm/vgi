@@ -1514,6 +1514,60 @@ static void UpdateDynamicFilterState(VgiTableFunctionGlobalState &global_state, 
 //! DuckDB internal error.
 static constexpr idx_t VGI_BATCH_INDEX_CAP = 10000000000000ULL;  // 10^13
 
+//! Convert a 2-row ``arrow::RecordBatch`` carrying ``(min, max)`` per
+//! partition column into a ``vector<ColumnPartitionData>`` via the
+//! established VGI Arrow-conversion machinery (the same path
+//! ``VgiTableFunctionScan`` uses for data batches —
+//! ``ArrowSchemaToDuckDBTypes`` + ``ArrowTableFunction::ArrowToDuckDB``).
+//! Reusing this code path is what guarantees lossless type handling
+//! for timestamps-with-tz, decimals, dictionary-encoded strings,
+//! extension types like ``geoarrow.wkb``, etc.
+//!
+//! Caller has already validated row-count, column-count, and column
+//! name/type alignment against the bind schema's partition fields.
+//! On failure (e.g. an Arrow type the conversion utility can't
+//! handle) any exception bubbles up.
+static duckdb::vector<ColumnPartitionData> ConvertPartitionValuesBatch(
+    ClientContext &context,
+    const std::shared_ptr<arrow::RecordBatch> &pv_batch) {
+	// Build an ArrowTableSchema + DuckDB LogicalTypes for the
+	// partition_values schema. ``names`` is filled too but unused.
+	ArrowSchemaWrapper c_schema;
+	ArrowTableSchema arrow_table;
+	vector<LogicalType> types;
+	vector<string> names;
+	ArrowSchemaToDuckDBTypes(context, pv_batch->schema(), c_schema, arrow_table, types, names);
+
+	// Export the 2-row record batch to the Arrow C ABI and stash it on
+	// a local scan state — the same shape ``VgiTableFunctionScan`` uses
+	// for the main data batch (vgi_table_function_impl.cpp:1757).
+	auto chunk_wrapper = make_uniq<ArrowArrayWrapper>();
+	ExportRecordBatch(pv_batch, *chunk_wrapper);
+
+	ArrowScanLocalState local_scan_state(std::move(chunk_wrapper), context);
+	local_scan_state.chunk_offset = 0;
+
+	// Convert into a 2-row DataChunk via DuckDB's standard Arrow path.
+	DataChunk chunk;
+	chunk.Initialize(Allocator::DefaultAllocator(), types, 2);
+	chunk.SetCardinality(2);
+	ArrowTableFunction::ArrowToDuckDB(local_scan_state, arrow_table.GetColumns(), chunk,
+	                                  /*arrow_scan_is_projected=*/false,
+	                                  COLUMN_IDENTIFIER_ROW_ID);
+
+	// Row 0 = min, row 1 = max per column. Pull as ``Value`` and
+	// build the ``ColumnPartitionData`` vector.
+	duckdb::vector<ColumnPartitionData> out;
+	out.reserve(chunk.ColumnCount());
+	for (idx_t col = 0; col < chunk.ColumnCount(); ++col) {
+		Value min_val = chunk.GetValue(col, 0);
+		Value max_val = chunk.GetValue(col, 1);
+		out.emplace_back(std::move(min_val));
+		out.back().max_val = std::move(max_val);
+	}
+	return out;
+}
+
 //! Install arrow_batch as the active chunk. Returns false on EOS (null batch).
 //! Caller is responsible for having already obtained arrow_batch either
 //! synchronously (via ReadDataBatch) or from the prefetch slot.
@@ -1567,6 +1621,113 @@ static bool InstallBatch(ClientContext &context, const VgiTableFunctionBindData 
 	// anyway, we silently ignore — non-opted-in functions shouldn't be
 	// tagging, but the harmless-passthrough behaviour matches our other
 	// metadata keys.
+
+	// PartitionColumns: decode the 2-row IPC RecordBatch (raw bytes were
+	// base64-decoded on the connection's reader thread; IPC decode +
+	// validation happen here on the consumer thread for uniform error
+	// reporting across transports).
+	if (bind_data.partition_kind != VgiPartitionKind::NotPartitioned) {
+		const std::string &pv_bytes = local_state.connection()->GetLastPartitionValuesBytes();
+		if (pv_bytes.empty()) {
+			throw IOException("VGI function '%s' with partition columns declared emitted a "
+			                  "non-empty data batch without vgi_partition_values metadata",
+			                  bind_data.function_name);
+		}
+		auto buf = arrow::Buffer::FromString(pv_bytes);
+		auto input = std::make_shared<arrow::io::BufferReader>(buf);
+		auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(input);
+		if (!reader_result.ok()) {
+			throw IOException("VGI function '%s' emitted invalid Arrow IPC payload in "
+			                  "vgi_partition_values#b64: %s",
+			                  bind_data.function_name,
+			                  reader_result.status().ToString());
+		}
+		auto reader = reader_result.ValueUnsafe();
+		auto next_result = reader->ReadNext();
+		if (!next_result.ok() || !next_result.ValueUnsafe().batch) {
+			throw IOException("VGI function '%s' emitted empty IPC stream in "
+			                  "vgi_partition_values#b64",
+			                  bind_data.function_name);
+		}
+		auto pv_batch = next_result.ValueUnsafe().batch;
+		if (pv_batch->num_rows() != 2) {
+			throw IOException("VGI function '%s' emitted vgi_partition_values with %lld rows "
+			                  "(expected exactly 2: row 0 = min, row 1 = max)",
+			                  bind_data.function_name,
+			                  static_cast<long long>(pv_batch->num_rows()));
+		}
+		const auto &declared_indices = bind_data.partition_column_indices;
+		if (static_cast<idx_t>(pv_batch->num_columns()) != declared_indices.size()) {
+			throw IOException("VGI function '%s' emitted vgi_partition_values with %d columns "
+			                  "(expected %llu — one per partition-annotated bind-schema field)",
+			                  bind_data.function_name, pv_batch->num_columns(),
+			                  static_cast<unsigned long long>(declared_indices.size()));
+		}
+		// Schema name + type cross-check against the bind output schema.
+		// We do this BEFORE the conversion so a typed error names the
+		// column rather than surfacing from deep inside ArrowToDuckDB.
+		const auto &bind_schema = bind_data.bind_result.output_schema;
+		for (idx_t i = 0; i < declared_indices.size(); ++i) {
+			const auto &declared_field = bind_schema->field(declared_indices[i]);
+			const auto &pv_field = pv_batch->schema()->field(static_cast<int>(i));
+			if (pv_field->name() != declared_field->name()) {
+				throw IOException("VGI function '%s' vgi_partition_values column %llu name "
+				                  "mismatch: declared '%s', got '%s'",
+				                  bind_data.function_name, static_cast<unsigned long long>(i),
+				                  declared_field->name(), pv_field->name());
+			}
+			if (!pv_field->type()->Equals(*declared_field->type())) {
+				throw IOException("VGI function '%s' vgi_partition_values column '%s' type "
+				                  "mismatch: declared %s, got %s",
+				                  bind_data.function_name, declared_field->name(),
+				                  declared_field->type()->ToString(),
+				                  pv_field->type()->ToString());
+			}
+		}
+
+		// Convert the 2-row Arrow batch into ``vector<ColumnPartitionData>``
+		// via the established ``ArrowSchemaToDuckDBTypes`` +
+		// ``ArrowTableFunction::ArrowToDuckDB`` path — same machinery that
+		// converts data batches in ``VgiTableFunctionScan``. Reusing this
+		// is what gives lossless type handling for timestamps-with-tz,
+		// decimals, dictionary-encoded strings, extension types, etc.
+		local_state.current_partition_data =
+		    ConvertPartitionValuesBatch(context, pv_batch);
+
+		// Defense in depth for SINGLE_VALUE_PARTITIONS: DuckDB's own
+		// assertion at physical_partitioned_aggregate.cpp:104 is
+		// ``D_ASSERT`` (debug only); we re-check in release.
+		if (bind_data.partition_kind == VgiPartitionKind::SingleValuePartitions) {
+			for (idx_t i = 0; i < local_state.current_partition_data.size(); ++i) {
+				const auto &entry = local_state.current_partition_data[i];
+				if (!Value::NotDistinctFrom(entry.min_val, entry.max_val)) {
+					throw IOException("VGI function '%s' SINGLE_VALUE_PARTITIONS contract "
+					                  "violated on column '%s': min (%s) != max (%s)",
+					                  bind_data.function_name,
+					                  bind_schema->field(declared_indices[i])->name(),
+					                  entry.min_val.ToString(), entry.max_val.ToString());
+				}
+			}
+		}
+		// Synthetic per-chunk batch_index for PartitionColumns mode.
+		// DuckDB's pipeline executor only fires the sink's ``NextBatch``
+		// (which is what copies ``partition_data`` into the sink's local
+		// state) when the source-returned ``batch_index`` *changes* from
+		// the previous chunk (pipeline_executor.cpp:147-149). For
+		// PartitionColumns-only functions the worker doesn't emit
+		// ``vgi_batch_index``, so ``current_batch_index`` would stay
+		// INVALID forever and the sink would never refresh its
+		// ``partition_data``. Bump a monotone counter per chunk to
+		// force the refresh. The actual values don't matter; only
+		// "changes per chunk" matters.
+		if (!bind_data.supports_batch_index) {
+			if (local_state.current_batch_index == DConstants::INVALID_INDEX) {
+				local_state.current_batch_index = 0;
+			} else {
+				local_state.current_batch_index++;
+			}
+		}
+	}
 
 	auto chunk = make_uniq<ArrowArrayWrapper>();
 	ExportRecordBatch(arrow_batch, *chunk);
@@ -2073,12 +2234,92 @@ void VgiSetScanOrder(unique_ptr<RowGroupOrderOptions> order_options, optional_pt
 // ``source_chunk.size() > 0``, which means ``InstallBatch`` already fired
 // at least once with a tagged data batch.
 //
-// ``partition_data`` left empty: v1 only handles BatchIndex() mode, not
-// PartitionColumns() (the latter would require per-column min/max from
-// the chunk for ``PhysicalPartitionedAggregate``).
+// Both halves of ``OperatorPartitionData`` are populated when the
+// function opts in to the respective mode; sinks pick what they need.
+// For batch_index-only functions, ``current_partition_data`` is empty
+// and ignored. For PartitionColumns-only functions,
+// ``current_batch_index`` stays INVALID and is ignored (sinks that
+// request ``PartitionColumns()`` don't read ``batch_index``).
+//
+// IMPORTANT: the sink (``PhysicalPartitionedAggregate::Sink``) reads
+// ``partition_data[i]`` indexed by its OWN partition columns position
+// (i.e. by GROUP BY column index 0..N-1), NOT by the source's
+// declared partition column index. So we must return
+// ``partition_data`` re-ordered to match
+// ``input.partition_info.partition_columns`` — the column indices the
+// sink is asking about.
 OperatorPartitionData VgiGetPartitionData(ClientContext &, TableFunctionGetPartitionInput &input) {
 	auto &local_state = input.local_state->Cast<VgiTableFunctionLocalState>();
-	return OperatorPartitionData(local_state.current_batch_index);
+	auto &bind_data = input.bind_data->Cast<VgiTableFunctionBindData>();
+	OperatorPartitionData result(local_state.current_batch_index);
+
+	// Re-order ``current_partition_data`` (indexed by declared order)
+	// into ``result.partition_data`` (indexed by the sink's requested
+	// column order). Only emit entries the sink asked for; ignore
+	// declared partition columns the sink doesn't care about.
+	if (!local_state.current_partition_data.empty() &&
+	    !input.partition_info.partition_columns.empty()) {
+		result.partition_data.reserve(input.partition_info.partition_columns.size());
+		for (column_t requested_col : input.partition_info.partition_columns) {
+			// Find this column in the declared partition indices.
+			idx_t declared_pos = DConstants::INVALID_INDEX;
+			for (idx_t i = 0; i < bind_data.partition_column_indices.size(); ++i) {
+				if (bind_data.partition_column_indices[i] == requested_col) {
+					declared_pos = i;
+					break;
+				}
+			}
+			if (declared_pos == DConstants::INVALID_INDEX) {
+				// Should not happen: ``VgiGetPartitionInfo`` returns
+				// NOT_PARTITIONED when the planner asks about a column
+				// we didn't declare, so the planner shouldn't pick
+				// PartitionedAggregate. Belt-and-suspenders.
+				throw InternalException(
+				    "VGI function '%s': sink requested partition column %llu that "
+				    "is not in the declared partition set",
+				    bind_data.function_name,
+				    static_cast<unsigned long long>(requested_col));
+			}
+			result.partition_data.push_back(local_state.current_partition_data[declared_pos]);
+		}
+	}
+	return result;
+}
+
+// get_partition_info: tells the planner whether the source guarantees a
+// particular partition shape over a given set of columns. Called from
+// ``CanUsePartitionedAggregate`` (plan_aggregate.cpp:108) during
+// GROUP BY planning.
+TablePartitionInfo VgiGetPartitionInfo(ClientContext &, TableFunctionPartitionInput &input) {
+	auto &bind_data = input.bind_data->Cast<VgiTableFunctionBindData>();
+	if (bind_data.partition_kind == VgiPartitionKind::NotPartitioned) {
+		return TablePartitionInfo::NOT_PARTITIONED;
+	}
+	// Every column the planner asks about must be in our declared
+	// partition set, otherwise we can't guarantee the partition shape.
+	for (auto col_id : input.partition_ids) {
+		bool found = false;
+		for (idx_t declared : bind_data.partition_column_indices) {
+			if (declared == col_id) {
+				found = true;
+				break;
+			}
+		}
+		if (!found) {
+			return TablePartitionInfo::NOT_PARTITIONED;
+		}
+	}
+	switch (bind_data.partition_kind) {
+	case VgiPartitionKind::SingleValuePartitions:
+		return TablePartitionInfo::SINGLE_VALUE_PARTITIONS;
+	case VgiPartitionKind::OverlappingPartitions:
+		return TablePartitionInfo::OVERLAPPING_PARTITIONS;
+	case VgiPartitionKind::DisjointPartitions:
+		return TablePartitionInfo::DISJOINT_PARTITIONS;
+	case VgiPartitionKind::NotPartitioned:
+	default:
+		return TablePartitionInfo::NOT_PARTITIONED;
+	}
 }
 
 // ============================================================================

@@ -106,6 +106,12 @@ static unique_ptr<FunctionData> VgiCatalogTableFunctionBind(ClientContext &conte
 		    OrderPreservationType::FIXED_ORDER;
 	}
 
+	// PartitionColumns mode: carry the wire ``partition_kind`` flag onto
+	// bind_data. ``partition_column_indices`` is resolved later, after
+	// ``PerformVgiTableFunctionBind`` populates the bind result's output
+	// schema (the per-field metadata we need is only available then).
+	bind_data->partition_kind = vgi_info.function_info().partition_kind;
+
 	// Build Arrow arguments from the function call inputs
 	// input.inputs contains positional arguments passed to the function
 	vector<Value> positional_args;
@@ -153,6 +159,40 @@ static unique_ptr<FunctionData> VgiCatalogTableFunctionBind(ClientContext &conte
 
 	// Perform the common bind handshake
 	vgi::PerformVgiTableFunctionBind(context, *bind_data, return_types, names);
+
+	// Resolve partition_column_indices by walking the bind output schema
+	// for fields whose metadata carries ``vgi.partition_column = "true"``.
+	// Per-field Arrow metadata round-trips losslessly through
+	// ``pa.Schema.serialize() -> arrow::ipc::ReadSchema``, which is what
+	// the bind RPC uses today. Doing this once at bind keeps
+	// ``VgiGetPartitionInfo`` cheap (O(P) membership check per planner
+	// call, no schema walk).
+	if (bind_data->partition_kind != vgi::VgiPartitionKind::NotPartitioned) {
+		const auto &out_schema = bind_data->bind_result.output_schema;
+		if (out_schema) {
+			for (int i = 0; i < out_schema->num_fields(); ++i) {
+				const auto &field = out_schema->field(i);
+				const auto &meta = field->metadata();
+				if (meta) {
+					int idx = meta->FindKey("vgi.partition_column");
+					if (idx >= 0 && meta->value(idx) == "true") {
+						bind_data->partition_column_indices.push_back(static_cast<idx_t>(i));
+					}
+				}
+			}
+		}
+		// Registration-time invariant: ``partition_kind != NotPartitioned``
+		// requires at least one annotated field. The worker library also
+		// enforces this at resolve_metadata; we check here as defense in
+		// depth (catches partial-deployment / version-skew bugs).
+		if (bind_data->partition_column_indices.empty()) {
+			throw BinderException(
+			    "VGI function '%s' declares partition_kind but no bind-schema "
+			    "field carries vgi.partition_column metadata; mark partition "
+			    "columns with vgi.schema_utils.partition_field()",
+			    bind_data->function_name);
+		}
+	}
 
 	input.table_function.projection_pushdown = bind_data->projection_pushdown;
 
@@ -318,6 +358,17 @@ void VgiTableFunctionSet::LoadEntries(ClientContext &context, const std::lock_gu
 				// batch carries ``vgi_batch_index`` in KeyValueMetadata —
 				// see ``InstallBatch`` for the parse + monotonicity check.
 				if (func_info.supports_batch_index) {
+					table_func.get_partition_data = vgi::VgiGetPartitionData;
+				}
+				// PartitionColumns opt-in: install the partition-info
+				// callback so the planner can ask whether the source is
+				// SINGLE_VALUE / OVERLAPPING / DISJOINT over the GROUP BY
+				// columns. Also installs get_partition_data (idempotent if
+				// supports_batch_index already did so) — PartitionColumns
+				// mode populates the ``partition_data`` half of
+				// OperatorPartitionData with per-column (min, max).
+				if (func_info.partition_kind != vgi::VgiPartitionKind::NotPartitioned) {
+					table_func.get_partition_info = vgi::VgiGetPartitionInfo;
 					table_func.get_partition_data = vgi::VgiGetPartitionData;
 				}
 				// INITIALIZE_ON_SCHEDULE would move init_global into

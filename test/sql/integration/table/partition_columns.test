@@ -1,0 +1,210 @@
+# name: test/sql/integration/table/partition_columns.test
+# description: v2 PartitionColumns mode for Hive-style partitioning.
+#              Workers declare Meta.partition_kind and annotate bind-schema
+#              fields with vgi.partition_column metadata; the C++ extension
+#              installs TableFunction::get_partition_info and populates the
+#              partition_data half of OperatorPartitionData. The planner
+#              picks PhysicalPartitionedAggregate (PARTITIONED_AGGREGATE in
+#              EXPLAIN) over PhysicalHashAggregate (HASH_GROUP_BY) for
+#              matching GROUP BY queries.
+#
+# NOTE: the ">=2 distinct conn=" parallelism assertion is meaningful on
+# subprocess transport only — under HTTP DuckDB eagerly allocates a
+# logical worker per pipeline task. Correctness assertions hold on both.
+# group: [vgi_integration_table]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+require json
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+SET threads=4;
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+# Pool warmup so the parallelism assertion below isn't racy.
+statement ok
+SELECT COUNT(*) FROM example.country_partitioned_sales(100);
+
+# ============================================================================
+# Planner check — the central proof of the feature.
+# ============================================================================
+# `EXPLAIN GROUP BY country` must show `PARTITIONED_AGGREGATE`. Without
+# v2 wiring, the planner falls back to HASH_GROUP_BY because the
+# source's get_partition_info isn't registered.
+
+query II
+EXPLAIN SELECT country, SUM(sales)
+FROM example.country_partitioned_sales(100) GROUP BY country;
+----
+physical_plan	<REGEX>:.*PARTITIONED_AGGREGATE.*
+
+# ============================================================================
+# Aggregate correctness — country partitioned sales
+# ============================================================================
+# Each country gets rows_per_country rows; sales values are
+# ``country_idx * 1_000_000 + i`` for i in [0, rpc).
+# rows_per_country = 100, so per-country sum = base*100 + sum(0..99)
+#                                            = base*100 + 4950.
+
+query II rowsort
+SELECT country, SUM(sales)
+FROM example.country_partitioned_sales(100) GROUP BY country;
+----
+AU	4950
+BR	100004950
+CA	200004950
+FR	300004950
+US	400004950
+
+# Total row count + distinct partitions.
+query II
+SELECT COUNT(*), COUNT(DISTINCT country)
+FROM example.country_partitioned_sales(100);
+----
+500	5
+
+# ============================================================================
+# Multi-column partitioning — (region, year)
+# ============================================================================
+
+query II
+EXPLAIN SELECT region, year, AVG(value)
+FROM example.region_year_partitioned(50) GROUP BY region, year;
+----
+physical_plan	<REGEX>:.*PARTITIONED_AGGREGATE.*
+
+# Per-(region, year) average. base = partition_idx * 1000;
+# values = base + [0, 50), so avg = base + 24.5.
+# Partition order: AMER 2023 (idx 0), AMER 2024 (idx 1), EMEA 2023 (idx 2),
+#                  EMEA 2024 (idx 3), APAC 2023 (idx 4), APAC 2024 (idx 5).
+
+query III rowsort
+SELECT region, year, AVG(value)
+FROM example.region_year_partitioned(50) GROUP BY region, year;
+----
+AMER	2023	24.5
+AMER	2024	1024.5
+APAC	2023	4024.5
+APAC	2024	5024.5
+EMEA	2023	2024.5
+EMEA	2024	3024.5
+
+# GROUP BY a strict subset of partition columns: declared = [region, year],
+# requested = [region]. The planner may or may not pick
+# PARTITIONED_AGGREGATE for the subset (single-valued per chunk only
+# holds when ALL declared columns are constant per chunk, which is the
+# precondition the source promised). We only assert correctness.
+# Per-region sum = sum over 2 years × 50 rows. Year offsets are
+# partition_idx * 1000; per-region pair_sum = (idx_2023*1000 + idx_2024*1000)*50
+# + 2*sum(0..49) = (50+50+...)+1225+1225.
+
+query II rowsort
+SELECT region, SUM(value) FROM example.region_year_partitioned(50) GROUP BY region;
+----
+AMER	52450
+APAC	452450
+EMEA	252450
+
+# ============================================================================
+# Explicit override path — partitioned_with_explicit_override
+# ============================================================================
+# Worker explicitly supplies partition_values= on out.emit even though
+# the column is in the emitted batch. Exercises the explicit override
+# validation + IPC build path.
+
+query II
+EXPLAIN SELECT category, SUM(revenue)
+FROM example.partitioned_with_explicit_override(20) GROUP BY category;
+----
+physical_plan	<REGEX>:.*PARTITIONED_AGGREGATE.*
+
+# revenue = (category_idx + 1) * 100 + i for i in [0, 20)
+# per-category sum = (idx+1)*100*20 + sum(0..19) = (idx+1)*2000 + 190.
+# Order: books (idx=0) → 2190, music (idx=1) → 4190, video (idx=2) → 6190.
+
+query II rowsort
+SELECT category, SUM(revenue)
+FROM example.partitioned_with_explicit_override(20) GROUP BY category;
+----
+books	2190
+music	4190
+video	6190
+
+# ============================================================================
+# DISJOINT fallback — DuckDB has no consumer for DISJOINT_PARTITIONS
+# today, so GROUP BY against a DISJOINT source falls back to HASH_GROUP_BY.
+# ============================================================================
+
+query II
+EXPLAIN SELECT key, SUM(value)
+FROM example.disjoint_range_partitioned(3) GROUP BY key;
+----
+physical_plan	<REGEX>:.*HASH_GROUP_BY.*
+
+# Correctness still holds — the wire path carries (min, max) but DuckDB
+# ignores it; hash aggregation produces the right answer.
+query I
+SELECT COUNT(*) FROM example.disjoint_range_partitioned(5);
+----
+50
+
+# ============================================================================
+# Filter pushdown on the partition column
+# ============================================================================
+
+query II rowsort
+SELECT country, SUM(sales)
+FROM example.country_partitioned_sales(50)
+WHERE country IN ('AU', 'CA') GROUP BY country;
+----
+AU	1225
+CA	100001225
+
+# ============================================================================
+# Larger scale — verify count/sum correctness at threads=4
+# ============================================================================
+# Parallel-scan parallelism itself is covered by the v1 batch_index suite;
+# v2 is about planner choice + correctness, so we don't re-assert >=2
+# conn= ids here.
+
+query II
+SELECT COUNT(*), SUM(sales)
+FROM example.country_partitioned_sales(1000);
+----
+5000	10002497500
+
+# ============================================================================
+# threads=1 baseline — same numerical results
+# ============================================================================
+
+statement ok
+SET threads=1;
+
+query II rowsort
+SELECT country, SUM(sales)
+FROM example.country_partitioned_sales(100) GROUP BY country;
+----
+AU	4950
+BR	100004950
+CA	200004950
+FR	300004950
+US	400004950
+
+statement ok
+SET threads=4;
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;

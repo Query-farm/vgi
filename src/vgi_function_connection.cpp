@@ -1,6 +1,7 @@
 #include "vgi_function_connection.hpp"
 
 #include "duckdb.hpp"
+#include "duckdb/common/types/blob.hpp"
 #include "duckdb/logging/log_manager.hpp"
 
 #include "vgi_arrow_ipc.hpp"
@@ -768,6 +769,29 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 			}
 			if (std::getenv("VGI_RPC_SHM_DEBUG") && result.batch && result.batch->num_rows() > 0) {
 				fprintf(stderr, "[shm] inline fallback (rows=%lld)\n", (long long)result.batch->num_rows());
+			}
+		}
+
+		// Parse vgi_partition_values#b64 off the wire metadata. Base64-
+		// decode here; IPC decode + validation happen in InstallBatch on
+		// the consumer thread (uniform error reporting across transports).
+		last_partition_values_bytes_.clear();
+		if (result.custom_metadata) {
+			int pv_idx = result.custom_metadata->FindKey("vgi_partition_values#b64");
+			if (pv_idx >= 0) {
+				const std::string &b64_value = result.custom_metadata->value(pv_idx);
+				try {
+					string_t b64_str(b64_value.data(), static_cast<uint32_t>(b64_value.size()));
+					idx_t decoded_size = Blob::FromBase64Size(b64_str);
+					last_partition_values_bytes_.resize(decoded_size);
+					Blob::FromBase64(b64_str,
+					                 data_ptr_cast(last_partition_values_bytes_.data()),
+					                 decoded_size);
+				} catch (const std::exception &e) {
+					throw IOException("VGI worker emitted invalid base64 payload in "
+					                  "vgi_partition_values#b64: %s [worker: %s, pid: %d]",
+					                  e.what(), worker_path_, proc_ ? proc_->GetPid() : 0);
+				}
 			}
 		}
 
