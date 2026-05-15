@@ -714,6 +714,19 @@ IFunctionConnection::BufferedTableFinalizeResult HttpFunctionConnection::RpcBuff
 	return BufferedTableFinalizeResult{batch, has_more_col->Value(0)};
 }
 
+void HttpFunctionConnection::RpcBufferedTableDestructor(const std::string &function_name,
+                                                         const std::vector<uint8_t> &execution_id) {
+	auto rpc_params = vgi::BuildBufferedTableDestructorInner(function_name, execution_id, attach_opaque_data_);
+	auto auth = attach_params_ ? attach_params_->auth() : nullptr;
+	auto cached_params = attach_params_
+	    ? attach_params_->GetOrInitHttpParams(context_, base_url_) : nullptr;
+	auto resp = HttpInvokeUnary(context_, base_url_, "buffered_table_destructor", rpc_params, auth,
+	                             /*cookie_jar=*/nullptr, cached_params,
+	                             GetExecutionIdHex(), GetAttachOpaqueDataHex(), "", GetConnIdHex());
+	auto inner = DecodeHttpOuterResponse(resp, "buffered_table_destructor", base_url_);
+	(void)inner; // empty response — no fields to extract
+}
+
 std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 	if (!init_done_) {
 		throw IOException("HttpFunctionConnection::ReadDataBatch called before PerformInit [url: %s]", base_url_);

@@ -43,5 +43,10 @@ BuildBufferedTableFinalizeInner(const std::string &function_name,
                                  int64_t finalize_state_id,
                                  const std::vector<uint8_t> &attach_opaque_data);
 
+std::shared_ptr<arrow::RecordBatch>
+BuildBufferedTableDestructorInner(const std::string &function_name,
+                                   const std::vector<uint8_t> &execution_id,
+                                   const std::vector<uint8_t> &attach_opaque_data);
+
 } // namespace vgi
 } // namespace duckdb

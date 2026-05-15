@@ -253,6 +253,8 @@ public:
 	BufferedTableFinalizeResult RpcBufferedTableFinalize(const std::string &function_name,
 	                                                      const std::vector<uint8_t> &execution_id,
 	                                                      int64_t finalize_state_id) override;
+	void RpcBufferedTableDestructor(const std::string &function_name,
+	                                 const std::vector<uint8_t> &execution_id) override;
 
 	// Check if this is a table-in-out function (has input schema)
 	bool IsTableInOut() const override {

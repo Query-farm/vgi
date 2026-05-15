@@ -140,6 +140,14 @@ public:
 	                                                              const std::vector<uint8_t> &execution_id,
 	                                                              int64_t finalize_state_id) = 0;
 
+	// Best-effort end-of-query cleanup for buffered_table. The worker pops
+	// any per-execution caches and wipes its FunctionStorage rows. The
+	// PhysicalVgiBufferedTableFunction operator fires this from its
+	// global-state destructor on every code path (success, cancel, throw).
+	// Implementations must not let exceptions escape — destructor context.
+	virtual void RpcBufferedTableDestructor(const std::string &function_name,
+	                                         const std::vector<uint8_t> &execution_id) = 0;
+
 	// Most recent stream-state token observed on this connection
 	// (HTTP only). Returns empty on subprocess. Used by the cancel
 	// dispatcher to address the right worker under HTTP pooling.

@@ -137,6 +137,8 @@ const std::unordered_map<std::string, ResponseSchema> &Registry() {
 		    ResponseSchema{AggregateDestructorResultSchema(), nullptr, false, nullptr};
 		m["buffered_table_process"] =
 		    ResponseSchema{BufferedTableProcessResultSchema(), nullptr, false, nullptr};
+		m["buffered_table_destructor"] =
+		    ResponseSchema{BufferedTableDestructorResultSchema(), nullptr, false, nullptr};
 		m["aggregate_window_init"] =
 		    ResponseSchema{AggregateWindowInitResultSchema(), nullptr, false, nullptr};
 		m["aggregate_window_destructor"] =
@@ -237,6 +239,7 @@ const std::unordered_map<std::string, ResponseSchema> &Registry() {
 		    {"buffered_table_process", &BufferedTableProcessParamsSchema},
 		    {"buffered_table_combine", &BufferedTableCombineParamsSchema},
 		    {"buffered_table_finalize", &BufferedTableFinalizeParamsSchema},
+		    {"buffered_table_destructor", &BufferedTableDestructorParamsSchema},
 		};
 		for (const auto &e : kRequestSchemas) {
 			auto it = m.find(e.name);

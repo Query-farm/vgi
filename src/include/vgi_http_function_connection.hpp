@@ -84,6 +84,8 @@ public:
 	BufferedTableFinalizeResult RpcBufferedTableFinalize(const std::string &function_name,
 	                                                      const std::vector<uint8_t> &execution_id,
 	                                                      int64_t finalize_state_id) override;
+	void RpcBufferedTableDestructor(const std::string &function_name,
+	                                 const std::vector<uint8_t> &execution_id) override;
 	std::vector<uint8_t> GetLastStateToken() const override {
 		return std::vector<uint8_t>(stream_state_token_.begin(), stream_state_token_.end());
 	}

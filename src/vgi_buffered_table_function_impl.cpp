@@ -9,8 +9,10 @@
 #include "duckdb/main/database.hpp"
 
 #include "vgi_arrow_utils.hpp"
+#include "vgi_buffered_table_builders.hpp"
 #include "vgi_cancel_dispatcher.hpp"
 #include "vgi_logging.hpp"
+#include "vgi_unary_rpc.hpp"
 #include "vgi_worker_pool.hpp"
 
 namespace duckdb {
@@ -181,6 +183,14 @@ public:
 	std::string function_name;
 	std::vector<uint8_t> attach_opaque_data;
 
+	// Captured at GetGlobalSinkState time so the destructor can fire a
+	// best-effort buffered_table_destructor RPC after the source phase
+	// drains. context_weak goes null if the originating session ends
+	// before teardown completes; attach_params keeps the connection
+	// metadata alive (worker_path, auth, pool flags) regardless.
+	weak_ptr<ClientContext> context_weak;
+	std::shared_ptr<VgiAttachParameters> attach_params;
+
 	// True once Sink::Finalize has fired (mirrors aggregate gstates).
 	std::atomic<bool> finalized {false};
 
@@ -233,6 +243,47 @@ VgiBufferedTableFunctionGlobalSinkState::~VgiBufferedTableFunctionGlobalSinkStat
 
 	// Any in-flight LocalSinkState connections handle their own cancel-dispatch
 	// via their destructor's cached gstate pointer + UntrackInFlight.
+
+	// Best-effort buffered_table_destructor RPC. Wipes the worker's
+	// FunctionStorage rows for this execution_id (b"buf_init" metadata,
+	// b"buf" per-state-id slots, b"buf" append log) and pops any
+	// in-process iter caches. Delivery is best-effort:
+	//   * ClientContext gone (session ended early): skip; cleanup_old_entries
+	//     is the FunctionStorage backstop.
+	//   * execution_id never published (init failed before completing):
+	//     nothing to clean; skip.
+	//   * RPC throws: swallow; we're in a destructor.
+	if (!execution_id.empty() && attach_params) {
+		auto context_lock = context_weak.lock();
+		if (context_lock) {
+			try {
+				auto rpc_params = vgi::BuildBufferedTableDestructorInner(
+				    function_name, execution_id, attach_opaque_data);
+				vgi::UnaryRpcOptions opts {*context_lock,
+				                            attach_params->worker_path(),
+				                            attach_params->worker_debug(),
+				                            attach_params->use_pool(),
+				                            attach_params->data_version_spec(),
+				                            attach_params->implementation_version(),
+				                            "rpc_buffered_table_destructor",
+				                            attach_params->auth(),
+				                            attach_params->cookie_jar(),
+				                            /*enable_logging=*/false};
+				if (attach_params->launcher_idle_timeout_seconds().has_value()) {
+					opts.launcher_idle_timeout =
+					    std::chrono::seconds(*attach_params->launcher_idle_timeout_seconds());
+				}
+				if (attach_params->launcher_state_dir().has_value()) {
+					opts.launcher_state_dir = *attach_params->launcher_state_dir();
+				}
+				(void)vgi::InvokePooledUnaryRpc(opts, "buffered_table_destructor", rpc_params);
+			} catch (...) {
+				// Swallow — destructor must not throw. The worker side's
+				// cleanup_old_entries (1-day default) is the long-term
+				// FunctionStorage GC backstop for missed RPCs.
+			}
+		}
+	}
 }
 
 class VgiBufferedTableFunctionLocalSinkState : public LocalSinkState {
@@ -333,6 +384,12 @@ PhysicalVgiBufferedTableFunction::GetGlobalSinkState(ClientContext &context) con
 	auto &bd = bind_data->Cast<VgiTableInOutBindData>();
 	gstate->function_name = bd.function_name;
 	gstate->attach_opaque_data = bd.attach_opaque_data;
+	// Captured for the best-effort destructor RPC fired from
+	// ~VgiBufferedTableFunctionGlobalSinkState. context.shared_from_this()
+	// gives us a non-owning observer; if the session ends before teardown
+	// runs the destructor swallows and relies on cleanup_old_entries.
+	gstate->context_weak = context.shared_from_this();
+	gstate->attach_params = bd.attach_params;
 	return std::move(gstate);
 }
 

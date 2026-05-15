@@ -1114,6 +1114,25 @@ IFunctionConnection::BufferedTableFinalizeResult FunctionConnection::RpcBuffered
 	return BufferedTableFinalizeResult{batch, has_more_col->Value(0)};
 }
 
+void FunctionConnection::RpcBufferedTableDestructor(const std::string &function_name,
+                                                     const std::vector<uint8_t> &execution_id) {
+	// Best-effort. Caller (the operator's destructor) wraps in try/catch
+	// because it runs during teardown. We still wait for the response so
+	// the worker is left in a clean state for the next pool acquisition —
+	// firing-and-forgetting at the wire level would leave a pending
+	// response in the worker's stdout pipe and corrupt the next RPC.
+	auto rpc_params = vgi::BuildBufferedTableDestructorInner(function_name, execution_id, attach_opaque_data_);
+	vgi::ValidateRequestSchema(rpc_params, "buffered_table_destructor", worker_path_);
+	vgi::WriteRpcRequest(proc_->GetStdinFd(), "buffered_table_destructor", rpc_params);
+	auto response = vgi::ReadUnaryResponse(proc_->GetStdoutFd(), &context_, worker_path_, proc_->GetPid(),
+	                                       GetExecutionIdHex(), GetAttachOpaqueDataHex(), "", GetConnIdHex(),
+	                                       /*block_until_cancel=*/true);
+	auto inner = DecodeOuterResponse(response, "buffered_table_destructor", worker_path_);
+	vgi::ValidateResponseSchema(inner, "buffered_table_destructor", worker_path_);
+	// Response is empty (BufferedTableDestructorResponse has no fields);
+	// schema validation is the only correctness check.
+}
+
 int FunctionConnection::Wait() {
 	if (!proc_) {
 		return 0;

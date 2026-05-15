@@ -103,5 +103,23 @@ BuildBufferedTableFinalizeInner(const std::string &function_name,
 	return vgi::generated::BuildBufferedTableFinalizeParams(inner_bytes);
 }
 
+std::shared_ptr<arrow::RecordBatch>
+BuildBufferedTableDestructorInner(const std::string &function_name,
+                                   const std::vector<uint8_t> &execution_id,
+                                   const std::vector<uint8_t> &attach_opaque_data) {
+	auto inner_schema = arrow::schema({
+	    arrow::field("function_name", arrow::utf8(), false),
+	    arrow::field("execution_id", arrow::binary(), false),
+	    arrow::field("attach_opaque_data", arrow::binary(), true),
+	});
+	auto inner = arrow::RecordBatch::Make(inner_schema, 1, {
+	    vgi::MakeSingleStringArray(function_name),
+	    vgi::MakeSingleBinaryArray(execution_id),
+	    vgi::MakeSingleBinaryArrayOrNull(attach_opaque_data),
+	});
+	auto inner_bytes = vgi::SerializeToIpcBytes(inner);
+	return vgi::generated::BuildBufferedTableDestructorParams(inner_bytes);
+}
+
 } // namespace vgi
 } // namespace duckdb
