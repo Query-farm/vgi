@@ -37,11 +37,8 @@ BuildBufferedTableCombineInner(const std::string &function_name,
                                 const std::vector<int64_t> &state_ids,
                                 const std::vector<uint8_t> &attach_opaque_data);
 
-std::shared_ptr<arrow::RecordBatch>
-BuildBufferedTableFinalizeInner(const std::string &function_name,
-                                 const std::vector<uint8_t> &execution_id,
-                                 int64_t finalize_state_id,
-                                 const std::vector<uint8_t> &attach_opaque_data);
+// BuildBufferedTableFinalizeInner removed: Source phase now uses
+// PerformInit(phase=BUFFERED_TABLE_FINALIZE) instead of a unary RPC.
 
 std::shared_ptr<arrow::RecordBatch>
 BuildBufferedTableDestructorInner(const std::string &function_name,

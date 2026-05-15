@@ -341,13 +341,19 @@ public:
 
 class VgiBufferedTableFunctionLocalSourceState : public LocalSourceState {
 public:
-	// One worker per source thread, popped from gstate.workers on first
-	// GetData. While has_more is true we keep calling RpcBufferedTableFinalize
-	// on the same finalize_state_id; when has_more flips to false we pop the
-	// next id from the queue.
+	// Per-thread fresh worker. Source acquires from the pool on first
+	// GetData and per finalize_state_id transition (each new state_id
+	// opens a new BUFFERED_TABLE_FINALIZE init stream that we drain via
+	// ReadDataBatch). We don't reuse the per-thread workers from the
+	// Sink phase because their init_done_ guard would reject a second
+	// PerformInit; cleaner to acquire fresh.
 	std::unique_ptr<IFunctionConnection> worker;
 	int64_t current_finalize_state_id = -1;
-	bool has_more = false;
+	// True once PerformInit(BUFFERED_TABLE_FINALIZE) has fired on
+	// `worker` for `current_finalize_state_id`. Subsequent GetData
+	// calls just keep calling ReadDataBatch on the same worker until
+	// EOS (null batch).
+	bool stream_open = false;
 	// Arrow → DuckDB scan plumbing. Rebuilt per emitted batch (the batch
 	// carries its own schema; we don't need to precompute one).
 	ArrowSchemaWrapper c_schema;
@@ -732,73 +738,81 @@ SourceResultType PhysicalVgiBufferedTableFunction::GetDataInternal(ExecutionCont
 	auto &lstate = input.local_state.Cast<VgiBufferedTableFunctionLocalSourceState>();
 	// gstate is the *Sink* global state under DuckDB's sink-to-source
 	// transition — operators that are both Sink and Source share the same
-	// state pointer via sink_state. The source-side input.global_state is a
-	// thin delegate (GetGlobalSourceState above).
+	// state pointer via sink_state.
 	auto &gstate = sink_state->Cast<VgiBufferedTableFunctionGlobalSinkState>();
+	auto &bd = bind_data->Cast<VgiTableInOutBindData>();
 
-	// Acquire a worker on first GetData call from this thread.
-	if (!lstate.worker) {
-		std::lock_guard<std::mutex> lk(gstate.workers_mutex);
-		if (gstate.workers.empty()) {
-			chunk.SetCardinality(0);
-			return SourceResultType::FINISHED;
-		}
-		lstate.worker = std::move(gstate.workers.back());
-		gstate.workers.pop_back();
-	}
-
-	// If we don't have an in-flight finalize_state_id, pull the next one.
-	if (!lstate.has_more) {
-		std::lock_guard<std::mutex> lk(gstate.finalize_queue_mutex);
-		if (gstate.finalize_queue.empty()) {
-			// Done — release this thread's worker back to the pool.
-			auto pooled = lstate.worker->ReleaseForPooling();
-			lstate.worker.reset();
-			if (pooled) {
-				VgiWorkerPool::Instance().Release(std::move(pooled));
+	// Open a fresh worker + stream for the next finalize_state_id when
+	// the previous stream has hit EOS (or this is the first call).
+	if (!lstate.stream_open) {
+		// Pop the next finalize_state_id; if none, we're FINISHED.
+		{
+			std::lock_guard<std::mutex> lk(gstate.finalize_queue_mutex);
+			if (gstate.finalize_queue.empty()) {
+				lstate.worker.reset();
+				chunk.SetCardinality(0);
+				return SourceResultType::FINISHED;
 			}
-			chunk.SetCardinality(0);
-			return SourceResultType::FINISHED;
+			lstate.current_finalize_state_id = gstate.finalize_queue.front();
+			gstate.finalize_queue.pop_front();
 		}
-		lstate.current_finalize_state_id = gstate.finalize_queue.front();
-		gstate.finalize_queue.pop_front();
+		// Acquire a fresh worker (or reuse the prior one — the unary path
+		// reused workers from gstate.workers, but those were init'd via
+		// phase=BUFFERED_TABLE and would reject a second PerformInit. The
+		// pool keeps subprocess workers warm so this is cheap.).
+		auto acquire_params = BuildAcquireParams(bd, gstate.execution_id);
+		auto acquired = AcquireConnectionForInit(context.client, acquire_params);
+		lstate.worker = std::move(acquired.connection);
+		if (VgiInfoLogActive(context.client)) {
+			VGI_LOG(context.client, "buffered_table.finalize_init",
+			        {{"conn", lstate.worker->GetConnIdHex()},
+			         {"function_name", gstate.function_name},
+			         {"finalize_state_id", std::to_string(lstate.current_finalize_state_id)}});
+		}
+		lstate.worker->PerformInit(bd.bind_result, /*projection_ids=*/{},
+		                           /*pushdown_filters=*/nullptr,
+		                           /*join_keys=*/{},
+		                           /*phase=*/"BUFFERED_TABLE_FINALIZE",
+		                           /*order_by=*/std::nullopt,
+		                           /*table_sample=*/std::nullopt,
+		                           /*init_opaque_data=*/{},
+		                           /*finalize_state_id=*/lstate.current_finalize_state_id);
+		lstate.stream_open = true;
 	}
 
-	if (VgiInfoLogActive(context.client)) {
-		VGI_LOG(context.client, "buffered_table.finalize",
-		        {{"conn", lstate.worker->GetConnIdHex()},
-		         {"function_name", gstate.function_name},
-		         {"finalize_state_id", std::to_string(lstate.current_finalize_state_id)}});
-	}
-	auto resp = lstate.worker->RpcBufferedTableFinalize(gstate.function_name, gstate.execution_id,
-	                                                     lstate.current_finalize_state_id);
-	lstate.has_more = resp.has_more;
-
-	// Convert the Arrow batch → DuckDB DataChunk.
-	if (!resp.batch || resp.batch->num_rows() == 0) {
+	auto batch = lstate.worker->ReadDataBatch();
+	if (!batch) {
+		// EOS — this finalize_state_id is exhausted. Release worker back
+		// to the pool; next GetData call will open the next stream.
+		auto pooled = lstate.worker->ReleaseForPooling();
+		lstate.worker.reset();
+		lstate.stream_open = false;
+		if (pooled) {
+			VgiWorkerPool::Instance().Release(std::move(pooled));
+		}
 		chunk.SetCardinality(0);
-		// Returning HAVE_MORE_OUTPUT keeps DuckDB pumping until we report
-		// FINISHED on a future call. With has_more=false we'll pull the next
-		// finalize_state_id; with has_more=true the worker is just emitting
-		// progressively-empty batches before non-empty ones — keep going.
 		return SourceResultType::HAVE_MORE_OUTPUT;
 	}
 
-	// Use the helper pair: ExportSchema + ExportRecordBatch + ArrowToDuckDB
-	// is the same plumbing the streaming InOut path uses
-	// (vgi_table_in_out_impl.cpp:306-345).
-	ExportSchema(resp.batch->schema(), lstate.c_schema);
+	if (batch->num_rows() == 0) {
+		chunk.SetCardinality(0);
+		return SourceResultType::HAVE_MORE_OUTPUT;
+	}
+
+	// Convert the Arrow batch → DuckDB DataChunk via the same helper pair
+	// the streaming InOut path uses (vgi_table_in_out_impl.cpp:306-345).
+	ExportSchema(batch->schema(), lstate.c_schema);
 	ArrowTableFunction::PopulateArrowTableSchema(context.client, lstate.arrow_table,
 	                                              lstate.c_schema.arrow_schema);
 
 	auto chunk_wrapper = make_uniq<ArrowArrayWrapper>();
-	ExportRecordBatch(resp.batch, *chunk_wrapper);
+	ExportRecordBatch(batch, *chunk_wrapper);
 
 	auto scan_state =
 	    make_uniq<ArrowScanLocalState>(std::move(chunk_wrapper), context.client);
 	scan_state->chunk_offset = 0;
 
-	idx_t rows = std::min<idx_t>(resp.batch->num_rows(), STANDARD_VECTOR_SIZE);
+	idx_t rows = std::min<idx_t>(batch->num_rows(), STANDARD_VECTOR_SIZE);
 	chunk.SetCardinality(rows);
 	ArrowTableFunction::ArrowToDuckDB(*scan_state, lstate.arrow_table.GetColumns(), chunk, false);
 	return SourceResultType::HAVE_MORE_OUTPUT;

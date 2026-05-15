@@ -394,7 +394,8 @@ InitResult HttpFunctionConnection::PerformInit(const BindResult &bind_result,
                                                 const std::string &phase,
                                                 const std::optional<OrderByHint> &order_by,
                                                 const std::optional<TableSampleHint> &table_sample,
-                                                const std::vector<uint8_t> &init_opaque_data) {
+                                                const std::vector<uint8_t> &init_opaque_data,
+                                                const std::optional<int64_t> &finalize_state_id) {
 #ifdef __EMSCRIPTEN__
 #endif
 	if (init_done_) {
@@ -440,7 +441,8 @@ InitResult HttpFunctionConnection::PerformInit(const BindResult &bind_result,
 	    execution_id,
 	    init_opaque_data,
 	    ob_col, ob_dir, ob_null, ob_limit,
-	    ts_percentage, ts_seed);
+	    ts_percentage, ts_seed,
+	    finalize_state_id);
 	auto init_request_bytes = SerializeToIpcBytes(init_request);
 #ifdef __EMSCRIPTEN__
 #endif
@@ -692,27 +694,9 @@ std::vector<int64_t> HttpFunctionConnection::RpcBufferedTableCombine(const std::
 	return result;
 }
 
-IFunctionConnection::BufferedTableFinalizeResult HttpFunctionConnection::RpcBufferedTableFinalize(
-    const std::string &function_name, const std::vector<uint8_t> &execution_id,
-    int64_t finalize_state_id) {
-	auto rpc_params = vgi::BuildBufferedTableFinalizeInner(function_name, execution_id, finalize_state_id,
-	                                                        attach_opaque_data_);
-	auto auth = attach_params_ ? attach_params_->auth() : nullptr;
-	auto cached_params = attach_params_
-	    ? attach_params_->GetOrInitHttpParams(context_, base_url_) : nullptr;
-	auto resp = HttpInvokeUnary(context_, base_url_, "buffered_table_finalize", rpc_params, auth,
-	                             /*cookie_jar=*/nullptr, cached_params,
-	                             GetExecutionIdHex(), GetAttachOpaqueDataHex(), "", GetConnIdHex());
-	auto inner = DecodeHttpOuterResponse(resp, "buffered_table_finalize", base_url_);
-	if (!inner || inner->num_rows() == 0) {
-		throw IOException("buffered_table_finalize response missing data [url: %s]", base_url_);
-	}
-	auto batch_col = std::static_pointer_cast<arrow::BinaryArray>(inner->GetColumnByName("output_batch"));
-	auto has_more_col = std::static_pointer_cast<arrow::BooleanArray>(inner->GetColumnByName("has_more"));
-	auto v = batch_col->GetView(0);
-	auto batch = vgi::DeserializeFromIpcBytes(reinterpret_cast<const uint8_t *>(v.data()), v.size());
-	return BufferedTableFinalizeResult{batch, has_more_col->Value(0)};
-}
+// RpcBufferedTableFinalize removed: Source phase now opens a stream
+// via PerformInit(phase=BUFFERED_TABLE_FINALIZE, finalize_state_id=N)
+// and drains via ReadDataBatch.
 
 void HttpFunctionConnection::RpcBufferedTableDestructor(const std::string &function_name,
                                                          const std::vector<uint8_t> &execution_id) {

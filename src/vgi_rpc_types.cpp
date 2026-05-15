@@ -605,8 +605,11 @@ BuildInitRequest(const std::vector<uint8_t> &bind_call_bytes, const std::vector<
                  const std::vector<uint8_t> &execution_id, const std::vector<uint8_t> &init_opaque_data,
                  const std::string &order_by_column_name, const std::string &order_by_direction,
                  const std::string &order_by_null_order, int64_t order_by_limit,
-                 double tablesample_percentage, int64_t tablesample_seed) {
-	static const std::vector<std::string> phase_values = {"INPUT", "FINALIZE", "BUFFERED_TABLE"};
+                 double tablesample_percentage, int64_t tablesample_seed,
+                 const std::optional<int64_t> &finalize_state_id) {
+	static const std::vector<std::string> phase_values = {
+	    "INPUT", "FINALIZE", "BUFFERED_TABLE", "BUFFERED_TABLE_FINALIZE",
+	};
 
 	auto phase_type = arrow::dictionary(arrow::int16(), arrow::utf8());
 
@@ -629,6 +632,7 @@ BuildInitRequest(const std::vector<uint8_t> &bind_call_bytes, const std::vector<
 	    arrow::field("order_by_limit", arrow::int64(), true),
 	    arrow::field("tablesample_percentage", arrow::float64(), true),
 	    arrow::field("tablesample_seed", arrow::int64(), true),
+	    arrow::field("finalize_state_id", arrow::int64(), true),
 	});
 
 	std::vector<std::shared_ptr<arrow::Array>> arrays;
@@ -752,6 +756,17 @@ BuildInitRequest(const std::vector<uint8_t> &bind_call_bytes, const std::vector<
 			CheckStatus(builder.Append(tablesample_seed), "append tablesample_seed");
 		}
 		arrays.push_back(FinishArray(builder, "tablesample_seed"));
+	}
+
+	// finalize_state_id: int64|null — required for phase=BUFFERED_TABLE_FINALIZE
+	{
+		arrow::Int64Builder builder;
+		if (finalize_state_id.has_value()) {
+			CheckStatus(builder.Append(*finalize_state_id), "append finalize_state_id");
+		} else {
+			CheckStatus(builder.AppendNull(), "append null finalize_state_id");
+		}
+		arrays.push_back(FinishArray(builder, "finalize_state_id"));
 	}
 
 	return arrow::RecordBatch::Make(schema, 1, arrays);

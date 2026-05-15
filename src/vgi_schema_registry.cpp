@@ -111,8 +111,8 @@ const std::unordered_map<std::string, ResponseSchema> &Registry() {
 		m["aggregate_finalize"] = ResponseSchema{AggregateFinalizeResultSchema(), nullptr, false, nullptr};
 		m["buffered_table_combine"] =
 		    ResponseSchema{BufferedTableCombineResultSchema(), nullptr, false, nullptr};
-		m["buffered_table_finalize"] =
-		    ResponseSchema{BufferedTableFinalizeResultSchema(), nullptr, false, nullptr};
+		// buffered_table_finalize: Source phase now uses
+		// PerformInit(phase=BUFFERED_TABLE_FINALIZE) — no unary entry.
 		m["aggregate_window"] = ResponseSchema{AggregateWindowResultSchema(), nullptr, false, nullptr};
 		m["aggregate_window_batch"] =
 		    ResponseSchema{AggregateWindowBatchResultSchema(), nullptr, false, nullptr};
@@ -238,7 +238,6 @@ const std::unordered_map<std::string, ResponseSchema> &Registry() {
 		    {"aggregate_streaming_close", &AggregateStreamingCloseParamsSchema},
 		    {"buffered_table_process", &BufferedTableProcessParamsSchema},
 		    {"buffered_table_combine", &BufferedTableCombineParamsSchema},
-		    {"buffered_table_finalize", &BufferedTableFinalizeParamsSchema},
 		    {"buffered_table_destructor", &BufferedTableDestructorParamsSchema},
 		};
 		for (const auto &e : kRequestSchemas) {

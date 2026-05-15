@@ -78,30 +78,8 @@ BuildBufferedTableCombineInner(const std::string &function_name,
 	return vgi::generated::BuildBufferedTableCombineParams(inner_bytes);
 }
 
-std::shared_ptr<arrow::RecordBatch>
-BuildBufferedTableFinalizeInner(const std::string &function_name,
-                                 const std::vector<uint8_t> &execution_id,
-                                 int64_t finalize_state_id,
-                                 const std::vector<uint8_t> &attach_opaque_data) {
-	auto inner_schema = arrow::schema({
-	    arrow::field("function_name", arrow::utf8(), false),
-	    arrow::field("execution_id", arrow::binary(), false),
-	    arrow::field("finalize_state_id", arrow::int64(), false),
-	    arrow::field("attach_opaque_data", arrow::binary(), true),
-	});
-	arrow::Int64Builder sid_builder;
-	(void)sid_builder.Append(finalize_state_id);
-	std::shared_ptr<arrow::Array> sid_array;
-	(void)sid_builder.Finish(&sid_array);
-	auto inner = arrow::RecordBatch::Make(inner_schema, 1, {
-	    vgi::MakeSingleStringArray(function_name),
-	    vgi::MakeSingleBinaryArray(execution_id),
-	    sid_array,
-	    vgi::MakeSingleBinaryArrayOrNull(attach_opaque_data),
-	});
-	auto inner_bytes = vgi::SerializeToIpcBytes(inner);
-	return vgi::generated::BuildBufferedTableFinalizeParams(inner_bytes);
-}
+// BuildBufferedTableFinalizeInner removed: Source phase now uses
+// PerformInit(phase=BUFFERED_TABLE_FINALIZE) instead of a unary RPC.
 
 std::shared_ptr<arrow::RecordBatch>
 BuildBufferedTableDestructorInner(const std::string &function_name,

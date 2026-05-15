@@ -209,7 +209,8 @@ public:
 	                       const std::string &phase = "",
 	                       const std::optional<OrderByHint> &order_by = std::nullopt,
 	                       const std::optional<TableSampleHint> &table_sample = std::nullopt,
-	                       const std::vector<uint8_t> &init_opaque_data = {}) override;
+	                       const std::vector<uint8_t> &init_opaque_data = {},
+	                       const std::optional<int64_t> &finalize_state_id = std::nullopt) override;
 
 	// Re-init for table-in-out FINALIZE: closes the current data streams
 	// and sends a new init RPC with phase="FINALIZE" that references the
@@ -250,9 +251,6 @@ public:
 	std::vector<int64_t> RpcBufferedTableCombine(const std::string &function_name,
 	                                             const std::vector<uint8_t> &execution_id,
 	                                             const std::vector<int64_t> &state_ids) override;
-	BufferedTableFinalizeResult RpcBufferedTableFinalize(const std::string &function_name,
-	                                                      const std::vector<uint8_t> &execution_id,
-	                                                      int64_t finalize_state_id) override;
 	void RpcBufferedTableDestructor(const std::string &function_name,
 	                                 const std::vector<uint8_t> &execution_id) override;
 

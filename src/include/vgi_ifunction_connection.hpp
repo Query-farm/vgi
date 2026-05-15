@@ -90,7 +90,8 @@ public:
 	                               const std::string &phase = "",
 	                               const std::optional<OrderByHint> &order_by = std::nullopt,
 	                               const std::optional<TableSampleHint> &table_sample = std::nullopt,
-	                               const std::vector<uint8_t> &init_opaque_data = {}) = 0;
+	                               const std::vector<uint8_t> &init_opaque_data = {},
+	                               const std::optional<int64_t> &finalize_state_id = std::nullopt) = 0;
 	// Re-init the connection in FINALIZE mode (table-in-out). Closes the
 	// current data streams and sends a new init RPC that references the
 	// original bind via bind_result.
@@ -130,15 +131,11 @@ public:
 	                                                     const std::vector<uint8_t> &execution_id,
 	                                                     const std::vector<int64_t> &state_ids) = 0;
 
-	// Pull one output batch from the worker's generator for finalize_state_id.
-	// has_more indicates whether further calls on the same id will yield more.
-	struct BufferedTableFinalizeResult {
-		std::shared_ptr<arrow::RecordBatch> batch;
-		bool has_more = false;
-	};
-	virtual BufferedTableFinalizeResult RpcBufferedTableFinalize(const std::string &function_name,
-	                                                              const std::vector<uint8_t> &execution_id,
-	                                                              int64_t finalize_state_id) = 0;
+	// Source-phase finalize is NOT a unary RPC anymore. The Source
+	// operator opens a stream by calling
+	// PerformInit(phase="BUFFERED_TABLE_FINALIZE", finalize_state_id=N)
+	// and drains via ReadDataBatch until null (EOS). One stream per
+	// finalize_state_id; the framework handles all per-tick state.
 
 	// Best-effort end-of-query cleanup for buffered_table. The worker pops
 	// any per-execution caches and wipes its FunctionStorage rows. The

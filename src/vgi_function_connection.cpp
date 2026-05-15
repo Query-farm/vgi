@@ -338,7 +338,8 @@ InitResult FunctionConnection::PerformInit(const BindResult &bind_result,
                                            const std::string &phase,
                                            const std::optional<OrderByHint> &order_by,
                                            const std::optional<TableSampleHint> &table_sample,
-                                           const std::vector<uint8_t> &init_opaque_data) {
+                                           const std::vector<uint8_t> &init_opaque_data,
+                                           const std::optional<int64_t> &finalize_state_id) {
 	if (!proc_) {
 		ThrowVgiIOException("FunctionConnection::PerformInit called before PerformBindRpc", worker_path_,
 		                    -1, GetExecutionIdHex());
@@ -388,7 +389,8 @@ InitResult FunctionConnection::PerformInit(const BindResult &bind_result,
 	    execution_id,
 	    init_opaque_data,
 	    ob_col, ob_dir, ob_null, ob_limit,
-	    ts_percentage, ts_seed);
+	    ts_percentage, ts_seed,
+	    finalize_state_id);
 	auto init_request_bytes = SerializeToIpcBytes(init_request);
 
 	// Build RPC params and send request. If shm transport is enabled,
@@ -1093,26 +1095,9 @@ std::vector<int64_t> FunctionConnection::RpcBufferedTableCombine(const std::stri
 	return result;
 }
 
-IFunctionConnection::BufferedTableFinalizeResult FunctionConnection::RpcBufferedTableFinalize(
-    const std::string &function_name, const std::vector<uint8_t> &execution_id, int64_t finalize_state_id) {
-	auto rpc_params = vgi::BuildBufferedTableFinalizeInner(function_name, execution_id, finalize_state_id,
-	                                                    attach_opaque_data_);
-	vgi::ValidateRequestSchema(rpc_params, "buffered_table_finalize", worker_path_);
-	vgi::WriteRpcRequest(proc_->GetStdinFd(), "buffered_table_finalize", rpc_params);
-	auto response = vgi::ReadUnaryResponse(proc_->GetStdoutFd(), &context_, worker_path_, proc_->GetPid(),
-	                                       GetExecutionIdHex(), GetAttachOpaqueDataHex(), "", GetConnIdHex(),
-	                                       /*block_until_cancel=*/true);
-	auto inner = DecodeOuterResponse(response, "buffered_table_finalize", worker_path_);
-	vgi::ValidateResponseSchema(inner, "buffered_table_finalize", worker_path_);
-	if (!inner || inner->num_rows() == 0) {
-		ThrowVgiIOException("buffered_table_finalize response missing data", worker_path_, proc_->GetPid(), "");
-	}
-	auto batch_col = std::static_pointer_cast<arrow::BinaryArray>(inner->GetColumnByName("output_batch"));
-	auto has_more_col = std::static_pointer_cast<arrow::BooleanArray>(inner->GetColumnByName("has_more"));
-	auto v = batch_col->GetView(0);
-	auto batch = vgi::DeserializeFromIpcBytes(reinterpret_cast<const uint8_t *>(v.data()), v.size());
-	return BufferedTableFinalizeResult{batch, has_more_col->Value(0)};
-}
+// RpcBufferedTableFinalize removed: Source phase now opens a stream
+// via PerformInit(phase=BUFFERED_TABLE_FINALIZE, finalize_state_id=N)
+// and drains via ReadDataBatch.
 
 void FunctionConnection::RpcBufferedTableDestructor(const std::string &function_name,
                                                      const std::vector<uint8_t> &execution_id) {
