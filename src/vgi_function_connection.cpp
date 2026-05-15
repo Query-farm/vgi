@@ -465,7 +465,16 @@ InitResult FunctionConnection::PerformInit(const BindResult &bind_result,
 	//   - Exchange mode: we defer opening data_reader_ to the first ReadDataBatch() call,
 	//     which happens after the caller has written at least one input batch via
 	//     WriteInputBatch(), giving the server data to process and flush.
-	if (!input_schema_) {
+	//
+	// Phase override: FINALIZE and BUFFERED_TABLE_FINALIZE phases are
+	// always producer-mode regardless of bind_call.input_schema, because
+	// they reuse the bind context but emit only output (no input). The
+	// streaming-shape FINALIZE phase historically went through
+	// PerformFinalizeInit which clears input_schema_; the buffered
+	// BUFFERED_TABLE_FINALIZE phase calls PerformInit directly with a
+	// fresh worker, so we honor the phase here.
+	bool producer_phase_override = (phase == "FINALIZE" || phase == "BUFFERED_TABLE_FINALIZE");
+	if (!input_schema_ || producer_phase_override) {
 		// Regular table function: producer mode (tick-based)
 		is_producer_mode_ = true;
 		tick_schema_ = arrow::schema({});

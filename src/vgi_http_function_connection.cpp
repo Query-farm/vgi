@@ -505,8 +505,10 @@ InitResult HttpFunctionConnection::PerformInit(const BindResult &bind_result,
 	// Capture the output schema for empty-response fallback in ReadDataBatch.
 	cached_output_schema_ = bind_result.output_schema;
 
-	// Determine mode based on input_schema presence
-	if (!input_schema_) {
+	// Determine mode based on input_schema presence — except for FINALIZE
+	// and BUFFERED_TABLE_FINALIZE phases which always run producer-side.
+	bool producer_phase_override = (phase == "FINALIZE" || phase == "BUFFERED_TABLE_FINALIZE");
+	if (!input_schema_ || producer_phase_override) {
 		is_producer_mode_ = true;
 	} else {
 		is_producer_mode_ = false;
