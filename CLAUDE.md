@@ -419,8 +419,18 @@ ordered tables. The C++ Sink reads it via `input.local_state.partition_info.batc
 `buffered_table_process` RPC to the worker as `params.batch_index: int`.
 
 **Cross-worker state.** State merging is the worker library's job, not the
-C++ side's. Workers coordinate via `BoundStorage.aggregate_get/put` keyed by
-`(execution_id, state_id)`. C++ never ships state bytes between workers.
+C++ side's. Workers coordinate via `BoundStorage.state_*` keyed by
+`(execution_id, ns, key)` — for buffered_table this is namespace `b"buf"`
+with `key = pack_int_key(state_id)`. The recommended shape is **append**
+(`state_append` per process call, `state_log_scan` in finalize) for
+variable-size accumulation — it's O(N inserts), versus the O(N²) RMW
+pattern that a `state_class != None` declaration forces (the framework
+loads + deserializes + re-serializes + persists state every process call).
+For constant-size aggregator state, RMW via `state_class` + `state_put`
+is fine. The framework's worker handler skips the round-trip when
+`state_class is None` and threads `state_id` through `ProcessParams.state_id`
+so process() can key its appends directly. C++ never ships state bytes
+between workers.
 
 **Compatibility.** Plain calls, `UNION ALL`, non-correlated `LATERAL`, anchor
 of recursive CTEs, and nesting under outer Sinks (ORDER BY, hash aggregate)
