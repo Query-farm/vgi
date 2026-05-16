@@ -1,5 +1,5 @@
 # name: test/sql/integration/table_in_out/buffered_large_state.test
-# description: Buffer ~50 MB of state per state_id through buffered_table_combine
+# description: Buffer ~50 MB of state per state_id through table_buffering.combine
 #   / _finalize — exercises Arrow IPC large-message handling on the response
 #   path. The function appends 1 MB per process() call; total payload is
 #   `(num_batches * 1 MB)`, where num_batches = ceil(N / STANDARD_VECTOR_SIZE).

@@ -105,7 +105,7 @@ struct UnaryResponseResult {
 // block_until_cancel=false → use the catalog timeout (default; bounds wait).
 // block_until_cancel=true  → block indefinitely, polling the context's
 //   `interrupted` flag every 250ms (used by data-phase RPCs like
-//   buffered_table_* that can legitimately run for arbitrary durations).
+//   table_buffering_* that can legitimately run for arbitrary durations).
 //   Cleanup of an interrupted-mid-RPC connection is the caller's
 //   responsibility (route through VgiCancelDispatcher).
 UnaryResponseResult ReadUnaryResponse(int fd, ClientContext *context,

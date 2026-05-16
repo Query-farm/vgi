@@ -410,11 +410,12 @@ struct VgiMacroInfo {
 // ============================================================================
 
 // Type of function for DuckDB registration
-// Wire format: lowercase string ("scalar", "table", "aggregate")
+// Wire format: lowercase string ("scalar", "table", "table_buffering", "aggregate")
 enum class VgiFunctionType {
-	Scalar,    // Scalar function: one output per input row
-	Table,     // Table function: returns a table (includes table_in_out)
-	Aggregate  // Aggregate function: many inputs → one output
+	Scalar,         // Scalar function: one output per input row
+	Table,          // Streaming table function (incl. streaming table_in_out)
+	TableBuffering, // Buffered table function — Sink+Source PhysicalOperator
+	Aggregate       // Aggregate function: many inputs → one output
 };
 
 // Parse VgiFunctionType from wire format string
@@ -542,28 +543,26 @@ struct VgiFunctionInfo {
 	// input; we only register the finalize callback when this is set.
 	bool has_finalize = false;
 
-	// Buffered table function path (Sink+Source PhysicalOperator).
-	// When True, the function is rewritten in the optimizer extension into
-	// ``PhysicalVgiBufferedTableFunction`` instead of registering through
-	// DuckDB's ``in_out_function``/``in_out_function_final`` — needed so that
-	// finalize sees the complete input stream (e.g. under UNION ALL — see
-	// DuckDB issue #18222).
-	bool buffered_table = false;
+	// Whether this function uses the buffered Sink+Source path is encoded in
+	// ``function_type`` (TableBuffering vs Table) — there is no separate
+	// boolean flag on the wire. The optimizer extension keys off
+	// ``function_type == TableBuffering``.
 
-	// Only meaningful when ``buffered_table`` is True. When True, the
-	// source phase is single-threaded and ``finalize_state_ids`` drain in
+	// Only meaningful when ``function_type == TableBuffering``. When True,
+	// the source phase is single-threaded and ``finalize_state_ids`` drain in
 	// combine-returned order. Default False enables parallel finalize.
 	bool source_order_dependent = false;
 
-	// Only meaningful when ``buffered_table`` is True. When True, the SINK
-	// phase runs single-threaded — every process() call arrives in source
-	// order on one worker. Mutually exclusive with requires_input_batch_index.
+	// Only meaningful when ``function_type == TableBuffering``. When True,
+	// the SINK phase runs single-threaded — every process() call arrives in
+	// source order on one worker. Mutually exclusive with
+	// requires_input_batch_index.
 	bool sink_order_dependent = false;
 
-	// Only meaningful when ``buffered_table`` is True. When True, the C++
-	// Sink operator declares RequiredPartitionInfo()=BatchIndex() so DuckDB
-	// threads a globally-unique monotonic batch_index from the source into
-	// every process() RPC. Workers can sort by it in combine() to
+	// Only meaningful when ``function_type == TableBuffering``. When True,
+	// the C++ Sink operator declares RequiredPartitionInfo()=BatchIndex() so
+	// DuckDB threads a globally-unique monotonic batch_index from the source
+	// into every process() RPC. Workers can sort by it in combine() to
 	// reconstruct source order under parallel ingest. Mutually exclusive
 	// with sink_order_dependent.
 	bool requires_input_batch_index = false;

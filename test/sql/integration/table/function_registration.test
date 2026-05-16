@@ -30,7 +30,7 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 # ============================================================================
 
 # Total table-type function count (includes table-in-out)
-# 68 base + 5 buffered_table failure-injection fixtures (crash_on_process,
+# 68 base + 5 table_buffering failure-injection fixtures (crash_on_process,
 # crash_on_combine, crash_on_finalize, hang_on_process, large_state) +
 # 2 ordering-knob fixtures (ordered_buffer_input, batch_index_buffer_input)
 # = 75

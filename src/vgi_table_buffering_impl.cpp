@@ -1,4 +1,4 @@
-#include "vgi_buffered_table_function_impl.hpp"
+#include "vgi_table_buffering_impl.hpp"
 
 #include <arrow/c/bridge.h>
 
@@ -9,7 +9,7 @@
 #include "duckdb/main/database.hpp"
 
 #include "vgi_arrow_utils.hpp"
-#include "vgi_buffered_table_builders.hpp"
+#include "vgi_table_buffering_builders.hpp"
 #include "vgi_cancel_dispatcher.hpp"
 #include "vgi_logging.hpp"
 #include "vgi_unary_rpc.hpp"
@@ -19,10 +19,10 @@ namespace duckdb {
 namespace vgi {
 
 // ============================================================================
-// LogicalVgiBufferedTableFunction
+// LogicalVgiTableBufferingFunction
 // ============================================================================
 
-LogicalVgiBufferedTableFunction::LogicalVgiBufferedTableFunction(idx_t table_index_p,
+LogicalVgiTableBufferingFunction::LogicalVgiTableBufferingFunction(idx_t table_index_p,
                                                                   vector<LogicalType> return_types_p,
                                                                   vector<string> return_names_p,
                                                                   unique_ptr<FunctionData> bind_data_p)
@@ -32,7 +32,7 @@ LogicalVgiBufferedTableFunction::LogicalVgiBufferedTableFunction(idx_t table_ind
       bind_data(std::move(bind_data_p)) {
 }
 
-vector<ColumnBinding> LogicalVgiBufferedTableFunction::GetColumnBindings() {
+vector<ColumnBinding> LogicalVgiTableBufferingFunction::GetColumnBindings() {
 	vector<ColumnBinding> bindings;
 	bindings.reserve(return_types.size());
 	for (idx_t i = 0; i < return_types.size(); i++) {
@@ -41,30 +41,30 @@ vector<ColumnBinding> LogicalVgiBufferedTableFunction::GetColumnBindings() {
 	return bindings;
 }
 
-vector<idx_t> LogicalVgiBufferedTableFunction::GetTableIndex() const {
+vector<idx_t> LogicalVgiTableBufferingFunction::GetTableIndex() const {
 	return vector<idx_t> {table_index};
 }
 
-string LogicalVgiBufferedTableFunction::GetName() const {
-	return "VGI_BUFFERED_TABLE";
+string LogicalVgiTableBufferingFunction::GetName() const {
+	return "VGI_TABLE_BUFFERING";
 }
 
-string LogicalVgiBufferedTableFunction::GetExtensionName() const {
-	return "vgi_buffered_table_function";
+string LogicalVgiTableBufferingFunction::GetExtensionName() const {
+	return "vgi_table_buffering_function";
 }
 
-void LogicalVgiBufferedTableFunction::ResolveTypes() {
+void LogicalVgiTableBufferingFunction::ResolveTypes() {
 	// Output column types are exactly the function's declared return_types.
 	types = return_types;
 }
 
-void LogicalVgiBufferedTableFunction::Serialize(Serializer & /*serializer*/) const {
+void LogicalVgiTableBufferingFunction::Serialize(Serializer & /*serializer*/) const {
 	throw NotImplementedException(
-	    "LogicalVgiBufferedTableFunction serialization is not supported "
+	    "LogicalVgiTableBufferingFunction serialization is not supported "
 	    "(plan caching across processes is out of scope for v1)");
 }
 
-PhysicalOperator &LogicalVgiBufferedTableFunction::CreatePlan(ClientContext &context,
+PhysicalOperator &LogicalVgiTableBufferingFunction::CreatePlan(ClientContext &context,
                                                                 PhysicalPlanGenerator &planner) {
 	// Plan the child (the table-input subquery) first so its data is
 	// pipelined into our Sink.
@@ -83,7 +83,7 @@ PhysicalOperator &LogicalVgiBufferedTableFunction::CreatePlan(ClientContext &con
 
 	auto types_copy = return_types;
 	auto names_copy = return_names;
-	auto &op = planner.Make<PhysicalVgiBufferedTableFunction>(std::move(types_copy), std::move(names_copy),
+	auto &op = planner.Make<PhysicalVgiTableBufferingFunction>(std::move(types_copy), std::move(names_copy),
 	                                                            std::move(bind_data), source_order_dependent,
 	                                                            sink_order_dependent, requires_input_batch_index,
 	                                                            estimated_cardinality);
@@ -92,10 +92,10 @@ PhysicalOperator &LogicalVgiBufferedTableFunction::CreatePlan(ClientContext &con
 }
 
 // ============================================================================
-// PhysicalVgiBufferedTableFunction
+// PhysicalVgiTableBufferingFunction
 // ============================================================================
 
-PhysicalVgiBufferedTableFunction::PhysicalVgiBufferedTableFunction(PhysicalPlan &physical_plan,
+PhysicalVgiTableBufferingFunction::PhysicalVgiTableBufferingFunction(PhysicalPlan &physical_plan,
                                                                     vector<LogicalType> return_types_p,
                                                                     vector<string> return_names_p,
                                                                     unique_ptr<FunctionData> bind_data_p,
@@ -112,11 +112,11 @@ PhysicalVgiBufferedTableFunction::PhysicalVgiBufferedTableFunction(PhysicalPlan 
       requires_input_batch_index(requires_input_batch_index_p) {
 }
 
-string PhysicalVgiBufferedTableFunction::GetName() const {
-	return "VGI_BUFFERED_TABLE";
+string PhysicalVgiTableBufferingFunction::GetName() const {
+	return "VGI_TABLE_BUFFERING";
 }
 
-InsertionOrderPreservingMap<string> PhysicalVgiBufferedTableFunction::ParamsToString() const {
+InsertionOrderPreservingMap<string> PhysicalVgiTableBufferingFunction::ParamsToString() const {
 	InsertionOrderPreservingMap<string> result;
 	auto &bd = bind_data->Cast<VgiTableInOutBindData>();
 	result["Name"] = bd.function_name;
@@ -130,11 +130,11 @@ InsertionOrderPreservingMap<string> PhysicalVgiBufferedTableFunction::ParamsToSt
 
 namespace {
 
-class VgiBufferedTableFunctionGlobalSinkState : public GlobalSinkState {
+class VgiTableBufferingGlobalSinkState : public GlobalSinkState {
 public:
-	explicit VgiBufferedTableFunctionGlobalSinkState(DatabaseInstance *db_p) : db(db_p) {
+	explicit VgiTableBufferingGlobalSinkState(DatabaseInstance *db_p) : db(db_p) {
 	}
-	~VgiBufferedTableFunctionGlobalSinkState() override;
+	~VgiTableBufferingGlobalSinkState() override;
 
 	// DatabaseInstance is captured at construction so the destructor can
 	// route any still-live connections through the global cancel-dispatcher
@@ -153,14 +153,13 @@ public:
 	bool init_failed = false;
 	std::atomic<bool> init_done {false};
 	std::vector<uint8_t> execution_id;
-	std::atomic<int64_t> state_id_counter {0};
 
 	// Per-thread workers handed off from Combine. Available for the source
 	// phase to grab via GetData. Also: state_ids[] runs parallel to workers[]
 	// and is what we ship to the combine RPC.
 	std::mutex workers_mutex;
 	std::vector<std::unique_ptr<IFunctionConnection>> workers;
-	std::vector<int64_t> state_ids;
+	std::vector<std::vector<uint8_t>> state_ids;
 
 	// Tracks every per-thread sink worker that is currently in-flight (between
 	// `lstate.connection = std::move(...)` and the Combine handoff). On the
@@ -175,16 +174,16 @@ public:
 	// Populated by Sink::Finalize after combine returns. Drained by the
 	// source phase under finalize_queue_mutex.
 	std::mutex finalize_queue_mutex;
-	std::deque<int64_t> finalize_queue;
+	std::deque<std::vector<uint8_t>> finalize_queue;
 
 	// Function name & attach_id snapshot, captured from bind_data. Used by
-	// the per-RPC wrappers (RpcBufferedTable*) so they don't need to chase
-	// pointers back through the operator.
+	// the per-RPC wrappers (RpcTableBuffering*) so they don't need to
+	// chase pointers back through the operator.
 	std::string function_name;
 	std::vector<uint8_t> attach_opaque_data;
 
 	// Captured at GetGlobalSinkState time so the destructor can fire a
-	// best-effort buffered_table_destructor RPC after the source phase
+	// best-effort table_buffering_destructor RPC after the source phase
 	// drains. context_weak goes null if the originating session ends
 	// before teardown completes; attach_params keeps the connection
 	// metadata alive (worker_path, auth, pool flags) regardless.
@@ -207,7 +206,7 @@ public:
 	}
 };
 
-VgiBufferedTableFunctionGlobalSinkState::~VgiBufferedTableFunctionGlobalSinkState() {
+VgiTableBufferingGlobalSinkState::~VgiTableBufferingGlobalSinkState() {
 	// Two cases:
 	//
 	// 1) Happy path — finalize ran cleanly. By the time we reach here every
@@ -244,10 +243,10 @@ VgiBufferedTableFunctionGlobalSinkState::~VgiBufferedTableFunctionGlobalSinkStat
 	// Any in-flight LocalSinkState connections handle their own cancel-dispatch
 	// via their destructor's cached gstate pointer + UntrackInFlight.
 
-	// Best-effort buffered_table_destructor RPC. Wipes the worker's
-	// FunctionStorage rows for this execution_id (b"buf_init" metadata,
-	// b"buf" per-state-id slots, b"buf" append log) and pops any
-	// in-process iter caches. Delivery is best-effort:
+	// Best-effort table_buffering_destructor RPC. Wipes the worker's
+	// FunctionStorage rows for this execution_id (worker-defined
+	// namespaces under the b"buf*" prefix) and pops any in-process iter
+	// caches. Delivery is best-effort:
 	//   * ClientContext gone (session ended early): skip; cleanup_old_entries
 	//     is the FunctionStorage backstop.
 	//   * execution_id never published (init failed before completing):
@@ -257,15 +256,15 @@ VgiBufferedTableFunctionGlobalSinkState::~VgiBufferedTableFunctionGlobalSinkStat
 		auto context_lock = context_weak.lock();
 		if (context_lock) {
 			try {
-				auto rpc_params = vgi::BuildBufferedTableDestructorInner(
-				    function_name, execution_id, attach_opaque_data);
+				auto rpc_params =
+				    vgi::BuildTableBufferingDestructorInner(function_name, execution_id, attach_opaque_data);
 				vgi::UnaryRpcOptions opts {*context_lock,
 				                            attach_params->worker_path(),
 				                            attach_params->worker_debug(),
 				                            attach_params->use_pool(),
 				                            attach_params->data_version_spec(),
 				                            attach_params->implementation_version(),
-				                            "rpc_buffered_table_destructor",
+				                            "rpc_table_buffering_destructor",
 				                            attach_params->auth(),
 				                            attach_params->cookie_jar(),
 				                            /*enable_logging=*/false};
@@ -276,7 +275,7 @@ VgiBufferedTableFunctionGlobalSinkState::~VgiBufferedTableFunctionGlobalSinkStat
 				if (attach_params->launcher_state_dir().has_value()) {
 					opts.launcher_state_dir = *attach_params->launcher_state_dir();
 				}
-				(void)vgi::InvokePooledUnaryRpc(opts, "buffered_table_destructor", rpc_params);
+				(void)vgi::InvokePooledUnaryRpc(opts, "table_buffering_destructor", rpc_params);
 			} catch (...) {
 				// Swallow — destructor must not throw. The worker side's
 				// cleanup_old_entries (1-day default) is the long-term
@@ -286,22 +285,24 @@ VgiBufferedTableFunctionGlobalSinkState::~VgiBufferedTableFunctionGlobalSinkStat
 	}
 }
 
-class VgiBufferedTableFunctionLocalSinkState : public LocalSinkState {
+class VgiTableBufferingLocalSinkState : public LocalSinkState {
 public:
 	// Per-thread worker connection. Acquired lazily on the thread's first
 	// Sink call (which assigns state_id from the global atomic). On the error
 	// path the destructor routes the connection through the cancel-dispatcher
 	// so the worker unblocks instead of being abandoned mid-RPC.
 	std::unique_ptr<IFunctionConnection> connection;
-	int64_t state_id = -1;
+	// Worker-chosen opaque state_id, returned from the first
+	// table_buffering_process RPC on this thread. Empty until then.
+	std::vector<uint8_t> state_id;
 
 	// Pointers cached at Sink-time so the destructor (which runs on this
 	// thread, possibly after another thread's exception has torn down the
 	// pipeline) can dispatch a cancel without re-walking the operator.
-	VgiBufferedTableFunctionGlobalSinkState *gstate_ptr = nullptr;
+	VgiTableBufferingGlobalSinkState *gstate_ptr = nullptr;
 	DatabaseInstance *db = nullptr;
 
-	~VgiBufferedTableFunctionLocalSinkState() override {
+	~VgiTableBufferingLocalSinkState() override {
 		if (!connection) {
 			return;
 		}
@@ -325,7 +326,7 @@ public:
 	}
 };
 
-class VgiBufferedTableFunctionGlobalSourceState : public GlobalSourceState {
+class VgiTableBufferingGlobalSourceState : public GlobalSourceState {
 public:
 	// Cap reported back to DuckDB's scheduler. Populated by GetGlobalSourceState
 	// from the worker count handed to source — there is no point scheduling
@@ -339,17 +340,17 @@ public:
 	}
 };
 
-class VgiBufferedTableFunctionLocalSourceState : public LocalSourceState {
+class VgiTableBufferingLocalSourceState : public LocalSourceState {
 public:
 	// Per-thread fresh worker. Source acquires from the pool on first
 	// GetData and per finalize_state_id transition (each new state_id
-	// opens a new BUFFERED_TABLE_FINALIZE init stream that we drain via
+	// opens a new TABLE_BUFFERING_FINALIZE init stream that we drain via
 	// ReadDataBatch). We don't reuse the per-thread workers from the
 	// Sink phase because their init_done_ guard would reject a second
 	// PerformInit; cleaner to acquire fresh.
 	std::unique_ptr<IFunctionConnection> worker;
-	int64_t current_finalize_state_id = -1;
-	// True once PerformInit(BUFFERED_TABLE_FINALIZE) has fired on
+	std::vector<uint8_t> current_finalize_state_id;
+	// True once PerformInit(TABLE_BUFFERING_FINALIZE) has fired on
 	// `worker` for `current_finalize_state_id`. Subsequent GetData
 	// calls just keep calling ReadDataBatch on the same worker until
 	// EOS (null batch).
@@ -384,14 +385,14 @@ FunctionConnectionParams BuildAcquireParams(const VgiTableInOutBindData &bd,
 // ============================================================================
 
 unique_ptr<GlobalSinkState>
-PhysicalVgiBufferedTableFunction::GetGlobalSinkState(ClientContext &context) const {
+PhysicalVgiTableBufferingFunction::GetGlobalSinkState(ClientContext &context) const {
 	auto *db = &DatabaseInstance::GetDatabase(context);
-	auto gstate = make_uniq<VgiBufferedTableFunctionGlobalSinkState>(db);
+	auto gstate = make_uniq<VgiTableBufferingGlobalSinkState>(db);
 	auto &bd = bind_data->Cast<VgiTableInOutBindData>();
 	gstate->function_name = bd.function_name;
 	gstate->attach_opaque_data = bd.attach_opaque_data;
 	// Captured for the best-effort destructor RPC fired from
-	// ~VgiBufferedTableFunctionGlobalSinkState. context.shared_from_this()
+	// ~VgiTableBufferingGlobalSinkState. context.shared_from_this()
 	// gives us a non-owning observer; if the session ends before teardown
 	// runs the destructor swallows and relies on cleanup_old_entries.
 	gstate->context_weak = context.shared_from_this();
@@ -400,14 +401,14 @@ PhysicalVgiBufferedTableFunction::GetGlobalSinkState(ClientContext &context) con
 }
 
 unique_ptr<LocalSinkState>
-PhysicalVgiBufferedTableFunction::GetLocalSinkState(ExecutionContext & /*context*/) const {
-	return make_uniq<VgiBufferedTableFunctionLocalSinkState>();
+PhysicalVgiTableBufferingFunction::GetLocalSinkState(ExecutionContext & /*context*/) const {
+	return make_uniq<VgiTableBufferingLocalSinkState>();
 }
 
-SinkResultType PhysicalVgiBufferedTableFunction::Sink(ExecutionContext &context, DataChunk &chunk,
+SinkResultType PhysicalVgiTableBufferingFunction::Sink(ExecutionContext &context, DataChunk &chunk,
                                                        OperatorSinkInput &input) const {
-	auto &gstate = input.global_state.Cast<VgiBufferedTableFunctionGlobalSinkState>();
-	auto &lstate = input.local_state.Cast<VgiBufferedTableFunctionLocalSinkState>();
+	auto &gstate = input.global_state.Cast<VgiTableBufferingGlobalSinkState>();
+	auto &lstate = input.local_state.Cast<VgiTableBufferingLocalSinkState>();
 	auto &bd = bind_data->Cast<VgiTableInOutBindData>();
 
 	// Strict invariant: Sink must not see input after Sink::Finalize ran on
@@ -417,7 +418,7 @@ SinkResultType PhysicalVgiBufferedTableFunction::Sink(ExecutionContext &context,
 	// surfaces loudly instead of silently producing wrong results.
 	if (gstate.finalized.load()) {
 		throw InternalException(
-		    "PhysicalVgiBufferedTableFunction::Sink called after Finalize returned READY — "
+		    "PhysicalVgiTableBufferingFunction::Sink called after Finalize returned READY — "
 		    "the strict once-per-GlobalSinkState invariant has been violated.");
 	}
 
@@ -426,13 +427,13 @@ SinkResultType PhysicalVgiBufferedTableFunction::Sink(ExecutionContext &context,
 	// the execution_id. Other threads wait on a CV until execution_id is
 	// publishable, then run their own per-thread secondary inits in parallel.
 	//
-	// The init RPC opens a Stream on the wire; for BUFFERED_TABLE we don't
+	// The init RPC opens a Stream on the wire; for TABLE_BUFFERING we don't
 	// use it (all subsequent traffic is unary RPCs). In exchange-mode (which
 	// is selected because we pass a non-null input_schema at bind), the
 	// worker is blocked waiting for input. Open the input writer and close
 	// it (sends EOS) so the worker's exchange loop completes, then drain
 	// ReadDataBatch to EOS. After that stdin/stdout are free for the unary
-	// buffered_table_* RPCs.
+	// table_buffering_* RPCs.
 	auto drain_init_stream = [](IFunctionConnection &conn) {
 		conn.OpenInputWriter();
 		conn.CloseInputWriter();
@@ -469,12 +470,12 @@ SinkResultType PhysicalVgiBufferedTableFunction::Sink(ExecutionContext &context,
 				// refresh, etc.) doesn't leave peers hung indefinitely.
 				while (!gstate.init_done.load(std::memory_order_acquire) && !gstate.init_failed) {
 					if (context.client.interrupted) {
-						throw IOException("buffered_table init wait interrupted (query cancelled)");
+						throw IOException("table_buffering init wait interrupted (query cancelled)");
 					}
 					gstate.init_cv.wait_for(lk, std::chrono::milliseconds(250));
 				}
 				if (gstate.init_failed) {
-					throw IOException("buffered_table init failed on peer thread");
+					throw IOException("table_buffering init failed on peer thread");
 				}
 				exec_id = gstate.execution_id;
 			}
@@ -516,16 +517,18 @@ SinkResultType PhysicalVgiBufferedTableFunction::Sink(ExecutionContext &context,
 				auto init_result = lstate.connection->PerformInit(bd.bind_result, /*projection_ids=*/{},
 				                                                    /*pushdown_filters=*/nullptr,
 				                                                    /*join_keys=*/{},
-				                                                    /*phase=*/"BUFFERED_TABLE");
+				                                                    /*phase=*/"TABLE_BUFFERING");
 				minted_exec_id = std::move(init_result.execution_id);
 				drain_init_stream(*lstate.connection);
-				lstate.state_id = gstate.state_id_counter.fetch_add(1);
+				// state_id is now assigned by the worker (returned on the
+				// RpcTableBufferingProcess response in Sink()).
 				if (VgiInfoLogActive(context.client)) {
-					VGI_LOG(context.client, "buffered_table.init",
+					// state_id is not yet known at init time (worker returns
+					// it from the first process() RPC); log it post-Sink.
+					VGI_LOG(context.client, "table_buffering.init",
 					        {{"conn", lstate.connection->GetConnIdHex()},
 					         {"function_name", bd.function_name},
-					         {"role", "init_runner"},
-					         {"state_id", std::to_string(lstate.state_id)}});
+					         {"role", "init_runner"}});
 				}
 			} catch (...) {
 				{
@@ -550,15 +553,14 @@ SinkResultType PhysicalVgiBufferedTableFunction::Sink(ExecutionContext &context,
 			lstate.connection->PerformInit(bd.bind_result, /*projection_ids=*/{},
 			                                /*pushdown_filters=*/nullptr,
 			                                /*join_keys=*/{},
-			                                /*phase=*/"BUFFERED_TABLE");
+			                                /*phase=*/"TABLE_BUFFERING");
 			drain_init_stream(*lstate.connection);
-			lstate.state_id = gstate.state_id_counter.fetch_add(1);
+			// state_id assigned by worker on first Sink RPC.
 			if (VgiInfoLogActive(context.client)) {
-				VGI_LOG(context.client, "buffered_table.init",
+				VGI_LOG(context.client, "table_buffering.init",
 				        {{"conn", lstate.connection->GetConnIdHex()},
 				         {"function_name", bd.function_name},
-				         {"role", "secondary"},
-				         {"state_id", std::to_string(lstate.state_id)}});
+				         {"role", "secondary"}});
 			}
 		}
 	}
@@ -590,30 +592,40 @@ SinkResultType PhysicalVgiBufferedTableFunction::Sink(ExecutionContext &context,
 		batch_index = static_cast<int64_t>(bi.GetIndex());
 	}
 
-	// Per-chunk log gated on VgiInfoLogActive so the info-vector construction
-	// (std::to_string, GetConnIdHex) is skipped in the steady-state /
-	// logging-disabled case. Sink() runs once per DataChunk — without this
-	// gate a 1M-row workload spends measurable time in string formatting
-	// before the DUCKDB_LOG_INTERNAL ShouldLog check elides the actual write.
+	// Worker chooses the state_id and returns it on the response — opaque
+	// bytes the worker can encode any way it wants (8-byte packed pid via
+	// thread_state_id(), UUID4, hash digest, etc.). The C++ side just
+	// shuttles them between phases.
+	lstate.state_id = lstate.connection->RpcTableBufferingProcess(
+	    gstate.function_name, gstate.execution_id, input_batch, batch_index);
 	if (VgiInfoLogActive(context.client)) {
+		// Render state_id as hex — opaque bytes have no canonical decimal form.
+		auto to_hex = [](const std::vector<uint8_t> &b) {
+			std::string out;
+			out.reserve(b.size() * 2);
+			static const char *digits = "0123456789abcdef";
+			for (auto c : b) {
+				out.push_back(digits[c >> 4]);
+				out.push_back(digits[c & 0xF]);
+			}
+			return out;
+		};
 		vector<std::pair<string, string>> info {
 		    {"conn", lstate.connection->GetConnIdHex()},
 		    {"function_name", bd.function_name},
-		    {"state_id", std::to_string(lstate.state_id)},
+		    {"state_id", to_hex(lstate.state_id)},
 		    {"input_rows", std::to_string(input_batch->num_rows())},
 		};
 		if (batch_index.has_value()) {
 			info.emplace_back("batch_index", std::to_string(*batch_index));
 		}
-		VGI_LOG(context.client, "buffered_table.process", info);
+		VGI_LOG(context.client, "table_buffering.process", info);
 	}
-	lstate.connection->RpcBufferedTableProcess(gstate.function_name, gstate.execution_id, lstate.state_id,
-	                                            input_batch, batch_index);
 	return SinkResultType::NEED_MORE_INPUT;
 }
 
 SinkNextBatchType
-PhysicalVgiBufferedTableFunction::NextBatch(ExecutionContext & /*context*/,
+PhysicalVgiTableBufferingFunction::NextBatch(ExecutionContext & /*context*/,
                                               OperatorSinkNextBatchInput & /*input*/) const {
 	// Required to be implementable for sinks that declare
 	// RequiredPartitionInfo()=BatchIndex(). DuckDB invokes this when the
@@ -624,10 +636,10 @@ PhysicalVgiBufferedTableFunction::NextBatch(ExecutionContext & /*context*/,
 }
 
 SinkCombineResultType
-PhysicalVgiBufferedTableFunction::Combine(ExecutionContext & /*context*/,
+PhysicalVgiTableBufferingFunction::Combine(ExecutionContext & /*context*/,
                                            OperatorSinkCombineInput &input) const {
-	auto &gstate = input.global_state.Cast<VgiBufferedTableFunctionGlobalSinkState>();
-	auto &lstate = input.local_state.Cast<VgiBufferedTableFunctionLocalSinkState>();
+	auto &gstate = input.global_state.Cast<VgiTableBufferingGlobalSinkState>();
+	auto &lstate = input.local_state.Cast<VgiTableBufferingLocalSinkState>();
 
 	// Thread didn't receive any input → nothing to hand off.
 	if (!lstate.connection) {
@@ -645,17 +657,17 @@ PhysicalVgiBufferedTableFunction::Combine(ExecutionContext & /*context*/,
 	return SinkCombineResultType::FINISHED;
 }
 
-SinkFinalizeType PhysicalVgiBufferedTableFunction::Finalize(Pipeline & /*pipeline*/, Event & /*event*/,
+SinkFinalizeType PhysicalVgiTableBufferingFunction::Finalize(Pipeline & /*pipeline*/, Event & /*event*/,
                                                               ClientContext &context,
                                                               OperatorSinkFinalizeInput &input) const {
-	auto &gstate = input.global_state.Cast<VgiBufferedTableFunctionGlobalSinkState>();
+	auto &gstate = input.global_state.Cast<VgiTableBufferingGlobalSinkState>();
 
 	// Snapshot state_ids and pop one worker for the combine RPC, all under
 	// workers_mutex. No special "coordinator" — combine reads peer state
 	// through shared BoundStorage in the worker library, so any worker that
 	// finished init can serve. We pop one to avoid running combine and
 	// source-drain concurrently on the same connection.
-	std::vector<int64_t> state_ids_snapshot;
+	std::vector<std::vector<uint8_t>> state_ids_snapshot;
 	std::unique_ptr<IFunctionConnection> combine_worker;
 	{
 		std::lock_guard<std::mutex> lk(gstate.workers_mutex);
@@ -675,14 +687,16 @@ SinkFinalizeType PhysicalVgiBufferedTableFunction::Finalize(Pipeline & /*pipelin
 	// the gstate destructor will cancel-dispatch any workers still in
 	// gstate.workers[]. The combine_worker connection itself, if it throws,
 	// is destroyed at this scope's exit which releases its own pid/fd.
-	VGI_LOG(context, "buffered_table.combine",
+	VGI_LOG(context, "table_buffering.combine",
 	        {{"conn", combine_worker->GetConnIdHex()},
 	         {"function_name", gstate.function_name},
 	         {"num_state_ids", std::to_string(state_ids_snapshot.size())}});
+	// state_ids flow through opaque-bytes — no packing/unpacking, the
+	// worker chose the encoding when it returned them from process().
 	auto finalize_state_ids =
-	    combine_worker->RpcBufferedTableCombine(gstate.function_name, gstate.execution_id,
-	                                              state_ids_snapshot);
-	VGI_LOG(context, "buffered_table.combine_result",
+	    combine_worker->RpcTableBufferingCombine(gstate.function_name, gstate.execution_id,
+	                                                state_ids_snapshot);
+	VGI_LOG(context, "table_buffering.combine_result",
 	        {{"conn", combine_worker->GetConnIdHex()},
 	         {"function_name", gstate.function_name},
 	         {"num_finalize_state_ids", std::to_string(finalize_state_ids.size())}});
@@ -700,8 +714,8 @@ SinkFinalizeType PhysicalVgiBufferedTableFunction::Finalize(Pipeline & /*pipelin
 	}
 	{
 		std::lock_guard<std::mutex> lk(gstate.finalize_queue_mutex);
-		for (auto id : finalize_state_ids) {
-			gstate.finalize_queue.push_back(id);
+		for (auto &id : finalize_state_ids) {
+			gstate.finalize_queue.push_back(std::move(id));
 		}
 	}
 	gstate.finalized.store(true);
@@ -713,14 +727,14 @@ SinkFinalizeType PhysicalVgiBufferedTableFunction::Finalize(Pipeline & /*pipelin
 // ============================================================================
 
 unique_ptr<GlobalSourceState>
-PhysicalVgiBufferedTableFunction::GetGlobalSourceState(ClientContext & /*context*/) const {
-	auto gss = make_uniq<VgiBufferedTableFunctionGlobalSourceState>();
+PhysicalVgiTableBufferingFunction::GetGlobalSourceState(ClientContext & /*context*/) const {
+	auto gss = make_uniq<VgiTableBufferingGlobalSourceState>();
 	// sink_state is populated by the time GetGlobalSourceState runs (the
 	// pipeline executor materializes the sink before scheduling the source).
 	// Read the worker count *now* so MaxThreads can return a sensible cap and
 	// DuckDB doesn't oversubscribe drainer threads.
 	if (sink_state) {
-		auto &gstate = sink_state->Cast<VgiBufferedTableFunctionGlobalSinkState>();
+		auto &gstate = sink_state->Cast<VgiTableBufferingGlobalSinkState>();
 		std::lock_guard<std::mutex> lk(gstate.workers_mutex);
 		gss->worker_count = gstate.workers.size();
 	}
@@ -728,18 +742,18 @@ PhysicalVgiBufferedTableFunction::GetGlobalSourceState(ClientContext & /*context
 }
 
 unique_ptr<LocalSourceState>
-PhysicalVgiBufferedTableFunction::GetLocalSourceState(ExecutionContext & /*context*/,
+PhysicalVgiTableBufferingFunction::GetLocalSourceState(ExecutionContext & /*context*/,
                                                       GlobalSourceState & /*gstate*/) const {
-	return make_uniq<VgiBufferedTableFunctionLocalSourceState>();
+	return make_uniq<VgiTableBufferingLocalSourceState>();
 }
 
-SourceResultType PhysicalVgiBufferedTableFunction::GetDataInternal(ExecutionContext &context, DataChunk &chunk,
+SourceResultType PhysicalVgiTableBufferingFunction::GetDataInternal(ExecutionContext &context, DataChunk &chunk,
                                                                     OperatorSourceInput &input) const {
-	auto &lstate = input.local_state.Cast<VgiBufferedTableFunctionLocalSourceState>();
+	auto &lstate = input.local_state.Cast<VgiTableBufferingLocalSourceState>();
 	// gstate is the *Sink* global state under DuckDB's sink-to-source
 	// transition — operators that are both Sink and Source share the same
 	// state pointer via sink_state.
-	auto &gstate = sink_state->Cast<VgiBufferedTableFunctionGlobalSinkState>();
+	auto &gstate = sink_state->Cast<VgiTableBufferingGlobalSinkState>();
 	auto &bd = bind_data->Cast<VgiTableInOutBindData>();
 
 	// Open a fresh worker + stream for the next finalize_state_id when
@@ -753,26 +767,36 @@ SourceResultType PhysicalVgiBufferedTableFunction::GetDataInternal(ExecutionCont
 				chunk.SetCardinality(0);
 				return SourceResultType::FINISHED;
 			}
-			lstate.current_finalize_state_id = gstate.finalize_queue.front();
+			lstate.current_finalize_state_id = std::move(gstate.finalize_queue.front());
 			gstate.finalize_queue.pop_front();
 		}
 		// Acquire a fresh worker (or reuse the prior one — the unary path
 		// reused workers from gstate.workers, but those were init'd via
-		// phase=BUFFERED_TABLE and would reject a second PerformInit. The
+		// phase=TABLE_BUFFERING and would reject a second PerformInit. The
 		// pool keeps subprocess workers warm so this is cheap.).
 		auto acquire_params = BuildAcquireParams(bd, gstate.execution_id);
 		auto acquired = AcquireConnectionForInit(context.client, acquire_params);
 		lstate.worker = std::move(acquired.connection);
 		if (VgiInfoLogActive(context.client)) {
-			VGI_LOG(context.client, "buffered_table.finalize_init",
+			auto to_hex = [](const std::vector<uint8_t> &b) {
+				std::string out;
+				out.reserve(b.size() * 2);
+				static const char *digits = "0123456789abcdef";
+				for (auto c : b) {
+					out.push_back(digits[c >> 4]);
+					out.push_back(digits[c & 0xF]);
+				}
+				return out;
+			};
+			VGI_LOG(context.client, "table_buffering.finalize_init",
 			        {{"conn", lstate.worker->GetConnIdHex()},
 			         {"function_name", gstate.function_name},
-			         {"finalize_state_id", std::to_string(lstate.current_finalize_state_id)}});
+			         {"finalize_state_id", to_hex(lstate.current_finalize_state_id)}});
 		}
 		lstate.worker->PerformInit(bd.bind_result, /*projection_ids=*/{},
 		                           /*pushdown_filters=*/nullptr,
 		                           /*join_keys=*/{},
-		                           /*phase=*/"BUFFERED_TABLE_FINALIZE",
+		                           /*phase=*/"TABLE_BUFFERING_FINALIZE",
 		                           /*order_by=*/std::nullopt,
 		                           /*table_sample=*/std::nullopt,
 		                           /*init_opaque_data=*/{},

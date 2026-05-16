@@ -218,7 +218,8 @@ static unique_ptr<FunctionData> VgiCatalogTableInOutFunctionBind(ClientContext &
 	params.transaction_opaque_data = tio_tx.GetTransactionOpaqueData();
 	params.settings = ExtractVgiSettings(context, vgi_info.setting_names());
 	params.required_secrets = vgi_info.function_info().required_secrets;
-	params.buffered_table = vgi_info.function_info().buffered_table;
+	params.table_buffering =
+	    vgi_info.function_info().function_type == vgi::VgiFunctionType::TableBuffering;
 	params.source_order_dependent = vgi_info.function_info().source_order_dependent;
 	params.sink_order_dependent = vgi_info.function_info().sink_order_dependent;
 	params.requires_input_batch_index = vgi_info.function_info().requires_input_batch_index;
@@ -283,7 +284,12 @@ void VgiTableFunctionSet::LoadEntries(ClientContext &context, const std::lock_gu
 	// hash-bucket order leaking into user-visible function dispatch.
 	std::map<std::string, std::vector<vgi::VgiFunctionInfo>> functions_by_name;
 	for (auto &func_info : function_list) {
-		if (func_info.function_type != vgi::VgiFunctionType::Table) {
+		// Streaming Table and buffered TableBuffering both live in the
+		// table-function namespace; the distinction drives bind-time
+		// dispatch (streaming in_out_function vs the optimizer rewrite to
+		// PhysicalVgiTableBufferingFunction) but not registration.
+		if (func_info.function_type != vgi::VgiFunctionType::Table &&
+		    func_info.function_type != vgi::VgiFunctionType::TableBuffering) {
 			throw IOException("VGI worker returned '%s' function_type when 'table' was requested (function: %s)",
 			                  vgi::VgiFunctionTypeToString(func_info.function_type), func_info.name);
 		}
@@ -322,14 +328,16 @@ void VgiTableFunctionSet::LoadEntries(ClientContext &context, const std::lock_gu
 				// stateless transforms lets those functions participate in
 				// lateral joins.
 				//
-				// When buffered_table is set, we deliberately *omit*
+				// When the function is TableBuffering, we deliberately *omit*
 				// in_out_function_final — the OptimizerExtension rewrites the
-				// LogicalGet into PhysicalVgiBufferedTableFunction, which
+				// LogicalGet into PhysicalVgiTableBufferingFunction, which
 				// handles finalize through its Sink+Source lifecycle. If the
 				// rewrite is somehow missed, the operator falls back to
 				// VgiTableInOutFunction, which asserts loudly on bind_data
-				// with buffered_table=true.
-				if (func_info.has_finalize && !func_info.buffered_table) {
+				// with table_buffering=true.
+				const bool is_buffering =
+				    func_info.function_type == vgi::VgiFunctionType::TableBuffering;
+				if (func_info.has_finalize && !is_buffering) {
 					table_func.in_out_function_final = vgi::VgiTableInOutFinalize;
 				}
 				table_func.order_preservation_type = MapOrderPreservation(func_info.order_preservation);

@@ -6,7 +6,7 @@
 
 #include "vgi_arrow_ipc.hpp"
 #include "vgi_bind_protocol.hpp"
-#include "vgi_buffered_table_builders.hpp"
+#include "vgi_table_buffering_builders.hpp"
 #include "vgi_catalog_api.hpp"
 #include "generated/vgi_protocol_constants.hpp"
 #include "vgi_exception.hpp"
@@ -339,7 +339,7 @@ InitResult FunctionConnection::PerformInit(const BindResult &bind_result,
                                            const std::optional<OrderByHint> &order_by,
                                            const std::optional<TableSampleHint> &table_sample,
                                            const std::vector<uint8_t> &init_opaque_data,
-                                           const std::optional<int64_t> &finalize_state_id) {
+                                           const std::optional<std::vector<uint8_t>> &finalize_state_id) {
 	if (!proc_) {
 		ThrowVgiIOException("FunctionConnection::PerformInit called before PerformBindRpc", worker_path_,
 		                    -1, GetExecutionIdHex());
@@ -466,14 +466,14 @@ InitResult FunctionConnection::PerformInit(const BindResult &bind_result,
 	//     which happens after the caller has written at least one input batch via
 	//     WriteInputBatch(), giving the server data to process and flush.
 	//
-	// Phase override: FINALIZE and BUFFERED_TABLE_FINALIZE phases are
+	// Phase override: FINALIZE and TABLE_BUFFERING_FINALIZE phases are
 	// always producer-mode regardless of bind_call.input_schema, because
 	// they reuse the bind context but emit only output (no input). The
 	// streaming-shape FINALIZE phase historically went through
 	// PerformFinalizeInit which clears input_schema_; the buffered
-	// BUFFERED_TABLE_FINALIZE phase calls PerformInit directly with a
+	// TABLE_BUFFERING_FINALIZE phase calls PerformInit directly with a
 	// fresh worker, so we honor the phase here.
-	bool producer_phase_override = (phase == "FINALIZE" || phase == "BUFFERED_TABLE_FINALIZE");
+	bool producer_phase_override = (phase == "FINALIZE" || phase == "TABLE_BUFFERING_FINALIZE");
 	if (!input_schema_ || producer_phase_override) {
 		// Regular table function: producer mode (tick-based)
 		is_producer_mode_ = true;
@@ -1025,12 +1025,12 @@ void FunctionConnection::CloseInputWriter() {
 // Each RPC is a unary request/response sent on the connection's stdin/stdout
 // using the same WriteRpcRequest/ReadUnaryResponse framing PerformBindRpc
 // uses. Bind+init must have run on this connection first (with phase
-// "BUFFERED_TABLE"), establishing execution_id on the worker side. The
+// "TABLE_BUFFERING"), establishing execution_id on the worker side. The
 // caller threads gstate.execution_id through every subsequent RPC.
 
 namespace {
 
-// Inner-request builders live in vgi_buffered_table_builders.cpp and are
+// Inner-request builders live in vgi_table_buffering_builders.cpp and are
 // shared with the HTTP transport. We reach them through ::duckdb::vgi::.
 
 // Decode the outer-envelope response into the registered result schema.
@@ -1051,8 +1051,8 @@ std::shared_ptr<arrow::RecordBatch> DecodeOuterResponse(const UnaryResponseResul
 	}
 	auto bin = std::static_pointer_cast<arrow::BinaryArray>(result_col);
 	if (bin->IsNull(0)) {
-		// Empty-schema responses (e.g. buffered_table_process) emit null result;
-		// return null so caller can detect and skip column lookup.
+		// Empty-schema responses (e.g. table_buffering_destructor) emit null
+		// result; return null so caller can detect and skip column lookup.
 		return nullptr;
 	}
 	auto v = bin->GetView(0);
@@ -1061,70 +1061,74 @@ std::shared_ptr<arrow::RecordBatch> DecodeOuterResponse(const UnaryResponseResul
 
 } // namespace
 
-void FunctionConnection::RpcBufferedTableProcess(const std::string &function_name,
-                                                  const std::vector<uint8_t> &execution_id,
-                                                  int64_t state_id,
-                                                  const std::shared_ptr<arrow::RecordBatch> &input_batch,
-                                                  std::optional<int64_t> batch_index) {
+
+// ===========================================================================
+// Table sink+source RPC family (new buffered API)
+// ===========================================================================
+
+std::vector<uint8_t>
+FunctionConnection::RpcTableBufferingProcess(const std::string &function_name,
+                                                const std::vector<uint8_t> &execution_id,
+                                                const std::shared_ptr<arrow::RecordBatch> &input_batch,
+                                                std::optional<int64_t> batch_index) {
 	auto batch_bytes = vgi::SerializeToIpcBytes(input_batch);
-	auto rpc_params = vgi::BuildBufferedTableProcessInner(function_name, execution_id, state_id, batch_bytes,
-	                                                        attach_opaque_data_, batch_index);
-	vgi::ValidateRequestSchema(rpc_params, "buffered_table_process", worker_path_);
-	vgi::WriteRpcRequest(proc_->GetStdinFd(), "buffered_table_process", rpc_params);
+	auto rpc_params = vgi::BuildTableBufferingProcessInner(function_name, execution_id, batch_bytes,
+	                                                          attach_opaque_data_, batch_index);
+	vgi::ValidateRequestSchema(rpc_params, "table_buffering_process", worker_path_);
+	vgi::WriteRpcRequest(proc_->GetStdinFd(), "table_buffering_process", rpc_params);
 	auto response = vgi::ReadUnaryResponse(proc_->GetStdoutFd(), &context_, worker_path_, proc_->GetPid(),
 	                                       GetExecutionIdHex(), GetAttachOpaqueDataHex(), "", GetConnIdHex(),
 	                                       /*block_until_cancel=*/true);
-	(void)DecodeOuterResponse(response, "buffered_table_process", worker_path_);
+	auto inner = DecodeOuterResponse(response, "table_buffering_process", worker_path_);
+	vgi::ValidateResponseSchema(inner, "table_buffering_process", worker_path_);
+	if (!inner || inner->num_rows() == 0) {
+		ThrowVgiIOException("table_buffering_process response missing data", worker_path_, proc_->GetPid(), "");
+	}
+	auto col = inner->GetColumnByName("state_id");
+	auto bin_array = std::static_pointer_cast<arrow::BinaryArray>(col);
+	auto view = bin_array->GetView(0);
+	return std::vector<uint8_t>(view.data(), view.data() + view.size());
 }
 
-std::vector<int64_t> FunctionConnection::RpcBufferedTableCombine(const std::string &function_name,
-                                                                  const std::vector<uint8_t> &execution_id,
-                                                                  const std::vector<int64_t> &state_ids) {
-	auto rpc_params = vgi::BuildBufferedTableCombineInner(function_name, execution_id, state_ids, attach_opaque_data_);
-	vgi::ValidateRequestSchema(rpc_params, "buffered_table_combine", worker_path_);
-	vgi::WriteRpcRequest(proc_->GetStdinFd(), "buffered_table_combine", rpc_params);
+std::vector<std::vector<uint8_t>>
+FunctionConnection::RpcTableBufferingCombine(const std::string &function_name,
+                                                const std::vector<uint8_t> &execution_id,
+                                                const std::vector<std::vector<uint8_t>> &state_ids) {
+	auto rpc_params = vgi::BuildTableBufferingCombineInner(function_name, execution_id, state_ids, attach_opaque_data_);
+	vgi::ValidateRequestSchema(rpc_params, "table_buffering_combine", worker_path_);
+	vgi::WriteRpcRequest(proc_->GetStdinFd(), "table_buffering_combine", rpc_params);
 	auto response = vgi::ReadUnaryResponse(proc_->GetStdoutFd(), &context_, worker_path_, proc_->GetPid(),
 	                                       GetExecutionIdHex(), GetAttachOpaqueDataHex(), "", GetConnIdHex(),
 	                                       /*block_until_cancel=*/true);
-	auto inner = DecodeOuterResponse(response, "buffered_table_combine", worker_path_);
-	vgi::ValidateResponseSchema(inner, "buffered_table_combine", worker_path_);
+	auto inner = DecodeOuterResponse(response, "table_buffering_combine", worker_path_);
+	vgi::ValidateResponseSchema(inner, "table_buffering_combine", worker_path_);
 	if (!inner || inner->num_rows() == 0) {
-		ThrowVgiIOException("buffered_table_combine response missing data", worker_path_, proc_->GetPid(), "");
+		ThrowVgiIOException("table_buffering_combine response missing data", worker_path_, proc_->GetPid(), "");
 	}
 	auto col = inner->GetColumnByName("finalize_state_ids");
 	auto list_array = std::static_pointer_cast<arrow::ListArray>(col);
-	auto values = std::static_pointer_cast<arrow::Int64Array>(list_array->values());
+	auto values = std::static_pointer_cast<arrow::BinaryArray>(list_array->values());
 	auto offset = list_array->value_offset(0);
 	auto length = list_array->value_length(0);
-	std::vector<int64_t> result;
+	std::vector<std::vector<uint8_t>> result;
 	result.reserve(length);
 	for (int64_t i = 0; i < length; ++i) {
-		result.push_back(values->Value(offset + i));
+		auto v = values->GetView(offset + i);
+		result.emplace_back(v.data(), v.data() + v.size());
 	}
 	return result;
 }
 
-// RpcBufferedTableFinalize removed: Source phase now opens a stream
-// via PerformInit(phase=BUFFERED_TABLE_FINALIZE, finalize_state_id=N)
-// and drains via ReadDataBatch.
-
-void FunctionConnection::RpcBufferedTableDestructor(const std::string &function_name,
-                                                     const std::vector<uint8_t> &execution_id) {
-	// Best-effort. Caller (the operator's destructor) wraps in try/catch
-	// because it runs during teardown. We still wait for the response so
-	// the worker is left in a clean state for the next pool acquisition —
-	// firing-and-forgetting at the wire level would leave a pending
-	// response in the worker's stdout pipe and corrupt the next RPC.
-	auto rpc_params = vgi::BuildBufferedTableDestructorInner(function_name, execution_id, attach_opaque_data_);
-	vgi::ValidateRequestSchema(rpc_params, "buffered_table_destructor", worker_path_);
-	vgi::WriteRpcRequest(proc_->GetStdinFd(), "buffered_table_destructor", rpc_params);
+void FunctionConnection::RpcTableBufferingDestructor(const std::string &function_name,
+                                                       const std::vector<uint8_t> &execution_id) {
+	auto rpc_params = vgi::BuildTableBufferingDestructorInner(function_name, execution_id, attach_opaque_data_);
+	vgi::ValidateRequestSchema(rpc_params, "table_buffering_destructor", worker_path_);
+	vgi::WriteRpcRequest(proc_->GetStdinFd(), "table_buffering_destructor", rpc_params);
 	auto response = vgi::ReadUnaryResponse(proc_->GetStdoutFd(), &context_, worker_path_, proc_->GetPid(),
 	                                       GetExecutionIdHex(), GetAttachOpaqueDataHex(), "", GetConnIdHex(),
 	                                       /*block_until_cancel=*/true);
-	auto inner = DecodeOuterResponse(response, "buffered_table_destructor", worker_path_);
-	vgi::ValidateResponseSchema(inner, "buffered_table_destructor", worker_path_);
-	// Response is empty (BufferedTableDestructorResponse has no fields);
-	// schema validation is the only correctness check.
+	auto inner = DecodeOuterResponse(response, "table_buffering_destructor", worker_path_);
+	vgi::ValidateResponseSchema(inner, "table_buffering_destructor", worker_path_);
 }
 
 int FunctionConnection::Wait() {

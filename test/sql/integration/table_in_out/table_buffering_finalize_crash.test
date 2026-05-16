@@ -1,5 +1,5 @@
 # name: test/sql/integration/table_in_out/buffered_finalize_crash.test
-# description: Worker raises during buffered_table_finalize — verify error
+# description: Worker raises during table_buffering.finalize — verify error
 #   propagates from the source phase; gstate teardown handles remaining
 #   workers; next query on the same catalog succeeds.
 # group: [vgi_integration_table_in_out]
@@ -14,8 +14,9 @@ statement ok
 ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
 # ----------------------------------------------------------------------------
-# Finalize raises on the first yield — GetDataInternal's RpcBufferedTableFinalize
-# throws; the source pipeline tears down. Other workers in gstate.workers[]
+# Finalize raises on the first tick — GetDataInternal's
+# PerformInit(TABLE_BUFFERING_FINALIZE) stream throws; the source pipeline
+# tears down. Other workers in gstate.workers[]
 # are still in flight; the gstate destructor cancel-dispatches them.
 # ----------------------------------------------------------------------------
 

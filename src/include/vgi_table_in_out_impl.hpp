@@ -76,12 +76,12 @@ struct VgiTableInOutBindData : public TableFunctionData {
 
 	// Buffered table function path (Sink+Source PhysicalOperator). When true,
 	// the OptimizerExtension rewrites the LogicalGet to
-	// LogicalVgiBufferedTableFunction; the streaming in_out_function /
+	// LogicalVgiTableBufferingFunction; the streaming in_out_function /
 	// in_out_function_final callbacks must never see a bind_data with this
 	// flag set (loud-failure assertion at their entry).
-	bool buffered_table = false;
+	bool table_buffering = false;
 	bool source_order_dependent = false;
-	// Sink-side ordering knobs — only meaningful with buffered_table=true.
+	// Sink-side ordering knobs — only meaningful with table_buffering=true.
 	// sink_order_dependent → ParallelSink=false (single-thread ingest).
 	// requires_input_batch_index → operator declares
 	// RequiredPartitionInfo()=BatchIndex(); per-chunk batch_index flows
@@ -160,7 +160,7 @@ struct VgiTableInOutBindParams {
 
 	// Routes through to bind_data so the OptimizerExtension can recognize a
 	// LogicalGet of a buffered table function and rewrite it.
-	bool buffered_table = false;
+	bool table_buffering = false;
 	bool source_order_dependent = false;
 	bool sink_order_dependent = false;
 	bool requires_input_batch_index = false;

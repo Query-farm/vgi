@@ -66,8 +66,8 @@ src/vgi_aggregate_function_impl.cpp
 src/vgi_aggregate_streaming_impl.cpp
 src/vgi_aggregate_window_impl.cpp
 src/vgi_streaming_window_operator.cpp
-src/vgi_buffered_table_builders.cpp
-src/vgi_buffered_table_function_impl.cpp
+src/vgi_table_buffering_builders.cpp
+src/vgi_table_buffering_impl.cpp
 src/vgi_catalog_api.cpp
 src/vgi_function_connection.cpp
 src/vgi_shm_segment.cpp

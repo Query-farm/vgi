@@ -64,8 +64,8 @@ true
 # ============================================================================
 # Multi-worker engagement assertions — verify parallelism actually engaged.
 #
-# The operator emits VGI_LOG events ("buffered_table.process",
-# "buffered_table.finalize") with a `conn=` field per worker connection.
+# The operator emits VGI_LOG events ("table_buffering.process",
+# "table_buffering.finalize_init") with a `conn=` field per worker connection.
 # Counting distinct conn= ids in those events proves N>1 workers ran.
 # Same pattern as filter_echo_partitioned.test:142-149 for the streaming path.
 #
@@ -93,11 +93,12 @@ statement ok
 CREATE TEMP TABLE parallel_input AS SELECT v FROM range(200000) AS t(v);
 
 # ----------------------------------------------------------------------------
-# Per-thread invariant — the operator assigns exactly one state_id per
-# worker connection (atomic counter + per-thread acquire). So in process
-# events, the count of distinct conn= must equal the count of distinct
-# state_id. This holds regardless of how many threads DuckDB actually
-# scheduled — it's an OPERATOR correctness property, not a scheduler one.
+# Shared-execution invariant — under the TableBuffering API workers
+# typically return ``params.execution_id`` as the state_id (one bucket per
+# execution), so distinct state_id count across every process() log event
+# should be exactly 1, regardless of how many Sink connections DuckDB
+# spawned. This validates that the worker's chosen state_id is stable
+# across threads.
 # ----------------------------------------------------------------------------
 
 statement ok
@@ -107,12 +108,10 @@ statement ok
 SELECT count(*) FROM example.buffer_input((SELECT * FROM parallel_input));
 
 query I
-SELECT
-  COUNT(DISTINCT regexp_extract(message, 'conn=([0-9a-f]+)', 1)) =
-  COUNT(DISTINCT regexp_extract(message, 'state_id=([0-9]+)', 1))
+SELECT COUNT(DISTINCT regexp_extract(message, 'state_id=([0-9a-f]+)', 1)) = 1
 FROM duckdb_logs()
 WHERE type = 'VGI'
-  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'buffered_table.process';
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'table_buffering.process';
 ----
 true
 
@@ -131,7 +130,7 @@ SELECT
   COUNT(DISTINCT regexp_extract(message, 'conn=([0-9a-f]+)', 1)) BETWEEN 1 AND 4
 FROM duckdb_logs()
 WHERE type = 'VGI'
-  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'buffered_table.process';
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'table_buffering.process';
 ----
 true
 
@@ -146,10 +145,10 @@ true
 query I
 SELECT
   COUNT(DISTINCT regexp_extract(message, 'conn=([0-9a-f]+)', 1)) =
-  COUNT(DISTINCT regexp_extract(message, 'finalize_state_id=([0-9]+)', 1))
+  COUNT(DISTINCT regexp_extract(message, 'finalize_state_id=([0-9a-f]+)', 1))
 FROM duckdb_logs()
 WHERE type = 'VGI'
-  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'buffered_table.finalize';
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'table_buffering.finalize_init';
 ----
 true
 
@@ -167,12 +166,10 @@ SELECT count(*) FROM example.buffer_input((SELECT * FROM parallel_input));
 200000
 
 query I
-SELECT
-  COUNT(DISTINCT regexp_extract(message, 'conn=([0-9a-f]+)', 1)) =
-  COUNT(DISTINCT regexp_extract(message, 'state_id=([0-9]+)', 1))
+SELECT COUNT(DISTINCT regexp_extract(message, 'state_id=([0-9a-f]+)', 1)) = 1
 FROM duckdb_logs()
 WHERE type = 'VGI'
-  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'buffered_table.process';
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'table_buffering.process';
 ----
 true
 

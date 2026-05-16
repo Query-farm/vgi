@@ -1,5 +1,5 @@
 # name: test/sql/integration/table_in_out/buffered_worker_crash.test
-# description: Worker SIGKILLs itself during buffered_table_process —
+# description: Worker SIGKILLs itself during table_buffering.process —
 #   verify the C++ side surfaces a clean error and the pool recovers so
 #   the next query against the same catalog succeeds on a fresh worker.
 #

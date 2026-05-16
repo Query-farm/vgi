@@ -1,5 +1,5 @@
 # name: test/sql/integration/table_in_out/buffered_combine_crash.test
-# description: Worker raises Python exception during buffered_table_combine —
+# description: Worker raises Python exception during table_buffering.combine —
 #   verify the error propagates as IOException, the combine_worker is dropped
 #   (not pushed back), and the pool drains so the next query succeeds.
 # group: [vgi_integration_table_in_out]

@@ -158,7 +158,7 @@ int GetCatalogTimeout(ClientContext *context);
 
 // Wait for a file descriptor to become readable, polling the context's
 // `interrupted` flag every 250ms so a user Ctrl-C breaks out of long blocking
-// reads. No deadline — used by data-phase RPCs (buffered_table_*) that can
+// reads. No deadline — used by data-phase RPCs (table_buffering_*) that can
 // legitimately run for arbitrary durations. Cleanup of an interrupted-mid-RPC
 // connection is the caller's responsibility (route through
 // VgiCancelDispatcher so the worker unblocks).

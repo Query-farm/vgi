@@ -1216,8 +1216,10 @@ std::optional<VgiFunctionType> ParseVgiFunctionType(const std::string &value) {
 	if (value == "scalar" || value == "SCALAR") {
 		return VgiFunctionType::Scalar;
 	} else if (value == "table" || value == "TABLE" || value == "table_in_out") {
-		// Both "table" and "table_in_out" map to Table type
+		// Both "table" and the legacy "table_in_out" map to streaming Table.
 		return VgiFunctionType::Table;
+	} else if (value == "table_buffering" || value == "TABLE_BUFFERING") {
+		return VgiFunctionType::TableBuffering;
 	} else if (value == "aggregate" || value == "AGGREGATE") {
 		return VgiFunctionType::Aggregate;
 	}
@@ -1230,6 +1232,8 @@ std::string VgiFunctionTypeToString(VgiFunctionType type) {
 		return "scalar";
 	case VgiFunctionType::Table:
 		return "table";
+	case VgiFunctionType::TableBuffering:
+		return "table_buffering";
 	case VgiFunctionType::Aggregate:
 		return "aggregate";
 	default:
@@ -2209,22 +2213,20 @@ VgiFunctionInfo ParseFunctionInfo(const std::shared_ptr<arrow::RecordBatch> &bat
 	// which lets the function be used under LATERAL with correlated input.
 	info.has_finalize = row["has_finalize"].value_or(false);
 
-	// buffered_table — optional bool (defaults to false for older workers).
-	// When true, the table-in-out function is rewritten in the optimizer
-	// extension into PhysicalVgiBufferedTableFunction (Sink+Source) — the
-	// fix for upstream DuckDB issue #18222.
-	info.buffered_table = row["buffered_table"].value_or(false);
+	// Whether the function uses the buffered Sink+Source path is encoded in
+	// ``function_type`` (TableBuffering vs Table) — parsed above. No
+	// separate boolean column on the wire.
 
 	// source_order_dependent — optional bool. Only meaningful when
-	// buffered_table is true; controls ParallelSource on the buffered op.
+	// function_type == TableBuffering; controls ParallelSource on the buffered op.
 	info.source_order_dependent = row["source_order_dependent"].value_or(false);
 
 	// sink_order_dependent — optional bool. Only meaningful when
-	// buffered_table is true; controls ParallelSink (single-thread ingest).
+	// function_type == TableBuffering; controls ParallelSink (single-thread ingest).
 	info.sink_order_dependent = row["sink_order_dependent"].value_or(false);
 
 	// requires_input_batch_index — optional bool. Only meaningful when
-	// buffered_table is true; advertises RequiredPartitionInfo()=BatchIndex()
+	// function_type == TableBuffering; advertises RequiredPartitionInfo()=BatchIndex()
 	// so DuckDB threads source-position metadata to every Sink call.
 	info.requires_input_batch_index = row["requires_input_batch_index"].value_or(false);
 

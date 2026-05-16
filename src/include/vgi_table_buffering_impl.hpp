@@ -16,10 +16,10 @@ namespace duckdb {
 namespace vgi {
 
 // ============================================================================
-// LogicalVgiBufferedTableFunction
+// LogicalVgiTableBufferingFunction
 // ============================================================================
 // Replaces a LogicalGet of a VGI table-in-out function when the function's
-// metadata declares Meta.buffered_table = True. The OptimizerExtension
+// metadata declares Meta.table_buffering = True. The OptimizerExtension
 // performs the rewrite at optimize_function time (post-built-in passes);
 // any LATERAL decorrelation has already happened by then.
 //
@@ -28,12 +28,12 @@ namespace vgi {
 //     downstream column references continue to resolve.
 //   - return_types / return_names: the function's output schema.
 //   - bind_data: the original VgiTableInOutBindData, owned by us. The
-//     PhysicalVgiBufferedTableFunction takes a reference to this for its
+//     PhysicalVgiTableBufferingFunction takes a reference to this for its
 //     execution-time RPC machinery.
 
-class LogicalVgiBufferedTableFunction : public LogicalExtensionOperator {
+class LogicalVgiTableBufferingFunction : public LogicalExtensionOperator {
 public:
-	LogicalVgiBufferedTableFunction(idx_t table_index_p, vector<LogicalType> return_types_p,
+	LogicalVgiTableBufferingFunction(idx_t table_index_p, vector<LogicalType> return_types_p,
 	                                vector<string> return_names_p,
 	                                unique_ptr<FunctionData> bind_data_p);
 
@@ -48,8 +48,8 @@ public:
 
 	// The VgiTableInOutBindData from the original bind. CreatePlan reads
 	// fields (worker_path, function_name, attach_params, input_schema,
-	// bind_result, buffered_table, source_order_dependent) to construct
-	// the PhysicalVgiBufferedTableFunction. Stored as the base FunctionData
+	// bind_result, table_buffering, source_order_dependent) to construct
+	// the PhysicalVgiTableBufferingFunction. Stored as the base FunctionData
 	// type to play nice with DuckDB's planner conventions; cast to
 	// VgiTableInOutBindData at use sites.
 	unique_ptr<FunctionData> bind_data;
@@ -70,7 +70,7 @@ protected:
 };
 
 // ============================================================================
-// PhysicalVgiBufferedTableFunction
+// PhysicalVgiTableBufferingFunction
 // ============================================================================
 // Sink+Source operator: ingest all input across all sub-pipelines into the
 // worker, run a single cross-pipeline combine, then emit output via parallel
@@ -80,7 +80,7 @@ protected:
 //
 //   Sink(chunk)                   — parallel per DuckDB thread; first Sink
 //                                   acquires the coordinator connection and
-//                                   performs init with phase=BUFFERED_TABLE;
+//                                   performs init with phase=TABLE_BUFFERING;
 //                                   per-thread workers are spawned with
 //                                   global_execution_id = gstate.execution_id
 //                                   (the secondary-init path).
@@ -88,26 +88,28 @@ protected:
 //                                   shared gstate.workers/state_ids lists.
 //   Finalize()                    — single-threaded, exactly once per
 //                                   GlobalSinkState. Calls
-//                                   RpcBufferedTableCombine on the
+//                                   RpcTableBufferingCombine on the
 //                                   coordinator; populates finalize_queue.
 //   GetData(chunk)                — parallel (or single-threaded when
 //                                   source_order_dependent). Pulls next
-//                                   finalize_state_id from the queue, calls
-//                                   RpcBufferedTableFinalize repeatedly while
-//                                   has_more, then moves to the next id.
+//                                   finalize_state_id from the queue, opens
+//                                   a producer-mode stream via
+//                                   PerformInit(phase=TABLE_BUFFERING_FINALIZE)
+//                                   and drains batches until EOS, then
+//                                   moves to the next id.
 
-class PhysicalVgiBufferedTableFunction : public PhysicalOperator {
+class PhysicalVgiTableBufferingFunction : public PhysicalOperator {
 public:
 	static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::EXTENSION;
 
-	PhysicalVgiBufferedTableFunction(PhysicalPlan &physical_plan, vector<LogicalType> return_types_p,
+	PhysicalVgiTableBufferingFunction(PhysicalPlan &physical_plan, vector<LogicalType> return_types_p,
 	                                  vector<string> return_names_p,
 	                                  unique_ptr<FunctionData> bind_data_p, bool source_order_dependent_p,
 	                                  bool sink_order_dependent_p, bool requires_input_batch_index_p,
 	                                  idx_t estimated_cardinality);
 
 	// Owned bind data. The physical operator is the sole long-lived holder
-	// during execution; the LogicalVgiBufferedTableFunction transfers
+	// during execution; the LogicalVgiTableBufferingFunction transfers
 	// ownership at CreatePlan time.
 	unique_ptr<FunctionData> bind_data;
 	vector<string> return_names;

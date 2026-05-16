@@ -210,7 +210,7 @@ public:
 	                       const std::optional<OrderByHint> &order_by = std::nullopt,
 	                       const std::optional<TableSampleHint> &table_sample = std::nullopt,
 	                       const std::vector<uint8_t> &init_opaque_data = {},
-	                       const std::optional<int64_t> &finalize_state_id = std::nullopt) override;
+	                       const std::optional<std::vector<uint8_t>> &finalize_state_id = std::nullopt) override;
 
 	// Re-init for table-in-out FINALIZE: closes the current data streams
 	// and sends a new init RPC with phase="FINALIZE" that references the
@@ -242,17 +242,19 @@ public:
 	// After this, the worker will send EOS on the output stream
 	void CloseInputWriter() override;
 
-	// ========== Buffered Table Function RPCs ==========
-	void RpcBufferedTableProcess(const std::string &function_name,
-	                             const std::vector<uint8_t> &execution_id,
-	                             int64_t state_id,
-	                             const std::shared_ptr<arrow::RecordBatch> &input_batch,
-	                             std::optional<int64_t> batch_index = std::nullopt) override;
-	std::vector<int64_t> RpcBufferedTableCombine(const std::string &function_name,
-	                                             const std::vector<uint8_t> &execution_id,
-	                                             const std::vector<int64_t> &state_ids) override;
-	void RpcBufferedTableDestructor(const std::string &function_name,
-	                                 const std::vector<uint8_t> &execution_id) override;
+	// ========== Table sink+source (buffered) RPC family ==========
+	std::vector<uint8_t>
+	RpcTableBufferingProcess(const std::string &function_name,
+	                           const std::vector<uint8_t> &execution_id,
+	                           const std::shared_ptr<arrow::RecordBatch> &input_batch,
+	                           std::optional<int64_t> batch_index = std::nullopt) override;
+	std::vector<std::vector<uint8_t>>
+	RpcTableBufferingCombine(const std::string &function_name,
+	                           const std::vector<uint8_t> &execution_id,
+	                           const std::vector<std::vector<uint8_t>> &state_ids) override;
+	void
+	RpcTableBufferingDestructor(const std::string &function_name,
+	                              const std::vector<uint8_t> &execution_id) override;
 
 	// Check if this is a table-in-out function (has input schema)
 	bool IsTableInOut() const override {

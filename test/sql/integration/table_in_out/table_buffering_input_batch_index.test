@@ -88,7 +88,7 @@ query I
 SELECT bool_and(message LIKE '%batch_index=%')
 FROM duckdb_logs()
 WHERE type = 'VGI'
-  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'buffered_table.process';
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'table_buffering.process';
 ----
 true
 

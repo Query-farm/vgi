@@ -83,6 +83,9 @@ public:
 	// this field directly and skips `on_init`; without it, secondaries
 	// always see `None` and break any function that uses init opaque data.
 	// Empty `{}` for primary inits.
+	// finalize_state_id is opaque worker-chosen bytes returned from
+	// table_buffering_combine. Empty (b"") is a legitimate value;
+	// nullopt means "no finalize_state_id supplied" (non-finalize phases).
 	virtual InitResult PerformInit(const BindResult &bind_result,
 	                               const std::vector<int32_t> &projection_ids = {},
 	                               std::shared_ptr<arrow::Buffer> pushdown_filters = nullptr,
@@ -91,7 +94,7 @@ public:
 	                               const std::optional<OrderByHint> &order_by = std::nullopt,
 	                               const std::optional<TableSampleHint> &table_sample = std::nullopt,
 	                               const std::vector<uint8_t> &init_opaque_data = {},
-	                               const std::optional<int64_t> &finalize_state_id = std::nullopt) = 0;
+	                               const std::optional<std::vector<uint8_t>> &finalize_state_id = std::nullopt) = 0;
 	// Re-init the connection in FINALIZE mode (table-in-out). Closes the
 	// current data streams and sends a new init RPC that references the
 	// original bind via bind_result.
@@ -104,8 +107,8 @@ public:
 	virtual std::shared_ptr<arrow::RecordBatch> ReadDataBatch() = 0;
 
 	// ========== Buffered Table Function RPCs ==========
-	// Used only when the function declared Meta.buffered_table = True. The
-	// connection must have been initialized via PerformInit(..., phase="BUFFERED_TABLE")
+	// Used only when the function declared Meta.table_buffering = True. The
+	// connection must have been initialized via PerformInit(..., phase="TABLE_BUFFERING")
 	// before any of these are called.
 
 	// Sink one input batch into the worker's per-(execution_id, state_id) state.
@@ -118,32 +121,27 @@ public:
 	// Meta.requires_input_batch_index=True). Pass nullopt otherwise. Workers
 	// that need source ordering accumulate (batch_index, payload) tuples and
 	// sort in combine().
-	virtual void RpcBufferedTableProcess(const std::string &function_name,
-	                                     const std::vector<uint8_t> &execution_id,
-	                                     int64_t state_id,
-	                                     const std::shared_ptr<arrow::RecordBatch> &input_batch,
-	                                     std::optional<int64_t> batch_index = std::nullopt) = 0;
+	// --- Table sink+source (buffered) RPC family ---
+	//
+	// Source-phase finalize is a producer-mode stream opened via
+	// PerformInit(phase="TABLE_BUFFERING_FINALIZE", finalize_state_id=N)
+	// and drained via ReadDataBatch until null (EOS).
 
-	// Once-per-query end-of-input signal. The worker may coordinate with
-	// peer workers (e.g. via shared BoundStorage) and returns partition
-	// keys (finalize_state_ids) that the C++ source phase will iterate.
-	virtual std::vector<int64_t> RpcBufferedTableCombine(const std::string &function_name,
-	                                                     const std::vector<uint8_t> &execution_id,
-	                                                     const std::vector<int64_t> &state_ids) = 0;
+	// Returns the worker-chosen state_id (opaque bytes) for this batch.
+	virtual std::vector<uint8_t>
+	RpcTableBufferingProcess(const std::string &function_name,
+	                           const std::vector<uint8_t> &execution_id,
+	                           const std::shared_ptr<arrow::RecordBatch> &input_batch,
+	                           std::optional<int64_t> batch_index = std::nullopt) = 0;
 
-	// Source-phase finalize is NOT a unary RPC anymore. The Source
-	// operator opens a stream by calling
-	// PerformInit(phase="BUFFERED_TABLE_FINALIZE", finalize_state_id=N)
-	// and drains via ReadDataBatch until null (EOS). One stream per
-	// finalize_state_id; the framework handles all per-tick state.
+	virtual std::vector<std::vector<uint8_t>>
+	RpcTableBufferingCombine(const std::string &function_name,
+	                           const std::vector<uint8_t> &execution_id,
+	                           const std::vector<std::vector<uint8_t>> &state_ids) = 0;
 
-	// Best-effort end-of-query cleanup for buffered_table. The worker pops
-	// any per-execution caches and wipes its FunctionStorage rows. The
-	// PhysicalVgiBufferedTableFunction operator fires this from its
-	// global-state destructor on every code path (success, cancel, throw).
-	// Implementations must not let exceptions escape — destructor context.
-	virtual void RpcBufferedTableDestructor(const std::string &function_name,
-	                                         const std::vector<uint8_t> &execution_id) = 0;
+	virtual void
+	RpcTableBufferingDestructor(const std::string &function_name,
+	                              const std::vector<uint8_t> &execution_id) = 0;
 
 	// Most recent stream-state token observed on this connection
 	// (HTTP only). Returns empty on subprocess. Used by the cancel

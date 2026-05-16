@@ -9,7 +9,7 @@
 #include "vgi_arrow_ipc.hpp"
 #include "vgi_arrow_utils.hpp"
 #include "vgi_bind_protocol.hpp"
-#include "vgi_buffered_table_builders.hpp"
+#include "vgi_table_buffering_builders.hpp"
 #include "vgi_catalog_api.hpp"
 #include "generated/vgi_protocol_constants.hpp"
 #include "vgi_exception.hpp"
@@ -395,7 +395,7 @@ InitResult HttpFunctionConnection::PerformInit(const BindResult &bind_result,
                                                 const std::optional<OrderByHint> &order_by,
                                                 const std::optional<TableSampleHint> &table_sample,
                                                 const std::vector<uint8_t> &init_opaque_data,
-                                                const std::optional<int64_t> &finalize_state_id) {
+                                                const std::optional<std::vector<uint8_t>> &finalize_state_id) {
 #ifdef __EMSCRIPTEN__
 #endif
 	if (init_done_) {
@@ -506,8 +506,8 @@ InitResult HttpFunctionConnection::PerformInit(const BindResult &bind_result,
 	cached_output_schema_ = bind_result.output_schema;
 
 	// Determine mode based on input_schema presence — except for FINALIZE
-	// and BUFFERED_TABLE_FINALIZE phases which always run producer-side.
-	bool producer_phase_override = (phase == "FINALIZE" || phase == "BUFFERED_TABLE_FINALIZE");
+	// and TABLE_BUFFERING_FINALIZE phases which always run producer-side.
+	bool producer_phase_override = (phase == "FINALIZE" || phase == "TABLE_BUFFERING_FINALIZE");
 	if (!input_schema_ || producer_phase_override) {
 		is_producer_mode_ = true;
 	} else {
@@ -615,8 +615,8 @@ void HttpFunctionConnection::CloseInputWriter() {
 // Buffered Table Function RPCs — HTTP transport
 // ============================================================================
 // Mirror the subprocess path: build the inner-schema RecordBatch using the
-// shared builders in vgi_buffered_table_builders.cpp, POST it to the
-// /buffered_table_* HTTP endpoint via HttpInvokeUnary, then decode the outer
+// shared builders in vgi_table_buffering_builders.cpp, POST it to the
+// /table_buffering_* HTTP endpoint via HttpInvokeUnary, then decode the outer
 // envelope's "result" column (an IPC-serialized inner batch).
 //
 // Errors and log batches flow through HttpInvokeUnary → ReadUnaryResponseFromBuffer
@@ -627,7 +627,7 @@ namespace {
 
 // Decode the outer envelope's 'result' column (binary blob containing
 // IPC bytes of the inner response batch). Returns nullptr if 'result' is null
-// (used for void-style methods like buffered_table_process).
+// (used for empty-response methods like table_buffering_destructor).
 std::shared_ptr<arrow::RecordBatch> DecodeHttpOuterResponse(const UnaryResponseResult &response,
                                                               const std::string &method_name,
                                                               const std::string &base_url) {
@@ -651,66 +651,75 @@ std::shared_ptr<arrow::RecordBatch> DecodeHttpOuterResponse(const UnaryResponseR
 
 } // namespace
 
-void HttpFunctionConnection::RpcBufferedTableProcess(const std::string &function_name,
-                                                      const std::vector<uint8_t> &execution_id,
-                                                      int64_t state_id,
-                                                      const std::shared_ptr<arrow::RecordBatch> &input_batch,
-                                                      std::optional<int64_t> batch_index) {
+
+// ===========================================================================
+// Table sink+source RPC family (new buffered API) — HTTP transport
+// ===========================================================================
+
+std::vector<uint8_t>
+HttpFunctionConnection::RpcTableBufferingProcess(const std::string &function_name,
+                                                    const std::vector<uint8_t> &execution_id,
+                                                    const std::shared_ptr<arrow::RecordBatch> &input_batch,
+                                                    std::optional<int64_t> batch_index) {
 	auto batch_bytes = vgi::SerializeToIpcBytes(input_batch);
-	auto rpc_params = vgi::BuildBufferedTableProcessInner(function_name, execution_id, state_id, batch_bytes,
-	                                                        attach_opaque_data_, batch_index);
+	auto rpc_params = vgi::BuildTableBufferingProcessInner(function_name, execution_id, batch_bytes,
+	                                                          attach_opaque_data_, batch_index);
 	auto auth = attach_params_ ? attach_params_->auth() : nullptr;
 	auto cached_params = attach_params_
 	    ? attach_params_->GetOrInitHttpParams(context_, base_url_) : nullptr;
-	auto resp = HttpInvokeUnary(context_, base_url_, "buffered_table_process", rpc_params, auth,
+	auto resp = HttpInvokeUnary(context_, base_url_, "table_buffering_process", rpc_params, auth,
 	                             /*cookie_jar=*/nullptr, cached_params,
 	                             GetExecutionIdHex(), GetAttachOpaqueDataHex(), "", GetConnIdHex());
-	(void)DecodeHttpOuterResponse(resp, "buffered_table_process", base_url_);
+	auto inner = DecodeHttpOuterResponse(resp, "table_buffering_process", base_url_);
+	if (!inner || inner->num_rows() == 0) {
+		throw IOException("table_buffering_process response missing data [url: %s]", base_url_);
+	}
+	auto col = inner->GetColumnByName("state_id");
+	auto bin_array = std::static_pointer_cast<arrow::BinaryArray>(col);
+	auto view = bin_array->GetView(0);
+	return std::vector<uint8_t>(view.data(), view.data() + view.size());
 }
 
-std::vector<int64_t> HttpFunctionConnection::RpcBufferedTableCombine(const std::string &function_name,
-                                                                     const std::vector<uint8_t> &execution_id,
-                                                                     const std::vector<int64_t> &state_ids) {
-	auto rpc_params = vgi::BuildBufferedTableCombineInner(function_name, execution_id, state_ids,
-	                                                       attach_opaque_data_);
+std::vector<std::vector<uint8_t>>
+HttpFunctionConnection::RpcTableBufferingCombine(const std::string &function_name,
+                                                    const std::vector<uint8_t> &execution_id,
+                                                    const std::vector<std::vector<uint8_t>> &state_ids) {
+	auto rpc_params = vgi::BuildTableBufferingCombineInner(function_name, execution_id, state_ids, attach_opaque_data_);
 	auto auth = attach_params_ ? attach_params_->auth() : nullptr;
 	auto cached_params = attach_params_
 	    ? attach_params_->GetOrInitHttpParams(context_, base_url_) : nullptr;
-	auto resp = HttpInvokeUnary(context_, base_url_, "buffered_table_combine", rpc_params, auth,
+	auto resp = HttpInvokeUnary(context_, base_url_, "table_buffering_combine", rpc_params, auth,
 	                             /*cookie_jar=*/nullptr, cached_params,
 	                             GetExecutionIdHex(), GetAttachOpaqueDataHex(), "", GetConnIdHex());
-	auto inner = DecodeHttpOuterResponse(resp, "buffered_table_combine", base_url_);
+	auto inner = DecodeHttpOuterResponse(resp, "table_buffering_combine", base_url_);
 	if (!inner || inner->num_rows() == 0) {
-		throw IOException("buffered_table_combine response missing data [url: %s]", base_url_);
+		throw IOException("table_buffering_combine response missing data [url: %s]", base_url_);
 	}
 	auto col = inner->GetColumnByName("finalize_state_ids");
 	auto list_array = std::static_pointer_cast<arrow::ListArray>(col);
-	auto values = std::static_pointer_cast<arrow::Int64Array>(list_array->values());
+	auto values = std::static_pointer_cast<arrow::BinaryArray>(list_array->values());
 	auto offset = list_array->value_offset(0);
 	auto length = list_array->value_length(0);
-	std::vector<int64_t> result;
+	std::vector<std::vector<uint8_t>> result;
 	result.reserve(length);
 	for (int64_t i = 0; i < length; ++i) {
-		result.push_back(values->Value(offset + i));
+		auto v = values->GetView(offset + i);
+		result.emplace_back(v.data(), v.data() + v.size());
 	}
 	return result;
 }
 
-// RpcBufferedTableFinalize removed: Source phase now opens a stream
-// via PerformInit(phase=BUFFERED_TABLE_FINALIZE, finalize_state_id=N)
-// and drains via ReadDataBatch.
-
-void HttpFunctionConnection::RpcBufferedTableDestructor(const std::string &function_name,
-                                                         const std::vector<uint8_t> &execution_id) {
-	auto rpc_params = vgi::BuildBufferedTableDestructorInner(function_name, execution_id, attach_opaque_data_);
+void HttpFunctionConnection::RpcTableBufferingDestructor(const std::string &function_name,
+                                                           const std::vector<uint8_t> &execution_id) {
+	auto rpc_params = vgi::BuildTableBufferingDestructorInner(function_name, execution_id, attach_opaque_data_);
 	auto auth = attach_params_ ? attach_params_->auth() : nullptr;
 	auto cached_params = attach_params_
 	    ? attach_params_->GetOrInitHttpParams(context_, base_url_) : nullptr;
-	auto resp = HttpInvokeUnary(context_, base_url_, "buffered_table_destructor", rpc_params, auth,
+	auto resp = HttpInvokeUnary(context_, base_url_, "table_buffering_destructor", rpc_params, auth,
 	                             /*cookie_jar=*/nullptr, cached_params,
 	                             GetExecutionIdHex(), GetAttachOpaqueDataHex(), "", GetConnIdHex());
-	auto inner = DecodeHttpOuterResponse(resp, "buffered_table_destructor", base_url_);
-	(void)inner; // empty response — no fields to extract
+	auto inner = DecodeHttpOuterResponse(resp, "table_buffering_destructor", base_url_);
+	(void)inner;
 }
 
 std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {

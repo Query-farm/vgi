@@ -40,7 +40,7 @@
 #include "vgi_oauth.hpp"
 #include "vgi_profiling.hpp"
 #include "vgi_streaming_window_operator.hpp"
-#include "vgi_buffered_table_function_impl.hpp"
+#include "vgi_table_buffering_impl.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #ifndef __EMSCRIPTEN__
 #include "vgi_subprocess.hpp"
@@ -266,18 +266,18 @@ private:
 };
 
 // ============================================================================
-// VgiBufferedTableRewriter — rewrite LogicalGet → LogicalVgiBufferedTableFunction
+// VgiTableBufferingRewriter — rewrite LogicalGet → LogicalVgiTableBufferingFunction
 // ============================================================================
 // Walks the plan post-built-in-optimizers. For each LogicalGet whose bind_data
-// is a VgiTableInOutBindData with buffered_table=true, replaces it with a
-// LogicalVgiBufferedTableFunction carrying the same return types/names and
+// is a VgiTableInOutBindData with table_buffering=true, replaces it with a
+// LogicalVgiTableBufferingFunction carrying the same return types/names and
 // the bind_data ownership. The LATERAL decorrelation pass has already run by
 // this point, so any correlated subqueries are already DELIM_JOINs and our
 // LogicalGet appears as a plain (non-projected_input) node.
 
-class VgiBufferedTableRewriter : public OptimizerExtension {
+class VgiTableBufferingRewriter : public OptimizerExtension {
 public:
-	VgiBufferedTableRewriter() {
+	VgiTableBufferingRewriter() {
 		optimize_function = Optimize;
 	}
 
@@ -287,7 +287,7 @@ private:
 			return false;
 		}
 		auto *bd = dynamic_cast<vgi::VgiTableInOutBindData *>(get.bind_data.get());
-		return bd && bd->buffered_table;
+		return bd && bd->table_buffering;
 	}
 
 	static void Rewrite(unique_ptr<LogicalOperator> &op) {
@@ -314,22 +314,22 @@ private:
 		// floor. Fail loudly here instead.
 		if (!get.projection_ids.empty()) {
 			throw InternalException(
-			    "VgiBufferedTableRewriter: LogicalGet has non-empty projection_ids — "
+			    "VgiTableBufferingRewriter: LogicalGet has non-empty projection_ids — "
 			    "buffered table functions don't support projection pushdown");
 		}
 		if (get.table_filters.filters.size() > 0) {
 			throw InternalException(
-			    "VgiBufferedTableRewriter: LogicalGet has table_filters — "
+			    "VgiTableBufferingRewriter: LogicalGet has table_filters — "
 			    "buffered table functions don't support filter pushdown");
 		}
 
-		auto rewritten = make_uniq<vgi::LogicalVgiBufferedTableFunction>(
+		auto rewritten = make_uniq<vgi::LogicalVgiTableBufferingFunction>(
 		    get.table_index, get.returned_types, get.names, std::move(get.bind_data));
 		rewritten->children = std::move(get.children);
 		rewritten->ResolveOperatorTypes();
 
 		VGI_STDERR_DEBUG(
-		    "[VGI] LogicalGet rewritten -> LogicalVgiBufferedTableFunction "
+		    "[VGI] LogicalGet rewritten -> LogicalVgiTableBufferingFunction "
 		    "(table_index=%llu, %zu output column(s))\n",
 		    static_cast<unsigned long long>(get.table_index), get.returned_types.size());
 
@@ -340,10 +340,10 @@ private:
 		// Gated on a session setting so an emergency-rollback path exists if
 		// the rewriter regresses against a real workload. When disabled, the
 		// loud-failure asserts in VgiTableInOutFunction/VgiTableInOutFinalize
-		// will catch any buffered_table function call so users see a clear
+		// will catch any table_buffering function call so users see a clear
 		// error rather than the pre-fix UNION-ALL corruption.
 		Value enabled_val;
-		if (!input.context.TryGetCurrentSetting("vgi_buffered_table", enabled_val) ||
+		if (!input.context.TryGetCurrentSetting("vgi_table_buffering", enabled_val) ||
 		    enabled_val.IsNull() || !enabled_val.GetValue<bool>()) {
 			return;
 		}
@@ -1263,19 +1263,19 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
 	OptimizerExtension::Register(config, VgiStreamingWindowOptimizer());
 
-	// Buffered table function rewriter — replace LogicalGet of any
-	// Meta.buffered_table=True function with our Sink+Source physical op.
+	// Table sink+source function rewriter — replace LogicalGet of any
+	// TableBufferingFunction subclass with our Sink+Source physical op.
 	// Gated on a session setting so a regression has an emergency rollback
 	// path. When disabled, the loud-failure asserts in VgiTableInOutFunction /
 	// VgiTableInOutFinalize will surface a clear error rather than the
 	// pre-fix UNION-ALL corruption.
-	config.AddExtensionOption("vgi_buffered_table",
-	                          "Rewrite calls to Meta.buffered_table=True functions through "
-	                          "the Sink+Source PhysicalVgiBufferedTableFunction operator. "
-	                          "Set to false to disable the rewrite — buffered_table queries "
+	config.AddExtensionOption("vgi_table_buffering",
+	                          "Rewrite calls to TableBufferingFunction subclasses through "
+	                          "the Sink+Source PhysicalVgiTableBufferingFunction operator. "
+	                          "Set to false to disable the rewrite — table_buffering queries "
 	                          "will then throw a clear InternalException instead of running.",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
-	OptimizerExtension::Register(config, VgiBufferedTableRewriter());
+	OptimizerExtension::Register(config, VgiTableBufferingRewriter());
 
 	// Register worker pool settings
 	config.AddExtensionOption("vgi_worker_pool_idle_limit_seconds",

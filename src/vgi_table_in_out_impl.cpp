@@ -38,7 +38,7 @@ unique_ptr<FunctionData> VgiTableInOutBindData::Copy() const {
 	copy->bind_result = bind_result;
 	copy->max_processes = max_processes;
 	copy->cardinality_estimate = cardinality_estimate;
-	copy->buffered_table = buffered_table;
+	copy->table_buffering = table_buffering;
 	copy->source_order_dependent = source_order_dependent;
 	copy->sink_order_dependent = sink_order_dependent;
 	copy->requires_input_batch_index = requires_input_batch_index;
@@ -104,7 +104,7 @@ unique_ptr<FunctionData> VgiTableInOutBind(ClientContext &context, TableFunction
 	bind_data->function_name = params.function_name;
 	bind_data->settings = params.settings;
 	bind_data->required_secrets = params.required_secrets;
-	bind_data->buffered_table = params.buffered_table;
+	bind_data->table_buffering = params.table_buffering;
 	bind_data->source_order_dependent = params.source_order_dependent;
 	bind_data->sink_order_dependent = params.sink_order_dependent;
 	bind_data->requires_input_batch_index = params.requires_input_batch_index;
@@ -383,21 +383,21 @@ OperatorResultType VgiTableInOutFunction(ExecutionContext &context, TableFunctio
 	auto &local_state = data.local_state->Cast<VgiTableInOutLocalState>();
 	auto &client_context = context.client;
 
-	// Loud-failure guard: a buffered_table function should never reach the
+	// Loud-failure guard: a table_buffering function should never reach the
 	// streaming in_out_function callback. The optimizer extension rewrites
-	// LogicalGet → LogicalVgiBufferedTableFunction at optimize_function
+	// LogicalGet → LogicalVgiTableBufferingFunction at optimize_function
 	// time, so reaching here means the rewriter was disabled or buggy.
 	// Catch this loudly rather than silently regressing to the broken
 	// per-pipeline-finalize semantics that the buffered path is meant to fix.
-	if (bind_data.buffered_table) {
-		// `vgi_buffered_table=false` deliberately routes us here so users can
+	if (bind_data.table_buffering) {
+		// `vgi_table_buffering=false` deliberately routes us here so users can
 		// roll back to the streaming path if the rewriter has a bug. Throw an
 		// `InvalidInputException` (recoverable; doesn't kill the session)
 		// instead of `InternalException`.
 		throw InvalidInputException(
-		    "Function '%s' is registered with Meta.buffered_table=True but the "
-		    "vgi_buffered_table rewriter did not fire (likely SET vgi_buffered_table=false). "
-		    "Re-enable with `SET vgi_buffered_table=true` or upgrade the worker to a "
+		    "Function '%s' is registered with Meta.table_buffering=True but the "
+		    "vgi_table_buffering rewriter did not fire (likely SET vgi_table_buffering=false). "
+		    "Re-enable with `SET vgi_table_buffering=true` or upgrade the worker to a "
 		    "non-buffered shape.", bind_data.function_name);
 	}
 
@@ -469,14 +469,14 @@ OperatorFinalizeResultType VgiTableInOutFinalize(ExecutionContext &context, Tabl
 	auto &local_state = data.local_state->Cast<VgiTableInOutLocalState>();
 	auto &client_context = context.client;
 
-	// See the matching guard in VgiTableInOutFunction. A buffered_table
+	// See the matching guard in VgiTableInOutFunction. A table_buffering
 	// function reaching the streaming finalize callback would re-introduce
 	// the per-pipeline-finalize bug — fail loudly.
-	if (bind_data.buffered_table) {
+	if (bind_data.table_buffering) {
 		throw InvalidInputException(
-		    "Function '%s' is registered with Meta.buffered_table=True but the "
-		    "vgi_buffered_table rewriter did not fire (likely SET vgi_buffered_table=false). "
-		    "Re-enable with `SET vgi_buffered_table=true` or upgrade the worker to a "
+		    "Function '%s' is registered with Meta.table_buffering=True but the "
+		    "vgi_table_buffering rewriter did not fire (likely SET vgi_table_buffering=false). "
+		    "Re-enable with `SET vgi_table_buffering=true` or upgrade the worker to a "
 		    "non-buffered shape.", bind_data.function_name);
 	}
 

@@ -149,7 +149,7 @@ UnaryResponseResult ReadUnaryResponse(int fd, ClientContext *context,
                                       const std::string &transaction_opaque_data_hex,
                                       const std::string &conn_id_hex,
                                       bool block_until_cancel) {
-	// Data-phase callers (buffered_table_*) block until either the worker
+	// Data-phase callers (table_buffering_*) block until either the worker
 	// speaks or the query is cancelled — no wall-clock deadline. Catalog
 	// callers use the bounded catalog timeout so a wedged worker doesn't
 	// hang the planner.

@@ -63,7 +63,7 @@ public:
 	                       const std::optional<OrderByHint> &order_by = std::nullopt,
 	                       const std::optional<TableSampleHint> &table_sample = std::nullopt,
 	                       const std::vector<uint8_t> &init_opaque_data = {},
-	                       const std::optional<int64_t> &finalize_state_id = std::nullopt) override;
+	                       const std::optional<std::vector<uint8_t>> &finalize_state_id = std::nullopt) override;
 	void PerformFinalizeInit(const BindResult &bind_result) override;
 
 	// Phase 3: Data exchange
@@ -73,17 +73,20 @@ public:
 	std::shared_ptr<arrow::RecordBatch> ReadDataBatch() override;
 	void CancelStream(const std::vector<uint8_t> &state_token) override;
 
-	// ========== Buffered Table Function RPCs ==========
-	void RpcBufferedTableProcess(const std::string &function_name,
-	                             const std::vector<uint8_t> &execution_id,
-	                             int64_t state_id,
-	                             const std::shared_ptr<arrow::RecordBatch> &input_batch,
-	                             std::optional<int64_t> batch_index = std::nullopt) override;
-	std::vector<int64_t> RpcBufferedTableCombine(const std::string &function_name,
-	                                             const std::vector<uint8_t> &execution_id,
-	                                             const std::vector<int64_t> &state_ids) override;
-	void RpcBufferedTableDestructor(const std::string &function_name,
-	                                 const std::vector<uint8_t> &execution_id) override;
+
+	// ========== Table sink+source RPC family ==========
+	std::vector<uint8_t>
+	RpcTableBufferingProcess(const std::string &function_name,
+	                           const std::vector<uint8_t> &execution_id,
+	                           const std::shared_ptr<arrow::RecordBatch> &input_batch,
+	                           std::optional<int64_t> batch_index = std::nullopt) override;
+	std::vector<std::vector<uint8_t>>
+	RpcTableBufferingCombine(const std::string &function_name,
+	                           const std::vector<uint8_t> &execution_id,
+	                           const std::vector<std::vector<uint8_t>> &state_ids) override;
+	void
+	RpcTableBufferingDestructor(const std::string &function_name,
+	                              const std::vector<uint8_t> &execution_id) override;
 	std::vector<uint8_t> GetLastStateToken() const override {
 		return std::vector<uint8_t>(stream_state_token_.begin(), stream_state_token_.end());
 	}
