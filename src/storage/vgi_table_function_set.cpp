@@ -342,28 +342,37 @@ void VgiTableFunctionSet::LoadEntries(ClientContext &context, const std::lock_gu
 				if (func_info.has_finalize && !is_buffering) {
 					table_func.in_out_function_final = vgi::VgiTableInOutFinalize;
 				}
-				// Advertise projection / filter pushdown to DuckDB's optimizer
-				// for the buffered (Sink+Source) path. The rewriter
-				// (vgi_extension.cpp:VgiTableBufferingRewriter) captures the
-				// pushed-down state at plan time, narrows the Logical op's
-				// return_types to the projected set, and threads pushdown
-				// through to the worker via PerformInit's projection_ids /
-				// pushdown_filters fields.
+				// Advertise pushdown capability to DuckDB's optimizer.
 				//
-				// Streaming TableInOut is intentionally NOT bundled here.
-				// PhysicalTableInOutFunction doesn't auto-narrow the output
-				// DataChunk under projection_pushdown the way
-				// PhysicalTableFunction does — so even with all the wire
-				// plumbing in place, the Python worker (which DOES narrow
-				// params.output_schema and emits narrow batches) would
-				// produce a width mismatch against the C++ scan's
-				// full-width output buffer (INTERNAL error in
-				// ArrowToDuckDB). The fix needs a custom narrow-output
-				// adaptation in the C++ scan path, separate from this PR.
-				// Tracked as a follow-up; see the plan's "out of scope".
+				// **Buffered (Sink+Source)** supports BOTH projection
+				// and filter pushdown. ``VgiTableBufferingRewriter`` in
+				// vgi_extension.cpp captures pushed-down state at plan
+				// time, narrows the Logical op's return_types, threads
+				// pushdown through PerformInit, and the Source's
+				// ArrowToDuckDB call uses arrow_scan_is_projected=true
+				// to read narrow worker batches positionally.
+				//
+				// **Streaming InOut** supports ONLY projection pushdown.
+				// DuckDB's planner discards ``table_filters`` for the
+				// InOut path (see duckdb/src/execution/physical_plan/
+				// plan_get.cpp:37-83 — the early-return InOut branch
+				// constructs ``PhysicalTableInOutFunction`` with no
+				// table_filters parameter and doesn't add a FILTER node
+				// above the operator). Advertising filter_pushdown=true
+				// causes the filter optimizer to push predicates into
+				// ``LogicalGet.table_filters``, where they then get
+				// silently dropped — query returns unfiltered rows.
+				// Don't advertise filter_pushdown for InOut. Filters
+				// always run via a separate FILTER node above the
+				// operator (correct behavior, just no wire-bandwidth
+				// savings). Expression pushdown is intentionally
+				// skipped for the same reason.
+				table_func.projection_pushdown = func_info.projection_pushdown.value_or(false);
 				if (is_buffering) {
-					table_func.projection_pushdown = func_info.projection_pushdown.value_or(false);
 					table_func.filter_pushdown = func_info.filter_pushdown.value_or(false);
+					if (!func_info.supported_expression_filters.empty()) {
+						table_func.pushdown_expression = vgi::VgiPushdownExpression;
+					}
 				}
 				table_func.order_preservation_type = MapOrderPreservation(func_info.order_preservation);
 

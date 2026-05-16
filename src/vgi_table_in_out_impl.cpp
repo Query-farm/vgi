@@ -260,23 +260,75 @@ unique_ptr<GlobalTableFunctionState> VgiTableInOutInitGlobal(ClientContext &cont
 	auto connection = std::move(acquired.connection);
 	global_state->bind_result = bind_data.bind_result;
 
+	// Capture projection + filter pushdown from the TableFunctionInitInput.
+	// Mirrors the streaming pure-table path at
+	// ``vgi_table_function_impl.cpp:1023-1090``. The capability flags
+	// (advertised in ``vgi_table_function_set.cpp``) gate whether DuckDB
+	// populated ``input.column_ids`` / ``input.filters`` with non-trivial
+	// pushdown state; without them, column_ids is a single virtual column
+	// placeholder and filters is null.
+	if (bind_data.projection_pushdown && !input.column_ids.empty()) {
+		// Save the DuckDB-side column_ids list. Threaded onto LocalState
+		// at InitLocal so ``ProduceOutputFromBatch`` can drive
+		// ``ArrowToDuckDB`` with arrow_scan_is_projected=true and
+		// the right per-column-type lookups.
+		global_state->column_ids.reserve(input.column_ids.size());
+		for (auto col_id : input.column_ids) {
+			global_state->column_ids.push_back(col_id);
+		}
+		global_state->projection_ids.reserve(input.column_ids.size());
+		for (auto col_id : input.column_ids) {
+			global_state->projection_ids.push_back(static_cast<int32_t>(col_id));
+		}
+	}
+	// Note: DuckDB's planner discards ``LogicalGet.table_filters`` for the
+	// InOut path (see plan_get.cpp:37-83), so ``input.filters`` is always
+	// null here even when ``bind_data.filter_pushdown`` is True. The
+	// streaming TableInOut path therefore only supports projection
+	// pushdown end-to-end; filters fall back to a separate FILTER node
+	// above the operator. The serialization below is guarded on
+	// ``input.filters != nullptr`` so the branch is a no-op today but
+	// ready if upstream DuckDB grows InOut filter-pushdown support.
+	if (bind_data.filter_pushdown && bind_data.output_schema && input.filters) {
+		// VgiSerializeFilters indexes filter column refs through
+		// ``column_ids`` → ``column_names``. The streaming pure-table
+		// path passes ``bind_data.all_column_names``; the InOut path's
+		// equivalent is the worker's full output schema.
+		vector<string> output_names;
+		output_names.reserve(bind_data.output_schema->num_fields());
+		for (int i = 0; i < bind_data.output_schema->num_fields(); ++i) {
+			output_names.push_back(bind_data.output_schema->field(i)->name());
+		}
+		try {
+			auto serialized = vgi::VgiSerializeFilters(
+			    context, input.column_ids, input.filters,
+			    output_names, bind_data.worker_path());
+			global_state->static_filter_bytes = std::move(serialized.filter_bytes);
+			global_state->join_keys_buffers = std::move(serialized.join_keys_buffers);
+			if (global_state->static_filter_bytes) {
+				VGI_LOG(context, "table_in_out.filters_serialized",
+				        {{"function_name", bind_data.function_name},
+				         {"filter_bytes_size",
+				          std::to_string(global_state->static_filter_bytes->size())}});
+			}
+		} catch (const InvalidInputException &e) {
+			// Unsupported filter — skip pushdown; DuckDB filters locally.
+			VGI_LOG(context, "table_in_out.filter_pushdown_skipped",
+			        {{"function_name", bind_data.function_name}, {"reason", e.what()}});
+		}
+	}
+
 	// Perform init with phase=INPUT for table-in-out functions. Init is the
 	// first RPC after acquire, so stale-pool detection lives here: a pooled
 	// subprocess that died while idle surfaces as IOException, and we retry
 	// once with a forced-fresh connection. HTTP transport never enters the
 	// retry branch (from_pool is always false there).
-	//
-	// Pushdown args are intentionally empty for the streaming TableInOut
-	// path: the C++ scan path doesn't auto-narrow output.ColumnCount() the
-	// way PhysicalTableFunction does, so a narrowed worker batch would
-	// width-mismatch the full-width output. The buffered (Sink+Source)
-	// path handles pushdown via VgiTableBufferingRewriter narrowing
-	// return_types at plan time; streaming InOut needs an analogous
-	// adaptation that's out of scope for this PR. See storage/
-	// vgi_table_function_set.cpp's comment on the same topic.
 	InitResult init_result;
 	try {
-		init_result = connection->PerformInit(global_state->bind_result, {}, nullptr, {}, "INPUT");
+		init_result = connection->PerformInit(global_state->bind_result,
+		                                       global_state->projection_ids,
+		                                       global_state->static_filter_bytes,
+		                                       global_state->join_keys_buffers, "INPUT");
 	} catch (const IOException &e) {
 		if (!acquired.from_pool) {
 			throw;
@@ -288,7 +340,10 @@ unique_ptr<GlobalTableFunctionState> VgiTableInOutInitGlobal(ClientContext &cont
 		         {"error", e.what()}});
 		acquired = AcquireConnectionForInit(context, acquire_params, /*force_fresh=*/true);
 		connection = std::move(acquired.connection);
-		init_result = connection->PerformInit(global_state->bind_result, {}, nullptr, {}, "INPUT");
+		init_result = connection->PerformInit(global_state->bind_result,
+		                                       global_state->projection_ids,
+		                                       global_state->static_filter_bytes,
+		                                       global_state->join_keys_buffers, "INPUT");
 	}
 	global_state->global_execution_id = std::move(init_result.execution_id);
 
@@ -308,6 +363,18 @@ unique_ptr<LocalTableFunctionState> VgiTableInOutInitLocal(ExecutionContext &con
                                                             GlobalTableFunctionState *global_state_p) {
 	auto current_chunk = make_uniq<ArrowArrayWrapper>();
 	auto local_state = make_uniq<VgiTableInOutLocalState>(std::move(current_chunk), context.client);
+	// Thread projection state captured at InitGlobal onto the local scan
+	// state so ``ProduceOutputFromBatch`` can drive ``ArrowToDuckDB`` with
+	// ``arrow_scan_is_projected=true`` and the right per-column-type
+	// lookups. ``ArrowScanLocalState::column_ids`` (inherited) is what
+	// ``ArrowToDuckDB`` reads to remap output positions to worker-original
+	// column indices. Empty list means "no projection" — positional read.
+	if (global_state_p != nullptr) {
+		auto &gstate = global_state_p->Cast<VgiTableInOutGlobalState>();
+		if (!gstate.column_ids.empty()) {
+			local_state->column_ids = gstate.column_ids;
+		}
+	}
 	return local_state;
 }
 
@@ -345,15 +412,24 @@ static bool HasRemainingBatchData(const VgiTableInOutLocalState &local_state) {
 //! ``output`` and convert into that. Writes land in the shared underlying
 //! vector buffers; the trailing correlated columns stay untouched.
 static idx_t ProduceOutputFromBatch(VgiTableInOutLocalState &local_state, const ArrowTableSchema &arrow_table,
-                                    DataChunk &output) {
+                                    DataChunk &output, bool projection_pushdown = false) {
 	idx_t remaining = static_cast<idx_t>(local_state.chunk->arrow_array.length) - local_state.chunk_offset;
 	idx_t output_size = MinValue<idx_t>(STANDARD_VECTOR_SIZE, remaining);
 	output.SetCardinality(output_size);
 
 	idx_t fn_columns = static_cast<idx_t>(local_state.chunk->arrow_array.n_children);
 	D_ASSERT(fn_columns <= output.ColumnCount());
+	// Under projection_pushdown, the worker emitted a narrow Arrow batch
+	// (positional columns matching the projection_ids order). The arrow
+	// type map ``arrow_table.GetColumns()`` is keyed by *worker-original*
+	// column index (built from the full output schema at bind), so reading
+	// it requires the remap-via-column_ids that
+	// ``arrow_scan_is_projected=true`` enables (see
+	// ``duckdb/src/function/table/arrow_conversion.cpp`` —
+	// ``ArrowToDuckDB`` reads ``col_idx = column_ids[idx]`` for the type
+	// map and ``arrow_array_idx = idx`` for the data).
 	if (fn_columns == output.ColumnCount()) {
-		ArrowTableFunction::ArrowToDuckDB(local_state, arrow_table.GetColumns(), output, false);
+		ArrowTableFunction::ArrowToDuckDB(local_state, arrow_table.GetColumns(), output, projection_pushdown);
 	} else {
 		// LATERAL / projected-input path: DuckDB's PhysicalTableInOutFunction
 		// appended correlated outer columns at ``[fn_columns, ColumnCount)``
@@ -369,7 +445,9 @@ static idx_t ProduceOutputFromBatch(VgiTableInOutLocalState &local_state, const 
 		// ``output.data[c].Reference(scratch.data[c])``. Vector buffer
 		// refcounting keeps the Arrow data alive after ``scratch`` goes out
 		// of scope, and the trailing LATERAL-projected columns are
-		// untouched.
+		// untouched. With projection_pushdown the scratch's types come
+		// from ``output.data[c]`` which are the post-projection slot
+		// types — already correct.
 		DataChunk scratch;
 		vector<LogicalType> scratch_types;
 		scratch_types.reserve(fn_columns);
@@ -378,7 +456,7 @@ static idx_t ProduceOutputFromBatch(VgiTableInOutLocalState &local_state, const 
 		}
 		scratch.Initialize(BufferAllocator::Get(local_state.context), scratch_types, output_size);
 		scratch.SetCardinality(output_size);
-		ArrowTableFunction::ArrowToDuckDB(local_state, arrow_table.GetColumns(), scratch, false);
+		ArrowTableFunction::ArrowToDuckDB(local_state, arrow_table.GetColumns(), scratch, projection_pushdown);
 		for (idx_t c = 0; c < fn_columns; c++) {
 			output.data[c].Reference(scratch.data[c]);
 		}
@@ -423,7 +501,7 @@ OperatorResultType VgiTableInOutFunction(ExecutionContext &context, TableFunctio
 
 	// Continue producing rows from a batch that exceeded STANDARD_VECTOR_SIZE
 	if (HasRemainingBatchData(local_state)) {
-		idx_t rows_copied = ProduceOutputFromBatch(local_state, bind_data.arrow_table, output);
+		idx_t rows_copied = ProduceOutputFromBatch(local_state, bind_data.arrow_table, output, bind_data.projection_pushdown);
 		VGI_LOG(client_context, "table_in_out.read_output",
 		        {{"conn", global_state.connection->GetConnIdHex()},
 		         {"worker_path", bind_data.worker_path()},
@@ -463,7 +541,7 @@ OperatorResultType VgiTableInOutFunction(ExecutionContext &context, TableFunctio
 
 	// Load batch into scan state and produce output
 	LoadBatchIntoScanState(local_state, output_batch);
-	idx_t rows_copied = ProduceOutputFromBatch(local_state, bind_data.arrow_table, output);
+	idx_t rows_copied = ProduceOutputFromBatch(local_state, bind_data.arrow_table, output, bind_data.projection_pushdown);
 
 	VGI_LOG(client_context, "table_in_out.read_output",
 	        {{"conn", global_state.connection->GetConnIdHex()},
@@ -516,7 +594,7 @@ OperatorFinalizeResultType VgiTableInOutFinalize(ExecutionContext &context, Tabl
 
 	// Continue producing rows from a batch that exceeded STANDARD_VECTOR_SIZE
 	if (HasRemainingBatchData(local_state)) {
-		idx_t rows_copied = ProduceOutputFromBatch(local_state, bind_data.arrow_table, output);
+		idx_t rows_copied = ProduceOutputFromBatch(local_state, bind_data.arrow_table, output, bind_data.projection_pushdown);
 		VGI_LOG(client_context, "table_in_out.finalize_output",
 		        {{"conn", global_state.connection->GetConnIdHex()},
 		         {"worker_path", bind_data.worker_path()},
@@ -557,7 +635,7 @@ OperatorFinalizeResultType VgiTableInOutFinalize(ExecutionContext &context, Tabl
 
 	// Load batch into scan state and produce output
 	LoadBatchIntoScanState(local_state, output_batch);
-	idx_t rows_copied = ProduceOutputFromBatch(local_state, bind_data.arrow_table, output);
+	idx_t rows_copied = ProduceOutputFromBatch(local_state, bind_data.arrow_table, output, bind_data.projection_pushdown);
 
 	VGI_LOG(client_context, "table_in_out.finalize_output",
 	        {{"conn", global_state.connection->GetConnIdHex()},

@@ -1,0 +1,150 @@
+# name: test/sql/integration/table_in_out/echo/lateral_projection.test
+# description: LATERAL + projection pushdown for the streaming TableInOut path.
+#   Verifies that projection pushdown into the worker coexists with LATERAL's
+#   correlated-column append. Correlated LATERAL is rewritten by DuckDB's
+#   decorrelator into DELIM_JOIN, so the InOut operator sees pushed-down
+#   column subsets but no projected_input pre-fill; the test pins user-visible
+#   behavior so any regression in either dimension surfaces.
+# group: [vgi_integration_table_in_out_echo]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# Correlated LATERAL — projects ONE of three echo output columns, with the
+# outer table's id correlated into the inner SELECT. Worker must receive a
+# narrow column subset; DuckDB joins on the correlated id.
+# ============================================================================
+
+query II
+SELECT t.id, e.b
+FROM (VALUES (1), (2), (3)) t(id),
+     LATERAL example.echo((SELECT t.id * 10 AS a, t.id * 100 AS b, t.id * 1000 AS c)) e
+ORDER BY t.id;
+----
+1	100
+2	200
+3	300
+
+query II
+SELECT t.id, e.a
+FROM (VALUES (1), (2), (3)) t(id),
+     LATERAL example.echo((SELECT t.id * 10 AS a, t.id * 100 AS b, t.id * 1000 AS c)) e
+ORDER BY t.id;
+----
+1	10
+2	20
+3	30
+
+query II
+SELECT t.id, e.c
+FROM (VALUES (1), (2), (3)) t(id),
+     LATERAL example.echo((SELECT t.id * 10 AS a, t.id * 100 AS b, t.id * 1000 AS c)) e
+ORDER BY t.id;
+----
+1	1000
+2	2000
+3	3000
+
+# Two of three echo columns projected; verifies SELECT-order shape on the wire.
+query III
+SELECT t.id, e.a, e.c
+FROM (VALUES (1), (2), (3)) t(id),
+     LATERAL example.echo((SELECT t.id * 10 AS a, t.id * 100 AS b, t.id * 1000 AS c)) e
+ORDER BY t.id;
+----
+1	10	1000
+2	20	2000
+3	30	3000
+
+query III
+SELECT t.id, e.c, e.a
+FROM (VALUES (1), (2), (3)) t(id),
+     LATERAL example.echo((SELECT t.id * 10 AS a, t.id * 100 AS b, t.id * 1000 AS c)) e
+ORDER BY t.id;
+----
+1	1000	10
+2	2000	20
+3	3000	30
+
+# ============================================================================
+# Non-correlated LATERAL — inner subquery is constant. DuckDB rewrites to a
+# CROSS PRODUCT; projection still pushes into the InOut operator below.
+# ============================================================================
+
+query II
+SELECT t.outer_v, e.b
+FROM (VALUES (10), (20)) t(outer_v),
+     LATERAL (SELECT b FROM example.echo((SELECT 1 AS a, 2 AS b, 3 AS c))) e
+ORDER BY t.outer_v;
+----
+10	2
+20	2
+
+# ============================================================================
+# Correlated LATERAL emitting multiple rows per outer row, projecting a subset.
+# Stresses parallel output cardinality with projection narrowing.
+# ============================================================================
+
+query II
+SELECT t.outer_v, e.n
+FROM (VALUES (1), (2)) t(outer_v),
+     LATERAL example.echo(
+         (SELECT t.outer_v + v AS n, t.outer_v * v AS m
+          FROM (VALUES (10), (20), (30)) v(v))
+     ) e
+ORDER BY t.outer_v, e.n;
+----
+1	11
+1	21
+1	31
+2	12
+2	22
+2	32
+
+# Same shape, project the OTHER column.
+query II
+SELECT t.outer_v, e.m
+FROM (VALUES (1), (2)) t(outer_v),
+     LATERAL example.echo(
+         (SELECT t.outer_v + v AS n, t.outer_v * v AS m
+          FROM (VALUES (10), (20), (30)) v(v))
+     ) e
+ORDER BY t.outer_v, e.m;
+----
+1	10
+1	20
+1	30
+2	20
+2	40
+2	60
+
+# ============================================================================
+# Correlated LATERAL + projection + filter — exercises the "filter survives
+# above the operator" shape (per DuckDB InOut planner: filters always run via
+# a separate FILTER node, projection still pushes into the operator).
+# ============================================================================
+
+query II
+SELECT t.id, e.b
+FROM (VALUES (1), (2), (3), (4)) t(id),
+     LATERAL example.echo((SELECT t.id AS a, t.id * 100 AS b, t.id * 1000 AS c)) e
+WHERE e.b >= 200
+ORDER BY t.id;
+----
+2	200
+3	300
+4	400
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;

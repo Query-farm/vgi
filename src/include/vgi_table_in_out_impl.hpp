@@ -138,6 +138,18 @@ struct VgiTableInOutGlobalState : public GlobalTableFunctionState {
 	// dispatcher. nullptr is valid (cancel dispatch is skipped).
 	DatabaseInstance *db = nullptr;
 
+	// Pushdown state captured at ``VgiTableInOutInitGlobal`` from the
+	// ``TableFunctionInitInput``. Threaded to ``local_state.column_ids``
+	// at InitLocal so ``ProduceOutputFromBatch`` can drive
+	// ``ArrowToDuckDB`` with ``arrow_scan_is_projected=true`` and remap
+	// worker-original column indices to type info correctly. Mirrors
+	// the streaming pure-table fields at
+	// ``vgi_table_function_impl.hpp:305-323``.
+	vector<column_t> column_ids;            // DuckDB-side column_ids (worker schema indices)
+	std::vector<int32_t> projection_ids;    // int32 form sent on the InitRequest wire
+	std::shared_ptr<arrow::Buffer> static_filter_bytes;
+	std::vector<std::shared_ptr<arrow::Buffer>> join_keys_buffers;
+
 	idx_t MaxThreads() const override {
 		return 1; // Table-in-out functions are single-threaded for now
 	}
