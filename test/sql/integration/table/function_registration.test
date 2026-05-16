@@ -32,14 +32,16 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 # Total table-type function count (includes table-in-out)
 # 68 base + 5 table_buffering failure-injection fixtures (crash_on_process,
 # crash_on_combine, crash_on_finalize, hang_on_process, large_state) +
-# 2 ordering-knob fixtures (ordered_buffer_input, batch_index_buffer_input)
-# = 75
+# 2 ordering-knob fixtures (ordered_buffer_input, batch_index_buffer_input) +
+# 2 cancel/pushdown probes (slow_cancellable_buffering, echo_buffering) +
+# 1 projection-pushdown witness (echo_witness)
+# = 78
 query I
 SELECT COUNT(*)
 FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'table';
 ----
-75
+78
 
 # The 33 pure table functions (no TABLE parameter type)
 # Note: make_series appears 5 times (5 overloads), make_pairs appears 3 times,
