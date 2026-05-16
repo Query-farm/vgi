@@ -76,24 +76,43 @@ protected:
 // worker, run a single cross-pipeline combine, then emit output via parallel
 // (or single-threaded — see source_order_dependent) source.
 //
-// Lifecycle (per the design plan, see /Users/rusty/.claude/plans/yes-lets-make-a-elegant-sparrow.md):
+// Lifecycle:
 //
-//   Sink(chunk)                   — parallel per DuckDB thread; first Sink
-//                                   acquires the coordinator connection and
-//                                   performs init with phase=TABLE_BUFFERING;
-//                                   per-thread workers are spawned with
-//                                   global_execution_id = gstate.execution_id
-//                                   (the secondary-init path).
+//   Sink(chunk)                   — parallel per DuckDB thread. The first
+//                                   thread to arrive becomes the *init
+//                                   runner*: it acquires its own per-thread
+//                                   worker, runs PerformInit with phase=
+//                                   TABLE_BUFFERING and no global_execution_id
+//                                   (the worker mints one), publishes the
+//                                   resulting execution_id on the gstate
+//                                   under init_mutex/init_cv. Peer Sink
+//                                   threads block on the condvar until init
+//                                   publishes (or fails), then acquire their
+//                                   own workers with the published
+//                                   global_execution_id (secondary init —
+//                                   no cold work) and run process() per
+//                                   chunk. There is no dedicated coordinator
+//                                   role; storage is shared via BoundStorage
+//                                   keyed by execution_id, so any worker that
+//                                   finished init can serve any combine.
 //   Combine(local sink state)     — moves the per-thread worker into the
-//                                   shared gstate.workers/state_ids lists.
+//                                   shared gstate.workers/state_ids lists
+//                                   under workers_mutex.
 //   Finalize()                    — single-threaded, exactly once per
-//                                   GlobalSinkState. Calls
-//                                   RpcTableBufferingCombine on the
-//                                   coordinator; populates finalize_queue.
+//                                   GlobalSinkState (DuckDB serializes this
+//                                   even under UNION ALL). Pops *one* worker
+//                                   from gstate.workers — any worker, since
+//                                   they're interchangeable — calls
+//                                   RpcTableBufferingCombine on it, pushes
+//                                   it back, populates finalize_queue. On
+//                                   throw the popped worker is cancel-
+//                                   dispatched (see Sink::Finalize comments).
 //   GetData(chunk)                — parallel (or single-threaded when
 //                                   source_order_dependent). Pulls next
-//                                   finalize_state_id from the queue, opens
-//                                   a producer-mode stream via
+//                                   finalize_state_id from the queue,
+//                                   acquires a fresh worker (Sink-phase
+//                                   workers can't reuse init), opens a
+//                                   producer-mode stream via
 //                                   PerformInit(phase=TABLE_BUFFERING_FINALIZE)
 //                                   and drains batches until EOS, then
 //                                   moves to the next id.

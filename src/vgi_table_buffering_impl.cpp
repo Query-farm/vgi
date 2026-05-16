@@ -308,6 +308,21 @@ public:
 		}
 		// Tell gstate we're no longer in-flight; if Combine already moved us
 		// to workers[], this is a no-op.
+		//
+		// Lifetime note for `gstate_ptr`: DuckDB's pipeline executor owns
+		// both the global and local sink states (via Pipeline /
+		// PipelineExecutor). The destruction order is documented as
+		// LocalSinkState → GlobalSinkState — the local states are
+		// per-executor (one per thread), torn down with the executor,
+		// while the global state is held by the operator's `sink_state`
+		// and outlives every executor. The pointer captured at Sink-time
+		// (line ~492 of this file) therefore remains valid through this
+		// destructor on every well-formed path. The one residual concern
+		// is host-process exit while a query is mid-flight: there the
+		// whole DatabaseInstance comes down, but it also drops the
+		// CancelDispatcher first, so the worst case is that we miss the
+		// UntrackInFlight bookkeeping update on a gstate that's about to
+		// be destroyed anyway. Acceptable.
 		if (gstate_ptr) {
 			gstate_ptr->UntrackInFlight(connection.get());
 		}
@@ -374,12 +389,16 @@ public:
 		}
 		// EOS path goes through ReleaseForPooling in GetDataInternal and
 		// leaves `worker` empty before we reach here. So if we're here
-		// holding a worker, something else short-circuited — most often
-		// PerformInit(TABLE_BUFFERING_FINALIZE) threw (worker died,
-		// user's initial_finalize_state raised, EPIPE), or ReadDataBatch
-		// threw mid-stream. Either way the worker thread may be parked
-		// in a blocking syscall; cancel-dispatch wakes it instead of
-		// silently dropping the connection.
+		// holding a worker, something else short-circuited:
+		//   1) PerformInit(TABLE_BUFFERING_FINALIZE) threw (worker died,
+		//      user's initial_finalize_state raised, EPIPE);
+		//   2) ReadDataBatch threw mid-stream;
+		//   3) DuckDB tore down the source pipeline early (LIMIT, user
+		//      break, parent exception) without reaching EOS.
+		// (3) is the on_cancel path — we want to deliver a CANCEL_KEY
+		// batch to the worker so it can run cls.on_cancel(...) before
+		// the pipe closes. (1)/(2) want the same dispatch so a worker
+		// parked in a blocking syscall unblocks promptly.
 		auto *dispatcher = db ? FindVgiCancelDispatcher(*db) : nullptr;
 		if (!dispatcher) {
 			return;

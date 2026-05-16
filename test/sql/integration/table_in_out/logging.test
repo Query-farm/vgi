@@ -81,6 +81,19 @@ SELECT COUNT(*) > 0 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%Pro
 true
 
 # ----------------------------------------------------------------------------
+# combine()-side client_log — process() and combine() are both unary RPCs
+# in the buffered path; ``params.client_log`` must work from both. The
+# fixture emits "Combining N state_ids" from inside its combine() under
+# the same logging=true switch process() uses. Verifies the unary in-band
+# log path on the combine method, which has no streaming OutputCollector.
+# ----------------------------------------------------------------------------
+
+query I
+SELECT COUNT(*) > 0 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%Combining%state_ids%';
+----
+true
+
+# ----------------------------------------------------------------------------
 # Multi-column with logging
 # ----------------------------------------------------------------------------
 

@@ -390,7 +390,10 @@ sets `VgiTableInOutBindData.table_buffering = true`. `VgiTableBufferingRewriter`
 (an `OptimizerExtension`) then rewrites the `LogicalGet` into
 `LogicalVgiTableBufferingFunction` after built-in passes have run (so LATERAL
 has already been decorrelated). Loud-failure asserts in the streaming
-`VgiTableInOutFunction` / `VgiTableInOutFinalize` catch missed rewrites.
+`VgiTableInOutFunction` / `VgiTableInOutFinalize` (see `vgi_table_in_out_impl.cpp`
+around lines ~392 / ~475) throw `InvalidInputException` with a clear message
+if a TableBufferingFunction reaches the streaming path — typically because
+`SET vgi_table_buffering=false` disabled the rewriter for an emergency rollback.
 
 **Lifecycle.** No separate coordinator worker. The first Sink thread to
 arrive becomes the *init runner*: it acquires its own per-thread worker,
@@ -399,7 +402,11 @@ runs `PerformInit(phase=TABLE_BUFFERING)` with no `global_execution_id`
 gstate under `init_mutex` / `init_cv`. Peer Sink threads block on the
 condvar until init publishes, then acquire their own workers with the
 published `global_execution_id` (secondary init — fast, no cold work) and
-run `table_buffering_process` for every input chunk. Each `process()` call
+run `table_buffering_process` for every input chunk. The peer wait loop
+polls `context.client.interrupted` every 250 ms so Ctrl-C while the
+runner is blocked (slow worker spawn, OAuth refresh, etc.) doesn't leave
+peers hung; if the runner throws it flips `init_failed` and notifies the
+condvar, and waiters propagate the failure as `IOException`. Each `process()` call
 returns an opaque `state_id: bytes` chosen by the worker (the framework
 just round-trips the bytes; common pattern is to return
 `params.execution_id` so all of a query's batches land in one bucket).

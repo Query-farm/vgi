@@ -395,10 +395,10 @@ OperatorResultType VgiTableInOutFunction(ExecutionContext &context, TableFunctio
 		// `InvalidInputException` (recoverable; doesn't kill the session)
 		// instead of `InternalException`.
 		throw InvalidInputException(
-		    "Function '%s' is registered with Meta.table_buffering=True but the "
+		    "Function '%s' is a TableBufferingFunction subclass but the "
 		    "vgi_table_buffering rewriter did not fire (likely SET vgi_table_buffering=false). "
-		    "Re-enable with `SET vgi_table_buffering=true` or upgrade the worker to a "
-		    "non-buffered shape.", bind_data.function_name);
+		    "Re-enable with `SET vgi_table_buffering=true` or migrate the worker to a "
+		    "streaming TableInOutGenerator shape.", bind_data.function_name);
 	}
 
 	if (!global_state.connection) {
@@ -474,10 +474,10 @@ OperatorFinalizeResultType VgiTableInOutFinalize(ExecutionContext &context, Tabl
 	// the per-pipeline-finalize bug — fail loudly.
 	if (bind_data.table_buffering) {
 		throw InvalidInputException(
-		    "Function '%s' is registered with Meta.table_buffering=True but the "
+		    "Function '%s' is a TableBufferingFunction subclass but the "
 		    "vgi_table_buffering rewriter did not fire (likely SET vgi_table_buffering=false). "
-		    "Re-enable with `SET vgi_table_buffering=true` or upgrade the worker to a "
-		    "non-buffered shape.", bind_data.function_name);
+		    "Re-enable with `SET vgi_table_buffering=true` or migrate the worker to a "
+		    "streaming TableInOutGenerator shape.", bind_data.function_name);
 	}
 
 	if (!global_state.connection) {
