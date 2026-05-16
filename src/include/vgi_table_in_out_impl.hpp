@@ -88,6 +88,14 @@ struct VgiTableInOutBindData : public TableFunctionData {
 	// through to the worker's process() params. Mutually exclusive.
 	bool sink_order_dependent = false;
 	bool requires_input_batch_index = false;
+	// Worker-declared pushdown capabilities (echo of Meta.projection_pushdown /
+	// Meta.filter_pushdown). The catalog set advertises these to DuckDB via
+	// table_func.projection_pushdown / filter_pushdown for the buffered
+	// branch. The rewriter reads these to know whether to capture column_ids
+	// / table_filters from the LogicalGet (without the flag, DuckDB never
+	// pushes — column_ids has only a virtual GetAnyColumn placeholder).
+	bool projection_pushdown = false;
+	bool filter_pushdown = false;
 };
 
 // ============================================================================
@@ -164,6 +172,11 @@ struct VgiTableInOutBindParams {
 	bool source_order_dependent = false;
 	bool sink_order_dependent = false;
 	bool requires_input_batch_index = false;
+	// Pushdown capability flags echoed from Meta. The rewriter reads
+	// bind_data->projection_pushdown to decide whether DuckDB's column_ids
+	// represent a real projection (vs. the default GetAnyColumn placeholder).
+	bool projection_pushdown = false;
+	bool filter_pushdown = false;
 
 	// Convenience accessors
 	const std::string &worker_path() const { return attach_params->worker_path(); }

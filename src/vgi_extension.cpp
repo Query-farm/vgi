@@ -290,10 +290,10 @@ private:
 		return bd && bd->table_buffering;
 	}
 
-	static void Rewrite(unique_ptr<LogicalOperator> &op) {
+	static void Rewrite(unique_ptr<LogicalOperator> &op, ClientContext &context) {
 		// Recurse first so leaf-level rewrites finish before we look at this node.
 		for (auto &child : op->children) {
-			Rewrite(child);
+			Rewrite(child, context);
 		}
 		if (op->type != LogicalOperatorType::LOGICAL_GET) {
 			return;
@@ -306,32 +306,182 @@ private:
 		// in-out function. Move it into our new extension op.
 		D_ASSERT(get.children.size() <= 1);
 
-		// Belt-and-suspenders: buffered table-in-out functions don't support
-		// projection-pushdown or filter-pushdown today (the catalog registers
-		// them with neither flag), so the bound LogicalGet should carry no
-		// such state. If a future binder change pushes projections/filters in
-		// without updating us, we'd silently lose them by dropping get on the
-		// floor. Fail loudly here instead.
+		// LogicalGet::ResolveTypes() (duckdb/src/planner/operator/logical_get.cpp:162-177)
+		// has already narrowed `get.types` to match column_ids/projection_ids
+		// under projection pushdown. Pass the narrowed types as our op's
+		// return_types so upstream LogicalProjection/LogicalFilter bindings
+		// resolve correctly. The full worker schema lives separately in
+		// all_column_types/all_column_names for filter serialization and
+		// for telling the worker what the projected output_schema should be.
+		auto post_proj_types = get.types;
+		auto post_proj_names = vector<string>();
+		const auto &all_col_ids = get.GetColumnIds();
 		if (!get.projection_ids.empty()) {
-			throw InternalException(
-			    "VgiTableBufferingRewriter: LogicalGet has non-empty projection_ids — "
-			    "buffered table functions don't support projection pushdown");
+			post_proj_names.reserve(get.projection_ids.size());
+			for (auto proj_id : get.projection_ids) {
+				const auto &idx = all_col_ids[proj_id];
+				post_proj_names.push_back(idx.IsVirtualColumn() ? string("__virtual__")
+				                                                : get.names[idx.GetPrimaryIndex()]);
+			}
+		} else if (!all_col_ids.empty()) {
+			post_proj_names.reserve(all_col_ids.size());
+			for (const auto &idx : all_col_ids) {
+				post_proj_names.push_back(idx.IsVirtualColumn() ? string("__virtual__")
+				                                                : get.names[idx.GetPrimaryIndex()]);
+			}
+		} else {
+			post_proj_names = get.names;
 		}
-		if (get.table_filters.filters.size() > 0) {
-			throw InternalException(
-			    "VgiTableBufferingRewriter: LogicalGet has table_filters — "
-			    "buffered table functions don't support filter pushdown");
-		}
+		D_ASSERT(post_proj_types.size() == post_proj_names.size());
 
 		auto rewritten = make_uniq<vgi::LogicalVgiTableBufferingFunction>(
-		    get.table_index, get.returned_types, get.names, std::move(get.bind_data));
+		    get.table_index, std::move(post_proj_types), std::move(post_proj_names),
+		    std::move(get.bind_data));
 		rewritten->children = std::move(get.children);
+
+		// Capture pushdown state. The streaming pure-table path captures the
+		// same data at InitGlobal time via TableFunctionInitInput; the buffered
+		// path goes through a custom PhysicalOperator with no InitInput, so the
+		// rewriter is the analogous capture point.
+		rewritten->all_column_types = get.returned_types;
+		rewritten->all_column_names = get.names;
+
+		// Read pushdown capabilities from bind_data (echoed from Meta at
+		// catalog-load time). The catalog set's HasTableInput branch already
+		// gated `table_func.projection_pushdown=true` on this same flag, so
+		// `column_ids` only contains real column indices (rather than a
+		// virtual GetAnyColumn placeholder) when this is true.
+		const auto *bd_for_caps =
+		    static_cast<const vgi::VgiTableInOutBindData *>(rewritten->bind_data.get());
+		const bool worker_supports_projection =
+		    bd_for_caps && bd_for_caps->projection_pushdown;
+
+		// projection_ids: worker-schema indices of the columns the parent op
+		// actually wants. Match the streaming pure-table convention
+		// (vgi_table_function_impl.cpp:1023-1042): when the function declares
+		// projection_pushdown=true, use ``get.GetColumnIds()`` as the
+		// projection (NOT ``get.projection_ids`` — that's a secondary
+		// projection on top of column_ids; rare in practice). The streaming
+		// path also handles get.projection_ids for completeness.
+		if (worker_supports_projection && !all_col_ids.empty()) {
+			rewritten->projection_pushdown = true;
+			if (get.projection_ids.empty()) {
+				rewritten->projection_ids.reserve(all_col_ids.size());
+				for (const auto &idx : all_col_ids) {
+					rewritten->projection_ids.push_back(static_cast<int32_t>(
+					    idx.IsVirtualColumn() ? COLUMN_IDENTIFIER_ROW_ID
+					                          : idx.GetPrimaryIndex()));
+				}
+			} else {
+				rewritten->projection_ids.reserve(get.projection_ids.size());
+				for (auto proj_id : get.projection_ids) {
+					const auto &idx = all_col_ids[proj_id];
+					rewritten->projection_ids.push_back(static_cast<int32_t>(
+					    idx.IsVirtualColumn() ? COLUMN_IDENTIFIER_ROW_ID
+					                          : idx.GetPrimaryIndex()));
+				}
+			}
+		}
+		// column_ids: what TableFilter col indices reference. Empty when no
+		// filters were pushed. VgiSerializeFilters indexes into
+		// all_column_names through this list.
+		rewritten->column_ids.reserve(all_col_ids.size());
+		for (const auto &idx : all_col_ids) {
+			rewritten->column_ids.push_back(static_cast<int32_t>(
+			    idx.IsVirtualColumn() ? COLUMN_IDENTIFIER_ROW_ID : idx.GetPrimaryIndex()));
+		}
+
+		// Serialize filters via the shared utility (declared in
+		// vgi_table_function_impl.hpp). Catches and swallows
+		// InvalidInputException — same convention as the streaming path:
+		// unsupported filter types skip pushdown and DuckDB will filter
+		// locally above us.
+		if (!get.table_filters.filters.empty()) {
+			try {
+				auto bd = rewritten->bind_data.get();
+				auto bd_typed = static_cast<vgi::VgiTableInOutBindData *>(bd);
+				auto worker_path = bd_typed && bd_typed->attach_params
+				                       ? bd_typed->attach_params->worker_path()
+				                       : std::string{};
+				// VgiSerializeFilters takes column_ids as the DuckDB-side post-
+				// projection list — what filter col_idx indexes into. Use the
+				// raw column_t form via GetColumnIds() which mirrors what the
+				// streaming path's InitGlobal uses (input.column_ids).
+				vector<column_t> col_ids_raw;
+				col_ids_raw.reserve(all_col_ids.size());
+				for (const auto &idx : all_col_ids) {
+					col_ids_raw.push_back(idx.IsVirtualColumn() ? COLUMN_IDENTIFIER_ROW_ID
+					                                            : idx.GetPrimaryIndex());
+				}
+				auto serialized = vgi::VgiSerializeFilters(
+				    context, col_ids_raw, &get.table_filters,
+				    rewritten->all_column_names, worker_path);
+				rewritten->pushdown_filters = std::move(serialized.filter_bytes);
+				rewritten->join_keys_buffers = std::move(serialized.join_keys_buffers);
+			} catch (const InvalidInputException &) {
+				// Unsupported filter — leave pushdown_filters null; DuckDB
+				// will filter locally above the operator.
+			}
+		}
+
+		// Pre-build the EXPLAIN summary while we still have the raw
+		// TableFilter objects in scope (the wire-serialized form is opaque
+		// to the C++ side). Reused later by PhysicalVgiTableBufferingFunction
+		// ::ParamsToString.
+		if (rewritten->projection_pushdown || !get.table_filters.filters.empty()) {
+			std::string summary;
+			if (rewritten->projection_pushdown) {
+				summary += "Projections: [";
+				for (size_t i = 0; i < rewritten->projection_ids.size(); ++i) {
+					if (i > 0) {
+						summary += ", ";
+					}
+					auto col_idx = rewritten->projection_ids[i];
+					if (col_idx >= 0 && static_cast<size_t>(col_idx) < rewritten->all_column_names.size()) {
+						summary += rewritten->all_column_names[col_idx];
+					} else {
+						summary += "<unknown>";
+					}
+				}
+				summary += "]";
+			}
+			if (!get.table_filters.filters.empty()) {
+				if (!summary.empty()) {
+					summary += " | ";
+				}
+				summary += "Filters: ";
+				bool first = true;
+				// table_filters.filters keys are indices into column_ids (the
+				// post-projection list), not direct worker-schema indices.
+				// Resolve through column_ids → worker-schema → all_column_names.
+				for (auto &kv : get.table_filters.filters) {
+					if (!first) {
+						summary += " AND ";
+					}
+					first = false;
+					std::string name = "<unknown>";
+					if (kv.first < all_col_ids.size()) {
+						const auto &idx = all_col_ids[kv.first];
+						if (!idx.IsVirtualColumn() &&
+						    idx.GetPrimaryIndex() < rewritten->all_column_names.size()) {
+							name = rewritten->all_column_names[idx.GetPrimaryIndex()];
+						}
+					}
+					summary += kv.second->ToString(name);
+				}
+			}
+			rewritten->explain_summary = std::move(summary);
+		}
+
 		rewritten->ResolveOperatorTypes();
 
 		VGI_STDERR_DEBUG(
 		    "[VGI] LogicalGet rewritten -> LogicalVgiTableBufferingFunction "
-		    "(table_index=%llu, %zu output column(s))\n",
-		    static_cast<unsigned long long>(get.table_index), get.returned_types.size());
+		    "(table_index=%llu, %zu output column(s), projection_pushdown=%d, "
+		    "filter_bytes=%s)\n",
+		    static_cast<unsigned long long>(get.table_index), rewritten->return_types.size(),
+		    rewritten->projection_pushdown ? 1 : 0,
+		    rewritten->pushdown_filters ? "yes" : "no");
 
 		op = std::move(rewritten);
 	}
@@ -347,7 +497,7 @@ private:
 		    enabled_val.IsNull() || !enabled_val.GetValue<bool>()) {
 			return;
 		}
-		Rewrite(plan);
+		Rewrite(plan, input.context);
 	}
 };
 

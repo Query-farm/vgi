@@ -5,6 +5,11 @@
 #include "vgi_function_connection.hpp"
 #include "vgi_ifunction_connection.hpp"
 #include "vgi_logging.hpp"
+// VgiSerializeFilters lives in vgi_table_function_impl.hpp — public utility
+// (declared at line 528 of that header). C3b reuses it on the streaming
+// TableInOut bind path; same serialization as the pure-table path so a
+// single filter format flows to all worker shapes.
+#include "vgi_table_function_impl.hpp"
 #include "vgi_transport.hpp"
 #include "vgi_worker_pool.hpp"
 
@@ -108,6 +113,8 @@ unique_ptr<FunctionData> VgiTableInOutBind(ClientContext &context, TableFunction
 	bind_data->source_order_dependent = params.source_order_dependent;
 	bind_data->sink_order_dependent = params.sink_order_dependent;
 	bind_data->requires_input_batch_index = params.requires_input_batch_index;
+	bind_data->projection_pushdown = params.projection_pushdown;
+	bind_data->filter_pushdown = params.filter_pushdown;
 
 	// Build arguments from the regular (non-TABLE) inputs
 	// input.inputs contains positional arguments, but TABLE arguments are represented as NULL
@@ -258,6 +265,15 @@ unique_ptr<GlobalTableFunctionState> VgiTableInOutInitGlobal(ClientContext &cont
 	// subprocess that died while idle surfaces as IOException, and we retry
 	// once with a forced-fresh connection. HTTP transport never enters the
 	// retry branch (from_pool is always false there).
+	//
+	// Pushdown args are intentionally empty for the streaming TableInOut
+	// path: the C++ scan path doesn't auto-narrow output.ColumnCount() the
+	// way PhysicalTableFunction does, so a narrowed worker batch would
+	// width-mismatch the full-width output. The buffered (Sink+Source)
+	// path handles pushdown via VgiTableBufferingRewriter narrowing
+	// return_types at plan time; streaming InOut needs an analogous
+	// adaptation that's out of scope for this PR. See storage/
+	// vgi_table_function_set.cpp's comment on the same topic.
 	InitResult init_result;
 	try {
 		init_result = connection->PerformInit(global_state->bind_result, {}, nullptr, {}, "INPUT");

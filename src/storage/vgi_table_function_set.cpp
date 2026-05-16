@@ -223,6 +223,8 @@ static unique_ptr<FunctionData> VgiCatalogTableInOutFunctionBind(ClientContext &
 	params.source_order_dependent = vgi_info.function_info().source_order_dependent;
 	params.sink_order_dependent = vgi_info.function_info().sink_order_dependent;
 	params.requires_input_batch_index = vgi_info.function_info().requires_input_batch_index;
+	params.projection_pushdown = vgi_info.function_info().projection_pushdown.value_or(false);
+	params.filter_pushdown = vgi_info.function_info().filter_pushdown.value_or(false);
 
 	// Validate required settings
 	const auto &required_settings = vgi_info.function_info().required_settings;
@@ -339,6 +341,29 @@ void VgiTableFunctionSet::LoadEntries(ClientContext &context, const std::lock_gu
 				    func_info.function_type == vgi::VgiFunctionType::TableBuffering;
 				if (func_info.has_finalize && !is_buffering) {
 					table_func.in_out_function_final = vgi::VgiTableInOutFinalize;
+				}
+				// Advertise projection / filter pushdown to DuckDB's optimizer
+				// for the buffered (Sink+Source) path. The rewriter
+				// (vgi_extension.cpp:VgiTableBufferingRewriter) captures the
+				// pushed-down state at plan time, narrows the Logical op's
+				// return_types to the projected set, and threads pushdown
+				// through to the worker via PerformInit's projection_ids /
+				// pushdown_filters fields.
+				//
+				// Streaming TableInOut is intentionally NOT bundled here.
+				// PhysicalTableInOutFunction doesn't auto-narrow the output
+				// DataChunk under projection_pushdown the way
+				// PhysicalTableFunction does — so even with all the wire
+				// plumbing in place, the Python worker (which DOES narrow
+				// params.output_schema and emits narrow batches) would
+				// produce a width mismatch against the C++ scan's
+				// full-width output buffer (INTERNAL error in
+				// ArrowToDuckDB). The fix needs a custom narrow-output
+				// adaptation in the C++ scan path, separate from this PR.
+				// Tracked as a follow-up; see the plan's "out of scope".
+				if (is_buffering) {
+					table_func.projection_pushdown = func_info.projection_pushdown.value_or(false);
+					table_func.filter_pushdown = func_info.filter_pushdown.value_or(false);
 				}
 				table_func.order_preservation_type = MapOrderPreservation(func_info.order_preservation);
 

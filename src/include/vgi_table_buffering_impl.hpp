@@ -4,7 +4,10 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <vector>
+
+#include <arrow/buffer.h>
 
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/planner/operator/logical_extension_operator.hpp"
@@ -40,10 +43,14 @@ public:
 	// Threaded through for ColumnBinding resolution.
 	idx_t table_index;
 
-	// Returned by the underlying function — preserved on the rewrite so
-	// downstream operators see the same shape they did against the
-	// original LogicalGet.
+	// The post-projection types that upstream operators bind against. Matches
+	// what ``LogicalGet::ResolveTypes()`` produces for the original Get under
+	// projection pushdown: narrowed via column_ids/projection_ids when those
+	// are non-empty, otherwise the full worker schema. Downstream column refs
+	// resolve to this. NOT the full worker schema — that lives in
+	// all_column_types below.
 	vector<LogicalType> return_types;
+	// Output names parallel to return_types (post-projection).
 	vector<string> return_names;
 
 	// The VgiTableInOutBindData from the original bind. CreatePlan reads
@@ -53,6 +60,43 @@ public:
 	// type to play nice with DuckDB's planner conventions; cast to
 	// VgiTableInOutBindData at use sites.
 	unique_ptr<FunctionData> bind_data;
+
+	// ============================================================================
+	// Pushdown — captured by the rewriter from the LogicalGet at optimize time
+	// ============================================================================
+	// True if the worker declared projection_pushdown=True in Meta and DuckDB
+	// pushed a projection. When false, projection_ids is empty and return_types
+	// equals the full worker schema.
+	bool projection_pushdown = false;
+	// Worker-schema column indices DuckDB requested. Empty when no projection.
+	// Mirrors the streaming pure-table path's int32_t projection_ids vector.
+	std::vector<int32_t> projection_ids;
+	// DuckDB-side column index list — what's referenced by table_filters' col
+	// indices. Same as ``LogicalGet::GetColumnIds()`` at rewriter time, mapped
+	// to int32_t for transit. Needed by the Source-side ArrowScan to do the
+	// projected→worker-schema index lookup in ArrowToDuckDB.
+	std::vector<int32_t> column_ids;
+	// Serialized table_filters (Arrow IPC bytes with json filter_spec + value
+	// columns) — null if no filters. Reuses VgiSerializeFilters from the
+	// streaming pure-table path.
+	std::shared_ptr<arrow::Buffer> pushdown_filters;
+	// Per-IN-filter join-keys batches (one single-column Arrow IPC RecordBatch
+	// each). Empty when no IN filters. Mirrors the streaming convention.
+	std::vector<std::shared_ptr<arrow::Buffer>> join_keys_buffers;
+	// Full worker-output schema (size matches the worker's declared output —
+	// what the worker would emit absent projection). Preserved verbatim from
+	// ``LogicalGet::returned_types`` / ``names`` at rewriter time. Used by
+	// VgiSerializeFilters (filter column-index → original-name lookup) and by
+	// the Source-side ArrowScan to populate its arrow_column_map_t with the
+	// full type signature.
+	vector<LogicalType> all_column_types;
+	vector<string> all_column_names;
+	// Pre-built human-readable description of projections + filters for
+	// EXPLAIN output. Built from ``TableFilter::ToString`` at rewriter time;
+	// the C++ side has no symmetric deserializer for the serialized filter
+	// IPC bytes, so we capture the pretty string when we still have the raw
+	// TableFilter objects in scope.
+	std::string explain_summary;
 
 public:
 	vector<ColumnBinding> GetColumnBindings() override;
@@ -138,6 +182,18 @@ public:
 	// requires_input_batch_index → RequiredPartitionInfo()=BatchIndex().
 	bool sink_order_dependent;
 	bool requires_input_batch_index;
+
+	// Pushdown data — populated by CreatePlan from the Logical op. Mirrors
+	// the field set on LogicalVgiTableBufferingFunction; see those docstrings.
+	// Read by Sink/Source PerformInit calls and by the Source-side ArrowScan.
+	bool projection_pushdown = false;
+	std::vector<int32_t> projection_ids;
+	std::vector<int32_t> column_ids;
+	std::shared_ptr<arrow::Buffer> pushdown_filters;
+	std::vector<std::shared_ptr<arrow::Buffer>> join_keys_buffers;
+	vector<LogicalType> all_column_types;
+	vector<string> all_column_names;
+	std::string explain_summary;
 
 public:
 	// ========== Sink Interface ==========

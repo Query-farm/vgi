@@ -83,12 +83,24 @@ PhysicalOperator &LogicalVgiTableBufferingFunction::CreatePlan(ClientContext &co
 
 	auto types_copy = return_types;
 	auto names_copy = return_names;
-	auto &op = planner.Make<PhysicalVgiTableBufferingFunction>(std::move(types_copy), std::move(names_copy),
-	                                                            std::move(bind_data), source_order_dependent,
-	                                                            sink_order_dependent, requires_input_batch_index,
-	                                                            estimated_cardinality);
+	auto &op_base = planner.Make<PhysicalVgiTableBufferingFunction>(
+	    std::move(types_copy), std::move(names_copy), std::move(bind_data), source_order_dependent,
+	    sink_order_dependent, requires_input_batch_index, estimated_cardinality);
+	auto &op = op_base.Cast<PhysicalVgiTableBufferingFunction>();
+	// Thread pushdown state captured by the rewriter onto the physical op
+	// (per-query plan data, not per-bind data). All Sink-side and Source-side
+	// PerformInit calls read these to populate InitRequest's projection_ids
+	// and pushdown_filters fields.
+	op.projection_pushdown = projection_pushdown;
+	op.projection_ids = std::move(projection_ids);
+	op.column_ids = std::move(column_ids);
+	op.pushdown_filters = std::move(pushdown_filters);
+	op.join_keys_buffers = std::move(join_keys_buffers);
+	op.all_column_types = std::move(all_column_types);
+	op.all_column_names = std::move(all_column_names);
+	op.explain_summary = std::move(explain_summary);
 	op.children.push_back(child_plan);
-	return op;
+	return op_base;
 }
 
 // ============================================================================
@@ -121,6 +133,13 @@ InsertionOrderPreservingMap<string> PhysicalVgiTableBufferingFunction::ParamsToS
 	auto &bd = bind_data->Cast<VgiTableInOutBindData>();
 	result["Name"] = bd.function_name;
 	result["Source"] = source_order_dependent ? "ordered" : "parallel";
+	// Surface pushed-down projections/filters so users can verify pushdown
+	// via EXPLAIN. The string was pre-built at rewriter time from
+	// TableFilter::ToString (the C++ side has no symmetric deserializer for
+	// the serialized filter IPC bytes).
+	if (!explain_summary.empty()) {
+		result["Pushdown"] = explain_summary;
+	}
 	return result;
 }
 
@@ -564,9 +583,9 @@ SinkResultType PhysicalVgiTableBufferingFunction::Sink(ExecutionContext &context
 				// Register as in-flight as soon as we own a connection so a
 				// peer-thread exception path can see us and cancel-dispatch.
 				gstate.TrackInFlight(lstate.connection.get());
-				auto init_result = lstate.connection->PerformInit(bd.bind_result, /*projection_ids=*/{},
-				                                                    /*pushdown_filters=*/nullptr,
-				                                                    /*join_keys=*/{},
+				auto init_result = lstate.connection->PerformInit(bd.bind_result, projection_ids,
+				                                                    pushdown_filters,
+				                                                    join_keys_buffers,
 				                                                    /*phase=*/"TABLE_BUFFERING");
 				minted_exec_id = std::move(init_result.execution_id);
 				drain_init_stream(*lstate.connection);
@@ -600,9 +619,9 @@ SinkResultType PhysicalVgiTableBufferingFunction::Sink(ExecutionContext &context
 			auto acquired = AcquireConnectionForInit(context.client, params);
 			lstate.connection = std::move(acquired.connection);
 			gstate.TrackInFlight(lstate.connection.get());
-			lstate.connection->PerformInit(bd.bind_result, /*projection_ids=*/{},
-			                                /*pushdown_filters=*/nullptr,
-			                                /*join_keys=*/{},
+			lstate.connection->PerformInit(bd.bind_result, projection_ids,
+			                                pushdown_filters,
+			                                join_keys_buffers,
 			                                /*phase=*/"TABLE_BUFFERING");
 			drain_init_stream(*lstate.connection);
 			// state_id assigned by worker on first Sink RPC.
@@ -882,9 +901,15 @@ SourceResultType PhysicalVgiTableBufferingFunction::GetDataInternal(ExecutionCon
 			         {"function_name", gstate.function_name},
 			         {"finalize_state_id", to_hex(lstate.current_finalize_state_id)}});
 		}
-		lstate.worker->PerformInit(bd.bind_result, /*projection_ids=*/{},
-		                           /*pushdown_filters=*/nullptr,
-		                           /*join_keys=*/{},
+		// The Source-side init thread must receive the same projection_ids /
+		// pushdown_filters as the Sink-side init thread so the worker's
+		// finalize() emits batches narrowed to the projected output_schema.
+		// Without this, the worker would emit full-width batches but the
+		// post-projection return_types this operator advertises is narrow —
+		// ArrowToDuckDB would read out-of-bounds.
+		lstate.worker->PerformInit(bd.bind_result, projection_ids,
+		                           pushdown_filters,
+		                           join_keys_buffers,
 		                           /*phase=*/"TABLE_BUFFERING_FINALIZE",
 		                           /*order_by=*/std::nullopt,
 		                           /*table_sample=*/std::nullopt,
@@ -927,7 +952,22 @@ SourceResultType PhysicalVgiTableBufferingFunction::GetDataInternal(ExecutionCon
 
 	idx_t rows = std::min<idx_t>(batch->num_rows(), STANDARD_VECTOR_SIZE);
 	chunk.SetCardinality(rows);
-	ArrowTableFunction::ArrowToDuckDB(*scan_state, lstate.arrow_table.GetColumns(), chunk, false);
+	// When projection_pushdown is on, the worker emits a narrow Arrow batch
+	// positionally aligned with chunk.ColumnCount() (which equals
+	// projection_ids.size() — our return_types was narrowed in the rewriter).
+	// `arrow_scan_is_projected=true` makes ArrowToDuckDB read children[idx]
+	// directly without remapping. Mirrors vgi_table_function_impl.cpp:1849,
+	// with one key difference: our ``lstate.arrow_table`` is built per-batch
+	// from the *narrow* emitted schema, so its column-type map keys are
+	// 0..projection_ids.size()-1 (positional). Leave ``scan_state.column_ids``
+	// empty so ArrowToDuckDB does ``arrow_convert_data[idx]`` (positional)
+	// rather than ``arrow_convert_data[column_ids[idx]]`` (which would index
+	// by worker-original column index and miss our narrow-keyed map). The
+	// streaming pure-table path can use worker-original keys because it
+	// builds ``bind_data.arrow_table`` once from the full schema at bind
+	// time; we deliberately don't pay that cache cost for v1.
+	ArrowTableFunction::ArrowToDuckDB(*scan_state, lstate.arrow_table.GetColumns(), chunk,
+	                                  projection_pushdown);
 	return SourceResultType::HAVE_MORE_OUTPUT;
 }
 
