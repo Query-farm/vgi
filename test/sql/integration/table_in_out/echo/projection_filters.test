@@ -285,6 +285,55 @@ SELECT n FROM example.echo((SELECT unnest(generate_series(1, 10)) AS n, 'label' 
 ----
 
 # ============================================================================
+# Plan-shape assertions — projection pushdown is actually happening
+# ============================================================================
+# When projection pushes into the operator, the worker emits a narrow Arrow
+# batch directly and DuckDB does NOT insert a PROJECTION node above
+# INOUT_FUNCTION to narrow the output. If the capability advertisement gets
+# dropped from vgi_table_function_set.cpp (or InitGlobal stops capturing
+# column_ids), DuckDB falls back to inserting a narrowing PROJECTION above
+# the operator — the negative regex below catches that.
+#
+# DOTALL (?s) is required so .* spans newlines. The input subquery's
+# PROJECTION (a/b/c projection over the inner SELECT) always sits BELOW
+# INOUT_FUNCTION in the rendered tree — and the rendered text shows the
+# root first, so any PROJECTION ABOVE the operator appears BEFORE the
+# INOUT_FUNCTION substring in the text.
+#
+# Verification that the regex has teeth: under
+# `PRAGMA disabled_optimizers='unused_columns'` the assertion fails
+# (DuckDB inserts a narrowing PROJECTION above INOUT_FUNCTION instead of
+# pushing). Don't enable that pragma here — these queries run with the
+# default optimizer set.
+
+# Single-column projection from a 3-column subquery
+query II
+EXPLAIN SELECT b FROM example.echo((SELECT 1 AS a, 2 AS b, 3 AS c));
+----
+physical_plan	<!REGEX>:(?s).*PROJECTION.*INOUT_FUNCTION.*
+
+# Two-column subset (verifies projection_ids handling, not just single-col)
+query II
+EXPLAIN SELECT a, c FROM example.echo((SELECT 1 AS a, 2 AS b, 3 AS c));
+----
+physical_plan	<!REGEX>:(?s).*PROJECTION.*INOUT_FUNCTION.*
+
+# Projection + filter — confirms FILTER sits above the operator (correct,
+# since DuckDB's planner doesn't push filters into InOut) while PROJECTION
+# does NOT sit above (projection pushes in).
+query II
+EXPLAIN SELECT b FROM example.echo((SELECT 1 AS a, 2 AS b, 3 AS c)) WHERE b > 0;
+----
+physical_plan	<!REGEX>:(?s).*PROJECTION.*INOUT_FUNCTION.*
+
+# Same query — assert the FILTER node IS present above (positive match,
+# pins the current "filter runs above operator" planner behavior).
+query II
+EXPLAIN SELECT b FROM example.echo((SELECT 1 AS a, 2 AS b, 3 AS c)) WHERE b > 0;
+----
+physical_plan	<REGEX>:(?s).*FILTER.*INOUT_FUNCTION.*
+
+# ============================================================================
 # Cleanup
 # ============================================================================
 
