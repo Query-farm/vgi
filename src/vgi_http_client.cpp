@@ -7,93 +7,50 @@
 #include "duckdb.hpp"
 #include "duckdb/common/http_util.hpp"
 #include "duckdb/common/enums/http_status_code.hpp"
-#include "zstd.h"
 
 #include "vgi_cookie_jar.hpp"
+#include "vgi_http_compression.hpp"
 #include "vgi_logging.hpp"
 #include "vgi_oauth.hpp"
 #include "vgi_rpc_client.hpp"
 
 #include "mbedtls_wrapper.hpp"
 
-using namespace duckdb_zstd;
-
 namespace duckdb {
 namespace vgi {
 
-// Cap on the maximum decompressed size we'll accept, in bytes. The frame_size
-// field of a zstd frame is attacker-controllable from the worker side; without
-// a cap, a malicious or buggy worker could declare frame_size = 1 << 60 and
-// trigger an exabyte allocation -> OOM crash. 1 GiB is generous for any
-// realistic VGI RPC response.
-static constexpr size_t kMaxDecompressedBytes = 1ULL << 30;  // 1 GiB
+// Header used to advertise / negotiate the set of supported content
+// encodings.  Mirrors the constant in ``vgi_rpc/http/_common.py``.
+static constexpr const char *kSupportedEncodingsHeader = "VGI-Supported-Encodings";
 
-// Decompress a zstd-encoded buffer. Returns decompressed bytes.
-static std::string ZstdDecompress(const char *data, size_t size) {
-	auto frame_size = ZSTD_getFrameContentSize(data, size);
-	if (frame_size == ZSTD_CONTENTSIZE_ERROR) {
-		throw IOException("VGI zstd decompression failed: not valid zstd data");
-	}
-
-	if (frame_size != ZSTD_CONTENTSIZE_UNKNOWN) {
-		if (frame_size > kMaxDecompressedBytes) {
-			throw IOException(
-			    "VGI zstd decompression rejected: declared frame size %llu bytes exceeds %llu byte cap",
-			    static_cast<unsigned long long>(frame_size),
-			    static_cast<unsigned long long>(kMaxDecompressedBytes));
-		}
-		// Known size — single-call decompress
-		std::string decompressed(frame_size, '\0');
-		auto result = ZSTD_decompress(decompressed.data(), frame_size, data, size);
-		if (ZSTD_isError(result)) {
-			throw IOException("VGI zstd decompression failed: %s", ZSTD_getErrorName(result));
-		}
-		decompressed.resize(result);
-		return decompressed;
-	}
-
-	// Unknown size — streaming decompress, also bounded by kMaxDecompressedBytes
-	// so a decompression bomb (small input, gigabyte output) can't OOM us.
-	auto *dstream = ZSTD_createDStream();
-	if (!dstream) {
-		throw IOException("VGI zstd decompression failed: could not create stream");
-	}
-	ZSTD_initDStream(dstream);
-
-	std::string output;
-	ZSTD_inBuffer input_buf = {data, size, 0};
-	std::vector<char> tmp(ZSTD_DStreamOutSize());
-
-	while (input_buf.pos < input_buf.size) {
-		ZSTD_outBuffer output_buf = {tmp.data(), tmp.size(), 0};
-		auto result = ZSTD_decompressStream(dstream, &output_buf, &input_buf);
-		if (ZSTD_isError(result)) {
-			ZSTD_freeDStream(dstream);
-			throw IOException("VGI zstd decompression failed: %s", ZSTD_getErrorName(result));
-		}
-		if (output.size() + output_buf.pos > kMaxDecompressedBytes) {
-			ZSTD_freeDStream(dstream);
-			throw IOException(
-			    "VGI zstd decompression rejected: streamed output exceeded %llu byte cap",
-			    static_cast<unsigned long long>(kMaxDecompressedBytes));
-		}
-		output.append(tmp.data(), output_buf.pos);
-	}
-
-	ZSTD_freeDStream(dstream);
-	return output;
+// Comma-joined list of codecs we can produce / decode, in our preference
+// order — sent on every request so the server can pick a codec for its
+// response.  When the chosen request codec doesn't match the server's
+// advertised set, the server returns 415 and the caller can re-pick from
+// the ``VGI-Supported-Encodings`` header it carries back.
+static std::string ClientAcceptEncoding() {
+	return "zstd, gzip";
 }
 
-// Compress a buffer with zstd. Returns compressed bytes.
-static std::vector<uint8_t> ZstdCompress(const uint8_t *data, size_t size, int level = 3) {
-	auto bound = ZSTD_compressBound(size);
-	std::vector<uint8_t> compressed(bound);
-	auto result = ZSTD_compress(compressed.data(), bound, data, size, level);
-	if (ZSTD_isError(result)) {
-		throw IOException("VGI zstd compression failed: %s", ZSTD_getErrorName(result));
+// Resolve the encoding advertised on a response.  Prefer the custom
+// ``X-VGI-Content-Encoding`` header (older servers stamp this on every
+// response — generic proxies don't fold it), falling back to the standard
+// ``Content-Encoding``.  Returns ``NONE`` when no codec is advertised or
+// when the token is unknown.
+static HttpEncoding ResolveResponseEncoding(const HTTPResponse &response) {
+	if (response.HasHeader("X-VGI-Content-Encoding")) {
+		auto enc = ParseEncoding(response.GetHeaderValue("X-VGI-Content-Encoding"));
+		if (enc != HttpEncoding::NONE) {
+			return enc;
+		}
 	}
-	compressed.resize(result);
-	return compressed;
+	if (response.HasHeader("Content-Encoding")) {
+		auto enc = ParseEncoding(response.GetHeaderValue("Content-Encoding"));
+		if (enc != HttpEncoding::NONE) {
+			return enc;
+		}
+	}
+	return HttpEncoding::NONE;
 }
 
 // Helper: strip trailing slash from a URL
@@ -172,13 +129,27 @@ static std::vector<std::string> CollectSetCookieHeaders(const HTTPResponse &resp
 // secret manager (which takes the MetaTransaction mutex) on every request —
 // required for HTTP RPCs invoked from VgiTransaction::Start to not deadlock.
 // TODO(#22258): drop when https://github.com/duckdb/duckdb/issues/22258 is fixed.
+// Pick the first encoding from ``offered`` that we can also produce.  Falls
+// back to GZIP (always available; the C++ side links miniz unconditionally)
+// when no overlap exists — the caller has nothing left to retry with anyway.
+static HttpEncoding PickAlternateEncoding(const std::vector<HttpEncoding> &offered, HttpEncoding tried) {
+	for (auto enc : offered) {
+		if (enc != tried && enc != HttpEncoding::NONE) {
+			return enc;
+		}
+	}
+	return tried == HttpEncoding::ZSTD ? HttpEncoding::GZIP : HttpEncoding::ZSTD;
+}
+
 static std::string HttpPostArrowIpcInternal(ClientContext &context,
                                              const std::string &url,
                                              const std::vector<uint8_t> &body,
                                              const std::string &bearer_token,
                                              const std::shared_ptr<SessionCookieJar> &cookie_jar,
                                              std::unique_ptr<HTTPResponse> &out_response,
-                                             const std::shared_ptr<HTTPParams> &cached_http_params = nullptr) {
+                                             const std::shared_ptr<HTTPParams> &cached_http_params = nullptr,
+                                             HttpEncoding request_encoding = HttpEncoding::ZSTD,
+                                             bool allow_codec_retry = true) {
 	auto &db = *context.db;
 	auto &http_util = HTTPUtil::Get(db);
 
@@ -196,13 +167,15 @@ static std::string HttpPostArrowIpcInternal(ClientContext &context,
 	// to debug a stuck endpoint saw no effect until re-ATTACH.
 	ApplyHttpTimeout(context, *params);
 
-	// Compress the request body with zstd
-	auto compressed_body = ZstdCompress(body.data(), body.size());
+	// Compress the request body with the chosen codec.  Default zstd matches
+	// every existing VGI server; a future gzip-only server is recovered via
+	// the 415-retry path below using ``VGI-Supported-Encodings``.
+	auto compressed_body = Compress(request_encoding, body.data(), body.size());
 
 	HTTPHeaders headers;
 	headers.Insert("Content-Type", ARROW_IPC_CONTENT_TYPE);
-	headers.Insert("Content-Encoding", "zstd");
-	headers.Insert("X-VGI-Accept-Encoding", "zstd");
+	headers.Insert("Content-Encoding", EncodingName(request_encoding));
+	headers.Insert("X-VGI-Accept-Encoding", ClientAcceptEncoding());
 	if (!bearer_token.empty()) {
 		headers.Insert("Authorization", "Bearer " + bearer_token);
 	}
@@ -234,16 +207,36 @@ static std::string HttpPostArrowIpcInternal(ClientContext &context,
 		return "";
 	}
 
+	// 415-retry: the codec we picked isn't enabled on this server.  When the
+	// response carries ``VGI-Supported-Encodings`` (stamped on every response
+	// by ``_CapabilitiesMiddleware``), re-pick and retry once.  This is the
+	// forward-compat hook for "first call against a gzip-only server" —
+	// before caps are discovered we default to zstd, and gzip-only servers
+	// reject with 415 + the right header.
+	if (out_response->status == HTTPStatusCode::UnsupportedMediaType_415 && allow_codec_retry &&
+	    out_response->HasHeader(kSupportedEncodingsHeader)) {
+		auto offered = ParseAcceptList(out_response->GetHeaderValue(kSupportedEncodingsHeader));
+		if (!offered.empty()) {
+			auto alternate = PickAlternateEncoding(offered, request_encoding);
+			if (alternate != request_encoding) {
+				return HttpPostArrowIpcInternal(context, url, body, bearer_token, cookie_jar,
+				                                 out_response, cached_http_params, alternate,
+				                                 /*allow_codec_retry=*/false);
+			}
+		}
+	}
+
 	if (!out_response->Success()) {
 		std::string error_body = post.buffer_out.empty() ? out_response->body
 		                                                 : std::string(post.buffer_out.data(),
 		                                                               post.buffer_out.data() + post.buffer_out.size());
-		// Decompress if the server advertised zstd — otherwise Arrow IPC parsing
-		// would see a zstd magic number and throw "negative continuation token".
-		if (!error_body.empty() && out_response->HasHeader("X-VGI-Content-Encoding") &&
-		    out_response->GetHeaderValue("X-VGI-Content-Encoding") == "zstd") {
+		// Decompress if the server advertised a codec we know — otherwise
+		// Arrow IPC parsing would see compressed-stream magic bytes and
+		// throw "negative continuation token".
+		auto error_enc = ResolveResponseEncoding(*out_response);
+		if (!error_body.empty() && error_enc != HttpEncoding::NONE) {
 			try {
-				error_body = ZstdDecompress(error_body.data(), error_body.size());
+				error_body = Decompress(error_enc, error_body.data(), error_body.size());
 			} catch (...) {
 				// Leave body as-is; the raw bytes will appear in the preview.
 			}
@@ -339,10 +332,10 @@ static std::string HttpPostArrowIpcInternal(ClientContext &context,
 		}
 	}
 
-	// Decompress zstd response if server sent it
-	if (out_response->HasHeader("X-VGI-Content-Encoding") &&
-	    out_response->GetHeaderValue("X-VGI-Content-Encoding") == "zstd" && !post.buffer_out.empty()) {
-		post.buffer_out = ZstdDecompress(post.buffer_out.data(), post.buffer_out.size());
+	// Decompress the response if the server stamped a codec we know.
+	auto resp_enc = ResolveResponseEncoding(*out_response);
+	if (resp_enc != HttpEncoding::NONE && !post.buffer_out.empty()) {
+		post.buffer_out = Decompress(resp_enc, post.buffer_out.data(), post.buffer_out.size());
 	}
 
 	// Server errors are sent as HTTP 200 with X-VGI-RPC-Error: true header
@@ -501,7 +494,7 @@ std::string HttpGetBytes(ClientContext &context, const std::string &url) {
 	ApplyHttpTimeout(context, *params);
 
 	HTTPHeaders headers;
-	headers.Insert("X-VGI-Accept-Encoding", "zstd");
+	headers.Insert("X-VGI-Accept-Encoding", ClientAcceptEncoding());
 	// No auth headers — pre-signed URLs break with extra Authorization headers
 
 	// Accumulate response body via content handler
@@ -524,10 +517,10 @@ std::string HttpGetBytes(ClientContext &context, const std::string &url) {
 		                  static_cast<int>(response->status), url);
 	}
 
-	// Decompress zstd if server indicates it
-	if (response->HasHeader("X-VGI-Content-Encoding") &&
-	    response->GetHeaderValue("X-VGI-Content-Encoding") == "zstd" && !body.empty()) {
-		return ZstdDecompress(body.data(), body.size());
+	// Decompress if the server indicates a codec we know.
+	auto get_enc = ResolveResponseEncoding(*response);
+	if (get_enc != HttpEncoding::NONE && !body.empty()) {
+		return Decompress(get_enc, body.data(), body.size());
 	}
 
 	return body;
@@ -728,6 +721,9 @@ static ServerCapabilities ParseCapabilityHeaders(const HTTPResponse &response) {
 			caps.max_upload_bytes = std::stoll(response.GetHeaderValue("VGI-Max-Upload-Bytes"));
 		} catch (...) {}
 	}
+	if (response.HasHeader(kSupportedEncodingsHeader)) {
+		caps.supported_encodings = ParseAcceptList(response.GetHeaderValue(kSupportedEncodingsHeader));
+	}
 
 	auto max_age = ParseCacheControlMaxAge(response);
 	if (max_age.count() > 0) {
@@ -797,7 +793,7 @@ std::vector<UploadUrl> HttpRequestUploadUrls(ClientContext &context,
 }
 
 void HttpPutBytes(ClientContext &context, const std::string &url,
-                   const std::vector<uint8_t> &data, bool compress_zstd) {
+                   const std::vector<uint8_t> &data, HttpEncoding encoding) {
 	auto &db = *context.db;
 	auto &http_util = HTTPUtil::Get(db);
 	auto params = http_util.InitializeParameters(context, url);
@@ -810,12 +806,12 @@ void HttpPutBytes(ClientContext &context, const std::string &url,
 	size_t body_size = data.size();
 	std::vector<uint8_t> compressed;
 
-	if (compress_zstd) {
-		compressed = ZstdCompress(data.data(), data.size());
+	if (encoding != HttpEncoding::NONE) {
+		compressed = Compress(encoding, data.data(), data.size());
 		body_data = compressed.data();
 		body_size = compressed.size();
-		headers.Insert("Content-Encoding", "zstd");
-		headers.Insert("X-VGI-Content-Encoding", "zstd");
+		headers.Insert("Content-Encoding", EncodingName(encoding));
+		headers.Insert("X-VGI-Content-Encoding", EncodingName(encoding));
 	}
 
 	PutRequestInfo put(url, headers, *params,

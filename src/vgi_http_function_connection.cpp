@@ -817,7 +817,7 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 		auto e_auth = attach_params_ ? attach_params_->auth() : nullptr;
 		auto urls = HttpRequestUploadUrls(context_, base_url_, 1, e_auth);
 		if (!urls.empty()) {
-			HttpPutBytes(context_, urls[0].upload_url, body, false);
+			HttpPutBytes(context_, urls[0].upload_url, body, HttpEncoding::NONE);
 			body = SerializePointerBatch(input_schema_, urls[0].download_url, stream_state_token_);
 		}
 	}

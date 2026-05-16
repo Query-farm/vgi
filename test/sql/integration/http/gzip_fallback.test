@@ -1,0 +1,47 @@
+# name: test/sql/integration/http/gzip_fallback.test
+# description: HTTP transport works when server advertises gzip only (no zstd)
+# group: [vgi_integration_http]
+#
+# Driven by VGI_HTTP_DISABLE_ZSTD=1 in run_http_integration.sh — that
+# environment variable makes ``_CompressionMiddleware`` drop zstd from the
+# advertised codec set even though ``zstandard`` is importable.  The C++
+# client defaults to zstd before discovery, gets a 415 with
+# ``VGI-Supported-Encodings: gzip`` back, refreshes its codec choice, and
+# retries with gzip.  After that first 415, the cached codec set keeps
+# every subsequent call on gzip without a retry.
+
+require-env VGI_TEST_WORKER
+
+require-env VGI_HTTP_DISABLE_ZSTD
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# Basic catalog read — exercises HttpInvokeUnary / HttpPostArrowIpc
+# through the codec dispatch.  Smoke test: just make sure the call
+# round-trips successfully under gzip.
+query I
+SELECT count(*) >= 0 FROM information_schema.tables WHERE table_catalog = 'example';
+----
+1
+
+# Scalar function call — exercises the streaming exchange path which
+# also funnels through the same compression code paths.
+query I
+SELECT example.double(3);
+----
+6
+
+# Multiple calls in succession verify cached caps keep the codec stable
+# (no per-call 415 retries thrashing).
+query III
+SELECT example.double(1), example.double(2), example.double(3);
+----
+2	4	6
+
+statement ok
+DETACH example;

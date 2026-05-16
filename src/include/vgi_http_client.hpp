@@ -11,6 +11,7 @@
 #include "duckdb/common/http_util.hpp"
 #include "duckdb/main/client_context.hpp"
 
+#include "vgi_http_compression.hpp"
 #include "vgi_rpc_client.hpp"
 
 namespace duckdb {
@@ -62,7 +63,8 @@ std::string HttpPostArrowIpc(ClientContext &context,
                               const std::shared_ptr<HTTPParams> &cached_http_params = nullptr);
 
 // HTTP GET raw bytes from a URL. Used for fetching externalized batches.
-// Handles X-VGI-Content-Encoding: zstd decompression. No auth headers sent.
+// Handles X-VGI-Content-Encoding decompression (zstd or gzip). No auth
+// headers sent.
 std::string HttpGetBytes(ClientContext &context, const std::string &url);
 
 // Resolve an external location pointer batch by fetching and parsing the URL.
@@ -87,14 +89,19 @@ UnaryResponseResult MaybeResolveExternalLocation(ClientContext &context,
 
 // Server capabilities discovered via HEAD /health.
 // Capability headers (VGI-Max-Request-Bytes, VGI-Upload-URL-Support,
-// VGI-Max-Upload-Bytes) are emitted by the server middleware on every
-// response; /health is the canonical discovery target since it is
-// mandatory and exempt from auth.
+// VGI-Max-Upload-Bytes, VGI-Supported-Encodings) are emitted by the
+// server middleware on every response; /health is the canonical discovery
+// target since it is mandatory and exempt from auth.
 struct ServerCapabilities {
 	bool discovered = false;
 	int64_t max_request_bytes = -1;   // -1 = no limit advertised
 	bool upload_url_support = false;
 	int64_t max_upload_bytes = -1;    // -1 = no limit advertised
+	// Content-encoding codecs the server can decompress on request bodies
+	// and produce on response bodies, in server-advertised preference order.
+	// Empty == "VGI-Supported-Encodings header absent" → caller should
+	// default to {ZSTD} for back-compat with pre-update servers.
+	std::vector<HttpEncoding> supported_encodings;
 	// Steady-clock time after which this snapshot should be re-probed.
 	// Populated from the response's Cache-Control: max-age=N header.
 	// epoch (default-constructed) means "no expiry hint" -> valid for
@@ -120,9 +127,12 @@ std::vector<UploadUrl> HttpRequestUploadUrls(ClientContext &context,
                                                int count,
                                                const std::shared_ptr<CatalogAuth> &auth = nullptr);
 
-// HTTP PUT raw bytes to a URL with optional zstd compression.
+// HTTP PUT raw bytes to a URL with optional compression.  ``encoding`` ==
+// ``HttpEncoding::NONE`` (the default) writes the body verbatim; any other
+// codec is applied before PUT and stamped on Content-Encoding /
+// X-VGI-Content-Encoding so the receiving side knows how to decode.
 void HttpPutBytes(ClientContext &context, const std::string &url,
-                   const std::vector<uint8_t> &data, bool compress_zstd = false);
+                   const std::vector<uint8_t> &data, HttpEncoding encoding = HttpEncoding::NONE);
 
 // Serialize a pointer batch: zero-row batch with schema + vgi_rpc.location metadata.
 // Optionally includes stream_state token in metadata.

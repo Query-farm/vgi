@@ -11,18 +11,28 @@ shift 2>/dev/null || true
 
 LOG_FILE="/tmp/vgi-http-test-server.log"
 
+# ``VGI_HTTP_DISABLE_ZSTD=1`` propagates into the fixture so the server's
+# ``_CompressionMiddleware`` drops zstd from its advertised codec set even
+# when ``zstandard`` is installed.  Used by the gzip-fallback SLT.
+export_args=()
+if [[ "${VGI_HTTP_DISABLE_ZSTD:-}" == "1" ]]; then
+    echo "VGI_HTTP_DISABLE_ZSTD=1 — server will advertise gzip only"
+fi
+
 # Start HTTP server with auto-selected port; stdout goes to a pipe so we can read PORT:XXXX
 if [[ "${VGI_DEMO_STORAGE:-}" == "1" ]]; then
     THRESHOLD="${VGI_EXTERNALIZE_THRESHOLD_BYTES:-1}"
     COMPRESSION="${VGI_EXTERNALIZE_COMPRESSION:-none}"
     echo "Demo storage mode: threshold=${THRESHOLD} compression=${COMPRESSION}"
-    uv run --project "$VGI_PYTHON_DIR" vgi-fixture-http \
+    VGI_HTTP_DISABLE_ZSTD="${VGI_HTTP_DISABLE_ZSTD:-}" \
+        uv run --project "$VGI_PYTHON_DIR" vgi-fixture-http \
         --port 0 --demo-storage \
         --externalize-threshold-bytes "$THRESHOLD" \
         --externalize-compression "$COMPRESSION" \
         > "$LOG_FILE" 2>&1 &
 else
-    uv run --project "$VGI_PYTHON_DIR" vgi-fixture-http \
+    VGI_HTTP_DISABLE_ZSTD="${VGI_HTTP_DISABLE_ZSTD:-}" \
+        uv run --project "$VGI_PYTHON_DIR" vgi-fixture-http \
         --port 0 --log-format json > "$LOG_FILE" 2>&1 &
 fi
 SERVER_PID=$!

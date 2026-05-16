@@ -33,6 +33,7 @@ include_directories(src/include)
 include_directories(duckdb/third_party/mbedtls/include)
 include_directories(duckdb/third_party/httplib)
 include_directories(duckdb/third_party/zstd/include)
+include_directories(duckdb/third_party/miniz)
 
 set(EXTENSION_SOURCES
 src/vgi_extension.cpp
@@ -53,6 +54,7 @@ src/vgi_stderr_drainer.cpp
 src/vgi_unary_rpc.cpp
 src/vgi_bind_protocol.cpp
 src/vgi_transport.cpp
+src/vgi_http_compression.cpp
 src/vgi_http_client.cpp
 src/vgi_http_function_connection.cpp
 src/vgi_cookie_jar.cpp
