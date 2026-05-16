@@ -1,0 +1,134 @@
+# name: test/sql/integration/table_in_out/echo/pushdown_witness.test
+# description: Worker-side instrumentation test for projection pushdown. The
+#   echo_witness fixture (TableInOutGenerator with projection_pushdown=True)
+#   emits each output column with the integer value len(params.output_schema)
+#   — the count of columns the worker actually observed AFTER framework
+#   projection narrowing. The output value distinguishes pushdown-working
+#   from pushdown-broken even when DuckDB narrows above the operator.
+#
+#   With pushdown: SELECT a FROM echo_witness(3 cols) → 1 (worker saw 1 col)
+#   Without pushdown: same query → 3 (worker saw 3 cols, DuckDB narrows above)
+#
+#   This is the verification gap that the EXPLAIN-based regex in
+#   projection_filters.test couldn't close: even if row results would still
+#   be correct via above-operator narrowing, this test fails because the
+#   encoded count reveals what the worker actually received on the wire.
+# group: [vgi_integration_table_in_out_echo]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# Baseline — SELECT * forces all columns to reach the worker.
+# Expected: every value = 3 (worker saw 3-column output schema).
+# ============================================================================
+
+query III
+SELECT * FROM example.echo_witness((SELECT 1 AS a, 2 AS b, 3 AS c));
+----
+3	3	3
+
+# ============================================================================
+# Single-column projection — worker should see ONE column.
+# Without pushdown, this would return 3 (DuckDB narrowing above).
+# ============================================================================
+
+query I
+SELECT a FROM example.echo_witness((SELECT 1 AS a, 2 AS b, 3 AS c));
+----
+1
+
+query I
+SELECT b FROM example.echo_witness((SELECT 1 AS a, 2 AS b, 3 AS c));
+----
+1
+
+query I
+SELECT c FROM example.echo_witness((SELECT 1 AS a, 2 AS b, 3 AS c));
+----
+1
+
+# ============================================================================
+# Two-column subset — worker should see TWO columns.
+# ============================================================================
+
+query II
+SELECT a, c FROM example.echo_witness((SELECT 1 AS a, 2 AS b, 3 AS c));
+----
+2	2
+
+query II
+SELECT b, a FROM example.echo_witness((SELECT 1 AS a, 2 AS b, 3 AS c));
+----
+2	2
+
+# ============================================================================
+# Five-column input with subset projections — exercises wider schemas.
+# ============================================================================
+
+query I
+SELECT c FROM example.echo_witness((SELECT 1 AS a, 2 AS b, 3 AS c, 4 AS d, 5 AS e));
+----
+1
+
+query II
+SELECT a, e FROM example.echo_witness((SELECT 1 AS a, 2 AS b, 3 AS c, 4 AS d, 5 AS e));
+----
+2	2
+
+query III
+SELECT a, c, e FROM example.echo_witness((SELECT 1 AS a, 2 AS b, 3 AS c, 4 AS d, 5 AS e));
+----
+3	3	3
+
+query IIIII
+SELECT * FROM example.echo_witness((SELECT 1 AS a, 2 AS b, 3 AS c, 4 AS d, 5 AS e));
+----
+5	5	5	5	5
+
+# ============================================================================
+# Multi-row input — confirms the witness encoding holds per row.
+# ============================================================================
+
+query I
+SELECT b FROM example.echo_witness((SELECT * FROM (VALUES (1, 2, 3), (4, 5, 6), (7, 8, 9)) t(a, b, c)));
+----
+1
+1
+1
+
+query II
+SELECT a, c FROM example.echo_witness((SELECT * FROM (VALUES (1, 2, 3), (4, 5, 6), (7, 8, 9)) t(a, b, c)));
+----
+2	2
+2	2
+2	2
+
+# ============================================================================
+# Aggregations over the witness — confirms many rows × narrow schema works.
+# Worker sees 1 col on every batch; SUM(b) over 1000 rows = 1000.
+# ============================================================================
+
+query II
+SELECT COUNT(*), SUM(b) FROM (
+    SELECT b FROM example.echo_witness(
+        (SELECT unnest(generate_series(1, 1000)) AS a,
+                unnest(generate_series(1, 1000)) AS b,
+                unnest(generate_series(1, 1000)) AS c)
+    )
+);
+----
+1000	1000
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;
