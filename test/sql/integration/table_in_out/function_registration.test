@@ -19,8 +19,21 @@ statement ok
 ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
 # ============================================================================
-# Function Inventory
-# All 8 table-in-out functions must be registered
+# Function Inventory — canonical specification fixtures.
+#
+# The example worker ships two categories of table-in-out functions:
+#
+#   * Canonical "specification" fixtures (listed below) — the documented
+#     surface that cross-language workers (Python, Go, ...) must mirror.
+#     This test pins their names, parameter shapes, descriptions, and
+#     categories.
+#
+#   * Fault-injection / behavioural fixtures (``crash_on_*``, ``hang_*``,
+#     ``exception_*``, ``ordered_buffer_input``, ``batch_index_buffer_input``,
+#     ``large_state``) — exercise specific edge cases in the SQL test
+#     suite; not part of the contract surface, may come and go. Excluded
+#     from the inventory checks so adding a new fault-injection fixture
+#     doesn't churn this file.
 # ============================================================================
 
 query T
@@ -45,11 +58,21 @@ sum_all_columns
 sum_all_columns_simple_distributed
 unnest_tensor_rows
 
-# All table-in-out functions have TABLE in their parameter types
+# Every canonical table-in-out fixture takes a TABLE-typed parameter — the
+# whole point of the shape. Scoped to the named list (above) on purpose:
+# the alternative — counting every table-in-out registration — bit-rotted
+# silently every time a fault-injection fixture was added. Pin the assertion
+# to the contract surface; expand the IN-list explicitly when a fixture
+# graduates from "test plumbing" to "canonical specification".
 query I
 SELECT COUNT(*)
 FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'table'
+AND function_name IN (
+    'buffer_input', 'echo', 'exception_finalize', 'exception_process',
+    'filter_by_setting', 'repeat_inputs', 'slow_cancellable_inout',
+    'sum_all_columns', 'sum_all_columns_simple_distributed', 'unnest_tensor_rows'
+)
 AND list_contains(parameter_types, 'TABLE');
 ----
 10
