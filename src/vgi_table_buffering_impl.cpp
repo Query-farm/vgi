@@ -359,6 +359,37 @@ public:
 	// carries its own schema; we don't need to precompute one).
 	ArrowSchemaWrapper c_schema;
 	ArrowTableSchema arrow_table;
+
+	// Captured at GetData-time alongside the worker acquisition so the
+	// destructor can route an unreleased connection through the global
+	// cancel-dispatcher. Mirrors LocalSinkState's `db` field. nullptr
+	// before the first GetData call, or if the cancel dispatcher isn't
+	// installed (in which case the destructor falls back to dropping
+	// the unique_ptr, same as the gstate destructor's last-resort path).
+	DatabaseInstance *db = nullptr;
+
+	~VgiTableBufferingLocalSourceState() override {
+		if (!worker) {
+			return;
+		}
+		// EOS path goes through ReleaseForPooling in GetDataInternal and
+		// leaves `worker` empty before we reach here. So if we're here
+		// holding a worker, something else short-circuited — most often
+		// PerformInit(TABLE_BUFFERING_FINALIZE) threw (worker died,
+		// user's initial_finalize_state raised, EPIPE), or ReadDataBatch
+		// threw mid-stream. Either way the worker thread may be parked
+		// in a blocking syscall; cancel-dispatch wakes it instead of
+		// silently dropping the connection.
+		auto *dispatcher = db ? FindVgiCancelDispatcher(*db) : nullptr;
+		if (!dispatcher) {
+			return;
+		}
+		auto token = worker->GetLastStateToken();
+		CancelRequest req;
+		req.connection = std::move(worker);
+		req.state_token = std::move(token);
+		(void)dispatcher->Enqueue(std::move(req));
+	}
 };
 
 // Helper: build FunctionConnectionParams from bind_data + optional
@@ -682,20 +713,54 @@ SinkFinalizeType PhysicalVgiTableBufferingFunction::Finalize(Pipeline & /*pipeli
 		gstate.workers.pop_back();
 	}
 
-	// Run combine outside the lock — it's a network round-trip. Cleanup of a
-	// failed combine_worker is handled by its unique_ptr: it drops here and
-	// the gstate destructor will cancel-dispatch any workers still in
-	// gstate.workers[]. The combine_worker connection itself, if it throws,
-	// is destroyed at this scope's exit which releases its own pid/fd.
+	// Run combine outside the lock — it's a network round-trip.
 	VGI_LOG(context, "table_buffering.combine",
 	        {{"conn", combine_worker->GetConnIdHex()},
 	         {"function_name", gstate.function_name},
 	         {"num_state_ids", std::to_string(state_ids_snapshot.size())}});
 	// state_ids flow through opaque-bytes — no packing/unpacking, the
 	// worker chose the encoding when it returned them from process().
-	auto finalize_state_ids =
-	    combine_worker->RpcTableBufferingCombine(gstate.function_name, gstate.execution_id,
-	                                                state_ids_snapshot);
+	std::vector<std::vector<uint8_t>> finalize_state_ids;
+	try {
+		finalize_state_ids =
+		    combine_worker->RpcTableBufferingCombine(gstate.function_name, gstate.execution_id,
+		                                              state_ids_snapshot);
+	} catch (...) {
+		// Combine failed. Three things to do before rethrow:
+		//   (a) Set finalized=true so the gstate destructor's "happy path"
+		//       skip is honored — the post-finalize Sink guard at the top
+		//       of Sink() is the only consumer of this flag, and it's
+		//       harmless to flip it here since the pipeline is unwinding.
+		//   (b) Cancel-dispatch combine_worker through the global dispatcher.
+		//       Without this the unique_ptr just drops, leaving the worker
+		//       thread parked in a blocking syscall until its own idle
+		//       reclaim path kicks in (subprocess: pool timeout; HTTP:
+		//       keep-alive expiry). Mirrors the gstate destructor's
+		//       reclaim_or_cancel logic and the LocalSinkState destructor.
+		//   (c) Pop the state_id we held aside for this worker so the
+		//       transient workers/state_ids size imbalance doesn't leak
+		//       past this throw. state_ids is dead after Finalize anyway,
+		//       but keeping the invariant tight makes the destructor
+		//       reasoning easier.
+		gstate.finalized.store(true);
+		{
+			std::lock_guard<std::mutex> lk(gstate.workers_mutex);
+			if (!gstate.state_ids.empty()) {
+				gstate.state_ids.pop_back();
+			}
+		}
+		auto *dispatcher = gstate.db ? FindVgiCancelDispatcher(*gstate.db) : nullptr;
+		if (dispatcher) {
+			auto token = combine_worker->GetLastStateToken();
+			CancelRequest req;
+			req.connection = std::move(combine_worker);
+			req.state_token = std::move(token);
+			(void)dispatcher->Enqueue(std::move(req));
+		}
+		// combine_worker (if dispatcher was null) drops here — last resort,
+		// same as the gstate-destructor fallback.
+		throw;
+	}
 	VGI_LOG(context, "table_buffering.combine_result",
 	        {{"conn", combine_worker->GetConnIdHex()},
 	         {"function_name", gstate.function_name},
@@ -777,6 +842,11 @@ SourceResultType PhysicalVgiTableBufferingFunction::GetDataInternal(ExecutionCon
 		auto acquire_params = BuildAcquireParams(bd, gstate.execution_id);
 		auto acquired = AcquireConnectionForInit(context.client, acquire_params);
 		lstate.worker = std::move(acquired.connection);
+		// Capture the DatabaseInstance pointer alongside the worker so the
+		// LocalSourceState destructor can cancel-dispatch the worker if a
+		// later step (PerformInit, ReadDataBatch) throws. Without this the
+		// unique_ptr would just drop and leave the worker thread parked.
+		lstate.db = &DatabaseInstance::GetDatabase(context.client);
 		if (VgiInfoLogActive(context.client)) {
 			auto to_hex = [](const std::vector<uint8_t> &b) {
 				std::string out;

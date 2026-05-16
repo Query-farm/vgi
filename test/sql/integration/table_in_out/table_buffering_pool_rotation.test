@@ -1,0 +1,121 @@
+# name: test/sql/integration/table_in_out/table_buffering_pool_rotation.test
+# description: Cross-process state contract — verifies that BoundStorage writes
+#   made by a Sink worker survive into a Source worker that runs in a DIFFERENT
+#   process. The contract from TableBufferingFunction's docstring says:
+#
+#     "any state the worker writes during process() that finalize() will read
+#      MUST live in cross-process storage scoped by params.execution_id. The
+#      Source phase routes a given finalize_state_id to whatever worker process
+#      the C++ scheduler picks; it is NOT guaranteed to be the same process
+#      that ran process()."
+#
+#   With ``pool := false`` every AcquireConnectionForInit spawns a brand-new
+#   subprocess. Sink threads get N fresh workers; Source threads get M more
+#   fresh workers — none of the Source workers participated in Sink. If the
+#   fixtures stored their accumulators on ``self`` or in module globals
+#   instead of BoundStorage, finalize() would read empty state and return
+#   wrong/missing rows. Output correctness IS the cross-process assertion.
+#
+# Subprocess-only. HTTP transport has no per-DuckDB-process subprocess pool
+# (the launcher manages worker lifetime out-of-band), so ``pool := false``
+# doesn't force the same scenario. CLAUDE.md "Pool diagnostics are
+# subprocess-only" notes this for the diagnostic functions; same principle
+# applies to forcing pool rotation.
+# group: [vgi_integration_table_in_out]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+# pool := false disables the per-DuckDB-process subprocess pool entirely for
+# this catalog. Each acquire forks a fresh worker; nothing is returned to a
+# warm cache between Sink and Source. Set threads=4 so DuckDB actually spreads
+# Sink across processes (against a parallel TEMP TABLE scan that supports
+# morsel-level partitioning).
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}', pool false);
+
+statement ok
+SET threads=4;
+
+# A parallel input source (TEMP TABLE scan IS parallel; range() isn't) so
+# multiple Sink threads engage and each picks up its own fresh worker.
+statement ok
+CREATE TEMP TABLE wide AS SELECT v FROM range(100000) AS t(v);
+
+# ----------------------------------------------------------------------------
+# buffer_input — process() does state_append per batch under the execution-
+# scoped log; finalize() drains via state_log_scan. With pool := false the
+# finalize worker IS a different process; it has to read the SQLite-shared
+# storage rows the Sink workers wrote. Correctness here proves the invariant.
+# ----------------------------------------------------------------------------
+
+query I
+SELECT count(*) FROM example.buffer_input((SELECT * FROM wide));
+----
+100000
+
+query I
+SELECT sum(v) FROM example.buffer_input((SELECT * FROM wide));
+----
+4999950000
+
+# ----------------------------------------------------------------------------
+# sum_all_columns — exercises combine() across the rotation as well.
+#   process() appends per-batch partial sums (state_append, ns=b"partial")
+#   combine() reduces partials into one final row (state_put, ns=b"count")
+#   finalize() reads the single final row and emits it
+# Each phase potentially runs on a different worker process; if combine's
+# worker couldn't read the Sink workers' partials, the result would either
+# be 0 or a partial sum.
+# ----------------------------------------------------------------------------
+
+query I
+SELECT * FROM example.sum_all_columns((SELECT * FROM wide));
+----
+4999950000
+
+# ----------------------------------------------------------------------------
+# large_state — process() appends ~1 MB per batch via state_append; combine()
+# scans the log and emits a single row carrying the total accumulated byte
+# count. With pool := false the combine worker is a different process from
+# the Sink workers that wrote the rows; if state_log_scan couldn't see the
+# Sink writes the total would be 0 (state empty) instead of >= 1 MiB.
+# ----------------------------------------------------------------------------
+
+query II
+SELECT count(*), max(v) >= 1048576
+FROM example.large_state((SELECT * FROM wide));
+----
+1	true
+
+# ----------------------------------------------------------------------------
+# Multi-query smoke — run twice to confirm no per-execution storage cross-
+# contamination. Each query's execution_id is fresh and its rows must not
+# bleed into the next query's read set.
+# ----------------------------------------------------------------------------
+
+query I
+SELECT count(*) FROM example.buffer_input((SELECT * FROM wide));
+----
+100000
+
+query I
+SELECT * FROM example.sum_all_columns((SELECT * FROM wide));
+----
+4999950000
+
+# Pool diagnostics check — with pool := false the per-process pool MUST be
+# empty after the query (nothing was ever returned to it).
+query I
+SELECT count(*) FROM vgi_worker_pool();
+----
+0
+
+statement ok
+RESET threads;
+
+statement ok
+DETACH example;

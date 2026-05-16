@@ -227,7 +227,7 @@ plus the shm-aware code paths in `src/vgi_function_connection.cpp`
 | `vgi_join_keys_limit` | UBIGINT | 100000 | Max distinct join key values pushed to VGI workers (0 = disabled) |
 | `vgi_join_keys_max_bytes` | UBIGINT | 67108864 | Max estimated byte size for join keys batch |
 | `vgi_streaming_window` | BOOLEAN | true | Route eligible `OVER (...)` queries against VGI aggregates with `streaming_partitioned=true` through the custom streaming operator. Set to false to fall back to `PhysicalWindow` |
-| `vgi_buffered_table` | BOOLEAN | true | Rewrite calls to `Meta.buffered_table=True` functions through the Sink+Source `PhysicalVgiBufferedTableFunction` operator. Set to false to disable the rewrite — buffered queries then throw `InvalidInputException` instead of running (emergency-rollback path; not generally useful) |
+| `vgi_table_buffering` | BOOLEAN | true | Rewrite calls to `TableBufferingFunction` subclasses through the Sink+Source `PhysicalVgiTableBufferingFunction` operator. Set to false to disable the rewrite — buffered queries then throw `InvalidInputException` instead of running (emergency-rollback path; not generally useful) |
 | `vgi_trust_empty_kinds` | BOOLEAN | true | Trust worker assertions that `estimated_object_count[kind] == 0` means the kind is empty (skip `catalog_schema_contents_*` RPC). Set to false to force every RPC to fire — debug escape hatch for diagnosing worker bugs |
 
 Catalogs may register additional settings at `ATTACH` time (e.g., `greeting`, `multiplier`).
@@ -291,8 +291,8 @@ The `launch:` and `unix://` paths share one warm worker process across every Duc
 | `vgi_aggregate_window_impl.cpp` | Aggregate window callbacks (`window_init` / `window` / `window_batch`) for `OVER (...)` queries; partition is materialised + shipped once, frames evaluated per output row |
 | `vgi_aggregate_streaming_impl.cpp` | Streaming-partitioned aggregate RPC client (`streaming_open` / `_chunk` / `_close`) — pipes input chunks straight to the worker without DuckDB-side partition materialisation |
 | `vgi_streaming_window_operator.cpp` | `LogicalVgiStreamingWindow` + `PhysicalVgiStreamingWindow` — custom `LogicalExtensionOperator` / pipeline `PhysicalOperator` pair that replaces eligible `LogicalWindow` nodes when the worker opts into the streaming protocol; lives in the extension, no DuckDB-core changes |
-| `vgi_table_in_out_impl.cpp` | Table-in-out function implementation (streaming shape — `Meta.buffered_table=False`) |
-| `vgi_buffered_table_function_impl.cpp` | `LogicalVgiBufferedTableFunction` + `PhysicalVgiBufferedTableFunction` — Sink+Source operator for buffered table functions (`Meta.buffered_table=True`); per-thread worker fan-out via `execution_id` |
+| `vgi_table_in_out_impl.cpp` | Table-in-out function implementation (streaming shape — `TableInOutGenerator` subclasses; routes through DuckDB's `in_out_function` / `in_out_function_final`) |
+| `vgi_table_buffering_impl.cpp` | `LogicalVgiTableBufferingFunction` + `PhysicalVgiTableBufferingFunction` — Sink+Source operator for buffered table functions (`TableBufferingFunction` subclasses); per-thread worker fan-out via `execution_id` |
 | `vgi_arrow_ipc.cpp` | Arrow IPC stream I/O: `FdInputStream`, `FdOutputStream`, `ReadRecordBatch` |
 | `vgi_arrow_utils.cpp` | Arrow-to-DuckDB type conversion |
 | `vgi_logging.cpp` | `VgiLogType`, `VgiStderrLogEnabled()`, `VgiLogToStderr()` |
@@ -371,34 +371,65 @@ VGI uses `vgi_rpc` for RPC over subprocess stdin/stdout or HTTP using Arrow IPC 
 - **Table functions** — Producer mode: client sends tick (0-row) batches, worker produces output
 - **Scalar functions** — Exchange mode: client sends input batches, worker returns 1:1 output
 - **Table-in-out functions** — Exchange mode for INPUT phase, producer mode for FINALIZE phase
-- **Buffered table functions** — Sink+Source PhysicalOperator (see below); INPUT batches go to per-thread workers via the `buffered_table_process` RPC, `buffered_table_combine` collapses worker state IDs after Sink, `buffered_table_finalize` drains output per finalize-state-id
+- **Buffered table functions** — Sink+Source PhysicalOperator (see below); INPUT batches go to per-thread workers via the `table_buffering_process` RPC, `table_buffering_combine` collapses worker state IDs after Sink, `table_buffering_finalize` drains output per finalize-state-id (streaming RPC, producer mode)
 
 ### Buffered Table Functions
 
 A second registration shape for table-in-out functions that need to **see every
 input row before producing output** (e.g. `buffer_input`, `sum_all_columns`).
 Routes the query through a custom Sink+Source `PhysicalOperator`
-(`PhysicalVgiBufferedTableFunction`) instead of `PhysicalTableInOutFunction`,
+(`PhysicalVgiTableBufferingFunction`) instead of `PhysicalTableInOutFunction`,
 which fixes upstream DuckDB issue #18222 where `FinalExecute` fires per source
 sub-pipeline and corrupts stateful workers under `UNION ALL`.
 
-**Opt-in.** Set `Meta.buffered_table = True` on a `TableInOutGenerator`
-subclass in vgi-python. The catalog flag propagates through `VgiFunctionInfo` →
-`VgiTableInOutBindData`; `VgiBufferedTableRewriter` (an `OptimizerExtension`)
-rewrites the `LogicalGet` to `LogicalVgiBufferedTableFunction` after built-in
-passes have run (so LATERAL has already been decorrelated). Loud-failure
-asserts in the streaming `VgiTableInOutFunction` / `VgiTableInOutFinalize`
-catch missed rewrites.
+**Opt-in.** Subclass `TableBufferingFunction` in vgi-python. The class
+hierarchy *is* the dispatch key — there is no separate `Meta.buffered_table`
+flag. The catalog wire encodes this as `function_type == TABLE_BUFFERING`
+(distinct from streaming `TABLE`); the C++ catalog set reads that value and
+sets `VgiTableInOutBindData.table_buffering = true`. `VgiTableBufferingRewriter`
+(an `OptimizerExtension`) then rewrites the `LogicalGet` into
+`LogicalVgiTableBufferingFunction` after built-in passes have run (so LATERAL
+has already been decorrelated). Loud-failure asserts in the streaming
+`VgiTableInOutFunction` / `VgiTableInOutFinalize` catch missed rewrites.
 
-**Lifecycle.** First `Sink` per query acquires the *coordinator* worker and
-captures its `execution_id`. Each DuckDB thread acquires a *secondary* worker
-keyed by `execution_id` (so workers can coordinate via shared `BoundStorage`)
-and gets a unique `state_id` from an atomic counter. `Sink::Finalize` (fires
-once per `GlobalSinkState`, even under `UNION ALL`) calls
-`buffered_table_combine(state_ids[])` on the coordinator; the worker returns
-`finalize_state_ids[]` (often `[0]` after merging, or the input list
-unchanged). `Source` threads pop finalize-state-ids from the queue and call
-`buffered_table_finalize(finalize_state_id)` repeatedly until `has_more=False`.
+**Lifecycle.** No separate coordinator worker. The first Sink thread to
+arrive becomes the *init runner*: it acquires its own per-thread worker,
+runs `PerformInit(phase=TABLE_BUFFERING)` with no `global_execution_id`
+(the worker mints one), and publishes the resulting `execution_id` on the
+gstate under `init_mutex` / `init_cv`. Peer Sink threads block on the
+condvar until init publishes, then acquire their own workers with the
+published `global_execution_id` (secondary init — fast, no cold work) and
+run `table_buffering_process` for every input chunk. Each `process()` call
+returns an opaque `state_id: bytes` chosen by the worker (the framework
+just round-trips the bytes; common pattern is to return
+`params.execution_id` so all of a query's batches land in one bucket).
+
+`Sink::Combine` returns each Sink thread's worker to `gstate.workers[]`,
+parallel to `gstate.state_ids[]`. `Sink::Finalize` (fires once per
+`GlobalSinkState`, even under `UNION ALL`) pops *one* worker — any worker,
+they're interchangeable since storage is shared via `BoundStorage` keyed by
+`execution_id` — and calls `table_buffering_combine(state_ids[])`. The worker
+returns `finalize_state_ids: list[bytes]` (often `[execution_id]` after
+merging, or the input list unchanged). Combine pushes the worker back
+into `gstate.workers[]` for the Source phase.
+
+`Source` threads each pop a `finalize_state_id` from the queue and acquire
+a *fresh* worker (the Sink-phase workers' `init_done_` guard would reject a
+second `PerformInit`; clean re-acquire is cheaper than reset). The fresh
+worker runs `PerformInit(phase=TABLE_BUFFERING_FINALIZE,
+finalize_state_id=...)` and the Source loop drains via `ReadDataBatch`
+producer-mode until EOS, then releases the worker back to the pool.
+
+**Cross-process invariant.** The Source-phase worker is, in the general
+case, a *different* worker process from the one that ran `process()` for
+this `execution_id`. Any state the worker needs to carry from Sink to
+Source MUST live in cross-process storage scoped by `params.execution_id`
+— `BoundStorage` is the canonical choice. Storing accumulators on `self`
+or in module globals silently breaks under HTTP transport, pool rotation,
+or any deployment where worker affinity isn't guaranteed. The
+`table_buffering_pool_rotation.test` integration test exercises this by
+running with `pool false` so every acquire spawns a fresh worker; output
+correctness *is* the assertion.
 
 **Ordering knobs.** Two orthogonal axes — input (Sink) and output (Source) —
 expressed as a 2×2 in worker `Meta`:
@@ -415,29 +446,29 @@ expressed as a 2×2 in worker `Meta`:
 `RequiredPartitionInfo()=BatchIndex()`, which surfaces the per-chunk
 `batch_index` on `OperatorSinkInput.partition_info`. Same mechanism DuckDB's
 `PhysicalBatchInsert` uses for ordered parallel ingest into row-group-
-ordered tables. The C++ Sink reads it via `input.local_state.partition_info.batch_index.GetIndex()` and forwards through the
-`buffered_table_process` RPC to the worker as `params.batch_index: int`.
+ordered tables. The C++ Sink reads it via
+`input.local_state.partition_info.batch_index.GetIndex()` and forwards
+through the `table_buffering_process` RPC to the worker as
+`params.batch_index: int`.
 
-**Cross-worker state.** State merging is the worker library's job, not the
+**Worker-owned state.** State merging is the worker library's job, not the
 C++ side's. Workers coordinate via `BoundStorage.state_*` keyed by
-`(execution_id, ns, key)` — for buffered_table this is namespace `b"buf"`
-with `key = pack_int_key(state_id)`. The recommended shape is **append**
-(`state_append` per process call, `state_log_scan` in finalize) for
-variable-size accumulation — it's O(N inserts), versus the O(N²) RMW
-pattern that a `state_class != None` declaration forces (the framework
-loads + deserializes + re-serializes + persists state every process call).
-For constant-size aggregator state, RMW via `state_class` + `state_put`
-is fine. The framework's worker handler skips the round-trip when
-`state_class is None` and threads `state_id` through `ProcessParams.state_id`
-so process() can key its appends directly. C++ never ships state bytes
-between workers.
+`(execution_id, ns, key)`; the worker picks the namespace (subject to the
+`b"_vgi/"` prefix being reserved for framework use — see `FrameworkNS`).
+State_ids are opaque `bytes` chosen by the worker; the framework
+round-trips them between Sink/Combine/Source without inspecting. The
+recommended shape is **append** (`state_append` per process call,
+`state_log_scan` in `combine()` / `finalize()`) for variable-size
+accumulation — it's O(N) inserts and race-safe across parallel process()
+calls. Constant-size aggregator state can use RMW via `state_get` /
+`state_put`. C++ never ships state bytes between workers.
 
 **Compatibility.** Plain calls, `UNION ALL`, non-correlated `LATERAL`, anchor
 of recursive CTEs, and nesting under outer Sinks (ORDER BY, hash aggregate)
 all work. Correlated LATERAL / correlated subqueries go through DuckDB's
 decorrelator first — behavior follows whatever `flatten_dependent_join.cpp`
-produces and is codified by `buffered_lateral.test` /
-`buffered_recursive_cte.test` so upstream changes are CI-visible.
+produces and is codified by `table_buffering_lateral.test` /
+`table_buffering_recursive_cte.test` so upstream changes are CI-visible.
 
 ### Catalog Integration
 
