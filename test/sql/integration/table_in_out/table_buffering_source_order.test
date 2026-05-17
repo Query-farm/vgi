@@ -1,0 +1,123 @@
+# name: test/sql/integration/table_in_out/table_buffering_source_order.test
+# description: Buffered table function with Meta.source_order_dependent=True
+#   forces ParallelSource()=false + SourceOrder()=FIXED_ORDER on the C++
+#   operator (src/include/vgi_table_buffering_impl.hpp:241-246). The Source
+#   phase serial-drains finalize_queue in the exact order combine()
+#   populated it; without source_order_dependent the parallel Source
+#   drainers would race across finalize_state_ids and emit rows in
+#   arbitrary order.
+#
+#   The ordered_source fixture (vgi-python's OrderedSourceFunction)
+#   ignores its input and returns 16 finalize_state_ids from combine() in
+#   ascending integer order; finalize() emits exactly one row per state_id
+#   containing that integer. With source_order_dependent the output MUST
+#   be 0..15 strictly ascending under any thread count.
+# group: [vgi_integration_table_in_out]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ----------------------------------------------------------------------------
+# threads=4 with parallel-scannable input — exercises parallel Sink ingest
+# alongside serial FIXED_ORDER Source drain. If source_order_dependent were
+# ignored, ParallelSource()=true would let 4 drainer threads race and the
+# output order would be non-deterministic.
+# ----------------------------------------------------------------------------
+
+statement ok
+SET threads=4;
+
+statement ok
+CREATE TEMP TABLE parallel_input AS SELECT v FROM range(200) AS t(v);
+
+query I
+SELECT * FROM example.ordered_source((SELECT * FROM parallel_input));
+----
+0
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+
+# ----------------------------------------------------------------------------
+# FIXED_ORDER survives downstream operators that don't themselves reorder.
+# row_number() OVER () attaches indices in source order; the assertion proves
+# v == rn-1 for every row (i.e. nothing got out of order between Source and
+# the window operator).
+# ----------------------------------------------------------------------------
+
+query I
+SELECT count(*) FROM (
+  SELECT v, row_number() OVER () AS rn
+  FROM example.ordered_source((SELECT 1::BIGINT AS v))
+) WHERE v != rn - 1;
+----
+0
+
+# ----------------------------------------------------------------------------
+# Single-threaded sanity check — threads=1 collapses ParallelSink/Source to
+# trivial cases, so this is mostly a guard against the operator hanging when
+# the parallel path isn't engaged.
+# ----------------------------------------------------------------------------
+
+statement ok
+SET threads=1;
+
+query I
+SELECT * FROM example.ordered_source((SELECT 42::BIGINT AS v));
+----
+0
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+
+# ----------------------------------------------------------------------------
+# Repeated queries in one session — verifies finalize_queue is rebuilt per
+# query (no leftover state_ids from the previous execution) and that the
+# pool drains cleanly between FIXED_ORDER drains.
+# ----------------------------------------------------------------------------
+
+statement ok
+RESET threads;
+
+query I
+SELECT sum(v) FROM example.ordered_source((SELECT 1::BIGINT AS v));
+----
+120
+
+query I
+SELECT count(*) FROM example.ordered_source((SELECT 1::BIGINT AS v));
+----
+16
+
+statement ok
+DETACH example;
