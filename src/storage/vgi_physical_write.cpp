@@ -327,6 +327,29 @@ InsertionOrderPreservingMap<string> VgiPhysicalInsert::ParamsToString() const {
 	return result;
 }
 
+// B3: refuse writes against multi-branch VGI tables. v1 ships read-only
+// multi-branch — writes have no canonical target without an additional
+// protocol field (writable_branch_index), so refusing loud is correct.
+// See plan §"Writes against multi-branch tables: refused in v1".
+//
+// Issues a fresh branches RPC (via the new method, which falls back to the
+// legacy single-function path for old workers). For single-branch tables
+// (size <= 1) this is a no-op; for multi-branch tables it throws
+// BinderException at bind time, before any wire I/O for the write happens.
+// Writes don't use AT (...) so empty strings are correct here.
+static void RefuseWriteIfMultiBranch(ClientContext &context, VgiTableEntry &table_entry,
+                                      const char *operation) {
+	auto branches_result = table_entry.FetchScanBranches(context, /*at_unit=*/"", /*at_value=*/"");
+	if (branches_result.branches.size() > 1) {
+		throw BinderException(
+		    "Multi-branch VGI tables are read-only in v1. "
+		    "%s is not supported on table '%s.%s' (%d branches). "
+		    "Write directly to a specific branch's underlying function instead.",
+		    operation, table_entry.ParentSchema().name, table_entry.name,
+		    static_cast<int>(branches_result.branches.size()));
+	}
+}
+
 unique_ptr<GlobalSinkState> VgiPhysicalInsert::GetGlobalSinkState(ClientContext &context) const {
 	optional_ptr<VgiTableEntry> table;
 	if (create_info) {
@@ -348,6 +371,8 @@ unique_ptr<GlobalSinkState> VgiPhysicalInsert::GetGlobalSinkState(ClientContext 
 	auto &catalog = table->GetCatalog().Cast<VgiCatalog>();
 	auto &params = catalog.attach_parameters();
 	auto &attach_result = catalog.attach_result();
+
+	RefuseWriteIfMultiBranch(context, *table, "INSERT");
 
 	auto &vgi_tx = VgiTransaction::Get(context, table->GetCatalog());
 	CatalogRpcContext rpc_ctx{params, attach_result->attach_opaque_data, vgi_tx.GetTransactionOpaqueData()};
@@ -508,6 +533,8 @@ unique_ptr<GlobalSinkState> VgiPhysicalDelete::GetGlobalSinkState(ClientContext 
 	auto &params = catalog.attach_parameters();
 	auto &attach_result = catalog.attach_result();
 
+	RefuseWriteIfMultiBranch(context, const_cast<VgiTableEntry &>(table), "DELETE");
+
 	auto &vgi_tx = VgiTransaction::Get(context, table.GetCatalog());
 	CatalogRpcContext rpc_ctx{params, attach_result->attach_opaque_data, vgi_tx.GetTransactionOpaqueData()};
 	auto write_func = ResolveWriteFunction(
@@ -645,6 +672,8 @@ unique_ptr<GlobalSinkState> VgiPhysicalUpdate::GetGlobalSinkState(ClientContext 
 	auto &catalog = table.GetCatalog().Cast<VgiCatalog>();
 	auto &params = catalog.attach_parameters();
 	auto &attach_result = catalog.attach_result();
+
+	RefuseWriteIfMultiBranch(context, const_cast<VgiTableEntry &>(table), "UPDATE");
 
 	auto &vgi_tx = VgiTransaction::Get(context, table.GetCatalog());
 	CatalogRpcContext rpc_ctx{params, attach_result->attach_opaque_data, vgi_tx.GetTransactionOpaqueData()};

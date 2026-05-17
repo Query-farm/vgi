@@ -122,6 +122,8 @@ const std::unordered_map<std::string, ResponseSchema> &Registry() {
 		    ResponseSchema{AggregateStreamingChunkResultSchema(), nullptr, false, nullptr};
 		m["catalog_table_scan_function_get"] =
 		    ResponseSchema{ScanFunctionResultSchema(), nullptr, false, nullptr};
+		m["catalog_table_scan_branches_get"] =
+		    ResponseSchema{ScanBranchesResultSchema(), nullptr, false, nullptr};
 		m["catalog_table_insert_function_get"] =
 		    ResponseSchema{ScanFunctionResultSchema(), nullptr, false, nullptr};
 		m["catalog_table_update_function_get"] =
@@ -192,6 +194,7 @@ const std::unordered_map<std::string, ResponseSchema> &Registry() {
 		    {"catalog_table_drop", &CatalogTableDropParamsSchema},
 		    {"catalog_table_rename", &CatalogTableRenameParamsSchema},
 		    {"catalog_table_scan_function_get", &CatalogTableScanFunctionGetParamsSchema},
+		    {"catalog_table_scan_branches_get", &CatalogTableScanBranchesGetParamsSchema},
 		    {"catalog_table_insert_function_get", &CatalogTableInsertFunctionGetParamsSchema},
 		    {"catalog_table_update_function_get", &CatalogTableUpdateFunctionGetParamsSchema},
 		    {"catalog_table_delete_function_get", &CatalogTableDeleteFunctionGetParamsSchema},

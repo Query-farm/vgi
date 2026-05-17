@@ -26,6 +26,7 @@
 #include "duckdb/common/types/geometry.hpp"
 #include "duckdb/function/cast/cast_function_set.hpp"
 #include "query_farm_telemetry.hpp"
+#include "vgi_multi_scan_rewriter.hpp"
 #ifdef __EMSCRIPTEN__
 #include "vgi_wasm_async_pool.hpp"
 #endif
@@ -50,6 +51,7 @@
 #include "vgi_transport.hpp"
 #include "vgi_worker_pool.hpp"
 #include "vgi_table_statistics_function.hpp"
+#include "vgi_table_branches_function.hpp"
 #include "vgi_clear_cache.hpp"
 #include "vgi_worker_pool_functions.hpp"
 
@@ -1401,6 +1403,32 @@ static void LoadInternal(ExtensionLoader &loader) {
 	config.AddExtensionOption("vgi_join_keys_max_bytes",
 	                          "Max estimated byte size for join keys batch (skip pushdown if exceeded)",
 	                          LogicalType::UBIGINT, Value::UBIGINT(67108864)); // 64MB
+
+	// =========================================================================
+	// Multi-scan rewriter MUST register BEFORE VgiJoinOptimizer. Both are
+	// pre_optimize_function; they fire in registration order. The rewriter
+	// replaces the marker LogicalGet with a LogicalSetOperation(UNION_ALL,
+	// [LogicalGet(vgi_fn), ...]) — only after that swap do the inner
+	// LogicalGets carry `function == VgiTableFunctionScan`, which is what
+	// VgiJoinOptimizer's IsVgiScan() detects to raise the InFilter
+	// threshold. If JoinOptimizer ran first, it would walk the unrewritten
+	// plan, see only markers (function == MultiBranchMarkerExecute), and
+	// miss the join+VGI heuristic.
+	//
+	// Phase-split rationale (PRE-pushdown rewrite vs. POST-pushdown rewrite
+	// for buffered_table) is documented at the buffered_table registration
+	// site below. The multi-scan rewriter is intentionally pre-pushdown so
+	// that DuckDB's standard filter-pushdown distributes parent filters
+	// into each arm after we've produced LogicalSetOperation. =========================================
+	config.AddExtensionOption(
+	    "vgi_multi_branch_scans",
+	    "Rewrite VGI multi-branch table scans into LogicalSetOperation(UNION_ALL, ...) "
+	    "via the optimizer extension. Set to false to disable the rewrite — multi-branch "
+	    "table scans will then throw at execution time (the marker placeholder's loud-fail). "
+	    "Emergency-rollback knob; not generally useful.",
+	    LogicalType::BOOLEAN, Value::BOOLEAN(true));
+	vgi::RegisterVgiMultiScanRewriter(config);
+
 	OptimizerExtension::Register(config, VgiJoinOptimizer());
 
 	// Streaming-window optimizer rule: rewrite eligible LogicalWindow ->
@@ -1426,6 +1454,13 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "will then throw a clear InternalException instead of running.",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
 	OptimizerExtension::Register(config, VgiTableBufferingRewriter());
+
+	// VgiMultiScanRewriter is registered BEFORE VgiJoinOptimizer above —
+	// see the comment block at that site for ordering rationale. It's
+	// pre_optimize_function (rewrites into standard DuckDB operators that
+	// benefit from filter pushdown). VgiStreamingWindowOptimizer and
+	// VgiTableBufferingRewriter above are optimize_function (post-pushdown)
+	// because their LogicalExtensionOperator outputs are opaque to pushdown.
 
 	// Register worker pool settings
 	config.AddExtensionOption("vgi_worker_pool_idle_limit_seconds",
@@ -1491,6 +1526,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	// Register cache management function
 	vgi::RegisterVgiClearCacheFunction(loader);
+
+	// Register multi-branch diagnostic function — one row per branch per
+	// VGI table, across every attached VGI catalog. See vgi_table_branches_function.cpp.
+	vgi::RegisterVgiTableBranchesFunction(loader);
 
 	// Register OAuth diagnostic/management functions
 	{

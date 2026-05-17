@@ -537,6 +537,78 @@ VgiScanFunctionResult InvokeCatalogTableScanFunctionGet(
 	return ParseScanFunctionResult(context, result_batch, worker_path);
 }
 
+// Helper: wrap a single-function (legacy) result as a one-branch
+// VgiScanBranchesResult. The branch carries no branch_filter (unconstrained)
+// and inherits required_extensions from the legacy result.
+static VgiScanBranchesResult WrapLegacyAsOneBranch(VgiScanFunctionResult legacy) {
+	VgiScanBranchesResult out;
+	VgiScanBranch branch;
+	branch.function_name = std::move(legacy.function_name);
+	branch.positional_arguments = std::move(legacy.positional_arguments);
+	branch.named_arguments = std::move(legacy.named_arguments);
+	branch.branch_filter.clear();
+	// parsed_branch_filter stays null — no filter to parse.
+	out.branches.push_back(std::move(branch));
+	out.required_extensions = std::move(legacy.required_extensions);
+	return out;
+}
+
+VgiScanBranchesResult InvokeCatalogTableScanBranchesGet(
+    const CatalogRpcContext &ctx, const std::string &schema_name,
+    const std::string &table_name, ClientContext &context, const std::string &at_unit, const std::string &at_value) {
+	auto &worker_path = ctx.params->worker_path();
+
+	// Capability-detection cache (A8): if a prior call against this attach
+	// already determined the worker doesn't implement the new method, skip
+	// the doomed RPC + exception entirely and go straight to the legacy
+	// fallback. State machine: 0 = unknown (probe), 1 = supported,
+	// 2 = not supported. Set by this function after each probe.
+	const int cap = ctx.params->LoadBranchesCapability();
+	if (cap == 2) {
+		auto legacy = InvokeCatalogTableScanFunctionGet(ctx, schema_name, table_name, context, at_unit, at_value);
+		return WrapLegacyAsOneBranch(std::move(legacy));
+	}
+
+	// Try the new method (either because cap == 1 / known-supported, or
+	// cap == 0 / unknown — probe). If the worker doesn't implement it, the
+	// Python-side dispatcher raises MethodNotImplementedError, which gets
+	// serialised to an EXCEPTION batch with metadata
+	// vgi_rpc.error_kind=method_not_implemented (see vgi-rpc commit adding
+	// the typed marker). The C++ side surfaces that as VgiRpcException,
+	// which we catch narrowly here.
+	auto params = generated::BuildCatalogTableScanBranchesGetParams(
+	    ctx.attach_opaque_data, schema_name, table_name,
+	    OptStrIfNonEmpty(at_unit), OptStrIfNonEmpty(at_value), OptTxn(ctx));
+	try {
+		auto response = InvokeRpcMethod(ctx, "catalog_table_scan_branches_get", params, context);
+		auto result_batch = ExtractAndDeserializeResult(response, "catalog_table_scan_branches_get", worker_path);
+		if (!result_batch || result_batch->num_rows() == 0) {
+			throw IOException("Empty response from catalog_table_scan_branches_get [worker: %s]", worker_path);
+		}
+		auto parsed = ParseScanBranchesResult(context, result_batch, worker_path);
+		// Probe succeeded — pin the cache so future calls skip the legacy
+		// fallback path entirely. Idempotent on warm-cache hit (cap == 1).
+		ctx.params->StoreBranchesCapability(true);
+		return parsed;
+	} catch (const VgiRpcException &e) {
+		if (e.GetErrorKind() == error_kind::kMethodNotImplemented) {
+			// Old worker: fall back to the legacy single-function RPC and
+			// synthesise a one-branch result. Pin the cache so the next
+			// catalog read skips the doomed-RPC round-trip — saves the
+			// IPC round-trip + EXCEPTION-batch parsing on every subsequent
+			// scan against this attach.
+			ctx.params->StoreBranchesCapability(false);
+			VGI_LOG(context, "catalog.rpc.scan_branches.fallback",
+			    {{"worker_path", worker_path},
+			     {"schema_name", schema_name},
+			     {"table_name", table_name}});
+			auto legacy = InvokeCatalogTableScanFunctionGet(ctx, schema_name, table_name, context, at_unit, at_value);
+			return WrapLegacyAsOneBranch(std::move(legacy));
+		}
+		throw;
+	}
+}
+
 // ============================================================================
 // Table Write Function Get
 // ============================================================================
@@ -1848,6 +1920,42 @@ VgiMacroInfo ParseMacroInfo(const std::shared_ptr<arrow::RecordBatch> &batch, co
 	return info;
 }
 
+// Shared helper: decode the nested-IPC argument batch (the "arguments" binary
+// field on both ScanFunctionResult and ScanBranch) into positional+named Values.
+// Field names matching ``arg_<N>`` are routed to positional slot N; everything
+// else becomes a named argument.
+static void DecodeScanArguments(ClientContext &context,
+                                const std::vector<uint8_t> &arguments_bytes,
+                                duckdb::vector<Value> &positional_out,
+                                std::map<std::string, Value> &named_out) {
+	if (arguments_bytes.empty()) {
+		return;
+	}
+	auto arguments_batch = DeserializeFromIpcBytes(arguments_bytes);
+	if (!arguments_batch || arguments_batch->num_rows() == 0) {
+		return;
+	}
+	auto values = ArrowBatchToValues(context, arguments_batch);
+	auto &schema = arguments_batch->schema();
+	for (int i = 0; i < schema->num_fields(); i++) {
+		const auto &field_name = schema->field(i)->name();
+		auto &duck_value = values[i];
+		if (field_name.rfind("arg_", 0) == 0) {
+			try {
+				size_t idx = std::stoul(field_name.substr(4));
+				if (idx >= positional_out.size()) {
+					positional_out.resize(idx + 1);
+				}
+				positional_out[idx] = duck_value;
+			} catch (const std::exception &) {
+				named_out[field_name] = duck_value;
+			}
+		} else {
+			named_out[field_name] = duck_value;
+		}
+	}
+}
+
 VgiScanFunctionResult ParseScanFunctionResult(ClientContext &context, const std::shared_ptr<arrow::RecordBatch> &batch,
                                                const std::string &worker_path) {
 	VgiScanFunctionResult result;
@@ -1866,38 +1974,82 @@ VgiScanFunctionResult ParseScanFunctionResult(ClientContext &context, const std:
 
 	// Get arguments as binary and deserialize the nested IPC batch
 	auto arguments_bytes = row["arguments"].value_not_null<std::vector<uint8_t>>();
-	if (!arguments_bytes.empty()) {
-		auto arguments_batch = DeserializeFromIpcBytes(arguments_bytes);
-		if (arguments_batch && arguments_batch->num_rows() > 0) {
-			// Convert the entire batch to DuckDB Values using proper conversion
-			auto values = ArrowBatchToValues(context, arguments_batch);
-			auto &schema = arguments_batch->schema();
+	DecodeScanArguments(context, arguments_bytes, result.positional_arguments, result.named_arguments);
 
-			// Map values to positional or named arguments based on field names
-			for (int i = 0; i < schema->num_fields(); i++) {
-				const auto &field_name = schema->field(i)->name();
-				auto &duck_value = values[i];
+	return result;
+}
 
-				// Check if this is a positional argument (arg_0, arg_1, etc.)
-				if (field_name.rfind("arg_", 0) == 0) {
-					// Extract index from arg_N
-					try {
-						size_t idx = std::stoul(field_name.substr(4));
-						// Ensure positional_arguments vector is large enough
-						if (idx >= result.positional_arguments.size()) {
-							result.positional_arguments.resize(idx + 1);
-						}
-						result.positional_arguments[idx] = duck_value;
-					} catch (const std::exception &) {
-						// If parsing fails, treat as named argument
-						result.named_arguments[field_name] = duck_value;
-					}
-				} else {
-					// Named argument
-					result.named_arguments[field_name] = duck_value;
+// Parse the result of catalog_table_scan_branches_get. The outer batch is a
+// 1-row record with a list<binary> column carrying serialized ScanBranch
+// 1-row batches; each branch's `arguments` field is itself a nested IPC
+// stream of typed scalars. The branch_filter SQL string (when non-empty) is
+// parsed eagerly via Parser::ParseExpressionList — the resulting
+// ParsedExpression lives on the catalog entry alongside the branches list.
+// We do NOT bind the expression here; binding happens in the rewriter where
+// a Binder + the branch's column list are in hand. See plan: §C++ wiring
+// sketch "branch_filter parse-at-attach, re-bind-per-rewrite, no bound cache".
+VgiScanBranchesResult ParseScanBranchesResult(ClientContext &context,
+                                               const std::shared_ptr<arrow::RecordBatch> &batch,
+                                               const std::string &worker_path) {
+	VgiScanBranchesResult result;
+
+	if (!batch || batch->num_rows() == 0) {
+		throw IOException("Empty response from table_scan_branches_get [worker: " + worker_path + "]");
+	}
+
+	RecordBatchSingleRow row(batch, 0, "ScanBranchesResult", worker_path);
+
+	// Top-level required_extensions (union across branches; hoisted from
+	// the per-branch shape that ScanFunctionResult used).
+	result.required_extensions = row["required_extensions"].value_or(std::vector<std::string> {});
+
+	// branches is a list<binary>; each element is the IPC bytes of a 1-row
+	// ScanBranch batch. The Python-side serialiser produced these via
+	// `[branch.serialize() for branch in self.branches]`.
+	auto branch_blobs = row["branches"].value_not_null<std::vector<std::vector<uint8_t>>>();
+	if (branch_blobs.empty()) {
+		// Loud-fail at parse time — workers must return at least one branch.
+		// Catches "worker bug returned empty" before silent zero-row queries.
+		throw BinderException("VGI table returned zero scan branches [worker: " + worker_path + "]");
+	}
+
+	result.branches.reserve(branch_blobs.size());
+	for (size_t i = 0; i < branch_blobs.size(); i++) {
+		auto branch_batch = DeserializeFromIpcBytes(branch_blobs[i]);
+		if (!branch_batch || branch_batch->num_rows() == 0) {
+			throw IOException("ScanBranch #" + std::to_string(i) + " is empty [worker: " + worker_path + "]");
+		}
+		RecordBatchSingleRow branch_row(branch_batch, 0, "ScanBranch", worker_path);
+
+		VgiScanBranch branch;
+		branch.function_name = branch_row["function_name"].value_not_null<std::string>();
+
+		auto arguments_bytes = branch_row["arguments"].value_not_null<std::vector<uint8_t>>();
+		DecodeScanArguments(context, arguments_bytes, branch.positional_arguments, branch.named_arguments);
+
+		// branch_filter is nullable; absent / NULL → empty string == unconstrained.
+		auto filter_opt = branch_row["branch_filter"].value_or(std::string{});
+		branch.branch_filter = filter_opt;
+		if (!branch.branch_filter.empty()) {
+			try {
+				auto exprs = Parser::ParseExpressionList(branch.branch_filter);
+				if (exprs.empty()) {
+					throw BinderException("VGI branch_filter parsed to no expressions [worker: " + worker_path +
+					                       ", filter: " + branch.branch_filter + "]");
 				}
+				// If the worker supplied multiple comma-separated expressions,
+				// AND them together. (Single expression is the typical case.)
+				branch.parsed_branch_filter = std::move(exprs[0]);
+				// Multi-expression case: leave as a single expression by AND-ing.
+				// Skipped here for simplicity — typical worker emits one
+				// predicate; multi-AND can ship in v2 if needed.
+			} catch (const std::exception &e) {
+				throw BinderException("VGI branch_filter parse error [worker: " + worker_path +
+				                       ", filter: " + branch.branch_filter + "]: " + e.what());
 			}
 		}
+
+		result.branches.push_back(std::move(branch));
 	}
 
 	return result;

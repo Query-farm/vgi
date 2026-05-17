@@ -1,0 +1,183 @@
+# name: test/sql/integration/catalog/multi_branch_scan.test
+# description: End-to-end test for VGI multi-branch table scans. Covers
+#              union semantics, plan shape, branch_filter pruning, and the
+#              vgi_multi_branch_scans rollback knob. Exercises the
+#              Phase A+B+C stack: typed RPC, catalog wiring, optimizer rewriter.
+# group: [vgi_integration_catalog]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# Basic union semantics: two arms each calling sequence(50). Total rows = 100.
+# ============================================================================
+
+query I
+SELECT count(*) FROM example.data.multi_branch_numbers;
+----
+100
+
+# Both arms produce rows in [0, 49]; union should span that range.
+query II
+SELECT min(n), max(n) FROM example.data.multi_branch_numbers;
+----
+0	49
+
+# Distinct value count = 50 (each value appears twice — once per arm).
+query II
+SELECT count(DISTINCT n), count(*) FROM example.data.multi_branch_numbers;
+----
+50	100
+
+# ============================================================================
+# branch_filter pruning: complementary filters (n < 50 / n >= 50) carve the
+# value range in half. Total rows = 100 (50 per arm after filtering).
+# ============================================================================
+
+query I
+SELECT count(*) FROM example.data.multi_branch_filtered_numbers;
+----
+100
+
+# Both arms each see sequence(100) but their branch_filter trims to half.
+query II
+SELECT min(n), max(n) FROM example.data.multi_branch_filtered_numbers;
+----
+0	99
+
+# Distinct count = 100 (no overlap — branch_filters are complementary).
+query II
+SELECT count(DISTINCT n), count(*) FROM example.data.multi_branch_filtered_numbers;
+----
+100	100
+
+# User filter `n > 75` is satisfiable only by the `n >= 50` arm. The
+# `n < 50` arm's branch_filter is unsatisfiable in conjunction, so the
+# optimizer eliminates it. Only the surviving arm's rows surface.
+query III
+SELECT count(*), min(n), max(n)
+FROM example.data.multi_branch_filtered_numbers
+WHERE n > 75;
+----
+24	76	99
+
+# Filter on the opposite half — only the `n < 50` arm contributes.
+query III
+SELECT count(*), min(n), max(n)
+FROM example.data.multi_branch_filtered_numbers
+WHERE n < 25;
+----
+25	0	24
+
+# ============================================================================
+# Rollback knob: vgi_multi_branch_scans=false refuses multi-branch tables
+# at bind time with a clear BinderException. Loud, deterministic, observable.
+# ============================================================================
+
+statement ok
+SET vgi_multi_branch_scans = false;
+
+statement error
+SELECT count(*) FROM example.data.multi_branch_numbers;
+----
+Multi-branch VGI table scan disabled via vgi_multi_branch_scans=false
+
+# Restore default so subsequent tests in the same session aren't broken.
+statement ok
+SET vgi_multi_branch_scans = true;
+
+query I
+SELECT count(*) FROM example.data.multi_branch_numbers;
+----
+100
+
+# ============================================================================
+# branch_filter scope-enforcement: workers can declare overlapping ranges
+# via misdeclared branch_filters. v1.0 contract: failure mode is duplicate
+# rows or missing rows, never silent corruption. The fixture's filtered
+# table uses complementary filters, so distinct count == total count
+# (asserted above). If the filters were overlapping, distinct < total.
+# ============================================================================
+
+# ============================================================================
+# B2 guard: AT (...) clauses are refused on multi-branch tables. v1
+# contract — multi-branch tables don't honour time travel because each arm
+# may interpret AT differently. Single-branch tables continue to honour AT
+# (verified by test/sql/integration/table/time_travel.test).
+# ============================================================================
+
+statement error
+SELECT * FROM example.data.multi_branch_numbers AT (VERSION => 1);
+----
+AT (...) clauses are not supported on multi-branch VGI tables
+
+statement error
+SELECT * FROM example.data.multi_branch_filtered_numbers AT (TIMESTAMP => '2026-01-01');
+----
+AT (...) clauses are not supported on multi-branch VGI tables
+
+# ============================================================================
+# Read-only catalog also refuses writes. ExampleCatalog is read-only, so
+# INSERT/UPDATE/DELETE refuse at the catalog-level guard before reaching
+# VgiPhysicalInsert's multi-branch check. The B3 multi-branch refusal
+# itself only fires for writable catalogs that contain a multi-branch
+# table — see vgi_physical_write.cpp's RefuseWriteIfMultiBranch.
+# v1 contract is satisfied either way: writes against multi-branch tables
+# fail loud at bind time. The read-only path is exercised here; the B3
+# path requires a separate writable-catalog fixture (Phase D2).
+# ============================================================================
+
+statement error
+INSERT INTO example.data.multi_branch_numbers VALUES (42);
+----
+does not support INSERT
+
+statement error
+DELETE FROM example.data.multi_branch_numbers WHERE n = 0;
+----
+Can only delete from base table
+
+statement error
+UPDATE example.data.multi_branch_numbers SET n = 99 WHERE n = 0;
+----
+Binder Error
+
+# ============================================================================
+# Diagnostic function: vgi_table_branches() surfaces the protocol shape.
+# Single-branch tables get one row; multi-branch tables get N rows.
+# ============================================================================
+
+# multi_branch_numbers has two branches with no filter.
+query III
+SELECT branch_index, function_name, branch_filter
+FROM vgi_table_branches()
+WHERE table_name = 'multi_branch_numbers'
+ORDER BY branch_index;
+----
+0	sequence	NULL
+1	sequence	NULL
+
+# multi_branch_filtered_numbers has two branches with complementary filters.
+query III
+SELECT branch_index, function_name, branch_filter
+FROM vgi_table_branches()
+WHERE table_name = 'multi_branch_filtered_numbers'
+ORDER BY branch_index;
+----
+0	sequence	n < 50
+1	sequence	n >= 50
+
+# Single-branch tables surface as exactly one row with branch_index=0 and
+# NULL branch_filter. The default-impl shim wraps the legacy result.
+query III
+SELECT branch_index, function_name, branch_filter
+FROM vgi_table_branches()
+WHERE table_name = 'numbers';
+----
+0	sequence	NULL

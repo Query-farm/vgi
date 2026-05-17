@@ -1,0 +1,100 @@
+# name: test/sql/integration/catalog/multi_branch_join_optimizer.test
+# description: E2 — VgiJoinOptimizer must see through the multi-branch rewrite.
+#              When a multi-branch VGI table is on the probe side of a hash join,
+#              the InFilter threshold must still be raised so join keys push into
+#              the VGI arms of the union. Requires VgiMultiScanRewriter to register
+#              BEFORE VgiJoinOptimizer so the rewrite has happened by the time
+#              HasJoinWithVgiScan walks the plan looking for VgiTableFunctionScan.
+# group: [vgi_integration_catalog]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require parquet
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# Setup: 200 sparse local keys (not a dense range — DuckDB needs an InFilter
+# rather than a min/max range filter, so the threshold gating matters).
+# ============================================================================
+
+statement ok
+CREATE TEMP TABLE large_keys AS SELECT * FROM generate_series(0, 999, 5) t(id);
+
+# ============================================================================
+# Join correctness against a multi-branch table.
+#
+# multi_branch_numbers is UNION ALL of sequence(50) + sequence(50). Each arm
+# emits n = 0..49 (twice in the union — once per arm). Joining against 200
+# keys (0, 5, 10, ..., 995) gives 10 matches per arm × 2 arms = 20 rows.
+# ============================================================================
+
+query I
+SELECT COUNT(*) FROM large_keys l JOIN example.data.multi_branch_numbers m ON l.id = m.n;
+----
+20
+
+# Value range — only matches in [0, 49] (where the sequence arms produce data).
+query II
+SELECT MIN(m.n), MAX(m.n) FROM large_keys l JOIN example.data.multi_branch_numbers m ON l.id = m.n;
+----
+0	45
+
+# ============================================================================
+# Threshold-raise: the JoinOptimizer must detect the post-rewrite plan
+# contains a VGI scan inside the LogicalSetOperation and raise the threshold
+# to at least vgi_join_keys_limit. Reset the threshold to a low value first
+# to make the raise observable.
+# ============================================================================
+
+statement ok
+RESET dynamic_or_filter_threshold;
+
+# Run the multi-branch join — this triggers the optimizer.
+statement ok
+SELECT COUNT(*) FROM large_keys l JOIN example.data.multi_branch_numbers m ON l.id = m.n;
+
+# Assert the threshold was raised to vgi_join_keys_limit (default 100000).
+# If JoinOptimizer ran BEFORE the rewriter, it would have walked the unrewritten
+# plan, seen only the marker (function != VgiTableFunctionScan), and left the
+# threshold alone. Asserting it WAS raised proves the rewriter runs first.
+query I
+SELECT CURRENT_SETTING('dynamic_or_filter_threshold')::BIGINT;
+----
+100000
+
+# ============================================================================
+# Threshold-raise with the heterogeneous multi-branch (one VGI arm + one
+# read_parquet arm). At least one arm post-rewrite is a VGI scan, so the
+# threshold still raises.
+# ============================================================================
+
+statement ok
+COPY (SELECT range AS n FROM range(50, 100))
+     TO '/tmp/vgi_hetero_branch.parquet' (FORMAT 'parquet');
+
+statement ok
+RESET dynamic_or_filter_threshold;
+
+statement ok
+SELECT COUNT(*) FROM large_keys l JOIN example.data.multi_branch_hetero m ON l.id = m.n;
+
+query I
+SELECT CURRENT_SETTING('dynamic_or_filter_threshold')::BIGINT;
+----
+100000
+
+# Correctness check: large_keys covers 0..995 step 5; multi_branch_hetero
+# covers 0..99 distinct. Matches at l.id ∈ {0, 5, 10, ..., 95} → 20 rows.
+query I
+SELECT COUNT(*) FROM large_keys l JOIN example.data.multi_branch_hetero m ON l.id = m.n;
+----
+20
+
+statement ok
+DROP TABLE large_keys;

@@ -44,6 +44,14 @@ public:
 		return catalog_;
 	}
 
+	// Fetch the scan branches for this table via a fresh RPC. NOT cached
+	// because branches can vary with AT(...) clauses — the same logical
+	// table may resolve to different function names / args at different
+	// versions (see test/sql/integration/table/time_travel.test).
+	// at_unit/at_value are empty strings for non-time-travel binds.
+	vgi::VgiScanBranchesResult FetchScanBranches(ClientContext &context, const std::string &at_unit,
+	                                              const std::string &at_value);
+
 private:
 	TableFunction GetScanFunctionImpl(ClientContext &context, unique_ptr<FunctionData> &bind_data,
 	                                  const string &at_unit, const string &at_value);
@@ -60,6 +68,9 @@ private:
 	vgi::VgiTableInfo table_info_;
 	Catalog &catalog_;
 	LogicalType rowid_type_ = LogicalType::INVALID;
+
+	// No persistent branches_ cache — fetched fresh per scan via
+	// FetchScanBranches so AT (...) variants resolve correctly.
 
 	// Column statistics cache: lazy-fetched via RPC, TTL-based expiry, thread-safe.
 	// Mutable because GetStatistics() is const in the DuckDB interface but we

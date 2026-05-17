@@ -1,0 +1,93 @@
+# name: test/sql/integration/catalog/multi_branch_heterogeneous.test
+# description: Heterogeneous multi-branch: one VGI worker arm + one native
+#              read_parquet arm under the same logical table. Validates D4 of
+#              the multi-branch design — cold-tier data comes from any DuckDB
+#              function the worker names, without tunneling through the
+#              worker pipe.
+# group: [vgi_integration_catalog]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require parquet
+
+require httpfs
+
+# ============================================================================
+# Setup: create the parquet file the heterogeneous fixture references. The
+# fixture's table_scan_branches_get returns read_parquet('/tmp/vgi_hetero_branch.parquet')
+# as branch 1, so this file must exist before any scan-bind happens.
+# ============================================================================
+
+statement ok
+COPY (SELECT range AS n FROM range(50, 100))
+    TO '/tmp/vgi_hetero_branch.parquet' (FORMAT 'parquet');
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# Union semantics: VGI sequence(50) produces 0..49, parquet produces 50..99.
+# No overlap; union is 100 distinct rows spanning the full range.
+# ============================================================================
+
+query I
+SELECT count(*) FROM example.data.multi_branch_hetero;
+----
+100
+
+query II
+SELECT min(n), max(n) FROM example.data.multi_branch_hetero;
+----
+0	99
+
+# Distinct count = 100 (each value appears exactly once across the union).
+query II
+SELECT count(DISTINCT n), count(*) FROM example.data.multi_branch_hetero;
+----
+100	100
+
+# ============================================================================
+# Diagnostic surfaces the heterogeneous shape — different function_names per
+# branch, both pointing at the same logical table.
+# ============================================================================
+
+query III
+SELECT branch_index, function_name, branch_filter
+FROM vgi_table_branches()
+WHERE table_name = 'multi_branch_hetero'
+ORDER BY branch_index;
+----
+0	sequence	NULL
+1	read_parquet	NULL
+
+# ============================================================================
+# Filter pushdown into the parquet arm: `WHERE n >= 60` reaches read_parquet
+# as a row-group prune. Only rows in [60, 99] surface from the parquet arm;
+# the VGI arm contributes [0, 49] minus the filter (empty after n >= 60).
+# Total = 40 rows (60..99).
+# ============================================================================
+
+query III
+SELECT count(*), min(n), max(n)
+FROM example.data.multi_branch_hetero
+WHERE n >= 60;
+----
+40	60	99
+
+# Filter `n < 20` cuts the parquet arm to zero (parquet has only n >= 50);
+# only the VGI arm contributes [0, 19]. Total = 20 rows.
+query III
+SELECT count(*), min(n), max(n)
+FROM example.data.multi_branch_hetero
+WHERE n < 20;
+----
+20	0	19
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+SET vgi_multi_branch_scans = true;

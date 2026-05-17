@@ -67,10 +67,13 @@ SELECT COUNT(*) = 0 FROM duckdb_logs() WHERE type = 'VGI'
 ----
 true
 
-# The legacy RPC must fire at least once.
+# After Phase C, the new catalog_table_scan_branches_get supersedes the
+# legacy catalog_table_scan_function_get when the worker supports both
+# (fixture worker does — see vgi-python's worker.py override). Assert the
+# new RPC is the one that fires for non-inlined tables.
 query I
 SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI'
-  AND message LIKE '%catalog_table_scan_function_get%'
+  AND message LIKE '%catalog_table_scan_branches_get%'
   AND message LIKE '%numbers%';
 ----
 true

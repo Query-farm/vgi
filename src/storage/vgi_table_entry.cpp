@@ -12,6 +12,7 @@
 #include "storage/vgi_transaction.hpp"
 #include "vgi_catalog_api.hpp"
 #include "vgi_logging.hpp"
+#include "vgi_multi_scan_rewriter.hpp"
 #include "vgi_table_function_impl.hpp"
 #include "vgi_worker_pool.hpp"
 
@@ -286,29 +287,131 @@ TableFunction VgiTableEntry::GetScanFunction(ClientContext &context, unique_ptr<
 	return GetScanFunctionImpl(context, bind_data, at_unit, at_value);
 }
 
+vgi::VgiScanBranchesResult VgiTableEntry::FetchScanBranches(ClientContext &context, const std::string &at_unit,
+                                                              const std::string &at_value) {
+	// Fresh RPC per call. branches[] can vary with AT(...) — e.g.,
+	// versioned_data tables return different function args per version.
+	// Capability cache on VgiAttachParameters (A8) avoids the doomed-RPC
+	// round-trip on workers that don't implement the new method.
+	auto &vgi_catalog = catalog_.Cast<VgiCatalog>();
+	auto &attach_params = vgi_catalog.attach_parameters();
+	auto &attach_result = vgi_catalog.attach_result();
+	auto &vgi_tx_scan = VgiTransaction::Get(context, catalog_);
+	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_opaque_data,
+	                                vgi_tx_scan.GetTransactionOpaqueData()};
+	rpc_ctx.entity_kind = "table";
+	rpc_ctx.entity_qualifier = ParentSchema().name + "." + name;
+	return vgi::InvokeCatalogTableScanBranchesGet(rpc_ctx, ParentSchema().name, name, context, at_unit, at_value);
+}
+
 TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_ptr<FunctionData> &bind_data,
                                                   const string &at_unit, const string &at_value) {
 	auto &vgi_catalog = catalog_.Cast<VgiCatalog>();
 	auto &attach_params = vgi_catalog.attach_parameters();
 	auto &attach_result = vgi_catalog.attach_result();
 
-	// Use the inlined scan_function carried on TableInfo when present, else
-	// fall back to the per-bind RPC. Workers opt in by populating
-	// ``TableInfo.scan_function`` in their catalog_table_get / schema_contents
-	// responses; this skips a 50–80ms RTT per bind on remote HTTP transports.
+	// Resolve the scan-function shape. Three paths in priority order:
+	//   1. Inlined ``table_info_.scan_function`` (legacy single-branch
+	//      pre-shipped path) — saves the per-bind RPC on HTTP transports.
+	//   2. Already-loaded ``branches_`` cache from a prior call (lazy load).
+	//   3. RPC: InvokeCatalogTableScanBranchesGet (probes the new multi-
+	//      branch method, transparently falls back to the legacy
+	//      single-function RPC for old workers).
+	//
+	// Multi-branch tables (branches.size() > 1) require the optimizer
+	// rewriter to stitch arms together via LogicalSetOperation(UNION_ALL,
+	// ...). That rewriter ships in Phase C — until then, multi-branch
+	// returns surface a NotImplementedException loud-fail so the design
+	// is observable without the rewriter shipping.
 	vgi::VgiScanFunctionResult scan_result;
+	bool used_inline = false;
 	if (table_info_.scan_function.has_value()) {
 		scan_result = *table_info_.scan_function;
+		used_inline = true;
 		VGI_LOG(context, "vgi.scan_function.inlined",
 		        {{"schema", ParentSchema().name}, {"table", name}, {"function", scan_result.function_name}});
 	} else {
-		auto &vgi_tx_scan = VgiTransaction::Get(context, catalog_);
-		vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_opaque_data, vgi_tx_scan.GetTransactionOpaqueData()};
-		rpc_ctx.entity_kind = "table";
-		rpc_ctx.entity_qualifier = ParentSchema().name + "." + name;
-		scan_result = vgi::InvokeCatalogTableScanFunctionGet(rpc_ctx, ParentSchema().name, name, context,
-		                                                      at_unit, at_value);
+		// Fetch branches fresh — branches[] varies with AT (e.g. versioned_data
+		// returns different args per VERSION). Capability cache on the attach
+		// params avoids the doomed-RPC round-trip on workers without the new
+		// method.
+		auto branches_result = FetchScanBranches(context, at_unit, at_value);
+
+		// B2 (Phase B): refuse AT (...) on multi-branch tables with a
+		// BinderException at bind time, so the rewriter never sees an AT
+		// clause it can't honour. Single-branch tables still honour AT
+		// (the branches.size() == 1 path threads at_unit/at_value into the
+		// branch's scan-function call exactly as the legacy code did).
+		if (!at_unit.empty() && branches_result.branches.size() > 1) {
+			throw BinderException(
+			    "AT (...) clauses are not supported on multi-branch VGI tables. "
+			    "Query a specific branch's underlying function directly. "
+			    "[table: %s.%s, branches: %d]",
+			    ParentSchema().name, name, static_cast<int>(branches_result.branches.size()));
+		}
+
+		if (branches_result.branches.size() > 1) {
+			// Multi-branch path. Up-front check of the rollback knob — if
+			// the rewriter is disabled, refuse here with a clear
+			// BinderException rather than returning the marker and reaching
+			// the internal-error safety net at execute time.
+			Value mb_enabled;
+			if (!context.TryGetCurrentSetting("vgi_multi_branch_scans", mb_enabled) ||
+			    mb_enabled.IsNull() || !mb_enabled.GetValue<bool>()) {
+				throw BinderException(
+				    "Multi-branch VGI table scan disabled via vgi_multi_branch_scans=false. "
+				    "Re-enable the setting or query a specific branch directly. "
+				    "[table: %s.%s, branches: %d]",
+				    ParentSchema().name, name,
+				    static_cast<int>(branches_result.branches.size()));
+			}
+
+			// Return the marker placeholder TableFunction. VgiMultiScanRewriter
+			// (pre_optimize_function in vgi_extension.cpp) detects the marker
+			// bind_data and rewrites the LogicalGet into a LogicalSetOperation
+			// (UNION_ALL, ...) with one arm per branch. The marker's execute
+			// callback throws InternalException — if execution reaches it,
+			// the rewriter failed to fire despite being enabled, which IS a bug.
+			auto marker_bd = make_uniq<vgi::VgiMultiBranchMarkerBindData>();
+			marker_bd->branches = std::move(branches_result.branches);
+			marker_bd->required_extensions = std::move(branches_result.required_extensions);
+			marker_bd->table_catalog_name = catalog_.GetName();
+			marker_bd->table_schema_name = ParentSchema().name;
+			marker_bd->default_schema = attach_result->default_schema;
+			// Canonical column list comes from the table's declared columns
+			// (GetColumns() inherited from TableCatalogEntry). The rewriter's
+			// per-arm projection layer reorders each branch's raw output to
+			// match this order (by name) and NULL-fills missing canonicals.
+			const auto &cols = GetColumns();
+			marker_bd->canonical_column_names.reserve(cols.LogicalColumnCount());
+			marker_bd->canonical_column_types.reserve(cols.LogicalColumnCount());
+			for (auto &col : cols.Logical()) {
+				marker_bd->canonical_column_names.push_back(col.Name());
+				marker_bd->canonical_column_types.push_back(col.Type());
+			}
+
+			VGI_LOG(context, "vgi.multi_scan.marker_returned",
+			        {{"schema", ParentSchema().name},
+			         {"table", name},
+			         {"branches", std::to_string(marker_bd->branches.size())}});
+
+			bind_data = std::move(marker_bd);
+			return vgi::MakeMultiBranchMarkerFunction();
+		}
+
+		// Single-branch path: project branches[0] back into the legacy
+		// ScanFunctionResult shape so the rest of this function (extension
+		// auto-load, function-catalog lookup, pushdown capability discovery,
+		// bind-data construction) keeps working unchanged.
+		auto &branch = branches_result.branches[0];
+		scan_result.function_name = std::move(branch.function_name);
+		scan_result.positional_arguments = std::move(branch.positional_arguments);
+		scan_result.named_arguments = std::move(branch.named_arguments);
+		// required_extensions hoisted to the top-level ScanBranchesResult;
+		// thread it back into scan_result so the auto-load loop below works.
+		scan_result.required_extensions = std::move(branches_result.required_extensions);
 	}
+	(void)used_inline; // tag for future per-path metrics
 
 	// Load any required extensions before scanning
 	for (auto &ext : scan_result.required_extensions) {

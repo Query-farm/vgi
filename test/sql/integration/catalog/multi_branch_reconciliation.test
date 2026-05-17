@@ -1,0 +1,109 @@
+# name: test/sql/integration/catalog/multi_branch_reconciliation.test
+# description: D5 — column reconciliation by name (not position) with NULL-fill
+#              for missing canonical columns. Validates that the rewriter's
+#              per-arm LogicalProjection correctly aligns columns across
+#              heterogeneous arm schemas.
+# group: [vgi_integration_catalog]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require parquet
+
+require httpfs
+
+# ============================================================================
+# Setup: three parquet files with deliberately different column shapes.
+# Canonical schema is (a BIGINT, b BIGINT).
+#   File 1: (a, b) — columns in canonical order.
+#   File 2: (b, a) — same columns, REVERSED order. Rewriter must align by
+#                    name; positional union would swap the data.
+#   File 3: (a)    — only one canonical column. The b column NULL-fills
+#                    for these rows.
+# ============================================================================
+
+statement ok
+COPY (SELECT * FROM (VALUES (1, 10), (2, 20), (3, 30)) AS t(a, b))
+     TO '/tmp/vgi_recon_a_b.parquet' (FORMAT 'parquet');
+
+statement ok
+COPY (SELECT * FROM (VALUES (40, 4), (50, 5), (60, 6)) AS t(b, a))
+     TO '/tmp/vgi_recon_b_a.parquet' (FORMAT 'parquet');
+
+statement ok
+COPY (SELECT * FROM (VALUES (7), (8), (9)) AS t(a))
+     TO '/tmp/vgi_recon_a_only.parquet' (FORMAT 'parquet');
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# Aggregate sanity: 9 rows total (3 per branch), distinct a-values cover
+# 1..9, b is NULL for the 3 rows from the a-only branch.
+# ============================================================================
+
+query I
+SELECT count(*) FROM example.data.multi_branch_recon;
+----
+9
+
+query II
+SELECT count(DISTINCT a), count(*) FROM example.data.multi_branch_recon;
+----
+9	9
+
+# NULL-fill count: branch 3 contributes 3 rows with b=NULL.
+query I
+SELECT count(*) FROM example.data.multi_branch_recon WHERE b IS NULL;
+----
+3
+
+query I
+SELECT count(*) FROM example.data.multi_branch_recon WHERE b IS NOT NULL;
+----
+6
+
+# ============================================================================
+# By-NAME alignment proof. If the rewriter had used POSITIONAL alignment
+# instead, branch 2's (b, a) data would surface as a=b's-data, b=a's-data.
+# After by-name alignment, every row satisfies the invariant
+# `b = a * 10` (since branches 1 & 2 use that pairing) for the 6 rows that
+# have a non-NULL b. Branch 3 contributes (7..9, NULL).
+# ============================================================================
+
+query I
+SELECT count(*)
+FROM example.data.multi_branch_recon
+WHERE b IS NOT NULL AND b != a * 10;
+----
+0
+
+# Full ordered output. NULL goes last for deterministic rendering.
+query II
+SELECT a, b FROM example.data.multi_branch_recon ORDER BY a, b NULLS LAST;
+----
+1	10
+2	20
+3	30
+4	40
+5	50
+6	60
+7	NULL
+8	NULL
+9	NULL
+
+# ============================================================================
+# Diagnostic surfaces all three branches with the same function_name
+# (read_parquet) but different paths. branch_filter is NULL on all three.
+# ============================================================================
+
+query II
+SELECT branch_index, function_name
+FROM vgi_table_branches()
+WHERE table_name = 'multi_branch_recon'
+ORDER BY branch_index;
+----
+0	read_parquet
+1	read_parquet
+2	read_parquet

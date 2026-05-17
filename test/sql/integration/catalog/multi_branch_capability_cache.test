@@ -1,0 +1,75 @@
+# name: test/sql/integration/catalog/multi_branch_capability_cache.test
+# description: E5 — capability-detection cache pins the worker's support for
+#              catalog_table_scan_branches_get. With a worker that DOES support
+#              the new method, the legacy catalog_table_scan_function_get RPC
+#              must never fire (the cache stays at "supported" and routes
+#              every catalog read through the new method).
+# group: [vgi_integration_catalog]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+SET enable_logging=true;
+
+statement ok
+SET enabled_log_types='VGI';
+
+# ============================================================================
+# Issue several scan queries against tables in the same VGI catalog. The
+# fixture worker implements catalog_table_scan_branches_get, so every query
+# should route through the new method. The capability cache (A8) ensures
+# subsequent queries don't reprobe.
+# ============================================================================
+
+statement ok
+SELECT count(*) FROM example.data.numbers;
+
+statement ok
+SELECT count(*) FROM example.data.multi_branch_numbers;
+
+statement ok
+SELECT count(*) FROM example.data.multi_branch_filtered_numbers;
+
+statement ok
+SELECT count(*) FROM example.data.numbers;
+
+# ============================================================================
+# Assert via duckdb_logs() that catalog_table_scan_branches_get fired and
+# catalog_table_scan_function_get did NOT. The legacy method only fires
+# when the cache hits state-2 (worker doesn't support new method), which
+# shouldn't happen against this fixture.
+# ============================================================================
+
+query I
+SELECT COUNT(*) >= 1 FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND message LIKE '%catalog_table_scan_branches_get%';
+----
+true
+
+query I
+SELECT COUNT(*) FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND message LIKE '%catalog_table_scan_function_get%';
+----
+0
+
+# Also assert the fallback-event log is never emitted — that event only
+# fires when we catch MethodNotImplementedError, which a compliant worker
+# never raises.
+query I
+SELECT COUNT(*) FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND message LIKE '%catalog.rpc.scan_branches.fallback%';
+----
+0
+
+statement ok
+SET enable_logging=false;

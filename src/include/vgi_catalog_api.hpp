@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -16,6 +17,7 @@
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/function/aggregate_state.hpp"
 #include "duckdb/function/function.hpp"
+#include "duckdb/parser/parsed_expression.hpp"
 #include "duckdb/storage/statistics/base_statistics.hpp"
 #include "vgi_rpc_types.hpp"
 
@@ -173,6 +175,22 @@ struct VgiAttachParameters {
 		return launcher_state_dir_;
 	}
 
+public:
+	// Capability cache for the new catalog_table_scan_branches_get RPC.
+	// Tri-state: 0 = unknown (probe), 1 = supported, 2 = not supported.
+	// Set by InvokeCatalogTableScanBranchesGet after the first call against
+	// this attach: on success → 1, on MethodNotImplemented fallback → 2.
+	// Subsequent calls short-circuit straight to the legacy RPC when the
+	// state is 2, avoiding a per-call round-trip-and-throw. Atomic for
+	// lock-free reads on the hot path; benign races (two threads probing
+	// once each before the cache settles) are acceptable.
+	int LoadBranchesCapability() const noexcept {
+		return branches_capability_.load(std::memory_order_relaxed);
+	}
+	void StoreBranchesCapability(bool supported) const noexcept {
+		branches_capability_.store(supported ? 1 : 2, std::memory_order_relaxed);
+	}
+
 private:
 	std::string worker_path_;
 	std::string catalog_name_;
@@ -188,6 +206,9 @@ private:
 	// See GetOrInitHttpParams above for the rationale behind caching these.
 	mutable std::mutex http_params_mutex_;
 	mutable std::shared_ptr<HTTPParams> cached_http_params_;
+
+	// Capability cache for catalog_table_scan_branches_get. See accessors above.
+	mutable std::atomic<int> branches_capability_{0};
 };
 
 // Bundles all catalog state needed for an RPC call.
@@ -297,6 +318,34 @@ struct VgiScanFunctionResult {
 	duckdb::vector<Value> positional_arguments;             // Positional arguments for the function
 	std::map<std::string, Value> named_arguments;           // Named arguments for the function
 	std::vector<std::string> required_extensions;           // Extensions to load before calling
+};
+
+// One physical-source branch within a multi-branch table. The C++ rewriter
+// (VgiMultiScanRewriter, pre_optimize_function) constructs a LogicalGet per
+// branch and stitches them under a LogicalSetOperation(UNION_ALL, ...).
+// `branch_filter` is the raw SQL expression text (parsed at catalog-load,
+// re-bound per rewrite) that the rewriter AND's into the branch's scan
+// before pushdown.
+struct VgiScanBranch {
+	std::string function_name;                              // e.g. "vgi_table_function", "iceberg_scan", "read_parquet"
+	duckdb::vector<Value> positional_arguments;
+	std::map<std::string, Value> named_arguments;
+	std::string branch_filter;                              // Empty == unconstrained
+	// Cached after first parse at catalog-load. NOT bound — re-binding from
+	// the parsed form happens at every rewriter invocation so schema drift
+	// across ATTACH/DETACH / vgi_clear_cache() doesn't corrupt cached
+	// column bindings. Empty when branch_filter is empty or parsing failed.
+	// See plan: §C++ wiring sketch "branch_filter parse-at-attach, ..." bullet.
+	duckdb::unique_ptr<ParsedExpression> parsed_branch_filter;
+};
+
+// Result of the new catalog_table_scan_branches_get RPC. New-protocol shape;
+// the legacy single-function path stays at VgiScanFunctionResult so old
+// workers continue to work via the typed-catch fallback in
+// InvokeCatalogTableScanBranchesGet.
+struct VgiScanBranchesResult {
+	std::vector<VgiScanBranch> branches;                    // One or more; empty list is loud-rejected at parse
+	std::vector<std::string> required_extensions;           // Union across all branches
 };
 
 // Table metadata from the worker
@@ -704,6 +753,22 @@ VgiScanFunctionResult InvokeCatalogTableScanFunctionGet(
     const CatalogRpcContext &ctx, const std::string &schema_name,
     const std::string &table_name, ClientContext &context, const std::string &at_unit,
     const std::string &at_value);
+
+// Invoke catalog_table_scan_branches_get: new-protocol multi-branch dispatch.
+// Tries the new method first; on MethodNotImplemented falls back to
+// InvokeCatalogTableScanFunctionGet and synthesises a one-branch result.
+// All other exceptions propagate. See A7 in the plan.
+VgiScanBranchesResult InvokeCatalogTableScanBranchesGet(
+    const CatalogRpcContext &ctx, const std::string &schema_name,
+    const std::string &table_name, ClientContext &context, const std::string &at_unit,
+    const std::string &at_value);
+
+// Parse a ScanBranchesResult RecordBatch into the in-memory C++ struct.
+// Loud-rejects empty branches lists and surfaces parse errors on
+// branch_filter expressions as BinderException.
+VgiScanBranchesResult ParseScanBranchesResult(ClientContext &context,
+                                                const std::shared_ptr<arrow::RecordBatch> &batch,
+                                                const std::string &worker_path);
 
 // Write function discovery uses the same result type as scan function discovery.
 using VgiWriteFunctionResult = VgiScanFunctionResult;

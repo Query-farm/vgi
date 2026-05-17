@@ -75,18 +75,57 @@ template <typename... ARGS>
 	throw IOException(extra_info, full_msg);
 }
 
-// Throw an InvalidInputException for user-code exceptions bubbling out of worker
-// Python code. This is distinct from IOException (transport failures) so that
-// retry logic in InvokePooledUnaryRpc does NOT retry user-code errors —
-// retrying them on a fresh worker is unsafe for stateful operations (the fresh
-// worker has no state populated by previous update/combine calls) and also
-// masks the real user-code error behind a silent NULL result.
+// Typed VGI RPC exception subclass — adds an `error_kind` field that callers
+// can inspect at catch time without parsing the message text.
+//
+// `error_kind` is an open-enum string token mirrored from the
+// `vgi_rpc.error_kind` metadata key on EXCEPTION-level batches (see
+// vgi-rpc Python's metadata.ERROR_KIND_KEY). Empty string when the worker
+// did not advertise a kind.
+//
+// Subclass of InvalidInputException so:
+//   1. Existing `catch (const InvalidInputException &)` callers in the
+//      retry-suppression path keep working unchanged.
+//   2. Callers that DO want to pattern-match (e.g. capability-detection
+//      fallback) catch `const VgiRpcException &` and read `GetErrorKind()`.
+class VgiRpcException : public InvalidInputException {
+public:
+	VgiRpcException(const std::unordered_map<std::string, std::string> &extra_info,
+	                const std::string &msg, std::string error_kind)
+	    : InvalidInputException(extra_info, msg), error_kind_(std::move(error_kind)) {
+	}
+
+	const std::string &GetErrorKind() const noexcept {
+		return error_kind_;
+	}
+
+private:
+	std::string error_kind_;
+};
+
+// Throw an InvalidInputException (or VgiRpcException if `error_kind` is set)
+// for user-code exceptions bubbling out of worker Python code. This is distinct
+// from IOException (transport failures) so that retry logic in
+// InvokePooledUnaryRpc does NOT retry user-code errors — retrying them on a
+// fresh worker is unsafe for stateful operations (the fresh worker has no
+// state populated by previous update/combine calls) and also masks the real
+// user-code error behind a silent NULL result.
 [[noreturn]] inline void ThrowVgiUserException(const std::string &msg, const std::string &worker_path,
-                                                pid_t worker_pid, const std::string &invocation_id_hex = "") {
+                                                pid_t worker_pid, const std::string &invocation_id_hex = "",
+                                                const std::string &error_kind = "") {
 	auto extra_info = BuildExtraInfo(worker_path, worker_pid, invocation_id_hex);
 	auto full_msg = BuildMessageWithContext(msg, worker_path);
+	if (!error_kind.empty()) {
+		throw VgiRpcException(extra_info, full_msg, error_kind);
+	}
 	throw InvalidInputException(extra_info, full_msg);
 }
+
+// Well-known `error_kind` token values. Open enum — new tokens may appear
+// at any time, callers should treat unknown values as "kind not recognised".
+namespace error_kind {
+inline constexpr const char *kMethodNotImplemented = "method_not_implemented";
+} // namespace error_kind
 
 // Check if a worker process exited with an error and throw appropriate exception.
 // Returns true if the process has exited, false if still running.

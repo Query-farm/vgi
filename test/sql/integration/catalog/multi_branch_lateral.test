@@ -1,0 +1,102 @@
+# name: test/sql/integration/catalog/multi_branch_lateral.test
+# description: E1 — multi-branch table on the RHS of LATERAL. VgiMultiScanRewriter
+#              runs at pre_optimize_function (BEFORE DuckDB's flatten_dependent_join
+#              decorrelator). The rewriter replaces the marker LogicalGet with a
+#              LogicalSetOperation(UNION_ALL, ...) before decorrelation sees the
+#              plan. LogicalSetOperation decorrelation works (SQL UNION decorrelates
+#              the same way), but interactions with DELIM_JOIN are subtle —
+#              this test pins the case as a CI regression guard.
+# group: [vgi_integration_catalog]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# Non-correlated LATERAL: the inner subquery doesn't reference the outer
+# tuple. multi_branch_numbers is bound once per outer row but with identical
+# results. Cross product of 3 outer × 100 inner = 300 rows.
+# ============================================================================
+
+query I
+SELECT count(*)
+FROM (VALUES (1), (2), (3)) AS t(outer_val),
+     LATERAL (SELECT n FROM example.data.multi_branch_numbers) AS b;
+----
+300
+
+query II
+SELECT count(*), count(DISTINCT outer_val)
+FROM (VALUES (1), (2), (3)) AS t(outer_val),
+     LATERAL (SELECT n FROM example.data.multi_branch_numbers) AS b
+WHERE b.n < 5;
+----
+30	3
+
+# ============================================================================
+# Non-correlated LATERAL against the filtered multi-branch. Each outer row
+# gets all 100 union rows. With outer filter `outer_val > 1`, 2 outer × 100
+# = 200 rows.
+# ============================================================================
+
+query I
+SELECT count(*)
+FROM (VALUES (1), (2), (3)) AS t(outer_val),
+     LATERAL (SELECT n FROM example.data.multi_branch_filtered_numbers) AS b
+WHERE t.outer_val > 1;
+----
+200
+
+# ============================================================================
+# CROSS JOIN equivalence: LATERAL on a non-correlated subquery should
+# produce the same row set as a CROSS JOIN. Confirms decorrelation /
+# DELIM_JOIN flow doesn't lose rows.
+# ============================================================================
+
+query I
+SELECT count(*)
+FROM (VALUES (1), (2), (3)) AS t(outer_val)
+     CROSS JOIN example.data.multi_branch_numbers m;
+----
+300
+
+# ============================================================================
+# Correlated LATERAL: the inner subquery references outer tuple via a
+# WHERE clause. DuckDB's decorrelator rewrites this into a DELIM_JOIN.
+# The multi-branch rewriter has already produced a LogicalSetOperation
+# by the time decorrelation runs.
+#
+# This is the case the senior review flagged as worth pinning. If
+# decorrelation breaks on UNION-rooted subqueries (known upstream-DuckDB
+# limit territory), surface it loudly in CI rather than silently producing
+# wrong results.
+# ============================================================================
+
+# 3 outer values, multi_branch_numbers is 0..49 twice. Each outer_val
+# filters to rows where m.n = outer_val, which exists in BOTH arms → 2 matches.
+# Total = 3 × 2 = 6.
+query I
+SELECT count(*)
+FROM (VALUES (1), (2), (3)) AS t(outer_val),
+     LATERAL (SELECT n FROM example.data.multi_branch_numbers m WHERE m.n = t.outer_val) AS b;
+----
+6
+
+# Verify the matched values are exactly the outer_vals.
+query II
+SELECT t.outer_val, b.n
+FROM (VALUES (1), (2), (3)) AS t(outer_val),
+     LATERAL (SELECT n FROM example.data.multi_branch_numbers m WHERE m.n = t.outer_val) AS b
+ORDER BY t.outer_val, b.n;
+----
+1	1
+1	1
+2	2
+2	2
+3	3
+3	3

@@ -1,0 +1,26 @@
+# name: test/sql/integration/catalog/multi_branch_empty_branches.test
+# description: E6 — worker that returns branches=[] for catalog_table_scan_branches_get
+#              must be rejected loud at the wire layer. ParseScanBranchesResult
+#              in C++ throws BinderException at parse time, so the failure
+#              surfaces at bind, before any scan or plan is built.
+# group: [vgi_integration_catalog]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# The fixture's multi_branch_empty table deliberately returns
+# ScanBranchesResult(branches=[], required_extensions=[]). The C++ parser
+# rejects this at the wire layer. The exception is a BinderException with
+# a clear message naming the worker — loud, deterministic, no silent
+# zero-row query.
+
+statement error
+SELECT count(*) FROM example.data.multi_branch_empty;
+----
+VGI table returned zero scan branches

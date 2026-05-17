@@ -272,6 +272,16 @@ bool HandleBatchLogMessage(const std::shared_ptr<arrow::RecordBatch> &batch,
 		}
 	}
 
+	// Read top-level error_kind metadata key — a stable token (e.g.
+	// "method_not_implemented") that callers can pattern-match on without
+	// substring-searching the message text. Mirrors vgi-rpc Python's
+	// metadata.ERROR_KIND_KEY (see vgi-rpc commit adding MethodNotImplementedError).
+	std::string error_kind;
+	int kind_idx = custom_metadata->FindKey("vgi_rpc.error_kind");
+	if (kind_idx >= 0) {
+		error_kind = custom_metadata->value(kind_idx);
+	}
+
 	// Handle based on log level
 	if (log_level == "EXCEPTION") {
 		// Construct error message with traceback (worker context is in extra_info)
@@ -282,7 +292,9 @@ bool HandleBatchLogMessage(const std::shared_ptr<arrow::RecordBatch> &batch,
 		// Throw InvalidInputException (not IOException) so the retry logic in
 		// InvokePooledUnaryRpc does NOT retry user-code errors. Retrying is
 		// unsafe for stateful aggregate operations and masks the real error.
-		vgi::ThrowVgiUserException(full_message, worker_path, worker_pid, invocation_id_hex);
+		// When `error_kind` is set, throws the typed VgiRpcException subclass
+		// instead so capability-detection callers can pattern-match.
+		vgi::ThrowVgiUserException(full_message, worker_path, worker_pid, invocation_id_hex, error_kind);
 	}
 
 	// For non-exception log levels, log to DuckDB if we have a context

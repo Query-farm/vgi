@@ -1,0 +1,92 @@
+# name: test/sql/integration/catalog/multi_branch_pushdown_incapable.test
+# description: E3 — arm with filter_pushdown=false (read_csv_auto) survives
+#              alongside an arm that supports pushdown (VGI sequence). The
+#              rewriter must not assume pushdown always succeeds: the
+#              non-pushdown arm gets a LogicalFilter above its LogicalGet
+#              while the pushdown-capable arm gets the filter pushed in.
+#              Correctness must be preserved.
+# group: [vgi_integration_catalog]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+# ============================================================================
+# Setup: a CSV file the fixture's multi_branch_nopushdown arm reads via
+# read_csv_auto. Schema: n BIGINT. Values 50..99 (50 rows).
+# ============================================================================
+
+statement ok
+COPY (SELECT range AS n FROM range(50, 100))
+     TO '/tmp/vgi_nopushdown_branch.csv' (HEADER);
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# Basic union: VGI sequence(50) → 0..49 (50 rows), read_csv_auto → 50..99
+# (50 rows). Total 100 distinct rows spanning 0..99.
+# ============================================================================
+
+query II
+SELECT count(*), count(DISTINCT n) FROM example.data.multi_branch_nopushdown;
+----
+100	100
+
+query II
+SELECT min(n), max(n) FROM example.data.multi_branch_nopushdown;
+----
+0	99
+
+# ============================================================================
+# WHERE clause correctness — the non-pushdown arm must still apply the
+# filter (DuckDB-side, via the LogicalFilter that pushdown couldn't push
+# into the scan). If the rewriter dropped the filter for the non-pushdown
+# arm, count(*) would be wrong.
+#
+# n > 60: only the CSV arm has values that match (61..99 = 39 rows). The
+# VGI sequence(50) arm has values 0..49, all < 60, so its arm contributes
+# zero rows under stats-based pruning.
+# ============================================================================
+
+query III
+SELECT count(*), min(n), max(n)
+FROM example.data.multi_branch_nopushdown
+WHERE n > 60;
+----
+39	61	99
+
+# n < 30: only the VGI arm has matches (0..29 = 30 rows). The CSV arm has
+# values 50..99, all >= 50, so its arm contributes zero rows after the
+# DuckDB-side filter rejects them all.
+query III
+SELECT count(*), min(n), max(n)
+FROM example.data.multi_branch_nopushdown
+WHERE n < 30;
+----
+30	0	29
+
+# Filter that hits BOTH arms: 25 <= n <= 75 → VGI [25, 49] (25 rows) +
+# CSV [50, 75] (26 rows) = 51 rows. The CSV arm's filter applies above
+# the read_csv_auto operator, not inside it.
+query III
+SELECT count(*), min(n), max(n)
+FROM example.data.multi_branch_nopushdown
+WHERE n BETWEEN 25 AND 75;
+----
+51	25	75
+
+# ============================================================================
+# Diagnostic surfaces the two branches with their distinct function names.
+# ============================================================================
+
+query II
+SELECT branch_index, function_name
+FROM vgi_table_branches()
+WHERE table_name = 'multi_branch_nopushdown'
+ORDER BY branch_index;
+----
+0	sequence
+1	read_csv_auto
