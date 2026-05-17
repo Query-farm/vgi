@@ -228,6 +228,7 @@ plus the shm-aware code paths in `src/vgi_function_connection.cpp`
 | `vgi_join_keys_max_bytes` | UBIGINT | 67108864 | Max estimated byte size for join keys batch |
 | `vgi_streaming_window` | BOOLEAN | true | Route eligible `OVER (...)` queries against VGI aggregates with `streaming_partitioned=true` through the custom streaming operator. Set to false to fall back to `PhysicalWindow` |
 | `vgi_table_buffering` | BOOLEAN | true | Rewrite calls to `TableBufferingFunction` subclasses through the Sink+Source `PhysicalVgiTableBufferingFunction` operator. Set to false to disable the rewrite — buffered queries then throw `InvalidInputException` instead of running (emergency-rollback path; not generally useful) |
+| `vgi_multi_branch_scans` | BOOLEAN | true | Rewrite multi-branch VGI table scans into `LogicalSetOperation(UNION_ALL, ...)` via the optimizer extension. Set to false to disable the rewrite — multi-branch tables then refuse at bind with a clear `BinderException`. Emergency-rollback knob. See [docs/multi_branch.md](docs/multi_branch.md) |
 | `vgi_trust_empty_kinds` | BOOLEAN | true | Trust worker assertions that `estimated_object_count[kind] == 0` means the kind is empty (skip `catalog_schema_contents_*` RPC). Set to false to force every RPC to fire — debug escape hatch for diagnosing worker bugs |
 
 Catalogs may register additional settings at `ATTACH` time (e.g., `greeting`, `multiplier`).
@@ -269,6 +270,7 @@ The `launch:` and `unix://` paths share one warm worker process across every Duc
 | `vgi_worker_pool_flush()` | Scalar | Clear all subprocess-pooled workers (returns count flushed). Has no effect on `launch:` / `unix://` workers. |
 | `vgi_clear_cache()` | Table | Clear cached catalog metadata (schemas, tables, functions, statistics) for all attached VGI catalogs |
 | `vgi_catalog_identity()` | Table | OIDC identity per attached VGI catalog: `catalog_name`, `origin`, `authenticated`, `sub`, `email`, `name`, `issuer`, `claims` (JSON). Claims carry the full decoded id_token payload — reach provider-specific fields via e.g. `claims->>'$.preferred_username'` for Entra, `claims->>'$.hd'` for Google Workspace, etc. |
+| `vgi_table_branches()` | Table | Diagnostic: one row per branch per VGI table across every attached VGI catalog. Columns: `catalog_name`, `schema_name`, `table_name`, `branch_index`, `function_name`, `positional_arguments` (JSON), `named_arguments` (JSON), `branch_filter`, `table_required_extensions` (LIST). Used to introspect multi-branch tables. See [docs/multi_branch.md](docs/multi_branch.md). |
 
 ## Key Source Files
 
@@ -298,6 +300,8 @@ The `launch:` and `unix://` paths share one warm worker process across every Duc
 | `vgi_logging.cpp` | `VgiLogType`, `VgiStderrLogEnabled()`, `VgiLogToStderr()` |
 | `vgi_catalogs.cpp` | `vgi_catalogs()` SQL function |
 | `vgi_clear_cache.cpp` | `vgi_clear_cache()` SQL function — clears all VGI catalog caches |
+| `vgi_table_branches_function.cpp` | `vgi_table_branches()` SQL diagnostic — one row per branch per VGI table across every attached VGI catalog |
+| `vgi_multi_scan_rewriter.cpp` | `VgiMultiScanRewriter` — pre-pushdown `OptimizerExtension` that rewrites multi-branch `LogicalGet(marker)` into `LogicalSetOperation(UNION_ALL, [LogicalProjection(LogicalFilter(branch_filter, LogicalGet(branch_fn))), ...])`. Includes a minimal v1.0 `branch_filter` binder (col OP const, AND/OR). See [docs/multi_branch.md](docs/multi_branch.md) for the user-facing reference |
 | `vgi_shm_segment.cpp` | `VgiShmSegment`: posix shm allocator + zero-copy chained-buffer reader for the shared-memory transport (see *Shared-Memory Transport*) |
 
 ### Storage Layer (`src/storage/`)
