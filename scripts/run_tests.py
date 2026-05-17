@@ -308,6 +308,19 @@ def main(argv: Iterable[str] | None = None) -> int:
         return 1
 
     env = os.environ.copy()
+
+    # Auto-set VGI_TEST_DEDICATED_WORKER when the worker is a bare command
+    # path (subprocess transport): each parallel unittest process spawns its
+    # own private worker child, so SIGKILL-self tests like
+    # table_buffering_worker_crash and table_buffering_pool_recovery are
+    # safe to run. http://, https://, unix://, launch: are all shared-worker
+    # transports — leave the var unset so those tests skip via require-env
+    # rather than nuke a worker that other parallel tests are using.
+    worker = env.get("VGI_TEST_WORKER", "")
+    shared_prefixes = ("http://", "https://", "unix://", "launch:")
+    if worker and not worker.startswith(shared_prefixes):
+        env.setdefault("VGI_TEST_DEDICATED_WORKER", "1")
+
     print(
         f"Discovered {len(tests)} tests under {args.root} — "
         f"running with -j{args.jobs} against {unittest.name} ({args.build})",

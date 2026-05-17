@@ -4,11 +4,14 @@
 #   AcquireAndBindConnection's stale-conn EPIPE retry on the buffered path,
 #   and proves the pool doesn't retain dead PIDs.
 #
-# Subprocess-only — see buffered_worker_crash.test header for the explanation
-# of why SIGKILL semantics aren't testable through a shared HTTP server.
+# Dedicated-worker only — see buffered_worker_crash.test header for the
+# explanation of why crash_on_process (which SIGKILLs its own process) is
+# not safe under shared-worker transports.
 # group: [vgi_integration_table_in_out]
 
 require-env VGI_TEST_WORKER
+
+require-env VGI_TEST_DEDICATED_WORKER
 
 require vgi
 

@@ -50,6 +50,7 @@ test_subprocess:
 	VGI_ATTACH_OPTIONS_WORKER="$(VGI_ATTACH_OPTIONS_WORKER)" \
 	VGI_SIMPLE_WRITABLE_WORKER="$(VGI_SIMPLE_WRITABLE_WORKER)" \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
+	VGI_TEST_DEDICATED_WORKER=1 \
 	./build/release/test/unittest "test/*" "~test/sql/integration/writable/*"
 
 test_subprocess_debug:
@@ -60,6 +61,7 @@ test_subprocess_debug:
 	VGI_ATTACH_OPTIONS_WORKER="$(VGI_ATTACH_OPTIONS_WORKER)" \
 	VGI_SIMPLE_WRITABLE_WORKER="$(VGI_SIMPLE_WRITABLE_WORKER)" \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
+	VGI_TEST_DEDICATED_WORKER=1 \
 	./build/debug/test/unittest "test/*" "~test/sql/integration/writable/*"
 
 # Launcher transport tests — runs the same .test suite as test_subprocess but

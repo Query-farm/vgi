@@ -3,14 +3,20 @@
 #   verify the C++ side surfaces a clean error and the pool recovers so
 #   the next query against the same catalog succeeds on a fresh worker.
 #
-# Subprocess-only: SIGKILLing a worker in subprocess mode kills only that
-# child process; under HTTP transport the "worker" is the shared HTTP server,
-# so SIGKILL would tear down the entire test harness. Auto-skipped on HTTP
-# via the "skip on error_message matching 'HTTP'" rule (the first error
-# message contains [url: http://...] when running against HTTP).
+# Dedicated-worker only: crash_on_process calls os.kill(getpid(), SIGKILL)
+# inside the worker. Under subprocess transport that kills only the per-
+# DuckDB-process worker child, which is what this test asserts. Under any
+# shared-worker transport (http://, https://, unix://, launch:) it would
+# tear down the single process serving every concurrent test, cascading
+# into "RPC response stream EOF" failures across the suite. The
+# VGI_TEST_DEDICATED_WORKER env var is set by Makefile test_subprocess*
+# targets and auto-detected by scripts/run_tests.py from a bare-path
+# VGI_TEST_WORKER; shared-worker runs leave it unset so this test skips.
 # group: [vgi_integration_table_in_out]
 
 require-env VGI_TEST_WORKER
+
+require-env VGI_TEST_DEDICATED_WORKER
 
 require vgi
 
