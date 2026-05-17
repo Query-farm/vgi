@@ -337,6 +337,12 @@ struct VgiScanBranch {
 	// column bindings. Empty when branch_filter is empty or parsing failed.
 	// See plan: §C++ wiring sketch "branch_filter parse-at-attach, ..." bullet.
 	duckdb::unique_ptr<ParsedExpression> parsed_branch_filter;
+	// Declares this branch as the INSERT target for the multi-branch
+	// table. At most one branch per table may set this (enforced in
+	// ParseScanBranchesResult). UPDATE/DELETE/MERGE remain refused on
+	// multi-branch tables regardless of this flag; the contract is
+	// INSERT-only until cross-arm semantics have customer-driven evidence.
+	bool writable = false;
 };
 
 // Result of the new catalog_table_scan_branches_get RPC. New-protocol shape;
@@ -774,9 +780,17 @@ VgiScanBranchesResult ParseScanBranchesResult(ClientContext &context,
 using VgiWriteFunctionResult = VgiScanFunctionResult;
 
 // Invoke catalog_table_{insert,update,delete}_function_get: get write function for a table
+// `writable_branch_function_name` is set ONLY when the C++ side is
+// dispatching an INSERT against a multi-branch VGI table that has a
+// writable arm — in which case it carries the writable arm's
+// `ScanBranch.function_name`, so the worker can dispatch without
+// re-resolving which branch is writable. Empty string means single-branch
+// (or worker-decided routing); workers serving single-branch tables can
+// ignore the field.
 VgiWriteFunctionResult InvokeCatalogTableInsertFunctionGet(
     const CatalogRpcContext &ctx, const std::string &schema_name,
-    const std::string &table_name, ClientContext &context);
+    const std::string &table_name, ClientContext &context,
+    const std::optional<std::string> &writable_branch_function_name = std::nullopt);
 
 VgiWriteFunctionResult InvokeCatalogTableUpdateFunctionGet(
     const CatalogRpcContext &ctx, const std::string &schema_name,

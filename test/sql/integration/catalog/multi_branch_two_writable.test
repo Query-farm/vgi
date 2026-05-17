@@ -1,0 +1,28 @@
+# name: test/sql/integration/catalog/multi_branch_two_writable.test
+# description: At-most-one-writable invariant for multi-branch tables. A
+#              worker that returns two ScanBranch entries with writable=True
+#              must be rejected loud at the wire layer by
+#              ParseScanBranchesResult. The rejection is motivated by
+#              DuckDB's single-writable-catalog-per-transaction rule
+#              (meta_transaction.cpp:257-261).
+# group: [vgi_integration_catalog]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# The fixture's multi_branch_two_writable table deliberately returns
+# two ScanBranch entries both with writable=True. ParseScanBranchesResult
+# in C++ rejects this loud at the wire layer with a BinderException
+# naming the offending ordinals. The failure surfaces at first scan-bind,
+# before any plan is built.
+
+statement error
+SELECT count(*) FROM example.data.multi_branch_two_writable;
+----
+declared 2 writable branches

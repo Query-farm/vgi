@@ -30,10 +30,13 @@ employees	Employee table with FK to departments
 funny_numbers	123456 integers; stats served by the sequence function, not the table
 generated_sequence	Table with generated columns backed by sequence(10)
 large_sequence	A large sequence of integers from 0 to 1,000,000
+multi_branch_empty	Multi-branch: worker returns empty branches list — used by multi_branch_empty_branches.test
 multi_branch_filtered_numbers	Multi-branch with complementary branch_filters — exercises pruning
 multi_branch_hetero	Multi-branch: sequence(50) + read_parquet — used by multi_branch_heterogeneous.test
+multi_branch_nopushdown	Multi-branch: VGI + read_csv — used by multi_branch_pushdown_incapable.test
 multi_branch_numbers	Multi-branch: UNION of sequence(50) + sequence(50) — used by multi_branch_scan.test
 multi_branch_recon	Multi-branch: column reconciliation — used by multi_branch_reconciliation.test
+multi_branch_two_writable	Multi-branch with two writable=True arms — used by multi_branch_two_writable.test
 numbers	First 100 integers (demonstrates explicit columns)
 products	Product table with column defaults
 projects	Projects with composite PK and FK to departments

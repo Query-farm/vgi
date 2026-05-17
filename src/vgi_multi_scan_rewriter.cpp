@@ -17,11 +17,11 @@
 //   - ColumnBindingReplacer pass on the root plan to rewrite parent
 //     expressions referencing the old marker bindings.
 //
-// Known v1.0 limitations:
+// Known limitations:
 //   - branch_filter binding supports only the subset
 //     "col OP const [AND col OP const ...]" — no function calls, no
-//     subqueries, no nested expressions. Workers wanting richer filters
-//     must wait for Phase D's full ExpressionBinder integration.
+//     subqueries, no nested expressions. Richer filters would require
+//     full ExpressionBinder integration.
 // =============================================================================
 
 #include "vgi_multi_scan_rewriter.hpp"
@@ -75,7 +75,7 @@ TableFunction MakeMultiBranchMarkerFunction() {
 }
 
 // ---------------------------------------------------------------------------
-// Minimal branch_filter binder (v1.0 scope: col OP const [AND ...])
+// Minimal branch_filter binder (scope: col OP const [AND ...])
 // ---------------------------------------------------------------------------
 
 // Map column name → ColumnBinding for the arm. Built from the arm's return_names
@@ -95,7 +95,7 @@ static unique_ptr<Expression> BindBranchFilterColumnRef(const ColumnRefExpressio
                                                           const ArmColumnLookup &cols) {
 	if (cref.IsQualified()) {
 		throw BinderException(
-		    "VGI branch_filter does not support qualified column references in v1.0 "
+		    "VGI branch_filter does not support qualified column references "
 		    "(got '%s'). Use unqualified column names referring to the branch's output schema.",
 		    cref.GetName());
 	}
@@ -121,8 +121,8 @@ static unique_ptr<Expression> BindBranchFilterComparison(ClientContext &context,
 	// Implicit cast: if one side is a constant whose type differs from the
 	// other, cast the constant to the other side's type. Handles
 	// `ts >= TIMESTAMP '...'` cleanly without invoking the full type
-	// resolver. Mismatched non-constant types throw — v1.0 doesn't support
-	// arbitrary type coercion.
+	// resolver. Mismatched non-constant types throw — arbitrary type
+	// coercion between non-constants is not supported.
 	if (left->return_type != right->return_type) {
 		if (left->GetExpressionType() == ExpressionType::VALUE_CONSTANT) {
 			left = BoundCastExpression::AddCastToType(context, std::move(left), right->return_type);
@@ -131,7 +131,7 @@ static unique_ptr<Expression> BindBranchFilterComparison(ClientContext &context,
 		} else {
 			throw BinderException(
 			    "VGI branch_filter comparison between mismatched types %s and %s is not supported "
-			    "in v1.0 (no automatic cast between two non-constant operands).",
+			    "(no automatic cast between two non-constant operands).",
 			    left->return_type.ToString(), right->return_type.ToString());
 		}
 	}
@@ -163,9 +163,9 @@ static unique_ptr<Expression> BindBranchFilterExpr(ClientContext &context, const
 		return BindBranchFilterConjunction(context, expr.Cast<ConjunctionExpression>(), cols);
 	default:
 		throw BinderException(
-		    "VGI branch_filter v1.0 only supports column references, constants, comparisons "
+		    "VGI branch_filter only supports column references, constants, comparisons "
 		    "(=, <, >, <=, >=, <>), and AND/OR conjunctions. Expression class %s is not supported. "
-		    "Restructure your filter or wait for the v2.0 binder.",
+		    "Restructure your filter to use only the supported expression forms.",
 		    static_cast<int>(expr.GetExpressionClass()));
 	}
 }
@@ -324,9 +324,9 @@ static unique_ptr<LogicalProjection> BuildArmProjection(
 			auto colref = make_uniq<BoundColumnRefExpression>(arm.raw_types[raw_idx], arm.bindings[raw_idx]);
 			unique_ptr<Expression> expr = std::move(colref);
 			if (arm.raw_types[raw_idx] != canonical_type) {
-				// Same-named column with different type — cast it. v1.0 doesn't
-				// support a missing implicit cast; let DuckDB's cast machinery
-				// throw with its own error if the cast isn't defined.
+				// Same-named column with different type — cast it. Let DuckDB's
+				// cast machinery throw with its own error if the cast isn't
+				// defined.
 				expr = BoundCastExpression::AddCastToType(context, std::move(expr), canonical_type);
 			}
 			proj_exprs.push_back(std::move(expr));
@@ -447,7 +447,7 @@ static void RewriteOne(unique_ptr<LogicalOperator> &op, ClientContext &context, 
 
 		unique_ptr<LogicalOperator> arm_top = std::move(arm.get);
 
-		// Optional branch_filter LogicalFilter (uses the minimal v1.0 binder).
+		// Optional branch_filter LogicalFilter (uses the minimal binder above).
 		if (branch.parsed_branch_filter) {
 			ArmColumnLookup cols{arm.raw_names, arm.raw_types, arm.bindings};
 			auto bound = BindBranchFilterExpr(context, *branch.parsed_branch_filter, cols);

@@ -99,17 +99,17 @@ SELECT count(*) FROM example.data.multi_branch_numbers;
 
 # ============================================================================
 # branch_filter scope-enforcement: workers can declare overlapping ranges
-# via misdeclared branch_filters. v1.0 contract: failure mode is duplicate
-# rows or missing rows, never silent corruption. The fixture's filtered
-# table uses complementary filters, so distinct count == total count
-# (asserted above). If the filters were overlapping, distinct < total.
+# via misdeclared branch_filters. Contract: failure mode is duplicate rows
+# or missing rows, never silent corruption. The fixture's filtered table
+# uses complementary filters, so distinct count == total count (asserted
+# above). If the filters were overlapping, distinct < total.
 # ============================================================================
 
 # ============================================================================
-# B2 guard: AT (...) clauses are refused on multi-branch tables. v1
-# contract — multi-branch tables don't honour time travel because each arm
-# may interpret AT differently. Single-branch tables continue to honour AT
-# (verified by test/sql/integration/table/time_travel.test).
+# AT (...) clauses are refused on multi-branch tables — multi-branch tables
+# don't honour time travel because each arm may interpret AT differently.
+# Single-branch tables continue to honour AT (verified by
+# test/sql/integration/table/time_travel.test).
 # ============================================================================
 
 statement error
@@ -125,12 +125,11 @@ AT (...) clauses are not supported on multi-branch VGI tables
 # ============================================================================
 # Read-only catalog also refuses writes. ExampleCatalog is read-only, so
 # INSERT/UPDATE/DELETE refuse at the catalog-level guard before reaching
-# VgiPhysicalInsert's multi-branch check. The B3 multi-branch refusal
-# itself only fires for writable catalogs that contain a multi-branch
-# table — see vgi_physical_write.cpp's RefuseWriteIfMultiBranch.
-# v1 contract is satisfied either way: writes against multi-branch tables
-# fail loud at bind time. The read-only path is exercised here; the B3
-# path requires a separate writable-catalog fixture (Phase D2).
+# VgiPhysicalInsert's multi-branch check. The multi-branch-specific
+# refusal helper itself only fires for writable catalogs that contain a
+# multi-branch table — see the refusal helpers in vgi_physical_write.cpp.
+# The contract is satisfied either way: writes against multi-branch
+# tables fail loud at bind time. The read-only path is exercised here.
 # ============================================================================
 
 statement error

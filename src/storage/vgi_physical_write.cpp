@@ -327,27 +327,77 @@ InsertionOrderPreservingMap<string> VgiPhysicalInsert::ParamsToString() const {
 	return result;
 }
 
-// B3: refuse writes against multi-branch VGI tables. v1 ships read-only
-// multi-branch — writes have no canonical target without an additional
-// protocol field (writable_branch_index), so refusing loud is correct.
-// See plan §"Writes against multi-branch tables: refused in v1".
+// Write-refusal split for multi-branch tables. INSERT is permitted when
+// exactly one branch declares writable=true. UPDATE/DELETE/MERGE always
+// refuse on multi-branch tables — the cross-arm-target semantics question
+// has no clean answer (loud-error / silent-scope / refuse each carry UX
+// trade-offs without engine precedent), and the conservative choice is
+// to refuse and direct the user to per-branch dispatch via
+// vgi_table_function(...).
 //
-// Issues a fresh branches RPC (via the new method, which falls back to the
-// legacy single-function path for old workers). For single-branch tables
-// (size <= 1) this is a no-op; for multi-branch tables it throws
-// BinderException at bind time, before any wire I/O for the write happens.
-// Writes don't use AT (...) so empty strings are correct here.
-static void RefuseWriteIfMultiBranch(ClientContext &context, VgiTableEntry &table_entry,
-                                      const char *operation) {
-	auto branches_result = table_entry.FetchScanBranches(context, /*at_unit=*/"", /*at_value=*/"");
-	if (branches_result.branches.size() > 1) {
-		throw BinderException(
-		    "Multi-branch VGI tables are read-only in v1. "
-		    "%s is not supported on table '%s.%s' (%d branches). "
-		    "Write directly to a specific branch's underlying function instead.",
-		    operation, table_entry.ParentSchema().name, table_entry.name,
-		    static_cast<int>(branches_result.branches.size()));
+// Both helpers issue a fresh branches RPC (via catalog_table_scan_branches_get,
+// which falls back to the legacy single-function path for older workers).
+// For single-branch tables (size <= 1) they're no-ops; only multi-branch
+// tables hit the refusal logic. Writes don't use AT (...) so empty strings
+// are correct here.
+
+// INSERT permits writes when at least one branch declares writable=true.
+// (ParseScanBranchesResult already enforces at-most-one-writable, so the
+// linear scan below sees 0 or 1 writable branches.) Short-circuits on
+// the cheap multi-branch hint to avoid an RPC on every INSERT to a
+// single-branch VGI table.
+//
+// Returns the writable arm's function_name when the table is multi-branch
+// and a writable arm exists; std::nullopt when the table is single-branch
+// (no disambiguation needed). The C++ caller forwards this value to the
+// worker via the catalog_table_insert_function_get RPC so the worker can
+// dispatch the INSERT against a verified key, instead of re-resolving the
+// writable arm internally and hoping the C++ side and the worker agree.
+static std::optional<std::string> RefuseInsertIfMultiBranchUnwritable(ClientContext &context,
+                                                                       VgiTableEntry &table_entry) {
+	if (table_entry.IsKnownSingleBranchNoAT()) {
+		return std::nullopt; // cheap path: no RPC, no multi-branch refusal applies
 	}
+	auto branches_result = table_entry.FetchScanBranches(context, /*at_unit=*/"", /*at_value=*/"");
+	if (branches_result.branches.size() <= 1) {
+		return std::nullopt; // single-branch path, unchanged (hint now populated)
+	}
+	for (const auto &branch : branches_result.branches) {
+		if (branch.writable) {
+			return branch.function_name; // writable arm exists; INSERT proceeds
+		}
+	}
+	throw BinderException(
+	    "Multi-branch VGI table '%s.%s' is read-only — no branch declared writable=true. "
+	    "INSERT is not supported. (Set writable=true on exactly one branch in the worker's "
+	    "ScanBranchesResult to enable INSERT routing to that arm.)",
+	    table_entry.ParentSchema().name, table_entry.name);
+}
+
+// UPDATE/DELETE/MERGE always refuse on multi-branch tables, regardless of
+// any branch's writable flag. The cross-arm-target UX question is open
+// (loud-error vs. silent-scope vs. refuse) and refusing is the
+// conservative answer until concrete customer requirements arrive.
+// Short-circuits on the cheap multi-branch hint to avoid an RPC on every
+// write to a single-branch VGI table.
+static void RefuseUpdateDeleteIfMultiBranch(ClientContext &context, VgiTableEntry &table_entry,
+                                             const char *operation) {
+	if (table_entry.IsKnownSingleBranchNoAT()) {
+		return; // cheap path: no RPC, no multi-branch refusal applies
+	}
+	auto branches_result = table_entry.FetchScanBranches(context, /*at_unit=*/"", /*at_value=*/"");
+	if (branches_result.branches.size() <= 1) {
+		return; // single-branch path, unchanged (hint now populated)
+	}
+	throw BinderException(
+	    "%s is not supported on multi-branch VGI table '%s.%s' (%d branches). "
+	    "Issue the %s directly against the writable arm's underlying VGI table "
+	    "(declare it as a single-branch VGI table for write access). "
+	    "(UPDATE/DELETE/MERGE on multi-branch tables is not supported pending "
+	    "concrete customer requirements for cross-arm semantics — see "
+	    "docs/multi_branch.md.)",
+	    operation, table_entry.ParentSchema().name, table_entry.name,
+	    static_cast<int>(branches_result.branches.size()), operation);
 }
 
 unique_ptr<GlobalSinkState> VgiPhysicalInsert::GetGlobalSinkState(ClientContext &context) const {
@@ -372,7 +422,7 @@ unique_ptr<GlobalSinkState> VgiPhysicalInsert::GetGlobalSinkState(ClientContext 
 	auto &params = catalog.attach_parameters();
 	auto &attach_result = catalog.attach_result();
 
-	RefuseWriteIfMultiBranch(context, *table, "INSERT");
+	auto writable_branch_function_name = RefuseInsertIfMultiBranchUnwritable(context, *table);
 
 	auto &vgi_tx = VgiTransaction::Get(context, table->GetCatalog());
 	CatalogRpcContext rpc_ctx{params, attach_result->attach_opaque_data, vgi_tx.GetTransactionOpaqueData()};
@@ -380,7 +430,8 @@ unique_ptr<GlobalSinkState> VgiPhysicalInsert::GetGlobalSinkState(ClientContext 
 	    context, *table, "insert", table->GetTableInfo().insert_function,
 	    [&]() {
 		    return InvokeCatalogTableInsertFunctionGet(rpc_ctx, table->GetTableInfo().schema_name,
-		                                                table->GetTableInfo().name, context);
+		                                                table->GetTableInfo().name, context,
+		                                                writable_branch_function_name);
 	    });
 
 	// Build input schema (table columns minus row_id)
@@ -533,7 +584,7 @@ unique_ptr<GlobalSinkState> VgiPhysicalDelete::GetGlobalSinkState(ClientContext 
 	auto &params = catalog.attach_parameters();
 	auto &attach_result = catalog.attach_result();
 
-	RefuseWriteIfMultiBranch(context, const_cast<VgiTableEntry &>(table), "DELETE");
+	RefuseUpdateDeleteIfMultiBranch(context, const_cast<VgiTableEntry &>(table), "DELETE");
 
 	auto &vgi_tx = VgiTransaction::Get(context, table.GetCatalog());
 	CatalogRpcContext rpc_ctx{params, attach_result->attach_opaque_data, vgi_tx.GetTransactionOpaqueData()};
@@ -673,7 +724,7 @@ unique_ptr<GlobalSinkState> VgiPhysicalUpdate::GetGlobalSinkState(ClientContext 
 	auto &params = catalog.attach_parameters();
 	auto &attach_result = catalog.attach_result();
 
-	RefuseWriteIfMultiBranch(context, const_cast<VgiTableEntry &>(table), "UPDATE");
+	RefuseUpdateDeleteIfMultiBranch(context, const_cast<VgiTableEntry &>(table), "UPDATE");
 
 	auto &vgi_tx = VgiTransaction::Get(context, table.GetCatalog());
 	CatalogRpcContext rpc_ctx{params, attach_result->attach_opaque_data, vgi_tx.GetTransactionOpaqueData()};

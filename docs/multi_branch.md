@@ -78,7 +78,7 @@ produce duplicates across arms). There is no silent corruption: a
 worker that lies about its scope produces detectable bad data, not
 plausible-looking bad data.
 
-**v1.0 binder scope.** The C++ side binds `branch_filter` via a minimal
+**Binder scope.** The C++ side binds `branch_filter` via a minimal
 binder supporting:
 
 - Column references (resolved against the branch's bound column list)
@@ -90,9 +90,9 @@ binder supporting:
 
 Function calls (`now()`, `current_timestamp`, etc.), subqueries,
 lambdas, and other complex expressions throw `BinderException` with a
-"not supported in v1.0" message. Workarounds: emit literal constants
-from the worker side (e.g. compute `cutoff` in Python, emit
-`ts >= TIMESTAMP '2026-05-15 12:34:56'`), or wait for the v2 binder.
+"not supported" message. Workarounds: emit literal constants from the
+worker side (e.g. compute `cutoff` in Python, emit
+`ts >= TIMESTAMP '2026-05-15 12:34:56'`).
 
 ## Column reconciliation
 
@@ -114,18 +114,99 @@ Type mismatches between an arm and the canonical schema attempt an
 implicit cast via DuckDB's standard cast machinery. If no cast is
 defined, the cast machinery throws.
 
-## What v1 deliberately doesn't do
+## What multi-branch tables deliberately don't do
 
-| Concern | v1 behaviour | v2 path |
+| Concern | Current behaviour | Future path (when customer evidence arrives) |
 |---|---|---|
-| **Writes** (`INSERT` / `UPDATE` / `DELETE` / `MERGE`) | Refused at bind with `BinderException("Multi-branch VGI tables are read-only in v1")` | `writable_branch_index` field on `ScanBranchesResult` |
+| **`INSERT`** | Routes to the writable arm when exactly one branch declares `writable=True` (see *Writable multi-branch tables* below). Otherwise refused. | — |
+| **`UPDATE` / `DELETE` / `MERGE`** | Refused at bind regardless of `writable` flag — see *Why UPDATE/DELETE are deferred* below for the cross-arm semantics question | Per-table semantic declaration (loud-error vs. silent-scope vs. refuse) once concrete customer evidence narrows the right choice |
 | **Time travel** (`AT (VERSION => N)`) | Refused at bind with `BinderException("AT (...) clauses are not supported on multi-branch VGI tables")` | Per-branch `at_modes: set[AtUnit]` declaration |
 | **Cross-branch snapshot consistency** | Each branch binds at its own per-source point-in-time. Kafka's offset and Iceberg's snapshot id are independent — no coordinated read transaction | Coordinated read transaction RPCs across branches |
 | **Error tolerance across arms** | Fail-fast. Any arm error fails the whole query | Per-branch `on_error: 'fail' \| 'skip_with_warning'` |
 | **Overlapping arms with dedup** | Customer keeps arms non-overlapping via complementary `branch_filter`s. Accidental overlap produces duplicate rows (loud — `COUNT(*)` is wrong) | `unique_columns` + window-function rewrite |
 
-These are concrete v2 paths sketched in the design memo, not omissions;
-each is gated on a real customer asking for it.
+These are concrete future paths sketched in the design memo, not
+omissions; each is gated on a real customer asking for it.
+
+## Writable multi-branch tables
+
+A multi-branch table can declare **exactly one** branch as the
+INSERT target via the `writable: bool` flag on `ScanBranch`:
+
+```python
+return ScanBranchesResult(
+    branches=[
+        ScanBranch(
+            function_name="vgi_kafka_writable_scan",
+            positional_arguments=[pa.scalar("orders-topic")],
+            named_arguments={},
+            writable=True,                   # ← INSERTs route here
+        ),
+        ScanBranch(
+            function_name="iceberg_scan",
+            positional_arguments=[pa.scalar("s3://archive/orders")],
+            named_arguments={},
+            # writable=False (default) — read-only cold tier
+        ),
+    ],
+    required_extensions=["iceberg", "httpfs"],
+)
+```
+
+INSERTs against the multi-branch table route to the worker's
+`catalog_table_insert_function_get` RPC and dispatch as if the
+writable arm were a normal single-branch VGI table. The C++ extension
+contributes the usual per-branch refusal/permission logic; the worker
+sees plain INSERT batches.
+
+### Rules enforced at catalog-load
+
+- **At most one writable branch.** Two or more is rejected at parse
+  time with a `BinderException` naming the offending ordinals. This
+  is the *single-writable-catalog-per-transaction* rule DuckDB enforces
+  at `duckdb/src/transaction/meta_transaction.cpp:257-261` — multi-
+  writable would violate it the moment UPDATE/DELETE land.
+- **Workers should keep the writable arm in the same catalog.** The
+  writable arm's `function_name` should resolve within the
+  multi-branch table's own catalog — workers proxy to native storage
+  like iceberg / ducklake internally rather than declaring a
+  cross-catalog writable arm. Cross-catalog dispatch would trip
+  DuckDB's single-writable-catalog rule at execute time. This is not
+  enforced in C++ today; misconfigured workers surface as
+  TransactionException at INSERT time.
+- **Writable arm column-list match.** The writable arm's column list
+  should match the multi-branch table's canonical column list — if
+  they diverge, an INSERT against the canonical schema would target
+  columns the writable arm doesn't have. Schema mismatches surface
+  as worker-level schema errors at INSERT time; an eager catalog-load
+  check may be added if it shows up in practice.
+
+### Why UPDATE/DELETE are deferred
+
+`UPDATE multi_branch_tbl SET status='archived' WHERE id IN (1,2,3)`
+is the kind of statement a SQL author expects to "just work." But if
+row id=1 lives in the writable arm and rows id=2,3 live in a read-
+only arm, there's no clean semantic:
+
+- **Loud error on cross-arm target**: throws when any matched row
+  comes from a read-only arm. No precedent in mainstream engines for
+  *partial* cross-arm matching like this (engines that refuse
+  external-table DML do so categorically, not per-row).
+- **Silent-scope to writable arm**: UPDATE only sees writable-arm
+  rows. `SELECT WHERE id=2` returns the row, `UPDATE WHERE id=2`
+  does nothing. Mirrors SQL Server temporal tables, but the temporal
+  "cold tier IS the past" justification doesn't transfer to hot-cold
+  tiering of live operational data.
+- **Refuse all UPDATE/DELETE**: safest. Loses workloads that
+  naturally only target the writable arm.
+
+VGI picks **refuse** as the conservative answer pending concrete
+customer evidence. The design memo documents the implementation path
+for either of the other two options when a ticket arrives.
+
+Customers needing UPDATE/DELETE on hot-cold data today route through
+`vgi_table_function(arm_args, ...)` against the specific writable
+branch — the same fallback the design memo offers as the workaround.
 
 ## Diagnostic: `vgi_table_branches()`
 
@@ -150,6 +231,7 @@ WHERE table_name = 'orders';
 | `named_arguments` | `JSON` | Named args as `{name: value}` |
 | `branch_filter` | `VARCHAR` | Raw SQL expression text; `NULL` when unset |
 | `table_required_extensions` | `LIST(VARCHAR)` | Top-level union; repeated identically on every branch row of the same table (for join-friendly query shapes) |
+| `writable` | `BOOLEAN` | `true` if this branch is the INSERT target for the table. At most one branch per table sets this true. `false` on all branches means the table is read-only. |
 
 Performance: this issues a fresh `catalog_table_scan_branches_get` RPC
 per table. Acceptable for ad-hoc inspection; **do not** call from a
@@ -234,12 +316,17 @@ failure doesn't get silently rerouted to the legacy path.
   lists per arm. The rewriter's by-name reconciliation is opinionated
   (missing → NULL; extra → loud error); a hand-written view lets you
   pick.
-- **You need writable multi-source tables today.** v1 refuses writes;
-  use a single-branch table for the writable surface and (separately)
-  a multi-branch table for reads.
-- **You need cross-branch snapshot consistency.** v1 doesn't provide
-  this. If you need it, declare a single-branch table at a coordinated
-  snapshot id and accept the consistency vs. tier-mixing trade-off.
+- **You need cross-arm UPDATE/DELETE today.** Multi-branch tables
+  support INSERT on the writable arm only. UPDATE/DELETE/MERGE are
+  refused at bind; route through `vgi_table_function(...)` against
+  the specific branch you want to modify. (See *Why UPDATE/DELETE
+  are deferred* above for the semantics question; the design memo
+  documents the implementation path when concrete customer evidence
+  arrives.)
+- **You need cross-branch snapshot consistency.** Multi-branch tables
+  don't provide this. If you need it, declare a single-branch table
+  at a coordinated snapshot id and accept the consistency vs.
+  tier-mixing trade-off.
 
 ## Internals reference
 

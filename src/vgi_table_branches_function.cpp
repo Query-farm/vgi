@@ -20,6 +20,7 @@
 
 #include "storage/vgi_catalog.hpp"
 #include "storage/vgi_table_entry.hpp"
+#include "vgi_logging.hpp"
 
 namespace duckdb {
 namespace vgi {
@@ -37,6 +38,7 @@ struct BranchesRow {
 	std::string branch_filter;  // empty == NULL
 	bool branch_filter_present;
 	std::vector<std::string> table_required_extensions;
+	bool writable;  // INSERT target declaration for multi-branch tables
 };
 
 struct VgiTableBranchesData : public TableFunctionData {
@@ -109,9 +111,11 @@ static unique_ptr<FunctionData> VgiTableBranchesBind(ClientContext &context, Tab
 	    LogicalType::JSON(),                           // named_arguments
 	    LogicalType::VARCHAR,                          // branch_filter (NULL when unset)
 	    LogicalType::LIST(LogicalType::VARCHAR),       // table_required_extensions
+	    LogicalType::BOOLEAN,                          // writable (INSERT target declaration for multi-branch)
 	};
 	names = {"catalog_name", "schema_name", "table_name", "branch_index", "function_name",
-	         "positional_arguments", "named_arguments", "branch_filter", "table_required_extensions"};
+	         "positional_arguments", "named_arguments", "branch_filter", "table_required_extensions",
+	         "writable"};
 
 	auto data = make_uniq<VgiTableBranchesData>();
 
@@ -141,10 +145,18 @@ static unique_ptr<FunctionData> VgiTableBranchesBind(ClientContext &context, Tab
 				VgiScanBranchesResult result;
 				try {
 					result = table_entry->FetchScanBranches(context, /*at_unit=*/"", /*at_value=*/"");
-				} catch (const std::exception &) {
+				} catch (const std::exception &e) {
 					// Skip tables whose branches RPC fails (e.g., transient
-					// worker error). The diagnostic should not block on
-					// individual table failures.
+					// worker error, parse-time rejection like at-most-one-
+					// writable). The diagnostic should not block on
+					// individual table failures, but the skip is observable
+					// via duckdb_logs so a hidden bad entry doesn't go
+					// unnoticed.
+					VGI_LOG(context, "vgi.table_branches.skip_failed_table",
+					        {{"catalog", catalog_name},
+					         {"schema", schema_name},
+					         {"table", table_entry->name},
+					         {"error", e.what()}});
 					return;
 				}
 				for (size_t i = 0; i < result.branches.size(); i++) {
@@ -160,6 +172,7 @@ static unique_ptr<FunctionData> VgiTableBranchesBind(ClientContext &context, Tab
 					row.branch_filter = branch.branch_filter;
 					row.branch_filter_present = !branch.branch_filter.empty();
 					row.table_required_extensions = result.required_extensions;
+					row.writable = branch.writable;
 					data->rows.push_back(std::move(row));
 				}
 			});
@@ -190,6 +203,7 @@ static void VgiTableBranchesScan(ClientContext &context, TableFunctionInput &inp
 			ext_values.emplace_back(ext);
 		}
 		output.SetValue(8, count, Value::LIST(LogicalType::VARCHAR, std::move(ext_values)));
+		output.SetValue(9, count, Value::BOOLEAN(row.writable));
 		count++;
 	}
 	output.SetCardinality(count);

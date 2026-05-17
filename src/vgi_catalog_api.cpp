@@ -615,11 +615,14 @@ VgiScanBranchesResult InvokeCatalogTableScanBranchesGet(
 
 static VgiWriteFunctionResult InvokeCatalogTableWriteFunctionGet(
     const CatalogRpcContext &ctx, const std::string &rpc_method,
-    const std::string &schema_name, const std::string &table_name, ClientContext &context) {
+    const std::string &schema_name, const std::string &table_name, ClientContext &context,
+    const std::optional<std::string> &writable_branch_function_name = std::nullopt) {
 	auto &worker_path = ctx.params->worker_path();
 	std::shared_ptr<arrow::RecordBatch> params;
 	if (rpc_method == "catalog_table_insert_function_get") {
-		params = generated::BuildCatalogTableInsertFunctionGetParams(ctx.attach_opaque_data, schema_name, table_name, OptTxn(ctx));
+		params = generated::BuildCatalogTableInsertFunctionGetParams(
+		    ctx.attach_opaque_data, schema_name, table_name, OptTxn(ctx),
+		    writable_branch_function_name);
 	} else if (rpc_method == "catalog_table_update_function_get") {
 		params = generated::BuildCatalogTableUpdateFunctionGetParams(ctx.attach_opaque_data, schema_name, table_name, OptTxn(ctx));
 	} else {
@@ -635,9 +638,11 @@ static VgiWriteFunctionResult InvokeCatalogTableWriteFunctionGet(
 
 VgiWriteFunctionResult InvokeCatalogTableInsertFunctionGet(
     const CatalogRpcContext &ctx, const std::string &schema_name,
-    const std::string &table_name, ClientContext &context) {
+    const std::string &table_name, ClientContext &context,
+    const std::optional<std::string> &writable_branch_function_name) {
 	return InvokeCatalogTableWriteFunctionGet(ctx, "catalog_table_insert_function_get",
-	                                          schema_name, table_name, context);
+	                                          schema_name, table_name, context,
+	                                          writable_branch_function_name);
 }
 
 VgiWriteFunctionResult InvokeCatalogTableUpdateFunctionGet(
@@ -2014,6 +2019,7 @@ VgiScanBranchesResult ParseScanBranchesResult(ClientContext &context,
 	}
 
 	result.branches.reserve(branch_blobs.size());
+	std::vector<size_t> writable_ordinals;
 	for (size_t i = 0; i < branch_blobs.size(); i++) {
 		auto branch_batch = DeserializeFromIpcBytes(branch_blobs[i]);
 		if (!branch_batch || branch_batch->num_rows() == 0) {
@@ -2042,14 +2048,42 @@ VgiScanBranchesResult ParseScanBranchesResult(ClientContext &context,
 				branch.parsed_branch_filter = std::move(exprs[0]);
 				// Multi-expression case: leave as a single expression by AND-ing.
 				// Skipped here for simplicity — typical worker emits one
-				// predicate; multi-AND can ship in v2 if needed.
+				// predicate; multi-AND can be added if it shows up in practice.
 			} catch (const std::exception &e) {
 				throw BinderException("VGI branch_filter parse error [worker: " + worker_path +
 				                       ", filter: " + branch.branch_filter + "]: " + e.what());
 			}
 		}
 
+		// writable flag is non-nullable on the wire — surface a loud error
+		// if the worker emits NULL. (Legacy single-function workers go
+		// through WrapLegacyAsOneBranch and never reach this parser, so
+		// they don't need a fallback default here.)
+		branch.writable = branch_row["writable"].value_not_null<bool>();
+		if (branch.writable) {
+			writable_ordinals.push_back(i);
+		}
+
 		result.branches.push_back(std::move(branch));
+	}
+
+	// At-most-one-writable invariant. Multiple writable arms would violate
+	// DuckDB's single-writable-catalog-per-transaction rule
+	// (duckdb/src/transaction/meta_transaction.cpp:257-261) if UPDATE/DELETE
+	// ever land, and even for INSERT it makes the routing target ambiguous.
+	// Reject loudly at catalog-load.
+	if (writable_ordinals.size() > 1) {
+		std::string ordinals_csv;
+		for (size_t i = 0; i < writable_ordinals.size(); i++) {
+			if (i > 0) {
+				ordinals_csv += ", ";
+			}
+			ordinals_csv += std::to_string(writable_ordinals[i]);
+		}
+		throw BinderException(
+		    "VGI multi-branch table declared %d writable branches (ordinals: %s); "
+		    "exactly zero or one is allowed [worker: %s]",
+		    static_cast<int>(writable_ordinals.size()), ordinals_csv, worker_path);
 	}
 
 	return result;

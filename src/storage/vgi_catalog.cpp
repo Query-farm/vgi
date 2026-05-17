@@ -215,6 +215,33 @@ static unique_ptr<MergeIntoOperator> VgiPlanMergeIntoAction(ClientContext &conte
 PhysicalOperator &VgiCatalog::PlanMergeInto(ClientContext &context, PhysicalPlanGenerator &planner,
                                              LogicalMergeInto &op, PhysicalOperator &plan) {
 	auto &table_for_returning = op.table.Cast<VgiTableEntry>();
+
+	// Refuse MERGE on multi-branch tables, regardless of which clauses the
+	// user specified (WHEN MATCHED / WHEN NOT MATCHED). Refusing here catches
+	// the "MERGE WHEN NOT MATCHED THEN INSERT only" edge case that would
+	// otherwise slip through (since the INSERT sub-operator's refusal helper
+	// permits writable multi-branch). MERGE on multi-branch tables remains
+	// unsupported until concrete customer requirements for cross-arm
+	// semantics arrive — see docs/multi_branch.md.
+	//
+	// Short-circuits on the cheap multi-branch hint to avoid an RPC on every
+	// MERGE bind to a single-branch VGI table.
+	if (!table_for_returning.IsKnownSingleBranchNoAT()) {
+		auto branches_result =
+		    table_for_returning.FetchScanBranches(context, /*at_unit=*/"", /*at_value=*/"");
+		if (branches_result.branches.size() > 1) {
+			throw BinderException(
+			    "MERGE is not supported on multi-branch VGI table '%s.%s' (%d branches). "
+			    "Issue the MERGE directly against the writable arm's underlying VGI table "
+			    "(declare it as a single-branch VGI table for write access). "
+			    "(MERGE on multi-branch tables is not supported pending concrete "
+			    "customer requirements for cross-arm semantics — see "
+			    "docs/multi_branch.md.)",
+			    table_for_returning.ParentSchema().name, table_for_returning.name,
+			    static_cast<int>(branches_result.branches.size()));
+		}
+	}
+
 	if (op.return_chunk && !table_for_returning.GetTableInfo().supports_returning) {
 		throw BinderException("Table '%s' does not support RETURNING on MERGE",
 		                      table_for_returning.name);

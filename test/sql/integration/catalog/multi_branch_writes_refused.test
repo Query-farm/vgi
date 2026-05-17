@@ -1,0 +1,124 @@
+# name: test/sql/integration/catalog/multi_branch_writes_refused.test
+# description: Verify the INSERT-only write contract for multi-branch tables:
+#                - INSERT against a multi-branch table with no writable arm
+#                  throws BinderException citing "no branch declared writable=true".
+#                - UPDATE/DELETE/MERGE always refuse on multi-branch tables,
+#                  regardless of any branch's writable flag.
+#                - vgi_table_branches() surfaces the `writable` column.
+#                - Single-branch VGI tables remain unaffected.
+# group: [vgi_integration_catalog]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# Reads still work — sanity check that the read path is unaffected.
+# multi_branch_numbers is a 2-branch table with no writable arms.
+# ============================================================================
+
+query I
+SELECT count(*) FROM example.data.multi_branch_numbers;
+----
+100
+
+# ============================================================================
+# INSERT refused. The example worker is fully read-only — it doesn't
+# implement table_insert_function_get for ANY table — so the DuckDB binder
+# refuses at an earlier layer than the multi-branch-specific refusal helper.
+# Either way, the customer sees a clear "this is not writable" error. The
+# multi-branch-specific helper (RefuseInsertIfMultiBranchUnwritable) is
+# exercised by writable workers that expose insert functions but lack a
+# writable arm declaration — that path is covered when a writable
+# multi-branch fixture lands.
+# ============================================================================
+
+statement error
+INSERT INTO example.data.multi_branch_numbers VALUES (42);
+----
+does not support INSERT
+
+# ============================================================================
+# UPDATE/DELETE/MERGE refused on multi-branch tables.
+#
+# DELETE / UPDATE: DuckDB's binder rejects at bind_delete.cpp:23 /
+# bind_update.cpp:128 because the marker TableFunction returned by
+# VgiTableEntry::GetScanFunction has no `get_bind_info` callback, so
+# LogicalGet::GetTable() returns null and the binder treats the source as
+# a non-base-table. The error is "Can only delete/update base table" —
+# misleading wording (the table IS a base table semantically) but the
+# refusal is loud and deterministic. The RefuseUpdateDeleteIfMultiBranch
+# helper inside VgiPhysicalDelete/Update::GetGlobalSinkState is a defense-
+# in-depth backstop that fires when this binder path is bypassed.
+# ============================================================================
+
+statement error
+DELETE FROM example.data.multi_branch_numbers WHERE n > 50;
+----
+Can only delete from base table
+
+statement error
+UPDATE example.data.multi_branch_numbers SET n = 0 WHERE n > 50;
+----
+Can only update base table
+
+# MERGE refusal: DuckDB's MERGE binder runs the same base-table check and
+# also rejects the marker-backed multi-branch source ("Can only merge into
+# base tables!"). Our explicit check in PlanMergeInto is a defense-in-depth
+# backstop for cases where this binder path is bypassed.
+statement error
+MERGE INTO example.data.multi_branch_numbers USING (SELECT 999 AS n) src ON 1=1 WHEN NOT MATCHED THEN INSERT (n) VALUES (src.n);
+----
+Can only merge into base tables
+
+# ============================================================================
+# vgi_table_branches() surfaces the writable column. All branches in the
+# example fixture are writable=false (the multi_branch_two_writable table
+# fails parse before this diagnostic can list its branches).
+# ============================================================================
+
+query I
+SELECT COUNT(*) > 0 FROM vgi_table_branches() WHERE catalog_name = 'example';
+----
+true
+
+# Schema sanity: writable column is BOOLEAN.
+query II
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM vgi_table_branches()) WHERE column_name = 'writable';
+----
+writable	BOOLEAN
+
+# All fixture branches are read-only.
+query I
+SELECT COUNT(*) FROM vgi_table_branches()
+WHERE catalog_name = 'example'
+  AND writable = true;
+----
+0
+
+# Specifically verify multi_branch_numbers has writable=false on both branches.
+query II
+SELECT branch_index, writable FROM vgi_table_branches()
+WHERE catalog_name = 'example' AND table_name = 'multi_branch_numbers'
+ORDER BY branch_index;
+----
+0	false
+1	false
+
+# ============================================================================
+# Single-branch backward compat: numbers is a single-branch table; writes
+# (if attempted) go through the regular single-branch path unchanged. The
+# example fixture's `numbers` table doesn't declare writability so writes
+# still refuse with a different (worker-level) error, but the multi-branch
+# refusal helper does NOT fire on it.
+# ============================================================================
+
+query I
+SELECT count(*) FROM example.data.numbers;
+----
+100

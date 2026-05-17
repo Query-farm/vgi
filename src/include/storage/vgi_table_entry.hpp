@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
@@ -52,6 +53,19 @@ public:
 	vgi::VgiScanBranchesResult FetchScanBranches(ClientContext &context, const std::string &at_unit,
 	                                              const std::string &at_value);
 
+	// Cheap pre-RPC check for "is this table multi-branch under the no-AT
+	// view?" Returns true only when we know cheaply that the table is
+	// single-branch (inlined scan_function, or a previously cached hint).
+	// False means "not known cheaply — caller must fetch branches to
+	// decide." Used by the write-refusal helpers to skip an RPC on every
+	// write to a single-branch table.
+	bool IsKnownSingleBranchNoAT() const;
+	// Record the multi-branch / single-branch determination after a
+	// FetchScanBranches call with empty AT, so subsequent
+	// IsKnownSingleBranchNoAT calls can short-circuit. Safe to call
+	// concurrently (atomic CAS internally).
+	void RecordMultiBranchHintNoAT(bool is_multi_branch) const;
+
 private:
 	TableFunction GetScanFunctionImpl(ClientContext &context, unique_ptr<FunctionData> &bind_data,
 	                                  const string &at_unit, const string &at_value);
@@ -71,6 +85,16 @@ private:
 
 	// No persistent branches_ cache — fetched fresh per scan via
 	// FetchScanBranches so AT (...) variants resolve correctly.
+
+	// Cheap multi-branch hint for the no-AT case (used by write-refusal
+	// helpers, which always use empty AT). Writes don't honour time
+	// travel so the no-AT view is stable per table. Atomic tri-state:
+	//   -1 = unknown (initial)
+	//    0 = known single-branch
+	//    1 = known multi-branch
+	// Lifetime is tied to the VgiTableEntry; vgi_clear_cache() or
+	// catalog-version invalidation creates a fresh entry with hint reset.
+	mutable std::atomic<int> multi_branch_hint_no_at_{-1};
 
 	// Column statistics cache: lazy-fetched via RPC, TTL-based expiry, thread-safe.
 	// Mutable because GetStatistics() is const in the DuckDB interface but we

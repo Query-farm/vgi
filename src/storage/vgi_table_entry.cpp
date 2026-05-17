@@ -287,6 +287,25 @@ TableFunction VgiTableEntry::GetScanFunction(ClientContext &context, unique_ptr<
 	return GetScanFunctionImpl(context, bind_data, at_unit, at_value);
 }
 
+bool VgiTableEntry::IsKnownSingleBranchNoAT() const {
+	// Inlined scan_function on table_info_ means the worker pre-shipped
+	// the legacy single-function path — definitely single-branch, no
+	// RPC ever needed for this table.
+	if (table_info_.scan_function.has_value()) {
+		return true;
+	}
+	// Otherwise consult the atomic hint populated by a prior
+	// FetchScanBranches call.
+	return multi_branch_hint_no_at_.load(std::memory_order_acquire) == 0;
+}
+
+void VgiTableEntry::RecordMultiBranchHintNoAT(bool is_multi_branch) const {
+	int target = is_multi_branch ? 1 : 0;
+	int expected = -1;
+	// First-writer-wins. Subsequent calls leave the existing value alone.
+	multi_branch_hint_no_at_.compare_exchange_strong(expected, target, std::memory_order_acq_rel);
+}
+
 vgi::VgiScanBranchesResult VgiTableEntry::FetchScanBranches(ClientContext &context, const std::string &at_unit,
                                                               const std::string &at_value) {
 	// Fresh RPC per call. branches[] can vary with AT(...) — e.g.,
@@ -301,7 +320,16 @@ vgi::VgiScanBranchesResult VgiTableEntry::FetchScanBranches(ClientContext &conte
 	                                vgi_tx_scan.GetTransactionOpaqueData()};
 	rpc_ctx.entity_kind = "table";
 	rpc_ctx.entity_qualifier = ParentSchema().name + "." + name;
-	return vgi::InvokeCatalogTableScanBranchesGet(rpc_ctx, ParentSchema().name, name, context, at_unit, at_value);
+	auto result = vgi::InvokeCatalogTableScanBranchesGet(rpc_ctx, ParentSchema().name, name, context, at_unit, at_value);
+	// Populate the multi-branch hint for the no-AT case so subsequent
+	// write-refusal helpers can short-circuit without an RPC. AT-carrying
+	// fetches don't populate the hint because the count COULD differ
+	// per version in principle (writes always use empty AT, so the no-AT
+	// snapshot is authoritative for them).
+	if (at_unit.empty() && at_value.empty()) {
+		RecordMultiBranchHintNoAT(result.branches.size() > 1);
+	}
+	return result;
 }
 
 TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_ptr<FunctionData> &bind_data,
