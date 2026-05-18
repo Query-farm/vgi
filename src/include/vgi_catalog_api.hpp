@@ -287,6 +287,20 @@ struct CatalogAttachResult {
 	std::string resolved_implementation_version;
 };
 
+// One published data version of a catalog, surfaced via catalog_catalogs().
+// Mirrors vgi-python CatalogDataVersionRelease.
+struct VgiCatalogReleaseInfo {
+	// Concrete published version (e.g. "1.0.0"). Non-empty per protocol.
+	std::string version;
+	// Release timestamp in microseconds since Unix epoch (UTC). Worker-asserted
+	// non-nullable on the wire; defaults to 0 if a worker ever omits it.
+	int64_t released_at_us = 0;
+	// One-line human summary. Empty when the worker has no opinion.
+	std::string summary;
+	// Optional per-release link to detailed notes. Empty when null on the wire.
+	std::string notes_url;
+};
+
 // Discovery record for a catalog returned by catalog_catalogs(). Matches the
 // vgi-python CatalogInfo dataclass on the wire.
 struct VgiCatalogInfo {
@@ -296,6 +310,12 @@ struct VgiCatalogInfo {
 	// Attach-time options this catalog accepts. Used for pre-attach discovery
 	// and for bind-time validation in VgiCatalogAttach.
 	std::vector<VgiAttachOptionSpec> attach_option_specs;
+	// Published data versions for this catalog, newest-first. Empty when the
+	// worker doesn't track release history.
+	std::vector<VgiCatalogReleaseInfo> releases;
+	// Where this worker's code lives (repo, build, docs). Empty when the
+	// worker doesn't advertise a source location.
+	std::string source_url;
 };
 
 // Schema metadata from the worker

@@ -67,6 +67,19 @@ static unique_ptr<FunctionData> VgiCatalogsBind(ClientContext &context, TableFun
 	return_types.push_back(LogicalType::LIST(LogicalType::STRUCT(std::move(option_fields))));
 	names.push_back("attach_options");
 
+	// Published data versions, newest-first. Empty when the worker has no
+	// release history. See CatalogDataVersionRelease in vgi-python.
+	child_list_t<LogicalType> release_fields;
+	release_fields.emplace_back("version", LogicalType::VARCHAR);
+	release_fields.emplace_back("released_at", LogicalType::TIMESTAMP_TZ);
+	release_fields.emplace_back("summary", LogicalType::VARCHAR);
+	release_fields.emplace_back("notes_url", LogicalType::VARCHAR);
+	return_types.push_back(LogicalType::LIST(LogicalType::STRUCT(std::move(release_fields))));
+	names.push_back("releases");
+
+	return_types.push_back(LogicalType::VARCHAR);
+	names.push_back("source_url");
+
 	return bind_data;
 }
 
@@ -121,6 +134,32 @@ static void VgiCatalogsScan(ClientContext &context, TableFunctionInput &input, D
 			option_values.push_back(Value::STRUCT(std::move(struct_values)));
 		}
 		output.data[3].SetValue(count, Value::LIST(struct_type, std::move(option_values)));
+
+		// Build LIST(STRUCT(...)) of releases.
+		child_list_t<LogicalType> release_child_types;
+		release_child_types.emplace_back("version", LogicalType::VARCHAR);
+		release_child_types.emplace_back("released_at", LogicalType::TIMESTAMP_TZ);
+		release_child_types.emplace_back("summary", LogicalType::VARCHAR);
+		release_child_types.emplace_back("notes_url", LogicalType::VARCHAR);
+		auto release_struct_type = LogicalType::STRUCT(release_child_types);
+
+		std::vector<Value> release_values;
+		release_values.reserve(info.releases.size());
+		for (const auto &release : info.releases) {
+			child_list_t<Value> struct_values;
+			struct_values.emplace_back("version", Value(release.version));
+			struct_values.emplace_back("released_at",
+			                           Value::TIMESTAMPTZ(timestamp_tz_t(release.released_at_us)));
+			struct_values.emplace_back("summary", Value(release.summary));
+			struct_values.emplace_back("notes_url",
+			                           release.notes_url.empty() ? Value(LogicalType::VARCHAR)
+			                                                     : Value(release.notes_url));
+			release_values.push_back(Value::STRUCT(std::move(struct_values)));
+		}
+		output.data[4].SetValue(count, Value::LIST(release_struct_type, std::move(release_values)));
+
+		output.data[5].SetValue(count, info.source_url.empty() ? Value(LogicalType::VARCHAR)
+		                                                      : Value(info.source_url));
 
 		count++;
 		state.current_idx++;

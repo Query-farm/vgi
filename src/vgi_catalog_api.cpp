@@ -317,6 +317,46 @@ std::vector<VgiCatalogInfo> InvokeCatalogs(const std::string &worker_path, Clien
 			info.attach_option_specs.push_back(ParseAttachOptionSpec(spec_bytes, worker_path, context));
 		}
 
+		// Parse releases (list<struct<version, released_at, summary, notes_url>>).
+		// Older workers that predate release-history discovery omit this field — treat as empty.
+		auto releases_col = info_batch->GetColumnByName("releases");
+		if (releases_col) {
+			auto list_array = std::dynamic_pointer_cast<arrow::ListArray>(releases_col);
+			if (list_array && !list_array->IsNull(0)) {
+				auto start = list_array->value_offset(0);
+				auto end = list_array->value_offset(1);
+				auto struct_array = std::dynamic_pointer_cast<arrow::StructArray>(list_array->values());
+				if (struct_array) {
+					auto version_array =
+					    std::dynamic_pointer_cast<arrow::StringArray>(struct_array->GetFieldByName("version"));
+					auto released_at_array =
+					    std::dynamic_pointer_cast<arrow::TimestampArray>(struct_array->GetFieldByName("released_at"));
+					auto summary_array =
+					    std::dynamic_pointer_cast<arrow::StringArray>(struct_array->GetFieldByName("summary"));
+					auto notes_url_array =
+					    std::dynamic_pointer_cast<arrow::StringArray>(struct_array->GetFieldByName("notes_url"));
+					for (auto i = start; i < end; i++) {
+						VgiCatalogReleaseInfo release;
+						if (version_array && !version_array->IsNull(i)) {
+							release.version = version_array->GetString(i);
+						}
+						if (released_at_array && !released_at_array->IsNull(i)) {
+							release.released_at_us = released_at_array->Value(i);
+						}
+						if (summary_array && !summary_array->IsNull(i)) {
+							release.summary = summary_array->GetString(i);
+						}
+						if (notes_url_array && !notes_url_array->IsNull(i)) {
+							release.notes_url = notes_url_array->GetString(i);
+						}
+						info.releases.push_back(std::move(release));
+					}
+				}
+			}
+		}
+
+		info.source_url = row["source_url"].value_or(std::string(""));
+
 		out.push_back(std::move(info));
 	}
 	return out;
