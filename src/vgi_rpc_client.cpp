@@ -1,6 +1,7 @@
 #include "vgi_rpc_client.hpp"
 
 #include "duckdb/common/exception.hpp"
+#include "generated/vgi_protocol_version.hpp"
 #include "vgi_arrow_ipc.hpp"
 #include "vgi_exception.hpp"
 #include "vgi_logging.hpp"
@@ -103,10 +104,18 @@ void WriteRpcRequest(int fd, const std::string &method_name,
 	}
 	auto writer = writer_result.ValueUnsafe();
 
-	// Create custom metadata with method and version, plus any caller-provided
-	// extras (e.g. shm segment advertisement on init requests).
-	std::vector<std::string> keys = {RPC_METHOD_KEY, RPC_REQUEST_VERSION_KEY};
-	std::vector<std::string> values = {method_name, RPC_REQUEST_VERSION_VALUE};
+	// Create custom metadata with method, wire version, application
+	// protocol_version, plus any caller-provided extras (e.g. shm segment
+	// advertisement on init requests). The protocol_version is enforced by
+	// the server at the dispatch boundary; a mismatch surfaces as IOException
+	// with directional "upgrade the client" / "upgrade the worker" guidance
+	// before any user data crosses the wire.
+	std::vector<std::string> keys = {RPC_METHOD_KEY, RPC_REQUEST_VERSION_KEY, RPC_PROTOCOL_VERSION_KEY};
+	std::vector<std::string> values = {
+	    method_name,
+	    RPC_REQUEST_VERSION_VALUE,
+	    std::string(::duckdb::vgi::generated::VGI_PROTOCOL_VERSION),
+	};
 	if (extra_metadata) {
 		for (int64_t i = 0; i < extra_metadata->size(); ++i) {
 			keys.push_back(extra_metadata->key(i));
@@ -332,10 +341,11 @@ std::vector<uint8_t> SerializeRpcRequest(const std::string &method_name,
 	}
 	auto writer = writer_result.ValueUnsafe();
 
-	// Create custom metadata with method and version
+	// Create custom metadata with method, wire version, and application
+	// protocol_version (enforced server-side at dispatch boundary).
 	auto metadata = arrow::KeyValueMetadata::Make(
-	    {RPC_METHOD_KEY, RPC_REQUEST_VERSION_KEY},
-	    {method_name, RPC_REQUEST_VERSION_VALUE});
+	    {RPC_METHOD_KEY, RPC_REQUEST_VERSION_KEY, RPC_PROTOCOL_VERSION_KEY},
+	    {method_name, RPC_REQUEST_VERSION_VALUE, std::string(::duckdb::vgi::generated::VGI_PROTOCOL_VERSION)});
 
 	auto status = writer->WriteRecordBatch(*params_batch, metadata);
 	if (!status.ok()) {
