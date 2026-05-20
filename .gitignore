@@ -9,3 +9,8 @@ testext
 test/python/__pycache__/
 .Rhistory
 .cloudflare-do.env
+
+# Local-only dev scripts and scratch SQL (kept on disk, not tracked)
+/build-wasm*.sh
+/otel-env.sh
+/test*.sql
