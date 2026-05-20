@@ -1,5 +1,4 @@
-// © Copyright 2025-2026, Query.Farm LLC - https://query.farm
-// SPDX-License-Identifier: Apache-2.0
+// © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 //
 // Pure helpers for the Unix-socket worker launcher.  No I/O, no fork, no
 // socket calls — every function here is a deterministic transformation that

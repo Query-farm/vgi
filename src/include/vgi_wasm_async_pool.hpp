@@ -1,3 +1,4 @@
+// © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #pragma once
 
 // WASM-only: a pre-spawned, bounded thread pool for std::async-style work.

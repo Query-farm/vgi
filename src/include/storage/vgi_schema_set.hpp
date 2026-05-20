@@ -1,3 +1,4 @@
+// © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #pragma once
 
 #include "storage/vgi_catalog_set.hpp"

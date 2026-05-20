@@ -1,3 +1,4 @@
+// © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "vgi_table_function_impl.hpp"
 #ifdef __EMSCRIPTEN__
 #include <pthread.h>

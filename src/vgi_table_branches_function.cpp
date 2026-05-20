@@ -1,3 +1,4 @@
+// © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 // =============================================================================
 // vgi_table_branches() — diagnostic table function. One row per
 // (catalog, schema, table, branch_index) across every attached VGI catalog.

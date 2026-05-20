@@ -1,3 +1,4 @@
+// © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "vgi_table_buffering_impl.hpp"
 
 #include <arrow/c/bridge.h>

@@ -1,5 +1,4 @@
-// © Copyright 2025-2026, Query.Farm LLC - https://query.farm
-// SPDX-License-Identifier: Apache-2.0
+// © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 //
 // POSIX-only — depends on vgi_launcher (fork/exec) and vgi_unix_socket
 // (AF_UNIX).  Under emscripten this translation unit is empty; the

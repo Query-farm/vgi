@@ -1,3 +1,4 @@
+// © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #define DUCKDB_EXTENSION_MAIN
 
 #include "vgi_extension.hpp"

@@ -1,5 +1,4 @@
-// © Copyright 2025-2026, Query.Farm LLC - https://query.farm
-// SPDX-License-Identifier: Apache-2.0
+// © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 //
 // SubProcess subclass that wraps a connected AF_UNIX socket.
 //

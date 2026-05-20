@@ -1,3 +1,4 @@
+// © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "vgi_arrow_utils.hpp"
 #include "vgi_protocol_constants.hpp"
 #include "vgi_rpc_types.hpp"

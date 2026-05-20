@@ -1,3 +1,4 @@
+// © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "vgi_table_statistics_function.hpp"
 
 #include "duckdb/catalog/catalog.hpp"

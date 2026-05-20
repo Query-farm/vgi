@@ -1,5 +1,4 @@
-// © Copyright 2025-2026, Query.Farm LLC - https://query.farm
-// SPDX-License-Identifier: Apache-2.0
+// © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 //
 // Public façade for the Unix-socket worker launcher.  Brings up — or reuses —
 // a long-running worker process that the calling DuckDB extension can then

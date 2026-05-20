@@ -1,3 +1,4 @@
+// © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "vgi_wasm_async_pool.hpp"
 
 #ifdef __EMSCRIPTEN__

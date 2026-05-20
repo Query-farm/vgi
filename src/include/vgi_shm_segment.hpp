@@ -1,5 +1,4 @@
-// © Copyright 2025-2026, Query.Farm LLC - https://query.farm
-// SPDX-License-Identifier: Apache-2.0
+// © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 //
 // Shared-memory transport for vgi_rpc on POSIX hosts. Mirrors the
 // Python reference implementation at vgi-rpc/vgi_rpc/shm.py:
