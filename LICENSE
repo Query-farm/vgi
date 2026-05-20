@@ -1,86 +1,134 @@
-License text copyright (c) 2020 MariaDB Corporation Ab, All Rights Reserved.
-"Business Source License" is a trademark of MariaDB Corporation Ab.
+Query Farm Source-Available License, Version 1.0
 
-## Parameters
+Copyright (c) 2026 Query Farm LLC. All rights reserved.
 
-**Licensor:** Query Farm LLC - http://query.farm (hello@query.farm)
+## 1. Definitions
 
-**Licensed Work:** VGI DuckDB Extension. The Licensed Work is (c) 2026 Query Farm LLC
+"Licensor" means Query Farm LLC (http://query.farm, hello@query.farm) and its
+affiliates under common control.
 
-**Additional Use Grant:** You may make production use of the Licensed Work, provided
-Your use does not include offering the Licensed Work to third parties on a hosted,
-embedded, or as-a-service basis in order to compete with Query Farm LLC or
-affiliates' commercial interests.
+"VGI" means the Vector Gateway Interface, the DuckDB extension technology developed
+by the Licensor, also referred to by the Licensor as its "Hyperfederation" database
+technology.
 
-For purposes of this license:
+"Licensed Work" means VGI, including its source code, object code, and any
+documentation distributed with it, in each version made available by the Licensor
+under this License.
 
-An offering is a "competitive offering" if it meets *either* of the two definitions
-below.
+"You" (or "Your") means the individual or legal entity exercising rights under this
+License, together with all affiliates under common control with that entity.
 
-A "competitive offering" is a Product that is offered to third parties on a paid
-basis, including through paid support arrangements, that significantly overlaps with
-the capabilities of Query Farm's version(s) of the Licensed Work.
+"Production Use" means any use of the Licensed Work other than for development,
+testing, evaluation, experimentation, or other non-production purposes.
 
-A "competitive offering" also includes any Product or service that integrates the
-Licensed Work with, or uses it to construct, a commercial marketplace
-or exchange for VGI-based services.
+"Hyperfederation Services" means services relating to the federation, gateway,
+integration, querying, or interoperation of data sources using VGI or
+functionally equivalent technology, including services that expose, broker, or
+provide access to such federated or gateway capabilities.
 
-"Product" means software that is offered to end users to manage in their own
-environments or offered as a service on a hosted basis.
+"Commercial Marketplace" means any platform, exchange, or intermediary service,
+whether or not operated for a fee, that connects providers and consumers of
+Hyperfederation Services, or that facilitates the offering, discovery, exchange,
+sale, or licensing of Hyperfederation Services among third parties.
 
-"Embedded" means including the source code or executable code from the Licensed Work
-in a competitive offering. "Embedded" also means packaging the competitive offering
-in such a way that the Licensed Work must be accessed or downloaded for the
-competitive offering to operate.
+"Competing Offering" means a product or service that You make available to third
+parties, on a paid basis (including through paid support, subscription, or hosting
+arrangements), whose capabilities significantly overlap with those of the Licensor's
+version(s) of the Licensed Work.
 
-Hosting or using the Licensed Work(s) for internal purposes within an organization
-is not considered a competitive offering. Query Farm considers your organization to
-include all of your affiliates under common control.
+## 2. Grant of Rights
 
-If you need custom licensing terms contact: hello@query.farm.
+Subject to the terms and limitations of this License, the Licensor grants You a
+worldwide, royalty-free, non-exclusive license to:
 
-**Change Date:** The tenth anniversary of the first publicly available distribution
-of the specific version of the Licensed Work.
+(a) use, copy, and run the Licensed Work for any non-production purpose;
 
-**Change License:** Apache 2.0
+(b) modify the Licensed Work and create derivative works of it;
 
-## Notice
+(c) redistribute the Licensed Work and Your derivative works, provided You comply
+with Section 5; and
 
-Business Source License 1.1
+(d) make Production Use of the Licensed Work, except where such use is restricted by
+Section 3 or reserved to the Licensor by Section 4.
 
-## Terms
+## 3. Production Use Conditions
 
-The Licensor hereby grants you the right to copy, modify, create derivative works,
-redistribute, and make non-production use of the Licensed Work. The Licensor may make
-an Additional Use Grant, above, permitting limited production use.
+The grant of Production Use in Section 2(d) does not extend to, and You may not
+without a separate commercial license from the Licensor:
 
-Effective on the Change Date, the Licensor hereby grants you rights under the terms of
-the Change License, and the rights granted in the paragraph above terminate.
+(a) provide a Competing Offering to third parties; or
 
-If your use of the Licensed Work does not comply with the requirements currently in
-effect as described in this License, you must purchase a commercial license from the
-Licensor, its affiliated entities, or authorized resellers, or you must refrain from
-using the Licensed Work.
+(b) offer the Licensed Work, or any derivative work of it, to third parties on a
+hosted, embedded, or as-a-service basis where doing so competes with the Licensor's
+commercial interests in the Licensed Work.
 
-All copies of the original and modified Licensed Work, and derivative works of the
-Licensed Work, are subject to this License. This License applies separately for each
-version of the Licensed Work and the Change Date may vary for each version of the
-Licensed Work released by Licensor.
+"Embedded" includes incorporating the source or object code of the Licensed Work
+into a Competing Offering, and packaging a Competing Offering such that the Licensed
+Work must be accessed or downloaded for that offering to function.
 
-You must conspicuously display this License on each original or modified copy of the
-Licensed Work. If you receive the Licensed Work in original or modified form from a
-third party, the terms and conditions set forth in this License apply to your use of
-that work.
+Hosting or using the Licensed Work for Your own internal purposes is not a Competing
+Offering and is permitted, including across Your affiliates under common control.
 
-Any use of the Licensed Work in violation of this License will automatically terminate
-your rights under this License for the current and all other versions of the Licensed
-Work.
+## 4. Reserved Rights
 
-This License does not grant you any right in any trademark or logo of Licensor or its
-affiliates (provided that you may use a trademark or logo of Licensor as expressly
-required by this License).
+Notwithstanding any other provision of this License, the Licensor reserves to itself
+the exclusive right to build, operate, offer, or authorize a Commercial Marketplace
+that incorporates, integrates, is built upon, or otherwise uses the Licensed Work.
 
-TO THE EXTENT PERMITTED BY APPLICABLE LAW, THE LICENSED WORK IS PROVIDED ON AN "AS IS"
-BASIS. LICENSOR HEREBY DISCLAIMS ALL WARRANTIES AND CONDITIONS, EXPRESS OR IMPLIED,
-INCLUDING (WITHOUT LIMITATION) WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR
-PURPOSE, NON-INFRINGEMENT, AND TITLE.
+This License grants You no right to construct, operate, or enable a Commercial
+Marketplace using the Licensed Work, whether on a commercial or non-commercial basis,
+and any such use requires a separate written agreement with the Licensor.
+
+## 5. Redistribution
+
+If You redistribute the Licensed Work or any derivative work of it, in original or
+modified form, You must:
+
+(a) include a complete, unmodified copy of this License with each copy; and
+
+(b) cause any recipient to receive the Licensed Work subject to the terms of this
+License.
+
+The conditions in Sections 3 and 4 apply to every recipient of the Licensed Work,
+whether received directly from the Licensor or through a third party.
+
+## 6. Conversion to Open Source
+
+For each version of the Licensed Work, on the tenth anniversary of the date the
+Licensor first made that version publicly available (the "Change Date" for that
+version), the Licensor additionally grants You the right to use that version under
+the terms of the Apache License, Version 2.0, and on and after that version's Change
+Date the restrictions in Sections 3 and 4 no longer apply to that version.
+
+This License applies separately to each version of the Licensed Work, and the Change
+Date may differ between versions.
+
+## 7. Commercial Licensing
+
+If Your intended use is not permitted under this License, You may obtain a separate
+commercial license from the Licensor by contacting hello@query.farm. Absent such a
+license, You must refrain from the restricted use.
+
+## 8. Trademarks
+
+This License does not grant You any right to use the names, trademarks, service
+marks, or logos of the Licensor, including "Vector Gateway Interface," "VGI," and
+"Hyperfederation," except as required for reasonable and customary use in describing
+the origin of the Licensed Work.
+
+## 9. Termination
+
+Any use of the Licensed Work in violation of this License automatically terminates
+Your rights under this License for the current and all other versions of the Licensed
+Work. Your rights may be reinstated only by a writing signed by the Licensor.
+
+## 10. Disclaimer of Warranty and Limitation of Liability
+
+TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, THE LICENSED WORK IS PROVIDED ON
+AN "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, EXPRESS OR IMPLIED,
+INCLUDING WITHOUT LIMITATION ANY WARRANTIES OR CONDITIONS OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE, NON-INFRINGEMENT, OR TITLE.
+
+TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, IN NO EVENT WILL THE LICENSOR BE
+LIABLE TO YOU FOR ANY DAMAGES ARISING OUT OF OR RELATING TO THIS LICENSE OR THE USE
+OF THE LICENSED WORK, WHETHER IN CONTRACT, TORT, OR OTHERWISE.
