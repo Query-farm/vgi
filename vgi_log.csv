@@ -1,1 +1,0 @@
-SELECT * FROM vgi_catalogs('/Users/rusty/Development/vgi-python/.venv/bin/vgi-example-worker');

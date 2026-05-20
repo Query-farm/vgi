@@ -14,3 +14,4 @@ test/python/__pycache__/
 /build-wasm*.sh
 /otel-env.sh
 /test*.sql
+/vgi_log.csv
