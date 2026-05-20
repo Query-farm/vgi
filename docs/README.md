@@ -150,6 +150,9 @@ test targets, debug builds, and environment variables.
 
 ## License
 
-This project is licensed under the **Business Source License 1.1** (Licensor: Query Farm
-LLC). It converts to **Apache 2.0** on the Change Date. See [`LICENSE`](../LICENSE) for the
-full terms.
+This project is licensed under the **Query Farm License** (Licensor: Query Farm LLC).
+Non-production use is freely permitted, and limited production use is allowed under the
+Additional Use Grant — see [`LICENSE`](../LICENSE) for the full terms. The license
+converts to **Apache 2.0** on the Change Date.
+
+For commercial or custom licensing, contact hello@query.farm.
