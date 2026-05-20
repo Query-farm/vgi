@@ -116,9 +116,11 @@ defined, the cast machinery throws.
 
 ## What multi-branch tables deliberately don't do
 
+> **`INSERT` is supported** — it routes to the writable arm when exactly one
+> branch declares `writable=True`. See *Writable multi-branch tables* below.
+
 | Concern | Current behaviour | Future path (when customer evidence arrives) |
 |---|---|---|
-| **`INSERT`** | Routes to the writable arm when exactly one branch declares `writable=True` (see *Writable multi-branch tables* below). Otherwise refused. | — |
 | **`UPDATE` / `DELETE` / `MERGE`** | Refused at bind regardless of `writable` flag — see *Why UPDATE/DELETE are deferred* below for the cross-arm semantics question | Per-table semantic declaration (loud-error vs. silent-scope vs. refuse) once concrete customer evidence narrows the right choice |
 | **Time travel** (`AT (VERSION => N)`) | Refused at bind with `BinderException("AT (...) clauses are not supported on multi-branch VGI tables")` | Per-branch `at_modes: set[AtUnit]` declaration |
 | **Cross-branch snapshot consistency** | Each branch binds at its own per-source point-in-time. Kafka's offset and Iceberg's snapshot id are independent — no coordinated read transaction | Coordinated read transaction RPCs across branches |
@@ -344,12 +346,16 @@ failure doesn't get silently rerouted to the legacy path.
 - **Per-attach capability cache**: tri-state atomic on
   `VgiAttachParameters` (`branches_capability_`), accessed via
   `LoadBranchesCapability` / `StoreBranchesCapability`.
-- **C++ refusal guards**: `VgiTableEntry::GetScanFunctionImpl`
-  (AT-clause refusal; multi-branch marker construction); the three
+- **C++ write guards**: `VgiTableEntry::GetScanFunctionImpl` (AT-clause
+  refusal; multi-branch marker construction); the
   `VgiPhysicalInsert/Delete/Update::GetGlobalSinkState` paths in
-  `src/storage/vgi_physical_write.cpp` (write refusal).
+  `src/storage/vgi_physical_write.cpp`. INSERT routes through
+  `RefuseInsertIfMultiBranchUnwritable` (permits when a writable arm exists,
+  refuses an all-read-only table); UPDATE/DELETE/MERGE go through
+  `RefuseUpdateDeleteIfMultiBranch` (always refuse on multi-branch tables).
 - **Tests**: `test/sql/integration/catalog/multi_branch_*.test` —
   union semantics, branch_filter pruning, heterogeneous arms, by-name
   reconciliation, LATERAL, JoinOptimizer interaction, pushdown-incapable
-  arms, capability cache, empty-branches loud-fail, AT/write refusal.
+  arms, capability cache, empty-branches loud-fail, AT refusal,
+  writable-arm INSERT, and UPDATE/DELETE refusal.
   All pass under both subprocess and HTTP transports.
