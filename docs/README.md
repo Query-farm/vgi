@@ -1,185 +1,155 @@
-# DuckDB Extension Template
-This repository contains a template for creating a DuckDB extension. The main goal of this template is to allow users to easily develop, test and distribute their own DuckDB extension. The main branch of the template is always based on the latest stable DuckDB allowing you to try out your extension right away.
+# VGI — Vector Gateway Interface for DuckDB
 
-## Getting started
-First step to getting started is to create your own repo from this template by clicking `Use this template`. Then clone your new repository using
-```sh
-git clone --recurse-submodules https://github.com/<you>/<your-new-extension-repo>.git
+**VGI** (Vector Gateway Interface) is an Apache Arrow–based protocol for extending DuckDB
+using *any* language — no C++/C/Rust/Zig and no compilation or linking required.
+
+This repository contains the **DuckDB extension** (the C++ side of VGI). It loads into
+DuckDB and lets you `ATTACH` a *worker* — a program written in Python, TypeScript, Go, or
+anything that speaks the protocol — and then call the scalar, table, and aggregate
+functions that worker exposes as if they were native DuckDB functions. Data moves between
+DuckDB and the worker over Apache Arrow IPC, across a subprocess pipe, an HTTP connection,
+or a Unix domain socket.
+
+The reference worker SDK lives in a sibling project:
+[**vgi-python**](https://github.com/Query-farm/vgi-python) — `pip install vgi`.
+
+Created by [Query.Farm](https://query.farm).
+
+## Why VGI?
+
+| Traditional DuckDB extensions | VGI workers |
+|-------------------------------|-------------|
+| C/C++ compilation required | Any language — write a script or ship a binary |
+| Tied to a specific DuckDB version | Version independent |
+| Complex build / release cycle | Ship a script or executable |
+| Runs in-process | Process isolation |
+| Single-threaded by default | Parallel pooled workers |
+
+**Use cases:** call REST APIs from SQL, run ML inference (PyTorch, scikit-learn),
+process data with Python/pandas/numpy, build custom ETL transforms, or expose external
+data sources as queryable tables and views.
+
+## Quick Start
+
+Install the extension and attach a worker:
+
+```sql
+-- First time only
+INSTALL vgi FROM community;
+LOAD vgi;
+
+-- Attach a worker as a catalog
+ATTACH 'my_funcs' (TYPE vgi, LOCATION './my_worker.py');
+
+-- Call the functions it exposes
+SELECT upper_case(name) FROM users;
+SELECT * FROM my_table_function('arg');
 ```
-Note that `--recurse-submodules` will ensure DuckDB is pulled which is required to build the extension.
+
+A minimal Python worker (using `vgi-python`):
+
+```python
+# my_worker.py
+from typing import Annotated
+import pyarrow as pa
+import pyarrow.compute as pc
+from vgi import ScalarFunction, Param, Returns, Worker
+
+
+class UpperCase(ScalarFunction):
+    """Convert string values to uppercase."""
+
+    @classmethod
+    def compute(
+        cls,
+        value: Annotated[pa.StringArray, Param(doc="String value to uppercase")],
+    ) -> Annotated[pa.StringArray, Returns()]:
+        return pc.utf8_upper(value)
+
+
+class MyWorker(Worker):
+    catalog_name = "my_funcs"
+    functions = [UpperCase]
+
+
+if __name__ == "__main__":
+    MyWorker().run()
+```
+
+## Features
+
+- **Function shapes** — scalar, table, table-in-out (streaming), buffered table
+  (see-every-row-before-output), aggregate, and windowed aggregate functions, all defined
+  in the worker and surfaced as native DuckDB functions.
+- **Full catalog integration** — workers expose schemas, tables, views, and functions;
+  DuckDB lazily loads catalog metadata, column statistics, and supports multi-branch
+  (UNION-ALL) tables.
+- **Multiple transports** — `LOCATION` accepts a bare command (subprocess, pooled per
+  DuckDB process), `http(s)://` (HTTP), `unix:///path/to.sock` (AF_UNIX), or
+  `launch:<argv>` (launcher-managed shared worker).
+- **Pushdown** — projection, filter, `ORDER BY` + `LIMIT`, and join-key pushdown to
+  workers that opt in.
+- **Worker pooling** — subprocess workers are pooled and reused across queries, with
+  diagnostics (`vgi_worker_pool()`, `vgi_worker_pool_stats()`).
+- **Performance** — optional POSIX shared-memory transport for zero-copy batch transfer.
+- **Auth** — per-catalog OAuth / bearer tokens; OIDC identity introspection via
+  `vgi_catalog_identity()`.
+
+See the [`docs/`](.) directory for deep dives on
+[multi-branch tables](multi_branch.md),
+[the launcher protocol](launcher-protocol.md),
+[catalog profiling](catalog_profiling.md), and more.
 
 ## Building
-### Managing dependencies
-> [!IMPORTANT]
-> The example extension uses VCPKG to build with a dependency for instructive purposes, so when skipping this step the build may not work without removing the dependency.
 
-DuckDB extensions uses VCPKG for dependency management. Enabling VCPKG is very simple: follow the [installation instructions](https://vcpkg.io/en/getting-started) or just run the following:
-```shell
-cd <your-working-dir-not-the-plugin-repo>
-git clone https://github.com/Microsoft/vcpkg.git
-cd vcpkg && git checkout ce613c41372b23b1f51333815feb3edd87ef8a8b
-sh ./scripts/bootstrap.sh -disableMetrics
-export VCPKG_TOOLCHAIN_PATH=`pwd`/vcpkg/scripts/buildsystems/vcpkg.cmake
-```
-
-> [!NOTE]
-> VCPKG is only required for extensions that want to rely on it for dependency management. If you want to develop an extension without dependencies, or want to do your own dependency management, just skip this step.
-
-### Updating Submodules
-DuckDB extensions use two submodules that are included in your forked extension repo when you use the `--recurse-submodules` flag. These modules are:
-
-| Name                  | Repository                                      | Description |
-|-----------------------|-------------------------------------------------|-------------|
-| duckdb                | https://github.com/duckdb/duckdb                | This repository contains core DuckDB code required for building extensions.            |
-| extension-ci-tools    | https://github.com/duckdb/extension-ci-tools    | This repository contains reusable components for building, testing and deploying DuckDB extensions.            |
-
-
-> [!IMPORTANT]
-> It is recommended that you update your submodules at least once every other major LTS release to avoid CI/CD pipeline build errors caused by remaining pinned to a stale commit of these submodules.
-
-To update all submodules to the latest commit hash:
-```bash
-git submodule update --init --recursive
-```
-
-To update your submodules to a specific commit hash, for example to update duckdb to the hash `8e146474d7adb960c5a2941142fe4482cc7dfc08`:
-```bash
-cd duckdb
-git fetch --all
-git checkout 8e146474d7adb960c5a2941142fe4482cc7dfc08   # or any tag/branch/commit hash
-cd ..
-git add duckdb
-git commit -m "Pin DuckDB submodule to cc7dfc08"
-git push HEAD:update-submodule-branch
-```
-
-### Build steps
-Now to build the extension, run:
-```sh
-make
-```
-The main binaries that will be built are:
-```sh
-./build/release/duckdb
-./build/release/test/unittest
-./build/release/extension/<extension_name>/<extension_name>.duckdb_extension
-```
-- `duckdb` is the binary for the duckdb shell with the extension code automatically loaded.
-- `unittest` is the test runner of duckdb. Again, the extension is already linked into the binary.
-- `<extension_name>.duckdb_extension` is the loadable binary as it would be distributed.
-
-### Tips for speedy builds
-DuckDB extensions currently rely on DuckDB's build system to provide easy testing and distributing. This does however come at the downside of requiring the template to build DuckDB and its unittest binary every time you build your extension. To mitigate this, we highly recommend installing [ccache](https://ccache.dev/) and [ninja](https://ninja-build.org/). This will ensure you only need to build core DuckDB once and allows for rapid rebuilds.
-
-To build using ninja and ccache ensure both are installed and run:
+This extension uses VCPKG for dependency management and is built with multiple modules,
+so set `USE_MERGED_VCPKG_MANIFEST=1`. The Makefile auto-detects the VCPKG toolchain from
+`vcpkg/` in the project tree.
 
 ```sh
-GEN=ninja make
+git clone --recurse-submodules https://github.com/Query-farm/vgi.git
+cd vgi
+
+# Debug build
+USE_MERGED_VCPKG_MANIFEST=1 GEN=ninja make debug
+
+# Release build
+USE_MERGED_VCPKG_MANIFEST=1 GEN=ninja make release
 ```
 
-## Running the extension
-To run the extension code, simply start the shell with `./build/release/duckdb`. This shell will have the extension pre-loaded.
+Installing [ccache](https://ccache.dev/) and [ninja](https://ninja-build.org/) is
+strongly recommended for fast incremental rebuilds.
 
-Now we can use the features from the extension directly in DuckDB. The template contains a single scalar function `vgi()` that takes a string arguments and returns a string:
-```
-D select vgi('Jane') as result;
-┌───────────────┐
-│    result     │
-│    varchar    │
-├───────────────┤
-│ vgi Jane 🐥 │
-└───────────────┘
-```
+The build produces:
 
-## Running the tests
-Different tests can be created for DuckDB extensions. The primary way of testing DuckDB extensions should be the SQL tests in `./test/sql`. These SQL tests can be run using:
 ```sh
-make test
+./build/release/duckdb                                    # DuckDB shell with the extension preloaded
+./build/release/test/unittest                             # test runner
+./build/release/extension/vgi/vgi.duckdb_extension        # the loadable extension
 ```
 
-## Getting started with your own extension
-After creating a repository from this template, the first step is to name your extension. To rename the extension, run:
+## Testing
+
+The extension supports two transports; subprocess is the faster default. Tests prefer the
+release build:
+
 ```sh
-# Note: This will rewrite this file!
-python3 ./scripts/bootstrap-template.py <extension_name_you_want>
-```
-Feel free to delete the script after this step.
+# Subprocess transport (default, faster)
+make test_subprocess
 
-Now you're good to go! After a (re)build, you should now be able to use your duckdb extension:
-```
-./build/release/duckdb
-D select <extension_name_you_chose>('Jane') as result;
-┌─────────────────────────────────────┐
-│                result               │
-│               varchar               │
-├─────────────────────────────────────┤
-│ <extension_name_you_chose> Jane 🐥  │
-└─────────────────────────────────────┘
+# HTTP transport
+make test_http
+
+# Both
+make test_all
 ```
 
-For inspiration/examples on how to extend DuckDB in a more meaningful way, check out the [test extensions](https://github.com/duckdb/duckdb/blob/main/test/extension),
-the [in-tree extensions](https://github.com/duckdb/duckdb/tree/main/extension), and the [out-of-tree extensions](https://github.com/duckdblabs).
+The `VGI_TEST_WORKER` environment variable controls which worker is used and defaults to
+the `vgi-python` fixture worker. See the project root `CLAUDE.md` for the full matrix of
+test targets, debug builds, and environment variables.
 
-## Distributing your extension
-To distribute your extension binaries, there are a few options.
+## License
 
-### Community extensions
-The recommended way of distributing extensions is through the [community extensions repository](https://github.com/duckdb/community-extensions).
-This repository is designed specifically for extensions that are built using this extension template, meaning that as long as your extension can be
-built using the default CI in this template, submitting it to the community extensions is a very simple process. The process works similarly to popular
-package managers like homebrew and vcpkg, where a PR containing a descriptor file is submitted to the package manager repository. After the CI in the
-community extensions repository completes, the extension can be installed and loaded in DuckDB with:
-```SQL
-INSTALL <my_extension> FROM community;
-LOAD <my_extension>
-```
-For more information, see the [community extensions documentation](https://duckdb.org/community_extensions/documentation).
-
-### Downloading artifacts from GitHub
-The default CI in this template will automatically upload the binaries for every push to the main branch as GitHub Actions artifacts. These
-can be downloaded manually and then loaded directly using:
-```SQL
-LOAD '/path/to/downloaded/extension.duckdb_extension';
-```
-Note that this will require starting DuckDB with the
-`allow_unsigned_extensions` option set to true. How to set this will depend on the client you're using. For the CLI it is done like:
-```shell
-duckdb -unsigned
-```
-
-### Uploading to a custom repository
-If for some reason distributing through community extensions is not an option, extensions can also be uploaded to a custom extension repository.
-This will give some more control over where and how the extensions are distributed, but comes with the downside of requiring the `allow_unsigned_extensions`
-option to be set. For examples of how to configure a manual GitHub Actions deploy pipeline, check out the extension deploy script in https://github.com/duckdb/extension-ci-tools.
-Some examples of extensions that use this CI/CD workflow check out [spatial](https://github.com/duckdblabs/duckdb_spatial) or [aws](https://github.com/duckdb/duckdb_aws).
-
-Extensions in custom repositories can be installed and loaded using:
-```SQL
-INSTALL <my_extension> FROM 'http://my-custom-repo'
-LOAD <my_extension>
-```
-
-### Versioning of your extension
-Extension binaries will only work for the specific DuckDB version they were built for. The version of DuckDB that is targeted
-is set to the latest stable release for the main branch of the template so initially that is all you need. As new releases
-of DuckDB are published however, the extension repository will need to be updated. The template comes with a workflow set-up
-that will automatically build the binaries for all DuckDB target architectures that are available in the corresponding DuckDB
-version. This workflow is found in `.github/workflows/MainDistributionPipeline.yml`. It is up to the extension developer to keep
-this up to date with DuckDB. Note also that its possible to distribute binaries for multiple DuckDB versions in this workflow
-by simply duplicating the jobs.
-
-## Setting up CLion
-
-### Opening project
-Configuring CLion with the extension template requires a little work. Firstly, make sure that the DuckDB submodule is available.
-Then make sure to open `./duckdb/CMakeLists.txt` (so not the top level `CMakeLists.txt` file from this repo) as a project in CLion.
-Now to fix your project path go to `tools->CMake->Change Project Root`([docs](https://www.jetbrains.com/help/clion/change-project-root-directory.html)) to set the project root to the root dir of this repo.
-
-### Debugging
-To set up debugging in CLion, there are two simple steps required. Firstly, in `CLion -> Settings / Preferences -> Build, Execution, Deploy -> CMake` you will need to add the desired builds (e.g. Debug, Release, RelDebug, etc). There's different ways to configure this, but the easiest is to leave all empty, except the `build path`, which needs to be set to `../build/{build type}`, and CMake Options to which the following flag should be added, with the path to the extension CMakeList:
-
-```
--DDUCKDB_EXTENSION_CONFIGS=<path_to_the_exentension_CMakeLists.txt>
-```
-
-The second step is to configure the unittest runner as a run/debug configuration. To do this, go to `Run -> Edit Configurations` and click `+ -> Cmake Application`. The target and executable should be `unittest`. This will run all the DuckDB tests. To specify only running the extension specific tests, add `--test-dir ../../.. [sql]` to the `Program Arguments`. Note that it is recommended to use the `unittest` executable for testing/development within CLion. The actual DuckDB CLI currently does not reliably work as a run target in CLion.
+This project is licensed under the **Business Source License 1.1** (Licensor: Query Farm
+LLC). It converts to **Apache 2.0** on the Change Date. See [`LICENSE`](../LICENSE) for the
+full terms.
