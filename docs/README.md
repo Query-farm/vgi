@@ -10,8 +10,7 @@ functions that worker exposes as if they were native DuckDB functions. Data move
 DuckDB and the worker over Apache Arrow IPC, across a subprocess pipe, an HTTP connection,
 or a Unix domain socket.
 
-The reference worker SDK lives in a sibling project:
-[**vgi-python**](https://github.com/Query-farm/vgi-python) — `pip install vgi`.
+The reference worker SDK is **vgi-python** — `pip install vgi`.
 
 Created by [Query.Farm](https://query.farm).
 
