@@ -6,23 +6,23 @@ duckdb_extension_load(vgi
     LOAD_TESTS
 )
 
-duckdb_extension_load(httpfs
-    LOAD_TESTS
-    GIT_URL https://github.com/duckdb/duckdb-httpfs
-    GIT_TAG 0de1997810f22888511efd277ed4775ece295561
-)
+#duckdb_extension_load(httpfs
+#    LOAD_TESTS
+#    GIT_URL https://github.com/duckdb/duckdb-httpfs
+#    GIT_TAG 0de1997810f22888511efd277ed4775ece295561
+#)
 
 # Any extra extensions that should be built
 duckdb_extension_load(json)
-duckdb_extension_load(icu)
+#duckdb_extension_load(icu)
 
 
-duckdb_extension_load(ducklake
-    GIT_URL https://github.com/Query-farm/ducklake
-    GIT_TAG e2ee16d580403eb2fd23ca277566776f27bdbf68
+#duckdb_extension_load(ducklake
+#    GIT_URL https://github.com/Query-farm/ducklake
+#    GIT_TAG e2ee16d580403eb2fd23ca277566776f27bdbf68
 #    INCLUDE_DIR src/ducklake
-    LOAD_TESTS
-)
+#    LOAD_TESTS
+#)
 
 
 
