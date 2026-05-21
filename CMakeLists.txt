@@ -40,6 +40,13 @@ if(WIN32)
   add_compile_definitions(WIN32_LEAN_AND_MEAN NOMINMAX)
 endif()
 
+# MSVC defaults to the traditional preprocessor, which does not support
+# __VA_OPT__ (used by VGI_LOG / VGI_STDERR_DEBUG in vgi_logging.hpp). Enable the
+# C++20-conformant preprocessor. MinGW/Clang already conform, so MSVC-only.
+if(MSVC)
+  add_compile_options(/Zc:preprocessor)
+endif()
+
 include_directories(src/include)
 include_directories(duckdb/third_party/mbedtls/include)
 include_directories(duckdb/third_party/httplib)
