@@ -549,4 +549,332 @@ std::string Launch(const LaunchConfig &cfg) {
 } // namespace vgi
 } // namespace duckdb
 
-#endif // VGI_POSIX_TRANSPORT
+#elif defined(_WIN32)
+
+// ===========================================================================
+// Windows launcher — named-pipe rendezvous.
+//
+// CPython has no AF_UNIX on Windows, so the launch: worker is reached via a
+// Windows named pipe (\\.\pipe\vgi-rpc-<hash>) served by serve_named_pipe. This
+// is a parallel implementation of Launch() that mirrors the POSIX flow: hash →
+// rendezvous name, system-wide spawn election (named mutex instead of flock),
+// probe-or-spawn, read the PIPE:<name> discovery line, detach. The cross-platform
+// hash / argv / discovery-parse helpers are shared (vgi_launcher_internal).
+// UNTESTED on macOS CI — validated on the Windows build machine.
+// ===========================================================================
+
+#include "vgi_launcher.hpp"
+
+#include "duckdb/common/exception.hpp"
+#include "vgi_launcher_internal.hpp"
+
+#include <chrono>
+#include <cstdio>
+#include <string>
+#include <thread>
+#include <utility>
+#include <vector>
+
+#include <fcntl.h>
+#include <io.h>
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+
+namespace duckdb {
+namespace vgi {
+
+namespace {
+
+constexpr std::size_t kDiscoveryBufferLimit = 1u << 20; // 1 MiB
+
+// Read the process environment as a flat (key, value) list (Windows).
+std::vector<std::pair<std::string, std::string>> WinEnvSnapshot() {
+	std::vector<std::pair<std::string, std::string>> out;
+	LPCH env = GetEnvironmentStringsA();
+	if (!env) {
+		return out;
+	}
+	for (LPCH p = env; *p;) {
+		std::string entry(p);
+		p += entry.size() + 1;
+		// Skip the magic "=C:=..." drive-cwd entries (key begins with '=').
+		if (entry.empty() || entry[0] == '=') {
+			continue;
+		}
+		auto eq = entry.find('=');
+		if (eq == std::string::npos) {
+			continue;
+		}
+		out.emplace_back(entry.substr(0, eq), entry.substr(eq + 1));
+	}
+	FreeEnvironmentStringsA(env);
+	return out;
+}
+
+std::string WinCwd() {
+	DWORD n = GetCurrentDirectoryA(0, nullptr);
+	if (n == 0) {
+		return std::string();
+	}
+	std::vector<char> buf(n);
+	DWORD got = GetCurrentDirectoryA(n, buf.data());
+	return std::string(buf.data(), got);
+}
+
+// Quote one argv element for a Windows command line per CommandLineToArgvW rules.
+std::string QuoteArg(const std::string &arg) {
+	if (!arg.empty() && arg.find_first_of(" \t\"") == std::string::npos) {
+		return arg; // no quoting needed
+	}
+	std::string out = "\"";
+	std::size_t backslashes = 0;
+	for (char c : arg) {
+		if (c == '\\') {
+			backslashes++;
+			out.push_back(c);
+		} else if (c == '"') {
+			out.append(backslashes + 1, '\\'); // escape the run of backslashes + the quote
+			out.push_back('"');
+			backslashes = 0;
+		} else {
+			backslashes = 0;
+			out.push_back(c);
+		}
+	}
+	out.append(backslashes, '\\'); // double trailing backslashes before the closing quote
+	out.push_back('"');
+	return out;
+}
+
+std::string BuildCommandLine(const std::vector<std::string> &argv) {
+	std::string cmd;
+	for (std::size_t i = 0; i < argv.size(); ++i) {
+		if (i) {
+			cmd.push_back(' ');
+		}
+		cmd += QuoteArg(argv[i]);
+	}
+	return cmd;
+}
+
+// RAII named mutex for system-wide spawn election (replaces POSIX flock).
+class WinMutexGuard {
+public:
+	static WinMutexGuard Acquire(const std::string &name, std::chrono::milliseconds timeout) {
+		// Prefer the Global namespace (cross-session); fall back to Local if the
+		// session can't create global objects.
+		HANDLE h = CreateMutexA(nullptr, FALSE, ("Global\\" + name).c_str());
+		if (!h) {
+			h = CreateMutexA(nullptr, FALSE, ("Local\\" + name).c_str());
+		}
+		if (!h) {
+			throw IOException("vgi launcher: CreateMutex(%s) failed (GetLastError=%lu)", name,
+			                  (unsigned long)GetLastError());
+		}
+		DWORD r = WaitForSingleObject(h, static_cast<DWORD>(timeout.count()));
+		if (r != WAIT_OBJECT_0 && r != WAIT_ABANDONED) {
+			CloseHandle(h);
+			throw IOException("vgi launcher: timed out acquiring spawn mutex %s after %lldms", name,
+			                  static_cast<long long>(timeout.count()));
+		}
+		return WinMutexGuard(h);
+	}
+	WinMutexGuard(WinMutexGuard &&o) noexcept : h_(o.h_) {
+		o.h_ = nullptr;
+	}
+	WinMutexGuard(const WinMutexGuard &) = delete;
+	WinMutexGuard &operator=(const WinMutexGuard &) = delete;
+	~WinMutexGuard() {
+		if (h_) {
+			ReleaseMutex(h_);
+			CloseHandle(h_);
+		}
+	}
+
+private:
+	explicit WinMutexGuard(HANDLE h) : h_(h) {
+	}
+	HANDLE h_ = nullptr;
+};
+
+// Is a worker already serving on `pipe_name`?  A successful connect (or
+// ERROR_PIPE_BUSY — all instances momentarily in use) means alive.
+bool ProbeAlivePipe(const std::string &pipe_name) {
+	HANDLE h = CreateFileA(pipe_name.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0,
+	                       nullptr);
+	if (h != INVALID_HANDLE_VALUE) {
+		CloseHandle(h);
+		return true;
+	}
+	return GetLastError() == ERROR_PIPE_BUSY;
+}
+
+// Spawn the worker detached, read its PIPE:<pipe_name> discovery line, then let
+// it run as a daemon (self-shuts-down via --idle-timeout).
+void SpawnWorkerWin(const std::vector<std::string> &argv, const std::string &pipe_name,
+                    const std::optional<std::string> &stderr_path,
+                    std::chrono::milliseconds startup_timeout) {
+	SECURITY_ATTRIBUTES sa {};
+	sa.nLength = sizeof(sa);
+	sa.bInheritHandle = TRUE;
+
+	HANDLE rd = nullptr, wr = nullptr;
+	if (!CreatePipe(&rd, &wr, &sa, 0)) {
+		throw IOException("vgi launcher: CreatePipe failed (GetLastError=%lu)", (unsigned long)GetLastError());
+	}
+	SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0); // our read end is not inherited
+	HANDLE nul_in = CreateFileA("NUL", GENERIC_READ, FILE_SHARE_READ, &sa, OPEN_EXISTING, 0, nullptr);
+	HANDLE err_h;
+	if (stderr_path.has_value()) {
+		err_h = CreateFileA(stderr_path->c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa,
+		                    CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+	} else {
+		err_h = CreateFileA("NUL", GENERIC_WRITE, FILE_SHARE_WRITE, &sa, OPEN_EXISTING, 0, nullptr);
+	}
+
+	STARTUPINFOA si {};
+	si.cb = sizeof(si);
+	si.dwFlags = STARTF_USESTDHANDLES;
+	si.hStdInput = nul_in;
+	si.hStdOutput = wr;
+	si.hStdError = err_h;
+
+	std::string cmdline = BuildCommandLine(argv);
+	std::vector<char> mutable_cmd(cmdline.begin(), cmdline.end());
+	mutable_cmd.push_back('\0');
+
+	PROCESS_INFORMATION pi {};
+	BOOL ok = CreateProcessA(nullptr, mutable_cmd.data(), nullptr, nullptr, /*bInheritHandles=*/TRUE,
+	                         CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+	CloseHandle(wr);
+	if (nul_in) {
+		CloseHandle(nul_in);
+	}
+	if (err_h) {
+		CloseHandle(err_h);
+	}
+	if (!ok) {
+		CloseHandle(rd);
+		throw IOException("vgi launcher: CreateProcess failed (GetLastError=%lu)",
+		                  (unsigned long)GetLastError());
+	}
+	CloseHandle(pi.hThread);
+
+	const std::string prefix = launcher::DiscoveryLinePrefix(); // "PIPE:"
+	std::string buffer;
+	char chunk[4096];
+	auto deadline = std::chrono::steady_clock::now() + startup_timeout;
+	bool found = false;
+	while (std::chrono::steady_clock::now() < deadline) {
+		DWORD avail = 0;
+		if (!PeekNamedPipe(rd, nullptr, 0, nullptr, &avail, nullptr)) {
+			break; // worker closed stdout
+		}
+		if (avail == 0) {
+			if (WaitForSingleObject(pi.hProcess, 0) == WAIT_OBJECT_0) {
+				break; // worker exited before announcing
+			}
+			std::this_thread::sleep_for(std::chrono::milliseconds(20));
+			continue;
+		}
+		DWORD nread = 0;
+		if (!ReadFile(rd, chunk, sizeof(chunk), &nread, nullptr) || nread == 0) {
+			break;
+		}
+		buffer.append(chunk, nread);
+		auto res = launcher::ParseDiscoveryLine(buffer, pipe_name, prefix);
+		if (res == launcher::DiscoveryParseResult::kFound) {
+			found = true;
+			break;
+		}
+		if (res == launcher::DiscoveryParseResult::kMismatch) {
+			TerminateProcess(pi.hProcess, 1);
+			CloseHandle(rd);
+			CloseHandle(pi.hProcess);
+			throw IOException("vgi launcher: worker announced an unexpected pipe (expected %s)", pipe_name);
+		}
+		if (buffer.size() > kDiscoveryBufferLimit) {
+			break;
+		}
+	}
+	CloseHandle(rd);
+	// Detach: closing our process handle leaves the worker running independently;
+	// it self-terminates via --idle-timeout. (Windows reclaims an unreferenced
+	// detached process automatically — no reaper needed.)
+	CloseHandle(pi.hProcess);
+	if (!found) {
+		throw IOException("vgi launcher: worker did not emit %s%s within %lldms", prefix, pipe_name,
+		                  static_cast<long long>(startup_timeout.count()));
+	}
+}
+
+std::string FormatIdleTimeoutSeconds(std::chrono::milliseconds ms) {
+	double sec = static_cast<double>(ms.count()) / 1000.0;
+	char buf[64];
+	std::snprintf(buf, sizeof(buf), "%.3f", sec);
+	std::string s(buf);
+	auto dot = s.find('.');
+	if (dot != std::string::npos) {
+		while (s.size() > dot + 1 && s.back() == '0') {
+			s.pop_back();
+		}
+		if (s.back() == '.') {
+			s.pop_back();
+		}
+	}
+	return s;
+}
+
+} // namespace
+
+std::string Launch(const LaunchConfig &cfg) {
+	if (cfg.worker_argv.empty()) {
+		throw InvalidInputException("vgi launcher: worker_argv must be non-empty");
+	}
+
+	std::string pipe_name;
+	std::string mutex_name;
+	if (cfg.socket_path_override.has_value()) {
+		pipe_name = *cfg.socket_path_override;
+		mutex_name = "vgi-rpc-override-" + std::to_string(std::hash<std::string> {}(pipe_name));
+	} else {
+		auto env_subset = launcher::FilterVgiRpcEnv(WinEnvSnapshot());
+		auto hash = launcher::ComputeLauncherHash(cfg.worker_argv, WinCwd(), env_subset);
+		// Pipe name + mutex name both derive from the hash, so every process
+		// pointing at the same (argv, cwd, VGI_RPC_*-env) tuple agrees on the
+		// rendezvous and serialises spawns against the same mutex.
+		pipe_name = "\\\\.\\pipe\\vgi-rpc-" + hash;
+		mutex_name = "vgi-rpc-" + hash;
+	}
+
+	try {
+		launcher::ValidateRendezvousPathLength(pipe_name);
+	} catch (const std::invalid_argument &e) {
+		throw InvalidInputException(e.what());
+	}
+
+	auto guard = WinMutexGuard::Acquire(mutex_name, cfg.connect_timeout);
+
+	if (ProbeAlivePipe(pipe_name)) {
+		return pipe_name;
+	}
+
+	std::vector<std::string> argv = cfg.worker_argv;
+	argv.emplace_back("--unix");
+	argv.push_back(pipe_name);
+	argv.emplace_back("--idle-timeout");
+	argv.push_back(FormatIdleTimeoutSeconds(cfg.idle_timeout));
+
+	SpawnWorkerWin(argv, pipe_name, cfg.worker_stderr_path, cfg.worker_startup_timeout);
+	return pipe_name; // mutex auto-releases as guard goes out of scope
+}
+
+} // namespace vgi
+} // namespace duckdb
+
+#endif // VGI_POSIX_TRANSPORT / _WIN32

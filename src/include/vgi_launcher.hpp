@@ -19,7 +19,9 @@
 
 #include "vgi_platform.hpp"
 
-#if VGI_POSIX_TRANSPORT
+// The launcher exists on POSIX (AF_UNIX rendezvous) and Windows (named-pipe
+// rendezvous). Emscripten has neither.
+#if VGI_POSIX_TRANSPORT || defined(_WIN32)
 
 namespace duckdb {
 namespace vgi {
@@ -71,4 +73,4 @@ std::string Launch(const LaunchConfig &cfg);
 } // namespace vgi
 } // namespace duckdb
 
-#endif // VGI_POSIX_TRANSPORT
+#endif // VGI_POSIX_TRANSPORT || _WIN32

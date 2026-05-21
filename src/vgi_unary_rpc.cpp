@@ -17,7 +17,9 @@
 #include "vgi_unix_socket.hpp"
 #include "vgi_unix_socket_worker.hpp"
 #elif defined(_WIN32)
-// Windows: unix:// rendezvous uses a Windows named pipe instead of AF_UNIX.
+// Windows: launch:/unix:// rendezvous uses Windows named pipes instead of AF_UNIX.
+#include "vgi_launcher.hpp"
+#include "vgi_launcher_internal.hpp"
 #include "vgi_named_pipe.hpp"
 #endif
 #include "vgi_worker_pool.hpp"
@@ -165,22 +167,30 @@ UnaryResponseResult InvokePooledUnaryRpc(const UnaryRpcOptions &opts, const std:
 		auto *log_ctx = opts.enable_logging ? &opts.context : nullptr;
 		return ReadUnaryResponse(worker.GetStdoutFd(), log_ctx, opts.worker_path, /*pid=*/-1);
 #elif defined(_WIN32)
-		// Windows: unix:// connects to a Windows named pipe served out-of-band.
-		// launch: (auto-spawn) is a later phase.
+		// Windows: launch:/unix:// over a Windows named pipe. unix:// connects to
+		// an out-of-band worker; launch: spawns (or reuses) one via the launcher.
+		std::string pipe_name;
 		if (IsUnixLocation(opts.worker_path)) {
-			NamedPipeWorker worker(NamedPipeConnect(StripUnixScheme(opts.worker_path), std::chrono::seconds(10)));
-			if (params) {
-				WriteRpcRequest(worker.GetStdinFd(), method_name, params);
-			} else {
-				WriteEmptyRpcRequest(worker.GetStdinFd(), method_name);
+			pipe_name = StripUnixScheme(opts.worker_path);
+		} else {
+			LaunchConfig cfg;
+			cfg.worker_argv = launcher::ParseLaunchArgv(StripLaunchScheme(opts.worker_path));
+			if (opts.launcher_idle_timeout.has_value()) {
+				cfg.idle_timeout = *opts.launcher_idle_timeout;
 			}
-			auto *log_ctx = opts.enable_logging ? &opts.context : nullptr;
-			return ReadUnaryResponse(worker.GetStdoutFd(), log_ctx, opts.worker_path, /*pid=*/-1);
+			if (opts.launcher_state_dir.has_value()) {
+				cfg.state_dir_override = *opts.launcher_state_dir;
+			}
+			pipe_name = Launch(cfg);
 		}
-		throw InvalidInputException(
-		    "vgi: launch: LOCATIONs are not yet supported on Windows (named-pipe launcher pending); use "
-		    "unix://\\\\.\\pipe\\... against an out-of-band worker (worker_path=%s)",
-		    opts.worker_path);
+		NamedPipeWorker worker(NamedPipeConnect(pipe_name, std::chrono::seconds(10)));
+		if (params) {
+			WriteRpcRequest(worker.GetStdinFd(), method_name, params);
+		} else {
+			WriteEmptyRpcRequest(worker.GetStdinFd(), method_name);
+		}
+		auto *log_ctx = opts.enable_logging ? &opts.context : nullptr;
+		return ReadUnaryResponse(worker.GetStdoutFd(), log_ctx, opts.worker_path, /*pid=*/-1);
 #else
 		throw InvalidInputException(
 		    "vgi: launch:/unix:// LOCATION schemes are not available in this build "

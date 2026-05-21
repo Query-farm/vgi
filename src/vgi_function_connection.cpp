@@ -28,7 +28,9 @@
 #include "vgi_unix_socket.hpp"
 #include "vgi_unix_socket_worker.hpp"
 #elif defined(_WIN32)
-// Windows: unix:// rendezvous uses a Windows named pipe instead of AF_UNIX.
+// Windows: launch:/unix:// rendezvous uses Windows named pipes instead of AF_UNIX.
+#include "vgi_launcher.hpp"
+#include "vgi_launcher_internal.hpp"
 #include "vgi_named_pipe.hpp"
 #endif
 
@@ -1302,22 +1304,28 @@ std::unique_ptr<IFunctionConnection> CreateFunctionConnection(
 		    std::move(worker), worker_path, function_name, arguments, attach_opaque_data, transaction_opaque_data,
 		    context, function_type, global_execution_id, worker_debug, settings, required_secrets);
 #elif defined(_WIN32)
-		// Windows: unix:// connects to a Windows named pipe (\\.\pipe\...) served
-		// by an out-of-band worker (serve_named_pipe). The named-pipe launcher
-		// for launch: (auto-spawn + named-mutex election) is a later phase.
+		// Windows: launch:/unix:// rendezvous over a Windows named pipe. unix://
+		// connects to an out-of-band worker; launch: spawns (or reuses) one via
+		// the named-pipe launcher (Launch → \\.\pipe\vgi-rpc-<hash>), then connects.
+		std::string pipe_name;
 		if (IsUnixLocation(worker_path)) {
-			int fd = NamedPipeConnect(StripUnixScheme(worker_path), std::chrono::seconds(10));
-			auto worker = std::make_unique<NamedPipeWorker>(fd);
-			return std::make_unique<FunctionConnection>(
-			    std::move(worker), worker_path, function_name, arguments, attach_opaque_data,
-			    transaction_opaque_data, context, function_type, global_execution_id, worker_debug, settings,
-			    required_secrets);
+			pipe_name = StripUnixScheme(worker_path);
+		} else {
+			LaunchConfig cfg;
+			cfg.worker_argv = launcher::ParseLaunchArgv(StripLaunchScheme(worker_path));
+			if (attach_params && attach_params->launcher_idle_timeout_seconds().has_value()) {
+				cfg.idle_timeout = std::chrono::seconds(*attach_params->launcher_idle_timeout_seconds());
+			}
+			if (attach_params && attach_params->launcher_state_dir().has_value()) {
+				cfg.state_dir_override = *attach_params->launcher_state_dir();
+			}
+			pipe_name = Launch(cfg);
 		}
-		throw InvalidInputException(
-		    "vgi: launch: LOCATIONs are not yet supported on Windows (named-pipe launcher pending); use "
-		    "unix://\\\\.\\pipe\\... against an out-of-band worker, http://…, or a bare-command subprocess "
-		    "(worker_path=%s)",
-		    worker_path);
+		int fd = NamedPipeConnect(pipe_name, std::chrono::seconds(10));
+		auto worker = std::make_unique<NamedPipeWorker>(fd);
+		return std::make_unique<FunctionConnection>(
+		    std::move(worker), worker_path, function_name, arguments, attach_opaque_data, transaction_opaque_data,
+		    context, function_type, global_execution_id, worker_debug, settings, required_secrets);
 #else
 		throw InvalidInputException(
 		    "vgi: launch:/unix:// LOCATION schemes are not available in this build "
