@@ -599,52 +599,101 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	// AttachOptionSpec list (fetched via InvokeCatalogs when present).
 	std::map<std::string, Value> attach_options;
 
-	// Extract options
-	for (auto &entry : info.options) {
-		auto lower_name = StringUtil::Lower(entry.first);
+	// Per-option handler, shared between the connection-string query (below) and
+	// the explicit (TYPE vgi, ...) options clause so both honour the same names.
+	auto apply_option = [&](const string &lower_name, const Value &value) {
 		if (lower_name == "type") {
-			continue;
+			return;
 		} else if (lower_name == "location" || lower_name == "path") {
-			worker_path = entry.second.ToString();
+			worker_path = value.ToString();
 		} else if (lower_name == "worker_debug") {
-			worker_debug = entry.second.GetValue<bool>();
+			// DefaultCastAs (not GetValue<bool>) so VARCHAR values from the
+			// connection-string query ("true"/"false") cast semantically rather
+			// than as a raw int8; typed BOOLEAN values from the clause are a no-op.
+			worker_debug = value.DefaultCastAs(LogicalType::BOOLEAN).GetValue<bool>();
 		} else if (lower_name == "pool") {
-			use_pool = entry.second.GetValue<bool>();
+			use_pool = value.DefaultCastAs(LogicalType::BOOLEAN).GetValue<bool>();
 		} else if (lower_name == "pool_max") {
-			pool_max_override = entry.second.GetValue<int64_t>();
+			pool_max_override = value.DefaultCastAs(LogicalType::BIGINT).GetValue<int64_t>();
 		} else if (lower_name == "pool_timeout") {
-			pool_timeout_override = entry.second.GetValue<int64_t>();
+			pool_timeout_override = value.DefaultCastAs(LogicalType::BIGINT).GetValue<int64_t>();
 		} else if (lower_name == "oauth_refresh_token") {
-			oauth_refresh_token = entry.second.ToString();
-			// Wipe the value out of the parsed AttachInfo so it can't be
-			// echoed by any DuckDB introspection path that reflects the
-			// original ATTACH options (catalog logging, prepared-statement
-			// dumps, telemetry). The CatalogAuth holds the live token from
-			// here on; the parsed option is no longer needed. Recommend
-			// CREATE SECRET for non-ephemeral storage.
-			entry.second = Value("<redacted>");
+			oauth_refresh_token = value.ToString();
 		} else if (lower_name == "bearer_token") {
-			bearer_token = entry.second.ToString();
-			entry.second = Value("<redacted>");
+			bearer_token = value.ToString();
 		} else if (lower_name == "data_version_spec") {
-			data_version_spec = entry.second.ToString();
+			data_version_spec = value.ToString();
 		} else if (lower_name == "implementation_version") {
-			implementation_version = entry.second.ToString();
+			implementation_version = value.ToString();
 		} else if (lower_name == "launcher_idle_timeout") {
-			launcher_idle_timeout_seconds = entry.second.GetValue<int64_t>();
+			launcher_idle_timeout_seconds = value.DefaultCastAs(LogicalType::BIGINT).GetValue<int64_t>();
 			if (launcher_idle_timeout_seconds < 0) {
 				throw BinderException(
 				    "launcher_idle_timeout must be >= 0 (got %lld); use 0 for no timeout",
 				    static_cast<long long>(launcher_idle_timeout_seconds));
 			}
 		} else if (lower_name == "launcher_state_dir") {
-			launcher_state_dir = entry.second.ToString();
+			launcher_state_dir = value.ToString();
 			if (launcher_state_dir.empty()) {
 				throw BinderException("launcher_state_dir, if set, must not be empty");
 			}
 		} else {
 			// Collect for validation + forwarding to the worker.
-			attach_options.emplace(lower_name, entry.second);
+			attach_options.emplace(lower_name, value);
+		}
+	};
+
+	// Connection-string form (mirrors the airport extension): the worker location
+	// and ATTACH options may be encoded in the ATTACH path as
+	//   '<catalog>?location=<worker>&<opt>=<val>&...'
+	// so a catalog is reachable without an explicit options clause — e.g. from the
+	// DuckDB/haybarn CLI:  haybarn-cli "vgi:example?location=https://host/vgi/".
+	// The base (before '?') stays the catalog name; the query string supplies
+	// options, applied first so an explicit (TYPE vgi, ...) clause still overrides.
+	bool secret_in_path = false;
+	{
+		auto qpos = catalog_name.find('?');
+		if (qpos != string::npos) {
+			string query = catalog_name.substr(qpos + 1);
+			catalog_name = catalog_name.substr(0, qpos);
+			size_t start = 0;
+			while (start <= query.size()) {
+				auto amp = query.find('&', start);
+				string token =
+				    query.substr(start, amp == string::npos ? string::npos : amp - start);
+				if (!token.empty()) {
+					auto eq = token.find('=');
+					string key = (eq == string::npos) ? token : token.substr(0, eq);
+					string val = (eq == string::npos) ? string() : token.substr(eq + 1);
+					auto lower_key = StringUtil::Lower(key);
+					if (lower_key == "oauth_refresh_token" || lower_key == "bearer_token") {
+						secret_in_path = true;
+					}
+					apply_option(lower_key, Value(val));
+				}
+				if (amp == string::npos) {
+					break;
+				}
+				start = amp + 1;
+			}
+			// A token embedded in the ATTACH path is just as introspection-visible
+			// as one in the options clause — strip the whole query from info.path.
+			// Recommend CREATE SECRET / the options clause for non-ephemeral tokens.
+			if (secret_in_path) {
+				info.path = catalog_name + "?<redacted>";
+			}
+		}
+	}
+
+	// Explicit (TYPE vgi, ...) options clause. Applied after the query string so it
+	// wins on conflicts; tokens are wiped from the parsed AttachInfo so they can't
+	// be echoed by DuckDB introspection (catalog logging, prepared-statement dumps,
+	// telemetry). The CatalogAuth holds the live token from here on.
+	for (auto &entry : info.options) {
+		auto lower_name = StringUtil::Lower(entry.first);
+		apply_option(lower_name, entry.second);
+		if (lower_name == "oauth_refresh_token" || lower_name == "bearer_token") {
+			entry.second = Value("<redacted>");
 		}
 	}
 

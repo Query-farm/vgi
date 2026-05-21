@@ -1,0 +1,50 @@
+# name: test/sql/integration/connection_string.test
+# description: ATTACH connection-string form — worker location encoded in the ATTACH path query
+# group: [integration]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+# The worker location may be encoded in the ATTACH path as a `?query=string`
+# (mirrors the airport extension), so a catalog is reachable without an explicit
+# options clause — including from the DuckDB/haybarn CLI, e.g.
+#   haybarn-cli "vgi:example?location=https://host/vgi/"
+# The base (before '?') stays the catalog name.
+statement ok
+ATTACH 'example?location=${VGI_TEST_WORKER}' AS ex (TYPE vgi);
+
+query I
+SELECT n FROM ex.main.first_ten ORDER BY n LIMIT 5;
+----
+0
+1
+2
+3
+4
+
+# Extra options ride in the query string alongside location ('&'-separated).
+statement ok
+ATTACH 'example?location=${VGI_TEST_WORKER}&pool=false' AS ex2 (TYPE vgi);
+
+query I
+SELECT count(*) FROM ex2.main.even_numbers;
+----
+50
+
+# Back-compat: an explicit (TYPE vgi, LOCATION ...) options clause still works.
+statement ok
+ATTACH 'example' AS ex3 (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+query I
+SELECT ex3.main.add_values(20, 22);
+----
+42
+
+# A '?' query that omits a location still fails with the clear LOCATION error.
+statement error
+ATTACH 'example?pool=false' AS ex4 (TYPE vgi);
+----
+VGI ATTACH requires LOCATION option
