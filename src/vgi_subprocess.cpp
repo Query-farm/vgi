@@ -13,6 +13,12 @@
 #elif defined(_WIN32)
 #include <fcntl.h> // _O_BINARY / _O_RDONLY / _O_WRONLY
 #include <io.h>     // _open_osfhandle, _get_osfhandle, _read, _write, _close
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN // keep <windows.h> from dragging in legacy <winsock.h>
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #endif
 

@@ -8,7 +8,13 @@
 #include <poll.h>
 #include <unistd.h>
 #elif defined(_WIN32)
-#include <io.h>      // _read, _get_osfhandle, _close
+#include <io.h> // _read, _get_osfhandle, _close
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN // keep <windows.h> from dragging in legacy <winsock.h>
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h> // PeekNamedPipe
 #endif
 

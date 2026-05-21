@@ -34,6 +34,12 @@ extern "C" char *duckdb_wasm_get_page_origin(void);
 #include <sys/stat.h>
 #include <unistd.h>
 #elif defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN // keep <windows.h> from dragging in legacy <winsock.h> (clashes with httplib's <winsock2.h>)
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #include <shellapi.h>
 #endif

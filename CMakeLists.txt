@@ -29,6 +29,17 @@ set(EXTENSION_NAME ${TARGET_NAME}_extension)
 set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 
 project(${TARGET_NAME})
+
+# Windows: keep <windows.h> from pulling in the legacy <winsock.h>, which
+# collides ("redefinition; different linkage") with the <winsock2.h> that
+# cpp-httplib (HTTP transport) uses. NOMINMAX stops windows.h's min/max macros
+# from clobbering std::min/std::max in Arrow/DuckDB headers. The source files
+# that include <windows.h> also define these defensively, in case this does not
+# propagate through the extension-ci-tools build.
+if(WIN32)
+  add_compile_definitions(WIN32_LEAN_AND_MEAN NOMINMAX)
+endif()
+
 include_directories(src/include)
 include_directories(duckdb/third_party/mbedtls/include)
 include_directories(duckdb/third_party/httplib)
