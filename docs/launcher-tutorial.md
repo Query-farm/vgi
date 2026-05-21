@@ -176,7 +176,7 @@ with `BinderException`.
 
 ## Common pitfalls
 
-- **`vgi_worker_pool()` returns no rows.**  That's expected for
+- **`vgi_worker_subprocess_pool()` returns no rows.**  That's expected for
   `launch:` and `unix://` LOCATIONs — workers there are pooled by the
   OS-level AF_UNIX socket, not by DuckDB's per-process subprocess
   pool.  See `CLAUDE.md` for the full caveat.

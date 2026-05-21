@@ -170,7 +170,7 @@ public:
 		int64_t age_seconds;
 	};
 
-	// Get pool statistics for the vgi_worker_pool() table function
+	// Get pool statistics for the vgi_worker_subprocess_pool() table function
 	std::vector<PoolEntry> GetPoolEntries() const;
 
 	// Pool statistics by worker path

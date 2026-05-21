@@ -157,7 +157,7 @@ $ for s in $XDG_RUNTIME_DIR/vgi-rpc/*.sock ; do
   done
 ```
 
-`vgi_worker_pool()` deliberately returns no rows for these workers —
+`vgi_worker_subprocess_pool()` deliberately returns no rows for these workers —
 see [`CLAUDE.md`](../CLAUDE.md) "Transports" section for why.
 
 ## Common pitfalls
@@ -180,4 +180,4 @@ see [`CLAUDE.md`](../CLAUDE.md) "Transports" section for why.
 
 - [`docs/launcher-tutorial.md`](launcher-tutorial.md) — narrative walkthrough
 - [`docs/launcher-protocol.md`](launcher-protocol.md) — cross-language wire contract
-- `CLAUDE.md` — `vgi_worker_pool()` caveats, ATTACH option summary table
+- `CLAUDE.md` — `vgi_worker_subprocess_pool()` caveats, ATTACH option summary table

@@ -19,6 +19,10 @@ VGI_VERSIONED_WORKER ?= uv run --project $(HOME)/Development/vgi-python vgi-fixt
 VGI_VERSIONED_TABLES_WORKER ?= uv run --project $(HOME)/Development/vgi-python vgi-fixture-versioned-tables-worker
 VGI_ATTACH_OPTIONS_WORKER ?= uv run --project $(HOME)/Development/vgi-python vgi-fixture-attach-options-worker
 
+# Worker that advertises an incompatible protocol_version (99.0.0) to drive
+# test/sql/integration/protocol_version/version_mismatch.test.
+VGI_BAD_PROTOCOL_WORKER ?= uv run --project $(HOME)/Development/vgi-python vgi-fixture-bad-protocol-worker
+
 # Minimal SQLite-backed writable fixture: exercises the INSERT/UPDATE/DELETE wire
 # path without requiring duckdb-python's subcursor() (which the production
 # writable fixture uses). Skips real transactional semantics; tests under
@@ -48,6 +52,7 @@ test_subprocess:
 	VGI_VERSIONED_WORKER="$(VGI_VERSIONED_WORKER)" \
 	VGI_VERSIONED_TABLES_WORKER="$(VGI_VERSIONED_TABLES_WORKER)" \
 	VGI_ATTACH_OPTIONS_WORKER="$(VGI_ATTACH_OPTIONS_WORKER)" \
+	VGI_BAD_PROTOCOL_WORKER="$(VGI_BAD_PROTOCOL_WORKER)" \
 	VGI_SIMPLE_WRITABLE_WORKER="$(VGI_SIMPLE_WRITABLE_WORKER)" \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
 	VGI_TEST_DEDICATED_WORKER=1 \
@@ -59,6 +64,7 @@ test_subprocess_debug:
 	VGI_VERSIONED_WORKER="$(VGI_VERSIONED_WORKER)" \
 	VGI_VERSIONED_TABLES_WORKER="$(VGI_VERSIONED_TABLES_WORKER)" \
 	VGI_ATTACH_OPTIONS_WORKER="$(VGI_ATTACH_OPTIONS_WORKER)" \
+	VGI_BAD_PROTOCOL_WORKER="$(VGI_BAD_PROTOCOL_WORKER)" \
 	VGI_SIMPLE_WRITABLE_WORKER="$(VGI_SIMPLE_WRITABLE_WORKER)" \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
 	VGI_TEST_DEDICATED_WORKER=1 \
@@ -72,33 +78,32 @@ test_subprocess_debug:
 # 300s), so concurrent test runs don't pile up — each unique worker argv
 # gets one warm process shared across every test that uses it.
 #
-# Three tests are excluded from this target because their assertions are
+# Two tests are excluded from this target because their assertions are
 # subprocess-pool-specific:
-# - vgi_worker_pool.test                          — asserts pool count >= 1
+# - vgi_worker_subprocess_pool.test               — asserts pool count >= 1
 # - integration/table/filter_echo_partitioned     — asserts >1 distinct
 #                                                   worker_pid across parallel
 #                                                   partitions
-# - integration/attach/versioned_tables_impl      — asserts pool rows for
-#                                                   specific data_version_spec
-#                                                   pairs
 # AF_UNIX workers are pooled by the OS socket (one shared warm worker
 # serves every concurrent caller via internal threading) rather than by
-# DuckDB's per-process subprocess pool; all three assertions are incidental
-# to that, not regressions.
+# DuckDB's per-process subprocess pool; both assertions are incidental
+# to that, not regressions. (versioned_tables_impl used to be excluded too,
+# but its pool-count assertion was removed — version dispatch is per-attach,
+# not per-process, so it now passes under both transports.)
 test_launcher:
 	VGI_TRANSACTOR_DB_DIR="$$(mktemp -d)" \
 	VGI_TEST_WORKER="launch:$(VGI_TEST_WORKER)" \
 	VGI_VERSIONED_WORKER="launch:$(VGI_VERSIONED_WORKER)" \
 	VGI_VERSIONED_TABLES_WORKER="launch:$(VGI_VERSIONED_TABLES_WORKER)" \
 	VGI_ATTACH_OPTIONS_WORKER="launch:$(VGI_ATTACH_OPTIONS_WORKER)" \
+	VGI_BAD_PROTOCOL_WORKER="launch:$(VGI_BAD_PROTOCOL_WORKER)" \
 	VGI_SIMPLE_WRITABLE_WORKER="launch:$(VGI_SIMPLE_WRITABLE_WORKER)" \
 	VGI_REQUIRE_LAUNCHER_TRANSPORT=1 \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
 	./build/release/test/unittest "test/*" \
 	    "~test/sql/integration/writable/*" \
-	    "~test/sql/vgi_worker_pool.test" \
-	    "~test/sql/integration/table/filter_echo_partitioned.test" \
-	    "~test/sql/integration/attach/versioned_tables_impl.test"
+	    "~test/sql/vgi_worker_subprocess_pool.test" \
+	    "~test/sql/integration/table/filter_echo_partitioned.test"
 
 test_launcher_debug:
 	VGI_TRANSACTOR_DB_DIR="$$(mktemp -d)" \
@@ -106,14 +111,14 @@ test_launcher_debug:
 	VGI_VERSIONED_WORKER="launch:$(VGI_VERSIONED_WORKER)" \
 	VGI_VERSIONED_TABLES_WORKER="launch:$(VGI_VERSIONED_TABLES_WORKER)" \
 	VGI_ATTACH_OPTIONS_WORKER="launch:$(VGI_ATTACH_OPTIONS_WORKER)" \
+	VGI_BAD_PROTOCOL_WORKER="launch:$(VGI_BAD_PROTOCOL_WORKER)" \
 	VGI_SIMPLE_WRITABLE_WORKER="launch:$(VGI_SIMPLE_WRITABLE_WORKER)" \
 	VGI_REQUIRE_LAUNCHER_TRANSPORT=1 \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
 	./build/debug/test/unittest "test/*" \
 	    "~test/sql/integration/writable/*" \
-	    "~test/sql/vgi_worker_pool.test" \
-	    "~test/sql/integration/table/filter_echo_partitioned.test" \
-	    "~test/sql/integration/attach/versioned_tables_impl.test"
+	    "~test/sql/vgi_worker_subprocess_pool.test" \
+	    "~test/sql/integration/table/filter_echo_partitioned.test"
 
 # Same test suite as test_launcher but with the fixture worker configured
 # to use the Cloudflare Durable Object storage backend
@@ -140,15 +145,15 @@ test_launcher_cloudflare_do:
 	VGI_VERSIONED_WORKER="launch:$(VGI_VERSIONED_WORKER)" \
 	VGI_VERSIONED_TABLES_WORKER="launch:$(VGI_VERSIONED_TABLES_WORKER)" \
 	VGI_ATTACH_OPTIONS_WORKER="launch:$(VGI_ATTACH_OPTIONS_WORKER)" \
+	VGI_BAD_PROTOCOL_WORKER="launch:$(VGI_BAD_PROTOCOL_WORKER)" \
 	VGI_SIMPLE_WRITABLE_WORKER="launch:$(VGI_SIMPLE_WRITABLE_WORKER)" \
 	VGI_REQUIRE_LAUNCHER_TRANSPORT=1 \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
 	VGI_WORKER_SHARED_STORAGE=cloudflare-do \
 	python3 scripts/run_tests.py --build release "test/*" \
 	    "~test/sql/integration/writable/*" \
-	    "~test/sql/vgi_worker_pool.test" \
-	    "~test/sql/integration/table/filter_echo_partitioned.test" \
-	    "~test/sql/integration/attach/versioned_tables_impl.test"
+	    "~test/sql/vgi_worker_subprocess_pool.test" \
+	    "~test/sql/integration/table/filter_echo_partitioned.test"
 
 test_launcher_cloudflare_do_debug:
 	@if [ ! -f .cloudflare-do.env ]; then \
@@ -162,15 +167,15 @@ test_launcher_cloudflare_do_debug:
 	VGI_VERSIONED_WORKER="launch:$(VGI_VERSIONED_WORKER)" \
 	VGI_VERSIONED_TABLES_WORKER="launch:$(VGI_VERSIONED_TABLES_WORKER)" \
 	VGI_ATTACH_OPTIONS_WORKER="launch:$(VGI_ATTACH_OPTIONS_WORKER)" \
+	VGI_BAD_PROTOCOL_WORKER="launch:$(VGI_BAD_PROTOCOL_WORKER)" \
 	VGI_SIMPLE_WRITABLE_WORKER="launch:$(VGI_SIMPLE_WRITABLE_WORKER)" \
 	VGI_REQUIRE_LAUNCHER_TRANSPORT=1 \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
 	VGI_WORKER_SHARED_STORAGE=cloudflare-do \
 	python3 scripts/run_tests.py --build debug "test/*" \
 	    "~test/sql/integration/writable/*" \
-	    "~test/sql/vgi_worker_pool.test" \
-	    "~test/sql/integration/table/filter_echo_partitioned.test" \
-	    "~test/sql/integration/attach/versioned_tables_impl.test"
+	    "~test/sql/vgi_worker_subprocess_pool.test" \
+	    "~test/sql/integration/table/filter_echo_partitioned.test"
 
 # HTTP transport tests (uses test/run_http_integration.sh)
 #

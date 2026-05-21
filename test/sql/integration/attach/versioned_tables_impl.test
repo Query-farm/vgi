@@ -194,8 +194,14 @@ statement ok
 DETACH i_both;
 
 # ============================================================================
-# Pool isolation on impl_version: two attaches with identical data_version
-# but different resolved impl versions must not share a pooled worker.
+# Per-attach impl_version isolation: two concurrent attaches to the SAME worker
+# path with identical data_version but different implementation_version specs
+# must each resolve independently. Version is dispatched per-attach (keyed by
+# attach_opaque_data), not baked into the worker process, so this holds
+# regardless of transport — a single shared launcher worker serves both attaches
+# their own resolved version. (Whether the subprocess pool keys distinct worker
+# *processes* by version is a transport-specific detail covered by
+# vgi_worker_subprocess_pool.test, not asserted here.)
 # ============================================================================
 
 statement ok
@@ -222,18 +228,6 @@ ORDER BY database_name;
 ----
 i_pool_a	10.0.0
 i_pool_b	11.0.0
-
-# Pool diagnostics show distinct (worker_path, data_version_spec, impl_version) keys.
-# Scope the predicate to the two impl_version values THIS block created so the
-# assertion is insensitive to stale pool rows left behind by earlier .test files
-# in the same unittest process (the pool is a process-global singleton whose
-# idle-timeout eviction is racy with fast workers).
-query I
-SELECT COUNT(*) FROM vgi_worker_pool()
-WHERE data_version_spec = '1.0.0'
-  AND implementation_version IN ('10.0.0', '11.0.0');
-----
-2
 
 statement ok
 DETACH i_pool_a;

@@ -24,7 +24,7 @@ void RegisterVgiWorkerPoolFlushFunction(ExtensionLoader &loader) {
 }
 
 // ============================================================================
-// vgi_worker_pool() - Table function to show pool contents
+// vgi_worker_subprocess_pool() - Table function to show pool contents
 // ============================================================================
 
 struct VgiWorkerPoolData : public TableFunctionData {
@@ -60,7 +60,7 @@ static void VgiWorkerPoolScan(ClientContext &context, TableFunctionInput &input,
 }
 
 void RegisterVgiWorkerPoolFunction(ExtensionLoader &loader) {
-	TableFunction func("vgi_worker_pool", {}, VgiWorkerPoolScan, VgiWorkerPoolBind);
+	TableFunction func("vgi_worker_subprocess_pool", {}, VgiWorkerPoolScan, VgiWorkerPoolBind);
 	loader.RegisterFunction(func);
 }
 
