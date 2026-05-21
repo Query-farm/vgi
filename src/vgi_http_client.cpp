@@ -3,6 +3,7 @@
 
 #include <cctype>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 
 #include "duckdb.hpp"
@@ -335,8 +336,40 @@ static std::string HttpPostArrowIpcInternal(ClientContext &context,
 
 	// Decompress the response if the server stamped a codec we know.
 	auto resp_enc = ResolveResponseEncoding(*out_response);
+	// Capture the on-the-wire size before app-level decompression so the log
+	// below reflects what was actually read off the socket. VGI uses the custom
+	// X-VGI-Content-Encoding header (which generic proxies/clients don't fold),
+	// so post.buffer_out here is still the compressed application body.
+	const size_t resp_wire_bytes = post.buffer_out.size();
 	if (resp_enc != HttpEncoding::NONE && !post.buffer_out.empty()) {
 		post.buffer_out = Decompress(resp_enc, post.buffer_out.data(), post.buffer_out.size());
+	}
+	const size_t resp_decoded_bytes = post.buffer_out.size();
+
+	// Per-response payload accounting for HTTP-transport debugging: how many
+	// bytes were read, whether the response was compressed (and with which
+	// codec), the decompressed size, and the decompression ratio. Both request
+	// directions are included so a slow scan can be attributed to wire volume vs
+	// codec choice. Surfaced via VGI_LOG (duckdb_logs type 'VGI' + stderr when
+	// VGI_STDERR_LOG=1). The matching Content-Length check above guards truncation.
+	{
+		const bool resp_compressed = resp_enc != HttpEncoding::NONE;
+		char ratio_buf[32];
+		std::snprintf(ratio_buf, sizeof(ratio_buf), "%.2f",
+		              resp_wire_bytes > 0
+		                  ? static_cast<double>(resp_decoded_bytes) / static_cast<double>(resp_wire_bytes)
+		                  : 0.0);
+		VGI_LOG(context, "http.response",
+		        {{"url", url},
+		         {"status", std::to_string(static_cast<int>(out_response->status))},
+		         {"req_encoding", EncodingName(request_encoding)},
+		         {"req_raw_bytes", std::to_string(body.size())},
+		         {"req_wire_bytes", std::to_string(compressed_body.size())},
+		         {"resp_compressed", resp_compressed ? "true" : "false"},
+		         {"resp_encoding", resp_compressed ? EncodingName(resp_enc) : "none"},
+		         {"resp_wire_bytes", std::to_string(resp_wire_bytes)},
+		         {"resp_decoded_bytes", std::to_string(resp_decoded_bytes)},
+		         {"resp_decompress_ratio", ratio_buf}});
 	}
 
 	// Server errors are sent as HTTP 200 with X-VGI-RPC-Error: true header
