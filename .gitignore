@@ -1,6 +1,7 @@
 build
 .cache/
 vcpkg_installed/
+/vcpkg/
 .idea
 cmake-build-debug
 duckdb_unittest_tempdir/
