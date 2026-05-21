@@ -1,5 +1,13 @@
 cmake_minimum_required(VERSION 3.5)
 
+# Honor CMAKE_MSVC_RUNTIME_LIBRARY (set below for MSVC). Must be NEW *before*
+# project() enables CXX; our cmake_minimum_required(3.5) would otherwise pin it
+# OLD in this scope, leaving our objects on the static CRT (/MT) while the
+# x64-windows-static-md vcpkg deps use the dynamic CRT (/MD) — an LNK2038 clash.
+if(POLICY CMP0091)
+  cmake_policy(SET CMP0091 NEW)
+endif()
+
 # Set extension name here
 set(TARGET_NAME vgi)
 set(CMAKE_CXX_STANDARD 17 CACHE STRING "C++ standard to enforce" FORCE)
@@ -45,6 +53,11 @@ endif()
 # C++20-conformant preprocessor. MinGW/Clang already conform, so MSVC-only.
 if(MSVC)
   add_compile_options(/Zc:preprocessor)
+  # Match the vcpkg deps (arrow/openssl/boost) built under x64-windows-static-md,
+  # which use the dynamic CRT (/MD). Without this our objects default to /MT and
+  # linking arrow.lib fails with LNK2038 RuntimeLibrary mismatch. Requires
+  # CMP0091=NEW (set above).
+  set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
 endif()
 
 include_directories(src/include)
