@@ -6,11 +6,19 @@ duckdb_extension_load(vgi
     LOAD_TESTS
 )
 
-duckdb_extension_load(httpfs
-    LOAD_TESTS
-    GIT_URL https://github.com/duckdb/duckdb-httpfs
-    GIT_TAG 52afb4204a3238d6ee132e83340f8d68c40ee91c
-)
+# DuckDB 1.5.3's httpfs (52afb42) is curl-based. On the MinGW toolchain
+# (x64-mingw-static, rtools GCC) it fails to link against static curl with
+# `undefined reference to __imp_curl_*` — curl's headers emit DLL-import symbols
+# unless CURL_STATICLIB is defined when httpfs compiles, and that flag can't be
+# injected into httpfs's separate CMake subtree from here. MSVC / Linux / WASM
+# link fine. So skip httpfs on MinGW; the `require httpfs` tests simply skip there.
+if(NOT MINGW)
+    duckdb_extension_load(httpfs
+        LOAD_TESTS
+        GIT_URL https://github.com/duckdb/duckdb-httpfs
+        GIT_TAG 52afb4204a3238d6ee132e83340f8d68c40ee91c
+    )
+endif()
 
 # Any extra extensions that should be built
 duckdb_extension_load(json)
