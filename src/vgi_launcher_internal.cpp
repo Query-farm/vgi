@@ -232,12 +232,19 @@ std::vector<std::string> ParseLaunchArgv(const std::string &payload) {
 				state = ShlexState::kInSingle;
 				has_token = true;
 			} else if (c == '\\') {
+#if defined(_WIN32)
+				// On Windows, backslash is a path separator, not a shell escape —
+				// keep it literal so `C:\path\to\worker` survives intact.
+				token.push_back(c);
+				has_token = true;
+#else
 				if (i + 1 >= payload.size()) {
 					throw std::invalid_argument(
 					    "vgi launcher: trailing backslash in launch: argv");
 				}
 				token.push_back(payload[++i]);
 				has_token = true;
+#endif
 			} else {
 				token.push_back(c);
 				has_token = true;
@@ -248,6 +255,10 @@ std::vector<std::string> ParseLaunchArgv(const std::string &payload) {
 			if (c == '"') {
 				state = ShlexState::kDefault;
 			} else if (c == '\\' && i + 1 < payload.size()) {
+#if defined(_WIN32)
+				// Backslash is a literal path separator on Windows.
+				token.push_back('\\');
+#else
 				char next = payload[i + 1];
 				// Only a few sequences are special inside double-quotes
 				// per POSIX; everything else preserves the backslash.
@@ -257,6 +268,7 @@ std::vector<std::string> ParseLaunchArgv(const std::string &payload) {
 				} else {
 					token.push_back('\\');
 				}
+#endif
 			} else {
 				token.push_back(c);
 			}
