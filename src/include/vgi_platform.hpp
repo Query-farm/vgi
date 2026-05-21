@@ -39,10 +39,17 @@
 #endif
 
 #if defined(_WIN32)
-// MSVC has no pid_t. Several widely-included headers use pid_t in declarations
-// that must compile on Windows even though no subprocess is ever spawned there.
-// POSIX provides ::pid_t at global scope (via <sys/types.h>), and the codebase
-// uses unqualified `pid_t` from multiple namespaces (duckdb and duckdb::vgi), so
-// the shim must also be a global-scope alias rather than namespace-scoped.
+#if defined(_MSC_VER)
+// MSVC's CRT has no pid_t. Several widely-included headers use pid_t in
+// declarations that must compile on Windows even though no subprocess is ever
+// spawned there. POSIX provides ::pid_t at global scope (via <sys/types.h>), and
+// the codebase uses unqualified `pid_t` from multiple namespaces (duckdb and
+// duckdb::vgi), so the shim is a global-scope alias. (clang-cl also defines
+// _MSC_VER and lacks pid_t, so it gets the shim too.)
 using pid_t = int;
+#else
+// MinGW/Clang-on-Windows DO define pid_t in <sys/types.h> (typedef _pid_t pid_t),
+// so defining our own conflicts ("conflicting declaration"). Pull theirs in.
+#include <sys/types.h>
+#endif
 #endif
