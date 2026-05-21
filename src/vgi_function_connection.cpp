@@ -181,13 +181,15 @@ AcquireForInitResult AcquireConnectionForInit(ClientContext &context, const Func
 // FunctionConnection - vgi_rpc Protocol Implementation
 // ============================================================================
 
-// The entire FunctionConnection implementation is the POSIX subprocess/AF_UNIX
-// transport (fork/exec or AF_UNIX socket, driven via fd-based RPC). On builds
-// without the POSIX transport the class is never instantiated — the factory
-// functions below throw before constructing it — so the member definitions are
-// simply excluded. HTTP uses HttpFunctionConnection, an independent
-// IFunctionConnection sibling. See vgi_platform.hpp.
-#if VGI_POSIX_TRANSPORT
+// The FunctionConnection implementation is the subprocess/AF_UNIX transport
+// (fork/exec or AF_UNIX socket on POSIX, CreateProcess on Windows), driven via
+// fd-based RPC. Compiled on POSIX and Windows; on Emscripten (HTTP-only) the
+// class is never instantiated — the factory functions below throw before
+// constructing it — so the member definitions are excluded. HTTP uses
+// HttpFunctionConnection, an independent IFunctionConnection sibling. The
+// shared-memory side-channel within is POSIX-only (guarded separately). See
+// vgi_platform.hpp.
+#if VGI_SUBPROCESS_TRANSPORT
 
 FunctionConnection::FunctionConnection(const std::string &worker_path, const std::string &function_name,
                                        const ArrowArguments &arguments, const std::vector<uint8_t> &attach_opaque_data,
@@ -411,6 +413,7 @@ InitResult FunctionConnection::PerformInit(const BindResult &bind_result,
 	auto rpc_params = generated::BuildInitParams(init_request_bytes);
 	ValidateRequestSchema(rpc_params, "init", worker_path_);
 	std::shared_ptr<arrow::KeyValueMetadata> shm_metadata;
+#if VGI_POSIX_TRANSPORT // shared-memory side-channel (shm_open/mmap) is POSIX-only
 	if (const char *env = std::getenv("VGI_RPC_SHM_SIZE_BYTES"); env && *env) {
 		try {
 			size_t shm_size = static_cast<size_t>(std::stoull(env));
@@ -438,6 +441,7 @@ InitResult FunctionConnection::PerformInit(const BindResult &bind_result,
 			shm_metadata.reset();
 		}
 	}
+#endif // VGI_POSIX_TRANSPORT (shm)
 	try {
 		WriteRpcRequest(proc_->GetStdinFd(), "init", rpc_params, shm_metadata);
 	} catch (const IOException &e) {
@@ -772,6 +776,8 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 		// guarantees DuckDB has fully consumed the previous chunk by the
 		// time it asks us for the next one. Without this, the allocator
 		// fills monotonically and the worker silently falls back to inline.
+		// (POSIX-only: shm_segment_ is never non-null on Windows.)
+#if VGI_POSIX_TRANSPORT
 		if (shm_segment_) {
 			if (shm_last_offset_ >= 0) {
 				shm_segment_->FreeAllocation(static_cast<uint64_t>(shm_last_offset_));
@@ -792,6 +798,7 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 				fprintf(stderr, "[shm] inline fallback (rows=%lld)\n", (long long)result.batch->num_rows());
 			}
 		}
+#endif // VGI_POSIX_TRANSPORT (shm)
 
 		// Parse vgi_partition_values#b64 off the wire metadata. Base64-
 		// decode here; IPC decode + validation happen in InstallBatch on
@@ -1237,7 +1244,7 @@ void FunctionConnection::DrainStderrLog() {
 	stderr_drainer_->DrainToLog(context_, worker_path_, proc_ ? proc_->GetPid() : -1);
 }
 
-#endif // VGI_POSIX_TRANSPORT
+#endif // VGI_SUBPROCESS_TRANSPORT
 
 // ============================================================================
 // Factory Functions
@@ -1297,11 +1304,11 @@ std::unique_ptr<IFunctionConnection> CreateFunctionConnection(
 		    context, function_type, global_execution_id, worker_debug, settings, required_secrets);
 #endif
 	}
-	// Bare-command path → subprocess transport (POSIX only). On builds without
-	// it, fail fast with the same guidance as the launch:/unix:// branch.
-#if !VGI_POSIX_TRANSPORT
+	// Bare-command path → subprocess transport. Available on POSIX (fork/exec)
+	// and Windows (CreateProcess); only Emscripten lacks a child-process transport.
+#if !VGI_SUBPROCESS_TRANSPORT
 	throw InvalidInputException(
-	    "vgi: subprocess (bare command) LOCATIONs require fork() and are "
+	    "vgi: subprocess (bare command) LOCATIONs require a child-process transport "
 	    "not available in this build (worker_path=%s); use http://… instead",
 	    worker_path);
 #else
@@ -1329,9 +1336,9 @@ std::unique_ptr<IFunctionConnection> CreateFunctionConnectionFromPool(
     bool worker_debug,
     const std::map<std::string, Value> &settings,
     const std::vector<VgiSecretRequirement> &required_secrets) {
-	// Only subprocess connections use the pool — POSIX-transport only. The pool
-	// is always empty on builds without it, so this is never reached there.
-#if VGI_POSIX_TRANSPORT
+	// Only subprocess connections use the pool. The pool is empty on builds
+	// without a child-process transport (Emscripten), so this is never reached there.
+#if VGI_SUBPROCESS_TRANSPORT
 	return std::make_unique<FunctionConnection>(
 	    std::move(pooled_worker), function_name, arguments, attach_opaque_data, transaction_opaque_data, context,
 	    function_type, global_execution_id, worker_debug, settings, required_secrets);

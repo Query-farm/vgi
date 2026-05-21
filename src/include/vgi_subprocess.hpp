@@ -135,6 +135,14 @@ protected:
 	int stdin_fd_ = -1;
 	int stdout_fd_ = -1;
 	int stderr_fd_ = -1;
+#if defined(_WIN32)
+	// Windows: the spawned child's process HANDLE (owned; closed in the dtor /
+	// after Wait). pid_ holds GetProcessId(process_handle_) for diagnostics, but
+	// Wait()/TryWait() need the HANDLE itself. void* avoids dragging <windows.h>
+	// into this widely-included header. The fd members above are CRT fds wrapping
+	// the parent ends of the stdio pipes via _open_osfhandle().
+	void *process_handle_ = nullptr;
+#endif
 };
 
 // Helper to write all bytes to a file descriptor

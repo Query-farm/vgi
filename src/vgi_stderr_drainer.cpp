@@ -2,10 +2,14 @@
 #include "vgi_stderr_drainer.hpp"
 
 #include <cerrno>
+#include <chrono>
 
 #if VGI_POSIX_TRANSPORT
 #include <poll.h>
 #include <unistd.h>
+#elif defined(_WIN32)
+#include <io.h>      // _read, _get_osfhandle, _close
+#include <windows.h> // PeekNamedPipe
 #endif
 
 #include "vgi_logging.hpp"
@@ -13,7 +17,7 @@
 namespace duckdb {
 namespace vgi {
 
-#if VGI_POSIX_TRANSPORT
+#if VGI_SUBPROCESS_TRANSPORT
 StderrDrainer::StderrDrainer(int fd) : fd_(fd) {
 	if (fd_ < 0) {
 		return;
@@ -27,7 +31,11 @@ StderrDrainer::~StderrDrainer() {
 		thread_.join();
 	}
 	if (fd_ >= 0) {
+#if defined(_WIN32)
+		_close(fd_);
+#else
 		close(fd_);
+#endif
 		fd_ = -1;
 	}
 }
@@ -41,7 +49,7 @@ int StderrDrainer::ReleaseFd() {
 	fd_ = -1;
 	return fd;
 }
-#else  // !VGI_POSIX_TRANSPORT
+#else  // Emscripten (HTTP-only)
 // No subprocess stderr pipe exists on this build; the drainer is never
 // constructed with a real fd. Defined so the always-compiled worker pool /
 // FunctionConnection (which hold a unique_ptr<StderrDrainer>) link.
@@ -52,7 +60,7 @@ StderrDrainer::~StderrDrainer() {
 int StderrDrainer::ReleaseFd() {
 	return -1;
 }
-#endif // VGI_POSIX_TRANSPORT
+#endif // VGI_SUBPROCESS_TRANSPORT
 
 void StderrDrainer::DrainToLog(ClientContext &context, const std::string &worker_path, pid_t worker_pid) {
 	std::vector<std::string> lines;
@@ -75,18 +83,23 @@ void StderrDrainer::DrainToLog(ClientContext &context, const std::string &worker
 	}
 }
 
-#if VGI_POSIX_TRANSPORT
+#if VGI_SUBPROCESS_TRANSPORT
 void StderrDrainer::ThreadLoop() {
 	char buffer[4096];
 	std::string line_buffer;
 
+#if VGI_POSIX_TRANSPORT
 	struct pollfd pfd;
 	pfd.fd = fd_;
 	pfd.events = POLLIN;
+#elif defined(_WIN32)
+	HANDLE h = reinterpret_cast<HANDLE>(_get_osfhandle(fd_));
+#endif
 
 	while (!stop_.load(std::memory_order_relaxed)) {
-		// poll() with timeout so we can periodically check the stop flag —
-		// avoids blocking read() from preventing the destructor from joining.
+		// Wait (with a timeout / poll quantum) so we can periodically check the
+		// stop flag — a blocking read would prevent the destructor from joining.
+#if VGI_POSIX_TRANSPORT
 		int poll_result = poll(&pfd, 1, 100); // 100ms
 		if (poll_result < 0) {
 			if (errno == EINTR) {
@@ -97,8 +110,18 @@ void StderrDrainer::ThreadLoop() {
 		if (poll_result == 0) {
 			continue;
 		}
-
 		ssize_t bytes_read = read(fd_, buffer, sizeof(buffer) - 1);
+#elif defined(_WIN32)
+		DWORD avail = 0;
+		if (h == INVALID_HANDLE_VALUE || !PeekNamedPipe(h, nullptr, 0, nullptr, &avail, nullptr)) {
+			break; // pipe closed / broken
+		}
+		if (avail == 0) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(100));
+			continue;
+		}
+		int bytes_read = _read(fd_, buffer, sizeof(buffer) - 1);
+#endif
 		if (bytes_read <= 0) {
 			break; // EOF or error
 		}
@@ -137,7 +160,7 @@ void StderrDrainer::ThreadLoop() {
 
 	// Note: fd is NOT closed here — the destructor or ReleaseFd() decides.
 }
-#endif // VGI_POSIX_TRANSPORT
+#endif // VGI_SUBPROCESS_TRANSPORT
 
 } // namespace vgi
 } // namespace duckdb

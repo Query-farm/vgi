@@ -94,11 +94,11 @@ static bool DispatchBatch(const std::shared_ptr<arrow::RecordBatch> &batch,
 // Request Writing
 // ============================================================================
 //
-// The fd-based request/response functions below are the POSIX subprocess/AF_UNIX
-// wire path (FdOutputStream/FdInputStream + WaitForReadable on a pipe/socket fd).
-// HTTP transport uses the buffer-based equivalents further down, which stay
-// compiled on every platform. See vgi_platform.hpp.
-#if VGI_POSIX_TRANSPORT
+// The fd-based request/response functions below are the subprocess/AF_UNIX wire
+// path (FdOutputStream/FdInputStream + WaitForReadable on a pipe/socket fd) — now
+// cross-platform (POSIX + Windows) via the fd I/O layer. HTTP transport uses the
+// buffer-based equivalents further down. See vgi_platform.hpp.
+#if VGI_SUBPROCESS_TRANSPORT
 
 void WriteRpcRequest(int fd, const std::string &method_name,
                      const std::shared_ptr<arrow::RecordBatch> &params_batch,
@@ -330,7 +330,7 @@ StreamHeaderResult ReadStreamHeader(int fd, ClientContext *context,
 	return result;
 }
 
-#endif // VGI_POSIX_TRANSPORT
+#endif // VGI_SUBPROCESS_TRANSPORT
 
 // ============================================================================
 // Buffer-based Serialization/Deserialization (for HTTP transport)

@@ -24,10 +24,11 @@ namespace vgi {
 
 namespace {
 
-#if VGI_POSIX_TRANSPORT
+#if VGI_SUBPROCESS_TRANSPORT
 // One attempt. Throws IOException on any transport error; caller decides whether
 // to retry. `force_fresh` bypasses the pool acquire entirely — used for the
-// retry path so a freshly-spawned worker does the work.
+// retry path so a freshly-spawned worker does the work. Cross-platform: the
+// SubProcess + fd RPC layer it uses works on POSIX and Windows.
 UnaryResponseResult AttemptUnaryRpc(const UnaryRpcOptions &opts, const std::string &method_name,
                                      const std::shared_ptr<arrow::RecordBatch> &params, bool force_fresh) {
 	std::unique_ptr<SubProcess> proc;
@@ -120,7 +121,7 @@ UnaryResponseResult AttemptUnaryRpc(const UnaryRpcOptions &opts, const std::stri
 
 	return response;
 }
-#endif // VGI_POSIX_TRANSPORT
+#endif // VGI_SUBPROCESS_TRANSPORT
 
 } // anonymous namespace
 
@@ -168,10 +169,11 @@ UnaryResponseResult InvokePooledUnaryRpc(const UnaryRpcOptions &opts, const std:
 #endif
 	}
 
-	// Bare-command path → subprocess transport (POSIX only).
-#if !VGI_POSIX_TRANSPORT
+	// Bare-command path → subprocess transport (POSIX fork/exec or Windows
+	// CreateProcess); only Emscripten lacks it.
+#if !VGI_SUBPROCESS_TRANSPORT
 	throw InvalidInputException(
-	    "vgi: subprocess (bare command) LOCATIONs require fork() and are "
+	    "vgi: subprocess (bare command) LOCATIONs require a child-process transport "
 	    "not available in this build (worker_path=%s); use http://… instead",
 	    opts.worker_path);
 #else

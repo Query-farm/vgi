@@ -8,6 +8,8 @@
 #if VGI_POSIX_TRANSPORT
 #include <sys/select.h>
 #include <unistd.h>
+#elif defined(_WIN32)
+#include <io.h> // _read, _write
 #endif
 
 #include "duckdb/common/exception.hpp"
@@ -90,11 +92,12 @@ std::shared_ptr<arrow::Buffer> SerializeRecordBatch(
 	return finish_result.ValueUnsafe();
 }
 
-// Fd-based stream I/O + ReadRecordBatch are the POSIX subprocess/AF_UNIX data
-// path (raw read/write/select on a pipe or socket fd). HTTP and catalog paths
-// use the buffer-based serialization helpers above, which stay compiled
-// everywhere. See vgi_platform.hpp.
-#if VGI_POSIX_TRANSPORT
+// Fd-based stream I/O + ReadRecordBatch are the subprocess/AF_UNIX data path
+// (raw read/write on a pipe or socket fd). Compiled on POSIX and Windows; the
+// per-syscall split is `#if VGI_POSIX_TRANSPORT … #else (Windows _read/_write)`.
+// HTTP and catalog paths use the buffer-based serialization helpers above, which
+// stay compiled everywhere. See vgi_platform.hpp.
+#if VGI_SUBPROCESS_TRANSPORT
 
 // FdInputStream implementation
 FdInputStream::FdInputStream(int fd) : fd_(fd), position_(0), is_open_(true) {
@@ -124,7 +127,12 @@ arrow::Result<int64_t> FdInputStream::Read(int64_t nbytes, void *out) {
 	int64_t total_bytes_read = 0;
 
 	while (total_bytes_read < nbytes) {
+#if VGI_POSIX_TRANSPORT
 		ssize_t bytes_read = read(fd_, buffer + total_bytes_read, nbytes - total_bytes_read);
+#else
+		int bytes_read =
+		    _read(fd_, buffer + total_bytes_read, static_cast<unsigned int>(nbytes - total_bytes_read));
+#endif
 		if (bytes_read == -1) {
 			if (errno == EINTR) {
 				continue;
@@ -177,6 +185,7 @@ arrow::Status FdOutputStream::Write(const void *data, int64_t nbytes) {
 	const uint8_t *bytes = static_cast<const uint8_t *>(data);
 	int64_t total_written = 0;
 
+#if VGI_POSIX_TRANSPORT
 	// Bound: an unresponsive worker that fills its kernel pipe buffer
 	// would otherwise block write() forever. 60s is well above any
 	// realistic RPC payload write time on a healthy worker. Same
@@ -233,6 +242,24 @@ arrow::Status FdOutputStream::Write(const void *data, int64_t nbytes) {
 		}
 		total_written += written;
 	}
+#else // _WIN32: anonymous pipes are not selectable, so no select() pre-gate; a
+      // blocking _write loop suffices for the lockstep RPC. (A hung-worker write
+      // timeout would need overlapped I/O — deferred; the read side is bounded.)
+	while (total_written < nbytes) {
+		int written =
+		    _write(fd_, bytes + total_written, static_cast<unsigned int>(nbytes - total_written));
+		if (written < 0) {
+			if (errno == EINTR) {
+				continue;
+			}
+			if (errno == EPIPE) {
+				return arrow::Status::IOError("Broken pipe writing to worker");
+			}
+			return arrow::Status::IOError("Write error: ", strerror(errno));
+		}
+		total_written += written;
+	}
+#endif
 
 	position_ += total_written;
 	return arrow::Status::OK();
@@ -307,7 +334,7 @@ arrow::RecordBatchWithMetadata ReadRecordBatch(int fd, const std::string &worker
 	return batch_with_metadata;
 }
 
-#endif // VGI_POSIX_TRANSPORT
+#endif // VGI_SUBPROCESS_TRANSPORT
 
 // Extract string values from a result batch column.
 // Returns empty vector if batch is null (protocol error) or has no rows (empty result).

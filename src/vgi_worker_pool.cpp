@@ -79,10 +79,10 @@ void VgiWorkerPool::SetDefaultSettings(const PoolSettings &settings) {
 }
 
 VgiWorkerPool::VgiWorkerPool() {
-#if VGI_POSIX_TRANSPORT
-	// Start the cleanup thread (no subprocess workers to clean up on builds
-	// without the POSIX transport — WASM is single-threaded, Windows is
-	// HTTP-only in Phase 1; the pool stays empty there).
+#if VGI_SUBPROCESS_TRANSPORT
+	// Start the cleanup thread. Runs wherever a subprocess pool exists (POSIX +
+	// Windows). Emscripten is single-threaded and HTTP-only, so the pool stays
+	// empty there and no cleanup thread is needed.
 	cleanup_thread_ = std::thread(&VgiWorkerPool::CleanupThread, this);
 #endif
 }
@@ -92,7 +92,7 @@ VgiWorkerPool::~VgiWorkerPool() {
 	shutdown_.store(true);
 	cleanup_cv_.notify_all();
 
-#if VGI_POSIX_TRANSPORT
+#if VGI_SUBPROCESS_TRANSPORT
 	// Wait for cleanup thread
 	if (cleanup_thread_.joinable()) {
 		cleanup_thread_.join();

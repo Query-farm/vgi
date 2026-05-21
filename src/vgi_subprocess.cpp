@@ -10,6 +10,10 @@
 #if VGI_POSIX_TRANSPORT
 #include <fcntl.h>
 #include <sys/select.h>
+#elif defined(_WIN32)
+#include <fcntl.h> // _O_BINARY / _O_RDONLY / _O_WRONLY
+#include <io.h>     // _open_osfhandle, _get_osfhandle, _read, _write, _close
+#include <windows.h>
 #endif
 
 #include "duckdb/common/exception.hpp"
@@ -343,14 +347,238 @@ void WaitForReadable(int fd, int timeout_seconds) {
 	}
 }
 
-#else // !VGI_POSIX_TRANSPORT
+#elif defined(_WIN32)
 
-// Windows / Emscripten stubs. The subprocess transport is unavailable on these
-// builds; the transport-dispatch layer (CreateFunctionConnection /
-// InvokePooledUnaryRpc) throws a clear InvalidInputException before any of these
-// is reached on a live path. They exist only so that the always-compiled
-// vgi_worker_pool.cpp (which holds unique_ptr<SubProcess>) and the
-// per-method-guarded FunctionConnection link cleanly.
+// ---------------------------------------------------------------------------
+// Windows subprocess backend.
+//
+// Realizes the same fd-based seam the POSIX path uses, via the CRT fd layer:
+// CreatePipe gives HANDLEs, _open_osfhandle wraps the parent ends as int fds so
+// the rest of the codebase keeps its `int fd` model unchanged. Readiness waits
+// use PeekNamedPipe polling (Windows anonymous pipes are not selectable). The
+// child is launched with CreateProcess via `cmd.exe /c <command>` (POSIX uses
+// `/bin/sh -c`). UNTESTED on macOS CI — validated on the Windows build machine.
+// ---------------------------------------------------------------------------
+
+// Pipe is fork-oriented (FD_CLOEXEC); the Windows SubProcess manages its pipes
+// inline, so this type is never instantiated here. Throwing stubs keep it linkable.
+Pipe::Pipe() {
+	throw NotImplementedException("vgi: Pipe is not used by the Windows subprocess backend");
+}
+Pipe::~Pipe() {
+}
+void Pipe::CloseRead() {
+}
+void Pipe::CloseWrite() {
+}
+
+SubProcess::SubProcess(const std::string &command, bool stderr_passthrough) {
+	if (!stderr_passthrough) {
+		const char *passthrough_env = std::getenv("VGI_WORKER_STDERR_PASSTHROUGH");
+		stderr_passthrough = passthrough_env && std::string(passthrough_env) == "1";
+	}
+	if (!stderr_passthrough) {
+		const char *debug_env = std::getenv("VGI_WORKER_DEBUG");
+		stderr_passthrough = debug_env && std::string(debug_env) == "1";
+	}
+
+	SECURITY_ATTRIBUTES sa {};
+	sa.nLength = sizeof(sa);
+	sa.bInheritHandle = TRUE;
+	sa.lpSecurityDescriptor = nullptr;
+
+	HANDLE child_stdin_rd = nullptr, parent_stdin_wr = nullptr;
+	HANDLE parent_stdout_rd = nullptr, child_stdout_wr = nullptr;
+	HANDLE parent_stderr_rd = nullptr, child_stderr_wr = nullptr;
+
+	auto fail = [&](const char *what) -> IOException {
+		DWORD e = GetLastError();
+		for (HANDLE h : {child_stdin_rd, parent_stdin_wr, parent_stdout_rd, child_stdout_wr,
+		                 parent_stderr_rd, child_stderr_wr}) {
+			if (h) {
+				CloseHandle(h);
+			}
+		}
+		return IOException("vgi: %s failed (GetLastError=%lu)", what, (unsigned long)e);
+	};
+
+	if (!CreatePipe(&child_stdin_rd, &parent_stdin_wr, &sa, 0)) {
+		throw fail("CreatePipe(stdin)");
+	}
+	SetHandleInformation(parent_stdin_wr, HANDLE_FLAG_INHERIT, 0); // parent end not inherited
+	if (!CreatePipe(&parent_stdout_rd, &child_stdout_wr, &sa, 0)) {
+		throw fail("CreatePipe(stdout)");
+	}
+	SetHandleInformation(parent_stdout_rd, HANDLE_FLAG_INHERIT, 0);
+	if (!stderr_passthrough) {
+		if (!CreatePipe(&parent_stderr_rd, &child_stderr_wr, &sa, 0)) {
+			throw fail("CreatePipe(stderr)");
+		}
+		SetHandleInformation(parent_stderr_rd, HANDLE_FLAG_INHERIT, 0);
+	}
+
+	STARTUPINFOA si {};
+	si.cb = sizeof(si);
+	si.dwFlags = STARTF_USESTDHANDLES;
+	si.hStdInput = child_stdin_rd;
+	si.hStdOutput = child_stdout_wr;
+	si.hStdError = stderr_passthrough ? GetStdHandle(STD_ERROR_HANDLE) : child_stderr_wr;
+
+	// POSIX runs `/bin/sh -c <command>`; the Windows equivalent is `cmd.exe /c`.
+	std::string cmdline = "cmd.exe /c " + command;
+	std::vector<char> mutable_cmd(cmdline.begin(), cmdline.end());
+	mutable_cmd.push_back('\0');
+
+	PROCESS_INFORMATION pi {};
+	BOOL ok = CreateProcessA(nullptr, mutable_cmd.data(), nullptr, nullptr, /*bInheritHandles=*/TRUE,
+	                         0, nullptr, nullptr, &si, &pi);
+
+	// The child's ends are now owned by the child; close our copies regardless.
+	CloseHandle(child_stdin_rd);
+	child_stdin_rd = nullptr;
+	CloseHandle(child_stdout_wr);
+	child_stdout_wr = nullptr;
+	if (child_stderr_wr) {
+		CloseHandle(child_stderr_wr);
+		child_stderr_wr = nullptr;
+	}
+
+	if (!ok) {
+		throw fail("CreateProcess");
+	}
+	CloseHandle(pi.hThread);
+	process_handle_ = pi.hProcess;
+	pid_ = static_cast<pid_t>(GetProcessId(pi.hProcess));
+
+	// Wrap the parent ends as CRT fds. After a successful _open_osfhandle the fd
+	// owns the HANDLE (closing the fd closes the HANDLE).
+	stdin_fd_ = _open_osfhandle(reinterpret_cast<intptr_t>(parent_stdin_wr), _O_BINARY | _O_WRONLY);
+	stdout_fd_ = _open_osfhandle(reinterpret_cast<intptr_t>(parent_stdout_rd), _O_BINARY | _O_RDONLY);
+	stderr_fd_ =
+	    stderr_passthrough ? -1 : _open_osfhandle(reinterpret_cast<intptr_t>(parent_stderr_rd), _O_BINARY | _O_RDONLY);
+}
+
+SubProcess::~SubProcess() {
+	if (stdin_fd_ >= 0) {
+		_close(stdin_fd_);
+	}
+	if (stdout_fd_ >= 0) {
+		_close(stdout_fd_);
+	}
+	if (stderr_fd_ >= 0) {
+		_close(stderr_fd_);
+	}
+	if (process_handle_) {
+		HANDLE h = static_cast<HANDLE>(process_handle_);
+		if (WaitForSingleObject(h, 0) != WAIT_OBJECT_0) {
+			TerminateProcess(h, 1);
+			WaitForSingleObject(h, 2000);
+		}
+		CloseHandle(h);
+		process_handle_ = nullptr;
+	}
+}
+
+void SubProcess::CloseStdin() {
+	if (stdin_fd_ >= 0) {
+		_close(stdin_fd_);
+		stdin_fd_ = -1;
+	}
+}
+
+void SubProcess::CloseStderr() {
+	if (stderr_fd_ >= 0) {
+		_close(stderr_fd_);
+		stderr_fd_ = -1;
+	}
+}
+
+int SubProcess::Wait(bool *exited_normally) {
+	if (!process_handle_) {
+		if (exited_normally) {
+			*exited_normally = true;
+		}
+		return 0;
+	}
+	HANDLE h = static_cast<HANDLE>(process_handle_);
+	WaitForSingleObject(h, INFINITE);
+	DWORD code = 0;
+	GetExitCodeProcess(h, &code);
+	CloseHandle(h);
+	process_handle_ = nullptr;
+	pid_ = -1;
+	if (exited_normally) {
+		*exited_normally = true; // Windows has no signal-vs-exit distinction here
+	}
+	return static_cast<int>(code);
+}
+
+bool SubProcess::TryWait(int *exit_status) {
+	if (!process_handle_) {
+		return true;
+	}
+	HANDLE h = static_cast<HANDLE>(process_handle_);
+	if (WaitForSingleObject(h, 0) == WAIT_TIMEOUT) {
+		return false; // still running
+	}
+	DWORD code = 0;
+	GetExitCodeProcess(h, &code);
+	if (exit_status) {
+		*exit_status = static_cast<int>(code);
+	}
+	CloseHandle(h);
+	process_handle_ = nullptr;
+	pid_ = -1;
+	return true;
+}
+
+void WriteAll(int fd, const uint8_t *data, size_t len) {
+	size_t written = 0;
+	while (written < len) {
+		int result = _write(fd, data + written, static_cast<unsigned int>(len - written));
+		if (result < 0) {
+			if (errno == EINTR) {
+				continue;
+			}
+			if (errno == EPIPE) {
+				throw IOException("Worker closed pipe (EPIPE). Worker may have crashed - "
+				                  "check worker stderr output");
+			}
+			throw IOException("Failed to write to worker: %s", std::strerror(errno));
+		}
+		written += static_cast<size_t>(result);
+	}
+}
+
+void WaitForReadable(int fd, int timeout_seconds) {
+	HANDLE h = reinterpret_cast<HANDLE>(_get_osfhandle(fd));
+	if (h == INVALID_HANDLE_VALUE) {
+		throw IOException("VGI WaitForReadable: invalid file descriptor");
+	}
+	auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout_seconds);
+	while (true) {
+		DWORD avail = 0;
+		if (!PeekNamedPipe(h, nullptr, 0, nullptr, &avail, nullptr)) {
+			// Broken pipe → treat as readable so the following read sees EOF,
+			// matching POSIX select() returning readable at EOF.
+			if (GetLastError() == ERROR_BROKEN_PIPE) {
+				return;
+			}
+			throw IOException("VGI catalog operation failed: PeekNamedPipe error %lu",
+			                  (unsigned long)GetLastError());
+		}
+		if (avail > 0) {
+			return;
+		}
+		if (std::chrono::steady_clock::now() >= deadline) {
+			throw IOException("VGI catalog operation timed out after %d seconds", timeout_seconds);
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(5));
+	}
+}
+
+#else // Emscripten (HTTP-only): throwing stubs so worker pool / FunctionConnection link
+
 Pipe::Pipe() {
 	throw NotImplementedException("vgi: subprocess transport unavailable in this build");
 }
@@ -380,7 +608,7 @@ bool SubProcess::TryWait(int *exit_status) {
 	if (exit_status) {
 		*exit_status = 0;
 	}
-	return true; // treat as exited; pool is always empty on this build
+	return true;
 }
 void WriteAll(int, const uint8_t *, size_t) {
 	throw NotImplementedException("vgi: subprocess transport unavailable in this build");
@@ -389,7 +617,7 @@ void WaitForReadable(int, int) {
 	throw NotImplementedException("vgi: subprocess transport unavailable in this build");
 }
 
-#endif // VGI_POSIX_TRANSPORT
+#endif // VGI_POSIX_TRANSPORT / _WIN32 / emscripten
 
 int GetCatalogTimeout(ClientContext *context) {
 	if (context) {
@@ -435,11 +663,35 @@ void WaitForReadableUntilCancel(int fd, ClientContext *context) {
 		return;
 	}
 }
-#else  // !VGI_POSIX_TRANSPORT
+#elif defined(_WIN32)
+void WaitForReadableUntilCancel(int fd, ClientContext *context) {
+	HANDLE h = reinterpret_cast<HANDLE>(_get_osfhandle(fd));
+	if (h == INVALID_HANDLE_VALUE) {
+		throw IOException("VGI WaitForReadableUntilCancel: invalid file descriptor");
+	}
+	while (true) {
+		if (context && context->interrupted) {
+			throw IOException("VGI operation interrupted (query cancelled)");
+		}
+		DWORD avail = 0;
+		if (!PeekNamedPipe(h, nullptr, 0, nullptr, &avail, nullptr)) {
+			if (GetLastError() == ERROR_BROKEN_PIPE) {
+				return; // EOF — let the read observe it
+			}
+			throw IOException("VGI operation failed: PeekNamedPipe error %lu",
+			                  (unsigned long)GetLastError());
+		}
+		if (avail > 0) {
+			return;
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(250)); // poll quantum
+	}
+}
+#else // Emscripten
 void WaitForReadableUntilCancel(int, ClientContext *) {
 	throw NotImplementedException("vgi: subprocess transport unavailable in this build");
 }
-#endif // VGI_POSIX_TRANSPORT
+#endif // VGI_POSIX_TRANSPORT / _WIN32 / emscripten
 
 } // namespace vgi
 } // namespace duckdb

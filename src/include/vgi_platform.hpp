@@ -24,6 +24,20 @@
 #include <sys/types.h> // real pid_t
 #endif
 
+// VGI_SUBPROCESS_TRANSPORT == 1 where a child-process worker transport exists:
+// POSIX (fork/exec/pipe/select) and Windows (CreateProcess/CreatePipe +
+// _open_osfhandle, PeekNamedPipe-poll). Emscripten has neither, so it stays
+// HTTP-only. Code shared by the POSIX and Windows subprocess paths (the fd I/O
+// layer, the RPC fd functions, FunctionConnection, the worker pool) guards on
+// this; truly POSIX-only facilities (AF_UNIX, flock launcher, shm) keep guarding
+// on VGI_POSIX_TRANSPORT. Within a VGI_SUBPROCESS_TRANSPORT block, platform
+// syscalls split `#if VGI_POSIX_TRANSPORT … #else (Windows) … #endif`.
+#if VGI_POSIX_TRANSPORT || defined(_WIN32)
+#define VGI_SUBPROCESS_TRANSPORT 1
+#else
+#define VGI_SUBPROCESS_TRANSPORT 0
+#endif
+
 #if defined(_WIN32)
 // MSVC has no pid_t. Several widely-included headers use pid_t in *declarations*
 // that must compile on Windows even though no subprocess is ever spawned there.
