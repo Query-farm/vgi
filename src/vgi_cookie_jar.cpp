@@ -5,6 +5,9 @@
 #include <cctype>
 #include <cstdlib>
 #include <ctime>
+#include <iomanip> // std::get_time
+#include <locale>  // std::locale::classic
+#include <sstream> // std::istringstream
 
 namespace duckdb {
 namespace vgi {
@@ -38,14 +41,22 @@ std::string LowerAscii(const std::string &s) {
 // the process restarts.
 std::optional<std::chrono::system_clock::time_point> ParseHttpDate(const std::string &s) {
 	std::tm tm {};
-	// strptime is POSIX; available on darwin and linux targets we support.
-	const char *res = strptime(s.c_str(), "%a, %d %b %Y %H:%M:%S GMT", &tm);
-	if (!res) {
+	// std::get_time is the portable replacement for POSIX strptime (MSVC has no
+	// strptime). Classic locale so %a/%b parse the English RFC 1123 names
+	// regardless of the process locale.
+	std::istringstream ss(s);
+	ss.imbue(std::locale::classic());
+	ss >> std::get_time(&tm, "%a, %d %b %Y %H:%M:%S GMT");
+	if (ss.fail()) {
 		return std::nullopt;
 	}
-	// strptime populates tm but leaves tm_gmtoff unset; timegm treats the
-	// struct as UTC which is what we want for GMT-stamped dates.
+	// tm is UTC (GMT-stamped). timegm interprets it as UTC; MSVC's equivalent is
+	// _mkgmtime (mktime would wrongly apply the local-time offset).
+#if defined(_WIN32)
+	time_t epoch = _mkgmtime(&tm);
+#else
 	time_t epoch = timegm(&tm);
+#endif
 	if (epoch == -1) {
 		return std::nullopt;
 	}
