@@ -6,7 +6,7 @@
 #include <unordered_map>
 #include <vector>
 
-#include <sys/types.h>
+#include "vgi_platform.hpp" // pid_t (real on POSIX, shim on Windows)
 
 #include "duckdb/common/exception.hpp"
 

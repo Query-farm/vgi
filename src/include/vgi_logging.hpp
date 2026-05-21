@@ -3,7 +3,8 @@
 
 #include <memory>
 #include <string>
-#include <sys/types.h>
+
+#include "vgi_platform.hpp" // pid_t (real on POSIX, shim on Windows)
 
 #include <arrow/api.h>
 

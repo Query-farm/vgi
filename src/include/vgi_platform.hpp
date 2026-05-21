@@ -39,13 +39,10 @@
 #endif
 
 #if defined(_WIN32)
-// MSVC has no pid_t. Several widely-included headers use pid_t in *declarations*
+// MSVC has no pid_t. Several widely-included headers use pid_t in declarations
 // that must compile on Windows even though no subprocess is ever spawned there.
-// All such uses are inside namespace duckdb::vgi (verified: no ::pid_t at global
-// scope), so a namespaced alias suffices.
-namespace duckdb {
-namespace vgi {
+// POSIX provides ::pid_t at global scope (via <sys/types.h>), and the codebase
+// uses unqualified `pid_t` from multiple namespaces (duckdb and duckdb::vgi), so
+// the shim must also be a global-scope alias rather than namespace-scoped.
 using pid_t = int;
-} // namespace vgi
-} // namespace duckdb
 #endif
