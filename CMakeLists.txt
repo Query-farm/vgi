@@ -76,6 +76,7 @@ src/vgi_launcher.cpp
 src/vgi_launcher_cache.cpp
 src/vgi_unix_socket.cpp
 src/vgi_unix_socket_worker.cpp
+src/vgi_named_pipe.cpp
 src/vgi_logging.cpp
 src/vgi_subprocess.cpp
 src/vgi_arrow_ipc.cpp

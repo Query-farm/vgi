@@ -16,6 +16,9 @@
 #include "vgi_launcher_cache.hpp"
 #include "vgi_unix_socket.hpp"
 #include "vgi_unix_socket_worker.hpp"
+#elif defined(_WIN32)
+// Windows: unix:// rendezvous uses a Windows named pipe instead of AF_UNIX.
+#include "vgi_named_pipe.hpp"
 #endif
 #include "vgi_worker_pool.hpp"
 
@@ -133,12 +136,7 @@ UnaryResponseResult InvokePooledUnaryRpc(const UnaryRpcOptions &opts, const std:
 	}
 
 	if (IsLaunchLocation(opts.worker_path) || IsUnixLocation(opts.worker_path)) {
-#if !VGI_POSIX_TRANSPORT
-		throw InvalidInputException(
-		    "vgi: launch:/unix:// LOCATION schemes require fork()/AF_UNIX and are "
-		    "not available in this build (worker_path=%s); use http://… instead",
-		    opts.worker_path);
-#else
+#if VGI_POSIX_TRANSPORT
 		// AF_UNIX path: resolve socket via the launcher cache (which fires
 		// the launcher on first call per process), open a fresh AF_UNIX
 		// connection, drive the same WriteRpcRequest / ReadUnaryResponse
@@ -166,6 +164,28 @@ UnaryResponseResult InvokePooledUnaryRpc(const UnaryRpcOptions &opts, const std:
 		}
 		auto *log_ctx = opts.enable_logging ? &opts.context : nullptr;
 		return ReadUnaryResponse(worker.GetStdoutFd(), log_ctx, opts.worker_path, /*pid=*/-1);
+#elif defined(_WIN32)
+		// Windows: unix:// connects to a Windows named pipe served out-of-band.
+		// launch: (auto-spawn) is a later phase.
+		if (IsUnixLocation(opts.worker_path)) {
+			NamedPipeWorker worker(NamedPipeConnect(StripUnixScheme(opts.worker_path), std::chrono::seconds(10)));
+			if (params) {
+				WriteRpcRequest(worker.GetStdinFd(), method_name, params);
+			} else {
+				WriteEmptyRpcRequest(worker.GetStdinFd(), method_name);
+			}
+			auto *log_ctx = opts.enable_logging ? &opts.context : nullptr;
+			return ReadUnaryResponse(worker.GetStdoutFd(), log_ctx, opts.worker_path, /*pid=*/-1);
+		}
+		throw InvalidInputException(
+		    "vgi: launch: LOCATIONs are not yet supported on Windows (named-pipe launcher pending); use "
+		    "unix://\\\\.\\pipe\\... against an out-of-band worker (worker_path=%s)",
+		    opts.worker_path);
+#else
+		throw InvalidInputException(
+		    "vgi: launch:/unix:// LOCATION schemes are not available in this build "
+		    "(worker_path=%s); use http://… instead",
+		    opts.worker_path);
 #endif
 	}
 

@@ -27,6 +27,9 @@
 #include "vgi_launcher_cache.hpp"
 #include "vgi_unix_socket.hpp"
 #include "vgi_unix_socket_worker.hpp"
+#elif defined(_WIN32)
+// Windows: unix:// rendezvous uses a Windows named pipe instead of AF_UNIX.
+#include "vgi_named_pipe.hpp"
 #endif
 
 namespace duckdb {
@@ -1268,12 +1271,7 @@ std::unique_ptr<IFunctionConnection> CreateFunctionConnection(
 		    attach_params);
 	}
 	if (IsLaunchLocation(worker_path) || IsUnixLocation(worker_path)) {
-#if !VGI_POSIX_TRANSPORT
-		throw InvalidInputException(
-		    "vgi: launch:/unix:// LOCATION schemes require fork()/AF_UNIX and are "
-		    "not available in this build (worker_path=%s); use http://… instead",
-		    worker_path);
-#else
+#if VGI_POSIX_TRANSPORT
 		// AF_UNIX path: resolve the socket via the launcher cache (which
 		// invokes vgi::Launch() on first call per process), open a fresh
 		// AF_UNIX connection, wrap it in a UnixSocketWorker so the
@@ -1303,6 +1301,28 @@ std::unique_ptr<IFunctionConnection> CreateFunctionConnection(
 		return std::make_unique<FunctionConnection>(
 		    std::move(worker), worker_path, function_name, arguments, attach_opaque_data, transaction_opaque_data,
 		    context, function_type, global_execution_id, worker_debug, settings, required_secrets);
+#elif defined(_WIN32)
+		// Windows: unix:// connects to a Windows named pipe (\\.\pipe\...) served
+		// by an out-of-band worker (serve_named_pipe). The named-pipe launcher
+		// for launch: (auto-spawn + named-mutex election) is a later phase.
+		if (IsUnixLocation(worker_path)) {
+			int fd = NamedPipeConnect(StripUnixScheme(worker_path), std::chrono::seconds(10));
+			auto worker = std::make_unique<NamedPipeWorker>(fd);
+			return std::make_unique<FunctionConnection>(
+			    std::move(worker), worker_path, function_name, arguments, attach_opaque_data,
+			    transaction_opaque_data, context, function_type, global_execution_id, worker_debug, settings,
+			    required_secrets);
+		}
+		throw InvalidInputException(
+		    "vgi: launch: LOCATIONs are not yet supported on Windows (named-pipe launcher pending); use "
+		    "unix://\\\\.\\pipe\\... against an out-of-band worker, http://…, or a bare-command subprocess "
+		    "(worker_path=%s)",
+		    worker_path);
+#else
+		throw InvalidInputException(
+		    "vgi: launch:/unix:// LOCATION schemes are not available in this build "
+		    "(worker_path=%s); use http://… instead",
+		    worker_path);
 #endif
 	}
 	// Bare-command path → subprocess transport. Available on POSIX (fork/exec)
