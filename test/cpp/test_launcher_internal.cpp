@@ -185,22 +185,22 @@ TEST_CASE("ResolveStateDir strips trailing slashes from TMPDIR", "[launcher][sta
 }
 
 // ---------------------------------------------------------------------------
-// ValidateUnixPathLength
+// ValidateRendezvousPathLength
 // ---------------------------------------------------------------------------
 
-TEST_CASE("ValidateUnixPathLength accepts paths under the cap", "[launcher][path]") {
-	CHECK_NOTHROW(ValidateUnixPathLength(""));
-	CHECK_NOTHROW(ValidateUnixPathLength("/tmp/short.sock"));
-	CHECK_NOTHROW(ValidateUnixPathLength(std::string(50, 'a')));
+TEST_CASE("ValidateRendezvousPathLength accepts paths under the cap", "[launcher][path]") {
+	CHECK_NOTHROW(ValidateRendezvousPathLength(""));
+	CHECK_NOTHROW(ValidateRendezvousPathLength("/tmp/short.sock"));
+	CHECK_NOTHROW(ValidateRendezvousPathLength(std::string(50, 'a')));
 }
 
-TEST_CASE("ValidateUnixPathLength rejects paths beyond the cap", "[launcher][path]") {
+TEST_CASE("ValidateRendezvousPathLength rejects paths beyond the cap", "[launcher][path]") {
 	std::string max_path(MaxUnixPathLen() - 1, 'a');
-	CHECK_NOTHROW(ValidateUnixPathLength(max_path));
+	CHECK_NOTHROW(ValidateRendezvousPathLength(max_path));
 	std::string too_long(MaxUnixPathLen(), 'a');
-	CHECK_THROWS_AS(ValidateUnixPathLength(too_long), std::invalid_argument);
+	CHECK_THROWS_AS(ValidateRendezvousPathLength(too_long), std::invalid_argument);
 	std::string way_too_long(200, 'a');
-	CHECK_THROWS_AS(ValidateUnixPathLength(way_too_long), std::invalid_argument);
+	CHECK_THROWS_AS(ValidateRendezvousPathLength(way_too_long), std::invalid_argument);
 }
 
 // ---------------------------------------------------------------------------

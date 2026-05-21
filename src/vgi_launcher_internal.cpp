@@ -145,6 +145,17 @@ FilterVgiRpcEnv(const std::vector<std::pair<std::string, std::string>> &env) {
 // ---------------------------------------------------------------------------
 
 std::string ResolveStateDir(const std::string &xdg_runtime_dir, const std::string &tmpdir, uint32_t euid) {
+#if defined(_WIN32)
+	// Windows has no XDG_RUNTIME_DIR or euid. Mirror vgi_rpc/launcher.py's
+	// `tempfile.gettempdir() / "vgi-rpc"` (no euid suffix).
+	(void)xdg_runtime_dir;
+	(void)euid;
+	std::string base = tmpdir.empty() ? "." : tmpdir;
+	while (base.size() > 1 && (base.back() == '\\' || base.back() == '/')) {
+		base.pop_back();
+	}
+	return base + "\\vgi-rpc";
+#else
 	if (!xdg_runtime_dir.empty()) {
 		return xdg_runtime_dir + "/vgi-rpc";
 	}
@@ -154,19 +165,31 @@ std::string ResolveStateDir(const std::string &xdg_runtime_dir, const std::strin
 		base.pop_back();
 	}
 	return base + "/vgi-rpc-" + std::to_string(euid);
+#endif
 }
 
 // ---------------------------------------------------------------------------
-// AF_UNIX path-length validation
+// Rendezvous path-length validation
 // ---------------------------------------------------------------------------
 
-void ValidateUnixPathLength(const std::string &path) {
+void ValidateRendezvousPathLength(const std::string &path) {
+#if defined(_WIN32)
+	// Windows named-pipe names (`\\.\pipe\<name>`) cap the <name> at 256 chars;
+	// be conservative and bound the whole address well under that.
+	constexpr std::size_t kMaxPipeName = 256;
+	if (path.size() > kMaxPipeName) {
+		throw std::invalid_argument("vgi launcher: named-pipe name too long (" +
+		                            std::to_string(path.size()) + " bytes, max " +
+		                            std::to_string(kMaxPipeName) + "): " + path);
+	}
+#else
 	// `+1` for the trailing NUL the kernel requires.
 	if (path.size() + 1 > MaxUnixPathLen()) {
 		throw std::invalid_argument("vgi launcher: AF_UNIX socket path too long (" +
 		                            std::to_string(path.size()) + " bytes, max " +
 		                            std::to_string(MaxUnixPathLen() - 1) + "): " + path);
 	}
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -265,8 +288,8 @@ std::vector<std::string> ParseLaunchArgv(const std::string &payload) {
 // Discovery-line parsing
 // ---------------------------------------------------------------------------
 
-DiscoveryParseResult ParseDiscoveryLine(std::string &buffer, const std::string &expected_path) {
-	const std::string prefix = "UNIX:";
+DiscoveryParseResult ParseDiscoveryLine(std::string &buffer, const std::string &expected_path,
+                                         const std::string &prefix) {
 	while (true) {
 		size_t newline = buffer.find('\n');
 		if (newline == std::string::npos) {

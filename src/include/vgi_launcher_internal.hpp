@@ -73,10 +73,14 @@ std::map<std::string, std::string> FilterVgiRpcEnv(const std::vector<std::pair<s
 // `xdg_runtime_dir`, `tmpdir`, and `euid` are passed in explicitly so the
 // function is testable without monkeypatching the process environment.
 // Returns the resolved path with no trailing slash.
+//
+// Windows: there is no XDG / euid, so the result is `<tmpdir>\vgi-rpc`
+// (mirrors vgi_rpc/launcher.py's `tempfile.gettempdir()/vgi-rpc`); the
+// `xdg_runtime_dir` and `euid` arguments are ignored.
 std::string ResolveStateDir(const std::string &xdg_runtime_dir, const std::string &tmpdir, uint32_t euid);
 
 // ---------------------------------------------------------------------------
-// AF_UNIX path-length validation
+// Rendezvous path-length validation
 // ---------------------------------------------------------------------------
 
 // AF_UNIX path length cap.  104 on macOS, 108 on Linux/FreeBSD.  Returns
@@ -89,12 +93,14 @@ constexpr std::size_t MaxUnixPathLen() {
 #endif
 }
 
-// Throws std::invalid_argument if `path` exceeds MaxUnixPathLen() bytes
-// (counting the trailing NUL).  Otherwise returns silently.  The launcher
-// orchestration layer translates std::invalid_argument into DuckDB's
-// InvalidInputException at the boundary; helpers here stay DuckDB-free so
-// the unit-test binary doesn't need to link libduckdb_static.
-void ValidateUnixPathLength(const std::string &path);
+// Throws std::invalid_argument if `path` is too long for the platform's
+// rendezvous address: the AF_UNIX `sun_path` cap (MaxUnixPathLen, counting the
+// trailing NUL) on POSIX, or the Windows named-pipe name cap on Windows.
+// Otherwise returns silently. The launcher orchestration layer translates
+// std::invalid_argument into DuckDB's InvalidInputException at the boundary;
+// helpers here stay DuckDB-free so the unit-test binary doesn't need to link
+// libduckdb_static. (Formerly ValidateUnixPathLength.)
+void ValidateRendezvousPathLength(const std::string &path);
 
 // ---------------------------------------------------------------------------
 // `launch:` location string parsing (POSIX shell-quote semantics)
@@ -113,11 +119,23 @@ std::vector<std::string> ParseLaunchArgv(const std::string &payload);
 // Discovery-line parsing
 // ---------------------------------------------------------------------------
 
+// The discovery-line scheme prefix the worker prints on stdout to advertise
+// its rendezvous address: "UNIX:" on POSIX (AF_UNIX socket path), "PIPE:" on
+// Windows (named-pipe name). This is a protocol constant — the C++ launcher and
+// the Python reference launcher/worker (vgi-rpc) must agree on it per platform.
+inline const char *DiscoveryLinePrefix() {
+#if defined(_WIN32)
+	return "PIPE:";
+#else
+	return "UNIX:";
+#endif
+}
+
 // Result of feeding a chunk of bytes to ParseDiscoveryLine.
 enum class DiscoveryParseResult {
 	kNeedMore,   // No complete line yet; keep reading.
-	kFound,      // The expected UNIX:<path> line has been consumed.
-	kMismatch,   // A UNIX: line was seen but its path doesn't match expected.
+	kFound,      // The expected <prefix><path> line has been consumed.
+	kMismatch,   // A <prefix> line was seen but its path doesn't match expected.
 };
 
 // Stateful line-by-line scanner that skips noise lines until it sees a
@@ -131,7 +149,10 @@ enum class DiscoveryParseResult {
 // differs from expected (callers should treat this as a fatal worker bug).
 // Returns kNeedMore otherwise (no terminator yet, or only non-UNIX prefix
 // lines have been consumed).
-DiscoveryParseResult ParseDiscoveryLine(std::string &buffer, const std::string &expected_path);
+// `prefix` is the scheme marker to match (default "UNIX:"; pass
+// DiscoveryLinePrefix() for the platform-appropriate one — "PIPE:" on Windows).
+DiscoveryParseResult ParseDiscoveryLine(std::string &buffer, const std::string &expected_path,
+                                         const std::string &prefix = "UNIX:");
 
 // ---------------------------------------------------------------------------
 // Transport detection (location-string scheme dispatching)

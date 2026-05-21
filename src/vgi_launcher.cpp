@@ -497,7 +497,7 @@ std::string Launch(const LaunchConfig &cfg) {
 	// Translate any std::invalid_argument out of pure helpers into the
 	// appropriate DuckDB exception at this single boundary.
 	try {
-		launcher::ValidateUnixPathLength(sock_path);
+		launcher::ValidateRendezvousPathLength(sock_path);
 	} catch (const std::invalid_argument &e) {
 		throw InvalidInputException(e.what());
 	}

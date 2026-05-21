@@ -98,7 +98,7 @@ UnixSocket UnixSocket::Connect(const std::string &path, std::chrono::millisecond
 	// std::invalid_argument from ValidateUnixPathLength into the DuckDB
 	// exception users expect at the boundary.
 	try {
-		launcher::ValidateUnixPathLength(path);
+		launcher::ValidateRendezvousPathLength(path);
 	} catch (const std::invalid_argument &e) {
 		throw InvalidInputException(e.what());
 	}

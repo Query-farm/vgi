@@ -131,22 +131,43 @@ on every platform agrees byte-for-byte.  Values:
 
 The worker MUST:
 
-1. bind an AF_UNIX SOCK_STREAM socket at `<abs_socket_path>`,
-2. emit exactly one line `UNIX:<abs_socket_path>\n` on **stdout** (not
-   stderr), flushed,
+1. bind its rendezvous endpoint — an AF_UNIX SOCK_STREAM socket at
+   `<abs_socket_path>` on POSIX, or a Windows **named pipe** at the
+   `\\.\pipe\…` name on Windows (see *Platform: Windows* below),
+2. emit exactly one discovery line on **stdout** (not stderr), flushed:
+   `UNIX:<abs_socket_path>\n` on POSIX, or `PIPE:<pipe_name>\n` on Windows.
+   The scheme prefix (`UNIX:` / `PIPE:`) is a protocol constant both the
+   launcher and the worker select by platform,
 3. emit nothing further on stdout for the rest of its lifetime
    (anything else triggers SIGPIPE on the launcher's now-closed read
    end, which kills the worker — this is intentional),
-4. listen for AF_UNIX connections, dispatching each to its own thread
+4. listen for connections, dispatching each to its own thread
    (or coroutine — the launcher requires no specific concurrency model),
 5. self-shutdown when zero clients have been connected for the requested
    idle period.
 
-The worker MAY emit log noise on stdout *before* the `UNIX:<path>` line
-— the launcher skips non-`UNIX:` prefix lines for resilience.  A hard
-cap of 1 MiB of pre-discovery noise applies; beyond that the launcher
-SIGTERMs the worker and reports an error.  Workers SHOULD direct logs to
-stderr instead.
+The worker MAY emit log noise on stdout *before* the discovery line
+— the launcher skips lines not matching the platform prefix for
+resilience.  A hard cap of 1 MiB of pre-discovery noise applies; beyond
+that the launcher SIGTERMs the worker and reports an error.  Workers
+SHOULD direct logs to stderr instead.
+
+### Platform: Windows
+
+CPython does not expose `socket.AF_UNIX` on Windows, so the Windows variant
+uses **named pipes** for the rendezvous instead of AF_UNIX sockets. The
+transport-agnostic machinery is unchanged: the hash, state-dir resolution,
+discovery line, and idle-timeout are identical; only three things differ:
+
+- **Rendezvous address**: a named pipe `\\.\pipe\vgi-rpc-<hash>` rather than
+  a filesystem socket path. The discovery line uses the `PIPE:` prefix.
+- **Singleton election**: a named mutex (`CreateMutex`, `Global\…`) replaces
+  the POSIX `flock` on the lockfile. (The Python reference launcher already
+  uses the cross-platform `filelock` library.)
+- **State dir**: `%TEMP%\vgi-rpc` (no `$XDG_RUNTIME_DIR`, no euid suffix).
+
+The named pipe MUST be created with `PIPE_UNLIMITED_INSTANCES` so multiple
+concurrent clients can connect, mirroring an AF_UNIX listen backlog.
 
 ## Idle-timeout encoding — single source of truth
 
