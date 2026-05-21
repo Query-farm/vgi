@@ -19,10 +19,11 @@
 #include "vgi_schema_registry.hpp"
 #include "vgi_shm_segment.hpp"
 #include "vgi_transport.hpp"
-#ifndef __EMSCRIPTEN__
-// Launcher / AF_UNIX transport — POSIX only.  Under emscripten the
-// dispatch path below short-circuits with InvalidInputException; the
-// supporting .cpp files are empty translation units.
+#if VGI_POSIX_TRANSPORT
+// Launcher / AF_UNIX transport — POSIX only (Windows brings launch:/unix:// via
+// named pipes in a later phase). On Windows/Emscripten the dispatch path below
+// short-circuits with InvalidInputException and these headers (whose classes are
+// VGI_POSIX_TRANSPORT-guarded) are not included.
 #include "vgi_launcher_cache.hpp"
 #include "vgi_unix_socket.hpp"
 #include "vgi_unix_socket_worker.hpp"
