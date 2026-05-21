@@ -181,6 +181,14 @@ AcquireForInitResult AcquireConnectionForInit(ClientContext &context, const Func
 // FunctionConnection - vgi_rpc Protocol Implementation
 // ============================================================================
 
+// The entire FunctionConnection implementation is the POSIX subprocess/AF_UNIX
+// transport (fork/exec or AF_UNIX socket, driven via fd-based RPC). On builds
+// without the POSIX transport the class is never instantiated — the factory
+// functions below throw before constructing it — so the member definitions are
+// simply excluded. HTTP uses HttpFunctionConnection, an independent
+// IFunctionConnection sibling. See vgi_platform.hpp.
+#if VGI_POSIX_TRANSPORT
+
 FunctionConnection::FunctionConnection(const std::string &worker_path, const std::string &function_name,
                                        const ArrowArguments &arguments, const std::vector<uint8_t> &attach_opaque_data,
                                        const std::vector<uint8_t> &transaction_opaque_data,
@@ -1229,6 +1237,8 @@ void FunctionConnection::DrainStderrLog() {
 	stderr_drainer_->DrainToLog(context_, worker_path_, proc_ ? proc_->GetPid() : -1);
 }
 
+#endif // VGI_POSIX_TRANSPORT
+
 // ============================================================================
 // Factory Functions
 // ============================================================================
@@ -1250,10 +1260,10 @@ std::unique_ptr<IFunctionConnection> CreateFunctionConnection(
 		    attach_params);
 	}
 	if (IsLaunchLocation(worker_path) || IsUnixLocation(worker_path)) {
-#ifdef __EMSCRIPTEN__
+#if !VGI_POSIX_TRANSPORT
 		throw InvalidInputException(
 		    "vgi: launch:/unix:// LOCATION schemes require fork()/AF_UNIX and are "
-		    "not supported in WASM builds (worker_path=%s); use http://… instead",
+		    "not available in this build (worker_path=%s); use http://… instead",
 		    worker_path);
 #else
 		// AF_UNIX path: resolve the socket via the launcher cache (which
@@ -1287,6 +1297,14 @@ std::unique_ptr<IFunctionConnection> CreateFunctionConnection(
 		    context, function_type, global_execution_id, worker_debug, settings, required_secrets);
 #endif
 	}
+	// Bare-command path → subprocess transport (POSIX only). On builds without
+	// it, fail fast with the same guidance as the launch:/unix:// branch.
+#if !VGI_POSIX_TRANSPORT
+	throw InvalidInputException(
+	    "vgi: subprocess (bare command) LOCATIONs require fork() and are "
+	    "not available in this build (worker_path=%s); use http://… instead",
+	    worker_path);
+#else
 	// Forward version-key fields so ReleaseForPooling routes this worker back
 	// to the same pool bucket on next release.
 	std::string data_version_spec;
@@ -1299,6 +1317,7 @@ std::unique_ptr<IFunctionConnection> CreateFunctionConnection(
 	    worker_path, function_name, arguments, attach_opaque_data, transaction_opaque_data, context,
 	    function_type, global_execution_id, worker_debug, settings, required_secrets,
 	    data_version_spec, implementation_version);
+#endif
 }
 
 std::unique_ptr<IFunctionConnection> CreateFunctionConnectionFromPool(
@@ -1310,10 +1329,15 @@ std::unique_ptr<IFunctionConnection> CreateFunctionConnectionFromPool(
     bool worker_debug,
     const std::map<std::string, Value> &settings,
     const std::vector<VgiSecretRequirement> &required_secrets) {
-	// Only subprocess connections use the pool
+	// Only subprocess connections use the pool — POSIX-transport only. The pool
+	// is always empty on builds without it, so this is never reached there.
+#if VGI_POSIX_TRANSPORT
 	return std::make_unique<FunctionConnection>(
 	    std::move(pooled_worker), function_name, arguments, attach_opaque_data, transaction_opaque_data, context,
 	    function_type, global_execution_id, worker_debug, settings, required_secrets);
+#else
+	throw InvalidInputException("vgi: subprocess transport unavailable in this build");
+#endif
 }
 
 } // namespace vgi

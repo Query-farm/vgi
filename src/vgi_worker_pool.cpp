@@ -79,8 +79,10 @@ void VgiWorkerPool::SetDefaultSettings(const PoolSettings &settings) {
 }
 
 VgiWorkerPool::VgiWorkerPool() {
-#ifndef __EMSCRIPTEN__
-	// Start the cleanup thread (not available in WASM single-threaded mode)
+#if VGI_POSIX_TRANSPORT
+	// Start the cleanup thread (no subprocess workers to clean up on builds
+	// without the POSIX transport — WASM is single-threaded, Windows is
+	// HTTP-only in Phase 1; the pool stays empty there).
 	cleanup_thread_ = std::thread(&VgiWorkerPool::CleanupThread, this);
 #endif
 }
@@ -90,7 +92,7 @@ VgiWorkerPool::~VgiWorkerPool() {
 	shutdown_.store(true);
 	cleanup_cv_.notify_all();
 
-#ifndef __EMSCRIPTEN__
+#if VGI_POSIX_TRANSPORT
 	// Wait for cleanup thread
 	if (cleanup_thread_.joinable()) {
 		cleanup_thread_.join();

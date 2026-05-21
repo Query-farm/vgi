@@ -8,9 +8,9 @@
 #include <chrono>
 #include <string>
 
-#ifdef _WIN32
-#error "VGI Unix-socket transport is currently POSIX-only."
-#endif
+#include "vgi_platform.hpp"
+
+#if VGI_POSIX_TRANSPORT
 
 namespace duckdb {
 namespace vgi {
@@ -62,3 +62,5 @@ private:
 
 } // namespace vgi
 } // namespace duckdb
+
+#endif // VGI_POSIX_TRANSPORT

@@ -4,9 +4,10 @@
 #include <atomic>
 #include <mutex>
 #include <string>
-#include <sys/types.h>
 #include <thread>
 #include <vector>
+
+#include "vgi_platform.hpp" // pid_t (real on POSIX, shim on Windows)
 
 namespace duckdb {
 

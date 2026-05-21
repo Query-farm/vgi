@@ -5,9 +5,8 @@
 #include <cstdint>
 #include <string>
 
-#ifdef _WIN32
-#error "VGI subprocess support is currently Unix-only. Windows support is not yet implemented."
-#else
+#include "vgi_platform.hpp"
+#if VGI_POSIX_TRANSPORT
 #include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>

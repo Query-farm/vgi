@@ -6,7 +6,9 @@
 // same macro and surface a clear error if launch:/unix:// LOCATIONs are
 // used in a WASM build.
 
-#ifndef __EMSCRIPTEN__
+#include "vgi_platform.hpp"
+
+#if VGI_POSIX_TRANSPORT
 
 #include "vgi_launcher_cache.hpp"
 
@@ -168,4 +170,4 @@ UnixSocket ResolveAndConnect(const std::string &location,
 } // namespace vgi
 } // namespace duckdb
 
-#endif // !__EMSCRIPTEN__
+#endif // VGI_POSIX_TRANSPORT

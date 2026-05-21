@@ -2,7 +2,9 @@
 //
 // POSIX-only — see vgi_launcher.cpp's banner for the WASM exclusion policy.
 
-#ifndef __EMSCRIPTEN__
+#include "vgi_platform.hpp"
+
+#if VGI_POSIX_TRANSPORT
 
 #include "vgi_unix_socket_worker.hpp"
 
@@ -80,4 +82,4 @@ bool UnixSocketWorker::IsLikelyAlive() const {
 } // namespace vgi
 } // namespace duckdb
 
-#endif // !__EMSCRIPTEN__
+#endif // VGI_POSIX_TRANSPORT

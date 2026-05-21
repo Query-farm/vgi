@@ -1,4 +1,12 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
+//
+// POSIX-only (shm_open/mmap). Under Windows/Emscripten this translation unit is
+// empty; the shared-memory side-channel is opt-in (VGI_RPC_SHM_SIZE_BYTES) and
+// simply never activates there. See vgi_platform.hpp.
+
+#include "vgi_platform.hpp"
+
+#if VGI_POSIX_TRANSPORT
 
 #include "vgi_shm_segment.hpp"
 
@@ -383,3 +391,5 @@ VgiShmSegment::MaybeResolveBatch(const std::shared_ptr<arrow::RecordBatch> &batc
 
 } // namespace vgi
 } // namespace duckdb
+
+#endif // VGI_POSIX_TRANSPORT

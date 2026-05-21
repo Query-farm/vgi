@@ -3,7 +3,9 @@
 // POSIX-only — under emscripten this translation unit is empty.  See
 // vgi_launcher.cpp's banner comment for the policy.
 
-#ifndef __EMSCRIPTEN__
+#include "vgi_platform.hpp"
+
+#if VGI_POSIX_TRANSPORT
 
 #include "vgi_unix_socket.hpp"
 
@@ -174,4 +176,4 @@ UnixSocket UnixSocket::Connect(const std::string &path, std::chrono::millisecond
 } // namespace vgi
 } // namespace duckdb
 
-#endif // !__EMSCRIPTEN__
+#endif // VGI_POSIX_TRANSPORT

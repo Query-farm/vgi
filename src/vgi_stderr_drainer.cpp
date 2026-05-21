@@ -2,14 +2,18 @@
 #include "vgi_stderr_drainer.hpp"
 
 #include <cerrno>
+
+#if VGI_POSIX_TRANSPORT
 #include <poll.h>
 #include <unistd.h>
+#endif
 
 #include "vgi_logging.hpp"
 
 namespace duckdb {
 namespace vgi {
 
+#if VGI_POSIX_TRANSPORT
 StderrDrainer::StderrDrainer(int fd) : fd_(fd) {
 	if (fd_ < 0) {
 		return;
@@ -37,6 +41,18 @@ int StderrDrainer::ReleaseFd() {
 	fd_ = -1;
 	return fd;
 }
+#else  // !VGI_POSIX_TRANSPORT
+// No subprocess stderr pipe exists on this build; the drainer is never
+// constructed with a real fd. Defined so the always-compiled worker pool /
+// FunctionConnection (which hold a unique_ptr<StderrDrainer>) link.
+StderrDrainer::StderrDrainer(int) : fd_(-1) {
+}
+StderrDrainer::~StderrDrainer() {
+}
+int StderrDrainer::ReleaseFd() {
+	return -1;
+}
+#endif // VGI_POSIX_TRANSPORT
 
 void StderrDrainer::DrainToLog(ClientContext &context, const std::string &worker_path, pid_t worker_pid) {
 	std::vector<std::string> lines;
@@ -59,6 +75,7 @@ void StderrDrainer::DrainToLog(ClientContext &context, const std::string &worker
 	}
 }
 
+#if VGI_POSIX_TRANSPORT
 void StderrDrainer::ThreadLoop() {
 	char buffer[4096];
 	std::string line_buffer;
@@ -120,6 +137,7 @@ void StderrDrainer::ThreadLoop() {
 
 	// Note: fd is NOT closed here — the destructor or ReleaseFd() decides.
 }
+#endif // VGI_POSIX_TRANSPORT
 
 } // namespace vgi
 } // namespace duckdb

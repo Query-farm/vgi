@@ -17,6 +17,8 @@
 
 #include "vgi_subprocess.hpp"
 
+#if VGI_POSIX_TRANSPORT
+
 namespace duckdb {
 namespace vgi {
 
@@ -102,3 +104,5 @@ private:
 
 } // namespace vgi
 } // namespace duckdb
+
+#endif // VGI_POSIX_TRANSPORT

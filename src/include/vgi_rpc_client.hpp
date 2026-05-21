@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "duckdb/main/client_context.hpp"
+#include "vgi_platform.hpp" // pid_t (real on POSIX, shim on Windows)
 
 namespace duckdb {
 namespace vgi {

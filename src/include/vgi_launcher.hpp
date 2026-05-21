@@ -17,9 +17,9 @@
 #include <string>
 #include <vector>
 
-#ifdef _WIN32
-#error "VGI Unix-socket launcher is currently POSIX-only."
-#endif
+#include "vgi_platform.hpp"
+
+#if VGI_POSIX_TRANSPORT
 
 namespace duckdb {
 namespace vgi {
@@ -70,3 +70,5 @@ std::string Launch(const LaunchConfig &cfg);
 
 } // namespace vgi
 } // namespace duckdb
+
+#endif // VGI_POSIX_TRANSPORT

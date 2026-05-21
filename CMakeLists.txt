@@ -117,7 +117,10 @@ install(
 # Run via:
 #     cmake --build build/<config> --target vgi_unit_tests
 #     ./build/<config>/extension/vgi/vgi_unit_tests
-if(BUILD_VGI_UNIT_TESTS OR DEFINED ENV{BUILD_VGI_UNIT_TESTS})
+# These are AF_UNIX / launcher / flock parity tests — inherently POSIX. They
+# exercise exactly the transports excluded on Windows (HTTP-only there), so the
+# whole target is gated off on Windows.
+if((BUILD_VGI_UNIT_TESTS OR DEFINED ENV{BUILD_VGI_UNIT_TESTS}) AND NOT WIN32)
   add_executable(vgi_unit_tests
     test/cpp/test_main.cpp
     test/cpp/test_launcher_internal.cpp

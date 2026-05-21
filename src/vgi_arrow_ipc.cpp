@@ -4,8 +4,11 @@
 #include <cerrno>
 #include <chrono>
 #include <cstring>
+
+#if VGI_POSIX_TRANSPORT
 #include <sys/select.h>
 #include <unistd.h>
+#endif
 
 #include "duckdb/common/exception.hpp"
 #include "vgi_exception.hpp"
@@ -86,6 +89,12 @@ std::shared_ptr<arrow::Buffer> SerializeRecordBatch(
 	}
 	return finish_result.ValueUnsafe();
 }
+
+// Fd-based stream I/O + ReadRecordBatch are the POSIX subprocess/AF_UNIX data
+// path (raw read/write/select on a pipe or socket fd). HTTP and catalog paths
+// use the buffer-based serialization helpers above, which stay compiled
+// everywhere. See vgi_platform.hpp.
+#if VGI_POSIX_TRANSPORT
 
 // FdInputStream implementation
 FdInputStream::FdInputStream(int fd) : fd_(fd), position_(0), is_open_(true) {
@@ -297,6 +306,8 @@ arrow::RecordBatchWithMetadata ReadRecordBatch(int fd, const std::string &worker
 
 	return batch_with_metadata;
 }
+
+#endif // VGI_POSIX_TRANSPORT
 
 // Extract string values from a result batch column.
 // Returns empty vector if batch is null (protocol error) or has no rows (empty result).

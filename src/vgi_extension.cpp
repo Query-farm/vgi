@@ -3,10 +3,14 @@
 
 #include "vgi_extension.hpp"
 
+#include "vgi_platform.hpp"
+
 #include <cerrno>
 #include <mutex>
 #include <set>
+#if VGI_POSIX_TRANSPORT
 #include <signal.h>
+#endif
 
 #include "duckdb.hpp"
 #include "duckdb/main/attached_database.hpp"
@@ -1265,8 +1269,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// threads — see duckdb-wasm/lib/CMakeLists.txt.
 	duckdb::vgi::VgiWasmAsyncPool::Instance().EnsureStarted(3);
 #endif
+#if VGI_POSIX_TRANSPORT
 	// Ignore SIGPIPE - we handle broken pipes via EPIPE error from write()
-	// This prevents the process from being killed when a worker dies unexpectedly
+	// This prevents the process from being killed when a worker dies unexpectedly.
+	// Windows has no SIGPIPE; the (future) Win32 subprocess backend maps
+	// ERROR_BROKEN_PIPE to the same EPIPE-equivalent status instead.
 	struct sigaction sa;
 	sa.sa_handler = SIG_IGN;
 	sigemptyset(&sa.sa_mask);
@@ -1274,6 +1281,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	if (sigaction(SIGPIPE, &sa, nullptr) == -1) {
 		VGI_STDERR_DEBUG("[VGI] extension.load sigpipe_ignore_failed errno=%d\n", errno);
 	}
+#endif // VGI_POSIX_TRANSPORT
 
 	// Register profiling atexit handler if VGI_PROFILE is enabled
 	vgi::VgiProfileRegisterAtExit();

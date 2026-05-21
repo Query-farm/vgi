@@ -4,7 +4,9 @@
 // translation unit collapses to nothing; LAUNCH/UNIX LOCATION schemes
 // surface a clear "not supported in WASM" error at the dispatch layer
 // (see vgi_function_connection.cpp, vgi_unary_rpc.cpp).
-#ifndef __EMSCRIPTEN__
+#include "vgi_platform.hpp"
+
+#if VGI_POSIX_TRANSPORT
 
 #include "vgi_launcher.hpp"
 
@@ -547,4 +549,4 @@ std::string Launch(const LaunchConfig &cfg) {
 } // namespace vgi
 } // namespace duckdb
 
-#endif // !__EMSCRIPTEN__
+#endif // VGI_POSIX_TRANSPORT

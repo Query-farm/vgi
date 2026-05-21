@@ -5,15 +5,20 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <thread>
+
+#if VGI_POSIX_TRANSPORT
 #include <fcntl.h>
 #include <sys/select.h>
-#include <thread>
+#endif
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/main/client_context.hpp"
 
 namespace duckdb {
 namespace vgi {
+
+#if VGI_POSIX_TRANSPORT
 
 // Pipe implementation
 Pipe::Pipe() {
@@ -338,6 +343,54 @@ void WaitForReadable(int fd, int timeout_seconds) {
 	}
 }
 
+#else // !VGI_POSIX_TRANSPORT
+
+// Windows / Emscripten stubs. The subprocess transport is unavailable on these
+// builds; the transport-dispatch layer (CreateFunctionConnection /
+// InvokePooledUnaryRpc) throws a clear InvalidInputException before any of these
+// is reached on a live path. They exist only so that the always-compiled
+// vgi_worker_pool.cpp (which holds unique_ptr<SubProcess>) and the
+// per-method-guarded FunctionConnection link cleanly.
+Pipe::Pipe() {
+	throw NotImplementedException("vgi: subprocess transport unavailable in this build");
+}
+Pipe::~Pipe() {
+}
+void Pipe::CloseRead() {
+}
+void Pipe::CloseWrite() {
+}
+SubProcess::SubProcess(const std::string &, bool) {
+	throw InvalidInputException("vgi: subprocess (bare command) LOCATIONs require fork() and are "
+	                            "not available in this build; use http://… instead");
+}
+SubProcess::~SubProcess() {
+}
+void SubProcess::CloseStdin() {
+}
+void SubProcess::CloseStderr() {
+}
+int SubProcess::Wait(bool *exited_normally) {
+	if (exited_normally) {
+		*exited_normally = true;
+	}
+	return 0;
+}
+bool SubProcess::TryWait(int *exit_status) {
+	if (exit_status) {
+		*exit_status = 0;
+	}
+	return true; // treat as exited; pool is always empty on this build
+}
+void WriteAll(int, const uint8_t *, size_t) {
+	throw NotImplementedException("vgi: subprocess transport unavailable in this build");
+}
+void WaitForReadable(int, int) {
+	throw NotImplementedException("vgi: subprocess transport unavailable in this build");
+}
+
+#endif // VGI_POSIX_TRANSPORT
+
 int GetCatalogTimeout(ClientContext *context) {
 	if (context) {
 		Value val;
@@ -348,6 +401,7 @@ int GetCatalogTimeout(ClientContext *context) {
 	return CATALOG_OPERATION_TIMEOUT_SECONDS;
 }
 
+#if VGI_POSIX_TRANSPORT
 void WaitForReadableUntilCancel(int fd, ClientContext *context) {
 	// No wall-clock deadline. Match the streaming data-phase model: block
 	// until the worker speaks. Cancellation comes via the context's
@@ -381,6 +435,11 @@ void WaitForReadableUntilCancel(int fd, ClientContext *context) {
 		return;
 	}
 }
+#else  // !VGI_POSIX_TRANSPORT
+void WaitForReadableUntilCancel(int, ClientContext *) {
+	throw NotImplementedException("vgi: subprocess transport unavailable in this build");
+}
+#endif // VGI_POSIX_TRANSPORT
 
 } // namespace vgi
 } // namespace duckdb

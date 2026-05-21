@@ -9,10 +9,10 @@
 #include "vgi_stderr_drainer.hpp"
 #include "vgi_subprocess.hpp"
 #include "vgi_transport.hpp"
-#ifndef __EMSCRIPTEN__
-// Launcher / AF_UNIX transport — POSIX only.  Under emscripten the
-// dispatch path short-circuits with InvalidInputException; these
-// supporting headers' .cpp counterparts are empty translation units.
+#if VGI_POSIX_TRANSPORT
+// Launcher / AF_UNIX transport — POSIX only.  On builds without it (WASM,
+// Windows Phase 1) the dispatch path short-circuits with InvalidInputException;
+// these supporting headers' .cpp counterparts are empty translation units.
 #include "vgi_launcher_cache.hpp"
 #include "vgi_unix_socket.hpp"
 #include "vgi_unix_socket_worker.hpp"
@@ -24,6 +24,7 @@ namespace vgi {
 
 namespace {
 
+#if VGI_POSIX_TRANSPORT
 // One attempt. Throws IOException on any transport error; caller decides whether
 // to retry. `force_fresh` bypasses the pool acquire entirely — used for the
 // retry path so a freshly-spawned worker does the work.
@@ -119,6 +120,7 @@ UnaryResponseResult AttemptUnaryRpc(const UnaryRpcOptions &opts, const std::stri
 
 	return response;
 }
+#endif // VGI_POSIX_TRANSPORT
 
 } // anonymous namespace
 
@@ -130,10 +132,10 @@ UnaryResponseResult InvokePooledUnaryRpc(const UnaryRpcOptions &opts, const std:
 	}
 
 	if (IsLaunchLocation(opts.worker_path) || IsUnixLocation(opts.worker_path)) {
-#ifdef __EMSCRIPTEN__
+#if !VGI_POSIX_TRANSPORT
 		throw InvalidInputException(
 		    "vgi: launch:/unix:// LOCATION schemes require fork()/AF_UNIX and are "
-		    "not supported in WASM builds (worker_path=%s); use http://… instead",
+		    "not available in this build (worker_path=%s); use http://… instead",
 		    opts.worker_path);
 #else
 		// AF_UNIX path: resolve socket via the launcher cache (which fires
@@ -166,6 +168,13 @@ UnaryResponseResult InvokePooledUnaryRpc(const UnaryRpcOptions &opts, const std:
 #endif
 	}
 
+	// Bare-command path → subprocess transport (POSIX only).
+#if !VGI_POSIX_TRANSPORT
+	throw InvalidInputException(
+	    "vgi: subprocess (bare command) LOCATIONs require fork() and are "
+	    "not available in this build (worker_path=%s); use http://… instead",
+	    opts.worker_path);
+#else
 	try {
 		return AttemptUnaryRpc(opts, method_name, params, /*force_fresh=*/false);
 	} catch (const IOException &) {
@@ -175,6 +184,7 @@ UnaryResponseResult InvokePooledUnaryRpc(const UnaryRpcOptions &opts, const std:
 		// Single retry with a fresh worker. If that also fails, propagate.
 		return AttemptUnaryRpc(opts, method_name, params, /*force_fresh=*/true);
 	}
+#endif
 }
 
 } // namespace vgi
