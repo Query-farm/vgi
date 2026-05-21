@@ -1,6 +1,7 @@
 {
         "dependencies": [
                 "openssl",
+                "curl",
                 {
                         "name": "arrow",
                         "default-features": false
