@@ -2,8 +2,8 @@ cmake_minimum_required(VERSION 3.5)
 
 # Set extension name here
 set(TARGET_NAME vgi)
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_STANDARD_REQUIRED 1)
+set(CMAKE_CXX_STANDARD 17 CACHE STRING "C++ standard to enforce" FORCE)
+set(CMAKE_CXX_STANDARD_REQUIRED True)
 
 
 # DuckDB's extension distribution supports vcpkg. As such, dependencies can be added in ./vcpkg.json and then
