@@ -53,11 +53,13 @@ endif()
 # C++20-conformant preprocessor. MinGW/Clang already conform, so MSVC-only.
 if(MSVC)
   add_compile_options(/Zc:preprocessor)
-  # Match the vcpkg deps (arrow/openssl/boost) built under x64-windows-static-md,
-  # which use the dynamic CRT (/MD). Without this our objects default to /MT and
-  # linking arrow.lib fails with LNK2038 RuntimeLibrary mismatch. Requires
-  # CMP0091=NEW (set above).
-  set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+  # Use the *static* CRT (/MT), matching duckdb (duckdb/CMakeLists.txt sets the
+  # same value) and the static vcpkg deps. The extension links both duckdb_static
+  # and arrow/openssl/boost into one loadable module, so all three must share a
+  # CRT; LNK2038 otherwise. This requires the vcpkg deps to be built with a
+  # static-CRT triplet — x64-windows-static (NOT x64-windows-static-md, whose -md
+  # forces the dynamic CRT). Requires CMP0091=NEW (set above).
+  set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 
 include_directories(src/include)
