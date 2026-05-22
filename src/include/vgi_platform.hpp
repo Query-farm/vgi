@@ -38,6 +38,22 @@
 #define VGI_SUBPROCESS_TRANSPORT 0
 #endif
 
+// VGI_ASYNC_INIT_ENABLED == 1 enables background-thread dispatch of the
+// PerformInit RPC in VgiTableFunctionInitGlobal (std::async on native,
+// VgiWasmAsyncPool on emscripten). When 0, init runs synchronously on the
+// main scheduling thread — slower for fan-outs of N independent pipelines
+// (loses concurrent-batch latency hiding), but avoids the WASM pthread
+// reliability issues (emsdk #19425/#19199/#13303) that hit MAIN_MODULE=1 +
+// pthreads builds when pthread_create runs after side modules dlopen.
+// Default off on emscripten, on elsewhere; overridable via -D at build time.
+#ifndef VGI_ASYNC_INIT_ENABLED
+#  if defined(__EMSCRIPTEN__)
+#    define VGI_ASYNC_INIT_ENABLED 0
+#  else
+#    define VGI_ASYNC_INIT_ENABLED 1
+#  endif
+#endif
+
 #if defined(_WIN32)
 #if defined(_MSC_VER)
 // MSVC's CRT has no pid_t. Several widely-included headers use pid_t in

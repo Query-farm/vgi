@@ -1309,13 +1309,16 @@ static void CatalogIdentityFunction(ClientContext &context, TableFunctionInput &
 }
 
 static void LoadInternal(ExtensionLoader &loader) {
-#ifdef __EMSCRIPTEN__
+#if defined(__EMSCRIPTEN__) && VGI_ASYNC_INIT_ENABLED
 	// Pre-spawn a bounded pool of background workers at extension load. Required
 	// under MAIN_MODULE=1 + pthreads: pthread_create after side-modules are
 	// dlopen'd is unreliable (emsdk #19425/#19199/#13303), so we spawn once at
 	// load time and keep the workers parked in cv_.wait() until tasks arrive.
 	// Pool size must fit within PTHREAD_POOL_SIZE alongside DuckDB's worker
 	// threads — see duckdb-wasm/lib/CMakeLists.txt.
+	//
+	// Only spawned when VGI_ASYNC_INIT_ENABLED == 1 (off by default on WASM).
+	// With async init disabled, the pool would sit idle forever — skip it.
 	duckdb::vgi::VgiWasmAsyncPool::Instance().EnsureStarted(3);
 #endif
 #if VGI_POSIX_TRANSPORT

@@ -1,5 +1,6 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "vgi_table_function_impl.hpp"
+#include "vgi_platform.hpp" // VGI_ASYNC_INIT_ENABLED
 #ifdef __EMSCRIPTEN__
 #include <pthread.h>
 #include <unistd.h>
@@ -1241,7 +1242,8 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 	// result + connection back into gstate). Multiple pipelines hit this
 	// path back-to-back during scheduling and run their RPCs concurrently
 	// instead of serializing on the main thread.
-#ifdef __EMSCRIPTEN__
+#if VGI_ASYNC_INIT_ENABLED
+#  ifdef __EMSCRIPTEN__
 	// Dispatch onto the pre-spawned VgiWasmAsyncPool. pthread_create after
 	// side modules are dlopen'd is unreliable in MAIN_MODULE=1 builds, so
 	// std::async(launch::async) would crash; the pool's workers were
@@ -1252,13 +1254,31 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 	     from_pool = acquired.from_pool]() mutable {
 		    return run(std::move(conn), from_pool);
 	    });
-#else
+#  else
 	global_state->pending_init = std::async(std::launch::async,
 	                                          [run = std::move(perform_init_with_retry),
 	                                           conn = std::move(connection),
 	                                           from_pool = acquired.from_pool]() mutable {
 		                                          return run(std::move(conn), from_pool);
 	                                          });
+#  endif
+#else
+	// Synchronous init: run the RPC inline and fold the result straight into
+	// the gstate, mirroring EnsureInitApplied()'s fold step. pending_init
+	// stays default-constructed (invalid future), so subsequent
+	// EnsureInitApplied() calls hit the `if (pending_init.valid())` branch
+	// and no-op. Selected on WASM by default to dodge the emsdk
+	// pthread-after-dlopen bug (#19425/#19199/#13303); flipping
+	// -DVGI_ASYNC_INIT_ENABLED=1 restores the async path.
+	auto applied = perform_init_with_retry(std::move(connection), acquired.from_pool);
+	global_state->global_execution_id = std::move(applied.first.execution_id);
+	global_state->max_processes = static_cast<idx_t>(applied.first.max_workers);
+	global_state->init_opaque_data = std::move(applied.first.opaque_data);
+	{
+		std::lock_guard<std::mutex> conn_lk(global_state->connection_mutex);
+		global_state->primary_connection = std::move(applied.second);
+	}
+	global_state->init_applied.store(true, std::memory_order_release);
 #endif
 
 	{
