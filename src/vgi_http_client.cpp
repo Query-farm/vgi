@@ -310,13 +310,27 @@ static std::string HttpPostArrowIpcInternal(ClientContext &context,
 		    body_preview.empty() ? out_response->GetError() : body_preview, url);
 	}
 
+	// In the browser (WASM), fetch/XHR transparently decompresses any STANDARD
+	// Content-Encoding (gzip/br/zstd) before the bytes reach us, leaving the body
+	// decoded while Content-Length still reports the *compressed* size. The custom
+	// X-VGI-Content-Encoding header is NOT folded by the browser, so it still
+	// routes through our own decompressor. So when the server stamped a standard
+	// Content-Encoding (and not X-VGI-Content-Encoding), treat the body as already
+	// decoded: skip the size check and skip our own decompress below.
+	bool browser_decoded = false;
+#if defined(__EMSCRIPTEN__)
+	browser_decoded = !out_response->HasHeader("X-VGI-Content-Encoding") &&
+	                  out_response->HasHeader("Content-Encoding");
+#endif
+
 	// Defensive: if the server sent a Content-Length header, ensure the
 	// buffered body matches. Truncated responses (mid-stream proxy timeout,
 	// dropped connection on a chunked transfer that the underlying client
 	// silently swallows) would otherwise be parsed as a valid empty result
 	// — silent wrong-result. Arrow IPC tolerates a truncated body by
-	// returning Invalid which we'd previously treat as EOS.
-	if (out_response->HasHeader("Content-Length")) {
+	// returning Invalid which we'd previously treat as EOS. Skipped when the
+	// browser transparently decompressed (body no longer matches Content-Length).
+	if (!browser_decoded && out_response->HasHeader("Content-Length")) {
 		const auto content_length_str = out_response->GetHeaderValue("Content-Length");
 		try {
 			auto declared = std::stoull(content_length_str);
@@ -334,8 +348,10 @@ static std::string HttpPostArrowIpcInternal(ClientContext &context,
 		}
 	}
 
-	// Decompress the response if the server stamped a codec we know.
-	auto resp_enc = ResolveResponseEncoding(*out_response);
+	// Decompress the response if the server stamped a codec we know. On WASM the
+	// browser already decoded a standard Content-Encoding (browser_decoded), so
+	// there's nothing left for us to decompress in that case.
+	auto resp_enc = browser_decoded ? HttpEncoding::NONE : ResolveResponseEncoding(*out_response);
 	// Capture the on-the-wire size before app-level decompression so the log
 	// below reflects what was actually read off the socket. VGI uses the custom
 	// X-VGI-Content-Encoding header (which generic proxies/clients don't fold),
