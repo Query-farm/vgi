@@ -319,8 +319,15 @@ static std::string HttpPostArrowIpcInternal(ClientContext &context,
 	// decoded: skip the size check and skip our own decompress below.
 	bool browser_decoded = false;
 #if defined(__EMSCRIPTEN__)
-	browser_decoded = !out_response->HasHeader("X-VGI-Content-Encoding") &&
-	                  out_response->HasHeader("Content-Encoding");
+	// The browser's HTTP stack transparently decompresses any standard
+	// Content-Encoding (gzip/br/zstd) and MAY strip the Content-Encoding header
+	// while leaving a stale, compressed Content-Length. The only encoding we
+	// decompress ourselves in the browser is the custom X-VGI-Content-Encoding,
+	// which the browser never folds. So when X-VGI-Content-Encoding is absent the
+	// body is already final (browser-decoded or uncompressed): skip the
+	// Content-Length check and our own decompress. We deliberately do NOT gate on
+	// HasHeader("Content-Encoding") — that header is unreliable post-decompression.
+	browser_decoded = !out_response->HasHeader("X-VGI-Content-Encoding");
 #endif
 
 	// Defensive: if the server sent a Content-Length header, ensure the
