@@ -729,9 +729,18 @@ CatalogAttachResult InvokeCatalogAttach(const std::string &worker_path, const st
 // List catalogs exposed by a worker. Returns per-catalog discovery records
 // carrying implementation_version and data_version_spec metadata alongside the
 // catalog name.
+//
+// The two launcher_* trailing parameters mirror InvokeCatalogAttach: when an
+// ATTACH carries `launcher_idle_timeout` / `launcher_state_dir`, those values
+// must flow into the discovery RPC so the launcher cache is primed with the
+// user's overrides — otherwise this RPC pins the cache with [defaults] and
+// the subsequent real ATTACH (which does carry the overrides) trips the
+// cache-conflict BinderException.
 std::vector<VgiCatalogInfo> InvokeCatalogs(const std::string &worker_path, ClientContext &context,
                                            bool worker_debug = false, bool use_pool = true,
-                                           const std::shared_ptr<CatalogAuth> &auth = nullptr);
+                                           const std::shared_ptr<CatalogAuth> &auth = nullptr,
+                                           std::optional<int64_t> launcher_idle_timeout_seconds = std::nullopt,
+                                           std::optional<std::string> launcher_state_dir = std::nullopt);
 
 // Invoke catalog_schemas: list schemas in an attached catalog
 std::vector<VgiSchemaInfo> InvokeCatalogSchemas(const CatalogRpcContext &ctx, ClientContext &context);

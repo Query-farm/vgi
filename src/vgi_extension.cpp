@@ -770,11 +770,25 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 		cookie_jar = std::make_shared<vgi::SessionCookieJar>();
 	}
 
+	// Lifted from the InvokeCatalogAttach call below — these optionals must
+	// also flow into InvokeCatalogs so the discovery RPC primes the launcher
+	// cache with the user's overrides, not [defaults]. See InvokeCatalogs's
+	// docstring and InvokeCatalogAttach's analogous fix.
+	std::optional<int64_t> launcher_idle_for_attach;
+	std::optional<std::string> launcher_state_dir_for_attach;
+	if (launcher_idle_timeout_seconds >= 0) {
+		launcher_idle_for_attach = launcher_idle_timeout_seconds;
+	}
+	if (!launcher_state_dir.empty()) {
+		launcher_state_dir_for_attach = launcher_state_dir;
+	}
+
 	// If the user passed attach-time options, validate them against the
 	// catalog's declared AttachOptionSpec list. Skip the extra RPC when
 	// attach_options is empty — catalogs without options pay no overhead.
 	if (!attach_options.empty()) {
-		auto catalogs = vgi::InvokeCatalogs(worker_path, context, worker_debug, use_pool, auth);
+		auto catalogs = vgi::InvokeCatalogs(worker_path, context, worker_debug, use_pool, auth,
+		                                    launcher_idle_for_attach, launcher_state_dir_for_attach);
 		const vgi::VgiCatalogInfo *matching_info = nullptr;
 		for (const auto &info_entry : catalogs) {
 			if (info_entry.name == catalog_name) {
@@ -824,15 +838,9 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 
 	// Call catalog_attach via RPC. The worker validates data_version_spec and
 	// implementation_version and throws with a human-readable message on
-	// unsatisfiable requests; that surfaces as the ATTACH failure.
-	std::optional<int64_t> launcher_idle_for_attach;
-	std::optional<std::string> launcher_state_dir_for_attach;
-	if (launcher_idle_timeout_seconds >= 0) {
-		launcher_idle_for_attach = launcher_idle_timeout_seconds;
-	}
-	if (!launcher_state_dir.empty()) {
-		launcher_state_dir_for_attach = launcher_state_dir;
-	}
+	// unsatisfiable requests; that surfaces as the ATTACH failure. The
+	// launcher_*_for_attach optionals were already built above (alongside the
+	// InvokeCatalogs path) so the override flows into both RPCs identically.
 	auto attach_result = vgi::InvokeCatalogAttach(worker_path, catalog_name, context, worker_debug, use_pool, auth,
 	                                              data_version_spec, implementation_version, cookie_jar,
 	                                              attach_options, launcher_idle_for_attach,

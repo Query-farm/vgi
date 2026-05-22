@@ -289,8 +289,23 @@ static void InvokeVoidRpc(const CatalogRpcContext &ctx, const std::string &metho
 
 std::vector<VgiCatalogInfo> InvokeCatalogs(const std::string &worker_path, ClientContext &context,
                                             bool worker_debug, bool use_pool,
-                                            const std::shared_ptr<CatalogAuth> &auth) {
-	auto temp_params = std::make_shared<VgiAttachParameters>(worker_path, "", worker_debug, use_pool, auth);
+                                            const std::shared_ptr<CatalogAuth> &auth,
+                                            std::optional<int64_t> launcher_idle_timeout_seconds,
+                                            std::optional<std::string> launcher_state_dir) {
+	// Use the config struct so launcher overrides flow into the temp_params —
+	// same rationale as InvokeCatalogAttach below. Without these, this RPC
+	// would prime the launcher cache with [defaults]; the user's subsequent
+	// ATTACH (carrying overrides) would then trip the cache-pin's
+	// BinderException, breaking even one-shot queries with custom launcher
+	// options.
+	VgiAttachParametersConfig temp_cfg;
+	temp_cfg.worker_path = worker_path;
+	temp_cfg.worker_debug = worker_debug;
+	temp_cfg.use_pool = use_pool;
+	temp_cfg.auth = auth;
+	temp_cfg.launcher_idle_timeout_seconds = launcher_idle_timeout_seconds;
+	temp_cfg.launcher_state_dir = launcher_state_dir;
+	auto temp_params = std::make_shared<VgiAttachParameters>(std::move(temp_cfg));
 	CatalogRpcContext ctx{temp_params, {}, {}};
 	auto response = InvokeRpcMethod(ctx, "catalog_catalogs", nullptr, context);
 	auto result_batch = ExtractAndDeserializeResult(response, "catalog_catalogs", worker_path);
