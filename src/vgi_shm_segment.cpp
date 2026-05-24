@@ -246,6 +246,12 @@ void VgiShmSegment::FreeAllocation(uint64_t offset) {
 		return;
 	}
 	uint32_t num = LoadU32LE(base_ + 16);
+	if (num > VGI_SHM_MAX_ALLOCS) {
+		// Corrupt header: num_allocs can't exceed what the header region holds.
+		// Trusting it would walk reads far past the mapping (OOB).
+		throw IOException("VgiShmSegment: corrupt header num_allocs=" + std::to_string(num) +
+		                  " exceeds max " + std::to_string(VGI_SHM_MAX_ALLOCS));
+	}
 	uint8_t *entries = base_ + 24;
 	for (uint32_t i = 0; i < num; i++) {
 		uint64_t entry_off = LoadU64LE(entries + i * 16);
@@ -281,9 +287,19 @@ VgiShmSegment::MaybeResolveBatch(const std::shared_ptr<arrow::RecordBatch> &batc
 		return nullptr;
 	}
 
-	uint64_t offset = std::stoull(offset_str.ValueUnsafe());
-	uint64_t length = std::stoull(length_str.ValueUnsafe());
-	if (offset < VGI_SHM_HEADER_SIZE || offset + length > size_) {
+	uint64_t offset;
+	uint64_t length;
+	try {
+		offset = std::stoull(offset_str.ValueUnsafe());
+		length = std::stoull(length_str.ValueUnsafe());
+	} catch (const std::exception &e) {
+		throw IOException("VgiShmSegment: malformed pointer batch offset/length metadata: " +
+		                  std::string(e.what()));
+	}
+	// Bounds check written without addition so a huge worker-supplied length
+	// can't overflow uint64 and wrap past the guard. offset <= size_ is checked
+	// first so size_ - offset below can't underflow.
+	if (offset < VGI_SHM_HEADER_SIZE || offset > size_ || length > size_ - offset) {
 		throw IOException("VgiShmSegment: pointer batch out of range (offset=" + std::to_string(offset) +
 		                  ", length=" + std::to_string(length) + ", size=" + std::to_string(size_) + ")");
 	}

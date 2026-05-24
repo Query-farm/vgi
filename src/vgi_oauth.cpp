@@ -32,6 +32,7 @@ extern "C" char *duckdb_wasm_get_page_origin(void);
 #if defined(__APPLE__) || defined(__linux__)
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #elif defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -615,24 +616,42 @@ void OpenBrowser(const std::string &url) {
 	// In WASM, we can't open a browser from a Worker — the URL is printed to stderr for the user
 	fprintf(stderr, "[VGI] Please open this URL in your browser: %s\n", url.c_str());
 #elif defined(__APPLE__)
+	// Double-fork: the intermediate child exits immediately, so the waitpid()
+	// below returns at once (no blocking on the browser launcher), and the
+	// grandchild that execs `open` is reparented to init and auto-reaped —
+	// no zombie left in the DuckDB process.
 	pid_t pid = fork();
 	if (pid == 0) {
-		execlp("open", "open", url.c_str(), nullptr);
-		_exit(1);
+		pid_t grandchild = fork();
+		if (grandchild == 0) {
+			execlp("open", "open", url.c_str(), nullptr);
+			_exit(1);
+		}
+		_exit(0);
+	}
+	if (pid > 0) {
+		waitpid(pid, nullptr, 0); // reap the (immediately-exiting) intermediate
 	}
 #elif defined(_WIN32)
 	ShellExecuteA(nullptr, "open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
 #else
 	pid_t pid = fork();
 	if (pid == 0) {
-		// Redirect stderr to /dev/null
-		int devnull = open("/dev/null", O_WRONLY);
-		if (devnull >= 0) {
-			dup2(devnull, STDERR_FILENO);
-			close(devnull);
+		pid_t grandchild = fork();
+		if (grandchild == 0) {
+			// Redirect stderr to /dev/null
+			int devnull = open("/dev/null", O_WRONLY);
+			if (devnull >= 0) {
+				dup2(devnull, STDERR_FILENO);
+				close(devnull);
+			}
+			execlp("xdg-open", "xdg-open", url.c_str(), nullptr);
+			_exit(1);
 		}
-		execlp("xdg-open", "xdg-open", url.c_str(), nullptr);
-		_exit(1);
+		_exit(0);
+	}
+	if (pid > 0) {
+		waitpid(pid, nullptr, 0); // reap the (immediately-exiting) intermediate
 	}
 #endif
 }
@@ -1006,9 +1025,6 @@ static OAuthTokenSet PerformDeviceCodeFlowImpl(const OAuthChallenge &challenge,
 			continue;
 		}
 
-		// Reset network retry counter on successful HTTP round-trip
-		network_retries = 0;
-
 		if (resp.status_code == 200) {
 			// Success
 			auto tokens = ParseTokenResponse(resp.body, "device code token response");
@@ -1027,6 +1043,12 @@ static OAuthTokenSet PerformDeviceCodeFlowImpl(const OAuthChallenge &challenge,
 			VGI_STDERR_DEBUG("[VGI] oauth.device_poll server_error=%d retry=%d\n", resp.status_code, network_retries);
 			continue;
 		}
+
+		// Healthy round-trip (non-5xx, non-200: e.g. authorization_pending,
+		// slow_down). Reset the consecutive network/server error counter here —
+		// NOT before the 5xx branch, or a steady stream of 500s would reset to
+		// zero every loop and the max_network_retries cap would never trip.
+		network_retries = 0;
 
 		// Parse error JSON BEFORE checking status code — servers may use non-standard
 		// status codes (e.g., 403 with slow_down, 428 with authorization_pending)

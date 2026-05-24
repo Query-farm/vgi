@@ -9,7 +9,7 @@
 
 #if VGI_POSIX_TRANSPORT
 #include <fcntl.h>
-#include <sys/select.h>
+#include <poll.h>
 #elif defined(_WIN32)
 #include <fcntl.h> // _O_BINARY / _O_RDONLY / _O_WRONLY
 #include <io.h>     // _open_osfhandle, _get_osfhandle, _read, _write, _close
@@ -327,28 +327,30 @@ void WaitForReadable(int fd, int timeout_seconds) {
 			throw IOException("VGI catalog operation timed out after %d seconds", timeout_seconds);
 		}
 
-		fd_set read_fds;
-		FD_ZERO(&read_fds);
-		FD_SET(fd, &read_fds);
+		// poll() (not select()) so fds >= FD_SETSIZE (1024) — reachable in a
+		// long-lived process with many attachments — don't overrun the fd_set
+		// bit array. Round remaining microseconds up to whole ms (poll's unit)
+		// so we never under-wait the final sub-millisecond slice.
+		struct pollfd pfd;
+		pfd.fd = fd;
+		pfd.events = POLLIN;
+		int timeout_ms = static_cast<int>((remaining.count() + 999) / 1000);
 
-		struct timeval tv;
-		tv.tv_sec = remaining.count() / 1000000;
-		tv.tv_usec = remaining.count() % 1000000;
-
-		int result = select(fd + 1, &read_fds, nullptr, nullptr, &tv);
+		int result = poll(&pfd, 1, timeout_ms);
 
 		if (result < 0) {
 			if (errno == EINTR) {
 				continue; // Recalculate remaining time and retry
 			}
-			throw IOException("VGI catalog operation failed: select error: %s", strerror(errno));
+			throw IOException("VGI catalog operation failed: poll error: %s", strerror(errno));
 		}
 
 		if (result == 0) {
 			throw IOException("VGI catalog operation timed out after %d seconds", timeout_seconds);
 		}
 
-		// fd is readable, return successfully
+		// fd is readable (or POLLHUP/POLLERR) — return so the caller's read
+		// observes data or EOF/error.
 		return;
 	}
 }
@@ -629,7 +631,18 @@ int GetCatalogTimeout(ClientContext *context) {
 	if (context) {
 		Value val;
 		if (context->TryGetCurrentSetting("vgi_catalog_timeout_seconds", val)) {
-			return static_cast<int>(val.GetValue<int64_t>());
+			int64_t raw = val.GetValue<int64_t>();
+			// Clamp to a sane range. A non-positive value would make the deadline
+			// already-elapsed on the first iteration (immediate bogus timeout);
+			// a value near INT_MAX overflows the steady_clock deadline math.
+			constexpr int64_t kMinTimeout = 1;
+			constexpr int64_t kMaxTimeout = 86400; // 1 day
+			if (raw < kMinTimeout) {
+				raw = kMinTimeout;
+			} else if (raw > kMaxTimeout) {
+				raw = kMaxTimeout;
+			}
+			return static_cast<int>(raw);
 		}
 	}
 	return CATALOG_OPERATION_TIMEOUT_SECONDS;
@@ -640,27 +653,24 @@ void WaitForReadableUntilCancel(int fd, ClientContext *context) {
 	// No wall-clock deadline. Match the streaming data-phase model: block
 	// until the worker speaks. Cancellation comes via the context's
 	// `interrupted` flag (Ctrl-C, query cancel) — we poll it every 250ms.
-	constexpr int64_t kPollIntervalUs = 250 * 1000;
+	constexpr int kPollIntervalMs = 250;
 
 	while (true) {
 		if (context && context->interrupted) {
 			throw IOException("VGI operation interrupted (query cancelled)");
 		}
 
-		fd_set read_fds;
-		FD_ZERO(&read_fds);
-		FD_SET(fd, &read_fds);
+		// poll() (not select()) so high-numbered fds don't overrun fd_set.
+		struct pollfd pfd;
+		pfd.fd = fd;
+		pfd.events = POLLIN;
 
-		struct timeval tv;
-		tv.tv_sec = 0;
-		tv.tv_usec = kPollIntervalUs;
-
-		int result = select(fd + 1, &read_fds, nullptr, nullptr, &tv);
+		int result = poll(&pfd, 1, kPollIntervalMs);
 		if (result < 0) {
 			if (errno == EINTR) {
 				continue;
 			}
-			throw IOException("VGI operation failed: select error: %s", strerror(errno));
+			throw IOException("VGI operation failed: poll error: %s", strerror(errno));
 		}
 		if (result == 0) {
 			// Quantum elapsed without data — loop to re-poll interrupted.

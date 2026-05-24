@@ -2002,14 +2002,30 @@ static void DecodeScanArguments(ClientContext &context,
 		const auto &field_name = schema->field(i)->name();
 		auto &duck_value = values[i];
 		if (field_name.rfind("arg_", 0) == 0) {
+			// Cap to a sane ceiling: a worker-supplied index is used to size the
+			// positional vector, so an unbounded value (e.g. "arg_9999999999")
+			// would force a multi-GB allocation. >1000 positional args to a
+			// single function is not a real workload — treat it as a protocol
+			// error rather than honoring the resize.
+			constexpr size_t kMaxPositionalArgs = 1000;
+			size_t idx;
+			bool is_positional = false;
 			try {
-				size_t idx = std::stoul(field_name.substr(4));
+				idx = std::stoul(field_name.substr(4));
+				is_positional = true;
+			} catch (const std::exception &) {
+				// Not a numeric arg_<N> suffix — fall through to named handling.
+				named_out[field_name] = duck_value;
+			}
+			if (is_positional) {
+				if (idx >= kMaxPositionalArgs) {
+					throw IOException("VGI: positional argument index %llu exceeds maximum of %llu",
+					                  (unsigned long long)idx, (unsigned long long)kMaxPositionalArgs);
+				}
 				if (idx >= positional_out.size()) {
 					positional_out.resize(idx + 1);
 				}
 				positional_out[idx] = duck_value;
-			} catch (const std::exception &) {
-				named_out[field_name] = duck_value;
 			}
 		} else {
 			named_out[field_name] = duck_value;
@@ -2214,6 +2230,11 @@ CreateTableInfo CreateTableInfoFromVgiTable(ClientContext &context, VgiTableInfo
 					adjusted--;
 				}
 			}
+			if (adjusted < 0 || (idx_t)adjusted >= create_info.columns.LogicalColumnCount()) {
+				throw InvalidInputException(
+				    "VGI: UNIQUE constraint references column index %d out of range (table '%s' has %llu columns)",
+				    adjusted, create_info.table, (unsigned long long)create_info.columns.LogicalColumnCount());
+			}
 			col_names.push_back(create_info.columns.GetColumn(LogicalIndex(adjusted)).Name());
 		}
 		create_info.constraints.push_back(make_uniq<UniqueConstraint>(std::move(col_names), false));
@@ -2231,6 +2252,11 @@ CreateTableInfo CreateTableInfoFromVgiTable(ClientContext &context, VgiTableInfo
 				if (idx > table_info.row_id_column) {
 					adjusted--;
 				}
+			}
+			if (adjusted < 0 || (idx_t)adjusted >= create_info.columns.LogicalColumnCount()) {
+				throw InvalidInputException(
+				    "VGI: PRIMARY KEY constraint references column index %d out of range (table '%s' has %llu columns)",
+				    adjusted, create_info.table, (unsigned long long)create_info.columns.LogicalColumnCount());
 			}
 			col_names.push_back(create_info.columns.GetColumn(LogicalIndex(adjusted)).Name());
 		}

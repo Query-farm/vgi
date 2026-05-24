@@ -43,6 +43,11 @@ namespace vgi {
 constexpr size_t VGI_SHM_HEADER_SIZE = 65536;
 constexpr const char *VGI_SHM_MAGIC = "VGIS";
 constexpr uint32_t VGI_SHM_VERSION = 1;
+// Max (offset,length) entries that fit in the header region after the 24-byte
+// preamble: (65536 - 24) / 16 = 4094. Mirrors the bound vgi_rpc/shm.py enforces
+// by construction; the C++ side must validate the worker-written num_allocs
+// against it before iterating the entry table.
+constexpr uint32_t VGI_SHM_MAX_ALLOCS = (VGI_SHM_HEADER_SIZE - 24) / 16;
 
 class VgiShmSegment {
 public:
