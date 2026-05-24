@@ -72,7 +72,7 @@ public:
 	void WriteInputBatch(const std::shared_ptr<arrow::RecordBatch> &batch) override;
 	void CloseInputWriter() override;
 	std::shared_ptr<arrow::RecordBatch> ReadDataBatch() override;
-	void CancelStream(const std::vector<uint8_t> &state_token) override;
+	void CancelStream(const std::vector<uint8_t> &state_token, ClientContext &live_context) override;
 
 
 	// ========== Table sink+source RPC family ==========

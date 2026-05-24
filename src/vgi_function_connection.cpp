@@ -984,8 +984,9 @@ void FunctionConnection::WriteInputBatch(const std::shared_ptr<arrow::RecordBatc
 	DrainStderrLog();
 }
 
-void FunctionConnection::CancelStream(const std::vector<uint8_t> &state_token) {
+void FunctionConnection::CancelStream(const std::vector<uint8_t> &state_token, ClientContext &live_context) {
 	(void)state_token;
+	(void)live_context; // subprocess cancel writes to the pipe; no context-bound logging/HTTP
 	// Best-effort: if the writer isn't open or is already closed, the
 	// worker has already learned the stream is done via EOS or pipe
 	// close; no cancel is needed.

@@ -156,7 +156,11 @@ void VgiCancelDispatcher::ProcessOne(CancelRequest &req) noexcept {
 		if (!req.connection) {
 			return;
 		}
-		req.connection->CancelStream(req.state_token);
+		// Pass the dispatcher's long-lived bot context: the connection's own
+		// context_ references the originating query's ClientContext, which is
+		// typically destroyed by the time we run here (off-thread). Using it
+		// would use-after-free its Logger inside CancelStream's VGI_LOG.
+		req.connection->CancelStream(req.state_token, *conn_->context);
 	} catch (const std::exception &e) {
 		// Best-effort; log and move on. Never propagate.
 		try {

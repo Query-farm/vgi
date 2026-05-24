@@ -233,8 +233,10 @@ public:
 	void WriteInputBatch(const std::shared_ptr<arrow::RecordBatch> &batch) override;
 
 	// Cancel the current stream by writing a zero-row batch tagged with
-	// VGI_RPC_CANCEL_KEY custom metadata. state_token unused (ignored).
-	void CancelStream(const std::vector<uint8_t> &state_token) override;
+	// VGI_RPC_CANCEL_KEY custom metadata. state_token + live_context unused
+	// (the subprocess stream is self-addressing and writes to a pipe, no
+	// context-bound logging/HTTP on this path).
+	void CancelStream(const std::vector<uint8_t> &state_token, ClientContext &live_context) override;
 
 	// Subprocess: no state token (the lockstep stream is self-addressing).
 	std::vector<uint8_t> GetLastStateToken() const override { return {}; }

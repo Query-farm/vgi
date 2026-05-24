@@ -183,7 +183,15 @@ public:
 	//   metadata on the input writer. state_token is ignored.
 	// - HTTP: POSTs {state, cancel} to /{method}/exchange addressed by
 	//   state_token (the most recent token seen on the stream).
-	virtual void CancelStream(const std::vector<uint8_t> &state_token) = 0;
+	//
+	// ``live_context`` MUST be a context guaranteed alive for the duration of
+	// this call — the dispatcher passes its long-lived bot connection's
+	// context. The connection's own ``context_`` is a reference to the
+	// originating query's ClientContext, which is typically already destroyed
+	// by the time the dispatcher runs this off-thread (use-after-free of its
+	// Logger otherwise). Implementations must route all logging / HTTP through
+	// ``live_context``, never ``context_``.
+	virtual void CancelStream(const std::vector<uint8_t> &state_token, ClientContext &live_context) = 0;
 
 	// State queries
 	virtual bool IsTableInOut() const = 0;

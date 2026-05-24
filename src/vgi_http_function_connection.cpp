@@ -920,7 +920,7 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 	return output_batch;
 }
 
-void HttpFunctionConnection::CancelStream(const std::vector<uint8_t> &state_token) {
+void HttpFunctionConnection::CancelStream(const std::vector<uint8_t> &state_token, ClientContext &live_context) {
 	// Need a state-token to address the server-side stream. Prefer the
 	// caller-supplied token (captured at the call site, immune to
 	// concurrent mutation); fall back to the live member for paths that
@@ -969,10 +969,13 @@ void HttpFunctionConnection::CancelStream(const std::vector<uint8_t> &state_toke
 
 	std::string exchange_url = base_url_ + "/init/exchange";
 	auto c_auth = attach_params_ ? attach_params_->auth() : nullptr;
+	// Route through ``live_context`` (dispatcher's bot context), NOT ``context_``:
+	// this runs off-thread after the originating query's ClientContext (and its
+	// Logger) may already be destroyed — see CancelStream contract in the header.
 	auto c_cached_params = attach_params_
-	    ? attach_params_->GetOrInitHttpParams(context_, exchange_url) : nullptr;
+	    ? attach_params_->GetOrInitHttpParams(live_context, exchange_url) : nullptr;
 	// Best-effort: dispatcher catches any thrown exception.
-	(void)HttpPostArrowIpc(context_, exchange_url, body, c_auth,
+	(void)HttpPostArrowIpc(live_context, exchange_url, body, c_auth,
 	                        /*cookie_jar=*/nullptr, c_cached_params);
 }
 
