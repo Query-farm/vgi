@@ -1,0 +1,98 @@
+# name: test/sql/integration/filter_pushdown/dictionary_varchar.test
+# description: Filter-pushdown over a dictionary-encoded column whose
+#   DuckDB-facing type is plain VARCHAR. dict_filter_echo declares its
+#   `s` column as Arrow `dictionary<int8, utf8>` *without* ENUM metadata,
+#   so DuckDB types it as VARCHAR and pushes a VARCHAR (string) literal
+#   down. The worker then emits `s` dictionary-encoded, so the auto-applied
+#   filter must compare (dictionary column, string literal). Naively casting
+#   the literal up to the column's dictionary type makes the kernel throw
+#   `ArrowTypeError: Array type doesn't match type of values set: string vs
+#   dictionary<...>`; the evaluator must instead decode the column to its
+#   value type. This is distinct from enums.test, where DuckDB knows the
+#   column is an ENUM and pushes an enum (dictionary) literal. Pin the
+#   working behavior so every language implementation handles it the same.
+#
+# group: [vgi_integration_filter_pushdown]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# The column reads back as VARCHAR despite the dictionary wire encoding.
+query I
+SELECT typeof(s) FROM example.dict_filter_echo(1);
+----
+VARCHAR
+
+# Baseline: no filter. Row i carries ('red','green','blue')[i % 3].
+query II
+SELECT n, s FROM example.dict_filter_echo(6) ORDER BY n;
+----
+0	red
+1	green
+2	blue
+3	red
+4	green
+5	blue
+
+# ============================================================================
+# Equality — pushes `s = 'green'` (VARCHAR literal) against a dictionary column
+# ============================================================================
+
+query II
+SELECT n, s FROM example.dict_filter_echo(6) WHERE s = 'green' ORDER BY n;
+----
+1	green
+4	green
+
+# ============================================================================
+# IN — multiple VARCHAR literals against a dictionary column
+# ============================================================================
+
+query II
+SELECT n, s FROM example.dict_filter_echo(6) WHERE s IN ('red', 'blue') ORDER BY n;
+----
+0	red
+2	blue
+3	red
+5	blue
+
+# A value not present in the dictionary matches nothing.
+query II
+SELECT n, s FROM example.dict_filter_echo(6) WHERE s IN ('yellow') ORDER BY n;
+----
+
+# ============================================================================
+# Inequality / NOT IN — comparison kernels on a dictionary column
+# ============================================================================
+
+query II
+SELECT n, s FROM example.dict_filter_echo(6) WHERE s != 'red' ORDER BY n;
+----
+1	green
+2	blue
+4	green
+5	blue
+
+query II
+SELECT n, s FROM example.dict_filter_echo(6) WHERE s NOT IN ('green', 'blue') ORDER BY n;
+----
+0	red
+3	red
+
+# ============================================================================
+# Conjunction — filter on the dictionary column AND the plain int column
+# ============================================================================
+
+query II
+SELECT n, s FROM example.dict_filter_echo(6) WHERE s = 'red' AND n >= 3 ORDER BY n;
+----
+3	red
+
+statement ok
+DETACH example;

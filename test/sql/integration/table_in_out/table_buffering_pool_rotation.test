@@ -40,6 +40,16 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}', pool false
 statement ok
 SET threads=4;
 
+# Flush a clean baseline. The subprocess pool is a process-global singleton
+# shared across every test file in a run; an earlier test that attached with
+# default pooling (e.g. table_buffering_parallel) can leave warm workers in it.
+# Flushing here — before any workload — makes the line-112 "pool MUST be empty"
+# assertion test THIS file's pool:=false behavior rather than the residue of
+# whatever ran first. The flush is at the start, not before the check, so a
+# pool:=false attach that wrongly pooled a worker is still caught.
+statement ok
+SELECT vgi_worker_pool_flush();
+
 # A parallel input source (TEMP TABLE scan IS parallel; range() isn't) so
 # multiple Sink threads engage and each picks up its own fresh worker.
 statement ok
