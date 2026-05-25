@@ -1,0 +1,27 @@
+# name: test/sql/integration/protocol_version/version_mismatch.test
+# description: VGI application protocol_version mismatch is fatal at the dispatch boundary
+# group: [vgi_integration_protocol_version]
+
+# The fixture worker advertises protocol_version 99.0.0 (a deliberate major
+# bump) while the C++ extension declares and sends 1.0.0 on every request. The
+# vgi-rpc framework enforces an exact major+minor match at the dispatch
+# boundary, so the very first RPC ATTACH issues (catalog discovery) must fail
+# with a directional ProtocolVersionError that round-trips back as an
+# IOException. This guards the cross-language version handshake: a worker built
+# against a newer protocol cannot silently mis-serve an older extension.
+#
+# Provisioned via the VGI_BAD_PROTOCOL_WORKER fixture
+# (vgi-fixture-bad-protocol-worker) — see vgi-python/vgi/_test_fixtures/bad_protocol.py.
+
+require-env VGI_BAD_PROTOCOL_WORKER
+
+require vgi
+
+require httpfs
+
+# The mismatch is detected on the first dispatched request, which ATTACH makes
+# during catalog discovery — so ATTACH itself fails.
+statement error
+ATTACH 'badproto' AS badproto (TYPE vgi, LOCATION '${VGI_BAD_PROTOCOL_WORKER}');
+----
+protocol_version mismatch
