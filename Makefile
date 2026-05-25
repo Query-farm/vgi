@@ -286,6 +286,57 @@ test_all: test_subprocess test_shm test_http test_http_bearer test_http_versione
 
 test_all_debug: test_subprocess_debug test_shm_debug test_http_debug test_http_bearer_debug test_http_versioned_tables_debug test_http_attach_options_debug
 
+# ---------------------------------------------------------------------------
+# Per-language integration runs
+#
+# The VGI_*_WORKER vars above default to the vgi-python fixtures, so the
+# transport targets (test_subprocess / test_launcher / ...) already exercise
+# the Python implementation. These convenience targets run the SAME
+# test/sql/integration suite against the Go / TypeScript / Java worker
+# implementations by delegating to each SDK repo's own `make test`, which
+# builds that language's worker(s) and applies the exclusions for fixtures it
+# doesn't implement. Each SDK Makefile points its UNITTEST back at this repo's
+# build, so all four run identical .test files — only the worker differs.
+#
+# Override an SDK location with VGI_GO_DIR / VGI_TS_DIR / VGI_JAVA_DIR.
+#
+# Storage backend: each run defaults to the local SQLite tier. The worker
+# inherits VGI_WORKER_SHARED_STORAGE from the environment, so
+# `VGI_WORKER_SHARED_STORAGE=memory make test_go` runs the in-process tier.
+# (Reliable on the subprocess transport, where every test spawns a fresh
+# worker. Under the launcher transport — TypeScript/Java — a warm worker
+# cached from a prior run is reused regardless of env, so kill stale workers
+# first if switching tiers mid-session.)
+# ---------------------------------------------------------------------------
+VGI_GO_DIR   ?= $(HOME)/Development/vgi-go
+VGI_TS_DIR   ?= $(HOME)/Development/vgi-typescript
+VGI_JAVA_DIR ?= $(HOME)/vgi-java
+
+.PHONY: test_python test_go test_typescript test_java test_languages
+
+# Python uses this repo's default worker set — run the launcher suite directly.
+test_python: test_launcher
+
+test_go:
+	$(MAKE) -C $(VGI_GO_DIR) test
+
+test_typescript:
+	$(MAKE) -C $(VGI_TS_DIR) test
+
+test_java:
+	$(MAKE) -C $(VGI_JAVA_DIR) test
+
+# Run the integration suite against every language implementation. Keeps going
+# on failure so one language's result doesn't mask the others, then exits
+# non-zero if any failed.
+test_languages:
+	@rc=0; \
+	for t in test_python test_go test_typescript test_java; do \
+		echo "==================== $$t ===================="; \
+		$(MAKE) $$t || rc=$$?; \
+	done; \
+	exit $$rc
+
 # Interactive DuckDB shell with the vgi extension loaded and the example
 # python worker pre-attached as the `example` catalog. Use `make shell`
 # (release) or `make shell_debug` for the debug build. Override the worker
