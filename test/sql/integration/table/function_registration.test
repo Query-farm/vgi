@@ -20,29 +20,30 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
 # ============================================================================
 # Function Inventory
-# 58 pure table functions + 9 table-in-out functions = 67 total table-type functions (+1 overload of an existing group = 68)
-# (58 includes the 3 partitioned_*_order fixtures used by order_preservation_modes.test,
+# 59 pure table functions + 9 table-in-out functions = 68 total table-type functions (+1 overload of an existing group = 69)
+# (59 includes the 3 partitioned_*_order fixtures used by order_preservation_modes.test,
 # the tx_cached_value fixture used by the catalog transaction tests, 2 batch_index
 # reference fixtures, 3 deliberately-broken batch_index fixtures used by
-# batch_index_contract.test, 4 partition_columns reference fixtures, and 4
+# batch_index_contract.test, 4 partition_columns reference fixtures, 4
 # deliberately-broken partition_columns fixtures used by
-# partition_columns_contract.test.)
+# partition_columns_contract.test, and the dict_filter_echo fixture used by
+# filter_pushdown/dictionary_varchar.test.)
 # ============================================================================
 
 # Total table-type function count (includes table-in-out)
-# 68 base + 5 table_buffering failure-injection fixtures (crash_on_process,
+# 69 base + 5 table_buffering failure-injection fixtures (crash_on_process,
 # crash_on_combine, crash_on_finalize, hang_on_process, large_state) +
 # 3 ordering-knob fixtures (ordered_buffer_input, batch_index_buffer_input,
 # ordered_source) +
 # 2 cancel/pushdown probes (slow_cancellable_buffering, echo_buffering) +
 # 1 projection-pushdown witness (echo_witness)
-# = 79
+# = 80
 query I
 SELECT COUNT(*)
 FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'table';
 ----
-79
+80
 
 # The 33 pure table functions (no TABLE parameter type)
 # Note: make_series appears 5 times (5 overloads), make_pairs appears 3 times,
