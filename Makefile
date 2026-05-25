@@ -38,6 +38,7 @@ VGI_SIMPLE_WRITABLE_WORKER ?= uv run --project $(HOME)/Development/vgi-python vg
 # a vgi-python worker with writable-catalog support enabled; run them
 # explicitly via `make test_writable` when that worker is available.
 .PHONY: test_subprocess test_subprocess_debug test_http test_http_debug \
+	test_shm test_shm_debug \
 	test_launcher test_launcher_debug \
 	test_launcher_cloudflare_do test_launcher_cloudflare_do_debug \
 	test_http_versioned_tables test_http_versioned_tables_debug \
@@ -46,6 +47,51 @@ VGI_SIMPLE_WRITABLE_WORKER ?= uv run --project $(HOME)/Development/vgi-python vg
 	test_simple_writable test_simple_writable_debug \
 	test_all test_all_debug
 
+# Shared-memory transport tests — runs the same .test suite as test_subprocess
+# but with VGI_RPC_SHM_SIZE_BYTES set so the subprocess workers advertise a
+# POSIX shm segment on init and route every data batch through the zero-copy
+# side-channel (see *Shared-Memory Transport* in CLAUDE.md). The worker attaches
+# the segment transparently via vgi_rpc's _maybe_attach_shm, so no separate
+# fixture is needed — the env var alone flips the transport. Catalog RPCs are
+# unaffected; this exercises the batch read/free/reset lockstep and the inline
+# fallback when a batch overflows the segment. 64 MiB comfortably holds the
+# suite's batches; overflow falls back to inline transport, not failure.
+VGI_RPC_SHM_SIZE_BYTES ?= 67108864
+
+# Routes through scripts/run_tests.py so each .test file runs in its own
+# unittest subprocess, N at a time (override with VGI_RUN_TESTS_JOBS). Serial
+# unittest wastes wall-clock here because each test is mostly waiting on the
+# subprocess worker's I/O.
+test_shm:
+	VGI_TRANSACTOR_DB_DIR="$$(mktemp -d)" \
+	VGI_RPC_SHM_SIZE_BYTES="$(VGI_RPC_SHM_SIZE_BYTES)" \
+	VGI_TEST_WORKER="$(VGI_TEST_WORKER)" \
+	VGI_VERSIONED_WORKER="$(VGI_VERSIONED_WORKER)" \
+	VGI_VERSIONED_TABLES_WORKER="$(VGI_VERSIONED_TABLES_WORKER)" \
+	VGI_ATTACH_OPTIONS_WORKER="$(VGI_ATTACH_OPTIONS_WORKER)" \
+	VGI_BAD_PROTOCOL_WORKER="$(VGI_BAD_PROTOCOL_WORKER)" \
+	VGI_SIMPLE_WRITABLE_WORKER="$(VGI_SIMPLE_WRITABLE_WORKER)" \
+	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
+	VGI_TEST_DEDICATED_WORKER=1 \
+	python3 scripts/run_tests.py --build release "test/*" "~test/sql/integration/writable/*"
+
+test_shm_debug:
+	VGI_TRANSACTOR_DB_DIR="$$(mktemp -d)" \
+	VGI_RPC_SHM_SIZE_BYTES="$(VGI_RPC_SHM_SIZE_BYTES)" \
+	VGI_TEST_WORKER="$(VGI_TEST_WORKER)" \
+	VGI_VERSIONED_WORKER="$(VGI_VERSIONED_WORKER)" \
+	VGI_VERSIONED_TABLES_WORKER="$(VGI_VERSIONED_TABLES_WORKER)" \
+	VGI_ATTACH_OPTIONS_WORKER="$(VGI_ATTACH_OPTIONS_WORKER)" \
+	VGI_BAD_PROTOCOL_WORKER="$(VGI_BAD_PROTOCOL_WORKER)" \
+	VGI_SIMPLE_WRITABLE_WORKER="$(VGI_SIMPLE_WRITABLE_WORKER)" \
+	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
+	VGI_TEST_DEDICATED_WORKER=1 \
+	python3 scripts/run_tests.py --build debug "test/*" "~test/sql/integration/writable/*"
+
+# Routes through scripts/run_tests.py so each .test file runs in its own
+# unittest subprocess, N at a time (override with VGI_RUN_TESTS_JOBS). Serial
+# unittest wastes wall-clock here because each test is mostly waiting on the
+# subprocess worker's I/O.
 test_subprocess:
 	VGI_TRANSACTOR_DB_DIR="$$(mktemp -d)" \
 	VGI_TEST_WORKER="$(VGI_TEST_WORKER)" \
@@ -56,7 +102,7 @@ test_subprocess:
 	VGI_SIMPLE_WRITABLE_WORKER="$(VGI_SIMPLE_WRITABLE_WORKER)" \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
 	VGI_TEST_DEDICATED_WORKER=1 \
-	./build/release/test/unittest "test/*" "~test/sql/integration/writable/*"
+	python3 scripts/run_tests.py --build release "test/*" "~test/sql/integration/writable/*"
 
 test_subprocess_debug:
 	VGI_TRANSACTOR_DB_DIR="$$(mktemp -d)" \
@@ -68,7 +114,7 @@ test_subprocess_debug:
 	VGI_SIMPLE_WRITABLE_WORKER="$(VGI_SIMPLE_WRITABLE_WORKER)" \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
 	VGI_TEST_DEDICATED_WORKER=1 \
-	./build/debug/test/unittest "test/*" "~test/sql/integration/writable/*"
+	python3 scripts/run_tests.py --build debug "test/*" "~test/sql/integration/writable/*"
 
 # Launcher transport tests — runs the same .test suite as test_subprocess but
 # with each worker fronted by `launch:` so traffic flows through the C++
@@ -236,9 +282,9 @@ test_simple_writable_debug:
 	VGI_SIMPLE_WRITABLE_WORKER="$(VGI_SIMPLE_WRITABLE_WORKER)" ./build/debug/test/unittest "test/sql/integration/simple_writable/*"
 
 # Run all transports
-test_all: test_subprocess test_http test_http_bearer test_http_versioned_tables test_http_attach_options
+test_all: test_subprocess test_shm test_http test_http_bearer test_http_versioned_tables test_http_attach_options
 
-test_all_debug: test_subprocess_debug test_http_debug test_http_bearer_debug test_http_versioned_tables_debug test_http_attach_options_debug
+test_all_debug: test_subprocess_debug test_shm_debug test_http_debug test_http_bearer_debug test_http_versioned_tables_debug test_http_attach_options_debug
 
 # Interactive DuckDB shell with the vgi extension loaded and the example
 # python worker pre-attached as the `example` catalog. Use `make shell`
