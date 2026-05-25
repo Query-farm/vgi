@@ -594,7 +594,15 @@ private:
 			// Struct child filter inherits column info from parent struct column
 			yyjson_mut_obj_add_strcpy(doc_, child_filter_obj, "column_name", column_name.c_str());
 			yyjson_mut_obj_add_uint(doc_, child_filter_obj, "column_index", column_index);
-			SerializeFilterInto(child_filter_obj, *struct_filter.child_filter, column_index, column_name);
+			// Propagate a skipped child instead of emitting a half-built struct with a
+			// "type"-less child_filter (which would make the worker fail to parse). This
+			// matches the CONJUNCTION_AND/OR/OPTIONAL_FILTER handling. DuckDB only ever
+			// places ConstantFilter/IsNull/IsNotNull under a struct_extract today (never
+			// a DynamicFilter/BloomFilter/IN — those optimizers reject nested expressions),
+			// so this is currently unreachable, but keeps the contract consistent.
+			if (!SerializeFilterInto(child_filter_obj, *struct_filter.child_filter, column_index, column_name)) {
+				return false;
+			}
 			yyjson_mut_obj_add_val(doc_, obj, "child_filter", child_filter_obj);
 			break;
 		}
