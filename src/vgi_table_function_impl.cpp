@@ -1593,6 +1593,7 @@ static duckdb::vector<ColumnPartitionData> ConvertPartitionValuesBatch(
 //! Caller is responsible for having already obtained arrow_batch either
 //! synchronously (via ReadDataBatch) or from the prefetch slot.
 static bool InstallBatch(ClientContext &context, const VgiTableFunctionBindData &bind_data,
+                         VgiTableFunctionGlobalState &global_state,
                          VgiTableFunctionLocalState &local_state,
                          std::shared_ptr<arrow::RecordBatch> arrow_batch) {
 	if (!arrow_batch) {
@@ -1730,7 +1731,7 @@ static bool InstallBatch(ClientContext &context, const VgiTableFunctionBindData 
 				}
 			}
 		}
-		// Synthetic per-chunk batch_index for PartitionColumns mode.
+		// Synthetic per-batch batch_index for PartitionColumns mode.
 		// DuckDB's pipeline executor only fires the sink's ``NextBatch``
 		// (which is what copies ``partition_data`` into the sink's local
 		// state) when the source-returned ``batch_index`` *changes* from
@@ -1738,15 +1739,25 @@ static bool InstallBatch(ClientContext &context, const VgiTableFunctionBindData 
 		// PartitionColumns-only functions the worker doesn't emit
 		// ``vgi_batch_index``, so ``current_batch_index`` would stay
 		// INVALID forever and the sink would never refresh its
-		// ``partition_data``. Bump a monotone counter per chunk to
-		// force the refresh. The actual values don't matter; only
-		// "changes per chunk" matters.
+		// ``partition_data``.
+		//
+		// The value MUST come from a GLOBAL monotonic counter, not a
+		// per-local-state one that restarts at 0. DuckDB initializes each
+		// scan thread's sink ``partition_info.batch_index`` from the global
+		// batch-index pool (``Pipeline::RegisterNewBatchIndex`` returns the
+		// current minimum), so a thread that registers after peers have
+		// advanced inherits a value > 0. A per-thread 0 would map (via
+		// ``base + value + 1`` in ``PipelineExecutor::NextBatch``) onto that
+		// inherited minimum, ``NextBatch`` would see "no change", the
+		// never-installed ``partition_data`` would be dereferenced empty in
+		// ``PhysicalPartitionedAggregate::Sink`` -> "index 0 within vector of
+		// size 0". A global counter guarantees every batch's index strictly
+		// exceeds any thread's inherited minimum, so the first chunk always
+		// refreshes. See ``synthetic_batch_index`` in the gstate header for
+		// the full rationale.
 		if (!bind_data.supports_batch_index) {
-			if (local_state.current_batch_index == DConstants::INVALID_INDEX) {
-				local_state.current_batch_index = 0;
-			} else {
-				local_state.current_batch_index++;
-			}
+			local_state.current_batch_index =
+			    global_state.synthetic_batch_index.fetch_add(1, std::memory_order_relaxed);
 		}
 	}
 
@@ -1789,7 +1800,7 @@ static bool GetNextBatch(ClientContext &context, const VgiTableFunctionBindData 
 		UpdateDynamicFilterState(global_state, context, bind_data);
 		auto arrow_batch = local_state.connection()->ReadDataBatch();
 		if (!arrow_batch) {
-			return InstallBatch(context, bind_data, local_state, nullptr);
+			return InstallBatch(context, bind_data, global_state, local_state, nullptr);
 		}
 		if (arrow_batch->num_rows() == 0) {
 			auto &conn = *local_state.connection();
@@ -1801,7 +1812,7 @@ static bool GetNextBatch(ClientContext &context, const VgiTableFunctionBindData 
 			VGI_LOG(context, "table_function.batch_empty_skipped", fields);
 			continue;
 		}
-		return InstallBatch(context, bind_data, local_state, std::move(arrow_batch));
+		return InstallBatch(context, bind_data, global_state, local_state, std::move(arrow_batch));
 	}
 }
 
@@ -1844,11 +1855,12 @@ static void LaunchPrefetch(TableFunctionInput &input, VgiTableFunctionLocalState
 }
 
 static void ConsumePrefetchedBatch(ClientContext &context, const VgiTableFunctionBindData &bind_data,
+                                   VgiTableFunctionGlobalState &global_state,
                                    VgiTableFunctionLocalState &local_state) {
 	auto arrow_batch = std::move(local_state.prefetch_slot_->batch);
 	local_state.prefetch_slot_->batch.reset();
 	local_state.prefetch_slot_->state.store(PrefetchState::IDLE);
-	InstallBatch(context, bind_data, local_state, std::move(arrow_batch));
+	InstallBatch(context, bind_data, global_state, local_state, std::move(arrow_batch));
 }
 
 // ============================================================================
@@ -1933,7 +1945,7 @@ void VgiTableFunctionScan(ClientContext &context, TableFunctionInput &input, Dat
 	}
 
 	if (state == PrefetchState::READY) {
-		ConsumePrefetchedBatch(context, bind_data, local_state);
+		ConsumePrefetchedBatch(context, bind_data, global_state, local_state);
 		if (local_state.done) {
 			output.SetCardinality(0);
 			return;

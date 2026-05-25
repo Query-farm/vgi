@@ -297,6 +297,26 @@ struct VgiTableFunctionGlobalState : public GlobalTableFunctionState {
 	// Progress tracking (atomic for thread safety with progress callback)
 	std::atomic<idx_t> rows_read {0};
 
+	// Synthetic batch-index source for PartitionColumns-mode functions that do
+	// NOT advertise supports_batch_index. DuckDB's PipelineExecutor::NextBatch
+	// refreshes the sink's partition_data only when the source's batch_index
+	// *changes*, so these functions need a value that moves per batch to drive
+	// PartitionedAggregate. It MUST be globally monotonic across scan threads,
+	// not per-local-state: DuckDB initializes each thread's sink batch_index
+	// from the global batch-index pool (Pipeline::RegisterNewBatchIndex returns
+	// the current minimum), so a late-registering thread starts at >0. A
+	// per-thread counter that restarts at 0 then collides with that initialized
+	// value (synthetic 0 -> base+0+1 == the global-min the thread inherited),
+	// NextBatch sees "no change", and the never-installed partition_data is
+	// dereferenced empty -> "index 0 within vector of size 0". A single global
+	// counter guarantees every batch's index strictly exceeds any thread's
+	// inherited minimum, so the first chunk always refreshes. Same-valued
+	// partitions still merge correctly downstream — the sink buckets by
+	// partition *value* (GetOrCreatePartition), so per-batch granularity is
+	// harmless. fetch_add(relaxed) is enough; we only need uniqueness +
+	// monotonicity, not ordering against other memory.
+	std::atomic<idx_t> synthetic_batch_index {0};
+
 	// Primary connection (moved from bind_data during InitGlobal)
 	// Protected by mutex for thread-safe handoff to first InitLocal caller.
 	// `mutable` so EnsureInitApplied() can install it from MaxThreads().
