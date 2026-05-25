@@ -663,12 +663,30 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 		data_reader_ = reader_result.ValueUnsafe();
 	}
 
-	// For producer mode (table functions): send tick batch before reading.
+	// For producer mode (table functions): each call sends the NEXT tick and
+	// returns the batch produced by the PREVIOUS tick — a one-ahead pipeline.
 	// The first tick was already sent during PerformInit to bootstrap the
-	// data stream, so each ReadDataBatch sends the NEXT tick and reads the
-	// response from the PREVIOUS tick — a one-ahead pipeline.
-	// Send one tick OUTSIDE the loop (only once per call).
-	if (is_producer_mode_ && input_writer_ && !input_writer_closed_) {
+	// stream, so we DON'T send a tick before reading here; we send it only
+	// after we've finished with the current batch (read + shm-free + resolve),
+	// just before returning it to the consumer (see end of this function).
+	//
+	// Why after, not before: with the shared-memory transport the worker's
+	// allocator and our FreeAllocation both mutate the segment's lock-free
+	// header. Sending the next tick wakes the worker's allocator; if we did
+	// that before FreeAllocation (as the old code did), the worker would be
+	// mid-allocate in its process while we mutate the same header here —
+	// a cross-process data race that corrupts num_allocs / the entry table
+	// (torn header => duplicated/lost batches). Deferring the tick until after
+	// the free restores the true lockstep the shm header assumes ("only one
+	// side active at a time"): once we've read the current pointer batch the
+	// worker is blocked waiting for the next tick, so the free is race-free.
+	// The tick still goes out before we return the batch, so DuckDB consuming
+	// the current batch overlaps with the worker producing the next one —
+	// the one-ahead latency hiding is preserved.
+	auto send_next_tick = [this]() {
+		if (!(is_producer_mode_ && input_writer_ && !input_writer_closed_)) {
+			return;
+		}
 		auto tick_batch = arrow::RecordBatch::Make(tick_schema_, 0, std::vector<std::shared_ptr<arrow::Array>>{});
 
 		// Attach dynamic filter metadata as IPC custom metadata if available
@@ -687,10 +705,10 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 		if (!write_status.ok()) {
 			// Tick write can fail with EPIPE/broken pipe if the server has already
 			// finished (e.g., finalize with no output). This is not an error — just
-			// mark the writer closed and proceed to read, which will return EOS.
+			// mark the writer closed; the next read will return EOS.
 			input_writer_closed_ = true;
 		}
-	}
+	};
 
 	// Loop to skip log batches (replaces recursive ReadDataBatch call)
 	while (true) {
@@ -798,7 +816,14 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 					fprintf(stderr, "[shm] resolved batch off=%lld len=%lld\n",
 					        (long long)resolved_offset, (long long)resolved->num_rows());
 				}
-				return resolved;
+				// Swap in the resolved batch but DON'T return here — fall through
+				// to the vgi_partition_values#b64 / vgi_batch_index parsing below.
+				// Those keys ride on result.custom_metadata (the worker merges them
+				// onto the pointer batch's metadata in maybe_write_to_shm), so an
+				// early return would silently drop partition values / batch index
+				// for every shm-resolved batch. result.custom_metadata is left
+				// intact precisely because the parsers read from it.
+				result.batch = resolved;
 			}
 			if (std::getenv("VGI_RPC_SHM_DEBUG") && result.batch && result.batch->num_rows() > 0) {
 				fprintf(stderr, "[shm] inline fallback (rows=%lld)\n", (long long)result.batch->num_rows());
@@ -860,6 +885,14 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 				}
 			}
 		}
+
+		// We're committed to returning this data batch. NOW send the next tick —
+		// after FreeAllocation + shm resolve above — so the worker's allocator
+		// never runs concurrently with our header mutation (see the long comment
+		// on send_next_tick near the top of this function). The tick goes out
+		// before we return, so the worker produces the next batch while DuckDB
+		// consumes this one.
+		send_next_tick();
 
 		// In the vgi_rpc protocol, EOS is signaled by the IPC stream closing (null
 		// batch from ReadNext above), not by 0-row batches. 0-row batches are valid
