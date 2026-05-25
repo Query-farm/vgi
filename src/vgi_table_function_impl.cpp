@@ -613,10 +613,14 @@ private:
 			break;
 		}
 		case TableFilterType::BLOOM_FILTER: {
-			throw InvalidInputException(
-			    "VGI filter pushdown failed for worker '%s': BloomFilter cannot be serialized because it contains a "
-			    "large binary buffer from join optimization",
-			    worker_path_);
+			// A BloomFilter is a probabilistic filter the optimizer pushes onto the
+			// probe side of a (semi/hash) join; its large binary buffer can't be put
+			// on the wire. Skip it instead of throwing: the join above the scan still
+			// enforces exact membership, so dropping this redundant optimization never
+			// changes results — it only means the worker isn't pre-filtered. This
+			// mirrors DYNAMIC_FILTER above and the CONJUNCTION_AND/OR handling that
+			// already catches and skips unserializable bloom-filter children.
+			return false;
 		}
 		case TableFilterType::OPTIONAL_FILTER: {
 			auto &optional_filter = filter.Cast<OptionalFilter>();
