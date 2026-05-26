@@ -108,6 +108,7 @@ src/vgi_table_buffering_builders.cpp
 src/vgi_table_buffering_impl.cpp
 src/vgi_catalog_api.cpp
 src/vgi_function_connection.cpp
+src/vgi_client_timing.cpp
 src/vgi_shm_segment.cpp
 src/vgi_cancel_dispatcher.cpp
 src/vgi_worker_pool.cpp

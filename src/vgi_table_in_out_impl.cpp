@@ -1,6 +1,7 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "vgi_table_in_out_impl.hpp"
 #include "vgi_arrow_utils.hpp"
+#include "vgi_client_timing.hpp"
 #include "vgi_cancel_dispatcher.hpp"
 #include "vgi_catalog_api.hpp"
 #include "vgi_function_connection.hpp"
@@ -513,7 +514,14 @@ OperatorResultType VgiTableInOutFunction(ExecutionContext &context, TableFunctio
 	}
 
 	// Convert input DataChunk to Arrow RecordBatch
-	auto input_batch = DataChunkToArrow(client_context, input, bind_data.input_schema);
+	const bool timing = ClientTiming::Enabled();
+	std::shared_ptr<arrow::RecordBatch> input_batch;
+	if (timing) {
+		ScopedNs _t(ClientTiming::Instance().convert_in_ns);
+		input_batch = DataChunkToArrow(client_context, input, bind_data.input_schema);
+	} else {
+		input_batch = DataChunkToArrow(client_context, input, bind_data.input_schema);
+	}
 
 	VGI_LOG(client_context, "table_in_out.write_input",
 	        {{"conn", global_state.connection->GetConnIdHex()},
@@ -522,10 +530,21 @@ OperatorResultType VgiTableInOutFunction(ExecutionContext &context, TableFunctio
 	         {"input_rows", std::to_string(input_batch->num_rows())}});
 
 	// Write the input batch to the worker
-	global_state.connection->WriteInputBatch(input_batch);
+	if (timing) {
+		ScopedNs _t(ClientTiming::Instance().write_ns);
+		global_state.connection->WriteInputBatch(input_batch);
+	} else {
+		global_state.connection->WriteInputBatch(input_batch);
+	}
 
 	// Read output batch (1:1 lockstep in exchange mode)
-	auto output_batch = global_state.connection->ReadDataBatch();
+	std::shared_ptr<arrow::RecordBatch> output_batch;
+	if (timing) {
+		ScopedNs _t(ClientTiming::Instance().read_ns);
+		output_batch = global_state.connection->ReadDataBatch();
+	} else {
+		output_batch = global_state.connection->ReadDataBatch();
+	}
 
 	if (!output_batch) {
 		// EOS - stream exhausted
@@ -541,8 +560,16 @@ OperatorResultType VgiTableInOutFunction(ExecutionContext &context, TableFunctio
 	}
 
 	// Load batch into scan state and produce output
-	LoadBatchIntoScanState(local_state, output_batch);
-	idx_t rows_copied = ProduceOutputFromBatch(local_state, bind_data.arrow_table, output, bind_data.projection_pushdown);
+	idx_t rows_copied;
+	if (timing) {
+		ScopedNs _t(ClientTiming::Instance().convert_out_ns);
+		LoadBatchIntoScanState(local_state, output_batch);
+		rows_copied = ProduceOutputFromBatch(local_state, bind_data.arrow_table, output, bind_data.projection_pushdown);
+		ClientTiming::Instance().batches.fetch_add(1, std::memory_order_relaxed);
+	} else {
+		LoadBatchIntoScanState(local_state, output_batch);
+		rows_copied = ProduceOutputFromBatch(local_state, bind_data.arrow_table, output, bind_data.projection_pushdown);
+	}
 
 	VGI_LOG(client_context, "table_in_out.read_output",
 	        {{"conn", global_state.connection->GetConnIdHex()},

@@ -2,6 +2,7 @@
 #include "vgi_scalar_function_impl.hpp"
 #include "storage/vgi_transaction.hpp"
 #include "vgi_arrow_utils.hpp"
+#include "vgi_client_timing.hpp"
 #include "vgi_catalog_api.hpp"
 #include "vgi_function_connection.hpp"
 #include "vgi_ifunction_connection.hpp"
@@ -481,7 +482,14 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 			to_serialize = &casted_chunk;
 		}
 	}
-	auto input_batch = DataChunkToArrow(context, *to_serialize, local_state.input_schema);
+	const bool timing = ClientTiming::Enabled();
+	std::shared_ptr<arrow::RecordBatch> input_batch;
+	if (timing) {
+		ScopedNs _t(ClientTiming::Instance().convert_in_ns);
+		input_batch = DataChunkToArrow(context, *to_serialize, local_state.input_schema);
+	} else {
+		input_batch = DataChunkToArrow(context, *to_serialize, local_state.input_schema);
+	}
 
 	VGI_LOG(context, "scalar.write_input",
 	        {{"conn", local_state.connection->GetConnIdHex()},
@@ -489,8 +497,18 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 	         {"input_rows", std::to_string(input_batch->num_rows())}});
 
 	// Write input and read output
-	local_state.connection->WriteInputBatch(input_batch);
-	auto output_batch = local_state.connection->ReadDataBatch();
+	std::shared_ptr<arrow::RecordBatch> output_batch;
+	if (timing) {
+		{
+			ScopedNs _t(ClientTiming::Instance().write_ns);
+			local_state.connection->WriteInputBatch(input_batch);
+		}
+		ScopedNs _t(ClientTiming::Instance().read_ns);
+		output_batch = local_state.connection->ReadDataBatch();
+	} else {
+		local_state.connection->WriteInputBatch(input_batch);
+		output_batch = local_state.connection->ReadDataBatch();
+	}
 
 	if (!output_batch) {
 		throw IOException("VGI scalar function '%s' returned no output for %d input rows", func_info.function_name,
@@ -518,18 +536,32 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 	ArrowTableSchema arrow_table;
 	vector<LogicalType> output_types;
 	vector<string> output_names;
-	ArrowSchemaToDuckDBTypes(context, output_batch->schema(), c_schema, arrow_table, output_types, output_names);
+	if (timing) {
+		ScopedNs _t(ClientTiming::Instance().schema_ns);
+		ArrowSchemaToDuckDBTypes(context, output_batch->schema(), c_schema, arrow_table, output_types, output_names);
+	} else {
+		ArrowSchemaToDuckDBTypes(context, output_batch->schema(), c_schema, arrow_table, output_types, output_names);
+	}
 
-	auto chunk_wrapper = make_uniq<ArrowArrayWrapper>();
-	ExportRecordBatch(output_batch, *chunk_wrapper);
-	ArrowScanLocalState scan_state(std::move(chunk_wrapper), context);
+	auto convert_out = [&]() {
+		auto chunk_wrapper = make_uniq<ArrowArrayWrapper>();
+		ExportRecordBatch(output_batch, *chunk_wrapper);
+		ArrowScanLocalState scan_state(std::move(chunk_wrapper), context);
 
-	DataChunk temp_output;
-	temp_output.Initialize(context, {result.GetType()});
-	temp_output.SetCardinality(args.size());
-	ArrowTableFunction::ArrowToDuckDB(scan_state, arrow_table.GetColumns(), temp_output, false);
+		DataChunk temp_output;
+		temp_output.Initialize(context, {result.GetType()});
+		temp_output.SetCardinality(args.size());
+		ArrowTableFunction::ArrowToDuckDB(scan_state, arrow_table.GetColumns(), temp_output, false);
 
-	result.Reference(temp_output.data[0]);
+		result.Reference(temp_output.data[0]);
+	};
+	if (timing) {
+		ScopedNs _t(ClientTiming::Instance().convert_out_ns);
+		convert_out();
+		ClientTiming::Instance().batches.fetch_add(1, std::memory_order_relaxed);
+	} else {
+		convert_out();
+	}
 
 	// For single-row results (constant folding), set vector type to CONSTANT_VECTOR
 	if (args.size() == 1) {
