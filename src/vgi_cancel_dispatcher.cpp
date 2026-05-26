@@ -37,6 +37,7 @@ VgiCancelDispatcher::~VgiCancelDispatcher() {
 		cv_.notify_all();
 	}
 
+	bool detached = false;
 	if (worker_started_.load(std::memory_order_acquire) && worker_.joinable()) {
 		// Detached join with a short deadline: if the worker is stuck
 		// on a slow HTTP call we'd rather drop the cancel than hang
@@ -59,11 +60,24 @@ VgiCancelDispatcher::~VgiCancelDispatcher() {
 			// down so leaked thread is acceptable.
 			worker_.detach();
 			joiner.detach();
+			detached = true;
 		}
 	}
 
-	// Close bot connection after the worker thread is joined/detached.
-	conn_.reset();
+	if (!detached) {
+		// Worker has exited — safe to close the bot connection.
+		conn_.reset();
+	} else {
+		// The detached worker is still inside ProcessOne -> CancelStream ->
+		// HttpPostArrowIpc, which dereferences *conn_->context (and the
+		// DatabaseInstance that ClientContext pins). Freeing conn_ here would
+		// pull that context out from under the running worker — a use-after-free
+		// that crashes in DBConfig::GetHTTPUtil. The process is shutting down,
+		// so intentionally leak the bot connection to keep its context valid for
+		// the detached worker's lifetime. Bounded and benign (matches the
+		// already-leaked worker thread).
+		(void)conn_.release();
+	}
 }
 
 bool VgiCancelDispatcher::Enqueue(CancelRequest req) noexcept {
