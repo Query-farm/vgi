@@ -92,7 +92,7 @@ std::shared_ptr<arrow::Buffer> SerializeRecordBatch(
 	return finish_result.ValueUnsafe();
 }
 
-// Fd-based stream I/O + ReadRecordBatch are the subprocess/AF_UNIX data path
+// Fd-based stream I/O is the subprocess/AF_UNIX data path
 // (raw read/write on a pipe or socket fd). Compiled on POSIX and Windows; the
 // per-syscall split is `#if VGI_POSIX_TRANSPORT … #else (Windows _read/_write)`.
 // HTTP and catalog paths use the buffer-based serialization helpers above, which
@@ -188,8 +188,8 @@ arrow::Status FdOutputStream::Write(const void *data, int64_t nbytes) {
 #if VGI_POSIX_TRANSPORT
 	// Bound: an unresponsive worker that fills its kernel pipe buffer
 	// would otherwise block write() forever. 60s is well above any
-	// realistic RPC payload write time on a healthy worker. Same
-	// pattern as WaitForReadable on the read side.
+	// realistic RPC payload write time on a healthy worker. Mirrors the
+	// fd-readiness wait (WaitForReadableUntilCancel) on the read side.
 	constexpr int kWriteTimeoutSeconds = 60;
 	const auto deadline =
 	    std::chrono::steady_clock::now() + std::chrono::seconds(kWriteTimeoutSeconds);
@@ -268,70 +268,6 @@ arrow::Status FdOutputStream::Write(const void *data, int64_t nbytes) {
 arrow::Status FdOutputStream::Flush() {
 	// File descriptors don't need explicit flushing
 	return arrow::Status::OK();
-}
-
-// Read a single RecordBatch from a file descriptor
-// This reads one complete IPC stream (schema + 1 batch + EOS marker)
-// Returns a result with null batch if the stream is at EOF (pipe closed, no more data)
-arrow::RecordBatchWithMetadata ReadRecordBatch(int fd, const std::string &worker_path, pid_t worker_pid) {
-	// Wait for data to be available with timeout
-	WaitForReadable(fd);
-
-	auto input = std::make_shared<FdInputStream>(fd);
-
-	auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(input);
-	if (!reader_result.ok()) {
-		auto status = reader_result.status();
-		// Invalid status when opening typically indicates EOF (no schema to read)
-		if (status.IsInvalid()) {
-			return arrow::RecordBatchWithMetadata{nullptr, nullptr};
-		}
-		ThrowVgiIOException("Failed to open Arrow IPC stream: %s", worker_path, worker_pid, "", status.ToString());
-	}
-	auto reader = reader_result.ValueUnsafe();
-
-	// Use ReadNext() which returns RecordBatchWithMetadata including custom metadata
-	auto result = reader->ReadNext();
-	if (!result.ok()) {
-		auto status = result.status();
-		// Invalid status typically indicates end-of-stream
-		if (status.IsInvalid()) {
-			return arrow::RecordBatchWithMetadata{nullptr, nullptr};
-		}
-		ThrowVgiIOException("Failed to read Arrow batch: %s", worker_path, worker_pid, "", status.ToString());
-	}
-	auto batch_with_metadata = result.ValueUnsafe();
-
-	// Consume any remaining stream data including EOS marker
-	// This is critical to avoid leaving data in the stream that would confuse the next reader
-	int drain_count = 0;
-	bool debug_ipc = getenv("VGI_IPC_DEBUG") != nullptr;
-	while (true) {
-		auto drain_result = reader->ReadNext();
-		if (!drain_result.ok()) {
-			// Error reading - might be at end of stream
-			if (debug_ipc) {
-				fprintf(stderr, "[VGI_IPC_DEBUG] pid=%d drain error after %d batches: %s\n", worker_pid, drain_count,
-				        drain_result.status().ToString().c_str());
-			}
-			break;
-		}
-		drain_count++;
-		if (!drain_result.ValueUnsafe().batch) {
-			// Null batch means end of stream - this is the expected EOS
-			if (debug_ipc) {
-				fprintf(stderr, "[VGI_IPC_DEBUG] pid=%d drain complete after %d reads (EOS)\n", worker_pid, drain_count);
-			}
-			break;
-		}
-		// Unexpected extra batch - this shouldn't happen for single-batch streams
-		if (debug_ipc) {
-			fprintf(stderr, "[VGI_IPC_DEBUG] pid=%d unexpected extra batch %d with %lld rows\n", worker_pid, drain_count,
-			        drain_result.ValueUnsafe().batch->num_rows());
-		}
-	}
-
-	return batch_with_metadata;
 }
 
 #endif // VGI_SUBPROCESS_TRANSPORT

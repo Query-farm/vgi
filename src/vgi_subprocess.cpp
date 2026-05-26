@@ -315,46 +315,6 @@ void WriteAll(int fd, const uint8_t *data, size_t len) {
 	}
 }
 
-// WaitForReadable implementation - wait for fd to be readable with timeout.
-// Retries on EINTR with deadline-based remaining time calculation.
-void WaitForReadable(int fd, int timeout_seconds) {
-	auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout_seconds);
-
-	while (true) {
-		auto now = std::chrono::steady_clock::now();
-		auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(deadline - now);
-		if (remaining.count() <= 0) {
-			throw IOException("VGI catalog operation timed out after %d seconds", timeout_seconds);
-		}
-
-		// poll() (not select()) so fds >= FD_SETSIZE (1024) — reachable in a
-		// long-lived process with many attachments — don't overrun the fd_set
-		// bit array. Round remaining microseconds up to whole ms (poll's unit)
-		// so we never under-wait the final sub-millisecond slice.
-		struct pollfd pfd;
-		pfd.fd = fd;
-		pfd.events = POLLIN;
-		int timeout_ms = static_cast<int>((remaining.count() + 999) / 1000);
-
-		int result = poll(&pfd, 1, timeout_ms);
-
-		if (result < 0) {
-			if (errno == EINTR) {
-				continue; // Recalculate remaining time and retry
-			}
-			throw IOException("VGI catalog operation failed: poll error: %s", strerror(errno));
-		}
-
-		if (result == 0) {
-			throw IOException("VGI catalog operation timed out after %d seconds", timeout_seconds);
-		}
-
-		// fd is readable (or POLLHUP/POLLERR) — return so the caller's read
-		// observes data or EOF/error.
-		return;
-	}
-}
-
 #elif defined(_WIN32)
 
 // ---------------------------------------------------------------------------
@@ -558,33 +518,6 @@ void WriteAll(int fd, const uint8_t *data, size_t len) {
 	}
 }
 
-void WaitForReadable(int fd, int timeout_seconds) {
-	HANDLE h = reinterpret_cast<HANDLE>(_get_osfhandle(fd));
-	if (h == INVALID_HANDLE_VALUE) {
-		throw IOException("VGI WaitForReadable: invalid file descriptor");
-	}
-	auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout_seconds);
-	while (true) {
-		DWORD avail = 0;
-		if (!PeekNamedPipe(h, nullptr, 0, nullptr, &avail, nullptr)) {
-			// Broken pipe → treat as readable so the following read sees EOF,
-			// matching POSIX select() returning readable at EOF.
-			if (GetLastError() == ERROR_BROKEN_PIPE) {
-				return;
-			}
-			throw IOException("VGI catalog operation failed: PeekNamedPipe error %lu",
-			                  (unsigned long)GetLastError());
-		}
-		if (avail > 0) {
-			return;
-		}
-		if (std::chrono::steady_clock::now() >= deadline) {
-			throw IOException("VGI catalog operation timed out after %d seconds", timeout_seconds);
-		}
-		std::this_thread::sleep_for(std::chrono::milliseconds(5));
-	}
-}
-
 #else // Emscripten (HTTP-only): throwing stubs so worker pool / FunctionConnection link
 
 Pipe::Pipe() {
@@ -621,32 +554,8 @@ bool SubProcess::TryWait(int *exit_status) {
 void WriteAll(int, const uint8_t *, size_t) {
 	throw NotImplementedException("vgi: subprocess transport unavailable in this build");
 }
-void WaitForReadable(int, int) {
-	throw NotImplementedException("vgi: subprocess transport unavailable in this build");
-}
 
 #endif // VGI_POSIX_TRANSPORT / _WIN32 / emscripten
-
-int GetCatalogTimeout(ClientContext *context) {
-	if (context) {
-		Value val;
-		if (context->TryGetCurrentSetting("vgi_catalog_timeout_seconds", val)) {
-			int64_t raw = val.GetValue<int64_t>();
-			// Clamp to a sane range. A non-positive value would make the deadline
-			// already-elapsed on the first iteration (immediate bogus timeout);
-			// a value near INT_MAX overflows the steady_clock deadline math.
-			constexpr int64_t kMinTimeout = 1;
-			constexpr int64_t kMaxTimeout = 86400; // 1 day
-			if (raw < kMinTimeout) {
-				raw = kMinTimeout;
-			} else if (raw > kMaxTimeout) {
-				raw = kMaxTimeout;
-			}
-			return static_cast<int>(raw);
-		}
-	}
-	return CATALOG_OPERATION_TIMEOUT_SECONDS;
-}
 
 #if VGI_POSIX_TRANSPORT
 void WaitForReadableUntilCancel(int fd, ClientContext *context) {

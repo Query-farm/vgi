@@ -130,8 +130,8 @@ UnixSocket UnixSocket::Connect(const std::string &path, std::chrono::millisecond
 	} else if (errno == EINPROGRESS) {
 		// Wait for the socket to become writable, signalling that connect
 		// finished.  ``select()`` (rather than poll) keeps the dependency
-		// surface aligned with the rest of vgi, which already uses it via
-		// ``WaitForReadable``.
+		// surface aligned with the rest of vgi, which already uses it (e.g.
+		// the FdOutputStream write-side readiness wait).
 		fd_set wfds;
 		FD_ZERO(&wfds);
 		FD_SET(raw_fd, &wfds);

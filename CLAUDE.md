@@ -221,7 +221,8 @@ plus the shm-aware code paths in `src/vgi_function_connection.cpp`
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
-| `vgi_catalog_timeout_seconds` | BIGINT | 5 | Timeout for catalog RPC operations |
+| `vgi_http_timeout_seconds` | BIGINT | 300 | Timeout for HTTP requests (catalog, init, exchange). Generous because HTTP workers may do heavy server-side compute per request |
+| `vgi_oauth_timeout_seconds` | BIGINT | 120 | Window for a human to complete device-code / browser OAuth. Further capped by the provider's `expires_in` |
 | `vgi_worker_pool_idle_limit_seconds` | BIGINT | 5 | Max idle time before pooled workers are removed |
 | `vgi_worker_pool_max` | BIGINT | 256 | Max workers in pool (0 = disabled) |
 | `vgi_join_keys_limit` | UBIGINT | 100000 | Max distinct join key values pushed to VGI workers (0 = disabled) |

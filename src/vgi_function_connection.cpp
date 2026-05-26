@@ -1294,8 +1294,7 @@ FunctionConnection::RpcTableBufferingProcess(const std::string &function_name,
 #endif
 	vgi::WriteRpcRequest(proc_->GetStdinFd(), "table_buffering_process", process_params, process_meta);
 	auto response = vgi::ReadUnaryResponse(proc_->GetStdoutFd(), &context_, worker_path_, proc_->GetPid(),
-	                                       GetExecutionIdHex(), GetAttachOpaqueDataHex(), "", GetConnIdHex(),
-	                                       /*block_until_cancel=*/true);
+	                                       GetExecutionIdHex(), GetAttachOpaqueDataHex(), "", GetConnIdHex());
 #if VGI_POSIX_TRANSPORT
 	ResolveUnaryShm(shm_segment_.get(), response);
 #endif
@@ -1318,8 +1317,7 @@ FunctionConnection::RpcTableBufferingCombine(const std::string &function_name,
 	vgi::ValidateRequestSchema(rpc_params, "table_buffering_combine", worker_path_);
 	vgi::WriteRpcRequest(proc_->GetStdinFd(), "table_buffering_combine", rpc_params);
 	auto response = vgi::ReadUnaryResponse(proc_->GetStdoutFd(), &context_, worker_path_, proc_->GetPid(),
-	                                       GetExecutionIdHex(), GetAttachOpaqueDataHex(), "", GetConnIdHex(),
-	                                       /*block_until_cancel=*/true);
+	                                       GetExecutionIdHex(), GetAttachOpaqueDataHex(), "", GetConnIdHex());
 #if VGI_POSIX_TRANSPORT
 	ResolveUnaryShm(shm_segment_.get(), response);
 #endif
@@ -1348,8 +1346,7 @@ void FunctionConnection::RpcTableBufferingDestructor(const std::string &function
 	vgi::ValidateRequestSchema(rpc_params, "table_buffering_destructor", worker_path_);
 	vgi::WriteRpcRequest(proc_->GetStdinFd(), "table_buffering_destructor", rpc_params);
 	auto response = vgi::ReadUnaryResponse(proc_->GetStdoutFd(), &context_, worker_path_, proc_->GetPid(),
-	                                       GetExecutionIdHex(), GetAttachOpaqueDataHex(), "", GetConnIdHex(),
-	                                       /*block_until_cancel=*/true);
+	                                       GetExecutionIdHex(), GetAttachOpaqueDataHex(), "", GetConnIdHex());
 #if VGI_POSIX_TRANSPORT
 	ResolveUnaryShm(shm_segment_.get(), response);
 #endif

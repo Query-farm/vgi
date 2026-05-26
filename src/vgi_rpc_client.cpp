@@ -95,7 +95,7 @@ static bool DispatchBatch(const std::shared_ptr<arrow::RecordBatch> &batch,
 // ============================================================================
 //
 // The fd-based request/response functions below are the subprocess/AF_UNIX wire
-// path (FdOutputStream/FdInputStream + WaitForReadable on a pipe/socket fd) — now
+// path (FdOutputStream/FdInputStream + WaitForReadableUntilCancel on a pipe/socket fd) — now
 // cross-platform (POSIX + Windows) via the fd I/O layer. HTTP transport uses the
 // buffer-based equivalents further down. See vgi_platform.hpp.
 #if VGI_SUBPROCESS_TRANSPORT
@@ -163,17 +163,15 @@ UnaryResponseResult ReadUnaryResponse(int fd, ClientContext *context,
                                       const std::string &invocation_id_hex,
                                       const std::string &attach_opaque_data_hex,
                                       const std::string &transaction_opaque_data_hex,
-                                      const std::string &conn_id_hex,
-                                      bool block_until_cancel) {
-	// Data-phase callers (table_buffering_*) block until either the worker
-	// speaks or the query is cancelled — no wall-clock deadline. Catalog
-	// callers use the bounded catalog timeout so a wedged worker doesn't
-	// hang the planner.
-	if (block_until_cancel) {
-		WaitForReadableUntilCancel(fd, context);
-	} else {
-		WaitForReadable(fd, GetCatalogTimeout(context));
-	}
+                                      const std::string &conn_id_hex) {
+	// Block until the worker speaks or the query is cancelled — no wall-clock
+	// deadline. Cancellation comes via the context's `interrupted` flag
+	// (Ctrl-C / query cancel), polled every 250ms. This covers both data-phase
+	// RPCs (table_buffering_*) and catalog RPCs: a wedged worker is broken out
+	// of by cancellation, while a legitimately-slow response (cold worker
+	// start, large catalog, slow upstream) is never killed by an arbitrary
+	// deadline.
+	WaitForReadableUntilCancel(fd, context);
 
 	auto input = std::make_shared<FdInputStream>(fd);
 	auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(input);
@@ -239,8 +237,9 @@ UnaryResponseResult ReadUnaryResponse(int fd, ClientContext *context,
 
 StreamHeaderResult ReadStreamHeader(int fd, ClientContext *context,
                                     const std::string &worker_path, pid_t worker_pid) {
-	// Wait for data to be available
-	WaitForReadable(fd, GetCatalogTimeout(context));
+	// Block until the worker speaks or the query is cancelled (Ctrl-C),
+	// polled every 250ms — no arbitrary wall-clock deadline.
+	WaitForReadableUntilCancel(fd, context);
 
 	auto input = std::make_shared<FdInputStream>(fd);
 	auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(input);

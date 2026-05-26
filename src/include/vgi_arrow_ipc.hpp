@@ -95,13 +95,6 @@ private:
 	bool is_open_;
 };
 
-// Read a single RecordBatch from a file descriptor (Arrow IPC stream format)
-// Returns RecordBatchWithMetadata containing both the batch and any custom metadata.
-// NOTE: This creates a new stream reader each time.
-// Optional worker_path and worker_pid are included in exception messages for debugging.
-arrow::RecordBatchWithMetadata ReadRecordBatch(int fd, const std::string &worker_path = "",
-                                               pid_t worker_pid = -1);
-
 // Extract string values from a result batch column
 std::vector<std::string> ExtractStringColumn(const std::shared_ptr<arrow::RecordBatch> &batch,
                                              const std::string &column_name = "value");

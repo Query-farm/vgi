@@ -1423,11 +1423,6 @@ static void LoadInternal(ExtensionLoader &loader) {
 		}
 	}
 
-	// Register catalog timeout setting (used for subprocess transport)
-	config.AddExtensionOption("vgi_catalog_timeout_seconds",
-	                          "Timeout in seconds for VGI subprocess catalog operations (list schemas, functions, etc.)",
-	                          LogicalType::BIGINT, Value::BIGINT(vgi::CATALOG_OPERATION_TIMEOUT_SECONDS));
-
 	// Register HTTP timeout setting
 	config.AddExtensionOption("vgi_http_timeout_seconds",
 	                          "Timeout in seconds for VGI HTTP requests (catalog, init, and exchange operations)",

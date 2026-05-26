@@ -148,22 +148,11 @@ protected:
 // Helper to write all bytes to a file descriptor
 void WriteAll(int fd, const uint8_t *data, size_t len);
 
-// Default timeout for catalog operations (30 seconds)
-constexpr int CATALOG_OPERATION_TIMEOUT_SECONDS = 30;
-
-// Wait for a file descriptor to become readable with a timeout.
-// Returns true if readable, throws IOException on timeout or error.
-void WaitForReadable(int fd, int timeout_seconds = CATALOG_OPERATION_TIMEOUT_SECONDS);
-
 } // namespace vgi
 
 class ClientContext;
 
 namespace vgi {
-// Get the catalog operation timeout from client context settings.
-// Returns CATALOG_OPERATION_TIMEOUT_SECONDS if context is null or setting is not found.
-int GetCatalogTimeout(ClientContext *context);
-
 // Wait for a file descriptor to become readable, polling the context's
 // `interrupted` flag every 250ms so a user Ctrl-C breaks out of long blocking
 // reads. No deadline — used by data-phase RPCs (table_buffering_*) that can
