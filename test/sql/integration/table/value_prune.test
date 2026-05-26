@@ -1,0 +1,140 @@
+# name: test/sql/integration/table/value_prune.test
+# description: End-to-end coverage for PushdownFilters.get_column_values() — the
+#              partition-pruning accessor. The value_prune fixture resolves the
+#              discrete value set for `n` up front and echoes it in the
+#              `resolved` column, so the accessor's behaviour is directly
+#              observable (independent of any residual filtering). Pins the
+#              AND-descent and OR-union fixes: `n IN (...) AND n>=min AND n<=max`
+#              (an AndFilter, as DuckDB pushes from a semi-join) and `n=a OR n=b`
+#              (an OrFilter) must resolve to the discrete set, while a
+#              non-enumerable predicate (bare range, or an OR with a range
+#              branch) must fall back to "(scan)" rather than a wrong subset.
+# group: [vgi_integration_table]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# No filter -> not enumerable -> "(scan)" (emits all candidate rows)
+# ============================================================================
+
+query T
+SELECT DISTINCT resolved FROM example.value_prune(5);
+----
+(scan)
+
+query I
+SELECT COUNT(*) FROM example.value_prune(5);
+----
+5
+
+# ============================================================================
+# Equality -> single discrete value
+# ============================================================================
+
+query T
+SELECT DISTINCT resolved FROM example.value_prune(100) WHERE n = 42;
+----
+42
+
+query I
+SELECT n FROM example.value_prune(100) WHERE n = 42;
+----
+42
+
+# ============================================================================
+# Literal IN -> bare InFilter, resolved directly
+# ============================================================================
+
+query T
+SELECT DISTINCT resolved FROM example.value_prune(100) WHERE n IN (5, 50, 95);
+----
+5,50,95
+
+query I
+SELECT n FROM example.value_prune(100) WHERE n IN (5, 50, 95) ORDER BY n;
+----
+5
+50
+95
+
+# ============================================================================
+# AND-descent: a semi-join pushes `n IN (...) AND n>=min AND n<=max` as a single
+# AndFilter. get_column_values must descend into it (this is the broken3 shape).
+# Before the fix this collapsed to "(scan)" and fanned out to a full scan.
+# ============================================================================
+
+query T
+SELECT DISTINCT resolved FROM example.value_prune(100)
+WHERE n IN (SELECT x FROM (VALUES (5), (50), (95)) v(x));
+----
+5,50,95
+
+query I
+SELECT n FROM example.value_prune(100)
+WHERE n IN (SELECT x FROM (VALUES (5), (50), (95)) v(x)) ORDER BY n;
+----
+5
+50
+95
+
+# ============================================================================
+# OR-union: `n = a OR n = b` is an OrFilter of equalities. Every branch pins the
+# column to a discrete value, so the resolved set is their union.
+# ============================================================================
+
+query T
+SELECT DISTINCT resolved FROM example.value_prune(100) WHERE n = 2 OR n = 7;
+----
+2,7
+
+query I
+SELECT n FROM example.value_prune(100) WHERE n = 2 OR n = 7 ORDER BY n;
+----
+2
+7
+
+# ============================================================================
+# OR with a non-discrete (range) branch -> NOT enumerable -> "(scan)".
+# Returning a subset here would drop the range branch's rows; the fallback must
+# be a full scan (auto-apply still yields the correct rows).
+# ============================================================================
+
+query T
+SELECT DISTINCT resolved FROM example.value_prune(100) WHERE n < 2 OR n > 97;
+----
+(scan)
+
+query I
+SELECT n FROM example.value_prune(100) WHERE n < 2 OR n > 97 ORDER BY n;
+----
+0
+1
+98
+99
+
+# ============================================================================
+# Pure range AND (no equality / IN) -> not enumerable -> "(scan)", rows still
+# correct via auto-apply.
+# ============================================================================
+
+query T
+SELECT DISTINCT resolved FROM example.value_prune(20) WHERE n > 5 AND n < 9;
+----
+(scan)
+
+query I
+SELECT n FROM example.value_prune(20) WHERE n > 5 AND n < 9 ORDER BY n;
+----
+6
+7
+8
+
+statement ok
+DETACH example;

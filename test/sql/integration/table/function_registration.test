@@ -36,14 +36,15 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 # 3 ordering-knob fixtures (ordered_buffer_input, batch_index_buffer_input,
 # ordered_source) +
 # 2 cancel/pushdown probes (slow_cancellable_buffering, echo_buffering) +
-# 1 projection-pushdown witness (echo_witness)
-# = 80
+# 1 projection-pushdown witness (echo_witness) +
+# 1 get_column_values pruning probe (value_prune)
+# = 81
 query I
 SELECT COUNT(*)
 FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'table';
 ----
-80
+81
 
 # The 33 pure table functions (no TABLE parameter type)
 # Note: make_series appears 5 times (5 overloads), make_pairs appears 3 times,
