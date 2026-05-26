@@ -57,6 +57,101 @@ const std::string &FunctionConnectionParams::implementation_version() const {
 
 namespace {
 
+#if VGI_POSIX_TRANSPORT
+// Recursively true if any field in the type tree is dictionary-encoded (DuckDB
+// ENUMs). Dict inputs are kept inline: the worker resolves inbound params with a
+// null DictionaryProvider, so a dict batch couldn't be decoded — matching the
+// worker's outbound emit policy, which also skips dicts.
+bool TypeHasDictionary(const std::shared_ptr<arrow::DataType> &type) {
+	if (type->id() == arrow::Type::DICTIONARY) {
+		return true;
+	}
+	for (const auto &child : type->fields()) {
+		if (TypeHasDictionary(child->type())) {
+			return true;
+		}
+	}
+	return false;
+}
+
+bool SchemaHasDictionary(const arrow::Schema &schema) {
+	for (const auto &field : schema.fields()) {
+		if (TypeHasDictionary(field->type())) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// Client→worker shm offload. If a segment is attached and `batch` is eligible
+// (non-empty, non-dict) and fits, write its IPC bytes into the segment and
+// return a 0-row pointer batch plus {shm_offset, shm_length} metadata to send in
+// its place. Otherwise returns {nullptr, nullptr} → caller sends `batch` inline.
+//
+// `wire_schema` is the schema the worker expects on the wire — for the streaming
+// input path it's the bind-time input schema the inline writer was opened with,
+// which can differ from batch->schema() (e.g. TIMESTAMP_TZ tz normalization).
+// We serialize the batch's buffers under wire_schema exactly as the inline
+// input_writer_ does (a lenient write), so the worker reads back the schema it
+// declared and doesn't try (and fail) to cast the resolved batch.
+//
+// Mirrors vgi_rpc/shm.py maybe_write_to_shm and the Java worker's
+// ShmResolver.maybeWriteToShm; the worker frees the slot once it resolves the
+// pointer (client allocates → worker frees).
+std::pair<std::shared_ptr<arrow::RecordBatch>, std::shared_ptr<arrow::KeyValueMetadata>>
+MaybeWriteBatchToShm(VgiShmSegment *shm, const std::shared_ptr<arrow::RecordBatch> &batch,
+                     const std::shared_ptr<arrow::Schema> &wire_schema) {
+	if (!shm || !batch || !wire_schema || batch->num_rows() == 0 || SchemaHasDictionary(*wire_schema)) {
+		return {nullptr, nullptr};
+	}
+	// Build the 0-row pointer batch first (before allocating) so a failure here
+	// can't leak a segment allocation.
+	std::vector<std::shared_ptr<arrow::Array>> empty_columns;
+	empty_columns.reserve(wire_schema->num_fields());
+	for (const auto &field : wire_schema->fields()) {
+		auto empty = arrow::MakeEmptyArray(field->type());
+		if (!empty.ok()) {
+			return {nullptr, nullptr};
+		}
+		empty_columns.push_back(empty.ValueUnsafe());
+	}
+
+	// Serialize batch under wire_schema → full IPC stream (schema + batch + EOS).
+	auto sink_result = arrow::io::BufferOutputStream::Create();
+	if (!sink_result.ok()) {
+		return {nullptr, nullptr};
+	}
+	auto sink = sink_result.ValueUnsafe();
+	auto writer_result = arrow::ipc::MakeStreamWriter(sink, wire_schema);
+	if (!writer_result.ok()) {
+		return {nullptr, nullptr};
+	}
+	auto writer = writer_result.ValueUnsafe();
+	if (!writer->WriteRecordBatch(*batch).ok() || !writer->Close().ok()) {
+		return {nullptr, nullptr};
+	}
+	auto finish_result = sink->Finish();
+	if (!finish_result.ok()) {
+		return {nullptr, nullptr};
+	}
+	auto bytes = finish_result.ValueUnsafe();
+
+	auto offset = shm->AllocateAndWrite(bytes->data(), static_cast<size_t>(bytes->size()));
+	if (!offset) {
+		return {nullptr, nullptr}; // segment / alloc-table full → inline fallback
+	}
+	auto pointer = arrow::RecordBatch::Make(wire_schema, 0, std::move(empty_columns));
+	auto metadata = arrow::KeyValueMetadata::Make(
+	    {std::string(SHM_OFFSET_KEY), std::string(SHM_LENGTH_KEY)},
+	    {std::to_string(*offset), std::to_string(static_cast<uint64_t>(bytes->size()))});
+	if (std::getenv("VGI_RPC_SHM_DEBUG")) {
+		fprintf(stderr, "[shm] wrote input off=%llu len=%lld\n",
+		        static_cast<unsigned long long>(*offset), static_cast<long long>(bytes->size()));
+	}
+	return {pointer, metadata};
+}
+#endif // VGI_POSIX_TRANSPORT
+
 // Internal: build a fresh FunctionConnection using the HTTP/subprocess factory.
 std::unique_ptr<IFunctionConnection> CreateFreshConnection(ClientContext &context,
                                                             const FunctionConnectionParams &params) {
@@ -999,8 +1094,23 @@ void FunctionConnection::WriteInputBatch(const std::shared_ptr<arrow::RecordBatc
 		reconciled = ReconcileBatchToSchema(batch, input_schema_);
 	}
 
-	// Write the batch (no protocol state metadata in vgi_rpc protocol)
-	auto write_status = input_writer_->WriteRecordBatch(*reconciled);
+	// Offload large non-dict inputs to the shared-memory segment: write the
+	// batch's IPC bytes into the segment and send a 0-row pointer batch
+	// (carrying shm_offset/shm_length) in its place. The worker resolves it and
+	// frees the slot. Falls back to writing the batch inline.
+	auto to_write = reconciled;
+	std::shared_ptr<arrow::KeyValueMetadata> write_meta;
+#if VGI_POSIX_TRANSPORT
+	// Serialize under input_schema_ — the schema input_writer_ declares on the
+	// wire — so the worker reads back exactly what it expects (no cast).
+	if (auto [pointer, shm_meta] = MaybeWriteBatchToShm(shm_segment_.get(), reconciled, input_schema_); pointer) {
+		to_write = pointer;
+		write_meta = shm_meta;
+	}
+#endif
+
+	auto write_status = write_meta ? input_writer_->WriteRecordBatch(*to_write, write_meta)
+	                               : input_writer_->WriteRecordBatch(*to_write);
 	if (!write_status.ok()) {
 		ThrowVgiIOException("Failed to write input batch: %s", worker_path_, proc_ ? proc_->GetPid() : -1,
 		                    GetExecutionIdHex(), write_status.ToString());
@@ -1089,6 +1199,35 @@ namespace {
 // Inner-request builders live in vgi_table_buffering_builders.cpp and are
 // shared with the HTTP transport. We reach them through ::duckdb::vgi::.
 
+#if VGI_POSIX_TRANSPORT
+// Resolve a shm pointer batch returned by a *unary* RPC response in place.
+// The worker offloads large non-dict responses to the shared-memory segment
+// exactly as it does for streaming scan output; the only difference is the
+// read path. Mirrors the ReadDataBatch resolution but frees immediately:
+// each unary call is request→response→decode, and under the lockstep RPC
+// protocol the worker stays blocked on the next request until we send it, so
+// the resolved batch's view into the segment remains valid through decode
+// even though its allocation is already freed (FreeAllocation only edits the
+// allocator header; the bytes survive until the worker's next write).
+void ResolveUnaryShm(VgiShmSegment *shm, UnaryResponseResult &response) {
+	if (!shm || !response.batch) {
+		return;
+	}
+	int64_t resolved_offset = -1;
+	auto resolved = shm->MaybeResolveBatch(response.batch, response.metadata, &resolved_offset);
+	if (resolved) {
+		response.batch = resolved;
+		if (resolved_offset >= 0) {
+			shm->FreeAllocation(static_cast<uint64_t>(resolved_offset));
+		}
+		if (std::getenv("VGI_RPC_SHM_DEBUG")) {
+			fprintf(stderr, "[shm] resolved unary response off=%lld rows=%lld\n",
+			        (long long)resolved_offset, (long long)response.batch->num_rows());
+		}
+	}
+}
+#endif // VGI_POSIX_TRANSPORT
+
 // Decode the outer-envelope response into the registered result schema.
 // The 'result' column of the outer envelope is a binary blob containing
 // the IPC-serialized inner RecordBatch (matches what the worker emits).
@@ -1131,10 +1270,28 @@ FunctionConnection::RpcTableBufferingProcess(const std::string &function_name,
 	auto rpc_params = vgi::BuildTableBufferingProcessInner(function_name, execution_id, batch_bytes,
 	                                                          attach_opaque_data_, batch_index);
 	vgi::ValidateRequestSchema(rpc_params, "table_buffering_process", worker_path_);
-	vgi::WriteRpcRequest(proc_->GetStdinFd(), "table_buffering_process", rpc_params);
+	// The params batch embeds the (potentially large) input batch bytes; offload
+	// it to shm when a segment is attached. The 0-row pointer goes inline and
+	// WriteRpcRequest still stamps the method/version metadata onto it, so the
+	// worker reads method + shm_offset off the pointer and resolves the params.
+	auto process_params = rpc_params;
+	std::shared_ptr<arrow::KeyValueMetadata> process_meta;
+#if VGI_POSIX_TRANSPORT
+	// WriteRpcRequest opens the request stream with the params batch's own
+	// schema, so that's the wire schema here.
+	if (auto [pointer, shm_meta] = MaybeWriteBatchToShm(shm_segment_.get(), rpc_params, rpc_params->schema());
+	    pointer) {
+		process_params = pointer;
+		process_meta = shm_meta;
+	}
+#endif
+	vgi::WriteRpcRequest(proc_->GetStdinFd(), "table_buffering_process", process_params, process_meta);
 	auto response = vgi::ReadUnaryResponse(proc_->GetStdoutFd(), &context_, worker_path_, proc_->GetPid(),
 	                                       GetExecutionIdHex(), GetAttachOpaqueDataHex(), "", GetConnIdHex(),
 	                                       /*block_until_cancel=*/true);
+#if VGI_POSIX_TRANSPORT
+	ResolveUnaryShm(shm_segment_.get(), response);
+#endif
 	auto inner = DecodeOuterResponse(response, "table_buffering_process", worker_path_);
 	vgi::ValidateResponseSchema(inner, "table_buffering_process", worker_path_);
 	if (!inner || inner->num_rows() == 0) {
@@ -1156,6 +1313,9 @@ FunctionConnection::RpcTableBufferingCombine(const std::string &function_name,
 	auto response = vgi::ReadUnaryResponse(proc_->GetStdoutFd(), &context_, worker_path_, proc_->GetPid(),
 	                                       GetExecutionIdHex(), GetAttachOpaqueDataHex(), "", GetConnIdHex(),
 	                                       /*block_until_cancel=*/true);
+#if VGI_POSIX_TRANSPORT
+	ResolveUnaryShm(shm_segment_.get(), response);
+#endif
 	auto inner = DecodeOuterResponse(response, "table_buffering_combine", worker_path_);
 	vgi::ValidateResponseSchema(inner, "table_buffering_combine", worker_path_);
 	if (!inner || inner->num_rows() == 0) {
@@ -1183,6 +1343,9 @@ void FunctionConnection::RpcTableBufferingDestructor(const std::string &function
 	auto response = vgi::ReadUnaryResponse(proc_->GetStdoutFd(), &context_, worker_path_, proc_->GetPid(),
 	                                       GetExecutionIdHex(), GetAttachOpaqueDataHex(), "", GetConnIdHex(),
 	                                       /*block_until_cancel=*/true);
+#if VGI_POSIX_TRANSPORT
+	ResolveUnaryShm(shm_segment_.get(), response);
+#endif
 	auto inner = DecodeOuterResponse(response, "table_buffering_destructor", worker_path_);
 	vgi::ValidateResponseSchema(inner, "table_buffering_destructor", worker_path_);
 }

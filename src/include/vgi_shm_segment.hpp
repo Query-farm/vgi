@@ -23,6 +23,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 
 #include <arrow/record_batch.h>
@@ -85,6 +86,16 @@ public:
 	// the allocator fills monotonically and the worker silently falls back
 	// to inline transport once the segment is full.
 	void FreeAllocation(uint64_t offset);
+
+	// First-fit allocate `len` bytes and copy `data` into the segment, the
+	// inverse of FreeAllocation. Used for the client→worker direction: the
+	// client writes a request/input batch's IPC bytes into the segment and
+	// sends a 0-row pointer batch in their place; the worker resolves it and
+	// FreeAllocation()s the slot. Returns the absolute offset, or nullopt when
+	// the segment (or the 4094-entry alloc table) is full — caller then falls
+	// back to inline transport. Lockstep guarantees the worker isn't
+	// mid-allocate while we mutate the header here.
+	std::optional<uint64_t> AllocateAndWrite(const uint8_t *data, size_t len);
 
 	// If `custom_metadata` carries SHM_OFFSET_KEY (i.e. the batch is a
 	// shm pointer batch), parse the IPC bytes from the segment and return

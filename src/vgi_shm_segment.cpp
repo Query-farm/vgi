@@ -267,6 +267,53 @@ void VgiShmSegment::FreeAllocation(uint64_t offset) {
 	// Unknown offset — nothing to free. Silent no-op.
 }
 
+std::optional<uint64_t> VgiShmSegment::AllocateAndWrite(const uint8_t *data, size_t len) {
+	// First-fit allocate, the inverse of FreeAllocation. Mirrors
+	// ShmAllocator.allocate in vgi_rpc/shm.py: scan the sorted (offset,length)
+	// entries for the first gap >= len starting at HEADER_SIZE, insert the new
+	// entry keeping the table sorted, then memcpy the bytes in. Lockstep
+	// guarantees the worker isn't mutating the header concurrently.
+	if (!base_ || len == 0) {
+		return std::nullopt;
+	}
+	uint32_t num = LoadU32LE(base_ + 16);
+	if (num > VGI_SHM_MAX_ALLOCS) {
+		throw IOException("VgiShmSegment: corrupt header num_allocs=" + std::to_string(num) +
+		                  " exceeds max " + std::to_string(VGI_SHM_MAX_ALLOCS));
+	}
+	if (num >= VGI_SHM_MAX_ALLOCS) {
+		return std::nullopt; // allocation table full → caller falls back to inline
+	}
+	uint8_t *entries = base_ + 24;
+	uint64_t cursor = VGI_SHM_HEADER_SIZE;
+	uint32_t ins = num; // default: append after the last entry
+	for (uint32_t i = 0; i < num; i++) {
+		uint64_t entry_off = LoadU64LE(entries + i * 16);
+		uint64_t entry_len = LoadU64LE(entries + i * 16 + 8);
+		if (entry_off >= cursor && entry_off - cursor >= len) {
+			ins = i; // fits in the gap before entry i
+			break;
+		}
+		uint64_t end = entry_off + entry_len;
+		if (end > cursor) {
+			cursor = end;
+		}
+	}
+	if (cursor + len > size_) {
+		return std::nullopt; // no contiguous gap large enough → inline fallback
+	}
+	// Make room at `ins` and write the new (offset,length) entry, keeping the
+	// table sorted by offset so the next first-fit scan stays correct.
+	if (ins < num) {
+		std::memmove(entries + (ins + 1) * 16, entries + ins * 16, (num - ins) * 16);
+	}
+	StoreU64LE(entries + ins * 16, cursor);
+	StoreU64LE(entries + ins * 16 + 8, static_cast<uint64_t>(len));
+	StoreU32LE(base_ + 16, num + 1);
+	std::memcpy(base_ + cursor, data, len);
+	return cursor;
+}
+
 std::shared_ptr<arrow::RecordBatch>
 VgiShmSegment::MaybeResolveBatch(const std::shared_ptr<arrow::RecordBatch> &batch,
                                  const std::shared_ptr<arrow::KeyValueMetadata> &custom_metadata,
