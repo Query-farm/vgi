@@ -116,12 +116,29 @@ MaybeWriteBatchToShm(VgiShmSegment *shm, const std::shared_ptr<arrow::RecordBatc
 		empty_columns.push_back(empty.ValueUnsafe());
 	}
 
-	// Serialize batch under wire_schema → full IPC stream (schema + batch + EOS).
-	auto sink_result = arrow::io::BufferOutputStream::Create();
-	if (!sink_result.ok()) {
-		return {nullptr, nullptr};
+	// Serialize the batch under wire_schema as a full IPC stream (schema +
+	// batch + EOS) *directly into the segment*, avoiding the temp-heap-buffer +
+	// memcpy double-copy. Two passes over the writer: a MockOutputStream pass
+	// computes the exact framed size without touching payload bytes, then we
+	// reserve that slot and a FixedSizeBufferWriter writes the real bytes once,
+	// straight into shm. IPC framing is deterministic for a fixed batch+schema,
+	// so the second pass produces exactly `total` bytes.
+	auto size_sink = std::make_shared<arrow::io::MockOutputStream>();
+	{
+		auto w = arrow::ipc::MakeStreamWriter(size_sink, wire_schema);
+		if (!w.ok() || !w.ValueUnsafe()->WriteRecordBatch(*batch).ok() ||
+		    !w.ValueUnsafe()->Close().ok()) {
+			return {nullptr, nullptr};
+		}
 	}
-	auto sink = sink_result.ValueUnsafe();
+	const int64_t total = size_sink->GetExtentBytesWritten();
+
+	auto offset = shm->Allocate(static_cast<size_t>(total));
+	if (!offset) {
+		return {nullptr, nullptr}; // segment / alloc-table full → inline fallback
+	}
+	auto slot = std::make_shared<arrow::MutableBuffer>(shm->MutableData(*offset), total);
+	auto sink = std::make_shared<arrow::io::FixedSizeBufferWriter>(slot);
 	auto writer_result = arrow::ipc::MakeStreamWriter(sink, wire_schema);
 	if (!writer_result.ok()) {
 		return {nullptr, nullptr};
@@ -130,23 +147,13 @@ MaybeWriteBatchToShm(VgiShmSegment *shm, const std::shared_ptr<arrow::RecordBatc
 	if (!writer->WriteRecordBatch(*batch).ok() || !writer->Close().ok()) {
 		return {nullptr, nullptr};
 	}
-	auto finish_result = sink->Finish();
-	if (!finish_result.ok()) {
-		return {nullptr, nullptr};
-	}
-	auto bytes = finish_result.ValueUnsafe();
-
-	auto offset = shm->AllocateAndWrite(bytes->data(), static_cast<size_t>(bytes->size()));
-	if (!offset) {
-		return {nullptr, nullptr}; // segment / alloc-table full → inline fallback
-	}
 	auto pointer = arrow::RecordBatch::Make(wire_schema, 0, std::move(empty_columns));
 	auto metadata = arrow::KeyValueMetadata::Make(
 	    {std::string(SHM_OFFSET_KEY), std::string(SHM_LENGTH_KEY)},
-	    {std::to_string(*offset), std::to_string(static_cast<uint64_t>(bytes->size()))});
+	    {std::to_string(*offset), std::to_string(static_cast<uint64_t>(total))});
 	if (std::getenv("VGI_RPC_SHM_DEBUG")) {
-		fprintf(stderr, "[shm] wrote input off=%llu len=%lld\n",
-		        static_cast<unsigned long long>(*offset), static_cast<long long>(bytes->size()));
+		fprintf(stderr, "[shm] wrote input off=%llu len=%lld (direct)\n",
+		        static_cast<unsigned long long>(*offset), static_cast<long long>(total));
 	}
 	return {pointer, metadata};
 }

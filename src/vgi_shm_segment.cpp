@@ -267,12 +267,13 @@ void VgiShmSegment::FreeAllocation(uint64_t offset) {
 	// Unknown offset — nothing to free. Silent no-op.
 }
 
-std::optional<uint64_t> VgiShmSegment::AllocateAndWrite(const uint8_t *data, size_t len) {
+std::optional<uint64_t> VgiShmSegment::Allocate(size_t len) {
 	// First-fit allocate, the inverse of FreeAllocation. Mirrors
 	// ShmAllocator.allocate in vgi_rpc/shm.py: scan the sorted (offset,length)
 	// entries for the first gap >= len starting at HEADER_SIZE, insert the new
-	// entry keeping the table sorted, then memcpy the bytes in. Lockstep
-	// guarantees the worker isn't mutating the header concurrently.
+	// entry keeping the table sorted. Reserves the slot only; the caller copies
+	// or serializes its bytes into MutableData(offset). Lockstep guarantees the
+	// worker isn't mutating the header concurrently.
 	if (!base_ || len == 0) {
 		return std::nullopt;
 	}
@@ -310,8 +311,15 @@ std::optional<uint64_t> VgiShmSegment::AllocateAndWrite(const uint8_t *data, siz
 	StoreU64LE(entries + ins * 16, cursor);
 	StoreU64LE(entries + ins * 16 + 8, static_cast<uint64_t>(len));
 	StoreU32LE(base_ + 16, num + 1);
-	std::memcpy(base_ + cursor, data, len);
 	return cursor;
+}
+
+std::optional<uint64_t> VgiShmSegment::AllocateAndWrite(const uint8_t *data, size_t len) {
+	auto offset = Allocate(len);
+	if (offset) {
+		std::memcpy(base_ + *offset, data, len);
+	}
+	return offset;
 }
 
 std::shared_ptr<arrow::RecordBatch>

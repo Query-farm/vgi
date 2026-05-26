@@ -97,6 +97,21 @@ public:
 	// mid-allocate while we mutate the header here.
 	std::optional<uint64_t> AllocateAndWrite(const uint8_t *data, size_t len);
 
+	// Reserve `len` bytes and return the absolute offset *without* copying any
+	// data — the caller writes straight into MutableData(offset). Lets a
+	// producer serialize an Arrow IPC stream directly into the segment instead
+	// of into a temp heap buffer that then has to be memcpy'd in (the
+	// AllocateAndWrite double-copy). Same first-fit allocator + header ops as
+	// AllocateAndWrite; nullopt when the segment / alloc table is full.
+	std::optional<uint64_t> Allocate(size_t len);
+
+	// Writable pointer to a region previously reserved by Allocate(). Only
+	// valid for [offset, offset+len) of that reservation; lockstep guarantees
+	// the worker isn't reading it until the pointer batch is sent.
+	uint8_t *MutableData(uint64_t offset) {
+		return base_ + offset;
+	}
+
 	// If `custom_metadata` carries SHM_OFFSET_KEY (i.e. the batch is a
 	// shm pointer batch), parse the IPC bytes from the segment and return
 	// the resolved RecordBatch. Returns nullptr when not a pointer batch.
