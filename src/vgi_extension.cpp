@@ -36,6 +36,7 @@
 #include "vgi_wasm_async_pool.hpp"
 #endif
 #include "storage/vgi_catalog.hpp"
+#include "storage/vgi_table_entry.hpp"
 #include "storage/vgi_transaction.hpp"
 #include "vgi_cancel_dispatcher.hpp"
 #include "vgi_catalog_api.hpp"
@@ -1584,6 +1585,27 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// Register VGI table functions
 	RegisterVgiCatalogsFunction(loader);
 	RegisterVgiTableFunction(loader);
+
+	// Register the synthetic catalog-scan function under its name. VgiTableEntry
+	// builds an unnamed-in-catalog "vgi_table_scan" TableFunction per scan, but
+	// DuckDB's LogicalOperator::Copy() round-trips a LogicalGet through
+	// serialize/deserialize (e.g. the WindowSelfJoin optimizer duplicating a
+	// `COUNT(*) OVER (PARTITION BY ...)` scan), and FunctionSerializer resolves
+	// the function *by name* from the catalog on the way back. Without a
+	// registered entry that lookup throws "Table Function with name
+	// vgi_table_scan does not exist!". This entry exists solely to carry the
+	// deserialize callback; it has no bind, so a direct call still fails at bind
+	// time. VgiTableScanDeserialize reassigns `function` to a fully-configured
+	// scan, so the flags/callbacks set here are only placeholders.
+	{
+		TableFunction scan_func("vgi_table_scan", {}, vgi::VgiTableFunctionScan, nullptr,
+		                        vgi::VgiTableFunctionInitGlobal, vgi::VgiTableFunctionInitLocal);
+		scan_func.serialize = VgiTableEntry::VgiTableScanSerialize;
+		scan_func.deserialize = VgiTableEntry::VgiTableScanDeserialize;
+		scan_func.projection_pushdown = true;
+		scan_func.filter_pushdown = true;
+		loader.RegisterFunction(scan_func);
+	}
 
 	// Register worker pool diagnostic functions
 	vgi::RegisterVgiWorkerPoolFunction(loader);

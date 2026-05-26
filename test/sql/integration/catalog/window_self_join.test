@@ -1,0 +1,77 @@
+# name: test/sql/integration/catalog/window_self_join.test
+# description: Regression test for the WindowSelfJoin optimizer deep-copying a
+#              VGI catalog-table scan. A partitioned window *aggregate* (e.g.
+#              COUNT(*) OVER (PARTITION BY ...)) makes DuckDB rewrite the window
+#              into a self-join, which round-trips the LogicalGet through
+#              serialize/deserialize. FunctionSerializer resolves the scan
+#              function by name, so the synthetic "vgi_table_scan" must be
+#              registered and carry (de)serialize callbacks — otherwise this
+#              query failed with "Table Function with name vgi_table_scan does
+#              not exist!". See VgiTableEntry::VgiTableScan{Serialize,Deserialize}
+#              and the catalog registration in vgi_extension.cpp.
+# group: [vgi_integration_catalog]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# example.data.numbers is a single-branch catalog table: one BIGINT column
+# `value` holding 0..99. The catalog-scan path (not the vgi_table_function()
+# call form) is what produces the synthetic "vgi_table_scan" function.
+query III
+SELECT count(*), min(value), max(value) FROM example.data.numbers;
+----
+100	0	99
+
+# The exact construct that triggered the crash: a partitioned window aggregate
+# over a catalog-table scan. Must plan + execute, not throw a Catalog Error.
+query II
+SELECT value % 3 AS bucket, COUNT(*) OVER (PARTITION BY value % 3) AS win_total
+FROM example.data.numbers
+QUALIFY ROW_NUMBER() OVER (PARTITION BY value % 3 ORDER BY value) = 1
+ORDER BY bucket;
+----
+0	34
+1	33
+2	33
+
+# Window aggregate combined with GROUP BY (the broken2.sql shape). The window
+# COUNT runs over the grouped rows.
+query III
+SELECT value % 3 AS bucket, COUNT(*) AS group_rows, COUNT(*) OVER () AS num_buckets
+FROM example.data.numbers
+GROUP BY value % 3
+ORDER BY bucket;
+----
+0	34	3
+1	33	3
+2	33	3
+
+# Correctness, not just non-crash: the self-join-rewritten window total must
+# equal the independently-computed per-partition aggregate for every row.
+query I
+SELECT COUNT(*)
+FROM (
+  SELECT value,
+         SUM(value) OVER (PARTITION BY value % 5) AS win_sum,
+         (SELECT SUM(b.value) FROM example.data.numbers b WHERE b.value % 5 = a.value % 5) AS sub_sum
+  FROM example.data.numbers a
+)
+WHERE win_sum IS DISTINCT FROM sub_sum;
+----
+0
+
+# vgi_table_scan is now resolvable by name in the catalog (the lookup that
+# FunctionSerializer performs on deserialize).
+query I
+SELECT count(*) FROM duckdb_functions() WHERE function_name = 'vgi_table_scan';
+----
+1
+
+statement ok
+DETACH example;

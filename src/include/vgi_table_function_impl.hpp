@@ -222,6 +222,16 @@ struct VgiTableFunctionBindData : public TableFunctionData {
 	// TABLESAMPLE SYSTEM hint from DuckDB optimizer (read from input.sample_options in InitGlobal).
 	// Mutable because InitGlobal receives const bind_data.
 	mutable std::optional<TableSampleHint> table_sample_hint;
+
+	// AT (...) time-travel clause this scan was bound under (empty for the
+	// common no-AT case). Captured on the catalog-scan path so the
+	// vgi_table_scan (de)serialize callbacks can rebuild an identical bind
+	// after a logical-plan deep copy (e.g. the WindowSelfJoin optimizer
+	// duplicating a `COUNT(*) OVER (PARTITION BY ...)` scan). Only the
+	// catalog-scan path sets these; the direct vgi_table_function() path
+	// leaves them empty.
+	std::string at_unit;
+	std::string at_value;
 };
 
 // ============================================================================

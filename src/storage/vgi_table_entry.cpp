@@ -3,6 +3,8 @@
 
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp"
+#include "duckdb/common/serializer/deserializer.hpp"
+#include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/extension_helper.hpp"
@@ -515,6 +517,12 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 	// Store table entry reference for get_bind_info callback
 	scan_bind_data->table_entry = this;
 
+	// Retain the AT (...) clause (empty for the no-AT case) so the
+	// vgi_table_scan (de)serialize callbacks can rebuild the same branch
+	// resolution after a logical-plan deep copy.
+	scan_bind_data->at_unit = at_unit;
+	scan_bind_data->at_value = at_value;
+
 	// Pass row_id info to bind data
 	if (table_info_.row_id_column >= 0) {
 		scan_bind_data->rowid_worker_col_index = table_info_.row_id_column;
@@ -574,6 +582,12 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 	func.get_bind_info = vgi::VgiTableScanGetBindInfo;
 	func.set_scan_order = vgi::VgiSetScanOrder;
 	func.statistics = vgi::VgiTableFunctionStatistics;
+	// Make the synthetic scan function survive LogicalOperator::Copy()'s
+	// serialize/deserialize round-trip (WindowSelfJoin et al.). See the
+	// callback definitions below and the catalog registration in
+	// vgi_extension.cpp (RegisterVgiTableScanFunction).
+	func.serialize = VgiTableScanSerialize;
+	func.deserialize = VgiTableScanDeserialize;
 	// INITIALIZE_ON_SCHEDULE would move init_global into
 	// Executor::ScheduleEvents' eager-init loop, collapsing N sequential
 	// metadata RTTs into one parallel batch — but it fires init_global
@@ -594,6 +608,51 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 	}
 
 	return func;
+}
+
+void VgiTableEntry::VgiTableScanSerialize(Serializer &serializer, const optional_ptr<FunctionData> bind_data_p,
+                                          const TableFunction &function) {
+	// The scan function carries no callable arguments; everything needed to
+	// rebuild it lives in the bind data. Persist only the table identity (and
+	// AT clause), mirroring DuckDB's own TableScanSerialize — the heavy bind
+	// state (Arrow schema, worker connection params, pushdown capabilities) is
+	// re-derived from the catalog entry on deserialize.
+	auto &bind_data = bind_data_p->Cast<vgi::VgiTableFunctionBindData>();
+	if (!bind_data.table_entry) {
+		// Only the catalog-scan path installs these callbacks, and it always
+		// sets table_entry. A null here means the direct vgi_table_function()
+		// bind data reached this callback — a wiring bug, not a user error.
+		throw SerializationException(
+		    "vgi_table_scan cannot be serialized without an originating table entry");
+	}
+	auto &table = *bind_data.table_entry;
+	serializer.WriteProperty(100, "catalog", table.ParentCatalog().GetName());
+	serializer.WriteProperty(101, "schema", table.ParentSchema().name);
+	serializer.WriteProperty(102, "table", table.name);
+	serializer.WriteProperty(103, "at_unit", bind_data.at_unit);
+	serializer.WriteProperty(104, "at_value", bind_data.at_value);
+}
+
+unique_ptr<FunctionData> VgiTableEntry::VgiTableScanDeserialize(Deserializer &deserializer, TableFunction &function) {
+	auto catalog = deserializer.ReadProperty<string>(100, "catalog");
+	auto schema = deserializer.ReadProperty<string>(101, "schema");
+	auto table = deserializer.ReadProperty<string>(102, "table");
+	auto at_unit = deserializer.ReadProperty<string>(103, "at_unit");
+	auto at_value = deserializer.ReadProperty<string>(104, "at_value");
+	auto &context = deserializer.Get<ClientContext &>();
+
+	auto &catalog_entry = Catalog::GetEntry<TableCatalogEntry>(context, catalog, schema, table);
+	auto &vgi_entry = catalog_entry.Cast<VgiTableEntry>();
+
+	// Re-run the bind to produce a fully-configured TableFunction (pushdown
+	// flags, order preservation, virtual columns, cardinality, statistics —
+	// all recomputed for *this* table) plus its bind data. Overwriting
+	// `function` is intentional and supported: LogicalGet::Deserialize reads
+	// `function.get_virtual_columns` from the reassigned function after this
+	// callback returns, so the copy ends up identical to a fresh bind.
+	unique_ptr<FunctionData> bind_data;
+	function = vgi_entry.GetScanFunctionImpl(context, bind_data, at_unit, at_value);
+	return bind_data;
 }
 
 TableStorageInfo VgiTableEntry::GetStorageInfo(ClientContext &context) {

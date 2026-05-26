@@ -67,6 +67,24 @@ public:
 	// concurrently (atomic CAS internally).
 	void RecordMultiBranchHintNoAT(bool is_multi_branch) const;
 
+	// (De)serialization callbacks for the synthetic ``vgi_table_scan``
+	// TableFunction returned by GetScanFunctionImpl. DuckDB's
+	// LogicalOperator::Copy() round-trips a LogicalGet through
+	// serialize/deserialize (e.g. when the WindowSelfJoin optimizer
+	// duplicates a partitioned window-aggregate scan), and
+	// FunctionSerializer resolves the function *by name* from the catalog
+	// on the way back in. Without these — and the matching catalog
+	// registration in vgi_extension.cpp — that lookup throws
+	// "Table Function with name vgi_table_scan does not exist!".
+	//
+	// Mirrors DuckDB's own TableScanSerialize/Deserialize: serialize only
+	// the table identity (catalog/schema/name + AT clause), then re-derive
+	// a fully-configured TableFunction + bind data by re-running the bind
+	// against the looked-up VgiTableEntry.
+	static void VgiTableScanSerialize(Serializer &serializer, const optional_ptr<FunctionData> bind_data,
+	                                  const TableFunction &function);
+	static unique_ptr<FunctionData> VgiTableScanDeserialize(Deserializer &deserializer, TableFunction &function);
+
 private:
 	TableFunction GetScanFunctionImpl(ClientContext &context, unique_ptr<FunctionData> &bind_data,
 	                                  const string &at_unit, const string &at_value);
