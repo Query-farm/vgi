@@ -19,6 +19,10 @@
 #include "vgi_schema_registry.hpp"
 #include "vgi_shm_segment.hpp"
 #include "vgi_transport.hpp"
+
+#include <map>
+#include <mutex>
+
 #if VGI_POSIX_TRANSPORT
 // Launcher / AF_UNIX transport — POSIX only (Windows brings launch:/unix:// via
 // named pipes in a later phase). On Windows/Emscripten the dispatch path below
@@ -156,6 +160,63 @@ MaybeWriteBatchToShm(VgiShmSegment *shm, const std::shared_ptr<arrow::RecordBatc
 		        static_cast<unsigned long long>(*offset), static_cast<long long>(total));
 	}
 	return {pointer, metadata};
+}
+
+// __transport_options__ capability handshake. Process-wide cache of each
+// worker's shm capability, keyed by worker identity (the launch:/binary path —
+// capability depends on the worker binary + its runtime, not on version dims).
+// Negotiated once per worker; reused across pooled / launcher-reused connections
+// so there is no per-query round trip. Stale entries are benign (the same path
+// always launches the same binary); a respawn of an idle-killed launcher worker
+// re-uses the cached value, which is unchanged.
+std::map<std::string, bool> g_shm_capability_cache;
+std::mutex g_shm_capability_mutex;
+
+// Ask the worker whether it supports the shared-memory side-channel, via the
+// framework-level __transport_options__ method, before any shm is used. The
+// client always advertises shm support (it both writes and resolves pointer
+// batches); shm is enabled only if the worker also reports it. ANY failure
+// (an old worker that 404s the method, an untagged unknown-method error, a
+// transport error) is treated as "no shm" → inline fallback. Result cached
+// per worker path. Runs in lockstep on the same pipe, before the init request.
+bool NegotiateWorkerShmCapability(int in_fd, int out_fd, const std::string &worker_path,
+                                  ClientContext &context, pid_t pid) {
+	{
+		std::lock_guard<std::mutex> lk(g_shm_capability_mutex);
+		auto it = g_shm_capability_cache.find(worker_path);
+		if (it != g_shm_capability_cache.end()) {
+			return it->second;
+		}
+	}
+	bool capable = false;
+	try {
+		// Zero-field, 1-row params batch (the worker decodes empty kwargs); the
+		// client's capabilities ride as metadata under vgi_rpc.transport.*.
+		auto empty_params = arrow::RecordBatch::Make(
+		    arrow::schema({}), 1, std::vector<std::shared_ptr<arrow::Array>>{});
+		auto client_caps = arrow::KeyValueMetadata::Make({TRANSPORT_CAP_SHM_KEY}, {"true"});
+		WriteRpcRequest(in_fd, TRANSPORT_OPTIONS_METHOD, empty_params, client_caps);
+		auto resp = ReadUnaryResponse(out_fd, &context, worker_path, pid);
+		if (resp.metadata) {
+			auto v = resp.metadata->Get(TRANSPORT_CAP_SHM_KEY);
+			capable = v.ok() && v.ValueUnsafe() == "true";
+		}
+	} catch (const std::exception &e) {
+		capable = false; // old worker / unknown method / transport error → inline
+		if (std::getenv("VGI_RPC_SHM_DEBUG")) {
+			fprintf(stderr, "[shm] transport_options negotiation failed for %s: %s — inline\n",
+			        worker_path.c_str(), e.what());
+		}
+	}
+	{
+		std::lock_guard<std::mutex> lk(g_shm_capability_mutex);
+		g_shm_capability_cache[worker_path] = capable;
+	}
+	if (std::getenv("VGI_RPC_SHM_DEBUG")) {
+		fprintf(stderr, "[shm] worker %s shm-capable=%s\n", worker_path.c_str(),
+		        capable ? "true" : "false");
+	}
+	return capable;
 }
 #endif // VGI_POSIX_TRANSPORT
 
@@ -522,7 +583,14 @@ InitResult FunctionConnection::PerformInit(const BindResult &bind_result,
 	ValidateRequestSchema(rpc_params, "init", worker_path_);
 	std::shared_ptr<arrow::KeyValueMetadata> shm_metadata;
 #if VGI_POSIX_TRANSPORT // shared-memory side-channel (shm_open/mmap) is POSIX-only
-	if (const char *env = std::getenv("VGI_RPC_SHM_SIZE_BYTES"); env && *env) {
+	// Only create + advertise the segment if shm is requested AND the worker
+	// confirmed (once, cached) it can do shm via __transport_options__. A worker
+	// that can't (Java 21 / non-POSIX / old worker) → segment stays null → all
+	// shm use sites no-op → inline (pipe) transport, no silent data loss.
+	if (const char *env = std::getenv("VGI_RPC_SHM_SIZE_BYTES");
+	    env && *env
+	        && NegotiateWorkerShmCapability(proc_->GetStdinFd(), proc_->GetStdoutFd(),
+	                                        worker_path_, context_, proc_->GetPid())) {
 		try {
 			size_t shm_size = static_cast<size_t>(std::stoull(env));
 			if (!shm_segment_) {

@@ -48,6 +48,13 @@ constexpr const char *RPC_LOCATION_KEY = "vgi_rpc.location";
 // External location SHA-256 checksum metadata key (pointer batch)
 constexpr const char *RPC_LOCATION_SHA256_KEY = "vgi_rpc.location.sha256";
 
+// Transport capability negotiation (mirror vgi-rpc TransportOptions). The client
+// calls TRANSPORT_OPTIONS_METHOD once per worker (before init) to discover which
+// transport features the worker supports; capabilities ride as metadata under
+// the vgi_rpc.transport.* namespace. shm is used only when both peers report it.
+constexpr const char *TRANSPORT_OPTIONS_METHOD = "__transport_options__";
+constexpr const char *TRANSPORT_CAP_SHM_KEY = "vgi_rpc.transport.shm";
+
 // Shared-memory transport keys (mirror vgi_rpc/metadata.py).
 // Set on the *request batch* to advertise a client-allocated segment to the
 // worker; the worker may then write its response batches into the segment
