@@ -4,7 +4,8 @@
                 "curl",
                 {
                         "name": "arrow",
-                        "default-features": false
+                        "default-features": false,
+                        "features": ["mimalloc"]
                 }
         ],
         "vcpkg-configuration": {
