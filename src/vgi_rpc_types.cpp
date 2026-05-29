@@ -257,27 +257,77 @@ BuildOptionalStringMapScalar(const std::optional<std::vector<std::pair<std::stri
 // ============================================================================
 
 std::vector<uint8_t> SerializeToIpcBytes(const std::shared_ptr<arrow::RecordBatch> &batch) {
-	auto sink_result = arrow::io::BufferOutputStream::Create();
-	if (!sink_result.ok()) {
-		throw IOException("Failed to create buffer: " + sink_result.status().ToString());
-	}
-	auto sink = sink_result.ValueUnsafe();
+	// Single-allocation path: drive the payload-level Arrow APIs by hand so
+	// RecordBatchSerializer::Assemble runs ONCE, GetPayloadSize tells us the
+	// exact total bytes, and we allocate the destination std::vector at the
+	// correct size up front. Skips the realloc chain that
+	// BufferOutputStream + MakeStreamWriter incur and the extra
+	// vector-from-buffer copy the prior implementation did at the end.
+	// Wire bytes are identical to what MakeStreamWriter+WriteRecordBatch+Close
+	// would have produced (same primitive Arrow calls underneath).
+	//
+	// Dictionary columns require an extra dictionary-batch message between
+	// the schema and record batch messages (IpcFormatWriter::WriteDictionaries
+	// in MakeStreamWriter's implementation). We replicate that ordering
+	// explicitly via CollectDictionaries + GetDictionaryPayload so enum/dict
+	// schemas (e.g. DuckDB enums) round-trip correctly.
+	const auto &options = arrow::ipc::IpcWriteOptions::Defaults();
+	arrow::ipc::DictionaryFieldMapper mapper(*batch->schema());
 
-	auto writer_result = arrow::ipc::MakeStreamWriter(sink, batch->schema());
-	if (!writer_result.ok()) {
-		throw IOException("Failed to create IPC writer: " + writer_result.status().ToString());
-	}
-	auto writer = writer_result.ValueUnsafe();
+	arrow::ipc::IpcPayload schema_payload;
+	CheckStatus(arrow::ipc::GetSchemaPayload(*batch->schema(), options, mapper, &schema_payload),
+	            "build schema payload");
 
-	CheckStatus(writer->WriteRecordBatch(*batch), "write batch to IPC");
-	CheckStatus(writer->Close(), "close IPC writer");
-
-	auto finish_result = sink->Finish();
-	if (!finish_result.ok()) {
-		throw IOException("Failed to finish IPC buffer: " + finish_result.status().ToString());
+	// Collect dictionary payloads (empty for non-dict schemas → no extra cost).
+	auto dictionaries_result = arrow::ipc::CollectDictionaries(*batch, mapper);
+	if (!dictionaries_result.ok()) {
+		throw IOException("Arrow collect dictionaries failed: %s",
+		                  dictionaries_result.status().ToString());
 	}
-	auto buffer = finish_result.ValueUnsafe();
-	return std::vector<uint8_t>(buffer->data(), buffer->data() + buffer->size());
+	const auto dictionaries = std::move(dictionaries_result).ValueUnsafe();
+	std::vector<arrow::ipc::IpcPayload> dict_payloads(dictionaries.size());
+	for (size_t i = 0; i < dictionaries.size(); ++i) {
+		CheckStatus(arrow::ipc::GetDictionaryPayload(dictionaries[i].first, dictionaries[i].second,
+		                                              options, &dict_payloads[i]),
+		            "build dictionary payload");
+	}
+
+	arrow::ipc::IpcPayload batch_payload;
+	CheckStatus(arrow::ipc::GetRecordBatchPayload(*batch, /*custom_metadata=*/nullptr, options, &batch_payload),
+	            "build record-batch payload");
+
+	// EOS marker: 4-byte continuation token 0xFFFFFFFF + 4-byte zero length.
+	// Matches arrow::ipc PayloadStreamWriter::WriteEOS (non-legacy format).
+	static constexpr uint8_t kEosMarker[8] = {0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00};
+	const int64_t schema_size = arrow::ipc::GetPayloadSize(schema_payload, options);
+	std::vector<int64_t> dict_sizes(dict_payloads.size());
+	int64_t dicts_total = 0;
+	for (size_t i = 0; i < dict_payloads.size(); ++i) {
+		dict_sizes[i] = arrow::ipc::GetPayloadSize(dict_payloads[i], options);
+		dicts_total += dict_sizes[i];
+	}
+	const int64_t batch_size = arrow::ipc::GetPayloadSize(batch_payload, options);
+	const int64_t total = schema_size + dicts_total + batch_size + static_cast<int64_t>(sizeof(kEosMarker));
+
+	std::vector<uint8_t> out(static_cast<size_t>(total));
+	int32_t mlen = 0; // discarded; only here to satisfy the API
+	auto write_payload_at = [&](const arrow::ipc::IpcPayload &p, int64_t offset, int64_t size, const char *what) {
+		auto slice = std::make_shared<arrow::MutableBuffer>(out.data() + offset, size);
+		auto sink = std::make_shared<arrow::io::FixedSizeBufferWriter>(slice);
+		CheckStatus(arrow::ipc::WriteIpcPayload(p, options, sink.get(), &mlen), what);
+	};
+
+	int64_t cursor = 0;
+	write_payload_at(schema_payload, cursor, schema_size, "write schema payload");
+	cursor += schema_size;
+	for (size_t i = 0; i < dict_payloads.size(); ++i) {
+		write_payload_at(dict_payloads[i], cursor, dict_sizes[i], "write dictionary payload");
+		cursor += dict_sizes[i];
+	}
+	write_payload_at(batch_payload, cursor, batch_size, "write record-batch payload");
+	cursor += batch_size;
+	std::memcpy(out.data() + cursor, kEosMarker, sizeof(kEosMarker));
+	return out;
 }
 
 std::shared_ptr<arrow::RecordBatch> DeserializeFromIpcBytes(const uint8_t *data, size_t len) {
