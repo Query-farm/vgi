@@ -6,6 +6,18 @@ duckdb_extension_load(vgi
     LOAD_TESTS
 )
 
+# httpfs source depends on the engine we're building against. The Haybarn
+# engine fork defines HAYBARN_VERSION_STRING (a top-level CMake var, set before
+# extension configs are included); stock DuckDB never does. Build against the
+# matching httpfs in each case — they have genuinely different sources.
+if(DEFINED HAYBARN_VERSION_STRING)
+    set(HTTPFS_GIT_URL https://github.com/Query-farm-haybarn/haybarn-httpfs)
+    set(HTTPFS_GIT_TAG 1f23e5bd8f7a50253c08b00bb7a88ecfa15862df)
+else()
+    set(HTTPFS_GIT_URL https://github.com/duckdb/duckdb-httpfs)
+    set(HTTPFS_GIT_TAG 52afb4204a3238d6ee132e83340f8d68c40ee91c)
+endif()
+
 # DuckDB 1.5.3's httpfs (52afb42) is curl-based. On the MinGW toolchain
 # (x64-mingw-static, rtools GCC) it fails to link against static curl with
 # `undefined reference to __imp_curl_*` — curl's headers emit DLL-import symbols
@@ -15,8 +27,8 @@ duckdb_extension_load(vgi
 if(NOT MINGW)
     duckdb_extension_load(httpfs
         LOAD_TESTS
-        GIT_URL https://github.com/duckdb/duckdb-httpfs
-        GIT_TAG 52afb4204a3238d6ee132e83340f8d68c40ee91c
+        GIT_URL ${HTTPFS_GIT_URL}
+        GIT_TAG ${HTTPFS_GIT_TAG}
     )
 endif()
 
