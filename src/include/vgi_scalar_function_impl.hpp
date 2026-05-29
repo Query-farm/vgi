@@ -8,7 +8,9 @@
 
 #include <arrow/api.h>
 
+#include "duckdb/common/arrow/arrow_wrapper.hpp"
 #include "duckdb/function/scalar_function.hpp"
+#include "duckdb/function/table/arrow/arrow_duck_schema.hpp"
 #include "duckdb/execution/expression_executor_state.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 
@@ -139,6 +141,30 @@ struct VgiScalarFunctionLocalState : public FunctionLocalState {
 
 	// Pool setting captured during initialization (for use in destructor)
 	bool use_pool = false;
+
+	// Cached output schema parse — populated on the first batch and reused
+	// for every subsequent batch on this thread. The output schema of a
+	// scalar function is fixed at bind time, so re-running
+	// ArrowSchemaToDuckDBTypes per batch (which does ExportSchema +
+	// PopulateArrowTableSchema + GetDuckDBTypesFromArrowTable) is wasted
+	// work. Caching these four fields in local state turns the per-batch
+	// "schema" phase from O(parse) into a member access.
+	ArrowSchemaWrapper output_c_schema;
+	ArrowTableSchema output_arrow_table;
+	vector<LogicalType> output_types;
+	vector<string> output_names;
+	bool output_schema_cached = false;
+
+	// Cached input-side conversion state — populated on the first batch and
+	// reused on every subsequent batch by DataChunkToArrowCached. Skips the
+	// per-batch types/names push-back, ClientProperties copy, and
+	// ArrowTypeExtensionData::GetExtensionTypes() lookup that
+	// DataChunkToArrow otherwise does internally.
+	vector<LogicalType> input_arrow_types;
+	vector<string> input_arrow_names;
+	unordered_map<idx_t, const shared_ptr<ArrowTypeExtensionData>> input_extension_types;
+	std::optional<ClientProperties> input_client_props;
+	bool input_convert_cached = false;
 };
 
 // ============================================================================

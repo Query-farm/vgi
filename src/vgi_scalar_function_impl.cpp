@@ -482,13 +482,40 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 			to_serialize = &casted_chunk;
 		}
 	}
+	// Build input-side conversion cache on the first batch. The cached
+	// types/names/extension_types/client_props are stable for the lifetime
+	// of this scalar's bind — input column count and types do not change
+	// per batch. Subsequent batches use DataChunkToArrowCached, which skips
+	// the per-batch vector push-backs + ClientProperties copy +
+	// GetExtensionTypes() lookup.
+	if (!local_state.input_convert_cached) {
+		local_state.input_arrow_types.clear();
+		local_state.input_arrow_names.clear();
+		local_state.input_arrow_types.reserve(to_serialize->ColumnCount());
+		local_state.input_arrow_names.reserve(to_serialize->ColumnCount());
+		for (idx_t i = 0; i < to_serialize->ColumnCount(); i++) {
+			local_state.input_arrow_types.push_back(to_serialize->data[i].GetType());
+			local_state.input_arrow_names.push_back(local_state.input_schema->field(i)->name());
+		}
+		local_state.input_client_props = context.GetClientProperties();
+		local_state.input_extension_types =
+		    ArrowTypeExtensionData::GetExtensionTypes(context, local_state.input_arrow_types);
+		local_state.input_convert_cached = true;
+	}
+
 	const bool timing = ClientTiming::Enabled();
 	std::shared_ptr<arrow::RecordBatch> input_batch;
 	if (timing) {
 		ScopedNs _t(ClientTiming::Instance().convert_in_ns);
-		input_batch = DataChunkToArrow(context, *to_serialize, local_state.input_schema);
+		input_batch = DataChunkToArrowCached(
+		    context, *to_serialize, local_state.input_schema,
+		    local_state.input_arrow_types, local_state.input_arrow_names,
+		    *local_state.input_client_props, local_state.input_extension_types);
 	} else {
-		input_batch = DataChunkToArrow(context, *to_serialize, local_state.input_schema);
+		input_batch = DataChunkToArrowCached(
+		    context, *to_serialize, local_state.input_schema,
+		    local_state.input_arrow_types, local_state.input_arrow_names,
+		    *local_state.input_client_props, local_state.input_extension_types);
 	}
 
 	VGI_LOG(context, "scalar.write_input",
@@ -530,17 +557,29 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 	         {"function_name", func_info.function_name},
 	         {"output_rows", std::to_string(output_batch->num_rows())}});
 
-	// Convert Arrow result to DuckDB Vector using DuckDB's built-in ArrowToDuckDB
-	// This supports all DuckDB types (including dates, timestamps, lists, structs, etc.)
-	ArrowSchemaWrapper c_schema;
-	ArrowTableSchema arrow_table;
-	vector<LogicalType> output_types;
-	vector<string> output_names;
-	if (timing) {
-		ScopedNs _t(ClientTiming::Instance().schema_ns);
-		ArrowSchemaToDuckDBTypes(context, output_batch->schema(), c_schema, arrow_table, output_types, output_names);
-	} else {
-		ArrowSchemaToDuckDBTypes(context, output_batch->schema(), c_schema, arrow_table, output_types, output_names);
+	// Convert Arrow result to DuckDB Vector using DuckDB's built-in ArrowToDuckDB.
+	// The output schema of a scalar function is fixed at bind time — the worker
+	// returns the same schema for every batch. So parse it ONCE on the first
+	// batch and reuse the cached result thereafter. Saves an ExportSchema +
+	// PopulateArrowTableSchema + GetDuckDBTypesFromArrowTable per batch
+	// (~1 µs each at 2K rows, ~3-5% of total per-batch cost for cheap-compute
+	// scalars like multiply).
+	if (!local_state.output_schema_cached) {
+		if (timing) {
+			ScopedNs _t(ClientTiming::Instance().schema_ns);
+			ArrowSchemaToDuckDBTypes(context, output_batch->schema(),
+			                         local_state.output_c_schema,
+			                         local_state.output_arrow_table,
+			                         local_state.output_types,
+			                         local_state.output_names);
+		} else {
+			ArrowSchemaToDuckDBTypes(context, output_batch->schema(),
+			                         local_state.output_c_schema,
+			                         local_state.output_arrow_table,
+			                         local_state.output_types,
+			                         local_state.output_names);
+		}
+		local_state.output_schema_cached = true;
 	}
 
 	auto convert_out = [&]() {
@@ -551,7 +590,8 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 		DataChunk temp_output;
 		temp_output.Initialize(context, {result.GetType()});
 		temp_output.SetCardinality(args.size());
-		ArrowTableFunction::ArrowToDuckDB(scan_state, arrow_table.GetColumns(), temp_output, false);
+		ArrowTableFunction::ArrowToDuckDB(scan_state, local_state.output_arrow_table.GetColumns(),
+		                                  temp_output, false);
 
 		result.Reference(temp_output.data[0]);
 	};

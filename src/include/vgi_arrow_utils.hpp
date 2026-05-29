@@ -125,6 +125,28 @@ std::shared_ptr<arrow::Schema> DuckDBColumnsToArrowSchema(ClientContext &context
 std::shared_ptr<arrow::RecordBatch> DataChunkToArrow(ClientContext &context, DataChunk &chunk,
                                                       const std::shared_ptr<arrow::Schema> &schema);
 
+// Cached-input version of DataChunkToArrow for hot-path scalar-style callers
+// where every batch shares the same logical types, names, extension types, and
+// client properties. The caller maintains a small cache (typically on a per-
+// thread local-state struct) and passes the four cached structures in by const
+// ref. This skips the per-batch
+//   * vector<LogicalType> + vector<string> push-backs,
+//   * ClientProperties copy,
+//   * ArrowTypeExtensionData::GetExtensionTypes() lookup
+// that DataChunkToArrow does internally — they are all stable for the lifetime
+// of the function call (e.g. a scalar's input schema never changes after bind).
+//
+// The caller is responsible for ensuring the cached vectors match `chunk`'s
+// column layout. Calls with mismatched shapes are undefined behaviour (no
+// runtime check — this is the cost of the fast path).
+std::shared_ptr<arrow::RecordBatch> DataChunkToArrowCached(
+    ClientContext &context, DataChunk &chunk,
+    const std::shared_ptr<arrow::Schema> &schema,
+    const vector<LogicalType> &cached_types,
+    const vector<string> &cached_names,
+    const ClientProperties &cached_client_props,
+    const unordered_map<idx_t, const shared_ptr<ArrowTypeExtensionData>> &cached_extension_types);
+
 // Build Arrow C++ Schema from DuckDB logical types and names
 std::shared_ptr<arrow::Schema> BuildArrowSchemaFromDuckDB(ClientContext &context, const vector<LogicalType> &types,
                                                             const vector<string> &names);

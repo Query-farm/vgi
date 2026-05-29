@@ -199,6 +199,57 @@ std::shared_ptr<arrow::RecordBatch> DataChunkToArrow(ClientContext &context, Dat
 	return import_result.ValueUnsafe();
 }
 
+// Cached-input fast path: see header for contract.
+std::shared_ptr<arrow::RecordBatch> DataChunkToArrowCached(
+    ClientContext &context, DataChunk &chunk,
+    const std::shared_ptr<arrow::Schema> &schema,
+    const vector<LogicalType> &cached_types,
+    const vector<string> &cached_names,
+    const ClientProperties &cached_client_props,
+    const unordered_map<idx_t, const shared_ptr<ArrowTypeExtensionData>> &cached_extension_types) {
+	if (chunk.size() == 0) {
+		// Same empty-batch path as DataChunkToArrow.
+		std::vector<std::shared_ptr<arrow::Array>> empty_arrays;
+		for (int i = 0; i < schema->num_fields(); i++) {
+			auto builder_result = arrow::MakeBuilder(schema->field(i)->type());
+			if (!builder_result.ok()) {
+				throw IOException("Failed to create Arrow builder: %s", builder_result.status().ToString());
+			}
+			auto array_result = builder_result.ValueUnsafe()->Finish();
+			if (!array_result.ok()) {
+				throw IOException("Failed to finish Arrow array: %s", array_result.status().ToString());
+			}
+			empty_arrays.push_back(array_result.ValueUnsafe());
+		}
+		return arrow::RecordBatch::Make(schema, 0, empty_arrays);
+	}
+
+	// Skip the per-batch types/names push-back, ClientProperties copy, and
+	// extension-type lookup: caller has pre-built and cached these.
+	ArrowAppender appender(cached_types, chunk.size(), cached_client_props, cached_extension_types);
+	appender.Append(chunk, 0, chunk.size(), chunk.size());
+	ArrowArray arr = appender.Finalize();
+
+	// Schema export still happens per batch — the C-ABI ArrowSchema is consumed
+	// by ImportRecordBatch (its release callback is invoked), so we cannot share
+	// a single instance across calls. ArrowConverter::ToArrowSchema takes its
+	// ClientProperties by non-const reference; copy from the cached const ref
+	// (small struct, free copy).
+	ArrowSchema c_schema;
+	ClientProperties props_copy = cached_client_props;
+	ArrowConverter::ToArrowSchema(&c_schema, cached_types, cached_names, props_copy);
+
+	auto import_result = arrow::ImportRecordBatch(&arr, &c_schema);
+	if (!import_result.ok()) {
+		if (c_schema.release) {
+			c_schema.release(&c_schema);
+		}
+		throw IOException("Failed to import Arrow batch: %s", import_result.status().ToString());
+	}
+
+	return import_result.ValueUnsafe();
+}
+
 std::shared_ptr<arrow::Schema> BuildArrowSchemaFromDuckDB(ClientContext &context, const vector<LogicalType> &types,
                                                             const vector<string> &names) {
 	// Use DuckDB's converter to get Arrow schema
