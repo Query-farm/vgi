@@ -121,36 +121,60 @@ MaybeWriteBatchToShm(VgiShmSegment *shm, const std::shared_ptr<arrow::RecordBatc
 	}
 
 	// Serialize the batch under wire_schema as a full IPC stream (schema +
-	// batch + EOS) *directly into the segment*, avoiding the temp-heap-buffer +
-	// memcpy double-copy. Two passes over the writer: a MockOutputStream pass
-	// computes the exact framed size without touching payload bytes, then we
-	// reserve that slot and a FixedSizeBufferWriter writes the real bytes once,
-	// straight into shm. IPC framing is deterministic for a fixed batch+schema,
-	// so the second pass produces exactly `total` bytes.
-	auto size_sink = std::make_shared<arrow::io::MockOutputStream>();
-	{
-		auto w = arrow::ipc::MakeStreamWriter(size_sink, wire_schema);
-		if (!w.ok() || !w.ValueUnsafe()->WriteRecordBatch(*batch).ok() ||
-		    !w.ValueUnsafe()->Close().ok()) {
-			return {nullptr, nullptr};
-		}
+	// batch + EOS) *directly into the segment*. We bypass MakeStreamWriter's
+	// IpcFormatWriter and drive the payload-level API by hand so the
+	// RecordBatchSerializer::Assemble pass runs ONCE (it builds metadata +
+	// collects body buffers). GetPayloadSize is then O(1) arithmetic on the
+	// built payload, letting us reserve the exact slot up-front. Compare:
+	// the prior implementation called Assemble twice (a MockOutputStream
+	// size pass + the real write).
+	const auto &options = arrow::ipc::IpcWriteOptions::Defaults();
+	arrow::ipc::DictionaryFieldMapper mapper(*wire_schema);
+
+	arrow::ipc::IpcPayload schema_payload;
+	if (!arrow::ipc::GetSchemaPayload(*wire_schema, options, mapper, &schema_payload).ok()) {
+		return {nullptr, nullptr};
 	}
-	const int64_t total = size_sink->GetExtentBytesWritten();
+	arrow::ipc::IpcPayload batch_payload;
+	if (!arrow::ipc::GetRecordBatchPayload(*batch, /*custom_metadata=*/nullptr, options, &batch_payload).ok()) {
+		return {nullptr, nullptr};
+	}
+
+	// EOS marker: 4-byte continuation token 0xFFFFFFFF + 4-byte zero length.
+	// Matches arrow::ipc PayloadStreamWriter::WriteEOS in the default
+	// (non-legacy) format. The on-wire bytes match what the read side
+	// (vgi_shm_segment.cpp) expects.
+	static constexpr uint8_t kEosMarker[8] = {0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00};
+	const int64_t schema_size = arrow::ipc::GetPayloadSize(schema_payload, options);
+	const int64_t batch_size = arrow::ipc::GetPayloadSize(batch_payload, options);
+	const int64_t total = schema_size + batch_size + static_cast<int64_t>(sizeof(kEosMarker));
 
 	auto offset = shm->Allocate(static_cast<size_t>(total));
 	if (!offset) {
 		return {nullptr, nullptr}; // segment / alloc-table full → inline fallback
 	}
-	auto slot = std::make_shared<arrow::MutableBuffer>(shm->MutableData(*offset), total);
-	auto sink = std::make_shared<arrow::io::FixedSizeBufferWriter>(slot);
-	auto writer_result = arrow::ipc::MakeStreamWriter(sink, wire_schema);
-	if (!writer_result.ok()) {
-		return {nullptr, nullptr};
+
+	// Write into the slot in three pieces: [schema | batch | EOS]. Each
+	// piece goes through a FixedSizeBufferWriter view over the right
+	// sub-range, so WriteIpcPayload writes exactly its computed size into
+	// the slot and refuses any drift.
+	uint8_t *slot_data = shm->MutableData(*offset);
+	int32_t mlen = 0; // discarded; we only need it to satisfy the API
+	{
+		auto schema_slice = std::make_shared<arrow::MutableBuffer>(slot_data, schema_size);
+		auto schema_sink = std::make_shared<arrow::io::FixedSizeBufferWriter>(schema_slice);
+		if (!arrow::ipc::WriteIpcPayload(schema_payload, options, schema_sink.get(), &mlen).ok()) {
+			return {nullptr, nullptr};
+		}
 	}
-	auto writer = writer_result.ValueUnsafe();
-	if (!writer->WriteRecordBatch(*batch).ok() || !writer->Close().ok()) {
-		return {nullptr, nullptr};
+	{
+		auto batch_slice = std::make_shared<arrow::MutableBuffer>(slot_data + schema_size, batch_size);
+		auto batch_sink = std::make_shared<arrow::io::FixedSizeBufferWriter>(batch_slice);
+		if (!arrow::ipc::WriteIpcPayload(batch_payload, options, batch_sink.get(), &mlen).ok()) {
+			return {nullptr, nullptr};
+		}
 	}
+	std::memcpy(slot_data + schema_size + batch_size, kEosMarker, sizeof(kEosMarker));
 	auto pointer = arrow::RecordBatch::Make(wire_schema, 0, std::move(empty_columns));
 	auto metadata = arrow::KeyValueMetadata::Make(
 	    {std::string(SHM_OFFSET_KEY), std::string(SHM_LENGTH_KEY)},
