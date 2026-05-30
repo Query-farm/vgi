@@ -28,3 +28,6 @@ jobs:
       duckdb_version: v1.5.3
       ci_tools_version: v1.5.3
       extension_name: vgi
+      use_prebuilt_images: true
+      use_prebuilt_wasm_image: true
+      prebuilt_image_tag: v1.5.3
