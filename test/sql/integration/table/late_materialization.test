@@ -1,0 +1,356 @@
+# name: test/sql/integration/table/late_materialization.test
+# description: Late materialization for VGI catalog tables. A TOP_N/LIMIT over a
+#              rowid-bearing VGI table that advertises Meta.late_materialization is
+#              rewritten into a SEMI join on rowid: a narrow ordering scan selects
+#              survivors, then the wide scan re-fetches their columns with the
+#              surviving rowids pushed down (IN-list when small, min/max range
+#              otherwise). The `pushed` witness column echoes the rowid filter the
+#              worker actually received, proving the pushdown reached it.
+# group: [vgi_integration_table]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# Structural: the rewrite fires — Top-N over the rowid table becomes a SEMI
+# join. Plan shape is transport-independent. Projection is a strict subset
+# (rowid, payload of {row_id, ord, payload, pushed}) so the optimizer benefits.
+# ============================================================================
+
+query II
+EXPLAIN SELECT rowid, payload FROM example.data.late_mat ORDER BY ord LIMIT 10;
+----
+physical_plan	<REGEX>:.*SEMI.*
+
+# ============================================================================
+# Negative gate: a rowid table whose worker does NOT advertise
+# late_materialization (rowid_first → rowid_sequence) is NOT rewritten.
+# ============================================================================
+
+query II
+EXPLAIN SELECT rowid, name FROM example.data.rowid_first ORDER BY value LIMIT 3;
+----
+physical_plan	<!REGEX>:.*SEMI.*
+
+# ============================================================================
+# Correctness: late-mat ON must equal the reference (rewrite disabled).
+# Total order (ord, rowid) removes tie-break ambiguity. EXCEPT both ways = equal.
+# ============================================================================
+
+# k small
+query II
+(SELECT rowid, payload FROM example.data.late_mat ORDER BY ord, rowid LIMIT 10)
+EXCEPT
+(SELECT rowid, payload FROM example.data.late_mat ORDER BY ord, rowid LIMIT 10);
+----
+
+statement ok
+SET disabled_optimizers='late_materialization';
+
+query II nosort ref10
+SELECT rowid, payload FROM example.data.late_mat ORDER BY ord, rowid LIMIT 10;
+----
+
+statement ok
+RESET disabled_optimizers;
+
+query II nosort ref10
+SELECT rowid, payload FROM example.data.late_mat ORDER BY ord, rowid LIMIT 10;
+----
+
+# k = 0
+query II
+SELECT rowid, payload FROM example.data.late_mat ORDER BY ord, rowid LIMIT 0;
+----
+
+# k larger than the table (1000 rows) returns every row
+query I
+SELECT count(*) FROM (SELECT rowid, payload FROM example.data.late_mat ORDER BY ord LIMIT 5000);
+----
+1000
+
+# ============================================================================
+# Behavioral: exact IN-list pushdown for small survivor sets (k <= 50).
+# Ordering on the scrambled `ord` scatters survivors, so DuckDB builds an
+# IN-list of exactly k rowids. The witness proves the worker received them.
+# `pushed, payload` are both projected so the wide scan is the one that
+# materializes payload and receives the rowid filter.
+# ============================================================================
+
+# Assert the IN-list count (= k) and that a rowid range is also present, but not
+# the exact min/max (those depend on which rowids the Top-N picks — deterministic
+# but version-coupled, so we don't hard-code them).
+query II
+SELECT
+    regexp_extract(pushed, 'in=([0-9]+)', 1)::INT AS in_count,
+    pushed NOT LIKE '%rng=none%' AS has_range
+FROM (SELECT pushed, payload FROM example.data.late_mat ORDER BY ord LIMIT 30)
+LIMIT 1;
+----
+30	true
+
+# ============================================================================
+# Behavioral: graceful degradation for large survivor sets (k > 50).
+# late_materialization_max_rows must be raised for the rewrite to fire at
+# LIMIT 200 at all. With dynamic_or_filter_threshold at its default (50),
+# >50 survivors push a min/max RANGE only (no IN-list, no bloom filter).
+# ============================================================================
+
+statement ok
+SET late_materialization_max_rows=500;
+
+# >50 survivors → no IN-list (in=0), range only.
+query II
+SELECT
+    regexp_extract(pushed, 'in=([0-9]+)', 1)::INT AS in_count,
+    pushed NOT LIKE '%rng=none%' AS has_range
+FROM (SELECT pushed, payload FROM example.data.late_mat ORDER BY ord LIMIT 200)
+LIMIT 1;
+----
+0	true
+
+# Raising dynamic_or_filter_threshold routes the survivors through the exact
+# IN-list (join_keys) path even at 200 — proves the knob works.
+statement ok
+SET dynamic_or_filter_threshold=512;
+
+query I
+SELECT regexp_extract(pushed, 'in=([0-9]+)', 1)::INT AS in_count
+FROM (SELECT pushed, payload FROM example.data.late_mat ORDER BY ord LIMIT 200)
+LIMIT 1;
+----
+200
+
+statement ok
+RESET dynamic_or_filter_threshold;
+
+statement ok
+RESET late_materialization_max_rows;
+
+# ============================================================================
+# WHERE + ORDER BY + LIMIT: the predicate must reach the ordering-scan Top-N
+# through CreateLHSGet / the VGI bind_data Copy(). Compare to the reference.
+# ============================================================================
+
+query II nosort refwhere
+SELECT rowid, payload FROM example.data.late_mat
+WHERE payload LIKE 'payload_1%' ORDER BY ord, rowid LIMIT 10;
+----
+
+statement ok
+SET disabled_optimizers='late_materialization';
+
+query II nosort refwhere
+SELECT rowid, payload FROM example.data.late_mat
+WHERE payload LIKE 'payload_1%' ORDER BY ord, rowid LIMIT 10;
+----
+
+statement ok
+RESET disabled_optimizers;
+
+# DESC ordering — exercises the descending dynamic-filter relocation.
+query II nosort refdesc
+SELECT rowid, payload FROM example.data.late_mat ORDER BY ord DESC, rowid LIMIT 10;
+----
+
+statement ok
+SET disabled_optimizers='late_materialization';
+
+query II nosort refdesc
+SELECT rowid, payload FROM example.data.late_mat ORDER BY ord DESC, rowid LIMIT 10;
+----
+
+statement ok
+RESET disabled_optimizers;
+
+# LIMIT + OFFSET — survivor set must account for skipped rows.
+query II nosort refoffset
+SELECT rowid, payload FROM example.data.late_mat ORDER BY ord, rowid LIMIT 10 OFFSET 20;
+----
+
+statement ok
+SET disabled_optimizers='late_materialization';
+
+query II nosort refoffset
+SELECT rowid, payload FROM example.data.late_mat ORDER BY ord, rowid LIMIT 10 OFFSET 20;
+----
+
+statement ok
+RESET disabled_optimizers;
+
+# ============================================================================
+# USING SAMPLE — the third late-mat trigger (reservoir, fixed row count ≤
+# late_materialization_max_rows). Sampling is random so we can't compare
+# unordered rows directly without a seed; instead we assert (a) the rewrite
+# fires, (b) exact cardinality, (c) the rowid↔payload pairing is preserved —
+# the key correctness property: a broken rowid pushdown would re-fetch the wrong
+# wide rows and break `payload == 'payload_' || rowid` — and (d) a SEEDED sample
+# is identical with late-mat on vs off.
+# ============================================================================
+
+# (a) structural: SAMPLE n ROWS rewrites to a SEMI join.
+query II
+EXPLAIN SELECT rowid, payload FROM example.data.late_mat USING SAMPLE 10 ROWS;
+----
+physical_plan	<REGEX>:.*SEMI.*
+
+# (b) cardinality.
+query I
+SELECT count(*) FROM (SELECT rowid, payload FROM example.data.late_mat USING SAMPLE 10 ROWS);
+----
+10
+
+# (c) every sampled row is internally consistent — the wide column was fetched
+# for the correct rowid. 0 mismatches.
+query I
+SELECT count(*) FROM (
+    SELECT rowid, payload FROM example.data.late_mat USING SAMPLE 30 ROWS
+) WHERE payload != 'payload_' || rowid;
+----
+0
+
+# (d) a seeded sample is stable across the rewrite (late-mat must not change
+# which rows the reservoir picks).
+query I nosort refsample
+SELECT rowid FROM example.data.late_mat USING SAMPLE reservoir(10 ROWS) REPEATABLE (42)
+ORDER BY rowid;
+----
+
+statement ok
+SET disabled_optimizers='late_materialization';
+
+query I nosort refsample
+SELECT rowid FROM example.data.late_mat USING SAMPLE reservoir(10 ROWS) REPEATABLE (42)
+ORDER BY rowid;
+----
+
+statement ok
+RESET disabled_optimizers;
+
+# ============================================================================
+# Combined witness + correctness at the SAME k: the worker received exactly
+# k=30 rowids (IN-list) AND the rewritten result equals the reference. Asserting
+# both together rules out "right filter pushed, wrong rows returned" (and vice
+# versa).
+# ============================================================================
+
+query II nosort ref30
+SELECT rowid, payload FROM example.data.late_mat ORDER BY ord, rowid LIMIT 30;
+----
+
+statement ok
+SET disabled_optimizers='late_materialization';
+
+query II nosort ref30
+SELECT rowid, payload FROM example.data.late_mat ORDER BY ord, rowid LIMIT 30;
+----
+
+statement ok
+RESET disabled_optimizers;
+
+# ============================================================================
+# Projection independence (worker-contract invariant 3): rowid must not depend
+# on which other columns are projected. RemoveUnusedColumns prunes the RHS to
+# different column sets for the two scans, so the rowid set must be identical
+# whether or not payload is also projected.
+# ============================================================================
+
+query I
+(SELECT rowid FROM example.data.late_mat ORDER BY ord, rowid LIMIT 25)
+EXCEPT
+(SELECT rowid FROM (SELECT rowid, payload FROM example.data.late_mat ORDER BY ord, rowid LIMIT 25));
+----
+
+# ============================================================================
+# NULL ordering: ord has NULLs (late_mat_nulls). NULLS FIRST / NULLS LAST must
+# match the reference — guards the OR(IsNull, DynamicFilter) relocation onto
+# the ordering scan. Both directions are covered (LAST is the default and pushes
+# NULLs to the end, changing the survivor set vs FIRST).
+# ============================================================================
+
+query II nosort refnullsfirst
+SELECT rowid, payload FROM example.data.late_mat_nulls
+ORDER BY ord NULLS FIRST, rowid LIMIT 10;
+----
+
+query II nosort refnullslast
+SELECT rowid, payload FROM example.data.late_mat_nulls
+ORDER BY ord NULLS LAST, rowid LIMIT 10;
+----
+
+statement ok
+SET disabled_optimizers='late_materialization';
+
+query II nosort refnullsfirst
+SELECT rowid, payload FROM example.data.late_mat_nulls
+ORDER BY ord NULLS FIRST, rowid LIMIT 10;
+----
+
+query II nosort refnullslast
+SELECT rowid, payload FROM example.data.late_mat_nulls
+ORDER BY ord NULLS LAST, rowid LIMIT 10;
+----
+
+statement ok
+RESET disabled_optimizers;
+
+# ============================================================================
+# Worker-contract invariant 1 (UNIQUE rowid) — a deliberately non-unique rowid
+# (late_mat_dup, row_id = index // 2) produces WRONG results, which the C++
+# extension cannot defend: it trusts the worker's late_materialization opt-in.
+# The SEMI join matches BOTH physical rows sharing each surviving rowid, so a
+# bare-projection LIMIT k that materializes the wide column returns MORE than k
+# rows. This test DEMONSTRATES the divergence (rather than hiding it behind a
+# count(*) wrapper that prunes the wide scan): workers with non-unique rowids
+# MUST NOT advertise late_materialization.
+#
+# `WHERE payload LIKE` forces the wide column to stay in the plan so the
+# inflation actually surfaces. The unique table is the control — same shape, no
+# inflation.
+# ============================================================================
+
+# Non-unique rowid: inflated past the LIMIT (contract violation is real).
+query I
+SELECT count(*) > 10 FROM (
+    SELECT rowid, payload FROM example.data.late_mat_dup ORDER BY ord LIMIT 10
+) WHERE payload LIKE 'payload_%';
+----
+true
+
+# Unique rowid, identical query shape: exactly the LIMIT, no inflation.
+query I
+SELECT count(*) FROM (
+    SELECT rowid, payload FROM example.data.late_mat ORDER BY ord LIMIT 10
+) WHERE payload LIKE 'payload_%';
+----
+10
+
+# ============================================================================
+# Cross-process correctness (worker-contract invariant 2: snapshot stability).
+# The ordering scan and the wide scan are two independent init() round-trips.
+# With pool=false every acquire spawns a FRESH worker process, so the two scans
+# provably resolve the same rowids in different processes — the real pool/HTTP
+# deployment shape. rowid == row index is stable, so results must still equal
+# the pooled reference.
+# ============================================================================
+
+statement ok
+ATTACH 'example' AS np (TYPE vgi, LOCATION '${VGI_TEST_WORKER}', pool false);
+
+query II
+(SELECT rowid, payload FROM np.data.late_mat ORDER BY ord, rowid LIMIT 10)
+EXCEPT
+(SELECT rowid, payload FROM example.data.late_mat ORDER BY ord, rowid LIMIT 10);
+----
+
+statement ok
+DETACH np;
+
+statement ok
+DETACH example;

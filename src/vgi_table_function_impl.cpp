@@ -164,6 +164,12 @@ static void ApplyBindResultToBindData(ClientContext &context, VgiTableFunctionBi
 	if (bind_data.rowid_worker_col_index >= 0) {
 		auto idx = static_cast<size_t>(bind_data.rowid_worker_col_index);
 		if (idx < return_types.size()) {
+			// Capture the rowid field name BEFORE erasing it — a pushed filter on
+			// the rowid virtual column (COLUMN_IDENTIFIER_ROW_ID) must carry this
+			// name so the worker can match/apply it. all_column_names below has
+			// the rowid removed, so indexing it by rowid_worker_col_index would
+			// resolve to the wrong (shifted) column.
+			bind_data.rowid_column_name = names[idx];
 			return_types.erase(return_types.begin() + idx);
 			names.erase(names.begin() + idx);
 		}
@@ -183,6 +189,66 @@ static void ApplyBindResultToBindData(ClientContext &context, VgiTableFunctionBi
 		fields.emplace_back("num_columns", std::to_string(bind_data.bind_result.output_schema->num_fields()));
 		VGI_LOG(context, "table_function.bind_result", fields);
 	}
+}
+
+unique_ptr<FunctionData> VgiTableFunctionBindData::Copy() const {
+	auto result = make_uniq<VgiTableFunctionBindData>();
+
+	// Worker identification + invocation inputs (shared_ptr / value copies).
+	result->attach_params = attach_params;
+	result->attach_opaque_data = attach_opaque_data;
+	result->transaction_opaque_data = transaction_opaque_data;
+	result->function_name = function_name;
+	result->arguments = arguments;
+	result->settings = settings;
+	result->required_secrets = required_secrets;
+
+	// Arrow conversion state. arrow_table holds shared_ptr<ArrowType> entries
+	// that are immutable and self-contained, so copy-by-value is safe and needs
+	// no ClientContext. The C-ABI export is rebuilt from the (copyable) arrow
+	// schema so the clone owns its own ArrowSchema lifetime.
+	result->arrow_table = arrow_table;
+	if (bind_result.output_schema) {
+		ExportSchema(bind_result.output_schema, result->c_schema);
+	}
+
+	// Execution hints + capability flags.
+	result->max_processes = max_processes;
+	result->fixed_order = fixed_order;
+	result->supports_batch_index = supports_batch_index;
+	result->partition_kind = partition_kind;
+	result->partition_column_indices = partition_column_indices;
+	result->cardinality_estimate = cardinality_estimate;
+	result->cardinality_max = cardinality_max;
+	result->cardinality_fetched = cardinality_fetched;
+	result->projection_pushdown = projection_pushdown;
+	result->supported_expression_filters = supported_expression_filters;
+
+	result->all_column_names = all_column_names;
+	result->all_column_types = all_column_types;
+	result->table_entry = table_entry;
+	result->rowid_worker_col_index = rowid_worker_col_index;
+	result->rowid_type = rowid_type;
+	result->rowid_column_name = rowid_column_name;
+	result->bind_result = bind_result;
+	// Base TableFunctionData::column_ids — the VGI bind path leaves this empty
+	// (column ids live on the local state from input.column_ids, not here), but
+	// copy it for robustness so a future writer can't silently lose it on clone.
+	result->column_ids = column_ids;
+
+	// statistics_mutex / statistics_cache / statistics_fetched are deliberately
+	// left fresh — the clone re-fetches per-column stats lazily on demand.
+
+	// order_by_hint / table_sample_hint are intentionally NOT copied. They are
+	// per-plan-node optimizer hints (set by RowGroupPruner / SamplingPushdown
+	// for the original scan position). The late-materialization clone is a
+	// distinct plan node — propagating a stale ORDER BY + LIMIT hint onto it
+	// would wrongly cap the cloned scan's row output.
+
+	result->at_unit = at_unit;
+	result->at_value = at_value;
+
+	return std::move(result);
 }
 
 void PerformVgiTableFunctionBind(ClientContext &context, VgiTableFunctionBindData &bind_data,
@@ -776,7 +842,8 @@ private:
 
 SerializedFilters VgiSerializeFilters(ClientContext &context, const vector<column_t> &column_ids,
                                       optional_ptr<TableFilterSet> filters,
-                                      const vector<string> &column_names, const string &worker_path) {
+                                      const vector<string> &column_names, const string &worker_path,
+                                      const string &rowid_column_name) {
 	// Return empty if no filters
 	if (!filters || filters->filters.empty()) {
 		return {nullptr, {}};
@@ -801,9 +868,29 @@ SerializedFilters VgiSerializeFilters(ClientContext &context, const vector<colum
 		// Map through column_ids to get the original schema column name, but keep the
 		// projected index as column_index since the worker output follows projection order.
 		idx_t original_col_idx = col_idx < column_ids.size() ? column_ids[col_idx] : col_idx;
-		string col_name =
-		    original_col_idx < column_names.size() ? column_names[original_col_idx] : std::to_string(original_col_idx);
+		// A filter on the rowid virtual column carries the COLUMN_IDENTIFIER_ROW_ID
+		// sentinel (UINT64_MAX). Without remapping, col_name would become the literal
+		// "18446744073709551615" and the worker — which resolves pushed/join-key columns
+		// by name — would silently drop it (the late-materialization semi-join still
+		// guarantees correctness, but the rowid IN-list / min-max pushdown is lost).
+		// Resolve to the worker's actual rowid field name (passed explicitly because
+		// column_names has the rowid column erased — indexing it would mis-resolve).
+		string col_name;
+		if (original_col_idx == COLUMN_IDENTIFIER_ROW_ID && !rowid_column_name.empty()) {
+			col_name = rowid_column_name;
+		} else {
+			col_name =
+			    original_col_idx < column_names.size() ? column_names[original_col_idx] : std::to_string(original_col_idx);
+		}
 
+		// `col_idx` is the filter's position in the projected column_ids and is
+		// sent as the wire `column_index`. The worker applies ConstantFilter /
+		// InFilter by INDEX (`batch.column(column_index)`), so this only resolves
+		// correctly because the worker emits its output batch in the same
+		// projected order (`project_schema(projection_ids, ...)`): emitted-batch
+		// position == projected column_ids position. A worker that reorders its
+		// emitted columns relative to projection_ids would mis-apply pushed
+		// filters. (Join-key IN filters are additionally matched by name.)
 		if (filter.filter_type == TableFilterType::OPTIONAL_FILTER) {
 			// Optional filters (e.g., DynamicFilter from TOP-N) may contain unserializable
 			// children. Skip them rather than failing the entire filter set.
@@ -1077,7 +1164,8 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 	SerializedFilters serialized_filters;
 	try {
 		serialized_filters =
-		    VgiSerializeFilters(context, input.column_ids, input.filters, bind_data.all_column_names, bind_data.worker_path());
+		    VgiSerializeFilters(context, input.column_ids, input.filters, bind_data.all_column_names,
+		                        bind_data.worker_path(), bind_data.rowid_column_name);
 		if (serialized_filters.filter_bytes) {
 			VGI_LOG(context, "table_function.filters_serialized",
 			        {{"function_name", bind_data.function_name},
@@ -1151,9 +1239,19 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 			auto &filter = *entry.second;
 
 			idx_t original_col_idx = col_idx < input.column_ids.size() ? input.column_ids[col_idx] : col_idx;
-			string col_name = original_col_idx < bind_data.all_column_names.size()
-			                      ? bind_data.all_column_names[original_col_idx]
-			                      : std::to_string(original_col_idx);
+			// Same rowid-sentinel remap as VgiSerializeFilters: name the rowid
+			// column with the worker's actual field name. Defensive — the rowid
+			// late-mat filter is a concrete CONJUNCTION_AND/InFilter, not a captured
+			// DynamicFilter, so it normally doesn't reach this loop, but a future
+			// rowid DynamicFilter would otherwise be misnamed.
+			string col_name;
+			if (original_col_idx == COLUMN_IDENTIFIER_ROW_ID && !bind_data.rowid_column_name.empty()) {
+				col_name = bind_data.rowid_column_name;
+			} else {
+				col_name = original_col_idx < bind_data.all_column_names.size()
+				               ? bind_data.all_column_names[original_col_idx]
+				               : std::to_string(original_col_idx);
+			}
 
 			if (filter.filter_type == TableFilterType::OPTIONAL_FILTER) {
 				try_capture_from_optional(original_col_idx, col_name, filter.Cast<OptionalFilter>());

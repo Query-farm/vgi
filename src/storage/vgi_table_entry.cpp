@@ -460,6 +460,7 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 	bool has_projection_pushdown = false;
 	bool has_filter_pushdown = false;
 	bool has_sampling_pushdown = false;
+	bool has_late_materialization = false;
 	// Default to INSERTION_ORDER (same as DuckDB's TableFunction default).
 	// Overridden below to the resolved function's declared preservation when
 	// at least one overload of the bound function pins it — required so the
@@ -498,6 +499,12 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 				auto &vgi_tf_info = tf.function_info->Cast<vgi::VgiTableFunctionInfo>();
 				scan_required_secrets = vgi_tf_info.function_info().required_secrets;
 				scan_supported_expression_filters = vgi_tf_info.function_info().supported_expression_filters;
+				// late_materialization is advertised on the parsed worker metadata
+				// (VgiFunctionInfo), not on DuckDB's TableFunction — the synthetic
+				// vgi_table_scan below is constructed fresh, so read the capability
+				// here and gate func.late_materialization on it.
+				has_late_materialization =
+				    has_late_materialization || vgi_tf_info.function_info().late_materialization.value_or(false);
 			}
 		}
 	}
@@ -605,6 +612,18 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 	if (table_info_.row_id_column >= 0) {
 		func.get_virtual_columns = vgi::VgiTableScanGetVirtualColumns;
 		func.get_row_id_columns = vgi::VgiTableScanGetRowIdColumns;
+
+		// Opt into DuckDB's late-materialization optimizer only when the worker
+		// advertises the capability AND the surviving rowids can be pushed back
+		// to the wide re-scan (filter_pushdown) over a pruned projection
+		// (projection_pushdown). Without filter_pushdown the RHS scan returns the
+		// whole table — a net loss (extra scan + semi-join, no pruning). The
+		// rowid virtual column required by the optimizer is registered just
+		// above (row_id_column >= 0), so this branch is the only place the flag
+		// can be safely set; the direct vgi_table_function() path registers no
+		// rowid callbacks and must stay false.
+		func.late_materialization =
+		    has_late_materialization && has_filter_pushdown && has_projection_pushdown;
 	}
 
 	return func;

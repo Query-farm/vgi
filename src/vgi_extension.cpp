@@ -421,6 +421,14 @@ private:
 					col_ids_raw.push_back(idx.IsVirtualColumn() ? COLUMN_IDENTIFIER_ROW_ID
 					                                            : idx.GetPrimaryIndex());
 				}
+				// NOTE: this is the only site that produces COLUMN_IDENTIFIER_ROW_ID
+				// without passing a rowid_column_name to VgiSerializeFilters, so a
+				// rowid filter here would serialize with the literal sentinel name.
+				// This is currently unreachable: multi-branch tables rewrite to a
+				// UNION ALL of branch functions (not a single rowid scan), and
+				// late_materialization is gated to the catalog-table scan path. If
+				// rowid pushdown is ever added here, thread the rowid field name
+				// through (see VgiTableFunctionBindData::rowid_column_name).
 				auto serialized = vgi::VgiSerializeFilters(
 				    context, col_ids_raw, &get.table_filters,
 				    rewritten->all_column_names, worker_path);

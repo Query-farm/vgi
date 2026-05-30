@@ -2435,6 +2435,9 @@ VgiFunctionInfo ParseFunctionInfo(const std::shared_ptr<arrow::RecordBatch> &bat
 	info.projection_pushdown = row["projection_pushdown"].as<bool>();
 	info.filter_pushdown = row["filter_pushdown"].as<bool>();
 	info.sampling_pushdown = row["sampling_pushdown"].as<bool>();
+	// nullopt for older workers whose metadata schema lacks the column — the
+	// gate in vgi_table_entry.cpp treats that as "not capable".
+	info.late_materialization = row["late_materialization"].as<bool>();
 	info.supported_expression_filters = row["supported_expression_filters"].value_or(std::vector<std::string> {});
 
 	// max_workers (nullable int, stored as optional)

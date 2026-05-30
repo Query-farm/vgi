@@ -572,6 +572,12 @@ struct VgiFunctionInfo {
 	std::optional<bool> projection_pushdown;
 	std::optional<bool> filter_pushdown;
 	std::optional<bool> sampling_pushdown;
+	// True when the worker advertises that the table participates in DuckDB's
+	// late-materialization optimizer (Meta.late_materialization). nullopt/false
+	// for older workers that omit the metadata column. Only honoured when the
+	// table also exposes a rowid virtual column and filter/projection pushdown
+	// (see GetScanFunctionImpl in vgi_table_entry.cpp).
+	std::optional<bool> late_materialization;
 	std::optional<VgiOrderPreservation> order_preservation;
 	std::optional<int32_t> max_workers;
 

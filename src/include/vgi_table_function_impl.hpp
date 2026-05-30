@@ -197,6 +197,12 @@ struct VgiTableFunctionBindData : public TableFunctionData {
 	int rowid_worker_col_index = -1;
 	// DuckDB type for the row_id column (INVALID when rowid_worker_col_index == -1)
 	LogicalType rowid_type = LogicalType::INVALID;
+	// Worker-schema field name of the rowid column (e.g. "row_id"). Captured at
+	// bind BEFORE the rowid is erased from all_column_names, so it survives for
+	// filter serialization — a filter on COLUMN_IDENTIFIER_ROW_ID must be named
+	// with this so the worker matches it (late-materialization rowid pushdown).
+	// Empty when rowid_worker_col_index < 0.
+	std::string rowid_column_name;
 
 	// Bind output retained for init phase and lazy cardinality / statistics
 	// RPCs. The init payload (BuildInitRequest) carries bind_request_bytes,
@@ -232,6 +238,15 @@ struct VgiTableFunctionBindData : public TableFunctionData {
 	// leaves them empty.
 	std::string at_unit;
 	std::string at_value;
+
+	//! Deep-copy for DuckDB's late-materialization optimizer, which clones the
+	//! LogicalGet (and hence this bind data) via CreateLHSGet to build the
+	//! narrow ordering-scan LHS. Shares the immutable Arrow conversion state
+	//! (ArrowType is self-contained, shared via shared_ptr) and rebuilds the
+	//! C-ABI schema export from bind_result.output_schema (context-free). The
+	//! per-bind statistics cache + its mutex are intentionally NOT copied — the
+	//! clone re-fetches lazily.
+	unique_ptr<FunctionData> Copy() const override;
 };
 
 // ============================================================================
@@ -556,9 +571,18 @@ struct SerializedFilters {
 //!
 //! If InFilter values are present and within size limits, each IN filter's values are
 //! serialized as a separate single-column Arrow IPC RecordBatch in join_keys_buffers.
+//!
+//! ``rowid_column_name`` (default empty = none) is the worker-schema field name
+//! of the table's rowid column. A filter on the rowid virtual column arrives with
+//! ``column_ids[col_idx] == COLUMN_IDENTIFIER_ROW_ID`` (UINT64_MAX); we name it
+//! with this so the worker — which matches pushed/join-key columns by name — can
+//! apply it (e.g. the rowid IN-list / min-max range pushed by DuckDB's
+//! late-materialization semi-join). It is passed explicitly (not looked up in
+//! ``column_names``) because ``column_names`` has the rowid column erased.
 SerializedFilters VgiSerializeFilters(ClientContext &context, const vector<column_t> &column_ids,
                                       optional_ptr<TableFilterSet> filters,
-                                      const vector<string> &column_names, const string &worker_path);
+                                      const vector<string> &column_names, const string &worker_path,
+                                      const string &rowid_column_name = "");
 
 //! Expression pushdown callback: checks if the expression tree only uses functions the worker supports
 bool VgiPushdownExpression(ClientContext &context, const LogicalGet &get, Expression &expr);
