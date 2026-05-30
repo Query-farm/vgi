@@ -31,3 +31,4 @@ jobs:
       use_prebuilt_images: true
       use_prebuilt_wasm_image: true
       prebuilt_image_tag: v1.5.3
+      extra_toolchains: parser_tools
