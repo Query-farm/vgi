@@ -5,7 +5,9 @@
                 {
                         "name": "arrow",
                         "default-features": false,
-                        "features": ["mimalloc"]
+                        "features": [
+                                { "name": "mimalloc", "platform": "!windows" }
+                        ]
                 }
         ],
         "vcpkg-configuration": {
