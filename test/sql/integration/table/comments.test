@@ -65,6 +65,56 @@ even_numbers	Even numbers from 0 to 98
 first_ten	First 10 integers
 
 # ============================================================================
+# View tags (via duckdb_views)
+# ============================================================================
+
+# first_ten declares view-level tags; even_numbers declares none (empty map).
+query TT
+SELECT view_name, tags
+FROM duckdb_views()
+WHERE database_name = 'example' AND schema_name = 'main'
+ORDER BY view_name;
+----
+even_numbers	{}
+first_ten	{layer=demo, origin=sequence}
+
+# ============================================================================
+# View column comments (via duckdb_columns)
+# ============================================================================
+
+# first_ten (main schema) carries a comment on its single output column `n`.
+query TT
+SELECT column_name, comment
+FROM duckdb_columns()
+WHERE database_name = 'example' AND schema_name = 'main'
+  AND table_name = 'first_ten'
+ORDER BY column_name;
+----
+n	Sequence index 0..9
+
+# small_numbers (data schema) carries a comment on its `value` column —
+# exercises a view column comment outside the default schema, aligned by name.
+query TT
+SELECT column_name, comment
+FROM duckdb_columns()
+WHERE database_name = 'example' AND schema_name = 'data'
+  AND table_name = 'small_numbers'
+ORDER BY column_name;
+----
+value	Single-digit value 0..9
+
+# even_numbers has a view-level comment but no column comments, so its column
+# `n` must report a NULL comment (commented view != commented columns).
+query TT
+SELECT column_name, comment
+FROM duckdb_columns()
+WHERE database_name = 'example' AND schema_name = 'main'
+  AND table_name = 'even_numbers'
+ORDER BY column_name;
+----
+n	NULL
+
+# ============================================================================
 # Column comments on products table (via duckdb_columns)
 # ============================================================================
 

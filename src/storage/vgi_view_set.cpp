@@ -31,6 +31,11 @@ static unique_ptr<ViewCatalogEntry> CreateViewEntryFromInfo(Catalog &catalog, Sc
 	for (auto &[key, val] : view_info.tags) {
 		info.tags[key] = val;
 	}
+	// Per-column comments — DuckDB aligns these by name against the columns it
+	// binds from the view's SQL and exposes them via duckdb_columns().
+	for (auto &[col, comment] : view_info.column_comments) {
+		info.column_comments_map[col] = Value(comment);
+	}
 	// Parse SQL to get SelectStatement
 	try {
 		Parser parser;

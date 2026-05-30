@@ -467,6 +467,9 @@ struct VgiViewInfo {
 	std::string definition; // SQL query defining the view
 	std::string comment;
 	std::map<std::string, std::string> tags;
+	// Per-column comments keyed by the view's output column name. Fed into
+	// CreateViewInfo.column_comments_map so they surface via duckdb_columns().
+	std::map<std::string, std::string> column_comments;
 };
 
 // Macro metadata from the worker

@@ -395,7 +395,14 @@ void VgiSchemaEntry::Scan(ClientContext &context, CatalogType type,
                           const std::function<void(CatalogEntry &)> &callback) {
 	switch (type) {
 	case CatalogType::TABLE_ENTRY:
+		// DuckDB stores tables and views in a single CatalogSet, so a TABLE_ENTRY
+		// scan naturally surfaces both — duckdb_tables()/duckdb_constraints() then
+		// skip non-table entries by type, while duckdb_columns() dispatches views
+		// to its ViewColumnHelper (which binds the view to expose its columns and
+		// column comments). VGI keeps views in a separate set, so we must include
+		// them here too; otherwise VGI views never appear in duckdb_columns().
 		tables_.Scan(context, callback);
+		views_.Scan(context, callback);
 		break;
 	case CatalogType::VIEW_ENTRY:
 		views_.Scan(context, callback);

@@ -1952,6 +1952,7 @@ VgiViewInfo ParseViewInfo(const std::shared_ptr<arrow::RecordBatch> &batch, cons
 	info.definition = row["definition"].value_not_null<std::string>();
 	info.comment = row["comment"].value_or("");
 	info.tags = row["tags"].value_not_null<std::map<std::string, std::string>>();
+	info.column_comments = row["column_comments"].value_not_null<std::map<std::string, std::string>>();
 
 	return info;
 }
