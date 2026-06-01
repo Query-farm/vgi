@@ -1,0 +1,69 @@
+# name: test/sql/integration/table/required_field_filter_paths_struct.test
+# description: Struct-subfield required paths (rff_struct, rff_nested)
+# group: [vgi_integration_table]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# rff_struct — required ('s.a', 's.b').
+# ============================================================================
+
+# Empty WHERE → reject; both subfields listed as missing.
+statement error
+SELECT * FROM example.data.rff_struct;
+----
+Table 'example.data.rff_struct' requires WHERE filters on: s.a, s.b. Missing: s.a, s.b.
+
+# Only s.a → reject (s.b missing).
+statement error
+SELECT * FROM example.data.rff_struct WHERE s.a = 1;
+----
+Missing: s.b.
+
+# Only s.b → reject (s.a missing).
+statement error
+SELECT * FROM example.data.rff_struct WHERE s.b = 10;
+----
+Missing: s.a.
+
+# Both subfields → rows.
+query II
+SELECT s.a, s.b FROM example.data.rff_struct WHERE s.a = 1 AND s.b = 10;
+----
+1	10
+
+# Filter on the unrelated 'other' column alone → reject.
+statement error
+SELECT * FROM example.data.rff_struct WHERE other = 100;
+----
+Missing: s.a, s.b.
+
+# Both subfields plus 'other' → rows.
+query III
+SELECT s.a, s.b, other FROM example.data.rff_struct
+WHERE s.a = 2 AND s.b = 20 AND other = 200;
+----
+2	20	200
+
+# ============================================================================
+# rff_nested — required ('wrapper.mid.leaf') — 3-deep struct subfield.
+# ============================================================================
+
+statement error
+SELECT * FROM example.data.rff_nested;
+----
+Missing: wrapper.mid.leaf.
+
+# Filter on the actual leaf subfield → rows.
+query I
+SELECT wrapper.mid.leaf FROM example.data.rff_nested WHERE wrapper.mid.leaf = 1;
+----
+1
+
+statement ok
+DETACH example;

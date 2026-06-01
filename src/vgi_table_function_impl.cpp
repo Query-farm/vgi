@@ -465,6 +465,10 @@ struct JoinKeysInfo {
 	const vector<Value> *values; // borrowed from InFilter::values
 };
 
+} // namespace (anonymous) — break out so VgiContainsDynamicFilter gets
+  // external linkage matching its declaration in vgi_table_function_impl.hpp.
+  // The VgiRequiredFiltersOptimizer in vgi_extension.cpp calls it across TU.
+
 //! Returns true if any descendant of ``filter`` is a DynamicFilter (Top-N
 //! tick-time bound). The static filter serializer must skip an entire
 //! OptionalFilter subtree when this is true: the DynamicFilter has no value
@@ -474,14 +478,14 @@ struct JoinKeysInfo {
 //! drop rows that were supposed to flow. The dynamic-filter mechanism in
 //! TickFilterPushdown re-pushes the filter at tick time once Top-N has
 //! established its threshold.
-static bool ContainsDynamicFilter(const TableFilter &filter) {
+bool VgiContainsDynamicFilter(const TableFilter &filter) {
 	switch (filter.filter_type) {
 	case TableFilterType::DYNAMIC_FILTER:
 		return true;
 	case TableFilterType::CONJUNCTION_AND: {
 		auto &conj = filter.Cast<ConjunctionAndFilter>();
 		for (auto &child : conj.child_filters) {
-			if (ContainsDynamicFilter(*child)) {
+			if (VgiContainsDynamicFilter(*child)) {
 				return true;
 			}
 		}
@@ -490,7 +494,7 @@ static bool ContainsDynamicFilter(const TableFilter &filter) {
 	case TableFilterType::CONJUNCTION_OR: {
 		auto &conj = filter.Cast<ConjunctionOrFilter>();
 		for (auto &child : conj.child_filters) {
-			if (ContainsDynamicFilter(*child)) {
+			if (VgiContainsDynamicFilter(*child)) {
 				return true;
 			}
 		}
@@ -498,16 +502,18 @@ static bool ContainsDynamicFilter(const TableFilter &filter) {
 	}
 	case TableFilterType::OPTIONAL_FILTER: {
 		auto &opt = filter.Cast<OptionalFilter>();
-		return opt.child_filter && ContainsDynamicFilter(*opt.child_filter);
+		return opt.child_filter && VgiContainsDynamicFilter(*opt.child_filter);
 	}
 	case TableFilterType::STRUCT_EXTRACT: {
 		auto &sf = filter.Cast<StructFilter>();
-		return sf.child_filter && ContainsDynamicFilter(*sf.child_filter);
+		return sf.child_filter && VgiContainsDynamicFilter(*sf.child_filter);
 	}
 	default:
 		return false;
 	}
 }
+
+namespace { // reopen anonymous namespace for the file-local FilterSerializer.
 
 //! FilterSerializer walks the filter tree, builds JSON, and collects values
 class FilterSerializer {
@@ -702,7 +708,7 @@ private:
 				return false;
 			}
 			// Skip the entire OptionalFilter when its subtree contains a
-			// DynamicFilter — see the comment on ContainsDynamicFilter for why.
+			// DynamicFilter — see the comment on VgiContainsDynamicFilter for why.
 			// The dynamic-filter mechanism captures DynamicFilters via
 			// try_capture_from_optional and pushes them per-tick once Top-N
 			// has established a threshold; serializing the static portion
@@ -711,7 +717,7 @@ private:
 			// SELECT n FROM filter_echo(10) ORDER BY n NULLS FIRST LIMIT 3
 			// returned 0 rows because OR(IsNull, DynamicFilter) collapsed
 			// to a one-child OR(IsNull) once the DynamicFilter was elided.)
-			if (ContainsDynamicFilter(*optional_filter.child_filter)) {
+			if (VgiContainsDynamicFilter(*optional_filter.child_filter)) {
 				return false;
 			}
 			return SerializeFilterInto(obj, *optional_filter.child_filter, column_index, column_name);

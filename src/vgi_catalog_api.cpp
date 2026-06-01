@@ -1903,6 +1903,13 @@ VgiTableInfo ParseTableInfo(ClientContext &context, const std::shared_ptr<arrow:
 		    bind_bytes.empty() ? std::nullopt : std::make_optional(std::move(bind_bytes));
 	}
 
+	// Parse required_field_filter_paths (optional, backward-compatible —
+	// missing column or empty list means no enforcement). The optimizer
+	// extension VgiRequiredFiltersOptimizer reads these from the cached
+	// VgiTableInfo at bind/optimize time.
+	info.required_field_filter_paths =
+	    row["required_field_filter_paths"].value_or(std::vector<std::string>{});
+
 	// Validate: UPDATE/DELETE require a row ID column
 	if ((info.supports_update || info.supports_delete) && info.row_id_column < 0) {
 		throw InvalidInputException(

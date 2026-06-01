@@ -8,6 +8,7 @@
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/extension_helper.hpp"
+#include "duckdb/parser/tableref/table_function_ref.hpp"
 #include "duckdb/planner/tableref/bound_at_clause.hpp"
 #include "duckdb/storage/table_storage_info.hpp"
 
@@ -20,6 +21,36 @@
 #include "vgi_worker_pool.hpp"
 
 namespace duckdb {
+
+// VgiNativeDelegationMarkerBindData is declared in storage/vgi_table_entry.hpp
+// so VgiRequiredFiltersOptimizer (vgi_extension.cpp) can dynamic_cast against
+// it. See the header for full docstring and lifecycle.
+
+namespace {
+
+// Marker placeholder TableFunction — never executed; the optimizer
+// extension must replace it. Mirrors MakeMultiBranchMarkerFunction in
+// vgi_multi_scan_rewriter.cpp.
+void NativeDelegationMarkerExecute(ClientContext &, TableFunctionInput &, DataChunk &) {
+	throw InternalException(
+	    "VgiRequiredFiltersOptimizer did not fire — native-delegation placeholder "
+	    "reached execution. Check that the optimizer extension is registered and "
+	    "that no other pass dropped the marker. This is a bug — please report it.");
+}
+
+}  // namespace
+
+TableFunction MakeNativeDelegationMarkerFunction() {
+	TableFunction fn("vgi_native_delegation_marker", {}, NativeDelegationMarkerExecute);
+	// No bind callback — bind_data is supplied externally by GetScanFunctionImpl.
+	// No init_global / init_local — the marker should never be executed.
+	// filter_pushdown=true so DuckDB's FilterPushdown still installs filters
+	// on this LogicalGet's table_filters; the rewriter then hands them off to
+	// the real native function on the rewritten LogicalGet.
+	fn.filter_pushdown = true;
+	fn.projection_pushdown = true;
+	return fn;
+}
 
 VgiTableEntry::VgiTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateTableInfo &info,
                              const vgi::VgiTableInfo &table_info)
@@ -481,6 +512,111 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 			func_entry = catalog_.GetEntry<TableFunctionCatalogEntry>(
 			    context, default_schema, scan_result.function_name, OnEntryNotFound::RETURN_NULL);
 		}
+	}
+	bool from_system_catalog = false;
+	if (!func_entry) {
+		// Last-resort fallback to the system catalog for built-in DuckDB
+		// table functions like `read_parquet` or `iceberg_scan` that workers
+		// declare via ScanFunctionResult. The multi-branch rewriter
+		// (vgi_multi_scan_rewriter.cpp:203) already does this fallback —
+		// mirror it for the single-branch path so workers can delegate scans
+		// to native DuckDB functions without going through a UNION ALL.
+		EntryLookupInfo lookup(CatalogType::TABLE_FUNCTION_ENTRY, scan_result.function_name);
+		auto sys_entry = Catalog::GetEntry(context, SYSTEM_CATALOG, DEFAULT_SCHEMA, lookup,
+		                                   OnEntryNotFound::RETURN_NULL);
+		if (sys_entry) {
+			func_entry = &sys_entry->Cast<TableFunctionCatalogEntry>();
+			from_system_catalog = true;
+		}
+	}
+
+	if (from_system_catalog && func_entry) {
+		// Native delegation: bind the system function eagerly here, then return
+		// a marker carrying the bound function + bind_data + return shapes.
+		// VgiRequiredFiltersOptimizer (vgi_extension.cpp) enforces this table's
+		// `required_field_filter_paths` against the LogicalGet's table_filters,
+		// then swaps `function` / `bind_data` / `returned_types` / `names` in
+		// place to the stashed native ones. Subsequent passes see a vanilla
+		// native scan. Matches VgiMultiScanRewriter's per-arm binding shape
+		// (vgi_multi_scan_rewriter.cpp:219-247) but for the single-branch path.
+		vector<LogicalType> arg_types;
+		arg_types.reserve(scan_result.positional_arguments.size());
+		for (const auto &v : scan_result.positional_arguments) {
+			arg_types.push_back(v.type());
+		}
+		TableFunction native_tf =
+		    func_entry->functions.GetFunctionByArguments(context, arg_types);
+		vector<Value> parameters(scan_result.positional_arguments.begin(),
+		                          scan_result.positional_arguments.end());
+		named_parameter_map_t named_parameters;
+		for (auto &kv : scan_result.named_arguments) {
+			named_parameters.emplace(kv.first, kv.second);
+		}
+		vector<LogicalType> input_table_types;
+		vector<string> input_table_names;
+		TableFunctionRef ref;
+		TableFunctionBindInput bind_input(parameters, named_parameters, input_table_types,
+		                                   input_table_names, native_tf.function_info.get(),
+		                                   nullptr, native_tf, ref);
+		vector<LogicalType> return_types;
+		vector<string> return_names;
+		auto native_bind = native_tf.bind(context, bind_input, return_types, return_names);
+		virtual_column_map_t native_virtual_columns;
+		if (native_tf.get_virtual_columns) {
+			native_virtual_columns = native_tf.get_virtual_columns(context, native_bind.get());
+		}
+
+		// Validate the catalog's declared columns match the native bind's
+		// output by position+name. The LogicalGet that DuckDB constructs uses
+		// the catalog's column list for FilterPushdown's column_ids /
+		// table_filters keys; if the native function emits a different shape,
+		// those indices mis-resolve once VgiRequiredFiltersOptimizer rewrites
+		// the marker. Two common causes:
+		//   - The worker's pa.Schema source omits Hive-partition columns that
+		//     the native bind appends (read_parquet on `theme=…/type=…/*`).
+		//   - The worker introspected against a different release than what
+		//     the URL points at.
+		// Either way the right move is to fail loudly here so the worker
+		// author sees the mismatch immediately instead of silent column
+		// misrouting at scan time.
+		{
+			const auto &decl_columns = GetColumns();
+			const auto decl_count = decl_columns.LogicalColumnCount();
+			if (decl_count != return_names.size()) {
+				throw BinderException(
+				    "VGI native delegation for '%s.%s.%s' (function '%s'): catalog declares "
+				    "%llu column(s) but the native bind returned %llu. The catalog's columns "
+				    "must match exactly what the native function emits at scan time (positions "
+				    "+ names). Common cause: Hive-partition columns that read_parquet appends "
+				    "but the worker's schema source omitted.",
+				    catalog_.GetName(), ParentSchema().name, name, scan_result.function_name,
+				    static_cast<unsigned long long>(decl_count),
+				    static_cast<unsigned long long>(return_names.size()));
+			}
+			for (idx_t i = 0; i < decl_count; ++i) {
+				const auto &decl_name = decl_columns.GetColumn(LogicalIndex(i)).Name();
+				if (decl_name != return_names[i]) {
+					throw BinderException(
+					    "VGI native delegation for '%s.%s.%s' (function '%s'): catalog "
+					    "declared column %llu as '%s' but the native bind returned '%s'. "
+					    "Names must match by position.",
+					    catalog_.GetName(), ParentSchema().name, name, scan_result.function_name,
+					    static_cast<unsigned long long>(i), decl_name, return_names[i]);
+				}
+			}
+		}
+
+		auto function_name_log = scan_result.function_name;
+		bind_data = make_uniq<VgiNativeDelegationMarkerBindData>(
+		    *this, std::move(native_tf), std::move(native_bind), std::move(return_types),
+		    std::move(return_names), std::move(native_virtual_columns), std::move(scan_result),
+		    attach_params->worker_path());
+
+		VGI_LOG(context, "vgi.scan_function.native_delegation_marker",
+		        {{"schema", ParentSchema().name},
+		         {"table", name},
+		         {"function", function_name_log}});
+		return MakeNativeDelegationMarkerFunction();
 	}
 	if (func_entry) {
 		for (auto &tf : func_entry->functions.functions) {

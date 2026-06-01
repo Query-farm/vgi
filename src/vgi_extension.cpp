@@ -21,9 +21,22 @@
 #include "duckdb/parser/parsed_data/attach_info.hpp"
 #include "duckdb/main/client_config.hpp"
 #include "duckdb/main/settings.hpp"
+#include "duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp"
 #include "duckdb/optimizer/optimizer_extension.hpp"
 #include "duckdb/parser/expression/window_expression.hpp"
+#include "duckdb/parser/tableref/table_function_ref.hpp"
+#include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_window_expression.hpp"
+#include "duckdb/planner/expression_iterator.hpp"
+#include "duckdb/planner/filter/conjunction_filter.hpp"
+#include "duckdb/planner/filter/constant_filter.hpp"
+#include "duckdb/planner/filter/in_filter.hpp"
+#include "duckdb/planner/filter/null_filter.hpp"
+#include "duckdb/planner/filter/optional_filter.hpp"
+#include "duckdb/planner/filter/struct_filter.hpp"
+#include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_window.hpp"
 #include "duckdb/storage/storage_extension.hpp"
@@ -514,6 +527,393 @@ private:
 			return;
 		}
 		Rewrite(plan, input.context);
+	}
+};
+
+// ============================================================================
+// VgiRequiredFiltersOptimizer — enforce Table.required_field_filter_paths
+// ============================================================================
+// Walks the plan post-FilterPushdown. For each LogicalGet whose underlying
+// table is a VgiTableEntry with a non-empty `required_field_filter_paths`,
+// collects the dotted-path column references touched by any filter expression
+// in scope (the LogicalGet's table_filters plus any parent LogicalFilter
+// expressions referencing this LogicalGet's table_index). Throws
+// BinderException listing any required path that is not satisfied (prefix-
+// inclusive: a present `bbox` satisfies all of `bbox.xmin` / `.xmax` / etc.).
+//
+// Phase: optimize_function (post-optimize), so DuckDB's FilterPushdown has
+// already settled filters into LogicalGet::table_filters.
+//
+// Cost: O(plan_size) for tables that have no requirements (empty list →
+// fast return after the cast); a small TableFilter tree walk + expression
+// walk per LogicalGet that does have requirements.
+class VgiRequiredFiltersOptimizer : public OptimizerExtension {
+public:
+	VgiRequiredFiltersOptimizer() {
+		optimize_function = Optimize;
+	}
+
+private:
+	// Append a dotted path to the present set.
+	static void EmitPath(unordered_set<std::string> &out, const std::string &top,
+	                     const std::string &suffix) {
+		if (suffix.empty()) {
+			out.insert(top);
+		} else {
+			out.insert(top + "." + suffix);
+		}
+	}
+
+	// Recursive walk over a TableFilter sub-tree, emitting dotted paths for
+	// every column reference. `top_col` is the LogicalGet column name; `suffix`
+	// grows as we descend into StructFilters. Mirrors the iteration shape of
+	// VgiSerializeFilters' JSON walker in vgi_table_function_impl.cpp:572+ but
+	// emits strings instead of building JSON.
+	static void WalkTableFilter(const TableFilter &filter, const std::string &top_col,
+	                            const std::string &suffix, unordered_set<std::string> &out) {
+		switch (filter.filter_type) {
+		case TableFilterType::CONSTANT_COMPARISON:
+		case TableFilterType::IS_NULL:
+		case TableFilterType::IS_NOT_NULL:
+		case TableFilterType::IN_FILTER:
+		case TableFilterType::EXPRESSION_FILTER:
+			EmitPath(out, top_col, suffix);
+			return;
+
+		case TableFilterType::CONJUNCTION_AND: {
+			auto &conj = filter.Cast<ConjunctionAndFilter>();
+			for (auto &child : conj.child_filters) {
+				WalkTableFilter(*child, top_col, suffix, out);
+			}
+			return;
+		}
+		case TableFilterType::CONJUNCTION_OR: {
+			auto &conj = filter.Cast<ConjunctionOrFilter>();
+			for (auto &child : conj.child_filters) {
+				WalkTableFilter(*child, top_col, suffix, out);
+			}
+			return;
+		}
+		case TableFilterType::STRUCT_EXTRACT: {
+			auto &sf = filter.Cast<StructFilter>();
+			std::string deeper = suffix.empty() ? sf.child_name : (suffix + "." + sf.child_name);
+			if (sf.child_filter) {
+				WalkTableFilter(*sf.child_filter, top_col, deeper, out);
+			} else {
+				EmitPath(out, top_col, deeper);
+			}
+			return;
+		}
+		case TableFilterType::OPTIONAL_FILTER: {
+			auto &opt = filter.Cast<OptionalFilter>();
+			// A null child_filter is a placeholder/sentinel — typically a Top-N
+			// OptionalFilter still waiting for a DynamicFilter value that never
+			// materialised. It is NOT a constraint, so we emit nothing. Mirrors
+			// the serializer at vgi_table_function_impl.cpp:699-703 which skips
+			// the OptionalFilter entirely in this case (returns false).
+			if (!opt.child_filter) {
+				return;
+			}
+			// Skip the entire OptionalFilter when its subtree contains a
+			// DynamicFilter — mirrors the serializer at
+			// vgi_table_function_impl.cpp:714-716. The static portion of a
+			// Top-N OptionalFilter (e.g. OR(IsNull, DynamicFilter)) is
+			// machinery, not user intent: emitting presence here would let a
+			// Top-N artifact spuriously satisfy a required_field_filter_paths
+			// requirement the user never wrote in their WHERE clause.
+			if (vgi::VgiContainsDynamicFilter(*opt.child_filter)) {
+				return;
+			}
+			WalkTableFilter(*opt.child_filter, top_col, suffix, out);
+			return;
+		}
+		case TableFilterType::DYNAMIC_FILTER:
+		case TableFilterType::BLOOM_FILTER: {
+			// Values aren't known at optimize time, but the column reference
+			// is — count it as presence so that join-derived filters satisfy
+			// requirements as the user intends.
+			EmitPath(out, top_col, suffix);
+			return;
+		}
+		default:
+			// Unknown future filter type — treat as presence so we don't
+			// over-reject the user.
+			EmitPath(out, top_col, suffix);
+			return;
+		}
+	}
+
+	// Resolve a BoundColumnRefExpression's binding.column_index (which is
+	// post-projection — an index into LogicalGet::column_ids) to the original
+	// column index in LogicalGet::names. Returns -1 for virtual columns or
+	// out-of-range bindings.
+	static int64_t ResolveOrigIndex(idx_t binding_col_idx,
+	                                const vector<ColumnIndex> &col_ids,
+	                                idx_t names_size) {
+		if (binding_col_idx >= col_ids.size()) {
+			return -1;
+		}
+		const auto &ci = col_ids[binding_col_idx];
+		if (ci.IsVirtualColumn()) {
+			return -1;
+		}
+		auto orig = ci.GetPrimaryIndex();
+		if (orig >= names_size) {
+			return -1;
+		}
+		return static_cast<int64_t>(orig);
+	}
+
+	// Walk an Expression for column refs whose binding resolves to the given
+	// LogicalGet. Emit top-level column names (or `col.subfield` for the
+	// `struct_extract(col, 'subfield')` shape that DuckDB uses to lower
+	// `col.sub` in expressions). `col_ids` and `names` come from the
+	// LogicalGet — `binding.column_index` is post-projection and must be
+	// resolved through `col_ids` before indexing `names`.
+	static void WalkExpression(const Expression &expr, idx_t target_table_index,
+	                           const vector<ColumnIndex> &col_ids,
+	                           const vector<std::string> &names,
+	                           unordered_set<std::string> &out) {
+		// Detect `struct_extract(<col_ref>, '<subfield>')`. DuckDB exposes this
+		// either as a BoundFunctionExpression with function name "struct_extract"
+		// (children = [col_ref, constant subfield index]) or as
+		// BoundExtractFunction wrapper. We match by name on
+		// BoundFunctionExpression and read the second child's constant value.
+		if (expr.GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
+			auto &fn = expr.Cast<BoundFunctionExpression>();
+			if (fn.function.name == "struct_extract" && fn.children.size() >= 2) {
+				auto &col_arg = *fn.children[0];
+				auto &sub_arg = *fn.children[1];
+				if (col_arg.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
+				    sub_arg.GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
+					auto &cref = col_arg.Cast<BoundColumnRefExpression>();
+					if (cref.binding.table_index == target_table_index) {
+						auto orig = ResolveOrigIndex(cref.binding.column_index, col_ids, names.size());
+						if (orig >= 0) {
+							auto &const_expr = sub_arg.Cast<BoundConstantExpression>();
+							if (!const_expr.value.IsNull() &&
+							    const_expr.value.type().id() == LogicalTypeId::VARCHAR) {
+								out.insert(names[orig] + "." +
+								           const_expr.value.GetValue<std::string>());
+								// Don't descend into children — we already
+								// captured the dotted path.
+								return;
+							}
+						}
+					}
+				}
+			}
+		}
+		if (expr.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
+			auto &cref = expr.Cast<BoundColumnRefExpression>();
+			if (cref.binding.table_index == target_table_index) {
+				auto orig = ResolveOrigIndex(cref.binding.column_index, col_ids, names.size());
+				if (orig >= 0) {
+					out.insert(names[orig]);
+				}
+			}
+		}
+		ExpressionIterator::EnumerateChildren(expr, [&](const Expression &child) {
+			WalkExpression(child, target_table_index, col_ids, names, out);
+		});
+	}
+
+	// Prefix-satisfaction: a required path is satisfied if itself OR any
+	// shorter dotted prefix of it is in `present`. So a present `"bbox"`
+	// satisfies all of `"bbox.xmin"`, `"bbox.xmax"`, etc. — the parent struct
+	// filter is at least as constraining as the four-corner conjunction.
+	static bool IsSatisfied(const std::string &required,
+	                        const unordered_set<std::string> &present) {
+		if (present.count(required)) {
+			return true;
+		}
+		auto dot = required.rfind('.');
+		while (dot != std::string::npos) {
+			if (present.count(required.substr(0, dot))) {
+				return true;
+			}
+			if (dot == 0) {
+				break;
+			}
+			dot = required.rfind('.', dot - 1);
+		}
+		return false;
+	}
+
+	static std::string JoinPaths(const std::vector<std::string> &v) {
+		std::string out;
+		for (size_t i = 0; i < v.size(); ++i) {
+			if (i) {
+				out += ", ";
+			}
+			out += v[i];
+		}
+		return out;
+	}
+
+	// Resolve "what VgiTableEntry owns this LogicalGet, if any". Two paths:
+	//   (1) VGI-side scans (vgi_table_scan): GetTable() returns the entry.
+	//   (2) Native delegation (marker bind_data): GetTable() returns nullptr,
+	//       but bind_data is a VgiNativeDelegationMarkerBindData carrying the
+	//       entry. The rewriter below will replace the marker after the check.
+	static optional_ptr<VgiTableEntry> ResolveEntry(const LogicalGet &get) {
+		if (auto tbl = get.GetTable()) {
+			if (auto *vgi = dynamic_cast<VgiTableEntry *>(tbl.get())) {
+				return vgi;
+			}
+		}
+		if (get.bind_data) {
+			if (auto *mark =
+			        dynamic_cast<VgiNativeDelegationMarkerBindData *>(get.bind_data.get())) {
+				return &mark->table.get();
+			}
+		}
+		return nullptr;
+	}
+
+	// Run the requirement check against the LogicalGet's filters + parent
+	// LogicalFilter expressions. Throws BinderException with the formatted
+	// message on miss; returns silently on satisfy.
+	static void EnforceRequirements(
+	    const LogicalGet &get, VgiTableEntry &vgi,
+	    const std::vector<reference<const Expression>> &parent_exprs) {
+		const auto &required = vgi.GetTableInfo().required_field_filter_paths;
+		if (required.empty()) {
+			return;
+		}
+
+		unordered_set<std::string> present;
+
+		// Source 1: filters pushed into the LogicalGet itself.
+		// table_filters.filters is keyed by column index in the LogicalGet's
+		// post-projection list (column_ids). Resolve through column_ids and
+		// `names` to get the top-level column name.
+		const auto &col_ids = get.GetColumnIds();
+		for (auto &kv : get.table_filters.filters) {
+			// The TableFilterSet key can be either a post-projection index
+			// (the VGI-table convention, where it indexes into column_ids) or
+			// a direct original-schema index (the convention used by parquet's
+			// native binding when filters are pushed before projection
+			// finalization). Disambiguate by checking column_ids first; if
+			// the key is in-range AND points at a non-virtual column, use
+			// that. Otherwise treat the key as an original-schema index.
+			idx_t orig_idx = get.names.size();  // sentinel = unknown
+			if (kv.first < col_ids.size() && !col_ids[kv.first].IsVirtualColumn()) {
+				orig_idx = col_ids[kv.first].GetPrimaryIndex();
+			}
+			if (orig_idx >= get.names.size() && kv.first < get.names.size()) {
+				orig_idx = kv.first;
+			}
+			if (orig_idx >= get.names.size()) {
+				continue;
+			}
+			WalkTableFilter(*kv.second, get.names[orig_idx], "", present);
+		}
+
+		// Source 2: dynamic_filters (Top-N / runtime). The public API doesn't
+		// expose per-column iteration, so we can't introspect *which* columns
+		// have dynamic filters from here. Acceptable for v1: the typical
+		// Overture bbox case is satisfied by static table_filters or by parent
+		// LogicalFilter walks; if a worker has a real need to count dynamic
+		// presence per-column, that's a follow-up. We do conservatively note
+		// that filters exist by emitting nothing — leaving the strict check.
+
+		// Source 3: parent LogicalFilter expressions in scope that reference
+		// this LogicalGet's table_index. Catches range-join LogicalFilters
+		// above the scan and other non-pushed-down predicates.
+		for (auto &expr_ref : parent_exprs) {
+			WalkExpression(expr_ref.get(), get.table_index, col_ids, get.names, present);
+		}
+
+		// Compute unsatisfied paths.
+		std::vector<std::string> missing;
+		for (const auto &req : required) {
+			if (!IsSatisfied(req, present)) {
+				missing.push_back(req);
+			}
+		}
+		if (missing.empty()) {
+			return;
+		}
+
+		throw BinderException(
+		    "Table '%s.%s.%s' requires WHERE filters on: %s. Missing: %s. "
+		    "Add predicates targeting those columns (or a filter on a parent struct) "
+		    "to avoid scanning the entire table.",
+		    vgi.ParentCatalog().GetName(), vgi.ParentSchema().name, vgi.name,
+		    JoinPaths(required), JoinPaths(missing));
+	}
+
+	// If the LogicalGet wraps a VgiNativeDelegationMarkerBindData, transfer
+	// the pre-bound native TableFunction / bind_data / return shape stashed by
+	// GetScanFunctionImpl into the LogicalGet in place. The LogicalGet was
+	// constructed with the catalog's declared Table.columns; we now replace
+	// returned_types/names with the native function's actual bind output so
+	// downstream passes (physical planner, executor) see the true scan shape.
+	static void RewriteMarkerToNative(ClientContext &context, LogicalGet &get) {
+		auto *mark = dynamic_cast<VgiNativeDelegationMarkerBindData *>(get.bind_data.get());
+		if (!mark) {
+			return;
+		}
+		// Move out of the marker. The marker bind_data is replaced by the
+		// native bind_data below, so this is the marker's last access.
+		auto native_tf = std::move(mark->native_tf);
+		auto native_bind = std::move(mark->native_bind);
+		auto native_return_types = std::move(mark->native_return_types);
+		auto native_return_names = std::move(mark->native_return_names);
+		auto native_virtual_columns = std::move(mark->native_virtual_columns);
+		auto function_name_log = mark->scan_result.function_name;
+		auto table_name_log = mark->table.get().name;
+
+		get.function = std::move(native_tf);
+		get.bind_data = std::move(native_bind);
+		get.returned_types = std::move(native_return_types);
+		get.names = std::move(native_return_names);
+		get.virtual_columns = std::move(native_virtual_columns);
+
+		VGI_LOG(context, "vgi.scan_function.native_delegation_rewritten",
+		        {{"table", table_name_log}, {"function", function_name_log}});
+	}
+
+	static void Walk(ClientContext &context, LogicalOperator &op,
+	                 std::vector<reference<const Expression>> &parent_exprs) {
+		// If this is a LogicalFilter, accumulate its expressions into the
+		// parent-context vector before descending — so any LogicalGet beneath
+		// us sees them.
+		size_t pushed = 0;
+		if (op.type == LogicalOperatorType::LOGICAL_FILTER) {
+			auto &lf = op.Cast<LogicalFilter>();
+			for (auto &expr : lf.expressions) {
+				parent_exprs.emplace_back(*expr);
+				++pushed;
+			}
+		}
+
+		if (op.type == LogicalOperatorType::LOGICAL_GET) {
+			auto &get = op.Cast<LogicalGet>();
+			if (auto vgi = ResolveEntry(get)) {
+				// Run the requirement check FIRST — if it fails, we throw,
+				// the plan is discarded, and the user sees a clean
+				// BinderException without ever binding read_parquet.
+				EnforceRequirements(get, *vgi, parent_exprs);
+				// Then rewrite if this was a marker; no-op for VGI-side scans.
+				RewriteMarkerToNative(context, get);
+			}
+		}
+
+		for (auto &child : op.children) {
+			Walk(context, *child, parent_exprs);
+		}
+
+		// Pop what we added — siblings should not see this filter's exprs.
+		for (size_t i = 0; i < pushed; ++i) {
+			parent_exprs.pop_back();
+		}
+	}
+
+	static void Optimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
+		std::vector<reference<const Expression>> parent_exprs;
+		Walk(input.context, *plan, parent_exprs);
 	}
 };
 
@@ -1528,6 +1928,13 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
 	OptimizerExtension::Register(config, VgiTableBufferingRewriter());
 
+	// Enforce Table.required_field_filter_paths at bind/optimize time.
+	// Post-optimize so DuckDB's FilterPushdown has settled filters into
+	// LogicalGet::table_filters. Zero overhead for tables that don't opt in
+	// (the optimizer does an O(plan_size) walk; tables with an empty
+	// required-paths list return immediately after the VgiTableEntry cast).
+	OptimizerExtension::Register(config, VgiRequiredFiltersOptimizer());
+
 	// VgiMultiScanRewriter is registered BEFORE VgiJoinOptimizer above —
 	// see the comment block at that site for ordering rationale. It's
 	// pre_optimize_function (rewrites into standard DuckDB operators that
@@ -1608,6 +2015,36 @@ static void LoadInternal(ExtensionLoader &loader) {
 		scan_func.projection_pushdown = true;
 		scan_func.filter_pushdown = true;
 		loader.RegisterFunction(scan_func);
+	}
+
+	// Register the native-delegation marker function under its name. Same
+	// motivation as vgi_table_scan above: built-in optimizer passes that run
+	// BEFORE VgiRequiredFiltersOptimizer (e.g. WindowSelfJoin,
+	// CommonSubplanOptimizer) may call LogicalOperator::Copy() on a LogicalGet
+	// while it still wraps the marker. FunctionSerializer::DeserializeBase
+	// resolves table functions by name from the system catalog on the way
+	// back, so without a registered entry that lookup throws "Table Function
+	// with name vgi_native_delegation_marker does not exist!" — opaque error.
+	//
+	// We give the registered entry a `deserialize` that throws a CLEAR
+	// SerializationException. Today's built-in callers (WindowSelfJoin,
+	// CommonSubplanOptimizer) wrap their Copy() in try/catch and bail
+	// gracefully (perf regression, not wrong result). Any future caller that
+	// doesn't try/catch gets a message pointing directly at the real bug:
+	// VgiRequiredFiltersOptimizer didn't fire when it should have.
+	{
+		TableFunction marker_func = MakeNativeDelegationMarkerFunction();
+		marker_func.deserialize = [](Deserializer &, TableFunction &) -> unique_ptr<FunctionData> {
+			throw SerializationException(
+			    "VGI native-delegation marker function 'vgi_native_delegation_marker' "
+			    "is being deserialized — VgiRequiredFiltersOptimizer must run BEFORE "
+			    "any pass that calls LogicalOperator::Copy() on the LogicalGet wrapping "
+			    "it. This usually means the optimizer extension was not registered or "
+			    "an earlier built-in pass moved the LogicalGet across an operator that "
+			    "the rewriter's tree walk doesn't descend into. File a bug — this is "
+			    "an unreachable state in normal use.");
+		};
+		loader.RegisterFunction(marker_func);
 	}
 
 	// Register worker pool diagnostic functions

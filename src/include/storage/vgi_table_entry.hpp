@@ -9,7 +9,9 @@
 
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/catalog/entry_lookup_info.hpp"
+#include "duckdb/function/table_function.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/storage/statistics/base_statistics.hpp"
 #include "vgi_catalog_api.hpp"
 
@@ -17,6 +19,57 @@ namespace duckdb {
 
 class VgiCatalog;
 class VgiSchemaEntry;
+class VgiTableEntry;
+
+// VgiNativeDelegationMarkerBindData — single-branch sibling of
+// VgiMultiBranchMarkerBindData. Carried by the placeholder TableFunction
+// returned from VgiTableEntry::GetScanFunctionImpl when the worker's
+// ScanFunctionResult names a SYSTEM_CATALOG function (read_parquet, etc.).
+// VgiRequiredFiltersOptimizer (vgi_extension.cpp) detects this marker via
+// `dynamic_cast<VgiNativeDelegationMarkerBindData *>(get.bind_data.get())`,
+// enforces `table.required_field_filter_paths`, and rewrites the LogicalGet
+// in place to point at the bound native TableFunction. See the comment
+// block at the struct definition in vgi_table_entry.cpp for full lifecycle.
+struct VgiNativeDelegationMarkerBindData : public duckdb::TableFunctionData {
+	// Owning VgiTableEntry — the rewriter reads
+	// `required_field_filter_paths` from this to know which paths must appear
+	// in `LogicalGet::table_filters`.
+	reference<VgiTableEntry> table;
+
+	// Pre-bound native TableFunction + bind_data. GetScanFunctionImpl binds
+	// eagerly (so we can populate the LogicalGet's returned_types/names
+	// faithfully), and the rewriter just transfers ownership of these into
+	// the LogicalGet during the in-place swap. No re-binding in the optimizer.
+	TableFunction native_tf;
+	mutable unique_ptr<duckdb::FunctionData> native_bind;
+	std::vector<LogicalType> native_return_types;
+	std::vector<std::string> native_return_names;
+	virtual_column_map_t native_virtual_columns;
+
+	// Originating ScanFunctionResult — kept for diagnostics + logging.
+	vgi::VgiScanFunctionResult scan_result;
+	std::string worker_path;
+
+	VgiNativeDelegationMarkerBindData(VgiTableEntry &table_p, TableFunction native_tf_p,
+	                                   unique_ptr<duckdb::FunctionData> native_bind_p,
+	                                   std::vector<LogicalType> native_return_types_p,
+	                                   std::vector<std::string> native_return_names_p,
+	                                   virtual_column_map_t native_virtual_columns_p,
+	                                   vgi::VgiScanFunctionResult scan_result_p,
+	                                   std::string worker_path_p)
+	    : table(table_p), native_tf(std::move(native_tf_p)),
+	      native_bind(std::move(native_bind_p)),
+	      native_return_types(std::move(native_return_types_p)),
+	      native_return_names(std::move(native_return_names_p)),
+	      native_virtual_columns(std::move(native_virtual_columns_p)),
+	      scan_result(std::move(scan_result_p)), worker_path(std::move(worker_path_p)) {
+	}
+};
+
+// Construct the native-delegation marker. Its execute callback throws
+// InternalException — reaching it means VgiRequiredFiltersOptimizer didn't
+// run, which IS a bug.
+TableFunction MakeNativeDelegationMarkerFunction();
 
 class VgiTableEntry : public TableCatalogEntry {
 public:

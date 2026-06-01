@@ -1,0 +1,105 @@
+# name: test/sql/integration/table/required_field_filter_paths_complex.test
+# description: Complex query shapes — UNION ALL, subqueries, CTEs, views, EXPLAIN
+# group: [vgi_integration_table]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# UNION ALL across two scans — every LogicalGet is checked independently.
+# ============================================================================
+
+# First filtered, second not → reject (the unfiltered scan alone fails).
+statement error
+SELECT * FROM example.data.rff_struct WHERE s.a = 1 AND s.b = 10
+UNION ALL
+SELECT * FROM example.data.rff_struct;
+----
+Missing: s.a, s.b.
+
+# Both filtered → row count is enough; assert via count.
+query I
+SELECT count(*) FROM (
+  SELECT s.a FROM example.data.rff_struct WHERE s.a = 1 AND s.b = 10
+  UNION ALL
+  SELECT s.a FROM example.data.rff_struct WHERE s.a = 2 AND s.b = 20
+);
+----
+2
+
+# ============================================================================
+# CTE / WITH clause — filters propagate through CTE binding.
+# ============================================================================
+
+query I
+WITH filtered AS (
+  SELECT s.a AS aa FROM example.data.rff_struct WHERE s.a = 1 AND s.b = 10
+)
+SELECT count(*) FROM filtered;
+----
+1
+
+statement error
+WITH unfiltered AS (
+  SELECT s.a AS aa FROM example.data.rff_struct
+)
+SELECT count(*) FROM unfiltered;
+----
+Missing: s.a, s.b.
+
+# ============================================================================
+# Subquery — correlated and uncorrelated subqueries still enforce.
+# ============================================================================
+
+query I
+SELECT (SELECT s.a FROM example.data.rff_struct WHERE s.a = 1 AND s.b = 10);
+----
+1
+
+statement error
+SELECT (SELECT s.a FROM example.data.rff_struct LIMIT 1);
+----
+Missing: s.a, s.b.
+
+# ============================================================================
+# Views over restricted tables — the view's bound query carries the filter.
+# ============================================================================
+
+statement ok
+CREATE VIEW v_simple AS SELECT * FROM example.data.rff_simple WHERE a = 1;
+
+query II
+SELECT * FROM v_simple;
+----
+1	10
+
+statement ok
+DROP VIEW v_simple;
+
+# View whose body lacks the required filter → query against the view fails.
+statement ok
+CREATE VIEW v_bad AS SELECT * FROM example.data.rff_simple;
+
+statement error
+SELECT * FROM v_bad;
+----
+Missing: a.
+
+statement ok
+DROP VIEW v_bad;
+
+# ============================================================================
+# EXPLAIN itself fails — the optimizer runs before plan output is produced.
+# ============================================================================
+
+statement error
+EXPLAIN SELECT * FROM example.data.rff_simple;
+----
+Missing: a.
+
+statement ok
+DETACH example;

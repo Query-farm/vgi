@@ -1,0 +1,38 @@
+# name: test/sql/integration/table/required_field_filter_paths_prefix.test
+# description: Prefix-satisfaction — a present parent filter subsumes child requirements
+# group: [vgi_integration_table]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# A whole-struct equality filter on 's' satisfies BOTH 's.a' and 's.b'
+# because the parent filter is at least as constraining as the four
+# individual subfield filters.
+
+query II
+SELECT s.a, s.b FROM example.data.rff_struct
+WHERE s = {a: 1, b: 10}::STRUCT(a BIGINT, b BIGINT);
+----
+1	10
+
+# rff_nested — a filter on the intermediate struct ('wrapper.mid') should
+# satisfy 'wrapper.mid.leaf'.
+query I
+SELECT wrapper.mid.leaf FROM example.data.rff_nested
+WHERE wrapper.mid = {leaf: 1}::STRUCT(leaf BIGINT);
+----
+1
+
+# A filter on the top-level 'wrapper' should also satisfy 'wrapper.mid.leaf'.
+query I
+SELECT wrapper.mid.leaf FROM example.data.rff_nested
+WHERE wrapper = {mid: {leaf: 1}::STRUCT(leaf BIGINT)}::STRUCT(mid STRUCT(leaf BIGINT));
+----
+1
+
+statement ok
+DETACH example;

@@ -584,6 +584,14 @@ SerializedFilters VgiSerializeFilters(ClientContext &context, const vector<colum
                                       const vector<string> &column_names, const string &worker_path,
                                       const string &rowid_column_name = "");
 
+//! Returns true if any descendant of ``filter`` is a DynamicFilter (Top-N
+//! tick-time bound). Consumers that walk TableFilter trees for *static*
+//! information (presence-of-filter checks, serialization of constants, etc.)
+//! should skip the entire OptionalFilter subtree when this returns true:
+//! the DynamicFilter has no value at init time, and any partial walk yields
+//! a stricter view than the OptionalFilter actually constrains.
+bool VgiContainsDynamicFilter(const TableFilter &filter);
+
 //! Expression pushdown callback: checks if the expression tree only uses functions the worker supports
 bool VgiPushdownExpression(ClientContext &context, const LogicalGet &get, Expression &expr);
 

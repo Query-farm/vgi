@@ -38,14 +38,16 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 # 2 cancel/pushdown probes (slow_cancellable_buffering, echo_buffering) +
 # 1 projection-pushdown witness (echo_witness) +
 # 1 get_column_values pruning probe (value_prune) +
-# 1 late-materialization fixture (late_materialization)
-# = 82
+# 1 late-materialization fixture (late_materialization) +
+# 5 required_field_filter_paths fixtures (rff_simple_scan, rff_struct_scan,
+#   rff_nested_scan, rff_multi_scan, rff_none_scan)
+# = 87
 query I
 SELECT COUNT(*)
 FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'table';
 ----
-82
+87
 
 # The 33 pure table functions (no TABLE parameter type)
 # Note: make_series appears 5 times (5 overloads), make_pairs appears 3 times,

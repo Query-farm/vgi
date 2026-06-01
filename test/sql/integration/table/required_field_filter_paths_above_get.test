@@ -1,0 +1,35 @@
+# name: test/sql/integration/table/required_field_filter_paths_above_get.test
+# description: LogicalFilter-above-LogicalGet — predicates DuckDB couldn't push down still count
+# group: [vgi_integration_table]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# `s.a + 1 = 2` is a function-wrapped predicate DuckDB may not push down
+# into table_filters. The walker collects column references from the
+# LogicalFilter sitting above the LogicalGet and counts s.a as present.
+query II
+SELECT s.a, s.b FROM example.data.rff_struct WHERE s.a + 1 = 2 AND s.b = 10;
+----
+1	10
+
+# COALESCE-wrapped predicate, same idea.
+query II
+SELECT s.a, s.b FROM example.data.rff_struct
+WHERE COALESCE(s.a, 0) > 0 AND s.b = 10;
+----
+1	10
+
+# Multi-level: nested function call on s.a still satisfies the requirement.
+query II
+SELECT s.a, s.b FROM example.data.rff_struct
+WHERE CAST(s.a AS VARCHAR) = '1' AND s.b = 10;
+----
+1	10
+
+statement ok
+DETACH example;

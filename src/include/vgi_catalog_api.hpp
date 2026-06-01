@@ -458,6 +458,19 @@ struct VgiTableInfo {
 	// declarative path (which is restricted to `@bind_fixed_schema`-decorated
 	// functions whose bind output is a pure function of `cls.FIXED_SCHEMA`).
 	std::optional<std::vector<uint8_t>> bind_result;
+
+	// Dotted-path column references that the optimizer extension must verify
+	// appear in any scan's WHERE expression. Top-level column names
+	// (`"country"`) or struct subfields (`"bbox.xmin"`, `"nested.outer.inner"`).
+	// Empty means no enforcement — the zero-cost fast path for every existing
+	// table.
+	//
+	// Satisfaction is prefix-based: a present filter on a shorter dotted path
+	// satisfies any required path it's a prefix of. A whole-struct filter on
+	// `bbox` therefore satisfies every required `"bbox.*"` path.
+	// `VgiRequiredFiltersOptimizer` consults this list at post-optimize time
+	// and throws `BinderException` listing any unsatisfied paths.
+	std::vector<std::string> required_field_filter_paths;
 };
 
 // View metadata from the worker

@@ -1,0 +1,83 @@
+# name: test/sql/integration/table/required_field_filter_paths_basic.test
+# description: Top-level + control coverage for Table.required_field_filter_paths
+# group: [vgi_integration_table]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# rff_simple — single top-level required path on column 'a'.
+# ============================================================================
+
+# Empty WHERE → reject; error names 'a' as required and missing.
+statement error
+SELECT * FROM example.data.rff_simple;
+----
+Table 'example.data.rff_simple' requires WHERE filters on: a. Missing: a.
+
+# Filter on 'a' present → rows.
+query II
+SELECT * FROM example.data.rff_simple WHERE a = 1;
+----
+1	10
+
+# Filter only on 'b' → reject (still missing 'a').
+statement error
+SELECT * FROM example.data.rff_simple WHERE b = 10;
+----
+Missing: a.
+
+# Filter on both 'a' and 'b' → rows.
+query II
+SELECT * FROM example.data.rff_simple WHERE a = 2 AND b = 20;
+----
+2	20
+
+# ============================================================================
+# rff_none — control table with no requirements. Opt-out fast path.
+# ============================================================================
+
+query I
+SELECT count(*) FROM example.data.rff_none;
+----
+3
+
+query II
+SELECT * FROM example.data.rff_none WHERE a = 1;
+----
+1	10
+
+# ============================================================================
+# rff_multi — mixed top-level + struct subfield requirements ('top', 's.a').
+# ============================================================================
+
+# Empty WHERE → reject; both required paths listed.
+statement error
+SELECT * FROM example.data.rff_multi;
+----
+Table 'example.data.rff_multi' requires WHERE filters on: top, s.a.
+
+# Filter on 'top' only → reject (s.a missing).
+statement error
+SELECT * FROM example.data.rff_multi WHERE top = 100;
+----
+Missing: s.a.
+
+# Filter on 's.a' only → reject (top missing).
+statement error
+SELECT * FROM example.data.rff_multi WHERE s.a = 1;
+----
+Missing: top.
+
+# Both → rows.
+query II
+SELECT s.a, top FROM example.data.rff_multi WHERE top = 100 AND s.a = 1;
+----
+1	100
+
+statement ok
+DETACH example;

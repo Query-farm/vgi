@@ -1,0 +1,51 @@
+# name: test/sql/integration/table/required_field_filter_paths_disjunction_null.test
+# description: OR, IS NULL / IS NOT NULL, IN filter shapes
+# group: [vgi_integration_table]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# OR of two subfield filters → both subfields contributed by
+# ConjunctionOrFilter recursion → accept.
+query II
+SELECT s.a, s.b FROM example.data.rff_struct WHERE s.a = 1 OR s.b = 30;
+----
+1	10
+3	30
+
+# OR where one side is on the unrelated 'other' column → s.b never gets
+# referenced → reject (s.b missing).
+statement error
+SELECT * FROM example.data.rff_struct WHERE s.a = 1 OR other = 100;
+----
+Missing: s.b.
+
+# IS NULL counts as a filter on the column.
+query II
+SELECT s.a, s.b FROM example.data.rff_struct
+WHERE s.a IS NOT NULL AND s.b IS NOT NULL;
+----
+1	10
+2	20
+3	30
+
+# IS NOT NULL on only s.a → reject.
+statement error
+SELECT * FROM example.data.rff_struct WHERE s.a IS NOT NULL;
+----
+Missing: s.b.
+
+# IN filter contributes the column.
+query II
+SELECT s.a, s.b FROM example.data.rff_struct
+WHERE s.a IN (1, 2) AND s.b IN (10, 20);
+----
+1	10
+2	20
+
+statement ok
+DETACH example;
