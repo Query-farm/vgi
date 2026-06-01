@@ -1,0 +1,174 @@
+# name: test/sql/integration/table/required_field_filter_paths_native.test
+# description: required_field_filter_paths over NATIVE read_parquet delegation,
+#              including a Hive-partitioned multi-file glob (the Overture
+#              transportation.segment shape). Regression for the table_filters
+#              key mis-resolution: when the native scan's column_ids projection
+#              is non-identity, the bbox.* StructFilters must still resolve to
+#              the bbox column (not whatever column sits at that projected slot).
+# group: [vgi_integration_table]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require parquet
+
+require httpfs
+
+# ============================================================================
+# Setup. Two layouts, both with a FLOAT bbox struct:
+#   rff_parquet — single file, bbox at column 0 (identity projection).
+#   rff_hive    — Hive-partitioned glob (theme/type), bbox at a non-zero index
+#                 → non-identity column_ids, which is what triggered the bug.
+# bbox is constant {1,2,3,4} so all four-corner predicates match every row.
+# ============================================================================
+
+# bbox.xmin varies by row (0..99); the other corners are constant inside the
+# tested range. Varying xmin lets a selective predicate return a strict subset,
+# which proves the predicate is actually *applied* to the scan — not merely
+# permitted by enforcement and then silently dropped (a constant column would
+# return all 100 either way).
+
+statement ok
+COPY (
+    SELECT {'xmin': i::FLOAT, 'ymin': 2.0::FLOAT, 'xmax': 3.0::FLOAT, 'ymax': 4.0::FLOAT} AS bbox,
+           5::BIGINT AS other
+    FROM range(100) t(i)
+) TO '/tmp/rff_seg.parquet' (FORMAT 'parquet');
+
+statement ok
+COPY (
+    SELECT 'id' || i AS id,
+           {'xmin': i::FLOAT, 'ymin': 2.0::FLOAT, 'xmax': 3.0::FLOAT, 'ymax': 4.0::FLOAT} AS bbox,
+           'n' || i AS name,
+           i::BIGINT AS num,
+           'transportation' AS theme,
+           'segment' AS type
+    FROM range(100) t(i)
+) TO '/tmp/rff_hive' (FORMAT 'parquet', PARTITION_BY (theme, type), OVERWRITE);
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# rff_parquet — single-file native delegation (identity projection).
+# ============================================================================
+
+# All four corners present → scan runs AND the predicate is applied: xmin in
+# [50,99] selects exactly 50 of 100 rows (would be 100 if the filter were
+# dropped).
+query I
+SELECT count(*) FROM example.data.rff_parquet
+WHERE bbox.xmin >= 50 AND bbox.ymin > 0 AND bbox.ymax <= 100 AND bbox.xmax <= 100.2;
+----
+50
+
+# Missing a corner → reject.
+statement error
+SELECT * FROM example.data.rff_parquet
+WHERE bbox.xmin > 0 AND bbox.ymin > 0 AND bbox.ymax <= 100;
+----
+Missing: bbox.xmax.
+
+# ============================================================================
+# rff_hive — Hive-partitioned multi-file native delegation. This is the exact
+# Overture transportation.segment shape that previously reported all four
+# corners missing even though all four predicates were present.
+# ============================================================================
+
+# All four corners present → scan runs AND filters correctly (50 of 100).
+# Pre-fix this threw "Missing: bbox.xmin, bbox.xmax, bbox.ymin, bbox.ymax".
+query I
+SELECT count(*) FROM example.data.rff_hive
+WHERE bbox.xmin >= 50 AND bbox.ymin > 0 AND bbox.ymax <= 100 AND bbox.xmax <= 100.2;
+----
+50
+
+# Mixed-type constants (100.2 DOUBLE vs FLOAT column) and LIMIT — exactly the
+# user's query. Returns rows, no binder error.
+query I
+SELECT count(*) FROM (
+    SELECT * FROM example.data.rff_hive
+    WHERE bbox.xmin > 0 AND bbox.ymin > 0 AND bbox.ymax <= 100 AND bbox.xmax <= 100.2
+    LIMIT 10
+);
+----
+10
+
+# A filter on the parent bbox struct satisfies all four corners (prefix rule),
+# and selects exactly the one row whose xmin matches.
+query I
+SELECT count(*) FROM example.data.rff_hive
+WHERE bbox = {'xmin': 1.0::FLOAT, 'ymin': 2.0::FLOAT, 'xmax': 3.0::FLOAT, 'ymax': 4.0::FLOAT};
+----
+1
+
+# Missing two corners → reject, and the message names exactly the missing ones
+# (proves the present corners were correctly attributed to bbox, not to id).
+statement error
+SELECT * FROM example.data.rff_hive
+WHERE bbox.xmin > 0 AND bbox.ymin > 0;
+----
+Missing: bbox.xmax, bbox.ymax.
+
+# Column-to-column predicates cannot become table_filters, so they survive as a
+# residual LogicalFilter *above an interposed projection* over the native scan
+# — the (native delegation x residual-filter, Source 3) path. Enforcement must
+# resolve the subfield refs through the projection back to the get. All four
+# corners are referenced, so the scan runs and the predicate is applied
+# (xmin<xmax holds for xmin in {0,1,2} → 3 rows).
+query I
+SELECT count(*) FROM example.data.rff_hive
+WHERE bbox.xmin < bbox.xmax AND bbox.ymin < bbox.ymax;
+----
+3
+
+# Same residual shape but only two corners referenced → reject naming the
+# absent ones (proves Source 3 attributes each subfield independently).
+statement error
+SELECT * FROM example.data.rff_hive
+WHERE bbox.xmin < bbox.xmax;
+----
+Missing: bbox.ymin, bbox.ymax.
+
+# No bbox filter at all → all four missing.
+statement error
+SELECT * FROM example.data.rff_hive WHERE num > 0;
+----
+requires WHERE filters on: bbox.xmin, bbox.xmax, bbox.ymin, bbox.ymax
+
+# ============================================================================
+# rff_hive_mixed — same native Hive layout, but requires a TOP-LEVEL field
+# ('id') plus the struct corners. 'id' sits at a permuted column_ids slot, so
+# this exercises the flat-field branch of the path walker through the same
+# original-index resolution as the struct corners.
+# ============================================================================
+
+# Top-level filter + all four corners present → scan runs and filters (id='id5'
+# → 1 row). Pre-fix the 'id' predicate was misattributed to 'bbox' and the
+# query was rejected with "Missing: id".
+query I
+SELECT count(*) FROM example.data.rff_hive_mixed
+WHERE id = 'id5'
+  AND bbox.xmin >= 0 AND bbox.ymin > 0 AND bbox.ymax <= 100 AND bbox.xmax <= 100.2;
+----
+1
+
+# Struct corners present but the top-level 'id' filter is absent → reject,
+# naming exactly the missing top-level path (proves 'id' is tracked distinctly
+# from the bbox corners that ARE present).
+statement error
+SELECT * FROM example.data.rff_hive_mixed
+WHERE bbox.xmin > 0 AND bbox.ymin > 0 AND bbox.ymax <= 100 AND bbox.xmax <= 100.2;
+----
+Missing: id.
+
+# 'id' present but a corner missing → reject naming only the missing corner.
+statement error
+SELECT * FROM example.data.rff_hive_mixed
+WHERE id = 'id5' AND bbox.xmin > 0 AND bbox.ymin > 0 AND bbox.ymax <= 100;
+----
+Missing: bbox.xmax.
+
+statement ok
+DETACH example;

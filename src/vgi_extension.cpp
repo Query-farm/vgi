@@ -38,6 +38,7 @@
 #include "duckdb/planner/filter/struct_filter.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_window.hpp"
 #include "duckdb/storage/storage_extension.hpp"
 #include "duckdb/common/arrow/arrow_type_extension.hpp"
@@ -776,7 +777,7 @@ private:
 	// message on miss; returns silently on satisfy.
 	static void EnforceRequirements(
 	    const LogicalGet &get, VgiTableEntry &vgi,
-	    const std::vector<reference<const Expression>> &parent_exprs) {
+	    const std::vector<unique_ptr<Expression>> &parent_exprs) {
 		const auto &required = vgi.GetTableInfo().required_field_filter_paths;
 		if (required.empty()) {
 			return;
@@ -785,29 +786,24 @@ private:
 		unordered_set<std::string> present;
 
 		// Source 1: filters pushed into the LogicalGet itself.
-		// table_filters.filters is keyed by column index in the LogicalGet's
-		// post-projection list (column_ids). Resolve through column_ids and
-		// `names` to get the top-level column name.
+		// At post-optimize time a TableFilterSet is keyed by the *original*
+		// table-schema column index (the ColumnIndex primary index) — see
+		// TableFilterSet::PushFilter (duckdb/src/planner/table_filter.cpp),
+		// which stores col_idx.GetPrimaryIndex() as the key, and
+		// remove_unused_columns.cpp which reads it back as a primary index.
+		// (The remap to a column_ids *position* happens later, at physical
+		// planning in CreateTableFilterSet.) So the key indexes directly into
+		// `get.names` (the full schema-ordered column list); do NOT route it
+		// through column_ids — for native multi-file/Hive scans column_ids is
+		// a non-identity permutation and the indirection lands on the wrong
+		// column.
 		const auto &col_ids = get.GetColumnIds();
 		for (auto &kv : get.table_filters.filters) {
-			// The TableFilterSet key can be either a post-projection index
-			// (the VGI-table convention, where it indexes into column_ids) or
-			// a direct original-schema index (the convention used by parquet's
-			// native binding when filters are pushed before projection
-			// finalization). Disambiguate by checking column_ids first; if
-			// the key is in-range AND points at a non-virtual column, use
-			// that. Otherwise treat the key as an original-schema index.
-			idx_t orig_idx = get.names.size();  // sentinel = unknown
-			if (kv.first < col_ids.size() && !col_ids[kv.first].IsVirtualColumn()) {
-				orig_idx = col_ids[kv.first].GetPrimaryIndex();
-			}
-			if (orig_idx >= get.names.size() && kv.first < get.names.size()) {
-				orig_idx = kv.first;
-			}
-			if (orig_idx >= get.names.size()) {
+			if (kv.first >= get.names.size()) {
+				// Virtual column (rowid etc.) — never a required path.
 				continue;
 			}
-			WalkTableFilter(*kv.second, get.names[orig_idx], "", present);
+			WalkTableFilter(*kv.second, get.names[kv.first], "", present);
 		}
 
 		// Source 2: dynamic_filters (Top-N / runtime). The public API doesn't
@@ -820,9 +816,11 @@ private:
 
 		// Source 3: parent LogicalFilter expressions in scope that reference
 		// this LogicalGet's table_index. Catches range-join LogicalFilters
-		// above the scan and other non-pushed-down predicates.
-		for (auto &expr_ref : parent_exprs) {
-			WalkExpression(expr_ref.get(), get.table_index, col_ids, get.names, present);
+		// above the scan and other non-pushed-down predicates. Walk() has
+		// already rewritten these through any intervening LogicalProjection,
+		// so their column refs bind to this get's table_index.
+		for (auto &expr_ptr : parent_exprs) {
+			WalkExpression(*expr_ptr, get.table_index, col_ids, get.names, present);
 		}
 
 		// Compute unsatisfied paths.
@@ -875,18 +873,62 @@ private:
 		        {{"table", table_name_log}, {"function", function_name_log}});
 	}
 
+	// Substitute every column ref that binds to `proj`'s output with a copy of
+	// the projection's defining expression, so a filter accumulated *above* the
+	// projection ends up referencing whatever the projection reads (ultimately
+	// the LogicalGet). Mirrors DuckDB's own ReplaceProjectionBindings
+	// (duckdb/src/optimizer/pushdown/pushdown_projection.cpp).
+	static void RewriteThroughProjection(unique_ptr<Expression> &expr,
+	                                     const LogicalProjection &proj) {
+		ExpressionIterator::VisitExpressionMutable<BoundColumnRefExpression>(
+		    expr, [&](BoundColumnRefExpression &cref, unique_ptr<Expression> &slot) {
+			    if (cref.binding.table_index == proj.table_index &&
+			        cref.binding.column_index < proj.expressions.size()) {
+				    slot = proj.expressions[cref.binding.column_index]->Copy();
+			    }
+		    });
+	}
+
 	static void Walk(ClientContext &context, LogicalOperator &op,
-	                 std::vector<reference<const Expression>> &parent_exprs) {
-		// If this is a LogicalFilter, accumulate its expressions into the
-		// parent-context vector before descending — so any LogicalGet beneath
-		// us sees them.
-		size_t pushed = 0;
+	                 std::vector<unique_ptr<Expression>> &parent_exprs) {
+		// LogicalFilter: accumulate owned copies of its expressions before
+		// descending — so any LogicalGet beneath us sees them. Pop on exit.
 		if (op.type == LogicalOperatorType::LOGICAL_FILTER) {
 			auto &lf = op.Cast<LogicalFilter>();
+			size_t pushed = 0;
 			for (auto &expr : lf.expressions) {
-				parent_exprs.emplace_back(*expr);
+				parent_exprs.emplace_back(expr->Copy());
 				++pushed;
 			}
+			for (auto &child : op.children) {
+				Walk(context, *child, parent_exprs);
+			}
+			for (size_t i = 0; i < pushed; ++i) {
+				parent_exprs.pop_back();
+			}
+			return;
+		}
+
+		// LogicalProjection: rewrite the accumulated filter expressions through
+		// the projection so their bindings reference the projection's input
+		// (the get, or a deeper projection). Restore the originals on exit so
+		// sibling subtrees are unaffected. Without this, a filter sitting above
+		// an interposed projection (the common shape DuckDB pushdown produces)
+		// binds to the projection's table_index and never matches the get.
+		if (op.type == LogicalOperatorType::LOGICAL_PROJECTION) {
+			auto &proj = op.Cast<LogicalProjection>();
+			std::vector<unique_ptr<Expression>> saved = std::move(parent_exprs);
+			parent_exprs.clear();
+			for (auto &expr : saved) {
+				auto rewritten = expr->Copy();
+				RewriteThroughProjection(rewritten, proj);
+				parent_exprs.emplace_back(std::move(rewritten));
+			}
+			for (auto &child : op.children) {
+				Walk(context, *child, parent_exprs);
+			}
+			parent_exprs = std::move(saved);
+			return;
 		}
 
 		if (op.type == LogicalOperatorType::LOGICAL_GET) {
@@ -904,15 +946,10 @@ private:
 		for (auto &child : op.children) {
 			Walk(context, *child, parent_exprs);
 		}
-
-		// Pop what we added — siblings should not see this filter's exprs.
-		for (size_t i = 0; i < pushed; ++i) {
-			parent_exprs.pop_back();
-		}
 	}
 
 	static void Optimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
-		std::vector<reference<const Expression>> parent_exprs;
+		std::vector<unique_ptr<Expression>> parent_exprs;
 		Walk(input.context, *plan, parent_exprs);
 	}
 };

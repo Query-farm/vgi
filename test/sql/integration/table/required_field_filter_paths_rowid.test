@@ -1,0 +1,54 @@
+# name: test/sql/integration/table/required_field_filter_paths_rowid.test
+# description: required_field_filter_paths coexisting with a virtual row-id
+#              column. A `WHERE rowid = N` predicate pushes a table_filter keyed
+#              by the COLUMN_IDENTIFIER_ROW_ID sentinel (UINT64_MAX, >> column
+#              count). The enforcement pass must SKIP that key rather than index
+#              get.names out of bounds — exercised here with instrumentation
+#              confirming the sentinel key is seen and skipped.
+# group: [vgi_integration_table]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# rff_rowid: 10 rows, row_id 0..9, bbox.xmin = row index. required: bbox.*.
+# rowid is a virtual column (hidden from SELECT *).
+
+# rowid filter + all four corners present → the rowid table_filter (sentinel
+# key) is skipped by the guard, the bbox corners satisfy the requirement, and
+# the rowid predicate selects exactly one row. Pre-guard this indexed
+# get.names[UINT64_MAX] out of bounds.
+query II
+SELECT rowid, bbox.xmin FROM example.data.rff_rowid
+WHERE rowid = 5
+  AND bbox.xmin >= 0 AND bbox.ymin > 0 AND bbox.ymax <= 100 AND bbox.xmax <= 100.2;
+----
+5	5.0
+
+# rowid present but NO bbox filter → reject. Proves the (virtual) rowid filter
+# is correctly NOT counted toward the required bbox.* paths.
+statement error
+SELECT rowid FROM example.data.rff_rowid WHERE rowid = 5;
+----
+requires WHERE filters on: bbox.xmin, bbox.xmax, bbox.ymin, bbox.ymax
+
+# bbox corners alone (no rowid filter) → scan runs over all 10 rows.
+query I
+SELECT count(*) FROM example.data.rff_rowid
+WHERE bbox.xmin >= 0 AND bbox.ymin > 0 AND bbox.ymax <= 100 AND bbox.xmax <= 100.2;
+----
+10
+
+# rowid filter + only two corners → reject naming the missing corners (the
+# sentinel-keyed rowid filter is skipped, so it doesn't mask the gap).
+statement error
+SELECT rowid FROM example.data.rff_rowid
+WHERE rowid = 5 AND bbox.xmin >= 0 AND bbox.ymin > 0;
+----
+Missing: bbox.xmax, bbox.ymax.
+
+statement ok
+DETACH example;
