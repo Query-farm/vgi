@@ -28,6 +28,7 @@ cardinality_inlined_table	Function-backed table with inlined cardinality (10000 
 colors	Colors table with ENUM-derived statistics
 departments	Department reference table
 employees	Employee table with FK to departments
+filter_echo_table	Catalog table echoing pushed-down filters (filter-pushdown-through-view tests).
 funny_numbers	123456 integers; stats served by the sequence function, not the table
 generated_sequence	Table with generated columns backed by sequence(10)
 large_sequence	A large sequence of integers from 0 to 1,000,000
