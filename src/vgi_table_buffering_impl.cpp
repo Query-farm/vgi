@@ -394,6 +394,11 @@ public:
 	// carries its own schema; we don't need to precompute one).
 	ArrowSchemaWrapper c_schema;
 	ArrowTableSchema arrow_table;
+	// The currently-draining emitted batch. Persisted across GetData calls so a
+	// finalize() batch larger than STANDARD_VECTOR_SIZE is emitted over several
+	// vectors (advancing chunk_offset) rather than truncated to the first 2048
+	// rows. Null between batches / before the first one.
+	std::unique_ptr<ArrowScanLocalState> scan_state;
 
 	// Captured at GetData-time alongside the worker acquisition so the
 	// destructor can route an unreleased connection through the global
@@ -446,6 +451,24 @@ FunctionConnectionParams BuildAcquireParams(const VgiTableInOutBindData &bd,
 	params.function_type = "TABLE";
 	params.input_schema = bd.input_schema;
 	return params;
+}
+
+// Emit up to STANDARD_VECTOR_SIZE rows from the scan_state's current batch into
+// `chunk`, advancing chunk_offset. Mirrors ProduceOutputFromBatch in
+// vgi_table_in_out_impl.cpp; the Source phase never has appended LATERAL
+// columns, so the scratch-chunk path isn't needed here.
+void EmitBufferedPage(ArrowScanLocalState &scan_state, const ArrowTableSchema &arrow_table, DataChunk &chunk,
+                      bool projection_pushdown) {
+	idx_t length = static_cast<idx_t>(scan_state.chunk->arrow_array.length);
+	idx_t remaining = length - scan_state.chunk_offset;
+	idx_t rows = std::min<idx_t>(remaining, STANDARD_VECTOR_SIZE);
+	chunk.SetCardinality(rows);
+	// column_ids is intentionally left empty so ArrowToDuckDB reads positionally
+	// (children[idx]) — the worker emits a narrow batch already aligned to the
+	// projected output schema. ArrowToDuckDB reads `rows` from chunk_offset; we
+	// advance chunk_offset ourselves afterwards.
+	ArrowTableFunction::ArrowToDuckDB(scan_state, arrow_table.GetColumns(), chunk, projection_pushdown);
+	scan_state.chunk_offset += rows;
 }
 
 } // namespace
@@ -860,6 +883,18 @@ SourceResultType PhysicalVgiTableBufferingFunction::GetDataInternal(ExecutionCon
 	auto &gstate = sink_state->Cast<VgiTableBufferingGlobalSinkState>();
 	auto &bd = bind_data->Cast<VgiTableInOutBindData>();
 
+	// Drain any rows still pending from the current emitted batch before
+	// reading a new one. finalize() may emit a batch larger than
+	// STANDARD_VECTOR_SIZE; we split it across GetData calls via the persisted
+	// scan_state.chunk_offset rather than truncating to a single vector.
+	if (lstate.scan_state &&
+	    lstate.scan_state->chunk_offset < static_cast<idx_t>(lstate.scan_state->chunk->arrow_array.length)) {
+		EmitBufferedPage(*lstate.scan_state, lstate.arrow_table, chunk, projection_pushdown);
+		return SourceResultType::HAVE_MORE_OUTPUT;
+	}
+	// Current batch (if any) is fully drained; drop it before fetching the next.
+	lstate.scan_state.reset();
+
 	// Open a fresh worker + stream for the next finalize_state_id when
 	// the previous stream has hit EOS (or this is the first call).
 	if (!lstate.stream_open) {
@@ -947,28 +982,18 @@ SourceResultType PhysicalVgiTableBufferingFunction::GetDataInternal(ExecutionCon
 	auto chunk_wrapper = make_uniq<ArrowArrayWrapper>();
 	ExportRecordBatch(batch, *chunk_wrapper);
 
-	auto scan_state =
-	    make_uniq<ArrowScanLocalState>(std::move(chunk_wrapper), context.client);
-	scan_state->chunk_offset = 0;
-
-	idx_t rows = std::min<idx_t>(batch->num_rows(), STANDARD_VECTOR_SIZE);
-	chunk.SetCardinality(rows);
-	// When projection_pushdown is on, the worker emits a narrow Arrow batch
-	// positionally aligned with chunk.ColumnCount() (which equals
-	// projection_ids.size() — our return_types was narrowed in the rewriter).
+	// Persist the scan_state on the local state so a batch wider than
+	// STANDARD_VECTOR_SIZE is drained over multiple GetData calls (see the
+	// pending-drain check at the top of this function). ``scan_state.column_ids``
+	// is left empty: when projection_pushdown is on the worker emits a narrow
+	// Arrow batch positionally aligned with chunk.ColumnCount(), and
 	// `arrow_scan_is_projected=true` makes ArrowToDuckDB read children[idx]
-	// directly without remapping. Mirrors vgi_table_function_impl.cpp:1849,
-	// with one key difference: our ``lstate.arrow_table`` is built per-batch
-	// from the *narrow* emitted schema, so its column-type map keys are
-	// 0..projection_ids.size()-1 (positional). Leave ``scan_state.column_ids``
-	// empty so ArrowToDuckDB does ``arrow_convert_data[idx]`` (positional)
-	// rather than ``arrow_convert_data[column_ids[idx]]`` (which would index
-	// by worker-original column index and miss our narrow-keyed map). The
-	// streaming pure-table path can use worker-original keys because it
-	// builds ``bind_data.arrow_table`` once from the full schema at bind
-	// time; we deliberately don't pay that cache cost for v1.
-	ArrowTableFunction::ArrowToDuckDB(*scan_state, lstate.arrow_table.GetColumns(), chunk,
-	                                  projection_pushdown);
+	// directly (our ``lstate.arrow_table`` is built per-batch from that narrow
+	// schema, so its column-type map keys are 0..n-1 positional).
+	lstate.scan_state = make_uniq<ArrowScanLocalState>(std::move(chunk_wrapper), context.client);
+	lstate.scan_state->chunk_offset = 0;
+
+	EmitBufferedPage(*lstate.scan_state, lstate.arrow_table, chunk, projection_pushdown);
 	return SourceResultType::HAVE_MORE_OUTPUT;
 }
 

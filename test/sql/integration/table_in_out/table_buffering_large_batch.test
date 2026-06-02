@@ -1,0 +1,61 @@
+# name: test/sql/integration/table_in_out/table_buffering_large_batch.test
+# description: A buffering function's Source phase (finalize) must support emitting
+#   a single output batch larger than STANDARD_VECTOR_SIZE (2048 rows), the same
+#   way a regular TableFunctionGenerator can. Regression test for a Source-path
+#   truncation bug: PhysicalVgiTableBufferingFunction::GetDataInternal built a
+#   fresh ArrowScanLocalState per GetData call and set cardinality to
+#   min(num_rows, STANDARD_VECTOR_SIZE), dropping any rows past 2048 instead of
+#   draining the batch across GetData calls (as the streaming InOut path does via
+#   a persisted chunk_offset). The example.buffer_emit_wide(rows, <table>) fixture
+#   emits exactly one finalize batch of `rows` rows.
+# group: [vgi_integration_table_in_out]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ----------------------------------------------------------------------------
+# Baseline: a single emitted batch at exactly the vector size works.
+# ----------------------------------------------------------------------------
+
+query I
+SELECT count(*) FROM example.buffer_emit_wide(2048, (SELECT 1));
+----
+2048
+
+# ----------------------------------------------------------------------------
+# Just over the vector size: must return all 2049 rows (BUG: returns 2048).
+# ----------------------------------------------------------------------------
+
+query I
+SELECT count(*) FROM example.buffer_emit_wide(2049, (SELECT 1));
+----
+2049
+
+# ----------------------------------------------------------------------------
+# A large single batch must come back in full, with values intact (not just a
+# count) — sum(0..9999) = 49995000.
+# ----------------------------------------------------------------------------
+
+query II
+SELECT count(*), sum(n) FROM example.buffer_emit_wide(10000, (SELECT 1));
+----
+10000	49995000
+
+# ----------------------------------------------------------------------------
+# Contrast: a regular TableFunctionGenerator already supports emitting a single
+# batch far larger than the vector size — this passes today.
+# ----------------------------------------------------------------------------
+
+query I
+SELECT count(*) FROM example.sequence(10000, batch_size := 10000);
+----
+10000
+
+statement ok
+DETACH example;

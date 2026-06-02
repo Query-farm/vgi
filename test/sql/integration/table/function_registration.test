@@ -42,14 +42,16 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 # 6 required_field_filter_paths fixtures (rff_simple_scan, rff_struct_scan,
 #   rff_nested_scan, rff_multi_scan, rff_none_scan, rff_rowid_scan) +
 # 1 filter-pushdown-through-view fixture (filter_echo_table_scan, backs
-#   example.data.filter_echo_table — see filter_pushdown_through_view.test)
-# = 89
+#   example.data.filter_echo_table — see filter_pushdown_through_view.test) +
+# 1 large-output-batch buffering repro (buffer_emit_wide, see
+#   table_in_out/table_buffering_large_batch.test)
+# = 90
 query I
 SELECT COUNT(*)
 FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'table';
 ----
-89
+90
 
 # The 33 pure table functions (no TABLE parameter type)
 # Note: make_series appears 5 times (5 overloads), make_pairs appears 3 times,
