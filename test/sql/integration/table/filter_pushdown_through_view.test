@@ -1,0 +1,251 @@
+# name: test/sql/integration/table/filter_pushdown_through_view.test
+# description: Characterize filter pushdown to a VGI *table* directly and through a VIEW.
+#              Reproduction harness for "a view's LIKE filter is not pushed down to the
+#              underlying VGI table". Finding: a plain view over a VGI table DOES push
+#              =, IN, range, BETWEEN, equality, and LIKE 'prefix%' down to the worker —
+#              identical to a direct scan. Pushdown legitimately stops only when the view
+#              transforms the column, or the LIKE pattern has no constant prefix.
+# group: [vgi_integration_table]
+
+# example.data.filter_echo_table is backed by FilterEchoTableScanFunction
+# (filter_pushdown=True, auto_apply_filters=True, projection_pushdown=True,
+# supported_expression_filters=["prefix","starts_with"]). Its pushed_filters
+# column echoes the SQL representation of whatever DuckDB pushed to the worker;
+# the framework auto-applies the filters so results stay correct. 100 rows:
+# n in 0..99, s = 'row_<n>'.
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# Part 1 — DIRECT scans of the VGI table (baseline for the view comparison)
+# ============================================================================
+
+# No filter
+query T
+SELECT DISTINCT pushed_filters FROM example.data.filter_echo_table;
+----
+(none)
+
+# Equality on int
+query III
+SELECT * FROM example.data.filter_echo_table WHERE n = 5;
+----
+5	row_5	n = 5
+
+# IN list
+query T
+SELECT DISTINCT pushed_filters FROM example.data.filter_echo_table WHERE n IN (1, 3, 7);
+----
+n IN (1, 3, 7)
+
+# Range (conjunction)
+query T
+SELECT DISTINCT pushed_filters FROM example.data.filter_echo_table WHERE n >= 3 AND n < 7;
+----
+(n >= 3 AND n < 7)
+
+# BETWEEN -> rewritten to a range conjunction
+query T
+SELECT DISTINCT pushed_filters FROM example.data.filter_echo_table WHERE n BETWEEN 3 AND 7;
+----
+(n >= 3 AND n <= 7)
+
+# String equality
+query T
+SELECT DISTINCT pushed_filters FROM example.data.filter_echo_table WHERE s = 'row_5';
+----
+s = 'row_5'
+
+# LIKE 'prefix%' — DuckDB's LikeOptimizationRule lowers a constant-prefix LIKE to
+# a RANGE ConstantFilter (NOT an expression filter), so it pushes down with no
+# supported_expression_filters needed. The '_' in 'row_1%' is a single-char
+# wildcard, so the constant prefix is just 'row' -> range [ 'row', 'rox' ).
+# The residual LIKE is applied above the scan, so results are exact.
+query T
+SELECT DISTINCT pushed_filters FROM example.data.filter_echo_table WHERE s LIKE 'row_1%';
+----
+(s >= 'row' AND s < 'rox')
+
+# LIKE 'prefix%' result correctness (exact rows after the residual LIKE).
+query I
+SELECT n FROM example.data.filter_echo_table WHERE s LIKE 'row_1%' ORDER BY n;
+----
+1
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+
+# ============================================================================
+# Part 2 — THROUGH A PLAIN VIEW (SELECT * over the table)
+# Pushdown behaves IDENTICALLY to the direct scan: the engine inlines the view
+# and pushes the predicate into the scan's table_filters. This is the core
+# finding — a plain view does NOT drop the filter.
+# ============================================================================
+
+statement ok
+CREATE VIEW v_echo AS SELECT * FROM example.data.filter_echo_table;
+
+query III
+SELECT * FROM v_echo WHERE n = 5;
+----
+5	row_5	n = 5
+
+query T
+SELECT DISTINCT pushed_filters FROM v_echo WHERE n IN (1, 3, 7);
+----
+n IN (1, 3, 7)
+
+query T
+SELECT DISTINCT pushed_filters FROM v_echo WHERE n >= 3 AND n < 7;
+----
+(n >= 3 AND n < 7)
+
+query T
+SELECT DISTINCT pushed_filters FROM v_echo WHERE n BETWEEN 3 AND 7;
+----
+(n >= 3 AND n <= 7)
+
+query T
+SELECT DISTINCT pushed_filters FROM v_echo WHERE s = 'row_5';
+----
+s = 'row_5'
+
+# The headline case: LIKE 'prefix%' applied to a view column IS pushed to the
+# worker, exactly as in the direct scan.
+query T
+SELECT DISTINCT pushed_filters FROM v_echo WHERE s LIKE 'row_1%';
+----
+(s >= 'row' AND s < 'rox')
+
+query I
+SELECT n FROM v_echo WHERE s LIKE 'row_1%' ORDER BY n;
+----
+1
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+
+# ============================================================================
+# Part 3 — LIKE filter baked INTO the view body also pushes down
+# (CREATE VIEW ... WHERE s LIKE 'prefix%')
+# ============================================================================
+
+statement ok
+CREATE VIEW v_body AS SELECT n, s, pushed_filters FROM example.data.filter_echo_table WHERE s LIKE 'row_1%';
+
+query T
+SELECT DISTINCT pushed_filters FROM v_body;
+----
+(s >= 'row' AND s < 'rox')
+
+query I
+SELECT count(*) FROM v_body;
+----
+11
+
+# ============================================================================
+# Part 4 — WHERE pushdown LEGITIMATELY STOPS (documents the boundary)
+# These are the realistic explanations for "my view's LIKE wasn't pushed down".
+# ============================================================================
+
+# 4a. View TRANSFORMS the column (upper(s)). A predicate on a derived expression
+#     cannot be pushed to the base table -> pushed_filters = (none). Results are
+#     still correct (DuckDB applies the filter above the scan).
+statement ok
+CREATE VIEW v_upper AS SELECT n, upper(s) AS su, pushed_filters FROM example.data.filter_echo_table;
+
+query T
+SELECT DISTINCT pushed_filters FROM v_upper WHERE su LIKE 'ROW%';
+----
+(none)
+
+query I
+SELECT count(*) FROM v_upper WHERE su LIKE 'ROW_1%';
+----
+11
+
+# 4b. LIKE with no constant prefix (leading wildcard) -> no range rewrite, and
+#     'contains'/'suffix' are not in supported_expression_filters, so nothing
+#     pushes. True both directly and through the plain view.
+query T
+SELECT DISTINCT pushed_filters FROM v_echo WHERE s LIKE '%row%';
+----
+(none)
+
+query T
+SELECT DISTINCT pushed_filters FROM v_echo WHERE s LIKE '%5';
+----
+(none)
+
+# 4c. ILIKE (case-insensitive) is NEVER pushed — not even the prefix form.
+#     The LIKE -> range rewrite only fires for case-SENSITIVE LIKE; a
+#     case-insensitive match can't be expressed as a single byte range
+#     (>= 'row' AND < 'rox' would miss 'ROW'/'Row'), so DuckDB keeps ILIKE as a
+#     residual expression above the scan. With no 'ilike'/'lower' in
+#     supported_expression_filters, nothing reaches the worker. This is a likely
+#     real-world cause of "my view's LIKE filter wasn't pushed down" when the
+#     predicate is actually a case-insensitive ILIKE. Results stay correct.
+
+# ILIKE prefix — direct
+query T
+SELECT DISTINCT pushed_filters FROM example.data.filter_echo_table WHERE s ILIKE 'ROW%';
+----
+(none)
+
+# ILIKE prefix — through the plain view (same: not pushed)
+query T
+SELECT DISTINCT pushed_filters FROM v_echo WHERE s ILIKE 'ROW%';
+----
+(none)
+
+# ILIKE contains — through the view
+query T
+SELECT DISTINCT pushed_filters FROM v_echo WHERE s ILIKE '%row%';
+----
+(none)
+
+# ILIKE results are still correct (filter applied above the scan).
+query I
+SELECT count(*) FROM v_echo WHERE s ILIKE 'ROW_1%';
+----
+11
+
+query I
+SELECT count(*) FROM v_echo WHERE s ILIKE '%ROW%';
+----
+100
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DROP VIEW v_upper;
+
+statement ok
+DROP VIEW v_body;
+
+statement ok
+DROP VIEW v_echo;
+
+statement ok
+DETACH example;
