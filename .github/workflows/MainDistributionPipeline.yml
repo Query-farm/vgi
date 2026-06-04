@@ -27,7 +27,7 @@ jobs:
     secrets:
       vcpkg_token: ${{ secrets.HAYBARN_VCPKG_TOKEN }}
     with:
-      duckdb_version: v1.5.3
+      duckdb_version: haybarn-v1.5.3-rc7
       ci_tools_version: haybarn
       override_ci_tools_repository: 'Query-farm-haybarn/haybarn-extension-ci-tools'
       extension_name: vgi
