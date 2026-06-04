@@ -51,6 +51,8 @@ rowid_middle	Table with row_id at column index 1
 rowid_string	Table with string row_id
 rowid_struct	Table with struct row_id
 ten_thousand_table	Function-backed table over the no-arg ten_thousand function
+tt_pushdown_cols	Columns-based: prunes by filter AND time-travels (AT → version arg).
+tt_pushdown_fn	Function-backed: prunes by filter AND time-travels (AT read at init).
 versioned_constraints	Table with constraints that evolve across versions
 versioned_data	Versioned data table demonstrating time travel with schema evolution
 volatile_numbers	Numbers with volatile stats (TTL=0, always re-fetched)

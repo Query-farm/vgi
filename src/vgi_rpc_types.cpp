@@ -497,7 +497,7 @@ BuildBindRequest(const std::string &function_name, const std::vector<uint8_t> &a
                  const std::string &function_type, const std::vector<uint8_t> &input_schema_bytes,
                  const std::vector<uint8_t> &settings_bytes, const std::vector<uint8_t> &secrets_bytes,
                  const std::vector<uint8_t> &attach_opaque_data, const std::vector<uint8_t> &transaction_opaque_data,
-                 bool resolved_secrets_provided) {
+                 bool resolved_secrets_provided, const std::string &at_unit, const std::string &at_value) {
 	// FunctionType enum: SCALAR, TABLE, AGGREGATE
 	static const std::vector<std::string> function_type_values = {"SCALAR", "TABLE", "AGGREGATE"};
 
@@ -511,6 +511,10 @@ BuildBindRequest(const std::string &function_name, const std::vector<uint8_t> &a
 	    arrow::field("attach_opaque_data", arrow::binary(), true),
 	    arrow::field("transaction_opaque_data", arrow::binary(), true),
 	    arrow::field("resolved_secrets_provided", arrow::boolean(), false),
+	    // Time travel (AT clause); empty string serialises as null. Matches the
+	    // Python BindRequest dataclass fields (matched by name, not position).
+	    arrow::field("at_unit", arrow::utf8(), true),
+	    arrow::field("at_value", arrow::utf8(), true),
 	});
 
 	std::vector<std::shared_ptr<arrow::Array>> arrays;
@@ -529,6 +533,9 @@ BuildBindRequest(const std::string &function_name, const std::vector<uint8_t> &a
 		CheckStatus(builder.Append(resolved_secrets_provided), "append resolved_secrets_provided");
 		arrays.push_back(FinishArray(builder, "resolved_secrets_provided"));
 	}
+
+	arrays.push_back(BuildNullableStringScalar(at_unit));
+	arrays.push_back(BuildNullableStringScalar(at_value));
 
 	return arrow::RecordBatch::Make(schema, 1, arrays);
 }

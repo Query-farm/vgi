@@ -279,7 +279,8 @@ void PerformVgiTableFunctionBind(ClientContext &context, VgiTableFunctionBindDat
 				    bind_data.attach_opaque_data, bind_data.transaction_opaque_data,
 				    bind_data.settings, resolved_secrets,
 				    /*resolved_secrets_provided=*/false,
-				    bind_data.worker_path());
+				    bind_data.worker_path(),
+				    bind_data.at_unit, bind_data.at_value);
 				auto bind_result = vgi::BuildBindResultFromInlinedBytes(
 				    std::move(bind_request_bytes), *tinfo.bind_result,
 				    bind_data.worker_path());
@@ -314,6 +315,8 @@ void PerformVgiTableFunctionBind(ClientContext &context, VgiTableFunctionBindDat
 	params.required_secrets = bind_data.required_secrets;
 	params.phase = "bind";
 	params.function_type = "TABLE";
+	params.at_unit = bind_data.at_unit;
+	params.at_value = bind_data.at_value;
 
 	auto result = AcquireAndBindConnection(context, params);
 	auto bind_worker_pid = result.connection ? result.connection->GetSubprocessPid().value_or(-1) : -1;

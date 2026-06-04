@@ -68,6 +68,14 @@ public:
 
 	virtual void SetInputSchema(const std::shared_ptr<arrow::Schema> &input_schema) = 0;
 
+	// Set the time-travel AT clause (empty = none) carried into the bind request
+	// so function-backed tables can read it at init via init_call.bind_call.at_value.
+	// Default no-op: only the real subprocess/HTTP connections override it.
+	virtual void SetAtClause(const std::string &at_unit, const std::string &at_value) {
+		(void)at_unit;
+		(void)at_value;
+	}
+
 	// Update input schema for execute phase (after bind, before OpenInputWriter)
 	// Used when reusing bind connection and actual DataChunk types differ from bind types
 	virtual void UpdateInputSchemaForExecution(const std::shared_ptr<arrow::Schema> &input_schema) = 0;

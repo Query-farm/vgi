@@ -48,7 +48,9 @@ BindResult PerformBindProtocol(
     const std::map<std::string, Value> &settings,
     const std::vector<VgiSecretRequirement> &required_secrets,
     const std::string &worker_label,  // for error messages (worker_path or base_url)
-    const BindTransportFn &transport_fn);
+    const BindTransportFn &transport_fn,
+    const std::string &at_unit = {},    // time travel; empty = null
+    const std::string &at_value = {});  // time travel; empty = null
 
 // Build the IPC-serialized BindRequest bytes that PerformBindProtocol sends
 // over the wire. Factored out so the inline-bind path (which has the
@@ -70,7 +72,9 @@ std::vector<uint8_t> BuildBindRequestBytes(
     const std::map<std::string, Value> &settings,
     const std::map<std::string, std::map<std::string, Value>> &resolved_secrets,
     bool resolved_secrets_provided,
-    const std::string &worker_label);
+    const std::string &worker_label,
+    const std::string &at_unit = {},    // time travel; empty = null
+    const std::string &at_value = {});  // time travel; empty = null
 
 // Non-network entrypoint: given pre-built bind_request_bytes (typically from
 // `BuildBindRequestBytes`) and an inlined bind_response blob (from

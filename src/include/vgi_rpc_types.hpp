@@ -126,7 +126,9 @@ std::shared_ptr<arrow::RecordBatch> BuildBindRequest(
     const std::vector<uint8_t> &secrets_bytes = {},        // Empty = null
     const std::vector<uint8_t> &attach_opaque_data = {},
     const std::vector<uint8_t> &transaction_opaque_data = {},
-    bool resolved_secrets_provided = false);
+    bool resolved_secrets_provided = false,
+    const std::string &at_unit = {},    // time travel; empty = null
+    const std::string &at_value = {});  // time travel; empty = null
 
 // Parsed BindResponse
 struct BindResponseResult {

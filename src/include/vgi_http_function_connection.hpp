@@ -53,6 +53,10 @@ public:
 	// HTTP has no spawn step; this is a no-op satisfying the interface.
 	void EnsureWorkerSpawned() override {}
 	void SetInputSchema(const std::shared_ptr<arrow::Schema> &input_schema) override;
+	void SetAtClause(const std::string &at_unit, const std::string &at_value) override {
+		at_unit_ = at_unit;
+		at_value_ = at_value;
+	}
 	void UpdateInputSchemaForExecution(const std::shared_ptr<arrow::Schema> &input_schema) override;
 
 	// Init RPC. bind_result must come from a prior PerformBindRpc.
@@ -148,6 +152,10 @@ private:
 
 	// Input schema for exchange mode
 	std::shared_ptr<arrow::Schema> input_schema_;
+
+	// Time-travel AT clause (empty = none) for the bind request. See SetAtClause.
+	std::string at_unit_;
+	std::string at_value_;
 
 	// Server capabilities (lazy-discovered)
 	ServerCapabilities capabilities_;

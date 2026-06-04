@@ -54,6 +54,13 @@ struct FunctionConnectionParams {
 	std::string phase;  // For logging (e.g., "bind", "init_local_secondary")
 	std::string function_type = "TABLE";  // "TABLE", "SCALAR", "AGGREGATE"
 
+	// Time travel (AT clause) for this scan; empty when no AT. Threaded into the
+	// bind request so function-backed tables can read it at init via
+	// init_call.bind_call.at_value. Only the non-inline RPC bind path uses these
+	// (the inline-bind path passes bind_data.at_* to BuildBindRequestBytes directly).
+	std::string at_unit;
+	std::string at_value;
+
 	// Optional input schema, required for function types that bind with a
 	// typed input stream (table-in-out, scalar). If set, AcquireAndBindConnection
 	// calls SetInputSchema before PerformBindRpc.
@@ -192,6 +199,11 @@ public:
 	// Must be called before PerformBindRpc() for table-in-out functions
 	// input_schema: Arrow schema describing the input data
 	void SetInputSchema(const std::shared_ptr<arrow::Schema> &input_schema) override;
+
+	void SetAtClause(const std::string &at_unit, const std::string &at_value) override {
+		at_unit_ = at_unit;
+		at_value_ = at_value;
+	}
 
 	// Update input schema for execution phase (when DataChunk types differ from bind types)
 	void UpdateInputSchemaForExecution(const std::shared_ptr<arrow::Schema> &input_schema) override;
@@ -370,6 +382,10 @@ private:
 
 	// Input schema for table-in-out/scalar functions (nullptr for regular table functions)
 	std::shared_ptr<arrow::Schema> input_schema_;
+
+	// Time-travel AT clause (empty = none) for the bind request. See SetAtClause.
+	std::string at_unit_;
+	std::string at_value_;
 
 	// Input data writer for exchange-mode functions
 	std::shared_ptr<arrow::ipc::RecordBatchWriter> input_writer_;

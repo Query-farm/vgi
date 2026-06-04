@@ -1,0 +1,141 @@
+# name: test/sql/integration/table/time_travel_pushdown.test
+# description: Time travel (AT) and filter pushdown together, for tables declared both ways
+# group: [vgi_integration_table]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# Function-backed table: tt_pushdown_fn. Reads the AT clause at init
+# (init_call.bind_call.at_value). Versions: v1 = ids 1..5, v2 = ids 1..10.
+# Regression guard: before the framework threads AT onto the bind request this
+# table cannot see AT, so seen_version collapses to the current version (2) and
+# the VERSION => 1 assertions below fail.
+# ============================================================================
+
+# AT VERSION 1: 5 rows, seen_version echoes 1
+query I
+SELECT count(*) FROM example.data.tt_pushdown_fn AT (VERSION => 1);
+----
+5
+
+query I
+SELECT DISTINCT seen_version FROM example.data.tt_pushdown_fn AT (VERSION => 1);
+----
+1
+
+# AT VERSION 2: 10 rows, seen_version echoes 2
+query II
+SELECT count(*), max(seen_version) FROM example.data.tt_pushdown_fn AT (VERSION => 2);
+----
+10	2
+
+# No AT: defaults to current version (2)
+query I
+SELECT DISTINCT seen_version FROM example.data.tt_pushdown_fn;
+----
+2
+
+# Time travel + filter pushdown in ONE query: prune id >= 8 at version 2.
+query III
+SELECT id, val, seen_version
+FROM example.data.tt_pushdown_fn AT (VERSION => 2)
+WHERE id >= 8 ORDER BY id;
+----
+8	80	2
+9	90	2
+10	100	2
+
+# The pushed-down predicate is observed by the function while time-travelling.
+query T
+SELECT DISTINCT pushed_filters
+FROM example.data.tt_pushdown_fn AT (VERSION => 2) WHERE id >= 8;
+----
+id >= 8
+
+# Filter that prunes to nothing still time-travels correctly (version 1 has no id 9).
+query I
+SELECT count(*) FROM example.data.tt_pushdown_fn AT (VERSION => 1) WHERE id >= 9;
+----
+0
+
+# TIMESTAMP-based time travel (year <= 2020 -> v1).
+query I
+SELECT count(*) FROM example.data.tt_pushdown_fn AT (TIMESTAMP => TIMESTAMP '2019-01-01');
+----
+5
+
+# Projection that drops the echo columns: AT + WHERE still correct.
+query I
+SELECT count(*) FROM example.data.tt_pushdown_fn AT (VERSION => 2) WHERE val > 50;
+----
+5
+
+# Multi-threaded: exercises the per-local-state (secondary) init carrying AT.
+statement ok
+SET threads=4;
+
+query II
+SELECT count(*), max(seen_version) FROM example.data.tt_pushdown_fn AT (VERSION => 1);
+----
+5	1
+
+statement ok
+RESET threads;
+
+# ============================================================================
+# Columns-based table: tt_pushdown_cols. AT is resolved to a version argument
+# in table_scan_function_get (the native columns-based mechanism). Same data.
+# ============================================================================
+
+query I
+SELECT count(*) FROM example.data.tt_pushdown_cols AT (VERSION => 1);
+----
+5
+
+query I
+SELECT DISTINCT seen_version FROM example.data.tt_pushdown_cols AT (VERSION => 1);
+----
+1
+
+query II
+SELECT count(*), max(seen_version) FROM example.data.tt_pushdown_cols AT (VERSION => 2);
+----
+10	2
+
+# No AT defaults to current version (2).
+query I
+SELECT DISTINCT seen_version FROM example.data.tt_pushdown_cols;
+----
+2
+
+# Time travel + filter pushdown together.
+query III
+SELECT id, val, seen_version
+FROM example.data.tt_pushdown_cols AT (VERSION => 2)
+WHERE id >= 8 ORDER BY id;
+----
+8	80	2
+9	90	2
+10	100	2
+
+query T
+SELECT DISTINCT pushed_filters
+FROM example.data.tt_pushdown_cols AT (VERSION => 2) WHERE id >= 8;
+----
+id >= 8
+
+# TIMESTAMP variant.
+query I
+SELECT count(*) FROM example.data.tt_pushdown_cols AT (TIMESTAMP => TIMESTAMP '2019-01-01');
+----
+5
+
+statement ok
+DETACH example;
