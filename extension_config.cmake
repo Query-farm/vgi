@@ -18,7 +18,7 @@ duckdb_extension_load(vgi
 # propagates to this scope), so the stock-DuckDB httpfs was being selected.
 # Force the haybarn fork until the CMake propagation is sorted out.
 set(HTTPFS_GIT_URL https://github.com/Query-farm-haybarn/haybarn-httpfs)
-set(HTTPFS_GIT_TAG 05a708ea2ccec7913bbad286f0a01eb030a3a32e)
+set(HTTPFS_GIT_TAG 2f99b6dd8b56ff0609d06eebbaf2200c47073d8f)
 # if(DEFINED HAYBARN_VERSION_STRING)
 #     set(HTTPFS_GIT_URL https://github.com/Query-farm-haybarn/haybarn-httpfs)
 #     set(HTTPFS_GIT_TAG 05a708ea2ccec7913bbad286f0a01eb030a3a32e)
