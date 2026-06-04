@@ -5,6 +5,8 @@
 #include "vgi_ifunction_connection.hpp"
 #include "yyjson.hpp"
 
+#include <arrow/api.h> // full Arrow definitions for HandleBatchLogMessage (forward-declared in the header)
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>

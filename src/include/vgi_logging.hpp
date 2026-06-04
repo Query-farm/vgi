@@ -6,7 +6,14 @@
 
 #include "vgi_platform.hpp" // pid_t (real on POSIX, shim on Windows)
 
-#include <arrow/api.h>
+// Arrow types appear only as shared_ptr parameters below, so forward
+// declarations suffice here. Pulling in the full <arrow/api.h> umbrella from
+// this header is expensive because vgi_logging.hpp is included by ~34 TUs; the
+// definitions are only needed in vgi_logging.cpp.
+namespace arrow {
+class RecordBatch;
+class KeyValueMetadata;
+} // namespace arrow
 
 #include "duckdb/logging/logging.hpp"
 #include "duckdb/logging/log_type.hpp"
