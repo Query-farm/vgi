@@ -45,6 +45,14 @@ public:
 	// Safe to call with no fd (does nothing). Main-thread only.
 	void DrainToLog(ClientContext &context, const std::string &worker_path, pid_t worker_pid);
 
+	// Join the reader thread (flushing any final unflushed bytes from a
+	// just-exited worker), then return the buffered stderr as one newline-joined
+	// string. Empty if nothing was captured / no fd. Intended for the error path
+	// only — the reader thread is stopped, so call this when the connection is
+	// about to be torn down (i.e. right before throwing a worker-failure error).
+	// Does NOT close the fd; the destructor still owns it.
+	std::string CaptureStderrSnapshot();
+
 private:
 	// Bound on the buffered-lines queue. Pooled workers can sit idle for
 	// long periods between queries; a chatty worker would otherwise grow

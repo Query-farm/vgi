@@ -91,7 +91,8 @@ UnaryResponseResult AttemptUnaryRpc(const UnaryRpcOptions &opts, const std::stri
 				         {"phase", opts.phase}});
 			}
 		} else {
-			CheckWorkerExitStatus(*proc, opts.worker_path, "failed during unary RPC");
+			CheckWorkerExitStatus(*proc, opts.worker_path, "failed during unary RPC", "",
+			                      drainer ? drainer->CaptureStderrSnapshot() : std::string());
 		}
 		throw;
 	}

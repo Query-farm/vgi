@@ -25,3 +25,14 @@ SELECT * FROM vgi_catalogs('/bin/echo');
 statement error
 SELECT * FROM vgi_catalogs('');
 ----
+
+# A worker that prints to stderr then exits non-zero should surface its stderr
+# in the error message (so users see *why* it failed, not just an exit code).
+# POSIX-only: the worker command is a /bin/sh snippet and stderr capture relies
+# on the subprocess (fork/exec) transport.
+require notwindows
+
+statement error
+SELECT * FROM vgi_catalogs('echo VGI_TEST_STDERR_MARKER 1>&2; exit 2');
+----
+worker stderr:

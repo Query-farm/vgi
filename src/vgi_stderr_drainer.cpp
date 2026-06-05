@@ -55,6 +55,38 @@ int StderrDrainer::ReleaseFd() {
 	fd_ = -1;
 	return fd;
 }
+
+std::string StderrDrainer::CaptureStderrSnapshot() {
+	// Stop and join the reader thread first. The caller only reaches this after
+	// the worker has exited, so its stderr write-end is closed: the reader hits
+	// EOF, flushes its trailing line_buffer into lines_, and returns promptly —
+	// the join captures the complete stderr with no race against the thread.
+	stop_.store(true, std::memory_order_relaxed);
+	if (thread_.joinable()) {
+		thread_.join();
+	}
+
+	std::vector<std::string> lines;
+	size_t dropped = 0;
+	{
+		std::lock_guard<std::mutex> lock(mutex_);
+		lines.swap(lines_);
+		dropped = dropped_lines_;
+		dropped_lines_ = 0;
+	}
+
+	std::string result;
+	if (dropped > 0) {
+		result += "[" + std::to_string(dropped) + " earlier stderr line(s) dropped]\n";
+	}
+	for (size_t i = 0; i < lines.size(); i++) {
+		if (i > 0) {
+			result += '\n';
+		}
+		result += lines[i];
+	}
+	return result;
+}
 #else  // Emscripten (HTTP-only)
 // No subprocess stderr pipe exists on this build; the drainer is never
 // constructed with a real fd. Defined so the always-compiled worker pool /
@@ -65,6 +97,9 @@ StderrDrainer::~StderrDrainer() {
 }
 int StderrDrainer::ReleaseFd() {
 	return -1;
+}
+std::string StderrDrainer::CaptureStderrSnapshot() {
+	return "";
 }
 #endif // VGI_SUBPROCESS_TRANSPORT
 

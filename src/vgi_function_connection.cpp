@@ -486,7 +486,8 @@ BindResult FunctionConnection::PerformBindRpc() {
 		try {
 			WriteRpcRequest(proc_->GetStdinFd(), "bind", rpc_params);
 		} catch (const IOException &e) {
-			CheckWorkerExitStatus(*proc_, worker_path_, "failed to start");
+			CheckWorkerExitStatus(*proc_, worker_path_, "failed to start", "",
+			                      stderr_drainer_ ? stderr_drainer_->CaptureStderrSnapshot() : std::string());
 			throw;
 		}
 
@@ -494,7 +495,8 @@ BindResult FunctionConnection::PerformBindRpc() {
 		try {
 			response = ReadUnaryResponse(proc_->GetStdoutFd(), &context_, worker_path_, proc_->GetPid());
 		} catch (const IOException &e) {
-			CheckWorkerExitStatus(*proc_, worker_path_, "failed during bind");
+			CheckWorkerExitStatus(*proc_, worker_path_, "failed during bind", "",
+			                      stderr_drainer_ ? stderr_drainer_->CaptureStderrSnapshot() : std::string());
 			throw;
 		}
 
@@ -646,7 +648,8 @@ InitResult FunctionConnection::PerformInit(const BindResult &bind_result,
 	try {
 		WriteRpcRequest(proc_->GetStdinFd(), "init", rpc_params, shm_metadata);
 	} catch (const IOException &e) {
-		CheckWorkerExitStatus(*proc_, worker_path_, "failed during init request");
+		CheckWorkerExitStatus(*proc_, worker_path_, "failed during init request", "",
+		                      stderr_drainer_ ? stderr_drainer_->CaptureStderrSnapshot() : std::string());
 		throw;
 	}
 
@@ -655,7 +658,8 @@ InitResult FunctionConnection::PerformInit(const BindResult &bind_result,
 	try {
 		header = ReadStreamHeader(proc_->GetStdoutFd(), &context_, worker_path_, proc_->GetPid());
 	} catch (const IOException &e) {
-		CheckWorkerExitStatus(*proc_, worker_path_, "failed during init response");
+		CheckWorkerExitStatus(*proc_, worker_path_, "failed during init response", "",
+		                      stderr_drainer_ ? stderr_drainer_->CaptureStderrSnapshot() : std::string());
 		throw;
 	}
 
