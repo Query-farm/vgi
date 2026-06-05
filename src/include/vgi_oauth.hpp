@@ -203,6 +203,18 @@ OAuthTokenSet PerformAuthFlow(const OAuthChallenge &challenge, ClientContext &co
 // Environment detection
 bool IsHeadlessEnvironment();
 
+// True when running inside a Google Colab kernel. Colab captures the kernel's
+// C-level stderr into the notebook cell, so the device-code prompt (URL + user
+// code) is written to stderr there — otherwise it only reaches DUCKDB_LOG_WARNING,
+// which the Python client never surfaces, and login appears to hang.
+bool IsColabEnvironment();
+
+// True iff url is a plain-http loopback URL (127.0.0.1 / localhost / [::1]) with a
+// proper host boundary after the host (':' port, '/' path, or end-of-string). Used
+// to allow http only for genuine loopback while rejecting look-alikes such as
+// http://127.0.0.1.evil.com that a prefix match would wrongly accept.
+bool IsLoopbackHttpUrl(const std::string &url);
+
 // Utility functions
 std::optional<OAuthChallenge> ParseWWWAuthenticate(const std::string &header);
 std::string GenerateCodeVerifier();

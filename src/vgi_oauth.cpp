@@ -419,8 +419,7 @@ static void EnforceHttpsUrl(const std::string &url, const std::string &context_n
 	if (url.empty()) {
 		throw IOException("VGI OAuth: %s URL is empty (no OAuth challenge from server)", context_name);
 	}
-	if (url.substr(0, 8) != "https://" && url.substr(0, 16) != "http://127.0.0.1" &&
-	    url.substr(0, 16) != "http://localhost") {
+	if (url.substr(0, 8) != "https://" && !IsLoopbackHttpUrl(url)) {
 		throw IOException("VGI OAuth: %s URL must use HTTPS: %s", context_name, url);
 	}
 }
@@ -846,6 +845,17 @@ bool IsHeadlessEnvironment() {
 	return false;
 }
 
+// Surface an auth-flow message on stderr when running in Colab. The flow already
+// logs via DUCKDB_LOG_WARNING, but the Python client never displays those; Colab
+// captures C-level stderr into the cell, so this is what the user actually sees.
+// fflush is required — Colab's fd capture won't reliably show buffered output.
+static void PrintPromptIfColab(const std::string &msg) {
+	if (IsColabEnvironment()) {
+		fprintf(stderr, "[VGI] %s\n", msg.c_str());
+		fflush(stderr);
+	}
+}
+
 //===--------------------------------------------------------------------===//
 // Device Code Flow (RFC 8628)
 //===--------------------------------------------------------------------===//
@@ -959,6 +969,7 @@ static OAuthTokenSet PerformDeviceCodeFlowImpl(const OAuthChallenge &challenge,
 		auth_msg += "\nOr visit: " + verification_uri_complete;
 	}
 	DUCKDB_LOG_WARNING(context, auth_msg);
+	PrintPromptIfColab(auth_msg);
 	// Note: in WASM, EM_ASM can't be used from side modules (extensions).
 	// The auth message is logged via DUCKDB_LOG_WARNING. The terminal UI
 	// should display DuckDB warning-level logs to show the user code.
@@ -1007,6 +1018,7 @@ static OAuthTokenSet PerformDeviceCodeFlowImpl(const OAuthChallenge &challenge,
 		auto since_last = std::chrono::duration_cast<std::chrono::seconds>(now - last_status_print).count();
 		if (since_last >= 30) {
 			DUCKDB_LOG_WARNING(context, "Still waiting for authentication...");
+			PrintPromptIfColab("Still waiting for authentication...");
 			last_status_print = now;
 		}
 
@@ -1030,6 +1042,7 @@ static OAuthTokenSet PerformDeviceCodeFlowImpl(const OAuthChallenge &challenge,
 			auto tokens = ParseTokenResponse(resp.body, "device code token response");
 			tokens.use_id_token = resource_meta.use_id_token_as_bearer;
 			DUCKDB_LOG_WARNING(context, "Authentication successful.");
+			PrintPromptIfColab("Authentication successful.");
 			return tokens;
 		}
 
@@ -1173,8 +1186,10 @@ OAuthTokenSet PerformAuthFlow(const OAuthChallenge &challenge,
 		return PerformDeviceCodeFlowImpl(challenge, resource_meta, server_meta, context);
 	}
 
-	// Headless environment
-	if (has_device_ep && IsHeadlessEnvironment()) {
+	// Headless / notebook environment. Colab is checked explicitly: it doesn't
+	// always trip the generic headless heuristics, and routing it to the
+	// server-side PKCE/localhost path would open an invisible browser and hang.
+	if (has_device_ep && (IsHeadlessEnvironment() || IsColabEnvironment())) {
 		VGI_STDERR_DEBUG("[VGI] oauth.auto_flow chose=device_code reason=headless_environment\n");
 		return PerformDeviceCodeFlowImpl(challenge, resource_meta, server_meta, context);
 	}
@@ -1596,8 +1611,10 @@ static OAuthTokenSet PerformPKCEFlowImpl(const OAuthChallenge &challenge,
 	}
 
 	// Always print the URL so user can manually navigate if browser fails
-	DUCKDB_LOG_WARNING(context, "Authentication required for " + GetResourceDisplayName(resource_meta) +
-	    ". Opening browser...\nIf the browser doesn't open, visit this URL:\n" + auth_url);
+	std::string pkce_msg = "Authentication required for " + GetResourceDisplayName(resource_meta) +
+	    ". Opening browser...\nIf the browser doesn't open, visit this URL:\n" + auth_url;
+	DUCKDB_LOG_WARNING(context, pkce_msg);
+	PrintPromptIfColab(pkce_msg);
 
 	OpenBrowser(auth_url);
 

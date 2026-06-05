@@ -93,6 +93,7 @@ src/vgi_http_client.cpp
 src/vgi_http_function_connection.cpp
 src/vgi_cookie_jar.cpp
 src/vgi_oauth.cpp
+src/vgi_oauth_env.cpp
 src/vgi_catalogs.cpp
 src/vgi_table_function.cpp
 src/vgi_table_function_impl.cpp
@@ -163,6 +164,8 @@ if((BUILD_VGI_UNIT_TESTS OR DEFINED ENV{BUILD_VGI_UNIT_TESTS}) AND NOT WIN32)
     test/cpp/test_launcher_e2e.cpp
     test/cpp/test_launcher_flock_parity.cpp
     test/cpp/test_transport_detection.cpp
+    test/cpp/test_oauth.cpp
+    src/vgi_oauth_env.cpp
     src/vgi_launcher_internal.cpp
     src/vgi_unix_socket.cpp
     src/vgi_launcher.cpp
