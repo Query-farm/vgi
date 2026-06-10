@@ -503,17 +503,20 @@ UnaryResponseResult HttpInvokeUnary(ClientContext &context,
                                      const std::string &invocation_id_hex,
                                      const std::string &attach_opaque_data_hex,
                                      const std::string &transaction_opaque_data_hex,
-                                     const std::string &conn_id_hex) {
+                                     const std::string &conn_id_hex,
+                                     const std::string &protocol_version_override) {
 	std::string base_url = NormalizeBaseUrl(worker_path);
 	std::string url = base_url + "/" + method_name;
 
 	VGI_LOG(context, "http.invoke_unary",
 	        {{"url", url}, {"method", method_name}});
 
-	// Serialize the RPC request to Arrow IPC bytes
+	// Serialize the RPC request to Arrow IPC bytes. A non-empty
+	// protocol_version_override stamps a different application protocol version
+	// (the secret protocol) into the request metadata.
 	std::vector<uint8_t> body;
 	if (params) {
-		body = SerializeRpcRequest(method_name, params);
+		body = SerializeRpcRequest(method_name, params, protocol_version_override);
 	} else {
 		body = SerializeEmptyRpcRequest(method_name);
 	}

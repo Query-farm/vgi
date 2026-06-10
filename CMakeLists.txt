@@ -117,6 +117,7 @@ src/vgi_worker_pool_functions.cpp
 src/vgi_wasm_async_pool.cpp
 src/vgi_table_statistics_function.cpp
 src/vgi_clear_cache.cpp
+src/vgi_secret_storage.cpp
 src/storage/vgi_catalog.cpp
 src/storage/vgi_catalog_set.cpp
 src/storage/vgi_schema_set.cpp

@@ -217,6 +217,69 @@ plus the shm-aware code paths in `src/vgi_function_connection.cpp`
 
 **vgi-python function classes**: Function names are CamelCased with a `Function` suffix (e.g., `projected_data` → `ProjectedDataFunction` in vgi-python).
 
+## Remote Secret Provider
+
+A VGI catalog can broker downstream credentials (S3/HTTP/GCS/…) from a remote secret
+service — *lazily*, with no `CREATE SECRET`, under the catalog's own identity. This is the
+"Orchard" feature.
+
+**Seam.** `VgiRemoteSecretStorage : duckdb::SecretStorage` (`src/vgi_secret_storage.{hpp,cpp}`),
+registered as a **catch-all** (scope `[""]`). `SecretManager::LookupSecret` calls its virtual
+`LookupSecret(path, type, txn)` on every path-keyed lookup — that's the lazy hook. Built-ins
+occupy tie-break offsets 10/20; the remote catch-all auto-allocates from 100 (step 10), so a
+user's local `CREATE SECRET` always wins and the remote is the transparent fallback.
+
+**Auto-registration.** When a catalog's `catalog_attach` response carries
+`tags["vgi_secret_service_url"]`, `VgiCatalogAttach` (`vgi_extension.cpp`) builds the storage
+**reusing the catalog's `CatalogAuth`** (`attach_params->auth()`) and `LoadSecretStorage`s it.
+One OAuth/bearer login authorizes both worker RPCs and secret fetches. HTTP-only; opt out with
+`secrets false`. The advertised URL **must be `https://`** (only `http://localhost` allowed,
+for tests). The per-DB registry lives on the file-local `VgiStorageExtension`.
+
+**Separate protocol.** The secret service speaks `VgiSecretProtocol` (`vgi/secret_protocol.py`),
+versioned independently of `VgiProtocol`. Its `secret_lookup(path, type)` is dispatched over the
+existing HTTP unary RPC with a per-call `protocol_version_override` = `VGI_SECRET_PROTOCOL_VERSION`
+(threaded through `UnaryRpcOptions` → `HttpInvokeUnary` → `SerializeRpcRequest`; default empty =
+`VGI_PROTOCOL_VERSION`, so existing callers are unchanged). The response is validated against
+`SecretLookupResultSchema()` inline — it does **not** enter the shared catalog schema registry.
+
+**Typed values.** `SecretLookupResponse.values` is a one-row Arrow RecordBatch carried as binary
+(columns = secret keys, row-0 cells = values). C++ converts each cell to a typed DuckDB `Value`
+via `ArrowTableFunction::ArrowToDuckDB` → `DataChunk::GetValue`, so values can be string, int64,
+bool, struct, list, or nested — not just strings. The server's `redact_keys` are honored so
+sensitive values are hidden in `duckdb_secrets()`.
+
+**Correctness invariants:**
+- **Null `ClientContext`** — on the httpfs/system-transaction path `txn->context` is null, so
+  `FetchRemote` mints a transient `Connection(db_)` per fetch (cheap; thread-safe; no txn).
+- **Reentrancy guard** — an `http(s)://` endpoint re-enters `LookupSecret(type="http")` on the
+  same thread; a `thread_local` flag short-circuits the nested call *before any locking*.
+- **Single-flight** — concurrent identical `(type, path)` lookups share one RPC via an
+  `inflight_` map + `condition_variable` (`InflightLookup`); the leader fetches lock-free,
+  waiters block then reuse the shared result/error. No lock is held across the RPC.
+- **Failures surface** — a real `found=false` is a silent miss (negative-cached, short TTL),
+  but any transport/auth/protocol failure throws a clear `IOException` (it is **not** masked as
+  "no credential").
+- **TTL** = `min(server ttl_seconds, expires_at_unix − now)` so short-lived STS tokens are never
+  served stale.
+- **Non-throwing scan methods** — `AllSecrets` / `GetSecretByName` / `DropSecretByName` never
+  throw (called by `duckdb_secrets()` / DROP); `StoreSecret` throws `NotImplementedException`.
+
+**Lifecycle (known limitation).** `SecretManager` has no unload API, so DETACH does **not**
+remove the provider — it stays registered for the DB's lifetime. `vgi_secret_provider_flush()`
+clears the cache as the manual control.
+
+**Reference service.** `vgi-secret-serve` + `ExampleOrchardSecretService` in vgi-python; the test
+catalog worker is `vgi/_test_fixtures/orchard_catalog.py` (advertises the URL from
+`$VGI_ORCHARD_SECRET_URL`). Logging: `secret.lookup` events (`endpoint`, `type`, `outcome`,
+`duration_ms`) via `VGI_LOG`. On the null-context path these log through the transient connection,
+so they appear on stderr with `VGI_STDERR_LOG=1` but **not** in the main connection's `duckdb_logs`.
+
+**Tests.** `test/orchard_secret_e2e.py` (auto-register, typed values, redaction, caching, opt-out,
+auth transmission via bearer, HTTPS enforcement) and `test/orchard_httpfs_e2e.py` (the
+null-`ClientContext` system-transaction path via a mock S3 + `SELECT … FROM 's3://…'`). Design
+notes: [`docs/remote_secret_provider_plan.md`](docs/remote_secret_provider_plan.md).
+
 ## Extension Settings
 
 | Setting | Type | Default | Description |
@@ -231,6 +294,7 @@ plus the shm-aware code paths in `src/vgi_function_connection.cpp`
 | `vgi_table_buffering` | BOOLEAN | true | Rewrite calls to `TableBufferingFunction` subclasses through the Sink+Source `PhysicalVgiTableBufferingFunction` operator. Set to false to disable the rewrite — buffered queries then throw `InvalidInputException` instead of running (emergency-rollback path; not generally useful) |
 | `vgi_multi_branch_scans` | BOOLEAN | true | Rewrite multi-branch VGI table scans into `LogicalSetOperation(UNION_ALL, ...)` via the optimizer extension. Set to false to disable the rewrite — multi-branch tables then refuse at bind with a clear `BinderException`. Emergency-rollback knob. See [docs/multi_branch.md](docs/multi_branch.md) |
 | `vgi_trust_empty_kinds` | BOOLEAN | true | Trust worker assertions that `estimated_object_count[kind] == 0` means the kind is empty (skip `catalog_schema_contents_*` RPC). Set to false to force every RPC to fire — debug escape hatch for diagnosing worker bugs |
+| `vgi_secret_default_ttl_seconds` | BIGINT | 300 | Default cache TTL for credentials fetched from an Orchard remote secret provider, when the server suggests none. Further capped per-credential by the credential's own expiry. Read at `ATTACH`, frozen per-provider. See *Remote Secret Provider* |
 
 Catalogs may register additional settings at `ATTACH` time (e.g., `greeting`, `multiplier`).
 
@@ -244,6 +308,8 @@ Catalogs may register additional settings at `ATTACH` time (e.g., `greeting`, `m
 | `pool_timeout` | BIGINT | (global default) | Idle timeout in seconds before pooled workers are removed |
 | `worker_debug` | BOOLEAN | false | Enable worker debug output |
 | `oauth_refresh_token` | VARCHAR | (none) | Pre-seed OAuth refresh token for HTTP transport (skips interactive auth) |
+| `bearer_token` | VARCHAR | (none) | Static bearer token for HTTP transport (reused for the remote secret provider too). Throws on 401 (no recovery), unlike OAuth |
+| `secrets` | BOOLEAN | true | Auto-register the Orchard remote secret provider when the catalog advertises a secret-service URL. Set `false` to opt out for this catalog. See *Remote Secret Provider* |
 | `launcher_idle_timeout` | BIGINT seconds | (uses launcher default of 300) | Self-shutdown idle timeout for `launch:` LOCATIONs. Pinned per-LOCATION; conflicting subsequent ATTACHes throw `BinderException`. See [`docs/launcher-tutorial.md`](docs/launcher-tutorial.md). |
 | `launcher_state_dir` | VARCHAR (path) | OS-derived (`$XDG_RUNTIME_DIR/vgi-rpc/` etc.) | Override the launcher's state directory. Escape valve only — does NOT isolate workers from other DuckDB processes with the same `launch:` argv. See [`docs/launcher-options.md`](docs/launcher-options.md). |
 
@@ -272,6 +338,8 @@ The `launch:` and `unix://` paths share one warm worker process across every Duc
 | `vgi_clear_cache()` | Table | Clear cached catalog metadata (schemas, tables, functions, statistics) for all attached VGI catalogs |
 | `vgi_catalog_identity()` | Table | OIDC identity per attached VGI catalog: `catalog_name`, `origin`, `authenticated`, `sub`, `email`, `name`, `issuer`, `claims` (JSON). Claims carry the full decoded id_token payload — reach provider-specific fields via e.g. `claims->>'$.preferred_username'` for Entra, `claims->>'$.hd'` for Google Workspace, etc. |
 | `vgi_table_branches()` | Table | Diagnostic: one row per branch per VGI table across every attached VGI catalog. Columns: `catalog_name`, `schema_name`, `table_name`, `branch_index`, `function_name`, `positional_arguments` (JSON), `named_arguments` (JSON), `branch_filter`, `table_required_extensions` (LIST). Used to introspect multi-branch tables. See [docs/multi_branch.md](docs/multi_branch.md). |
+| `vgi_secret_providers()` | Table | Diagnostic: one row per auto-registered Orchard remote secret provider. Columns: `catalog_name`, `endpoint`, `tie_break_offset`, `active`, `cached_secrets`, `ttl_seconds`. See *Remote Secret Provider* |
+| `vgi_secret_provider_flush(catalog := NULL)` | Table | Clear a provider's TTL cache (all providers when `catalog` omitted). Returns the count of positive secrets dropped |
 
 ## Key Source Files
 
@@ -304,6 +372,7 @@ The `launch:` and `unix://` paths share one warm worker process across every Duc
 | `vgi_table_branches_function.cpp` | `vgi_table_branches()` SQL diagnostic — one row per branch per VGI table across every attached VGI catalog |
 | `vgi_multi_scan_rewriter.cpp` | `VgiMultiScanRewriter` — pre-pushdown `OptimizerExtension` that rewrites multi-branch `LogicalGet(marker)` into `LogicalSetOperation(UNION_ALL, [LogicalProjection(LogicalFilter(branch_filter, LogicalGet(branch_fn))), ...])`. Includes a minimal v1.0 `branch_filter` binder (col OP const, AND/OR). See [docs/multi_branch.md](docs/multi_branch.md) for the user-facing reference |
 | `vgi_shm_segment.cpp` | `VgiShmSegment`: posix shm allocator + zero-copy chained-buffer reader for the shared-memory transport (see *Shared-Memory Transport*) |
+| `vgi_secret_storage.cpp` | `VgiRemoteSecretStorage : duckdb::SecretStorage` — lazy, remote-backed credential provider (see *Remote Secret Provider*). The `vgi_secret_providers()` / `vgi_secret_provider_flush()` SQL fns and the per-DB provider registry live in `vgi_extension.cpp` (registry is on the file-local `VgiStorageExtension`) |
 
 ### Storage Layer (`src/storage/`)
 
@@ -331,6 +400,7 @@ The `launch:` and `unix://` paths share one warm worker process across every Duc
 | `vgi_worker_pool.hpp` | `PooledWorker`, `VgiWorkerPool` singleton |
 | `vgi_logging.hpp` | `VGI_LOG()`, `VGI_STDERR_DEBUG()` macro, `HandleBatchLogMessage()` |
 | `vgi_shm_segment.hpp` | `VgiShmSegment::Create/ResetAllocator/FreeAllocation/MaybeResolveBatch`, header-byte-layout constants matching `vgi-rpc/vgi_rpc/shm.py` |
+| `vgi_secret_storage.hpp` | `VgiRemoteSecretStorage` — `(type,scope)`+negative caches, single-flight `InflightLookup`, reentrancy guard, transient-`Connection` context (see *Remote Secret Provider*) |
 | `vgi_arrow_ipc.hpp` | `FdInputStream`, `FdOutputStream` (non-owning), Arrow IPC helpers |
 | `vgi_scalar_function_impl.hpp` | `VgiScalarFunctionInfo`, `VgiScalarFunctionBindData` |
 | `storage/vgi_catalog_set.hpp` | `VgiCatalogSet` with `CreateEntryLocked()` (requires lock held) |
@@ -346,6 +416,9 @@ edit these files by hand; regenerate.
 |------|-----------|---------|
 | `vgi_protocol_schemas.hpp` | `python -m vgi.codegen.cpp_schemas` | One `XxxParamsSchema()` / `XxxResponseSchema()` factory per RPC method |
 | `vgi_request_builders.hpp` | `python -m vgi.codegen.cpp_request_builders` | One `BuildXxxParams(...)` builder per RPC method, taking `std::optional<T>` for nullable fields |
+| `vgi_secret_protocol_schemas.hpp` | `python -m vgi.codegen.cpp_secret_schemas` | Schema factories for the separately-versioned `VgiSecretProtocol` (`SecretLookupParamsSchema` / `SecretLookupResultSchema`) |
+| `vgi_secret_request_builders.hpp` | `python -m vgi.codegen.cpp_secret_request_builders` | `BuildSecretLookupParams(path, type)` builder for the secret protocol |
+| `vgi_secret_protocol_version.hpp` | `python -m vgi.codegen.cpp_secret_protocol_version` | `VGI_SECRET_PROTOCOL_VERSION` — the secret protocol's own version, passed as a per-call `protocol_version_override` |
 
 Regenerate after changing `VgiProtocol`:
 
@@ -357,9 +430,25 @@ uv run python -m vgi.codegen.cpp_request_builders \
     > ~/Development/vgi/src/generated/vgi_request_builders.hpp
 ```
 
-Drift is enforced by `tests/test_generated_cpp_schemas.py` and
-`tests/test_generated_cpp_request_builders.py` in `vgi-python` (CI fails if the
-checked-in headers diverge from the generators).
+Regenerate after changing `VgiSecretProtocol` (`vgi/secret_protocol.py`):
+
+```bash
+cd ~/Development/vgi-python
+uv run python -m vgi.codegen.cpp_secret_protocol_version \
+    > ~/Development/vgi/src/generated/vgi_secret_protocol_version.hpp
+uv run python -m vgi.codegen.cpp_secret_schemas \
+    > ~/Development/vgi/src/generated/vgi_secret_protocol_schemas.hpp
+uv run python -m vgi.codegen.cpp_secret_request_builders \
+    > ~/Development/vgi/src/generated/vgi_secret_request_builders.hpp
+```
+
+The codegen is parametrized by protocol class — `collect_schemas(protocol_cls, ...)` in
+`vgi/codegen/_common.py` and the reusable `emit_schemas` / `emit_builders` /
+`emit_version_header` helpers — so the same machinery emits both protocols.
+
+Drift is enforced by `tests/test_generated_cpp_schemas.py`,
+`tests/test_generated_cpp_request_builders.py`, and `tests/test_generated_cpp_secret.py`
+in `vgi-python` (CI fails if the checked-in headers diverge from the generators).
 
 ## Coding Conventions
 

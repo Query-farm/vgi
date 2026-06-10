@@ -6,6 +6,8 @@
 #include "vgi_platform.hpp"
 
 #include <cerrno>
+#include <chrono>
+#include <map>
 #include <mutex>
 #include <set>
 #if VGI_POSIX_TRANSPORT
@@ -60,6 +62,7 @@
 #include "vgi_aggregate_function_impl.hpp"
 #include "vgi_oauth.hpp"
 #include "vgi_profiling.hpp"
+#include "vgi_secret_storage.hpp"
 #include "vgi_streaming_window_operator.hpp"
 #include "vgi_table_buffering_impl.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
@@ -993,10 +996,58 @@ public:
 		return {};
 	}
 
+	// Locate the VGI storage extension on a DatabaseInstance. nullptr if absent.
+	static VgiStorageExtension *Find(DatabaseInstance &db) {
+		auto &config = DBConfig::GetConfig(db);
+		auto ext = StorageExtension::Find(config, "vgi");
+		if (!ext) {
+			return nullptr;
+		}
+		return static_cast<VgiStorageExtension *>(ext.get());
+	}
+
+	// Registry of Orchard remote secret providers, keyed by attached catalog
+	// name. The SecretManager owns each VgiRemoteSecretStorage (no unload API);
+	// these are non-owning pointers kept for diagnostics and best-effort detach.
+	// Valid for the DB's lifetime (the storage objects never go away).
+	void RegisterSecretProvider(const std::string &catalog_name, vgi::VgiRemoteSecretStorage *storage) {
+		std::lock_guard<std::mutex> lock(secret_mutex_);
+		secret_providers_[catalog_name] = storage;
+	}
+
+	vgi::VgiRemoteSecretStorage *FindSecretProvider(const std::string &catalog_name) {
+		std::lock_guard<std::mutex> lock(secret_mutex_);
+		auto it = secret_providers_.find(catalog_name);
+		return it != secret_providers_.end() ? it->second : nullptr;
+	}
+
+	std::vector<std::pair<std::string, vgi::VgiRemoteSecretStorage *>> AllSecretProviders() {
+		std::lock_guard<std::mutex> lock(secret_mutex_);
+		std::vector<std::pair<std::string, vgi::VgiRemoteSecretStorage *>> out;
+		out.reserve(secret_providers_.size());
+		for (auto &kv : secret_providers_) {
+			out.emplace_back(kv.first, kv.second);
+		}
+		return out;
+	}
+
+	// Auto-allocate a unique tie_break_offset for each secret provider, starting
+	// at 100 (built-ins occupy 10/20, so a remote catch-all loses to local
+	// secrets). Step 10 leaves room and never collides within a DB.
+	int64_t NextSecretTieBreakOffset() {
+		std::lock_guard<std::mutex> lock(secret_mutex_);
+		int64_t off = next_secret_offset_;
+		next_secret_offset_ += 10;
+		return off;
+	}
+
 private:
 	mutable std::mutex redact_mutex_;
 	std::unordered_map<std::string, case_insensitive_set_t> redact_keys_;
 	vgi::VgiCancelDispatcher dispatcher_;
+	mutable std::mutex secret_mutex_;
+	std::map<std::string, vgi::VgiRemoteSecretStorage *> secret_providers_;
+	int64_t next_secret_offset_ = 100;
 };
 
 // Create function for VGI secrets — builds a KeyValueSecret from config options.
@@ -1040,6 +1091,10 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	// on the integer; std::nullopt-equivalent on the string is empty.
 	int64_t launcher_idle_timeout_seconds = -1;
 	string launcher_state_dir;
+	// Opt out of Orchard's remote secret provider for this catalog. Default on:
+	// an HTTP catalog whose attach response advertises a secret-service URL gets
+	// a VgiRemoteSecretStorage auto-registered (reusing this catalog's identity).
+	bool secrets_enabled = true;
 	// Unknown-to-the-extension options are forwarded to the worker as
 	// attach-time options after validation against the catalog's declared
 	// AttachOptionSpec list (fetched via InvokeCatalogs when present).
@@ -1059,6 +1114,8 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 			worker_debug = value.DefaultCastAs(LogicalType::BOOLEAN).GetValue<bool>();
 		} else if (lower_name == "pool") {
 			use_pool = value.DefaultCastAs(LogicalType::BOOLEAN).GetValue<bool>();
+		} else if (lower_name == "secrets") {
+			secrets_enabled = value.DefaultCastAs(LogicalType::BOOLEAN).GetValue<bool>();
 		} else if (lower_name == "pool_max") {
 			pool_max_override = value.DefaultCastAs(LogicalType::BIGINT).GetValue<int64_t>();
 		} else if (lower_name == "pool_timeout") {
@@ -1454,6 +1511,63 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 		eager_thresholds = ObjectCountsFromMap(threshold_map, 1000);
 	}
 
+	// Auto-register Orchard's remote secret provider when the catalog advertises
+	// a secret-service URL via tags (and the user didn't opt out with
+	// `secrets false`). Reuses THIS catalog's auth (OAuth/bearer) so a single
+	// login authorizes both worker RPCs and secret fetches. HTTP-only — there's
+	// no secret endpoint to call on subprocess/launch/unix transports.
+	if (secrets_enabled && vgi::IsHttpTransport(worker_path)) {
+		auto turl = attach_result_ptr->tags.find("vgi_secret_service_url");
+		if (turl != attach_result_ptr->tags.end() && !turl->second.empty()) {
+			const std::string secret_endpoint = turl->second;
+			// A remote credential broker must be reached over TLS. Require https://
+			// — allow cleartext http only for loopback (local testing).
+			auto lower_secret_url = StringUtil::Lower(secret_endpoint);
+			const bool is_https = StringUtil::StartsWith(lower_secret_url, "https://");
+			const bool is_loopback_http =
+			    StringUtil::StartsWith(lower_secret_url, "http://127.0.0.1") ||
+			    StringUtil::StartsWith(lower_secret_url, "http://localhost") ||
+			    StringUtil::StartsWith(lower_secret_url, "http://[::1]");
+			if (!is_https && !is_loopback_http) {
+				throw BinderException(
+				    "vgi_secret_service_url advertised by catalog '%s' must be an https:// URL — a remote "
+				    "secret broker must not be reached over cleartext HTTP (only http://localhost is allowed "
+				    "for testing). Got: %s",
+				    catalog_name, secret_endpoint);
+			}
+			// Default cache TTL frozen per-provider at attach time.
+			int64_t default_ttl = 300;
+			Value ttl_val;
+			if (context.TryGetCurrentSetting("vgi_secret_default_ttl_seconds", ttl_val) && !ttl_val.IsNull()) {
+				default_ttl = ttl_val.GetValue<int64_t>();
+				if (default_ttl < 0) {
+					default_ttl = 0;
+				}
+			}
+
+			auto *vgi_ext = VgiStorageExtension::Find(*context.db);
+			if (vgi_ext) {
+				const int64_t offset = vgi_ext->NextSecretTieBreakOffset();
+				// Unique storage name per registration (offset suffix) so a
+				// re-ATTACH after detach doesn't collide with the inert prior
+				// storage still owned by the SecretManager.
+				const std::string storage_name =
+				    "vgi_secret_" + catalog_name + "_" + std::to_string(offset);
+				auto storage = make_uniq<vgi::VgiRemoteSecretStorage>(
+				    *context.db, storage_name, secret_endpoint, auth, std::chrono::seconds(default_ttl), offset);
+				auto *storage_ptr = storage.get();
+				try {
+					SecretManager::Get(context).LoadSecretStorage(std::move(storage));
+				} catch (const std::exception &e) {
+					throw BinderException(
+					    "Failed to register VGI remote secret provider for catalog '%s' (endpoint %s): %s",
+					    catalog_name, secret_endpoint, e.what());
+				}
+				vgi_ext->RegisterSecretProvider(catalog_name, storage_ptr);
+			}
+		}
+	}
+
 	return make_uniq<VgiCatalog>(db, name, options.access_mode, std::move(attach_params),
 	                              std::move(attach_result_ptr), eager_thresholds);
 }
@@ -1762,6 +1876,87 @@ static void CatalogIdentityFunction(ClientContext &context, TableFunctionInput &
 	output.SetCardinality(count);
 }
 
+// ── Orchard remote secret provider diagnostics ──────────────────────────────
+// These live here (not a separate .cpp) because the per-DB provider registry is
+// a member of the file-local VgiStorageExtension.
+
+struct VgiSecretProvidersData : public TableFunctionData {
+	bool finished = false;
+};
+
+static unique_ptr<FunctionData> VgiSecretProvidersBind(ClientContext &context, TableFunctionBindInput &input,
+                                                       vector<LogicalType> &return_types, vector<string> &names) {
+	names = {"catalog_name", "endpoint", "tie_break_offset", "active", "cached_secrets", "ttl_seconds"};
+	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT,
+	                LogicalType::BOOLEAN, LogicalType::BIGINT, LogicalType::BIGINT};
+	return make_uniq<VgiSecretProvidersData>();
+}
+
+static void VgiSecretProvidersScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &data = data_p.bind_data->CastNoConst<VgiSecretProvidersData>();
+	if (data.finished) {
+		return;
+	}
+	data.finished = true;
+
+	auto *ext = VgiStorageExtension::Find(*context.db);
+	if (!ext) {
+		output.SetCardinality(0);
+		return;
+	}
+	auto providers = ext->AllSecretProviders();
+	idx_t row = 0;
+	for (auto &kv : providers) {
+		auto *storage = kv.second;
+		output.SetValue(0, row, Value(kv.first));
+		output.SetValue(1, row, Value(storage->Endpoint()));
+		output.SetValue(2, row, Value::BIGINT(storage->TieBreakOffset()));
+		output.SetValue(3, row, Value::BOOLEAN(storage->Active()));
+		output.SetValue(4, row, Value::BIGINT(static_cast<int64_t>(storage->CachedSecretCount())));
+		output.SetValue(5, row, Value::BIGINT(storage->DefaultTtlSeconds()));
+		row++;
+	}
+	output.SetCardinality(row);
+}
+
+struct VgiSecretFlushData : public TableFunctionData {
+	bool finished = false;
+	string catalog_filter; // empty = all providers
+};
+
+static unique_ptr<FunctionData> VgiSecretFlushBind(ClientContext &context, TableFunctionBindInput &input,
+                                                   vector<LogicalType> &return_types, vector<string> &names) {
+	names = {"flushed"};
+	return_types = {LogicalType::BIGINT};
+	auto data = make_uniq<VgiSecretFlushData>();
+	auto it = input.named_parameters.find("catalog");
+	if (it != input.named_parameters.end() && !it->second.IsNull()) {
+		data->catalog_filter = it->second.ToString();
+	}
+	return std::move(data);
+}
+
+static void VgiSecretFlushScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &data = data_p.bind_data->CastNoConst<VgiSecretFlushData>();
+	if (data.finished) {
+		return;
+	}
+	data.finished = true;
+
+	int64_t flushed = 0;
+	auto *ext = VgiStorageExtension::Find(*context.db);
+	if (ext) {
+		for (auto &kv : ext->AllSecretProviders()) {
+			if (!data.catalog_filter.empty() && kv.first != data.catalog_filter) {
+				continue;
+			}
+			flushed += static_cast<int64_t>(kv.second->FlushCache());
+		}
+	}
+	output.SetValue(0, 0, Value::BIGINT(flushed));
+	output.SetCardinality(1);
+}
+
 static void LoadInternal(ExtensionLoader &loader) {
 #if defined(__EMSCRIPTEN__) && VGI_ASYNC_INIT_ENABLED
 	// Pre-spawn a bounded pool of background workers at extension load. Required
@@ -1872,6 +2067,12 @@ static void LoadInternal(ExtensionLoader &loader) {
 	config.AddExtensionOption("vgi_http_timeout_seconds",
 	                          "Timeout in seconds for VGI HTTP requests (catalog, init, and exchange operations)",
 	                          LogicalType::BIGINT, Value::BIGINT(300));
+
+	config.AddExtensionOption(
+	    "vgi_secret_default_ttl_seconds",
+	    "Default cache TTL (seconds) for credentials fetched from an Orchard remote secret provider. "
+	    "Capped per-credential by the credential's own expiry. Read at ATTACH and frozen per-provider.",
+	    LogicalType::BIGINT, Value::BIGINT(300));
 
 	// Register OAuth settings
 	config.AddExtensionOption("vgi_oauth_timeout_seconds",
@@ -2094,6 +2295,16 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	// Register cache management function
 	vgi::RegisterVgiClearCacheFunction(loader);
+
+	// Register Orchard remote secret provider diagnostics
+	{
+		TableFunction providers_func("vgi_secret_providers", {}, VgiSecretProvidersScan, VgiSecretProvidersBind);
+		loader.RegisterFunction(providers_func);
+
+		TableFunction flush_func("vgi_secret_provider_flush", {}, VgiSecretFlushScan, VgiSecretFlushBind);
+		flush_func.named_parameters["catalog"] = LogicalType::VARCHAR;
+		loader.RegisterFunction(flush_func);
+	}
 
 	// Register multi-branch diagnostic function — one row per branch per
 	// VGI table, across every attached VGI catalog. See vgi_table_branches_function.cpp.

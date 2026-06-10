@@ -154,8 +154,13 @@ StreamHeaderResult ReadStreamHeader(int fd, ClientContext *context,
 
 // Serialize an RPC request to bytes (same format as WriteRpcRequest but to buffer).
 // Returns a complete Arrow IPC stream: schema + 1-row batch with method metadata + EOS.
+// protocol_version_override: when non-empty, stamps this value into the
+// `vgi_rpc.protocol_version` metadata instead of the global VGI_PROTOCOL_VERSION.
+// Used by the separately-versioned secret protocol (VGI_SECRET_PROTOCOL_VERSION);
+// all worker/catalog call sites leave it empty.
 std::vector<uint8_t> SerializeRpcRequest(const std::string &method_name,
-                                          const std::shared_ptr<arrow::RecordBatch> &params_batch);
+                                          const std::shared_ptr<arrow::RecordBatch> &params_batch,
+                                          const std::string &protocol_version_override = "");
 
 // Serialize an RPC request with no parameters (zero-field schema, 1-row batch).
 std::vector<uint8_t> SerializeEmptyRpcRequest(const std::string &method_name);

@@ -135,7 +135,10 @@ UnaryResponseResult InvokePooledUnaryRpc(const UnaryRpcOptions &opts, const std:
                                           const std::shared_ptr<arrow::RecordBatch> &params) {
 	if (IsHttpTransport(opts.worker_path)) {
 		return HttpInvokeUnary(opts.context, opts.worker_path, method_name, params, opts.auth,
-		                        opts.cookie_jar, opts.cached_http_params);
+		                        opts.cookie_jar, opts.cached_http_params,
+		                        /*invocation_id_hex=*/"", /*attach_opaque_data_hex=*/"",
+		                        /*transaction_opaque_data_hex=*/"", /*conn_id_hex=*/"",
+		                        opts.protocol_version_override.value_or(""));
 	}
 
 	if (IsLaunchLocation(opts.worker_path) || IsUnixLocation(opts.worker_path)) {

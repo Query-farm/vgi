@@ -93,6 +93,10 @@ if __name__ == "__main__":
 - **Performance** — optional POSIX shared-memory transport for zero-copy batch transfer.
 - **Auth** — per-catalog OAuth / bearer tokens; OIDC identity introspection via
   `vgi_catalog_identity()`.
+- **Remote secret provider** — a catalog can advertise a secret-service URL at `ATTACH`;
+  DuckDB then fetches S3/HTTP/etc. credentials *lazily* from that remote service under the
+  **same** identity (no `CREATE SECRET`), cached with a TTL bounded by the credential's
+  own expiry. See [Remote secret provider](#remote-secret-provider) below.
 
 See the [`docs/`](.) directory for deep dives on
 [multi-branch tables](multi_branch.md),
@@ -146,6 +150,36 @@ make test_all
 The `VGI_TEST_WORKER` environment variable controls which worker is used and defaults to
 the `vgi-python` fixture worker. See the project root `CLAUDE.md` for the full matrix of
 test targets, debug builds, and environment variables.
+
+## Remote secret provider
+
+A VGI catalog can broker downstream credentials. When its `ATTACH` response advertises a
+secret-service URL (via the catalog `tags["vgi_secret_service_url"]`), the extension
+registers a custom DuckDB `SecretStorage` that resolves secrets **lazily** from that
+service — so a consumer like httpfs resolving an `s3://` path "just works" with **no
+`CREATE SECRET`**:
+
+```sql
+ATTACH 'orchard' AS orch (TYPE vgi, LOCATION 'https://orchard.example/');
+SELECT count(*) FROM 's3://bucket/data.parquet';   -- credentials fetched on demand
+```
+
+- **One identity** — the secret service is called under the *same* OAuth / bearer auth the
+  catalog established, so you authenticate once for both worker RPCs and credential fetches.
+- **Lazy + cached** — credentials are fetched on first use and cached with a TTL bounded by
+  the credential's own expiry (short-lived STS tokens are never served stale).
+- **Any value type** — string, int64, bool, struct, list, and nested values round-trip
+  through the Arrow→DuckDB bridge; the server marks sensitive keys `redact_keys` so they
+  are hidden in `duckdb_secrets()`.
+- **HTTPS required** — a remote secret broker must be reached over `https://` (only
+  `http://localhost` is allowed, for testing).
+- **Opt out per catalog** — add `secrets false` to the `ATTACH` options.
+
+Diagnostics: `vgi_secret_providers()` lists registered providers; `vgi_secret_provider_flush([catalog])`
+clears the TTL cache. The `vgi_secret_default_ttl_seconds` setting (default 300) bounds the
+cache when the server suggests no TTL. The remote service speaks a separate, independently
+versioned protocol (`VgiSecretProtocol`); the reference server is `vgi-secret-serve` in
+vgi-python. See [the design notes](remote_secret_provider_plan.md) for the full architecture.
 
 ## License
 

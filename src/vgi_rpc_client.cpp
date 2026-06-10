@@ -336,7 +336,8 @@ StreamHeaderResult ReadStreamHeader(int fd, ClientContext *context,
 // ============================================================================
 
 std::vector<uint8_t> SerializeRpcRequest(const std::string &method_name,
-                                          const std::shared_ptr<arrow::RecordBatch> &params_batch) {
+                                          const std::shared_ptr<arrow::RecordBatch> &params_batch,
+                                          const std::string &protocol_version_override) {
 	auto sink_result = arrow::io::BufferOutputStream::Create();
 	if (!sink_result.ok()) {
 		throw IOException("Failed to create buffer for RPC request: " + sink_result.status().ToString());
@@ -350,10 +351,15 @@ std::vector<uint8_t> SerializeRpcRequest(const std::string &method_name,
 	auto writer = writer_result.ValueUnsafe();
 
 	// Create custom metadata with method, wire version, and application
-	// protocol_version (enforced server-side at dispatch boundary).
+	// protocol_version (enforced server-side at dispatch boundary). A non-empty
+	// override (the secret protocol's VGI_SECRET_PROTOCOL_VERSION) replaces the
+	// global worker/catalog version.
+	std::string protocol_version = protocol_version_override.empty()
+	                                   ? std::string(::duckdb::vgi::generated::VGI_PROTOCOL_VERSION)
+	                                   : protocol_version_override;
 	auto metadata = arrow::KeyValueMetadata::Make(
 	    {RPC_METHOD_KEY, RPC_REQUEST_VERSION_KEY, RPC_PROTOCOL_VERSION_KEY},
-	    {method_name, RPC_REQUEST_VERSION_VALUE, std::string(::duckdb::vgi::generated::VGI_PROTOCOL_VERSION)});
+	    {method_name, RPC_REQUEST_VERSION_VALUE, protocol_version});
 
 	auto status = writer->WriteRecordBatch(*params_batch, metadata);
 	if (!status.ok()) {

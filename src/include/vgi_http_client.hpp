@@ -49,7 +49,8 @@ UnaryResponseResult HttpInvokeUnary(ClientContext &context,
                                      const std::string &invocation_id_hex = "",
                                      const std::string &attach_opaque_data_hex = "",
                                      const std::string &transaction_opaque_data_hex = "",
-                                     const std::string &conn_id_hex = "");
+                                     const std::string &conn_id_hex = "",
+                                     const std::string &protocol_version_override = "");
 
 // POST Arrow IPC bytes to a URL, return raw response body bytes.
 // Used for catalog, stream init, and exchange operations.
