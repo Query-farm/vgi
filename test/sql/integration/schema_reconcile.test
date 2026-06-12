@@ -9,6 +9,11 @@
 
 require-env VGI_TEST_WORKER
 
+# The fixture persists its writable table in this per-run sqlite path (every
+# Makefile lane exports it). Declaring it also skips this test under read-only
+# worker harnesses (vgi-java / vgi-go) that can't serve the INSERT path.
+require-env VGI_SCHEMA_RECONCILE_DB
+
 require vgi
 
 require httpfs
