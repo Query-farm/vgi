@@ -1,0 +1,154 @@
+# name: test/sql/integration/accumulate/basic.test
+# description: Basic accumulate semantics — rows persist across calls (each
+#              query spawns a fresh worker under subprocess transport, so this
+#              exercises persistent BoundStorage state, not process memory),
+#              one _timestamp per call, name independence, compound input,
+#              large input streamed back in batches, and accumulate_read.
+# group: [vgi_integration_accumulate]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'accumulate' AS accumulate (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# Basic accumulation across calls (collection 'a')
+# ============================================================================
+
+# First call appends two rows and returns them.
+query I
+SELECT x FROM accumulate.main.accumulate('a', (SELECT * FROM (VALUES (1), (2)) AS t(x))) ORDER BY x;
+----
+1
+2
+
+# Second call appends one row and returns the full collection (incl. new row).
+query I
+SELECT x FROM accumulate.main.accumulate('a', (SELECT * FROM (VALUES (3)) AS t(x))) ORDER BY x;
+----
+1
+2
+3
+
+# ============================================================================
+# accumulate_read: read contents without adding rows
+# ============================================================================
+
+query I
+SELECT x FROM accumulate.main.accumulate_read('a') ORDER BY x;
+----
+1
+2
+3
+
+# Reading again returns the same rows — no mutation.
+query I
+SELECT count(*) FROM accumulate.main.accumulate_read('a');
+----
+3
+
+# accumulate_read carries the _timestamp column too.
+query I
+SELECT typeof(_timestamp) FROM accumulate.main.accumulate_read('a') LIMIT 1;
+----
+TIMESTAMP
+
+# ============================================================================
+# A _timestamp column is appended, typed TIMESTAMP
+# ============================================================================
+
+query I
+SELECT DISTINCT typeof(_timestamp)
+FROM accumulate.main.accumulate('ts', (SELECT * FROM (VALUES (1)) AS t(x)));
+----
+TIMESTAMP
+
+# All rows ingested in one call share a single _timestamp.
+query I
+SELECT count(DISTINCT _timestamp)
+FROM accumulate.main.accumulate('ts1', (SELECT * FROM (VALUES (1), (2), (3)) AS t(x)));
+----
+1
+
+# ============================================================================
+# Collections are independent by name
+# ============================================================================
+
+query I
+SELECT count(*) FROM accumulate.main.accumulate('b', (SELECT * FROM (VALUES (9)) AS t(x)));
+----
+1
+
+# ============================================================================
+# Compound (UNION ALL) input — the case a streaming in-out operator mishandles
+# ============================================================================
+
+# The buffering operator sees every input row before emitting, so a UNION ALL
+# feeding the table argument accumulates correctly. (Column types must be
+# consistent across calls, so everything is BIGINT here.)
+query I
+SELECT count(*) FROM accumulate.main.accumulate('uni',
+    (SELECT x FROM (VALUES (1::BIGINT), (2)) AS a(x)
+     UNION ALL
+     SELECT x FROM (VALUES (3::BIGINT), (4), (5)) AS b(x)));
+----
+5
+
+# A second call with another UNION ALL keeps accumulating.
+query I
+SELECT count(*) FROM accumulate.main.accumulate('uni',
+    (SELECT x FROM (VALUES (6::BIGINT)) AS a(x)
+     UNION ALL
+     SELECT i FROM range(7, 10) AS b(i)));
+----
+9
+
+# ============================================================================
+# Large input is accepted and returned in full (streamed back in batches)
+# ============================================================================
+
+query I
+SELECT count(*) FROM accumulate.main.accumulate('large', (SELECT i AS x FROM range(10000) t(i)));
+----
+10000
+
+# Accumulates on top of the large collection; each call stamps its rows with one
+# timestamp (2 calls so far -> 2 distinct timestamps).
+query I
+SELECT count(DISTINCT _timestamp) FROM accumulate.main.accumulate('large', (SELECT 999999::BIGINT AS x));
+----
+2
+
+query I
+SELECT count(*) FROM accumulate.main.accumulate('large', (SELECT 1000000::BIGINT AS x));
+----
+10002
+
+# ============================================================================
+# Cleanup — the storage backend is persistent; bound its growth
+# ============================================================================
+
+statement ok
+SELECT * FROM accumulate.main.accumulate_clear('a');
+
+statement ok
+SELECT * FROM accumulate.main.accumulate_clear('ts');
+
+statement ok
+SELECT * FROM accumulate.main.accumulate_clear('ts1');
+
+statement ok
+SELECT * FROM accumulate.main.accumulate_clear('b');
+
+statement ok
+SELECT * FROM accumulate.main.accumulate_clear('uni');
+
+statement ok
+SELECT * FROM accumulate.main.accumulate_clear('large');
+
+statement ok
+DETACH accumulate;

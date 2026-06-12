@@ -1,0 +1,68 @@
+# name: test/sql/integration/accumulate/attach_scope.test
+# description: Per-ATTACH scoping — the catalog mints a random attach id per
+#              ATTACH, so two simultaneous sessions never share a collection
+#              even under the same name. Also exercises persistence across
+#              statements: under subprocess transport every query spawns a
+#              fresh worker, so state survives only via BoundStorage.
+# group: [vgi_integration_accumulate]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'accumulate' AS accumulate (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+ATTACH 'accumulate' AS accumulate2 (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# Seed 'shared' in the first session with two rows.
+statement ok
+SELECT x FROM accumulate.main.accumulate('shared', (SELECT * FROM (VALUES (1), (2)) AS t(x)));
+
+# The same name in the second session starts empty -> only its own row.
+query I
+SELECT x FROM accumulate2.main.accumulate('shared', (SELECT * FROM (VALUES (9)) AS t(x))) ORDER BY x;
+----
+9
+
+# The first session is unaffected by the second.
+query I
+SELECT count(*) FROM accumulate.main.accumulate('shared', (SELECT * FROM (VALUES (3)) AS t(x)));
+----
+3
+
+# Each session reads back only its own rows.
+query I
+SELECT x FROM accumulate.main.accumulate_read('shared') ORDER BY x;
+----
+1
+2
+3
+
+query I
+SELECT x FROM accumulate2.main.accumulate_read('shared') ORDER BY x;
+----
+9
+
+# ============================================================================
+# Cleanup — clear in both sessions (independent collections)
+# ============================================================================
+
+query I
+SELECT rows_cleared FROM accumulate.main.accumulate_clear('shared');
+----
+3
+
+query I
+SELECT rows_cleared FROM accumulate2.main.accumulate_clear('shared');
+----
+1
+
+statement ok
+DETACH accumulate2;
+
+statement ok
+DETACH accumulate;

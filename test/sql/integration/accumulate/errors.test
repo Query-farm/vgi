@@ -1,0 +1,91 @@
+# name: test/sql/integration/accumulate/errors.test
+# description: Bind-time validation errors (schema mismatch against the pinned
+#              collection schema, reserved _timestamp column, empty name,
+#              reading an unknown collection) and accumulate_clear semantics.
+# group: [vgi_integration_accumulate]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'accumulate' AS accumulate (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# Schema validation: a differing input schema for the same name errors
+# ============================================================================
+
+statement ok
+SELECT x FROM accumulate.main.accumulate('sc', (SELECT * FROM (VALUES (1)) AS t(x)));
+
+statement error
+SELECT x FROM accumulate.main.accumulate('sc', (SELECT * FROM (VALUES ('not an int')) AS t(x)));
+----
+does not match
+
+# ============================================================================
+# A reserved '_timestamp' input column is rejected
+# ============================================================================
+
+statement error
+SELECT * FROM accumulate.main.accumulate('rsv', (SELECT * FROM (VALUES (1)) AS t(_timestamp)));
+----
+reserved '_timestamp' column
+
+# ============================================================================
+# An empty collection name is rejected
+# ============================================================================
+
+statement error
+SELECT * FROM accumulate.main.accumulate('', (SELECT * FROM (VALUES (1)) AS t(x)));
+----
+non-empty
+
+# ============================================================================
+# Reading an unknown collection errors
+# ============================================================================
+
+statement error
+SELECT * FROM accumulate.main.accumulate_read('does_not_exist');
+----
+no accumulation named
+
+# ============================================================================
+# accumulate_clear removes a collection by name
+# ============================================================================
+
+statement ok
+SELECT x FROM accumulate.main.accumulate('clr', (SELECT * FROM (VALUES (1), (2)) AS t(x)));
+
+# Clearing returns the name and the number of rows removed.
+query II
+SELECT name, rows_cleared FROM accumulate.main.accumulate_clear('clr');
+----
+clr	2
+
+# Clearing an unknown (or already-cleared) name returns 0.
+query I
+SELECT rows_cleared FROM accumulate.main.accumulate_clear('clr');
+----
+0
+
+# After clearing, the name starts fresh — even with a different schema.
+query I
+SELECT y FROM accumulate.main.accumulate('clr', (SELECT * FROM (VALUES ('nine')) AS t(y)));
+----
+nine
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+SELECT * FROM accumulate.main.accumulate_clear('sc');
+
+statement ok
+SELECT * FROM accumulate.main.accumulate_clear('clr');
+
+statement ok
+DETACH accumulate;

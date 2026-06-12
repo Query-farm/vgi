@@ -35,7 +35,7 @@ large_sequence	A large sequence of integers from 0 to 1,000,000
 late_mat	Late-materialization table (1000 rows, unique rowid)
 late_mat_dup	Late-materialization table with deliberately non-unique rowid (contract violation)
 late_mat_nulls	Late-materialization table with NULLs in the ord column
-multi_branch_empty	Multi-branch: worker returns empty branches list — used by multi_branch_empty_branches.test
+multi_branch_empty	Multi-branch: empty branches list — used by multi_branch_empty_branches.test
 multi_branch_filtered_numbers	Multi-branch with complementary branch_filters — exercises pruning
 multi_branch_hetero	Multi-branch: sequence(50) + read_parquet — used by multi_branch_heterogeneous.test
 multi_branch_nopushdown	Multi-branch: VGI + read_csv — used by multi_branch_pushdown_incapable.test

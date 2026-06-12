@@ -1,0 +1,54 @@
+# name: test/sql/integration/accumulate/result_modes.test
+# description: The accumulate result option — 'all' (default) returns the
+#              whole collection, 'new' only the rows added by the call,
+#              'none' appends without returning anything.
+# group: [vgi_integration_accumulate]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'accumulate' AS accumulate (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# Default ('all') returns the full collection.
+query I
+SELECT x FROM accumulate.main.accumulate('res', (SELECT * FROM (VALUES (1), (2)) AS t(x))) ORDER BY x;
+----
+1
+2
+
+# 'new' returns only the rows added this call.
+query I
+SELECT x FROM accumulate.main.accumulate('res', (SELECT * FROM (VALUES (3), (4)) AS t(x)), result := 'new') ORDER BY x;
+----
+3
+4
+
+# 'none' returns nothing but still appends.
+query I
+SELECT count(*) FROM accumulate.main.accumulate('res', (SELECT * FROM (VALUES (5)) AS t(x)), result := 'none');
+----
+0
+
+# All five rows landed in the collection regardless of result mode.
+query I
+SELECT x FROM accumulate.main.accumulate_read('res') ORDER BY x;
+----
+1
+2
+3
+4
+5
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+SELECT * FROM accumulate.main.accumulate_clear('res');
+
+statement ok
+DETACH accumulate;

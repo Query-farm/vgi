@@ -1,0 +1,67 @@
+# name: test/sql/integration/accumulate/eviction.test
+# description: Eviction policies — max_row_size caps the collection (oldest
+#              dropped first, exercising ranged BoundStorage deletes and the
+#              row counter), ttl evicts rows older than call_time - ttl.
+# group: [vgi_integration_accumulate]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'accumulate' AS accumulate (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# max_row_size: keep only the newest N rows (FIFO drop oldest)
+# ============================================================================
+
+statement ok
+SELECT x FROM accumulate.main.accumulate('cap', (SELECT * FROM (VALUES (1), (2), (3)) AS t(x)));
+
+# Append 4 -> [1,2,3,4], cap to newest 2 -> [3,4]
+query I
+SELECT x FROM accumulate.main.accumulate('cap', (SELECT * FROM (VALUES (4)) AS t(x)), max_row_size := 2) ORDER BY x;
+----
+3
+4
+
+# ============================================================================
+# ttl: zero interval keeps only the rows added by the current call
+# ============================================================================
+
+statement ok
+SELECT x FROM accumulate.main.accumulate('ttl0', (SELECT * FROM (VALUES (1), (2)) AS t(x)));
+
+query I
+SELECT x FROM accumulate.main.accumulate('ttl0', (SELECT * FROM (VALUES (3)) AS t(x)), ttl := INTERVAL '0 seconds') ORDER BY x;
+----
+3
+
+# ttl: a large interval retains everything
+statement ok
+SELECT x FROM accumulate.main.accumulate('ttl1', (SELECT * FROM (VALUES (1), (2)) AS t(x)));
+
+query I
+SELECT x FROM accumulate.main.accumulate('ttl1', (SELECT * FROM (VALUES (3)) AS t(x)), ttl := INTERVAL '1 year') ORDER BY x;
+----
+1
+2
+3
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+SELECT * FROM accumulate.main.accumulate_clear('cap');
+
+statement ok
+SELECT * FROM accumulate.main.accumulate_clear('ttl0');
+
+statement ok
+SELECT * FROM accumulate.main.accumulate_clear('ttl1');
+
+statement ok
+DETACH accumulate;

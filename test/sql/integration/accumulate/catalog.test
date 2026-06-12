@@ -1,0 +1,47 @@
+# name: test/sql/integration/accumulate/catalog.test
+# description: Catalog discovery and ATTACH for the accumulate fixture catalog.
+#              The fixture worker is a MetaWorker serving several catalogs, so
+#              discovery queries filter by name.
+# group: [vgi_integration_accumulate]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+# ============================================================================
+# Catalog discovery
+# ============================================================================
+
+# The worker exposes the "accumulate" catalog (among others).
+query I
+SELECT catalog FROM vgi_catalogs('${VGI_TEST_WORKER}') WHERE catalog = 'accumulate';
+----
+accumulate
+
+# The catalog advertises a stable data version.
+query I
+SELECT data_version_spec FROM vgi_catalogs('${VGI_TEST_WORKER}') WHERE catalog = 'accumulate';
+----
+2.0.0
+
+# ============================================================================
+# ATTACH and schema discovery
+# ============================================================================
+
+statement ok
+ATTACH 'accumulate' AS accumulate (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# Should have a "main" schema
+query II
+SELECT catalog_name, schema_name FROM information_schema.schemata WHERE catalog_name = 'accumulate';
+----
+accumulate	main
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH accumulate;
