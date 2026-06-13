@@ -61,19 +61,15 @@ ATTACH 'example' AS example_both (TYPE vgi, LOCATION '${VGI_TEST_WORKER}', beare
 Cannot specify both bearer_token and oauth_refresh_token
 
 # ============================================================================
-# ATTACH without any credentials against a bearer-protected server yields a
-# clean diagnostic — not the legacy "VGI OAuth: resource metadata URL must
-# use HTTPS:" message that surfaced when the default OAuthCatalogAuth tried
-# to feed an empty challenge into the OAuth discovery flow.
+# ATTACH without any credentials against a bearer-protected server fails fast
+# with a clean diagnostic. The extension calls catalog_attach eagerly during
+# ATTACH, so the 401 surfaces here — at ATTACH — not on a later query. (The
+# diagnostic is the actionable "no OAuth challenge" message, not the legacy
+# "VGI OAuth: resource metadata URL must use HTTPS:" that surfaced when the
+# default OAuthCatalogAuth fed an empty challenge into the OAuth discovery flow.)
 # ============================================================================
 
-statement ok
-ATTACH 'example' AS example_no_auth (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
-
 statement error
-SELECT example_no_auth.double(1);
+ATTACH 'example' AS example_no_auth (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 ----
 The server requires authentication but advertised no OAuth challenge
-
-statement ok
-DETACH example_no_auth;
