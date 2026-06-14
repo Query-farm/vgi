@@ -103,7 +103,7 @@ static unique_ptr<TransactionManager> CreateVgiTransactionManager(optional_ptr<S
 // can push an InFilter containing the build-side's distinct key values to the
 // probe-side scan. DuckDB's default threshold (dynamic_or_filter_threshold=50)
 // is too low for remote scans where network savings justify sending more keys.
-// This optimizer raises the threshold to vgi_join_keys_limit when a VGI scan
+// This optimizer raises the threshold to vgi_join_keys_threshold when a VGI scan
 // is detected in the plan.
 
 class VgiJoinOptimizer : public OptimizerExtension {
@@ -158,21 +158,21 @@ private:
 			return;
 		}
 
-		Value limit_val;
-		if (!input.context.TryGetCurrentSetting("vgi_join_keys_limit", limit_val) || limit_val.IsNull()) {
+		Value threshold_val;
+		if (!input.context.TryGetCurrentSetting("vgi_join_keys_threshold", threshold_val) || threshold_val.IsNull()) {
 			return;
 		}
-		auto vgi_limit = limit_val.GetValue<idx_t>();
-		if (vgi_limit == 0) {
+		auto vgi_threshold = threshold_val.GetValue<idx_t>();
+		if (vgi_threshold == 0) {
 			return; // disabled
 		}
 
 		// Only raise, never lower a user-set threshold
 		auto current = Settings::Get<DynamicOrFilterThresholdSetting>(input.context);
-		if (current < vgi_limit) {
+		if (current < vgi_threshold) {
 			auto &client_config = ClientConfig::GetConfig(input.context);
 			client_config.user_settings.SetUserSetting(DynamicOrFilterThresholdSetting::SettingIndex,
-			                                           Value::UBIGINT(vgi_limit));
+			                                           Value::UBIGINT(vgi_threshold));
 		}
 	}
 };
@@ -2112,8 +2112,13 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
 
 	// Register join key pushdown settings + optimizer
-	config.AddExtensionOption("vgi_join_keys_limit",
-	                          "Max distinct join key values to push to VGI workers (0 = disabled)",
+	config.AddExtensionOption("vgi_join_keys_threshold",
+	                          "When a join has a VGI scan on one side, raise DuckDB's "
+	                          "dynamic_or_filter_threshold to this value so the build side's distinct join "
+	                          "keys are pushed to the worker as an IN filter. This is a threshold, not a "
+	                          "cap on keys sent: if the distinct count exceeds it, NO keys are pushed (the "
+	                          "filter is not built). Raise-only — never lowers a user-set threshold. "
+	                          "0 = disabled. See also vgi_join_keys_max_bytes for the byte-size cap.",
 	                          LogicalType::UBIGINT, Value::UBIGINT(100000));
 	config.AddExtensionOption("vgi_join_keys_max_bytes",
 	                          "Max estimated byte size for join keys batch (skip pushdown if exceeded)",

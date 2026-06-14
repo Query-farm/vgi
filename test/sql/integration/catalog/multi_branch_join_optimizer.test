@@ -48,7 +48,7 @@ SELECT MIN(m.n), MAX(m.n) FROM large_keys l JOIN example.data.multi_branch_numbe
 # ============================================================================
 # Threshold-raise: the JoinOptimizer must detect the post-rewrite plan
 # contains a VGI scan inside the LogicalSetOperation and raise the threshold
-# to at least vgi_join_keys_limit. Reset the threshold to a low value first
+# to at least vgi_join_keys_threshold. Reset the threshold to a low value first
 # to make the raise observable.
 # ============================================================================
 
@@ -59,7 +59,7 @@ RESET dynamic_or_filter_threshold;
 statement ok
 SELECT COUNT(*) FROM large_keys l JOIN example.data.multi_branch_numbers m ON l.id = m.n;
 
-# Assert the threshold was raised to vgi_join_keys_limit (default 100000).
+# Assert the threshold was raised to vgi_join_keys_threshold (default 100000).
 # If JoinOptimizer ran BEFORE the rewriter, it would have walked the unrewritten
 # plan, seen only the marker (function != VgiTableFunctionScan), and left the
 # threshold alone. Asserting it WAS raised proves the rewriter runs first.

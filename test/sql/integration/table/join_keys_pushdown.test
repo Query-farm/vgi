@@ -18,7 +18,7 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 # ============================================================================
 
 # The VgiJoinOptimizer pre_optimize_function should set the threshold
-# to at least vgi_join_keys_limit (default 100000) when a join involving
+# to at least vgi_join_keys_threshold (default 100000) when a join involving
 # a VGI scan is in the plan. Plain VGI scans without joins don't trigger it.
 
 statement ok
@@ -93,13 +93,15 @@ SELECT DISTINCT pushed_filters FROM large_keys l JOIN example.filter_echo(10000)
 (n IN (200 values) AND n >= 0 AND n <= 995)
 
 # ============================================================================
-# Size limit — verify bail-out when keys exceed vgi_join_keys_limit
+# Threshold — verify bail-out when distinct keys exceed the effective threshold
 # ============================================================================
 
-# Set the limit below 200 — DuckDB's dynamic_or_filter_threshold will be
-# capped at 10, so the hash join won't create an InFilter for 200 keys.
+# vgi_join_keys_threshold is raise-only: setting it to 10 (below DuckDB's
+# default dynamic_or_filter_threshold of 50) leaves the effective threshold at
+# 50, so a 200-key build side still exceeds it and no InFilter is created. The
+# keys are not pushed; DuckDB filters client-side via the hash-join probe.
 statement ok
-SET vgi_join_keys_limit = 10;
+SET vgi_join_keys_threshold = 10;
 
 # Join with 200 keys — exceeds the limit, so no InFilter is created and no
 # join keys are pushed to the worker. DuckDB filters client-side via hash join probe.
@@ -110,14 +112,14 @@ SELECT COUNT(*) FROM large_keys l JOIN example.sequence(10000) s ON l.id = s.n;
 
 # Reset to default
 statement ok
-RESET vgi_join_keys_limit;
+RESET vgi_join_keys_threshold;
 
 # ============================================================================
-# Disabled — vgi_join_keys_limit = 0 disables join key pushdown
+# Disabled — vgi_join_keys_threshold = 0 disables join key pushdown
 # ============================================================================
 
 statement ok
-SET vgi_join_keys_limit = 0;
+SET vgi_join_keys_threshold = 0;
 
 # Still produces correct results — DuckDB handles the join locally
 query I
@@ -126,7 +128,7 @@ SELECT COUNT(*) FROM large_keys l JOIN example.sequence(10000) s ON l.id = s.n;
 200
 
 statement ok
-RESET vgi_join_keys_limit;
+RESET vgi_join_keys_threshold;
 
 # ============================================================================
 # Left join — verify join keys pushdown works for left joins too

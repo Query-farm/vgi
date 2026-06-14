@@ -288,7 +288,7 @@ notes: [`docs/remote_secret_provider_plan.md`](docs/remote_secret_provider_plan.
 | `vgi_oauth_timeout_seconds` | BIGINT | 120 | Window for a human to complete device-code / browser OAuth. Further capped by the provider's `expires_in` |
 | `vgi_worker_pool_idle_limit_seconds` | BIGINT | 5 | Max idle time before pooled workers are removed |
 | `vgi_worker_pool_max` | BIGINT | 256 | Max workers in pool (0 = disabled) |
-| `vgi_join_keys_limit` | UBIGINT | 100000 | Max distinct join key values pushed to VGI workers (0 = disabled) |
+| `vgi_join_keys_threshold` | UBIGINT | 100000 | When a join has a VGI scan on one side, raise DuckDB's `dynamic_or_filter_threshold` to this value so distinct build-side join keys are pushed to the worker as an IN filter. A threshold, not a cap: above it, no keys are pushed. Raise-only; 0 = disabled |
 | `vgi_join_keys_max_bytes` | UBIGINT | 67108864 | Max estimated byte size for join keys batch |
 | `vgi_streaming_window` | BOOLEAN | true | Route eligible `OVER (...)` queries against VGI aggregates with `streaming_partitioned=true` through the custom streaming operator. Set to false to fall back to `PhysicalWindow` |
 | `vgi_table_buffering` | BOOLEAN | true | Rewrite calls to `TableBufferingFunction` subclasses through the Sink+Source `PhysicalVgiTableBufferingFunction` operator. Set to false to disable the rewrite — buffered queries then throw `InvalidInputException` instead of running (emergency-rollback path; not generally useful) |
