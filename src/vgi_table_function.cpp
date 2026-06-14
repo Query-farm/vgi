@@ -5,6 +5,9 @@
 
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/parser/parsed_data/create_table_function_info.hpp"
+
+#include "vgi_function_docs.hpp"
 
 namespace duckdb {
 
@@ -100,7 +103,21 @@ void RegisterVgiTableFunction(ExtensionLoader &loader) {
 	configure_func(func4);
 	func_set.AddFunction(func4);
 
-	loader.RegisterFunction(func_set);
+	CreateTableFunctionInfo info(func_set);
+	info.descriptions.push_back(vgi::MakeFunctionDescription(
+	    "Directly execute a table function exposed by a VGI worker, without ATTACHing it as a catalog. "
+	    "Pass the worker executable path, the worker-side function name, the positional arguments as a LIST, "
+	    "and optionally a STRUCT of named arguments.",
+	    {"worker_path", "function_name", "positional_args"},
+	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::LIST(LogicalType::ANY)},
+	    {"SELECT * FROM vgi_table_function('./worker', 'projected_data', [10]);"}));
+	info.descriptions.push_back(vgi::MakeFunctionDescription(
+	    "Directly execute a table function exposed by a VGI worker, supplying both positional arguments "
+	    "(as a LIST) and named arguments (as a STRUCT of arbitrary fields).",
+	    {"worker_path", "function_name", "positional_args", "named_args"},
+	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::LIST(LogicalType::ANY), LogicalType::ANY},
+	    {"SELECT * FROM vgi_table_function('./worker', 'projected_data', [10], {limit: 5});"}));
+	loader.RegisterFunction(std::move(info));
 }
 
 } // namespace duckdb

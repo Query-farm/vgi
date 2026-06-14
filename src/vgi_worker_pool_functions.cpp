@@ -4,6 +4,10 @@
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
+#include "duckdb/parser/parsed_data/create_table_function_info.hpp"
+
+#include "vgi_function_docs.hpp"
 
 namespace duckdb {
 namespace vgi {
@@ -20,7 +24,12 @@ static void VgiWorkerPoolFlushFunction(DataChunk &args, ExpressionState &state, 
 void RegisterVgiWorkerPoolFlushFunction(ExtensionLoader &loader) {
 	ScalarFunction func("vgi_worker_pool_flush", {}, LogicalType::BIGINT, VgiWorkerPoolFlushFunction);
 	func.stability = FunctionStability::VOLATILE;
-	loader.RegisterFunction(func);
+	CreateScalarFunctionInfo info(func);
+	info.descriptions.push_back(MakeFunctionDescription(
+	    "Clear all subprocess-pooled VGI workers, returning the count of workers flushed. Has no effect on "
+	    "launch:/unix:// workers, which are pooled by the OS-level AF_UNIX socket rather than this process.",
+	    {}, {}, {"SELECT vgi_worker_pool_flush();"}));
+	loader.RegisterFunction(std::move(info));
 }
 
 // ============================================================================
@@ -61,7 +70,13 @@ static void VgiWorkerPoolScan(ClientContext &context, TableFunctionInput &input,
 
 void RegisterVgiWorkerPoolFunction(ExtensionLoader &loader) {
 	TableFunction func("vgi_worker_subprocess_pool", {}, VgiWorkerPoolScan, VgiWorkerPoolBind);
-	loader.RegisterFunction(func);
+	CreateTableFunctionInfo info(func);
+	info.descriptions.push_back(MakeFunctionDescription(
+	    "Diagnostic: list the subprocess-pooled VGI workers (worker_path, data_version_spec, "
+	    "implementation_version, pid, age_seconds). Returns no rows for launch:/unix:// transports, whose "
+	    "workers are pooled by the OS-level AF_UNIX socket rather than this DuckDB process.",
+	    {}, {}, {"SELECT * FROM vgi_worker_subprocess_pool();"}));
+	loader.RegisterFunction(std::move(info));
 }
 
 // ============================================================================
@@ -99,7 +114,12 @@ static void VgiWorkerPoolStatsScan(ClientContext &context, TableFunctionInput &i
 
 void RegisterVgiWorkerPoolStatsFunction(ExtensionLoader &loader) {
 	TableFunction func("vgi_worker_pool_stats", {}, VgiWorkerPoolStatsScan, VgiWorkerPoolStatsBind);
-	loader.RegisterFunction(func);
+	CreateTableFunctionInfo info(func);
+	info.descriptions.push_back(MakeFunctionDescription(
+	    "Diagnostic: subprocess worker-pool hit/miss statistics by worker_path (worker_path, hits, misses). "
+	    "Subprocess transport only.",
+	    {}, {}, {"SELECT * FROM vgi_worker_pool_stats();"}));
+	loader.RegisterFunction(std::move(info));
 }
 
 } // namespace vgi

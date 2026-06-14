@@ -58,7 +58,9 @@
 #include "vgi_catalog_api.hpp"
 #include "vgi_catalogs.hpp"
 #include "vgi_cookie_jar.hpp"
+#include "vgi_function_docs.hpp"
 #include "vgi_logging.hpp"
+#include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "vgi_aggregate_function_impl.hpp"
 #include "vgi_oauth.hpp"
 #include "vgi_profiling.hpp"
@@ -2076,10 +2078,12 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	// Register OAuth settings
 	config.AddExtensionOption("vgi_oauth_timeout_seconds",
-	                          "Timeout in seconds for OAuth browser authentication flow",
+	                          "Window in seconds for a human to complete interactive OAuth (device-code or "
+	                          "browser/PKCE) authentication. Further capped by the provider's token expires_in.",
 	                          LogicalType::BIGINT, Value::BIGINT(120));
 	config.AddExtensionOption("vgi_oauth_enabled",
-	                          "Enable OAuth PKCE authentication on HTTP 401 (set false to fail fast)",
+	                          "Enable interactive OAuth (PKCE or device-code) authentication on HTTP 401. "
+	                          "Set false to fail fast instead of prompting.",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
 	config.AddExtensionOption("vgi_oauth_flow",
 	                          "OAuth flow type: auto (default), device_code, or pkce",
@@ -2299,11 +2303,24 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// Register Orchard remote secret provider diagnostics
 	{
 		TableFunction providers_func("vgi_secret_providers", {}, VgiSecretProvidersScan, VgiSecretProvidersBind);
-		loader.RegisterFunction(providers_func);
+		CreateTableFunctionInfo providers_info(providers_func);
+		providers_info.descriptions.push_back(vgi::MakeFunctionDescription(
+		    "Diagnostic: one row per auto-registered Orchard remote secret provider (catalog_name, endpoint, "
+		    "tie_break_offset, active, cached_secrets, ttl_seconds). A provider is registered when an attached "
+		    "VGI catalog advertises a secret-service URL.",
+		    {}, {}, {"SELECT * FROM vgi_secret_providers();"}));
+		loader.RegisterFunction(std::move(providers_info));
 
 		TableFunction flush_func("vgi_secret_provider_flush", {}, VgiSecretFlushScan, VgiSecretFlushBind);
 		flush_func.named_parameters["catalog"] = LogicalType::VARCHAR;
-		loader.RegisterFunction(flush_func);
+		CreateTableFunctionInfo flush_info(flush_func);
+		flush_info.descriptions.push_back(vgi::MakeFunctionDescription(
+		    "Clear the TTL cache of one Orchard remote secret provider, or all providers when 'catalog' is "
+		    "omitted. Returns the count of positive (found) secrets dropped.",
+		    {"catalog"}, {LogicalType::VARCHAR},
+		    {"SELECT * FROM vgi_secret_provider_flush();",
+		     "SELECT * FROM vgi_secret_provider_flush(catalog := 'mycatalog');"}));
+		loader.RegisterFunction(std::move(flush_info));
 	}
 
 	// Register multi-branch diagnostic function — one row per branch per
@@ -2315,16 +2332,34 @@ static void LoadInternal(ExtensionLoader &loader) {
 		// vgi_oauth_logout([origin])
 		TableFunction logout_func("vgi_oauth_logout", {}, OAuthLogoutFunction, OAuthLogoutBind, OAuthLogoutInit);
 		logout_func.varargs = LogicalType::VARCHAR;
-		loader.RegisterFunction(logout_func);
+		CreateTableFunctionInfo logout_info(logout_func);
+		logout_info.descriptions.push_back(vgi::MakeFunctionDescription(
+		    "Forget cached OAuth tokens. With no arguments, clears every stored token; pass one or more OAuth "
+		    "origins to clear only those. Returns one row per cleared origin.",
+		    {"origin"}, {LogicalType::VARCHAR},
+		    {"SELECT * FROM vgi_oauth_logout();",
+		     "SELECT * FROM vgi_oauth_logout('https://auth.example.com');"}));
+		loader.RegisterFunction(std::move(logout_info));
 
 		// vgi_oauth_tokens()
 		TableFunction tokens_func("vgi_oauth_tokens", {}, OAuthTokensFunction, OAuthTokensBind, OAuthTokensInit);
-		loader.RegisterFunction(tokens_func);
+		CreateTableFunctionInfo tokens_info(tokens_func);
+		tokens_info.descriptions.push_back(vgi::MakeFunctionDescription(
+		    "Diagnostic: list the OAuth tokens currently cached by the extension, one row per origin, with "
+		    "their expiry and refresh state. Token values themselves are not exposed.",
+		    {}, {}, {"SELECT * FROM vgi_oauth_tokens();"}));
+		loader.RegisterFunction(std::move(tokens_info));
 
 		// vgi_catalog_identity() — surfaces OIDC identity claims per attached VGI catalog
 		TableFunction identity_func("vgi_catalog_identity", {}, CatalogIdentityFunction, CatalogIdentityBind,
 		                            CatalogIdentityInit);
-		loader.RegisterFunction(identity_func);
+		CreateTableFunctionInfo identity_info(identity_func);
+		identity_info.descriptions.push_back(vgi::MakeFunctionDescription(
+		    "Report the OIDC identity for each attached VGI catalog (catalog_name, origin, authenticated, sub, "
+		    "email, name, issuer, and the full decoded id_token claims as JSON). Reach provider-specific fields "
+		    "via the claims JSON, e.g. claims->>'$.hd' for Google Workspace.",
+		    {}, {}, {"SELECT * FROM vgi_catalog_identity();"}));
+		loader.RegisterFunction(std::move(identity_info));
 	}
 }
 

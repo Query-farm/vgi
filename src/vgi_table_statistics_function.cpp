@@ -1,11 +1,13 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "vgi_table_statistics_function.hpp"
+#include "vgi_function_docs.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/enums/on_entry_not_found.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/common/types/geometry.hpp"
 #include "duckdb/storage/statistics/base_statistics.hpp"
 #include "duckdb/storage/statistics/geometry_stats.hpp"
@@ -214,7 +216,15 @@ void RegisterVgiTableStatisticsFunction(ExtensionLoader &loader) {
 	TableFunction func("vgi_table_statistics",
 	                   {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
 	                   VgiTableStatisticsScan, VgiTableStatisticsBind);
-	loader.RegisterFunction(func);
+	CreateTableFunctionInfo info(func);
+	info.descriptions.push_back(MakeFunctionDescription(
+	    "Diagnostic: report the per-column statistics DuckDB holds for a VGI table, identified by "
+	    "catalog, schema, and table name. One row per column, exposing the materialized BaseStatistics "
+	    "(min/max, null counts, distinct estimates) that the worker supplied.",
+	    {"catalog", "schema", "table"},
+	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
+	    {"SELECT * FROM vgi_table_statistics('mycatalog', 'main', 'events');"}));
+	loader.RegisterFunction(std::move(info));
 }
 
 } // namespace vgi

@@ -10,6 +10,9 @@
 #include "duckdb.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/parser/parsed_data/create_table_function_info.hpp"
+
+#include "vgi_function_docs.hpp"
 #include "duckdb/main/extension_helper.hpp"
 
 namespace duckdb {
@@ -188,7 +191,13 @@ void RegisterVgiCatalogsFunction(ExtensionLoader &loader) {
 	// Enable EXPLAIN output
 	func.to_string = VgiCatalogsToString;
 
-	loader.RegisterFunction(func);
+	CreateTableFunctionInfo info(func);
+	info.descriptions.push_back(vgi::MakeFunctionDescription(
+	    "List the catalogs advertised by a VGI worker, one row per catalog with its name and description. "
+	    "Use this to discover what a worker exposes before ATTACHing it.",
+	    {"worker_path"}, {LogicalType::VARCHAR},
+	    {"SELECT * FROM vgi_catalogs('./worker');"}));
+	loader.RegisterFunction(std::move(info));
 }
 
 } // namespace duckdb

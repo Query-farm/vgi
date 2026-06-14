@@ -6,7 +6,10 @@
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 
+#include "duckdb/parser/parsed_data/create_table_function_info.hpp"
+
 #include "storage/vgi_catalog.hpp"
+#include "vgi_function_docs.hpp"
 #include "vgi_logging.hpp"
 
 namespace duckdb {
@@ -52,7 +55,12 @@ static void VgiClearCacheScan(ClientContext &context, TableFunctionInput &data_p
 
 void RegisterVgiClearCacheFunction(ExtensionLoader &loader) {
 	TableFunction func("vgi_clear_cache", {}, VgiClearCacheScan, VgiClearCacheBind);
-	loader.RegisterFunction(func);
+	CreateTableFunctionInfo info(func);
+	info.descriptions.push_back(MakeFunctionDescription(
+	    "Clear cached catalog metadata (schemas, tables, functions, statistics) for all attached VGI catalogs, "
+	    "returning one row per catalog cleared. Forces the next query to re-fetch metadata from the worker.",
+	    {}, {}, {"SELECT * FROM vgi_clear_cache();"}));
+	loader.RegisterFunction(std::move(info));
 }
 
 } // namespace vgi

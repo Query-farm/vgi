@@ -18,9 +18,11 @@
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 
 #include "storage/vgi_catalog.hpp"
 #include "storage/vgi_table_entry.hpp"
+#include "vgi_function_docs.hpp"
 #include "vgi_logging.hpp"
 
 namespace duckdb {
@@ -214,7 +216,13 @@ static void VgiTableBranchesScan(ClientContext &context, TableFunctionInput &inp
 
 void RegisterVgiTableBranchesFunction(ExtensionLoader &loader) {
 	TableFunction func("vgi_table_branches", {}, VgiTableBranchesScan, VgiTableBranchesBind);
-	loader.RegisterFunction(func);
+	CreateTableFunctionInfo info(func);
+	info.descriptions.push_back(MakeFunctionDescription(
+	    "Diagnostic: one row per branch per VGI table across every attached VGI catalog. Surfaces the "
+	    "multi-branch shape (function_name, positional/named arguments, branch_filter, required extensions) "
+	    "consumed by the multi-scan rewriter. Single-branch tables surface as one row with branch_index=0.",
+	    {}, {}, {"SELECT * FROM vgi_table_branches();"}));
+	loader.RegisterFunction(std::move(info));
 }
 
 } // namespace vgi
