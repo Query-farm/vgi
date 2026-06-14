@@ -1768,14 +1768,14 @@ static void OAuthTokensFunction(ClientContext &context, TableFunctionInput &inpu
 }
 
 //===--------------------------------------------------------------------===//
-// vgi_catalog_identity() table function
+// vgi_oauth_identity() table function
 //===--------------------------------------------------------------------===//
 //
 // Emits one row per attached VGI catalog showing the OIDC identity parsed
 // from the OAuth id_token (if any). Catalogs without OAuth state appear
 // with authenticated=false and NULL identity fields.
 
-struct CatalogIdentityState : public GlobalTableFunctionState {
+struct OAuthIdentityState : public GlobalTableFunctionState {
 	struct IdentityRow {
 		std::string catalog_name;
 		std::string origin;
@@ -1791,7 +1791,7 @@ struct CatalogIdentityState : public GlobalTableFunctionState {
 	idx_t offset = 0;
 };
 
-static unique_ptr<FunctionData> CatalogIdentityBind(ClientContext &context, TableFunctionBindInput &input,
+static unique_ptr<FunctionData> OAuthIdentityBind(ClientContext &context, TableFunctionBindInput &input,
                                                     vector<LogicalType> &return_types, vector<string> &names) {
 	return_types.push_back(LogicalType::VARCHAR);
 	names.push_back("catalog_name");
@@ -1814,8 +1814,8 @@ static unique_ptr<FunctionData> CatalogIdentityBind(ClientContext &context, Tabl
 	return nullptr;
 }
 
-static unique_ptr<GlobalTableFunctionState> CatalogIdentityInit(ClientContext &context, TableFunctionInitInput &input) {
-	auto state = make_uniq<CatalogIdentityState>();
+static unique_ptr<GlobalTableFunctionState> OAuthIdentityInit(ClientContext &context, TableFunctionInitInput &input) {
+	auto state = make_uniq<OAuthIdentityState>();
 
 	auto databases = DatabaseManager::Get(context).GetDatabases(context);
 	for (auto &db : databases) {
@@ -1829,7 +1829,7 @@ static unique_ptr<GlobalTableFunctionState> CatalogIdentityInit(ClientContext &c
 			continue;
 		}
 
-		CatalogIdentityState::IdentityRow row;
+		OAuthIdentityState::IdentityRow row;
 		row.catalog_name = catalog.GetName();
 		row.origin = vgi::ExtractOrigin(params->worker_path());
 
@@ -1856,8 +1856,8 @@ static unique_ptr<GlobalTableFunctionState> CatalogIdentityInit(ClientContext &c
 	return std::move(state);
 }
 
-static void CatalogIdentityFunction(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
-	auto &state = input.global_state->Cast<CatalogIdentityState>();
+static void OAuthIdentityFunction(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
+	auto &state = input.global_state->Cast<OAuthIdentityState>();
 	idx_t count = 0;
 	while (state.offset < state.rows.size() && count < STANDARD_VECTOR_SIZE) {
 		auto &row = state.rows[state.offset];
@@ -2256,7 +2256,14 @@ static void LoadInternal(ExtensionLoader &loader) {
 		scan_func.deserialize = VgiTableEntry::VgiTableScanDeserialize;
 		scan_func.projection_pushdown = true;
 		scan_func.filter_pushdown = true;
-		loader.RegisterFunction(scan_func);
+		CreateTableFunctionInfo scan_info(scan_func);
+		scan_info.descriptions.push_back(vgi::MakeFunctionDescription(
+		    "Internal: the physical scan operator for tables in an attached VGI catalog. DuckDB binds it "
+		    "automatically when you query a VGI table (SELECT ... FROM mycatalog.schema.table); it exists in "
+		    "the function list only so serialized query plans can resolve it by name. It takes no arguments "
+		    "and cannot be called directly — use a normal table reference instead.",
+		    {}, {}, {}));
+		loader.RegisterFunction(std::move(scan_info));
 	}
 
 	// Register the native-delegation marker function under its name. Same
@@ -2351,15 +2358,15 @@ static void LoadInternal(ExtensionLoader &loader) {
 		    {}, {}, {"SELECT * FROM vgi_oauth_tokens();"}));
 		loader.RegisterFunction(std::move(tokens_info));
 
-		// vgi_catalog_identity() — surfaces OIDC identity claims per attached VGI catalog
-		TableFunction identity_func("vgi_catalog_identity", {}, CatalogIdentityFunction, CatalogIdentityBind,
-		                            CatalogIdentityInit);
+		// vgi_oauth_identity() — surfaces OIDC identity claims per attached VGI catalog
+		TableFunction identity_func("vgi_oauth_identity", {}, OAuthIdentityFunction, OAuthIdentityBind,
+		                            OAuthIdentityInit);
 		CreateTableFunctionInfo identity_info(identity_func);
 		identity_info.descriptions.push_back(vgi::MakeFunctionDescription(
 		    "Report the OIDC identity for each attached VGI catalog (catalog_name, origin, authenticated, sub, "
 		    "email, name, issuer, and the full decoded id_token claims as JSON). Reach provider-specific fields "
 		    "via the claims JSON, e.g. claims->>'$.hd' for Google Workspace.",
-		    {}, {}, {"SELECT * FROM vgi_catalog_identity();"}));
+		    {}, {}, {"SELECT * FROM vgi_oauth_identity();"}));
 		loader.RegisterFunction(std::move(identity_info));
 	}
 }

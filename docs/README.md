@@ -92,7 +92,7 @@ if __name__ == "__main__":
   diagnostics (`vgi_worker_subprocess_pool()`, `vgi_worker_pool_stats()`).
 - **Performance** — optional POSIX shared-memory transport for zero-copy batch transfer.
 - **Auth** — per-catalog OAuth / bearer tokens; OIDC identity introspection via
-  `vgi_catalog_identity()`.
+  `vgi_oauth_identity()`.
 - **Remote secret provider** — a catalog can advertise a secret-service URL at `ATTACH`;
   DuckDB then fetches S3/HTTP/etc. credentials *lazily* from that remote service under the
   **same** identity (no `CREATE SECRET`), cached with a TTL bounded by the credential's

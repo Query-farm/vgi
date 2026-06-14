@@ -1,5 +1,5 @@
-# name: test/sql/oauth/catalog_identity.test
-# description: test vgi_catalog_identity() table function
+# name: test/sql/oauth/oauth_identity.test
+# description: test vgi_oauth_identity() table function
 # group: [vgi]
 
 require-env VGI_TEST_WORKER
@@ -14,11 +14,11 @@ require vgi
 # ============================================================================
 
 query IIIIIIII
-SELECT * FROM vgi_catalog_identity() LIMIT 0;
+SELECT * FROM vgi_oauth_identity() LIMIT 0;
 ----
 
 query IIIIII
-DESCRIBE SELECT * FROM vgi_catalog_identity() LIMIT 0;
+DESCRIBE SELECT * FROM vgi_oauth_identity() LIMIT 0;
 ----
 catalog_name	VARCHAR	YES	NULL	NULL	NULL
 origin	VARCHAR	YES	NULL	NULL	NULL
@@ -34,7 +34,7 @@ claims	JSON	YES	NULL	NULL	NULL
 # ============================================================================
 
 query I
-SELECT count(*) FROM vgi_catalog_identity();
+SELECT count(*) FROM vgi_oauth_identity();
 ----
 0
 
@@ -47,20 +47,20 @@ statement ok
 ATTACH 'example' AS vgi_identity_test (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
 query I
-SELECT count(*) FROM vgi_catalog_identity() WHERE catalog_name = 'vgi_identity_test';
+SELECT count(*) FROM vgi_oauth_identity() WHERE catalog_name = 'vgi_identity_test';
 ----
 1
 
 query IIIIIIII
 SELECT authenticated, sub, email, name, issuer, claims, origin IS NOT NULL, claims IS NULL
-FROM vgi_catalog_identity()
+FROM vgi_oauth_identity()
 WHERE catalog_name = 'vgi_identity_test';
 ----
 false	NULL	NULL	NULL	NULL	NULL	true	true
 
 # Filter by catalog name works
 query I
-SELECT count(*) FROM vgi_catalog_identity() WHERE catalog_name = 'no_such_catalog';
+SELECT count(*) FROM vgi_oauth_identity() WHERE catalog_name = 'no_such_catalog';
 ----
 0
 
@@ -69,6 +69,6 @@ DETACH vgi_identity_test;
 
 # After detach, the catalog no longer appears
 query I
-SELECT count(*) FROM vgi_catalog_identity() WHERE catalog_name = 'vgi_identity_test';
+SELECT count(*) FROM vgi_oauth_identity() WHERE catalog_name = 'vgi_identity_test';
 ----
 0
