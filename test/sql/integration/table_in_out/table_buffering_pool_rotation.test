@@ -48,7 +48,7 @@ SET threads=4;
 # whatever ran first. The flush is at the start, not before the check, so a
 # pool:=false attach that wrongly pooled a worker is still caught.
 statement ok
-SELECT vgi_worker_pool_flush();
+SELECT * FROM vgi_worker_pool_flush();
 
 # A parallel input source (TEMP TABLE scan IS parallel; range() isn't) so
 # multiple Sink threads engage and each picks up its own fresh worker.

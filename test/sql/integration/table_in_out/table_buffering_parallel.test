@@ -43,7 +43,7 @@ SELECT * FROM example.sum_all_columns((SELECT i::BIGINT FROM range(100000) t(i))
 # ----------------------------------------------------------------------------
 
 statement ok
-SELECT vgi_worker_pool_flush();
+SELECT * FROM vgi_worker_pool_flush();
 
 query I
 SELECT count(*) FROM example.buffer_input((SELECT i::BIGINT FROM range(50000) t(i)));

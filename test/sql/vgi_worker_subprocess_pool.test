@@ -17,24 +17,24 @@ SELECT typeof(worker_path), typeof(pid), typeof(age_seconds) FROM vgi_worker_sub
 ----
 
 # ============================================================================
-# Test vgi_worker_pool_flush() scalar function
+# Test vgi_worker_pool_flush() table function
 # ============================================================================
 
 # First flush any workers left over from previous tests
 query I
-SELECT vgi_worker_pool_flush() >= 0;
+SELECT flushed >= 0 FROM vgi_worker_pool_flush();
 ----
 true
 
 # Flush should return an integer count (0 when pool is empty)
 query I
-SELECT typeof(vgi_worker_pool_flush());
+SELECT typeof(flushed) FROM vgi_worker_pool_flush();
 ----
 BIGINT
 
 # Flush on empty pool returns 0
 query I
-SELECT vgi_worker_pool_flush();
+SELECT flushed FROM vgi_worker_pool_flush();
 ----
 0
 
@@ -58,7 +58,7 @@ SELECT COUNT(*) FROM duckdb_settings() WHERE name = 'vgi_worker_pool_max';
 
 # First, flush the pool to start clean
 query I
-SELECT vgi_worker_pool_flush();
+SELECT flushed FROM vgi_worker_pool_flush();
 ----
 0
 
@@ -102,7 +102,7 @@ DROP TABLE pool_snapshot;
 
 # Flush and verify pool is empty
 query I
-SELECT vgi_worker_pool_flush() >= 1;
+SELECT flushed >= 1 FROM vgi_worker_pool_flush();
 ----
 true
 
@@ -122,7 +122,7 @@ SELECT typeof(worker_path), typeof(hits), typeof(misses) FROM vgi_worker_pool_st
 
 # Flush pool, then run a query (first run = miss)
 query I
-SELECT vgi_worker_pool_flush() >= 0;
+SELECT flushed >= 0 FROM vgi_worker_pool_flush();
 ----
 true
 
@@ -151,7 +151,7 @@ true
 
 # Flush pool and verify stats still reflect historical counts
 query I
-SELECT vgi_worker_pool_flush() >= 1;
+SELECT flushed >= 1 FROM vgi_worker_pool_flush();
 ----
 true
 
@@ -166,7 +166,7 @@ true
 
 # Flush pool to start clean
 query I
-SELECT vgi_worker_pool_flush() >= 0;
+SELECT flushed >= 0 FROM vgi_worker_pool_flush();
 ----
 true
 
@@ -207,7 +207,7 @@ DETACH vgi_nopool;
 
 # Flush pool first
 query I
-SELECT vgi_worker_pool_flush() >= 0;
+SELECT flushed >= 0 FROM vgi_worker_pool_flush();
 ----
 true
 
@@ -232,7 +232,7 @@ DETACH vgi_pool;
 
 # Clean up
 query I
-SELECT vgi_worker_pool_flush() >= 0;
+SELECT flushed >= 0 FROM vgi_worker_pool_flush();
 ----
 true
 
@@ -242,7 +242,7 @@ true
 
 # Flush pool first
 query I
-SELECT vgi_worker_pool_flush() >= 0;
+SELECT flushed >= 0 FROM vgi_worker_pool_flush();
 ----
 true
 
@@ -281,7 +281,7 @@ DETACH vgi_pm0;
 # ============================================================================
 
 query I
-SELECT vgi_worker_pool_flush() >= 0;
+SELECT flushed >= 0 FROM vgi_worker_pool_flush();
 ----
 true
 
@@ -316,7 +316,7 @@ statement ok
 DETACH vgi_pm1;
 
 query I
-SELECT vgi_worker_pool_flush() >= 0;
+SELECT flushed >= 0 FROM vgi_worker_pool_flush();
 ----
 true
 
@@ -325,7 +325,7 @@ true
 # ============================================================================
 
 query I
-SELECT vgi_worker_pool_flush() >= 0;
+SELECT flushed >= 0 FROM vgi_worker_pool_flush();
 ----
 true
 
@@ -365,7 +365,7 @@ DETACH vgi_pt1;
 # ============================================================================
 
 query I
-SELECT vgi_worker_pool_flush() >= 0;
+SELECT flushed >= 0 FROM vgi_worker_pool_flush();
 ----
 true
 

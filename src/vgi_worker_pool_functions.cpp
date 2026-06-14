@@ -1,10 +1,8 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "vgi_worker_pool.hpp"
 
-#include "duckdb/function/scalar_function.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
-#include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 
 #include "vgi_function_docs.hpp"
@@ -13,22 +11,39 @@ namespace duckdb {
 namespace vgi {
 
 // ============================================================================
-// vgi_worker_pool_flush() - Scalar function to flush the worker pool
+// vgi_worker_pool_flush() - Table function to flush the worker pool
 // ============================================================================
 
-static void VgiWorkerPoolFlushFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+struct VgiWorkerPoolFlushData : public TableFunctionData {
+	bool finished = false;
+};
+
+static unique_ptr<FunctionData> VgiWorkerPoolFlushBind(ClientContext &context, TableFunctionBindInput &input,
+                                                       vector<LogicalType> &return_types, vector<string> &names) {
+	return_types.push_back(LogicalType::BIGINT);
+	names.emplace_back("flushed");
+	return make_uniq<VgiWorkerPoolFlushData>();
+}
+
+static void VgiWorkerPoolFlushScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &data = data_p.bind_data->CastNoConst<VgiWorkerPoolFlushData>();
+	if (data.finished) {
+		return;
+	}
 	auto count = VgiWorkerPool::Instance().Flush();
-	result.SetValue(0, Value::BIGINT(static_cast<int64_t>(count)));
+	output.SetValue(0, 0, Value::BIGINT(static_cast<int64_t>(count)));
+	output.SetCardinality(1);
+	data.finished = true;
 }
 
 void RegisterVgiWorkerPoolFlushFunction(ExtensionLoader &loader) {
-	ScalarFunction func("vgi_worker_pool_flush", {}, LogicalType::BIGINT, VgiWorkerPoolFlushFunction);
-	func.stability = FunctionStability::VOLATILE;
-	CreateScalarFunctionInfo info(func);
+	TableFunction func("vgi_worker_pool_flush", {}, VgiWorkerPoolFlushScan, VgiWorkerPoolFlushBind);
+	CreateTableFunctionInfo info(func);
 	info.descriptions.push_back(MakeFunctionDescription(
-	    "Clear all subprocess-pooled VGI workers, returning the count of workers flushed. Has no effect on "
-	    "launch:/unix:// workers, which are pooled by the OS-level AF_UNIX socket rather than this process.",
-	    {}, {}, {"SELECT vgi_worker_pool_flush();"}));
+	    "Clear all subprocess-pooled VGI workers, returning one row with the count of workers flushed. Has no "
+	    "effect on launch:/unix:// workers, which are pooled by the OS-level AF_UNIX socket rather than this "
+	    "process.",
+	    {}, {}, {"SELECT * FROM vgi_worker_pool_flush();"}));
 	loader.RegisterFunction(std::move(info));
 }
 

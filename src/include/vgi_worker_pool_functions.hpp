@@ -13,7 +13,7 @@ void RegisterVgiWorkerPoolFunction(ExtensionLoader &loader);
 //! Register the vgi_worker_pool_stats() table function (hit/miss statistics)
 void RegisterVgiWorkerPoolStatsFunction(ExtensionLoader &loader);
 
-//! Register the vgi_worker_pool_flush() scalar function
+//! Register the vgi_worker_pool_flush() table function
 void RegisterVgiWorkerPoolFlushFunction(ExtensionLoader &loader);
 
 } // namespace vgi
