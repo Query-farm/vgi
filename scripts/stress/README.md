@@ -45,7 +45,7 @@ Exit code is non-zero if any assertion fails, so it composes with `&&` / CI.
 
 - **Fault injection is external SIGKILL.** The fixture `crash_on_process` hook
   doesn't cleanly kill against the community extension, so faults kill worker
-  PIDs directly (`vgi_worker_subprocess_pool()` for subprocess; `lsof -t
+  PIDs directly (`vgi_worker_pool()` for subprocess; `lsof -t
   <hash>.sock` for launcher). Transport-agnostic and more robust.
 - **Isolation.** Launcher runs use a private temp `launcher_state_dir`, and
   every worker bound to it is killed on teardown — the harness never touches a

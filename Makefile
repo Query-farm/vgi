@@ -126,7 +126,7 @@ test_subprocess_debug:
 #
 # Two tests are excluded from this target because their assertions are
 # subprocess-pool-specific:
-# - vgi_worker_subprocess_pool.test               — asserts pool count >= 1
+# - vgi_worker_pool.test               — asserts pool count >= 1
 # - integration/table/filter_echo_partitioned     — asserts >1 distinct
 #                                                   worker_pid across parallel
 #                                                   partitions
@@ -148,7 +148,7 @@ test_launcher:
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
 	./build/release/test/unittest "test/*" \
 	    "~test/sql/integration/writable/*" \
-	    "~test/sql/vgi_worker_subprocess_pool.test" \
+	    "~test/sql/vgi_worker_pool.test" \
 	    "~test/sql/integration/table/filter_echo_partitioned.test"
 
 test_launcher_debug:
@@ -163,7 +163,7 @@ test_launcher_debug:
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
 	./build/debug/test/unittest "test/*" \
 	    "~test/sql/integration/writable/*" \
-	    "~test/sql/vgi_worker_subprocess_pool.test" \
+	    "~test/sql/vgi_worker_pool.test" \
 	    "~test/sql/integration/table/filter_echo_partitioned.test"
 
 # Same test suite as test_launcher but with the fixture worker configured
@@ -198,7 +198,7 @@ test_launcher_cloudflare_do:
 	VGI_WORKER_SHARED_STORAGE=cloudflare-do \
 	python3 scripts/run_tests.py --build release "test/*" \
 	    "~test/sql/integration/writable/*" \
-	    "~test/sql/vgi_worker_subprocess_pool.test" \
+	    "~test/sql/vgi_worker_pool.test" \
 	    "~test/sql/integration/table/filter_echo_partitioned.test"
 
 test_launcher_cloudflare_do_debug:
@@ -220,7 +220,7 @@ test_launcher_cloudflare_do_debug:
 	VGI_WORKER_SHARED_STORAGE=cloudflare-do \
 	python3 scripts/run_tests.py --build debug "test/*" \
 	    "~test/sql/integration/writable/*" \
-	    "~test/sql/vgi_worker_subprocess_pool.test" \
+	    "~test/sql/vgi_worker_pool.test" \
 	    "~test/sql/integration/table/filter_echo_partitioned.test"
 
 # HTTP transport tests (uses test/run_http_integration.sh)

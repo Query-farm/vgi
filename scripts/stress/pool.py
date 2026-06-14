@@ -6,7 +6,7 @@ big scans drive concurrent acquire/release against the same pool, while the
 background cleanup thread evicts idle/dead workers underneath.
 
 Fault injection SIGKILLs pooled worker PIDs externally (read from
-``vgi_worker_subprocess_pool()``) and asserts the next query recovers via the
+``vgi_worker_pool()``) and asserts the next query recovers via the
 pool's EPIPE stale-connection retry.
 """
 
@@ -23,13 +23,13 @@ from .common import StressConfig
 
 def _pooled_pids(conn) -> list[int]:
     return [int(r[0]) for r in conn.execute(
-        "SELECT pid FROM vgi_worker_subprocess_pool()"
+        "SELECT pid FROM vgi_worker_pool()"
     ).fetchall()]
 
 
 def _pool_size(conn) -> int:
     return int(conn.execute(
-        "SELECT count(*) FROM vgi_worker_subprocess_pool()"
+        "SELECT count(*) FROM vgi_worker_pool()"
     ).fetchone()[0])
 
 
