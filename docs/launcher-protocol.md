@@ -60,7 +60,7 @@ canonical-JSON tuple bytes (see *Hashing* below):
 |---|---|---|
 | `<hash>.lock` | flock target.  Body unused. | empty file (mode 0600) |
 | `<hash>.sock` | AF_UNIX SOCK_STREAM socket the worker binds | socket file |
-| `<hash>.meta` | human-readable metadata for `vgi_worker_subprocess_pool()`-style debugging | JSON: `{cmd, cwd, started_at, launcher_pid, socket}` |
+| `<hash>.meta` | human-readable metadata for `vgi_worker_pool()`-style debugging | JSON: `{cmd, cwd, started_at, launcher_pid, socket}` |
 
 **The body of `<hash>.lock` is unused.**  Do not put data there — atomicity
 of the lockfile body is genuinely hard (see Python launcher

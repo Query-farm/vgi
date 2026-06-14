@@ -48,7 +48,7 @@ void RegisterVgiWorkerPoolFlushFunction(ExtensionLoader &loader) {
 }
 
 // ============================================================================
-// vgi_worker_subprocess_pool() - Table function to show pool contents
+// vgi_worker_pool() - Table function to show pool contents
 // ============================================================================
 
 struct VgiWorkerPoolData : public TableFunctionData {
@@ -84,14 +84,14 @@ static void VgiWorkerPoolScan(ClientContext &context, TableFunctionInput &input,
 }
 
 void RegisterVgiWorkerPoolFunction(ExtensionLoader &loader) {
-	TableFunction func("vgi_worker_subprocess_pool", {}, VgiWorkerPoolScan, VgiWorkerPoolBind);
+	TableFunction func("vgi_worker_pool", {}, VgiWorkerPoolScan, VgiWorkerPoolBind);
 	CreateTableFunctionInfo info(func);
 	info.descriptions.push_back(MakeFunctionDescription(
 	    "List the VGI worker subprocesses currently pooled for reuse by this DuckDB process, one row per "
 	    "worker with its path, version info, pid, and idle age in seconds. Useful for capacity planning and "
 	    "spotting stale workers. Returns no rows for launch:/unix:// transports, whose workers are pooled by "
 	    "the OS-level AF_UNIX socket rather than this DuckDB process.",
-	    {}, {}, {"SELECT * FROM vgi_worker_subprocess_pool();"}));
+	    {}, {}, {"SELECT * FROM vgi_worker_pool();"}));
 	loader.RegisterFunction(std::move(info));
 }
 

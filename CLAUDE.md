@@ -324,7 +324,7 @@ Catalogs may register additional settings at `ATTACH` time (e.g., `greeting`, `m
 
 The `launch:` and `unix://` paths share one warm worker process across every DuckDB instance that points at the same `(cmd, args, cwd, VGI_RPC_*-env)` tuple — coordinated system-wide via per-hash flock + AF_UNIX socket.  See `docs/launcher-protocol.md` for the wire-protocol contract (state-dir layout, hash inputs, lockfile semantics) shared with the Python reference launcher in `vgi-rpc/vgi_rpc/launcher.py`.
 
-**Pool diagnostics are subprocess-only.**  `vgi_worker_subprocess_pool()`, `vgi_worker_pool_stats()`, and `vgi_worker_pool_flush()` operate exclusively on the per-DuckDB-process subprocess pool; they return zero rows for `LAUNCH` / `UNIX` transports because workers there are pooled by the OS-level AF_UNIX socket (one shared process serves every concurrent caller via internal threading), not by DuckDB.  Capacity-planning queries against `vgi_worker_subprocess_pool()` on a launcher-fronted catalog will look "broken" if you don't know to expect this — it isn't.  Idle launcher workers self-shutdown via the `--idle-timeout` flag (default 300 s); to inspect them, list `${XDG_RUNTIME_DIR:-$TMPDIR}/vgi-rpc[-$UID]/*.meta`.
+**Pool diagnostics are subprocess-only.**  `vgi_worker_pool()`, `vgi_worker_pool_stats()`, and `vgi_worker_pool_flush()` operate exclusively on the per-DuckDB-process subprocess pool; they return zero rows for `LAUNCH` / `UNIX` transports because workers there are pooled by the OS-level AF_UNIX socket (one shared process serves every concurrent caller via internal threading), not by DuckDB.  Capacity-planning queries against `vgi_worker_pool()` on a launcher-fronted catalog will look "broken" if you don't know to expect this — it isn't.  Idle launcher workers self-shutdown via the `--idle-timeout` flag (default 300 s); to inspect them, list `${XDG_RUNTIME_DIR:-$TMPDIR}/vgi-rpc[-$UID]/*.meta`.
 
 ## SQL Functions
 
@@ -332,7 +332,7 @@ The `launch:` and `unix://` paths share one warm worker process across every Duc
 |----------|------|-------------|
 | `vgi_table_function(worker_path, function_name, args)` | Table | Direct table function execution |
 | `vgi_catalogs(worker_path)` | Table | List available catalogs from a worker |
-| `vgi_worker_subprocess_pool()` | Table | Diagnostic: list **subprocess**-pooled workers (worker_path, pid, age_seconds). Returns no rows for `launch:` / `unix://` transports — see *Transports* section. |
+| `vgi_worker_pool()` | Table | Diagnostic: list **subprocess**-pooled workers (worker_path, pid, age_seconds). Returns no rows for `launch:` / `unix://` transports — see *Transports* section. |
 | `vgi_worker_pool_stats()` | Table | Diagnostic: hit/miss statistics by worker_path. Subprocess pool only. |
 | `vgi_worker_pool_flush()` | Table | Clear all subprocess-pooled workers; returns one row with the count flushed (`flushed`). Has no effect on `launch:` / `unix://` workers. |
 | `vgi_clear_cache()` | Table | Clear cached catalog metadata (schemas, tables, functions, statistics) for all attached VGI catalogs |
@@ -580,7 +580,7 @@ Workers expose functions via `ATTACH 'catalog_name' AS name (TYPE vgi, LOCATION 
 Worker subprocesses are pooled for reuse across queries:
 
 - **Pool settings**: `vgi_worker_pool_max` (default 256, 0 = disabled), `vgi_worker_pool_idle_limit_seconds` (default 5); per-catalog overrides via `pool_max` and `pool_timeout` ATTACH options
-- **Diagnostics**: `vgi_worker_subprocess_pool()` lists pooled workers, `vgi_worker_pool_stats()` shows hit/miss rates
+- **Diagnostics**: `vgi_worker_pool()` lists pooled workers, `vgi_worker_pool_stats()` shows hit/miss rates
 - **Stale connection handling**: `AcquireAndBindConnection()` retries with fresh connection if pooled worker died (EPIPE)
 - **SIGPIPE handling**: Extension uses `sigaction()` to ignore SIGPIPE; broken pipes return EPIPE error with diagnostic hint
 - **Background cleanup**: Thread removes dead and idle workers every second

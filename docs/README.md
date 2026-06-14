@@ -89,7 +89,7 @@ if __name__ == "__main__":
 - **Pushdown** — projection, filter, `ORDER BY` + `LIMIT`, and join-key pushdown to
   workers that opt in.
 - **Worker pooling** — subprocess workers are pooled and reused across queries, with
-  diagnostics (`vgi_worker_subprocess_pool()`, `vgi_worker_pool_stats()`).
+  diagnostics (`vgi_worker_pool()`, `vgi_worker_pool_stats()`).
 - **Performance** — optional POSIX shared-memory transport for zero-copy batch transfer.
 - **Auth** — per-catalog OAuth / bearer tokens; OIDC identity introspection via
   `vgi_oauth_identity()`.

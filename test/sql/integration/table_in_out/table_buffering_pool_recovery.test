@@ -56,7 +56,7 @@ SELECT count(*) FROM example.buffer_input((SELECT * FROM range(20) AS t(v)));
 # Pool diagnostics: any pooled worker still around must be a fresh one (not
 # the killed PIDs). Bounded-count check proves we're not leaking entries.
 query I
-SELECT count(*) <= 32 FROM vgi_worker_subprocess_pool();
+SELECT count(*) <= 32 FROM vgi_worker_pool();
 ----
 true
 
@@ -66,7 +66,7 @@ true
 # check, not a freshness proof. The real freshness signal is the misses
 # delta below.
 query I
-SELECT count(*) = 0 FROM vgi_worker_subprocess_pool() WHERE pid <= 0;
+SELECT count(*) = 0 FROM vgi_worker_pool() WHERE pid <= 0;
 ----
 true
 

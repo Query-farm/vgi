@@ -120,7 +120,7 @@ SELECT * FROM example.sum_all_columns((SELECT * FROM wide));
 # Pool diagnostics check — with pool := false the per-process pool MUST be
 # empty after the query (nothing was ever returned to it).
 query I
-SELECT count(*) FROM vgi_worker_subprocess_pool();
+SELECT count(*) FROM vgi_worker_pool();
 ----
 0
 

@@ -92,7 +92,7 @@ Unsupported implementation_version
 
 # ============================================================================
 # Pool isolation: two attaches at different data_version_spec values must not
-# share a pooled worker. vgi_worker_subprocess_pool() shows distinct (worker_path,
+# share a pooled worker. vgi_worker_pool() shows distinct (worker_path,
 # data_version_spec, implementation_version) keys.
 # ============================================================================
 

@@ -57,7 +57,7 @@ SELECT count(*) FROM example.buffer_input((SELECT i::BIGINT FROM range(50000) t(
 # per CLAUDE.md's "Pool diagnostics are subprocess-only" note); the
 # meaningful coverage is on subprocess.
 query I
-SELECT count(*) <= 24 FROM vgi_worker_subprocess_pool();
+SELECT count(*) <= 24 FROM vgi_worker_pool();
 ----
 true
 

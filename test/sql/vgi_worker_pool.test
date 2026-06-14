@@ -1,4 +1,4 @@
-# name: test/sql/vgi_worker_subprocess_pool.test
+# name: test/sql/vgi_worker_pool.test
 # description: test vgi worker pool functionality
 # group: [vgi]
 
@@ -8,12 +8,12 @@ require-env VGI_TEST_WORKER
 require vgi
 
 # ============================================================================
-# Test vgi_worker_subprocess_pool() table function structure
+# Test vgi_worker_pool() table function structure
 # ============================================================================
 
-# Verify vgi_worker_subprocess_pool() returns a table with the correct schema
+# Verify vgi_worker_pool() returns a table with the correct schema
 query III
-SELECT typeof(worker_path), typeof(pid), typeof(age_seconds) FROM vgi_worker_subprocess_pool() LIMIT 0;
+SELECT typeof(worker_path), typeof(pid), typeof(age_seconds) FROM vgi_worker_pool() LIMIT 0;
 ----
 
 # ============================================================================
@@ -70,13 +70,13 @@ SELECT COUNT(*) FROM vgi_table_function('${VGI_TEST_WORKER}', 'sequence', [10]);
 
 # Pool should now have workers (scan worker + cardinality RPC worker)
 query I
-SELECT COUNT(*) >= 1 FROM vgi_worker_subprocess_pool();
+SELECT COUNT(*) >= 1 FROM vgi_worker_pool();
 ----
 true
 
 # Snapshot the pool state (save all PIDs)
 statement ok
-CREATE TEMP TABLE pool_snapshot AS SELECT * FROM vgi_worker_subprocess_pool();
+CREATE TEMP TABLE pool_snapshot AS SELECT * FROM vgi_worker_pool();
 
 # Run another query - should acquire from pool, then return to pool
 query I
@@ -86,13 +86,13 @@ SELECT COUNT(*) FROM vgi_table_function('${VGI_TEST_WORKER}', 'sequence', [5]);
 
 # Pool should still have workers
 query I
-SELECT COUNT(*) >= 1 FROM vgi_worker_subprocess_pool();
+SELECT COUNT(*) >= 1 FROM vgi_worker_pool();
 ----
 true
 
 # THE KEY TEST: Verify at least one PID was reused from the pool
 query I
-SELECT COUNT(*) > 0 FROM vgi_worker_subprocess_pool() p JOIN pool_snapshot s ON p.pid = s.pid;
+SELECT COUNT(*) > 0 FROM vgi_worker_pool() p JOIN pool_snapshot s ON p.pid = s.pid;
 ----
 true
 
@@ -107,7 +107,7 @@ SELECT flushed >= 1 FROM vgi_worker_pool_flush();
 true
 
 query I
-SELECT COUNT(*) FROM vgi_worker_subprocess_pool();
+SELECT COUNT(*) FROM vgi_worker_pool();
 ----
 0
 
@@ -182,7 +182,7 @@ SELECT COUNT(*) FROM vgi_nopool.main.sequence(5, batch_size := 1000);
 
 # Pool should still be empty because pool=false
 query I
-SELECT COUNT(*) FROM vgi_worker_subprocess_pool();
+SELECT COUNT(*) FROM vgi_worker_pool();
 ----
 0
 
@@ -194,7 +194,7 @@ SELECT vgi_nopool.main.double(21);
 
 # Pool should still be empty
 query I
-SELECT COUNT(*) FROM vgi_worker_subprocess_pool();
+SELECT COUNT(*) FROM vgi_worker_pool();
 ----
 0
 
@@ -223,7 +223,7 @@ SELECT COUNT(*) FROM vgi_pool.main.sequence(5, batch_size := 1000);
 
 # Pool should have at least one worker now
 query I
-SELECT COUNT(*) >= 1 FROM vgi_worker_subprocess_pool();
+SELECT COUNT(*) >= 1 FROM vgi_worker_pool();
 ----
 true
 
@@ -258,7 +258,7 @@ SELECT COUNT(*) FROM vgi_pm0.main.sequence(5, batch_size := 1000);
 
 # Pool should be empty (pool_max=0 disables pooling)
 query I
-SELECT COUNT(*) FROM vgi_worker_subprocess_pool();
+SELECT COUNT(*) FROM vgi_worker_pool();
 ----
 0
 
@@ -269,7 +269,7 @@ SELECT vgi_pm0.main.double(21);
 42
 
 query I
-SELECT COUNT(*) FROM vgi_worker_subprocess_pool();
+SELECT COUNT(*) FROM vgi_worker_pool();
 ----
 0
 
@@ -297,7 +297,7 @@ SELECT COUNT(*) FROM vgi_pm1.main.sequence(5, batch_size := 1000);
 
 # Pool should have exactly 1 worker
 query I
-SELECT COUNT(*) FROM vgi_worker_subprocess_pool();
+SELECT COUNT(*) FROM vgi_worker_pool();
 ----
 1
 
@@ -308,7 +308,7 @@ SELECT COUNT(*) FROM vgi_pm1.main.sequence(3, batch_size := 1000);
 3
 
 query I
-SELECT COUNT(*) FROM vgi_worker_subprocess_pool();
+SELECT COUNT(*) FROM vgi_worker_pool();
 ----
 1
 
@@ -341,7 +341,7 @@ SELECT COUNT(*) FROM vgi_pt1.main.sequence(5, batch_size := 1000);
 
 # Pool should have a worker now
 query I
-SELECT COUNT(*) >= 1 FROM vgi_worker_subprocess_pool();
+SELECT COUNT(*) >= 1 FROM vgi_worker_pool();
 ----
 true
 
@@ -353,7 +353,7 @@ NULL
 
 # Pool should be empty now (worker expired after 1 second idle)
 query I
-SELECT COUNT(*) FROM vgi_worker_subprocess_pool();
+SELECT COUNT(*) FROM vgi_worker_pool();
 ----
 0
 
@@ -380,7 +380,7 @@ SELECT COUNT(*) FROM vgi_pf_pm.main.sequence(5, batch_size := 1000);
 
 # Pool should be empty because pool=false overrides pool_max
 query I
-SELECT COUNT(*) FROM vgi_worker_subprocess_pool();
+SELECT COUNT(*) FROM vgi_worker_pool();
 ----
 0
 

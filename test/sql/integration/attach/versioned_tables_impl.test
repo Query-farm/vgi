@@ -201,7 +201,7 @@ DETACH i_both;
 # regardless of transport — a single shared launcher worker serves both attaches
 # their own resolved version. (Whether the subprocess pool keys distinct worker
 # *processes* by version is a transport-specific detail covered by
-# vgi_worker_subprocess_pool.test, not asserted here.)
+# vgi_worker_pool.test, not asserted here.)
 # ============================================================================
 
 statement ok
