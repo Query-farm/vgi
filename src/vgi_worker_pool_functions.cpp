@@ -72,9 +72,10 @@ void RegisterVgiWorkerPoolFunction(ExtensionLoader &loader) {
 	TableFunction func("vgi_worker_subprocess_pool", {}, VgiWorkerPoolScan, VgiWorkerPoolBind);
 	CreateTableFunctionInfo info(func);
 	info.descriptions.push_back(MakeFunctionDescription(
-	    "Diagnostic: list the subprocess-pooled VGI workers (worker_path, data_version_spec, "
-	    "implementation_version, pid, age_seconds). Returns no rows for launch:/unix:// transports, whose "
-	    "workers are pooled by the OS-level AF_UNIX socket rather than this DuckDB process.",
+	    "List the VGI worker subprocesses currently pooled for reuse by this DuckDB process, one row per "
+	    "worker with its path, version info, pid, and idle age in seconds. Useful for capacity planning and "
+	    "spotting stale workers. Returns no rows for launch:/unix:// transports, whose workers are pooled by "
+	    "the OS-level AF_UNIX socket rather than this DuckDB process.",
 	    {}, {}, {"SELECT * FROM vgi_worker_subprocess_pool();"}));
 	loader.RegisterFunction(std::move(info));
 }
@@ -116,8 +117,9 @@ void RegisterVgiWorkerPoolStatsFunction(ExtensionLoader &loader) {
 	TableFunction func("vgi_worker_pool_stats", {}, VgiWorkerPoolStatsScan, VgiWorkerPoolStatsBind);
 	CreateTableFunctionInfo info(func);
 	info.descriptions.push_back(MakeFunctionDescription(
-	    "Diagnostic: subprocess worker-pool hit/miss statistics by worker_path (worker_path, hits, misses). "
-	    "Subprocess transport only.",
+	    "Report worker-pool reuse effectiveness, one row per worker_path with how many acquisitions reused a "
+	    "pooled worker (hits) versus spawned a fresh one (misses). A low hit rate suggests workers are being "
+	    "evicted before reuse. Subprocess transport only.",
 	    {}, {}, {"SELECT * FROM vgi_worker_pool_stats();"}));
 	loader.RegisterFunction(std::move(info));
 }

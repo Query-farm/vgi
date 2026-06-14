@@ -2305,9 +2305,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 		TableFunction providers_func("vgi_secret_providers", {}, VgiSecretProvidersScan, VgiSecretProvidersBind);
 		CreateTableFunctionInfo providers_info(providers_func);
 		providers_info.descriptions.push_back(vgi::MakeFunctionDescription(
-		    "Diagnostic: one row per auto-registered Orchard remote secret provider (catalog_name, endpoint, "
-		    "tie_break_offset, active, cached_secrets, ttl_seconds). A provider is registered when an attached "
-		    "VGI catalog advertises a secret-service URL.",
+		    "List the Orchard remote secret providers auto-registered by attached VGI catalogs, one row per "
+		    "provider with its endpoint, tie-break offset, active flag, cached-secret count, and cache TTL. "
+		    "A provider appears here when an attached VGI catalog advertises a secret-service URL.",
 		    {}, {}, {"SELECT * FROM vgi_secret_providers();"}));
 		loader.RegisterFunction(std::move(providers_info));
 
@@ -2345,8 +2345,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 		TableFunction tokens_func("vgi_oauth_tokens", {}, OAuthTokensFunction, OAuthTokensBind, OAuthTokensInit);
 		CreateTableFunctionInfo tokens_info(tokens_func);
 		tokens_info.descriptions.push_back(vgi::MakeFunctionDescription(
-		    "Diagnostic: list the OAuth tokens currently cached by the extension, one row per origin, with "
-		    "their expiry and refresh state. Token values themselves are not exposed.",
+		    "Show the OAuth tokens the extension has cached, one row per origin, with each token's expiry and "
+		    "refresh state. Token values themselves are never exposed. Pair with vgi_oauth_logout() to clear "
+		    "stale or unwanted tokens.",
 		    {}, {}, {"SELECT * FROM vgi_oauth_tokens();"}));
 		loader.RegisterFunction(std::move(tokens_info));
 

@@ -218,9 +218,10 @@ void RegisterVgiTableBranchesFunction(ExtensionLoader &loader) {
 	TableFunction func("vgi_table_branches", {}, VgiTableBranchesScan, VgiTableBranchesBind);
 	CreateTableFunctionInfo info(func);
 	info.descriptions.push_back(MakeFunctionDescription(
-	    "Diagnostic: one row per branch per VGI table across every attached VGI catalog. Surfaces the "
-	    "multi-branch shape (function_name, positional/named arguments, branch_filter, required extensions) "
-	    "consumed by the multi-scan rewriter. Single-branch tables surface as one row with branch_index=0.",
+	    "Inspect how each attached VGI table is composed from its underlying worker functions, one row per "
+	    "branch per table across every attached VGI catalog. Shows the function_name, positional/named "
+	    "arguments, branch_filter, and required extensions behind every branch — the multi-branch shape the "
+	    "scan rewriter unions together. Single-branch tables surface as one row with branch_index=0.",
 	    {}, {}, {"SELECT * FROM vgi_table_branches();"}));
 	loader.RegisterFunction(std::move(info));
 }

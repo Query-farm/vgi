@@ -218,9 +218,9 @@ void RegisterVgiTableStatisticsFunction(ExtensionLoader &loader) {
 	                   VgiTableStatisticsScan, VgiTableStatisticsBind);
 	CreateTableFunctionInfo info(func);
 	info.descriptions.push_back(MakeFunctionDescription(
-	    "Diagnostic: report the per-column statistics DuckDB holds for a VGI table, identified by "
-	    "catalog, schema, and table name. One row per column, exposing the materialized BaseStatistics "
-	    "(min/max, null counts, distinct estimates) that the worker supplied.",
+	    "Show the per-column statistics DuckDB holds for a VGI table, identified by catalog, schema, and "
+	    "table name. One row per column, exposing the worker-supplied min/max, null counts, and distinct "
+	    "estimates the optimizer uses to plan queries.",
 	    {"catalog", "schema", "table"},
 	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
 	    {"SELECT * FROM vgi_table_statistics('mycatalog', 'main', 'events');"}));
