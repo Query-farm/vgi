@@ -1,18 +1,40 @@
+<p align="center">
+  <img src="vgi-logo.png" alt="VGI — Vector Gateway Interface" width="480">
+</p>
+
 # VGI — Vector Gateway Interface for DuckDB
 
 **VGI** (Vector Gateway Interface) is an Apache Arrow–based protocol for extending DuckDB
-using *any* language — no C++/C/Rust/Zig and no compilation or linking required.
+using *any* language — without writing, compiling, or linking a DuckDB-native C++ extension.
+Workers run as separate programs, so there is no DuckDB build to match and nothing to link
+in-process. Use an interpreted language like Python or TypeScript, or ship a compiled binary
+written in Go, Rust, or Java — VGI only cares that the program speaks the protocol over
+Apache Arrow IPC.
 
 This repository contains the **DuckDB extension** (the C++ side of VGI). It loads into
-DuckDB and lets you `ATTACH` a *worker* — a program written in Python, TypeScript, Go, or
-anything that speaks the protocol — and then call the scalar, table, and aggregate
-functions that worker exposes as if they were native DuckDB functions. Data moves between
-DuckDB and the worker over Apache Arrow IPC, across a subprocess pipe, an HTTP connection,
-or a Unix domain socket.
+DuckDB and lets you `ATTACH` a *worker* — a program written in any supported language (see
+[Worker SDKs](#worker-sdks)) — and then call the scalar, table, and aggregate functions that
+worker exposes as if they were native DuckDB functions. Data moves between DuckDB and the
+worker over Apache Arrow IPC, across a subprocess pipe, an HTTP connection, or a Unix domain
+socket.
 
 The reference worker SDK is **vgi-python** — `pip install vgi`.
 
 Created by [Query.Farm](https://query.farm).
+
+## Worker SDKs
+
+A VGI worker can be written in any language that implements the protocol. Query.Farm
+maintains reference SDKs in five languages. **vgi-python** is the most complete reference
+implementation and is published to PyPI; the others are developed in the open.
+
+| Language   | Repository                                                                 | Build | Package |
+|------------|---------------------------------------------------------------------------|-------|---------|
+| Python     | [Query-farm/vgi-python](https://github.com/Query-farm/vgi-python)          | [![CI](https://github.com/Query-farm/vgi-python/actions/workflows/ci.yml/badge.svg)](https://github.com/Query-farm/vgi-python/actions/workflows/ci.yml) | [![PyPI](https://img.shields.io/pypi/v/vgi)](https://pypi.org/project/vgi/) `pip install vgi` |
+| TypeScript | [Query-farm/vgi-typescript](https://github.com/Query-farm/vgi-typescript) | _private repo_ | — |
+| Go         | [Query-farm/vgi-go](https://github.com/Query-farm/vgi-go)                  | [![CI](https://github.com/Query-farm/vgi-go/actions/workflows/ci.yml/badge.svg)](https://github.com/Query-farm/vgi-go/actions/workflows/ci.yml) | — |
+| Rust       | [Query-farm/vgi-rust](https://github.com/Query-farm/vgi-rust)              | [![CI](https://github.com/Query-farm/vgi-rust/actions/workflows/ci.yml/badge.svg)](https://github.com/Query-farm/vgi-rust/actions/workflows/ci.yml) | — |
+| Java       | [Query-farm/vgi-java](https://github.com/Query-farm/vgi-java)              | [![CI](https://github.com/Query-farm/vgi-java/actions/workflows/integration.yml/badge.svg)](https://github.com/Query-farm/vgi-java/actions/workflows/integration.yml) | — |
 
 ## Why VGI?
 
