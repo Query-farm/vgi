@@ -44,7 +44,7 @@ implementation and is published to PyPI; the others are developed in the open.
 | Tied to a specific DuckDB version | Version independent |
 | Complex build / release cycle | Ship a script or executable |
 | Runs in-process | Process isolation |
-| Single-threaded by default | Parallel pooled workers |
+| Shares DuckDB's process and runtime | Pool of independent worker processes — true parallelism even under a GIL |
 
 **Use cases:** call REST APIs from SQL, run ML inference (PyTorch, scikit-learn),
 process data with Python/pandas/numpy, build custom ETL transforms, or expose external
