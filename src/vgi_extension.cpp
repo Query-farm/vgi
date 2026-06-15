@@ -15,6 +15,7 @@
 #endif
 
 #include "duckdb.hpp"
+#include "duckdb/common/file_system.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/database_manager.hpp"
@@ -1333,6 +1334,20 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 				    worker_path);
 			}
 			catalog_name = catalogs[0].name;
+
+			// When DuckDB derived the database alias from the path (the CLI
+			// default-DB open `vgi:uvx vgi-easter`, or `ATTACH 'uvx vgi-easter'
+			// (TYPE vgi)` with no AS clause), the alias is the ugly path
+			// basename. Replace it with the discovered catalog name so the DB
+			// surfaces as `easter`, not `uvx vgi-easter`. Registration reads
+			// GetName() *after* attach (DatabaseManager::FinalizeAttach), and
+			// derives the default-database pointer from it too, so SetName here
+			// is honored consistently. A user-chosen `AS alias` (name differs
+			// from the path basename) is left untouched.
+			auto &fs = FileSystem::GetFileSystem(context);
+			if (name == AttachedDatabase::ExtractDatabaseName(info.path, fs)) {
+				db.SetName(catalog_name);
+			}
 		}
 
 		// Validate attach-time options against the resolved catalog's declared
