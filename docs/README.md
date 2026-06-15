@@ -18,7 +18,7 @@ worker exposes as if they were native DuckDB functions. Data moves between DuckD
 worker over Apache Arrow IPC, across a subprocess pipe, an HTTP connection, or a Unix domain
 socket.
 
-The reference worker SDK is **vgi-python** — `pip install vgi`.
+The reference worker SDK is **vgi-python** — `pip install vgi-python`.
 
 Created by [Query.Farm](https://query.farm).
 
@@ -30,7 +30,7 @@ implementation and is published to PyPI; the others are developed in the open.
 
 | Language   | Repository                                                                 | Build | Package |
 |------------|---------------------------------------------------------------------------|-------|---------|
-| Python     | [Query-farm/vgi-python](https://github.com/Query-farm/vgi-python)          | [![CI](https://github.com/Query-farm/vgi-python/actions/workflows/ci.yml/badge.svg)](https://github.com/Query-farm/vgi-python/actions/workflows/ci.yml) | [![PyPI](https://img.shields.io/pypi/v/vgi)](https://pypi.org/project/vgi/) `pip install vgi` |
+| Python     | [Query-farm/vgi-python](https://github.com/Query-farm/vgi-python)          | [![CI](https://github.com/Query-farm/vgi-python/actions/workflows/ci.yml/badge.svg)](https://github.com/Query-farm/vgi-python/actions/workflows/ci.yml) | [![PyPI](https://img.shields.io/pypi/v/vgi-python)](https://pypi.org/project/vgi-python/) `pip install vgi-python` |
 | TypeScript | [Query-farm/vgi-typescript](https://github.com/Query-farm/vgi-typescript) | _private repo_ | — |
 | Go         | [Query-farm/vgi-go](https://github.com/Query-farm/vgi-go)                  | [![CI](https://github.com/Query-farm/vgi-go/actions/workflows/ci.yml/badge.svg)](https://github.com/Query-farm/vgi-go/actions/workflows/ci.yml) | — |
 | Rust       | [Query-farm/vgi-rust](https://github.com/Query-farm/vgi-rust)              | [![CI](https://github.com/Query-farm/vgi-rust/actions/workflows/ci.yml/badge.svg)](https://github.com/Query-farm/vgi-rust/actions/workflows/ci.yml) | — |
