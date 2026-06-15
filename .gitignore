@@ -14,6 +14,19 @@ duckdb.old
 
 # Local-only dev scripts and scratch SQL (kept on disk, not tracked)
 /build-wasm*.sh
+/backup-wasm*.sh
 /otel-env.sh
 /test*.sql
 /vgi_log.csv
+/ducklake.sql
+*.bak
+
+# Scratch data / scratch DBs / screenshots at repo root
+/dl
+/*.parquet
+/*.db
+/*.png
+
+# Tooling output
+.playwright-mcp/
+__pycache__/
