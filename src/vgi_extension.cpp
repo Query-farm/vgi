@@ -1156,9 +1156,11 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	// The base (before '?') stays the catalog name; the query string supplies
 	// options, applied first so an explicit (TYPE vgi, ...) clause still overrides.
 	bool secret_in_path = false;
+	bool had_query = false;
 	{
 		auto qpos = catalog_name.find('?');
 		if (qpos != string::npos) {
+			had_query = true;
 			string query = catalog_name.substr(qpos + 1);
 			catalog_name = catalog_name.substr(0, qpos);
 			size_t start = 0;
@@ -1205,6 +1207,18 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	// Validate mutual exclusivity of auth options
 	if (!bearer_token.empty() && !oauth_refresh_token.empty()) {
 		throw BinderException("Cannot specify both bearer_token and oauth_refresh_token");
+	}
+
+	// Bare connection-string form: when no LOCATION was given and the path
+	// carried no '?query' (which would mark the base as a catalog name,
+	// airport-style), the whole ATTACH path IS the worker location — e.g. the
+	// haybarn CLI form `vgi:uvx vgi-easter`, or `ATTACH 'uvx vgi-easter'
+	// (TYPE vgi)`. The remote catalog name is discovered from the worker below.
+	bool discover_catalog = false;
+	if (worker_path.empty() && !had_query && !catalog_name.empty()) {
+		worker_path = catalog_name;
+		catalog_name.clear();
+		discover_catalog = true;
 	}
 
 	if (worker_path.empty()) {
@@ -1288,57 +1302,88 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 		launcher_state_dir_for_attach = launcher_state_dir;
 	}
 
-	// If the user passed attach-time options, validate them against the
-	// catalog's declared AttachOptionSpec list. Skip the extra RPC when
-	// attach_options is empty — catalogs without options pay no overhead.
-	if (!attach_options.empty()) {
+	// Fetch the worker's catalog list once when we need it — either to discover
+	// the catalog name for the bare connection-string form, or to validate
+	// attach-time options against the catalog's declared AttachOptionSpec list.
+	// Catalogs without options on the explicit form pay no overhead (no RPC).
+	if (discover_catalog || !attach_options.empty()) {
 		auto catalogs = vgi::InvokeCatalogs(worker_path, context, worker_debug, use_pool, auth,
 		                                    launcher_idle_for_attach, launcher_state_dir_for_attach);
-		const vgi::VgiCatalogInfo *matching_info = nullptr;
-		for (const auto &info_entry : catalogs) {
-			if (info_entry.name == catalog_name) {
-				matching_info = &info_entry;
-				break;
-			}
-		}
-		if (!matching_info) {
-			throw BinderException("Worker at '%s' exposes no catalog named '%s'", worker_path, catalog_name);
-		}
 
-		auto build_accepted_list = [&]() {
-			std::string joined;
-			for (const auto &spec : matching_info->attach_option_specs) {
-				if (!joined.empty()) {
-					joined += ", ";
+		// Bare form: resolve the (omitted) catalog name from the worker. A
+		// single-catalog worker resolves unambiguously; >1 forces the user to
+		// name one via the '<catalog>?location=<worker>' form.
+		if (discover_catalog) {
+			if (catalogs.empty()) {
+				throw BinderException("VGI worker at '%s' exposes no catalogs", worker_path);
+			}
+			if (catalogs.size() > 1) {
+				std::string names;
+				for (const auto &c : catalogs) {
+					if (!names.empty()) {
+						names += ", ";
+					}
+					names += c.name;
 				}
-				joined += spec.name;
+				throw BinderException(
+				    "VGI worker at '%s' exposes %llu catalogs (%s); name one with "
+				    "ATTACH '<catalog>?location=%s' (TYPE vgi) or "
+				    "ATTACH '<catalog>' (TYPE vgi, LOCATION '%s')",
+				    worker_path, static_cast<unsigned long long>(catalogs.size()), names, worker_path,
+				    worker_path);
 			}
-			return joined.empty() ? std::string("(none)") : joined;
-		};
+			catalog_name = catalogs[0].name;
+		}
 
-		std::map<std::string, Value> validated_options;
-		for (const auto &opt : attach_options) {
-			const vgi::VgiAttachOptionSpec *matching_spec = nullptr;
-			for (const auto &spec : matching_info->attach_option_specs) {
-				if (StringUtil::Lower(spec.name) == opt.first) {
-					matching_spec = &spec;
+		// Validate attach-time options against the resolved catalog's declared
+		// AttachOptionSpec list (skipped on the bare form when no options given).
+		if (!attach_options.empty()) {
+			const vgi::VgiCatalogInfo *matching_info = nullptr;
+			for (const auto &info_entry : catalogs) {
+				if (info_entry.name == catalog_name) {
+					matching_info = &info_entry;
 					break;
 				}
 			}
-			if (!matching_spec) {
-				throw BinderException("Unknown ATTACH option '%s' for catalog '%s'. Accepted options: %s",
-				                      opt.first, catalog_name, build_accepted_list());
+			if (!matching_info) {
+				throw BinderException("Worker at '%s' exposes no catalog named '%s'", worker_path, catalog_name);
 			}
 
-			Value casted;
-			std::string cast_error;
-			if (!opt.second.DefaultTryCastAs(matching_spec->type, casted, &cast_error)) {
-				throw BinderException("Cannot cast ATTACH option '%s' to declared type %s: %s", matching_spec->name,
-				                      matching_spec->type.ToString(), cast_error);
+			auto build_accepted_list = [&]() {
+				std::string joined;
+				for (const auto &spec : matching_info->attach_option_specs) {
+					if (!joined.empty()) {
+						joined += ", ";
+					}
+					joined += spec.name;
+				}
+				return joined.empty() ? std::string("(none)") : joined;
+			};
+
+			std::map<std::string, Value> validated_options;
+			for (const auto &opt : attach_options) {
+				const vgi::VgiAttachOptionSpec *matching_spec = nullptr;
+				for (const auto &spec : matching_info->attach_option_specs) {
+					if (StringUtil::Lower(spec.name) == opt.first) {
+						matching_spec = &spec;
+						break;
+					}
+				}
+				if (!matching_spec) {
+					throw BinderException("Unknown ATTACH option '%s' for catalog '%s'. Accepted options: %s",
+					                      opt.first, catalog_name, build_accepted_list());
+				}
+
+				Value casted;
+				std::string cast_error;
+				if (!opt.second.DefaultTryCastAs(matching_spec->type, casted, &cast_error)) {
+					throw BinderException("Cannot cast ATTACH option '%s' to declared type %s: %s",
+					                      matching_spec->name, matching_spec->type.ToString(), cast_error);
+				}
+				validated_options.emplace(matching_spec->name, std::move(casted));
 			}
-			validated_options.emplace(matching_spec->name, std::move(casted));
+			attach_options = std::move(validated_options);
 		}
-		attach_options = std::move(validated_options);
 	}
 
 	// Call catalog_attach via RPC. The worker validates data_version_spec and

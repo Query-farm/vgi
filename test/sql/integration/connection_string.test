@@ -44,7 +44,30 @@ SELECT ex3.main.add_values(20, 22);
 42
 
 # A '?' query that omits a location still fails with the clear LOCATION error.
+# (The '?' marks the base as a catalog name, airport-style — a location must be
+# supplied explicitly; it is NOT treated as a bare worker location.)
 statement error
 ATTACH 'example?pool=false' AS ex4 (TYPE vgi);
 ----
 VGI ATTACH requires LOCATION option
+
+# Bare connection-string form: with no '?query' and no LOCATION, the whole
+# ATTACH path IS the worker location and the remote catalog name is discovered
+# from the worker. This is the form behind the haybarn CLI's `vgi:uvx vgi-easter`.
+# The fixture worker exposes several catalogs, so discovery is ambiguous and the
+# error must name them and point at the disambiguating forms.
+statement error
+ATTACH '${VGI_TEST_WORKER}' AS exauto (TYPE vgi);
+----
+name one with ATTACH '<catalog>?location=
+
+# Naming one of the discovered catalogs with the existing '?location=' form
+# resolves the ambiguity and attaches successfully (single-catalog discovery is
+# exercised end-to-end against a real single-catalog worker in the easter demo).
+statement ok
+ATTACH 'example?location=${VGI_TEST_WORKER}' AS exauto (TYPE vgi);
+
+query I
+SELECT exauto.main.add_values(20, 22);
+----
+42
