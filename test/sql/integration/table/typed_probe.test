@@ -1,0 +1,60 @@
+# name: test/sql/integration/table/typed_probe.test
+# description: typed const-argument binding + typed column emit (cross-language)
+#   typed_probe(n, ts, iv, blob, ub, f) binds less-common scalar const args —
+#   TIMESTAMPTZ, INTERVAL, BLOB, UBIGINT — each with a default, and echoes them
+#   into uint64/int64/blob/double columns. Calling with defaults exercises the
+#   default-binding path; passing named args exercises scalar extraction.
+# group: [vgi_integration_table]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# Defaults: ts=2026-01-02T03:04:05Z (1767323045000000us), iv=1500ms, blob='vgi',
+# ub=9, f=2.5. idx counts rows; f column is f_const + idx.
+# ============================================================================
+
+query IIITIR
+SELECT idx, ts_us, iv_ms, payload::VARCHAR AS payload, ub, f
+FROM example.typed_probe(2)
+ORDER BY idx;
+----
+0	1767323045000000	1500	vgi	9	2.5
+1	1767323045000000	1500	vgi	9	3.5
+
+# Column types: idx/ub UBIGINT, ts_us/iv_ms BIGINT, payload BLOB, f DOUBLE.
+query TTTTTT
+SELECT typeof(idx), typeof(ts_us), typeof(iv_ms), typeof(payload), typeof(ub), typeof(f)
+FROM example.typed_probe(1);
+----
+UBIGINT	BIGINT	BIGINT	BLOB	UBIGINT	DOUBLE
+
+# ============================================================================
+# Named args drive the scalar-extraction path: ts=2027-06-15T12:00:00Z
+# (1813060800000000us), iv=2500ms, blob='xyz', ub=100, f=10.0.
+# ============================================================================
+
+query IIITIR
+SELECT idx, ts_us, iv_ms, payload::VARCHAR AS payload, ub, f
+FROM example.typed_probe(2, ts := TIMESTAMPTZ '2027-06-15 12:00:00+00', iv := INTERVAL 2500 MILLISECOND, blob := 'xyz'::BLOB, ub := 100, f := 10.0)
+ORDER BY idx;
+----
+0	1813060800000000	2500	xyz	100	10.0
+1	1813060800000000	2500	xyz	100	11.0
+
+# Partial named args — only some consts overridden, rest default.
+query III
+SELECT idx, iv_ms, ub
+FROM example.typed_probe(1, ub := 42)
+ORDER BY idx;
+----
+0	1500	42
+
+statement ok
+DETACH example;
