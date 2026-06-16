@@ -1,0 +1,89 @@
+# name: test/sql/integration/scalar/numeric_promotion.test
+# description: Exercises numeric type promotion across float/unsigned/decimal/mixed-sign inputs
+# group: [vgi_integration_scalar]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# double(value) — output type is promoted for overflow headroom.
+# float32 -> float64 ; unsigned widens ; decimal gains one digit of precision.
+# ============================================================================
+
+query T
+SELECT typeof(example.double(1.5::REAL));
+----
+DOUBLE
+
+query I
+SELECT example.double(1.5::REAL) = 3.0;
+----
+true
+
+query T
+SELECT typeof(example.double(10::UTINYINT));
+----
+USMALLINT
+
+query I
+SELECT example.double(10::UTINYINT);
+----
+20
+
+query T
+SELECT typeof(example.double(100::UINTEGER));
+----
+UBIGINT
+
+query T
+SELECT typeof(example.double(1.25::DECIMAL(10,2)));
+----
+DECIMAL(11,2)
+
+query I
+SELECT example.double(1.25::DECIMAL(10,2)) = 2.50;
+----
+true
+
+# ============================================================================
+# add_values(a, b) — common numeric type of the two inputs, then promoted.
+# mixed-sign integers -> int64 ; same-sign widen ; decimals merge precision/scale.
+# ============================================================================
+
+query T
+SELECT typeof(example.add_values(2::INTEGER, 3::UINTEGER));
+----
+BIGINT
+
+query I
+SELECT example.add_values(2::INTEGER, 3::UINTEGER);
+----
+5
+
+query T
+SELECT typeof(example.add_values(2::TINYINT, 3::INTEGER));
+----
+BIGINT
+
+query I
+SELECT example.add_values(2::TINYINT, 3::INTEGER);
+----
+5
+
+# Decimal inputs exercise the decimal branch of the common-type computation. We
+# assert only the value, not typeof: the exact result precision/scale of decimal
+# addition is implementation-defined and differs between worker backends.
+
+query I
+SELECT example.add_values(1.50::DECIMAL(5,2), 2.250::DECIMAL(7,3)) = 3.750;
+----
+true
+
+statement ok
+DETACH example;

@@ -25,7 +25,7 @@ SELECT COUNT(*)
 FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'scalar';
 ----
-39
+41
 
 query T
 SELECT function_name
@@ -61,6 +61,8 @@ pair_type
 random_bytes
 random_int
 return_secret_value
+scale_by_setting
+secret_field
 smart_format
 smart_format
 sum_values
@@ -311,6 +313,30 @@ WHERE database_name = 'example' AND function_name = 'return_secret_value';
 return_secret_value	[]	[]	VARCHAR	CONSISTENT	Return a secret's value
 
 # ----------------------------------------------------------------------------
+# scale_by_setting — float Setting() parameter (read via get_f64, not visible)
+# Parameters: value (DOUBLE) → DOUBLE
+# ----------------------------------------------------------------------------
+
+query TTTTTT
+SELECT function_name, parameters, parameter_types, return_type, stability, description
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_name = 'scale_by_setting';
+----
+scale_by_setting	[value]	[DOUBLE]	DOUBLE	CONSISTENT	Scale the input value by the float setting `scale_factor`
+
+# ----------------------------------------------------------------------------
+# secret_field — Secret() parameter, looks up individual fields by name
+# Parameters: (none) → VARCHAR
+# ----------------------------------------------------------------------------
+
+query TTTTTT
+SELECT function_name, parameters, parameter_types, return_type, stability, description
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_name = 'secret_field';
+----
+secret_field	[]	[]	VARCHAR	CONSISTENT	Look up secret fields by name
+
+# ----------------------------------------------------------------------------
 # sum_values — Varargs with AnyArrow type and dynamic return type
 # Parameters: (none positional), varargs=ANY → ANY
 # ----------------------------------------------------------------------------
@@ -358,7 +384,7 @@ SELECT COUNT(*)
 FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'scalar' AND varargs IS NULL;
 ----
-33
+35
 
 # ============================================================================
 # Stability
@@ -379,7 +405,7 @@ SELECT COUNT(*)
 FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'scalar' AND stability = 'CONSISTENT';
 ----
-37
+39
 
 # ============================================================================
 # Cleanup

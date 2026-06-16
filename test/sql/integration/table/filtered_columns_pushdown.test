@@ -1,0 +1,69 @@
+# name: test/sql/integration/table/filtered_columns_pushdown.test
+# description: Pushed-filter column introspection — filtered_columns, has_filter_for_column, typed get_column_values_array
+# group: [vgi_integration_table]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# filtered_columns_echo(count) reports, per query, which columns the pushed-down
+# filters reference (filtered_cols), whether a given column is filtered (has_n /
+# has_tag), and the discrete value set resolved for the string column `tag` via
+# the typed get_column_values_array accessor (tag_values).
+
+# No filter — nothing is constrained.
+
+query TTTT
+SELECT DISTINCT filtered_cols, has_n, has_tag, tag_values
+FROM example.filtered_columns_echo(5);
+----
+(empty)	false	false	(none)
+
+# Discrete IN on a string column — resolved as a typed value set.
+
+query TTTT
+SELECT DISTINCT filtered_cols, has_n, has_tag, tag_values
+FROM example.filtered_columns_echo(5) WHERE tag IN ('t1','t3');
+----
+tag	false	true	t1,t3
+
+# Equality on a string column.
+
+query TTTT
+SELECT DISTINCT filtered_cols, has_n, has_tag, tag_values
+FROM example.filtered_columns_echo(5) WHERE tag = 't2';
+----
+tag	false	true	t2
+
+# Both columns constrained (AND) — get_column_values_array digs into the AND child.
+
+query TTTT
+SELECT DISTINCT filtered_cols, has_n, has_tag, tag_values
+FROM example.filtered_columns_echo(5) WHERE n IN (1, 2, 3) AND tag = 't2';
+----
+n,tag	true	true	t2
+
+# A non-enumerable range filter — column is reported as filtered, but no discrete set.
+
+query TTTT
+SELECT DISTINCT filtered_cols, has_n, has_tag, tag_values
+FROM example.filtered_columns_echo(5) WHERE n >= 2;
+----
+n	true	false	(none)
+
+# The pushed filter is also applied to the rows (auto_apply_filters): the string
+# IN keeps exactly the matching rows.
+
+query IT
+SELECT n, tag FROM example.filtered_columns_echo(5) WHERE tag IN ('t1', 't3') ORDER BY n;
+----
+1	t1
+3	t3
+
+statement ok
+DETACH example;
