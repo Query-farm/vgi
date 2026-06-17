@@ -49,13 +49,15 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 #   see table/time_travel_pushdown.test) +
 # 1 typed const-arg / typed-column emit fixture (typed_probe, see
 #   table/typed_probe.test)
-# = 93
+# 1 filter-column introspection fixture (filtered_columns_echo, see
+#   table/filtered_columns_pushdown.test)
+# = 94
 query I
 SELECT COUNT(*)
 FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'table';
 ----
-93
+94
 
 # The 33 pure table functions (no TABLE parameter type)
 # Note: make_series appears 5 times (5 overloads), make_pairs appears 3 times,

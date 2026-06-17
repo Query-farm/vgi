@@ -1,0 +1,49 @@
+# name: test/sql/integration/settings/settings_types.test
+# description: Validates a float (DOUBLE) setting read via the get_f64 accessor
+# group: [vgi_integration_settings]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# The float setting is registered and visible.
+
+query I
+SELECT COUNT(*) FROM duckdb_settings() WHERE name = 'scale_factor';
+----
+1
+
+# scale_by_setting(value) multiplies its input by the DOUBLE setting scale_factor,
+# read via Settings::get_f64.
+
+statement ok
+SET scale_factor = 2.5;
+
+query I
+SELECT example.scale_by_setting(4.0) = 10.0;
+----
+true
+
+query I
+SELECT example.scale_by_setting(value) = 5.0
+FROM (VALUES (2.0)) AS t(value);
+----
+true
+
+# A different float value is reflected on the next call.
+
+statement ok
+SET scale_factor = 0.5;
+
+query I
+SELECT example.scale_by_setting(10.0) = 5.0;
+----
+true
+
+statement ok
+DETACH example;
