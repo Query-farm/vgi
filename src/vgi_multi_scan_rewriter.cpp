@@ -481,6 +481,12 @@ static void RewriteOne(unique_ptr<LogicalOperator> &op, ClientContext &context, 
 		                         marker.table_schema_name);
 	}
 
+	// Snapshot what the post-move log needs: `op` still owns the LogicalGet
+	// whose bind_data is `marker`, and the std::move below frees it — reading
+	// `marker.*` afterward is a use-after-free.
+	const auto branch_count = marker.branches.size();
+	const string marker_schema_name = marker.table_schema_name;
+
 	auto *union_ptr = union_op.get();
 	op = std::move(union_op);
 
@@ -495,8 +501,8 @@ static void RewriteOne(unique_ptr<LogicalOperator> &op, ClientContext &context, 
 	replacer.VisitOperator(root);
 
 	VGI_LOG(context, "vgi.multi_scan_rewriter.fired",
-	    {{"branches", std::to_string(marker.branches.size())},
-	     {"schema", marker.table_schema_name}});
+	    {{"branches", std::to_string(branch_count)},
+	     {"schema", marker_schema_name}});
 }
 
 class VgiMultiScanRewriter : public OptimizerExtension {

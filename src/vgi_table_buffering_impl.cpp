@@ -976,6 +976,14 @@ SourceResultType PhysicalVgiTableBufferingFunction::GetDataInternal(ExecutionCon
 	// Convert the Arrow batch → DuckDB DataChunk via the same helper pair
 	// the streaming InOut path uses (vgi_table_in_out_impl.cpp:306-345).
 	ExportSchema(batch->schema(), lstate.c_schema);
+	// Reset before repopulating: PopulateArrowTableSchema *appends* columns via
+	// ArrowTableSchema::AddColumn, which D_ASSERTs that a column index isn't
+	// added twice. A finalize() stream that returns multiple batches reaches
+	// here once per batch on the same lstate.arrow_table, so without this reset
+	// the second batch re-adds index 0 and aborts debug builds (in release the
+	// assert is compiled out and the duplicate emplace is a silent no-op). The
+	// schema is rebuilt per batch, as documented on the member.
+	lstate.arrow_table = ArrowTableSchema();
 	ArrowTableFunction::PopulateArrowTableSchema(context.client, lstate.arrow_table,
 	                                              lstate.c_schema.arrow_schema);
 
