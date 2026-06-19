@@ -1998,6 +1998,37 @@ static void ConvertCurrentBatch(const VgiTableFunctionBindData &bind_data,
 		idx_t rowid_col = (!bind_data.projection_pushdown && bind_data.rowid_worker_col_index >= 0)
 		                      ? static_cast<idx_t>(bind_data.rowid_worker_col_index)
 		                      : COLUMN_IDENTIFIER_ROW_ID;
+		// Defense in depth: ArrowTableFunction::ArrowToDuckDB dereferences
+		// arrow_array.children[arrow_array_idx] per output column, using the same
+		// projection / rowid-shift mapping replicated below. If the worker emitted
+		// a batch with fewer children than that mapping reaches — a runtime
+		// inconsistency the bind-time schema check in GetScanFunctionImpl didn't
+		// catch (e.g. a worker whose scan-time output disagrees with its own
+		// declared bind output_schema) — core walks off the end of the children
+		// array and the client SIGSEGVs (arrow_conversion.cpp). Bounds-check here
+		// so the failure surfaces as a clear IOException naming the function.
+		const int64_t n_children = local_state.chunk->arrow_array.n_children;
+		for (idx_t idx = 0; idx < output.ColumnCount(); idx++) {
+			idx_t col_idx = local_state.column_ids.empty() ? idx : local_state.column_ids[idx];
+			idx_t arrow_array_idx = bind_data.projection_pushdown ? idx : col_idx;
+			if (rowid_col != COLUMN_IDENTIFIER_ROW_ID) {
+				if (col_idx == COLUMN_IDENTIFIER_ROW_ID) {
+					arrow_array_idx = rowid_col;
+				} else if (col_idx >= rowid_col) {
+					arrow_array_idx += 1;
+				}
+			} else if (col_idx == COLUMN_IDENTIFIER_ROW_ID) {
+				continue; // core skips the rowid column when no rowid index is defined
+			}
+			if (static_cast<int64_t>(arrow_array_idx) >= n_children) {
+				throw IOException(
+				    "VGI function '%s' emitted a batch with %lld column(s) but the scan needs column "
+				    "index %llu; the worker's scan-time output is inconsistent with its declared bind "
+				    "output schema",
+				    bind_data.function_name, static_cast<long long>(n_children),
+				    static_cast<unsigned long long>(arrow_array_idx));
+			}
+		}
 		ArrowTableFunction::ArrowToDuckDB(local_state, bind_data.arrow_table.GetColumns(), output,
 		                                  bind_data.projection_pushdown, rowid_col);
 	}

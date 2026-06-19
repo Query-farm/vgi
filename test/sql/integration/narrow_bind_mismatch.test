@@ -1,0 +1,67 @@
+# name: test/sql/integration/narrow_bind_mismatch.test
+# description: Regression — a VGI worker whose bind output_schema disagrees with
+#   the table's advertised columns must fail closed at bind with a clear
+#   BinderException, NOT segfault the client. The narrow_bind fixture catalog
+#   advertises columns {id, val} for table `mismatch` but its scan function
+#   narrow_scan binds to {id} only. Before the fix this walked off the end of
+#   the worker's 1-column batch in ArrowTableFunction::ArrowToDuckDB (a hard
+#   client SIGSEGV, rc=-11). A consistent table (`consistent`, wide_scan binds
+#   to {id, val}) is the positive control and must keep working.
+# group: [vgi_integration]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'narrow_bind' AS n (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ---------------------------------------------------------------------------
+# The mismatched table must refuse at bind. Every projection shape goes
+# through GetScanFunctionImpl's bind, so all of these error cleanly rather
+# than reaching the scan-time conversion that used to crash.
+# ---------------------------------------------------------------------------
+
+statement error
+SELECT * FROM n.main.mismatch;
+----
+bind output_schema with 1 column(s) but the catalog advertises 2
+
+statement error
+SELECT id FROM n.main.mismatch;
+----
+bind output_schema with 1 column(s) but the catalog advertises 2
+
+statement error
+SELECT id, val FROM n.main.mismatch;
+----
+bind output_schema with 1 column(s) but the catalog advertises 2
+
+statement error
+SELECT count(*) FROM n.main.mismatch;
+----
+bind output_schema with 1 column(s) but the catalog advertises 2
+
+# ---------------------------------------------------------------------------
+# Positive control — a consistent worker (table listing AND bind both
+# advertise {id, val}) must keep working with no regression.
+# ---------------------------------------------------------------------------
+
+query II
+SELECT id, val FROM n.main.consistent ORDER BY id;
+----
+0	10
+1	20
+2	30
+
+query I
+SELECT id FROM n.main.consistent ORDER BY id;
+----
+0
+1
+2
+
+query I
+SELECT count(*) FROM n.main.consistent;
+----
+3

@@ -677,6 +677,59 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 	vector<string> names;
 	vgi::PerformVgiTableFunctionBind(context, *scan_bind_data, return_types, names);
 
+	// Validate the worker's bind output_schema against the catalog's declared
+	// columns. DuckDB plans this catalog table scan from GetColumns() (the
+	// column list advertised via catalog_schema_contents_tables /
+	// catalog_table_get) — that list, not the bind result, fixes the LogicalGet's
+	// column_ids and the output DataChunk shape. The scan then reads worker
+	// batches shaped by the bind output_schema and reconciles them by column id
+	// (ArrowTableFunction::ArrowToDuckDB). If the worker binds *fewer* physical
+	// columns than the catalog exposes, that reconciliation indexes the emitted
+	// batch's children past its end and the client SIGSEGVs on server-supplied
+	// data (arrow_conversion.cpp dereferences arrow_array.children[idx] out of
+	// bounds). Fail closed at bind with a clear error instead.
+	//
+	// Only the *count floor* is an invariant here — the catalog deliberately may
+	// NOT match the bind output one-to-one:
+	//   - Column NAMES may differ: a virtual table renames its scan function's
+	//     output (e.g. ``numbers.value`` backed by ``sequence``'s ``n``).
+	//   - The catalog may expose a SUBSET: it can advertise fewer physical
+	//     columns than the function binds (the extras are simply unused).
+	//   - GENERATED columns inflate LogicalColumnCount but are computed by DuckDB
+	//     from physical columns and never scanned from the worker — so compare
+	//     against PhysicalColumnCount, which excludes them.
+	//   - The ROWID is a virtual column: excluded from GetColumns() (see
+	//     CreateTableInfoFromVgiTable, which filters it out of the ColumnList) and
+	//     already erased from names/return_types in ApplyBindResultToBindData.
+	// So the worker may bind *more* physical columns than the catalog exposes,
+	// but never *fewer* — that's the case that overflows the batch.
+	{
+		// Count the columns the worker is actually responsible for scanning:
+		// every declared column except generated ones (those are computed by
+		// DuckDB from physical columns and never read off the wire). We can't use
+		// ColumnList::PhysicalColumnCount() here — VGI marks generated columns via
+		// SetGeneratedExpression() *after* AddColumn() has already assigned them a
+		// storage oid (CreateTableInfoFromVgiTable), so that count is stale and
+		// still includes them. Test directly with Generated().
+		const auto &decl_columns = GetColumns();
+		idx_t scannable_count = 0;
+		for (auto &col : decl_columns.Logical()) {
+			if (!col.Generated()) {
+				scannable_count++;
+			}
+		}
+		if (names.size() < scannable_count) {
+			throw BinderException(
+			    "VGI worker returned a bind output_schema with %llu column(s) but the catalog "
+			    "advertises %llu for '%s.%s.%s' (function '%s'). The bind output schema must cover "
+			    "every column the table exposes. A mismatch usually means the worker's table listing "
+			    "and its scan bind disagree — e.g. a proxy narrowed one but not the other.",
+			    static_cast<unsigned long long>(names.size()),
+			    static_cast<unsigned long long>(scannable_count),
+			    catalog_.GetName(), ParentSchema().name, name, scan_result.function_name);
+		}
+	}
+
 	// Use inlined cardinality from TableInfo when present, skipping the
 	// per-bind table_function_cardinality RPC. Saves 50–80ms RTT on remote
 	// HTTP transports for read-only / slow-changing tables. Workers opt in
