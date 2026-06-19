@@ -20,11 +20,11 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
 # ============================================================================
 # Function Inventory
-# 59 pure table functions + 9 table-in-out functions = 68 total table-type functions (+1 overload of an existing group = 69)
-# (59 includes the 3 partitioned_*_order fixtures used by order_preservation_modes.test,
+# 60 pure table functions + 9 table-in-out functions = 69 total table-type functions (+1 overload of an existing group = 70)
+# (60 includes the 3 partitioned_*_order fixtures used by order_preservation_modes.test,
 # the tx_cached_value fixture used by the catalog transaction tests, 2 batch_index
 # reference fixtures, 3 deliberately-broken batch_index fixtures used by
-# batch_index_contract.test, 4 partition_columns reference fixtures, 4
+# batch_index_contract.test, 5 partition_columns reference fixtures, 4
 # deliberately-broken partition_columns fixtures used by
 # partition_columns_contract.test, and the dict_filter_echo fixture used by
 # filter_pushdown/dictionary_varchar.test.)
@@ -51,13 +51,15 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 #   table/typed_probe.test)
 # 1 filter-column introspection fixture (filtered_columns_echo, see
 #   table/filtered_columns_pushdown.test)
-# = 94
+# 1 OVERLAPPING_PARTITIONS reference fixture (overlapping_range_partitioned,
+#   see table/partition_columns.test)
+# = 95
 query I
 SELECT COUNT(*)
 FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'table';
 ----
-94
+95
 
 # The 33 pure table functions (no TABLE parameter type)
 # Note: make_series appears 5 times (5 overloads), make_pairs appears 3 times,

@@ -1345,6 +1345,21 @@ InsertionOrderPreservingMap<std::string> InvokeTableFunctionDynamicToString(
 // Enum parsing functions
 // ============================================================================
 
+// Enforce that a wire enum string parsed to a known value. The parser helpers
+// return std::nullopt for unrecognized strings; this turns that into a loud
+// IOException so a worker typo, protocol skew, or newer worker-side enum
+// variant surfaces instead of being silently masked as a default (which would
+// run with behavior inconsistent with what the worker declared).
+template <typename T>
+static T RequireKnownEnum(std::optional<T> parsed, const std::string &raw, const char *field_name,
+                          const std::string &worker_path, const std::string &fn_name) {
+	if (!parsed) {
+		throw IOException("VGI worker '%s' returned unknown %s '%s' for function '%s'", worker_path, field_name, raw,
+		                  fn_name);
+	}
+	return *parsed;
+}
+
 std::optional<VgiFunctionType> ParseVgiFunctionType(const std::string &value) {
 	if (value == "scalar" || value == "SCALAR") {
 		return VgiFunctionType::Scalar;
@@ -2362,30 +2377,31 @@ VgiFunctionInfo ParseFunctionInfo(const std::shared_ptr<arrow::RecordBatch> &bat
 
 	// Parse function_type as enum (required, non-nullable)
 	auto function_type_str = row["function_type"].value_not_null<std::string>();
-	auto function_type = ParseVgiFunctionType(function_type_str);
-	if (!function_type) {
-		throw IOException("VGI worker '%s' returned unknown function_type '%s' for function '%s'", worker_path,
-		                  function_type_str, info.name);
-	}
-	info.function_type = *function_type;
+	info.function_type = RequireKnownEnum(ParseVgiFunctionType(function_type_str), function_type_str, "function_type",
+	                                      worker_path, info.name);
 
 	// Optional string field for description
 	info.description = row["description"].value_or("");
 
-	// Parse optional enum fields (nullable per protocol)
+	// Parse optional enum fields (nullable per protocol). A missing field is
+	// legitimate ("leave default"); a present-but-unrecognized string throws.
 	auto stability_str = row["stability"].as<std::string>();
 	if (stability_str) {
-		info.stability = ParseFunctionStability(*stability_str);
+		info.stability = RequireKnownEnum(ParseFunctionStability(*stability_str), *stability_str, "stability",
+		                                  worker_path, info.name);
 	}
 
 	auto null_handling_str = row["null_handling"].as<std::string>();
 	if (null_handling_str) {
-		info.null_handling = ParseFunctionNullHandling(*null_handling_str);
+		info.null_handling = RequireKnownEnum(ParseFunctionNullHandling(*null_handling_str), *null_handling_str,
+		                                      "null_handling", worker_path, info.name);
 	}
 
 	auto order_preservation_str = row["order_preservation"].as<std::string>();
 	if (order_preservation_str) {
-		info.order_preservation = ParseVgiOrderPreservation(*order_preservation_str);
+		info.order_preservation = RequireKnownEnum(ParseVgiOrderPreservation(*order_preservation_str),
+		                                           *order_preservation_str, "order_preservation", worker_path,
+		                                           info.name);
 	}
 
 	// Documentation fields
@@ -2465,18 +2481,20 @@ VgiFunctionInfo ParseFunctionInfo(const std::shared_ptr<arrow::RecordBatch> &bat
 	// value so the planner can pick PhysicalPartitionedAggregate for
 	// matching GROUP BY queries. Only ``SINGLE_VALUE_PARTITIONS``
 	// materially affects planner behavior today.
+	// .value_or() supplies a valid default when the field is absent, so any
+	// parse failure here is a genuinely unrecognized non-empty wire string.
 	auto partition_kind_str = row["partition_kind"].value_or(std::string {"NOT_PARTITIONED"});
-	info.partition_kind =
-	    ParseVgiPartitionKind(partition_kind_str).value_or(VgiPartitionKind::NotPartitioned);
+	info.partition_kind = RequireKnownEnum(ParseVgiPartitionKind(partition_kind_str), partition_kind_str,
+	                                       "partition_kind", worker_path, info.name);
 
 	// Aggregate function fields (non-nullable with defaults)
 	auto order_dependent_str = row["order_dependent"].value_or(std::string {"NOT_ORDER_DEPENDENT"});
-	auto order_dependent = ParseAggregateOrderDependent(order_dependent_str);
-	info.order_dependent = order_dependent.value_or(AggregateOrderDependent::NOT_ORDER_DEPENDENT);
+	info.order_dependent = RequireKnownEnum(ParseAggregateOrderDependent(order_dependent_str), order_dependent_str,
+	                                        "order_dependent", worker_path, info.name);
 
 	auto distinct_dependent_str = row["distinct_dependent"].value_or(std::string {"NOT_DISTINCT_DEPENDENT"});
-	auto distinct_dependent = ParseAggregateDistinctDependent(distinct_dependent_str);
-	info.distinct_dependent = distinct_dependent.value_or(AggregateDistinctDependent::NOT_DISTINCT_DEPENDENT);
+	info.distinct_dependent = RequireKnownEnum(ParseAggregateDistinctDependent(distinct_dependent_str),
+	                                           distinct_dependent_str, "distinct_dependent", worker_path, info.name);
 
 	// supports_window — optional bool (defaults to false for older workers).
 	info.supports_window = row["supports_window"].value_or(false);

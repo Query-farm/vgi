@@ -158,6 +158,25 @@ SELECT COUNT(*) FROM example.disjoint_range_partitioned(5);
 50
 
 # ============================================================================
+# OVERLAPPING fallback — DuckDB has no consumer for OVERLAPPING_PARTITIONS
+# today either, so GROUP BY falls back to HASH_GROUP_BY. This is the only
+# fixture that emits OVERLAPPING_PARTITIONS; the assertions below keep the wire
+# enum exercised (the C++ parser now rejects unknown enum values, so simply
+# running this proves OVERLAPPING_PARTITIONS parsed end-to-end).
+# ============================================================================
+
+query II
+EXPLAIN SELECT key, SUM(value)
+FROM example.overlapping_range_partitioned(3) GROUP BY key;
+----
+physical_plan	<REGEX>:.*HASH_GROUP_BY.*
+
+query I
+SELECT COUNT(*) FROM example.overlapping_range_partitioned(5);
+----
+50
+
+# ============================================================================
 # Filter pushdown on the partition column
 # ============================================================================
 

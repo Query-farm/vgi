@@ -25,7 +25,7 @@ SELECT COUNT(*)
 FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'scalar';
 ----
-41
+42
 
 query T
 SELECT function_name
@@ -58,6 +58,7 @@ null_handling
 pair_type
 pair_type
 pair_type
+query_seed
 random_bytes
 random_int
 return_secret_value
@@ -384,11 +385,14 @@ SELECT COUNT(*)
 FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'scalar' AND varargs IS NULL;
 ----
-35
+36
 
 # ============================================================================
 # Stability
-# Most scalar functions are CONSISTENT; bernoulli and random_int are VOLATILE
+# Most scalar functions are CONSISTENT; bernoulli and random_int are VOLATILE;
+# query_seed is CONSISTENT_WITHIN_QUERY. All three stability variants are
+# emitted by a fixture so the wire enum stays covered (and other-language
+# workers must specify it).
 # ============================================================================
 
 query T
@@ -406,6 +410,14 @@ FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'scalar' AND stability = 'CONSISTENT';
 ----
 39
+
+query T
+SELECT function_name
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_type = 'scalar' AND stability = 'CONSISTENT_WITHIN_QUERY'
+ORDER BY function_name;
+----
+query_seed
 
 # ============================================================================
 # Cleanup

@@ -23,6 +23,10 @@ VGI_ATTACH_OPTIONS_WORKER ?= uv run --project $(HOME)/Development/vgi-python vgi
 # test/sql/integration/protocol_version/version_mismatch.test.
 VGI_BAD_PROTOCOL_WORKER ?= uv run --project $(HOME)/Development/vgi-python vgi-fixture-bad-protocol-worker
 
+# Worker that advertises an unrecognized null_handling enum value ("WEIRD") for
+# one scalar function, to drive test/sql/integration/bad_enum.test.
+VGI_BAD_ENUM_WORKER ?= uv run --project $(HOME)/Development/vgi-python vgi-fixture-bad-enum-worker
+
 # Minimal SQLite-backed writable fixture: exercises the INSERT/UPDATE/DELETE wire
 # path without requiring duckdb-python's subcursor() (which the production
 # writable fixture uses). Skips real transactional semantics; tests under
@@ -70,6 +74,7 @@ test_shm:
 	VGI_VERSIONED_TABLES_WORKER="$(VGI_VERSIONED_TABLES_WORKER)" \
 	VGI_ATTACH_OPTIONS_WORKER="$(VGI_ATTACH_OPTIONS_WORKER)" \
 	VGI_BAD_PROTOCOL_WORKER="$(VGI_BAD_PROTOCOL_WORKER)" \
+	VGI_BAD_ENUM_WORKER="$(VGI_BAD_ENUM_WORKER)" \
 	VGI_SIMPLE_WRITABLE_WORKER="$(VGI_SIMPLE_WRITABLE_WORKER)" \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
 	VGI_TEST_DEDICATED_WORKER=1 \
@@ -83,6 +88,7 @@ test_shm_debug:
 	VGI_VERSIONED_TABLES_WORKER="$(VGI_VERSIONED_TABLES_WORKER)" \
 	VGI_ATTACH_OPTIONS_WORKER="$(VGI_ATTACH_OPTIONS_WORKER)" \
 	VGI_BAD_PROTOCOL_WORKER="$(VGI_BAD_PROTOCOL_WORKER)" \
+	VGI_BAD_ENUM_WORKER="$(VGI_BAD_ENUM_WORKER)" \
 	VGI_SIMPLE_WRITABLE_WORKER="$(VGI_SIMPLE_WRITABLE_WORKER)" \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
 	VGI_TEST_DEDICATED_WORKER=1 \
@@ -99,6 +105,7 @@ test_subprocess:
 	VGI_VERSIONED_TABLES_WORKER="$(VGI_VERSIONED_TABLES_WORKER)" \
 	VGI_ATTACH_OPTIONS_WORKER="$(VGI_ATTACH_OPTIONS_WORKER)" \
 	VGI_BAD_PROTOCOL_WORKER="$(VGI_BAD_PROTOCOL_WORKER)" \
+	VGI_BAD_ENUM_WORKER="$(VGI_BAD_ENUM_WORKER)" \
 	VGI_SIMPLE_WRITABLE_WORKER="$(VGI_SIMPLE_WRITABLE_WORKER)" \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
 	VGI_TEST_DEDICATED_WORKER=1 \
@@ -111,6 +118,7 @@ test_subprocess_debug:
 	VGI_VERSIONED_TABLES_WORKER="$(VGI_VERSIONED_TABLES_WORKER)" \
 	VGI_ATTACH_OPTIONS_WORKER="$(VGI_ATTACH_OPTIONS_WORKER)" \
 	VGI_BAD_PROTOCOL_WORKER="$(VGI_BAD_PROTOCOL_WORKER)" \
+	VGI_BAD_ENUM_WORKER="$(VGI_BAD_ENUM_WORKER)" \
 	VGI_SIMPLE_WRITABLE_WORKER="$(VGI_SIMPLE_WRITABLE_WORKER)" \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
 	VGI_TEST_DEDICATED_WORKER=1 \
@@ -143,6 +151,7 @@ test_launcher:
 	VGI_VERSIONED_TABLES_WORKER="launch:$(VGI_VERSIONED_TABLES_WORKER)" \
 	VGI_ATTACH_OPTIONS_WORKER="launch:$(VGI_ATTACH_OPTIONS_WORKER)" \
 	VGI_BAD_PROTOCOL_WORKER="launch:$(VGI_BAD_PROTOCOL_WORKER)" \
+	VGI_BAD_ENUM_WORKER="launch:$(VGI_BAD_ENUM_WORKER)" \
 	VGI_SIMPLE_WRITABLE_WORKER="launch:$(VGI_SIMPLE_WRITABLE_WORKER)" \
 	VGI_REQUIRE_LAUNCHER_TRANSPORT=1 \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
@@ -158,6 +167,7 @@ test_launcher_debug:
 	VGI_VERSIONED_TABLES_WORKER="launch:$(VGI_VERSIONED_TABLES_WORKER)" \
 	VGI_ATTACH_OPTIONS_WORKER="launch:$(VGI_ATTACH_OPTIONS_WORKER)" \
 	VGI_BAD_PROTOCOL_WORKER="launch:$(VGI_BAD_PROTOCOL_WORKER)" \
+	VGI_BAD_ENUM_WORKER="launch:$(VGI_BAD_ENUM_WORKER)" \
 	VGI_SIMPLE_WRITABLE_WORKER="launch:$(VGI_SIMPLE_WRITABLE_WORKER)" \
 	VGI_REQUIRE_LAUNCHER_TRANSPORT=1 \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
@@ -192,6 +202,7 @@ test_launcher_cloudflare_do:
 	VGI_VERSIONED_TABLES_WORKER="launch:$(VGI_VERSIONED_TABLES_WORKER)" \
 	VGI_ATTACH_OPTIONS_WORKER="launch:$(VGI_ATTACH_OPTIONS_WORKER)" \
 	VGI_BAD_PROTOCOL_WORKER="launch:$(VGI_BAD_PROTOCOL_WORKER)" \
+	VGI_BAD_ENUM_WORKER="launch:$(VGI_BAD_ENUM_WORKER)" \
 	VGI_SIMPLE_WRITABLE_WORKER="launch:$(VGI_SIMPLE_WRITABLE_WORKER)" \
 	VGI_REQUIRE_LAUNCHER_TRANSPORT=1 \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
@@ -214,6 +225,7 @@ test_launcher_cloudflare_do_debug:
 	VGI_VERSIONED_TABLES_WORKER="launch:$(VGI_VERSIONED_TABLES_WORKER)" \
 	VGI_ATTACH_OPTIONS_WORKER="launch:$(VGI_ATTACH_OPTIONS_WORKER)" \
 	VGI_BAD_PROTOCOL_WORKER="launch:$(VGI_BAD_PROTOCOL_WORKER)" \
+	VGI_BAD_ENUM_WORKER="launch:$(VGI_BAD_ENUM_WORKER)" \
 	VGI_SIMPLE_WRITABLE_WORKER="launch:$(VGI_SIMPLE_WRITABLE_WORKER)" \
 	VGI_REQUIRE_LAUNCHER_TRANSPORT=1 \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \

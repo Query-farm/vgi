@@ -1,0 +1,35 @@
+# name: test/sql/integration/bad_enum.test
+# description: An unrecognized wire enum value is fatal at catalog-metadata parse time
+# group: [vgi_integration]
+
+# The fixture worker advertises an unrecognized null_handling enum value
+# ("WEIRD") for its `double` scalar function. The C++ catalog-metadata parser
+# (ParseFunctionInfo in src/vgi_catalog_api.cpp) must reject any enum string it
+# does not recognize with a loud IOException rather than silently defaulting —
+# a silent fallback would run with behavior inconsistent with what the worker
+# declared. This guards the cross-language enum contract for every wire enum
+# (null_handling, stability, order_preservation, partition_kind,
+# order_dependent, distinct_dependent), matching the existing function_type
+# behavior.
+#
+# Provisioned via the VGI_BAD_ENUM_WORKER fixture (vgi-fixture-bad-enum-worker)
+# — see vgi-python/vgi/_test_fixtures/bad_enum.py.
+
+require-env VGI_BAD_ENUM_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS badenum (TYPE vgi, LOCATION '${VGI_BAD_ENUM_WORKER}');
+
+# Binding the `double` scalar forces its FunctionInfo (with the bogus
+# null_handling) onto the parse path, which must throw.
+statement error
+SELECT badenum.double(1);
+----
+unknown null_handling 'WEIRD'
+
+statement ok
+DETACH badenum;
