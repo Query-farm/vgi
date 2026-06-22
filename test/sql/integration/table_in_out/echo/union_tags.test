@@ -1,0 +1,173 @@
+# name: test/sql/integration/table_in_out/echo/union_tags.test
+# description: Explicit union discriminator-tag coverage for the echo round-trip.
+#              all_types.test and nested_type_combinations.test only validate
+#              unions via EXCEPT whole-value set-difference, which checks the tag
+#              only implicitly (and set semantics ignore row order / duplicates).
+#              These tests pin the discriminator explicitly with union_tag() and
+#              union_extract(), row-ordered, so a tag/value demux bug that happens
+#              to reproduce an existing value cannot slip through. Also covers
+#              large-arity unions (tag-index stability across many members) and
+#              NULL-inside-variant-payload vs fully-NULL union row.
+# group: [vgi_integration_table_in_out_echo]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+SET arrow_lossless_conversion = true;
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# Discriminator tag preserved per row, in order (not just as a set)
+# ============================================================================
+
+query I
+SELECT union_tag(u) FROM example.echo((
+    SELECT * FROM (VALUES
+        (1, union_value(num := 10)::UNION(num INT, str VARCHAR)),
+        (2, union_value(str := 'a')::UNION(num INT, str VARCHAR)),
+        (3, union_value(num := 30)::UNION(num INT, str VARCHAR)),
+        (4, union_value(str := 'b')::UNION(num INT, str VARCHAR))
+    ) t(idx, u)
+)) ORDER BY idx;
+----
+num
+str
+num
+str
+
+# union_extract demuxes to the active member; the inactive member reads NULL.
+# This pins the payload to the tag (a swapped tag would surface as a non-NULL
+# value in the wrong column).
+query II
+SELECT union_extract(u, 'num') AS n, union_extract(u, 'str') AS s
+FROM example.echo((
+    SELECT * FROM (VALUES
+        (1, union_value(num := 10)::UNION(num INT, str VARCHAR)),
+        (2, union_value(str := 'a')::UNION(num INT, str VARCHAR)),
+        (3, union_value(num := 30)::UNION(num INT, str VARCHAR)),
+        (4, union_value(str := 'b')::UNION(num INT, str VARCHAR))
+    ) t(idx, u)
+)) ORDER BY idx;
+----
+10
+NULL
+NULL
+a
+30
+NULL
+NULL
+b
+
+# ============================================================================
+# Large-arity union — tag-index stability across many members (max in the
+# other files is 3). Each row selects a distinct member m0..m9.
+# ============================================================================
+
+query I
+SELECT union_tag(u) FROM example.echo((
+    SELECT * FROM (VALUES
+        (0, union_value(m0 := 0)::UNION(m0 INT, m1 INT, m2 INT, m3 INT, m4 INT, m5 INT, m6 INT, m7 INT, m8 INT, m9 INT)),
+        (1, union_value(m1 := 1)),
+        (2, union_value(m2 := 2)),
+        (3, union_value(m3 := 3)),
+        (4, union_value(m4 := 4)),
+        (5, union_value(m5 := 5)),
+        (6, union_value(m6 := 6)),
+        (7, union_value(m7 := 7)),
+        (8, union_value(m8 := 8)),
+        (9, union_value(m9 := 9))
+    ) t(idx, u)
+)) ORDER BY idx;
+----
+m0
+m1
+m2
+m3
+m4
+m5
+m6
+m7
+m8
+m9
+
+# the extracted payload matches the member index for every row (union_extract
+# requires a constant key, so coalesce over every member — only the active one
+# is non-NULL).
+query I
+SELECT coalesce(
+    union_extract(u, 'm0'), union_extract(u, 'm1'), union_extract(u, 'm2'),
+    union_extract(u, 'm3'), union_extract(u, 'm4'), union_extract(u, 'm5'),
+    union_extract(u, 'm6'), union_extract(u, 'm7'), union_extract(u, 'm8'),
+    union_extract(u, 'm9')
+) FROM example.echo((
+    SELECT * FROM (VALUES
+        (0, union_value(m0 := 0)::UNION(m0 INT, m1 INT, m2 INT, m3 INT, m4 INT, m5 INT, m6 INT, m7 INT, m8 INT, m9 INT)),
+        (1, union_value(m1 := 1)),
+        (2, union_value(m2 := 2)),
+        (3, union_value(m3 := 3)),
+        (4, union_value(m4 := 4)),
+        (5, union_value(m5 := 5)),
+        (6, union_value(m6 := 6)),
+        (7, union_value(m7 := 7)),
+        (8, union_value(m8 := 8)),
+        (9, union_value(m9 := 9))
+    ) t(idx, u)
+)) ORDER BY idx;
+----
+0
+1
+2
+3
+4
+5
+6
+7
+8
+9
+
+# ============================================================================
+# NULL-inside-variant-payload (tag set, value NULL) vs fully-NULL union row.
+#
+# Before the round-trip these are distinct: row 1 has tag `num` with a NULL
+# payload (the union itself is NOT NULL); row 2 is a NULL union (tag NULL, union
+# IS NULL). They are NOT distinct after the echo round-trip: a union slot whose
+# active member value is NULL collapses to a fully-NULL union (tag NULL, IS NULL
+# true). Arrow represents a null union slot with type code 0 and cannot carry a
+# live discriminator over a NULL payload, so the tag is lost in transit. This
+# query therefore pins the OBSERVED collapse (row 1 comes back identical to row
+# 2) as a regression guard — if a future Arrow/DuckDB change preserves the tag
+# across a NULL payload, update row 1's expected output to `num / NULL / false`.
+# ============================================================================
+
+query III
+SELECT union_tag(u) AS tag, union_extract(u, 'num') AS n, u IS NULL AS is_null
+FROM example.echo((
+    SELECT * FROM (VALUES
+        (1, union_value(num := NULL::INT)::UNION(num INT, str VARCHAR)),
+        (2, NULL::UNION(num INT, str VARCHAR)),
+        (3, union_value(num := 5)::UNION(num INT, str VARCHAR))
+    ) t(idx, u)
+)) ORDER BY idx;
+----
+NULL
+NULL
+true
+NULL
+NULL
+true
+num
+5
+false
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;
