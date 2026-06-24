@@ -91,3 +91,39 @@ query II
 EXPLAIN ANALYZE SELECT count(*) FROM example.profiling_demo(10000);
 ----
 analyzed_plan	<REGEX>:.*rows_produced: 10000.*
+
+# ============================================================================
+# 6. Bounded-batch streaming: a large scan emits its rows in many bounded
+#    batches, never a single mega-batch. profiling_demo's batches_emitted is
+#    a worker-side count of out.emit() calls, so it directly witnesses that
+#    the worker chunks output by batch_size rather than materialising the
+#    whole result in memory. ceil(count / batch_size) batches, exactly.
+#
+#    batch_size is pinned explicitly in both queries below: the DEFAULT
+#    batch_size is NOT part of the cross-language worker contract (Python/Go
+#    default to 1000, Java to 1024, Rust/TypeScript to 2048), so asserting a
+#    batch-count value against the default would only hold for some workers.
+#    Pinning batch_size makes the count well-defined for every implementation.
+#    The two row-counts below are exact multiples of their batch_size, so the
+#    count is unambiguous (no partial final batch to round).
+#
+#    profiling_demo is @init_single_worker, so the count is stable regardless
+#    of `threads`. Transport-agnostic: identical over subprocess and HTTP
+#    (HTTP just pays a round-trip per batch — same batch count, more latency).
+# ============================================================================
+
+statement ok
+SET threads=1;
+
+# 1,000,000 rows in batches of 1000 = 1000 batches (not one mega-batch).
+query II
+EXPLAIN ANALYZE SELECT count(*) FROM example.profiling_demo(1000000, batch_size := 1000);
+----
+analyzed_plan	<REGEX>:.*batches_emitted: 1000\b.*
+
+# Same row count, larger batch_size: the batch count tracks ceil(count /
+# batch_size) = 4, proving the chunking is genuine, not coincidental.
+query II
+EXPLAIN ANALYZE SELECT count(*) FROM example.profiling_demo(1000000, batch_size := 250000);
+----
+analyzed_plan	<REGEX>:.*batches_emitted: 4\b.*
