@@ -189,6 +189,17 @@ void VgiScalarFunctionSet::LoadEntries(ClientContext &context, const std::lock_g
 		auto function_entry = make_uniq_base<StandardEntry, ScalarFunctionCatalogEntry>(
 		    catalog_, schema_, info.Cast<CreateScalarFunctionInfo>());
 
+		// DuckDB's FunctionEntry constructor does not copy comment/tags from the
+		// CreateInfo the way schema/table/view/macro entries do, so the worker's
+		// tags must be set on the constructed entry directly — otherwise they
+		// never reach duckdb_functions().tags. Tags are an entry-level concept
+		// (not per-overload), so union them across overloads.
+		for (const auto &func_info : pair.second) {
+			for (const auto &[key, val] : func_info.tags) {
+				function_entry->tags[key] = val;
+			}
+		}
+
 		{ std::lock_guard<std::mutex> __entry_lk(entry_lock_); CreateEntryLocked(std::move(function_entry)); }
 	}
 }

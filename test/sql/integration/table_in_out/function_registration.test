@@ -206,6 +206,21 @@ WHERE database_name = 'example' AND function_name = 'sum_all_columns';
 sum_all_columns	[aggregation, numeric]
 
 # ============================================================================
+# Tags
+# Worker-supplied Meta.tags must surface through duckdb_functions().tags.
+# DuckDB's FunctionEntry ctor does not copy comment/tags from the CreateInfo
+# (unlike schema/table/view/macro entries), so the VGI function-set builders
+# set them on the constructed entry directly — without that these are empty.
+# ============================================================================
+
+query TT
+SELECT map_extract(tags, 'category')[1], map_extract(tags, 'type')[1]
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_name = 'echo';
+----
+debug	passthrough
+
+# ============================================================================
 # No varargs
 # None of the table-in-out functions use varargs
 # ============================================================================
