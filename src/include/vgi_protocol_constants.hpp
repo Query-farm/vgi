@@ -62,6 +62,14 @@ constexpr const char *VGI_CONST_METADATA_KEY = "vgi_const";
 constexpr const char *VGI_CONST_TRUE_VALUE = "true";
 
 // ----------------------------------------------------------------------------
+// Per-Argument Documentation Metadata
+// ----------------------------------------------------------------------------
+// Arrow field metadata key carrying a per-argument description (UTF-8 text).
+// Presence-only: absent when an argument has no doc. The `vgi_doc_*` prefix is
+// reserved for future per-argument doc variants.
+constexpr const char *VGI_DOC_METADATA_KEY = "vgi_doc";
+
+// ----------------------------------------------------------------------------
 // Row ID Metadata
 // ----------------------------------------------------------------------------
 // Arrow field metadata key indicating the field is the table's row identifier.

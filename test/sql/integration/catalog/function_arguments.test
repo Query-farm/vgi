@@ -1,0 +1,49 @@
+# name: test/sql/integration/catalog/function_arguments.test
+# description: vgi_function_arguments() surfaces per-argument metadata that
+#   duckdb_functions() flattens away — named/positional/const/varargs/type —
+#   plus the per-argument description (vgi_doc field metadata). Anchored on the
+#   example worker's `multiply` (value positional non-const + factor positional
+#   const, both documented) and `double` (AnyArrow value).
+# group: [vgi_integration]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# multiply: const fidelity + per-argument docs (cast bools to text for stable
+# sqllogictest column typing).
+query TTTTT
+SELECT arg_name, arg_type, is_positional::VARCHAR, is_const::VARCHAR, arg_description
+FROM vgi_function_arguments()
+WHERE catalog_name = 'example' AND function_name = 'multiply'
+ORDER BY arg_position;
+----
+value	BIGINT	true	false	Integer value to multiply
+factor	BIGINT	true	true	Multiplication factor
+
+# double: AnyArrow argument surfaces as is_any_type with arg_type ANY.
+query TTT
+SELECT arg_name, arg_type, is_any_type::VARCHAR
+FROM vgi_function_arguments()
+WHERE catalog_name = 'example' AND function_name = 'double'
+ORDER BY arg_position;
+----
+value	ANY	true
+
+# Scoping by WHERE works and a non-existent catalog yields no rows.
+query I
+SELECT count(*) FROM vgi_function_arguments() WHERE catalog_name = 'does_not_exist';
+----
+0
+
+# The function returns rows for the example catalog and at least some are
+# documented (vgi_doc surfaced as arg_description).
+query II
+SELECT (count(*) > 0)::INT, (count(arg_description) > 0)::INT
+FROM vgi_function_arguments()
+WHERE catalog_name = 'example';
+----
+1	1

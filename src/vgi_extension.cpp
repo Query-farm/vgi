@@ -78,6 +78,7 @@
 #include "vgi_worker_pool.hpp"
 #include "vgi_table_statistics_function.hpp"
 #include "vgi_table_branches_function.hpp"
+#include "vgi_function_arguments_function.hpp"
 #include "vgi_clear_cache.hpp"
 #include "vgi_worker_pool_functions.hpp"
 
@@ -2398,6 +2399,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// Register multi-branch diagnostic function — one row per branch per
 	// VGI table, across every attached VGI catalog. See vgi_table_branches_function.cpp.
 	vgi::RegisterVgiTableBranchesFunction(loader);
+
+	// Register per-argument diagnostic function — one row per (catalog, schema,
+	// function, argument) with named/positional/const/varargs/type + vgi_doc.
+	vgi::RegisterVgiFunctionArgumentsFunction(loader);
 
 	// Register OAuth diagnostic/management functions
 	{
