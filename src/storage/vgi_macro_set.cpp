@@ -138,6 +138,17 @@ void VgiMacroSet::LoadEntries(ClientContext &context, const std::lock_guard<std:
 			info.name = macro_info.name;
 			info.schema = schema_.name;
 			info.internal = true;
+			// Propagate the worker's object-level metadata so it reaches
+			// duckdb_functions().comment / .tags (the macro entry constructor
+			// copies comment/tags from the CreateInfo, unlike FunctionEntry).
+			// Without this, macros surface with NULL comment + empty tags and
+			// fail the metadata linter even when the worker supplies them.
+			if (!macro_info.comment.empty()) {
+				info.comment = Value(macro_info.comment);
+			}
+			for (const auto &[key, val] : macro_info.tags) {
+				info.tags[key] = val;
+			}
 			info.macros.push_back(std::move(macro_func));
 
 			unique_ptr<CatalogEntry> entry;
