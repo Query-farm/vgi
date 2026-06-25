@@ -1,11 +1,11 @@
 # name: test/sql/integration/catalog/function_arguments.test
 # description: vgi_function_arguments() surfaces per-argument metadata that
-#   duckdb_functions() flattens away — named/positional/const/varargs/type.
-#   Anchored on the example worker's `multiply` (value positional non-const +
-#   factor positional const) and `double` (AnyArrow value). The per-argument
-#   description (vgi_doc) plumbing is exercised by each SDK's unit round-trip
-#   tests; it is intentionally NOT asserted here because the example workers do
-#   not uniformly document their arguments, so the value would vary per worker.
+#   duckdb_functions() flattens away — named/positional/const/varargs/type —
+#   plus the per-argument description (vgi_doc field metadata). Anchored on the
+#   example worker's `multiply`, whose argument docs and const-ness are
+#   standardized across all SDK example workers (value: documented columnar
+#   parameter; factor: documented const parameter) so this is a real cross-SDK
+#   contract — and on `double` (AnyArrow value).
 # group: [vgi_integration]
 
 require-env VGI_TEST_WORKER
@@ -15,17 +15,19 @@ require vgi
 statement ok
 ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
-# multiply: const fidelity duckdb_functions() can't show — factor is a const
-# parameter (resolved at bind), value is a regular columnar parameter. Both
-# positional. (Cast bools to text for stable sqllogictest column typing.)
-query TTTT
-SELECT arg_name, arg_type, is_positional::VARCHAR, is_const::VARCHAR
+# multiply: const fidelity duckdb_functions() can't show (factor is a const
+# parameter, value is a regular columnar parameter — both positional and both
+# documented) plus the per-argument descriptions. This is exactly the detail an
+# LLM needs to call the function: which arg is constant, and what each means.
+# (Cast bools to text for stable sqllogictest column typing.)
+query TTTTT
+SELECT arg_name, arg_type, is_positional::VARCHAR, is_const::VARCHAR, arg_description
 FROM vgi_function_arguments()
 WHERE catalog_name = 'example' AND function_name = 'multiply'
 ORDER BY arg_position;
 ----
-value	BIGINT	true	false
-factor	BIGINT	true	true
+value	BIGINT	true	false	Integer value to multiply
+factor	BIGINT	true	true	Multiplication factor
 
 # double: AnyArrow argument surfaces as is_any_type with arg_type ANY.
 query TTT
@@ -43,13 +45,14 @@ WHERE catalog_name = 'example' AND is_positional AND is_named;
 ----
 0
 
-# The arg_description column is queryable across every row regardless of
-# whether the worker documents the argument (NULL when undocumented).
-query I
-SELECT (count(*) > 0)::INT FROM vgi_function_arguments()
+# The function returns rows for the example catalog and at least some carry a
+# description (vgi_doc surfaced as arg_description).
+query II
+SELECT (count(*) > 0)::INT, (count(arg_description) > 0)::INT
+FROM vgi_function_arguments()
 WHERE catalog_name = 'example';
 ----
-1
+1	1
 
 # Scoping by WHERE works and a non-existent catalog yields no rows.
 query I
