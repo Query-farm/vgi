@@ -4,7 +4,7 @@
 #include "duckdb/common/types.hpp"
 #include "duckdb/catalog/entry_lookup_info.hpp"
 #include "storage/vgi_catalog_set.hpp"
-#include "vgi_catalog_api.hpp"
+#include "vgi_catalog_metadata.hpp"
 
 namespace duckdb {
 

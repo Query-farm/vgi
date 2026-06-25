@@ -9,7 +9,7 @@
 #include "storage/vgi_catalog.hpp"
 #include "storage/vgi_schema_entry.hpp"
 #include "storage/vgi_transaction.hpp"
-#include "vgi_catalog_api.hpp"
+#include "vgi_catalog_rpc.hpp"
 
 namespace duckdb {
 

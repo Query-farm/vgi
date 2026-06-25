@@ -18,7 +18,7 @@
 #include "storage/vgi_catalog.hpp"
 #include "storage/vgi_table_entry.hpp"
 #include "vgi_arrow_utils.hpp"
-#include "vgi_catalog_api.hpp"
+#include "vgi_catalog_metadata.hpp"
 #include "vgi_ifunction_connection.hpp"
 
 namespace duckdb {

@@ -9,7 +9,7 @@
 #include "storage/vgi_table_function_set.hpp"
 #include "storage/vgi_table_set.hpp"
 #include "storage/vgi_view_set.hpp"
-#include "vgi_catalog_api.hpp"
+#include "vgi_catalog_metadata.hpp"
 
 namespace duckdb {
 

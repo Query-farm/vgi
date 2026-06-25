@@ -16,7 +16,7 @@
 #include "vgi_aggregate_function_impl.hpp"
 #include "vgi_aggregate_window_impl.hpp"
 #include "vgi_arrow_utils.hpp"
-#include "vgi_catalog_api.hpp"
+#include "vgi_catalog_rpc.hpp"
 #include "vgi_logging.hpp"
 
 namespace duckdb {

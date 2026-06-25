@@ -10,7 +10,7 @@
 #include "duckdb/planner/operator/logical_insert.hpp"
 #include "duckdb/planner/operator/logical_update.hpp"
 #include "storage/vgi_transaction.hpp"
-#include "vgi_catalog_api.hpp"
+#include "vgi_catalog_rpc.hpp"
 #include "vgi_function_connection.hpp"
 #include "vgi_logging.hpp"
 #include "vgi_rpc_types.hpp"

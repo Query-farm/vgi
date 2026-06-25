@@ -3,7 +3,7 @@
 #include "vgi_arrow_utils.hpp"
 #include "vgi_client_timing.hpp"
 #include "vgi_cancel_dispatcher.hpp"
-#include "vgi_catalog_api.hpp"
+#include "vgi_catalog_metadata.hpp"
 #include "vgi_function_connection.hpp"
 #include "vgi_ifunction_connection.hpp"
 #include "vgi_logging.hpp"

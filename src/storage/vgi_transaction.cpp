@@ -2,7 +2,7 @@
 #include "storage/vgi_transaction.hpp"
 
 #include "storage/vgi_catalog.hpp"
-#include "vgi_catalog_api.hpp"
+#include "vgi_catalog_rpc.hpp"
 
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/client_context.hpp"

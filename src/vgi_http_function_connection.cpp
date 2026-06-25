@@ -11,13 +11,14 @@
 #include "vgi_arrow_utils.hpp"
 #include "vgi_bind_protocol.hpp"
 #include "vgi_table_buffering_builders.hpp"
-#include "vgi_catalog_api.hpp"
+#include "vgi_catalog_metadata.hpp"
 #include "generated/vgi_protocol_constants.hpp"
 #include "vgi_exception.hpp"
 #include "vgi_http_client.hpp"
 #include "vgi_logging.hpp"
 #include "vgi_rpc_client.hpp"
 #include "vgi_rpc_types.hpp"
+#include "vgi_protocol.hpp" // BindResult
 #include "generated/vgi_request_builders.hpp"
 
 namespace duckdb {

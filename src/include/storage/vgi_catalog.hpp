@@ -10,7 +10,7 @@
 
 #include "storage/vgi_object_counts.hpp"
 #include "storage/vgi_schema_set.hpp"
-#include "vgi_catalog_api.hpp"
+#include "vgi_catalog_metadata.hpp"
 
 namespace duckdb {
 

@@ -10,7 +10,7 @@
 #include "storage/vgi_table_entry.hpp"
 #include "vgi_bind_protocol.hpp"
 #include "vgi_cancel_dispatcher.hpp"
-#include "vgi_catalog_api.hpp"
+#include "vgi_catalog_rpc.hpp"
 #include "vgi_exception.hpp"
 #include "vgi_extension.hpp"
 #include "vgi_logging.hpp"

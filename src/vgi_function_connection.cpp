@@ -8,7 +8,7 @@
 #include "vgi_arrow_ipc.hpp"
 #include "vgi_bind_protocol.hpp"
 #include "vgi_table_buffering_builders.hpp"
-#include "vgi_catalog_api.hpp"
+#include "vgi_catalog_metadata.hpp"
 #include "generated/vgi_protocol_constants.hpp"
 #include "vgi_exception.hpp"
 #include "vgi_http_function_connection.hpp"

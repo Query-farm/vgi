@@ -14,7 +14,7 @@
 #include "storage/vgi_schema_entry.hpp"
 #include "storage/vgi_transaction.hpp"
 #include "vgi_arrow_utils.hpp"
-#include "vgi_catalog_api.hpp"
+#include "vgi_catalog_rpc.hpp"
 #include "vgi_scalar_function_impl.hpp"
 #include "vgi_worker_pool.hpp"
 

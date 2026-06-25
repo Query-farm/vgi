@@ -11,7 +11,7 @@
 #include "storage/vgi_catalog.hpp"
 #include "storage/vgi_transaction.hpp"
 #include "storage/vgi_schema_entry.hpp"
-#include "vgi_catalog_api.hpp"
+#include "vgi_catalog_rpc.hpp"
 #include "vgi_logging.hpp"
 
 namespace duckdb {

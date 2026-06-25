@@ -29,7 +29,7 @@
 #include "duckdb/main/config.hpp"
 #include "duckdb/optimizer/optimizer_extension.hpp"
 
-#include "vgi_catalog_api.hpp"
+#include "vgi_catalog_metadata.hpp"
 
 namespace duckdb {
 

@@ -3,7 +3,7 @@
 
 #include "duckdb/common/exception.hpp"
 #include "vgi_arrow_utils.hpp"
-#include "vgi_catalog_api.hpp"
+#include "vgi_catalog_rpc.hpp"
 #include "vgi_rpc_types.hpp"
 
 namespace duckdb {

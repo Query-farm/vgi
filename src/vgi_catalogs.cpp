@@ -1,6 +1,6 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "vgi_catalogs.hpp"
-#include "vgi_catalog_api.hpp"
+#include "vgi_catalog_rpc.hpp"
 #include "vgi_logging.hpp"
 #include "vgi_transport.hpp"
 

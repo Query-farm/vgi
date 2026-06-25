@@ -12,7 +12,7 @@
 #include "duckdb/main/client_context.hpp"
 
 #include "vgi_arrow_utils.hpp"
-#include "vgi_catalog_api.hpp"
+#include "vgi_catalog_metadata.hpp"
 #include "vgi_http_client.hpp"
 #include "vgi_ifunction_connection.hpp"
 #include "vgi_protocol.hpp"

@@ -10,7 +10,7 @@
 
 #include "duckdb/function/aggregate_function.hpp"
 
-#include "vgi_catalog_api.hpp"
+#include "vgi_catalog_metadata.hpp"
 
 namespace duckdb {
 namespace vgi {

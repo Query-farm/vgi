@@ -395,7 +395,10 @@ The `launch:` and `unix://` paths share one warm worker process across every Duc
 
 | Header | Key contents |
 |--------|-------------|
-| `vgi_catalog_api.hpp` | All `InvokeCatalog*()` functions, `VgiFunctionInfo`, catalog metadata types |
+| `vgi_catalog_api.hpp` | Thin back-compat umbrella over the three headers below (see *Header Hygiene*); prefer the specific one |
+| `vgi_attach_parameters.hpp` | `VgiAttachParameters(+Config)`, `CatalogRpcContext` (Arrow-free) |
+| `vgi_catalog_metadata.hpp` | Discovery POD types (`VgiTableInfo`, `VgiFunctionInfo`, …) + `Parse*` (Arrow forward-declared) |
+| `vgi_catalog_rpc.hpp` | `InvokeCatalog*()` / DDL / stats / secret helpers (Arrow IPC carrier) |
 | `vgi_function_connection.hpp` | `FunctionConnection` class, `FunctionConnectionParams`, `AcquireAndBindConnection()` |
 | `vgi_rpc_client.hpp` | `WriteRpcRequest()`, `ReadUnaryResponse()`, `ReadStreamHeader()`, `RpcBatchType` |
 | `vgi_subprocess.hpp` | `SubProcess`, `Pipe`, `WaitForReadable()`, `GetCatalogTimeout()` |
@@ -457,6 +460,23 @@ in `vgi-python` (CI fails if the checked-in headers diverge from the generators)
 ### Arrow-to-DuckDB Type Conversion
 
 Always use `ArrowSchemaToDuckDBTypes()` (from `vgi_arrow_utils.hpp`) to convert Arrow types to DuckDB types. Do not write manual switch statements over `arrow::Type` IDs — this misses complex types (structs, lists, maps, timestamps, etc.) and leads to silent fallback to VARCHAR. The utility handles all types correctly via the DuckDB Arrow C ABI bridge.
+
+### Header Hygiene
+
+Widely-included "hub" headers must not drag the heavy `<arrow/api.h>` / `arrow/ipc/api.h` umbrella into translation units that don't actually deserialize Arrow. The umbrella is ~8–10k lines of templates per TU; pulling it through a header reached by 30+ TUs dominates compile time.
+
+**The rule.** When a header uses an Arrow (or other heavy third-party) type *only* as a `std::shared_ptr<T>` member, a pointer/reference, or a function parameter/return type, **forward-declare it** and push the real `#include` down into the `.cpp` files that construct or dereference it. `std::shared_ptr<arrow::Schema>` as a struct member or parameter does **not** require the complete type — `shared_ptr` type-erases its deleter. The blueprint is `src/include/vgi_logging.hpp` (forward-declares `arrow::RecordBatch`); the catalog headers below follow it.
+
+**Caveats that DO need the full type** (the compiler catches these): `unique_ptr<Incomplete>` members (the implicit destructor needs the complete type — keep the include or out-of-line the dtor; e.g. `VgiScanBranch::parsed_branch_filter`), by-value members, base classes, `sizeof`, and inline functions that dereference the type.
+
+**Catalog header split.** `vgi_catalog_api.hpp` is a thin back-compat umbrella over a cumulative `attach ⊂ metadata ⊂ rpc` layering — include the most specific one you need:
+- `vgi_attach_parameters.hpp` — `VgiAttachParameters(+Config)`, `CatalogRpcContext`. Arrow-free.
+- `vgi_catalog_metadata.hpp` — discovery POD types (`VgiTableInfo`, `VgiFunctionInfo`, …) + `Parse*`. Arrow forward-declared; includes attach.
+- `vgi_catalog_rpc.hpp` — `InvokeCatalog*` / DDL / stats / secret helpers. Legitimately carries Arrow IPC (via `vgi_rpc_types.hpp`); include only from `.cpp` files that issue catalog RPCs.
+
+**Legitimate Arrow carriers** — do *not* try to make these Arrow-free; their consumers genuinely call Arrow-typed functions, so forward-declaring would only relocate the include: `vgi_rpc_types.hpp`, `vgi_arrow_utils.hpp`, `vgi_arrow_ipc.hpp`, `vgi_function_connection.hpp`, `vgi_catalog_rpc.hpp`.
+
+**Guardrail.** `python3 scripts/header_reach.py` prints a per-header transitive TU-reach table (which headers are expensive to edit). `python3 scripts/header_reach.py --check` enforces the heavy-include denylist on guarded hubs (`GUARDED_HEADERS` in the script) and runs in CI (`header-hygiene` job). If you add a heavy include to a guarded header, the check fails — forward-declare instead.
 
 ## Architecture
 

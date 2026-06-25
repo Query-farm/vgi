@@ -13,8 +13,9 @@
 #include "duckdb/function/table/arrow/arrow_duck_schema.hpp"
 #include "duckdb/execution/expression_executor_state.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/main/client_properties.hpp" // ClientProperties
 
-#include "vgi_catalog_api.hpp"
+#include "vgi_catalog_metadata.hpp"
 
 namespace duckdb {
 

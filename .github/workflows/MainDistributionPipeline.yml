@@ -21,6 +21,17 @@ concurrency:
 #       extension_name: vgi
 
 jobs:
+  header-hygiene:
+    name: Header hygiene (fan-out guardrail)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Enforce heavy-include denylist on hub headers
+        # Fails if a guarded hub header (see GUARDED_HEADERS in the script /
+        # CLAUDE.md "Header hygiene") transitively pulls in the Arrow umbrella.
+        # Pure source scan — no build needed.
+        run: python3 scripts/header_reach.py --check
+
   duckdb-stable-build:
     name: Build extension binaries
     uses: Query-farm-haybarn/haybarn-extension-ci-tools/.github/workflows/_extension_distribution.yml@haybarn

@@ -19,7 +19,7 @@
 #include "vgi_aggregate_streaming_impl.hpp"
 #include "vgi_arrow_utils.hpp"
 #include "vgi_cancel_dispatcher.hpp"
-#include "vgi_catalog_api.hpp"
+#include "vgi_attach_parameters.hpp"
 #include "vgi_logging.hpp"
 
 namespace duckdb {

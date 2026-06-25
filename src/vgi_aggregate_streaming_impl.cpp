@@ -11,6 +11,7 @@
 #include "vgi_aggregate_function_impl.hpp"
 #include "vgi_arrow_utils.hpp"
 #include "vgi_logging.hpp"
+#include "vgi_rpc_types.hpp" // SerializeToIpcBytes / DeserializeFromIpcBytes
 
 namespace duckdb {
 namespace vgi {

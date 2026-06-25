@@ -10,7 +10,6 @@
 
 #include "vgi_aggregate_function_impl.hpp"
 #include "vgi_aggregate_streaming_impl.hpp"
-#include "vgi_catalog_api.hpp"
 #include "vgi_ifunction_connection.hpp"
 #include "vgi_logging.hpp"
 
