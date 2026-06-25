@@ -2001,6 +2001,16 @@ VgiMacroInfo ParseMacroInfo(const std::shared_ptr<arrow::RecordBatch> &batch, co
 		info.parameter_default_values_bytes = std::move(*default_bytes);
 	}
 
+	// arguments_schema is an additive binary (IPC schema bytes) carrying per-
+	// parameter docs via vgi_doc field metadata. Absent on older workers — guard
+	// on the column existing so we stay compatible with pre-feature listings.
+	if (batch->schema()->GetFieldByName("arguments_schema")) {
+		auto args_bytes = row["arguments_schema"].as<std::vector<uint8_t>>();
+		if (args_bytes && !args_bytes->empty()) {
+			info.arguments_schema = DeserializeSchema(*args_bytes);
+		}
+	}
+
 	return info;
 }
 

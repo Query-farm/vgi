@@ -1,0 +1,52 @@
+# name: test/sql/integration/catalog/function_arguments_macros.test
+# description: vgi_function_arguments() now also enumerates MACROS and surfaces
+#   their per-parameter descriptions (the macro arguments_schema vgi_doc field
+#   metadata). function_type is scalar_macro / table_macro. Anchored on the
+#   fixture worker's documented macros vgi_multiply / vgi_clamp / vgi_range_table.
+# group: [vgi_integration]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# Scalar macro: per-parameter docs surface, function_type = scalar_macro.
+query TTT
+SELECT function_type, arg_name, arg_description
+FROM vgi_function_arguments()
+WHERE catalog_name = 'example' AND function_name = 'vgi_multiply'
+ORDER BY field_index;
+----
+scalar_macro	x	First factor
+scalar_macro	y	Second factor
+
+# Scalar macro with defaulted params: every parameter documented.
+query TT
+SELECT arg_name, arg_description
+FROM vgi_function_arguments()
+WHERE catalog_name = 'example' AND function_name = 'vgi_clamp'
+ORDER BY field_index;
+----
+val	Value to clamp
+lo	Lower bound (inclusive)
+hi	Upper bound (inclusive)
+
+# Table macro: function_type = table_macro, parameter documented.
+query TTT
+SELECT function_type, arg_name, arg_description
+FROM vgi_function_arguments()
+WHERE catalog_name = 'example' AND function_name = 'vgi_range_table'
+ORDER BY field_index;
+----
+table_macro	n	Number of rows to generate
+
+# All three macros' parameters are documented (no NULL arg_description).
+query I
+SELECT count(*) FROM vgi_function_arguments()
+WHERE catalog_name = 'example'
+  AND function_type IN ('scalar_macro', 'table_macro')
+  AND arg_description IS NULL;
+----
+0

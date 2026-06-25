@@ -74,10 +74,12 @@ static std::string MetadataValue(const std::shared_ptr<const arrow::KeyValueMeta
 	return md->value(idx);
 }
 
-// Expand one function's arguments_schema into per-argument rows.
-static void EmitFunctionArgs(ClientContext &context, const std::string &catalog_name, const std::string &schema_name,
-                             const VgiFunctionInfo &func, std::vector<ArgRow> &out) {
-	if (!func.arguments_schema || func.arguments_schema->num_fields() == 0) {
+// Expand an arguments_schema (from a function OR a macro) into per-argument
+// rows. function_type is the display string (e.g. "scalar", "table_macro").
+static void EmitArgsFromSchema(ClientContext &context, const std::string &catalog_name, const std::string &schema_name,
+                               const std::string &function_name, const std::string &function_type,
+                               const std::shared_ptr<arrow::Schema> &arguments_schema, std::vector<ArgRow> &out) {
+	if (!arguments_schema || arguments_schema->num_fields() == 0) {
 		return; // No declared arguments — emit no rows.
 	}
 
@@ -87,14 +89,13 @@ static void EmitFunctionArgs(ClientContext &context, const std::string &catalog_
 	ArrowTableSchema arrow_table;
 	vector<LogicalType> types;
 	vector<string> names;
-	ArrowSchemaToDuckDBTypes(context, func.arguments_schema, c_schema, arrow_table, types, names);
+	ArrowSchemaToDuckDBTypes(context, arguments_schema, c_schema, arrow_table, types, names);
 
-	const auto function_type = VgiFunctionTypeToString(func.function_type);
-	const int num_fields = func.arguments_schema->num_fields();
+	const int num_fields = arguments_schema->num_fields();
 	int64_t positional_ordinal = 0;
 
 	for (int i = 0; i < num_fields; i++) {
-		auto field = func.arguments_schema->field(i);
+		auto field = arguments_schema->field(i);
 		auto md = field->HasMetadata() ? field->metadata() : nullptr;
 
 		const bool is_named = MetadataValue(md, VGI_ARG_METADATA_KEY) == VGI_ARG_NAMED_VALUE;
@@ -124,7 +125,7 @@ static void EmitFunctionArgs(ClientContext &context, const std::string &catalog_
 		ArgRow row;
 		row.catalog_name = catalog_name;
 		row.schema_name = schema_name;
-		row.function_name = func.name;
+		row.function_name = function_name;
 		row.function_type = function_type;
 		row.field_index = i;
 		row.arg_position = has_position ? positional_ordinal : 0;
@@ -144,6 +145,25 @@ static void EmitFunctionArgs(ClientContext &context, const std::string &catalog_
 		row.is_any_type = is_any_type;
 		out.push_back(std::move(row));
 	}
+}
+
+// Expand one function's arguments_schema into per-argument rows.
+static void EmitFunctionArgs(ClientContext &context, const std::string &catalog_name, const std::string &schema_name,
+                             const VgiFunctionInfo &func, std::vector<ArgRow> &out) {
+	EmitArgsFromSchema(context, catalog_name, schema_name, func.name, VgiFunctionTypeToString(func.function_type),
+	                   func.arguments_schema, out);
+}
+
+// Expand one macro's arguments_schema into per-argument rows. macro_type is the
+// wire value "scalar"/"table"; surface it as "scalar_macro"/"table_macro" so the
+// function_type column distinguishes macros from same-named functions.
+static void EmitMacroArgs(ClientContext &context, const std::string &catalog_name, const std::string &schema_name,
+                          const VgiMacroInfo &macro, std::vector<ArgRow> &out) {
+	// macro_type arrives as the MacroType enum name ("SCALAR"/"TABLE"); accept the
+	// lowercase value form too for resilience.
+	const bool is_table = macro.macro_type == "TABLE" || macro.macro_type == "table";
+	const std::string function_type = is_table ? "table_macro" : "scalar_macro";
+	EmitArgsFromSchema(context, catalog_name, schema_name, macro.name, function_type, macro.arguments_schema, out);
 }
 
 static unique_ptr<FunctionData> VgiFunctionArgumentsBind(ClientContext &context, TableFunctionBindInput &input,
@@ -211,6 +231,27 @@ static unique_ptr<FunctionData> VgiFunctionArgumentsBind(ClientContext &context,
 					         {"error", e.what()}});
 				}
 			}
+
+			// Macros: enumerate scalar + table macros and surface their per-
+			// parameter docs (arguments_schema vgi_doc field metadata).
+			static const char *kMacroTypeRequests[] = {"SCALAR_MACRO", "TABLE_MACRO"};
+			for (const char *macro_type : kMacroTypeRequests) {
+				try {
+					CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_opaque_data, transaction_opaque};
+					rpc_ctx.entity_kind = "schema";
+					rpc_ctx.entity_qualifier = schema_name;
+					auto macro_list = InvokeCatalogSchemaContentsMacros(rpc_ctx, schema_name, macro_type, context);
+					for (auto &macro : macro_list) {
+						EmitMacroArgs(context, catalog_name, schema_name, macro, data->rows);
+					}
+				} catch (const std::exception &e) {
+					VGI_LOG(context, "vgi.function_arguments.skip_failed",
+					        {{"catalog", catalog_name},
+					         {"schema", schema_name},
+					         {"function_type", macro_type},
+					         {"error", e.what()}});
+				}
+			}
 		});
 	}
 
@@ -248,7 +289,8 @@ void RegisterVgiFunctionArgumentsFunction(ExtensionLoader &loader) {
 	TableFunction func("vgi_function_arguments", {}, VgiFunctionArgumentsScan, VgiFunctionArgumentsBind);
 	CreateTableFunctionInfo info(func);
 	info.descriptions.push_back(MakeFunctionDescription(
-	    "Inspect the arguments of every function exposed by every attached VGI catalog, one row per argument. "
+	    "Inspect the arguments of every function and macro exposed by every attached VGI catalog, one row per "
+	    "argument. function_type is scalar/table/aggregate for functions and scalar_macro/table_macro for macros. "
 	    "Surfaces per-argument detail that duckdb_functions() flattens away: named-vs-positional, const, "
 	    "varargs, table-input, any-type, and the per-argument description (vgi_doc). Filter with "
 	    "WHERE catalog_name = '...'. Reports each catalog's current data version; does not honor time travel.",

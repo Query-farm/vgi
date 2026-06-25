@@ -494,6 +494,10 @@ struct VgiMacroInfo {
 	std::string comment;
 	std::vector<std::string> parameters;
 	std::vector<uint8_t> parameter_default_values_bytes;  // IPC-serialized defaults batch
+	// One nullable field per parameter (in `parameters` order) carrying the
+	// per-parameter description via the `vgi_doc` field-metadata key — mirrors
+	// VgiFunctionInfo::arguments_schema. Null on older workers that don't emit it.
+	std::shared_ptr<arrow::Schema> arguments_schema;
 	std::map<std::string, std::string> tags;
 };
 
