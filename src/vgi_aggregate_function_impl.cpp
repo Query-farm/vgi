@@ -283,8 +283,25 @@ unique_ptr<FunctionData> VgiAggregateBindData::Copy() const {
 
 bool VgiAggregateBindData::Equals(const FunctionData &other_p) const {
 	auto &other = other_p.Cast<VgiAggregateBindData>();
-	return function_name == other.function_name && attach_opaque_data == other.attach_opaque_data && settings == other.settings &&
-	       const_values == other.const_values;
+	if (function_name != other.function_name || attach_opaque_data != other.attach_opaque_data ||
+	    settings != other.settings) {
+		return false;
+	}
+	// Null-safe const-argument comparison: Value::operator== throws
+	// "Comparison on NULL values" when either side is NULL (e.g. a NULL const
+	// argument like vgi_percentile(x, NULL)). NotDistinctFrom treats NULL==NULL
+	// as equal and NULL vs non-null as unequal, without throwing — so the NULL
+	// const flows through to the worker, which returns its own clean validation
+	// error instead of an INTERNAL error.
+	if (const_values.size() != other.const_values.size()) {
+		return false;
+	}
+	for (idx_t i = 0; i < const_values.size(); i++) {
+		if (!Value::NotDistinctFrom(const_values[i], other.const_values[i])) {
+			return false;
+		}
+	}
+	return true;
 }
 
 // ============================================================================
