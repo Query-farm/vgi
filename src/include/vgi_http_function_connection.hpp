@@ -16,6 +16,7 @@
 #include "vgi_http_client.hpp"
 #include "vgi_ifunction_connection.hpp"
 #include "vgi_protocol.hpp"
+#include "vgi_worker_pool.hpp" // complete PooledWorker for inline ReleaseForPooling()
 
 namespace duckdb {
 namespace vgi {

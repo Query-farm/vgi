@@ -17,6 +17,7 @@
 #include "vgi_arrow_utils.hpp"
 #include "vgi_catalog_metadata.hpp"
 #include "vgi_protocol.hpp" // BindResult
+#include "vgi_ifunction_connection.hpp" // complete IFunctionConnection for unique_ptr member
 
 namespace duckdb {
 
