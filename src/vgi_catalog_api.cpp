@@ -2639,7 +2639,35 @@ static std::map<std::string, Value> ExtractSecretKeyValues(const KeyValueSecret 
 	for (const auto &[k, v] : kv_secret.secret_map) {
 		kv_pairs[k] = v;
 	}
+	// Add the secret's scope prefixes (newline-joined), set AFTER the secret_map
+	// loop so it is reliable for worker-side scope matching. Lets a worker that
+	// requested several scopes pick the right secret per path (e.g. per S3
+	// bucket). Empty for an unscoped secret (matches anything as a fallback).
+	const auto &scope = kv_secret.GetScope();
+	std::string joined_scope;
+	for (idx_t i = 0; i < scope.size(); i++) {
+		if (i > 0) {
+			joined_scope += "\n";
+		}
+		joined_scope += scope[i];
+	}
+	kv_pairs["scope"] = Value(joined_scope);
 	return kv_pairs;
+}
+
+// Insert a resolved secret's fields into `result`, keyed by the secret's unique
+// name so multiple secrets of the same type (e.g. several S3 buckets) all
+// survive. Requesting the same secret via several scopes dedups naturally (same
+// name). The serialized `type`/`scope`/... fields let the worker select per
+// path via `Secrets::for_scope`. (No name should be empty, but fall back to the
+// type to avoid an empty key colliding.)
+static void InsertResolvedSecret(std::map<std::string, std::map<std::string, Value>> &result,
+                                 const std::string &secret_type, const KeyValueSecret &kv_secret) {
+	std::string key = kv_secret.GetName();
+	if (key.empty()) {
+		key = secret_type;
+	}
+	result[key] = ExtractSecretKeyValues(kv_secret);
 }
 
 std::map<std::string, std::map<std::string, Value>> ExtractVgiSecrets(
@@ -2662,7 +2690,7 @@ std::map<std::string, std::map<std::string, Value>> ExtractVgiSecrets(
 				if (base_secret->GetType() == req.secret_type) {
 					auto *kv_secret = dynamic_cast<const KeyValueSecret *>(base_secret.get());
 					if (kv_secret) {
-						result[req.secret_type] = ExtractSecretKeyValues(*kv_secret);
+						InsertResolvedSecret(result, req.secret_type, *kv_secret);
 					}
 				}
 			}
@@ -2672,7 +2700,7 @@ std::map<std::string, std::map<std::string, Value>> ExtractVgiSecrets(
 			if (match.HasMatch()) {
 				auto *kv_secret = dynamic_cast<const KeyValueSecret *>(&match.GetSecret());
 				if (kv_secret) {
-					result[req.secret_type] = ExtractSecretKeyValues(*kv_secret);
+					InsertResolvedSecret(result, req.secret_type, *kv_secret);
 				}
 			}
 		}

@@ -148,6 +148,8 @@ BindResult PerformBindProtocol(
 
 		auto scoped = ExtractVgiSecrets(context, scoped_reqs);
 		for (auto &[k, v] : scoped) {
+			// Keyed by secret name: a distinct secret (e.g. another s3 bucket)
+			// lands under its own key; re-resolving the same secret is idempotent.
 			secrets[k] = std::move(v);
 		}
 
