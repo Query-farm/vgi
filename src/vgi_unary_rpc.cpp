@@ -171,6 +171,31 @@ UnaryResponseResult InvokePooledUnaryRpc(const UnaryRpcOptions &opts, const std:
 #endif
 	}
 
+	if (IsTcpTransport(opts.worker_path)) {
+#if VGI_POSIX_TRANSPORT
+		// tcp://host:port — connect-only against an out-of-band worker on a raw-TCP
+		// socket; drive the same wire-protocol code through a UnixSocketWorker (the
+		// connected fd). No pooling — the long-lived worker is itself the pool.
+		std::string tcp_host;
+		int tcp_port;
+		ParseTcpLocation(opts.worker_path, tcp_host, tcp_port);
+		int fd = TcpConnect(tcp_host, tcp_port, 10000);
+		if (fd < 0) {
+			throw IOException("vgi: failed to connect to tcp worker %s", opts.worker_path);
+		}
+		UnixSocketWorker worker(fd);
+		if (params) {
+			WriteRpcRequest(worker.GetStdinFd(), method_name, params);
+		} else {
+			WriteEmptyRpcRequest(worker.GetStdinFd(), method_name);
+		}
+		auto *log_ctx = opts.enable_logging ? &opts.context : nullptr;
+		return ReadUnaryResponse(worker.GetStdoutFd(), log_ctx, opts.worker_path, /*pid=*/-1);
+#else
+		throw InvalidInputException("vgi: tcp:// LOCATIONs are not available in this build");
+#endif
+	}
+
 	if (IsLaunchLocation(opts.worker_path) || IsUnixLocation(opts.worker_path)) {
 #if VGI_POSIX_TRANSPORT
 		// AF_UNIX path: resolve socket via the launcher cache (which fires

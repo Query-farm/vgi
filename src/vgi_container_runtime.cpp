@@ -637,10 +637,10 @@ bool LookupSharedContainer(const std::string &location, ContainerSpec &out_spec,
 }
 
 #if VGI_POSIX_TRANSPORT
-namespace {
 
 // Non-blocking TCP connect with a timeout. Returns a connected (blocking-mode) fd,
-// or -1. Caller closes the fd.
+// or -1. Caller closes the fd. Exported (declared in vgi_container_runtime.hpp) so
+// the tcp:// transport reuses it.
 int TcpConnect(const std::string &host, int port, int timeout_ms) {
 	int fd = ::socket(AF_INET, SOCK_STREAM, 0);
 	if (fd < 0) {
@@ -678,6 +678,8 @@ int TcpConnect(const std::string &host, int port, int timeout_ms) {
 	::fcntl(fd, F_SETFL, flags);  // restore blocking
 	return fd;
 }
+
+namespace {
 
 // Native-protocol (tcp) readiness probe. A bare TCP connect is fooled by
 // docker-proxy, which accepts the host-port handshake before the worker inside is

@@ -201,6 +201,10 @@ void InvalidateSharedContainer(const ContainerSpec &spec);
 // / WriteRpcRequest path drives it. Http endpoints don't use this (they go through
 // HttpFunctionConnection). Throws IOException on connect failure. POSIX-only.
 std::unique_ptr<SubProcess> ConnectSharedContainer(const ContainerEndpoint &endpoint);
+
+// Open a raw TCP connection to host:port, returning a connected fd (or -1 on
+// failure). Shared by the container-shared TCP mode and the tcp:// transport.
+int TcpConnect(const std::string &host, int port, int timeout_ms);
 #endif
 
 // Per-process registry mapping an internal `container-shared:` worker_path to its

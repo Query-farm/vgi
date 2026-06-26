@@ -1599,6 +1599,28 @@ std::unique_ptr<IFunctionConnection> CreateFunctionConnection(
 		throw InvalidInputException("vgi: shared containers are unavailable in this build");
 #endif
 	}
+	if (IsTcpTransport(worker_path)) {
+#if VGI_POSIX_TRANSPORT
+		// tcp://host:port — connect-only against an out-of-band worker listening
+		// on a raw-TCP socket (vgi-rpc serve_tcp). Wrap the connected fd in a
+		// UnixSocketWorker (it's just an fd) so the existing FunctionConnection
+		// wire-protocol code drives it, exactly like unix:// and container-shared tcp.
+		std::string host;
+		int port;
+		ParseTcpLocation(worker_path, host, port);
+		int fd = TcpConnect(host, port, 10000);
+		if (fd < 0) {
+			throw IOException("vgi: failed to connect to tcp worker %s", worker_path);
+		}
+		auto worker = std::make_unique<UnixSocketWorker>(fd);
+		return std::make_unique<FunctionConnection>(
+		    std::move(worker), worker_path, function_name, arguments, attach_opaque_data,
+		    transaction_opaque_data, context, function_type, global_execution_id, worker_debug, settings,
+		    required_secrets);
+#else
+		throw InvalidInputException("vgi: tcp:// LOCATIONs are not available in this build");
+#endif
+	}
 	if (IsLaunchLocation(worker_path) || IsUnixLocation(worker_path)) {
 #if VGI_POSIX_TRANSPORT
 		// AF_UNIX path: resolve the socket via the launcher cache (which
