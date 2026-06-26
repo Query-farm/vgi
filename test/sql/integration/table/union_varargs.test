@@ -1,0 +1,88 @@
+# name: test/sql/integration/table/union_varargs.test
+# description: Tests for VGI union_varargs table function (union-typed varargs)
+# group: [vgi_integration_table]
+
+# This test requires a VGI worker to be available
+# Set VGI_TEST_WORKER environment variable to the path of a VGI worker executable
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# union_varargs function (union-typed varargs)
+# Each argument is a UNION(i BIGINT, s VARCHAR); the function echoes the active
+# member tag and value of each vararg, proving the discriminator survives the
+# round-trip (decoded worker-side into a TaggedUnion). One row per vararg:
+#   idx BIGINT, tag VARCHAR, value VARCHAR
+# ============================================================================
+
+# Two args, one of each member
+query ITT
+SELECT * FROM example.union_varargs(
+    union_value(i := 1)::UNION(i BIGINT, s VARCHAR),
+    union_value(s := 'x')::UNION(i BIGINT, s VARCHAR))
+ORDER BY idx;
+----
+0	i	1
+1	s	x
+
+# Single integer-member arg
+query ITT
+SELECT * FROM example.union_varargs(
+    union_value(i := 42)::UNION(i BIGINT, s VARCHAR))
+ORDER BY idx;
+----
+0	i	42
+
+# Single string-member arg
+query ITT
+SELECT * FROM example.union_varargs(
+    union_value(s := 'hello')::UNION(i BIGINT, s VARCHAR))
+ORDER BY idx;
+----
+0	s	hello
+
+# Many args, members interleaved — positional order preserved
+query ITT
+SELECT * FROM example.union_varargs(
+    union_value(s := 'a')::UNION(i BIGINT, s VARCHAR),
+    union_value(i := 10)::UNION(i BIGINT, s VARCHAR),
+    union_value(i := 20)::UNION(i BIGINT, s VARCHAR),
+    union_value(s := 'b')::UNION(i BIGINT, s VARCHAR))
+ORDER BY idx;
+----
+0	s	a
+1	i	10
+2	i	20
+3	s	b
+
+# Project only the tag column
+query T
+SELECT tag FROM example.union_varargs(
+    union_value(i := 7)::UNION(i BIGINT, s VARCHAR),
+    union_value(s := 'z')::UNION(i BIGINT, s VARCHAR))
+ORDER BY idx;
+----
+i
+s
+
+# Aggregate over the result — confirms full materialization
+query I
+SELECT COUNT(*) FROM example.union_varargs(
+    union_value(i := 1)::UNION(i BIGINT, s VARCHAR),
+    union_value(i := 2)::UNION(i BIGINT, s VARCHAR),
+    union_value(s := 'q')::UNION(i BIGINT, s VARCHAR));
+----
+3
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DETACH example;

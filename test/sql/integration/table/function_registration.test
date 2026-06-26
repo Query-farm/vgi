@@ -31,7 +31,7 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 # ============================================================================
 
 # Total table-type function count (includes table-in-out)
-# 69 base + 5 table_buffering failure-injection fixtures (crash_on_process,
+# 70 base + 5 table_buffering failure-injection fixtures (crash_on_process,
 # crash_on_combine, crash_on_finalize, hang_on_process, large_state) +
 # 3 ordering-knob fixtures (ordered_buffer_input, batch_index_buffer_input,
 # ordered_source) +
@@ -55,15 +55,17 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 #   see table/partition_columns.test)
 # 1 COPY ... FROM reader fixture (example_lines_copy_reader, registered as a
 #   table function; backs the example_lines COPY format — see copy_from/*.test)
-# = 96
+# 1 union-typed varargs fixture (union_varargs; echoes each union vararg's
+#   active member tag — see table/union_varargs.test)
+# = 98
 query I
 SELECT COUNT(*)
 FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'table';
 ----
-96
+98
 
-# The 33 pure table functions (no TABLE parameter type)
+# The 34 pure table functions (no TABLE parameter type)
 # Note: make_series appears 5 times (5 overloads), make_pairs appears 3 times,
 #       repeat_value appears 2 times
 query T
@@ -77,7 +79,8 @@ AND function_name IN (
     'make_pairs', 'order_echo', 'repeat_value',
     'named_params_echo', 'nested_sequence', 'partitioned_sequence',
     'projected_data', 'rowid_sequence', 'sample_echo', 'scoped_secret_demo', 'secret_demo', 'sequence',
-    'settings_aware', 'spatial_filter_example', 'struct_settings', 'ten_thousand', 'versioned_data_scan'
+    'settings_aware', 'spatial_filter_example', 'struct_settings', 'ten_thousand', 'union_varargs',
+    'versioned_data_scan'
 )
 ORDER BY function_name;
 ----
@@ -113,6 +116,7 @@ settings_aware
 spatial_filter_example
 struct_settings
 ten_thousand
+union_varargs
 versioned_data_scan
 
 # ============================================================================
@@ -317,7 +321,8 @@ ten_thousand	[]	[]	Generates 10000 integers from 0 to 9999
 
 # ============================================================================
 # Varargs
-# Only constant_columns declares varargs (accepts variable number of ANY-typed args)
+# constant_columns (ANY), repeat_value (BIGINT/VARCHAR overloads), and
+# union_varargs (a sparse UNION) all declare varargs.
 # ============================================================================
 
 query TT
@@ -328,7 +333,7 @@ AND function_name IN (
     'constant_columns', 'double_sequence', 'generator_exception',
     'logging_generator', 'named_params_echo', 'nested_sequence',
     'partitioned_sequence', 'projected_data', 'repeat_value', 'sequence',
-    'settings_aware', 'struct_settings', 'ten_thousand'
+    'settings_aware', 'struct_settings', 'ten_thousand', 'union_varargs'
 )
 AND varargs IS NOT NULL
 ORDER BY function_name, varargs;
@@ -336,6 +341,7 @@ ORDER BY function_name, varargs;
 constant_columns	ANY
 repeat_value	BIGINT
 repeat_value	VARCHAR
+union_varargs	UNION(i BIGINT, s VARCHAR)
 
 # ============================================================================
 # Categories
