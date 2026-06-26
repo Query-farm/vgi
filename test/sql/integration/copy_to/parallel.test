@@ -1,0 +1,97 @@
+# name: test/sql/integration/copy_to/parallel.test
+# description: COPY ... TO parallel / cross-process / large-value correctness
+# group: [vgi_integration_copy_to]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+# pool false: every worker acquire spawns a FRESH process and is never pooled, so
+# the per-thread sink workers and the combine worker are guaranteed-distinct
+# processes. This is the strongest test of the cross-process shard invariant —
+# shards written by one worker process must be merged by another via
+# execution_id-scoped BoundStorage. Mirrors table_buffering_pool_rotation.test.
+statement ok
+ATTACH 'example' AS acme (TYPE vgi, LOCATION '${VGI_TEST_WORKER}', pool false);
+
+statement ok
+SET threads = 8;
+
+statement ok
+SET preserve_insertion_order = false;
+
+# A TEMP TABLE source scans with many parallel morsels, forcing real sink fan-out
+# (manually observed up to 9 concurrent workers). 100k rows must all survive the
+# per-thread shard -> cross-process combine merge.
+statement ok
+CREATE TABLE src AS SELECT a, (a * 2654435761) % 100000 AS h FROM range(100000) t(a);
+
+query I
+COPY (SELECT * FROM src) TO '__TEST_DIR__/par_pf.txt'
+(FORMAT 'acme.example_lines_out', null_string 'NA');
+----
+100000
+
+query II
+SELECT count(*), count(DISTINCT a)
+FROM read_csv('__TEST_DIR__/par_pf.txt', columns = {'a': 'BIGINT', 'h': 'BIGINT'}, header = false);
+----
+100000	100000
+
+# Large / wide values: 20k rows × 1000-char payloads survive shard + merge intact.
+query I
+COPY (SELECT a, repeat('x', 1000) AS b FROM range(20000) t(a))
+TO '__TEST_DIR__/par_wide.txt' (FORMAT 'acme.example_lines_out', null_string 'NA');
+----
+20000
+
+query III
+SELECT count(*), min(length(b)), max(length(b))
+FROM read_csv('__TEST_DIR__/par_wide.txt', columns = {'a': 'BIGINT', 'b': 'VARCHAR'}, header = false);
+----
+20000	1000	1000
+
+# int64 boundary values round-trip through TO -> FROM.
+statement ok
+CREATE TABLE bigv (v BIGINT);
+
+statement ok
+COPY (SELECT * FROM (VALUES (9223372036854775807), (-9223372036854775808), (0)) t(v))
+TO '__TEST_DIR__/par_bigv.txt' (FORMAT 'acme.example_lines_out', null_string 'NA');
+
+statement ok
+COPY bigv FROM '__TEST_DIR__/par_bigv.txt' (FORMAT 'acme.example_lines', null_string 'NA');
+
+query I
+SELECT v FROM bigv ORDER BY v;
+----
+-9223372036854775808
+0
+9223372036854775807
+
+# Error recovery: a worker-side failure mid-COPY must not wedge the pool/workers —
+# a subsequent COPY on the same catalog still succeeds.
+statement ok
+COPY (SELECT 1 AS a) TO '__TEST_DIR__/exists.txt' (FORMAT 'acme.example_lines_out', null_string 'NA');
+
+statement error
+COPY (SELECT 2 AS a) TO '__TEST_DIR__/exists.txt'
+(FORMAT 'acme.example_lines_out', null_string 'NA', on_exists 'error');
+----
+already exists
+
+query I
+COPY (SELECT * FROM range(1000) t(a)) TO '__TEST_DIR__/after_error.txt'
+(FORMAT 'acme.example_lines_out', null_string 'NA');
+----
+1000
+
+query I
+SELECT count(*) FROM read_csv('__TEST_DIR__/after_error.txt', columns = {'a': 'BIGINT'}, header = false);
+----
+1000
+
+statement ok
+DETACH acme;

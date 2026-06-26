@@ -1,0 +1,84 @@
+# name: test/sql/integration/copy_to/basic.test
+# description: COPY ... TO backed by a VGI worker custom format writer (example_lines_out)
+# group: [vgi_integration_copy_to]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS acme (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# The catalog advertises its custom COPY TO format, scoped by the attach alias.
+query TTT
+SELECT catalog_name, format_name, direction
+FROM vgi_copy_formats()
+WHERE catalog_name = 'acme' AND format_name = 'acme.example_lines_out' AND option_name = 'delimiter';
+----
+acme	acme.example_lines_out	to
+
+# Write rows out through the worker; COPY reports the row count.
+query I
+COPY (SELECT * FROM (VALUES (1, 'foo'), (2, NULL), (3, 'baz')) t(a, b))
+TO '__TEST_DIR__/copy_to_basic.txt' (FORMAT 'acme.example_lines_out', null_string 'NA');
+----
+3
+
+# The worker wrote the delimited file (NULL -> the null_string token).
+query IT
+SELECT a, b FROM read_csv('__TEST_DIR__/copy_to_basic.txt', columns = {'a': 'INTEGER', 'b': 'VARCHAR'},
+                          header = false, nullstr = 'NA') ORDER BY a;
+----
+1	foo
+2	NULL
+3	baz
+
+# Round-trip: write with the TO format, read back with the FROM format.
+statement ok
+COPY (SELECT * FROM (VALUES (7, 'x'), (8, 'y')) t(a, b))
+TO '__TEST_DIR__/copy_to_rt.txt' (FORMAT 'acme.example_lines_out', null_string 'NA');
+
+statement ok
+CREATE TABLE rt (a INTEGER, b VARCHAR);
+
+statement ok
+COPY rt FROM '__TEST_DIR__/copy_to_rt.txt' (FORMAT 'acme.example_lines', null_string 'NA');
+
+query IT
+SELECT a, b FROM rt ORDER BY a;
+----
+7	x
+8	y
+
+# Parallel sharded write: every row survives the per-thread shard -> combine merge.
+statement ok
+SET threads = 4;
+
+query I
+COPY (SELECT * FROM range(2000) t(a)) TO '__TEST_DIR__/copy_to_par.txt'
+(FORMAT 'acme.example_lines_out', null_string 'NA');
+----
+2000
+
+query II
+SELECT count(*), count(DISTINCT a)
+FROM read_csv('__TEST_DIR__/copy_to_par.txt', columns = {'a': 'BIGINT'}, header = false);
+----
+2000	2000
+
+# Empty input still writes a (header-only) file and reports 0 rows.
+query I
+COPY (SELECT a FROM range(5) t(a) WHERE a > 100)
+TO '__TEST_DIR__/copy_to_empty.txt' (FORMAT 'acme.example_lines_out', null_string 'NA', header true);
+----
+0
+
+query I
+SELECT count(*) FROM read_csv('__TEST_DIR__/copy_to_empty.txt', columns = {'a': 'VARCHAR'}, header = false);
+----
+1
+
+statement ok
+DETACH acme;

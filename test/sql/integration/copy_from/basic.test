@@ -15,7 +15,7 @@ ATTACH 'example' AS acme (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 query TTT
 SELECT catalog_name, format_name, direction
 FROM vgi_copy_formats()
-WHERE catalog_name = 'acme' AND option_name = 'delimiter';
+WHERE catalog_name = 'acme' AND direction = 'from' AND option_name = 'delimiter';
 ----
 acme	acme.example_lines	from
 
@@ -46,7 +46,7 @@ ATTACH 'example' AS other (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 query TT
 SELECT catalog_name, format_name
 FROM vgi_copy_formats()
-WHERE option_name = 'delimiter' ORDER BY catalog_name;
+WHERE direction = 'from' AND option_name = 'delimiter' ORDER BY catalog_name;
 ----
 acme	acme.example_lines
 other	other.example_lines

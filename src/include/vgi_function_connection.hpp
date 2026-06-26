@@ -68,6 +68,11 @@ struct FunctionConnectionParams {
 	// source path + target schema. Empty optional for ordinary scans.
 	std::optional<CopyFromBindContext> copy_from;
 
+	// COPY ... TO context for this sink; set only for a COPY-TO bind. Threaded
+	// into the bind request (and init_call.bind_call.copy_to) so the worker's
+	// CopyToFunction reads the destination path. Empty for ordinary scans.
+	std::optional<CopyToBindContext> copy_to;
+
 	// Optional input schema, required for function types that bind with a
 	// typed input stream (table-in-out, scalar). If set, AcquireAndBindConnection
 	// calls SetInputSchema before PerformBindRpc.
@@ -214,6 +219,10 @@ public:
 
 	void SetCopyFromContext(const CopyFromBindContext &copy_from) override {
 		copy_from_ = copy_from;
+	}
+
+	void SetCopyToContext(const CopyToBindContext &copy_to) override {
+		copy_to_ = copy_to;
 	}
 
 	// Update input schema for execution phase (when DataChunk types differ from bind types)
@@ -400,6 +409,9 @@ private:
 
 	// COPY ... FROM context for the bind request (empty = none). See SetCopyFromContext.
 	std::optional<CopyFromBindContext> copy_from_;
+
+	// COPY ... TO context for the bind request (empty = none). See SetCopyToContext.
+	std::optional<CopyToBindContext> copy_to_;
 
 	// Input data writer for exchange-mode functions
 	std::shared_ptr<arrow::ipc::RecordBatchWriter> input_writer_;

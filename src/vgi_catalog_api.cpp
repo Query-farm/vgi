@@ -2009,6 +2009,7 @@ VgiCopyFromFormatInfo ParseCopyFromFormatInfo(const std::shared_ptr<arrow::Recor
 	info.format_name = row["format_name"].value_not_null<std::string>();
 	info.handler = row["handler"].value_not_null<std::string>();
 	info.direction = row["direction"].value_or(std::string("from"));
+	info.ordered = row["ordered"].value_or(false);
 	info.description = row["description"].value_or("");
 	if (auto comment = row["comment"].as<std::string>()) {
 		info.comment = *comment;

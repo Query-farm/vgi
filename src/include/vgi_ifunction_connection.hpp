@@ -27,6 +27,7 @@ class PooledWorker;
 struct VgiAttachParameters;
 struct VgiSecretRequirement;
 struct CopyFromBindContext;
+struct CopyToBindContext;
 
 // ============================================================================
 // IFunctionConnection - Abstract interface for VGI function connections
@@ -83,6 +84,14 @@ public:
 	// subprocess/HTTP connections override it.
 	virtual void SetCopyFromContext(const CopyFromBindContext &copy_from) {
 		(void)copy_from;
+	}
+
+	// Set the COPY ... TO context (destination path + format) carried into the
+	// bind request so a worker CopyToFunction reads it at bind/init via
+	// init_call.bind_call.copy_to. Default no-op: only the real
+	// subprocess/HTTP connections override it.
+	virtual void SetCopyToContext(const CopyToBindContext &copy_to) {
+		(void)copy_to;
 	}
 
 	// Update input schema for execute phase (after bind, before OpenInputWriter)

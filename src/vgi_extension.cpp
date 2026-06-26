@@ -59,6 +59,7 @@
 #include "vgi_catalog_rpc.hpp"
 #include "vgi_catalogs.hpp"
 #include "vgi_copy_from_impl.hpp"
+#include "vgi_copy_to_impl.hpp"
 #include "vgi_exception.hpp"
 #include "vgi_protocol_constants.hpp"
 #include "vgi_container_runtime.hpp"
@@ -1968,16 +1969,32 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 					    registered_name, name);
 				}
 
-				// Build the CopyFunction. Per-format worker context rides on the
-				// copy_from_function's TableFunctionInfo carrier (self-contained,
-				// no Catalog& — it must outlive DETACH). The carrier keeps the
-				// worker's bare advertised format name for the copy_from context.
+				// Build the CopyFunction, wiring each direction the worker
+				// advertises. A format may be "from", "to", or "both"; the FROM
+				// and TO sides are independent (copy_from_function.function_info
+				// vs cf.function_info), so one CopyFunction can carry both.
+				const std::string dir = StringUtil::Lower(fmt.direction);
+				const bool wants_from = (dir != "to"); // "from", "both", or unset → reader
+				const bool wants_to = (dir == "to" || dir == "both");
+
 				CopyFunction cf(registered_name);
-				cf.copy_from_bind = vgi::VgiCopyFromBind;
-				cf.copy_from_function = vgi::MakeVgiCopyFromTableFunction();
-				cf.copy_from_function.function_info = make_shared_ptr<vgi::VgiCopyFromFunctionInfo>(
-				    name, attach_params, attach_result_ptr->attach_opaque_data, fmt.format_name, fmt.handler,
-				    fmt.options_schema, setting_names);
+				if (wants_from) {
+					// Per-format reader context rides on the copy_from_function's
+					// TableFunctionInfo carrier (self-contained, outlives DETACH).
+					cf.copy_from_bind = vgi::VgiCopyFromBind;
+					cf.copy_from_function = vgi::MakeVgiCopyFromTableFunction();
+					cf.copy_from_function.function_info = make_shared_ptr<vgi::VgiCopyFromFunctionInfo>(
+					    name, attach_params, attach_result_ptr->attach_opaque_data, fmt.format_name, fmt.handler,
+					    fmt.options_schema, setting_names);
+				}
+				if (wants_to) {
+					// Per-format writer context rides on cf.function_info, which
+					// copy_to_bind receives directly (no table-function indirection).
+					cf.function_info = make_shared_ptr<vgi::VgiCopyToFunctionInfo>(
+					    name, attach_params, attach_result_ptr->attach_opaque_data, fmt.format_name, fmt.handler,
+					    fmt.options_schema, setting_names);
+					vgi::InstallVgiCopyToCallbacks(cf, fmt.ordered);
+				}
 				cf.extension = registered_name;
 
 				CreateCopyFunctionInfo cf_info(std::move(cf));
@@ -2395,6 +2412,7 @@ struct VgiCopyFormatRow {
 	string catalog_name;
 	string format_name;
 	string direction;
+	bool ordered = false;
 	string description;
 	bool has_comment = false;
 	string comment;
@@ -2426,11 +2444,12 @@ static Value TagsToMapValue(const std::map<std::string, std::string> &tags) {
 
 static unique_ptr<FunctionData> VgiCopyFormatsBind(ClientContext &context, TableFunctionBindInput &input,
                                                    vector<LogicalType> &return_types, vector<string> &names) {
-	names = {"catalog_name",      "format_name", "direction", "format_description", "format_comment",
-	         "format_tags",       "handler",     "option_name", "option_type",     "option_description"};
+	names = {"catalog_name", "format_name",  "direction",   "ordered",     "format_description", "format_comment",
+	         "format_tags",  "handler",      "option_name", "option_type", "option_description"};
 	return_types = {LogicalType::VARCHAR,
 	                LogicalType::VARCHAR,
 	                LogicalType::VARCHAR,
+	                LogicalType::BOOLEAN,
 	                LogicalType::VARCHAR,
 	                LogicalType::VARCHAR,
 	                LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR),
@@ -2455,6 +2474,7 @@ static unique_ptr<FunctionData> VgiCopyFormatsBind(ClientContext &context, Table
 			// The registered (alias-scoped) name is what users type in FORMAT.
 			r.format_name = entry.registered_name;
 			r.direction = info.direction;
+			r.ordered = info.ordered;
 			r.description = info.description;
 			r.has_comment = info.comment.has_value();
 			r.comment = info.comment.value_or("");
@@ -2500,13 +2520,14 @@ static void VgiCopyFormatsScan(ClientContext &context, TableFunctionInput &data_
 		output.SetValue(0, count, Value(r.catalog_name));
 		output.SetValue(1, count, Value(r.format_name));
 		output.SetValue(2, count, Value(r.direction));
-		output.SetValue(3, count, Value(r.description));
-		output.SetValue(4, count, r.has_comment ? Value(r.comment) : Value(LogicalType::VARCHAR));
-		output.SetValue(5, count, r.tags);
-		output.SetValue(6, count, Value(r.handler));
-		output.SetValue(7, count, r.has_option ? Value(r.option_name) : Value(LogicalType::VARCHAR));
-		output.SetValue(8, count, r.has_option ? Value(r.option_type) : Value(LogicalType::VARCHAR));
-		output.SetValue(9, count, r.has_option_desc ? Value(r.option_desc) : Value(LogicalType::VARCHAR));
+		output.SetValue(3, count, Value::BOOLEAN(r.ordered));
+		output.SetValue(4, count, Value(r.description));
+		output.SetValue(5, count, r.has_comment ? Value(r.comment) : Value(LogicalType::VARCHAR));
+		output.SetValue(6, count, r.tags);
+		output.SetValue(7, count, Value(r.handler));
+		output.SetValue(8, count, r.has_option ? Value(r.option_name) : Value(LogicalType::VARCHAR));
+		output.SetValue(9, count, r.has_option ? Value(r.option_type) : Value(LogicalType::VARCHAR));
+		output.SetValue(10, count, r.has_option_desc ? Value(r.option_desc) : Value(LogicalType::VARCHAR));
 		data.offset++;
 		count++;
 	}

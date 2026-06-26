@@ -1,0 +1,102 @@
+# name: test/sql/integration/copy_to/options.test
+# description: COPY ... TO option handling (defaults, pass-through, validation, introspection)
+# group: [vgi_integration_copy_to]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS acme (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# --- Registration / introspection: the writer's options are documented --------
+query TTTT
+SELECT format_name, option_name, option_type, option_description
+FROM vgi_copy_formats()
+WHERE catalog_name = 'acme' AND format_name = 'acme.example_lines_out'
+ORDER BY option_name;
+----
+acme.example_lines_out	delimiter	VARCHAR	Field separator
+acme.example_lines_out	header	BOOLEAN	Write a header row of column names
+acme.example_lines_out	null_string	VARCHAR	Token written for SQL NULL
+acme.example_lines_out	on_exists	VARCHAR	Behavior when the destination file already exists
+
+# The format comment + tags round-trip into the system catalog entry.
+query TIT
+SELECT DISTINCT format_comment, cardinality(format_tags), map_extract(format_tags, 'category')[1]
+FROM vgi_copy_formats() WHERE catalog_name = 'acme' AND format_name = 'acme.example_lines_out';
+----
+Toy delimited-text writer for tests	2	copy_to
+
+# --- Default applied: omit delimiter (defaults to ',') ------------------------
+statement ok
+COPY (SELECT * FROM (VALUES (10, 'x'), (20, 'y')) t(a, b))
+TO '__TEST_DIR__/to_default.txt' (FORMAT 'acme.example_lines_out', null_string 'NA');
+
+query IT
+SELECT a, b FROM read_csv('__TEST_DIR__/to_default.txt', columns = {'a': 'INTEGER', 'b': 'VARCHAR'},
+                          header = false) ORDER BY a;
+----
+10	x
+20	y
+
+# --- Pass-through + effect: a non-default delimiter changes the output --------
+statement ok
+COPY (SELECT * FROM (VALUES (1, 'p'), (2, 'q')) t(a, b))
+TO '__TEST_DIR__/to_pipe.txt' (FORMAT 'acme.example_lines_out', null_string 'NA', delimiter '|');
+
+query IT
+SELECT a, b FROM read_csv('__TEST_DIR__/to_pipe.txt', columns = {'a': 'INTEGER', 'b': 'VARCHAR'},
+                          header = false, delim = '|') ORDER BY a;
+----
+1	p
+2	q
+
+# --- header=true writes a header row -----------------------------------------
+statement ok
+COPY (SELECT * FROM (VALUES (1, 'a')) t(a, b))
+TO '__TEST_DIR__/to_header.txt' (FORMAT 'acme.example_lines_out', null_string 'NA', header true);
+
+query T
+SELECT line FROM read_csv('__TEST_DIR__/to_header.txt', columns = {'line': 'VARCHAR'}, header = false) LIMIT 1;
+----
+a,b
+
+# --- Unknown option -> clear bind error --------------------------------------
+statement error
+COPY (SELECT 1 AS a) TO '__TEST_DIR__/to_bad.txt' (FORMAT 'acme.example_lines_out', null_string 'NA', bogus 1);
+----
+Unsupported option 'bogus'
+
+# --- Required option missing -> error (worker-side enforcement) ---------------
+statement error
+COPY (SELECT 1 AS a) TO '__TEST_DIR__/to_req.txt' (FORMAT 'acme.example_lines_out');
+----
+null_string
+
+# --- Unsupported generic write option -> clear error -------------------------
+statement error
+COPY (SELECT * FROM (VALUES (1, 'x'), (2, 'y')) t(a, b))
+TO '__TEST_DIR__/to_part' (FORMAT 'acme.example_lines_out', null_string 'NA', PARTITION_BY (a));
+----
+do not support
+
+statement error
+COPY (SELECT * FROM range(4) t(a))
+TO '__TEST_DIR__/to_pto' (FORMAT 'acme.example_lines_out', null_string 'NA', PER_THREAD_OUTPUT true);
+----
+do not support
+
+# --- Worker-side semantic option: on_exists='error' refuses an existing file --
+statement ok
+COPY (SELECT 1 AS a) TO '__TEST_DIR__/to_exists.txt' (FORMAT 'acme.example_lines_out', null_string 'NA');
+
+statement error
+COPY (SELECT 2 AS a) TO '__TEST_DIR__/to_exists.txt' (FORMAT 'acme.example_lines_out', null_string 'NA', on_exists 'error');
+----
+already exists
+
+statement ok
+DETACH acme;

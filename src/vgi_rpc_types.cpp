@@ -498,7 +498,7 @@ BuildBindRequest(const std::string &function_name, const std::vector<uint8_t> &a
                  const std::vector<uint8_t> &settings_bytes, const std::vector<uint8_t> &secrets_bytes,
                  const std::vector<uint8_t> &attach_opaque_data, const std::vector<uint8_t> &transaction_opaque_data,
                  bool resolved_secrets_provided, const std::string &at_unit, const std::string &at_value,
-                 const CopyFromBindContext *copy_from) {
+                 const CopyFromBindContext *copy_from, const CopyToBindContext *copy_to) {
 	// FunctionType enum: SCALAR, TABLE, AGGREGATE
 	static const std::vector<std::string> function_type_values = {"SCALAR", "TABLE", "AGGREGATE"};
 
@@ -558,6 +558,25 @@ BuildBindRequest(const std::string &function_name, const std::vector<uint8_t> &a
 			throw IOException("Failed to build copy_from struct array: %s", struct_result.status().ToString());
 		}
 		fields.push_back(arrow::field("copy_from", copy_from_type, true));
+		arrays.push_back(struct_result.ValueUnsafe());
+	}
+
+	// copy_to: nested struct<format, file_path>, only added for a COPY ... TO
+	// sink. Same wire-safe rationale as copy_from (matched by name, defaults None).
+	if (copy_to) {
+		auto copy_to_type = arrow::struct_({
+		    arrow::field("format", arrow::utf8(), false),
+		    arrow::field("file_path", arrow::utf8(), false),
+		});
+		std::vector<std::shared_ptr<arrow::Array>> children = {
+		    BuildStringScalar(copy_to->format),
+		    BuildStringScalar(copy_to->file_path),
+		};
+		auto struct_result = arrow::StructArray::Make(children, copy_to_type->fields());
+		if (!struct_result.ok()) {
+			throw IOException("Failed to build copy_to struct array: %s", struct_result.status().ToString());
+		}
+		fields.push_back(arrow::field("copy_to", copy_to_type, true));
 		arrays.push_back(struct_result.ValueUnsafe());
 	}
 

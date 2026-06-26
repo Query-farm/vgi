@@ -62,6 +62,9 @@ public:
 	void SetCopyFromContext(const CopyFromBindContext &copy_from) override {
 		copy_from_ = copy_from;
 	}
+	void SetCopyToContext(const CopyToBindContext &copy_to) override {
+		copy_to_ = copy_to;
+	}
 	void UpdateInputSchemaForExecution(const std::shared_ptr<arrow::Schema> &input_schema) override;
 
 	// Init RPC. bind_result must come from a prior PerformBindRpc.
@@ -164,6 +167,9 @@ private:
 
 	// COPY ... FROM context for the bind request (empty = none). See SetCopyFromContext.
 	std::optional<CopyFromBindContext> copy_from_;
+
+	// COPY ... TO context for the bind request (empty = none). See SetCopyToContext.
+	std::optional<CopyToBindContext> copy_to_;
 
 	// Server capabilities (lazy-discovered)
 	ServerCapabilities capabilities_;

@@ -1,0 +1,61 @@
+# name: test/sql/integration/copy_to/ordered.test
+# description: COPY ... TO ordered formats (Meta.sink_order_dependent → single-thread sink)
+# group: [vgi_integration_copy_to]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS acme (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+SET threads = 8;
+
+# The ordered writer is advertised with ordered=true; the default one with false.
+query TTT
+SELECT format_name, direction, CAST(ordered AS VARCHAR)
+FROM vgi_copy_formats()
+WHERE catalog_name = 'acme' AND direction = 'to' AND option_name = 'delimiter'
+ORDER BY format_name;
+----
+acme.example_lines_ordered_out	to	true
+acme.example_lines_out	to	false
+
+# Small check: the ordered single-thread sink writes rows in source order
+# (a single-file read_csv preserves file line order).
+statement ok
+COPY (SELECT * FROM (VALUES (0), (1), (2), (3), (4), (5), (6), (7)) t(a) ORDER BY a)
+TO '__TEST_DIR__/ord_small.txt' (FORMAT 'acme.example_lines_ordered_out', null_string 'NA');
+
+query I
+SELECT a FROM read_csv('__TEST_DIR__/ord_small.txt', columns = {'a': 'BIGINT'}, header = false);
+----
+0
+1
+2
+3
+4
+5
+6
+7
+
+# Large ordered write with threads=8: every file line position equals its value,
+# i.e. output is strictly in source order despite parallel scheduling.
+query I
+COPY (SELECT * FROM range(50000) t(a)) TO '__TEST_DIR__/ord_big.txt'
+(FORMAT 'acme.example_lines_ordered_out', null_string 'NA');
+----
+50000
+
+query II
+SELECT count(*), count(*) FILTER (WHERE a <> rn)
+FROM (SELECT a, (row_number() OVER ()) - 1 AS rn
+      FROM read_csv('__TEST_DIR__/ord_big.txt', columns = {'a': 'BIGINT'}, header = false));
+----
+50000	0
+
+statement ok
+DETACH acme;

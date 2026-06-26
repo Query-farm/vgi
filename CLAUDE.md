@@ -325,6 +325,42 @@ registered subclasses.
 **Limitation.** `DETACH` does not unregister the format (no copy-function unload API; persists for
 the DB lifetime), mirroring the secret provider. Introspect with `vgi_copy_formats()`.
 
+## Custom `COPY ... TO` Formats
+
+An attached VGI catalog can also advertise custom `COPY ... TO` formats, turning a worker into a
+remote sink: `COPY (query) TO 'path' (FORMAT '<alias>.<fmt>', opt val)` streams the source rows out
+to the worker, which writes them to the destination; DuckDB reports the row count.
+
+**Model.** A COPY-TO writer is a **buffered (Sink+Combine) function with no Source phase**. DuckDB's
+`PhysicalCopyToFile` drives the extension's `copy_to_*` callbacks, which reuse the worker's existing
+`table_buffering_process` (per-shard write) / `table_buffering_combine` (terminal write+close) RPCs.
+Parallel sink: each thread fans out to its own `execution_id`-scoped worker; `copy_to_finalize` runs
+combine once on the retained init worker (also handles empty input). `initialize_global` runs once
+before any sink, so no init handshake is needed (unlike the buffered-table operator).
+
+**Carrier / bind.** `copy_to_bind` receives the per-format carrier directly via
+`CopyFunctionBindInput.function_info` (a `VgiCopyToFunctionInfo : CopyFunctionInfo` — no
+table-function indirection). The source schema rides `BindRequest.input_schema`; a `copy_to`
+context (format + path) is threaded onto the bind exactly like `copy_from`.
+
+**Teardown.** The buffered operator's cancel-dispatch/in-flight machinery is **re-implemented** on
+DuckDB's `GlobalFunctionData`/`LocalFunctionData` (different base classes), with a best-effort
+`table_buffering_destructor` to free worker `BoundStorage`.
+
+**Ordering.** Default is the parallel sharded sink (unordered). A writer that needs source order
+declares `Meta.sink_order_dependent = True`; discovery surfaces it as `CopyFromFormatInfo.ordered`,
+and registration installs a single-thread execution mode (`REGULAR_COPY_TO_FILE`) for that format
+(the per-format execution_mode is chosen at registration since the callback is a bare pointer with no
+bind-data access). `vgi_copy_formats().ordered` reports it.
+
+**Registration is direction-gated** (`fmt.direction` ∈ `from`/`to`/`both`): one alias-scoped
+`CopyFunction` carries the FROM and/or TO callbacks. Rejects `PARTITION_BY`/`PER_THREAD_OUTPUT`/
+rotation. **Worker API (vgi-python):** subclass `CopyToFunction`, implement `write` (per shard) +
+`close` (terminal write). **Files:** `src/vgi_copy_to_impl.{cpp,hpp}`; `vgi/copy_to_function.py`,
+`vgi/_test_fixtures/copy_to.py`. Tests: `test/sql/integration/copy_to/*`,
+`vgi-python/tests/test_copy_to_function.py`. Same DETACH limitation as COPY FROM. See
+[docs/copy_to.md](docs/copy_to.md).
+
 **Files.** `src/vgi_copy_from_impl.cpp`, `src/include/vgi_copy_from_impl.hpp`; threading in
 `vgi_rpc_types.cpp`/`vgi_bind_protocol.cpp`/`vgi_function_connection.cpp`; discovery in
 `vgi_catalog_api.cpp`; registration + diagnostic in `vgi_extension.cpp`. vgi-python:
@@ -393,7 +429,7 @@ The `launch:` and `unix://` paths share one warm worker process across every Duc
 | `vgi_oauth_identity()` | Table | OIDC identity per attached VGI catalog: `catalog_name`, `origin`, `authenticated`, `sub`, `email`, `name`, `issuer`, `claims` (JSON). Claims carry the full decoded id_token payload — reach provider-specific fields via e.g. `claims->>'$.preferred_username'` for Entra, `claims->>'$.hd'` for Google Workspace, etc. |
 | `vgi_table_branches()` | Table | Diagnostic: one row per branch per VGI table across every attached VGI catalog. Columns: `catalog_name`, `schema_name`, `table_name`, `branch_index`, `function_name`, `positional_arguments` (JSON), `named_arguments` (JSON), `branch_filter`, `table_required_extensions` (LIST). Used to introspect multi-branch tables. See [docs/multi_branch.md](docs/multi_branch.md). |
 | `vgi_function_arguments()` | Table | Diagnostic: one row per (catalog, schema, function/macro, argument) across every attached VGI catalog. Covers scalar/table/aggregate **functions** and scalar/table **macros** (`function_type` is `scalar`/`table`/`aggregate` for functions, `scalar_macro`/`table_macro` for macros). Columns: `catalog_name`, `schema_name`, `function_name`, `function_type`, `arg_position` (NULL for named/varargs), `field_index`, `arg_name`, `arg_type`, `arg_description` (the `vgi_doc` field metadata; NULL when undocumented), `is_named`, `is_positional`, `is_const`, `is_varargs`, `is_table_input`, `is_any_type`. Surfaces per-argument detail that `duckdb_functions()` flattens away. Filter with `WHERE catalog_name = '...'`. Reports each catalog's current data version (no time travel). |
-| `vgi_copy_formats()` | Table | Diagnostic: one row per (catalog, format, direction, option) for every custom `COPY ... FROM` format registered by attached VGI catalogs. Columns: `catalog_name`, `format_name` (alias-scoped — the exact `FORMAT` string to type), `direction` (`from`), `format_description`, `format_comment`, `format_tags` (MAP), `handler`, `option_name`, `option_type`, `option_description`. See [docs/copy_from.md](docs/copy_from.md) |
+| `vgi_copy_formats()` | Table | Diagnostic: one row per (catalog, format, direction, option) for every custom `COPY ... FROM`/`TO` format registered by attached VGI catalogs. Columns: `catalog_name`, `format_name` (alias-scoped — the exact `FORMAT` string to type), `direction` (`from`/`to`/`both`), `ordered` (BOOLEAN — TO single-thread/source-ordered sink), `format_description`, `format_comment`, `format_tags` (MAP), `handler`, `option_name`, `option_type`, `option_description`. See [docs/copy_from.md](docs/copy_from.md), [docs/copy_to.md](docs/copy_to.md) |
 | `vgi_secret_providers()` | Table | Diagnostic: one row per auto-registered Orchard remote secret provider. Columns: `catalog_name`, `endpoint`, `tie_break_offset`, `active`, `cached_secrets`, `ttl_seconds`. See *Remote Secret Provider* |
 | `vgi_secret_provider_flush(catalog := NULL)` | Table | Clear a provider's TTL cache (all providers when `catalog` omitted). Returns the count of positive secrets dropped |
 
@@ -428,6 +464,7 @@ The `launch:` and `unix://` paths share one warm worker process across every Duc
 | `vgi_table_branches_function.cpp` | `vgi_table_branches()` SQL diagnostic — one row per branch per VGI table across every attached VGI catalog |
 | `vgi_function_arguments_function.cpp` | `vgi_function_arguments()` SQL diagnostic — one row per function/macro argument across every attached VGI catalog (named/positional/const/varargs/type + `vgi_doc` description; macros surface as scalar_macro/table_macro) |
 | `vgi_copy_from_impl.cpp` | Custom `COPY ... FROM` format support: `VgiCopyFromFunctionInfo` carrier (self-contained, no `Catalog&` — outlives DETACH), `VgiCopyFromBind` (option validation/coercion + bind + hard schema check), and `MakeVgiCopyFromTableFunction` (reuses the producer-mode table-function scan). Attach-time registration + the `vgi_copy_formats()` diagnostic live in `vgi_extension.cpp` (per-DB format registry on `VgiStorageExtension`). See [docs/copy_from.md](docs/copy_from.md) |
+| `vgi_copy_to_impl.cpp` | Custom `COPY ... TO` format support: `VgiCopyToFunctionInfo` carrier (rides `CopyFunction::function_info`), the `copy_to_*` sink callbacks (parallel sink → per-thread workers via `table_buffering_process`; terminal write in `copy_to_finalize` via `table_buffering_combine`; no Source phase), gstate/lstate with cancel-dispatch teardown, and `initialize_operator` that rejects `PARTITION_BY`/`PER_THREAD_OUTPUT`/rotation. See [docs/copy_to.md](docs/copy_to.md) |
 | `vgi_multi_scan_rewriter.cpp` | `VgiMultiScanRewriter` — pre-pushdown `OptimizerExtension` that rewrites multi-branch `LogicalGet(marker)` into `LogicalSetOperation(UNION_ALL, [LogicalProjection(LogicalFilter(branch_filter, LogicalGet(branch_fn))), ...])`. Includes a minimal v1.0 `branch_filter` binder (col OP const, AND/OR). See [docs/multi_branch.md](docs/multi_branch.md) for the user-facing reference |
 | `vgi_shm_segment.cpp` | `VgiShmSegment`: posix shm allocator + zero-copy chained-buffer reader for the shared-memory transport (see *Shared-Memory Transport*) |
 | `vgi_container_runtime.cpp` | Container (OCI/Docker) transport: runtime detection, image-label volume inspection, `docker run` command construction, per-process launch registry, `ContainerWorker` (force-removes its container on teardown), and the shared `SpawnWorker()` used by both worker spawn sites. See [docs/container-transport.md](docs/container-transport.md) |

@@ -320,6 +320,9 @@ AcquireAndBindResult AcquireAndBindConnection(ClientContext &context, const Func
 			if (params.copy_from) {
 				conn->SetCopyFromContext(*params.copy_from);
 			}
+			if (params.copy_to) {
+				conn->SetCopyToContext(*params.copy_to);
+			}
 			bind_result = conn->PerformBindRpc();
 			return true; // Success
 		} catch (const IOException &e) {
@@ -528,7 +531,8 @@ BindResult FunctionConnection::PerformBindRpc() {
 	                                        arguments_array_, input_schema_, attach_opaque_data_,
 	                                        transaction_opaque_data_, settings_, required_secrets_,
 	                                        worker_path_, transport_fn, at_unit_, at_value_,
-	                                        copy_from_ ? &*copy_from_ : nullptr);
+	                                        copy_from_ ? &*copy_from_ : nullptr,
+	                                        copy_to_ ? &*copy_to_ : nullptr);
 
 	DrainStderrLog();
 

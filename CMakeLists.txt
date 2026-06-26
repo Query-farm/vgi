@@ -108,6 +108,7 @@ src/vgi_multi_scan_rewriter.cpp
 src/vgi_table_branches_function.cpp
 src/vgi_function_arguments_function.cpp
 src/vgi_copy_from_impl.cpp
+src/vgi_copy_to_impl.cpp
 src/vgi_table_buffering_builders.cpp
 src/vgi_table_buffering_impl.cpp
 src/vgi_catalog_api.cpp

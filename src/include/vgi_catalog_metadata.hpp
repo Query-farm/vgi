@@ -387,7 +387,8 @@ std::optional<VgiPartitionKind> ParseVgiPartitionKind(const std::string &value);
 struct VgiCopyFromFormatInfo {
 	std::string format_name;       // SQL FORMAT identifier (global namespace)
 	std::string handler;           // worker table-function that performs the read
-	std::string direction = "from"; // "from" only today; "to" reserved
+	std::string direction = "from"; // "from" | "to" | "both"
+	bool ordered = false;          // COPY TO: single-thread sink (source order) when true
 	std::string description;       // intrinsic doc (handler Meta.description)
 	std::optional<std::string> comment; // free-text comment (nullopt if unset)
 	std::map<std::string, std::string> tags;
