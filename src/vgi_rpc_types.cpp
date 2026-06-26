@@ -497,11 +497,12 @@ BuildBindRequest(const std::string &function_name, const std::vector<uint8_t> &a
                  const std::string &function_type, const std::vector<uint8_t> &input_schema_bytes,
                  const std::vector<uint8_t> &settings_bytes, const std::vector<uint8_t> &secrets_bytes,
                  const std::vector<uint8_t> &attach_opaque_data, const std::vector<uint8_t> &transaction_opaque_data,
-                 bool resolved_secrets_provided, const std::string &at_unit, const std::string &at_value) {
+                 bool resolved_secrets_provided, const std::string &at_unit, const std::string &at_value,
+                 const CopyFromBindContext *copy_from) {
 	// FunctionType enum: SCALAR, TABLE, AGGREGATE
 	static const std::vector<std::string> function_type_values = {"SCALAR", "TABLE", "AGGREGATE"};
 
-	auto schema = arrow::schema({
+	std::vector<std::shared_ptr<arrow::Field>> fields = {
 	    arrow::field("function_name", arrow::utf8(), false),
 	    arrow::field("arguments", arrow::binary(), false),
 	    arrow::field("function_type", arrow::dictionary(arrow::int16(), arrow::utf8()), false),
@@ -515,7 +516,7 @@ BuildBindRequest(const std::string &function_name, const std::vector<uint8_t> &a
 	    // Python BindRequest dataclass fields (matched by name, not position).
 	    arrow::field("at_unit", arrow::utf8(), true),
 	    arrow::field("at_value", arrow::utf8(), true),
-	});
+	};
 
 	std::vector<std::shared_ptr<arrow::Array>> arrays;
 	arrays.push_back(BuildStringScalar(function_name));
@@ -537,7 +538,30 @@ BuildBindRequest(const std::string &function_name, const std::vector<uint8_t> &a
 	arrays.push_back(BuildNullableStringScalar(at_unit));
 	arrays.push_back(BuildNullableStringScalar(at_value));
 
-	return arrow::RecordBatch::Make(schema, 1, arrays);
+	// copy_from: nested struct<format, file_path, expected_schema>, only added
+	// for a COPY ... FROM scan. The Python worker matches BindRequest fields by
+	// name and defaults this to None when absent, so omitting it for ordinary
+	// scans is wire-safe. Built as a 1-row, non-null struct.
+	if (copy_from) {
+		auto copy_from_type = arrow::struct_({
+		    arrow::field("format", arrow::utf8(), false),
+		    arrow::field("file_path", arrow::utf8(), false),
+		    arrow::field("expected_schema", arrow::binary(), false),
+		});
+		std::vector<std::shared_ptr<arrow::Array>> children = {
+		    BuildStringScalar(copy_from->format),
+		    BuildStringScalar(copy_from->file_path),
+		    BuildBinaryScalar(copy_from->expected_schema_bytes),
+		};
+		auto struct_result = arrow::StructArray::Make(children, copy_from_type->fields());
+		if (!struct_result.ok()) {
+			throw IOException("Failed to build copy_from struct array: %s", struct_result.status().ToString());
+		}
+		fields.push_back(arrow::field("copy_from", copy_from_type, true));
+		arrays.push_back(struct_result.ValueUnsafe());
+	}
+
+	return arrow::RecordBatch::Make(arrow::schema(fields), 1, arrays);
 }
 
 // ============================================================================

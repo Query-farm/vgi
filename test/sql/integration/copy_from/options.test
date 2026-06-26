@@ -1,0 +1,119 @@
+# name: test/sql/integration/copy_from/options.test
+# description: COPY ... FROM option handling (defaults, pass-through, validation, introspection)
+# group: [vgi_integration_copy_from]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS acme (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# --- Registration / introspection: the format's options are documented -------
+query TTTT
+SELECT format_name, option_name, option_type, option_description
+FROM vgi_copy_formats()
+WHERE catalog_name = 'acme'
+ORDER BY option_name;
+----
+acme.example_lines	delimiter	VARCHAR	Field separator
+acme.example_lines	null_string	VARCHAR	Token parsed as SQL NULL
+acme.example_lines	on_error	VARCHAR	Behavior on a row whose column count does not match the target
+acme.example_lines	skip_rows	BIGINT	Leading lines to skip before data
+
+# The format comment + tags round-trip into the system catalog entry.
+query TIT
+SELECT DISTINCT format_comment, cardinality(format_tags), map_extract(format_tags, 'category')[1]
+FROM vgi_copy_formats() WHERE catalog_name = 'acme';
+----
+Toy delimited-text reader for tests	2	copy_from
+
+# --- Default applied: omit delimiter (defaults to ',') -----------------------
+statement ok
+COPY (SELECT * FROM (VALUES (10, 'x'), (20, 'y')) t(a, b))
+TO '__TEST_DIR__/opts_default.txt' (FORMAT csv, HEADER false, DELIMITER ',');
+
+statement ok
+CREATE TABLE d_default (a INTEGER, b VARCHAR);
+
+statement ok
+COPY d_default FROM '__TEST_DIR__/opts_default.txt' (FORMAT 'acme.example_lines', null_string 'NA');
+
+query IT
+SELECT a, b FROM d_default ORDER BY a;
+----
+10	x
+20	y
+
+# --- Pass-through + effect: a non-default delimiter changes parsing -----------
+statement ok
+COPY (SELECT * FROM (VALUES (1, 'p'), (2, 'q')) t(a, b))
+TO '__TEST_DIR__/opts_pipe.txt' (FORMAT csv, HEADER false, DELIMITER '|');
+
+statement ok
+CREATE TABLE d_pipe (a INTEGER, b VARCHAR);
+
+statement ok
+COPY d_pipe FROM '__TEST_DIR__/opts_pipe.txt' (FORMAT 'acme.example_lines', null_string 'NA', delimiter '|');
+
+query IT
+SELECT a, b FROM d_pipe ORDER BY a;
+----
+1	p
+2	q
+
+# --- skip_rows (INTEGER, coerced from the supplied value) --------------------
+# Single-column raw lines (delimiter '~' is absent from the data, so the writer
+# never quotes the comma-containing lines).
+statement ok
+COPY (SELECT line FROM (VALUES (1, '# header'), (2, '1,a'), (3, '2,b')) t(ord, line) ORDER BY ord)
+TO '__TEST_DIR__/opts_skip.txt' (FORMAT csv, HEADER false, DELIMITER '~');
+
+statement ok
+CREATE TABLE d_skip (a INTEGER, b VARCHAR);
+
+statement ok
+COPY d_skip FROM '__TEST_DIR__/opts_skip.txt' (FORMAT 'acme.example_lines', null_string 'NA', skip_rows 1);
+
+query IT
+SELECT a, b FROM d_skip ORDER BY a;
+----
+1	a
+2	b
+
+# --- Unknown option -> clear bind error --------------------------------------
+statement ok
+CREATE TABLE d_bad (a INTEGER, b VARCHAR);
+
+statement error
+COPY d_bad FROM '__TEST_DIR__/opts_default.txt' (FORMAT 'acme.example_lines', null_string 'NA', bogus 1);
+----
+Unsupported option 'bogus'
+
+# --- Required option missing -> error (worker-side enforcement) --------------
+statement error
+COPY d_bad FROM '__TEST_DIR__/opts_default.txt' (FORMAT 'acme.example_lines');
+----
+null_string
+
+# --- Worker-side semantic handling: on_error = 'skip' drops a bad row --------
+statement ok
+COPY (SELECT line FROM (VALUES (1, '1,a'), (2, 'BADROW'), (3, '3,c')) t(ord, line) ORDER BY ord)
+TO '__TEST_DIR__/opts_onerror.txt' (FORMAT csv, HEADER false, DELIMITER '~');
+
+statement ok
+CREATE TABLE d_onerror (a INTEGER, b VARCHAR);
+
+statement ok
+COPY d_onerror FROM '__TEST_DIR__/opts_onerror.txt' (FORMAT 'acme.example_lines', null_string 'NA', on_error 'skip');
+
+query IT
+SELECT a, b FROM d_onerror ORDER BY a;
+----
+1	a
+3	c
+
+statement ok
+DETACH acme;

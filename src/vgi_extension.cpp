@@ -58,11 +58,15 @@
 #include "vgi_cancel_dispatcher.hpp"
 #include "vgi_catalog_rpc.hpp"
 #include "vgi_catalogs.hpp"
+#include "vgi_copy_from_impl.hpp"
+#include "vgi_exception.hpp"
+#include "vgi_protocol_constants.hpp"
 #include "vgi_container_runtime.hpp"
 #include "vgi_launcher_internal.hpp"
 #include "vgi_cookie_jar.hpp"
 #include "vgi_function_docs.hpp"
 #include "vgi_logging.hpp"
+#include "duckdb/parser/parsed_data/create_copy_function_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "vgi_aggregate_function_impl.hpp"
 #include "vgi_oauth.hpp"
@@ -1047,6 +1051,46 @@ public:
 		return off;
 	}
 
+	// ---- COPY ... FROM format registry --------------------------------------
+	// Tracks the VGI-registered COPY formats per DB so vgi_copy_formats() can
+	// enumerate them and so ATTACH can detect collisions. The system-catalog
+	// CopyFunction entry persists past DETACH, so entries here also persist
+	// (matching the documented "DETACH can't unregister" limitation).
+	//
+	// Concurrency: callers performing the registry-check + system-catalog
+	// create + record sequence hold CopyFormatMutex() across all three steps to
+	// close the TOCTOU between concurrent ATTACHes (see VgiCatalogAttach).
+	struct CopyFormatEntry {
+		std::string catalog_name;   // owning catalog attach alias (may later be detached)
+		std::string registered_name; // scoped name registered in the system catalog (what users type)
+		vgi::VgiCopyFromFormatInfo info; // info.format_name is the worker's bare advertised name
+	};
+
+	std::mutex &CopyFormatMutex() {
+		return copy_format_mutex_;
+	}
+
+	// Caller must hold CopyFormatMutex(). key = lowercase format name.
+	const CopyFormatEntry *FindCopyFormatLocked(const std::string &format_key) const {
+		auto it = copy_formats_.find(format_key);
+		return it != copy_formats_.end() ? &it->second : nullptr;
+	}
+
+	// Caller must hold CopyFormatMutex().
+	void InsertCopyFormatLocked(const std::string &format_key, CopyFormatEntry entry) {
+		copy_formats_[format_key] = std::move(entry);
+	}
+
+	std::vector<CopyFormatEntry> AllCopyFormats() const {
+		std::lock_guard<std::mutex> lock(copy_format_mutex_);
+		std::vector<CopyFormatEntry> out;
+		out.reserve(copy_formats_.size());
+		for (auto &kv : copy_formats_) {
+			out.push_back(kv.second);
+		}
+		return out;
+	}
+
 private:
 	mutable std::mutex redact_mutex_;
 	std::unordered_map<std::string, case_insensitive_set_t> redact_keys_;
@@ -1054,6 +1098,8 @@ private:
 	mutable std::mutex secret_mutex_;
 	std::map<std::string, vgi::VgiRemoteSecretStorage *> secret_providers_;
 	int64_t next_secret_offset_ = 100;
+	mutable std::mutex copy_format_mutex_;
+	std::map<std::string, CopyFormatEntry> copy_formats_;
 };
 
 // Create function for VGI secrets — builds a KeyValueSecret from config options.
@@ -1861,6 +1907,95 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 		}
 	}
 
+	// Auto-register custom COPY ... FROM formats advertised by this catalog.
+	// Each format becomes a DuckDB CopyFunction in the system catalog. DuckDB's
+	// COPY format namespace is global and keyed by the exact string the user
+	// types, so we SCOPE the registered name by the attach alias (`name`, which
+	// is unique per DB): `<alias>.<format>`. That makes collisions between
+	// attaches impossible by construction — two attaches of the same worker get
+	// distinct format names — so no opt-out flag is needed. Users write
+	// `COPY t FROM 'p' (FORMAT '<alias>.<format>')`. Old workers that don't
+	// implement the discovery RPC degrade to "no formats". See docs/copy_from.md.
+	{
+		std::vector<vgi::VgiCopyFromFormatInfo> formats;
+		try {
+			vgi::CatalogRpcContext rpc_ctx {attach_params, attach_result_ptr->attach_opaque_data, {}};
+			formats = vgi::InvokeCatalogCopyFromFormats(rpc_ctx, context);
+		} catch (const vgi::VgiRpcException &e) {
+			if (e.GetErrorKind() != vgi::error_kind::kMethodNotImplemented) {
+				throw;
+			}
+			// Old worker: advertises no COPY formats. Continue the ATTACH.
+		}
+
+		if (!formats.empty()) {
+			auto *vgi_ext = VgiStorageExtension::Find(*context.db);
+			auto &system_catalog = Catalog::GetSystemCatalog(*context.db);
+			auto sys_txn = CatalogTransaction::GetSystemTransaction(*context.db);
+			const std::string alias_lower = StringUtil::Lower(name);
+
+			// Collect setting names registered by this catalog so COPY binds can
+			// forward catalog-scoped settings to the worker handler.
+			std::vector<std::string> setting_names;
+			setting_names.reserve(attach_result_ptr->settings.size());
+			for (const auto &setting : attach_result_ptr->settings) {
+				setting_names.push_back(setting.name);
+			}
+
+			for (auto &fmt : formats) {
+				// Scoped, collision-free registered name (lowercased to match the
+				// binder's case-insensitive format lookup).
+				const std::string registered_name = alias_lower + "." + StringUtil::Lower(fmt.format_name);
+
+				// Registry-first under the registry lock. With alias scoping a hit
+				// means a re-ATTACH of the same alias (the prior system-catalog
+				// entry persists past DETACH) — idempotent, skip re-registering.
+				std::lock_guard<std::mutex> lock(vgi_ext->CopyFormatMutex());
+				if (vgi_ext->FindCopyFormatLocked(registered_name)) {
+					continue;
+				}
+
+				// Defensive: refuse if something already owns the scoped name in
+				// the system catalog (shouldn't happen for alias-scoped names).
+				CatalogEntryRetriever retriever {context};
+				auto clash = system_catalog.GetEntry(retriever, DEFAULT_SCHEMA,
+				                                     {CatalogType::COPY_FUNCTION_ENTRY, registered_name},
+				                                     OnEntryNotFound::RETURN_NULL);
+				if (clash) {
+					throw BinderException(
+					    "Cannot register COPY format '%s' for catalog '%s': a COPY format with that name "
+					    "already exists.",
+					    registered_name, name);
+				}
+
+				// Build the CopyFunction. Per-format worker context rides on the
+				// copy_from_function's TableFunctionInfo carrier (self-contained,
+				// no Catalog& — it must outlive DETACH). The carrier keeps the
+				// worker's bare advertised format name for the copy_from context.
+				CopyFunction cf(registered_name);
+				cf.copy_from_bind = vgi::VgiCopyFromBind;
+				cf.copy_from_function = vgi::MakeVgiCopyFromTableFunction();
+				cf.copy_from_function.function_info = make_shared_ptr<vgi::VgiCopyFromFunctionInfo>(
+				    name, attach_params, attach_result_ptr->attach_opaque_data, fmt.format_name, fmt.handler,
+				    fmt.options_schema, setting_names);
+				cf.extension = registered_name;
+
+				CreateCopyFunctionInfo cf_info(std::move(cf));
+				cf_info.comment = fmt.comment.has_value() ? Value(*fmt.comment) : Value();
+				for (auto &tag : fmt.tags) {
+					cf_info.tags[tag.first] = tag.second;
+				}
+				system_catalog.CreateCopyFunction(sys_txn, cf_info);
+
+				VgiStorageExtension::CopyFormatEntry entry;
+				entry.catalog_name = name;
+				entry.registered_name = registered_name;
+				entry.info = fmt;
+				vgi_ext->InsertCopyFormatLocked(registered_name, std::move(entry));
+			}
+		}
+	}
+
 	return make_uniq<VgiCatalog>(db, name, options.access_mode, std::move(attach_params),
 	                              std::move(attach_result_ptr), eager_thresholds);
 }
@@ -2250,6 +2385,134 @@ static void VgiSecretFlushScan(ClientContext &context, TableFunctionInput &data_
 	output.SetCardinality(1);
 }
 
+// ============================================================================
+// vgi_copy_formats() — diagnostic: one row per (catalog, format, direction,
+// option) for every VGI-registered COPY ... FROM format. Modeled on
+// vgi_function_arguments(); reads the per-DB registry on VgiStorageExtension.
+// ============================================================================
+
+struct VgiCopyFormatRow {
+	string catalog_name;
+	string format_name;
+	string direction;
+	string description;
+	bool has_comment = false;
+	string comment;
+	Value tags; // MAP(VARCHAR, VARCHAR)
+	string handler;
+	bool has_option = false;
+	string option_name;
+	string option_type;
+	bool has_option_desc = false;
+	string option_desc;
+};
+
+struct VgiCopyFormatsData : public TableFunctionData {
+	vector<VgiCopyFormatRow> rows;
+	idx_t offset = 0;
+};
+
+static Value TagsToMapValue(const std::map<std::string, std::string> &tags) {
+	vector<Value> keys;
+	vector<Value> values;
+	keys.reserve(tags.size());
+	values.reserve(tags.size());
+	for (auto &kv : tags) {
+		keys.emplace_back(Value(kv.first));
+		values.emplace_back(Value(kv.second));
+	}
+	return Value::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR, std::move(keys), std::move(values));
+}
+
+static unique_ptr<FunctionData> VgiCopyFormatsBind(ClientContext &context, TableFunctionBindInput &input,
+                                                   vector<LogicalType> &return_types, vector<string> &names) {
+	names = {"catalog_name",      "format_name", "direction", "format_description", "format_comment",
+	         "format_tags",       "handler",     "option_name", "option_type",     "option_description"};
+	return_types = {LogicalType::VARCHAR,
+	                LogicalType::VARCHAR,
+	                LogicalType::VARCHAR,
+	                LogicalType::VARCHAR,
+	                LogicalType::VARCHAR,
+	                LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR),
+	                LogicalType::VARCHAR,
+	                LogicalType::VARCHAR,
+	                LogicalType::VARCHAR,
+	                LogicalType::VARCHAR};
+
+	auto data = make_uniq<VgiCopyFormatsData>();
+	auto *ext = VgiStorageExtension::Find(*context.db);
+	if (!ext) {
+		return std::move(data);
+	}
+
+	for (auto &entry : ext->AllCopyFormats()) {
+		const auto &info = entry.info;
+		Value tags_value = TagsToMapValue(info.tags);
+
+		auto base_row = [&]() {
+			VgiCopyFormatRow r;
+			r.catalog_name = entry.catalog_name;
+			// The registered (alias-scoped) name is what users type in FORMAT.
+			r.format_name = entry.registered_name;
+			r.direction = info.direction;
+			r.description = info.description;
+			r.has_comment = info.comment.has_value();
+			r.comment = info.comment.value_or("");
+			r.tags = tags_value;
+			r.handler = info.handler;
+			return r;
+		};
+
+		if (info.options_schema && info.options_schema->num_fields() > 0) {
+			ArrowSchemaWrapper c_schema;
+			ArrowTableSchema arrow_table;
+			vector<LogicalType> types;
+			vector<string> opt_names;
+			vgi::ArrowSchemaToDuckDBTypes(context, info.options_schema, c_schema, arrow_table, types, opt_names);
+			for (idx_t i = 0; i < opt_names.size(); i++) {
+				auto field = info.options_schema->field(static_cast<int>(i));
+				auto row = base_row();
+				row.has_option = true;
+				row.option_name = opt_names[i];
+				row.option_type = (i < types.size() ? types[i] : LogicalType::ANY).ToString();
+				if (field->HasMetadata()) {
+					auto doc = field->metadata()->Get(vgi::VGI_DOC_METADATA_KEY);
+					if (doc.ok() && !doc.ValueUnsafe().empty()) {
+						row.has_option_desc = true;
+						row.option_desc = doc.ValueUnsafe();
+					}
+				}
+				data->rows.push_back(std::move(row));
+			}
+		} else {
+			// Format with no declared options: still emit one row.
+			data->rows.push_back(base_row());
+		}
+	}
+	return std::move(data);
+}
+
+static void VgiCopyFormatsScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &data = data_p.bind_data->CastNoConst<VgiCopyFormatsData>();
+	idx_t count = 0;
+	while (data.offset < data.rows.size() && count < STANDARD_VECTOR_SIZE) {
+		auto &r = data.rows[data.offset];
+		output.SetValue(0, count, Value(r.catalog_name));
+		output.SetValue(1, count, Value(r.format_name));
+		output.SetValue(2, count, Value(r.direction));
+		output.SetValue(3, count, Value(r.description));
+		output.SetValue(4, count, r.has_comment ? Value(r.comment) : Value(LogicalType::VARCHAR));
+		output.SetValue(5, count, r.tags);
+		output.SetValue(6, count, Value(r.handler));
+		output.SetValue(7, count, r.has_option ? Value(r.option_name) : Value(LogicalType::VARCHAR));
+		output.SetValue(8, count, r.has_option ? Value(r.option_type) : Value(LogicalType::VARCHAR));
+		output.SetValue(9, count, r.has_option_desc ? Value(r.option_desc) : Value(LogicalType::VARCHAR));
+		data.offset++;
+		count++;
+	}
+	output.SetCardinality(count);
+}
+
 static void LoadInternal(ExtensionLoader &loader) {
 #if defined(__EMSCRIPTEN__) && VGI_ASYNC_INIT_ENABLED
 	// Pre-spawn a bounded pool of background workers at extension load. Required
@@ -2605,6 +2868,16 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	// Register Orchard remote secret provider diagnostics
 	{
+		TableFunction copy_formats_func("vgi_copy_formats", {}, VgiCopyFormatsScan, VgiCopyFormatsBind);
+		CreateTableFunctionInfo copy_formats_info(copy_formats_func);
+		copy_formats_info.descriptions.push_back(vgi::MakeFunctionDescription(
+		    "List the custom COPY ... FROM formats registered by attached VGI catalogs, one row per (catalog, "
+		    "format, direction, option). Format names are scoped by the attach alias ('<alias>.<format>') — the "
+		    "'format_name' column is the exact string to type in FORMAT. Options surface name/type/description "
+		    "from the handler's argument metadata.",
+		    {}, {}, {"SELECT * FROM vgi_copy_formats();"}));
+		loader.RegisterFunction(std::move(copy_formats_info));
+
 		TableFunction providers_func("vgi_secret_providers", {}, VgiSecretProvidersScan, VgiSecretProvidersBind);
 		CreateTableFunctionInfo providers_info(providers_func);
 		providers_info.descriptions.push_back(vgi::MakeFunctionDescription(

@@ -15,6 +15,7 @@
 #include "vgi_catalog_metadata.hpp"
 #include "vgi_http_client.hpp"
 #include "vgi_ifunction_connection.hpp"
+#include "vgi_rpc_types.hpp" // CopyFromBindContext (complete type for optional<> member)
 #include "vgi_protocol.hpp"
 #include "vgi_worker_pool.hpp" // complete PooledWorker for inline ReleaseForPooling()
 
@@ -57,6 +58,9 @@ public:
 	void SetAtClause(const std::string &at_unit, const std::string &at_value) override {
 		at_unit_ = at_unit;
 		at_value_ = at_value;
+	}
+	void SetCopyFromContext(const CopyFromBindContext &copy_from) override {
+		copy_from_ = copy_from;
 	}
 	void UpdateInputSchemaForExecution(const std::shared_ptr<arrow::Schema> &input_schema) override;
 
@@ -157,6 +161,9 @@ private:
 	// Time-travel AT clause (empty = none) for the bind request. See SetAtClause.
 	std::string at_unit_;
 	std::string at_value_;
+
+	// COPY ... FROM context for the bind request (empty = none). See SetCopyFromContext.
+	std::optional<CopyFromBindContext> copy_from_;
 
 	// Server capabilities (lazy-discovered)
 	ServerCapabilities capabilities_;

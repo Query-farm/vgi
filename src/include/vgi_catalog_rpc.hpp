@@ -113,6 +113,13 @@ std::vector<VgiFunctionInfo> InvokeCatalogSchemaContentsFunctions(
     const CatalogRpcContext &ctx, const std::string &schema_name,
     const std::string &function_type, ClientContext &context);
 
+// Invoke catalog_copy_from_formats: list custom COPY ... FROM formats this
+// catalog advertises (catalog-level, not schema-scoped). Returns an empty
+// vector when the worker advertises none. Callers must treat a
+// MethodNotImplementedError / ProtocolVersionError from an old worker as "no
+// formats" (handled at the ATTACH call site, not here).
+std::vector<VgiCopyFromFormatInfo> InvokeCatalogCopyFromFormats(const CatalogRpcContext &ctx, ClientContext &context);
+
 // Invoke catalog_table_get: get a specific table's metadata
 // Returns nullopt if table not found (empty response)
 std::optional<VgiTableInfo> InvokeCatalogTableGet(const CatalogRpcContext &ctx,

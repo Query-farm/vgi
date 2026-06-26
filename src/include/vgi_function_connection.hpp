@@ -19,6 +19,7 @@
 #include "vgi_arrow_utils.hpp"
 #include "vgi_ifunction_connection.hpp"
 #include "vgi_protocol.hpp"
+#include "vgi_rpc_types.hpp" // CopyFromBindContext (complete type for optional<> member)
 #include "vgi_stderr_drainer.hpp"
 #include "vgi_subprocess.hpp"
 #include "vgi_worker_pool.hpp"
@@ -60,6 +61,12 @@ struct FunctionConnectionParams {
 	// (the inline-bind path passes bind_data.at_* to BuildBindRequestBytes directly).
 	std::string at_unit;
 	std::string at_value;
+
+	// COPY ... FROM context for this scan; set only for a COPY-FROM bind.
+	// Threaded into the bind request (and, via reused bind_request_bytes, into
+	// init_call.bind_call.copy_from) so the worker's CopyFromFunction reads the
+	// source path + target schema. Empty optional for ordinary scans.
+	std::optional<CopyFromBindContext> copy_from;
 
 	// Optional input schema, required for function types that bind with a
 	// typed input stream (table-in-out, scalar). If set, AcquireAndBindConnection
@@ -203,6 +210,10 @@ public:
 	void SetAtClause(const std::string &at_unit, const std::string &at_value) override {
 		at_unit_ = at_unit;
 		at_value_ = at_value;
+	}
+
+	void SetCopyFromContext(const CopyFromBindContext &copy_from) override {
+		copy_from_ = copy_from;
 	}
 
 	// Update input schema for execution phase (when DataChunk types differ from bind types)
@@ -386,6 +397,9 @@ private:
 	// Time-travel AT clause (empty = none) for the bind request. See SetAtClause.
 	std::string at_unit_;
 	std::string at_value_;
+
+	// COPY ... FROM context for the bind request (empty = none). See SetCopyFromContext.
+	std::optional<CopyFromBindContext> copy_from_;
 
 	// Input data writer for exchange-mode functions
 	std::shared_ptr<arrow::ipc::RecordBatchWriter> input_writer_;

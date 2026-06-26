@@ -317,6 +317,9 @@ AcquireAndBindResult AcquireAndBindConnection(ClientContext &context, const Func
 				conn->SetInputSchema(params.input_schema);
 			}
 			conn->SetAtClause(params.at_unit, params.at_value);
+			if (params.copy_from) {
+				conn->SetCopyFromContext(*params.copy_from);
+			}
 			bind_result = conn->PerformBindRpc();
 			return true; // Success
 		} catch (const IOException &e) {
@@ -524,7 +527,8 @@ BindResult FunctionConnection::PerformBindRpc() {
 	auto bind_result = PerformBindProtocol(context_, function_name_, function_type_,
 	                                        arguments_array_, input_schema_, attach_opaque_data_,
 	                                        transaction_opaque_data_, settings_, required_secrets_,
-	                                        worker_path_, transport_fn, at_unit_, at_value_);
+	                                        worker_path_, transport_fn, at_unit_, at_value_,
+	                                        copy_from_ ? &*copy_from_ : nullptr);
 
 	DrainStderrLog();
 

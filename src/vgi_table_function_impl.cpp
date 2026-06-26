@@ -317,6 +317,7 @@ void PerformVgiTableFunctionBind(ClientContext &context, VgiTableFunctionBindDat
 	params.function_type = "TABLE";
 	params.at_unit = bind_data.at_unit;
 	params.at_value = bind_data.at_value;
+	params.copy_from = bind_data.copy_from;
 
 	auto result = AcquireAndBindConnection(context, params);
 	auto bind_worker_pid = result.connection ? result.connection->GetSubprocessPid().value_or(-1) : -1;

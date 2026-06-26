@@ -381,6 +381,23 @@ enum class VgiPartitionKind {
 std::optional<VgiPartitionKind> ParseVgiPartitionKind(const std::string &value);
 
 // ============================================================================
+// Custom COPY ... FROM format advertised by a catalog (matches Python
+// CopyFromFormatInfo). The extension registers one DuckDB CopyFunction per
+// entry at ATTACH; see vgi_copy_from_impl.{hpp,cpp}.
+struct VgiCopyFromFormatInfo {
+	std::string format_name;       // SQL FORMAT identifier (global namespace)
+	std::string handler;           // worker table-function that performs the read
+	std::string direction = "from"; // "from" only today; "to" reserved
+	std::string description;       // intrinsic doc (handler Meta.description)
+	std::optional<std::string> comment; // free-text comment (nullopt if unset)
+	std::map<std::string, std::string> tags;
+	// Option schema: deserialized Arrow schema of the format's options, built
+	// from the handler's Arg-annotated arguments (same encoding parsed by
+	// vgi_function_arguments()). Null when the format declares no options.
+	std::shared_ptr<arrow::Schema> options_schema;
+};
+
+// ============================================================================
 // Function metadata from the worker (matches Python FunctionInfo)
 struct VgiFunctionInfo {
 	std::string name;
@@ -538,6 +555,10 @@ VgiFunctionInfo ParseFunctionInfo(const std::shared_ptr<arrow::RecordBatch> &bat
 
 // Parse a VgiViewInfo from an Arrow RecordBatch (single row)
 VgiViewInfo ParseViewInfo(const std::shared_ptr<arrow::RecordBatch> &batch, const std::string &worker_path);
+
+// Parse a VgiCopyFromFormatInfo from an Arrow RecordBatch (single row)
+VgiCopyFromFormatInfo ParseCopyFromFormatInfo(const std::shared_ptr<arrow::RecordBatch> &batch,
+                                              const std::string &worker_path);
 
 // Parse a VgiMacroInfo from an Arrow RecordBatch (single row)
 VgiMacroInfo ParseMacroInfo(const std::shared_ptr<arrow::RecordBatch> &batch, const std::string &worker_path);

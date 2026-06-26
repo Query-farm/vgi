@@ -518,6 +518,24 @@ std::vector<VgiMacroInfo> InvokeCatalogSchemaContentsMacros(
 	return macros;
 }
 
+std::vector<VgiCopyFromFormatInfo> InvokeCatalogCopyFromFormats(const CatalogRpcContext &ctx, ClientContext &context) {
+	auto &worker_path = ctx.params->worker_path();
+	auto params = generated::BuildCatalogCopyFromFormatsParams(ctx.attach_opaque_data, OptTxn(ctx));
+	auto response = InvokeRpcMethod(ctx, "catalog_copy_from_formats", params, context);
+	auto result_batch = ExtractAndDeserializeResult(response, "catalog_copy_from_formats", worker_path);
+	if (!result_batch) {
+		return {};
+	}
+
+	auto info_batches = UnwrapAndValidateItems(result_batch, "catalog_copy_from_formats", worker_path);
+	std::vector<VgiCopyFromFormatInfo> formats;
+	formats.reserve(info_batches.size());
+	for (const auto &info_batch : info_batches) {
+		formats.push_back(ParseCopyFromFormatInfo(info_batch, worker_path));
+	}
+	return formats;
+}
+
 std::optional<VgiTableInfo> InvokeCatalogTableGet(const CatalogRpcContext &ctx,
                                                    const std::string &schema_name, const std::string &table_name,
                                                    ClientContext &context) {
@@ -1975,6 +1993,34 @@ VgiViewInfo ParseViewInfo(const std::shared_ptr<arrow::RecordBatch> &batch, cons
 	info.comment = row["comment"].value_or("");
 	info.tags = row["tags"].value_not_null<std::map<std::string, std::string>>();
 	info.column_comments = row["column_comments"].value_not_null<std::map<std::string, std::string>>();
+
+	return info;
+}
+
+VgiCopyFromFormatInfo ParseCopyFromFormatInfo(const std::shared_ptr<arrow::RecordBatch> &batch,
+                                              const std::string &worker_path) {
+	VgiCopyFromFormatInfo info;
+
+	if (!batch || batch->num_rows() == 0) {
+		throw IOException("Empty response from catalog_copy_from_formats [worker: %s]", worker_path);
+	}
+
+	RecordBatchSingleRow row(batch, 0, "CopyFromFormatInfo", worker_path);
+	info.format_name = row["format_name"].value_not_null<std::string>();
+	info.handler = row["handler"].value_not_null<std::string>();
+	info.direction = row["direction"].value_or(std::string("from"));
+	info.description = row["description"].value_or("");
+	if (auto comment = row["comment"].as<std::string>()) {
+		info.comment = *comment;
+	}
+	info.tags = row["tags"].value_not_null<std::map<std::string, std::string>>();
+
+	// options: serialized Arrow schema (the handler's arg schema). Non-nullable
+	// per protocol but may be an empty (zero-field) schema when no options.
+	auto options_data = row["options"].value_not_null<std::vector<uint8_t>>();
+	if (!options_data.empty()) {
+		info.options_schema = DeserializeSchema(options_data);
+	}
 
 	return info;
 }

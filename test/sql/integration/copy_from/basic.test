@@ -1,0 +1,69 @@
+# name: test/sql/integration/copy_from/basic.test
+# description: COPY ... FROM backed by a VGI worker custom format (example_lines)
+# group: [vgi_integration_copy_from]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS acme (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# The catalog advertises its custom COPY format, scoped by the attach alias.
+query TTT
+SELECT catalog_name, format_name, direction
+FROM vgi_copy_formats()
+WHERE catalog_name = 'acme' AND option_name = 'delimiter';
+----
+acme	acme.example_lines	from
+
+# Write a delimited source file, then import it through the worker format.
+statement ok
+COPY (SELECT * FROM (VALUES (1, 'foo'), (2, 'NA'), (3, 'baz')) t(a, b))
+TO '__TEST_DIR__/copy_from_basic.txt' (FORMAT csv, HEADER false, DELIMITER ',');
+
+statement ok
+CREATE TABLE dst (a INTEGER, b VARCHAR);
+
+statement ok
+COPY dst FROM '__TEST_DIR__/copy_from_basic.txt' (FORMAT 'acme.example_lines', null_string 'NA');
+
+# Rows landed in the LOCAL table; the null_string option mapped 'NA' -> NULL.
+query IT
+SELECT a, b FROM dst ORDER BY a;
+----
+1	foo
+2	NULL
+3	baz
+
+# A second attach of the same worker registers a distinct, non-colliding format
+# name (scoped by alias) — the two coexist without trampling.
+statement ok
+ATTACH 'example' AS other (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+query TT
+SELECT catalog_name, format_name
+FROM vgi_copy_formats()
+WHERE option_name = 'delimiter' ORDER BY catalog_name;
+----
+acme	acme.example_lines
+other	other.example_lines
+
+statement ok
+CREATE TABLE dst2 (a INTEGER, b VARCHAR);
+
+statement ok
+COPY dst2 FROM '__TEST_DIR__/copy_from_basic.txt' (FORMAT 'other.example_lines', null_string 'NA');
+
+query I
+SELECT count(*) FROM dst2;
+----
+3
+
+statement ok
+DETACH acme;
+
+statement ok
+DETACH other;

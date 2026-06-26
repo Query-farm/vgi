@@ -373,7 +373,8 @@ BindResult HttpFunctionConnection::PerformBindRpc() {
 	auto bind_result = PerformBindProtocol(context_, function_name_, function_type_,
 	                                        arguments_array_, input_schema_, attach_opaque_data_,
 	                                        transaction_opaque_data_, settings_, required_secrets_,
-	                                        base_url_, transport_fn, at_unit_, at_value_);
+	                                        base_url_, transport_fn, at_unit_, at_value_,
+	                                        copy_from_ ? &*copy_from_ : nullptr);
 
 	{
 		auto fields = BuildConnLogFields(*this);

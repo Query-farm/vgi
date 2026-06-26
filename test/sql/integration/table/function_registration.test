@@ -53,13 +53,15 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 #   table/filtered_columns_pushdown.test)
 # 1 OVERLAPPING_PARTITIONS reference fixture (overlapping_range_partitioned,
 #   see table/partition_columns.test)
-# = 95
+# 1 COPY ... FROM reader fixture (example_lines_copy_reader, registered as a
+#   table function; backs the example_lines COPY format — see copy_from/*.test)
+# = 96
 query I
 SELECT COUNT(*)
 FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'table';
 ----
-95
+96
 
 # The 33 pure table functions (no TABLE parameter type)
 # Note: make_series appears 5 times (5 overloads), make_pairs appears 3 times,

@@ -239,6 +239,12 @@ struct VgiTableFunctionBindData : public TableFunctionData {
 	std::string at_unit;
 	std::string at_value;
 
+	//! COPY ... FROM context. Set only by VgiCopyFromBind (the copy_from_bind
+	//! entry for a registered COPY format); empty for all other scans. Threaded
+	//! into the bind request so the worker's CopyFromFunction reads the source
+	//! path + target schema; the init reuses the same bind_request_bytes.
+	std::optional<CopyFromBindContext> copy_from;
+
 	//! Deep-copy for DuckDB's late-materialization optimizer, which clones the
 	//! LogicalGet (and hence this bind data) via CreateLHSGet to build the
 	//! narrow ordering-scan LHS. Shares the immutable Arrow conversion state

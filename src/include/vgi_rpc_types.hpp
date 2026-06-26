@@ -106,6 +106,16 @@ BuildOptionalStringMapScalar(const std::optional<std::vector<std::pair<std::stri
 // BindRequest / BindResponse
 // ============================================================================
 
+// COPY ... FROM context attached to a BindRequest (and, via the reused
+// bind_request_bytes, to the InitRequest's bind_call). Set only for a COPY-FROM
+// scan; nullptr/empty otherwise. Mirrors Python's CopyFromContext dataclass:
+//   format: utf8, file_path: utf8, expected_schema: binary (IPC schema bytes).
+struct CopyFromBindContext {
+	std::string format;
+	std::string file_path;
+	std::vector<uint8_t> expected_schema_bytes;
+};
+
 // Build a BindRequest as a RecordBatch (for serialization to IPC bytes).
 // Fields match Python BindRequest dataclass:
 //   function_name: utf8
@@ -128,7 +138,8 @@ std::shared_ptr<arrow::RecordBatch> BuildBindRequest(
     const std::vector<uint8_t> &transaction_opaque_data = {},
     bool resolved_secrets_provided = false,
     const std::string &at_unit = {},    // time travel; empty = null
-    const std::string &at_value = {});  // time travel; empty = null
+    const std::string &at_value = {},   // time travel; empty = null
+    const CopyFromBindContext *copy_from = nullptr);  // COPY FROM; null = omit field
 
 // Parsed BindResponse
 struct BindResponseResult {

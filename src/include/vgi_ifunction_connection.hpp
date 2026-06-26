@@ -26,6 +26,7 @@ namespace vgi {
 class PooledWorker;
 struct VgiAttachParameters;
 struct VgiSecretRequirement;
+struct CopyFromBindContext;
 
 // ============================================================================
 // IFunctionConnection - Abstract interface for VGI function connections
@@ -74,6 +75,14 @@ public:
 	virtual void SetAtClause(const std::string &at_unit, const std::string &at_value) {
 		(void)at_unit;
 		(void)at_value;
+	}
+
+	// Set the COPY ... FROM context (source path + target schema) carried into
+	// the bind request so a worker CopyFromFunction reads it at bind/init via
+	// init_call.bind_call.copy_from. Default no-op: only the real
+	// subprocess/HTTP connections override it.
+	virtual void SetCopyFromContext(const CopyFromBindContext &copy_from) {
+		(void)copy_from;
 	}
 
 	// Update input schema for execute phase (after bind, before OpenInputWriter)

@@ -22,7 +22,8 @@ std::vector<uint8_t> BuildBindRequestBytes(
     bool resolved_secrets_provided,
     const std::string &worker_label,
     const std::string &at_unit,
-    const std::string &at_value) {
+    const std::string &at_value,
+    const CopyFromBindContext *copy_from) {
 
 	// 1. Convert arguments to IPC bytes (Python expects a struct column "args")
 	std::vector<uint8_t> arguments_bytes;
@@ -63,7 +64,7 @@ std::vector<uint8_t> BuildBindRequestBytes(
 	auto bind_request = BuildBindRequest(function_name, arguments_bytes, function_type,
 	                                     input_schema_bytes, settings_bytes, secrets_bytes,
 	                                     attach_opaque_data, transaction_opaque_data, resolved_secrets_provided,
-	                                     at_unit, at_value);
+	                                     at_unit, at_value, copy_from);
 	return SerializeToIpcBytes(bind_request);
 }
 
@@ -116,7 +117,8 @@ BindResult PerformBindProtocol(
     const std::string &worker_label,
     const BindTransportFn &transport_fn,
     const std::string &at_unit,
-    const std::string &at_value) {
+    const std::string &at_value,
+    const CopyFromBindContext *copy_from) {
 
 	// Resolve unscoped + static-scope/name secrets up front. Scoped secrets
 	// requested by the worker mid-bind are merged in below if needed.
@@ -126,7 +128,7 @@ BindResult PerformBindProtocol(
 	auto bind_request_bytes = BuildBindRequestBytes(
 	    context, function_name, function_type, arguments_array, input_schema,
 	    attach_opaque_data, transaction_opaque_data, settings, secrets,
-	    /*resolved_secrets_provided=*/false, worker_label, at_unit, at_value);
+	    /*resolved_secrets_provided=*/false, worker_label, at_unit, at_value, copy_from);
 
 	// Send first bind and read response.
 	auto bind_response_batch = transport_fn(bind_request_bytes);
@@ -152,7 +154,7 @@ BindResult PerformBindProtocol(
 		bind_request_bytes = BuildBindRequestBytes(
 		    context, function_name, function_type, arguments_array, input_schema,
 		    attach_opaque_data, transaction_opaque_data, settings, secrets,
-		    /*resolved_secrets_provided=*/true, worker_label, at_unit, at_value);
+		    /*resolved_secrets_provided=*/true, worker_label, at_unit, at_value, copy_from);
 
 		bind_response_batch = transport_fn(bind_request_bytes);
 
