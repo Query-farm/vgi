@@ -869,9 +869,13 @@ ContainerEndpoint EnsureSharedContainer(const ContainerSpec &spec, ContainerConn
 		const int deadline_iters = 240;  // ~60s at 250ms
 		for (int i = 0; i < deadline_iters; i++) {
 			int hp = ResolveHostPort(rt, name, cport);
+			// A live native worker holds the connection open (sending nothing until
+			// it gets a request), so TcpReadyProbe blocks for its full timeout on a
+			// healthy worker — keep it short. docker-proxy with a dead upstream
+			// resets well within this, so 120ms is ample to tell them apart.
 			bool ready = hp > 0 && (mode == ContainerConnMode::HTTP
 			                            ? HttpHealthProbe("127.0.0.1", hp, 1000)
-			                            : TcpReadyProbe("127.0.0.1", hp, 500));
+			                            : TcpReadyProbe("127.0.0.1", hp, 120));
 			if (ready) {
 				ep.port = hp;
 				ep.url = "http://127.0.0.1:" + std::to_string(hp);
