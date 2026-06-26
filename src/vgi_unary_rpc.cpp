@@ -1,6 +1,10 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "vgi_unary_rpc.hpp"
 
+#include <algorithm>
+#include <chrono>
+#include <thread>
+
 #include "duckdb/common/exception.hpp"
 
 #include "vgi_container_runtime.hpp"
@@ -151,21 +155,41 @@ UnaryResponseResult InvokePooledUnaryRpc(const UnaryRpcOptions &opts, const std:
 		if (!LookupSharedContainer(opts.worker_path, shared_spec, shared_mode)) {
 			throw IOException("vgi: no resolved shared-container info for '%s'", opts.worker_path);
 		}
-		auto ep = EnsureSharedContainer(shared_spec, shared_mode);
-		if (ep.mode == ContainerConnMode::HTTP) {
-			return HttpInvokeUnary(opts.context, ep.url, method_name, params, opts.auth, opts.cookie_jar,
-			                        /*cached_http_params=*/nullptr, "", "", "", "",
-			                        opts.protocol_version_override.value_or(""));
+		// The connect + RPC IS the readiness check: a fresh shared container may
+		// still be starting (the worker imports before it binds), so retry with
+		// backoff while it (re)starts. Mirrors ResolveAndConnect's invalidate-and-
+		// retry, with a startup deadline so a broken image fails clearly rather
+		// than spinning. The first RPC of an ATTACH (catalog_attach) lands here, so
+		// this is where cold start is absorbed; a successful RPC returns at once,
+		// so a warm container pays nothing.
+		auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+		auto backoff = std::chrono::milliseconds(150);
+		for (;;) {
+			try {
+				auto ep = EnsureSharedContainer(shared_spec, shared_mode);
+				if (ep.mode == ContainerConnMode::HTTP) {
+					return HttpInvokeUnary(opts.context, ep.url, method_name, params, opts.auth,
+					                        opts.cookie_jar, /*cached_http_params=*/nullptr, "", "", "", "",
+					                        opts.protocol_version_override.value_or(""));
+				}
+				// tcp (and, later, unix): native vgi-rpc over the connected fd.
+				auto worker = ConnectSharedContainer(ep);
+				if (params) {
+					WriteRpcRequest(worker->GetStdinFd(), method_name, params);
+				} else {
+					WriteEmptyRpcRequest(worker->GetStdinFd(), method_name);
+				}
+				auto *log_ctx = opts.enable_logging ? &opts.context : nullptr;
+				return ReadUnaryResponse(worker->GetStdoutFd(), log_ctx, opts.worker_path, /*pid=*/-1);
+			} catch (const IOException &) {
+				if (std::chrono::steady_clock::now() >= deadline) {
+					throw;
+				}
+				InvalidateSharedContainer(shared_spec);
+				std::this_thread::sleep_for(backoff);
+				backoff = std::min(backoff * 2, std::chrono::milliseconds(1000));
+			}
 		}
-		// tcp (and, later, unix): native vgi-rpc over the connected fd.
-		auto worker = ConnectSharedContainer(ep);
-		if (params) {
-			WriteRpcRequest(worker->GetStdinFd(), method_name, params);
-		} else {
-			WriteEmptyRpcRequest(worker->GetStdinFd(), method_name);
-		}
-		auto *log_ctx = opts.enable_logging ? &opts.context : nullptr;
-		return ReadUnaryResponse(worker->GetStdoutFd(), log_ctx, opts.worker_path, /*pid=*/-1);
 #else
 		throw InvalidInputException("vgi: shared containers are unavailable in this build");
 #endif

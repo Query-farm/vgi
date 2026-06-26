@@ -710,32 +710,6 @@ bool TcpReadyProbe(const std::string &host, int port, int timeout_ms) {
 	return ready;
 }
 
-// HTTP readiness probe: GET /health and require a 200. A bare TCP connect succeeds
-// before the WSGI app is serving, so http mode must check the app actually answers.
-bool HttpHealthProbe(const std::string &host, int port, int timeout_ms) {
-	int fd = TcpConnect(host, port, timeout_ms);
-	if (fd < 0) {
-		return false;
-	}
-	struct timeval tv;
-	tv.tv_sec = timeout_ms / 1000;
-	tv.tv_usec = (timeout_ms % 1000) * 1000;
-	::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-	::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-	std::string req = "GET /health HTTP/1.0\r\nHost: " + host + "\r\nConnection: close\r\n\r\n";
-	bool ok = false;
-	if (::send(fd, req.data(), req.size(), 0) == static_cast<ssize_t>(req.size())) {
-		char buf[512];
-		ssize_t n = ::recv(fd, buf, sizeof(buf) - 1, 0);
-		if (n > 0) {
-			std::string resp(buf, static_cast<size_t>(n));
-			ok = resp.find(" 200") != std::string::npos;
-		}
-	}
-	::close(fd);
-	return ok;
-}
-
 // `<rt> port <name> <cport>/tcp` → parse the loopback host port (0 if absent).
 int ResolveHostPort(const std::string &rt, const std::string &name, int cport) {
 	auto res = RunCaptureCommand(ShellQuote(rt) + " port " + ShellQuote(name) + " " + std::to_string(cport) +
@@ -860,32 +834,23 @@ ContainerEndpoint EnsureSharedContainer(const ContainerSpec &spec, ContainerConn
 		}
 	};
 
+	// Resolve the live endpoint in one shot. We do NOT probe for readiness here —
+	// the dispatch (vgi_unary_rpc.cpp / vgi_function_connection.cpp) connects and
+	// runs the RPC with retry, so the RPC itself is the readiness check. If the
+	// host port isn't published yet (just-created container), throw so that retry
+	// re-resolves.
 	auto finish = [&](ContainerConnMode mode, int cport) -> ContainerEndpoint {
+		int hp = ResolveHostPort(rt, name, cport);
+		if (hp <= 0) {
+			throw IOException("vgi container: shared container '%s' port is not published yet", name);
+		}
 		ContainerEndpoint ep;
 		ep.mode = mode;
 		ep.container_name = name;
 		ep.host = "127.0.0.1";
-		// Poll for the published host port + readiness (cold start can take a while;
-		// the image was already pulled at ATTACH). http requires the app to answer
-		// /health — a bare TCP connect succeeds before the WSGI app is serving.
-		const int deadline_iters = 240;  // ~60s at 250ms
-		for (int i = 0; i < deadline_iters; i++) {
-			int hp = ResolveHostPort(rt, name, cport);
-			// A live native worker holds the connection open (sending nothing until
-			// it gets a request), so TcpReadyProbe blocks for its full timeout on a
-			// healthy worker — keep it short. docker-proxy with a dead upstream
-			// resets well within this, so 120ms is ample to tell them apart.
-			bool ready = hp > 0 && (mode == ContainerConnMode::HTTP
-			                            ? HttpHealthProbe("127.0.0.1", hp, 1000)
-			                            : TcpReadyProbe("127.0.0.1", hp, 120));
-			if (ready) {
-				ep.port = hp;
-				ep.url = "http://127.0.0.1:" + std::to_string(hp);
-				return ep;
-			}
-			std::this_thread::sleep_for(std::chrono::milliseconds(250));
-		}
-		throw IOException("vgi container: shared container '%s' did not become ready", name);
+		ep.port = hp;
+		ep.url = "http://127.0.0.1:" + std::to_string(hp);
+		return ep;
 	};
 
 	// 1. Fast path: already running → reuse its recorded mode.

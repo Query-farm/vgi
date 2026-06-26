@@ -1582,19 +1582,33 @@ std::unique_ptr<IFunctionConnection> CreateFunctionConnection(
 			throw IOException("vgi: no resolved shared-container info for '%s' (was the catalog attached?)",
 			                  worker_path);
 		}
-		auto ep = EnsureSharedContainer(shared_spec, shared_mode);
-		if (ep.mode == ContainerConnMode::HTTP) {
-			return std::make_unique<HttpFunctionConnection>(
-			    ep.url, function_name, arguments, attach_opaque_data, transaction_opaque_data, context,
-			    function_type, global_execution_id, worker_debug, settings, required_secrets, attach_params);
+		// The container is warm by query time (catalog discovery already ran RPCs
+		// against it), so a single defensive stale-retry suffices — mirrors
+		// ResolveAndConnect: on a connect failure, invalidate the cached endpoint
+		// and re-resolve once (re-creating the container if it died mid-session).
+		for (int attempt = 0;; attempt++) {
+			try {
+				auto ep = EnsureSharedContainer(shared_spec, shared_mode);
+				if (ep.mode == ContainerConnMode::HTTP) {
+					return std::make_unique<HttpFunctionConnection>(
+					    ep.url, function_name, arguments, attach_opaque_data, transaction_opaque_data, context,
+					    function_type, global_execution_id, worker_debug, settings, required_secrets,
+					    attach_params);
+				}
+				// tcp (and, later, unix): native vgi-rpc over a connected fd, driven by
+				// the same FunctionConnection machinery as the launch:/unix:// transports.
+				auto worker = ConnectSharedContainer(ep);
+				return std::make_unique<FunctionConnection>(
+				    std::move(worker), worker_path, function_name, arguments, attach_opaque_data,
+				    transaction_opaque_data, context, function_type, global_execution_id, worker_debug,
+				    settings, required_secrets);
+			} catch (const IOException &) {
+				if (attempt >= 1) {
+					throw;
+				}
+				InvalidateSharedContainer(shared_spec);
+			}
 		}
-		// tcp (and, later, unix): native vgi-rpc over a connected fd, driven by the
-		// same FunctionConnection machinery as the launch:/unix:// transports.
-		auto worker = ConnectSharedContainer(ep);
-		return std::make_unique<FunctionConnection>(
-		    std::move(worker), worker_path, function_name, arguments, attach_opaque_data,
-		    transaction_opaque_data, context, function_type, global_execution_id, worker_debug, settings,
-		    required_secrets);
 #else
 		throw InvalidInputException("vgi: shared containers are unavailable in this build");
 #endif
