@@ -88,6 +88,7 @@ src/vgi_stderr_drainer.cpp
 src/vgi_unary_rpc.cpp
 src/vgi_bind_protocol.cpp
 src/vgi_transport.cpp
+src/vgi_container_runtime.cpp
 src/vgi_http_compression.cpp
 src/vgi_http_client.cpp
 src/vgi_http_function_connection.cpp
@@ -166,13 +167,17 @@ if((BUILD_VGI_UNIT_TESTS OR DEFINED ENV{BUILD_VGI_UNIT_TESTS}) AND NOT WIN32)
     test/cpp/test_launcher_e2e.cpp
     test/cpp/test_launcher_flock_parity.cpp
     test/cpp/test_transport_detection.cpp
+    test/cpp/test_container_runtime.cpp
     test/cpp/test_oauth.cpp
     src/vgi_oauth_env.cpp
     src/vgi_launcher_internal.cpp
     src/vgi_unix_socket.cpp
     src/vgi_launcher.cpp
     src/vgi_launcher_cache.cpp
-    src/vgi_transport.cpp)
+    src/vgi_transport.cpp
+    src/vgi_container_runtime.cpp
+    src/vgi_subprocess.cpp
+    src/vgi_unix_socket_worker.cpp)
   target_include_directories(vgi_unit_tests PRIVATE
     src/include
     duckdb/src/include

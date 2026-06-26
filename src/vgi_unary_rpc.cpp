@@ -3,6 +3,7 @@
 
 #include "duckdb/common/exception.hpp"
 
+#include "vgi_container_runtime.hpp"
 #include "vgi_exception.hpp"
 #include "vgi_http_client.hpp"
 #include "vgi_logging.hpp"
@@ -52,7 +53,7 @@ UnaryResponseResult AttemptUnaryRpc(const UnaryRpcOptions &opts, const std::stri
 		}
 	}
 	if (!proc) {
-		proc = std::make_unique<SubProcess>(opts.worker_path, opts.worker_debug);
+		proc = SpawnWorker(opts.worker_path, opts.worker_debug);
 		drainer = std::make_unique<StderrDrainer>(proc->ReleaseStderrFd());
 		if (opts.use_pool && !force_fresh) {
 			VgiWorkerPool::Instance().RecordMiss(opts.worker_path);
@@ -139,6 +140,35 @@ UnaryResponseResult InvokePooledUnaryRpc(const UnaryRpcOptions &opts, const std:
 		                        /*invocation_id_hex=*/"", /*attach_opaque_data_hex=*/"",
 		                        /*transaction_opaque_data_hex=*/"", /*conn_id_hex=*/"",
 		                        opts.protocol_version_override.value_or(""));
+	}
+
+	// Shared container: resolve the live endpoint at call time, then dispatch to
+	// the resolved transport (http reuses HttpInvokeUnary on the loopback URL).
+	if (IsContainerSharedLocation(opts.worker_path)) {
+#if VGI_SUBPROCESS_TRANSPORT
+		ContainerSpec shared_spec;
+		ContainerConnMode shared_mode;
+		if (!LookupSharedContainer(opts.worker_path, shared_spec, shared_mode)) {
+			throw IOException("vgi: no resolved shared-container info for '%s'", opts.worker_path);
+		}
+		auto ep = EnsureSharedContainer(shared_spec, shared_mode);
+		if (ep.mode == ContainerConnMode::HTTP) {
+			return HttpInvokeUnary(opts.context, ep.url, method_name, params, opts.auth, opts.cookie_jar,
+			                        /*cached_http_params=*/nullptr, "", "", "", "",
+			                        opts.protocol_version_override.value_or(""));
+		}
+		// tcp (and, later, unix): native vgi-rpc over the connected fd.
+		auto worker = ConnectSharedContainer(ep);
+		if (params) {
+			WriteRpcRequest(worker->GetStdinFd(), method_name, params);
+		} else {
+			WriteEmptyRpcRequest(worker->GetStdinFd(), method_name);
+		}
+		auto *log_ctx = opts.enable_logging ? &opts.context : nullptr;
+		return ReadUnaryResponse(worker->GetStdoutFd(), log_ctx, opts.worker_path, /*pid=*/-1);
+#else
+		throw InvalidInputException("vgi: shared containers are unavailable in this build");
+#endif
 	}
 
 	if (IsLaunchLocation(opts.worker_path) || IsUnixLocation(opts.worker_path)) {

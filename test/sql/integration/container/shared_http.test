@@ -1,0 +1,43 @@
+# name: test/sql/integration/container/shared_http.test
+# description: Transparent shared container worker over the HTTP connection
+# group: [vgi_integration_container]
+
+# Gated on VGI_DOCKER_IMAGE (set only by test/run_docker_integration.sh).
+
+require-env VGI_DOCKER_IMAGE
+
+require vgi
+
+require httpfs
+
+# connection:'http' routes through the daemon-introspection coordinator: a
+# deterministically-named container (vgi-rpc-<spechash>) is found-or-created and
+# reached over the image's http server. Reused system-wide across processes.
+statement ok
+ATTACH 'sklearn' AS sk (TYPE vgi, LOCATION {
+  'image': '${VGI_DOCKER_IMAGE}',
+  'connection': 'http',
+  'env': ['VGI_SIGNING_KEY=dev']});
+
+query I
+SELECT count(*) FROM sk.datasets.breast_cancer();
+----
+569
+
+# A second ATTACH in the same process reuses the running shared container.
+statement ok
+ATTACH 'sklearn' AS sk2 (TYPE vgi, LOCATION {
+  'image': '${VGI_DOCKER_IMAGE}',
+  'connection': 'http',
+  'env': ['VGI_SIGNING_KEY=dev']});
+
+query I
+SELECT count(*) FROM sk2.datasets.breast_cancer();
+----
+569
+
+statement ok
+DETACH sk2;
+
+statement ok
+DETACH sk;

@@ -1,0 +1,43 @@
+# name: test/sql/integration/container/shared_tcp.test
+# description: Transparent shared container worker over the native-protocol TCP connection
+# group: [vgi_integration_container]
+
+# Gated on VGI_DOCKER_TCP_IMAGE — a container image that advertises
+# farm.query.vgi.transports including "tcp" and provides a `tcp` entrypoint mode
+# (worker run with --tcp 0.0.0.0:8001). test/run_docker_integration.sh sets this
+# to the vgi-sklearn image when that image advertises tcp.
+
+require-env VGI_DOCKER_TCP_IMAGE
+
+require vgi
+
+# Explicit connection:'tcp' → daemon-introspected shared container reached over
+# the native vgi-rpc protocol on a loopback-published TCP port.
+statement ok
+ATTACH 'sklearn' AS sk (TYPE vgi, LOCATION {
+  'image': '${VGI_DOCKER_TCP_IMAGE}',
+  'connection': 'tcp',
+  'env': ['VGI_SIGNING_KEY=dev']});
+
+query I
+SELECT count(*) FROM sk.datasets.breast_cancer();
+----
+569
+
+# Auto-selection: with no connection key, the image's advertised transports label
+# drives the choice (tcp preferred over http); reuses the same shared container.
+statement ok
+ATTACH 'sklearn' AS sk2 (TYPE vgi, LOCATION {
+  'image': '${VGI_DOCKER_TCP_IMAGE}',
+  'env': ['VGI_SIGNING_KEY=dev']});
+
+query I
+SELECT count(*) FROM sk2.datasets.breast_cancer();
+----
+569
+
+statement ok
+DETACH sk2;
+
+statement ok
+DETACH sk;

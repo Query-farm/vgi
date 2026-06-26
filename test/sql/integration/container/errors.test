@@ -1,0 +1,54 @@
+# name: test/sql/integration/container/errors.test
+# description: Container-transport option parsing + validation (no daemon needed)
+# group: [vgi_integration_container]
+
+# These cases all fail at ATTACH parse/validation time, before any container
+# runtime is invoked, so they run in the normal integration suite without a
+# docker/podman daemon present.
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+# A struct LOCATION must include an image/location/path address key.
+statement error
+ATTACH 'x' AS c_err0 (TYPE vgi, LOCATION {'volumes': ['d:/data']});
+----
+must include an 'image'
+
+# A struct LOCATION is only valid for a container (oci://) image.
+statement error
+ATTACH 'x' AS c_err1 (TYPE vgi, LOCATION {'image': 'some-bare-command', 'volumes': ['d:/data']});
+----
+only supported for oci:// / docker:// container images
+
+# Unknown runtime is rejected with the list of valid runtimes.
+statement error
+ATTACH 'sk' AS c_err3 (TYPE vgi, LOCATION {'image': 'oci://ghcr.io/query-farm/vgi-sklearn:latest', 'runtime': 'not-a-runtime'});
+----
+unknown container_runtime
+
+# Unknown struct keys are rejected.
+statement error
+ATTACH 'sk' AS c_err3b (TYPE vgi, LOCATION {'image': 'oci://ghcr.io/query-farm/vgi-sklearn:latest', 'bogus': 'x'});
+----
+unknown key
+
+# The 'unix' shared connection is rejected up front (AF_UNIX over docker bind
+# mounts is unreliable). Validated before any docker call, so daemon-free.
+statement error
+ATTACH 'sk' AS c_err5 (TYPE vgi, LOCATION {'image': 'docker://library/python:3.13', 'connection': 'unix'});
+----
+is not supported
+
+# An unknown connection value is rejected.
+statement error
+ATTACH 'sk' AS c_err5b (TYPE vgi, LOCATION {'image': 'oci://ghcr.io/query-farm/vgi-sklearn:latest', 'connection': 'bogus'});
+----
+unknown connection
+
+# launcher_* overrides remain launch:-only and are rejected for container LOCATIONs.
+statement error
+ATTACH 'oci://ghcr.io/query-farm/vgi-sklearn:latest' AS c_err6 (TYPE vgi, launcher_idle_timeout 30);
+----
+only valid for `launch:`

@@ -1,0 +1,57 @@
+# name: test/sql/integration/container/sklearn_smoke.test
+# description: End-to-end container transport against the vgi-sklearn OCI image
+# group: [vgi_integration_container]
+
+# Gated on VGI_DOCKER_IMAGE, which is set only by test/run_docker_integration.sh
+# (it requires a container runtime + the image to be pullable). Skipped in the
+# normal subprocess/HTTP suites.
+
+require-env VGI_DOCKER_IMAGE
+
+require vgi
+
+# Pre-ATTACH: vgi_catalogs() resolves the container with default options on first
+# use (no ATTACH required) and lists the image's catalog.
+query I
+SELECT count(*) FROM vgi_catalogs('${VGI_DOCKER_IMAGE}') WHERE catalog = 'sklearn';
+----
+1
+
+# Pre-ATTACH: the standalone table function runs straight from the image too.
+query I
+SELECT count(*) FROM vgi_table_function('${VGI_DOCKER_IMAGE}', 'breast_cancer', []);
+----
+569
+
+# Attach the worker as a private per-process container (connection:'stdio'). The
+# image advertises shared transports (tcp/http) via its label, so we pin 'stdio'
+# here to exercise the per-process path specifically (shared modes are covered by
+# shared_http.test / shared_tcp.test). Volumes declared by the image's
+# farm.query.vgi.volumes label are auto-mounted; the catalog 'sklearn' is aliased
+# locally as 'sk'.
+statement ok
+ATTACH 'sklearn' AS sk (TYPE vgi,
+  LOCATION {'image': '${VGI_DOCKER_IMAGE}', 'connection': 'stdio', 'env': ['VGI_SIGNING_KEY=dev']});
+
+# Function discovery worked: the catalog is populated from the containerized
+# worker's metadata RPCs.
+query I
+SELECT count(*) > 0 FROM duckdb_functions() WHERE database_name = 'sk';
+----
+true
+
+# A table function executes inside the container and streams data back over the
+# stdin/stdout Arrow-IPC pipe. The breast-cancer dataset has 569 rows.
+query I
+SELECT count(*) FROM sk.datasets.breast_cancer();
+----
+569
+
+# The pooled worker shows up under its disambiguated oci:// pool key.
+query I
+SELECT count(*) > 0 FROM vgi_worker_pool() WHERE worker_path LIKE 'oci://%';
+----
+true
+
+statement ok
+DETACH sk;

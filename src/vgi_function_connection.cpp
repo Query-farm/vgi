@@ -9,6 +9,7 @@
 #include "vgi_bind_protocol.hpp"
 #include "vgi_table_buffering_builders.hpp"
 #include "vgi_catalog_metadata.hpp"
+#include "vgi_container_runtime.hpp"
 #include "generated/vgi_protocol_constants.hpp"
 #include "vgi_exception.hpp"
 #include "vgi_http_function_connection.hpp"
@@ -461,7 +462,7 @@ void FunctionConnection::EnsureWorkerSpawned() {
 	// callers that skip the on-wire bind (cached BindResult → straight to
 	// PerformInit) call this directly so proc_ exists before the init write.
 	if (!proc_) {
-		proc_ = std::make_unique<SubProcess>(worker_path_, worker_debug_);
+		proc_ = SpawnWorker(worker_path_, worker_debug_);
 		StartStderrReader();
 	}
 }
@@ -1569,6 +1570,34 @@ std::unique_ptr<IFunctionConnection> CreateFunctionConnection(
 		    worker_path, function_name, arguments, attach_opaque_data, transaction_opaque_data, context,
 		    function_type, global_execution_id, worker_debug, settings, required_secrets,
 		    attach_params);
+	}
+	// Shared container: resolve the live endpoint via the daemon-introspection
+	// coordinator at connection time (self-heals an idle-stopped container), then
+	// build the right connection for the resolved mode.
+	if (IsContainerSharedLocation(worker_path)) {
+#if VGI_SUBPROCESS_TRANSPORT
+		ContainerSpec shared_spec;
+		ContainerConnMode shared_mode;
+		if (!LookupSharedContainer(worker_path, shared_spec, shared_mode)) {
+			throw IOException("vgi: no resolved shared-container info for '%s' (was the catalog attached?)",
+			                  worker_path);
+		}
+		auto ep = EnsureSharedContainer(shared_spec, shared_mode);
+		if (ep.mode == ContainerConnMode::HTTP) {
+			return std::make_unique<HttpFunctionConnection>(
+			    ep.url, function_name, arguments, attach_opaque_data, transaction_opaque_data, context,
+			    function_type, global_execution_id, worker_debug, settings, required_secrets, attach_params);
+		}
+		// tcp (and, later, unix): native vgi-rpc over a connected fd, driven by the
+		// same FunctionConnection machinery as the launch:/unix:// transports.
+		auto worker = ConnectSharedContainer(ep);
+		return std::make_unique<FunctionConnection>(
+		    std::move(worker), worker_path, function_name, arguments, attach_opaque_data,
+		    transaction_opaque_data, context, function_type, global_execution_id, worker_debug, settings,
+		    required_secrets);
+#else
+		throw InvalidInputException("vgi: shared containers are unavailable in this build");
+#endif
 	}
 	if (IsLaunchLocation(worker_path) || IsUnixLocation(worker_path)) {
 #if VGI_POSIX_TRANSPORT

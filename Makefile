@@ -49,6 +49,7 @@ VGI_SIMPLE_WRITABLE_WORKER ?= uv run --project $(HOME)/Development/vgi-python vg
 	test_http_attach_options test_http_attach_options_debug \
 	test_writable test_writable_debug \
 	test_simple_writable test_simple_writable_debug \
+	test_docker test_docker_debug \
 	test_all test_all_debug
 
 # Shared-memory transport tests — runs the same .test suite as test_subprocess
@@ -275,6 +276,16 @@ test_http_attach_options:
 
 test_http_attach_options_debug:
 	BUILD_DIR=debug ./test/run_http_attach_options_integration.sh
+
+# Container (OCI/Docker) transport tests (uses test/run_docker_integration.sh).
+# Skips cleanly when no container runtime is present, so it's safe to run
+# anywhere. Override VGI_DOCKER_IMAGE / CONTAINER_RUNTIME to target a different
+# image or runtime (e.g. CONTAINER_RUNTIME=podman).
+test_docker:
+	./test/run_docker_integration.sh "test/sql/integration/container/*"
+
+test_docker_debug:
+	BUILD_DIR=debug ./test/run_docker_integration.sh "test/sql/integration/container/*"
 
 # Writable catalog tests (subprocess transport) — opt-in, require a worker
 # with writable-catalog support.

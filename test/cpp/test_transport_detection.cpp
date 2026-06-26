@@ -12,9 +12,12 @@
 #include <stdexcept>
 
 using duckdb::vgi::DetectTransport;
+using duckdb::vgi::IsContainerLocation;
+using duckdb::vgi::IsContainerSharedLocation;
 using duckdb::vgi::IsHttpTransport;
 using duckdb::vgi::IsLaunchLocation;
 using duckdb::vgi::IsUnixLocation;
+using duckdb::vgi::StripContainerScheme;
 using duckdb::vgi::StripLaunchScheme;
 using duckdb::vgi::StripUnixScheme;
 using duckdb::vgi::TransportType;
@@ -24,9 +27,32 @@ TEST_CASE("DetectTransport routes each scheme correctly", "[transport]") {
 	CHECK(DetectTransport("HTTPS://example.com") == TransportType::HTTP);
 	CHECK(DetectTransport("launch:python -m worker") == TransportType::LAUNCH);
 	CHECK(DetectTransport("unix:///tmp/foo.sock") == TransportType::UNIX);
+	CHECK(DetectTransport("oci://ghcr.io/org/img:tag") == TransportType::CONTAINER);
+	CHECK(DetectTransport("docker://library/python:3.13") == TransportType::CONTAINER);
 	CHECK(DetectTransport("/path/to/worker") == TransportType::SUBPROCESS);
 	CHECK(DetectTransport("/path/with launch: in middle") == TransportType::SUBPROCESS);
 	CHECK(DetectTransport("") == TransportType::SUBPROCESS);
+}
+
+TEST_CASE("Container scheme detection and stripping", "[transport]") {
+	CHECK(IsContainerLocation("oci://ghcr.io/org/img:tag"));
+	CHECK(IsContainerLocation("docker://img"));
+	CHECK(IsContainerLocation("OCI://Img:Tag"));  // scheme is case-insensitive
+	CHECK_FALSE(IsContainerLocation("http://x"));
+	CHECK_FALSE(IsContainerLocation("/bare/path"));
+	// Strips the scheme and preserves original-case image refs.
+	CHECK(StripContainerScheme("oci://ghcr.io/org/Img:Tag") == "ghcr.io/org/Img:Tag");
+	CHECK(StripContainerScheme("docker://img:1.2") == "img:1.2");
+	// Drops the pool-disambiguation "#<hash>" suffix.
+	CHECK(StripContainerScheme("oci://ghcr.io/org/img:tag#deadbeef") == "ghcr.io/org/img:tag");
+	CHECK_THROWS_AS(StripContainerScheme("http://x"), std::invalid_argument);
+}
+
+TEST_CASE("Shared-container internal scheme detection", "[transport]") {
+	CHECK(IsContainerSharedLocation("container-shared:oci://ghcr.io/org/img:tag#deadbeef"));
+	CHECK_FALSE(IsContainerSharedLocation("oci://img"));
+	CHECK_FALSE(IsContainerSharedLocation("http://x"));
+	CHECK_FALSE(IsContainerSharedLocation(""));
 }
 
 TEST_CASE("Scheme predicates are mutually exclusive", "[transport]") {

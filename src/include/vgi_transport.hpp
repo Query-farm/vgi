@@ -11,7 +11,11 @@ namespace vgi {
 // UNIX       — unix:///path/to/sock; connect to an existing AF_UNIX worker.
 // LAUNCH     — launch:<argv>; spawn-or-reuse via the C++ launcher, then
 //              connect via AF_UNIX.
-enum class TransportType { SUBPROCESS, HTTP, UNIX, LAUNCH };
+// CONTAINER  — oci://image[:tag] (or the docker:// alias); spawn the worker
+//              inside an OCI container via the host container runtime
+//              (docker/podman/…), wired over stdin/stdout like a subprocess.
+//              See vgi_container_runtime.hpp.
+enum class TransportType { SUBPROCESS, HTTP, UNIX, LAUNCH, CONTAINER };
 
 // Detect what kind of worker location this string represents.  Pure on
 // inputs — no I/O, no ambient state.
@@ -21,6 +25,15 @@ TransportType DetectTransport(const std::string &worker_path);
 bool IsHttpTransport(const std::string &worker_path);
 bool IsUnixLocation(const std::string &worker_path);
 bool IsLaunchLocation(const std::string &worker_path);
+// Container location: oci:// (canonical) or docker:// (alias).  A trailing
+// "#<hash>" pool-disambiguation suffix (appended at ATTACH) does not affect
+// the match — only the scheme prefix is inspected.
+bool IsContainerLocation(const std::string &worker_path);
+
+// Internal `container-shared:` token (synthesized at ATTACH; never user-typed)
+// for a transparently-reused shared container. The dispatch resolves it via the
+// shared-container coordinator at connection time. See vgi_container_runtime.hpp.
+bool IsContainerSharedLocation(const std::string &worker_path);
 
 // Strip the leading scheme prefix from a unix:// or launch: location.
 // For unix://, returns the absolute filesystem path.  For launch:, returns
@@ -29,6 +42,12 @@ bool IsLaunchLocation(const std::string &worker_path);
 // prefix.
 std::string StripUnixScheme(const std::string &location);
 std::string StripLaunchScheme(const std::string &location);
+
+// Strip the oci:// / docker:// prefix from a container location, returning the
+// image reference (e.g. "ghcr.io/query-farm/vgi-sklearn:latest").  A trailing
+// "#<hash>" pool-disambiguation suffix, if present, is removed too.  Throws
+// std::invalid_argument if the location is not a container location.
+std::string StripContainerScheme(const std::string &location);
 
 } // namespace vgi
 } // namespace duckdb

@@ -72,6 +72,22 @@ This uses `test/run_http_integration.sh` which starts an HTTP server (`vgi-serve
 - `buffer_input/sizes.test`, `buffer_input/scale.test_slow` — input buffering semantics differ
 - `order_preservation_modes.test` — under HTTP, DuckDB allocates one `FunctionConnection` per worker thread eagerly, so `FIXED_ORDER` (which serializes the pipeline source to a single thread of *execution*) still surfaces N distinct `conn=` ids in the per-batch logs. Subprocess transport collapses to 1 distinct `conn=` because only one worker is actually acquired from the pool. The assertion is meaningful on subprocess only.
 
+### Container Transport (OCI/Docker)
+
+```bash
+# Run the container integration suite against the vgi-sklearn image (release).
+# Skips cleanly if no container runtime/daemon is available.
+make test_docker
+
+# Target a different image or runtime:
+VGI_DOCKER_IMAGE=ghcr.io/query-farm/vgi-sklearn:edge CONTAINER_RUNTIME=podman make test_docker
+```
+
+`test/run_docker_integration.sh` resolves a runtime (docker→podman→nerdctl), pulls the
+image (unless `VGI_DOCKER_NO_PULL=1`), and runs `test/sql/integration/container/*`. The
+option-parsing/validation cases (`container/errors.test`) need no daemon and also run in the
+normal subprocess suite. See [docs/container-transport.md](docs/container-transport.md).
+
 ### Both Transports
 
 ```bash
@@ -312,15 +328,17 @@ Catalogs may register additional settings at `ATTACH` time (e.g., `greeting`, `m
 | `secrets` | BOOLEAN | true | Auto-register the Orchard remote secret provider when the catalog advertises a secret-service URL. Set `false` to opt out for this catalog. See *Remote Secret Provider* |
 | `launcher_idle_timeout` | BIGINT seconds | (uses launcher default of 300) | Self-shutdown idle timeout for `launch:` LOCATIONs. Pinned per-LOCATION; conflicting subsequent ATTACHes throw `BinderException`. See [`docs/launcher-tutorial.md`](docs/launcher-tutorial.md). |
 | `launcher_state_dir` | VARCHAR (path) | OS-derived (`$XDG_RUNTIME_DIR/vgi-rpc/` etc.) | Override the launcher's state directory. Escape valve only — does NOT isolate workers from other DuckDB processes with the same `launch:` argv. See [`docs/launcher-options.md`](docs/launcher-options.md). |
+| `LOCATION` / `PATH` (struct form) | STRUCT | — | **Container LOCATIONs only.** `LOCATION` is dynamically typed: a VARCHAR is the plain address; a STRUCT bundles the address + container options — `{image (or location/path), runtime, connection, volumes, env, extra_args}` (`volumes`/`env` accept VARCHAR[] or comma-separated VARCHAR; `extra_args` VARCHAR is shell-tokenized, VARCHAR[] is verbatim). `connection` (`tcp`\|`http`\|`stdio`) selects a transparently-**shared** system-wide container (daemon rendezvous via deterministic `vgi-rpc-<hash>` name) vs the private per-process `stdio`; default auto from the image's `farm.query.vgi.transports` label (prefer tcp > http), else per-process. `tcp` (native vgi-rpc over a loopback-published port) and `http` are implemented; `unix` is rejected (AF_UNIX over docker bind mounts is unreliable). No separate options keyword, so nothing can shadow a worker attach option. See [`docs/container-transport.md`](docs/container-transport.md). |
 
 ## Transports
 
-`LOCATION` accepts four schemes:
+`LOCATION` accepts five schemes:
 
 - bare command path → **subprocess** transport (default; pooled per-DuckDB-process)
 - `http://...` / `https://...` → **HTTP** transport
 - `unix:///path/to/sock` → **AF_UNIX** transport against a worker started out-of-band
 - `launch:<argv>` → **AF_UNIX** transport with the worker spawned via the launcher
+- `oci://<image>[:tag]` (or `docker://` alias) → **container** transport: the worker runs inside an OCI container via the host runtime (docker/podman/nerdctl/Apple `container`), wired over stdin/stdout like a subprocess and pooled the same way. See [docs/container-transport.md](docs/container-transport.md)
 
 The `launch:` and `unix://` paths share one warm worker process across every DuckDB instance that points at the same `(cmd, args, cwd, VGI_RPC_*-env)` tuple — coordinated system-wide via per-hash flock + AF_UNIX socket.  See `docs/launcher-protocol.md` for the wire-protocol contract (state-dir layout, hash inputs, lockfile semantics) shared with the Python reference launcher in `vgi-rpc/vgi_rpc/launcher.py`.
 
@@ -330,8 +348,8 @@ The `launch:` and `unix://` paths share one warm worker process across every Duc
 
 | Function | Type | Description |
 |----------|------|-------------|
-| `vgi_table_function(worker_path, function_name, args)` | Table | Direct table function execution |
-| `vgi_catalogs(worker_path)` | Table | List available catalogs from a worker |
+| `vgi_table_function(worker_path, function_name, args)` | Table | Direct table function execution. `worker_path` accepts any LOCATION scheme incl. `oci://` (container resolved on first use with default options) |
+| `vgi_catalogs(worker_path)` | Table | List available catalogs from a worker. `worker_path` accepts any LOCATION scheme incl. `oci://` (container resolved on first use with default options) |
 | `vgi_worker_pool()` | Table | Diagnostic: list **subprocess**-pooled workers (worker_path, pid, age_seconds). Returns no rows for `launch:` / `unix://` transports — see *Transports* section. |
 | `vgi_worker_pool_stats()` | Table | Diagnostic: hit/miss statistics by worker_path. Subprocess pool only. |
 | `vgi_worker_pool_flush()` | Table | Clear all subprocess-pooled workers; returns one row with the count flushed (`flushed`). Has no effect on `launch:` / `unix://` workers. |
@@ -374,6 +392,7 @@ The `launch:` and `unix://` paths share one warm worker process across every Duc
 | `vgi_function_arguments_function.cpp` | `vgi_function_arguments()` SQL diagnostic — one row per function/macro argument across every attached VGI catalog (named/positional/const/varargs/type + `vgi_doc` description; macros surface as scalar_macro/table_macro) |
 | `vgi_multi_scan_rewriter.cpp` | `VgiMultiScanRewriter` — pre-pushdown `OptimizerExtension` that rewrites multi-branch `LogicalGet(marker)` into `LogicalSetOperation(UNION_ALL, [LogicalProjection(LogicalFilter(branch_filter, LogicalGet(branch_fn))), ...])`. Includes a minimal v1.0 `branch_filter` binder (col OP const, AND/OR). See [docs/multi_branch.md](docs/multi_branch.md) for the user-facing reference |
 | `vgi_shm_segment.cpp` | `VgiShmSegment`: posix shm allocator + zero-copy chained-buffer reader for the shared-memory transport (see *Shared-Memory Transport*) |
+| `vgi_container_runtime.cpp` | Container (OCI/Docker) transport: runtime detection, image-label volume inspection, `docker run` command construction, per-process launch registry, `ContainerWorker` (force-removes its container on teardown), and the shared `SpawnWorker()` used by both worker spawn sites. See [docs/container-transport.md](docs/container-transport.md) |
 | `vgi_secret_storage.cpp` | `VgiRemoteSecretStorage : duckdb::SecretStorage` — lazy, remote-backed credential provider (see *Remote Secret Provider*). The `vgi_secret_providers()` / `vgi_secret_provider_flush()` SQL fns and the per-DB provider registry live in `vgi_extension.cpp` (registry is on the file-local `VgiStorageExtension`) |
 
 ### Storage Layer (`src/storage/`)

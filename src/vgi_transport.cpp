@@ -24,6 +24,15 @@ bool IsLaunchLocation(const std::string &worker_path) {
 	return launcher::IsLaunchLocation(worker_path);
 }
 
+bool IsContainerLocation(const std::string &worker_path) {
+	auto lower = StringUtil::Lower(worker_path);
+	return StringUtil::StartsWith(lower, "oci://") || StringUtil::StartsWith(lower, "docker://");
+}
+
+bool IsContainerSharedLocation(const std::string &worker_path) {
+	return StringUtil::StartsWith(worker_path, "container-shared:");
+}
+
 TransportType DetectTransport(const std::string &worker_path) {
 	if (IsHttpTransport(worker_path)) {
 		return TransportType::HTTP;
@@ -33,6 +42,9 @@ TransportType DetectTransport(const std::string &worker_path) {
 	}
 	if (IsUnixLocation(worker_path)) {
 		return TransportType::UNIX;
+	}
+	if (IsContainerLocation(worker_path)) {
+		return TransportType::CONTAINER;
 	}
 	return TransportType::SUBPROCESS;
 }
@@ -52,6 +64,24 @@ std::string StripLaunchScheme(const std::string &location) {
 		                             location);
 	}
 	return location.substr(prefix.size());
+}
+
+std::string StripContainerScheme(const std::string &location) {
+	if (!IsContainerLocation(location)) {
+		throw std::invalid_argument("StripContainerScheme: location is not an oci:// / docker:// URL: " +
+		                             location);
+	}
+	// Case-insensitive scheme match, but preserve the original-case remainder
+	// (image refs are case-sensitive on the path component for some registries).
+	auto lower = StringUtil::Lower(location);
+	size_t scheme_len = StringUtil::StartsWith(lower, "oci://") ? 6 : 9;  // "oci://" | "docker://"
+	std::string rest = location.substr(scheme_len);
+	// Drop the "#<hash>" pool-disambiguation suffix if present.
+	auto hash_pos = rest.rfind('#');
+	if (hash_pos != std::string::npos) {
+		rest = rest.substr(0, hash_pos);
+	}
+	return rest;
 }
 
 } // namespace vgi

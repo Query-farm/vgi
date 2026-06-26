@@ -58,6 +58,8 @@
 #include "vgi_cancel_dispatcher.hpp"
 #include "vgi_catalog_rpc.hpp"
 #include "vgi_catalogs.hpp"
+#include "vgi_container_runtime.hpp"
+#include "vgi_launcher_internal.hpp"
 #include "vgi_cookie_jar.hpp"
 #include "vgi_function_docs.hpp"
 #include "vgi_logging.hpp"
@@ -1076,6 +1078,98 @@ static unique_ptr<BaseSecret> VgiCreateSecret(ClientContext &context, CreateSecr
 	return secret;
 }
 
+namespace {
+
+// Container-transport configuration extracted from a struct-valued LOCATION.
+struct ParsedContainerOptions {
+	string image;                       // the oci:// / docker:// address (struct's image/location/path key)
+	string runtime_override;            // "" ⇒ auto-detect
+	string connection;                  // "" ⇒ auto; else http|tcp|unix|stdio (shared vs per-process)
+	std::vector<string> volumes;        // "host:/container/path"
+	std::vector<string> env;            // "KEY=VALUE"
+	std::vector<string> extra_args;     // verbatim docker-run argv tokens
+};
+
+// Collect a struct field that is either a VARCHAR (split on `delim`) or a
+// LIST(VARCHAR) (elements used verbatim). Empty/NULL entries are dropped.
+static std::vector<string> CollectScalarOrList(const Value &v, char delim) {
+	std::vector<string> out;
+	if (v.IsNull()) {
+		return out;
+	}
+	if (v.type().id() == LogicalTypeId::LIST) {
+		for (auto &child : ListValue::GetChildren(v)) {
+			if (child.IsNull()) {
+				continue;
+			}
+			string s = child.ToString();
+			StringUtil::Trim(s);
+			if (!s.empty()) {
+				out.push_back(s);
+			}
+		}
+	} else {
+		for (auto &part : StringUtil::Split(v.ToString(), delim)) {
+			string s = part;
+			StringUtil::Trim(s);
+			if (!s.empty()) {
+				out.push_back(s);
+			}
+		}
+	}
+	return out;
+}
+
+// Parse a struct-valued LOCATION into its address (image) + container options.
+// The address comes from an `image` (or `location`/`path`) key; remaining keys
+// are runtime / transport / volumes / env / extra_args. Throws on unknown keys
+// or a missing address.
+static ParsedContainerOptions ParseContainerLocationStruct(const Value &loc) {
+	ParsedContainerOptions out;
+	auto &child_types = StructType::GetChildTypes(loc.type());
+	auto &children = StructValue::GetChildren(loc);
+	for (idx_t i = 0; i < children.size(); i++) {
+		auto key = StringUtil::Lower(child_types[i].first);
+		const Value &cv = children[i];
+		if (key == "image" || key == "location" || key == "path") {
+			out.image = cv.IsNull() ? "" : cv.ToString();
+		} else if (key == "runtime" || key == "container_runtime") {
+			out.runtime_override = cv.IsNull() ? "" : cv.ToString();
+		} else if (key == "connection") {
+			if (!cv.IsNull()) {
+				out.connection = cv.ToString();
+			}
+		} else if (key == "volumes" || key == "volume") {
+			auto vs = CollectScalarOrList(cv, ',');
+			out.volumes.insert(out.volumes.end(), vs.begin(), vs.end());
+		} else if (key == "env") {
+			auto es = CollectScalarOrList(cv, ',');
+			out.env.insert(out.env.end(), es.begin(), es.end());
+		} else if (key == "extra_args" || key == "args") {
+			// LIST → verbatim argv; VARCHAR → shell-tokenized.
+			if (!cv.IsNull() && cv.type().id() == LogicalTypeId::LIST) {
+				auto as = CollectScalarOrList(cv, ' ');
+				out.extra_args.insert(out.extra_args.end(), as.begin(), as.end());
+			} else if (!cv.IsNull()) {
+				auto toks = vgi::launcher::ParseLaunchArgv(cv.ToString());
+				out.extra_args.insert(out.extra_args.end(), toks.begin(), toks.end());
+			}
+		} else {
+			throw BinderException(
+			    "VGI struct LOCATION: unknown key '%s' (expected image, runtime, connection, "
+			    "volumes, env, or extra_args)",
+			    child_types[i].first);
+		}
+	}
+	if (out.image.empty()) {
+		throw BinderException(
+		    "VGI struct LOCATION must include an 'image' (or 'location'/'path') key with the worker address");
+	}
+	return out;
+}
+
+} // namespace
+
 // ATTACH handler for VGI catalogs
 static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> storage_info, ClientContext &context,
                                             AttachedDatabase &db, const string &name, AttachInfo &info,
@@ -1095,6 +1189,11 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	// on the integer; std::nullopt-equivalent on the string is empty.
 	int64_t launcher_idle_timeout_seconds = -1;
 	string launcher_state_dir;
+	// A struct-valued LOCATION carries the worker address plus all transport
+	// options in one parameter (container transport). Captured here, parsed after
+	// the option loops. A plain VARCHAR LOCATION sets worker_path directly.
+	Value location_struct;
+	bool location_is_struct = false;
 	// Opt out of Orchard's remote secret provider for this catalog. Default on:
 	// an HTTP catalog whose attach response advertises a secret-service URL gets
 	// a VgiRemoteSecretStorage auto-registered (reusing this catalog's identity).
@@ -1110,7 +1209,15 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 		if (lower_name == "type") {
 			return;
 		} else if (lower_name == "location" || lower_name == "path") {
-			worker_path = value.ToString();
+			// LOCATION is dynamically typed: a STRUCT bundles the worker address
+			// plus transport options (container transport); a VARCHAR is the plain
+			// address. The struct is parsed after the option loops.
+			if (value.type().id() == LogicalTypeId::STRUCT) {
+				location_struct = value;
+				location_is_struct = true;
+			} else {
+				worker_path = value.ToString();
+			}
 		} else if (lower_name == "worker_debug") {
 			// DefaultCastAs (not GetValue<bool>) so VARCHAR values from the
 			// connection-string query ("true"/"false") cast semantically rather
@@ -1206,6 +1313,15 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 		}
 	}
 
+	// Resolve a struct-valued LOCATION into the worker address (worker_path) plus
+	// the container options carried alongside it. Done before the bare-form
+	// fallback / empty-LOCATION check below so worker_path is set.
+	ParsedContainerOptions container_opts;
+	if (location_is_struct) {
+		container_opts = ParseContainerLocationStruct(location_struct);
+		worker_path = container_opts.image;
+	}
+
 	// Validate mutual exclusivity of auth options
 	if (!bearer_token.empty() && !oauth_refresh_token.empty()) {
 		throw BinderException("Cannot specify both bearer_token and oauth_refresh_token");
@@ -1238,6 +1354,120 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 		    "launcher_idle_timeout / launcher_state_dir are only valid for `launch:` "
 		    "LOCATIONs (got LOCATION=%s)",
 		    worker_path);
+	}
+
+	// A struct-valued LOCATION carries container options, so it is only meaningful
+	// for a container (oci:// / docker://) address. Catch a struct LOCATION whose
+	// address isn't a container image early.
+	if (location_is_struct && !vgi::IsContainerLocation(worker_path)) {
+		throw BinderException(
+		    "VGI struct LOCATION is only supported for oci:// / docker:// container images "
+		    "(got image=%s)",
+		    worker_path);
+	}
+
+	if (vgi::IsContainerLocation(worker_path)) {
+#if !VGI_SUBPROCESS_TRANSPORT
+		throw BinderException(
+		    "VGI container (oci:// / docker://) LOCATIONs require a child-process transport "
+		    "not available in this build; use http:// instead");
+#else
+		// Validate an explicit `connection` up front — before any docker call
+		// (runtime detect / image inspect) — so a bad value fails fast and
+		// daemon-free. `stdio` ⇒ private per-process; http/tcp ⇒ shared; unix is
+		// rejected (AF_UNIX over docker bind mounts is unreliable).
+		string conn = StringUtil::Lower(container_opts.connection);
+		bool shared = false;
+		vgi::ContainerConnMode shared_mode = vgi::ContainerConnMode::HTTP;
+		if (!conn.empty() && conn != "stdio") {
+			shared = true;
+			shared_mode = vgi::ParseContainerConnMode(conn);
+			if (shared_mode == vgi::ContainerConnMode::UNIX) {
+				throw BinderException(
+				    "VGI shared container connection 'unix' is not supported (AF_UNIX over docker bind "
+				    "mounts is unreliable); use 'tcp' or 'http'");
+			}
+		}
+
+		vgi::ContainerSpec spec;
+		spec.transport = "stdio";
+		spec.image = vgi::StripContainerScheme(worker_path);
+		spec.runtime = vgi::DetectContainerRuntime(container_opts.runtime_override);
+
+		// Auto-mount the volumes the image declares via its OCI label, then layer
+		// user-supplied volume entries on top (user wins on a duplicate mount
+		// point).  Inspection pulls the image first if it isn't present locally.
+		spec.volumes = vgi::InspectImageVolumes(spec.runtime, spec.image);
+		auto upsert_volume = [&](const string &host, const string &path) {
+			for (auto &v : spec.volumes) {
+				if (v.path == path) {
+					v.host = host;
+					return;
+				}
+			}
+			spec.volumes.push_back(vgi::ContainerVolume {host, path});
+		};
+		for (auto &e : container_opts.volumes) {
+			auto colon = e.find(':');
+			if (colon == string::npos) {
+				throw BinderException(
+				    "VGI LOCATION volume entry '%s' must be of the form 'name:/container/path'", e);
+			}
+			upsert_volume(e.substr(0, colon), e.substr(colon + 1));
+		}
+		spec.env = std::move(container_opts.env);
+		spec.extra_args = std::move(container_opts.extra_args);
+
+		// Auto-select the connection from the image's advertised transports when
+		// none was given (prefer tcp — native protocol + idle self-shutdown — over
+		// http); a label-less image stays private per-process (back-compat).
+		if (conn.empty()) {
+			auto modes = vgi::InspectImageTransports(spec.runtime, spec.image);
+			bool has_tcp = false, has_http = false;
+			for (auto m : modes) {
+				has_tcp = has_tcp || (m == vgi::ContainerConnMode::TCP);
+				has_http = has_http || (m == vgi::ContainerConnMode::HTTP);
+			}
+			if (has_tcp) {
+				shared = true;
+				shared_mode = vgi::ContainerConnMode::TCP;
+			} else if (has_http) {
+				shared = true;
+				shared_mode = vgi::ContainerConnMode::HTTP;
+			}
+		}
+
+		if (shared) {
+			// Transparent shared container: register the resolved spec/mode under an
+			// internal container-shared: token; the dispatch resolves the live
+			// endpoint at connection time via the daemon-introspection coordinator.
+			string shared_loc = "container-shared:" + worker_path + "#" + vgi::ContainerSpecHash(spec);
+			vgi::RegisterSharedContainer(shared_loc, spec, shared_mode);
+			static std::once_flag reap_shared_once;
+			std::call_once(reap_shared_once, [&]() { vgi::ReapDeadSharedContainers(spec.runtime); });
+			// http mode talks to the container over the existing HTTP transport;
+			// tcp speaks the native protocol over a socket (no httpfs needed).
+			if (shared_mode == vgi::ContainerConnMode::HTTP) {
+				ExtensionHelper::TryAutoLoadExtension(db.GetDatabase(), "httpfs");
+				if (!db.GetDatabase().ExtensionIsLoaded("httpfs")) {
+					throw BinderException("VGI shared http container requires the httpfs extension. "
+					                      "Install it with: INSTALL httpfs; LOAD httpfs;");
+				}
+			}
+			use_pool = false;
+			worker_path = shared_loc;
+		} else {
+			// Private per-process container (the shipped default for label-less
+			// images / connection:'stdio'). Resolve the run command + a
+			// pool-disambiguation suffix and register it for the spawn sites.
+			string command_template = vgi::BuildContainerRunCommandTemplate(spec);
+			string suffixed = worker_path + "#" + vgi::ContainerSpecHash(spec);
+			vgi::RegisterContainerLaunch(suffixed, spec.runtime.binary, command_template);
+			static std::once_flag reap_once;
+			std::call_once(reap_once, [&]() { vgi::ReapOrphanContainers(spec.runtime); });
+			worker_path = suffixed;
+		}
+#endif
 	}
 
 #ifdef __EMSCRIPTEN__
