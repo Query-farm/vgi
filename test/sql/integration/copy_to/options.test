@@ -19,7 +19,9 @@ WHERE catalog_name = 'acme' AND format_name = 'acme.example_lines_out'
 ORDER BY option_name;
 ----
 acme.example_lines_out	delimiter	VARCHAR	Field separator
+acme.example_lines_out	fail_on_value	VARCHAR	If non-empty, fail mid-write when a cell equals this value
 acme.example_lines_out	header	BOOLEAN	Write a header row of column names
+acme.example_lines_out	header_repeat	BIGINT	When header=true, write the header line this many times
 acme.example_lines_out	null_string	VARCHAR	Token written for SQL NULL
 acme.example_lines_out	on_exists	VARCHAR	Behavior when the destination file already exists
 
@@ -75,6 +77,32 @@ statement error
 COPY (SELECT 1 AS a) TO '__TEST_DIR__/to_req.txt' (FORMAT 'acme.example_lines_out');
 ----
 null_string
+
+# --- Invalid enum choice -> error (worker-side `choices` enforcement) ---------
+statement error
+COPY (SELECT 1 AS a) TO '__TEST_DIR__/to_choice.txt'
+(FORMAT 'acme.example_lines_out', null_string 'NA', on_exists 'bogus');
+----
+on_exists
+
+# --- Ranged INTEGER option: type coercion ('3' -> 3) + effect ----------------
+# header_repeat=3 with header=true writes the header line 3 times.
+statement ok
+COPY (SELECT * FROM (VALUES (1, 'a')) t(a, b))
+TO '__TEST_DIR__/to_hr.txt' (FORMAT 'acme.example_lines_out', null_string 'NA', header true, header_repeat '3');
+
+query I
+SELECT count(*) FROM read_csv('__TEST_DIR__/to_hr.txt', columns = {'line': 'VARCHAR'}, header = false)
+WHERE line = 'a,b';
+----
+3
+
+# --- Ranged INTEGER option: out-of-range -> error (worker-side ge/le) ---------
+statement error
+COPY (SELECT 1 AS a) TO '__TEST_DIR__/to_hr_bad.txt'
+(FORMAT 'acme.example_lines_out', null_string 'NA', header true, header_repeat 9);
+----
+header_repeat
 
 # --- Unsupported generic write option -> clear error -------------------------
 statement error

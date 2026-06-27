@@ -1,0 +1,70 @@
+# name: test/sql/integration/copy_to/failure.test
+# description: COPY ... TO mid-sink worker failure -> clean error + no wedged workers
+# group: [vgi_integration_copy_to]
+#
+# Exercises the in-flight teardown path: under a parallel sink, one worker raises
+# mid-write (fail_on_value) while peers are in-flight. The COPY must fail cleanly
+# and — critically — must not leak/wedge workers: a subsequent COPY on the same
+# catalog must still succeed. (True query-interrupt cancellation is covered by the
+# C++ cancel harness, not SLT; this covers worker-error teardown + recovery.)
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS acme (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+SET threads = 4;
+
+statement ok
+SET preserve_insertion_order = false;
+
+# TEMP TABLE source → real parallel sink fan-out; one shard hits the sentinel.
+statement ok
+CREATE TABLE src AS SELECT a FROM range(100000) t(a);
+
+statement error
+COPY (SELECT * FROM src) TO '__TEST_DIR__/fail.txt'
+(FORMAT 'acme.example_lines_out', null_string 'NA', fail_on_value '50000');
+----
+fail_on_value
+
+# Recovery: the pool/workers are not wedged — a fresh COPY succeeds, all rows.
+query I
+COPY (SELECT * FROM src) TO '__TEST_DIR__/after_fail.txt'
+(FORMAT 'acme.example_lines_out', null_string 'NA');
+----
+100000
+
+query II
+SELECT count(*), count(DISTINCT a)
+FROM read_csv('__TEST_DIR__/after_fail.txt', columns = {'a': 'BIGINT'}, header = false);
+----
+100000	100000
+
+# Same with pool false (every worker is a fresh process — exercises cancel-dispatch
+# teardown of distinct processes), then recovery again.
+statement ok
+DETACH acme;
+
+statement ok
+ATTACH 'example' AS acme2 (TYPE vgi, LOCATION '${VGI_TEST_WORKER}', pool false);
+
+statement error
+COPY (SELECT * FROM src) TO '__TEST_DIR__/fail2.txt'
+(FORMAT 'acme2.example_lines_out', null_string 'NA', fail_on_value '50000');
+----
+fail_on_value
+
+query I
+COPY (SELECT * FROM src) TO '__TEST_DIR__/after_fail2.txt'
+(FORMAT 'acme2.example_lines_out', null_string 'NA');
+----
+100000
+
+statement ok
+DETACH acme2;

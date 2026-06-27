@@ -1,0 +1,58 @@
+# name: test/sql/integration/copy_to/types.test
+# description: COPY ... TO type coverage — multi-type rows with NULLs round-trip TO -> FROM
+# group: [vgi_integration_copy_to]
+#
+# The toy example_lines format is delimited text, so this asserts a round-trip
+# (write with example_lines_out, read back with example_lines) where the
+# assertion is data equality — the intermediate string form is language-defined
+# but round-trips losslessly within a worker. Covers INTEGER / BIGINT / DOUBLE /
+# VARCHAR (incl. spaces + UTF-8) and NULLs in every column. Non-text-friendly
+# types (TIMESTAMP/DECIMAL/BLOB/nested) are out of scope for the toy text format.
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS acme (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+CREATE TABLE src (id INTEGER, i INTEGER, b BIGINT, d DOUBLE, s VARCHAR);
+
+statement ok
+INSERT INTO src VALUES
+  (1, 10, 100, 1.5, 'alpha'),
+  (2, NULL, 200, -2.25, NULL),
+  (3, 30, NULL, 0.0, 'café'),
+  (4, 40, 9223372036854775807, NULL, 'has space');
+
+statement ok
+COPY (SELECT * FROM src) TO '__TEST_DIR__/types.txt'
+(FORMAT 'acme.example_lines_out', null_string 'NULLTOK');
+
+statement ok
+CREATE TABLE dst (id INTEGER, i INTEGER, b BIGINT, d DOUBLE, s VARCHAR);
+
+statement ok
+COPY dst FROM '__TEST_DIR__/types.txt' (FORMAT 'acme.example_lines', null_string 'NULLTOK');
+
+# Round-trip preserves every column's type + NULLs (double rendered via CAST so
+# the comparison is on DuckDB's canonical string, not SLT float formatting).
+query IIITT
+SELECT id, i, b, CAST(d AS VARCHAR), s FROM dst ORDER BY id;
+----
+1	10	100	1.5	alpha
+2	NULL	200	-2.25	NULL
+3	30	NULL	0.0	café
+4	40	9223372036854775807	NULL	has space
+
+# Equivalent to the source table (full set equality).
+query I
+SELECT count(*) FROM (SELECT * FROM src EXCEPT SELECT * FROM dst);
+----
+0
+
+statement ok
+DETACH acme;
