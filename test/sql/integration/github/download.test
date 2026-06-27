@@ -1,0 +1,42 @@
+# name: test/sql/integration/github/download.test
+# description: github-auto:// + github:// real download/extract/run against Query-farm/vgi-units (network)
+# group: [vgi_integration_github]
+
+# Network-dependent: hits api.github.com + the release CDN. Gated behind an env
+# var so the default offline CI suite skips it. Run with:
+#   VGI_GITHUB_NETWORK_TESTS=1 ./build/release/test/unittest test/sql/integration/github/download.test
+require-env VGI_GITHUB_NETWORK_TESTS
+
+require vgi
+
+# github-auto:// builds the asset name from the host DuckDB platform string and
+# verifies it against the published .sha256 sidecar — platform-agnostic.
+statement ok
+ATTACH 'u' AS u (TYPE vgi, LOCATION 'github-auto://Query-farm/vgi-units@v0.1.1');
+
+# The worker is now running locally; its catalog exposes functions.
+query I
+SELECT count(*) > 0 FROM duckdb_functions() WHERE database_name='u';
+----
+true
+
+# The cache records the resolved entrypoint for this release.
+query I
+SELECT count(*) >= 1 FROM vgi_github_cache() WHERE repo='vgi-units' AND tag='v0.1.1';
+----
+true
+
+# A second attach of the same release is a cache hit (no second download): still one row.
+statement ok
+ATTACH 'u2' AS u2 (TYPE vgi, LOCATION 'github-auto://Query-farm/vgi-units@v0.1.1');
+
+query I
+SELECT count(*) FROM vgi_github_cache() WHERE repo='vgi-units' AND tag='v0.1.1';
+----
+1
+
+# Flushing the cache reports the release removed.
+query I
+SELECT flushed >= 1 FROM vgi_github_cache_flush();
+----
+true

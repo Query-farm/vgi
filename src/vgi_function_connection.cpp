@@ -19,6 +19,7 @@
 #include "generated/vgi_request_builders.hpp"
 #include "vgi_schema_registry.hpp"
 #include "vgi_shm_segment.hpp"
+#include "vgi_github.hpp"
 #include "vgi_transport.hpp"
 
 #include <map>
@@ -468,7 +469,10 @@ void FunctionConnection::EnsureWorkerSpawned() {
 	// callers that skip the on-wire bind (cached BindResult → straight to
 	// PerformInit) call this directly so proc_ exists before the init write.
 	if (!proc_) {
-		proc_ = SpawnWorker(worker_path_, worker_debug_);
+		// worker_path_ stays the (github://) LOCATION so the pool keys consistently;
+		// ResolveWorkerPath turns a github scheme into the local cached entrypoint
+		// (no-op for every other scheme).
+		proc_ = SpawnWorker(ResolveWorkerPath(worker_path_, context_), worker_debug_);
 		StartStderrReader();
 	}
 }
@@ -1701,6 +1705,31 @@ std::unique_ptr<IFunctionConnection> CreateFunctionConnection(
 		throw InvalidInputException(
 		    "vgi: launch:/unix:// LOCATION schemes are not available in this build "
 		    "(worker_path=%s); use http://… instead",
+		    worker_path);
+#endif
+	}
+	if (IsGithubLocation(worker_path) || IsGithubAutoLocation(worker_path)) {
+#if VGI_POSIX_TRANSPORT
+		// github:// / github-auto:// — run a worker downloaded from a GitHub release
+		// over the subprocess transport. Resolution (download/extract/verify) is
+		// deferred to EnsureWorkerSpawned, which has the ClientContext and resolves
+		// worker_path → the local cached entrypoint. worker_path stays the github://
+		// LOCATION so the worker pool keys acquire/release symmetrically. Version-key
+		// fields are forwarded so ReleaseForPooling buckets correctly.
+		std::string gh_data_version_spec;
+		std::string gh_implementation_version;
+		if (attach_params) {
+			gh_data_version_spec = attach_params->data_version_spec();
+			gh_implementation_version = attach_params->implementation_version();
+		}
+		return std::make_unique<FunctionConnection>(
+		    worker_path, function_name, arguments, attach_opaque_data, transaction_opaque_data, context,
+		    function_type, global_execution_id, worker_debug, settings, required_secrets,
+		    gh_data_version_spec, gh_implementation_version);
+#else
+		throw InvalidInputException(
+		    "vgi: github:// / github-auto:// LOCATIONs require a POSIX child-process transport "
+		    "not available in this build (worker_path=%s)",
 		    worker_path);
 #endif
 	}

@@ -1,0 +1,44 @@
+# name: test/sql/integration/github/errors.test
+# description: github:// / github-auto:// LOCATION parse + validation errors (no network needed)
+# group: [vgi_integration_github]
+
+# These all fail at ATTACH while parsing the LOCATION coordinates, before any
+# network request, so they run in the normal integration suite offline.
+
+require vgi
+
+# github:// requires owner/repo
+statement error
+ATTACH 'x' AS g_err0 (TYPE vgi, LOCATION 'github://justowner');
+----
+missing owner/repo
+
+# github:// requires @tag
+statement error
+ATTACH 'x' AS g_err1 (TYPE vgi, LOCATION 'github://owner/repo');
+----
+missing @tag
+
+# github:// requires /asset
+statement error
+ATTACH 'x' AS g_err2 (TYPE vgi, LOCATION 'github://owner/repo@v1.0');
+----
+missing /asset
+
+# Unknown fragment key is rejected
+statement error
+ATTACH 'x' AS g_err3 (TYPE vgi, LOCATION 'github://owner/repo@v1.0/a.tar.gz#bogus=1');
+----
+unknown fragment key
+
+# A fragment without '=' is malformed
+statement error
+ATTACH 'x' AS g_err4 (TYPE vgi, LOCATION 'github://owner/repo@v1.0/a.tar.gz#nope');
+----
+malformed fragment
+
+# github-auto:// requires @tag
+statement error
+ATTACH 'x' AS g_err5 (TYPE vgi, LOCATION 'github-auto://owner/repo');
+----
+missing @tag

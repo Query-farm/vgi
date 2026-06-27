@@ -87,6 +87,7 @@
 #include "vgi_table_branches_function.hpp"
 #include "vgi_function_arguments_function.hpp"
 #include "vgi_clear_cache.hpp"
+#include "vgi_github_functions.hpp"
 #include "vgi_worker_pool_functions.hpp"
 
 #include "duckdb/catalog/catalog_transaction.hpp"
@@ -2771,6 +2772,14 @@ static void LoadInternal(ExtensionLoader &loader) {
 	config.AddExtensionOption("vgi_worker_pool_max", "Default per-path pool limit for VGI workers (0 = disabled)",
 	                          LogicalType::BIGINT, Value::BIGINT(256));
 
+	// Cache directory for worker binaries downloaded via github:// / github-auto://
+	// LOCATIONs. Empty (default) → ${XDG_CACHE_HOME:-~/.cache}/vgi/releases. Must be
+	// on an exec-capable filesystem (not a noexec runtime/tmp mount).
+	config.AddExtensionOption("vgi_github_cache_dir",
+	                          "Cache directory for worker binaries downloaded from GitHub releases "
+	                          "(github:// / github-auto:// LOCATIONs); empty = ${XDG_CACHE_HOME:-~/.cache}/vgi/releases",
+	                          LogicalType::VARCHAR, Value(""));
+
 	// Eager-load thresholds. Per-kind: a schema's estimated_object_count[kind]
 	// is compared against the corresponding value here; below or equal triggers
 	// a single bulk LoadEntries() instead of per-name single-entry RPCs. Read
@@ -2880,6 +2889,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	vgi::RegisterVgiWorkerPoolFunction(loader);
 	vgi::RegisterVgiWorkerPoolStatsFunction(loader);
 	vgi::RegisterVgiWorkerPoolFlushFunction(loader);
+	vgi::RegisterVgiGithubCacheFunction(loader);
+	vgi::RegisterVgiGithubCacheFlushFunction(loader);
 
 	// Register table statistics diagnostic function
 	vgi::RegisterVgiTableStatisticsFunction(loader);

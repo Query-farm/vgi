@@ -33,6 +33,18 @@ bool IsContainerSharedLocation(const std::string &worker_path) {
 	return StringUtil::StartsWith(worker_path, "container-shared:");
 }
 
+bool IsGithubLocation(const std::string &worker_path) {
+	// Case-insensitive scheme match.  `github-auto://` does not start with
+	// `github://` (position 6 is '-' vs ':'), so the two predicates are disjoint.
+	auto lower = StringUtil::Lower(worker_path);
+	return StringUtil::StartsWith(lower, "github://");
+}
+
+bool IsGithubAutoLocation(const std::string &worker_path) {
+	auto lower = StringUtil::Lower(worker_path);
+	return StringUtil::StartsWith(lower, "github-auto://");
+}
+
 bool IsTcpTransport(const std::string &worker_path) {
 	auto lower = StringUtil::Lower(worker_path);
 	return StringUtil::StartsWith(lower, "tcp://");
@@ -110,6 +122,23 @@ std::string StripContainerScheme(const std::string &location) {
 		rest = rest.substr(0, hash_pos);
 	}
 	return rest;
+}
+
+std::string StripGithubScheme(const std::string &location) {
+	if (!IsGithubLocation(location)) {
+		throw std::invalid_argument("StripGithubScheme: location is not a github:// URL: " + location);
+	}
+	// "github://" is 9 chars.  Preserve the original-case remainder and keep any
+	// "#sha256="/"#path=" fragment (the coordinate parser consumes it).
+	return location.substr(9);
+}
+
+std::string StripGithubAutoScheme(const std::string &location) {
+	if (!IsGithubAutoLocation(location)) {
+		throw std::invalid_argument("StripGithubAutoScheme: location is not a github-auto:// URL: " + location);
+	}
+	// "github-auto://" is 14 chars.
+	return location.substr(14);
 }
 
 } // namespace vgi

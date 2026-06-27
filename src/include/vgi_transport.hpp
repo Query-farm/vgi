@@ -61,5 +61,22 @@ std::string StripLaunchScheme(const std::string &location);
 // std::invalid_argument if the location is not a container location.
 std::string StripContainerScheme(const std::string &location);
 
+// GitHub-release locations.  `github://` downloads a named release asset and runs
+// it over the subprocess transport; `github-auto://` builds the asset name from a
+// fixed convention (see vgi_github.hpp).  These are distinct schemes — note that
+// `github-auto://` does NOT start with `github://`, so the predicates don't
+// overlap.  Both are POSIX-only (the cache uses flock/rename); the dispatch throws
+// on other builds.  Unlike `oci://ghcr.io/...` (GitHub's *container* registry),
+// these fetch *release assets*.
+bool IsGithubLocation(const std::string &worker_path);
+bool IsGithubAutoLocation(const std::string &worker_path);
+
+// Strip the `github://` / `github-auto://` scheme prefix, preserving the
+// case-sensitive remainder (owner/repo are case-sensitive) INCLUDING any
+// `#sha256=`/`#path=` fragment — the coordinate parser in vgi_github.cpp needs it.
+// Throws std::invalid_argument if the location doesn't carry the expected prefix.
+std::string StripGithubScheme(const std::string &location);
+std::string StripGithubAutoScheme(const std::string &location);
+
 } // namespace vgi
 } // namespace duckdb

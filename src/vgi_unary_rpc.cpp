@@ -12,6 +12,7 @@
 #include "vgi_http_client.hpp"
 #include "vgi_logging.hpp"
 #include "vgi_stderr_drainer.hpp"
+#include "vgi_github.hpp"
 #include "vgi_subprocess.hpp"
 #include "vgi_transport.hpp"
 #if VGI_POSIX_TRANSPORT
@@ -57,7 +58,10 @@ UnaryResponseResult AttemptUnaryRpc(const UnaryRpcOptions &opts, const std::stri
 		}
 	}
 	if (!proc) {
-		proc = SpawnWorker(opts.worker_path, opts.worker_debug);
+		// Resolve github:// / github-auto:// to the local cached entrypoint before
+		// spawning (no-op for every other scheme). opts.worker_path stays the
+		// LOCATION above so the pool keys consistently.
+		proc = SpawnWorker(ResolveWorkerPath(opts.worker_path, opts.context), opts.worker_debug);
 		drainer = std::make_unique<StderrDrainer>(proc->ReleaseStderrFd());
 		if (opts.use_pool && !force_fresh) {
 			VgiWorkerPool::Instance().RecordMiss(opts.worker_path);

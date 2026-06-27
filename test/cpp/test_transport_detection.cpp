@@ -17,7 +17,11 @@ using duckdb::vgi::IsContainerSharedLocation;
 using duckdb::vgi::IsHttpTransport;
 using duckdb::vgi::IsLaunchLocation;
 using duckdb::vgi::IsUnixLocation;
+using duckdb::vgi::IsGithubAutoLocation;
+using duckdb::vgi::IsGithubLocation;
 using duckdb::vgi::StripContainerScheme;
+using duckdb::vgi::StripGithubAutoScheme;
+using duckdb::vgi::StripGithubScheme;
 using duckdb::vgi::StripLaunchScheme;
 using duckdb::vgi::StripUnixScheme;
 using duckdb::vgi::TransportType;
@@ -87,4 +91,24 @@ TEST_CASE("StripLaunchScheme returns the argv payload", "[transport]") {
 	CHECK(StripLaunchScheme("launch:python -m foo") == "python -m foo");
 	CHECK(StripLaunchScheme("launch:") == "");
 	CHECK_THROWS_AS(StripLaunchScheme("unix:///x"), std::invalid_argument);
+}
+
+TEST_CASE("github:// and github-auto:// detection is disjoint", "[transport]") {
+	// github-auto:// must NOT match the github:// predicate (and vice versa).
+	CHECK(IsGithubLocation("github://owner/repo@v1/asset.tar.gz"));
+	CHECK_FALSE(IsGithubLocation("github-auto://owner/repo@v1"));
+	CHECK(IsGithubAutoLocation("github-auto://owner/repo@v1"));
+	CHECK_FALSE(IsGithubAutoLocation("github://owner/repo@v1/asset.tar.gz"));
+	// Case-insensitive scheme; never confused with oci://ghcr.io or http://.
+	CHECK(IsGithubLocation("GITHUB://o/r@v1/a"));
+	CHECK_FALSE(IsGithubLocation("oci://ghcr.io/o/r:tag"));
+	CHECK_FALSE(IsGithubLocation("https://github.com/o/r"));
+	CHECK_FALSE(IsGithubAutoLocation(""));
+}
+
+TEST_CASE("StripGithubScheme keeps the remainder incl. fragment", "[transport]") {
+	CHECK(StripGithubScheme("github://o/r@v1/a.tar.gz#sha256=ab") == "o/r@v1/a.tar.gz#sha256=ab");
+	CHECK(StripGithubAutoScheme("github-auto://o/r@v1") == "o/r@v1");
+	CHECK_THROWS_AS(StripGithubScheme("github-auto://o/r@v1"), std::invalid_argument);
+	CHECK_THROWS_AS(StripGithubAutoScheme("github://o/r@v1/a"), std::invalid_argument);
 }

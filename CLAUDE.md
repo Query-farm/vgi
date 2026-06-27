@@ -383,6 +383,7 @@ rotation. **Worker API (vgi-python):** subclass `CopyToFunction`, implement `wri
 | `vgi_multi_branch_scans` | BOOLEAN | true | Rewrite multi-branch VGI table scans into `LogicalSetOperation(UNION_ALL, ...)` via the optimizer extension. Set to false to disable the rewrite — multi-branch tables then refuse at bind with a clear `BinderException`. Emergency-rollback knob. See [docs/multi_branch.md](docs/multi_branch.md) |
 | `vgi_trust_empty_kinds` | BOOLEAN | true | Trust worker assertions that `estimated_object_count[kind] == 0` means the kind is empty (skip `catalog_schema_contents_*` RPC). Set to false to force every RPC to fire — debug escape hatch for diagnosing worker bugs |
 | `vgi_secret_default_ttl_seconds` | BIGINT | 300 | Default cache TTL for credentials fetched from an Orchard remote secret provider, when the server suggests none. Further capped per-credential by the credential's own expiry. Read at `ATTACH`, frozen per-provider. See *Remote Secret Provider* |
+| `vgi_github_cache_dir` | VARCHAR | `""` | Cache directory for worker binaries downloaded from GitHub releases (`github://` / `github-auto://`). Empty → `${XDG_CACHE_HOME:-~/.cache}/vgi/releases`. Must be on an exec-capable filesystem. See [docs/github-transport.md](docs/github-transport.md) |
 
 Catalogs may register additional settings at `ATTACH` time (e.g., `greeting`, `multiplier`).
 
@@ -404,13 +405,14 @@ Catalogs may register additional settings at `ATTACH` time (e.g., `greeting`, `m
 
 ## Transports
 
-`LOCATION` accepts five schemes:
+`LOCATION` accepts these schemes:
 
 - bare command path → **subprocess** transport (default; pooled per-DuckDB-process)
 - `http://...` / `https://...` → **HTTP** transport
 - `unix:///path/to/sock` → **AF_UNIX** transport against a worker started out-of-band
 - `launch:<argv>` → **AF_UNIX** transport with the worker spawned via the launcher
 - `oci://<image>[:tag]` (or `docker://` alias) → **container** transport: the worker runs inside an OCI container via the host runtime (docker/podman/nerdctl/Apple `container`), wired over stdin/stdout like a subprocess and pooled the same way. See [docs/container-transport.md](docs/container-transport.md)
+- `github://owner/repo@tag/asset[#sha256=][#path=]` and `github-auto://owner/repo@tag[/prefix]` → **GitHub-release** transport (POSIX-only): download a worker executable from a GitHub release, SHA256-verify it, extract the full archive into `${XDG_CACHE_HOME:-~/.cache}/vgi/releases` (cross-process flock + atomic dir install), and run it over the subprocess transport. `github://` names the asset explicitly (+ optional `#sha256=` pin, enforced even on cache hit); `github-auto://` builds `{prefix=repo}-{tag}-{DuckDB-platform}.tar.gz` and verifies against the published `.sha256` sidecar. A DX convenience (overlaps `oci://`); SHA256-only (cosign provenance deferred); no allowlist; runs the binary with cwd inherited (publisher must build relocatable). See [docs/github-transport.md](docs/github-transport.md)
 
 The `launch:` and `unix://` paths share one warm worker process across every DuckDB instance that points at the same `(cmd, args, cwd, VGI_RPC_*-env)` tuple — coordinated system-wide via per-hash flock + AF_UNIX socket.  See `docs/launcher-protocol.md` for the wire-protocol contract (state-dir layout, hash inputs, lockfile semantics) shared with the Python reference launcher in `vgi-rpc/vgi_rpc/launcher.py`.
 
@@ -425,6 +427,8 @@ The `launch:` and `unix://` paths share one warm worker process across every Duc
 | `vgi_worker_pool()` | Table | Diagnostic: list **subprocess**-pooled workers (worker_path, pid, age_seconds). Returns no rows for `launch:` / `unix://` transports — see *Transports* section. |
 | `vgi_worker_pool_stats()` | Table | Diagnostic: hit/miss statistics by worker_path. Subprocess pool only. |
 | `vgi_worker_pool_flush()` | Table | Clear all subprocess-pooled workers; returns one row with the count flushed (`flushed`). Has no effect on `launch:` / `unix://` workers. |
+| `vgi_github_cache()` | Table | Diagnostic: one row per worker binary cached from a `github://` / `github-auto://` release LOCATION. Columns: `owner`, `repo`, `tag`, `asset`, `digest` (archive SHA256), `dir` (extracted directory), `entrypoint`, `age_seconds`. See [docs/github-transport.md](docs/github-transport.md) |
+| `vgi_github_cache_flush()` | Table | Delete the on-disk GitHub-release worker cache; returns one row with the count of cached releases removed (`flushed`). |
 | `vgi_clear_cache()` | Table | Clear cached catalog metadata (schemas, tables, functions, statistics) for all attached VGI catalogs |
 | `vgi_oauth_identity()` | Table | OIDC identity per attached VGI catalog: `catalog_name`, `origin`, `authenticated`, `sub`, `email`, `name`, `issuer`, `claims` (JSON). Claims carry the full decoded id_token payload — reach provider-specific fields via e.g. `claims->>'$.preferred_username'` for Entra, `claims->>'$.hd'` for Google Workspace, etc. |
 | `vgi_table_branches()` | Table | Diagnostic: one row per branch per VGI table across every attached VGI catalog. Columns: `catalog_name`, `schema_name`, `table_name`, `branch_index`, `function_name`, `positional_arguments` (JSON), `named_arguments` (JSON), `branch_filter`, `table_required_extensions` (LIST). Used to introspect multi-branch tables. See [docs/multi_branch.md](docs/multi_branch.md). |
@@ -447,6 +451,8 @@ The `launch:` and `unix://` paths share one warm worker process across every Duc
 | `vgi_subprocess.cpp` | SubProcess/Pipe RAII, `WaitForReadable()` with EINTR retry, `GetCatalogTimeout()` |
 | `vgi_worker_pool.cpp` | `VgiWorkerPool` singleton, background cleanup thread |
 | `vgi_worker_pool_functions.cpp` | Pool diagnostic SQL functions |
+| `vgi_github.cpp` | `github://` / `github-auto://` transport: coordinate parsing, `github-auto://` convention name-building from `DuckDB::Platform()`, authenticated GitHub API GET (+ reuse of `HttpGetBytes` for CDN downloads), SHA256 verify-before-extract, full-tree USTAR extractor with tar-slip sanitization, and the flock'd content-digest-keyed atomic-directory cache. Exposes `ResolveWorkerPath()` (called at both spawn sites: `EnsureWorkerSpawned` + `AttemptUnaryRpc`). See [docs/github-transport.md](docs/github-transport.md) |
+| `vgi_github_functions.cpp` | `vgi_github_cache()` / `vgi_github_cache_flush()` SQL diagnostics |
 | `vgi_table_function.cpp` | Direct `vgi_table_function()` SQL function |
 | `vgi_table_function_impl.cpp` | Shared table function logic (bind/init/scan) |
 | `vgi_scalar_function_impl.cpp` | Scalar function bind/execute with dynamic types and const params |
