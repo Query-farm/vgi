@@ -37,10 +37,12 @@ Builds the asset name from a fixed convention and verifies it against the publis
 
 ```
 {prefix}-{tag}-{platform}.tar.gz          (prefix defaults to the repo name)
+{prefix}-{tag}-{platform}.zip             (on Windows platforms)
 ```
 
 `{platform}` is DuckDB's own platform string (`osx_arm64`, `linux_amd64`,
-`linux_arm64`, `linux_amd64_musl`, …). The digest is read from the first sidecar that
+`linux_arm64`, `linux_amd64_musl`, `windows_amd64`, …) — the extension picks `.zip`
+for `windows_*` and `.tar.gz` otherwise. The digest is read from the first sidecar that
 exists among `{stem}.sha256` (GoReleaser style) or `{asset}.sha256`.
 
 It is a **deterministic convention**, not a heuristic: it constructs *one* exact name
@@ -84,7 +86,8 @@ is required.
   `noexec` runtime/tmp mount).
 - Keyed by **content digest** — two attaches of the same release share one cached,
   immutable extracted tree, across concurrent DuckDB processes (coordinate-keyed
-  `flock`, atomic directory install).
+  cross-process write-lock, atomic directory install — via DuckDB's cross-platform
+  FileSystem).
 - macOS arm64: the extracted binary is ad-hoc code-signed (`codesign --deep -s -`) so
   unsigned Mach-O / nested dylibs aren't `SIGKILL`ed at exec.
 - No automatic eviction in v1 — clear with `SELECT * FROM vgi_github_cache_flush();`
@@ -99,12 +102,16 @@ SELECT * FROM vgi_github_cache_flush();  -- clears the cache; returns the count 
 
 ## Formats & limits
 
-- Supported assets: bare executable, single-file `.zst`/`.gz`, and `.tar.gz` /
-  `.tar.zst` archives (decompressed in-process; the full tree is extracted with
-  tar-slip path sanitization). The single executable-bit member is the entrypoint;
-  use `#path=<member>` to disambiguate.
-- `.zip` is not supported (publish `.tar.gz`).
-- **POSIX-only.** On non-POSIX builds these schemes throw a clear error at ATTACH.
+- Supported assets: bare executable, single-file `.zst`/`.gz`, `.tar.gz` /
+  `.tar.zst` archives, and `.zip` (Windows). Archives are decompressed in-process and
+  the full tree is extracted with path sanitization (tar-slip / zip-slip). The
+  entrypoint is the single executable member — the exec-bit file in a tar, the single
+  `.exe` in a zip; use `#path=<member>` to disambiguate.
+- **Runs on any platform with a child-process transport — POSIX *and* Windows.**
+  `github-auto://` builds a `.tar.gz` asset name on POSIX and a `.zip` on Windows (the
+  GoReleaser convention). On Emscripten/WASM (no subprocess) the schemes throw a clear
+  error at ATTACH. Archive symlinks are POSIX-only (a tar symlink on Windows errors —
+  ship a `.zip` there). macOS arm64 binaries are ad-hoc codesigned.
 - Authenticated GitHub API access: set `$GITHUB_TOKEN` (or `$GH_TOKEN`) to avoid the
   60-request/hour unauthenticated limit and to reach private repos. Asset *downloads*
   use the pre-signed CDN URL with no Authorization header.

@@ -1709,13 +1709,14 @@ std::unique_ptr<IFunctionConnection> CreateFunctionConnection(
 #endif
 	}
 	if (IsGithubLocation(worker_path) || IsGithubAutoLocation(worker_path)) {
-#if VGI_POSIX_TRANSPORT
+#if VGI_SUBPROCESS_TRANSPORT
 		// github:// / github-auto:// — run a worker downloaded from a GitHub release
-		// over the subprocess transport. Resolution (download/extract/verify) is
-		// deferred to EnsureWorkerSpawned, which has the ClientContext and resolves
-		// worker_path → the local cached entrypoint. worker_path stays the github://
-		// LOCATION so the worker pool keys acquire/release symmetrically. Version-key
-		// fields are forwarded so ReleaseForPooling buckets correctly.
+		// over the subprocess transport (POSIX or Windows). Resolution
+		// (download/extract/verify) is deferred to EnsureWorkerSpawned, which has the
+		// ClientContext and resolves worker_path → the local cached entrypoint.
+		// worker_path stays the github:// LOCATION so the worker pool keys
+		// acquire/release symmetrically. Version-key fields are forwarded so
+		// ReleaseForPooling buckets correctly.
 		std::string gh_data_version_spec;
 		std::string gh_implementation_version;
 		if (attach_params) {
@@ -1728,7 +1729,7 @@ std::unique_ptr<IFunctionConnection> CreateFunctionConnection(
 		    gh_data_version_spec, gh_implementation_version);
 #else
 		throw InvalidInputException(
-		    "vgi: github:// / github-auto:// LOCATIONs require a POSIX child-process transport "
+		    "vgi: github:// / github-auto:// LOCATIONs require a child-process transport "
 		    "not available in this build (worker_path=%s)",
 		    worker_path);
 #endif

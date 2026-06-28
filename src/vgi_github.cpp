@@ -20,11 +20,12 @@
 #include <cctype>
 #include <string>
 
-#if VGI_POSIX_TRANSPORT
+#if VGI_SUBPROCESS_TRANSPORT
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/http_util.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "mbedtls_wrapper.hpp"
+#include "miniz.hpp"
 #include "vgi_http_client.hpp"
 #include "vgi_http_compression.hpp"
 #include "yyjson.hpp"
@@ -39,13 +40,15 @@
 #include <thread>
 #include <unordered_map>
 
-// Genuine platform-specific remainder (no FileSystem equivalent): the executable
-// bit, archive symlinks, and the codesign subprocess.
+#if VGI_POSIX_TRANSPORT
+// Platform remainder (no portable API): the executable bit, archive symlinks,
+// and the macOS codesign subprocess. On Windows these are no-ops / unsupported.
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
-#endif // VGI_POSIX_TRANSPORT
+#endif
+#endif // VGI_SUBPROCESS_TRANSPORT
 
 namespace duckdb {
 namespace vgi {
@@ -162,19 +165,21 @@ GithubCoords ParseGithubAutoLocation(const std::string &location, const std::str
 	c.owner = owner;
 	c.repo = repo;
 	c.tag = tag;
-	c.asset = prefix + "-" + tag + "-" + platform + ".tar.gz";
+	// Windows release assets are .zip by convention; everyone else ships .tar.gz.
+	const std::string ext = (platform.rfind("windows", 0) == 0) ? ".zip" : ".tar.gz";
+	c.asset = prefix + "-" + tag + "-" + platform + ext;
 	c.expected_sha256 = sha;
 	c.member_hint = path;
 	c.is_auto = true;
 	return c;
 }
 
-#if VGI_POSIX_TRANSPORT
+#if VGI_SUBPROCESS_TRANSPORT
 
 namespace {
 
 // Always the real local filesystem — the cached binary must be a real path we can
-// hand to fork/exec; never an overridable virtual FS.
+// hand to the child-process spawn; never an overridable virtual FS.
 FileSystem &LocalFs() {
 	static unique_ptr<FileSystem> fs = FileSystem::CreateLocal();
 	return *fs;
@@ -306,12 +311,16 @@ std::string ReadFileBytes(const std::string &path) {
 	return out;
 }
 
-// Platform remainder: the executable bit. FileSystem has no portable chmod; on a
-// future Windows port the entrypoint is selected by .exe instead.
+// Platform remainder: the executable bit. FileSystem has no portable chmod.
 void MakeExecutable(const std::string &path) {
+#if VGI_POSIX_TRANSPORT
 	::chmod(path.c_str(), 0755);
+#else
+	(void)path; // Windows: executability is by extension (.exe), no mode bit.
+#endif
 }
 
+#if VGI_POSIX_TRANSPORT
 int RunArgvSilent(const std::vector<std::string> &argv) {
 	pid_t pid = ::fork();
 	if (pid < 0) {
@@ -336,6 +345,7 @@ int RunArgvSilent(const std::vector<std::string> &argv) {
 	::waitpid(pid, &status, 0);
 	return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
+#endif // VGI_POSIX_TRANSPORT
 
 // Authenticated GitHub *API* GET via DuckDB's HTTPUtil. Adds a bearer token from
 // $GITHUB_TOKEN/$GH_TOKEN when set (avoids the 60-req/hr limit; reaches private
@@ -541,6 +551,7 @@ std::string WalkTar(const std::string &tar, const std::string &dest, const std::
 			if (target.empty() || target[0] == '/' || target.find("..") != std::string::npos) {
 				throw IOException("github: unsafe symlink %s -> %s", rel.c_str(), target.c_str());
 			}
+#if VGI_POSIX_TRANSPORT
 			auto sl = full.rfind('/');
 			if (sl != std::string::npos) {
 				MkdirP(full.substr(0, sl));
@@ -549,6 +560,11 @@ std::string WalkTar(const std::string &tar, const std::string &dest, const std::
 			if (::symlink(target.c_str(), full.c_str()) != 0) {
 				throw IOException("github: symlink failed for %s: %s", full.c_str(), strerror(errno));
 			}
+#else
+			throw IOException("github: symlinks in tar archives are not supported on this platform "
+			                  "(%s); publish a .zip for this platform",
+			                  rel.c_str());
+#endif
 		} else if (typeflag == '1') {
 			throw IOException("github: hardlinks in release archives are not supported (%s)", rel.c_str());
 		}
@@ -597,6 +613,72 @@ void WriteSingleFile(const std::string &dest, const std::string &name, const std
 	MakeExecutable(full);
 }
 
+// Extract a .zip (Windows release assets) into `dest` via the vendored miniz,
+// returning the absolute entrypoint path. Entrypoint = `member_hint`, else the
+// single .exe member, else the single regular file.
+std::string WalkZip(const std::string &zipbytes, const std::string &dest, const std::string &member_hint) {
+	using namespace duckdb_miniz;
+	mz_zip_archive zip;
+	memset(&zip, 0, sizeof(zip));
+	if (!mz_zip_reader_init_mem(&zip, zipbytes.data(), zipbytes.size(), 0)) {
+		throw IOException("github: failed to open .zip archive");
+	}
+	struct ZipGuard {
+		mz_zip_archive *z;
+		~ZipGuard() {
+			mz_zip_reader_end(z);
+		}
+	} zg {&zip};
+
+	std::vector<std::string> regular_files;
+	std::vector<std::string> exe_files;
+	mz_uint n = mz_zip_reader_get_num_files(&zip);
+	for (mz_uint i = 0; i < n; i++) {
+		mz_zip_archive_file_stat st;
+		if (!mz_zip_reader_file_stat(&zip, i, &st)) {
+			continue;
+		}
+		std::string rel = SanitizeMember(st.m_filename);
+		std::string full = dest + "/" + rel;
+		if (mz_zip_reader_is_file_a_directory(&zip, i)) {
+			MkdirP(full);
+			continue;
+		}
+		auto sl = full.rfind('/');
+		if (sl != std::string::npos) {
+			MkdirP(full.substr(0, sl));
+		}
+		size_t usize = static_cast<size_t>(st.m_uncomp_size);
+		std::string buf;
+		buf.resize(usize);
+		if (usize > 0 && !mz_zip_reader_extract_to_mem(&zip, i, &buf[0], usize, 0)) {
+			throw IOException("github: failed to extract %s from .zip", rel.c_str());
+		}
+		WriteFileBytes(full, buf.data(), usize);
+		regular_files.push_back(rel);
+		if (rel.size() >= 4 && rel.compare(rel.size() - 4, 4, ".exe") == 0) {
+			exe_files.push_back(rel);
+		}
+	}
+
+	std::string chosen;
+	if (!member_hint.empty()) {
+		chosen = SanitizeMember(member_hint);
+		if (!LocalFs().FileExists(dest + "/" + chosen)) {
+			throw IOException("github: #path=%s not found in archive", member_hint.c_str());
+		}
+	} else if (exe_files.size() == 1) {
+		chosen = exe_files[0];
+	} else if (exe_files.empty() && regular_files.size() == 1) {
+		chosen = regular_files[0];
+	} else {
+		throw IOException("github: ambiguous entrypoint in .zip; pin one with #path=<member>");
+	}
+	std::string ep = dest + "/" + chosen;
+	MakeExecutable(ep);
+	return ep;
+}
+
 // Decompress+extract `bytes` (the downloaded asset) into `dest`; return the
 // absolute entrypoint path. `asset` drives format + single-file naming.
 std::string ExtractFullTree(const std::string &bytes, const std::string &asset, const std::string &dest,
@@ -625,7 +707,7 @@ std::string ExtractFullTree(const std::string &bytes, const std::string &asset, 
 		return dest + "/" + name;
 	}
 	if (EndsWith(asset, ".zip")) {
-		throw IOException("github: .zip assets are not supported in this build; publish a .tar.gz");
+		return WalkZip(bytes, dest, member_hint);
 	}
 	WriteSingleFile(dest, asset, bytes);
 	return dest + "/" + asset;
@@ -917,19 +999,21 @@ int64_t FlushGithubCache(ClientContext &context) {
 	return count;
 }
 
-#else // !VGI_POSIX_TRANSPORT
+#else // !VGI_SUBPROCESS_TRANSPORT (e.g. Emscripten — no child-process transport)
 
 std::string ResolveGithubWorker(const std::string &location, ClientContext &) {
 	// Parse the coordinates first so malformed-LOCATION errors are identical on every
 	// platform (e.g. "missing owner/repo"); only a well-formed github location hits the
-	// POSIX-only wall below. The constructed asset name is discarded — we only validate.
+	// no-subprocess wall below. The constructed asset name is discarded — we only validate.
 	if (IsGithubAutoLocation(location)) {
 		(void)ParseGithubAutoLocation(location, DuckDB::Platform());
 	} else {
 		(void)ParseGithubLocation(location);
 	}
 	throw InvalidInputException(
-	    "vgi: github:// / github-auto:// LOCATIONs require a POSIX build (location=%s)", location);
+	    "vgi: github:// / github-auto:// LOCATIONs require a child-process transport not available in "
+	    "this build (location=%s)",
+	    location);
 }
 std::vector<GithubCacheEntry> ListGithubCache(ClientContext &) {
 	return {};
@@ -938,7 +1022,7 @@ int64_t FlushGithubCache(ClientContext &) {
 	return 0;
 }
 
-#endif // VGI_POSIX_TRANSPORT
+#endif // VGI_SUBPROCESS_TRANSPORT
 
 } // namespace vgi
 } // namespace duckdb
