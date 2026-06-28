@@ -1,6 +1,13 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 //
 // github:// and github-auto:// LOCATION schemes. See vgi_github.hpp.
+//
+// File I/O goes through DuckDB's cross-platform FileSystem (LocalFileSystem) so
+// the cache/extract layer is portable; only the genuine platform-specifics —
+// the executable bit, archive symlinks, and the macOS ad-hoc codesign — remain
+// POSIX, gated below. The whole module stays VGI_POSIX_TRANSPORT-gated for now
+// (those few bits + .zip support + .exe entrypoint selection are the remaining
+// Windows-port work); the FileSystem refactor keeps that delta small.
 
 #include "vgi_github.hpp"
 
@@ -14,28 +21,30 @@
 #include <string>
 
 #if VGI_POSIX_TRANSPORT
+#include "duckdb/common/file_system.hpp"
 #include "duckdb/common/http_util.hpp"
 #include "duckdb/main/client_context.hpp"
-#include "duckdb/main/database.hpp"
 #include "mbedtls_wrapper.hpp"
 #include "vgi_http_client.hpp"
 #include "vgi_http_compression.hpp"
 #include "yyjson.hpp"
 
-#include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
-#include <dirent.h>
-#include <fcntl.h>
 #include <map>
 #include <mutex>
-#include <sys/file.h>
+#include <thread>
+#include <unordered_map>
+
+// Genuine platform-specific remainder (no FileSystem equivalent): the executable
+// bit, archive symlinks, and the codesign subprocess.
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
-#include <unordered_map>
 #endif // VGI_POSIX_TRANSPORT
 
 namespace duckdb {
@@ -66,7 +75,6 @@ void SplitCommon(const std::string &body, std::string &owner, std::string &repo,
 		std::string key = frag.substr(0, eq);
 		std::string val = frag.substr(eq + 1);
 		if (key == "sha256") {
-			// normalise to lowercase hex
 			std::transform(val.begin(), val.end(), val.begin(), [](unsigned char c) { return std::tolower(c); });
 			sha256_out = val;
 		} else if (key == "path") {
@@ -90,9 +98,6 @@ void SplitCommon(const std::string &body, std::string &owner, std::string &repo,
 	repo = after_owner.substr(0, at);
 	std::string after_repo = after_owner.substr(at + 1);
 
-	// Tag may itself contain '/', so the asset is the segment after the LAST '/'.
-	// For github-auto:// (no explicit asset) the caller passes rest_after_tag back
-	// as the optional prefix; we split on the last '/' only when an asset is needed.
 	rest_after_tag = after_repo;
 	tag = after_repo; // provisional; callers refine
 
@@ -108,7 +113,6 @@ GithubCoords ParseGithubLocation(const std::string &location) {
 	std::string body = StripGithubScheme(location);
 	std::string owner, repo, tag_and_asset, rest, sha, path;
 	SplitCommon(body, owner, repo, tag_and_asset, rest, sha, path);
-	// Explicit form: asset = segment after the LAST '/'; tag = everything before it.
 	auto last_slash = rest.rfind('/');
 	if (last_slash == std::string::npos) {
 		throw std::invalid_argument("github://: missing /asset in '" + location +
@@ -139,9 +143,6 @@ GithubCoords ParseGithubAutoLocation(const std::string &location, const std::str
 	std::string body = StripGithubAutoScheme(location);
 	std::string owner, repo, tag_and_prefix, rest, sha, path;
 	SplitCommon(body, owner, repo, tag_and_prefix, rest, sha, path);
-	// Auto form: `tag[/prefix]`. A trailing '/' (or no '/') means "use repo name as
-	// prefix". If a non-empty segment follows the last '/', it's the prefix override
-	// AND the tag is the part before it; otherwise the whole `rest` is the tag.
 	std::string tag = rest;
 	std::string prefix = repo;
 	auto last_slash = rest.rfind('/');
@@ -161,9 +162,8 @@ GithubCoords ParseGithubAutoLocation(const std::string &location, const std::str
 	c.owner = owner;
 	c.repo = repo;
 	c.tag = tag;
-	// Convention: {prefix}-{tag}-{platform}.tar.gz
 	c.asset = prefix + "-" + tag + "-" + platform + ".tar.gz";
-	c.expected_sha256 = sha;     // usually empty; sidecar is fetched at resolve time
+	c.expected_sha256 = sha;
 	c.member_hint = path;
 	c.is_auto = true;
 	return c;
@@ -172,6 +172,13 @@ GithubCoords ParseGithubAutoLocation(const std::string &location, const std::str
 #if VGI_POSIX_TRANSPORT
 
 namespace {
+
+// Always the real local filesystem — the cached binary must be a real path we can
+// hand to fork/exec; never an overridable virtual FS.
+FileSystem &LocalFs() {
+	static unique_ptr<FileSystem> fs = FileSystem::CreateLocal();
+	return *fs;
+}
 
 std::string Sha256Hex(const std::string &bytes) {
 	auto raw = duckdb_mbedtls::MbedTlsWrapper::ComputeSha256Hash(bytes);
@@ -222,7 +229,9 @@ std::string CacheDir(ClientContext &context) {
 	return base + "/vgi/releases";
 }
 
-void MkdirP(const std::string &path, mode_t mode = 0700) {
+// Recursive directory create via FileSystem (cross-platform).
+void MkdirP(const std::string &path) {
+	auto &fs = LocalFs();
 	std::string cur;
 	size_t i = 0;
 	if (!path.empty() && path[0] == '/') {
@@ -232,8 +241,14 @@ void MkdirP(const std::string &path, mode_t mode = 0700) {
 	while (i <= path.size()) {
 		if (i == path.size() || path[i] == '/') {
 			if (cur.size() > 1 || (cur.size() == 1 && cur[0] != '/')) {
-				if (::mkdir(cur.c_str(), mode) != 0 && errno != EEXIST) {
-					throw IOException("github: mkdir(%s) failed: %s", cur, strerror(errno));
+				if (!fs.DirectoryExists(cur)) {
+					try {
+						fs.CreateDirectory(cur);
+					} catch (...) {
+						if (!fs.DirectoryExists(cur)) {
+							throw;
+						}
+					}
 				}
 			}
 			if (i == path.size()) {
@@ -248,39 +263,53 @@ void MkdirP(const std::string &path, mode_t mode = 0700) {
 }
 
 void RmRf(const std::string &path) {
-	struct stat st;
-	if (::lstat(path.c_str(), &st) != 0) {
-		return;
-	}
-	if (S_ISDIR(st.st_mode)) {
-		DIR *d = ::opendir(path.c_str());
-		if (d) {
-			struct dirent *e;
-			while ((e = ::readdir(d)) != nullptr) {
-				std::string n = e->d_name;
-				if (n == "." || n == "..") {
-					continue;
-				}
-				RmRf(path + "/" + n);
-			}
-			::closedir(d);
-		}
-		::rmdir(path.c_str());
-	} else {
-		::unlink(path.c_str());
+	auto &fs = LocalFs();
+	if (fs.DirectoryExists(path)) {
+		fs.RemoveDirectory(path); // LocalFileSystem removes recursively
+	} else if (fs.FileExists(path)) {
+		fs.RemoveFile(path);
 	}
 }
 
-void FsyncDir(const std::string &path) {
-	int fd = ::open(path.c_str(), O_RDONLY
-#ifdef O_DIRECTORY
-	                                  | O_DIRECTORY
-#endif
-	);
-	if (fd >= 0) {
-		::fsync(fd);
-		::close(fd);
+void WriteFileBytes(const std::string &path, const char *data, size_t size) {
+	auto &fs = LocalFs();
+	auto h = fs.OpenFile(path, FileFlags::FILE_FLAGS_WRITE | FileFlags::FILE_FLAGS_FILE_CREATE);
+	size_t off = 0;
+	while (off < size) {
+		int64_t w = h->Write(const_cast<char *>(data + off), static_cast<idx_t>(size - off));
+		if (w <= 0) {
+			throw IOException("github: write failed for %s", path.c_str());
+		}
+		off += static_cast<size_t>(w);
 	}
+	h->Sync();
+}
+
+std::string ReadFileBytes(const std::string &path) {
+	auto &fs = LocalFs();
+	if (!fs.FileExists(path)) {
+		return "";
+	}
+	auto h = fs.OpenFile(path, FileFlags::FILE_FLAGS_READ);
+	idx_t sz = static_cast<idx_t>(h->GetFileSize());
+	std::string out;
+	out.resize(sz);
+	size_t off = 0;
+	while (off < sz) {
+		int64_t r = h->Read(&out[off], sz - off);
+		if (r <= 0) {
+			break;
+		}
+		off += static_cast<size_t>(r);
+	}
+	out.resize(off);
+	return out;
+}
+
+// Platform remainder: the executable bit. FileSystem has no portable chmod; on a
+// future Windows port the entrypoint is selected by .exe instead.
+void MakeExecutable(const std::string &path) {
+	::chmod(path.c_str(), 0755);
 }
 
 int RunArgvSilent(const std::vector<std::string> &argv) {
@@ -308,12 +337,10 @@ int RunArgvSilent(const std::vector<std::string> &argv) {
 	return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
 
-// Authenticated GitHub *API* GET via DuckDB's HTTPUtil (same abstraction as the
-// rest of the extension). Adds the GitHub API headers and a bearer token from
-// $GITHUB_TOKEN/$GH_TOKEN when set (avoids the 60-req/hr unauthenticated limit and
-// reaches private repos). The asset/sidecar *downloads* use the shared
-// HttpGetBytes() instead — they come from a pre-signed CDN URL that breaks if an
-// Authorization header is attached.
+// Authenticated GitHub *API* GET via DuckDB's HTTPUtil. Adds a bearer token from
+// $GITHUB_TOKEN/$GH_TOKEN when set (avoids the 60-req/hr limit; reaches private
+// repos). Asset/sidecar *downloads* use HttpGetBytes() — they come from a
+// pre-signed CDN URL that breaks if an Authorization header is attached.
 std::string GithubApiGet(ClientContext &context, const std::string &url) {
 	auto &db = *context.db;
 	auto &http_util = HTTPUtil::Get(db);
@@ -348,8 +375,6 @@ std::string GithubApiGet(ClientContext &context, const std::string &url) {
 	return body;
 }
 
-// Parse the releases-by-tag JSON; return the browser_download_url for
-// `asset_name` (empty if absent). Collects all asset names for error messages.
 std::string FindAssetUrl(const std::string &json, const std::string &asset_name,
                          std::vector<std::string> &all_names) {
 	using namespace duckdb_yyjson;
@@ -414,7 +439,6 @@ std::string SanitizeMember(const std::string &name) {
 }
 
 uint64_t ReadTarNumeric(const char *p, size_t n) {
-	// GNU base-256 (high bit of first byte set) or octal ASCII.
 	if (n > 0 && (static_cast<unsigned char>(p[0]) & 0x80)) {
 		uint64_t v = 0;
 		for (size_t i = 0; i < n; i++) {
@@ -442,7 +466,10 @@ uint64_t ReadTarNumeric(const char *p, size_t n) {
 
 // Extract a USTAR/GNU tar into `dest`, returning the absolute path of the chosen
 // entrypoint (single executable-bit regular file, or `member_hint` override).
+// File/dir writes go through FileSystem; symlinks + the exec bit are the platform
+// remainder.
 std::string WalkTar(const std::string &tar, const std::string &dest, const std::string &member_hint) {
+	auto &fs = LocalFs();
 	const size_t BS = 512;
 	size_t off = 0;
 	std::string pending_long_name;
@@ -482,7 +509,7 @@ std::string WalkTar(const std::string &tar, const std::string &dest, const std::
 			name = prefix.empty() ? nm : prefix + "/" + nm;
 		}
 
-		if (typeflag == 'L') { // GNU long name: payload is the name of the next entry
+		if (typeflag == 'L') { // GNU long name: payload names the next entry
 			pending_long_name.assign(tar.data() + data_off, ::strnlen(tar.data() + data_off, size));
 			off = data_off + data_blocks * BS;
 			continue;
@@ -497,38 +524,26 @@ std::string WalkTar(const std::string &tar, const std::string &dest, const std::
 		std::string full = dest + "/" + rel;
 
 		if (typeflag == '5') {
-			MkdirP(full, 0755);
+			MkdirP(full);
 		} else if (typeflag == '0' || typeflag == '\0') {
 			auto sl = full.rfind('/');
 			if (sl != std::string::npos) {
-				MkdirP(full.substr(0, sl), 0755);
+				MkdirP(full.substr(0, sl));
 			}
-			int fd = ::open(full.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0644);
-			if (fd < 0) {
-				throw IOException("github: cannot create %s: %s", full.c_str(), strerror(errno));
-			}
-			size_t written = 0;
-			while (written < size) {
-				ssize_t w = ::write(fd, tar.data() + data_off + written, size - written);
-				if (w < 0) {
-					::close(fd);
-					throw IOException("github: write failed for %s: %s", full.c_str(), strerror(errno));
-				}
-				written += static_cast<size_t>(w);
-			}
-			::fchmod(fd, (mode & 0111) ? 0755 : 0644);
-			::close(fd);
+			WriteFileBytes(full, tar.data() + data_off, size);
 			if (mode & 0111) {
+				MakeExecutable(full);
 				exec_files.push_back(rel);
 			}
 		} else if (typeflag == '2') {
+			// Symlink: platform remainder (no FileSystem API). Reject escapes.
 			std::string target(h + 157, ::strnlen(h + 157, 100));
 			if (target.empty() || target[0] == '/' || target.find("..") != std::string::npos) {
 				throw IOException("github: unsafe symlink %s -> %s", rel.c_str(), target.c_str());
 			}
 			auto sl = full.rfind('/');
 			if (sl != std::string::npos) {
-				MkdirP(full.substr(0, sl), 0755);
+				MkdirP(full.substr(0, sl));
 			}
 			::unlink(full.c_str());
 			if (::symlink(target.c_str(), full.c_str()) != 0) {
@@ -537,17 +552,15 @@ std::string WalkTar(const std::string &tar, const std::string &dest, const std::
 		} else if (typeflag == '1') {
 			throw IOException("github: hardlinks in release archives are not supported (%s)", rel.c_str());
 		}
-		// other types (devices, fifos) are silently skipped
 		off = data_off + data_blocks * BS;
 	}
 
 	if (!member_hint.empty()) {
 		std::string ep = dest + "/" + SanitizeMember(member_hint);
-		struct stat st;
-		if (::stat(ep.c_str(), &st) != 0) {
+		if (!fs.FileExists(ep)) {
 			throw IOException("github: #path=%s not found in archive", member_hint.c_str());
 		}
-		::chmod(ep.c_str(), 0755);
+		MakeExecutable(ep);
 		return ep;
 	}
 	if (exec_files.empty()) {
@@ -568,8 +581,6 @@ bool EndsWith(const std::string &s, const std::string &suf) {
 	return s.size() >= suf.size() && s.compare(s.size() - suf.size(), suf.size(), suf) == 0;
 }
 
-// Strip the longest known archive/compression suffix, e.g.
-// "x-osx_arm64.tar.gz" -> "x-osx_arm64". Used to derive the `.sha256` sidecar name.
 std::string ArchiveStem(const std::string &asset) {
 	static const char *suffixes[] = {".tar.gz", ".tgz", ".tar.zst", ".tar", ".gz", ".zst", ".zip"};
 	for (const char *suf : suffixes) {
@@ -582,25 +593,12 @@ std::string ArchiveStem(const std::string &asset) {
 
 void WriteSingleFile(const std::string &dest, const std::string &name, const std::string &bytes) {
 	std::string full = dest + "/" + SanitizeMember(name);
-	int fd = ::open(full.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0755);
-	if (fd < 0) {
-		throw IOException("github: cannot create %s: %s", full.c_str(), strerror(errno));
-	}
-	size_t written = 0;
-	while (written < bytes.size()) {
-		ssize_t w = ::write(fd, bytes.data() + written, bytes.size() - written);
-		if (w < 0) {
-			::close(fd);
-			throw IOException("github: write failed for %s: %s", full.c_str(), strerror(errno));
-		}
-		written += static_cast<size_t>(w);
-	}
-	::fchmod(fd, 0755);
-	::close(fd);
+	WriteFileBytes(full, bytes.data(), bytes.size());
+	MakeExecutable(full);
 }
 
 // Decompress+extract `bytes` (the downloaded asset) into `dest`; return the
-// absolute entrypoint path. `asset` is the asset filename (drives format + name).
+// absolute entrypoint path. `asset` drives format + single-file naming.
 std::string ExtractFullTree(const std::string &bytes, const std::string &asset, const std::string &dest,
                             const std::string &member_hint) {
 	if (EndsWith(asset, ".tar.gz") || EndsWith(asset, ".tgz")) {
@@ -629,7 +627,6 @@ std::string ExtractFullTree(const std::string &bytes, const std::string &asset, 
 	if (EndsWith(asset, ".zip")) {
 		throw IOException("github: .zip assets are not supported in this build; publish a .tar.gz");
 	}
-	// bare executable
 	WriteSingleFile(dest, asset, bytes);
 	return dest + "/" + asset;
 }
@@ -637,7 +634,7 @@ std::string ExtractFullTree(const std::string &bytes, const std::string &asset, 
 void CodesignAdHoc(const std::string &entrypoint) {
 #ifdef __APPLE__
 	// Ad-hoc sign the whole bundle so nested unsigned dylibs aren't SIGKILLed on
-	// arm64. Best-effort: a failure is logged via the spawn error later, not here.
+	// arm64. Best-effort: a failure surfaces later as a spawn error.
 	int rc = RunArgvSilent({"/usr/bin/codesign", "-s", "-", "--force", "--deep", entrypoint});
 	if (rc != 0) {
 		fprintf(stderr, "[VGI] github: codesign of %s returned %d (worker may fail to start on arm64)\n",
@@ -648,30 +645,29 @@ void CodesignAdHoc(const std::string &entrypoint) {
 #endif
 }
 
-// RAII exclusive flock on a lockfile (blocking).
-struct FlockGuard {
-	int fd = -1;
-	explicit FlockGuard(const std::string &path) {
-		fd = ::open(path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0600);
-		if (fd < 0) {
-			throw IOException("github: cannot open lock %s: %s", path.c_str(), strerror(errno));
-		}
-		while (::flock(fd, LOCK_EX) != 0) {
-			if (errno == EINTR) {
-				continue;
+// Cross-process lock via FileSystem's write lock. DuckDB's lock is fail-fast
+// (throws on contention), so we poll into blocking behavior — a second process
+// waits for the first to finish downloading rather than racing it.
+struct FsLockGuard {
+	unique_ptr<FileHandle> handle;
+	explicit FsLockGuard(const std::string &path) {
+		auto &fs = LocalFs();
+		FileOpenFlags flags = FileFlags::FILE_FLAGS_WRITE | FileFlags::FILE_FLAGS_FILE_CREATE;
+		flags |= FileOpenFlags(FileLockType::WRITE_LOCK);
+		for (int attempt = 0;; attempt++) {
+			try {
+				handle = fs.OpenFile(path, flags);
+				return;
+			} catch (const std::exception &) {
+				if (attempt >= 600) { // ~60s at 100ms
+					throw IOException("github: timed out acquiring lock %s", path.c_str());
+				}
+				std::this_thread::sleep_for(std::chrono::milliseconds(100));
 			}
-			int saved = errno;
-			::close(fd);
-			throw IOException("github: flock(%s) failed: %s", path.c_str(), strerror(saved));
 		}
 	}
-	~FlockGuard() {
-		if (fd >= 0) {
-			::close(fd);
-		}
-	}
-	FlockGuard(const FlockGuard &) = delete;
-	FlockGuard &operator=(const FlockGuard &) = delete;
+	FsLockGuard(const FsLockGuard &) = delete;
+	FsLockGuard &operator=(const FsLockGuard &) = delete;
 };
 
 std::string MetaEscape(const std::string &s) {
@@ -687,7 +683,6 @@ std::string MetaEscape(const std::string &s) {
 
 void WriteMeta(const std::string &meta_path, const GithubCoords &c, const std::string &digest,
                const std::string &entrypoint) {
-	std::string tmp = meta_path + ".tmp";
 	std::string body;
 	body += "owner=" + MetaEscape(c.owner) + "\n";
 	body += "repo=" + MetaEscape(c.repo) + "\n";
@@ -696,29 +691,18 @@ void WriteMeta(const std::string &meta_path, const GithubCoords &c, const std::s
 	body += "digest=" + MetaEscape(digest) + "\n";
 	body += "entrypoint=" + MetaEscape(entrypoint) + "\n";
 	body += "installed_at=" + std::to_string(static_cast<int64_t>(::time(nullptr))) + "\n";
-	int fd = ::open(tmp.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0600);
-	if (fd < 0) {
-		return; // meta is advisory; ignore failure
+	std::string tmp = meta_path + ".tmp";
+	try {
+		WriteFileBytes(tmp, body.data(), body.size());
+		LocalFs().MoveFile(tmp, meta_path);
+	} catch (...) {
+		// meta is advisory — ignore failures
 	}
-	(void)!::write(fd, body.data(), body.size());
-	::fsync(fd);
-	::close(fd);
-	::rename(tmp.c_str(), meta_path.c_str());
 }
 
 std::map<std::string, std::string> ReadMeta(const std::string &meta_path) {
 	std::map<std::string, std::string> kv;
-	int fd = ::open(meta_path.c_str(), O_RDONLY);
-	if (fd < 0) {
-		return kv;
-	}
-	std::string buf;
-	char tmp[4096];
-	ssize_t n;
-	while ((n = ::read(fd, tmp, sizeof(tmp))) > 0) {
-		buf.append(tmp, static_cast<size_t>(n));
-	}
-	::close(fd);
+	std::string buf = ReadFileBytes(meta_path);
 	size_t pos = 0;
 	while (pos < buf.size()) {
 		size_t nl = buf.find('\n', pos);
@@ -738,13 +722,14 @@ std::unordered_map<std::string, std::string> g_resolved; // location -> entrypoi
 } // namespace
 
 std::string ResolveGithubWorker(const std::string &location, ClientContext &context) {
+	auto &fs = LocalFs();
+
 	// In-process fast path.
 	{
 		std::lock_guard<std::mutex> lk(g_resolved_mu);
 		auto it = g_resolved.find(location);
 		if (it != g_resolved.end()) {
-			struct stat st;
-			if (::stat(it->second.c_str(), &st) == 0) {
+			if (fs.FileExists(it->second)) {
 				return it->second;
 			}
 			g_resolved.erase(it);
@@ -756,30 +741,26 @@ std::string ResolveGithubWorker(const std::string &location, ClientContext &cont
 	                     : ParseGithubLocation(location);
 
 	std::string cache = CacheDir(context);
-	MkdirP(cache, 0700);
-	::chmod(cache.c_str(), 0700);
+	MkdirP(cache);
 
 	std::string coord_key = c.owner + "/" + c.repo + "@" + c.tag + "/" + c.asset;
 	std::string coord_hash = Sha256Hex(coord_key).substr(0, 32);
 	std::string lock_path = cache + "/" + coord_hash + ".lock";
 	std::string meta_path = cache + "/" + coord_hash + ".meta";
 
-	FlockGuard guard(lock_path);
+	FsLockGuard guard(lock_path);
 
-	// Cache hit: meta records an entrypoint that still exists. If the caller pinned a
-	// digest, the cached digest must match it — otherwise fall through to re-download,
-	// which re-verifies and throws a clear mismatch (the pin is never silently ignored).
+	// Cache hit: meta records an entrypoint that still exists. A caller-supplied
+	// pin must match the cached digest — otherwise fall through to re-download,
+	// which re-verifies and throws a clear mismatch (the pin is never ignored).
 	{
 		auto meta = ReadMeta(meta_path);
 		auto ep_it = meta.find("entrypoint");
 		bool pin_ok = c.expected_sha256.empty() || meta["digest"] == c.expected_sha256;
-		if (pin_ok && ep_it != meta.end() && !ep_it->second.empty()) {
-			struct stat st;
-			if (::stat(ep_it->second.c_str(), &st) == 0) {
-				std::lock_guard<std::mutex> lk(g_resolved_mu);
-				g_resolved[location] = ep_it->second;
-				return ep_it->second;
-			}
+		if (pin_ok && ep_it != meta.end() && !ep_it->second.empty() && fs.FileExists(ep_it->second)) {
+			std::lock_guard<std::mutex> lk(g_resolved_mu);
+			g_resolved[location] = ep_it->second;
+			return ep_it->second;
 		}
 	}
 
@@ -801,9 +782,6 @@ std::string ResolveGithubWorker(const std::string &location, ClientContext &cont
 	// Expected digest: explicit pin, or (auto) the .sha256 sidecar.
 	std::string expected = c.expected_sha256;
 	if (expected.empty() && c.is_auto) {
-		// Sidecar naming varies: GoReleaser publishes "{stem}.sha256" (stem = asset
-		// without the archive suffix); some publishers use "{asset}.sha256". Try both
-		// against the asset list we already fetched.
 		std::vector<std::string> candidates = {ArchiveStem(c.asset) + ".sha256", c.asset + ".sha256"};
 		std::string sidecar_url;
 		std::vector<std::string> tmp_names;
@@ -846,32 +824,26 @@ std::string ResolveGithubWorker(const std::string &location, ClientContext &cont
 
 	std::string final_dir = cache + "/" + digest;
 
-	// Extract into a unique temp dir, then atomically rename into <digest>/.
-	std::string tmpl = cache + "/.tmp-" + coord_hash + "-XXXXXX";
-	std::vector<char> tbuf(tmpl.begin(), tmpl.end());
-	tbuf.push_back('\0');
-	if (!::mkdtemp(tbuf.data())) {
-		throw IOException("github: mkdtemp failed: %s", strerror(errno));
-	}
-	std::string tmpdir(tbuf.data());
+	// Extract into a per-coordinate temp dir (safe: we hold the coord lock), then
+	// atomically move into <digest>/.
+	std::string tmpdir = cache + "/.tmp-" + coord_hash;
+	RmRf(tmpdir); // clear any stale temp from a crashed run
+	MkdirP(tmpdir);
 
 	std::string entrypoint;
 	try {
 		std::string ep_in_tmp = ExtractFullTree(bytes, c.asset, tmpdir, c.member_hint);
 		CodesignAdHoc(ep_in_tmp);
-		FsyncDir(tmpdir);
 		std::string rel = ep_in_tmp.substr(tmpdir.size()); // "/<member>"
-		if (::rename(tmpdir.c_str(), final_dir.c_str()) != 0) {
-			if (errno == ENOTEMPTY || errno == EEXIST) {
-				// Another process installed the same digest first — use theirs.
-				RmRf(tmpdir);
-			} else {
-				int saved = errno;
-				RmRf(tmpdir);
-				throw IOException("github: atomic install rename failed: %s", strerror(saved));
+		try {
+			fs.MoveFile(tmpdir, final_dir);
+		} catch (...) {
+			// Another process installed the same digest first → use theirs.
+			RmRf(tmpdir);
+			if (!fs.DirectoryExists(final_dir)) {
+				throw;
 			}
 		}
-		FsyncDir(cache);
 		entrypoint = final_dir + rel;
 	} catch (...) {
 		RmRf(tmpdir);
@@ -888,25 +860,22 @@ std::string ResolveGithubWorker(const std::string &location, ClientContext &cont
 
 std::vector<GithubCacheEntry> ListGithubCache(ClientContext &context) {
 	std::vector<GithubCacheEntry> out;
+	auto &fs = LocalFs();
 	std::string cache = CacheDir(context);
-	DIR *d = ::opendir(cache.c_str());
-	if (!d) {
+	if (!fs.DirectoryExists(cache)) {
 		return out;
 	}
 	int64_t now = static_cast<int64_t>(::time(nullptr));
-	struct dirent *e;
-	while ((e = ::readdir(d)) != nullptr) {
-		std::string n = e->d_name;
-		if (n.size() < 5 || n.compare(n.size() - 5, 5, ".meta") != 0) {
-			continue;
+	std::vector<std::string> meta_files;
+	fs.ListFiles(cache, [&](const std::string &name, bool /*is_dir*/) {
+		if (name.size() >= 5 && name.compare(name.size() - 5, 5, ".meta") == 0) {
+			meta_files.push_back(name);
 		}
+	});
+	for (auto &n : meta_files) {
 		auto meta = ReadMeta(cache + "/" + n);
 		auto ep_it = meta.find("entrypoint");
-		if (ep_it == meta.end()) {
-			continue;
-		}
-		struct stat st;
-		if (::stat(ep_it->second.c_str(), &st) != 0) {
+		if (ep_it == meta.end() || !fs.FileExists(ep_it->second)) {
 			continue; // stale meta; entrypoint gone
 		}
 		GithubCacheEntry ce;
@@ -925,25 +894,20 @@ std::vector<GithubCacheEntry> ListGithubCache(ClientContext &context) {
 		ce.age_seconds = installed > 0 ? (now - installed) : 0;
 		out.push_back(std::move(ce));
 	}
-	::closedir(d);
 	return out;
 }
 
 int64_t FlushGithubCache(ClientContext &context) {
+	auto &fs = LocalFs();
 	std::string cache = CacheDir(context);
 	int64_t count = 0;
-	DIR *d = ::opendir(cache.c_str());
-	if (d) {
-		struct dirent *e;
-		while ((e = ::readdir(d)) != nullptr) {
-			std::string n = e->d_name;
+	if (fs.DirectoryExists(cache)) {
+		fs.ListFiles(cache, [&](const std::string &name, bool /*is_dir*/) {
 			// A digest dir is 64 lowercase hex chars.
-			if (n.size() == 64 &&
-			    n.find_first_not_of("0123456789abcdef") == std::string::npos) {
+			if (name.size() == 64 && name.find_first_not_of("0123456789abcdef") == std::string::npos) {
 				count++;
 			}
-		}
-		::closedir(d);
+		});
 	}
 	RmRf(cache);
 	{
