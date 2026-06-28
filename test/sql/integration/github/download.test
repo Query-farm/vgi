@@ -9,6 +9,11 @@ require-env VGI_GITHUB_NETWORK_TESTS
 
 require vgi
 
+# Outbound HTTPS to api.github.com + the release CDN needs TLS. haybarn autoloads
+# httpfs on demand in production; the standalone unittest binary does not, so load
+# it explicitly here (skips the test if httpfs isn't available).
+require httpfs
+
 # github-auto:// builds the asset name from the host DuckDB platform string and
 # verifies it against the published .sha256 sidecar — platform-agnostic.
 statement ok
