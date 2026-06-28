@@ -118,11 +118,17 @@ TO '__TEST_DIR__/to_pto' (FORMAT 'acme.example_lines_out', null_string 'NA', PER
 do not support
 
 # --- Worker-side semantic option: on_exists='error' refuses an existing file --
+# A worker can only observe the real destination when DuckDB writes in place. By
+# default DuckDB overwrites an existing local file via a temp sibling + rename
+# (use_tmp_file), so the worker is handed a fresh temp path and cannot see the
+# existing destination. Pin use_tmp_file=false so the worker receives the actual
+# destination and can enforce on_exists. (use_tmp_file is already off for remote
+# destinations, so on_exists works there without this.)
 statement ok
 COPY (SELECT 1 AS a) TO '__TEST_DIR__/to_exists.txt' (FORMAT 'acme.example_lines_out', null_string 'NA');
 
 statement error
-COPY (SELECT 2 AS a) TO '__TEST_DIR__/to_exists.txt' (FORMAT 'acme.example_lines_out', null_string 'NA', on_exists 'error');
+COPY (SELECT 2 AS a) TO '__TEST_DIR__/to_exists.txt' (FORMAT 'acme.example_lines_out', null_string 'NA', on_exists 'error', use_tmp_file false);
 ----
 already exists
 

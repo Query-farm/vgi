@@ -109,6 +109,28 @@ format that supports both read and write is advertised once with `direction='bot
 - **DETACH** does not unregister the format (same lifecycle gap as COPY FROM / the
   secret provider); the entry persists for the DB's lifetime.
 
+## Temp-file overwrite (`use_tmp_file`)
+
+When the destination is a **local file that already exists**, DuckDB performs an atomic
+overwrite: `PhysicalCopyToFile` writes to a `tmp_<name>` sibling and renames it onto the
+final name at finalize (`MoveTmpFile`). The path it hands `copy_to_initialize_global` is
+that **temp** path — distinct from the bind-time destination. The extension detects the
+mismatch and **re-binds the worker with the temp path** (`RebindCopyToForPath` in
+`vgi_copy_to_impl.cpp`), republishing the bind result onto the bind data so every
+sink-thread secondary init (and the combine worker, whichever worker it lands on) agrees
+on where to write. Without this the worker would write the final path, the temp file would
+never be created, and DuckDB's rename would throw `Could not rename ... No such file or
+directory`. `initialize_global` runs once before any sink, so mutating the bind data there
+is race-free. Covered by `test/sql/integration/copy_to/tmp_file.test`.
+
+`use_tmp_file` is **off** for remote destinations (DuckDB forces it false for `s3://` /
+`http(s)://`) and for first-time (fresh-file) writes, so the worker receives the real
+destination in those cases. Consequence: a worker that inspects the destination (e.g. an
+`on_exists='error'` check) only sees the real path when DuckDB writes in place — under the
+default temp-file overwrite it is handed a fresh temp path and cannot observe the existing
+file. Pass `use_tmp_file false` in the COPY options to force the worker to receive the
+actual destination.
+
 ## How it works (C++)
 
 `src/vgi_copy_to_impl.cpp` — `VgiCopyToFunctionInfo` carrier (self-contained, no

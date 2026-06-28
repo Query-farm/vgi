@@ -347,6 +347,16 @@ context (format + path) is threaded onto the bind exactly like `copy_from`.
 DuckDB's `GlobalFunctionData`/`LocalFunctionData` (different base classes), with a best-effort
 `table_buffering_destructor` to free worker `BoundStorage`.
 
+**Temp-file overwrite (`use_tmp_file`).** When the destination is a local file that already exists,
+DuckDB writes to a `tmp_<name>` sibling and renames it onto the final name at finalize. The path
+handed to `copy_to_initialize_global` is that temp path, distinct from the bind-time destination —
+so `VgiCopyToInitializeGlobal` re-binds the worker with it (`RebindCopyToForPath`) and republishes
+`bind_data.bind_result`/`file_path` so the sink-thread secondary inits (and the combine worker)
+write where DuckDB will rename FROM. `initialize_global` runs once before any sink, so the mutation
+is race-free. Without it the worker writes the final path and DuckDB's rename throws "Could not
+rename". `use_tmp_file` is off for remote destinations and fresh files (worker gets the real path
+there). Regression: `test/sql/integration/copy_to/tmp_file.test`. See [docs/copy_to.md](docs/copy_to.md).
+
 **Ordering.** Default is the parallel sharded sink (unordered). A writer that needs source order
 declares `Meta.sink_order_dependent = True`; discovery surfaces it as `CopyFromFormatInfo.ordered`,
 and registration installs a single-thread execution mode (`REGULAR_COPY_TO_FILE`) for that format

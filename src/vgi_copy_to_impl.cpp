@@ -40,6 +40,7 @@ struct VgiCopyToBindData : public FunctionData {
 	std::vector<uint8_t> attach_opaque_data;
 	std::vector<uint8_t> transaction_opaque_data; // empty: COPY runs outside a catalog read txn
 	std::string function_name;                    // worker handler
+	ArrowArguments arguments;                     // resolved COPY options (for re-bind at init)
 	std::map<std::string, Value> settings;
 	std::shared_ptr<arrow::Schema> input_schema; // source columns
 	BindResult bind_result;                      // bind_request_bytes carries the copy_to context
@@ -52,6 +53,7 @@ struct VgiCopyToBindData : public FunctionData {
 		c->attach_opaque_data = attach_opaque_data;
 		c->transaction_opaque_data = transaction_opaque_data;
 		c->function_name = function_name;
+		c->arguments = arguments;
 		c->settings = settings;
 		c->input_schema = input_schema;
 		c->bind_result = bind_result;
@@ -331,6 +333,7 @@ unique_ptr<FunctionData> VgiCopyToBind(ClientContext &context, CopyFunctionBindI
 	bind_data->attach_params = carrier.attach_params;
 	bind_data->attach_opaque_data = carrier.attach_opaque_data;
 	bind_data->function_name = carrier.handler;
+	bind_data->arguments = arguments;
 	bind_data->settings = std::move(settings);
 	bind_data->input_schema = input_schema;
 	bind_data->bind_result = std::move(acquired.bind_result);
@@ -343,11 +346,52 @@ unique_ptr<FunctionData> VgiCopyToBind(ClientContext &context, CopyFunctionBindI
 	return std::move(bind_data);
 }
 
+// Re-bind the worker against `path` and republish the result to bind_data. Used
+// when DuckDB hands initialize_global a path that differs from the bind-time
+// destination — the `use_tmp_file` case, where PhysicalCopyToFile writes to a
+// `tmp_<name>` sibling and renames it to the final name at finalize
+// (MoveTmpFile). The worker must write to *that* temp path, so we re-issue the
+// bind with copy_to.file_path = path and overwrite bd.bind_result + bd.file_path.
+// Because initialize_global runs exactly once before any sink, the sink-thread
+// secondary inits (which reuse bd.bind_result) observe the updated path — they
+// must, or a combine that lands on a sink worker would write the wrong path.
+void RebindCopyToForPath(ClientContext &context, VgiCopyToBindData &bd, const string &path) {
+	CopyToBindContext copy_ctx;
+	copy_ctx.format = bd.format;
+	copy_ctx.file_path = path;
+
+	FunctionConnectionParams bp;
+	bp.attach_params = bd.attach_params;
+	bp.attach_opaque_data = bd.attach_opaque_data;
+	bp.function_name = bd.function_name;
+	bp.arguments = bd.arguments;
+	bp.settings = bd.settings;
+	bp.input_schema = bd.input_schema;
+	bp.copy_to = copy_ctx;
+	bp.function_type = "TABLE";
+	bp.phase = "bind";
+
+	auto acquired = AcquireAndBindConnection(context, bp);
+	bd.bind_result = std::move(acquired.bind_result);
+	bd.file_path = path;
+	ReleaseWorkerToPool(std::move(acquired.connection), bd);
+}
+
 unique_ptr<GlobalFunctionData> VgiCopyToInitializeGlobal(ClientContext &context, FunctionData &bind_data_p,
                                                           const string &file_path) {
 	auto &bd = bind_data_p.Cast<VgiCopyToBindData>();
 	auto *db = &DatabaseInstance::GetDatabase(context);
 	auto gstate = make_uniq<VgiCopyToGlobalState>(db);
+
+	// DuckDB writes via a temp file by default (use_tmp_file) and renames it to
+	// the final destination at finalize; the path it hands us here is that temp
+	// path, which may differ from the bind-time destination. Re-bind so the
+	// worker writes exactly where DuckDB expects (else MoveTmpFile fails because
+	// the temp file was never created). No-op when the paths already match.
+	if (file_path != bd.file_path) {
+		RebindCopyToForPath(context, bd, file_path);
+	}
+
 	gstate->function_name = bd.function_name;
 	gstate->attach_opaque_data = bd.attach_opaque_data;
 	gstate->attach_params = bd.attach_params;
@@ -365,7 +409,6 @@ unique_ptr<GlobalFunctionData> VgiCopyToInitializeGlobal(ClientContext &context,
 	gstate->execution_id = std::move(init_result.execution_id);
 	DrainInitStream(*acquired.connection);
 	gstate->init_worker = std::move(acquired.connection);
-	(void)file_path; // destination is carried on the bind's copy_to context
 	return std::move(gstate);
 }
 

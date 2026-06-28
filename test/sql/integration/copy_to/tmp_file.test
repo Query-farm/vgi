@@ -1,0 +1,99 @@
+# name: test/sql/integration/copy_to/tmp_file.test
+# description: COPY ... TO over an EXISTING destination — exercises DuckDB's
+#              use_tmp_file path (write to a `tmp_<name>` sibling, then rename to
+#              the final name at finalize via MoveTmpFile).
+# group: [vgi_integration_copy_to]
+#
+# Regression: when the destination already exists, PhysicalCopyToFile hands
+# copy_to_initialize_global a TEMP path (distinct from the bind-time final path)
+# and renames it to the final name at finalize. The VGI extension must bind the
+# worker with that temp path so the worker writes where DuckDB will rename FROM;
+# otherwise the worker writes the final path, the temp file is never created, and
+# MoveTmpFile throws "Could not rename ... No such file or directory". This case
+# is NOT reached by a first-time (fresh-file) COPY, where use_tmp_file is off.
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS acme (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# First write CREATES the destination (use_tmp_file off — fresh file).
+query I
+COPY (SELECT * FROM (VALUES (1, 'a'), (2, 'b')) t(x, y))
+TO '__TEST_DIR__/copy_to_tmp.txt' (FORMAT 'acme.example_lines_out', null_string 'NA');
+----
+2
+
+query IT
+SELECT x, y FROM read_csv('__TEST_DIR__/copy_to_tmp.txt',
+    columns = {'x': 'INTEGER', 'y': 'VARCHAR'}, header = false, nullstr = 'NA') ORDER BY x;
+----
+1	a
+2	b
+
+# Second write OVERWRITES the now-existing destination — this is the
+# use_tmp_file path. Pre-fix this threw a MoveTmpFile rename error.
+query I
+COPY (SELECT * FROM (VALUES (10, 'p'), (20, 'q'), (30, 'r')) t(x, y))
+TO '__TEST_DIR__/copy_to_tmp.txt' (FORMAT 'acme.example_lines_out', null_string 'NA');
+----
+3
+
+# The destination holds the NEW contents (the overwrite landed atomically).
+query IT
+SELECT x, y FROM read_csv('__TEST_DIR__/copy_to_tmp.txt',
+    columns = {'x': 'INTEGER', 'y': 'VARCHAR'}, header = false, nullstr = 'NA') ORDER BY x;
+----
+10	p
+20	q
+30	r
+
+# A third overwrite still works (no wedged worker / stale state across rounds).
+query I
+COPY (SELECT * FROM (VALUES (99, 'z')) t(x, y))
+TO '__TEST_DIR__/copy_to_tmp.txt' (FORMAT 'acme.example_lines_out', null_string 'NA');
+----
+1
+
+query IT
+SELECT x, y FROM read_csv('__TEST_DIR__/copy_to_tmp.txt',
+    columns = {'x': 'INTEGER', 'y': 'VARCHAR'}, header = false, nullstr = 'NA') ORDER BY x;
+----
+99	z
+
+# The temp sibling DuckDB wrote-then-renamed must not linger.
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/tmp_copy_to_tmp.txt');
+----
+0
+
+# Overwrite over a parallel sink (threads>1) — the published temp path must be
+# visible to every sink worker's init, not just the retained init worker.
+statement ok
+SET threads = 4;
+
+statement ok
+SET preserve_insertion_order = false;
+
+statement ok
+CREATE TABLE big AS SELECT i AS x, ('v' || i) AS y FROM range(5000) t(i);
+
+query I
+COPY (SELECT x, y FROM big) TO '__TEST_DIR__/copy_to_tmp.txt'
+(FORMAT 'acme.example_lines_out', null_string 'NA');
+----
+5000
+
+query II
+SELECT count(*), count(DISTINCT x)
+FROM read_csv('__TEST_DIR__/copy_to_tmp.txt',
+    columns = {'x': 'INTEGER', 'y': 'VARCHAR'}, header = false, nullstr = 'NA');
+----
+5000	5000
+
+statement ok
+DETACH acme;

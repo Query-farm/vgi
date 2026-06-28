@@ -72,13 +72,16 @@ SELECT v FROM bigv ORDER BY v;
 9223372036854775807
 
 # Error recovery: a worker-side failure mid-COPY must not wedge the pool/workers —
-# a subsequent COPY on the same catalog still succeeds.
+# a subsequent COPY on the same catalog still succeeds. (use_tmp_file false so the
+# worker sees the real destination — under DuckDB's default temp-file overwrite it
+# would be handed a fresh temp path and could not observe the existing file. See
+# copy_to/tmp_file.test for the temp-file write path.)
 statement ok
 COPY (SELECT 1 AS a) TO '__TEST_DIR__/exists.txt' (FORMAT 'acme.example_lines_out', null_string 'NA');
 
 statement error
 COPY (SELECT 2 AS a) TO '__TEST_DIR__/exists.txt'
-(FORMAT 'acme.example_lines_out', null_string 'NA', on_exists 'error');
+(FORMAT 'acme.example_lines_out', null_string 'NA', on_exists 'error', use_tmp_file false);
 ----
 already exists
 
