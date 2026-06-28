@@ -5,6 +5,7 @@
 #include "vgi_github.hpp"
 
 #include "duckdb/common/exception.hpp"
+#include "duckdb/main/database.hpp"
 #include "vgi_platform.hpp"
 #include "vgi_transport.hpp"
 
@@ -955,6 +956,14 @@ int64_t FlushGithubCache(ClientContext &context) {
 #else // !VGI_POSIX_TRANSPORT
 
 std::string ResolveGithubWorker(const std::string &location, ClientContext &) {
+	// Parse the coordinates first so malformed-LOCATION errors are identical on every
+	// platform (e.g. "missing owner/repo"); only a well-formed github location hits the
+	// POSIX-only wall below. The constructed asset name is discarded — we only validate.
+	if (IsGithubAutoLocation(location)) {
+		(void)ParseGithubAutoLocation(location, DuckDB::Platform());
+	} else {
+		(void)ParseGithubLocation(location);
+	}
 	throw InvalidInputException(
 	    "vgi: github:// / github-auto:// LOCATIONs require a POSIX build (location=%s)", location);
 }
