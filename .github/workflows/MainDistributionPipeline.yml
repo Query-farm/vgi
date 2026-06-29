@@ -46,3 +46,28 @@ jobs:
       use_prebuilt_wasm_image: true
       prebuilt_image_tag: v1.5.3
       extra_toolchains: parser_tools
+      # Run the integration suite (which is otherwise skipped in CI: every
+      # test/sql/integration/*.test carries require-env VGI_TEST_WORKER) against
+      # the published vgi-fixtures container images. The oci:// transport runs
+      # each worker in a container over stdio — full subprocess fidelity, no
+      # uv/Python install on the runner.
+      #
+      # post_build_command runs on the Linux build host BEFORE the test steps.
+      # Writing to $GITHUB_ENV reaches the host "Test extension (outside docker)"
+      # leg (which has Docker, so docker run works) but NOT the "inside docker"
+      # leg (it runs `make test` with an explicit --env-file, so VGI_TEST_WORKER
+      # stays unset there and the integration tests skip) — so the suite runs
+      # exactly once, on the host, where the unittest binary already lives in its
+      # build tree. macOS/Windows have no post_build_command + no Docker, so the
+      # integration tests skip there too.
+      post_build_command: |
+        IMG=oci://ghcr.io/query-farm/vgi-fixtures:0.8.11
+        {
+          echo "VGI_TEST_WORKER=${IMG}-worker"
+          echo "VGI_VERSIONED_WORKER=${IMG}-versioned"
+          echo "VGI_VERSIONED_TABLES_WORKER=${IMG}-versioned-tables"
+          echo "VGI_ATTACH_OPTIONS_WORKER=${IMG}-attach-options"
+          echo "VGI_BAD_PROTOCOL_WORKER=${IMG}-bad-protocol"
+          echo "VGI_BAD_ENUM_WORKER=${IMG}-bad-enum"
+          echo "VGI_SIMPLE_WRITABLE_WORKER=${IMG}-simple-writable"
+        } >> "$GITHUB_ENV"
