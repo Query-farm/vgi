@@ -181,16 +181,6 @@ public:
 	std::vector<std::unique_ptr<IFunctionConnection>> workers;
 	std::vector<std::vector<uint8_t>> state_ids;
 
-	// Tracks every per-thread sink worker that is currently in-flight (between
-	// `lstate.connection = std::move(...)` and the Combine handoff). On the
-	// error path we want to cancel-dispatch every in-flight peer so its
-	// blocking RPC unblocks promptly rather than waiting for the worker's own
-	// idle path. Stored as raw pointers (the unique_ptr is owned by the
-	// LocalSinkState); LocalSinkState's destructor calls UntrackInFlight to
-	// remove itself before dropping the connection.
-	std::mutex in_flight_mutex;
-	std::vector<IFunctionConnection *> in_flight_workers;
-
 	// Populated by Sink::Finalize after combine returns. Drained by the
 	// source phase under finalize_queue_mutex.
 	std::mutex finalize_queue_mutex;
@@ -212,39 +202,36 @@ public:
 
 	// True once Sink::Finalize has fired (mirrors aggregate gstates).
 	std::atomic<bool> finalized {false};
-
-	void TrackInFlight(IFunctionConnection *conn) {
-		std::lock_guard<std::mutex> lk(in_flight_mutex);
-		in_flight_workers.push_back(conn);
-	}
-	void UntrackInFlight(IFunctionConnection *conn) {
-		std::lock_guard<std::mutex> lk(in_flight_mutex);
-		auto it = std::find(in_flight_workers.begin(), in_flight_workers.end(), conn);
-		if (it != in_flight_workers.end()) {
-			in_flight_workers.erase(it);
-		}
-	}
 };
 
 VgiTableBufferingGlobalSinkState::~VgiTableBufferingGlobalSinkState() {
-	// Two cases:
+	// `workers` holds the per-thread Sink workers (handed off by Combine) plus
+	// the combine worker (pushed back by Finalize). The Source phase acquires
+	// *fresh* workers and never drains this vector — those Sink/combine workers
+	// were init'd with phase=TABLE_BUFFERING and would reject a second
+	// PerformInit — so on the HAPPY path `workers` is NOT empty here; it holds
+	// idle, finished, reusable connections owned by this gstate (no thread is
+	// using them).  Return each to the pool first (the canonical happy-path
+	// release the Source phase uses on FINISHED).
 	//
-	// 1) Happy path — finalize ran cleanly. By the time we reach here every
-	//    worker has returned to its idle accept loop on its own thread (the
-	//    source loop releases-for-pooling on FINISHED). `workers` and
-	//    `coordinator` are empty.
-	//
-	// 2) Error path — some Sink, Combine, Finalize, or Source RPC threw. Any
-	//    connection still alive may be parked inside a blocking syscall on a
-	//    worker thread we no longer control. Dispatch a cancel through the
-	//    global VgiCancelDispatcher (same machinery the streaming InOut path
-	//    uses at vgi_table_in_out_impl.cpp:58-81) so the worker unblocks and
-	//    is reclaimable rather than forced-killed.
+	// Only if a worker can't be pooled (HTTP transport, pooling disabled, or a
+	// dead connection) do we fall back to cancel-dispatch through the global
+	// VgiCancelDispatcher (same machinery the streaming InOut path uses) so any
+	// worker still parked in a blocking syscall unblocks and is reclaimable
+	// rather than forced-killed on the error path.
 	auto *dispatcher = db ? FindVgiCancelDispatcher(*db) : nullptr;
 	auto reclaim_or_cancel = [&](std::unique_ptr<IFunctionConnection> conn) {
 		if (!conn) {
 			return;
 		}
+		// Try pooling first — restores the pooling win the TABLE_BUFFERING
+		// design is built around.  Release() internally skips dead workers.
+		if (auto pooled = conn->ReleaseForPooling()) {
+			(void)VgiWorkerPool::Instance().Release(std::move(pooled));
+			return;
+		}
+		// Not poolable (HTTP / pooling off / dead) — cancel-dispatch so a
+		// possibly-blocked worker thread is woken rather than left parked.
 		if (dispatcher) {
 			auto token = conn->GetLastStateToken();
 			CancelRequest req;
@@ -260,8 +247,8 @@ VgiTableBufferingGlobalSinkState::~VgiTableBufferingGlobalSinkState() {
 	workers.clear();
 	state_ids.clear();
 
-	// Any in-flight LocalSinkState connections handle their own cancel-dispatch
-	// via their destructor's cached gstate pointer + UntrackInFlight.
+	// In-flight LocalSinkState connections (still owned by a thread's lstate)
+	// handle their own cancel-dispatch in ~VgiTableBufferingLocalSinkState.
 
 	// Best-effort table_buffering_destructor RPC. Wipes the worker's
 	// FunctionStorage rows for this execution_id (worker-defined
@@ -316,35 +303,20 @@ public:
 	// table_buffering_process RPC on this thread. Empty until then.
 	std::vector<uint8_t> state_id;
 
-	// Pointers cached at Sink-time so the destructor (which runs on this
-	// thread, possibly after another thread's exception has torn down the
-	// pipeline) can dispatch a cancel without re-walking the operator.
-	VgiTableBufferingGlobalSinkState *gstate_ptr = nullptr;
+	// Cached at Sink-time so the destructor (which runs on this thread,
+	// possibly after another thread's exception has torn down the pipeline) can
+	// dispatch a cancel without re-walking the operator.
 	DatabaseInstance *db = nullptr;
 
 	~VgiTableBufferingLocalSinkState() override {
+		// If Combine already moved our connection into gstate.workers[], `connection`
+		// is null and there's nothing to do — that worker is now the gstate's to
+		// pool/cancel. We only reach the cancel-dispatch below when this lstate is
+		// torn down still owning a connection (an error unwound the pipeline before
+		// Combine ran), which is the sole mechanism that unblocks a peer worker
+		// parked in a blocking process() RPC.
 		if (!connection) {
 			return;
-		}
-		// Tell gstate we're no longer in-flight; if Combine already moved us
-		// to workers[], this is a no-op.
-		//
-		// Lifetime note for `gstate_ptr`: DuckDB's pipeline executor owns
-		// both the global and local sink states (via Pipeline /
-		// PipelineExecutor). The destruction order is documented as
-		// LocalSinkState → GlobalSinkState — the local states are
-		// per-executor (one per thread), torn down with the executor,
-		// while the global state is held by the operator's `sink_state`
-		// and outlives every executor. The pointer captured at Sink-time
-		// (line ~492 of this file) therefore remains valid through this
-		// destructor on every well-formed path. The one residual concern
-		// is host-process exit while a query is mid-flight: there the
-		// whole DatabaseInstance comes down, but it also drops the
-		// CancelDispatcher first, so the worst case is that we miss the
-		// UntrackInFlight bookkeeping update on a gstate that's about to
-		// be destroyed anyway. Acceptable.
-		if (gstate_ptr) {
-			gstate_ptr->UntrackInFlight(connection.get());
 		}
 		// Cancel-dispatch the connection so a blocked process call (e.g. a
 		// worker thread parked in select() waiting for the next request) gets
@@ -582,7 +554,6 @@ SinkResultType PhysicalVgiTableBufferingFunction::Sink(ExecutionContext &context
 		// but its destructor sees `db == nullptr` and falls back to a raw
 		// drop, which closes stdin without giving the worker a chance to
 		// shut down cleanly.
-		lstate.gstate_ptr = &gstate;
 		lstate.db = gstate.db;
 
 		if (i_am_runner) {
@@ -604,9 +575,6 @@ SinkResultType PhysicalVgiTableBufferingFunction::Sink(ExecutionContext &context
 				auto params = BuildAcquireParams(bd, /*global_execution_id=*/{});
 				auto acquired = AcquireConnectionForInit(context.client, params);
 				lstate.connection = std::move(acquired.connection);
-				// Register as in-flight as soon as we own a connection so a
-				// peer-thread exception path can see us and cancel-dispatch.
-				gstate.TrackInFlight(lstate.connection.get());
 				auto init_result = lstate.connection->PerformInit(bd.bind_result, projection_ids,
 				                                                    pushdown_filters,
 				                                                    join_keys_buffers,
@@ -642,7 +610,6 @@ SinkResultType PhysicalVgiTableBufferingFunction::Sink(ExecutionContext &context
 			auto params = BuildAcquireParams(bd, exec_id);
 			auto acquired = AcquireConnectionForInit(context.client, params);
 			lstate.connection = std::move(acquired.connection);
-			gstate.TrackInFlight(lstate.connection.get());
 			lstate.connection->PerformInit(bd.bind_result, projection_ids,
 			                                pushdown_filters,
 			                                join_keys_buffers,
@@ -739,9 +706,9 @@ PhysicalVgiTableBufferingFunction::Combine(ExecutionContext & /*context*/,
 		return SinkCombineResultType::FINISHED;
 	}
 
-	// Untrack first so the lstate dtor doesn't try to cancel-dispatch the
-	// connection after Combine has moved it into gstate.workers[].
-	gstate.UntrackInFlight(lstate.connection.get());
+	// Move the connection into gstate.workers[]; this nulls lstate.connection, so
+	// ~VgiTableBufferingLocalSinkState sees no connection and won't cancel-dispatch
+	// it (the worker is now the gstate's to pool/cancel at teardown).
 	{
 		std::lock_guard<std::mutex> lk(gstate.workers_mutex);
 		gstate.workers.push_back(std::move(lstate.connection));

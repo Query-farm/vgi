@@ -927,6 +927,13 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 		// Drain any buffered stderr to logging
 		DrainStderrLog();
 
+		// Gate each read on cancellation. Without this, a worker that opens the
+		// data stream then stalls mid-production wedges the scan with Ctrl-C
+		// ignored — ReadNext() bottoms out in a bare blocking read(). proc_ is
+		// always non-null here (the lazy open above throws otherwise; HTTP uses a
+		// separate connection class), so polling its stdout fd is safe.
+		WaitForReadableUntilCancel(proc_->GetStdoutFd(), &context_);
+
 		// Read from the data stream reader
 		auto read_result = data_reader_->ReadNext();
 		if (!read_result.ok()) {

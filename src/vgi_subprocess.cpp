@@ -93,6 +93,16 @@ SubProcess::SubProcess(const std::string &command, bool stderr_passthrough) {
 		stderr_passthrough = debug_env && std::string(debug_env) == "1";
 	}
 
+	// Build the final shell command BEFORE fork(). When passthrough/debug is on
+	// we want VGI_IPC_DEBUG=1 in the worker's environment; do it by prefixing the
+	// shell command with `export` rather than calling setenv() in the child after
+	// fork(). setenv() is not async-signal-safe (it may take the allocator/environ
+	// lock); DuckDB forks workers from query threads, so a peer thread holding that
+	// lock at fork time could deadlock the child. Building the string pre-fork keeps
+	// the child path to only async-signal-safe calls (dup2/close/execl/_exit).
+	std::string shell_command =
+	    stderr_passthrough ? ("export VGI_IPC_DEBUG=1; " + command) : command;
+
 	Pipe stdin_pipe;
 	Pipe stdout_pipe;
 	Pipe stderr_pipe; // Only used if not passthrough
@@ -125,14 +135,12 @@ SubProcess::SubProcess(const std::string &command, bool stderr_passthrough) {
 			}
 			stderr_pipe.CloseRead();
 			stderr_pipe.CloseWrite();
-		} else {
-			// Enable IPC debug output in the worker when debugging
-			setenv("VGI_IPC_DEBUG", "1", 1);
 		}
-		// If passthrough, stderr remains connected to parent's stderr
+		// If passthrough, stderr remains connected to parent's stderr and
+		// VGI_IPC_DEBUG was already baked into shell_command above (pre-fork).
 
 		// Execute command via shell
-		execl("/bin/sh", "sh", "-c", command.c_str(), nullptr);
+		execl("/bin/sh", "sh", "-c", shell_command.c_str(), nullptr);
 		_exit(127); // exec failed
 	}
 

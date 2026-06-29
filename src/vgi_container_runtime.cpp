@@ -296,7 +296,17 @@ std::vector<ContainerVolume> InspectImageVolumes(const ContainerRuntime &runtime
 		vol.path = yyjson_get_str(path_v);
 		yyjson_val *name_v = yyjson_obj_get(entry, "name");
 		if (name_v && yyjson_is_str(name_v)) {
-			vol.host = yyjson_get_str(name_v);
+			// SECURITY: the label is attacker-controlled (it ships inside the
+			// image).  Docker treats a `-v` source that looks like a path
+			// (leading '/' or '.') as a *host bind-mount*, not a named volume,
+			// so an unsanitized label name of "/", "/var/run/docker.sock", etc.
+			// would mount arbitrary host paths into the image's own container on
+			// a plain ATTACH.  Run it through SanitizeVolumeToken (which maps '/'
+			// and every other non-[A-Za-z0-9_.-] byte to '_') so a label can only
+			// ever request a named volume.  User-supplied `volumes` via the
+			// struct LOCATION are the local operator's own trusted input and are
+			// intentionally left permissive (merged later in VgiCatalogAttach).
+			vol.host = SanitizeVolumeToken(yyjson_get_str(name_v));
 		} else {
 			// Synthesize a stable named volume so state persists across attaches.
 			vol.host = "vgi_" + SanitizeVolumeToken(image) + "_" + SanitizeVolumeToken(vol.path);

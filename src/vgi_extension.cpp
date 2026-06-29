@@ -41,6 +41,7 @@
 #include "duckdb/planner/filter/struct_filter.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/planner/operator/logical_order.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_window.hpp"
 #include "duckdb/storage/storage_extension.hpp"
@@ -282,6 +283,37 @@ private:
 		auto streaming_op = make_uniq<vgi::LogicalVgiStreamingWindow>(window.window_index);
 		streaming_op->expressions = std::move(window.expressions);
 		streaming_op->children = std::move(window.children);
+
+		// Restore the sort PhysicalWindow would have done internally.  Unlike
+		// PhysicalWindow, the VGI streaming operator has no internal sort: it
+		// ships chunks to the worker in arrival order and the worker computes the
+		// running aggregate over rows in exactly that order.  Without an explicit
+		// LogicalOrder on (PARTITION BY, ORDER BY), an OVER (... ORDER BY y) over
+		// an unsorted input silently produces wrong cumulative values.  Insert a
+		// binding-transparent LogicalOrder (empty projection_map passes the
+		// child's bindings/types through unchanged, so streaming_op's bound
+		// expressions keep resolving and the plan survives VerifyPlan).  All
+		// expressions in one node share equivalent partitions/orders (enforced by
+		// eligibility + the streaming operator's OpenSessions asserts), so
+		// expressions[0] is representative.
+		auto &wexpr = streaming_op->expressions[0]->Cast<BoundWindowExpression>();
+		if (!wexpr.partitions.empty() || !wexpr.orders.empty()) {
+			vector<BoundOrderByNode> sort_orders;
+			// Group partitions first (any total order over the key suffices to make
+			// each partition contiguous); then the within-partition window order,
+			// copied verbatim so ASC/DESC + NULLS placement match the frame.
+			for (auto &p : wexpr.partitions) {
+				sort_orders.emplace_back(OrderType::ASCENDING, OrderByNullType::ORDER_DEFAULT, p->Copy());
+			}
+			for (auto &o : wexpr.orders) {
+				sort_orders.push_back(o.Copy());
+			}
+			auto order = make_uniq<LogicalOrder>(std::move(sort_orders));
+			order->children.push_back(std::move(streaming_op->children[0]));
+			order->ResolveOperatorTypes();
+			streaming_op->children[0] = std::move(order);
+		}
+
 		streaming_op->ResolveOperatorTypes();
 
 		VGI_STDERR_DEBUG("[VGI] LogicalWindow rewritten -> LogicalVgiStreamingWindow "

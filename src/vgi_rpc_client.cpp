@@ -35,6 +35,14 @@ RpcBatchType ClassifyBatch(const std::shared_ptr<arrow::RecordBatch> &batch,
 	// EXCEPTION levels, silently swallowing the LOG as a 0-row data
 	// batch — making the worker bug invisible at this layer.
 	int level_idx = custom_metadata->FindKey(RPC_LOG_LEVEL_KEY);
+	if (level_idx < 0) {
+		// Legacy key — HandleBatchLogMessage also falls back to "vgi.log_level".
+		// ClassifyBatch is the gate on the unary/header paths, so if it doesn't
+		// recognize the legacy key a 0-row EXCEPTION batch is misclassified DATA
+		// and the worker error is silently swallowed instead of thrown. Keep the
+		// two functions' key sets in sync.
+		level_idx = custom_metadata->FindKey("vgi.log_level");
+	}
 	if (level_idx >= 0) {
 		std::string level = custom_metadata->value(level_idx);
 		if (level == "EXCEPTION") {
@@ -188,6 +196,10 @@ UnaryResponseResult ReadUnaryResponse(int fd, ClientContext *context,
 	// Read batches, dispatching log/error until we find a data batch
 	UnaryResponseResult result;
 	while (true) {
+		// Gate every read on cancellation: WaitForReadableUntilCancel was called
+		// only before stream open, so without this a worker that stalls mid-stream
+		// (schema sent, body withheld) would wedge the query with Ctrl-C ignored.
+		WaitForReadableUntilCancel(fd, context);
 		auto read_result = reader->ReadNext();
 		if (!read_result.ok()) {
 			auto status = read_result.status();
@@ -221,6 +233,7 @@ UnaryResponseResult ReadUnaryResponse(int fd, ClientContext *context,
 
 	// Drain remaining stream to EOS
 	while (true) {
+		WaitForReadableUntilCancel(fd, context);
 		auto drain_result = reader->ReadNext();
 		if (!drain_result.ok() || !drain_result.ValueUnsafe().batch) {
 			break;
@@ -258,6 +271,7 @@ StreamHeaderResult ReadStreamHeader(int fd, ClientContext *context,
 	if (response_schema->num_fields() == 0) {
 		// Error stream - read the error batch, capturing any exception so we can drain first
 		std::exception_ptr caught_exception;
+		WaitForReadableUntilCancel(fd, context);
 		auto read_result = reader->ReadNext();
 		if (read_result.ok()) {
 			auto bwm = read_result.ValueUnsafe();
@@ -285,6 +299,7 @@ StreamHeaderResult ReadStreamHeader(int fd, ClientContext *context,
 	// Read batches, dispatching log/error until we find the header data batch
 	StreamHeaderResult result;
 	while (true) {
+		WaitForReadableUntilCancel(fd, context);
 		auto read_result = reader->ReadNext();
 		if (!read_result.ok()) {
 			auto status = read_result.status();
@@ -314,6 +329,7 @@ StreamHeaderResult ReadStreamHeader(int fd, ClientContext *context,
 	// The header is a complete IPC stream that ends with EOS marker.
 	// After EOS, a new data IPC stream begins on the same fd.
 	while (true) {
+		WaitForReadableUntilCancel(fd, context);
 		auto drain_result = reader->ReadNext();
 		if (!drain_result.ok() || !drain_result.ValueUnsafe().batch) {
 			break;

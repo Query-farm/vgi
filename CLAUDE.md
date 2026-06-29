@@ -121,6 +121,17 @@ Each test file should complete in <10 seconds per suite.
 
 For debugging failures, write standalone `.sql` files in `/tmp/` and run with `./build/debug/duckdb -f /tmp/test.sql`.
 
+### CI
+
+`.github/workflows/MainDistributionPipeline.yml` gates three things: `header-hygiene`
+(the `header_reach.py --check` guardrail), `duckdb-stable-build` (the reusable
+distribution build), and `integration-tests` — which stages the `unittest` binary
+from the build artifacts, checks out the public `vgi-python` fixture workers + `uv`,
+and runs `make test_launcher` (launcher transport: fast, one warm worker per argv).
+Green CI therefore means *built + header-clean + integration suite passed under the
+launcher transport*, not just "compiles". HTTP/container/github/Orchard suites remain
+out of the gate (daemon/network/env-gated); run those locally.
+
 ## Debug Environment Variables
 
 | Variable | Effect |

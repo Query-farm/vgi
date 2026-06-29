@@ -113,28 +113,11 @@ public:
 	std::vector<std::unique_ptr<IFunctionConnection>> workers;
 	std::vector<std::vector<uint8_t>> state_ids;
 
-	// In-flight sink workers (between sink-acquire and Combine handoff) so the
-	// error path can cancel-dispatch a peer parked in a blocking RPC.
-	std::mutex in_flight_mutex;
-	std::vector<IFunctionConnection *> in_flight;
-
 	std::string function_name;
 	std::vector<uint8_t> attach_opaque_data;
 	std::shared_ptr<VgiAttachParameters> attach_params;
 	weak_ptr<ClientContext> context_weak;
 	bool finalized = false;
-
-	void TrackInFlight(IFunctionConnection *conn) {
-		std::lock_guard<std::mutex> lk(in_flight_mutex);
-		in_flight.push_back(conn);
-	}
-	void UntrackInFlight(IFunctionConnection *conn) {
-		std::lock_guard<std::mutex> lk(in_flight_mutex);
-		auto it = std::find(in_flight.begin(), in_flight.end(), conn);
-		if (it != in_flight.end()) {
-			in_flight.erase(it);
-		}
-	}
 };
 
 VgiCopyToGlobalState::~VgiCopyToGlobalState() {
@@ -199,13 +182,11 @@ VgiCopyToGlobalState::~VgiCopyToGlobalState() {
 class VgiCopyToLocalState : public LocalFunctionData {
 public:
 	~VgiCopyToLocalState() override {
-		// Error path: this thread still owns a connection (Combine never ran).
-		// Cancel-dispatch it so a blocking RPC unblocks; otherwise drop.
+		// Error path: this thread still owns a connection (Combine never ran — it
+		// moves the connection into gstate.workers[], nulling this one). Cancel-
+		// dispatch it so a blocking RPC unblocks; otherwise drop.
 		if (!connection) {
 			return;
-		}
-		if (gstate) {
-			gstate->UntrackInFlight(connection.get());
 		}
 		auto *dispatcher = db ? FindVgiCancelDispatcher(*db) : nullptr;
 		if (dispatcher) {
@@ -219,7 +200,6 @@ public:
 
 	std::unique_ptr<IFunctionConnection> connection;
 	std::vector<uint8_t> state_id;
-	VgiCopyToGlobalState *gstate = nullptr;
 	DatabaseInstance *db = nullptr;
 };
 
@@ -424,12 +404,10 @@ void VgiCopyToSink(ExecutionContext &context, FunctionData &bind_data_p, GlobalF
 
 	// Lazy per-thread worker acquire (secondary init with the published id).
 	if (!lstate.connection) {
-		lstate.gstate = &gstate;
 		lstate.db = gstate.db;
 		auto params = BuildCopyToAcquireParams(bd, gstate.execution_id);
 		auto acquired = AcquireConnectionForInit(context.client, params);
 		lstate.connection = std::move(acquired.connection);
-		gstate.TrackInFlight(lstate.connection.get());
 		lstate.connection->PerformInit(bd.bind_result, /*projection_ids=*/{}, /*pushdown_filters=*/nullptr,
 		                               /*join_keys=*/{}, /*phase=*/"TABLE_BUFFERING");
 		DrainInitStream(*lstate.connection);
@@ -447,7 +425,8 @@ void VgiCopyToCombine(ExecutionContext & /*context*/, FunctionData & /*bind_data
 	if (!lstate.connection) {
 		return; // this thread sank no rows
 	}
-	gstate.UntrackInFlight(lstate.connection.get());
+	// Moving the connection into gstate.workers[] nulls lstate.connection, so
+	// ~VgiCopyToLocalState won't cancel-dispatch it (finalize pools it instead).
 	std::lock_guard<std::mutex> lk(gstate.workers_mutex);
 	gstate.workers.push_back(std::move(lstate.connection));
 	gstate.state_ids.push_back(lstate.state_id);
