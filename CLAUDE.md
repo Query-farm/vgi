@@ -123,14 +123,19 @@ For debugging failures, write standalone `.sql` files in `/tmp/` and run with `.
 
 ### CI
 
-`.github/workflows/MainDistributionPipeline.yml` gates three things: `header-hygiene`
-(the `header_reach.py --check` guardrail), `duckdb-stable-build` (the reusable
-distribution build), and `integration-tests` — which stages the `unittest` binary
-from the build artifacts, checks out the public `vgi-python` fixture workers + `uv`,
-and runs `make test_launcher` (launcher transport: fast, one warm worker per argv).
-Green CI therefore means *built + header-clean + integration suite passed under the
-launcher transport*, not just "compiles". HTTP/container/github/Orchard suites remain
-out of the gate (daemon/network/env-gated); run those locally.
+`.github/workflows/MainDistributionPipeline.yml` gates `header-hygiene`
+(the `header_reach.py --check` guardrail) and `duckdb-stable-build` (the reusable
+distribution build). The distribution build runs the extension's own
+`make test_<build_type>` step, but the VGI integration `.test` files all carry
+`require-env VGI_TEST_WORKER`, so they **skip** in CI unless the fixture workers are
+present — i.e. green CI today means *built + header-clean*, not "integration suite
+passed". Run the integration suite locally (`make test_subprocess` / `make
+test_launcher`). Wiring the reusable build's in-workflow test step to actually run
+the suite needs the `vgi-python` fixture workers installed on the runner via the
+reusable workflow's `post_build_command` + `test_config.test_env_variables` hooks
+(the pattern the airport extension uses); the Linux leg's in-docker test step is the
+remaining obstacle (the host-side worker install isn't visible inside that
+container).
 
 ## Debug Environment Variables
 
