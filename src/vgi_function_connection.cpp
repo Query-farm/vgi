@@ -19,6 +19,7 @@
 #include "generated/vgi_request_builders.hpp"
 #include "vgi_schema_registry.hpp"
 #include "vgi_shm_segment.hpp"
+#include "arrow/util/byte_size.h"
 #include "vgi_github.hpp"
 #include "vgi_transport.hpp"
 
@@ -89,10 +90,36 @@ bool SchemaHasDictionary(const arrow::Schema &schema) {
 	return false;
 }
 
+// Minimum batch size (bytes) worth shipping through shm. Below this, the pipe
+// wins: shm's fixed per-batch cost (slot allocation + a pointer-batch round trip
+// + the peer's resolve/free) outweighs the copy it saves on a small payload.
+// Measured crossover is platform-specific — POSIX shm_open/mmap is cheap (~64KB)
+// while Windows' page-file mapping plus the fast overlapped-pipe read push the
+// crossover to ~1.5MB. Overridable with VGI_RPC_SHM_MIN_BATCH_BYTES. Computed
+// once. Mirrors the same gate in the Python/Go/Rust/Java SDK output paths.
+static int64_t ShmMinBatchBytes() {
+	static const int64_t kThreshold = []() -> int64_t {
+		if (const char *e = std::getenv("VGI_RPC_SHM_MIN_BATCH_BYTES")) {
+			char *end = nullptr;
+			unsigned long long v = std::strtoull(e, &end, 10);
+			if (end != e) {
+				return static_cast<int64_t>(v);
+			}
+		}
+#ifdef _WIN32
+		return 1024 * 1024; // 1 MiB
+#else
+		return 64 * 1024; // 64 KiB
+#endif
+	}();
+	return kThreshold;
+}
+
 // Client→worker shm offload. If a segment is attached and `batch` is eligible
-// (non-empty, non-dict) and fits, write its IPC bytes into the segment and
-// return a 0-row pointer batch plus {shm_offset, shm_length} metadata to send in
-// its place. Otherwise returns {nullptr, nullptr} → caller sends `batch` inline.
+// (non-empty, non-dict, at least ShmMinBatchBytes()) and fits, write its IPC
+// bytes into the segment and return a 0-row pointer batch plus
+// {shm_offset, shm_length} metadata to send in its place. Otherwise returns
+// {nullptr, nullptr} → caller sends `batch` inline.
 //
 // `wire_schema` is the schema the worker expects on the wire — for the streaming
 // input path it's the bind-time input schema the inline writer was opened with,
@@ -108,6 +135,11 @@ std::pair<std::shared_ptr<arrow::RecordBatch>, std::shared_ptr<arrow::KeyValueMe
 MaybeWriteBatchToShm(VgiShmSegment *shm, const std::shared_ptr<arrow::RecordBatch> &batch,
                      const std::shared_ptr<arrow::Schema> &wire_schema) {
 	if (!shm || !batch || !wire_schema || batch->num_rows() == 0 || SchemaHasDictionary(*wire_schema)) {
+		return {nullptr, nullptr};
+	}
+	// Small batches are cheaper over the pipe than through shm — skip the slot
+	// allocation + pointer round trip below the measured crossover.
+	if (arrow::util::TotalBufferSize(*batch) < ShmMinBatchBytes()) {
 		return {nullptr, nullptr};
 	}
 	// Build the 0-row pointer batch first (before allocating) so a failure here
