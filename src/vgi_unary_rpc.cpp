@@ -219,6 +219,24 @@ UnaryResponseResult InvokePooledUnaryRpc(const UnaryRpcOptions &opts, const std:
 		}
 		auto *log_ctx = opts.enable_logging ? &opts.context : nullptr;
 		return ReadUnaryResponse(worker.GetStdoutFd(), log_ctx, opts.worker_path, /*pid=*/-1);
+#elif defined(_WIN32)
+		// tcp://host:port on Windows — raw TCP socket (Winsock), wrapped in a
+		// NamedPipeWorker fd worker; same wire-protocol path as POSIX unix://.
+		std::string tcp_host;
+		int tcp_port;
+		ParseTcpLocation(opts.worker_path, tcp_host, tcp_port);
+		int fd = TcpConnect(tcp_host, tcp_port, 10000);
+		if (fd < 0) {
+			throw IOException("vgi: failed to connect to tcp worker %s", opts.worker_path);
+		}
+		NamedPipeWorker worker(fd);
+		if (params) {
+			WriteRpcRequest(worker.GetStdinFd(), method_name, params);
+		} else {
+			WriteEmptyRpcRequest(worker.GetStdinFd(), method_name);
+		}
+		auto *log_ctx = opts.enable_logging ? &opts.context : nullptr;
+		return ReadUnaryResponse(worker.GetStdoutFd(), log_ctx, opts.worker_path, /*pid=*/-1);
 #else
 		throw InvalidInputException("vgi: tcp:// LOCATIONs are not available in this build");
 #endif

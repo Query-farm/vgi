@@ -1650,6 +1650,22 @@ std::unique_ptr<IFunctionConnection> CreateFunctionConnection(
 		    std::move(worker), worker_path, function_name, arguments, attach_opaque_data,
 		    transaction_opaque_data, context, function_type, global_execution_id, worker_debug, settings,
 		    required_secrets);
+#elif defined(_WIN32)
+		// tcp://host:port on Windows — connect a raw TCP socket (Winsock) and wrap
+		// the connected fd in a NamedPipeWorker (the generic fd worker on Windows),
+		// exactly like UnixSocketWorker over AF_UNIX on POSIX.
+		std::string host;
+		int port;
+		ParseTcpLocation(worker_path, host, port);
+		int fd = TcpConnect(host, port, 10000);
+		if (fd < 0) {
+			throw IOException("vgi: failed to connect to tcp worker %s", worker_path);
+		}
+		auto worker = std::make_unique<NamedPipeWorker>(fd);
+		return std::make_unique<FunctionConnection>(
+		    std::move(worker), worker_path, function_name, arguments, attach_opaque_data,
+		    transaction_opaque_data, context, function_type, global_execution_id, worker_debug, settings,
+		    required_secrets);
 #else
 		throw InvalidInputException("vgi: tcp:// LOCATIONs are not available in this build");
 #endif

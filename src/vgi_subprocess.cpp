@@ -19,6 +19,9 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#include <winsock2.h> // SOCKET, WSAPoll, getsockopt — MUST precede <windows.h>
+#include <ws2tcpip.h> // inet_pton
+#pragma comment(lib, "ws2_32")
 #include <windows.h>
 #endif
 
@@ -607,10 +610,106 @@ void WaitForReadableUntilCancel(int fd, ClientContext *context) {
 	}
 }
 #elif defined(_WIN32)
+// Windows raw-TCP connect (Winsock). The POSIX definition lives in
+// vgi_container_runtime.cpp; this satisfies the same VGI_SUBPROCESS_TRANSPORT-
+// declared TcpConnect for the tcp:// transport on Windows. Returns a CRT fd that
+// owns the socket (close with _close), so the existing fd-based
+// FunctionConnection / Fd{Input,Output}Stream path drives it unchanged.
+int TcpConnect(const std::string &host, int port, int timeout_ms) {
+	static const bool wsa_ok = []() {
+		WSADATA w;
+		return WSAStartup(MAKEWORD(2, 2), &w) == 0;
+	}();
+	(void)wsa_ok;
+	// WSASocket with dwFlags=0 (NOT the implicit WSA_FLAG_OVERLAPPED that plain
+	// socket() sets) — a non-overlapped socket is what lets the CRT fd layer's
+	// _read/_write (ReadFile/WriteFile) drive it synchronously, exactly like a pipe.
+	SOCKET s = ::WSASocketW(AF_INET, SOCK_STREAM, IPPROTO_TCP, nullptr, 0, 0);
+	if (s == INVALID_SOCKET) {
+		return -1;
+	}
+	u_long nb = 1;
+	::ioctlsocket(s, FIONBIO, &nb); // non-blocking for the timed connect
+	struct sockaddr_in addr;
+	ZeroMemory(&addr, sizeof(addr));
+	addr.sin_family = AF_INET;
+	addr.sin_port = htons(static_cast<uint16_t>(port));
+	::inet_pton(AF_INET, host.c_str(), &addr.sin_addr);
+	bool ok = false;
+	if (::connect(s, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)) == 0) {
+		ok = true;
+	} else if (WSAGetLastError() == WSAEWOULDBLOCK) {
+		fd_set wf;
+		FD_ZERO(&wf);
+		FD_SET(s, &wf);
+		timeval tv;
+		tv.tv_sec = timeout_ms / 1000;
+		tv.tv_usec = (timeout_ms % 1000) * 1000;
+		if (::select(0, nullptr, &wf, nullptr, &tv) > 0) {
+			int soerr = 0;
+			int l = static_cast<int>(sizeof(soerr));
+			::getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char *>(&soerr), &l);
+			ok = (soerr == 0);
+		}
+	}
+	if (!ok) {
+		::closesocket(s);
+		return -1;
+	}
+	nb = 0;
+	::ioctlsocket(s, FIONBIO, &nb); // restore blocking for the fd I/O layer
+	int fd = _open_osfhandle(static_cast<intptr_t>(s), _O_BINARY);
+	if (fd < 0) {
+		::closesocket(s);
+		return -1;
+	}
+	return fd;
+}
+
 void WaitForReadableUntilCancel(int fd, ClientContext *context) {
 	HANDLE h = reinterpret_cast<HANDLE>(_get_osfhandle(fd));
 	if (h == INVALID_HANDLE_VALUE) {
 		throw IOException("VGI WaitForReadableUntilCancel: invalid file descriptor");
+	}
+	// A tcp:// worker's fd is a socket, not a pipe — PeekNamedPipe can't probe it.
+	// Sockets ARE selectable, so block in WSAPoll (the Windows poll()): it wakes
+	// the instant data arrives, with a 250ms cap only to re-check cancellation.
+	// getsockopt fails (WSAENOTSOCK / WSANOTINITIALISED) on a pipe handle, so the
+	// subprocess pipe path falls through to the adaptive-backoff peek loop below.
+	{
+		SOCKET sock = reinterpret_cast<SOCKET>(h);
+		int sotype = 0;
+		int slen = static_cast<int>(sizeof(sotype));
+		if (::getsockopt(sock, SOL_SOCKET, SO_TYPE, reinterpret_cast<char *>(&sotype), &slen) == 0) {
+			// Same adaptive ladder as the pipe path so a tcp:// worker isn't
+			// penalised vs subprocess: ioctlsocket(FIONREAD) is the non-blocking
+			// peek; spin (YieldProcessor) → yield (SwitchToThread) → WSAPoll(1ms)
+			// backstop. WSAPoll also wakes on EOF/hangup, so a closed peer doesn't
+			// spin forever (recv() then observes the EOF). interrupted re-checked
+			// each iteration → prompt cancel.
+			for (unsigned attempt = 0;; attempt++) {
+				if (context && context->interrupted) {
+					throw IOException("VGI operation interrupted (query cancelled)");
+				}
+				u_long avail = 0;
+				if (::ioctlsocket(sock, FIONREAD, &avail) == 0 && avail > 0) {
+					return; // data ready
+				}
+				if (attempt < 64) {
+					YieldProcessor();
+				} else if (attempt < 4096) {
+					SwitchToThread();
+				} else {
+					WSAPOLLFD pfd;
+					pfd.fd = sock;
+					pfd.events = POLLRDNORM;
+					pfd.revents = 0;
+					if (::WSAPoll(&pfd, 1, 1) > 0) {
+						return; // readable (data or EOF — recv observes which)
+					}
+				}
+			}
+		}
 	}
 	// Anonymous pipes have no poll()-equivalent that blocks until readable, so we
 	// peek in a loop. The back-off ADAPTS instead of sleeping a fixed quantum:
