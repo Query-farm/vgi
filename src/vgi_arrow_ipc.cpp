@@ -13,8 +13,19 @@
 #endif
 
 #include "duckdb/common/exception.hpp"
+#include "duckdb/main/client_context.hpp" // ClientContext::interrupted
 #include "vgi_exception.hpp"
 #include "vgi_subprocess.hpp"
+
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h> // overlapped ReadFile / WaitForSingleObject
+#endif
 
 namespace duckdb {
 namespace vgi {
@@ -100,7 +111,22 @@ std::shared_ptr<arrow::Buffer> SerializeRecordBatch(
 #if VGI_SUBPROCESS_TRANSPORT
 
 // FdInputStream implementation
-FdInputStream::FdInputStream(int fd) : fd_(fd), position_(0), is_open_(true) {
+FdInputStream::FdInputStream(int fd, ClientContext *context)
+    : fd_(fd), position_(0), is_open_(true), context_(context)
+#if defined(_WIN32)
+      ,
+      read_event_(::CreateEvent(nullptr, TRUE, FALSE, nullptr))
+#endif
+{
+}
+
+FdInputStream::~FdInputStream() {
+#if defined(_WIN32)
+	if (read_event_) {
+		::CloseHandle(read_event_);
+		read_event_ = nullptr;
+	}
+#endif
 }
 
 arrow::Status FdInputStream::Close() {
@@ -130,8 +156,77 @@ arrow::Result<int64_t> FdInputStream::Read(int64_t nbytes, void *out) {
 #if VGI_POSIX_TRANSPORT
 		ssize_t bytes_read = read(fd_, buffer + total_bytes_read, nbytes - total_bytes_read);
 #else
-		int bytes_read =
-		    _read(fd_, buffer + total_bytes_read, static_cast<unsigned int>(nbytes - total_bytes_read));
+		// Windows: overlapped ReadFile so the engine thread blocks at 0% CPU and
+		// wakes the instant bytes arrive (poll()-equivalent), instead of
+		// busy-spinning and stealing a core from the worker. A non-overlapped
+		// handle (e.g. a socket) completes synchronously and we use that result.
+		// Cancellation: re-check context->interrupted every 250ms.
+		int bytes_read;
+		{
+			DWORD want = static_cast<DWORD>(nbytes - total_bytes_read);
+			DWORD got = 0;
+			HANDLE h = reinterpret_cast<HANDLE>(_get_osfhandle(fd_));
+			OVERLAPPED ov = {};
+			if (read_event_) {
+				::ResetEvent(read_event_);
+			}
+			ov.hEvent = read_event_;
+			if (::ReadFile(h, buffer + total_bytes_read, want, &got, &ov)) {
+				bytes_read = static_cast<int>(got); // synchronous completion
+			} else {
+				DWORD e = ::GetLastError();
+				if (e == ERROR_IO_PENDING) {
+					// Cheap spin (no syscall — polls the OVERLAPPED completion flag)
+					// to catch the common case where the next batch is already
+					// in-flight and completes within nanoseconds, keeping the inline
+					// RPC hot path fast. If it doesn't land quickly, fall through to a
+					// blocking wait at 0% CPU so a slow worker (e.g. the shm-write
+					// path) gets the core instead of our busy-spinning.
+					bool completed = false;
+					for (int spin = 0; spin < 8192; ++spin) {
+						if (HasOverlappedIoCompleted(&ov)) {
+							completed = true;
+							break;
+						}
+						YieldProcessor();
+					}
+					bool cancelled = false;
+					while (!completed) {
+						DWORD w = ::WaitForSingleObject(read_event_, 250);
+						if (w == WAIT_OBJECT_0) {
+							break;
+						}
+						if (w == WAIT_TIMEOUT) {
+							if (context_ && context_->interrupted) {
+								::CancelIoEx(h, &ov);
+								cancelled = true;
+								break;
+							}
+							continue;
+						}
+						::CancelIoEx(h, &ov); // wait failed
+						break;
+					}
+					if (cancelled) {
+						return arrow::Status::IOError("VGI operation interrupted (query cancelled)");
+					}
+					if (::GetOverlappedResult(h, &ov, &got, FALSE)) {
+						bytes_read = static_cast<int>(got);
+					} else {
+						DWORD ge = ::GetLastError();
+						if (ge == ERROR_BROKEN_PIPE || ge == ERROR_HANDLE_EOF) {
+							bytes_read = 0;
+						} else {
+							return arrow::Status::IOError("Overlapped read failed: " + std::to_string(ge));
+						}
+					}
+				} else if (e == ERROR_BROKEN_PIPE || e == ERROR_HANDLE_EOF) {
+					bytes_read = 0;
+				} else {
+					return arrow::Status::IOError("ReadFile failed: " + std::to_string(e));
+				}
+			}
+		}
 #endif
 		if (bytes_read == -1) {
 			if (errno == EINTR) {

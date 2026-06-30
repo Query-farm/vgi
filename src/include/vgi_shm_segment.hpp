@@ -124,9 +124,13 @@ public:
 	                  int64_t *out_offset) const;
 
 private:
+#if defined(_WIN32)
+	VgiShmSegment(void *map_handle, std::string name, uint8_t *base, size_t size);
+	void *map_handle_; // HANDLE from CreateFileMapping (closed on destruction)
+#else
 	VgiShmSegment(int fd, std::string name, uint8_t *base, size_t size);
-
 	int fd_;
+#endif
 	std::string name_;
 	uint8_t *base_;
 	size_t size_;

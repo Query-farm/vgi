@@ -346,6 +346,35 @@ Pipe::Pipe() {
 }
 Pipe::~Pipe() {
 }
+
+// Create the worker's stdout pipe as an OVERLAPPED named pipe so the parent
+// (engine) read end supports async ReadFile -- letting FdInputStream block at
+// 0% CPU and wake instantly on data instead of busy-polling an anonymous pipe.
+// parent_read: overlapped, not inheritable. child_write: synchronous,
+// inheritable (becomes the child's stdout). The MyCreatePipeEx pattern.
+static BOOL CreateOverlappedStdoutPipe(HANDLE *parent_read, HANDLE *child_write, DWORD bufsize) {
+	static volatile LONG serial = 0;
+	char name[80];
+	_snprintf_s(name, sizeof(name), _TRUNCATE, "\\\\.\\pipe\\vgi-data-%lu-%lu",
+	            (unsigned long)::GetCurrentProcessId(), (unsigned long)::InterlockedIncrement(&serial));
+	HANDLE rd = ::CreateNamedPipeA(
+	    name, PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
+	    PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT, 1, bufsize, bufsize, 0, nullptr);
+	if (rd == INVALID_HANDLE_VALUE) {
+		return FALSE;
+	}
+	SECURITY_ATTRIBUTES sa = {};
+	sa.nLength = sizeof(sa);
+	sa.bInheritHandle = TRUE;
+	HANDLE wr = ::CreateFileA(name, GENERIC_WRITE, 0, &sa, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+	if (wr == INVALID_HANDLE_VALUE) {
+		::CloseHandle(rd);
+		return FALSE;
+	}
+	*parent_read = rd;
+	*child_write = wr;
+	return TRUE;
+}
 void Pipe::CloseRead() {
 }
 void Pipe::CloseWrite() {
@@ -395,10 +424,10 @@ SubProcess::SubProcess(const std::string &command, bool stderr_passthrough) {
 		throw fail("CreatePipe(stdin)");
 	}
 	SetHandleInformation(parent_stdin_wr, HANDLE_FLAG_INHERIT, 0); // parent end not inherited
-	if (!CreatePipe(&parent_stdout_rd, &child_stdout_wr, &sa, kDataPipeBufferBytes)) {
-		throw fail("CreatePipe(stdout)");
+	if (!CreateOverlappedStdoutPipe(&parent_stdout_rd, &child_stdout_wr, kDataPipeBufferBytes)) {
+		throw fail("CreateOverlappedStdoutPipe");
 	}
-	SetHandleInformation(parent_stdout_rd, HANDLE_FLAG_INHERIT, 0);
+	// parent_stdout_rd is FILE_FLAG_OVERLAPPED + not inheritable; child_stdout_wr inheritable.
 	if (!stderr_passthrough) {
 		if (!CreatePipe(&parent_stderr_rd, &child_stderr_wr, &sa, 0)) {
 			throw fail("CreatePipe(stderr)");
@@ -715,42 +744,11 @@ void WaitForReadableUntilCancel(int fd, ClientContext *context) {
 			}
 		}
 	}
-	// Anonymous pipes have no poll()-equivalent that blocks until readable, so we
-	// peek in a loop. The back-off ADAPTS instead of sleeping a fixed quantum:
-	// the producer one-ahead pipeline means the next batch is almost always
-	// in-flight when this is called, so the FIRST peek typically misses it and we
-	// must detect its arrival within microseconds — otherwise every data-phase
-	// batch read stalls. A flat Sleep(250ms) here cost ~250ms PER BATCH on
-	// Windows (a ~100-1000x throughput regression vs a direct blocking read);
-	// poll() on POSIX never had this because it wakes the instant data arrives.
-	//
-	// Ladder: spin (YieldProcessor, ~ns) → yield to the worker thread
-	// (SwitchToThread, µs–ms) → short Sleep backstop for a genuinely idle/slow
-	// worker. `interrupted` is re-checked every iteration, so Ctrl-C / query
-	// cancel is still observed promptly (bounded by the Sleep cap).
-	for (unsigned attempt = 0;; attempt++) {
-		if (context && context->interrupted) {
-			throw IOException("VGI operation interrupted (query cancelled)");
-		}
-		DWORD avail = 0;
-		if (!PeekNamedPipe(h, nullptr, 0, nullptr, &avail, nullptr)) {
-			if (GetLastError() == ERROR_BROKEN_PIPE) {
-				return; // EOF — let the read observe it
-			}
-			throw IOException("VGI operation failed: PeekNamedPipe error %lu",
-			                  (unsigned long)GetLastError());
-		}
-		if (avail > 0) {
-			return; // data ready — return immediately, no sleep
-		}
-		if (attempt < 64) {
-			YieldProcessor(); // tight spin: catches the common in-flight batch
-		} else if (attempt < 4096) {
-			SwitchToThread(); // hand the core to the worker producing the batch
-		} else {
-			std::this_thread::sleep_for(std::chrono::milliseconds(1)); // idle backstop
-		}
-	}
+	// Pipe path: the subprocess stdout pipe is OVERLAPPED, so the actual read
+	// (FdInputStream::Read) blocks at 0% CPU via overlapped ReadFile +
+	// WaitForSingleObject and wakes the instant data arrives -- a real
+	// poll()-equivalent that also handles cancellation. Nothing to poll here.
+	return;
 }
 #else // Emscripten
 void WaitForReadableUntilCancel(int, ClientContext *) {

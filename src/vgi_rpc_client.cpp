@@ -181,7 +181,7 @@ UnaryResponseResult ReadUnaryResponse(int fd, ClientContext *context,
 	// deadline.
 	WaitForReadableUntilCancel(fd, context);
 
-	auto input = std::make_shared<FdInputStream>(fd);
+	auto input = std::make_shared<FdInputStream>(fd, context);
 	auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(input);
 	if (!reader_result.ok()) {
 		auto status = reader_result.status();
@@ -254,7 +254,7 @@ StreamHeaderResult ReadStreamHeader(int fd, ClientContext *context,
 	// polled every 250ms — no arbitrary wall-clock deadline.
 	WaitForReadableUntilCancel(fd, context);
 
-	auto input = std::make_shared<FdInputStream>(fd);
+	auto input = std::make_shared<FdInputStream>(fd, context);
 	auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(input);
 	if (!reader_result.ok()) {
 		auto status = reader_result.status();

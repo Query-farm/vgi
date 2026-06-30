@@ -12,6 +12,7 @@
 #include "vgi_platform.hpp" // pid_t (real on POSIX, shim on Windows)
 
 namespace duckdb {
+class ClientContext; // fwd: overlapped-read cancellation
 namespace vgi {
 
 // ============================================================================
@@ -61,8 +62,8 @@ std::shared_ptr<arrow::Buffer> SerializeRecordBatch(
 // NON-OWNING: Does not close the fd on destruction. The caller retains ownership.
 class FdInputStream : public arrow::io::InputStream {
 public:
-	explicit FdInputStream(int fd);
-	~FdInputStream() override = default;
+	explicit FdInputStream(int fd, ClientContext *context = nullptr);
+	~FdInputStream() override;
 
 	arrow::Status Close() override;
 	bool closed() const override;
@@ -74,6 +75,10 @@ private:
 	int fd_;
 	int64_t position_;
 	bool is_open_;
+	ClientContext *context_;
+#if defined(_WIN32)
+	void *read_event_; // manual-reset event for overlapped reads (HANDLE)
+#endif
 };
 
 // Output stream wrapper for writing to a file descriptor.

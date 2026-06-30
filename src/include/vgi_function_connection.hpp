@@ -449,7 +449,7 @@ private:
 	// pointer batches against it. Reset between requests. POSIX-only
 	// (shm_open/mmap) — excluded on Windows so the unique_ptr never needs
 	// VgiShmSegment's (POSIX-only) destructor.
-#if VGI_POSIX_TRANSPORT
+#if VGI_SHM_TRANSPORT
 	std::unique_ptr<class VgiShmSegment> shm_segment_;
 	// Offset of the most-recently-resolved shm batch. Freed when the next
 	// ReadDataBatch is called (lockstep: DuckDB has finished with the

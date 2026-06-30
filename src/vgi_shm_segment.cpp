@@ -1,24 +1,28 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 //
-// POSIX-only (shm_open/mmap). Under Windows/Emscripten this translation unit is
-// empty; the shared-memory side-channel is opt-in (VGI_RPC_SHM_SIZE_BYTES) and
-// simply never activates there. See vgi_platform.hpp.
+// Shared-memory side-channel. POSIX uses shm_open/mmap; Windows uses
+// CreateFileMapping/MapViewOfFile (page-file-backed named mapping). Under
+// Emscripten this translation unit is empty. The allocator/IPC logic below is
+// platform-independent; only Create/dtor/GenerateName differ. Opt-in via
+// VGI_RPC_SHM_SIZE_BYTES. See vgi_platform.hpp.
 
 #include "vgi_platform.hpp"
 
-#if VGI_POSIX_TRANSPORT
+#if VGI_SHM_TRANSPORT
 
 #include "vgi_shm_segment.hpp"
 
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
-#include <fcntl.h>
 #include <random>
 #include <sstream>
+#if VGI_POSIX_TRANSPORT
+#include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 #include <arrow/buffer.h>
 #include <arrow/io/memory.h>
@@ -29,6 +33,19 @@
 #include "duckdb/common/exception.hpp"
 
 #include "vgi_rpc_client.hpp" // for SHM_OFFSET_KEY / SHM_LENGTH_KEY
+
+#if defined(_WIN32)
+// windows.h must come AFTER the arrow / vgi_rpc_client headers: it #defines
+// ERROR (and other all-caps tokens) that collide with identifiers in them.
+#include <process.h> // _getpid
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace duckdb {
 namespace vgi {
@@ -155,7 +172,14 @@ std::string GenerateName() {
 	std::random_device rd;
 	uint32_t r = rd();
 	std::ostringstream oss;
+#if defined(_WIN32)
+	// Win32 file-mapping object name (session-local namespace). No leading slash:
+	// Python's multiprocessing.shared_memory uses the name verbatim as the mmap
+	// tagname on Windows.
+	oss << "vgi_shm_" << std::hex << ::_getpid() << "_" << r << "_" << n;
+#else
 	oss << "/vgi_shm_" << std::hex << ::getpid() << "_" << r << "_" << n;
+#endif
 	return oss.str();
 }
 
@@ -168,6 +192,29 @@ std::unique_ptr<VgiShmSegment> VgiShmSegment::Create(size_t size_bytes) {
 
 	std::string name = GenerateName();
 
+#if defined(_WIN32)
+	// Page-file-backed named mapping; the worker attaches by this same name
+	// (Python's multiprocessing.shared_memory, which maps it read-write).
+	HANDLE h = ::CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE,
+	                                static_cast<DWORD>(static_cast<uint64_t>(size_bytes) >> 32),
+	                                static_cast<DWORD>(size_bytes & 0xFFFFFFFFu), name.c_str());
+	if (h == nullptr) {
+		throw IOException("VgiShmSegment: CreateFileMapping failed: " + std::to_string(::GetLastError()));
+	}
+	if (::GetLastError() == ERROR_ALREADY_EXISTS) {
+		::CloseHandle(h);
+		throw IOException("VgiShmSegment: name collision: " + name);
+	}
+	void *map = ::MapViewOfFile(h, FILE_MAP_ALL_ACCESS, 0, 0, size_bytes);
+	if (map == nullptr) {
+		DWORD e = ::GetLastError();
+		::CloseHandle(h);
+		throw IOException("VgiShmSegment: MapViewOfFile failed: " + std::to_string(e));
+	}
+	// Windows maps exactly size_bytes; the worker attaches with the same size.
+	size_t actual_size = size_bytes;
+	auto *base = static_cast<uint8_t *>(map);
+#else
 	// O_CREAT | O_EXCL: fail if a stale segment exists with this name.
 	int fd = ::shm_open(name.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
 	if (fd < 0) {
@@ -201,6 +248,7 @@ std::unique_ptr<VgiShmSegment> VgiShmSegment::Create(size_t size_bytes) {
 		throw IOException("VgiShmSegment: mmap failed: " + std::string(std::strerror(err)));
 	}
 	auto *base = static_cast<uint8_t *>(map);
+#endif
 
 	// Initialize header: magic, version, data_size, num_allocs=0, padding.
 	std::memcpy(base, VGI_SHM_MAGIC, 4);
@@ -209,14 +257,35 @@ std::unique_ptr<VgiShmSegment> VgiShmSegment::Create(size_t size_bytes) {
 	StoreU32LE(base + 16, 0);
 	StoreU32LE(base + 20, 0);
 
+#if defined(_WIN32)
+	return std::unique_ptr<VgiShmSegment>(new VgiShmSegment(h, std::move(name), base, actual_size));
+#else
 	return std::unique_ptr<VgiShmSegment>(new VgiShmSegment(fd, std::move(name), base, actual_size));
+#endif
 }
 
+#if defined(_WIN32)
+VgiShmSegment::VgiShmSegment(void *map_handle, std::string name, uint8_t *base, size_t size)
+    : map_handle_(map_handle), name_(std::move(name)), base_(base), size_(size) {
+}
+#else
 VgiShmSegment::VgiShmSegment(int fd, std::string name, uint8_t *base, size_t size)
     : fd_(fd), name_(std::move(name)), base_(base), size_(size) {
 }
+#endif
 
 VgiShmSegment::~VgiShmSegment() {
+#if defined(_WIN32)
+	if (base_) {
+		::UnmapViewOfFile(base_);
+		base_ = nullptr;
+	}
+	if (map_handle_) {
+		::CloseHandle(map_handle_);
+		map_handle_ = nullptr;
+	}
+	// Windows reclaims the mapping when the last handle closes — no unlink.
+#else
 	if (base_) {
 		::munmap(base_, size_);
 		base_ = nullptr;
@@ -228,6 +297,7 @@ VgiShmSegment::~VgiShmSegment() {
 	if (!name_.empty()) {
 		::shm_unlink(name_.c_str());
 	}
+#endif
 }
 
 void VgiShmSegment::ResetAllocator() {

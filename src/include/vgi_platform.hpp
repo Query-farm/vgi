@@ -38,6 +38,16 @@
 #define VGI_SUBPROCESS_TRANSPORT 0
 #endif
 
+// VGI_SHM_TRANSPORT == 1 where the shared-memory side-channel can run: POSIX
+// (shm_open/mmap) and Windows (CreateFileMapping/MapViewOfFile). It rides on the
+// subprocess/launch pipe for control + signalling and is opt-in via
+// VGI_RPC_SHM_SIZE_BYTES. Emscripten has no cross-worker shared memory, so 0.
+#if VGI_POSIX_TRANSPORT || defined(_WIN32)
+#define VGI_SHM_TRANSPORT 1
+#else
+#define VGI_SHM_TRANSPORT 0
+#endif
+
 // VGI_ASYNC_INIT_ENABLED == 1 enables background-thread dispatch of the
 // PerformInit RPC in VgiTableFunctionInitGlobal (std::async on native,
 // VgiWasmAsyncPool on emscripten). When 0, init runs synchronously on the
