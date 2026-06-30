@@ -658,6 +658,10 @@ int TcpConnect(const std::string &host, int port, int timeout_ms) {
 	}
 	nb = 0;
 	::ioctlsocket(s, FIONBIO, &nb); // restore blocking for the fd I/O layer
+	// Lockstep request/response RPC — disable Nagle so a small request isn't held
+	// waiting to coalesce (the worker can't reply until it arrives).
+	BOOL nodelay = TRUE;
+	::setsockopt(s, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char *>(&nodelay), sizeof(nodelay));
 	int fd = _open_osfhandle(static_cast<intptr_t>(s), _O_BINARY);
 	if (fd < 0) {
 		::closesocket(s);
