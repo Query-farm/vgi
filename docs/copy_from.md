@@ -88,6 +88,36 @@ Register the class in the catalog's function list and answer
 `catalog_copy_from_formats` (the default `ReadOnlyCatalogInterface.copy_from_formats`
 introspects registered `CopyFromFunction` subclasses automatically).
 
+## Forwarding `CREATE SECRET` credentials (secret-backed cloud sources)
+
+`on_bind` is `@final` on `CopyFromFunction` (the output schema is fixed to the COPY
+target), so a reader requests the caller's credentials via the **`on_secrets`** hook,
+called by the framework during bind:
+
+```python
+class WeirdReader(CopyFromFunction[WeirdArgs]):
+    COPY_FROM_FORMAT = "weird_in"
+
+    class Meta:
+        name = "weird_reader"
+
+    @classmethod
+    def on_secrets(cls, params):
+        cf = params.bind_call.copy_from
+        params.secrets.get("s3", scope=cf.file_path if cf else None)
+
+    @classmethod
+    def read(cls, *, path, options, expected_schema, params, out):
+        creds = params.secrets.for_scope_of_type(path, "s3")  # resolved at bind
+        ...  # authenticate the source read, emit batches
+```
+
+`on_secrets` calls `params.secrets.get(secret_type, scope=…, name=…)`; each request for a
+not-yet-resolved secret triggers the framework's **two-phase bind retry**, where the
+extension resolves the secret from the caller's `SecretManager` and re-binds. The resolved
+values surface on `params.secrets` at `read` time. Mirrors the COPY-TO writer hook — see
+[docs/copy_to.md](copy_to.md). Covered by `test/sql/integration/copy_from/secrets.test`.
+
 ## How it works (C++)
 
 - **Discovery.** At `ATTACH`, `VgiCatalogAttach` calls the `catalog_copy_from_formats`

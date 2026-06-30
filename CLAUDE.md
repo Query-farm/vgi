@@ -336,7 +336,11 @@ inserts **no cast**). Execution reuses the producer-mode table-function scan ver
 **Worker API (vgi-python).** Subclass `CopyFromFunction`, set `COPY_FROM_FORMAT`, declare options
 as `Arg`-annotated arguments (`file_path` is supplied by COPY, not an option), implement `read(...)`
 to emit batches matching `expected_schema`. `ReadOnlyCatalogInterface.copy_from_formats` auto-advertises
-registered subclasses.
+registered subclasses. **Secrets:** `on_bind` is `@final`, so forward `CREATE SECRET` creds for
+secret-backed cloud sources by overriding `on_secrets(params)` and calling
+`params.secrets.get(type, scope=params.bind_call.copy_from.file_path)`; the framework's two-phase
+secret bind resolves them and surfaces them on `params.secrets` at `read()` time (no C++ change — the
+COPY bind already drives `PerformBindProtocol`). See [docs/copy_from.md](docs/copy_from.md).
 
 **Limitation.** `DETACH` does not unregister the format (no copy-function unload API; persists for
 the DB lifetime), mirroring the secret provider. Introspect with `vgi_copy_formats()`.
@@ -382,7 +386,11 @@ bind-data access). `vgi_copy_formats().ordered` reports it.
 **Registration is direction-gated** (`fmt.direction` ∈ `from`/`to`/`both`): one alias-scoped
 `CopyFunction` carries the FROM and/or TO callbacks. Rejects `PARTITION_BY`/`PER_THREAD_OUTPUT`/
 rotation. **Worker API (vgi-python):** subclass `CopyToFunction`, implement `write` (per shard) +
-`close` (terminal write). **Files:** `src/vgi_copy_to_impl.{cpp,hpp}`; `vgi/copy_to_function.py`,
+`close` (terminal write); forward `CREATE SECRET` creds for secret-backed cloud writes by overriding
+`on_secrets(params)` (the `@final`-`on_bind` secret-bind hook) and calling `params.secrets.get(type,
+scope=params.bind_call.copy_to.file_path)` — resolved via the two-phase secret bind and surfaced on
+`params.secrets` at `write`/`close` (parity with `write_fixed`; no C++ change needed). **Files:**
+`src/vgi_copy_to_impl.{cpp,hpp}`; `vgi/copy_to_function.py`,
 `vgi/_test_fixtures/copy_to.py`. Tests: `test/sql/integration/copy_to/*`,
 `vgi-python/tests/test_copy_to_function.py`. Same DETACH limitation as COPY FROM. See
 [docs/copy_to.md](docs/copy_to.md).

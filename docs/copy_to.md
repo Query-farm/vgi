@@ -93,6 +93,53 @@ Register the class in the catalog's function list;
 `ReadOnlyCatalogInterface.copy_from_formats` advertises registered `CopyToFunction`
 subclasses automatically (with `direction='to'`).
 
+## Forwarding `CREATE SECRET` credentials (secret-backed cloud writes)
+
+A writer that targets cloud storage (S3/GCS/HTTP/…) needs the caller's credentials.
+Forward them by overriding **`on_secrets`** — the secret-bind hook on `CopyToFunction`.
+`on_bind` is `@final` for a writer (no output schema to compute), so `on_secrets` is the
+seam the framework calls during bind:
+
+```python
+class WeirdWriter(CopyToFunction[WeirdArgs]):
+    COPY_TO_FORMAT = "weird_out"
+
+    class Meta:
+        name = "weird_writer"
+
+    @classmethod
+    def on_secrets(cls, params):
+        # Request an s3 secret scoped to the destination path; the framework's
+        # two-phase secret bind resolves the longest-prefix-matching CREATE SECRET.
+        cf = params.bind_call.copy_to
+        params.secrets.get("s3", scope=cf.file_path if cf else None)
+
+    @classmethod
+    def write(cls, *, batch, options, file_path, params):
+        params.storage.state_append(b"shard", b"", serialize(batch))
+
+    @classmethod
+    def close(cls, *, options, file_path, params) -> int:
+        creds = params.secrets.for_scope_of_type(file_path, "s3")  # resolved at bind
+        ...  # use creds to authenticate the destination write
+```
+
+Mechanics: `on_secrets` calls `params.secrets.get(secret_type, scope=…, name=…)`. Each
+`get()` for a not-yet-resolved secret registers a pending lookup; the framework then
+issues a **two-phase bind retry** — the extension (C++) resolves every requested secret
+from the caller's `SecretManager` and re-binds with the resolved values, exactly like a
+plain table function's `on_bind` secret request. The resolved values ride the bind into
+init and are surfaced on `params.secrets` (a `ResolvedSecrets`) at `write` / `close`
+time. A genuinely missing secret resolves to "not found" (silent miss); pass
+`required=True` to `get()` to make a missing secret fail the bind. No `CREATE SECRET` is
+needed inside the worker — the credential is brokered from the calling DuckDB session,
+reaching parity with the writable-table (`write_fixed`) path. This needs **no extra COPY
+options or wiring** on the C++ side: the COPY-TO bind already drives the two-phase secret
+protocol (`PerformBindProtocol`). Covered by `test/sql/integration/copy_to/secrets.test`.
+
+`CopyFromFunction` has the symmetric `on_secrets` hook for secret-backed cloud *sources*
+(scope by `params.bind_call.copy_from.file_path`); see [docs/copy_from.md](copy_from.md).
+
 ## Direction (`from` / `to` / `both`)
 
 The discovery metadata's `direction` field drives registration: the extension wires the

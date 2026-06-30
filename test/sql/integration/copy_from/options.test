@@ -15,7 +15,7 @@ ATTACH 'example' AS acme (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 query TTTT
 SELECT format_name, option_name, option_type, option_description
 FROM vgi_copy_formats()
-WHERE catalog_name = 'acme' AND direction = 'from'
+WHERE catalog_name = 'acme' AND direction = 'from' AND format_name = 'acme.example_lines'
 ORDER BY option_name;
 ----
 acme.example_lines	delimiter	VARCHAR	Field separator
@@ -26,7 +26,7 @@ acme.example_lines	skip_rows	BIGINT	Leading lines to skip before data
 # The format comment + tags round-trip into the system catalog entry.
 query TIT
 SELECT DISTINCT format_comment, cardinality(format_tags), map_extract(format_tags, 'category')[1]
-FROM vgi_copy_formats() WHERE catalog_name = 'acme' AND direction = 'from';
+FROM vgi_copy_formats() WHERE catalog_name = 'acme' AND direction = 'from' AND format_name = 'acme.example_lines';
 ----
 Toy delimited-text reader for tests	2	copy_from
 
