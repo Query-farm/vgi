@@ -60,13 +60,19 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 # 2 COPY ... TO writer fixtures (example_lines_writer + example_lines_ordered_writer,
 #   TableBufferingFunctions registered as table functions; back the
 #   example_lines_out / example_lines_ordered_out COPY formats — see copy_to/*.test)
-# = 100
+# 1 COPY ... FROM secret-forwarding reader fixture (secret_lines_reader, registered
+#   as a table function; backs the secret_lines_in COPY format — see
+#   copy_from/secrets.test)
+# 1 COPY ... TO secret-forwarding writer fixture (secret_lines_writer, a
+#   TableBufferingFunction registered as a table function; backs the
+#   secret_lines_out COPY format — see copy_to/secrets.test)
+# = 102
 query I
 SELECT COUNT(*)
 FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'table';
 ----
-100
+102
 
 # The 34 pure table functions (no TABLE parameter type)
 # Note: make_series appears 5 times (5 overloads), make_pairs appears 3 times,
