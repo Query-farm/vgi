@@ -523,27 +523,39 @@ OperatorResultType VgiTableInOutFunction(ExecutionContext &context, TableFunctio
 		input_batch = DataChunkToArrow(client_context, input, bind_data.input_schema);
 	}
 
-	VGI_LOG(client_context, "table_in_out.write_input",
-	        {{"conn", global_state.connection->GetConnIdHex()},
-	         {"worker_path", bind_data.worker_path()},
-	         {"function_name", bind_data.function_name},
-	         {"input_rows", std::to_string(input_batch->num_rows())}});
-
-	// Write the input batch to the worker
-	if (timing) {
-		ScopedNs _t(ClientTiming::Instance().write_ns);
-		global_state.connection->WriteInputBatch(input_batch);
-	} else {
-		global_state.connection->WriteInputBatch(input_batch);
-	}
-
-	// Read output batch (1:1 lockstep in exchange mode)
+	// The write→read exchange below shares ONE `connection` across every source
+	// sub-pipeline of this operator. Under UNION ALL, DuckDB feeds the operator
+	// from multiple source sub-pipelines whose PipelineExecutors may run
+	// concurrently (MaxThreads()=1 serializes only WITHIN one pipeline). Without
+	// serialization their WriteInputBatch/ReadDataBatch calls interleave on the
+	// single IPC stream and desync the worker's schema-first reader ("Invalid
+	// flatbuffers message"). Hold the lock across the whole 1:1 write→read so
+	// each batch's exchange on the connection is atomic.
 	std::shared_ptr<arrow::RecordBatch> output_batch;
-	if (timing) {
-		ScopedNs _t(ClientTiming::Instance().read_ns);
-		output_batch = global_state.connection->ReadDataBatch();
-	} else {
-		output_batch = global_state.connection->ReadDataBatch();
+	{
+		std::lock_guard<std::mutex> exchange_guard(global_state.exchange_mutex);
+
+		VGI_LOG(client_context, "table_in_out.write_input",
+		        {{"conn", global_state.connection->GetConnIdHex()},
+		         {"worker_path", bind_data.worker_path()},
+		         {"function_name", bind_data.function_name},
+		         {"input_rows", std::to_string(input_batch->num_rows())}});
+
+		// Write the input batch to the worker
+		if (timing) {
+			ScopedNs _t(ClientTiming::Instance().write_ns);
+			global_state.connection->WriteInputBatch(input_batch);
+		} else {
+			global_state.connection->WriteInputBatch(input_batch);
+		}
+
+		// Read output batch (1:1 lockstep in exchange mode)
+		if (timing) {
+			ScopedNs _t(ClientTiming::Instance().read_ns);
+			output_batch = global_state.connection->ReadDataBatch();
+		} else {
+			output_batch = global_state.connection->ReadDataBatch();
+		}
 	}
 
 	if (!output_batch) {

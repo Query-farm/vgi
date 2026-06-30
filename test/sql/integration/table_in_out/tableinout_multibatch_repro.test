@@ -1,23 +1,25 @@
 # name: test/sql/integration/table_in_out/tableinout_multibatch_repro.test
-# description: Minimal reproducer for the table-in-out multi-batch input bug,
-#   run against the CANONICAL Python worker (vgi-python vgi-fixture-worker) so
-#   the result is decisive across SDKs. A relation built from UNION ALL of
-#   literal SELECTs is delivered by DuckDB as one Arrow sub-stream per source
-#   sub-pipeline (upstream DuckDB issue #18222: PhysicalTableInOutFunction
-#   FinalExecute fires per source sub-pipeline). The SDK stream reader is
-#   schema-first, so the second branch's RecordBatch arrives with no preceding
-#   Schema and the exchange desyncs ("Invalid flatbuffers message"; Rust's
-#   vgi-rpc-rust wire.rs StreamReader::new words it "expected Schema, got
-#   RecordBatch").
+# description: Regression test for the table-in-out multi-source-pipeline input
+#   desync (NOW FIXED), run against the CANONICAL Python worker (vgi-python
+#   vgi-fixture-worker) so the result is decisive across SDKs. A relation built
+#   from UNION ALL of literal SELECTs is fed to the streaming table-in-out
+#   operator from one source sub-pipeline per branch; DuckDB's PipelineExecutors
+#   for those branches can run CONCURRENTLY against the operator's single shared
+#   worker connection (cf. DuckDB issue #18222). The original bug: their 1:1
+#   write→read exchanges interleaved on the one schema-first IPC stream and
+#   desynced ("Invalid flatbuffers message"; Rust's vgi-rpc-rust wire.rs
+#   StreamReader::new words it "expected Schema, got RecordBatch").
 #
-#   FINDING: the failure tracks the table-in-out KIND, not the worker language.
-#     * STREAMING kind (TableInOutFunction / TableInOutGenerator; here `echo`)
-#       FAILS the UNION-ALL shape on this Python worker.
-#     * BUFFERING kind (TableBufferingFunction; here `buffer_input`) is IMMUNE.
-#   Because the Python worker — the byte-for-byte canonical the other SDKs
-#   mirror — reproduces, the defect is in the SHARED client framing / protocol
-#   for the streaming exchange, NOT a Rust-only divergence. See the Rust
-#   apples-to-apples in tableinout_multibatch_repro_rust.test (eval_all).
+#   THE FIX: VgiTableInOutGlobalState::exchange_mutex serializes each per-batch
+#   write→read on the shared connection, so concurrent branch executors no longer
+#   interleave. Streaming is preserved — input is NOT buffered.
+#
+#   HISTORY: the failure tracked the table-in-out KIND, not the worker language.
+#   The STREAMING kind (`echo`) failed; the BUFFERING kind (`buffer_input`) was
+#   always immune (it coalesces sub-pipelines in a Sink+Source operator). The
+#   canonical Python worker reproduced it, proving the defect was shared client
+#   framing, not Rust-only. See the Rust apples-to-apples in
+#   tableinout_multibatch_repro_rust.test (eval_all).
 # group: [vgi_integration_table_in_out]
 
 require-env VGI_TEST_WORKER
@@ -57,10 +59,12 @@ SELECT count(*), sum(x) FROM example.echo((
 # ----------------------------------------------------------------------------
 # REPRO — streaming echo, SAME logical rows as CONTROL A but built from
 # UNION ALL of literal SELECTs (one source sub-pipeline / sub-stream per
-# branch). The schema-first stream reader desyncs on the second branch.
-# Captured exactly: the canonical Python worker FAILS here.
+# branch). FIXED: the per-batch write→read exchange on the operator's single
+# shared connection is now serialized (VgiTableInOutGlobalState::exchange_mutex),
+# so the concurrent branch PipelineExecutors no longer interleave IPC on the one
+# stream. Must now PASS.
 # ----------------------------------------------------------------------------
-statement error
+query I
 SELECT * FROM example.echo((
     SELECT 1::BIGINT
     UNION ALL
@@ -69,7 +73,9 @@ SELECT * FROM example.echo((
     SELECT 3::BIGINT
 )) ORDER BY 1;
 ----
-Invalid flatbuffers message
+1
+2
+3
 
 # ----------------------------------------------------------------------------
 # CONTRAST — the BUFFERING kind (buffer_input) is IMMUNE to the same input.
@@ -89,6 +95,59 @@ SELECT * FROM example.buffer_input((
 1
 2
 3
+
+# ----------------------------------------------------------------------------
+# HARDENING — extra multi-source-pipeline shapes that all hit the same fixed
+# concurrent-exchange path. All must PASS.
+# ----------------------------------------------------------------------------
+
+# 5-branch UNION ALL of literals.
+query II
+SELECT count(*), sum(x) FROM example.echo((
+    SELECT 10::BIGINT UNION ALL SELECT 20 UNION ALL SELECT 30
+    UNION ALL SELECT 40 UNION ALL SELECT 50
+)) t(x);
+----
+5	150
+
+# UNION ALL of two multi-batch range() scans (each branch is its own
+# source sub-pipeline AND emits many RecordBatches).
+query II
+SELECT count(*), sum(x) FROM example.echo((
+    SELECT i::BIGINT AS x FROM range(3000) t(i)
+    UNION ALL
+    SELECT i::BIGINT AS x FROM range(3000) t(i)
+)) t2(x);
+----
+6000	8997000
+
+# Streaming echo fed by a JOIN (multi-pipeline source), then re-streamed.
+query I
+SELECT count(*) FROM example.echo((
+    SELECT a.x::BIGINT AS x
+    FROM (VALUES (1),(2),(3)) a(x)
+    JOIN (VALUES (1),(2),(3),(1)) b(x) USING (x)
+)) t(x);
+----
+4
+
+# Parallelism stress: many-branch UNION ALL under multiple threads — exercises
+# the exchange_mutex across concurrent branch PipelineExecutors.
+statement ok
+SET threads = 8;
+
+query II
+SELECT count(*), sum(x) FROM example.echo((
+    SELECT i::BIGINT AS x FROM range(2000) t(i)
+    UNION ALL SELECT i::BIGINT FROM range(2000) t(i)
+    UNION ALL SELECT i::BIGINT FROM range(2000) t(i)
+    UNION ALL SELECT i::BIGINT FROM range(2000) t(i)
+)) t2(x);
+----
+8000	7996000
+
+statement ok
+RESET threads;
 
 statement ok
 DETACH example;

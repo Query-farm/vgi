@@ -2,6 +2,7 @@
 #pragma once
 
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -111,6 +112,15 @@ struct VgiTableInOutGlobalState : public GlobalTableFunctionState {
 
 	// Primary connection for this execution
 	std::unique_ptr<IFunctionConnection> connection;
+
+	// Serializes the per-batch write→read exchange on `connection`. Under
+	// UNION ALL, DuckDB feeds this operator from multiple source sub-pipelines
+	// whose PipelineExecutors can run concurrently; MaxThreads()=1 serializes
+	// only within a single pipeline, NOT across union pipelines. Without this
+	// lock their WriteInputBatch/ReadDataBatch calls interleave on the one IPC
+	// stream and desync the worker's schema-first reader. Held across each 1:1
+	// write→read in VgiTableInOutFunction so the exchange is atomic.
+	std::mutex exchange_mutex;
 
 	// BindResult from the bind RPC sent at InitGlobal time. Held here so
 	// that the later PerformInit (INPUT phase, called below at InitGlobal)

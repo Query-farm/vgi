@@ -36,11 +36,12 @@ ORDER BY id;
 2	false
 
 # ----------------------------------------------------------------------------
-# REPRO — SAME rows via UNION ALL of literal SELECTs (one sub-stream per
-# branch). The Rust streaming reader (vgi-rpc-rust wire.rs StreamReader::new)
-# desyncs identically to Python's.
+# REPRO (now FIXED) — SAME rows via UNION ALL of literal SELECTs (one sub-stream
+# per branch). The extension now serializes the per-batch write→read exchange on
+# the operator's single shared connection, so the Rust streaming reader no longer
+# desyncs. Must now PASS (apples-to-apples with the Python echo fix).
 # ----------------------------------------------------------------------------
-statement error
+query II
 SELECT id, result FROM rules.main.eval_all(
   (SELECT 1 AS id, '{"amount":99999}' AS data
    UNION ALL
@@ -48,7 +49,8 @@ SELECT id, result FROM rules.main.eval_all(
   engine := 'cel', rule := 'amount > 10000', id := 'id', data := 'data', result_type := 'BOOLEAN')
 ORDER BY id;
 ----
-Invalid flatbuffers message
+1	true
+2	false
 
 statement ok
 DETACH rules;
