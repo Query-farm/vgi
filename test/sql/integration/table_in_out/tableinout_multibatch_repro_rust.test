@@ -1,0 +1,54 @@
+# name: test/sql/integration/table_in_out/tableinout_multibatch_repro_rust.test
+# description: Rust-SDK apples-to-apples for the streaming table-in-out
+#   multi-batch input bug (see tableinout_multibatch_repro.test for the Python
+#   side and the full write-up). Pins a Rust STREAMING table-in-out worker
+#   (vgi-rules rules-worker; eval_all impl vgi::table_in_out::TableInOutFunction)
+#   and feeds the SAME logical rows two ways:
+#     CONTROL — single-batch VALUES — PASSES.
+#     REPRO   — UNION ALL of literal SELECTs (one source sub-stream per branch) —
+#               FAILS with the identical "Invalid flatbuffers message" desync the
+#               canonical Python streaming worker (echo) hits. Confirms the bug is
+#               SHARED client framing, not Rust-only.
+#   Gated on VGI_RULES_WORKER so the default Python suite skips it. Run with:
+#     VGI_RULES_WORKER=~/Development/vgi-rules/target/release/rules-worker \
+#       ./build/release/test/unittest <this file>
+# group: [vgi_integration_table_in_out]
+
+require-env VGI_RULES_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'rules' AS rules (TYPE vgi, LOCATION '${VGI_RULES_WORKER}');
+
+# ----------------------------------------------------------------------------
+# CONTROL — single-batch VALUES input. Must PASS.
+# ----------------------------------------------------------------------------
+query II
+SELECT id, result FROM rules.main.eval_all(
+  (SELECT * FROM (VALUES (1, '{"amount":99999}'), (2, '{"amount":5}')) AS t(id, data)),
+  engine := 'cel', rule := 'amount > 10000', id := 'id', data := 'data', result_type := 'BOOLEAN')
+ORDER BY id;
+----
+1	true
+2	false
+
+# ----------------------------------------------------------------------------
+# REPRO — SAME rows via UNION ALL of literal SELECTs (one sub-stream per
+# branch). The Rust streaming reader (vgi-rpc-rust wire.rs StreamReader::new)
+# desyncs identically to Python's.
+# ----------------------------------------------------------------------------
+statement error
+SELECT id, result FROM rules.main.eval_all(
+  (SELECT 1 AS id, '{"amount":99999}' AS data
+   UNION ALL
+   SELECT 2, '{"amount":5}'),
+  engine := 'cel', rule := 'amount > 10000', id := 'id', data := 'data', result_type := 'BOOLEAN')
+ORDER BY id;
+----
+Invalid flatbuffers message
+
+statement ok
+DETACH rules;

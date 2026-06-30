@@ -1,0 +1,94 @@
+# name: test/sql/integration/table_in_out/tableinout_multibatch_repro.test
+# description: Minimal reproducer for the table-in-out multi-batch input bug,
+#   run against the CANONICAL Python worker (vgi-python vgi-fixture-worker) so
+#   the result is decisive across SDKs. A relation built from UNION ALL of
+#   literal SELECTs is delivered by DuckDB as one Arrow sub-stream per source
+#   sub-pipeline (upstream DuckDB issue #18222: PhysicalTableInOutFunction
+#   FinalExecute fires per source sub-pipeline). The SDK stream reader is
+#   schema-first, so the second branch's RecordBatch arrives with no preceding
+#   Schema and the exchange desyncs ("Invalid flatbuffers message"; Rust's
+#   vgi-rpc-rust wire.rs StreamReader::new words it "expected Schema, got
+#   RecordBatch").
+#
+#   FINDING: the failure tracks the table-in-out KIND, not the worker language.
+#     * STREAMING kind (TableInOutFunction / TableInOutGenerator; here `echo`)
+#       FAILS the UNION-ALL shape on this Python worker.
+#     * BUFFERING kind (TableBufferingFunction; here `buffer_input`) is IMMUNE.
+#   Because the Python worker — the byte-for-byte canonical the other SDKs
+#   mirror — reproduces, the defect is in the SHARED client framing / protocol
+#   for the streaming exchange, NOT a Rust-only divergence. See the Rust
+#   apples-to-apples in tableinout_multibatch_repro_rust.test (eval_all).
+# group: [vgi_integration_table_in_out]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ----------------------------------------------------------------------------
+# CONTROL A — streaming echo, single-batch VALUES input. Must PASS.
+# ----------------------------------------------------------------------------
+query I
+SELECT * FROM example.echo((
+    SELECT * FROM (VALUES (1::BIGINT), (2::BIGINT), (3::BIGINT)) t(x)
+)) ORDER BY 1;
+----
+1
+2
+3
+
+# ----------------------------------------------------------------------------
+# CONTROL B — streaming echo, MULTI-batch but SINGLE source operator
+# (range(5000) >> the 2048-row batch size). This proves the trigger is the
+# multi-SOURCE-pipeline shape, not row count / batch count: a single scan that
+# emits many RecordBatches under one Schema stays in lockstep. Must PASS.
+# ----------------------------------------------------------------------------
+query II
+SELECT count(*), sum(x) FROM example.echo((
+    SELECT i::BIGINT AS x FROM range(5000) t(i)
+)) t2(x);
+----
+5000	12497500
+
+# ----------------------------------------------------------------------------
+# REPRO — streaming echo, SAME logical rows as CONTROL A but built from
+# UNION ALL of literal SELECTs (one source sub-pipeline / sub-stream per
+# branch). The schema-first stream reader desyncs on the second branch.
+# Captured exactly: the canonical Python worker FAILS here.
+# ----------------------------------------------------------------------------
+statement error
+SELECT * FROM example.echo((
+    SELECT 1::BIGINT
+    UNION ALL
+    SELECT 2::BIGINT
+    UNION ALL
+    SELECT 3::BIGINT
+)) ORDER BY 1;
+----
+Invalid flatbuffers message
+
+# ----------------------------------------------------------------------------
+# CONTRAST — the BUFFERING kind (buffer_input) is IMMUNE to the same input.
+# Identical UNION-ALL relation, emitted in full. This localizes the defect to
+# the STREAMING table-in-out exchange, and rules out "Rust vs Python": the same
+# Python worker passes buffering and fails streaming.
+# ----------------------------------------------------------------------------
+query I
+SELECT * FROM example.buffer_input((
+    SELECT 1::BIGINT
+    UNION ALL
+    SELECT 2::BIGINT
+    UNION ALL
+    SELECT 3::BIGINT
+)) ORDER BY 1;
+----
+1
+2
+3
+
+statement ok
+DETACH example;
