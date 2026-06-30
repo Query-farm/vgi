@@ -93,9 +93,10 @@ bool SchemaHasDictionary(const arrow::Schema &schema) {
 // Minimum batch size (bytes) worth shipping through shm. Below this, the pipe
 // wins: shm's fixed per-batch cost (slot allocation + a pointer-batch round trip
 // + the peer's resolve/free) outweighs the copy it saves on a small payload.
-// Measured crossover is platform-specific — POSIX shm_open/mmap is cheap (~64KB)
-// while Windows' page-file mapping plus the fast overlapped-pipe read push the
-// crossover to ~1.5MB. Overridable with VGI_RPC_SHM_MIN_BATCH_BYTES. Computed
+// Measured crossover is platform-specific — POSIX shm_open/mmap overtakes the
+// pipe around 64–256KB, while Windows' page-file mapping plus the fast
+// overlapped-pipe read push it to ~0.5–1MB. Overridable with
+// VGI_RPC_SHM_MIN_BATCH_BYTES. Computed
 // once. Mirrors the same gate in the Python/Go/Rust/Java SDK output paths.
 static int64_t ShmMinBatchBytes() {
 	static const int64_t kThreshold = []() -> int64_t {
@@ -109,7 +110,7 @@ static int64_t ShmMinBatchBytes() {
 #ifdef _WIN32
 		return 1024 * 1024; // 1 MiB
 #else
-		return 64 * 1024; // 64 KiB
+		return 128 * 1024; // 128 KiB
 #endif
 	}();
 	return kThreshold;
