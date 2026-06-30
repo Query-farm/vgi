@@ -378,11 +378,21 @@ SubProcess::SubProcess(const std::string &command, bool stderr_passthrough) {
 		return IOException("vgi: %s failed (GetLastError=%lu)", what, (unsigned long)e);
 	};
 
-	if (!CreatePipe(&child_stdin_rd, &parent_stdin_wr, &sa, 0)) {
+	// Pipe buffer hint for the two DATA pipes (stdin carries exchange-mode input
+	// + producer ticks; stdout carries the worker's Arrow IPC batches). The
+	// default CreatePipe buffer is ~4 KiB, which is far smaller than a typical
+	// Arrow batch — so the worker blocks part-way through every batch write and
+	// ping-pongs with the reader, adding context switches on the hot path. A
+	// larger buffer lets a whole batch flow without blocking. 256 KiB is a
+	// deliberate balance: big enough for typical/large batches, while bounding
+	// nonpaged-pool use across pooled workers (the size is advisory — Windows
+	// caps the actual allocation). stderr stays at the default (low-volume logs).
+	constexpr DWORD kDataPipeBufferBytes = 1u << 18; // 256 KiB
+	if (!CreatePipe(&child_stdin_rd, &parent_stdin_wr, &sa, kDataPipeBufferBytes)) {
 		throw fail("CreatePipe(stdin)");
 	}
 	SetHandleInformation(parent_stdin_wr, HANDLE_FLAG_INHERIT, 0); // parent end not inherited
-	if (!CreatePipe(&parent_stdout_rd, &child_stdout_wr, &sa, 0)) {
+	if (!CreatePipe(&parent_stdout_rd, &child_stdout_wr, &sa, kDataPipeBufferBytes)) {
 		throw fail("CreatePipe(stdout)");
 	}
 	SetHandleInformation(parent_stdout_rd, HANDLE_FLAG_INHERIT, 0);
