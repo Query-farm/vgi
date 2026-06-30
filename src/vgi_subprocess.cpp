@@ -602,7 +602,20 @@ void WaitForReadableUntilCancel(int fd, ClientContext *context) {
 	if (h == INVALID_HANDLE_VALUE) {
 		throw IOException("VGI WaitForReadableUntilCancel: invalid file descriptor");
 	}
-	while (true) {
+	// Anonymous pipes have no poll()-equivalent that blocks until readable, so we
+	// peek in a loop. The back-off ADAPTS instead of sleeping a fixed quantum:
+	// the producer one-ahead pipeline means the next batch is almost always
+	// in-flight when this is called, so the FIRST peek typically misses it and we
+	// must detect its arrival within microseconds — otherwise every data-phase
+	// batch read stalls. A flat Sleep(250ms) here cost ~250ms PER BATCH on
+	// Windows (a ~100-1000x throughput regression vs a direct blocking read);
+	// poll() on POSIX never had this because it wakes the instant data arrives.
+	//
+	// Ladder: spin (YieldProcessor, ~ns) → yield to the worker thread
+	// (SwitchToThread, µs–ms) → short Sleep backstop for a genuinely idle/slow
+	// worker. `interrupted` is re-checked every iteration, so Ctrl-C / query
+	// cancel is still observed promptly (bounded by the Sleep cap).
+	for (unsigned attempt = 0;; attempt++) {
 		if (context && context->interrupted) {
 			throw IOException("VGI operation interrupted (query cancelled)");
 		}
@@ -615,9 +628,15 @@ void WaitForReadableUntilCancel(int fd, ClientContext *context) {
 			                  (unsigned long)GetLastError());
 		}
 		if (avail > 0) {
-			return;
+			return; // data ready — return immediately, no sleep
 		}
-		std::this_thread::sleep_for(std::chrono::milliseconds(250)); // poll quantum
+		if (attempt < 64) {
+			YieldProcessor(); // tight spin: catches the common in-flight batch
+		} else if (attempt < 4096) {
+			SwitchToThread(); // hand the core to the worker producing the batch
+		} else {
+			std::this_thread::sleep_for(std::chrono::milliseconds(1)); // idle backstop
+		}
 	}
 }
 #else // Emscripten
