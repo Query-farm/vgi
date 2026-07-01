@@ -26,7 +26,7 @@ FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'aggregate'
   AND function_name NOT IN ('vgi_dynamic_agg', 'vgi_dynamic_ml_agg');
 ----
-14
+15
 
 query TT
 SELECT function_name, return_type
@@ -36,6 +36,7 @@ WHERE database_name = 'example' AND function_type = 'aggregate'
 ORDER BY function_name;
 ----
 nest_tensor	ANY
+secret_typed_sum	ANY
 vgi_avg	DOUBLE
 vgi_count	BIGINT
 vgi_generic_sum	ANY
