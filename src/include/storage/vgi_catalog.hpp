@@ -37,6 +37,14 @@ public:
 		return attach_result_ && attach_result_->supports_time_travel;
 	}
 
+	// Companion catalog aliases this VGI attach referenced (lakehouse
+	// federation). Recorded at attach time; refcount-released in OnDetach so the
+	// federation is reversible (unlike the secret-provider seam).
+	void SetCompanionCatalogs(std::vector<std::string> aliases) {
+		companion_catalogs_ = std::move(aliases);
+	}
+	void OnDetach(ClientContext &context) override;
+
 	optional_ptr<CatalogEntry> CreateSchema(CatalogTransaction transaction, CreateSchemaInfo &info) override;
 
 	void ScanSchemas(ClientContext &context, std::function<void(SchemaCatalogEntry &)> callback) override;
@@ -118,6 +126,9 @@ private:
 	std::string default_schema_;
 	VgiObjectCounts eager_load_thresholds_;
 	VgiSchemaSet schemas;
+
+	// Companion catalog aliases this catalog referenced (released in OnDetach).
+	std::vector<std::string> companion_catalogs_;
 
 	/// Last known catalog version from the worker. Initialized from attach_result.
 	/// Atomic since it can be read/written from concurrent transactions.

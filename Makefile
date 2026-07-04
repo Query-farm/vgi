@@ -50,6 +50,7 @@ VGI_SIMPLE_WRITABLE_WORKER ?= uv run --project $(HOME)/Development/vgi-python vg
 	test_writable test_writable_debug \
 	test_simple_writable test_simple_writable_debug \
 	test_docker test_docker_debug \
+	test_companion test_companion_debug \
 	test_all test_all_debug
 
 # Shared-memory transport tests — runs the same .test suite as test_subprocess
@@ -286,6 +287,16 @@ test_docker:
 
 test_docker_debug:
 	BUILD_DIR=debug ./test/run_docker_integration.sh "test/sql/integration/container/*"
+
+# Companion-catalog (lakehouse federation) integration tests (uses
+# test/run_companion_integration.sh). Seeds a DuckLake, points the companion
+# fixture worker at it, and runs the companion .test files. Skips cleanly when
+# ducklake / sqlite_scanner are unavailable.
+test_companion:
+	./test/run_companion_integration.sh "test/sql/integration/catalog/companion_catalogs.test"
+
+test_companion_debug:
+	BUILD_DIR=debug ./test/run_companion_integration.sh "test/sql/integration/catalog/companion_catalogs.test"
 
 # Writable catalog tests (subprocess transport) — opt-in, require a worker
 # with writable-catalog support.

@@ -85,6 +85,21 @@ struct VgiSecretRequirement {
 	std::string scope;          // Empty = not specified (dynamic — resolved at bind time)
 };
 
+// A companion catalog the client should ATTACH when this VGI catalog attaches
+// (lakehouse federation). Parsed from serialized AttachCatalogInfo objects in
+// CatalogAttachResult.attach_catalogs. Attached at VGI-attach time with a
+// never-clobber conflict policy + scheme allowlist; detached (refcounted) on
+// DETACH. See vgi_extension.cpp companion-attach + docs/companion_catalogs.md.
+struct VgiAttachCatalogInfo {
+	std::string alias;                          // ATTACH alias; also a catalog-table branch's source_catalog
+	std::string target;                         // ATTACH target — path or DSN (e.g. "ducklake:sqlite:/m.sqlite")
+	std::string db_type;                        // DuckDB db type; empty = infer from target scheme prefix
+	std::map<std::string, std::string> options; // Extra ATTACH options (e.g. DuckLake DATA_PATH)
+	bool hidden = false;                        // Attach hidden (excluded from duckdb_databases())
+	bool required = false;                       // Attach failure fails the VGI ATTACH (vs log+skip)
+	std::string secret_ref;                     // Optional credential to pre-resolve via Orchard; empty = catch-all
+};
+
 // Result of catalog_attach call
 struct CatalogAttachResult {
 	std::vector<uint8_t> attach_opaque_data;
@@ -96,6 +111,7 @@ struct CatalogAttachResult {
 	std::string default_schema = "main";
 	std::vector<VgiSetting> settings;             // Extension options exposed by this catalog
 	std::vector<VgiSecretType> secret_types;      // Secret types exposed by this catalog
+	std::vector<VgiAttachCatalogInfo> attach_catalogs; // Companion catalogs to ATTACH at VGI-attach time
 	std::string comment;                          // Optional comment describing this catalog
 	std::map<std::string, std::string> tags;      // Optional key-value tags for this catalog
 	bool supports_column_statistics = false;      // Whether any tables provide column statistics
@@ -182,6 +198,22 @@ struct VgiScanBranch {
 	// multi-branch tables regardless of this flag; the contract is
 	// INSERT-only until cross-arm semantics have customer-driven evidence.
 	bool writable = false;
+
+	// Catalog-table branch (Approach 3). When function_name is empty and
+	// source_table is set, this branch scans an attached-catalog BASE TABLE —
+	// typically a companion catalog advertised via
+	// CatalogAttachResult.attach_catalogs (e.g. a DuckLake table). The rewriter
+	// binds it via TableCatalogEntry::GetScanFunction (3-arg, with
+	// EntryLookupInfo) rather than TableFunction::bind, so the companion's
+	// snapshot/pruning semantics are honored. The companion must already be
+	// attached (the manifest handles that at VGI-attach time). See
+	// vgi_multi_scan_rewriter.cpp:BindCatalogTableArm.
+	std::string source_catalog;
+	std::string source_schema;
+	std::string source_table;
+	bool IsCatalogTable() const {
+		return function_name.empty() && !source_table.empty();
+	}
 };
 
 // Result of the new catalog_table_scan_branches_get RPC. New-protocol shape;

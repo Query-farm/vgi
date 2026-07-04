@@ -271,6 +271,19 @@ parquet/iceberg/whatever reader runs in-process inside DuckDB, with
 the worker only consulted for the hot tier. The worker pipe doesn't
 become a bottleneck on TB-scale historical data.
 
+### Catalog-table branches (companion catalogs)
+
+A branch can also scan a **base table in an attached catalog** rather than call a
+table function — a `ScanBranch` with an empty `function_name` and
+`source_{catalog,schema,table}` set. This is how a branch targets a DuckLake /
+Iceberg-REST / Postgres table that is *catalog-managed* (accessed via `ATTACH`,
+not a path-taking function): the rewriter binds it through the table entry's own
+`GetScanFunction`, honoring the source's snapshot/pruning semantics. The
+companion catalog is provisioned automatically at VGI `ATTACH` time via the
+`attach_catalogs` manifest — see [companion_catalogs.md](companion_catalogs.md).
+`branch_filter` pruning works identically (a disjoint query predicate eliminates
+the cold DuckLake arm from the plan entirely).
+
 ### Required extensions
 
 Declare extensions used by ANY branch in `required_extensions` on the

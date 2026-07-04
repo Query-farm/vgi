@@ -1,0 +1,43 @@
+# name: test/sql/integration/catalog/companion_partial_failure.test
+# description: Companion catalogs — partial-failure cleanup. The worker advertises
+#              a valid DuckLake companion followed by a poison companion (disallowed
+#              scheme) that throws AFTER the first attached. The failed VGI ATTACH
+#              must not leak the first companion (registry + attached DB). Run via
+#              test/run_companion_integration.sh with VGI_TEST_COMPANION_POISON=1.
+# group: [vgi_integration_catalog]
+
+require-env VGI_TEST_WORKER
+
+require-env VGI_TEST_COMPANION_TARGET
+
+require-env VGI_TEST_COMPANION_POISON
+
+require vgi
+
+statement ok
+LOAD ducklake;
+
+statement ok
+LOAD sqlite_scanner;
+
+statement ok
+LOAD parquet;
+
+# The poison second companion (disallowed scheme) throws after the first
+# DuckLake companion attached.
+statement error
+ATTACH 'companion' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+----
+not permitted
+
+# Partial-failure cleanup released the first companion — nothing leaked.
+query I
+SELECT count(*) FROM duckdb_databases() WHERE database_name = 'vgi_companion';
+----
+0
+
+# And the VGI catalog itself did not attach.
+query I
+SELECT count(*) FROM duckdb_databases() WHERE database_name = 'ex';
+----
+0

@@ -1,0 +1,178 @@
+# name: test/sql/integration/catalog/companion_catalogs.test
+# description: Companion catalogs (lakehouse federation) — a VGI catalog_attach
+#              advertises attach_catalogs; the extension attaches a DuckLake
+#              companion at ATTACH time; a multi-branch table's catalog-table
+#              branches scan it with hot/cold branch_filter pruning; never-clobber
+#              conflict policy; opt-out; refcounted detach. Requires the
+#              companion fixture worker + a pre-seeded DuckLake — run via
+#              test/run_companion_integration.sh (sets VGI_TEST_WORKER +
+#              VGI_TEST_COMPANION_TARGET).
+# group: [vgi_integration_catalog]
+
+require-env VGI_TEST_WORKER
+
+require-env VGI_TEST_COMPANION_TARGET
+
+require vgi
+
+# ducklake / sqlite_scanner are not autoloadable in the unittest binary, so load
+# them explicitly. The runner (run_companion_integration.sh) already skips the
+# whole suite when they are unavailable (it seeds the DuckLake first).
+statement ok
+LOAD ducklake;
+
+statement ok
+LOAD sqlite_scanner;
+
+# DuckLake builds its scan from parquet_scan's bind. parquet is statically
+# linked but not autoloaded in the unittest binary, so load it explicitly.
+statement ok
+LOAD parquet;
+
+# ============================================================================
+# Companion auto-attach + catalog-table branches
+# ============================================================================
+
+statement ok
+ATTACH 'companion' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# The DuckLake companion was attached at VGI-attach time (visible: not hidden).
+query I
+SELECT count(*) FROM duckdb_databases() WHERE database_name = 'vgi_companion';
+----
+1
+
+# Full scan: both catalog-table branches scan the companion's events table
+# (hot arm id>=100, cold arm id<100). Union = all 5 rows.
+query II
+SELECT * FROM ex.data.hot_cold ORDER BY id;
+----
+1	cold-a
+2	cold-b
+3	cold-c
+100	hot-x
+200	hot-y
+
+query I
+SELECT count(*) FROM ex.data.hot_cold;
+----
+5
+
+# ============================================================================
+# branch_filter hot/cold pruning: a predicate disjoint with a branch's filter
+# eliminates that arm's DuckLake scan entirely.
+# ============================================================================
+
+# id >= 150 → cold arm (id<100) is contradictory ⇒ only the hot arm survives.
+query II
+SELECT * FROM ex.data.hot_cold WHERE id >= 150 ORDER BY id;
+----
+200	hot-y
+
+# id < 50 → hot arm (id>=100) is contradictory ⇒ only the cold arm survives.
+query II
+SELECT * FROM ex.data.hot_cold WHERE id < 50 ORDER BY id;
+----
+1	cold-a
+2	cold-b
+3	cold-c
+
+# ============================================================================
+# Detach removes the companion (refcount → 0)
+# ============================================================================
+
+statement ok
+DETACH ex;
+
+query I
+SELECT count(*) FROM duckdb_databases() WHERE database_name = 'vgi_companion';
+----
+0
+
+# ============================================================================
+# Opt-out: attach_companions false ⇒ no companion; branch query errors clearly
+# ============================================================================
+
+statement ok
+ATTACH 'companion' AS exo (TYPE vgi, LOCATION '${VGI_TEST_WORKER}', attach_companions false);
+
+query I
+SELECT count(*) FROM duckdb_databases() WHERE database_name = 'vgi_companion';
+----
+0
+
+statement error
+SELECT * FROM exo.data.hot_cold;
+----
+not attached
+
+statement ok
+DETACH exo;
+
+# ============================================================================
+# Never-clobber conflict: a companion alias held by a user catalog fails the
+# (required) VGI attach and leaves the user catalog untouched.
+# ============================================================================
+
+statement ok
+ATTACH ':memory:' AS vgi_companion;
+
+statement ok
+CREATE TABLE vgi_companion.main.user_table(x INTEGER);
+
+statement ok
+INSERT INTO vgi_companion.main.user_table VALUES (42);
+
+statement error
+ATTACH 'companion' AS exc (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+----
+already in use
+
+# User catalog is intact — never replaced.
+query I
+SELECT x FROM vgi_companion.main.user_table;
+----
+42
+
+statement ok
+DETACH vgi_companion;
+
+# ============================================================================
+# Sharing + refcounted detach: two VGI catalogs share one companion; detaching
+# one keeps it alive for the other until the last releases it.
+# ============================================================================
+
+statement ok
+ATTACH 'companion' AS exA (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+ATTACH 'companion' AS exB (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# One shared attachment (same alias + same target).
+query I
+SELECT count(*) FROM duckdb_databases() WHERE database_name = 'vgi_companion';
+----
+1
+
+# Detaching exA must NOT detach the shared companion (exB still references it).
+statement ok
+DETACH exA;
+
+query I
+SELECT count(*) FROM duckdb_databases() WHERE database_name = 'vgi_companion';
+----
+1
+
+query I
+SELECT count(*) FROM exB.data.hot_cold;
+----
+5
+
+# Last referencer releases it ⇒ companion detached.
+statement ok
+DETACH exB;
+
+query I
+SELECT count(*) FROM duckdb_databases() WHERE database_name = 'vgi_companion';
+----
+0

@@ -1744,6 +1744,25 @@ VgiSecretType ParseVgiSecretType(const std::vector<uint8_t> &bytes, const std::s
 	return secret_type;
 }
 
+// Parse one serialized AttachCatalogInfo (companion catalog). Fields beyond
+// alias/target are backward-compatible via value_or.
+static VgiAttachCatalogInfo ParseVgiAttachCatalog(const std::vector<uint8_t> &bytes, const std::string &worker_path) {
+	auto batch = DeserializeFromIpcBytes(bytes);
+	if (!batch || batch->num_rows() == 0) {
+		throw IOException("Empty AttachCatalogInfo batch from worker: %s", worker_path);
+	}
+	RecordBatchSingleRow row(batch, 0, "AttachCatalogInfo", worker_path);
+	VgiAttachCatalogInfo info;
+	info.alias = row["alias"].value_not_null<std::string>();
+	info.target = row["target"].value_not_null<std::string>();
+	info.db_type = row["db_type"].value_or(std::string(""));
+	info.options = row["options"].value_or(std::map<std::string, std::string> {});
+	info.hidden = row["hidden"].value_or(false);
+	info.required = row["required"].value_or(false);
+	info.secret_ref = row["secret_ref"].value_or(std::string(""));
+	return info;
+}
+
 CatalogAttachResult ParseCatalogAttachResult(const std::shared_ptr<arrow::RecordBatch> &batch,
                                              const std::string &worker_path, ClientContext &context) {
 	CatalogAttachResult result;
@@ -1774,6 +1793,13 @@ CatalogAttachResult ParseCatalogAttachResult(const std::shared_ptr<arrow::Record
 	auto secret_types_bytes = row["secret_types"].value_or(std::vector<std::vector<uint8_t>> {});
 	for (const auto &st_bytes : secret_types_bytes) {
 		result.secret_types.push_back(ParseVgiSecretType(st_bytes, worker_path, context));
+	}
+
+	// Parse companion catalogs (attach_catalogs) — backward-compatible: older
+	// workers omit the field entirely, yielding an empty list.
+	auto attach_catalogs_bytes = row["attach_catalogs"].value_or(std::vector<std::vector<uint8_t>> {});
+	for (const auto &ac_bytes : attach_catalogs_bytes) {
+		result.attach_catalogs.push_back(ParseVgiAttachCatalog(ac_bytes, worker_path));
 	}
 
 	// Parse optional comment and tags (backward-compatible with older workers)
@@ -2215,6 +2241,13 @@ VgiScanBranchesResult ParseScanBranchesResult(ClientContext &context,
 		if (branch.writable) {
 			writable_ordinals.push_back(i);
 		}
+
+		// Catalog-table branch fields (nullable; empty ⇒ function branch). A
+		// non-empty source_table selects the catalog-table kind — the branch
+		// scans source_catalog.source_schema.source_table in a companion catalog.
+		branch.source_catalog = branch_row["source_catalog"].value_or(std::string{});
+		branch.source_schema = branch_row["source_schema"].value_or(std::string{});
+		branch.source_table = branch_row["source_table"].value_or(std::string{});
 
 		result.branches.push_back(std::move(branch));
 	}

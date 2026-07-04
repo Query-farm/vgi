@@ -3,6 +3,7 @@
 
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/main/attached_database.hpp"
+#include "duckdb/main/database_manager.hpp"
 #include "duckdb/storage/database_size.hpp"
 #include "duckdb/catalog/catalog_transaction.hpp"
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
@@ -22,6 +23,7 @@
 #include "storage/vgi_table_entry.hpp"
 #include "storage/vgi_transaction.hpp"
 #include "vgi_catalog_rpc.hpp"
+#include "vgi_companion_catalogs.hpp"
 #include "vgi_logging.hpp"
 
 namespace duckdb {
@@ -39,6 +41,20 @@ VgiCatalog::VgiCatalog(AttachedDatabase &db_p, const std::string &internal_name,
 }
 
 VgiCatalog::~VgiCatalog() = default;
+
+// Release the companion catalogs this VGI attach referenced, so the federation
+// is reversible. Refcount-aware: a companion shared with another still-attached
+// VGI catalog is NOT detached until the last referencer releases it (see
+// ReleaseCompanionCatalogs → VgiStorageExtension::ReleaseCompanions). Called by
+// AttachedDatabase::OnDetach AFTER DetachInternal removed the parent
+// (databases_lock not held) — nested DetachDatabase is safe here.
+void VgiCatalog::OnDetach(ClientContext &context) {
+	if (companion_catalogs_.empty()) {
+		return;
+	}
+	vgi::ReleaseCompanionCatalogs(context, companion_catalogs_);
+	companion_catalogs_.clear();
+}
 
 void VgiCatalog::Initialize(bool load_builtin) {
 	// Nothing to do - schemas are loaded lazily

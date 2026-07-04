@@ -28,7 +28,9 @@
 #include "vgi_multi_scan_rewriter.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp"
+#include "duckdb/catalog/entry_lookup_info.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/extension_helper.hpp"
@@ -185,10 +187,82 @@ struct ArmBindResult {
 	std::vector<ColumnBinding> bindings;  // matching ColumnBinding list
 };
 
+// Build a LogicalGet for a catalog-table branch that scans an attached-catalog
+// BASE TABLE (source_catalog.source_schema.source_table) rather than a table
+// function. Mirrors DuckDB's own base-table binding in bind_basetableref.cpp
+// (CatalogType::TABLE_ENTRY case): resolve the TableCatalogEntry, ask it for its
+// scan function + bind_data, and construct the LogicalGet from the table's
+// logical columns. The companion catalog is attached at VGI-attach time (via the
+// attach_catalogs manifest), so this is a pure lookup — no attach here.
+static ArmBindResult BindCatalogTableArm(const VgiScanBranch &branch, ClientContext &context, Binder &binder) {
+	// The companion catalog must already be attached. If it isn't (e.g.
+	// `attach_companions false`, or an optional companion that failed/conflicted),
+	// fail with a clear message rather than a bare "catalog not found".
+	if (!Catalog::GetCatalogEntry(context, branch.source_catalog)) {
+		throw BinderException(
+		    "VGI multi-branch catalog-table branch references companion catalog '%s' (table '%s.%s') which is not "
+		    "attached. Companion catalogs are attached at VGI ATTACH time — was `attach_companions false` set, or did "
+		    "an optional companion fail to attach?",
+		    branch.source_catalog, branch.source_schema, branch.source_table);
+	}
+
+	// Resolve + scan through the 3-arg GetScanFunction that carries the
+	// EntryLookupInfo. Catalog-managed sources like DuckLake REQUIRE it — the
+	// 2-arg overload throws "called without entry lookup info" (it needs the
+	// lookup to bind the snapshot/file-list). No AT clause = current snapshot.
+	EntryLookupInfo table_lookup(CatalogType::TABLE_ENTRY, branch.source_table);
+	auto &table = Catalog::GetEntry<TableCatalogEntry>(context, branch.source_catalog, branch.source_schema,
+	                                                    branch.source_table);
+
+	unique_ptr<FunctionData> bind_data;
+	auto scan_function = table.GetScanFunction(context, bind_data, table_lookup);
+
+	vector<LogicalType> return_types;
+	vector<string> return_names;
+	for (auto &col : table.GetColumns().Logical()) {
+		return_types.push_back(col.Type());
+		return_names.push_back(col.Name());
+	}
+
+	virtual_column_map_t virtual_columns;
+	if (scan_function.get_virtual_columns) {
+		virtual_columns = scan_function.get_virtual_columns(context, bind_data.get());
+	} else {
+		virtual_columns = table.GetVirtualColumns();
+	}
+
+	auto bind_index = binder.GenerateTableIndex();
+	auto get = make_uniq<LogicalGet>(bind_index, scan_function, std::move(bind_data), return_types, return_names,
+	                                 std::move(virtual_columns));
+
+	// Full column set (same rationale as the function path — avoid the
+	// GetAnyColumn() fallback in ResolveOperatorTypes).
+	vector<ColumnIndex> all_cols;
+	all_cols.reserve(return_types.size());
+	for (idx_t i = 0; i < return_types.size(); i++) {
+		all_cols.emplace_back(i);
+	}
+	get->SetColumnIds(std::move(all_cols));
+	get->ResolveOperatorTypes();
+
+	ArmBindResult result;
+	result.raw_names = std::move(return_names);
+	result.raw_types = std::move(return_types);
+	result.bindings = get->GetColumnBindings();
+	result.get = std::move(get);
+	return result;
+}
+
 static ArmBindResult BindBranchArm(const VgiScanBranch &branch, ClientContext &context, Binder &binder,
                                     const std::string &table_catalog_name,
                                     const std::string &table_schema_name, const std::string &default_schema,
                                     const std::vector<ColumnIndex> &marker_column_ids) {
+	// SPIKE A: catalog-table branches take a completely different bind path
+	// (base table entry, not a table function).
+	if (branch.IsCatalogTable()) {
+		(void)marker_column_ids;
+		return BindCatalogTableArm(branch, context, binder);
+	}
 	// Look up the branch's function. Try the table's catalog/schema first,
 	// fall back to the catalog's default schema, then the system catalog
 	// (read_parquet, iceberg_scan, etc.).

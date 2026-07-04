@@ -312,6 +312,55 @@ auth transmission via bearer, HTTPS enforcement) and `test/orchard_httpfs_e2e.py
 null-`ClientContext` system-transaction path via a mock S3 + `SELECT … FROM 's3://…'`). Design
 notes: [`docs/remote_secret_provider_plan.md`](docs/remote_secret_provider_plan.md).
 
+## Companion Catalogs (Lakehouse Federation)
+
+An attached VGI catalog can ask the client to **also attach companion catalogs**
+(DuckLake / Iceberg / Postgres / DuckDB) at `ATTACH` time, so a multi-branch
+table's **catalog-table branches** can scan a lakehouse table alongside a hot VGI
+arm (hot/cold tiering, `branch_filter`-pruned). Two additive protocol pieces:
+
+- **Manifest.** `catalog_attach` result carries `attach_catalogs:
+  list[AttachCatalogInfo]` (`alias`, `target`, `db_type`, `options`, `hidden`,
+  `required`, `secret_ref`). `VgiCatalogAttach` (`vgi_extension.cpp`) provisions
+  each via `DatabaseManager::AttachDatabase` (statement-free) inside the storage
+  attach callback — reentrancy-safe (DuckDB doesn't hold `databases_lock` across
+  it). Parsed by `ParseVgiAttachCatalog` in `vgi_catalog_api.cpp`.
+- **Catalog-table branch.** A `ScanBranch` with empty `function_name` +
+  `source_{catalog,schema,table}` (nullable wire fields; discriminator =
+  `source_table` present). `BindCatalogTableArm` (`vgi_multi_scan_rewriter.cpp`)
+  binds it via `TableCatalogEntry::GetScanFunction` — the **3-arg** overload with
+  `EntryLookupInfo` (catalog-managed sources like DuckLake throw
+  "called without entry lookup info" on the 2-arg one).
+
+**Trust.** Opt-out (`attach_companions false`), scheme allowlist
+(ducklake/iceberg/postgres/mysql/duckdb/sqlite), and a **never-clobber** conflict
+policy: a per-DB companion registry on `VgiStorageExtension` (`AcquireCompanion`)
+refuses to replace a catalog the VGI layer didn't create, refcount-shares a
+companion across VGI catalogs, and `VgiCatalog::OnDetach` →
+`ReleaseCompanionCatalogs` detaches only when the last referencer releases it.
+
+**Credentials.** The Orchard catch-all `VgiRemoteSecretStorage` (registered before
+companion attach) serves companion cred lookups automatically at attach + query.
+`secret_ref` pre-resolves a named secret into ATTACH options for metadata DSNs
+(`InjectCompanionSecret`) but is **opt-in** (`attach_companion_secrets true`,
+default off) — a worker chooses both the secret name and the target host, so
+auto-injection would allow credential exfiltration; fail-closed by default.
+Companions attach at their natural access mode (writable federation supported;
+a bare sqlite/duckdb target is created — low-impact, trust the worker). HTTP
+catalogs only for Orchard; subprocess companions use ambient creds.
+
+**Gotcha.** DuckLake builds its scan from `parquet_scan`'s bind — declare
+`required_extensions=["parquet"]` on the branch (the rewriter auto-loads it) or
+DuckLake **segfaults** where parquet isn't autoloaded (e.g. the unittest binary).
+
+**Files.** `vgi_extension.cpp` (attach/registry/secret inject),
+`src/include/vgi_companion_catalogs.hpp`, `vgi_multi_scan_rewriter.cpp`
+(`BindCatalogTableArm`), `vgi_catalog_api.cpp` (parse), `vgi_catalog_metadata.hpp`
+(`VgiAttachCatalogInfo`). vgi-python: `AttachCatalogInfo` + `ScanBranch.source_*`
+in `catalog_interface.py`; fixture `vgi/_test_fixtures/companion.py`. Tests:
+`test/sql/integration/catalog/companion_catalogs.test` (`make test_companion`).
+See [docs/companion_catalogs.md](docs/companion_catalogs.md).
+
 ## Custom `COPY ... FROM` Formats
 
 An attached VGI catalog can advertise custom `COPY ... FROM` formats, turning a worker into
@@ -433,6 +482,8 @@ Catalogs may register additional settings at `ATTACH` time (e.g., `greeting`, `m
 | `oauth_refresh_token` | VARCHAR | (none) | Pre-seed OAuth refresh token for HTTP transport (skips interactive auth) |
 | `bearer_token` | VARCHAR | (none) | Static bearer token for HTTP transport (reused for the remote secret provider too). Throws on 401 (no recovery), unlike OAuth |
 | `secrets` | BOOLEAN | true | Auto-register the Orchard remote secret provider when the catalog advertises a secret-service URL. Set `false` to opt out for this catalog. See *Remote Secret Provider* |
+| `attach_companions` | BOOLEAN | true | Provision companion catalogs advertised via the catalog_attach `attach_catalogs` manifest (lakehouse federation). Set `false` to opt out. Guarded by a scheme allowlist + never-clobber conflict policy. See *Companion Catalogs* |
+| `attach_companion_secrets` | BOOLEAN | false | Opt IN to injecting a worker-named `secret_ref` credential into a companion's ATTACH options. Off by default: a worker chooses both the secret name and target host, so auto-injection would allow credential exfiltration. See *Companion Catalogs* |
 | `launcher_idle_timeout` | BIGINT seconds | (uses launcher default of 300) | Self-shutdown idle timeout for `launch:` LOCATIONs. Pinned per-LOCATION; conflicting subsequent ATTACHes throw `BinderException`. See [`docs/launcher-tutorial.md`](docs/launcher-tutorial.md). |
 | `launcher_state_dir` | VARCHAR (path) | OS-derived (`$XDG_RUNTIME_DIR/vgi-rpc/` etc.) | Override the launcher's state directory. Escape valve only — does NOT isolate workers from other DuckDB processes with the same `launch:` argv. See [`docs/launcher-options.md`](docs/launcher-options.md). |
 | `LOCATION` / `PATH` (struct form) | STRUCT | — | **Container LOCATIONs only.** `LOCATION` is dynamically typed: a VARCHAR is the plain address; a STRUCT bundles the address + container options — `{image (or location/path), runtime, connection, volumes, env, extra_args}` (`volumes`/`env` accept VARCHAR[] or comma-separated VARCHAR; `extra_args` VARCHAR is shell-tokenized, VARCHAR[] is verbatim). `connection` (`tcp`\|`http`\|`stdio`) selects a transparently-**shared** system-wide container (daemon rendezvous via deterministic `vgi-rpc-<hash>` name) vs the private per-process `stdio`; default auto from the image's `farm.query.vgi.transports` label (prefer tcp > http), else per-process. `tcp` (native vgi-rpc over a loopback-published port) and `http` are implemented; `unix` is rejected (AF_UNIX over docker bind mounts is unreliable). No separate options keyword, so nothing can shadow a worker attach option. See [`docs/container-transport.md`](docs/container-transport.md). |

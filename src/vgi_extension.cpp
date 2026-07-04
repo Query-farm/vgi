@@ -7,6 +7,7 @@
 
 #include <cerrno>
 #include <chrono>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <set>
@@ -19,6 +20,7 @@
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/database_manager.hpp"
+#include "duckdb/main/database_path_and_type.hpp"
 #include "duckdb/main/extension_helper.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
 #include "duckdb/parser/parsed_data/attach_info.hpp"
@@ -88,6 +90,7 @@
 #include "vgi_table_branches_function.hpp"
 #include "vgi_function_arguments_function.hpp"
 #include "vgi_clear_cache.hpp"
+#include "vgi_companion_catalogs.hpp"
 #include "vgi_github_functions.hpp"
 #include "vgi_worker_pool_functions.hpp"
 
@@ -1125,6 +1128,70 @@ public:
 		return out;
 	}
 
+	// --- Companion catalog registry (lakehouse federation) ---------------
+	// Tracks catalogs the VGI layer attached on behalf of a catalog_attach
+	// `attach_catalogs` manifest, so we never clobber a non-companion catalog
+	// and can refcount-share a companion across VGI catalogs.
+	enum class CompanionOutcome { ATTACHED, SHARED, CONFLICT };
+
+	// Resolve + (if needed) attach one companion, serialized against other
+	// companion ops. Returns:
+	//   SHARED   — an existing companion with the same target; refcount bumped,
+	//              no attach performed.
+	//   ATTACHED — freshly attached (attach_fn ran and did not throw).
+	//   CONFLICT — the alias is held by a different-target companion or by a
+	//              non-companion catalog; `conflict_target_out` describes the
+	//              holder. Nothing is attached; never clobbers.
+	// attach_fn performs the real DatabaseManager::AttachDatabase and throws on
+	// failure (registry stays unchanged in that case — it propagates out).
+	CompanionOutcome AcquireCompanion(const std::string &alias, const std::string &target,
+	                                  DatabaseManager &db_manager, const std::function<void()> &attach_fn,
+	                                  std::string &conflict_target_out) {
+		std::lock_guard<std::mutex> lock(companion_mutex_);
+		auto it = companion_catalogs_.find(alias);
+		if (it != companion_catalogs_.end()) {
+			if (it->second.target == target) {
+				// Share — but only if the companion is still actually attached.
+				// If a user detached it out-of-band, the registry is stale; drop
+				// the stale record and fall through to a fresh attach so branches
+				// can still resolve it.
+				if (db_manager.GetDatabase(alias)) {
+					it->second.refcount++;
+					return CompanionOutcome::SHARED;
+				}
+				companion_catalogs_.erase(it);
+			} else {
+				conflict_target_out = it->second.target;
+				return CompanionOutcome::CONFLICT;
+			}
+		}
+		if (db_manager.GetDatabase(alias)) {
+			conflict_target_out = "(existing non-companion catalog)";
+			return CompanionOutcome::CONFLICT;
+		}
+		attach_fn(); // throws → registry unchanged
+		companion_catalogs_[alias] = CompanionRecord {target, 1};
+		return CompanionOutcome::ATTACHED;
+	}
+
+	// Decrement refcounts for the aliases a detaching VGI catalog referenced;
+	// return those that hit zero (the caller detaches them from DuckDB).
+	std::vector<std::string> ReleaseCompanions(const std::vector<std::string> &aliases) {
+		std::lock_guard<std::mutex> lock(companion_mutex_);
+		std::vector<std::string> to_detach;
+		for (const auto &alias : aliases) {
+			auto it = companion_catalogs_.find(alias);
+			if (it == companion_catalogs_.end()) {
+				continue;
+			}
+			if (--it->second.refcount <= 0) {
+				to_detach.push_back(alias);
+				companion_catalogs_.erase(it);
+			}
+		}
+		return to_detach;
+	}
+
 private:
 	mutable std::mutex redact_mutex_;
 	std::unordered_map<std::string, case_insensitive_set_t> redact_keys_;
@@ -1134,7 +1201,82 @@ private:
 	int64_t next_secret_offset_ = 100;
 	mutable std::mutex copy_format_mutex_;
 	std::map<std::string, CopyFormatEntry> copy_formats_;
+
+	struct CompanionRecord {
+		std::string target; // canonical target key (raw manifest target string)
+		int64_t refcount = 0;
+	};
+	mutable std::mutex companion_mutex_;
+	std::map<std::string, CompanionRecord> companion_catalogs_;
 };
+
+namespace vgi {
+
+// Resolve a companion's secret_ref into ATTACH options for metadata connections
+// that need credentials at attach time (e.g. a postgres DSN). Data-file creds
+// (S3/GCS/HTTP) don't need this — they resolve through the Orchard catch-all
+// secret storage at query time.
+//
+// SECURITY: secret_ref is a WORKER-CHOSEN local secret name, and the companion
+// target host is also worker-chosen — so blindly injecting the secret would let
+// a malicious worker exfiltrate a user's credentials to an arbitrary host. This
+// is therefore FAIL-CLOSED: injection happens only when the user explicitly
+// opts in per-ATTACH (`attach_companion_secrets true`). Without opt-in a
+// non-empty secret_ref is skipped (logged); the companion falls back to the
+// Orchard catch-all / ambient credentials, or fails on its own — never exfil.
+static void InjectCompanionSecret(ClientContext &context, const std::string &secret_ref, bool allowed,
+                                  AttachOptions &options) {
+	if (secret_ref.empty()) {
+		return;
+	}
+	if (!allowed) {
+		VGI_LOG(context, "vgi.companion_secret.skipped",
+		        {{"secret_ref", secret_ref},
+		         {"reason", "attach_companion_secrets not enabled (opt-in required to inject a worker-named secret)"}});
+		return;
+	}
+	auto &secret_manager = SecretManager::Get(context);
+	auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
+	auto entry = secret_manager.GetSecretByName(transaction, secret_ref);
+	if (!entry || !entry->secret) {
+		throw BinderException("VGI companion secret_ref '%s' did not resolve to a secret", secret_ref);
+	}
+	const auto *kv = dynamic_cast<const KeyValueSecret *>(entry->secret.get());
+	if (!kv) {
+		throw BinderException("VGI companion secret_ref '%s' is not a key-value secret", secret_ref);
+	}
+	// Don't overwrite an option the worker set explicitly.
+	for (const auto &e : kv->secret_map) {
+		if (options.options.find(e.first) == options.options.end()) {
+			options.options[e.first] = e.second;
+		}
+	}
+}
+
+void ReleaseCompanionCatalogs(ClientContext &context, const std::vector<std::string> &aliases) {
+	if (aliases.empty()) {
+		return;
+	}
+	auto *vgi_ext = VgiStorageExtension::Find(*context.db);
+	if (!vgi_ext) {
+		return;
+	}
+	auto to_detach = vgi_ext->ReleaseCompanions(aliases);
+	auto &db_manager = DatabaseManager::Get(context);
+	for (const auto &alias : to_detach) {
+		// Best-effort: DetachDatabase throws on the default-DB guard
+		// (`USE companion; DETACH vgi_catalog`) — a rare edge case that must not
+		// abort the parent detach or leak the exception out of OnDetach.
+		try {
+			db_manager.DetachDatabase(context, alias, OnEntryNotFound::RETURN_NULL);
+			VGI_LOG(context, "vgi.companion_detach", {{"alias", alias}});
+		} catch (const std::exception &e) {
+			VGI_LOG(context, "vgi.companion_detach.failed", {{"alias", alias}, {"error", e.what()}});
+		}
+	}
+}
+
+} // namespace vgi
 
 // Create function for VGI secrets — builds a KeyValueSecret from config options.
 // All named parameters from CREATE SECRET are copied into the secret's key-value map.
@@ -1278,6 +1420,17 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	// an HTTP catalog whose attach response advertises a secret-service URL gets
 	// a VgiRemoteSecretStorage auto-registered (reusing this catalog's identity).
 	bool secrets_enabled = true;
+	// Opt out of provisioning companion catalogs advertised via the
+	// catalog_attach `attach_catalogs` manifest (lakehouse federation). Default
+	// on: attach is largely lazy and guarded by a scheme allowlist + a
+	// never-clobber conflict policy. Set `attach_companions false` to disable.
+	bool attach_companions_enabled = true;
+	// Opt IN to injecting a worker-named secret (`secret_ref`) into a companion's
+	// ATTACH options. Default OFF: a worker chooses both the secret name and the
+	// target host, so auto-injecting would let a malicious worker exfiltrate the
+	// user's credentials to an arbitrary host. Data-file creds still resolve via
+	// the Orchard catch-all without this.
+	bool attach_companion_secrets = false;
 	// Unknown-to-the-extension options are forwarded to the worker as
 	// attach-time options after validation against the catalog's declared
 	// AttachOptionSpec list (fetched via InvokeCatalogs when present).
@@ -1307,6 +1460,10 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 			use_pool = value.DefaultCastAs(LogicalType::BOOLEAN).GetValue<bool>();
 		} else if (lower_name == "secrets") {
 			secrets_enabled = value.DefaultCastAs(LogicalType::BOOLEAN).GetValue<bool>();
+		} else if (lower_name == "attach_companions") {
+			attach_companions_enabled = value.DefaultCastAs(LogicalType::BOOLEAN).GetValue<bool>();
+		} else if (lower_name == "attach_companion_secrets") {
+			attach_companion_secrets = value.DefaultCastAs(LogicalType::BOOLEAN).GetValue<bool>();
 		} else if (lower_name == "pool_max") {
 			pool_max_override = value.DefaultCastAs(LogicalType::BIGINT).GetValue<int64_t>();
 		} else if (lower_name == "pool_timeout") {
@@ -2046,8 +2203,129 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 		}
 	}
 
-	return make_uniq<VgiCatalog>(db, name, options.access_mode, std::move(attach_params),
-	                              std::move(attach_result_ptr), eager_thresholds);
+	// Capture the companion manifest before attach_result_ptr is moved into the
+	// catalog below.
+	std::vector<vgi::VgiAttachCatalogInfo> companion_manifest;
+	if (attach_companions_enabled && attach_result_ptr) {
+		companion_manifest = attach_result_ptr->attach_catalogs;
+	}
+
+	auto vgi_catalog = make_uniq<VgiCatalog>(db, name, options.access_mode, std::move(attach_params),
+	                                          std::move(attach_result_ptr), eager_thresholds);
+
+	// Provision companion catalogs advertised via the catalog_attach
+	// `attach_catalogs` manifest (lakehouse federation). Done eagerly here,
+	// inside the storage attach callback: reentrancy-safe because DuckDB's
+	// databases_lock is NOT held across CreateAttachedDatabase (which invoked
+	// us) — a companion registers before this parent (FinalizeAttach).
+	//
+	// Trust: opt-out (`attach_companions false`) + a scheme allowlist +
+	// AcquireCompanion's never-clobber conflict policy (it will not replace a
+	// catalog the VGI layer did not itself create). The secret provider was
+	// registered above, so a companion's credential lookups resolve through the
+	// Orchard catch-all automatically (see docs/companion_catalogs.md).
+	if (attach_companions_enabled && !companion_manifest.empty()) {
+		auto *vgi_ext = VgiStorageExtension::Find(*context.db);
+		if (vgi_ext) {
+			static const std::set<std::string> kAllowedCompanionSchemes = {
+			    "ducklake", "iceberg", "postgres", "mysql", "duckdb", "sqlite"};
+			auto &db_manager = DatabaseManager::Get(context);
+			auto &cfg = DBConfig::GetConfig(context);
+			std::vector<std::string> referenced;
+			// Partial-failure safety: a mid-loop throw (scheme reject, required
+			// conflict/failure) must not leak the companions already attached in
+			// this ATTACH — release them (registry refcount + detach) before the
+			// exception unwinds out of VgiCatalogAttach (whose catalog is never
+			// returned, so OnDetach would never run).
+			try {
+			for (const auto &c : companion_manifest) {
+				// Scheme allowlist (defense-in-depth): the scheme is the explicit
+				// db_type or the target's prefix. Reject bare local-file paths
+				// and unknown schemes.
+				std::string scheme = StringUtil::Lower(c.db_type);
+				if (scheme.empty()) {
+					auto colon = c.target.find(':');
+					if (colon != std::string::npos) {
+						scheme = StringUtil::Lower(c.target.substr(0, colon));
+					}
+				}
+				if (scheme.empty() || kAllowedCompanionSchemes.find(scheme) == kAllowedCompanionSchemes.end()) {
+					throw BinderException(
+					    "VGI catalog '%s' advertised companion '%s' with target '%s' whose scheme '%s' is not "
+					    "permitted (allowed: ducklake, iceberg, postgres, mysql, duckdb, sqlite).",
+					    catalog_name, c.alias, c.target, scheme);
+				}
+
+				auto handle_failure = [&](const std::string &reason) {
+					if (c.required) {
+						throw BinderException(
+						    "VGI catalog '%s' could not attach required companion '%s' (target '%s'): %s",
+						    catalog_name, c.alias, c.target, reason);
+					}
+					VGI_LOG(context, "vgi.companion_attach.skipped",
+					        {{"alias", c.alias}, {"target", c.target}, {"reason", reason}});
+				};
+
+				std::string conflict_target;
+				VgiStorageExtension::CompanionOutcome outcome;
+				try {
+					outcome = vgi_ext->AcquireCompanion(
+					    c.alias, c.target, db_manager,
+					    [&]() {
+						    AttachInfo cinfo;
+						    cinfo.name = c.alias;
+						    cinfo.path = c.target;
+						    cinfo.on_conflict = OnCreateConflict::ERROR_ON_CONFLICT; // never clobber
+						    AttachOptions coptions(cfg.options);
+						    coptions.db_type = c.db_type;
+						    if (coptions.db_type.empty()) {
+							    DBPathAndType::ExtractExtensionPrefix(cinfo.path, coptions.db_type);
+						    }
+						    // Companions attach at their natural (config/worker-specified)
+						    // access mode — writable federation (postgres, a writable
+						    // DuckLake, a local duckdb/sqlite file) is supported. Note
+						    // the tradeoff: a bare `sqlite`/`duckdb` target that doesn't
+						    // exist is CREATED, so a malicious worker can make the client
+						    // create empty db files at writable paths (low impact — no
+						    // data write on attach, existing non-db files error). Only
+						    // attach workers you trust; the scheme allowlist +
+						    // never-clobber policy remain the primary guards.
+						    if (c.hidden) {
+							    coptions.visibility = AttachVisibility::HIDDEN;
+						    }
+						    for (const auto &kv : c.options) {
+							    coptions.options[kv.first] = Value(kv.second);
+						    }
+						    // Orchard: pre-resolve secret_ref into ATTACH options for
+						    // metadata connections that need creds at attach time.
+						    // Fail-closed — only when the user opted in (see the flag).
+						    vgi::InjectCompanionSecret(context, c.secret_ref, attach_companion_secrets, coptions);
+						    db_manager.AttachDatabase(context, cinfo, coptions);
+					    },
+					    conflict_target);
+				} catch (const std::exception &e) {
+					handle_failure(e.what());
+					continue;
+				}
+				if (outcome == VgiStorageExtension::CompanionOutcome::CONFLICT) {
+					handle_failure("alias already in use by " + conflict_target + " (not replaced)");
+					continue;
+				}
+				referenced.push_back(c.alias);
+				VGI_LOG(context, "vgi.companion_attach",
+				        {{"alias", c.alias},
+				         {"target", c.target},
+				         {"shared", outcome == VgiStorageExtension::CompanionOutcome::SHARED ? "true" : "false"}});
+			}
+			} catch (...) {
+				vgi::ReleaseCompanionCatalogs(context, referenced);
+				throw;
+			}
+			vgi_catalog->SetCompanionCatalogs(std::move(referenced));
+		}
+	}
+
+	return vgi_catalog;
 }
 
 // Create transaction manager for VGI catalog
