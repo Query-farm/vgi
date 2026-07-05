@@ -1174,7 +1174,7 @@ public:
 		return CompanionOutcome::ATTACHED;
 	}
 
-	// One companion catalog for the vgi_companions() diagnostic.
+	// One companion catalog for the vgi_companion_catalogs() diagnostic.
 	struct CompanionSnapshot {
 		std::string alias;
 		std::string target;
@@ -1183,7 +1183,7 @@ public:
 		int64_t refcount = 0;
 	};
 
-	// Snapshot the companion registry (for vgi_companions()).
+	// Snapshot the companion registry (for vgi_companion_catalogs()).
 	std::vector<CompanionSnapshot> AllCompanions() const {
 		std::lock_guard<std::mutex> lock(companion_mutex_);
 		std::vector<CompanionSnapshot> out;
@@ -1226,7 +1226,7 @@ private:
 	struct CompanionRecord {
 		std::string target; // canonical target key (raw manifest target string)
 		int64_t refcount = 0;
-		std::string db_type; // resolved/advertised db_type (for the vgi_companions() diagnostic)
+		std::string db_type; // resolved/advertised db_type (for the vgi_companion_catalogs() diagnostic)
 		bool hidden = false; // attached hidden (invisible to duckdb_databases())
 	};
 	mutable std::mutex companion_mutex_;
@@ -2698,7 +2698,7 @@ static void VgiSecretProvidersScan(ClientContext &context, TableFunctionInput &d
 	output.SetCardinality(row);
 }
 
-// vgi_companions(): one row per companion catalog attached by the VGI layer
+// vgi_companion_catalogs(): one row per companion catalog attached by the VGI layer
 // (lakehouse federation). Surfaces hidden companions that are invisible to
 // duckdb_databases().
 struct VgiCompanionsData : public TableFunctionData {
@@ -3292,13 +3292,13 @@ static void LoadInternal(ExtensionLoader &loader) {
 		    {}, {}, {"SELECT * FROM vgi_secret_providers();"}));
 		loader.RegisterFunction(std::move(providers_info));
 
-		TableFunction companions_func("vgi_companions", {}, VgiCompanionsScan, VgiCompanionsBind);
+		TableFunction companions_func("vgi_companion_catalogs", {}, VgiCompanionsScan, VgiCompanionsBind);
 		CreateTableFunctionInfo companions_info(companions_func);
 		companions_info.descriptions.push_back(vgi::MakeFunctionDescription(
 		    "List the companion catalogs attached by VGI catalogs (lakehouse federation), one row per companion "
 		    "with its catalog_name (alias), target, db_type, hidden flag, and refcount (how many attached VGI "
 		    "catalogs share it). Surfaces `hidden` companions that are invisible to duckdb_databases().",
-		    {}, {}, {"SELECT * FROM vgi_companions();"}));
+		    {}, {}, {"SELECT * FROM vgi_companion_catalogs();"}));
 		loader.RegisterFunction(std::move(companions_info));
 
 		TableFunction flush_func("vgi_secret_provider_flush", {}, VgiSecretFlushScan, VgiSecretFlushBind);

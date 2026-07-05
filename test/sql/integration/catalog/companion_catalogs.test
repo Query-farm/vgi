@@ -42,15 +42,15 @@ SELECT count(*) FROM duckdb_databases() WHERE database_name = 'vgi_companion';
 ----
 1
 
-# vgi_companions() introspection: the companion is listed with its db_type,
+# vgi_companion_catalogs() introspection: the companion is listed with its db_type,
 # hidden flag, refcount, and a ducklake: target.
 query TII
-SELECT db_type, hidden, refcount FROM vgi_companions() WHERE catalog_name = 'vgi_companion';
+SELECT db_type, hidden, refcount FROM vgi_companion_catalogs() WHERE catalog_name = 'vgi_companion';
 ----
 ducklake	false	1
 
 query I
-SELECT count(*) FROM vgi_companions()
+SELECT count(*) FROM vgi_companion_catalogs()
 WHERE catalog_name = 'vgi_companion' AND target LIKE 'ducklake:sqlite:%';
 ----
 1
@@ -104,7 +104,7 @@ SELECT count(*) FROM duckdb_databases() WHERE database_name = 'vgi_companion';
 
 # ...and it's gone from the diagnostic too.
 query I
-SELECT count(*) FROM vgi_companions();
+SELECT count(*) FROM vgi_companion_catalogs();
 ----
 0
 

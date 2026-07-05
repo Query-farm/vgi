@@ -1,6 +1,6 @@
 # name: test/sql/integration/catalog/companion_hidden.test
 # description: A hidden companion (AttachVisibility::HIDDEN) is invisible to
-#              duckdb_databases() but IS enumerable via vgi_companions() — closes
+#              duckdb_databases() but IS enumerable via vgi_companion_catalogs() — closes
 #              the concealment gap the security review flagged. Run via
 #              test/run_companion_integration.sh with VGI_TEST_COMPANION_HIDDEN=1.
 # group: [vgi_integration_catalog]
@@ -31,9 +31,9 @@ SELECT count(*) FROM duckdb_databases() WHERE database_name = 'vgi_companion';
 ----
 0
 
-# ...but IS enumerable via vgi_companions(), flagged hidden.
+# ...but IS enumerable via vgi_companion_catalogs(), flagged hidden.
 query TI
-SELECT db_type, refcount FROM vgi_companions() WHERE catalog_name = 'vgi_companion' AND hidden;
+SELECT db_type, refcount FROM vgi_companion_catalogs() WHERE catalog_name = 'vgi_companion' AND hidden;
 ----
 ducklake	1
 

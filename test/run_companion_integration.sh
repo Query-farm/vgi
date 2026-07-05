@@ -56,7 +56,7 @@ VGI_TEST_WORKER="uv run --project ${VGI_PYTHON_DIR} vgi-fixture-companion-worker
 	VGI_TEST_COMPANION_POISON=1 \
 	"$UNITTEST" "test/sql/integration/catalog/companion_partial_failure.test"
 
-# Hidden companion: a third run asserting vgi_companions() surfaces a companion
+# Hidden companion: a third run asserting vgi_companion_catalogs() surfaces a companion
 # that duckdb_databases() hides.
 echo "Running hidden-companion test (VGI_TEST_COMPANION_HIDDEN=1)"
 VGI_TEST_WORKER="uv run --project ${VGI_PYTHON_DIR} vgi-fixture-companion-worker" \
