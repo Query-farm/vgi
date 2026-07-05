@@ -5,9 +5,19 @@
 #   the fixture worker's `format_number` overloads, whose `precision` const parameter
 #   declares a numeric range (ge=0, le=10) via the modern ConstParam API — and on
 #   `multiply`, which declares no constraints (the absence contract).
+#
+#   The arg_default/arg_choices/arg_range/arg_pattern columns are new to
+#   vgi_function_arguments(), so this test needs a haybarn built from a source
+#   tree that includes them. It is gated by `require-env VGI_TEST_ARG_CONSTRAINTS`
+#   (set only by `make test_arg_constraints`, which runs the freshly-built local
+#   binary) so it skips cleanly in the vgi-python integration suite, which drives
+#   an older *pinned* published haybarn binary that lacks the columns. Drop the
+#   gate once the pinned HAYBARN_RELEASE in vgi-python advances past this change.
 # group: [vgi_integration]
 
 require-env VGI_TEST_WORKER
+
+require-env VGI_TEST_ARG_CONSTRAINTS
 
 require vgi
 
