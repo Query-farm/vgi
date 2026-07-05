@@ -70,6 +70,23 @@ constexpr const char *VGI_CONST_TRUE_VALUE = "true";
 constexpr const char *VGI_DOC_METADATA_KEY = "vgi_doc";
 
 // ----------------------------------------------------------------------------
+// Per-Argument Constraint Metadata (agent discovery)
+// ----------------------------------------------------------------------------
+// Arrow field metadata keys carrying per-argument constraints, surfaced through
+// vgi_function_arguments(). All presence-only and value-encoded as UTF-8 so the
+// column type stays uniform regardless of the argument's value type:
+//   vgi_default — JSON scalar (the argument's default value)
+//   vgi_choices — JSON array (the closed set of allowed values)
+//   vgi_range   — interval notation built from ge/le/gt/lt (e.g. "[0, 100]")
+//   vgi_pattern — raw regex the value must match
+// Kept byte-for-byte in sync with the writer in vgi-python
+// (vgi/argument_spec.py).
+constexpr const char *VGI_DEFAULT_METADATA_KEY = "vgi_default";
+constexpr const char *VGI_CHOICES_METADATA_KEY = "vgi_choices";
+constexpr const char *VGI_RANGE_METADATA_KEY = "vgi_range";
+constexpr const char *VGI_PATTERN_METADATA_KEY = "vgi_pattern";
+
+// ----------------------------------------------------------------------------
 // Row ID Metadata
 // ----------------------------------------------------------------------------
 // Arrow field metadata key indicating the field is the table's row identifier.

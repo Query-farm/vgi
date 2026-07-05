@@ -1,0 +1,55 @@
+# name: test/sql/integration/catalog/function_arguments_constraints.test
+# description: vgi_function_arguments() surfaces per-argument constraint metadata for
+#   agent discovery — arg_default (JSON scalar), arg_choices (JSON array), arg_range
+#   (interval notation built from ge/le/gt/lt), and arg_pattern (regex). Anchored on
+#   the fixture worker's `format_number` overloads, whose `precision` const parameter
+#   declares a numeric range (ge=0, le=10) via the modern ConstParam API — and on
+#   `multiply`, which declares no constraints (the absence contract).
+# group: [vgi_integration]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# precision (a const param, shared across the format_number overloads) declares a
+# numeric range → surfaces as interval notation in arg_range. DISTINCT collapses the
+# identical rows the overloads contribute.
+query TT
+SELECT DISTINCT arg_name, arg_range
+FROM vgi_function_arguments()
+WHERE catalog_name = 'example' AND function_name = 'format_number' AND arg_name = 'precision';
+----
+precision	[0, 10]
+
+# The unconstrained params of format_number carry no range (value across all
+# overloads, prefix on the full overload).
+query TT
+SELECT DISTINCT arg_name, arg_range
+FROM vgi_function_arguments()
+WHERE catalog_name = 'example' AND function_name = 'format_number' AND arg_name <> 'precision'
+ORDER BY arg_name;
+----
+prefix	NULL
+value	NULL
+
+# precision declares only a range — its choices / pattern / default stay NULL.
+query TTTT
+SELECT DISTINCT arg_name, arg_choices, arg_pattern, arg_default
+FROM vgi_function_arguments()
+WHERE catalog_name = 'example' AND function_name = 'format_number' AND arg_name = 'precision';
+----
+precision	NULL	NULL	NULL
+
+# multiply declares no constraints — every constraint column is NULL (the absence
+# contract: additive columns default to SQL NULL on functions that don't use them).
+query TTTTT
+SELECT arg_name, arg_default, arg_choices, arg_range, arg_pattern
+FROM vgi_function_arguments()
+WHERE catalog_name = 'example' AND function_name = 'multiply'
+ORDER BY arg_position;
+----
+value	NULL	NULL	NULL	NULL
+factor	NULL	NULL	NULL	NULL

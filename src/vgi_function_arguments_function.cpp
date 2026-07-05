@@ -55,6 +55,15 @@ struct ArgRow {
 	bool is_varargs;
 	bool is_table_input;
 	bool is_any_type;
+	// Per-argument constraint metadata (agent discovery); empty -> NULL.
+	std::string arg_default; // presence-only vgi_default (JSON scalar text)
+	bool arg_default_present;
+	std::string arg_choices; // presence-only vgi_choices (JSON array text)
+	bool arg_choices_present;
+	std::string arg_range; // presence-only vgi_range (interval notation, e.g. "[0, 100]")
+	bool arg_range_present;
+	std::string arg_pattern; // presence-only vgi_pattern (regex)
+	bool arg_pattern_present;
 };
 
 struct VgiFunctionArgumentsData : public TableFunctionData {
@@ -105,6 +114,12 @@ static void EmitArgsFromSchema(ClientContext &context, const std::string &catalo
 		const bool is_any_type = type_marker == VGI_TYPE_ANY_VALUE;
 		const bool is_const = MetadataValue(md, VGI_CONST_METADATA_KEY) == VGI_CONST_TRUE_VALUE;
 		const auto doc = MetadataValue(md, VGI_DOC_METADATA_KEY);
+		// Constraint metadata: value-encoded UTF-8, empty == absent (JSON/interval
+		// encodings are never empty), so the emptiness test is a safe presence check.
+		const auto arg_default = MetadataValue(md, VGI_DEFAULT_METADATA_KEY);
+		const auto arg_choices = MetadataValue(md, VGI_CHOICES_METADATA_KEY);
+		const auto arg_range = MetadataValue(md, VGI_RANGE_METADATA_KEY);
+		const auto arg_pattern = MetadataValue(md, VGI_PATTERN_METADATA_KEY);
 
 		// Type display: ANY for any-typed args, TABLE for table inputs, else
 		// the resolved DuckDB type.
@@ -143,6 +158,14 @@ static void EmitArgsFromSchema(ClientContext &context, const std::string &catalo
 		row.is_varargs = is_varargs;
 		row.is_table_input = is_table_input;
 		row.is_any_type = is_any_type;
+		row.arg_default = arg_default;
+		row.arg_default_present = !arg_default.empty();
+		row.arg_choices = arg_choices;
+		row.arg_choices_present = !arg_choices.empty();
+		row.arg_range = arg_range;
+		row.arg_range_present = !arg_range.empty();
+		row.arg_pattern = arg_pattern;
+		row.arg_pattern_present = !arg_pattern.empty();
 		out.push_back(std::move(row));
 	}
 }
@@ -184,10 +207,15 @@ static unique_ptr<FunctionData> VgiFunctionArgumentsBind(ClientContext &context,
 	    LogicalType::BOOLEAN, // is_varargs
 	    LogicalType::BOOLEAN, // is_table_input
 	    LogicalType::BOOLEAN, // is_any_type
+	    LogicalType::VARCHAR, // arg_default (NULL when unconstrained; JSON scalar)
+	    LogicalType::VARCHAR, // arg_choices (NULL when unconstrained; JSON array)
+	    LogicalType::VARCHAR, // arg_range (NULL when unbounded; interval notation)
+	    LogicalType::VARCHAR, // arg_pattern (NULL when no pattern; regex)
 	};
-	names = {"catalog_name", "schema_name",   "function_name", "function_type", "arg_position",
-	         "field_index",  "arg_name",      "arg_type",      "arg_description", "is_named",
-	         "is_positional", "is_const",     "is_varargs",    "is_table_input", "is_any_type"};
+	names = {"catalog_name",  "schema_name", "function_name", "function_type",   "arg_position",
+	         "field_index",   "arg_name",    "arg_type",      "arg_description", "is_named",
+	         "is_positional", "is_const",    "is_varargs",    "is_table_input",  "is_any_type",
+	         "arg_default",   "arg_choices", "arg_range",     "arg_pattern"};
 
 	auto data = make_uniq<VgiFunctionArgumentsData>();
 
@@ -213,7 +241,7 @@ static unique_ptr<FunctionData> VgiFunctionArgumentsBind(ClientContext &context,
 			const auto schema_name = schema.name;
 			for (const char *request_type : kFunctionTypeRequests) {
 				try {
-					CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_opaque_data, transaction_opaque};
+					CatalogRpcContext rpc_ctx {attach_params, attach_result->attach_opaque_data, transaction_opaque};
 					rpc_ctx.entity_kind = "schema";
 					rpc_ctx.entity_qualifier = schema_name;
 					auto function_list =
@@ -237,7 +265,7 @@ static unique_ptr<FunctionData> VgiFunctionArgumentsBind(ClientContext &context,
 			static const char *kMacroTypeRequests[] = {"SCALAR_MACRO", "TABLE_MACRO"};
 			for (const char *macro_type : kMacroTypeRequests) {
 				try {
-					CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_opaque_data, transaction_opaque};
+					CatalogRpcContext rpc_ctx {attach_params, attach_result->attach_opaque_data, transaction_opaque};
 					rpc_ctx.entity_kind = "schema";
 					rpc_ctx.entity_qualifier = schema_name;
 					auto macro_list = InvokeCatalogSchemaContentsMacros(rpc_ctx, schema_name, macro_type, context);
@@ -278,6 +306,10 @@ static void VgiFunctionArgumentsScan(ClientContext &context, TableFunctionInput 
 		output.SetValue(12, count, Value::BOOLEAN(row.is_varargs));
 		output.SetValue(13, count, Value::BOOLEAN(row.is_table_input));
 		output.SetValue(14, count, Value::BOOLEAN(row.is_any_type));
+		output.SetValue(15, count, row.arg_default_present ? Value(row.arg_default) : Value());
+		output.SetValue(16, count, row.arg_choices_present ? Value(row.arg_choices) : Value());
+		output.SetValue(17, count, row.arg_range_present ? Value(row.arg_range) : Value());
+		output.SetValue(18, count, row.arg_pattern_present ? Value(row.arg_pattern) : Value());
 		count++;
 	}
 	output.SetCardinality(count);
@@ -292,12 +324,16 @@ void RegisterVgiFunctionArgumentsFunction(ExtensionLoader &loader) {
 	    "Inspect the arguments of every function and macro exposed by every attached VGI catalog, one row per "
 	    "argument. function_type is scalar/table/aggregate for functions and scalar_macro/table_macro for macros. "
 	    "Surfaces per-argument detail that duckdb_functions() flattens away: named-vs-positional, const, "
-	    "varargs, table-input, any-type, and the per-argument description (vgi_doc). Filter with "
-	    "WHERE catalog_name = '...'. Reports each catalog's current data version; does not honor time travel.",
+	    "varargs, table-input, any-type, the per-argument description (vgi_doc), and discovery-facing "
+	    "constraints (arg_default, arg_choices, arg_range, arg_pattern) so an agent can read valid inputs "
+	    "before calling. Filter with WHERE catalog_name = '...'. Reports each catalog's current data "
+	    "version; does not honor time travel.",
 	    {}, {},
 	    {"SELECT * FROM vgi_function_arguments();",
 	     "SELECT arg_name, arg_type, is_const, arg_description FROM vgi_function_arguments() "
-	     "WHERE catalog_name = 'example' AND function_name = 'multiply' ORDER BY arg_position;"}));
+	     "WHERE catalog_name = 'example' AND function_name = 'multiply' ORDER BY arg_position;",
+	     "SELECT arg_name, arg_range, arg_choices, arg_pattern FROM vgi_function_arguments() "
+	     "WHERE catalog_name = 'example' AND function_name = 'format_number' ORDER BY field_index;"}));
 	loader.RegisterFunction(std::move(info));
 }
 
