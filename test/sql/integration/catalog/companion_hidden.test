@@ -1,0 +1,44 @@
+# name: test/sql/integration/catalog/companion_hidden.test
+# description: A hidden companion (AttachVisibility::HIDDEN) is invisible to
+#              duckdb_databases() but IS enumerable via vgi_companions() — closes
+#              the concealment gap the security review flagged. Run via
+#              test/run_companion_integration.sh with VGI_TEST_COMPANION_HIDDEN=1.
+# group: [vgi_integration_catalog]
+
+require-env VGI_TEST_WORKER
+
+require-env VGI_TEST_COMPANION_TARGET
+
+require-env VGI_TEST_COMPANION_HIDDEN
+
+require vgi
+
+statement ok
+LOAD ducklake;
+
+statement ok
+LOAD sqlite_scanner;
+
+statement ok
+LOAD parquet;
+
+statement ok
+ATTACH 'companion' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# Hidden companion: NOT listed by duckdb_databases()...
+query I
+SELECT count(*) FROM duckdb_databases() WHERE database_name = 'vgi_companion';
+----
+0
+
+# ...but IS enumerable via vgi_companions(), flagged hidden.
+query TI
+SELECT db_type, refcount FROM vgi_companions() WHERE catalog_name = 'vgi_companion' AND hidden;
+----
+ducklake	1
+
+# The hidden companion is still resolvable by qualified name (attach isn't lost).
+query I
+SELECT count(*) FROM ex.data.hot_cold;
+----
+5

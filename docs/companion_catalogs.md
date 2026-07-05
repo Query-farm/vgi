@@ -126,6 +126,13 @@ fine for a local SQLite+parquet DuckLake.
 - Companion attach/detach and skips are logged via `VGI_LOG`
   (`vgi.companion_attach`, `vgi.companion_attach.skipped`,
   `vgi.companion_detach`) — surface with `VGI_STDERR_LOG=1` or `duckdb_logs`.
+- **`vgi_companions()`** lists every attached companion — `catalog_name` (alias),
+  `target`, `db_type`, `hidden`, `refcount`. This is the way to enumerate a
+  **hidden** companion, which `duckdb_databases()` deliberately omits:
+
+  ```sql
+  SELECT * FROM vgi_companions();
+  ```
 
 ## Requirements & gotchas
 

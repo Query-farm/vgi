@@ -1,0 +1,105 @@
+# name: test/sql/integration/catalog/multi_branch_iceberg.test
+# description: Iceberg cold-tier multi-branch: one VGI worker arm + one native
+#              iceberg_scan arm under the same logical table. iceberg_scan is
+#              the flagship lakehouse example — a first-class cold-tier branch,
+#              bound through the same function-branch path as read_parquet, with
+#              no tunneling through the worker pipe. Gated by
+#              `require-env VGI_TEST_ICEBERG` (set only by the runner) so it
+#              skips cleanly in the bare subprocess suite, and run under
+#              test/run_iceberg_integration.sh (INSTALL iceberg + example worker).
+# group: [vgi_integration_catalog]
+
+require-env VGI_TEST_WORKER
+
+require-env VGI_TEST_ICEBERG
+
+require vgi
+
+require parquet
+
+require httpfs
+
+# iceberg is a community extension not statically linked into the unittest
+# binary, so `require iceberg` can't autoload it — load it explicitly. The
+# runner (run_iceberg_integration.sh) has already INSTALLed it and only sets
+# VGI_TEST_ICEBERG when it's available, so the bare suite skips this file.
+statement ok
+LOAD iceberg;
+
+# ============================================================================
+# Setup: create the iceberg table the fixture references. The fixture's
+# table_scan_branches_get returns iceberg_scan('/tmp/vgi_iceberg_branch') as
+# branch 1, so this table dir must exist before any scan-bind happens. Cast to
+# BIGINT so iceberg stores `long`, matching the canonical n=int64 (no cast arm).
+# ============================================================================
+
+statement ok
+COPY (SELECT range::BIGINT AS n FROM range(50, 100))
+    TO '/tmp/vgi_iceberg_branch' (FORMAT iceberg);
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# Union semantics: VGI sequence(50) produces 0..49, iceberg produces 50..99.
+# No overlap; union is 100 distinct rows spanning the full range.
+# ============================================================================
+
+query I
+SELECT count(*) FROM example.data.multi_branch_iceberg;
+----
+100
+
+query II
+SELECT min(n), max(n) FROM example.data.multi_branch_iceberg;
+----
+0	99
+
+# Distinct count = 100 (each value appears exactly once across the union).
+query II
+SELECT count(DISTINCT n), count(*) FROM example.data.multi_branch_iceberg;
+----
+100	100
+
+# ============================================================================
+# Diagnostic surfaces the heterogeneous shape — sequence + iceberg_scan under
+# the same logical table.
+# ============================================================================
+
+query III
+SELECT branch_index, function_name, branch_filter
+FROM vgi_table_branches()
+WHERE table_name = 'multi_branch_iceberg'
+ORDER BY branch_index;
+----
+0	sequence	NULL
+1	iceberg_scan	NULL
+
+# ============================================================================
+# Filter pushdown into the iceberg arm: `WHERE n >= 60` reaches iceberg_scan.
+# Only rows in [60, 99] surface from the iceberg arm; the VGI arm contributes
+# [0, 49] minus the filter (empty after n >= 60). Total = 40 rows (60..99).
+# ============================================================================
+
+query III
+SELECT count(*), min(n), max(n)
+FROM example.data.multi_branch_iceberg
+WHERE n >= 60;
+----
+40	60	99
+
+# Filter `n < 20` cuts the iceberg arm to zero (iceberg has only n >= 50);
+# only the VGI arm contributes [0, 19]. Total = 20 rows.
+query III
+SELECT count(*), min(n), max(n)
+FROM example.data.multi_branch_iceberg
+WHERE n < 20;
+----
+20	0	19
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+SET vgi_multi_branch_scans = true;

@@ -38,6 +38,7 @@ late_mat_nulls	Late-materialization table with NULLs in the ord column
 multi_branch_empty	Multi-branch: empty branches list — used by multi_branch_empty_branches.test
 multi_branch_filtered_numbers	Multi-branch with complementary branch_filters — exercises pruning
 multi_branch_hetero	Multi-branch: sequence(50) + read_parquet — used by multi_branch_heterogeneous.test
+multi_branch_iceberg	Multi-branch: sequence(50) + iceberg_scan — used by multi_branch_iceberg.test
 multi_branch_nopushdown	Multi-branch: VGI + read_csv — used by multi_branch_pushdown_incapable.test
 multi_branch_numbers	Multi-branch: UNION of sequence(50) + sequence(50) — used by multi_branch_scan.test
 multi_branch_recon	Multi-branch: column reconciliation — used by multi_branch_reconciliation.test

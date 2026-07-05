@@ -1145,8 +1145,8 @@ public:
 	// attach_fn performs the real DatabaseManager::AttachDatabase and throws on
 	// failure (registry stays unchanged in that case — it propagates out).
 	CompanionOutcome AcquireCompanion(const std::string &alias, const std::string &target,
-	                                  DatabaseManager &db_manager, const std::function<void()> &attach_fn,
-	                                  std::string &conflict_target_out) {
+	                                  const std::string &db_type, bool hidden, DatabaseManager &db_manager,
+	                                  const std::function<void()> &attach_fn, std::string &conflict_target_out) {
 		std::lock_guard<std::mutex> lock(companion_mutex_);
 		auto it = companion_catalogs_.find(alias);
 		if (it != companion_catalogs_.end()) {
@@ -1170,8 +1170,29 @@ public:
 			return CompanionOutcome::CONFLICT;
 		}
 		attach_fn(); // throws → registry unchanged
-		companion_catalogs_[alias] = CompanionRecord {target, 1};
+		companion_catalogs_[alias] = CompanionRecord {target, 1, db_type, hidden};
 		return CompanionOutcome::ATTACHED;
+	}
+
+	// One companion catalog for the vgi_companions() diagnostic.
+	struct CompanionSnapshot {
+		std::string alias;
+		std::string target;
+		std::string db_type;
+		bool hidden = false;
+		int64_t refcount = 0;
+	};
+
+	// Snapshot the companion registry (for vgi_companions()).
+	std::vector<CompanionSnapshot> AllCompanions() const {
+		std::lock_guard<std::mutex> lock(companion_mutex_);
+		std::vector<CompanionSnapshot> out;
+		out.reserve(companion_catalogs_.size());
+		for (const auto &kv : companion_catalogs_) {
+			out.push_back(CompanionSnapshot {kv.first, kv.second.target, kv.second.db_type, kv.second.hidden,
+			                                 kv.second.refcount});
+		}
+		return out;
 	}
 
 	// Decrement refcounts for the aliases a detaching VGI catalog referenced;
@@ -1205,6 +1226,8 @@ private:
 	struct CompanionRecord {
 		std::string target; // canonical target key (raw manifest target string)
 		int64_t refcount = 0;
+		std::string db_type; // resolved/advertised db_type (for the vgi_companions() diagnostic)
+		bool hidden = false; // attached hidden (invisible to duckdb_databases())
 	};
 	mutable std::mutex companion_mutex_;
 	std::map<std::string, CompanionRecord> companion_catalogs_;
@@ -2270,7 +2293,7 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 				VgiStorageExtension::CompanionOutcome outcome;
 				try {
 					outcome = vgi_ext->AcquireCompanion(
-					    c.alias, c.target, db_manager,
+					    c.alias, c.target, scheme, c.hidden, db_manager,
 					    [&]() {
 						    AttachInfo cinfo;
 						    cinfo.name = c.alias;
@@ -2670,6 +2693,46 @@ static void VgiSecretProvidersScan(ClientContext &context, TableFunctionInput &d
 		output.SetValue(3, row, Value::BOOLEAN(storage->Active()));
 		output.SetValue(4, row, Value::BIGINT(static_cast<int64_t>(storage->CachedSecretCount())));
 		output.SetValue(5, row, Value::BIGINT(storage->DefaultTtlSeconds()));
+		row++;
+	}
+	output.SetCardinality(row);
+}
+
+// vgi_companions(): one row per companion catalog attached by the VGI layer
+// (lakehouse federation). Surfaces hidden companions that are invisible to
+// duckdb_databases().
+struct VgiCompanionsData : public TableFunctionData {
+	bool finished = false;
+};
+
+static unique_ptr<FunctionData> VgiCompanionsBind(ClientContext &context, TableFunctionBindInput &input,
+                                                  vector<LogicalType> &return_types, vector<string> &names) {
+	names = {"catalog_name", "target", "db_type", "hidden", "refcount"};
+	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BOOLEAN,
+	                LogicalType::BIGINT};
+	return make_uniq<VgiCompanionsData>();
+}
+
+static void VgiCompanionsScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &data = data_p.bind_data->CastNoConst<VgiCompanionsData>();
+	if (data.finished) {
+		return;
+	}
+	data.finished = true;
+
+	auto *ext = VgiStorageExtension::Find(*context.db);
+	if (!ext) {
+		output.SetCardinality(0);
+		return;
+	}
+	auto companions = ext->AllCompanions();
+	idx_t row = 0;
+	for (const auto &c : companions) {
+		output.SetValue(0, row, Value(c.alias));
+		output.SetValue(1, row, Value(c.target));
+		output.SetValue(2, row, c.db_type.empty() ? Value(LogicalType::VARCHAR) : Value(c.db_type));
+		output.SetValue(3, row, Value::BOOLEAN(c.hidden));
+		output.SetValue(4, row, Value::BIGINT(c.refcount));
 		row++;
 	}
 	output.SetCardinality(row);
@@ -3228,6 +3291,15 @@ static void LoadInternal(ExtensionLoader &loader) {
 		    "A provider appears here when an attached VGI catalog advertises a secret-service URL.",
 		    {}, {}, {"SELECT * FROM vgi_secret_providers();"}));
 		loader.RegisterFunction(std::move(providers_info));
+
+		TableFunction companions_func("vgi_companions", {}, VgiCompanionsScan, VgiCompanionsBind);
+		CreateTableFunctionInfo companions_info(companions_func);
+		companions_info.descriptions.push_back(vgi::MakeFunctionDescription(
+		    "List the companion catalogs attached by VGI catalogs (lakehouse federation), one row per companion "
+		    "with its catalog_name (alias), target, db_type, hidden flag, and refcount (how many attached VGI "
+		    "catalogs share it). Surfaces `hidden` companions that are invisible to duckdb_databases().",
+		    {}, {}, {"SELECT * FROM vgi_companions();"}));
+		loader.RegisterFunction(std::move(companions_info));
 
 		TableFunction flush_func("vgi_secret_provider_flush", {}, VgiSecretFlushScan, VgiSecretFlushBind);
 		flush_func.named_parameters["catalog"] = LogicalType::VARCHAR;

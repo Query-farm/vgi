@@ -51,6 +51,7 @@ VGI_SIMPLE_WRITABLE_WORKER ?= uv run --project $(HOME)/Development/vgi-python vg
 	test_simple_writable test_simple_writable_debug \
 	test_docker test_docker_debug \
 	test_companion test_companion_debug \
+	test_iceberg test_iceberg_debug \
 	test_all test_all_debug
 
 # Shared-memory transport tests — runs the same .test suite as test_subprocess
@@ -297,6 +298,16 @@ test_companion:
 
 test_companion_debug:
 	BUILD_DIR=debug ./test/run_companion_integration.sh "test/sql/integration/catalog/companion_catalogs.test"
+
+# Iceberg function-branch integration tests (uses test/run_iceberg_integration.sh).
+# Installs the iceberg community extension and runs multi_branch_iceberg.test,
+# which scans a COPY-TO-iceberg table as a native cold-tier branch of a VGI
+# multi-branch table. Skips cleanly when iceberg is unavailable.
+test_iceberg:
+	./test/run_iceberg_integration.sh "test/sql/integration/catalog/multi_branch_iceberg.test"
+
+test_iceberg_debug:
+	BUILD_DIR=debug ./test/run_iceberg_integration.sh "test/sql/integration/catalog/multi_branch_iceberg.test"
 
 # Writable catalog tests (subprocess transport) — opt-in, require a worker
 # with writable-catalog support.

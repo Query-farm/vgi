@@ -359,7 +359,11 @@ DuckLake **segfaults** where parquet isn't autoloaded (e.g. the unittest binary)
 (`VgiAttachCatalogInfo`). vgi-python: `AttachCatalogInfo` + `ScanBranch.source_*`
 in `catalog_interface.py`; fixture `vgi/_test_fixtures/companion.py`. Tests:
 `test/sql/integration/catalog/companion_catalogs.test` (`make test_companion`).
-See [docs/companion_catalogs.md](docs/companion_catalogs.md).
+A related multi-branch test exercises `iceberg_scan('path')` as a native
+cold-tier *function* branch (not a companion): `multi_branch_iceberg.test`,
+run via `make test_iceberg` (INSTALLs the iceberg community extension, seeds a
+table with `COPY … TO (FORMAT iceberg)`, sets `VGI_TEST_ICEBERG`; skips cleanly
+in the bare suite). See [docs/companion_catalogs.md](docs/companion_catalogs.md).
 
 ## Custom `COPY ... FROM` Formats
 
@@ -520,6 +524,7 @@ The `launch:` and `unix://` paths share one warm worker process across every Duc
 | `vgi_function_arguments()` | Table | Diagnostic: one row per (catalog, schema, function/macro, argument) across every attached VGI catalog. Covers scalar/table/aggregate **functions** and scalar/table **macros** (`function_type` is `scalar`/`table`/`aggregate` for functions, `scalar_macro`/`table_macro` for macros). Columns: `catalog_name`, `schema_name`, `function_name`, `function_type`, `arg_position` (NULL for named/varargs), `field_index`, `arg_name`, `arg_type`, `arg_description` (the `vgi_doc` field metadata; NULL when undocumented), `is_named`, `is_positional`, `is_const`, `is_varargs`, `is_table_input`, `is_any_type`. Surfaces per-argument detail that `duckdb_functions()` flattens away. Filter with `WHERE catalog_name = '...'`. Reports each catalog's current data version (no time travel). |
 | `vgi_copy_formats()` | Table | Diagnostic: one row per (catalog, format, direction, option) for every custom `COPY ... FROM`/`TO` format registered by attached VGI catalogs. Columns: `catalog_name`, `format_name` (alias-scoped — the exact `FORMAT` string to type), `direction` (`from`/`to`/`both`), `ordered` (BOOLEAN — TO single-thread/source-ordered sink), `format_description`, `format_comment`, `format_tags` (MAP), `handler`, `option_name`, `option_type`, `option_description`. See [docs/copy_from.md](docs/copy_from.md), [docs/copy_to.md](docs/copy_to.md) |
 | `vgi_secret_providers()` | Table | Diagnostic: one row per auto-registered Orchard remote secret provider. Columns: `catalog_name`, `endpoint`, `tie_break_offset`, `active`, `cached_secrets`, `ttl_seconds`. See *Remote Secret Provider* |
+| `vgi_companions()` | Table | Diagnostic: one row per companion catalog attached by VGI catalogs (lakehouse federation). Columns: `catalog_name` (alias), `target`, `db_type`, `hidden` (BOOLEAN — surfaces companions invisible to `duckdb_databases()`), `refcount` (how many attached VGI catalogs share it). See *Companion Catalogs* |
 | `vgi_secret_provider_flush(catalog := NULL)` | Table | Clear a provider's TTL cache (all providers when `catalog` omitted). Returns the count of positive secrets dropped |
 
 ## Key Source Files
