@@ -14,7 +14,7 @@
 #   `function_arguments.test`'s `multiply` — this is a real cross-SDK contract, not a
 #   Python-only assertion. The arg_* columns ship in the signed community `vgi`
 #   extension the integration suites `INSTALL vgi FROM community`, so this runs
-#   unconditionally (no longer gated behind VGI_TEST_ARG_CONSTRAINTS).
+#   unconditionally in every integration suite.
 # group: [vgi_integration]
 
 require-env VGI_TEST_WORKER
