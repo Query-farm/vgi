@@ -769,7 +769,8 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 		auto p_cached_params = attach_params_
 		    ? attach_params_->GetOrInitHttpParams(context_, exchange_url) : nullptr;
 		auto response_body = HttpPostArrowIpc(context_, exchange_url, body, p_auth,
-		                                        /*cookie_jar=*/nullptr, p_cached_params);
+		                                        /*cookie_jar=*/nullptr, p_cached_params,
+		                                        HttpRetryPolicy::ExchangeTick());
 
 		// Parse response — buffer new data batches
 		BufferDataBatches(response_body);
@@ -832,7 +833,8 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 	auto x_cached_params = attach_params_
 	    ? attach_params_->GetOrInitHttpParams(context_, exchange_url) : nullptr;
 	auto response_body = HttpPostArrowIpc(context_, exchange_url, body, x_auth,
-	                                        /*cookie_jar=*/nullptr, x_cached_params);
+	                                        /*cookie_jar=*/nullptr, x_cached_params,
+	                                        HttpRetryPolicy::ExchangeTick());
 
 	// Parse response — copy into owning buffer since Arrow IPC reads zero-copy reference it
 	auto buffer = arrow::Buffer::FromString(std::move(response_body));
@@ -979,7 +981,8 @@ void HttpFunctionConnection::CancelStream(const std::vector<uint8_t> &state_toke
 	    ? attach_params_->GetOrInitHttpParams(live_context, exchange_url) : nullptr;
 	// Best-effort: dispatcher catches any thrown exception.
 	(void)HttpPostArrowIpc(live_context, exchange_url, body, c_auth,
-	                        /*cookie_jar=*/nullptr, c_cached_params);
+	                        /*cookie_jar=*/nullptr, c_cached_params,
+	                        HttpRetryPolicy::ExchangeTick());
 }
 
 } // namespace vgi

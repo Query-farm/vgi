@@ -5,6 +5,8 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <random>
+#include <thread>
 
 #include "duckdb.hpp"
 #include "duckdb/common/http_util.hpp"
@@ -143,6 +145,22 @@ static HttpEncoding PickAlternateEncoding(const std::vector<HttpEncoding> &offer
 	return tried == HttpEncoding::ZSTD ? HttpEncoding::GZIP : HttpEncoding::ZSTD;
 }
 
+// Current UTC time in seconds since epoch — for resolving a Retry-After HTTP-date.
+static int64_t NowUnixSeconds() {
+	return std::chrono::duration_cast<std::chrono::seconds>(
+	           std::chrono::system_clock::now().time_since_epoch())
+	    .count();
+}
+
+// A jitter draw in [0,1). Thread-local RNG — retries run on the DuckDB task
+// thread, and independent draws per thread keep concurrent retriers from
+// synchronizing their backoff (thundering herd).
+static double Rand01() {
+	static thread_local std::mt19937 rng(std::random_device{}());
+	static thread_local std::uniform_real_distribution<double> dist(0.0, 1.0);
+	return dist(rng);
+}
+
 static std::string HttpPostArrowIpcInternal(ClientContext &context,
                                              const std::string &url,
                                              const std::vector<uint8_t> &body,
@@ -151,7 +169,9 @@ static std::string HttpPostArrowIpcInternal(ClientContext &context,
                                              std::unique_ptr<HTTPResponse> &out_response,
                                              const std::shared_ptr<HTTPParams> &cached_http_params = nullptr,
                                              HttpEncoding request_encoding = HttpEncoding::ZSTD,
-                                             bool allow_codec_retry = true) {
+                                             bool allow_codec_retry = true,
+                                             int attempt = 0,
+                                             const HttpRetryPolicy &retry_policy = HttpRetryPolicy::Default()) {
 	auto &db = *context.db;
 	auto &http_util = HTTPUtil::Get(db);
 
@@ -223,9 +243,38 @@ static std::string HttpPostArrowIpcInternal(ClientContext &context,
 			if (alternate != request_encoding) {
 				return HttpPostArrowIpcInternal(context, url, body, bearer_token, cookie_jar,
 				                                 out_response, cached_http_params, alternate,
-				                                 /*allow_codec_retry=*/false);
+				                                 /*allow_codec_retry=*/false, attempt, retry_policy);
 			}
 		}
+	}
+
+	// Transient-failure retry: the auth proxy sheds load with 503 + Retry-After
+	// (backpressure), and reverse proxies emit 429/502/504 under stress. Honor
+	// Retry-After + exponential backoff with jitter, bounded by the policy, then
+	// recurse. Exhausted retries fall through to the rich error below. (502/504
+	// are excluded for stream exchange ticks — see HttpRetryPolicy::ExchangeTick.)
+	if (!out_response->Success() && attempt < retry_policy.max_retries &&
+	    IsRetryableStatus(static_cast<int>(out_response->status), retry_policy)) {
+		std::optional<double> retry_after;
+		if (out_response->HasHeader("Retry-After")) {
+			retry_after = ParseRetryAfter(out_response->GetHeaderValue("Retry-After"), NowUnixSeconds());
+		}
+		double delay_s = ComputeRetryDelaySeconds(attempt, retry_after, retry_policy, Rand01());
+		char delay_buf[32];
+		std::snprintf(delay_buf, sizeof(delay_buf), "%.3f", delay_s);
+		VGI_LOG(context, "http.retry",
+		        {{"url", url},
+		         {"status", std::to_string(static_cast<int>(out_response->status))},
+		         {"attempt", std::to_string(attempt + 1)},
+		         {"max_retries", std::to_string(retry_policy.max_retries)},
+		         {"retry_after_hdr", retry_after.has_value() ? "true" : "false"},
+		         {"delay_s", delay_buf}});
+		if (delay_s > 0.0) {
+			std::this_thread::sleep_for(std::chrono::duration<double>(delay_s));
+		}
+		return HttpPostArrowIpcInternal(context, url, body, bearer_token, cookie_jar, out_response,
+		                                 cached_http_params, request_encoding, allow_codec_retry,
+		                                 attempt + 1, retry_policy);
 	}
 
 	if (!out_response->Success()) {
@@ -420,15 +469,27 @@ std::string HttpPostArrowIpc(ClientContext &context,
                               const std::vector<uint8_t> &body,
                               const std::shared_ptr<CatalogAuth> &auth,
                               const std::shared_ptr<SessionCookieJar> &cookie_jar,
-                              const std::shared_ptr<HTTPParams> &cached_http_params) {
+                              const std::shared_ptr<HTTPParams> &cached_http_params,
+                              const HttpRetryPolicy &retry_policy) {
 	// Get cached token from per-catalog auth (if any)
 	std::string token;
 	if (auth) {
 		token = auth->GetToken();
 	}
 
+	// Let ops cap/disable retries via `vgi_http_max_retries` (default from the
+	// policy). `SET vgi_http_max_retries=0` disables the transient-failure retry.
+	HttpRetryPolicy policy = retry_policy;
+	Value max_retries_val;
+	if (context.TryGetCurrentSetting("vgi_http_max_retries", max_retries_val)) {
+		auto configured = static_cast<int>(max_retries_val.GetValue<int64_t>());
+		policy.max_retries = configured < 0 ? 0 : configured;
+	}
+
 	std::unique_ptr<HTTPResponse> response;
-	auto result = HttpPostArrowIpcInternal(context, url, body, token, cookie_jar, response, cached_http_params);
+	auto result =
+	    HttpPostArrowIpcInternal(context, url, body, token, cookie_jar, response, cached_http_params,
+	                             HttpEncoding::ZSTD, /*allow_codec_retry=*/true, /*attempt=*/0, policy);
 
 	if (response->status != HTTPStatusCode::Unauthorized_401) {
 		return result;
@@ -484,7 +545,9 @@ std::string HttpPostArrowIpc(ClientContext &context,
 	auto new_token = auth->HandleUnauthorized(*challenge, context);
 
 	// Retry with new token
-	result = HttpPostArrowIpcInternal(context, url, body, new_token, cookie_jar, response, cached_http_params);
+	result =
+	    HttpPostArrowIpcInternal(context, url, body, new_token, cookie_jar, response, cached_http_params,
+	                             HttpEncoding::ZSTD, /*allow_codec_retry=*/true, /*attempt=*/0, policy);
 	if (response->status == HTTPStatusCode::Unauthorized_401) {
 		throw IOException("VGI HTTP authentication failed after auth flow (HTTP 401) [url: %s]. "
 		                  "Response: %s", url, response->body);
