@@ -3019,14 +3019,6 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "Timeout in seconds for VGI HTTP requests (catalog, init, and exchange operations)",
 	                          LogicalType::BIGINT, Value::BIGINT(300));
 
-	// Register HTTP transient-failure retry cap. The VGI auth proxy sheds load
-	// with 503 + Retry-After (backpressure); the client honors Retry-After and
-	// backs off up to this many times before surfacing an error. 0 disables retrying.
-	config.AddExtensionOption("vgi_http_max_retries",
-	                          "Maximum retries for a transient VGI HTTP failure (429/503 + Retry-After, and "
-	                          "502/504 for idempotent phases). 0 disables retrying.",
-	                          LogicalType::BIGINT, Value::BIGINT(4));
-
 	config.AddExtensionOption(
 	    "vgi_secret_default_ttl_seconds",
 	    "Default cache TTL (seconds) for credentials fetched from an Orchard remote secret provider. "

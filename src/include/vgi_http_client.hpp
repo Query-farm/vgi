@@ -13,7 +13,6 @@
 #include "duckdb/main/client_context.hpp"
 
 #include "vgi_http_compression.hpp"
-#include "vgi_http_retry.hpp"
 #include "vgi_rpc_client.hpp"
 
 namespace duckdb {
@@ -58,16 +57,12 @@ UnaryResponseResult HttpInvokeUnary(ClientContext &context,
 // Timeout is controlled by the vgi_http_timeout_seconds setting (default 300s).
 // auth: per-catalog auth state for bearer token injection and 401 handling.
 // cookie_jar: per-catalog HTTP cookie store (see HttpInvokeUnary).
-// retry_policy: transient-failure retry (429/503 + Retry-After, and 502/504 for
-// idempotent phases). max_retries is overridden by the vgi_http_max_retries
-// setting when present. Stream *exchange* ticks pass HttpRetryPolicy::ExchangeTick().
 std::string HttpPostArrowIpc(ClientContext &context,
                               const std::string &url,
                               const std::vector<uint8_t> &body,
                               const std::shared_ptr<CatalogAuth> &auth = nullptr,
                               const std::shared_ptr<SessionCookieJar> &cookie_jar = nullptr,
-                              const std::shared_ptr<HTTPParams> &cached_http_params = nullptr,
-                              const HttpRetryPolicy &retry_policy = HttpRetryPolicy::Default());
+                              const std::shared_ptr<HTTPParams> &cached_http_params = nullptr);
 
 // HTTP GET raw bytes from a URL. Used for fetching externalized batches.
 // Handles X-VGI-Content-Encoding decompression (zstd or gzip). No auth
