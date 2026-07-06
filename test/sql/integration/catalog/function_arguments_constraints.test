@@ -9,18 +9,15 @@
 #   const args declare ranges through the same Arg(...) path) and that a table bind
 #   enforces those ranges, not just surfaces them.
 #
-#   The arg_default/arg_choices/arg_range/arg_pattern columns are new to
-#   vgi_function_arguments(), so this test needs a haybarn built from a source
-#   tree that includes them. It is gated by `require-env VGI_TEST_ARG_CONSTRAINTS`
-#   (set only by `make test_arg_constraints`, which runs the freshly-built local
-#   binary) so it skips cleanly in the vgi-python integration suite, which drives
-#   an older *pinned* published haybarn binary that lacks the columns. Drop the
-#   gate once the pinned HAYBARN_RELEASE in vgi-python advances past this change.
+#   `format_number` (precision [0, 10]) and `make_series` (count [0, +inf), step
+#   [1, +inf)) declare identical constraints across every SDK example worker, so — like
+#   `function_arguments.test`'s `multiply` — this is a real cross-SDK contract, not a
+#   Python-only assertion. The arg_* columns ship in the signed community `vgi`
+#   extension the integration suites `INSTALL vgi FROM community`, so this runs
+#   unconditionally (no longer gated behind VGI_TEST_ARG_CONSTRAINTS).
 # group: [vgi_integration]
 
 require-env VGI_TEST_WORKER
-
-require-env VGI_TEST_ARG_CONSTRAINTS
 
 require vgi
 

@@ -52,7 +52,6 @@ VGI_SIMPLE_WRITABLE_WORKER ?= uv run --project $(HOME)/Development/vgi-python vg
 	test_docker test_docker_debug \
 	test_companion test_companion_debug \
 	test_iceberg test_iceberg_debug \
-	test_arg_constraints test_arg_constraints_debug \
 	test_all test_all_debug
 
 # Shared-memory transport tests — runs the same .test suite as test_subprocess
@@ -309,17 +308,6 @@ test_iceberg:
 
 test_iceberg_debug:
 	BUILD_DIR=debug ./test/run_iceberg_integration.sh "test/sql/integration/catalog/multi_branch_iceberg.test"
-
-# Per-argument constraint-metadata test (vgi_function_arguments() arg_default/
-# arg_choices/arg_range/arg_pattern columns). Gated by VGI_TEST_ARG_CONSTRAINTS
-# so it runs only against the freshly-built local binary — the vgi-python
-# integration suite drives an older pinned haybarn that lacks these columns and
-# would skip it.
-test_arg_constraints:
-	VGI_TEST_ARG_CONSTRAINTS=1 VGI_TEST_WORKER="$(VGI_TEST_WORKER)" ./build/release/test/unittest "test/sql/integration/catalog/function_arguments_constraints.test"
-
-test_arg_constraints_debug:
-	VGI_TEST_ARG_CONSTRAINTS=1 VGI_TEST_WORKER="$(VGI_TEST_WORKER)" ./build/debug/test/unittest "test/sql/integration/catalog/function_arguments_constraints.test"
 
 # Writable catalog tests (subprocess transport) — opt-in, require a worker
 # with writable-catalog support.
