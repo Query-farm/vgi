@@ -1,0 +1,37 @@
+# Registry for the central cross-language landing-conformance matrix.
+#
+# Each entry describes how to boot that language's example HTTP worker. The
+# runner starts it on an ephemeral port, drives GET /describe.json + / +
+# column endpoints, validates against describe.schema.json, and diffs the
+# normalized document against fixtures/describe.expected.json.
+#
+# Per-repo CI is the primary guard (each repo runs the checker against its own
+# worker); this matrix is the belt-and-suspenders cross-repo run. A language
+# whose toolchain/binary is absent is skipped loudly.
+#
+# {port} is substituted with the chosen ephemeral port.
+
+[python]
+repo = "~/Development/vgi-python"
+command = "uv run --project ~/Development/vgi-python vgi-fixture-http --port {port}"
+enabled = true
+
+[go]
+repo = "~/Development/vgi-go"
+command = "" # TODO: example HTTP worker command once ported (see §7 of the plan)
+enabled = false
+
+[rust]
+repo = "~/Development/vgi-rust"
+command = "" # TODO
+enabled = false
+
+[typescript]
+repo = "~/Development/vgi-typescript"
+command = "" # TODO
+enabled = false
+
+[java]
+repo = "~/Development/vgi-java"
+command = "" # TODO
+enabled = false

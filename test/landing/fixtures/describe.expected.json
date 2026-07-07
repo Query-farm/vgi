@@ -1,0 +1,2638 @@
+{
+  "catalogs": [
+    {
+      "attach_options": [],
+      "counts": {
+        "functions": 162,
+        "schemas": 2,
+        "tables": 44,
+        "views": 3
+      },
+      "data_version_spec": null,
+      "data_versions": [],
+      "implementation_version": null,
+      "name": "example",
+      "schemas": [
+        {
+          "functions": [
+            {
+              "args": [
+                {
+                  "desc": "Tensor cell value",
+                  "name": "value",
+                  "type": "null"
+                },
+                {
+                  "desc": "Struct of axis coordinates",
+                  "name": "axes",
+                  "type": "null"
+                }
+              ],
+              "doc": "Collect rows into a dense N-D tensor plus per-axis coordinates",
+              "name": "nest_tensor",
+              "returns": "null",
+              "type": "aggregate"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Integer column to sum",
+                  "name": "value",
+                  "type": "int64"
+                }
+              ],
+              "doc": "Sum an integer column; the result type is chosen from a secret",
+              "name": "secret_typed_sum",
+              "returns": "null",
+              "type": "aggregate"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Column to average",
+                  "name": "value",
+                  "type": "int64"
+                }
+              ],
+              "doc": "Average of integer values",
+              "name": "vgi_avg",
+              "returns": "double",
+              "type": "aggregate"
+            },
+            {
+              "args": [],
+              "doc": "Count rows",
+              "name": "vgi_count",
+              "returns": "int64",
+              "type": "aggregate"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Python code defining Aggregate class",
+                  "name": "code",
+                  "type": "string"
+                },
+                {
+                  "desc": "Input columns",
+                  "name": "columns",
+                  "type": "null"
+                }
+              ],
+              "doc": "Dynamic aggregate defined by Python code string",
+              "name": "vgi_dynamic_agg",
+              "returns": "double",
+              "type": "aggregate"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Python code defining Aggregate class",
+                  "name": "code",
+                  "type": "string"
+                },
+                {
+                  "desc": "MAP(VARCHAR, DOUBLE) parameters",
+                  "name": "params_col",
+                  "type": "null"
+                },
+                {
+                  "desc": "Input columns",
+                  "name": "columns",
+                  "type": "null"
+                }
+              ],
+              "doc": "Dynamic ML aggregate with params dict",
+              "name": "vgi_dynamic_ml_agg",
+              "returns": "double",
+              "type": "aggregate"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Numeric value to sum",
+                  "name": "value",
+                  "type": "null"
+                }
+              ],
+              "doc": "Sum any numeric type",
+              "name": "vgi_generic_sum",
+              "returns": "null",
+              "type": "aggregate"
+            },
+            {
+              "args": [
+                {
+                  "desc": "String column",
+                  "name": "value",
+                  "type": "string"
+                }
+              ],
+              "doc": "Concatenate strings with comma separator",
+              "name": "vgi_listagg",
+              "returns": "string",
+              "type": "aggregate"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Values",
+                  "name": "value",
+                  "type": "double"
+                },
+                {
+                  "desc": "Percentile (0-1)",
+                  "name": "percentile",
+                  "type": "double"
+                }
+              ],
+              "doc": "Approximate percentile (demonstrates ConstParam)",
+              "name": "vgi_percentile",
+              "returns": "double",
+              "type": "aggregate"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Column to sum",
+                  "name": "value",
+                  "type": "int64"
+                }
+              ],
+              "doc": "Running sum across PARTITION BY keys via the streaming-partitioned protocol. Each input row emits the cumulative sum at its position.",
+              "name": "vgi_streaming_sum",
+              "returns": "int64",
+              "type": "aggregate"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Column to sum",
+                  "name": "value",
+                  "type": "int64"
+                }
+              ],
+              "doc": "Sum integer values",
+              "name": "vgi_sum",
+              "returns": "int64",
+              "type": "aggregate"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Numeric columns to sum",
+                  "name": "columns",
+                  "type": "null"
+                }
+              ],
+              "doc": "Sum all numeric columns",
+              "name": "vgi_sum_all",
+              "returns": "double",
+              "type": "aggregate"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Values to sum",
+                  "name": "value",
+                  "type": "double"
+                },
+                {
+                  "desc": "Weights",
+                  "name": "weight",
+                  "type": "double"
+                }
+              ],
+              "doc": "Weighted sum of values",
+              "name": "vgi_weighted_sum",
+              "returns": "double",
+              "type": "aggregate"
+            },
+            {
+              "args": [
+                {
+                  "desc": "String column",
+                  "name": "value",
+                  "type": "string"
+                }
+              ],
+              "doc": "Windowed string concat (ORDER_DEPENDENT; tests fallback handoff)",
+              "name": "vgi_window_listagg",
+              "returns": "string",
+              "type": "aggregate"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Column to compute median of",
+                  "name": "value",
+                  "type": "double"
+                }
+              ],
+              "doc": "Windowed median (window() callback demonstrates non-incremental aggregates)",
+              "name": "vgi_window_median",
+              "returns": "double",
+              "type": "aggregate"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Column to sum",
+                  "name": "value",
+                  "type": "int64"
+                }
+              ],
+              "doc": "Windowed sum that uses the per-partition window() callback",
+              "name": "vgi_window_sum",
+              "returns": "int64",
+              "type": "aggregate"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Column to sum",
+                  "name": "value",
+                  "type": "int64"
+                }
+              ],
+              "doc": "Windowed sum demonstrating window_batch returning pa.Array",
+              "name": "vgi_window_sum_batch",
+              "returns": "int64",
+              "type": "aggregate"
+            },
+            {
+              "args": [
+                {
+                  "desc": "First numeric value",
+                  "name": "col1",
+                  "type": "null"
+                },
+                {
+                  "desc": "Second numeric value",
+                  "name": "col2",
+                  "type": "null"
+                }
+              ],
+              "doc": "Adds two numeric values",
+              "name": "add_values",
+              "returns": "null",
+              "type": "scalar"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Any type value",
+                  "name": "a",
+                  "type": "null"
+                },
+                {
+                  "desc": "Int value",
+                  "name": "b",
+                  "type": "int64"
+                }
+              ],
+              "doc": "Any+int dispatch",
+              "name": "any_mixed",
+              "returns": "string",
+              "type": "scalar"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Any type value",
+                  "name": "a",
+                  "type": "null"
+                },
+                {
+                  "desc": "String value",
+                  "name": "b",
+                  "type": "string"
+                }
+              ],
+              "doc": "Any+str dispatch",
+              "name": "any_mixed",
+              "returns": "string",
+              "type": "scalar"
+            },
+            {
+              "args": [],
+              "doc": "Generate random booleans (demonstrates VOLATILE stability)",
+              "name": "bernoulli",
+              "returns": "bool",
+              "type": "scalar"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Header bytes to prepend",
+                  "name": "header",
+                  "type": "binary"
+                },
+                {
+                  "desc": "Binary payload data",
+                  "name": "payload",
+                  "type": "binary"
+                },
+                {
+                  "desc": "Config {label, version}",
+                  "name": "config",
+                  "type": "struct<label: string, version: int64>"
+                }
+              ],
+              "doc": "Build binary packets with header, payload, and config",
+              "name": "binary_packet",
+              "returns": "binary",
+              "type": "scalar"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Integer values to sum",
+                  "name": "values",
+                  "type": "int64"
+                }
+              ],
+              "doc": "Sum integer varargs and return as string",
+              "name": "concat_values",
+              "returns": "null",
+              "type": "scalar"
+            },
+            {
+              "args": [
+                {
+                  "desc": "String values to concatenate",
+                  "name": "values",
+                  "type": "string"
+                }
+              ],
+              "doc": "Concatenate string varargs",
+              "name": "concat_values",
+              "returns": "null",
+              "type": "scalar"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Number of times to repeat",
+                  "name": "repeat_count",
+                  "type": "int64"
+                },
+                {
+                  "desc": "Message to repeat",
+                  "name": "message",
+                  "type": "string"
+                },
+                {
+                  "desc": "Apply message condition",
+                  "name": "condition",
+                  "type": "bool"
+                }
+              ],
+              "doc": "Returns repeated message when condition is true",
+              "name": "conditional_message",
+              "returns": "string",
+              "type": "scalar"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Numeric value to double",
+                  "name": "value",
+                  "type": "null"
+                }
+              ],
+              "doc": "Doubles numeric values",
+              "name": "double",
+              "returns": "null",
+              "type": "scalar"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Number to format",
+                  "name": "value",
+                  "type": "double"
+                }
+              ],
+              "doc": "Format number with default precision (0 decimals)",
+              "name": "format_number",
+              "returns": "string",
+              "type": "scalar"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Number of decimal places",
+                  "name": "precision",
+                  "type": "int64"
+                },
+                {
+                  "desc": "Prefix string",
+                  "name": "prefix",
+                  "type": "string"
+                },
+                {
+                  "desc": "Number to format",
+                  "name": "value",
+                  "type": "double"
+                }
+              ],
+              "doc": "Format number with precision and prefix",
+              "name": "format_number",
+              "returns": "string",
+              "type": "scalar"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Number of decimal places",
+                  "name": "precision",
+                  "type": "int64"
+                },
+                {
+                  "desc": "Number to format",
+                  "name": "value",
+                  "type": "double"
+                }
+              ],
+              "doc": "Format number with specified precision",
+              "name": "format_number",
+              "returns": "string",
+              "type": "scalar"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Point columns [lat, lon]",
+                  "name": "points",
+                  "type": "fixed_size_list<item: double>[2]"
+                }
+              ],
+              "doc": "Centroid of N fixed-size list points",
+              "name": "geo_centroid_fixed",
+              "returns": "struct<lat: double, lon: double>",
+              "type": "scalar"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Point columns [lat, lon]",
+                  "name": "points",
+                  "type": "list<item: double>"
+                }
+              ],
+              "doc": "Centroid of N list points",
+              "name": "geo_centroid_list",
+              "returns": "struct<lat: double, lon: double>",
+              "type": "scalar"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Point columns {lat, lon}",
+                  "name": "points",
+                  "type": "struct<lat: double, lon: double>"
+                }
+              ],
+              "doc": "Centroid of N struct points",
+              "name": "geo_centroid_struct",
+              "returns": "struct<lat: double, lon: double>",
+              "type": "scalar"
+            },
+            {
+              "args": [
+                {
+                  "desc": "First point [lat, lon]",
+                  "name": "p1",
+                  "type": "fixed_size_list<item: double>[2]"
+                },
+                {
+                  "desc": "Second point [lat, lon]",
+                  "name": "p2",
+                  "type": "fixed_size_list<item: double>[2]"
+                }
+              ],
+              "doc": "Euclidean distance between two fixed-size list points",
+              "name": "geo_distance_fixed",
+              "returns": "double",
+              "type": "scalar"
+            },
+            {
+              "args": [
+                {
+                  "desc": "First point [lat, lon]",
+                  "name": "p1",
+                  "type": "list<item: double>"
+                },
+                {
+                  "desc": "Second point [lat, lon]",
+                  "name": "p2",
+                  "type": "list<item: double>"
+                }
+              ],
+              "doc": "Euclidean distance between two list points",
+              "name": "geo_distance_list",
+              "returns": "double",
+              "type": "scalar"
+            },
+            {
+              "args": [
+                {
+                  "desc": "First point {lat, lon}",
+                  "name": "p1",
+                  "type": "struct<lat: double, lon: double>"
+                },
+                {
+                  "desc": "Second point {lat, lon}",
+                  "name": "p2",
+                  "type": "struct<lat: double, lon: double>"
+                }
+              ],
+              "doc": "Euclidean distance between two struct points",
+              "name": "geo_distance_struct",
+              "returns": "double",
+              "type": "scalar"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Seed value",
+                  "name": "seed",
+                  "type": "int64"
+                }
+              ],
+              "doc": "Generate deterministic integers from a constant seed",
+              "name": "hash_seed",
+              "returns": "int64",
+              "type": "scalar"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Integer value to multiply",
+                  "name": "value",
+                  "type": "int64"
+                },
+                {
+                  "desc": "Multiplication factor",
+                  "name": "factor",
+                  "type": "int64"
+                }
+              ],
+              "doc": "Multiplies a value by a constant factor",
+              "name": "multiply",
+              "returns": "int64",
+              "type": "scalar"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Integer value to multiply",
+                  "name": "value",
+                  "type": "int64"
+                }
+              ],
+              "doc": "Multiply the input value by a setting value",
+              "name": "multiply_by_setting",
+              "returns": "int64",
+              "type": "scalar"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Integer value to process",
+                  "name": "value",
+                  "type": "int64"
+                }
+              ],
+              "doc": "Returns value or -5000 if null",
+              "name": "null_handling",
+              "returns": "int64",
+              "type": "scalar"
+            },
+            {
+              "args": [
+                {
+                  "desc": "First value",
+                  "name": "a",
+                  "type": "int64"
+                },
+                {
+                  "desc": "Second value",
+                  "name": "b",
+                  "type": "int64"
+                }
+              ],
+              "doc": "Return type pair name for int+int",
+              "name": "pair_type",
+              "returns": "string",
+              "type": "scalar"
+            },
+            {
+              "args": [
+                {
+                  "desc": "First value",
+                  "name": "a",
+                  "type": "int64"
+                },
+                {
+                  "desc": "Second value",
+                  "name": "b",
+                  "type": "string"
+                }
+              ],
+              "doc": "Return type pair name for int+str",
+              "name": "pair_type",
+              "returns": "string",
+              "type": "scalar"
+            },
+            {
+              "args": [
+                {
+                  "desc": "First value",
+                  "name": "a",
+                  "type": "string"
+                },
+                {
+                  "desc": "Second value",
+                  "name": "b",
+                  "type": "string"
+                }
+              ],
+              "doc": "Return type pair name for str+str",
+              "name": "pair_type",
+              "returns": "string",
+              "type": "scalar"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Value to offset",
+                  "name": "value",
+                  "type": "int64"
+                }
+              ],
+              "doc": "Add a per-query-stable seed to each value (demonstrates CONSISTENT_WITHIN_QUERY stability)",
+              "name": "query_seed",
+              "returns": "int64",
+              "type": "scalar"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Seed for pseudo-random byte generation",
+                  "name": "seed",
+                  "type": "int64"
+                },
+                {
+                  "desc": "Output blob length in bytes",
+                  "name": "byte_length",
+                  "type": "int64"
+                }
+              ],
+              "doc": "Generate pseudo-random binary blobs from seed and length",
+              "name": "random_bytes",
+              "returns": "binary",
+              "type": "scalar"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Minimum value (inclusive)",
+                  "name": "min_val",
+                  "type": "int64"
+                },
+                {
+                  "desc": "Maximum value (inclusive)",
+                  "name": "max_val",
+                  "type": "int64"
+                }
+              ],
+              "doc": "Generate random integers (demonstrates VOLATILE stability)",
+              "name": "random_int",
+              "returns": "int64",
+              "type": "scalar"
+            },
+            {
+              "args": [],
+              "doc": "Return a secret's value",
+              "name": "return_secret_value",
+              "returns": "string",
+              "type": "scalar"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Value to scale",
+                  "name": "value",
+                  "type": "double"
+                }
+              ],
+              "doc": "Scale the input value by the float setting `scale_factor`",
+              "name": "scale_by_setting",
+              "returns": "double",
+              "type": "scalar"
+            },
+            {
+              "args": [],
+              "doc": "Look up secret fields by name",
+              "name": "secret_field",
+              "returns": "string",
+              "type": "scalar"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Prefix string",
+                  "name": "prefix",
+                  "type": "string"
+                },
+                {
+                  "desc": "Value to format",
+                  "name": "value",
+                  "type": "double"
+                }
+              ],
+              "doc": "Prepend prefix to formatted value",
+              "name": "smart_format",
+              "returns": "string",
+              "type": "scalar"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Field width",
+                  "name": "width",
+                  "type": "int64"
+                },
+                {
+                  "desc": "Value to format",
+                  "name": "value",
+                  "type": "double"
+                }
+              ],
+              "doc": "Right-align value in field of given width",
+              "name": "smart_format",
+              "returns": "string",
+              "type": "scalar"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Numeric values to sum",
+                  "name": "values",
+                  "type": "null"
+                }
+              ],
+              "doc": "Sum multiple numeric values",
+              "name": "sum_values",
+              "returns": "null",
+              "type": "scalar"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Input value",
+                  "name": "v",
+                  "type": "int32"
+                }
+              ],
+              "doc": "Return type name for int32 input",
+              "name": "type_info",
+              "returns": "string",
+              "type": "scalar"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Input value",
+                  "name": "v",
+                  "type": "int64"
+                }
+              ],
+              "doc": "Return type name for int64 input",
+              "name": "type_info",
+              "returns": "string",
+              "type": "scalar"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Input value",
+                  "name": "v",
+                  "type": "string"
+                }
+              ],
+              "doc": "Return type name for string input",
+              "name": "type_info",
+              "returns": "string",
+              "type": "scalar"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Input value",
+                  "name": "v",
+                  "type": "uint32"
+                }
+              ],
+              "doc": "Return type name for uint32 input",
+              "name": "type_info",
+              "returns": "string",
+              "type": "scalar"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Input value",
+                  "name": "v",
+                  "type": "uint64"
+                }
+              ],
+              "doc": "Return type name for uint64 input",
+              "name": "type_info",
+              "returns": "string",
+              "type": "scalar"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Struct produced by nest_tensor",
+                  "name": "tensor",
+                  "type": "null"
+                }
+              ],
+              "doc": "Invert nest_tensor: list of {value, axes} structs per cell",
+              "name": "unnest_tensor",
+              "returns": "null",
+              "type": "scalar"
+            },
+            {
+              "args": [
+                {
+                  "desc": "String value to uppercase",
+                  "name": "value",
+                  "type": "string"
+                }
+              ],
+              "doc": "Converts string values to uppercase",
+              "name": "upper_case",
+              "returns": "string",
+              "type": "scalar"
+            },
+            {
+              "args": [
+                {
+                  "desc": "dummy input",
+                  "name": "x",
+                  "type": "int64"
+                }
+              ],
+              "doc": "Return the authenticated principal name.",
+              "name": "whoami",
+              "returns": "string",
+              "type": "scalar"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Total rows to attempt to generate",
+                  "name": "count",
+                  "type": "int64"
+                }
+              ],
+              "doc": "DELIBERATELY BROKEN: emits a batch tagged with a partition_id well above DuckDB's BATCH_INCREMENT=10^13 per-pipeline cap. C++ extension rejects at parse time.",
+              "name": "broken_batch_index_overflow",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Total rows to attempt to generate",
+                  "name": "count",
+                  "type": "int64"
+                }
+              ],
+              "doc": "DELIBERATELY BROKEN: declares supports_batch_index=True but emits a data batch with no vgi_batch_index metadata. C++ extension's contract check raises.",
+              "name": "broken_missing_batch_index_tag",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Rows to attempt to emit",
+                  "name": "count",
+                  "type": "int64"
+                }
+              ],
+              "doc": "DELIBERATELY BROKEN: declares partition_kind + partition-annotated field but emits a data batch without vgi_partition_values#b64 metadata. C++ extension's contract check raises.",
+              "name": "broken_missing_partition_values",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Total rows to attempt to generate",
+                  "name": "count",
+                  "type": "int64"
+                }
+              ],
+              "doc": "DELIBERATELY BROKEN: emits batches with strictly decreasing partition_id on one stream. C++ extension's monotonicity check raises (DuckDB's debug-only assertion is not relied upon).",
+              "name": "broken_non_monotone_batch_index",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Rows to attempt to emit",
+                  "name": "count",
+                  "type": "int64"
+                }
+              ],
+              "doc": "DELIBERATELY BROKEN: declares partition_kind on 'category' but emits a batch without 'category' AND doesn't supply an explicit partition_values override. The framework's auto-extract fails with RuntimeError before the wire.",
+              "name": "broken_partition_column_absent_from_batch",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Rows to attempt to emit",
+                  "name": "count",
+                  "type": "int64"
+                }
+              ],
+              "doc": "DELIBERATELY BROKEN: declares SINGLE_VALUE_PARTITIONS but supplies an explicit partition_values override with min != max. The framework's wrapper validation doesn't compare min vs max for SINGLE_VALUE; the C++ extension's defense-in-depth check in InstallBatch raises.",
+              "name": "broken_partition_min_neq_max",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Rows to attempt to emit",
+                  "name": "count",
+                  "type": "int64"
+                }
+              ],
+              "doc": "DELIBERATELY BROKEN: no field carries vgi.partition_column metadata (and partition_kind defaults to NOT_PARTITIONED), but the worker passes partition_values= on out.emit. The framework rejects with RuntimeError before the wire.",
+              "name": "broken_partition_values_no_annotation",
+              "type": "table"
+            },
+            {
+              "args": [],
+              "doc": "Scan colors table (ENUM column)",
+              "name": "colors_scan",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Number of rows to generate",
+                  "name": "count",
+                  "type": "int64"
+                },
+                {
+                  "desc": "Values to fill each column (at least one required)",
+                  "name": "values",
+                  "type": "null"
+                }
+              ],
+              "doc": "Generates rows with constant values from varargs",
+              "name": "constant_columns",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Rows to emit per country partition",
+                  "name": "rows_per_country",
+                  "type": "int64"
+                }
+              ],
+              "doc": "Per-country sales rows, one Arrow batch per country. Declares country as a SINGLE_VALUE partition column.",
+              "name": "country_partitioned_sales",
+              "type": "table"
+            },
+            {
+              "args": [],
+              "doc": "Scan departments table",
+              "name": "departments_scan",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Number of rows to generate",
+                  "name": "count",
+                  "type": "int64"
+                },
+                {
+                  "default": "2048",
+                  "desc": "Rows per batch",
+                  "name": "batch_size",
+                  "named": true,
+                  "type": "int64"
+                }
+              ],
+              "doc": "Emits a dictionary-encoded VARCHAR column for filter-pushdown testing",
+              "name": "dict_filter_echo",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Number of disjoint partitions",
+                  "name": "partitions",
+                  "type": "int64"
+                },
+                {
+                  "default": "10",
+                  "desc": "Rows per partition",
+                  "name": "rows_per_partition",
+                  "named": true,
+                  "type": "int64"
+                }
+              ],
+              "doc": "Disjoint per-chunk integer ranges on ``key``. Declares DISJOINT_PARTITIONS (wire-level only; DuckDB falls back to HASH_GROUP_BY for now).",
+              "name": "disjoint_range_partitioned",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Number of rows to generate",
+                  "name": "count",
+                  "type": "int64"
+                },
+                {
+                  "default": "2048",
+                  "desc": "Batch size for output",
+                  "name": "batch_size",
+                  "named": true,
+                  "type": "int64"
+                },
+                {
+                  "default": "1.0",
+                  "desc": "Step between values",
+                  "name": "increment",
+                  "named": true,
+                  "type": "double"
+                }
+              ],
+              "doc": "Generates a sequence of floating-point numbers from 0 to n-1",
+              "name": "double_sequence",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Number of rows to generate",
+                  "name": "count",
+                  "type": "int64"
+                },
+                {
+                  "default": "100",
+                  "desc": "Rows per batch",
+                  "name": "batch_size",
+                  "named": true,
+                  "type": "int64"
+                }
+              ],
+              "doc": "Generates descending integers, echoes dynamic tick filter per batch",
+              "name": "dynamic_filter_echo",
+              "type": "table"
+            },
+            {
+              "args": [],
+              "doc": "Passthrough function that emits each input batch unchanged",
+              "name": "echo",
+              "type": "table"
+            },
+            {
+              "args": [],
+              "doc": "Emits len(observed_output_schema) per column — projection probe",
+              "name": "echo_witness",
+              "type": "table"
+            },
+            {
+              "args": [],
+              "doc": "Scan employees table",
+              "name": "employees_scan",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "default": "\",\"",
+                  "desc": "Field separator",
+                  "name": "delimiter",
+                  "named": true,
+                  "type": "string"
+                },
+                {
+                  "desc": "Token parsed as SQL NULL",
+                  "name": "null_string",
+                  "named": true,
+                  "type": "string"
+                },
+                {
+                  "default": "\"fail\"",
+                  "desc": "Behavior on a row whose column count does not match the target",
+                  "name": "on_error",
+                  "named": true,
+                  "type": "string"
+                },
+                {
+                  "default": "0",
+                  "desc": "Leading lines to skip before data",
+                  "name": "skip_rows",
+                  "named": true,
+                  "type": "int64"
+                }
+              ],
+              "doc": "Read a delimited text file into the COPY target table",
+              "name": "example_lines_copy_reader",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Number of rows to generate",
+                  "name": "count",
+                  "type": "int64"
+                },
+                {
+                  "default": "1024",
+                  "desc": "Rows per batch",
+                  "name": "batch_size",
+                  "named": true,
+                  "type": "int64"
+                }
+              ],
+              "doc": "Generates rows for non-spatial expression filter testing",
+              "name": "expression_filter_test",
+              "type": "table"
+            },
+            {
+              "args": [],
+              "doc": "Filter rows where value column >= threshold setting",
+              "name": "filter_by_setting",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Number of rows to generate",
+                  "name": "count",
+                  "type": "int64"
+                },
+                {
+                  "default": "2048",
+                  "desc": "Batch size for output",
+                  "name": "batch_size",
+                  "named": true,
+                  "type": "int64"
+                }
+              ],
+              "doc": "Echoes pushed-down filter predicates in output",
+              "name": "filter_echo",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Total number of integers to generate",
+                  "name": "count",
+                  "type": "int64"
+                }
+              ],
+              "doc": "Multi-worker partitioned sequence that echoes pushed-down filters",
+              "name": "filter_echo_partitioned",
+              "type": "table"
+            },
+            {
+              "args": [],
+              "doc": "Catalog-table scan echoing pushed-down filters (backs example.data.filter_echo_table)",
+              "name": "filter_echo_table_scan",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Number of rows to generate",
+                  "name": "count",
+                  "type": "int64"
+                },
+                {
+                  "default": "2048",
+                  "desc": "Batch size for output",
+                  "name": "batch_size",
+                  "named": true,
+                  "type": "int64"
+                }
+              ],
+              "doc": "Echoes filtered_columns / has_filter_for_column / get_column_values_array",
+              "name": "filtered_columns_echo",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Number of batches before failure",
+                  "name": "fail_after",
+                  "type": "int64"
+                }
+              ],
+              "doc": "Raises an exception after N batches for testing",
+              "name": "generator_exception",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Number of rows to generate",
+                  "name": "count",
+                  "type": "int64"
+                },
+                {
+                  "default": "2048",
+                  "desc": "Batch size for output",
+                  "name": "batch_size",
+                  "named": true,
+                  "type": "int64"
+                },
+                {
+                  "default": "false",
+                  "desc": "Emit a deliberately non-unique row_id (index // 2)",
+                  "name": "dup_row_id",
+                  "named": true,
+                  "type": "bool"
+                },
+                {
+                  "default": "0",
+                  "desc": "Emit NULL ord every Nth row (0 = never)",
+                  "name": "null_ord_stride",
+                  "named": true,
+                  "type": "int64"
+                }
+              ],
+              "doc": "Rowid generator that participates in late materialization",
+              "name": "late_materialization",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Number of values to generate",
+                  "name": "count",
+                  "type": "int64"
+                }
+              ],
+              "doc": "Emits log messages during generation",
+              "name": "logging_generator",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Start value",
+                  "name": "start",
+                  "type": "int64"
+                },
+                {
+                  "desc": "Stop value",
+                  "name": "stop",
+                  "type": "int64"
+                }
+              ],
+              "doc": "Generate integer pairs (i, i*2)",
+              "name": "make_pairs",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Start integer value",
+                  "name": "start",
+                  "type": "int64"
+                },
+                {
+                  "desc": "Label prefix for string column",
+                  "name": "label",
+                  "type": "string"
+                }
+              ],
+              "doc": "Generate mixed int/string pairs",
+              "name": "make_pairs",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Prefix for column a",
+                  "name": "prefix",
+                  "type": "string"
+                },
+                {
+                  "desc": "Suffix for column b",
+                  "name": "suffix",
+                  "type": "string"
+                }
+              ],
+              "doc": "Generate string pairs with prefix and suffix",
+              "name": "make_pairs",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Number of values to generate",
+                  "name": "count",
+                  "type": "int64"
+                }
+              ],
+              "doc": "Generate integers from 0 to count-1",
+              "name": "make_series",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Comma-separated integers",
+                  "name": "values",
+                  "type": "string"
+                }
+              ],
+              "doc": "Parse comma-separated integers into rows",
+              "name": "make_series",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Step size between values",
+                  "name": "step",
+                  "type": "double"
+                }
+              ],
+              "doc": "Generate 10 float values with given step size",
+              "name": "make_series",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Start value (inclusive)",
+                  "name": "start",
+                  "type": "int64"
+                },
+                {
+                  "desc": "Stop value (exclusive)",
+                  "name": "stop",
+                  "type": "int64"
+                }
+              ],
+              "doc": "Generate integers from start to stop-1",
+              "name": "make_series",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Start value (inclusive)",
+                  "name": "start",
+                  "type": "int64"
+                },
+                {
+                  "desc": "Stop value (exclusive)",
+                  "name": "stop",
+                  "type": "int64"
+                },
+                {
+                  "desc": "Step between values",
+                  "name": "step",
+                  "type": "int64"
+                }
+              ],
+              "doc": "Generate integers from start to stop-1 with step",
+              "name": "make_series",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Scope path for secret lookup",
+                  "name": "path",
+                  "type": "string"
+                }
+              ],
+              "doc": "Demo: two same-type scoped secrets resolved in one bind",
+              "name": "multi_secret_demo",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Number of rows to generate",
+                  "name": "count",
+                  "type": "int64"
+                },
+                {
+                  "default": "true",
+                  "desc": "Boolean echoed in output",
+                  "name": "enabled",
+                  "named": true,
+                  "type": "bool"
+                },
+                {
+                  "default": "\"hello\"",
+                  "desc": "Greeting text echoed in output",
+                  "name": "greeting",
+                  "named": true,
+                  "type": "string"
+                },
+                {
+                  "default": "1",
+                  "desc": "Multiplier for value column",
+                  "name": "multiplier",
+                  "named": true,
+                  "type": "int64"
+                },
+                {
+                  "default": "1.0",
+                  "desc": "Scale factor for float_value column",
+                  "name": "scale",
+                  "named": true,
+                  "type": "double"
+                }
+              ],
+              "doc": "Echoes named parameter values in output columns",
+              "name": "named_params_echo",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Number of rows to generate",
+                  "name": "count",
+                  "type": "int64"
+                },
+                {
+                  "default": "2048",
+                  "desc": "Batch size for output",
+                  "name": "batch_size",
+                  "named": true,
+                  "type": "int64"
+                },
+                {
+                  "default": "20",
+                  "desc": "Max items in history list",
+                  "name": "history_size",
+                  "named": true,
+                  "type": "int64"
+                }
+              ],
+              "doc": "Generates a sequence with nested struct and list columns",
+              "name": "nested_sequence",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Number of rows to generate",
+                  "name": "count",
+                  "type": "int64"
+                },
+                {
+                  "default": "2048",
+                  "desc": "Batch size for output",
+                  "name": "batch_size",
+                  "named": true,
+                  "type": "int64"
+                }
+              ],
+              "doc": "Echoes ORDER BY + LIMIT pushdown hints in output",
+              "name": "order_echo",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Number of overlapping partitions",
+                  "name": "partitions",
+                  "type": "int64"
+                },
+                {
+                  "default": "10",
+                  "desc": "Rows per partition",
+                  "name": "rows_per_partition",
+                  "named": true,
+                  "type": "int64"
+                }
+              ],
+              "doc": "Overlapping per-chunk integer ranges on ``key``. Declares OVERLAPPING_PARTITIONS (wire-level only; DuckDB falls back to HASH_GROUP_BY for now).",
+              "name": "overlapping_range_partitioned",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Total number of integers to generate",
+                  "name": "count",
+                  "type": "int64"
+                }
+              ],
+              "doc": "Multi-worker partitioned sequence with per-batch batch_index tagging; parallel scan + ordered sink reassembly.",
+              "name": "partitioned_batch_index",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Total number of rows to generate",
+                  "name": "count",
+                  "type": "int64"
+                },
+                {
+                  "default": "1000",
+                  "desc": "Rows per partition",
+                  "name": "chunk_size",
+                  "named": true,
+                  "type": "int64"
+                }
+              ],
+              "doc": "Two-column batch_index demo: rows are (partition_id, seq). Tests assert that DuckDB's ordered sinks reassemble output in partition_id order under parallel execution.",
+              "name": "partitioned_batch_index_marked",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Total number of integers to generate",
+                  "name": "count",
+                  "type": "int64"
+                }
+              ],
+              "doc": "Multi-worker partitioned sequence; preserves_order=FIXED_ORDER (DuckDB serializes the pipeline so a single worker produces all rows).",
+              "name": "partitioned_fixed_order",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Total number of integers to generate",
+                  "name": "count",
+                  "type": "int64"
+                }
+              ],
+              "doc": "Multi-worker partitioned sequence; preserves_order=NO_ORDER_GUARANTEE (maps to DuckDB NO_ORDER).",
+              "name": "partitioned_no_order_guarantee",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Total number of integers to generate",
+                  "name": "count",
+                  "type": "int64"
+                }
+              ],
+              "doc": "Multi-worker partitioned sequence; preserves_order=PRESERVES_ORDER (maps to DuckDB INSERTION_ORDER).",
+              "name": "partitioned_preserves_order",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Total number of integers to generate",
+                  "name": "count",
+                  "type": "int64"
+                },
+                {
+                  "default": "1",
+                  "desc": "Step between values",
+                  "name": "increment",
+                  "named": true,
+                  "type": "int64"
+                }
+              ],
+              "doc": "Generates a partitioned sequence for multi-worker execution",
+              "name": "partitioned_sequence",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Rows per category partition",
+                  "name": "rows_per_category",
+                  "type": "int64"
+                }
+              ],
+              "doc": "Partition column ``category`` is in the bind schema and the emitted batches; worker uses the explicit ``partition_values=`` override on ``out.emit`` to exercise the override code path.",
+              "name": "partitioned_with_explicit_override",
+              "type": "table"
+            },
+            {
+              "args": [],
+              "doc": "Scan products table",
+              "name": "products_scan",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Number of rows to generate",
+                  "name": "count",
+                  "type": "int64"
+                },
+                {
+                  "default": "2048",
+                  "desc": "Batch size for output",
+                  "name": "batch_size",
+                  "named": true,
+                  "type": "int64"
+                },
+                {
+                  "default": "1",
+                  "desc": "Step between values",
+                  "name": "increment",
+                  "named": true,
+                  "type": "int64"
+                }
+              ],
+              "doc": "Sequence generator publishing diagnostics under EXPLAIN ANALYZE",
+              "name": "profiling_demo",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Number of rows to generate",
+                  "name": "count",
+                  "type": "int64"
+                }
+              ],
+              "doc": "Generates data with 4 columns, supporting projection pushdown",
+              "name": "projected_data",
+              "type": "table"
+            },
+            {
+              "args": [],
+              "doc": "Scan projects table",
+              "name": "projects_scan",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Rows per (region, year) partition",
+                  "name": "rows_per_partition",
+                  "type": "int64"
+                }
+              ],
+              "doc": "Per-(region, year) value rows. Declares both region and year as SINGLE_VALUE partition columns; GROUP BY region, year plans as PARTITIONED_AGGREGATE.",
+              "name": "region_year_partitioned",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Number of times to repeat each input batch",
+                  "name": "repeat_count",
+                  "type": "int64"
+                }
+              ],
+              "doc": "Duplicates each input batch N times",
+              "name": "repeat_inputs",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Number of rows to generate",
+                  "name": "count",
+                  "type": "int64"
+                },
+                {
+                  "desc": "Integer values to repeat",
+                  "name": "values",
+                  "type": "int64"
+                }
+              ],
+              "doc": "Repeat integer values for N rows",
+              "name": "repeat_value",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Number of rows to generate",
+                  "name": "count",
+                  "type": "int64"
+                },
+                {
+                  "desc": "String values to repeat",
+                  "name": "values",
+                  "type": "string"
+                }
+              ],
+              "doc": "Repeat string values for N rows",
+              "name": "repeat_value",
+              "type": "table"
+            },
+            {
+              "args": [],
+              "doc": "rff_multi — top-level + struct subfield required paths",
+              "name": "rff_multi_scan",
+              "type": "table"
+            },
+            {
+              "args": [],
+              "doc": "rff_nested — nested STRUCT(wrapper.mid.leaf) for required_field_filter_paths tests",
+              "name": "rff_nested_scan",
+              "type": "table"
+            },
+            {
+              "args": [],
+              "doc": "rff_none — control table with no required_field_filter_paths",
+              "name": "rff_none_scan",
+              "type": "table"
+            },
+            {
+              "args": [],
+              "doc": "rff_rowid — row_id virtual column + bbox.* required filters",
+              "name": "rff_rowid_scan",
+              "type": "table"
+            },
+            {
+              "args": [],
+              "doc": "rff_simple — flat columns (a, b) for required_field_filter_paths tests",
+              "name": "rff_simple_scan",
+              "type": "table"
+            },
+            {
+              "args": [],
+              "doc": "rff_struct — STRUCT(s.a, s.b) + other for required_field_filter_paths tests",
+              "name": "rff_struct_scan",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Number of rows to generate",
+                  "name": "count",
+                  "type": "int64"
+                },
+                {
+                  "default": "\"first\"",
+                  "desc": "Row ID column position",
+                  "name": "layout",
+                  "named": true,
+                  "type": "string"
+                },
+                {
+                  "default": "\"int64\"",
+                  "desc": "Row ID type",
+                  "name": "row_id_type",
+                  "named": true,
+                  "type": "string"
+                }
+              ],
+              "doc": "Sequence with row_id column",
+              "name": "rowid_sequence",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Number of rows to generate",
+                  "name": "count",
+                  "type": "int64"
+                },
+                {
+                  "default": "2048",
+                  "desc": "Batch size for output",
+                  "name": "batch_size",
+                  "named": true,
+                  "type": "int64"
+                }
+              ],
+              "doc": "Echoes TABLESAMPLE pushdown hints in output",
+              "name": "sample_echo",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Scope path for secret lookup",
+                  "name": "path",
+                  "type": "string"
+                }
+              ],
+              "doc": "Demo: resolves scoped secret based on argument",
+              "name": "scoped_secret_demo",
+              "type": "table"
+            },
+            {
+              "args": [],
+              "doc": "Outputs secret contents as key-value rows",
+              "name": "secret_demo",
+              "type": "table"
+            },
+            {
+              "args": [],
+              "doc": "Append a resolved secret value to each input row",
+              "name": "secret_in_out",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "default": "\"vgi_example\"",
+                  "desc": "Secret type to fetch, scoped by the source path",
+                  "name": "secret_type",
+                  "named": true,
+                  "type": "string"
+                }
+              ],
+              "doc": "Emit the resolved secret's api_key as a single VARCHAR row",
+              "name": "secret_lines_reader",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Number of rows to generate",
+                  "name": "count",
+                  "type": "int64"
+                },
+                {
+                  "default": "2048",
+                  "desc": "Batch size for output",
+                  "name": "batch_size",
+                  "named": true,
+                  "type": "int64"
+                },
+                {
+                  "default": "1",
+                  "desc": "Step between values",
+                  "name": "increment",
+                  "named": true,
+                  "type": "int64"
+                }
+              ],
+              "doc": "Generates a sequence of integers from 0 to n-1",
+              "name": "sequence",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Number of rows to generate",
+                  "name": "count",
+                  "type": "int64"
+                }
+              ],
+              "doc": "Generates data demonstrating settings are passed",
+              "name": "settings_aware",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Path to append to when on_cancel fires",
+                  "name": "probe_path",
+                  "type": "string"
+                },
+                {
+                  "default": "1000000",
+                  "desc": "Total rows to produce (caps the source)",
+                  "name": "count",
+                  "named": true,
+                  "type": "int64"
+                },
+                {
+                  "default": "50",
+                  "desc": "Sleep per batch (ms)",
+                  "name": "sleep_ms",
+                  "named": true,
+                  "type": "int64"
+                }
+              ],
+              "doc": "Slow producer with an on_cancel file-writing probe (test fixture)",
+              "name": "slow_cancellable",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Path to append to when on_cancel fires",
+                  "name": "probe_path",
+                  "type": "string"
+                },
+                {
+                  "default": "50",
+                  "desc": "Sleep per batch (ms)",
+                  "name": "sleep_ms",
+                  "named": true,
+                  "type": "int64"
+                }
+              ],
+              "doc": "Slow table-in-out with on_cancel probe (test fixture)",
+              "name": "slow_cancellable_inout",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Number of points to generate",
+                  "name": "count",
+                  "type": "int64"
+                },
+                {
+                  "default": "1024",
+                  "desc": "Rows per batch",
+                  "name": "batch_size",
+                  "named": true,
+                  "type": "int64"
+                }
+              ],
+              "doc": "Generates points on a grid with geometry for spatial filter testing",
+              "name": "spatial_filter_example",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Number of rows to generate",
+                  "name": "count",
+                  "type": "int64"
+                }
+              ],
+              "doc": "Generate a sequence configured by a struct setting",
+              "name": "struct_settings",
+              "type": "table"
+            },
+            {
+              "args": [],
+              "doc": "Distributed sum using simple callback API",
+              "name": "sum_all_columns_simple_distributed",
+              "type": "table_in_out"
+            },
+            {
+              "args": [],
+              "doc": "Generates 10000 integers from 0 to 9999",
+              "name": "ten_thousand",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Resolved data version",
+                  "name": "version",
+                  "type": "int64"
+                }
+              ],
+              "doc": "Columns-based time-travel + filter-pushdown scan (version via arg).",
+              "name": "tt_pushdown_cols_scan",
+              "type": "table"
+            },
+            {
+              "args": [],
+              "doc": "Function-backed time-travel + filter-pushdown scan (reads AT at init).",
+              "name": "tt_pushdown_scan",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Cache key, scoped to the current transaction",
+                  "name": "key",
+                  "type": "string"
+                },
+                {
+                  "desc": "Value to cache on first call; ignored on cache hit",
+                  "name": "seed",
+                  "type": "int64"
+                }
+              ],
+              "doc": "Return a value cached per (transaction_opaque_data, key) via transaction_storage.",
+              "name": "tx_cached_value",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Number of rows to emit",
+                  "name": "n",
+                  "type": "int64"
+                },
+                {
+                  "default": "\"b'vgi'\"",
+                  "desc": "Blob const (BLOB)",
+                  "name": "blob",
+                  "named": true,
+                  "type": "binary"
+                },
+                {
+                  "default": "2.5",
+                  "desc": "Float const (DOUBLE)",
+                  "name": "f",
+                  "named": true,
+                  "type": "double"
+                },
+                {
+                  "default": "\"datetime.timedelta(seconds=1, microseconds=500000)\"",
+                  "desc": "Interval const (INTERVAL)",
+                  "name": "iv",
+                  "named": true,
+                  "type": "duration[ns]"
+                },
+                {
+                  "default": "\"datetime.datetime(2026, 1, 2, 3, 4, 5, tzinfo=datetime.timezone.utc)\"",
+                  "desc": "Timestamp const (TIMESTAMPTZ)",
+                  "name": "ts",
+                  "named": true,
+                  "type": "timestamp[us, tz=UTC]"
+                },
+                {
+                  "default": "9",
+                  "desc": "Unsigned const (UBIGINT)",
+                  "name": "ub",
+                  "named": true,
+                  "type": "uint64"
+                }
+              ],
+              "doc": "Echoes typed const args (timestamp/interval/blob/ubigint) into typed columns",
+              "name": "typed_probe",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Union values whose active member tag is echoed back",
+                  "name": "configs",
+                  "type": "sparse_union<i: int64=0, s: string=1>"
+                }
+              ],
+              "doc": "Echo the active member tag and value of each union vararg",
+              "name": "union_varargs",
+              "type": "table"
+            },
+            {
+              "args": [],
+              "doc": "Invert nest_tensor, streaming one row per cell (LATERAL-friendly)",
+              "name": "unnest_tensor_rows",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Number of candidate rows (keys 0..count-1)",
+                  "name": "count",
+                  "type": "int64"
+                },
+                {
+                  "default": "2048",
+                  "desc": "Batch size for output",
+                  "name": "batch_size",
+                  "named": true,
+                  "type": "int64"
+                }
+              ],
+              "doc": "Prunes the key set via get_column_values('n'); echoes the resolved discrete values",
+              "name": "value_prune",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Data version",
+                  "name": "version",
+                  "type": "int64"
+                }
+              ],
+              "doc": "Scan versioned constraints table",
+              "name": "versioned_constraints_scan",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Data version to return",
+                  "name": "version",
+                  "type": "int64"
+                }
+              ],
+              "doc": "Returns versioned data with schema evolution",
+              "name": "versioned_data_scan",
+              "type": "table"
+            },
+            {
+              "args": [],
+              "doc": "buffer_input variant using batch_index to reconstruct order",
+              "name": "batch_index_buffer_input",
+              "type": "table_in_out"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Number of rows to emit in one finalize batch",
+                  "name": "rows",
+                  "type": "int64"
+                }
+              ],
+              "doc": "Emit a single finalize batch of N rows (vector-size repro)",
+              "name": "buffer_emit_wide",
+              "type": "table_in_out"
+            },
+            {
+              "args": [],
+              "doc": "Collects all input batches and emits during finalization",
+              "name": "buffer_input",
+              "type": "table_in_out"
+            },
+            {
+              "args": [],
+              "doc": "Worker raises during combine (test)",
+              "name": "crash_on_combine",
+              "type": "table_in_out"
+            },
+            {
+              "args": [],
+              "doc": "Worker raises during finalize (test)",
+              "name": "crash_on_finalize",
+              "type": "table_in_out"
+            },
+            {
+              "args": [],
+              "doc": "Worker SIGKILLs itself during process (test)",
+              "name": "crash_on_process",
+              "type": "table_in_out"
+            },
+            {
+              "args": [],
+              "doc": "Buffered passthrough with projection + filter pushdown",
+              "name": "echo_buffering",
+              "type": "table_in_out"
+            },
+            {
+              "args": [
+                {
+                  "default": "\",\"",
+                  "desc": "Field separator",
+                  "name": "delimiter",
+                  "named": true,
+                  "type": "string"
+                },
+                {
+                  "default": "\"\"",
+                  "desc": "If non-empty, fail mid-write when a cell equals this value",
+                  "name": "fail_on_value",
+                  "named": true,
+                  "type": "string"
+                },
+                {
+                  "default": "false",
+                  "desc": "Write a header row of column names",
+                  "name": "header",
+                  "named": true,
+                  "type": "bool"
+                },
+                {
+                  "default": "1",
+                  "desc": "When header=true, write the header line this many times",
+                  "name": "header_repeat",
+                  "named": true,
+                  "type": "int64"
+                },
+                {
+                  "desc": "Token written for SQL NULL",
+                  "name": "null_string",
+                  "named": true,
+                  "type": "string"
+                },
+                {
+                  "default": "\"overwrite\"",
+                  "desc": "Behavior when the destination file already exists",
+                  "name": "on_exists",
+                  "named": true,
+                  "type": "string"
+                }
+              ],
+              "doc": "Write the COPY source to a delimited file, preserving source order",
+              "name": "example_lines_ordered_writer",
+              "type": "table_in_out"
+            },
+            {
+              "args": [
+                {
+                  "default": "\",\"",
+                  "desc": "Field separator",
+                  "name": "delimiter",
+                  "named": true,
+                  "type": "string"
+                },
+                {
+                  "default": "\"\"",
+                  "desc": "If non-empty, fail mid-write when a cell equals this value",
+                  "name": "fail_on_value",
+                  "named": true,
+                  "type": "string"
+                },
+                {
+                  "default": "false",
+                  "desc": "Write a header row of column names",
+                  "name": "header",
+                  "named": true,
+                  "type": "bool"
+                },
+                {
+                  "default": "1",
+                  "desc": "When header=true, write the header line this many times",
+                  "name": "header_repeat",
+                  "named": true,
+                  "type": "int64"
+                },
+                {
+                  "desc": "Token written for SQL NULL",
+                  "name": "null_string",
+                  "named": true,
+                  "type": "string"
+                },
+                {
+                  "default": "\"overwrite\"",
+                  "desc": "Behavior when the destination file already exists",
+                  "name": "on_exists",
+                  "named": true,
+                  "type": "string"
+                }
+              ],
+              "doc": "Write the COPY source to a delimited text file",
+              "name": "example_lines_writer",
+              "type": "table_in_out"
+            },
+            {
+              "args": [
+                {
+                  "default": "false",
+                  "desc": "Whether to log during processing",
+                  "name": "logging",
+                  "named": true,
+                  "type": "bool"
+                }
+              ],
+              "doc": "Test function that raises exception during finalize",
+              "name": "exception_finalize",
+              "type": "table_in_out"
+            },
+            {
+              "args": [
+                {
+                  "default": "false",
+                  "desc": "Whether to log during processing",
+                  "name": "logging",
+                  "named": true,
+                  "type": "bool"
+                }
+              ],
+              "doc": "Test function that raises exception during process",
+              "name": "exception_process",
+              "type": "table_in_out"
+            },
+            {
+              "args": [],
+              "doc": "Worker sleeps in process (manual cancel test)",
+              "name": "hang_on_process",
+              "type": "table_in_out"
+            },
+            {
+              "args": [],
+              "doc": "Buffers ~1 MB per input batch into state (IPC test)",
+              "name": "large_state",
+              "type": "table_in_out"
+            },
+            {
+              "args": [],
+              "doc": "buffer_input variant with sink_order_dependent=True",
+              "name": "ordered_buffer_input",
+              "type": "table_in_out"
+            },
+            {
+              "args": [],
+              "doc": "Emits a fixed 0..15 sequence via source_order_dependent=True; input is ignored",
+              "name": "ordered_source",
+              "type": "table_in_out"
+            },
+            {
+              "args": [
+                {
+                  "default": "\"vgi_example\"",
+                  "desc": "Secret type to fetch, scoped by the destination path",
+                  "name": "secret_type",
+                  "named": true,
+                  "type": "string"
+                }
+              ],
+              "doc": "Write the resolved secret's api_key + row count to the destination",
+              "name": "secret_lines_writer",
+              "type": "table_in_out"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Path to append to when on_cancel fires",
+                  "name": "probe_path",
+                  "type": "string"
+                },
+                {
+                  "default": "1000",
+                  "desc": "Total rows to emit during finalize",
+                  "name": "count",
+                  "named": true,
+                  "type": "int64"
+                },
+                {
+                  "default": "10",
+                  "desc": "Sleep per emitted row (ms)",
+                  "name": "sleep_ms",
+                  "named": true,
+                  "type": "int64"
+                }
+              ],
+              "doc": "Slow buffered table function with an on_cancel file probe (test fixture)",
+              "name": "slow_cancellable_buffering",
+              "type": "table_in_out"
+            },
+            {
+              "args": [
+                {
+                  "default": "false",
+                  "desc": "Whether to log during processing",
+                  "name": "logging",
+                  "named": true,
+                  "type": "bool"
+                }
+              ],
+              "doc": "Computes column-wise sums across all batches",
+              "name": "sum_all_columns",
+              "type": "table_in_out"
+            }
+          ],
+          "name": "main",
+          "tables": [],
+          "views": [
+            {
+              "cols": 1,
+              "comment": "First 10 integers",
+              "def": "SELECT * FROM sequence(10)",
+              "name": "first_ten"
+            },
+            {
+              "cols": 0,
+              "comment": "Even numbers from 0 to 98",
+              "def": "SELECT * FROM sequence(100) WHERE n % 2 = 0",
+              "name": "even_numbers"
+            }
+          ]
+        },
+        {
+          "functions": [],
+          "name": "data",
+          "tables": [
+            {
+              "cols": 1,
+              "comment": "A large sequence of integers from 0 to 1,000,000",
+              "name": "large_sequence"
+            },
+            {
+              "cols": 1,
+              "comment": "Function-backed table over the no-arg ten_thousand function",
+              "name": "ten_thousand_table"
+            },
+            {
+              "cols": 3,
+              "comment": "Function-backed table over the secret-using secret_demo function",
+              "name": "secret_demo_table"
+            },
+            {
+              "cols": 1,
+              "comment": "Function-backed table with inlined cardinality (10000 rows)",
+              "name": "cardinality_inlined_table"
+            },
+            {
+              "cols": 2,
+              "comment": "Versioned data table demonstrating time travel with schema evolution",
+              "name": "versioned_data"
+            },
+            {
+              "cols": 4,
+              "comment": "Function-backed: prunes by filter AND time-travels (AT read at init).",
+              "name": "tt_pushdown_fn"
+            },
+            {
+              "cols": 4,
+              "comment": "Columns-based: prunes by filter AND time-travels (AT → version arg).",
+              "name": "tt_pushdown_cols"
+            },
+            {
+              "cols": 1,
+              "comment": "First 100 integers (demonstrates explicit columns)",
+              "name": "numbers"
+            },
+            {
+              "cols": 2,
+              "comment": "5x5 grid of points with spatial statistics",
+              "name": "geo_points"
+            },
+            {
+              "cols": 1,
+              "comment": "Numbers with volatile stats (TTL=0, always re-fetched)",
+              "name": "volatile_numbers"
+            },
+            {
+              "cols": 1,
+              "comment": "123456 integers; stats served by the sequence function, not the table",
+              "name": "funny_numbers"
+            },
+            {
+              "cols": 1,
+              "comment": "Multi-branch: UNION of sequence(50) + sequence(50) — used by multi_branch_scan.test",
+              "name": "multi_branch_numbers"
+            },
+            {
+              "cols": 1,
+              "comment": "Multi-branch with complementary branch_filters — exercises pruning",
+              "name": "multi_branch_filtered_numbers"
+            },
+            {
+              "cols": 1,
+              "comment": "Multi-branch: sequence(50) + read_parquet — used by multi_branch_heterogeneous.test",
+              "name": "multi_branch_hetero"
+            },
+            {
+              "cols": 1,
+              "comment": "Multi-branch: sequence(50) + iceberg_scan — used by multi_branch_iceberg.test",
+              "name": "multi_branch_iceberg"
+            },
+            {
+              "cols": 2,
+              "comment": "Multi-branch: column reconciliation — used by multi_branch_reconciliation.test",
+              "name": "multi_branch_recon"
+            },
+            {
+              "cols": 1,
+              "comment": "Multi-branch: VGI + read_csv — used by multi_branch_pushdown_incapable.test",
+              "name": "multi_branch_nopushdown"
+            },
+            {
+              "cols": 1,
+              "comment": "Multi-branch: empty branches list — used by multi_branch_empty_branches.test",
+              "name": "multi_branch_empty"
+            },
+            {
+              "cols": 1,
+              "comment": "Multi-branch with two writable=True arms — used by multi_branch_two_writable.test",
+              "name": "multi_branch_two_writable"
+            },
+            {
+              "cols": 3,
+              "comment": "Colors table with ENUM-derived statistics",
+              "name": "colors"
+            },
+            {
+              "cols": 3,
+              "comment": "Table with row_id at column index 0",
+              "name": "rowid_first"
+            },
+            {
+              "cols": 3,
+              "comment": "Table with row_id at column index 1",
+              "name": "rowid_middle"
+            },
+            {
+              "cols": 3,
+              "comment": "Table with row_id at column index 2",
+              "name": "rowid_last"
+            },
+            {
+              "cols": 2,
+              "comment": "Table with string row_id",
+              "name": "rowid_string"
+            },
+            {
+              "cols": 2,
+              "comment": "Table with struct row_id",
+              "name": "rowid_struct"
+            },
+            {
+              "cols": 4,
+              "comment": "Late-materialization table (1000 rows, unique rowid)",
+              "name": "late_mat"
+            },
+            {
+              "cols": 4,
+              "comment": "Late-materialization table with deliberately non-unique rowid (contract violation)",
+              "name": "late_mat_dup"
+            },
+            {
+              "cols": 4,
+              "comment": "Late-materialization table with NULLs in the ord column",
+              "name": "late_mat_nulls"
+            },
+            {
+              "cols": 3,
+              "comment": "Table with generated columns backed by sequence(10)",
+              "name": "generated_sequence"
+            },
+            {
+              "cols": 3,
+              "comment": "Department reference table",
+              "name": "departments"
+            },
+            {
+              "cols": 4,
+              "comment": "Product table with column defaults",
+              "name": "products"
+            },
+            {
+              "cols": 4,
+              "comment": "Employee table with FK to departments",
+              "name": "employees"
+            },
+            {
+              "cols": 3,
+              "comment": "Projects with composite PK and FK to departments",
+              "name": "projects"
+            },
+            {
+              "cols": 3,
+              "comment": "Catalog table echoing pushed-down filters (filter-pushdown-through-view tests).",
+              "name": "filter_echo_table"
+            },
+            {
+              "cols": 2,
+              "comment": "rff_simple — requires a filter referencing column 'a'.",
+              "name": "rff_simple"
+            },
+            {
+              "cols": 2,
+              "comment": "rff_struct — requires filters on both struct subfields s.a and s.b.",
+              "name": "rff_struct"
+            },
+            {
+              "cols": 1,
+              "comment": "rff_nested — requires a filter on the 3-deep nested path wrapper.mid.leaf.",
+              "name": "rff_nested"
+            },
+            {
+              "cols": 2,
+              "comment": "rff_multi — mixed top-level + struct subfield requirements.",
+              "name": "rff_multi"
+            },
+            {
+              "cols": 2,
+              "comment": "rff_none — control table with no required_field_filter_paths (opt-out fast path).",
+              "name": "rff_none"
+            },
+            {
+              "cols": 3,
+              "comment": "rff_rowid — row_id virtual column + required bbox.* filters.",
+              "name": "rff_rowid"
+            },
+            {
+              "cols": 2,
+              "comment": "rff_parquet — native read_parquet delegation with bbox.* required filters.",
+              "name": "rff_parquet"
+            },
+            {
+              "cols": 6,
+              "comment": "rff_hive — native read_parquet over Hive glob with bbox.* required filters.",
+              "name": "rff_hive"
+            },
+            {
+              "cols": 6,
+              "comment": "rff_hive_mixed — native read_parquet, top-level 'id' + bbox.* required filters.",
+              "name": "rff_hive_mixed"
+            },
+            {
+              "cols": 4,
+              "comment": "Table with constraints that evolve across versions",
+              "name": "versioned_constraints"
+            }
+          ],
+          "views": [
+            {
+              "cols": 1,
+              "comment": "Numbers less than 10",
+              "def": "SELECT * FROM numbers WHERE value < 10",
+              "name": "small_numbers"
+            }
+          ]
+        }
+      ],
+      "tags": {}
+    }
+  ],
+  "cupola_base": "https://cupola.query-farm.services",
+  "landing_schema_version": 1
+}
