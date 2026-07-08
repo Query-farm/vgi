@@ -5,158 +5,394 @@
   "description": "Validates GET {prefix}/describe.json. See docs/http-landing-contract.md.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["landing_schema_version", "worker", "server_id", "oauth", "cupola_base", "catalogs"],
+  "required": [
+    "landing_schema_version",
+    "worker",
+    "server_id",
+    "oauth",
+    "cupola_base",
+    "catalogs"
+  ],
   "properties": {
-    "landing_schema_version": { "type": "integer", "minimum": 1 },
+    "landing_schema_version": {
+      "type": "integer",
+      "minimum": 1
+    },
     "worker": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["name", "doc", "version", "lang"],
+      "required": [
+        "name",
+        "doc",
+        "version",
+        "lang"
+      ],
       "properties": {
-        "name": { "type": "string" },
-        "doc": { "type": "string" },
-        "version": { "type": "string" },
-        "lang": { "enum": ["python", "go", "rust", "typescript", "java"] }
+        "name": {
+          "type": "string"
+        },
+        "doc": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        },
+        "lang": {
+          "enum": [
+            "python",
+            "go",
+            "rust",
+            "typescript",
+            "java"
+          ]
+        }
       }
     },
-    "server_id": { "type": "string" },
-    "oauth": { "type": "boolean" },
-    "cupola_base": { "type": "string", "format": "uri" },
-    "catalogs": { "type": "array", "items": { "$ref": "#/$defs/catalog" } }
+    "server_id": {
+      "type": "string"
+    },
+    "oauth": {
+      "type": "boolean"
+    },
+    "cupola_base": {
+      "type": "string",
+      "format": "uri"
+    },
+    "catalogs": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/catalog"
+      }
+    }
   },
   "$defs": {
     "catalog": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["name", "implementation_version", "data_version_spec", "data_versions", "attach_options", "tags", "counts", "schemas"],
+      "required": [
+        "name",
+        "implementation_version",
+        "data_version_spec",
+        "data_versions",
+        "attach_options",
+        "tags",
+        "counts",
+        "schemas"
+      ],
       "properties": {
-        "name": { "type": "string" },
-        "implementation_version": { "type": ["string", "null"] },
-        "data_version_spec": { "type": ["string", "null"] },
-        "data_versions": { "type": "array", "items": { "$ref": "#/$defs/dataVersion" } },
-        "attach_options": { "type": "array", "items": { "$ref": "#/$defs/attachOption" } },
-        "tags": { "$ref": "#/$defs/tags" },
-        "counts": { "$ref": "#/$defs/counts" },
-        "schemas": { "type": "array", "items": { "$ref": "#/$defs/schema" } }
+        "name": {
+          "type": "string"
+        },
+        "implementation_version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "data_version_spec": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "data_versions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/dataVersion"
+          }
+        },
+        "attach_options": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/attachOption"
+          }
+        },
+        "tags": {
+          "$ref": "#/$defs/tags"
+        },
+        "counts": {
+          "$ref": "#/$defs/counts"
+        },
+        "schemas": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/schema"
+          }
+        }
       }
     },
     "dataVersion": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["spec"],
+      "required": [
+        "spec"
+      ],
       "properties": {
-        "spec": { "type": "string" },
-        "label": { "type": "string" }
+        "spec": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        }
       }
     },
     "attachOption": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["name", "type", "default", "description"],
+      "required": [
+        "name",
+        "type",
+        "default",
+        "description"
+      ],
       "properties": {
-        "name": { "type": "string" },
-        "type": { "type": "string" },
-        "default": { "type": "string" },
-        "description": { "type": "string" }
+        "name": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string"
+        },
+        "default": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        }
       }
     },
     "tags": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "title": { "type": "string" },
-        "doc_md": { "type": "string" },
-        "source_url": { "type": "string" },
-        "license": { "type": "string" },
-        "author": { "type": "string" },
-        "copyright": { "type": "string" },
-        "support_contact": { "type": "string" },
-        "support_policy_url": { "type": "string" },
-        "keywords": { "type": "array", "items": { "type": "string" } }
+        "title": {
+          "type": "string"
+        },
+        "doc_md": {
+          "type": "string"
+        },
+        "source_url": {
+          "type": "string"
+        },
+        "license": {
+          "type": "string"
+        },
+        "author": {
+          "type": "string"
+        },
+        "copyright": {
+          "type": "string"
+        },
+        "support_contact": {
+          "type": "string"
+        },
+        "support_policy_url": {
+          "type": "string"
+        },
+        "keywords": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
       }
     },
     "counts": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["schemas", "tables", "views", "functions"],
+      "required": [
+        "schemas",
+        "tables",
+        "views",
+        "functions"
+      ],
       "properties": {
-        "schemas": { "type": "integer", "minimum": 0 },
-        "tables": { "type": "integer", "minimum": 0 },
-        "views": { "type": "integer", "minimum": 0 },
-        "functions": { "type": "integer", "minimum": 0 }
+        "schemas": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "tables": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "views": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "functions": {
+          "type": "integer",
+          "minimum": 0
+        }
       }
     },
     "schema": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["name", "tables", "views", "functions"],
+      "required": [
+        "name",
+        "tables",
+        "views",
+        "functions"
+      ],
       "properties": {
-        "name": { "type": "string" },
-        "tables": { "type": "array", "items": { "$ref": "#/$defs/table" } },
-        "views": { "type": "array", "items": { "$ref": "#/$defs/view" } },
-        "functions": { "type": "array", "items": { "$ref": "#/$defs/function" } }
+        "name": {
+          "type": "string"
+        },
+        "doc": {
+          "type": "string",
+          "description": "Schema comment/description (optional, may be Markdown)"
+        },
+        "tables": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/table"
+          }
+        },
+        "views": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/view"
+          }
+        },
+        "functions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/function"
+          }
+        }
       }
     },
     "table": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["name", "cols", "comment"],
+      "required": [
+        "name",
+        "cols",
+        "comment"
+      ],
       "properties": {
-        "name": { "type": "string" },
-        "cols": { "type": "integer", "minimum": 0 },
-        "comment": { "type": "string" }
+        "name": {
+          "type": "string"
+        },
+        "cols": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "comment": {
+          "type": "string"
+        }
       }
     },
     "view": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["name", "cols", "comment", "def"],
+      "required": [
+        "name",
+        "cols",
+        "comment",
+        "def"
+      ],
       "properties": {
-        "name": { "type": "string" },
-        "cols": { "type": "integer", "minimum": 0 },
-        "comment": { "type": "string" },
-        "def": { "type": "string" }
+        "name": {
+          "type": "string"
+        },
+        "cols": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "comment": {
+          "type": "string"
+        },
+        "def": {
+          "type": "string"
+        }
       }
     },
     "function": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["name", "type", "doc", "args"],
+      "required": [
+        "name",
+        "type",
+        "doc",
+        "args"
+      ],
       "properties": {
-        "name": { "type": "string" },
-        "type": { "enum": ["scalar", "table", "aggregate", "table_in_out"] },
-        "doc": { "type": "string" },
-        "args": { "type": "array", "items": { "$ref": "#/$defs/arg" } },
-        "returns": { "type": "string" }
+        "name": {
+          "type": "string"
+        },
+        "type": {
+          "enum": [
+            "scalar",
+            "table",
+            "aggregate",
+            "table_in_out"
+          ]
+        },
+        "doc": {
+          "type": "string"
+        },
+        "args": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/arg"
+          }
+        },
+        "returns": {
+          "type": "string"
+        }
       }
     },
     "arg": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["name", "type"],
+      "required": [
+        "name",
+        "type"
+      ],
       "properties": {
-        "name": { "type": "string" },
-        "type": { "type": "string" },
-        "named": { "type": "boolean" },
-        "default": { "type": "string" },
-        "desc": { "type": "string" }
+        "name": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string"
+        },
+        "named": {
+          "type": "boolean"
+        },
+        "default": {
+          "type": "string"
+        },
+        "desc": {
+          "type": "string"
+        }
       }
     },
     "columns": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["columns"],
+      "required": [
+        "columns"
+      ],
       "properties": {
         "columns": {
           "type": "array",
           "items": {
             "type": "object",
             "additionalProperties": false,
-            "required": ["name", "type"],
+            "required": [
+              "name",
+              "type"
+            ],
             "properties": {
-              "name": { "type": "string" },
-              "type": { "type": "string" },
-              "comment": { "type": "string" }
+              "name": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string"
+              },
+              "comment": {
+                "type": "string"
+              }
             }
           }
         }
