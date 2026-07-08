@@ -3,7 +3,7 @@
     {
       "attach_options": [],
       "counts": {
-        "functions": 162,
+        "functions": 165,
         "schemas": 2,
         "tables": 44,
         "views": 3
@@ -1117,6 +1117,49 @@
             {
               "args": [
                 {
+                  "desc": "Value to clamp",
+                  "name": "val",
+                  "type": "ANY"
+                },
+                {
+                  "default": "0",
+                  "desc": "Lower bound (inclusive)",
+                  "name": "lo",
+                  "named": true,
+                  "type": "int64"
+                },
+                {
+                  "default": "100",
+                  "desc": "Upper bound (inclusive)",
+                  "name": "hi",
+                  "named": true,
+                  "type": "int64"
+                }
+              ],
+              "doc": "Clamp a value between lo and hi (defaults: 0..100)",
+              "name": "vgi_clamp",
+              "type": "scalar"
+            },
+            {
+              "args": [
+                {
+                  "desc": "First factor",
+                  "name": "x",
+                  "type": "ANY"
+                },
+                {
+                  "desc": "Second factor",
+                  "name": "y",
+                  "type": "ANY"
+                }
+              ],
+              "doc": "Multiply two values",
+              "name": "vgi_multiply",
+              "type": "scalar"
+            },
+            {
+              "args": [
+                {
                   "desc": "dummy input",
                   "name": "x",
                   "type": "int64"
@@ -2208,12 +2251,6 @@
             },
             {
               "args": [],
-              "doc": "Distributed sum using simple callback API",
-              "name": "sum_all_columns_simple_distributed",
-              "type": "table_in_out"
-            },
-            {
-              "args": [],
               "doc": "Generates 10000 integers from 0 to 9999",
               "name": "ten_thousand",
               "type": "table"
@@ -2359,6 +2396,18 @@
               ],
               "doc": "Returns versioned data with schema evolution",
               "name": "versioned_data_scan",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Number of rows to generate",
+                  "name": "n",
+                  "type": "ANY"
+                }
+              ],
+              "doc": "Table macro returning range of values",
+              "name": "vgi_range_table",
               "type": "table"
             },
             {
@@ -2609,6 +2658,12 @@
               ],
               "doc": "Computes column-wise sums across all batches",
               "name": "sum_all_columns",
+              "type": "table_in_out"
+            },
+            {
+              "args": [],
+              "doc": "Distributed sum using simple callback API",
+              "name": "sum_all_columns_simple_distributed",
               "type": "table_in_out"
             }
           ],
