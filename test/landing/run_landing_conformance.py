@@ -112,9 +112,7 @@ def check(
             import difflib
 
             diff = list(
-                difflib.unified_diff(
-                    want.strip().splitlines(), got.strip().splitlines(), "golden", "live", lineterm=""
-                )
+                difflib.unified_diff(want.strip().splitlines(), got.strip().splitlines(), "golden", "live", lineterm="")
             )
             snippet = "\n".join(diff[:40])
             fails.append(f"describe.json does not match golden {golden_path.name}:\n{snippet}")
