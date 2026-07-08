@@ -14,6 +14,240 @@
       "name": "example",
       "schemas": [
         {
+          "functions": [],
+          "name": "data",
+          "tables": [
+            {
+              "cols": 1,
+              "comment": "Function-backed table with inlined cardinality (10000 rows)",
+              "name": "cardinality_inlined_table"
+            },
+            {
+              "cols": 3,
+              "comment": "Colors table with ENUM-derived statistics",
+              "name": "colors"
+            },
+            {
+              "cols": 3,
+              "comment": "Department reference table",
+              "name": "departments"
+            },
+            {
+              "cols": 4,
+              "comment": "Employee table with FK to departments",
+              "name": "employees"
+            },
+            {
+              "cols": 3,
+              "comment": "Catalog table echoing pushed-down filters (filter-pushdown-through-view tests).",
+              "name": "filter_echo_table"
+            },
+            {
+              "cols": 1,
+              "comment": "123456 integers; stats served by the sequence function, not the table",
+              "name": "funny_numbers"
+            },
+            {
+              "cols": 3,
+              "comment": "Table with generated columns backed by sequence(10)",
+              "name": "generated_sequence"
+            },
+            {
+              "cols": 2,
+              "comment": "5x5 grid of points with spatial statistics",
+              "name": "geo_points"
+            },
+            {
+              "cols": 1,
+              "comment": "A large sequence of integers from 0 to 1,000,000",
+              "name": "large_sequence"
+            },
+            {
+              "cols": 4,
+              "comment": "Late-materialization table (1000 rows, unique rowid)",
+              "name": "late_mat"
+            },
+            {
+              "cols": 4,
+              "comment": "Late-materialization table with deliberately non-unique rowid (contract violation)",
+              "name": "late_mat_dup"
+            },
+            {
+              "cols": 4,
+              "comment": "Late-materialization table with NULLs in the ord column",
+              "name": "late_mat_nulls"
+            },
+            {
+              "cols": 1,
+              "comment": "Multi-branch: empty branches list — used by multi_branch_empty_branches.test",
+              "name": "multi_branch_empty"
+            },
+            {
+              "cols": 1,
+              "comment": "Multi-branch with complementary branch_filters — exercises pruning",
+              "name": "multi_branch_filtered_numbers"
+            },
+            {
+              "cols": 1,
+              "comment": "Multi-branch: sequence(50) + read_parquet — used by multi_branch_heterogeneous.test",
+              "name": "multi_branch_hetero"
+            },
+            {
+              "cols": 1,
+              "comment": "Multi-branch: sequence(50) + iceberg_scan — used by multi_branch_iceberg.test",
+              "name": "multi_branch_iceberg"
+            },
+            {
+              "cols": 1,
+              "comment": "Multi-branch: VGI + read_csv — used by multi_branch_pushdown_incapable.test",
+              "name": "multi_branch_nopushdown"
+            },
+            {
+              "cols": 1,
+              "comment": "Multi-branch: UNION of sequence(50) + sequence(50) — used by multi_branch_scan.test",
+              "name": "multi_branch_numbers"
+            },
+            {
+              "cols": 2,
+              "comment": "Multi-branch: column reconciliation — used by multi_branch_reconciliation.test",
+              "name": "multi_branch_recon"
+            },
+            {
+              "cols": 1,
+              "comment": "Multi-branch with two writable=True arms — used by multi_branch_two_writable.test",
+              "name": "multi_branch_two_writable"
+            },
+            {
+              "cols": 1,
+              "comment": "First 100 integers (demonstrates explicit columns)",
+              "name": "numbers"
+            },
+            {
+              "cols": 4,
+              "comment": "Product table with column defaults",
+              "name": "products"
+            },
+            {
+              "cols": 3,
+              "comment": "Projects with composite PK and FK to departments",
+              "name": "projects"
+            },
+            {
+              "cols": 6,
+              "comment": "rff_hive — native read_parquet over Hive glob with bbox.* required filters.",
+              "name": "rff_hive"
+            },
+            {
+              "cols": 6,
+              "comment": "rff_hive_mixed — native read_parquet, top-level 'id' + bbox.* required filters.",
+              "name": "rff_hive_mixed"
+            },
+            {
+              "cols": 2,
+              "comment": "rff_multi — mixed top-level + struct subfield requirements.",
+              "name": "rff_multi"
+            },
+            {
+              "cols": 1,
+              "comment": "rff_nested — requires a filter on the 3-deep nested path wrapper.mid.leaf.",
+              "name": "rff_nested"
+            },
+            {
+              "cols": 2,
+              "comment": "rff_none — control table with no required_field_filter_paths (opt-out fast path).",
+              "name": "rff_none"
+            },
+            {
+              "cols": 2,
+              "comment": "rff_parquet — native read_parquet delegation with bbox.* required filters.",
+              "name": "rff_parquet"
+            },
+            {
+              "cols": 3,
+              "comment": "rff_rowid — row_id virtual column + required bbox.* filters.",
+              "name": "rff_rowid"
+            },
+            {
+              "cols": 2,
+              "comment": "rff_simple — requires a filter referencing column 'a'.",
+              "name": "rff_simple"
+            },
+            {
+              "cols": 2,
+              "comment": "rff_struct — requires filters on both struct subfields s.a and s.b.",
+              "name": "rff_struct"
+            },
+            {
+              "cols": 3,
+              "comment": "Table with row_id at column index 0",
+              "name": "rowid_first"
+            },
+            {
+              "cols": 3,
+              "comment": "Table with row_id at column index 2",
+              "name": "rowid_last"
+            },
+            {
+              "cols": 3,
+              "comment": "Table with row_id at column index 1",
+              "name": "rowid_middle"
+            },
+            {
+              "cols": 2,
+              "comment": "Table with string row_id",
+              "name": "rowid_string"
+            },
+            {
+              "cols": 2,
+              "comment": "Table with struct row_id",
+              "name": "rowid_struct"
+            },
+            {
+              "cols": 3,
+              "comment": "Function-backed table over the secret-using secret_demo function",
+              "name": "secret_demo_table"
+            },
+            {
+              "cols": 1,
+              "comment": "Function-backed table over the no-arg ten_thousand function",
+              "name": "ten_thousand_table"
+            },
+            {
+              "cols": 4,
+              "comment": "Columns-based: prunes by filter AND time-travels (AT → version arg).",
+              "name": "tt_pushdown_cols"
+            },
+            {
+              "cols": 4,
+              "comment": "Function-backed: prunes by filter AND time-travels (AT read at init).",
+              "name": "tt_pushdown_fn"
+            },
+            {
+              "cols": 4,
+              "comment": "Table with constraints that evolve across versions",
+              "name": "versioned_constraints"
+            },
+            {
+              "cols": 2,
+              "comment": "Versioned data table demonstrating time travel with schema evolution",
+              "name": "versioned_data"
+            },
+            {
+              "cols": 1,
+              "comment": "Numbers with volatile stats (TTL=0, always re-fetched)",
+              "name": "volatile_numbers"
+            }
+          ],
+          "views": [
+            {
+              "cols": 1,
+              "comment": "Numbers less than 10",
+              "def": "SELECT * FROM numbers WHERE value < 10",
+              "name": "small_numbers"
+            }
+          ]
+        },
+        {
           "functions": [
             {
               "args": [
@@ -2382,250 +2616,16 @@
           "tables": [],
           "views": [
             {
-              "cols": 1,
-              "comment": "First 10 integers",
-              "def": "SELECT * FROM sequence(10)",
-              "name": "first_ten"
-            },
-            {
               "cols": 0,
               "comment": "Even numbers from 0 to 98",
               "def": "SELECT * FROM sequence(100) WHERE n % 2 = 0",
               "name": "even_numbers"
-            }
-          ]
-        },
-        {
-          "functions": [],
-          "name": "data",
-          "tables": [
-            {
-              "cols": 1,
-              "comment": "A large sequence of integers from 0 to 1,000,000",
-              "name": "large_sequence"
             },
             {
               "cols": 1,
-              "comment": "Function-backed table over the no-arg ten_thousand function",
-              "name": "ten_thousand_table"
-            },
-            {
-              "cols": 3,
-              "comment": "Function-backed table over the secret-using secret_demo function",
-              "name": "secret_demo_table"
-            },
-            {
-              "cols": 1,
-              "comment": "Function-backed table with inlined cardinality (10000 rows)",
-              "name": "cardinality_inlined_table"
-            },
-            {
-              "cols": 2,
-              "comment": "Versioned data table demonstrating time travel with schema evolution",
-              "name": "versioned_data"
-            },
-            {
-              "cols": 4,
-              "comment": "Function-backed: prunes by filter AND time-travels (AT read at init).",
-              "name": "tt_pushdown_fn"
-            },
-            {
-              "cols": 4,
-              "comment": "Columns-based: prunes by filter AND time-travels (AT → version arg).",
-              "name": "tt_pushdown_cols"
-            },
-            {
-              "cols": 1,
-              "comment": "First 100 integers (demonstrates explicit columns)",
-              "name": "numbers"
-            },
-            {
-              "cols": 2,
-              "comment": "5x5 grid of points with spatial statistics",
-              "name": "geo_points"
-            },
-            {
-              "cols": 1,
-              "comment": "Numbers with volatile stats (TTL=0, always re-fetched)",
-              "name": "volatile_numbers"
-            },
-            {
-              "cols": 1,
-              "comment": "123456 integers; stats served by the sequence function, not the table",
-              "name": "funny_numbers"
-            },
-            {
-              "cols": 1,
-              "comment": "Multi-branch: UNION of sequence(50) + sequence(50) — used by multi_branch_scan.test",
-              "name": "multi_branch_numbers"
-            },
-            {
-              "cols": 1,
-              "comment": "Multi-branch with complementary branch_filters — exercises pruning",
-              "name": "multi_branch_filtered_numbers"
-            },
-            {
-              "cols": 1,
-              "comment": "Multi-branch: sequence(50) + read_parquet — used by multi_branch_heterogeneous.test",
-              "name": "multi_branch_hetero"
-            },
-            {
-              "cols": 1,
-              "comment": "Multi-branch: sequence(50) + iceberg_scan — used by multi_branch_iceberg.test",
-              "name": "multi_branch_iceberg"
-            },
-            {
-              "cols": 2,
-              "comment": "Multi-branch: column reconciliation — used by multi_branch_reconciliation.test",
-              "name": "multi_branch_recon"
-            },
-            {
-              "cols": 1,
-              "comment": "Multi-branch: VGI + read_csv — used by multi_branch_pushdown_incapable.test",
-              "name": "multi_branch_nopushdown"
-            },
-            {
-              "cols": 1,
-              "comment": "Multi-branch: empty branches list — used by multi_branch_empty_branches.test",
-              "name": "multi_branch_empty"
-            },
-            {
-              "cols": 1,
-              "comment": "Multi-branch with two writable=True arms — used by multi_branch_two_writable.test",
-              "name": "multi_branch_two_writable"
-            },
-            {
-              "cols": 3,
-              "comment": "Colors table with ENUM-derived statistics",
-              "name": "colors"
-            },
-            {
-              "cols": 3,
-              "comment": "Table with row_id at column index 0",
-              "name": "rowid_first"
-            },
-            {
-              "cols": 3,
-              "comment": "Table with row_id at column index 1",
-              "name": "rowid_middle"
-            },
-            {
-              "cols": 3,
-              "comment": "Table with row_id at column index 2",
-              "name": "rowid_last"
-            },
-            {
-              "cols": 2,
-              "comment": "Table with string row_id",
-              "name": "rowid_string"
-            },
-            {
-              "cols": 2,
-              "comment": "Table with struct row_id",
-              "name": "rowid_struct"
-            },
-            {
-              "cols": 4,
-              "comment": "Late-materialization table (1000 rows, unique rowid)",
-              "name": "late_mat"
-            },
-            {
-              "cols": 4,
-              "comment": "Late-materialization table with deliberately non-unique rowid (contract violation)",
-              "name": "late_mat_dup"
-            },
-            {
-              "cols": 4,
-              "comment": "Late-materialization table with NULLs in the ord column",
-              "name": "late_mat_nulls"
-            },
-            {
-              "cols": 3,
-              "comment": "Table with generated columns backed by sequence(10)",
-              "name": "generated_sequence"
-            },
-            {
-              "cols": 3,
-              "comment": "Department reference table",
-              "name": "departments"
-            },
-            {
-              "cols": 4,
-              "comment": "Product table with column defaults",
-              "name": "products"
-            },
-            {
-              "cols": 4,
-              "comment": "Employee table with FK to departments",
-              "name": "employees"
-            },
-            {
-              "cols": 3,
-              "comment": "Projects with composite PK and FK to departments",
-              "name": "projects"
-            },
-            {
-              "cols": 3,
-              "comment": "Catalog table echoing pushed-down filters (filter-pushdown-through-view tests).",
-              "name": "filter_echo_table"
-            },
-            {
-              "cols": 2,
-              "comment": "rff_simple — requires a filter referencing column 'a'.",
-              "name": "rff_simple"
-            },
-            {
-              "cols": 2,
-              "comment": "rff_struct — requires filters on both struct subfields s.a and s.b.",
-              "name": "rff_struct"
-            },
-            {
-              "cols": 1,
-              "comment": "rff_nested — requires a filter on the 3-deep nested path wrapper.mid.leaf.",
-              "name": "rff_nested"
-            },
-            {
-              "cols": 2,
-              "comment": "rff_multi — mixed top-level + struct subfield requirements.",
-              "name": "rff_multi"
-            },
-            {
-              "cols": 2,
-              "comment": "rff_none — control table with no required_field_filter_paths (opt-out fast path).",
-              "name": "rff_none"
-            },
-            {
-              "cols": 3,
-              "comment": "rff_rowid — row_id virtual column + required bbox.* filters.",
-              "name": "rff_rowid"
-            },
-            {
-              "cols": 2,
-              "comment": "rff_parquet — native read_parquet delegation with bbox.* required filters.",
-              "name": "rff_parquet"
-            },
-            {
-              "cols": 6,
-              "comment": "rff_hive — native read_parquet over Hive glob with bbox.* required filters.",
-              "name": "rff_hive"
-            },
-            {
-              "cols": 6,
-              "comment": "rff_hive_mixed — native read_parquet, top-level 'id' + bbox.* required filters.",
-              "name": "rff_hive_mixed"
-            },
-            {
-              "cols": 4,
-              "comment": "Table with constraints that evolve across versions",
-              "name": "versioned_constraints"
-            }
-          ],
-          "views": [
-            {
-              "cols": 1,
-              "comment": "Numbers less than 10",
-              "def": "SELECT * FROM numbers WHERE value < 10",
-              "name": "small_numbers"
+              "comment": "First 10 integers",
+              "def": "SELECT * FROM sequence(10)",
+              "name": "first_ten"
             }
           ]
         }

@@ -109,7 +109,15 @@ def check(
         if want is None:
             fails.append(f"golden {golden_path} does not exist (run with --update)")
         elif got.strip() != want.strip():
-            fails.append(f"describe.json does not match golden {golden_path.name} (normalized diff)")
+            import difflib
+
+            diff = list(
+                difflib.unified_diff(
+                    want.strip().splitlines(), got.strip().splitlines(), "golden", "live", lineterm=""
+                )
+            )
+            snippet = "\n".join(diff[:40])
+            fails.append(f"describe.json does not match golden {golden_path.name}:\n{snippet}")
 
     return fails
 
