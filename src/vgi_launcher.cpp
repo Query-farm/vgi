@@ -12,6 +12,7 @@
 
 #include "duckdb/common/exception.hpp"
 #include "vgi_launcher_internal.hpp"
+#include "vgi_subprocess.hpp" // ResetChildSignalDispositions
 #include "vgi_unix_socket.hpp"
 
 #include <atomic>
@@ -311,6 +312,8 @@ SpawnResult SpawnWorker(const std::vector<std::string> &final_argv,
 	}
 	if (pid == 0) {
 		// --- Child ---
+		ResetChildSignalDispositions();
+
 		// Replace stdout with the write end of the pipe.
 		::close(pipefd[0]);
 		if (::dup2(pipefd[1], STDOUT_FILENO) < 0) {

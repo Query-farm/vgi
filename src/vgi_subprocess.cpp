@@ -33,6 +33,27 @@ namespace vgi {
 
 #if VGI_POSIX_TRANSPORT
 
+void ResetChildSignalDispositions() {
+	// SIGKILL / SIGSTOP cannot be reset; sigaction() on them just fails, so
+	// walking the whole range and ignoring errors is correct and cheapest.
+	for (int sig = 1; sig < NSIG; ++sig) {
+		struct sigaction sa;
+		std::memset(&sa, 0, sizeof(sa));
+		sa.sa_handler = SIG_DFL;
+		sigemptyset(&sa.sa_mask);
+		// Preserve the process-wide SIGPIPE ignore (see header).
+		if (sig == SIGPIPE) {
+			continue;
+		}
+		(void)::sigaction(sig, &sa, nullptr);
+	}
+	// The child inherits the forking thread's signal mask, and exec() preserves
+	// it — a blocked signal would otherwise stay blocked in the worker.
+	sigset_t empty;
+	sigemptyset(&empty);
+	(void)::sigprocmask(SIG_SETMASK, &empty, nullptr);
+}
+
 // Pipe implementation
 Pipe::Pipe() {
 	int fds[2];
@@ -117,6 +138,11 @@ SubProcess::SubProcess(const std::string &command, bool stderr_passthrough) {
 
 	if (pid_ == 0) {
 		// Child process
+		// Disarm the host's signal handlers before anything else — while stdout
+		// is still the host's, a handler firing here writes to the host's
+		// console under the host's identity. See ResetChildSignalDispositions().
+		ResetChildSignalDispositions();
+
 		// Redirect stdin
 		if (dup2(stdin_pipe.read_fd, STDIN_FILENO) < 0) {
 			_exit(126); // dup2 failed

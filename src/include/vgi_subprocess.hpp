@@ -15,6 +15,28 @@
 namespace duckdb {
 namespace vgi {
 
+#if VGI_POSIX_TRANSPORT
+// Restore default signal dispositions and an empty signal mask in a freshly
+// forked child, BEFORE it touches fds or execs.
+//
+// exec() resets *caught* signals to SIG_DFL for free, but the window between
+// fork() and exec() runs with the parent's handlers armed on the child's copy
+// of the parent's address space. A host process that installs its own handlers
+// — a test harness (Catch2 traps SIGTERM/SIGINT/SIGABRT/SIGSEGV/...), a server,
+// an embedder — will therefore run that handler inside the child if a signal
+// lands in the window, producing output attributed to the host and, in
+// Catch2's case, a spurious test failure the parent never sees. The child is
+// descheduled for whole milliseconds on a loaded box, so the window is not
+// theoretical.
+//
+// SIGPIPE is deliberately left alone: the extension ignores it process-wide,
+// ignored dispositions survive exec, and workers depend on that inherited
+// SIG_IGN (broken pipes must surface as EPIPE, not kill the worker).
+//
+// Every call here is async-signal-safe, as required post-fork.
+void ResetChildSignalDispositions();
+#endif
+
 // Pipe wrapper for RAII cleanup
 class Pipe {
 public:

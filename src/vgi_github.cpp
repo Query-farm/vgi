@@ -14,6 +14,7 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/main/database.hpp"
 #include "vgi_platform.hpp"
+#include "vgi_subprocess.hpp" // ResetChildSignalDispositions
 #include "vgi_transport.hpp"
 
 #include <algorithm>
@@ -327,6 +328,7 @@ int RunArgvSilent(const std::vector<std::string> &argv) {
 		return -1;
 	}
 	if (pid == 0) {
+		ResetChildSignalDispositions();
 		int devnull = ::open("/dev/null", O_WRONLY);
 		if (devnull >= 0) {
 			::dup2(devnull, STDOUT_FILENO);

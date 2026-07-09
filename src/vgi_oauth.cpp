@@ -21,6 +21,7 @@ extern "C" char *duckdb_wasm_get_page_origin(void);
 
 #include "vgi_logging.hpp"
 #include "duckdb/logging/logger.hpp"
+#include "vgi_subprocess.hpp" // ResetChildSignalDispositions
 
 #ifndef __EMSCRIPTEN__
 #include <openssl/evp.h>
@@ -621,6 +622,7 @@ void OpenBrowser(const std::string &url) {
 	// no zombie left in the DuckDB process.
 	pid_t pid = fork();
 	if (pid == 0) {
+		ResetChildSignalDispositions(); // inherited by the grandchild
 		pid_t grandchild = fork();
 		if (grandchild == 0) {
 			execlp("open", "open", url.c_str(), nullptr);
@@ -636,6 +638,7 @@ void OpenBrowser(const std::string &url) {
 #else
 	pid_t pid = fork();
 	if (pid == 0) {
+		ResetChildSignalDispositions(); // inherited by the grandchild
 		pid_t grandchild = fork();
 		if (grandchild == 0) {
 			// Redirect stderr to /dev/null
