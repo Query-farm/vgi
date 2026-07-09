@@ -102,6 +102,32 @@ void MkdirP(const std::string &path) {
 	}
 }
 
+// Short unique suffix for the same-directory atomic-write temp. Kept COMPACT so
+// the transient `<final>.tmp-<suffix>` path stays under Windows' 260-char MAX_PATH:
+// the final path already carries a 64-char identity shard + a 64-char content name,
+// so appending another 64-char SHA (the old suffix) tipped the tmp path over the
+// limit and `OpenFile(FILE_CREATE)` failed — silently disabling the whole disk tier
+// on Windows. base36(clock)+base36(seq) is ~16 chars and only needs per-directory
+// uniqueness during the brief write window (a cross-process collision self-heals:
+// the loser's CREATE throws, the memory tier still holds the entry, and the winner
+// wrote identical content-addressed bytes). NOT prefixed "stream-", so a crash-
+// orphaned atomic temp gets the reaper's SHORT grace, unlike an in-flight spill.
+std::string ShortTempSuffix() {
+	static const uint64_t base = static_cast<uint64_t>(
+	    std::chrono::steady_clock::now().time_since_epoch().count());
+	static std::atomic<uint64_t> counter{0};
+	auto b36 = [](uint64_t v) {
+		static const char *d = "0123456789abcdefghijklmnopqrstuvwxyz";
+		std::string s;
+		do {
+			s.push_back(d[v % 36]);
+			v /= 36;
+		} while (v);
+		return s;
+	};
+	return b36(base) + "-" + b36(counter.fetch_add(1, std::memory_order_relaxed));
+}
+
 // Atomic write: tmp file in the SAME directory + MoveFile (same-mount atomic).
 void WriteFileAtomic(const std::string &dir, const std::string &final_path, const std::string &bytes,
                      const std::string &tmp_suffix) {
@@ -215,7 +241,7 @@ void WriteRef(const std::string &refs_dir, const std::string &fp, const std::str
 	ref += "bytes=" + std::to_string(meta.total_bytes) + "\n";
 	ref += "catalog=" + meta.catalog_name + "\n";
 	ref += "function=" + meta.key.function_name + "\n"; // for the vgi_result_cache_disk() diagnostic
-	WriteFileAtomic(refs_dir, refs_dir + "/" + fp + ".ref", ref, fp);
+	WriteFileAtomic(refs_dir, refs_dir + "/" + fp + ".ref", ref, ShortTempSuffix());
 }
 
 // Process-unique temp-blob suffix for a streaming capture (the content sha is
@@ -1056,7 +1082,7 @@ void VgiResultCache::PersistToDisk(const VgiResultCacheEntry &entry, const std::
 		std::string content_sha = Sha256Hex(blob);
 		std::string obj_path = objects + "/" + content_sha + ".vrc";
 		if (!LocalFs().FileExists(obj_path)) {
-			WriteFileAtomic(objects, obj_path, blob, content_sha);
+			WriteFileAtomic(objects, obj_path, blob, ShortTempSuffix());
 		}
 		WriteRef(refs, fp, content_sha, ComputeExpiresUnix(entry), entry);
 	} catch (...) {
