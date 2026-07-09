@@ -1,6 +1,7 @@
 # On-Disk Compression for the VGI Result Cache — Strategy
 
-Status: **proposal** (not yet implemented). Author: cache maintainers.
+Status: **analysis complete → recommended for implementation** (Arrow built-in IPC codec,
+disk-only, `zstd:1` default). Author: cache maintainers.
 
 ## 1. Motivation
 
@@ -28,9 +29,13 @@ nothing.
   ~1 GB/s decompress cost.
 - Cross-restart / cross-process warm cache stores more history in the same space.
 
-**Why it must be optional (default off):**
-- Random/incompressible data pays compress+decompress CPU for ~0 benefit.
-- The uncompressed path has zero added latency; some deployments are CPU-bound, not disk-bound.
+**Default ON when the disk tier is enabled, but overridable:**
+- The disk tier is opt-in already (it exists to persist large / cross-restart results), and for
+  that use case denser storage is almost always wanted — so `zstd:1` is the sensible default the
+  moment someone turns disk on.
+- Kept optional (`= none`, or `= lz4` for a lower-CPU profile) because random/incompressible data
+  pays compress+decompress CPU for ~0 benefit, and some deployments are CPU-bound, not disk-bound.
+- The **memory-only** tier is never compressed — zero added latency on the hot path.
 
 ## 2. Hard constraint from the current architecture: keep per-batch random access
 
@@ -45,64 +50,105 @@ positioned into** — you'd have to decompress from the start to reach batch N. 
 flat-RAM streaming serve. The measured whole-blob win (4.10× vs 2.85× on mixed data — ~44%
 better) is real but **not worth losing the streaming serve**.
 
-→ **Compress per batch.** Each batch's IPC bytes are an independent zstd frame; the positioned
-read fetches the compressed frame and decompresses just that batch. Random access preserved.
+→ **Compress per batch.** Each batch stays an independent, self-contained compressed unit; the
+positioned read fetches just that batch's bytes and decompresses only it. Random access preserved.
 
-(A zstd **dictionary** recovers most of the cross-batch ratio while keeping per-batch access —
-see §6, a future enhancement.)
+## 3. Codec: Arrow's built-in IPC compression (`IpcWriteOptions.codec`)
 
-## 3. Codec: zstd
+**Decision (revised): use Arrow's built-in IPC buffer compression, not a hand-rolled zstd frame
+around the serialized bytes.** Arrow's `RecordBatchStreamWriter` compresses each column *buffer*
+inside the batch message and records the codec in the message's `BodyCompression` metadata; the
+reader (`RecordBatchStreamReader`) **decompresses transparently** — it detects the codec from the
+message itself.
 
-- **Already linked** (`libzstd.a` via vcpkg — visible in the link line). No new dependency.
-- Fast, tunable level, strong ratio, dictionary support. Recommend **zstd level 3** default
-  (the sweet spot above), configurable.
-- **vs Arrow IPC's built-in codec** (`IpcWriteOptions.codec = ZSTD/LZ4`): Arrow compresses
-  per-*buffer* within a batch, transparently on read. But (a) it lives at *serialize* time, so
-  it would also compress the **memory tier** (we want disk-only), and (b) it has the same
-  per-batch limitation. Applying zstd directly to the already-serialized IPC bytes at the
-  disk-write boundary is **disk-only**, needs no Arrow re-encode, and gives us level/dictionary
-  control. LZ4 remains an option for a "fast" profile.
+Why this beats compressing the IPC bytes ourselves (the previous draft's plan):
+- **Zero custom read code.** `LoadFromDisk`, `LoadFromDiskStreaming`, and
+  `CachedReplayConnection` already decode each batch through `RecordBatchStreamReader`. Because
+  the codec rides in the message, **all three keep working unchanged** — no decompress call, no
+  branch. A hand-rolled frame needs a decompress step wired into every one of those read sites.
+- **Seek is preserved for free.** Each batch is still one self-contained IPC stream; the TOC's
+  `disk_ipc_offset`/`disk_ipc_length` bracket that (now smaller) stream exactly as today. The
+  S8 flat-RAM streaming serve is untouched — this is precisely the "keep the ability to seek
+  between batches" property, and Arrow gives it to us without us maintaining a framing format.
+- **Self-describing ⇒ toggle-safe, no format version.** A batch says how it's compressed, so a
+  blob written under `zstd` still reads after the setting is flipped to `lz4` or `none`, and a
+  dir can hold a mix. The `VRC1` magic and the per-batch TOC are **unchanged** (the payload is
+  just a compressed IPC stream instead of an uncompressed one) — no `VRCZ` variant needed.
+- **No new dependency.** The extension's Arrow is already built with `ARROW_WITH_ZSTD` **and**
+  `ARROW_WITH_LZ4` (confirmed in `arrow/util/config.h`), so `arrow::util::Codec::Create(ZSTD|
+  LZ4_FRAME)` is available today. Arrow's IPC path only accepts these two codecs.
 
-## 4. Recommended design — per-batch zstd, disk-only, self-describing
+The one property we give up vs. a hand-rolled codec is a **cross-batch zstd dictionary** (§6):
+Arrow's IPC compression is per-buffer with no shared dictionary. Given the ask ("don't spend much
+CPU, compression not super high"), the dictionary's marginal ratio gain is explicitly not worth
+its cost — so foregoing it is the *right* trade, not a regret.
+
+**Keeping it disk-only.** The stored `cb.ipc` (the memory tier) stays **uncompressed** so hot
+memory hits pay zero decompress. Compression is applied at the **disk-write boundary** by
+transcoding each batch — decode the uncompressed `cb.ipc` and re-emit it with
+`IpcWriteOptions.codec` set (see §4). This resolves the only real objection to Arrow's codec
+(that it normally acts at serialize time and would compress memory too): we serialize for memory
+uncompressed, and re-serialize for disk compressed.
+
+**Level — keep it cheap.** Default **`zstd` level 1**: on the mixed workload above it lands near
+the zstd-3 ratio (~2.5–2.8×) at roughly half the compress CPU, and decompresses at ~1 GB/s (well
+under the streaming-serve batch cadence). `lz4` is offered as the minimal-CPU profile
+(~2× ratio, multi-GB/s both directions); `none` disables. Compression runs **once**, off the
+query hot path (at disk write / spill drain), and *reduces* the bytes the reader later reads —
+on a networked/slow disk it can net-*speed-up* serve even after decompression.
+
+## 4. Recommended design — transcode-at-disk-write via Arrow's codec, disk-only
 
 **Setting** (session-scoped, read per-query at InitGlobal like the other cache settings; frozen
-per capture):
+per capture). **Default-on when the disk tier is enabled**, per the ask:
 
 ```
-vgi_result_cache_disk_compression = 'none' (default) | 'zstd' | 'zstd:<level>'   [| 'lz4' later]
+vgi_result_cache_disk_compression = 'zstd' (default) | 'lz4' | 'none'
+vgi_result_cache_disk_compression_level = 1 (default; zstd only, ignored for lz4/none)
 ```
 
-**Blob format** — self-describing via the magic, so a reader auto-detects regardless of the
-current setting:
-- `VRC1` = uncompressed (today's format), `VRCZ` = per-batch zstd.
-- Per batch layout is unchanged **except** the stored `ipc_len`/payload is now the **compressed
-  frame**. zstd frames embed the decompressed size (`ZSTD_getFrameContentSize`), so **no new
-  field** is needed — the TOC's per-batch length is simply the compressed length, and
-  `disk_ipc_offset/length` point at the compressed frame.
+Only meaningful when `vgi_result_cache_dir` + `disk_max_bytes` are set (disk tier on). The
+memory-only tier is never compressed.
 
-**Capture** (`VgiCaptureDiskWriter::AppendBatch` and `DrainSubstreamToWriter`, plus the RAM→disk
-`PersistToDisk` for small memory entries):
-- `ZSTD_compress(ipc_bytes, level)` → write the frame; feed the **compressed** bytes to the
-  incremental SHA (content-addressing over stored bytes — deterministic per codec+level).
-- Optional refinement: if `compressed_len >= raw_len` (incompressible batch), store raw and set
-  a per-batch flag — avoids the rare expansion. v1 can skip this (zstd expansion is <0.1%).
+**Blob format — unchanged.** `VRC1` magic + per-batch TOC exactly as today. The only difference is
+that each batch's stored IPC stream now carries Arrow `BodyCompression`, so the payload is smaller
+and self-describing. `disk_ipc_offset/length` still bracket one complete IPC stream. **No format
+version, no new per-batch field** — the batch itself records its codec.
 
-**Serve**:
-- `CachedReplayConnection` (streaming): if `entry.codec == zstd`, positioned-read the compressed
-  frame → `ZSTD_decompress` → `arrow::io::BufferReader` → decode. One decompress per batch; RAM
-  stays one-batch (decompressed) — same as today.
-- `LoadFromDisk` (materialized, ≤`max_entry_bytes`): decompress each batch on load; the (D)
-  integrity re-hash runs over the **compressed** blob bytes (unchanged); the streaming path still
-  skips re-hash.
+**One transcode helper** — `TranscodeIpcWithCodec(uncompressed_ipc, codec, level) ->
+compressed_ipc`: `RecordBatchStreamReader` the (uncompressed) `cb.ipc` to recover the batch +
+its `custom_metadata`, then re-emit through `MakeStreamWriter(sink, schema, opts)` with
+`opts.codec = *Codec::Create(codec, level)` and re-attach the metadata. Used at both disk-write
+sites:
+- **`PersistToDisk`** (small buffered entries, RAM→disk): transcode each `cb.ipc` before it's
+  concatenated into the blob; feed the **compressed** bytes to the SHA (content-addressing over
+  stored bytes — deterministic per codec+level+Arrow version).
+- **`VgiCaptureDiskWriter`** (streaming spill, the >RAM path): transcode each batch as it drains
+  to the blob. Spill is disk-only (no memory copy), so this is the *only* serialization of those
+  batches — no double work.
 
-**Untouched:** the cache key, eligibility, never-partial invariant, the reaper, identity
-sharding, the ref format (a `codec=` field can be added for diagnostics but the magic is
-authoritative). The **memory tier stays uncompressed** (disk-only compression, per the ask).
+Decode-of-uncompressed-IPC is cheap (framing parse + zero-copy buffer views); the added cost is
+the codec's compress, once, off the query hot path. (Alternative considered — serialize twice at
+capture, once compressed for disk — rejected: it complicates the flat-RAM spill and duplicates the
+memory copy for the common small-entry case. Transcoding from the one uncompressed copy is simpler
+and only runs for disk-bound entries.)
 
-**Format coexistence / migration:** none needed. A dir can hold `VRC1` and `VRCZ` blobs at once;
-the reader always supports both. Turning the setting **off** still serves previously-written
-`VRCZ` blobs. A key re-stored under a different codec yields a different `content_sha` → a new
-blob; the old one orphans out via the reaper.
+**Serve — no code change.** `CachedReplayConnection` (streaming) and `LoadFromDisk`
+(materialized ≤ `max_entry_bytes`) already funnel every batch through `RecordBatchStreamReader`,
+which decompresses transparently. `LoadFromDiskStreaming`'s TOC walk reads the fixed per-batch
+header + `ipc_len` and seeks past the (now compressed) payload — unchanged. The (D) integrity
+re-hash runs over the on-disk (compressed) bytes — unchanged; the streaming path still skips it.
+
+**Untouched:** the cache key, eligibility, never-partial invariant, the reaper (its byte-cap
+eviction stats real file sizes, so it counts *compressed* disk usage automatically), identity
+sharding. The ref's `bytes=` stays the **logical/uncompressed** size (it drives the S8
+materialize-vs-stream threshold and `vgi_result_cache()` reporting, both of which want the
+in-memory footprint); a new `codec=` line is added for the diagnostic only.
+
+**Format coexistence / migration:** none. A dir can hold uncompressed and zstd/lz4 blobs at once;
+the reader always handles all three (the codec is in each message). Flipping the setting **off**
+still serves previously-compressed blobs. Re-storing a key under a different codec yields a
+different `content_sha` → a new blob; the old one orphans out via the reaper.
 
 ## 5. Testing plan (when implemented)
 
@@ -117,20 +163,29 @@ blob; the old one orphans out via the reaper.
 - **Perf sanity** (bench mode): capture+serve wall-time and disk bytes with/without compression on
   compressible vs random data.
 
-## 6. Future enhancement — zstd dictionary for cross-batch ratio
+## 6. Explicitly out of scope — cross-batch zstd dictionary
 
-Per-batch compression forfeits cross-batch redundancy (the 2.85× vs 4.10× gap on low-cardinality
-categoricals). A **zstd dictionary** trained on the first K batches (`ZDICT_trainFromBuffer`),
-stored once in the blob header and used to compress/decompress every batch
-(`ZSTD_compress_usingDict`), recovers most of that gap **while preserving per-batch random
-access**. Costs: dict training at capture, a header section, dict load at serve. Ship plain
-per-batch first; add the dictionary if the ratio gap proves material on real workloads.
+A **zstd dictionary** trained across batches would recover the cross-batch redundancy that
+per-batch compression forfeits (the 2.85× vs 4.10× gap on low-cardinality categoricals), while
+keeping per-batch random access. But Arrow's built-in IPC compression has **no dictionary hook** —
+adopting it would mean abandoning the transparent-read property and hand-rolling the framing +
+decompress in all three read sites. Given the ask (low CPU, ratio "not super high"), the
+dictionary's marginal gain does not justify that complexity or the extra training/compress CPU.
+**Not planned.** If a real workload ever makes cross-batch ratio critical, this section is the
+knowingly-deferred lever, and the cost of switching (custom framing) is documented here.
 
-## 7. Effort
+## 7. Effort & touch points
 
-Small–medium (~1 day). Touch points: one setting; `AppendBatch` / `DrainSubstreamToWriter` /
-`SerializeEntryBlob`(+`PersistToDisk`) on write; `LoadFromDisk` / `LoadFromDiskStreaming` /
-`CachedReplayConnection` on read; a `codec` field on the entry. No change to keys, eligibility,
-never-partial, or the reaper. zstd one-shot API (`ZSTD_compress`/`ZSTD_decompress`/
-`ZSTD_getFrameContentSize`) is trivial to wire.
+Small (~half a day). **Write side only** — the read side is free (Arrow decompresses
+transparently):
+- Two settings (`vgi_result_cache_disk_compression`, `..._level`) + per-query plumbing to the
+  singleton (mirror the existing cap settings).
+- One `TranscodeIpcWithCodec` helper (Arrow `RecordBatchStreamReader` → `MakeStreamWriter` with
+  `IpcWriteOptions.codec`).
+- Call it in `PersistToDisk` (buffered) and `VgiCaptureDiskWriter`'s drain (spill).
+- A `codec=` line in the ref + a column in `vgi_result_cache(include_disk:=true)` for
+  observability.
+
+No change to the cache key, eligibility, never-partial commit, the reaper, identity sharding, or
+any read path. No blob-format version bump. No new dependency (Arrow ZSTD/LZ4 already compiled in).
 ```
