@@ -9,6 +9,7 @@
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/file_system.hpp" // FileHandle / FileSystem positioned reads (S8)
+#include "vgi_worker_pool.hpp"           // complete PooledWorker for ReleaseForPooling's deleter
 
 namespace duckdb {
 namespace vgi {
@@ -24,6 +25,10 @@ FileSystem &ReplayLocalFs() {
 } // namespace
 
 CachedReplayConnection::~CachedReplayConnection() = default;
+
+std::unique_ptr<PooledWorker> CachedReplayConnection::ReleaseForPooling() {
+	return nullptr; // cache serve owns no worker
+}
 
 CachedReplayConnection::CachedReplayConnection(std::shared_ptr<const VgiResultCacheEntry> entry)
     : entry_(std::move(entry)) {

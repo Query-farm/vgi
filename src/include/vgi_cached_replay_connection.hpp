@@ -52,9 +52,10 @@ public:
 	int Wait() override {
 		return 0;
 	}
-	std::unique_ptr<PooledWorker> ReleaseForPooling() override {
-		return nullptr;
-	}
+	// Out-of-line: returns nullptr, but `unique_ptr<PooledWorker>` needs the complete
+	// type to instantiate its deleter (MSVC enforces this even for a null return;
+	// clang defers it). Defined in the .cpp where vgi_worker_pool.hpp is included.
+	std::unique_ptr<PooledWorker> ReleaseForPooling() override;
 	std::vector<uint8_t> GetLastStateToken() const override {
 		return {};
 	}
