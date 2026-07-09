@@ -1,0 +1,45 @@
+# name: test/sql/integration/table/positional_args.test
+# description: A function-backed catalog data-table forwards its declared Arguments to the scan-time worker bind
+# group: [vgi_integration_table]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# Regression: Table(function=..., arguments=Arguments(positional=(...,)))
+#
+# `example.data.large_sequence` is declared as
+#     Table(name="large_sequence", function=SequenceFunction,
+#           arguments=Arguments(positional=(pa.scalar(1_000_000),)))
+# and SequenceFunction's row count is a *required positional* arg (Arg(0)).
+#
+# The worker framework used to derive the table's schema from those arguments
+# but drop them when building the scan-time ScanFunctionResult, so the bind RPC
+# arrived with zero positional arguments and the scan failed with
+# `IndexError: Argument 0: index out of range (have 0 positional arguments)`.
+#
+# Scanning the table at all is therefore the assertion: the declared positional
+# argument must reach the worker's bind.
+# ============================================================================
+
+query I
+SELECT COUNT(*) FROM example.data.large_sequence;
+----
+1000000
+
+# The *value* of the positional argument reached the worker, not just some
+# argument: SequenceFunction emits 0..count-1, so max(n) pins count == 1e6.
+query II
+SELECT MIN(n), MAX(n) FROM example.data.large_sequence;
+----
+0	999999
+
+# Projection + filter pushdown over the same table still binds with the args.
+query I
+SELECT COUNT(*) FROM example.data.large_sequence WHERE n < 10;
+----
+10
