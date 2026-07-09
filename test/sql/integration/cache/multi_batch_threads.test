@@ -1,0 +1,73 @@
+# name: test/sql/integration/cache/multi_batch_threads.test
+# description: VGI result cache — multi-batch capture + serve across independent thread counts
+# group: [vgi_integration_cache]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+statement ok
+ATTACH 'example' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+# Capture a multi-batch result (cache_big = 5000 rows across ~5 batches of 1000).
+statement ok
+SET threads = 4;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query II
+SELECT COUNT(*), SUM(n) FROM ex.data.cache_big;
+----
+5000	12497500
+
+query I
+SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%result_cache.miss%';
+----
+true
+
+# The cached entry holds the complete multi-batch result.
+query II
+SELECT num_rows, (num_batches >= 2) FROM vgi_result_cache() WHERE function = 'cache_big';
+----
+5000	true
+
+# Serve at threads = 1: complete + byte-identical (row count + content sum).
+statement ok
+SET threads = 1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query II
+SELECT COUNT(*), SUM(n) FROM ex.data.cache_big;
+----
+5000	12497500
+
+query I
+SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%result_cache.hit%';
+----
+true
+
+# Serve with MORE threads than substreams: still complete + correct.
+statement ok
+SET threads = 8;
+
+query II
+SELECT COUNT(*), SUM(n) FROM ex.data.cache_big;
+----
+5000	12497500
+
+statement ok
+SET threads = 4;
+
+statement ok
+DETACH ex;

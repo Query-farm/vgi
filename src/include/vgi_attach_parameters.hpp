@@ -40,6 +40,9 @@ struct VgiAttachParametersConfig {
 	std::string catalog_name;
 	bool worker_debug = false;
 	bool use_pool = true;
+	// Per-catalog result-cache opt-out (ATTACH `cache` option). Default true;
+	// when false, this catalog's table-function results are never cached.
+	bool cache = true;
 	std::shared_ptr<CatalogAuth> auth;
 	std::string data_version_spec;
 	std::string implementation_version;
@@ -49,6 +52,11 @@ struct VgiAttachParametersConfig {
 	// LOCATIONs and rejected at parse time for any other transport.
 	std::optional<int64_t> launcher_idle_timeout_seconds;
 	std::optional<std::string> launcher_state_dir;
+	// Canonical (sorted `k=v;`) serialization of the ATTACH options, EXCLUDING
+	// the secret tokens (bearer_token / oauth_refresh_token). Folded into the
+	// result-cache key so two attaches with different options (which may route
+	// to different data/locations) never share a cache entry. Empty = none.
+	std::string attach_options_canonical;
 };
 
 // Parameters for connecting to a VGI worker
@@ -57,12 +65,14 @@ struct VgiAttachParameters {
 	// the config's defaults; callers only specify what they care about.
 	explicit VgiAttachParameters(VgiAttachParametersConfig cfg)
 	    : worker_path_(std::move(cfg.worker_path)), catalog_name_(std::move(cfg.catalog_name)),
-	      worker_debug_(cfg.worker_debug), use_pool_(cfg.use_pool), auth_(std::move(cfg.auth)),
+	      worker_debug_(cfg.worker_debug), use_pool_(cfg.use_pool), cache_(cfg.cache),
+	      auth_(std::move(cfg.auth)),
 	      data_version_spec_(std::move(cfg.data_version_spec)),
 	      implementation_version_(std::move(cfg.implementation_version)),
 	      cookie_jar_(std::move(cfg.cookie_jar)),
 	      launcher_idle_timeout_seconds_(cfg.launcher_idle_timeout_seconds),
-	      launcher_state_dir_(std::move(cfg.launcher_state_dir)) {
+	      launcher_state_dir_(std::move(cfg.launcher_state_dir)),
+	      attach_options_canonical_(std::move(cfg.attach_options_canonical)) {
 	}
 
 	// Legacy constructor — thin wrapper for in-tree call sites that haven't
@@ -73,9 +83,11 @@ struct VgiAttachParameters {
 	                    std::string data_version_spec = "", std::string implementation_version = "",
 	                    std::shared_ptr<SessionCookieJar> cookie_jar = nullptr)
 	    : VgiAttachParameters(VgiAttachParametersConfig {worker_path, catalog_name, worker_debug, use_pool,
-	                                                     std::move(auth), std::move(data_version_spec),
+	                                                     /*cache=*/true, std::move(auth),
+	                                                     std::move(data_version_spec),
 	                                                     std::move(implementation_version), std::move(cookie_jar),
-	                                                     std::nullopt, std::nullopt}) {
+	                                                     std::nullopt, std::nullopt,
+	                                                     /*attach_options_canonical=*/std::string()}) {
 	}
 
 	// Lazy-initialized, per-catalog HTTPParams cache.
@@ -102,6 +114,11 @@ struct VgiAttachParameters {
 
 	const std::string &catalog_name() const {
 		return catalog_name_;
+	}
+
+	// Per-catalog result-cache opt-out (ATTACH `cache` option; default true).
+	bool cache() const {
+		return cache_;
 	}
 
 	bool worker_debug() const {
@@ -147,6 +164,12 @@ struct VgiAttachParameters {
 		return launcher_state_dir_;
 	}
 
+	// Canonical ATTACH-options string (secret tokens excluded) folded into the
+	// result-cache key. Empty when no non-secret options were supplied.
+	const std::string &attach_options_canonical() const {
+		return attach_options_canonical_;
+	}
+
 public:
 	// Capability cache for the new catalog_table_scan_branches_get RPC.
 	// Tri-state: 0 = unknown (probe), 1 = supported, 2 = not supported.
@@ -168,12 +191,14 @@ private:
 	std::string catalog_name_;
 	bool worker_debug_;
 	bool use_pool_;
+	bool cache_;
 	std::shared_ptr<CatalogAuth> auth_;
 	std::string data_version_spec_;
 	std::string implementation_version_;
 	std::shared_ptr<SessionCookieJar> cookie_jar_;
 	std::optional<int64_t> launcher_idle_timeout_seconds_;
 	std::optional<std::string> launcher_state_dir_;
+	std::string attach_options_canonical_;
 
 	// See GetOrInitHttpParams above for the rationale behind caching these.
 	mutable std::mutex http_params_mutex_;

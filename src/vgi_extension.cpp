@@ -90,6 +90,7 @@
 #include "vgi_table_branches_function.hpp"
 #include "vgi_function_arguments_function.hpp"
 #include "vgi_clear_cache.hpp"
+#include "vgi_result_cache.hpp"
 #include "vgi_companion_catalogs.hpp"
 #include "vgi_github_functions.hpp"
 #include "vgi_worker_pool_functions.hpp"
@@ -1423,6 +1424,7 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	string catalog_name = info.path; // The first argument to ATTACH is the catalog name
 	bool worker_debug = false;
 	bool use_pool = true;
+	bool cache_enabled = true; // ATTACH `cache` option (result cache opt-out)
 	int64_t pool_max_override = -1;      // -1 = not set
 	int64_t pool_timeout_override = -1;  // -1 = not set
 	string oauth_refresh_token;
@@ -1458,10 +1460,24 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	// attach-time options after validation against the catalog's declared
 	// AttachOptionSpec list (fetched via InvokeCatalogs when present).
 	std::map<std::string, Value> attach_options;
+	// Every non-secret ATTACH option (name → string value), folded into the
+	// result-cache key so differing options (which may route to different data /
+	// locations) never share a cache entry. Excludes the secret tokens and
+	// LOCATION (already keyed via worker_path). std::map keeps it canonically
+	// sorted for a stable serialization.
+	std::map<std::string, std::string> key_options;
 
 	// Per-option handler, shared between the connection-string query (below) and
 	// the explicit (TYPE vgi, ...) options clause so both honour the same names.
 	auto apply_option = [&](const string &lower_name, const Value &value) {
+		// Record for the cache key — every option except the secret tokens and
+		// LOCATION/PATH (LOCATION is already the key's worker_path; the tokens
+		// must never enter the key or the on-disk digest).
+		if (lower_name != "type" && lower_name != "location" && lower_name != "path" &&
+		    lower_name != "bearer_token" && lower_name != "oauth_refresh_token" &&
+		    value.type().id() != LogicalTypeId::STRUCT) {
+			key_options[lower_name] = value.ToString();
+		}
 		if (lower_name == "type") {
 			return;
 		} else if (lower_name == "location" || lower_name == "path") {
@@ -1481,6 +1497,8 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 			worker_debug = value.DefaultCastAs(LogicalType::BOOLEAN).GetValue<bool>();
 		} else if (lower_name == "pool") {
 			use_pool = value.DefaultCastAs(LogicalType::BOOLEAN).GetValue<bool>();
+		} else if (lower_name == "cache") {
+			cache_enabled = value.DefaultCastAs(LogicalType::BOOLEAN).GetValue<bool>();
 		} else if (lower_name == "secrets") {
 			secrets_enabled = value.DefaultCastAs(LogicalType::BOOLEAN).GetValue<bool>();
 		} else if (lower_name == "attach_companions") {
@@ -2018,6 +2036,7 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	attach_cfg.catalog_name = catalog_name;
 	attach_cfg.worker_debug = worker_debug;
 	attach_cfg.use_pool = use_pool;
+	attach_cfg.cache = cache_enabled;
 	attach_cfg.auth = auth;
 	attach_cfg.data_version_spec = attach_result.resolved_data_version;
 	attach_cfg.implementation_version = attach_result.resolved_implementation_version;
@@ -2027,6 +2046,18 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	}
 	if (!launcher_state_dir.empty()) {
 		attach_cfg.launcher_state_dir = launcher_state_dir;
+	}
+	// Canonical (sorted) serialization of the non-secret ATTACH options for the
+	// result-cache key. std::map iteration is already sorted.
+	{
+		std::string canonical;
+		for (auto &kv : key_options) {
+			canonical += kv.first;
+			canonical += '=';
+			canonical += kv.second;
+			canonical += ';';
+		}
+		attach_cfg.attach_options_canonical = std::move(canonical);
 	}
 	auto attach_params = std::make_shared<vgi::VgiAttachParameters>(std::move(attach_cfg));
 
@@ -3145,6 +3176,48 @@ static void LoadInternal(ExtensionLoader &loader) {
 	config.AddExtensionOption("vgi_worker_pool_max", "Default per-path pool limit for VGI workers (0 = disabled)",
 	                          LogicalType::BIGINT, Value::BIGINT(256));
 
+	// Result cache (milestone 1: in-memory tier). Caches the complete result of
+	// a worker-advertised-cacheable table-function call and serves identical
+	// future calls from memory. Double-gated: only results advertising
+	// vgi.cache.* are stored, and a catalog opts out with the `cache` ATTACH option.
+	config.AddExtensionOption("vgi_result_cache",
+	                          "Enable the VGI table-function result cache (master switch; still "
+	                          "double-gated by worker advertisement + per-catalog `cache` option)",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
+	config.AddExtensionOption("vgi_result_cache_max_bytes",
+	                          "Global byte cap for the in-memory result cache (LRU eviction above it)",
+	                          LogicalType::UBIGINT, Value::UBIGINT(268435456));
+	config.AddExtensionOption("vgi_result_cache_max_entry_bytes",
+	                          "Per-entry byte cap; capture aborts (streams uncached) above it",
+	                          LogicalType::UBIGINT, Value::UBIGINT(67108864));
+	config.AddExtensionOption("vgi_result_cache_max_entries",
+	                          "Entry-count cap for the in-memory result cache (LRU eviction above it; "
+	                          "0 = unlimited). Bounds unbounded small-entry accumulation under the byte cap",
+	                          LogicalType::UBIGINT, Value::UBIGINT(131072));
+	config.AddExtensionOption("vgi_result_cache_max_inflight_bytes",
+	                          "Process-global budget for in-flight capture buffers; a capture that would "
+	                          "exceed it streams uncached (bounds concurrent-capture RAM; 0 = unbounded)",
+	                          LogicalType::UBIGINT, Value::UBIGINT(268435456));
+	config.AddExtensionOption("vgi_result_cache_disk_reap_interval_seconds",
+	                          "How often the on-disk result-cache tier is reaped (reading every ref is "
+	                          "O(total refs) I/O, so this runs on a coarser cadence than the 1s memory reap)",
+	                          LogicalType::UBIGINT, Value::UBIGINT(60));
+	config.AddExtensionOption("vgi_result_cache_default_ttl_seconds",
+	                          "Default cache TTL when a worker advertises cacheability without a ttl "
+	                          "(0 = require a worker-supplied ttl/expires)",
+	                          LogicalType::UBIGINT, Value::UBIGINT(0));
+	config.AddExtensionOption("vgi_result_cache_revalidate_min_bytes",
+	                          "Minimum stored-payload size before a stale revalidatable entry is "
+	                          "conditionally revalidated (below it, refetch instead of a conditional request)",
+	                          LogicalType::UBIGINT, Value::UBIGINT(262144));
+	config.AddExtensionOption("vgi_result_cache_dir",
+	                          "Directory for the on-disk result-cache tier (content-addressed store; "
+	                          "cross-process + cross-restart). Empty = disk tier off (memory only)",
+	                          LogicalType::VARCHAR, Value(""));
+	config.AddExtensionOption("vgi_result_cache_disk_max_bytes",
+	                          "Byte cap for the on-disk result-cache tier (0 = disk tier off)",
+	                          LogicalType::UBIGINT, Value::UBIGINT(0));
+
 	// Cache directory for worker binaries downloaded via github:// / github-auto://
 	// LOCATIONs. Empty (default) → ${XDG_CACHE_HOME:-~/.cache}/vgi/releases. Must be
 	// on an exec-capable filesystem (not a noexec runtime/tmp mount).
@@ -3195,6 +3268,12 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// Set default pool settings for paths without explicit per-path config
 	// (e.g., direct vgi_table_function() calls that don't go through ATTACH)
 	vgi::VgiWorkerPool::Instance().SetDefaultSettings({256, 5});
+
+	// Configure the result-cache global byte caps (process-global; match the
+	// AddExtensionOption defaults above). SET on these settings tightens the
+	// per-query capture guard (read from context at scan time); the global LRU
+	// cap here governs eviction.
+	vgi::VgiResultCache::Instance().Configure(vgi::VgiResultCache::Settings{});
 
 	// Register VGI table functions
 	RegisterVgiCatalogsFunction(loader);
@@ -3270,6 +3349,12 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	// Register cache management function
 	vgi::RegisterVgiClearCacheFunction(loader);
+
+	// Register result-cache diagnostics
+	vgi::RegisterVgiResultCacheFunction(loader);
+	vgi::RegisterVgiResultCacheFlushFunction(loader);
+	vgi::RegisterVgiResultCacheReapFunction(loader);
+	vgi::RegisterVgiResultCacheStatsFunction(loader);
 
 	// Register Orchard remote secret provider diagnostics
 	{

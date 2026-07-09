@@ -109,6 +109,15 @@ public:
 	const std::string &GetLastPartitionValuesBytes() const override {
 		return last_partition_values_bytes_;
 	}
+	VgiCacheControl GetLastCacheControl() const override {
+		return last_cache_control_;
+	}
+	void SetConditionalRequest(const std::string &if_none_match,
+	                           const std::string &if_modified_since) override {
+		cond_if_none_match_ = if_none_match;
+		cond_if_modified_since_ = if_modified_since;
+		cond_sent_ = false;
+	}
 
 	// State queries
 	bool IsTableInOut() const override { return input_schema_ != nullptr; }
@@ -195,7 +204,17 @@ private:
 	// as ``buffered_batch_indexes_``: the buffered path returns batches
 	// without their wire metadata, so we stash the bytes here.
 	std::vector<std::string> buffered_partition_values_bytes_;
+	// Parsed vgi.cache.* advertisement off the most recent data batch, and its
+	// parallel-to-buffered_batches_ per-batch capture (same rationale as the
+	// batch_index / partition_values vectors above). Result-cache capture reads
+	// GetLastCacheControl() on the first batch.
+	VgiCacheControl last_cache_control_;
+	std::vector<VgiCacheControl> buffered_cache_controls_;
 	size_t buffered_batch_index_ = 0;
+	// Conditional-revalidation validators (M6) sent once on the first tick.
+	std::string cond_if_none_match_;
+	std::string cond_if_modified_since_;
+	bool cond_sent_ = false;
 	bool is_producer_mode_ = false;
 
 	// Exchange mode pending input

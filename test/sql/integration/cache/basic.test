@@ -1,0 +1,118 @@
+# name: test/sql/integration/cache/basic.test
+# description: VGI result cache (in-memory) — miss/hit, behavioral serve proof, no_store, flush
+# group: [vgi_integration_cache]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+statement ok
+ATTACH 'example' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# Start from a clean cache (the cache singleton is process-global and persists
+# across .test files run in one unittest invocation).
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# First scan of a cacheable table → MISS + store
+query I
+SELECT COUNT(*) FROM ex.data.cacheable_numbers;
+----
+10
+
+query I
+SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%result_cache.miss%';
+----
+true
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# Second scan of the same table → HIT (served from cache, no worker RPC)
+query I
+SELECT COUNT(*) FROM ex.data.cacheable_numbers;
+----
+10
+
+# Pin the tier on the hit event (tier=memory) so a memory/disk mislabel is caught
+# on BOTH values, not just the disk-streaming path.
+query I
+SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI'
+    AND message LIKE '%result_cache.hit%' AND message LIKE '%tier=memory%';
+----
+true
+
+# Behavioral proof: cache_nonce emits a value that only advances on a REAL
+# worker invocation. The served value being STABLE across scans proves the
+# later scans were served from cache (the worker was not called). We compare to
+# the first observed value rather than an absolute (the worker's counter is not
+# reset between .test files that share the worker pool).
+statement ok
+CREATE TEMP TABLE nonce_first AS SELECT nonce AS v FROM ex.data.cache_nonce;
+
+query I
+SELECT (SELECT nonce FROM ex.data.cache_nonce) = (SELECT v FROM nonce_first);
+----
+true
+
+query I
+SELECT (SELECT nonce FROM ex.data.cache_nonce) = (SELECT v FROM nonce_first);
+----
+true
+
+# The cache now holds cacheable_numbers + cache_nonce (2 distinct entries).
+query I
+SELECT COUNT(*) FROM vgi_result_cache() WHERE function IN ('cacheable_numbers', 'cache_nonce');
+----
+2
+
+# no_store: advertised no_store → capture aborts → never stored (no entry).
+query I
+SELECT COUNT(*) FROM ex.data.cache_no_store;
+----
+10
+
+query I
+SELECT COUNT(*) FROM ex.data.cache_no_store;
+----
+10
+
+query I
+SELECT COUNT(*) FROM vgi_result_cache() WHERE function = 'cache_no_store';
+----
+0
+
+# vgi_result_cache_flush() clears the cache; next scan is a MISS again.
+query I
+SELECT flushed >= 2 FROM vgi_result_cache_flush();
+----
+true
+
+query I
+SELECT COUNT(*) FROM vgi_result_cache();
+----
+0
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT COUNT(*) FROM ex.data.cacheable_numbers;
+----
+10
+
+query I
+SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%result_cache.miss%';
+----
+true
+
+statement ok
+DETACH ex;

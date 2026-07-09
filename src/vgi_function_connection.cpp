@@ -7,11 +7,13 @@
 
 #include "vgi_arrow_ipc.hpp"
 #include "vgi_bind_protocol.hpp"
+#include "vgi_cache_control.hpp"
 #include "vgi_table_buffering_builders.hpp"
 #include "vgi_catalog_metadata.hpp"
 #include "vgi_container_runtime.hpp"
 #include "generated/vgi_protocol_constants.hpp"
 #include "vgi_exception.hpp"
+#include "vgi_http_client.hpp" // ResolveExternalLocation (externalized-batch resolution)
 #include "vgi_http_function_connection.hpp"
 #include "vgi_logging.hpp"
 #include "vgi_rpc_client.hpp"
@@ -756,9 +758,29 @@ InitResult FunctionConnection::PerformInit(const BindResult &bind_result,
 		// Send the first tick batch immediately. The server needs to receive and
 		// process a tick before it calls write_batch() on the output, which is
 		// what actually flushes the output IPC schema to stdout.
+		//
+		// Conditional-revalidation validators (M6) ride the FIRST tick's
+		// custom_metadata (where the worker's process() reads them, mirroring
+		// vgi_pushdown_filters) so the worker can answer 304-style with a 0-row
+		// vgi.cache.not_modified batch instead of re-streaming the payload.
 		auto tick_batch = arrow::RecordBatch::Make(
 		    tick_schema_, 0, std::vector<std::shared_ptr<arrow::Array>>{});
-		auto write_status = input_writer_->WriteRecordBatch(*tick_batch);
+		std::shared_ptr<const arrow::KeyValueMetadata> first_tick_metadata;
+		if (!cond_if_none_match_.empty() || !cond_if_modified_since_.empty()) {
+			std::vector<std::string> keys, vals;
+			if (!cond_if_none_match_.empty()) {
+				keys.emplace_back(VGI_CACHE_IF_NONE_MATCH_KEY);
+				vals.push_back(cond_if_none_match_);
+			}
+			if (!cond_if_modified_since_.empty()) {
+				keys.emplace_back(VGI_CACHE_IF_MODIFIED_SINCE_KEY);
+				vals.push_back(cond_if_modified_since_);
+			}
+			first_tick_metadata = arrow::KeyValueMetadata::Make(std::move(keys), std::move(vals));
+		}
+		auto write_status = first_tick_metadata
+		    ? input_writer_->WriteRecordBatch(*tick_batch, first_tick_metadata)
+		    : input_writer_->WriteRecordBatch(*tick_batch);
 		if (!write_status.ok()) {
 			ThrowVgiIOException("Failed to write initial tick batch: %s", worker_path_, proc_->GetPid(),
 			                    GetExecutionIdHex(), write_status.ToString());
@@ -1046,6 +1068,27 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 			continue;  // Skip log batch, read next
 		}
 
+		// External-location pointer batches: a 0-row batch carrying
+		// `vgi_rpc.location`. The worker externalized this batch (e.g. a large
+		// payload written to a shared blob store / pre-signed URL) instead of
+		// streaming it inline. Fetch + splice the real IPC data in place, then
+		// fall through to the metadata parsing below (batch_index /
+		// partition_values / cache-control ride the RESOLVED batch's metadata).
+		// Transport-independent: ResolveExternalLocation uses DuckDB's HTTPUtil,
+		// so subprocess workers get externalization just like HTTP ones. (A batch
+		// is either an external-location pointer OR a shm pointer OR inline — the
+		// shm block below is skipped for a resolved external batch.)
+		if (result.custom_metadata &&
+		    ClassifyBatch(result.batch, result.custom_metadata) == RpcBatchType::EXTERNAL_LOCATION) {
+			int loc_idx = result.custom_metadata->FindKey(RPC_LOCATION_KEY);
+			const std::string location_url = result.custom_metadata->value(loc_idx);
+			auto resolved = ResolveExternalLocation(context_, location_url, worker_path_,
+			                                        GetExecutionIdHex(), GetAttachOpaqueDataHex(),
+			                                        result.custom_metadata);
+			result.batch = resolved.batch;
+			result.custom_metadata = resolved.metadata;
+		}
+
 		// shm pointer batches: 0-row batches with shm_offset/shm_length in
 		// custom_metadata. Resolve to the actual batch from the segment.
 		// Free the prior batch's slot first — the lockstep RPC protocol
@@ -1137,6 +1180,13 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 				}
 			}
 		}
+
+		// Parse vgi.cache.* cache-control off the wire metadata. A worker
+		// advertises only on the first data batch; the result-cache capture
+		// layer reads this via GetLastCacheControl() on that first batch (same
+		// lockstep timing as last_batch_index_). Cheap: a few FindKeys, only on
+		// the data-batch path; present=false when no vgi.cache.* key is set.
+		last_cache_control_ = ParseVgiCacheControl(result.custom_metadata);
 
 		// We're committed to returning this data batch. NOW send the next tick —
 		// after FreeAllocation + shm resolve above — so the worker's allocator

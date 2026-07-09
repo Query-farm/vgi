@@ -1,0 +1,96 @@
+# name: test/sql/integration/cache/ineligible_reasons.test
+# description: VGI result cache — the ineligible-reason vocabulary is a documented contract (the primary "why isn't my query caching?" surface), so pin the reason strings: dynamic_filter (a Top-N / join-key dynamic filter has no stable key at decision time), disabled_global (vgi_result_cache=false). Also pins the first-batch opt-in boundary: an EMPTY (0-row) result emits no batch, so it can never be cached.
+# group: [vgi_integration_cache]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+statement ok
+ATTACH 'example' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+# ---- reason=dynamic_filter: ORDER BY … LIMIT pushes a dynamic (Top-N) filter
+#      into a filter-pushdown scan; its bounds tighten during the scan → no stable
+#      key at InitGlobal → never cache. The query is still CORRECT.
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT LIST(n) FROM (SELECT n FROM ex.cache_filtered(rows := 10000) ORDER BY n LIMIT 5);
+----
+[0, 1, 2, 3, 4]
+
+query I
+SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI'
+    AND message LIKE '%result_cache.ineligible%' AND message LIKE '%reason=dynamic_filter%';
+----
+true
+
+query I
+SELECT COUNT(*) FROM vgi_result_cache() WHERE function = 'cache_filtered';
+----
+0
+
+# ---- reason=disabled_global: the master switch off → ineligible, never served ----
+statement ok
+SET vgi_result_cache = false;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT COUNT(*) FROM ex.data.cacheable_numbers;
+----
+10
+
+query I
+SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI'
+    AND message LIKE '%result_cache.ineligible%' AND message LIKE '%reason=disabled_global%';
+----
+true
+
+statement ok
+SET vgi_result_cache = true;
+
+# ---- Empty (0-row) result NEVER caches (cacheability rides the FIRST batch, which
+#      an empty result never emits). Two calls both MISS; no entry; no crash. ----
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT COUNT(*) FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_bench', [0]);
+----
+0
+
+query I
+SELECT COUNT(*) FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_bench', [0]);
+----
+0
+
+# Both scans MISSed (never a hit), and nothing was cached.
+query I
+SELECT COUNT(*) FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%result_cache.hit%';
+----
+0
+
+query I
+SELECT COUNT(*) FROM vgi_result_cache() WHERE function = 'cache_bench';
+----
+0
+
+statement ok
+DETACH ex;
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();

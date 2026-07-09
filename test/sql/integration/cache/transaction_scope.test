@@ -1,0 +1,84 @@
+# name: test/sql/integration/cache/transaction_scope.test
+# description: VGI result cache — scope=transaction results are cached but ONLY reusable within the same transaction. cache_scoped_txn folds the transaction id into the key and carries a per-invocation `nonce` (bumped once per real MISS), so a second scan in the SAME transaction is a HIT (nonce unchanged) while a scan in a NEW transaction is a MISS (nonce changes). Transaction-scoped entries are memory-only (never persisted to disk).
+# group: [vgi_integration_cache]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+# Disk tier on to prove transaction-scoped entries stay MEMORY-ONLY (no blob).
+statement ok
+SET vgi_result_cache_dir = '__TEST_DIR__/vgi_txn';
+
+statement ok
+SET vgi_result_cache_disk_max_bytes = 1073741824;
+
+statement ok
+ATTACH 'example' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+# ---- Transaction 1: first scan MISS, second scan HIT (same nonce) ----------
+statement ok
+BEGIN;
+
+statement ok
+CREATE TEMP TABLE t1a AS SELECT DISTINCT nonce FROM ex.data.cache_scoped_txn;
+
+statement ok
+CREATE TEMP TABLE t1b AS SELECT DISTINCT nonce FROM ex.data.cache_scoped_txn;
+
+# Same transaction → same nonce → the second scan was served from cache.
+query I
+SELECT (SELECT nonce FROM t1a) = (SELECT nonce FROM t1b);
+----
+true
+
+statement ok
+COMMIT;
+
+# ---- Transaction 2: fresh transaction → MISS → different nonce -------------
+statement ok
+BEGIN;
+
+statement ok
+CREATE TEMP TABLE t2 AS SELECT DISTINCT nonce FROM ex.data.cache_scoped_txn;
+
+statement ok
+COMMIT;
+
+# New transaction id → different key → recomputed → nonce advanced.
+query I
+SELECT (SELECT nonce FROM t2) <> (SELECT nonce FROM t1a);
+----
+true
+
+# Two distinct memory entries (one per transaction), and NOTHING on disk
+# (transaction-scoped entries are memory-only).
+query I
+SELECT COUNT(*) FROM vgi_result_cache() WHERE function = 'cache_scoped_txn';
+----
+2
+
+query I
+SELECT COUNT(*) FROM glob('__TEST_DIR__/vgi_txn/*/objects/*.vrc');
+----
+0
+
+# The stored entries advertise scope=transaction.
+query I
+SELECT DISTINCT scope FROM vgi_result_cache() WHERE function = 'cache_scoped_txn';
+----
+transaction
+
+statement ok
+DETACH ex;
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();

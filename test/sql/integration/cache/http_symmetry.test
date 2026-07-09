@@ -1,0 +1,39 @@
+# name: test/sql/integration/cache/http_symmetry.test
+# description: VGI result cache (M7) — capture + serve work over HTTP transport
+# group: [vgi_integration_cache]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+# First scan captures; the served value being stable across a second scan proves
+# the second was served from cache (worker not re-invoked) — over whatever
+# transport the catalog is attached with (subprocess or HTTP).
+statement ok
+CREATE TEMP TABLE http_nonce AS SELECT nonce AS v FROM ex.data.cache_nonce;
+
+query I
+SELECT (SELECT nonce FROM ex.data.cache_nonce) = (SELECT v FROM http_nonce);
+----
+true
+
+query I
+SELECT COUNT(*) FROM ex.data.cacheable_numbers;
+----
+10
+
+query I
+SELECT COUNT(*) FROM vgi_result_cache() WHERE function IN ('cache_nonce', 'cacheable_numbers');
+----
+2
+
+statement ok
+DETACH ex;

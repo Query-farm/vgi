@@ -1,0 +1,91 @@
+# name: test/sql/integration/cache/parallel_capture.test
+# description: VGI result cache — AFFIRMATIVE parallel capture. cache_parallel fans out across N workers, so a cached MISS captures >1 substream (one per worker thread); a HIT reassembles the complete union on a single serve thread. This is the only cache fixture that drives num_substreams > 1.
+# group: [vgi_integration_cache]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+# The direct vgi_table_function() path resolves VGI_TEST_WORKER as the worker
+# LOCATION; under the HTTP harness that is an http:// URL (HTTP transport POSTs
+# via httpfs).
+require httpfs
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+# Fan the source out across 8 threads so the multi-worker producer actually
+# schedules multiple scan threads (one capture substream each).
+statement ok
+SET threads = 8;
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# First scan → MISS + parallel capture. SUM is the closed form sum(0..N-1) =
+# N*(N-1)/2 = 499999500000, independent of how the range was split across workers.
+query II
+SELECT COUNT(*), SUM(v) FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_parallel', [1000000]);
+----
+1000000	499999500000
+
+query I
+SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%result_cache.miss%';
+----
+true
+
+# AFFIRMATIVE PARALLELISM: the cached entry holds MORE THAN ONE substream —
+# capture genuinely ran on multiple worker threads (not a single producer).
+query I
+SELECT num_substreams > 1 FROM vgi_result_cache() WHERE function = 'cache_parallel';
+----
+true
+
+# The complete result was captured across those substreams.
+query I
+SELECT num_rows FROM vgi_result_cache() WHERE function = 'cache_parallel';
+----
+1000000
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# Second identical scan → HIT. The single-thread CachedReplayConnection flattens
+# every substream back into the complete union — byte-identical aggregate.
+query II
+SELECT COUNT(*), SUM(v) FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_parallel', [1000000]);
+----
+1000000	499999500000
+
+query I
+SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%result_cache.hit%';
+----
+true
+
+# Serve with MORE threads than substreams — still the complete union (idle
+# serve threads, no missing/duplicated rows; serve is single-threaded anyway).
+statement ok
+SET threads = 16;
+
+query II
+SELECT COUNT(*), SUM(v) FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_parallel', [1000000]);
+----
+1000000	499999500000
+
+# Serve with FEWER threads than substreams — one thread drains all substreams.
+statement ok
+SET threads = 1;
+
+query II
+SELECT COUNT(*), SUM(v) FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_parallel', [1000000]);
+----
+1000000	499999500000
+
+statement ok
+SET threads = 4;
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();

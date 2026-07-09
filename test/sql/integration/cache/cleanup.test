@@ -1,0 +1,135 @@
+# name: test/sql/integration/cache/cleanup.test
+# description: VGI result cache — reproducible cleanup (TTL reap, disk reap, LRU eviction)
+# group: [vgi_integration_cache]
+#
+# The background reaper is a 1s thread keyed on wall-clock time, so it can't be
+# tested by sleeping. vgi_result_cache_reap(advance_seconds => N) runs ONE reap
+# pass synchronously with an injected `now + N`, making TTL/disk expiry
+# deterministic. Effects are observed via vgi_result_cache() (memory) + glob (disk).
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+SET vgi_result_cache_dir = '__TEST_DIR__/vgi_cleanup';
+
+statement ok
+SET vgi_result_cache_disk_max_bytes = 1073741824;
+
+statement ok
+ATTACH 'example' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+# ---------------------------------------------------------------------------
+# 1. Memory + disk TTL reap. cacheable_numbers advertises ttl=300 (non-
+#    revalidatable), so a 400s advance lapses it in both tiers.
+# ---------------------------------------------------------------------------
+statement ok
+CREATE TEMP TABLE t AS SELECT COUNT(*) c FROM ex.data.cacheable_numbers;
+
+query I
+SELECT COUNT(*) FROM vgi_result_cache() WHERE function = 'cacheable_numbers';
+----
+1
+
+query II
+SELECT (SELECT COUNT(*) FROM glob('__TEST_DIR__/vgi_cleanup/*/refs/*.ref')),
+       (SELECT COUNT(*) FROM glob('__TEST_DIR__/vgi_cleanup/*/objects/*.vrc'));
+----
+1	1
+
+# Reap simulating 400s elapsed → the ttl=300 entry expires in memory AND on disk
+# (ref unlinked; object swept, since 400 > the 60s orphan grace window).
+query II
+SELECT memory_reaped, disk_refs_removed FROM vgi_result_cache_reap(advance_seconds => 400);
+----
+1	1
+
+query I
+SELECT COUNT(*) FROM vgi_result_cache() WHERE function = 'cacheable_numbers';
+----
+0
+
+query II
+SELECT (SELECT COUNT(*) FROM glob('__TEST_DIR__/vgi_cleanup/*/refs/*.ref')),
+       (SELECT COUNT(*) FROM glob('__TEST_DIR__/vgi_cleanup/*/objects/*.vrc'));
+----
+0	0
+
+# ---------------------------------------------------------------------------
+# 2. A short advance does NOT reap a still-fresh entry (no premature cleanup).
+# ---------------------------------------------------------------------------
+statement ok
+SELECT COUNT(*) FROM ex.data.cacheable_numbers;
+
+query II
+SELECT memory_reaped, disk_refs_removed FROM vgi_result_cache_reap(advance_seconds => 10);
+----
+0	0
+
+query I
+SELECT COUNT(*) FROM vgi_result_cache() WHERE function = 'cacheable_numbers';
+----
+1
+
+# ---------------------------------------------------------------------------
+# 3. Revalidatable entries survive reaping (they refresh on access, not on TTL).
+#    cache_revalidatable is stored immediately-stale + revalidatable.
+# ---------------------------------------------------------------------------
+statement ok
+SELECT nonce FROM ex.data.cache_revalidatable;
+
+query I
+SELECT COUNT(*) FROM vgi_result_cache() WHERE function = 'cache_revalidatable' AND stale AND revalidatable;
+----
+1
+
+# Even a huge advance leaves the revalidatable entry in place.
+statement ok
+SELECT * FROM vgi_result_cache_reap(advance_seconds => 100000);
+
+query I
+SELECT COUNT(*) FROM vgi_result_cache() WHERE function = 'cache_revalidatable';
+----
+1
+
+# ---------------------------------------------------------------------------
+# 4. LRU eviction under a byte cap (no time involved — deterministic today).
+#    Shrinking vgi_result_cache_max_bytes takes effect at the next scan's
+#    InitGlobal (Configure evicts-to-fit), so storing a new entry evicts the old.
+# ---------------------------------------------------------------------------
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+statement ok
+SELECT COUNT(*) FROM ex.data.cacheable_numbers;
+
+# One entry present under the normal cap.
+query I
+SELECT COUNT(*) FROM vgi_result_cache() WHERE function = 'cacheable_numbers';
+----
+1
+
+statement ok
+SET vgi_result_cache_max_bytes = 1;
+
+# The next scan re-Configures the cache with the 1-byte cap and evicts the prior
+# entry to fit; the fresh scan's own entry is what remains.
+statement ok
+SELECT a, b, c FROM ex.data.cache_multicol;
+
+query I
+SELECT COUNT(*) FROM vgi_result_cache() WHERE function = 'cacheable_numbers';
+----
+0
+
+statement ok
+SET vgi_result_cache_max_bytes = 268435456;
+
+statement ok
+DETACH ex;

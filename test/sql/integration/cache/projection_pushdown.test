@@ -1,0 +1,62 @@
+# name: test/sql/integration/cache/projection_pushdown.test
+# description: VGI result cache — projection-pushdown does not cross-serve columns
+# group: [vgi_integration_cache]
+#
+# For a projection_pushdown=true function, `projection_ids` are part of the cache
+# key, so `SELECT a` and `SELECT b` push distinct projections → distinct keys →
+# separate entries, each holding only its own column's bytes. One column's cached
+# result can never be served for another's.
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+# Each single-column scan pushes a distinct projection and returns its own data.
+query I
+SELECT list_sort(array_agg(a)) FROM ex.data.cache_projection;
+----
+[1, 2, 3]
+
+query I
+SELECT list_sort(array_agg(b)) FROM ex.data.cache_projection;
+----
+[10, 20, 30]
+
+query I
+SELECT list_sort(array_agg(c)) FROM ex.data.cache_projection;
+----
+[100, 200, 300]
+
+# Three distinct entries (one per projection) — never merged / cross-served.
+query I
+SELECT COUNT(*) FROM vgi_result_cache() WHERE function = 'cache_projection';
+----
+3
+
+# Repeating each projection HITs its OWN entry and returns its OWN column.
+query I
+SELECT list_sort(array_agg(a)) FROM ex.data.cache_projection;
+----
+[1, 2, 3]
+
+query I
+SELECT list_sort(array_agg(b)) FROM ex.data.cache_projection;
+----
+[10, 20, 30]
+
+# A different projection combination is a distinct key again (widening, not reuse).
+query II
+SELECT list_sort(array_agg(a)), list_sort(array_agg(b)) FROM ex.data.cache_projection;
+----
+[1, 2, 3]	[10, 20, 30]
+
+statement ok
+DETACH ex;

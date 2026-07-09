@@ -1,0 +1,76 @@
+# name: test/sql/integration/cache/spill_poison.test
+# description: VGI result cache (spill-to-disk) — the never-partial invariant holds ACROSS the spill boundary. With max_entry_bytes=1 the cacheable first batch spills to a disk blob immediately; the worker then errors mid-stream. The failing producer never reaches EOS, so nothing is committed AND the streamed temp blob is deleted — no orphan .vrc / .ref, no memory entry.
+# group: [vgi_integration_cache]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+statement ok
+SET vgi_result_cache_dir = '__TEST_DIR__/vgi_spill_poison';
+
+statement ok
+SET vgi_result_cache_disk_max_bytes = 1073741824;
+
+# max_entry_bytes=1 → the cacheable first batch (hundreds of bytes) crosses the
+# threshold instantly, so capture SPILLS to a temp disk blob before the worker's
+# mid-stream error arrives. This exercises the abort/cleanup on the spill path
+# (not the pure-RAM never-partial path that poison.test covers).
+statement ok
+SET vgi_result_cache_max_entry_bytes = 1;
+
+statement ok
+ATTACH 'example' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# The worker raises on the second tick → the query fails.
+statement error
+SELECT * FROM ex.data.cache_poison;
+----
+
+# Never-partial through the spill: NOTHING committed. No memory entry…
+query I
+SELECT COUNT(*) FROM vgi_result_cache() WHERE function = 'cache_poison';
+----
+0
+
+# …and the streamed temp blob was deleted on abort — no object, no ref, no
+# leftover .tmp-* (AbortStreamingCapture removes the temp; no ref is ever written).
+query I
+SELECT COUNT(*) FROM glob('__TEST_DIR__/vgi_spill_poison/*/objects/*');
+----
+0
+
+query I
+SELECT COUNT(*) FROM glob('__TEST_DIR__/vgi_spill_poison/*/refs/*.ref');
+----
+0
+
+# A subsequent healthy cacheable scan under the same tiny cap still spills + caches
+# fine (the failed capture left no poisoned state behind).
+statement ok
+SELECT COUNT(*) FROM ex.data.cacheable_numbers;
+
+query I
+SELECT COUNT(*) FROM glob('__TEST_DIR__/vgi_spill_poison/*/objects/*.vrc');
+----
+1
+
+statement ok
+DETACH ex;
+
+statement ok
+SET vgi_result_cache_max_entry_bytes = 67108864;
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();

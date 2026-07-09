@@ -20,6 +20,7 @@
 #include "vgi_function_connection.hpp"
 #include "vgi_ifunction_connection.hpp"
 #include "vgi_logging.hpp"
+#include "vgi_result_cache.hpp" // result-cache key/entry/capture types
 #include "vgi_worker_pool.hpp"
 
 namespace duckdb {
@@ -273,7 +274,100 @@ struct VgiDynamicFilterInfo {
 	bool nulls_first = false;
 };
 
+// ============================================================================
+// Result-cache capture context (miss path)
+// ============================================================================
+// Lives on the global state for a cache-eligible scan that missed. Each scan
+// thread (local state) captures its own substream — no shared batch buffer, no
+// mutex on the append path (only `mu` guards growing the streams vector + the
+// first-batch cache-control latch). Committed to the cache in the gstate
+// destructor iff the complete result was drained (never-partial invariant).
+struct VgiResultCaptureCtx {
+	VgiResultCacheKey key;
+	std::string catalog_name;
+	//! Current transaction id; folded into the key at commit iff the worker
+	//! advertised scope=transaction (so the entry is only reused within this txn).
+	std::string transaction_id;
+	int64_t max_entry_bytes = 0;
+	int64_t max_bytes = 0;
+	uint64_t default_ttl_seconds = 0;
+	bool catalog_version_frozen = false; // allows never-expires (at-pinned / frozen)
+
+	std::atomic<int64_t> total_bytes {0};
+	// [S6] Bytes this capture has reserved against the process-global in-flight
+	// budget (VgiResultCache::TryReserveInflightCapture). Released in full at
+	// gstate teardown (commit or abort) so concurrent captures can't OOM the box.
+	std::atomic<int64_t> reserved_inflight_bytes {0};
+	std::atomic<int> launched {0}; // ++ in InitLocal
+	std::atomic<int> eos {0};      // ++ when a local state hits InstallBatch(nullptr)
+	// The never-partial invariant: commit ONLY when every launched local state
+	// reached clean EOS (`eos == launched`) and nothing aborted. A mid-stream
+	// worker error / external-location resolution failure throws out of
+	// ReadDataBatch before that thread ever reaches EOS, so `eos < launched` and
+	// the entry is not committed — no separate "poisoned" flag is needed.
+	std::atomic<bool> aborted {false};
+
+	std::mutex mu; // guards `streams`, `cc_seen`, `cc`
+	std::vector<std::unique_ptr<CachedStream>> streams;
+	bool cc_seen = false;      // a vgi.cache.* advertisement has been latched
+	VgiCacheControl cc;        // the latched advertisement (from the first advertising batch)
+
+	// Threshold spill-to-disk. Capture buffers in RAM (per-substream) up to
+	// max_entry_bytes; if it would EXCEED that and the disk tier is on, capture
+	// SPILLS to a streaming disk blob instead of aborting — RAM then stays flat at
+	// ~max_entry_bytes no matter how large the result is (a 2 GB result caches with
+	// ~64 MB peak, not 2 GB). `disk_dir`/`disk_max` are the disk config captured at
+	// InitGlobal; the writer is created lazily on the first threshold cross under `mu`.
+	// Once `spilling` is set, InstallBatch appends straight to `disk_writer` and each
+	// thread drains its own RAM substream on its next batch; the gstate dtor drains
+	// any substreams that finished before the spill. A spilled entry is disk-only
+	// (discovered via its ref, adopted into memory on a small serve).
+	std::string disk_dir;
+	uint64_t disk_max = 0;
+	std::atomic<bool> spilling {false};
+	std::shared_ptr<VgiCaptureDiskWriter> disk_writer; // created under `mu` at first spill
+	bool streaming() const {
+		return spilling.load(std::memory_order_acquire);
+	}
+
+	// Allocate + register a per-local-state substream. Increments `launched`.
+	CachedStream *NewStream() {
+		std::lock_guard<std::mutex> lk(mu);
+		streams.push_back(make_uniq<CachedStream>());
+		launched.fetch_add(1, std::memory_order_relaxed);
+		return streams.back().get();
+	}
+};
+
 struct VgiTableFunctionGlobalState : public GlobalTableFunctionState {
+	// --- Result-cache serve / capture -------------------------------------
+	// Serve (cache hit): serving_entry is replayed via CachedReplayConnection
+	// (single-threaded — MaxThreads() clamps to 1). serve_claimed guards
+	// against a second local state duplicating rows if DuckDB ever creates one.
+	bool serving_from_cache = false;
+	std::shared_ptr<const VgiResultCacheEntry> serving_entry;
+	std::atomic<bool> serve_claimed {false};
+	// Capture (cache miss + eligible). Null when the scan isn't cacheable.
+	std::shared_ptr<VgiResultCaptureCtx> capture;
+
+	// --- Conditional revalidation (M6) ------------------------------------
+	// A stale-but-revalidatable entry: the worker was sent if_none_match /
+	// if_modified_since on init. If it replies with a 0-row vgi.cache.not_modified
+	// batch, GetNextBatch slides the entry's TTL and swaps to replaying it
+	// (single-threaded — MaxThreads() clamps to 1). If the worker instead
+	// streams fresh data, the parallel `capture` records it and the gstate
+	// destructor commits a new entry (replacing the stale one). Conditional
+	// request validators are built from revalidation_entry's etag/last_modified.
+	bool revalidating = false;
+	std::shared_ptr<const VgiResultCacheEntry> revalidation_entry;
+	std::string revalidate_if_none_match;   // stored etag ("" = none)
+	std::string revalidate_if_modified_since; // stored last_modified ("" = none)
+	std::atomic<bool> revalidation_served {false};
+
+	// Commits a completed capture to the result cache (never-partial gate).
+	// Defined in vgi_table_function_impl.cpp.
+	~VgiTableFunctionGlobalState() override;
+
 	// --- Async init plumbing ----------------------------------------------
 	// DuckDB schedules independent pipelines' `init_global` serially on the
 	// main thread (Executor::ScheduleEventsInternal), so a synchronous HTTP
@@ -397,6 +491,17 @@ struct VgiTableFunctionGlobalState : public GlobalTableFunctionState {
 		// This holds within ONE ScheduleEventsInternal invocation. Queries
 		// scheduled in waves (CTE materialization, join build vs. probe)
 		// pay one wait per wave. Most queries are one wave.
+		// Cache serve replays a single flattened stream (CachedReplayConnection)
+		// on one thread — clamp before touching the (absent) init future.
+		if (serving_from_cache) {
+			return 1;
+		}
+		// Conditional revalidation serves a single flattened stream on the
+		// not_modified path (GetNextBatch swaps to CachedReplayConnection) —
+		// clamp to one thread so that swap is race-free.
+		if (revalidating) {
+			return 1;
+		}
 		EnsureInitApplied();
 		// FIXED_ORDER functions must serialize the source — see field
 		// comment above. The worker may still advertise max_workers > 1
@@ -538,6 +643,15 @@ struct VgiTableFunctionLocalState : public ArrowScanLocalState {
 
 	// Shared prefetch state (see VgiPrefetchSlot docstring).
 	std::shared_ptr<VgiPrefetchSlot> prefetch_slot_;
+
+	// Result-cache capture: this local state's own substream (null when the
+	// scan isn't a cache-capture candidate). Owned by the gstate's capture ctx;
+	// this is a borrowed pointer. Appended to in InstallBatch.
+	CachedStream *capture_stream = nullptr;
+	bool capture_checked_first_batch = false;
+	// Set once this local state has drained its RAM substream into the spill writer
+	// (see VgiResultCaptureCtx spill notes); afterwards it appends straight to disk.
+	bool capture_spilled = false;
 
 	// Accessed by the destructor to locate the per-DatabaseInstance
 	// cancel dispatcher. Captured at construction (the DatabaseInstance

@@ -1,5 +1,6 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "storage/vgi_catalog.hpp"
+#include "vgi_result_cache.hpp"
 
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/main/attached_database.hpp"
@@ -25,6 +26,7 @@
 #include "vgi_catalog_rpc.hpp"
 #include "vgi_companion_catalogs.hpp"
 #include "vgi_logging.hpp"
+#include "vgi_oauth.hpp" // BuildCatalogIdentityScope (per-identity disk flush)
 
 namespace duckdb {
 
@@ -312,6 +314,17 @@ std::string VgiCatalog::GetDBPath() {
 }
 
 void VgiCatalog::ClearCache(bool force) {
+	// Drop this catalog's result-cache entries too (both the deferred and
+	// forced paths, and the version-bump caller). Result entries are keyed by
+	// the catalog's ATTACH identity, so a version bump / DDL / manual clear all
+	// invalidate them here.
+	if (attach_parameters_) {
+		// identity_scope (catalog name + auth fingerprint) locates the per-identity
+		// disk shard so we drop ONLY this identity's on-disk entries.
+		auto identity = vgi::BuildCatalogIdentityScope(attach_parameters_->catalog_name(),
+		                                               attach_parameters_->auth());
+		vgi::VgiResultCache::Instance().FlushCatalog(attach_parameters_->catalog_name(), identity);
+	}
 	auto harvested = schemas.HarvestEntries();
 	if (force) {
 		// User-facing vgi_clear_cache(): purge the graveyard too. Bound

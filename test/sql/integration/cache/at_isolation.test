@@ -1,0 +1,64 @@
+# name: test/sql/integration/cache/at_isolation.test
+# description: VGI result cache — time-travel (AT) isolation, no cross-version serve
+# group: [vgi_integration_cache]
+#
+# The cache key folds at_unit/at_value, so AT (VERSION => 1) / AT (VERSION => 2)
+# and the live scan are distinct entries whose bytes never cross-serve. An
+# AT-pinned scan is an immutable snapshot (never-expires); live uses the TTL.
+# The scan function is `cache_versioned_scan` (the catalog maps AT → its version
+# argument), which is the name under which entries appear in vgi_result_cache().
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+# Distinct data per version — a cross-version serve would surface the wrong rows.
+query I
+SELECT list_sort(array_agg(v)) FROM ex.data.cache_versioned AT (VERSION => 1);
+----
+[101, 102, 103]
+
+query I
+SELECT list_sort(array_agg(v)) FROM ex.data.cache_versioned AT (VERSION => 2);
+----
+[201, 202]
+
+query I
+SELECT list_sort(array_agg(v)) FROM ex.data.cache_versioned;
+----
+[301, 302, 303, 304]
+
+# Three distinct cache entries (AT(1), AT(2), live) — none merged.
+query I
+SELECT COUNT(*) FROM vgi_result_cache() WHERE function = 'cache_versioned_scan';
+----
+3
+
+# Repeating each scan HITs its OWN entry and returns its OWN rows (no cross-serve).
+query I
+SELECT list_sort(array_agg(v)) FROM ex.data.cache_versioned AT (VERSION => 1);
+----
+[101, 102, 103]
+
+query I
+SELECT list_sort(array_agg(v)) FROM ex.data.cache_versioned AT (VERSION => 2);
+----
+[201, 202]
+
+# All three entries carry the worker-advertised TTL and are distinguished purely
+# by their at_value ("" for live, "1"/"2" for the pinned scans) — three keys.
+query I
+SELECT COUNT(DISTINCT at_value) FROM vgi_result_cache() WHERE function = 'cache_versioned_scan';
+----
+3
+
+statement ok
+DETACH ex;

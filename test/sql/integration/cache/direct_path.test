@@ -1,0 +1,52 @@
+# name: test/sql/integration/cache/direct_path.test
+# description: VGI result cache (M5) — direct vgi_table_function() path caches (TTL-only, worker-path identity)
+# group: [vgi_integration_cache]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# First direct call → MISS + store (no catalog / no version dimension; TTL-only).
+statement ok
+CREATE TEMP TABLE direct_first AS
+SELECT nonce AS v FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_nonce', []);
+
+query I
+SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%result_cache.miss%';
+----
+true
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# Second identical direct call → HIT (worker not called → nonce unchanged).
+query I
+SELECT (SELECT nonce FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_nonce', []))
+     = (SELECT v FROM direct_first);
+----
+true
+
+query I
+SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%result_cache.hit%';
+----
+true
+
+# The direct-path entry is present, TTL-only, worker-path scoped.
+query I
+SELECT COUNT(*) FROM vgi_result_cache() WHERE function = 'cache_nonce' AND ttl_seconds = 300;
+----
+1
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();

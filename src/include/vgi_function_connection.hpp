@@ -434,6 +434,12 @@ private:
 	// absent. IPC decode + validation happen in ``InstallBatch`` on
 	// the consumer thread (uniform across transports).
 	std::string last_partition_values_bytes_;
+
+	// Parsed ``vgi.cache.*`` advertisement off the most recent data batch's
+	// custom_metadata (present=false when absent). Set in ``ReadDataBatch``,
+	// read by the result-cache capture layer on the first batch (same lockstep
+	// timing as ``last_batch_index_``).
+	VgiCacheControl last_cache_control_;
 public:
 	idx_t GetLastBatchIndex() const override {
 		return last_batch_index_;
@@ -441,7 +447,19 @@ public:
 	const std::string &GetLastPartitionValuesBytes() const override {
 		return last_partition_values_bytes_;
 	}
+	VgiCacheControl GetLastCacheControl() const override {
+		return last_cache_control_;
+	}
+	void SetConditionalRequest(const std::string &if_none_match,
+	                           const std::string &if_modified_since) override {
+		cond_if_none_match_ = if_none_match;
+		cond_if_modified_since_ = if_modified_since;
+	}
 private:
+	// Conditional-revalidation validators (M6) to attach to the next init
+	// request's custom_metadata. Empty = no key emitted.
+	std::string cond_if_none_match_;
+	std::string cond_if_modified_since_;
 
 	// Optional shared-memory segment for zero-copy batch transfer.
 	// When non-null, the segment name + size are advertised to the worker

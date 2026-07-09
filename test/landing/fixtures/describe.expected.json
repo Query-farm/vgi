@@ -3,9 +3,9 @@
     {
       "attach_options": [],
       "counts": {
-        "functions": 165,
+        "functions": 183,
         "schemas": 2,
-        "tables": 44,
+        "tables": 58,
         "views": 3
       },
       "data_version_spec": null,
@@ -18,6 +18,76 @@
           "functions": [],
           "name": "data",
           "tables": [
+            {
+              "cols": 1,
+              "comment": "Large multi-batch cacheable result (advertises vgi.cache.ttl)",
+              "name": "cache_big"
+            },
+            {
+              "cols": 1,
+              "comment": "Cacheable first batch then an unresolvable external-location pointer",
+              "name": "cache_external_fail"
+            },
+            {
+              "cols": 1,
+              "comment": "Cacheable sequence with static filter pushdown (filter_bytes keying)",
+              "name": "cache_filtered"
+            },
+            {
+              "cols": 3,
+              "comment": "Multi-column cacheable result (projection-coverage reuse)",
+              "name": "cache_multicol"
+            },
+            {
+              "cols": 1,
+              "comment": "Advertises vgi.cache.no_store — must never be cached",
+              "name": "cache_no_store"
+            },
+            {
+              "cols": 1,
+              "comment": "One-row cacheable result whose value changes per real invocation",
+              "name": "cache_nonce"
+            },
+            {
+              "cols": 1,
+              "comment": "Multi-worker order-sensitive cacheable result (batch_index; parallel capture, ordered serve)",
+              "name": "cache_ordered"
+            },
+            {
+              "cols": 1,
+              "comment": "Cacheable first batch then a mid-stream error (never-partial check)",
+              "name": "cache_poison"
+            },
+            {
+              "cols": 3,
+              "comment": "Projection-pushdown cacheable result (SELECT a vs b are distinct keys)",
+              "name": "cache_projection"
+            },
+            {
+              "cols": 1,
+              "comment": "Always-revalidate result (304 not_modified reuses stored bytes)",
+              "name": "cache_revalidatable"
+            },
+            {
+              "cols": 2,
+              "comment": "Advertises vgi.cache.scope=transaction",
+              "name": "cache_scoped_txn"
+            },
+            {
+              "cols": 1,
+              "comment": "Version-specific cacheable rows (AT-keyed cache isolation)",
+              "name": "cache_versioned"
+            },
+            {
+              "cols": 1,
+              "comment": "Cacheable result echoing the caller's auth principal (identity-scoped)",
+              "name": "cache_whoami"
+            },
+            {
+              "cols": 1,
+              "comment": "Cacheable 10-row result advertising vgi.cache.ttl",
+              "name": "cacheable_numbers"
+            },
             {
               "cols": 1,
               "comment": "Function-backed table with inlined cardinality (10000 rows)",
@@ -1254,6 +1324,226 @@
               ],
               "doc": "DELIBERATELY BROKEN: no field carries vgi.partition_column metadata (and partition_kind defaults to NOT_PARTITIONED), but the worker passes partition_values= on out.emit. The framework rejects with RuntimeError before the wire.",
               "name": "broken_partition_values_no_annotation",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Number of rows to generate",
+                  "name": "rows",
+                  "type": "int64"
+                }
+              ],
+              "doc": "Emits `rows` int64 rows (positional arg); cacheable — scaling bench fixture",
+              "name": "cache_bench",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "default": "5000",
+                  "desc": "Number of rows to generate",
+                  "name": "rows",
+                  "named": true,
+                  "type": "int64"
+                }
+              ],
+              "doc": "Emits many small batches totaling `rows` rows; cacheable",
+              "name": "cache_big",
+              "type": "table"
+            },
+            {
+              "args": [],
+              "doc": "Cacheable first batch then an unresolvable external-location pointer",
+              "name": "cache_external_fail",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "default": "100",
+                  "desc": "Total number of rows to generate",
+                  "name": "rows",
+                  "named": true,
+                  "type": "int64"
+                }
+              ],
+              "doc": "Cacheable sequence with static filter pushdown (filter_bytes keying)",
+              "name": "cache_filtered",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Total number of rows to generate",
+                  "name": "rows",
+                  "type": "int64"
+                },
+                {
+                  "default": "20000",
+                  "desc": "Rows per partition",
+                  "name": "chunk_size",
+                  "named": true,
+                  "type": "int64"
+                }
+              ],
+              "doc": "Parallel batch_index-tagged cacheable sequence; cache serve reassembles order",
+              "name": "cache_interleaved",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "default": "10",
+                  "desc": "Number of rows to generate",
+                  "name": "n",
+                  "named": true,
+                  "type": "int64"
+                }
+              ],
+              "doc": "Emits n rows but advertises no_store (never cached)",
+              "name": "cache_no_store",
+              "type": "table"
+            },
+            {
+              "args": [],
+              "doc": "Emits one row with a per-invocation nonce; cacheable",
+              "name": "cache_nonce",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "default": "1000",
+                  "desc": "Rows per partition",
+                  "name": "chunk_size",
+                  "named": true,
+                  "type": "int64"
+                },
+                {
+                  "default": "200000",
+                  "desc": "Total number of rows to generate",
+                  "name": "rows",
+                  "named": true,
+                  "type": "int64"
+                }
+              ],
+              "doc": "Multi-worker order-sensitive cacheable sequence (batch_index); order-preservation cache fixture",
+              "name": "cache_ordered",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Total number of rows to generate",
+                  "name": "rows",
+                  "type": "int64"
+                },
+                {
+                  "default": "24000",
+                  "desc": "Rows per output batch",
+                  "name": "batch_size",
+                  "named": true,
+                  "type": "int64"
+                }
+              ],
+              "doc": "Multi-worker cacheable sequence (one substream per worker); parallel-capture fixture",
+              "name": "cache_parallel",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Rows per country partition",
+                  "name": "rows_per_country",
+                  "type": "int64"
+                }
+              ],
+              "doc": "Cacheable single-value-partitioned result (partition_values through the spill blob)",
+              "name": "cache_partitioned",
+              "type": "table"
+            },
+            {
+              "args": [],
+              "doc": "Cacheable first batch then a mid-stream error (never-partial check)",
+              "name": "cache_poison",
+              "type": "table"
+            },
+            {
+              "args": [],
+              "doc": "3-column projection-pushdown generator; cacheable",
+              "name": "cache_projection",
+              "type": "table"
+            },
+            {
+              "args": [],
+              "doc": "Emits one nonce row; always-revalidate (304 not_modified)",
+              "name": "cache_revalidatable",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "default": "10",
+                  "desc": "Number of rows to generate",
+                  "name": "n",
+                  "named": true,
+                  "type": "int64"
+                }
+              ],
+              "doc": "Emits n rows and advertises scope=transaction",
+              "name": "cache_scoped_txn",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Total number of rows to generate",
+                  "name": "rows",
+                  "type": "int64"
+                }
+              ],
+              "doc": "Nested/wide/NULL cacheable result (STRUCT/LIST/DECIMAL/TIMESTAMP + NULLs)",
+              "name": "cache_types",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Data version, resolved from the AT clause by the catalog",
+                  "name": "version",
+                  "type": "int64"
+                }
+              ],
+              "doc": "Version-specific rows; cacheable (AT-keyed)",
+              "name": "cache_versioned_scan",
+              "type": "table"
+            },
+            {
+              "args": [],
+              "doc": "Emits the caller's auth principal; cacheable (identity-scoped)",
+              "name": "cache_whoami",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "default": "10",
+                  "desc": "Number of rows to generate",
+                  "name": "n",
+                  "named": true,
+                  "type": "int64"
+                },
+                {
+                  "default": "300",
+                  "desc": "Cache TTL in seconds",
+                  "name": "ttl",
+                  "named": true,
+                  "type": "int64"
+                }
+              ],
+              "doc": "Emits n rows [0..n) and advertises a cache TTL",
+              "name": "cacheable_numbers",
               "type": "table"
             },
             {

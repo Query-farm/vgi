@@ -1,0 +1,67 @@
+# name: test/sql/integration/cache/filter_pushdown_keys.test
+# description: VGI result cache — STATIC filter pushdown keys the cache (filter_bytes ∈ key). Two different pushed predicates (WHERE n>=5 vs WHERE n>=7) must produce TWO distinct entries, each serving its own filtered rows — the filter analog of the tested projection cross-serve boundary. Filter pushdown is wired on the catalog scan path (not direct vgi_table_function), so this uses ex.data.cache_filtered.
+# group: [vgi_integration_cache]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+statement ok
+ATTACH 'example' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+# cache_filtered emits n = 0..99 and auto-applies the pushed predicate.
+# Predicate A: n >= 5 → 95 rows (5..99).
+query III
+SELECT COUNT(*), MIN(n), MAX(n) FROM ex.data.cache_filtered WHERE n >= 5;
+----
+95	5	99
+
+# Predicate B: n >= 7 → 93 rows (7..99). Different filter_bytes → different key.
+query III
+SELECT COUNT(*), MIN(n), MAX(n) FROM ex.data.cache_filtered WHERE n >= 7;
+----
+93	7	99
+
+# TWO distinct cache entries — the two filters did NOT collapse to one (no cross-serve).
+query I
+SELECT COUNT(*) FROM vgi_result_cache() WHERE function = 'cache_filtered';
+----
+2
+
+# Re-running predicate A must HIT its OWN entry and return A's rows (95, min 5),
+# never B's (93, min 7). This is the correctness boundary.
+statement ok
+CALL truncate_duckdb_logs();
+
+query III
+SELECT COUNT(*), MIN(n), MAX(n) FROM ex.data.cache_filtered WHERE n >= 5;
+----
+95	5	99
+
+query I
+SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%result_cache.hit%';
+----
+true
+
+# A third distinct predicate adds a third entry (keys are per-predicate).
+query I
+SELECT COUNT(*) FROM ex.data.cache_filtered WHERE n >= 50;
+----
+50
+
+query I
+SELECT COUNT(*) FROM vgi_result_cache() WHERE function = 'cache_filtered';
+----
+3
+
+statement ok
+DETACH ex;
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();

@@ -1,0 +1,69 @@
+# name: test/sql/integration/cache/coverage.test
+# description: VGI result cache (M4) — subset projection reuses the full-result cache entry
+# group: [vgi_integration_cache]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+statement ok
+ATTACH 'example' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# SELECT * populates the cache (full 3-column result: a=i, b=i*10, c=i*100, n=4).
+query III
+SELECT a, b, c FROM ex.data.cache_multicol ORDER BY a;
+----
+0	0	0
+1	10	100
+2	20	200
+3	30	300
+
+query I
+SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%result_cache.miss%';
+----
+true
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# A narrower projection reuses the SAME cached full result and projects locally.
+query I
+SELECT b FROM ex.data.cache_multicol ORDER BY b;
+----
+0
+10
+20
+30
+
+query I
+SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%result_cache.hit%';
+----
+true
+
+# A different subset also reuses the same single cached entry.
+query I
+SELECT c FROM ex.data.cache_multicol ORDER BY c;
+----
+0
+100
+200
+300
+
+query I
+SELECT COUNT(*) FROM vgi_result_cache() WHERE function = 'cache_multicol';
+----
+1
+
+statement ok
+DETACH ex;

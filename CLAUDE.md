@@ -455,6 +455,152 @@ scope=params.bind_call.copy_to.file_path)` — resolved via the two-phase secret
 `test/sql/integration/copy_from/*`, `vgi-python/tests/test_copy_from_function.py`. See
 [docs/copy_from.md](docs/copy_from.md).
 
+## Table-Function Result Cache
+
+Caches the **complete result** of a table-function scan when the worker advertises
+`vgi.cache.*` metadata on its result's first batch, then serves identical future scans from
+memory (or disk) — skipping the worker round-trip entirely on a fresh hit. Modeled on HTTP caching;
+opt-in per result, on by default, per-catalog opt-out via the `cache` ATTACH option.
+**Implemented:** in-memory + content-addressed disk tiers; catalog-attached **and** direct
+`vgi_table_function()` paths; static-pushdown keying (filter/order/sample); projection-coverage
+reuse; conditional revalidation (304); HTTP serve. Design notes:
+`~/.claude/plans/i-want-to-add-twinkly-cascade.md`.
+
+**Metadata vocabulary (`vgi.cache.*`, on the first data batch):** `ttl` (opt-in + freshness
+seconds) / `expires` (RFC3339) / `no_store` / `scope` (`catalog` default | `transaction`) /
+`etag` / `last_modified` / `revalidatable` / `stale_while_revalidate` / `stale_if_error` /
+`not_modified` (304 reply). Presence of `ttl` or `expires` is the opt-in; `no_store` overrides.
+`ttl=0 + etag + revalidatable` is the HTTP "no-cache" semantic: stored but immediately stale, so
+every read revalidates. Request-side (client→worker, on the first tick's `custom_metadata`):
+`if_none_match` / `if_modified_since`.
+
+**Cache key** (identity-scoped, correctness-critical): catalog identity + worker_path + function
++ canonical args/settings + **canonical ATTACH options** + projection + `attached_data_version` +
+`implementation_version` + runtime `catalog_version` + time-travel + static
+`filter_bytes`/`order_by_hint`/`sample_hint`. A `catalog_version` bump (or DDL / `vgi_clear_cache()`)
+invalidates via `VgiCatalog::ClearCache` → `VgiResultCache::FlushCatalog`. Dynamic (join-key IN)
+filters are always ineligible.
+
+**Identity scoping is a security boundary.** `identity_scope` = catalog name **+ the caller's auth
+principal fingerprint** (`ComputeCatalogIdentityFingerprint` in `vgi_oauth.cpp`: OAuth hashes the
+stable `iss`+`sub`; bearer hashes a salted token; no-auth = `anon`). Two attaches of the same
+alias+worker+args under **different** bearer/OAuth identities therefore never share a cache entry —
+without it, one principal's rows would be served to another. A configured-but-unresolved identity
+(e.g. OAuth not yet authenticated) **fails closed** (`ineligible_reason=identity_unresolved`). ATTACH
+options (except the secret tokens `bearer_token`/`oauth_refresh_token`) are folded in too, since they
+can route to different data/locations. Worker-advertised `ttl` is clamped to `VGI_CACHE_MAX_TTL_SECONDS`
+(10 y) so hostile values can't overflow the expiry arithmetic. Tests: `cache/identity_isolation.test`
+(HTTP; bearer alice/bob), `cache/at_isolation.test`, `cache/projection_pushdown.test`,
+`cache/poison{,_external}.test` (never-partial under mid-stream error / external-resolution failure).
+
+**Architecture.** Leaked process-wide singleton `VgiResultCache` (LRU + byte caps + background
+TTL/disk reaper, mirrors `VgiWorkerPool`). Three hooks in the table-function scan: (A) parse
+`vgi.cache.*` off each batch in `FunctionConnection::ReadDataBatch` → `GetLastCacheControl()`;
+(B) capture per-thread substreams in `InstallBatch` with an all-EOS never-partial commit in the
+gstate destructor (+ per-entry size-ceiling abort); (C) on a hit, `InitGlobal` short-circuits the
+worker and hands each local state a `CachedReplayConnection` (a second `IFunctionConnection` impl)
+that replays the cached batches — so `InitLocal`/`GetNextBatch`/`InstallBatch` run unchanged.
+Serve is single-threaded (`MaxThreads`→1), flattening substreams (sorted by `batch_index` when
+present).
+
+**Disk tier (opt-in).** `vgi_result_cache_dir` + `vgi_result_cache_disk_max_bytes` enable a
+**per-identity-sharded** content-addressed store: `<dir>/<sha256(identity_scope)>/objects/<content_sha>.vrc`
+(immutable blob) + `.../refs/<key_fingerprint>.ref`. The ref filename is `VgiResultCacheKey::Fingerprint()`
+— a **SHA-256 of the full key** (not the 64-bit `HexDigest`), and the ref stores `keyfp=` which the
+loader re-verifies, so a 64-bit bucket collision can never cross-serve. `LoadFromDisk` also validates
+`content` is 64-hex before path-joining (no traversal) and re-hashes the blob against `content` (a
+tampered/corrupt object is a clean miss, not a poisoned serve or crash). Sharding per identity kills
+the cross-identity object-dedup existence oracle and makes `FlushCatalog` an O(1) shard-subtree removal
+(via `BuildCatalogIdentityScope`) that can't nuke another tenant's same-alias refs. `Insert` persists
+outside the cache lock; `Lookup` probes disk on an in-memory miss and adopts the entry (cross-process +
+cross-restart warm cache). Reaping (the one background thread) unlinks expired refs, evicts oldest-mtime
+over a **global** byte cap across shards, and sweeps orphan objects past a 60 s grace window.
+Atomic-rename correctness only — no locks. `FlushAll` `RemoveDirectory`s the tree.
+
+**Spill-to-disk capture (RAM-flat, results larger than RAM).** Capture buffers in RAM per-substream
+up to `max_entry_bytes` (small results stay memory-hot). When a capture would **exceed**
+`max_entry_bytes` and the disk tier is on, it **spills** to a streaming disk blob instead of aborting:
+`VgiCaptureDiskWriter` (`vgi_result_cache.cpp`, pimpl'd) appends each subsequent batch straight to a
+temp `.vrc`, hashing **incrementally** (`MbedTlsWrapper::SHA256State`) so the finished object stays
+content-addressed without ever holding the whole blob (or a serialized copy of it) in memory. Peak
+capture RAM is therefore ~`max_entry_bytes` regardless of result size — a 1.94 GB result caches at
+**~125 MB** peak RSS (was ~4.2 GB under the old buffer-in-RAM-then-`SerializeEntryBlob`-string path)
+and serves back at **~33 MB** (S8 streaming). The spill is lazy + per-thread: the first producer to
+cross the threshold creates the writer under `mu` and flips `spilling`; each producer then drains its
+own RAM substream to the blob on its next batch (no cross-thread substream access, so parallel capture
+still fans out); the gstate dtor drains any substream whose producer finished before the spill.
+A spilled entry is **disk-only** (never enters the memory index — that is the point) and is adopted
+into memory on a small serve like any disk entry; a `> max_entry_bytes` serve streams it (S8). The blob
+format is `"VRC1"` magic + batch records **to EOF** (no batch-count header — incremental hashing can't
+know the count upfront; readers loop until EOF). Disk **off** → capture still aborts above
+`max_entry_bytes` (`result_cache.abort reason=entry_too_large`), unchanged. Over the per-entry disk
+budget mid-spill → `reason=disk_entry_too_large`. Files: `VgiCaptureDiskWriter` +
+`BeginStreamingCapture`/`CommitStreamingCapture`/`AbortStreamingCapture` in `vgi_result_cache.cpp`; the
+spill wiring (`VgiResultCaptureCtx.disk_writer`/`spilling`, `InstallBatch`, gstate dtor) in
+`vgi_table_function_impl.cpp`. Tests: `cache/spill.test` (fast, parallel + single-producer) +
+`cache/parallel_2gb.test_slow` (2 GB end to end).
+
+**Streaming disk serve for results larger than RAM (S8).** On an in-memory miss, `Lookup` first
+`PeekDiskRefBytes` (a cheap ref read): entries **≤ `max_entry_bytes`** take `LoadFromDisk` (materialize
++ adopt into the memory LRU for fast repeat hits); entries **> `max_entry_bytes`** take
+`LoadFromDiskStreaming`, which reads only the blob **header + per-batch TOC** (fixed fields + partition
+values, seeking past each IPC payload) and records `disk_ipc_offset`/`disk_ipc_length` per
+`VgiCachedBatch` — the multi-GB payload is never read at load. The disk-backed entry is served but **not**
+inserted into `lru_`/`index_` (adopting it would defeat the point; the tiny TOC is cheaply re-read per
+hit). `CachedReplayConnection` opens the `.vrc` blob once (a process-static `FileSystem` outlives the
+held `FileHandle`) and does a positioned `FileSystem::Read` of just `disk_ipc_length` bytes per batch →
+`arrow::io::BufferReader` → `RecordBatchStreamReader`. One batch resident at a time → RAM stays flat
+regardless of result size (a 194 MB entry serves at ~34 MB peak RSS). Positioned pread, **not** mmap:
+replay is a single sequential pass (mmap's random-access/zero-copy wins don't apply), it needs no
+blob-format change, and it avoids handing DuckDB Arrow buffers whose lifetime collides with the leaked
+singleton's Arrow-static-destruction rationale. The re-hash integrity check (D) is skipped on the
+streaming path (it would require reading the whole blob); the content-addressed name + `keyfp` still bind
+the object to the key, and a corrupt batch throws cleanly at IPC-decode on replay. The `result_cache.hit`
+log carries `tier=disk_streaming` vs `tier=memory` so the streaming path is test-observable.
+
+**Conditional revalidation (304).** A stale-but-`revalidatable` entry is probed by
+`LookupForRevalidation` *before* `Lookup` (which drops stale) — if the payload ≥
+`vgi_result_cache_revalidate_min_bytes`, the first producer tick carries `if_none_match` /
+`if_modified_since`. If the worker replies with a 0-row `not_modified` batch, `GetNextBatch` slides
+the entry's TTL and swaps to a `CachedReplayConnection` over the stored bytes (single-threaded, no
+re-stream); if it streams fresh data instead, the parallel capture commits a replacement.
+Revalidatable entries survive TTL reaping (refreshed on access, not dropped). **Subprocess only**
+(over HTTP the first producer exchange folds into `/init` before any tick, so the validator can't
+reach the worker's first `process()` — a follow-up).
+
+**Files:** `src/vgi_result_cache.cpp` (singleton + disk tier + revalidation lookup),
+`src/vgi_cached_replay_connection.cpp` (serve), `src/vgi_result_cache_functions.cpp` (diagnostics),
+`src/include/vgi_cache_control.hpp` (vocabulary), plus hooks in `vgi_function_connection.cpp`
+(first-tick conditional metadata) / `vgi_http_function_connection.cpp` / `vgi_table_function_impl.cpp`
+(eligibility/serve/capture/revalidate). vgi-python: `vgi/cache_control.py` (`CacheControl`),
+`vgi/_test_fixtures/table/cache.py` (fixtures incl. `cache_revalidatable`), `ProcessParams.if_none_match`.
+Tests: `test/sql/integration/cache/*.test` (duckdb_logs-observed), `vgi-python/tests/test_cache_control.py`.
+
+**Transaction scope (`scope=transaction`).** A worker can advertise `vgi.cache.scope=transaction` to
+mark a result reusable **only within the transaction that produced it** (output depends on
+transaction-local state). Such an entry folds the current `ActiveTransaction().global_transaction_id`
+into its key, so a second scan in the same transaction is a HIT while any other transaction MISSes.
+The scope is only known at capture (first-batch advertisement), not at the lookup key-build, so the
+key stays catalog-scoped at InitGlobal and a lookup probes **both** the catalog key and (key + txn id).
+Transaction-scoped entries are **memory-only** — never persisted to disk (the txn id is ephemeral +
+process-local; a disk blob would orphan after the txn), and a transaction-scoped result that would
+spill is refused. Test: `cache/transaction_scope.test` (the `cache_scoped_txn` fixture carries a
+per-invocation `nonce` so a same-txn hit vs new-txn miss is provable from the value).
+
+**Observability.** Scan-thread decisions log a `result_cache.{hit,miss,store,store_skipped,ineligible,
+abort,revalidate}` event via `VGI_LOG` (queryable in `duckdb_logs WHERE type='VGI'`) — these have a
+`ClientContext`. `store {tier=memory|disk, rows, bytes}` fires on a successful commit (a positive
+signal, vs inferring from an absent abort); `store_skipped {reason=not_cacheable|no_freshness|
+immediately_stale|transaction_scoped_spill|drain_failed|…}` fires on the silent refusal branches.
+`EXPLAIN ANALYZE` on a cached scan shows a `Cache: hit (memory|disk_streaming)` line (a hit skips the
+worker entirely — `VgiTableFunctionDynamicToString`). Cleanup (LRU eviction + TTL/disk reaping) runs on
+the context-less singleton / background thread and emits **no** `duckdb_logs` events; observe it via
+`vgi_result_cache_stats()` (the `evictions_*` / `capture_aborts` counters — the only SQL surface for
+reaper work), `vgi_result_cache(include_disk := true)` (memory **and** disk-only entries), and `glob()`
+(disk `objects/`+`refs/`). Reap runs on a 1s wall-clock-keyed thread, so
+`vgi_result_cache_reap(advance_seconds := N)` drives a synchronous, clock-injected reap pass for
+reproducible cleanup tests. Clear with `vgi_result_cache_flush()` (both tiers).
+
 ## Extension Settings
 
 | Setting | Type | Default | Description |
@@ -471,6 +617,16 @@ scope=params.bind_call.copy_to.file_path)` — resolved via the two-phase secret
 | `vgi_trust_empty_kinds` | BOOLEAN | true | Trust worker assertions that `estimated_object_count[kind] == 0` means the kind is empty (skip `catalog_schema_contents_*` RPC). Set to false to force every RPC to fire — debug escape hatch for diagnosing worker bugs |
 | `vgi_secret_default_ttl_seconds` | BIGINT | 300 | Default cache TTL for credentials fetched from an Orchard remote secret provider, when the server suggests none. Further capped per-credential by the credential's own expiry. Read at `ATTACH`, frozen per-provider. See *Remote Secret Provider* |
 | `vgi_github_cache_dir` | VARCHAR | `""` | Cache directory for worker binaries downloaded from GitHub releases (`github://` / `github-auto://`). Empty → `${XDG_CACHE_HOME:-~/.cache}/vgi/releases`. Must be on an exec-capable filesystem. See [docs/github-transport.md](docs/github-transport.md) |
+| `vgi_result_cache` | BOOLEAN | true | Master switch for the **table-function result cache**. When a worker advertises `vgi.cache.*` metadata on its result's first batch, the complete result is cached and identical future scans are served without the worker round-trip. Double-gated: only advertised results are stored, and a catalog opts out via the `cache` ATTACH option |
+| `vgi_result_cache_max_bytes` | UBIGINT | 268435456 (256 MB) | Global byte cap for the in-memory result cache (LRU eviction above it). Read per-query, so `SET` is runtime-effective |
+| `vgi_result_cache_max_entry_bytes` | UBIGINT | 67108864 (64 MB) | Per-entry RAM cap: capture buffers up to this in RAM, then — if the disk tier is on (`vgi_result_cache_dir`+`disk_max_bytes`) — **spills the rest to a streaming disk blob** (RAM stays flat at ~this cap, result cached to disk); if the disk tier is **off**, capture aborts and the result streams uncached (`result_cache.abort reason=entry_too_large`). Also the serve threshold: a disk entry larger than this is served by streaming (never materialized), smaller ones are materialized + adopted into memory. See *Spill-to-disk capture* |
+| `vgi_result_cache_default_ttl_seconds` | UBIGINT | 0 | Default cache TTL when a worker advertises cacheability without a `ttl`/`expires` (0 = require a worker-supplied freshness key) |
+| `vgi_result_cache_revalidate_min_bytes` | UBIGINT | 262144 (256 KB) | Minimum stored-payload size before a stale `revalidatable` entry is conditionally revalidated (below it, refetch instead of a conditional request) |
+| `vgi_result_cache_dir` | VARCHAR | `""` | Directory for the on-disk result-cache tier (content-addressed store; cross-process + cross-restart). Empty = disk tier off (memory only) |
+| `vgi_result_cache_disk_max_bytes` | UBIGINT | 0 | Byte cap for the on-disk result-cache tier (0 = disk tier off) |
+| `vgi_result_cache_max_entries` | UBIGINT | 131072 | **Entry-count** cap for the in-memory index (0 = unlimited). Bounds unbounded small-entry accumulation that the byte cap alone misses (~700k tiny entries fit under 256 MB); also keeps the reaper / `vgi_result_cache()` O(N) walks small. LRU-evicts oldest above the cap. Read per-query. (Scaling seam **S5**) |
+| `vgi_result_cache_max_inflight_bytes` | UBIGINT | 268435456 (256 MB) | Process-global budget for **in-flight capture** RAM (sum of all concurrently-capturing MISSes' buffered substreams). A capture that would push the total over the budget aborts to uncached (`result_cache.abort reason=inflight_budget`) and keeps streaming to DuckDB — bounds total capture RAM regardless of query concurrency, which the per-entry cap alone can't (N captures peak at N × `max_entry_bytes`). Read per-query. (Scaling seam **S6**) |
+| `vgi_result_cache_disk_reap_interval_seconds` | UBIGINT | 60 | How often the background thread reaps the **disk** tier (expired refs / over-cap eviction / orphan sweep), decoupled from the ~1 s in-memory reap. The disk reap reads every ref + stats every object per pass, so running it every tick is wasteful; expiry is wall-clock, so a coarser cadence is correctness-neutral. (Scaling seam **S7**) |
 
 Catalogs may register additional settings at `ATTACH` time (e.g., `greeting`, `multiplier`).
 
@@ -480,6 +636,7 @@ Catalogs may register additional settings at `ATTACH` time (e.g., `greeting`, `m
 |--------|------|---------|-------------|
 | `LOCATION` / `PATH` | VARCHAR | (required) | Path to VGI worker executable |
 | `pool` | BOOLEAN | true | Enable/disable worker pooling for this catalog |
+| `cache` | BOOLEAN | true | Enable/disable the table-function **result cache** for this catalog. `cache false` opts the catalog out — its table-function results are never cached or served from cache. See *Table-Function Result Cache* |
 | `pool_max` | BIGINT | (global default) | Max pooled workers for this worker path (0 = disabled) |
 | `pool_timeout` | BIGINT | (global default) | Idle timeout in seconds before pooled workers are removed |
 | `worker_debug` | BOOLEAN | false | Enable worker debug output |
@@ -518,7 +675,11 @@ The `launch:` and `unix://` paths share one warm worker process across every Duc
 | `vgi_worker_pool_flush()` | Table | Clear all subprocess-pooled workers; returns one row with the count flushed (`flushed`). Has no effect on `launch:` / `unix://` workers. |
 | `vgi_github_cache()` | Table | Diagnostic: one row per worker binary cached from a `github://` / `github-auto://` release LOCATION. Columns: `owner`, `repo`, `tag`, `asset`, `digest` (archive SHA256), `dir` (extracted directory), `entrypoint`, `age_seconds`. See [docs/github-transport.md](docs/github-transport.md) |
 | `vgi_github_cache_flush()` | Table | Delete the on-disk GitHub-release worker cache; returns one row with the count of cached releases removed (`flushed`). |
-| `vgi_clear_cache()` | Table | Clear cached catalog metadata (schemas, tables, functions, statistics) for all attached VGI catalogs |
+| `vgi_clear_cache()` | Table | Clear cached catalog metadata (schemas, tables, functions, statistics) for all attached VGI catalogs. Also drops that catalog's **result-cache** entries |
+| `vgi_result_cache(include_disk := false)` | Table | Diagnostic: one row per cached table-function result. Columns: `catalog`, `function`, `key_hash`, `scope`, `attached_data_version`, `implementation_version`, `catalog_version`, `at_unit`, `at_value`, `num_batches`, `num_substreams` (capture-thread count — `> 1` proves parallel capture across workers), `num_rows`, `total_bytes`, `age_seconds`, `ttl_seconds`, `stale`, `tier` (`memory`/`disk`), `etag`, `last_modified`, `revalidatable`, `hits`. Defaults to the **in-memory** tier; `include_disk := true` also walks the on-disk refs so **spilled/disk-only** entries (invisible to the memory index until adopted) are listed with `tier='disk'`. See *Table-Function Result Cache* |
+| `vgi_result_cache_flush()` | Table | Clear the in-memory result cache; returns one row with the count of entries flushed (`flushed`) |
+| `vgi_result_cache_stats()` | Table | Diagnostic: process-global aggregate counters (`hits`, `misses`, `inserts`, `evictions_lru`, `evictions_ttl`, `capture_aborts`) + current in-memory `entries` and `total_bytes`. The only SQL surface for reaper evictions (which emit no `duckdb_logs` events) and capture aborts |
+| `vgi_result_cache_reap(advance_seconds := 0)` | Table | Run one synchronous cleanup pass over both cache tiers (the work the background reaper does per tick) on the calling thread. `advance_seconds` simulates elapsed time so TTL/disk expiry reaps deterministically — the reproducible test seam for cleanup (the reaper is otherwise a 1s wall-clock-keyed thread that emits no `duckdb_logs` events). Returns `memory_reaped`, `disk_refs_removed`. See `test/sql/integration/cache/cleanup.test` |
 | `vgi_oauth_identity()` | Table | OIDC identity per attached VGI catalog: `catalog_name`, `origin`, `authenticated`, `sub`, `email`, `name`, `issuer`, `claims` (JSON). Claims carry the full decoded id_token payload — reach provider-specific fields via e.g. `claims->>'$.preferred_username'` for Entra, `claims->>'$.hd'` for Google Workspace, etc. |
 | `vgi_table_branches()` | Table | Diagnostic: one row per branch per VGI table across every attached VGI catalog. Columns: `catalog_name`, `schema_name`, `table_name`, `branch_index`, `function_name`, `positional_arguments` (JSON), `named_arguments` (JSON), `branch_filter`, `table_required_extensions` (LIST). Used to introspect multi-branch tables. See [docs/multi_branch.md](docs/multi_branch.md). |
 | `vgi_function_arguments()` | Table | Diagnostic: one row per (catalog, schema, function/macro, argument) across every attached VGI catalog. Covers scalar/table/aggregate **functions** and scalar/table **macros** (`function_type` is `scalar`/`table`/`aggregate` for functions, `scalar_macro`/`table_macro` for macros). Columns: `catalog_name`, `schema_name`, `function_name`, `function_type`, `arg_position` (NULL for named/varargs), `field_index`, `arg_name`, `arg_type`, `arg_description` (the `vgi_doc` field metadata; NULL when undocumented), `is_named`, `is_positional`, `is_const`, `is_varargs`, `is_table_input`, `is_any_type`. Surfaces per-argument detail that `duckdb_functions()` flattens away. Filter with `WHERE catalog_name = '...'`. Reports each catalog's current data version (no time travel). |
@@ -537,9 +698,12 @@ The `launch:` and `unix://` paths share one warm worker process across every Duc
 | `vgi_rpc_client.cpp` | RPC wire protocol: request writing, response reading, batch classification |
 | `vgi_rpc_types.cpp` | RPC type definitions |
 | `vgi_catalog_api.cpp` | Catalog RPC dispatchers, response parsers, type conversion |
-| `vgi_function_connection.cpp` | `FunctionConnection` class, `AcquireAndBindConnection()` |
+| `vgi_function_connection.cpp` | `FunctionConnection` class, `AcquireAndBindConnection()`. `ReadDataBatch` resolves **externalized batches** (0-row `vgi_rpc.location` pointer → `ResolveExternalLocation` HTTP fetch + splice) on the **subprocess** path too, not just HTTP — a subprocess worker that externalizes a large batch is transparently resolved (transport-independent via DuckDB `HTTPUtil`) |
 | `vgi_subprocess.cpp` | SubProcess/Pipe RAII, `WaitForReadable()` with EINTR retry, `GetCatalogTimeout()` |
 | `vgi_worker_pool.cpp` | `VgiWorkerPool` singleton, background cleanup thread |
+| `vgi_result_cache.cpp` | `VgiResultCache` singleton: cache key/entry types, `ParseVgiCacheControl`, LRU + byte caps + background TTL reaper. See *Table-Function Result Cache* |
+| `vgi_cached_replay_connection.cpp` | `CachedReplayConnection` — an `IFunctionConnection` that replays a cached result (serve path) |
+| `vgi_result_cache_functions.cpp` | `vgi_result_cache()` / `vgi_result_cache_flush()` SQL diagnostics |
 | `vgi_worker_pool_functions.cpp` | Pool diagnostic SQL functions |
 | `vgi_github.cpp` | `github://` / `github-auto://` transport (subprocess-capable platforms incl. Windows): coordinate parsing, `github-auto://` convention name-building from `DuckDB::Platform()` (`.zip` on Windows, `.tar.gz` else), authenticated GitHub API GET (+ reuse of `HttpGetBytes` for CDN downloads), SHA256 verify-before-extract, full-tree USTAR + miniz `.zip` extractors with path sanitization, and the content-digest-keyed atomic-directory cache. File I/O via DuckDB's cross-platform `FileSystem` (`CreateLocal()`; cross-process write-lock); only `chmod`/tar-symlink/macOS-codesign stay POSIX (`#if VGI_POSIX_TRANSPORT`). Exposes `ResolveWorkerPath()` (called at both spawn sites: `EnsureWorkerSpawned` + `AttemptUnaryRpc`). See [docs/github-transport.md](docs/github-transport.md) |
 | `vgi_github_functions.cpp` | `vgi_github_cache()` / `vgi_github_cache_flush()` SQL diagnostics |

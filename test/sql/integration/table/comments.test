@@ -24,6 +24,20 @@ WHERE database_name = 'example' AND schema_name = 'data'
   AND table_name NOT LIKE 'rff_%'  -- rff_* fixtures live in required_field_filter_paths_*.test
 ORDER BY table_name;
 ----
+cache_big	Large multi-batch cacheable result (advertises vgi.cache.ttl)
+cache_external_fail	Cacheable first batch then an unresolvable external-location pointer
+cache_filtered	Cacheable sequence with static filter pushdown (filter_bytes keying)
+cache_multicol	Multi-column cacheable result (projection-coverage reuse)
+cache_no_store	Advertises vgi.cache.no_store — must never be cached
+cache_nonce	One-row cacheable result whose value changes per real invocation
+cache_ordered	Multi-worker order-sensitive cacheable result (batch_index; parallel capture, ordered serve)
+cache_poison	Cacheable first batch then a mid-stream error (never-partial check)
+cache_projection	Projection-pushdown cacheable result (SELECT a vs b are distinct keys)
+cache_revalidatable	Always-revalidate result (304 not_modified reuses stored bytes)
+cache_scoped_txn	Advertises vgi.cache.scope=transaction
+cache_versioned	Version-specific cacheable rows (AT-keyed cache isolation)
+cache_whoami	Cacheable result echoing the caller's auth principal (identity-scoped)
+cacheable_numbers	Cacheable 10-row result advertising vgi.cache.ttl
 cardinality_inlined_table	Function-backed table with inlined cardinality (10000 rows)
 colors	Colors table with ENUM-derived statistics
 departments	Department reference table

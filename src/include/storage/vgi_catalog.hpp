@@ -115,6 +115,12 @@ public:
 		return eager_load_thresholds_;
 	}
 
+	/// Last catalog version observed from the worker (0 = unknown). Used as a
+	/// cache-key dimension by the result cache — a bump invalidates entries.
+	int64_t GetKnownCatalogVersion() const {
+		return last_known_catalog_version_.load(std::memory_order_acquire);
+	}
+
 private:
 	void DropSchema(ClientContext &context, DropInfo &info) override;
 

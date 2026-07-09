@@ -66,6 +66,8 @@ fi
 
 echo "HTTP server running on port $PORT (pid $SERVER_PID)"
 
-# Run tests
+# Run tests. VGI_HTTP_TRANSPORT lets HTTP-only tests (e.g. bearer/OAuth identity,
+# which subprocess can't carry) gate themselves via `require-env VGI_HTTP_TRANSPORT`.
 VGI_TEST_WORKER="http://localhost:$PORT" \
+VGI_HTTP_TRANSPORT=1 \
     ./build/$BUILD_DIR/test/unittest "$FILTER" "$@"

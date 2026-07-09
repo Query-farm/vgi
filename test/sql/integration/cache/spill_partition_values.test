@@ -1,0 +1,89 @@
+# name: test/sql/integration/cache/spill_partition_values.test
+# description: VGI result cache (spill-to-disk) — non-empty partition_values round-trip through the disk blob. cache_partitioned emits a single-valued `country` partition column, so the framework attaches partition_values (min/max) to each batch; those pv_bytes are written into the blob (AppendBatch) and SEEKED past on the streaming read (LoadFromDiskStreaming). A misframed pv_len would misalign the TOC seek → wrong rows. Forced to spill + served, a GROUP BY on the partition column must match the live result exactly.
+# group: [vgi_integration_cache]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+statement ok
+SET threads = 8;
+
+statement ok
+SET vgi_result_cache_dir = '__TEST_DIR__/vgi_spill_pv';
+
+statement ok
+SET vgi_result_cache_disk_max_bytes = 1073741824;
+
+# Tiny cap → the partitioned result (with per-batch partition_values) spills.
+statement ok
+SET vgi_result_cache_max_entry_bytes = 4096;
+
+statement ok
+SET vgi_result_cache_max_bytes = 268435456;
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# Live (miss) → spills to disk (disk-only). Grouped per partition value.
+statement ok
+CREATE TEMP TABLE live AS
+SELECT country, COUNT(*) c, SUM(sales) s
+FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_partitioned', [1000]) GROUP BY country;
+
+query I
+SELECT COUNT(*) FROM vgi_result_cache() WHERE function = 'cache_partitioned';
+----
+0
+
+query I
+SELECT COUNT(*) FROM glob('__TEST_DIR__/vgi_spill_pv/*/objects/*.vrc');
+----
+1
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# Served from the disk blob via streaming.
+statement ok
+CREATE TEMP TABLE served AS
+SELECT country, COUNT(*) c, SUM(sales) s
+FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_partitioned', [1000]) GROUP BY country;
+
+query I
+SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI'
+    AND message LIKE '%result_cache.hit%' AND message LIKE '%tier=disk_streaming%';
+----
+true
+
+# Five partitions, and every per-partition (count, sum) matches live — the pv
+# framing round-tripped and the TOC seek stayed aligned across all batches.
+query I
+SELECT COUNT(*) FROM served;
+----
+5
+
+query I
+SELECT COUNT(*) FROM live l JOIN served s USING (country) WHERE l.c <> s.c OR l.s <> s.s;
+----
+0
+
+query I
+SELECT (SELECT COUNT(*) FROM (SELECT country FROM live EXCEPT SELECT country FROM served))
+     + (SELECT COUNT(*) FROM (SELECT country FROM served EXCEPT SELECT country FROM live));
+----
+0
+
+statement ok
+SET vgi_result_cache_max_entry_bytes = 67108864;
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();

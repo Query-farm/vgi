@@ -1,0 +1,56 @@
+# name: test/sql/integration/cache/identity_isolation.test
+# description: VGI result cache (security A) — cross-identity isolation (bearer principals)
+# group: [vgi_integration_cache]
+#
+# HTTP-only: bearer/OAuth identity is carried only over HTTP, and the fixture
+# server maps `vgi-test-alice`→alice / `vgi-test-bob`→bob (optional bearer; no
+# token = anonymous). require-env VGI_HTTP_TRANSPORT is set only by
+# run_http_integration.sh, so this file runs over HTTP and is skipped on the
+# subprocess suite (where every caller is anonymous and the assertion is moot).
+#
+# Finding A: the cache key folds the caller's auth principal. Two attaches of the
+# SAME alias+worker+args with DIFFERENT bearer tokens must NEVER share a cache
+# entry — bob must not be served alice's cached bytes.
+
+require-env VGI_TEST_WORKER
+
+require-env VGI_HTTP_TRANSPORT
+
+require vgi
+
+require httpfs
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+# alice attaches and caches her identity-scoped result.
+statement ok
+ATTACH 'example' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}', bearer_token 'vgi-test-alice');
+
+query I
+SELECT who FROM ex.data.cache_whoami;
+----
+alice
+
+statement ok
+DETACH ex;
+
+# bob attaches the SAME alias + worker + args, only the bearer token differs.
+# Without the auth fingerprint in the key this would HIT alice's entry and leak
+# "alice"; with it, bob MISSes and gets his own "bob".
+statement ok
+ATTACH 'example' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}', bearer_token 'vgi-test-bob');
+
+query I
+SELECT who FROM ex.data.cache_whoami;
+----
+bob
+
+# Two distinct cache entries exist — alice's and bob's are not merged.
+query I
+SELECT COUNT(*) FROM vgi_result_cache() WHERE function = 'cache_whoami';
+----
+2
+
+statement ok
+DETACH ex;

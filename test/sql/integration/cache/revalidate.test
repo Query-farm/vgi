@@ -1,0 +1,108 @@
+# name: test/sql/integration/cache/revalidate.test
+# description: VGI result cache (M6) — conditional revalidation (304 / not_modified)
+# group: [vgi_integration_cache]
+#
+# Subprocess-only: the conditional-request validators ride the first producer
+# tick, which the worker's process() reads. Over HTTP the first producer exchange
+# is folded into the /init POST (its output is buffered before any tick is sent),
+# so the if_none_match validator never reaches the worker's first process() call
+# and the not_modified path can't fire. Omitting `require httpfs` makes this file
+# skip cleanly under the HTTP harness (the http:// ATTACH errors → auto-skip)
+# while still running on subprocess. See docs — HTTP revalidation is a follow-up.
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+# Revalidate even tiny payloads (default threshold is 256 KiB).
+statement ok
+SET vgi_result_cache_revalidate_min_bytes = 0;
+
+statement ok
+ATTACH 'example' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# First scan → MISS + store. cache_revalidatable advertises ttl=0 + etag +
+# revalidatable ("no-cache"): the entry is stored but immediately stale, so
+# every repeat sends a conditional request.
+statement ok
+CREATE TEMP TABLE first AS SELECT nonce AS v FROM ex.data.cache_revalidatable;
+
+query I
+SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%result_cache.miss%';
+----
+true
+
+# The stored entry is revalidatable and (being ttl=0) already stale.
+query I
+SELECT COUNT(*) FROM vgi_result_cache()
+WHERE function = 'cache_revalidatable' AND revalidatable AND stale;
+----
+1
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# Second scan → stale + revalidatable → conditional request. The worker's data is
+# unchanged, so it answers 304 not_modified and the client reuses the STORED
+# payload. A stable nonce proves the worker did not recompute / re-stream.
+query I
+SELECT (SELECT nonce FROM ex.data.cache_revalidatable) = (SELECT v FROM first);
+----
+true
+
+query I
+SELECT COUNT(*) >= 1 FROM duckdb_logs()
+WHERE type = 'VGI' AND message LIKE '%result_cache.revalidate%' AND message LIKE '%outcome=not_modified%';
+----
+true
+
+# A plain hit was NOT logged (this is the revalidation path, not a fresh hit).
+query I
+SELECT COUNT(*) FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%result_cache.hit%';
+----
+0
+
+# Third scan revalidates again — the not_modified reply slid the TTL but kept the
+# entry revalidatable, so it stays the always-revalidate contract.
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT (SELECT nonce FROM ex.data.cache_revalidatable) = (SELECT v FROM first);
+----
+true
+
+query I
+SELECT COUNT(*) >= 1 FROM duckdb_logs()
+WHERE type = 'VGI' AND message LIKE '%result_cache.revalidate%' AND message LIKE '%outcome=not_modified%';
+----
+true
+
+# Below the revalidate threshold, a stale revalidatable entry is refetched
+# instead of conditionally revalidated (no revalidate event).
+statement ok
+SET vgi_result_cache_revalidate_min_bytes = 1000000;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+SELECT nonce FROM ex.data.cache_revalidatable;
+
+query I
+SELECT COUNT(*) FROM duckdb_logs()
+WHERE type = 'VGI' AND message LIKE '%result_cache.revalidate%' AND message LIKE '%outcome=not_modified%';
+----
+0
+
+statement ok
+DETACH ex;

@@ -1,0 +1,93 @@
+# name: test/sql/integration/cache/prepared_reset.test
+# description: VGI result cache — (#15) a PREPAREd statement re-keys per EXECUTE: the bind parameter feeds canonical_arguments so distinct params are distinct entries and a repeated param HITs; (#16) RESET of a cache setting restores its documented default (an over-cap result that aborted uncached under a tiny max_entry_bytes caches again after RESET).
+# group: [vgi_integration_cache]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+statement ok
+ATTACH 'example' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+# ---- #15 prepared statements re-key per parameter -------------------------
+statement ok
+PREPARE p AS SELECT COUNT(*) FROM ex.cacheable_numbers(n := CAST($1 AS INTEGER));
+
+# First execute → MISS + store.
+query I
+EXECUTE p(5);
+----
+5
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# Same param → HIT (its entry).
+query I
+EXECUTE p(5);
+----
+5
+
+query I
+SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%result_cache.hit%';
+----
+true
+
+# Different param → distinct key → MISS + a SECOND entry, different rows.
+query I
+EXECUTE p(8);
+----
+8
+
+# Two distinct entries with two distinct key hashes (the param is in the key).
+query I
+SELECT COUNT(*) FROM vgi_result_cache() WHERE function = 'cacheable_numbers';
+----
+2
+
+query I
+SELECT COUNT(DISTINCT key_hash) FROM vgi_result_cache() WHERE function = 'cacheable_numbers';
+----
+2
+
+# ---- #16 RESET restores the default cap ------------------------------------
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+# Tiny per-entry cap, disk OFF → a larger result aborts (uncached).
+statement ok
+SET vgi_result_cache_max_entry_bytes = 4096;
+
+statement ok
+SELECT COUNT(*) FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_bench', [200000]);
+
+query I
+SELECT COUNT(*) FROM vgi_result_cache() WHERE function = 'cache_bench';
+----
+0
+
+# RESET restores the 64 MB default → the same result now caches.
+statement ok
+RESET vgi_result_cache_max_entry_bytes;
+
+statement ok
+SELECT COUNT(*) FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_bench', [200000]);
+
+query I
+SELECT COUNT(*) FROM vgi_result_cache() WHERE function = 'cache_bench';
+----
+1
+
+statement ok
+DETACH ex;
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();

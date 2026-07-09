@@ -1,0 +1,93 @@
+# name: test/sql/integration/cache/entry_cap.test
+# description: VGI result cache (S5) — vgi_result_cache_max_entries bounds the in-memory index by COUNT (not just bytes); N > cap distinct-key scans evict oldest so the entry count never exceeds the cap.
+# group: [vgi_integration_cache]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+# The direct vgi_table_function() path resolves VGI_TEST_WORKER as the worker
+# LOCATION; under the HTTP harness that is an http:// URL, so the HTTP transport's
+# POST needs httpfs loaded (mirrors direct_path.test / disk_streaming.test).
+require httpfs
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+# Generous byte caps so eviction is driven purely by the ENTRY-COUNT cap, not size.
+statement ok
+SET vgi_result_cache_max_bytes = 268435456;
+
+statement ok
+SET vgi_result_cache_max_entry_bytes = 67108864;
+
+# Cap the number of cached entries at 5.
+statement ok
+SET vgi_result_cache_max_entries = 5;
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+# Ten distinct-arg scans (distinct keys, tiny results). Without a count cap all
+# ten would sit in the index (each is well under the byte cap); the count cap
+# must hold the index at 5, evicting oldest.
+statement ok
+SELECT COUNT(*) FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_bench', [1]);
+
+statement ok
+SELECT COUNT(*) FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_bench', [2]);
+
+statement ok
+SELECT COUNT(*) FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_bench', [3]);
+
+statement ok
+SELECT COUNT(*) FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_bench', [4]);
+
+statement ok
+SELECT COUNT(*) FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_bench', [5]);
+
+statement ok
+SELECT COUNT(*) FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_bench', [6]);
+
+statement ok
+SELECT COUNT(*) FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_bench', [7]);
+
+statement ok
+SELECT COUNT(*) FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_bench', [8]);
+
+statement ok
+SELECT COUNT(*) FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_bench', [9]);
+
+statement ok
+SELECT COUNT(*) FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_bench', [10]);
+
+# The index is capped at exactly 5 entries (oldest evicted), never all ten.
+query I
+SELECT COUNT(*) FROM vgi_result_cache() WHERE function = 'cache_bench';
+----
+5
+
+# The 5 survivors are the MOST-RECENT keys (LRU keeps [6..10]); the oldest
+# (arg 1) was evicted, so re-scanning it is a MISS + store, evicting arg 6.
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+SELECT COUNT(*) FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_bench', [1]);
+
+query I
+SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%result_cache.miss%';
+----
+true
+
+# Still capped at 5 after the re-insert.
+query I
+SELECT COUNT(*) FROM vgi_result_cache() WHERE function = 'cache_bench';
+----
+5
+
+statement ok
+SET vgi_result_cache_max_entries = 131072;
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();

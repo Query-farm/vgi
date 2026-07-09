@@ -1,0 +1,35 @@
+# name: test/sql/integration/cache/poison.test
+# description: VGI result cache — a mid-stream worker error commits nothing (never-partial)
+# group: [vgi_integration_cache]
+#
+# Adversarial never-partial check: cache_poison emits a cacheable first batch
+# (advertising a TTL) and then RAISES on the next tick. The failing thread never
+# reaches EOS, so `eos < launched` and the capture must NOT commit. A partial
+# result must never be served as if complete.
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+# The scan fails partway through (after a cacheable batch has already streamed).
+statement error
+SELECT * FROM ex.data.cache_poison;
+----
+intentional mid-stream failure
+
+# Nothing was committed to the cache — the partial result is not stored.
+query I
+SELECT COUNT(*) FROM vgi_result_cache() WHERE function = 'cache_poison';
+----
+0
+
+statement ok
+DETACH ex;

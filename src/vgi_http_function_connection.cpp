@@ -183,6 +183,20 @@ std::vector<uint8_t> HttpFunctionConnection::SerializeBatchWithState(
 			meta_values.push_back(tick_filter_state_->encoded_filters);
 		}
 	}
+	// Conditional-revalidation validators (M6): send once on the first tick that
+	// carries them (mirrors the subprocess path). The worker's process() reads
+	// vgi.cache.if_none_match / if_modified_since to answer 304 not_modified.
+	if (!cond_sent_ && (!cond_if_none_match_.empty() || !cond_if_modified_since_.empty())) {
+		if (!cond_if_none_match_.empty()) {
+			meta_keys.push_back(VGI_CACHE_IF_NONE_MATCH_KEY);
+			meta_values.push_back(cond_if_none_match_);
+		}
+		if (!cond_if_modified_since_.empty()) {
+			meta_keys.push_back(VGI_CACHE_IF_MODIFIED_SINCE_KEY);
+			meta_values.push_back(cond_if_modified_since_);
+		}
+		cond_sent_ = true;
+	}
 	std::shared_ptr<arrow::KeyValueMetadata> metadata;
 	if (!meta_keys.empty()) {
 		metadata = arrow::KeyValueMetadata::Make(meta_keys, meta_values);
@@ -293,6 +307,7 @@ void HttpFunctionConnection::BufferDataBatches(const std::string &response_body,
 			buffered_batch_indexes_.push_back(ParseVgiBatchIndex(resolved.metadata, base_url_));
 			buffered_partition_values_bytes_.push_back(
 			    ParseVgiPartitionValuesBytes(resolved.metadata, base_url_));
+			buffered_cache_controls_.push_back(ParseVgiCacheControl(resolved.metadata));
 			ExtractStreamState(resolved.batch, resolved.metadata);
 			++spike_external_batches;
 			continue;
@@ -304,6 +319,7 @@ void HttpFunctionConnection::BufferDataBatches(const std::string &response_body,
 		buffered_batch_indexes_.push_back(ParseVgiBatchIndex(bwm.custom_metadata, base_url_));
 		buffered_partition_values_bytes_.push_back(
 		    ParseVgiPartitionValuesBytes(bwm.custom_metadata, base_url_));
+		buffered_cache_controls_.push_back(ParseVgiCacheControl(bwm.custom_metadata));
 		++spike_data_batches;
 	}
 
@@ -742,6 +758,7 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 		if (buffered_batch_index_ < buffered_batches_.size()) {
 			last_batch_index_ = buffered_batch_indexes_[buffered_batch_index_];
 			last_partition_values_bytes_ = buffered_partition_values_bytes_[buffered_batch_index_];
+			last_cache_control_ = buffered_cache_controls_[buffered_batch_index_];
 			return buffered_batches_[buffered_batch_index_++];
 		}
 
@@ -777,6 +794,7 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 		if (buffered_batch_index_ < buffered_batches_.size()) {
 			last_batch_index_ = buffered_batch_indexes_[buffered_batch_index_];
 			last_partition_values_bytes_ = buffered_partition_values_bytes_[buffered_batch_index_];
+			last_cache_control_ = buffered_cache_controls_[buffered_batch_index_];
 			return buffered_batches_[buffered_batch_index_++];
 		}
 
@@ -854,6 +872,7 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 	// batch.
 	last_batch_index_ = DConstants::INVALID_INDEX;
 	last_partition_values_bytes_.clear();
+	last_cache_control_ = VgiCacheControl{};
 
 	while (true) {
 		auto read_result = reader->ReadNext();
@@ -904,6 +923,10 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 			std::string pv = ParseVgiPartitionValuesBytes(bwm.custom_metadata, base_url_);
 			if (!pv.empty()) {
 				last_partition_values_bytes_ = std::move(pv);
+			}
+			auto cc = ParseVgiCacheControl(bwm.custom_metadata);
+			if (cc.present) {
+				last_cache_control_ = cc;
 			}
 		}
 		if (!output_batch) {

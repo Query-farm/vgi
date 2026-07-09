@@ -1,0 +1,103 @@
+# name: test/sql/integration/cache/diagnostics.test
+# description: VGI result cache observability — result_cache.store / store_skipped log events (a positive signal, not a double-negative), vgi_result_cache(include_disk := true) surfacing disk-only spilled entries, and vgi_result_cache_stats() exposing the aggregate counters (the only SQL surface for reaper evictions).
+# group: [vgi_integration_cache]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+statement ok
+SET threads = 8;
+
+statement ok
+SET vgi_result_cache_dir = '__TEST_DIR__/vgi_diag';
+
+statement ok
+SET vgi_result_cache_disk_max_bytes = 1073741824;
+
+statement ok
+ATTACH 'example' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# ---- #19 store event: a MEMORY commit emits result_cache.store tier=memory ----
+statement ok
+SELECT COUNT(*) FROM ex.data.cacheable_numbers;
+
+query I
+SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI'
+    AND message LIKE '%result_cache.store%' AND message LIKE '%tier=memory%';
+----
+true
+
+# ---- #19 store tier=disk on a spill (positive proof, not "abort count = 0") ----
+statement ok
+SET vgi_result_cache_max_entry_bytes = 4096;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+SELECT COUNT(*) FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_parallel', [200000]);
+
+query I
+SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI'
+    AND message LIKE '%result_cache.store%' AND message LIKE '%tier=disk%';
+----
+true
+
+# ---- #18 include_disk: the spilled entry is disk-only (invisible by default),
+#      but vgi_result_cache(include_disk := true) lists it with tier='disk' + size.
+query I
+SELECT COUNT(*) FROM vgi_result_cache() WHERE function = 'cache_parallel';
+----
+0
+
+query I
+SELECT COUNT(*) FROM vgi_result_cache(include_disk := true)
+    WHERE function = 'cache_parallel' AND tier = 'disk' AND total_bytes > 4096;
+----
+1
+
+# ---- #19 store_skipped: a no_store result logs store_skipped reason=not_cacheable
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+SELECT COUNT(*) FROM ex.data.cache_no_store;
+
+query I
+SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI'
+    AND message LIKE '%result_cache.store_skipped%' AND message LIKE '%reason=not_cacheable%';
+----
+true
+
+# ---- #23 stats: counters surface hits + misses + inserts --------------------
+query I
+SELECT hits >= 0 AND misses >= 1 AND inserts >= 1 FROM vgi_result_cache_stats();
+----
+true
+
+# entries + total_bytes reflect the in-memory tier (cacheable_numbers is resident).
+query I
+SELECT entries >= 1 AND total_bytes >= 1 FROM vgi_result_cache_stats();
+----
+true
+
+statement ok
+SET vgi_result_cache_max_entry_bytes = 67108864;
+
+statement ok
+DETACH ex;
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();

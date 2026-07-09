@@ -1,0 +1,139 @@
+# name: test/sql/integration/cache/spill_lifecycle.test
+# description: VGI result cache (spill-to-disk) — lifecycle edges: (1) LIMIT/early-stop tears the scan down before EOS → never-partial refuses the commit AND cleans the in-flight temp; (2) a spilled entry re-reads correctly after max_entry_bytes is raised (incremental-SHA == whole-file-SHA crossover: LoadFromDisk re-hashes the whole blob); (3) an immediately-stale "no-cache" (revalidatable, ttl=0) result that spills is NOT written (disk entries can't be revalidated) → no per-scan orphan leak.
+# group: [vgi_integration_cache]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+statement ok
+SET threads = 8;
+
+statement ok
+SET vgi_result_cache_dir = '__TEST_DIR__/vgi_spill_lc';
+
+statement ok
+SET vgi_result_cache_disk_max_bytes = 1073741824;
+
+statement ok
+SET vgi_result_cache_max_entry_bytes = 1;
+
+statement ok
+SET vgi_result_cache_max_bytes = 268435456;
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+# ===========================================================================
+# 1. LIMIT / early-stop never-partial: the scan spills (tiny cap) then DuckDB
+#    stops pulling after 5 rows — producers are torn down before EOS, so
+#    eos < launched → the gstate dtor refuses the commit and aborts the temp.
+# ===========================================================================
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT COUNT(*) FROM (SELECT v FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_parallel', [400000]) LIMIT 5);
+----
+5
+
+# Nothing committed: no memory entry, no object, no ref, no leftover temp.
+query I
+SELECT COUNT(*) FROM vgi_result_cache() WHERE function = 'cache_parallel';
+----
+0
+
+query I
+SELECT COUNT(*) FROM glob('__TEST_DIR__/vgi_spill_lc/*/objects/*');
+----
+0
+
+query I
+SELECT COUNT(*) FROM glob('__TEST_DIR__/vgi_spill_lc/*/refs/*.ref');
+----
+0
+
+# ===========================================================================
+# 2. Incremental-SHA == whole-file-SHA crossover. Store via streaming spill
+#    (content hash built incrementally), then RAISE max_entry_bytes above the
+#    entry size: the next lookup takes LoadFromDisk, which RE-HASHES the whole
+#    blob and rejects on mismatch. A tier=memory hit proves the incremental
+#    hash equals the whole-file hash (else the entry would be a permanent miss).
+# ===========================================================================
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# MISS + streaming spill (max_entry_bytes still 1).
+query II
+SELECT COUNT(*), SUM(v) FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_parallel', [100000]);
+----
+100000	4999950000
+
+# Raise the per-entry cap above the ~800 KB entry → the serve materializes + adopts.
+statement ok
+SET vgi_result_cache_max_entry_bytes = 67108864;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query II
+SELECT COUNT(*), SUM(v) FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_parallel', [100000]);
+----
+100000	4999950000
+
+# LoadFromDisk's whole-blob re-hash matched the incrementally-written hash → memory adopt.
+query I
+SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI'
+    AND message LIKE '%result_cache.hit%' AND message LIKE '%tier=memory%';
+----
+true
+
+# ===========================================================================
+# 3. Immediately-stale "no-cache" (ttl=0 + etag + revalidatable) that SPILLS is
+#    never committed — a disk-only entry can't be revalidated, and an already-
+#    stale ref would orphan one blob per scan. cache_revalidatable emits 1 nonce
+#    row; under max_entry_bytes=1 it spills. Scan it 4× → ZERO objects/refs, and
+#    the nonce advances every scan (always recomputed, never served stale).
+# ===========================================================================
+statement ok
+SET vgi_result_cache_max_entry_bytes = 1;
+
+statement ok
+SET vgi_result_cache_revalidate_min_bytes = 0;
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+statement ok
+SELECT nonce FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_revalidatable', []);
+
+statement ok
+SELECT nonce FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_revalidatable', []);
+
+statement ok
+SELECT nonce FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_revalidatable', []);
+
+# No orphan accumulation across repeated spills of the immediately-stale result.
+query I
+SELECT COUNT(*) FROM glob('__TEST_DIR__/vgi_spill_lc/*/objects/*');
+----
+0
+
+query I
+SELECT COUNT(*) FROM glob('__TEST_DIR__/vgi_spill_lc/*/refs/*.ref');
+----
+0
+
+statement ok
+SET vgi_result_cache_max_entry_bytes = 67108864;
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();

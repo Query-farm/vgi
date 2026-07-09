@@ -1,0 +1,91 @@
+# name: test/sql/integration/cache/query_shapes.test
+# description: VGI result cache — query shapes beyond a bare scan: the same cached function scanned TWICE in one query (self-join / cold same-key capture race → one surviving entry), a cached scan JOINed to a local table, UNION ALL of two DISTINCT cached scans served together, and GROUP BY over a replayed multi-batch cached result.
+# group: [vgi_integration_cache]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+statement ok
+SET threads = 8;
+
+statement ok
+ATTACH 'example' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+# ===========================================================================
+# 1. COLD same-query self-join: two LogicalGet nodes → two InitGlobal → two
+#    captures of the SAME key racing to commit. Result must be correct and
+#    exactly ONE entry survives (content-addressed dedup / last-writer ref).
+# ===========================================================================
+query I
+SELECT COUNT(*) FROM ex.data.cacheable_numbers a JOIN ex.data.cacheable_numbers b USING (n);
+----
+10
+
+query I
+SELECT COUNT(*) FROM vgi_result_cache() WHERE function = 'cacheable_numbers';
+----
+1
+
+# ===========================================================================
+# 2. WARM self-join: both scans are HITs served from the one entry; still correct.
+# ===========================================================================
+statement ok
+CALL truncate_duckdb_logs();
+
+query II
+SELECT COUNT(*), SUM(a.n + b.n) FROM ex.data.cacheable_numbers a JOIN ex.data.cacheable_numbers b USING (n);
+----
+10	90
+
+query I
+SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%result_cache.hit%';
+----
+true
+
+# ===========================================================================
+# 3. Cached scan JOINed to a local table (small build side, no dynamic filter):
+#    the cached rows must join correctly.
+# ===========================================================================
+query I
+SELECT LIST(c.n ORDER BY c.n) FROM ex.data.cacheable_numbers c JOIN (VALUES (3), (7), (9)) t(k) ON c.n = t.k;
+----
+[3, 7, 9]
+
+# ===========================================================================
+# 4. UNION ALL of two DISTINCT cached entries served in one plan (two separate
+#    CachedReplayConnections — no cross-contamination).
+# ===========================================================================
+statement ok
+SELECT COUNT(*) FROM ex.data.cache_big;
+
+query II
+SELECT COUNT(*), SUM(x) FROM (
+    SELECT n AS x FROM ex.data.cacheable_numbers     -- 0..9  (10 rows, sum 45)
+    UNION ALL
+    SELECT n AS x FROM ex.data.cache_big);           -- 0..4999 (5000 rows, sum 12497500)
+----
+5010	12497545
+
+# ===========================================================================
+# 5. GROUP BY over a replayed multi-batch cached result (grouping spans replay
+#    batch boundaries).
+# ===========================================================================
+query I
+SELECT COUNT(*) FROM (SELECT n % 7 AS g, COUNT(*) c FROM ex.data.cache_big GROUP BY g);
+----
+7
+
+query I
+SELECT SUM(c) FROM (SELECT n % 7 AS g, COUNT(*) c FROM ex.data.cache_big GROUP BY g);
+----
+5000
+
+statement ok
+DETACH ex;

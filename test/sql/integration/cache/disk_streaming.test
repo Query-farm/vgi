@@ -1,0 +1,118 @@
+# name: test/sql/integration/cache/disk_streaming.test
+# description: VGI result cache (S8) — a disk entry larger than max_entry_bytes is served by STREAMING off disk (never materialized into RAM), so results far larger than the memory cap replay with flat memory.
+# group: [vgi_integration_cache]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+# Disk tier on, generous disk cap. Keep max_entry_bytes LARGE for the capture so
+# the ~1.6 MB result is actually stored (capture aborts above max_entry_bytes).
+statement ok
+SET vgi_result_cache_dir = '__TEST_DIR__/vgi_rc_stream';
+
+statement ok
+SET vgi_result_cache_disk_max_bytes = 1073741824;
+
+statement ok
+SET vgi_result_cache_max_entry_bytes = 268435456;
+
+statement ok
+SET vgi_result_cache_max_bytes = 268435456;
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# First direct call → MISS + store to memory + disk (200k int64 rows ≈ 1.6 MB).
+query II
+SELECT COUNT(*), SUM(v) FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_bench', [200000]);
+----
+200000	19999900000
+
+query I
+SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%result_cache.miss%';
+----
+true
+
+# Exactly one blob + ref written under the identity shard.
+query I
+SELECT COUNT(*) FROM glob('__TEST_DIR__/vgi_rc_stream/*/objects/*.vrc');
+----
+1
+
+# Now make the entry LARGER than max_entry_bytes (shrink the per-entry cap to 1)
+# and evict the memory tier (max_bytes -> 1). The next InitGlobal re-Configures
+# the cache. A memory miss + ref_bytes > max_entry_bytes routes to the streaming
+# disk load: the multi-MB payload is NOT read into RAM, only the per-batch TOC.
+statement ok
+SET vgi_result_cache_max_entry_bytes = 1;
+
+statement ok
+SET vgi_result_cache_max_bytes = 1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# Second identical call → disk STREAMING hit; data byte-identical to the live result.
+query II
+SELECT COUNT(*), SUM(v) FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_bench', [200000]);
+----
+200000	19999900000
+
+# CONTENT-level check (not just COUNT/SUM): the streaming TOC path skips the
+# whole-blob integrity re-hash, so a value-preserving corruption (swapped rows /
+# a mis-seek returning a shifted-but-same-sum slice) would pass a SUM check but
+# fail this — cache_bench is strictly monotonic, so v MUST equal its 0-based
+# position on the streamed serve.
+query I
+SELECT bool_and(v = rn) FROM (
+    SELECT v, row_number() OVER () - 1 AS rn
+    FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_bench', [200000]));
+----
+true
+
+# The hit was served by the disk-streaming path (not materialized into memory).
+query I
+SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI'
+    AND message LIKE '%result_cache.hit%' AND message LIKE '%tier=disk_streaming%';
+----
+true
+
+# Streaming entries are NOT adopted into the in-memory index (that would defeat
+# the flat-RAM point), so the memory-tier snapshot stays empty for this entry.
+query I
+SELECT COUNT(*) FROM vgi_result_cache() WHERE function = 'cache_bench';
+----
+0
+
+# A repeat hit re-loads only the TOC and streams again — still correct.
+statement ok
+CALL truncate_duckdb_logs();
+
+query II
+SELECT COUNT(*), SUM(v) FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_bench', [200000]);
+----
+200000	19999900000
+
+query I
+SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI'
+    AND message LIKE '%result_cache.hit%' AND message LIKE '%tier=disk_streaming%';
+----
+true
+
+statement ok
+SET vgi_result_cache_max_bytes = 268435456;
+
+statement ok
+SET vgi_result_cache_max_entry_bytes = 67108864;
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();

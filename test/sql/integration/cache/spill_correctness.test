@@ -1,0 +1,114 @@
+# name: test/sql/integration/cache/spill_correctness.test
+# description: VGI result cache (spill-to-disk) — a SPILLED result serves BYTE-IDENTICAL to the live result, not merely a matching aggregate. Covers the RAM→disk spill boundary reassembly: full row-set equality (cache_parallel) and full row-ORDER equality via round-tripped batch_index (cache_ordered). Ordered path is subprocess-only (FIXED_ORDER work-queue HTTP limitation), so this file is subprocess-focused.
+# group: [vgi_integration_cache]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+statement ok
+SET threads = 8;
+
+statement ok
+SET vgi_result_cache_dir = '__TEST_DIR__/vgi_spill_ok';
+
+statement ok
+SET vgi_result_cache_disk_max_bytes = 1073741824;
+
+# Tiny per-entry cap → every result below spills after the first few KB.
+statement ok
+SET vgi_result_cache_max_entry_bytes = 4096;
+
+statement ok
+SET vgi_result_cache_max_bytes = 268435456;
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+# ===========================================================================
+# 1. batch_index REORDER across a spill (cache_interleaved): the worker emits 100
+#    batches (10 batch_index groups × 10 batches) in DESCENDING order, so the
+#    stored arrival order is genuinely scrambled — this is a real reorder, not a
+#    no-op on an already-sorted single batch. With the tiny cap the entry spills,
+#    so the batches live on disk (pre-spill RAM batches + post-spill disk batches,
+#    each carrying its batch_index). A cached serve must flatten + stable-sort by
+#    batch_index → strictly 0,1,…,N-1.
+# ===========================================================================
+statement ok
+CREATE TEMP TABLE live_ord AS
+SELECT n, row_number() OVER () - 1 AS rn
+FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_interleaved', [200000]);
+
+# The live (miss) scan is NOT monotonic — descending-block emission order — and it
+# spilled (disk-only, no memory row). This is what makes the serve sort do real work.
+query I
+SELECT bool_and(n = rn) FROM live_ord;
+----
+false
+
+query I
+SELECT COUNT(*) FROM vgi_result_cache() WHERE function = 'cache_interleaved';
+----
+0
+
+# Served from disk streaming; the 100 scrambled batches are stable-sorted by
+# batch_index back into a strictly monotonic sequence over >2048 rows / many batches.
+statement ok
+CREATE TEMP TABLE served_ord AS
+SELECT n, row_number() OVER () - 1 AS rn
+FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_interleaved', [200000]);
+
+query II
+SELECT bool_and(n = rn), COUNT(*) FROM served_ord;
+----
+true	200000
+
+# The served stream is the fully-ordered permutation of the (scrambled) live rows:
+# same row SET, and the serve order is the reassembled batch_index order.
+query I
+SELECT (SELECT COUNT(*) FROM (SELECT n FROM live_ord EXCEPT SELECT n FROM served_ord))
+     + (SELECT COUNT(*) FROM (SELECT n FROM served_ord EXCEPT SELECT n FROM live_ord));
+----
+0
+
+# ===========================================================================
+# 2. Set-preserving spill (cache_parallel, 8 producers): the union of all
+#    spilled substreams must equal the live union exactly (no lost / duplicated
+#    / reordered-into-wrong-value rows).
+# ===========================================================================
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+statement ok
+CREATE TEMP TABLE live_par AS
+SELECT v FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_parallel', [200000]);
+
+statement ok
+CREATE TEMP TABLE served_par AS
+SELECT v FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_parallel', [200000]);
+
+# Same cardinality, same sum, and the two multisets are identical (symmetric EXCEPT empty).
+query III
+SELECT (SELECT COUNT(*) FROM served_par),
+       (SELECT SUM(v) FROM served_par),
+       (SELECT COUNT(*) FROM (SELECT v FROM live_par EXCEPT SELECT v FROM served_par))
+     + (SELECT COUNT(*) FROM (SELECT v FROM served_par EXCEPT SELECT v FROM live_par));
+----
+200000	19999900000	0
+
+# No duplicates introduced by the spill (v is distinct 0..N-1).
+query I
+SELECT COUNT(*) = COUNT(DISTINCT v) FROM served_par;
+----
+true
+
+statement ok
+SET vgi_result_cache_max_entry_bytes = 67108864;
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();

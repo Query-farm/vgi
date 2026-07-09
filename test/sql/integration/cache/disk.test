@@ -1,0 +1,89 @@
+# name: test/sql/integration/cache/disk.test
+# description: VGI result cache (M2) — content-addressed disk tier persists + serves
+# group: [vgi_integration_cache]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+# Enable the disk tier at a per-test scratch directory with a generous cap.
+statement ok
+SET vgi_result_cache_dir = '__TEST_DIR__/vgi_rc';
+
+statement ok
+SET vgi_result_cache_disk_max_bytes = 1073741824;
+
+statement ok
+ATTACH 'example' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# First scan → MISS + store to BOTH the memory and disk tiers.
+statement ok
+CREATE TEMP TABLE first AS SELECT nonce AS v FROM ex.data.cache_nonce;
+
+query I
+SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%result_cache.miss%';
+----
+true
+
+# The content-addressed store wrote exactly one blob object + one ref pointer.
+query I
+SELECT COUNT(*) FROM glob('__TEST_DIR__/vgi_rc/*/objects/*.vrc');
+----
+1
+
+query I
+SELECT COUNT(*) FROM glob('__TEST_DIR__/vgi_rc/*/refs/*.ref');
+----
+1
+
+# Force the in-memory entry out by shrinking the memory cap to 1 byte: the next
+# scan's InitGlobal re-Configures the cache and evicts-to-fit, leaving the entry
+# ONLY on disk. The subsequent hit can then only be served from the disk tier.
+statement ok
+SET vgi_result_cache_max_bytes = 1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# Second scan → memory miss, disk HIT. Worker is NOT re-invoked, so the served
+# nonce equals the one stored on the first scan.
+query I
+SELECT (SELECT nonce FROM ex.data.cache_nonce) = (SELECT v FROM first);
+----
+true
+
+query I
+SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%result_cache.hit%';
+----
+true
+
+# vgi_result_cache_flush() also clears the disk tier.
+statement ok
+SET vgi_result_cache_max_bytes = 268435456;
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+query I
+SELECT COUNT(*) FROM glob('__TEST_DIR__/vgi_rc/*/objects/*.vrc');
+----
+0
+
+query I
+SELECT COUNT(*) FROM glob('__TEST_DIR__/vgi_rc/*/refs/*.ref');
+----
+0
+
+statement ok
+DETACH ex;

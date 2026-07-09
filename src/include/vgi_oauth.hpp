@@ -240,5 +240,28 @@ OAuthServerMetadata FetchAuthServerMetadata(ClientContext &context, const std::s
 // Extract scheme://host:port from a URL
 std::string ExtractOrigin(const std::string &url);
 
+// Stable, NON-SECRET fingerprint of the calling identity, for scoping the
+// result cache so one principal's cached rows are never served to another
+// (security-critical — see the result-cache identity_scope). Returns:
+//   - "anon"            : no auth / not explicitly configured (subprocess,
+//                         anonymous HTTP, direct path).
+//   - "oauth:<sha256>"  : OAuth with a resolved identity — hashes the stable
+//                         (iss, sub) claims (survives token refresh).
+//   - "bearer:<sha256>" : static bearer token — salted SHA-256 of the token
+//                         (the raw token never enters the key or disk).
+//   - ""  (empty)       : configured but UNRESOLVABLE (e.g. OAuth opted-in but
+//                         not yet authenticated) — the caller MUST fail closed
+//                         and refuse to cache rather than collapse identities.
+// Never triggers an auth flow (reads only already-resolved state / the static
+// bearer token).
+std::string ComputeCatalogIdentityFingerprint(const std::shared_ptr<CatalogAuth> &auth);
+
+// The full cache identity scope for a catalog-attached table: catalog name +
+// the auth-principal fingerprint (US-separated). Returns "" when the identity is
+// configured-but-unresolvable (caller must fail closed / skip). Used by both the
+// cache-key builder and the per-identity disk-flush path so they agree exactly.
+std::string BuildCatalogIdentityScope(const std::string &catalog_name,
+                                      const std::shared_ptr<CatalogAuth> &auth);
+
 } // namespace vgi
 } // namespace duckdb

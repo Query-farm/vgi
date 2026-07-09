@@ -8,12 +8,16 @@
 #endif
 
 #include "storage/vgi_table_entry.hpp"
+#include "storage/vgi_catalog.hpp"
 #include "vgi_bind_protocol.hpp"
+#include "vgi_cached_replay_connection.hpp"
+#include "vgi_arrow_ipc.hpp" // SerializeRecordBatch (capture)
 #include "vgi_cancel_dispatcher.hpp"
 #include "vgi_catalog_rpc.hpp"
 #include "vgi_exception.hpp"
 #include "vgi_extension.hpp"
 #include "vgi_logging.hpp"
+#include "vgi_oauth.hpp" // ComputeCatalogIdentityFingerprint (cache identity scoping)
 #include "vgi_protocol.hpp"
 #include "vgi_worker_pool.hpp"
 
@@ -1120,6 +1124,372 @@ void VgiTableFunctionGlobalState::EnsureInitApplied() const {
 // Init Global Function - Performs init handshake with existing connection
 // ============================================================================
 
+// ============================================================================
+// Result cache — key computation, eligibility, capture commit (milestone 1)
+// ============================================================================
+namespace {
+
+//! Canonical serialization of the worker settings map for the cache key
+//! (sorted key=value; deterministic across runs within a process).
+std::string SerializeSettingsForKey(const std::map<std::string, Value> &settings) {
+	std::string out;
+	for (const auto &kv : settings) { // std::map iterates in sorted key order
+		out += kv.first;
+		out += '=';
+		out += kv.second.ToString();
+		out += ';';
+	}
+	return out;
+}
+
+//! Canonical serialization of the projection id list for the cache key.
+std::string SerializeProjectionForKey(const std::vector<int32_t> &projection_ids) {
+	std::string out;
+	for (auto id : projection_ids) {
+		out += std::to_string(id);
+		out += ',';
+	}
+	return out;
+}
+
+//! Result of a v1 cache-eligibility check for a scan.
+struct CacheEligibility {
+	bool eligible = false;                  //! query is a cache candidate (opt-in gates pass)
+	const char *ineligible_reason = nullptr; //! set when !eligible (for logging)
+	VgiResultCacheKey key;                  //! populated when eligible (catalog-scoped: txn_id empty)
+	std::string catalog_name;
+	bool catalog_version_frozen = false;
+	//! Current transaction identifier. The KEY stays catalog-scoped (txn_id empty)
+	//! because scope is worker-advertised on the first batch, not known here — but a
+	//! `scope=transaction` result folds this into its key at commit and a lookup
+	//! probes both the catalog key and (key + this txn_id).
+	std::string transaction_id;
+};
+
+//! Evaluate v1 cache eligibility for a table scan and build the cache key.
+//! v1 policy: catalog-attached path only, unfiltered full scans only (no
+//! filter / order / sample / dynamic pushdown), known catalog version.
+CacheEligibility EvaluateCacheEligibility(ClientContext &context,
+                                          const VgiTableFunctionBindData &bind_data,
+                                          TableFunctionInitInput &input,
+                                          const std::vector<int32_t> &projection_ids) {
+	CacheEligibility e;
+	// Global master switch.
+	Value master;
+	if (context.TryGetCurrentSetting("vgi_result_cache", master) && !master.GetValue<bool>()) {
+		e.ineligible_reason = "disabled_global";
+		return e;
+	}
+	// Per-catalog opt-out.
+	if (!bind_data.attach_params->cache()) {
+		e.ineligible_reason = "disabled_attach";
+		return e;
+	}
+	// Identity + version dimensions. Two paths (M5 adds the direct one):
+	//   - catalog-attached (bind_data.table_entry set): identity = catalog name,
+	//     freshness bounded by the runtime catalog_version (0 = unknown → never
+	//     cache, since a version bump is how catalog data invalidates).
+	//   - direct vgi_table_function() (no table_entry): no VgiCatalog and no
+	//     version dimension; identity = worker_path, freshness is TTL-only.
+	std::string identity_scope;
+	int64_t version = 0;
+	std::string catalog_label;
+	if (bind_data.table_entry) {
+		// ParentCatalog() comes through the const bind_data; the catalog is
+		// logically mutable (a live attached catalog) — const_cast to call the
+		// non-const GetCatalogType()/Cast().
+		auto &catalog = const_cast<Catalog &>(bind_data.table_entry->ParentCatalog());
+		if (catalog.GetCatalogType() != "vgi") {
+			e.ineligible_reason = "not_vgi";
+			return e;
+		}
+		auto &vcat = catalog.Cast<VgiCatalog>();
+		version = vcat.GetKnownCatalogVersion();
+		if (version == 0) {
+			e.ineligible_reason = "unknown_version";
+			return e;
+		}
+		// SECURITY-CRITICAL: fold the caller's auth principal into the identity
+		// scope so two attaches with the same alias+worker+args but different
+		// bearer/OAuth identities NEVER share a cache entry. "" = configured but
+		// unresolvable → fail closed (never cache under an ambiguous principal).
+		catalog_label = bind_data.attach_params->catalog_name();
+		identity_scope =
+		    vgi::BuildCatalogIdentityScope(catalog_label, bind_data.attach_params->auth());
+		if (identity_scope.empty()) {
+			e.ineligible_reason = "identity_unresolved";
+			return e;
+		}
+	} else {
+		// Direct path: worker-path identity, TTL-only (version stays 0 here,
+		// which means "no version dimension", NOT "unknown version"). No auth on
+		// this path — anonymous scope.
+		catalog_label = bind_data.worker_path();
+		std::string principal =
+		    vgi::ComputeCatalogIdentityFingerprint(bind_data.attach_params->auth());
+		if (principal.empty()) {
+			e.ineligible_reason = "identity_unresolved";
+			return e;
+		}
+		identity_scope = "worker:" + bind_data.worker_path() + "\x1f" + principal;
+	}
+
+	// Static pushdowns are KEY COMPONENTS (M3): a filtered/ordered/sampled scan
+	// caches under a key that includes the pushdown, so it can never be served
+	// to a differently-shaped scan. Two classes still DISABLE caching:
+	//   - dynamic filters (join-key IN pushdown / Top-N): their values arrive
+	//     via ticks during the scan, so there's no stable key at decision time.
+	//   - unseeded TABLESAMPLE: non-deterministic, must not be frozen.
+	std::string filter_key;
+	if (input.filters) {
+		for (auto &kv : input.filters->filters) {
+			if (VgiContainsDynamicFilter(*kv.second)) {
+				e.ineligible_reason = "dynamic_filter";
+				return e;
+			}
+		}
+		if (!input.filters->filters.empty()) {
+			// Serialize the STATIC filters deterministically for the key. If the
+			// serializer can't represent a filter, fail closed (skip caching).
+			try {
+				auto sf = VgiSerializeFilters(context, input.column_ids, input.filters,
+				                              bind_data.all_column_names, bind_data.worker_path(),
+				                              bind_data.rowid_column_name);
+				if (sf.filter_bytes) {
+					filter_key.append(reinterpret_cast<const char *>(sf.filter_bytes->data()),
+					                  static_cast<size_t>(sf.filter_bytes->size()));
+				}
+				for (auto &jk : sf.join_keys_buffers) {
+					filter_key.push_back('|');
+					filter_key.append(reinterpret_cast<const char *>(jk->data()),
+					                  static_cast<size_t>(jk->size()));
+				}
+			} catch (const std::exception &) {
+				e.ineligible_reason = "unserializable_filter";
+				return e;
+			}
+		}
+	}
+	std::string order_key;
+	if (bind_data.order_by_hint) {
+		const auto &o = *bind_data.order_by_hint;
+		order_key = o.column_name + "/" + o.direction + "/" + o.null_order + "/" +
+		            std::to_string(o.row_limit);
+	}
+	std::string sample_key;
+	if (bind_data.table_sample_hint) {
+		const auto &s = *bind_data.table_sample_hint;
+		if (s.seed < 0) {
+			// Unseeded sample is non-deterministic — never cache.
+			e.ineligible_reason = "unseeded_sample";
+			return e;
+		}
+		sample_key = std::to_string(s.sample_percentage) + "/" + std::to_string(s.seed);
+	}
+
+	// Build the key (projection IN the key; transaction scope deferred).
+	e.key.identity_scope = identity_scope;
+	e.key.worker_path = bind_data.worker_path();
+	e.key.function_name = bind_data.function_name;
+	e.key.canonical_arguments = bind_data.arguments.array ? bind_data.arguments.array->ToString() : "";
+	e.key.canonical_settings = SerializeSettingsForKey(bind_data.settings);
+	e.key.attach_options = bind_data.attach_params->attach_options_canonical();
+	e.key.projection = SerializeProjectionForKey(projection_ids);
+	e.key.attached_data_version = bind_data.attach_params->data_version_spec();
+	e.key.implementation_version = bind_data.attach_params->implementation_version();
+	e.key.catalog_version = version;
+	e.key.at_unit = bind_data.at_unit;
+	e.key.at_value = bind_data.at_value;
+	// Static pushdown key components (M3).
+	e.key.filter_bytes = std::move(filter_key);
+	e.key.order_by_hint = std::move(order_key);
+	e.key.sample_hint = std::move(sample_key);
+	// The key stays catalog-scoped here (txn_id empty); the current transaction id
+	// is carried separately for the scope=transaction commit + two-key lookup.
+	e.transaction_id = std::to_string(static_cast<uint64_t>(context.ActiveTransaction().global_transaction_id));
+	e.catalog_name = catalog_label;
+	e.eligible = true;
+	return e;
+}
+
+//! Log a result_cache.* event.
+void LogResultCache(ClientContext &context, const string &event,
+                    const vector<pair<string, string>> &fields) {
+	VGI_LOG(context, event, fields);
+}
+
+} // namespace
+
+// Drain a RAM substream's buffered batches into the spill writer (freeing them as
+// it goes). Returns false if the writer refused (per-entry disk budget exceeded).
+static bool DrainSubstreamToWriter(CachedStream &s, VgiCaptureDiskWriter &w) {
+	bool ok = true;
+	for (auto &cb : s.batches) {
+		if (ok && cb.ipc) {
+			ok = w.AppendBatch(cb.has_batch_index, cb.batch_index, cb.rows, cb.partition_values_bytes,
+			                   cb.ipc->data(), static_cast<int64_t>(cb.ipc->size()));
+		}
+	}
+	s.batches.clear(); // free the RAM regardless (streaming from here on)
+	s.bytes = 0;
+	s.rows = 0;
+	return ok;
+}
+
+// Commit a completed capture to the result cache. Called from the gstate
+// destructor. Enforces the never-partial invariant: only commits when the full
+// result was drained (every launched local state reached EOS) and the worker
+// advertised a cacheable result.
+VgiTableFunctionGlobalState::~VgiTableFunctionGlobalState() {
+	if (!capture) {
+		return;
+	}
+	auto &cap = *capture;
+	// [S6] Release this capture's in-flight budget on EVERY teardown path (commit,
+	// abort, incomplete) — the transient capture buffers are done being resident
+	// (either committed into the LRU, whose bytes are accounted separately, or
+	// freed). Do it first so no early-return leaks the reservation.
+	int64_t reserved = cap.reserved_inflight_bytes.exchange(0, std::memory_order_relaxed);
+	if (reserved > 0) {
+		VgiResultCache::Instance().ReleaseInflightCapture(reserved);
+	}
+	// Any path that does NOT commit must discard a streamed temp blob (no ref is
+	// written, so an un-aborted temp would linger until the reaper sweeps it).
+	auto abort_stream = [&]() {
+		if (cap.disk_writer) {
+			VgiResultCache::Instance().AbortStreamingCapture(*cap.disk_writer);
+		}
+	};
+	// Best-effort store diagnostics. The dtor runs during query teardown while the
+	// ClientContext is still alive (same assumption as dynamic_to_string); guard + swallow.
+	auto log_store = [&](const string &event, const vector<pair<string, string>> &fields) {
+		if (client_context_for_explain) {
+			try {
+				VGI_LOG(*client_context_for_explain, event, fields);
+			} catch (...) {
+			}
+		}
+	};
+	auto skip = [&](const char *reason) {
+		log_store("result_cache.store_skipped",
+		          {{"function", cap.key.function_name}, {"key_hash", cap.key.HexDigest()}, {"reason", reason}});
+	};
+
+	const bool complete = cap.cc_seen && cap.cc.Cacheable() && !cap.aborted.load() &&
+	                      cap.launched.load() > 0 && cap.eos.load() == cap.launched.load();
+	// v1: transaction-scoped results are not cached (transaction keying is a later
+	// milestone). Refuse rather than mis-key.
+	if (!complete) {
+		abort_stream();
+		return;
+	}
+	// scope=transaction: reusable only within THIS transaction. Fold the txn id into
+	// the key so a different transaction (different id) misses it. Refuse if we have
+	// no txn id to isolate by (shouldn't happen).
+	const bool txn_scoped = cap.cc.TransactionScoped();
+	if (txn_scoped && cap.transaction_id.empty()) {
+		skip("no_transaction_id");
+		abort_stream();
+		return;
+	}
+	auto entry = std::make_shared<VgiResultCacheEntry>();
+	entry->key = cap.key;
+	if (txn_scoped) {
+		entry->key.transaction_id = cap.transaction_id;
+	}
+	entry->catalog_name = cap.catalog_name;
+	entry->scope = cap.cc.scope;
+	entry->etag = cap.cc.etag;
+	entry->last_modified = cap.cc.last_modified;
+	entry->revalidatable = cap.cc.revalidatable;
+	entry->stored_at = std::chrono::steady_clock::now();
+	// Freshness: ttl wins over expires; frozen/at-pinned may never expire. The
+	// worker ttl was already clamped at parse; clamp the settings-derived default
+	// too so `stored_at + seconds(ttl)` can never overflow the time_point.
+	int64_t ttl = cap.cc.ttl_seconds.value_or(static_cast<int64_t>(cap.default_ttl_seconds));
+	if (ttl > VGI_CACHE_MAX_TTL_SECONDS) {
+		ttl = VGI_CACHE_MAX_TTL_SECONDS;
+	}
+	if (ttl <= 0 && cap.cc.expires_rfc3339.empty()) {
+		if (cap.catalog_version_frozen || !cap.key.at_value.empty()) {
+			entry->never_expires = true;
+		} else if (cap.cc.revalidatable && !cap.cc.etag.empty()) {
+			// "no-cache" semantic (HTTP): ttl=0 + a validator + revalidatable
+			// stores the payload but marks it immediately stale, so every read
+			// revalidates via a conditional request (a not_modified reply reuses
+			// the stored bytes without re-streaming). expires_at == stored_at.
+		} else {
+			skip("no_freshness");
+			abort_stream();
+			return; // no freshness basis — refuse (shouldn't happen: Cacheable() gate)
+		}
+	}
+	entry->expires_at = entry->stored_at + std::chrono::seconds(ttl > 0 ? ttl : 0);
+
+	if (cap.streaming()) {
+		// A spilled entry is disk-only, and conditional revalidation
+		// (LookupForRevalidation) only probes the in-memory index — so a disk-only
+		// entry can never be revalidated. An immediately-stale "no-cache" result
+		// (ttl=0 + etag + revalidatable, expires_at == stored_at) would therefore be
+		// written un-loadable (both disk loaders reject `now >= expires`) and orphan
+		// one blob per scan. Refuse to spill it — recompute is the correct behavior.
+		if (!entry->never_expires && entry->expires_at <= entry->stored_at) {
+			skip("immediately_stale");
+			abort_stream();
+			return;
+		}
+		// Transaction-scoped entries are memory-only (the txn id is process-local and
+		// ephemeral; a disk blob would orphan after the txn and be meaningless
+		// cross-process). A spilled one has no RAM copy → refuse (recompute).
+		if (txn_scoped) {
+			skip("transaction_scoped_spill");
+			abort_stream();
+			return;
+		}
+		// Spilled path: most batches already streamed to the disk blob. Drain any
+		// substreams whose producer finished BEFORE the spill (their RAM batches were
+		// never streamed) — single-threaded here, all producers done. Then finalize
+		// (hash → rename → ref); the entry is disk-only, discovered via its ref and
+		// adopted into memory on a small serve. A failed drain/commit caches nothing.
+		for (auto &sp : cap.streams) {
+			if (!sp->batches.empty() && !DrainSubstreamToWriter(*sp, *cap.disk_writer)) {
+				skip("drain_failed");
+				VgiResultCache::Instance().AbortStreamingCapture(*cap.disk_writer);
+				return;
+			}
+		}
+		if (VgiResultCache::Instance().CommitStreamingCapture(*cap.disk_writer, *entry)) {
+			log_store("result_cache.store", {{"function", cap.key.function_name},
+			                                 {"key_hash", entry->key.HexDigest()},
+			                                 {"tier", "disk"},
+			                                 {"rows", std::to_string(cap.disk_writer->Rows())},
+			                                 {"bytes", std::to_string(cap.disk_writer->Bytes())}});
+		}
+		return;
+	}
+	// RAM-buffered path (disk tier off): move the substreams in + insert into memory.
+	int64_t rows = 0;
+	int64_t bytes = 0;
+	for (auto &sp : cap.streams) {
+		rows += sp->rows;
+		bytes += sp->bytes;
+		entry->streams.push_back(std::move(*sp));
+	}
+	entry->rows = rows;
+	entry->total_bytes = bytes;
+	const std::string stored_key_hash = entry->key.HexDigest();
+	// Transaction-scoped entries never persist to disk (ephemeral, process-local id).
+	if (VgiResultCache::Instance().Insert(std::move(entry), /*allow_disk=*/!txn_scoped)) {
+		log_store("result_cache.store", {{"function", cap.key.function_name},
+		                                 {"key_hash", stored_key_hash},
+		                                 {"tier", "memory"},
+		                                 {"rows", std::to_string(rows)},
+		                                 {"bytes", std::to_string(bytes)}});
+	} else {
+		skip("too_large_for_memory"); // > max_entry_bytes with disk off (or memory-only txn)
+	}
+}
+
 unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
 	auto &bind_data = input.bind_data->Cast<VgiTableFunctionBindData>();
 
@@ -1150,6 +1520,105 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 				projection_ids.push_back(static_cast<int32_t>(col_id));
 			}
 		}
+	}
+
+	// --- Result cache: eligibility + serve (cache hit short-circuits worker) ---
+	// Sync the process-global cache config from this query's settings so SET on
+	// any cap / the disk dir takes effect. [S1] ConfigureIfChanged skips the
+	// global lock + evict entirely when the settings are unchanged (the steady
+	// state), so this is lock-free on the hot path. Empty dir / 0 disk cap = off.
+	{
+		VgiResultCache::Settings s;
+		Value sv;
+		if (context.TryGetCurrentSetting("vgi_result_cache_max_bytes", sv) && !sv.IsNull()) {
+			s.max_bytes = sv.GetValue<uint64_t>();
+		}
+		if (context.TryGetCurrentSetting("vgi_result_cache_max_entry_bytes", sv) && !sv.IsNull()) {
+			s.max_entry_bytes = sv.GetValue<uint64_t>();
+		}
+		if (context.TryGetCurrentSetting("vgi_result_cache_max_entries", sv) && !sv.IsNull()) {
+			s.max_entries = sv.GetValue<uint64_t>();
+		}
+		if (context.TryGetCurrentSetting("vgi_result_cache_max_inflight_bytes", sv) && !sv.IsNull()) {
+			s.max_inflight_bytes = sv.GetValue<uint64_t>();
+		}
+		if (context.TryGetCurrentSetting("vgi_result_cache_dir", sv) && !sv.IsNull()) {
+			s.disk_dir = sv.GetValue<string>();
+		}
+		if (context.TryGetCurrentSetting("vgi_result_cache_disk_max_bytes", sv) && !sv.IsNull()) {
+			s.disk_max_bytes = sv.GetValue<uint64_t>();
+		}
+		if (context.TryGetCurrentSetting("vgi_result_cache_disk_reap_interval_seconds", sv) && !sv.IsNull()) {
+			s.disk_reap_interval_seconds = sv.GetValue<uint64_t>();
+		}
+		VgiResultCache::Instance().ConfigureIfChanged(s);
+	}
+	auto cache_eval = EvaluateCacheEligibility(context, bind_data, input, projection_ids);
+	// A stale-but-revalidatable entry the worker can cheaply confirm via a
+	// conditional request. Set below the eligible block; consumed when the
+	// gstate is built (miss path) to arm revalidation mode. Null otherwise.
+	std::shared_ptr<const VgiResultCacheEntry> revalidation_entry;
+	if (cache_eval.eligible) {
+		auto now_tp = std::chrono::steady_clock::now();
+		// Conditional revalidation takes precedence: probe for a stale
+		// revalidatable entry FIRST, because Lookup() drops stale entries.
+		auto reval = VgiResultCache::Instance().LookupForRevalidation(cache_eval.key, now_tp);
+		if (reval) {
+			// Only worth a conditional round-trip when re-streaming would cost
+			// more than the check — gate on the payload size threshold.
+			Value rmv;
+			uint64_t reval_min_bytes =
+			    context.TryGetCurrentSetting("vgi_result_cache_revalidate_min_bytes", rmv) && !rmv.IsNull()
+			        ? rmv.GetValue<uint64_t>()
+			        : 262144;
+			if (static_cast<uint64_t>(reval->total_bytes) >= reval_min_bytes) {
+				revalidation_entry = std::move(reval);
+				LogResultCache(context, "result_cache.revalidate",
+				               {{"catalog", cache_eval.catalog_name},
+				                {"function", bind_data.function_name},
+				                {"key_hash", cache_eval.key.HexDigest()},
+				                {"outcome", "conditional_request"}});
+			}
+			// else: too small — fall through to a plain refetch (capture below).
+		}
+		if (!revalidation_entry) {
+			auto entry = VgiResultCache::Instance().Lookup(cache_eval.key, now_tp);
+			if (!entry && !cache_eval.transaction_id.empty()) {
+				// The catalog key (txn_id empty) didn't match; a scope=transaction
+				// result stored earlier in THIS transaction lives under (key + txn_id),
+				// so probe that too. A different transaction has a different id → miss.
+				VgiResultCacheKey txn_key = cache_eval.key;
+				txn_key.transaction_id = cache_eval.transaction_id;
+				entry = VgiResultCache::Instance().Lookup(txn_key, now_tp);
+			}
+			if (entry) {
+				// HIT — serve from cache; no worker acquire / init RPC / pool touch.
+				auto gstate = make_uniq<VgiTableFunctionGlobalState>();
+				gstate->serving_from_cache = true;
+				// [S8] A disk-backed entry streams off disk (never materialized); a
+				// memory / adopted entry replays from RAM. Surface which so tests can
+				// prove the flat-RAM streaming path was taken.
+				const bool disk_streaming = entry->disk_backed;
+				gstate->serving_entry = std::move(entry);
+				gstate->max_processes = 1;
+				gstate->init_applied.store(true, std::memory_order_release);
+				gstate->client_context_for_explain = &context;
+				LogResultCache(context, "result_cache.hit",
+				               {{"catalog", cache_eval.catalog_name},
+				                {"function", bind_data.function_name},
+				                {"key_hash", cache_eval.key.HexDigest()},
+				                {"tier", disk_streaming ? "disk_streaming" : "memory"}});
+				return unique_ptr<GlobalTableFunctionState>(std::move(gstate));
+			}
+			LogResultCache(context, "result_cache.miss",
+			               {{"catalog", cache_eval.catalog_name},
+			                {"function", bind_data.function_name},
+			                {"key_hash", cache_eval.key.HexDigest()}});
+		}
+	} else if (cache_eval.ineligible_reason) {
+		LogResultCache(context, "result_cache.ineligible",
+		               {{"function", bind_data.function_name},
+		                {"reason", cache_eval.ineligible_reason}});
 	}
 
 	// Acquire a connection for the init/scan phase. The planner-phase BindResult
@@ -1324,17 +1793,66 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 	// reads (Ducklake bind-time scan plan) it has no observable effect.
 	global_state->max_processes = 1;
 
+	// Result cache: eligible MISS → set up capture. Each local state captures
+	// its own substream; commit happens in the gstate destructor (never-partial).
+	if (cache_eval.eligible) {
+		auto cap = std::make_shared<VgiResultCaptureCtx>();
+		cap->key = cache_eval.key;
+		cap->catalog_name = cache_eval.catalog_name;
+		cap->catalog_version_frozen = cache_eval.catalog_version_frozen;
+		cap->transaction_id = cache_eval.transaction_id;
+		Value sv;
+		cap->max_entry_bytes = context.TryGetCurrentSetting("vgi_result_cache_max_entry_bytes", sv)
+		                           ? static_cast<int64_t>(sv.GetValue<uint64_t>())
+		                           : 67108864;
+		cap->max_bytes = context.TryGetCurrentSetting("vgi_result_cache_max_bytes", sv)
+		                     ? static_cast<int64_t>(sv.GetValue<uint64_t>())
+		                     : 268435456;
+		cap->default_ttl_seconds =
+		    context.TryGetCurrentSetting("vgi_result_cache_default_ttl_seconds", sv)
+		        ? sv.GetValue<uint64_t>()
+		        : 0;
+		// Disk config for the threshold spill: when a RAM capture would exceed
+		// max_entry_bytes AND the disk tier is on, capture spills to a streaming disk
+		// blob (RAM-flat) instead of aborting. Captured here; the writer is created
+		// lazily in InstallBatch on the first threshold cross.
+		if (context.TryGetCurrentSetting("vgi_result_cache_dir", sv) && !sv.IsNull()) {
+			cap->disk_dir = sv.GetValue<std::string>();
+		}
+		if (context.TryGetCurrentSetting("vgi_result_cache_disk_max_bytes", sv) && !sv.IsNull()) {
+			cap->disk_max = sv.GetValue<uint64_t>();
+		}
+		global_state->capture = std::move(cap);
+	}
+
+	// Conditional revalidation: arm the gstate so the init request carries the
+	// stored validators and GetNextBatch can honor a not_modified reply. The
+	// capture set up just above still records fresh data on the changed path.
+	if (revalidation_entry) {
+		global_state->revalidating = true;
+		global_state->revalidate_if_none_match = revalidation_entry->etag;
+		global_state->revalidate_if_modified_since = revalidation_entry->last_modified;
+		global_state->revalidation_entry = std::move(revalidation_entry);
+	}
+
 	auto perform_init_with_retry =
 	    [acquire_params, &context_ref = context,
 	     bind_result, projection_ids, filter_bytes, join_keys_buffers,
 	     order_by_hint = bind_data.order_by_hint,
 	     table_sample_hint = bind_data.table_sample_hint,
 	     worker_path = bind_data.worker_path(),
-	     function_name = bind_data.function_name](
+	     function_name = bind_data.function_name,
+	     reval_inm = global_state->revalidate_if_none_match,
+	     reval_ims = global_state->revalidate_if_modified_since](
 	        std::unique_ptr<IFunctionConnection> conn,
 	        bool from_pool) mutable
 	    -> std::pair<InitResult, std::unique_ptr<IFunctionConnection>> {
 		auto run = [&](IFunctionConnection &c) {
+			// Arm conditional-revalidation validators (M6) before init; no-op
+			// when both are empty (the common non-revalidation path).
+			if (!reval_inm.empty() || !reval_ims.empty()) {
+				c.SetConditionalRequest(reval_inm, reval_ims);
+			}
 			return c.PerformInit(bind_result, projection_ids, filter_bytes, join_keys_buffers,
 			                     "", order_by_hint, table_sample_hint);
 		};
@@ -1469,6 +1987,24 @@ unique_ptr<LocalTableFunctionState> VgiTableFunctionInitLocal(ExecutionContext &
 		}
 	}
 
+	// Result cache serve: replace the worker connection with a cached-replay
+	// connection that returns the cached batches. Only the FIRST local state to
+	// claim replays the full result; any extra local state (should not occur
+	// with MaxThreads()==1, but guard anyway) gets an empty replay so rows are
+	// never duplicated.
+	if (global_state.serving_from_cache) {
+		const bool first = !global_state.serve_claimed.exchange(true);
+		std::shared_ptr<const VgiResultCacheEntry> entry =
+		    first ? global_state.serving_entry : std::make_shared<const VgiResultCacheEntry>();
+		local_state->prefetch_slot_->connection = make_uniq<CachedReplayConnection>(std::move(entry));
+		VGI_LOG(context.client, "table_function.init_local",
+		        {{"conn", "cachehit"},
+		         {"worker_path", bind_data.worker_path()},
+		         {"function_name", bind_data.function_name},
+		         {"worker_type", first ? "cache_serve" : "cache_serve_empty"}});
+		return unique_ptr<LocalTableFunctionState>(std::move(local_state));
+	}
+
 	// Try to claim the primary connection from global_state (thread-safe check-and-move)
 	std::unique_ptr<IFunctionConnection> primary_connection;
 	{
@@ -1568,6 +2104,13 @@ unique_ptr<LocalTableFunctionState> VgiTableFunctionInitLocal(ExecutionContext &
 			fields.emplace_back("worker_type", "secondary");
 			VGI_LOG(context.client, "table_function.init_local", fields);
 		}
+	}
+
+	// Result cache capture: give this local state its own substream to append
+	// to (increments launched). InstallBatch appends; the gstate destructor
+	// commits when every launched local state reached EOS.
+	if (global_state.capture) {
+		local_state->capture_stream = global_state.capture->NewStream();
 	}
 
 	return local_state;
@@ -1718,6 +2261,11 @@ static bool InstallBatch(ClientContext &context, const VgiTableFunctionBindData 
                          std::shared_ptr<arrow::RecordBatch> arrow_batch) {
 	if (!arrow_batch) {
 		local_state.done = true;
+		// Result-cache capture: this local state fully drained its stream. The
+		// gstate destructor commits iff eos == launched (never-partial).
+		if (global_state.capture && local_state.capture_stream) {
+			global_state.capture->eos.fetch_add(1, std::memory_order_relaxed);
+		}
 		{
 			auto &conn = *local_state.connection();
 			vector<pair<string, string>> fields;
@@ -1902,7 +2450,184 @@ static bool InstallBatch(ClientContext &context, const VgiTableFunctionBindData 
 		VGI_LOG(context, "table_function.batch_received", fields);
 	}
 
+	// Result-cache capture: append this batch to the local state's substream.
+	if (global_state.capture && local_state.capture_stream) {
+		auto &cap = *global_state.capture;
+		if (!cap.aborted.load(std::memory_order_relaxed)) {
+			auto *conn = local_state.connection();
+			// First batch this thread sees: latch the cache-control advertisement
+			// (a worker advertises on the first batch of its stream).
+			if (!local_state.capture_checked_first_batch) {
+				local_state.capture_checked_first_batch = true;
+				VgiCacheControl cc = conn->GetLastCacheControl();
+				if (cc.present) {
+					std::lock_guard<std::mutex> lk(cap.mu);
+					if (!cap.cc_seen) {
+						cap.cc = cc;
+						cap.cc_seen = true;
+					}
+				}
+			}
+			// If a non-cacheable advertisement was latched (no_store / no
+			// freshness key), abort — never commit. Buffered bytes are freed at
+			// gstate teardown (bounded by max_entry_bytes).
+			bool not_cacheable = false;
+			{
+				std::lock_guard<std::mutex> lk(cap.mu);
+				not_cacheable = cap.cc_seen && !cap.cc.Cacheable();
+			}
+			auto spill_append = [&](const std::shared_ptr<arrow::Buffer> &ipc) -> bool {
+				idx_t bi = conn->GetLastBatchIndex();
+				bool has_bi = bi != DConstants::INVALID_INDEX;
+				return cap.disk_writer->AppendBatch(
+				    has_bi, has_bi ? static_cast<uint64_t>(bi) : 0,
+				    static_cast<int64_t>(arrow_batch->num_rows()), conn->GetLastPartitionValuesBytes(),
+				    ipc->data(), static_cast<int64_t>(ipc->size()));
+			};
+			auto log_disk_too_large = [&]() {
+				cap.aborted.store(true, std::memory_order_relaxed);
+				VgiResultCache::Instance().NoteCaptureAbort();
+				LogResultCache(context, "result_cache.abort",
+				               {{"key_hash", cap.key.HexDigest()},
+				                {"reason", "disk_entry_too_large"},
+				                {"bytes_seen", std::to_string(cap.disk_writer->Bytes())}});
+			};
+			if (not_cacheable) {
+				// Worker advertised no_store / no freshness key. Log the skip once
+				// (exchange → only the first thread to flip `aborted` logs).
+				if (!cap.aborted.exchange(true, std::memory_order_relaxed)) {
+					LogResultCache(context, "result_cache.store_skipped",
+					               {{"function", cap.key.function_name},
+					                {"key_hash", cap.key.HexDigest()},
+					                {"reason", "not_cacheable"}});
+				}
+			} else if (cap.streaming()) {
+				// Capture has SPILLED to disk. This thread first drains its own RAM
+				// substream (once), then appends straight to disk — one batch resident
+				// at a time, RAM flat at ~max_entry_bytes no matter the result size.
+				if (!local_state.capture_spilled) {
+					if (!DrainSubstreamToWriter(*local_state.capture_stream, *cap.disk_writer)) {
+						log_disk_too_large();
+					}
+					local_state.capture_spilled = true;
+				}
+				if (!cap.aborted.load(std::memory_order_relaxed)) {
+					auto ipc = SerializeRecordBatch(arrow_batch);
+					if (!spill_append(ipc)) {
+						log_disk_too_large();
+					}
+				}
+			} else {
+				auto ipc = SerializeRecordBatch(arrow_batch);
+				const int64_t sz = static_cast<int64_t>(ipc->size());
+				const int64_t running = cap.total_bytes.fetch_add(sz, std::memory_order_relaxed) + sz;
+				if (running > cap.max_entry_bytes) {
+					// Over the memory-tier per-entry cap. If the disk tier is on, SPILL
+					// to a streaming disk blob instead of aborting — RAM stays flat from
+					// here (a >max_entry_bytes result caches to disk, not uncached).
+					bool spilled = false;
+					if (!cap.disk_dir.empty() && cap.disk_max > 0) {
+						std::lock_guard<std::mutex> lk(cap.mu);
+						if (!cap.disk_writer && !cap.aborted.load(std::memory_order_relaxed)) {
+							cap.disk_writer = VgiResultCache::Instance().BeginStreamingCapture(
+							    cap.key, cap.disk_dir, cap.disk_max);
+							if (cap.disk_writer) {
+								cap.spilling.store(true, std::memory_order_release);
+							}
+						}
+						spilled = cap.disk_writer != nullptr;
+					}
+					if (spilled) {
+						// Buffer THIS batch into my substream, then drain the whole
+						// substream (my earlier RAM batches + this one) to disk, in order.
+						VgiCachedBatch cb;
+						cb.ipc = std::move(ipc);
+						cb.rows = arrow_batch->num_rows();
+						idx_t bi = conn->GetLastBatchIndex();
+						if (bi != DConstants::INVALID_INDEX) {
+							cb.batch_index = static_cast<uint64_t>(bi);
+							cb.has_batch_index = true;
+						}
+						cb.partition_values_bytes = conn->GetLastPartitionValuesBytes();
+						local_state.capture_stream->batches.push_back(std::move(cb));
+						if (!DrainSubstreamToWriter(*local_state.capture_stream, *cap.disk_writer)) {
+							log_disk_too_large();
+						}
+						local_state.capture_spilled = true;
+					} else {
+						// No disk tier → abort to uncached, keep streaming to DuckDB.
+						cap.aborted.store(true, std::memory_order_relaxed);
+						VgiResultCache::Instance().NoteCaptureAbort();
+						LogResultCache(context, "result_cache.abort",
+						               {{"key_hash", cap.key.HexDigest()},
+						                {"reason", "entry_too_large"},
+						                {"bytes_seen", std::to_string(running)}});
+					}
+				} else if (!VgiResultCache::Instance().TryReserveInflightCapture(sz)) {
+					// [S6] Global in-flight capture budget exhausted (too many
+					// concurrent captures) — abort THIS one to uncached, keep
+					// streaming. Bounds total transient capture RAM under load.
+					cap.aborted.store(true, std::memory_order_relaxed);
+					VgiResultCache::Instance().NoteCaptureAbort();
+					LogResultCache(context, "result_cache.abort",
+					               {{"key_hash", cap.key.HexDigest()},
+					                {"reason", "inflight_budget"},
+					                {"bytes_seen", std::to_string(running)}});
+				} else {
+					cap.reserved_inflight_bytes.fetch_add(sz, std::memory_order_relaxed);
+					VgiCachedBatch cb;
+					cb.ipc = std::move(ipc);
+					cb.rows = arrow_batch->num_rows();
+					idx_t bi = conn->GetLastBatchIndex();
+					if (bi != DConstants::INVALID_INDEX) {
+						cb.batch_index = static_cast<uint64_t>(bi);
+						cb.has_batch_index = true;
+					}
+					cb.partition_values_bytes = conn->GetLastPartitionValuesBytes();
+					local_state.capture_stream->bytes += sz;
+					local_state.capture_stream->rows += cb.rows;
+					local_state.capture_stream->batches.push_back(std::move(cb));
+				}
+			}
+		}
+	}
+
 	return true;
+}
+
+// On a 304 not_modified reply, re-insert the stored entry with a slid TTL so
+// future lookups hit fresh. The cached batches are unchanged; only freshness
+// (and any refreshed validators) is updated. Best-effort — a failed re-insert
+// just means the next scan revalidates again.
+static void MaybeSlideRevalidatedEntry(ClientContext &context, const VgiTableFunctionBindData &bind_data,
+                                       VgiTableFunctionGlobalState &global_state,
+                                       const VgiCacheControl &cc) {
+	const auto &orig = *global_state.revalidation_entry;
+	auto fresh = std::make_shared<VgiResultCacheEntry>(orig); // shallow copy (shared Buffers)
+	fresh->stored_at = std::chrono::steady_clock::now();
+	// Fresh ttl/expires on the not_modified batch wins; else reuse the prior
+	// lifetime duration so a validator-only 304 still slides forward.
+	int64_t ttl = cc.ttl_seconds.value_or(0);
+	if (ttl <= 0 && cc.expires_rfc3339.empty() && !orig.never_expires) {
+		auto prior = std::chrono::duration_cast<std::chrono::seconds>(orig.expires_at - orig.stored_at).count();
+		ttl = prior > 0 ? prior : 0;
+	}
+	if (!orig.never_expires) {
+		fresh->expires_at = fresh->stored_at + std::chrono::seconds(ttl > 0 ? ttl : 0);
+	}
+	// A worker may refresh validators alongside the 304.
+	if (!cc.etag.empty()) {
+		fresh->etag = cc.etag;
+	}
+	if (!cc.last_modified.empty()) {
+		fresh->last_modified = cc.last_modified;
+	}
+	VgiResultCache::Instance().Insert(fresh);
+	LogResultCache(context, "result_cache.revalidate",
+	               {{"catalog", global_state.revalidation_entry->catalog_name},
+	                {"function", bind_data.function_name},
+	                {"key_hash", global_state.revalidation_entry->key.HexDigest()},
+	                {"outcome", "not_modified"}});
 }
 
 static bool GetNextBatch(ClientContext &context, const VgiTableFunctionBindData &bind_data,
@@ -1923,6 +2648,25 @@ static bool GetNextBatch(ClientContext &context, const VgiTableFunctionBindData 
 			return InstallBatch(context, bind_data, global_state, local_state, nullptr);
 		}
 		if (arrow_batch->num_rows() == 0) {
+			// Conditional revalidation (M6): a 0-row vgi.cache.not_modified batch
+			// is a 304 — the stored payload is still fresh. Slide its TTL and swap
+			// this (single) local state to replay the stored entry. Single-threaded
+			// (MaxThreads()==1 while revalidating) makes the swap race-free.
+			if (global_state.revalidating && global_state.revalidation_entry &&
+			    !global_state.revalidation_served.exchange(true)) {
+				auto cc = local_state.connection()->GetLastCacheControl();
+				if (cc.not_modified) {
+					MaybeSlideRevalidatedEntry(context, bind_data, global_state, cc);
+					// Serve the stored entry from here on; abandon the live worker
+					// connection and disable the (now-irrelevant) capture.
+					local_state.prefetch_slot_->connection =
+					    make_uniq<CachedReplayConnection>(global_state.revalidation_entry);
+					if (global_state.capture) {
+						global_state.capture->aborted.store(true);
+					}
+					continue; // next ReadDataBatch pulls from the replay connection
+				}
+			}
 			auto &conn = *local_state.connection();
 			vector<pair<string, string>> fields;
 			fields.emplace_back("conn", conn.GetConnIdHex());
@@ -2272,6 +3016,15 @@ InsertionOrderPreservingMap<string> VgiTableFunctionDynamicToString(TableFunctio
 	// return one from their own ``dynamic_to_string``.
 	result["Worker"] = bind_data.worker_path();
 	result["Function"] = bind_data.function_name;
+
+	// Result-cache serve indicator: a HIT skips the worker entirely, so EXPLAIN
+	// ANALYZE should say so (and which tier). The worker RPC below is also skipped
+	// on a hit (no global_execution_id), so surface this before the early return.
+	if (global_state.serving_from_cache) {
+		result["Cache"] = (global_state.serving_entry && global_state.serving_entry->disk_backed)
+		                      ? "hit (disk_streaming)"
+		                      : "hit (memory)";
+	}
 
 	// User-defined diagnostics via worker RPC. Skip if we don't have enough
 	// context to make the call — happens for direct vgi_table_function() invocations

@@ -1,0 +1,70 @@
+# name: test/sql/integration/cache/pushdown.test
+# description: VGI result cache (M3) — filtered/ordered scans of a cacheable function cache + stay correct
+# group: [vgi_integration_cache]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+statement ok
+ATTACH 'example' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# WHERE on a cacheable function: the full result is cached (the simple generator
+# does not push filters, so DuckDB filters above the scan), then reused.
+query I
+SELECT COUNT(*) FROM ex.data.cacheable_numbers WHERE n >= 5;
+----
+5
+
+query I
+SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%result_cache.miss%';
+----
+true
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# Second identical filtered scan → HIT on the cached full result, correct rows.
+query I
+SELECT COUNT(*) FROM ex.data.cacheable_numbers WHERE n >= 5;
+----
+5
+
+query I
+SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%result_cache.hit%';
+----
+true
+
+# A different WHERE reuses the same cached full scan and stays correct.
+query I
+SELECT COUNT(*) FROM ex.data.cacheable_numbers WHERE n >= 7;
+----
+3
+
+# ORDER BY + LIMIT over the cached result is correct.
+query I
+SELECT n FROM ex.data.cacheable_numbers ORDER BY n LIMIT 3;
+----
+0
+1
+2
+
+# Exactly one cached entry backs all of these (the full unfiltered scan).
+query I
+SELECT COUNT(*) FROM vgi_result_cache() WHERE function = 'cacheable_numbers';
+----
+1
+
+statement ok
+DETACH ex;

@@ -68,13 +68,31 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 #   secret_lines_out COPY format — see copy_to/secrets.test)
 # 1 table-in-out secret fixture (secret_in_out, resolves a secret in on_bind and
 #   appends it per row — see secret/secret_table_in_out.test)
-# = 103
+# 12 result-cache fixtures (cacheable_numbers, cache_nonce, cache_no_store,
+#   cache_scoped_txn, cache_big, cache_multicol, cache_revalidatable, cache_whoami,
+#   cache_versioned_scan, cache_projection, cache_poison, cache_external_fail —
+#   advertise vgi.cache.* / drive the security tests; see cache/*.test)
+# 1 scaling-bench cache fixture (cache_bench — positional Arg(0) row count; direct
+#   path only, NOT a data Table; backs the C++ concurrency bench + the S8/S5 guards;
+#   see cache/disk_streaming.test + cache/entry_cap.test)
+# 3 parallel/order cache fixtures (cache_parallel — multi-worker cacheable, one
+#   substream per worker, backs cache/parallel_capture.test + cache/parallel_2gb.test_slow;
+#   cache_ordered — FIXED_ORDER/supports_batch_index cacheable, backs cache/ordered_serve.test;
+#   cache_interleaved — batch_index emitted OUT OF ORDER so the cache serve genuinely
+#   reorders multi-batch output, backs cache/spill_correctness.test.
+#   cache_ordered is ALSO a data Table but that surfaces as a table, not a table function)
+# 3 spill-coverage cache fixtures (cache_types — nested/wide/NULL columns through the
+#   spill blob, backs cache/spill_types.test; cache_filtered — static filter pushdown so
+#   filter_bytes keys distinct entries, backs cache/filter_pushdown_keys.test, ALSO a data
+#   Table (surfaces as a table); cache_partitioned — single-value partition_values through
+#   the spill blob, backs cache/spill_partition_values.test)
+# = 121
 query I
 SELECT COUNT(*)
 FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'table';
 ----
-103
+121
 
 # The 34 pure table functions (no TABLE parameter type)
 # Note: make_series appears 5 times (5 overloads), make_pairs appears 3 times,

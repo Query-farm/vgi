@@ -15,6 +15,7 @@
 #include "duckdb/common/types/value.hpp"
 
 #include "vgi_arrow_utils.hpp"
+#include "vgi_cache_control.hpp" // VgiCacheControl (returned by GetLastCacheControl)
 #include "vgi_protocol.hpp"
 
 namespace duckdb {
@@ -122,6 +123,14 @@ public:
 	                               const std::optional<TableSampleHint> &table_sample = std::nullopt,
 	                               const std::vector<uint8_t> &init_opaque_data = {},
 	                               const std::optional<std::vector<uint8_t>> &finalize_state_id = std::nullopt) = 0;
+	// Arm conditional-revalidation validators (M6) sent on the NEXT PerformInit
+	// via the init request's custom_metadata (vgi.cache.if_none_match /
+	// vgi.cache.if_modified_since). Empty strings clear the corresponding key.
+	// Default no-op: connection types that don't do RPCs (cached replay) ignore
+	// it. Must be called before PerformInit.
+	virtual void SetConditionalRequest(const std::string & /*if_none_match*/,
+	                                   const std::string & /*if_modified_since*/) {}
+
 	// Re-init the connection in FINALIZE mode (table-in-out). Closes the
 	// current data streams and sends a new init RPC that references the
 	// original bind via bind_result.
@@ -201,6 +210,16 @@ public:
 	virtual const std::string &GetLastPartitionValuesBytes() const {
 		static const std::string kEmpty;
 		return kEmpty;
+	}
+
+	// Parsed `vgi.cache.*` cache-control advertisement observed on the most
+	// recent data batch's wire custom_metadata. Set inside ``ReadDataBatch``
+	// (per batch); the result-cache capture layer reads it on the FIRST batch
+	// (the only one a worker advertises on) via the same lockstep timing as
+	// GetLastBatchIndex. Default returns present=false so transports/connection
+	// types that don't parse it report "not cacheable."
+	virtual VgiCacheControl GetLastCacheControl() const {
+		return {};
 	}
 
 	// Cancel the current stream. Called off-thread by VgiCancelDispatcher

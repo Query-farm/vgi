@@ -1,0 +1,44 @@
+# name: test/sql/integration/cache/poison_external.test
+# description: VGI result cache — external-location resolution failure commits nothing
+# group: [vgi_integration_cache]
+#
+# Second never-partial check: cache_external_fail emits a cacheable first batch,
+# then a 0-row EXTERNAL_LOCATION pointer batch whose URL is unreachable. The
+# client fetches the URL, fails, and aborts the scan mid-stream — so, exactly as
+# with a worker error, the capture must commit nothing. Runs on BOTH transports:
+# external-location resolution is now transport-independent (subprocess workers
+# resolve externalized batches too, not just HTTP).
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+# Bound the failed fetch so the connection-refused surfaces quickly.
+statement ok
+SET http_retries=0;
+
+statement ok
+SET http_timeout=2000;
+
+statement ok
+ATTACH 'example' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+# Resolving the unreachable external location throws; the scan fails.
+statement error
+SELECT * FROM ex.data.cache_external_fail;
+----
+127.0.0.1
+
+# Nothing committed — an unresolved external batch must not leave a partial entry.
+query I
+SELECT COUNT(*) FROM vgi_result_cache() WHERE function = 'cache_external_fail';
+----
+0
+
+statement ok
+DETACH ex;
