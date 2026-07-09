@@ -2,17 +2,18 @@
 # description: VGI result cache (M6) — conditional revalidation (304 / not_modified)
 # group: [vgi_integration_cache]
 #
-# Subprocess-only: the conditional-request validators ride the first producer
-# tick, which the worker's process() reads. Over HTTP the first producer exchange
-# is folded into the /init POST (its output is buffered before any tick is sent),
-# so the if_none_match validator never reaches the worker's first process() call
-# and the not_modified path can't fire. Omitting `require httpfs` makes this file
-# skip cleanly under the HTTP harness (the http:// ATTACH errors → auto-skip)
-# while still running on subprocess. See docs — HTTP revalidation is a follow-up.
+# Works on BOTH transports. The conditional-request validators
+# (vgi.cache.if_none_match / if_modified_since) ride the first producer tick on the
+# subprocess transport. Over HTTP the first producer turn is folded into the /init
+# request, so the C++ client attaches the validators to the /init request metadata
+# and the worker (via vgi_rpc) surfaces that metadata to its first process() call —
+# so the not_modified path fires identically over HTTP.
 
 require-env VGI_TEST_WORKER
 
 require vgi
+
+require httpfs
 
 statement ok
 CALL enable_logging(level := 'debug');

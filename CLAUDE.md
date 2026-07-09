@@ -581,13 +581,17 @@ log carries `tier=disk_streaming` vs `tier=memory` so the streaming path is test
 
 **Conditional revalidation (304).** A stale-but-`revalidatable` entry is probed by
 `LookupForRevalidation` *before* `Lookup` (which drops stale) — if the payload ≥
-`vgi_result_cache_revalidate_min_bytes`, the first producer tick carries `if_none_match` /
-`if_modified_since`. If the worker replies with a 0-row `not_modified` batch, `GetNextBatch` slides
-the entry's TTL and swaps to a `CachedReplayConnection` over the stored bytes (single-threaded, no
-re-stream); if it streams fresh data instead, the parallel capture commits a replacement.
-Revalidatable entries survive TTL reaping (refreshed on access, not dropped). **Subprocess only**
-(over HTTP the first producer exchange folds into `/init` before any tick, so the validator can't
-reach the worker's first `process()` — a follow-up).
+`vgi_result_cache_revalidate_min_bytes`, the client sends `if_none_match` / `if_modified_since`. If
+the worker replies with a 0-row `not_modified` batch, `GetNextBatch` slides the entry's TTL and swaps
+to a `CachedReplayConnection` over the stored bytes (single-threaded, no re-stream); if it streams
+fresh data instead, the parallel capture commits a replacement. Revalidatable entries survive TTL
+reaping (refreshed on access, not dropped). **Works on both transports.** Subprocess carries the
+validators on the first producer tick. Over HTTP the first producer turn folds into the `/init`
+request, so the C++ client attaches the validators to the `/init` request `custom_metadata`
+(`SerializeRpcRequest` `extra_metadata`) and the worker's framework (vgi-rpc `_run_http_producer_init`)
+surfaces that init-request metadata to the producer's first `process()` — so `not_modified` fires
+identically. Detection/consumption (`GetLastCacheControl` → `MaybeSlideRevalidatedEntry` → replay swap)
+is transport-agnostic (the 304 arrives in the `/init` response buffer over HTTP).
 
 **Files:** `src/vgi_result_cache.cpp` (singleton + disk tier + revalidation lookup),
 `src/vgi_cached_replay_connection.cpp` (serve), `src/vgi_result_cache_functions.cpp` (diagnostics),

@@ -7,6 +7,7 @@
 
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "duckdb/main/client_context.hpp"
@@ -158,9 +159,15 @@ StreamHeaderResult ReadStreamHeader(int fd, ClientContext *context,
 // `vgi_rpc.protocol_version` metadata instead of the global VGI_PROTOCOL_VERSION.
 // Used by the separately-versioned secret protocol (VGI_SECRET_PROTOCOL_VERSION);
 // all worker/catalog call sites leave it empty.
-std::vector<uint8_t> SerializeRpcRequest(const std::string &method_name,
-                                          const std::shared_ptr<arrow::RecordBatch> &params_batch,
-                                          const std::string &protocol_version_override = "");
+// extra_metadata: additional (key,value) pairs folded into the request's
+// custom_metadata alongside the method/version keys. Used by the HTTP transport to
+// carry the result-cache conditional-revalidation validators (vgi.cache.if_none_match
+// / if_modified_since) on the `/init` request, since over HTTP the worker's first
+// producer turn runs inside /init and must see the validators before it produces.
+std::vector<uint8_t> SerializeRpcRequest(
+    const std::string &method_name, const std::shared_ptr<arrow::RecordBatch> &params_batch,
+    const std::string &protocol_version_override = "",
+    const std::vector<std::pair<std::string, std::string>> &extra_metadata = {});
 
 // Serialize an RPC request with no parameters (zero-field schema, 1-row batch).
 std::vector<uint8_t> SerializeEmptyRpcRequest(const std::string &method_name);

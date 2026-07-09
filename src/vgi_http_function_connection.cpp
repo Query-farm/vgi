@@ -470,8 +470,24 @@ InitResult HttpFunctionConnection::PerformInit(const BindResult &bind_result,
 #ifdef __EMSCRIPTEN__
 #endif
 
-	// Serialize the init RPC request to Arrow IPC
-	auto body = SerializeRpcRequest("init", rpc_params);
+	// Serialize the init RPC request to Arrow IPC. Over HTTP the worker's first
+	// producer turn runs INSIDE this /init request (its output folds into the
+	// response), so a conditional-revalidation validator must ride the init request
+	// itself — the subprocess "first tick" arrives too late here. Attach
+	// vgi.cache.if_none_match / if_modified_since to the init request metadata when
+	// armed; the worker reads them off the init request and can answer 304
+	// not_modified in its first (init-time) batch. cond_sent_ guards single delivery.
+	std::vector<std::pair<std::string, std::string>> extra_metadata;
+	if (!cond_sent_ && (!cond_if_none_match_.empty() || !cond_if_modified_since_.empty())) {
+		if (!cond_if_none_match_.empty()) {
+			extra_metadata.emplace_back(VGI_CACHE_IF_NONE_MATCH_KEY, cond_if_none_match_);
+		}
+		if (!cond_if_modified_since_.empty()) {
+			extra_metadata.emplace_back(VGI_CACHE_IF_MODIFIED_SINCE_KEY, cond_if_modified_since_);
+		}
+		cond_sent_ = true;
+	}
+	auto body = SerializeRpcRequest("init", rpc_params, /*protocol_version_override=*/"", extra_metadata);
 #ifdef __EMSCRIPTEN__
 #endif
 

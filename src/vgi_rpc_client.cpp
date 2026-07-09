@@ -351,9 +351,10 @@ StreamHeaderResult ReadStreamHeader(int fd, ClientContext *context,
 // Buffer-based Serialization/Deserialization (for HTTP transport)
 // ============================================================================
 
-std::vector<uint8_t> SerializeRpcRequest(const std::string &method_name,
-                                          const std::shared_ptr<arrow::RecordBatch> &params_batch,
-                                          const std::string &protocol_version_override) {
+std::vector<uint8_t> SerializeRpcRequest(
+    const std::string &method_name, const std::shared_ptr<arrow::RecordBatch> &params_batch,
+    const std::string &protocol_version_override,
+    const std::vector<std::pair<std::string, std::string>> &extra_metadata) {
 	auto sink_result = arrow::io::BufferOutputStream::Create();
 	if (!sink_result.ok()) {
 		throw IOException("Failed to create buffer for RPC request: " + sink_result.status().ToString());
@@ -373,9 +374,14 @@ std::vector<uint8_t> SerializeRpcRequest(const std::string &method_name,
 	std::string protocol_version = protocol_version_override.empty()
 	                                   ? std::string(::duckdb::vgi::generated::VGI_PROTOCOL_VERSION)
 	                                   : protocol_version_override;
-	auto metadata = arrow::KeyValueMetadata::Make(
-	    {RPC_METHOD_KEY, RPC_REQUEST_VERSION_KEY, RPC_PROTOCOL_VERSION_KEY},
-	    {method_name, RPC_REQUEST_VERSION_VALUE, protocol_version});
+	std::vector<std::string> meta_keys = {RPC_METHOD_KEY, RPC_REQUEST_VERSION_KEY,
+	                                      RPC_PROTOCOL_VERSION_KEY};
+	std::vector<std::string> meta_values = {method_name, RPC_REQUEST_VERSION_VALUE, protocol_version};
+	for (const auto &kv : extra_metadata) {
+		meta_keys.push_back(kv.first);
+		meta_values.push_back(kv.second);
+	}
+	auto metadata = arrow::KeyValueMetadata::Make(std::move(meta_keys), std::move(meta_values));
 
 	auto status = writer->WriteRecordBatch(*params_batch, metadata);
 	if (!status.ok()) {
