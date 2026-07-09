@@ -11,6 +11,8 @@
 
 require-env VGI_TEST_WORKER
 
+require-env VGI_TEST_BRANCH_DIR
+
 require-env VGI_TEST_ICEBERG
 
 require vgi
@@ -28,14 +30,14 @@ LOAD iceberg;
 
 # ============================================================================
 # Setup: create the iceberg table the fixture references. The fixture's
-# table_scan_branches_get returns iceberg_scan('/tmp/vgi_iceberg_branch') as
+# table_scan_branches_get returns iceberg_scan('${VGI_TEST_BRANCH_DIR}/vgi_iceberg_branch') as
 # branch 1, so this table dir must exist before any scan-bind happens. Cast to
 # BIGINT so iceberg stores `long`, matching the canonical n=int64 (no cast arm).
 # ============================================================================
 
 statement ok
 COPY (SELECT range::BIGINT AS n FROM range(50, 100))
-    TO '/tmp/vgi_iceberg_branch' (FORMAT iceberg);
+    TO '${VGI_TEST_BRANCH_DIR}/vgi_iceberg_branch' (FORMAT iceberg);
 
 statement ok
 ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');

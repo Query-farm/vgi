@@ -9,6 +9,8 @@
 
 require-env VGI_TEST_WORKER
 
+require-env VGI_TEST_BRANCH_DIR
+
 require vgi
 
 require parquet
@@ -34,7 +36,7 @@ COPY (
     SELECT {'xmin': i::FLOAT, 'ymin': 2.0::FLOAT, 'xmax': 3.0::FLOAT, 'ymax': 4.0::FLOAT} AS bbox,
            5::BIGINT AS other
     FROM range(100) t(i)
-) TO '/tmp/rff_seg.parquet' (FORMAT 'parquet');
+) TO '${VGI_TEST_BRANCH_DIR}/rff_seg.parquet' (FORMAT 'parquet');
 
 statement ok
 COPY (
@@ -45,7 +47,7 @@ COPY (
            'transportation' AS theme,
            'segment' AS type
     FROM range(100) t(i)
-) TO '/tmp/rff_hive' (FORMAT 'parquet', PARTITION_BY (theme, type), OVERWRITE);
+) TO '${VGI_TEST_BRANCH_DIR}/rff_hive' (FORMAT 'parquet', PARTITION_BY (theme, type), OVERWRITE);
 
 statement ok
 ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');

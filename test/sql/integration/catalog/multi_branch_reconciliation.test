@@ -7,6 +7,8 @@
 
 require-env VGI_TEST_WORKER
 
+require-env VGI_TEST_BRANCH_DIR
+
 require vgi
 
 require parquet
@@ -25,15 +27,15 @@ require httpfs
 
 statement ok
 COPY (SELECT * FROM (VALUES (1, 10), (2, 20), (3, 30)) AS t(a, b))
-     TO '/tmp/vgi_recon_a_b.parquet' (FORMAT 'parquet');
+     TO '${VGI_TEST_BRANCH_DIR}/vgi_recon_a_b.parquet' (FORMAT 'parquet');
 
 statement ok
 COPY (SELECT * FROM (VALUES (40, 4), (50, 5), (60, 6)) AS t(b, a))
-     TO '/tmp/vgi_recon_b_a.parquet' (FORMAT 'parquet');
+     TO '${VGI_TEST_BRANCH_DIR}/vgi_recon_b_a.parquet' (FORMAT 'parquet');
 
 statement ok
 COPY (SELECT * FROM (VALUES (7), (8), (9)) AS t(a))
-     TO '/tmp/vgi_recon_a_only.parquet' (FORMAT 'parquet');
+     TO '${VGI_TEST_BRANCH_DIR}/vgi_recon_a_only.parquet' (FORMAT 'parquet');
 
 statement ok
 ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');

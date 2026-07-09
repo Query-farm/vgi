@@ -9,6 +9,8 @@
 
 require-env VGI_TEST_WORKER
 
+require-env VGI_TEST_BRANCH_DIR
+
 require vgi
 
 require parquet
@@ -76,7 +78,7 @@ SELECT CURRENT_SETTING('dynamic_or_filter_threshold')::BIGINT;
 
 statement ok
 COPY (SELECT range AS n FROM range(50, 100))
-     TO '/tmp/vgi_hetero_branch.parquet' (FORMAT 'parquet');
+     TO '${VGI_TEST_BRANCH_DIR}/vgi_hetero_branch.parquet' (FORMAT 'parquet');
 
 statement ok
 RESET dynamic_or_filter_threshold;

@@ -8,6 +8,8 @@
 
 require-env VGI_TEST_WORKER
 
+require-env VGI_TEST_BRANCH_DIR
+
 require vgi
 
 require parquet
@@ -16,13 +18,13 @@ require httpfs
 
 # ============================================================================
 # Setup: create the parquet file the heterogeneous fixture references. The
-# fixture's table_scan_branches_get returns read_parquet('/tmp/vgi_hetero_branch.parquet')
+# fixture's table_scan_branches_get returns read_parquet('${VGI_TEST_BRANCH_DIR}/vgi_hetero_branch.parquet')
 # as branch 1, so this file must exist before any scan-bind happens.
 # ============================================================================
 
 statement ok
 COPY (SELECT range AS n FROM range(50, 100))
-    TO '/tmp/vgi_hetero_branch.parquet' (FORMAT 'parquet');
+    TO '${VGI_TEST_BRANCH_DIR}/vgi_hetero_branch.parquet' (FORMAT 'parquet');
 
 statement ok
 ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');

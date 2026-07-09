@@ -13,6 +13,16 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 # VGI test worker (subprocess transport)
 VGI_TEST_WORKER ?= uv run --project $(HOME)/Development/vgi-python vgi-fixture-worker
 
+# Shared scratch dir for native-branch fixtures (read_parquet / read_csv arms in
+# the multi_branch_* and required_field_filter_paths_native tests). The vgi-python
+# fixture bakes this into its branch definitions and the coupled .test files write
+# their parquet/csv there via ${VGI_TEST_BRANCH_DIR} — both must name the SAME path.
+# Defaults to the OS temp dir so those tests run with no extra setup; exported so
+# both the unittest process and the subprocess worker it spawns see it. (Hardcoded
+# /tmp broke on Windows, which has no /tmp.)
+VGI_TEST_BRANCH_DIR ?= $(shell python3 -c 'import tempfile;print(tempfile.gettempdir())')
+export VGI_TEST_BRANCH_DIR
+
 # Versioned fixture workers for attach/versioning*.test. Set to overrideable
 # defaults so `require-env` gates pass under `make test_subprocess` by default.
 VGI_VERSIONED_WORKER ?= uv run --project $(HOME)/Development/vgi-python vgi-fixture-versioned-worker

@@ -9,6 +9,8 @@
 
 require-env VGI_TEST_WORKER
 
+require-env VGI_TEST_BRANCH_DIR
+
 require vgi
 
 require httpfs
@@ -20,7 +22,7 @@ require httpfs
 
 statement ok
 COPY (SELECT range AS n FROM range(50, 100))
-     TO '/tmp/vgi_nopushdown_branch.csv' (HEADER);
+     TO '${VGI_TEST_BRANCH_DIR}/vgi_nopushdown_branch.csv' (HEADER);
 
 statement ok
 ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
