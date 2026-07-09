@@ -9,6 +9,7 @@
 #include <utility>
 
 #include "duckdb/common/arrow/arrow_wrapper.hpp"
+#include "duckdb/common/limits.hpp"
 #include "duckdb/function/table/arrow.hpp"
 #include "duckdb/function/table/arrow/arrow_duck_schema.hpp"
 #include "duckdb/function/table_function.hpp"
@@ -423,6 +424,42 @@ struct VgiTableFunctionGlobalState : public GlobalTableFunctionState {
 
 	// Progress tracking (atomic for thread safety with progress callback)
 	std::atomic<idx_t> rows_read {0};
+
+	// Worker-emitted batch shape, aggregated across every scan thread. Distinct
+	// from ``rows_read``, which counts post-projection DuckDB output-chunk rows
+	// after the batch has been sliced to STANDARD_VECTOR_SIZE; these count the
+	// RecordBatches as they came off the wire. Workers vary wildly here — one
+	// 2M-row batch versus two thousand 1k-row batches are indistinguishable in
+	// the profile box otherwise — so ``VgiTableFunctionDynamicToString`` surfaces
+	// the distribution. Must live on the gstate, not the lstate: DuckDB calls
+	// dynamic_to_string once per source thread and *overrides* duplicate keys
+	// (see OperatorProfiler::FinalizeSourceProfiling), so a per-thread counter
+	// would report whichever thread happened to finalize last.
+	//
+	// Relaxed ordering throughout: these are pure counters, read only after the
+	// pipeline has quiesced, and never used to order other memory.
+	std::atomic<idx_t> batches_received {0};
+	std::atomic<idx_t> batch_rows_total {0};
+	std::atomic<idx_t> batch_bytes_total {0};
+	std::atomic<idx_t> batch_rows_max {0};
+	//! Sentinel is the max value so the first CAS always wins; read via
+	//! ``batches_received == 0`` guard rather than comparing against it.
+	std::atomic<idx_t> batch_rows_min {NumericLimits<idx_t>::Maximum()};
+
+	//! Fold one worker-emitted batch into the statistics above.
+	void RecordBatchStats(idx_t rows, idx_t bytes) {
+		batches_received.fetch_add(1, std::memory_order_relaxed);
+		batch_rows_total.fetch_add(rows, std::memory_order_relaxed);
+		batch_bytes_total.fetch_add(bytes, std::memory_order_relaxed);
+		auto prev_max = batch_rows_max.load(std::memory_order_relaxed);
+		while (rows > prev_max &&
+		       !batch_rows_max.compare_exchange_weak(prev_max, rows, std::memory_order_relaxed)) {
+		}
+		auto prev_min = batch_rows_min.load(std::memory_order_relaxed);
+		while (rows < prev_min &&
+		       !batch_rows_min.compare_exchange_weak(prev_min, rows, std::memory_order_relaxed)) {
+		}
+	}
 
 	// Synthetic batch-index source for PartitionColumns-mode functions that do
 	// NOT advertise supports_batch_index. DuckDB's PipelineExecutor::NextBatch

@@ -127,3 +127,60 @@ query II
 EXPLAIN ANALYZE SELECT count(*) FROM example.profiling_demo(1000000, batch_size := 250000);
 ----
 analyzed_plan	<REGEX>:.*batches_emitted: 4\b.*
+
+# ============================================================================
+# 7. Intrinsic batch-shape keys. Section 6 above measures batches from the
+#    *worker* side (an opt-in dynamic_to_string override). These keys are
+#    extension-side and need no worker cooperation, so they render for every
+#    VGI table function — including ones with no override at all.
+#
+#    Counted on gstate atomics rather than the local state: DuckDB calls
+#    dynamic_to_string once per source thread and overrides duplicate keys,
+#    so a per-thread counter would report whichever thread finalised last.
+#
+#    Only fragment-matched here, not matched whole: EXPLAIN renders into a
+#    fixed-width box and wraps the value across lines, so "Batches: 4 (rows:
+#    min 250000, ...)" never appears contiguously. Exact values are asserted
+#    from the batch_received log below, which is one line per batch.
+# ============================================================================
+
+query II
+EXPLAIN ANALYZE SELECT count(*) FROM example.sequence(1000);
+----
+analyzed_plan	<REGEX>:.*Batches:.*
+
+query II
+EXPLAIN ANALYZE SELECT count(*) FROM example.sequence(1000);
+----
+analyzed_plan	<REGEX>:.*Batch Bytes:.*
+
+# The row distribution is what makes a mega-batch worker distinguishable from
+# a well-chunked one at a glance.
+query II
+EXPLAIN ANALYZE SELECT count(*) FROM example.profiling_demo(1000000, batch_size := 250000);
+----
+analyzed_plan	<REGEX>:.*rows: min.*
+
+# Like every other dynamic_to_string key, absent from plain EXPLAIN.
+query II
+EXPLAIN SELECT * FROM example.sequence(1000);
+----
+physical_plan	<!REGEX>:.*Batch Bytes.*
+
+# Exact values, via the per-batch log rather than the wrapped EXPLAIN box.
+# 4 batches x 250,000 int64 rows = 2,000,000 bytes each.
+statement ok
+CALL enable_logging(level := 'info');
+
+statement ok
+SELECT count(*) FROM example.profiling_demo(1000000, batch_size := 250000);
+
+query I
+SELECT count(*) FROM duckdb_logs() WHERE type = 'VGI'
+  AND message LIKE '%table_function.batch_received%'
+  AND message LIKE '%batch_rows=250000%';
+----
+4
+
+statement ok
+CALL disable_logging();

@@ -21,10 +21,13 @@
 #include "vgi_protocol.hpp"
 #include "vgi_worker_pool.hpp"
 
+#include "arrow/util/byte_size.h" // TotalBufferSize (batch-shape stats)
+
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/arrow/arrow_appender.hpp"
 #include "duckdb/common/arrow/arrow_converter.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/function/table/arrow.hpp"
 #include "duckdb/planner/filter/conjunction_filter.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
@@ -2283,7 +2286,7 @@ static bool InstallBatch(ClientContext &context, const VgiTableFunctionBindData 
 		if (global_state.capture && local_state.capture_stream) {
 			global_state.capture->eos.fetch_add(1, std::memory_order_relaxed);
 		}
-		{
+		if (VgiInfoLogActive(context)) {
 			auto &conn = *local_state.connection();
 			vector<pair<string, string>> fields;
 			fields.emplace_back("conn", conn.GetConnIdHex());
@@ -2456,14 +2459,22 @@ static bool InstallBatch(ClientContext &context, const VgiTableFunctionBindData 
 	// points to the previous chunk, and when that chunk is released, the data becomes invalid.
 	local_state.Reset();
 
-	{
+	// Batch-shape accounting for EXPLAIN ANALYZE. TotalBufferSize walks the
+	// batch's buffer list (O(columns), not O(rows)), so this is cheap enough to
+	// run unconditionally — unlike the log below, it has no sink to check.
+	const auto batch_rows = static_cast<idx_t>(arrow_batch->num_rows());
+	const auto batch_bytes = static_cast<idx_t>(arrow::util::TotalBufferSize(*arrow_batch));
+	global_state.RecordBatchStats(batch_rows, batch_bytes);
+
+	if (VgiInfoLogActive(context)) {
 		auto &conn = *local_state.connection();
 		vector<pair<string, string>> fields;
 		fields.emplace_back("conn", conn.GetConnIdHex());
 		fields.emplace_back("worker_path", bind_data.worker_path());
 		AppendSubprocessPidField(fields, conn);
 		fields.emplace_back("function_name", bind_data.function_name);
-		fields.emplace_back("batch_rows", std::to_string(arrow_batch->num_rows()));
+		fields.emplace_back("batch_rows", std::to_string(batch_rows));
+		fields.emplace_back("batch_bytes", std::to_string(batch_bytes));
 		VGI_LOG(context, "table_function.batch_received", fields);
 	}
 
@@ -2693,13 +2704,15 @@ static bool GetNextBatch(ClientContext &context, const VgiTableFunctionBindData 
 					continue; // next ReadDataBatch pulls from the replay connection
 				}
 			}
-			auto &conn = *local_state.connection();
-			vector<pair<string, string>> fields;
-			fields.emplace_back("conn", conn.GetConnIdHex());
-			fields.emplace_back("worker_path", bind_data.worker_path());
-			AppendSubprocessPidField(fields, conn);
-			fields.emplace_back("function_name", bind_data.function_name);
-			VGI_LOG(context, "table_function.batch_empty_skipped", fields);
+			if (VgiInfoLogActive(context)) {
+				auto &conn = *local_state.connection();
+				vector<pair<string, string>> fields;
+				fields.emplace_back("conn", conn.GetConnIdHex());
+				fields.emplace_back("worker_path", bind_data.worker_path());
+				AppendSubprocessPidField(fields, conn);
+				fields.emplace_back("function_name", bind_data.function_name);
+				VGI_LOG(context, "table_function.batch_empty_skipped", fields);
+			}
 			continue;
 		}
 		return InstallBatch(context, bind_data, global_state, local_state, std::move(arrow_batch));
@@ -3050,6 +3063,25 @@ InsertionOrderPreservingMap<string> VgiTableFunctionDynamicToString(TableFunctio
 		result["Cache"] = (global_state.serving_entry && global_state.serving_entry->disk_backed)
 		                      ? "hit (disk_streaming)"
 		                      : "hit (memory)";
+	}
+
+	// Worker batch shape. Workers differ enormously in how they chunk a result —
+	// one 2M-row batch versus two thousand 1k-row batches produce the same "N
+	// rows" in the profile box but very different memory and latency profiles —
+	// so report the count and the row distribution. Cache hits replay through
+	// the same InstallBatch path, so a served entry reports its stored shape.
+	const auto batches = global_state.batches_received.load(std::memory_order_relaxed);
+	if (batches > 0) {
+		const auto rows = global_state.batch_rows_total.load(std::memory_order_relaxed);
+		const auto rows_min = global_state.batch_rows_min.load(std::memory_order_relaxed);
+		const auto rows_max = global_state.batch_rows_max.load(std::memory_order_relaxed);
+		const auto bytes = global_state.batch_bytes_total.load(std::memory_order_relaxed);
+		result["Batches"] = StringUtil::Format("%llu (rows: min %llu, avg %llu, max %llu)",
+		                                       static_cast<unsigned long long>(batches),
+		                                       static_cast<unsigned long long>(rows_min),
+		                                       static_cast<unsigned long long>(rows / batches),
+		                                       static_cast<unsigned long long>(rows_max));
+		result["Batch Bytes"] = StringUtil::BytesToHumanReadableString(bytes);
 	}
 
 	// User-defined diagnostics via worker RPC. Skip if we don't have enough
