@@ -1,7 +1,9 @@
 # On-Disk Compression for the VGI Result Cache — Strategy
 
-Status: **analysis complete → recommended for implementation** (Arrow built-in IPC codec,
-disk-only, `zstd:1` default). Author: cache maintainers.
+Status: **IMPLEMENTED** (Arrow built-in IPC codec, disk-only, `zstd:1` default). Settings
+`vgi_result_cache_disk_compression` (+`_level`); `codec` column on
+`vgi_result_cache(include_disk := true)`; tests in
+`test/sql/integration/cache/compression.test`. Author: cache maintainers.
 
 ## 1. Motivation
 

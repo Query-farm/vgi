@@ -1,0 +1,220 @@
+# name: test/sql/integration/cache/compression.test
+# description: VGI result cache disk tier — Arrow built-in IPC compression (zstd default / lz4 / none). Round-trip byte-identical through the materialize + streaming serve paths, the `codec` diagnostic proves compression is active, on-disk size shrinks, and a compressed blob stays self-describing when the setting is later flipped off.
+# group: [vgi_integration_cache]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+statement ok
+SET vgi_result_cache_disk_max_bytes = 1073741824;
+
+# =====================================================================
+# (a) default zstd: store → codec diagnostic → disk-serve round-trip
+# =====================================================================
+statement ok
+SET vgi_result_cache_dir = '__TEST_DIR__/vgi_rc_zstd';
+
+statement ok
+SET vgi_result_cache_max_entry_bytes = 268435456;
+
+statement ok
+SET vgi_result_cache_max_bytes = 268435456;
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# First direct call → MISS + store to memory + disk (compressed with the default zstd).
+query II
+SELECT COUNT(*), SUM(v) FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_bench', [200000]);
+----
+200000	19999900000
+
+query I
+SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%result_cache.miss%';
+----
+true
+
+# Exactly one blob + ref written.
+query I
+SELECT COUNT(*) FROM glob('__TEST_DIR__/vgi_rc_zstd/*/objects/*.vrc');
+----
+1
+
+# The `codec` diagnostic reports zstd — proof compression is actually engaged
+# (not silently falling back to uncompressed).
+query I
+SELECT codec FROM vgi_result_cache(include_disk := true)
+    WHERE function = 'cache_bench' AND tier = 'disk';
+----
+zstd
+
+# Evict the memory tier (max_bytes -> 1) so the next read comes ONLY from disk and
+# must decompress. max_entry_bytes stays large → the MATERIALIZE (LoadFromDisk +
+# adopt) path, whose adopted batches are compressed and decode transparently on serve.
+statement ok
+SET vgi_result_cache_max_bytes = 1
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# Content-level round-trip: cache_bench is strictly monotonic, so v MUST equal its
+# 0-based position — a decompression bug (shifted/garbled bytes) would fail this even
+# if COUNT/SUM matched.
+query I
+SELECT bool_and(v = rn) FROM (
+    SELECT v, row_number() OVER () - 1 AS rn
+    FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_bench', [200000]));
+----
+true
+
+query I
+SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%result_cache.hit%';
+----
+true
+
+# =====================================================================
+# (b) zstd shrinks the on-disk blob vs none (same result, two dirs)
+# =====================================================================
+# NOTE: vgi_result_cache_flush() removes whatever disk dir was last SCANNED (the
+# singleton's config only updates on a scan, not a bare SET), so it can't isolate
+# two dirs. Instead: flush ONCE to clear memory + the section-(a) dir, write the
+# `none` blob, then force the `zstd` re-store to a fresh dir by EVICTING memory with
+# max_bytes=1 (which leaves the on-disk `none` blob intact) — the same key would
+# otherwise be a memory HIT and never re-store.
+statement ok
+SET vgi_result_cache_max_bytes = 268435456;
+
+statement ok
+SET vgi_result_cache_dir = '__TEST_DIR__/vgi_rc_none';
+
+statement ok
+SET vgi_result_cache_disk_compression = 'none';
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+statement ok
+SELECT COUNT(*) FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_bench', [200000]);
+
+statement ok
+SET vgi_result_cache_dir = '__TEST_DIR__/vgi_rc_z';
+
+statement ok
+SET vgi_result_cache_disk_compression = 'zstd';
+
+# Evict the memory tier (not disk) so the next scan MISSes memory + the empty z dir
+# and re-runs the worker → stores a fresh zstd blob to vgi_rc_z. max_entry_bytes stays
+# large so the entry is eligible (only the memory LRU cap is shrunk).
+statement ok
+SET vgi_result_cache_max_bytes = 1
+
+statement ok
+SELECT COUNT(*) FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_bench', [200000]);
+
+statement ok
+SET vgi_result_cache_max_bytes = 268435456;
+
+# The zstd object is strictly smaller than the uncompressed one (monotonic int64
+# compresses well). read_blob exposes the on-disk byte size.
+query I
+SELECT (SELECT SUM(size) FROM read_blob('__TEST_DIR__/vgi_rc_z/*/objects/*.vrc'))
+     < (SELECT SUM(size) FROM read_blob('__TEST_DIR__/vgi_rc_none/*/objects/*.vrc'));
+----
+true
+
+# =====================================================================
+# (c) lz4 codec round-trips + reports its codec
+# =====================================================================
+statement ok
+SET vgi_result_cache_dir = '__TEST_DIR__/vgi_rc_lz4';
+
+statement ok
+SET vgi_result_cache_disk_compression = 'lz4';
+
+statement ok
+SET vgi_result_cache_max_bytes = 268435456;
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+statement ok
+SELECT COUNT(*) FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_bench', [200000]);
+
+query I
+SELECT codec FROM vgi_result_cache(include_disk := true)
+    WHERE function = 'cache_bench' AND tier = 'disk';
+----
+lz4
+
+# Evict memory → streaming disk serve of the lz4 blob; content byte-identical.
+statement ok
+SET vgi_result_cache_max_entry_bytes = 1
+
+statement ok
+SET vgi_result_cache_max_bytes = 1
+
+query I
+SELECT bool_and(v = rn) FROM (
+    SELECT v, row_number() OVER () - 1 AS rn
+    FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_bench', [200000]));
+----
+true
+
+# =====================================================================
+# (d) self-describing: a zstd blob still serves after the setting flips to none
+# =====================================================================
+statement ok
+SET vgi_result_cache_max_entry_bytes = 268435456;
+
+statement ok
+SET vgi_result_cache_max_bytes = 268435456;
+
+statement ok
+SET vgi_result_cache_dir = '__TEST_DIR__/vgi_rc_toggle';
+
+statement ok
+SET vgi_result_cache_disk_compression = 'zstd';
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+statement ok
+SELECT COUNT(*) FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_bench', [200000]);
+
+# Flip the codec OFF and evict memory (max_bytes -> 1, which leaves the disk blob).
+# The next read loads the previously-written ZSTD blob from disk — the batch carries
+# its codec in the IPC metadata, so it decodes regardless of the current setting.
+statement ok
+SET vgi_result_cache_disk_compression = 'none';
+
+statement ok
+SET vgi_result_cache_max_bytes = 1
+
+query II
+SELECT COUNT(*), SUM(v) FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_bench', [200000]);
+----
+200000	19999900000
+
+statement ok
+SET vgi_result_cache_max_bytes = 268435456;
+
+statement ok
+SET vgi_result_cache_max_entry_bytes = 67108864;
+
+statement ok
+SET vgi_result_cache_disk_compression = 'zstd';
+
+statement ok
+SET vgi_result_cache_disk_max_bytes = 0;
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();

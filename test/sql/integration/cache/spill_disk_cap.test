@@ -17,6 +17,12 @@ SET threads = 8;
 statement ok
 SET vgi_result_cache_dir = '__TEST_DIR__/vgi_spill_cap';
 
+# This test pins the disk-budget ABORT path, which is byte-driven — disable on-disk
+# compression so the ~1.6 MB result's on-disk size is deterministic (compression
+# would shrink it under the 256 KB budget and the abort would never fire).
+statement ok
+SET vgi_result_cache_disk_compression = 'none';
+
 # Small per-entry disk budget: the ~1.6 MB result spills, then blows the 256 KB
 # budget partway → the writer refuses further batches and the capture aborts.
 statement ok

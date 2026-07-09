@@ -83,6 +83,11 @@ true
 statement ok
 SET vgi_result_cache_disk_max_bytes = 262144;
 
+# Byte-driven abort path — disable on-disk compression so the on-disk size is
+# deterministic (compression would shrink the result under the tiny budget).
+statement ok
+SET vgi_result_cache_disk_compression = 'none';
+
 statement ok
 SELECT * FROM vgi_result_cache_flush();
 

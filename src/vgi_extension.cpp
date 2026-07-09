@@ -3217,6 +3217,17 @@ static void LoadInternal(ExtensionLoader &loader) {
 	config.AddExtensionOption("vgi_result_cache_disk_max_bytes",
 	                          "Byte cap for the on-disk result-cache tier (0 = disk tier off)",
 	                          LogicalType::UBIGINT, Value::UBIGINT(0));
+	config.AddExtensionOption("vgi_result_cache_disk_compression",
+	                          "Compression codec for the on-disk result-cache tier (Arrow built-in IPC "
+	                          "compression, applied per batch so seek is preserved; memory tier is never "
+	                          "compressed): 'zstd' (default), 'lz4', or 'none'. Default-on when the disk "
+	                          "tier is enabled",
+	                          LogicalType::VARCHAR, Value("zstd"));
+	config.AddExtensionOption("vgi_result_cache_disk_compression_level",
+	                          "zstd compression level for the on-disk result-cache tier (ignored for "
+	                          "lz4/none). Keep it low — the default 1 is Pareto-optimal (near-zstd-3 ratio "
+	                          "at ~half the CPU)",
+	                          LogicalType::UBIGINT, Value::UBIGINT(1));
 
 	// Cache directory for worker binaries downloaded via github:// / github-auto://
 	// LOCATIONs. Empty (default) → ${XDG_CACHE_HOME:-~/.cache}/vgi/releases. Must be

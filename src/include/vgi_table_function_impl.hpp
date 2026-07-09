@@ -324,6 +324,8 @@ struct VgiResultCaptureCtx {
 	// (discovered via its ref, adopted into memory on a small serve).
 	std::string disk_dir;
 	uint64_t disk_max = 0;
+	std::string disk_compression = "zstd"; // resolved lazily by the writer at first spill
+	uint64_t disk_compression_level = 1;
 	std::atomic<bool> spilling {false};
 	std::shared_ptr<VgiCaptureDiskWriter> disk_writer; // created under `mu` at first spill
 	bool streaming() const {

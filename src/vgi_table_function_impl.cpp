@@ -1326,8 +1326,13 @@ static bool DrainSubstreamToWriter(CachedStream &s, VgiCaptureDiskWriter &w) {
 	bool ok = true;
 	for (auto &cb : s.batches) {
 		if (ok && cb.ipc) {
+			// These pre-threshold batches were serialized uncompressed (the live
+			// RecordBatch is gone), so transcode to the writer's codec here. logical_len
+			// is the uncompressed size (no-op transcode when codec=="none").
+			auto payload = TranscodeIpcWithCodec(cb.ipc, w.CodecName(), w.Level());
 			ok = w.AppendBatch(cb.has_batch_index, cb.batch_index, cb.rows, cb.partition_values_bytes,
-			                   cb.ipc->data(), static_cast<int64_t>(cb.ipc->size()));
+			                   payload->data(), static_cast<int64_t>(payload->size()),
+			                   static_cast<int64_t>(cb.ipc->size()));
 		}
 	}
 	s.batches.clear(); // free the RAM regardless (streaming from here on)
@@ -1550,6 +1555,12 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 		}
 		if (context.TryGetCurrentSetting("vgi_result_cache_disk_reap_interval_seconds", sv) && !sv.IsNull()) {
 			s.disk_reap_interval_seconds = sv.GetValue<uint64_t>();
+		}
+		if (context.TryGetCurrentSetting("vgi_result_cache_disk_compression", sv) && !sv.IsNull()) {
+			s.disk_compression = sv.GetValue<string>();
+		}
+		if (context.TryGetCurrentSetting("vgi_result_cache_disk_compression_level", sv) && !sv.IsNull()) {
+			s.disk_compression_level = sv.GetValue<uint64_t>();
 		}
 		VgiResultCache::Instance().ConfigureIfChanged(s);
 	}
@@ -1821,6 +1832,12 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 		}
 		if (context.TryGetCurrentSetting("vgi_result_cache_disk_max_bytes", sv) && !sv.IsNull()) {
 			cap->disk_max = sv.GetValue<uint64_t>();
+		}
+		if (context.TryGetCurrentSetting("vgi_result_cache_disk_compression", sv) && !sv.IsNull()) {
+			cap->disk_compression = sv.GetValue<std::string>();
+		}
+		if (context.TryGetCurrentSetting("vgi_result_cache_disk_compression_level", sv) && !sv.IsNull()) {
+			cap->disk_compression_level = sv.GetValue<uint64_t>();
 		}
 		global_state->capture = std::move(cap);
 	}
@@ -2476,13 +2493,13 @@ static bool InstallBatch(ClientContext &context, const VgiTableFunctionBindData 
 				std::lock_guard<std::mutex> lk(cap.mu);
 				not_cacheable = cap.cc_seen && !cap.cc.Cacheable();
 			}
-			auto spill_append = [&](const std::shared_ptr<arrow::Buffer> &ipc) -> bool {
+			auto spill_append = [&](const std::shared_ptr<arrow::Buffer> &ipc, int64_t logical_len) -> bool {
 				idx_t bi = conn->GetLastBatchIndex();
 				bool has_bi = bi != DConstants::INVALID_INDEX;
 				return cap.disk_writer->AppendBatch(
 				    has_bi, has_bi ? static_cast<uint64_t>(bi) : 0,
 				    static_cast<int64_t>(arrow_batch->num_rows()), conn->GetLastPartitionValuesBytes(),
-				    ipc->data(), static_cast<int64_t>(ipc->size()));
+				    ipc->data(), static_cast<int64_t>(ipc->size()), logical_len);
 			};
 			auto log_disk_too_large = [&]() {
 				cap.aborted.store(true, std::memory_order_relaxed);
@@ -2512,8 +2529,16 @@ static bool InstallBatch(ClientContext &context, const VgiTableFunctionBindData 
 					local_state.capture_spilled = true;
 				}
 				if (!cap.aborted.load(std::memory_order_relaxed)) {
-					auto ipc = SerializeRecordBatch(arrow_batch);
-					if (!spill_append(ipc)) {
+					// Compress AT SOURCE (the live batch is here) — one serialize pass, no
+					// transcode round-trip on the multi-GB spill path. logical_len is the
+					// uncompressed IPC size (cheap, no extra serialize).
+					int64_t logical_len = 0;
+					if (!arrow::ipc::GetRecordBatchSize(*arrow_batch, &logical_len).ok()) {
+						logical_len = 0;
+					}
+					auto ipc = SerializeRecordBatch(arrow_batch, nullptr, cap.disk_writer->CodecName(),
+					                                cap.disk_writer->Level());
+					if (!spill_append(ipc, logical_len)) {
 						log_disk_too_large();
 					}
 				}
@@ -2530,7 +2555,8 @@ static bool InstallBatch(ClientContext &context, const VgiTableFunctionBindData 
 						std::lock_guard<std::mutex> lk(cap.mu);
 						if (!cap.disk_writer && !cap.aborted.load(std::memory_order_relaxed)) {
 							cap.disk_writer = VgiResultCache::Instance().BeginStreamingCapture(
-							    cap.key, cap.disk_dir, cap.disk_max);
+							    cap.key, cap.disk_dir, cap.disk_max, cap.disk_compression,
+							    cap.disk_compression_level);
 							if (cap.disk_writer) {
 								cap.spilling.store(true, std::memory_order_release);
 							}

@@ -517,6 +517,27 @@ cross-restart warm cache). Reaping (the one background thread) unlinks expired r
 over a **global** byte cap across shards, and sweeps orphan objects past a 60 s grace window.
 Atomic-rename correctness only — no locks. `FlushAll` `RemoveDirectory`s the tree.
 
+**On-disk compression (default-on, disk-only).** Blobs are compressed with Arrow's **built-in IPC
+buffer compression** (`IpcWriteOptions.codec`), controlled by `vgi_result_cache_disk_compression`
+(`zstd` default / `lz4` / `none`) + `..._level`. Because Arrow stamps the codec into each message,
+`RecordBatchStreamReader` decompresses **transparently** — so per-batch seek (the S8 streaming serve)
+is preserved and the **entire read side is unchanged** (`LoadFromDisk` / `LoadFromDiskStreaming` /
+`CachedReplayConnection` untouched; the (D) re-hash runs over the compressed on-disk bytes and still
+matches). Disk-only: the memory tier stays uncompressed (zero hot-path decompress); a disk entry
+adopted into memory keeps its compressed bytes and decodes on serve. Compression is applied at the
+write boundary — **compress-at-source** on the spill hot path (`SerializeRecordBatch(..., codec, level)`
+at the live-batch site, no transcode round-trip), and **transcode** (`TranscodeIpcWithCodec`) only where
+just pre-serialized bytes exist (`SerializeEntryBlob` / the spill drain). `use_threads=false` keeps the
+content SHA deterministic; content-addressing tolerates non-determinism anyway. Byte accounting splits
+**on-disk (compressed)** — the `disk_max_bytes` budget + the incremental content hash — from **logical
+(uncompressed)** — the ref's `bytes=`, which drives the materialize-vs-stream threshold and
+`vgi_result_cache().total_bytes` (`VgiCaptureDiskWriter` tracks both). A codec that isn't compiled into
+Arrow degrades gracefully to uncompressed (never throws); the effective codec is recorded in the ref's
+`codec=` and surfaced by `vgi_result_cache(include_disk := true).codec`. `SerializeRecordBatch`'s codec
+args live in `vgi_arrow_ipc.{hpp,cpp}`. No blob-format version bump (a batch self-describes, so a dir
+mixes codecs and flipping the setting off still serves old blobs). Cross-batch zstd dictionary is out of
+scope (incompatible with the transparent codec). See [docs/result_cache_compression.md](docs/result_cache_compression.md).
+
 **Spill-to-disk capture (RAM-flat, results larger than RAM).** Capture buffers in RAM per-substream
 up to `max_entry_bytes` (small results stay memory-hot). When a capture would **exceed**
 `max_entry_bytes` and the disk tier is on, it **spills** to a streaming disk blob instead of aborting:
@@ -624,6 +645,8 @@ reproducible cleanup tests. Clear with `vgi_result_cache_flush()` (both tiers).
 | `vgi_result_cache_revalidate_min_bytes` | UBIGINT | 262144 (256 KB) | Minimum stored-payload size before a stale `revalidatable` entry is conditionally revalidated (below it, refetch instead of a conditional request) |
 | `vgi_result_cache_dir` | VARCHAR | `""` | Directory for the on-disk result-cache tier (content-addressed store; cross-process + cross-restart). Empty = disk tier off (memory only) |
 | `vgi_result_cache_disk_max_bytes` | UBIGINT | 0 | Byte cap for the on-disk result-cache tier (0 = disk tier off) |
+| `vgi_result_cache_disk_compression` | VARCHAR | `zstd` | Compression codec for the **on-disk** result-cache tier (Arrow built-in IPC buffer compression, applied per-batch so per-batch seek / streaming serve is preserved; the reader decompresses transparently). `zstd` (default), `lz4` (minimal CPU), or `none`. The **memory tier is never compressed** (zero hot-path decompress); compression is applied at the disk-write boundary — compress-at-source on the spill path, transcode on the buffered/drain paths. Default-on when the disk tier is enabled. A missing codec degrades gracefully to uncompressed. Verify it's active via the `codec` column of `vgi_result_cache(include_disk := true)`. See [docs/result_cache_compression.md](docs/result_cache_compression.md) |
+| `vgi_result_cache_disk_compression_level` | UBIGINT | 1 | zstd compression level for the on-disk tier (ignored for `lz4`/`none`). Keep it low — the default 1 is Pareto-optimal (near-zstd-3 ratio at ~half the CPU) |
 | `vgi_result_cache_max_entries` | UBIGINT | 131072 | **Entry-count** cap for the in-memory index (0 = unlimited). Bounds unbounded small-entry accumulation that the byte cap alone misses (~700k tiny entries fit under 256 MB); also keeps the reaper / `vgi_result_cache()` O(N) walks small. LRU-evicts oldest above the cap. Read per-query. (Scaling seam **S5**) |
 | `vgi_result_cache_max_inflight_bytes` | UBIGINT | 268435456 (256 MB) | Process-global budget for **in-flight capture** RAM (sum of all concurrently-capturing MISSes' buffered substreams). A capture that would push the total over the budget aborts to uncached (`result_cache.abort reason=inflight_budget`) and keeps streaming to DuckDB — bounds total capture RAM regardless of query concurrency, which the per-entry cap alone can't (N captures peak at N × `max_entry_bytes`). Read per-query. (Scaling seam **S6**) |
 | `vgi_result_cache_disk_reap_interval_seconds` | UBIGINT | 60 | How often the background thread reaps the **disk** tier (expired refs / over-cap eviction / orphan sweep), decoupled from the ~1 s in-memory reap. The disk reap reads every ref + stats every object per pass, so running it every tick is wasteful; expiry is wall-clock, so a coarser cadence is correctness-neutral. (Scaling seam **S7**) |
@@ -676,7 +699,7 @@ The `launch:` and `unix://` paths share one warm worker process across every Duc
 | `vgi_github_cache()` | Table | Diagnostic: one row per worker binary cached from a `github://` / `github-auto://` release LOCATION. Columns: `owner`, `repo`, `tag`, `asset`, `digest` (archive SHA256), `dir` (extracted directory), `entrypoint`, `age_seconds`. See [docs/github-transport.md](docs/github-transport.md) |
 | `vgi_github_cache_flush()` | Table | Delete the on-disk GitHub-release worker cache; returns one row with the count of cached releases removed (`flushed`). |
 | `vgi_clear_cache()` | Table | Clear cached catalog metadata (schemas, tables, functions, statistics) for all attached VGI catalogs. Also drops that catalog's **result-cache** entries |
-| `vgi_result_cache(include_disk := false)` | Table | Diagnostic: one row per cached table-function result. Columns: `catalog`, `function`, `key_hash`, `scope`, `attached_data_version`, `implementation_version`, `catalog_version`, `at_unit`, `at_value`, `num_batches`, `num_substreams` (capture-thread count — `> 1` proves parallel capture across workers), `num_rows`, `total_bytes`, `age_seconds`, `ttl_seconds`, `stale`, `tier` (`memory`/`disk`), `etag`, `last_modified`, `revalidatable`, `hits`. Defaults to the **in-memory** tier; `include_disk := true` also walks the on-disk refs so **spilled/disk-only** entries (invisible to the memory index until adopted) are listed with `tier='disk'`. See *Table-Function Result Cache* |
+| `vgi_result_cache(include_disk := false)` | Table | Diagnostic: one row per cached table-function result. Columns: `catalog`, `function`, `key_hash`, `scope`, `attached_data_version`, `implementation_version`, `catalog_version`, `at_unit`, `at_value`, `num_batches`, `num_substreams` (capture-thread count — `> 1` proves parallel capture across workers), `num_rows`, `total_bytes`, `age_seconds`, `ttl_seconds`, `stale`, `tier` (`memory`/`disk`), `etag`, `last_modified`, `revalidatable`, `hits`, `codec` (on-disk compression codec `none`/`zstd`/`lz4`; always `none` for memory-tier rows). Defaults to the **in-memory** tier; `include_disk := true` also walks the on-disk refs so **spilled/disk-only** entries (invisible to the memory index until adopted) are listed with `tier='disk'`. See *Table-Function Result Cache* |
 | `vgi_result_cache_flush()` | Table | Clear the in-memory result cache; returns one row with the count of entries flushed (`flushed`) |
 | `vgi_result_cache_stats()` | Table | Diagnostic: process-global aggregate counters (`hits`, `misses`, `inserts`, `evictions_lru`, `evictions_ttl`, `capture_aborts`) + current in-memory `entries` and `total_bytes`. The only SQL surface for reaper evictions (which emit no `duckdb_logs` events) and capture aborts |
 | `vgi_result_cache_reap(advance_seconds := 0)` | Table | Run one synchronous cleanup pass over both cache tiers (the work the background reaper does per tick) on the calling thread. `advance_seconds` simulates elapsed time so TTL/disk expiry reaps deterministically — the reproducible test seam for cleanup (the reaper is otherwise a 1s wall-clock-keyed thread that emits no `duckdb_logs` events). Returns `memory_reaped`, `disk_refs_removed`. See `test/sql/integration/cache/cleanup.test` |

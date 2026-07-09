@@ -117,13 +117,13 @@ static unique_ptr<FunctionData> VgiResultCacheListBind(ClientContext &, TableFun
 	         "at_unit",         "at_value",        "num_batches",  "num_substreams", "num_rows",
 	         "total_bytes",     "age_seconds",     "ttl_seconds",  "stale",
 	         "tier",            "etag",            "last_modified", "revalidatable",
-	         "hits"};
+	         "hits",            "codec"};
 	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
 	                LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT,  LogicalType::VARCHAR,
 	                LogicalType::VARCHAR, LogicalType::BIGINT,  LogicalType::BIGINT,  LogicalType::BIGINT,
 	                LogicalType::BIGINT,  LogicalType::BIGINT,  LogicalType::BIGINT,  LogicalType::BOOLEAN,
 	                LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BOOLEAN,
-	                LogicalType::UBIGINT};
+	                LogicalType::UBIGINT, LogicalType::VARCHAR};
 	auto data = make_uniq<VgiResultCacheListData>();
 	data->entries = VgiResultCache::Instance().Snapshot();
 	// include_disk := true → also walk the on-disk tier so spilled/disk-only entries
@@ -165,6 +165,7 @@ static void VgiResultCacheListScan(ClientContext &, TableFunctionInput &input, D
 		output.SetValue(c++, count, Value(e.last_modified));
 		output.SetValue(c++, count, Value::BOOLEAN(e.revalidatable));
 		output.SetValue(c++, count, Value::UBIGINT(e.hits));
+		output.SetValue(c++, count, Value(e.codec));
 		count++;
 	}
 	output.SetCardinality(count);

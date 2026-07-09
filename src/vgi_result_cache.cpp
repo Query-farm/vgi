@@ -12,6 +12,7 @@
 
 #include "duckdb/common/file_system.hpp"
 #include "mbedtls_wrapper.hpp"
+#include "vgi_arrow_ipc.hpp" // TranscodeIpcWithCodec / ResolveDiskCompressionCodec (disk compression)
 #include "vgi_platform.hpp" // VGI_SUBPROCESS_TRANSPORT (thread gate — Emscripten is single-threaded)
 
 namespace duckdb {
@@ -195,7 +196,12 @@ uint64_t GetU64(const std::string &b, size_t &pos) {
 // re-hash of the finished file (integrity check D) still matches. Readers loop
 // until they exhaust the bytes. Per batch:
 //   [u64 has_index][u64 batch_index][u64 rows][u64 pv_len][pv][u64 ipc_len][ipc]
-std::string SerializeEntryBlob(const VgiResultCacheEntry &entry) {
+// `codec`/`level` (already resolved via ResolveDiskCompressionCodec) apply Arrow's
+// built-in IPC compression to each batch's payload — the per-batch `ipc_len` framing
+// becomes the COMPRESSED length, and the content SHA (taken over this blob) covers the
+// compressed bytes. codec=="none" → TranscodeIpcWithCodec is a passthrough (unchanged
+// format). The ref's logical `bytes=` is entry.total_bytes, set by the caller — not here.
+std::string SerializeEntryBlob(const VgiResultCacheEntry &entry, const std::string &codec, uint64_t level) {
 	std::string b;
 	b.append("VRC1", 4);
 	for (const auto &s : entry.streams) {
@@ -205,10 +211,11 @@ std::string SerializeEntryBlob(const VgiResultCacheEntry &entry) {
 			PutU64(b, static_cast<uint64_t>(cb.rows));
 			PutU64(b, cb.partition_values_bytes.size());
 			b.append(cb.partition_values_bytes);
-			uint64_t ipc_len = cb.ipc ? static_cast<uint64_t>(cb.ipc->size()) : 0;
+			auto payload = TranscodeIpcWithCodec(cb.ipc, codec, level); // no-op when codec=="none"
+			uint64_t ipc_len = payload ? static_cast<uint64_t>(payload->size()) : 0;
 			PutU64(b, ipc_len);
-			if (cb.ipc) {
-				b.append(reinterpret_cast<const char *>(cb.ipc->data()), cb.ipc->size());
+			if (payload) {
+				b.append(reinterpret_cast<const char *>(payload->data()), payload->size());
 			}
 		}
 	}
@@ -229,7 +236,7 @@ int64_t ComputeExpiresUnix(const VgiResultCacheEntry &entry) {
 // Build + atomically write the key→content ref. Shared by the RAM-persist path
 // (PersistToDisk) and the streaming-capture commit so the ref format stays in one place.
 void WriteRef(const std::string &refs_dir, const std::string &fp, const std::string &content_sha,
-              int64_t expires_unix, const VgiResultCacheEntry &meta) {
+              int64_t expires_unix, const VgiResultCacheEntry &meta, const std::string &codec) {
 	std::string ref;
 	ref += "keyfp=" + fp + "\n";
 	ref += "content=" + content_sha + "\n";
@@ -238,9 +245,10 @@ void WriteRef(const std::string &refs_dir, const std::string &fp, const std::str
 	ref += "etag=" + meta.etag + "\n";
 	ref += "last_modified=" + meta.last_modified + "\n";
 	ref += "rows=" + std::to_string(meta.rows) + "\n";
-	ref += "bytes=" + std::to_string(meta.total_bytes) + "\n";
+	ref += "bytes=" + std::to_string(meta.total_bytes) + "\n"; // LOGICAL/uncompressed size
 	ref += "catalog=" + meta.catalog_name + "\n";
 	ref += "function=" + meta.key.function_name + "\n"; // for the vgi_result_cache_disk() diagnostic
+	ref += "codec=" + codec + "\n";                     // diagnostic only; batches self-describe
 	WriteFileAtomic(refs_dir, refs_dir + "/" + fp + ".ref", ref, ShortTempSuffix());
 }
 
@@ -445,7 +453,9 @@ uint64_t SettingsSignature(const VgiResultCache::Settings &s) {
 	HashCombine(seed, s.max_inflight_bytes);
 	HashCombine(seed, s.disk_max_bytes);
 	HashCombine(seed, s.disk_reap_interval_seconds);
+	HashCombine(seed, s.disk_compression_level);
 	HashStr(seed, s.disk_dir);
+	HashStr(seed, s.disk_compression);
 	return seed;
 }
 } // namespace
@@ -455,6 +465,8 @@ void VgiResultCache::Configure(const Settings &settings) {
 	settings_ = settings;
 	disk_dir_ = settings.disk_dir;
 	disk_max_bytes_ = settings.disk_max_bytes;
+	disk_compression_ = settings.disk_compression;
+	disk_compression_level_ = settings.disk_compression_level;
 	// Shrinking the cap mid-flight is honored on the next Insert / reap tick;
 	// evict now so a lowered cap takes effect immediately.
 	EvictToFitLocked(0);
@@ -587,6 +599,8 @@ bool VgiResultCache::Insert(std::shared_ptr<VgiResultCacheEntry> entry, bool all
 	}
 	std::string disk_dir; // snapshot of disk config, taken under the lock
 	uint64_t disk_max = 0;
+	std::string disk_codec;
+	uint64_t disk_level = 1;
 	{
 		std::lock_guard<std::mutex> lock(mutex_);
 		if (entry->total_bytes > static_cast<int64_t>(settings_.max_entry_bytes)) {
@@ -607,12 +621,14 @@ bool VgiResultCache::Insert(std::shared_ptr<VgiResultCacheEntry> entry, bool all
 		if (allow_disk && DiskEnabledLocked()) {
 			disk_dir = disk_dir_;
 			disk_max = disk_max_bytes_;
+			disk_codec = disk_compression_;
+			disk_level = disk_compression_level_;
 		}
 	}
 	// Persist to the disk tier OUTSIDE the cache lock (file I/O), over the
 	// config snapshot taken above.
 	if (!disk_dir.empty()) {
-		PersistToDisk(*entry, disk_dir, disk_max);
+		PersistToDisk(*entry, disk_dir, disk_max, disk_codec, disk_level);
 	}
 	return true;
 }
@@ -819,6 +835,7 @@ std::vector<VgiResultCache::EntryInfo> VgiResultCache::SnapshotDisk() const {
 					else if (k == "last_modified") info.last_modified = v;
 					else if (k == "rows") info.num_rows = ParseInt(v, 0);
 					else if (k == "bytes") info.total_bytes = ParseInt(v, 0);
+					else if (k == "codec") info.codec = v;
 					else if (k == "expires_unix") expires_unix = ParseInt(v, INT64_MAX);
 				}
 				if (expires_unix == INT64_MAX) {
@@ -904,8 +921,11 @@ struct VgiCaptureDiskWriter::Impl {
 	std::string refs_dir;
 	std::string fp; // key fingerprint = ref filename
 	uint64_t disk_max = 0;
+	std::string codec = "none"; // resolved disk-compression codec ("none"/"zstd"/"lz4")
+	uint64_t level = 1;         // zstd level (ignored for lz4/none)
 	duckdb_mbedtls::MbedTlsWrapper::SHA256State sha; // incremental hash of the blob
-	int64_t bytes = 0;                               // running blob size (incl. "VRC1")
+	int64_t bytes = 0;          // running ON-DISK (compressed) blob size (incl. "VRC1"); vs disk_max
+	int64_t logical_bytes = 0;  // running UNCOMPRESSED payload size → the ref's logical bytes=
 	int64_t rows = 0;
 	int64_t batch_count = 0;
 	std::atomic<int64_t> producers{0};
@@ -931,15 +951,23 @@ int64_t VgiCaptureDiskWriter::Bytes() const {
 int64_t VgiCaptureDiskWriter::Producers() const {
 	return impl_->producers.load(std::memory_order_relaxed);
 }
+const std::string &VgiCaptureDiskWriter::CodecName() const {
+	return impl_->codec;
+}
+uint64_t VgiCaptureDiskWriter::Level() const {
+	return impl_->level;
+}
 
 bool VgiCaptureDiskWriter::AppendBatch(bool has_batch_index, uint64_t batch_index, int64_t rows,
                                        const std::string &pv_bytes, const uint8_t *ipc_data,
-                                       int64_t ipc_len) {
+                                       int64_t ipc_len, int64_t logical_len) {
 	std::lock_guard<std::mutex> lk(impl_->mu);
 	if (impl_->failed || impl_->finalized || !impl_->handle) {
 		return false;
 	}
-	// Per-batch record framing (matches SerializeEntryBlob, minus the count header).
+	// `ipc_data`/`ipc_len` are the ON-DISK (already codec-compressed by the caller)
+	// bytes; `logical_len` is the uncompressed size, accounted separately so the ref
+	// bytes= stays logical. Per-batch record framing (matches SerializeEntryBlob).
 	std::string rec;
 	PutU64(rec, has_batch_index ? 1 : 0);
 	PutU64(rec, batch_index);
@@ -965,7 +993,8 @@ bool VgiCaptureDiskWriter::AppendBatch(bool has_batch_index, uint64_t batch_inde
 		impl_->failed = true;
 		return false;
 	}
-	impl_->bytes += add;
+	impl_->bytes += add;                 // on-disk (compressed) — budget counter
+	impl_->logical_bytes += logical_len; // uncompressed — the ref's logical bytes=
 	impl_->rows += rows;
 	impl_->batch_count++;
 	return true;
@@ -973,7 +1002,9 @@ bool VgiCaptureDiskWriter::AppendBatch(bool has_batch_index, uint64_t batch_inde
 
 std::shared_ptr<VgiCaptureDiskWriter> VgiResultCache::BeginStreamingCapture(const VgiResultCacheKey &key,
                                                                             const std::string &dir,
-                                                                            uint64_t disk_max) {
+                                                                            uint64_t disk_max,
+                                                                            const std::string &codec,
+                                                                            uint64_t level) {
 	if (dir.empty() || disk_max == 0) {
 		return nullptr;
 	}
@@ -999,11 +1030,16 @@ std::shared_ptr<VgiCaptureDiskWriter> VgiResultCache::BeginStreamingCapture(cons
 		impl.refs_dir = refs;
 		impl.fp = fp;
 		impl.disk_max = disk_max;
+		// Resolve the codec once (availability-checked; "none" fallback recorded) so
+		// every AppendBatch compresses with it and the ref's codec= matches.
+		impl.codec = ResolveDiskCompressionCodec(codec);
+		impl.level = level;
 		// The magic is the first hashed bytes; the content sha covers "VRC1" + batches.
 		const std::string magic("VRC1", 4);
 		WriteAll(*impl.handle, magic.data(), magic.size());
 		impl.sha.AddString(magic);
-		impl.bytes = 4;
+		impl.bytes = 4;         // on-disk includes the 4-byte magic
+		impl.logical_bytes = 0; // logical = uncompressed batch payloads only (no magic)
 		return writer;
 	} catch (...) {
 		return nullptr;
@@ -1028,11 +1064,12 @@ bool VgiResultCache::CommitStreamingCapture(VgiCaptureDiskWriter &writer,
 		} else {
 			fs.MoveFile(impl.tmp_path, obj_path); // atomic publish
 		}
-		// The ref carries the FINISHED blob's rows/bytes (meta supplies scope/etag/ttl).
+		// The ref carries the FINISHED blob's rows + LOGICAL bytes (uncompressed, for
+		// the materialize-vs-stream threshold); meta supplies scope/etag/ttl.
 		VgiResultCacheEntry m = meta;
 		m.rows = impl.rows;
-		m.total_bytes = impl.bytes;
-		WriteRef(impl.refs_dir, impl.fp, content_sha, ComputeExpiresUnix(meta), m);
+		m.total_bytes = impl.logical_bytes;
+		WriteRef(impl.refs_dir, impl.fp, content_sha, ComputeExpiresUnix(meta), m, impl.codec);
 		impl.finalized = true;
 		inserts_.fetch_add(1, std::memory_order_relaxed);
 		return true;
@@ -1058,7 +1095,7 @@ void VgiResultCache::AbortStreamingCapture(VgiCaptureDiskWriter &writer) {
 }
 
 void VgiResultCache::PersistToDisk(const VgiResultCacheEntry &entry, const std::string &dir,
-                                   uint64_t max_bytes) {
+                                   uint64_t max_bytes, const std::string &codec, uint64_t level) {
 	if (dir.empty() || max_bytes == 0) {
 		return;
 	}
@@ -1075,16 +1112,20 @@ void VgiResultCache::PersistToDisk(const VgiResultCacheEntry &entry, const std::
 		MkdirP(objects);
 		MkdirP(refs);
 
-		std::string blob = SerializeEntryBlob(entry);
+		// Resolve the codec once (availability-checked; falls back to "none") so the
+		// blob and the ref's codec= agree, and a fallback is recorded.
+		std::string eff_codec = ResolveDiskCompressionCodec(codec);
+		std::string blob = SerializeEntryBlob(entry, eff_codec, level);
 		if (blob.size() > max_bytes) {
-			return; // too large for the disk tier
+			return; // too large for the disk tier (compressed on-disk size)
 		}
 		std::string content_sha = Sha256Hex(blob);
 		std::string obj_path = objects + "/" + content_sha + ".vrc";
 		if (!LocalFs().FileExists(obj_path)) {
 			WriteFileAtomic(objects, obj_path, blob, ShortTempSuffix());
 		}
-		WriteRef(refs, fp, content_sha, ComputeExpiresUnix(entry), entry);
+		// Ref bytes= stays LOGICAL (entry.total_bytes = uncompressed sum from capture).
+		WriteRef(refs, fp, content_sha, ComputeExpiresUnix(entry), entry, eff_codec);
 	} catch (...) {
 		// Best-effort: the memory tier still holds the entry.
 	}

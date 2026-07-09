@@ -1,9 +1,13 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "vgi_arrow_ipc.hpp"
 
+#include <atomic>
+#include <cctype>
 #include <cerrno>
 #include <chrono>
 #include <cstring>
+
+#include <arrow/util/compression.h> // util::Codec (disk-tier IPC compression)
 
 #if VGI_POSIX_TRANSPORT
 #include <sys/select.h>
@@ -15,6 +19,7 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/main/client_context.hpp" // ClientContext::interrupted
 #include "vgi_exception.hpp"
+#include "vgi_logging.hpp" // VGI_STDERR_DEBUG (one-shot codec-fallback warning)
 #include "vgi_subprocess.hpp"
 
 #if defined(_WIN32)
@@ -66,17 +71,109 @@ void ValidateProtocolState(const std::shared_ptr<arrow::KeyValueMetadata> &metad
 // Serialization Functions
 // ============================================================================
 
-// Serialize an Arrow RecordBatch to IPC stream format bytes
+namespace {
+// Map a resolved codec name to Arrow's Compression enum. Returns false for
+// "none"/unknown (→ uncompressed).
+bool CodecTypeFromName(const std::string &name, arrow::Compression::type &out) {
+	if (name == "zstd") {
+		out = arrow::Compression::ZSTD;
+		return true;
+	}
+	if (name == "lz4") {
+		out = arrow::Compression::LZ4_FRAME;
+		return true;
+	}
+	return false;
+}
+
+// Build IpcWriteOptions for a resolved codec name + level. Deterministic
+// (use_threads=false) so the content-addressed disk blob's SHA is stable. The
+// caller has already resolved availability via ResolveDiskCompressionCodec, but
+// Codec::Create can still fail — fall back to uncompressed (best-effort).
+arrow::ipc::IpcWriteOptions MakeIpcWriteOptions(const std::string &codec, uint64_t level) {
+	auto opts = arrow::ipc::IpcWriteOptions::Defaults();
+	arrow::Compression::type ctype;
+	if (!CodecTypeFromName(codec, ctype)) {
+		return opts; // none / unknown → uncompressed
+	}
+	opts.use_threads = false;
+	int lvl = static_cast<int>(level == 0 ? 1 : level);
+	auto codec_res = arrow::util::Codec::Create(ctype, lvl);
+	if (codec_res.ok()) {
+		opts.codec = std::move(codec_res).ValueUnsafe();
+	}
+	return opts;
+}
+} // namespace
+
+std::string ResolveDiskCompressionCodec(const std::string &requested) {
+	std::string c;
+	c.reserve(requested.size());
+	for (char ch : requested) {
+		c.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
+	}
+	if (c.empty() || c == "none") {
+		return "none";
+	}
+	arrow::Compression::type ctype;
+	if (!CodecTypeFromName(c, ctype)) {
+		static std::atomic<bool> warned{false};
+		if (!warned.exchange(true)) {
+			VGI_STDERR_DEBUG("[VGI] result cache: unknown disk compression codec '%s' → uncompressed\n",
+			                 requested.c_str());
+		}
+		return "none";
+	}
+	if (!arrow::util::Codec::IsAvailable(ctype)) {
+		static std::atomic<bool> warned{false};
+		if (!warned.exchange(true)) {
+			VGI_STDERR_DEBUG("[VGI] result cache: Arrow built without %s codec → disk tier uncompressed\n",
+			                 c.c_str());
+		}
+		return "none";
+	}
+	return c;
+}
+
+std::shared_ptr<arrow::Buffer> TranscodeIpcWithCodec(const std::shared_ptr<arrow::Buffer> &ipc,
+                                                     const std::string &codec, uint64_t level) {
+	if (!ipc || codec.empty() || codec == "none") {
+		return ipc;
+	}
+	try {
+		auto in = std::make_shared<arrow::io::BufferReader>(ipc);
+		auto reader_res = arrow::ipc::RecordBatchStreamReader::Open(in);
+		if (!reader_res.ok()) {
+			return ipc;
+		}
+		auto reader = reader_res.ValueUnsafe();
+		std::shared_ptr<arrow::RecordBatch> batch;
+		if (!reader->ReadNext(&batch).ok() || !batch) {
+			return ipc;
+		}
+		// Cache batches are single-batch streams with no per-batch custom_metadata
+		// (vgi_meta lives in the blob framing), so none needs preserving.
+		auto out = SerializeRecordBatch(batch, nullptr, codec, level);
+		return out ? out : ipc;
+	} catch (...) {
+		return ipc; // best-effort: compression must never break caching
+	}
+}
+
+// Serialize an Arrow RecordBatch to IPC stream format bytes (optionally compressed
+// via Arrow's built-in codec — see the header).
 std::shared_ptr<arrow::Buffer> SerializeRecordBatch(
     const std::shared_ptr<arrow::RecordBatch> &batch,
-    const std::shared_ptr<const arrow::KeyValueMetadata> &custom_metadata) {
+    const std::shared_ptr<const arrow::KeyValueMetadata> &custom_metadata, const std::string &codec,
+    uint64_t level) {
 	auto sink_result = arrow::io::BufferOutputStream::Create();
 	if (!sink_result.ok()) {
 		throw IOException("Failed to create Arrow buffer: " + sink_result.status().ToString());
 	}
 	auto sink = sink_result.ValueUnsafe();
 
-	auto writer_result = arrow::ipc::MakeStreamWriter(sink, batch->schema());
+	auto write_options = MakeIpcWriteOptions(codec, level);
+	auto writer_result = arrow::ipc::MakeStreamWriter(sink, batch->schema(), write_options);
 	if (!writer_result.ok()) {
 		throw IOException("Failed to create Arrow writer: " + writer_result.status().ToString());
 	}

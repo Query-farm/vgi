@@ -52,11 +52,31 @@ void ValidateProtocolState(const std::shared_ptr<arrow::KeyValueMetadata> &metad
 // Serialization Functions
 // ============================================================================
 
-// Serialize an Arrow RecordBatch to IPC stream format bytes
-// Optional custom_metadata is attached to the batch (typically protocol state)
+// Serialize an Arrow RecordBatch to IPC stream format bytes.
+// Optional custom_metadata is attached to the batch (typically protocol state).
+// `codec` ∈ {"none","zstd","lz4"} (+ `level`, zstd only) enables Arrow's built-in
+// IPC buffer compression at serialize time (used by the result-cache disk tier's
+// compress-at-source spill path). "none"/unknown/unavailable → uncompressed. The
+// codec rides in the message metadata so readers decompress transparently.
 std::shared_ptr<arrow::Buffer> SerializeRecordBatch(
     const std::shared_ptr<arrow::RecordBatch> &batch,
-    const std::shared_ptr<const arrow::KeyValueMetadata> &custom_metadata = nullptr);
+    const std::shared_ptr<const arrow::KeyValueMetadata> &custom_metadata = nullptr,
+    const std::string &codec = "none", uint64_t level = 1);
+
+// Resolve a requested disk-compression codec name to the one actually usable:
+// lowercases + maps zstd/lz4/none, probes `arrow::util::Codec::IsAvailable`, and
+// falls back to "none" (logging once) if the codec was not compiled into Arrow.
+// Never throws. Callers record the returned name so a fallback is observable.
+std::string ResolveDiskCompressionCodec(const std::string &requested);
+
+// Re-encode an already-serialized (uncompressed) IPC stream buffer with `codec` +
+// `level` (Arrow built-in buffer compression). Used on the disk-write paths that
+// only hold pre-serialized bytes (no live RecordBatch): the buffered blob and the
+// spill drain of pre-threshold RAM substreams. Best-effort — any failure (or
+// codec=="none") returns the input buffer unchanged, so compression can never
+// break caching.
+std::shared_ptr<arrow::Buffer> TranscodeIpcWithCodec(const std::shared_ptr<arrow::Buffer> &ipc,
+                                                     const std::string &codec, uint64_t level);
 
 // Input stream wrapper for reading from a file descriptor.
 // NON-OWNING: Does not close the fd on destruction. The caller retains ownership.

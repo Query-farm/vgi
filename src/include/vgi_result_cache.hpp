@@ -158,11 +158,20 @@ struct VgiResultCacheEntry {
 class VgiCaptureDiskWriter {
 public:
 	~VgiCaptureDiskWriter();
-	// Append one batch record (thread-safe; serializes writers). Returns false if
-	// the running blob size would exceed the per-entry disk budget — the caller
-	// then aborts the capture (and keeps streaming to DuckDB uncached).
+	// Append one batch record (thread-safe; serializes writers). `ipc_data`/`ipc_len`
+	// are the bytes written VERBATIM (already codec-compressed by the caller, or raw
+	// when the codec is "none"); `logical_len` is the uncompressed IPC size, summed
+	// separately so the ref's `bytes=` stays logical (drives the materialize-vs-stream
+	// threshold). Returns false if the running ON-DISK (compressed) blob size would
+	// exceed the per-entry disk budget — the caller then aborts + keeps streaming.
 	bool AppendBatch(bool has_batch_index, uint64_t batch_index, int64_t rows,
-	                 const std::string &pv_bytes, const uint8_t *ipc_data, int64_t ipc_len);
+	                 const std::string &pv_bytes, const uint8_t *ipc_data, int64_t ipc_len,
+	                 int64_t logical_len);
+	// The resolved codec ("none"/"zstd"/"lz4") + level this writer compresses with —
+	// so a caller holding pre-serialized (uncompressed) bytes can transcode them to
+	// match before AppendBatch (the spill-drain path).
+	const std::string &CodecName() const;
+	uint64_t Level() const;
 	// Observability: how many distinct producer threads (local states) fed this
 	// capture — the streaming analogue of substream count.
 	void RegisterProducer();
@@ -190,6 +199,10 @@ public:
 		std::string disk_dir;                 // empty = disk tier off
 		uint64_t disk_max_bytes = 0;          // 0 = disk tier off
 		uint64_t disk_reap_interval_seconds = 60; // disk reaper cadence [S7]
+		// Disk-tier on-write compression (Arrow built-in IPC codec; memory tier is
+		// never compressed). "zstd" default (level 1), "lz4", or "none".
+		std::string disk_compression = "zstd";
+		uint64_t disk_compression_level = 1; // zstd only; ignored for lz4/none
 	};
 
 	// Snapshot row for the vgi_result_cache() diagnostic.
@@ -215,6 +228,9 @@ public:
 		std::string last_modified;
 		bool revalidatable = false;
 		uint64_t hits = 0;
+		// Disk-tier on-write compression codec ("none"/"zstd"/"lz4"). Always "none"
+		// for memory-tier rows (the memory tier is never compressed).
+		std::string codec = "none";
 	};
 
 	// Aggregate counters for diagnostics / debugging.
@@ -277,7 +293,8 @@ public:
 	// disk-only — future lookups discover it via the ref (adopted into memory on a
 	// small serve). AbortStreamingCapture deletes the temp on a non-commit.
 	std::shared_ptr<VgiCaptureDiskWriter> BeginStreamingCapture(const VgiResultCacheKey &key,
-	                                                            const std::string &dir, uint64_t disk_max);
+	                                                            const std::string &dir, uint64_t disk_max,
+	                                                            const std::string &codec, uint64_t level);
 	bool CommitStreamingCapture(VgiCaptureDiskWriter &writer, const VgiResultCacheEntry &meta);
 	void AbortStreamingCapture(VgiCaptureDiskWriter &writer);
 
@@ -333,7 +350,8 @@ private:
 	}
 	// Persist a committed entry to the content-addressed disk store (best-effort;
 	// failures are swallowed — the memory tier still holds it).
-	void PersistToDisk(const VgiResultCacheEntry &entry, const std::string &dir, uint64_t max_bytes);
+	void PersistToDisk(const VgiResultCacheEntry &entry, const std::string &dir, uint64_t max_bytes,
+	                   const std::string &codec, uint64_t level);
 	// Try to load an entry for `key` from disk (cross-process / cross-restart).
 	// Returns null on miss/stale/corruption. Wall-clock TTL. Fully materializes
 	// the payload — used only for SMALL entries (≤ max_entry_bytes) that are then
@@ -361,6 +379,10 @@ private:
 
 	std::string disk_dir_;      // guarded by mutex_
 	uint64_t disk_max_bytes_ = 0; // guarded by mutex_
+	// Disk-tier compression config (guarded by mutex_; snapshotted under the lock
+	// and passed into the disk-write methods, like disk_dir_ / disk_max_bytes_).
+	std::string disk_compression_ = "zstd"; // guarded by mutex_
+	uint64_t disk_compression_level_ = 1;   // guarded by mutex_
 
 	mutable std::mutex mutex_;
 	// MRU-ordered list of entries; front = most recently used.
