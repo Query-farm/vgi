@@ -39,8 +39,9 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 # 1 projection-pushdown witness (echo_witness) +
 # 1 get_column_values pruning probe (value_prune) +
 # 1 late-materialization fixture (late_materialization) +
-# 6 required_field_filter_paths fixtures (rff_simple_scan, rff_struct_scan,
-#   rff_nested_scan, rff_multi_scan, rff_none_scan, rff_rowid_scan) +
+# 6 required_filters fixtures (rff_simple_scan, rff_struct_scan,
+#   rff_nested_scan, rff_multi_scan, rff_none_scan, rff_rowid_scan; rff_or reuses
+#   rff_simple_scan so it adds no function) +
 # 1 filter-pushdown-through-view fixture (filter_echo_table_scan, backs
 #   example.data.filter_echo_table — see filter_pushdown_through_view.test) +
 # 1 large-output-batch buffering repro (buffer_emit_wide, see

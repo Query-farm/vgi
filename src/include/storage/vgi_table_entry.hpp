@@ -27,12 +27,12 @@ class VgiTableEntry;
 // ScanFunctionResult names a SYSTEM_CATALOG function (read_parquet, etc.).
 // VgiRequiredFiltersOptimizer (vgi_extension.cpp) detects this marker via
 // `dynamic_cast<VgiNativeDelegationMarkerBindData *>(get.bind_data.get())`,
-// enforces `table.required_field_filter_paths`, and rewrites the LogicalGet
+// enforces `table.required_filters`, and rewrites the LogicalGet
 // in place to point at the bound native TableFunction. See the comment
 // block at the struct definition in vgi_table_entry.cpp for full lifecycle.
 struct VgiNativeDelegationMarkerBindData : public duckdb::TableFunctionData {
 	// Owning VgiTableEntry — the rewriter reads
-	// `required_field_filter_paths` from this to know which paths must appear
+	// `required_filters` from this to know which paths must appear
 	// in `LogicalGet::table_filters`.
 	reference<VgiTableEntry> table;
 

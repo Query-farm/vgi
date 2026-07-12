@@ -1,5 +1,5 @@
-# name: test/sql/integration/table/required_field_filter_paths_native.test
-# description: required_field_filter_paths over NATIVE read_parquet delegation,
+# name: test/sql/integration/table/required_filters_native.test
+# description: required_filters over NATIVE read_parquet delegation,
 #              including a Hive-partitioned multi-file glob (the Overture
 #              transportation.segment shape). Regression for the table_filters
 #              key mis-resolution: when the native scan's column_ids projection

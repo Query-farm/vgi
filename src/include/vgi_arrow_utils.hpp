@@ -277,6 +277,7 @@ public:
 	operator std::optional<std::vector<std::string>>() const;
 	operator std::optional<std::vector<int32_t>>() const;
 	operator std::optional<std::vector<std::vector<int32_t>>>() const;
+	operator std::optional<std::vector<std::vector<std::string>>>() const;
 	operator std::optional<std::map<std::string, std::string>>() const;
 	operator std::optional<std::map<std::string, int64_t>>() const;
 
@@ -294,6 +295,7 @@ public:
 	std::vector<std::string> value_or(std::vector<std::string> default_val) const;
 	std::vector<int32_t> value_or(std::vector<int32_t> default_val) const;
 	std::vector<std::vector<int32_t>> value_or(std::vector<std::vector<int32_t>> default_val) const;
+	std::vector<std::vector<std::string>> value_or(std::vector<std::vector<std::string>> default_val) const;
 	std::map<std::string, std::string> value_or(std::map<std::string, std::string> default_val) const;
 	std::map<std::string, int64_t> value_or(std::map<std::string, int64_t> default_val) const;
 

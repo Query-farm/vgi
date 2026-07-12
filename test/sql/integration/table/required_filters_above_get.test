@@ -1,4 +1,4 @@
-# name: test/sql/integration/table/required_field_filter_paths_above_get.test
+# name: test/sql/integration/table/required_filters_above_get.test
 # description: LogicalFilter-above-LogicalGet — predicates DuckDB couldn't push down still count
 # group: [vgi_integration_table]
 

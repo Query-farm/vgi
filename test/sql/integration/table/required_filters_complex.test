@@ -1,4 +1,4 @@
-# name: test/sql/integration/table/required_field_filter_paths_complex.test
+# name: test/sql/integration/table/required_filters_complex.test
 # description: Complex query shapes — UNION ALL, subqueries, CTEs, views, EXPLAIN
 # group: [vgi_integration_table]
 

@@ -1,5 +1,5 @@
-# name: test/sql/integration/table/required_field_filter_paths_rowid.test
-# description: required_field_filter_paths coexisting with a virtual row-id
+# name: test/sql/integration/table/required_filters_rowid.test
+# description: required_filters coexisting with a virtual row-id
 #              column. A `WHERE rowid = N` predicate pushes a table_filter keyed
 #              by the COLUMN_IDENTIFIER_ROW_ID sentinel (UINT64_MAX, >> column
 #              count). The enforcement pass must SKIP that key rather than index

@@ -21,7 +21,7 @@ FROM duckdb_tables()
 WHERE database_name = 'example' AND schema_name = 'data'
   AND comment IS NOT NULL
   AND table_name != 'geo_points'  -- geo_points requires spatial extension
-  AND table_name NOT LIKE 'rff_%'  -- rff_* fixtures live in required_field_filter_paths_*.test
+  AND table_name NOT LIKE 'rff_%'  -- rff_* fixtures live in required_filters_*.test
 ORDER BY table_name;
 ----
 cache_big	Large multi-batch cacheable result (advertises vgi.cache.ttl)

@@ -1,4 +1,4 @@
-# name: test/sql/integration/table/required_field_filter_paths_struct.test
+# name: test/sql/integration/table/required_filters_struct.test
 # description: Struct-subfield required paths (rff_struct, rff_nested)
 # group: [vgi_integration_table]
 

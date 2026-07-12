@@ -584,10 +584,10 @@ private:
 };
 
 // ============================================================================
-// VgiRequiredFiltersOptimizer — enforce Table.required_field_filter_paths
+// VgiRequiredFiltersOptimizer — enforce Table.required_filters
 // ============================================================================
 // Walks the plan post-FilterPushdown. For each LogicalGet whose underlying
-// table is a VgiTableEntry with a non-empty `required_field_filter_paths`,
+// table is a VgiTableEntry with a non-empty `required_filters`,
 // collects the dotted-path column references touched by any filter expression
 // in scope (the LogicalGet's table_filters plus any parent LogicalFilter
 // expressions referencing this LogicalGet's table_index). Throws
@@ -672,7 +672,7 @@ private:
 			// vgi_table_function_impl.cpp:714-716. The static portion of a
 			// Top-N OptionalFilter (e.g. OR(IsNull, DynamicFilter)) is
 			// machinery, not user intent: emitting presence here would let a
-			// Top-N artifact spuriously satisfy a required_field_filter_paths
+			// Top-N artifact spuriously satisfy a required_filters
 			// requirement the user never wrote in their WHERE clause.
 			if (vgi::VgiContainsDynamicFilter(*opt.child_filter)) {
 				return;
@@ -804,6 +804,27 @@ private:
 		return out;
 	}
 
+	// Render one OR-group for an error message: a singleton group as the bare
+	// path (`ticker`); a multi-member group as `one of (ticker, cik)`.
+	static std::string RenderGroup(const std::vector<std::string> &group) {
+		if (group.size() == 1) {
+			return group[0];
+		}
+		return "one of (" + JoinPaths(group) + ")";
+	}
+
+	// Join rendered groups with ", " for the required / missing lists.
+	static std::string JoinGroups(const std::vector<std::vector<std::string>> &groups) {
+		std::string out;
+		for (size_t i = 0; i < groups.size(); ++i) {
+			if (i) {
+				out += ", ";
+			}
+			out += RenderGroup(groups[i]);
+		}
+		return out;
+	}
+
 	// Resolve "what VgiTableEntry owns this LogicalGet, if any". Two paths:
 	//   (1) VGI-side scans (vgi_table_scan): GetTable() returns the entry.
 	//   (2) Native delegation (marker bind_data): GetTable() returns nullptr,
@@ -830,7 +851,7 @@ private:
 	static void EnforceRequirements(
 	    const LogicalGet &get, VgiTableEntry &vgi,
 	    const std::vector<unique_ptr<Expression>> &parent_exprs) {
-		const auto &required = vgi.GetTableInfo().required_field_filter_paths;
+		const auto &required = vgi.GetTableInfo().required_filters;
 		if (required.empty()) {
 			return;
 		}
@@ -875,11 +896,19 @@ private:
 			WalkExpression(*expr_ptr, get.table_index, col_ids, get.names, present);
 		}
 
-		// Compute unsatisfied paths.
-		std::vector<std::string> missing;
-		for (const auto &req : required) {
-			if (!IsSatisfied(req, present)) {
-				missing.push_back(req);
+		// Compute unsatisfied groups: a group is satisfied when any one of its
+		// member paths has a filter present; every group must be satisfied.
+		std::vector<std::vector<std::string>> missing;
+		for (const auto &group : required) {
+			bool satisfied = false;
+			for (const auto &member : group) {
+				if (IsSatisfied(member, present)) {
+					satisfied = true;
+					break;
+				}
+			}
+			if (!satisfied) {
+				missing.push_back(group);
 			}
 		}
 		if (missing.empty()) {
@@ -891,7 +920,7 @@ private:
 		    "Add predicates targeting those columns (or a filter on a parent struct) "
 		    "to avoid scanning the entire table.",
 		    vgi.ParentCatalog().GetName(), vgi.ParentSchema().name, vgi.name,
-		    JoinPaths(required), JoinPaths(missing));
+		    JoinGroups(required), JoinGroups(missing));
 	}
 
 	// If the LogicalGet wraps a VgiNativeDelegationMarkerBindData, transfer
@@ -3229,7 +3258,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
 	OptimizerExtension::Register(config, VgiTableBufferingRewriter());
 
-	// Enforce Table.required_field_filter_paths at bind/optimize time.
+	// Enforce Table.required_filters at bind/optimize time.
 	// Post-optimize so DuckDB's FilterPushdown has settled filters into
 	// LogicalGet::table_filters. Zero overhead for tables that don't opt in
 	// (the optimizer does an O(plan_size) walk; tables with an empty

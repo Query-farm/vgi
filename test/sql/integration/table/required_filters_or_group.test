@@ -1,0 +1,46 @@
+# name: test/sql/integration/table/required_filters_or_group.test
+# description: OR-group coverage for Table.required_filters — a group satisfied by any member
+# group: [vgi_integration_table]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# rff_or — a single OR-group requiring a filter on 'a' OR 'b'.
+# ============================================================================
+
+# Empty WHERE → reject; the group renders as "one of (a, b)".
+statement error
+SELECT * FROM example.data.rff_or;
+----
+Table 'example.data.rff_or' requires WHERE filters on: one of (a, b). Missing: one of (a, b).
+
+# Filter on 'a' alone satisfies the OR-group → rows.
+query II
+SELECT * FROM example.data.rff_or WHERE a = 1;
+----
+1	10
+
+# Filter on 'b' alone also satisfies it → rows.
+query II
+SELECT * FROM example.data.rff_or WHERE b = 20;
+----
+2	20
+
+# ============================================================================
+# The requirement is discoverable in SQL via the extension-injected
+# vgi_required_filters tag — before hitting the error.
+# ============================================================================
+
+query T
+SELECT tags['vgi_required_filters'] FROM duckdb_tables()
+WHERE database_name = 'example' AND table_name = 'rff_or';
+----
+[["a","b"]]
+
+statement ok
+DETACH example;

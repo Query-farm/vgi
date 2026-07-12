@@ -534,7 +534,7 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 		// Native delegation: bind the system function eagerly here, then return
 		// a marker carrying the bound function + bind_data + return shapes.
 		// VgiRequiredFiltersOptimizer (vgi_extension.cpp) enforces this table's
-		// `required_field_filter_paths` against the LogicalGet's table_filters,
+		// `required_filters` against the LogicalGet's table_filters,
 		// then swaps `function` / `bind_data` / `returned_types` / `names` in
 		// place to the stashed native ones. Subsequent passes see a vanilla
 		// native scan. Matches VgiMultiScanRewriter's per-arm binding shape

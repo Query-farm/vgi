@@ -1,4 +1,4 @@
-# name: test/sql/integration/table/required_field_filter_paths_disjunction_null.test
+# name: test/sql/integration/table/required_filters_disjunction_null.test
 # description: OR, IS NULL / IS NOT NULL, IN filter shapes
 # group: [vgi_integration_table]
 

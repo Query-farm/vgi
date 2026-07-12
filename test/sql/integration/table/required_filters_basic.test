@@ -1,5 +1,5 @@
-# name: test/sql/integration/table/required_field_filter_paths_basic.test
-# description: Top-level + control coverage for Table.required_field_filter_paths
+# name: test/sql/integration/table/required_filters_basic.test
+# description: Top-level + control coverage for Table.required_filters
 # group: [vgi_integration_table]
 
 require-env VGI_TEST_WORKER

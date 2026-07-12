@@ -822,6 +822,46 @@ ColumnValue::operator std::optional<std::vector<std::vector<int32_t>>>() const {
 	return result;
 }
 
+ColumnValue::operator std::optional<std::vector<std::vector<std::string>>>() const {
+	auto column = batch_ ? batch_->GetColumnByName(column_name_) : nullptr;
+	if (!column) {
+		return std::nullopt;
+	}
+	auto outer_list = std::dynamic_pointer_cast<arrow::ListArray>(column);
+	if (!outer_list || outer_list->IsNull(row_idx_)) {
+		return std::nullopt;
+	}
+
+	int64_t outer_start = outer_list->value_offset(row_idx_);
+	int64_t outer_end = outer_list->value_offset(row_idx_ + 1);
+
+	auto inner_list = std::dynamic_pointer_cast<arrow::ListArray>(outer_list->values());
+	if (!inner_list) {
+		return std::nullopt;
+	}
+
+	auto string_array = std::dynamic_pointer_cast<arrow::StringArray>(inner_list->values());
+	if (!string_array) {
+		return std::nullopt;
+	}
+
+	std::vector<std::vector<std::string>> result;
+	for (int64_t i = outer_start; i < outer_end; i++) {
+		std::vector<std::string> inner_result;
+		if (!inner_list->IsNull(i)) {
+			int64_t inner_start = inner_list->value_offset(i);
+			int64_t inner_end = inner_list->value_offset(i + 1);
+			for (int64_t j = inner_start; j < inner_end; j++) {
+				if (!string_array->IsNull(j)) {
+					inner_result.push_back(string_array->GetString(j));
+				}
+			}
+		}
+		result.push_back(std::move(inner_result));
+	}
+	return result;
+}
+
 ColumnValue::operator std::optional<std::map<std::string, std::string>>() const {
 	auto column = batch_ ? batch_->GetColumnByName(column_name_) : nullptr;
 	if (!column) {
@@ -925,6 +965,11 @@ std::vector<int32_t> ColumnValue::value_or(std::vector<int32_t> default_val) con
 
 std::vector<std::vector<int32_t>> ColumnValue::value_or(std::vector<std::vector<int32_t>> default_val) const {
 	auto opt = static_cast<std::optional<std::vector<std::vector<int32_t>>>>(*this);
+	return opt.value_or(std::move(default_val));
+}
+
+std::vector<std::vector<std::string>> ColumnValue::value_or(std::vector<std::vector<std::string>> default_val) const {
+	auto opt = static_cast<std::optional<std::vector<std::vector<std::string>>>>(*this);
 	return opt.value_or(std::move(default_val));
 }
 

@@ -1962,12 +1962,12 @@ VgiTableInfo ParseTableInfo(ClientContext &context, const std::shared_ptr<arrow:
 		    bind_bytes.empty() ? std::nullopt : std::make_optional(std::move(bind_bytes));
 	}
 
-	// Parse required_field_filter_paths (optional, backward-compatible —
-	// missing column or empty list means no enforcement). The optimizer
-	// extension VgiRequiredFiltersOptimizer reads these from the cached
-	// VgiTableInfo at bind/optimize time.
-	info.required_field_filter_paths =
-	    row["required_field_filter_paths"].value_or(std::vector<std::string>{});
+	// Parse required_filters (optional — missing column or empty list means no
+	// enforcement). CNF: an AND (outer) of OR-groups (inner) of dotted paths.
+	// The optimizer extension VgiRequiredFiltersOptimizer reads these from the
+	// cached VgiTableInfo at bind/optimize time.
+	info.required_filters =
+	    row["required_filters"].value_or(std::vector<std::vector<std::string>>{});
 
 	// Validate: UPDATE/DELETE require a row ID column
 	if ((info.supports_update || info.supports_delete) && info.row_id_column < 0) {
@@ -2278,6 +2278,29 @@ VgiScanBranchesResult ParseScanBranchesResult(ClientContext &context,
 // DuckDB type conversion
 // ============================================================================
 
+// Render required_filters (CNF: an AND of OR-groups) as a compact JSON array of
+// arrays of strings, e.g. [["accession_number"],["ticker","cik"]]. Surfaced on
+// the extension-injected `vgi_required_filters` table tag so callers can discover
+// the requirement via duckdb_tables().tags before hitting the BinderException.
+static std::string RenderRequiredFiltersJson(const std::vector<std::vector<std::string>> &groups) {
+	yyjson_mut_doc *doc = yyjson_mut_doc_new(nullptr);
+	yyjson_mut_val *outer = yyjson_mut_arr(doc);
+	for (const auto &group : groups) {
+		yyjson_mut_val *inner = yyjson_mut_arr(doc);
+		for (const auto &path : group) {
+			yyjson_mut_arr_append(inner, yyjson_mut_strncpy(doc, path.c_str(), path.size()));
+		}
+		yyjson_mut_arr_append(outer, inner);
+	}
+	char *json_str = yyjson_mut_val_write(outer, 0, nullptr);
+	std::string out = json_str ? json_str : "[]";
+	if (json_str) {
+		free(json_str);
+	}
+	yyjson_mut_doc_free(doc);
+	return out;
+}
+
 CreateTableInfo CreateTableInfoFromVgiTable(ClientContext &context, VgiTableInfo &table_info,
                                             const std::string &schema_name) {
 	CreateTableInfo create_info;
@@ -2288,6 +2311,11 @@ CreateTableInfo CreateTableInfoFromVgiTable(ClientContext &context, VgiTableInfo
 	}
 	for (auto &[key, val] : table_info.tags) {
 		create_info.tags[key] = val;
+	}
+	// Expose the required-filter requirement to SQL callers as a reserved tag
+	// (extension-injected, `vgi_`-prefixed) so it's discoverable pre-query.
+	if (!table_info.required_filters.empty()) {
+		create_info.tags["vgi_required_filters"] = RenderRequiredFiltersJson(table_info.required_filters);
 	}
 
 	if (table_info.arrow_schema) {

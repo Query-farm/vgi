@@ -1,4 +1,4 @@
-# name: test/sql/integration/table/required_field_filter_paths_prefix.test
+# name: test/sql/integration/table/required_filters_prefix.test
 # description: Prefix-satisfaction — a present parent filter subsumes child requirements
 # group: [vgi_integration_table]
 
