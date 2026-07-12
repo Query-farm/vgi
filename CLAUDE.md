@@ -626,6 +626,19 @@ reaper work), `vgi_result_cache(include_disk := true)` (memory **and** disk-only
 `vgi_result_cache_reap(advance_seconds := N)` drives a synchronous, clock-injected reap pass for
 reproducible cleanup tests. Clear with `vgi_result_cache_flush()` (both tiers).
 
+## Query Farm Telemetry
+
+Anonymous, opt-out usage telemetry. Two fire-and-forget async HTTPS events: the long-standing
+`load` ping (7 fields at extension load → `duckdb-in.query-farm.services`) and a per-successful-
+`ATTACH` `attach` event (transport / server-version / auth-mode / options / DuckLake-federation
+summary → a dedicated `vgi-in.query-farm.services` worker). No PII, no persistent id (`session_id`
+is per-process, in-memory); locations are credential-scrubbed; federation is reported as
+count + engine `db_type`s only. Opt out with `QUERY_FARM_TELEMETRY_OPT_OUT`. Success-only — a
+failed attach sends nothing. Files: `src/vgi_telemetry.cpp` (build+send),
+`src/vgi_telemetry_util.cpp` (pure scrub/classify/host_kind helpers, unit-tested in
+`test/cpp/test_telemetry.cpp`), emit site in `VgiCatalogAttach` (`src/vgi_extension.cpp`), shared
+transport in `src/query_farm_telemetry.cpp`. Full field reference: [docs/telemetry.md](docs/telemetry.md).
+
 ## Extension Settings
 
 | Setting | Type | Default | Description |

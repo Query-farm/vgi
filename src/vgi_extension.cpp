@@ -51,6 +51,7 @@
 #include "duckdb/common/types/geometry.hpp"
 #include "duckdb/function/cast/cast_function_set.hpp"
 #include "query_farm_telemetry.hpp"
+#include "vgi_telemetry.hpp"
 #include "vgi_multi_scan_rewriter.hpp"
 #ifdef __EMSCRIPTEN__
 #include "vgi_wasm_async_pool.hpp"
@@ -1621,6 +1622,27 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 		throw BinderException("VGI ATTACH requires LOCATION option specifying the worker path");
 	}
 
+	// Telemetry capture — the event fires only on the success path, near the
+	// return. Snapshot the raw (pre-rewrite) location + the user's options here,
+	// before the container/HTTP rewrites and the attach RPC. Best-effort; nothing
+	// below may throw on telemetry's account.
+	vgi::VgiAttachInfo tele;
+	tele.raw_location = worker_path;
+	tele.opt_pool = use_pool;
+	tele.opt_secrets = secrets_enabled;
+	tele.opt_cache = cache_enabled;
+	tele.opt_attach_companions = attach_companions_enabled;
+	tele.opt_attach_companion_secrets = attach_companion_secrets;
+	if (pool_max_override >= 0) {
+		tele.has_pool_max = true;
+		tele.opt_pool_max = pool_max_override;
+	}
+	if (pool_timeout_override >= 0) {
+		tele.has_pool_timeout = true;
+		tele.opt_pool_timeout = pool_timeout_override;
+	}
+	const auto tele_start = std::chrono::steady_clock::now();
+
 	// Launcher overrides are only meaningful for ``launch:`` LOCATIONs.
 	// ``unix://`` connects to an externally-managed worker (we don't spawn,
 	// don't manage state); HTTP and bare-subprocess transports don't go
@@ -1715,6 +1737,12 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 			}
 		}
 
+		// Telemetry: container facts (before worker_path is rewritten below).
+		tele.is_container = true;
+		tele.container_runtime = spec.runtime.kind;
+		tele.container_connection = shared ? (shared_mode == vgi::ContainerConnMode::TCP ? "tcp" : "http") : "stdio";
+		tele.container_shared = shared;
+
 		if (shared) {
 			// Transparent shared container: register the resolved spec/mode under an
 			// internal container-shared: token; the dispatch resolves the live
@@ -1790,6 +1818,18 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 			oauth_auth->SeedRefreshToken(oauth_refresh_token);
 		}
 		auth = std::move(oauth_auth);
+	}
+
+	// Telemetry: auth mode. OAuth/bearer only apply to HTTP transport; every other
+	// transport is unauthenticated from the extension's perspective.
+	if (!bearer_token.empty()) {
+		tele.auth_mode = "bearer";
+	} else if (!oauth_refresh_token.empty()) {
+		tele.auth_mode = "oauth_refresh_token";
+	} else if (vgi::IsHttpTransport(worker_path)) {
+		tele.auth_mode = "oauth";
+	} else {
+		tele.auth_mode = "none";
 	}
 
 	// HTTP cookie jar — carries proxy-issued Set-Cookie / Cookie headers for
@@ -2264,6 +2304,26 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 		companion_manifest = attach_result_ptr->attach_catalogs;
 	}
 
+	// Telemetry: catalog facts from the attach result, captured before the result
+	// is moved into the catalog below. companion_count reflects what the worker
+	// advertised (independent of the attach_companions opt-out); db_types only —
+	// never companion targets/DSNs.
+	tele.catalog_name = catalog_name;
+	tele.has_catalog_version = true;
+	tele.catalog_version = attach_result_ptr->catalog_version;
+	tele.resolved_impl_version = attach_result_ptr->resolved_implementation_version;
+	tele.resolved_data_version = attach_result_ptr->resolved_data_version;
+	{
+		auto turl = attach_result_ptr->tags.find("vgi_secret_service_url");
+		if (turl != attach_result_ptr->tags.end() && !turl->second.empty()) {
+			tele.secret_service_url = vgi::VgiScrubLocation(turl->second);
+		}
+	}
+	tele.companion_count = static_cast<int64_t>(attach_result_ptr->attach_catalogs.size());
+	for (auto &c : attach_result_ptr->attach_catalogs) {
+		tele.companion_types.push_back(c.db_type);
+	}
+
 	auto vgi_catalog = make_uniq<VgiCatalog>(db, name, options.access_mode, std::move(attach_params),
 	                                          std::move(attach_result_ptr), eager_thresholds);
 
@@ -2378,6 +2438,20 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 			vgi_catalog->SetCompanionCatalogs(std::move(referenced));
 		}
 	}
+
+	// Success path only — fire the attach telemetry event (async, fire-and-forget,
+	// honors QUERY_FARM_TELEMETRY_OPT_OUT; never throws).
+	tele.extension_version = VGI_EXTENSION_VERSION;
+	if (auth) {
+		tele.auth_interactive = auth->WasInteractive();
+		vgi::OAuthTokenSet token_copy;
+		if (auth->GetTokenSetCopy(token_copy)) {
+			tele.oauth_issuer = token_copy.identity.issuer;
+		}
+	}
+	tele.attach_duration_ms = static_cast<int64_t>(
+	    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - tele_start).count());
+	vgi::VgiSendAttachEvent(context, tele);
 
 	return vgi_catalog;
 }

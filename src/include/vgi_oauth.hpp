@@ -105,6 +105,11 @@ struct AuthState {
 	// HandleUnauthorized on the same thread, we'd self-wait on cv
 	// forever. This lets us throw cleanly instead.
 	std::thread::id owner;
+	// True once an interactive auth flow (device-code / browser PKCE) actually
+	// ran for this catalog — i.e. PerformAuthFlow was invoked, as opposed to a
+	// silent refresh or an already-cached token. Sticky for the auth object's
+	// lifetime; read by telemetry to distinguish human-in-the-loop attaches.
+	bool interactive = false;
 };
 
 // ============================================================================
@@ -136,6 +141,12 @@ public:
 	};
 	virtual bool GetTokenInfo(TokenInfo &info) { return false; }
 	virtual bool GetTokenSetCopy(OAuthTokenSet &out) { return false; }
+
+	// True iff an interactive auth flow (device-code / browser) actually ran for
+	// this catalog. Distinct from IsExplicitlyConfigured() (which reflects an
+	// ATTACH-time opt-in, not whether a human completed a flow). Bearer / silent
+	// refresh / cached-token paths never set it. Used by attach telemetry.
+	virtual bool WasInteractive() const { return false; }
 
 	// True iff the user explicitly opted into this auth flow at ATTACH time.
 	// Bearer auth: always true once the bearer_token option was supplied.
@@ -181,6 +192,7 @@ public:
 	bool GetTokenInfo(TokenInfo &info) override;
 	bool GetTokenSetCopy(OAuthTokenSet &out) override;
 	bool IsExplicitlyConfigured() const override;
+	bool WasInteractive() const override;
 
 private:
 	mutable std::mutex mutex_;

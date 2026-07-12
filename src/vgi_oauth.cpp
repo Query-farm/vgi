@@ -1719,6 +1719,11 @@ bool OAuthCatalogAuth::IsExplicitlyConfigured() const {
 	return false;
 }
 
+bool OAuthCatalogAuth::WasInteractive() const {
+	std::lock_guard<std::mutex> lock(mutex_);
+	return state_.interactive;
+}
+
 std::string OAuthCatalogAuth::HandleUnauthorized(const OAuthChallenge &challenge, ClientContext &context) {
 	// Check if OAuth is enabled
 	Value oauth_enabled_val;
@@ -1814,6 +1819,10 @@ std::string OAuthCatalogAuth::HandleUnauthorized(const OAuthChallenge &challenge
 			OAuthRefreshContext new_refresh_ctx;
 			auto tokens = PerformAuthFlow(challenge, context, new_refresh_ctx);
 			lock.lock();
+			// Reaching here means an interactive flow (device-code / browser)
+			// completed — the refresh branch above never falls through. Record
+			// it for telemetry (sticky for the auth object's lifetime).
+			state_.interactive = true;
 			return StoreSuccess(std::move(tokens), new_refresh_ctx);
 		} catch (const std::exception &e) {
 			lock.lock();

@@ -71,6 +71,8 @@ include_directories(duckdb/third_party/miniz)
 set(EXTENSION_SOURCES
 src/vgi_extension.cpp
 src/query_farm_telemetry.cpp
+src/vgi_telemetry.cpp
+src/vgi_telemetry_util.cpp
 src/vgi_launcher_internal.cpp
 src/vgi_launcher.cpp
 src/vgi_launcher_cache.cpp
@@ -176,6 +178,8 @@ if((BUILD_VGI_UNIT_TESTS OR DEFINED ENV{BUILD_VGI_UNIT_TESTS}) AND NOT WIN32)
     test/cpp/test_transport_detection.cpp
     test/cpp/test_container_runtime.cpp
     test/cpp/test_oauth.cpp
+    test/cpp/test_telemetry.cpp
+    src/vgi_telemetry_util.cpp
     src/vgi_oauth_env.cpp
     src/vgi_launcher_internal.cpp
     src/vgi_unix_socket.cpp
