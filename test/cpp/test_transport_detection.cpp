@@ -24,6 +24,8 @@ using duckdb::vgi::StripGithubAutoScheme;
 using duckdb::vgi::StripGithubScheme;
 using duckdb::vgi::StripLaunchScheme;
 using duckdb::vgi::StripUnixScheme;
+using duckdb::vgi::StripWebWorkerScheme;
+using duckdb::vgi::IsWebWorkerTransport;
 using duckdb::vgi::TransportType;
 
 TEST_CASE("DetectTransport routes each scheme correctly", "[transport]") {
@@ -33,9 +35,27 @@ TEST_CASE("DetectTransport routes each scheme correctly", "[transport]") {
 	CHECK(DetectTransport("unix:///tmp/foo.sock") == TransportType::UNIX);
 	CHECK(DetectTransport("oci://ghcr.io/org/img:tag") == TransportType::CONTAINER);
 	CHECK(DetectTransport("docker://library/python:3.13") == TransportType::CONTAINER);
+	CHECK(DetectTransport("worker:/workers/example.js") == TransportType::WEBWORKER);
+	CHECK(DetectTransport("worker:https://cdn.example.com/w.js") == TransportType::WEBWORKER);
+	CHECK(DetectTransport("worker:example") == TransportType::WEBWORKER);
 	CHECK(DetectTransport("/path/to/worker") == TransportType::SUBPROCESS);
 	CHECK(DetectTransport("/path/with launch: in middle") == TransportType::SUBPROCESS);
 	CHECK(DetectTransport("") == TransportType::SUBPROCESS);
+}
+
+TEST_CASE("worker: scheme predicate + strip", "[transport]") {
+	CHECK(IsWebWorkerTransport("worker:/workers/example.js"));
+	CHECK(IsWebWorkerTransport("worker:https://cdn.example.com/w.js"));
+	CHECK(IsWebWorkerTransport("WORKER:example")); // scheme is case-insensitive
+	CHECK_FALSE(IsWebWorkerTransport("/path/to/worker"));
+	CHECK_FALSE(IsWebWorkerTransport("http://x"));
+
+	// Strip preserves the case-sensitive remainder (URLs/paths).
+	CHECK(StripWebWorkerScheme("worker:/workers/Example.js") == "/workers/Example.js");
+	CHECK(StripWebWorkerScheme("worker:https://Cdn/W.js") == "https://Cdn/W.js");
+	CHECK(StripWebWorkerScheme("worker://host/x.js") == "//host/x.js");
+	CHECK(StripWebWorkerScheme("worker:name") == "name");
+	CHECK_THROWS_AS(StripWebWorkerScheme("http://x"), std::invalid_argument);
 }
 
 TEST_CASE("Container scheme detection and stripping", "[transport]") {

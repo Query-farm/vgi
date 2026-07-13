@@ -45,6 +45,18 @@ bool IsGithubAutoLocation(const std::string &worker_path) {
 	return StringUtil::StartsWith(lower, "github-auto://");
 }
 
+bool IsWebWorkerTransport(const std::string &worker_path) {
+	auto lower = StringUtil::Lower(worker_path);
+	return StringUtil::StartsWith(lower, "worker:");
+}
+
+std::string StripWebWorkerScheme(const std::string &location) {
+	if (!IsWebWorkerTransport(location)) {
+		throw std::invalid_argument("Not a worker: location: " + location);
+	}
+	return location.substr(std::string("worker:").size()); // preserve case of the remainder
+}
+
 bool IsTcpTransport(const std::string &worker_path) {
 	auto lower = StringUtil::Lower(worker_path);
 	return StringUtil::StartsWith(lower, "tcp://");
@@ -85,6 +97,9 @@ TransportType DetectTransport(const std::string &worker_path) {
 	}
 	if (IsTcpTransport(worker_path)) {
 		return TransportType::TCP;
+	}
+	if (IsWebWorkerTransport(worker_path)) {
+		return TransportType::WEBWORKER;
 	}
 	return TransportType::SUBPROCESS;
 }

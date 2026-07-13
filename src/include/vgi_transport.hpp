@@ -19,7 +19,11 @@ namespace vgi {
 //              listening on a raw-TCP socket (vgi-rpc serve_tcp). Connect-only,
 //              like UNIX. Used by wasm workers (wasip2 has TCP sockets but no
 //              AF_UNIX), and for any worker reachable over loopback/trusted TCP.
-enum class TransportType { SUBPROCESS, HTTP, UNIX, LAUNCH, CONTAINER, TCP };
+// WEBWORKER  — worker:<url>; in-browser Web Worker over a SharedArrayBuffer duplex
+//              ring (DuckDB-WASM only). The <url> is whatever `new Worker(url)`
+//              accepts. No spawn/pool on the C++ side; the JS bridge owns the
+//              worker. See vgi_sab_abi.hpp / docs/sab_transport_abi.md.
+enum class TransportType { SUBPROCESS, HTTP, UNIX, LAUNCH, CONTAINER, TCP, WEBWORKER };
 
 // Detect what kind of worker location this string represents.  Pure on
 // inputs — no I/O, no ambient state.
@@ -42,6 +46,15 @@ bool IsContainerSharedLocation(const std::string &worker_path);
 // Raw-TCP location: tcp://host:port. Connect-only against an out-of-band worker
 // (vgi-rpc serve_tcp).
 bool IsTcpTransport(const std::string &worker_path);
+
+// Web Worker location: worker:<url>. In-browser SharedArrayBuffer transport
+// (DuckDB-WASM only); the JS bridge owns worker lifecycle.
+bool IsWebWorkerTransport(const std::string &worker_path);
+
+// Strip the `worker:` scheme prefix, returning the (case-preserved) URL/name the
+// JS bridge resolves to a Web Worker. Throws std::invalid_argument if the
+// location is not a worker: location.
+std::string StripWebWorkerScheme(const std::string &location);
 
 // Parse a tcp:// location into (host, port). Throws std::invalid_argument if the
 // location is not a well-formed tcp://host:port.

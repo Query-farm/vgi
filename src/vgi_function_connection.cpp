@@ -15,6 +15,9 @@
 #include "vgi_exception.hpp"
 #include "vgi_http_client.hpp" // ResolveExternalLocation (externalized-batch resolution)
 #include "vgi_http_function_connection.hpp"
+#if defined(__EMSCRIPTEN__)
+#include "vgi_webworker_function_connection.hpp"
+#endif
 #include "vgi_logging.hpp"
 #include "vgi_rpc_client.hpp"
 #include "vgi_rpc_types.hpp"
@@ -1674,6 +1677,15 @@ std::unique_ptr<IFunctionConnection> CreateFunctionConnection(
 		    function_type, global_execution_id, worker_debug, settings, required_secrets,
 		    attach_params);
 	}
+#if defined(__EMSCRIPTEN__)
+	// worker:<url> — in-browser Web Worker over a SharedArrayBuffer duplex ring.
+	// No spawn/pool here; the JS bridge owns the worker (see vgi_sab_abi.hpp).
+	if (IsWebWorkerTransport(worker_path)) {
+		return std::make_unique<WebWorkerFunctionConnection>(
+		    worker_path, function_name, arguments, attach_opaque_data, transaction_opaque_data, context,
+		    function_type, global_execution_id, settings, required_secrets);
+	}
+#endif
 	// Shared container: resolve the live endpoint via the daemon-introspection
 	// coordinator at connection time (self-heals an idle-stopped container), then
 	// build the right connection for the resolved mode.

@@ -1,0 +1,23 @@
+[package]
+name = "sabffi"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Static lib linked into the C++ vgi_unit_tests binary. Exposes
+# `vgi_rust_serve_sab_slot(slot)`: runs the real vgi-rpc `server.serve()` over a
+# native ring slot (via the extern "C" vgi_sab_worker_* ops defined in the C++
+# test), so a C++ client and the Rust worker meet over one ring in one process.
+[lib]
+name = "sabffi"
+crate-type = ["staticlib"]
+path = "src/lib.rs"
+
+[dependencies]
+vgi-rpc = { path = "../../../../vgi-rpc-rust/vgi-rpc", default-features = false, features = ["macros", "stream-codec"] }
+arrow-array = "59"
+arrow-schema = "59"
+serde = { version = "1", features = ["derive"] }
+
+[profile.release]
+opt-level = 2

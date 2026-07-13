@@ -179,6 +179,13 @@ if((BUILD_VGI_UNIT_TESTS OR DEFINED ENV{BUILD_VGI_UNIT_TESTS}) AND NOT WIN32)
     test/cpp/test_container_runtime.cpp
     test/cpp/test_oauth.cpp
     test/cpp/test_telemetry.cpp
+    test/cpp/test_sab_stream.cpp
+    test/cpp/test_sab_e2e.cpp
+    test/support/vgi_sab_native_ring.cpp
+    src/vgi_sab_stream.cpp
+    src/vgi_rpc_client.cpp
+    src/vgi_arrow_ipc.cpp
+    src/vgi_logging.cpp
     src/vgi_telemetry_util.cpp
     src/vgi_oauth_env.cpp
     src/vgi_launcher_internal.cpp
@@ -200,10 +207,20 @@ if((BUILD_VGI_UNIT_TESTS OR DEFINED ENV{BUILD_VGI_UNIT_TESTS}) AND NOT WIN32)
   # satisfies the LoadAllExtensions symbol DuckDB references.  The Layer-1 /
   # Layer-2 helpers themselves stay DuckDB-free but link into the same binary
   # for convenience.
+  # Rust FFI worker staticlib for the cross-language SAB e2e (test_sab_e2e.cpp).
+  # Built out-of-band via `cargo build --release` in test/support/sabffi.
+  set(SABFFI_LIB
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/support/sabffi/target/release/libsabffi.a)
   target_link_libraries(vgi_unit_tests
     duckdb_static
     dummy_static_extension_loader
-    duckdb_mbedtls)
+    duckdb_mbedtls
+    ${VGI_ARROW_LIB}
+    ${SABFFI_LIB})
+  if(APPLE)
+    # Rust std / chrono's iana_time_zone dep in libsabffi references CoreFoundation.
+    target_link_libraries(vgi_unit_tests "-framework CoreFoundation")
+  endif()
 
   # Standalone test worker — tiny AF_UNIX server that satisfies the launcher
   # contract.  Used by test_launcher_e2e.cpp; no Python required.
