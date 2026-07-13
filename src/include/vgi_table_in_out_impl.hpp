@@ -112,6 +112,17 @@ struct VgiTableInOutBindData : public TableFunctionData {
 	// own worker), but Execute must keep the substream connection open at input-EOS
 	// so VgiTableInOutFinalize can reuse it (a no-finalize map releases it there).
 	bool has_finalize = false;
+
+	// Blended ("UNNEST-style") table-in-out (Phase B). input_from_args: this is a
+	// blended function (positional args are input columns). single_row_scan: this
+	// particular bind is the childless call shape (literal f(52,13) or a
+	// pure-varargs childless call) that DuckDB drives via PhysicalTableScan — a
+	// SOURCE that re-feeds its cardinality-1 input chunk until the callback returns
+	// a 0-row chunk. Execute uses the write-once -> CloseInputWriter -> drain-to-EOS
+	// scan-mode branch for this shape. False for the streaming column/LATERAL shape
+	// (PhysicalTableInOutFunction, which advances on NEED_MORE_INPUT).
+	bool input_from_args = false;
+	bool single_row_scan = false;
 };
 
 // ============================================================================
@@ -219,6 +230,12 @@ struct VgiTableInOutLocalState : public ArrowScanLocalState {
 	// finalize is independent per substream, so the "init once" latch must live on
 	// the local state, not the global one (which the serial path uses).
 	bool finalize_sent = false;
+
+	// Phase B (blended literal scan-mode): whether the single synthesized input row
+	// has been written + the input writer closed. Single-thread-safe:
+	// PhysicalTableScan::ParallelSource() is false for in-out functions, so the
+	// literal scan runs on one local state.
+	bool input_submitted = false;
 };
 
 // ============================================================================
@@ -237,6 +254,16 @@ struct VgiTableInOutBindParams {
 	// (single shared worker, MaxThreads()=1); 0/unset or >1 = parallel-by-default
 	// per-substream fan-out. Threaded to bind_data.parallel_safe.
 	int32_t max_workers = 0;
+
+	// Blended ("UNNEST-style") table-in-out (Phase B): positional args ARE the
+	// per-row input columns. When true, bind builds the worker input schema from
+	// `positional_input_names` (the DECLARED arg names — the worker reads columns
+	// by those names) + `input.input_table_types`, ignoring input_table_names
+	// (empty in the literal shape), and sets single_row_scan for the childless
+	// (literal / pure-varargs) call so Execute uses the write-once scan-mode.
+	bool input_from_args = false;
+	std::vector<std::string> positional_input_names;
+	bool has_varargs = false;
 
 	// Routes through to bind_data so the OptimizerExtension can recognize a
 	// LogicalGet of a buffered table function and rewrite it.

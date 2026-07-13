@@ -3,7 +3,7 @@
     {
       "attach_options": [],
       "counts": {
-        "functions": 184,
+        "functions": 185,
         "schemas": 2,
         "tables": 59,
         "views": 3
@@ -1818,6 +1818,30 @@
               ],
               "doc": "Raises an exception after N batches for testing",
               "name": "generator_exception",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Latitude input column",
+                  "name": "latitude",
+                  "type": "double"
+                },
+                {
+                  "desc": "Longitude input column",
+                  "name": "longitude",
+                  "type": "double"
+                },
+                {
+                  "default": "4",
+                  "desc": "Rounding precision",
+                  "name": "precision",
+                  "named": true,
+                  "type": "int64"
+                }
+              ],
+              "doc": "Blended per-row geo encoder (lat, lon -> geohash)",
+              "name": "geo_encode",
               "type": "table"
             },
             {

@@ -229,6 +229,16 @@ static unique_ptr<FunctionData> VgiCatalogTableInOutFunctionBind(ClientContext &
 	// A3 serial opt-out: a worker that declares Meta.max_workers=1 keeps its
 	// streaming table-in-out on a single shared worker (MaxThreads()=1).
 	params.max_workers = vgi_info.function_info().max_workers.value_or(0);
+	// Blended (Phase B): the DECLARED positional arg names are the worker's input
+	// column names (it reads batch.column("<name>")). Re-parse the arguments schema
+	// to recover them (+ varargs flag) so bind can build the input schema by name.
+	params.input_from_args = vgi_info.function_info().input_from_args;
+	if (params.input_from_args && vgi_info.function_info().arguments_schema) {
+		auto blended_args =
+		    vgi::ParseFunctionArgumentSchema(context, vgi_info.function_info().arguments_schema);
+		params.positional_input_names = blended_args.positional_names;
+		params.has_varargs = blended_args.has_varargs;
+	}
 
 	// Validate required settings
 	const auto &required_settings = vgi_info.function_info().required_settings;
@@ -317,8 +327,21 @@ void VgiTableFunctionSet::LoadEntries(ClientContext &context, const std::lock_gu
 				arg_types = vgi::ParseFunctionArgumentSchema(context, func_info.arguments_schema);
 			}
 
-			// Check if this is a table-in-out function (has TABLE input argument)
-			if (arg_types.HasTableInput()) {
+			// Check if this is a table-in-out function: either it has a TABLE input
+			// argument (classic), or it is a blended ("UNNEST-style") function whose
+			// positional args ARE its per-row input columns (input_from_args). Both
+			// register through the in_out_function path — a blended function's
+			// positional_types are real value types (no TABLE marker), so it also
+			// serves the literal f(52,13) and column FROM t, f(t.x,t.y) shapes.
+			if (arg_types.HasTableInput() || func_info.input_from_args) {
+				// A blended function must not also declare a finalize (map-shaped).
+				// The worker's resolve_metadata already rejects this; assert as a
+				// defense against a hand-rolled/old worker that advertises both.
+				if (func_info.input_from_args && func_info.has_finalize) {
+					throw InvalidInputException(
+					    "Function '%s' advertises input_from_args (blended) AND has_finalize; a blended "
+					    "RowTransformFunction is map-shaped and cannot have a finalize.", func_info.name);
+				}
 				// Create a table-in-out function
 				// Table-in-out functions use LogicalType::TABLE in args and have an in_out_function
 				TableFunction table_func(arg_types.positional_types, nullptr, VgiCatalogTableInOutFunctionBind,

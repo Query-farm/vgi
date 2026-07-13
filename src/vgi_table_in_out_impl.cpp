@@ -77,6 +77,8 @@ unique_ptr<FunctionData> VgiTableInOutBindData::Copy() const {
 	copy->requires_input_batch_index = requires_input_batch_index;
 	copy->parallel_safe = parallel_safe;
 	copy->has_finalize = has_finalize;
+	copy->input_from_args = input_from_args;
+	copy->single_row_scan = single_row_scan;
 	return copy;
 }
 
@@ -165,17 +167,25 @@ unique_ptr<FunctionData> VgiTableInOutBind(ClientContext &context, TableFunction
 	// case is honored, matching the pure-table path's use of the same field.)
 	bind_data->parallel_safe = (params.max_workers != 1);
 
-	// Build arguments from the regular (non-TABLE) inputs
-	// input.inputs contains positional arguments, but TABLE arguments are represented as NULL
-	// We skip NULL values since they represent the TABLE input (not a scalar argument)
-	// Named arguments are in input.named_parameters
+	bind_data->input_from_args = params.input_from_args;
+
+	// Build arguments from the regular (non-TABLE) inputs.
+	// input.inputs contains positional arguments, but TABLE arguments are represented as NULL.
+	// We skip NULL values since they represent the TABLE input (not a scalar argument).
+	// Named arguments are in input.named_parameters.
+	//
+	// BLENDED (input_from_args): the positional inputs ARE the per-row input
+	// columns (delivered by DuckDB's synthesized input chunk), NOT bind arguments —
+	// skip ALL of them. Only named args survive as bind-time scalars.
 	vector<Value> positional_args;
-	for (auto &val : input.inputs) {
-		// Skip NULL values - these represent TABLE arguments
-		if (val.IsNull()) {
-			continue;
+	if (!params.input_from_args) {
+		for (auto &val : input.inputs) {
+			// Skip NULL values - these represent TABLE arguments
+			if (val.IsNull()) {
+				continue;
+			}
+			positional_args.push_back(val);
 		}
-		positional_args.push_back(val);
 	}
 	vector<std::pair<string, Value>> named_args;
 	for (auto &[name, value] : input.named_parameters) {
@@ -183,12 +193,49 @@ unique_ptr<FunctionData> VgiTableInOutBind(ClientContext &context, TableFunction
 	}
 	bind_data->arguments = BuildArgumentsFromValues(context, positional_args, named_args);
 
-	// Build the input schema from the table input types/names
-	bind_data->input_schema = BuildArrowSchemaFromDuckDB(context, input.input_table_types, input.input_table_names);
+	// Build the input schema.
+	//
+	// BLENDED: use the DECLARED positional arg names (the worker reads columns by
+	// those names) with the input-provided types. IGNORE input.input_table_names —
+	// it is empty in the literal shape (f(52,13) -> ["",""]) and would otherwise
+	// name the worker's input columns after the referenced columns in the column
+	// shape. For a pure-VARARGS blended function the declared names don't cover the
+	// N runtime columns, so fall back to generated col0..colN-1.
+	if (params.input_from_args) {
+		vector<string> in_names;
+		const idx_t n_cols = input.input_table_types.size();
+		if (!params.has_varargs && params.positional_input_names.size() == n_cols) {
+			for (auto &nm : params.positional_input_names) {
+				in_names.push_back(nm);
+			}
+		} else {
+			for (idx_t i = 0; i < n_cols; i++) {
+				in_names.push_back("col" + std::to_string(i));
+			}
+		}
+		bind_data->input_schema = BuildArrowSchemaFromDuckDB(context, input.input_table_types, in_names);
+		// Childless call shape (literal f(52,13) or a pure-varargs childless call)
+		// -> PhysicalTableScan, which needs the write-once scan-mode in Execute.
+		// Robust signal: all synthesized input names are empty (the column/LATERAL
+		// shape gives non-empty names and a streaming child). Do NOT key on
+		// !input.inputs.empty() (false-negatives the zero-positional childless call).
+		bool all_names_empty = true;
+		for (auto &nm : input.input_table_names) {
+			if (!nm.empty()) {
+				all_names_empty = false;
+				break;
+			}
+		}
+		bind_data->single_row_scan = all_names_empty;
+	} else {
+		bind_data->input_schema = BuildArrowSchemaFromDuckDB(context, input.input_table_types, input.input_table_names);
+	}
 
 	VGI_LOG(context, "table_in_out.bind",
 	        {{"worker_path", bind_data->worker_path()},
 	         {"function_name", bind_data->function_name},
+	         {"input_from_args", params.input_from_args ? "true" : "false"},
+	         {"single_row_scan", bind_data->single_row_scan ? "true" : "false"},
 	         {"input_columns", std::to_string(input.input_table_types.size())}});
 
 	// Create the connection and perform bind
@@ -630,6 +677,72 @@ OperatorResultType VgiTableInOutFunction(ExecutionContext &context, TableFunctio
 		throw InternalException("VgiTableInOutFunction: connection is null");
 	}
 	IFunctionConnection &conn = parallel ? *local_state.connection : *global_state.connection;
+
+	// ------------------------------------------------------------------------
+	// Phase B — blended LITERAL scan-mode (single_row_scan).
+	// ------------------------------------------------------------------------
+	// DuckDB drives the childless call shape (f(52,13) / pure-varargs childless)
+	// through PhysicalTableScan, which acts as a SOURCE: it re-invokes this
+	// callback with the SAME cardinality-1 input chunk and decides flow SOLELY on
+	// `chunk.size()` (it DISCARDS our returned OperatorResultType). So we must
+	// return a 0-row chunk ONLY at true end-of-stream, and never mid-stream.
+	if (bind_data.single_row_scan) {
+		// 1) Drain a large (1->N) output batch that overflowed STANDARD_VECTOR_SIZE.
+		if (HasRemainingBatchData(local_state)) {
+			idx_t rows_copied =
+			    ProduceOutputFromBatch(local_state, bind_data.arrow_table, output, bind_data.projection_pushdown);
+			VGI_LOG(client_context, "table_in_out.scan_output",
+			        {{"conn", conn.GetConnIdHex()}, {"function_name", bind_data.function_name},
+			         {"output_rows", std::to_string(rows_copied)}});
+			return OperatorResultType::HAVE_MORE_OUTPUT;
+		}
+		// 2) First call: write the single synthesized input row ONCE, then close the
+		//    input writer so the worker can reach EOS (no deadlock).
+		if (!local_state.input_submitted) {
+			auto input_batch = DataChunkToArrow(client_context, input, bind_data.input_schema);
+			VGI_LOG(client_context, "table_in_out.scan_write_input",
+			        {{"conn", conn.GetConnIdHex()}, {"function_name", bind_data.function_name},
+			         {"input_rows", std::to_string(input_batch->num_rows())}});
+			conn.WriteInputBatch(input_batch);
+			conn.CloseInputWriter();
+			local_state.input_submitted = true;
+		}
+		// 3) Drain to EOS INSIDE this call: skip empty-but-not-EOS batches (worker
+		//    heartbeat / 1->0). Return a >0-row chunk on the first non-empty batch;
+		//    return a 0-row chunk (SetCardinality(0)) only on nullptr (true EOS).
+		while (true) {
+			std::shared_ptr<arrow::RecordBatch> output_batch;
+			try {
+				output_batch = conn.ReadDataBatch();
+			} catch (const IOException &) {
+				// Worker may exit right after input EOS (e.g. empty 1->0). Treat as
+				// clean end-of-stream, mirroring the scalar path's post-close read.
+				output_batch = nullptr;
+			}
+			if (!output_batch) {
+				output.SetCardinality(0);
+				// Cancel-not-pool: the "no-finalize in-out worker returns to a clean
+				// accept-loop after input-EOS" transition is unproven for scan-mode,
+				// so drop the connection instead of pooling it.
+				if (parallel) {
+					local_state.connection.reset();
+				} else {
+					global_state.stream_finished = true;
+				}
+				return OperatorResultType::FINISHED;
+			}
+			if (output_batch->num_rows() == 0) {
+				continue; // empty-but-not-EOS: keep reading, never return 0 rows mid-stream
+			}
+			LoadBatchIntoScanState(local_state, output_batch);
+			idx_t rows_copied =
+			    ProduceOutputFromBatch(local_state, bind_data.arrow_table, output, bind_data.projection_pushdown);
+			VGI_LOG(client_context, "table_in_out.scan_output",
+			        {{"conn", conn.GetConnIdHex()}, {"function_name", bind_data.function_name},
+			         {"output_rows", std::to_string(rows_copied)}});
+			return OperatorResultType::HAVE_MORE_OUTPUT;
+		}
+	}
 
 	// Continue producing rows from a batch that exceeded STANDARD_VECTOR_SIZE
 	if (HasRemainingBatchData(local_state)) {

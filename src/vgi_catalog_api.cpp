@@ -2645,6 +2645,11 @@ VgiFunctionInfo ParseFunctionInfo(const std::shared_ptr<arrow::RecordBatch> &bat
 	// so DuckDB threads source-position metadata to every Sink call.
 	info.requires_input_batch_index = row["requires_input_batch_index"].value_or(false);
 
+	// input_from_args — optional bool (defaults to false for older workers). A
+	// blended ("UNNEST-style") table-in-out whose positional args ARE its per-row
+	// input columns.
+	info.input_from_args = row["input_from_args"].value_or(false);
+
 	// Required settings for this function (list of strings)
 	info.required_settings = row["required_settings"].value_or(std::vector<std::string> {});
 

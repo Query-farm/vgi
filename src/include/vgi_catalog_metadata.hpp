@@ -540,6 +540,14 @@ struct VgiFunctionInfo {
 	// with sink_order_dependent.
 	bool requires_input_batch_index = false;
 
+	// Blended ("UNNEST-style") table-in-out: the function's positional args ARE
+	// its per-row input columns (real typed args, no synthetic TABLE placeholder),
+	// so ONE registration serves f(52,13) (literal), FROM t, f(t.x,t.y) (columns),
+	// and LATERAL f(t.x,t.y). The registration enters the in-out branch on this
+	// flag even without a TABLE-typed arg, and bind builds the input schema from
+	// the declared arg names + drives the literal single-row scan-mode.
+	bool input_from_args = false;
+
 	// Settings required by this function (must be set before invocation)
 	std::vector<std::string> required_settings;
 
