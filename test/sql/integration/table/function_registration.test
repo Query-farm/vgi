@@ -72,10 +72,11 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 # 1 parallel-streaming-finalize fixture (substream_partial_sum, a streaming
 #   TableInOutFunction whose per-substream finalize emits this substream's partial
 #   sum — see table_in_out/parallel_finalize.test)
-# 3 blended ("UNNEST-style") fixtures (geo_encode + geo_encode3, arity-overloaded
+# 4 blended ("UNNEST-style") fixtures (geo_encode + geo_encode3, arity-overloaded
 #   RowTransformFunctions sharing the name "geo_encode"; row_sum, a VARARGS blended
-#   fn — positional args ARE the per-row input columns, one registration serves
-#   literal / column / LATERAL; see table_in_out/blended.test)
+#   fn; blended_drop, a 1->0 scan-mode edge-case map — positional args ARE the
+#   per-row input columns, one registration serves literal / column / LATERAL; see
+#   table_in_out/blended.test)
 # 12 result-cache fixtures (cacheable_numbers, cache_nonce, cache_no_store,
 #   cache_scoped_txn, cache_big, cache_multicol, cache_revalidatable, cache_whoami,
 #   cache_versioned_scan, cache_projection, cache_poison, cache_external_fail —
@@ -94,13 +95,13 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 #   filter_bytes keys distinct entries, backs cache/filter_pushdown_keys.test, ALSO a data
 #   Table (surfaces as a table); cache_partitioned — single-value partition_values through
 #   the spill blob, backs cache/spill_partition_values.test)
-# = 125
+# = 126
 query I
 SELECT COUNT(*)
 FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'table';
 ----
-125
+126
 
 # The 34 pure table functions (no TABLE parameter type)
 # Note: make_series appears 5 times (5 overloads), make_pairs appears 3 times,

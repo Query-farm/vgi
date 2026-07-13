@@ -146,5 +146,39 @@ SELECT row_sum FROM (VALUES (1.0, 2.0)) v(a, b), ex.row_sum(v.a, v.b, nope := tr
 ----
 Invalid named parameter
 
+# a reserved SQL keyword works as a named param when quoted (literal form)
+query I
+SELECT geohash FROM ex.geo_encode(52.5, 13.4, "precision" := 1);
+----
+52.5:13.4
+
+# ---------------------------------------------------------------------------
+# edge cases (senior-review C1/M1)
+# ---------------------------------------------------------------------------
+
+# 1 -> 0 at the WORKER: a blended map whose whole output for the single input row
+# is a 0-row batch. The literal scan-mode must skip the empty batch and finish
+# cleanly at true EOS — NOT infinite-loop re-feeding the PhysicalTableScan input.
+query I
+SELECT count(*) FROM ex.blended_drop(1.0);
+----
+0
+
+# zero-varargs childless call: row_sum() has no input columns -> the childless
+# scan-mode path with an empty input schema (M1 all-names-empty signal). The point
+# is it must COMPLETE (no infinite-loop hang), not a specific row count: over
+# subprocess it yields one 0.0 row, but over HTTP a 0-column input batch loses its
+# row count (an Arrow-IPC quirk) so the worker sees no rows and emits none. Assert
+# only that it runs cleanly on both transports.
+statement ok
+SELECT row_sum FROM ex.row_sum();
+
+# an AS alias in a table-function argument position is a parser error (so the
+# named-vs-alias ambiguity for input columns never arises — you cannot write it).
+statement error
+SELECT * FROM (VALUES (1.0, 2.0)) v(a, b), ex.geo_encode(v.a AS foo, v.b);
+----
+syntax error
+
 statement ok
 DETACH ex;

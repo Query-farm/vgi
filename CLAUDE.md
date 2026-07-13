@@ -71,6 +71,7 @@ This uses `test/run_http_integration.sh` which starts an HTTP server (`vgi-serve
 - `partitioned_sequence.test` — partition-local state not preserved across HTTP exchanges
 - `buffer_input/sizes.test`, `buffer_input/scale.test_slow` — input buffering semantics differ
 - `order_preservation_modes.test` — under HTTP, DuckDB allocates one `FunctionConnection` per worker thread eagerly, so `FIXED_ORDER` (which serializes the pipeline source to a single thread of *execution*) still surfaces N distinct `conn=` ids in the per-batch logs. Subprocess transport collapses to 1 distinct `conn=` because only one worker is actually acquired from the pool. The assertion is meaningful on subprocess only.
+- **Zero-column blended input** (`blended.test` `row_sum()` — a pure-varargs blended call with NO input columns): an Arrow-IPC RecordBatch with no arrays defaults to 0 rows, so over HTTP the worker sees no input row and emits nothing (subprocess yields one 0.0 row). Same root cause as the scalar `SELECT func()` 0-column workaround. The childless scan-mode still terminates cleanly on both transports (no hang) — the test asserts only that, not the row count. Any *non-empty* blended call is unaffected.
 
 ### Container Transport (OCI/Docker)
 
@@ -938,6 +939,78 @@ worker fleet agrees on it; `substream_id` does not). The framework's default
 `execution_id`-keyed `BoundStorage` already isolates per substream over both
 transports; `substream_id` is the explicit key for workers that manage
 cross-backend state themselves. Additive + nullable → old workers ignore it.
+
+### Blended ("UNNEST-style") Table Functions
+
+A **blended** table-in-out function's **positional args ARE its per-row input
+columns** (real typed args, no synthetic `LogicalType::TABLE` placeholder), so ONE
+registration serves every call shape — exactly like native `UNNEST`:
+
+```sql
+SELECT * FROM cat.main.forecast_current(52.52, 13.41);          -- literal (1 input row)
+SELECT * FROM points p, cat.main.forecast_current(p.x, p.y);   -- columns (streaming)
+SELECT * FROM points p, LATERAL cat.main.forecast_current(p.x, p.y);
+```
+
+**Opt-in (vgi-python).** Subclass `RowTransformFunction(TableInOutGenerator)` — the
+base class *is* the signal (not a `Meta` flag, which could be forgotten on one of N
+same-named overloads). Positional `Arg`s are the input columns (read from `batch`
+by declared name, or positionally via `input_columns(batch)` for varargs); named
+(`str`-position) `Arg`s stay bind-time scalars on `params.args`. Map-shaped, **no
+finalize** (DuckDB forbids `FinalExecute` under correlated LATERAL, one of the call
+shapes). `resolve_metadata` sets `ResolvedMetadata.input_from_args` and rejects the
+foot-guns: a finalize override, a `TableInput` arg, a positional `const` arg, or
+zero positional args. `function_type` stays `TABLE`.
+
+**C++.** Advertised as `VgiFunctionInfo.input_from_args`. Registration enters the
+`in_out_function` branch on `HasTableInput() || input_from_args`
+(`vgi_table_function_set.cpp`); a blended function's `positional_types` are real
+value types (no TABLE marker) and its varargs set `table_func.varargs`. Bind
+(`VgiTableInOutBind`) builds the worker input schema from the **declared positional
+arg names** (the worker reads columns by name) + the input-provided types,
+**ignoring** `input_table_names` (empty in the literal shape; for pure-varargs falls
+back to `col0..colN-1`), and sets `single_row_scan` when all input names are empty
+(the childless literal shape).
+
+**Literal scan-mode (the load-bearing fix).** The literal shape is driven by
+`PhysicalTableScan`, which acts as a SOURCE: it re-invokes the callback with the
+SAME cardinality-1 input chunk and decides flow SOLELY on `chunk.size()` (it
+**discards** the returned `OperatorResultType`). So `VgiTableInOutFunction`'s
+`single_row_scan` branch writes the one synthesized input row **once**,
+`CloseInputWriter()`s so the worker reaches EOS, then drains to EOS **inside the
+call** (skipping empty-but-not-EOS batches), returning a 0-row chunk **only** at
+true EOS — otherwise the query infinite-loops. The scan-mode worker is
+cancel-not-pooled on EOS. The column/LATERAL shapes use the normal streaming
+`PhysicalTableInOutFunction` path unchanged.
+
+**Overloads + varargs.** Same-name overloads (`geo_encode` 2-arg + 3-arg) are legal
+because blended uses real value types (the `bind_table_function.cpp` TABLE-overload
+restriction doesn't apply). The worker's `_match_function_arguments` resolves a
+blended overload by **input-column count** (positional args aren't on the wire);
+same-arity ties disambiguate via `_filter_by_argument_types` scoring the declared
+types against the **input schema** (coercibly — a literal delivers `DECIMAL` where
+the declared type is `DOUBLE`).
+
+**Inline named args (Haybarn engine patch, `haybarn-v1.5.4-rc3`).** Named args in
+the literal form always worked (STANDARD bind path). The column/LATERAL form needed
+a binder patch: the `TABLE_IN_OUT_FUNCTION` branch in
+`duckdb/src/planner/binder/tableref/bind_table_function.cpp` swept ALL expressions
+into the input subquery before named-param extraction, so `f(t.x, t.y, opt := 5)`
+became a phantom input column. The patch partitions inline named args (`:=`/alias;
+never SUBQUERY children — those are the classic TABLE input) into `named_parameters`
+before `BindTableInTableOutFunction`. An `AS` alias in an arg position is a **parser
+error** (so the named-vs-alias ambiguity never arises). A named value referencing an
+outer column throws the normal "does not support lateral join column parameters".
+
+**Files.** vgi-python: `RowTransformFunction` in `vgi/table_in_out_function.py`,
+`input_from_args` in `vgi/metadata.py` + `vgi/catalog/catalog_interface.py`,
+`_parse_arguments(blended=...)` / `_is_blended()` in `vgi/table_function.py`, overload
+resolution in `vgi/worker.py`, fixtures (`GeoEncodeFunction` / `GeoEncode3Function` /
+`RowSumFunction` / `BlendedDropFunction`) in `_test_fixtures/table_in_out.py`. C++:
+`vgi_table_in_out_impl.{cpp,hpp}` (bind + scan-mode), `vgi_table_function_set.cpp`
+(registration), `vgi_catalog_metadata.hpp` + `vgi_catalog_api.cpp` (parse). Tests:
+`test/sql/integration/table_in_out/blended.test` (both transports),
+`vgi-python/tests/table_in_out/test_blended_metadata.py`.
 
 ### Buffered Table Functions
 
