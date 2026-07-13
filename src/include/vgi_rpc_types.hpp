@@ -210,7 +210,8 @@ std::shared_ptr<arrow::RecordBatch> BuildInitRequest(
     int64_t order_by_limit = -1,                     // -1 = null
     double tablesample_percentage = -1.0,            // -1.0 = null (no sample)
     int64_t tablesample_seed = -1,                   // -1 = null (no seed)
-    const std::optional<std::vector<uint8_t>> &finalize_state_id = std::nullopt);  // TABLE_BUFFERING_FINALIZE only
+    const std::optional<std::vector<uint8_t>> &finalize_state_id = std::nullopt,  // TABLE_BUFFERING_FINALIZE only
+    const std::vector<uint8_t> &substream_id = {});  // parallel streaming table-in-out per-substream id
 
 // ============================================================================
 // GlobalInitResponse

@@ -21,8 +21,34 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/config.hpp"
 
+#include <atomic>
+#include <random>
+
 namespace duckdb {
 namespace vgi {
+
+// Mint a stable, process-unique id for one streaming table-in-out substream.
+// Layout: 8-byte process salt (random, once per process) || 8-byte monotonic
+// counter, little-endian. The salt makes ids unique ACROSS DuckDB processes
+// that share one HTTP worker fleet + shared storage (so two processes' substream
+// #1 never collide); the counter makes them unique WITHIN a process (across
+// substreams and across queries reusing the same attach). Per-substream worker
+// state is additionally attach-sharded worker-side, so uniqueness only has to
+// hold within a shared-storage namespace — this comfortably does.
+static std::vector<uint8_t> MintSubstreamId() {
+	static const uint64_t salt = [] {
+		std::random_device rd;
+		return (static_cast<uint64_t>(rd()) << 32) ^ static_cast<uint64_t>(rd());
+	}();
+	static std::atomic<uint64_t> counter {0};
+	uint64_t n = counter.fetch_add(1, std::memory_order_relaxed);
+	std::vector<uint8_t> id(16);
+	for (int i = 0; i < 8; ++i) {
+		id[i] = static_cast<uint8_t>((salt >> (8 * i)) & 0xFF);
+		id[8 + i] = static_cast<uint8_t>((n >> (8 * i)) & 0xFF);
+	}
+	return id;
+}
 
 // ============================================================================
 // Bind Data for Table-In-Out Functions
@@ -49,6 +75,8 @@ unique_ptr<FunctionData> VgiTableInOutBindData::Copy() const {
 	copy->source_order_dependent = source_order_dependent;
 	copy->sink_order_dependent = sink_order_dependent;
 	copy->requires_input_batch_index = requires_input_batch_index;
+	copy->parallel_safe = parallel_safe;
+	copy->has_finalize = has_finalize;
 	return copy;
 }
 
@@ -117,6 +145,25 @@ unique_ptr<FunctionData> VgiTableInOutBind(ClientContext &context, TableFunction
 	bind_data->requires_input_batch_index = params.requires_input_batch_index;
 	bind_data->projection_pushdown = params.projection_pushdown;
 	bind_data->filter_pushdown = params.filter_pushdown;
+	// Phase A: a streaming table-in-out function is a per-substream map, so it
+	// parallelizes by default — one worker per substream (per PipelineExecutor).
+	// This holds EVEN with a finalize callback: with per-substream workers each
+	// FinalExecute runs on the substream's OWN worker over its OWN state, so the
+	// per-substream finalize is correct (the DuckDB #18222 corruption was a
+	// *shared* worker seeing N FinalExecutes; that is exactly what per-substream
+	// fan-out removes). A global cross-substream combine is NOT a streaming
+	// table-in-out — it is a TableBufferingFunction. `has_finalize` (derived from
+	// the actual registered callback, the single source of truth) tells Execute
+	// to leave the connection open at input-EOS so the per-substream FINALIZE can
+	// reuse it. `max_workers=1` (A3) is the serial opt-out for a not-yet-migrated
+	// worker.
+	bind_data->has_finalize = static_cast<bool>(input.table_function.in_out_function_final);
+	// A3 serial opt-out: Meta.max_workers=1 forces the single-shared-worker path
+	// (MaxThreads()=1). 0/unset or >1 keeps the parallel-by-default per-substream
+	// fan-out. (A hard N-worker cap for max_workers>1 is not modeled here — the
+	// per-substream model spawns one worker per substream; only the ==1 serial
+	// case is honored, matching the pure-table path's use of the same field.)
+	bind_data->parallel_safe = (params.max_workers != 1);
 
 	// Build arguments from the regular (non-TABLE) inputs
 	// input.inputs contains positional arguments, but TABLE arguments are represented as NULL
@@ -235,6 +282,8 @@ unique_ptr<FunctionData> VgiTableInOutBind(ClientContext &context, TableFunction
 unique_ptr<GlobalTableFunctionState> VgiTableInOutInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
 	auto &bind_data = input.bind_data->Cast<VgiTableInOutBindData>();
 	auto global_state = make_uniq<VgiTableInOutGlobalState>(context.db.get());
+	// Phase A: MaxThreads() reads this. Derived at bind from the finalize callback.
+	global_state->parallel_safe = bind_data.parallel_safe;
 	{
 		Value v;
 		if (context.TryGetCurrentSetting("vgi_cancel_enabled", v)) {
@@ -242,24 +291,6 @@ unique_ptr<GlobalTableFunctionState> VgiTableInOutInitGlobal(ClientContext &cont
 		}
 	}
 
-	// Acquire a connection without firing a redundant bind RPC. The
-	// planner-phase BindResult is already cached on bind_data; PerformInit's
-	// payload carries it inline. AcquireConnectionForInit pool-hits when
-	// possible (subprocess) or constructs a fresh HTTP connection, and wires
-	// SetInputSchema for the typed-input-stream protocol.
-	FunctionConnectionParams acquire_params;
-	acquire_params.attach_params = bind_data.attach_params;
-	acquire_params.attach_opaque_data = bind_data.attach_opaque_data;
-	acquire_params.function_name = bind_data.function_name;
-	acquire_params.arguments = bind_data.arguments;
-	acquire_params.transaction_opaque_data = bind_data.transaction_opaque_data;
-	acquire_params.settings = bind_data.settings;
-	acquire_params.required_secrets = bind_data.required_secrets;
-	acquire_params.phase = "init_global";
-	acquire_params.function_type = "TABLE";
-	acquire_params.input_schema = bind_data.input_schema;
-	auto acquired = AcquireConnectionForInit(context, acquire_params);
-	auto connection = std::move(acquired.connection);
 	global_state->bind_result = bind_data.bind_result;
 
 	// Capture projection + filter pushdown from the TableFunctionInitInput.
@@ -320,40 +351,57 @@ unique_ptr<GlobalTableFunctionState> VgiTableInOutInitGlobal(ClientContext &cont
 		}
 	}
 
-	// Perform init with phase=INPUT for table-in-out functions. Init is the
-	// first RPC after acquire, so stale-pool detection lives here: a pooled
-	// subprocess that died while idle surfaces as IOException, and we retry
-	// once with a forced-fresh connection. HTTP transport never enters the
-	// retry branch (from_pool is always false there).
-	InitResult init_result;
-	try {
-		init_result = connection->PerformInit(global_state->bind_result,
-		                                       global_state->projection_ids,
-		                                       global_state->static_filter_bytes,
-		                                       global_state->join_keys_buffers, "INPUT");
-	} catch (const IOException &e) {
-		if (!acquired.from_pool) {
-			throw;
+	// Phase A: a parallel (no-finalize) function fans out one worker PER SUBSTREAM
+	// — each VgiTableInOutLocalState lazily acquires + inits its own pooled worker
+	// in VgiTableInOutFunction (no shared global connection, no exchange mutex),
+	// so skip the shared-connection acquire here. A finalize function keeps the
+	// single shared connection (serial path below).
+	if (!global_state->parallel_safe) {
+		// Acquire a connection without firing a redundant bind RPC. The
+		// planner-phase BindResult is already cached on bind_data; PerformInit's
+		// payload carries it inline. AcquireConnectionForInit pool-hits when
+		// possible (subprocess) or constructs a fresh HTTP connection.
+		FunctionConnectionParams acquire_params;
+		acquire_params.attach_params = bind_data.attach_params;
+		acquire_params.attach_opaque_data = bind_data.attach_opaque_data;
+		acquire_params.function_name = bind_data.function_name;
+		acquire_params.arguments = bind_data.arguments;
+		acquire_params.transaction_opaque_data = bind_data.transaction_opaque_data;
+		acquire_params.settings = bind_data.settings;
+		acquire_params.required_secrets = bind_data.required_secrets;
+		acquire_params.phase = "init_global";
+		acquire_params.function_type = "TABLE";
+		acquire_params.input_schema = bind_data.input_schema;
+		auto acquired = AcquireConnectionForInit(context, acquire_params);
+		auto connection = std::move(acquired.connection);
+
+		// Perform init with phase=INPUT. Init is the first RPC after acquire, so
+		// stale-pool detection lives here: a pooled subprocess that died while idle
+		// surfaces as IOException, and we retry once with a forced-fresh connection.
+		InitResult init_result;
+		try {
+			init_result = connection->PerformInit(global_state->bind_result, global_state->projection_ids,
+			                                      global_state->static_filter_bytes,
+			                                      global_state->join_keys_buffers, "INPUT");
+		} catch (const IOException &e) {
+			if (!acquired.from_pool) {
+				throw;
+			}
+			VGI_LOG(context, "worker_pool.stale",
+			        {{"worker_path", bind_data.worker_path()},
+			         {"function_name", bind_data.function_name},
+			         {"phase", "init_global"},
+			         {"error", e.what()}});
+			acquired = AcquireConnectionForInit(context, acquire_params, /*force_fresh=*/true);
+			connection = std::move(acquired.connection);
+			init_result = connection->PerformInit(global_state->bind_result, global_state->projection_ids,
+			                                      global_state->static_filter_bytes,
+			                                      global_state->join_keys_buffers, "INPUT");
 		}
-		VGI_LOG(context, "worker_pool.stale",
-		        {{"worker_path", bind_data.worker_path()},
-		         {"function_name", bind_data.function_name},
-		         {"phase", "init_global"},
-		         {"error", e.what()}});
-		acquired = AcquireConnectionForInit(context, acquire_params, /*force_fresh=*/true);
-		connection = std::move(acquired.connection);
-		init_result = connection->PerformInit(global_state->bind_result,
-		                                       global_state->projection_ids,
-		                                       global_state->static_filter_bytes,
-		                                       global_state->join_keys_buffers, "INPUT");
+		global_state->global_execution_id = std::move(init_result.execution_id);
+		connection->OpenInputWriter();
+		global_state->connection = std::move(connection);
 	}
-	global_state->global_execution_id = std::move(init_result.execution_id);
-
-	// Open the input writer for Stream 5
-	connection->OpenInputWriter();
-
-	// Store the connection
-	global_state->connection = std::move(connection);
 
 	VGI_LOG(context, "table_in_out.init_global",
 	        {{"worker_path", bind_data.worker_path()}, {"function_name", bind_data.function_name}});
@@ -377,6 +425,12 @@ unique_ptr<LocalTableFunctionState> VgiTableInOutInitLocal(ExecutionContext &con
 			local_state->column_ids = gstate.column_ids;
 		}
 	}
+	// Phase A: mint this substream's stable id (one InitLocal call == one
+	// substream == one PipelineExecutor; the spike proved Execute↔FinalExecute
+	// run on the SAME local state, so a single mint here is stable across the
+	// substream's whole life). See MintSubstreamId for the encoding / uniqueness
+	// rationale, and VgiTableInOutLocalState::substream_id for the contract.
+	local_state->substream_id = MintSubstreamId();
 	return local_state;
 }
 
@@ -469,6 +523,71 @@ static idx_t ProduceOutputFromBatch(VgiTableInOutLocalState &local_state, const 
 }
 
 // ============================================================================
+// Phase A: per-substream worker helpers (parallel, no-finalize path)
+// ============================================================================
+
+// Acquire + init a fresh worker for ONE substream (one VgiTableInOutLocalState).
+// Mirrors the serial InitGlobal acquire, reading the already-captured
+// bind_result / projection / filter state off the global state.
+static std::unique_ptr<IFunctionConnection>
+AcquireSubstreamConnection(ClientContext &context, const VgiTableInOutBindData &bind_data,
+                           VgiTableInOutGlobalState &gstate, const std::vector<uint8_t> &substream_id) {
+	FunctionConnectionParams p;
+	p.attach_params = bind_data.attach_params;
+	p.attach_opaque_data = bind_data.attach_opaque_data;
+	p.function_name = bind_data.function_name;
+	p.arguments = bind_data.arguments;
+	p.transaction_opaque_data = bind_data.transaction_opaque_data;
+	p.settings = bind_data.settings;
+	p.required_secrets = bind_data.required_secrets;
+	p.phase = "init_substream";
+	p.function_type = "TABLE";
+	p.input_schema = bind_data.input_schema;
+	auto acquired = AcquireConnectionForInit(context, p);
+	auto conn = std::move(acquired.connection);
+	// Stamp the per-substream id BEFORE PerformInit so it rides the INPUT init
+	// request (and, later, this same connection's FINALIZE init) on the wire.
+	conn->SetSubstreamId(substream_id);
+	try {
+		conn->PerformInit(gstate.bind_result, gstate.projection_ids, gstate.static_filter_bytes,
+		                  gstate.join_keys_buffers, "INPUT");
+	} catch (const IOException &) {
+		if (!acquired.from_pool) {
+			throw;
+		}
+		acquired = AcquireConnectionForInit(context, p, /*force_fresh=*/true);
+		conn = std::move(acquired.connection);
+		conn->SetSubstreamId(substream_id);
+		conn->PerformInit(gstate.bind_result, gstate.projection_ids, gstate.static_filter_bytes,
+		                  gstate.join_keys_buffers, "INPUT");
+	}
+	conn->OpenInputWriter();
+	return conn;
+}
+
+// Return a substream's worker to the pool at clean end-of-stream. On early
+// termination the local-state destructor drops the connection (unique_ptr),
+// which is safe (a mid-stream worker is never pooled).
+static void ReleaseSubstreamConnection(std::unique_ptr<IFunctionConnection> &conn,
+                                       const VgiTableInOutBindData &bind_data, ClientContext &context) {
+	if (conn && bind_data.use_pool()) {
+		auto release_conn_id = conn->GetConnIdHex();
+		if (auto pooled = conn->ReleaseForPooling()) {
+			auto released_pid = pooled->GetPid();
+			auto rr = VgiWorkerPool::Instance().Release(std::move(pooled));
+			PoolReleaseLogFields lf;
+			lf.conn_id = release_conn_id;
+			lf.worker_path = bind_data.worker_path();
+			lf.function_name = bind_data.function_name;
+			lf.worker_pid = released_pid;
+			lf.event_name = "table_in_out.pool_release";
+			LogWorkerPoolRelease(context, lf, rr.pooled, rr.skip_reason, rr.pool_size, rr.total_pool_size);
+		}
+	}
+	conn.reset();
+}
+
+// ============================================================================
 // In-Out Function (Main Processing)
 // ============================================================================
 
@@ -497,15 +616,26 @@ OperatorResultType VgiTableInOutFunction(ExecutionContext &context, TableFunctio
 		    "streaming TableInOutGenerator shape.", bind_data.function_name);
 	}
 
-	if (!global_state.connection) {
+	// Phase A: select the exchange connection. A parallel (no-finalize) function
+	// uses THIS substream's own worker (per-substream fan-out) — acquired lazily
+	// here on first use, and NOT shared, so no exchange mutex. A finalize function
+	// uses the single shared global connection under exchange_mutex (serial path).
+	const bool parallel = global_state.parallel_safe;
+	if (parallel) {
+		if (!local_state.connection) {
+			local_state.connection =
+			    AcquireSubstreamConnection(client_context, bind_data, global_state, local_state.substream_id);
+		}
+	} else if (!global_state.connection) {
 		throw InternalException("VgiTableInOutFunction: connection is null");
 	}
+	IFunctionConnection &conn = parallel ? *local_state.connection : *global_state.connection;
 
 	// Continue producing rows from a batch that exceeded STANDARD_VECTOR_SIZE
 	if (HasRemainingBatchData(local_state)) {
 		idx_t rows_copied = ProduceOutputFromBatch(local_state, bind_data.arrow_table, output, bind_data.projection_pushdown);
 		VGI_LOG(client_context, "table_in_out.read_output",
-		        {{"conn", global_state.connection->GetConnIdHex()},
+		        {{"conn", conn.GetConnIdHex()},
 		         {"worker_path", bind_data.worker_path()},
 		         {"function_name", bind_data.function_name},
 		         {"output_rows", std::to_string(rows_copied)}});
@@ -523,20 +653,21 @@ OperatorResultType VgiTableInOutFunction(ExecutionContext &context, TableFunctio
 		input_batch = DataChunkToArrow(client_context, input, bind_data.input_schema);
 	}
 
-	// The write→read exchange below shares ONE `connection` across every source
-	// sub-pipeline of this operator. Under UNION ALL, DuckDB feeds the operator
-	// from multiple source sub-pipelines whose PipelineExecutors may run
-	// concurrently (MaxThreads()=1 serializes only WITHIN one pipeline). Without
-	// serialization their WriteInputBatch/ReadDataBatch calls interleave on the
-	// single IPC stream and desync the worker's schema-first reader ("Invalid
-	// flatbuffers message"). Hold the lock across the whole 1:1 write→read so
-	// each batch's exchange on the connection is atomic.
+	// The 1:1 write→read exchange. SERIAL (finalize) path: the ONE shared
+	// `connection` is fed by multiple source sub-pipelines under UNION ALL whose
+	// PipelineExecutors may run concurrently, so hold `exchange_mutex` across the
+	// whole write→read (else their calls interleave on the single IPC stream and
+	// desync the worker's schema-first reader). PARALLEL path: this substream owns
+	// its connection exclusively, so no lock is needed.
 	std::shared_ptr<arrow::RecordBatch> output_batch;
 	{
-		std::lock_guard<std::mutex> exchange_guard(global_state.exchange_mutex);
+		std::unique_lock<std::mutex> exchange_guard;
+		if (!parallel) {
+			exchange_guard = std::unique_lock<std::mutex>(global_state.exchange_mutex);
+		}
 
 		VGI_LOG(client_context, "table_in_out.write_input",
-		        {{"conn", global_state.connection->GetConnIdHex()},
+		        {{"conn", conn.GetConnIdHex()},
 		         {"worker_path", bind_data.worker_path()},
 		         {"function_name", bind_data.function_name},
 		         {"input_rows", std::to_string(input_batch->num_rows())}});
@@ -544,24 +675,34 @@ OperatorResultType VgiTableInOutFunction(ExecutionContext &context, TableFunctio
 		// Write the input batch to the worker
 		if (timing) {
 			ScopedNs _t(ClientTiming::Instance().write_ns);
-			global_state.connection->WriteInputBatch(input_batch);
+			conn.WriteInputBatch(input_batch);
 		} else {
-			global_state.connection->WriteInputBatch(input_batch);
+			conn.WriteInputBatch(input_batch);
 		}
 
 		// Read output batch (1:1 lockstep in exchange mode)
 		if (timing) {
 			ScopedNs _t(ClientTiming::Instance().read_ns);
-			output_batch = global_state.connection->ReadDataBatch();
+			output_batch = conn.ReadDataBatch();
 		} else {
-			output_batch = global_state.connection->ReadDataBatch();
+			output_batch = conn.ReadDataBatch();
 		}
 	}
 
 	if (!output_batch) {
 		// EOS - stream exhausted
 		output.SetCardinality(0);
-		global_state.stream_finished = true;
+		if (parallel) {
+			// A no-finalize map is done here — return its substream worker to the
+			// pool. A finalize function must KEEP its substream connection open so
+			// the per-substream VgiTableInOutFinalize can drive the FINALIZE phase
+			// on the same worker (it releases the connection at finalize-EOS).
+			if (!bind_data.has_finalize) {
+				ReleaseSubstreamConnection(local_state.connection, bind_data, client_context);
+			}
+		} else {
+			global_state.stream_finished = true;
+		}
 		return OperatorResultType::FINISHED;
 	}
 
@@ -584,7 +725,7 @@ OperatorResultType VgiTableInOutFunction(ExecutionContext &context, TableFunctio
 	}
 
 	VGI_LOG(client_context, "table_in_out.read_output",
-	        {{"conn", global_state.connection->GetConnIdHex()},
+	        {{"conn", conn.GetConnIdHex()},
 	         {"worker_path", bind_data.worker_path()},
 	         {"function_name", bind_data.function_name},
 	         {"output_rows", std::to_string(rows_copied)}});
@@ -614,20 +755,56 @@ OperatorFinalizeResultType VgiTableInOutFinalize(ExecutionContext &context, Tabl
 		    "streaming TableInOutGenerator shape.", bind_data.function_name);
 	}
 
-	if (!global_state.connection) {
+	// Phase A: select the connection this substream finalizes on. PARALLEL path:
+	// each substream drives the FINALIZE phase on its OWN worker (the one that saw
+	// this substream's input), so its per-substream finalize reads its own state.
+	// SERIAL path: the single shared global connection. A parallel substream that
+	// received no input never acquired a connection (null) — nothing to finalize.
+	const bool parallel = global_state.parallel_safe;
+	IFunctionConnection *conn = parallel ? local_state.connection.get() : global_state.connection.get();
+	bool &finalize_sent = parallel ? local_state.finalize_sent : global_state.finalize_sent;
+
+	if (!conn) {
 		global_state.stream_finished = true;
 		return OperatorFinalizeResultType::FINISHED;
 	}
 
-	// Perform finalize init (only once)
+	// Release helper: return `conn` to the pool. PARALLEL path resets the local
+	// unique_ptr after release (a mid-stream/finished substream worker is never
+	// double-released); SERIAL path leaves the global connection in place (its
+	// destructor handles teardown) and only marks the stream finished.
+	auto release_and_finish = [&]() {
+		if (bind_data.use_pool()) {
+			auto release_conn_id = conn->GetConnIdHex();
+			if (auto pooled = conn->ReleaseForPooling()) {
+				auto released_pid = pooled->GetPid();
+				auto rr = VgiWorkerPool::Instance().Release(std::move(pooled));
+				PoolReleaseLogFields lf;
+				lf.conn_id = release_conn_id;
+				lf.worker_path = bind_data.worker_path();
+				lf.function_name = bind_data.function_name;
+				lf.worker_pid = released_pid;
+				lf.event_name = "table_in_out.pool_release";
+				LogWorkerPoolRelease(client_context, lf, rr.pooled, rr.skip_reason, rr.pool_size,
+				                     rr.total_pool_size);
+			}
+		}
+		if (parallel) {
+			local_state.connection.reset();
+		} else {
+			global_state.stream_finished = true;
+		}
+	};
+
+	// Perform finalize init (only once per substream)
 	// This closes current data streams and opens new init with phase=FINALIZE
 	// The worker enters producer mode (tick-based) to emit any finalize output
-	if (global_state.connection->IsTableInOut() && !global_state.connection->IsFinished() && !global_state.finalize_sent) {
-		global_state.connection->PerformFinalizeInit(global_state.bind_result);
-		global_state.finalize_sent = true;
+	if (conn->IsTableInOut() && !conn->IsFinished() && !finalize_sent) {
+		conn->PerformFinalizeInit(global_state.bind_result);
+		finalize_sent = true;
 
 		VGI_LOG(client_context, "table_in_out.finalize",
-		        {{"conn", global_state.connection->GetConnIdHex()},
+		        {{"conn", conn->GetConnIdHex()},
 		         {"worker_path", bind_data.worker_path()},
 		         {"function_name", bind_data.function_name}});
 	}
@@ -636,7 +813,7 @@ OperatorFinalizeResultType VgiTableInOutFinalize(ExecutionContext &context, Tabl
 	if (HasRemainingBatchData(local_state)) {
 		idx_t rows_copied = ProduceOutputFromBatch(local_state, bind_data.arrow_table, output, bind_data.projection_pushdown);
 		VGI_LOG(client_context, "table_in_out.finalize_output",
-		        {{"conn", global_state.connection->GetConnIdHex()},
+		        {{"conn", conn->GetConnIdHex()},
 		         {"worker_path", bind_data.worker_path()},
 		         {"function_name", bind_data.function_name},
 		         {"output_rows", std::to_string(rows_copied)}});
@@ -647,29 +824,14 @@ OperatorFinalizeResultType VgiTableInOutFinalize(ExecutionContext &context, Tabl
 
 	// Read next output batch from worker
 	VGI_LOG(client_context, "table_in_out.finalize_reading",
-	        {{"conn", global_state.connection->GetConnIdHex()},
+	        {{"conn", conn->GetConnIdHex()},
 	         {"worker_path", bind_data.worker_path()},
 	         {"function_name", bind_data.function_name}});
-	auto output_batch = global_state.connection->ReadDataBatch();
+	auto output_batch = conn->ReadDataBatch();
 
 	if (!output_batch || output_batch->num_rows() == 0) {
 		// No more output - clean up
-		if (bind_data.use_pool() && global_state.connection) {
-			auto release_conn_id = global_state.connection->GetConnIdHex();
-			if (auto pooled = global_state.connection->ReleaseForPooling()) {
-				auto released_pid = pooled->GetPid();
-				auto rr = VgiWorkerPool::Instance().Release(std::move(pooled));
-				PoolReleaseLogFields lf;
-				lf.conn_id = release_conn_id;
-				lf.worker_path = bind_data.worker_path();
-				lf.function_name = bind_data.function_name;
-				lf.worker_pid = released_pid;
-				lf.event_name = "table_in_out.pool_release";
-				LogWorkerPoolRelease(client_context, lf, rr.pooled, rr.skip_reason, rr.pool_size,
-				                     rr.total_pool_size);
-			}
-		}
-		global_state.stream_finished = true;
+		release_and_finish();
 		return OperatorFinalizeResultType::FINISHED;
 	}
 
@@ -678,29 +840,14 @@ OperatorFinalizeResultType VgiTableInOutFinalize(ExecutionContext &context, Tabl
 	idx_t rows_copied = ProduceOutputFromBatch(local_state, bind_data.arrow_table, output, bind_data.projection_pushdown);
 
 	VGI_LOG(client_context, "table_in_out.finalize_output",
-	        {{"conn", global_state.connection->GetConnIdHex()},
+	        {{"conn", conn->GetConnIdHex()},
 	         {"worker_path", bind_data.worker_path()},
 	         {"function_name", bind_data.function_name},
 	         {"output_rows", std::to_string(rows_copied)}});
 
 	// Check if worker is finished and we've exhausted the current batch
-	if (!HasRemainingBatchData(local_state) && global_state.connection->IsFinished()) {
-		if (bind_data.use_pool()) {
-			auto release_conn_id = global_state.connection->GetConnIdHex();
-			if (auto pooled = global_state.connection->ReleaseForPooling()) {
-				auto released_pid = pooled->GetPid();
-				auto rr = VgiWorkerPool::Instance().Release(std::move(pooled));
-				PoolReleaseLogFields lf;
-				lf.conn_id = release_conn_id;
-				lf.worker_path = bind_data.worker_path();
-				lf.function_name = bind_data.function_name;
-				lf.worker_pid = released_pid;
-				lf.event_name = "table_in_out.pool_release";
-				LogWorkerPoolRelease(client_context, lf, rr.pooled, rr.skip_reason, rr.pool_size,
-				                     rr.total_pool_size);
-			}
-		}
-		global_state.stream_finished = true;
+	if (!HasRemainingBatchData(local_state) && conn->IsFinished()) {
+		release_and_finish();
 		return OperatorFinalizeResultType::FINISHED;
 	}
 

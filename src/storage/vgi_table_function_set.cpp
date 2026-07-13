@@ -226,6 +226,9 @@ static unique_ptr<FunctionData> VgiCatalogTableInOutFunctionBind(ClientContext &
 	params.requires_input_batch_index = vgi_info.function_info().requires_input_batch_index;
 	params.projection_pushdown = vgi_info.function_info().projection_pushdown.value_or(false);
 	params.filter_pushdown = vgi_info.function_info().filter_pushdown.value_or(false);
+	// A3 serial opt-out: a worker that declares Meta.max_workers=1 keeps its
+	// streaming table-in-out on a single shared worker (MaxThreads()=1).
+	params.max_workers = vgi_info.function_info().max_workers.value_or(0);
 
 	// Validate required settings
 	const auto &required_settings = vgi_info.function_info().required_settings;

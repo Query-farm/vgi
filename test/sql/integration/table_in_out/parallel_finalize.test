@@ -1,0 +1,88 @@
+# name: test/sql/integration/table_in_out/parallel_finalize.test
+# description: Phase A (A4) — a STREAMING table-in-out function WITH a finalize
+#   now parallelizes across per-substream workers. `substream_partial_sum`
+#   accumulates each substream's rows in transform() (emitting nothing) and emits
+#   ONE partial-sum row per substream at finalize(); DuckDB unions the substreams'
+#   finalize outputs, so an outer SELECT sum() re-aggregates to the global total.
+#
+#   Correctness is deterministic no matter how many substreams DuckDB spins up, so
+#   we deliberately drive the fixture from sources that DO fan out to >1 substream:
+#     * a TEMP TABLE scan (a parallelizable source — a single range() subquery,
+#       by contrast, stays one substream), and
+#     * UNION ALL of N calls (each branch is its own substream, so >= N of them).
+#   Under threads=8 + pool false (a fresh worker per substream acquire), if any
+#   substream's finalize were skipped, hit a stateless worker, or read another
+#   substream's accumulated state, these totals would be wrong. This is the
+#   per-substream finalize contract A4 enables (a GLOBAL cross-substream combine
+#   is a TableBufferingFunction; see distributed_sum.test).
+# group: [vgi_integration_table_in_out]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+# HTTP transport ATTACH needs httpfs loaded (else a "VGI HTTP transport requires
+# the httpfs extension" error — containing "HTTP" — makes the harness silently
+# skip the whole file). Harmless on subprocess.
+require httpfs
+
+# pool false → every substream acquire spawns a FRESH worker, so per-substream
+# finalize state that leaked onto a shared worker would surface as a wrong total.
+statement ok
+ATTACH 'example' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}', pool false);
+
+statement ok
+SET threads=8;
+
+# A parallelizable source: a materialized table scan fans out across substreams
+# (unlike a single range() subquery, which stays one substream).
+statement ok
+CREATE TEMP TABLE big AS SELECT i AS n FROM range(1, 100001) t(i);
+
+# sum(1..100000) = 5000050000 — re-aggregated from every substream's partial.
+query I
+SELECT sum(n) FROM ex.substream_partial_sum((SELECT n FROM big));
+----
+5000050000
+
+# ---------------------------------------------------------------------------
+# UNION ALL guarantees >= 4 independent substreams (one per branch, each its own
+# per-substream worker + finalize). 4 * 5000050000 = 20000200000.
+# ---------------------------------------------------------------------------
+query I
+SELECT sum(n) FROM (
+    SELECT n FROM ex.substream_partial_sum((SELECT n FROM big))
+    UNION ALL SELECT n FROM ex.substream_partial_sum((SELECT n FROM big))
+    UNION ALL SELECT n FROM ex.substream_partial_sum((SELECT n FROM big))
+    UNION ALL SELECT n FROM ex.substream_partial_sum((SELECT n FROM big))
+) s;
+----
+20000200000
+
+# ---------------------------------------------------------------------------
+# small deterministic case: 1+2+3 = 6, however the rows are partitioned
+# ---------------------------------------------------------------------------
+query I
+SELECT sum(n) FROM ex.substream_partial_sum((SELECT * FROM (VALUES (1),(2),(3)) t(n)));
+----
+6
+
+# ---------------------------------------------------------------------------
+# idempotent re-run over the same fan-out source is still correct
+# ---------------------------------------------------------------------------
+query I
+SELECT sum(n) FROM ex.substream_partial_sum((SELECT n FROM big));
+----
+5000050000
+
+# ---------------------------------------------------------------------------
+# empty input: no substream has rows to partition; assert no crash + no spurious
+# non-zero partial.
+# ---------------------------------------------------------------------------
+query I
+SELECT count(*) FROM ex.substream_partial_sum((SELECT n FROM big WHERE n < 0)) WHERE n <> 0;
+----
+0
+
+statement ok
+DETACH ex;

@@ -883,6 +883,62 @@ VGI uses `vgi_rpc` for RPC over subprocess stdin/stdout or HTTP using Arrow IPC 
 - **Table-in-out functions** — Exchange mode for INPUT phase, producer mode for FINALIZE phase
 - **Buffered table functions** — Sink+Source PhysicalOperator (see below); INPUT batches go to per-thread workers via the `table_buffering_process` RPC, `table_buffering_combine` collapses worker state IDs after Sink, `table_buffering_finalize` drains output per finalize-state-id (streaming RPC, producer mode)
 
+### Parallel Streaming Table-In-Out (per-substream fan-out)
+
+A streaming table-in-out function (`TableInOutGenerator` / `TableInOutFunction`,
+routed through DuckDB's `in_out_function` / `in_out_function_final`) is a
+**per-substream map**: its output depends only on its own input row/batch (+ bind
+args) and, for a finalize function, on the rows *this substream* saw. Under that
+contract every streaming table-in-out is parallel-safe, so
+`VgiTableInOutGlobalState::MaxThreads()` returns `MAX_THREADS` (was hardcoded `1`)
+and each substream (one DuckDB `PipelineExecutor` = one `VgiTableInOutLocalState`)
+lazily acquires its **own** pooled worker on its first `Execute` — no shared
+connection, no `exchange_mutex`. A **global cross-substream combine is NOT a
+streaming table-in-out** — it is a `TableBufferingFunction` (see below).
+`sum_all_columns_simple_distributed` was migrated for exactly this reason; its
+`distributed_sum.test` now exercises the buffered path.
+
+- **No-finalize map** (`echo`, `filter_by_setting`, `repeat_inputs`, blended):
+  each substream streams its 1:1 (or 1:N) exchange on its own worker and returns
+  it to the pool at input-EOS. Regression: `table_in_out/parallel_fanout.test`
+  (`pool false` + `threads=8`, both transports).
+- **Finalize function** (`substream_partial_sum`): `transform()` accumulates this
+  substream's state (framework-persisted to `BoundStorage`, keyed by the
+  substream's own `execution_id`), and `VgiTableInOutFinalize` drives the FINALIZE
+  phase on **this substream's own worker** (`local_state.connection`, with a
+  per-local-state `finalize_sent` latch) — so per-substream `FinalExecute` reads
+  only its own state. This is exactly what DuckDB #18222 could not do with a
+  *shared* worker (N `FinalExecute`s corrupting one accumulator); per-substream
+  workers dissolve it. `Execute` keeps a finalize function's connection open at
+  input-EOS (gated on `bind_data.has_finalize`) so finalize can reuse it.
+  Correlated LATERAL still can't carry a finalize (DuckDB forbids `FinalExecute`
+  under `projected_input`); a finalize function fans out from UNION-ALL branches
+  and parallelizable scans, not from correlated LATERAL. Regression:
+  `table_in_out/parallel_finalize.test` (temp-table + UNION-ALL sources force >1
+  substream; both transports).
+
+**Serial opt-out.** `bind_data.parallel_safe` gates the whole thing (derived at
+bind; `MaxThreads` collapses to 1 and the single shared `global_state.connection`
++ `exchange_mutex` path runs when false). `Meta.max_workers=1` is the intended
+worker-declared serial opt-out for a not-yet-migrated function (see the Settings
+table / A3).
+
+**`substream_id` (per-substream identity on the wire).** Each substream mints a
+stable, process-unique `substream_id` at `InitLocal` (`MintSubstreamId`: 8-byte
+process salt ‖ 8-byte counter) and stamps it on its worker via
+`IFunctionConnection::SetSubstreamId` **before** `PerformInit`, so it rides every
+`InitRequest` that connection builds — INPUT **and** FINALIZE (`FunctionConnection`
+/ `HttpFunctionConnection` carry it as `substream_id_`; `BuildInitRequest` adds the
+nullable `substream_id` column; `InitRequest.substream_id` in `vgi/protocol.py`,
+surfaced to workers as `ProcessParams.substream_id`). It is the stable,
+**client-owned** key a worker can use to find a substream's accumulated state even
+when an HTTP load balancer dispatches that substream's init / process / finalize
+requests to *different* backends (a worker-minted `execution_id` alone assumes the
+worker fleet agrees on it; `substream_id` does not). The framework's default
+`execution_id`-keyed `BoundStorage` already isolates per substream over both
+transports; `substream_id` is the explicit key for workers that manage
+cross-backend state themselves. Additive + nullable → old workers ignore it.
+
 ### Buffered Table Functions
 
 A second registration shape for table-in-out functions that need to **see every

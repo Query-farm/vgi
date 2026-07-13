@@ -707,7 +707,8 @@ BuildInitRequest(const std::vector<uint8_t> &bind_call_bytes, const std::vector<
                  const std::string &order_by_column_name, const std::string &order_by_direction,
                  const std::string &order_by_null_order, int64_t order_by_limit,
                  double tablesample_percentage, int64_t tablesample_seed,
-                 const std::optional<std::vector<uint8_t>> &finalize_state_id) {
+                 const std::optional<std::vector<uint8_t>> &finalize_state_id,
+                 const std::vector<uint8_t> &substream_id) {
 	static const std::vector<std::string> phase_values = {
 	    "INPUT", "FINALIZE", "TABLE_BUFFERING", "TABLE_BUFFERING_FINALIZE",
 	};
@@ -734,6 +735,7 @@ BuildInitRequest(const std::vector<uint8_t> &bind_call_bytes, const std::vector<
 	    arrow::field("tablesample_percentage", arrow::float64(), true),
 	    arrow::field("tablesample_seed", arrow::int64(), true),
 	    arrow::field("finalize_state_id", arrow::binary(), true),
+	    arrow::field("substream_id", arrow::binary(), true),
 	});
 
 	std::vector<std::shared_ptr<arrow::Array>> arrays;
@@ -873,6 +875,11 @@ BuildInitRequest(const std::vector<uint8_t> &bind_call_bytes, const std::vector<
 		}
 		arrays.push_back(FinishArray(builder, "finalize_state_id"));
 	}
+
+	// substream_id: binary|null — stable client-minted per-substream id for the
+	// parallel streaming table-in-out path. Empty => null (serial path / not a
+	// streaming table-in-out). See InitRequest.substream_id in vgi/protocol.py.
+	arrays.push_back(BuildBinaryScalar(substream_id));
 
 	return arrow::RecordBatch::Make(schema, 1, arrays);
 }

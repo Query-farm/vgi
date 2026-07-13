@@ -79,6 +79,16 @@ public:
 		(void)at_value;
 	}
 
+	// Set the stable, client-minted per-substream id carried on the InitRequest
+	// for the parallel streaming table-in-out path (see InitRequest.substream_id).
+	// It is the same for this substream's init / process / finalize, so a
+	// finalize that lands on a different HTTP backend can still key the
+	// substream's shared state. Empty = none (serial path / not table-in-out).
+	// Default no-op: only the real subprocess/HTTP connections override it.
+	virtual void SetSubstreamId(const std::vector<uint8_t> &substream_id) {
+		(void)substream_id;
+	}
+
 	// Set the COPY ... FROM context (source path + target schema) carried into
 	// the bind request so a worker CopyFromFunction reads it at bind/init via
 	// init_call.bind_call.copy_from. Default no-op: only the real

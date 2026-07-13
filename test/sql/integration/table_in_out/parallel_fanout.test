@@ -1,0 +1,105 @@
+# name: test/sql/integration/table_in_out/parallel_fanout.test
+# description: Phase A — parallel per-substream worker fan-out for streaming
+#   table-in/out functions. A NO-finalize function is a per-substream map, so
+#   DuckDB runs the operator on many threads and VGI gives each substream
+#   (PipelineExecutor) its OWN worker (no shared connection / exchange mutex).
+#   This test forces maximal fan-out (`pool false` → a fresh worker per acquire,
+#   threads=8) and asserts results are identical to the single-worker path —
+#   the safety net for the parallel-by-default contract (catches state leakage,
+#   order breakage, and early-termination bugs). A FINALIZE function must stay
+#   single-worker (its finalize is unsound under per-substream parallelism), so
+#   it is exercised here for correctness too.
+# group: [vgi_integration_table_in_out]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+# HTTP transport ATTACH requires httpfs to be loaded (else it throws a "VGI HTTP
+# transport requires the httpfs extension" BinderException — which, containing
+# "HTTP", the test harness silently auto-skips). Harmless on subprocess.
+require httpfs
+
+# pool false → every substream acquire spawns a FRESH worker, so any reliance on
+# a shared worker / on-`self` state surfaces as a wrong answer here.
+statement ok
+ATTACH 'example' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}', pool false);
+
+statement ok
+SET threads=8;
+
+# ---------------------------------------------------------------------------
+# no-finalize map (echo) — correctness under heavy per-substream fan-out
+# ---------------------------------------------------------------------------
+query II
+SELECT count(*), sum(v) FROM ex.echo((SELECT i AS v FROM range(1, 100001) t(i)));
+----
+100000	5000050000
+
+# Output ORDER must be preserved (echo declares INSERTION_ORDER) even though the
+# operator fanned out to multiple workers: 0 non-consecutive positions.
+query I
+SELECT count(*) FROM (
+    SELECT v, lag(v) OVER () AS prev
+    FROM ex.echo((SELECT i AS v FROM range(1, 50001) t(i)))
+) s
+WHERE prev IS NOT NULL AND v <> prev + 1;
+----
+0
+
+# ---------------------------------------------------------------------------
+# correlated LATERAL — the projected (row-by-row) path, per-substream workers.
+# Kept modest (1000 rows): correlated LATERAL is one worker exchange PER ROW, so
+# over HTTP this is one request per row — a large N here floods the transport
+# without adding coverage (correctness is N-independent).
+# ---------------------------------------------------------------------------
+query I
+SELECT count(*) FROM range(1000) t(x), LATERAL ex.echo((SELECT t.x AS v)) e;
+----
+1000
+
+query I
+SELECT sum(e.v) FROM (VALUES (10),(20),(30)) t(x), LATERAL ex.echo((SELECT t.x AS v)) e;
+----
+60
+
+# ---------------------------------------------------------------------------
+# early termination (LIMIT) — per-substream connections drop cleanly, no hang.
+# range(50000) is large enough that the source is not exhausted before LIMIT 5
+# fires, so this genuinely exercises early-termination teardown; kept below the
+# per-row-HTTP flood threshold so it passes over both transports.
+# ---------------------------------------------------------------------------
+query I
+SELECT count(*) FROM (
+    SELECT * FROM range(50000) t(x), LATERAL ex.echo((SELECT t.x AS v)) e LIMIT 5
+) s;
+----
+5
+
+# ---------------------------------------------------------------------------
+# pool reuse / repeat — second run of the same query is still correct
+# ---------------------------------------------------------------------------
+query I
+SELECT sum(v) FROM ex.echo((SELECT i AS v FROM range(1, 1001) t(i)));
+----
+500500
+
+query I
+SELECT sum(v) FROM ex.echo((SELECT i AS v FROM range(1, 1001) t(i)));
+----
+500500
+
+# ---------------------------------------------------------------------------
+# global combine (sum_all_columns_simple_distributed) is a BUFFERED function —
+# a full-stream reduction belongs on the Sink+Combine+Source operator, not the
+# streaming per-substream map path. Exercised here under threads=8 + pool false
+# to prove the buffered path stays bit-correct alongside the parallel streaming
+# path (its cross-worker state lives in BoundStorage keyed by execution_id).
+# ---------------------------------------------------------------------------
+query I
+SELECT n FROM ex.sum_all_columns_simple_distributed((SELECT i AS n FROM range(1, 101) t(i)));
+----
+5050
+
+statement ok
+DETACH ex;

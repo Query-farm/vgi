@@ -184,7 +184,7 @@ SELECT function_name, parameters, parameter_types, description
 FROM duckdb_functions()
 WHERE database_name = 'example' AND function_name = 'sum_all_columns_simple_distributed';
 ----
-sum_all_columns_simple_distributed	[data]	[TABLE]	Distributed sum using simple callback API
+sum_all_columns_simple_distributed	[data]	[TABLE]	Distributed sum using the buffered (Sink+Combine+Source) model
 
 # ============================================================================
 # Categories

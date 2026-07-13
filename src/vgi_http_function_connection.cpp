@@ -462,7 +462,8 @@ InitResult HttpFunctionConnection::PerformInit(const BindResult &bind_result,
 	    init_opaque_data,
 	    ob_col, ob_dir, ob_null, ob_limit,
 	    ts_percentage, ts_seed,
-	    finalize_state_id);
+	    finalize_state_id,
+	    substream_id_);
 	auto init_request_bytes = SerializeToIpcBytes(init_request);
 #ifdef __EMSCRIPTEN__
 #endif

@@ -59,6 +59,9 @@ public:
 		at_unit_ = at_unit;
 		at_value_ = at_value;
 	}
+	void SetSubstreamId(const std::vector<uint8_t> &substream_id) override {
+		substream_id_ = substream_id;
+	}
 	void SetCopyFromContext(const CopyFromBindContext &copy_from) override {
 		copy_from_ = copy_from;
 	}
@@ -149,6 +152,9 @@ private:
 	std::vector<uint8_t> attach_opaque_data_;
 	std::vector<uint8_t> transaction_opaque_data_;
 	std::vector<uint8_t> global_execution_id_;
+	// Stable client-minted per-substream id (parallel streaming table-in-out);
+	// folded onto every InitRequest. Empty = none. Set via SetSubstreamId.
+	std::vector<uint8_t> substream_id_;
 	ClientContext &context_;
 	bool worker_debug_;
 	std::map<std::string, Value> settings_;

@@ -69,6 +69,9 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 #   secret_lines_out COPY format — see copy_to/secrets.test)
 # 1 table-in-out secret fixture (secret_in_out, resolves a secret in on_bind and
 #   appends it per row — see secret/secret_table_in_out.test)
+# 1 parallel-streaming-finalize fixture (substream_partial_sum, a streaming
+#   TableInOutFunction whose per-substream finalize emits this substream's partial
+#   sum — see table_in_out/parallel_finalize.test)
 # 12 result-cache fixtures (cacheable_numbers, cache_nonce, cache_no_store,
 #   cache_scoped_txn, cache_big, cache_multicol, cache_revalidatable, cache_whoami,
 #   cache_versioned_scan, cache_projection, cache_poison, cache_external_fail —
@@ -87,13 +90,13 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 #   filter_bytes keys distinct entries, backs cache/filter_pushdown_keys.test, ALSO a data
 #   Table (surfaces as a table); cache_partitioned — single-value partition_values through
 #   the spill blob, backs cache/spill_partition_values.test)
-# = 121
+# = 122
 query I
 SELECT COUNT(*)
 FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'table';
 ----
-121
+122
 
 # The 34 pure table functions (no TABLE parameter type)
 # Note: make_series appears 5 times (5 overloads), make_pairs appears 3 times,

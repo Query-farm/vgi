@@ -100,6 +100,18 @@ struct VgiTableInOutBindData : public TableFunctionData {
 	// pushes — column_ids has only a virtual GetAnyColumn placeholder).
 	bool projection_pushdown = false;
 	bool filter_pushdown = false;
+	// Phase A parallelism gate, DERIVED at bind from the registered finalize
+	// callback (`input.table_function.in_out_function_final`), not from
+	// func_info metadata. True (default) = no finalize = per-substream map =
+	// fan out one worker per substream. False = finalize registered = keep a
+	// single shared worker (per-substream finalize is unsound; DuckDB #18222).
+	bool parallel_safe = true;
+	// Whether the function registered an in_out_function_final (finalize) callback,
+	// derived at bind from the actual TableFunction callback. Distinct from
+	// parallel_safe: a finalize function IS parallel (per-substream finalize on its
+	// own worker), but Execute must keep the substream connection open at input-EOS
+	// so VgiTableInOutFinalize can reuse it (a no-finalize map releases it there).
+	bool has_finalize = false;
 };
 
 // ============================================================================
@@ -163,8 +175,16 @@ struct VgiTableInOutGlobalState : public GlobalTableFunctionState {
 	std::shared_ptr<arrow::Buffer> static_filter_bytes;
 	std::vector<std::shared_ptr<arrow::Buffer>> join_keys_buffers;
 
+	// Phase A: parallel-by-default. A streaming table-in/out function is a
+	// per-substream map, so it fans out one worker per substream (see
+	// VgiTableInOutFunction). A function that registers a finalize callback stays
+	// single-worker (per-substream finalize is unsound — DuckDB #18222); that fact
+	// is derived at bind from `input.table_function.in_out_function_final` (the
+	// single source of truth — the actual registered callback) into
+	// `bind_data.parallel_safe`, copied here at InitGlobal.
+	bool parallel_safe = true;
 	idx_t MaxThreads() const override {
-		return 1; // Table-in-out functions are single-threaded for now
+		return parallel_safe ? GlobalTableFunctionState::MAX_THREADS : 1;
 	}
 };
 
@@ -177,6 +197,28 @@ struct VgiTableInOutLocalState : public ArrowScanLocalState {
 	    : ArrowScanLocalState(std::move(current_chunk), ctx) {
 	}
 	~VgiTableInOutLocalState() override;
+
+	// Phase A parallel path: this substream's OWN worker (one per
+	// PipelineExecutor). Acquired lazily on first exchange in
+	// VgiTableInOutFunction, released to the pool at end-of-stream. On early
+	// termination the destructor drops it (unique_ptr) — a mid-stream worker is
+	// never pooled. Null on the serial (finalize) path, which uses the shared
+	// global connection instead.
+	std::unique_ptr<IFunctionConnection> connection;
+
+	// Phase A: stable, process-unique id for THIS substream, minted once at
+	// InitLocal and carried on every InitRequest this substream's worker builds
+	// (INPUT + FINALIZE) via IFunctionConnection::SetSubstreamId. It survives an
+	// HTTP load balancer re-dispatching a substream's requests across backends,
+	// so a finalize can key the substream's accumulated state even on a
+	// different backend than the process() calls. Empty on the serial path.
+	std::vector<uint8_t> substream_id;
+
+	// Phase A (finalize functions): whether THIS substream has already sent its
+	// FINALIZE init (PerformFinalizeInit) to its own worker. Per-substream — the
+	// finalize is independent per substream, so the "init once" latch must live on
+	// the local state, not the global one (which the serial path uses).
+	bool finalize_sent = false;
 };
 
 // ============================================================================
@@ -190,6 +232,11 @@ struct VgiTableInOutBindParams {
 	std::vector<uint8_t> transaction_opaque_data;
 	std::map<std::string, Value> settings;
 	std::vector<vgi::VgiSecretRequirement> required_secrets;
+
+	// Worker-advertised Meta.max_workers (A3 serial opt-out). 1 = force serial
+	// (single shared worker, MaxThreads()=1); 0/unset or >1 = parallel-by-default
+	// per-substream fan-out. Threaded to bind_data.parallel_safe.
+	int32_t max_workers = 0;
 
 	// Routes through to bind_data so the OptimizerExtension can recognize a
 	// LogicalGet of a buffered table function and rewrite it.
