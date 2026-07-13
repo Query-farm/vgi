@@ -123,6 +123,12 @@ struct VgiTableInOutBindData : public TableFunctionData {
 	// (PhysicalTableInOutFunction, which advances on NEED_MORE_INPUT).
 	bool input_from_args = false;
 	bool single_row_scan = false;
+	// Declared DuckDB types of the per-row input columns (blended). One entry per
+	// input column. Execute casts the incoming input DataChunk to these before
+	// shipping it, so the worker always receives its declared arg types (the
+	// literal shape otherwise delivers the constant's natural type). Empty for
+	// classic (non-blended) table-in-out.
+	std::vector<LogicalType> declared_input_types;
 };
 
 // ============================================================================
@@ -258,11 +264,17 @@ struct VgiTableInOutBindParams {
 	// Blended ("UNNEST-style") table-in-out (Phase B): positional args ARE the
 	// per-row input columns. When true, bind builds the worker input schema from
 	// `positional_input_names` (the DECLARED arg names — the worker reads columns
-	// by those names) + `input.input_table_types`, ignoring input_table_names
-	// (empty in the literal shape), and sets single_row_scan for the childless
-	// (literal / pure-varargs) call so Execute uses the write-once scan-mode.
+	// by those names) + the DECLARED types (`positional_input_types` /
+	// `varargs_input_type` — NOT the incoming input_table_types, so the worker
+	// always receives its declared arg types regardless of call shape: a literal
+	// otherwise delivers the constant's natural type, e.g. DECIMAL for 52.0, while
+	// a column already casts to the signature). single_row_scan is set for the
+	// childless (literal / pure-varargs) call so Execute uses the write-once
+	// scan-mode + casts the synthesized input row to the declared types.
 	bool input_from_args = false;
 	std::vector<std::string> positional_input_names;
+	std::vector<LogicalType> positional_input_types;
+	LogicalType varargs_input_type;
 	bool has_varargs = false;
 
 	// Routes through to bind_data so the OptimizerExtension can recognize a

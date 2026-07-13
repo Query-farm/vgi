@@ -17,6 +17,7 @@
 
 #include "duckdb/common/arrow/arrow_appender.hpp"
 #include "duckdb/common/arrow/arrow_converter.hpp"
+#include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/function/table/arrow.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/config.hpp"
@@ -79,6 +80,7 @@ unique_ptr<FunctionData> VgiTableInOutBindData::Copy() const {
 	copy->has_finalize = has_finalize;
 	copy->input_from_args = input_from_args;
 	copy->single_row_scan = single_row_scan;
+	copy->declared_input_types = declared_input_types;
 	return copy;
 }
 
@@ -203,17 +205,28 @@ unique_ptr<FunctionData> VgiTableInOutBind(ClientContext &context, TableFunction
 	// N runtime columns, so fall back to generated col0..colN-1.
 	if (params.input_from_args) {
 		vector<string> in_names;
+		vector<LogicalType> in_types;
 		const idx_t n_cols = input.input_table_types.size();
-		if (!params.has_varargs && params.positional_input_names.size() == n_cols) {
-			for (auto &nm : params.positional_input_names) {
-				in_names.push_back(nm);
-			}
-		} else {
-			for (idx_t i = 0; i < n_cols; i++) {
-				in_names.push_back("col" + std::to_string(i));
+		const bool fixed_names_match = !params.has_varargs && params.positional_input_names.size() == n_cols;
+		for (idx_t i = 0; i < n_cols; i++) {
+			// Names: declared arg names for fixed arity, else generated col0..colN-1.
+			in_names.push_back(fixed_names_match ? params.positional_input_names[i] : ("col" + std::to_string(i)));
+			// Types: the DECLARED arg types, NOT input.input_table_types — so the
+			// worker always receives its declared arg types (a literal delivers the
+			// constant's natural type, e.g. DECIMAL for 52.0 / INTEGER for 52, while
+			// a column already casts to the signature). Fixed args use their declared
+			// type; varargs columns use the vararg element type; fall back to the
+			// incoming type only if neither is available (shouldn't happen).
+			if (i < params.positional_input_types.size()) {
+				in_types.push_back(params.positional_input_types[i]);
+			} else if (params.has_varargs && params.varargs_input_type.id() != LogicalTypeId::INVALID) {
+				in_types.push_back(params.varargs_input_type);
+			} else {
+				in_types.push_back(input.input_table_types[i]);
 			}
 		}
-		bind_data->input_schema = BuildArrowSchemaFromDuckDB(context, input.input_table_types, in_names);
+		bind_data->declared_input_types = in_types;
+		bind_data->input_schema = BuildArrowSchemaFromDuckDB(context, in_types, in_names);
 		// Childless call shape (literal f(52,13) or a pure-varargs childless call)
 		// -> PhysicalTableScan, which needs the write-once scan-mode in Execute.
 		// Robust signal: all synthesized input names are empty (the column/LATERAL
@@ -634,6 +647,39 @@ static void ReleaseSubstreamConnection(std::unique_ptr<IFunctionConnection> &con
 	conn.reset();
 }
 
+// Convert an input DataChunk to the worker-input Arrow batch. For a BLENDED
+// function, first cast the columns to their DECLARED types (bind_data
+// .declared_input_types) when the incoming types differ — so the worker always
+// receives its declared arg types regardless of call shape. This matters for the
+// LITERAL shape, which delivers each constant's natural type (DECIMAL for 52.0,
+// INTEGER for 52) rather than the DOUBLE signature; the column/LATERAL shape has
+// already been cast to the signature by DuckDB, so this is a no-op there. A no-op
+// for classic (non-blended) table-in-out (empty declared_input_types).
+static std::shared_ptr<arrow::RecordBatch>
+ConvertInputToArrow(ClientContext &context, DataChunk &input, const VgiTableInOutBindData &bind_data) {
+	const auto &declared = bind_data.declared_input_types;
+	bool needs_cast = false;
+	if (!declared.empty() && declared.size() == input.ColumnCount()) {
+		for (idx_t c = 0; c < input.ColumnCount(); c++) {
+			if (input.data[c].GetType() != declared[c]) {
+				needs_cast = true;
+				break;
+			}
+		}
+	}
+	if (!needs_cast) {
+		return DataChunkToArrow(context, input, bind_data.input_schema);
+	}
+	vector<LogicalType> dtypes(declared.begin(), declared.end());
+	DataChunk casted;
+	casted.Initialize(Allocator::Get(context), dtypes);
+	for (idx_t c = 0; c < input.ColumnCount(); c++) {
+		VectorOperations::Cast(context, input.data[c], casted.data[c], input.size());
+	}
+	casted.SetCardinality(input.size());
+	return DataChunkToArrow(context, casted, bind_data.input_schema);
+}
+
 // ============================================================================
 // In-Out Function (Main Processing)
 // ============================================================================
@@ -699,7 +745,7 @@ OperatorResultType VgiTableInOutFunction(ExecutionContext &context, TableFunctio
 		// 2) First call: write the single synthesized input row ONCE, then close the
 		//    input writer so the worker can reach EOS (no deadlock).
 		if (!local_state.input_submitted) {
-			auto input_batch = DataChunkToArrow(client_context, input, bind_data.input_schema);
+			auto input_batch = ConvertInputToArrow(client_context, input, bind_data);
 			VGI_LOG(client_context, "table_in_out.scan_write_input",
 			        {{"conn", conn.GetConnIdHex()}, {"function_name", bind_data.function_name},
 			         {"input_rows", std::to_string(input_batch->num_rows())}});
@@ -761,9 +807,9 @@ OperatorResultType VgiTableInOutFunction(ExecutionContext &context, TableFunctio
 	std::shared_ptr<arrow::RecordBatch> input_batch;
 	if (timing) {
 		ScopedNs _t(ClientTiming::Instance().convert_in_ns);
-		input_batch = DataChunkToArrow(client_context, input, bind_data.input_schema);
+		input_batch = ConvertInputToArrow(client_context, input, bind_data);
 	} else {
-		input_batch = DataChunkToArrow(client_context, input, bind_data.input_schema);
+		input_batch = ConvertInputToArrow(client_context, input, bind_data);
 	}
 
 	// The 1:1 write→read exchange. SERIAL (finalize) path: the ONE shared

@@ -237,6 +237,8 @@ static unique_ptr<FunctionData> VgiCatalogTableInOutFunctionBind(ClientContext &
 		auto blended_args =
 		    vgi::ParseFunctionArgumentSchema(context, vgi_info.function_info().arguments_schema);
 		params.positional_input_names = blended_args.positional_names;
+		params.positional_input_types = blended_args.positional_types;
+		params.varargs_input_type = blended_args.varargs_type;
 		params.has_varargs = blended_args.has_varargs;
 	}
 
