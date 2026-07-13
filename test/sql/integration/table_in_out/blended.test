@@ -109,5 +109,42 @@ SELECT a, b, c, row_sum FROM (VALUES (1.0, 2.0, 3.0), (10.0, 20.0, 30.0)) v(a, b
 1.0	2.0	3.0	6.0
 10.0	20.0	30.0	60.0
 
+# ---------------------------------------------------------------------------
+# inline named args (opt := value) — the Haybarn binder patch extracts them
+# BEFORE the input subquery sweep, so they work in the literal, column, AND
+# LATERAL forms (not just the literal STANDARD path).
+# ---------------------------------------------------------------------------
+
+# literal + named
+query I
+SELECT row_sum FROM ex.row_sum(-1.0, -2.0, absolute := true);
+----
+3.0
+
+# COLUMN form + named (row_sum(a, b) with absolute -> abs(a)+abs(b))
+query I
+SELECT row_sum FROM (VALUES (-1.0, -2.0), (3.0, -4.0)) v(a, b), ex.row_sum(v.a, v.b, absolute := true) ORDER BY 1;
+----
+3.0
+7.0
+
+# LATERAL form + named
+query I
+SELECT row_sum FROM (VALUES (-5.0, -5.0)) v(a, b), LATERAL ex.row_sum(v.a, v.b, absolute := true);
+----
+10.0
+
+# a named value referencing an outer column is rejected (named args are constants)
+statement error
+SELECT row_sum FROM (VALUES (1.0, 2.0)) v(a, b), ex.row_sum(v.a, v.b, absolute := (v.a > 0));
+----
+does not support lateral join column parameters
+
+# an unknown named param is rejected at bind
+statement error
+SELECT row_sum FROM (VALUES (1.0, 2.0)) v(a, b), ex.row_sum(v.a, v.b, nope := true);
+----
+Invalid named parameter
+
 statement ok
 DETACH ex;
