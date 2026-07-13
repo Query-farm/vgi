@@ -1,0 +1,113 @@
+# name: test/sql/integration/table_in_out/blended.test
+# description: Phase B — blended ("UNNEST-style") table-in-out functions. A blended
+#   function's POSITIONAL args ARE its per-row input columns (real typed args, no
+#   synthetic TABLE placeholder), so ONE registration serves the literal call
+#   (f(52,13) -> PhysicalTableScan single-row scan-mode), the column call (FROM t,
+#   f(t.x,t.y) -> streaming), and LATERAL (f(t.x,t.y)). Covers the simple fixture
+#   (geo_encode), an arity overload sharing the name (geo_encode3), and a VARARGS
+#   fixture (row_sum). Inline named args in the FROM-clause forms are a separate
+#   follow-up (a Haybarn binder patch); not exercised here.
+# group: [vgi_integration_table_in_out]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+# HTTP transport ATTACH needs httpfs loaded (else a "VGI HTTP transport requires
+# the httpfs extension" error — containing "HTTP" — makes the harness silently
+# skip the whole file). Harmless on subprocess.
+require httpfs
+
+statement ok
+ATTACH 'example' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ---------------------------------------------------------------------------
+# simple blended: geo_encode(latitude, longitude) -> geohash
+# ---------------------------------------------------------------------------
+
+# LITERAL form — the PhysicalTableScan single-row scan-mode risk: exactly one row,
+# no infinite loop.
+query I
+SELECT geohash FROM ex.geo_encode(52.0, 13.0);
+----
+52.0:13.0
+
+# integer literals cast to the DOUBLE signature (fixture normalizes to float)
+query I
+SELECT geohash FROM ex.geo_encode(52, 13);
+----
+52.0:13.0
+
+# COLUMN form — streaming input, one output row per input row (order-checked)
+query III
+SELECT x, y, geohash FROM (VALUES (1.0, 2.0), (3.0, 4.0)) v(x, y), ex.geo_encode(v.x, v.y) ORDER BY x;
+----
+1.0	2.0	1.0:2.0
+3.0	4.0	3.0:4.0
+
+# LATERAL form — must NOT throw the FinalExecute/projected-input error (blended is
+# no-finalize by design, so it participates in correlated lateral joins)
+query III
+SELECT x, y, geohash FROM (VALUES (10.0, 20.0), (30.0, 40.0)) v(x, y), LATERAL ex.geo_encode(v.x, v.y) ORDER BY x;
+----
+10.0	20.0	10.0:20.0
+30.0	40.0	30.0:40.0
+
+# 1 -> 0 (filter to no rows) is clean: no hang, no spurious rows
+query I
+SELECT count(*) FROM ex.geo_encode(1.0, 2.0) WHERE geohash IS NULL;
+----
+0
+
+# catalog introspection: the args are REAL value types (DOUBLE), NOT a TABLE arg
+# (DISTINCT because geo_encode has two arity overloads, both DOUBLE-typed).
+query TT
+SELECT DISTINCT arg_name, arg_type
+FROM vgi_function_arguments()
+WHERE catalog_name = 'ex' AND function_name = 'geo_encode' AND arg_name IN ('latitude', 'longitude')
+ORDER BY arg_name;
+----
+latitude	DOUBLE
+longitude	DOUBLE
+
+# ---------------------------------------------------------------------------
+# arity overload: geo_encode3 shares the name "geo_encode" with a 3rd column
+# ---------------------------------------------------------------------------
+
+# 3-arg literal resolves to the 3-positional overload
+query I
+SELECT geohash FROM ex.geo_encode(52.0, 13.0, 100.0);
+----
+52.0:13.0:100.0
+
+# 3-arg column form
+query I
+SELECT geohash FROM (VALUES (1.0, 2.0, 3.0)) v(a, b, c), ex.geo_encode(v.a, v.b, v.c);
+----
+1.0:2.0:3.0
+
+# ---------------------------------------------------------------------------
+# VARARGS blended: row_sum(v1, v2, ...) sums the per-row input columns
+# ---------------------------------------------------------------------------
+
+# literal, 3 columns
+query I
+SELECT row_sum FROM ex.row_sum(1.0, 2.0, 3.0);
+----
+6.0
+
+# literal, different arity (2 columns)
+query I
+SELECT row_sum FROM ex.row_sum(5.0, 5.0);
+----
+10.0
+
+# column form, varargs
+query IIII
+SELECT a, b, c, row_sum FROM (VALUES (1.0, 2.0, 3.0), (10.0, 20.0, 30.0)) v(a, b, c), ex.row_sum(v.a, v.b, v.c) ORDER BY a;
+----
+1.0	2.0	3.0	6.0
+10.0	20.0	30.0	60.0
+
+statement ok
+DETACH ex;

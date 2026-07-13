@@ -406,6 +406,14 @@ void VgiTableFunctionSet::LoadEntries(ClientContext &context, const std::lock_gu
 				// Register named parameters
 				table_func.named_parameters = arg_types.named_parameters;
 
+				// Register varargs so DuckDB accepts a blended VARARGS call
+				// (row_sum(1,2,3) -> N input columns of varargs_type). Without this
+				// the signature would carry only the named params and DuckDB would
+				// reject any positional args.
+				if (arg_types.has_varargs) {
+					table_func.varargs = arg_types.varargs_type;
+				}
+
 				// Attach function info
 				table_func.function_info = make_uniq<vgi::VgiTableFunctionInfo>(
 				    catalog_, attach_params, attach_result->attach_opaque_data, func_info, setting_names);
