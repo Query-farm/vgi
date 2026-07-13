@@ -36,7 +36,7 @@ namespace vgi {
 // substreams and across queries reusing the same attach). Per-substream worker
 // state is additionally attach-sharded worker-side, so uniqueness only has to
 // hold within a shared-storage namespace — this comfortably does.
-static std::vector<uint8_t> MintSubstreamId() {
+std::vector<uint8_t> MintSubstreamId() {
 	static const uint64_t salt = [] {
 		std::random_device rd;
 		return (static_cast<uint64_t>(rd()) << 32) ^ static_cast<uint64_t>(rd());
@@ -500,8 +500,8 @@ unique_ptr<LocalTableFunctionState> VgiTableInOutInitLocal(ExecutionContext &con
 
 //! Load an Arrow C++ RecordBatch into the ArrowScanLocalState for consumption.
 //! Must call Reset() to clear stale owned_data references before loading a new batch.
-static void LoadBatchIntoScanState(VgiTableInOutLocalState &local_state,
-                                   const std::shared_ptr<arrow::RecordBatch> &batch) {
+void LoadBatchIntoScanState(VgiTableInOutLocalState &local_state,
+                            const std::shared_ptr<arrow::RecordBatch> &batch) {
 	auto chunk = make_uniq<ArrowArrayWrapper>();
 	ExportRecordBatch(batch, *chunk);
 	local_state.chunk = shared_ptr<ArrowArrayWrapper>(chunk.release());
@@ -510,7 +510,7 @@ static void LoadBatchIntoScanState(VgiTableInOutLocalState &local_state,
 }
 
 //! Check whether the local state has remaining rows to produce from the current batch.
-static bool HasRemainingBatchData(const VgiTableInOutLocalState &local_state) {
+bool HasRemainingBatchData(const VgiTableInOutLocalState &local_state) {
 	return local_state.chunk && local_state.chunk->arrow_array.release &&
 	       local_state.chunk_offset < static_cast<idx_t>(local_state.chunk->arrow_array.length);
 }
@@ -527,8 +527,8 @@ static bool HasRemainingBatchData(const VgiTableInOutLocalState &local_state) {
 //! ``DataChunk`` that references only the first ``n_children`` vectors of
 //! ``output`` and convert into that. Writes land in the shared underlying
 //! vector buffers; the trailing correlated columns stay untouched.
-static idx_t ProduceOutputFromBatch(VgiTableInOutLocalState &local_state, const ArrowTableSchema &arrow_table,
-                                    DataChunk &output, bool projection_pushdown = false) {
+idx_t ProduceOutputFromBatch(VgiTableInOutLocalState &local_state, const ArrowTableSchema &arrow_table,
+                             DataChunk &output, bool projection_pushdown) {
 	idx_t remaining = static_cast<idx_t>(local_state.chunk->arrow_array.length) - local_state.chunk_offset;
 	idx_t output_size = MinValue<idx_t>(STANDARD_VECTOR_SIZE, remaining);
 	output.SetCardinality(output_size);
@@ -625,11 +625,47 @@ AcquireSubstreamConnection(ClientContext &context, const VgiTableInOutBindData &
 	return conn;
 }
 
+// Acquire + INPUT-init a worker for a blended function from bind_data alone (no
+// VgiTableInOutGlobalState). Used by the batched-lateral operator, which has no
+// InitGlobal — bind_data.bind_result is populated at bind. No projection/filter
+// pushdown (a blended LATERAL call gets none). Mirrors AcquireSubstreamConnection.
+std::unique_ptr<IFunctionConnection>
+AcquireBlendedInputConnection(ClientContext &context, const VgiTableInOutBindData &bind_data,
+                              const std::vector<uint8_t> &substream_id) {
+	FunctionConnectionParams p;
+	p.attach_params = bind_data.attach_params;
+	p.attach_opaque_data = bind_data.attach_opaque_data;
+	p.function_name = bind_data.function_name;
+	p.arguments = bind_data.arguments;
+	p.transaction_opaque_data = bind_data.transaction_opaque_data;
+	p.settings = bind_data.settings;
+	p.required_secrets = bind_data.required_secrets;
+	p.phase = "init_lateral_batch";
+	p.function_type = "TABLE";
+	p.input_schema = bind_data.input_schema;
+	auto acquired = AcquireConnectionForInit(context, p);
+	auto conn = std::move(acquired.connection);
+	conn->SetSubstreamId(substream_id);
+	try {
+		conn->PerformInit(bind_data.bind_result, {}, nullptr, {}, "INPUT");
+	} catch (const IOException &) {
+		if (!acquired.from_pool) {
+			throw;
+		}
+		acquired = AcquireConnectionForInit(context, p, /*force_fresh=*/true);
+		conn = std::move(acquired.connection);
+		conn->SetSubstreamId(substream_id);
+		conn->PerformInit(bind_data.bind_result, {}, nullptr, {}, "INPUT");
+	}
+	conn->OpenInputWriter();
+	return conn;
+}
+
 // Return a substream's worker to the pool at clean end-of-stream. On early
 // termination the local-state destructor drops the connection (unique_ptr),
 // which is safe (a mid-stream worker is never pooled).
-static void ReleaseSubstreamConnection(std::unique_ptr<IFunctionConnection> &conn,
-                                       const VgiTableInOutBindData &bind_data, ClientContext &context) {
+void ReleaseSubstreamConnection(std::unique_ptr<IFunctionConnection> &conn,
+                                const VgiTableInOutBindData &bind_data, ClientContext &context) {
 	if (conn && bind_data.use_pool()) {
 		auto release_conn_id = conn->GetConnIdHex();
 		if (auto pooled = conn->ReleaseForPooling()) {
@@ -655,7 +691,7 @@ static void ReleaseSubstreamConnection(std::unique_ptr<IFunctionConnection> &con
 // INTEGER for 52) rather than the DOUBLE signature; the column/LATERAL shape has
 // already been cast to the signature by DuckDB, so this is a no-op there. A no-op
 // for classic (non-blended) table-in-out (empty declared_input_types).
-static std::shared_ptr<arrow::RecordBatch>
+std::shared_ptr<arrow::RecordBatch>
 ConvertInputToArrow(ClientContext &context, DataChunk &input, const VgiTableInOutBindData &bind_data) {
 	const auto &declared = bind_data.declared_input_types;
 	bool needs_cast = false;

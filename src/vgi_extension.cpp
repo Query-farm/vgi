@@ -77,6 +77,7 @@
 #include "vgi_oauth.hpp"
 #include "vgi_profiling.hpp"
 #include "vgi_secret_storage.hpp"
+#include "vgi_lateral_batch_operator.hpp"
 #include "vgi_streaming_window_operator.hpp"
 #include "vgi_table_buffering_impl.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
@@ -3257,6 +3258,18 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "will then throw a clear InternalException instead of running.",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
 	OptimizerExtension::Register(config, VgiTableBufferingRewriter());
+
+	// Batched correlated LATERAL for blended VGI table-in-out functions. Replaces
+	// DuckDB's row-by-row PhysicalTableInOutFunction (one worker exchange per input
+	// row) with PhysicalVgiLateralBatch (one exchange per input chunk), recovering
+	// the input->output row mapping via worker-emitted provenance. optimize_function
+	// (post-decorrelation, opaque extension node). See docs / the operator file.
+	config.AddExtensionOption("vgi_batch_lateral",
+	                          "Batch correlated LATERAL calls to blended VGI table functions through a single "
+	                          "worker exchange per input chunk instead of DuckDB's row-by-row driver. "
+	                          "Set to false to fall back to the row-by-row PhysicalTableInOutFunction.",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
+	vgi::RegisterVgiLateralBatchRewriter(config);
 
 	// Enforce Table.required_filters at bind/optimize time.
 	// Post-optimize so DuckDB's FilterPushdown has settled filters into

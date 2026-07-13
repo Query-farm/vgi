@@ -316,6 +316,40 @@ unique_ptr<LocalTableFunctionState> VgiTableInOutInitLocal(ExecutionContext &con
 OperatorResultType VgiTableInOutFunction(ExecutionContext &context, TableFunctionInput &data,
                                           DataChunk &input, DataChunk &output);
 
+// ============================================================================
+// Exchange/scan helpers reused by the batched-lateral operator
+// (vgi_lateral_batch_operator.cpp). Defined in vgi_table_in_out_impl.cpp.
+// ============================================================================
+
+// Mint a stable, process-unique per-substream id (8-byte salt || 8-byte counter).
+std::vector<uint8_t> MintSubstreamId();
+
+// Acquire + INPUT-init a blended function's worker from bind_data alone (no
+// VgiTableInOutGlobalState); bind_data.bind_result is populated at bind.
+std::unique_ptr<IFunctionConnection>
+AcquireBlendedInputConnection(ClientContext &context, const VgiTableInOutBindData &bind_data,
+                              const std::vector<uint8_t> &substream_id);
+
+// Return a substream's worker to the pool at clean end-of-stream.
+void ReleaseSubstreamConnection(std::unique_ptr<IFunctionConnection> &conn,
+                                const VgiTableInOutBindData &bind_data, ClientContext &context);
+
+// Convert an input DataChunk to the worker-input Arrow batch (casts to declared types).
+std::shared_ptr<arrow::RecordBatch>
+ConvertInputToArrow(ClientContext &context, DataChunk &input, const VgiTableInOutBindData &bind_data);
+
+// Load a worker output Arrow batch into a scan local state for draining.
+void LoadBatchIntoScanState(VgiTableInOutLocalState &local_state,
+                            const std::shared_ptr<arrow::RecordBatch> &batch);
+
+// Whether the scan local state has remaining rows to produce from its batch.
+bool HasRemainingBatchData(const VgiTableInOutLocalState &local_state);
+
+// Produce one DataChunk slice (<= STANDARD_VECTOR_SIZE) of worker output columns
+// into `output`'s LEADING columns, leaving any trailing columns untouched.
+idx_t ProduceOutputFromBatch(VgiTableInOutLocalState &local_state, const ArrowTableSchema &arrow_table,
+                             DataChunk &output, bool projection_pushdown = false);
+
 // Finalize function - called when all input has been processed
 OperatorFinalizeResultType VgiTableInOutFinalize(ExecutionContext &context, TableFunctionInput &data, DataChunk &output);
 
