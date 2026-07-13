@@ -157,3 +157,56 @@ TEST_CASE("unary RPC then producer RPC on one slot (bind->init sequencing)", "[s
 	vgi_wasm_slot_release(slot);
 	CHECK(got == std::vector<int64_t>({0, 1, 2}));
 }
+
+// Exchange mode (scalar / table-in-out path): the client writes a real INPUT
+// batch and reads a 1:1 OUTPUT batch — exercising OpenInputWriter/WriteInputBatch/
+// CloseInputWriter over the ring (validates the port's #2 flagged uncertainty:
+// CloseInputWriter -> slot_write_eos ordering in exchange mode).
+TEST_CASE("exchange RPC (scale) over the ring", "[sab-e2e]") {
+	int slot = vgi_wasm_slot_open("test");
+	REQUIRE(slot >= 0);
+	std::thread rust_worker([slot]() { vgi_rust_serve_sab_slot(slot); });
+
+	// 1. request scale(factor = 10.0).
+	arrow::DoubleBuilder fb;
+	REQUIRE(fb.Append(10.0).ok());
+	std::shared_ptr<arrow::Array> fa;
+	REQUIRE(fb.Finish(&fa).ok());
+	auto params = arrow::RecordBatch::Make(arrow::schema({arrow::field("factor", arrow::float64())}), 1, {fa});
+	auto req = SerializeRpcRequest("scale", params);
+
+	auto out = std::make_shared<SabOutputStream>(slot);
+	REQUIRE(out->Write(req.data(), static_cast<int64_t>(req.size())).ok());
+
+	// 2. input stream (single "value" f64 column) + one input batch [1,2,3].
+	auto input_schema = arrow::schema({arrow::field("value", arrow::float64())});
+	arrow::DoubleBuilder ib;
+	REQUIRE(ib.AppendValues({1.0, 2.0, 3.0}).ok());
+	std::shared_ptr<arrow::Array> ia;
+	REQUIRE(ib.Finish(&ia).ok());
+	auto input_batch = arrow::RecordBatch::Make(input_schema, 3, {ia});
+	auto input_writer = *arrow::ipc::MakeStreamWriter(out, input_schema);
+	REQUIRE(input_writer->WriteRecordBatch(*input_batch).ok());
+
+	// 3. read the 1:1 scaled output batch.
+	auto in = std::make_shared<SabInputStream>(slot);
+	auto reader = *arrow::ipc::RecordBatchStreamReader::Open(in);
+	std::shared_ptr<arrow::RecordBatch> outb;
+	REQUIRE(reader->ReadNext(&outb).ok());
+	REQUIRE(outb != nullptr);
+	auto ocol = std::static_pointer_cast<arrow::DoubleArray>(outb->column(0));
+	std::vector<double> got;
+	for (int64_t i = 0; i < ocol->length(); i++) {
+		got.push_back(ocol->Value(i));
+	}
+	CHECK(got == std::vector<double>({10.0, 20.0, 30.0}));
+
+	// 4. close input (Arrow EOS + ring EOF), drain output EOS.
+	REQUIRE(input_writer->Close().ok());
+	vgi_wasm_slot_write_eos(slot);
+	REQUIRE(reader->ReadNext(&outb).ok());
+	CHECK(outb == nullptr);
+
+	rust_worker.join();
+	vgi_wasm_slot_release(slot);
+}

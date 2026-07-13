@@ -6,10 +6,10 @@
 use std::io::{Read, Write};
 use std::sync::Arc;
 
-use arrow_array::RecordBatch;
+use arrow_array::{Float64Array, RecordBatch};
 use serde::{Deserialize, Serialize};
 
-use vgi_rpc::stream::{OutputCollector, ProducerState};
+use vgi_rpc::stream::{ExchangeState, OutputCollector, ProducerState};
 use vgi_rpc::{service, CallContext, Result, RpcServer, StreamState, VgiArrow};
 
 // Worker-side ring ops, implemented in C++ (test/support/vgi_sab_native_ring.cpp).
@@ -70,6 +70,27 @@ impl ProducerState for CountTo {
     }
 }
 
+// ---- exchange service (scale, from hello_stream) — 1:1 input->output ----
+#[derive(StreamState, Serialize, Deserialize)]
+struct Scale {
+    factor: f64,
+}
+impl ExchangeState for Scale {
+    fn exchange(&mut self, input: &RecordBatch, out: &mut OutputCollector, _ctx: &CallContext) -> Result<()> {
+        let col = input
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("f64 input");
+        let scaled: Vec<f64> = (0..col.len()).map(|i| col.value(i) * self.factor).collect();
+        let arr = std::sync::Arc::new(Float64Array::from(scaled)) as arrow_array::ArrayRef;
+        out.emit(RecordBatch::try_new(out.schema(), vec![arr])?)
+    }
+    fn encode_state(&self) -> Result<Vec<u8>> {
+        vgi_rpc::stream_codec::StreamStateCodec::encode(self)
+    }
+}
+
 struct Svc;
 #[service]
 impl Svc {
@@ -82,6 +103,11 @@ impl Svc {
     #[producer(state = CountTo, output = i64)]
     fn count_to(&self, total: i64) -> Result<CountTo> {
         Ok(CountTo { total, cur: 0 })
+    }
+    // Exchange method — multiply each input f64 by factor (1:1 input->output).
+    #[exchange(state = Scale, input = f64, output = f64)]
+    fn scale(&self, factor: f64) -> Result<Scale> {
+        Ok(Scale { factor })
     }
 }
 
