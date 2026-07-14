@@ -11,8 +11,12 @@
 
 #include "vgi_arrow_utils.hpp"
 #include "vgi_table_buffering_builders.hpp"
+#include "vgi_cache_control.hpp"        // VgiCacheControl (M3)
+#include "vgi_cached_replay_connection.hpp" // CachedReplayConnection (M3 hit replay)
 #include "vgi_cancel_dispatcher.hpp"
+#include "vgi_exchange_cache_key.hpp"   // exchange-mode result cache (M3)
 #include "vgi_logging.hpp"
+#include "vgi_result_cache.hpp"         // VgiResultCache singleton (M3)
 #include "vgi_unary_rpc.hpp"
 #include "vgi_worker_pool.hpp"
 
@@ -202,6 +206,38 @@ public:
 
 	// True once Sink::Finalize has fired (mirrors aggregate gstates).
 	std::atomic<bool> finalized {false};
+
+	// ---- Exchange-mode result cache (M3, whole-input memoization) ----
+	// Built once at GetGlobalSinkState. Scoped to !sink_order_dependent (result is a
+	// function of the input MULTISET, so a commutative additive fold of per-row hashes
+	// keys it — order/thread independent). A HIT skips the combine RPC + the Source
+	// finalize-drain and replays the cached result; ingestion (Sink process() RPCs)
+	// still runs (the key is only known after all input is folded).
+	bool cache_eligible = false;
+	VgiResultCacheKey cache_key;                 // static; input_hash set at Finalize
+	std::string cache_catalog_name;
+	int64_t cache_default_ttl_seconds = 0;
+	// Additive input digest, merged from per-thread LocalSinkState partials at Combine.
+	std::atomic<uint64_t> digest_lo {0};
+	std::atomic<uint64_t> digest_hi {0};
+	std::atomic<uint64_t> digest_rows {0};
+	// Serve (hit): the cached whole-input result + a single-claim guard (only one
+	// Source thread replays the single entry; the rest are FINISHED immediately).
+	bool serving_from_cache = false;
+	std::shared_ptr<const VgiResultCacheEntry> serving;
+	std::atomic<bool> serving_claimed {false};
+	// Capture (miss): all Source batches accumulate here under `capture_mu`; committed
+	// in this destructor iff every finalize state reached EOS (never-partial).
+	std::mutex capture_mu;
+	bool capturing = false;
+	VgiCacheControl capture_cc;
+	bool capture_cc_latched = false;
+	std::vector<std::shared_ptr<arrow::RecordBatch>> capture_batches;
+	size_t total_finalize_states = 0;
+	std::atomic<size_t> finalize_eos_count {0};
+	// Set if the worker's finalize output is not cacheable (no vgi.cache.* advertised),
+	// so capture stops early and the destructor never stores a partial result.
+	std::atomic<bool> capture_aborted {false};
 };
 
 VgiTableBufferingGlobalSinkState::~VgiTableBufferingGlobalSinkState() {
@@ -290,6 +326,23 @@ VgiTableBufferingGlobalSinkState::~VgiTableBufferingGlobalSinkState() {
 			}
 		}
 	}
+
+	// Exchange-mode result cache (M3): commit the captured whole-input result iff
+	// EVERY finalize state reached EOS (never-partial — a mid-drain error or early
+	// LIMIT teardown leaves finalize_eos_count < total_finalize_states, so nothing is
+	// stored). Runs after the Source phase (source shares this sink_state), so all
+	// capture_batches are present. allow_disk=true — one large result, like a producer
+	// entry; Insert rejects it (uncached) if it exceeds the memory cap with disk off.
+	if (capturing && !capture_aborted.load() && total_finalize_states > 0 &&
+	    finalize_eos_count.load(std::memory_order_acquire) == total_finalize_states &&
+	    capture_cc.Cacheable()) {
+		try {
+			(void)StoreExchangeMemoEntry(cache_key, capture_cc, cache_catalog_name,
+			                             cache_default_ttl_seconds, capture_batches, /*allow_disk=*/true);
+		} catch (...) {
+			// Destructor must not throw; a failed cache store is non-fatal.
+		}
+	}
 }
 
 class VgiTableBufferingLocalSinkState : public LocalSinkState {
@@ -307,6 +360,12 @@ public:
 	// possibly after another thread's exception has torn down the pipeline) can
 	// dispatch a cancel without re-walking the operator.
 	DatabaseInstance *db = nullptr;
+
+	// M3 result cache: this thread's partial additive input digest, folded per Sink
+	// chunk and merged into the gstate atomics at Combine (associative/commutative).
+	uint64_t digest_lo = 0;
+	uint64_t digest_hi = 0;
+	uint64_t digest_rows = 0;
 
 	~VgiTableBufferingLocalSinkState() override {
 		// If Combine already moved our connection into gstate.workers[], `connection`
@@ -462,6 +521,30 @@ PhysicalVgiTableBufferingFunction::GetGlobalSinkState(ClientContext &context) co
 	// runs the destructor swallows and relies on cleanup_old_entries.
 	gstate->context_weak = context.shared_from_this();
 	gstate->attach_params = bd.attach_params;
+
+	// Exchange-mode result cache (M3): eligible only for an UNORDERED sink (result is a
+	// function of the input multiset — the commutative additive digest keys it). An
+	// order-dependent sink is excluded (its result depends on input order, which the
+	// commutative fold can't capture).
+	if (!bd.sink_order_dependent) {
+		std::vector<int32_t> proj_key;
+		if (bd.projection_pushdown) {
+			proj_key = projection_ids; // the wire projection the worker was init'd with
+		}
+		const char *reason = nullptr;
+		int64_t catalog_version = 0;
+		if (BuildExchangeCacheKeyStatic(context, bd, proj_key, gstate->cache_key,
+		                                gstate->cache_catalog_name, catalog_version, reason)) {
+			gstate->cache_eligible = true;
+			Value ttl_v;
+			if (context.TryGetCurrentSetting("vgi_result_cache_default_ttl_seconds", ttl_v)) {
+				gstate->cache_default_ttl_seconds = static_cast<int64_t>(ttl_v.GetValue<uint64_t>());
+			}
+		} else if (reason) {
+			VGI_LOG(context, "result_cache.ineligible",
+			        {{"function", bd.function_name}, {"reason", reason}});
+		}
+	}
 	return std::move(gstate);
 }
 
@@ -485,6 +568,13 @@ SinkResultType PhysicalVgiTableBufferingFunction::Sink(ExecutionContext &context
 		throw InternalException(
 		    "PhysicalVgiTableBufferingFunction::Sink called after Finalize returned READY — "
 		    "the strict once-per-GlobalSinkState invariant has been violated.");
+	}
+
+	// M3 result cache: fold this chunk into the per-thread additive input digest
+	// (merged into the gstate at Combine). Order/thread independent — the buffered
+	// result is a function of the input multiset (eligibility requires !sink_order_dependent).
+	if (gstate.cache_eligible) {
+		AccumulateInputDigest(chunk, lstate.digest_lo, lstate.digest_hi, lstate.digest_rows);
 	}
 
 	// Init protocol — symmetric, no coordinator. The first Sink thread to
@@ -701,6 +791,15 @@ PhysicalVgiTableBufferingFunction::Combine(ExecutionContext & /*context*/,
 	auto &gstate = input.global_state.Cast<VgiTableBufferingGlobalSinkState>();
 	auto &lstate = input.local_state.Cast<VgiTableBufferingLocalSinkState>();
 
+	// M3 result cache: merge this thread's partial additive input digest into the
+	// gstate (associative + commutative → order/thread independent). Done before the
+	// no-input early return (a thread with no input contributes 0, harmlessly).
+	if (gstate.cache_eligible) {
+		gstate.digest_lo.fetch_add(lstate.digest_lo, std::memory_order_relaxed);
+		gstate.digest_hi.fetch_add(lstate.digest_hi, std::memory_order_relaxed);
+		gstate.digest_rows.fetch_add(lstate.digest_rows, std::memory_order_relaxed);
+	}
+
 	// Thread didn't receive any input → nothing to hand off.
 	if (!lstate.connection) {
 		return SinkCombineResultType::FINISHED;
@@ -721,6 +820,23 @@ SinkFinalizeType PhysicalVgiTableBufferingFunction::Finalize(Pipeline & /*pipeli
                                                               ClientContext &context,
                                                               OperatorSinkFinalizeInput &input) const {
 	auto &gstate = input.global_state.Cast<VgiTableBufferingGlobalSinkState>();
+
+	// M3 result cache: the input digest is now complete (all Combine calls merged).
+	// Fold it into the key and probe the cache. A HIT skips the combine RPC + the
+	// Source finalize-drain — the Source phase replays the cached result instead.
+	if (gstate.cache_eligible) {
+		gstate.cache_key.input_hash =
+		    FinalizeInputDigest(gstate.digest_lo.load(), gstate.digest_hi.load(), gstate.digest_rows.load());
+		auto entry = VgiResultCache::Instance().Lookup(gstate.cache_key, std::chrono::steady_clock::now());
+		if (entry) {
+			VGI_LOG(context, "result_cache.hit",
+			        {{"function", gstate.function_name}, {"key_hash", gstate.cache_key.HexDigest()}, {"tier", "memory"}});
+			gstate.serving_from_cache = true;
+			gstate.serving = entry;
+			gstate.finalized.store(true);
+			return SinkFinalizeType::READY; // Source replays; no combine, no worker drain
+		}
+	}
 
 	// Snapshot state_ids and pop one worker for the combine RPC, all under
 	// workers_mutex. No special "coordinator" — combine reads peer state
@@ -811,6 +927,13 @@ SinkFinalizeType PhysicalVgiTableBufferingFunction::Finalize(Pipeline & /*pipeli
 		for (auto &id : finalize_state_ids) {
 			gstate.finalize_queue.push_back(std::move(id));
 		}
+		// M3 result cache (MISS): arm capture. The Source phase accumulates every
+		// drained batch; the gstate destructor commits iff all finalize states reach
+		// EOS (never-partial). total_finalize_states is the drain target.
+		if (gstate.cache_eligible) {
+			gstate.capturing = true;
+			gstate.total_finalize_states = gstate.finalize_queue.size();
+		}
 	}
 	gstate.finalized.store(true);
 	return SinkFinalizeType::READY;
@@ -861,6 +984,18 @@ SourceResultType PhysicalVgiTableBufferingFunction::GetDataInternal(ExecutionCon
 	}
 	// Current batch (if any) is fully drained; drop it before fetching the next.
 	lstate.scan_state.reset();
+
+	// M3 result cache HIT: replay the single cached whole-input result. Exactly one
+	// Source thread claims it (CachedReplayConnection); the rest are FINISHED. Skips
+	// the finalize_queue + worker acquire + PerformInit entirely.
+	if (gstate.serving_from_cache && !lstate.stream_open) {
+		if (gstate.serving_claimed.exchange(true)) {
+			chunk.SetCardinality(0);
+			return SourceResultType::FINISHED; // another thread is replaying the result
+		}
+		lstate.worker = make_uniq<CachedReplayConnection>(gstate.serving);
+		lstate.stream_open = true;
+	}
 
 	// Open a fresh worker + stream for the next finalize_state_id when
 	// the previous stream has hit EOS (or this is the first call).
@@ -925,6 +1060,11 @@ SourceResultType PhysicalVgiTableBufferingFunction::GetDataInternal(ExecutionCon
 	if (!batch) {
 		// EOS — this finalize_state_id is exhausted. Release worker back
 		// to the pool; next GetData call will open the next stream.
+		// M3 (MISS capture): count this finalize state as fully drained — the gstate
+		// destructor commits only when finalize_eos_count == total_finalize_states.
+		if (gstate.capturing && !gstate.serving_from_cache) {
+			gstate.finalize_eos_count.fetch_add(1, std::memory_order_acq_rel);
+		}
 		auto pooled = lstate.worker->ReleaseForPooling();
 		lstate.worker.reset();
 		lstate.stream_open = false;
@@ -933,6 +1073,25 @@ SourceResultType PhysicalVgiTableBufferingFunction::GetDataInternal(ExecutionCon
 		}
 		chunk.SetCardinality(0);
 		return SourceResultType::HAVE_MORE_OUTPUT;
+	}
+
+	// M3 (MISS capture): accumulate the whole-input result. Latch the worker's cache
+	// advertisement off the first batch; if not cacheable, abort capture (nothing is
+	// stored). Capturing 0-row batches would bloat the entry with no rows — skip them
+	// (they're valid "no output yet" ticks, not result data).
+	if (gstate.capturing && !gstate.serving_from_cache && !gstate.capture_aborted.load() &&
+	    batch->num_rows() > 0) {
+		std::lock_guard<std::mutex> lk(gstate.capture_mu);
+		if (!gstate.capture_cc_latched) {
+			gstate.capture_cc = lstate.worker->GetLastCacheControl();
+			gstate.capture_cc_latched = true;
+			if (!gstate.capture_cc.Cacheable()) {
+				gstate.capture_aborted.store(true);
+			}
+		}
+		if (!gstate.capture_aborted.load()) {
+			gstate.capture_batches.push_back(batch);
+		}
 	}
 
 	if (batch->num_rows() == 0) {

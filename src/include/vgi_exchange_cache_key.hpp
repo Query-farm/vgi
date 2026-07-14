@@ -54,6 +54,15 @@ std::string HashInputBatchOrdered(const std::shared_ptr<arrow::RecordBatch> &inp
 //! chunk (all columns) — the correlated columns are baked into the cached output.
 std::string HashInputChunkUnordered(ClientContext &context, DataChunk &chunk);
 
+//! Order-INDEPENDENT streaming digest for whole-input keying (buffered functions):
+//! folds a chunk's per-row hashes into a two-lane 64-bit ADDITIVE accumulator (+ row
+//! count). Additive => associative + commutative => independent of both chunk order
+//! and the (parallel) thread that folded each chunk, and duplicate-preserving (unlike
+//! XOR). Partial accumulators merge by field-wise addition. FinalizeInputDigest
+//! renders the accumulator to a stable hex string for VgiResultCacheKey::input_hash.
+void AccumulateInputDigest(DataChunk &chunk, uint64_t &sum_lo, uint64_t &sum_hi, uint64_t &row_count);
+std::string FinalizeInputDigest(uint64_t sum_lo, uint64_t sum_hi, uint64_t row_count);
+
 // ============================================================================
 // Static cache-key builder for EXCHANGE-mode functions
 // ============================================================================
@@ -90,13 +99,15 @@ struct ExchangeStoreResult {
 	int64_t bytes = 0;
 };
 
-//! Build a memory-only cache entry from one input unit's output batches and Insert
-//! it (allow_disk=false — many tiny entries would thrash the disk ref store).
-//! Freshness from `cc`: a positive ttl (from cc.ttl_seconds or default_ttl_seconds)
-//! is required; no_store and transaction-scoped results are refused.
+//! Build a cache entry from one input unit's output batches and Insert it. Freshness
+//! from `cc`: a positive ttl (from cc.ttl_seconds or default_ttl_seconds) is required;
+//! no_store and transaction-scoped results are refused. `allow_disk` is false for the
+//! tiny per-chunk/per-batch streaming entries (many would thrash the disk ref store)
+//! and true for the buffered whole-input entry (one large result, like a producer one).
 ExchangeStoreResult StoreExchangeMemoEntry(const VgiResultCacheKey &key, const VgiCacheControl &cc,
                                            const std::string &catalog_name, int64_t default_ttl_seconds,
-                                           const std::vector<std::shared_ptr<arrow::RecordBatch>> &out_batches);
+                                           const std::vector<std::shared_ptr<arrow::RecordBatch>> &out_batches,
+                                           bool allow_disk = false);
 
 } // namespace vgi
 } // namespace duckdb

@@ -1,0 +1,142 @@
+# name: test/sql/integration/cache/exchange_buffered.test
+# description: EXCHANGE-mode result cache (M3) — whole-input memoization of a BUFFERED
+#   table function (PhysicalVgiTableBufferingFunction). An order-independent additive
+#   digest is folded across all Sink batches; the key is computed at Finalize. A HIT
+#   skips the combine RPC + the Source finalize-drain and replays the cached result via
+#   CachedReplayConnection. Same input multiset (any order) => hit. Known limitation:
+#   the Sink ingestion (process() RPCs) still runs — the key is only known after all
+#   input is folded. Shares the producer cache singleton/stats/invalidation.
+# group: [vgi_integration_cache]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+SET threads=1;
+
+statement ok
+CREATE TEMP TABLE t AS SELECT * FROM range(10) r(x);
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+# ---------------------------------------------------------------------------
+# First scan: MISS — Sink ingests, Combine runs, result captured at Source.
+# ---------------------------------------------------------------------------
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT x AS total FROM ex.cached_sum_all((SELECT x FROM t));
+----
+45
+
+# The combine RPC ran (miss path).
+query I
+SELECT count(*) > 0
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'table_buffering.combine'
+  AND message LIKE '%cached_sum_all%';
+----
+true
+
+# ---------------------------------------------------------------------------
+# Second identical scan: HIT — combine + finalize-drain skipped, replayed.
+# ---------------------------------------------------------------------------
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT x AS total FROM ex.cached_sum_all((SELECT x FROM t));
+----
+45
+
+# Proof of hit: ZERO combine RPCs on the second run (the expensive reduce is skipped).
+query I
+SELECT count(*)
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'table_buffering.combine'
+  AND message LIKE '%cached_sum_all%';
+----
+0
+
+query I
+SELECT count(*) > 0
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'result_cache.hit'
+  AND message LIKE '%cached_sum_all%';
+----
+true
+
+# ---------------------------------------------------------------------------
+# Order-independence: the SAME rows in a DIFFERENT order fold to the same
+# additive digest, so they HIT the same entry (buffered result = function of the
+# input MULTISET; eligibility requires !sink_order_dependent).
+# ---------------------------------------------------------------------------
+
+statement ok
+CREATE TEMP TABLE reordered AS SELECT x::BIGINT AS x FROM (VALUES (9),(0),(7),(2),(5),(1),(8),(3),(6),(4)) v(x);
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT x AS total FROM ex.cached_sum_all((SELECT x FROM reordered));
+----
+45
+
+query I
+SELECT count(*)
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'table_buffering.combine'
+  AND message LIKE '%cached_sum_all%';
+----
+0
+
+# ---------------------------------------------------------------------------
+# Shared cache surface + flush invalidation.
+# ---------------------------------------------------------------------------
+
+query I
+SELECT count(*) > 0 FROM vgi_result_cache() WHERE function = 'cached_sum_all';
+----
+true
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT x AS total FROM ex.cached_sum_all((SELECT x FROM t));
+----
+45
+
+# After flush the next scan MISSes (combine runs again).
+query I
+SELECT count(*) > 0
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'table_buffering.combine'
+  AND message LIKE '%cached_sum_all%';
+----
+true
+
+statement ok
+CALL disable_logging();
+
+statement ok
+DETACH ex;

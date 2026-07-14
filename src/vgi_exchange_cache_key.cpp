@@ -12,6 +12,7 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/common/vector.hpp"
+#include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/function/create_sort_key.hpp"
 #include "duckdb/main/client_context.hpp"
 
@@ -120,6 +121,42 @@ std::string HashInputChunkUnordered(ClientContext & /*context*/, DataChunk &chun
 	return std::string(hex, duckdb_mbedtls::MbedTlsWrapper::SHA256_HASH_LENGTH_TEXT);
 }
 
+void AccumulateInputDigest(DataChunk &chunk, uint64_t &sum_lo, uint64_t &sum_hi, uint64_t &row_count) {
+	const idx_t n = chunk.size();
+	if (n == 0 || chunk.ColumnCount() == 0) {
+		return;
+	}
+	// One hash_t per row over ALL columns (join-hashtable pattern).
+	Vector hashes(LogicalType::HASH);
+	VectorOperations::Hash(chunk.data[0], hashes, n);
+	for (idx_t c = 1; c < chunk.ColumnCount(); c++) {
+		VectorOperations::CombineHash(hashes, chunk.data[c], n);
+	}
+	hashes.Flatten(n);
+	auto h = FlatVector::GetData<hash_t>(hashes);
+	for (idx_t i = 0; i < n; i++) {
+		// Two lanes with different odd-constant mixes make additive collisions
+		// astronomically unlikely while staying commutative/associative.
+		sum_lo += static_cast<uint64_t>(h[i]);
+		sum_hi += static_cast<uint64_t>(h[i]) * 0x9E3779B97F4A7C15ULL + 0x165667B19E3779F9ULL;
+	}
+	row_count += static_cast<uint64_t>(n);
+}
+
+std::string FinalizeInputDigest(uint64_t sum_lo, uint64_t sum_hi, uint64_t row_count) {
+	// Row count discriminates multisets that happen to fold to the same sums.
+	unsigned char buf[24];
+	auto put = [&](uint64_t v, int off) {
+		for (int i = 0; i < 8; i++) {
+			buf[off + i] = static_cast<unsigned char>((v >> (8 * i)) & 0xFF);
+		}
+	};
+	put(sum_lo, 0);
+	put(sum_hi, 8);
+	put(row_count, 16);
+	return Sha256Hex(std::string(reinterpret_cast<const char *>(buf), sizeof(buf)));
+}
+
 // ----------------------------------------------------------------------------
 // Static key builder
 // ----------------------------------------------------------------------------
@@ -219,7 +256,8 @@ std::shared_ptr<arrow::RecordBatch> DeserializeCachedRecordBatch(const VgiCached
 
 ExchangeStoreResult StoreExchangeMemoEntry(const VgiResultCacheKey &key, const VgiCacheControl &cc,
                                            const std::string &catalog_name, int64_t default_ttl_seconds,
-                                           const std::vector<std::shared_ptr<arrow::RecordBatch>> &out_batches) {
+                                           const std::vector<std::shared_ptr<arrow::RecordBatch>> &out_batches,
+                                           bool allow_disk) {
 	ExchangeStoreResult res;
 	auto skip = [&](const char *r) {
 		res.reason = r;
@@ -275,9 +313,7 @@ ExchangeStoreResult StoreExchangeMemoEntry(const VgiResultCacheKey &key, const V
 	entry->rows = rows;
 	entry->total_bytes = bytes;
 
-	// allow_disk=false: per-unit entries are tiny + numerous; a content-addressed
-	// disk ref per input chunk would thrash the store. Memory tier only (LRU-bounded).
-	if (!VgiResultCache::Instance().Insert(std::move(entry), /*allow_disk=*/false)) {
+	if (!VgiResultCache::Instance().Insert(std::move(entry), allow_disk)) {
 		return skip("too_large_for_memory");
 	}
 	res.stored = true;
