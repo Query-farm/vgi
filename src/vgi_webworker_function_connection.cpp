@@ -236,6 +236,61 @@ std::shared_ptr<arrow::RecordBatch> DecodeOuterResponse(const UnaryResponseResul
 
 } // namespace
 
+#if defined(__EMSCRIPTEN__)
+namespace {
+// Forward declaration — defined below in its own __EMSCRIPTEN__-guarded
+// anon-namespace block (same TU-local anon namespace, so this links). Needed here
+// because WebWorkerInvokeUnary (below) calls it before that definition.
+int EnsureVgiSabChannel();
+} // namespace
+#endif
+
+// Standalone unary RPC over the `worker:` SAB transport, for catalog RPCs (ATTACH
+// + discovery), which are request -> single response. Spawns/reuses the worker,
+// claims a transient slot, writes the request + EOS on c2w, reads the one response
+// on w2c, releases the slot (RAII). Self-contained (no persistent connection) so
+// InvokePooledUnaryRpc's worker: branch can call it directly. Reuses the same SAB
+// stream helpers as the streaming connection. On the native test the ensure-worker
+// stub is a no-op and the in-process ring backend serves, so this is exercisable
+// natively too.
+UnaryResponseResult WebWorkerInvokeUnary(ClientContext &context, const std::string &worker_path,
+                                         const std::string &method_name,
+                                         const std::shared_ptr<arrow::RecordBatch> &params,
+                                         const std::string &protocol_version_override) {
+	const std::string location = StripWebWorkerScheme(worker_path);
+#if defined(__EMSCRIPTEN__)
+	vgi_wasm_set_channel(EnsureVgiSabChannel());
+#endif
+	if (vgi_wasm_ensure_worker(location.c_str()) != 0) {
+		ThrowVgiIOException("Failed to spawn/ready the VGI Web Worker", location, -1, "");
+	}
+	int slot = vgi_wasm_slot_open(location.c_str());
+	if (slot < 0) {
+		ThrowVgiIOException("Failed to open SAB slot (channel exhausted)", location, -1, "");
+	}
+	// RAII: always release the transient slot (the dispatcher then serves the next).
+	struct SlotReleaser {
+		int slot;
+		~SlotReleaser() {
+			if (slot >= 0) {
+				vgi_wasm_slot_release(slot);
+			}
+		}
+	} releaser {slot};
+
+	std::vector<uint8_t> request = params ? SerializeRpcRequest(method_name, params, protocol_version_override)
+	                                      : SerializeEmptyRpcRequest(method_name);
+	auto out = std::make_shared<SabOutputStream>(slot);
+	auto write_status = out->Write(request.data(), static_cast<int64_t>(request.size()));
+	if (!write_status.ok()) {
+		ThrowVgiIOException("Failed to write unary request: %s", location, -1, "", write_status.ToString());
+	}
+	// EOS on c2w so the worker's serve loop reads exactly this one request,
+	// responds on w2c, then returns (transient slot = one request lifecycle).
+	vgi_wasm_slot_write_eos(slot);
+	return SabReadUnaryResponse(slot, &context, location);
+}
+
 // ============================================================================
 // WebWorkerFunctionConnection
 // ============================================================================
@@ -311,6 +366,13 @@ void WebWorkerFunctionConnection::EnsureWorkerSpawned() {
 		// JS runtime before the slot stubs touch it. (Native test: static ring.)
 		vgi_wasm_set_channel(EnsureVgiSabChannel());
 #endif
+		// Ensure the Web Worker for this location exists and is serving the channel
+		// before we claim a slot. Idempotent (spawns once per location); blocks
+		// until the worker booted. On the native test the stub is a no-op (returns
+		// 0) — the in-process ring backend needs no spawn.
+		if (vgi_wasm_ensure_worker(location_.c_str()) != 0) {
+			ThrowVgiIOException("Failed to spawn/ready the VGI Web Worker", location_, -1, "");
+		}
 		slot_ = vgi_wasm_slot_open(location_.c_str());
 		if (slot_ < 0) {
 			ThrowVgiIOException("Failed to open SAB slot (channel exhausted)", location_, -1, "");

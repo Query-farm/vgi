@@ -17,6 +17,7 @@
 #include "vgi_arrow_utils.hpp"
 #include "vgi_ifunction_connection.hpp"
 #include "vgi_protocol.hpp"
+#include "vgi_rpc_client.hpp"  // UnaryResponseResult (return of WebWorkerInvokeUnary)
 #include "vgi_rpc_types.hpp" // CopyFromBindContext/CopyToBindContext (complete type for optional<> members)
 
 namespace duckdb {
@@ -27,6 +28,16 @@ namespace vgi {
 
 // Forward declarations
 struct VgiSecretRequirement;
+
+// Standalone unary RPC over the `worker:` SAB transport, for catalog RPCs (ATTACH
+// + discovery) which are request -> single response. Claims a transient slot,
+// writes the request + EOS, reads the one response, releases the slot. Called from
+// InvokePooledUnaryRpc's worker: branch. Definition in the .cpp (guarded on
+// __EMSCRIPTEN__ || VGI_SAB_NATIVE_TEST).
+UnaryResponseResult WebWorkerInvokeUnary(ClientContext &context, const std::string &worker_path,
+                                         const std::string &method_name,
+                                         const std::shared_ptr<arrow::RecordBatch> &params,
+                                         const std::string &protocol_version_override);
 
 // ============================================================================
 // WebWorkerFunctionConnection - vgi_rpc Protocol over the `worker:` SAB transport

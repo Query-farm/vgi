@@ -1,0 +1,69 @@
+// Worker-side emscripten --js-library for the VGI browser `worker:` module.
+// Implements the three ops sabtable's serve entry imports
+// (vgi_sab_worker_read/write/close), operating on DuckDB's *delivered* channel
+// buffer (globalThis.__vgiBuf at byte offset globalThis.__vgiBase) — NOT this
+// module's own linear memory. The ring math is byte-exact to
+// vgi/src/include/vgi_sab_abi.hpp and mirrors lib/vgi-sab-ring.js's worker ops
+// (workerRead=c2w read, workerWrite=w2c write, workerCloseW2c). The `ptr`
+// argument is a pointer into THIS module's HEAPU8 (the Rust serve buffers); the
+// ring lives in the foreign delivered buffer, so each op copies across the two.
+addToLibrary({
+  $vgiW: {
+    i32: function () { return new Int32Array(globalThis.__vgiBuf); },
+    u8: function () { return new Uint8Array(globalThis.__vgiBuf); },
+    hdr: function () {
+      var i = this.i32(); var h = globalThis.__vgiBase >> 2;
+      // header i32 lanes: [3]=ring_cap [4]=slot_stride [5]=slots_off
+      return { ringCap: i[h + 3], slotStride: i[h + 4], slotsOff: i[h + 5] };
+    },
+    slotByte: function (hdr, slot) { return globalThis.__vgiBase + hdr.slotsOff + slot * hdr.slotStride; },
+    // Blocking ring read (ring in delivered buf) -> this module's HEAP at dstPtr.
+    ringRead: function (ctl, wLane, rLane, clLane, dataByte, ringCap, dstPtr, n) {
+      var i = this.i32(); var src = this.u8(); var dst = HEAPU8;
+      for (;;) {
+        var w = Atomics.load(i, ctl + wLane); var r = Atomics.load(i, ctl + rLane);
+        var avail = w - r;
+        if (avail === 0) {
+          if (Atomics.load(i, ctl + clLane) === 1) return 0; // EOS
+          Atomics.wait(i, ctl + wLane, w, 250); continue;
+        }
+        var k = Math.min(avail, n); var pos = r % ringCap; var first = Math.min(k, ringCap - pos);
+        dst.set(src.subarray(dataByte + pos, dataByte + pos + first), dstPtr);
+        if (k > first) dst.set(src.subarray(dataByte, dataByte + k - first), dstPtr + first);
+        Atomics.store(i, ctl + rLane, r + k); Atomics.notify(i, ctl + rLane); return k;
+      }
+    },
+    // Blocking ring write from this module's HEAP srcPtr -> ring in delivered buf.
+    ringWrite: function (ctl, wLane, rLane, dataByte, ringCap, srcPtr, n) {
+      var i = this.i32(); var dst = this.u8(); var src = HEAPU8; var off = 0;
+      while (off < n) {
+        var w = Atomics.load(i, ctl + wLane); var r = Atomics.load(i, ctl + rLane);
+        var free = ringCap - (w - r);
+        if (free === 0) { Atomics.wait(i, ctl + rLane, r, 250); continue; }
+        var k = Math.min(free, n - off); var pos = w % ringCap; var first = Math.min(k, ringCap - pos);
+        dst.set(src.subarray(srcPtr + off, srcPtr + off + first), dataByte + pos);
+        if (k > first) dst.set(src.subarray(srcPtr + off + first, srcPtr + off + k), dataByte);
+        Atomics.store(i, ctl + wLane, w + k); Atomics.notify(i, ctl + wLane); off += k;
+      }
+      return n;
+    },
+  },
+  // Worker reads the client->worker ring (c2w): lanes W=1 R=2 CL=3, data at ctl+64.
+  vgi_sab_worker_read__deps: ['$vgiW'],
+  vgi_sab_worker_read: function (slot, ptr, n) {
+    var hdr = vgiW.hdr(); var sb = vgiW.slotByte(hdr, slot);
+    return vgiW.ringRead(sb >> 2, 1, 2, 3, sb + 64, hdr.ringCap, ptr, n);
+  },
+  // Worker writes the worker->client ring (w2c): lanes W=4 R=5, data at ctl+64+ring_cap.
+  vgi_sab_worker_write__deps: ['$vgiW'],
+  vgi_sab_worker_write: function (slot, ptr, n) {
+    var hdr = vgiW.hdr(); var sb = vgiW.slotByte(hdr, slot);
+    return vgiW.ringWrite(sb >> 2, 4, 5, sb + 64 + hdr.ringCap, hdr.ringCap, ptr, n);
+  },
+  // EOS on w2c: set W2C_CLOSED(=6), wake a client blocked reading w2c (on W2C_W=4).
+  vgi_sab_worker_close__deps: ['$vgiW'],
+  vgi_sab_worker_close: function (slot) {
+    var i = vgiW.i32(); var hdr = vgiW.hdr(); var sb = vgiW.slotByte(hdr, slot) >> 2;
+    Atomics.store(i, sb + 6, 1); Atomics.notify(i, sb + 4);
+  },
+});

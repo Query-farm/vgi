@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Build the VGI browser `worker:` module: sabtable's real vgi table-function
+# serve entry + the worker-side SAB js-library, linked with emscripten into a
+# MODULARIZE Web Worker module (vgi_worker.js + .wasm). The bridge spawns
+# vgi-worker-boot.js, which importScripts this module and runs the serve
+# dispatcher over DuckDB's delivered SAB channel. See docs + the WASM worker
+# transport design.
+set -euo pipefail
+cd "$(dirname "$0")"
+: "${EMSDK_DIR:=/tmp/emsdk}"
+source "$EMSDK_DIR/emsdk_env.sh" >/dev/null 2>&1
+export PATH="$EMSDK_DIR/upstream/emscripten:$PATH"
+SABLIB="${SABLIB:-$(cd ../sabtable && pwd)/target/wasm32-unknown-emscripten/release/libsabtable.a}"
+[ -f "$SABLIB" ] || { echo "build sabtable first: (cd ../sabtable && cargo +nightly build --target wasm32-unknown-emscripten -Z build-std=std,panic_abort --release)"; exit 1; }
+emcc vgi_worker_main.c "$SABLIB" \
+  --js-library vgi_worker_lib.js \
+  -sMODULARIZE=1 -sEXPORT_NAME=VgiWorker \
+  -pthread -sPTHREAD_POOL_SIZE=2 -sSHARED_MEMORY=1 \
+  -fwasm-exceptions \
+  -sENVIRONMENT=web,worker \
+  -sEXPORTED_FUNCTIONS=_main,_vgi_rust_serve_table_sab_slot,_malloc,_free \
+  -sEXPORTED_RUNTIME_METHODS=HEAPU8 \
+  -sEXIT_RUNTIME=0 -sALLOW_MEMORY_GROWTH=1 \
+  -o vgi_worker.js
+echo "built vgi_worker.js + vgi_worker.wasm"

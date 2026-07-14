@@ -15,6 +15,9 @@
 #include "vgi_github.hpp"
 #include "vgi_subprocess.hpp"
 #include "vgi_transport.hpp"
+#if defined(__EMSCRIPTEN__)
+#include "vgi_webworker_function_connection.hpp" // WebWorkerInvokeUnary (worker: unary branch)
+#endif
 #if VGI_POSIX_TRANSPORT
 // Launcher / AF_UNIX transport — POSIX only.  On builds without it (WASM,
 // Windows Phase 1) the dispatch path short-circuits with InvalidInputException;
@@ -149,6 +152,15 @@ UnaryResponseResult InvokePooledUnaryRpc(const UnaryRpcOptions &opts, const std:
 		                        /*transaction_opaque_data_hex=*/"", /*conn_id_hex=*/"",
 		                        opts.protocol_version_override.value_or(""));
 	}
+
+#if defined(__EMSCRIPTEN__)
+	// Browser worker: SAB transport — catalog RPCs (ATTACH, discovery) as a
+	// self-contained unary over a transient SAB slot (open/write+EOS/read/release).
+	if (IsWebWorkerTransport(opts.worker_path)) {
+		return WebWorkerInvokeUnary(opts.context, opts.worker_path, method_name, params,
+		                            opts.protocol_version_override.value_or(""));
+	}
+#endif
 
 	// Shared container: resolve the live endpoint at call time, then dispatch to
 	// the resolved transport (http reuses HttpInvokeUnary on the loopback URL).
