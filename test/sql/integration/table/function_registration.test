@@ -104,13 +104,15 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 #   advertising vgi.cache.ttl — backs cache/exchange_streaming.test; cached_double, a
 #   cacheable blended map — backs the LATERAL exchange-cache tests)
 # 1 cacheable buffered reducer (cached_sum_all — backs cache/exchange_buffered.test)
-# = 132
+# 2 always-revalidate (304) exchange-cache fixtures (cached_reval_echo classic +
+#   cached_reval_double blended — back cache/exchange_revalidate.test)
+# = 134
 query I
 SELECT COUNT(*)
 FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'table';
 ----
-132
+134
 
 # The 34 pure table functions (no TABLE parameter type)
 # Note: make_series appears 5 times (5 overloads), make_pairs appears 3 times,

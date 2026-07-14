@@ -218,6 +218,9 @@ struct VgiTableInOutGlobalState : public GlobalTableFunctionState {
 	VgiResultCacheKey cache_key;             // static portion; input_hash set per exchange
 	std::string cache_catalog_name;
 	int64_t cache_default_ttl_seconds = 0;
+	// Min stored-payload size before a stale revalidatable entry is conditionally
+	// revalidated (below it, refetch instead of a conditional request).
+	int64_t cache_revalidate_min_bytes = 262144;
 };
 
 // ============================================================================

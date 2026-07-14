@@ -1,0 +1,132 @@
+# name: test/sql/integration/cache/exchange_revalidate.test
+# description: Conditional revalidation (304 / not_modified) for the EXCHANGE-mode result
+#   cache — streaming table-in-out (M1) and correlated LATERAL (M2). A worker advertising
+#   the always-revalidate contract (ttl=0 + etag + revalidatable) stores an immediately-
+#   stale entry; a repeat scan sends the stored validator (vgi.cache.if_none_match) on the
+#   exchange input, the worker confirms with a 0-row not_modified batch, and the C++ side
+#   slides the entry's TTL and reuses the stored bytes instead of recomputing.
+# group: [vgi_integration_cache]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+SET threads=1;
+
+# Force revalidation even for tiny entries (the default min is 256 KB).
+statement ok
+SET vgi_result_cache_revalidate_min_bytes=0;
+
+statement ok
+CREATE TEMP TABLE t AS SELECT * FROM range(5) r(x);
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+# ---------------------------------------------------------------------------
+# Streaming table-in-out (M1): run 1 stores an immediately-stale revalidatable
+# entry; run 2 revalidates (304 not_modified) and reuses the stored bytes.
+# ---------------------------------------------------------------------------
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT x FROM ex.cached_reval_echo((SELECT x FROM t)) ORDER BY x;
+----
+0
+1
+2
+3
+4
+
+query I
+SELECT count(*) > 0
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'result_cache.store'
+  AND message LIKE '%cached_reval_echo%';
+----
+true
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT x FROM ex.cached_reval_echo((SELECT x FROM t)) ORDER BY x;
+----
+0
+1
+2
+3
+4
+
+# The repeat was a 304 revalidation, not a re-store.
+query I
+SELECT count(*) > 0
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'result_cache.revalidate'
+  AND message LIKE '%cached_reval_echo%'
+  AND message LIKE '%not_modified%';
+----
+true
+
+# ---------------------------------------------------------------------------
+# Correlated LATERAL (M2): same always-revalidate contract, per input chunk.
+# ---------------------------------------------------------------------------
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query II
+SELECT x, doubled FROM t, LATERAL ex.cached_reval_double(t.x) ORDER BY x;
+----
+0	0
+1	2
+2	4
+3	6
+4	8
+
+query I
+SELECT count(*) > 0
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'result_cache.store'
+  AND message LIKE '%cached_reval_double%';
+----
+true
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query II
+SELECT x, doubled FROM t, LATERAL ex.cached_reval_double(t.x) ORDER BY x;
+----
+0	0
+1	2
+2	4
+3	6
+4	8
+
+query I
+SELECT count(*) > 0
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'result_cache.revalidate'
+  AND message LIKE '%cached_reval_double%'
+  AND message LIKE '%not_modified%';
+----
+true
+
+statement ok
+CALL disable_logging();
+
+statement ok
+DETACH ex;

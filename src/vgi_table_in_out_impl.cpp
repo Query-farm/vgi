@@ -484,6 +484,10 @@ unique_ptr<GlobalTableFunctionState> VgiTableInOutInitGlobal(ClientContext &cont
 			if (context.TryGetCurrentSetting("vgi_result_cache_default_ttl_seconds", ttl_v)) {
 				global_state->cache_default_ttl_seconds = static_cast<int64_t>(ttl_v.GetValue<uint64_t>());
 			}
+			Value rmv;
+			if (context.TryGetCurrentSetting("vgi_result_cache_revalidate_min_bytes", rmv) && !rmv.IsNull()) {
+				global_state->cache_revalidate_min_bytes = static_cast<int64_t>(rmv.GetValue<uint64_t>());
+			}
 		} else if (reason) {
 			VGI_LOG(context, "result_cache.ineligible",
 			        {{"function", bind_data.function_name}, {"reason", reason}});
@@ -885,17 +889,32 @@ OperatorResultType VgiTableInOutFunction(ExecutionContext &context, TableFunctio
 	std::shared_ptr<arrow::RecordBatch> output_batch;
 	bool cache_hit = false;
 	VgiResultCacheKey batch_key;
+	// Conditional revalidation: a stale-but-revalidatable entry the worker can confirm
+	// via a cheap 0-row not_modified reply (validators ride the exchange input batch).
+	std::shared_ptr<const VgiResultCacheEntry> reval_entry;
 	if (global_state.cache_eligible) {
 		batch_key = global_state.cache_key;
 		batch_key.input_hash = HashInputBatchOrdered(input_batch);
-		auto entry = VgiResultCache::Instance().Lookup(batch_key, std::chrono::steady_clock::now());
-		if (entry && !entry->streams.empty() && !entry->streams[0].batches.empty()) {
-			output_batch = DeserializeCachedRecordBatch(*entry, entry->streams[0].batches[0]);
-			cache_hit = true;
-			VGI_LOG(client_context, "result_cache.hit",
-			        {{"function", bind_data.function_name},
-			         {"key_hash", batch_key.HexDigest()},
-			         {"tier", "memory"}});
+		auto now = std::chrono::steady_clock::now();
+		// Probe conditional revalidation FIRST — Lookup() drops (evicts) a stale entry,
+		// so calling it first would destroy the very entry we want to revalidate.
+		auto reval = VgiResultCache::Instance().LookupForRevalidation(batch_key, now);
+		if (reval && reval->revalidatable && !reval->streams.empty() &&
+		    reval->total_bytes >= global_state.cache_revalidate_min_bytes) {
+			// Arm the exchange with its validators; do NOT serve yet — the worker
+			// confirms (304 → reuse stored) or returns fresh data (recapture).
+			reval_entry = reval;
+			conn.SetConditionalRequest(reval->etag, reval->last_modified);
+		} else {
+			auto entry = VgiResultCache::Instance().Lookup(batch_key, now);
+			if (entry && !entry->streams.empty() && !entry->streams[0].batches.empty()) {
+				output_batch = DeserializeCachedRecordBatch(*entry, entry->streams[0].batches[0]);
+				cache_hit = true;
+				VGI_LOG(client_context, "result_cache.hit",
+				        {{"function", bind_data.function_name},
+				         {"key_hash", batch_key.HexDigest()},
+				         {"tier", "memory"}});
+			}
 		}
 	}
 
@@ -933,10 +952,33 @@ OperatorResultType VgiTableInOutFunction(ExecutionContext &context, TableFunctio
 			output_batch = conn.ReadDataBatch();
 		}
 
+		// Conditional revalidation: if we armed validators for this unit, clear them so
+		// the next input batch's exchange isn't a stray conditional request. If the
+		// worker answered 304 (a 0-row vgi.cache.not_modified batch), slide the stored
+		// entry's TTL and serve its bytes instead of re-storing — the payload is
+		// unchanged. Otherwise the fresh response falls through to normal capture below
+		// (replacing the stale entry).
+		if (reval_entry) {
+			conn.SetConditionalRequest("", "");
+			if (output_batch && output_batch->num_rows() == 0) {
+				auto cc = conn.GetLastCacheControl();
+				if (cc.not_modified) {
+					SlideRevalidatedExchangeEntry(*reval_entry, cc, global_state.cache_default_ttl_seconds,
+					                              /*allow_disk=*/true);
+					output_batch = DeserializeCachedRecordBatch(*reval_entry, reval_entry->streams[0].batches[0]);
+					cache_hit = true; // serve the stored bytes; skip the store below
+					VGI_LOG(client_context, "result_cache.revalidate",
+					        {{"function", bind_data.function_name},
+					         {"key_hash", batch_key.HexDigest()},
+					         {"outcome", "not_modified"}});
+				}
+			}
+		}
+
 		// Latch the worker's cache-control advertisement off the first exchange
 		// output, then (if cacheable) memoize this input batch's output. Skip on the
 		// terminal EOS batch (nullptr) — there is nothing to cache and cc rides data.
-		if (global_state.cache_eligible && output_batch) {
+		if (!cache_hit && global_state.cache_eligible && output_batch) {
 			if (!local_state.cache_cc_latched) {
 				local_state.cache_cc = conn.GetLastCacheControl();
 				local_state.cache_cc_latched = true;

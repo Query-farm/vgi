@@ -104,6 +104,12 @@ struct ExchangeStoreResult {
 	int64_t bytes = 0;
 };
 
+//! On a 304 not_modified reply, re-insert the stored entry with a slid TTL (and any
+//! refreshed validators from `cc`) so future lookups hit fresh without re-fetching.
+//! Mirrors the producer's MaybeSlideRevalidatedEntry. Best-effort.
+void SlideRevalidatedExchangeEntry(const VgiResultCacheEntry &entry, const VgiCacheControl &cc,
+                                   int64_t default_ttl_seconds, bool allow_disk);
+
 //! Build a cache entry from one input unit's output batches and Insert it. Freshness
 //! from `cc`: a positive ttl (from cc.ttl_seconds or default_ttl_seconds) is required;
 //! no_store and transaction-scoped results are refused. `allow_disk` opts the entry

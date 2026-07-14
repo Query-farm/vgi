@@ -313,6 +313,38 @@ std::shared_ptr<arrow::RecordBatch> DeserializeCachedRecordBatch(const VgiResult
 	return next_result.ValueUnsafe().batch;
 }
 
+void SlideRevalidatedExchangeEntry(const VgiResultCacheEntry &entry, const VgiCacheControl &cc,
+                                   int64_t /*default_ttl_seconds*/, bool allow_disk) {
+	auto fresh = std::make_shared<VgiResultCacheEntry>(entry); // shallow copy (shared Buffers)
+	fresh->stored_at = std::chrono::steady_clock::now();
+	// A fresh ttl on the not_modified batch wins; else reuse the PRIOR lifetime so a
+	// validator-only 304 slides forward — and, crucially, an always-revalidate entry
+	// (prior lifetime 0 / immediately stale) stays immediately stale so it keeps
+	// revalidating (do NOT fall to a positive default). Mirrors the producer.
+	int64_t ttl = cc.ttl_seconds.value_or(0);
+	if (ttl <= 0 && !entry.never_expires) {
+		auto prior =
+		    std::chrono::duration_cast<std::chrono::seconds>(entry.expires_at - entry.stored_at).count();
+		ttl = prior > 0 ? prior : 0;
+	}
+	if (ttl > VGI_CACHE_MAX_TTL_SECONDS) {
+		ttl = VGI_CACHE_MAX_TTL_SECONDS;
+	}
+	if (!entry.never_expires) {
+		fresh->expires_at = fresh->stored_at + std::chrono::seconds(ttl > 0 ? ttl : 0);
+	}
+	if (!cc.etag.empty()) {
+		fresh->etag = cc.etag;
+	}
+	if (!cc.last_modified.empty()) {
+		fresh->last_modified = cc.last_modified;
+	}
+	// An immediately-stale (always-revalidate) entry is memory-only: LookupForRevalidation
+	// probes the in-memory index, and a disk immediately-stale blob is un-loadable.
+	bool eff_allow_disk = allow_disk && (entry.never_expires || fresh->expires_at > fresh->stored_at);
+	VgiResultCache::Instance().Insert(fresh, eff_allow_disk);
+}
+
 ExchangeStoreResult StoreExchangeMemoEntry(const VgiResultCacheKey &key, const VgiCacheControl &cc,
                                            const std::string &catalog_name, int64_t default_ttl_seconds,
                                            const std::vector<std::shared_ptr<arrow::RecordBatch>> &out_batches,
@@ -335,11 +367,17 @@ ExchangeStoreResult StoreExchangeMemoEntry(const VgiResultCacheKey &key, const V
 	if (ttl > VGI_CACHE_MAX_TTL_SECONDS) {
 		ttl = VGI_CACHE_MAX_TTL_SECONDS;
 	}
-	// v1: a positive ttl is required (expires-only advertisements fall back to the
-	// default; if that is also 0 there is no freshness basis → refuse).
-	if (ttl <= 0) {
+	// A positive ttl is required UNLESS this is the "always-revalidate" (HTTP no-cache)
+	// contract: ttl=0 + a validator (etag) + revalidatable — stored but immediately
+	// stale, so every read revalidates via a conditional request and a 304 reuses the
+	// stored bytes. Such an entry is memory-only (LookupForRevalidation probes memory;
+	// a disk immediately-stale blob is un-loadable).
+	const bool immediately_stale = ttl <= 0;
+	const bool revalidatable_no_cache = immediately_stale && cc.revalidatable && !cc.etag.empty();
+	if (immediately_stale && !revalidatable_no_cache) {
 		return skip("no_freshness");
 	}
+	const bool eff_allow_disk = allow_disk && !immediately_stale;
 
 	auto entry = std::make_shared<VgiResultCacheEntry>();
 	entry->key = key;
@@ -349,7 +387,7 @@ ExchangeStoreResult StoreExchangeMemoEntry(const VgiResultCacheKey &key, const V
 	entry->last_modified = cc.last_modified;
 	entry->revalidatable = cc.revalidatable;
 	entry->stored_at = std::chrono::steady_clock::now();
-	entry->expires_at = entry->stored_at + std::chrono::seconds(ttl);
+	entry->expires_at = entry->stored_at + std::chrono::seconds(immediately_stale ? 0 : ttl);
 
 	CachedStream stream;
 	int64_t rows = 0;
@@ -372,7 +410,7 @@ ExchangeStoreResult StoreExchangeMemoEntry(const VgiResultCacheKey &key, const V
 	entry->rows = rows;
 	entry->total_bytes = bytes;
 
-	if (!VgiResultCache::Instance().Insert(std::move(entry), allow_disk)) {
+	if (!VgiResultCache::Instance().Insert(std::move(entry), eff_allow_disk)) {
 		return skip("too_large_for_memory");
 	}
 	res.stored = true;

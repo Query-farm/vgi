@@ -127,6 +127,7 @@ struct VgiLateralBatchOperatorState : public OperatorState {
 	VgiResultCacheKey cache_static_key;
 	std::string cache_catalog_name;
 	int64_t cache_default_ttl_seconds = 0;
+	int64_t cache_revalidate_min_bytes = 262144;
 	VgiCacheControl cache_cc;   // latched from the first exchange output
 	bool cache_cc_latched = false;
 	// MISS capture: the current input chunk's full key + its accumulated POST-STAMP
@@ -328,6 +329,10 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 			if (client_context.TryGetCurrentSetting("vgi_result_cache_default_ttl_seconds", ttl_v)) {
 				state.cache_default_ttl_seconds = static_cast<int64_t>(ttl_v.GetValue<uint64_t>());
 			}
+			Value rmv;
+			if (client_context.TryGetCurrentSetting("vgi_result_cache_revalidate_min_bytes", rmv) && !rmv.IsNull()) {
+				state.cache_revalidate_min_bytes = static_cast<int64_t>(rmv.GetValue<uint64_t>());
+			}
 		} else if (reason) {
 			VGI_LOG(client_context, "result_cache.ineligible",
 			        {{"function", bd.function_name}, {"reason", reason}});
@@ -377,20 +382,31 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 	// (B) Fresh input chunk. Cache lookup on the static key + order-independent
 	// FULL-chunk input hash. A HIT replays the cached POST-STAMP output (correlated
 	// columns baked in — no re-stamp; sound because the operator is NO_ORDER).
+	std::shared_ptr<const VgiResultCacheEntry> reval_entry; // armed conditional revalidation
 	if (state.cache_eligible) {
 		state.capture_key = state.cache_static_key;
 		state.capture_key.input_hash = HashInputChunkUnordered(client_context, input);
-		auto entry = VgiResultCache::Instance().Lookup(state.capture_key, std::chrono::steady_clock::now());
-		if (entry) {
-			VGI_LOG(client_context, "result_cache.hit",
-			        {{"function", bd.function_name}, {"key_hash", state.capture_key.HexDigest()}, {"tier", "memory"}});
-			if (entry->streams.empty() || entry->streams[0].batches.empty()) {
-				chunk.SetCardinality(0); // cached empty (all-filtered) result — nothing to emit
-				return OperatorResultType::NEED_MORE_INPUT;
+		auto now = std::chrono::steady_clock::now();
+		// Probe conditional revalidation FIRST (Lookup evicts a stale entry). If a
+		// large-enough stale revalidatable entry exists, arm the exchange with its
+		// validators; the worker confirms (304 → reuse stored) or returns fresh data.
+		auto reval = VgiResultCache::Instance().LookupForRevalidation(state.capture_key, now);
+		if (reval && reval->revalidatable && !reval->streams.empty() &&
+		    reval->total_bytes >= state.cache_revalidate_min_bytes) {
+			reval_entry = reval;
+		} else {
+			auto entry = VgiResultCache::Instance().Lookup(state.capture_key, now);
+			if (entry) {
+				VGI_LOG(client_context, "result_cache.hit",
+				        {{"function", bd.function_name}, {"key_hash", state.capture_key.HexDigest()}, {"tier", "memory"}});
+				if (entry->streams.empty() || entry->streams[0].batches.empty()) {
+					chunk.SetCardinality(0); // cached empty (all-filtered) result — nothing to emit
+					return OperatorResultType::NEED_MORE_INPUT;
+				}
+				state.serving = entry;
+				state.serve_cursor = 0;
+				return EmitServedSlice(state, state.serve_arrow_table, chunk);
 			}
-			state.serving = entry;
-			state.serve_cursor = 0;
-			return EmitServedSlice(state, state.serve_arrow_table, chunk);
 		}
 	}
 
@@ -406,6 +422,12 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 			state.scan.column_ids = worker_column_ids;
 		}
 		state.connection = AcquireBlendedInputConnection(client_context, bd, state.substream_id, projection_ids);
+	}
+
+	// Arm conditional-revalidation validators for this chunk's exchange (they ride the
+	// input batch's metadata). Cleared right after the exchange so they don't leak.
+	if (reval_entry) {
+		state.connection->SetConditionalRequest(reval_entry->etag, reval_entry->last_modified);
 	}
 
 	// Split off the worker-input columns [0, input_length) as a zero-copy view.
@@ -440,6 +462,28 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 		throw IOException("vgi_batch_lateral: worker '%s' function '%s' returned end-of-stream "
 		                  "mid-exchange (expected one output batch per input chunk)",
 		                  bd.worker_path(), bd.function_name);
+	}
+
+	// Conditional revalidation: clear the armed validators (so the next chunk's exchange
+	// isn't a stray conditional request) and, on a 304 (0-row not_modified reply), slide
+	// the stored entry's TTL and serve its cached POST-STAMP output instead of the worker
+	// response. Otherwise the fresh response falls through to the normal capture path.
+	if (reval_entry) {
+		state.connection->SetConditionalRequest("", "");
+		if (output_batch->num_rows() == 0) {
+			auto cc = state.connection->GetLastCacheControl();
+			if (cc.not_modified) {
+				SlideRevalidatedExchangeEntry(*reval_entry, cc, state.cache_default_ttl_seconds,
+				                              /*allow_disk=*/true);
+				VGI_LOG(client_context, "result_cache.revalidate",
+				        {{"function", bd.function_name},
+				         {"key_hash", state.capture_key.HexDigest()},
+				         {"outcome", "not_modified"}});
+				state.serving = reval_entry;
+				state.serve_cursor = 0;
+				return EmitServedSlice(state, state.serve_arrow_table, chunk);
+			}
+		}
 	}
 
 	// Latch the worker's cache-control advertisement off the first exchange output.

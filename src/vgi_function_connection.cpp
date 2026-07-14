@@ -1342,6 +1342,31 @@ void FunctionConnection::WriteInputBatch(const std::shared_ptr<arrow::RecordBatc
 	}
 #endif
 
+	// Conditional-revalidation validators (exchange-mode result cache): ride the
+	// exchange input batch's custom_metadata (the worker's exchange process() reads
+	// them, mirroring the producer's first tick) so the worker can answer 304-style
+	// with a 0-row vgi.cache.not_modified batch. The caller (an exchange operator)
+	// sets them per input unit via SetConditionalRequest and clears them after, so
+	// they never leak to the next unit. Merged with any shm pointer metadata.
+	if (!cond_if_none_match_.empty() || !cond_if_modified_since_.empty()) {
+		std::vector<std::string> keys, vals;
+		if (write_meta) {
+			for (int64_t i = 0; i < write_meta->size(); i++) {
+				keys.push_back(write_meta->key(i));
+				vals.push_back(write_meta->value(i));
+			}
+		}
+		if (!cond_if_none_match_.empty()) {
+			keys.emplace_back(VGI_CACHE_IF_NONE_MATCH_KEY);
+			vals.push_back(cond_if_none_match_);
+		}
+		if (!cond_if_modified_since_.empty()) {
+			keys.emplace_back(VGI_CACHE_IF_MODIFIED_SINCE_KEY);
+			vals.push_back(cond_if_modified_since_);
+		}
+		write_meta = arrow::KeyValueMetadata::Make(std::move(keys), std::move(vals));
+	}
+
 	auto write_status = write_meta ? input_writer_->WriteRecordBatch(*to_write, write_meta)
 	                               : input_writer_->WriteRecordBatch(*to_write);
 	if (!write_status.ok()) {

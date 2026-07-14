@@ -674,10 +674,25 @@ by default (needs `vgi_result_cache_dir`), so this only persists when configured
 `BuildExchangeCacheKeyStatic` calls `SyncResultCacheSettings` (mirroring the producer's
 `ConfigureIfChanged`) so `SET vgi_result_cache_dir/…` reaches the singleton on the exchange
 path; `DeserializeCachedRecordBatch` is disk-aware (positioned-reads a streaming entry's
-batch from the blob). Transaction scope is refused for exchange entries in v1. Conditional
-revalidation (etag/last-modified/304/stale-while-revalidate) is **producer-only** — exchange
-entries store the validator fields but a stale entry is a plain miss, not a 304 refresh.
-Fixtures (vgi-python `_test_fixtures/table_in_out.py`):
+batch from the blob). Transaction scope is refused for exchange entries in v1.
+
+**Conditional revalidation (304).** Wired for the **streaming table-in-out (M1)** and
+**correlated LATERAL (M2)** operators (both transports). A worker advertises the
+always-revalidate contract (`ttl=0 + etag + revalidatable` → stored but immediately
+stale, memory-only). On a repeat, the operator probes `LookupForRevalidation` FIRST
+(plain `Lookup` evicts a stale entry), and if the entry is ≥
+`vgi_result_cache_revalidate_min_bytes` arms the exchange: the stored validators ride
+the `WriteInputBatch` input-batch metadata (`SetConditionalRequest` →
+`vgi.cache.if_none_match`/`if_modified_since`), the worker's exchange `process()` reads
+them off `input.custom_metadata` (surfaced on `ProcessParams`) and answers a 0-row
+`CacheControl(not_modified=True)`, and the operator slides the entry's TTL
+(`SlideRevalidatedExchangeEntry`) + serves the stored bytes (`result_cache.revalidate
+outcome=not_modified`) instead of recomputing. The vgi-python buffered/exchange
+`finalize()`/`exchange()` now surface the validators. **NOT wired for buffered (M3)** —
+its request model (combine/finalize, key known only at Finalize) doesn't fit the
+per-unit validator flow; a buffered stale entry is a plain miss (documented follow-up).
+Fixtures: `cached_reval_echo` (M1 classic), `cached_reval_double` (M2 blended).
+Other fixtures (vgi-python `_test_fixtures/table_in_out.py`):
 `cached_echo` (streaming), `cached_double` (LATERAL), `cached_sum_all` (buffered). Tests:
 `test/sql/integration/cache/exchange_{streaming,lateral,buffered}.test` (both transports;
 hit-skips-worker, LATERAL order-independence + correlated correctness, shared surface + flush).
