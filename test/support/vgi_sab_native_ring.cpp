@@ -167,4 +167,11 @@ int vgi_sab_worker_write(int slot, const uint8_t *d, int n) {
 void vgi_sab_worker_close(int slot) {
 	slot_at(slot).w2c.close_ring();
 }
+// Browser pthread-pool dispatcher hook — unused natively (the native tests drive a
+// single slot via vgi_rust_serve_table_sab_slot directly, not the multi-thread
+// pool). Present so sabtable's serve_slot_loop / serve_pool link in native builds.
+void vgi_worker_await_slot(int /*slot*/) {
+}
+void vgi_worker_await_release(int /*slot*/) {
+}
 }

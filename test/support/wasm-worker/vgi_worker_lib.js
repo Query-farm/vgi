@@ -66,4 +66,24 @@ addToLibrary({
     var i = vgiW.i32(); var hdr = vgiW.hdr(); var sb = vgiW.slotByte(hdr, slot) >> 2;
     Atomics.store(i, sb + 6, 1); Atomics.notify(i, sb + 4);
   },
+  // Per-thread dispatcher: block until `slot` is CLAIMED (STATE 0 -> 1) and ready to
+  // serve. Called BEFORE serving. If the slot is already claimed (the client raced
+  // ahead of this thread), returns immediately — do NOT wait for a release first, or
+  // the thread deadlocks waiting for a release that only happens after it serves.
+  // Parks on the STATE lane (lane 0), which slot_open notifies; 500ms is a safety poll.
+  vgi_worker_await_slot__deps: ['$vgiW'],
+  vgi_worker_await_slot: function (slot) {
+    var i = vgiW.i32(); var hdr = vgiW.hdr();
+    var stateLane = vgiW.slotByte(hdr, slot) >> 2; // STATE = lane 0
+    while (Atomics.load(i, stateLane) === 0) Atomics.wait(i, stateLane, 0, 500);
+  },
+  // Block until `slot` is RELEASED (STATE 1 -> 0). Called AFTER serving one request
+  // so the thread doesn't re-serve the same drained/closed slot before the client
+  // releases it (slot_release notifies the STATE lane).
+  vgi_worker_await_release__deps: ['$vgiW'],
+  vgi_worker_await_release: function (slot) {
+    var i = vgiW.i32(); var hdr = vgiW.hdr();
+    var stateLane = vgiW.slotByte(hdr, slot) >> 2;
+    while (Atomics.load(i, stateLane) === 1) Atomics.wait(i, stateLane, 1, 500);
+  },
 });
