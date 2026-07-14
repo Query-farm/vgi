@@ -101,7 +101,15 @@ public:
 	                           GlobalOperatorState &gstate, OperatorState &state) const override;
 
 	bool ParallelOperator() const override {
-		return false; // spike: single-threaded; parallel per-substream fan-out follows.
+		// Each pipeline-executor thread owns its OperatorState -> its own substream_id
+		// -> its own worker (Phase A per-substream fan-out). No shared connection.
+		return true;
+	}
+
+	OrderPreservationType OperatorOrder() const override {
+		// LATERAL without an outer ORDER BY is unordered, and after decorrelation the
+		// correlated columns are value-joined, so cross-morsel reordering is sound.
+		return OrderPreservationType::NO_ORDER;
 	}
 
 	string GetName() const override;

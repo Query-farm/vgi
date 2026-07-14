@@ -1,9 +1,13 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "vgi_lateral_batch_operator.hpp"
 
+#include <cstring>
+
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
+#include "duckdb/common/types/selection_vector.hpp"
+#include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/config.hpp"
@@ -93,7 +97,73 @@ struct VgiLateralBatchOperatorState : public OperatorState {
 	std::unique_ptr<IFunctionConnection> connection; // this thread's own worker
 	std::vector<uint8_t> substream_id;
 	VgiTableInOutLocalState scan; // drain buffer for the worker output batch
+	// Per-output-row parent input-row index for the batch currently in `scan`.
+	// Held across HAVE_MORE_OUTPUT slices (the input chunk is re-passed unchanged
+	// by DuckDB while draining, so stamping stays correct). Identity [0..n) when the
+	// worker emitted no provenance (1->1 maps). Cleared when the batch is exhausted.
+	std::vector<int32_t> parent_index;
 };
+
+// Decode the worker's per-output-row provenance. `raw` is the base64-decoded raw
+// little-endian int32[] from the batch's ``vgi_rpc.parent_row`` metadata (already
+// b64-decoded by the connection). Empty = no provenance: assume an identity 1->1
+// map (valid only when output rows == input rows, else a loud error). Validates
+// length and that every parent index is in [0, input_rows).
+std::vector<int32_t> DecodeParentRow(const std::string &raw, idx_t output_rows, idx_t input_rows,
+                                     const VgiTableInOutBindData &bd) {
+	std::vector<int32_t> result;
+	if (raw.empty()) {
+		if (output_rows != input_rows) {
+			throw IOException(
+			    "vgi_batch_lateral: worker '%s' function '%s' returned %llu output rows for %llu input rows "
+			    "without vgi_rpc.parent_row provenance; a fan-out (1->N) or filtering (1->0) blended LATERAL map "
+			    "must emit per-output-row parent indices",
+			    bd.worker_path(), bd.function_name, (unsigned long long)output_rows, (unsigned long long)input_rows);
+		}
+		result.resize(output_rows);
+		for (idx_t i = 0; i < output_rows; i++) {
+			result[i] = static_cast<int32_t>(i);
+		}
+		return result;
+	}
+	if (raw.size() != output_rows * sizeof(int32_t)) {
+		throw IOException("vgi_batch_lateral: vgi_rpc.parent_row is %llu bytes for %llu output rows "
+		                  "(expected %llu); worker '%s' function '%s'",
+		                  (unsigned long long)raw.size(), (unsigned long long)output_rows,
+		                  (unsigned long long)(output_rows * sizeof(int32_t)), bd.worker_path(), bd.function_name);
+	}
+	result.resize(output_rows);
+	std::memcpy(result.data(), raw.data(), raw.size()); // LE int32[] — DuckDB targets are little-endian
+	for (idx_t i = 0; i < output_rows; i++) {
+		if (result[i] < 0 || static_cast<idx_t>(result[i]) >= input_rows) {
+			throw IOException("vgi_batch_lateral: parent_row[%llu] = %d is out of range [0, %llu); "
+			                  "worker '%s' function '%s'",
+			                  (unsigned long long)i, result[i], (unsigned long long)input_rows, bd.worker_path(),
+			                  bd.function_name);
+		}
+	}
+	return result;
+}
+
+// Stamp the projected/correlated columns onto the produced output slice by gathering
+// each input correlated column at the parent-row index of every output row. `start`
+// is the offset into `parent_index` for the first row of this slice (== the scan's
+// chunk_offset before this ProduceOutputFromBatch call).
+void StampProjected(DataChunk &chunk, DataChunk &input, const std::vector<int32_t> &parent_index,
+                    const std::vector<column_t> &projected_input, idx_t base_idx, idx_t start, idx_t produced) {
+	if (produced == 0) {
+		return;
+	}
+	SelectionVector sel(produced);
+	for (idx_t r = 0; r < produced; r++) {
+		sel.set_index(r, static_cast<idx_t>(parent_index[start + r]));
+	}
+	for (idx_t k = 0; k < projected_input.size(); k++) {
+		// target[r] = input_col[sel[r]] — a flat gather that severs the input
+		// dependency for the emitted chunk (like the streaming-window op's copy).
+		VectorOperations::Copy(input.data[projected_input[k]], chunk.data[base_idx + k], sel, produced, 0, 0);
+	}
+}
 
 } // anonymous namespace
 
@@ -128,12 +198,25 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 		state.connection = AcquireBlendedInputConnection(client_context, bd, state.substream_id);
 	}
 
+	// (A) Drain the remaining slices of the output batch already loaded in `scan`.
+	// DuckDB re-passes the SAME `input` chunk unchanged across HAVE_MORE_OUTPUT, so
+	// the held parent_index still refers to the right correlated rows.
+	if (HasRemainingBatchData(state.scan)) {
+		idx_t start = state.scan.chunk_offset; // rows already produced from this batch
+		idx_t produced = ProduceOutputFromBatch(state.scan, bd.arrow_table, chunk);
+		StampProjected(chunk, input, state.parent_index, projected_input, base_idx, start, produced);
+		chunk.SetCardinality(produced);
+		return HasRemainingBatchData(state.scan) ? OperatorResultType::HAVE_MORE_OUTPUT
+		                                         : OperatorResultType::NEED_MORE_INPUT;
+	}
+
 	if (input.size() == 0) {
 		chunk.SetCardinality(0);
 		return OperatorResultType::NEED_MORE_INPUT;
 	}
 
-	// Split off the worker-input columns [0, input_length) as a zero-copy view.
+	// (B) Fresh input chunk: split off the worker-input columns [0, input_length)
+	// as a zero-copy view.
 	DataChunk worker_input;
 	vector<LogicalType> in_types;
 	in_types.reserve(input_length);
@@ -163,34 +246,23 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 		return OperatorResultType::FINISHED;
 	}
 	if (output_batch->num_rows() == 0) {
-		// 1->0: every input row filtered out this chunk.
+		// 1->0 for the WHOLE chunk: every input row filtered out. (A per-row 1->0 with
+		// some surviving rows carries provenance and is handled by the stamp below.)
 		chunk.SetCardinality(0);
 		return OperatorResultType::NEED_MORE_INPUT;
 	}
 
-	// SPIKE: 1->1 identity provenance only. Assert row-alignment so the direct
-	// Reference stamp below is correct; multi-slice drain + real provenance follow.
-	if (static_cast<idx_t>(output_batch->num_rows()) != input.size()) {
-		throw NotImplementedException(
-		    "vgi_batch_lateral spike supports only 1->1 maps (got %lld output rows for %llu input rows); "
-		    "provenance-based 1->N is not yet implemented",
-		    (long long)output_batch->num_rows(), (unsigned long long)input.size());
-	}
+	// Decode provenance (identity when absent + rows align). Held for the drain.
+	state.parent_index = DecodeParentRow(state.connection->GetLastParentRowBytes(),
+	                                     static_cast<idx_t>(output_batch->num_rows()), input.size(), bd);
 
 	LoadBatchIntoScanState(state.scan, output_batch);
+	idx_t start = state.scan.chunk_offset; // 0 for a freshly loaded batch
 	idx_t produced = ProduceOutputFromBatch(state.scan, bd.arrow_table, chunk); // fills [0, base_idx)
-	if (HasRemainingBatchData(state.scan)) {
-		throw NotImplementedException("vgi_batch_lateral spike: output batch > STANDARD_VECTOR_SIZE "
-		                              "(multi-slice drain not yet implemented)");
-	}
-
-	// Identity stamp: output row r <- input row r, so each projected/outer column
-	// is a direct reference to the input's correlated column (aligned 1:1).
-	for (idx_t k = 0; k < projected_input.size(); k++) {
-		chunk.data[base_idx + k].Reference(input.data[projected_input[k]]);
-	}
+	StampProjected(chunk, input, state.parent_index, projected_input, base_idx, start, produced);
 	chunk.SetCardinality(produced);
-	return OperatorResultType::NEED_MORE_INPUT;
+	return HasRemainingBatchData(state.scan) ? OperatorResultType::HAVE_MORE_OUTPUT
+	                                         : OperatorResultType::NEED_MORE_INPUT;
 }
 
 string PhysicalVgiLateralBatch::GetName() const {

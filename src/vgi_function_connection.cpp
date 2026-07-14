@@ -1153,6 +1153,28 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 			}
 		}
 
+		// Parse vgi_rpc.parent_row#b64 off the wire metadata (per-output-row parent
+		// input-row index for the batched-lateral operator). Raw little-endian
+		// int32 array (length == batch rows); the operator decodes + validates it.
+		// Empty = no provenance on this batch (identity mapping assumed).
+		last_parent_row_bytes_.clear();
+		if (result.custom_metadata) {
+			int pr_idx = result.custom_metadata->FindKey("vgi_rpc.parent_row#b64");
+			if (pr_idx >= 0) {
+				const std::string &b64_value = result.custom_metadata->value(pr_idx);
+				try {
+					string_t b64_str(b64_value.data(), static_cast<uint32_t>(b64_value.size()));
+					idx_t decoded_size = Blob::FromBase64Size(b64_str);
+					last_parent_row_bytes_.resize(decoded_size);
+					Blob::FromBase64(b64_str, data_ptr_cast(last_parent_row_bytes_.data()), decoded_size);
+				} catch (const std::exception &e) {
+					throw IOException("VGI worker emitted invalid base64 payload in "
+					                  "vgi_rpc.parent_row#b64: %s [worker: %s, pid: %d]",
+					                  e.what(), worker_path_, proc_ ? proc_->GetPid() : 0);
+				}
+			}
+		}
+
 		// Parse vgi_batch_index off the wire metadata, if present. Validation
 		// (missing-tag / cap / monotonicity) happens in VgiTableFunctionImpl's
 		// InstallBatch on the consumer thread — here we just stash the raw

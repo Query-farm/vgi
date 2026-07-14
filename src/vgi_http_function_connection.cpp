@@ -59,17 +59,17 @@ static idx_t ParseVgiBatchIndex(const std::shared_ptr<arrow::KeyValueMetadata> &
 	}
 }
 
-// Helper: base64-decode the ``vgi_partition_values#b64`` payload into
-// raw Arrow IPC bytes. Returns empty string when the key is absent.
-// Raises IOException when present but the base64 is invalid. IPC
-// decode + validation happen downstream in InstallBatch.
-static std::string ParseVgiPartitionValuesBytes(
+// Helper: base64-decode a ``<key>`` (e.g. ``vgi_partition_values#b64`` /
+// ``vgi_rpc.parent_row#b64``) payload into raw bytes. Returns empty string when
+// the key is absent. Raises IOException when present but the base64 is invalid.
+// IPC/int32 decode + validation happen downstream on the consumer thread.
+static std::string ParseVgiB64Bytes(
     const std::shared_ptr<arrow::KeyValueMetadata> &custom_metadata,
-    const std::string &base_url) {
+    const char *key, const std::string &base_url) {
 	if (!custom_metadata) {
 		return "";
 	}
-	int idx = custom_metadata->FindKey("vgi_partition_values#b64");
+	int idx = custom_metadata->FindKey(key);
 	if (idx < 0) {
 		return "";
 	}
@@ -82,9 +82,7 @@ static std::string ParseVgiPartitionValuesBytes(
 		Blob::FromBase64(b64_str, data_ptr_cast(out.data()), decoded_size);
 		return out;
 	} catch (const std::exception &e) {
-		throw IOException("VGI worker emitted invalid base64 payload in "
-		                  "vgi_partition_values#b64: %s [url: %s]",
-		                  e.what(), base_url);
+		throw IOException("VGI worker emitted invalid base64 payload in %s: %s [url: %s]", key, e.what(), base_url);
 	}
 }
 
@@ -251,6 +249,7 @@ void HttpFunctionConnection::BufferDataBatches(const std::string &response_body,
 	buffered_batches_.clear();
 	buffered_batch_indexes_.clear();
 	buffered_partition_values_bytes_.clear();
+	buffered_parent_row_bytes_.clear();
 	buffered_batch_index_ = 0;
 	stream_state_token_.clear();
 
@@ -306,7 +305,9 @@ void HttpFunctionConnection::BufferDataBatches(const std::string &response_body,
 			buffered_batches_.push_back(resolved.batch);
 			buffered_batch_indexes_.push_back(ParseVgiBatchIndex(resolved.metadata, base_url_));
 			buffered_partition_values_bytes_.push_back(
-			    ParseVgiPartitionValuesBytes(resolved.metadata, base_url_));
+			    ParseVgiB64Bytes(resolved.metadata, "vgi_partition_values#b64", base_url_));
+			buffered_parent_row_bytes_.push_back(
+			    ParseVgiB64Bytes(resolved.metadata, "vgi_rpc.parent_row#b64", base_url_));
 			buffered_cache_controls_.push_back(ParseVgiCacheControl(resolved.metadata));
 			ExtractStreamState(resolved.batch, resolved.metadata);
 			++spike_external_batches;
@@ -318,7 +319,9 @@ void HttpFunctionConnection::BufferDataBatches(const std::string &response_body,
 		buffered_batches_.push_back(bwm.batch);
 		buffered_batch_indexes_.push_back(ParseVgiBatchIndex(bwm.custom_metadata, base_url_));
 		buffered_partition_values_bytes_.push_back(
-		    ParseVgiPartitionValuesBytes(bwm.custom_metadata, base_url_));
+		    ParseVgiB64Bytes(bwm.custom_metadata, "vgi_partition_values#b64", base_url_));
+		buffered_parent_row_bytes_.push_back(
+		    ParseVgiB64Bytes(bwm.custom_metadata, "vgi_rpc.parent_row#b64", base_url_));
 		buffered_cache_controls_.push_back(ParseVgiCacheControl(bwm.custom_metadata));
 		++spike_data_batches;
 	}
@@ -775,6 +778,7 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 		if (buffered_batch_index_ < buffered_batches_.size()) {
 			last_batch_index_ = buffered_batch_indexes_[buffered_batch_index_];
 			last_partition_values_bytes_ = buffered_partition_values_bytes_[buffered_batch_index_];
+			last_parent_row_bytes_ = buffered_parent_row_bytes_[buffered_batch_index_];
 			last_cache_control_ = buffered_cache_controls_[buffered_batch_index_];
 			return buffered_batches_[buffered_batch_index_++];
 		}
@@ -811,6 +815,7 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 		if (buffered_batch_index_ < buffered_batches_.size()) {
 			last_batch_index_ = buffered_batch_indexes_[buffered_batch_index_];
 			last_partition_values_bytes_ = buffered_partition_values_bytes_[buffered_batch_index_];
+			last_parent_row_bytes_ = buffered_parent_row_bytes_[buffered_batch_index_];
 			last_cache_control_ = buffered_cache_controls_[buffered_batch_index_];
 			return buffered_batches_[buffered_batch_index_++];
 		}
@@ -937,10 +942,11 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 			if (parsed != DConstants::INVALID_INDEX) {
 				last_batch_index_ = parsed;
 			}
-			std::string pv = ParseVgiPartitionValuesBytes(bwm.custom_metadata, base_url_);
+			std::string pv = ParseVgiB64Bytes(bwm.custom_metadata, "vgi_partition_values#b64", base_url_);
 			if (!pv.empty()) {
 				last_partition_values_bytes_ = std::move(pv);
 			}
+			last_parent_row_bytes_ = ParseVgiB64Bytes(bwm.custom_metadata, "vgi_rpc.parent_row#b64", base_url_);
 			auto cc = ParseVgiCacheControl(bwm.custom_metadata);
 			if (cc.present) {
 				last_cache_control_ = cc;

@@ -222,6 +222,16 @@ public:
 		return kEmpty;
 	}
 
+	// Raw little-endian int32[] from the most recent data batch's
+	// ``vgi_rpc.parent_row#b64`` metadata: for each output row, the 0-based index
+	// of the input row that produced it (batched-lateral provenance). Empty = no
+	// provenance on this batch (the operator assumes identity for a 1->1 map).
+	// Default empty so connections that don't implement the parse report "none."
+	virtual const std::string &GetLastParentRowBytes() const {
+		static const std::string kEmpty;
+		return kEmpty;
+	}
+
 	// Parsed `vgi.cache.*` cache-control advertisement observed on the most
 	// recent data batch's wire custom_metadata. Set inside ``ReadDataBatch``
 	// (per batch); the result-cache capture layer reads it on the FIRST batch

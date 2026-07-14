@@ -443,6 +443,11 @@ private:
 	// the consumer thread (uniform across transports).
 	std::string last_partition_values_bytes_;
 
+	// Raw little-endian int32 array from the most recent data batch's
+	// ``vgi_rpc.parent_row#b64`` metadata (per-output-row parent input-row index
+	// for the batched-lateral operator). Empty when the key is absent.
+	std::string last_parent_row_bytes_;
+
 	// Parsed ``vgi.cache.*`` advertisement off the most recent data batch's
 	// custom_metadata (present=false when absent). Set in ``ReadDataBatch``,
 	// read by the result-cache capture layer on the first batch (same lockstep
@@ -454,6 +459,9 @@ public:
 	}
 	const std::string &GetLastPartitionValuesBytes() const override {
 		return last_partition_values_bytes_;
+	}
+	const std::string &GetLastParentRowBytes() const override {
+		return last_parent_row_bytes_;
 	}
 	VgiCacheControl GetLastCacheControl() const override {
 		return last_cache_control_;

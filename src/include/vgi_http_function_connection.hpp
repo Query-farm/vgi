@@ -112,6 +112,9 @@ public:
 	const std::string &GetLastPartitionValuesBytes() const override {
 		return last_partition_values_bytes_;
 	}
+	const std::string &GetLastParentRowBytes() const override {
+		return last_parent_row_bytes_;
+	}
 	VgiCacheControl GetLastCacheControl() const override {
 		return last_cache_control_;
 	}
@@ -199,6 +202,9 @@ private:
 	// ``vgi_partition_values#b64`` metadata. Empty when the key is
 	// absent. IPC decode happens in InstallBatch on the consumer thread.
 	std::string last_partition_values_bytes_;
+	// Raw little-endian int32[] from the most recent data batch's
+	// ``vgi_rpc.parent_row#b64`` metadata (batched-lateral provenance). Empty absent.
+	std::string last_parent_row_bytes_;
 	std::vector<std::shared_ptr<arrow::RecordBatch>> buffered_batches_;
 	// Parallel to ``buffered_batches_``: ``vgi_batch_index`` parsed off
 	// each batch's custom_metadata at buffer time (or INVALID if absent).
@@ -210,6 +216,8 @@ private:
 	// as ``buffered_batch_indexes_``: the buffered path returns batches
 	// without their wire metadata, so we stash the bytes here.
 	std::vector<std::string> buffered_partition_values_bytes_;
+	// Parallel to ``buffered_batches_``: ``vgi_rpc.parent_row#b64`` bytes per batch.
+	std::vector<std::string> buffered_parent_row_bytes_;
 	// Parsed vgi.cache.* advertisement off the most recent data batch, and its
 	// parallel-to-buffered_batches_ per-batch capture (same rationale as the
 	// batch_index / partition_values vectors above). Result-cache capture reads
