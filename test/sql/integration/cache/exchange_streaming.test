@@ -112,6 +112,14 @@ SELECT hits > 0 AND inserts > 0 FROM vgi_result_cache_stats();
 ----
 true
 
+# Exchange-specific sub-counters isolate this cache from the producer cache: the
+# scans above produced at least one exchange hit + store + bytes served.
+query I
+SELECT exchange_hits > 0 AND exchange_stores > 0 AND exchange_bytes_served > 0
+FROM vgi_result_cache_stats();
+----
+true
+
 # ---------------------------------------------------------------------------
 # Flush clears exchange entries too (shared singleton), so the next scan MISSes.
 # ---------------------------------------------------------------------------

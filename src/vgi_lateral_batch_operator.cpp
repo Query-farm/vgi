@@ -263,6 +263,7 @@ void CommitCapture(VgiLateralBatchOperatorState &state, const VgiTableInOutBindD
 	                                 state.cache_default_ttl_seconds, state.capture_pending,
 	                                 /*allow_disk=*/true);
 	if (sr.stored) {
+		VgiResultCache::Instance().RecordExchangeStore();
 		VGI_LOG(ctx, "result_cache.store",
 		        {{"function", bd.function_name},
 		         {"key_hash", state.capture_key.HexDigest()},
@@ -397,6 +398,7 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 		} else {
 			auto entry = VgiResultCache::Instance().Lookup(state.capture_key, now);
 			if (entry) {
+				VgiResultCache::Instance().RecordExchangeHit(entry->total_bytes);
 				VGI_LOG(client_context, "result_cache.hit",
 				        {{"function", bd.function_name}, {"key_hash", state.capture_key.HexDigest()}, {"tier", "memory"}});
 				if (entry->streams.empty() || entry->streams[0].batches.empty()) {
@@ -475,6 +477,7 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 			if (cc.not_modified) {
 				SlideRevalidatedExchangeEntry(*reval_entry, cc, state.cache_default_ttl_seconds,
 				                              /*allow_disk=*/true);
+				VgiResultCache::Instance().RecordExchangeRevalidation(reval_entry->total_bytes);
 				VGI_LOG(client_context, "result_cache.revalidate",
 				        {{"function", bd.function_name},
 				         {"key_hash", state.capture_key.HexDigest()},
@@ -484,6 +487,11 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 				return EmitServedSlice(state, state.serve_arrow_table, chunk);
 			}
 		}
+	}
+
+	// Reaching here = a fresh exchange for this chunk (not a cache hit, not a 304).
+	if (state.cache_eligible) {
+		VgiResultCache::Instance().RecordExchangeMiss();
 	}
 
 	// Latch the worker's cache-control advertisement off the first exchange output.

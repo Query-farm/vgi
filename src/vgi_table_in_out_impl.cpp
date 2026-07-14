@@ -910,6 +910,7 @@ OperatorResultType VgiTableInOutFunction(ExecutionContext &context, TableFunctio
 			if (entry && !entry->streams.empty() && !entry->streams[0].batches.empty()) {
 				output_batch = DeserializeCachedRecordBatch(*entry, entry->streams[0].batches[0]);
 				cache_hit = true;
+				VgiResultCache::Instance().RecordExchangeHit(entry->total_bytes);
 				VGI_LOG(client_context, "result_cache.hit",
 				        {{"function", bind_data.function_name},
 				         {"key_hash", batch_key.HexDigest()},
@@ -967,6 +968,7 @@ OperatorResultType VgiTableInOutFunction(ExecutionContext &context, TableFunctio
 					                              /*allow_disk=*/true);
 					output_batch = DeserializeCachedRecordBatch(*reval_entry, reval_entry->streams[0].batches[0]);
 					cache_hit = true; // serve the stored bytes; skip the store below
+					VgiResultCache::Instance().RecordExchangeRevalidation(reval_entry->total_bytes);
 					VGI_LOG(client_context, "result_cache.revalidate",
 					        {{"function", bind_data.function_name},
 					         {"key_hash", batch_key.HexDigest()},
@@ -979,6 +981,7 @@ OperatorResultType VgiTableInOutFunction(ExecutionContext &context, TableFunctio
 		// output, then (if cacheable) memoize this input batch's output. Skip on the
 		// terminal EOS batch (nullptr) — there is nothing to cache and cc rides data.
 		if (!cache_hit && global_state.cache_eligible && output_batch) {
+			VgiResultCache::Instance().RecordExchangeMiss(); // fresh exchange (not a hit / 304)
 			if (!local_state.cache_cc_latched) {
 				local_state.cache_cc = conn.GetLastCacheControl();
 				local_state.cache_cc_latched = true;
@@ -989,6 +992,7 @@ OperatorResultType VgiTableInOutFunction(ExecutionContext &context, TableFunctio
 				                                 global_state.cache_default_ttl_seconds, {output_batch},
 				                                 /*allow_disk=*/true);
 				if (sr.stored) {
+					VgiResultCache::Instance().RecordExchangeStore();
 					VGI_LOG(client_context, "result_cache.store",
 					        {{"function", bind_data.function_name},
 					         {"key_hash", batch_key.HexDigest()},

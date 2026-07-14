@@ -248,7 +248,24 @@ public:
 		uint64_t evictions_lru = 0;
 		uint64_t evictions_ttl = 0;
 		uint64_t capture_aborts = 0;
+		// Exchange-mode (table-in-out / LATERAL / buffered) sub-counters. The
+		// hits/misses above are producer+exchange combined (both call Lookup); these
+		// isolate the exchange paths so an operator can measure whether the input-keyed
+		// cache earns its keep. A hit rate = (hits+revalidations)/(hits+revalidations+
+		// misses); bytes_served is the payload NOT recomputed/transferred on hits.
+		uint64_t exchange_hits = 0;
+		uint64_t exchange_misses = 0;
+		uint64_t exchange_stores = 0;
+		uint64_t exchange_revalidations = 0;
+		uint64_t exchange_bytes_served = 0;
 	};
+
+	// Exchange-mode metric recorders (the exchange operators call these at their
+	// hit / miss / store / 304-revalidation decision points).
+	void RecordExchangeHit(int64_t bytes_served);
+	void RecordExchangeMiss();
+	void RecordExchangeStore();
+	void RecordExchangeRevalidation(int64_t bytes_served);
 
 	static VgiResultCache &Instance();
 
@@ -408,6 +425,11 @@ private:
 	std::atomic<uint64_t> evictions_lru_ {0};
 	std::atomic<uint64_t> evictions_ttl_ {0};
 	std::atomic<uint64_t> capture_aborts_ {0};
+	std::atomic<uint64_t> exchange_hits_ {0};
+	std::atomic<uint64_t> exchange_misses_ {0};
+	std::atomic<uint64_t> exchange_stores_ {0};
+	std::atomic<uint64_t> exchange_revalidations_ {0};
+	std::atomic<uint64_t> exchange_bytes_served_ {0};
 
 	// [S1] Signature of the last-applied Settings; ConfigureIfChanged skips the
 	// lock + evict when the current query's settings match this.

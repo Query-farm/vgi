@@ -198,10 +198,14 @@ struct VgiResultCacheStatsData : public TableFunctionData {
 static unique_ptr<FunctionData> VgiResultCacheStatsBind(ClientContext &, TableFunctionBindInput &,
                                                         vector<LogicalType> &return_types,
                                                         vector<string> &names) {
-	names = {"hits",        "misses",       "inserts",     "evictions_lru",
-	         "evictions_ttl", "capture_aborts", "entries",  "total_bytes"};
+	names = {"hits",           "misses",         "inserts",         "evictions_lru",
+	         "evictions_ttl",  "capture_aborts", "entries",         "total_bytes",
+	         "exchange_hits",  "exchange_misses", "exchange_stores", "exchange_revalidations",
+	         "exchange_bytes_served"};
 	return_types = {LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT,
-	                LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::BIGINT,  LogicalType::BIGINT};
+	                LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::BIGINT,  LogicalType::BIGINT,
+	                LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT,
+	                LogicalType::UBIGINT};
 	auto data = make_uniq<VgiResultCacheStatsData>();
 	data->counters = VgiResultCache::Instance().GetCounters();
 	auto snap = VgiResultCache::Instance().Snapshot();
@@ -229,6 +233,11 @@ static void VgiResultCacheStatsScan(ClientContext &, TableFunctionInput &input, 
 	output.SetValue(col++, 0, Value::UBIGINT(c.capture_aborts));
 	output.SetValue(col++, 0, Value::BIGINT(data.entries));
 	output.SetValue(col++, 0, Value::BIGINT(data.total_bytes));
+	output.SetValue(col++, 0, Value::UBIGINT(c.exchange_hits));
+	output.SetValue(col++, 0, Value::UBIGINT(c.exchange_misses));
+	output.SetValue(col++, 0, Value::UBIGINT(c.exchange_stores));
+	output.SetValue(col++, 0, Value::UBIGINT(c.exchange_revalidations));
+	output.SetValue(col++, 0, Value::UBIGINT(c.exchange_bytes_served));
 	output.SetCardinality(1);
 }
 

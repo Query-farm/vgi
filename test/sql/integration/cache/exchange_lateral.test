@@ -174,6 +174,45 @@ WHERE type = 'VGI'
 ----
 true
 
+# ---------------------------------------------------------------------------
+# Parallelism: repeat hits are STABLE under multi-threading. DuckDB's parallel
+# scan chunking is deterministic for a given source + thread count, so an
+# identical repeat query produces identical per-chunk keys — 100% hit, zero
+# worker exchange, even at threads=8 (a bigger input to force multiple morsels).
+# ---------------------------------------------------------------------------
+
+statement ok
+SET threads=8;
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# Warm (cold miss — the worker is exchanged with across all parallel chunks).
+statement ok
+SELECT count(*) FROM range(20000) g(x), LATERAL ex.cached_double(g.x);
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# Repeat: served entirely from cache — ZERO write_input despite 8 threads.
+statement ok
+SELECT count(*) FROM range(20000) g(x), LATERAL ex.cached_double(g.x);
+
+query I
+SELECT count(*)
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'table_in_out.write_input'
+  AND message LIKE '%cached_double%';
+----
+0
+
+statement ok
+RESET threads;
+
 statement ok
 CALL disable_logging();
 

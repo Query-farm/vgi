@@ -337,8 +337,11 @@ VgiTableBufferingGlobalSinkState::~VgiTableBufferingGlobalSinkState() {
 	    finalize_eos_count.load(std::memory_order_acquire) == total_finalize_states &&
 	    capture_cc.Cacheable()) {
 		try {
-			(void)StoreExchangeMemoEntry(cache_key, capture_cc, cache_catalog_name,
-			                             cache_default_ttl_seconds, capture_batches, /*allow_disk=*/true);
+			auto sr = StoreExchangeMemoEntry(cache_key, capture_cc, cache_catalog_name,
+			                                 cache_default_ttl_seconds, capture_batches, /*allow_disk=*/true);
+			if (sr.stored) {
+				VgiResultCache::Instance().RecordExchangeStore();
+			}
 		} catch (...) {
 			// Destructor must not throw; a failed cache store is non-fatal.
 		}
@@ -829,6 +832,7 @@ SinkFinalizeType PhysicalVgiTableBufferingFunction::Finalize(Pipeline & /*pipeli
 		    FinalizeInputDigest(gstate.digest_lo.load(), gstate.digest_hi.load(), gstate.digest_rows.load());
 		auto entry = VgiResultCache::Instance().Lookup(gstate.cache_key, std::chrono::steady_clock::now());
 		if (entry) {
+			VgiResultCache::Instance().RecordExchangeHit(entry->total_bytes);
 			VGI_LOG(context, "result_cache.hit",
 			        {{"function", gstate.function_name}, {"key_hash", gstate.cache_key.HexDigest()}, {"tier", "memory"}});
 			gstate.serving_from_cache = true;
@@ -836,6 +840,8 @@ SinkFinalizeType PhysicalVgiTableBufferingFunction::Finalize(Pipeline & /*pipeli
 			gstate.finalized.store(true);
 			return SinkFinalizeType::READY; // Source replays; no combine, no worker drain
 		}
+		// Not a hit — the combine below runs (a fresh whole-input miss).
+		VgiResultCache::Instance().RecordExchangeMiss();
 	}
 
 	// Snapshot state_ids and pop one worker for the combine RPC, all under

@@ -862,7 +862,34 @@ VgiResultCache::Counters VgiResultCache::GetCounters() const {
 	c.evictions_lru = evictions_lru_.load(std::memory_order_relaxed);
 	c.evictions_ttl = evictions_ttl_.load(std::memory_order_relaxed);
 	c.capture_aborts = capture_aborts_.load(std::memory_order_relaxed);
+	c.exchange_hits = exchange_hits_.load(std::memory_order_relaxed);
+	c.exchange_misses = exchange_misses_.load(std::memory_order_relaxed);
+	c.exchange_stores = exchange_stores_.load(std::memory_order_relaxed);
+	c.exchange_revalidations = exchange_revalidations_.load(std::memory_order_relaxed);
+	c.exchange_bytes_served = exchange_bytes_served_.load(std::memory_order_relaxed);
 	return c;
+}
+
+void VgiResultCache::RecordExchangeHit(int64_t bytes_served) {
+	exchange_hits_.fetch_add(1, std::memory_order_relaxed);
+	if (bytes_served > 0) {
+		exchange_bytes_served_.fetch_add(static_cast<uint64_t>(bytes_served), std::memory_order_relaxed);
+	}
+}
+
+void VgiResultCache::RecordExchangeMiss() {
+	exchange_misses_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void VgiResultCache::RecordExchangeStore() {
+	exchange_stores_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void VgiResultCache::RecordExchangeRevalidation(int64_t bytes_served) {
+	exchange_revalidations_.fetch_add(1, std::memory_order_relaxed);
+	if (bytes_served > 0) {
+		exchange_bytes_served_.fetch_add(static_cast<uint64_t>(bytes_served), std::memory_order_relaxed);
+	}
 }
 
 void VgiResultCache::CleanupThread() {
