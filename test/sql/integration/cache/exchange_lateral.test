@@ -177,5 +177,33 @@ true
 statement ok
 CALL disable_logging();
 
+# ---------------------------------------------------------------------------
+# Disk tier: exchange entries persist to the content-addressed on-disk store
+# (cross-process + cross-restart warm cache), same as producer entries.
+# ---------------------------------------------------------------------------
+
+statement ok
+SET vgi_result_cache_dir = '__TEST_DIR__/vgi_exch_lateral_disk';
+
+statement ok
+SET vgi_result_cache_disk_max_bytes = 104857600;
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+statement ok
+SELECT count(*) FROM t, LATERAL ex.cached_double(t.x);
+
+# The result was written to the disk tier: an immutable object blob + a key ref.
+query I
+SELECT COUNT(*) > 0 FROM glob('__TEST_DIR__/vgi_exch_lateral_disk/*/objects/*.vrc');
+----
+true
+
+query I
+SELECT COUNT(*) > 0 FROM glob('__TEST_DIR__/vgi_exch_lateral_disk/*/refs/*.ref');
+----
+true
+
 statement ok
 DETACH ex;

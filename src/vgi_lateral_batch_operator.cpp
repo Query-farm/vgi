@@ -242,7 +242,7 @@ void EnsureServeSchema(VgiLateralBatchOperatorState &state, const vector<Logical
 OperatorResultType EmitServedSlice(VgiLateralBatchOperatorState &state, const ArrowTableSchema &arrow_table,
                                    DataChunk &chunk) {
 	const auto &batches = state.serving->streams[0].batches;
-	auto batch = DeserializeCachedRecordBatch(batches[state.serve_cursor]);
+	auto batch = DeserializeCachedRecordBatch(*state.serving, batches[state.serve_cursor]);
 	state.serve_cursor++;
 	LoadBatchIntoScanState(state.serve_scan, batch);
 	ProduceOutputFromBatch(state.serve_scan, arrow_table, chunk); // full-output batch → all cols
@@ -259,7 +259,8 @@ OperatorResultType EmitServedSlice(VgiLateralBatchOperatorState &state, const Ar
 // memory-only cache entry (allow_disk=false). Clears the capture state.
 void CommitCapture(VgiLateralBatchOperatorState &state, const VgiTableInOutBindData &bd, ClientContext &ctx) {
 	auto sr = StoreExchangeMemoEntry(state.capture_key, state.cache_cc, state.cache_catalog_name,
-	                                 state.cache_default_ttl_seconds, state.capture_pending);
+	                                 state.cache_default_ttl_seconds, state.capture_pending,
+	                                 /*allow_disk=*/true);
 	if (sr.stored) {
 		VGI_LOG(ctx, "result_cache.store",
 		        {{"function", bd.function_name},

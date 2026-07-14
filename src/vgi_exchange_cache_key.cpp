@@ -10,6 +10,7 @@
 
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/file_system.hpp" // FileSystem positioned reads (disk-tier serve)
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/common/vector.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
@@ -161,11 +162,44 @@ std::string FinalizeInputDigest(uint64_t sum_lo, uint64_t sum_hi, uint64_t row_c
 // Static key builder
 // ----------------------------------------------------------------------------
 
+// Sync the process-global cache config (byte caps, disk dir/caps, compression) from
+// this query's settings into the singleton, so SET takes effect on the exchange path
+// exactly as it does on the producer path (which does this before eligibility). Without
+// this the singleton's disk_dir stays empty and allow_disk=true is a silent no-op.
+// ConfigureIfChanged is lock-free when the settings are unchanged (the steady state).
+void SyncResultCacheSettings(ClientContext &context) {
+	VgiResultCache::Settings s;
+	Value sv;
+	auto u64 = [&](const char *name, uint64_t &dst) {
+		if (context.TryGetCurrentSetting(name, sv) && !sv.IsNull()) {
+			dst = sv.GetValue<uint64_t>();
+		}
+	};
+	auto str = [&](const char *name, std::string &dst) {
+		if (context.TryGetCurrentSetting(name, sv) && !sv.IsNull()) {
+			dst = sv.GetValue<std::string>();
+		}
+	};
+	u64("vgi_result_cache_max_bytes", s.max_bytes);
+	u64("vgi_result_cache_max_entry_bytes", s.max_entry_bytes);
+	u64("vgi_result_cache_max_entries", s.max_entries);
+	u64("vgi_result_cache_max_inflight_bytes", s.max_inflight_bytes);
+	str("vgi_result_cache_dir", s.disk_dir);
+	u64("vgi_result_cache_disk_max_bytes", s.disk_max_bytes);
+	u64("vgi_result_cache_disk_reap_interval_seconds", s.disk_reap_interval_seconds);
+	str("vgi_result_cache_disk_compression", s.disk_compression);
+	u64("vgi_result_cache_disk_compression_level", s.disk_compression_level);
+	VgiResultCache::Instance().ConfigureIfChanged(s);
+}
+
 bool BuildExchangeCacheKeyStatic(ClientContext &context, const VgiTableInOutBindData &bd,
                                  const std::vector<int32_t> &projection_ids, VgiResultCacheKey &key,
                                  std::string &catalog_name, int64_t &catalog_version, const char *&reason) {
 	reason = nullptr;
 	catalog_version = 0;
+
+	// Apply cache config from this query's settings (disk tier, caps) to the singleton.
+	SyncResultCacheSettings(context);
 
 	// Global master switch.
 	Value master;
@@ -234,13 +268,38 @@ bool BuildExchangeCacheKeyStatic(ClientContext &context, const VgiTableInOutBind
 // Per-unit memoization serve / store
 // ----------------------------------------------------------------------------
 
-std::shared_ptr<arrow::RecordBatch> DeserializeCachedRecordBatch(const VgiCachedBatch &cached) {
-	// Exchange entries are memory-only (allow_disk=false), so the in-RAM IPC blob is
-	// always present. Deserialize the self-contained per-batch IPC stream.
-	if (!cached.ipc) {
-		throw IOException("VGI exchange cache: cached batch has no in-memory IPC bytes");
+// Process-static local FileSystem for disk-backed replay. A FileHandle keeps a
+// reference to the FileSystem that opened it, so the FS must outlive the handle —
+// a function-local static (leaked, like the cache singleton) guarantees that.
+namespace {
+FileSystem &ExchangeReplayFs() {
+	static std::unique_ptr<FileSystem> fs = FileSystem::CreateLocal();
+	return *fs;
+}
+} // namespace
+
+std::shared_ptr<arrow::RecordBatch> DeserializeCachedRecordBatch(const VgiResultCacheEntry &entry,
+                                                                 const VgiCachedBatch &cached) {
+	// In-RAM (memory tier or a materialized disk entry) uses cached.ipc directly. A
+	// disk-STREAMING entry (Lookup returned it TOC-only for a payload > max_entry_bytes)
+	// has ipc==nullptr; positioned-read just this batch's bytes from the blob file.
+	std::shared_ptr<arrow::Buffer> ipc = cached.ipc;
+	if (!ipc && cached.disk_ipc_offset >= 0) {
+		auto handle = ExchangeReplayFs().OpenFile(entry.disk_path, FileFlags::FILE_FLAGS_READ);
+		auto buf_result = arrow::AllocateBuffer(cached.disk_ipc_length);
+		if (!buf_result.ok()) {
+			throw IOException("VGI exchange cache: failed to allocate %lld bytes for disk batch",
+			                  static_cast<long long>(cached.disk_ipc_length));
+		}
+		std::shared_ptr<arrow::Buffer> b = std::move(buf_result.ValueUnsafe());
+		ExchangeReplayFs().Read(*handle, b->mutable_data(), cached.disk_ipc_length,
+		                        static_cast<idx_t>(cached.disk_ipc_offset));
+		ipc = b;
 	}
-	auto input = std::make_shared<arrow::io::BufferReader>(cached.ipc);
+	if (!ipc) {
+		throw IOException("VGI exchange cache: cached batch has neither in-memory nor on-disk IPC bytes");
+	}
+	auto input = std::make_shared<arrow::io::BufferReader>(ipc);
 	auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(input);
 	if (!reader_result.ok()) {
 		throw IOException("VGI exchange cache: failed to open cached batch IPC stream: %s",

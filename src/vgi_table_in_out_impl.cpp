@@ -890,7 +890,7 @@ OperatorResultType VgiTableInOutFunction(ExecutionContext &context, TableFunctio
 		batch_key.input_hash = HashInputBatchOrdered(input_batch);
 		auto entry = VgiResultCache::Instance().Lookup(batch_key, std::chrono::steady_clock::now());
 		if (entry && !entry->streams.empty() && !entry->streams[0].batches.empty()) {
-			output_batch = DeserializeCachedRecordBatch(entry->streams[0].batches[0]);
+			output_batch = DeserializeCachedRecordBatch(*entry, entry->streams[0].batches[0]);
 			cache_hit = true;
 			VGI_LOG(client_context, "result_cache.hit",
 			        {{"function", bind_data.function_name},
@@ -944,7 +944,8 @@ OperatorResultType VgiTableInOutFunction(ExecutionContext &context, TableFunctio
 			if (local_state.cache_cc.Cacheable()) {
 				auto sr = StoreExchangeMemoEntry(batch_key, local_state.cache_cc,
 				                                 global_state.cache_catalog_name,
-				                                 global_state.cache_default_ttl_seconds, {output_batch});
+				                                 global_state.cache_default_ttl_seconds, {output_batch},
+				                                 /*allow_disk=*/true);
 				if (sr.stored) {
 					VGI_LOG(client_context, "result_cache.store",
 					        {{"function", bind_data.function_name},

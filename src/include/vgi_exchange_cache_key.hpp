@@ -21,6 +21,7 @@ class DataChunk;
 namespace vgi {
 
 struct VgiResultCacheKey;      // vgi_result_cache.hpp
+struct VgiResultCacheEntry;    // vgi_result_cache.hpp
 struct VgiCachedBatch;         // vgi_result_cache.hpp
 struct VgiCacheControl;        // vgi_cache_control.hpp
 struct VgiTableInOutBindData;  // vgi_table_in_out_impl.hpp
@@ -86,9 +87,13 @@ bool BuildExchangeCacheKeyStatic(ClientContext &context, const VgiTableInOutBind
 // input unit" keyed by (static key + input_hash).
 // ============================================================================
 
-//! Deserialize one memory-tier cached batch's self-contained IPC blob back to an
-//! Arrow RecordBatch (the in-RAM `ipc` path; exchange entries are memory-only).
-std::shared_ptr<arrow::RecordBatch> DeserializeCachedRecordBatch(const VgiCachedBatch &cached);
+//! Deserialize one cached batch's self-contained IPC blob back to an Arrow
+//! RecordBatch. Handles both the in-RAM `ipc` path AND a disk-backed batch
+//! (`ipc==nullptr`, `disk_ipc_offset>=0`) by positioned-reading just that batch's
+//! bytes from `entry.disk_path` — so a disk-tier exchange entry that Lookup returned
+//! as a streaming (TOC-only) entry serves correctly, not just materialized ones.
+std::shared_ptr<arrow::RecordBatch> DeserializeCachedRecordBatch(const VgiResultCacheEntry &entry,
+                                                                 const VgiCachedBatch &cached);
 
 //! Result of a StoreExchangeMemoEntry attempt (for the caller's result_cache.store /
 //! result_cache.store_skipped observability, kept parallel to the producer path).
@@ -101,9 +106,10 @@ struct ExchangeStoreResult {
 
 //! Build a cache entry from one input unit's output batches and Insert it. Freshness
 //! from `cc`: a positive ttl (from cc.ttl_seconds or default_ttl_seconds) is required;
-//! no_store and transaction-scoped results are refused. `allow_disk` is false for the
-//! tiny per-chunk/per-batch streaming entries (many would thrash the disk ref store)
-//! and true for the buffered whole-input entry (one large result, like a producer one).
+//! no_store and transaction-scoped results are refused. `allow_disk` opts the entry
+//! into the on-disk tier (content-addressed; cross-process + cross-restart). All
+//! exchange callers pass true — the disk tier is off by default (needs
+//! `vgi_result_cache_dir`), so this only persists when the user configured it.
 ExchangeStoreResult StoreExchangeMemoEntry(const VgiResultCacheKey &key, const VgiCacheControl &cc,
                                            const std::string &catalog_name, int64_t default_ttl_seconds,
                                            const std::vector<std::shared_ptr<arrow::RecordBatch>> &out_batches,

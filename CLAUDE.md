@@ -668,9 +668,16 @@ Three shapes, three granularities (all emit `result_cache.{hit,store,store_skipp
   folded). The vgi-python buffered `finalize()` now always wraps `out` in
   `_TrackingOutputCollector` so it can advertise `vgi.cache.*` (parity with the streaming emit).
 
-Streaming/LATERAL entries are **memory-only** (`allow_disk=false` — many tiny entries would
-thrash the disk ref store); the buffered whole-input entry uses the disk tier. Transaction
-scope is refused for exchange entries in v1. Fixtures (vgi-python `_test_fixtures/table_in_out.py`):
+All exchange entries participate in the **on-disk tier** (`allow_disk=true`) for a
+cross-process + cross-restart warm cache, same as producer entries — the disk tier is off
+by default (needs `vgi_result_cache_dir`), so this only persists when configured.
+`BuildExchangeCacheKeyStatic` calls `SyncResultCacheSettings` (mirroring the producer's
+`ConfigureIfChanged`) so `SET vgi_result_cache_dir/…` reaches the singleton on the exchange
+path; `DeserializeCachedRecordBatch` is disk-aware (positioned-reads a streaming entry's
+batch from the blob). Transaction scope is refused for exchange entries in v1. Conditional
+revalidation (etag/last-modified/304/stale-while-revalidate) is **producer-only** — exchange
+entries store the validator fields but a stale entry is a plain miss, not a 304 refresh.
+Fixtures (vgi-python `_test_fixtures/table_in_out.py`):
 `cached_echo` (streaming), `cached_double` (LATERAL), `cached_sum_all` (buffered). Tests:
 `test/sql/integration/cache/exchange_{streaming,lateral,buffered}.test` (both transports;
 hit-skips-worker, LATERAL order-independence + correlated correctness, shared surface + flush).
