@@ -17,8 +17,15 @@
 #include "duckdb/optimizer/optimizer_extension.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 
+#include <chrono>
+
+#include "vgi_arrow_ipc.hpp"          // SerializeRecordBatch
+#include "vgi_arrow_utils.hpp"        // BuildArrowSchemaFromDuckDB / ArrowSchemaToDuckDBTypes / DataChunkToArrow
+#include "vgi_cache_control.hpp"      // VgiCacheControl
+#include "vgi_exchange_cache_key.hpp" // exchange-mode result cache (M2)
 #include "vgi_ifunction_connection.hpp"
 #include "vgi_logging.hpp"
+#include "vgi_result_cache.hpp"       // VgiResultCache singleton
 
 namespace duckdb {
 namespace vgi {
@@ -89,14 +96,16 @@ struct VgiLateralBatchGlobalState : public GlobalOperatorState {};
 
 struct VgiLateralBatchOperatorState : public OperatorState {
 	VgiLateralBatchOperatorState(ClientContext &context, const std::vector<uint8_t> &substream_id)
-	    : substream_id(substream_id),
-	      scan(make_uniq<ArrowArrayWrapper>(), context) {
+	    : client_context(context), substream_id(substream_id),
+	      scan(make_uniq<ArrowArrayWrapper>(), context),
+	      serve_scan(make_uniq<ArrowArrayWrapper>(), context) {
 	}
 	~VgiLateralBatchOperatorState() override {
 		// Mid-stream worker (no finalize map) is never pooled — just drop it.
 		connection.reset();
 	}
 
+	ClientContext &client_context; // for lazy schema build + (de)serialize
 	std::unique_ptr<IFunctionConnection> connection; // this thread's own worker
 	std::vector<uint8_t> substream_id;
 	VgiTableInOutLocalState scan; // drain buffer for the worker output batch
@@ -110,6 +119,32 @@ struct VgiLateralBatchOperatorState : public OperatorState {
 	// input at those indices and relies on DuckDB re-passing the same-sized chunk.
 	// Asserted on each drain so a broken re-pass contract fails loudly, never OOB.
 	idx_t input_size_at_decode = 0;
+
+	// ---- Exchange-mode result cache (M2, per-input-chunk memoization) ----
+	// Built once on the first chunk: the static key + whether caching is eligible.
+	bool cache_key_built = false;
+	bool cache_eligible = false;
+	VgiResultCacheKey cache_static_key;
+	std::string cache_catalog_name;
+	int64_t cache_default_ttl_seconds = 0;
+	VgiCacheControl cache_cc;   // latched from the first exchange output
+	bool cache_cc_latched = false;
+	// MISS capture: the current input chunk's full key + its accumulated POST-STAMP
+	// output slices (serialized). Committed as one entry when the chunk fully drains.
+	VgiResultCacheKey capture_key;
+	std::vector<std::shared_ptr<arrow::RecordBatch>> capture_pending;
+	bool capturing = false;
+	// HIT serve: the cached entry for the current input chunk + replay cursor.
+	std::shared_ptr<const VgiResultCacheEntry> serving;
+	size_t serve_cursor = 0;
+	// Full-output arrow schema + table (all output columns, synthetic names), built
+	// once. Capture serializes the post-stamp chunk with `serve_schema`; replay
+	// deserializes into `serve_scan` and produces via `serve_arrow_table`.
+	bool serve_schema_built = false;
+	std::shared_ptr<arrow::Schema> serve_schema;
+	ArrowSchemaWrapper serve_c_schema;
+	ArrowTableSchema serve_arrow_table;
+	VgiTableInOutLocalState serve_scan; // replay drain buffer (full output schema)
 };
 
 // Decode the worker's per-output-row provenance. `raw` is the base64-decoded raw
@@ -180,6 +215,65 @@ void StampProjected(DataChunk &chunk, DataChunk &input, const std::vector<int32_
 	}
 }
 
+// Build the full-output arrow schema + ArrowTableSchema once (synthetic col names).
+// Capture serializes the post-stamp chunk with `serve_schema`; replay deserializes
+// into `serve_scan` and produces via `serve_arrow_table`.
+void EnsureServeSchema(VgiLateralBatchOperatorState &state, const vector<LogicalType> &out_types) {
+	if (state.serve_schema_built) {
+		return;
+	}
+	vector<string> names;
+	names.reserve(out_types.size());
+	for (idx_t i = 0; i < out_types.size(); i++) {
+		names.push_back("col" + std::to_string(i));
+	}
+	state.serve_schema = BuildArrowSchemaFromDuckDB(state.client_context, out_types, names);
+	vector<LogicalType> rt;
+	vector<string> rn;
+	ArrowSchemaToDuckDBTypes(state.client_context, state.serve_schema, state.serve_c_schema,
+	                         state.serve_arrow_table, rt, rn);
+	state.serve_schema_built = true;
+}
+
+// Emit the next cached POST-STAMP slice of the entry being served into `chunk`.
+// Each cached batch is exactly one produced slice (<= STANDARD_VECTOR_SIZE), so it
+// converts whole. Returns HAVE_MORE_OUTPUT while slices remain, else NEED_MORE_INPUT
+// (and clears the serving state).
+OperatorResultType EmitServedSlice(VgiLateralBatchOperatorState &state, const ArrowTableSchema &arrow_table,
+                                   DataChunk &chunk) {
+	const auto &batches = state.serving->streams[0].batches;
+	auto batch = DeserializeCachedRecordBatch(batches[state.serve_cursor]);
+	state.serve_cursor++;
+	LoadBatchIntoScanState(state.serve_scan, batch);
+	ProduceOutputFromBatch(state.serve_scan, arrow_table, chunk); // full-output batch → all cols
+	chunk.SetCardinality(static_cast<idx_t>(batch->num_rows()));
+	if (state.serve_cursor >= batches.size()) {
+		state.serving.reset();
+		state.serve_cursor = 0;
+		return OperatorResultType::NEED_MORE_INPUT;
+	}
+	return OperatorResultType::HAVE_MORE_OUTPUT;
+}
+
+// Commit the current input chunk's accumulated POST-STAMP output slices as one
+// memory-only cache entry (allow_disk=false). Clears the capture state.
+void CommitCapture(VgiLateralBatchOperatorState &state, const VgiTableInOutBindData &bd, ClientContext &ctx) {
+	auto sr = StoreExchangeMemoEntry(state.capture_key, state.cache_cc, state.cache_catalog_name,
+	                                 state.cache_default_ttl_seconds, state.capture_pending);
+	if (sr.stored) {
+		VGI_LOG(ctx, "result_cache.store",
+		        {{"function", bd.function_name},
+		         {"key_hash", state.capture_key.HexDigest()},
+		         {"tier", "memory"},
+		         {"rows", std::to_string(sr.rows)},
+		         {"bytes", std::to_string(sr.bytes)}});
+	} else if (sr.reason) {
+		VGI_LOG(ctx, "result_cache.store_skipped", {{"function", bd.function_name}, {"reason", sr.reason}});
+	}
+	state.capturing = false;
+	state.capture_pending.clear();
+}
+
 } // anonymous namespace
 
 // ============================================================================
@@ -211,26 +305,42 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 	auto &client_context = context.client;
 	auto &bd = bind_data->Cast<VgiTableInOutBindData>();
 
-	// Lazy per-substream worker acquire (INPUT phase, input writer open). When the
-	// function supports projection pushdown, DuckDB narrowed worker_column_ids to the
-	// referenced columns; thread them as the wire projection so the worker emits only
-	// those, and set the scan state's column_ids so ProduceOutputFromBatch's projected
-	// read (arrow_scan_is_projected=true) remaps the narrow batch correctly.
-	if (!state.connection) {
-		std::vector<int32_t> projection_ids;
+	// Build the STATIC cache key once (per-chunk memoization: a hit replays a chunk's
+	// POST-STAMP output and skips the worker exchange; the key folds in an
+	// order-independent hash of the FULL input chunk — correlated columns are baked
+	// into the cached output so they must be part of the key). See docs/result cache.
+	if (!state.cache_key_built) {
+		state.cache_key_built = true;
+		std::vector<int32_t> proj_key;
 		if (projection_pushdown) {
-			projection_ids.reserve(worker_column_ids.size());
 			for (auto col_id : worker_column_ids) {
-				projection_ids.push_back(static_cast<int32_t>(col_id));
+				proj_key.push_back(static_cast<int32_t>(col_id));
 			}
-			state.scan.column_ids = worker_column_ids;
 		}
-		state.connection = AcquireBlendedInputConnection(client_context, bd, state.substream_id, projection_ids);
+		const char *reason = nullptr;
+		int64_t catalog_version = 0;
+		if (BuildExchangeCacheKeyStatic(client_context, bd, proj_key, state.cache_static_key,
+		                                state.cache_catalog_name, catalog_version, reason)) {
+			state.cache_eligible = true;
+			EnsureServeSchema(state, types);
+			Value ttl_v;
+			if (client_context.TryGetCurrentSetting("vgi_result_cache_default_ttl_seconds", ttl_v)) {
+				state.cache_default_ttl_seconds = static_cast<int64_t>(ttl_v.GetValue<uint64_t>());
+			}
+		} else if (reason) {
+			VGI_LOG(client_context, "result_cache.ineligible",
+			        {{"function", bd.function_name}, {"reason", reason}});
+		}
 	}
 
-	// (A) Drain the remaining slices of the output batch already loaded in `scan`.
-	// DuckDB re-passes the SAME `input` chunk unchanged across HAVE_MORE_OUTPUT, so
-	// the held parent_index still refers to the right correlated rows.
+	// (S) Serve the next cached POST-STAMP slice of a HIT for the current input chunk.
+	if (state.serving) {
+		return EmitServedSlice(state, state.serve_arrow_table, chunk);
+	}
+
+	// (A) Drain the remaining slices of the worker output batch already loaded in
+	// `scan` (a MISS in progress). DuckDB re-passes the SAME `input` chunk unchanged
+	// across HAVE_MORE_OUTPUT, so the held parent_index still refers to the right rows.
 	if (HasRemainingBatchData(state.scan)) {
 		// Defense-in-depth: parent_index was range-validated against input.size() at
 		// decode time. If DuckDB ever re-passed a smaller chunk during the drain, a
@@ -246,8 +356,16 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 		idx_t produced = ProduceOutputFromBatch(state.scan, bd.arrow_table, chunk, projection_pushdown);
 		StampProjected(chunk, input, state.parent_index, projected_input, base_idx, start, produced);
 		chunk.SetCardinality(produced);
-		return HasRemainingBatchData(state.scan) ? OperatorResultType::HAVE_MORE_OUTPUT
-		                                         : OperatorResultType::NEED_MORE_INPUT;
+		if (state.capturing) {
+			state.capture_pending.push_back(DataChunkToArrow(client_context, chunk, state.serve_schema));
+		}
+		if (HasRemainingBatchData(state.scan)) {
+			return OperatorResultType::HAVE_MORE_OUTPUT;
+		}
+		if (state.capturing) {
+			CommitCapture(state, bd, client_context); // input chunk fully drained → commit
+		}
+		return OperatorResultType::NEED_MORE_INPUT;
 	}
 
 	if (input.size() == 0) {
@@ -255,8 +373,41 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 		return OperatorResultType::NEED_MORE_INPUT;
 	}
 
-	// (B) Fresh input chunk: split off the worker-input columns [0, input_length)
-	// as a zero-copy view.
+	// (B) Fresh input chunk. Cache lookup on the static key + order-independent
+	// FULL-chunk input hash. A HIT replays the cached POST-STAMP output (correlated
+	// columns baked in — no re-stamp; sound because the operator is NO_ORDER).
+	if (state.cache_eligible) {
+		state.capture_key = state.cache_static_key;
+		state.capture_key.input_hash = HashInputChunkUnordered(client_context, input);
+		auto entry = VgiResultCache::Instance().Lookup(state.capture_key, std::chrono::steady_clock::now());
+		if (entry) {
+			VGI_LOG(client_context, "result_cache.hit",
+			        {{"function", bd.function_name}, {"key_hash", state.capture_key.HexDigest()}, {"tier", "memory"}});
+			if (entry->streams.empty() || entry->streams[0].batches.empty()) {
+				chunk.SetCardinality(0); // cached empty (all-filtered) result — nothing to emit
+				return OperatorResultType::NEED_MORE_INPUT;
+			}
+			state.serving = entry;
+			state.serve_cursor = 0;
+			return EmitServedSlice(state, state.serve_arrow_table, chunk);
+		}
+	}
+
+	// MISS: acquire this substream's worker lazily (only on a miss — an all-hit scan
+	// never checks one out). Thread the wire projection when the worker narrows output.
+	if (!state.connection) {
+		std::vector<int32_t> projection_ids;
+		if (projection_pushdown) {
+			projection_ids.reserve(worker_column_ids.size());
+			for (auto col_id : worker_column_ids) {
+				projection_ids.push_back(static_cast<int32_t>(col_id));
+			}
+			state.scan.column_ids = worker_column_ids;
+		}
+		state.connection = AcquireBlendedInputConnection(client_context, bd, state.substream_id, projection_ids);
+	}
+
+	// Split off the worker-input columns [0, input_length) as a zero-copy view.
 	DataChunk worker_input;
 	vector<LogicalType> in_types;
 	in_types.reserve(input_length);
@@ -289,9 +440,16 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 		                  "mid-exchange (expected one output batch per input chunk)",
 		                  bd.worker_path(), bd.function_name);
 	}
+
+	// Latch the worker's cache-control advertisement off the first exchange output.
+	if (state.cache_eligible && !state.cache_cc_latched) {
+		state.cache_cc = state.connection->GetLastCacheControl();
+		state.cache_cc_latched = true;
+	}
+
 	if (output_batch->num_rows() == 0) {
-		// 1->0 for the WHOLE chunk: every input row filtered out. (A per-row 1->0 with
-		// some surviving rows carries provenance and is handled by the stamp below.)
+		// 1->0 for the WHOLE chunk: every input row filtered out. Not cached (v1) — a
+		// partial 1->0 (some rows survive) carries provenance and IS captured below.
 		chunk.SetCardinality(0);
 		return OperatorResultType::NEED_MORE_INPUT;
 	}
@@ -307,8 +465,22 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 	idx_t produced = ProduceOutputFromBatch(state.scan, bd.arrow_table, chunk, projection_pushdown); // fills [0, base_idx)
 	StampProjected(chunk, input, state.parent_index, projected_input, base_idx, start, produced);
 	chunk.SetCardinality(produced);
-	return HasRemainingBatchData(state.scan) ? OperatorResultType::HAVE_MORE_OUTPUT
-	                                         : OperatorResultType::NEED_MORE_INPUT;
+
+	// Begin capturing this input chunk's POST-STAMP output (if the worker opted in).
+	if (state.cache_eligible && state.cache_cc.Cacheable()) {
+		state.capturing = true;
+		state.capture_pending.clear();
+		state.capture_pending.push_back(DataChunkToArrow(client_context, chunk, state.serve_schema));
+	} else {
+		state.capturing = false;
+	}
+	if (HasRemainingBatchData(state.scan)) {
+		return OperatorResultType::HAVE_MORE_OUTPUT;
+	}
+	if (state.capturing) {
+		CommitCapture(state, bd, client_context);
+	}
+	return OperatorResultType::NEED_MORE_INPUT;
 }
 
 string PhysicalVgiLateralBatch::GetName() const {

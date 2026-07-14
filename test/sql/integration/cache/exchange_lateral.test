@@ -1,0 +1,181 @@
+# name: test/sql/integration/cache/exchange_lateral.test
+# description: EXCHANGE-mode result cache (M2) — per-input-chunk memoization of a
+#   correlated blended LATERAL call (PhysicalVgiLateralBatch). Each input chunk keys
+#   on the static exchange key + an ORDER-INDEPENDENT hash of the FULL input chunk
+#   (correlated columns baked into the cached POST-STAMP output). A repeat scan — even
+#   with the same rows in a different order — replays the cached output and skips the
+#   worker exchange. Shares the producer cache singleton/stats/invalidation.
+# group: [vgi_integration_cache]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+SET threads=1;
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+# ---------------------------------------------------------------------------
+# Basic correlated LATERAL: 1st scan MISS (worker exchange + store), 2nd HIT.
+# ---------------------------------------------------------------------------
+
+statement ok
+CREATE TEMP TABLE t AS SELECT * FROM range(5) r(x);
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query II
+SELECT x, doubled FROM t, LATERAL ex.cached_double(t.x) ORDER BY x;
+----
+0	0
+1	2
+2	4
+3	6
+4	8
+
+query I
+SELECT count(*) > 0
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'result_cache.store'
+  AND message LIKE '%cached_double%';
+----
+true
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query II
+SELECT x, doubled FROM t, LATERAL ex.cached_double(t.x) ORDER BY x;
+----
+0	0
+1	2
+2	4
+3	6
+4	8
+
+# Proof of hit: ZERO write_input on the second run (worker skipped).
+query I
+SELECT count(*)
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'table_in_out.write_input'
+  AND message LIKE '%cached_double%';
+----
+0
+
+query I
+SELECT count(*) > 0
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'result_cache.hit'
+  AND message LIKE '%cached_double%';
+----
+true
+
+# ---------------------------------------------------------------------------
+# Order-independence: the SAME rows in a DIFFERENT order hit the same entry
+# (the key hashes the input as a sorted multiset). LATERAL is NO_ORDER, so
+# replaying a same-multiset chunk's cached output is correct.
+# ---------------------------------------------------------------------------
+
+# Same BIGINT column type as `t` (range(5)); the projected column's type is part of
+# the input hash, so a differently-typed literal would legitimately be a distinct entry.
+statement ok
+CREATE TEMP TABLE reordered AS SELECT x::BIGINT AS x FROM (VALUES (4),(0),(3),(1),(2)) v(x);
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query II
+SELECT x, doubled FROM reordered r, LATERAL ex.cached_double(r.x) ORDER BY x;
+----
+0	0
+1	2
+2	4
+3	6
+4	8
+
+# Hit despite the different row order — zero write_input.
+query I
+SELECT count(*)
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'table_in_out.write_input'
+  AND message LIKE '%cached_double%';
+----
+0
+
+# ---------------------------------------------------------------------------
+# Correlated-column correctness: an OUTER column NOT passed to the function is
+# re-associated by the DELIM_JOIN above the operator, so two tables with the same
+# function input (x) but different outer y return their OWN y — even on a cache hit.
+# ---------------------------------------------------------------------------
+
+statement ok
+CREATE TEMP TABLE xy1 AS SELECT * FROM (VALUES (1,10),(2,20)) v(x,y);
+
+statement ok
+CREATE TEMP TABLE xy2 AS SELECT * FROM (VALUES (1,99),(2,88)) v(x,y);
+
+query II
+SELECT y, doubled FROM xy1, LATERAL ex.cached_double(xy1.x) ORDER BY y;
+----
+10	2
+20	4
+
+# Same x (function input) as xy1 but different y: doubled is served from cache,
+# y comes from THIS table via the delim join — never xy1's y.
+query II
+SELECT y, doubled FROM xy2, LATERAL ex.cached_double(xy2.x) ORDER BY y;
+----
+88	4
+99	2
+
+# ---------------------------------------------------------------------------
+# Shared cache surface + flush invalidation (same singleton as producer cache).
+# ---------------------------------------------------------------------------
+
+query I
+SELECT count(*) > 0 FROM vgi_result_cache() WHERE function = 'cached_double';
+----
+true
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query II
+SELECT x, doubled FROM t, LATERAL ex.cached_double(t.x) ORDER BY x;
+----
+0	0
+1	2
+2	4
+3	6
+4	8
+
+# After flush the next scan MISSes (worker exchanged again).
+query I
+SELECT count(*) > 0
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'table_in_out.write_input'
+  AND message LIKE '%cached_double%';
+----
+true
+
+statement ok
+CALL disable_logging();
+
+statement ok
+DETACH ex;
