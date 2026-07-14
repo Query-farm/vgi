@@ -627,6 +627,54 @@ reaper work), `vgi_result_cache(include_disk := true)` (memory **and** disk-only
 `vgi_result_cache_reap(advance_seconds := N)` drives a synchronous, clock-injected reap pass for
 reproducible cleanup tests. Clear with `vgi_result_cache_flush()` (both tiers).
 
+### Exchange-Mode Result Cache (table-in-out / LATERAL / buffered)
+
+The result cache above is producer-mode (table-function) only — its key is **static**
+(built at `InitGlobal`, before any input). The **exchange-mode** functions
+(table-in-out, correlated LATERAL, buffered) also depend on **input data**, so their
+key gains one field — `VgiResultCacheKey::input_hash` (empty for producer entries, so
+producer keys are byte-identical). Everything else is **shared**: the same
+`VgiResultCache` singleton (LRU/byte caps/disk tier), stats (`vgi_result_cache_stats()`),
+diagnostics (`vgi_result_cache()`), the auth-folded `identity_scope` security boundary,
+`catalog_version`/DDL invalidation (`vgi_clear_cache()`), the `vgi_result_cache` setting
++ per-catalog `cache` opt-out, opt-in via `vgi.cache.*` on the **output**, and the
+entry/batch types + `CachedReplayConnection`. Shared infra: `vgi_exchange_cache_key.{hpp,cpp}`
+(`BuildExchangeCacheKeyStatic` mirrors `EvaluateCacheEligibility`; the input-hash helpers;
+`StoreExchangeMemoEntry`). Producer/exchange entries coexist without collision.
+
+Three shapes, three granularities (all emit `result_cache.{hit,store,store_skipped,ineligible}`):
+- **Streaming table-in-out map** (`VgiTableInOutFunction`, parallel no-finalize path):
+  **per-input-batch** memoization keyed on an **ordered** IPC-bytes hash
+  (`HashInputBatchOrdered`) — output is positionally aligned to input. A hit replays the
+  cached worker-output batch via the existing `ProduceOutputFromBatch`, skipping the
+  exchange (zero `table_in_out.write_input`). Only the classic TABLE-input shape reaches
+  this path — a blended column/LATERAL call decorrelates to the batched-LATERAL operator.
+- **Correlated LATERAL** (`PhysicalVgiLateralBatch`): **per-input-chunk** memoization keyed
+  on an **order-independent** hash of the **FULL** input chunk
+  (`HashInputChunkUnordered` — sorted multiset of per-row `CreateSortKey` blobs). The
+  cached POST-STAMP output has the correlated columns baked in (no re-stamp; sound because
+  the operator is `NO_ORDER`); keying on the full chunk (not just worker-input cols) is the
+  correctness anchor — the operator's `projected_input` (delim-join keys) is in the key, and
+  other outer columns are re-associated by the DELIM_JOIN above the operator. Worker acquired
+  lazily only on a miss.
+- **Buffered** (`PhysicalVgiTableBufferingFunction`): **whole-input** keying. An
+  order-independent **additive** digest (`AccumulateInputDigest`, two-lane per-row-hash fold,
+  merged from per-thread Sink partials at Combine) is finalized into the key at
+  `Sink::Finalize`. A hit skips the combine RPC + Source finalize-drain and replays via a
+  `CachedReplayConnection` (one Source thread claims it); a miss captures Source batches under
+  a mutex and the gstate dtor commits iff every finalize state reached EOS (never-partial).
+  Scoped to `!sink_order_dependent`; `allow_disk=true`. **Limitation:** a hit skips
+  combine+drain, NOT the Sink `process()` ingestion (the key is only known after all input is
+  folded). The vgi-python buffered `finalize()` now always wraps `out` in
+  `_TrackingOutputCollector` so it can advertise `vgi.cache.*` (parity with the streaming emit).
+
+Streaming/LATERAL entries are **memory-only** (`allow_disk=false` — many tiny entries would
+thrash the disk ref store); the buffered whole-input entry uses the disk tier. Transaction
+scope is refused for exchange entries in v1. Fixtures (vgi-python `_test_fixtures/table_in_out.py`):
+`cached_echo` (streaming), `cached_double` (LATERAL), `cached_sum_all` (buffered). Tests:
+`test/sql/integration/cache/exchange_{streaming,lateral,buffered}.test` (both transports;
+hit-skips-worker, LATERAL order-independence + correlated correctness, shared surface + flush).
+
 ## Query Farm Telemetry
 
 Anonymous, opt-out usage telemetry. Two fire-and-forget async HTTPS events: the long-standing
@@ -745,6 +793,7 @@ The `launch:` and `unix://` paths share one warm worker process across every Duc
 | `vgi_worker_pool.cpp` | `VgiWorkerPool` singleton, background cleanup thread |
 | `vgi_result_cache.cpp` | `VgiResultCache` singleton: cache key/entry types, `ParseVgiCacheControl`, LRU + byte caps + background TTL reaper. See *Table-Function Result Cache* |
 | `vgi_cached_replay_connection.cpp` | `CachedReplayConnection` — an `IFunctionConnection` that replays a cached result (serve path) |
+| `vgi_exchange_cache_key.cpp` | Exchange-mode (table-in-out / LATERAL / buffered) result-cache infra: `input_hash` key helpers (`HashInputBatchOrdered` ordered IPC, `HashInputChunkUnordered` sorted-multiset, `AccumulateInputDigest`/`FinalizeInputDigest` additive fold), `BuildExchangeCacheKeyStatic` (mirrors the producer eligibility), `StoreExchangeMemoEntry` / `DeserializeCachedRecordBatch`. See *Exchange-Mode Result Cache* |
 | `vgi_result_cache_functions.cpp` | `vgi_result_cache()` / `vgi_result_cache_flush()` SQL diagnostics |
 | `vgi_worker_pool_functions.cpp` | Pool diagnostic SQL functions |
 | `vgi_github.cpp` | `github://` / `github-auto://` transport (subprocess-capable platforms incl. Windows): coordinate parsing, `github-auto://` convention name-building from `DuckDB::Platform()` (`.zip` on Windows, `.tar.gz` else), authenticated GitHub API GET (+ reuse of `HttpGetBytes` for CDN downloads), SHA256 verify-before-extract, full-tree USTAR + miniz `.zip` extractors with path sanitization, and the content-digest-keyed atomic-directory cache. File I/O via DuckDB's cross-platform `FileSystem` (`CreateLocal()`; cross-process write-lock); only `chmod`/tar-symlink/macOS-codesign stay POSIX (`#if VGI_POSIX_TRANSPORT`). Exposes `ResolveWorkerPath()` (called at both spawn sites: `EnsureWorkerSpawned` + `AttemptUnaryRpc`). See [docs/github-transport.md](docs/github-transport.md) |
