@@ -27,7 +27,11 @@
 #include "vgi_table_buffering_builders.hpp"
 #include "vgi_transport.hpp"
 
+#include <atomic>
+#include <cstdlib>
+#include <cstring>
 #include <map>
+#include <mutex>
 
 namespace duckdb {
 namespace vgi {
@@ -256,11 +260,57 @@ WebWorkerFunctionConnection::~WebWorkerFunctionConnection() {
 	}
 }
 
+#if defined(__EMSCRIPTEN__)
+namespace {
+// Lazily create the one shared SAB channel in DuckDB's linear memory and return
+// its byte offset. All connections/pthreads share it (decision #1); the ABI
+// header is written here so the JS slot stubs are self-describing. wasm-only —
+// the native test uses the static in-process ring backend and never calls this.
+int EnsureVgiSabChannel() {
+	static std::atomic<int> g_channel{0};
+	static std::mutex g_mutex;
+	int existing = g_channel.load(std::memory_order_acquire);
+	if (existing != 0) {
+		return existing;
+	}
+	std::lock_guard<std::mutex> lk(g_mutex);
+	existing = g_channel.load(std::memory_order_relaxed);
+	if (existing != 0) {
+		return existing;
+	}
+	const int n_slots = 8;
+	const int ring_cap = sab::kDefaultRingCap;
+	const int stride = sab::SlotStride(ring_cap);
+	const int bytes = sab::kHeaderBytes + n_slots * stride;
+	void *mem = std::malloc(static_cast<size_t>(bytes));
+	if (mem == nullptr) {
+		throw IOException("VGI worker: failed to allocate SAB channel (%d bytes)", bytes);
+	}
+	std::memset(mem, 0, static_cast<size_t>(bytes));
+	auto *h = reinterpret_cast<int32_t *>(mem);
+	h[sab::HDR_MAGIC] = static_cast<int32_t>(sab::kMagic);
+	h[sab::HDR_VERSION] = sab::kVersion;
+	h[sab::HDR_N_SLOTS] = n_slots;
+	h[sab::HDR_RING_CAP] = ring_cap;
+	h[sab::HDR_SLOT_STRIDE] = stride;
+	h[sab::HDR_SLOTS_OFF] = sab::kHeaderBytes;
+	const int off = static_cast<int>(reinterpret_cast<intptr_t>(mem));
+	g_channel.store(off, std::memory_order_release);
+	return off;
+}
+} // namespace
+#endif
+
 void WebWorkerFunctionConnection::EnsureWorkerSpawned() {
 	// Lazy slot open (analog of the subprocess lazy fork/exec). The JS bridge
 	// already ensured the Web Worker exists at attach time (vgi_wasm_ensure_worker);
 	// here we only claim a free duplex slot on its channel.
 	if (slot_ < 0) {
+#if defined(__EMSCRIPTEN__)
+		// Create/reuse the shared channel and push its offset onto this pthread's
+		// JS runtime before the slot stubs touch it. (Native test: static ring.)
+		vgi_wasm_set_channel(EnsureVgiSabChannel());
+#endif
 		slot_ = vgi_wasm_slot_open(location_.c_str());
 		if (slot_ < 0) {
 			ThrowVgiIOException("Failed to open SAB slot (channel exhausted)", location_, -1, "");

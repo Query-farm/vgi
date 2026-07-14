@@ -73,4 +73,9 @@ void vgi_wasm_slot_write_eos(int slot);
 int vgi_wasm_slot_read(int slot, uint8_t *data, int n);
 // Release the slot (state -> 0). Idempotent.
 void vgi_wasm_slot_release(int slot);
+// Push the channel's byte offset in linear memory onto the calling pthread's JS
+// runtime (the slot stubs read the channel via Module.HEAP at this offset). C++
+// calls this per connection with the shared channel offset. wasm build only; the
+// native test uses a static in-process channel and does not call it.
+void vgi_wasm_set_channel(int channel_offset);
 }
