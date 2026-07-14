@@ -30,10 +30,12 @@ class LogicalVgiLateralBatch : public LogicalExtensionOperator {
 public:
 	LogicalVgiLateralBatch(idx_t table_index, vector<column_t> projected_input,
 	                       vector<LogicalType> worker_output_types, vector<ColumnBinding> worker_bindings,
-	                       unique_ptr<FunctionData> bind_data)
+	                       unique_ptr<FunctionData> bind_data, vector<column_t> worker_column_ids,
+	                       bool projection_pushdown)
 	    : table_index(table_index), projected_input(std::move(projected_input)),
 	      worker_output_types(std::move(worker_output_types)), worker_bindings(std::move(worker_bindings)),
-	      bind_data(std::move(bind_data)) {
+	      bind_data(std::move(bind_data)), worker_column_ids(std::move(worker_column_ids)),
+	      projection_pushdown(projection_pushdown) {
 	}
 
 	idx_t table_index;
@@ -41,6 +43,15 @@ public:
 	vector<column_t> projected_input;
 	//! Worker output column types (the leading base_idx columns).
 	vector<LogicalType> worker_output_types;
+	//! Worker-original column indices of the leading base_idx output columns (from
+	//! LogicalGet::GetColumnIds()). When the function supports projection pushdown,
+	//! DuckDB's UNUSED_COLUMNS pass narrows these to the referenced worker columns;
+	//! they are threaded to the worker as the wire projection so it emits exactly
+	//! this narrow set, and drive the projected ArrowToDuckDB remap.
+	vector<column_t> worker_column_ids;
+	//! Echo of VgiTableInOutBindData::projection_pushdown — gates whether the wire
+	//! projection is sent (sending it to a non-projecting worker mis-projects).
+	bool projection_pushdown;
 	//! Worker output column bindings (ColumnBinding(table_index, i)); snapshot at
 	//! rewrite so we don't depend on the child for these.
 	vector<ColumnBinding> worker_bindings;
@@ -82,7 +93,8 @@ public:
 public:
 	PhysicalVgiLateralBatch(PhysicalPlan &physical_plan, vector<LogicalType> types,
 	                        unique_ptr<FunctionData> bind_data, vector<column_t> projected_input, idx_t input_length,
-	                        idx_t base_idx, idx_t estimated_cardinality);
+	                        idx_t base_idx, vector<column_t> worker_column_ids, bool projection_pushdown,
+	                        idx_t estimated_cardinality);
 
 	//! Owns the VgiTableInOutBindData for the life of the plan.
 	unique_ptr<FunctionData> bind_data;
@@ -92,6 +104,14 @@ public:
 	idx_t input_length;
 	//! First output column index of the projected/outer columns.
 	idx_t base_idx;
+	//! Worker-original column indices of the leading base_idx output columns. When
+	//! projection_pushdown is set, threaded to the worker as the wire projection so
+	//! it emits exactly this narrow set, and used to drive the projected
+	//! ArrowToDuckDB remap (arrow_scan_is_projected=true).
+	vector<column_t> worker_column_ids;
+	//! Whether the function supports projection pushdown (gates threading the wire
+	//! projection + the projected ArrowToDuckDB read).
+	bool projection_pushdown;
 
 public:
 	unique_ptr<GlobalOperatorState> GetGlobalOperatorState(ClientContext &context) const override;

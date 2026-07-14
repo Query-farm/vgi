@@ -156,5 +156,90 @@ true
 statement ok
 CALL disable_logging();
 
+# ---------------------------------------------------------------------------
+# Projection pushdown through the batched operator. projectable_blended is a 1->1
+# map with TWO output columns (a=x*10, b=x*100) that advertises projection_pushdown.
+# When a correlated LATERAL projects only a SUBSET of the worker's output, DuckDB's
+# UNUSED_COLUMNS pass narrows the get's column_ids; the operator must thread that
+# projection to the worker (narrow emit) and remap it — NOT read worker column 0
+# into the `b` slot. Regression for the silent-corruption bug where `SELECT x,b`
+# returned column `a`'s value.
+# ---------------------------------------------------------------------------
+
+# subset: only b referenced (b = x*100, NOT x*10)
+query II
+SELECT x, b FROM range(4) t(x), LATERAL ex.projectable_blended(t.x) ORDER BY x;
+----
+0	0
+1	100
+2	200
+3	300
+
+# subset: only a referenced (a = x*10)
+query II
+SELECT x, a FROM range(4) t(x), LATERAL ex.projectable_blended(t.x) ORDER BY x;
+----
+0	0
+1	10
+2	20
+3	30
+
+# full projection: both columns, correct order
+query III
+SELECT x, a, b FROM range(4) t(x), LATERAL ex.projectable_blended(t.x) ORDER BY x;
+----
+0	0	0
+1	10	100
+2	20	200
+3	30	300
+
+# Equivalence anchor: the subset projection must match the row-by-row path exactly.
+statement ok
+SET vgi_batch_lateral=false;
+
+query II
+SELECT x, b FROM range(4) t(x), LATERAL ex.projectable_blended(t.x) ORDER BY x;
+----
+0	0
+1	100
+2	200
+3	300
+
+statement ok
+SET vgi_batch_lateral=true;
+
+# ---------------------------------------------------------------------------
+# Adversarial provenance: the worker (a semi-trusted, possibly remote, party)
+# supplies integers used as input-row indices. A malformed vgi_rpc.parent_row must
+# be REJECTED (clear error), never used as an unchecked array index. hostile_provenance
+# emits a poisoned payload per `mode`; each must throw on BOTH transports so the
+# subprocess and HTTP parse/validate paths stay symmetric. threads=1 makes the
+# single input chunk deterministic.
+# ---------------------------------------------------------------------------
+
+statement ok
+SET threads=1;
+
+# out-of-range index (== num_rows, one past the last valid): the range check throws.
+statement error
+SELECT t.x, hv FROM range(4) t(x), LATERAL ex.hostile_provenance(t.x, mode := 'range');
+----
+out of range
+
+# wrong-length blob (one int32 too many): the length check throws.
+statement error
+SELECT t.x, hv FROM range(4) t(x), LATERAL ex.hostile_provenance(t.x, mode := 'length');
+----
+vgi_rpc.parent_row
+
+# non-base64 payload: the connection's base64 decode throws before any indexing.
+statement error
+SELECT t.x, hv FROM range(4) t(x), LATERAL ex.hostile_provenance(t.x, mode := 'base64');
+----
+invalid base64 payload
+
+statement ok
+RESET threads;
+
 statement ok
 DETACH ex;

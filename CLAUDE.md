@@ -1159,13 +1159,36 @@ output rows == input rows, else a loud `IOException` naming the worker/function)
 So existing 1→1 blended fixtures (`geo_encode`, `row_sum`) need zero change. The
 vgi-python emit API is `out.emit(batch, parent_rows=[…])` (`_merge_parent_rows`
 in `vgi/protocol.py`); the `blended_explode` fixture (emit `0..n-1` per input
-row) exercises 1→0/1→1/1→N. Tests:
-`test/sql/integration/table_in_out/lateral_batch.test` (both transports;
+row) exercises 1→0/1→1/1→N.
+
+**Projection pushdown.** Supported (not gated off). When the blended function
+advertises `projection_pushdown` and a correlated LATERAL references only a subset
+of its output columns, DuckDB's `UNUSED_COLUMNS` pass narrows the get's
+`column_ids` before the rewriter runs (the InOut path uses `column_ids`, not
+`projection_ids` — see `plan_get.cpp`), so `base_idx == column_ids.size()`. The
+rewriter captures those worker-original indices; the operator threads them to the
+worker as the wire projection (narrow emit) and sets the scan state's `column_ids`
+so `ProduceOutputFromBatch(projection_pushdown=true)` remaps the narrow batch
+(`arrow_scan_is_projected`). Getting this wrong reads a worker column into a
+correlated-column slot — the review that added `projectable_blended` caught exactly
+that silent corruption. Filter pushdown stays unsupported (DuckDB's InOut path
+discards `table_filters`).
+
+**Hardening (review-driven).** Worker-supplied `parent_row` indices are validated
+before use as array indices: length (`raw.size() == output_rows*4`), range
+(`[0, input_rows)`), an overflow guard on the row count, and base64 decode — all
+throwing a clear `IOException`, symmetric across subprocess/HTTP. A mid-drain
+input-size change and a mid-stream EOS both fail loudly rather than reading OOB /
+dropping rows. The `hostile_provenance` fixture (`mode` ∈ range/length/base64)
+regresses each on both transports.
+
+Tests: `test/sql/integration/table_in_out/lateral_batch.test` (both transports;
 result-equivalence vs `SET vgi_batch_lateral=false`; batching proof via
-`duckdb_logs` `write_input` count; multi-slice drain). **Files:**
-`src/vgi_lateral_batch_operator.{cpp,hpp}`, plus the `parent_row` parse in
-`vgi_function_connection.cpp` / `vgi_http_function_connection.cpp` and the
-reused exchange helpers in `vgi_table_in_out_impl.cpp`.
+`duckdb_logs` `write_input` count; multi-slice drain; projection subset;
+adversarial provenance). **Files:** `src/vgi_lateral_batch_operator.{cpp,hpp}`,
+plus the `parent_row` parse in `vgi_function_connection.cpp` /
+`vgi_http_function_connection.cpp` and the reused exchange helpers
+(`AcquireBlendedInputConnection` threads projection) in `vgi_table_in_out_impl.cpp`.
 
 ### Catalog Integration
 

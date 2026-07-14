@@ -2,6 +2,7 @@
 #include "vgi_lateral_batch_operator.hpp"
 
 #include <cstring>
+#include <limits>
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/serializer/serializer.hpp"
@@ -68,9 +69,11 @@ PhysicalOperator &LogicalVgiLateralBatch::CreatePlan(ClientContext &context, Phy
 	// input_length = worker-input width = child columns minus the correlated cols.
 	const idx_t input_length = children[0]->types.size() - projected_input.size();
 	const idx_t base_idx = worker_output_types.size();
+	D_ASSERT(worker_column_ids.size() == base_idx);
 	auto out_types = types; // [worker | projected]
 	auto &op = planner.Make<PhysicalVgiLateralBatch>(std::move(out_types), std::move(bind_data),
 	                                                  std::move(projected_input), input_length, base_idx,
+	                                                  std::move(worker_column_ids), projection_pushdown,
 	                                                  estimated_cardinality);
 	op.children.push_back(child_plan);
 	return op;
@@ -102,6 +105,11 @@ struct VgiLateralBatchOperatorState : public OperatorState {
 	// by DuckDB while draining, so stamping stays correct). Identity [0..n) when the
 	// worker emitted no provenance (1->1 maps). Cleared when the batch is exhausted.
 	std::vector<int32_t> parent_index;
+	// input.size() when parent_index was decoded (branch B). parent_index was
+	// range-validated against THIS size; every drain slice (branch A) gathers from
+	// input at those indices and relies on DuckDB re-passing the same-sized chunk.
+	// Asserted on each drain so a broken re-pass contract fails loudly, never OOB.
+	idx_t input_size_at_decode = 0;
 };
 
 // Decode the worker's per-output-row provenance. `raw` is the base64-decoded raw
@@ -125,6 +133,13 @@ std::vector<int32_t> DecodeParentRow(const std::string &raw, idx_t output_rows, 
 			result[i] = static_cast<int32_t>(i);
 		}
 		return result;
+	}
+	// Guard the multiply below against overflow (a hostile 0-column batch could claim
+	// an enormous num_rows). output_rows this large can never be matched by a deliverable
+	// raw payload, so this fails closed with a clear error rather than wrapping.
+	if (output_rows > (std::numeric_limits<size_t>::max() / sizeof(int32_t))) {
+		throw IOException("vgi_batch_lateral: implausible output row count %llu from worker '%s' function '%s'",
+		                  (unsigned long long)output_rows, bd.worker_path(), bd.function_name);
 	}
 	if (raw.size() != output_rows * sizeof(int32_t)) {
 		throw IOException("vgi_batch_lateral: vgi_rpc.parent_row is %llu bytes for %llu output rows "
@@ -173,10 +188,13 @@ void StampProjected(DataChunk &chunk, DataChunk &input, const std::vector<int32_
 
 PhysicalVgiLateralBatch::PhysicalVgiLateralBatch(PhysicalPlan &physical_plan, vector<LogicalType> types,
                                                  unique_ptr<FunctionData> bind_data_p, vector<column_t> projected_input_p,
-                                                 idx_t input_length_p, idx_t base_idx_p, idx_t estimated_cardinality)
+                                                 idx_t input_length_p, idx_t base_idx_p,
+                                                 vector<column_t> worker_column_ids_p, bool projection_pushdown_p,
+                                                 idx_t estimated_cardinality)
     : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, std::move(types), estimated_cardinality),
       bind_data(std::move(bind_data_p)), projected_input(std::move(projected_input_p)), input_length(input_length_p),
-      base_idx(base_idx_p) {
+      base_idx(base_idx_p), worker_column_ids(std::move(worker_column_ids_p)),
+      projection_pushdown(projection_pushdown_p) {
 }
 
 unique_ptr<GlobalOperatorState> PhysicalVgiLateralBatch::GetGlobalOperatorState(ClientContext & /*context*/) const {
@@ -193,17 +211,39 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 	auto &client_context = context.client;
 	auto &bd = bind_data->Cast<VgiTableInOutBindData>();
 
-	// Lazy per-substream worker acquire (INPUT phase, input writer open).
+	// Lazy per-substream worker acquire (INPUT phase, input writer open). When the
+	// function supports projection pushdown, DuckDB narrowed worker_column_ids to the
+	// referenced columns; thread them as the wire projection so the worker emits only
+	// those, and set the scan state's column_ids so ProduceOutputFromBatch's projected
+	// read (arrow_scan_is_projected=true) remaps the narrow batch correctly.
 	if (!state.connection) {
-		state.connection = AcquireBlendedInputConnection(client_context, bd, state.substream_id);
+		std::vector<int32_t> projection_ids;
+		if (projection_pushdown) {
+			projection_ids.reserve(worker_column_ids.size());
+			for (auto col_id : worker_column_ids) {
+				projection_ids.push_back(static_cast<int32_t>(col_id));
+			}
+			state.scan.column_ids = worker_column_ids;
+		}
+		state.connection = AcquireBlendedInputConnection(client_context, bd, state.substream_id, projection_ids);
 	}
 
 	// (A) Drain the remaining slices of the output batch already loaded in `scan`.
 	// DuckDB re-passes the SAME `input` chunk unchanged across HAVE_MORE_OUTPUT, so
 	// the held parent_index still refers to the right correlated rows.
 	if (HasRemainingBatchData(state.scan)) {
+		// Defense-in-depth: parent_index was range-validated against input.size() at
+		// decode time. If DuckDB ever re-passed a smaller chunk during the drain, a
+		// held index could point past the input's cardinality — an OOB gather. Fail
+		// loudly instead (the invariant is a same-sized re-pass; this should be dead).
+		if (input.size() != state.input_size_at_decode) {
+			throw IOException("vgi_batch_lateral: input chunk resized mid-drain (%llu -> %llu); "
+			                  "worker '%s' function '%s'",
+			                  (unsigned long long)state.input_size_at_decode, (unsigned long long)input.size(),
+			                  bd.worker_path(), bd.function_name);
+		}
 		idx_t start = state.scan.chunk_offset; // rows already produced from this batch
-		idx_t produced = ProduceOutputFromBatch(state.scan, bd.arrow_table, chunk);
+		idx_t produced = ProduceOutputFromBatch(state.scan, bd.arrow_table, chunk, projection_pushdown);
 		StampProjected(chunk, input, state.parent_index, projected_input, base_idx, start, produced);
 		chunk.SetCardinality(produced);
 		return HasRemainingBatchData(state.scan) ? OperatorResultType::HAVE_MORE_OUTPUT
@@ -240,10 +280,14 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 	auto output_batch = state.connection->ReadDataBatch();
 
 	if (!output_batch) {
-		// Unexpected EOS on a live map stream — drop (never pool a mid-stream worker).
-		chunk.SetCardinality(0);
+		// EOS mid-stream is a worker protocol violation: this operator never closes the
+		// input writer (a map keeps exchanging), so the worker must answer every input
+		// chunk with a data batch. A silent FINISHED here would drop the rest of the
+		// input; surface it. Drop the connection (never pool a mid-stream worker).
 		state.connection.reset();
-		return OperatorResultType::FINISHED;
+		throw IOException("vgi_batch_lateral: worker '%s' function '%s' returned end-of-stream "
+		                  "mid-exchange (expected one output batch per input chunk)",
+		                  bd.worker_path(), bd.function_name);
 	}
 	if (output_batch->num_rows() == 0) {
 		// 1->0 for the WHOLE chunk: every input row filtered out. (A per-row 1->0 with
@@ -252,13 +296,15 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 		return OperatorResultType::NEED_MORE_INPUT;
 	}
 
-	// Decode provenance (identity when absent + rows align). Held for the drain.
+	// Decode provenance (identity when absent + rows align). Held for the drain,
+	// range-validated against THIS input.size() (see the branch-A drain guard).
 	state.parent_index = DecodeParentRow(state.connection->GetLastParentRowBytes(),
 	                                     static_cast<idx_t>(output_batch->num_rows()), input.size(), bd);
+	state.input_size_at_decode = input.size();
 
 	LoadBatchIntoScanState(state.scan, output_batch);
 	idx_t start = state.scan.chunk_offset; // 0 for a freshly loaded batch
-	idx_t produced = ProduceOutputFromBatch(state.scan, bd.arrow_table, chunk); // fills [0, base_idx)
+	idx_t produced = ProduceOutputFromBatch(state.scan, bd.arrow_table, chunk, projection_pushdown); // fills [0, base_idx)
 	StampProjected(chunk, input, state.parent_index, projected_input, base_idx, start, produced);
 	chunk.SetCardinality(produced);
 	return HasRemainingBatchData(state.scan) ? OperatorResultType::HAVE_MORE_OUTPUT
@@ -308,9 +354,32 @@ void RewriteOne(unique_ptr<LogicalOperator> &op) {
 	vector<ColumnBinding> worker_bindings(all_bindings.begin(), all_bindings.begin() + base_idx);
 	vector<LogicalType> worker_output_types(get.types.begin(), get.types.begin() + base_idx);
 
+	// Capture the worker-original column indices of the leading base_idx output
+	// columns. When the function supports projection pushdown, DuckDB's
+	// UNUSED_COLUMNS pass has narrowed get.column_ids to the referenced worker
+	// columns (the InOut path uses column_ids, not projection_ids — see
+	// plan_get.cpp), so column_ids.size() == base_idx and these are exactly the
+	// columns to request from the worker. Without projection pushdown the worker
+	// emits its full schema in order, so identity indices are used (and never sent).
+	auto *bd = &get.bind_data->Cast<VgiTableInOutBindData>();
+	const bool projection_pushdown = bd->projection_pushdown;
+	auto col_ids = get.GetColumnIds();
+	vector<column_t> worker_column_ids;
+	worker_column_ids.reserve(base_idx);
+	if (projection_pushdown && col_ids.size() == base_idx) {
+		for (idx_t i = 0; i < base_idx; i++) {
+			worker_column_ids.push_back(col_ids[i].GetPrimaryIndex());
+		}
+	} else {
+		for (idx_t i = 0; i < base_idx; i++) {
+			worker_column_ids.push_back(i);
+		}
+	}
+
 	auto new_op = make_uniq<LogicalVgiLateralBatch>(get.table_index, std::move(get.projected_input),
 	                                                std::move(worker_output_types), std::move(worker_bindings),
-	                                                std::move(get.bind_data));
+	                                                std::move(get.bind_data), std::move(worker_column_ids),
+	                                                projection_pushdown);
 	new_op->children.push_back(std::move(get.children[0]));
 	new_op->ResolveOperatorTypes();
 	op = std::move(new_op);

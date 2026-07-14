@@ -326,9 +326,12 @@ std::vector<uint8_t> MintSubstreamId();
 
 // Acquire + INPUT-init a blended function's worker from bind_data alone (no
 // VgiTableInOutGlobalState); bind_data.bind_result is populated at bind.
+// `projection_ids` (worker-original column indices) is threaded to PerformInit so a
+// projection-pushdown function emits only the referenced columns; pass {} for none.
 std::unique_ptr<IFunctionConnection>
 AcquireBlendedInputConnection(ClientContext &context, const VgiTableInOutBindData &bind_data,
-                              const std::vector<uint8_t> &substream_id);
+                              const std::vector<uint8_t> &substream_id,
+                              const std::vector<int32_t> &projection_ids = {});
 
 // Return a substream's worker to the pool at clean end-of-stream.
 void ReleaseSubstreamConnection(std::unique_ptr<IFunctionConnection> &conn,

@@ -627,11 +627,15 @@ AcquireSubstreamConnection(ClientContext &context, const VgiTableInOutBindData &
 
 // Acquire + INPUT-init a worker for a blended function from bind_data alone (no
 // VgiTableInOutGlobalState). Used by the batched-lateral operator, which has no
-// InitGlobal — bind_data.bind_result is populated at bind. No projection/filter
-// pushdown (a blended LATERAL call gets none). Mirrors AcquireSubstreamConnection.
+// InitGlobal — bind_data.bind_result is populated at bind. `projection_ids`
+// (worker-original column indices) is threaded when the function supports
+// projection pushdown so it emits only the referenced columns; the operator sets
+// the scan state's column_ids to match for the projected read. No filter pushdown
+// (DuckDB's InOut path discards table_filters). Mirrors AcquireSubstreamConnection.
 std::unique_ptr<IFunctionConnection>
 AcquireBlendedInputConnection(ClientContext &context, const VgiTableInOutBindData &bind_data,
-                              const std::vector<uint8_t> &substream_id) {
+                              const std::vector<uint8_t> &substream_id,
+                              const std::vector<int32_t> &projection_ids) {
 	FunctionConnectionParams p;
 	p.attach_params = bind_data.attach_params;
 	p.attach_opaque_data = bind_data.attach_opaque_data;
@@ -647,7 +651,7 @@ AcquireBlendedInputConnection(ClientContext &context, const VgiTableInOutBindDat
 	auto conn = std::move(acquired.connection);
 	conn->SetSubstreamId(substream_id);
 	try {
-		conn->PerformInit(bind_data.bind_result, {}, nullptr, {}, "INPUT");
+		conn->PerformInit(bind_data.bind_result, projection_ids, nullptr, {}, "INPUT");
 	} catch (const IOException &) {
 		if (!acquired.from_pool) {
 			throw;
@@ -655,7 +659,7 @@ AcquireBlendedInputConnection(ClientContext &context, const VgiTableInOutBindDat
 		acquired = AcquireConnectionForInit(context, p, /*force_fresh=*/true);
 		conn = std::move(acquired.connection);
 		conn->SetSubstreamId(substream_id);
-		conn->PerformInit(bind_data.bind_result, {}, nullptr, {}, "INPUT");
+		conn->PerformInit(bind_data.bind_result, projection_ids, nullptr, {}, "INPUT");
 	}
 	conn->OpenInputWriter();
 	return conn;
