@@ -3347,6 +3347,12 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "lz4/none). Keep it low — the default 1 is Pareto-optimal (near-zstd-3 ratio "
 	                          "at ~half the CPU)",
 	                          LogicalType::UBIGINT, Value::UBIGINT(1));
+	config.AddExtensionOption("vgi_result_cache_exchange_disk_min_bytes",
+	                          "Minimum stored-payload size before an EXCHANGE-mode memo entry (streaming "
+	                          "table-in-out / correlated LATERAL / buffered) is written to the disk tier. "
+	                          "Below it the entry stays memory-only, so per-input-chunk keying can't spray "
+	                          "millions of tiny files at the content-addressed store (default 64 KB)",
+	                          LogicalType::UBIGINT, Value::UBIGINT(65536));
 
 	// Cache directory for worker binaries downloaded via github:// / github-auto://
 	// LOCATIONs. Empty (default) → ${XDG_CACHE_HOME:-~/.cache}/vgi/releases. Must be

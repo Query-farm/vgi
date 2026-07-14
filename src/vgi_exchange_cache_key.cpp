@@ -189,6 +189,7 @@ void SyncResultCacheSettings(ClientContext &context) {
 	u64("vgi_result_cache_disk_reap_interval_seconds", s.disk_reap_interval_seconds);
 	str("vgi_result_cache_disk_compression", s.disk_compression);
 	u64("vgi_result_cache_disk_compression_level", s.disk_compression_level);
+	u64("vgi_result_cache_exchange_disk_min_bytes", s.exchange_disk_min_bytes);
 	VgiResultCache::Instance().ConfigureIfChanged(s);
 }
 
@@ -340,8 +341,10 @@ void SlideRevalidatedExchangeEntry(const VgiResultCacheEntry &entry, const VgiCa
 		fresh->last_modified = cc.last_modified;
 	}
 	// An immediately-stale (always-revalidate) entry is memory-only: LookupForRevalidation
-	// probes the in-memory index, and a disk immediately-stale blob is un-loadable.
-	bool eff_allow_disk = allow_disk && (entry.never_expires || fresh->expires_at > fresh->stored_at);
+	// probes the in-memory index, and a disk immediately-stale blob is un-loadable. Small
+	// entries also stay memory-only ([S9] floor) — same rationale as the store path.
+	bool eff_allow_disk = allow_disk && (entry.never_expires || fresh->expires_at > fresh->stored_at) &&
+	                      entry.total_bytes >= VgiResultCache::Instance().ExchangeDiskMinBytes();
 	VgiResultCache::Instance().Insert(fresh, eff_allow_disk);
 }
 
@@ -410,7 +413,12 @@ ExchangeStoreResult StoreExchangeMemoEntry(const VgiResultCacheKey &key, const V
 	entry->rows = rows;
 	entry->total_bytes = bytes;
 
-	if (!VgiResultCache::Instance().Insert(std::move(entry), eff_allow_disk)) {
+	// [S9] Disk-tier floor: a tiny per-input-batch/-chunk memo stays memory-only so
+	// per-chunk keying can't spray millions of .vrc/.ref files at the content-addressed
+	// store (the floor is only ~64 KB; a whole-input buffered result clears it easily).
+	bool floored_allow_disk = eff_allow_disk && bytes >= VgiResultCache::Instance().ExchangeDiskMinBytes();
+
+	if (!VgiResultCache::Instance().Insert(std::move(entry), floored_allow_disk)) {
 		return skip("too_large_for_memory");
 	}
 	res.stored = true;

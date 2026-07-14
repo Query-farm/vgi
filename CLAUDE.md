@@ -668,6 +668,20 @@ Three shapes, three granularities (all emit `result_cache.{hit,store,store_skipp
   folded). The vgi-python buffered `finalize()` now always wraps `out` in
   `_TrackingOutputCollector` so it can advertise `vgi.cache.*` (parity with the streaming emit).
 
+**⚠️ Correctness contract — the opt-in asserts per-unit purity.** Advertising `vgi.cache.*`
+on an exchange-mode output is a **promise that the output is a pure function of the keyed
+input unit** (the batch for streaming; the full chunk for LATERAL; the whole input multiset
+for buffered) plus the static bind dimensions — with **no cross-batch/cross-invocation worker
+state** feeding the output. A hit serves the memoized output for an identical input unit
+**without running the worker**, so a *stateful* streaming map that advertises cacheability
+(e.g. output depends on a running counter, prior-batch carryover, wall-clock, or any
+per-connection accumulator not in the key) will serve **stale/wrong** rows on a hit. The
+framework cannot detect this generically — it is the **worker author's responsibility**. If a
+function isn't per-unit-pure, do **not** advertise `vgi.cache.*` (or advertise `no_store`).
+The structurally-stateful shapes are already excluded from M1 (`has_finalize` /
+`single_row_scan` / serial path never memoize per-batch); a *finalize* / *buffered* function's
+state is legitimately keyed by the whole-input digest, so those are safe by construction.
+
 All exchange entries participate in the **on-disk tier** (`allow_disk=true`) for a
 cross-process + cross-restart warm cache, same as producer entries — the disk tier is off
 by default (needs `vgi_result_cache_dir`), so this only persists when configured.
@@ -675,6 +689,21 @@ by default (needs `vgi_result_cache_dir`), so this only persists when configured
 `ConfigureIfChanged`) so `SET vgi_result_cache_dir/…` reaches the singleton on the exchange
 path; `DeserializeCachedRecordBatch` is disk-aware (positioned-reads a streaming entry's
 batch from the blob). Transaction scope is refused for exchange entries in v1.
+
+**Disk-tier floor ([S9], `vgi_result_cache_exchange_disk_min_bytes`, default 64 KB).** Per-
+input-batch/-chunk memos are tiny, so writing every one to the content-addressed disk store
+would spray millions of `.vrc`/`.ref` files. An exchange entry below the floor stays
+**memory-only**; only entries ≥ the floor (in practice, whole-input buffered results) reach
+disk. Set the floor to 0 to force even tiny memos to disk.
+
+**Bounded buffered capture ([S6]).** Unlike the producer path (which spills a large capture to
+a streaming disk blob), the buffered operator accumulates the whole-input result in RAM
+(`capture_batches`) before the gstate dtor commits — so it is bounded **during** capture:
+a capture crossing `vgi_result_cache_max_entry_bytes` **or** the process-global
+`vgi_result_cache_max_inflight_bytes` budget (`arrow::util::TotalBufferSize` per batch,
+`TryReserveInflightCapture`) aborts to uncached, drops the accumulated batches, and keeps
+streaming to DuckDB (`result_cache.abort` → `capture_aborts`). The reserved budget is released
+in the dtor.
 
 **Conditional revalidation (304).** Wired for the **streaming table-in-out (M1)** and
 **correlated LATERAL (M2)** operators (both transports). A worker advertises the
@@ -736,6 +765,7 @@ transport in `src/query_farm_telemetry.cpp`. Full field reference: [docs/telemet
 | `vgi_result_cache_disk_max_bytes` | UBIGINT | 0 | Byte cap for the on-disk result-cache tier (0 = disk tier off) |
 | `vgi_result_cache_disk_compression` | VARCHAR | `zstd` | Compression codec for the **on-disk** result-cache tier (Arrow built-in IPC buffer compression, applied per-batch so per-batch seek / streaming serve is preserved; the reader decompresses transparently). `zstd` (default), `lz4` (minimal CPU), or `none`. The **memory tier is never compressed** (zero hot-path decompress); compression is applied at the disk-write boundary — compress-at-source on the spill path, transcode on the buffered/drain paths. Default-on when the disk tier is enabled. A missing codec degrades gracefully to uncompressed. Verify it's active via the `codec` column of `vgi_result_cache(include_disk := true)`. See [docs/result_cache_compression.md](docs/result_cache_compression.md) |
 | `vgi_result_cache_disk_compression_level` | UBIGINT | 1 | zstd compression level for the on-disk tier (ignored for `lz4`/`none`). Keep it low — the default 1 is Pareto-optimal (near-zstd-3 ratio at ~half the CPU) |
+| `vgi_result_cache_exchange_disk_min_bytes` | UBIGINT | 65536 (64 KB) | Minimum stored-payload size before an **exchange-mode** memo entry (streaming table-in-out / correlated LATERAL / buffered) is written to the disk tier. Per-input-batch/-chunk memos are tiny; below the floor they stay **memory-only** so per-chunk keying can't spray millions of `.vrc`/`.ref` files at the content-addressed store. Whole-input buffered results clear the floor. Set 0 to force even tiny memos to disk. (Scaling seam **S9**) |
 | `vgi_result_cache_max_entries` | UBIGINT | 131072 | **Entry-count** cap for the in-memory index (0 = unlimited). Bounds unbounded small-entry accumulation that the byte cap alone misses (~700k tiny entries fit under 256 MB); also keeps the reaper / `vgi_result_cache()` O(N) walks small. LRU-evicts oldest above the cap. Read per-query. (Scaling seam **S5**) |
 | `vgi_result_cache_max_inflight_bytes` | UBIGINT | 268435456 (256 MB) | Process-global budget for **in-flight capture** RAM (sum of all concurrently-capturing MISSes' buffered substreams). A capture that would push the total over the budget aborts to uncached (`result_cache.abort reason=inflight_budget`) and keeps streaming to DuckDB — bounds total capture RAM regardless of query concurrency, which the per-entry cap alone can't (N captures peak at N × `max_entry_bytes`). Read per-query. (Scaling seam **S6**) |
 | `vgi_result_cache_disk_reap_interval_seconds` | UBIGINT | 60 | How often the background thread reaps the **disk** tier (expired refs / over-cap eviction / orphan sweep), decoupled from the ~1 s in-memory reap. The disk reap reads every ref + stats every object per pass, so running it every tick is wasteful; expiry is wall-clock, so a coarser cadence is correctness-neutral. (Scaling seam **S7**) |

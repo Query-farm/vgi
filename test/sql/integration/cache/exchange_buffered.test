@@ -106,6 +106,80 @@ WHERE type = 'VGI'
 0
 
 # ---------------------------------------------------------------------------
+# Capture bound ([S6]): the buffered operator accumulates the whole-input result
+# in RAM before committing, so it is bounded DURING capture. A result larger than
+# max_entry_bytes aborts capture to uncached — the query still returns correct rows,
+# but nothing is stored, so a repeat MISSes again (combine re-runs). This is the
+# only exchange path that captures a whole result in RAM (streaming/LATERAL memos
+# are per-unit tiny); bounding it keeps a huge buffered result from blowing memory.
+# ---------------------------------------------------------------------------
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+statement ok
+SET vgi_result_cache_max_entry_bytes = 1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT x AS total FROM ex.cached_sum_all((SELECT x FROM t));
+----
+45
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# Repeat: still a MISS (capture aborted over the 1-byte cap — nothing was stored).
+query I
+SELECT x AS total FROM ex.cached_sum_all((SELECT x FROM t));
+----
+45
+
+query I
+SELECT count(*) > 0
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'table_buffering.combine'
+  AND message LIKE '%cached_sum_all%';
+----
+true
+
+# The bounded capture bumped the process-global capture-abort counter.
+query I
+SELECT capture_aborts > 0 FROM vgi_result_cache_stats();
+----
+true
+
+statement ok
+RESET vgi_result_cache_max_entry_bytes;
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+# Sanity: with the cap restored the entry caches again (combine skipped on repeat).
+statement ok
+SELECT x AS total FROM ex.cached_sum_all((SELECT x FROM t));
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT x AS total FROM ex.cached_sum_all((SELECT x FROM t));
+----
+45
+
+query I
+SELECT count(*)
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'table_buffering.combine'
+  AND message LIKE '%cached_sum_all%';
+----
+0
+
+# ---------------------------------------------------------------------------
 # Shared cache surface + flush invalidation.
 # ---------------------------------------------------------------------------
 

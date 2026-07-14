@@ -456,6 +456,7 @@ uint64_t SettingsSignature(const VgiResultCache::Settings &s) {
 	HashCombine(seed, s.disk_max_bytes);
 	HashCombine(seed, s.disk_reap_interval_seconds);
 	HashCombine(seed, s.disk_compression_level);
+	HashCombine(seed, s.exchange_disk_min_bytes);
 	HashStr(seed, s.disk_dir);
 	HashStr(seed, s.disk_compression);
 	return seed;
@@ -469,6 +470,8 @@ void VgiResultCache::Configure(const Settings &settings) {
 	disk_max_bytes_ = settings.disk_max_bytes;
 	disk_compression_ = settings.disk_compression;
 	disk_compression_level_ = settings.disk_compression_level;
+	exchange_disk_min_bytes_.store(static_cast<int64_t>(settings.exchange_disk_min_bytes),
+	                               std::memory_order_relaxed);
 	// Shrinking the cap mid-flight is honored on the next Insert / reap tick;
 	// evict now so a lowered cap takes effect immediately.
 	EvictToFitLocked(0);
@@ -508,6 +511,10 @@ void VgiResultCache::ReleaseInflightCapture(int64_t bytes) {
 	if (bytes > 0) {
 		inflight_capture_bytes_.fetch_sub(bytes, std::memory_order_relaxed);
 	}
+}
+
+int64_t VgiResultCache::ExchangeDiskMinBytes() const {
+	return exchange_disk_min_bytes_.load(std::memory_order_relaxed);
 }
 
 std::shared_ptr<const VgiResultCacheEntry>

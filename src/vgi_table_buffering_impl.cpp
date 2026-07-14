@@ -2,6 +2,7 @@
 #include "vgi_table_buffering_impl.hpp"
 
 #include <arrow/c/bridge.h>
+#include <arrow/util/byte_size.h> // TotalBufferSize — bound the whole-input RAM capture
 
 #include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
@@ -238,6 +239,15 @@ public:
 	// Set if the worker's finalize output is not cacheable (no vgi.cache.* advertised),
 	// so capture stops early and the destructor never stores a partial result.
 	std::atomic<bool> capture_aborted {false};
+	// [S6/S9] Bound the whole-input RAM capture. Unlike the producer path, buffered
+	// capture accumulates the entire result in RAM (capture_batches) before the dtor
+	// commits — so it must be bounded DURING capture or a multi-GB result blows memory.
+	// A capture crossing max_entry_bytes or the process-global in-flight budget aborts
+	// to uncached (keeps streaming to DuckDB). All three guarded by capture_mu; the
+	// reserved inflight budget is released in the dtor.
+	int64_t cache_max_entry_bytes = 67108864;
+	int64_t capture_bytes = 0;
+	int64_t reserved_inflight_bytes = 0;
 };
 
 VgiTableBufferingGlobalSinkState::~VgiTableBufferingGlobalSinkState() {
@@ -346,6 +356,10 @@ VgiTableBufferingGlobalSinkState::~VgiTableBufferingGlobalSinkState() {
 			// Destructor must not throw; a failed cache store is non-fatal.
 		}
 	}
+	// [S6] Release the in-flight capture budget this gstate reserved (0 if it never
+	// captured or aborted early). Held from first captured batch until here — the
+	// transient window that bounds concurrent buffered-capture RAM.
+	VgiResultCache::Instance().ReleaseInflightCapture(reserved_inflight_bytes);
 }
 
 class VgiTableBufferingLocalSinkState : public LocalSinkState {
@@ -542,6 +556,10 @@ PhysicalVgiTableBufferingFunction::GetGlobalSinkState(ClientContext &context) co
 			Value ttl_v;
 			if (context.TryGetCurrentSetting("vgi_result_cache_default_ttl_seconds", ttl_v)) {
 				gstate->cache_default_ttl_seconds = static_cast<int64_t>(ttl_v.GetValue<uint64_t>());
+			}
+			Value mev;
+			if (context.TryGetCurrentSetting("vgi_result_cache_max_entry_bytes", mev) && !mev.IsNull()) {
+				gstate->cache_max_entry_bytes = static_cast<int64_t>(mev.GetValue<uint64_t>());
 			}
 		} else if (reason) {
 			VGI_LOG(context, "result_cache.ineligible",
@@ -1096,7 +1114,24 @@ SourceResultType PhysicalVgiTableBufferingFunction::GetDataInternal(ExecutionCon
 			}
 		}
 		if (!gstate.capture_aborted.load()) {
-			gstate.capture_batches.push_back(batch);
+			// [S6/S9] Bound the RAM capture. A result crossing the per-entry cap or the
+			// process-global in-flight budget aborts to uncached — drop what we've
+			// accumulated (freeing RAM now) and release any reserved budget; the dtor
+			// then won't commit. The query keeps streaming to DuckDB unaffected.
+			int64_t sz = arrow::util::TotalBufferSize(*batch);
+			if (gstate.capture_bytes + sz > gstate.cache_max_entry_bytes ||
+			    !VgiResultCache::Instance().TryReserveInflightCapture(sz)) {
+				gstate.capture_aborted.store(true);
+				VgiResultCache::Instance().NoteCaptureAbort();
+				VgiResultCache::Instance().ReleaseInflightCapture(gstate.reserved_inflight_bytes);
+				gstate.reserved_inflight_bytes = 0;
+				gstate.capture_bytes = 0;
+				gstate.capture_batches.clear();
+			} else {
+				gstate.capture_bytes += sz;
+				gstate.reserved_inflight_bytes += sz;
+				gstate.capture_batches.push_back(batch);
+			}
 		}
 	}
 
