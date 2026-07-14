@@ -653,6 +653,7 @@ transport in `src/query_farm_telemetry.cpp`. Full field reference: [docs/telemet
 | `vgi_streaming_window` | BOOLEAN | true | Route eligible `OVER (...)` queries against VGI aggregates with `streaming_partitioned=true` through the custom streaming operator. Set to false to fall back to `PhysicalWindow` |
 | `vgi_table_buffering` | BOOLEAN | true | Rewrite calls to `TableBufferingFunction` subclasses through the Sink+Source `PhysicalVgiTableBufferingFunction` operator. Set to false to disable the rewrite — buffered queries then throw `InvalidInputException` instead of running (emergency-rollback path; not generally useful) |
 | `vgi_multi_branch_scans` | BOOLEAN | true | Rewrite multi-branch VGI table scans into `LogicalSetOperation(UNION_ALL, ...)` via the optimizer extension. Set to false to disable the rewrite — multi-branch tables then refuse at bind with a clear `BinderException`. Emergency-rollback knob. See [docs/multi_branch.md](docs/multi_branch.md) |
+| `vgi_batch_lateral` | BOOLEAN | true | Rewrite a **correlated** blended (`RowTransformFunction`) call — `FROM t, f(t.x)` / `LATERAL f(t.x)` — into the custom `PhysicalVgiLateralBatch` operator, which ships the whole input chunk in ONE worker exchange instead of DuckDB's row-by-row `PhysicalTableInOutFunction` (one exchange per outer row). Set to false to fall back to the stock row-by-row path. See *Batched Correlated LATERAL* |
 | `vgi_trust_empty_kinds` | BOOLEAN | true | Trust worker assertions that `estimated_object_count[kind] == 0` means the kind is empty (skip `catalog_schema_contents_*` RPC). Set to false to force every RPC to fire — debug escape hatch for diagnosing worker bugs |
 | `vgi_secret_default_ttl_seconds` | BIGINT | 300 | Default cache TTL for credentials fetched from an Orchard remote secret provider, when the server suggests none. Further capped per-credential by the credential's own expiry. Read at `ATTACH`, frozen per-provider. See *Remote Secret Provider* |
 | `vgi_github_cache_dir` | VARCHAR | `""` | Cache directory for worker binaries downloaded from GitHub releases (`github://` / `github-auto://`). Empty → `${XDG_CACHE_HOME:-~/.cache}/vgi/releases`. Must be on an exec-capable filesystem. See [docs/github-transport.md](docs/github-transport.md) |
@@ -755,6 +756,7 @@ The `launch:` and `unix://` paths share one warm worker process across every Duc
 | `vgi_aggregate_window_impl.cpp` | Aggregate window callbacks (`window_init` / `window` / `window_batch`) for `OVER (...)` queries; partition is materialised + shipped once, frames evaluated per output row |
 | `vgi_aggregate_streaming_impl.cpp` | Streaming-partitioned aggregate RPC client (`streaming_open` / `_chunk` / `_close`) — pipes input chunks straight to the worker without DuckDB-side partition materialisation |
 | `vgi_streaming_window_operator.cpp` | `LogicalVgiStreamingWindow` + `PhysicalVgiStreamingWindow` — custom `LogicalExtensionOperator` / pipeline `PhysicalOperator` pair that replaces eligible `LogicalWindow` nodes when the worker opts into the streaming protocol; lives in the extension, no DuckDB-core changes |
+| `vgi_lateral_batch_operator.cpp` | `LogicalVgiLateralBatch` + `PhysicalVgiLateralBatch` + `VgiLateralBatchRewriter` — batches a **correlated** blended (`RowTransformFunction`) call into ONE worker exchange per input chunk instead of DuckDB's row-by-row driver, using per-output-row `vgi_rpc.parent_row` provenance to stamp the correlated columns. Gated on `vgi_batch_lateral`. See *Batched Correlated LATERAL* |
 | `vgi_table_in_out_impl.cpp` | Table-in-out function implementation (streaming shape — `TableInOutGenerator` subclasses; routes through DuckDB's `in_out_function` / `in_out_function_final`) |
 | `vgi_table_buffering_impl.cpp` | `LogicalVgiTableBufferingFunction` + `PhysicalVgiTableBufferingFunction` — Sink+Source operator for buffered table functions (`TableBufferingFunction` subclasses); per-thread worker fan-out via `execution_id` |
 | `vgi_arrow_ipc.cpp` | Arrow IPC stream I/O: `FdInputStream`, `FdOutputStream`, `ReadRecordBatch` |
@@ -1115,6 +1117,55 @@ all work. Correlated LATERAL / correlated subqueries go through DuckDB's
 decorrelator first — behavior follows whatever `flatten_dependent_join.cpp`
 produces and is codified by `table_buffering_lateral.test` /
 `table_buffering_recursive_cte.test` so upstream changes are CI-visible.
+
+### Batched Correlated LATERAL
+
+A **correlated** blended (`RowTransformFunction`) call — `FROM t, f(t.x, t.y)`
+or `LATERAL f(t.x, t.y)`, where the args reference an outer table — is
+decorrelated by DuckDB's planner (`flatten_dependent_join.cpp`) into a
+`LogicalGet` with a non-empty `projected_input`. The stock
+`PhysicalTableInOutFunction` then drives it **row-by-row**: it slices the child
+input to cardinality-1 and calls the in_out function once per outer row (so it
+can stamp the correct outer columns onto a possibly-1→N result). For an HTTP
+worker that is one request per outer row — 10k rows = 10k requests.
+
+`PhysicalVgiLateralBatch` (`vgi_lateral_batch_operator.cpp`) replaces that with
+**one worker exchange per input chunk**. It's installed by the
+`VgiLateralBatchRewriter` `OptimizerExtension` (post-decorrelation, same pattern
+as the streaming-window / table-buffering rewriters), which swaps the eligible
+`LogicalGet` for a `LogicalVgiLateralBatch` that replicates the get's
+column-binding/type shape exactly (`[worker output | projected outer cols]`), so
+the enclosing DELIM_JOIN is unaffected. Eligibility (`IsBatchableLateralGet`):
+`VgiTableInOutBindData` with `input_from_args && !has_finalize &&
+!table_buffering && !projected_input.empty() && children.size()==1`. Gated on
+the `vgi_batch_lateral` setting (default true).
+
+**Row provenance.** Batching is sound because the worker declares, per output
+row, which input row produced it — a per-batch `vgi_rpc.parent_row#b64`
+metadata array (base64 raw LE `int32[]`, length = output rows), mirroring the
+`vgi_partition_values#b64` carrier and parsed via
+`IFunctionConnection::GetLastParentRowBytes()` on **both** the subprocess and
+HTTP paths. The operator gathers each correlated input column at that parent
+index (`SelectionVector` + flat `VectorOperations::Copy`) to stamp the outer
+columns — so 1→N fan-out, 1→0 filtering, and 1→1 maps all work. A `> 2048`-row
+fan-out from a single input row drains across `HAVE_MORE_OUTPUT` calls, holding
+the decoded parent index (DuckDB re-passes the same input chunk while draining).
+`ParallelOperator()=true` / `NO_ORDER`: each pipeline thread owns its own
+per-substream worker.
+
+**No init flag.** A worker emits `vgi_rpc.parent_row` only when it fans out;
+absent metadata = an identity 1→1 map (the operator assumes it, and **requires**
+output rows == input rows, else a loud `IOException` naming the worker/function).
+So existing 1→1 blended fixtures (`geo_encode`, `row_sum`) need zero change. The
+vgi-python emit API is `out.emit(batch, parent_rows=[…])` (`_merge_parent_rows`
+in `vgi/protocol.py`); the `blended_explode` fixture (emit `0..n-1` per input
+row) exercises 1→0/1→1/1→N. Tests:
+`test/sql/integration/table_in_out/lateral_batch.test` (both transports;
+result-equivalence vs `SET vgi_batch_lateral=false`; batching proof via
+`duckdb_logs` `write_input` count; multi-slice drain). **Files:**
+`src/vgi_lateral_batch_operator.{cpp,hpp}`, plus the `parent_row` parse in
+`vgi_function_connection.cpp` / `vgi_http_function_connection.cpp` and the
+reused exchange helpers in `vgi_table_in_out_impl.cpp`.
 
 ### Catalog Integration
 

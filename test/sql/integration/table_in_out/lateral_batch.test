@@ -1,0 +1,160 @@
+# name: test/sql/integration/table_in_out/lateral_batch.test
+# description: Batched correlated LATERAL for blended (RowTransformFunction) table-in-out.
+#   A correlated blended call — FROM t, f(t.x) or LATERAL f(t.x) — is decorrelated by
+#   DuckDB into a LogicalGet with a non-empty projected_input, which the stock
+#   PhysicalTableInOutFunction drives ROW-BY-ROW (one worker exchange per outer row).
+#   The VgiLateralBatchRewriter OptimizerExtension swaps in PhysicalVgiLateralBatch,
+#   which ships the WHOLE input chunk in ONE exchange and maps each output row back to
+#   its input row via the worker's per-batch vgi_rpc.parent_row provenance — so a 1->N
+#   fan-out / 1->0 filter / 1->1 map all batch. Identity (1->1) needs no provenance
+#   (the operator assumes it). `SET vgi_batch_lateral=false` restores row-by-row; the
+#   two must produce identical results.
+# group: [vgi_integration_table_in_out]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+# HTTP transport ATTACH needs httpfs loaded (else a "VGI HTTP transport requires
+# the httpfs extension" error — containing "HTTP" — makes the harness silently
+# skip the whole file). Harmless on subprocess.
+require httpfs
+
+statement ok
+ATTACH 'example' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ---------------------------------------------------------------------------
+# 1->N / 1->1 / 1->0 fan-out with provenance (blended_explode emits 0..n-1 for
+# input n): n=0 -> filtered out, n=1 -> one row, n=3 -> three rows. The correlated
+# column x must be stamped onto every output row by the worker's parent_row map.
+# ---------------------------------------------------------------------------
+
+query II
+SELECT x, i FROM range(4) t(x), LATERAL ex.blended_explode(t.x) ORDER BY x, i;
+----
+1	0
+2	0
+2	1
+3	0
+3	1
+3	2
+
+# The comma-join (non-LATERAL) correlated form decorrelates the same way.
+query II
+SELECT x, i FROM range(4) t(x), ex.blended_explode(t.x) ORDER BY x, i;
+----
+1	0
+2	0
+2	1
+3	0
+3	1
+3	2
+
+# Total row count for a larger input — proves 1->0 (x=0) really drops rows.
+query I
+SELECT count(*) FROM range(4) t(x), LATERAL ex.blended_explode(t.x);
+----
+6
+
+# ---------------------------------------------------------------------------
+# Result-equivalence: batched path == row-by-row path (the correctness anchor).
+# EXCEPT-both-ways: identical multisets iff both are empty.
+# ---------------------------------------------------------------------------
+
+statement ok
+CREATE TEMP TABLE batched_result AS
+SELECT x, i FROM range(20) t(x), LATERAL ex.blended_explode(t.x % 4);
+
+statement ok
+SET vgi_batch_lateral=false;
+
+statement ok
+CREATE TEMP TABLE rowbyrow_result AS
+SELECT x, i FROM range(20) t(x), LATERAL ex.blended_explode(t.x % 4);
+
+query I
+SELECT count(*) FROM (
+  SELECT * FROM batched_result EXCEPT SELECT * FROM rowbyrow_result
+  UNION ALL
+  SELECT * FROM rowbyrow_result EXCEPT SELECT * FROM batched_result
+);
+----
+0
+
+# Same total either way (sanity: the temp tables are non-trivially sized).
+query I
+SELECT (SELECT count(*) FROM batched_result) = (SELECT count(*) FROM rowbyrow_result)
+   AND (SELECT count(*) FROM batched_result) > 0;
+----
+true
+
+statement ok
+SET vgi_batch_lateral=true;
+
+# ---------------------------------------------------------------------------
+# Identity 1->1 map through the batched operator: geo_encode emits NO provenance,
+# so the operator assumes an identity map (output rows == input rows). The
+# correlated x/y columns must still be stamped correctly.
+# ---------------------------------------------------------------------------
+
+query III
+SELECT x, y, geohash
+FROM (VALUES (10.0, 20.0), (30.0, 40.0)) v(x, y), LATERAL ex.geo_encode(v.x, v.y)
+ORDER BY x;
+----
+10.0	20.0	10.0:20.0
+30.0	40.0	30.0:40.0
+
+# ---------------------------------------------------------------------------
+# Multi-slice HAVE_MORE_OUTPUT drain: a single input row fans out to 5000 output
+# rows (> STANDARD_VECTOR_SIZE), spanning multiple 2048-row output slices. The
+# correlated column (n=5000) must be stamped identically across every slice.
+# ---------------------------------------------------------------------------
+
+query IIIII
+SELECT count(*), min(n), max(n), min(i), max(i)
+FROM (VALUES (5000)) v(n), LATERAL ex.blended_explode(v.n);
+----
+5000	5000	5000	0	4999
+
+# Every output row of the big fan-out carries the same correlated n.
+query I
+SELECT count(*) FROM (VALUES (5000)) v(n), LATERAL ex.blended_explode(v.n) WHERE n <> 5000;
+----
+0
+
+# ---------------------------------------------------------------------------
+# Batching proof: the operator issues ONE worker exchange per input CHUNK, not
+# per input ROW. 5000 input rows -> a handful of write_input events (<= chunk
+# count), never ~5000. (Only meaningful on subprocess; over HTTP the exchange
+# count is the same but the assertion below is transport-agnostic — it just
+# asserts "far fewer than one per row".)
+# ---------------------------------------------------------------------------
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT count(*) FROM range(5000) t(x), LATERAL ex.blended_explode(t.x % 3);
+----
+4999
+
+# write_input events for the blended_explode function this query issued: batched
+# is one-per-chunk (single digits for 5000 rows); row-by-row would be ~5000.
+query I
+SELECT count(*) < 100
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'table_in_out.write_input'
+  AND message LIKE '%blended_explode%';
+----
+true
+
+statement ok
+CALL disable_logging();
+
+statement ok
+DETACH ex;
