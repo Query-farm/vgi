@@ -21,6 +21,8 @@ class DataChunk;
 namespace vgi {
 
 struct VgiResultCacheKey;      // vgi_result_cache.hpp
+struct VgiCachedBatch;         // vgi_result_cache.hpp
+struct VgiCacheControl;        // vgi_cache_control.hpp
 struct VgiTableInOutBindData;  // vgi_table_in_out_impl.hpp
 
 // ============================================================================
@@ -68,6 +70,33 @@ std::string HashInputChunkUnordered(ClientContext &context, DataChunk &chunk);
 bool BuildExchangeCacheKeyStatic(ClientContext &context, const VgiTableInOutBindData &bd,
                                  const std::vector<int32_t> &projection_ids, VgiResultCacheKey &key,
                                  std::string &catalog_name, int64_t &catalog_version, const char *&reason);
+
+// ============================================================================
+// Per-unit memoization serve/store (shared by the streaming table-in-out and
+// LATERAL operators). An exchange cache entry is "the output batches for ONE
+// input unit" keyed by (static key + input_hash).
+// ============================================================================
+
+//! Deserialize one memory-tier cached batch's self-contained IPC blob back to an
+//! Arrow RecordBatch (the in-RAM `ipc` path; exchange entries are memory-only).
+std::shared_ptr<arrow::RecordBatch> DeserializeCachedRecordBatch(const VgiCachedBatch &cached);
+
+//! Result of a StoreExchangeMemoEntry attempt (for the caller's result_cache.store /
+//! result_cache.store_skipped observability, kept parallel to the producer path).
+struct ExchangeStoreResult {
+	bool stored = false;
+	const char *reason = nullptr; // set when !stored (not_cacheable / transaction_scoped / …)
+	int64_t rows = 0;
+	int64_t bytes = 0;
+};
+
+//! Build a memory-only cache entry from one input unit's output batches and Insert
+//! it (allow_disk=false — many tiny entries would thrash the disk ref store).
+//! Freshness from `cc`: a positive ttl (from cc.ttl_seconds or default_ttl_seconds)
+//! is required; no_store and transaction-scoped results are refused.
+ExchangeStoreResult StoreExchangeMemoEntry(const VgiResultCacheKey &key, const VgiCacheControl &cc,
+                                           const std::string &catalog_name, int64_t default_ttl_seconds,
+                                           const std::vector<std::shared_ptr<arrow::RecordBatch>> &out_batches);
 
 } // namespace vgi
 } // namespace duckdb

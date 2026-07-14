@@ -1,0 +1,194 @@
+# name: test/sql/integration/cache/exchange_streaming.test
+# description: EXCHANGE-mode result cache (M1) — per-input-batch memoization of a
+#   classic (TABLE-input) streaming table-in-out function. A worker that advertises
+#   vgi.cache.* on its output has each input batch's output cached keyed on an ordered
+#   hash of that input batch; an identical repeat scan is served from cache and the
+#   worker exchange is SKIPPED (zero table_in_out.write_input on the 2nd run). Shares
+#   the same VgiResultCache singleton, stats, identity scope, and invalidation as the
+#   producer-mode table-function cache.
+# group: [vgi_integration_cache]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# Deterministic single-threaded scan so input-batch boundaries repeat across runs.
+statement ok
+SET threads=1;
+
+statement ok
+CREATE TEMP TABLE src AS SELECT * FROM range(5) r(x);
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+# ---------------------------------------------------------------------------
+# First scan: MISS — the worker exchange runs and the output is captured.
+# ---------------------------------------------------------------------------
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT x FROM ex.cached_echo((SELECT x FROM src)) ORDER BY x;
+----
+0
+1
+2
+3
+4
+
+# The worker was exchanged with (miss) and the result stored.
+query I
+SELECT count(*) > 0
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'table_in_out.write_input'
+  AND message LIKE '%cached_echo%';
+----
+true
+
+query I
+SELECT count(*) > 0
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'result_cache.store'
+  AND message LIKE '%cached_echo%';
+----
+true
+
+# ---------------------------------------------------------------------------
+# Second identical scan: HIT — no worker exchange, served from the cache.
+# ---------------------------------------------------------------------------
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT x FROM ex.cached_echo((SELECT x FROM src)) ORDER BY x;
+----
+0
+1
+2
+3
+4
+
+# Proof of hit: ZERO write_input on the second run (worker skipped entirely).
+query I
+SELECT count(*)
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'table_in_out.write_input'
+  AND message LIKE '%cached_echo%';
+----
+0
+
+query I
+SELECT count(*) > 0
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'result_cache.hit'
+  AND message LIKE '%cached_echo%';
+----
+true
+
+# ---------------------------------------------------------------------------
+# Exchange entries share the producer cache surface: they appear in
+# vgi_result_cache() and count toward vgi_result_cache_stats().
+# ---------------------------------------------------------------------------
+
+query I
+SELECT count(*) > 0 FROM vgi_result_cache() WHERE function = 'cached_echo';
+----
+true
+
+query I
+SELECT hits > 0 AND inserts > 0 FROM vgi_result_cache_stats();
+----
+true
+
+# ---------------------------------------------------------------------------
+# Flush clears exchange entries too (shared singleton), so the next scan MISSes.
+# ---------------------------------------------------------------------------
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT x FROM ex.cached_echo((SELECT x FROM src)) ORDER BY x;
+----
+0
+1
+2
+3
+4
+
+query I
+SELECT count(*) > 0
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'table_in_out.write_input'
+  AND message LIKE '%cached_echo%';
+----
+true
+
+# ---------------------------------------------------------------------------
+# Per-catalog opt-out: `cache false` makes the exchange ineligible (always exchanges).
+# ---------------------------------------------------------------------------
+
+statement ok
+CALL disable_logging();
+
+statement ok
+ATTACH 'example' AS nocache (TYPE vgi, LOCATION '${VGI_TEST_WORKER}', cache false);
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT x FROM nocache.cached_echo((SELECT x FROM src)) ORDER BY x;
+----
+0
+1
+2
+3
+4
+
+query I
+SELECT x FROM nocache.cached_echo((SELECT x FROM src)) ORDER BY x;
+----
+0
+1
+2
+3
+4
+
+# Both runs exchanged (no caching for the opted-out catalog): write_input on both.
+query I
+SELECT count(*) >= 2
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'table_in_out.write_input'
+  AND message LIKE '%cached_echo%';
+----
+true
+
+statement ok
+CALL disable_logging();
+
+statement ok
+DETACH ex;
+
+statement ok
+DETACH nocache;

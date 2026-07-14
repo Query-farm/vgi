@@ -4,6 +4,7 @@
 #include "vgi_client_timing.hpp"
 #include "vgi_cancel_dispatcher.hpp"
 #include "vgi_catalog_metadata.hpp"
+#include "vgi_exchange_cache_key.hpp" // exchange-mode result cache (M1)
 #include "vgi_function_connection.hpp"
 #include "vgi_ifunction_connection.hpp"
 #include "vgi_logging.hpp"
@@ -466,6 +467,29 @@ unique_ptr<GlobalTableFunctionState> VgiTableInOutInitGlobal(ClientContext &cont
 	VGI_LOG(context, "table_in_out.init_global",
 	        {{"worker_path", bind_data.worker_path()}, {"function_name", bind_data.function_name}});
 
+	// Exchange-mode result cache (M1): eligible only for a parallel, no-finalize
+	// streaming map (output depends solely on the current input batch — a pure
+	// per-batch function; the worker asserts this by advertising vgi.cache.*). The
+	// serial/finalize path (shared worker, cross-batch state) and the literal
+	// scan-mode path are excluded. Build the STATIC key once; the per-batch input
+	// hash is folded in at each exchange.
+	if (bind_data.parallel_safe && !bind_data.has_finalize && !bind_data.single_row_scan) {
+		const char *reason = nullptr;
+		int64_t catalog_version = 0; // out param; already folded into cache_key
+		if (BuildExchangeCacheKeyStatic(context, bind_data, global_state->projection_ids,
+		                                global_state->cache_key, global_state->cache_catalog_name,
+		                                catalog_version, reason)) {
+			global_state->cache_eligible = true;
+			Value ttl_v;
+			if (context.TryGetCurrentSetting("vgi_result_cache_default_ttl_seconds", ttl_v)) {
+				global_state->cache_default_ttl_seconds = static_cast<int64_t>(ttl_v.GetValue<uint64_t>());
+			}
+		} else if (reason) {
+			VGI_LOG(context, "result_cache.ineligible",
+			        {{"function", bind_data.function_name}, {"reason", reason}});
+		}
+	}
+
 	return global_state;
 }
 
@@ -852,14 +876,36 @@ OperatorResultType VgiTableInOutFunction(ExecutionContext &context, TableFunctio
 		input_batch = ConvertInputToArrow(client_context, input, bind_data);
 	}
 
-	// The 1:1 write→read exchange. SERIAL (finalize) path: the ONE shared
-	// `connection` is fed by multiple source sub-pipelines under UNION ALL whose
-	// PipelineExecutors may run concurrently, so hold `exchange_mutex` across the
-	// whole write→read (else their calls interleave on the single IPC stream and
-	// desync the worker's schema-first reader). PARALLEL path: this substream owns
-	// its connection exclusively, so no lock is needed.
+	// Exchange-mode result cache (M1). Key this input batch (ordered — the output is
+	// positionally aligned to the input) on the static key + input-batch hash. A HIT
+	// replays the cached output batch and SKIPS the worker exchange (no write_input
+	// log = proof of hit); a MISS runs the exchange and, once the worker's cc is
+	// latched + cacheable, stores the output. The lookup is unconditional (another
+	// substream may have already stored this input's output).
 	std::shared_ptr<arrow::RecordBatch> output_batch;
-	{
+	bool cache_hit = false;
+	VgiResultCacheKey batch_key;
+	if (global_state.cache_eligible) {
+		batch_key = global_state.cache_key;
+		batch_key.input_hash = HashInputBatchOrdered(input_batch);
+		auto entry = VgiResultCache::Instance().Lookup(batch_key, std::chrono::steady_clock::now());
+		if (entry && !entry->streams.empty() && !entry->streams[0].batches.empty()) {
+			output_batch = DeserializeCachedRecordBatch(entry->streams[0].batches[0]);
+			cache_hit = true;
+			VGI_LOG(client_context, "result_cache.hit",
+			        {{"function", bind_data.function_name},
+			         {"key_hash", batch_key.HexDigest()},
+			         {"tier", "memory"}});
+		}
+	}
+
+	if (!cache_hit) {
+		// The 1:1 write→read exchange. SERIAL (finalize) path: the ONE shared
+		// `connection` is fed by multiple source sub-pipelines under UNION ALL whose
+		// PipelineExecutors may run concurrently, so hold `exchange_mutex` across the
+		// whole write→read (else their calls interleave on the single IPC stream and
+		// desync the worker's schema-first reader). PARALLEL path: this substream owns
+		// its connection exclusively, so no lock is needed.
 		std::unique_lock<std::mutex> exchange_guard;
 		if (!parallel) {
 			exchange_guard = std::unique_lock<std::mutex>(global_state.exchange_mutex);
@@ -885,6 +931,32 @@ OperatorResultType VgiTableInOutFunction(ExecutionContext &context, TableFunctio
 			output_batch = conn.ReadDataBatch();
 		} else {
 			output_batch = conn.ReadDataBatch();
+		}
+
+		// Latch the worker's cache-control advertisement off the first exchange
+		// output, then (if cacheable) memoize this input batch's output. Skip on the
+		// terminal EOS batch (nullptr) — there is nothing to cache and cc rides data.
+		if (global_state.cache_eligible && output_batch) {
+			if (!local_state.cache_cc_latched) {
+				local_state.cache_cc = conn.GetLastCacheControl();
+				local_state.cache_cc_latched = true;
+			}
+			if (local_state.cache_cc.Cacheable()) {
+				auto sr = StoreExchangeMemoEntry(batch_key, local_state.cache_cc,
+				                                 global_state.cache_catalog_name,
+				                                 global_state.cache_default_ttl_seconds, {output_batch});
+				if (sr.stored) {
+					VGI_LOG(client_context, "result_cache.store",
+					        {{"function", bind_data.function_name},
+					         {"key_hash", batch_key.HexDigest()},
+					         {"tier", "memory"},
+					         {"rows", std::to_string(sr.rows)},
+					         {"bytes", std::to_string(sr.bytes)}});
+				} else if (sr.reason) {
+					VGI_LOG(client_context, "result_cache.store_skipped",
+					        {{"function", bind_data.function_name}, {"reason", sr.reason}});
+				}
+			}
 		}
 	}
 

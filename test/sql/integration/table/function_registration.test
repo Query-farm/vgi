@@ -100,13 +100,16 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 #   filter_bytes keys distinct entries, backs cache/filter_pushdown_keys.test, ALSO a data
 #   Table (surfaces as a table); cache_partitioned — single-value partition_values through
 #   the spill blob, backs cache/spill_partition_values.test)
-# = 129
+# 2 exchange-mode result-cache fixtures (cached_echo, a classic TABLE-input passthrough
+#   advertising vgi.cache.ttl — backs cache/exchange_streaming.test; cached_double, a
+#   cacheable blended map — backs the LATERAL exchange-cache tests)
+# = 131
 query I
 SELECT COUNT(*)
 FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'table';
 ----
-129
+131
 
 # The 34 pure table functions (no TABLE parameter type)
 # Note: make_series appears 5 times (5 overloads), make_pairs appears 3 times,

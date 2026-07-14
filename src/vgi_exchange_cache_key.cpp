@@ -2,10 +2,14 @@
 #include "vgi_exchange_cache_key.hpp"
 
 #include <algorithm>
+#include <chrono>
 
 #include <arrow/api.h>
+#include <arrow/io/api.h>
+#include <arrow/ipc/api.h>
 
 #include "duckdb/catalog/catalog.hpp"
+#include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/common/vector.hpp"
 #include "duckdb/function/create_sort_key.hpp"
@@ -15,6 +19,7 @@
 
 #include "storage/vgi_catalog.hpp"
 #include "vgi_arrow_ipc.hpp"
+#include "vgi_cache_control.hpp"
 #include "vgi_oauth.hpp"
 #include "vgi_result_cache.hpp"
 #include "vgi_table_in_out_impl.hpp"
@@ -186,6 +191,99 @@ bool BuildExchangeCacheKeyStatic(ClientContext &context, const VgiTableInOutBind
 	// filter_bytes, order_by_hint, sample_hint, transaction_id. input_hash is set by
 	// the caller per memoization event.
 	return true;
+}
+
+// ----------------------------------------------------------------------------
+// Per-unit memoization serve / store
+// ----------------------------------------------------------------------------
+
+std::shared_ptr<arrow::RecordBatch> DeserializeCachedRecordBatch(const VgiCachedBatch &cached) {
+	// Exchange entries are memory-only (allow_disk=false), so the in-RAM IPC blob is
+	// always present. Deserialize the self-contained per-batch IPC stream.
+	if (!cached.ipc) {
+		throw IOException("VGI exchange cache: cached batch has no in-memory IPC bytes");
+	}
+	auto input = std::make_shared<arrow::io::BufferReader>(cached.ipc);
+	auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(input);
+	if (!reader_result.ok()) {
+		throw IOException("VGI exchange cache: failed to open cached batch IPC stream: %s",
+		                  reader_result.status().ToString());
+	}
+	auto reader = reader_result.ValueUnsafe();
+	auto next_result = reader->ReadNext();
+	if (!next_result.ok() || !next_result.ValueUnsafe().batch) {
+		throw IOException("VGI exchange cache: cached batch IPC stream was empty");
+	}
+	return next_result.ValueUnsafe().batch;
+}
+
+ExchangeStoreResult StoreExchangeMemoEntry(const VgiResultCacheKey &key, const VgiCacheControl &cc,
+                                           const std::string &catalog_name, int64_t default_ttl_seconds,
+                                           const std::vector<std::shared_ptr<arrow::RecordBatch>> &out_batches) {
+	ExchangeStoreResult res;
+	auto skip = [&](const char *r) {
+		res.reason = r;
+		return res;
+	};
+	if (!cc.present || cc.no_store || !cc.Cacheable()) {
+		return skip("not_cacheable");
+	}
+	// v1: exchange caching supports catalog scope only. A transaction-scoped result
+	// (output depends on transaction-local state) is process-/txn-ephemeral; refuse
+	// rather than risk serving it across transactions.
+	if (cc.TransactionScoped()) {
+		return skip("transaction_scoped");
+	}
+	int64_t ttl = cc.ttl_seconds.value_or(default_ttl_seconds);
+	if (ttl > VGI_CACHE_MAX_TTL_SECONDS) {
+		ttl = VGI_CACHE_MAX_TTL_SECONDS;
+	}
+	// v1: a positive ttl is required (expires-only advertisements fall back to the
+	// default; if that is also 0 there is no freshness basis → refuse).
+	if (ttl <= 0) {
+		return skip("no_freshness");
+	}
+
+	auto entry = std::make_shared<VgiResultCacheEntry>();
+	entry->key = key;
+	entry->catalog_name = catalog_name;
+	entry->scope = cc.scope;
+	entry->etag = cc.etag;
+	entry->last_modified = cc.last_modified;
+	entry->revalidatable = cc.revalidatable;
+	entry->stored_at = std::chrono::steady_clock::now();
+	entry->expires_at = entry->stored_at + std::chrono::seconds(ttl);
+
+	CachedStream stream;
+	int64_t rows = 0;
+	int64_t bytes = 0;
+	for (const auto &b : out_batches) {
+		if (!b) {
+			continue;
+		}
+		auto buffer = SerializeRecordBatch(b); // self-contained IPC (schema+batch)
+		VgiCachedBatch cb;
+		cb.ipc = buffer;
+		cb.rows = b->num_rows();
+		rows += cb.rows;
+		bytes += static_cast<int64_t>(buffer->size());
+		stream.batches.push_back(std::move(cb));
+	}
+	stream.rows = rows;
+	stream.bytes = bytes;
+	entry->streams.push_back(std::move(stream));
+	entry->rows = rows;
+	entry->total_bytes = bytes;
+
+	// allow_disk=false: per-unit entries are tiny + numerous; a content-addressed
+	// disk ref per input chunk would thrash the store. Memory tier only (LRU-bounded).
+	if (!VgiResultCache::Instance().Insert(std::move(entry), /*allow_disk=*/false)) {
+		return skip("too_large_for_memory");
+	}
+	res.stored = true;
+	res.rows = rows;
+	res.bytes = bytes;
+	return res;
 }
 
 } // namespace vgi

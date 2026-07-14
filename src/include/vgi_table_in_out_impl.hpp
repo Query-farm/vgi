@@ -16,8 +16,10 @@
 #include "duckdb/main/client_context.hpp"
 
 #include "vgi_arrow_utils.hpp"
+#include "vgi_cache_control.hpp"        // VgiCacheControl (latched per substream)
 #include "vgi_catalog_metadata.hpp"
 #include "vgi_protocol.hpp" // BindResult
+#include "vgi_result_cache.hpp"         // VgiResultCacheKey (exchange-mode memoization)
 #include "vgi_ifunction_connection.hpp" // complete IFunctionConnection for unique_ptr member
 
 namespace duckdb {
@@ -203,6 +205,19 @@ struct VgiTableInOutGlobalState : public GlobalTableFunctionState {
 	idx_t MaxThreads() const override {
 		return parallel_safe ? GlobalTableFunctionState::MAX_THREADS : 1;
 	}
+
+	// Exchange-mode result cache (M1). Built once at InitGlobal for the parallel,
+	// no-finalize streaming-map path (a pure per-input-batch function). When
+	// cache_eligible, each exchange keys on cache_key + an ordered hash of its input
+	// batch: a hit replays the cached output batch and skips the worker exchange; a
+	// miss captures it (gated on the worker's vgi.cache.* advertisement). The
+	// per-substream cc latch lives on the local state (each substream's own worker
+	// advertises). Entries are shared process-wide via the cache singleton, so one
+	// substream's store can serve another's identical input batch.
+	bool cache_eligible = false;
+	VgiResultCacheKey cache_key;             // static portion; input_hash set per exchange
+	std::string cache_catalog_name;
+	int64_t cache_default_ttl_seconds = 0;
 };
 
 // ============================================================================
@@ -242,6 +257,12 @@ struct VgiTableInOutLocalState : public ArrowScanLocalState {
 	// PhysicalTableScan::ParallelSource() is false for in-out functions, so the
 	// literal scan runs on one local state.
 	bool input_submitted = false;
+
+	// Exchange-mode result cache (M1): this substream's latched worker cache-control
+	// advertisement (read from the first exchange output batch). Once latched,
+	// cache_cc.Cacheable() gates whether this substream stores its miss outputs.
+	VgiCacheControl cache_cc;
+	bool cache_cc_latched = false;
 };
 
 // ============================================================================
