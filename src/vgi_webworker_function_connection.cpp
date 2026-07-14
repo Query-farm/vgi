@@ -18,7 +18,6 @@
 #include "generated/vgi_protocol_constants.hpp"
 #include "generated/vgi_request_builders.hpp"
 #include "vgi_exception.hpp"
-#include "vgi_http_client.hpp" // ResolveExternalLocation (externalized-batch resolution)
 #include "vgi_logging.hpp"
 #include "vgi_rpc_client.hpp"
 #include "vgi_rpc_types.hpp"
@@ -594,6 +593,18 @@ std::shared_ptr<arrow::RecordBatch> WebWorkerFunctionConnection::ReadDataBatch()
 		}
 	};
 
+	// At producer EOS the worker's serve turn does a final input_reader.drain();
+	// close our tick stream (Arrow EOS marker) + the c2w ring (EOF) so that drain
+	// returns and the worker frees the slot. Without this the worker blocks
+	// forever in drain() (the subprocess path handles this via pooling teardown).
+	auto finish_producer_input = [this]() {
+		if (is_producer_mode_ && input_writer_ && !input_writer_closed_) {
+			(void)input_writer_->Close();
+			input_writer_closed_ = true;
+			vgi_wasm_slot_write_eos(slot_);
+		}
+	};
+
 	while (true) {
 		auto read_result = data_reader_->ReadNext();
 		if (!read_result.ok()) {
@@ -602,6 +613,7 @@ std::shared_ptr<arrow::RecordBatch> WebWorkerFunctionConnection::ReadDataBatch()
 			// tolerant HTTP/no-proc path: treat it as end-of-stream.
 			auto status = read_result.status();
 			if (status.IsInvalid()) {
+				finish_producer_input();
 				data_finished_ = true;
 				return nullptr;
 			}
@@ -612,6 +624,7 @@ std::shared_ptr<arrow::RecordBatch> WebWorkerFunctionConnection::ReadDataBatch()
 
 		// Null batch = EOS (clean stream end).
 		if (!result.batch) {
+			finish_producer_input();
 			data_finished_ = true;
 			return nullptr;
 		}
@@ -622,18 +635,15 @@ std::shared_ptr<arrow::RecordBatch> WebWorkerFunctionConnection::ReadDataBatch()
 			continue;
 		}
 
-		// External-location pointer batches: a 0-row batch carrying
-		// vgi_rpc.location. Fetch + splice the real IPC data in place, then fall
-		// through to the metadata parsing below (batch_index / partition_values /
-		// cache-control ride the RESOLVED batch's metadata).
+		// External-location pointer batches are an HTTP-storage optimization; a
+		// SAB worker streams its data inline over the ring and does not emit them.
+		// Fail loudly rather than pulling the HTTP/catalog resolution subtree into
+		// this transport (a documented v1 limitation of worker:).
 		if (result.custom_metadata &&
 		    ClassifyBatch(result.batch, result.custom_metadata) == RpcBatchType::EXTERNAL_LOCATION) {
-			int loc_idx = result.custom_metadata->FindKey(RPC_LOCATION_KEY);
-			const std::string location_url = result.custom_metadata->value(loc_idx);
-			auto resolved = ResolveExternalLocation(context_, location_url, location_, GetExecutionIdHex(),
-			                                         GetAttachOpaqueDataHex(), result.custom_metadata);
-			result.batch = resolved.batch;
-			result.custom_metadata = resolved.metadata;
+			throw IOException("VGI worker: external-location batches are not supported over the "
+			                  "worker: (SAB) transport [worker: %s]",
+			                  location_);
 		}
 
 		// Parse vgi_partition_values#b64 off the wire metadata. Base64-decode

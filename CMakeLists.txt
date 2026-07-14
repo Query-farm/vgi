@@ -182,9 +182,18 @@ if((BUILD_VGI_UNIT_TESTS OR DEFINED ENV{BUILD_VGI_UNIT_TESTS}) AND NOT WIN32)
     test/cpp/test_telemetry.cpp
     test/cpp/test_sab_stream.cpp
     test/cpp/test_sab_e2e.cpp
+    test/cpp/test_sab_conn.cpp
     test/support/vgi_sab_native_ring.cpp
+    test/support/vgi_sab_test_stubs.cpp
     src/vgi_sab_stream.cpp
+    src/vgi_webworker_function_connection.cpp
     src/vgi_rpc_client.cpp
+    src/vgi_rpc_types.cpp
+    src/vgi_bind_protocol.cpp
+    src/vgi_arrow_utils.cpp
+    src/vgi_result_cache.cpp
+    src/vgi_table_buffering_builders.cpp
+    src/vgi_schema_registry.cpp
     src/vgi_arrow_ipc.cpp
     src/vgi_logging.cpp
     src/vgi_telemetry_util.cpp
@@ -202,6 +211,10 @@ if((BUILD_VGI_UNIT_TESTS OR DEFINED ENV{BUILD_VGI_UNIT_TESTS}) AND NOT WIN32)
     duckdb/src/include
     duckdb/third_party/catch
     duckdb/third_party/mbedtls/include)
+  # Compile WebWorkerFunctionConnection (SAB transport) natively against the
+  # in-process ring backend for the runtime e2e; its production form is
+  # emscripten-only.
+  target_compile_definitions(vgi_unit_tests PRIVATE VGI_SAB_NATIVE_TEST)
   # Layer-3 integration tests in test_launcher_e2e.cpp link against the real
   # launcher orchestration (which uses duckdb::IOException), so we now do
   # need libduckdb_static plus the dummy static-extension loader stub that
@@ -212,12 +225,17 @@ if((BUILD_VGI_UNIT_TESTS OR DEFINED ENV{BUILD_VGI_UNIT_TESTS}) AND NOT WIN32)
   # Built out-of-band via `cargo build --release` in test/support/sabffi.
   set(SABFFI_LIB
     ${CMAKE_CURRENT_SOURCE_DIR}/test/support/sabffi/target/release/libsabffi.a)
+  # Table-function worker staticlib (vgi crate) for the WebWorkerFunctionConnection
+  # runtime e2e. Built via `cargo build --release` in test/support/sabtable.
+  set(SABTABLE_LIB
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/support/sabtable/target/release/libsabtable.a)
   target_link_libraries(vgi_unit_tests
     duckdb_static
     dummy_static_extension_loader
     duckdb_mbedtls
     ${VGI_ARROW_LIB}
-    ${SABFFI_LIB})
+    ${SABFFI_LIB}
+    ${SABTABLE_LIB})
   if(APPLE)
     # Rust std / chrono's iana_time_zone dep in libsabffi references CoreFoundation.
     target_link_libraries(vgi_unit_tests "-framework CoreFoundation")

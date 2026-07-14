@@ -1,0 +1,31 @@
+[package]
+name = "sabtable"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Static lib linked into the C++ vgi_unit_tests binary. Exposes
+# `vgi_rust_serve_table_sab_slot(slot)`: runs the real vgi *table-function*
+# framework (`vgi::Worker` serving `count_to`) over a native ring slot (via the
+# extern "C" vgi_sab_worker_* ops defined in the C++ test), so a C++ client
+# driving WebWorkerFunctionConnection and the Rust worker meet over one ring in
+# one process.
+[lib]
+name = "sabtable"
+crate-type = ["staticlib"]
+path = "src/lib.rs"
+
+[dependencies]
+# default-features=false drops `sqlite` (bundled libsqlite3) and `transport-http`
+# (tokio); the worker falls back to the zero-dep FsStorage backend, so the native
+# staticlib builds with no heavy/C deps.
+vgi = { path = "../../../../vgi-rust/vgi", default-features = false }
+# Must match the exact vgi-rpc that `vgi` resolves to (crates.io 0.11.0) so the
+# `OutputCollector` / `Result` / `RpcError` types are one crate instance, not two.
+vgi-rpc = { version = "0.11.0", default-features = false, features = ["macros", "stream-codec"] }
+arrow-array = "59"
+arrow-schema = "59"
+serde = { version = "1", features = ["derive"] }
+
+[profile.release]
+opt-level = 2
