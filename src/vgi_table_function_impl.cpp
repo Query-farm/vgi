@@ -13,6 +13,7 @@
 #include "vgi_cached_replay_connection.hpp"
 #include "vgi_arrow_ipc.hpp" // SerializeRecordBatch (capture)
 #include "vgi_cancel_dispatcher.hpp"
+#include "vgi_exchange_cache_key.hpp" // SerializeSettingsForKey / SerializeProjectionForKey (shared)
 #include "vgi_catalog_rpc.hpp"
 #include "vgi_exception.hpp"
 #include "vgi_extension.hpp"
@@ -1132,28 +1133,10 @@ void VgiTableFunctionGlobalState::EnsureInitApplied() const {
 // ============================================================================
 namespace {
 
-//! Canonical serialization of the worker settings map for the cache key
-//! (sorted key=value; deterministic across runs within a process).
-std::string SerializeSettingsForKey(const std::map<std::string, Value> &settings) {
-	std::string out;
-	for (const auto &kv : settings) { // std::map iterates in sorted key order
-		out += kv.first;
-		out += '=';
-		out += kv.second.ToString();
-		out += ';';
-	}
-	return out;
-}
-
-//! Canonical serialization of the projection id list for the cache key.
-std::string SerializeProjectionForKey(const std::vector<int32_t> &projection_ids) {
-	std::string out;
-	for (auto id : projection_ids) {
-		out += std::to_string(id);
-		out += ',';
-	}
-	return out;
-}
+// SerializeSettingsForKey / SerializeProjectionForKey moved to
+// vgi_exchange_cache_key.{hpp,cpp} (shared with the exchange-mode cache key so
+// both compute the key byte-identically). They are reached here via the header's
+// duckdb::vgi declarations.
 
 //! Result of a v1 cache-eligibility check for a scan.
 struct CacheEligibility {

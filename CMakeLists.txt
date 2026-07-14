@@ -122,6 +122,7 @@ src/vgi_cancel_dispatcher.cpp
 src/vgi_worker_pool.cpp
 src/vgi_worker_pool_functions.cpp
 src/vgi_result_cache.cpp
+src/vgi_exchange_cache_key.cpp
 src/vgi_result_cache_functions.cpp
 src/vgi_cached_replay_connection.cpp
 src/vgi_github.cpp

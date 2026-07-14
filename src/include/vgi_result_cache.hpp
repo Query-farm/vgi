@@ -96,6 +96,13 @@ struct VgiResultCacheKey {
 	std::string order_by_hint;         // column/direction/null_order/row_limit
 	std::string sample_hint;           // sample_percentage/seed
 	std::string transaction_id;        // empty unless scope=transaction
+	// EXCHANGE-mode input identity. Empty for producer-mode table-function entries
+	// (so their keys are byte-identical to before this field existed). Set for
+	// table-in-out / correlated-LATERAL / buffered entries whose output depends on
+	// input data: a per-input-batch/-chunk hash (ordered IPC for streaming maps;
+	// order-independent sorted-multiset for LATERAL; additive whole-input fold for
+	// buffered). See vgi_exchange_cache_key.hpp.
+	std::string input_hash;
 
 	bool operator==(const VgiResultCacheKey &o) const;
 	// 64-bit bucket hash over all fields.

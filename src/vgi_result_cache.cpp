@@ -278,7 +278,7 @@ bool VgiResultCacheKey::operator==(const VgiResultCacheKey &o) const {
 	       implementation_version == o.implementation_version && catalog_version == o.catalog_version &&
 	       at_unit == o.at_unit && at_value == o.at_value && filter_bytes == o.filter_bytes &&
 	       order_by_hint == o.order_by_hint && sample_hint == o.sample_hint &&
-	       transaction_id == o.transaction_id;
+	       transaction_id == o.transaction_id && input_hash == o.input_hash;
 }
 
 uint64_t VgiResultCacheKey::Hash() const {
@@ -299,6 +299,7 @@ uint64_t VgiResultCacheKey::Hash() const {
 	HashStr(seed, order_by_hint);
 	HashStr(seed, sample_hint);
 	HashStr(seed, transaction_id);
+	HashStr(seed, input_hash);
 	return seed;
 }
 
@@ -336,6 +337,7 @@ std::string VgiResultCacheKey::Fingerprint() const {
 	add(order_by_hint);
 	add(sample_hint);
 	add(transaction_id);
+	add(input_hash);
 	return Sha256Hex(m); // "" if SHA-256 unavailable → caller skips disk tier
 }
 
