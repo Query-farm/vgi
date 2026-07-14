@@ -1807,13 +1807,16 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	}
 
 #ifdef __EMSCRIPTEN__
-	// WASM: only HTTP transport is supported (no subprocess/fork)
-	if (!vgi::IsHttpTransport(worker_path)) {
-		throw BinderException("VGI in WASM only supports HTTP transport. "
-		                      "LOCATION must be an HTTP/HTTPS URL.");
+	// WASM: HTTP (duckdb-wasm XHR layer) and the browser `worker:` SAB transport
+	// (a Web Worker over a SharedArrayBuffer duplex ring) are supported; no
+	// subprocess/fork transports exist here.
+	if (!vgi::IsHttpTransport(worker_path) && !vgi::IsWebWorkerTransport(worker_path)) {
+		throw BinderException("VGI in WASM only supports HTTP ('http[s]://') or "
+		                      "browser worker ('worker:') transports.");
 	}
 	use_pool = false;
-	// HTTP in WASM goes through duckdb-wasm's XHR layer, not httpfs
+	// HTTP in WASM goes through duckdb-wasm's XHR layer, not httpfs; worker: pools
+	// via SAB slots, not the subprocess pool.
 #else
 	// HTTP transport: require httpfs for POST support, disable subprocess pooling
 	if (vgi::IsHttpTransport(worker_path)) {

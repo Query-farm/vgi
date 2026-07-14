@@ -6,7 +6,7 @@
                         "name": "arrow",
                         "default-features": false,
                         "features": [
-                                { "name": "mimalloc", "platform": "linux | (osx & arm64)" }
+                                { "name": "mimalloc", "platform": "(linux | (osx & arm64)) & !emscripten" }
                         ]
                 }
         ],

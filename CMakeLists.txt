@@ -145,6 +145,19 @@ src/storage/vgi_object_counts.cpp
 src/storage/vgi_transaction.cpp
 src/storage/vgi_physical_write.cpp)
 
+# The browser `worker:` SAB transport (WebWorkerFunctionConnection +
+# SabInputStream/SabOutputStream) is emscripten-only: it resolves the
+# vgi_wasm_slot_* extern "C" stubs against the engine's --js-library at dlopen.
+# On native builds these files live only in the vgi_unit_tests target (compiled
+# with -DVGI_SAB_NATIVE_TEST against the in-process ring backend); the shipped
+# native/loadable extension must not pull them in (undefined stubs). See
+# docs/sab_transport_abi.md and the WASM worker-transport design.
+if(EMSCRIPTEN)
+  list(APPEND EXTENSION_SOURCES
+    src/vgi_webworker_function_connection.cpp
+    src/vgi_sab_stream.cpp)
+endif()
+
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 
