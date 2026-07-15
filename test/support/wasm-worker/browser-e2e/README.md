@@ -50,30 +50,32 @@ because it depended on which pool pthread DuckDB scheduled the scan onto. Fixes 
 
 With these, the full E2E is **reliably green** across repeated fresh loads (`maxConcurrency = 4`).
 
-### Known limitation: flaky worker-error propagation under `threads > 1` + heavy load
+### Resolved: worker-error deadlock under `threads > 1` (a DuckDB-WASM engine bug)
 
-Case 5 (the worker-error case) runs under `SET threads=1`. This is **not** a transport bug — it's
-a narrowly-scoped, flaky DuckDB-WASM-side error-propagation race, characterized carefully:
+Case 5 (the worker-error case) now runs under `SET threads=4`. It previously (≈2/3 of fresh loads)
+**deadlocked the whole engine**: a worker throw under `threads>1` left the DuckDB-WASM worker thread
+frozen *inside* the query C++ call (a trivial `SELECT 42` on a *fresh* connection also hung), so the
+query promise never settled — even though the SAB transport had already torn down cleanly (all slots
+freed, both rings closed, worker idle). It was characterized as **not a transport bug** (making the
+transport error path fully non-blocking did not fix it; a generic non-VGI parallel throw settled
+fine), then root-caused to the engine:
 
-- The SAB transport tears down **cleanly** on a worker error under `threads=4` (channel
-  diagnostics show all slots freed, both rings closed, worker idle) — the exception *is* delivered.
-- A worker throw under `threads=4` propagates fine **in isolation** — even after a warm scan +
-  ATTACH + a concurrent 4-connection case (see `probe-vgi-boom.mjs`).
-- A generic (non-VGI) parallel throw propagates fine under `threads=4` too (see `probe-throw.mjs`).
-- **Only** under the *full* suite's concurrency/timing does a worker throw under `threads>1`
-  *occasionally* (≈2/3 of fresh loads) hang. When it does, the diagnostics show the **entire engine
-  is frozen**: a trivial `SELECT 42` on a *fresh* connection also times out, so DuckDB-WASM's worker
-  thread is deadlocked **inside** the boom query's C++ call and never returns to settle the promise —
-  after the transport already tore down cleanly. It is a DuckDB-WASM parallel-error-handling deadlock,
-  exercised by (not caused by) the error path. **Confirmed not the transport:** making the transport's
-  error path fully non-blocking (no `Atomics.wait` during the C++ exception unwind) did **not** fix it,
-  and it does not reproduce in the focused `probe-vgi-boom.mjs` (same prefix + boom in isolation).
-  Fixing it is DuckDB-WASM-internals work, not transport work.
+- On a query error the DuckDB-WASM runtime **main thread** busy-spins `Executor::CancelTasks`
+  (`while (executor_tasks > 0) WorkOnTasks()`). When its own producer queue is empty that loop
+  pure-spins on the atomic without hitting any cancellation point, **starving the main thread's
+  proxied-call queue** (emscripten issue [#3495](https://github.com/emscripten-core/emscripten/issues/3495)).
+- A worker **pthread** whose in-flight task makes a main-thread-proxied call during teardown then
+  blocks forever; its `ExecutorTask` never destructs, `executor_tasks` sticks (observed wedged at
+  `1`), and the drain never converges → the engine deadlocks.
+- **Fix** (haybarn DuckDB fork, `src/parallel/executor.cpp`): pump
+  `emscripten_main_thread_process_queued_calls()` inside that spin (the documented workaround for
+  exactly this lock-free-loop pattern) so the proxied call completes and the task finishes.
 
-`threads=1` makes the error path deterministic. Everything else — including the parallel-serve proof
-(case 7, `maxConcurrency=4`) and all the happy-path streaming/catalog/concurrent cases — runs green
-under `threads=4`. The `probe-*.mjs` files (run via `VGI_ENTRY=probe-*.mjs node serve.mjs`) are the
-isolation harness used to characterize this.
+Verified across many fresh loads with the race provably occurring (`executor_tasks` briefly `1`) and
+**draining every time**; the full suite — including this error case and the parallel-serve proof
+(`maxConcurrency=4`) — is green under `threads=4`. `repro-threads-deadlock.mjs` is the
+reproduction / regression harness (it loops the trigger and asserts no engine freeze); the
+`probe-*.mjs` files were the isolation harness used to characterize the bug.
 
 ## Prerequisites (build these first)
 

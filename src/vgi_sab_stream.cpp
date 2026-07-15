@@ -2,6 +2,8 @@
 #include "vgi_sab_stream.hpp"
 #include "vgi_sab_abi.hpp"
 
+#include "duckdb/main/client_context.hpp" // ClientContext::interrupted (cancel polling)
+
 #include <arrow/buffer.h>
 
 namespace duckdb {
@@ -49,6 +51,18 @@ arrow::Result<int64_t> SabInputStream::Read(int64_t nbytes, void *out) {
 	while (total < nbytes) {
 		int want = static_cast<int>(nbytes - total > INT32_MAX ? INT32_MAX : nbytes - total);
 		int n = vgi_wasm_slot_read(slot_, dst + total, want);
+		if (n == sab::kSabWouldBlock) {
+			// The ring was empty for a bounded wait. Poll query cancellation and retry —
+			// this is what keeps a read running as a DuckDB async prefetch task
+			// interruptible: on an error/cancel DuckDB sets context.interrupted (see
+			// Executor::PushError) and busy-waits for all executor tasks to return; an
+			// uninterruptible read here would never return and would freeze the whole
+			// engine. Mirrors the subprocess WaitForReadableUntilCancel poll.
+			if (context_ && context_->interrupted) {
+				return arrow::Status::IOError("SabInputStream: read interrupted (query cancelled)");
+			}
+			continue;
+		}
 		if (n < 0) {
 			return arrow::Status::IOError("SabInputStream: slot_read error/cancel");
 		}

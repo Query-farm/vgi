@@ -1,13 +1,20 @@
 // ============================================================================
-// Reproduction: DuckDB-WASM full-engine deadlock when a table-function scan
-// throws under `threads > 1` amid concurrent multi-connection load.
+// Regression harness (was: reproduction) for the DuckDB-WASM full-engine deadlock
+// when a table-function scan throws under `threads > 1` amid concurrent load.
 // ============================================================================
 //
-// What it shows: with `SET threads=4`, after some concurrent VGI `worker:` scans,
-// a scan whose worker throws (`boom`) *occasionally* (~2/3 per attempt) leaves the
-// async query promise UNSETTLED. When it does, the WHOLE engine is frozen: a trivial
-// `SELECT 42` on a brand-new connection ALSO times out — so DuckDB-WASM's worker
-// thread is deadlocked INSIDE the query C++ call and never returns.
+// FIXED — kept as a regression guard. Before the fix, with `SET threads=4`, after
+// some concurrent VGI `worker:` scans, a scan whose worker threw (`boom`)
+// *occasionally* (~2/3 per attempt) left the async query promise UNSETTLED and froze
+// the WHOLE engine (a trivial `SELECT 42` on a brand-new connection also timed out).
+//
+// Root cause was the DuckDB-WASM engine, not the transport: on a query error the
+// runtime main thread busy-spins `Executor::CancelTasks` (`while (executor_tasks > 0)`)
+// without pumping its proxied-call queue (emscripten #3495), so a worker pthread whose
+// teardown makes a main-thread-proxied call blocks forever and `executor_tasks` sticks
+// at 1. Fixed in the haybarn DuckDB fork by pumping
+// `emscripten_main_thread_process_queued_calls()` in that spin. This harness now
+// asserts NO freeze across ATTEMPTS trigger iterations (was ~2/3 hang; now 0).
 //
 // Why it is NOT the VGI transport:
 //   - On the hang the SAB channel is fully torn down (every slot STATE=0, both rings
@@ -68,6 +75,11 @@ function channel() {
     await conn.query("SET custom_extension_repository='" + location.origin + "/extensions'");
     await conn.query('INSTALL vgi'); await conn.query('LOAD vgi');
     await conn.query('SET threads=4');
+    // Test lever: ?async=0 disables VGI's async prefetch (synchronous reads, no async
+    // tasks) — if that avoids the freeze, the async-task path is the trigger.
+    R.asyncPrefetch = new URLSearchParams(location.search).get('async') !== '0';
+    if (!R.asyncPrefetch) { await conn.query('SET vgi_async_prefetch=false'); }
+    log('vgi_async_prefetch=' + R.asyncPrefetch);
 
     // Warm the catalog + discovery path once (part of the load that trips it).
     await conn.query(`SELECT count(*) FROM vgi_table_function(${W}, 'emit_batches', [3, 4])`);
@@ -77,9 +89,14 @@ function channel() {
     R.attempts = [];
     for (let a = 1; a <= ATTEMPTS; a++) {
       // concurrent multi-connection scans (build pool-pthread load), then close.
-      const cs = await Promise.all([6, 9].map(() => db.connect()));
-      await Promise.all(cs.map((c, k) => c.query(`SELECT * FROM vgi_table_function(${W}, 'count_to', [${[6, 9][k]}])`)));
-      for (const c of cs) await c.close();
+      // Tolerate a per-attempt setup error (e.g. the separate slot-reuse "Stream
+      // header EOF") so it doesn't mask the deadlock we're hunting — keep looping.
+      try {
+        const cs = await Promise.all([6, 9].map(() => db.connect()));
+        if (!R.asyncPrefetch) { await Promise.all(cs.map((c) => c.query('SET vgi_async_prefetch=false'))); }
+        await Promise.all(cs.map((c, k) => c.query(`SELECT * FROM vgi_table_function(${W}, 'count_to', [${[6, 9][k]}])`)));
+        for (const c of cs) await c.close();
+      } catch (e) { log(`attempt ${a}: setup err ${String(e.message).slice(0, 60)}`); }
 
       // the throwing scan under threads=4, on the main connection.
       let boom, ms = Date.now();

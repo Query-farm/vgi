@@ -39,6 +39,9 @@ enum SlotLane : int32_t {
 };
 constexpr int32_t kSlotControlBytes = 64; // control block, cache-line isolated
 
+// vgi_wasm_slot_read sentinel: ring empty after a bounded wait — poll cancellation + retry.
+constexpr int32_t kSabWouldBlock = -2;
+
 // state values. STATE=0 is free; a claim stores a UNIQUE nonzero id (from the
 // HDR_CLAIM_SEQ counter) rather than a constant 1, so the per-slot worker
 // dispatcher can tell "still my claim" from "already reclaimed by the next scan"
@@ -76,7 +79,11 @@ int vgi_wasm_slot_open(const char *location);
 int vgi_wasm_slot_write(int slot, const uint8_t *data, int n);
 // Signal EOS on the c2w (input) ring (CloseInputWriter).
 void vgi_wasm_slot_write_eos(int slot);
-// Blocking read of up to n bytes from the w2c ring. >0 bytes, 0 = EOS, <0 = cancel.
+// Read up to n bytes from the w2c ring. >0 = bytes read, 0 = EOS (worker closed +
+// drained). Two negative sentinels: VGI_SAB_WOULD_BLOCK (-2) = the ring was empty for a
+// bounded wait (the caller must poll query-cancellation and retry, so an in-flight
+// prefetch read on a DuckDB task thread doesn't block DuckDB's error/cancel busy-wait
+// forever — see docs/sab_transport_abi.md "Cancellation"); any other <0 = hard error.
 int vgi_wasm_slot_read(int slot, uint8_t *data, int n);
 // Release the slot (state -> 0). Idempotent.
 void vgi_wasm_slot_release(int slot);

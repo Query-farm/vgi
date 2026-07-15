@@ -1,0 +1,41 @@
+diff --git a/src/parallel/executor.cpp b/src/parallel/executor.cpp
+index bc8b757233..d80415a0b3 100644
+--- a/src/parallel/executor.cpp
++++ b/src/parallel/executor.cpp
+@@ -22,6 +22,11 @@
+ #include <algorithm>
+ #include <chrono>
+ 
++#if defined(__EMSCRIPTEN__)
++#include <emscripten/threading.h>
++#include <pthread.h>
++#endif
++
+ namespace duckdb {
+ 
+ Executor::Executor(ClientContext &context) : context(context), executor_tasks(0), blocked_thread_time(0) {
+@@ -439,6 +444,24 @@ void Executor::CancelTasks() {
+ 	// so those must stay alive until all tasks have completed
+ 	while (executor_tasks > 0) {
+ 		WorkOnTasks();
++#if defined(__EMSCRIPTEN__)
++		// Emscripten (pthreads): this drain is a lock-free spin on `executor_tasks` that
++		// the runtime main thread enters on a query error. When WorkOnTasks finds no task
++		// in this thread's own producer queue it returns instantly, so the loop pure-spins
++		// on the atomic without hitting any cancellation point — which starves the main
++		// thread's proxied-call queue (emscripten issue #3495). A worker pthread whose
++		// in-flight task makes a main-thread-proxied call during teardown then blocks
++		// forever, its ExecutorTask never destructs, `executor_tasks` sticks (observed
++		// wedged at 1), and the whole engine deadlocks — the query promise never settles
++		// and even a trivial follow-up query on a fresh connection hangs. Pumping the queued
++		// calls here (the documented workaround for exactly this lock-free-loop pattern)
++		// lets the proxied call complete so the task finishes and the drain converges.
++		// Reproduced + fixed against the VGI `worker:` SAB transport's parallel worker-error
++		// path (a worker throw under threads>1); see vgi test/support/wasm-worker.
++		if (pthread_self() == emscripten_main_runtime_thread_id()) {
++			emscripten_main_thread_process_queued_calls();
++		}
++#endif
+ 	}
+ 	// Now safe to destroy pipelines, events and states — no tasks reference them
+ 	lock_guard<mutex> elock(executor_lock);

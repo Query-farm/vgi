@@ -76,16 +76,19 @@ window.__result = {};
 
     // 5. worker produce error must surface as a thrown query error (not a hang/empty),
     // AND a scan after it must still work (proves the errored slot frees). Runs under
-    // threads=1. The SAB transport does the RIGHT thing under threads=4 too — it delivers
-    // the error and tears down cleanly (all slots freed, rings closed, worker idle;
-    // verified) — but under the FULL suite's heavy load a worker throw under threads>1
-    // *occasionally* (~2/3) DEADLOCKS DuckDB-WASM: the engine's worker thread stays blocked
-    // INSIDE the query C++ call (a `SELECT 42` on a fresh connection also hangs), so the
-    // promise never settles. This is a DuckDB-WASM parallel-error-handling deadlock, NOT a
-    // transport bug — making the transport error path fully non-blocking did NOT fix it,
-    // and a generic (non-VGI) parallel throw settles fine. threads=1 makes it deterministic.
-    // See README "Known limitation" + the probe-*.mjs isolation harness.
-    await conn.query('SET threads=1');
+    // threads=4. This previously (~2/3 of loads) DEADLOCKED DuckDB-WASM — the engine's
+    // worker thread stayed blocked INSIDE the query C++ call (a `SELECT 42` on a fresh
+    // connection also hung), so the promise never settled. Root cause was NOT the
+    // transport (it delivers the error + tears down cleanly — all slots freed, rings
+    // closed) but a DuckDB-WASM engine deadlock: on a query error the runtime main thread
+    // busy-spins `Executor::CancelTasks` (`while (executor_tasks > 0)`) without pumping its
+    // proxied-call queue (emscripten #3495), so a worker pthread whose teardown makes a
+    // main-thread-proxied call blocks forever and the drain never converges. Fixed in the
+    // haybarn DuckDB fork by pumping `emscripten_main_thread_process_queued_calls()` inside
+    // that spin. With the fix, a worker throw under threads=4 propagates reliably (verified
+    // across many fresh loads with the race provably occurring and draining). See
+    // repro-threads-deadlock.mjs for the reproduction/regression harness.
+    await conn.query('SET threads=4');
     R.errorOk = false;
     try {
       await conn.query("SELECT * FROM vgi_table_function('worker:vgi-worker-boot.js', 'boom', [])");
