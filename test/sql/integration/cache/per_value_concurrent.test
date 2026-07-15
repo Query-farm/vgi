@@ -1,0 +1,92 @@
+# name: test/sql/integration/cache/per_value_concurrent.test
+# description: Concurrency for the per-value memo tier. At threads=8 the LookupBatch + per-chunk
+#   stores run across parallel operator instances (each its own worker); this asserts
+#   result-equivalence vs per-value OFF for both the batched LATERAL and scalar paths, over a
+#   large low-cardinality input where per-value is heavily exercised (many hits + concurrent
+#   stores under the store cap). Correctness under concurrency is the assertion. A debug-build
+#   soak of the same shape catches asserts/races.
+# group: [vgi_integration_cache]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+SET threads=8;
+
+# ---------------------------------------------------------------------------
+# LATERAL per-value under concurrency: x % 50 → 50 distinct over 20k rows, so per-value
+# is hit hard and stores race across threads. Result must equal the per-value-OFF path.
+# ---------------------------------------------------------------------------
+
+statement ok
+SET vgi_result_cache_per_value = true;
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+statement ok
+CREATE TEMP TABLE lat_on AS
+SELECT x, doubled FROM range(20000) g(x), LATERAL ex.cached_double(x % 50);
+
+statement ok
+SET vgi_result_cache_per_value = false;
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+statement ok
+CREATE TEMP TABLE lat_off AS
+SELECT x, doubled FROM range(20000) g(x), LATERAL ex.cached_double(x % 50);
+
+# Identical multisets (symmetric difference empty).
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM lat_on EXCEPT ALL SELECT * FROM lat_off)
+  UNION ALL
+  (SELECT * FROM lat_off EXCEPT ALL SELECT * FROM lat_on)
+);
+----
+0
+
+query I
+SELECT count(*) FROM lat_on;
+----
+20000
+
+# ---------------------------------------------------------------------------
+# Scalar per-value under concurrency: same shape, sum equivalence on vs off.
+# ---------------------------------------------------------------------------
+
+statement ok
+SET vgi_result_cache_per_value = true;
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+query I
+SELECT sum(ex.cached_double_scalar(x % 50))::BIGINT FROM range(20000) g(x);
+----
+980000
+
+statement ok
+SET vgi_result_cache_per_value = false;
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+query I
+SELECT sum(ex.cached_double_scalar(x % 50))::BIGINT FROM range(20000) g(x);
+----
+980000
+
+statement ok
+RESET vgi_result_cache_per_value;
+
+statement ok
+DETACH ex;

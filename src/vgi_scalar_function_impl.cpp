@@ -680,9 +680,24 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 			// connection like the table-in-out path.
 			auto cc = local_state.connection->GetLastCacheControl();
 			if (cc.Cacheable()) {
+				// Cap new stores per chunk (0 = unlimited) — bounds entry-count amplification
+				// on a high-cardinality input. A store cap, not a lookup gate, so store-then-hit
+				// is preserved for low-cardinality (K < cap → all stored).
+				uint64_t store_cap = 256;
+				{
+					Value scv;
+					if (context.TryGetCurrentSetting("vgi_result_cache_per_value_max_stores_per_chunk", scv) &&
+					    !scv.IsNull()) {
+						store_cap = scv.GetValue<uint64_t>();
+					}
+				}
+				uint64_t stored = 0;
 				for (idx_t d = 0; d < ship->size(); d++) {
 					if (pv_hits[d]) {
 						continue;
+					}
+					if (store_cap != 0 && stored >= store_cap) {
+						break;
 					}
 					auto rd = output_batch->Slice(static_cast<int64_t>(d), 1);
 					auto sr = StoreExchangeMemoEntry(pv_keys[d], cc, local_state.cache_catalog_name,
@@ -692,6 +707,7 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 					if (sr.stored) {
 						VgiResultCache::Instance().RecordExchangeStore();
 					}
+					stored++;
 				}
 			}
 		}

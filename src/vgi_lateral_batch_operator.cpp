@@ -663,6 +663,18 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 		// worker. Only when the worker opted into caching (cache_cc). A tuple with 0 output
 		// rows (1->0) stores an empty batch (a valid negative memo).
 		if (pv_enabled && state.cache_cc.Cacheable()) {
+			// Cap new stores per chunk to bound entry-count amplification on a
+			// high-cardinality input (0 = unlimited). A store cap, not a lookup gate, so
+			// low-cardinality (K < cap) stores everything and store-then-hit is preserved.
+			uint64_t store_cap = 256;
+			{
+				Value scv;
+				if (client_context.TryGetCurrentSetting("vgi_result_cache_per_value_max_stores_per_chunk", scv) &&
+				    !scv.IsNull()) {
+					store_cap = scv.GetValue<uint64_t>();
+				}
+			}
+			uint64_t stored = 0;
 			std::vector<std::vector<int32_t>> rows_by_d(dd.k);
 			for (idx_t m = 0; m < worker_parent.size(); m++) {
 				rows_by_d[static_cast<idx_t>(worker_parent[m])].push_back(static_cast<int32_t>(m));
@@ -670,6 +682,9 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 			for (idx_t d = 0; d < dd.k; d++) {
 				if (pv_hits[d]) {
 					continue; // already cached (partial-hit chunk) — don't re-store
+				}
+				if (store_cap != 0 && stored >= store_cap) {
+					break; // per-chunk store cap reached — leave the rest to recompute
 				}
 				std::shared_ptr<arrow::RecordBatch> rd = rows_by_d[d].empty()
 				                                             ? output_batch->Slice(0, 0)
@@ -681,6 +696,7 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 				if (sr.stored) {
 					VgiResultCache::Instance().RecordExchangeStore();
 				}
+				stored++; // count attempts toward the cap (a rejected store still cost work)
 			}
 		}
 	}

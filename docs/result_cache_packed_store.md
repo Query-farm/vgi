@@ -216,6 +216,35 @@ tunable cross-process visibility lag.
 `vgi_result_cache_exchange_disk_max_refs` stays as the index entry-count cap (now cheap to enforce)
 and can default much higher once packed.
 
+## 6a. Operational limitations & diagnosis
+
+**Know before you rely on it:**
+
+- **No-op until a cache dir is configured.** The packed backend defaults ON but the disk tier itself
+  is opt-in (`vgi_result_cache_dir` + `vgi_result_cache_disk_max_bytes`) — with no dir, everything is
+  memory-only and packing never runs.
+- **Exchange-only routing.** Only small **exchange** memos (`input_hash` present) pack; producer
+  results always stay loose (`objects/`/`refs/`) — so producer disk diagnostics are unchanged.
+- **Cross-process is READ + cross-restart, not live-write (v1).** A running process sees a *peer's*
+  sealed packs on shard-load but NOT its in-flight appends until a reload; a crashed writer's packs are
+  reclaimed only on expiry / `vgi_result_cache_flush()`, not compacted (phases 3–4, deferred). Safe
+  under concurrency — writers never touch each other's packs — just not maximally space-efficient.
+- **Reaper is eventual.** The ref-count / byte caps + compaction run on the disk-reaper cadence
+  (`vgi_result_cache_disk_reap_interval_seconds`, 60 s), so a burst can transiently overshoot before
+  the next reap trims it — same eventual-consistency the byte cap already has.
+
+**Diagnosing the packed tier** (`vgi_result_cache_stats()` + `glob()` + `vgi_result_cache_reap()`):
+
+| Symptom | Check | Likely cause |
+|---|---|---|
+| memos not on disk | `SELECT * FROM glob('<dir>/*/packs/*.vpack')` | disk tier off (no dir/cap), or entries ≥ `pack_max_entry_bytes` (went loose) |
+| pack files growing / not shrinking | `vgi_result_cache_reap()` returns `disk_refs_removed` | reaper hasn't run (coarse cadence) — drive it with `vgi_result_cache_reap(advance_seconds := N)` |
+| a value won't serve cross-restart | re-hash mismatch → clean miss | corrupt/truncated `.vpack` (torn append) — the record is skipped, not served |
+| capture aborted (large buffered) | `vgi_result_cache_stats().capture_aborts` | result crossed `max_entry_bytes` / inflight budget mid-capture (streamed uncached) |
+
+`vgi_result_cache(include_disk := true)` lists disk-only (spilled/packed) entries the in-memory index
+can't see; `vgi_result_cache_reap(advance_seconds := N)` is the deterministic cleanup seam for tests.
+
 ## 7. Phased implementation plan
 
 1. **Format + single-process pack read/write** — ✅ **DONE**. `.vpack` record framing (per-record

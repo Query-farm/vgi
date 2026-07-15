@@ -3391,6 +3391,14 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "reuse the per-chunk cache misses). Gated by the master vgi_result_cache + the "
 	                          "worker's vgi.cache.* opt-in. Default ON",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
+	config.AddExtensionOption("vgi_result_cache_per_value_max_stores_per_chunk",
+	                          "Cap on how many NEW per-value memo entries a single input chunk may store "
+	                          "(0 = unlimited). Bounds entry-count amplification on a high-cardinality input "
+	                          "(one distinct value → one tiny entry): a chunk memoizes at most this many new "
+	                          "values, the rest are recomputed next time. A cap on STORES, not lookups, so it "
+	                          "never breaks store-then-hit for a low-cardinality workload (K new < cap → all "
+	                          "stored). Default 256",
+	                          LogicalType::UBIGINT, Value::UBIGINT(256));
 	config.AddExtensionOption("vgi_exchange_per_batch_min_distinct_ratio",
 	                          "Store the COARSE per-chunk (M2) exchange-cache entry only when the chunk's "
 	                          "distinct ratio (K/N) is at least this — below it the per-value tier already "

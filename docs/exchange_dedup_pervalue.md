@@ -178,9 +178,47 @@ collision, so `vgi_result_cache()` / stats / flush / disk tier all treat them un
 | `vgi_exchange_input_dedup` | `true` | Dedup distinct worker-input tuples in a chunk before the exchange (compute win; scalar + streaming + LATERAL). No persistence, no correctness risk beyond the per-row-purity opt-in. |
 | `vgi_result_cache_per_value` | `true` | Per-value memoization layer (durability). Gated by the master `vgi_result_cache` + per-catalog `cache` opt-out like every other cache tier. |
 | `vgi_exchange_per_batch_min_distinct_ratio` | `0.5` | Store the coarse whole-unit (M1/M2) entry only when `K/N ≥` this (else per-value covers replay). 0 = always store the coarse entry (today's behavior); 1 = never. |
+| `vgi_result_cache_per_value_max_stores_per_chunk` | `256` | Cap on NEW per-value entries a single chunk may store (0 = unlimited). Bounds entry-count amplification on a high-cardinality input. A cap on STORES not lookups, so it never breaks store-then-hit for a low-cardinality workload. |
 
 Dedup is a compute optimization and defaults ON independently of the disk tier; per-value persistence
 rides the existing disk-tier opt-in (needs a cache dir to reach disk, memory-only otherwise).
+
+## 7a. Operational limitations & diagnosis
+
+**Know before you rely on it:**
+
+- **Per-value only skips the worker on a FULL hit (v1).** A partially-warm distinct set (some values
+  cached, some new) still ships the *whole* deduped set to the worker — it does not ship only the
+  misses. So per-value's saving is binary: nothing until every distinct value in the chunk is cached,
+  then everything. Steady-state benefit needs the working set of distinct values to fully warm.
+- **A direct-column correlated LATERAL gets NOTHING from per-value.** `FROM t, f(t.x)` (a bare column)
+  is already **delim-join-deduped by DuckDB** before the operator, so the M2 per-chunk cache alone
+  covers cross-query reuse and per-value is redundant. Per-value earns its keep only when the delim
+  join does *not* pre-dedup — an **expression arg** `f(t.x % k)` / `f(lower(t.x))` — and for cross-chunk
+  reuse within one query. Scalars are unaffected (no delim join).
+- **Store amplification on high-cardinality input.** One distinct value → one tiny per-value entry.
+  A genuinely high-cardinality column (millions of distinct values) will churn the cache; the
+  per-chunk **store cap** (`…_max_stores_per_chunk`, 256) + the entry-count cap
+  (`vgi_result_cache_max_entries`) + the packed disk tier bound it, but per-value adds little value
+  there (those values rarely repeat) — consider `SET vgi_result_cache_per_value=false` for a
+  known-high-cardinality workload.
+- **Correctness contract.** Advertising cacheability / being dedup-eligible is a promise that the
+  output is a pure function of the input tuple + static dims. A **VOLATILE** scalar is never deduped
+  or memoized (gated on DuckDB `FunctionStability`); a non-pure table-in-out map that advertises
+  `vgi.cache.*` is the worker author's bug (see the M1 stateful-map guardrail).
+
+**Diagnosing "why didn't per-value hit?"** (all via `duckdb_logs WHERE type='VGI'` + counters):
+
+| Symptom | Check | Likely cause |
+|---|---|---|
+| worker still exchanged (`table_in_out.write_input` / `scalar.write_input` > 0) on a repeat | `vgi_result_cache_stats()` — `exchange_hits` vs `exchange_misses` | not fully warm (partial hit → still ships), or high-cardinality beyond the store cap |
+| never any per-value hit | `result_cache.ineligible` log `reason=` | `disabled_global` / `disabled_attach` / `unknown_version` / `identity_unresolved` — the static key is ineligible |
+| LATERAL: dedup reduced but no memo | is the arg a bare column? | direct-column ref is delim-deduped; per-value is moot (expected) |
+| scalar: `exchange_stores=0` after a cold run | does the worker set `ScalarFunction.CACHE_CONTROL`? | not advertising `vgi.cache.*` → nothing stored |
+| entries growing without bound | `vgi_result_cache_stats().entries` + `vgi_result_cache().function` | high-cardinality store amplification → lower the store cap or disable per-value |
+
+The `result_cache.hit` log's `tier=` field is `per_value` for a per-value serve, `memory`/`disk_streaming`
+for an M2/producer serve — so a hit's origin is always observable.
 
 ## 8. Phasing
 
