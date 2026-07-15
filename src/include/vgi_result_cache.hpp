@@ -318,6 +318,15 @@ public:
 	std::shared_ptr<const VgiResultCacheEntry> Lookup(const VgiResultCacheKey &key,
 	                                                   std::chrono::steady_clock::time_point now);
 
+	// Batched memory-tier lookup for the per-VALUE dedup path: one lock acquisition for
+	// all `keys` instead of K individual Lookup() calls (a mutex storm at 2048 keys/chunk).
+	// Returns a vector parallel to `keys`; each element is the fresh entry or nullptr
+	// (miss / stale, stale dropped). Memory tier only — per-value entries are tiny and the
+	// disk tier's per-key file I/O would defeat the batching (they still spill to the packed
+	// tier via Insert). Splices hits to MRU + bumps hit counters like Lookup.
+	std::vector<std::shared_ptr<const VgiResultCacheEntry>>
+	LookupBatch(const std::vector<VgiResultCacheKey> &keys, std::chrono::steady_clock::time_point now);
+
 	// Conditional-revalidation lookup (M6). Like Lookup but returns a STALE
 	// entry (past expires_at) *iff* it is revalidatable, WITHOUT dropping it —
 	// the caller sends a conditional request and either slides the TTL (on a

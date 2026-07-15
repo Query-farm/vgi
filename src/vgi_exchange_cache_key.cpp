@@ -122,6 +122,25 @@ std::string HashInputChunkUnordered(ClientContext & /*context*/, DataChunk &chun
 	return std::string(hex, duckdb_mbedtls::MbedTlsWrapper::SHA256_HASH_LENGTH_TEXT);
 }
 
+std::vector<std::string> HashInputRowsPerValue(ClientContext & /*context*/, DataChunk &chunk) {
+	const idx_t count = chunk.size();
+	std::vector<std::string> out(count);
+	if (count == 0 || chunk.ColumnCount() == 0) {
+		return out;
+	}
+	vector<OrderModifiers> mods(chunk.ColumnCount(), OrderModifiers(OrderType::ASCENDING, OrderByNullType::NULLS_LAST));
+	Vector keys(LogicalType::BLOB);
+	CreateSortKeyHelpers::CreateSortKey(chunk, mods, keys);
+	keys.Flatten(count);
+	auto key_data = FlatVector::GetData<string_t>(keys);
+	for (idx_t i = 0; i < count; i++) {
+		// "v:" discriminator: a per-batch/-chunk input_hash is pure hex, so this prefix
+		// guarantees per-value and per-unit keys never collide in the shared keyspace.
+		out[i] = "v:" + Sha256Hex(std::string(key_data[i].GetData(), key_data[i].GetSize()));
+	}
+	return out;
+}
+
 void AccumulateInputDigest(DataChunk &chunk, uint64_t &sum_lo, uint64_t &sum_hi, uint64_t &row_count) {
 	const idx_t n = chunk.size();
 	if (n == 0 || chunk.ColumnCount() == 0) {

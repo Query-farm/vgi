@@ -55,6 +55,12 @@ std::string HashInputBatchOrdered(const std::shared_ptr<arrow::RecordBatch> &inp
 //! chunk (all columns) — the correlated columns are baked into the cached output.
 std::string HashInputChunkUnordered(ClientContext &context, DataChunk &chunk);
 
+//! Per-VALUE hash: one input_hash per row of `chunk` (a canonical NULL-aware sort-key
+//! blob → SHA-256, prefixed with a "v:" granularity discriminator so a per-value key can
+//! never collide with a per-batch/per-chunk `input_hash` in the same keyspace). Used for
+//! the per-value memoization tier over a DEDUPED input chunk (one key per distinct tuple).
+std::vector<std::string> HashInputRowsPerValue(ClientContext &context, DataChunk &chunk);
+
 //! Order-INDEPENDENT streaming digest for whole-input keying (buffered functions):
 //! folds a chunk's per-row hashes into a two-lane 64-bit ADDITIVE accumulator (+ row
 //! count). Additive => associative + commutative => independent of both chunk order

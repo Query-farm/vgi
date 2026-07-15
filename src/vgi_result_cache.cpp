@@ -1256,6 +1256,35 @@ VgiResultCache::Lookup(const VgiResultCacheKey &key, std::chrono::steady_clock::
 	return nullptr;
 }
 
+std::vector<std::shared_ptr<const VgiResultCacheEntry>>
+VgiResultCache::LookupBatch(const std::vector<VgiResultCacheKey> &keys,
+                            std::chrono::steady_clock::time_point now) {
+	std::vector<std::shared_ptr<const VgiResultCacheEntry>> out(keys.size());
+	std::lock_guard<std::mutex> lock(mutex_);
+	for (size_t i = 0; i < keys.size(); i++) {
+		auto it = index_.find(keys[i]);
+		if (it == index_.end()) {
+			misses_.fetch_add(1, std::memory_order_relaxed);
+			continue;
+		}
+		auto entry = *(it->second);
+		if (entry->IsStale(now)) {
+			total_bytes_ -= entry->total_bytes;
+			lru_.erase(it->second);
+			index_.erase(it);
+			evictions_ttl_.fetch_add(1, std::memory_order_relaxed);
+			misses_.fetch_add(1, std::memory_order_relaxed);
+			continue;
+		}
+		lru_.splice(lru_.begin(), lru_, it->second);
+		it->second = lru_.begin();
+		entry->hits++;
+		hits_.fetch_add(1, std::memory_order_relaxed);
+		out[i] = entry;
+	}
+	return out;
+}
+
 std::shared_ptr<const VgiResultCacheEntry>
 VgiResultCache::LookupForRevalidation(const VgiResultCacheKey &key,
                                       std::chrono::steady_clock::time_point now) {
