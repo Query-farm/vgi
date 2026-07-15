@@ -4,6 +4,9 @@
 #include <cstring>
 #include <limits>
 
+#include <arrow/array/builder_primitive.h> // Int32Builder for the Take indices
+#include <arrow/compute/api_vector.h>       // arrow::compute::Take (dedup expansion)
+
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
@@ -24,6 +27,7 @@
 #include "vgi_cache_control.hpp"      // VgiCacheControl
 #include "vgi_exchange_cache_key.hpp" // exchange-mode result cache (M2)
 #include "vgi_ifunction_connection.hpp"
+#include "vgi_input_dedup.hpp"        // input dedup (ship distinct tuples; expand back)
 #include "vgi_logging.hpp"
 #include "vgi_result_cache.hpp"       // VgiResultCache singleton
 
@@ -214,6 +218,33 @@ void StampProjected(DataChunk &chunk, DataChunk &input, const std::vector<int32_
 		// dependency for the emitted chunk (like the streaming-window op's copy).
 		VectorOperations::Copy(input.data[projected_input[k]], chunk.data[base_idx + k], sel, produced, 0, 0);
 	}
+}
+
+// Gather (replicate) the worker output batch rows at `take` (dedup expansion): the
+// resulting batch has one row per FINAL output row, so the existing drain+stamp path
+// runs over it unchanged. Uses Arrow's built-in Take so all column types are handled.
+std::shared_ptr<arrow::RecordBatch> TakeRecordBatch(const std::shared_ptr<arrow::RecordBatch> &batch,
+                                                    const std::vector<int32_t> &take,
+                                                    const VgiTableInOutBindData &bd) {
+	arrow::Int32Builder b;
+	auto st = b.Reserve(static_cast<int64_t>(take.size()));
+	if (!st.ok()) {
+		throw IOException("vgi_batch_lateral: dedup Take index reserve failed: %s", st.ToString());
+	}
+	for (auto v : take) {
+		b.UnsafeAppend(v);
+	}
+	std::shared_ptr<arrow::Array> indices;
+	st = b.Finish(&indices);
+	if (!st.ok()) {
+		throw IOException("vgi_batch_lateral: dedup Take index build failed: %s", st.ToString());
+	}
+	auto res = arrow::compute::Take(arrow::Datum(batch), arrow::Datum(indices));
+	if (!res.ok()) {
+		throw IOException("vgi_batch_lateral: worker '%s' function '%s' output Take (dedup expansion) failed: %s",
+		                  bd.worker_path(), bd.function_name, res.status().ToString());
+	}
+	return res.ValueUnsafe().record_batch();
 }
 
 // Build the full-output arrow schema + ArrowTableSchema once (synthetic col names).
@@ -432,18 +463,50 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 		state.connection->SetConditionalRequest(reval_entry->etag, reval_entry->last_modified);
 	}
 
-	// Split off the worker-input columns [0, input_length) as a zero-copy view.
+	// [dedup] Ship only the DISTINCT worker-input tuples to the worker (unless disabled,
+	// trivial, or the map is VOLATILE — a volatile map's per-row output varies for the
+	// same input, so duplicate tuples must NOT be collapsed). The 1:N worker output is
+	// expanded back over each tuple's original-row group after the exchange (below).
+	bool dedup_enabled = true;
+	{
+		Value dv;
+		if (client_context.TryGetCurrentSetting("vgi_exchange_input_dedup", dv) && !dv.IsNull()) {
+			dedup_enabled = dv.GetValue<bool>();
+		}
+	}
+	const bool is_volatile = bd.stability.has_value() && bd.stability.value() == FunctionStability::VOLATILE;
+	InputDedup dd;
+	bool use_dedup = false;
+	if (dedup_enabled && !is_volatile) {
+		std::vector<column_t> wcols;
+		wcols.reserve(input_length);
+		for (idx_t c = 0; c < input_length; c++) {
+			wcols.push_back(c);
+		}
+		dd = BuildInputDedup(input, wcols);
+		use_dedup = !dd.trivial;
+	}
+
+	// Build the worker-input chunk: K deduped rows (materialized gather) or an N-row view.
 	DataChunk worker_input;
 	vector<LogicalType> in_types;
 	in_types.reserve(input_length);
 	for (idx_t c = 0; c < input_length; c++) {
 		in_types.push_back(input.data[c].GetType());
 	}
-	worker_input.InitializeEmpty(in_types);
-	for (idx_t c = 0; c < input_length; c++) {
-		worker_input.data[c].Reference(input.data[c]);
+	if (use_dedup) {
+		worker_input.Initialize(Allocator::Get(client_context), in_types, dd.k == 0 ? 1 : dd.k);
+		for (idx_t c = 0; c < input_length; c++) {
+			VectorOperations::Copy(input.data[c], worker_input.data[c], dd.distinct, dd.k, 0, 0);
+		}
+		worker_input.SetCardinality(dd.k);
+	} else {
+		worker_input.InitializeEmpty(in_types);
+		for (idx_t c = 0; c < input_length; c++) {
+			worker_input.data[c].Reference(input.data[c]);
+		}
+		worker_input.SetCardinality(input.size());
 	}
-	worker_input.SetCardinality(input.size());
 
 	// ONE batched exchange for the whole input chunk.
 	auto input_batch = ConvertInputToArrow(client_context, worker_input, bd);
@@ -507,10 +570,33 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 		return OperatorResultType::NEED_MORE_INPUT;
 	}
 
-	// Decode provenance (identity when absent + rows align). Held for the drain,
-	// range-validated against THIS input.size() (see the branch-A drain guard).
-	state.parent_index = DecodeParentRow(state.connection->GetLastParentRowBytes(),
-	                                     static_cast<idx_t>(output_batch->num_rows()), input.size(), bd);
+	// Decode provenance (identity when absent + rows align). With dedup the worker's
+	// parent indices point into the K-row DEDUPED input; EXPAND them: each worker output
+	// row (parent d) fans out to every ORIGINAL row in that tuple's group, and the worker
+	// output row itself is replicated (Arrow Take), so the existing drain+stamp path runs
+	// unchanged over an expanded batch whose parent_index now points at ORIGINAL rows
+	// (each stamped with its OWN outer columns — two rows sharing a worker-input tuple can
+	// differ in other outer columns). Range-validated against THIS input.size() (drain guard).
+	const idx_t worker_input_rows = use_dedup ? dd.k : input.size();
+	auto worker_parent = DecodeParentRow(state.connection->GetLastParentRowBytes(),
+	                                     static_cast<idx_t>(output_batch->num_rows()), worker_input_rows, bd);
+	if (use_dedup) {
+		std::vector<int32_t> take_idx; // worker output row to copy for each final row
+		std::vector<int32_t> expanded; // ORIGINAL input row to stamp for each final row
+		take_idx.reserve(worker_parent.size());
+		expanded.reserve(worker_parent.size());
+		for (idx_t m = 0; m < worker_parent.size(); m++) {
+			const auto &grp = dd.groups[static_cast<idx_t>(worker_parent[m])];
+			for (idx_t o : grp) {
+				take_idx.push_back(static_cast<int32_t>(m));
+				expanded.push_back(static_cast<int32_t>(o));
+			}
+		}
+		output_batch = TakeRecordBatch(output_batch, take_idx, bd);
+		state.parent_index = std::move(expanded);
+	} else {
+		state.parent_index = std::move(worker_parent);
+	}
 	state.input_size_at_decode = input.size();
 
 	LoadBatchIntoScanState(state.scan, output_batch);

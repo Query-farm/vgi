@@ -114,6 +114,11 @@ struct VgiTableInOutBindData : public TableFunctionData {
 	// own worker), but Execute must keep the substream connection open at input-EOS
 	// so VgiTableInOutFinalize can reuse it (a no-finalize map releases it there).
 	bool has_finalize = false;
+	// Worker-declared function stability (DuckDB FunctionStability). Threaded so the
+	// map operators (batched LATERAL / streaming) can refuse to DEDUP a VOLATILE map —
+	// its per-row output legitimately varies for the same input, so collapsing
+	// duplicate input tuples would be wrong. Unset ⇒ treat as CONSISTENT (the default).
+	std::optional<FunctionStability> stability;
 
 	// Blended ("UNNEST-style") table-in-out (Phase B). input_from_args: this is a
 	// blended function (positional args are input columns). single_row_scan: this
@@ -284,6 +289,10 @@ struct VgiTableInOutBindParams {
 	// (single shared worker, MaxThreads()=1); 0/unset or >1 = parallel-by-default
 	// per-substream fan-out. Threaded to bind_data.parallel_safe.
 	int32_t max_workers = 0;
+
+	// Worker-declared FunctionStability → threaded to bind_data.stability so the map
+	// operators refuse to dedup a VOLATILE map. Unset ⇒ CONSISTENT.
+	std::optional<FunctionStability> stability;
 
 	// Blended ("UNNEST-style") table-in-out (Phase B): positional args ARE the
 	// per-row input columns. When true, bind builds the worker input schema from

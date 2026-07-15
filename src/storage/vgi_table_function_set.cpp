@@ -233,6 +233,7 @@ static unique_ptr<FunctionData> VgiCatalogTableInOutFunctionBind(ClientContext &
 	// column names (it reads batch.column("<name>")). Re-parse the arguments schema
 	// to recover them (+ varargs flag) so bind can build the input schema by name.
 	params.input_from_args = vgi_info.function_info().input_from_args;
+	params.stability = vgi_info.function_info().stability; // for the map-operator dedup gate
 	if (params.input_from_args && vgi_info.function_info().arguments_schema) {
 		auto blended_args =
 		    vgi::ParseFunctionArgumentSchema(context, vgi_info.function_info().arguments_schema);

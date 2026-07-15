@@ -79,6 +79,7 @@ unique_ptr<FunctionData> VgiTableInOutBindData::Copy() const {
 	copy->requires_input_batch_index = requires_input_batch_index;
 	copy->parallel_safe = parallel_safe;
 	copy->has_finalize = has_finalize;
+	copy->stability = stability;
 	copy->input_from_args = input_from_args;
 	copy->single_row_scan = single_row_scan;
 	copy->declared_input_types = declared_input_types;
@@ -171,6 +172,7 @@ unique_ptr<FunctionData> VgiTableInOutBind(ClientContext &context, TableFunction
 	bind_data->parallel_safe = (params.max_workers != 1);
 
 	bind_data->input_from_args = params.input_from_args;
+	bind_data->stability = params.stability;
 
 	// Build arguments from the regular (non-TABLE) inputs.
 	// input.inputs contains positional arguments, but TABLE arguments are represented as NULL.

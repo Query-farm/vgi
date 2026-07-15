@@ -211,6 +211,11 @@ Ship 1 first (no storage, big win, low risk), measure, then layer.
   high-cardinality lean on dedup-only? The distinct-ratio gate (§6) covers the coarse copy; a parallel
   guard may be wanted for per-value *stores* — but must respect the store-then-hit lesson (don't gate
   on miss history). Lean: cap per-chunk *new* stores, not ratio-gate them.
-- **Streaming vs LATERAL de-dup overlap.** A correlated blended call decorrelates to LATERAL; the
-  classic TABLE-input streaming map is the only pure-M1 path. Confirm the streaming dedup is worth the
-  code vs scoping phase 2 to LATERAL only (the common correlated case).
+- **Streaming vs LATERAL de-dup overlap — RESOLVED: streaming dedup scoped OUT (v1).** A correlated
+  blended call decorrelates to LATERAL (handled), so the classic TABLE-input streaming map is the only
+  remaining pure-M1 path. It is scoped out of phase-2 dedup because: (a) it's the lower-value case (the
+  low-cardinality-repeat pattern is overwhelmingly correlated LATERAL, `FROM t, f(t.x)`); (b) it has a
+  **soundness gap** — a 1:N streaming map without `vgi_rpc.parent_row` provenance can't be expanded
+  back from a deduped input (only a 1:1 positional map could, and detecting that needs a post-ship
+  fallback that doubles work on the 1:N case); and (c) per-value memo (phase 3) is the better lever for
+  streaming and applies uniformly. Phase-2 dedup ships for **scalar + batched LATERAL**.

@@ -1,0 +1,142 @@
+# name: test/sql/integration/table_in_out/lateral_dedup.test
+# description: Input dedup for the batched correlated LATERAL operator (phase 2). On a
+#   MISS the operator ships only the DISTINCT worker-input tuples in a chunk and expands
+#   the 1:N worker output back over each tuple's original-row group (Arrow Take +
+#   per-original-row stamp). Correctness is proven by result-equivalence vs dedup OFF (the
+#   already-verified batched path). See docs/exchange_dedup_pervalue.md.
+# group: [vgi_integration_table_in_out]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+SET threads=1;
+
+# ---------------------------------------------------------------------------
+# 1->N fan-out with heavy input repetition (x%4 → 4 distinct over 20 rows).
+# Result-equivalence: dedup ON must equal dedup OFF exactly.
+# ---------------------------------------------------------------------------
+
+statement ok
+SET vgi_exchange_input_dedup = true;
+
+statement ok
+CREATE TEMP TABLE d_on AS
+SELECT x, i FROM range(20) t(x), LATERAL ex.blended_explode(t.x % 4);
+
+statement ok
+SET vgi_exchange_input_dedup = false;
+
+statement ok
+CREATE TEMP TABLE d_off AS
+SELECT x, i FROM range(20) t(x), LATERAL ex.blended_explode(t.x % 4);
+
+# Symmetric difference is empty (identical multisets).
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM d_on EXCEPT ALL SELECT * FROM d_off)
+  UNION ALL
+  (SELECT * FROM d_off EXCEPT ALL SELECT * FROM d_on)
+);
+----
+0
+
+# ... and non-trivial (the fan-out actually produced rows).
+query I
+SELECT count(*) > 20 FROM d_on;
+----
+true
+
+# ---------------------------------------------------------------------------
+# Dedup proof: the worker saw only the DISTINCT worker-input tuples. One 20-row
+# chunk over x%4 reaches the worker as 4 rows with dedup, 20 without.
+# ---------------------------------------------------------------------------
+
+statement ok
+SET vgi_exchange_input_dedup = true;
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+SELECT count(*) FROM range(20) t(x), LATERAL ex.blended_explode(t.x % 4);
+
+query I
+SELECT max(CAST(regexp_extract(message, 'input_rows=([0-9]+)', 1) AS BIGINT))
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'table_in_out.write_input'
+  AND message LIKE '%blended_explode%';
+----
+4
+
+statement ok
+SET vgi_exchange_input_dedup = false;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+SELECT count(*) FROM range(20) t(x), LATERAL ex.blended_explode(t.x % 4);
+
+query I
+SELECT max(CAST(regexp_extract(message, 'input_rows=([0-9]+)', 1) AS BIGINT))
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'table_in_out.write_input'
+  AND message LIKE '%blended_explode%';
+----
+20
+
+statement ok
+CALL disable_logging();
+
+statement ok
+RESET vgi_exchange_input_dedup;
+
+# ---------------------------------------------------------------------------
+# 1->1 identity map (geo_encode emits NO provenance) with a repeated (x,y) pair.
+# The dedup path replicates the single worker output across the group; equivalence.
+# ---------------------------------------------------------------------------
+
+statement ok
+SET vgi_exchange_input_dedup = true;
+
+# 3 output rows (correct cardinality); the two identical (10,20) inputs yield the SAME
+# geohash and (30,40) a different one → exactly 2 distinct geohashes. No hardcoded hash.
+query II
+SELECT count(*), count(DISTINCT geohash)
+FROM (VALUES (10.0, 20.0), (10.0, 20.0), (30.0, 40.0)) v(x, y), LATERAL ex.geo_encode(v.x, v.y);
+----
+3	2
+
+# ---------------------------------------------------------------------------
+# Shared worker-arg / distinct OTHER outer column: two rows share the explode arg
+# but carry different `id`. Each output row must keep ITS OWN id (the delim-join /
+# per-original-row association), not the dedup representative's.
+# ---------------------------------------------------------------------------
+
+query II
+SELECT id, i
+FROM (VALUES (100, 2), (200, 2), (300, 3)) t(id, n), LATERAL ex.blended_explode(t.n)
+ORDER BY id, i;
+----
+100	0
+100	1
+200	0
+200	1
+300	0
+300	1
+300	2
+
+statement ok
+DETACH ex;
