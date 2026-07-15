@@ -1,0 +1,118 @@
+# name: test/sql/integration/scalar/dedup.test
+# description: Input dedup for scalar functions (phase 1). A VGI scalar is a pure 1:1
+#   map, so with vgi_exchange_input_dedup=true (default) the operator ships only the
+#   DISTINCT input tuples in a chunk to the worker and scatters the results back — a
+#   low-cardinality column of 100 rows / 5 distinct values reaches the worker as 5 rows,
+#   not 100, with identical results. See docs/exchange_dedup_pervalue.md.
+# group: [vgi_integration_scalar]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+SET threads=1;
+
+# 100 rows, only 5 distinct values (0..4), each repeated 20×.
+statement ok
+CREATE TEMP TABLE t AS SELECT (r % 5)::BIGINT AS v FROM range(100) g(r);
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+# ---------------------------------------------------------------------------
+# Dedup ON (default): correct result, but the worker sees only the 5 distinct inputs.
+# ---------------------------------------------------------------------------
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# sum(v*2) = 2 * 20 * (0+1+2+3+4) = 400, over 100 rows.
+query II
+SELECT count(*), sum(example.double(v))::BIGINT FROM t;
+----
+100	400
+
+# The single 100-row chunk reached the worker as 5 rows (the distinct count).
+query I
+SELECT max(CAST(regexp_extract(message, 'input_rows=([0-9]+)', 1) AS BIGINT))
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'scalar.write_input'
+  AND message LIKE '%double%';
+----
+5
+
+# ---------------------------------------------------------------------------
+# Dedup OFF: same result, but the worker now sees all 100 rows (equivalence proof).
+# ---------------------------------------------------------------------------
+
+statement ok
+SET vgi_exchange_input_dedup = false;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query II
+SELECT count(*), sum(example.double(v))::BIGINT FROM t;
+----
+100	400
+
+query I
+SELECT max(CAST(regexp_extract(message, 'input_rows=([0-9]+)', 1) AS BIGINT))
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'scalar.write_input'
+  AND message LIKE '%double%';
+----
+100
+
+statement ok
+RESET vgi_exchange_input_dedup;
+
+# ---------------------------------------------------------------------------
+# Correctness with NULLs + a single distinct value (dedup grouping edge cases).
+# ---------------------------------------------------------------------------
+
+statement ok
+CREATE TEMP TABLE tn AS SELECT CASE WHEN r % 3 = 0 THEN NULL ELSE 7::BIGINT END AS v FROM range(30) g(r);
+
+query II
+SELECT count(v), sum(example.double(v))::BIGINT FROM tn;
+----
+20	280
+
+# ---------------------------------------------------------------------------
+# A VOLATILE scalar is NEVER deduped — its output varies per call for the same
+# input, so collapsing duplicates would be wrong. random_int is VOLATILE; over a
+# 100-row / 5-distinct input the worker must still see all 100 rows.
+# ---------------------------------------------------------------------------
+
+statement ok
+CREATE TEMP TABLE rin AS SELECT 1::BIGINT AS lo, ((r % 5) + 10)::BIGINT AS hi FROM range(100) g(r);
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+SELECT example.random_int(lo, hi) FROM rin;
+
+query I
+SELECT max(CAST(regexp_extract(message, 'input_rows=([0-9]+)', 1) AS BIGINT))
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'scalar.write_input'
+  AND message LIKE '%random_int%';
+----
+100
+
+statement ok
+CALL disable_logging();
+
+statement ok
+DETACH example;

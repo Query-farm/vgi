@@ -3377,6 +3377,13 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "(expired/evicted); rewrites live records to a fresh pack and drops the old "
 	                          "(git gc). 0..100, default 50",
 	                          LogicalType::UBIGINT, Value::UBIGINT(50));
+	config.AddExtensionOption("vgi_exchange_input_dedup",
+	                          "Before an exchange-mode MAP call (scalar / streaming table-in-out / batched "
+	                          "correlated LATERAL), ship only the DISTINCT worker-input tuples in each chunk "
+	                          "to the worker and scatter the results back — turning e.g. 2048 evals over a "
+	                          "low-cardinality column into the distinct count. Compute-only (no cache); sound "
+	                          "under the same per-row-purity the cacheability opt-in asserts. Default ON",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
 
 	// Cache directory for worker binaries downloaded via github:// / github-auto://
 	// LOCATIONs. Empty (default) → ${XDG_CACHE_HOME:-~/.cache}/vgi/releases. Must be

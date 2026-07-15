@@ -5,6 +5,7 @@
 #include "vgi_client_timing.hpp"
 #include "vgi_function_connection.hpp"
 #include "vgi_ifunction_connection.hpp"
+#include "vgi_input_dedup.hpp" // input dedup (ship only distinct tuples; scatter back)
 #include "vgi_logging.hpp"
 #include "vgi_transport.hpp"
 #include "vgi_worker_pool.hpp"
@@ -481,6 +482,46 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 			to_serialize = &casted_chunk;
 		}
 	}
+
+	// [dedup] A VGI scalar is a pure 1:1 map, so ship only the DISTINCT input tuples to
+	// the worker and scatter the results back positionally. For a low-cardinality input
+	// (country_code, enum, …) this turns 2048 worker evals into the distinct count. The
+	// per-row-purity that makes this sound is the same contract the cache opt-in asserts.
+	bool dedup_enabled = true;
+	{
+		Value dv;
+		if (context.TryGetCurrentSetting("vgi_exchange_input_dedup", dv) && !dv.IsNull()) {
+			dedup_enabled = dv.GetValue<bool>();
+		}
+	}
+	// NEVER dedup a VOLATILE scalar — its output legitimately differs per call for the
+	// same input (RNG, etc.), so collapsing duplicate inputs would serve one row's value
+	// for all of them. The worker declares stability (FunctionStability) and it is set on
+	// the ScalarFunction at registration; CONSISTENT / CONSISTENT_WITHIN_QUERY are safe.
+	const bool is_volatile = func_expr.function.stability == FunctionStability::VOLATILE;
+	InputDedup dedup;
+	DataChunk deduped_chunk;
+	DataChunk *ship = to_serialize;
+	if (dedup_enabled && !is_volatile) {
+		vector<column_t> key_cols;
+		key_cols.reserve(to_serialize->ColumnCount());
+		for (idx_t c = 0; c < to_serialize->ColumnCount(); c++) {
+			key_cols.push_back(c);
+		}
+		dedup = BuildInputDedup(*to_serialize, key_cols);
+		if (!dedup.trivial) {
+			deduped_chunk.Initialize(Allocator::Get(context), to_serialize->GetTypes(),
+			                         dedup.k == 0 ? 1 : dedup.k);
+			for (idx_t c = 0; c < to_serialize->ColumnCount(); c++) {
+				VectorOperations::Copy(to_serialize->data[c], deduped_chunk.data[c], dedup.distinct,
+				                       dedup.k, 0, 0);
+			}
+			deduped_chunk.SetCardinality(dedup.k);
+			ship = &deduped_chunk;
+		}
+	}
+	const bool deduped = (ship != to_serialize);
+
 	// Build input-side conversion cache on the first batch. The cached
 	// types/names/extension_types/client_props are stable for the lifetime
 	// of this scalar's bind — input column count and types do not change
@@ -507,12 +548,12 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 	if (timing) {
 		ScopedNs _t(ClientTiming::Instance().convert_in_ns);
 		input_batch = DataChunkToArrowCached(
-		    context, *to_serialize, local_state.input_schema,
+		    context, *ship, local_state.input_schema,
 		    local_state.input_arrow_types, local_state.input_arrow_names,
 		    *local_state.input_client_props, local_state.input_extension_types);
 	} else {
 		input_batch = DataChunkToArrowCached(
-		    context, *to_serialize, local_state.input_schema,
+		    context, *ship, local_state.input_schema,
 		    local_state.input_arrow_types, local_state.input_arrow_names,
 		    *local_state.input_client_props, local_state.input_extension_types);
 	}
@@ -541,9 +582,10 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 		                  args.size());
 	}
 
-	if (static_cast<idx_t>(output_batch->num_rows()) != args.size()) {
+	if (static_cast<idx_t>(output_batch->num_rows()) != ship->size()) {
 		throw IOException("VGI scalar function '%s' returned %d rows but expected %d (1:1 mapping required)",
-		                  func_info.function_name, output_batch->num_rows(), args.size());
+		                  func_info.function_name, output_batch->num_rows(),
+		                  static_cast<int64_t>(ship->size()));
 	}
 
 	if (output_batch->num_columns() != 1) {
@@ -586,13 +628,24 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 		ExportRecordBatch(output_batch, *chunk_wrapper);
 		ArrowScanLocalState scan_state(std::move(chunk_wrapper), context);
 
+		const idx_t out_rows = static_cast<idx_t>(output_batch->num_rows());
 		DataChunk temp_output;
 		temp_output.Initialize(context, {result.GetType()});
-		temp_output.SetCardinality(args.size());
+		temp_output.SetCardinality(out_rows);
 		ArrowTableFunction::ArrowToDuckDB(scan_state, local_state.output_arrow_table.GetColumns(),
 		                                  temp_output, false);
 
-		result.Reference(temp_output.data[0]);
+		if (deduped) {
+			// Scatter the K distinct worker outputs back to the N original rows:
+			// result[n] = worker_out[orig_to_distinct[n]].
+			SelectionVector sel(args.size());
+			for (idx_t n = 0; n < args.size(); n++) {
+				sel.set_index(n, dedup.orig_to_distinct[n]);
+			}
+			VectorOperations::Copy(temp_output.data[0], result, sel, args.size(), 0, 0);
+		} else {
+			result.Reference(temp_output.data[0]);
+		}
 	};
 	if (timing) {
 		ScopedNs _t(ClientTiming::Instance().convert_out_ns);
