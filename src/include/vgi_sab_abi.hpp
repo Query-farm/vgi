@@ -22,12 +22,14 @@ enum HeaderLane : int32_t {
 	HDR_RING_CAP = 3,     // bytes per ring (per direction)
 	HDR_SLOT_STRIDE = 4,  // bytes per slot
 	HDR_SLOTS_OFF = 5,    // byte offset of slot[0]
+	// lane 7 = ensure-worker ready flag (client-side, js-stubs.js)
+	HDR_CLAIM_SEQ = 8,    // monotonic global claim-id counter (Atomics.add on slot_open)
 };
 constexpr int32_t kHeaderBytes = 64;
 
 // ---- Per-slot control (i32 lane indices within the slot's control block) --
 enum SlotLane : int32_t {
-	SLOT_STATE = 0,         // 0 = free, 1 = claimed
+	SLOT_STATE = 0,         // 0 = free, nonzero = unique claim id (see below)
 	C2W_WRITE_POS = 1,      // client -> worker ring
 	C2W_READ_POS = 2,
 	C2W_CLOSED = 3,
@@ -37,7 +39,12 @@ enum SlotLane : int32_t {
 };
 constexpr int32_t kSlotControlBytes = 64; // control block, cache-line isolated
 
-// state values
+// state values. STATE=0 is free; a claim stores a UNIQUE nonzero id (from the
+// HDR_CLAIM_SEQ counter) rather than a constant 1, so the per-slot worker
+// dispatcher can tell "still my claim" from "already reclaimed by the next scan"
+// (STATE 1->0->1 would otherwise be an ABA race that wedges await_release). The
+// native harness uses a single serve per slot (await is a no-op there) and may
+// still store 1. kSlotClaimed is retained for that native path.
 constexpr int32_t kSlotFree = 0;
 constexpr int32_t kSlotClaimed = 1;
 // closed flag

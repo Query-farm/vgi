@@ -243,6 +243,20 @@ namespace {
 // because WebWorkerInvokeUnary (below) calls it before that definition.
 int EnsureVgiSabChannel();
 } // namespace
+
+// Publish the shared channel's byte offset onto the CALLING pthread's JS realm.
+// `vgiSab.base` (the offset the JS ring stubs read through) is per-realm state, but a
+// connection is bound on one pthread while its ring I/O (ReadDataBatch tick/scan,
+// input writes) can be scheduled by DuckDB onto a DIFFERENT pool pthread whose realm
+// never had the offset set — its ring reads then look at the wrong linear-memory
+// location and block forever (an intermittent, thread-scheduling-dependent hang). The
+// SAB stream Read/Write call this first so the current realm is always correct. Cheap:
+// EnsureVgiSabChannel is a cached atomic load and set_channel is a JS field store.
+void VgiSabEnsureChannelOnRealm() {
+	vgi_wasm_set_channel(EnsureVgiSabChannel());
+}
+#else
+void VgiSabEnsureChannelOnRealm() {}
 #endif
 
 // Standalone unary RPC over the `worker:` SAB transport, for catalog RPCs (ATTACH
@@ -333,10 +347,12 @@ int EnsureVgiSabChannel() {
 	if (existing != 0) {
 		return existing;
 	}
-	// Concurrent slot count = the worker's serve-thread count. 4 covers typical
-	// concurrent scans (a bare Web Worker with many pthreads is heavy on the browser;
-	// AsyncDuckDB also serializes multi-connection queries, so deep concurrency is
-	// rarely realized). Raise if a parallel-scan workload needs more simultaneous slots.
+	// Concurrent slot count = the worker's serve-thread count, matched to the engine's
+	// max scan threads (4). Same-slot reuse is made safe by the worker-done-aware
+	// release (AwaitWorkerDoneThenRelease) + the unique claim-id STATE handoff, so no
+	// extra headroom is needed — a released slot is provably idle and cleanly reusable.
+	// (A bare Web Worker with many pthreads is heavy on the browser; keep this modest.
+	// PTHREAD_POOL_SIZE in the worker build must be >= this.)
 	const int n_slots = 4;
 	const int ring_cap = sab::kDefaultRingCap;
 	const int stride = sab::SlotStride(ring_cap);
@@ -772,6 +788,16 @@ std::shared_ptr<arrow::RecordBatch> WebWorkerFunctionConnection::ReadDataBatch()
 				// ignore secondary errors while draining post-error
 			}
 			data_finished_ = true;
+			// Free the slot NOW rather than waiting for the connection destructor:
+			// DuckDB(-wasm) may defer destroying an errored scan's local state well
+			// past the throw, so a parallel scan that follows would otherwise see this
+			// slot still claimed and fail "channel exhausted". The w2c drain above has
+			// already consumed the worker's output to EOS. Idempotent; the destructor's
+			// release then no-ops (slot_ < 0).
+			if (slot_ >= 0) {
+				vgi_wasm_slot_release(slot_);
+				slot_ = -1;
+			}
 			throw;
 		}
 

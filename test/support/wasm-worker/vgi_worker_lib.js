@@ -11,6 +11,12 @@ addToLibrary({
   $vgiW: {
     i32: function () { return new Int32Array(globalThis.__vgiBuf); },
     u8: function () { return new Uint8Array(globalThis.__vgiBuf); },
+    // Per-slot claim id this thread is currently serving (STATE value captured at
+    // await_slot). await_release waits for STATE to leave THIS id — not merely to
+    // become nonzero-again — so a release+immediate-reclaim (STATE id->0->newid) by
+    // the next scan can't be mistaken for "not yet released" (the ABA that wedged
+    // the errored-slot handoff). One serve thread per slot, so a plain array is safe.
+    served: [],
     hdr: function () {
       var i = this.i32(); var h = globalThis.__vgiBase >> 2;
       // header i32 lanes: [3]=ring_cap [4]=slot_stride [5]=slots_off
@@ -66,24 +72,31 @@ addToLibrary({
     var i = vgiW.i32(); var hdr = vgiW.hdr(); var sb = vgiW.slotByte(hdr, slot) >> 2;
     Atomics.store(i, sb + 6, 1); Atomics.notify(i, sb + 4);
   },
-  // Per-thread dispatcher: block until `slot` is CLAIMED (STATE 0 -> 1) and ready to
-  // serve. Called BEFORE serving. If the slot is already claimed (the client raced
-  // ahead of this thread), returns immediately — do NOT wait for a release first, or
-  // the thread deadlocks waiting for a release that only happens after it serves.
+  // Per-thread dispatcher: block until `slot` is CLAIMED (STATE 0 -> claim-id) and
+  // ready to serve. Called BEFORE serving. If the slot is already claimed (the client
+  // raced ahead of this thread), returns immediately — do NOT wait for a release first,
+  // or the thread deadlocks waiting for a release that only happens after it serves.
+  // Records the captured claim id in vgiW.served[slot] for await_release to key on.
   // Parks on the STATE lane (lane 0), which slot_open notifies; 500ms is a safety poll.
   vgi_worker_await_slot__deps: ['$vgiW'],
   vgi_worker_await_slot: function (slot) {
     var i = vgiW.i32(); var hdr = vgiW.hdr();
     var stateLane = vgiW.slotByte(hdr, slot) >> 2; // STATE = lane 0
-    while (Atomics.load(i, stateLane) === 0) Atomics.wait(i, stateLane, 0, 500);
+    var st;
+    while ((st = Atomics.load(i, stateLane)) === 0) Atomics.wait(i, stateLane, 0, 500);
+    vgiW.served[slot] = st; // the unique claim id we're about to serve
   },
-  // Block until `slot` is RELEASED (STATE 1 -> 0). Called AFTER serving one request
-  // so the thread doesn't re-serve the same drained/closed slot before the client
-  // releases it (slot_release notifies the STATE lane).
+  // Block until `slot`'s CURRENT claim is released (STATE leaves the served id).
+  // Called AFTER serving one request so the thread doesn't re-serve the same
+  // drained/closed slot before the client releases it. Keying on the served id (not a
+  // constant 1) is what makes release+reclaim (id->0->newid) safe: STATE != served-id
+  // is true for BOTH the free state and a fresh reclaim, so we never block on the next
+  // scan's claim mistaking it for our own un-released one.
   vgi_worker_await_release__deps: ['$vgiW'],
   vgi_worker_await_release: function (slot) {
     var i = vgiW.i32(); var hdr = vgiW.hdr();
     var stateLane = vgiW.slotByte(hdr, slot) >> 2;
-    while (Atomics.load(i, stateLane) === 1) Atomics.wait(i, stateLane, 1, 500);
+    var served = vgiW.served[slot];
+    while (Atomics.load(i, stateLane) === served) Atomics.wait(i, stateLane, served, 500);
   },
 });

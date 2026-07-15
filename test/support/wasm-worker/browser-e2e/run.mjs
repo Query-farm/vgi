@@ -106,10 +106,10 @@ try {
 
   console.log('result:', JSON.stringify(result, null, 2));
   const pass = result && result.coi && result.loaded && result.workerOk && result.multiBatchOk &&
-    result.attachOk && result.concurrentOk && result.errorOk && result.postErrorOk;
+    result.attachOk && result.concurrentOk && result.parallelOk && result.errorOk && result.postErrorOk;
   if (!pass) { console.error('FAIL: worker: transport e2e assertions not all green'); process.exit(1); }
   console.log('PASS: worker: transport e2e (LOAD + direct + multi-batch + ATTACH + concurrent + ' +
-    'error + post-error)');
+    'parallel-serve + error + post-error)');
   process.exit(0);
 } catch (e) {
   console.error('FAIL:', e && e.stack ? e.stack : e);

@@ -291,6 +291,58 @@ impl TableFunction for PeekMaxConcurrency {
     }
 }
 
+// ---- parallel_probe: force a PARALLEL scan → concurrent slots → parallel serve --
+// Declares max_workers=4 so a SINGLE scan fans out across DuckDB scan threads, each
+// acquiring its own worker: connection (own slot). Each thread's producer sleeps
+// (so the threads overlap) and holds a ConcGuard, so peek_max_concurrency reports
+// the peak number of serve pthreads active at once. Unlike multiple separate
+// queries (which AsyncDuckDB serializes), one parallel scan genuinely runs N serve
+// threads concurrently.
+struct ParallelProbe;
+struct ParallelProbeProducer {
+    schema: SchemaRef,
+    sleep_ms: i64,
+    i: i64,
+    _guard: ConcGuard,
+}
+impl TableProducer for ParallelProbeProducer {
+    fn next_batch(&mut self, _out: &mut OutputCollector) -> Result<Option<RecordBatch>> {
+        if self.i >= 2 {
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(self.sleep_ms.max(0) as u64));
+        let col: ArrayRef = Arc::new(Int64Array::from(vec![self.i]));
+        self.i += 1;
+        Ok(Some(RecordBatch::try_new(self.schema.clone(), vec![col])
+            .map_err(|e| RpcError::runtime_error(e.to_string()))?))
+    }
+}
+impl TableFunction for ParallelProbe {
+    fn name(&self) -> &str {
+        "parallel_probe"
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        FunctionMetadata { max_workers: 4, ..Default::default() }
+    }
+    fn max_workers(&self, _params: &BindParams) -> i64 {
+        4
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![ArgSpec::const_arg("sleep_ms", 0, "int64", "Sleep between batches (widen overlap)")]
+    }
+    fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
+        Ok(BindResponse { output_schema: value_schema(), opaque_data: Vec::new() })
+    }
+    fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
+        Ok(Box::new(ParallelProbeProducer {
+            schema: params.output_schema.clone(),
+            sleep_ms: params.arguments.const_i64(0).unwrap_or(0),
+            i: 0,
+            _guard: ConcGuard::new(),
+        }))
+    }
+}
+
 /// Serve one slot to completion, then EOS the output ring. Blocking; run on a thread.
 #[no_mangle]
 pub extern "C" fn vgi_rust_serve_table_sab_slot(slot: i32) {
@@ -300,6 +352,7 @@ pub extern "C" fn vgi_rust_serve_table_sab_slot(slot: i32) {
     worker.register_table(Boom);
     worker.register_table(SlowCount);
     worker.register_table(PeekMaxConcurrency);
+    worker.register_table(ParallelProbe);
     // No set_catalog: the dispatcher installs a default CatalogModel, and the C++
     // client binds `count_to` directly by name against the dispatch registry.
     worker.serve_reader_writer(SabReader { slot }, SabWriter { slot });

@@ -11,7 +11,9 @@ cd "$(dirname "$0")"
 set +u; source "$EMSDK_DIR/emsdk_env.sh" >/dev/null 2>&1; set -u
 export PATH="$EMSDK_DIR/upstream/emscripten:$PATH"
 SABLIB="${SABLIB:-$(cd ../sabtable && pwd)/target/wasm32-unknown-emscripten/release/libsabtable.a}"
-[ -f "$SABLIB" ] || { echo "build sabtable first: (cd ../sabtable && cargo +nightly build --target wasm32-unknown-emscripten -Z build-std=std,panic_abort --release)"; exit 1; }
+# NB: -Z build-std recompiles compiler_builtins, which needs +atomics,+bulk-memory
+# via RUSTFLAGS or wasm-ld rejects --shared-memory ("disallowed by compiler_builtins").
+[ -f "$SABLIB" ] || { echo "build sabtable first: (cd ../sabtable && RUSTFLAGS='-C target-feature=+atomics,+bulk-memory,+mutable-globals -C link-args=-pthread' cargo +nightly build --target wasm32-unknown-emscripten -Z build-std=std,panic_abort --release)"; exit 1; }
 # PTHREAD_POOL_SIZE must be >= the channel slot count (EnsureVgiSabChannel = 4) so
 # every serve thread gets a pre-spawned pool worker (pthread_create-after-dlopen is
 # flaky, so pre-spawn the full set). --pre-js injects DuckDB's SAB into each pthread

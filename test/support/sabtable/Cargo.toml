@@ -20,12 +20,19 @@ path = "src/lib.rs"
 # (tokio); the worker falls back to the zero-dep FsStorage backend, so the native
 # staticlib builds with no heavy/C deps.
 vgi = { path = "../../../../vgi-rust/vgi", default-features = false }
-# Must match the exact vgi-rpc that `vgi` resolves to (crates.io 0.11.0) so the
-# `OutputCollector` / `Result` / `RpcError` types are one crate instance, not two.
-vgi-rpc = { version = "0.11.0", default-features = false, features = ["macros", "stream-codec"] }
+# Must match the exact vgi-rpc that `vgi` resolves to (local 0.12.0 via the
+# [patch.crates-io] below) so the `OutputCollector` / `Result` / `RpcError`
+# types are one crate instance, not two.
+vgi-rpc = { version = "0.12.0", default-features = false, features = ["macros", "stream-codec"] }
 arrow-array = "59"
 arrow-schema = "59"
 serde = { version = "1", features = ["derive"] }
 
 [profile.release]
 opt-level = 2
+
+# vgi (via ../../../../vgi-rust) resolves vgi-rpc to the local 0.12.0 checkout;
+# point this standalone crate at the same source so both unify to ONE vgi-rpc
+# instance. Remove once vgi-rpc 0.12.0 is on crates.io.
+[patch.crates-io]
+vgi-rpc = { path = "../../../../vgi-rpc-rust/vgi-rpc" }

@@ -21,11 +21,14 @@ header (i32 lanes):
   [3] ring_cap       = bytes per ring (per direction)
   [4] slot_stride    = bytes per slot
   [5] slots_off      = byte offset of slot[0]  (= 64)
-  [6..15] reserved
+  [6] reserved
+  [7] ensure-worker ready flag (client-side dedup; 1 = worker booted)
+  [8] claim_seq      monotonic global claim-id counter (Atomics.add on slot_open)
+  [9..15] reserved
 
 slot (at slots_off + i*slot_stride):
   control (i32 lanes, first 64B, cache-line isolated):
-    [0] state          0 = free, 1 = claimed        (slot_open CAS target)
+    [0] state          0 = free, nonzero = unique claim id  (slot_open CAS target)
     [1] c2w_write_pos  monotonic bytes written (client → worker)
     [2] c2w_read_pos   monotonic bytes read
     [3] c2w_closed     1 = client finished writing (EOS on input)
@@ -38,6 +41,15 @@ slot (at slots_off + i*slot_stride):
 
 slot_stride = align_up(64 + 2*ring_cap, 64)
 ```
+
+**`state` carries a UNIQUE claim id, not a constant 1.** `slot_open` writes
+`Atomics.add(header[claim_seq], 1) + 1` (a globally-unique nonzero id) into the slot `state`,
+not `1`. The worker's per-slot dispatcher records the id it is serving and, after serving,
+waits for `state` to leave *that* id before accepting the next claim. A constant `1` would make
+a release+immediate-reclaim (`state 1 → 0 → 1`) an **ABA race** — the worker would read the new
+`1` as "my claim not released yet" and block forever. Unique ids make `state != served_id` true
+for both the free state and any fresh reclaim, so the handoff is unambiguous. (The native single-
+serve harness never reuses a slot mid-dispatch, so it may still store `1`.)
 
 **SPSC ring semantics** (per direction): positions are **monotonic** (never wrap; index =
 `pos % ring_cap`), so `avail = write_pos - read_pos`, `free = ring_cap - avail`. A writer
@@ -94,6 +106,31 @@ Errors surface **in-band** as Arrow error batches (reuse `ClassifyBatch`/
 `HandleBatchLogMessage`), never as a transport error code. Cancellation: `slot_write`/
 `slot_read` block with a bounded timeout and re-check `context.client.interrupted`
 (adaptive backoff), mirroring `FdInputStream::Read`.
+
+## Browser implementation notes (load-bearing — non-obvious)
+
+Two emscripten-pthread footguns must be handled or the transport hangs **intermittently**
+(depending on which pool pthread the scheduler runs a scan on — so it passes in single-thread /
+native tests and flakes only in the real threaded browser):
+
+1. **Read the LIVE memory buffer, never the cached `Module.HEAPU8` view.** emscripten's cached
+   `Module.HEAP*` typed-array views go **stale** on a pthread that was mid-compute/blocked through
+   a memory-growth event — its `Atomics.load` then never observes another thread's stores into the
+   *current* buffer, so a ring read sees `avail == 0` forever even though the bytes are there (a
+   native C++ pointer, always aliasing live memory, sees them — so the two sides silently diverge).
+   The JS ring stubs must derive their views from `wasmMemory.buffer` (a live getter) on every op,
+   not `Module.HEAPU8.buffer`. This was the primary cause of the early flaky hangs.
+
+2. **Re-publish the channel offset onto the executing pthread's realm before each ring op.**
+   `vgiSab.base` (the offset the JS ring stubs index through) is per-realm JS state. A connection is
+   bound on one pthread, but DuckDB can schedule its ring I/O (tick/scan reads, input writes) onto a
+   different pool pthread whose realm never had the offset set → it indexes the wrong linear-memory
+   location. The C++ `SabInputStream::Read` / `SabOutputStream::Write` call a
+   `vgi_wasm_set_channel(EnsureVgiSabChannel())` shim first so the current realm is always correct.
+
+The native (POSIX-shm) harness has neither issue (native pointers + a single serve thread), so
+**both must be covered by the browser E2E** (`test/support/wasm-worker/browser-e2e/`), not the
+native `[sab-conn]` unit tests.
 
 ## Rust worker side
 

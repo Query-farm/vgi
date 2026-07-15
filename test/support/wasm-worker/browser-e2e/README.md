@@ -14,17 +14,61 @@ duplex-ring channel) — asserting:
 5. **ATTACH** — `ATTACH 'worker:...'` → catalog discovery → `wcat.main.count_to(3)` ⇒ `[0..2]`
    (catalog RPCs over the unary-over-SAB path).
 6. **concurrent** — 4 concurrent `worker:` scans on separate connections (`SET threads=4`).
-7. **concurrency diagnostic (not a gate)** — 4 concurrent `slow_count` scans, then
-   `peek_max_concurrency()` reads the process-global peak number of simultaneously-active serves
-   (tracked by a Drop guard in shared worker memory). This is **reported, not asserted**: with
-   these single-producer fixtures + DuckDB-WASM's `AsyncDuckDB` serializing multi-connection
-   queries at its single-threaded worker boundary, the observed peak is **1** — the "concurrent"
-   scans serialize, so the multi-thread serve (correct, one pthread per slot) is not exercised in
-   parallel here. Exercising it in parallel needs a workload DuckDB parallelizes across scan
-   threads (one scan → >1 slot at once); the diagnostic is emitted so that can be checked later.
+7. **PARALLEL SERVE PROOF** — a **single** scan of `parallel_probe` (a producer that declares
+   `max_workers=4`) with `SET threads=4`. DuckDB fans one scan out across scan threads, each
+   acquiring its own `worker:` connection = its own SAB slot = its own worker serve pthread, so N
+   serves run **at once**. Each `parallel_probe` producer holds a process-global `ConcGuard`
+   (shared across serve threads via the worker module's linear memory), and `peek_max_concurrency()`
+   reads back the peak simultaneously-active serves. Observed **maxConcurrency = 4** — genuine
+   parallel multi-thread serve. (This is the workload the older `slow_count` "diagnostic, not a
+   gate" note called for: separate concurrent queries serialize at `AsyncDuckDB`'s single-threaded
+   boundary and only ever showed a peak of 1; ONE parallelized scan does not, so it exercises the
+   multi-thread serve for real.)
 
-The fixtures (`count_to`, `emit_batches`, `boom`, `slow_count`, `peek_max_concurrency`) live in
-`../../sabtable/src/lib.rs`; cases 2–4 are also covered natively by the `[sab-conn]` unit test.
+The fixtures (`count_to`, `emit_batches`, `boom`, `parallel_probe`, `peek_max_concurrency`, plus
+`slow_count`) live in `../../sabtable/src/lib.rs`; cases 2–4 are also covered natively by the
+`[sab-conn]` unit test.
+
+### Resolved: stale pthread heap views (was an intermittent hang)
+
+Earlier this suite hung intermittently whenever a scan reused a SAB slot (streaming
+`count_to`→`emit_batches`, catalog discovery's rapid unary RPCs, etc.). Root cause — found via the
+worker-side + client-side channel observability: the JS ring stubs read the channel through
+emscripten's cached `Module.HEAPU8` **view**, which goes **stale on a pthread that was
+mid-compute/blocked through a memory-growth event** — so its `Atomics.load` never observed another
+thread's stores into the *current* buffer, and the ring read saw `avail=0` forever (native C++
+pointers, always aliasing live memory, saw the data fine, so the two sides diverged). It was flaky
+because it depended on which pool pthread DuckDB scheduled the scan onto. Fixes (all landed):
+
+- **`js-stubs.js` reads the live buffer** (`$vgiSab.buf()` → `wasmMemory.buffer`, not
+  `Module.HEAPU8.buffer`) for every ring op. This is the primary fix.
+- **`VgiSabEnsureChannelOnRealm()`** (`vgi_sab_stream.cpp` `Read`/`Write`) re-publishes the channel
+  offset onto the executing pthread's realm, since `vgiSab.base` is per-realm and the scan can run
+  on a different pthread than the one that bound the connection.
+- **Unique claim-id STATE handoff** (`vgi_sab_abi.hpp` `HDR_CLAIM_SEQ`) fixes the ABA in the
+  worker's `await_release`; proactively freeing an errored slot fixes "channel exhausted".
+
+With these, the full E2E is **reliably green** across repeated fresh loads (`maxConcurrency = 4`).
+
+### Known limitation: flaky worker-error propagation under `threads > 1` + heavy load
+
+Case 5 (the worker-error case) runs under `SET threads=1`. This is **not** a transport bug — it's
+a narrowly-scoped, flaky DuckDB-WASM-side error-propagation race, characterized carefully:
+
+- The SAB transport tears down **cleanly** on a worker error under `threads=4` (channel
+  diagnostics show all slots freed, both rings closed, worker idle) — the exception *is* delivered.
+- A worker throw under `threads=4` propagates fine **in isolation** — even after a warm scan +
+  ATTACH + a concurrent 4-connection case (see `probe-vgi-boom.mjs`).
+- A generic (non-VGI) parallel throw propagates fine under `threads=4` too (see `probe-throw.mjs`).
+- **Only** under the *full* suite's concurrency/timing does a worker throw under `threads>1`
+  *occasionally* (≈2/3 of fresh loads) leave the async query promise unsettled. Root: a DuckDB-WASM
+  Asyncify + pthread + C++-exception propagation race, exercised by the error path — orthogonal to
+  the transport (which did its job). Fixing it means DuckDB-WASM-internals work, not transport work.
+
+`threads=1` makes the error path deterministic. Everything else — including the parallel-serve proof
+(case 7, `maxConcurrency=4`) and all the happy-path streaming/catalog/concurrent cases — runs green
+under `threads=4`. The `probe-*.mjs` files (run via `VGI_ENTRY=probe-*.mjs node serve.mjs`) are the
+isolation harness used to characterize this.
 
 ## Prerequisites (build these first)
 
@@ -38,8 +82,9 @@ The fixtures (`count_to`, `emit_batches`, `boom`, `slow_count`, `peek_max_concur
 - **VGI wasm extension** — deployed under `<haybarn-wasm>/extensions/<ver>/wasm_threads/`
   (see `../../../build-wasm-coi.sh`, pointed at the haybarn engine's Arrow).
 - **Worker module** — `../vgi_worker.{js,wasm}`, built via `../build.sh` (needs sabtable's
-  wasm staticlib: `cd ../sabtable && cargo +nightly build --target wasm32-unknown-emscripten
-  -Z build-std=std,panic_abort --release`).
+  wasm staticlib: `cd ../sabtable && RUSTFLAGS='-C target-feature=+atomics,+bulk-memory,+mutable-globals -C link-args=-pthread' cargo +nightly build --target wasm32-unknown-emscripten -Z build-std=std,panic_abort --release`
+  — the `RUSTFLAGS` are required so `-Z build-std`'s recompiled `compiler_builtins` supports
+  `--shared-memory`, else wasm-ld rejects the link).
 - **puppeteer + esbuild** resolvable from `<haybarn-wasm>/node_modules` (used headless).
 
 ## Run

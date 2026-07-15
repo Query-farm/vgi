@@ -7,6 +7,13 @@
 namespace duckdb {
 namespace vgi {
 
+// Publish the shared channel offset onto the calling pthread's JS realm before ring
+// I/O (defined in vgi_webworker_function_connection.cpp). A connection is bound on one
+// pthread but DuckDB may run its ring reads/writes on a different pool pthread whose
+// realm never had the offset set; without this the JS ring stubs read the wrong
+// linear-memory location and block. wasm-only; a no-op on the native test harness.
+void VgiSabEnsureChannelOnRealm();
+
 // ---- SabInputStream ---------------------------------------------------------
 
 SabInputStream::SabInputStream(int slot, ClientContext *context)
@@ -36,6 +43,7 @@ arrow::Result<int64_t> SabInputStream::Read(int64_t nbytes, void *out) {
 	if (!is_open_) {
 		return arrow::Status::IOError("SabInputStream: read on closed stream");
 	}
+	VgiSabEnsureChannelOnRealm(); // this pthread's realm must know the channel offset
 	auto *dst = static_cast<uint8_t *>(out);
 	int64_t total = 0;
 	while (total < nbytes) {
@@ -84,6 +92,7 @@ arrow::Status SabOutputStream::Write(const void *data, int64_t nbytes) {
 	if (!is_open_) {
 		return arrow::Status::IOError("SabOutputStream: write on closed stream");
 	}
+	VgiSabEnsureChannelOnRealm(); // this pthread's realm must know the channel offset
 	const auto *src = static_cast<const uint8_t *>(data);
 	int64_t total = 0;
 	while (total < nbytes) {
