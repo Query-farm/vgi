@@ -3361,8 +3361,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "Route SMALL on-disk result-cache entries into append-only per-process pack "
 	                          "files + a rebuildable index (git-style loose-vs-packed split) instead of a "
 	                          "loose object+ref file pair each, so thousands of tiny per-input-chunk exchange "
-	                          "memos cost a few files. Large entries stay loose. Ship OFF; enable per session",
-	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
+	                          "memos cost a few files. Large entries stay loose. Default ON (the disk tier "
+	                          "itself is opt-in, so this only bites once a cache dir is configured)",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
 	config.AddExtensionOption("vgi_result_cache_pack_max_entry_bytes",
 	                          "Route threshold for the packed disk backend: on-disk entries below this size "
 	                          "are packed, at/above are stored as loose objects (default 262144 = 256 KB)",

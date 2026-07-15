@@ -702,23 +702,30 @@ takes effect on the next scan **or** the next `vgi_result_cache_reap()` (which n
 `SyncResultCacheSettings` so a bare `SET` before a reap is honored). 0 = unbounded. This is the
 **loose-store** guard; the packed backend below bounds file count structurally.
 
-**Packed small-entry disk backend ([S9], `vgi_result_cache_pack`, default OFF).** The loose store
+**Packed small-entry disk backend ([S9], `vgi_result_cache_pack`, default ON).** The loose store
 writes an object+ref *file pair* per entry — pathological for thousands of tiny per-chunk memos.
-`vgi_result_cache_pack=true` routes **small** on-disk entries (`< vgi_result_cache_pack_max_entry_bytes`,
-256 KB) into **append-only per-process pack files** (`<shard>/packs/<selfid>-<seq>.vpack`) + a
-rebuildable index (`.vidx`), git-style loose-vs-packed: thousands of memos cost a few files, large
-entries stay loose. Each process WRITES only its own `<selfid>-*` packs (append-only, single writer)
-and READS all packs in the shard (cross-restart + cross-process read). A packed record embeds the
+The packed backend routes **small EXCHANGE memos** (`input_hash` present AND `<
+vgi_result_cache_pack_max_entry_bytes`, 256 KB) into **append-only per-process pack files**
+(`<shard>/packs/<selfid>-<seq>.vpack`) + a rebuildable index (`.vidx`), git-style loose-vs-packed:
+thousands of memos cost a few files. **Producer entries never pack** (empty `input_hash`) — they are
+few-and-large, and the loose store (+ its `objects/`/`refs/` diagnostics) is ideal — so the packed
+backend is scoped to exactly the many-tiny-files case it exists to solve. Large exchange entries also
+stay loose. Each process WRITES only its own `<selfid>-*` packs (append-only, single writer) and
+READS all packs in the shard (cross-restart + cross-process read). A packed record embeds the
 **same** `SerializeEntryBlob` bytes + `content_sha` the loose store writes, re-verified on serve
 (positioned-read → `BufferReader` → the shared `ParseEntryBlobIntoStream`), so integrity is
 identical. The reaper walks the **in-memory index** (no directory scan): expiry, a global byte-cap
 LRU evict, and own-pack compaction once a pack crosses `vgi_result_cache_pack_compaction_dead_pct`
-(git `gc` — rewrite live records to a fresh pack, drop the old). Routing/probe are transport-agnostic
-and live in `VgiResultCache::PackStore` (pimpl in `vgi_result_cache.cpp`); `Insert` routes, `Lookup`
-probes the pack index first then loose, the reaper + `FlushAll`/`FlushCatalog` drive/invalidate it.
-Cross-process *concurrent-write* freshness (a live peer's in-flight appends) + dead-writer reclaim
-are follow-ups (phases 3–4). See [docs/result_cache_packed_store.md](docs/result_cache_packed_store.md).
-Test: `test/sql/integration/cache/pack.test`.
+(git `gc` — rewrite live records to a fresh pack, drop the old; a fully-dead pack is deleted, and the
+active writer is sealed first when it crosses the threshold so a never-rolling writer can't pin dead
+space). Shard state is keyed by **(dir, shard_hash)** — `vgi_result_cache_dir` can change mid-process,
+and keying by shard alone would reuse an open writer pointing at the old dir. Routing/probe are
+transport-agnostic and live in `VgiResultCache::PackStore` (pimpl in `vgi_result_cache.cpp`); `Insert`
+routes, `Lookup` probes the pack index first then loose, the reaper + `FlushAll`/`FlushCatalog`
+drive/invalidate it. Cross-process *concurrent-write* freshness (a live peer's in-flight appends) +
+dead-writer reclaim are follow-ups (phases 3–4). See
+[docs/result_cache_packed_store.md](docs/result_cache_packed_store.md). Tests:
+`test/sql/integration/cache/pack.test`.
 
 **Bounded buffered capture ([S6]).** Unlike the producer path (which spills a large capture to
 a streaming disk blob), the buffered operator accumulates the whole-input result in RAM
@@ -790,7 +797,7 @@ transport in `src/query_farm_telemetry.cpp`. Full field reference: [docs/telemet
 | `vgi_result_cache_disk_compression` | VARCHAR | `zstd` | Compression codec for the **on-disk** result-cache tier (Arrow built-in IPC buffer compression, applied per-batch so per-batch seek / streaming serve is preserved; the reader decompresses transparently). `zstd` (default), `lz4` (minimal CPU), or `none`. The **memory tier is never compressed** (zero hot-path decompress); compression is applied at the disk-write boundary — compress-at-source on the spill path, transcode on the buffered/drain paths. Default-on when the disk tier is enabled. A missing codec degrades gracefully to uncompressed. Verify it's active via the `codec` column of `vgi_result_cache(include_disk := true)`. See [docs/result_cache_compression.md](docs/result_cache_compression.md) |
 | `vgi_result_cache_disk_compression_level` | UBIGINT | 1 | zstd compression level for the on-disk tier (ignored for `lz4`/`none`). Keep it low — the default 1 is Pareto-optimal (near-zstd-3 ratio at ~half the CPU) |
 | `vgi_result_cache_exchange_disk_max_refs` | UBIGINT | 100000 | File-count cap for **exchange-mode** disk entries (streaming table-in-out / correlated LATERAL / buffered) in the **loose** store. Every exchange memo persists to disk regardless of payload size — so a small-but-**expensive** result still warms the cross-process cache — and per-input-chunk file fan-out is bounded by the reaper LRU-evicting oldest **exchange** refs above this count. Scoped to exchange refs (`exch=1` marker) so a memo flood never evicts a large producer entry. Honored on the next scan or `vgi_result_cache_reap()`. 0 = unbounded. Superseded structurally by the packed backend below. (Scaling seam **S9**) |
-| `vgi_result_cache_pack` | BOOLEAN | false | Route **small** on-disk result-cache entries into append-only per-process pack files + a rebuildable index (git-style loose-vs-packed) instead of a loose object+ref file pair each, so thousands of tiny per-input-chunk exchange memos cost a few files. Large entries stay loose. Ship OFF; enable per session. See *Packed small-entry disk backend* + [docs/result_cache_packed_store.md](docs/result_cache_packed_store.md). (Scaling seam **S9**) |
+| `vgi_result_cache_pack` | BOOLEAN | true | Route **small EXCHANGE** on-disk result-cache memos (`input_hash` present) into append-only per-process pack files + a rebuildable index (git-style loose-vs-packed) instead of a loose object+ref file pair each, so thousands of tiny per-input-chunk memos cost a few files. Producer entries never pack (few-and-large → loose). The disk tier itself is opt-in, so this only bites once a cache dir is configured. `SET false` to force exchange memos to the loose store. See *Packed small-entry disk backend* + [docs/result_cache_packed_store.md](docs/result_cache_packed_store.md). (Scaling seam **S9**) |
 | `vgi_result_cache_pack_max_entry_bytes` | UBIGINT | 262144 (256 KB) | Route threshold for the packed backend: on-disk entries **below** this size are packed, at/above are stored as loose objects. |
 | `vgi_result_cache_pack_target_bytes` | UBIGINT | 67108864 (64 MB) | Roll to a fresh pack file once the current one exceeds this size (bounds one compaction unit). |
 | `vgi_result_cache_pack_compaction_dead_pct` | UBIGINT | 50 | Compact an owned pack file when this percent of its bytes is dead (expired/evicted) — rewrites live records to a fresh pack and drops the old (git `gc`). 0..100. |

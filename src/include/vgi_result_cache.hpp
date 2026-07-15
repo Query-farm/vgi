@@ -223,8 +223,10 @@ public:
 		// --- Packed small-entry disk backend (git-style loose-vs-packed split) ---
 		// Master switch: route SMALL entries into append-only per-process pack files +
 		// a rebuildable index instead of a loose .vrc/.ref pair each, so thousands of
-		// tiny per-chunk memos cost a few files. Large entries stay loose. Ship OFF.
-		bool pack = false;
+		// tiny per-chunk memos cost a few files. Large entries stay loose. Default ON
+		// (the disk tier itself is opt-in, so this only takes effect once a disk dir is
+		// configured); the loose store is still used for large entries.
+		bool pack = true;
 		// Route threshold: entries with total_bytes below this pack; at/above go loose.
 		uint64_t pack_max_entry_bytes = 262144; // 256 KB
 		// Roll to a new pack file past this size (bounds one compaction unit).

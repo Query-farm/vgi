@@ -1,11 +1,13 @@
 # Packed On-Disk Store for Small Exchange-Mode Cache Entries — Design
 
-Status: **PHASE 1 IMPLEMENTED** (single-process pack backend + cross-restart read,
-feature-flagged `vgi_result_cache_pack`, default OFF). Cross-process *concurrent*-write
-coordination (phases 3–4) not yet built — a second live process reading a shard sees peers'
-sealed packs on load but not their in-flight appends until a reload, and a dead writer's packs
-are reclaimed only on expiry / `vgi_result_cache_flush()`, not compacted. See §7 for the plan.
-Author: cache maintainers.
+Status: **PHASE 1 SHIPPED, DEFAULT ON** (`vgi_result_cache_pack=true`; single-process pack
+backend + cross-restart read). **Routing is EXCHANGE-only** — a memo packs when its
+`input_hash` is present and it is small; producer entries (few-and-large) always stay in the
+loose store, so their `objects/`/`refs/` diagnostics are unchanged. Cross-process
+*concurrent*-write coordination (phases 3–4) not yet built — a second live process reading a
+shard sees peers' sealed packs on load but not their in-flight appends until a reload, and a
+dead writer's packs are reclaimed only on expiry / `vgi_result_cache_flush()`, not compacted.
+See §7. Author: cache maintainers.
 Supersedes the interim guard `vgi_result_cache_exchange_disk_max_refs` (which bounds file
 count by *evicting* small entries; this replaces the storage model so we don't have to).
 
@@ -52,13 +54,23 @@ directory.** Our `.vrc` files *are* git loose objects; the mature move is to pac
 
 ## 3. Design: a size-tiered disk tier
 
-Route by size, keep two storage backends **coexisting** under the same per-identity shard:
+Route by **kind + size**, keeping two storage backends **coexisting** under the same
+per-identity shard. As shipped, only **exchange** memos pack (see the routing note below):
 
-- **Large entries** (≥ `pack_max_entry_bytes`) — buffered exchange results, producer results.
-  **Unchanged**: loose `objects/<sha>.vrc` + `refs/*.ref`, including the S8 streaming serve
+- **Loose** — producer results (any size) + large exchange entries (≥ `pack_max_entry_bytes`) +
+  buffered exchange results. `objects/<sha>.vrc` + `refs/*.ref`, including the S8 streaming serve
   (positioned per-batch reads for >RAM results). Loose is *ideal* for these — few and large.
-- **Small entries** (< `pack_max_entry_bytes`) — streaming / LATERAL per-chunk memos, and any
-  other small result. **Packed** into append-only pack files + an index, described below.
+- **Packed** — small **exchange** memos (`input_hash` present, `< pack_max_entry_bytes`): the
+  streaming / LATERAL per-chunk memos, the actual many-tiny-files case. Appended into pack files +
+  an index, described below.
+
+**Routing note (as shipped).** The design originally proposed routing purely by *size* (a small
+producer result would also pack — open question #1 below). When flipping the default ON we scoped
+it to **exchange memos only** (`!input_hash.empty()`): the file-explosion problem is specific to
+per-chunk memoization, producer results are few-and-large (loose is ideal + keeps their
+`objects/`/`refs/` diagnostics + the S8 streaming serve), and it kept the producer disk tests
+untouched. Packing small *producer* results is a future option if a high-arg-cardinality workload
+ever needs it.
 
 Per-shard packing preserves the two invariants the loose store already gives us:
 - **Identity security boundary** — a pack never mixes identities (packs live *under* the shard),
@@ -195,7 +207,7 @@ tunable cross-process visibility lag.
 
 | Setting | Default | Meaning |
 |---|--:|---|
-| `vgi_result_cache_pack` | `false` | Master switch for the packed small-entry backend (ship off). |
+| `vgi_result_cache_pack` | `true` | Master switch for the packed small-entry backend (default ON; routes small **exchange** memos). |
 | `vgi_result_cache_pack_max_entry_bytes` | `262144` (256 KB) | Route threshold: entries below this pack; at/above go loose. |
 | `vgi_result_cache_pack_target_bytes` | `67108864` (64 MB) | Roll to a new pack past this size (compaction-unit size). |
 | `vgi_result_cache_pack_compaction_dead_ratio` | `0.5` | Compact an owned pack when this fraction is dead. |
@@ -214,7 +226,14 @@ and can default much higher once packed.
    Reaper (expiry / global byte-cap evict / own-pack compaction over the dead-ratio threshold) runs
    over the in-memory index via `vgi_result_cache_reap()` + the background thread — no directory
    scan for lookups. Cross-**restart** read works (a new process reads prior packs as foreign +
-   compacts only its own). Tests: `test/sql/integration/cache/pack.test`.
+   compacts only its own). **Reap hardening (shipped):** a fully-dead pack is *deleted* (not
+   compacted to an empty pack); the active writer is *sealed* first when it crosses the dead
+   threshold so a never-rolling writer can't pin dead space open; shard state is keyed by
+   **(dir, shard_hash)** so a mid-process `vgi_result_cache_dir` change can't reuse a writer
+   pointing at the old dir. **Default flipped ON**, routing scoped to exchange memos. Tests:
+   `test/sql/integration/cache/pack.test` (structural file-count, cross-serve, routing threshold,
+   expiry reclamation + seal + fresh-writer, byte-cap eviction, flush); concurrent soak (8 threads,
+   tiny pack target forcing rolls, interleaved reap/flush) validated on release + debug.
 2. *(folded into 1)* Reaper on the index.
 3. **Cross-process union read (live)** — refresh peers' pack indexes on a cadence
    (`pack_flush_interval`) so a running process sees another running process's *new* appends without

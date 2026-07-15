@@ -504,6 +504,12 @@ struct VgiResultCache::PackStore {
 		self_id = "p" + ShortTempSuffix();
 	}
 
+	// Shard state is keyed by (dir, shard_hash), NOT shard_hash alone: `vgi_result_cache_dir`
+	// can change mid-process (SET), and two dirs can share an identity shard. Keying by
+	// shard_hash only would reuse an open writer pointing at the OLD dir's file.
+	static std::string ShardKey(const std::string &dir, const std::string &shard_hash) {
+		return dir + "\x1f" + shard_hash;
+	}
 	static std::string VidxOf(const std::string &vpack_basename) {
 		return vpack_basename.substr(0, vpack_basename.size() - 6) + ".vidx"; // strip ".vpack"
 	}
@@ -755,7 +761,7 @@ struct VgiResultCache::PackStore {
 		}
 		const std::string shard_hash = IdentityShard(entry.key.identity_scope);
 		std::lock_guard<std::mutex> lk(mu);
-		ShardState &st = shards[shard_hash];
+		ShardState &st = shards[ShardKey(dir, shard_hash)];
 		try {
 			EnsureLoaded(dir, shard_hash, st);
 			std::string rec = BuildRecord(entry, blob, content_sha, keyfp);
@@ -794,7 +800,7 @@ struct VgiResultCache::PackStore {
 		Loc loc;
 		{
 			std::lock_guard<std::mutex> lk(mu);
-			ShardState &st = shards[shard_hash];
+			ShardState &st = shards[ShardKey(dir, shard_hash)];
 			EnsureLoaded(dir, shard_hash, st);
 			auto it = st.index.find(keyfp);
 			if (it == st.index.end()) {
@@ -846,8 +852,35 @@ struct VgiResultCache::PackStore {
 		}
 	}
 
-	// Rewrite an OWN pack keeping only its still-live records; drop the old file. Caller
-	// holds mu. Returns bytes reclaimed (old size - new size).
+	void RemovePackFiles(const std::string &packs_dir, const std::string &basename) {
+		try {
+			LocalFs().RemoveFile(packs_dir + "/" + basename);
+		} catch (...) {
+		}
+		try {
+			LocalFs().RemoveFile(packs_dir + "/" + VidxOf(basename));
+		} catch (...) {
+		}
+	}
+
+	// Seal the active writer pack (flush its final .vidx, close) so its dead space can be
+	// reclaimed by compaction; the next Persist opens a fresh writer. Caller holds mu.
+	void SealWriter(const std::string &packs_dir, ShardState &st) {
+		if (!st.writer) {
+			return;
+		}
+		try {
+			st.writer->Sync();
+		} catch (...) {
+		}
+		WriteVidx(packs_dir, st.writer_pack, st, st.writer_size);
+		st.writer.reset();
+		st.writer_pack.clear();
+		st.writer_size = 0;
+	}
+
+	// Rewrite an OWN pack keeping only its still-live records; drop the old file. A pack
+	// with NO live records left is deleted outright (no empty replacement). Caller holds mu.
 	void CompactPack(const std::string &packs_dir, const std::string &basename, ShardState &st) {
 		// Gather live locs in this pack.
 		std::vector<std::pair<std::string, Loc>> live;
@@ -857,6 +890,12 @@ struct VgiResultCache::PackStore {
 			}
 		}
 		std::string old_path = packs_dir + "/" + basename;
+		if (live.empty()) {
+			// Fully dead → just delete it (don't spawn an empty pack).
+			st.packs.erase(basename);
+			RemovePackFiles(packs_dir, basename);
+			return;
+		}
 		std::string new_base = self_id + "-" + std::to_string(st.writer_seq++) + ".vpack";
 		std::string new_path = packs_dir + "/" + new_base;
 		try {
@@ -883,15 +922,7 @@ struct VgiResultCache::PackStore {
 		} catch (...) {
 			return; // leave the old pack in place on any failure
 		}
-		// Drop the old pack + its sidecar.
-		try {
-			LocalFs().RemoveFile(old_path);
-		} catch (...) {
-		}
-		try {
-			LocalFs().RemoveFile(packs_dir + "/" + VidxOf(basename));
-		} catch (...) {
-		}
+		RemovePackFiles(packs_dir, basename); // drop the old pack + its sidecar
 	}
 
 	// One reap pass over all shards on disk: expire, byte-cap evict (own), compact
@@ -913,7 +944,7 @@ struct VgiResultCache::PackStore {
 		});
 		// 1. expire (per shard).
 		for (auto &sh : shard_hashes) {
-			ShardState &st = shards[sh];
+			ShardState &st = shards[ShardKey(dir, sh)];
 			EnsureLoaded(dir, sh, st);
 			for (auto it = st.index.begin(); it != st.index.end();) {
 				if (it->second.expires_unix != INT64_MAX && now_unix >= it->second.expires_unix) {
@@ -930,12 +961,12 @@ struct VgiResultCache::PackStore {
 		// the owner compacts. Evict lowest seq first (approx LRU).
 		if (max_bytes > 0) {
 			int64_t total = 0;
-			std::vector<std::pair<uint64_t, std::pair<std::string, std::string>>> by_age; // seq -> (shard,keyfp)
+			std::vector<std::pair<uint64_t, std::pair<std::string, std::string>>> by_age; // seq -> (shardkey,keyfp)
 			for (auto &sh : shard_hashes) {
-				ShardState &st = shards[sh];
+				ShardState &st = shards[ShardKey(dir, sh)];
 				for (auto &kv : st.index) {
 					total += static_cast<int64_t>(kv.second.logical);
-					by_age.push_back({kv.second.seq, {sh, kv.first}});
+					by_age.push_back({kv.second.seq, {ShardKey(dir, sh), kv.first}});
 				}
 			}
 			if (total > static_cast<int64_t>(max_bytes)) {
@@ -955,23 +986,42 @@ struct VgiResultCache::PackStore {
 				}
 			}
 		}
-		// 3. compact OWN packs over the dead-ratio threshold.
+		// 3. reclaim OWN pack disk space: a pack whose live fraction is too low is
+		// compacted (git gc); a pack with NO live records is deleted. The active writer
+		// is sealed first when it is over the threshold so its dead space isn't pinned
+		// open forever (a writer that never rolls would otherwise accumulate dead space).
 		for (auto &sh : shard_hashes) {
-			ShardState &st = shards[sh];
+			ShardState &st = shards[ShardKey(dir, sh)];
 			const std::string packs_dir = dir + "/" + sh + "/packs";
-			// live bytes per pack.
-			std::unordered_map<std::string, uint64_t> live_bytes;
-			for (auto &kv : st.index) {
-				live_bytes[kv.second.pack] += kv.second.rec_len;
+			auto live_of = [&](const std::string &pack) {
+				uint64_t live = 0;
+				for (auto &kv : st.index) {
+					if (kv.second.pack == pack) {
+						live += kv.second.rec_len;
+					}
+				}
+				return live;
+			};
+			auto over_threshold = [&](uint64_t size, uint64_t live) {
+				if (size == 0) {
+					return false;
+				}
+				uint64_t dead = size > live ? size - live : 0;
+				return live == 0 || dead * 100 >= size * dead_pct;
+			};
+			// Seal the writer if it is mostly dead, so it becomes a compactable sealed pack.
+			if (st.writer && !st.writer_pack.empty()) {
+				uint64_t wsize = st.packs.count(st.writer_pack) ? st.packs[st.writer_pack].size : 0;
+				if (over_threshold(wsize, live_of(st.writer_pack))) {
+					SealWriter(packs_dir, st);
+				}
 			}
 			std::vector<std::string> to_compact;
 			for (auto &pk : st.packs) {
-				if (!pk.second.own || pk.first == st.writer_pack || pk.second.size == 0) {
-					continue; // never compact the active writer or foreign packs
+				if (!pk.second.own || pk.first == st.writer_pack) {
+					continue; // never touch the active writer or foreign packs
 				}
-				uint64_t live = live_bytes.count(pk.first) ? live_bytes[pk.first] : 0;
-				uint64_t dead = pk.second.size > live ? pk.second.size - live : 0;
-				if (dead * 100 >= pk.second.size * dead_pct) {
+				if (over_threshold(pk.second.size, live_of(pk.first))) {
 					to_compact.push_back(pk.first);
 				}
 			}
@@ -982,9 +1032,9 @@ struct VgiResultCache::PackStore {
 		return removed;
 	}
 
-	void InvalidateShard(const std::string &shard_hash) {
+	void InvalidateShard(const std::string &dir, const std::string &shard_hash) {
 		std::lock_guard<std::mutex> lk(mu);
-		shards.erase(shard_hash);
+		shards.erase(ShardKey(dir, shard_hash));
 	}
 	void InvalidateAll() {
 		std::lock_guard<std::mutex> lk(mu);
@@ -1256,8 +1306,11 @@ bool VgiResultCache::Insert(std::shared_ptr<VgiResultCacheEntry> entry, bool all
 			disk_max = disk_max_bytes_;
 			disk_codec = disk_compression_;
 			disk_level = disk_compression_level_;
-			// [S9 packed] Route SMALL entries into the packed backend; large stay loose.
-			if (settings_.pack &&
+			// [S9 packed] Route SMALL EXCHANGE memos into the packed backend; producer
+			// entries (empty input_hash) and large entries stay loose. Exchange per-chunk
+			// memos are the many-tiny-files case packing exists to solve; producer results
+			// are few-and-large and the loose store (+ its diagnostics) is ideal for them.
+			if (settings_.pack && !entry->key.input_hash.empty() &&
 			    entry->total_bytes < static_cast<int64_t>(settings_.pack_max_entry_bytes)) {
 				use_pack = true;
 				pack_target = settings_.pack_target_bytes;
@@ -1353,7 +1406,7 @@ size_t VgiResultCache::FlushCatalog(const std::string &catalog_name, const std::
 	if (!disk_dir.empty() && !identity_scope.empty()) {
 		// [S9 packed] Drop this shard's pack index + writer before removing its files.
 		if (auto *ps = PackStoreIfExists()) {
-			ps->InvalidateShard(IdentityShard(identity_scope));
+			ps->InvalidateShard(disk_dir, IdentityShard(identity_scope));
 		}
 		FlushCatalogDisk(identity_scope, disk_dir);
 	}
