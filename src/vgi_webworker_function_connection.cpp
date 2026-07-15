@@ -772,29 +772,25 @@ std::shared_ptr<arrow::RecordBatch> WebWorkerFunctionConnection::ReadDataBatch()
 				continue;
 			}
 		} catch (...) {
-			finish_producer_input();
-			// Drain the output ring to EOS so the worker's serve thread has fully
-			// finished (closed w2c) before this connection releases the slot —
-			// otherwise a subsequent scan could slot_open + reset the rings while the
-			// errored serve thread is still draining, corrupting it.
-			try {
-				while (true) {
-					auto rr = data_reader_->ReadNext();
-					if (!rr.ok() || !rr.ValueUnsafe().batch) {
-						break;
-					}
-				}
-			} catch (...) {
-				// ignore secondary errors while draining post-error
-			}
+			// CRITICAL: do NO blocking / Atomics.wait work on this path. We are inside a
+			// C++ exception unwind, and under DuckDB-WASM the scan can run on the
+			// Asyncify-instrumented worker thread — an Atomics.wait mid-unwind corrupts
+			// the Asyncify coroutine so the query never resumes and the WHOLE engine
+			// deadlocks (a flaky, load-dependent freeze; a non-Atomics throw never does).
+			// So the teardown here is strictly store+notify, never wait:
+			//   - vgi_wasm_slot_write_eos: set c2w_closed + notify. The worker's next c2w
+			//     read returns ring-EOS, so its serve loop ends and it closes w2c itself —
+			//     no client-side drain needed (a drain read CAN Atomics.wait: forbidden).
+			//   - vgi_wasm_slot_release: set state=0 + notify.
+			// We deliberately skip finish_producer_input()/input_writer_->Close() (an Arrow
+			// EOS write that CAN Atomics.wait if the c2w ring is full). Reuse safety for the
+			// freed slot rides the next slot_open's worker-done handshake (unique claim id +
+			// the worker closing w2c before it re-parks), not a drain here. Freeing now (vs
+			// the deferred destructor) avoids "channel exhausted" for a following scan.
 			data_finished_ = true;
-			// Free the slot NOW rather than waiting for the connection destructor:
-			// DuckDB(-wasm) may defer destroying an errored scan's local state well
-			// past the throw, so a parallel scan that follows would otherwise see this
-			// slot still claimed and fail "channel exhausted". The w2c drain above has
-			// already consumed the worker's output to EOS. Idempotent; the destructor's
-			// release then no-ops (slot_ < 0).
+			input_writer_closed_ = true; // abandon the Arrow writer; ring EOS below drives teardown
 			if (slot_ >= 0) {
+				vgi_wasm_slot_write_eos(slot_);
 				vgi_wasm_slot_release(slot_);
 				slot_ = -1;
 			}

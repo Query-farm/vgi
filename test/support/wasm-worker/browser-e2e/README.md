@@ -61,9 +61,14 @@ a narrowly-scoped, flaky DuckDB-WASM-side error-propagation race, characterized 
   ATTACH + a concurrent 4-connection case (see `probe-vgi-boom.mjs`).
 - A generic (non-VGI) parallel throw propagates fine under `threads=4` too (see `probe-throw.mjs`).
 - **Only** under the *full* suite's concurrency/timing does a worker throw under `threads>1`
-  *occasionally* (≈2/3 of fresh loads) leave the async query promise unsettled. Root: a DuckDB-WASM
-  Asyncify + pthread + C++-exception propagation race, exercised by the error path — orthogonal to
-  the transport (which did its job). Fixing it means DuckDB-WASM-internals work, not transport work.
+  *occasionally* (≈2/3 of fresh loads) hang. When it does, the diagnostics show the **entire engine
+  is frozen**: a trivial `SELECT 42` on a *fresh* connection also times out, so DuckDB-WASM's worker
+  thread is deadlocked **inside** the boom query's C++ call and never returns to settle the promise —
+  after the transport already tore down cleanly. It is a DuckDB-WASM parallel-error-handling deadlock,
+  exercised by (not caused by) the error path. **Confirmed not the transport:** making the transport's
+  error path fully non-blocking (no `Atomics.wait` during the C++ exception unwind) did **not** fix it,
+  and it does not reproduce in the focused `probe-vgi-boom.mjs` (same prefix + boom in isolation).
+  Fixing it is DuckDB-WASM-internals work, not transport work.
 
 `threads=1` makes the error path deterministic. Everything else — including the parallel-serve proof
 (case 7, `maxConcurrency=4`) and all the happy-path streaming/catalog/concurrent cases — runs green

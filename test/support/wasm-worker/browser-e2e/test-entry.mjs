@@ -76,13 +76,15 @@ window.__result = {};
 
     // 5. worker produce error must surface as a thrown query error (not a hang/empty),
     // AND a scan after it must still work (proves the errored slot frees). Runs under
-    // threads=1. The SAB transport tears down cleanly on the error under threads=4 too
-    // (verified: all slots freed, rings closed, worker idle — and boom throws fine under
-    // threads=4 in isolation, incl. after ATTACH + concurrent). But under the FULL suite's
-    // load, a worker throw under threads>1 *occasionally* leaves the async query promise
-    // unsettled — a flaky DuckDB-WASM-side error-propagation race (Asyncify + pthread +
-    // C++ exception), NOT a transport bug (a generic parallel throw also settles fine).
-    // threads=1 makes the error path deterministic. See README "Known limitation".
+    // threads=1. The SAB transport does the RIGHT thing under threads=4 too — it delivers
+    // the error and tears down cleanly (all slots freed, rings closed, worker idle;
+    // verified) — but under the FULL suite's heavy load a worker throw under threads>1
+    // *occasionally* (~2/3) DEADLOCKS DuckDB-WASM: the engine's worker thread stays blocked
+    // INSIDE the query C++ call (a `SELECT 42` on a fresh connection also hangs), so the
+    // promise never settles. This is a DuckDB-WASM parallel-error-handling deadlock, NOT a
+    // transport bug — making the transport error path fully non-blocking did NOT fix it,
+    // and a generic (non-VGI) parallel throw settles fine. threads=1 makes it deterministic.
+    // See README "Known limitation" + the probe-*.mjs isolation harness.
     await conn.query('SET threads=1');
     R.errorOk = false;
     try {
