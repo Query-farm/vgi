@@ -1,11 +1,10 @@
 # Input Dedup + Per-Value Memoization for Exchange-Mode Maps — Design
 
-Status: **SHIPPING (phases 1–4 landed for the cache-infra operators).** Scalar + LATERAL
-input dedup (phases 1–2), per-value memo + M1/M2 coexistence gate for the batched LATERAL
-operator (phases 3–4). Deferred with justification: streaming dedup (§10), and **scalar
-per-value** — scalars have no result-cache infrastructure today (they were dedup-only in
-phase 1), so per-value there means building scalar result-caching from scratch; the mechanism
-is proven on LATERAL and scalar per-value is a clean follow-on. Author: cache maintainers.
+Status: **SHIPPED (phases 1–4).** Scalar + LATERAL input dedup (phases 1–2); per-value memo
+for **both scalar and LATERAL** + M1/M2 coexistence gate (phases 3–4). Scalar per-value required
+building scalar result-caching (the `CACHE_CONTROL` opt-in on `ScalarFunction`, riding the emit
+path's batch custom_metadata) — done. Only **streaming (classic TABLE-input) dedup** remains
+deferred, with justification (§10). Author: cache maintainers.
 Unifies the per-input caching story across the **map-shaped** exchange operators (scalar,
 streaming table-in-out, batched correlated LATERAL) and reframes the existing per-batch/per-chunk
 result caches (M1/M2) as a coarse outer layer over a finer **per-value** one. Buffered (M3, a
@@ -192,12 +191,15 @@ rides the existing disk-tier opt-in (needs a cache dir to reach disk, memory-onl
 2. **LATERAL + streaming dedup** — the 1:N inverse-map expansion in `PhysicalVgiLateralBatch` (the
    stamp-per-original-row crux) and the streaming table-in-out map. Regression: shared-arg /
    different-outer-column fixture; result-equivalence vs `SET vgi_exchange_input_dedup=false`.
-3. **Per-value memo** — ✅ **LATERAL** (`LookupBatch` + the per-tuple key/`v:` discriminator; a
-   full-hit distinct set assembles the cached per-tuple outputs via `ConcatenateRecordBatches` +
-   synthetic parent and serves without the worker; a miss stores each distinct tuple's output
-   sliced by `parent_row`). v1 skips the worker only on a **full** hit (partial-hit still ships the
-   whole deduped set — the reassemble-only-misses optimization is deferred). **Scalar per-value
-   deferred** (needs scalar result-caching, which doesn't exist). Both transports.
+3. **Per-value memo** — ✅ **LATERAL and scalar** (`LookupBatch` + the per-tuple key/`v:`
+   discriminator; a full-hit distinct set assembles the cached per-tuple outputs via
+   `ConcatenateRecordBatches` and serves without the worker; a miss stores each distinct tuple's
+   output — sliced by `parent_row` for LATERAL, a 1-row slice for the scalar). v1 skips the worker
+   only on a **full** hit (partial-hit still ships the whole deduped set — the reassemble-only-misses
+   optimization is deferred). **Scalar** required the result-caching prerequisite: a `CACHE_CONTROL`
+   opt-in on `ScalarFunction` (vgi-python) riding the emit path's batch custom_metadata, and a
+   field-based `BuildExchangeCacheKeyStaticFields` the scalar shares with the table-in-out key
+   builder. Both transports.
 4. **Coexistence + gate** — ✅ M2 layering (per-chunk hit short-circuits; on a miss, dedup + per-value
    run under it) + the store-then-hit-safe distinct-ratio store gate
    (`vgi_exchange_per_batch_min_distinct_ratio`). **Dedup is the master switch for both** (per-value

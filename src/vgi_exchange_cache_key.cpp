@@ -221,9 +221,14 @@ void SyncResultCacheSettings(ClientContext &context) {
 	VgiResultCache::Instance().ConfigureIfChanged(s);
 }
 
-bool BuildExchangeCacheKeyStatic(ClientContext &context, const VgiTableInOutBindData &bd,
-                                 const std::vector<int32_t> &projection_ids, VgiResultCacheKey &key,
-                                 std::string &catalog_name, int64_t &catalog_version, const char *&reason) {
+bool BuildExchangeCacheKeyStaticFields(ClientContext &context,
+                                       const std::shared_ptr<VgiAttachParameters> &attach_params,
+                                       const std::string &function_name,
+                                       const std::string &canonical_arguments,
+                                       const std::map<std::string, Value> &settings,
+                                       const std::vector<int32_t> &projection_ids, VgiResultCacheKey &key,
+                                       std::string &catalog_name, int64_t &catalog_version,
+                                       const char *&reason) {
 	reason = nullptr;
 	catalog_version = 0;
 
@@ -237,7 +242,7 @@ bool BuildExchangeCacheKeyStatic(ClientContext &context, const VgiTableInOutBind
 		return false;
 	}
 	// Per-catalog opt-out.
-	if (!bd.attach_params || !bd.attach_params->cache()) {
+	if (!attach_params || !attach_params->cache()) {
 		reason = "disabled_attach";
 		return false;
 	}
@@ -247,7 +252,7 @@ bool BuildExchangeCacheKeyStatic(ClientContext &context, const VgiTableInOutBind
 	// or vgi_clear_cache() invalidates). A catalog-less call falls back to worker-path
 	// identity, TTL-only (version stays 0 = "no version dimension").
 	std::string identity_scope;
-	const std::string &cat = bd.attach_params->catalog_name();
+	const std::string &cat = attach_params->catalog_name();
 	if (!cat.empty()) {
 		auto catalog = Catalog::GetCatalogEntry(context, cat);
 		if (catalog && catalog->GetCatalogType() == "vgi") {
@@ -259,7 +264,7 @@ bool BuildExchangeCacheKeyStatic(ClientContext &context, const VgiTableInOutBind
 			}
 			// SECURITY-CRITICAL: fold the caller's auth principal into identity_scope
 			// so two identities never share a cache entry. "" → fail closed.
-			identity_scope = BuildCatalogIdentityScope(cat, bd.attach_params->auth());
+			identity_scope = BuildCatalogIdentityScope(cat, attach_params->auth());
 			if (identity_scope.empty()) {
 				reason = "identity_unresolved";
 				return false;
@@ -268,29 +273,38 @@ bool BuildExchangeCacheKeyStatic(ClientContext &context, const VgiTableInOutBind
 		}
 	}
 	if (identity_scope.empty()) {
-		std::string principal = ComputeCatalogIdentityFingerprint(bd.attach_params->auth());
+		std::string principal = ComputeCatalogIdentityFingerprint(attach_params->auth());
 		if (principal.empty()) {
 			reason = "identity_unresolved";
 			return false;
 		}
-		identity_scope = "worker:" + bd.worker_path() + "\x1f" + principal;
-		catalog_name = bd.worker_path();
+		identity_scope = "worker:" + attach_params->worker_path() + "\x1f" + principal;
+		catalog_name = attach_params->worker_path();
 	}
 
 	key.identity_scope = identity_scope;
-	key.worker_path = bd.worker_path();
-	key.function_name = bd.function_name;
-	key.canonical_arguments = bd.arguments.array ? bd.arguments.array->ToString() : "";
-	key.canonical_settings = SerializeSettingsForKey(bd.settings);
-	key.attach_options = bd.attach_params->attach_options_canonical();
+	key.worker_path = attach_params->worker_path();
+	key.function_name = function_name;
+	key.canonical_arguments = canonical_arguments;
+	key.canonical_settings = SerializeSettingsForKey(settings);
+	key.attach_options = attach_params->attach_options_canonical();
 	key.projection = SerializeProjectionForKey(projection_ids);
-	key.attached_data_version = bd.attach_params->data_version_spec();
-	key.implementation_version = bd.attach_params->implementation_version();
+	key.attached_data_version = attach_params->data_version_spec();
+	key.implementation_version = attach_params->implementation_version();
 	key.catalog_version = catalog_version;
 	// Producer-only dimensions stay empty for exchange-mode: at_unit/at_value,
 	// filter_bytes, order_by_hint, sample_hint, transaction_id. input_hash is set by
 	// the caller per memoization event.
 	return true;
+}
+
+bool BuildExchangeCacheKeyStatic(ClientContext &context, const VgiTableInOutBindData &bd,
+                                 const std::vector<int32_t> &projection_ids, VgiResultCacheKey &key,
+                                 std::string &catalog_name, int64_t &catalog_version, const char *&reason) {
+	return BuildExchangeCacheKeyStaticFields(context, bd.attach_params, bd.function_name,
+	                                         bd.arguments.array ? bd.arguments.array->ToString() : "",
+	                                         bd.settings, projection_ids, key, catalog_name, catalog_version,
+	                                         reason);
 }
 
 // ----------------------------------------------------------------------------

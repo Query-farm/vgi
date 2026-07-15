@@ -1,0 +1,129 @@
+# name: test/sql/integration/scalar/per_value.test
+# description: Per-VALUE memoization for scalar functions (dedup+per-value phase 3, scalar).
+#   A cacheable scalar (advertises vgi.cache.*) has its output memoized per distinct input
+#   value: after dedup ships the distinct set, a later chunk over the same distinct values is
+#   served from the per-value tier WITHOUT the worker (zero scalar.write_input). Scalars have
+#   no per-chunk (M2) cache, so per-value is the whole cache. See docs/exchange_dedup_pervalue.md.
+# group: [vgi_integration_scalar]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+SET threads=1;
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+# ---------------------------------------------------------------------------
+# Cold: 9 rows over distinct values {0,1,2} → dedup ships 3, each memoized per-value.
+# ---------------------------------------------------------------------------
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# sum of doubled distinct values: (0+2+4) each appears 3× over range(9) → 18.
+query I
+SELECT sum(ex.cached_double_scalar(x % 3))::BIGINT FROM range(9) t(x);
+----
+18
+
+# Dedup: the worker saw only the 3 DISTINCT values.
+query I
+SELECT max(CAST(regexp_extract(message, 'input_rows=([0-9]+)', 1) AS BIGINT))
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'scalar.write_input'
+  AND message LIKE '%cached_double_scalar%';
+----
+3
+
+# ---------------------------------------------------------------------------
+# A different chunk (6 rows) over the SAME distinct values {0,1,2}: served from the
+# per-value tier, worker NOT exchanged with.
+# ---------------------------------------------------------------------------
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT sum(ex.cached_double_scalar(x % 3))::BIGINT FROM range(6) t(x);
+----
+12
+
+# Proof of per-value hit: ZERO scalar.write_input.
+query I
+SELECT count(*)
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'scalar.write_input'
+  AND message LIKE '%cached_double_scalar%';
+----
+0
+
+# ... and the hit was logged at the per_value tier.
+query I
+SELECT count(*) > 0
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'result_cache.hit'
+  AND message LIKE '%per_value%';
+----
+true
+
+query I
+SELECT exchange_hits > 0 FROM vgi_result_cache_stats();
+----
+true
+
+statement ok
+CALL disable_logging();
+
+# ---------------------------------------------------------------------------
+# Per-value disabled: the same second chunk now exchanges with the worker again.
+# ---------------------------------------------------------------------------
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+statement ok
+SET vgi_result_cache_per_value = false;
+
+statement ok
+SELECT sum(ex.cached_double_scalar(x % 3)) FROM range(9) t(x);
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+SELECT sum(ex.cached_double_scalar(x % 3)) FROM range(6) t(x);
+
+query I
+SELECT count(*) > 0
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'scalar.write_input'
+  AND message LIKE '%cached_double_scalar%';
+----
+true
+
+statement ok
+CALL disable_logging();
+
+statement ok
+RESET vgi_result_cache_per_value;
+
+statement ok
+DETACH ex;

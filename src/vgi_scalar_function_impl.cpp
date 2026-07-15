@@ -3,10 +3,12 @@
 #include "storage/vgi_transaction.hpp"
 #include "vgi_arrow_utils.hpp"
 #include "vgi_client_timing.hpp"
+#include "vgi_exchange_cache_key.hpp" // per-value memo: static key + per-tuple hash + store
 #include "vgi_function_connection.hpp"
 #include "vgi_ifunction_connection.hpp"
 #include "vgi_input_dedup.hpp" // input dedup (ship only distinct tuples; scatter back)
 #include "vgi_logging.hpp"
+#include "vgi_result_cache.hpp" // VgiResultCache singleton (per-value memo)
 #include "vgi_transport.hpp"
 #include "vgi_worker_pool.hpp"
 
@@ -20,6 +22,7 @@
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 
 #include <arrow/c/bridge.h>
+#include <arrow/record_batch.h> // arrow::ConcatenateRecordBatches (per-value full-hit assembly)
 
 namespace duckdb {
 
@@ -522,6 +525,60 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 	}
 	const bool deduped = (ship != to_serialize);
 
+	// [per-value] Build the static cache key once (identity + worker + fn + const args +
+	// settings + versions), then memoize the scalar output per DISTINCT input tuple: a
+	// fully-warm distinct set serves without the worker (cross-chunk / cross-query /
+	// cross-restart value reuse). Gated by the dedup master switch (per-value needs the
+	// distinct set), the master cache switch + per-catalog opt-out (via the key builder),
+	// the worker's vgi.cache.* opt-in (checked on store), and non-volatility. `ship` is the
+	// distinct set (dd.k rows) whenever dedup ran.
+	if (!local_state.cache_key_built && bind_data) {
+		local_state.cache_key_built = true;
+		std::string canon_args; // canonical const-arg serialization (stable per bind)
+		for (auto &cv : bind_data->const_values) {
+			canon_args += cv.ToString();
+			canon_args += '\x1f';
+		}
+		const char *reason = nullptr;
+		int64_t cver = 0;
+		if (BuildExchangeCacheKeyStaticFields(context, bind_data->attach_params, bind_data->function_name,
+		                                      canon_args, bind_data->settings, {}, local_state.cache_static_key,
+		                                      local_state.cache_catalog_name, cver, reason)) {
+			local_state.cache_eligible = true;
+			Value ttl_v;
+			if (context.TryGetCurrentSetting("vgi_result_cache_default_ttl_seconds", ttl_v) && !ttl_v.IsNull()) {
+				local_state.cache_default_ttl_seconds = static_cast<int64_t>(ttl_v.GetValue<uint64_t>());
+			}
+		}
+	}
+	bool pv_setting = true;
+	{
+		Value pvv;
+		if (context.TryGetCurrentSetting("vgi_result_cache_per_value", pvv) && !pvv.IsNull()) {
+			pv_setting = pvv.GetValue<bool>();
+		}
+	}
+	const bool pv_enabled = pv_setting && dedup_enabled && !is_volatile && local_state.cache_eligible;
+	std::vector<VgiResultCacheKey> pv_keys;
+	std::vector<std::shared_ptr<const VgiResultCacheEntry>> pv_hits;
+	bool full_pv_hit = false;
+	if (pv_enabled) {
+		auto pv_hashes = HashInputRowsPerValue(context, *ship);
+		pv_keys.resize(ship->size());
+		for (idx_t d = 0; d < ship->size(); d++) {
+			pv_keys[d] = local_state.cache_static_key;
+			pv_keys[d].input_hash = pv_hashes[d];
+		}
+		pv_hits = VgiResultCache::Instance().LookupBatch(pv_keys, std::chrono::steady_clock::now());
+		full_pv_hit = ship->size() > 0;
+		for (auto &h : pv_hits) {
+			if (!h) {
+				full_pv_hit = false;
+				break;
+			}
+		}
+	}
+
 	// Build input-side conversion cache on the first batch. The cached
 	// types/names/extension_types/client_props are stable for the lifetime
 	// of this scalar's bind — input column count and types do not change
@@ -544,53 +601,100 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 	}
 
 	const bool timing = ClientTiming::Enabled();
-	std::shared_ptr<arrow::RecordBatch> input_batch;
-	if (timing) {
-		ScopedNs _t(ClientTiming::Instance().convert_in_ns);
-		input_batch = DataChunkToArrowCached(
-		    context, *ship, local_state.input_schema,
-		    local_state.input_arrow_types, local_state.input_arrow_names,
-		    *local_state.input_client_props, local_state.input_extension_types);
-	} else {
-		input_batch = DataChunkToArrowCached(
-		    context, *ship, local_state.input_schema,
-		    local_state.input_arrow_types, local_state.input_arrow_names,
-		    *local_state.input_client_props, local_state.input_extension_types);
-	}
-
-	VGI_LOG(context, "scalar.write_input",
-	        {{"conn", local_state.connection->GetConnIdHex()},
-	         {"function_name", func_info.function_name},
-	         {"input_rows", std::to_string(input_batch->num_rows())}});
-
-	// Write input and read output
 	std::shared_ptr<arrow::RecordBatch> output_batch;
-	if (timing) {
-		{
-			ScopedNs _t(ClientTiming::Instance().write_ns);
-			local_state.connection->WriteInputBatch(input_batch);
+
+	if (full_pv_hit) {
+		// Every distinct input tuple is memoized → assemble the K cached 1-row outputs and
+		// serve WITHOUT the worker (result_cache.hit tier=per_value).
+		std::vector<std::shared_ptr<arrow::RecordBatch>> parts;
+		int64_t served_bytes = 0;
+		for (auto &h : pv_hits) {
+			served_bytes += h->total_bytes;
+			for (auto &cb : h->streams[0].batches) {
+				parts.push_back(DeserializeCachedRecordBatch(*h, cb));
+			}
 		}
-		ScopedNs _t(ClientTiming::Instance().read_ns);
-		output_batch = local_state.connection->ReadDataBatch();
+		auto cat = arrow::ConcatenateRecordBatches(parts);
+		if (!cat.ok()) {
+			throw IOException("VGI scalar '%s' per-value assembly failed: %s", func_info.function_name,
+			                  cat.status().ToString());
+		}
+		output_batch = cat.ValueUnsafe();
+		VgiResultCache::Instance().RecordExchangeHit(served_bytes);
+		VGI_LOG(context, "result_cache.hit",
+		        {{"function", func_info.function_name},
+		         {"key_hash", local_state.cache_static_key.HexDigest()},
+		         {"tier", "per_value"}});
 	} else {
-		local_state.connection->WriteInputBatch(input_batch);
-		output_batch = local_state.connection->ReadDataBatch();
-	}
+		std::shared_ptr<arrow::RecordBatch> input_batch;
+		if (timing) {
+			ScopedNs _t(ClientTiming::Instance().convert_in_ns);
+			input_batch = DataChunkToArrowCached(context, *ship, local_state.input_schema,
+			                                     local_state.input_arrow_types, local_state.input_arrow_names,
+			                                     *local_state.input_client_props,
+			                                     local_state.input_extension_types);
+		} else {
+			input_batch = DataChunkToArrowCached(context, *ship, local_state.input_schema,
+			                                     local_state.input_arrow_types, local_state.input_arrow_names,
+			                                     *local_state.input_client_props,
+			                                     local_state.input_extension_types);
+		}
 
-	if (!output_batch) {
-		throw IOException("VGI scalar function '%s' returned no output for %d input rows", func_info.function_name,
-		                  args.size());
-	}
+		VGI_LOG(context, "scalar.write_input",
+		        {{"conn", local_state.connection->GetConnIdHex()},
+		         {"function_name", func_info.function_name},
+		         {"input_rows", std::to_string(input_batch->num_rows())}});
 
-	if (static_cast<idx_t>(output_batch->num_rows()) != ship->size()) {
-		throw IOException("VGI scalar function '%s' returned %d rows but expected %d (1:1 mapping required)",
-		                  func_info.function_name, output_batch->num_rows(),
-		                  static_cast<int64_t>(ship->size()));
-	}
+		if (timing) {
+			{
+				ScopedNs _t(ClientTiming::Instance().write_ns);
+				local_state.connection->WriteInputBatch(input_batch);
+			}
+			ScopedNs _t(ClientTiming::Instance().read_ns);
+			output_batch = local_state.connection->ReadDataBatch();
+		} else {
+			local_state.connection->WriteInputBatch(input_batch);
+			output_batch = local_state.connection->ReadDataBatch();
+		}
 
-	if (output_batch->num_columns() != 1) {
-		throw IOException("VGI scalar function '%s' returned %d columns but expected 1", func_info.function_name,
-		                  output_batch->num_columns());
+		if (!output_batch) {
+			throw IOException("VGI scalar function '%s' returned no output for %d input rows",
+			                  func_info.function_name, args.size());
+		}
+		if (static_cast<idx_t>(output_batch->num_rows()) != ship->size()) {
+			throw IOException("VGI scalar function '%s' returned %d rows but expected %d (1:1 mapping required)",
+			                  func_info.function_name, output_batch->num_rows(),
+			                  static_cast<int64_t>(ship->size()));
+		}
+		if (output_batch->num_columns() != 1) {
+			throw IOException("VGI scalar function '%s' returned %d columns but expected 1",
+			                  func_info.function_name, output_batch->num_columns());
+		}
+
+		// [per-value store] Memoize each MISSED distinct tuple's 1-row output, if the worker
+		// opted into caching. A future chunk sharing that value serves without the worker.
+		if (pv_enabled) {
+			VgiResultCache::Instance().RecordExchangeMiss();
+			// A scalar advertises vgi.cache.* on its output batch custom_metadata (via the
+			// emit path — see ScalarExchangeState.exchange in vgi-python), latched by the
+			// connection like the table-in-out path.
+			auto cc = local_state.connection->GetLastCacheControl();
+			if (cc.Cacheable()) {
+				for (idx_t d = 0; d < ship->size(); d++) {
+					if (pv_hits[d]) {
+						continue;
+					}
+					auto rd = output_batch->Slice(static_cast<int64_t>(d), 1);
+					auto sr = StoreExchangeMemoEntry(pv_keys[d], cc, local_state.cache_catalog_name,
+					                                 local_state.cache_default_ttl_seconds,
+					                                 std::vector<std::shared_ptr<arrow::RecordBatch>>{rd},
+					                                 /*allow_disk=*/true);
+					if (sr.stored) {
+						VgiResultCache::Instance().RecordExchangeStore();
+					}
+				}
+			}
+		}
 	}
 
 	VGI_LOG(context, "scalar.read_output",

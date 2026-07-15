@@ -16,6 +16,7 @@
 #include "duckdb/main/client_properties.hpp" // ClientProperties
 
 #include "vgi_catalog_metadata.hpp"
+#include "vgi_result_cache.hpp" // VgiResultCacheKey (per-value memo)
 
 namespace duckdb {
 
@@ -166,6 +167,15 @@ struct VgiScalarFunctionLocalState : public FunctionLocalState {
 	unordered_map<idx_t, const shared_ptr<ArrowTypeExtensionData>> input_extension_types;
 	std::optional<ClientProperties> input_client_props;
 	bool input_convert_cached = false;
+
+	// Per-value memoization: the static cache key (identity + worker + fn + const args +
+	// settings + versions) built once on the first batch; per-value keys derive from it by
+	// setting input_hash per distinct input tuple. cache_eligible gates the whole tier.
+	bool cache_key_built = false;
+	bool cache_eligible = false;
+	vgi::VgiResultCacheKey cache_static_key;
+	std::string cache_catalog_name;
+	int64_t cache_default_ttl_seconds = 0;
 };
 
 // ============================================================================

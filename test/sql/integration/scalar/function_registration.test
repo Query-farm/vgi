@@ -25,7 +25,7 @@ SELECT COUNT(*)
 FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'scalar';
 ----
-42
+43
 
 query T
 SELECT function_name
@@ -38,6 +38,7 @@ any_mixed
 any_mixed
 bernoulli
 binary_packet
+cached_double_scalar
 concat_values
 concat_values
 conditional_message
@@ -385,7 +386,7 @@ SELECT COUNT(*)
 FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'scalar' AND varargs IS NULL;
 ----
-36
+37
 
 # ============================================================================
 # Stability
@@ -409,7 +410,7 @@ SELECT COUNT(*)
 FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'scalar' AND stability = 'CONSISTENT';
 ----
-39
+40
 
 query T
 SELECT function_name

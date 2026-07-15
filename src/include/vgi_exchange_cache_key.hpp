@@ -25,6 +25,7 @@ struct VgiResultCacheEntry;    // vgi_result_cache.hpp
 struct VgiCachedBatch;         // vgi_result_cache.hpp
 struct VgiCacheControl;        // vgi_cache_control.hpp
 struct VgiTableInOutBindData;  // vgi_table_in_out_impl.hpp
+struct VgiAttachParameters;    // vgi_attach_parameters.hpp
 
 // ============================================================================
 // Canonical key-component serializers (shared with the producer path)
@@ -92,6 +93,18 @@ void SyncResultCacheSettings(ClientContext &context);
 bool BuildExchangeCacheKeyStatic(ClientContext &context, const VgiTableInOutBindData &bd,
                                  const std::vector<int32_t> &projection_ids, VgiResultCacheKey &key,
                                  std::string &catalog_name, int64_t &catalog_version, const char *&reason);
+
+//! Field-based core of the above — decoupled from any bind-data struct so the SCALAR
+//! path (which has its own bind data) shares the exact eligibility + key-shape logic.
+//! `canonical_arguments` is the caller's canonical const-arg serialization.
+bool BuildExchangeCacheKeyStaticFields(ClientContext &context,
+                                       const std::shared_ptr<VgiAttachParameters> &attach_params,
+                                       const std::string &function_name,
+                                       const std::string &canonical_arguments,
+                                       const std::map<std::string, Value> &settings,
+                                       const std::vector<int32_t> &projection_ids, VgiResultCacheKey &key,
+                                       std::string &catalog_name, int64_t &catalog_version,
+                                       const char *&reason);
 
 // ============================================================================
 // Per-unit memoization serve/store (shared by the streaming table-in-out and
