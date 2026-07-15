@@ -5,6 +5,7 @@
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 
+#include "vgi_exchange_cache_key.hpp" // SyncResultCacheSettings (honor SET before reap)
 #include "vgi_function_docs.hpp"
 
 namespace duckdb {
@@ -75,11 +76,15 @@ static unique_ptr<FunctionData> VgiResultCacheReapBind(ClientContext &, TableFun
 	return data;
 }
 
-static void VgiResultCacheReapScan(ClientContext &, TableFunctionInput &data_p, DataChunk &output) {
+static void VgiResultCacheReapScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
 	auto &data = data_p.bind_data->CastNoConst<VgiResultCacheReapData>();
 	if (data.finished) {
 		return;
 	}
+	// Honor a bare `SET vgi_result_cache_*` issued before the reap (disk dir/caps, the
+	// exchange ref-count cap): push the current settings into the singleton so ReapNow
+	// sees them — otherwise settings only reach the singleton when a scan runs.
+	SyncResultCacheSettings(context);
 	auto stats = VgiResultCache::Instance().ReapNow(data.advance_seconds);
 	output.SetValue(0, 0, Value::BIGINT(static_cast<int64_t>(stats.memory_reaped)));
 	output.SetValue(1, 0, Value::BIGINT(static_cast<int64_t>(stats.disk_refs_removed)));

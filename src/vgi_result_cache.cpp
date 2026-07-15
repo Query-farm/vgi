@@ -249,6 +249,12 @@ void WriteRef(const std::string &refs_dir, const std::string &fp, const std::str
 	ref += "catalog=" + meta.catalog_name + "\n";
 	ref += "function=" + meta.key.function_name + "\n"; // for the vgi_result_cache_disk() diagnostic
 	ref += "codec=" + codec + "\n";                     // diagnostic only; batches self-describe
+	// [S9] Mark EXCHANGE entries (input-keyed: input_hash present) so the reaper's
+	// ref-count cap evicts only these — a per-chunk memo flood never evicts a large
+	// producer entry.
+	if (!meta.key.input_hash.empty()) {
+		ref += "exch=1\n";
+	}
 	WriteFileAtomic(refs_dir, refs_dir + "/" + fp + ".ref", ref, ShortTempSuffix());
 }
 
@@ -456,7 +462,7 @@ uint64_t SettingsSignature(const VgiResultCache::Settings &s) {
 	HashCombine(seed, s.disk_max_bytes);
 	HashCombine(seed, s.disk_reap_interval_seconds);
 	HashCombine(seed, s.disk_compression_level);
-	HashCombine(seed, s.exchange_disk_min_bytes);
+	HashCombine(seed, s.exchange_disk_max_refs);
 	HashStr(seed, s.disk_dir);
 	HashStr(seed, s.disk_compression);
 	return seed;
@@ -470,8 +476,6 @@ void VgiResultCache::Configure(const Settings &settings) {
 	disk_max_bytes_ = settings.disk_max_bytes;
 	disk_compression_ = settings.disk_compression;
 	disk_compression_level_ = settings.disk_compression_level;
-	exchange_disk_min_bytes_.store(static_cast<int64_t>(settings.exchange_disk_min_bytes),
-	                               std::memory_order_relaxed);
 	// Shrinking the cap mid-flight is honored on the next Insert / reap tick;
 	// evict now so a lowered cap takes effect immediately.
 	EvictToFitLocked(0);
@@ -511,10 +515,6 @@ void VgiResultCache::ReleaseInflightCapture(int64_t bytes) {
 	if (bytes > 0) {
 		inflight_capture_bytes_.fetch_sub(bytes, std::memory_order_relaxed);
 	}
-}
-
-int64_t VgiResultCache::ExchangeDiskMinBytes() const {
-	return exchange_disk_min_bytes_.load(std::memory_order_relaxed);
 }
 
 std::shared_ptr<const VgiResultCacheEntry>
@@ -714,6 +714,7 @@ VgiResultCache::ReapStats VgiResultCache::ReapNow(int64_t advance_seconds) {
 	ReapStats stats;
 	std::string disk_dir; // snapshot of disk config, taken under the lock
 	uint64_t disk_max = 0;
+	uint64_t disk_max_refs = 0;
 	{
 		std::lock_guard<std::mutex> lock(mutex_);
 		// Simulate `advance_seconds` of elapsed time for the memory tier
@@ -725,13 +726,14 @@ VgiResultCache::ReapStats VgiResultCache::ReapNow(int64_t advance_seconds) {
 		if (DiskEnabledLocked()) {
 			disk_dir = disk_dir_;
 			disk_max = disk_max_bytes_;
+			disk_max_refs = settings_.exchange_disk_max_refs;
 		}
 	}
 	// Disk tier (wall-clock): inject `now + advance` as now_unix so expired refs
 	// and past-grace orphans are reaped without waiting real time.
 	if (!disk_dir.empty()) {
-		stats.disk_refs_removed =
-		    ReapDisk(disk_dir, disk_max, static_cast<int64_t>(std::time(nullptr)) + advance_seconds);
+		stats.disk_refs_removed = ReapDisk(disk_dir, disk_max, disk_max_refs,
+		                                   static_cast<int64_t>(std::time(nullptr)) + advance_seconds);
 	}
 	return stats;
 }
@@ -914,6 +916,7 @@ void VgiResultCache::CleanupThread() {
 		// and bounded by the entry-count cap [S5].
 		std::string disk_dir; // snapshot of disk config, taken under the lock
 		uint64_t disk_max = 0;
+		uint64_t disk_max_refs = 0;
 		int64_t disk_interval = 60;
 		{
 			std::lock_guard<std::mutex> lock(mutex_);
@@ -922,6 +925,7 @@ void VgiResultCache::CleanupThread() {
 			if (DiskEnabledLocked()) {
 				disk_dir = disk_dir_;
 				disk_max = disk_max_bytes_;
+				disk_max_refs = settings_.exchange_disk_max_refs;
 			}
 		}
 		// [S7] Disk reap is O(total refs) I/O per pass (it reads every ref +
@@ -931,7 +935,7 @@ void VgiResultCache::CleanupThread() {
 		seconds_since_disk_reap += 1;
 		if (!disk_dir.empty() && seconds_since_disk_reap >= std::max<int64_t>(1, disk_interval)) {
 			seconds_since_disk_reap = 0;
-			ReapDisk(disk_dir, disk_max, static_cast<int64_t>(std::time(nullptr)));
+			ReapDisk(disk_dir, disk_max, disk_max_refs, static_cast<int64_t>(std::time(nullptr)));
 		}
 	}
 }
@@ -1438,7 +1442,8 @@ void VgiResultCache::FlushCatalogDisk(const std::string &identity_scope, const s
 	}
 }
 
-size_t VgiResultCache::ReapDisk(const std::string &dir, uint64_t max_bytes, int64_t now_unix) {
+size_t VgiResultCache::ReapDisk(const std::string &dir, uint64_t max_bytes, uint64_t max_refs,
+                               int64_t now_unix) {
 	size_t removed = 0;
 	if (dir.empty() || max_bytes == 0) {
 		return removed;
@@ -1476,6 +1481,7 @@ size_t VgiResultCache::ReapDisk(const std::string &dir, uint64_t max_bytes, int6
 			std::string content;
 			int64_t mtime;
 			int64_t bytes;
+			bool exchange; // [S9] input-keyed memo (exch=1) — subject to the ref-count cap
 		};
 		std::vector<RefInfo> live_refs;
 		std::map<std::string, std::set<std::string>> live_objects; // shard -> live content shas
@@ -1494,6 +1500,7 @@ size_t VgiResultCache::ReapDisk(const std::string &dir, uint64_t max_bytes, int6
 				}
 				int64_t expires = INT64_MAX, bytes = 0;
 				std::string content;
+				bool exchange = false;
 				size_t start = 0;
 				while (start < body.size()) {
 					size_t nl = body.find('\n', start);
@@ -1506,6 +1513,7 @@ size_t VgiResultCache::ReapDisk(const std::string &dir, uint64_t max_bytes, int6
 					if (k == "content") content = v;
 					else if (k == "expires_unix") expires = ParseInt(v, INT64_MAX);
 					else if (k == "bytes") bytes = ParseInt(v, 0);
+					else if (k == "exch") exchange = (v == "1");
 				}
 				if (expires != INT64_MAX && now_unix >= expires) {
 					if (fs.TryRemoveFile(path)) {
@@ -1520,12 +1528,12 @@ size_t VgiResultCache::ReapDisk(const std::string &dir, uint64_t max_bytes, int6
 						auto h = fs.OpenFile(path, FileFlags::FILE_FLAGS_READ);
 						mt = fs.GetLastModifiedTime(*h).value / 1000000; // micros → seconds
 					} catch (...) {}
-					live_refs.push_back({path, shard, content, mt, bytes});
+					live_refs.push_back({path, shard, content, mt, bytes, exchange});
 				}
 			});
 		}
 
-		// Pass 2 (GLOBAL): evict oldest-mtime whole entries while over the cap.
+		// Pass 2 (GLOBAL): evict oldest-mtime whole entries while over the byte cap.
 		int64_t total = 0;
 		for (auto &r : live_refs) {
 			total += r.bytes;
@@ -1537,11 +1545,40 @@ size_t VgiResultCache::ReapDisk(const std::string &dir, uint64_t max_bytes, int6
 				if (total <= static_cast<int64_t>(max_bytes)) {
 					break;
 				}
+				if (r.path.empty()) {
+					continue; // already unlinked in an earlier pass
+				}
 				if (fs.TryRemoveFile(r.path)) {
 					++removed;
 				}
 				live_objects[r.shard].erase(r.content);
 				total -= r.bytes;
+				r.path.clear(); // mark evicted so Pass 2b doesn't double-count/unlink
+			}
+		}
+
+		// Pass 2b [S9] (GLOBAL): LRU-evict oldest EXCHANGE refs while their live count
+		// exceeds max_refs. Per-input-chunk memos are tiny (so the byte cap barely
+		// bites) but numerous, so this is the real bound on per-chunk file fan-out.
+		// Scoped to exchange refs so a memo flood never evicts a large producer entry.
+		if (max_refs > 0) {
+			std::vector<RefInfo *> exch;
+			for (auto &r : live_refs) {
+				if (r.exchange && !r.path.empty()) {
+					exch.push_back(&r);
+				}
+			}
+			if (exch.size() > max_refs) {
+				std::sort(exch.begin(), exch.end(),
+				          [](const RefInfo *a, const RefInfo *b) { return a->mtime < b->mtime; });
+				size_t over = exch.size() - max_refs;
+				for (size_t i = 0; i < over; i++) {
+					if (fs.TryRemoveFile(exch[i]->path)) {
+						++removed;
+					}
+					live_objects[exch[i]->shard].erase(exch[i]->content);
+					exch[i]->path.clear();
+				}
 			}
 		}
 

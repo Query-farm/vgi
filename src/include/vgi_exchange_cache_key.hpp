@@ -64,6 +64,12 @@ std::string HashInputChunkUnordered(ClientContext &context, DataChunk &chunk);
 void AccumulateInputDigest(DataChunk &chunk, uint64_t &sum_lo, uint64_t &sum_hi, uint64_t &row_count);
 std::string FinalizeInputDigest(uint64_t sum_lo, uint64_t sum_hi, uint64_t row_count);
 
+//! Push this query's cache-config settings (byte caps, disk dir/caps, compression,
+//! exchange ref-count cap) into the VgiResultCache singleton, so a `SET` takes effect
+//! on paths that don't otherwise run an eligibility check (e.g. vgi_result_cache_reap()).
+//! Lock-free when the settings are unchanged (ConfigureIfChanged fast path).
+void SyncResultCacheSettings(ClientContext &context);
+
 // ============================================================================
 // Static cache-key builder for EXCHANGE-mode functions
 // ============================================================================

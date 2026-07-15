@@ -210,11 +210,15 @@ public:
 		// never compressed). "zstd" default (level 1), "lz4", or "none".
 		std::string disk_compression = "zstd";
 		uint64_t disk_compression_level = 1; // zstd only; ignored for lz4/none
-		// [S9] Disk-tier floor for EXCHANGE-mode entries. A per-input-batch/-chunk memo
-		// (streaming / LATERAL) below this size stays memory-only so per-chunk keying
-		// can't spray millions of tiny .vrc/.ref files at the content-addressed store.
-		// Whole-input buffered results are large and cross the floor. 64 KB default.
-		uint64_t exchange_disk_min_bytes = 65536;
+		// [S9] File-count cap for EXCHANGE-mode disk entries. Per-input-batch/-chunk
+		// memos are tiny but numerous (one per input chunk), so keying the disk
+		// decision on payload size would wrongly exclude a small-but-EXPENSIVE result
+		// (the case a warm disk cache helps most). Instead every exchange memo may go
+		// to disk, but the reaper LRU-evicts oldest exchange refs above this count so
+		// per-chunk fan-out can't spray unbounded .vrc/.ref files. Scoped to exchange
+		// refs (input_hash present) so a memo flood never evicts a large producer
+		// entry. 0 = unbounded. Default 100k.
+		uint64_t exchange_disk_max_refs = 100000;
 	};
 
 	// Snapshot row for the vgi_result_cache() diagnostic.
@@ -291,11 +295,6 @@ public:
 	// LRU cap); this bounds the *transient* capture buffers.
 	bool TryReserveInflightCapture(int64_t bytes);
 	void ReleaseInflightCapture(int64_t bytes);
-
-	// [S9] Minimum stored-payload size before an EXCHANGE-mode memo entry is eligible
-	// for the disk tier. Below it the entry stays memory-only. Lock-free (atomic
-	// mirror of settings_.exchange_disk_min_bytes, refreshed by Configure).
-	int64_t ExchangeDiskMinBytes() const;
 
 	// Look up a fresh entry. Returns nullptr on miss or if the entry is stale
 	// (a stale entry is dropped). On a hit, splices the entry to MRU, bumps its
@@ -405,9 +404,10 @@ private:
 	// build for small entries. Returns -1 (miss) when the ref is absent/invalid.
 	int64_t PeekDiskRefBytes(const VgiResultCacheKey &key, const std::string &dir);
 	// Reap the disk store against wall-clock `now_unix` (injectable for tests):
-	// unlink expired refs, evict oldest-mtime while over max_bytes, then sweep
-	// orphan objects past the grace window. Returns the count of refs removed.
-	size_t ReapDisk(const std::string &dir, uint64_t max_bytes, int64_t now_unix);
+	// unlink expired refs, evict oldest-mtime while over max_bytes, LRU-evict oldest
+	// EXCHANGE refs while over max_refs (0 = unbounded), then sweep orphan objects past
+	// the grace window. Returns the count of refs removed.
+	size_t ReapDisk(const std::string &dir, uint64_t max_bytes, uint64_t max_refs, int64_t now_unix);
 	// Remove a whole per-identity disk shard (invalidation).
 	void FlushCatalogDisk(const std::string &identity_scope, const std::string &dir);
 
@@ -446,9 +446,6 @@ private:
 	std::atomic<uint64_t> config_signature_ {0};
 	// [S6] Process-global sum of bytes reserved by in-flight captures.
 	std::atomic<int64_t> inflight_capture_bytes_ {0};
-	// [S9] Lock-free mirror of settings_.exchange_disk_min_bytes (read on the store
-	// hot path without taking mutex_; refreshed under the lock by Configure).
-	std::atomic<int64_t> exchange_disk_min_bytes_ {65536};
 
 	std::thread cleanup_thread_;
 	std::atomic<bool> shutdown_ {false};
