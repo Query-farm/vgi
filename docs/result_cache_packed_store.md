@@ -1,6 +1,11 @@
 # Packed On-Disk Store for Small Exchange-Mode Cache Entries — Design
 
-Status: **APPROVED — implementing** (phased; see §7). Author: cache maintainers.
+Status: **PHASE 1 IMPLEMENTED** (single-process pack backend + cross-restart read,
+feature-flagged `vgi_result_cache_pack`, default OFF). Cross-process *concurrent*-write
+coordination (phases 3–4) not yet built — a second live process reading a shard sees peers'
+sealed packs on load but not their in-flight appends until a reload, and a dead writer's packs
+are reclaimed only on expiry / `vgi_result_cache_flush()`, not compacted. See §7 for the plan.
+Author: cache maintainers.
 Supersedes the interim guard `vgi_result_cache_exchange_disk_max_refs` (which bounds file
 count by *evicting* small entries; this replaces the storage model so we don't have to).
 
@@ -201,19 +206,22 @@ and can default much higher once packed.
 
 ## 7. Phased implementation plan
 
-1. **Format + single-process pack read/write** — `.vpack` record framing (CRC + content_sha),
-   append, in-memory index, `.vidx` write/rebuild. Route small entries here; loose unchanged. Serve
-   reuses the existing positioned-read → `BufferReader` path. Unit tests on the format + round-trip.
-2. **Reaper on the index** — expiry/caps/compaction over the in-memory index; own-pack compaction
-   with atomic `.vidx` rename. Retire the directory scan for the packed backend. Reuse
-   `vgi_result_cache_reap()` as the deterministic test seam.
-3. **Cross-process union read** — read peers' packs, union index, mtime-based refresh; the
-   `pack_flush_interval` cadence. Test with two processes over one dir (mirrors the existing HTTP
-   identity-isolation cross-process tests).
-4. **Orphaned-pack reclaim** — dead-owner detection + per-shard flock reclaim. Test with a killed
-   writer leaving packs behind.
-5. **Enable path + docs** — flip `vgi_result_cache_pack` default after soak; fold into CLAUDE.md +
-   the settings table; note the loose store remains for large entries.
+1. **Format + single-process pack read/write** — ✅ **DONE**. `.vpack` record framing (per-record
+   magic + `content_sha`; a torn append tail is detected by length-bounds on scan, so no CRC is
+   needed for an append-only single-writer file), append, in-memory index, `.vidx` write/rebuild
+   (trusted when its recorded `pack_size` matches the file, else rebuilt from the pack). Small
+   entries route here; loose unchanged. Serve reuses the positioned-read → `BufferReader` path.
+   Reaper (expiry / global byte-cap evict / own-pack compaction over the dead-ratio threshold) runs
+   over the in-memory index via `vgi_result_cache_reap()` + the background thread — no directory
+   scan for lookups. Cross-**restart** read works (a new process reads prior packs as foreign +
+   compacts only its own). Tests: `test/sql/integration/cache/pack.test`.
+2. *(folded into 1)* Reaper on the index.
+3. **Cross-process union read (live)** — refresh peers' pack indexes on a cadence
+   (`pack_flush_interval`) so a running process sees another running process's *new* appends without
+   a restart. Test with two concurrent processes over one dir.
+4. **Orphaned-pack reclaim** — dead-owner detection + per-shard flock so a crashed writer's dead
+   space is compacted, not just left to expire. Test with a killed writer leaving packs behind.
+5. **Enable path** — flip `vgi_result_cache_pack` default after soak.
 
 ## 8. Open questions for review
 

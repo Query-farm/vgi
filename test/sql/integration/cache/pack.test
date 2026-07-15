@@ -1,0 +1,183 @@
+# name: test/sql/integration/cache/pack.test
+# description: Packed small-entry disk backend ([S9], git-style loose-vs-packed). With
+#   vgi_result_cache_pack=true, SMALL on-disk exchange memos are appended into a few
+#   per-process .vpack files + an index instead of a loose object+ref pair each — so
+#   thousands of tiny per-input-chunk memos cost a few files, not thousands. Large
+#   entries still go loose. See docs/result_cache_packed_store.md.
+# group: [vgi_integration_cache]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+SET threads=1;
+
+statement ok
+SET vgi_result_cache_dir = '__TEST_DIR__/vgi_pack';
+
+statement ok
+SET vgi_result_cache_disk_max_bytes = 104857600;
+
+statement ok
+SET vgi_result_cache_pack = true;
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+# ---------------------------------------------------------------------------
+# Structural win: many DISTINCT per-chunk memos land in a FEW pack files, and
+# ZERO loose object/ref files are created for them.
+# ---------------------------------------------------------------------------
+
+statement ok
+SELECT count(*) FROM (VALUES (1::BIGINT)) v(x), LATERAL ex.cached_double(v.x);
+
+statement ok
+SELECT count(*) FROM (VALUES (2::BIGINT)) v(x), LATERAL ex.cached_double(v.x);
+
+statement ok
+SELECT count(*) FROM (VALUES (3::BIGINT)) v(x), LATERAL ex.cached_double(v.x);
+
+statement ok
+SELECT count(*) FROM (VALUES (4::BIGINT)) v(x), LATERAL ex.cached_double(v.x);
+
+statement ok
+SELECT count(*) FROM (VALUES (5::BIGINT)) v(x), LATERAL ex.cached_double(v.x);
+
+statement ok
+SELECT count(*) FROM (VALUES (6::BIGINT)) v(x), LATERAL ex.cached_double(v.x);
+
+statement ok
+SELECT count(*) FROM (VALUES (7::BIGINT)) v(x), LATERAL ex.cached_double(v.x);
+
+statement ok
+SELECT count(*) FROM (VALUES (8::BIGINT)) v(x), LATERAL ex.cached_double(v.x);
+
+# Pack files exist — and there are only a handful (one per-process writer pack),
+# NOT one file per memo. Eight distinct memos, a single .vpack.
+query I
+SELECT COUNT(*) FROM glob('__TEST_DIR__/vgi_pack/*/packs/*.vpack');
+----
+1
+
+# No LOOSE object/ref files were created for these small exchange memos.
+query I
+SELECT COUNT(*) FROM glob('__TEST_DIR__/vgi_pack/*/objects/*.vrc');
+----
+0
+
+query I
+SELECT COUNT(*) FROM glob('__TEST_DIR__/vgi_pack/*/refs/*.ref');
+----
+0
+
+# ---------------------------------------------------------------------------
+# Serve from the pack: shrink the in-memory cap to ~nothing so a stored memo is
+# evicted from RAM immediately, forcing the next identical scan to be served from
+# the on-disk PACK (worker exchange skipped => zero write_input).
+# ---------------------------------------------------------------------------
+
+statement ok
+SET vgi_result_cache_max_bytes = 1;
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# Store (immediately RAM-evicted; persisted to the pack).
+statement ok
+SELECT count(*) FROM (VALUES (42::BIGINT)) v(x), LATERAL ex.cached_double(v.x);
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# Repeat: RAM miss -> served from the PACK, worker NOT exchanged with. The served
+# output (doubled = 84) proves the pack replay is byte-correct, not just a skipped worker.
+query I
+SELECT doubled FROM (VALUES (42::BIGINT)) v(x), LATERAL ex.cached_double(v.x);
+----
+84
+
+query I
+SELECT count(*)
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'table_in_out.write_input'
+  AND message LIKE '%cached_double%';
+----
+0
+
+statement ok
+RESET vgi_result_cache_max_bytes;
+
+statement ok
+CALL disable_logging();
+
+# ---------------------------------------------------------------------------
+# Reap runs cleanly over the packed backend (expiry + compaction pass); the
+# entries have no TTL-expiry here so nothing is removed, but the pass must not error.
+# ---------------------------------------------------------------------------
+
+query I
+SELECT disk_refs_removed >= 0 FROM vgi_result_cache_reap();
+----
+true
+
+# ---------------------------------------------------------------------------
+# Routing: with a tiny pack threshold the memo is too big to pack and goes LOOSE
+# (an object + ref appear); back at the default it packs again.
+# ---------------------------------------------------------------------------
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+statement ok
+SET vgi_result_cache_pack_max_entry_bytes = 1;
+
+statement ok
+SELECT count(*) FROM (VALUES (11::BIGINT)) v(x), LATERAL ex.cached_double(v.x);
+
+# Above the (1-byte) pack threshold => stored LOOSE, not packed.
+query I
+SELECT COUNT(*) > 0 FROM glob('__TEST_DIR__/vgi_pack/*/objects/*.vrc');
+----
+true
+
+query I
+SELECT COUNT(*) FROM glob('__TEST_DIR__/vgi_pack/*/packs/*.vpack');
+----
+0
+
+statement ok
+RESET vgi_result_cache_pack_max_entry_bytes;
+
+# ---------------------------------------------------------------------------
+# Flush clears the packed tier (shared singleton): no pack files remain.
+# ---------------------------------------------------------------------------
+
+statement ok
+SELECT count(*) FROM (VALUES (99::BIGINT)) v(x), LATERAL ex.cached_double(v.x);
+
+query I
+SELECT COUNT(*) > 0 FROM glob('__TEST_DIR__/vgi_pack/*/packs/*.vpack');
+----
+true
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+query I
+SELECT COUNT(*) FROM glob('__TEST_DIR__/vgi_pack/*/packs/*.vpack');
+----
+0
+
+statement ok
+DETACH ex;

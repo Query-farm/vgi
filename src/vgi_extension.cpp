@@ -3354,8 +3354,28 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "cross-process cache); the reaper LRU-evicts oldest exchange refs above this "
 	                          "count so per-input-chunk fan-out can't spray unbounded files. Scoped to "
 	                          "exchange refs so a memo flood never evicts a large producer entry (0 = "
-	                          "unbounded; default 100000)",
+	                          "unbounded; default 100000). Loose store only; the packed backend below "
+	                          "bounds file count structurally",
 	                          LogicalType::UBIGINT, Value::UBIGINT(100000));
+	config.AddExtensionOption("vgi_result_cache_pack",
+	                          "Route SMALL on-disk result-cache entries into append-only per-process pack "
+	                          "files + a rebuildable index (git-style loose-vs-packed split) instead of a "
+	                          "loose object+ref file pair each, so thousands of tiny per-input-chunk exchange "
+	                          "memos cost a few files. Large entries stay loose. Ship OFF; enable per session",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
+	config.AddExtensionOption("vgi_result_cache_pack_max_entry_bytes",
+	                          "Route threshold for the packed disk backend: on-disk entries below this size "
+	                          "are packed, at/above are stored as loose objects (default 262144 = 256 KB)",
+	                          LogicalType::UBIGINT, Value::UBIGINT(262144));
+	config.AddExtensionOption("vgi_result_cache_pack_target_bytes",
+	                          "Roll to a fresh pack file once the current one exceeds this size (bounds one "
+	                          "compaction unit; default 67108864 = 64 MB)",
+	                          LogicalType::UBIGINT, Value::UBIGINT(67108864));
+	config.AddExtensionOption("vgi_result_cache_pack_compaction_dead_pct",
+	                          "Compact an owned pack file when this percent of its bytes is dead "
+	                          "(expired/evicted); rewrites live records to a fresh pack and drops the old "
+	                          "(git gc). 0..100, default 50",
+	                          LogicalType::UBIGINT, Value::UBIGINT(50));
 
 	// Cache directory for worker binaries downloaded via github:// / github-auto://
 	// LOCATIONs. Empty (default) → ${XDG_CACHE_HOME:-~/.cache}/vgi/releases. Must be

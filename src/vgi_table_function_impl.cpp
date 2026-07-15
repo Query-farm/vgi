@@ -1514,42 +1514,11 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 	}
 
 	// --- Result cache: eligibility + serve (cache hit short-circuits worker) ---
-	// Sync the process-global cache config from this query's settings so SET on
-	// any cap / the disk dir takes effect. [S1] ConfigureIfChanged skips the
-	// global lock + evict entirely when the settings are unchanged (the steady
-	// state), so this is lock-free on the hot path. Empty dir / 0 disk cap = off.
-	{
-		VgiResultCache::Settings s;
-		Value sv;
-		if (context.TryGetCurrentSetting("vgi_result_cache_max_bytes", sv) && !sv.IsNull()) {
-			s.max_bytes = sv.GetValue<uint64_t>();
-		}
-		if (context.TryGetCurrentSetting("vgi_result_cache_max_entry_bytes", sv) && !sv.IsNull()) {
-			s.max_entry_bytes = sv.GetValue<uint64_t>();
-		}
-		if (context.TryGetCurrentSetting("vgi_result_cache_max_entries", sv) && !sv.IsNull()) {
-			s.max_entries = sv.GetValue<uint64_t>();
-		}
-		if (context.TryGetCurrentSetting("vgi_result_cache_max_inflight_bytes", sv) && !sv.IsNull()) {
-			s.max_inflight_bytes = sv.GetValue<uint64_t>();
-		}
-		if (context.TryGetCurrentSetting("vgi_result_cache_dir", sv) && !sv.IsNull()) {
-			s.disk_dir = sv.GetValue<string>();
-		}
-		if (context.TryGetCurrentSetting("vgi_result_cache_disk_max_bytes", sv) && !sv.IsNull()) {
-			s.disk_max_bytes = sv.GetValue<uint64_t>();
-		}
-		if (context.TryGetCurrentSetting("vgi_result_cache_disk_reap_interval_seconds", sv) && !sv.IsNull()) {
-			s.disk_reap_interval_seconds = sv.GetValue<uint64_t>();
-		}
-		if (context.TryGetCurrentSetting("vgi_result_cache_disk_compression", sv) && !sv.IsNull()) {
-			s.disk_compression = sv.GetValue<string>();
-		}
-		if (context.TryGetCurrentSetting("vgi_result_cache_disk_compression_level", sv) && !sv.IsNull()) {
-			s.disk_compression_level = sv.GetValue<uint64_t>();
-		}
-		VgiResultCache::Instance().ConfigureIfChanged(s);
-	}
+	// Sync the process-global cache config from this query's settings so SET on any
+	// cap / the disk dir / the packed backend takes effect. Shared with the exchange
+	// path (single source of truth — no drift). [S1] ConfigureIfChanged skips the
+	// global lock + evict entirely when the settings are unchanged (the steady state).
+	SyncResultCacheSettings(context);
 	auto cache_eval = EvaluateCacheEligibility(context, bind_data, input, projection_ids);
 	// A stale-but-revalidatable entry the worker can cheaply confirm via a
 	// conditional request. Set below the eligible block; consumed when the

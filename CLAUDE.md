@@ -699,7 +699,26 @@ is bounded instead by the reaper, which LRU-evicts oldest **exchange** refs abov
 The cap is **scoped to exchange refs** (refs carry `exch=1` when `input_hash` is present) so a
 memo flood never evicts a large producer entry. `SET vgi_result_cache_exchange_disk_max_refs`
 takes effect on the next scan **or** the next `vgi_result_cache_reap()` (which now
-`SyncResultCacheSettings` so a bare `SET` before a reap is honored). 0 = unbounded.
+`SyncResultCacheSettings` so a bare `SET` before a reap is honored). 0 = unbounded. This is the
+**loose-store** guard; the packed backend below bounds file count structurally.
+
+**Packed small-entry disk backend ([S9], `vgi_result_cache_pack`, default OFF).** The loose store
+writes an object+ref *file pair* per entry — pathological for thousands of tiny per-chunk memos.
+`vgi_result_cache_pack=true` routes **small** on-disk entries (`< vgi_result_cache_pack_max_entry_bytes`,
+256 KB) into **append-only per-process pack files** (`<shard>/packs/<selfid>-<seq>.vpack`) + a
+rebuildable index (`.vidx`), git-style loose-vs-packed: thousands of memos cost a few files, large
+entries stay loose. Each process WRITES only its own `<selfid>-*` packs (append-only, single writer)
+and READS all packs in the shard (cross-restart + cross-process read). A packed record embeds the
+**same** `SerializeEntryBlob` bytes + `content_sha` the loose store writes, re-verified on serve
+(positioned-read → `BufferReader` → the shared `ParseEntryBlobIntoStream`), so integrity is
+identical. The reaper walks the **in-memory index** (no directory scan): expiry, a global byte-cap
+LRU evict, and own-pack compaction once a pack crosses `vgi_result_cache_pack_compaction_dead_pct`
+(git `gc` — rewrite live records to a fresh pack, drop the old). Routing/probe are transport-agnostic
+and live in `VgiResultCache::PackStore` (pimpl in `vgi_result_cache.cpp`); `Insert` routes, `Lookup`
+probes the pack index first then loose, the reaper + `FlushAll`/`FlushCatalog` drive/invalidate it.
+Cross-process *concurrent-write* freshness (a live peer's in-flight appends) + dead-writer reclaim
+are follow-ups (phases 3–4). See [docs/result_cache_packed_store.md](docs/result_cache_packed_store.md).
+Test: `test/sql/integration/cache/pack.test`.
 
 **Bounded buffered capture ([S6]).** Unlike the producer path (which spills a large capture to
 a streaming disk blob), the buffered operator accumulates the whole-input result in RAM
@@ -770,7 +789,11 @@ transport in `src/query_farm_telemetry.cpp`. Full field reference: [docs/telemet
 | `vgi_result_cache_disk_max_bytes` | UBIGINT | 0 | Byte cap for the on-disk result-cache tier (0 = disk tier off) |
 | `vgi_result_cache_disk_compression` | VARCHAR | `zstd` | Compression codec for the **on-disk** result-cache tier (Arrow built-in IPC buffer compression, applied per-batch so per-batch seek / streaming serve is preserved; the reader decompresses transparently). `zstd` (default), `lz4` (minimal CPU), or `none`. The **memory tier is never compressed** (zero hot-path decompress); compression is applied at the disk-write boundary — compress-at-source on the spill path, transcode on the buffered/drain paths. Default-on when the disk tier is enabled. A missing codec degrades gracefully to uncompressed. Verify it's active via the `codec` column of `vgi_result_cache(include_disk := true)`. See [docs/result_cache_compression.md](docs/result_cache_compression.md) |
 | `vgi_result_cache_disk_compression_level` | UBIGINT | 1 | zstd compression level for the on-disk tier (ignored for `lz4`/`none`). Keep it low — the default 1 is Pareto-optimal (near-zstd-3 ratio at ~half the CPU) |
-| `vgi_result_cache_exchange_disk_max_refs` | UBIGINT | 100000 | File-count cap for **exchange-mode** disk entries (streaming table-in-out / correlated LATERAL / buffered). Every exchange memo persists to disk regardless of payload size — so a small-but-**expensive** result still warms the cross-process cache — and per-input-chunk file fan-out is bounded by the reaper LRU-evicting oldest **exchange** refs above this count. Scoped to exchange refs (`exch=1` marker) so a memo flood never evicts a large producer entry. Honored on the next scan or `vgi_result_cache_reap()`. 0 = unbounded. (Scaling seam **S9**) |
+| `vgi_result_cache_exchange_disk_max_refs` | UBIGINT | 100000 | File-count cap for **exchange-mode** disk entries (streaming table-in-out / correlated LATERAL / buffered) in the **loose** store. Every exchange memo persists to disk regardless of payload size — so a small-but-**expensive** result still warms the cross-process cache — and per-input-chunk file fan-out is bounded by the reaper LRU-evicting oldest **exchange** refs above this count. Scoped to exchange refs (`exch=1` marker) so a memo flood never evicts a large producer entry. Honored on the next scan or `vgi_result_cache_reap()`. 0 = unbounded. Superseded structurally by the packed backend below. (Scaling seam **S9**) |
+| `vgi_result_cache_pack` | BOOLEAN | false | Route **small** on-disk result-cache entries into append-only per-process pack files + a rebuildable index (git-style loose-vs-packed) instead of a loose object+ref file pair each, so thousands of tiny per-input-chunk exchange memos cost a few files. Large entries stay loose. Ship OFF; enable per session. See *Packed small-entry disk backend* + [docs/result_cache_packed_store.md](docs/result_cache_packed_store.md). (Scaling seam **S9**) |
+| `vgi_result_cache_pack_max_entry_bytes` | UBIGINT | 262144 (256 KB) | Route threshold for the packed backend: on-disk entries **below** this size are packed, at/above are stored as loose objects. |
+| `vgi_result_cache_pack_target_bytes` | UBIGINT | 67108864 (64 MB) | Roll to a fresh pack file once the current one exceeds this size (bounds one compaction unit). |
+| `vgi_result_cache_pack_compaction_dead_pct` | UBIGINT | 50 | Compact an owned pack file when this percent of its bytes is dead (expired/evicted) — rewrites live records to a fresh pack and drops the old (git `gc`). 0..100. |
 | `vgi_result_cache_max_entries` | UBIGINT | 131072 | **Entry-count** cap for the in-memory index (0 = unlimited). Bounds unbounded small-entry accumulation that the byte cap alone misses (~700k tiny entries fit under 256 MB); also keeps the reaper / `vgi_result_cache()` O(N) walks small. LRU-evicts oldest above the cap. Read per-query. (Scaling seam **S5**) |
 | `vgi_result_cache_max_inflight_bytes` | UBIGINT | 268435456 (256 MB) | Process-global budget for **in-flight capture** RAM (sum of all concurrently-capturing MISSes' buffered substreams). A capture that would push the total over the budget aborts to uncached (`result_cache.abort reason=inflight_budget`) and keeps streaming to DuckDB — bounds total capture RAM regardless of query concurrency, which the per-entry cap alone can't (N captures peak at N × `max_entry_bytes`). Read per-query. (Scaling seam **S6**) |
 | `vgi_result_cache_disk_reap_interval_seconds` | UBIGINT | 60 | How often the background thread reaps the **disk** tier (expired refs / over-cap eviction / orphan sweep), decoupled from the ~1 s in-memory reap. The disk reap reads every ref + stats every object per pass, so running it every tick is wasteful; expiry is wall-clock, so a coarser cadence is correctness-neutral. (Scaling seam **S7**) |
@@ -848,7 +871,7 @@ The `launch:` and `unix://` paths share one warm worker process across every Duc
 | `vgi_function_connection.cpp` | `FunctionConnection` class, `AcquireAndBindConnection()`. `ReadDataBatch` resolves **externalized batches** (0-row `vgi_rpc.location` pointer → `ResolveExternalLocation` HTTP fetch + splice) on the **subprocess** path too, not just HTTP — a subprocess worker that externalizes a large batch is transparently resolved (transport-independent via DuckDB `HTTPUtil`) |
 | `vgi_subprocess.cpp` | SubProcess/Pipe RAII, `WaitForReadable()` with EINTR retry, `GetCatalogTimeout()` |
 | `vgi_worker_pool.cpp` | `VgiWorkerPool` singleton, background cleanup thread |
-| `vgi_result_cache.cpp` | `VgiResultCache` singleton: cache key/entry types, `ParseVgiCacheControl`, LRU + byte caps + background TTL reaper. See *Table-Function Result Cache* |
+| `vgi_result_cache.cpp` | `VgiResultCache` singleton: cache key/entry types, `ParseVgiCacheControl`, LRU + byte caps + background TTL reaper, the content-addressed loose disk tier, and the **packed small-entry backend** (`VgiResultCache::PackStore`, pimpl — append-only per-process pack files + index; see *Packed small-entry disk backend*). See *Table-Function Result Cache* |
 | `vgi_cached_replay_connection.cpp` | `CachedReplayConnection` — an `IFunctionConnection` that replays a cached result (serve path) |
 | `vgi_exchange_cache_key.cpp` | Exchange-mode (table-in-out / LATERAL / buffered) result-cache infra: `input_hash` key helpers (`HashInputBatchOrdered` ordered IPC, `HashInputChunkUnordered` sorted-multiset, `AccumulateInputDigest`/`FinalizeInputDigest` additive fold), `BuildExchangeCacheKeyStatic` (mirrors the producer eligibility), `StoreExchangeMemoEntry` / `DeserializeCachedRecordBatch`. See *Exchange-Mode Result Cache* |
 | `vgi_result_cache_functions.cpp` | `vgi_result_cache()` / `vgi_result_cache_flush()` SQL diagnostics |

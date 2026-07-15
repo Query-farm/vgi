@@ -190,6 +190,15 @@ void SyncResultCacheSettings(ClientContext &context) {
 	str("vgi_result_cache_disk_compression", s.disk_compression);
 	u64("vgi_result_cache_disk_compression_level", s.disk_compression_level);
 	u64("vgi_result_cache_exchange_disk_max_refs", s.exchange_disk_max_refs);
+	auto boolean = [&](const char *name, bool &dst) {
+		if (context.TryGetCurrentSetting(name, sv) && !sv.IsNull()) {
+			dst = sv.GetValue<bool>();
+		}
+	};
+	boolean("vgi_result_cache_pack", s.pack);
+	u64("vgi_result_cache_pack_max_entry_bytes", s.pack_max_entry_bytes);
+	u64("vgi_result_cache_pack_target_bytes", s.pack_target_bytes);
+	u64("vgi_result_cache_pack_compaction_dead_pct", s.pack_compaction_dead_pct);
 	VgiResultCache::Instance().ConfigureIfChanged(s);
 }
 

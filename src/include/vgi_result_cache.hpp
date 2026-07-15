@@ -217,8 +217,21 @@ public:
 		// to disk, but the reaper LRU-evicts oldest exchange refs above this count so
 		// per-chunk fan-out can't spray unbounded .vrc/.ref files. Scoped to exchange
 		// refs (input_hash present) so a memo flood never evicts a large producer
-		// entry. 0 = unbounded. Default 100k.
+		// entry. 0 = unbounded. Default 100k. (Loose store only; the packed store
+		// below bounds file count structurally.)
 		uint64_t exchange_disk_max_refs = 100000;
+		// --- Packed small-entry disk backend (git-style loose-vs-packed split) ---
+		// Master switch: route SMALL entries into append-only per-process pack files +
+		// a rebuildable index instead of a loose .vrc/.ref pair each, so thousands of
+		// tiny per-chunk memos cost a few files. Large entries stay loose. Ship OFF.
+		bool pack = false;
+		// Route threshold: entries with total_bytes below this pack; at/above go loose.
+		uint64_t pack_max_entry_bytes = 262144; // 256 KB
+		// Roll to a new pack file past this size (bounds one compaction unit).
+		uint64_t pack_target_bytes = 67108864; // 64 MB
+		// Compact an OWN pack when this fraction of its bytes is dead (0..100, percent,
+		// integer so it folds into the settings signature cleanly). Default 50%.
+		uint64_t pack_compaction_dead_pct = 50;
 	};
 
 	// Snapshot row for the vgi_result_cache() diagnostic.
@@ -410,6 +423,18 @@ private:
 	size_t ReapDisk(const std::string &dir, uint64_t max_bytes, uint64_t max_refs, int64_t now_unix);
 	// Remove a whole per-identity disk shard (invalidation).
 	void FlushCatalogDisk(const std::string &identity_scope, const std::string &dir);
+
+	// [S9 packed] Append-only per-process pack backend for SMALL entries (git-style
+	// loose-vs-packed split). Pimpl'd: the per-shard index / writer state stays in the
+	// .cpp. Constructed lazily on first packed Persist. Its own internal mutex guards
+	// shard state, so it is NOT under `mutex_` (file I/O must not hold the cache lock).
+	struct PackStore;
+	std::unique_ptr<PackStore> pack_store_;
+	std::mutex pack_store_init_mutex_; // guards lazy construction of pack_store_
+	PackStore &EnsurePackStore();
+	// Guarded read of the (maybe-null) pack store — used by the reaper / flush paths
+	// that must NOT construct it, without racing a concurrent EnsurePackStore.
+	PackStore *PackStoreIfExists();
 
 	std::string disk_dir_;      // guarded by mutex_
 	uint64_t disk_max_bytes_ = 0; // guarded by mutex_

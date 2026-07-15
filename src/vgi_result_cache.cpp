@@ -187,6 +187,19 @@ uint64_t GetU64(const std::string &b, size_t &pos) {
 	pos += 8;
 	return v;
 }
+void PutU32(std::string &b, uint32_t v) {
+	for (int i = 0; i < 4; i++) {
+		b.push_back(static_cast<char>((v >> (i * 8)) & 0xFF));
+	}
+}
+uint32_t GetU32(const std::string &b, size_t &pos) {
+	uint32_t v = 0;
+	for (int i = 0; i < 4; i++) {
+		v |= static_cast<uint32_t>(static_cast<unsigned char>(b[pos + i])) << (i * 8);
+	}
+	pos += 4;
+	return v;
+}
 
 // Flat blob: [magic VRC1][u64 num_batches]{ per batch: [u64 has_index][u64 batch_index]
 //   [u64 rows][u64 pv_len][pv bytes][u64 ipc_len][ipc bytes] }
@@ -220,6 +233,37 @@ std::string SerializeEntryBlob(const VgiResultCacheEntry &entry, const std::stri
 		}
 	}
 	return b;
+}
+
+// Parse a flat "VRC1" entry blob (magic + batch records to EOF, the format
+// SerializeEntryBlob writes) into a single CachedStream. Shared by the loose-store
+// LoadFromDisk and the packed-store record loader so the blob format lives in one
+// place. Returns false if the magic is missing/short (caller → clean miss). Assumes
+// the blob passed a content-SHA (loose) / CRC (packed) integrity check first, so a
+// malformed body is a corruption case the caller already guards; still wrapped in the
+// caller's try/catch. `total_bytes` accumulates the per-batch IPC byte lengths.
+bool ParseEntryBlobIntoStream(const std::string &blob, CachedStream &stream, int64_t &total_bytes) {
+	if (blob.size() < 4 || blob.compare(0, 4, "VRC1") != 0) {
+		return false;
+	}
+	size_t pos = 4;
+	while (pos < blob.size()) {
+		VgiCachedBatch cb;
+		cb.has_batch_index = GetU64(blob, pos) != 0;
+		cb.batch_index = GetU64(blob, pos);
+		cb.rows = static_cast<int64_t>(GetU64(blob, pos));
+		uint64_t pv_len = GetU64(blob, pos);
+		cb.partition_values_bytes = blob.substr(pos, pv_len);
+		pos += pv_len;
+		uint64_t ipc_len = GetU64(blob, pos);
+		cb.ipc = arrow::Buffer::FromString(blob.substr(pos, ipc_len));
+		pos += ipc_len;
+		total_bytes += static_cast<int64_t>(ipc_len);
+		stream.rows += cb.rows;
+		stream.bytes += static_cast<int64_t>(ipc_len);
+		stream.batches.push_back(std::move(cb));
+	}
+	return true;
 }
 
 // Wall-clock expiry for a ref (steady_clock is per-process; disk needs wall time).
@@ -410,6 +454,557 @@ VgiCacheControl ParseVgiCacheControl(const std::shared_ptr<const arrow::KeyValue
 // VgiResultCache singleton
 // ============================================================================
 
+// ============================================================================
+// Packed small-entry disk backend ([S9] git-style loose-vs-packed)
+// ============================================================================
+// Layout (per identity shard, alongside objects/ + refs/):
+//   <dir>/<shard>/packs/<selfid>-<seq>.vpack   append-only concatenated records
+//   <dir>/<shard>/packs/<selfid>-<seq>.vidx    derived index (rebuildable from .vpack)
+// Each process WRITES only its own <selfid>-* packs (append-only, single writer) and
+// READS all packs in the shard (own + foreign) — cross-restart + cross-process read
+// fall out. Compaction rewrites only OWN packs. Record format:
+//   "VPK1" | keyfp[64 hex] | content_sha[64 hex] | flags u8 | expires u64 | rows u64
+//         | logical u64 | (u32 len + bytes){scope,etag,last_modified,catalog}
+//         | blob_len u64 | blob    (blob = the SerializeEntryBlob "VRC1" stream)
+// See docs/result_cache_packed_store.md.
+struct VgiResultCache::PackStore {
+	struct Loc {
+		std::string pack;      // pack basename
+		uint64_t offset = 0;   // record start
+		uint64_t rec_len = 0;  // total record bytes
+		int64_t expires_unix = 0;
+		uint64_t logical = 0;  // uncompressed payload bytes (entry.total_bytes)
+		int64_t rows = 0;
+		bool exchange = false;
+		bool own = false;      // this process owns `pack` (writable / compactable)
+		uint64_t seq = 0;      // monotonic age key for LRU eviction
+	};
+	struct PackMeta {
+		bool own = false;
+		uint64_t size = 0; // indexed file size
+	};
+	struct ShardState {
+		bool loaded = false;
+		std::unordered_map<std::string, Loc> index;      // keyfp -> live loc
+		std::unordered_map<std::string, PackMeta> packs; // basename -> meta
+		std::unique_ptr<FileHandle> writer;
+		std::string writer_pack;
+		uint64_t writer_size = 0;
+		uint32_t writer_seq = 0;
+	};
+
+	std::mutex mu;
+	std::unordered_map<std::string, ShardState> shards; // shard hash -> state
+	std::string self_id;
+	std::atomic<uint64_t> age_seq {1};
+
+	PackStore() {
+		// Per-process pack-name prefix, unique across processes sharing a dir (a same-
+		// instant clash self-heals via FILE_CREATE failure). Computed once → stable.
+		self_id = "p" + ShortTempSuffix();
+	}
+
+	static std::string VidxOf(const std::string &vpack_basename) {
+		return vpack_basename.substr(0, vpack_basename.size() - 6) + ".vidx"; // strip ".vpack"
+	}
+	bool IsOwn(const std::string &basename) const {
+		return basename.rfind(self_id + "-", 0) == 0;
+	}
+
+	// ---- record build / parse -------------------------------------------
+	static std::string BuildRecord(const VgiResultCacheEntry &e, const std::string &blob,
+	                               const std::string &content_sha, const std::string &keyfp) {
+		std::string r;
+		r.append("VPK1", 4);
+		r.append(keyfp);       // 64 hex
+		r.append(content_sha); // 64 hex
+		r.push_back(e.key.input_hash.empty() ? 0 : 1); // flags bit0 = exchange
+		PutU64(r, static_cast<uint64_t>(ComputeExpiresUnix(e)));
+		PutU64(r, static_cast<uint64_t>(e.rows));
+		PutU64(r, static_cast<uint64_t>(e.total_bytes));
+		auto puts = [&](const std::string &s) {
+			PutU32(r, static_cast<uint32_t>(s.size()));
+			r.append(s);
+		};
+		puts(e.scope);
+		puts(e.etag);
+		puts(e.last_modified);
+		puts(e.catalog_name);
+		PutU64(r, blob.size());
+		r.append(blob);
+		return r;
+	}
+	struct Rec {
+		std::string keyfp, content_sha, scope, etag, lm, catalog, blob;
+		uint8_t flags = 0;
+		int64_t expires = 0, rows = 0;
+		uint64_t logical = 0;
+	};
+	// Parse one record from buf[pos, end). Advances pos. Returns false on any
+	// out-of-bounds length (a torn append tail on scan → stop cleanly).
+	static bool ParseRecord(const std::string &buf, size_t &pos, size_t end, Rec &out) {
+		auto have = [&](size_t n) { return pos + n <= end; };
+		if (!have(4) || buf.compare(pos, 4, "VPK1") != 0) {
+			return false;
+		}
+		pos += 4;
+		if (!have(64)) return false;
+		out.keyfp = buf.substr(pos, 64);
+		pos += 64;
+		if (!have(64)) return false;
+		out.content_sha = buf.substr(pos, 64);
+		pos += 64;
+		if (!have(1)) return false;
+		out.flags = static_cast<unsigned char>(buf[pos]);
+		pos += 1;
+		if (!have(8)) return false;
+		out.expires = static_cast<int64_t>(GetU64(buf, pos));
+		if (!have(8)) return false;
+		out.rows = static_cast<int64_t>(GetU64(buf, pos));
+		if (!have(8)) return false;
+		out.logical = GetU64(buf, pos);
+		auto gets = [&](std::string &s) -> bool {
+			if (!have(4)) return false;
+			uint32_t n = GetU32(buf, pos);
+			if (pos + n > end) return false;
+			s = buf.substr(pos, n);
+			pos += n;
+			return true;
+		};
+		if (!gets(out.scope) || !gets(out.etag) || !gets(out.lm) || !gets(out.catalog)) {
+			return false;
+		}
+		if (!have(8)) return false;
+		uint64_t bl = GetU64(buf, pos);
+		if (pos + bl > end) return false;
+		out.blob = buf.substr(pos, bl);
+		pos += bl;
+		return true;
+	}
+
+	// ---- index persistence ----------------------------------------------
+	// .vidx = "VIX1" | pack_size u64 | count u64 | count×{keyfp[64], offset u64,
+	//         rec_len u64, expires u64, logical u64, rows u64, flags u8}
+	void WriteVidx(const std::string &packs_dir, const std::string &vpack_basename,
+	               const ShardState &st, uint64_t pack_size) {
+		std::string idx;
+		idx.append("VIX1", 4);
+		PutU64(idx, pack_size);
+		std::string body;
+		uint64_t count = 0;
+		for (const auto &kv : st.index) {
+			if (kv.second.pack != vpack_basename) {
+				continue;
+			}
+			body.append(kv.first); // keyfp (64)
+			PutU64(body, kv.second.offset);
+			PutU64(body, kv.second.rec_len);
+			PutU64(body, static_cast<uint64_t>(kv.second.expires_unix));
+			PutU64(body, kv.second.logical);
+			PutU64(body, static_cast<uint64_t>(kv.second.rows));
+			body.push_back(static_cast<char>(kv.second.exchange ? 1 : 0));
+			count++;
+		}
+		PutU64(idx, count);
+		idx.append(body);
+		try {
+			WriteFileAtomic(packs_dir, packs_dir + "/" + VidxOf(vpack_basename), idx, ShortTempSuffix());
+		} catch (...) {
+			// Best-effort: a missing/stale .vidx is rebuilt from the pack on next load.
+		}
+	}
+
+	// Load one pack's entries into `st.index` (collision → keep greater expiry, since
+	// content is deterministic per key so either copy serves identically). Trusts a
+	// .vidx whose recorded pack_size matches the actual file; else scans the pack and
+	// rewrites the .vidx. Returns the actual pack file size.
+	void LoadOnePack(const std::string &packs_dir, const std::string &vpack_basename, ShardState &st) {
+		const std::string vpack_path = packs_dir + "/" + vpack_basename;
+		uint64_t actual_size = 0;
+		try {
+			auto h = LocalFs().OpenFile(vpack_path, FileFlags::FILE_FLAGS_READ);
+			actual_size = static_cast<uint64_t>(LocalFs().GetFileSize(*h));
+		} catch (...) {
+			return;
+		}
+		const bool own = IsOwn(vpack_basename);
+		st.packs[vpack_basename] = PackMeta{own, actual_size};
+
+		auto insert_loc = [&](const std::string &keyfp, const Loc &loc) {
+			auto it = st.index.find(keyfp);
+			if (it == st.index.end() || loc.expires_unix > it->second.expires_unix) {
+				st.index[keyfp] = loc;
+			}
+		};
+
+		// Try the sidecar .vidx first.
+		std::string idx;
+		if (ReadFileAll(packs_dir + "/" + VidxOf(vpack_basename), idx) && idx.size() >= 20 &&
+		    idx.compare(0, 4, "VIX1") == 0) {
+			size_t p = 4;
+			uint64_t idx_pack_size = GetU64(idx, p);
+			uint64_t count = GetU64(idx, p);
+			if (idx_pack_size == actual_size) {
+				bool ok = true;
+				for (uint64_t i = 0; i < count; i++) {
+					if (p + 64 + 8 * 5 + 1 > idx.size()) {
+						ok = false;
+						break;
+					}
+					Loc loc;
+					std::string keyfp = idx.substr(p, 64);
+					p += 64;
+					loc.pack = vpack_basename;
+					loc.offset = GetU64(idx, p);
+					loc.rec_len = GetU64(idx, p);
+					loc.expires_unix = static_cast<int64_t>(GetU64(idx, p));
+					loc.logical = GetU64(idx, p);
+					loc.rows = static_cast<int64_t>(GetU64(idx, p));
+					loc.exchange = idx[p++] != 0;
+					loc.own = own;
+					loc.seq = age_seq.fetch_add(1, std::memory_order_relaxed);
+					insert_loc(keyfp, loc);
+				}
+				if (ok) {
+					return; // trusted the .vidx
+				}
+			}
+		}
+		// Rebuild by scanning the whole pack (missing / stale / short .vidx).
+		std::string buf;
+		if (!ReadFileAll(vpack_path, buf)) {
+			return;
+		}
+		size_t pos = 0;
+		while (pos < buf.size()) {
+			size_t rec_start = pos;
+			Rec rec;
+			if (!ParseRecord(buf, pos, buf.size(), rec)) {
+				break; // torn tail
+			}
+			Loc loc;
+			loc.pack = vpack_basename;
+			loc.offset = rec_start;
+			loc.rec_len = pos - rec_start;
+			loc.expires_unix = rec.expires;
+			loc.logical = rec.logical;
+			loc.rows = rec.rows;
+			loc.exchange = (rec.flags & 1) != 0;
+			loc.own = own;
+			loc.seq = age_seq.fetch_add(1, std::memory_order_relaxed);
+			insert_loc(rec.keyfp, loc);
+		}
+		WriteVidx(packs_dir, vpack_basename, st, actual_size); // heal the sidecar
+	}
+
+	void EnsureLoaded(const std::string &dir, const std::string &shard_hash, ShardState &st) {
+		if (st.loaded) {
+			return;
+		}
+		st.loaded = true;
+		const std::string packs_dir = dir + "/" + shard_hash + "/packs";
+		if (!LocalFs().DirectoryExists(packs_dir)) {
+			return;
+		}
+		std::vector<std::string> vpacks;
+		LocalFs().ListFiles(packs_dir, [&](const std::string &name, bool is_dir) {
+			if (!is_dir && name.size() > 6 && name.compare(name.size() - 6, 6, ".vpack") == 0) {
+				vpacks.push_back(name);
+			}
+		});
+		std::sort(vpacks.begin(), vpacks.end()); // stable load order for age seq
+		for (auto &vp : vpacks) {
+			LoadOnePack(packs_dir, vp, st);
+		}
+	}
+
+	// Open (or roll) this process's writer pack so a `need`-byte record fits under target.
+	void EnsureWriter(const std::string &dir, const std::string &shard_hash, ShardState &st,
+	                  uint64_t target_bytes, uint64_t need) {
+		const std::string packs_dir = dir + "/" + shard_hash + "/packs";
+		const bool roll = st.writer && target_bytes > 0 && st.writer_size + need > target_bytes;
+		if (st.writer && !roll) {
+			return;
+		}
+		if (st.writer) {
+			// Seal the current writer: flush its final .vidx + sync + close.
+			try {
+				st.writer->Sync();
+			} catch (...) {
+			}
+			WriteVidx(packs_dir, st.writer_pack, st, st.writer_size);
+			st.writer.reset();
+		}
+		MkdirP(dir);
+		MkdirP(dir + "/" + shard_hash);
+		MkdirP(packs_dir);
+		std::string basename = self_id + "-" + std::to_string(st.writer_seq++) + ".vpack";
+		st.writer = LocalFs().OpenFile(packs_dir + "/" + basename,
+		                               FileFlags::FILE_FLAGS_WRITE | FileFlags::FILE_FLAGS_FILE_CREATE);
+		st.writer_pack = basename;
+		st.writer_size = 0;
+		st.packs[basename] = PackMeta{true, 0};
+	}
+
+	// ---- public ops ------------------------------------------------------
+	bool Persist(const std::string &dir, const VgiResultCacheEntry &entry, const std::string &blob,
+	             const std::string &content_sha, uint64_t target_bytes) {
+		std::string keyfp = entry.key.Fingerprint();
+		if (keyfp.empty()) {
+			return false;
+		}
+		const std::string shard_hash = IdentityShard(entry.key.identity_scope);
+		std::lock_guard<std::mutex> lk(mu);
+		ShardState &st = shards[shard_hash];
+		try {
+			EnsureLoaded(dir, shard_hash, st);
+			std::string rec = BuildRecord(entry, blob, content_sha, keyfp);
+			EnsureWriter(dir, shard_hash, st, target_bytes, rec.size());
+			if (!st.writer) {
+				return false;
+			}
+			uint64_t offset = st.writer_size;
+			WriteAll(*st.writer, rec.data(), rec.size());
+			st.writer_size += rec.size();
+			st.packs[st.writer_pack].size = st.writer_size;
+			Loc loc;
+			loc.pack = st.writer_pack;
+			loc.offset = offset;
+			loc.rec_len = rec.size();
+			loc.expires_unix = ComputeExpiresUnix(entry);
+			loc.logical = static_cast<uint64_t>(entry.total_bytes);
+			loc.rows = entry.rows;
+			loc.exchange = !entry.key.input_hash.empty();
+			loc.own = true;
+			loc.seq = age_seq.fetch_add(1, std::memory_order_relaxed);
+			st.index[keyfp] = loc;
+			return true;
+		} catch (...) {
+			return false; // best-effort; memory tier still holds the entry
+		}
+	}
+
+	std::shared_ptr<VgiResultCacheEntry> Lookup(const std::string &dir, const VgiResultCacheKey &key,
+	                                            int64_t now_unix) {
+		std::string keyfp = key.Fingerprint();
+		if (keyfp.empty()) {
+			return nullptr;
+		}
+		const std::string shard_hash = IdentityShard(key.identity_scope);
+		Loc loc;
+		{
+			std::lock_guard<std::mutex> lk(mu);
+			ShardState &st = shards[shard_hash];
+			EnsureLoaded(dir, shard_hash, st);
+			auto it = st.index.find(keyfp);
+			if (it == st.index.end()) {
+				return nullptr;
+			}
+			loc = it->second;
+		}
+		if (loc.expires_unix != INT64_MAX && now_unix >= loc.expires_unix) {
+			return nullptr; // stale
+		}
+		try {
+			const std::string pack_path = dir + "/" + shard_hash + "/packs/" + loc.pack;
+			std::string buf;
+			buf.resize(loc.rec_len);
+			auto &fs = LocalFs();
+			auto h = fs.OpenFile(pack_path, FileFlags::FILE_FLAGS_READ);
+			fs.Read(*h, &buf[0], static_cast<int64_t>(loc.rec_len), static_cast<idx_t>(loc.offset));
+			size_t p = 0;
+			Rec rec;
+			if (!ParseRecord(buf, p, buf.size(), rec) || rec.keyfp != keyfp) {
+				return nullptr; // torn / index-vs-pack mismatch → clean miss
+			}
+			if (Sha256Hex(rec.blob) != rec.content_sha) {
+				return nullptr; // corrupt blob → clean miss
+			}
+			auto entry = std::make_shared<VgiResultCacheEntry>();
+			entry->key = key;
+			entry->scope = rec.scope;
+			entry->etag = rec.etag;
+			entry->last_modified = rec.lm;
+			entry->catalog_name = rec.catalog;
+			entry->rows = rec.rows;
+			CachedStream stream;
+			int64_t total_bytes = 0;
+			if (!ParseEntryBlobIntoStream(rec.blob, stream, total_bytes)) {
+				return nullptr;
+			}
+			entry->streams.push_back(std::move(stream));
+			entry->total_bytes = total_bytes;
+			entry->stored_at = std::chrono::steady_clock::now();
+			if (rec.expires == INT64_MAX) {
+				entry->never_expires = true;
+			} else {
+				entry->expires_at = entry->stored_at + std::chrono::seconds(rec.expires - now_unix);
+			}
+			return entry;
+		} catch (...) {
+			return nullptr;
+		}
+	}
+
+	// Rewrite an OWN pack keeping only its still-live records; drop the old file. Caller
+	// holds mu. Returns bytes reclaimed (old size - new size).
+	void CompactPack(const std::string &packs_dir, const std::string &basename, ShardState &st) {
+		// Gather live locs in this pack.
+		std::vector<std::pair<std::string, Loc>> live;
+		for (auto &kv : st.index) {
+			if (kv.second.pack == basename) {
+				live.push_back(kv);
+			}
+		}
+		std::string old_path = packs_dir + "/" + basename;
+		std::string new_base = self_id + "-" + std::to_string(st.writer_seq++) + ".vpack";
+		std::string new_path = packs_dir + "/" + new_base;
+		try {
+			auto src = LocalFs().OpenFile(old_path, FileFlags::FILE_FLAGS_READ);
+			auto dst = LocalFs().OpenFile(new_path,
+			                              FileFlags::FILE_FLAGS_WRITE | FileFlags::FILE_FLAGS_FILE_CREATE);
+			auto &fs = LocalFs();
+			uint64_t out_off = 0;
+			for (auto &kv : live) {
+				std::string buf;
+				buf.resize(kv.second.rec_len);
+				fs.Read(*src, &buf[0], static_cast<int64_t>(kv.second.rec_len),
+				        static_cast<idx_t>(kv.second.offset));
+				WriteAll(*dst, buf.data(), buf.size());
+				kv.second.pack = new_base;
+				kv.second.offset = out_off;
+				st.index[kv.first] = kv.second; // rebind to new pack/offset
+				out_off += kv.second.rec_len;
+			}
+			dst->Sync();
+			st.packs.erase(basename);
+			st.packs[new_base] = PackMeta{true, out_off};
+			WriteVidx(packs_dir, new_base, st, out_off);
+		} catch (...) {
+			return; // leave the old pack in place on any failure
+		}
+		// Drop the old pack + its sidecar.
+		try {
+			LocalFs().RemoveFile(old_path);
+		} catch (...) {
+		}
+		try {
+			LocalFs().RemoveFile(packs_dir + "/" + VidxOf(basename));
+		} catch (...) {
+		}
+	}
+
+	// One reap pass over all shards on disk: expire, byte-cap evict (own), compact
+	// own packs over the dead-ratio threshold. Returns entries removed.
+	size_t Reap(const std::string &dir, int64_t now_unix, uint64_t max_bytes, uint64_t dead_pct) {
+		size_t removed = 0;
+		if (dir.empty()) {
+			return 0;
+		}
+		std::lock_guard<std::mutex> lk(mu);
+		if (!LocalFs().DirectoryExists(dir)) {
+			return 0;
+		}
+		std::vector<std::string> shard_hashes;
+		LocalFs().ListFiles(dir, [&](const std::string &name, bool is_dir) {
+			if (is_dir) {
+				shard_hashes.push_back(name);
+			}
+		});
+		// 1. expire (per shard).
+		for (auto &sh : shard_hashes) {
+			ShardState &st = shards[sh];
+			EnsureLoaded(dir, sh, st);
+			for (auto it = st.index.begin(); it != st.index.end();) {
+				if (it->second.expires_unix != INT64_MAX && now_unix >= it->second.expires_unix) {
+					it = st.index.erase(it);
+					++removed;
+				} else {
+					++it;
+				}
+			}
+		}
+		// 2. global byte cap: evict lowest-seq live entries until under. Only OWN
+		// entries free disk (foreign entries can't be compacted here), but evicting a
+		// foreign entry from the index still stops serving it; its bytes reclaim when
+		// the owner compacts. Evict lowest seq first (approx LRU).
+		if (max_bytes > 0) {
+			int64_t total = 0;
+			std::vector<std::pair<uint64_t, std::pair<std::string, std::string>>> by_age; // seq -> (shard,keyfp)
+			for (auto &sh : shard_hashes) {
+				ShardState &st = shards[sh];
+				for (auto &kv : st.index) {
+					total += static_cast<int64_t>(kv.second.logical);
+					by_age.push_back({kv.second.seq, {sh, kv.first}});
+				}
+			}
+			if (total > static_cast<int64_t>(max_bytes)) {
+				std::sort(by_age.begin(), by_age.end(),
+				          [](const auto &a, const auto &b) { return a.first < b.first; });
+				for (auto &e : by_age) {
+					if (total <= static_cast<int64_t>(max_bytes)) {
+						break;
+					}
+					ShardState &st = shards[e.second.first];
+					auto it = st.index.find(e.second.second);
+					if (it != st.index.end()) {
+						total -= static_cast<int64_t>(it->second.logical);
+						st.index.erase(it);
+						++removed;
+					}
+				}
+			}
+		}
+		// 3. compact OWN packs over the dead-ratio threshold.
+		for (auto &sh : shard_hashes) {
+			ShardState &st = shards[sh];
+			const std::string packs_dir = dir + "/" + sh + "/packs";
+			// live bytes per pack.
+			std::unordered_map<std::string, uint64_t> live_bytes;
+			for (auto &kv : st.index) {
+				live_bytes[kv.second.pack] += kv.second.rec_len;
+			}
+			std::vector<std::string> to_compact;
+			for (auto &pk : st.packs) {
+				if (!pk.second.own || pk.first == st.writer_pack || pk.second.size == 0) {
+					continue; // never compact the active writer or foreign packs
+				}
+				uint64_t live = live_bytes.count(pk.first) ? live_bytes[pk.first] : 0;
+				uint64_t dead = pk.second.size > live ? pk.second.size - live : 0;
+				if (dead * 100 >= pk.second.size * dead_pct) {
+					to_compact.push_back(pk.first);
+				}
+			}
+			for (auto &basename : to_compact) {
+				CompactPack(packs_dir, basename, st);
+			}
+		}
+		return removed;
+	}
+
+	void InvalidateShard(const std::string &shard_hash) {
+		std::lock_guard<std::mutex> lk(mu);
+		shards.erase(shard_hash);
+	}
+	void InvalidateAll() {
+		std::lock_guard<std::mutex> lk(mu);
+		shards.clear();
+	}
+};
+
+VgiResultCache::PackStore &VgiResultCache::EnsurePackStore() {
+	std::lock_guard<std::mutex> lk(pack_store_init_mutex_);
+	if (!pack_store_) {
+		pack_store_ = std::unique_ptr<PackStore>(new PackStore());
+	}
+	return *pack_store_;
+}
+
+VgiResultCache::PackStore *VgiResultCache::PackStoreIfExists() {
+	std::lock_guard<std::mutex> lk(pack_store_init_mutex_);
+	return pack_store_.get();
+}
+
 VgiResultCache &VgiResultCache::Instance() {
 	// Intentionally leaked (same rationale as VgiWorkerPool::Instance): cached
 	// entries hold Arrow Buffers whose destructors touch the Arrow memory pool;
@@ -463,6 +1058,10 @@ uint64_t SettingsSignature(const VgiResultCache::Settings &s) {
 	HashCombine(seed, s.disk_reap_interval_seconds);
 	HashCombine(seed, s.disk_compression_level);
 	HashCombine(seed, s.exchange_disk_max_refs);
+	HashCombine(seed, s.pack ? 1u : 0u);
+	HashCombine(seed, s.pack_max_entry_bytes);
+	HashCombine(seed, s.pack_target_bytes);
+	HashCombine(seed, s.pack_compaction_dead_pct);
 	HashStr(seed, s.disk_dir);
 	HashStr(seed, s.disk_compression);
 	return seed;
@@ -548,6 +1147,29 @@ VgiResultCache::Lookup(const VgiResultCacheKey &key, std::chrono::steady_clock::
 	// In-memory miss — try the disk tier (cross-process / cross-restart). Disk
 	// I/O runs WITHOUT the cache lock, over the config snapshot taken above.
 	if (!disk_dir.empty()) {
+		// [S9 packed] Probe the packed small-entry backend first (in-memory index →
+		// cheap miss; the shard's packs/ dir absence short-circuits). A packed hit is
+		// small, so adopt it into the memory LRU like a small loose entry. Probed
+		// regardless of the current `pack` flag so entries written while it was on
+		// still serve after it's turned off.
+		{
+			int64_t now_unix = static_cast<int64_t>(std::time(nullptr));
+			auto packed = EnsurePackStore().Lookup(disk_dir, key, now_unix);
+			if (packed) {
+				std::lock_guard<std::mutex> lock(mutex_);
+				auto existing = index_.find(key);
+				if (existing == index_.end() &&
+				    packed->total_bytes <= static_cast<int64_t>(max_entry_bytes)) {
+					EvictToFitLocked(packed->total_bytes);
+					total_bytes_ += packed->total_bytes;
+					packed->hits++;
+					lru_.push_front(packed);
+					index_[key] = lru_.begin();
+				}
+				hits_.fetch_add(1, std::memory_order_relaxed);
+				return packed;
+			}
+		}
 		// [S8] Peek the entry size (cheap ref read) and route: SMALL entries
 		// materialize + adopt into the memory LRU (fast repeat hits); LARGE
 		// entries (> max_entry_bytes) are served by a disk-backed STREAMING entry
@@ -610,6 +1232,8 @@ bool VgiResultCache::Insert(std::shared_ptr<VgiResultCacheEntry> entry, bool all
 	uint64_t disk_max = 0;
 	std::string disk_codec;
 	uint64_t disk_level = 1;
+	bool use_pack = false;
+	uint64_t pack_target = 0;
 	{
 		std::lock_guard<std::mutex> lock(mutex_);
 		if (entry->total_bytes > static_cast<int64_t>(settings_.max_entry_bytes)) {
@@ -632,12 +1256,29 @@ bool VgiResultCache::Insert(std::shared_ptr<VgiResultCacheEntry> entry, bool all
 			disk_max = disk_max_bytes_;
 			disk_codec = disk_compression_;
 			disk_level = disk_compression_level_;
+			// [S9 packed] Route SMALL entries into the packed backend; large stay loose.
+			if (settings_.pack &&
+			    entry->total_bytes < static_cast<int64_t>(settings_.pack_max_entry_bytes)) {
+				use_pack = true;
+				pack_target = settings_.pack_target_bytes;
+			}
 		}
 	}
 	// Persist to the disk tier OUTSIDE the cache lock (file I/O), over the
 	// config snapshot taken above.
 	if (!disk_dir.empty()) {
-		PersistToDisk(*entry, disk_dir, disk_max, disk_codec, disk_level);
+		if (use_pack) {
+			// Serialize once (same blob/codec/content-sha the loose store would write) and
+			// append it as a packed record. On any failure the memory tier still holds it.
+			std::string eff_codec = ResolveDiskCompressionCodec(disk_codec);
+			std::string blob = SerializeEntryBlob(*entry, eff_codec, disk_level);
+			if (blob.size() <= disk_max) {
+				std::string content_sha = Sha256Hex(blob);
+				EnsurePackStore().Persist(disk_dir, *entry, blob, content_sha, pack_target);
+			}
+		} else {
+			PersistToDisk(*entry, disk_dir, disk_max, disk_codec, disk_level);
+		}
 	}
 	return true;
 }
@@ -674,6 +1315,11 @@ size_t VgiResultCache::FlushAll() {
 	}
 	// Clear the disk tier too (best-effort; outside the lock).
 	if (disk_enabled) {
+		// [S9 packed] Drop the pack store's in-memory index + open writers FIRST, so we
+		// don't keep writing to files under a directory we're about to remove.
+		if (auto *ps = PackStoreIfExists()) {
+			ps->InvalidateAll();
+		}
 		auto &fs = LocalFs();
 		if (fs.DirectoryExists(disk_dir)) {
 			fs.RemoveDirectory(disk_dir);
@@ -705,6 +1351,10 @@ size_t VgiResultCache::FlushCatalog(const std::string &catalog_name, const std::
 	// Disk tier: remove this identity's shard (outside the lock — file I/O). Only
 	// when the identity is resolvable — an "" scope means nothing was cached.
 	if (!disk_dir.empty() && !identity_scope.empty()) {
+		// [S9 packed] Drop this shard's pack index + writer before removing its files.
+		if (auto *ps = PackStoreIfExists()) {
+			ps->InvalidateShard(IdentityShard(identity_scope));
+		}
 		FlushCatalogDisk(identity_scope, disk_dir);
 	}
 	return n;
@@ -715,8 +1365,10 @@ VgiResultCache::ReapStats VgiResultCache::ReapNow(int64_t advance_seconds) {
 	std::string disk_dir; // snapshot of disk config, taken under the lock
 	uint64_t disk_max = 0;
 	uint64_t disk_max_refs = 0;
+	uint64_t pack_dead_pct = 50;
 	{
 		std::lock_guard<std::mutex> lock(mutex_);
+		pack_dead_pct = settings_.pack_compaction_dead_pct;
 		// Simulate `advance_seconds` of elapsed time for the memory tier
 		// (steady_clock): any non-revalidatable entry stale within the window is
 		// dropped. This is exactly the background thread's per-tick reap, but
@@ -732,8 +1384,13 @@ VgiResultCache::ReapStats VgiResultCache::ReapNow(int64_t advance_seconds) {
 	// Disk tier (wall-clock): inject `now + advance` as now_unix so expired refs
 	// and past-grace orphans are reaped without waiting real time.
 	if (!disk_dir.empty()) {
-		stats.disk_refs_removed = ReapDisk(disk_dir, disk_max, disk_max_refs,
-		                                   static_cast<int64_t>(std::time(nullptr)) + advance_seconds);
+		int64_t now_unix = static_cast<int64_t>(std::time(nullptr)) + advance_seconds;
+		stats.disk_refs_removed = ReapDisk(disk_dir, disk_max, disk_max_refs, now_unix);
+		// [S9 packed] Reap the packed backend too (expiry + byte-cap evict + own-pack
+		// compaction). Its removals count toward disk_refs_removed for observability.
+		if (auto *ps = PackStoreIfExists()) {
+			stats.disk_refs_removed += ps->Reap(disk_dir, now_unix, disk_max, pack_dead_pct);
+		}
 	}
 	return stats;
 }
@@ -917,6 +1574,7 @@ void VgiResultCache::CleanupThread() {
 		std::string disk_dir; // snapshot of disk config, taken under the lock
 		uint64_t disk_max = 0;
 		uint64_t disk_max_refs = 0;
+		uint64_t pack_dead_pct = 50;
 		int64_t disk_interval = 60;
 		{
 			std::lock_guard<std::mutex> lock(mutex_);
@@ -926,6 +1584,7 @@ void VgiResultCache::CleanupThread() {
 				disk_dir = disk_dir_;
 				disk_max = disk_max_bytes_;
 				disk_max_refs = settings_.exchange_disk_max_refs;
+				pack_dead_pct = settings_.pack_compaction_dead_pct;
 			}
 		}
 		// [S7] Disk reap is O(total refs) I/O per pass (it reads every ref +
@@ -935,7 +1594,11 @@ void VgiResultCache::CleanupThread() {
 		seconds_since_disk_reap += 1;
 		if (!disk_dir.empty() && seconds_since_disk_reap >= std::max<int64_t>(1, disk_interval)) {
 			seconds_since_disk_reap = 0;
-			ReapDisk(disk_dir, disk_max, disk_max_refs, static_cast<int64_t>(std::time(nullptr)));
+			int64_t now_unix = static_cast<int64_t>(std::time(nullptr));
+			ReapDisk(disk_dir, disk_max, disk_max_refs, now_unix);
+			if (auto *ps = PackStoreIfExists()) {
+				ps->Reap(disk_dir, now_unix, disk_max, pack_dead_pct);
+			}
 		}
 	}
 }
@@ -1234,12 +1897,7 @@ std::shared_ptr<VgiResultCacheEntry> VgiResultCache::LoadFromDisk(const VgiResul
 		if (Sha256Hex(blob) != content) {
 			return nullptr;
 		}
-		// Deserialize the flat blob into a single-substream entry. The blob is
-		// "VRC1" + batch records to EOF (no count header) — loop until the bytes run out.
-		if (blob.size() < 4 || blob.compare(0, 4, "VRC1") != 0) {
-			return nullptr;
-		}
-		size_t pos = 4;
+		// Deserialize the flat blob into a single-substream entry (shared parser).
 		auto entry = std::make_shared<VgiResultCacheEntry>();
 		entry->key = key;
 		entry->scope = scope;
@@ -1249,21 +1907,8 @@ std::shared_ptr<VgiResultCacheEntry> VgiResultCache::LoadFromDisk(const VgiResul
 		entry->rows = rows;
 		CachedStream stream;
 		int64_t total_bytes = 0;
-		while (pos < blob.size()) {
-			VgiCachedBatch cb;
-			cb.has_batch_index = GetU64(blob, pos) != 0;
-			cb.batch_index = GetU64(blob, pos);
-			cb.rows = static_cast<int64_t>(GetU64(blob, pos));
-			uint64_t pv_len = GetU64(blob, pos);
-			cb.partition_values_bytes = blob.substr(pos, pv_len);
-			pos += pv_len;
-			uint64_t ipc_len = GetU64(blob, pos);
-			cb.ipc = arrow::Buffer::FromString(blob.substr(pos, ipc_len));
-			pos += ipc_len;
-			total_bytes += static_cast<int64_t>(ipc_len);
-			stream.rows += cb.rows;
-			stream.bytes += static_cast<int64_t>(ipc_len);
-			stream.batches.push_back(std::move(cb));
+		if (!ParseEntryBlobIntoStream(blob, stream, total_bytes)) {
+			return nullptr;
 		}
 		entry->streams.push_back(std::move(stream));
 		entry->total_bytes = total_bytes;
