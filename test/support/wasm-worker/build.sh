@@ -12,7 +12,7 @@ set +u; source "$EMSDK_DIR/emsdk_env.sh" >/dev/null 2>&1; set -u
 export PATH="$EMSDK_DIR/upstream/emscripten:$PATH"
 SABLIB="${SABLIB:-$(cd ../sabtable && pwd)/target/wasm32-unknown-emscripten/release/libsabtable.a}"
 [ -f "$SABLIB" ] || { echo "build sabtable first: (cd ../sabtable && cargo +nightly build --target wasm32-unknown-emscripten -Z build-std=std,panic_abort --release)"; exit 1; }
-# PTHREAD_POOL_SIZE must be >= the channel slot count (EnsureVgiSabChannel = 8) so
+# PTHREAD_POOL_SIZE must be >= the channel slot count (EnsureVgiSabChannel = 4) so
 # every serve thread gets a pre-spawned pool worker (pthread_create-after-dlopen is
 # flaky, so pre-spawn the full set). --pre-js injects DuckDB's SAB into each pthread
 # realm; PThread must be exported so the boot can hook getNewWorker.
@@ -20,7 +20,7 @@ emcc vgi_worker_main.c "$SABLIB" \
   --js-library vgi_worker_lib.js \
   --pre-js vgi_worker_pre.js \
   -sMODULARIZE=1 -sEXPORT_NAME=VgiWorker \
-  -pthread -sPTHREAD_POOL_SIZE=8 -sSHARED_MEMORY=1 \
+  -pthread -sPTHREAD_POOL_SIZE=4 -sSHARED_MEMORY=1 \
   -fwasm-exceptions \
   -sENVIRONMENT=web,worker \
   -sEXPORTED_FUNCTIONS=_main,_vgi_rust_serve_table_sab_slot,_vgi_worker_serve_pool,_malloc,_free \

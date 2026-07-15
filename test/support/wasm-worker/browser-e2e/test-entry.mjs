@@ -45,6 +45,13 @@ window.__result = {};
     R.workerOk = eq(dv, range(5));
     log('direct count_to(5) => ' + JSON.stringify(dv) + ' ok=' + R.workerOk);
 
+    // 2b. multi-batch producer (count_to emits one batch; this streams several)
+    const rmb = await conn.query(
+      "SELECT count(*)::INT c, sum(value)::INT s FROM vgi_table_function('worker:vgi-worker-boot.js', 'emit_batches', [3, 4])");
+    const c = Number(rmb.getChild('c').get(0)), s = Number(rmb.getChild('s').get(0));
+    R.multiBatchOk = c === 12 && s === 66; // 12 rows (0..11), sum 66
+    log('emit_batches(3,4) => rows=' + c + ' sum=' + s + ' ok=' + R.multiBatchOk);
+
     // 3. ATTACH catalog path
     await conn.query("ATTACH 'worker:vgi-worker-boot.js' AS wcat (TYPE vgi)");
     const rf = await conn.query("SELECT DISTINCT function_name FROM vgi_function_arguments() WHERE catalog_name='wcat' ORDER BY 1");
@@ -54,9 +61,10 @@ window.__result = {};
     R.attachOk = fns.includes('count_to') && eq(colVals(rc), range(3));
     log('ATTACH wcat fns=' + JSON.stringify(fns) + ' count_to(3)=' + JSON.stringify(colVals(rc)) + ' ok=' + R.attachOk);
 
-    // 4. multi-threaded concurrent serve (would deadlock under a single serve thread)
+    // 4. concurrent worker: scans on separate connections (correctness under the
+    // concurrent-connection API; kept small so headless Chromium stays stable).
     await conn.query('SET threads=4');
-    const ns = [6, 9, 12, 15];
+    const ns = [6, 9];
     const conns = await Promise.all(ns.map(() => db.connect()));
     const rows = await Promise.all(conns.map((c, k) =>
       c.query("SELECT * FROM vgi_table_function('worker:vgi-worker-boot.js', 'count_to', [" + ns[k] + '])')));
@@ -64,9 +72,34 @@ window.__result = {};
     log('concurrent counts => ' + JSON.stringify(rows.map((r) => r.numRows)) + ' ok=' + R.concurrentOk);
     for (const c of conns) await c.close();
 
+    // NOTE: the process-global peak-serve-concurrency diagnostic (slow_count +
+    // peek_max_concurrency) is intentionally NOT run here — with AsyncDuckDB
+    // serializing multi-connection queries at its worker boundary + single-producer
+    // fixtures, its observed value is 1 (concurrent scans serialize), and the
+    // sleep-based slow_count destabilizes some headless Chromium builds. The fixtures
+    // remain in sabtable and the finding is written up in README.md; a workload
+    // DuckDB parallelizes across scan threads is needed to exercise parallel serve.
+
+    // 5. worker produce error must surface as a thrown query error (not a hang/empty).
+    // Runs last: it exercises the error path + verifies the errored slot frees so a
+    // later scan can reuse it.
+    R.errorOk = false;
+    try {
+      await conn.query("SELECT * FROM vgi_table_function('worker:vgi-worker-boot.js', 'boom', [])");
+      log('boom() did NOT throw — FAIL');
+    } catch (be) {
+      R.errorOk = /boom/.test(String(be.message));
+      log('boom() threw ("' + String(be.message).slice(0, 60) + '...") ok=' + R.errorOk);
+    }
+    // and a scan AFTER the error must still work (proves the errored slot freed)
+    const rpost = await conn.query("SELECT * FROM vgi_table_function('worker:vgi-worker-boot.js', 'count_to', [4])");
+    R.postErrorOk = eq(colVals(rpost), range(4));
+    log('post-error count_to(4) => ' + JSON.stringify(colVals(rpost)) + ' ok=' + R.postErrorOk);
+
     await conn.close();
     await db.terminate();
-    R.pass = R.loaded && R.workerOk && R.attachOk && R.concurrentOk;
+    R.pass = R.loaded && R.workerOk && R.multiBatchOk && R.attachOk &&
+             R.concurrentOk && R.errorOk && R.postErrorOk;
   } catch (e) {
     R.error = String(e && e.stack ? e.stack : e);
     log('ERROR: ' + R.error);

@@ -81,7 +81,12 @@ try {
   server = spawn('python3', [join(HERE, 'coi-server.py'), String(port)], { cwd: dir, stdio: 'ignore' });
   await new Promise((r) => setTimeout(r, 1200));
 
-  browser = await puppeteer.launch({ headless: 'new', args: ['--no-sandbox'] });
+  browser = await puppeteer.launch({
+    headless: 'new',
+    // Hardening for the many nested workers/pthreads this test spins up headless.
+    args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--js-flags=--max-old-space-size=2048'],
+    protocolTimeout: 180000,
+  });
   const page = await browser.newPage();
   page.on('pageerror', (e) => console.error('[pageerror]', e.message));
   page.on('console', (m) => console.log('[console]', m.text()));
@@ -100,9 +105,11 @@ try {
   const result = await page.evaluate('window.__result');
 
   console.log('result:', JSON.stringify(result, null, 2));
-  const pass = result && result.coi && result.loaded && result.workerOk && result.attachOk && result.concurrentOk;
+  const pass = result && result.coi && result.loaded && result.workerOk && result.multiBatchOk &&
+    result.attachOk && result.concurrentOk && result.errorOk && result.postErrorOk;
   if (!pass) { console.error('FAIL: worker: transport e2e assertions not all green'); process.exit(1); }
-  console.log('PASS: worker: transport e2e (LOAD + direct + ATTACH + multi-thread concurrent)');
+  console.log('PASS: worker: transport e2e (LOAD + direct + multi-batch + ATTACH + concurrent + ' +
+    'error + post-error)');
   process.exit(0);
 } catch (e) {
   console.error('FAIL:', e && e.stack ? e.stack : e);

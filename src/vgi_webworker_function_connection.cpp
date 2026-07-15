@@ -333,7 +333,11 @@ int EnsureVgiSabChannel() {
 	if (existing != 0) {
 		return existing;
 	}
-	const int n_slots = 8;
+	// Concurrent slot count = the worker's serve-thread count. 4 covers typical
+	// concurrent scans (a bare Web Worker with many pthreads is heavy on the browser;
+	// AsyncDuckDB also serializes multi-connection queries, so deep concurrency is
+	// rarely realized). Raise if a parallel-scan workload needs more simultaneous slots.
+	const int n_slots = 4;
 	const int ring_cap = sab::kDefaultRingCap;
 	const int stride = sab::SlotStride(ring_cap);
 	const int bytes = sab::kHeaderBytes + n_slots * stride;
@@ -741,10 +745,34 @@ std::shared_ptr<arrow::RecordBatch> WebWorkerFunctionConnection::ReadDataBatch()
 			return nullptr;
 		}
 
-		// Skip log/error batches.
-		if (HandleBatchLogMessage(result.batch, result.custom_metadata, &context_, location_, -1,
-		                          GetExecutionIdHex(), GetAttachOpaqueDataHex(), "", GetConnIdHex())) {
-			continue;
+		// Skip log/error batches. HandleBatchLogMessage THROWS on an EXCEPTION-level
+		// batch (a worker error). On that throw the producer's tick stream is still
+		// open, so the worker's post-turn input_reader.drain() would block forever
+		// (and its serve thread wedge) — close the input first (Arrow EOS + ring EOF)
+		// so the worker's drain returns and the slot frees, then rethrow.
+		try {
+			if (HandleBatchLogMessage(result.batch, result.custom_metadata, &context_, location_, -1,
+			                          GetExecutionIdHex(), GetAttachOpaqueDataHex(), "", GetConnIdHex())) {
+				continue;
+			}
+		} catch (...) {
+			finish_producer_input();
+			// Drain the output ring to EOS so the worker's serve thread has fully
+			// finished (closed w2c) before this connection releases the slot —
+			// otherwise a subsequent scan could slot_open + reset the rings while the
+			// errored serve thread is still draining, corrupting it.
+			try {
+				while (true) {
+					auto rr = data_reader_->ReadNext();
+					if (!rr.ok() || !rr.ValueUnsafe().batch) {
+						break;
+					}
+				}
+			} catch (...) {
+				// ignore secondary errors while draining post-error
+			}
+			data_finished_ = true;
+			throw;
 		}
 
 		// External-location pointer batches are an HTTP-storage optimization; a
