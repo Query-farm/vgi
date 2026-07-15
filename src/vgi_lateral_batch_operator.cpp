@@ -6,6 +6,7 @@
 
 #include <arrow/array/builder_primitive.h> // Int32Builder for the Take indices
 #include <arrow/compute/api_vector.h>       // arrow::compute::Take (dedup expansion)
+#include <arrow/record_batch.h>             // arrow::ConcatenateRecordBatches (per-value assembly)
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/serializer/serializer.hpp"
@@ -475,26 +476,43 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 		}
 	}
 	const bool is_volatile = bd.stability.has_value() && bd.stability.value() == FunctionStability::VOLATILE;
+	// Build the dedup grouping whenever dedup OR per-value is in play (per-value needs the
+	// distinct set even for an all-distinct chunk — a value unique in THIS chunk may repeat
+	// in a later one). `reduce_worker`: gather only the distinct tuples for the worker (a
+	// real reduction, only when there ARE duplicates); `needs_expand`: fan the 1:N output
+	// back over each tuple's group (only when we reduced). Both false ⇒ trivial identity.
+	bool pv_setting = true;
+	{
+		Value pv;
+		if (client_context.TryGetCurrentSetting("vgi_result_cache_per_value", pv) && !pv.IsNull()) {
+			pv_setting = pv.GetValue<bool>();
+		}
+	}
+	// Dedup is the master switch for BOTH the worker-input reduction AND per-value memo
+	// (per-value inherently needs the distinct set). `vgi_exchange_input_dedup=false`
+	// disables both; per-value additionally needs its own flag + cache eligibility.
+	const bool dedup_active = dedup_enabled && !is_volatile;
 	InputDedup dd;
-	bool use_dedup = false;
-	if (dedup_enabled && !is_volatile) {
+	if (dedup_active) {
 		std::vector<column_t> wcols;
 		wcols.reserve(input_length);
 		for (idx_t c = 0; c < input_length; c++) {
 			wcols.push_back(c);
 		}
 		dd = BuildInputDedup(input, wcols);
-		use_dedup = !dd.trivial;
 	}
+	const bool reduce_worker = dedup_active && !dd.trivial;
+	const bool needs_expand = reduce_worker;
 
-	// Build the worker-input chunk: K deduped rows (materialized gather) or an N-row view.
+	// Build the worker-input chunk: K deduped rows (materialized gather) when we reduce, else
+	// an N-row view. When dedup_active, dd.k == cardinality of worker_input either way.
 	DataChunk worker_input;
 	vector<LogicalType> in_types;
 	in_types.reserve(input_length);
 	for (idx_t c = 0; c < input_length; c++) {
 		in_types.push_back(input.data[c].GetType());
 	}
-	if (use_dedup) {
+	if (reduce_worker) {
 		worker_input.Initialize(Allocator::Get(client_context), in_types, dd.k == 0 ? 1 : dd.k);
 		for (idx_t c = 0; c < input_length; c++) {
 			VectorOperations::Copy(input.data[c], worker_input.data[c], dd.distinct, dd.k, 0, 0);
@@ -508,79 +526,172 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 		worker_input.SetCardinality(input.size());
 	}
 
-	// ONE batched exchange for the whole input chunk.
-	auto input_batch = ConvertInputToArrow(client_context, worker_input, bd);
-	VGI_LOG(client_context, "table_in_out.write_input",
-	        {{"conn", state.connection->GetConnIdHex()},
-	         {"worker_path", bd.worker_path()},
-	         {"function_name", bd.function_name},
-	         {"input_rows", std::to_string(input_batch->num_rows())}});
-	state.connection->WriteInputBatch(input_batch);
-	auto output_batch = state.connection->ReadDataBatch();
-
-	if (!output_batch) {
-		// EOS mid-stream is a worker protocol violation: this operator never closes the
-		// input writer (a map keeps exchanging), so the worker must answer every input
-		// chunk with a data batch. A silent FINISHED here would drop the rest of the
-		// input; surface it. Drop the connection (never pool a mid-stream worker).
-		state.connection.reset();
-		throw IOException("vgi_batch_lateral: worker '%s' function '%s' returned end-of-stream "
-		                  "mid-exchange (expected one output batch per input chunk)",
-		                  bd.worker_path(), bd.function_name);
-	}
-
-	// Conditional revalidation: clear the armed validators (so the next chunk's exchange
-	// isn't a stray conditional request) and, on a 304 (0-row not_modified reply), slide
-	// the stored entry's TTL and serve its cached POST-STAMP output instead of the worker
-	// response. Otherwise the fresh response falls through to the normal capture path.
-	if (reval_entry) {
-		state.connection->SetConditionalRequest("", "");
-		if (output_batch->num_rows() == 0) {
-			auto cc = state.connection->GetLastCacheControl();
-			if (cc.not_modified) {
-				SlideRevalidatedExchangeEntry(*reval_entry, cc, state.cache_default_ttl_seconds,
-				                              /*allow_disk=*/true);
-				VgiResultCache::Instance().RecordExchangeRevalidation(reval_entry->total_bytes);
-				VGI_LOG(client_context, "result_cache.revalidate",
-				        {{"function", bd.function_name},
-				         {"key_hash", state.capture_key.HexDigest()},
-				         {"outcome", "not_modified"}});
-				state.serving = reval_entry;
-				state.serve_cursor = 0;
-				return EmitServedSlice(state, state.serve_arrow_table, chunk);
+	// [per-value] After dedup, memoize per DISTINCT worker-input tuple — the finer tier
+	// UNDER the M2 per-chunk cache (which already missed here). Batch-look-up each distinct
+	// tuple's key; a FULL hit (every tuple cached) serves without the worker, catching
+	// cross-chunk / cross-query value reuse the whole-chunk key misses. Skipped while
+	// revalidation is armed (the 304 flow owns this chunk). See docs/exchange_dedup_pervalue.md.
+	const bool pv_enabled = pv_setting && dedup_active && state.cache_eligible && !reval_entry;
+	std::vector<VgiResultCacheKey> pv_keys;
+	std::vector<std::shared_ptr<const VgiResultCacheEntry>> pv_hits;
+	bool full_pv_hit = false;
+	if (pv_enabled) {
+		auto pv_hashes = HashInputRowsPerValue(client_context, worker_input);
+		pv_keys.resize(dd.k);
+		for (idx_t d = 0; d < dd.k; d++) {
+			pv_keys[d] = state.cache_static_key;
+			pv_keys[d].input_hash = pv_hashes[d];
+		}
+		pv_hits = VgiResultCache::Instance().LookupBatch(pv_keys, std::chrono::steady_clock::now());
+		full_pv_hit = dd.k > 0;
+		for (auto &h : pv_hits) {
+			if (!h) {
+				full_pv_hit = false;
+				break;
 			}
 		}
 	}
 
-	// Reaching here = a fresh exchange for this chunk (not a cache hit, not a 304).
-	if (state.cache_eligible) {
-		VgiResultCache::Instance().RecordExchangeMiss();
+	std::shared_ptr<arrow::RecordBatch> output_batch;
+	std::vector<int32_t> worker_parent; // per worker-output-row: the DEDUPED tuple index
+
+	if (full_pv_hit) {
+		// Serve entirely from the per-value tier: concat each distinct tuple's cached output
+		// rows and synthesize the parent array (each row → its tuple index d). No worker.
+		std::vector<std::shared_ptr<arrow::RecordBatch>> parts;
+		for (idx_t d = 0; d < dd.k; d++) {
+			const auto &batches = pv_hits[d]->streams[0].batches;
+			for (size_t b = 0; b < batches.size(); b++) {
+				auto rb = DeserializeCachedRecordBatch(*pv_hits[d], batches[b]);
+				for (int64_t r = 0; r < rb->num_rows(); r++) {
+					worker_parent.push_back(static_cast<int32_t>(d));
+				}
+				parts.push_back(rb);
+			}
+		}
+		int64_t served_bytes = 0;
+		for (auto &h : pv_hits) {
+			served_bytes += h->total_bytes;
+		}
+		VgiResultCache::Instance().RecordExchangeHit(served_bytes);
+		VGI_LOG(client_context, "result_cache.hit",
+		        {{"function", bd.function_name}, {"key_hash", state.capture_key.HexDigest()}, {"tier", "per_value"}});
+		if (parts.empty()) {
+			chunk.SetCardinality(0); // every distinct tuple cached an empty (all-1->0) output
+			return OperatorResultType::NEED_MORE_INPUT;
+		}
+		auto cat = arrow::ConcatenateRecordBatches(parts);
+		if (!cat.ok()) {
+			throw IOException("vgi_batch_lateral: per-value assembly concat failed: %s", cat.status().ToString());
+		}
+		output_batch = cat.ValueUnsafe();
+		if (output_batch->num_rows() == 0) {
+			chunk.SetCardinality(0);
+			return OperatorResultType::NEED_MORE_INPUT;
+		}
+	} else {
+		// ONE batched exchange for the (deduped) input chunk.
+		auto input_batch = ConvertInputToArrow(client_context, worker_input, bd);
+		VGI_LOG(client_context, "table_in_out.write_input",
+		        {{"conn", state.connection->GetConnIdHex()},
+		         {"worker_path", bd.worker_path()},
+		         {"function_name", bd.function_name},
+		         {"input_rows", std::to_string(input_batch->num_rows())}});
+		state.connection->WriteInputBatch(input_batch);
+		output_batch = state.connection->ReadDataBatch();
+
+		if (!output_batch) {
+			// EOS mid-stream is a worker protocol violation: this operator never closes the
+			// input writer (a map keeps exchanging), so the worker must answer every input
+			// chunk with a data batch. A silent FINISHED here would drop the rest of the
+			// input; surface it. Drop the connection (never pool a mid-stream worker).
+			state.connection.reset();
+			throw IOException("vgi_batch_lateral: worker '%s' function '%s' returned end-of-stream "
+			                  "mid-exchange (expected one output batch per input chunk)",
+			                  bd.worker_path(), bd.function_name);
+		}
+
+		// Conditional revalidation: clear the armed validators (so the next chunk's exchange
+		// isn't a stray conditional request) and, on a 304 (0-row not_modified reply), slide
+		// the stored entry's TTL and serve its cached POST-STAMP output instead of the worker
+		// response. Otherwise the fresh response falls through to the normal capture path.
+		if (reval_entry) {
+			state.connection->SetConditionalRequest("", "");
+			if (output_batch->num_rows() == 0) {
+				auto cc = state.connection->GetLastCacheControl();
+				if (cc.not_modified) {
+					SlideRevalidatedExchangeEntry(*reval_entry, cc, state.cache_default_ttl_seconds,
+					                              /*allow_disk=*/true);
+					VgiResultCache::Instance().RecordExchangeRevalidation(reval_entry->total_bytes);
+					VGI_LOG(client_context, "result_cache.revalidate",
+					        {{"function", bd.function_name},
+					         {"key_hash", state.capture_key.HexDigest()},
+					         {"outcome", "not_modified"}});
+					state.serving = reval_entry;
+					state.serve_cursor = 0;
+					return EmitServedSlice(state, state.serve_arrow_table, chunk);
+				}
+			}
+		}
+
+		// Reaching here = a fresh exchange for this chunk (not a cache hit, not a 304).
+		if (state.cache_eligible) {
+			VgiResultCache::Instance().RecordExchangeMiss();
+		}
+
+		// Latch the worker's cache-control advertisement off the first exchange output.
+		if (state.cache_eligible && !state.cache_cc_latched) {
+			state.cache_cc = state.connection->GetLastCacheControl();
+			state.cache_cc_latched = true;
+		}
+
+		if (output_batch->num_rows() == 0) {
+			// 1->0 for the WHOLE chunk: every input row filtered out. Not cached (v1) — a
+			// partial 1->0 (some rows survive) carries provenance and IS captured below.
+			chunk.SetCardinality(0);
+			return OperatorResultType::NEED_MORE_INPUT;
+		}
+
+		// Decode provenance (identity when absent + rows align). When dedup_active the
+		// worker input is the distinct set (dd.k rows), else the full N-row chunk.
+		const idx_t worker_input_rows = dedup_active ? dd.k : input.size();
+		worker_parent = DecodeParentRow(state.connection->GetLastParentRowBytes(),
+		                                static_cast<idx_t>(output_batch->num_rows()), worker_input_rows, bd);
+
+		// [per-value store] Persist each MISSED distinct tuple's output rows (pre-stamp) as
+		// its own per-value entry, so a future chunk with the same value serves without the
+		// worker. Only when the worker opted into caching (cache_cc). A tuple with 0 output
+		// rows (1->0) stores an empty batch (a valid negative memo).
+		if (pv_enabled && state.cache_cc.Cacheable()) {
+			std::vector<std::vector<int32_t>> rows_by_d(dd.k);
+			for (idx_t m = 0; m < worker_parent.size(); m++) {
+				rows_by_d[static_cast<idx_t>(worker_parent[m])].push_back(static_cast<int32_t>(m));
+			}
+			for (idx_t d = 0; d < dd.k; d++) {
+				if (pv_hits[d]) {
+					continue; // already cached (partial-hit chunk) — don't re-store
+				}
+				std::shared_ptr<arrow::RecordBatch> rd = rows_by_d[d].empty()
+				                                             ? output_batch->Slice(0, 0)
+				                                             : TakeRecordBatch(output_batch, rows_by_d[d], bd);
+				auto sr = StoreExchangeMemoEntry(pv_keys[d], state.cache_cc, state.cache_catalog_name,
+				                                 state.cache_default_ttl_seconds,
+				                                 std::vector<std::shared_ptr<arrow::RecordBatch>>{rd},
+				                                 /*allow_disk=*/true);
+				if (sr.stored) {
+					VgiResultCache::Instance().RecordExchangeStore();
+				}
+			}
+		}
 	}
 
-	// Latch the worker's cache-control advertisement off the first exchange output.
-	if (state.cache_eligible && !state.cache_cc_latched) {
-		state.cache_cc = state.connection->GetLastCacheControl();
-		state.cache_cc_latched = true;
-	}
-
-	if (output_batch->num_rows() == 0) {
-		// 1->0 for the WHOLE chunk: every input row filtered out. Not cached (v1) — a
-		// partial 1->0 (some rows survive) carries provenance and IS captured below.
-		chunk.SetCardinality(0);
-		return OperatorResultType::NEED_MORE_INPUT;
-	}
-
-	// Decode provenance (identity when absent + rows align). With dedup the worker's
-	// parent indices point into the K-row DEDUPED input; EXPAND them: each worker output
-	// row (parent d) fans out to every ORIGINAL row in that tuple's group, and the worker
-	// output row itself is replicated (Arrow Take), so the existing drain+stamp path runs
-	// unchanged over an expanded batch whose parent_index now points at ORIGINAL rows
-	// (each stamped with its OWN outer columns — two rows sharing a worker-input tuple can
-	// differ in other outer columns). Range-validated against THIS input.size() (drain guard).
-	const idx_t worker_input_rows = use_dedup ? dd.k : input.size();
-	auto worker_parent = DecodeParentRow(state.connection->GetLastParentRowBytes(),
-	                                     static_cast<idx_t>(output_batch->num_rows()), worker_input_rows, bd);
-	if (use_dedup) {
+	// EXPAND (common to the full-hit and miss paths): each worker output row (parent d)
+	// fans out to every ORIGINAL row in that tuple's group, and the worker output row is
+	// replicated (Arrow Take), so the existing drain+stamp path runs unchanged over an
+	// expanded batch whose parent_index points at ORIGINAL rows (each stamped with its OWN
+	// outer columns). Only when we reduced (duplicates present); for a trivial/all-distinct
+	// chunk each distinct tuple IS one original row, so parent_index = worker_parent directly.
+	if (needs_expand) {
 		std::vector<int32_t> take_idx; // worker output row to copy for each final row
 		std::vector<int32_t> expanded; // ORIGINAL input row to stamp for each final row
 		take_idx.reserve(worker_parent.size());
@@ -605,8 +716,24 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 	StampProjected(chunk, input, state.parent_index, projected_input, base_idx, start, produced);
 	chunk.SetCardinality(produced);
 
-	// Begin capturing this input chunk's POST-STAMP output (if the worker opted in).
-	if (state.cache_eligible && state.cache_cc.Cacheable()) {
+	// Begin capturing this input chunk's POST-STAMP output for the M2 per-chunk cache (if
+	// the worker opted in). Never on a full per-value hit (nothing new). Coexistence gate:
+	// when per-value memo is active, store the coarse whole-chunk entry only if the distinct
+	// ratio K/N clears the floor — below it, per-value already covers a future identical-chunk
+	// replay, so the redundant whole-chunk copy is skipped (a per-chunk cardinality gate, not
+	// a miss-history back-off — per-value still always stored its misses above).
+	bool m2_capture = !full_pv_hit && state.cache_eligible && state.cache_cc.Cacheable();
+	if (m2_capture && pv_enabled && input.size() > 0) {
+		double min_ratio = 0.5;
+		Value mr;
+		if (client_context.TryGetCurrentSetting("vgi_exchange_per_batch_min_distinct_ratio", mr) && !mr.IsNull()) {
+			min_ratio = mr.GetValue<double>();
+		}
+		if (static_cast<double>(dd.k) / static_cast<double>(input.size()) < min_ratio) {
+			m2_capture = false;
+		}
+	}
+	if (m2_capture) {
 		state.capturing = true;
 		state.capture_pending.clear();
 		state.capture_pending.push_back(DataChunkToArrow(client_context, chunk, state.serve_schema));

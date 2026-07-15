@@ -3384,6 +3384,20 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "low-cardinality column into the distinct count. Compute-only (no cache); sound "
 	                          "under the same per-row-purity the cacheability opt-in asserts. Default ON",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
+	config.AddExtensionOption("vgi_result_cache_per_value",
+	                          "Per-VALUE memoization for exchange-mode maps: after input dedup, memoize the "
+	                          "worker output keyed on the individual input tuple, so a fully-warm distinct set "
+	                          "serves without the worker (cross-chunk / cross-query / cross-restart value "
+	                          "reuse the per-chunk cache misses). Gated by the master vgi_result_cache + the "
+	                          "worker's vgi.cache.* opt-in. Default ON",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
+	config.AddExtensionOption("vgi_exchange_per_batch_min_distinct_ratio",
+	                          "Store the COARSE per-chunk (M2) exchange-cache entry only when the chunk's "
+	                          "distinct ratio (K/N) is at least this — below it the per-value tier already "
+	                          "covers a future identical-chunk replay, so the redundant whole-chunk copy is "
+	                          "skipped. A per-chunk cardinality gate, not a miss-history back-off (per-value "
+	                          "still always stores its misses). 0 = always store the coarse entry. Default 0.5",
+	                          LogicalType::DOUBLE, Value::DOUBLE(0.5));
 
 	// Cache directory for worker binaries downloaded via github:// / github-auto://
 	// LOCATIONs. Empty (default) → ${XDG_CACHE_HOME:-~/.cache}/vgi/releases. Must be

@@ -1,6 +1,11 @@
 # Input Dedup + Per-Value Memoization for Exchange-Mode Maps — Design
 
-Status: **APPROVED — implementing** (phased; see §8). Author: cache maintainers.
+Status: **SHIPPING (phases 1–4 landed for the cache-infra operators).** Scalar + LATERAL
+input dedup (phases 1–2), per-value memo + M1/M2 coexistence gate for the batched LATERAL
+operator (phases 3–4). Deferred with justification: streaming dedup (§10), and **scalar
+per-value** — scalars have no result-cache infrastructure today (they were dedup-only in
+phase 1), so per-value there means building scalar result-caching from scratch; the mechanism
+is proven on LATERAL and scalar per-value is a clean follow-on. Author: cache maintainers.
 Unifies the per-input caching story across the **map-shaped** exchange operators (scalar,
 streaming table-in-out, batched correlated LATERAL) and reframes the existing per-batch/per-chunk
 result caches (M1/M2) as a coarse outer layer over a finer **per-value** one. Buffered (M3, a
@@ -187,10 +192,19 @@ rides the existing disk-tier opt-in (needs a cache dir to reach disk, memory-onl
 2. **LATERAL + streaming dedup** — the 1:N inverse-map expansion in `PhysicalVgiLateralBatch` (the
    stamp-per-original-row crux) and the streaming table-in-out map. Regression: shared-arg /
    different-outer-column fixture; result-equivalence vs `SET vgi_exchange_input_dedup=false`.
-3. **Per-value memo (all three)** — `LookupBatch`/`InsertBatch`, the per-tuple key + granularity
-   discriminator, the dedup→lookup→partition→ship-misses→assemble→store→scatter flow. Both transports.
-4. **Coexistence + gate** — the M1/M2 layering + the distinct-ratio store gate; stats
-   (`exchange_*` sub-counters already exist) to make hit rate observable; decide defaults from data.
+3. **Per-value memo** — ✅ **LATERAL** (`LookupBatch` + the per-tuple key/`v:` discriminator; a
+   full-hit distinct set assembles the cached per-tuple outputs via `ConcatenateRecordBatches` +
+   synthetic parent and serves without the worker; a miss stores each distinct tuple's output
+   sliced by `parent_row`). v1 skips the worker only on a **full** hit (partial-hit still ships the
+   whole deduped set — the reassemble-only-misses optimization is deferred). **Scalar per-value
+   deferred** (needs scalar result-caching, which doesn't exist). Both transports.
+4. **Coexistence + gate** — ✅ M2 layering (per-chunk hit short-circuits; on a miss, dedup + per-value
+   run under it) + the store-then-hit-safe distinct-ratio store gate
+   (`vgi_exchange_per_batch_min_distinct_ratio`). **Dedup is the master switch for both** (per-value
+   inherently needs the distinct set, so `vgi_exchange_input_dedup=false` disables both). Note: for a
+   **direct-column** correlated ref DuckDB's delim-join already feeds the operator the distinct set,
+   so M2 alone covers cross-query reuse; per-value's unique win is the **expression-arg** case (delim
+   does not pre-dedup) and cross-chunk value reuse within a query.
 
 Ship 1 first (no storage, big win, low risk), measure, then layer.
 

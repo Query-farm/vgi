@@ -1,0 +1,134 @@
+# name: test/sql/integration/cache/per_value_lateral.test
+# description: Per-VALUE memoization for the batched correlated LATERAL operator (phase 3).
+#   After input dedup, each distinct worker-input tuple's output is memoized keyed on the
+#   tuple. A later chunk with a DIFFERENT composition but the SAME distinct values misses the
+#   M2 per-chunk cache yet FULL-HITs the per-value tier → served without the worker (zero
+#   write_input). Uses an EXPRESSION arg (x % 3) so DuckDB's delim-join does NOT pre-dedup the
+#   correlated values (a direct column ref would, making per-value moot). See
+#   docs/exchange_dedup_pervalue.md.
+# group: [vgi_integration_cache]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+SET threads=1;
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+# ---------------------------------------------------------------------------
+# Cold: 9 rows over distinct values {0,1,2} → the worker computes the 3 distinct
+# (dedup: write_input=3) and each is memoized per-value (cached_double is cacheable).
+# ---------------------------------------------------------------------------
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query II
+SELECT count(*), sum(doubled)::BIGINT FROM range(9) t(x), LATERAL ex.cached_double(x % 3);
+----
+9	18
+
+# The worker saw only the 3 DISTINCT values (dedup), and it WAS exchanged with (cold).
+query I
+SELECT max(CAST(regexp_extract(message, 'input_rows=([0-9]+)', 1) AS BIGINT))
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'table_in_out.write_input'
+  AND message LIKE '%cached_double%';
+----
+3
+
+# ---------------------------------------------------------------------------
+# A DIFFERENT chunk (6 rows) over the SAME distinct values {0,1,2}: the M2 per-chunk
+# cache MISSES (different chunk) but every distinct value is memoized → per-value
+# FULL HIT, worker NOT exchanged with.
+# ---------------------------------------------------------------------------
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query II
+SELECT count(*), sum(doubled)::BIGINT FROM range(6) t(x), LATERAL ex.cached_double(x % 3);
+----
+6	12
+
+# Proof of per-value hit: ZERO write_input on the second chunk.
+query I
+SELECT count(*)
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'table_in_out.write_input'
+  AND message LIKE '%cached_double%';
+----
+0
+
+# ... and the hit was logged at the per_value tier.
+query I
+SELECT count(*) > 0
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'result_cache.hit'
+  AND message LIKE '%per_value%';
+----
+true
+
+# Exchange sub-counters saw the per-value hit.
+query I
+SELECT exchange_hits > 0 FROM vgi_result_cache_stats();
+----
+true
+
+statement ok
+CALL disable_logging();
+
+# ---------------------------------------------------------------------------
+# Disable per-value: the same second chunk now MISSES and the worker is exchanged
+# with again — proves the hit above was the per-value tier.
+# ---------------------------------------------------------------------------
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+statement ok
+SET vgi_result_cache_per_value = false;
+
+statement ok
+SELECT count(*) FROM range(9) t(x), LATERAL ex.cached_double(x % 3);
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+SELECT count(*) FROM range(6) t(x), LATERAL ex.cached_double(x % 3);
+
+query I
+SELECT count(*) > 0
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'table_in_out.write_input'
+  AND message LIKE '%cached_double%';
+----
+true
+
+statement ok
+CALL disable_logging();
+
+statement ok
+RESET vgi_result_cache_per_value;
+
+statement ok
+DETACH ex;
