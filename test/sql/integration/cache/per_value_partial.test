@@ -1,0 +1,123 @@
+# name: test/sql/integration/cache/per_value_partial.test
+# description: Per-value memo PARTIAL-hit skip. When only SOME distinct input values are already
+#   memoized, the operator ships ONLY the un-cached values to the worker and splices the cached
+#   outputs back — so a chunk whose distinct set overlaps a prior chunk/query recomputes just the
+#   NEW values (v1 recomputed the whole deduped set on any miss). Covers correlated LATERAL (1:N)
+#   and scalar (1:1). Asserts: (a) the worker input drops to the MISS count, (b) a partial_hit
+#   event fires, (c) the result is identical to per-value OFF. Both transports.
+# group: [vgi_integration_cache]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+SET threads=1;
+
+# ===========================================================================
+# Correlated LATERAL — warm values {0..24}, then query {0..49} in one chunk:
+# 25 hit + 25 miss → PARTIAL hit → the worker sees only the 25 new values.
+# ===========================================================================
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+# Warm ONLY the distinct set {0..24}.
+statement ok
+CREATE TEMP TABLE lat_warm AS SELECT x FROM range(25) g(x), LATERAL ex.cached_double(x % 25);
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE TEMP TABLE lat_partial AS SELECT x, doubled FROM range(50) g(x), LATERAL ex.cached_double(x % 50);
+
+# The single write_input for this partial chunk shipped 25 rows (the misses), NOT 50.
+query I
+SELECT max(regexp_extract(message, 'input_rows=([0-9]+)', 1)::INT)
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'table_in_out.write_input'
+  AND message LIKE '%cached_double%';
+----
+25
+
+# A partial_hit event fired: 25 values reused, 25 computed.
+query I
+SELECT count(*)
+FROM duckdb_logs()
+WHERE type = 'VGI' AND message LIKE '%result_cache.partial_hit%'
+  AND message LIKE '%reused_tuples=25%' AND message LIKE '%computed_tuples=25%';
+----
+1
+
+statement ok
+CALL disable_logging();
+
+# Correctness: identical to the per-value-OFF path (worker computes everything).
+statement ok
+SET vgi_result_cache_per_value = false;
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+statement ok
+CREATE TEMP TABLE lat_off AS SELECT x, doubled FROM range(50) g(x), LATERAL ex.cached_double(x % 50);
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM lat_partial EXCEPT ALL SELECT * FROM lat_off)
+  UNION ALL
+  (SELECT * FROM lat_off EXCEPT ALL SELECT * FROM lat_partial)
+);
+----
+0
+
+statement ok
+RESET vgi_result_cache_per_value;
+
+# ===========================================================================
+# Scalar (1:1) — same shape: warm {0..24}, query {0..49}, worker sees 25.
+# ===========================================================================
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+statement ok
+CREATE TEMP TABLE sc_warm AS SELECT ex.cached_double_scalar(x % 25) AS d FROM range(25) g(x);
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE TEMP TABLE sc_partial AS SELECT x, ex.cached_double_scalar(x % 50) AS d FROM range(50) g(x);
+
+query I
+SELECT max(regexp_extract(message, 'input_rows=([0-9]+)', 1)::INT)
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'scalar.write_input'
+  AND message LIKE '%cached_double_scalar%';
+----
+25
+
+statement ok
+CALL disable_logging();
+
+# Correctness: values are the true (x % 50) * 2 for every row, hits and misses alike.
+query I
+SELECT count(*) FROM sc_partial WHERE d <> (x % 50) * 2;
+----
+0
+
+statement ok
+DETACH ex;

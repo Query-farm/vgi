@@ -626,15 +626,45 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 		         {"key_hash", local_state.cache_static_key.HexDigest()},
 		         {"tier", "per_value"}});
 	} else {
+		// [partial per-value] Ship ONLY the distinct tuples with no cached entry; splice the
+		// cached 1-row outputs back into distinct order below. A chunk whose distinct set
+		// overlaps a prior chunk/query recomputes just the NEW values. Full-miss is the
+		// empty-cached-prefix case (miss_indices == every distinct tuple). `full_pv_hit`
+		// already handled all-cached, so with pv on here miss_indices is non-empty.
+		std::vector<idx_t> miss_indices;
+		if (pv_enabled) {
+			for (idx_t d = 0; d < ship->size(); d++) {
+				if (!pv_hits[d]) {
+					miss_indices.push_back(d);
+				}
+			}
+		}
+		const bool partial_pv = pv_enabled && miss_indices.size() < ship->size();
+		DataChunk miss_ship;
+		DataChunk *ship_to_worker = ship;
+		if (partial_pv) {
+			const idx_t m = miss_indices.size();
+			SelectionVector sel(m == 0 ? 1 : m);
+			for (idx_t j = 0; j < m; j++) {
+				sel.set_index(j, miss_indices[j]);
+			}
+			miss_ship.Initialize(Allocator::Get(context), ship->GetTypes(), m == 0 ? 1 : m);
+			for (idx_t c = 0; c < ship->ColumnCount(); c++) {
+				VectorOperations::Copy(ship->data[c], miss_ship.data[c], sel, m, 0, 0);
+			}
+			miss_ship.SetCardinality(m);
+			ship_to_worker = &miss_ship;
+		}
+
 		std::shared_ptr<arrow::RecordBatch> input_batch;
 		if (timing) {
 			ScopedNs _t(ClientTiming::Instance().convert_in_ns);
-			input_batch = DataChunkToArrowCached(context, *ship, local_state.input_schema,
+			input_batch = DataChunkToArrowCached(context, *ship_to_worker, local_state.input_schema,
 			                                     local_state.input_arrow_types, local_state.input_arrow_names,
 			                                     *local_state.input_client_props,
 			                                     local_state.input_extension_types);
 		} else {
-			input_batch = DataChunkToArrowCached(context, *ship, local_state.input_schema,
+			input_batch = DataChunkToArrowCached(context, *ship_to_worker, local_state.input_schema,
 			                                     local_state.input_arrow_types, local_state.input_arrow_names,
 			                                     *local_state.input_client_props,
 			                                     local_state.input_extension_types);
@@ -661,14 +691,48 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 			throw IOException("VGI scalar function '%s' returned no output for %d input rows",
 			                  func_info.function_name, args.size());
 		}
-		if (static_cast<idx_t>(output_batch->num_rows()) != ship->size()) {
+		if (static_cast<idx_t>(output_batch->num_rows()) != ship_to_worker->size()) {
 			throw IOException("VGI scalar function '%s' returned %d rows but expected %d (1:1 mapping required)",
 			                  func_info.function_name, output_batch->num_rows(),
-			                  static_cast<int64_t>(ship->size()));
+			                  static_cast<int64_t>(ship_to_worker->size()));
 		}
 		if (output_batch->num_columns() != 1) {
 			throw IOException("VGI scalar function '%s' returned %d columns but expected 1",
 			                  func_info.function_name, output_batch->num_columns());
+		}
+
+		// [partial per-value] Reassemble the fresh worker rows + cached 1-row outputs into a
+		// full distinct-order batch (row d = distinct tuple d), so the store loop and the
+		// scatter-back below index it exactly as they would a full worker exchange.
+		if (partial_pv) {
+			std::vector<int64_t> miss_pos(ship->size(), -1); // distinct index → its row in the fresh output
+			for (idx_t j = 0; j < miss_indices.size(); j++) {
+				miss_pos[miss_indices[j]] = static_cast<int64_t>(j);
+			}
+			std::vector<std::shared_ptr<arrow::RecordBatch>> parts(ship->size());
+			idx_t reused_tuples = 0;
+			for (idx_t d = 0; d < ship->size(); d++) {
+				if (pv_hits[d]) {
+					++reused_tuples;
+					// A scalar per-value entry is exactly one 1-row batch (1:1 store).
+					parts[d] = DeserializeCachedRecordBatch(*pv_hits[d], pv_hits[d]->streams[0].batches[0]);
+				} else {
+					parts[d] = output_batch->Slice(miss_pos[d], 1);
+				}
+			}
+			auto cat = arrow::ConcatenateRecordBatches(parts);
+			if (!cat.ok()) {
+				throw IOException("VGI scalar '%s' partial per-value splice failed: %s", func_info.function_name,
+				                  cat.status().ToString());
+			}
+			output_batch = cat.ValueUnsafe();
+			// Still a MISS for the hit/miss counters (the worker ran for the misses, recorded
+			// below); this surfaces the worker-input reduction.
+			VGI_LOG(context, "result_cache.partial_hit",
+			        {{"function", func_info.function_name},
+			         {"key_hash", local_state.cache_static_key.HexDigest()},
+			         {"reused_tuples", std::to_string(reused_tuples)},
+			         {"computed_tuples", std::to_string(miss_indices.size())}});
 		}
 
 		// [per-value store] Memoize each MISSED distinct tuple's 1-row output, if the worker

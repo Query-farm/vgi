@@ -165,6 +165,14 @@ missing coverage.
 28. `LIMIT … OFFSET` past a substream boundary on the single-thread serve.
 
 ## Non-test follow-ups noted by reviewers
-- CLAUDE.md `max_entry_bytes` doc is stale post-spill (says "aborts" — now spills to disk). Fix the two rows.
-- Ref `bytes=` unit differs between `CommitStreamingCapture` (framing-inclusive) and `PersistToDisk`
-  (payload-only); the global disk-cap sums both. Low severity; unify or note.
+- ~~CLAUDE.md `max_entry_bytes` doc is stale post-spill (says "aborts" — now spills to disk).~~
+  **RESOLVED** — CLAUDE.md's `vgi_result_cache_max_entry_bytes` row + the *Spill-to-disk capture*
+  section both correctly describe the spill-then-abort-if-no-disk behavior.
+- Ref `bytes=` unit: the streaming-live spill path (`AppendBatch` logical_len via
+  `GetRecordBatchSize` — the RecordBatch message size) and the memory-capture / pre-threshold-drain
+  paths (`SerializeRecordBatch(uncompressed)->size()` — includes IPC stream framing) differ by a few
+  hundred bytes/batch of framing. **Resolution: NOTED, not unified** (see the code comment at the
+  live-spill `logical_len` site in `vgi_table_function_impl.cpp`). Unifying would add an uncompressed
+  serialize to the multi-GB spill hot path, or shift reported `total_bytes` for every memory entry —
+  not worth it. The disk byte *cap* uses the on-disk COMPRESSED size (consistent); only the advisory
+  logical `bytes=` and the materialize-vs-stream threshold see the delta. Low severity.

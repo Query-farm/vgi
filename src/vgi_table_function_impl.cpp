@@ -2496,6 +2496,17 @@ static bool InstallBatch(ClientContext &context, const VgiTableFunctionBindData 
 					// Compress AT SOURCE (the live batch is here) — one serialize pass, no
 					// transcode round-trip on the multi-GB spill path. logical_len is the
 					// uncompressed IPC size (cheap, no extra serialize).
+					//
+					// NOTE (bytes= unit): this uses GetRecordBatchSize (the RecordBatch IPC
+					// message size) whereas the memory-capture path (and the pre-threshold
+					// spill drain) uses SerializeRecordBatch(uncompressed)->size(), which also
+					// counts any IPC stream framing. So the ref's logical bytes= can differ by
+					// a few hundred bytes/batch of framing between a spilled-live entry and a
+					// memory-persisted one. Deliberately NOT unified: matching it would add an
+					// uncompressed serialize to this hot path, or shift reported total_bytes for
+					// every memory entry — not worth it for a sub-batch-of-framing delta. The
+					// disk byte CAP uses the on-disk COMPRESSED size (consistent), so only the
+					// advisory logical bytes= / materialize-vs-stream threshold is affected.
 					int64_t logical_len = 0;
 					if (!arrow::ipc::GetRecordBatchSize(*arrow_batch, &logical_len).ok()) {
 						logical_len = 0;

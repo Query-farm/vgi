@@ -232,9 +232,19 @@ for an M2/producer serve — so a hit's origin is always observable.
 3. **Per-value memo** — ✅ **LATERAL and scalar** (`LookupBatch` + the per-tuple key/`v:`
    discriminator; a full-hit distinct set assembles the cached per-tuple outputs via
    `ConcatenateRecordBatches` and serves without the worker; a miss stores each distinct tuple's
-   output — sliced by `parent_row` for LATERAL, a 1-row slice for the scalar). v1 skips the worker
-   only on a **full** hit (partial-hit still ships the whole deduped set — the reassemble-only-misses
-   optimization is deferred). **Scalar** required the result-caching prerequisite: a `CACHE_CONTROL`
+   output — sliced by `parent_row` for LATERAL, a 1-row slice for the scalar).
+   **✅ Partial-hit skip (reassemble-only-misses):** when only SOME distinct tuples are cached, the
+   operator ships ONLY the un-cached ones to the worker and splices the cached outputs back — so a
+   chunk whose distinct set overlaps a prior chunk/query recomputes just the NEW values (the common
+   slowly-growing / overlapping-key-space steady state). Unification insight: a full miss is the
+   empty-cached-prefix special case (`miss_indices` == the whole distinct set), so one code path
+   serves both. LATERAL splices cached-hit rows (parent = distinct index) in front of the fresh
+   worker output (sub-index remapped to distinct index via `miss_indices`); scalar reassembles into
+   distinct order (row d = tuple d) since its scatter is positional. A partial hit still ran the
+   worker (for the misses) so it stays a MISS for the hit/miss counters; a `result_cache.partial_hit`
+   `{reused_tuples, computed_tuples}` event surfaces the worker-input reduction. Proof:
+   `write_input` `input_rows` drops to the miss count. Test: `cache/per_value_partial.test`.
+   **Scalar** required the result-caching prerequisite: a `CACHE_CONTROL`
    opt-in on `ScalarFunction` (vgi-python) riding the emit path's batch custom_metadata, and a
    field-based `BuildExchangeCacheKeyStaticFields` the scalar shares with the table-in-out key
    builder. Both transports.

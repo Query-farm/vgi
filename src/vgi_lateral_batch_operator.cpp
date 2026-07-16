@@ -652,8 +652,43 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 		if (state.cache_eligible) {
 			gstate.cache_misses.fetch_add(1, std::memory_order_relaxed); // this chunk hit the worker
 		}
-		// ONE batched exchange for the (deduped) input chunk.
-		auto input_batch = ConvertInputToArrow(client_context, worker_input, bd);
+		// [partial per-value] Ship ONLY the distinct tuples with no cached entry; the cached
+		// ones are spliced back in below. So a chunk whose distinct set overlaps a prior
+		// chunk/query recomputes just the NEW values (a full miss is the empty-cached-prefix
+		// special case: miss_indices == the whole distinct set, cached prefix empty). pv off ⇒
+		// ship the whole worker_input unchanged. `full_pv_hit` already handled the all-cached
+		// case, so with pv on here miss_indices is guaranteed non-empty.
+		std::vector<idx_t> miss_indices;
+		if (pv_enabled) {
+			for (idx_t d = 0; d < dd.k; d++) {
+				if (!pv_hits[d]) {
+					miss_indices.push_back(d);
+				}
+			}
+		}
+		DataChunk miss_input;
+		idx_t shipped_rows;
+		if (pv_enabled) {
+			const idx_t m = miss_indices.size();
+			SelectionVector sel(m == 0 ? 1 : m);
+			for (idx_t j = 0; j < m; j++) {
+				sel.set_index(j, miss_indices[j]);
+			}
+			miss_input.Initialize(Allocator::Get(client_context), in_types, m == 0 ? 1 : m);
+			for (idx_t c = 0; c < input_length; c++) {
+				VectorOperations::Copy(worker_input.data[c], miss_input.data[c], sel, m, 0, 0);
+			}
+			miss_input.SetCardinality(m);
+			shipped_rows = m;
+		} else {
+			// Decode provenance against the full worker input: the distinct set (dd.k rows)
+			// when dedup_active, else the full N-row chunk.
+			shipped_rows = dedup_active ? dd.k : input.size();
+		}
+		DataChunk &ship = pv_enabled ? miss_input : worker_input;
+
+		// ONE batched exchange for the (miss-subset, or whole deduped) input chunk.
+		auto input_batch = ConvertInputToArrow(client_context, ship, bd);
 		VGI_LOG(client_context, "table_in_out.write_input",
 		        {{"conn", state.connection->GetConnIdHex()},
 		         {"worker_path", bd.worker_path()},
@@ -707,18 +742,73 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 			state.cache_cc_latched = true;
 		}
 
-		if (output_batch->num_rows() == 0) {
-			// 1->0 for the WHOLE chunk: every input row filtered out. Not cached (v1) — a
-			// partial 1->0 (some rows survive) carries provenance and IS captured below.
+		// Decode the FRESH worker output's provenance (sub-index into the shipped subset).
+		// Guard the 0-row case: DecodeParentRow requires output_rows == input_rows when the
+		// worker sends no provenance, which a whole-subset 1->0 (0 output rows, m>0 shipped)
+		// can't satisfy — a 0-row fresh output simply contributes no rows.
+		std::vector<int32_t> fresh_parent;
+		if (output_batch->num_rows() > 0) {
+			fresh_parent = DecodeParentRow(state.connection->GetLastParentRowBytes(),
+			                               static_cast<idx_t>(output_batch->num_rows()), shipped_rows, bd);
+		}
+
+		if (pv_enabled) {
+			// Splice: cached-hit rows (parent = the distinct index d) come first, then the fresh
+			// rows (their sub-index remapped to the real distinct index via miss_indices). The
+			// resulting output_batch + worker_parent look exactly like a full exchange, so the
+			// store loop and the EXPAND below run unchanged. Full-miss ⇒ empty cached prefix.
+			std::vector<std::shared_ptr<arrow::RecordBatch>> parts;
+			worker_parent.clear();
+			idx_t reused_tuples = 0;
+			for (idx_t d = 0; d < dd.k; d++) {
+				if (!pv_hits[d]) {
+					continue;
+				}
+				++reused_tuples;
+				for (const auto &b : pv_hits[d]->streams[0].batches) {
+					auto rb = DeserializeCachedRecordBatch(*pv_hits[d], b);
+					for (int64_t r = 0; r < rb->num_rows(); r++) {
+						worker_parent.push_back(static_cast<int32_t>(d));
+					}
+					parts.push_back(std::move(rb));
+				}
+			}
+			if (output_batch->num_rows() > 0) {
+				for (auto p : fresh_parent) {
+					worker_parent.push_back(static_cast<int32_t>(miss_indices[static_cast<idx_t>(p)]));
+				}
+				parts.push_back(output_batch);
+			}
+			if (parts.empty()) {
+				output_batch = nullptr; // whole chunk 1->0 across every distinct tuple
+			} else if (parts.size() == 1) {
+				output_batch = std::move(parts[0]);
+			} else {
+				auto cat = arrow::ConcatenateRecordBatches(parts);
+				if (!cat.ok()) {
+					throw IOException("vgi_batch_lateral: partial per-value splice concat failed: %s",
+					                  cat.status().ToString());
+				}
+				output_batch = cat.ValueUnsafe();
+			}
+			// A partial hit still ran the worker (for the misses), so it stays a MISS for the
+			// hit/miss counters (recorded above); this event surfaces the worker-input reduction.
+			if (reused_tuples > 0 && reused_tuples < dd.k) {
+				VGI_LOG(client_context, "result_cache.partial_hit",
+				        {{"function", bd.function_name},
+				         {"key_hash", state.capture_key.HexDigest()},
+				         {"reused_tuples", std::to_string(reused_tuples)},
+				         {"computed_tuples", std::to_string(miss_indices.size())}});
+			}
+		} else {
+			worker_parent = std::move(fresh_parent);
+		}
+
+		// Whole chunk produced nothing (all-filtered fresh + no cached rows, or a pv-off 1->0).
+		if (!output_batch || output_batch->num_rows() == 0) {
 			chunk.SetCardinality(0);
 			return OperatorResultType::NEED_MORE_INPUT;
 		}
-
-		// Decode provenance (identity when absent + rows align). When dedup_active the
-		// worker input is the distinct set (dd.k rows), else the full N-row chunk.
-		const idx_t worker_input_rows = dedup_active ? dd.k : input.size();
-		worker_parent = DecodeParentRow(state.connection->GetLastParentRowBytes(),
-		                                static_cast<idx_t>(output_batch->num_rows()), worker_input_rows, bd);
 
 		// [per-value store] Persist each MISSED distinct tuple's output rows (pre-stamp) as
 		// its own per-value entry, so a future chunk with the same value serves without the
