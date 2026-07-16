@@ -117,7 +117,10 @@ function-type protocol paths over the SAB channel, all under `SET threads=4`:
 - **streaming table-in-out** (`sab_echo`, classic `TABLE`/subquery input → passthrough),
 - **aggregate** (`sab_sum`, exchange update + combine + finalize; ungrouped + grouped),
 - **large payload** (`sab_big`, ~50 MB streamed over the 64 KiB ring — the chunker),
-- **LIMIT early-abandon** (client stops mid-stream → slot teardown/bail; a following scan works).
+- **LIMIT early-abandon** (client stops mid-stream → slot teardown/bail; a following scan works),
+- **result-cache hit** (`sab_cached` advertises `vgi.cache.ttl` + stamps a per-run nonce; two
+  identical scans return the SAME nonce ⇒ the 2nd was served from cache, and
+  `vgi_result_cache_stats().hits ≥ 1`).
 
 Fixtures live in `../../sabtable/src/lib.rs` (rebuild the worker via `../build.sh`). Run:
 
@@ -127,15 +130,15 @@ VGI_ENTRY=test-features.mjs node serve.mjs 8799   # then open the page in a COI 
 # worker thread, so isolate to localize a hang). window.__result.pass is the gate.
 ```
 
-**WASM result-cache limitation.** The table-function / exchange **result cache** is defaulted
-**OFF on WASM** (`vgi_result_cache` default `false` under emscripten). Its cache keys + identity
-scope are SHA-256 hashes via the engine's mbedtls (`MbedTlsWrapper::ComputeSha256Hash`), which is
-not resolvable from the dlopen'd extension side-module on emscripten — any cache-eligibility path
-throws "`_ is not a function`", which for the exchange operators (scalar / table-in-out) manifests
-as a **hang**. The cache is also value-less over the in-browser `worker:` transport (single
-in-process session). Fixing it needs a WASM-native SHA-256 in the extension; until then the cache
-is off on WASM. (This is why `test-features.mjs` passes without any `SET` — the default already
-disables it.)
+**Result cache on WASM (resolved).** The cache was briefly defaulted off on WASM because its keys +
+identity scope are SHA-256 hashes, and the engine's mbedtls (`MbedTlsWrapper::ComputeSha256Hash`) is
+not resolvable from the dlopen'd extension side-module on emscripten (→ "`_ is not a function`",
+which for the exchange operators manifested as a hang). Fixed: the extension now computes SHA-256 via
+`VgiSha256Hex` (`src/vgi_sha256.cpp`), which on emscripten calls the engine's **exported**
+`duckdb_wasm_sha256` primitive (mbedtls runs inside the main module, where it *is* available — the
+same primitive `vgi_oauth` uses) and on native uses mbedtls directly. The cache is **on by default**
+again on WASM; `cacheHitOk` proves a real hit. (The on-disk cache tier's incremental hashing stays
+mbedtls, but the disk tier is off on WASM — no persistent FS.)
 
 **Reliability.** The transport's *logic* is covered reliably + fast by the native
 `[sab]/[sab-e2e]/[sab-conn]` unit tests (count_to + multi-batch + error over the in-process ring

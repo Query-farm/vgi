@@ -17,13 +17,12 @@
 #include "duckdb/function/create_sort_key.hpp"
 #include "duckdb/main/client_context.hpp"
 
-#include "mbedtls_wrapper.hpp"
-
 #include "storage/vgi_catalog.hpp"
 #include "vgi_arrow_ipc.hpp"
 #include "vgi_cache_control.hpp"
 #include "vgi_oauth.hpp"
 #include "vgi_result_cache.hpp"
+#include "vgi_sha256.hpp"
 #include "vgi_table_in_out_impl.hpp"
 
 namespace duckdb {
@@ -31,18 +30,8 @@ namespace vgi {
 
 namespace {
 
-std::string HexEncode(const std::string &raw) {
-	static const char *digits = "0123456789abcdef";
-	std::string hex(raw.size() * 2, '0');
-	for (size_t i = 0; i < raw.size(); i++) {
-		hex[i * 2] = digits[(static_cast<unsigned char>(raw[i]) >> 4) & 0xF];
-		hex[i * 2 + 1] = digits[static_cast<unsigned char>(raw[i]) & 0xF];
-	}
-	return hex;
-}
-
 std::string Sha256Hex(const std::string &bytes) {
-	return HexEncode(duckdb_mbedtls::MbedTlsWrapper::ComputeSha256Hash(bytes));
+	return VgiSha256Hex(bytes); // WASM-safe (native mbedtls / emscripten engine primitive)
 }
 
 } // namespace
@@ -109,17 +98,19 @@ std::string HashInputChunkUnordered(ClientContext & /*context*/, DataChunk &chun
 	}
 	std::sort(rows.begin(), rows.end());
 
-	duckdb_mbedtls::MbedTlsWrapper::SHA256State sha;
-	sha.AddString(std::to_string(static_cast<uint64_t>(count)));
-	sha.AddString(":");
+	// Serialize the sorted multiset into one buffer and hash it once — byte-identical
+	// to streaming the same (count ":" then per-row "len:bytes") sequence, and WASM-safe
+	// (see VgiSha256Hex). The rows are already materialized above, so one-shot vs
+	// incremental is equivalent here (this is a per-chunk key, not a large blob).
+	std::string buf;
+	buf += std::to_string(static_cast<uint64_t>(count));
+	buf += ":";
 	for (auto &r : rows) {
-		sha.AddString(std::to_string(r.size()));
-		sha.AddString(":");
-		sha.AddString(r);
+		buf += std::to_string(r.size());
+		buf += ":";
+		buf += r;
 	}
-	char hex[duckdb_mbedtls::MbedTlsWrapper::SHA256_HASH_LENGTH_TEXT];
-	sha.FinishHex(hex);
-	return std::string(hex, duckdb_mbedtls::MbedTlsWrapper::SHA256_HASH_LENGTH_TEXT);
+	return VgiSha256Hex(buf);
 }
 
 std::vector<std::string> HashInputRowsPerValue(ClientContext & /*context*/, DataChunk &chunk) {

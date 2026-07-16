@@ -14,6 +14,7 @@
 #include "mbedtls_wrapper.hpp"
 #include "vgi_arrow_ipc.hpp" // TranscodeIpcWithCodec / ResolveDiskCompressionCodec (disk compression)
 #include "vgi_platform.hpp" // VGI_SUBPROCESS_TRANSPORT (thread gate — Emscripten is single-threaded)
+#include "vgi_sha256.hpp"   // WASM-safe SHA-256 (Sha256Hex; the disk-writer streaming stays mbedtls)
 
 namespace duckdb {
 namespace vgi {
@@ -59,7 +60,7 @@ std::string HexEncode(const std::string &raw) {
 }
 
 std::string Sha256Hex(const std::string &bytes) {
-	return HexEncode(duckdb_mbedtls::MbedTlsWrapper::ComputeSha256Hash(bytes));
+	return VgiSha256Hex(bytes); // WASM-safe (native mbedtls / emscripten engine primitive)
 }
 
 // Write all bytes to a FileHandle (handles short writes). Throws on a stuck write.

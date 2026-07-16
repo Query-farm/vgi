@@ -3299,24 +3299,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// a worker-advertised-cacheable table-function call and serves identical
 	// future calls from memory. Double-gated: only results advertising
 	// vgi.cache.* are stored, and a catalog opts out with the `cache` ATTACH option.
-	// Default the result cache OFF on WASM/emscripten: its cache keys + identity scope are
-	// SHA-256 hashes computed via the engine's mbedtls (MbedTlsWrapper::ComputeSha256Hash),
-	// which is NOT resolvable from the dlopen'd extension side-module on emscripten (the
-	// symbol isn't in the main module's dynamic export table), so any cache-eligibility
-	// path throws "_ is not a function" — which for the exchange-mode (scalar / table-in-out)
-	// operators manifests as a hang. The cache is also value-less over the in-browser
-	// `worker:` transport (single in-process session, no network/process round-trip to
-	// amortize). Off by default here until the extension carries a WASM-native SHA-256.
-#if defined(__EMSCRIPTEN__)
-	const bool kResultCacheDefault = false;
-#else
-	const bool kResultCacheDefault = true;
-#endif
 	config.AddExtensionOption("vgi_result_cache",
 	                          "Enable the VGI table-function result cache (master switch; still "
-	                          "double-gated by worker advertisement + per-catalog `cache` option). "
-	                          "Defaults OFF on WASM (no extension-side SHA-256)",
-	                          LogicalType::BOOLEAN, Value::BOOLEAN(kResultCacheDefault));
+	                          "double-gated by worker advertisement + per-catalog `cache` option)",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
 	config.AddExtensionOption("vgi_result_cache_max_bytes",
 	                          "Global byte cap for the in-memory result cache (LRU eviction above it)",
 	                          LogicalType::UBIGINT, Value::UBIGINT(268435456));

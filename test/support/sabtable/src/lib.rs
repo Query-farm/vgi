@@ -17,6 +17,7 @@ use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 
 use vgi::aggregate::{AggregateBindParams, AggregateFunction};
+use vgi::cache_control::CacheControl;
 use vgi::function::{ArgSpec, BindParams, BindResponse, FunctionMetadata, ProcessParams, ScalarFunction};
 use vgi::table_function::{TableFunction, TableProducer};
 use vgi::table_in_out::{project_batch, TableInOutFunction};
@@ -515,6 +516,61 @@ impl TableFunction for SabBig {
     }
 }
 
+// ---- sab_cached(rows): a cacheable producer (proves the result cache on WASM) --------
+// Advertises `vgi.cache.ttl` on its first batch so an identical repeat scan is served from
+// the extension's result cache WITHOUT re-running the worker. Each actual worker run stamps
+// a fresh process-global NONCE into every row's value; so if two identical scans return the
+// SAME value the second was a cache HIT (the worker did not re-run → nonce unchanged). The
+// nonce also proves the SHA-256 cache-key path works on WASM (a miss recomputes → new nonce).
+static CACHE_NONCE: AtomicI32 = AtomicI32::new(0);
+
+struct SabCached;
+struct SabCachedProducer {
+    schema: SchemaRef,
+    rows: i64,
+    done: bool,
+    meta: Option<HashMap<String, String>>,
+}
+impl TableProducer for SabCachedProducer {
+    fn next_batch(&mut self, _out: &mut OutputCollector) -> Result<Option<RecordBatch>> {
+        if self.done {
+            return Ok(None);
+        }
+        self.done = true;
+        let nonce = CACHE_NONCE.fetch_add(1, Ordering::SeqCst) as i64 + 1;
+        let col: ArrayRef = Arc::new(Int64Array::from(vec![nonce; self.rows.max(0) as usize]));
+        // Opt into caching (ttl) on the first (only) batch.
+        self.meta = Some(CacheControl::ttl(60).to_metadata());
+        Ok(Some(RecordBatch::try_new(self.schema.clone(), vec![col])
+            .map_err(|e| RpcError::runtime_error(e.to_string()))?))
+    }
+    fn last_metadata(&self) -> Option<HashMap<String, String>> {
+        self.meta.clone()
+    }
+}
+impl TableFunction for SabCached {
+    fn name(&self) -> &str {
+        "sab_cached"
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        FunctionMetadata::default()
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![ArgSpec::const_arg("rows", 0, "int64", "Rows to emit (all = a per-run nonce)")]
+    }
+    fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
+        Ok(BindResponse { output_schema: value_schema(), opaque_data: Vec::new() })
+    }
+    fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
+        Ok(Box::new(SabCachedProducer {
+            schema: params.output_schema.clone(),
+            rows: params.arguments.const_i64(0).unwrap_or(1),
+            done: false,
+            meta: None,
+        }))
+    }
+}
+
 /// Serve one slot to completion, then EOS the output ring. Blocking; run on a thread.
 #[no_mangle]
 pub extern "C" fn vgi_rust_serve_table_sab_slot(slot: i32) {
@@ -529,6 +585,7 @@ pub extern "C" fn vgi_rust_serve_table_sab_slot(slot: i32) {
     worker.register_table_in_out(SabEcho);
     worker.register_aggregate(SabSum);
     worker.register_table(SabBig);
+    worker.register_table(SabCached);
     // No set_catalog: the dispatcher installs a default CatalogModel, and the C++
     // client binds `count_to` directly by name against the dispatch registry.
     worker.serve_reader_writer(SabReader { slot }, SabWriter { slot });

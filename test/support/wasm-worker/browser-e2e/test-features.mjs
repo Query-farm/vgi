@@ -94,8 +94,22 @@ async function step(R, name, fn) {
       return Number(r2.getChild('c').get(0)) === 4;
     });
 
+    // --- RESULT CACHE HIT (proves the WASM-native SHA-256 cache key path works) --
+    // sab_cached advertises vgi.cache.ttl and stamps a per-worker-run NONCE into every
+    // row. Two identical scans: if the 2nd returns the SAME nonce, it was served from
+    // the result cache (worker NOT re-run). A broken/off cache re-runs → different nonce.
+    await step(R, 'cacheHitOk', async () => {
+      const a = await q(`SELECT DISTINCT value v FROM vgi_table_function(${W}, 'sab_cached', [3])`);
+      const b = await q(`SELECT DISTINCT value v FROM vgi_table_function(${W}, 'sab_cached', [3])`);
+      const va = Number(a.getChild('v').get(0)), vb = Number(b.getChild('v').get(0));
+      R.cacheNonces = va + ',' + vb;
+      const st = await q("SELECT hits::INT h FROM vgi_result_cache_stats()");
+      R.cacheHits = Number(st.getChild('h').get(0));
+      return va === vb && R.cacheHits >= 1; // same nonce + a recorded hit
+    });
+
     try { await conn.close(); await db.terminate(); } catch (e) { /* a hung conn may not close */ }
-    R.pass = ['scalarOk', 'tableInOutOk', 'aggregateOk', 'aggregateGroupedOk', 'largePayloadOk', 'limitAbandonOk'].every((k) => R[k] === 'OK');
+    R.pass = ['scalarOk', 'tableInOutOk', 'aggregateOk', 'aggregateGroupedOk', 'largePayloadOk', 'limitAbandonOk', 'cacheHitOk'].every((k) => R[k] === 'OK');
     log('PASS=' + R.pass);
   } catch (e) {
     R.error = String(e && e.stack ? e.stack : e);

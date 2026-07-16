@@ -123,6 +123,7 @@ src/vgi_worker_pool.cpp
 src/vgi_worker_pool_functions.cpp
 src/vgi_result_cache.cpp
 src/vgi_exchange_cache_key.cpp
+src/vgi_sha256.cpp
 src/vgi_input_dedup.cpp
 src/vgi_result_cache_functions.cpp
 src/vgi_cached_replay_connection.cpp
@@ -207,6 +208,7 @@ if((BUILD_VGI_UNIT_TESTS OR DEFINED ENV{BUILD_VGI_UNIT_TESTS}) AND NOT WIN32)
     src/vgi_bind_protocol.cpp
     src/vgi_arrow_utils.cpp
     src/vgi_result_cache.cpp
+    src/vgi_sha256.cpp
     src/vgi_table_buffering_builders.cpp
     src/vgi_schema_registry.cpp
     src/vgi_arrow_ipc.cpp
