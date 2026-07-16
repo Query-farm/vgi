@@ -140,6 +140,28 @@ same primitive `vgi_oauth` uses) and on native uses mbedtls directly. The cache 
 again on WASM; `cacheHitOk` proves a real hit. (The on-disk cache tier's incremental hashing stays
 mbedtls, but the disk tier is off on WASM — no persistent FS.)
 
+### TypeScript worker parity (`test-ts-worker.mjs`)
+
+The `worker:` transport is worker-language-agnostic. `test-ts-worker.mjs` proves a
+**TypeScript** worker (vgi-typescript) serves over the same SAB channel at parity with
+the Rust `sabtable` worker: a direct `vgi_table_function('worker:ts-worker-boot.js',
+'ts_count', [5])` (producer mode), `ATTACH` + discovery + `tcat.main.ts_count(3)`, and a
+`ts_double` scalar (exchange mode). The worker is
+`vgi-typescript/examples/sab-worker/boot.ts` — it multiplexes all SAB slots on one Web
+Worker's event loop via `Atomics.waitAsync` (vs. the Rust worker's emscripten
+thread-per-slot) and drives vgi-rpc's `serveStream` over a new browser `ByteSink` writer.
+
+```bash
+# build the TS worker bundle (from vgi-typescript), copy to ts-worker-mod.js here:
+(cd <vgi-typescript> && bun build examples/sab-worker/boot.ts --outdir examples/sab-worker/dist --target browser --format esm)
+cp <vgi-typescript>/examples/sab-worker/dist/boot.js test/support/wasm-worker/ts-worker-mod.js
+VGI_ENTRY=test-ts-worker.mjs node serve.mjs 8799   # then open in a COI browser
+```
+
+`ts-worker-boot.js` (a hand-written classic shim, tracked) dynamic-imports the ESM
+`ts-worker-mod.js` bundle (a build artifact, gitignored). Needs vgi-rpc-typescript ≥ the
+`ByteSink` serve writable and vgi-typescript's `serveStream` widened to accept it.
+
 **Reliability.** The transport's *logic* is covered reliably + fast by the native
 `[sab]/[sab-e2e]/[sab-conn]` unit tests (count_to + multi-batch + error over the in-process ring
 analog) — those are the gate. This browser runner is the only test of the *real* browser stack

@@ -1,3 +1,4 @@
 # Built worker-module artifacts (produced by build.sh)
 vgi_worker.js
 vgi_worker.wasm
+ts-worker-mod.js

@@ -24,7 +24,7 @@ const dir = mkdtempSync(join(tmpdir(), 'vgi-worker-serve-'));
 for (const f of ['duckdb-browser.mjs', 'duckdb-browser-coi.worker.js', 'duckdb-browser-coi.pthread.worker.js'])
   copyFileSync(join(DIST, f), join(dir, f));
 copyFileSync(join(BINDINGS, 'duckdb-coi.wasm'), join(dir, 'duckdb-coi.wasm'));
-for (const f of ['vgi_worker.js', 'vgi_worker.wasm', 'vgi-worker-boot.js'])
+for (const f of ['vgi_worker.js', 'vgi_worker.wasm', 'vgi-worker-boot.js', 'ts-worker-boot.js', 'ts-worker-mod.js'])
   copyFileSync(join(HERE, '..', f), join(dir, f));
 copyFileSync(BRIDGE, join(dir, 'vgi-webworker-bridge.ts'));
 copyFileSync(join(HERE, 'index.html'), join(dir, 'index.html'));
