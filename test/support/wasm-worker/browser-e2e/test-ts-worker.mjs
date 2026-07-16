@@ -54,8 +54,21 @@ const to = (ms, t) => new Promise((_, rej) => setTimeout(() => rej(new Error('__
       log('ts_count(3)=' + JSON.stringify(cv) + ' ok=' + R.attachTableOk + '; ts_double=' + JSON.stringify(sv) + ' ok=' + R.scalarOk);
     } catch (e) { R.attachTableOk = false; R.scalarOk = false; R.attachErr = String(e.message || e).slice(0, 160); log('attach ERR ' + R.attachErr); }
 
+    // 3. TRUE PARALLELISM proof. ts_probe (maxWorkers=4) fans ONE scan across DuckDB scan
+    // threads => N worker: connections => N slots => N dedicated SLOT sub-Workers, each
+    // CPU-busy-looping under a shared concurrency guard. On a single async event loop the
+    // busy loop blocks => peak concurrency 1; N real sub-Worker threads => peak >= 2.
+    try {
+      await q('SET threads=4');
+      await q(`SELECT count(*)::INT FROM vgi_table_function(${W}, 'ts_probe', [200])`, 30000);
+      const rp = await q(`SELECT * FROM vgi_table_function(${W}, 'ts_peek', [])`);
+      R.peakConcurrency = Number(rp.getChildAt(0).get(0));
+      R.parallelOk = R.peakConcurrency >= 2;
+      log('peakConcurrency=' + R.peakConcurrency + ' parallelOk=' + R.parallelOk);
+    } catch (e) { R.parallelOk = false; R.parallelErr = String(e.message || e).slice(0, 160); log('parallel ERR ' + R.parallelErr); }
+
     await conn.close(); await db.terminate();
-    R.pass = R.loaded && R.directOk && R.attachTableOk && R.scalarOk;
+    R.pass = R.loaded && R.directOk && R.attachTableOk && R.scalarOk && R.parallelOk;
     log('PASS=' + R.pass);
   } catch (e) {
     R.error = String(e && e.stack ? e.stack : e); log('ERROR: ' + R.error);

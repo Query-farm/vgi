@@ -145,11 +145,12 @@ mbedtls, but the disk tier is off on WASM — no persistent FS.)
 The `worker:` transport is worker-language-agnostic. `test-ts-worker.mjs` proves a
 **TypeScript** worker (vgi-typescript) serves over the same SAB channel at parity with
 the Rust `sabtable` worker: a direct `vgi_table_function('worker:ts-worker-boot.js',
-'ts_count', [5])` (producer mode), `ATTACH` + discovery + `tcat.main.ts_count(3)`, and a
-`ts_double` scalar (exchange mode). The worker is
-`vgi-typescript/examples/sab-worker/boot.ts` — it multiplexes all SAB slots on one Web
-Worker's event loop via `Atomics.waitAsync` (vs. the Rust worker's emscripten
-thread-per-slot) and drives vgi-rpc's `serveStream` over a new browser `ByteSink` writer.
+'ts_count', [5])` (producer mode), `ATTACH` + discovery + `tcat.main.ts_count(3)`, a
+`ts_double` scalar (exchange mode), and a **true-parallelism** proof (`peakConcurrency=4`
+— `ts_probe`/`ts_peek`). The worker is `vgi-typescript/examples/sab-worker/boot.ts` — it
+drives vgi-rpc's `serveStream` over a browser `ByteSink` writer and is **truly parallel**:
+one dedicated sub-Worker per SAB slot (real threads sharing the SAB), matching the Rust
+worker's emscripten thread-per-slot.
 
 ```bash
 # build the TS worker bundle (from vgi-typescript), copy to ts-worker-mod.js here:
