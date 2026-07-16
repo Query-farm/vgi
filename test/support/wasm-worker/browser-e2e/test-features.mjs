@@ -108,8 +108,32 @@ async function step(R, name, fn) {
       return va === vb && R.cacheHits >= 1; // same nonce + a recorded hit
     });
 
+    // --- BROWSER APIs: client-side Web APIs a server-side worker can't reach ----
+    // The worker runs in the browser, so it exposes the END USER's navigator, page URL,
+    // high-res clock, COI flag, and the browser CSPRNG as SQL.
+    await step(R, 'browserInfoOk', async () => {
+      const r = await q(`SELECT * FROM vgi_table_function(${W}, 'browser_info', [])`);
+      if (r.numRows !== 1) return false;
+      const ua = String(r.getChild('user_agent').get(0) ?? '');
+      const url = String(r.getChild('page_url').get(0) ?? '');
+      const hw = Number(r.getChild('hardware_concurrency').get(0));
+      const coi = r.getChild('cross_origin_isolated').get(0);
+      const perf = Number(r.getChild('perf_now_ms').get(0));
+      R.browserInfo = { ua: ua.slice(0, 40), url, hw, coi, perf };
+      return ua.length > 0 && /Mozilla|Chrome|Safari|Firefox/.test(ua) && hw > 0 &&
+             (coi === true || coi === 1) && url.includes(location.origin) && perf > 0;
+    });
+    // Browser CSPRNG: two draws differ, and aren't all-zero.
+    await step(R, 'clientRandomOk', async () => {
+      const draw = async () => { const r = await q(`SELECT * FROM vgi_table_function(${W}, 'client_random', [4])`);
+        const c = r.getChildAt(0); const v = []; for (let i = 0; i < r.numRows; i++) v.push(String(c.get(i))); return v; };
+      const a = await draw(), b = await draw();
+      R.rand = a.slice(0, 2);
+      return a.length === 4 && b.length === 4 && JSON.stringify(a) !== JSON.stringify(b) && a.some((x) => x !== '0');
+    });
+
     try { await conn.close(); await db.terminate(); } catch (e) { /* a hung conn may not close */ }
-    R.pass = ['scalarOk', 'tableInOutOk', 'aggregateOk', 'aggregateGroupedOk', 'largePayloadOk', 'limitAbandonOk', 'cacheHitOk'].every((k) => R[k] === 'OK');
+    R.pass = ['scalarOk', 'tableInOutOk', 'aggregateOk', 'aggregateGroupedOk', 'largePayloadOk', 'limitAbandonOk', 'cacheHitOk', 'browserInfoOk', 'clientRandomOk'].every((k) => R[k] === 'OK');
     log('PASS=' + R.pass);
   } catch (e) {
     R.error = String(e && e.stack ? e.stack : e);

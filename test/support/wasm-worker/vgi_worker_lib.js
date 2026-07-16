@@ -115,4 +115,56 @@ addToLibrary({
     var served = vgiW.served[slot];
     while (Atomics.load(i, stateLane) === served) Atomics.wait(i, stateLane, served, 500);
   },
+
+  // ==========================================================================
+  // Browser-API bridge. These expose Web APIs available in a Web Worker realm —
+  // things a normal server-side (subprocess/HTTP) VGI worker can NEVER reach,
+  // because they describe the END USER's browser/client, not the server:
+  //   navigator.userAgent/language/platform/hardwareConcurrency, WorkerLocation
+  //   (the page URL), performance.now() (client high-res clock),
+  //   self.crossOriginIsolated, and crypto.getRandomValues (the browser CSPRNG).
+  // The Rust worker declares these `extern "C"` and surfaces them as SQL functions.
+  // (DOM APIs like `document`/`window` are intentionally NOT here — unavailable in
+  // a Worker realm.) Strings are written UTF-8 into the module HEAP at `ptr`.
+  // ==========================================================================
+  vgi_browser_hw_concurrency: function () {
+    return (typeof navigator !== 'undefined' && navigator.hardwareConcurrency) | 0;
+  },
+  vgi_browser_coi: function () {
+    return (typeof self !== 'undefined' && self.crossOriginIsolated) ? 1 : 0;
+  },
+  vgi_browser_perf_now: function () {
+    return (typeof performance !== 'undefined' && performance.now) ? performance.now() : 0;
+  },
+  // Fill `n` bytes at `ptr` from the browser CSPRNG. Two constraints: getRandomValues
+  // caps at 65536 bytes/call, AND it THROWS on a SharedArrayBuffer-backed view (the module
+  // HEAP is a SAB under -pthread) — so draw into a fresh non-shared buffer and copy into
+  // the heap. Returns 1 on success, 0 if unavailable.
+  vgi_browser_random: function (ptr, n) {
+    if (typeof crypto === 'undefined' || !crypto.getRandomValues) return 0;
+    var tmp = new Uint8Array(Math.min(n, 65536));
+    for (var off = 0; off < n; off += 65536) {
+      var len = Math.min(65536, n - off);
+      var chunk = len === tmp.length ? tmp : tmp.subarray(0, len);
+      crypto.getRandomValues(chunk);
+      HEAPU8.set(chunk, ptr + off);
+    }
+    return 1;
+  },
+  // Write a UTF-8 browser string (kind: 0=userAgent 1=language 2=platform 3=page URL)
+  // into `ptr` (<= max bytes). Returns bytes written.
+  vgi_browser_info: function (kind, ptr, max) {
+    var s = '';
+    try {
+      var nav = (typeof navigator !== 'undefined') ? navigator : {};
+      if (kind === 0) s = nav.userAgent || '';
+      else if (kind === 1) s = nav.language || '';
+      else if (kind === 2) s = nav.platform || '';
+      else if (kind === 3) s = (typeof location !== 'undefined' && location.href) ? location.href : '';
+    } catch (e) { s = ''; }
+    var bytes = new TextEncoder().encode(s);
+    var len = Math.min(bytes.length, max);
+    HEAPU8.set(bytes.subarray(0, len), ptr);
+    return len;
+  },
 });

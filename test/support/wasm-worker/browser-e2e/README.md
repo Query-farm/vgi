@@ -121,6 +121,17 @@ function-type protocol paths over the SAB channel, all under `SET threads=4`:
 - **result-cache hit** (`sab_cached` advertises `vgi.cache.ttl` + stamps a per-run nonce; two
   identical scans return the SAME nonce ⇒ the 2nd was served from cache, and
   `vgi_result_cache_stats().hits ≥ 1`).
+- **browser Web APIs** — the killer property of a *client-side* worker: it exposes APIs a
+  server-side (subprocess/HTTP) worker can NEVER reach because they describe the END USER's
+  browser. `browser_info()` returns one row of `navigator.userAgent`/`language`/`platform`/
+  `hardwareConcurrency`, the page URL (`WorkerLocation`), `performance.now()`, and
+  `self.crossOriginIsolated`; `client_random(n)` draws `n` int64 from the browser CSPRNG
+  (`crypto.getRandomValues`). Bridged via the emscripten `--js-library` (`vgi_worker_lib.js`
+  `vgi_browser_*`) that the Rust fixtures declare `extern "C"` (see `../../sabtable/src/lib.rs`,
+  emscripten-gated). Two gotchas the code handles: `getRandomValues` **throws on a
+  SharedArrayBuffer**-backed view (the `-pthread` module heap), so it draws into a fresh
+  non-shared buffer then copies in; and DOM APIs (`document`/`window`) are intentionally absent
+  (unavailable in a Worker realm).
 
 Fixtures live in `../../sabtable/src/lib.rs` (rebuild the worker via `../build.sh`). Run:
 

@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::Int64Type;
-use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray};
+use arrow_array::{Array, ArrayRef, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 
 use vgi::aggregate::{AggregateBindParams, AggregateFunction};
@@ -33,6 +33,30 @@ extern "C" {
     // (after serving).
     fn vgi_worker_await_slot(slot: i32);
     fn vgi_worker_await_release(slot: i32);
+
+}
+
+// Browser Web APIs (implemented in vgi_worker_lib.js — the emscripten `--js-library`).
+// Reachable because this worker runs client-side in the browser — a normal server-side VGI
+// worker cannot see any of these (they describe the END USER's browser/client, not the
+// server). Emscripten-only: on native these symbols aren't provided (the C++ test harness
+// supplies only the vgi_sab_worker_* ring ops), so the whole feature is target-gated.
+#[cfg(target_os = "emscripten")]
+extern "C" {
+    fn vgi_browser_hw_concurrency() -> i32; // navigator.hardwareConcurrency
+    fn vgi_browser_coi() -> i32; // self.crossOriginIsolated (0/1)
+    fn vgi_browser_perf_now() -> f64; // performance.now()
+    fn vgi_browser_random(ptr: *mut u8, n: i32) -> i32; // crypto.getRandomValues (CSPRNG)
+    fn vgi_browser_info(kind: i32, ptr: *mut u8, max: i32) -> i32; // navigator/location strings
+}
+
+// Read a browser string (0=userAgent 1=language 2=platform 3=page URL) via the JS bridge.
+#[cfg(target_os = "emscripten")]
+fn browser_string(kind: i32) -> String {
+    let mut buf = vec![0u8; 4096];
+    let n = unsafe { vgi_browser_info(kind, buf.as_mut_ptr(), buf.len() as i32) };
+    buf.truncate(n.max(0) as usize);
+    String::from_utf8_lossy(&buf).into_owned()
 }
 
 // std::io::Read+Write over the slot's worker end (c2w read, w2c write).
@@ -571,6 +595,124 @@ impl TableFunction for SabCached {
     }
 }
 
+// ---- browser_info(): expose client-side Web APIs to SQL --------------------------------
+// A single row of things ONLY reachable from a browser-resident worker — the end user's
+// navigator (userAgent/language/platform/hardwareConcurrency), the page URL, the client's
+// high-res clock (performance.now), and self.crossOriginIsolated. A server-side worker has
+// none of these. `SELECT * FROM browser_info()` runs the user's own browser as a data source.
+#[cfg(target_os = "emscripten")]
+struct BrowserInfo;
+#[cfg(target_os = "emscripten")]
+struct BrowserInfoProducer {
+    schema: SchemaRef,
+    done: bool,
+}
+#[cfg(target_os = "emscripten")]
+impl TableProducer for BrowserInfoProducer {
+    fn next_batch(&mut self, _out: &mut OutputCollector) -> Result<Option<RecordBatch>> {
+        if self.done {
+            return Ok(None);
+        }
+        self.done = true;
+        let hw = unsafe { vgi_browser_hw_concurrency() } as i64;
+        let coi = unsafe { vgi_browser_coi() } != 0;
+        let perf = unsafe { vgi_browser_perf_now() };
+        let cols: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(vec![browser_string(0)])),
+            Arc::new(StringArray::from(vec![browser_string(1)])),
+            Arc::new(StringArray::from(vec![browser_string(2)])),
+            Arc::new(StringArray::from(vec![browser_string(3)])),
+            Arc::new(Int64Array::from(vec![hw])),
+            Arc::new(BooleanArray::from(vec![coi])),
+            Arc::new(Float64Array::from(vec![perf])),
+        ];
+        Ok(Some(RecordBatch::try_new(self.schema.clone(), cols)
+            .map_err(|e| RpcError::runtime_error(e.to_string()))?))
+    }
+}
+#[cfg(target_os = "emscripten")]
+impl TableFunction for BrowserInfo {
+    fn name(&self) -> &str {
+        "browser_info"
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        FunctionMetadata::default()
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        Vec::new()
+    }
+    fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("user_agent", DataType::Utf8, true),
+            Field::new("language", DataType::Utf8, true),
+            Field::new("platform", DataType::Utf8, true),
+            Field::new("page_url", DataType::Utf8, true),
+            Field::new("hardware_concurrency", DataType::Int64, true),
+            Field::new("cross_origin_isolated", DataType::Boolean, true),
+            Field::new("perf_now_ms", DataType::Float64, true),
+        ]));
+        Ok(BindResponse { output_schema: schema, opaque_data: Vec::new() })
+    }
+    fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
+        Ok(Box::new(BrowserInfoProducer { schema: params.output_schema.clone(), done: false }))
+    }
+}
+
+// ---- client_random(n): n int64 drawn from the browser CSPRNG ---------------------------
+// crypto.getRandomValues — the *client's* cryptographically-secure RNG. A server worker
+// can only offer server-side randomness; this seeds SQL from the end user's browser.
+#[cfg(target_os = "emscripten")]
+struct ClientRandom;
+#[cfg(target_os = "emscripten")]
+struct ClientRandomProducer {
+    schema: SchemaRef,
+    n: i64,
+    done: bool,
+}
+#[cfg(target_os = "emscripten")]
+impl TableProducer for ClientRandomProducer {
+    fn next_batch(&mut self, _out: &mut OutputCollector) -> Result<Option<RecordBatch>> {
+        if self.done {
+            return Ok(None);
+        }
+        self.done = true;
+        let n = self.n.max(0) as usize;
+        let mut bytes = vec![0u8; n * 8];
+        if unsafe { vgi_browser_random(bytes.as_mut_ptr(), (n * 8) as i32) } == 0 {
+            return Err(RpcError::runtime_error("crypto.getRandomValues unavailable"));
+        }
+        let vals: Vec<i64> = bytes
+            .chunks_exact(8)
+            .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        let col: ArrayRef = Arc::new(Int64Array::from(vals));
+        Ok(Some(RecordBatch::try_new(self.schema.clone(), vec![col])
+            .map_err(|e| RpcError::runtime_error(e.to_string()))?))
+    }
+}
+#[cfg(target_os = "emscripten")]
+impl TableFunction for ClientRandom {
+    fn name(&self) -> &str {
+        "client_random"
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        FunctionMetadata::default()
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![ArgSpec::const_arg("n", 0, "int64", "How many random int64 to draw from the CSPRNG")]
+    }
+    fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
+        Ok(BindResponse { output_schema: value_schema(), opaque_data: Vec::new() })
+    }
+    fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
+        Ok(Box::new(ClientRandomProducer {
+            schema: params.output_schema.clone(),
+            n: params.arguments.const_i64(0).unwrap_or(0),
+            done: false,
+        }))
+    }
+}
+
 /// Serve one slot to completion, then EOS the output ring. Blocking; run on a thread.
 #[no_mangle]
 pub extern "C" fn vgi_rust_serve_table_sab_slot(slot: i32) {
@@ -586,6 +728,10 @@ pub extern "C" fn vgi_rust_serve_table_sab_slot(slot: i32) {
     worker.register_aggregate(SabSum);
     worker.register_table(SabBig);
     worker.register_table(SabCached);
+    #[cfg(target_os = "emscripten")]
+    worker.register_table(BrowserInfo);
+    #[cfg(target_os = "emscripten")]
+    worker.register_table(ClientRandom);
     // No set_catalog: the dispatcher installs a default CatalogModel, and the C++
     // client binds `count_to` directly by name against the dispatch registry.
     worker.serve_reader_writer(SabReader { slot }, SabWriter { slot });
