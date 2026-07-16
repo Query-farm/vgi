@@ -135,8 +135,11 @@ function-type protocol paths over the SAB channel, all under `SET threads=4`:
       (`SELECT ... FROM client_fetch('/whoami')` returns the *browser's* UA, not the server's).
       Same-origin always works under COI; cross-origin needs `Cross-Origin-Resource-Policy`.
     - `client_geo()` — the **actual `navigator.geolocation`** position of the end user.
-      geolocation is a Window API (absent in a Worker realm), so the page bridge
-      (`vgi-webworker-bridge.ts` `vgi-geo-init`) calls `getCurrentPosition` and publishes
+      geolocation is a Window API (absent in a Worker realm), so the worker posts a
+      `vgi-geo-init` message up to the page and an app-supplied responder
+      (`resolveWorkerGeolocation` in `test-features.mjs`, wired via the bridge's **generic**
+      `onVgiWorkerMessage` hook — the specialized handler ships WITH the worker, not in the
+      shared `vgi-webworker-bridge.ts`) calls `getCurrentPosition` and publishes
       `[status, lat, lon, accuracy]` into a `SharedArrayBuffer` shared with the serve pthreads
       (`vgi_worker_pre.js` injects it per realm); the fixture polls it. The E2E grants
       geolocation + sets a mock position via Playwright `context.setGeolocation` and asserts

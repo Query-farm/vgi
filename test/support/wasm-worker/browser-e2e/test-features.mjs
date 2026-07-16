@@ -10,6 +10,31 @@
 import * as duckdb from './duckdb-browser.mjs';
 import { installVgiWebWorkerBridge } from './vgi-webworker-bridge.ts';
 
+// Page-side geolocation responder — ships WITH the worker example, NOT the shared bridge.
+// navigator.geolocation is a Window-only API (absent in any Worker realm), so the worker
+// (vgi-worker-boot.js) creates a tiny SharedArrayBuffer, injects it into each serve pthread,
+// and posts it up to the page as `vgi-geo-init`. We resolve the real end-user position here
+// and publish it into that buffer for the worker's client_geo() fixture to read. Wired via
+// the bridge's GENERIC `onVgiWorkerMessage` hook so this app-specific capability stays out of
+// haybarn-wasm's reusable bridge. Layout: [status:i32 @0, lat/lon/accuracy:f64 @8/@16/@24].
+function resolveWorkerGeolocation(_worker, m) {
+  if (!m || m.type !== 'vgi-geo-init' || !m.geoSab) return;
+  const status = new Int32Array(m.geoSab, 0, 1);
+  const geo = new Float64Array(m.geoSab, 8, 3);
+  const nav = typeof navigator !== 'undefined' ? navigator : undefined;
+  if (!nav?.geolocation) { Atomics.store(status, 0, -1); return; }
+  nav.geolocation.getCurrentPosition(
+    (pos) => {
+      geo[0] = pos.coords.latitude;
+      geo[1] = pos.coords.longitude;
+      geo[2] = pos.coords.accuracy;
+      Atomics.store(status, 0, 1); // ready (release barrier for geo[])
+    },
+    () => Atomics.store(status, 0, -1), // denied / unavailable / timeout
+    { enableHighAccuracy: false, timeout: 10000, maximumAge: 0 },
+  );
+}
+
 const out = document.getElementById('out');
 const log = (m) => { out.textContent += m + '\n'; };
 window.__done = false;
@@ -43,7 +68,7 @@ async function step(R, name, fn) {
       mainModule: './duckdb-coi.wasm', mainWorker: './duckdb-browser-coi.worker.js',
       pthreadWorker: './duckdb-browser-coi.pthread.worker.js' } });
     const worker = new Worker(bundle.mainWorker);
-    installVgiWebWorkerBridge()(worker);
+    installVgiWebWorkerBridge({ onVgiWorkerMessage: resolveWorkerGeolocation })(worker);
     const db = new duckdb.AsyncDuckDB(new duckdb.ConsoleLogger(), worker);
     await db.instantiate(bundle.mainModule, bundle.pthreadWorker);
     await db.open({ allowUnsignedExtensions: true, query: { castBigIntToDouble: true } });
