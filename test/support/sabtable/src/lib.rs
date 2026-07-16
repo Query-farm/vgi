@@ -5,16 +5,21 @@
 //! producer output — driven by a C++ client over WebWorkerFunctionConnection.
 //! The ring is the C++ native backend; this side reaches it through the extern
 //! "C" `vgi_sab_worker_*` ops.
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use arrow_array::{ArrayRef, Int64Array, RecordBatch};
+use arrow_array::cast::AsArray;
+use arrow_array::types::Int64Type;
+use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 
-use vgi::function::{ArgSpec, BindParams, BindResponse, FunctionMetadata, ProcessParams};
+use vgi::aggregate::{AggregateBindParams, AggregateFunction};
+use vgi::function::{ArgSpec, BindParams, BindResponse, FunctionMetadata, ProcessParams, ScalarFunction};
 use vgi::table_function::{TableFunction, TableProducer};
+use vgi::table_in_out::{project_batch, TableInOutFunction};
 use vgi_rpc::{OutputCollector, Result, RpcError};
 
 // Worker-side ring ops, implemented in C++ (test/support/vgi_sab_native_ring.cpp)
@@ -343,6 +348,173 @@ impl TableFunction for ParallelProbe {
     }
 }
 
+// ---- sab_double(x int64) -> int64: 1:1 scalar map (null-safe) ----------------
+// Exercises the scalar (exchange-mode 1:1) path over the SAB ring. Doubles each
+// int64 input; null in → null out.
+struct SabDouble;
+impl ScalarFunction for SabDouble {
+    fn name(&self) -> &str {
+        "sab_double"
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        FunctionMetadata { return_type: Some(DataType::Int64), ..Default::default() }
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![ArgSpec::column("x", 0, "int64", "Integer to double")]
+    }
+    fn process(&self, params: &ProcessParams, batch: &RecordBatch) -> Result<RecordBatch> {
+        let a = batch.column(0).as_primitive::<Int64Type>();
+        let out: Int64Array = (0..a.len())
+            .map(|i| (!a.is_null(i)).then(|| a.value(i) * 2))
+            .collect();
+        RecordBatch::try_new(params.output_schema.clone(), vec![Arc::new(out) as ArrayRef])
+            .map_err(|e| RpcError::runtime_error(e.to_string()))
+    }
+}
+
+// ---- sab_echo(input) -> passthrough: streaming table-in-out ------------------
+// Classic TABLE-input streaming shape (NOT blended): on_bind passes the input
+// schema through; process returns the input batch projected to the output schema.
+struct SabEcho;
+impl TableInOutFunction for SabEcho {
+    fn name(&self) -> &str {
+        "sab_echo"
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        FunctionMetadata::default()
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![ArgSpec::column("data", 0, "table", "Input table")]
+    }
+    fn on_bind(&self, params: &BindParams) -> Result<BindResponse> {
+        let input = params
+            .input_schema
+            .clone()
+            .ok_or_else(|| RpcError::value_error("sab_echo requires an input schema"))?;
+        Ok(BindResponse { output_schema: input, opaque_data: Vec::new() })
+    }
+    fn process(&self, params: &ProcessParams, batch: &RecordBatch) -> Result<Vec<RecordBatch>> {
+        Ok(vec![project_batch(batch, &params.output_schema)?])
+    }
+}
+
+// ---- sab_sum(value int64) -> int64: group-by aggregate -----------------------
+// State = 8-byte little-endian i64. Adapted from the example worker's SumFunction
+// (no arrow_cast dep — the declared int64 arg type guarantees an int64 column).
+fn sab_le_i64(v: i64) -> Vec<u8> {
+    v.to_le_bytes().to_vec()
+}
+fn sab_read_i64(b: &[u8]) -> i64 {
+    let mut a = [0u8; 8];
+    a.copy_from_slice(&b[..8.min(b.len())]);
+    i64::from_le_bytes(a)
+}
+struct SabSum;
+impl AggregateFunction for SabSum {
+    fn name(&self) -> &str {
+        "sab_sum"
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        FunctionMetadata::default()
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![ArgSpec::column("value", 0, "int64", "Column to sum")]
+    }
+    fn on_bind(&self, _params: &AggregateBindParams) -> Result<BindResponse> {
+        Ok(BindResponse {
+            output_schema: Arc::new(Schema::new(vec![Field::new("result", DataType::Int64, true)])),
+            opaque_data: Vec::new(),
+        })
+    }
+    fn initial_state(&self) -> Vec<u8> {
+        sab_le_i64(0)
+    }
+    fn update(
+        &self,
+        states: &mut HashMap<i64, Vec<u8>>,
+        group_ids: &Int64Array,
+        columns: &[ArrayRef],
+    ) -> Result<()> {
+        let v = columns[0].as_primitive::<Int64Type>();
+        for i in 0..group_ids.len() {
+            if v.is_null(i) {
+                continue;
+            }
+            let st = states.entry(group_ids.value(i)).or_insert_with(|| sab_le_i64(0));
+            *st = sab_le_i64(sab_read_i64(st) + v.value(i));
+        }
+        Ok(())
+    }
+    fn combine(&self, target: Vec<u8>, source: Vec<u8>) -> Result<Vec<u8>> {
+        Ok(sab_le_i64(sab_read_i64(&target) + sab_read_i64(&source)))
+    }
+    fn finalize(
+        &self,
+        output_schema: &SchemaRef,
+        group_ids: &Int64Array,
+        states: &[Option<Vec<u8>>],
+    ) -> Result<RecordBatch> {
+        let out: Int64Array = (0..group_ids.len())
+            .map(|i| states[i].as_ref().map(|s| sab_read_i64(s)))
+            .collect();
+        RecordBatch::try_new(output_schema.clone(), vec![Arc::new(out)])
+            .map_err(|e| RpcError::runtime_error(e.to_string()))
+    }
+}
+
+// ---- sab_big(n_rows, value_len) -> (value varchar): large-payload producer ----
+// Emits n_rows rows in ~1000-row batches; each `value` is 'x' repeated value_len
+// times. Stresses the ring chunker with payloads far larger than the 64 KiB ring.
+struct SabBig;
+struct SabBigProducer {
+    schema: SchemaRef,
+    n_rows: i64,
+    value_len: i64,
+    emitted: i64,
+}
+impl TableProducer for SabBigProducer {
+    fn next_batch(&mut self, _out: &mut OutputCollector) -> Result<Option<RecordBatch>> {
+        if self.emitted >= self.n_rows {
+            return Ok(None);
+        }
+        let remaining = self.n_rows - self.emitted;
+        let this_batch = remaining.min(1000);
+        let cell = "x".repeat(self.value_len.max(0) as usize);
+        let col: ArrayRef = Arc::new(
+            (0..this_batch).map(|_| Some(cell.as_str())).collect::<StringArray>(),
+        );
+        self.emitted += this_batch;
+        Ok(Some(RecordBatch::try_new(self.schema.clone(), vec![col])
+            .map_err(|e| RpcError::runtime_error(e.to_string()))?))
+    }
+}
+impl TableFunction for SabBig {
+    fn name(&self) -> &str {
+        "sab_big"
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        FunctionMetadata::default()
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![
+            ArgSpec::const_arg("n_rows", 0, "int64", "Number of rows to emit"),
+            ArgSpec::const_arg("value_len", 1, "int64", "Length of each value string"),
+        ]
+    }
+    fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
+        let schema = Arc::new(Schema::new(vec![Field::new("value", DataType::Utf8, true)]));
+        Ok(BindResponse { output_schema: schema, opaque_data: Vec::new() })
+    }
+    fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
+        Ok(Box::new(SabBigProducer {
+            schema: params.output_schema.clone(),
+            n_rows: params.arguments.const_i64(0).unwrap_or(0),
+            value_len: params.arguments.const_i64(1).unwrap_or(0),
+            emitted: 0,
+        }))
+    }
+}
+
 /// Serve one slot to completion, then EOS the output ring. Blocking; run on a thread.
 #[no_mangle]
 pub extern "C" fn vgi_rust_serve_table_sab_slot(slot: i32) {
@@ -353,6 +525,10 @@ pub extern "C" fn vgi_rust_serve_table_sab_slot(slot: i32) {
     worker.register_table(SlowCount);
     worker.register_table(PeekMaxConcurrency);
     worker.register_table(ParallelProbe);
+    worker.register_scalar(SabDouble);
+    worker.register_table_in_out(SabEcho);
+    worker.register_aggregate(SabSum);
+    worker.register_table(SabBig);
     // No set_catalog: the dispatcher installs a default CatalogModel, and the C++
     // client binds `count_to` directly by name against the dispatch registry.
     worker.serve_reader_writer(SabReader { slot }, SabWriter { slot });

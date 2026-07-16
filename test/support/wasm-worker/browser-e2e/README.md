@@ -108,6 +108,35 @@ dev engine requests; set to the engine's real version for a release build).
 Not wired into the default `make test` suite (it needs the three sibling wasm builds); run it
 directly after a wasm build.
 
+### Function-type coverage (`test-features.mjs`)
+
+`test-entry.mjs` covers producer-mode tables. `test-features.mjs` broadens coverage to the other
+function-type protocol paths over the SAB channel, all under `SET threads=4`:
+
+- **scalar** (`sab_double`, exchange 1:1, null passthrough),
+- **streaming table-in-out** (`sab_echo`, classic `TABLE`/subquery input → passthrough),
+- **aggregate** (`sab_sum`, exchange update + combine + finalize; ungrouped + grouped),
+- **large payload** (`sab_big`, ~50 MB streamed over the 64 KiB ring — the chunker),
+- **LIMIT early-abandon** (client stops mid-stream → slot teardown/bail; a following scan works).
+
+Fixtures live in `../../sabtable/src/lib.rs` (rebuild the worker via `../build.sh`). Run:
+
+```bash
+VGI_ENTRY=test-features.mjs node serve.mjs 8799   # then open the page in a COI browser
+# ?only=<caseName> runs one case in isolation (a hung query blocks the single DuckDB-WASM
+# worker thread, so isolate to localize a hang). window.__result.pass is the gate.
+```
+
+**WASM result-cache limitation.** The table-function / exchange **result cache** is defaulted
+**OFF on WASM** (`vgi_result_cache` default `false` under emscripten). Its cache keys + identity
+scope are SHA-256 hashes via the engine's mbedtls (`MbedTlsWrapper::ComputeSha256Hash`), which is
+not resolvable from the dlopen'd extension side-module on emscripten — any cache-eligibility path
+throws "`_ is not a function`", which for the exchange operators (scalar / table-in-out) manifests
+as a **hang**. The cache is also value-less over the in-browser `worker:` transport (single
+in-process session). Fixing it needs a WASM-native SHA-256 in the extension; until then the cache
+is off on WASM. (This is why `test-features.mjs` passes without any `SET` — the default already
+disables it.)
+
 **Reliability.** The transport's *logic* is covered reliably + fast by the native
 `[sab]/[sab-e2e]/[sab-conn]` unit tests (count_to + multi-batch + error over the in-process ring
 analog) — those are the gate. This browser runner is the only test of the *real* browser stack
