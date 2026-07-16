@@ -151,7 +151,8 @@ static std::string HttpPostArrowIpcInternal(ClientContext &context,
                                              std::unique_ptr<HTTPResponse> &out_response,
                                              const std::shared_ptr<HTTPParams> &cached_http_params = nullptr,
                                              HttpEncoding request_encoding = HttpEncoding::ZSTD,
-                                             bool allow_codec_retry = true) {
+                                             bool allow_codec_retry = true,
+                                             duckdb::unique_ptr<HTTPClient> *client_holder = nullptr) {
 	auto &db = *context.db;
 	auto &http_util = HTTPUtil::Get(db);
 
@@ -192,7 +193,15 @@ static std::string HttpPostArrowIpcInternal(ClientContext &context,
 	                     reinterpret_cast<const_data_ptr_t>(compressed_body.data()),
 	                     static_cast<idx_t>(compressed_body.size()));
 
-	out_response = http_util.Request(post);
+	// When the caller supplies a client holder, reuse its keep-alive HTTP
+	// client (and TCP connection) across calls; the 2-arg overload creates
+	// the client lazily on first use and refreshes it on retry. Otherwise
+	// fall back to a fresh per-call client (the single-arg overload).
+	if (client_holder) {
+		out_response = http_util.Request(post, *client_holder);
+	} else {
+		out_response = http_util.Request(post);
+	}
 	if (!out_response) {
 		throw IOException("VGI HTTP POST returned no response (transport failure) [url: %s]", url);
 	}
@@ -223,7 +232,7 @@ static std::string HttpPostArrowIpcInternal(ClientContext &context,
 			if (alternate != request_encoding) {
 				return HttpPostArrowIpcInternal(context, url, body, bearer_token, cookie_jar,
 				                                 out_response, cached_http_params, alternate,
-				                                 /*allow_codec_retry=*/false);
+				                                 /*allow_codec_retry=*/false, client_holder);
 			}
 		}
 	}
@@ -420,7 +429,8 @@ std::string HttpPostArrowIpc(ClientContext &context,
                               const std::vector<uint8_t> &body,
                               const std::shared_ptr<CatalogAuth> &auth,
                               const std::shared_ptr<SessionCookieJar> &cookie_jar,
-                              const std::shared_ptr<HTTPParams> &cached_http_params) {
+                              const std::shared_ptr<HTTPParams> &cached_http_params,
+                              duckdb::unique_ptr<HTTPClient> *client_holder) {
 	// Get cached token from per-catalog auth (if any)
 	std::string token;
 	if (auth) {
@@ -428,7 +438,8 @@ std::string HttpPostArrowIpc(ClientContext &context,
 	}
 
 	std::unique_ptr<HTTPResponse> response;
-	auto result = HttpPostArrowIpcInternal(context, url, body, token, cookie_jar, response, cached_http_params);
+	auto result = HttpPostArrowIpcInternal(context, url, body, token, cookie_jar, response, cached_http_params,
+	                                       HttpEncoding::ZSTD, /*allow_codec_retry=*/true, client_holder);
 
 	if (response->status != HTTPStatusCode::Unauthorized_401) {
 		return result;
@@ -484,7 +495,8 @@ std::string HttpPostArrowIpc(ClientContext &context,
 	auto new_token = auth->HandleUnauthorized(*challenge, context);
 
 	// Retry with new token
-	result = HttpPostArrowIpcInternal(context, url, body, new_token, cookie_jar, response, cached_http_params);
+	result = HttpPostArrowIpcInternal(context, url, body, new_token, cookie_jar, response, cached_http_params,
+	                                  HttpEncoding::ZSTD, /*allow_codec_retry=*/true, client_holder);
 	if (response->status == HTTPStatusCode::Unauthorized_401) {
 		throw IOException("VGI HTTP authentication failed after auth flow (HTTP 401) [url: %s]. "
 		                  "Response: %s", url, response->body);

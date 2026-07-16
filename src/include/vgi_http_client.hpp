@@ -57,12 +57,22 @@ UnaryResponseResult HttpInvokeUnary(ClientContext &context,
 // Timeout is controlled by the vgi_http_timeout_seconds setting (default 300s).
 // auth: per-catalog auth state for bearer token injection and 401 handling.
 // cookie_jar: per-catalog HTTP cookie store (see HttpInvokeUnary).
+// client_holder: optional caller-owned HTTP client cache. When non-null, the
+// underlying DuckDB HTTPClient (and thus its keep-alive TCP connection) is
+// created on first use and REUSED across calls instead of a fresh connection
+// per request — the win on the chatty per-batch exchange path, where a 500k
+// scan otherwise opens ~one TCP connection per 2048-row vector. The client is
+// keyed by host:port, so a single holder is only valid for one host: pass a
+// holder that is used exclusively for one base_url (e.g. a per-connection
+// member), and NEVER share it across threads (HTTPClient is not thread-safe).
+// Null (the default) preserves the previous fresh-connection-per-call behavior.
 std::string HttpPostArrowIpc(ClientContext &context,
                               const std::string &url,
                               const std::vector<uint8_t> &body,
                               const std::shared_ptr<CatalogAuth> &auth = nullptr,
                               const std::shared_ptr<SessionCookieJar> &cookie_jar = nullptr,
-                              const std::shared_ptr<HTTPParams> &cached_http_params = nullptr);
+                              const std::shared_ptr<HTTPParams> &cached_http_params = nullptr,
+                              duckdb::unique_ptr<HTTPClient> *client_holder = nullptr);
 
 // HTTP GET raw bytes from a URL. Used for fetching externalized batches.
 // Handles X-VGI-Content-Encoding decompression (zstd or gzip). No auth

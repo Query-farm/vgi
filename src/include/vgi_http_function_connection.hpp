@@ -159,6 +159,13 @@ private:
 	// folded onto every InitRequest. Empty = none. Set via SetSubstreamId.
 	std::vector<uint8_t> substream_id_;
 	ClientContext &context_;
+	// Reused keep-alive HTTP client for this connection's per-batch hot path
+	// (/init + every /init/exchange POST). Created lazily on first use and
+	// reused across all subsequent exchange requests so a large scan doesn't
+	// open a fresh TCP connection per 2048-row vector. Single-threaded per
+	// connection (HTTPClient is not thread-safe); the off-thread cancel path
+	// deliberately does NOT touch this — it uses a fresh client.
+	duckdb::unique_ptr<HTTPClient> http_client_;
 	bool worker_debug_;
 	std::map<std::string, Value> settings_;
 	std::vector<VgiSecretRequirement> required_secrets_;
