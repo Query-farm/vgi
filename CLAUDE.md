@@ -618,8 +618,21 @@ abort,revalidate}` event via `VGI_LOG` (queryable in `duckdb_logs WHERE type='VG
 `ClientContext`. `store {tier=memory|disk, rows, bytes}` fires on a successful commit (a positive
 signal, vs inferring from an absent abort); `store_skipped {reason=not_cacheable|no_freshness|
 immediately_stale|transaction_scoped_spill|drain_failed|…}` fires on the silent refusal branches.
-`EXPLAIN ANALYZE` on a cached scan shows a `Cache: hit (memory|disk_streaming)` line (a hit skips the
-worker entirely — `VgiTableFunctionDynamicToString`). Cleanup (LRU eviction + TTL/disk reaping) runs on
+`EXPLAIN ANALYZE` surfaces per-operator cache effectiveness in the plan box (complementing the
+process-global `vgi_result_cache_stats()`): the producer table-function scan shows `Cache: hit
+(memory|disk_streaming)` on a hit and `Cache: miss` on an eligible miss (a hit skips the worker
+entirely — `VgiTableFunctionDynamicToString`; the `cache_eligible` gstate flag drives the miss
+label so an *ineligible* scan gets no line). The **exchange-mode** operators report too: the
+correlated-LATERAL operator caches PER INPUT CHUNK, so it shows a hit/miss/store **rate** — e.g.
+`Cache: 2 hit / 1 miss / 50 store (67% hit)` — via shared `std::atomic` counters on
+`VgiLateralBatchGlobalState` (incremented in `Execute`, published post-exec through
+`OperatorState::Finalize` → `context.thread.profiler.GetOperatorInfo(op).extra_info`, guarded by
+`QueryProfiler::IsEnabled()`); the whole-input **buffered** operator shows binary `Cache: hit
+(memory)`/`miss` via `ExtraSourceParams` reading its sink gstate. `ParamsToString` is captured
+pre-execution so it CAN'T carry runtime counters — the post-exec hooks above are load-bearing.
+The streaming table-in-out map (DuckDB's own `PhysicalTableInOutFunction`) and scalar per-value
+have no owned-operator surface, so they stay on `vgi_result_cache_stats()` / `duckdb_logs`. Test:
+`cache/explain_stats.test` (both transports). Cleanup (LRU eviction + TTL/disk reaping) runs on
 the context-less singleton / background thread and emits **no** `duckdb_logs` events; observe it via
 `vgi_result_cache_stats()` (the `evictions_*` / `capture_aborts` counters — the only SQL surface for
 reaper work), `vgi_result_cache(include_disk := true)` (memory **and** disk-only entries), and `glob()`

@@ -245,6 +245,11 @@ public:
 	OrderPreservationType SourceOrder() const override {
 		return source_order_dependent ? OrderPreservationType::FIXED_ORDER : OrderPreservationType::NO_ORDER;
 	}
+	// Post-execution: surface the whole-input (M3) cache hit/miss in EXPLAIN ANALYZE.
+	// Reads the sink gstate (where the Finalize-time lookup decided hit vs miss);
+	// buffered is whole-input keyed, so this is binary, not a rate.
+	InsertionOrderPreservingMap<string> ExtraSourceParams(GlobalSourceState &gstate,
+	                                                       LocalSourceState &lstate) const override;
 
 	string GetName() const override;
 	InsertionOrderPreservingMap<string> ParamsToString() const override;

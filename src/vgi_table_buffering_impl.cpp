@@ -967,6 +967,24 @@ SinkFinalizeType PhysicalVgiTableBufferingFunction::Finalize(Pipeline & /*pipeli
 // Source
 // ============================================================================
 
+// Post-execution EXPLAIN ANALYZE line: whole-input (M3) cache hit vs miss. The
+// decision was made at Sink::Finalize and lives on the sink gstate; buffered is
+// whole-input keyed, so a query is a single hit or miss (binary, not a rate).
+InsertionOrderPreservingMap<string>
+PhysicalVgiTableBufferingFunction::ExtraSourceParams(GlobalSourceState & /*gstate*/,
+                                                     LocalSourceState & /*lstate*/) const {
+	InsertionOrderPreservingMap<string> result;
+	if (!sink_state) {
+		return result;
+	}
+	auto &sink = sink_state->Cast<VgiTableBufferingGlobalSinkState>();
+	if (!sink.cache_eligible) {
+		return result; // caching not active for this scan → no Cache line
+	}
+	result["Cache"] = sink.serving_from_cache ? "hit (memory)" : "miss";
+	return result;
+}
+
 unique_ptr<GlobalSourceState>
 PhysicalVgiTableBufferingFunction::GetGlobalSourceState(ClientContext & /*context*/) const {
 	auto gss = make_uniq<VgiTableBufferingGlobalSourceState>();

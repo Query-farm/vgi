@@ -1,6 +1,7 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "vgi_lateral_batch_operator.hpp"
 
+#include <atomic>
 #include <cstring>
 #include <limits>
 
@@ -17,6 +18,8 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/database.hpp"
+#include "duckdb/main/query_profiler.hpp"     // OperatorProfiler (EXPLAIN ANALYZE cache stats)
+#include "duckdb/parallel/thread_context.hpp" // context.thread.profiler
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/optimizer/optimizer_extension.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
@@ -97,7 +100,16 @@ PhysicalOperator &LogicalVgiLateralBatch::CreatePlan(ClientContext &context, Phy
 
 namespace {
 
-struct VgiLateralBatchGlobalState : public GlobalOperatorState {};
+struct VgiLateralBatchGlobalState : public GlobalOperatorState {
+	// Shared across this operator's parallel Execute threads; reported post-execution
+	// in EXPLAIN ANALYZE via VgiLateralBatchOperatorState::Finalize (which reads these
+	// off op.op_state). The exchange cache here is PER-INPUT-CHUNK, so a single scan
+	// legitimately mixes hits and misses — hence a rate, not a boolean.
+	std::atomic<bool> cache_eligible {false};
+	std::atomic<idx_t> cache_hits {0};    // chunks served without the worker (M2 or full per-value)
+	std::atomic<idx_t> cache_misses {0};  // chunks that invoked the worker
+	std::atomic<idx_t> cache_stores {0};  // entries committed (M2 whole-chunk + per-value)
+};
 
 struct VgiLateralBatchOperatorState : public OperatorState {
 	VgiLateralBatchOperatorState(ClientContext &context, const std::vector<uint8_t> &substream_id)
@@ -151,6 +163,12 @@ struct VgiLateralBatchOperatorState : public OperatorState {
 	ArrowSchemaWrapper serve_c_schema;
 	ArrowTableSchema serve_arrow_table;
 	VgiTableInOutLocalState serve_scan; // replay drain buffer (full output schema)
+
+	// Post-execution: publish this operator's shared per-chunk cache counters into
+	// the EXPLAIN ANALYZE plan. Runs per pipeline thread; each reads the same
+	// op.op_state aggregate and writes the same "Cache" string, so the profiler's
+	// last-write-wins merge keeps one correct copy.
+	void Finalize(const PhysicalOperator &op, ExecutionContext &context) override;
 };
 
 // Decode the worker's per-output-row provenance. `raw` is the base64-decoded raw
@@ -289,8 +307,9 @@ OperatorResultType EmitServedSlice(VgiLateralBatchOperatorState &state, const Ar
 }
 
 // Commit the current input chunk's accumulated POST-STAMP output slices as one
-// memory-only cache entry (allow_disk=false). Clears the capture state.
-void CommitCapture(VgiLateralBatchOperatorState &state, const VgiTableInOutBindData &bd, ClientContext &ctx) {
+// memory-only cache entry (allow_disk=false). Clears the capture state. Returns
+// true iff an entry was actually stored (for the EXPLAIN ANALYZE store counter).
+bool CommitCapture(VgiLateralBatchOperatorState &state, const VgiTableInOutBindData &bd, ClientContext &ctx) {
 	auto sr = StoreExchangeMemoEntry(state.capture_key, state.cache_cc, state.cache_catalog_name,
 	                                 state.cache_default_ttl_seconds, state.capture_pending,
 	                                 /*allow_disk=*/true);
@@ -307,6 +326,40 @@ void CommitCapture(VgiLateralBatchOperatorState &state, const VgiTableInOutBindD
 	}
 	state.capturing = false;
 	state.capture_pending.clear();
+	return sr.stored;
+}
+
+// Publish the shared per-chunk cache counters (M2 + per-value) into EXPLAIN ANALYZE.
+// Only emits when the scan was cache-eligible (else the "misses" would just be
+// every chunk with caching off — misleading). Reached via the pipeline executor's
+// intermediate-operator finalize; op.op_state is the shared VgiLateralBatchGlobalState.
+void VgiLateralBatchOperatorState::Finalize(const PhysicalOperator &op, ExecutionContext &context) {
+	if (!op.op_state) {
+		return;
+	}
+	auto &g = op.op_state->Cast<VgiLateralBatchGlobalState>();
+	if (!g.cache_eligible.load(std::memory_order_relaxed)) {
+		return; // caching not active for this scan → no Cache line
+	}
+	// Only when query profiling is on (EXPLAIN ANALYZE / enable_profiling). Writing to
+	// this thread's OperatorProfiler is merged into the plan at the following Flush; if
+	// profiling is off, Flush early-returns and the entry is discarded — so skip the work.
+	if (!QueryProfiler::Get(context.client).IsEnabled()) {
+		return;
+	}
+	auto &profiler = context.thread.profiler;
+	const auto hits = g.cache_hits.load(std::memory_order_relaxed);
+	const auto misses = g.cache_misses.load(std::memory_order_relaxed);
+	const auto stores = g.cache_stores.load(std::memory_order_relaxed);
+	const auto decided = hits + misses;
+	std::string line = StringUtil::Format("%llu hit / %llu miss / %llu store",
+	                                       static_cast<unsigned long long>(hits),
+	                                       static_cast<unsigned long long>(misses),
+	                                       static_cast<unsigned long long>(stores));
+	if (decided > 0) {
+		line += StringUtil::Format(" (%.0f%% hit)", 100.0 * static_cast<double>(hits) / static_cast<double>(decided));
+	}
+	profiler.GetOperatorInfo(op).extra_info["Cache"] = line;
 }
 
 } // anonymous namespace
@@ -335,8 +388,9 @@ unique_ptr<OperatorState> PhysicalVgiLateralBatch::GetOperatorState(ExecutionCon
 }
 
 OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, DataChunk &input, DataChunk &chunk,
-                                                    GlobalOperatorState & /*gstate*/, OperatorState &state_p) const {
+                                                    GlobalOperatorState &gstate_p, OperatorState &state_p) const {
 	auto &state = state_p.Cast<VgiLateralBatchOperatorState>();
+	auto &gstate = gstate_p.Cast<VgiLateralBatchGlobalState>(); // shared cache counters (EXPLAIN ANALYZE)
 	auto &client_context = context.client;
 	auto &bd = bind_data->Cast<VgiTableInOutBindData>();
 
@@ -357,6 +411,7 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 		if (BuildExchangeCacheKeyStatic(client_context, bd, proj_key, state.cache_static_key,
 		                                state.cache_catalog_name, catalog_version, reason)) {
 			state.cache_eligible = true;
+			gstate.cache_eligible.store(true, std::memory_order_relaxed); // arm EXPLAIN ANALYZE reporting
 			EnsureServeSchema(state, types);
 			Value ttl_v;
 			if (client_context.TryGetCurrentSetting("vgi_result_cache_default_ttl_seconds", ttl_v)) {
@@ -402,7 +457,9 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 			return OperatorResultType::HAVE_MORE_OUTPUT;
 		}
 		if (state.capturing) {
-			CommitCapture(state, bd, client_context); // input chunk fully drained → commit
+			if (CommitCapture(state, bd, client_context)) { // input chunk fully drained → commit
+				gstate.cache_stores.fetch_add(1, std::memory_order_relaxed);
+			}
 		}
 		return OperatorResultType::NEED_MORE_INPUT;
 	}
@@ -431,6 +488,7 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 			auto entry = VgiResultCache::Instance().Lookup(state.capture_key, now);
 			if (entry) {
 				VgiResultCache::Instance().RecordExchangeHit(entry->total_bytes);
+				gstate.cache_hits.fetch_add(1, std::memory_order_relaxed); // whole-chunk (M2) hit
 				VGI_LOG(client_context, "result_cache.hit",
 				        {{"function", bd.function_name}, {"key_hash", state.capture_key.HexDigest()}, {"tier", "memory"}});
 				if (entry->streams.empty() || entry->streams[0].batches.empty()) {
@@ -556,6 +614,7 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 	std::vector<int32_t> worker_parent; // per worker-output-row: the DEDUPED tuple index
 
 	if (full_pv_hit) {
+		gstate.cache_hits.fetch_add(1, std::memory_order_relaxed); // full per-value hit (no worker)
 		// Serve entirely from the per-value tier: concat each distinct tuple's cached output
 		// rows and synthesize the parent array (each row → its tuple index d). No worker.
 		std::vector<std::shared_ptr<arrow::RecordBatch>> parts;
@@ -590,6 +649,9 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 			return OperatorResultType::NEED_MORE_INPUT;
 		}
 	} else {
+		if (state.cache_eligible) {
+			gstate.cache_misses.fetch_add(1, std::memory_order_relaxed); // this chunk hit the worker
+		}
 		// ONE batched exchange for the (deduped) input chunk.
 		auto input_batch = ConvertInputToArrow(client_context, worker_input, bd);
 		VGI_LOG(client_context, "table_in_out.write_input",
@@ -695,6 +757,7 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 				                                 /*allow_disk=*/true);
 				if (sr.stored) {
 					VgiResultCache::Instance().RecordExchangeStore();
+					gstate.cache_stores.fetch_add(1, std::memory_order_relaxed); // per-value entry stored
 				}
 				stored++; // count attempts toward the cap (a rejected store still cost work)
 			}
@@ -760,7 +823,9 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 		return OperatorResultType::HAVE_MORE_OUTPUT;
 	}
 	if (state.capturing) {
-		CommitCapture(state, bd, client_context);
+		if (CommitCapture(state, bd, client_context)) {
+			gstate.cache_stores.fetch_add(1, std::memory_order_relaxed);
+		}
 	}
 	return OperatorResultType::NEED_MORE_INPUT;
 }

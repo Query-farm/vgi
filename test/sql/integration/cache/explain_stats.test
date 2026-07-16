@@ -1,0 +1,95 @@
+# name: test/sql/integration/cache/explain_stats.test
+# description: EXPLAIN ANALYZE surfaces per-operator result-cache effectiveness. The
+#   correlated-LATERAL operator caches PER INPUT CHUNK, so one scan mixes hits and misses
+#   — it reports a hit/miss/store RATE. The buffered (whole-input) operator and the
+#   producer table-function scan cache the WHOLE result, so they are binary hit/miss.
+#   A hit skips the worker entirely, so these counts are the SQL-visible measure of cache
+#   effectiveness (complementing the process-global vgi_result_cache_stats()).
+# group: [vgi_integration_cache]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# threads=1 keeps chunking deterministic so the counts are stable.
+statement ok
+SET threads=1;
+
+# =====================================================================
+# Correlated LATERAL (M2, per-input-chunk) — a true hit / miss / store RATE.
+# x % 50 → 50 distinct values across 6000 rows (3 chunks). The first chunk misses
+# and stores each distinct value; later chunks reuse them, so a single scan mixes
+# hits and misses.
+# =====================================================================
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+# Cold: the per-chunk rate line renders (some miss + some store on the first chunk).
+query II
+EXPLAIN ANALYZE SELECT x, doubled FROM range(6000) g(x), LATERAL ex.cached_double(x % 50);
+----
+analyzed_plan	<REGEX>:.*[0-9]+ hit / [0-9]+ miss / [1-9][0-9]* store.*
+
+# The prior EXPLAIN ANALYZE executed the scan, warming every distinct value. A second
+# identical run now serves every chunk from cache: 0 miss, 0 store.
+query II
+EXPLAIN ANALYZE SELECT x, doubled FROM range(6000) g(x), LATERAL ex.cached_double(x % 50);
+----
+analyzed_plan	<REGEX>:.*[0-9]+ hit / 0 miss / 0 store.*
+
+# =====================================================================
+# Buffered (M3, whole-input) — binary hit / miss.
+# =====================================================================
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+statement ok
+CREATE TEMP TABLE t AS SELECT * FROM range(5000) g(x);
+
+query II
+EXPLAIN ANALYZE SELECT x AS total FROM ex.cached_sum_all((SELECT x FROM t));
+----
+analyzed_plan	<REGEX>:.*Cache: miss.*
+
+query II
+EXPLAIN ANALYZE SELECT x AS total FROM ex.cached_sum_all((SELECT x FROM t));
+----
+analyzed_plan	<REGEX>:.*Cache: hit \(memory\).*
+
+# =====================================================================
+# Producer table function (whole-result) — the miss label is now shown too (a hit
+# was already surfaced; this pins the symmetric miss branch).
+# =====================================================================
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+query II
+EXPLAIN ANALYZE SELECT n FROM ex.data.cacheable_numbers;
+----
+analyzed_plan	<REGEX>:.*Cache: miss.*
+
+query II
+EXPLAIN ANALYZE SELECT n FROM ex.data.cacheable_numbers;
+----
+analyzed_plan	<REGEX>:.*Cache: hit \(memory\).*
+
+# An ineligible scan (cache disabled) gets NO Cache line — the label is not noise on
+# every plan, only where the cache is actually in play.
+statement ok
+SET vgi_result_cache = false;
+
+query II
+EXPLAIN ANALYZE SELECT n FROM ex.data.cacheable_numbers;
+----
+analyzed_plan	<!REGEX>:.*Cache:.*
+
+statement ok
+RESET vgi_result_cache;
+
+statement ok
+DETACH ex;

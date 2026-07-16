@@ -1742,6 +1742,7 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 	// init_local).
 	auto global_state = make_uniq<VgiTableFunctionGlobalState>();
 	global_state->client_context_for_explain = &context;
+	global_state->cache_eligible = cache_eval.eligible; // an eligible non-hit is a genuine miss (EXPLAIN)
 	global_state->dynamic_filters = std::move(dynamic_filters);
 	global_state->static_filter_bytes = filter_bytes;
 	global_state->tick_filter_state = tick_filter_state;
@@ -3015,6 +3016,10 @@ InsertionOrderPreservingMap<string> VgiTableFunctionDynamicToString(TableFunctio
 		result["Cache"] = (global_state.serving_entry && global_state.serving_entry->disk_backed)
 		                      ? "hit (disk_streaming)"
 		                      : "hit (memory)";
+	} else if (global_state.cache_eligible) {
+		// Eligible but not served → a genuine miss (the worker ran; the result may
+		// have been captured for next time). An ineligible scan gets no Cache line.
+		result["Cache"] = "miss";
 	}
 
 	// Worker batch shape. Workers differ enormously in how they chunk a result —

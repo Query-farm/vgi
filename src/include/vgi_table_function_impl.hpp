@@ -350,6 +350,10 @@ struct VgiTableFunctionGlobalState : public GlobalTableFunctionState {
 	bool serving_from_cache = false;
 	std::shared_ptr<const VgiResultCacheEntry> serving_entry;
 	std::atomic<bool> serve_claimed {false};
+	// Whether this scan was cache-eligible (opt-in gates passed). Drives the
+	// EXPLAIN ANALYZE "Cache: miss" label — an eligible scan that didn't serve
+	// from cache is a genuine miss; an ineligible scan gets no Cache line.
+	bool cache_eligible = false;
 	// Capture (cache miss + eligible). Null when the scan isn't cacheable.
 	std::shared_ptr<VgiResultCaptureCtx> capture;
 
