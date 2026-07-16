@@ -34,7 +34,7 @@ slot (at slots_off + i*slot_stride):
     [3] c2w_closed     1 = client finished writing (EOS on input)
     [4] w2c_write_pos  monotonic (worker → client)
     [5] w2c_read_pos
-    [6] w2c_closed     1 = worker finished streaming (EOS on output)
+    [6] w2c_closed     0 = open; else the CLOSING WORKER's claim id (a token, not a bare 1)
     [7..15] reserved
   c2w_data: ring_cap bytes   (byte offset control+64)
   w2c_data: ring_cap bytes   (byte offset control+64+ring_cap)
@@ -51,10 +51,26 @@ a release+immediate-reclaim (`state 1 → 0 → 1`) an **ABA race** — the work
 for both the free state and any fresh reclaim, so the handoff is unambiguous. (The native single-
 serve harness never reuses a slot mid-dispatch, so it may still store `1`.)
 
+**`w2c_closed` is a claim-id TOKEN, and the worker BAILS from a blocked ring op when its slot
+is reclaimed.** These two rules make reusing a not-yet-drained slot race-free. On the error
+path the client frees the slot (`state → 0`) *before* the worker's serve finishes — it cannot
+drain `w2c` during the C++ exception unwind because the query is already interrupted, so reads
+bail. A new scan may therefore reclaim + reset the slot while the old worker is still finishing.
+Two guards close the race: **(a)** the worker closes `w2c` by storing *its own* `served` claim
+id in `w2c_closed` (not `1`), and a reader treats `w2c` as EOS only when `w2c_closed == state`
+(its current claim) — so a stale worker's late close carries the *old* id and the new client
+ignores it (no phantom `Stream header EOF (no schema)`); **(b)** the worker's blocking ring
+read/write re-checks `state == served` after each bounded wait and, if the slot was
+released/reclaimed, ends the serve (read → EOS, write → abort) — so a reclaimed slot's serve
+thread can't wedge on a ring the client abandoned (which would leak the slot and later starve
+scans). The native single-serve harness stores `1` and never reuses a slot mid-dispatch, so
+`w2c_closed == state` reduces to `1 == 1` there.
+
 **SPSC ring semantics** (per direction): positions are **monotonic** (never wrap; index =
 `pos % ring_cap`), so `avail = write_pos - read_pos`, `free = ring_cap - avail`. A writer
 that finds `free == 0` blocks on `read_pos` (waits for the reader to advance); a reader that
-finds `avail == 0` blocks on `write_pos` (unless `*_closed == 1`, then EOS). Each side
+finds `avail == 0` blocks on `write_pos` (EOS when `c2w_closed == 1` for the worker reading
+input, or `w2c_closed == state` for the client reading output — the claim-id token above). Each side
 `notify`s the word it advanced. This is the SAB analog of an OS pipe buffer — the ring is
 the chunker, so payloads larger than `ring_cap` stream through in bounded pieces.
 

@@ -24,14 +24,20 @@ addToLibrary({
     },
     slotByte: function (hdr, slot) { return globalThis.__vgiBase + hdr.slotsOff + slot * hdr.slotStride; },
     // Blocking ring read (ring in delivered buf) -> this module's HEAP at dstPtr.
-    ringRead: function (ctl, wLane, rLane, clLane, dataByte, ringCap, dstPtr, n) {
+    // `served` is the claim id this thread is serving (STATE at claim). If STATE (lane 0)
+    // leaves `served` while we block (the client released/reclaimed the slot — the error
+    // path frees it before we finish), we BAIL (return 0 = EOS) so the serve ends and this
+    // pthread re-parks instead of wedging on a ring the client abandoned.
+    ringRead: function (ctl, wLane, rLane, clLane, dataByte, ringCap, dstPtr, n, served) {
       var i = this.i32(); var src = this.u8(); var dst = HEAPU8;
       for (;;) {
         var w = Atomics.load(i, ctl + wLane); var r = Atomics.load(i, ctl + rLane);
         var avail = w - r;
         if (avail === 0) {
-          if (Atomics.load(i, ctl + clLane) === 1) return 0; // EOS
-          Atomics.wait(i, ctl + wLane, w, 250); continue;
+          if (Atomics.load(i, ctl + clLane) === 1) return 0; // client closed c2w (EOS)
+          Atomics.wait(i, ctl + wLane, w, 250);
+          if (Atomics.load(i, ctl) !== served) return 0; // slot released/reclaimed -> end serve
+          continue;
         }
         var k = Math.min(avail, n); var pos = r % ringCap; var first = Math.min(k, ringCap - pos);
         dst.set(src.subarray(dataByte + pos, dataByte + pos + first), dstPtr);
@@ -39,10 +45,15 @@ addToLibrary({
         Atomics.store(i, ctl + rLane, r + k); Atomics.notify(i, ctl + rLane); return k;
       }
     },
-    // Blocking ring write from this module's HEAP srcPtr -> ring in delivered buf.
-    ringWrite: function (ctl, wLane, rLane, dataByte, ringCap, srcPtr, n) {
+    // Blocking ring write from this module's HEAP srcPtr -> ring in delivered buf. Same
+    // reclaim-bail as ringRead: if STATE leaves `served` while the ring is full (client
+    // stopped draining because it abandoned/errored), abort the write (return short) so the
+    // serve ends — otherwise this pthread blocks forever on a ring nobody reads (a slot leak
+    // that later starves scans) and could clobber a reused slot.
+    ringWrite: function (ctl, wLane, rLane, dataByte, ringCap, srcPtr, n, served) {
       var i = this.i32(); var dst = this.u8(); var src = HEAPU8; var off = 0;
       while (off < n) {
+        if (Atomics.load(i, ctl) !== served) return off; // slot released/reclaimed -> abort
         var w = Atomics.load(i, ctl + wLane); var r = Atomics.load(i, ctl + rLane);
         var free = ringCap - (w - r);
         if (free === 0) { Atomics.wait(i, ctl + rLane, r, 250); continue; }
@@ -58,19 +69,24 @@ addToLibrary({
   vgi_sab_worker_read__deps: ['$vgiW'],
   vgi_sab_worker_read: function (slot, ptr, n) {
     var hdr = vgiW.hdr(); var sb = vgiW.slotByte(hdr, slot);
-    return vgiW.ringRead(sb >> 2, 1, 2, 3, sb + 64, hdr.ringCap, ptr, n);
+    return vgiW.ringRead(sb >> 2, 1, 2, 3, sb + 64, hdr.ringCap, ptr, n, vgiW.served[slot]);
   },
   // Worker writes the worker->client ring (w2c): lanes W=4 R=5, data at ctl+64+ring_cap.
   vgi_sab_worker_write__deps: ['$vgiW'],
   vgi_sab_worker_write: function (slot, ptr, n) {
     var hdr = vgiW.hdr(); var sb = vgiW.slotByte(hdr, slot);
-    return vgiW.ringWrite(sb >> 2, 4, 5, sb + 64 + hdr.ringCap, hdr.ringCap, ptr, n);
+    return vgiW.ringWrite(sb >> 2, 4, 5, sb + 64 + hdr.ringCap, hdr.ringCap, ptr, n, vgiW.served[slot]);
   },
-  // EOS on w2c: set W2C_CLOSED(=6), wake a client blocked reading w2c (on W2C_W=4).
+  // Close w2c with a claim-id TOKEN: store this thread's served claim id in W2C_CLOSED(=6)
+  // (not a constant 1). The client reads w2c as EOS only when W2C_CLOSED == its current
+  // STATE (see js-stubs ringRead), so if we reclaimed-race (this close fires after the
+  // client freed + a new scan reclaimed the slot) our OLD id != the new claim's STATE and
+  // the new client ignores it — no phantom "Stream header EOF (no schema)". Wake the client
+  // blocked reading w2c (waits on W2C_W=4).
   vgi_sab_worker_close__deps: ['$vgiW'],
   vgi_sab_worker_close: function (slot) {
     var i = vgiW.i32(); var hdr = vgiW.hdr(); var sb = vgiW.slotByte(hdr, slot) >> 2;
-    Atomics.store(i, sb + 6, 1); Atomics.notify(i, sb + 4);
+    Atomics.store(i, sb + 6, vgiW.served[slot] | 0); Atomics.notify(i, sb + 4);
   },
   // Per-thread dispatcher: block until `slot` is CLAIMED (STATE 0 -> claim-id) and
   // ready to serve. Called BEFORE serving. If the slot is already claimed (the client

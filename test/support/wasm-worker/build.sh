@@ -8,7 +8,10 @@
 set -eo pipefail
 cd "$(dirname "$0")"
 : "${EMSDK_DIR:=/tmp/emsdk}"
+# emsdk_env.sh UNSETS EMSDK_DIR on source, so stash it and restore before we use it.
+_VGI_EMSDK_DIR="$EMSDK_DIR"
 set +u; source "$EMSDK_DIR/emsdk_env.sh" >/dev/null 2>&1; set -u
+EMSDK_DIR="$_VGI_EMSDK_DIR"
 export PATH="$EMSDK_DIR/upstream/emscripten:$PATH"
 SABLIB="${SABLIB:-$(cd ../sabtable && pwd)/target/wasm32-unknown-emscripten/release/libsabtable.a}"
 # NB: -Z build-std recompiles compiler_builtins, which needs +atomics,+bulk-memory

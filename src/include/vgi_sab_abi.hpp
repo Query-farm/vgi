@@ -35,6 +35,19 @@ enum SlotLane : int32_t {
 	C2W_CLOSED = 3,
 	W2C_WRITE_POS = 4,      // worker -> client ring
 	W2C_READ_POS = 5,
+	// Worker->client "closed" lane. 0 = open; when the worker finishes serving a claim
+	// it stores its OWN claim id here (not a constant 1) — a claim-id close TOKEN. The
+	// client treats w2c as EOS only when W2C_CLOSED == the slot's current STATE (its own
+	// claim). This makes slot reuse race-free: on the error path the client frees the
+	// slot (STATE->0) before the worker's serve finishes (it can't drain w2c during the
+	// C++ exception unwind — the query is interrupted, so reads bail), so a NEW scan may
+	// reclaim + reset the slot while the old worker is still finishing. That stale
+	// worker's late close writes the OLD claim id, which != the new claim's STATE, so the
+	// new client ignores it (no phantom "Stream header EOF") and waits for its own
+	// worker. Paired with the worker bailing from a blocked ring op when STATE != served
+	// (so a reclaimed slot's serve thread can't wedge). Additive: a worker that stores 1
+	// still reads as "closed" for a same-claim reader iff STATE==1, but the C++ side never
+	// uses claim id 1, so mixed old workers simply never spuriously-close a reused slot.
 	W2C_CLOSED = 6,
 };
 constexpr int32_t kSlotControlBytes = 64; // control block, cache-line isolated
