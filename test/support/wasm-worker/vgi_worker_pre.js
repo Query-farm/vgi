@@ -13,6 +13,7 @@
     if (d && d.__vgiInject) {
       globalThis.__vgiBuf = d.__vgiBuf;
       globalThis.__vgiBase = d.__vgiBase;
+      if (d.__vgiGeoSab) globalThis.__vgiGeoSab = d.__vgiGeoSab; // navigator.geolocation result buffer
     }
   });
 })();

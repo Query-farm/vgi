@@ -151,6 +151,49 @@ addToLibrary({
     }
     return 1;
   },
+  // Network fetch from the browser worker — a GET via SYNCHRONOUS XMLHttpRequest, which
+  // is allowed in a Worker realm (only deprecated on the main thread) and blocks this
+  // pthread synchronously until the response arrives, so it fits the sync serve loop with
+  // no async/Atomics plumbing. The request runs from the END USER's network position (its
+  // IP, cookies, VPN) — a server-side worker's fetch would be the server's. Writes the
+  // response body UTF-8 into `outPtr` (<= maxLen), the HTTP status into `statusPtr` (i32),
+  // returns bytes written or -1 on a network/CORS error. Under COI (COEP: require-corp) a
+  // cross-origin response must send `Cross-Origin-Resource-Policy` or the browser blocks it;
+  // same-origin always works.
+  vgi_browser_fetch: function (urlPtr, urlLen, outPtr, maxLen, statusPtr) {
+    var status32 = new Int32Array(HEAPU8.buffer, statusPtr, 1);
+    try {
+      // .slice (not .subarray) → a NON-shared copy: TextDecoder rejects a
+      // SharedArrayBuffer-backed view (the -pthread module heap is a SAB).
+      var url = new TextDecoder().decode(HEAPU8.slice(urlPtr, urlPtr + urlLen));
+      var xhr = new XMLHttpRequest();
+      xhr.open('GET', url, false); // synchronous
+      xhr.send();
+      status32[0] = xhr.status | 0;
+      var bytes = new TextEncoder().encode(xhr.responseText || '');
+      var len = Math.min(bytes.length, maxLen);
+      HEAPU8.set(bytes.subarray(0, len), outPtr);
+      return len;
+    } catch (e) {
+      status32[0] = 0;
+      return -1;
+    }
+  },
+  // navigator.geolocation is a Window API (absent in a Worker realm), so the page bridge
+  // resolves getCurrentPosition and publishes [status:i32 @0, lat:f64 @8, lon:f64 @16,
+  // acc:f64 @24] into a shared buffer (globalThis.__vgiGeoSab, injected per pthread realm by
+  // vgi_worker_pre.js). Copy [lat, lon, acc] to outPtr (3 f64) when ready. Returns 1=ready,
+  // 0=pending, -1=error/denied/unavailable.
+  vgi_browser_geolocation: function (outPtr) {
+    var sab = globalThis.__vgiGeoSab;
+    if (!sab) return -1;
+    var st = Atomics.load(new Int32Array(sab, 0, 1), 0);
+    if (st !== 1) return st | 0; // 0 pending, -1 error
+    var g = new Float64Array(sab, 8, 3);
+    var out = new Float64Array(HEAPU8.buffer, outPtr, 3);
+    out[0] = g[0]; out[1] = g[1]; out[2] = g[2];
+    return 1;
+  },
   // Write a UTF-8 browser string (kind: 0=userAgent 1=language 2=platform 3=page URL)
   // into `ptr` (<= max bytes). Returns bytes written.
   vgi_browser_info: function (kind, ptr, max) {

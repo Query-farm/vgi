@@ -123,15 +123,28 @@ function-type protocol paths over the SAB channel, all under `SET threads=4`:
   `vgi_result_cache_stats().hits ≥ 1`).
 - **browser Web APIs** — the killer property of a *client-side* worker: it exposes APIs a
   server-side (subprocess/HTTP) worker can NEVER reach because they describe the END USER's
-  browser. `browser_info()` returns one row of `navigator.userAgent`/`language`/`platform`/
-  `hardwareConcurrency`, the page URL (`WorkerLocation`), `performance.now()`, and
-  `self.crossOriginIsolated`; `client_random(n)` draws `n` int64 from the browser CSPRNG
-  (`crypto.getRandomValues`). Bridged via the emscripten `--js-library` (`vgi_worker_lib.js`
-  `vgi_browser_*`) that the Rust fixtures declare `extern "C"` (see `../../sabtable/src/lib.rs`,
-  emscripten-gated). Two gotchas the code handles: `getRandomValues` **throws on a
-  SharedArrayBuffer**-backed view (the `-pthread` module heap), so it draws into a fresh
-  non-shared buffer then copies in; and DOM APIs (`document`/`window`) are intentionally absent
-  (unavailable in a Worker realm).
+  browser. Fixtures (Rust `extern "C"` → emscripten `--js-library` `vgi_worker_lib.js`
+  `vgi_browser_*`, emscripten-gated in `../../sabtable/src/lib.rs`):
+    - `browser_info()` — one row of `navigator.userAgent`/`language`/`platform`/
+      `hardwareConcurrency`, the page URL (`WorkerLocation`), `performance.now()`, and
+      `self.crossOriginIsolated`.
+    - `client_random(n)` — `n` int64 from the browser CSPRNG (`crypto.getRandomValues`).
+    - `client_fetch(url)` — a **network GET from the browser** (synchronous `XMLHttpRequest`,
+      allowed in a Worker realm; blocks the serve pthread synchronously, no async plumbing).
+      The request runs from the END USER's network position — its IP, cookies, CORS
+      (`SELECT ... FROM client_fetch('/whoami')` returns the *browser's* UA, not the server's).
+      Same-origin always works under COI; cross-origin needs `Cross-Origin-Resource-Policy`.
+    - `client_geo()` — the **actual `navigator.geolocation`** position of the end user.
+      geolocation is a Window API (absent in a Worker realm), so the page bridge
+      (`vgi-webworker-bridge.ts` `vgi-geo-init`) calls `getCurrentPosition` and publishes
+      `[status, lat, lon, accuracy]` into a `SharedArrayBuffer` shared with the serve pthreads
+      (`vgi_worker_pre.js` injects it per realm); the fixture polls it. The E2E grants
+      geolocation + sets a mock position via Playwright `context.setGeolocation` and asserts
+      the fixture returns those coords.
+  **Three SharedArrayBuffer gotchas the code handles** (the `-pthread` module heap is a SAB):
+  `crypto.getRandomValues` and `TextDecoder.decode` both **throw on a SAB-backed view** — draw
+  into / copy from a fresh non-shared buffer (`.slice`); and DOM APIs (`document`/`window`) are
+  intentionally absent (unavailable in a Worker realm).
 
 Fixtures live in `../../sabtable/src/lib.rs` (rebuild the worker via `../build.sh`). Run:
 

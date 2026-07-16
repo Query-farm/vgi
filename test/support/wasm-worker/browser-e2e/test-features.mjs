@@ -132,8 +132,29 @@ async function step(R, name, fn) {
       return a.length === 4 && b.length === 4 && JSON.stringify(a) !== JSON.stringify(b) && a.some((x) => x !== '0');
     });
 
+    // --- NETWORK FETCH from the worker (sync XHR, same-origin /whoami) ----------
+    await step(R, 'networkFetchOk', async () => {
+      const r = await q(`SELECT status::INT s, body FROM vgi_table_function(${W}, 'client_fetch', ['${location.origin}/whoami'])`);
+      const s = Number(r.getChild('s').get(0));
+      const body = String(r.getChild('body').get(0) ?? '');
+      R.fetch = { s, body: body.slice(0, 80) };
+      return s === 200 && body.includes('"ip"') && body.includes('"user_agent"');
+    });
+
+    // --- REAL navigator.geolocation of the end user (resolved via the page bridge) ---
+    // The test grants geolocation + sets a mock position via Playwright before loading.
+    await step(R, 'geoOk', async () => {
+      const r = await q(`SELECT * FROM vgi_table_function(${W}, 'client_geo', [])`, 20000);
+      const st = String(r.getChild('status').get(0) ?? '');
+      const lat = r.getChild('latitude').get(0);
+      const lon = r.getChild('longitude').get(0);
+      R.geo = { st, lat: lat == null ? null : Number(lat), lon: lon == null ? null : Number(lon) };
+      // Playwright mock: 37.7749, -122.4194. Accept a small tolerance.
+      return st === 'ok' && Math.abs(Number(lat) - 37.7749) < 0.001 && Math.abs(Number(lon) + 122.4194) < 0.001;
+    });
+
     try { await conn.close(); await db.terminate(); } catch (e) { /* a hung conn may not close */ }
-    R.pass = ['scalarOk', 'tableInOutOk', 'aggregateOk', 'aggregateGroupedOk', 'largePayloadOk', 'limitAbandonOk', 'cacheHitOk', 'browserInfoOk', 'clientRandomOk'].every((k) => R[k] === 'OK');
+    R.pass = ['scalarOk', 'tableInOutOk', 'aggregateOk', 'aggregateGroupedOk', 'largePayloadOk', 'limitAbandonOk', 'cacheHitOk', 'browserInfoOk', 'clientRandomOk', 'networkFetchOk', 'geoOk'].every((k) => R[k] === 'OK');
     log('PASS=' + R.pass);
   } catch (e) {
     R.error = String(e && e.stack ? e.stack : e);

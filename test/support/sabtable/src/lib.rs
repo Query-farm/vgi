@@ -48,6 +48,13 @@ extern "C" {
     fn vgi_browser_perf_now() -> f64; // performance.now()
     fn vgi_browser_random(ptr: *mut u8, n: i32) -> i32; // crypto.getRandomValues (CSPRNG)
     fn vgi_browser_info(kind: i32, ptr: *mut u8, max: i32) -> i32; // navigator/location strings
+    // Network GET via synchronous XHR. Writes body UTF-8 to out_ptr (<= max), HTTP status
+    // to *status_ptr; returns bytes written or -1 on network/CORS error.
+    fn vgi_browser_fetch(url_ptr: *const u8, url_len: i32, out_ptr: *mut u8, max: i32, status_ptr: *mut i32) -> i32;
+    // navigator.geolocation (resolved on the page, published into a shared buffer by the
+    // bridge). Writes [lat, lon, accuracy] as 3 f64 to out_ptr. Returns 1=ready, 0=pending,
+    // -1=error/denied/unavailable.
+    fn vgi_browser_geolocation(out_ptr: *mut f64) -> i32;
 }
 
 // Read a browser string (0=userAgent 1=language 2=platform 3=page URL) via the JS bridge.
@@ -713,6 +720,139 @@ impl TableFunction for ClientRandom {
     }
 }
 
+// ---- client_fetch(url): a network GET from the browser worker ---------------------------
+// A sync-XHR GET issued from the END USER's browser — its IP, cookies, VPN, CORS context —
+// not the server's. Returns (status, body). Same-origin always works under COI; cross-origin
+// needs the response to send Cross-Origin-Resource-Policy.
+#[cfg(target_os = "emscripten")]
+struct ClientFetch;
+#[cfg(target_os = "emscripten")]
+struct ClientFetchProducer {
+    schema: SchemaRef,
+    url: String,
+    done: bool,
+}
+#[cfg(target_os = "emscripten")]
+impl TableProducer for ClientFetchProducer {
+    fn next_batch(&mut self, _out: &mut OutputCollector) -> Result<Option<RecordBatch>> {
+        if self.done {
+            return Ok(None);
+        }
+        self.done = true;
+        let url = self.url.as_bytes();
+        let mut buf = vec![0u8; 1 << 20];
+        let mut status: i32 = 0;
+        let n = unsafe {
+            vgi_browser_fetch(url.as_ptr(), url.len() as i32, buf.as_mut_ptr(), buf.len() as i32, &mut status)
+        };
+        if n < 0 {
+            return Err(RpcError::runtime_error(format!(
+                "client_fetch: network/CORS error for {}",
+                self.url
+            )));
+        }
+        buf.truncate(n as usize);
+        let body = String::from_utf8_lossy(&buf).into_owned();
+        let cols: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from(vec![status as i64])),
+            Arc::new(StringArray::from(vec![body])),
+        ];
+        Ok(Some(RecordBatch::try_new(self.schema.clone(), cols)
+            .map_err(|e| RpcError::runtime_error(e.to_string()))?))
+    }
+}
+#[cfg(target_os = "emscripten")]
+impl TableFunction for ClientFetch {
+    fn name(&self) -> &str {
+        "client_fetch"
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        FunctionMetadata::default()
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        vec![ArgSpec::const_arg("url", 0, "varchar", "URL to GET (same-origin under COI; cross-origin needs CORP)")]
+    }
+    fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("status", DataType::Int64, true),
+            Field::new("body", DataType::Utf8, true),
+        ]));
+        Ok(BindResponse { output_schema: schema, opaque_data: Vec::new() })
+    }
+    fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
+        Ok(Box::new(ClientFetchProducer {
+            schema: params.output_schema.clone(),
+            url: params.arguments.const_str(0).unwrap_or_default(),
+            done: false,
+        }))
+    }
+}
+
+// ---- client_geo(): the actual navigator.geolocation position of the END USER --------------
+// geolocation is a Window API (absent in a Worker realm), so the page bridge resolves the
+// position (permission-gated) and publishes it into a shared buffer this fixture reads. The
+// position is the END USER's — a server worker has no such concept. Async, so poll briefly.
+#[cfg(target_os = "emscripten")]
+struct ClientGeo;
+#[cfg(target_os = "emscripten")]
+struct ClientGeoProducer {
+    schema: SchemaRef,
+    done: bool,
+}
+#[cfg(target_os = "emscripten")]
+impl TableProducer for ClientGeoProducer {
+    fn next_batch(&mut self, _out: &mut OutputCollector) -> Result<Option<RecordBatch>> {
+        if self.done {
+            return Ok(None);
+        }
+        self.done = true;
+        let mut coords = [0.0f64; 3];
+        let mut st = 0;
+        for _ in 0..60 {
+            // up to ~6 s — getCurrentPosition resolves async on the page
+            st = unsafe { vgi_browser_geolocation(coords.as_mut_ptr()) };
+            if st != 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let ok = st == 1;
+        let status = if ok { "ok" } else if st == -1 { "error" } else { "pending" };
+        let cols: Vec<ArrayRef> = vec![
+            Arc::new(Float64Array::from(vec![ok.then_some(coords[0])])),
+            Arc::new(Float64Array::from(vec![ok.then_some(coords[1])])),
+            Arc::new(Float64Array::from(vec![ok.then_some(coords[2])])),
+            Arc::new(StringArray::from(vec![status])),
+        ];
+        Ok(Some(RecordBatch::try_new(self.schema.clone(), cols)
+            .map_err(|e| RpcError::runtime_error(e.to_string()))?))
+    }
+}
+#[cfg(target_os = "emscripten")]
+impl TableFunction for ClientGeo {
+    fn name(&self) -> &str {
+        "client_geo"
+    }
+    fn metadata(&self) -> FunctionMetadata {
+        FunctionMetadata::default()
+    }
+    fn argument_specs(&self) -> Vec<ArgSpec> {
+        Vec::new()
+    }
+    fn on_bind(&self, _params: &BindParams) -> Result<BindResponse> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("latitude", DataType::Float64, true),
+            Field::new("longitude", DataType::Float64, true),
+            Field::new("accuracy_m", DataType::Float64, true),
+            Field::new("status", DataType::Utf8, true),
+        ]));
+        Ok(BindResponse { output_schema: schema, opaque_data: Vec::new() })
+    }
+    fn producer(&self, params: &ProcessParams) -> Result<Box<dyn TableProducer>> {
+        Ok(Box::new(ClientGeoProducer { schema: params.output_schema.clone(), done: false }))
+    }
+}
+
 /// Serve one slot to completion, then EOS the output ring. Blocking; run on a thread.
 #[no_mangle]
 pub extern "C" fn vgi_rust_serve_table_sab_slot(slot: i32) {
@@ -732,6 +872,10 @@ pub extern "C" fn vgi_rust_serve_table_sab_slot(slot: i32) {
     worker.register_table(BrowserInfo);
     #[cfg(target_os = "emscripten")]
     worker.register_table(ClientRandom);
+    #[cfg(target_os = "emscripten")]
+    worker.register_table(ClientFetch);
+    #[cfg(target_os = "emscripten")]
+    worker.register_table(ClientGeo);
     // No set_catalog: the dispatcher installs a default CatalogModel, and the C++
     // client binds `count_to` directly by name against the dispatch registry.
     worker.serve_reader_writer(SabReader { slot }, SabWriter { slot });
