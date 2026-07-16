@@ -1122,7 +1122,19 @@ uint64_t SettingsSignature(const VgiResultCache::Settings &s) {
 void VgiResultCache::Configure(const Settings &settings) {
 	std::lock_guard<std::mutex> lock(mutex_);
 	settings_ = settings;
+#ifdef __EMSCRIPTEN__
+	// WASM is memory-only by construction: the on-disk tier uses DuckDB's local
+	// FileSystem (absent in the browser) and its incremental blob hashing still
+	// calls mbedtls directly (SHA256State), which is not resolvable from the
+	// dlopen'd side-module on emscripten. Force the disk dir empty here — the
+	// single chokepoint every singleton disk path (Lookup/Insert/pack/reap) reads
+	// disk_dir_ from — so `SET vgi_result_cache_dir` is a clean no-op on WASM
+	// rather than a latent crash. The producer spill path is gated at its own
+	// setting read (vgi_table_function_impl.cpp). Native is unchanged.
+	disk_dir_.clear();
+#else
 	disk_dir_ = settings.disk_dir;
+#endif
 	disk_max_bytes_ = settings.disk_max_bytes;
 	disk_compression_ = settings.disk_compression;
 	disk_compression_level_ = settings.disk_compression_level;

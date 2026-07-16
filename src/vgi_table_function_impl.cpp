@@ -1783,9 +1783,16 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 		// max_entry_bytes AND the disk tier is on, capture spills to a streaming disk
 		// blob (RAM-flat) instead of aborting. Captured here; the writer is created
 		// lazily in InstallBatch on the first threshold cross.
+#ifndef __EMSCRIPTEN__
+		// WASM is memory-only: leave cap->disk_dir empty so a >max_entry_bytes capture
+		// aborts to uncached (streams to DuckDB) rather than spilling to a disk blob —
+		// the spill writer's incremental hash (MbedTlsWrapper::SHA256State) is not
+		// resolvable from the emscripten side-module. The singleton disk tier is gated
+		// in parallel at VgiResultCache::Configure. Native is unchanged.
 		if (context.TryGetCurrentSetting("vgi_result_cache_dir", sv) && !sv.IsNull()) {
 			cap->disk_dir = sv.GetValue<std::string>();
 		}
+#endif
 		if (context.TryGetCurrentSetting("vgi_result_cache_disk_max_bytes", sv) && !sv.IsNull()) {
 			cap->disk_max = sv.GetValue<uint64_t>();
 		}
