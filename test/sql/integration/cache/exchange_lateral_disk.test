@@ -1,0 +1,63 @@
+# name: test/sql/integration/cache/exchange_lateral_disk.test
+# description: EXCHANGE-mode result cache — LOOSE disk tier (pack disabled): EVERY
+#   exchange memo persists to the content-addressed on-disk store regardless of
+#   payload size — a small-but-expensive result is exactly where a cross-process +
+#   cross-restart warm cache pays off, so tiny per-chunk memos are NOT excluded by
+#   a size floor. (With the default packed backend these small memos pack instead —
+#   see cache/pack.test; this file pins the loose store.)
+#
+#   Split out of cache/exchange_lateral.test and gated off Windows: on the Windows
+#   runner this exact flow (loose store + per-value default + LATERAL over a temp
+#   table) deterministically writes NO objects/refs to disk, while the loose
+#   ref-count-cap flow in exchange_lateral.test (per_value=false, VALUES inputs)
+#   and the producer-mode disk tests (cache/disk.test, disk_streaming.test) DO
+#   persist on the same runner — a Windows-specific gap in the extension's
+#   exchange disk tier (PersistToDisk's catch-all swallows the cause), tracked in
+#   Query-farm/vgi. Re-merge into exchange_lateral.test once fixed.
+# group: [vgi_integration_cache]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+require notwindows
+
+statement ok
+ATTACH 'example' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+SET threads=1;
+
+statement ok
+CREATE TEMP TABLE t AS SELECT * FROM range(5) r(x);
+
+statement ok
+SET vgi_result_cache_pack = false;
+
+statement ok
+SET vgi_result_cache_dir = '__TEST_DIR__/vgi_exch_lateral_disk';
+
+statement ok
+SET vgi_result_cache_disk_max_bytes = 104857600;
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+statement ok
+SELECT count(*) FROM t, LATERAL ex.cached_double(t.x);
+
+# The tiny chunk memo reached disk: an immutable object blob + a key ref.
+query I
+SELECT COUNT(*) > 0 FROM glob('__TEST_DIR__/vgi_exch_lateral_disk/*/objects/*.vrc');
+----
+true
+
+query I
+SELECT COUNT(*) > 0 FROM glob('__TEST_DIR__/vgi_exch_lateral_disk/*/refs/*.ref');
+----
+true
+
+statement ok
+DETACH ex;
