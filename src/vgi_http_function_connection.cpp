@@ -250,6 +250,7 @@ void HttpFunctionConnection::BufferDataBatches(const std::string &response_body,
 	buffered_batch_indexes_.clear();
 	buffered_partition_values_bytes_.clear();
 	buffered_parent_row_bytes_.clear();
+	buffered_cache_controls_.clear();
 	buffered_batch_index_ = 0;
 	stream_state_token_.clear();
 
