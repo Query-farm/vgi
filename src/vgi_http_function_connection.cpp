@@ -376,7 +376,8 @@ BindResult HttpFunctionConnection::PerformBindRpc() {
 		auto cached_params = attach_params_
 		    ? attach_params_->GetOrInitHttpParams(context_, base_url_) : nullptr;
 		auto resp = HttpInvokeUnary(context_, base_url_, "bind", rpc_params, auth,
-		                             /*cookie_jar=*/nullptr, cached_params);
+		                             /*cookie_jar=*/nullptr, cached_params,
+		                             "", "", "", "", "", &http_client_);
 		if (!resp.batch || resp.batch->num_rows() == 0) {
 			throw IOException("Empty bind response from HTTP server [url: %s]", base_url_);
 		}
@@ -720,7 +721,8 @@ HttpFunctionConnection::RpcTableBufferingProcess(const std::string &function_nam
 	    ? attach_params_->GetOrInitHttpParams(context_, base_url_) : nullptr;
 	auto resp = HttpInvokeUnary(context_, base_url_, "table_buffering_process", rpc_params, auth,
 	                             /*cookie_jar=*/nullptr, cached_params,
-	                             GetExecutionIdHex(), GetAttachOpaqueDataHex(), "", GetConnIdHex());
+	                             GetExecutionIdHex(), GetAttachOpaqueDataHex(), "", GetConnIdHex(),
+	                             /*protocol_version_override=*/"", &http_client_);
 	auto inner = DecodeHttpOuterResponse(resp, "table_buffering_process", base_url_);
 	if (!inner || inner->num_rows() == 0) {
 		throw IOException("table_buffering_process response missing data [url: %s]", base_url_);
@@ -741,7 +743,8 @@ HttpFunctionConnection::RpcTableBufferingCombine(const std::string &function_nam
 	    ? attach_params_->GetOrInitHttpParams(context_, base_url_) : nullptr;
 	auto resp = HttpInvokeUnary(context_, base_url_, "table_buffering_combine", rpc_params, auth,
 	                             /*cookie_jar=*/nullptr, cached_params,
-	                             GetExecutionIdHex(), GetAttachOpaqueDataHex(), "", GetConnIdHex());
+	                             GetExecutionIdHex(), GetAttachOpaqueDataHex(), "", GetConnIdHex(),
+	                             /*protocol_version_override=*/"", &http_client_);
 	auto inner = DecodeHttpOuterResponse(resp, "table_buffering_combine", base_url_);
 	if (!inner || inner->num_rows() == 0) {
 		throw IOException("table_buffering_combine response missing data [url: %s]", base_url_);
@@ -768,7 +771,8 @@ void HttpFunctionConnection::RpcTableBufferingDestructor(const std::string &func
 	    ? attach_params_->GetOrInitHttpParams(context_, base_url_) : nullptr;
 	auto resp = HttpInvokeUnary(context_, base_url_, "table_buffering_destructor", rpc_params, auth,
 	                             /*cookie_jar=*/nullptr, cached_params,
-	                             GetExecutionIdHex(), GetAttachOpaqueDataHex(), "", GetConnIdHex());
+	                             GetExecutionIdHex(), GetAttachOpaqueDataHex(), "", GetConnIdHex(),
+	                             /*protocol_version_override=*/"", &http_client_);
 	auto inner = DecodeHttpOuterResponse(resp, "table_buffering_destructor", base_url_);
 	(void)inner;
 }

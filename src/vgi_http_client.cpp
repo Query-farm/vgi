@@ -532,7 +532,8 @@ UnaryResponseResult HttpInvokeUnary(ClientContext &context,
                                      const std::string &attach_opaque_data_hex,
                                      const std::string &transaction_opaque_data_hex,
                                      const std::string &conn_id_hex,
-                                     const std::string &protocol_version_override) {
+                                     const std::string &protocol_version_override,
+                                     duckdb::unique_ptr<HTTPClient> *client_holder) {
 	std::string base_url = NormalizeBaseUrl(worker_path);
 	std::string url = base_url + "/" + method_name;
 
@@ -550,7 +551,8 @@ UnaryResponseResult HttpInvokeUnary(ClientContext &context,
 	}
 
 	// POST to {worker_path}/{method_name} using standard HTTP timeout
-	auto response_body = HttpPostArrowIpc(context, url, body, auth, cookie_jar, cached_http_params);
+	auto response_body = HttpPostArrowIpc(context, url, body, auth, cookie_jar, cached_http_params,
+	                                       client_holder);
 
 	// Parse the Arrow IPC response. Move the body in — the string becomes the
 	// owning Arrow buffer, avoiding an alloc+memcpy of the whole payload.

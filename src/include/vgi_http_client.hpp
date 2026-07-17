@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -40,6 +41,9 @@ constexpr const char *ARROW_IPC_CONTENT_TYPE = "application/vnd.apache.arrow.str
 // manager on every RPC (deadlock hazard under the MetaTransaction mutex — see
 // https://github.com/duckdb/duckdb/issues/22258). Callers that have a
 // VgiAttachParameters should pass params->GetOrInitHttpParams(context, url).
+// client_holder: optional caller-owned keep-alive HTTP client (see
+// HttpPostArrowIpc). Same contract: one base URL per holder, never shared
+// across threads. Null = fresh connection per call (previous behavior).
 UnaryResponseResult HttpInvokeUnary(ClientContext &context,
                                      const std::string &worker_path,
                                      const std::string &method_name,
@@ -51,7 +55,47 @@ UnaryResponseResult HttpInvokeUnary(ClientContext &context,
                                      const std::string &attach_opaque_data_hex = "",
                                      const std::string &transaction_opaque_data_hex = "",
                                      const std::string &conn_id_hex = "",
-                                     const std::string &protocol_version_override = "");
+                                     const std::string &protocol_version_override = "",
+                                     duckdb::unique_ptr<HTTPClient> *client_holder = nullptr);
+
+// Small thread-safe pool of keep-alive HTTPClients for unary RPCs against ONE
+// base URL (a pool instance lives on a catalog's VgiAttachParameters, whose
+// worker_path is fixed). HTTPClient itself is not thread-safe and catalog RPCs
+// arrive from many threads, so callers CHECK OUT a client into a thread-local
+// holder (null on a cold pool — HttpPostArrowIpc lazily creates one), pass the
+// holder through the request, and RETURN it only on success. A client whose
+// request threw may hold a wedged TCP connection and is dropped instead
+// (DuckDB's retry loop already refreshes the client on transport errors, but
+// an exception that escapes means we can't trust its state).
+class VgiHttpClientPool {
+public:
+	duckdb::unique_ptr<HTTPClient> Checkout() {
+		std::lock_guard<std::mutex> lock(mu_);
+		if (clients_.empty()) {
+			return nullptr;
+		}
+		auto client = std::move(clients_.back());
+		clients_.pop_back();
+		return client;
+	}
+	void Return(duckdb::unique_ptr<HTTPClient> client) {
+		if (!client) {
+			return;
+		}
+		std::lock_guard<std::mutex> lock(mu_);
+		if (clients_.size() < kMaxPooled) {
+			clients_.push_back(std::move(client));
+		}
+	}
+
+private:
+	// Bounds idle keep-alive connections per catalog; excess returns are
+	// simply dropped (closing the connection). 8 covers DuckDB's typical
+	// catalog-RPC concurrency without holding sockets open needlessly.
+	static constexpr size_t kMaxPooled = 8;
+	std::mutex mu_;
+	std::vector<duckdb::unique_ptr<HTTPClient>> clients_;
+};
 
 // POST Arrow IPC bytes to a URL, return raw response body bytes.
 // Used for catalog, stream init, and exchange operations.

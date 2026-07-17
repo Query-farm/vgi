@@ -20,6 +20,8 @@ namespace vgi {
 class CatalogAuth;
 // Forward declaration — full definition in vgi_cookie_jar.hpp
 class SessionCookieJar;
+// Forward declaration — full definition in vgi_http_client.hpp
+class VgiHttpClientPool;
 
 // Options for a pooled unary RPC invocation.
 // context outlives the call; worker_path/phase may be string_view-like but we
@@ -71,6 +73,12 @@ struct UnaryRpcOptions {
 	// secret RPCs don't exist). Placed last so positional call sites are
 	// unaffected.
 	std::optional<std::string> protocol_version_override;
+	// Per-catalog keep-alive HTTP client pool (see VgiHttpClientPool in
+	// vgi_http_client.hpp). When set on HTTP transport, the RPC checks a
+	// client out for the call and returns it on success, so consecutive
+	// catalog RPCs reuse TCP/TLS connections instead of handshaking each
+	// time. Null = fresh connection per call. Ignored for subprocess.
+	std::shared_ptr<VgiHttpClientPool> http_client_pool;
 };
 
 // Send a single unary RPC and return the response.

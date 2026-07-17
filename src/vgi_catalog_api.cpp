@@ -177,6 +177,14 @@ std::shared_ptr<HTTPParams> VgiAttachParameters::GetOrInitHttpParams(
 	return cached_http_params_;
 }
 
+std::shared_ptr<VgiHttpClientPool> VgiAttachParameters::GetOrInitHttpClientPool() const {
+	std::lock_guard<std::mutex> lock(http_params_mutex_);
+	if (!http_client_pool_) {
+		http_client_pool_ = std::make_shared<VgiHttpClientPool>();
+	}
+	return http_client_pool_;
+}
+
 // ============================================================================
 // RPC-based Catalog API Helper
 // ============================================================================
@@ -210,6 +218,9 @@ static UnaryResponseResult InvokeRpcMethod(const CatalogRpcContext &ctx, const s
 		// VgiAttachParameters::GetOrInitHttpParams.
 		if (IsHttpTransport(ctx.params->worker_path())) {
 			opts.cached_http_params = ctx.params->GetOrInitHttpParams(context, ctx.params->worker_path());
+			// Keep-alive client pool: consecutive catalog RPCs reuse TCP/TLS
+			// connections instead of handshaking per call.
+			opts.http_client_pool = ctx.params->GetOrInitHttpClientPool();
 		}
 		// Forward launcher overrides for `launch:` LOCATIONs.  Empty
 		// optionals on every other transport — no per-call cost.

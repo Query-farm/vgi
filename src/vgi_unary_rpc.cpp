@@ -146,11 +146,24 @@ UnaryResponseResult AttemptUnaryRpc(const UnaryRpcOptions &opts, const std::stri
 UnaryResponseResult InvokePooledUnaryRpc(const UnaryRpcOptions &opts, const std::string &method_name,
                                           const std::shared_ptr<arrow::RecordBatch> &params) {
 	if (IsHttpTransport(opts.worker_path)) {
-		return HttpInvokeUnary(opts.context, opts.worker_path, method_name, params, opts.auth,
-		                        opts.cookie_jar, opts.cached_http_params,
-		                        /*invocation_id_hex=*/"", /*attach_opaque_data_hex=*/"",
-		                        /*transaction_opaque_data_hex=*/"", /*conn_id_hex=*/"",
-		                        opts.protocol_version_override.value_or(""));
+		// Keep-alive: check a client out of the per-catalog pool for this call
+		// and return it only on success. If HttpInvokeUnary throws, ``pooled``
+		// is destroyed here — a client whose request failed may hold a wedged
+		// connection, so it is dropped rather than repooled.
+		duckdb::unique_ptr<HTTPClient> pooled;
+		if (opts.http_client_pool) {
+			pooled = opts.http_client_pool->Checkout();
+		}
+		auto result = HttpInvokeUnary(opts.context, opts.worker_path, method_name, params, opts.auth,
+		                              opts.cookie_jar, opts.cached_http_params,
+		                              /*invocation_id_hex=*/"", /*attach_opaque_data_hex=*/"",
+		                              /*transaction_opaque_data_hex=*/"", /*conn_id_hex=*/"",
+		                              opts.protocol_version_override.value_or(""),
+		                              opts.http_client_pool ? &pooled : nullptr);
+		if (opts.http_client_pool) {
+			opts.http_client_pool->Return(std::move(pooled));
+		}
+		return result;
 	}
 
 #if defined(__EMSCRIPTEN__)

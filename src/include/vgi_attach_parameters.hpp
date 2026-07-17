@@ -30,6 +30,8 @@ namespace vgi {
 class CatalogAuth;
 // Forward declaration — full definition in vgi_cookie_jar.hpp
 class SessionCookieJar;
+// Forward declaration — full definition in vgi_http_client.hpp
+class VgiHttpClientPool;
 
 // POD constructor argument for ``VgiAttachParameters``.  Replaces the
 // 8-positional-default-param constructor that previous versions of this
@@ -202,6 +204,12 @@ public:
 		return cached_server_caps_;
 	}
 
+	// Lazy-initialized per-catalog keep-alive HTTP client pool for unary RPCs
+	// (catalog metadata, DDL, stats). See VgiHttpClientPool in
+	// vgi_http_client.hpp. Only meaningful on HTTP transport; defined
+	// out-of-line (vgi_catalog_api.cpp) so this header stays light.
+	std::shared_ptr<VgiHttpClientPool> GetOrInitHttpClientPool() const;
+
 private:
 	std::string worker_path_;
 	std::string catalog_name_;
@@ -226,6 +234,10 @@ private:
 	// HTTP ServerCapabilities snapshot. See Store/LoadServerCapabilities above.
 	mutable std::mutex server_caps_mutex_;
 	mutable ServerCapabilities cached_server_caps_;
+
+	// Keep-alive HTTP client pool for unary RPCs. Guarded by
+	// http_params_mutex_ for lazy init (same tiny critical section).
+	mutable std::shared_ptr<VgiHttpClientPool> http_client_pool_;
 };
 
 // Bundles all catalog state needed for an RPC call.
