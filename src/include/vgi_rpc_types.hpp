@@ -34,6 +34,16 @@ std::vector<uint8_t> SerializeToIpcBytes(const std::shared_ptr<arrow::RecordBatc
 std::shared_ptr<arrow::RecordBatch> DeserializeFromIpcBytes(const std::vector<uint8_t> &bytes);
 std::shared_ptr<arrow::RecordBatch> DeserializeFromIpcBytes(const uint8_t *data, size_t len);
 
+// Zero-copy variant: decode the inner IPC stream stored in cell ``index`` of a
+// BinaryArray (the "dataclass-as-binary" envelope pattern) WITHOUT copying the
+// bytes. The decode reads from an arrow::SliceBuffer of the array's values
+// buffer, so the returned batch's arrays refcount-share that buffer — the
+// outer response batch can be dropped freely. Use on response-decode hot
+// paths (bind results, table-buffering envelopes, catalog results) where the
+// pointer-based overload would alloc+memcpy the whole inner payload.
+std::shared_ptr<arrow::RecordBatch> DeserializeFromIpcBytesZeroCopy(const arrow::BinaryArray &bin,
+                                                                     int64_t index);
+
 // Deserialized batch with optional custom metadata from the IPC message.
 struct DeserializedBatch {
 	std::shared_ptr<arrow::RecordBatch> batch;

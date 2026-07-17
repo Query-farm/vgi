@@ -372,8 +372,7 @@ BindResult HttpFunctionConnection::PerformBindRpc() {
 		if (!bin_arr || bin_arr->IsNull(0)) {
 			throw IOException("Bind response 'result' column is null [url: %s]", base_url_);
 		}
-		auto v = bin_arr->GetView(0);
-		return DeserializeFromIpcBytes(reinterpret_cast<const uint8_t *>(v.data()), v.size());
+		return DeserializeFromIpcBytesZeroCopy(*bin_arr, 0);
 	};
 
 	auto bind_result = PerformBindProtocol(context_, function_name_, function_type_,
@@ -680,8 +679,7 @@ std::shared_ptr<arrow::RecordBatch> DecodeHttpOuterResponse(const UnaryResponseR
 	if (bin->IsNull(0)) {
 		return nullptr;
 	}
-	auto v = bin->GetView(0);
-	return vgi::DeserializeFromIpcBytes(reinterpret_cast<const uint8_t *>(v.data()), v.size());
+	return vgi::DeserializeFromIpcBytesZeroCopy(*bin, 0);
 }
 
 } // namespace

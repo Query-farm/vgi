@@ -267,10 +267,10 @@ static std::shared_ptr<arrow::RecordBatch> ExtractAndDeserializeResult(
 		}
 		auto binary_array = std::static_pointer_cast<arrow::BinaryArray>(result_col);
 		if (!binary_array->IsNull(0)) {
-			auto view = binary_array->GetView(0);
 			try {
-				result =
-				    DeserializeFromIpcBytes(reinterpret_cast<const uint8_t *>(view.data()), view.size());
+				// Zero-copy: the inner batch's arrays refcount-share the outer
+				// envelope's values buffer — no copy of the payload.
+				result = DeserializeFromIpcBytesZeroCopy(*binary_array, 0);
 			} catch (const std::exception &e) {
 				throw IOException(
 				    "Failed to deserialize IPC response for %s from worker [worker: %s]: %s. "

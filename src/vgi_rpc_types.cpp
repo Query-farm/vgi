@@ -358,6 +358,29 @@ std::shared_ptr<arrow::RecordBatch> DeserializeFromIpcBytes(const std::vector<ui
 	return DeserializeFromIpcBytes(bytes.data(), bytes.size());
 }
 
+std::shared_ptr<arrow::RecordBatch> DeserializeFromIpcBytesZeroCopy(const arrow::BinaryArray &bin,
+                                                                     int64_t index) {
+	// Slice the cell straight out of the array's values buffer — the slice
+	// holds a reference to the parent buffer, so batches decoded from it
+	// (Arrow IPC reads are zero-copy views) stay valid after the outer batch
+	// is dropped.
+	auto slice = arrow::SliceBuffer(bin.value_data(), bin.value_offset(index),
+	                                 bin.value_length(index));
+	auto buffer_reader = std::make_shared<arrow::io::BufferReader>(std::move(slice));
+	auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(buffer_reader);
+	if (!reader_result.ok()) {
+		throw IOException("Failed to open IPC stream from bytes: %s", reader_result.status().ToString());
+	}
+	auto reader = reader_result.ValueUnsafe();
+
+	std::shared_ptr<arrow::RecordBatch> batch;
+	auto status = reader->ReadNext(&batch);
+	if (!status.ok()) {
+		throw IOException("Failed to read batch from IPC bytes: %s", status.ToString());
+	}
+	return batch;
+}
+
 DeserializedBatch DeserializeFromIpcBytesWithMetadata(const uint8_t *data, size_t len) {
 	auto alloc_result = arrow::AllocateBuffer(static_cast<int64_t>(len));
 	if (!alloc_result.ok()) {
