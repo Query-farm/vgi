@@ -14,6 +14,7 @@
 
 #include "vgi_http_compression.hpp"
 #include "vgi_rpc_client.hpp"
+#include "vgi_server_capabilities.hpp"
 
 namespace duckdb {
 namespace vgi {
@@ -66,13 +67,18 @@ UnaryResponseResult HttpInvokeUnary(ClientContext &context,
 // holder that is used exclusively for one base_url (e.g. a per-connection
 // member), and NEVER share it across threads (HTTPClient is not thread-safe).
 // Null (the default) preserves the previous fresh-connection-per-call behavior.
+// harvested_caps: when non-null, filled from the capability headers the server
+// middleware stamps on every response (successful responses only). Lets
+// callers discover ServerCapabilities from traffic they already generate
+// instead of paying a separate HEAD /health round trip per connection.
 std::string HttpPostArrowIpc(ClientContext &context,
                               const std::string &url,
                               const std::vector<uint8_t> &body,
                               const std::shared_ptr<CatalogAuth> &auth = nullptr,
                               const std::shared_ptr<SessionCookieJar> &cookie_jar = nullptr,
                               const std::shared_ptr<HTTPParams> &cached_http_params = nullptr,
-                              duckdb::unique_ptr<HTTPClient> *client_holder = nullptr);
+                              duckdb::unique_ptr<HTTPClient> *client_holder = nullptr,
+                              ServerCapabilities *harvested_caps = nullptr);
 
 // HTTP GET raw bytes from a URL. Used for fetching externalized batches.
 // Handles X-VGI-Content-Encoding decompression (zstd or gzip). No auth
@@ -99,27 +105,8 @@ UnaryResponseResult MaybeResolveExternalLocation(ClientContext &context,
                                                    UnaryResponseResult &result,
                                                    const std::string &worker_path = "");
 
-// Server capabilities discovered via HEAD /health.
-// Capability headers (VGI-Max-Request-Bytes, VGI-Upload-URL-Support,
-// VGI-Max-Upload-Bytes, VGI-Supported-Encodings) are emitted by the
-// server middleware on every response; /health is the canonical discovery
-// target since it is mandatory and exempt from auth.
-struct ServerCapabilities {
-	bool discovered = false;
-	int64_t max_request_bytes = -1;   // -1 = no limit advertised
-	bool upload_url_support = false;
-	int64_t max_upload_bytes = -1;    // -1 = no limit advertised
-	// Content-encoding codecs the server can decompress on request bodies
-	// and produce on response bodies, in server-advertised preference order.
-	// Empty == "VGI-Supported-Encodings header absent" → caller should
-	// default to {ZSTD} for back-compat with pre-update servers.
-	std::vector<HttpEncoding> supported_encodings;
-	// Steady-clock time after which this snapshot should be re-probed.
-	// Populated from the response's Cache-Control: max-age=N header.
-	// epoch (default-constructed) means "no expiry hint" -> valid for
-	// the lifetime of the connection.
-	std::chrono::steady_clock::time_point cache_expires_at{};
-};
+// ServerCapabilities moved to vgi_server_capabilities.hpp (arrow-free) so the
+// per-catalog cache on VgiAttachParameters can include it without Arrow.
 
 // Upload URL returned by __upload_url__/init
 struct UploadUrl {

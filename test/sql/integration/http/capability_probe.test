@@ -1,0 +1,50 @@
+# name: test/sql/integration/http/capability_probe.test
+# description: ServerCapabilities are harvested from response headers — no HEAD /health probe
+# group: [vgi_integration_http]
+#
+# Capability headers ride every server response (stamped by
+# _CapabilitiesMiddleware), so the C++ client learns ServerCapabilities from
+# the /init and /exchange responses it already receives. The explicit
+# HEAD /health probe (HttpDiscoverCapabilities) survives only as a fallback
+# and logs an http.capability_probe event when it fires — a healthy workload
+# must show ZERO of those events.
+
+require-env VGI_TEST_WORKER
+
+require-env VGI_HTTP_TRANSPORT
+
+require vgi
+
+require httpfs
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+statement ok
+ATTACH 'example' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# Scalar function → exchange mode. Pre-harvest, the first exchange used to pay
+# a HEAD /health round trip per connection right here.
+query I
+SELECT ex.double(21);
+----
+42
+
+# Table function → producer mode (init + continuations).
+query I
+SELECT count(*) > 0 FROM ex.data.cacheable_numbers;
+----
+true
+
+# The load-bearing assertion: capabilities came from harvested response
+# headers; the fallback probe never fired.
+query I
+SELECT COUNT(*) FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%http.capability_probe%';
+----
+0
+
+statement ok
+DETACH ex;

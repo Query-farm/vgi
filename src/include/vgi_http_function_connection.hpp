@@ -196,8 +196,23 @@ private:
 	// COPY ... TO context for the bind request (empty = none). See SetCopyToContext.
 	std::optional<CopyToBindContext> copy_to_;
 
-	// Server capabilities (lazy-discovered)
+	// Server capabilities. Harvested from the capability headers the server
+	// middleware stamps on every response this connection receives (/init and
+	// /exchange POSTs), shared per-catalog via attach_params_, with the HEAD
+	// /health probe as a last-resort fallback in ReadDataBatch.
 	ServerCapabilities capabilities_;
+
+	// Publish freshly-harvested capabilities to this connection and (when
+	// attached) the per-catalog cache, so sibling connections start warm.
+	void PublishHarvestedCapabilities(const ServerCapabilities &caps) {
+		if (!caps.discovered) {
+			return;
+		}
+		capabilities_ = caps;
+		if (attach_params_) {
+			attach_params_->StoreServerCapabilities(caps);
+		}
+	}
 
 	// HTTP streaming state
 	std::string stream_state_token_;

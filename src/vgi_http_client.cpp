@@ -143,6 +143,9 @@ static HttpEncoding PickAlternateEncoding(const std::vector<HttpEncoding> &offer
 	return tried == HttpEncoding::ZSTD ? HttpEncoding::GZIP : HttpEncoding::ZSTD;
 }
 
+// Forward declaration — defined below with the capability-header parsing.
+static ServerCapabilities ParseCapabilityHeaders(const HTTPResponse &response);
+
 static std::string HttpPostArrowIpcInternal(ClientContext &context,
                                              const std::string &url,
                                              const std::vector<uint8_t> &body,
@@ -152,7 +155,8 @@ static std::string HttpPostArrowIpcInternal(ClientContext &context,
                                              const std::shared_ptr<HTTPParams> &cached_http_params = nullptr,
                                              HttpEncoding request_encoding = HttpEncoding::ZSTD,
                                              bool allow_codec_retry = true,
-                                             duckdb::unique_ptr<HTTPClient> *client_holder = nullptr) {
+                                             duckdb::unique_ptr<HTTPClient> *client_holder = nullptr,
+                                             ServerCapabilities *harvested_caps = nullptr) {
 	auto &db = *context.db;
 	auto &http_util = HTTPUtil::Get(db);
 
@@ -232,7 +236,8 @@ static std::string HttpPostArrowIpcInternal(ClientContext &context,
 			if (alternate != request_encoding) {
 				return HttpPostArrowIpcInternal(context, url, body, bearer_token, cookie_jar,
 				                                 out_response, cached_http_params, alternate,
-				                                 /*allow_codec_retry=*/false, client_holder);
+				                                 /*allow_codec_retry=*/false, client_holder,
+				                                 harvested_caps);
 			}
 		}
 	}
@@ -317,6 +322,14 @@ static std::string HttpPostArrowIpcInternal(ClientContext &context,
 		    content_type.empty() ? "" : " Content-Type=",
 		    content_type,
 		    body_preview.empty() ? out_response->GetError() : body_preview, url);
+	}
+
+	// Harvest server capabilities off this (successful) response. The server
+	// middleware stamps the capability headers on every response, so callers
+	// that pass a harvest slot learn ServerCapabilities from traffic they were
+	// already generating — no separate HEAD /health probe round trip.
+	if (harvested_caps) {
+		*harvested_caps = ParseCapabilityHeaders(*out_response);
 	}
 
 	// In the browser (WASM), fetch/XHR transparently decompresses any STANDARD
@@ -430,7 +443,8 @@ std::string HttpPostArrowIpc(ClientContext &context,
                               const std::shared_ptr<CatalogAuth> &auth,
                               const std::shared_ptr<SessionCookieJar> &cookie_jar,
                               const std::shared_ptr<HTTPParams> &cached_http_params,
-                              duckdb::unique_ptr<HTTPClient> *client_holder) {
+                              duckdb::unique_ptr<HTTPClient> *client_holder,
+                              ServerCapabilities *harvested_caps) {
 	// Get cached token from per-catalog auth (if any)
 	std::string token;
 	if (auth) {
@@ -439,7 +453,8 @@ std::string HttpPostArrowIpc(ClientContext &context,
 
 	std::unique_ptr<HTTPResponse> response;
 	auto result = HttpPostArrowIpcInternal(context, url, body, token, cookie_jar, response, cached_http_params,
-	                                       HttpEncoding::ZSTD, /*allow_codec_retry=*/true, client_holder);
+	                                       HttpEncoding::ZSTD, /*allow_codec_retry=*/true, client_holder,
+	                                       harvested_caps);
 
 	if (response->status != HTTPStatusCode::Unauthorized_401) {
 		return result;
@@ -496,7 +511,8 @@ std::string HttpPostArrowIpc(ClientContext &context,
 
 	// Retry with new token
 	result = HttpPostArrowIpcInternal(context, url, body, new_token, cookie_jar, response, cached_http_params,
-	                                  HttpEncoding::ZSTD, /*allow_codec_retry=*/true, client_holder);
+	                                  HttpEncoding::ZSTD, /*allow_codec_retry=*/true, client_holder,
+	                                  harvested_caps);
 	if (response->status == HTTPStatusCode::Unauthorized_401) {
 		throw IOException("VGI HTTP authentication failed after auth flow (HTTP 401) [url: %s]. "
 		                  "Response: %s", url, response->body);
@@ -807,6 +823,12 @@ ServerCapabilities HttpDiscoverCapabilities(ClientContext &context, const std::s
 	// {base_url}/health: it is mandatory in every implementation and exempt
 	// from auth, matching the Python reference client.
 	auto url = NormalizeBaseUrl(base_url) + "/health";
+
+	// This explicit probe is the FALLBACK — capabilities are normally harvested
+	// off responses the connection already receives (see HttpPostArrowIpc's
+	// harvested_caps). Log so an unexpected probe on a hot path is visible in
+	// duckdb_logs; a healthy scan should show zero of these events.
+	VGI_LOG(context, "http.capability_probe", {{"url", url}});
 
 	auto &db = *context.db;
 	auto &http_util = HTTPUtil::Get(db);

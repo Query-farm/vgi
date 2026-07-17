@@ -520,8 +520,11 @@ InitResult HttpFunctionConnection::PerformInit(const BindResult &bind_result,
 	    ? attach_params_->GetOrInitHttpParams(context_, init_url) : nullptr;
 #ifdef __EMSCRIPTEN__
 #endif
+	ServerCapabilities harvested;
 	auto response_body = HttpPostArrowIpc(context_, init_url, body, auth,
-	                                        /*cookie_jar=*/nullptr, cached_params_init, &http_client_);
+	                                        /*cookie_jar=*/nullptr, cached_params_init, &http_client_,
+	                                        &harvested);
+	PublishHarvestedCapabilities(harvested);
 #ifdef __EMSCRIPTEN__
 #endif
 
@@ -814,8 +817,11 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 		auto p_auth = attach_params_ ? attach_params_->auth() : nullptr;
 		auto p_cached_params = attach_params_
 		    ? attach_params_->GetOrInitHttpParams(context_, exchange_url) : nullptr;
+		ServerCapabilities p_harvested;
 		auto response_body = HttpPostArrowIpc(context_, exchange_url, body, p_auth,
-		                                        /*cookie_jar=*/nullptr, p_cached_params, &http_client_);
+		                                        /*cookie_jar=*/nullptr, p_cached_params, &http_client_,
+		                                        &p_harvested);
+		PublishHarvestedCapabilities(p_harvested);
 
 		// Parse response — buffer new data batches (adopt the body, no copy)
 		BufferDataBatches(arrow::Buffer::FromString(std::move(response_body)));
@@ -854,9 +860,15 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 	auto body = SerializeBatchWithState(input_batch, input_schema_);
 
 	// Check if batch exceeds max_request_bytes and upload URL support is available.
-	// Re-probe when we have never discovered yet, or when the cached snapshot's
-	// Cache-Control max-age has elapsed (cache_expires_at == time_point{} means
-	// "no expiry advertised" — treat as valid for the connection's lifetime).
+	// Capabilities are primarily HARVESTED off the responses this connection (and
+	// its per-catalog siblings) already received — the /init POST always precedes
+	// the first exchange, so capabilities_ is normally warm by now. The explicit
+	// HEAD /health probe survives only as a last-resort fallback (plus the
+	// Cache-Control re-probe for a probed snapshot whose max-age elapsed;
+	// harvested snapshots refresh on every response and never carry an expiry).
+	if (!capabilities_.discovered && attach_params_) {
+		capabilities_ = attach_params_->LoadServerCapabilities();
+	}
 	if (!capabilities_.discovered ||
 	    (capabilities_.cache_expires_at != std::chrono::steady_clock::time_point{} &&
 	     std::chrono::steady_clock::now() >= capabilities_.cache_expires_at)) {
@@ -879,8 +891,11 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 	auto x_auth = attach_params_ ? attach_params_->auth() : nullptr;
 	auto x_cached_params = attach_params_
 	    ? attach_params_->GetOrInitHttpParams(context_, exchange_url) : nullptr;
+	ServerCapabilities x_harvested;
 	auto response_body = HttpPostArrowIpc(context_, exchange_url, body, x_auth,
-	                                        /*cookie_jar=*/nullptr, x_cached_params, &http_client_);
+	                                        /*cookie_jar=*/nullptr, x_cached_params, &http_client_,
+	                                        &x_harvested);
+	PublishHarvestedCapabilities(x_harvested);
 
 	// Parse response — copy into owning buffer since Arrow IPC reads zero-copy reference it
 	auto buffer = arrow::Buffer::FromString(std::move(response_body));

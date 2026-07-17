@@ -14,6 +14,8 @@
 #include <string>
 #include <vector>
 
+#include "vgi_server_capabilities.hpp" // arrow-free; per-catalog capability snapshot
+
 namespace duckdb {
 
 // Forward declarations — full definitions live in their owning headers; only
@@ -186,6 +188,20 @@ public:
 		branches_capability_.store(supported ? 1 : 2, std::memory_order_relaxed);
 	}
 
+	// Per-catalog HTTP ServerCapabilities snapshot, harvested from the
+	// capability headers the server middleware stamps on every response.
+	// Shared across all of this catalog's connections so a new connection
+	// starts warm instead of paying a HEAD /health probe. Returns a copy
+	// with discovered=false when nothing has been harvested yet.
+	void StoreServerCapabilities(const ServerCapabilities &caps) const {
+		std::lock_guard<std::mutex> lock(server_caps_mutex_);
+		cached_server_caps_ = caps;
+	}
+	ServerCapabilities LoadServerCapabilities() const {
+		std::lock_guard<std::mutex> lock(server_caps_mutex_);
+		return cached_server_caps_;
+	}
+
 private:
 	std::string worker_path_;
 	std::string catalog_name_;
@@ -206,6 +222,10 @@ private:
 
 	// Capability cache for catalog_table_scan_branches_get. See accessors above.
 	mutable std::atomic<int> branches_capability_{0};
+
+	// HTTP ServerCapabilities snapshot. See Store/LoadServerCapabilities above.
+	mutable std::mutex server_caps_mutex_;
+	mutable ServerCapabilities cached_server_caps_;
 };
 
 // Bundles all catalog state needed for an RPC call.
