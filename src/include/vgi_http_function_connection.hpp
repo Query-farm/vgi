@@ -255,8 +255,11 @@ private:
 	    const std::shared_ptr<arrow::RecordBatch> &batch,
 	    const std::shared_ptr<arrow::KeyValueMetadata> &metadata);
 
-	// Helper: read all data batches from an IPC stream buffer (starting at offset)
-	void BufferDataBatches(const std::string &response_body, size_t offset = 0);
+	// Helper: read all data batches from an owning IPC stream buffer (starting
+	// at offset). Batches zero-copy reference ``owned`` (kept alive by their
+	// refcounted buffer slices), so the caller hands over ownership and the
+	// payload is materialized exactly once.
+	void BufferDataBatches(std::shared_ptr<arrow::Buffer> owned, size_t offset = 0);
 };
 
 } // namespace vgi

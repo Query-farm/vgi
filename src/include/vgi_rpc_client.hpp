@@ -210,5 +210,15 @@ BufferStreamHeaderResult ReadStreamHeaderFromBuffer(const uint8_t *data, size_t 
                                                      ClientContext *context,
                                                      const std::string &url = "");
 
+// Owning-buffer overload: parses directly out of ``buffer`` with no copy.
+// The returned header batch zero-copy references ``buffer`` — callers keep it
+// alive implicitly via the batch's refcounted slices. Prefer this when the
+// caller already owns the response body as an Arrow buffer (HTTP /init path:
+// wrap the body once, parse the header here, then slice the data section at
+// data_offset — the whole response is materialized exactly once).
+BufferStreamHeaderResult ReadStreamHeaderFromBuffer(std::shared_ptr<arrow::Buffer> buffer,
+                                                     ClientContext *context,
+                                                     const std::string &url = "");
+
 } // namespace vgi
 } // namespace duckdb

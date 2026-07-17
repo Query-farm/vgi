@@ -515,8 +515,13 @@ UnaryResponseResult ReadUnaryResponseFromBuffer(std::string &&body,
 BufferStreamHeaderResult ReadStreamHeaderFromBuffer(const uint8_t *data, size_t len,
                                                      ClientContext *context,
                                                      const std::string &url) {
-	auto buffer = CopyToOwnedBuffer(data, len);
-	auto input = std::make_shared<arrow::io::BufferReader>(buffer);
+	return ReadStreamHeaderFromBuffer(CopyToOwnedBuffer(data, len), context, url);
+}
+
+BufferStreamHeaderResult ReadStreamHeaderFromBuffer(std::shared_ptr<arrow::Buffer> buffer,
+                                                     ClientContext *context,
+                                                     const std::string &url) {
+	auto input = std::make_shared<arrow::io::BufferReader>(std::move(buffer));
 	auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(input);
 	if (!reader_result.ok()) {
 		auto status = reader_result.status();

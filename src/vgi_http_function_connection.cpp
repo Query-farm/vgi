@@ -245,7 +245,7 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ExtractStreamState(
 	return batch;
 }
 
-void HttpFunctionConnection::BufferDataBatches(const std::string &response_body, size_t offset) {
+void HttpFunctionConnection::BufferDataBatches(std::shared_ptr<arrow::Buffer> owned, size_t offset) {
 	buffered_batches_.clear();
 	buffered_batch_indexes_.clear();
 	buffered_partition_values_bytes_.clear();
@@ -254,14 +254,16 @@ void HttpFunctionConnection::BufferDataBatches(const std::string &response_body,
 	buffered_batch_index_ = 0;
 	stream_state_token_.clear();
 
-	if (offset >= response_body.size()) {
+	if (!owned || offset >= static_cast<size_t>(owned->size())) {
 		return;
 	}
+	const size_t data_bytes = static_cast<size_t>(owned->size()) - offset;
 
-	// Copy into an owning buffer — Arrow IPC zero-copy reads reference this memory
-	auto substr = response_body.substr(offset);
-	auto buffer = arrow::Buffer::FromString(std::move(substr));
-	auto input = std::make_shared<arrow::io::BufferReader>(buffer);
+	// Slice the data section out of the owning buffer — Arrow IPC zero-copy
+	// reads reference the parent buffer through the slice's refcount, so no
+	// copy of the payload is made here.
+	auto buffer = arrow::SliceBuffer(std::move(owned), static_cast<int64_t>(offset));
+	auto input = std::make_shared<arrow::io::BufferReader>(std::move(buffer));
 	auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(input);
 	if (!reader_result.ok()) {
 		// Empty data stream is valid (no output yet)
@@ -332,7 +334,7 @@ void HttpFunctionConnection::BufferDataBatches(const std::string &response_body,
 		fields.emplace_back("data_batches", std::to_string(spike_data_batches));
 		fields.emplace_back("log_batches", std::to_string(spike_log_batches));
 		fields.emplace_back("external_batches", std::to_string(spike_external_batches));
-		fields.emplace_back("response_bytes", std::to_string(response_body.size() - offset));
+		fields.emplace_back("response_bytes", std::to_string(data_bytes));
 		VGI_LOG(context_, "http_function_connection.buffer_data_batches", fields);
 	}
 }
@@ -523,10 +525,15 @@ InitResult HttpFunctionConnection::PerformInit(const BindResult &bind_result,
 #ifdef __EMSCRIPTEN__
 #endif
 
+	// Adopt the response body as the single owning Arrow buffer. The header
+	// parse and the data-section buffering below both operate on zero-copy
+	// slices of it — previously the whole payload was copied twice more
+	// (CopyToOwnedBuffer for the header parse + substr for the data section),
+	// tripling peak memory for a large first producer turn.
+	auto owned_body = arrow::Buffer::FromString(std::move(response_body));
+
 	// Parse response: header IPC stream + data IPC stream
-	auto header_result = ReadStreamHeaderFromBuffer(
-	    reinterpret_cast<const uint8_t *>(response_body.data()),
-	    response_body.size(), &context_, init_url);
+	auto header_result = ReadStreamHeaderFromBuffer(owned_body, &context_, init_url);
 
 	// Resolve external location pointer batch in stream header if needed
 	if (header_result.header.header_batch && header_result.header.metadata) {
@@ -555,8 +562,8 @@ InitResult HttpFunctionConnection::PerformInit(const BindResult &bind_result,
 		is_producer_mode_ = false;
 	}
 
-	// Buffer data batches from the init response
-	BufferDataBatches(response_body, header_result.data_offset);
+	// Buffer data batches from the init response (slices owned_body; no copy)
+	BufferDataBatches(std::move(owned_body), header_result.data_offset);
 
 	init_done_ = true;
 
@@ -810,8 +817,8 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 		auto response_body = HttpPostArrowIpc(context_, exchange_url, body, p_auth,
 		                                        /*cookie_jar=*/nullptr, p_cached_params, &http_client_);
 
-		// Parse response — buffer new data batches
-		BufferDataBatches(response_body);
+		// Parse response — buffer new data batches (adopt the body, no copy)
+		BufferDataBatches(arrow::Buffer::FromString(std::move(response_body)));
 
 		if (buffered_batch_index_ < buffered_batches_.size()) {
 			last_batch_index_ = buffered_batch_indexes_[buffered_batch_index_];
