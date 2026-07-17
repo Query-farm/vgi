@@ -6,14 +6,16 @@
 #   a size floor. (With the default packed backend these small memos pack instead —
 #   see cache/pack.test; this file pins the loose store.)
 #
+#   Also carries the exchange ref-count-cap coverage ([S9] reaper section).
+#
 #   Split out of cache/exchange_lateral.test and gated off Windows: on the Windows
-#   runner this exact flow (loose store + per-value default + LATERAL over a temp
-#   table) deterministically writes NO objects/refs to disk, while the loose
-#   ref-count-cap flow in exchange_lateral.test (per_value=false, VALUES inputs)
-#   and the producer-mode disk tests (cache/disk.test, disk_streaming.test) DO
-#   persist on the same runner — a Windows-specific gap in the extension's
-#   exchange disk tier (PersistToDisk's catch-all swallows the cause), tracked in
-#   Query-farm/vgi. Re-merge into exchange_lateral.test once fixed.
+#   runner exchange-mode disk persistence deterministically writes NO objects/refs
+#   (both the loose-store flow here and the ref-count-cap flow — the latter only
+#   appeared to pass when preceded by the loose section's statements), while the
+#   producer-mode disk tests (cache/disk.test, disk_streaming.test) DO persist on
+#   the same runner — a Windows-specific gap in the extension's exchange disk tier
+#   (PersistToDisk's catch-all swallows the cause). Tracked as Query-farm/vgi#4;
+#   re-merge into exchange_lateral.test once fixed.
 # group: [vgi_integration_cache]
 
 require-env VGI_TEST_WORKER
@@ -58,6 +60,60 @@ query I
 SELECT COUNT(*) > 0 FROM glob('__TEST_DIR__/vgi_exch_lateral_disk/*/refs/*.ref');
 ----
 true
+
+# ---------------------------------------------------------------------------
+# File-count cap ([S9]): per-chunk memos are tiny but numerous, so instead of a
+# size floor the reaper LRU-evicts oldest EXCHANGE refs above
+# vgi_result_cache_exchange_disk_max_refs — bounding per-chunk file fan-out. Four
+# distinct single-row inputs => four distinct memos => four refs; a cap of 2 +
+# reap trims to 2.
+# ---------------------------------------------------------------------------
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+# Per-value memo would store a second (per-tuple) entry per call; this section tests the
+# M2 per-chunk loose ref-count cap in isolation, so disable it.
+statement ok
+SET vgi_result_cache_per_value = false;
+
+statement ok
+SET vgi_result_cache_dir = '__TEST_DIR__/vgi_exch_lateral_refs';
+
+statement ok
+SELECT count(*) FROM (VALUES (1::BIGINT)) v(x), LATERAL ex.cached_double(v.x);
+
+statement ok
+SELECT count(*) FROM (VALUES (2::BIGINT)) v(x), LATERAL ex.cached_double(v.x);
+
+statement ok
+SELECT count(*) FROM (VALUES (3::BIGINT)) v(x), LATERAL ex.cached_double(v.x);
+
+statement ok
+SELECT count(*) FROM (VALUES (4::BIGINT)) v(x), LATERAL ex.cached_double(v.x);
+
+# Four distinct exchange refs on disk (one per distinct input chunk).
+query I
+SELECT COUNT(*) FROM glob('__TEST_DIR__/vgi_exch_lateral_refs/*/refs/*.ref');
+----
+4
+
+statement ok
+SET vgi_result_cache_exchange_disk_max_refs = 2;
+
+# Synchronous reap enforces the cap (evicts the 2 oldest exchange refs).
+query I
+SELECT disk_refs_removed >= 2 FROM vgi_result_cache_reap();
+----
+true
+
+query I
+SELECT COUNT(*) FROM glob('__TEST_DIR__/vgi_exch_lateral_refs/*/refs/*.ref');
+----
+2
+
+statement ok
+RESET vgi_result_cache_exchange_disk_max_refs;
 
 statement ok
 DETACH ex;

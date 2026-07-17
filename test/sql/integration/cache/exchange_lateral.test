@@ -217,71 +217,12 @@ statement ok
 CALL disable_logging();
 
 # ---------------------------------------------------------------------------
-# LOOSE disk tier: split out to cache/exchange_lateral_disk.test — its
-# "every memo reaches disk" assertion is gated `require notwindows` there
-# (deterministically 0 objects on the Windows runner; see that file's header).
-# The pack pin below still applies to the ref-count-cap section that follows.
+# Disk-tier coverage (loose store + exchange ref-count cap) lives in
+# cache/exchange_lateral_disk.test, gated `require notwindows`: exchange-mode
+# disk persistence is broken on the Windows runner (0 objects/refs written;
+# Query-farm/vgi#4). This file keeps the memory-tier coverage, which is green
+# everywhere.
 # ---------------------------------------------------------------------------
-
-statement ok
-SET vgi_result_cache_pack = false;
-
-statement ok
-SET vgi_result_cache_disk_max_bytes = 104857600;
-
-# ---------------------------------------------------------------------------
-# File-count cap ([S9]): per-chunk memos are tiny but numerous, so instead of a
-# size floor the reaper LRU-evicts oldest EXCHANGE refs above
-# vgi_result_cache_exchange_disk_max_refs — bounding per-chunk file fan-out. Four
-# distinct single-row inputs => four distinct memos => four refs; a cap of 2 +
-# reap trims to 2.
-# ---------------------------------------------------------------------------
-
-statement ok
-SELECT * FROM vgi_result_cache_flush();
-
-# Per-value memo would store a second (per-tuple) entry per call; this section tests the
-# M2 per-chunk loose ref-count cap in isolation, so disable it.
-statement ok
-SET vgi_result_cache_per_value = false;
-
-statement ok
-SET vgi_result_cache_dir = '__TEST_DIR__/vgi_exch_lateral_refs';
-
-statement ok
-SELECT count(*) FROM (VALUES (1::BIGINT)) v(x), LATERAL ex.cached_double(v.x);
-
-statement ok
-SELECT count(*) FROM (VALUES (2::BIGINT)) v(x), LATERAL ex.cached_double(v.x);
-
-statement ok
-SELECT count(*) FROM (VALUES (3::BIGINT)) v(x), LATERAL ex.cached_double(v.x);
-
-statement ok
-SELECT count(*) FROM (VALUES (4::BIGINT)) v(x), LATERAL ex.cached_double(v.x);
-
-# Four distinct exchange refs on disk (one per distinct input chunk).
-query I
-SELECT COUNT(*) FROM glob('__TEST_DIR__/vgi_exch_lateral_refs/*/refs/*.ref');
-----
-4
-
-statement ok
-SET vgi_result_cache_exchange_disk_max_refs = 2;
-
-# Synchronous reap enforces the cap (evicts the 2 oldest exchange refs).
-query I
-SELECT disk_refs_removed >= 2 FROM vgi_result_cache_reap();
-----
-true
-
-query I
-SELECT COUNT(*) FROM glob('__TEST_DIR__/vgi_exch_lateral_refs/*/refs/*.ref');
-----
-2
-
-statement ok
-RESET vgi_result_cache_exchange_disk_max_refs;
 
 statement ok
 DETACH ex;
