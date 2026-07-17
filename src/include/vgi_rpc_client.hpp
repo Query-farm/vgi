@@ -185,6 +185,18 @@ UnaryResponseResult ReadUnaryResponseFromBuffer(const uint8_t *data, size_t len,
                                                  const std::string &transaction_opaque_data_hex = "",
                                                  const std::string &conn_id_hex = "");
 
+// Move-in overload: adopts the response body string as the owning Arrow buffer
+// (arrow::Buffer::FromString) instead of allocating + memcpying a copy of the
+// whole payload. Prefer this whenever the caller owns the body and is done
+// with it — e.g. HttpInvokeUnary handing over the decompressed HTTP response.
+UnaryResponseResult ReadUnaryResponseFromBuffer(std::string &&body,
+                                                 ClientContext *context,
+                                                 const std::string &url = "",
+                                                 const std::string &invocation_id_hex = "",
+                                                 const std::string &attach_opaque_data_hex = "",
+                                                 const std::string &transaction_opaque_data_hex = "",
+                                                 const std::string &conn_id_hex = "");
+
 // Result from reading a stream header from a buffer.
 // For HTTP init responses: the response body contains header IPC stream + data IPC stream.
 struct BufferStreamHeaderResult {

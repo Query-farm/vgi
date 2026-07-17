@@ -536,10 +536,10 @@ UnaryResponseResult HttpInvokeUnary(ClientContext &context,
 	// POST to {worker_path}/{method_name} using standard HTTP timeout
 	auto response_body = HttpPostArrowIpc(context, url, body, auth, cookie_jar, cached_http_params);
 
-	// Parse the Arrow IPC response
+	// Parse the Arrow IPC response. Move the body in — the string becomes the
+	// owning Arrow buffer, avoiding an alloc+memcpy of the whole payload.
 	auto result = ReadUnaryResponseFromBuffer(
-	    reinterpret_cast<const uint8_t *>(response_body.data()),
-	    response_body.size(), &context, url,
+	    std::move(response_body), &context, url,
 	    invocation_id_hex, attach_opaque_data_hex,
 	    transaction_opaque_data_hex, conn_id_hex);
 
@@ -636,13 +636,10 @@ UnaryResponseResult ResolveExternalLocation(ClientContext &context,
 	// Parse the externalized IPC stream with proper log context.
 	// The stream may contain log batches (bundled by maybe_externalize_collector)
 	// followed by a data batch.
-	auto alloc_result = arrow::AllocateBuffer(static_cast<int64_t>(body.size()));
-	if (!alloc_result.ok()) {
-		throw IOException("Failed to allocate buffer for external location: %s",
-		                  alloc_result.status().ToString());
-	}
-	auto owned = std::shared_ptr<arrow::Buffer>(std::move(alloc_result).ValueUnsafe());
-	memcpy(const_cast<uint8_t *>(owned->data()), body.data(), body.size());
+	// Adopt the fetched body as the owning Arrow buffer — this is the
+	// large-batch path, so avoiding a full alloc+memcpy of the payload matters.
+	// The SHA-256 check above already consumed ``body`` by reference.
+	auto owned = arrow::Buffer::FromString(std::move(body));
 
 	auto input = std::make_shared<arrow::io::BufferReader>(owned);
 	auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(input);

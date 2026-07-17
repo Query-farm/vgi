@@ -420,15 +420,18 @@ static std::shared_ptr<arrow::Buffer> CopyToOwnedBuffer(const uint8_t *data, siz
 	return owned;
 }
 
-UnaryResponseResult ReadUnaryResponseFromBuffer(const uint8_t *data, size_t len,
-                                                 ClientContext *context,
-                                                 const std::string &url,
-                                                 const std::string &invocation_id_hex,
-                                                 const std::string &attach_opaque_data_hex,
-                                                 const std::string &transaction_opaque_data_hex,
-                                                 const std::string &conn_id_hex) {
-	auto buffer = CopyToOwnedBuffer(data, len);
-	auto input = std::make_shared<arrow::io::BufferReader>(buffer);
+// Core implementation over an owning Arrow buffer. Arrow IPC reads are
+// zero-copy views into ``buffer``, so it must stay alive as long as any
+// returned batch — the BufferReader holds a reference for us.
+static UnaryResponseResult ReadUnaryResponseFromOwnedBuffer(
+    std::shared_ptr<arrow::Buffer> buffer,
+    ClientContext *context,
+    const std::string &url,
+    const std::string &invocation_id_hex,
+    const std::string &attach_opaque_data_hex,
+    const std::string &transaction_opaque_data_hex,
+    const std::string &conn_id_hex) {
+	auto input = std::make_shared<arrow::io::BufferReader>(std::move(buffer));
 	auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(input);
 	if (!reader_result.ok()) {
 		auto status = reader_result.status();
@@ -483,6 +486,30 @@ UnaryResponseResult ReadUnaryResponseFromBuffer(const uint8_t *data, size_t len,
 	}
 
 	return result;
+}
+
+UnaryResponseResult ReadUnaryResponseFromBuffer(const uint8_t *data, size_t len,
+                                                 ClientContext *context,
+                                                 const std::string &url,
+                                                 const std::string &invocation_id_hex,
+                                                 const std::string &attach_opaque_data_hex,
+                                                 const std::string &transaction_opaque_data_hex,
+                                                 const std::string &conn_id_hex) {
+	return ReadUnaryResponseFromOwnedBuffer(CopyToOwnedBuffer(data, len), context, url,
+	                                        invocation_id_hex, attach_opaque_data_hex,
+	                                        transaction_opaque_data_hex, conn_id_hex);
+}
+
+UnaryResponseResult ReadUnaryResponseFromBuffer(std::string &&body,
+                                                 ClientContext *context,
+                                                 const std::string &url,
+                                                 const std::string &invocation_id_hex,
+                                                 const std::string &attach_opaque_data_hex,
+                                                 const std::string &transaction_opaque_data_hex,
+                                                 const std::string &conn_id_hex) {
+	return ReadUnaryResponseFromOwnedBuffer(arrow::Buffer::FromString(std::move(body)), context, url,
+	                                        invocation_id_hex, attach_opaque_data_hex,
+	                                        transaction_opaque_data_hex, conn_id_hex);
 }
 
 BufferStreamHeaderResult ReadStreamHeaderFromBuffer(const uint8_t *data, size_t len,
