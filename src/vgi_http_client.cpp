@@ -417,7 +417,9 @@ static std::string HttpPostArrowIpcInternal(ClientContext &context,
 	// directions are included so a slow scan can be attributed to wire volume vs
 	// codec choice. Surfaced via VGI_LOG (duckdb_logs type 'VGI' + stderr when
 	// VGI_STDERR_LOG=1). The matching Content-Length check above guards truncation.
-	{
+	// Gated: this fires once per request on the hot path, so skip the ~10-field
+	// string build (snprintf, to_string) when no sink is listening.
+	if (VgiInfoLogActive(context)) {
 		const bool resp_compressed = resp_enc != HttpEncoding::NONE;
 		char ratio_buf[32];
 		std::snprintf(ratio_buf, sizeof(ratio_buf), "%.2f",
@@ -558,8 +560,12 @@ UnaryResponseResult HttpInvokeUnary(ClientContext &context,
 	std::string base_url = NormalizeBaseUrl(worker_path);
 	std::string url = base_url + "/" + method_name;
 
-	VGI_LOG(context, "http.invoke_unary",
-	        {{"url", url}, {"method", method_name}});
+	// Gated: fires once per unary RPC (hot on catalog bursts / buffered sinks).
+	const bool log_active = VgiInfoLogActive(context);
+	if (log_active) {
+		VGI_LOG(context, "http.invoke_unary",
+		        {{"url", url}, {"method", method_name}});
+	}
 
 	// Serialize the RPC request to Arrow IPC bytes. A non-empty
 	// protocol_version_override stamps a different application protocol version
@@ -585,10 +591,12 @@ UnaryResponseResult HttpInvokeUnary(ClientContext &context,
 	// Resolve external location pointer batches
 	result = MaybeResolveExternalLocation(context, result, base_url);
 
-	VGI_LOG(context, "http.invoke_unary_result",
-	        {{"url", url},
-	         {"method", method_name},
-	         {"has_batch", result.batch ? "true" : "false"}});
+	if (log_active) {
+		VGI_LOG(context, "http.invoke_unary_result",
+		        {{"url", url},
+		         {"method", method_name},
+		         {"has_batch", result.batch ? "true" : "false"}});
+	}
 
 	return result;
 }

@@ -329,7 +329,8 @@ void HttpFunctionConnection::BufferDataBatches(std::shared_ptr<arrow::Buffer> ow
 		++spike_data_batches;
 	}
 
-	{
+	// Gated: fires once per response on the producer hot path.
+	if (VgiInfoLogActive(context_)) {
 		auto fields = BuildConnLogFields(*this);
 		fields.emplace_back("data_batches", std::to_string(spike_data_batches));
 		fields.emplace_back("log_batches", std::to_string(spike_log_batches));
@@ -812,7 +813,8 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 
 		std::string exchange_url = base_url_ + "/init/exchange";
 
-		{
+		// Gated: fires once per continuation on the producer hot path.
+		if (VgiInfoLogActive(context_)) {
 			auto fields = BuildConnLogFields(*this);
 			fields.emplace_back("function_name", function_name_);
 			VGI_LOG(context_, "http_function_connection.producer_exchange", fields);

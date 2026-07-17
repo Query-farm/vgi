@@ -670,10 +670,13 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 			                                     local_state.input_extension_types);
 		}
 
-		VGI_LOG(context, "scalar.write_input",
-		        {{"conn", local_state.connection->GetConnIdHex()},
-		         {"function_name", func_info.function_name},
-		         {"input_rows", std::to_string(input_batch->num_rows())}});
+		// Gated: fires once per chunk on the scalar exchange hot path.
+		if (VgiInfoLogActive(context)) {
+			VGI_LOG(context, "scalar.write_input",
+			        {{"conn", local_state.connection->GetConnIdHex()},
+			         {"function_name", func_info.function_name},
+			         {"input_rows", std::to_string(input_batch->num_rows())}});
+		}
 
 		if (timing) {
 			{
