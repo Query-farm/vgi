@@ -1,0 +1,55 @@
+# name: test/sql/integration/http/small_body_encoding.test
+# description: Tiny request bodies skip compression (identity); large bodies still compress
+# group: [vgi_integration_http]
+#
+# Sub-KiB request bodies (producer ticks, 1-row exchanges, small unary
+# envelopes) are posted uncompressed with NO Content-Encoding header — zstd
+# would burn CPU and often grow them. Larger bodies keep the zstd default.
+# Observed via the http.response log event's req_encoding field.
+
+require-env VGI_TEST_WORKER
+
+require-env VGI_HTTP_TRANSPORT
+
+require vgi
+
+require httpfs
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+statement ok
+ATTACH 'example' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# One-row scalar exchange → body well under 1 KiB → identity.
+query I
+SELECT ex.double(21);
+----
+42
+
+query I
+SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI'
+    AND message LIKE '%http.response%' AND message LIKE '%req_encoding=none%';
+----
+true
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# Full 2048-row exchange chunks → bodies well over 1 KiB → zstd stays on.
+query I
+SELECT count(*) FROM (SELECT ex.double(i) AS d FROM range(5000) t(i)) WHERE d IS NOT NULL;
+----
+5000
+
+query I
+SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI'
+    AND message LIKE '%http.response%' AND message LIKE '%req_encoding=zstd%';
+----
+true
+
+statement ok
+DETACH ex;

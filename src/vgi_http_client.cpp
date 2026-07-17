@@ -174,14 +174,34 @@ static std::string HttpPostArrowIpcInternal(ClientContext &context,
 	// to debug a stuck endpoint saw no effect until re-ATTACH.
 	ApplyHttpTimeout(context, *params);
 
+	// Skip compression for tiny bodies (producer ticks, small unary
+	// envelopes): zstd adds CPU on the per-request hot path and often GROWS a
+	// sub-KiB payload past its raw size. The server treats an absent
+	// Content-Encoding header as identity (do NOT send a literal "identity"
+	// token — the server 415s unknown codecs).
+	static constexpr size_t kMinCompressBytes = 1024;
+	if (request_encoding != HttpEncoding::NONE && body.size() < kMinCompressBytes) {
+		request_encoding = HttpEncoding::NONE;
+	}
+
 	// Compress the request body with the chosen codec.  Default zstd matches
 	// every existing VGI server; a future gzip-only server is recovered via
-	// the 415-retry path below using ``VGI-Supported-Encodings``.
-	auto compressed_body = Compress(request_encoding, body.data(), body.size());
+	// the 415-retry path below using ``VGI-Supported-Encodings``.  The NONE
+	// path posts ``body`` directly — no copy.
+	std::vector<uint8_t> compressed_body;
+	const uint8_t *req_body_data = body.data();
+	size_t req_body_size = body.size();
+	if (request_encoding != HttpEncoding::NONE) {
+		compressed_body = Compress(request_encoding, body.data(), body.size());
+		req_body_data = compressed_body.data();
+		req_body_size = compressed_body.size();
+	}
 
 	HTTPHeaders headers;
 	headers.Insert("Content-Type", ARROW_IPC_CONTENT_TYPE);
-	headers.Insert("Content-Encoding", EncodingName(request_encoding));
+	if (request_encoding != HttpEncoding::NONE) {
+		headers.Insert("Content-Encoding", EncodingName(request_encoding));
+	}
 	headers.Insert("X-VGI-Accept-Encoding", ClientAcceptEncoding());
 	if (!bearer_token.empty()) {
 		headers.Insert("Authorization", "Bearer " + bearer_token);
@@ -194,8 +214,8 @@ static std::string HttpPostArrowIpcInternal(ClientContext &context,
 	}
 
 	PostRequestInfo post(url, headers, *params,
-	                     reinterpret_cast<const_data_ptr_t>(compressed_body.data()),
-	                     static_cast<idx_t>(compressed_body.size()));
+	                     reinterpret_cast<const_data_ptr_t>(req_body_data),
+	                     static_cast<idx_t>(req_body_size));
 
 	// When the caller supplies a client holder, reuse its keep-alive HTTP
 	// client (and TCP connection) across calls; the 2-arg overload creates
@@ -407,9 +427,10 @@ static std::string HttpPostArrowIpcInternal(ClientContext &context,
 		VGI_LOG(context, "http.response",
 		        {{"url", url},
 		         {"status", std::to_string(static_cast<int>(out_response->status))},
-		         {"req_encoding", EncodingName(request_encoding)},
+		         {"req_encoding", request_encoding == HttpEncoding::NONE ? "none"
+		                                                                 : EncodingName(request_encoding)},
 		         {"req_raw_bytes", std::to_string(body.size())},
-		         {"req_wire_bytes", std::to_string(compressed_body.size())},
+		         {"req_wire_bytes", std::to_string(req_body_size)},
 		         {"resp_compressed", resp_compressed ? "true" : "false"},
 		         {"resp_encoding", resp_compressed ? EncodingName(resp_enc) : "none"},
 		         {"resp_wire_bytes", std::to_string(resp_wire_bytes)},

@@ -25,6 +25,50 @@ static constexpr int kDefaultGzipLevel = 6;
 // zstd
 // ---------------------------------------------------------------------------
 
+// Reused per-thread compression / decompression contexts. The one-shot
+// ZSTD_compress / ZSTD_decompress entry points allocate and free a full
+// CCtx/DCtx internally on EVERY call — measurable on the per-chunk HTTP
+// exchange hot path (one compress + one decompress per 2048-row vector).
+// A context is created lazily per thread and reused for its lifetime;
+// creation failure falls back to the one-shot API (never throws here).
+namespace {
+
+struct ZstdCCtxHolder {
+	duckdb_zstd::ZSTD_CCtx *ctx = nullptr;
+	~ZstdCCtxHolder() {
+		if (ctx) {
+			duckdb_zstd::ZSTD_freeCCtx(ctx);
+		}
+	}
+};
+
+struct ZstdDCtxHolder {
+	duckdb_zstd::ZSTD_DCtx *ctx = nullptr;
+	~ZstdDCtxHolder() {
+		if (ctx) {
+			duckdb_zstd::ZSTD_freeDCtx(ctx);
+		}
+	}
+};
+
+duckdb_zstd::ZSTD_CCtx *GetThreadZstdCCtx() {
+	thread_local ZstdCCtxHolder holder;
+	if (!holder.ctx) {
+		holder.ctx = duckdb_zstd::ZSTD_createCCtx();
+	}
+	return holder.ctx;
+}
+
+duckdb_zstd::ZSTD_DCtx *GetThreadZstdDCtx() {
+	thread_local ZstdDCtxHolder holder;
+	if (!holder.ctx) {
+		holder.ctx = duckdb_zstd::ZSTD_createDCtx();
+	}
+	return holder.ctx;
+}
+
+} // namespace
+
 static std::string ZstdDecompress(const char *data, size_t size) {
 	using namespace duckdb_zstd;
 	auto frame_size = ZSTD_getFrameContentSize(data, size);
@@ -40,7 +84,9 @@ static std::string ZstdDecompress(const char *data, size_t size) {
 			    static_cast<unsigned long long>(kMaxDecompressedBytes));
 		}
 		std::string decompressed(frame_size, '\0');
-		auto result = ZSTD_decompress(decompressed.data(), frame_size, data, size);
+		auto *dctx = GetThreadZstdDCtx();
+		auto result = dctx ? ZSTD_decompressDCtx(dctx, decompressed.data(), frame_size, data, size)
+		                   : ZSTD_decompress(decompressed.data(), frame_size, data, size);
 		if (ZSTD_isError(result)) {
 			throw IOException("VGI zstd decompression failed: %s", ZSTD_getErrorName(result));
 		}
@@ -85,7 +131,9 @@ static std::vector<uint8_t> ZstdCompress(const uint8_t *data, size_t size, int l
 	using namespace duckdb_zstd;
 	auto bound = ZSTD_compressBound(size);
 	std::vector<uint8_t> compressed(bound);
-	auto result = ZSTD_compress(compressed.data(), bound, data, size, level);
+	auto *cctx = GetThreadZstdCCtx();
+	auto result = cctx ? ZSTD_compressCCtx(cctx, compressed.data(), bound, data, size, level)
+	                   : ZSTD_compress(compressed.data(), bound, data, size, level);
 	if (ZSTD_isError(result)) {
 		throw IOException("VGI zstd compression failed: %s", ZSTD_getErrorName(result));
 	}
