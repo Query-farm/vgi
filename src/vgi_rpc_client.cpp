@@ -6,6 +6,7 @@
 #include "vgi_arrow_ipc.hpp"
 #include "vgi_exception.hpp"
 #include "vgi_logging.hpp"
+#include "vgi_rpc_types.hpp" // SerializeToIpcBytes (single-allocation IPC serialization)
 #include "vgi_subprocess.hpp"
 
 namespace duckdb {
@@ -355,18 +356,6 @@ std::vector<uint8_t> SerializeRpcRequest(
     const std::string &method_name, const std::shared_ptr<arrow::RecordBatch> &params_batch,
     const std::string &protocol_version_override,
     const std::vector<std::pair<std::string, std::string>> &extra_metadata) {
-	auto sink_result = arrow::io::BufferOutputStream::Create();
-	if (!sink_result.ok()) {
-		throw IOException("Failed to create buffer for RPC request: " + sink_result.status().ToString());
-	}
-	auto sink = sink_result.ValueUnsafe();
-
-	auto writer_result = arrow::ipc::MakeStreamWriter(sink, params_batch->schema());
-	if (!writer_result.ok()) {
-		throw IOException("Failed to create RPC request writer: " + writer_result.status().ToString());
-	}
-	auto writer = writer_result.ValueUnsafe();
-
 	// Create custom metadata with method, wire version, and application
 	// protocol_version (enforced server-side at dispatch boundary). A non-empty
 	// override (the secret protocol's VGI_SECRET_PROTOCOL_VERSION) replaces the
@@ -383,22 +372,10 @@ std::vector<uint8_t> SerializeRpcRequest(
 	}
 	auto metadata = arrow::KeyValueMetadata::Make(std::move(meta_keys), std::move(meta_values));
 
-	auto status = writer->WriteRecordBatch(*params_batch, metadata);
-	if (!status.ok()) {
-		throw IOException("Failed to write RPC request batch: " + status.ToString());
-	}
-
-	status = writer->Close();
-	if (!status.ok()) {
-		throw IOException("Failed to close RPC request stream: " + status.ToString());
-	}
-
-	auto finish_result = sink->Finish();
-	if (!finish_result.ok()) {
-		throw IOException("Failed to finish RPC request buffer: " + finish_result.status().ToString());
-	}
-	auto buffer = finish_result.ValueUnsafe();
-	return std::vector<uint8_t>(buffer->data(), buffer->data() + buffer->size());
+	// Single-allocation serialization (schema + batch-with-metadata + EOS) —
+	// wire-identical to the previous MakeStreamWriter path, minus its
+	// BufferOutputStream realloc chain and final buffer→vector copy.
+	return SerializeToIpcBytes(params_batch, metadata);
 }
 
 std::vector<uint8_t> SerializeEmptyRpcRequest(const std::string &method_name) {

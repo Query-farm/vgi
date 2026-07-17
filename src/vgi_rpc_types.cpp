@@ -256,7 +256,8 @@ BuildOptionalStringMapScalar(const std::optional<std::vector<std::pair<std::stri
 // IPC Bytes Serialization
 // ============================================================================
 
-std::vector<uint8_t> SerializeToIpcBytes(const std::shared_ptr<arrow::RecordBatch> &batch) {
+std::vector<uint8_t> SerializeToIpcBytes(const std::shared_ptr<arrow::RecordBatch> &batch,
+                                          const std::shared_ptr<arrow::KeyValueMetadata> &custom_metadata) {
 	// Single-allocation path: drive the payload-level Arrow APIs by hand so
 	// RecordBatchSerializer::Assemble runs ONCE, GetPayloadSize tells us the
 	// exact total bytes, and we allocate the destination std::vector at the
@@ -293,7 +294,7 @@ std::vector<uint8_t> SerializeToIpcBytes(const std::shared_ptr<arrow::RecordBatc
 	}
 
 	arrow::ipc::IpcPayload batch_payload;
-	CheckStatus(arrow::ipc::GetRecordBatchPayload(*batch, /*custom_metadata=*/nullptr, options, &batch_payload),
+	CheckStatus(arrow::ipc::GetRecordBatchPayload(*batch, custom_metadata, options, &batch_payload),
 	            "build record-batch payload");
 
 	// EOS marker: 4-byte continuation token 0xFFFFFFFF + 4-byte zero length.

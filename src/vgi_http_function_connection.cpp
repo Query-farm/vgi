@@ -155,17 +155,23 @@ std::string HttpFunctionConnection::GetTransactionOpaqueDataHex() const {
 std::vector<uint8_t> HttpFunctionConnection::SerializeBatchWithState(
     const std::shared_ptr<arrow::RecordBatch> &batch,
     const std::shared_ptr<arrow::Schema> &schema) {
-	auto sink_result = arrow::io::BufferOutputStream::Create();
-	if (!sink_result.ok()) {
-		throw IOException("Failed to create buffer: %s", sink_result.status().ToString());
+	// Guard: the batch must match the declared (worker-facing) schema. Arrow's
+	// stream writer enforced this (schema equality, metadata excluded — the
+	// same check MakeStreamWriter's WriteRecordBatch performs); we replicate it
+	// so a mismatch still produces the inline schema diff instead of silently
+	// serializing the batch's own schema. In practice WriteInputBatch's
+	// ReconcileBatchToSchema guarantees a match.
+	if (schema && batch->schema().get() != schema.get() &&
+	    !batch->schema()->Equals(*schema, /*check_metadata=*/false)) {
+		std::string writer_schema_str = schema->ToString(/*show_metadata=*/true);
+		std::string batch_schema_str = batch->schema()
+		    ? batch->schema()->ToString(/*show_metadata=*/true) : "<null>";
+		throw IOException(
+		    "Failed to write batch: schema mismatch\n"
+		    "  writer schema (advertised at bind):\n%s\n"
+		    "  batch schema (received from caller):\n%s",
+		    writer_schema_str, batch_schema_str);
 	}
-	auto sink = sink_result.ValueUnsafe();
-
-	auto writer_result = arrow::ipc::MakeStreamWriter(sink, schema);
-	if (!writer_result.ok()) {
-		throw IOException("Failed to create IPC writer: %s", writer_result.status().ToString());
-	}
-	auto writer = writer_result.ValueUnsafe();
 
 	// Build metadata with stream_state and optional dynamic filters
 	std::vector<std::string> meta_keys;
@@ -200,34 +206,10 @@ std::vector<uint8_t> HttpFunctionConnection::SerializeBatchWithState(
 		metadata = arrow::KeyValueMetadata::Make(meta_keys, meta_values);
 	}
 
-	auto status = writer->WriteRecordBatch(*batch, metadata);
-	if (!status.ok()) {
-		// Arrow's IPC writer rejects any batch whose schema differs from the
-		// writer's schema (down to per-field nullable flags and metadata).
-		// The bare status string ("Tried to write record batch with
-		// different schema") is useless for debugging. Diff both schemas
-		// inline so an operator can see exactly which field changed.
-		std::string writer_schema_str = schema ? schema->ToString(/*show_metadata=*/true) : "<null>";
-		std::string batch_schema_str = batch && batch->schema()
-		    ? batch->schema()->ToString(/*show_metadata=*/true) : "<null>";
-		throw IOException(
-		    "Failed to write batch: %s\n"
-		    "  writer schema (advertised at bind):\n%s\n"
-		    "  batch schema (received from caller):\n%s",
-		    status.ToString(), writer_schema_str, batch_schema_str);
-	}
-
-	status = writer->Close();
-	if (!status.ok()) {
-		throw IOException("Failed to close IPC writer: %s", status.ToString());
-	}
-
-	auto finish_result = sink->Finish();
-	if (!finish_result.ok()) {
-		throw IOException("Failed to finish buffer: %s", finish_result.status().ToString());
-	}
-	auto buffer = finish_result.ValueUnsafe();
-	return std::vector<uint8_t>(buffer->data(), buffer->data() + buffer->size());
+	// Single-allocation serialization (schema + batch-with-metadata + EOS);
+	// wire-identical to the previous MakeStreamWriter path without its
+	// realloc chain + final buffer→vector copy. Runs once per exchange chunk.
+	return SerializeToIpcBytes(batch, metadata);
 }
 
 std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ExtractStreamState(

@@ -22,7 +22,13 @@ namespace vgi {
 
 // Serialize a RecordBatch to a complete IPC stream in memory (schema + batch + EOS).
 // Returns raw bytes suitable for storing in a binary column.
-std::vector<uint8_t> SerializeToIpcBytes(const std::shared_ptr<arrow::RecordBatch> &batch);
+// custom_metadata (optional) is attached to the record-batch message, exactly
+// as MakeStreamWriter+WriteRecordBatch(batch, metadata) would — but via the
+// single-allocation payload path (payload sizes are computed up front, so the
+// destination vector is allocated once; no BufferOutputStream realloc chain
+// and no final buffer→vector copy).
+std::vector<uint8_t> SerializeToIpcBytes(const std::shared_ptr<arrow::RecordBatch> &batch,
+                                          const std::shared_ptr<arrow::KeyValueMetadata> &custom_metadata = nullptr);
 
 // Deserialize a RecordBatch from IPC bytes.
 std::shared_ptr<arrow::RecordBatch> DeserializeFromIpcBytes(const std::vector<uint8_t> &bytes);
