@@ -1,0 +1,186 @@
+# name: test/sql/integration/cache/partition_scope_ops.test
+# description: Per-partition result cache — operational concerns: max-enumerated cap, TTL expiry via reap, disk tier (partition entries are MEMORY-ONLY; whole-scan persists), and the direct vgi_table_function() populate path
+# group: [vgi_integration_cache]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+statement ok
+ATTACH 'example' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# 1. max-enumerated cap: too many distinct partitions → no split, no serve
+# ============================================================================
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+statement ok
+SET vgi_result_cache_partition_max_enumerated = 1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# 5 distinct partitions > cap(1) → the split refuses (partition_too_many); no per-partition
+# entries are stored (the whole-scan entry is unaffected).
+query I
+SELECT COUNT(*) FROM ex.cache_partition_scope(3);
+----
+15
+
+query I
+SELECT COUNT(*) FROM vgi_result_cache() WHERE function = 'cache_partition_scope' AND partition_label != '';
+----
+0
+
+query I
+SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI'
+    AND message LIKE '%result_cache.ineligible%' AND message LIKE '%partition_too_many%';
+----
+true
+
+# An IN of 2 values also exceeds cap(1) at serve enumeration → no partition serve.
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT COUNT(*) FROM ex.cache_partition_scope(3) WHERE country IN ('US', 'CA');
+----
+6
+
+query I
+SELECT COUNT(*) FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%result_cache.partition_hit%';
+----
+0
+
+statement ok
+SET vgi_result_cache_partition_max_enumerated = 1024;
+
+# ============================================================================
+# 2. TTL expiry — a reap past the freshness window drops per-partition entries
+# ============================================================================
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+query I
+SELECT COUNT(*) FROM ex.cache_partition_scope(3);
+----
+15
+
+# 5 per-partition + 1 whole-scan entry present (ttl = 300s).
+query I
+SELECT COUNT(*) FROM vgi_result_cache() WHERE function = 'cache_partition_scope';
+----
+6
+
+# Reap 400s into the future (past the 300s TTL) → all entries reaped (non-revalidatable).
+query II
+SELECT memory_reaped >= 6, disk_refs_removed FROM vgi_result_cache_reap(advance_seconds := 400);
+----
+true	0
+
+query I
+SELECT COUNT(*) FROM vgi_result_cache() WHERE function = 'cache_partition_scope';
+----
+0
+
+# ============================================================================
+# 3. Disk tier: per-partition entries are MEMORY-ONLY; the whole-scan entry persists
+# ============================================================================
+statement ok
+SET vgi_result_cache_dir = '__TEST_DIR__/vgi_pscope_disk';
+
+statement ok
+SET vgi_result_cache_disk_max_bytes = 104857600;
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+query I
+SELECT COUNT(*) FROM ex.cache_partition_scope(3);
+----
+15
+
+# Per-partition entries live in memory (5 of them)...
+query I
+SELECT COUNT(*) FROM vgi_result_cache() WHERE function = 'cache_partition_scope' AND partition_label != '';
+----
+5
+
+# ...but NOT on disk: no packed exchange files (they'd wrongly route via input_hash),
+# while the whole-scan producer entry DID persist as a loose object.
+query I
+SELECT COUNT(*) FROM glob('__TEST_DIR__/vgi_pscope_disk/*/packs/*.vpack');
+----
+0
+
+query I
+SELECT COUNT(*) >= 1 FROM glob('__TEST_DIR__/vgi_pscope_disk/*/objects/*.vrc');
+----
+true
+
+# The combined serve is memory-only: after flushing the MEMORY tier, a =/IN scan can no
+# longer serve per-partition (the disk whole-scan entry doesn't answer a partition serve).
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT COUNT(*) FROM ex.cache_partition_scope(3) WHERE country = 'US';
+----
+3
+
+query I
+SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%result_cache.partition_miss%';
+----
+true
+
+statement ok
+SET vgi_result_cache_dir = '';
+
+statement ok
+SET vgi_result_cache_disk_max_bytes = 0;
+
+# ============================================================================
+# 4. Direct vgi_table_function() path — whole-scan cache only (partition columns are
+#    resolved on the catalog-attached bind path, not the direct one). Documents the
+#    limitation: the direct path still caches + serves the WHOLE scan, but does NOT
+#    split by partition.
+# ============================================================================
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT COUNT(*) FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_partition_scope', [3]);
+----
+15
+
+# No per-partition split on the direct path...
+query I
+SELECT COUNT(*) FROM vgi_result_cache() WHERE function = 'cache_partition_scope' AND partition_label != '';
+----
+0
+
+# ...but the whole-scan entry is stored and an identical direct repeat hits it.
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT COUNT(*) FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_partition_scope', [3]);
+----
+15
+
+query I
+SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%result_cache.hit%';
+----
+true

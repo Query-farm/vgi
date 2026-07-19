@@ -1,0 +1,243 @@
+# name: test/sql/integration/cache/partition_scope.test
+# description: Per-partition result cache (SINGLE_VALUE_PARTITIONS + vgi.cache.partition_scope) — populate, =/IN all-hit serve, partial-miss fall-through, residual isolation, full-scan-repeat, served correctness, ineligible shapes
+# group: [vgi_integration_cache]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+statement ok
+ATTACH 'example' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# The result-cache singleton is process-global; start clean.
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# --- 1. Full scan populates per-partition entries (additive: whole-scan entry too) ---
+query I
+SELECT COUNT(*) FROM ex.cache_partition_scope(3);
+----
+15
+
+# One split-store event covering all 5 country partitions.
+query I
+SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI'
+    AND message LIKE '%result_cache.partition_store%' AND message LIKE '%partitions=5%';
+----
+true
+
+# vgi_result_cache() shows the 5 per-partition entries (labeled) PLUS the whole-scan entry.
+query I
+SELECT COUNT(*) FROM vgi_result_cache() WHERE function = 'cache_partition_scope' AND partition_label != '';
+----
+5
+
+query I
+SELECT COUNT(*) FROM vgi_result_cache() WHERE function = 'cache_partition_scope' AND partition_label = '';
+----
+1
+
+query II
+SELECT partition_label, num_rows FROM vgi_result_cache()
+    WHERE function = 'cache_partition_scope' AND partition_label != '' ORDER BY partition_label;
+----
+country=AU	3
+country=BR	3
+country=CA	3
+country=FR	3
+country=US	3
+
+# --- 2. WHERE country = 'US' serves entirely from the per-partition cache ---
+statement ok
+CALL truncate_duckdb_logs();
+
+query II
+SELECT country, sales FROM ex.cache_partition_scope(3) WHERE country = 'US' ORDER BY sales;
+----
+US	4000000
+US	4000001
+US	4000002
+
+query I
+SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%result_cache.partition_hit%';
+----
+true
+
+# --- 3. WHERE IN (both cached) → all-hit combined serve; GROUP BY (partitioned aggregate) is exact ---
+statement ok
+CALL truncate_duckdb_logs();
+
+query III
+SELECT country, COUNT(*), SUM(sales) FROM ex.cache_partition_scope(3)
+    WHERE country IN ('US', 'CA') GROUP BY country ORDER BY country;
+----
+CA	3	6000003
+US	3	12000003
+
+query I
+SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%result_cache.partition_hit%';
+----
+true
+
+# --- 4. WHERE IN with an absent partition (ZZ) → partial miss, falls through to the worker (still correct) ---
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT COUNT(*) FROM ex.cache_partition_scope(3) WHERE country IN ('US', 'ZZ');
+----
+3
+
+query I
+SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%result_cache.partition_miss%';
+----
+true
+
+# --- 5. Full-scan repeat hits the whole-scan entry (additive design — no manifest needed) ---
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT COUNT(*) FROM ex.cache_partition_scope(3);
+----
+15
+
+query I
+SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI'
+    AND message LIKE '%result_cache.hit%' AND message LIKE '%tier=memory%';
+----
+true
+
+# --- 6. Residual isolation: a NON-partition predicate must NOT be served by the residual-empty entry ---
+statement ok
+CALL truncate_duckdb_logs();
+
+# First run: the (residual='sales>1', country=US) entry does not exist yet → partition miss → worker.
+query I
+SELECT COUNT(*) FROM ex.cache_partition_scope(3) WHERE country = 'US' AND sales > 4000000;
+----
+2
+
+query I
+SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%result_cache.partition_miss%';
+----
+true
+
+# Its identical repeat now hits (its own whole-scan entry).
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT COUNT(*) FROM ex.cache_partition_scope(3) WHERE country = 'US' AND sales > 4000000;
+----
+2
+
+query I
+SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%result_cache.hit%';
+----
+true
+
+# --- 7. Served GROUP BY equals an uncached worker scan (correctness of the combined replay) ---
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+statement ok
+SET vgi_result_cache = false;
+
+query III
+SELECT country, COUNT(*), SUM(sales) FROM ex.cache_partition_scope(3)
+    WHERE country IN ('US', 'CA') GROUP BY country ORDER BY country;
+----
+CA	3	6000003
+US	3	12000003
+
+statement ok
+SET vgi_result_cache = true;
+
+# --- 8. Stats counters isolate the per-partition sub-metrics ---
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+query I
+SELECT COUNT(*) FROM ex.cache_partition_scope(3);
+----
+15
+
+query I
+SELECT COUNT(*) FROM ex.cache_partition_scope(3) WHERE country = 'US';
+----
+3
+
+query I
+SELECT partition_stores >= 5 AND partition_hits >= 1 FROM vgi_result_cache_stats();
+----
+true
+
+# --- 9. Ineligible: master toggle off → no per-partition activity, whole-scan cache still works ---
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+statement ok
+SET vgi_result_cache_partition_scope = false;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT COUNT(*) FROM ex.cache_partition_scope(3);
+----
+15
+
+query I
+SELECT COUNT(*) FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%result_cache.partition_store%';
+----
+0
+
+# A =/IN scan with the toggle off does not serve per-partition (no partition_hit); it just misses.
+query I
+SELECT COUNT(*) FROM ex.cache_partition_scope(3) WHERE country = 'US';
+----
+3
+
+query I
+SELECT COUNT(*) FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%result_cache.partition_hit%';
+----
+0
+
+statement ok
+SET vgi_result_cache_partition_scope = true;
+
+# --- 10. Ineligible: ORDER BY (combined concat can't honor a global order) → no per-partition serve ---
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# Populate via a full scan first.
+query I
+SELECT COUNT(*) FROM ex.cache_partition_scope(3);
+----
+15
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# An ORDER BY + LIMIT scan is partition-ineligible: it must not partition_hit.
+query II
+SELECT country, sales FROM ex.cache_partition_scope(3) WHERE country = 'US' ORDER BY sales LIMIT 1;
+----
+US	4000000
+
+query I
+SELECT COUNT(*) FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%result_cache.partition_hit%';
+----
+0

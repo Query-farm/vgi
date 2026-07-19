@@ -113,6 +113,30 @@ std::string HashInputChunkUnordered(ClientContext & /*context*/, DataChunk &chun
 	return VgiSha256Hex(buf);
 }
 
+std::string CanonicalPartitionTupleKey(ClientContext & /*context*/, const std::vector<Value> &tuple,
+                                       const std::vector<LogicalType> &partition_types) {
+	D_ASSERT(tuple.size() == partition_types.size());
+	// One-row chunk of the partition columns in declared order. Cast each Value to the
+	// declared partition type so the capture side (min-value decoded from
+	// vgi_partition_values, already the declared Arrow type) and the serve side (filter
+	// constants, which may arrive as a coercible literal type) produce identical bytes.
+	DataChunk chunk;
+	duckdb::vector<LogicalType> dtypes(partition_types.begin(), partition_types.end());
+	chunk.Initialize(Allocator::DefaultAllocator(), dtypes, 1);
+	for (idx_t c = 0; c < partition_types.size(); c++) {
+		Value v = tuple[c].DefaultCastAs(partition_types[c]);
+		chunk.SetValue(c, 0, v);
+	}
+	chunk.SetCardinality(1);
+	vector<OrderModifiers> mods(chunk.ColumnCount(),
+	                            OrderModifiers(OrderType::ASCENDING, OrderByNullType::NULLS_LAST));
+	Vector keys(LogicalType::BLOB);
+	CreateSortKeyHelpers::CreateSortKey(chunk, mods, keys);
+	keys.Flatten(1);
+	auto key_data = FlatVector::GetData<string_t>(keys);
+	return std::string(key_data[0].GetData(), key_data[0].GetSize());
+}
+
 std::vector<std::string> HashInputRowsPerValue(ClientContext & /*context*/, DataChunk &chunk) {
 	const idx_t count = chunk.size();
 	std::vector<std::string> out(count);

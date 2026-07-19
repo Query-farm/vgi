@@ -448,6 +448,9 @@ VgiCacheControl ParseVgiCacheControl(const std::shared_ptr<const arrow::KeyValue
 	if (get(VGI_CACHE_NOT_MODIFIED_KEY, tmp)) {
 		cc.not_modified = (tmp == "1");
 	}
+	if (get(VGI_CACHE_PARTITION_SCOPE_KEY, tmp)) {
+		cc.partition_scope = (tmp == "1");
+	}
 	return cc;
 }
 
@@ -1538,6 +1541,7 @@ std::vector<VgiResultCache::EntryInfo> VgiResultCache::Snapshot() const {
 		info.last_modified = e->last_modified;
 		info.revalidatable = e->revalidatable;
 		info.hits = e->hits;
+		info.partition_label = e->partition_label;
 		out.push_back(std::move(info));
 	}
 	return out;
@@ -1628,7 +1632,22 @@ VgiResultCache::Counters VgiResultCache::GetCounters() const {
 	c.exchange_stores = exchange_stores_.load(std::memory_order_relaxed);
 	c.exchange_revalidations = exchange_revalidations_.load(std::memory_order_relaxed);
 	c.exchange_bytes_served = exchange_bytes_served_.load(std::memory_order_relaxed);
+	c.partition_hits = partition_hits_.load(std::memory_order_relaxed);
+	c.partition_misses = partition_misses_.load(std::memory_order_relaxed);
+	c.partition_stores = partition_stores_.load(std::memory_order_relaxed);
 	return c;
+}
+
+void VgiResultCache::RecordPartitionHit() {
+	partition_hits_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void VgiResultCache::RecordPartitionMiss() {
+	partition_misses_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void VgiResultCache::RecordPartitionStore() {
+	partition_stores_.fetch_add(1, std::memory_order_relaxed);
 }
 
 void VgiResultCache::RecordExchangeHit(int64_t bytes_served) {

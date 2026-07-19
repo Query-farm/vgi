@@ -56,6 +56,18 @@ std::string HashInputBatchOrdered(const std::shared_ptr<arrow::RecordBatch> &inp
 //! chunk (all columns) — the correlated columns are baked into the cached output.
 std::string HashInputChunkUnordered(ClientContext &context, DataChunk &chunk);
 
+//! Canonical byte-string for ONE partition-value tuple (per-partition producer cache).
+//! Builds a 1-row DataChunk from `tuple` (each Value cast to the matching
+//! `partition_types[i]`, in declared partition-column order) and runs CreateSortKey —
+//! the same NULL-aware, all-types machinery HashInputChunkUnordered uses. BOTH the
+//! capture side (fed the decoded partition min-values) and the serve side (fed the
+//! `=`/`IN` filter constants) call this with the same types + order, so their
+//! discriminator bytes are byte-identical (the per-partition-cache correctness
+//! linchpin). Returns the raw sort-key bytes; callers prefix "p:" + SHA-256 for the
+//! VgiResultCacheKey::input_hash discriminator. Throws on a cast failure.
+std::string CanonicalPartitionTupleKey(ClientContext &context, const std::vector<Value> &tuple,
+                                       const std::vector<LogicalType> &partition_types);
+
 //! Per-VALUE hash: one input_hash per row of `chunk` (a canonical NULL-aware sort-key
 //! blob → SHA-256, prefixed with a "v:" granularity discriminator so a per-value key can
 //! never collide with a per-batch/per-chunk `input_hash` in the same keyspace). Used for

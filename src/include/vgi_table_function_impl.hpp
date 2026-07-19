@@ -6,6 +6,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <utility>
 
 #include "duckdb/common/arrow/arrow_wrapper.hpp"
@@ -332,6 +333,21 @@ struct VgiResultCaptureCtx {
 	bool streaming() const {
 		return spilling.load(std::memory_order_acquire);
 	}
+
+	// --- Per-partition split (SINGLE_VALUE_PARTITIONS) ----------------------
+	// Armed at InitGlobal when the scan is partition-split-eligible (partition_kind ==
+	// SingleValuePartitions, the vgi_result_cache_partition_scope setting is on, and the
+	// filter shape is splittable). The actual split at commit is ADDITIONALLY gated on
+	// `cc.partition_scope` (the worker's first-batch opt-in). Additive: the whole-scan
+	// entry above is still built/inserted; the split adds one entry per distinct
+	// partition-value tuple, keyed by (static + `residual_filter_bytes`) with
+	// input_hash = "p:" + sha256(CanonicalPartitionTupleKey(...)). See CLAUDE.md.
+	bool partition_split_requested = false;
+	std::vector<idx_t> partition_column_indices;   // output-schema indices, declared order
+	std::vector<LogicalType> partition_types;      // matching declared partition types
+	std::vector<std::string> partition_names;      // matching declared partition column names
+	std::string residual_filter_bytes;             // filter_bytes with the partition predicate stripped
+	uint64_t partition_max = 1024;                  // cap on distinct partitions per split
 
 	// Allocate + register a per-local-state substream. Increments `launched`.
 	CachedStream *NewStream() {
@@ -742,10 +758,15 @@ struct SerializedFilters {
 //! apply it (e.g. the rowid IN-list / min-max range pushed by DuckDB's
 //! late-materialization semi-join). It is passed explicitly (not looked up in
 //! ``column_names``) because ``column_names`` has the rowid column erased.
+//! ``exclude_filter_keys`` (default null): projected filter-map keys (``filters->filters``
+//! entry keys, i.e. the projected col_idx) to SKIP. Used by the per-partition result
+//! cache to serialize the RESIDUAL filter — everything except the partition-column
+//! predicate — so a per-partition entry keys on the non-partition filter shape only.
 SerializedFilters VgiSerializeFilters(ClientContext &context, const vector<column_t> &column_ids,
                                       optional_ptr<TableFilterSet> filters,
                                       const vector<string> &column_names, const string &worker_path,
-                                      const string &rowid_column_name = "");
+                                      const string &rowid_column_name = "",
+                                      const std::set<idx_t> *exclude_filter_keys = nullptr);
 
 //! Returns true if any descendant of ``filter`` is a DynamicFilter (Top-N
 //! tick-time bound). Consumers that walk TableFilter trees for *static*

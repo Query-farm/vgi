@@ -1,0 +1,76 @@
+# name: test/sql/integration/cache/partition_scope_identity.test
+# description: Per-partition result cache (security) — cross-identity isolation. Two bearer principals attaching the SAME worker+args must never share per-partition entries: bob must not be served alice's cached partition.
+# group: [vgi_integration_cache]
+#
+# HTTP-only: bearer identity is carried only over HTTP (the fixture server maps
+# vgi-test-alice→alice / vgi-test-bob→bob). require-env VGI_HTTP_TRANSPORT is set only
+# by run_http_integration.sh, so this file is skipped on the subprocess suite (where
+# every caller is anonymous and the isolation assertion is moot). The per-partition key
+# inherits the producer key's identity_scope (catalog/worker + auth-principal fingerprint).
+
+require-env VGI_TEST_WORKER
+
+require-env VGI_HTTP_TRANSPORT
+
+require vgi
+
+require httpfs
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+# alice populates per-partition entries under her identity and serves her US partition.
+statement ok
+ATTACH 'example' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}', bearer_token 'vgi-test-alice');
+
+query I
+SELECT COUNT(*) FROM ex.cache_partition_scope(3);
+----
+15
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT COUNT(*) FROM ex.cache_partition_scope(3) WHERE country = 'US';
+----
+3
+
+query I
+SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%result_cache.partition_hit%';
+----
+true
+
+statement ok
+DETACH ex;
+
+# bob attaches the SAME worker + args, only the bearer token differs. His WHERE US must
+# NOT be served alice's cached partition (different auth principal in identity_scope) →
+# a partition MISS, then his own scan.
+statement ok
+ATTACH 'example' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}', bearer_token 'vgi-test-bob');
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT COUNT(*) FROM ex.cache_partition_scope(3) WHERE country = 'US';
+----
+3
+
+query I
+SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%result_cache.partition_miss%';
+----
+true
+
+# alice's and bob's US partitions are DISTINCT entries — not merged.
+query I
+SELECT COUNT(*) FROM vgi_result_cache() WHERE function = 'cache_partition_scope' AND partition_label = 'country=US';
+----
+2
+
+statement ok
+DETACH ex;

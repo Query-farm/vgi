@@ -1,0 +1,219 @@
+# name: test/sql/integration/cache/partition_scope_shapes.test
+# description: Per-partition result cache — harder shapes: PARALLEL capture (multi-worker fan-out) + a NULL partition; MULTI-COLUMN (region, year) cross-product enumeration + partial-constraint fall-through; PROJECTION pushdown (keying + partition-column-dropped explicit-pv)
+# group: [vgi_integration_cache]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+# pool false forces a fresh worker per acquire so a threads>1 scan fans partitions
+# across MULTIPLE workers → the split at commit must bucket across capture substreams.
+statement ok
+ATTACH 'example' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}', pool false);
+
+statement ok
+SET threads = 8;
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+# ============================================================================
+# 1. Parallel capture + NULL partition (cache_partition_parallel: AU, CA, US, NULL)
+# ============================================================================
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT COUNT(*) FROM ex.cache_partition_parallel(3);
+----
+12
+
+# The whole-scan entry proves PARALLEL capture (>1 capture substream across workers).
+query I
+SELECT MAX(num_substreams) > 1 FROM vgi_result_cache()
+    WHERE function = 'cache_partition_parallel' AND partition_label = '';
+----
+true
+
+# The split produced one entry per distinct partition value — INCLUDING the NULL one.
+query II
+SELECT partition_label, num_rows FROM vgi_result_cache()
+    WHERE function = 'cache_partition_parallel' AND partition_label != '' ORDER BY partition_label;
+----
+country=AU	3
+country=CA	3
+country=NULL	3
+country=US	3
+
+# A non-NULL partition serves from cache.
+statement ok
+CALL truncate_duckdb_logs();
+
+query II
+SELECT country, sales FROM ex.cache_partition_parallel(3) WHERE country = 'US' ORDER BY sales;
+----
+US	2000000
+US	2000001
+US	2000002
+
+query I
+SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%result_cache.partition_hit%';
+----
+true
+
+# `IS NULL` is NOT enumerable (only =/IN), so it does NOT partition-serve — but is still correct.
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT COUNT(*) FROM ex.cache_partition_parallel(3) WHERE country IS NULL;
+----
+3
+
+query I
+SELECT COUNT(*) FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%result_cache.partition_hit%';
+----
+0
+
+# ============================================================================
+# 2. Multi-column (region, year) — cross-product enumeration + partial constraint
+# ============================================================================
+# Sections 2 & 3 use single-value-partitioned single-worker fixtures; run them
+# single-threaded so capture is deterministic (the parallel proof is section 1).
+statement ok
+SET threads = 1;
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT COUNT(*) FROM ex.cache_partition_multicol(2);
+----
+8
+
+query II
+SELECT partition_label, num_rows FROM vgi_result_cache()
+    WHERE function = 'cache_partition_multicol' AND partition_label != '' ORDER BY partition_label;
+----
+region=EU, year=2020	2
+region=EU, year=2022	2
+region=US, year=2020	2
+region=US, year=2022	2
+
+# Full-tuple equality on BOTH columns serves from cache.
+statement ok
+CALL truncate_duckdb_logs();
+
+query III
+SELECT region, year, amount FROM ex.cache_partition_multicol(2)
+    WHERE region = 'US' AND year = 2020 ORDER BY amount;
+----
+US	2020	2000
+US	2020	2001
+
+query I
+SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%result_cache.partition_hit%';
+----
+true
+
+# Cross-product IN × IN (non-contiguous years so the IN stays enumerable) → all 4 tuples hit.
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT COUNT(*) FROM ex.cache_partition_multicol(2) WHERE region IN ('US', 'EU') AND year IN (2020, 2022);
+----
+8
+
+query I
+SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%result_cache.partition_hit%';
+----
+true
+
+# Partial constraint (region fixed, year FREE) → NOT enumerable → falls through (still correct).
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT COUNT(*) FROM ex.cache_partition_multicol(2) WHERE region = 'US';
+----
+4
+
+query I
+SELECT COUNT(*) FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%result_cache.partition_hit%';
+----
+0
+
+# ============================================================================
+# 3. Projection pushdown (cache_partition_proj: country, sales, extra)
+# ============================================================================
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+# Populate via a full scan that KEEPS the partition column but projects `extra` away.
+# Select the columns directly (NOT COUNT(*), which would let the optimizer drop the
+# projection and mismatch the serve query's projection key).
+query II
+SELECT country, sales FROM ex.cache_partition_proj(3) ORDER BY country, sales;
+----
+CA	0
+CA	1
+CA	2
+US	1000000
+US	1000001
+US	1000002
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# Same projection + WHERE country=X → per-partition serve (projection is part of the key).
+query II
+SELECT country, sales FROM ex.cache_partition_proj(3) WHERE country = 'US' ORDER BY sales;
+----
+US	1000000
+US	1000001
+US	1000002
+
+query I
+SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%result_cache.partition_hit%';
+----
+true
+
+# Partition column PROJECTED OUT (SELECT sales only) — split still populates via explicit
+# partition_values; the repeat serves (whole-scan hit for the identical projected scan).
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT SUM(sales) FROM ex.cache_partition_proj(3);
+----
+3000006
+
+query I
+SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%result_cache.partition_store%';
+----
+true
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT SUM(sales) FROM ex.cache_partition_proj(3);
+----
+3000006
+
+query I
+SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%result_cache.hit%';
+----
+true

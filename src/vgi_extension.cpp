@@ -3384,6 +3384,21 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "low-cardinality column into the distinct count. Compute-only (no cache); sound "
 	                          "under the same per-row-purity the cacheability opt-in asserts. Default ON",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
+	config.AddExtensionOption(
+	    "vgi_result_cache_partition_scope",
+	    "Per-PARTITION result caching for SINGLE_VALUE_PARTITIONS table functions that advertise "
+	    "vgi.cache.partition_scope. When on, a cacheable partitioned scan ALSO caches its result split "
+	    "by partition value (one entry per distinct partition-value tuple), so a later =/IN-filtered "
+	    "scan on the partition column(s) serves the requested partitions from cache without the worker. "
+	    "Additive — the whole-scan entry is still stored/served. Default ON",
+	    LogicalType::BOOLEAN, Value::BOOLEAN(true));
+	config.AddExtensionOption(
+	    "vgi_result_cache_partition_max_enumerated",
+	    "Cap on the number of distinct partitions handled per scan by the per-partition cache: bounds "
+	    "both the enumerated =/IN cross-product at serve time and the distinct-partition count at "
+	    "capture (split) time. Over the cap, the scan falls back to the whole-scan cache / worker. "
+	    "Default 1024",
+	    LogicalType::UBIGINT, Value::UBIGINT(1024));
 	config.AddExtensionOption("vgi_result_cache_per_value",
 	                          "Per-VALUE memoization for exchange-mode maps: after input dedup, memoize the "
 	                          "worker output keyed on the individual input tuple, so a fully-warm distinct set "

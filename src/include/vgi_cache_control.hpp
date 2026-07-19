@@ -32,6 +32,12 @@ constexpr const char *VGI_CACHE_STALE_WHILE_REVALIDATE_KEY = "vgi.cache.stale_wh
 constexpr const char *VGI_CACHE_STALE_IF_ERROR_KEY = "vgi.cache.stale_if_error";
 // 304-equivalent + request-side conditional keys (revalidation milestone).
 constexpr const char *VGI_CACHE_NOT_MODIFIED_KEY = "vgi.cache.not_modified";
+// Per-partition caching opt-in: when a SINGLE_VALUE_PARTITIONS function sets this,
+// the client ALSO caches the result split by partition value (one entry per distinct
+// partition-value tuple), so a later `=`/`IN`-filtered scan reuses per-partition
+// entries. Additive — today's whole-scan entry is still stored/served. See CLAUDE.md
+// "Per-Partition Result Cache".
+constexpr const char *VGI_CACHE_PARTITION_SCOPE_KEY = "vgi.cache.partition_scope";
 constexpr const char *VGI_CACHE_IF_NONE_MATCH_KEY = "vgi.cache.if_none_match";
 constexpr const char *VGI_CACHE_IF_MODIFIED_SINCE_KEY = "vgi.cache.if_modified_since";
 
@@ -61,6 +67,9 @@ struct VgiCacheControl {
 	// 304-equivalent: worker asserts the stored payload is still fresh. Carried
 	// on a 0-row batch alongside a fresh ttl/expires (used to slide the entry).
 	bool not_modified = false;
+	// Opt-in to per-partition caching (SINGLE_VALUE_PARTITIONS only). Additive to
+	// the whole-scan cache; the split at capture is gated on this.
+	bool partition_scope = false;
 
 	// Opt-in: a freshness key present and not explicitly no_store.
 	bool Cacheable() const {

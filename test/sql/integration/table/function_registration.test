@@ -106,13 +106,18 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 # 1 cacheable buffered reducer (cached_sum_all — backs cache/exchange_buffered.test)
 # 2 always-revalidate (304) exchange-cache fixtures (cached_reval_echo classic +
 #   cached_reval_double blended — back cache/exchange_revalidate.test)
-# = 134
+# 4 per-partition result-cache fixtures (cache_partition_scope — SINGLE_VALUE_PARTITIONS +
+#   vgi.cache.partition_scope + filter_pushdown, backs cache/partition_scope.test;
+#   cache_partition_parallel — work-queue fan-out + a NULL partition; cache_partition_multicol
+#   — (region, year) multi-column; cache_partition_proj — projection pushdown; all back
+#   cache/partition_scope_shapes.test)
+# = 138
 query I
 SELECT COUNT(*)
 FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'table';
 ----
-134
+138
 
 # The 34 pure table functions (no TABLE parameter type)
 # Note: make_series appears 5 times (5 overloads), make_pairs appears 3 times,

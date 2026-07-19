@@ -14,6 +14,7 @@
 #include "vgi_arrow_ipc.hpp" // SerializeRecordBatch (capture)
 #include "vgi_cancel_dispatcher.hpp"
 #include "vgi_exchange_cache_key.hpp" // SerializeSettingsForKey / SerializeProjectionForKey (shared)
+#include "vgi_sha256.hpp"             // VgiSha256Hex (per-partition discriminator)
 #include "vgi_catalog_rpc.hpp"
 #include "vgi_exception.hpp"
 #include "vgi_extension.hpp"
@@ -861,7 +862,8 @@ private:
 SerializedFilters VgiSerializeFilters(ClientContext &context, const vector<column_t> &column_ids,
                                       optional_ptr<TableFilterSet> filters,
                                       const vector<string> &column_names, const string &worker_path,
-                                      const string &rowid_column_name) {
+                                      const string &rowid_column_name,
+                                      const std::set<idx_t> *exclude_filter_keys) {
 	// Return empty if no filters
 	if (!filters || filters->filters.empty()) {
 		return {nullptr, {}};
@@ -881,6 +883,12 @@ SerializedFilters VgiSerializeFilters(ClientContext &context, const vector<colum
 	for (auto &entry : filters->filters) {
 		idx_t col_idx = entry.first;
 		auto &filter = *entry.second;
+
+		// Residual serialization (per-partition cache): skip the partition-column
+		// predicate keys so the residual filter reflects only non-partition constraints.
+		if (exclude_filter_keys && exclude_filter_keys->count(col_idx)) {
+			continue;
+		}
 
 		// DuckDB's TableFilterSet uses indices into the projected column list (column_ids).
 		// Map through column_ids to get the original schema column name, but keep the
@@ -1150,7 +1158,288 @@ struct CacheEligibility {
 	//! `scope=transaction` result folds this into its key at commit and a lookup
 	//! probes both the catalog key and (key + this txn_id).
 	std::string transaction_id;
+
+	// --- Per-partition cache classification (SINGLE_VALUE_PARTITIONS) ---------
+	//! Splittable: eligible to split the captured result by partition value AND (if
+	//! enumerable) serve a `=`/`IN` scan from per-partition entries. False when the
+	//! function isn't partition-scope-eligible, the setting is off, or a partition
+	//! column carries a non-`=`/`IN` (range/other) predicate. When false the whole
+	//! per-partition layer is skipped (the whole-scan cache still operates normally).
+	bool partition_splittable = false;
+	//! Enumerable: every partition column is constrained by `=`/`IN`, so the requested
+	//! partition set is finite and known here (in `partition_enumerated_tuples`). Only
+	//! an enumerable scan can be SERVED from per-partition entries; a non-enumerable
+	//! splittable scan only POPULATES them.
+	bool partition_enumerable = false;
+	std::vector<std::vector<Value>> partition_enumerated_tuples; // parallel to partition_types
+	std::string partition_residual_filter_bytes;                 // filter_bytes minus the partition predicate
+	std::vector<idx_t> partition_column_indices;                 // output-schema indices, declared order
+	std::vector<LogicalType> partition_types;                    // matching declared partition types
+	std::vector<std::string> partition_names;                    // matching declared partition column names
+	uint64_t partition_max = 1024;                               // cap on distinct/enumerated partitions
 };
+
+//! Resolve partition column names (from the Arrow bind output schema — the index
+//! space of `partition_column_indices`, which INCLUDES the rowid column) and their
+//! DuckDB types (matched BY NAME into all_column_names/all_column_types, whose index
+//! space has the rowid erased). Returns false if any partition column can't be
+//! resolved. Keeps `names`/`types` in declared partition order.
+static bool ResolvePartitionColumns(const VgiTableFunctionBindData &bind_data,
+                                    std::vector<std::string> &names, std::vector<LogicalType> &types) {
+	const auto &out_schema = bind_data.bind_result.output_schema;
+	if (!out_schema) {
+		return false;
+	}
+	for (idx_t pi : bind_data.partition_column_indices) {
+		if (static_cast<int>(pi) >= out_schema->num_fields()) {
+			return false;
+		}
+		const std::string nm = out_schema->field(static_cast<int>(pi))->name();
+		bool found = false;
+		for (idx_t c = 0; c < bind_data.all_column_names.size(); c++) {
+			if (bind_data.all_column_names[c] == nm) {
+				names.push_back(nm);
+				types.push_back(bind_data.all_column_types[c]);
+				found = true;
+				break;
+			}
+		}
+		if (!found) {
+			return false;
+		}
+	}
+	return true;
+}
+
+//! Returns true iff `filter` constrains its (single) column to a FINITE enumerable set
+//! of constants — an `=`, an `IN`, or an `OR` of those — appending the constants to
+//! `out`. Returns false for any range / NULL / AND / other shape (not enumerable). A
+//! TableFilterSet entry is per-column, so an OR here is `col=a OR col=b` on one column.
+static bool ExtractPartitionEqualityValues(const TableFilter &filter, std::vector<Value> &out) {
+	switch (filter.filter_type) {
+	case TableFilterType::CONSTANT_COMPARISON: {
+		auto &cf = filter.Cast<ConstantFilter>();
+		if (cf.comparison_type != ExpressionType::COMPARE_EQUAL) {
+			return false;
+		}
+		out.push_back(cf.constant);
+		return true;
+	}
+	case TableFilterType::IN_FILTER: {
+		auto &inf = filter.Cast<InFilter>();
+		if (inf.values.empty()) {
+			return false;
+		}
+		for (auto &v : inf.values) {
+			out.push_back(v);
+		}
+		return true;
+	}
+	case TableFilterType::CONJUNCTION_OR: {
+		auto &orf = filter.Cast<ConjunctionOrFilter>();
+		if (orf.child_filters.empty()) {
+			return false;
+		}
+		for (auto &c : orf.child_filters) {
+			if (!ExtractPartitionEqualityValues(*c, out)) {
+				return false;
+			}
+		}
+		return true;
+	}
+	case TableFilterType::OPTIONAL_FILTER: {
+		// DuckDB wraps a pushed `col IN (...)` in an OptionalFilter ("not required for
+		// query correctness" — enforced above the scan too). Its child is the real IN/=.
+		// Any dynamic filter was already rejected upstream (VgiContainsDynamicFilter →
+		// cache-ineligible), so an optional reaching here is static and safe to unwrap.
+		auto &opt = filter.Cast<OptionalFilter>();
+		return opt.child_filter && ExtractPartitionEqualityValues(*opt.child_filter, out);
+	}
+	default:
+		return false; // range / IS NULL / AND → not enumerable
+	}
+}
+
+//! Classify the pushed filter for per-partition caching, filling the partition_* fields
+//! of `e`. Called only when the base scan is already cache-eligible (so dynamic filters
+//! were rejected upstream). Sets `partition_splittable` (may populate per-partition
+//! entries) and, when every partition column is `=`/`IN`-constrained, `partition_enumerable`
+//! + `partition_enumerated_tuples` (may serve). A non-`=`/`IN` (range/other) predicate on
+//! ANY partition column disables the whole per-partition layer (leaves it false).
+static void ClassifyPartitionFilters(ClientContext &context, const VgiTableFunctionBindData &bind_data,
+                                     TableFunctionInitInput &input, CacheEligibility &e) {
+	if (bind_data.partition_kind != VgiPartitionKind::SingleValuePartitions) {
+		return;
+	}
+	Value pv;
+	if (context.TryGetCurrentSetting("vgi_result_cache_partition_scope", pv) && !pv.IsNull() &&
+	    !pv.GetValue<bool>()) {
+		return;
+	}
+	// Ordered/sampled scans can't use the combined per-partition serve (concatenation
+	// can't honor a global ORDER BY; per-partition sampling semantics differ), so the
+	// whole per-partition layer is skipped — the whole-scan cache handles them.
+	if (bind_data.order_by_hint || bind_data.table_sample_hint) {
+		return;
+	}
+	Value maxv;
+	if (context.TryGetCurrentSetting("vgi_result_cache_partition_max_enumerated", maxv) && !maxv.IsNull()) {
+		e.partition_max = maxv.GetValue<uint64_t>();
+	}
+	if (!ResolvePartitionColumns(bind_data, e.partition_names, e.partition_types)) {
+		return;
+	}
+	e.partition_column_indices = bind_data.partition_column_indices;
+
+	std::map<std::string, idx_t> name_to_pos;
+	for (idx_t i = 0; i < e.partition_names.size(); i++) {
+		name_to_pos[e.partition_names[i]] = i;
+	}
+	std::vector<std::vector<Value>> per_col(e.partition_names.size());
+	std::vector<bool> col_constrained(e.partition_names.size(), false);
+	std::set<idx_t> exclude_keys; // projected filter-map keys that are partition predicates
+	bool splittable = true;
+	bool any_partition_pred = false;
+
+	if (input.filters) {
+		for (auto &entry : input.filters->filters) {
+			const idx_t col_idx = entry.first;
+			auto &filter = *entry.second;
+			const idx_t original_col_idx =
+			    col_idx < input.column_ids.size() ? input.column_ids[col_idx] : col_idx;
+			std::string col_name;
+			if (original_col_idx == COLUMN_IDENTIFIER_ROW_ID && !bind_data.rowid_column_name.empty()) {
+				col_name = bind_data.rowid_column_name;
+			} else {
+				col_name = original_col_idx < bind_data.all_column_names.size()
+				               ? bind_data.all_column_names[original_col_idx]
+				               : std::to_string(original_col_idx);
+			}
+			auto it = name_to_pos.find(col_name);
+			if (it == name_to_pos.end()) {
+				continue; // non-partition predicate → stays in the residual
+			}
+			any_partition_pred = true;
+			exclude_keys.insert(col_idx);
+			const idx_t pos = it->second;
+			std::vector<Value> vals;
+			if (!ExtractPartitionEqualityValues(filter, vals)) {
+				splittable = false; // range/other on a partition column → ineligible
+				break;
+			}
+			for (auto &v : vals) {
+				per_col[pos].push_back(v);
+			}
+			col_constrained[pos] = true;
+		}
+	}
+	if (!splittable) {
+		return; // whole-scan cache still operates; per-partition layer disabled
+	}
+	e.partition_splittable = true;
+
+	// Residual = the pushed filters MINUS the partition predicates. CRITICAL: when EVERY
+	// pushed filter is a partition predicate (all excluded), the residual must be the
+	// empty string — byte-identical to a full/no-filter scan's residual — so a
+	// `WHERE part=X` scan reuses the per-partition entry a full scan stored. Serializing
+	// an all-excluded set would still emit a non-empty empty-filter IPC batch and never
+	// match. So only serialize when a NON-excluded filter remains.
+	bool has_residual_filter = false;
+	if (input.filters) {
+		for (auto &entry : input.filters->filters) {
+			if (!exclude_keys.count(entry.first)) {
+				has_residual_filter = true;
+				break;
+			}
+		}
+	}
+	if (has_residual_filter) {
+		try {
+			auto sf = VgiSerializeFilters(context, input.column_ids, input.filters,
+			                              bind_data.all_column_names, bind_data.worker_path(),
+			                              bind_data.rowid_column_name, &exclude_keys);
+			if (sf.filter_bytes) {
+				e.partition_residual_filter_bytes.append(reinterpret_cast<const char *>(sf.filter_bytes->data()),
+				                                         static_cast<size_t>(sf.filter_bytes->size()));
+			}
+			for (auto &jk : sf.join_keys_buffers) {
+				e.partition_residual_filter_bytes.push_back('|');
+				e.partition_residual_filter_bytes.append(reinterpret_cast<const char *>(jk->data()),
+				                                         static_cast<size_t>(jk->size()));
+			}
+		} catch (const std::exception &) {
+			e.partition_splittable = false;
+			return;
+		}
+	}
+
+	// Enumerable requires a partition predicate on EVERY partition column.
+	if (!any_partition_pred) {
+		return; // full/partition-free scan: populate-only (can't enumerate the universe)
+	}
+	for (bool c : col_constrained) {
+		if (!c) {
+			return; // some partition column free → populate-only
+		}
+	}
+	// Cross product of the per-column value sets → the requested tuple set.
+	std::vector<std::vector<Value>> tuples;
+	tuples.emplace_back();
+	for (idx_t i = 0; i < per_col.size(); i++) {
+		std::vector<std::vector<Value>> next;
+		for (auto &prefix : tuples) {
+			for (auto &v : per_col[i]) {
+				auto t = prefix;
+				t.push_back(v);
+				next.push_back(std::move(t));
+				if (next.size() > e.partition_max) {
+					return; // too many → populate-only (no serve)
+				}
+			}
+		}
+		tuples = std::move(next);
+	}
+	e.partition_enumerated_tuples = std::move(tuples);
+	e.partition_enumerable = true;
+}
+
+//! The "p:"-prefixed input_hash discriminator for one partition-value tuple. Both the
+//! serve side (filter constants) and the capture side (decoded partition min-values)
+//! call this with the same `partition_types`, so identical tuples produce identical
+//! discriminators (the per-partition-cache correctness linchpin).
+static std::string PartitionDiscriminator(ClientContext &context, const std::vector<Value> &tuple,
+                                          const std::vector<LogicalType> &partition_types) {
+	return "p:" + VgiSha256Hex(vgi::CanonicalPartitionTupleKey(context, tuple, partition_types));
+}
+
+//! Build a per-partition cache key from the base (whole-scan) key: swap filter_bytes for
+//! the residual (partition predicate stripped), set the "p:" input_hash discriminator,
+//! and clear order/sample/transaction dimensions (partition entries are catalog-scoped,
+//! order/sample-free by construction).
+static VgiResultCacheKey BuildPartitionKey(const VgiResultCacheKey &base, const std::string &residual,
+                                           const std::string &disc) {
+	VgiResultCacheKey k = base;
+	k.filter_bytes = residual;
+	k.order_by_hint.clear();
+	k.sample_hint.clear();
+	k.transaction_id.clear();
+	k.input_hash = disc;
+	return k;
+}
+
+//! Human-readable "name=value, name2=value2" label of a partition tuple (diagnostics).
+static std::string PartitionLabel(const std::vector<std::string> &names, const std::vector<Value> &tuple) {
+	std::string out;
+	for (idx_t i = 0; i < names.size() && i < tuple.size(); i++) {
+		if (i) {
+			out += ", ";
+		}
+		out += names[i];
+		out += "=";
+		out += tuple[i].IsNull() ? "NULL" : tuple[i].ToString();
+	}
+	return out;
+}
 
 //! Evaluate v1 cache eligibility for a table scan and build the cache key.
 //! v1 policy: catalog-attached path only, unfiltered full scans only (no
@@ -1294,6 +1583,10 @@ CacheEligibility EvaluateCacheEligibility(ClientContext &context,
 	// is carried separately for the scope=transaction commit + two-key lookup.
 	e.transaction_id = std::to_string(static_cast<uint64_t>(context.ActiveTransaction().global_transaction_id));
 	e.catalog_name = catalog_label;
+	// Per-partition classification piggybacks on the base eligibility (same identity /
+	// version / opt-out). Populates the partition_* fields; harmless when the function
+	// isn't SINGLE_VALUE_PARTITIONS or the setting is off.
+	ClassifyPartitionFilters(context, bind_data, input, e);
 	e.eligible = true;
 	return e;
 }
@@ -1326,6 +1619,11 @@ static bool DrainSubstreamToWriter(CachedStream &s, VgiCaptureDiskWriter &w) {
 	s.rows = 0;
 	return ok;
 }
+
+// Per-partition split-at-commit (SINGLE_VALUE_PARTITIONS). Defined after
+// ConvertPartitionValuesBatch; forward-declared here so the commit dtor can call it.
+static void SplitAndStorePartitionEntries(ClientContext *ctx, VgiResultCaptureCtx &cap,
+                                          const VgiResultCacheEntry &meta, bool allow_disk);
 
 // Commit a completed capture to the result cache. Called from the gstate
 // destructor. Enforces the never-partial invariant: only commits when the full
@@ -1456,7 +1754,24 @@ VgiTableFunctionGlobalState::~VgiTableFunctionGlobalState() {
 			                                 {"rows", std::to_string(cap.disk_writer->Rows())},
 			                                 {"bytes", std::to_string(cap.disk_writer->Bytes())}});
 		}
+		// A spilled capture is disk-only and its RAM batches were drained — no per-batch
+		// bytes remain to split by partition. Skip the per-partition layer (v1 boundary).
+		if (cap.partition_split_requested && cap.cc.partition_scope) {
+			skip("partition_spilled");
+		}
 		return;
+	}
+	// Per-partition split (additive): store one entry per distinct partition value BEFORE
+	// the whole-scan move consumes the substreams. Gated on the worker's first-batch
+	// opt-in (cc.partition_scope) and skipped for transaction-scoped results (their key
+	// is process-local; partition entries are catalog-scoped). Copies batch shared_ptrs.
+	// MEMORY-ONLY (allow_disk=false): the combined serve probes only the memory tier
+	// (LookupBatch), so a disk copy would never be read back — and persisting an
+	// input_hash-keyed entry would wrongly route it into the packed EXCHANGE store + its
+	// ref-count cap. The whole-scan entry above still persists to disk for cross-process
+	// warmth of full/identical-filter repeats.
+	if (cap.partition_split_requested && cap.cc.partition_scope && !txn_scoped) {
+		SplitAndStorePartitionEntries(client_context_for_explain, cap, *entry, /*allow_disk=*/false);
 	}
 	// RAM-buffered path (disk tier off): move the substreams in + insert into memory.
 	int64_t rows = 0;
@@ -1580,6 +1895,86 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 			               {{"catalog", cache_eval.catalog_name},
 			                {"function", bind_data.function_name},
 			                {"key_hash", cache_eval.key.HexDigest()}});
+
+			// Per-partition serve (additive): the whole-scan key missed, but if this scan
+			// enumerates its requested partition set (`=`/`IN` on every partition column)
+			// AND every per-partition entry is an in-memory hit, serve the union without
+			// the worker. Row-exact: each entry keys on the same residual filter, the
+			// enumerated set equals the requested set, and SINGLE_VALUE guarantees each
+			// cached row belongs to exactly its entry's partition (no super/subset).
+			if (cache_eval.partition_enumerable && !cache_eval.partition_enumerated_tuples.empty()) {
+				std::vector<VgiResultCacheKey> pkeys;
+				pkeys.reserve(cache_eval.partition_enumerated_tuples.size());
+				for (auto &tuple : cache_eval.partition_enumerated_tuples) {
+					auto disc = PartitionDiscriminator(context, tuple, cache_eval.partition_types);
+					pkeys.push_back(
+					    BuildPartitionKey(cache_eval.key, cache_eval.partition_residual_filter_bytes, disc));
+				}
+				auto hits = VgiResultCache::Instance().LookupBatch(pkeys, now_tp);
+				bool all_hit = !pkeys.empty();
+				int64_t missing = 0;
+				for (auto &h : hits) {
+					// Combined serve is memory-only: a disk-backed (streaming) entry can't
+					// be aggregated into one replay stream, so treat it as a miss.
+					if (!h || h->disk_backed) {
+						all_hit = false;
+						++missing;
+					}
+				}
+				if (all_hit) {
+					// Aggregate every partition entry's batches into ONE partition-contiguous
+					// replay stream with fresh sequential batch_index — so the sort in
+					// CachedReplayConnection keeps each partition's batches together (required
+					// by PhysicalPartitionedAggregate) regardless of the stored indices.
+					auto combined = std::make_shared<VgiResultCacheEntry>();
+					combined->key = cache_eval.key;
+					combined->catalog_name = cache_eval.catalog_name;
+					combined->never_expires = true; // transient serve entry (not inserted)
+					CachedStream merged;
+					uint64_t seq = 0;
+					int64_t total_rows = 0;
+					int64_t total_bytes = 0;
+					for (auto &h : hits) {
+						for (auto &s : h->streams) {
+							for (auto &b : s.batches) {
+								VgiCachedBatch nb = b; // shared_ptr ipc copy
+								nb.has_batch_index = true;
+								nb.batch_index = seq++;
+								total_rows += b.rows;
+								merged.batches.push_back(std::move(nb));
+							}
+						}
+						total_bytes += h->total_bytes;
+					}
+					merged.rows = total_rows;
+					merged.bytes = total_bytes;
+					combined->streams.push_back(std::move(merged));
+					combined->rows = total_rows;
+					combined->total_bytes = total_bytes;
+
+					auto gstate = make_uniq<VgiTableFunctionGlobalState>();
+					gstate->serving_from_cache = true;
+					gstate->serving_entry = std::move(combined);
+					gstate->max_processes = 1;
+					gstate->init_applied.store(true, std::memory_order_release);
+					gstate->client_context_for_explain = &context;
+					VgiResultCache::Instance().RecordPartitionHit();
+					LogResultCache(context, "result_cache.partition_hit",
+					               {{"catalog", cache_eval.catalog_name},
+					                {"function", bind_data.function_name},
+					                {"key_hash", cache_eval.key.HexDigest()},
+					                {"partitions", std::to_string(pkeys.size())}});
+					return unique_ptr<GlobalTableFunctionState>(std::move(gstate));
+				}
+				VgiResultCache::Instance().RecordPartitionMiss();
+				LogResultCache(context, "result_cache.partition_miss",
+				               {{"catalog", cache_eval.catalog_name},
+				                {"function", bind_data.function_name},
+				                {"key_hash", cache_eval.key.HexDigest()},
+				                {"requested", std::to_string(pkeys.size())},
+				                {"missing", std::to_string(missing)}});
+				// fall through to the worker scan (which repopulates per-partition entries).
+			}
 		}
 	} else if (cache_eval.ineligible_reason) {
 		LogResultCache(context, "result_cache.ineligible",
@@ -1801,6 +2196,16 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 		}
 		if (context.TryGetCurrentSetting("vgi_result_cache_disk_compression_level", sv) && !sv.IsNull()) {
 			cap->disk_compression_level = sv.GetValue<uint64_t>();
+		}
+		// Arm the per-partition split (SINGLE_VALUE_PARTITIONS). The actual split at
+		// commit is ADDITIONALLY gated on the worker's first-batch cc.partition_scope.
+		if (cache_eval.partition_splittable) {
+			cap->partition_split_requested = true;
+			cap->partition_column_indices = cache_eval.partition_column_indices;
+			cap->partition_types = cache_eval.partition_types;
+			cap->partition_names = cache_eval.partition_names;
+			cap->residual_filter_bytes = cache_eval.partition_residual_filter_bytes;
+			cap->partition_max = cache_eval.partition_max;
 		}
 		global_state->capture = std::move(cap);
 	}
@@ -2230,6 +2635,116 @@ static duckdb::vector<ColumnPartitionData> ConvertPartitionValuesBatch(
 		out.back().max_val = std::move(max_val);
 	}
 	return out;
+}
+
+//! Decode a captured batch's vgi_partition_values bytes to the per-column MIN values
+//! (row 0; == max for SINGLE_VALUE). Returns false on any decode/shape problem (the
+//! caller then aborts the whole split — a batch we can't classify must not be dropped).
+static bool DecodePartitionMinTuple(ClientContext &context, const std::string &pv_bytes,
+                                    std::vector<Value> &out) {
+	if (pv_bytes.empty()) {
+		return false;
+	}
+	auto buf = arrow::Buffer::FromString(pv_bytes);
+	auto input = std::make_shared<arrow::io::BufferReader>(buf);
+	auto rr = arrow::ipc::RecordBatchStreamReader::Open(input);
+	if (!rr.ok()) {
+		return false;
+	}
+	auto reader = rr.ValueUnsafe();
+	auto nr = reader->ReadNext();
+	if (!nr.ok() || !nr.ValueUnsafe().batch) {
+		return false;
+	}
+	auto pv_batch = nr.ValueUnsafe().batch;
+	if (pv_batch->num_rows() != 2) {
+		return false;
+	}
+	auto cpd = ConvertPartitionValuesBatch(context, pv_batch);
+	out.clear();
+	out.reserve(cpd.size());
+	for (auto &c : cpd) {
+		out.push_back(c.min_val);
+	}
+	return true;
+}
+
+// Per-partition split-at-commit: bucket the captured batches by partition-value tuple
+// and Insert one entry per distinct partition, keyed by (static key + residual filter)
+// with a "p:" discriminator. Additive to the whole-scan entry. Best-effort — any decode
+// failure or an over-cap partition count skips the split (the whole-scan entry stands).
+static void SplitAndStorePartitionEntries(ClientContext *ctx, VgiResultCaptureCtx &cap,
+                                          const VgiResultCacheEntry &meta, bool allow_disk) {
+	if (!ctx || cap.partition_types.empty()) {
+		return;
+	}
+	struct Bucket {
+		std::vector<VgiCachedBatch> batches;
+		int64_t rows = 0;
+		int64_t bytes = 0;
+		std::string label;
+	};
+	std::map<std::string, Bucket> buckets; // "p:"-disc -> bucket (map = deterministic order)
+	for (auto &sp : cap.streams) {
+		for (auto &b : sp->batches) {
+			std::vector<Value> tuple;
+			if (!DecodePartitionMinTuple(*ctx, b.partition_values_bytes, tuple) ||
+			    tuple.size() != cap.partition_types.size()) {
+				LogResultCache(*ctx, "result_cache.store_skipped",
+				               {{"function", cap.key.function_name},
+				                {"key_hash", cap.key.HexDigest()},
+				                {"reason", "partition_decode_failed"}});
+				return; // can't classify a batch → abandon the split entirely
+			}
+			auto disc = PartitionDiscriminator(*ctx, tuple, cap.partition_types);
+			auto &bk = buckets[disc];
+			if (bk.batches.empty()) {
+				bk.label = PartitionLabel(cap.partition_names, tuple);
+			}
+			bk.rows += b.rows;
+			bk.bytes += static_cast<int64_t>(b.ipc ? b.ipc->size() : 0);
+			bk.batches.push_back(b); // shared_ptr ipc copy
+		}
+	}
+	if (buckets.empty()) {
+		return;
+	}
+	if (buckets.size() > cap.partition_max) {
+		LogResultCache(*ctx, "result_cache.ineligible",
+		               {{"function", cap.key.function_name}, {"reason", "partition_too_many"}});
+		return;
+	}
+	int64_t stored = 0;
+	for (auto &kv : buckets) {
+		auto pe = std::make_shared<VgiResultCacheEntry>();
+		pe->key = BuildPartitionKey(cap.key, cap.residual_filter_bytes, kv.first);
+		pe->catalog_name = meta.catalog_name;
+		pe->scope = meta.scope;
+		// v1: per-partition entries are non-revalidatable (the combined serve never issues
+		// conditional requests). Freshness mirrors the whole-scan entry.
+		pe->revalidatable = false;
+		pe->stored_at = meta.stored_at;
+		pe->expires_at = meta.expires_at;
+		pe->never_expires = meta.never_expires;
+		pe->partition_label = kv.second.label;
+		CachedStream s;
+		s.batches = std::move(kv.second.batches);
+		s.rows = kv.second.rows;
+		s.bytes = kv.second.bytes;
+		pe->rows = kv.second.rows;
+		pe->total_bytes = kv.second.bytes;
+		pe->streams.push_back(std::move(s));
+		if (VgiResultCache::Instance().Insert(std::move(pe), allow_disk)) {
+			VgiResultCache::Instance().RecordPartitionStore();
+			++stored;
+		}
+	}
+	if (stored > 0) {
+		LogResultCache(*ctx, "result_cache.partition_store",
+		               {{"function", cap.key.function_name},
+		                {"key_hash", cap.key.HexDigest()},
+		                {"partitions", std::to_string(stored)}});
+	}
 }
 
 //! Install arrow_batch as the active chunk. Returns false on EOS (null batch).

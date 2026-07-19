@@ -140,6 +140,11 @@ struct VgiResultCacheEntry {
 	// identity_scope in the key is a fingerprint; this is the human name).
 	std::string catalog_name;
 	uint64_t hits = 0;
+	// Per-partition producer entry: a human-readable label of the partition-value
+	// tuple ("country=US", or "country=US, year=2020" for multi-column), empty for
+	// non-partition entries. Diagnostics only (the real discriminator is the "p:"
+	// input_hash). See CLAUDE.md "Per-Partition Result Cache".
+	std::string partition_label;
 	// [S8] Disk-backed streaming entry: `disk_backed` set, `streams` hold TOC-only
 	// VgiCachedBatch (disk_ipc_offset/length, no in-RAM `ipc`), and `disk_path` is
 	// the blob file the replay connection positioned-reads. Such entries are served
@@ -262,6 +267,8 @@ public:
 		// Disk-tier on-write compression codec ("none"/"zstd"/"lz4"). Always "none"
 		// for memory-tier rows (the memory tier is never compressed).
 		std::string codec = "none";
+		// Per-partition producer entry label ("country=US"); empty for others.
+		std::string partition_label;
 	};
 
 	// Aggregate counters for diagnostics / debugging.
@@ -282,6 +289,14 @@ public:
 		uint64_t exchange_stores = 0;
 		uint64_t exchange_revalidations = 0;
 		uint64_t exchange_bytes_served = 0;
+		// Per-partition producer sub-counters. A partition_hit serves a `=`/`IN` scan
+		// entirely from N per-partition entries without the worker; a partition_miss is
+		// a scan that could enumerate its partition set but at least one entry was cold
+		// (fell through to the worker); a partition_store counts each per-partition entry
+		// committed by a split capture.
+		uint64_t partition_hits = 0;
+		uint64_t partition_misses = 0;
+		uint64_t partition_stores = 0;
 	};
 
 	// Exchange-mode metric recorders (the exchange operators call these at their
@@ -290,6 +305,13 @@ public:
 	void RecordExchangeMiss();
 	void RecordExchangeStore();
 	void RecordExchangeRevalidation(int64_t bytes_served);
+
+	// Per-partition producer metric recorders (the producer scan calls these at its
+	// partition serve / miss decision points; the split commit calls RecordPartitionStore
+	// once per committed partition entry).
+	void RecordPartitionHit();
+	void RecordPartitionMiss();
+	void RecordPartitionStore();
 
 	static VgiResultCache &Instance();
 
@@ -476,6 +498,9 @@ private:
 	std::atomic<uint64_t> exchange_stores_ {0};
 	std::atomic<uint64_t> exchange_revalidations_ {0};
 	std::atomic<uint64_t> exchange_bytes_served_ {0};
+	std::atomic<uint64_t> partition_hits_ {0};
+	std::atomic<uint64_t> partition_misses_ {0};
+	std::atomic<uint64_t> partition_stores_ {0};
 
 	// [S1] Signature of the last-applied Settings; ConfigureIfChanged skips the
 	// lock + evict when the current query's settings match this.

@@ -122,13 +122,13 @@ static unique_ptr<FunctionData> VgiResultCacheListBind(ClientContext &, TableFun
 	         "at_unit",         "at_value",        "num_batches",  "num_substreams", "num_rows",
 	         "total_bytes",     "age_seconds",     "ttl_seconds",  "stale",
 	         "tier",            "etag",            "last_modified", "revalidatable",
-	         "hits",            "codec"};
+	         "hits",            "codec",           "partition_label"};
 	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
 	                LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT,  LogicalType::VARCHAR,
 	                LogicalType::VARCHAR, LogicalType::BIGINT,  LogicalType::BIGINT,  LogicalType::BIGINT,
 	                LogicalType::BIGINT,  LogicalType::BIGINT,  LogicalType::BIGINT,  LogicalType::BOOLEAN,
 	                LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BOOLEAN,
-	                LogicalType::UBIGINT, LogicalType::VARCHAR};
+	                LogicalType::UBIGINT, LogicalType::VARCHAR, LogicalType::VARCHAR};
 	auto data = make_uniq<VgiResultCacheListData>();
 	data->entries = VgiResultCache::Instance().Snapshot();
 	// include_disk := true → also walk the on-disk tier so spilled/disk-only entries
@@ -171,6 +171,7 @@ static void VgiResultCacheListScan(ClientContext &, TableFunctionInput &input, D
 		output.SetValue(c++, count, Value::BOOLEAN(e.revalidatable));
 		output.SetValue(c++, count, Value::UBIGINT(e.hits));
 		output.SetValue(c++, count, Value(e.codec));
+		output.SetValue(c++, count, Value(e.partition_label));
 		count++;
 	}
 	output.SetCardinality(count);
@@ -206,11 +207,11 @@ static unique_ptr<FunctionData> VgiResultCacheStatsBind(ClientContext &, TableFu
 	names = {"hits",           "misses",         "inserts",         "evictions_lru",
 	         "evictions_ttl",  "capture_aborts", "entries",         "total_bytes",
 	         "exchange_hits",  "exchange_misses", "exchange_stores", "exchange_revalidations",
-	         "exchange_bytes_served"};
+	         "exchange_bytes_served", "partition_hits", "partition_misses", "partition_stores"};
 	return_types = {LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT,
 	                LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::BIGINT,  LogicalType::BIGINT,
 	                LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT,
-	                LogicalType::UBIGINT};
+	                LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT};
 	auto data = make_uniq<VgiResultCacheStatsData>();
 	data->counters = VgiResultCache::Instance().GetCounters();
 	auto snap = VgiResultCache::Instance().Snapshot();
@@ -243,6 +244,9 @@ static void VgiResultCacheStatsScan(ClientContext &, TableFunctionInput &input, 
 	output.SetValue(col++, 0, Value::UBIGINT(c.exchange_stores));
 	output.SetValue(col++, 0, Value::UBIGINT(c.exchange_revalidations));
 	output.SetValue(col++, 0, Value::UBIGINT(c.exchange_bytes_served));
+	output.SetValue(col++, 0, Value::UBIGINT(c.partition_hits));
+	output.SetValue(col++, 0, Value::UBIGINT(c.partition_misses));
+	output.SetValue(col++, 0, Value::UBIGINT(c.partition_stores));
 	output.SetCardinality(1);
 }
 

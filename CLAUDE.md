@@ -640,6 +640,76 @@ reaper work), `vgi_result_cache(include_disk := true)` (memory **and** disk-only
 `vgi_result_cache_reap(advance_seconds := N)` drives a synchronous, clock-injected reap pass for
 reproducible cleanup tests. Clear with `vgi_result_cache_flush()` (both tiers).
 
+### Per-Partition Result Cache (SINGLE_VALUE_PARTITIONS)
+
+For a `SINGLE_VALUE_PARTITIONS` table function that advertises `vgi.cache.partition_scope` (on the
+first data batch, alongside `vgi.cache.ttl`/etc), the client **additionally** caches the result
+**split by partition value** — one entry per distinct partition-value tuple — so a later `=`/`IN`-
+filtered scan on the partition column(s) reuses per-partition entries populated by earlier scans.
+Purely **additive**: today's whole-scan entry is still stored/served, so full-scan (and identical-
+filter) repeats hit it unchanged — no partition "universe" is ever inferred (the design the user
+picked over a manifest, eliminating any wrong-partition-set serve). Gated by
+`vgi_result_cache_partition_scope` (master) + the per-catalog `cache` opt-out + the worker's opt-in.
+The producer-mode analogue of the exchange **per-value memo**.
+
+**Row-exact serve (correctness anchor).** DuckDB does **not** re-apply a pushed `filter_pushdown`
+predicate above the scan (`physical_table_scan.cpp` `GetDataInternal` returns the function's chunk
+verbatim), so a serve must be row-exact — never a superset. Two consequences: (1) a per-partition
+entry keys on the **non-partition residual** filter (partition predicate stripped; **all-excluded →
+`""`, byte-identical to a full scan** so full+filtered scans share entries), plus projection; (2) the
+requested set must be **exactly enumerable** — only `=` / `IN` / `OR`-of-those on **every** partition
+column yields a finite set (a pushed `IN` arrives wrapped in an `OPTIONAL_FILTER`, unwrapped in
+`ExtractPartitionEqualityValues`). Range/partial/absent partition filters → non-enumerable → no
+per-partition serve (fall through to the whole-scan cache / worker). Ordered/sampled scans are
+excluded (combined concat can't honor a global ORDER BY).
+
+**Key.** Reuses `VgiResultCacheKey::input_hash` with a `p:` prefix (`v:` = per-value, so no
+collision; producer whole-scan keys stay byte-identical when off). The discriminator is
+`sha256(CanonicalPartitionTupleKey(...))` — a `CreateSortKey` over the partition tuple in declared
+order (`vgi_exchange_cache_key.cpp`), computed **identically** by the capture side (decoded partition
+min-values) and the serve side (filter constants); this shared canonicalization is the linchpin.
+
+**Populate.** The gstate-dtor commit (`SplitAndStorePartitionEntries` in `vgi_table_function_impl.cpp`)
+buckets the captured `VgiCachedBatch`es by their decoded `vgi_partition_values` tuple (each batch is
+exactly one partition — SINGLE_VALUE) and `Insert`s one entry per bucket, riding the existing
+never-partial gate (a mid-scan error leaves `eos < launched` → nothing committed, so no partition
+entry can hold an incomplete partition). Spilled/streaming captures skip the split (`store_skipped
+reason=partition_spilled`); transaction-scoped results skip it (catalog-scoped only).
+
+**Serve.** After the whole-scan `Lookup` misses, `VgiTableFunctionInitGlobal` enumerates the requested
+tuples, `LookupBatch`es the N per-partition keys, and on an **all-in-memory hit** synthesizes one
+transient combined `VgiResultCacheEntry` (aggregating the hit entries' batches with **fresh sequential
+`batch_index`** in partition-contiguous order — so `CachedReplayConnection`'s sort keeps each
+partition's batches together, required by `PhysicalPartitionedAggregate`, and the synthetic-index
+regeneration in `InstallBatch` stays monotone). Wired exactly like the normal hit path
+(`serving_from_cache`, `MaxThreads`→1). Any miss / over-cap → `result_cache.partition_miss`, fall
+through (which repopulates). Both transports.
+
+**Scope / limitations (v1).** Per-partition entries are **MEMORY-ONLY** (`allow_disk=false`): the
+combined serve probes only the memory tier (`LookupBatch`), so a disk copy would never be read back —
+and persisting an `input_hash`-keyed entry would wrongly route it into the packed **exchange** disk
+store + its ref-count cap. The whole-scan entry still persists to disk (cross-process warmth of
+full/identical-filter repeats). Enumeration is `=`/`IN`/`OR`-of-those only — note DuckDB rewrites a
+**contiguous-integer** `IN` (e.g. `year IN (2020,2021)`) into a `BETWEEN` range, which is correctly
+non-enumerable (a gap keeps it an `IN_FILTER`). `IS NULL`, ordered/sampled scans, transaction scope,
+and M6 revalidation are out of scope. The **direct `vgi_table_function()` path does NOT split** —
+`partition_column_indices` is resolved only on the catalog-attached bind path — so it uses whole-scan
+caching only. Like the whole producer cache, table-function entries key on worker-path identity (with
+the auth-principal fingerprint folded in, so cross-identity isolation holds) and are TTL-only, so
+`vgi_clear_cache()` (which flushes by catalog alias) doesn't drop them — TTL/worker freshness governs.
+
+**Observability.** `result_cache.{partition_hit,partition_miss,partition_store}` (`duckdb_logs`; plus
+the `partition_too_many` ineligible reason); `vgi_result_cache().partition_label` (`country=US`, empty
+for non-partition entries); `vgi_result_cache_stats().{partition_hits,partition_misses,partition_stores}`.
+**Files.** `vgi_cache_control.hpp` (key), `vgi_result_cache.{hpp,cpp}` (parse/counters/label),
+`vgi_exchange_cache_key.{hpp,cpp}` (`CanonicalPartitionTupleKey`), `vgi_table_function_impl.cpp`
+(`ClassifyPartitionFilters`/`ExtractPartitionEqualityValues`/serve/split; `VgiSerializeFilters`
+`exclude_filter_keys`). vgi-python: `vgi/cache_control.py` (`partition_scope`), fixtures
+`cache_partition_scope` (single-col), `cache_partition_parallel` (work-queue + NULL),
+`cache_partition_multicol`, `cache_partition_proj`. Tests: `test/sql/integration/cache/partition_scope*.test`
+(populate/serve/residual + shapes: parallel/NULL/multi-column/projection + ops: cap/TTL/disk/direct +
+identity isolation; both transports).
+
 ### Exchange-Mode Result Cache (table-in-out / LATERAL / buffered)
 
 The result cache above is producer-mode (table-function) only — its key is **static**
@@ -821,6 +891,8 @@ transport in `src/query_farm_telemetry.cpp`. Full field reference: [docs/telemet
 | `vgi_result_cache_max_entries` | UBIGINT | 131072 | **Entry-count** cap for the in-memory index (0 = unlimited). Bounds unbounded small-entry accumulation that the byte cap alone misses (~700k tiny entries fit under 256 MB); also keeps the reaper / `vgi_result_cache()` O(N) walks small. LRU-evicts oldest above the cap. Read per-query. (Scaling seam **S5**) |
 | `vgi_result_cache_max_inflight_bytes` | UBIGINT | 268435456 (256 MB) | Process-global budget for **in-flight capture** RAM (sum of all concurrently-capturing MISSes' buffered substreams). A capture that would push the total over the budget aborts to uncached (`result_cache.abort reason=inflight_budget`) and keeps streaming to DuckDB — bounds total capture RAM regardless of query concurrency, which the per-entry cap alone can't (N captures peak at N × `max_entry_bytes`). Read per-query. (Scaling seam **S6**) |
 | `vgi_result_cache_disk_reap_interval_seconds` | UBIGINT | 60 | How often the background thread reaps the **disk** tier (expired refs / over-cap eviction / orphan sweep), decoupled from the ~1 s in-memory reap. The disk reap reads every ref + stats every object per pass, so running it every tick is wasteful; expiry is wall-clock, so a coarser cadence is correctness-neutral. (Scaling seam **S7**) |
+| `vgi_result_cache_partition_scope` | BOOLEAN | true | Master switch for the **per-partition result cache** (SINGLE_VALUE_PARTITIONS functions that advertise `vgi.cache.partition_scope`). When on, a cacheable partitioned scan ALSO caches its result split by partition value (one entry per distinct partition-value tuple), so a later `=`/`IN`-filtered scan on the partition column(s) serves the requested partitions from cache without the worker. Additive — the whole-scan entry is still stored/served. See *Per-Partition Result Cache* |
+| `vgi_result_cache_partition_max_enumerated` | UBIGINT | 1024 | Cap on distinct partitions handled per scan by the per-partition cache: bounds both the enumerated `=`/`IN` cross-product at serve time and the distinct-partition count at capture (split) time. Over the cap, the scan falls back to the whole-scan cache / worker |
 
 Catalogs may register additional settings at `ATTACH` time (e.g., `greeting`, `multiplier`).
 
@@ -871,9 +943,9 @@ The `launch:` and `unix://` paths share one warm worker process across every Duc
 | `vgi_github_cache()` | Table | Diagnostic: one row per worker binary cached from a `github://` / `github-auto://` release LOCATION. Columns: `owner`, `repo`, `tag`, `asset`, `digest` (archive SHA256), `dir` (extracted directory), `entrypoint`, `age_seconds`. See [docs/github-transport.md](docs/github-transport.md) |
 | `vgi_github_cache_flush()` | Table | Delete the on-disk GitHub-release worker cache; returns one row with the count of cached releases removed (`flushed`). |
 | `vgi_clear_cache()` | Table | Clear cached catalog metadata (schemas, tables, functions, statistics) for all attached VGI catalogs. Also drops that catalog's **result-cache** entries |
-| `vgi_result_cache(include_disk := false)` | Table | Diagnostic: one row per cached table-function result. Columns: `catalog`, `function`, `key_hash`, `scope`, `attached_data_version`, `implementation_version`, `catalog_version`, `at_unit`, `at_value`, `num_batches`, `num_substreams` (capture-thread count — `> 1` proves parallel capture across workers), `num_rows`, `total_bytes`, `age_seconds`, `ttl_seconds`, `stale`, `tier` (`memory`/`disk`), `etag`, `last_modified`, `revalidatable`, `hits`, `codec` (on-disk compression codec `none`/`zstd`/`lz4`; always `none` for memory-tier rows). Defaults to the **in-memory** tier; `include_disk := true` also walks the on-disk refs so **spilled/disk-only** entries (invisible to the memory index until adopted) are listed with `tier='disk'`. See *Table-Function Result Cache* |
+| `vgi_result_cache(include_disk := false)` | Table | Diagnostic: one row per cached table-function result. Columns: `catalog`, `function`, `key_hash`, `scope`, `attached_data_version`, `implementation_version`, `catalog_version`, `at_unit`, `at_value`, `num_batches`, `num_substreams` (capture-thread count — `> 1` proves parallel capture across workers), `num_rows`, `total_bytes`, `age_seconds`, `ttl_seconds`, `stale`, `tier` (`memory`/`disk`), `etag`, `last_modified`, `revalidatable`, `hits`, `codec` (on-disk compression codec `none`/`zstd`/`lz4`; always `none` for memory-tier rows), `partition_label` (per-partition entry's tuple, e.g. `country=US`; empty for non-partition entries — see *Per-Partition Result Cache*). Defaults to the **in-memory** tier; `include_disk := true` also walks the on-disk refs so **spilled/disk-only** entries (invisible to the memory index until adopted) are listed with `tier='disk'`. See *Table-Function Result Cache* |
 | `vgi_result_cache_flush()` | Table | Clear the in-memory result cache; returns one row with the count of entries flushed (`flushed`) |
-| `vgi_result_cache_stats()` | Table | Diagnostic: process-global aggregate counters (`hits`, `misses`, `inserts`, `evictions_lru`, `evictions_ttl`, `capture_aborts`) + current in-memory `entries` and `total_bytes`, plus **exchange-mode** sub-counters (`exchange_hits`, `exchange_misses`, `exchange_stores`, `exchange_revalidations`, `exchange_bytes_served`) that isolate the input-keyed table-in-out/LATERAL/buffered cache from the producer cache — so an operator can measure exchange hit rate `= (exchange_hits+exchange_revalidations)/(…+exchange_misses)` and the payload not recomputed (`exchange_bytes_served`). The only SQL surface for reaper evictions (which emit no `duckdb_logs` events) and capture aborts |
+| `vgi_result_cache_stats()` | Table | Diagnostic: process-global aggregate counters (`hits`, `misses`, `inserts`, `evictions_lru`, `evictions_ttl`, `capture_aborts`) + current in-memory `entries` and `total_bytes`, plus **exchange-mode** sub-counters (`exchange_hits`, `exchange_misses`, `exchange_stores`, `exchange_revalidations`, `exchange_bytes_served`) that isolate the input-keyed table-in-out/LATERAL/buffered cache from the producer cache — so an operator can measure exchange hit rate `= (exchange_hits+exchange_revalidations)/(…+exchange_misses)` and the payload not recomputed (`exchange_bytes_served`), plus **per-partition** sub-counters (`partition_hits`, `partition_misses`, `partition_stores`) for the SINGLE_VALUE_PARTITIONS cache (see *Per-Partition Result Cache*). The only SQL surface for reaper evictions (which emit no `duckdb_logs` events) and capture aborts |
 | `vgi_result_cache_reap(advance_seconds := 0)` | Table | Run one synchronous cleanup pass over both cache tiers (the work the background reaper does per tick) on the calling thread. First `SyncResultCacheSettings` so a bare `SET vgi_result_cache_*` (disk caps, the exchange ref-count cap) issued just before the call is honored. `advance_seconds` simulates elapsed time so TTL/disk expiry reaps deterministically — the reproducible test seam for cleanup (the reaper is otherwise a 1s wall-clock-keyed thread that emits no `duckdb_logs` events). Returns `memory_reaped`, `disk_refs_removed`. See `test/sql/integration/cache/cleanup.test` |
 | `vgi_oauth_identity()` | Table | OIDC identity per attached VGI catalog: `catalog_name`, `origin`, `authenticated`, `sub`, `email`, `name`, `issuer`, `claims` (JSON). Claims carry the full decoded id_token payload — reach provider-specific fields via e.g. `claims->>'$.preferred_username'` for Entra, `claims->>'$.hd'` for Google Workspace, etc. |
 | `vgi_table_branches()` | Table | Diagnostic: one row per branch per VGI table across every attached VGI catalog. Columns: `catalog_name`, `schema_name`, `table_name`, `branch_index`, `function_name`, `positional_arguments` (JSON), `named_arguments` (JSON), `branch_filter`, `table_required_extensions` (LIST). Used to introspect multi-branch tables. See [docs/multi_branch.md](docs/multi_branch.md). |
