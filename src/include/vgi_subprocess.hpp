@@ -7,6 +7,7 @@
 
 #include "vgi_platform.hpp"
 #if VGI_POSIX_TRANSPORT
+#include <pthread.h> // pthread_sigmask (ScopedForkSignalBlock)
 #include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -35,6 +36,39 @@ namespace vgi {
 //
 // Every call here is async-signal-safe, as required post-fork.
 void ResetChildSignalDispositions();
+
+// Block every signal on the calling thread for the duration of a fork(),
+// restoring the previous mask on scope exit (RAII; also usable explicitly via
+// Restore()).
+//
+// ResetChildSignalDispositions() disarms the inherited handlers as the child's
+// very first statement, but it necessarily runs *after* fork() returns — a
+// signal delivered in that sliver still runs the parent's handler inside the
+// child. That is not hypothetical: a worker torn down immediately after being
+// spawned gets SIGTERM from ~SubProcess while it may still be pre-exec, and
+// under Catch2 the inherited handler prints a full failure report (with the
+// parent's assertion counters, copied at fork) to the host's stdout — a test
+// failure that never happened.
+//
+// Blocking around the fork closes the window: nothing can be delivered until
+// the child has reset dispositions and unblocked, at which point a pending
+// signal takes its DEFAULT action — which is exactly right for a child that was
+// being killed anyway.
+class ScopedForkSignalBlock {
+public:
+	ScopedForkSignalBlock();
+	~ScopedForkSignalBlock();
+	// Restore the saved mask early (idempotent). The parent uses this once the
+	// fork has returned; the child never runs it (it execs or _exits).
+	void Restore() noexcept;
+
+	ScopedForkSignalBlock(const ScopedForkSignalBlock &) = delete;
+	ScopedForkSignalBlock &operator=(const ScopedForkSignalBlock &) = delete;
+
+private:
+	sigset_t saved_;
+	bool active_ = false;
+};
 #endif
 
 // Pipe wrapper for RAII cleanup

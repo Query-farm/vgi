@@ -323,6 +323,8 @@ void MakeExecutable(const std::string &path) {
 
 #if VGI_POSIX_TRANSPORT
 int RunArgvSilent(const std::vector<std::string> &argv) {
+	// See ScopedForkSignalBlock: closes the fork()->reset window.
+	ScopedForkSignalBlock fork_signal_block;
 	pid_t pid = ::fork();
 	if (pid < 0) {
 		return -1;
@@ -343,6 +345,9 @@ int RunArgvSilent(const std::vector<std::string> &argv) {
 		::execv(argv[0].c_str(), c.data());
 		_exit(127);
 	}
+	// Unblock before waiting: the child can run for an arbitrary time and the
+	// host must stay interruptible (Ctrl-C) while it does.
+	fork_signal_block.Restore();
 	int status = 0;
 	::waitpid(pid, &status, 0);
 	return WIFEXITED(status) ? WEXITSTATUS(status) : -1;

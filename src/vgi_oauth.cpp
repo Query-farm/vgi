@@ -620,6 +620,9 @@ void OpenBrowser(const std::string &url) {
 	// below returns at once (no blocking on the browser launcher), and the
 	// grandchild that execs `open` is reparented to init and auto-reaped —
 	// no zombie left in the DuckDB process.
+	// See ScopedForkSignalBlock: closes the fork()->reset window. The grandchild
+	// fork below is already safe — by then dispositions are SIG_DFL.
+	ScopedForkSignalBlock fork_signal_block;
 	pid_t pid = fork();
 	if (pid == 0) {
 		ResetChildSignalDispositions(); // inherited by the grandchild
@@ -631,11 +634,15 @@ void OpenBrowser(const std::string &url) {
 		_exit(0);
 	}
 	if (pid > 0) {
+		fork_signal_block.Restore(); // don't wait with signals masked
 		waitpid(pid, nullptr, 0); // reap the (immediately-exiting) intermediate
 	}
 #elif defined(_WIN32)
 	ShellExecuteA(nullptr, "open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
 #else
+	// See ScopedForkSignalBlock: closes the fork()->reset window. The grandchild
+	// fork below is already safe — by then dispositions are SIG_DFL.
+	ScopedForkSignalBlock fork_signal_block;
 	pid_t pid = fork();
 	if (pid == 0) {
 		ResetChildSignalDispositions(); // inherited by the grandchild
@@ -653,6 +660,7 @@ void OpenBrowser(const std::string &url) {
 		_exit(0);
 	}
 	if (pid > 0) {
+		fork_signal_block.Restore(); // don't wait with signals masked
 		waitpid(pid, nullptr, 0); // reap the (immediately-exiting) intermediate
 	}
 #endif

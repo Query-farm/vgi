@@ -303,6 +303,8 @@ SpawnResult SpawnWorker(const std::vector<std::string> &final_argv,
 		throw IOException("vgi launcher: fcntl(FD_CLOEXEC) failed: %s", std::strerror(saved));
 	}
 
+	// See ScopedForkSignalBlock: closes the fork()->reset window.
+	ScopedForkSignalBlock fork_signal_block;
 	pid_t pid = ::fork();
 	if (pid < 0) {
 		int saved = errno;
@@ -362,6 +364,7 @@ SpawnResult SpawnWorker(const std::vector<std::string> &final_argv,
 	}
 
 	// --- Parent ---
+	fork_signal_block.Restore();
 	::close(pipefd[1]);
 	return {pid, pipefd[0]};
 }

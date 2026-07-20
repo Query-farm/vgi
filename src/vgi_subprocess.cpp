@@ -54,6 +54,28 @@ void ResetChildSignalDispositions() {
 	(void)::sigprocmask(SIG_SETMASK, &empty, nullptr);
 }
 
+ScopedForkSignalBlock::ScopedForkSignalBlock() {
+	sigset_t all;
+	sigfillset(&all);
+	// SIGKILL/SIGSTOP are silently not blockable, which is fine — neither can
+	// run a handler. SIGPIPE is blocked here too and restored on scope exit;
+	// the process-wide SIG_IGN disposition it relies on is untouched.
+	if (::pthread_sigmask(SIG_SETMASK, &all, &saved_) == 0) {
+		active_ = true;
+	}
+}
+
+void ScopedForkSignalBlock::Restore() noexcept {
+	if (active_) {
+		(void)::pthread_sigmask(SIG_SETMASK, &saved_, nullptr);
+		active_ = false;
+	}
+}
+
+ScopedForkSignalBlock::~ScopedForkSignalBlock() {
+	Restore();
+}
+
 // Pipe implementation
 Pipe::Pipe() {
 	int fds[2];
@@ -131,6 +153,9 @@ SubProcess::SubProcess(const std::string &command, bool stderr_passthrough) {
 	Pipe stdout_pipe;
 	Pipe stderr_pipe; // Only used if not passthrough
 
+	// Block signals across the fork so nothing can be delivered to the child
+	// before it resets the host's inherited handlers (see ScopedForkSignalBlock).
+	ScopedForkSignalBlock fork_signal_block;
 	pid_ = fork();
 	if (pid_ < 0) {
 		throw IOException("Failed to fork process");
@@ -173,7 +198,9 @@ SubProcess::SubProcess(const std::string &command, bool stderr_passthrough) {
 		_exit(127); // exec failed
 	}
 
-	// Parent process
+	// Parent process — unblock as soon as the fork has returned; the remaining
+	// setup is ordinary parent-side bookkeeping that must not run masked.
+	fork_signal_block.Restore();
 	stdin_fd_ = stdin_pipe.write_fd;
 	stdin_pipe.write_fd = -1; // Transfer ownership
 
