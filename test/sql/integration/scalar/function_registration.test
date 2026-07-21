@@ -25,7 +25,7 @@ SELECT COUNT(*)
 FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'scalar';
 ----
-45
+49
 
 query T
 SELECT function_name
@@ -41,6 +41,7 @@ binary_packet
 cached_add_const
 cached_double_scalar
 cached_label
+collatz_steps
 concat_values
 concat_values
 conditional_message
@@ -54,6 +55,7 @@ geo_centroid_struct
 geo_distance_fixed
 geo_distance_list
 geo_distance_struct
+hash_rounds
 hash_seed
 multiply
 multiply_by_setting
@@ -61,12 +63,14 @@ null_handling
 pair_type
 pair_type
 pair_type
+passthru
 query_seed
 random_bytes
 random_int
 return_secret_value
 scale_by_setting
 secret_field
+sha256_hex
 smart_format
 smart_format
 sum_values
@@ -388,7 +392,7 @@ SELECT COUNT(*)
 FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'scalar' AND varargs IS NULL;
 ----
-39
+43
 
 # ============================================================================
 # Stability
@@ -412,7 +416,7 @@ SELECT COUNT(*)
 FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'scalar' AND stability = 'CONSISTENT';
 ----
-42
+46
 
 query T
 SELECT function_name
