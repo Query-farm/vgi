@@ -57,6 +57,7 @@ VGI_SIMPLE_WRITABLE_WORKER ?= uv run --project $(HOME)/Development/vgi-python vg
 	test_launcher_cloudflare_do test_launcher_cloudflare_do_debug \
 	test_http_versioned_tables test_http_versioned_tables_debug \
 	test_http_attach_options test_http_attach_options_debug \
+	test_http_no_compression test_http_no_compression_debug \
 	test_writable test_writable_debug \
 	test_simple_writable test_simple_writable_debug \
 	test_docker test_docker_debug \
@@ -289,6 +290,15 @@ test_http_attach_options:
 test_http_attach_options_debug:
 	BUILD_DIR=debug ./test/run_http_attach_options_integration.sh
 
+# HTTP tests against a compression-DISABLED server (make_wsgi_app with
+# compression_level=None), which advertises an EMPTY VGI-Supported-Encodings.
+# Needs its own server because the standard fixture always enables compression.
+test_http_no_compression:
+	./test/run_http_no_compression_integration.sh
+
+test_http_no_compression_debug:
+	BUILD_DIR=debug ./test/run_http_no_compression_integration.sh
+
 # Container (OCI/Docker) transport tests (uses test/run_docker_integration.sh).
 # Skips cleanly when no container runtime is present, so it's safe to run
 # anywhere. Override VGI_DOCKER_IMAGE / CONTAINER_RUNTIME to target a different
@@ -337,9 +347,9 @@ test_simple_writable_debug:
 	VGI_SIMPLE_WRITABLE_WORKER="$(VGI_SIMPLE_WRITABLE_WORKER)" ./build/debug/test/unittest "test/sql/integration/simple_writable/*"
 
 # Run all transports
-test_all: test_subprocess test_shm test_http test_http_bearer test_http_versioned_tables test_http_attach_options
+test_all: test_subprocess test_shm test_http test_http_bearer test_http_versioned_tables test_http_attach_options test_http_no_compression
 
-test_all_debug: test_subprocess_debug test_shm_debug test_http_debug test_http_bearer_debug test_http_versioned_tables_debug test_http_attach_options_debug
+test_all_debug: test_subprocess_debug test_shm_debug test_http_debug test_http_bearer_debug test_http_versioned_tables_debug test_http_attach_options_debug test_http_no_compression_debug
 
 # ---------------------------------------------------------------------------
 # Per-language integration runs

@@ -66,6 +66,19 @@ make test_http_debug
 
 This uses `test/run_http_integration.sh` which starts an HTTP server (`vgi-serve`), waits for it to be ready, runs the tests, and cleans up. Server logs are at `/tmp/vgi-http-test-server.log`.
 
+```bash
+# Run against a server with compression fully disabled (release build)
+make test_http_no_compression
+```
+
+`test/run_http_no_compression_integration.sh` serves the fixture worker through
+`make_wsgi_app(compression_level=None)` (see `test/support/http_no_compression_server.py`).
+That server advertises `VGI-Supported-Encodings` with an **empty** value — the
+positive "I speak no compression", as opposed to an *absent* header, which means
+a pre-update server and is still assumed to speak zstd. The client must downgrade
+request bodies to identity for it; see the renegotiation path in
+`src/vgi_http_client.cpp`. Server logs are at `/tmp/vgi-http-no-compression-server.log`.
+
 **Known HTTP limitations** (these tests fail over HTTP, not regressions):
 - `logging_generator.test` — inline log streaming not supported over HTTP
 - `partitioned_sequence.test` — partition-local state not preserved across HTTP exchanges

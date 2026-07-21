@@ -358,9 +358,13 @@ BindResult HttpFunctionConnection::PerformBindRpc() {
 		auto auth = attach_params_ ? attach_params_->auth() : nullptr;
 		auto cached_params = attach_params_
 		    ? attach_params_->GetOrInitHttpParams(context_, base_url_) : nullptr;
+		// In/out capability snapshot: picks this request's Content-Encoding and
+		// is refreshed from the response (see CurrentCapabilities).
+		ServerCapabilities b_caps = CurrentCapabilities();
 		auto resp = HttpInvokeUnary(context_, base_url_, "bind", rpc_params, auth,
 		                             /*cookie_jar=*/nullptr, cached_params,
-		                             "", "", "", "", "", &http_client_);
+		                             "", "", "", "", "", &http_client_, &b_caps);
+		PublishHarvestedCapabilities(b_caps);
 		if (!resp.batch || resp.batch->num_rows() == 0) {
 			throw IOException("Empty bind response from HTTP server [url: %s]", base_url_);
 		}
@@ -503,7 +507,10 @@ InitResult HttpFunctionConnection::PerformInit(const BindResult &bind_result,
 	    ? attach_params_->GetOrInitHttpParams(context_, init_url) : nullptr;
 #ifdef __EMSCRIPTEN__
 #endif
-	ServerCapabilities harvested;
+	// Seeded from what we already know about this server so the request body's
+	// codec is right on the first try (see CurrentCapabilities); refreshed from
+	// the response below.
+	ServerCapabilities harvested = CurrentCapabilities();
 	auto response_body = HttpPostArrowIpc(context_, init_url, body, auth,
 	                                        /*cookie_jar=*/nullptr, cached_params_init, &http_client_,
 	                                        &harvested);
@@ -700,10 +707,12 @@ HttpFunctionConnection::RpcTableBufferingProcess(const std::string &function_nam
 	auto auth = attach_params_ ? attach_params_->auth() : nullptr;
 	auto cached_params = attach_params_
 	    ? attach_params_->GetOrInitHttpParams(context_, base_url_) : nullptr;
+	ServerCapabilities tb_caps = CurrentCapabilities();
 	auto resp = HttpInvokeUnary(context_, base_url_, "table_buffering_process", rpc_params, auth,
 	                             /*cookie_jar=*/nullptr, cached_params,
 	                             GetExecutionIdHex(), GetAttachOpaqueDataHex(), "", GetConnIdHex(),
-	                             /*protocol_version_override=*/"", &http_client_);
+	                             /*protocol_version_override=*/"", &http_client_, &tb_caps);
+	PublishHarvestedCapabilities(tb_caps);
 	auto inner = DecodeHttpOuterResponse(resp, "table_buffering_process", base_url_);
 	if (!inner || inner->num_rows() == 0) {
 		throw IOException("table_buffering_process response missing data [url: %s]", base_url_);
@@ -722,10 +731,12 @@ HttpFunctionConnection::RpcTableBufferingCombine(const std::string &function_nam
 	auto auth = attach_params_ ? attach_params_->auth() : nullptr;
 	auto cached_params = attach_params_
 	    ? attach_params_->GetOrInitHttpParams(context_, base_url_) : nullptr;
+	ServerCapabilities tb_caps = CurrentCapabilities();
 	auto resp = HttpInvokeUnary(context_, base_url_, "table_buffering_combine", rpc_params, auth,
 	                             /*cookie_jar=*/nullptr, cached_params,
 	                             GetExecutionIdHex(), GetAttachOpaqueDataHex(), "", GetConnIdHex(),
-	                             /*protocol_version_override=*/"", &http_client_);
+	                             /*protocol_version_override=*/"", &http_client_, &tb_caps);
+	PublishHarvestedCapabilities(tb_caps);
 	auto inner = DecodeHttpOuterResponse(resp, "table_buffering_combine", base_url_);
 	if (!inner || inner->num_rows() == 0) {
 		throw IOException("table_buffering_combine response missing data [url: %s]", base_url_);
@@ -750,10 +761,12 @@ void HttpFunctionConnection::RpcTableBufferingDestructor(const std::string &func
 	auto auth = attach_params_ ? attach_params_->auth() : nullptr;
 	auto cached_params = attach_params_
 	    ? attach_params_->GetOrInitHttpParams(context_, base_url_) : nullptr;
+	ServerCapabilities tb_caps = CurrentCapabilities();
 	auto resp = HttpInvokeUnary(context_, base_url_, "table_buffering_destructor", rpc_params, auth,
 	                             /*cookie_jar=*/nullptr, cached_params,
 	                             GetExecutionIdHex(), GetAttachOpaqueDataHex(), "", GetConnIdHex(),
-	                             /*protocol_version_override=*/"", &http_client_);
+	                             /*protocol_version_override=*/"", &http_client_, &tb_caps);
+	PublishHarvestedCapabilities(tb_caps);
 	auto inner = DecodeHttpOuterResponse(resp, "table_buffering_destructor", base_url_);
 	(void)inner;
 }
@@ -803,7 +816,7 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 		auto p_auth = attach_params_ ? attach_params_->auth() : nullptr;
 		auto p_cached_params = attach_params_
 		    ? attach_params_->GetOrInitHttpParams(context_, exchange_url) : nullptr;
-		ServerCapabilities p_harvested;
+		ServerCapabilities p_harvested = CurrentCapabilities();
 		auto response_body = HttpPostArrowIpc(context_, exchange_url, body, p_auth,
 		                                        /*cookie_jar=*/nullptr, p_cached_params, &http_client_,
 		                                        &p_harvested);
@@ -877,7 +890,7 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 	auto x_auth = attach_params_ ? attach_params_->auth() : nullptr;
 	auto x_cached_params = attach_params_
 	    ? attach_params_->GetOrInitHttpParams(context_, exchange_url) : nullptr;
-	ServerCapabilities x_harvested;
+	ServerCapabilities x_harvested = CurrentCapabilities();
 	auto response_body = HttpPostArrowIpc(context_, exchange_url, body, x_auth,
 	                                        /*cookie_jar=*/nullptr, x_cached_params, &http_client_,
 	                                        &x_harvested);

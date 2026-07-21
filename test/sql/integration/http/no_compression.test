@@ -1,0 +1,76 @@
+# name: test/sql/integration/http/no_compression.test
+# description: HTTP transport works against a server that advertises NO compression
+# group: [vgi_integration_http]
+#
+# Driven by test/run_http_no_compression_integration.sh, which serves the
+# fixture worker through make_wsgi_app(compression_level=None). Such a server
+# stamps ``VGI-Supported-Encodings`` with an EMPTY value — the positive
+# statement "I speak no compression" — and installs no decompressor at all.
+#
+# The empty advertisement is deliberately distinct from an ABSENT header (a
+# pre-update server, still assumed to speak zstd). Collapsing the two used to
+# make this server unusable: the client kept compressing request bodies over
+# 1 KiB, and the server died parsing them with
+# ``Invalid IPC stream: negative continuation token`` (HTTP 500).
+#
+# Note the server cannot answer 415 for a body it can't decode — it fails
+# while parsing it — so recovery cannot be keyed on a status code. It is keyed
+# on the capability header, which rides every response including errors.
+
+require-env VGI_TEST_WORKER
+
+require-env VGI_HTTP_NO_COMPRESSION
+
+require vgi
+
+require httpfs
+
+# The runner's default ignore_error_messages is {"HTTP", "Unable to connect"},
+# which would SKIP this test the moment a regression reappeared — the failure
+# mode being tested is literally an HTTP 500. Clear the list so any error here
+# is a hard failure. The harness guarantees the server is up.
+set ignore_error_messages
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+# catalog_attach's own request body is already over the 1 KiB threshold below
+# which the client never compresses, so this statement is itself a regression
+# test: pre-fix it failed outright with HTTP 500.
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# Scalar over enough rows that every exchange body is far above the 1 KiB
+# small-body threshold — i.e. bodies the client WOULD have compressed.
+query I
+SELECT sum(example.double(i)) FROM range(4000) t(i);
+----
+15996000
+
+query I
+SELECT count(*) > 0 FROM example.data.cacheable_numbers;
+----
+true
+
+# Load-bearing: nothing went out compressed. Once the empty advertisement has
+# been seen, every request body is identity — no Content-Encoding header at
+# all, never a literal "identity" token.
+query I
+SELECT COUNT(*) FROM duckdb_logs()
+WHERE type = 'VGI' AND message LIKE '%http.response%' AND message NOT LIKE '%req_encoding=none%';
+----
+0
+
+# ...and the traffic above really did flow (guards against the assertion
+# passing because no HTTP request was logged at all).
+query I
+SELECT COUNT(*) > 0 FROM duckdb_logs()
+WHERE type = 'VGI' AND message LIKE '%http.response%' AND message LIKE '%req_encoding=none%';
+----
+true
+
+statement ok
+DETACH example;

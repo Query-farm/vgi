@@ -202,6 +202,18 @@ private:
 	// /health probe as a last-resort fallback in ReadDataBatch.
 	ServerCapabilities capabilities_;
 
+	// Best snapshot we currently have for this server, for seeding a request's
+	// in/out capability slot — that is what lets HttpPostArrowIpc pick the
+	// right request Content-Encoding up front (identity for a server that
+	// advertised no codecs) instead of discovering it from a rejection. Falls
+	// back to the per-catalog cache the first time this connection asks.
+	ServerCapabilities CurrentCapabilities() {
+		if (!capabilities_.discovered && attach_params_) {
+			capabilities_ = attach_params_->LoadServerCapabilities();
+		}
+		return capabilities_;
+	}
+
 	// Publish freshly-harvested capabilities to this connection and (when
 	// attached) the per-catalog cache, so sibling connections start warm.
 	void PublishHarvestedCapabilities(const ServerCapabilities &caps) {

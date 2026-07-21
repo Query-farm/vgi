@@ -27,9 +27,9 @@ static constexpr const char *kSupportedEncodingsHeader = "VGI-Supported-Encoding
 
 // Comma-joined list of codecs we can produce / decode, in our preference
 // order — sent on every request so the server can pick a codec for its
-// response.  When the chosen request codec doesn't match the server's
-// advertised set, the server returns 415 and the caller can re-pick from
-// the ``VGI-Supported-Encodings`` header it carries back.
+// response.  The reverse direction (what the server accepts on REQUEST
+// bodies) is the ``VGI-Supported-Encodings`` header it stamps on every
+// response; see the renegotiation path in HttpPostArrowIpcInternal.
 static std::string ClientAcceptEncoding() {
 	return "zstd, gzip";
 }
@@ -124,6 +124,10 @@ static std::vector<std::string> CollectSetCookieHeaders(const HTTPResponse &resp
 	return out;
 }
 
+// Forward declarations — defined below with the capability-header parsing.
+static ServerCapabilities ParseCapabilityHeaders(const HTTPResponse &response);
+static bool HasCapabilityHeaders(const HTTPResponse &response);
+
 // Internal: perform a single HTTP POST with optional auth header.
 //
 // cached_http_params: when non-null, use it instead of calling
@@ -131,21 +135,12 @@ static std::vector<std::string> CollectSetCookieHeaders(const HTTPResponse &resp
 // secret manager (which takes the MetaTransaction mutex) on every request —
 // required for HTTP RPCs invoked from VgiTransaction::Start to not deadlock.
 // TODO(#22258): drop when https://github.com/duckdb/duckdb/issues/22258 is fixed.
-// Pick the first encoding from ``offered`` that we can also produce.  Falls
-// back to GZIP (always available; the C++ side links miniz unconditionally)
-// when no overlap exists — the caller has nothing left to retry with anyway.
-static HttpEncoding PickAlternateEncoding(const std::vector<HttpEncoding> &offered, HttpEncoding tried) {
-	for (auto enc : offered) {
-		if (enc != tried && enc != HttpEncoding::NONE) {
-			return enc;
-		}
-	}
-	return tried == HttpEncoding::ZSTD ? HttpEncoding::GZIP : HttpEncoding::ZSTD;
-}
-
-// Forward declaration — defined below with the capability-header parsing.
-static ServerCapabilities ParseCapabilityHeaders(const HTTPResponse &response);
-
+//
+// request_encoding: codec for the body, chosen by the caller from the
+// capabilities harvested so far. When the server turns out not to accept it,
+// the renegotiate-and-retry path below re-encodes once (gated by
+// allow_codec_retry so a retry can't recurse).
+// harvested_caps: in/out — refreshed from this response's capability headers.
 static std::string HttpPostArrowIpcInternal(ClientContext &context,
                                              const std::string &url,
                                              const std::vector<uint8_t> &body,
@@ -184,10 +179,12 @@ static std::string HttpPostArrowIpcInternal(ClientContext &context,
 		request_encoding = HttpEncoding::NONE;
 	}
 
-	// Compress the request body with the chosen codec.  Default zstd matches
-	// every existing VGI server; a future gzip-only server is recovered via
-	// the 415-retry path below using ``VGI-Supported-Encodings``.  The NONE
-	// path posts ``body`` directly — no copy.
+	// Compress the request body with the chosen codec.  The caller picked it
+	// from whatever ``VGI-Supported-Encodings`` we have already harvested for
+	// this server (zstd when nothing is known yet — the pre-update default);
+	// a server that turns out not to accept it is recovered by the
+	// renegotiate-and-retry path below.  The NONE path posts ``body``
+	// directly — no copy.
 	std::vector<uint8_t> compressed_body;
 	const uint8_t *req_body_data = body.data();
 	size_t req_body_size = body.size();
@@ -217,6 +214,20 @@ static std::string HttpPostArrowIpcInternal(ClientContext &context,
 	                     reinterpret_cast<const_data_ptr_t>(req_body_data),
 	                     static_cast<idx_t>(req_body_size));
 
+	// Hand failed responses back to us instead of letting HTTPUtil throw its
+	// generic HTTPException. Two reasons, both about the response HEADERS:
+	//   1) the VGI capability headers (VGI-Supported-Encodings and friends)
+	//      ride on EVERY response, errors included — that is precisely the
+	//      signal we need when the failure IS a codec mismatch, and a thrown
+	//      HTTPException buries it in an extra-info map.
+	//   2) the error-reporting block below already knows how to decode a VGI
+	//      error batch into the worker's own message; without this it only ever
+	//      ran for non-retryable statuses (HTTPResponse::ShouldRetry treats
+	//      408/418/429/500/503/504 as retryable and those threw instead).
+	// Retry/backoff behaviour is unchanged — try_request only replaces the
+	// terminal throw with a returned response.
+	post.try_request = true;
+
 	// When the caller supplies a client holder, reuse its keep-alive HTTP
 	// client (and TCP connection) across calls; the 2-arg overload creates
 	// the client lazily on first use and refreshes it on retry. Otherwise
@@ -237,29 +248,68 @@ static std::string HttpPostArrowIpcInternal(ClientContext &context,
 		}
 	}
 
+	// Harvest server capabilities off this response — ANY response, whatever
+	// its status. The server middleware stamps the capability headers on every
+	// one, so callers that pass a harvest slot learn ServerCapabilities from
+	// traffic they were already generating (no separate HEAD /health probe),
+	// and — the reason this runs before the status handling below — a failure
+	// caused by a codec the server can't decode still tells us which codecs it
+	// can. Responses with no VGI capability header at all (a proxy error page,
+	// a non-VGI endpoint) are ignored rather than cached as "server advertises
+	// nothing", which would be indistinguishable from a real answer.
+	ServerCapabilities response_caps;
+	if (HasCapabilityHeaders(*out_response)) {
+		response_caps = ParseCapabilityHeaders(*out_response);
+		if (harvested_caps) {
+			*harvested_caps = response_caps;
+		}
+	}
+
 	if (out_response->status == HTTPStatusCode::Unauthorized_401) {
 		// Return empty — caller handles 401
 		return "";
 	}
 
-	// 415-retry: the codec we picked isn't enabled on this server.  When the
-	// response carries ``VGI-Supported-Encodings`` (stamped on every response
-	// by ``_CapabilitiesMiddleware``), re-pick and retry once.  This is the
-	// forward-compat hook for "first call against a gzip-only server" —
-	// before caps are discovered we default to zstd, and gzip-only servers
-	// reject with 415 + the right header.
-	if (out_response->status == HTTPStatusCode::UnsupportedMediaType_415 && allow_codec_retry &&
-	    out_response->HasHeader(kSupportedEncodingsHeader)) {
-		auto offered = ParseAcceptList(out_response->GetHeaderValue(kSupportedEncodingsHeader));
-		if (!offered.empty()) {
-			auto alternate = PickAlternateEncoding(offered, request_encoding);
-			if (alternate != request_encoding) {
-				return HttpPostArrowIpcInternal(context, url, body, bearer_token, cookie_jar,
-				                                 out_response, cached_http_params, alternate,
-				                                 /*allow_codec_retry=*/false, client_holder,
-				                                 harvested_caps);
-			}
+	// Codec renegotiation: the request failed and the server just told us which
+	// content encodings it accepts — and ours isn't one of them. Re-encode and
+	// retry once. Covers both directions of the mismatch:
+	//   * a gzip-only server (advertises "gzip", 415s our zstd body), and
+	//   * a compression-disabled server, which advertises the header with an
+	//     EMPTY value. That is a positive "I speak no compression", distinct
+	//     from an absent header (a pre-update server, still assumed zstd), and
+	//     routes us into the same identity path small bodies already take: post
+	//     the bytes verbatim with no Content-Encoding header at all. Such a
+	//     server has no decompressor, so it can't answer 415 — it fails while
+	//     parsing the body (HTTP 500) — which is why this is keyed on the
+	//     capability header rather than on a particular status code.
+	// Only fires when the codec we used is genuinely unacceptable, so a request
+	// the server did decode and then failed on is never re-sent.
+	//
+	// Cost note: recovery here is the fallback, not the steady state. The
+	// harvested snapshot is cached per catalog (ServerCapabilitiesCache), so a
+	// compression-disabled server costs one rejected request for the whole
+	// ATTACH — and, because 500 is retryable, HTTPUtil burns its own retry
+	// budget on that one before handing it back (~0.5 s of backoff, once).
+	// Everything after it goes out as identity on the first try.
+	if (allow_codec_retry && !out_response->Success() && response_caps.discovered &&
+	    !ServerAcceptsRequestEncoding(response_caps, request_encoding)) {
+		auto alternate = ChooseRequestEncoding(response_caps);
+		if (alternate != request_encoding) {
+			return HttpPostArrowIpcInternal(context, url, body, bearer_token, cookie_jar,
+			                                 out_response, cached_http_params, alternate,
+			                                 /*allow_codec_retry=*/false, client_holder,
+			                                 harvested_caps);
 		}
+	}
+
+	// Transport-level failure (connection refused, timeout, cancellation): with
+	// try_request set, HTTPUtil hands these back as a response carrying a
+	// request error rather than throwing. There is no HTTP status or body to
+	// report, so surface the transport error directly instead of falling into
+	// the status-code formatting below.
+	if (out_response->HasRequestError()) {
+		throw IOException("VGI HTTP request failed (transport error): %s [url: %s]",
+		                  out_response->GetError(), url);
 	}
 
 	if (!out_response->Success()) {
@@ -342,14 +392,6 @@ static std::string HttpPostArrowIpcInternal(ClientContext &context,
 		    content_type.empty() ? "" : " Content-Type=",
 		    content_type,
 		    body_preview.empty() ? out_response->GetError() : body_preview, url);
-	}
-
-	// Harvest server capabilities off this (successful) response. The server
-	// middleware stamps the capability headers on every response, so callers
-	// that pass a harvest slot learn ServerCapabilities from traffic they were
-	// already generating — no separate HEAD /health probe round trip.
-	if (harvested_caps) {
-		*harvested_caps = ParseCapabilityHeaders(*out_response);
 	}
 
 	// In the browser (WASM), fetch/XHR transparently decompresses any STANDARD
@@ -474,9 +516,16 @@ std::string HttpPostArrowIpc(ClientContext &context,
 		token = auth->GetToken();
 	}
 
+	// ``harvested_caps`` is in/out: a discovered snapshot on the way in picks
+	// the request codec (so a server that already told us it speaks no
+	// compression is never sent a compressed body again), and it is refreshed
+	// from this response's capability headers on the way out.
+	const HttpEncoding request_encoding =
+	    harvested_caps ? ChooseRequestEncoding(*harvested_caps) : HttpEncoding::ZSTD;
+
 	std::unique_ptr<HTTPResponse> response;
 	auto result = HttpPostArrowIpcInternal(context, url, body, token, cookie_jar, response, cached_http_params,
-	                                       HttpEncoding::ZSTD, /*allow_codec_retry=*/true, client_holder,
+	                                       request_encoding, /*allow_codec_retry=*/true, client_holder,
 	                                       harvested_caps);
 
 	if (response->status != HTTPStatusCode::Unauthorized_401) {
@@ -534,8 +583,8 @@ std::string HttpPostArrowIpc(ClientContext &context,
 
 	// Retry with new token
 	result = HttpPostArrowIpcInternal(context, url, body, new_token, cookie_jar, response, cached_http_params,
-	                                  HttpEncoding::ZSTD, /*allow_codec_retry=*/true, client_holder,
-	                                  harvested_caps);
+	                                  harvested_caps ? ChooseRequestEncoding(*harvested_caps) : request_encoding,
+	                                  /*allow_codec_retry=*/true, client_holder, harvested_caps);
 	if (response->status == HTTPStatusCode::Unauthorized_401) {
 		throw IOException("VGI HTTP authentication failed after auth flow (HTTP 401) [url: %s]. "
 		                  "Response: %s", url, response->body);
@@ -556,7 +605,8 @@ UnaryResponseResult HttpInvokeUnary(ClientContext &context,
                                      const std::string &transaction_opaque_data_hex,
                                      const std::string &conn_id_hex,
                                      const std::string &protocol_version_override,
-                                     duckdb::unique_ptr<HTTPClient> *client_holder) {
+                                     duckdb::unique_ptr<HTTPClient> *client_holder,
+                                     ServerCapabilities *caps) {
 	std::string base_url = NormalizeBaseUrl(worker_path);
 	std::string url = base_url + "/" + method_name;
 
@@ -579,7 +629,7 @@ UnaryResponseResult HttpInvokeUnary(ClientContext &context,
 
 	// POST to {worker_path}/{method_name} using standard HTTP timeout
 	auto response_body = HttpPostArrowIpc(context, url, body, auth, cookie_jar, cached_http_params,
-	                                       client_holder);
+	                                       client_holder, caps);
 
 	// Parse the Arrow IPC response. Move the body in — the string becomes the
 	// owning Arrow buffer, avoiding an alloc+memcpy of the whole payload.
@@ -819,6 +869,16 @@ static std::chrono::seconds ParseCacheControlMaxAge(const HTTPResponse &response
 	return std::chrono::seconds(0);
 }
 
+// Did this response come from something that speaks the VGI capability
+// contract at all? Used to gate the harvest-off-every-response path: an error
+// page synthesized by an intermediary carries none of these headers, and
+// caching it as a discovered snapshot would look identical to a server that
+// genuinely advertises nothing.
+static bool HasCapabilityHeaders(const HTTPResponse &response) {
+	return response.HasHeader(kSupportedEncodingsHeader) || response.HasHeader("VGI-Max-Request-Bytes") ||
+	       response.HasHeader("VGI-Upload-URL-Support") || response.HasHeader("VGI-Max-Upload-Bytes");
+}
+
 // Parse capability headers from an HTTP response (set by middleware on every response).
 static ServerCapabilities ParseCapabilityHeaders(const HTTPResponse &response) {
 	ServerCapabilities caps;
@@ -837,7 +897,12 @@ static ServerCapabilities ParseCapabilityHeaders(const HTTPResponse &response) {
 			caps.max_upload_bytes = std::stoll(response.GetHeaderValue("VGI-Max-Upload-Bytes"));
 		} catch (...) {}
 	}
-	if (response.HasHeader(kSupportedEncodingsHeader)) {
+	// Three-valued, and the empty case matters: an absent header is a
+	// pre-update server (assume zstd), whereas a present-but-empty one is the
+	// server stating it speaks no compression. ParseAcceptList("") yields an
+	// empty vector for both, so record the presence separately.
+	caps.encodings_advertised = response.HasHeader(kSupportedEncodingsHeader);
+	if (caps.encodings_advertised) {
 		caps.supported_encodings = ParseAcceptList(response.GetHeaderValue(kSupportedEncodingsHeader));
 	}
 

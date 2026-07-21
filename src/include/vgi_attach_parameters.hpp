@@ -196,12 +196,17 @@ public:
 	// starts warm instead of paying a HEAD /health probe. Returns a copy
 	// with discovered=false when nothing has been harvested yet.
 	void StoreServerCapabilities(const ServerCapabilities &caps) const {
-		std::lock_guard<std::mutex> lock(server_caps_mutex_);
-		cached_server_caps_ = caps;
+		server_caps_->Store(caps);
 	}
 	ServerCapabilities LoadServerCapabilities() const {
-		std::lock_guard<std::mutex> lock(server_caps_mutex_);
-		return cached_server_caps_;
+		return server_caps_->Load();
+	}
+	// The same snapshot as a shareable handle, for call paths that don't hold
+	// the VgiAttachParameters itself (the unary catalog RPCs, which take a
+	// plain UnaryRpcOptions). Handing out the holder rather than a copy is what
+	// lets a codec downgrade learned by one path apply to the others.
+	const std::shared_ptr<ServerCapabilitiesCache> &server_caps() const {
+		return server_caps_;
 	}
 
 	// Lazy-initialized per-catalog keep-alive HTTP client pool for unary RPCs
@@ -232,8 +237,9 @@ private:
 	mutable std::atomic<int> branches_capability_{0};
 
 	// HTTP ServerCapabilities snapshot. See Store/LoadServerCapabilities above.
-	mutable std::mutex server_caps_mutex_;
-	mutable ServerCapabilities cached_server_caps_;
+	// Held by shared_ptr (not by value) so the unary catalog-RPC path can share
+	// the very same holder; never null.
+	std::shared_ptr<ServerCapabilitiesCache> server_caps_ = std::make_shared<ServerCapabilitiesCache>();
 
 	// Keep-alive HTTP client pool for unary RPCs. Guarded by
 	// http_params_mutex_ for lazy init (same tiny critical section).

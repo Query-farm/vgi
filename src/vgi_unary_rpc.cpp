@@ -154,12 +154,24 @@ UnaryResponseResult InvokePooledUnaryRpc(const UnaryRpcOptions &opts, const std:
 		if (opts.http_client_pool) {
 			pooled = opts.http_client_pool->Checkout();
 		}
+		// Carry the catalog's capability snapshot in and back out. In: it picks
+		// the request codec, so a server that advertised no compression gets an
+		// identity body on the FIRST try instead of a rejected compressed one.
+		// Out: refreshed from this response's capability headers.
+		ServerCapabilities caps;
+		if (opts.server_caps) {
+			caps = opts.server_caps->Load();
+		}
 		auto result = HttpInvokeUnary(opts.context, opts.worker_path, method_name, params, opts.auth,
 		                              opts.cookie_jar, opts.cached_http_params,
 		                              /*invocation_id_hex=*/"", /*attach_opaque_data_hex=*/"",
 		                              /*transaction_opaque_data_hex=*/"", /*conn_id_hex=*/"",
 		                              opts.protocol_version_override.value_or(""),
-		                              opts.http_client_pool ? &pooled : nullptr);
+		                              opts.http_client_pool ? &pooled : nullptr,
+		                              opts.server_caps ? &caps : nullptr);
+		if (opts.server_caps) {
+			opts.server_caps->Store(caps);
+		}
 		if (opts.http_client_pool) {
 			opts.http_client_pool->Return(std::move(pooled));
 		}

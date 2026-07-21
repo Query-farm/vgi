@@ -44,6 +44,11 @@ constexpr const char *ARROW_IPC_CONTENT_TYPE = "application/vnd.apache.arrow.str
 // client_holder: optional caller-owned keep-alive HTTP client (see
 // HttpPostArrowIpc). Same contract: one base URL per holder, never shared
 // across threads. Null = fresh connection per call (previous behavior).
+// caps: optional IN/OUT ServerCapabilities snapshot, forwarded verbatim to
+// HttpPostArrowIpc — see its contract. Callers with a per-catalog
+// ServerCapabilitiesCache should load into a local, pass it, and store it back,
+// so the codec choice (in particular "this server takes identity bodies only")
+// is learned once per catalog instead of once per RPC.
 UnaryResponseResult HttpInvokeUnary(ClientContext &context,
                                      const std::string &worker_path,
                                      const std::string &method_name,
@@ -56,7 +61,8 @@ UnaryResponseResult HttpInvokeUnary(ClientContext &context,
                                      const std::string &transaction_opaque_data_hex = "",
                                      const std::string &conn_id_hex = "",
                                      const std::string &protocol_version_override = "",
-                                     duckdb::unique_ptr<HTTPClient> *client_holder = nullptr);
+                                     duckdb::unique_ptr<HTTPClient> *client_holder = nullptr,
+                                     ServerCapabilities *caps = nullptr);
 
 // Small thread-safe pool of keep-alive HTTPClients for unary RPCs against ONE
 // base URL (a pool instance lives on a catalog's VgiAttachParameters, whose
@@ -111,10 +117,16 @@ private:
 // holder that is used exclusively for one base_url (e.g. a per-connection
 // member), and NEVER share it across threads (HTTPClient is not thread-safe).
 // Null (the default) preserves the previous fresh-connection-per-call behavior.
-// harvested_caps: when non-null, filled from the capability headers the server
-// middleware stamps on every response (successful responses only). Lets
-// callers discover ServerCapabilities from traffic they already generate
-// instead of paying a separate HEAD /health round trip per connection.
+// harvested_caps: when non-null, an IN/OUT snapshot of what this server can do.
+// On the way in, a discovered snapshot selects the request body's
+// Content-Encoding — notably, a server that advertised an EMPTY
+// VGI-Supported-Encodings (it speaks no compression) gets identity bodies. On
+// the way out it is refreshed from the capability headers the server middleware
+// stamps on every response, whatever its status, so callers discover
+// ServerCapabilities from traffic they already generate instead of paying a
+// separate HEAD /health round trip per connection. Pass the same per-catalog
+// snapshot (see ServerCapabilitiesCache) on every call to keep the codec
+// choice warm.
 std::string HttpPostArrowIpc(ClientContext &context,
                               const std::string &url,
                               const std::vector<uint8_t> &body,

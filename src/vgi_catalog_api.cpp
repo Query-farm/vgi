@@ -221,6 +221,10 @@ static UnaryResponseResult InvokeRpcMethod(const CatalogRpcContext &ctx, const s
 			// Keep-alive client pool: consecutive catalog RPCs reuse TCP/TLS
 			// connections instead of handshaking per call.
 			opts.http_client_pool = ctx.params->GetOrInitHttpClientPool();
+			// Share the catalog's capability snapshot with the streaming
+			// connections: whichever path first sees the server's
+			// VGI-Supported-Encodings settles the codec for both.
+			opts.server_caps = ctx.params->server_caps();
 		}
 		// Forward launcher overrides for `launch:` LOCATIONs.  Empty
 		// optionals on every other transport — no per-call cost.
