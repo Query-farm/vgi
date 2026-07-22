@@ -8,7 +8,7 @@
 // (sab_double / sab_echo / sab_sum / sab_big). Result on window.__result/__done.
 //   Serve:  VGI_ENTRY=test-features.mjs node serve.mjs 8799
 import * as duckdb from './duckdb-browser.mjs';
-import { installVgiWebWorkerBridge } from './vgi-webworker-bridge.ts';
+import { installVgiWebWorkerBridge } from './vgi-webworker-bridge.mjs';
 
 // Page-side geolocation responder — ships WITH the worker example, NOT the shared bridge.
 // navigator.geolocation is a Window-only API (absent in any Worker realm), so the worker

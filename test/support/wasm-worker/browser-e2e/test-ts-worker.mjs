@@ -4,7 +4,7 @@
 // vgi-rpc's serveStream over each SAB slot via an Atomics.waitAsync dispatcher.
 //   VGI_ENTRY=test-ts-worker.mjs node serve.mjs 8799
 import * as duckdb from './duckdb-browser.mjs';
-import { installVgiWebWorkerBridge } from './vgi-webworker-bridge.ts';
+import { installVgiWebWorkerBridge } from './vgi-webworker-bridge.mjs';
 
 const out = document.getElementById('out');
 const log = (m) => { out.textContent += m + '\n'; };

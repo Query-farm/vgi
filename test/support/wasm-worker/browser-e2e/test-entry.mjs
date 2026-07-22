@@ -7,7 +7,7 @@
 //   4. multi-threaded: 4 concurrent worker: scans on separate connections
 // Results land on window.__result / window.__done for the puppeteer runner.
 import * as duckdb from './duckdb-browser.mjs';
-import { installVgiWebWorkerBridge } from './vgi-webworker-bridge.ts';
+import { installVgiWebWorkerBridge } from './vgi-webworker-bridge.mjs';
 
 const out = document.getElementById('out');
 const log = (m) => { out.textContent += m + '\n'; };

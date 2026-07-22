@@ -17,7 +17,7 @@ const BINDINGS = join(HAYBARN, 'packages/duckdb-wasm/src/bindings');
 const NM = join(HAYBARN, 'node_modules');
 const VER_DIR = process.env.VGI_ENGINE_VERSION_DIR || 'unknown';
 const EXT = process.env.VGI_EXT_WASM || join(HAYBARN, 'extensions/v1.5.4/wasm_threads/vgi.duckdb_extension.wasm');
-const BRIDGE = join(HAYBARN, 'packages/duckdb-wasm-app/src/lib/vgi-webworker-bridge.ts');
+const BRIDGE = join(HAYBARN, 'packages/duckdb-wasm/dist/duckdb-browser-vgi.mjs');
 const PORT = process.argv[2] || '8799';
 
 const dir = mkdtempSync(join(tmpdir(), 'vgi-worker-serve-'));
@@ -26,7 +26,7 @@ for (const f of ['duckdb-browser.mjs', 'duckdb-browser-coi.worker.js', 'duckdb-b
 copyFileSync(join(BINDINGS, 'duckdb-coi.wasm'), join(dir, 'duckdb-coi.wasm'));
 for (const f of ['vgi_worker.js', 'vgi_worker.wasm', 'vgi-worker-boot.js', 'ts-worker-boot.js', 'ts-worker-mod.js'])
   copyFileSync(join(HERE, '..', f), join(dir, f));
-copyFileSync(BRIDGE, join(dir, 'vgi-webworker-bridge.ts'));
+copyFileSync(BRIDGE, join(dir, 'vgi-webworker-bridge.mjs'));
 copyFileSync(join(HERE, 'index.html'), join(dir, 'index.html'));
 // VGI_ENTRY overrides the bundled entry (default test-entry.mjs) — used to run a
 // standalone probe (e.g. probe-throw.mjs) without touching the main suite.

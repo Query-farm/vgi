@@ -34,7 +34,7 @@
 // then open http://127.0.0.1:<port>/index.html in a cross-origin-isolated browser
 // (COI headers are served by coi-server.py). Result lands on window.__result.
 import * as duckdb from './duckdb-browser.mjs';
-import { installVgiWebWorkerBridge } from './vgi-webworker-bridge.ts';
+import { installVgiWebWorkerBridge } from './vgi-webworker-bridge.mjs';
 
 const out = document.getElementById('out');
 const log = (m) => { out.textContent += m + '\n'; };
@@ -46,7 +46,7 @@ const to = (ms, t) => new Promise((_, rej) => setTimeout(() => rej(new Error('__
 
 // Raw SAB channel readout (slot STATE + ring positions the transport itself writes —
 // no instrumentation). OPTIONAL: to enable it, add one line to
-// vgi-webworker-bridge.ts inside the `vgi-ensure-worker` handler:
+// vgi-webworker-bridge.mjs inside the `vgi-ensure-worker` handler:
 //   globalThis.__vgiDiag = { buffer: d.buffer, offset: d.offset };
 // Without it the engine-frozen proof (the load-bearing evidence) still works;
 // only the "transport is clean" channel detail is skipped.
