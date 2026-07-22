@@ -112,17 +112,57 @@ struct VgiLateralBatchGlobalState : public GlobalOperatorState {
 };
 
 struct VgiLateralBatchOperatorState : public OperatorState {
-	VgiLateralBatchOperatorState(ClientContext &context, const std::vector<uint8_t> &substream_id)
-	    : client_context(context), substream_id(substream_id),
+	VgiLateralBatchOperatorState(ClientContext &context, const std::vector<uint8_t> &substream_id,
+	                             const VgiTableInOutBindData &bind_data)
+	    : client_context(context), bind_data(&bind_data), substream_id(substream_id),
 	      scan(make_uniq<ArrowArrayWrapper>(), context),
 	      serve_scan(make_uniq<ArrowArrayWrapper>(), context) {
 	}
 	~VgiLateralBatchOperatorState() override {
-		// Mid-stream worker (no finalize map) is never pooled — just drop it.
-		connection.reset();
+		ShutdownConnection();
+	}
+
+	// Close the stream cleanly and hand the worker back to the pool. This used to
+	// just drop the connection, on the theory that a worker left mid-stream can
+	// never be reused — but the operator can END the stream, exactly as the scalar
+	// path does (VgiScalarFunctionLocalState's destructor). Dropping it meant EVERY
+	// lateral query burned a worker process: acquire, use, kill, and the next query
+	// pays a fresh spawn. That showed up as a flat per-query cost independent of row
+	// count — ~60ms against a Rust worker, ~530ms against Python — which dwarfed the
+	// actual work (the same worker handles 1M rows through the scalar path in 18ms).
+	// Safe here because the batched-lateral path only ever handles maps with no
+	// finalize (see the operator's applicability check), so there is no finalize
+	// handshake owed to the worker: closing input is a complete end-of-stream.
+	void ShutdownConnection() noexcept {
+		if (!connection) {
+			return;
+		}
+		if (!connection->IsFinished()) {
+			try {
+				connection->CloseInputWriter();
+				// Execute reads exactly one output batch per input chunk it writes, so
+				// the wire is already drained and this should see EOS on the first read.
+				// Bounded anyway: a worker that keeps emitting must not spin us forever.
+				for (int i = 0; i < 64 && !connection->IsFinished(); i++) {
+					if (!connection->ReadDataBatch()) {
+						break;
+					}
+				}
+			} catch (...) {
+				connection.reset(); // never pool a worker that failed to close cleanly
+				return;
+			}
+		}
+		try {
+			ReleaseSubstreamConnection(connection, *bind_data, client_context);
+		} catch (...) {
+			connection.reset();
+		}
 	}
 
 	ClientContext &client_context; // for lazy schema build + (de)serialize
+	// Owned by the PhysicalOperator, which outlives every operator state it hands out.
+	const VgiTableInOutBindData *bind_data; // for use_pool() / worker_path() at shutdown
 	std::unique_ptr<IFunctionConnection> connection; // this thread's own worker
 	std::vector<uint8_t> substream_id;
 	VgiTableInOutLocalState scan; // drain buffer for the worker output batch
@@ -384,7 +424,8 @@ unique_ptr<GlobalOperatorState> PhysicalVgiLateralBatch::GetGlobalOperatorState(
 }
 
 unique_ptr<OperatorState> PhysicalVgiLateralBatch::GetOperatorState(ExecutionContext &context) const {
-	return make_uniq<VgiLateralBatchOperatorState>(context.client, MintSubstreamId());
+	return make_uniq<VgiLateralBatchOperatorState>(context.client, MintSubstreamId(),
+	                                               bind_data->Cast<VgiTableInOutBindData>());
 }
 
 OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, DataChunk &input, DataChunk &chunk,
