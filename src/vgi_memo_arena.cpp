@@ -289,10 +289,13 @@ int64_t VgiMemoArena::RecomputeFootprintLocked() {
 	if (tail_) {
 		f += arrow::util::TotalBufferSize(*tail_);
 	}
-	// Slot-map + key-blob overhead (approximate but honest — the whole point of the
-	// arena is that this is a bounded, measurable per-value cost, ~tens of bytes).
+	// Slot-map + key-blob overhead. Per slot: the unordered_map node (~48), the
+	// VgiMemoSlot (~48), the std::string key control block (~32) + slack, plus the key
+	// bytes. Calibrated against a measured ~240 B/value at 1M BIGINT values (of which
+	// ~8 B is the payload, counted above): 160 + key bytes tracks real RSS within ~1.35x
+	// so the byte budget genuinely bounds memory rather than under-counting it.
 	for (auto &kv : slots_) {
-		f += static_cast<int64_t>(kv.first.size()) + 64;
+		f += static_cast<int64_t>(kv.first.size()) + 160;
 	}
 	f += static_cast<int64_t>(validators_.size()) * 96;
 	footprint_ = f;
