@@ -121,6 +121,16 @@ struct VgiResultCacheKey {
 	// order-independent sorted-multiset for LATERAL; additive whole-input fold for
 	// buffered). See vgi_exchange_cache_key.hpp.
 	std::string input_hash;
+	// EXCHANGE-mode SHAPE discriminator. Empty for producer-mode / per-partition
+	// entries. Set to the operator kind ("scalar" / "lateral" / "stream" / "buffered")
+	// so that entries produced by DIFFERENT operators over the same function can never
+	// cross-serve. Without it, the scalar and correlated-LATERAL static keys are
+	// separated only by an accident of two incompatible canonical_arguments encodings —
+	// a same-named function reachable both ways (no const args, no projection pushdown)
+	// would produce byte-identical keys and silently serve one shape's memo to the
+	// other. (A worker-output-schema fingerprint may be appended here when the on-disk
+	// backend lands, as defence-in-depth against shape drift across restart.)
+	std::string shape_key;
 
 	bool operator==(const VgiResultCacheKey &o) const;
 	// 64-bit bucket hash over all fields.

@@ -551,7 +551,7 @@ PhysicalVgiTableBufferingFunction::GetGlobalSinkState(ClientContext &context) co
 		const char *reason = nullptr;
 		int64_t catalog_version = 0;
 		if (BuildExchangeCacheKeyStatic(context, bd, proj_key, gstate->cache_key,
-		                                gstate->cache_catalog_name, catalog_version, reason)) {
+		                                gstate->cache_catalog_name, catalog_version, reason, "buffered")) {
 			gstate->cache_eligible = true;
 			Value ttl_v;
 			if (context.TryGetCurrentSetting("vgi_result_cache_default_ttl_seconds", ttl_v)) {

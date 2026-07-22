@@ -102,13 +102,18 @@ void SyncResultCacheSettings(ClientContext &context);
 //!
 //! SECURITY: identity_scope folds in the caller's auth principal
 //! (BuildCatalogIdentityScope); "" fails closed so two identities never cross-serve.
+//! `operator_kind` is the SHAPE discriminator baked into key.shape_key ("lateral" here);
+//! it prevents entries from different operators cross-serving (see VgiResultCacheKey).
 bool BuildExchangeCacheKeyStatic(ClientContext &context, const VgiTableInOutBindData &bd,
                                  const std::vector<int32_t> &projection_ids, VgiResultCacheKey &key,
-                                 std::string &catalog_name, int64_t &catalog_version, const char *&reason);
+                                 std::string &catalog_name, int64_t &catalog_version, const char *&reason,
+                                 const std::string &operator_kind);
 
 //! Field-based core of the above — decoupled from any bind-data struct so the SCALAR
 //! path (which has its own bind data) shares the exact eligibility + key-shape logic.
 //! `canonical_arguments` is the caller's canonical const-arg serialization.
+//! `operator_kind` is baked into key.shape_key (required — an empty value would let two
+//! operator shapes collide, which is the bug this parameter exists to close).
 bool BuildExchangeCacheKeyStaticFields(ClientContext &context,
                                        const std::shared_ptr<VgiAttachParameters> &attach_params,
                                        const std::string &function_name,
@@ -116,7 +121,7 @@ bool BuildExchangeCacheKeyStaticFields(ClientContext &context,
                                        const std::map<std::string, Value> &settings,
                                        const std::vector<int32_t> &projection_ids, VgiResultCacheKey &key,
                                        std::string &catalog_name, int64_t &catalog_version,
-                                       const char *&reason);
+                                       const char *&reason, const std::string &operator_kind);
 
 // ============================================================================
 // Per-unit memoization serve/store (shared by the streaming table-in-out and

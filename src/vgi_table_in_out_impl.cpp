@@ -480,7 +480,7 @@ unique_ptr<GlobalTableFunctionState> VgiTableInOutInitGlobal(ClientContext &cont
 		int64_t catalog_version = 0; // out param; already folded into cache_key
 		if (BuildExchangeCacheKeyStatic(context, bind_data, global_state->projection_ids,
 		                                global_state->cache_key, global_state->cache_catalog_name,
-		                                catalog_version, reason)) {
+		                                catalog_version, reason, "stream")) {
 			global_state->cache_eligible = true;
 			Value ttl_v;
 			if (context.TryGetCurrentSetting("vgi_result_cache_default_ttl_seconds", ttl_v)) {

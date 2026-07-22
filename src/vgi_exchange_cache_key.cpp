@@ -243,7 +243,7 @@ bool BuildExchangeCacheKeyStaticFields(ClientContext &context,
                                        const std::map<std::string, Value> &settings,
                                        const std::vector<int32_t> &projection_ids, VgiResultCacheKey &key,
                                        std::string &catalog_name, int64_t &catalog_version,
-                                       const char *&reason) {
+                                       const char *&reason, const std::string &operator_kind) {
 	reason = nullptr;
 	catalog_version = 0;
 
@@ -307,6 +307,7 @@ bool BuildExchangeCacheKeyStaticFields(ClientContext &context,
 	key.attached_data_version = attach_params->data_version_spec();
 	key.implementation_version = attach_params->implementation_version();
 	key.catalog_version = catalog_version;
+	key.shape_key = operator_kind; // SHAPE discriminator — see VgiResultCacheKey::shape_key
 	// Producer-only dimensions stay empty for exchange-mode: at_unit/at_value,
 	// filter_bytes, order_by_hint, sample_hint, transaction_id. input_hash is set by
 	// the caller per memoization event.
@@ -315,11 +316,12 @@ bool BuildExchangeCacheKeyStaticFields(ClientContext &context,
 
 bool BuildExchangeCacheKeyStatic(ClientContext &context, const VgiTableInOutBindData &bd,
                                  const std::vector<int32_t> &projection_ids, VgiResultCacheKey &key,
-                                 std::string &catalog_name, int64_t &catalog_version, const char *&reason) {
+                                 std::string &catalog_name, int64_t &catalog_version, const char *&reason,
+                                 const std::string &operator_kind) {
 	return BuildExchangeCacheKeyStaticFields(context, bd.attach_params, bd.function_name,
 	                                         bd.arguments.array ? bd.arguments.array->ToString() : "",
 	                                         bd.settings, projection_ids, key, catalog_name, catalog_version,
-	                                         reason);
+	                                         reason, operator_kind);
 }
 
 // ----------------------------------------------------------------------------

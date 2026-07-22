@@ -543,7 +543,7 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 		int64_t cver = 0;
 		if (BuildExchangeCacheKeyStaticFields(context, bind_data->attach_params, bind_data->function_name,
 		                                      canon_args, bind_data->settings, {}, local_state.cache_static_key,
-		                                      local_state.cache_catalog_name, cver, reason)) {
+		                                      local_state.cache_catalog_name, cver, reason, "scalar")) {
 			local_state.cache_eligible = true;
 			Value ttl_v;
 			if (context.TryGetCurrentSetting("vgi_result_cache_default_ttl_seconds", ttl_v) && !ttl_v.IsNull()) {

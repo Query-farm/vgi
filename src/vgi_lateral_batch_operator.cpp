@@ -456,7 +456,7 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 		const char *reason = nullptr;
 		int64_t catalog_version = 0;
 		if (BuildExchangeCacheKeyStatic(client_context, bd, proj_key, state.cache_static_key,
-		                                state.cache_catalog_name, catalog_version, reason)) {
+		                                state.cache_catalog_name, catalog_version, reason, "lateral")) {
 			state.cache_eligible = true;
 			gstate.cache_eligible.store(true, std::memory_order_relaxed); // arm EXPLAIN ANALYZE reporting
 			EnsureServeSchema(state, types);
