@@ -123,6 +123,7 @@ src/vgi_worker_pool.cpp
 src/vgi_worker_pool_functions.cpp
 src/vgi_result_cache.cpp
 src/vgi_exchange_cache_key.cpp
+src/vgi_memo_arena.cpp
 src/vgi_sha256.cpp
 src/vgi_input_dedup.cpp
 src/vgi_result_cache_functions.cpp

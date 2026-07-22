@@ -7,6 +7,7 @@
 
 #include "vgi_exchange_cache_key.hpp" // SyncResultCacheSettings (honor SET before reap)
 #include "vgi_function_docs.hpp"
+#include "vgi_memo_arena.hpp" // per-value arena registry (flush + diagnostics)
 
 namespace duckdb {
 namespace vgi {
@@ -33,6 +34,9 @@ static void VgiResultCacheFlushScan(ClientContext &, TableFunctionInput &data_p,
 		return;
 	}
 	auto count = VgiResultCache::Instance().FlushAll();
+	// The per-value memo arena is a separate registry; flush it too so a flush gives a
+	// genuinely cold per-value tier (tests rely on this).
+	vgi::VgiMemoArenaRegistry::Instance().FlushAll();
 	output.SetValue(0, 0, Value::BIGINT(static_cast<int64_t>(count)));
 	output.SetCardinality(1);
 	data.finished = true;

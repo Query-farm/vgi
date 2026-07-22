@@ -20,6 +20,7 @@
 #include "storage/vgi_catalog.hpp"
 #include "vgi_arrow_ipc.hpp"
 #include "vgi_cache_control.hpp"
+#include "vgi_memo_arena.hpp" // per-value arena registry (byte budget)
 #include "vgi_oauth.hpp"
 #include "vgi_result_cache.hpp"
 #include "vgi_sha256.hpp"
@@ -156,6 +157,24 @@ std::vector<std::string> HashInputRowsPerValue(ClientContext & /*context*/, Data
 	return out;
 }
 
+std::vector<std::string> InputRowSortKeys(ClientContext & /*context*/, DataChunk &chunk) {
+	const idx_t count = chunk.size();
+	std::vector<std::string> out(count);
+	if (count == 0 || chunk.ColumnCount() == 0) {
+		return out;
+	}
+	vector<OrderModifiers> mods(chunk.ColumnCount(), OrderModifiers(OrderType::ASCENDING, OrderByNullType::NULLS_LAST));
+	Vector keys(LogicalType::BLOB);
+	CreateSortKeyHelpers::CreateSortKey(chunk, mods, keys);
+	keys.Flatten(count);
+	auto key_data = FlatVector::GetData<string_t>(keys);
+	for (idx_t i = 0; i < count; i++) {
+		// Raw canonical blob — the arena compares it by value; no SHA, no prefix.
+		out[i].assign(key_data[i].GetData(), key_data[i].GetSize());
+	}
+	return out;
+}
+
 void AccumulateInputDigest(DataChunk &chunk, uint64_t &sum_lo, uint64_t &sum_hi, uint64_t &row_count) {
 	const idx_t n = chunk.size();
 	if (n == 0 || chunk.ColumnCount() == 0) {
@@ -234,6 +253,9 @@ void SyncResultCacheSettings(ClientContext &context) {
 	u64("vgi_result_cache_pack_target_bytes", s.pack_target_bytes);
 	u64("vgi_result_cache_pack_compaction_dead_pct", s.pack_compaction_dead_pct);
 	VgiResultCache::Instance().ConfigureIfChanged(s);
+	// The per-value memo arena is a separate registry with its own byte budget; it shares
+	// the whole-cache max_bytes so `SET vgi_result_cache_max_bytes` bounds it too.
+	VgiMemoArenaRegistry::Instance().SetMaxBytes(static_cast<int64_t>(s.max_bytes));
 }
 
 bool BuildExchangeCacheKeyStaticFields(ClientContext &context,

@@ -74,6 +74,13 @@ std::string CanonicalPartitionTupleKey(ClientContext &context, const std::vector
 //! the per-value memoization tier over a DEDUPED input chunk (one key per distinct tuple).
 std::vector<std::string> HashInputRowsPerValue(ClientContext &context, DataChunk &chunk);
 
+//! Per-VALUE RAW sort-key blobs: one canonical NULL-aware sort-key blob per row of
+//! `chunk`, WITHOUT the SHA-256 + "v:" prefix that HashInputRowsPerValue applies. This
+//! is the per-value memo ARENA's slot key: inside an arena already scoped to a verified
+//! static key, the raw blob is compared by value (memcmp), so no cryptographic digest is
+//! needed — cheaper (no per-row SHA-256) and collision-free by construction.
+std::vector<std::string> InputRowSortKeys(ClientContext &context, DataChunk &chunk);
+
 //! Order-INDEPENDENT streaming digest for whole-input keying (buffered functions):
 //! folds a chunk's per-row hashes into a two-lane 64-bit ADDITIVE accumulator (+ row
 //! count). Additive => associative + commutative => independent of both chunk order

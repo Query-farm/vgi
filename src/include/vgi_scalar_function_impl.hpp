@@ -175,6 +175,9 @@ struct VgiScalarFunctionLocalState : public FunctionLocalState {
 	bool cache_eligible = false;
 	vgi::VgiResultCacheKey cache_static_key;
 	std::string cache_catalog_name;
+	// SHA-256 fingerprint of cache_static_key (input_hash empty) — the per-value arena
+	// registry key. Computed once when the static key is built.
+	std::string cache_static_fp;
 	int64_t cache_default_ttl_seconds = 0;
 	// Latched `vgi.cache.per_value` advertisement. Per-value memoization is OFF until the
 	// worker asks for it (see VGI_CACHE_PER_VALUE_KEY) — the fixed per-entry probe/decode

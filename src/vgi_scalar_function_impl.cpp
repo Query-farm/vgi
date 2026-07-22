@@ -8,6 +8,7 @@
 #include "vgi_ifunction_connection.hpp"
 #include "vgi_input_dedup.hpp" // input dedup (ship only distinct tuples; scatter back)
 #include "vgi_logging.hpp"
+#include "vgi_memo_arena.hpp"  // per-value memo arena (columnar store)
 #include "vgi_result_cache.hpp" // VgiResultCache singleton (per-value memo)
 #include "vgi_transport.hpp"
 #include "vgi_worker_pool.hpp"
@@ -21,7 +22,10 @@
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 
+#include <arrow/array/builder_primitive.h> // Int64Builder (per-value distinct-order gather)
 #include <arrow/c/bridge.h>
+#include <arrow/compute/api_vector.h>       // arrow::compute::Take (per-value distinct-order gather)
+#include <arrow/datum.h>
 #include <arrow/record_batch.h> // arrow::ConcatenateRecordBatches (per-value full-hit assembly)
 
 namespace duckdb {
@@ -545,6 +549,7 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 		                                      canon_args, bind_data->settings, {}, local_state.cache_static_key,
 		                                      local_state.cache_catalog_name, cver, reason, "scalar")) {
 			local_state.cache_eligible = true;
+			local_state.cache_static_fp = local_state.cache_static_key.Fingerprint();
 			Value ttl_v;
 			if (context.TryGetCurrentSetting("vgi_result_cache_default_ttl_seconds", ttl_v) && !ttl_v.IsNull()) {
 				local_state.cache_default_ttl_seconds = static_cast<int64_t>(ttl_v.GetValue<uint64_t>());
@@ -570,25 +575,30 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 	}
 	const bool pv_enabled = pv_setting && local_state.cache_pv_opt_in && dedup_enabled && !is_volatile &&
 	                        local_state.cache_eligible;
-	std::vector<VgiResultCacheKey> pv_keys;
-	std::vector<std::shared_ptr<const VgiResultCacheEntry>> pv_hits;
-	bool full_pv_hit = false;
+	// Per-value memo probe against the columnar arena. `pv_blobs` is the raw sort-key blob
+	// per distinct tuple (the arena's slot key). Probe returns the hit rows in ascending
+	// distinct order + a per-tuple hit mask; a miss (or no arena yet) leaves pv_hit=0.
+	std::vector<std::string> pv_blobs;
+	std::vector<char> pv_hit;                      // parallel to ship (1 = served from arena)
+	std::shared_ptr<arrow::RecordBatch> pv_cached; // hit rows, ascending-distinct order
+	int64_t pv_hit_count = 0;
 	if (pv_enabled) {
-		auto pv_hashes = HashInputRowsPerValue(context, *ship);
-		pv_keys.resize(ship->size());
-		for (idx_t d = 0; d < ship->size(); d++) {
-			pv_keys[d] = local_state.cache_static_key;
-			pv_keys[d].input_hash = pv_hashes[d];
-		}
-		pv_hits = VgiResultCache::Instance().LookupBatch(pv_keys, std::chrono::steady_clock::now());
-		full_pv_hit = ship->size() > 0;
-		for (auto &h : pv_hits) {
-			if (!h) {
-				full_pv_hit = false;
-				break;
+		pv_blobs = InputRowSortKeys(context, *ship);
+		if (auto arena = VgiMemoArenaRegistry::Instance().Get(local_state.cache_static_fp)) {
+			auto pr = arena->Probe(pv_blobs, std::chrono::steady_clock::now());
+			pv_hit = std::move(pr.hit);
+			pv_cached = pr.rows;
+			pv_hit_count = pr.num_hits;
+			if (pr.served_bytes) {
+				VgiResultCache::Instance().RecordExchangeHit(pr.served_bytes);
 			}
 		}
 	}
+	if (pv_hit.empty()) {
+		pv_hit.assign(ship->size(), 0);
+	}
+	const bool full_pv_hit =
+	    pv_enabled && ship->size() > 0 && pv_hit_count == static_cast<int64_t>(ship->size());
 
 	// Build input-side conversion cache on the first batch. The cached
 	// types/names/extension_types/client_props are stable for the lifetime
@@ -615,42 +625,24 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 	std::shared_ptr<arrow::RecordBatch> output_batch;
 
 	if (full_pv_hit) {
-		// Every distinct input tuple is memoized → assemble the K cached 1-row outputs and
-		// serve WITHOUT the worker (result_cache.hit tier=per_value).
-		std::vector<std::shared_ptr<arrow::RecordBatch>> parts;
-		int64_t served_bytes = 0;
-		for (auto &h : pv_hits) {
-			served_bytes += h->total_bytes;
-			for (auto &cb : h->streams[0].batches) {
-				parts.push_back(DeserializeCachedRecordBatch(*h, cb));
-			}
-		}
-		auto cat = arrow::ConcatenateRecordBatches(parts);
-		if (!cat.ok()) {
-			throw IOException("VGI scalar '%s' per-value assembly failed: %s", func_info.function_name,
-			                  cat.status().ToString());
-		}
-		output_batch = cat.ValueUnsafe();
-		VgiResultCache::Instance().RecordExchangeHit(served_bytes);
+		// Every distinct tuple is memoized → the arena already returned all K rows in
+		// ascending-distinct order; serve WITHOUT the worker.
+		output_batch = pv_cached;
 		VGI_LOG(context, "result_cache.hit",
 		        {{"function", func_info.function_name},
-		         {"key_hash", local_state.cache_static_key.HexDigest()},
+		         {"key_hash", local_state.cache_static_fp},
 		         {"tier", "per_value"}});
 	} else {
-		// [partial per-value] Ship ONLY the distinct tuples with no cached entry; splice the
-		// cached 1-row outputs back into distinct order below. A chunk whose distinct set
-		// overlaps a prior chunk/query recomputes just the NEW values. Full-miss is the
-		// empty-cached-prefix case (miss_indices == every distinct tuple). `full_pv_hit`
-		// already handled all-cached, so with pv on here miss_indices is non-empty.
+		// Ship the tuples with no cached row; splice the arena's cached rows back into
+		// distinct order below. Full-miss is the empty-cached-prefix case (every distinct
+		// tuple is a miss); full_pv_hit already handled all-cached.
 		std::vector<idx_t> miss_indices;
-		if (pv_enabled) {
-			for (idx_t d = 0; d < ship->size(); d++) {
-				if (!pv_hits[d]) {
-					miss_indices.push_back(d);
-				}
+		for (idx_t d = 0; d < ship->size(); d++) {
+			if (!pv_hit[d]) {
+				miss_indices.push_back(d);
 			}
 		}
-		const bool partial_pv = pv_enabled && miss_indices.size() < ship->size();
+		const bool partial_pv = pv_enabled && pv_hit_count > 0 && miss_indices.size() < ship->size();
 		DataChunk miss_ship;
 		DataChunk *ship_to_worker = ship;
 		if (partial_pv) {
@@ -681,7 +673,6 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 			                                     local_state.input_extension_types);
 		}
 
-		// Gated: fires once per chunk on the scalar exchange hot path.
 		if (VgiInfoLogActive(context)) {
 			VGI_LOG(context, "scalar.write_input",
 			        {{"conn", local_state.connection->GetConnIdHex()},
@@ -689,75 +680,77 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 			         {"input_rows", std::to_string(input_batch->num_rows())}});
 		}
 
+		std::shared_ptr<arrow::RecordBatch> fresh;
 		if (timing) {
 			{
 				ScopedNs _t(ClientTiming::Instance().write_ns);
 				local_state.connection->WriteInputBatch(input_batch);
 			}
 			ScopedNs _t(ClientTiming::Instance().read_ns);
-			output_batch = local_state.connection->ReadDataBatch();
+			fresh = local_state.connection->ReadDataBatch();
 		} else {
 			local_state.connection->WriteInputBatch(input_batch);
-			output_batch = local_state.connection->ReadDataBatch();
+			fresh = local_state.connection->ReadDataBatch();
 		}
 
-		if (!output_batch) {
+		if (!fresh) {
 			throw IOException("VGI scalar function '%s' returned no output for %d input rows",
 			                  func_info.function_name, args.size());
 		}
-		if (static_cast<idx_t>(output_batch->num_rows()) != ship_to_worker->size()) {
+		if (static_cast<idx_t>(fresh->num_rows()) != ship_to_worker->size()) {
 			throw IOException("VGI scalar function '%s' returned %d rows but expected %d (1:1 mapping required)",
-			                  func_info.function_name, output_batch->num_rows(),
+			                  func_info.function_name, fresh->num_rows(),
 			                  static_cast<int64_t>(ship_to_worker->size()));
 		}
-		if (output_batch->num_columns() != 1) {
+		if (fresh->num_columns() != 1) {
 			throw IOException("VGI scalar function '%s' returned %d columns but expected 1",
-			                  func_info.function_name, output_batch->num_columns());
+			                  func_info.function_name, fresh->num_columns());
 		}
 
-		// [partial per-value] Reassemble the fresh worker rows + cached 1-row outputs into a
-		// full distinct-order batch (row d = distinct tuple d), so the store loop and the
-		// scatter-back below index it exactly as they would a full worker exchange.
-		if (partial_pv) {
-			std::vector<int64_t> miss_pos(ship->size(), -1); // distinct index → its row in the fresh output
-			for (idx_t j = 0; j < miss_indices.size(); j++) {
-				miss_pos[miss_indices[j]] = static_cast<int64_t>(j);
+		// Assemble distinct-order output (row d = tuple d) from the arena's cached rows
+		// (hits, ascending d) + the fresh worker rows (misses, ascending d) with ONE gather:
+		// combined = [cached | fresh]; perm[d] picks the right combined row.
+		if (partial_pv && pv_cached && pv_cached->num_rows() > 0) {
+			const int64_t H = pv_cached->num_rows();
+			std::vector<std::shared_ptr<arrow::RecordBatch>> parts {pv_cached};
+			if (fresh->num_rows() > 0) {
+				parts.push_back(fresh);
 			}
-			std::vector<std::shared_ptr<arrow::RecordBatch>> parts(ship->size());
-			idx_t reused_tuples = 0;
+			auto combined_r = arrow::ConcatenateRecordBatches(parts);
+			if (!combined_r.ok()) {
+				throw IOException("VGI scalar '%s' per-value splice concat failed: %s", func_info.function_name,
+				                  combined_r.status().ToString());
+			}
+			auto combined = combined_r.ValueUnsafe();
+			arrow::Int64Builder ib;
+			(void)ib.Reserve(static_cast<int64_t>(ship->size()));
+			int64_t hc = 0;
+			int64_t mc = 0;
 			for (idx_t d = 0; d < ship->size(); d++) {
-				if (pv_hits[d]) {
-					++reused_tuples;
-					// A scalar per-value entry is exactly one 1-row batch (1:1 store).
-					parts[d] = DeserializeCachedRecordBatch(*pv_hits[d], pv_hits[d]->streams[0].batches[0]);
-				} else {
-					parts[d] = output_batch->Slice(miss_pos[d], 1);
-				}
+				ib.UnsafeAppend(pv_hit[d] ? hc++ : H + mc++);
 			}
-			auto cat = arrow::ConcatenateRecordBatches(parts);
-			if (!cat.ok()) {
-				throw IOException("VGI scalar '%s' partial per-value splice failed: %s", func_info.function_name,
-				                  cat.status().ToString());
+			std::shared_ptr<arrow::Array> perm;
+			(void)ib.Finish(&perm);
+			auto tk = arrow::compute::Take(arrow::Datum(combined), arrow::Datum(perm),
+			                               arrow::compute::TakeOptions::NoBoundsCheck());
+			if (!tk.ok()) {
+				throw IOException("VGI scalar '%s' per-value splice take failed: %s", func_info.function_name,
+				                  tk.status().ToString());
 			}
-			output_batch = cat.ValueUnsafe();
-			// Still a MISS for the hit/miss counters (the worker ran for the misses, recorded
-			// below); this surfaces the worker-input reduction.
+			output_batch = tk.ValueUnsafe().record_batch();
 			VGI_LOG(context, "result_cache.partial_hit",
 			        {{"function", func_info.function_name},
-			         {"key_hash", local_state.cache_static_key.HexDigest()},
-			         {"reused_tuples", std::to_string(reused_tuples)},
+			         {"key_hash", local_state.cache_static_fp},
+			         {"reused_tuples", std::to_string(pv_hit_count)},
 			         {"computed_tuples", std::to_string(miss_indices.size())}});
+		} else {
+			// No cached rows: `fresh` covers every distinct tuple in order → distinct order.
+			output_batch = fresh;
 		}
 
-		// [per-value store] Memoize each MISSED distinct tuple's 1-row output, if the worker
-		// opted into caching AND asked for per-value memoization. A future chunk sharing
-		// that value serves without the worker.
-		//
-		// A scalar advertises vgi.cache.* on its output batch custom_metadata (via the emit
-		// path — see ScalarExchangeState.exchange in vgi-python), latched by the connection
-		// like the table-in-out path. Gated on this LIVE advertisement rather than on
-		// `pv_enabled`, so the first exchange against a function still memoizes even though
-		// its probe was necessarily disarmed (nothing had told us the opt-in yet).
+		// [per-value store] Memoize the missed tuples' 1-row outputs into the arena as ONE
+		// append. Gated on the LIVE advertisement (cc.per_value), so a function's first
+		// exchange still memoizes even though its probe was necessarily disarmed.
 		auto cc = local_state.connection->GetLastCacheControl();
 		const bool pv_store =
 		    cc.per_value && pv_setting && dedup_enabled && !is_volatile && local_state.cache_eligible;
@@ -766,47 +759,52 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 			local_state.cache_pv_opt_in = true;
 			VgiResultCache::Instance().NotePerValueOptIn(local_state.cache_static_key);
 		}
-		if (pv_store && !pv_enabled) {
-			// Probe was disarmed for this chunk, so the keys were never built. Build them
-			// now over the same shipped set; every tuple counts as a miss.
-			auto pv_hashes = HashInputRowsPerValue(context, *ship);
-			pv_keys.resize(ship->size());
-			for (idx_t d = 0; d < ship->size(); d++) {
-				pv_keys[d] = local_state.cache_static_key;
-				pv_keys[d].input_hash = pv_hashes[d];
-			}
-		}
 		if (pv_store) {
 			VgiResultCache::Instance().RecordExchangeMiss();
-			if (cc.Cacheable()) {
-				// Cap new stores per chunk (0 = unlimited) — bounds entry-count amplification
-				// on a high-cardinality input. A store cap, not a lookup gate, so store-then-hit
-				// is preserved for low-cardinality (K < cap → all stored).
-				uint64_t store_cap = 256;
-				{
-					Value scv;
-					if (context.TryGetCurrentSetting("vgi_result_cache_per_value_max_stores_per_chunk", scv) &&
-					    !scv.IsNull()) {
-						store_cap = scv.GetValue<uint64_t>();
-					}
+		}
+		if (pv_store && cc.Cacheable() && !miss_indices.empty()) {
+			// The missed tuples' rows are exactly `fresh` (m rows, ascending-d-among-misses);
+			// their keys are pv_blobs[miss_indices[j]]. Build the raw blobs if the probe was
+			// disarmed (first exchange). Cap bounds per-chunk fill on a high-cardinality input.
+			if (pv_blobs.empty()) {
+				pv_blobs = InputRowSortKeys(context, *ship);
+			}
+			uint64_t store_cap = 256;
+			{
+				Value scv;
+				if (context.TryGetCurrentSetting("vgi_result_cache_per_value_max_stores_per_chunk", scv) &&
+				    !scv.IsNull()) {
+					store_cap = scv.GetValue<uint64_t>();
 				}
-				uint64_t stored = 0;
-				for (idx_t d = 0; d < ship->size(); d++) {
-					if (!pv_hits.empty() && pv_hits[d]) {
-						continue;
-					}
-					if (store_cap != 0 && stored >= store_cap) {
-						break;
-					}
-					auto rd = output_batch->Slice(static_cast<int64_t>(d), 1);
-					auto sr = StoreExchangeMemoEntry(pv_keys[d], cc, local_state.cache_catalog_name,
-					                                 local_state.cache_default_ttl_seconds,
-					                                 std::vector<std::shared_ptr<arrow::RecordBatch>>{rd},
-					                                 /*allow_disk=*/true, /*allow_immediately_stale=*/false);
-					if (sr.stored) {
-						VgiResultCache::Instance().RecordExchangeStore();
-					}
-					stored++;
+			}
+			idx_t to_store = miss_indices.size();
+			if (store_cap != 0 && to_store > store_cap) {
+				to_store = store_cap;
+			}
+			int64_t ttl = cc.ttl_seconds.value_or(local_state.cache_default_ttl_seconds);
+			if (ttl > VGI_CACHE_MAX_TTL_SECONDS) {
+				ttl = VGI_CACHE_MAX_TTL_SECONDS;
+			}
+			auto expires = std::chrono::steady_clock::now() + std::chrono::seconds(ttl);
+			auto arena = VgiMemoArenaRegistry::Instance().GetOrCreate(local_state.cache_static_fp, fresh->schema());
+			if (arena) {
+				ArenaValidator av;
+				av.scope = cc.scope;
+				av.etag = cc.etag;
+				av.last_modified = cc.last_modified;
+				av.revalidatable = cc.revalidatable;
+				const int32_t vref = arena->ResolveValidator(av);
+				std::vector<ArenaStoreSpec> specs(to_store);
+				for (idx_t j = 0; j < to_store; j++) {
+					specs[j].key = &pv_blobs[miss_indices[j]];
+					specs[j].length = 1;
+					specs[j].validator_ref = vref;
+				}
+				auto store_rows = fresh->Slice(0, static_cast<int64_t>(to_store));
+				const int64_t delta = arena->Store(store_rows, specs, expires, /*never_expires=*/false);
+				VgiMemoArenaRegistry::Instance().NoteFootprintDelta(local_state.cache_static_fp, delta);
+				for (idx_t j = 0; j < to_store; j++) {
+					VgiResultCache::Instance().RecordExchangeStore();
 				}
 			}
 		}
