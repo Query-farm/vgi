@@ -153,10 +153,17 @@ void SlideRevalidatedExchangeEntry(const VgiResultCacheEntry &entry, const VgiCa
 //! into the on-disk tier (content-addressed; cross-process + cross-restart). All
 //! exchange callers pass true — the disk tier is off by default (needs
 //! `vgi_result_cache_dir`), so this only persists when the user configured it.
+//!
+//! `allow_immediately_stale` (default true) governs the ttl=0 "always-revalidate"
+//! contract (etag + revalidatable, stored memory-only, immediately stale). The
+//! PER-VALUE callers pass FALSE: per-value keys are probed by LookupBatch, which has
+//! no revalidation path, so an immediately-stale per-value entry would be found stale
+//! and evicted on the very next probe — a store/insert/evict/serialize churn loop
+//! with a 0% hit rate every chunk (B3). Refusing to store it is strictly better.
 ExchangeStoreResult StoreExchangeMemoEntry(const VgiResultCacheKey &key, const VgiCacheControl &cc,
                                            const std::string &catalog_name, int64_t default_ttl_seconds,
                                            const std::vector<std::shared_ptr<arrow::RecordBatch>> &out_batches,
-                                           bool allow_disk = false);
+                                           bool allow_disk = false, bool allow_immediately_stale = true);
 
 } // namespace vgi
 } // namespace duckdb

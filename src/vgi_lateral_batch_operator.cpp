@@ -301,7 +301,10 @@ std::shared_ptr<arrow::RecordBatch> TakeRecordBatch(const std::shared_ptr<arrow:
 	if (!st.ok()) {
 		throw IOException("vgi_batch_lateral: dedup Take index build failed: %s", st.ToString());
 	}
-	auto res = arrow::compute::Take(arrow::Datum(batch), arrow::Datum(indices));
+	// NoBoundsCheck: `take` holds worker-output row positions built from worker_parent /
+	// rows_by_d, always in [0, batch->num_rows()), so the kernel's bounds pass is wasted.
+	auto res = arrow::compute::Take(arrow::Datum(batch), arrow::Datum(indices),
+	                                arrow::compute::TakeOptions::NoBoundsCheck());
 	if (!res.ok()) {
 		throw IOException("vgi_batch_lateral: worker '%s' function '%s' output Take (dedup expansion) failed: %s",
 		                  bd.worker_path(), bd.function_name, res.status().ToString());
@@ -694,28 +697,59 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 			served_bytes += h->total_bytes;
 		}
 		VgiResultCache::Instance().RecordExchangeHit(served_bytes);
-		// Latch cache-control off a served per-value entry when this operator state has not
-		// yet seen an exchange. Without this, a scan that is a full per-value hit from its
-		// very FIRST chunk (a warm memo + a fresh operator state) could never store the
-		// coarse whole-chunk entry — cache_cc is normally latched off a worker reply, and
-		// there is no worker reply on this path. The stored entry's own lifetime/validators
-		// are exactly what the worker advertised when the value was memoized, so reusing
-		// them keeps the M2 entry's freshness identical to the per-value entries it derives
-		// from (never longer).
+		// Latch cache-control off the served per-value entries when this operator state has
+		// not yet seen an exchange. Without this, a scan that is a full per-value hit from
+		// its very FIRST chunk (a warm memo + a fresh operator state) could never store the
+		// coarse whole-chunk (M2) entry — cache_cc is normally latched off a worker reply,
+		// and there is no worker reply on this path. Two correctness rules the earlier code
+		// got wrong (they over-served stale data):
+		//   B1 — freshness is the MINIMUM REMAINING lifetime across ALL probed slots, not
+		//        pv_hits[0]'s ORIGINAL lifetime. Re-stamping the M2 entry to now+original_ttl
+		//        extended its freshness by up to a full TTL past the source data's own expiry.
+		//   B2 — validators (etag/last_modified/revalidatable) are latched ONLY if every
+		//        probed slot agrees. Values memoized in different exchanges legitimately carry
+		//        different etags; borrowing pv_hits[0]'s etag for a payload covering all K
+		//        would let a 304 on value 0 slide an entry whose other values may have changed.
+		//        On disagreement, fall back to freshness-only (no etag, not revalidatable).
 		if (!state.cache_cc_latched && !pv_hits.empty() && pv_hits[0]) {
-			const auto &src = *pv_hits[0];
+			const auto now = std::chrono::steady_clock::now();
+			const auto &src0 = *pv_hits[0];
+			bool all_never_expires = true;
+			int64_t min_remaining = VGI_CACHE_MAX_TTL_SECONDS;
+			bool validators_agree = true;
+			for (const auto &h : pv_hits) {
+				if (!h) {
+					continue; // full-hit path: all non-null, but stay defensive
+				}
+				if (!h->never_expires) {
+					all_never_expires = false;
+					auto rem = std::chrono::duration_cast<std::chrono::seconds>(h->expires_at - now).count();
+					if (rem < 0) {
+						rem = 0;
+					}
+					if (rem < min_remaining) {
+						min_remaining = rem;
+					}
+				}
+				if (h->etag != src0.etag || h->last_modified != src0.last_modified ||
+				    h->revalidatable != src0.revalidatable) {
+					validators_agree = false;
+				}
+			}
 			VgiCacheControl cc;
 			cc.present = true;
-			cc.scope = src.scope;
-			cc.etag = src.etag;
-			cc.last_modified = src.last_modified;
-			cc.revalidatable = src.revalidatable;
-			auto lifetime =
-			    std::chrono::duration_cast<std::chrono::seconds>(src.expires_at - src.stored_at).count();
-			cc.ttl_seconds = src.never_expires ? VGI_CACHE_MAX_TTL_SECONDS : lifetime;
-			// Reaching this branch means per-value memoization is already active for this
-			// scan, which can only happen when the worker advertised the opt-in.
+			// Reaching this branch means per-value memoization is active for this scan,
+			// which can only happen when the worker advertised the opt-in.
 			cc.per_value = true;
+			cc.scope = src0.scope; // per-value entries are catalog-scoped by construction
+			cc.ttl_seconds = all_never_expires ? VGI_CACHE_MAX_TTL_SECONDS : min_remaining;
+			if (validators_agree) {
+				cc.etag = src0.etag;
+				cc.last_modified = src0.last_modified;
+				cc.revalidatable = src0.revalidatable;
+			} else {
+				cc.revalidatable = false; // freshness-only fallback
+			}
 			state.cache_cc = cc;
 			state.cache_cc_latched = true;
 		}
@@ -955,7 +989,7 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 				auto sr = StoreExchangeMemoEntry(pv_keys[d], state.cache_cc, state.cache_catalog_name,
 				                                 state.cache_default_ttl_seconds,
 				                                 std::vector<std::shared_ptr<arrow::RecordBatch>>{rd},
-				                                 /*allow_disk=*/true);
+				                                 /*allow_disk=*/true, /*allow_immediately_stale=*/false);
 				if (sr.stored) {
 					VgiResultCache::Instance().RecordExchangeStore();
 					gstate.cache_stores.fetch_add(1, std::memory_order_relaxed); // per-value entry stored

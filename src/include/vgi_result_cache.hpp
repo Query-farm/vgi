@@ -14,6 +14,7 @@
 // real Arrow includes live in vgi_result_cache.cpp.
 
 #include <atomic>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -47,6 +48,22 @@ void RegisterVgiResultCacheFunction(ExtensionLoader &loader);
 void RegisterVgiResultCacheFlushFunction(ExtensionLoader &loader);
 void RegisterVgiResultCacheReapFunction(ExtensionLoader &loader);
 void RegisterVgiResultCacheStatsFunction(ExtensionLoader &loader);
+
+// A uint64 counter that is atomic for concurrent access but stays copyable, so the
+// enclosing VgiResultCacheEntry keeps its implicit copy constructor (used by the
+// revalidation shallow-copy paths). `entry->hits` is incremented under mutex_ but
+// read off-lock by Snapshot(); a plain uint64_t there is a data race (B4).
+struct CopyableAtomicU64 {
+	std::atomic<uint64_t> v {0};
+	CopyableAtomicU64() = default;
+	CopyableAtomicU64(const CopyableAtomicU64 &o) : v(o.v.load(std::memory_order_relaxed)) {}
+	CopyableAtomicU64 &operator=(const CopyableAtomicU64 &o) {
+		v.store(o.v.load(std::memory_order_relaxed), std::memory_order_relaxed);
+		return *this;
+	}
+	uint64_t operator++(int) { return v.fetch_add(1, std::memory_order_relaxed); }
+	operator uint64_t() const { return v.load(std::memory_order_relaxed); }
+};
 
 // ============================================================================
 // Cached storage — per-batch bytes, per-thread substreams, whole-result entry
@@ -140,7 +157,7 @@ struct VgiResultCacheEntry {
 	// A short catalog-name label for FlushCatalog scoping + diagnostics (the
 	// identity_scope in the key is a fingerprint; this is the human name).
 	std::string catalog_name;
-	uint64_t hits = 0;
+	CopyableAtomicU64 hits; // atomic (incremented under mutex_, read off-lock by Snapshot)
 	// Per-partition producer entry: a human-readable label of the partition-value
 	// tuple ("country=US", or "country=US, year=2020" for multi-column), empty for
 	// non-partition entries. Diagnostics only (the real discriminator is the "p:"

@@ -802,7 +802,7 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 					auto sr = StoreExchangeMemoEntry(pv_keys[d], cc, local_state.cache_catalog_name,
 					                                 local_state.cache_default_ttl_seconds,
 					                                 std::vector<std::shared_ptr<arrow::RecordBatch>>{rd},
-					                                 /*allow_disk=*/true);
+					                                 /*allow_disk=*/true, /*allow_immediately_stale=*/false);
 					if (sr.stored) {
 						VgiResultCache::Instance().RecordExchangeStore();
 					}

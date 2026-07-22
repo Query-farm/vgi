@@ -406,7 +406,7 @@ void SlideRevalidatedExchangeEntry(const VgiResultCacheEntry &entry, const VgiCa
 ExchangeStoreResult StoreExchangeMemoEntry(const VgiResultCacheKey &key, const VgiCacheControl &cc,
                                            const std::string &catalog_name, int64_t default_ttl_seconds,
                                            const std::vector<std::shared_ptr<arrow::RecordBatch>> &out_batches,
-                                           bool allow_disk) {
+                                           bool allow_disk, bool allow_immediately_stale) {
 	ExchangeStoreResult res;
 	auto skip = [&](const char *r) {
 		res.reason = r;
@@ -431,6 +431,11 @@ ExchangeStoreResult StoreExchangeMemoEntry(const VgiResultCacheKey &key, const V
 	// stored bytes. Such an entry is memory-only (LookupForRevalidation probes memory;
 	// a disk immediately-stale blob is un-loadable).
 	const bool immediately_stale = ttl <= 0;
+	// B3: per-value callers refuse the immediately-stale contract outright — LookupBatch
+	// has no revalidation path, so such an entry churns (stored then evicted every probe).
+	if (immediately_stale && !allow_immediately_stale) {
+		return skip("immediately_stale_per_value");
+	}
 	const bool revalidatable_no_cache = immediately_stale && cc.revalidatable && !cc.etag.empty();
 	if (immediately_stale && !revalidatable_no_cache) {
 		return skip("no_freshness");
