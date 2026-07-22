@@ -1,0 +1,106 @@
+# name: test/sql/integration/cache/per_value_negative_memo.test
+# description: Per-VALUE memoization of a NEGATIVE memo — a distinct input value whose
+#   worker output is ZERO rows (a 1->0 map). cached_explode(0) emits nothing, so the
+#   value 0 is stored as a length-0 slot. A later chunk containing value 0 (alongside
+#   producing values) FULL-HITs the per-value tier — the worker is NOT called for the
+#   filtered value — and it contributes zero rows, exactly as a fresh compute would.
+#   Guards the arena's length==0 slot handling on both the store and serve paths.
+# group: [vgi_integration_cache]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+SET threads=1;
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+# ---------------------------------------------------------------------------
+# Cold MIXED chunk over x % 3 → distinct {0,1,2}: value 0 is 1->0 (negative memo),
+# 1 and 2 produce rows. The chunk is mixed (not all-filtered), so the negative memo
+# for value 0 IS stored alongside the producing values. write_input=3 (dedup).
+# range(9): per 3-cycle 3 rows [0,0,1] → 9 rows, sum(i)=3.
+# ---------------------------------------------------------------------------
+statement ok
+CALL truncate_duckdb_logs();
+
+query II
+SELECT count(*), sum(i)::BIGINT FROM range(9) g(x), LATERAL ex.cached_explode(x % 3);
+----
+9	3
+
+query I
+SELECT max(CAST(regexp_extract(message, 'input_rows=([0-9]+)', 1) AS BIGINT))
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'table_in_out.write_input'
+  AND message LIKE '%cached_explode%';
+----
+3
+
+# ---------------------------------------------------------------------------
+# Warm: same distinct set {0,1,2}, different composition → M2 chunk-key misses but
+# per-value FULL-HITs. Zero write_input proves the NEGATIVE memo for value 0 was
+# cached and served (not recomputed), and it still contributes zero rows.
+# ---------------------------------------------------------------------------
+statement ok
+CALL truncate_duckdb_logs();
+
+query II
+SELECT count(*), sum(i)::BIGINT FROM range(3) g(x), LATERAL ex.cached_explode(x % 3);
+----
+3	1
+
+query I
+SELECT count(*)
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'table_in_out.write_input'
+  AND message LIKE '%cached_explode%';
+----
+0
+
+# A chunk of only the filtered value 0 still emits nothing (the negative memo is
+# served — its zero rows are correct, not a recompute artifact).
+query I
+SELECT count(*) FROM (VALUES (0),(3),(6)) t(x), LATERAL ex.cached_explode(x % 3);
+----
+0
+
+statement ok
+CALL disable_logging();
+
+# Equivalence with per-value OFF (multiset of (x,i), negative-memo rows included as none).
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+statement ok
+CREATE TEMP TABLE nm_on AS SELECT x, i FROM range(30) g(x), LATERAL ex.cached_explode(x % 3);
+
+statement ok
+SET vgi_result_cache_per_value=false;
+
+statement ok
+CREATE TEMP TABLE nm_off AS SELECT x, i FROM range(30) g(x), LATERAL ex.cached_explode(x % 3);
+
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM nm_on EXCEPT ALL SELECT * FROM nm_off)
+  UNION ALL
+  (SELECT * FROM nm_off EXCEPT ALL SELECT * FROM nm_on)
+);
+----
+0
+
+statement ok
+DETACH ex;

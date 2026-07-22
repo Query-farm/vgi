@@ -1,0 +1,118 @@
+# name: test/sql/integration/cache/per_value_multi_batch.test
+# description: Per-VALUE memoization of a 1->N blended map (cached_explode) with
+#   INTERLEAVED worker output — the rows for a given distinct value are NOT a
+#   contiguous run in the worker's output batch. This stresses the per-value store's
+#   rows_by_d gather (which groups the pre-expand worker output by distinct index)
+#   and the serve-time reassembly: a gather that assumed each value's rows were
+#   contiguous would corrupt the result. The memoized result must equal both the
+#   per-value-OFF path and the row-by-row path, and a warm chunk with the same
+#   distinct set full-hits (zero write_input) including the 1:N and negative slots.
+# group: [vgi_integration_cache]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+SET threads=1;
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+# cached_explode(n): emits round-robin range(n) per input row (n=0 filters, n>1 fans
+# out), so over x % 4 the distinct values {0,1,2,3} cover 1:0, 1:1 and 1:N in one call.
+
+# ---------------------------------------------------------------------------
+# Cold over range(12): 4 distinct values (dedup → write_input=4), each memoized.
+# 18 output rows; sum(i)=12 (the emitted integers); sum(x)=114 (correlated stamp).
+# ---------------------------------------------------------------------------
+statement ok
+CALL enable_logging(level := 'debug');
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query III
+SELECT count(*), sum(i)::BIGINT, sum(x)::BIGINT FROM range(12) g(x), LATERAL ex.cached_explode(x % 4);
+----
+18	12	114
+
+query I
+SELECT max(CAST(regexp_extract(message, 'input_rows=([0-9]+)', 1) AS BIGINT))
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'table_in_out.write_input'
+  AND message LIKE '%cached_explode%';
+----
+4
+
+# ---------------------------------------------------------------------------
+# Warm: a DIFFERENT composition (range(4)) over the SAME distinct set {0,1,2,3}.
+# The M2 whole-chunk key misses (different chunk) but every value FULL-HITs the
+# per-value tier → served WITHOUT the worker (zero write_input), including the 1:N
+# slots and the n=0 negative memo. 6 rows; sum(i)=4.
+# ---------------------------------------------------------------------------
+statement ok
+CALL truncate_duckdb_logs();
+
+query II
+SELECT count(*), sum(i)::BIGINT FROM range(4) g(x), LATERAL ex.cached_explode(x % 4);
+----
+6	4
+
+query I
+SELECT count(*)
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'table_in_out.write_input'
+  AND message LIKE '%cached_explode%';
+----
+0
+
+statement ok
+CALL disable_logging();
+
+# ---------------------------------------------------------------------------
+# Equivalence: the per-value (batched) result matches BOTH per-value-OFF and the
+# row-by-row operator EXACTLY (multiset of (x, i) pairs), proving the interleaved
+# gather + stamp are correct, not just the aggregates.
+# ---------------------------------------------------------------------------
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+statement ok
+CREATE TEMP TABLE mb_on AS SELECT x, i FROM range(40) g(x), LATERAL ex.cached_explode(x % 5);
+
+statement ok
+SET vgi_result_cache_per_value=false;
+
+statement ok
+CREATE TEMP TABLE mb_off AS SELECT x, i FROM range(40) g(x), LATERAL ex.cached_explode(x % 5);
+
+statement ok
+SET vgi_batch_lateral=false;
+
+statement ok
+CREATE TEMP TABLE mb_row AS SELECT x, i FROM range(40) g(x), LATERAL ex.cached_explode(x % 5);
+
+# symmetric difference must be empty for both comparisons
+query I
+SELECT count(*) FROM (
+  (SELECT * FROM mb_on EXCEPT ALL SELECT * FROM mb_off)
+  UNION ALL
+  (SELECT * FROM mb_off EXCEPT ALL SELECT * FROM mb_on)
+  UNION ALL
+  (SELECT * FROM mb_on EXCEPT ALL SELECT * FROM mb_row)
+  UNION ALL
+  (SELECT * FROM mb_row EXCEPT ALL SELECT * FROM mb_on)
+);
+----
+0
+
+statement ok
+DETACH ex;
