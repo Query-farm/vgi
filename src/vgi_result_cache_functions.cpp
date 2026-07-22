@@ -28,11 +28,15 @@ static unique_ptr<FunctionData> VgiResultCacheFlushBind(ClientContext &, TableFu
 	return make_uniq<VgiResultCacheFlushData>();
 }
 
-static void VgiResultCacheFlushScan(ClientContext &, TableFunctionInput &data_p, DataChunk &output) {
+static void VgiResultCacheFlushScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
 	auto &data = data_p.bind_data->CastNoConst<VgiResultCacheFlushData>();
 	if (data.finished) {
 		return;
 	}
+	// Attach the per-value disk backend from vgi_result_cache_dir first, so a flush clears
+	// the disk tier even in a process that set the dir but has not yet called a per-value
+	// function (which is normally what attaches the backend). Idempotent.
+	SyncResultCacheSettings(context);
 	auto count = VgiResultCache::Instance().FlushAll();
 	// The per-value memo arena is a separate registry; flush it too so a flush gives a
 	// genuinely cold per-value tier (tests rely on this).

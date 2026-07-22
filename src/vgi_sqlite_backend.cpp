@@ -114,6 +114,9 @@ public:
 		std::lock_guard<std::mutex> lg(mu_);
 		if (db_) {
 			sqlite3_exec(db_, "DELETE FROM slots", nullptr, nullptr, nullptr);
+			// Reclaim the WAL immediately (TRUNCATE checkpoints then shrinks the -wal file
+			// to zero), so a flush leaves no on-disk residue.
+			sqlite3_exec(db_, "PRAGMA wal_checkpoint(TRUNCATE)", nullptr, nullptr, nullptr);
 		}
 	}
 
@@ -138,6 +141,11 @@ std::shared_ptr<PerValueDiskBackend> MakeSqliteDiskBackend(const std::string &di
 	sqlite3_exec(db, "PRAGMA journal_mode=WAL", nullptr, nullptr, nullptr);
 	sqlite3_exec(db, "PRAGMA synchronous=NORMAL", nullptr, nullptr, nullptr);
 	sqlite3_exec(db, "PRAGMA busy_timeout=5000", nullptr, nullptr, nullptr);
+	// Auto-checkpoint the WAL every ~1000 pages (~4 MB) — the default, set explicitly so
+	// the -wal file stays bounded even though the connection is a leaked process-lifetime
+	// singleton (never cleanly closed). Verified: 1M stores through one connection leaves
+	// the WAL at ~0.3 MB while the main DB holds the data. NORMAL sync keeps this crash-safe.
+	sqlite3_exec(db, "PRAGMA wal_autocheckpoint=1000", nullptr, nullptr, nullptr);
 	const char *ddl = "CREATE TABLE IF NOT EXISTS slots("
 	                  "static_fp TEXT NOT NULL, input_blob BLOB NOT NULL, ipc BLOB NOT NULL,"
 	                  "rows INTEGER NOT NULL, expires_unix INTEGER NOT NULL,"

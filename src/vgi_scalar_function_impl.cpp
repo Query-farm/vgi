@@ -545,9 +545,14 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 		}
 		const char *reason = nullptr;
 		int64_t cver = 0;
+		// operator_kind carries a fingerprint of the worker OUTPUT schema (the scalar's
+		// return type) so a worker that changes its output shape WITHOUT bumping a version
+		// gets a DIFFERENT key — old-shaped cached bytes can never be served into the new
+		// shape (critical once results persist across a restart). See shape_key.
+		const std::string op_kind = "scalar\x1f" + result.GetType().ToString();
 		if (BuildExchangeCacheKeyStaticFields(context, bind_data->attach_params, bind_data->function_name,
 		                                      canon_args, bind_data->settings, {}, local_state.cache_static_key,
-		                                      local_state.cache_catalog_name, cver, reason, "scalar")) {
+		                                      local_state.cache_catalog_name, cver, reason, op_kind)) {
 			local_state.cache_eligible = true;
 			local_state.cache_static_fp = local_state.cache_static_key.Fingerprint();
 			Value ttl_v;

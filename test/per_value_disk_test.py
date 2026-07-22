@@ -211,6 +211,64 @@ def test_scale_eviction():
     print(f"       (scale={n}, threads={THREADS}, {dt:.1f}s)")
 
 
+# ---------------------------------------------------------------------------
+# 5. Soak: for VGI_PV_SOAK_SECONDS, hammer the disk-backed per-value tier with a
+#    mix of workloads — concurrent multi-process writers/readers over one dir,
+#    eviction pressure, cross-"restart" (a fresh process each iteration) — and
+#    assert correctness holds EVERY iteration and the SQLite WAL stays bounded.
+#    Off by default (0); a nightly/soak run sets e.g. VGI_PV_SOAK_SECONDS=600.
+# ---------------------------------------------------------------------------
+def test_soak(dirroot):
+    secs = int(os.environ.get("VGI_PV_SOAK_SECONDS", "0"))
+    if secs <= 0:
+        return
+    d = os.path.join(dirroot, "soak")
+    os.makedirs(d)
+    wal = os.path.join(d, "vgi_per_value.sqlite-wal")
+    # Each iteration: N distinct over 2N rows (some reuse), 2 threads, disk on, a tiny
+    # byte cap to force in-memory eviction (disk still holds everything). Result must
+    # equal the analytic sum(2*(i%N)) for i in [0,2N).
+    n = 20000
+    rows = 2 * n
+    analytic = 2 * sum(i % n for i in range(rows))
+    sql = (
+        f"SET vgi_result_cache_dir='{d}'; SET threads=2;\n"
+        "SET vgi_result_cache_per_value_max_stores_per_chunk=0;\n"
+        "SET vgi_result_cache_max_bytes=1000000;\n"
+        f"CREATE TABLE t AS SELECT (i % {n})::BIGINT v FROM range({rows}) g(i);\n"
+        "SELECT 's', sum(ex.cached_double_scalar(v))::HUGEINT FROM t;\n"
+    )
+    t_end = time.time() + secs
+    it = 0
+    max_wal = 0
+    bad = 0
+    concurrent = 0
+    while time.time() < t_end:
+        it += 1
+        if it % 3 == 0:
+            # concurrent pair on the same dir
+            pa, sa = run_bg(sql)
+            pb, sb = run_bg(sql)
+            oa, _ = pa.communicate(sa)
+            ob, _ = pb.communicate(sb)
+            for o in (oa, ob):
+                r = tagged(o, "s")
+                if not (r and int(r[1]) == analytic):
+                    bad += 1
+            concurrent += 1
+        else:
+            out, _, _ = run(sql)
+            r = tagged(out, "s")
+            if not (r and int(r[1]) == analytic):
+                bad += 1
+        if os.path.exists(wal):
+            max_wal = max(max_wal, os.path.getsize(wal))
+    check(f"soak: correctness held all {it} iterations", bad == 0, f"{bad} bad")
+    # WAL must stay bounded (autocheckpoint ~4 MB); allow generous 32 MB headroom.
+    check(f"soak: WAL bounded (max {max_wal//1024} KB over {it} iters, {concurrent} concurrent)",
+          max_wal < 32 * 1024 * 1024, f"max_wal={max_wal}")
+
+
 def main():
     if not os.path.exists(HAYBARN):
         print(f"haybarn not found at {HAYBARN} (set VGI_HAYBARN)", file=sys.stderr)
@@ -227,6 +285,10 @@ def main():
         test_multiprocess(dirroot)
         print(f"- scale + eviction correctness (VGI_PV_SCALE={SCALE})")
         test_scale_eviction()
+        soak = int(os.environ.get("VGI_PV_SOAK_SECONDS", "0"))
+        if soak > 0:
+            print(f"- soak ({soak}s: concurrent multi-process + eviction + disk)")
+            test_soak(dirroot)
     finally:
         shutil.rmtree(dirroot, ignore_errors=True)
     print()

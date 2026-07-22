@@ -459,8 +459,17 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 		}
 		const char *reason = nullptr;
 		int64_t catalog_version = 0;
+		// operator_kind carries a fingerprint of the WORKER output schema (types[0..base_idx],
+		// the worker columns before the projected outer columns) so a worker that changes its
+		// output shape without bumping a version gets a DIFFERENT key — old-shaped cached bytes
+		// can never be served into the new shape (critical across a disk restart). See shape_key.
+		std::string op_kind = "lateral";
+		for (idx_t c = 0; c < base_idx; c++) {
+			op_kind += '\x1f';
+			op_kind += types[c].ToString();
+		}
 		if (BuildExchangeCacheKeyStatic(client_context, bd, proj_key, state.cache_static_key,
-		                                state.cache_catalog_name, catalog_version, reason, "lateral")) {
+		                                state.cache_catalog_name, catalog_version, reason, op_kind)) {
 			state.cache_eligible = true;
 			state.cache_static_fp = state.cache_static_key.Fingerprint();
 			gstate.cache_eligible.store(true, std::memory_order_relaxed); // arm EXPLAIN ANALYZE reporting
