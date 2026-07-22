@@ -14,6 +14,7 @@
 #include "vgi_memo_arena.hpp"
 
 #include <chrono>
+#include <cstdio>
 #include <mutex>
 
 namespace duckdb {
@@ -30,6 +31,22 @@ namespace duckdb {
 namespace vgi {
 
 namespace {
+
+// Error logging for the disk tier. Failures are rare and operationally important (a
+// silent disk cache is worse than no cache), so these go to stderr UNCONDITIONALLY —
+// not gated behind VGI_STDERR_LOG. A fatal error disables the backend (see disabled_)
+// so it logs once and degrades to memory-only rather than spamming.
+void LogDiskErr(const char *what, sqlite3 *db) {
+	std::fprintf(stderr, "[vgi] per-value disk cache: %s%s%s\n", what, db ? ": " : "",
+	             db ? sqlite3_errmsg(db) : "");
+	std::fflush(stderr);
+}
+
+bool IsFatalSqlite(int rc) {
+	// Errors that will keep failing → stop trying (disable). Transient ones (BUSY after
+	// the busy_timeout, FULL when the disk clears) are logged but not disabling.
+	return rc == SQLITE_CORRUPT || rc == SQLITE_NOTADB || rc == SQLITE_CANTOPEN || rc == SQLITE_READONLY;
+}
 
 class SqliteDiskBackend : public PerValueDiskBackend {
 public:
@@ -48,7 +65,7 @@ public:
 	void Persist(const std::string &static_fp, const std::string & /*schema_ipc*/,
 	             const std::vector<PersistedSlot> &slots) override {
 		std::lock_guard<std::mutex> lg(mu_);
-		if (!db_ || slots.empty()) {
+		if (!db_ || disabled_ || slots.empty()) {
 			return;
 		}
 		const int64_t now_unix = NowUnix();
@@ -59,9 +76,11 @@ public:
 		                  " VALUES(?,?,?,?,?,?,?,?,?,?)";
 		sqlite3_stmt *st = nullptr;
 		if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) {
+			HandleErrLocked("persist prepare failed", sqlite3_errcode(db_));
 			sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
 			return;
 		}
+		int first_err = SQLITE_OK;
 		for (const auto &s : slots) {
 			sqlite3_bind_text(st, 1, static_fp.data(), static_cast<int>(static_fp.size()), SQLITE_STATIC);
 			sqlite3_bind_blob(st, 2, s.input_blob.data(), static_cast<int>(s.input_blob.size()), SQLITE_STATIC);
@@ -73,11 +92,20 @@ public:
 			sqlite3_bind_text(st, 8, s.etag.data(), static_cast<int>(s.etag.size()), SQLITE_STATIC);
 			sqlite3_bind_text(st, 9, s.last_modified.data(), static_cast<int>(s.last_modified.size()), SQLITE_STATIC);
 			sqlite3_bind_int(st, 10, s.revalidatable ? 1 : 0);
-			sqlite3_step(st);
+			const int rc = sqlite3_step(st);
+			if (rc != SQLITE_DONE && first_err == SQLITE_OK) {
+				first_err = rc;
+			}
 			sqlite3_reset(st);
 		}
 		sqlite3_finalize(st);
-		sqlite3_exec(db_, "COMMIT", nullptr, nullptr, nullptr);
+		if (sqlite3_exec(db_, "COMMIT", nullptr, nullptr, nullptr) != SQLITE_OK && first_err == SQLITE_OK) {
+			first_err = sqlite3_errcode(db_);
+		}
+		if (first_err != SQLITE_OK) {
+			HandleErrLocked("persist write failed", first_err);
+			return; // skip reap/evict on a failed write
+		}
 		// Reap expired rows and evict LRU to stay under the byte cap (bounded, off the hot
 		// path — this runs only on a store, i.e. a cache miss).
 		ReapAndEvictLocked(now_unix);
@@ -86,13 +114,14 @@ public:
 	bool Hydrate(const std::string &static_fp, int64_t now_unix, std::string & /*schema_ipc_out*/,
 	             std::vector<PersistedSlot> &slots_out) override {
 		std::lock_guard<std::mutex> lg(mu_);
-		if (!db_) {
+		if (!db_ || disabled_) {
 			return false;
 		}
 		const char *sql = "SELECT input_blob,ipc,rows,expires_unix,scope,etag,last_modified,revalidatable"
 		                  " FROM slots WHERE static_fp=? AND (expires_unix<0 OR expires_unix>?)";
 		sqlite3_stmt *st = nullptr;
 		if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) {
+			HandleErrLocked("hydrate prepare failed", sqlite3_errcode(db_));
 			return false;
 		}
 		sqlite3_bind_text(st, 1, static_fp.data(), static_cast<int>(static_fp.size()), SQLITE_STATIC);
@@ -147,6 +176,20 @@ public:
 	}
 
 private:
+	// Log a disk error (throttled so a full/busy disk can't spam) and disable the backend
+	// on a fatal error so it degrades to memory-only instead of failing on every store.
+	void HandleErrLocked(const char *what, int rc) {
+		err_count_++;
+		if (err_count_ <= 3 || (err_count_ % 1000) == 0) {
+			LogDiskErr(what, db_);
+		}
+		if (IsFatalSqlite(rc)) {
+			if (!disabled_) {
+				LogDiskErr("disabling per-value disk tier (degrading to memory-only)", db_);
+			}
+			disabled_ = true;
+		}
+	}
 	static int64_t NowUnix() {
 		return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch())
 		    .count();
@@ -195,6 +238,8 @@ private:
 	std::mutex mu_;
 	sqlite3 *db_ = nullptr;
 	int64_t max_bytes_ = 0; // 0 = unlimited
+	bool disabled_ = false; // set on a fatal error → memory-only
+	uint64_t err_count_ = 0;
 };
 
 } // namespace
@@ -203,6 +248,7 @@ std::shared_ptr<PerValueDiskBackend> MakeSqliteDiskBackend(const std::string &di
 	const std::string path = dir + "/vgi_per_value.sqlite";
 	sqlite3 *db = nullptr;
 	if (sqlite3_open(path.c_str(), &db) != SQLITE_OK) {
+		LogDiskErr(("open failed (" + path + ") — per-value disk tier off").c_str(), db);
 		if (db) {
 			sqlite3_close(db);
 		}
@@ -241,6 +287,7 @@ std::shared_ptr<PerValueDiskBackend> MakeSqliteDiskBackend(const std::string &di
 	                  "PRIMARY KEY(static_fp,input_blob));"
 	                  "CREATE INDEX IF NOT EXISTS slots_lru ON slots(last_used);";
 	if (sqlite3_exec(db, ddl, nullptr, nullptr, nullptr) != SQLITE_OK) {
+		LogDiskErr("schema init failed — per-value disk tier off", db);
 		sqlite3_close(db);
 		return nullptr;
 	}
