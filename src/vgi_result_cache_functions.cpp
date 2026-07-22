@@ -135,6 +135,22 @@ static unique_ptr<FunctionData> VgiResultCacheListBind(ClientContext &, TableFun
 	                LogicalType::UBIGINT, LogicalType::VARCHAR, LogicalType::VARCHAR};
 	auto data = make_uniq<VgiResultCacheListData>();
 	data->entries = VgiResultCache::Instance().Snapshot();
+	// Per-value memo arenas are a SEPARATE registry (one arena per function, not per
+	// value), so surface them as one row each (tier='arena'): num_batches = live slots,
+	// num_rows = total stored rows (live + dead), total_bytes = the arena's real footprint.
+	// ttl_seconds is -1 because slots expire heterogeneously.
+	for (auto &ar : vgi::VgiMemoArenaRegistry::Instance().Snapshot()) {
+		VgiResultCache::EntryInfo e;
+		e.function_name = "(per-value arena)";
+		e.key_hex = ar.static_fp.substr(0, 16);
+		e.tier = "arena";
+		e.num_substreams = 1;
+		e.num_batches = ar.stats.live_slots;
+		e.num_rows = ar.stats.total_rows;
+		e.total_bytes = ar.stats.footprint_bytes;
+		e.ttl_seconds = -1;
+		data->entries.push_back(std::move(e));
+	}
 	// include_disk := true → also walk the on-disk tier so spilled/disk-only entries
 	// (which never enter the in-memory index) are observable (tier='disk').
 	auto it = input.named_parameters.find("include_disk");

@@ -213,11 +213,19 @@ int64_t VgiMemoArena::Store(const std::shared_ptr<arrow::RecordBatch> &batch,
 	const int64_t batch_base = base_rows_ + (tail_rows_ - appended);
 	int64_t off = 0;
 	int64_t new_dead = 0;
+	// Structural bound on a single arena (the registry's byte-budget eviction cannot evict
+	// the arena currently being appended to, so a single pathological high-cardinality key
+	// must not grow without limit). Over the cap, new values are simply not memoized.
+	const int64_t kMaxSlots = 1 << 20;
 	for (const auto &sp : specs) {
 		const int64_t start = batch_base + off;
 		off += sp.length;
 		if (slots_.find(*sp.key) != slots_.end()) {
 			new_dead += sp.length; // first-writer-wins: keep the existing slot
+			continue;
+		}
+		if (static_cast<int64_t>(slots_.size()) >= kMaxSlots) {
+			new_dead += sp.length; // arena full: this value's rows become dead, not memoized
 			continue;
 		}
 		VgiMemoSlot s;
