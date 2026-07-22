@@ -269,6 +269,41 @@ def test_soak(dirroot):
           max_wal < 32 * 1024 * 1024, f"max_wal={max_wal}")
 
 
+# ---------------------------------------------------------------------------
+# 6. Disk size cap + LRU eviction: with a small vgi_result_cache_per_value_disk_max_bytes,
+#    memoize FAR more distinct values than fit. The SQLite store must stay under the cap
+#    (LRU-evicting cold entries) and the result must stay exactly correct (evicted values
+#    recompute).
+# ---------------------------------------------------------------------------
+def _sqlite_used_bytes(db):
+    def pragma(p):
+        try:
+            return int(subprocess.run(["sqlite3", db, f"PRAGMA {p}"], capture_output=True, text=True).stdout or 0)
+        except Exception:
+            return 0
+    return (pragma("page_count") - pragma("freelist_count")) * pragma("page_size")
+
+def test_disk_cap(dirroot):
+    d = os.path.join(dirroot, "cap")
+    os.makedirs(d)
+    cap = 3_000_000
+    n = 300_000
+    analytic = 2 * sum(range(n))
+    sql = (
+        f"SET vgi_result_cache_dir='{d}'; SET threads=1;\n"
+        f"SET vgi_result_cache_per_value_disk_max_bytes={cap};\n"
+        "SET vgi_result_cache_per_value_max_stores_per_chunk=0;\n"
+        f"SELECT 's', sum(ex.cached_double_scalar(v))::HUGEINT FROM range({n}) g(v);\n"
+    )
+    out, _, _ = run(sql)
+    r = tagged(out, "s")
+    used = _sqlite_used_bytes(os.path.join(d, "vgi_per_value.sqlite"))
+    check(f"disk_cap: correct under LRU eviction ({n} distinct)", r and int(r[1]) == analytic, f"got {r}")
+    # Allow one eviction batch of headroom over the cap.
+    check(f"disk_cap: SQLite bounded ({used//1024} KB <= {cap//1024} KB cap)", 0 < used <= cap + 512 * 1024,
+          f"used={used} cap={cap}")
+
+
 def main():
     if not os.path.exists(HAYBARN):
         print(f"haybarn not found at {HAYBARN} (set VGI_HAYBARN)", file=sys.stderr)
@@ -285,6 +320,8 @@ def main():
         test_multiprocess(dirroot)
         print(f"- scale + eviction correctness (VGI_PV_SCALE={SCALE})")
         test_scale_eviction()
+        print("- disk size cap + LRU eviction")
+        test_disk_cap(dirroot)
         soak = int(os.environ.get("VGI_PV_SOAK_SECONDS", "0"))
         if soak > 0:
             print(f"- soak ({soak}s: concurrent multi-process + eviction + disk)")

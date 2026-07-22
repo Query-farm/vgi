@@ -257,8 +257,14 @@ void SyncResultCacheSettings(ClientContext &context) {
 	// the whole-cache max_bytes so `SET vgi_result_cache_max_bytes` bounds it too.
 	VgiMemoArenaRegistry::Instance().SetMaxBytes(static_cast<int64_t>(s.max_bytes));
 	// `SET vgi_result_cache_dir` turns on the per-value disk tier (same-host multi-process
-	// + cross-restart warm reuse). Idempotent: a no-op when the dir is unchanged.
-	VgiMemoArenaRegistry::Instance().EnsureSqliteBackend(s.disk_dir);
+	// + cross-restart warm reuse); `..._per_value_disk_max_bytes` caps its on-disk size
+	// (LRU eviction + expired-row reaping), 0 = unlimited.
+	uint64_t pv_disk_max = 0;
+	Value pdmv;
+	if (context.TryGetCurrentSetting("vgi_result_cache_per_value_disk_max_bytes", pdmv) && !pdmv.IsNull()) {
+		pv_disk_max = pdmv.GetValue<uint64_t>();
+	}
+	VgiMemoArenaRegistry::Instance().EnsureSqliteBackend(s.disk_dir, static_cast<int64_t>(pv_disk_max));
 }
 
 bool BuildExchangeCacheKeyStaticFields(ClientContext &context,

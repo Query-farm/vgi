@@ -13,6 +13,7 @@
 
 #include "vgi_memo_arena.hpp"
 
+#include <chrono>
 #include <mutex>
 
 namespace duckdb {
@@ -39,16 +40,23 @@ public:
 		}
 	}
 
+	void SetMaxBytes(int64_t max_bytes) override {
+		std::lock_guard<std::mutex> lg(mu_);
+		max_bytes_ = max_bytes;
+	}
+
 	void Persist(const std::string &static_fp, const std::string & /*schema_ipc*/,
 	             const std::vector<PersistedSlot> &slots) override {
 		std::lock_guard<std::mutex> lg(mu_);
 		if (!db_ || slots.empty()) {
 			return;
 		}
+		const int64_t now_unix = NowUnix();
 		sqlite3_exec(db_, "BEGIN", nullptr, nullptr, nullptr);
 		const char *sql = "INSERT OR REPLACE INTO slots"
-		                  "(static_fp,input_blob,ipc,rows,expires_unix,scope,etag,last_modified,revalidatable)"
-		                  " VALUES(?,?,?,?,?,?,?,?,?)";
+		                  "(static_fp,input_blob,ipc,rows,expires_unix,last_used,"
+		                  "scope,etag,last_modified,revalidatable)"
+		                  " VALUES(?,?,?,?,?,?,?,?,?,?)";
 		sqlite3_stmt *st = nullptr;
 		if (sqlite3_prepare_v2(db_, sql, -1, &st, nullptr) != SQLITE_OK) {
 			sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
@@ -60,15 +68,19 @@ public:
 			sqlite3_bind_blob(st, 3, s.ipc.data(), static_cast<int>(s.ipc.size()), SQLITE_STATIC);
 			sqlite3_bind_int64(st, 4, s.rows);
 			sqlite3_bind_int64(st, 5, s.expires_unix);
-			sqlite3_bind_text(st, 6, s.scope.data(), static_cast<int>(s.scope.size()), SQLITE_STATIC);
-			sqlite3_bind_text(st, 7, s.etag.data(), static_cast<int>(s.etag.size()), SQLITE_STATIC);
-			sqlite3_bind_text(st, 8, s.last_modified.data(), static_cast<int>(s.last_modified.size()), SQLITE_STATIC);
-			sqlite3_bind_int(st, 9, s.revalidatable ? 1 : 0);
+			sqlite3_bind_int64(st, 6, now_unix); // last_used (LRU)
+			sqlite3_bind_text(st, 7, s.scope.data(), static_cast<int>(s.scope.size()), SQLITE_STATIC);
+			sqlite3_bind_text(st, 8, s.etag.data(), static_cast<int>(s.etag.size()), SQLITE_STATIC);
+			sqlite3_bind_text(st, 9, s.last_modified.data(), static_cast<int>(s.last_modified.size()), SQLITE_STATIC);
+			sqlite3_bind_int(st, 10, s.revalidatable ? 1 : 0);
 			sqlite3_step(st);
 			sqlite3_reset(st);
 		}
 		sqlite3_finalize(st);
 		sqlite3_exec(db_, "COMMIT", nullptr, nullptr, nullptr);
+		// Reap expired rows and evict LRU to stay under the byte cap (bounded, off the hot
+		// path — this runs only on a store, i.e. a cache miss).
+		ReapAndEvictLocked(now_unix);
 	}
 
 	bool Hydrate(const std::string &static_fp, int64_t now_unix, std::string & /*schema_ipc_out*/,
@@ -107,6 +119,20 @@ public:
 			slots_out.push_back(std::move(p));
 		}
 		sqlite3_finalize(st);
+		if (any) {
+			// LRU touch: mark this key's live rows as recently used so eviction favours
+			// genuinely cold static keys.
+			sqlite3_stmt *up = nullptr;
+			if (sqlite3_prepare_v2(
+			        db_, "UPDATE slots SET last_used=? WHERE static_fp=? AND (expires_unix<0 OR expires_unix>?)",
+			        -1, &up, nullptr) == SQLITE_OK) {
+				sqlite3_bind_int64(up, 1, now_unix);
+				sqlite3_bind_text(up, 2, static_fp.data(), static_cast<int>(static_fp.size()), SQLITE_STATIC);
+				sqlite3_bind_int64(up, 3, now_unix);
+				sqlite3_step(up);
+				sqlite3_finalize(up);
+			}
+		}
 		return any;
 	}
 
@@ -121,8 +147,54 @@ public:
 	}
 
 private:
+	static int64_t NowUnix() {
+		return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch())
+		    .count();
+	}
+	int64_t PragmaIntLocked(const char *pragma) {
+		sqlite3_stmt *st = nullptr;
+		int64_t v = 0;
+		if (sqlite3_prepare_v2(db_, pragma, -1, &st, nullptr) == SQLITE_OK) {
+			if (sqlite3_step(st) == SQLITE_ROW) {
+				v = sqlite3_column_int64(st, 0);
+			}
+			sqlite3_finalize(st);
+		}
+		return v;
+	}
+	// Live data size = (total pages - freelist pages) * page size. O(1) pragmas, and it
+	// SHRINKS as rows are deleted (freed pages join the freelist, reused by later inserts),
+	// so evict-to-fit terminates without a VACUUM.
+	int64_t UsedBytesLocked() {
+		const int64_t page = PragmaIntLocked("PRAGMA page_size");
+		return (PragmaIntLocked("PRAGMA page_count") - PragmaIntLocked("PRAGMA freelist_count")) * page;
+	}
+	void ReapAndEvictLocked(int64_t now_unix) {
+		// Reap expired rows first.
+		sqlite3_stmt *rp = nullptr;
+		if (sqlite3_prepare_v2(db_, "DELETE FROM slots WHERE expires_unix>=0 AND expires_unix<=?", -1, &rp,
+		                       nullptr) == SQLITE_OK) {
+			sqlite3_bind_int64(rp, 1, now_unix);
+			sqlite3_step(rp);
+			sqlite3_finalize(rp);
+		}
+		if (max_bytes_ <= 0) {
+			return;
+		}
+		// Evict least-recently-used rows in batches until under the cap. Bounded loop.
+		for (int guard = 0; guard < 100000 && UsedBytesLocked() > max_bytes_; guard++) {
+			const int before = sqlite3_total_changes(db_);
+			sqlite3_exec(db_, "DELETE FROM slots WHERE rowid IN (SELECT rowid FROM slots ORDER BY last_used ASC LIMIT 512)",
+			             nullptr, nullptr, nullptr);
+			if (sqlite3_total_changes(db_) == before) {
+				break; // nothing left to delete
+			}
+		}
+	}
+
 	std::mutex mu_;
 	sqlite3 *db_ = nullptr;
+	int64_t max_bytes_ = 0; // 0 = unlimited
 };
 
 } // namespace
@@ -146,11 +218,28 @@ std::shared_ptr<PerValueDiskBackend> MakeSqliteDiskBackend(const std::string &di
 	// singleton (never cleanly closed). Verified: 1M stores through one connection leaves
 	// the WAL at ~0.3 MB while the main DB holds the data. NORMAL sync keeps this crash-safe.
 	sqlite3_exec(db, "PRAGMA wal_autocheckpoint=1000", nullptr, nullptr, nullptr);
+	// Schema version 2 adds the last_used column (LRU eviction). On a pre-v2 file, drop and
+	// recreate — the per-value tier is a cache, so invalidating it on upgrade is fine.
+	{
+		sqlite3_stmt *st = nullptr;
+		int64_t ver = 0;
+		if (sqlite3_prepare_v2(db, "PRAGMA user_version", -1, &st, nullptr) == SQLITE_OK) {
+			if (sqlite3_step(st) == SQLITE_ROW) {
+				ver = sqlite3_column_int64(st, 0);
+			}
+			sqlite3_finalize(st);
+		}
+		if (ver != 0 && ver < 2) {
+			sqlite3_exec(db, "DROP TABLE IF EXISTS slots", nullptr, nullptr, nullptr);
+		}
+		sqlite3_exec(db, "PRAGMA user_version=2", nullptr, nullptr, nullptr);
+	}
 	const char *ddl = "CREATE TABLE IF NOT EXISTS slots("
 	                  "static_fp TEXT NOT NULL, input_blob BLOB NOT NULL, ipc BLOB NOT NULL,"
-	                  "rows INTEGER NOT NULL, expires_unix INTEGER NOT NULL,"
+	                  "rows INTEGER NOT NULL, expires_unix INTEGER NOT NULL, last_used INTEGER NOT NULL DEFAULT 0,"
 	                  "scope TEXT, etag TEXT, last_modified TEXT, revalidatable INTEGER,"
-	                  "PRIMARY KEY(static_fp,input_blob))";
+	                  "PRIMARY KEY(static_fp,input_blob));"
+	                  "CREATE INDEX IF NOT EXISTS slots_lru ON slots(last_used);";
 	if (sqlite3_exec(db, ddl, nullptr, nullptr, nullptr) != SQLITE_OK) {
 		sqlite3_close(db);
 		return nullptr;

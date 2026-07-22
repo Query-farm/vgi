@@ -67,6 +67,9 @@ public:
 	                     std::vector<PersistedSlot> &slots_out) = 0;
 	// Clear everything (for vgi_result_cache_flush()).
 	virtual void Flush() = 0;
+	// Cap the on-disk size in bytes (0 = unlimited). When set, the backend reaps expired
+	// rows and evicts least-recently-used entries to stay under the cap. Default no-op.
+	virtual void SetMaxBytes(int64_t /*max_bytes*/) {}
 };
 
 // Create a SQLite-backed PerValueDiskBackend rooted at `dir` (WAL mode: concurrent
@@ -239,10 +242,11 @@ public:
 	// Attach the persistence backend (null = memory-only). New arenas hydrate from it on
 	// a cold GetOrCreate, and their stores persist through it.
 	void SetBackend(std::shared_ptr<PerValueDiskBackend> backend);
-	// Idempotently attach a SQLite backend rooted at `dir` (empty → detach). Tracks the
-	// current dir so a repeated call with the same value is a no-op. Called from
-	// SyncResultCacheSettings so `SET vgi_result_cache_dir` turns the disk tier on.
-	void EnsureSqliteBackend(const std::string &dir);
+	// Idempotently attach a SQLite backend rooted at `dir` (empty → detach) and apply the
+	// on-disk byte cap (0 = unlimited). Tracks the current dir so a repeated call with the
+	// same dir only refreshes the cap. Called from SyncResultCacheSettings so
+	// `SET vgi_result_cache_dir` / `..._per_value_disk_max_bytes` take effect.
+	void EnsureSqliteBackend(const std::string &dir, int64_t disk_max_bytes);
 	void FlushAll();
 
 	// Snapshot for diagnostics (one row per arena).

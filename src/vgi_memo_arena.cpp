@@ -577,14 +577,16 @@ void VgiMemoArenaRegistry::SetBackend(std::shared_ptr<PerValueDiskBackend> backe
 	backend_ = std::move(backend);
 }
 
-void VgiMemoArenaRegistry::EnsureSqliteBackend(const std::string &dir) {
+void VgiMemoArenaRegistry::EnsureSqliteBackend(const std::string &dir, int64_t disk_max_bytes) {
 	std::lock_guard<std::mutex> lg(mu_);
-	if (dir == backend_dir_) {
-		return; // unchanged — no-op (this is called per operator-state build)
+	if (dir != backend_dir_) {
+		backend_dir_ = dir;
+		backend_ = dir.empty() ? nullptr : MakeSqliteDiskBackend(dir);
+		// Existing in-memory arenas keep serving; new/cold ones will use the new backend.
 	}
-	backend_dir_ = dir;
-	backend_ = dir.empty() ? nullptr : MakeSqliteDiskBackend(dir);
-	// Existing in-memory arenas keep serving; new/cold ones will use the new backend.
+	if (backend_) {
+		backend_->SetMaxBytes(disk_max_bytes); // refresh the cap even when the dir is unchanged
+	}
 }
 
 void VgiMemoArenaRegistry::FlushAll() {

@@ -3418,6 +3418,12 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "never breaks store-then-hit for a low-cardinality workload (K new < cap → all "
 	                          "stored). Default 256",
 	                          LogicalType::UBIGINT, Value::UBIGINT(256));
+	config.AddExtensionOption("vgi_result_cache_per_value_disk_max_bytes",
+	                          "Cap on the on-disk size (bytes) of the per-value memo SQLite store when "
+	                          "vgi_result_cache_dir is set. Over the cap, the backend reaps expired rows and "
+	                          "evicts least-recently-used entries (LRU) to stay under it — enforced on store "
+	                          "(a cache miss), off the hot path. 0 = unlimited. Default 1 GiB",
+	                          LogicalType::UBIGINT, Value::UBIGINT(1073741824ULL));
 	config.AddExtensionOption("vgi_exchange_per_batch_min_distinct_ratio",
 	                          "DEPRECATED / NO-OP. Formerly suppressed the coarse per-chunk (M2) exchange-cache "
 	                          "entry when the chunk's distinct ratio (K/N) fell below this, on the theory that "
