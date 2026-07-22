@@ -60,7 +60,7 @@ int32_t VgiMemoArena::ResolveValidator(const ArenaValidator &v) {
 	if (v.scope.empty() && v.etag.empty() && v.last_modified.empty() && !v.revalidatable) {
 		return -1;
 	}
-	std::lock_guard<std::mutex> lg(mu_);
+	std::unique_lock<std::shared_mutex> lg(mu_);
 	for (size_t i = 0; i < validators_.size(); i++) {
 		if (validators_[i] == v) {
 			return static_cast<int32_t>(i);
@@ -71,7 +71,7 @@ int32_t VgiMemoArena::ResolveValidator(const ArenaValidator &v) {
 }
 
 ArenaValidator VgiMemoArena::GetValidator(int32_t ref) {
-	std::lock_guard<std::mutex> lg(mu_);
+	std::shared_lock<std::shared_mutex> lg(mu_);
 	if (ref < 0 || ref >= static_cast<int32_t>(validators_.size())) {
 		return ArenaValidator {};
 	}
@@ -135,23 +135,24 @@ ArenaProbeResult VgiMemoArena::Probe(const std::vector<std::string> &keys,
 	std::vector<int64_t> logical;
 	std::vector<int32_t> parent;
 
-	std::lock_guard<std::mutex> lg(mu_);
-	++tick_;
+	// SHARED lock: read-only. Concurrent probes of the same (hot) arena run their gathers
+	// in parallel. NO mutation here — a stale slot is treated as a MISS and left in place;
+	// the exclusive Store path reclaims stale slots + their rows (either by overwriting the
+	// key on a re-store, or by dropping it on the next compaction). This is what removes the
+	// Step-5 warm-serve contention (Probe used to hold an exclusive lock during the Take).
+	std::shared_lock<std::shared_mutex> lg(mu_);
 	bool first_hit = true;
 	for (size_t k = 0; k < keys.size(); k++) {
 		auto it = slots_.find(keys[k]);
 		if (it == slots_.end()) {
 			continue;
 		}
-		VgiMemoSlot &s = it->second;
+		const VgiMemoSlot &s = it->second;
 		if (!s.never_expires && now >= s.expires_at) {
-			dead_rows_ += s.length; // stale: unpublish; its rows are now dead
-			slots_.erase(it);
-			continue;
+			continue; // stale → MISS (reclaimed by Store, never mutated under the shared lock)
 		}
 		r.hit[k] = 1;
 		r.validator_ref[k] = s.validator_ref;
-		s.last_used = tick_;
 		r.num_hits++;
 		// Aggregate for the M2 cc-latch (B1/B2).
 		if (!s.never_expires) {
@@ -180,25 +181,18 @@ ArenaProbeResult VgiMemoArena::Probe(const std::vector<std::string> &keys,
 		r.parent = std::move(parent);
 		r.served_bytes = r.rows ? arrow::util::TotalBufferSize(*r.rows) : 0;
 	}
-	// A pure-read arena whose slots expire accumulates dead rows with no append to
-	// trigger compaction; reclaim here when the dead fraction is high.
-	const int64_t total = base_rows_ + tail_rows_;
-	if (total > 0 && dead_rows_ * 2 >= total) {
-		CompactLocked();
-		RecomputeFootprintLocked();
-	}
 	return r;
 }
 
 int64_t VgiMemoArena::Store(const std::shared_ptr<arrow::RecordBatch> &batch,
                             const std::vector<ArenaStoreSpec> &specs,
                             std::chrono::steady_clock::time_point expires_at, bool never_expires) {
-	std::lock_guard<std::mutex> lg(mu_);
-	++tick_;
+	std::unique_lock<std::shared_mutex> lg(mu_);
 	const int64_t before = footprint_;
+	const auto now = std::chrono::steady_clock::now();
 
 	// Append the whole batch to the tail (coalesced into one contiguous batch). Rows
-	// land at [base_rows_ + old_tail_rows, ...). Specs whose key already has a live
+	// land at [base_rows_ + old_tail_rows, ...). Specs whose key already has a FRESH
 	// slot are skipped (first-writer-wins); their rows in `batch` become dead.
 	const int64_t appended = batch ? batch->num_rows() : 0;
 	if (appended > 0) {
@@ -220,9 +214,18 @@ int64_t VgiMemoArena::Store(const std::shared_ptr<arrow::RecordBatch> &batch,
 	for (const auto &sp : specs) {
 		const int64_t start = batch_base + off;
 		off += sp.length;
-		if (slots_.find(*sp.key) != slots_.end()) {
-			new_dead += sp.length; // first-writer-wins: keep the existing slot
-			continue;
+		auto it = slots_.find(*sp.key);
+		if (it != slots_.end()) {
+			if (!it->second.never_expires && now >= it->second.expires_at) {
+				// Existing slot is STALE — reclaim it so this value can be re-memoized
+				// (Probe treated it as a miss). Its old rows become dead; fall through to
+				// insert the fresh slot below.
+				dead_rows_ += it->second.length;
+				slots_.erase(it);
+			} else {
+				new_dead += sp.length; // fresh slot present → first-writer-wins
+				continue;
+			}
 		}
 		if (static_cast<int64_t>(slots_.size()) >= kMaxSlots) {
 			new_dead += sp.length; // arena full: this value's rows become dead, not memoized
@@ -234,12 +237,11 @@ int64_t VgiMemoArena::Store(const std::shared_ptr<arrow::RecordBatch> &batch,
 		s.validator_ref = sp.validator_ref;
 		s.expires_at = expires_at;
 		s.never_expires = never_expires;
-		s.last_used = tick_;
 		slots_.emplace(*sp.key, s);
 	}
 	dead_rows_ += new_dead;
 	if (ShouldCompactLocked()) {
-		CompactLocked();
+		CompactLocked(now);
 	}
 	const int64_t after = RecomputeFootprintLocked();
 	return after - before;
@@ -253,20 +255,29 @@ bool VgiMemoArena::ShouldCompactLocked() const {
 	return base_rows_ == 0 || tail_rows_ * 2 >= base_rows_ || dead_rows_ * 2 >= (base_rows_ + tail_rows_);
 }
 
-void VgiMemoArena::CompactLocked() {
-	// Rebuild base_ from ONLY the live slots (dropping dead rows) in slot-iteration
-	// order, rebasing each slot's row_start. Reads the OLD base_/tail_/base_rows_ via
-	// MaterializeLocked, so publish the new state only after materializing.
+void VgiMemoArena::CompactLocked(std::chrono::steady_clock::time_point now) {
+	// Rebuild base_ from ONLY the live+FRESH slots (dropping dead rows AND stale slots)
+	// in slot-iteration order, rebasing each slot's row_start. Reads the OLD
+	// base_/tail_/base_rows_ via MaterializeLocked, so publish the new state only after
+	// materializing. This is where stale slots left behind by Probe are reclaimed.
 	std::vector<int64_t> logical;
 	logical.reserve(static_cast<size_t>(base_rows_ + tail_rows_ - dead_rows_));
+	std::vector<std::string> stale_keys;
 	int64_t cursor = 0;
 	for (auto &kv : slots_) {
 		VgiMemoSlot &s = kv.second;
+		if (!s.never_expires && now >= s.expires_at) {
+			stale_keys.push_back(kv.first); // drop (and its rows) — do not carry into the new base
+			continue;
+		}
 		for (int32_t o = 0; o < s.length; o++) {
 			logical.push_back(s.row_start + static_cast<int64_t>(o));
 		}
 		s.row_start = cursor; // new offset in the rebuilt base
 		cursor += s.length;
+	}
+	for (auto &k : stale_keys) {
+		slots_.erase(k);
 	}
 	std::shared_ptr<arrow::RecordBatch> nb;
 	if (logical.empty()) {
@@ -303,12 +314,12 @@ int64_t VgiMemoArena::RecomputeFootprintLocked() {
 }
 
 int64_t VgiMemoArena::FootprintBytes() {
-	std::lock_guard<std::mutex> lg(mu_);
+	std::shared_lock<std::shared_mutex> lg(mu_);
 	return footprint_;
 }
 
 VgiMemoArena::Stats VgiMemoArena::GetStats() {
-	std::lock_guard<std::mutex> lg(mu_);
+	std::shared_lock<std::shared_mutex> lg(mu_);
 	Stats st;
 	st.live_slots = static_cast<int64_t>(slots_.size());
 	st.dead_rows = dead_rows_;

@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -125,7 +126,11 @@ public:
 	const std::shared_ptr<arrow::Schema> &schema() const { return schema_; }
 
 private:
-	std::mutex mu_;
+	// shared_mutex: Probe is a SHARED-lock reader (concurrent probes of a hot arena run
+	// their gathers in parallel over the immutable base/tail buffers — the measured Step-5
+	// contention was Probe holding an EXCLUSIVE lock during the Take). All mutation —
+	// Store, compaction, stale reclamation, validator dedup — takes the exclusive lock.
+	std::shared_mutex mu_;
 	std::shared_ptr<arrow::Schema> schema_;
 	std::shared_ptr<arrow::RecordBatch> base_; // contiguous, immutable once published
 	std::shared_ptr<arrow::RecordBatch> tail_; // recent appends coalesced into one batch
@@ -141,9 +146,9 @@ private:
 	// the order of `logical`. One Take when all rows are in base (the common path after
 	// a compaction); otherwise a 2-source gather (still O(#rows), never O(arena)).
 	std::shared_ptr<arrow::RecordBatch> MaterializeLocked(const std::vector<int64_t> &logical);
-	// Rebuild base_ from only the live slots (dropping dead rows) and clear tail_. Also
-	// serves as compaction. Rebases every slot's row_start. Recomputes footprint_.
-	void CompactLocked();
+	// Rebuild base_ from only the live+FRESH slots (dropping dead rows AND stale slots as
+	// of `now`) and clear tail_. Also serves as compaction. Rebases every slot's row_start.
+	void CompactLocked(std::chrono::steady_clock::time_point now);
 	bool ShouldCompactLocked() const;
 	int64_t RecomputeFootprintLocked();
 };
