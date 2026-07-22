@@ -256,6 +256,9 @@ void SyncResultCacheSettings(ClientContext &context) {
 	// The per-value memo arena is a separate registry with its own byte budget; it shares
 	// the whole-cache max_bytes so `SET vgi_result_cache_max_bytes` bounds it too.
 	VgiMemoArenaRegistry::Instance().SetMaxBytes(static_cast<int64_t>(s.max_bytes));
+	// `SET vgi_result_cache_dir` turns on the per-value disk tier (same-host multi-process
+	// + cross-restart warm reuse). Idempotent: a no-op when the dir is unchanged.
+	VgiMemoArenaRegistry::Instance().EnsureSqliteBackend(s.disk_dir);
 }
 
 bool BuildExchangeCacheKeyStaticFields(ClientContext &context,

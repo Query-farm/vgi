@@ -124,6 +124,7 @@ src/vgi_worker_pool_functions.cpp
 src/vgi_result_cache.cpp
 src/vgi_exchange_cache_key.cpp
 src/vgi_memo_arena.cpp
+src/vgi_sqlite_backend.cpp
 src/vgi_sha256.cpp
 src/vgi_input_dedup.cpp
 src/vgi_result_cache_functions.cpp
@@ -168,6 +169,20 @@ build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 # Link OpenSSL in both the static library as the loadable extension
 target_link_libraries(${EXTENSION_NAME} ${VGI_SSL_LIBS} ${VGI_ARROW_LIB})
 target_link_libraries(${LOADABLE_EXTENSION_NAME} ${VGI_SSL_LIBS} ${VGI_ARROW_LIB})
+
+# SQLite-backed per-value memo disk tier (same-host multi-process + cross-restart).
+# Native only: WASM has no filesystem tier (the cache dir is forced empty), so the
+# backend compiles to a null stub there. macOS/Linux ship libsqlite3; Windows would
+# vendor the amalgamation (follow-up).
+if(NOT EMSCRIPTEN)
+  find_library(VGI_SQLITE3_LIB sqlite3)
+  if(VGI_SQLITE3_LIB)
+    target_compile_definitions(${EXTENSION_NAME} PRIVATE VGI_ENABLE_SQLITE)
+    target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE VGI_ENABLE_SQLITE)
+    target_link_libraries(${EXTENSION_NAME} ${VGI_SQLITE3_LIB})
+    target_link_libraries(${LOADABLE_EXTENSION_NAME} ${VGI_SQLITE3_LIB})
+  endif()
+endif()
 
 install(
   TARGETS ${EXTENSION_NAME}

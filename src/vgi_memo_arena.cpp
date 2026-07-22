@@ -7,6 +7,9 @@
 #include <arrow/array/builder_primitive.h>
 #include <arrow/compute/api_vector.h> // arrow::compute::Take
 #include <arrow/datum.h>              // arrow::Datum (complete type for Result<Datum>)
+#include <arrow/io/memory.h>          // BufferReader / BufferOutputStream (IPC persist)
+#include <arrow/ipc/reader.h>         // RecordBatchStreamReader
+#include <arrow/ipc/writer.h>         // MakeStreamWriter
 #include <arrow/util/byte_size.h>     // arrow::util::TotalBufferSize
 
 namespace duckdb {
@@ -48,6 +51,33 @@ std::shared_ptr<arrow::RecordBatch> TakeRows(const std::shared_ptr<arrow::Record
 
 std::shared_ptr<arrow::RecordBatch> ConcatBatches(const std::vector<std::shared_ptr<arrow::RecordBatch>> &parts) {
 	return Unwrap(arrow::ConcatenateRecordBatches(parts), "concat");
+}
+
+// Serialize one batch as a self-contained Arrow IPC stream (schema + batch). The
+// columnar arena is the memory optimization; the DISK representation is per-slot IPC
+// (the same bytes the pre-arena per-value entries used), which the backend stores.
+std::string SerializeBatchToIpc(const std::shared_ptr<arrow::RecordBatch> &batch) {
+	auto sink = Unwrap(arrow::io::BufferOutputStream::Create(), "ipc sink");
+	auto writer = Unwrap(arrow::ipc::MakeStreamWriter(sink, batch->schema(), arrow::ipc::IpcWriteOptions::Defaults()),
+	                     "ipc writer");
+	Check(writer->WriteRecordBatch(*batch), "ipc write");
+	Check(writer->Close(), "ipc close");
+	auto buf = Unwrap(sink->Finish(), "ipc finish");
+	return std::string(reinterpret_cast<const char *>(buf->data()), static_cast<size_t>(buf->size()));
+}
+
+int64_t NowUnix() {
+	return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch())
+	    .count();
+}
+
+std::shared_ptr<arrow::RecordBatch> DeserializeBatchFromIpc(const std::string &ipc) {
+	auto buf = arrow::Buffer::FromString(ipc);
+	auto in = std::make_shared<arrow::io::BufferReader>(buf);
+	auto reader = Unwrap(arrow::ipc::RecordBatchStreamReader::Open(in), "ipc open");
+	std::shared_ptr<arrow::RecordBatch> batch;
+	Check(reader->ReadNext(&batch), "ipc readnext");
+	return batch; // schema included; may be a 0-row batch (a negative memo)
 }
 
 } // namespace
@@ -211,8 +241,12 @@ int64_t VgiMemoArena::Store(const std::shared_ptr<arrow::RecordBatch> &batch,
 	// the arena currently being appended to, so a single pathological high-cardinality key
 	// must not grow without limit). Over the cap, new values are simply not memoized.
 	const int64_t kMaxSlots = 1 << 20;
+	// Track newly-published slots (with their offset WITHIN `batch`) so they can be
+	// persisted to the disk backend after the loop (before compaction rebases offsets).
+	std::vector<std::pair<std::string, VgiMemoSlot>> new_slots;
 	for (const auto &sp : specs) {
 		const int64_t start = batch_base + off;
+		const int64_t batch_off = off; // this slot's offset within `batch`
 		off += sp.length;
 		auto it = slots_.find(*sp.key);
 		if (it != slots_.end()) {
@@ -238,13 +272,107 @@ int64_t VgiMemoArena::Store(const std::shared_ptr<arrow::RecordBatch> &batch,
 		s.expires_at = expires_at;
 		s.never_expires = never_expires;
 		slots_.emplace(*sp.key, s);
+		if (backend_) {
+			VgiMemoSlot ps = s;
+			ps.row_start = batch_off; // repurposed: offset within `batch` for persistence
+			new_slots.emplace_back(*sp.key, ps);
+		}
 	}
 	dead_rows_ += new_dead;
+	if (backend_ && !new_slots.empty()) {
+		PersistNewSlotsLocked(batch, new_slots);
+	}
 	if (ShouldCompactLocked()) {
 		CompactLocked(now);
 	}
 	const int64_t after = RecomputeFootprintLocked();
 	return after - before;
+}
+
+void VgiMemoArena::PersistNewSlotsLocked(const std::shared_ptr<arrow::RecordBatch> &batch,
+                                         const std::vector<std::pair<std::string, VgiMemoSlot>> &new_slots) {
+	if (!backend_ || !batch) {
+		return;
+	}
+	const int64_t now_unix =
+	    std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+	const auto steady_now = std::chrono::steady_clock::now();
+	std::vector<PersistedSlot> ps;
+	ps.reserve(new_slots.size());
+	for (const auto &kv : new_slots) {
+		const VgiMemoSlot &s = kv.second; // s.row_start holds the offset within `batch`
+		PersistedSlot p;
+		p.input_blob = kv.first;
+		p.rows = s.length;
+		auto rows_batch = batch->Slice(s.row_start, s.length); // 0-length → 0-row batch (negative memo)
+		p.ipc = SerializeBatchToIpc(rows_batch);
+		if (s.never_expires) {
+			p.expires_unix = -1;
+		} else {
+			const int64_t rem =
+			    std::chrono::duration_cast<std::chrono::seconds>(s.expires_at - steady_now).count();
+			p.expires_unix = now_unix + rem;
+		}
+		if (s.validator_ref >= 0 && s.validator_ref < static_cast<int32_t>(validators_.size())) {
+			const ArenaValidator &v = validators_[static_cast<size_t>(s.validator_ref)];
+			p.scope = v.scope;
+			p.etag = v.etag;
+			p.last_modified = v.last_modified;
+			p.revalidatable = v.revalidatable;
+		}
+		ps.push_back(std::move(p));
+	}
+	backend_->Persist(static_fp_, std::string(), ps);
+}
+
+int64_t VgiMemoArena::LoadFromBackend(int64_t now_unix) {
+	if (!backend_) {
+		return 0;
+	}
+	std::string schema_ipc;
+	std::vector<PersistedSlot> slots;
+	if (!backend_->Hydrate(static_fp_, now_unix, schema_ipc, slots) || slots.empty()) {
+		return 0;
+	}
+	// No lock: called pre-publication (the registry holds this arena's only reference).
+	const auto steady_now = std::chrono::steady_clock::now();
+	std::vector<std::shared_ptr<arrow::RecordBatch>> batches;
+	int64_t cursor = 0;
+	for (auto &p : slots) {
+		auto b = DeserializeBatchFromIpc(p.ipc);
+		if (!schema_) {
+			schema_ = b->schema();
+		}
+		VgiMemoSlot s;
+		s.row_start = cursor;
+		s.length = static_cast<int32_t>(p.rows);
+		s.never_expires = (p.expires_unix < 0);
+		s.expires_at = s.never_expires ? steady_now
+		                               : steady_now + std::chrono::seconds(p.expires_unix - now_unix);
+		// Deduplicate the validator (no lock; single-threaded during hydrate).
+		ArenaValidator v {p.scope, p.etag, p.last_modified, p.revalidatable};
+		s.validator_ref = -1;
+		if (!(v.scope.empty() && v.etag.empty() && v.last_modified.empty() && !v.revalidatable)) {
+			for (size_t i = 0; i < validators_.size(); i++) {
+				if (validators_[i] == v) {
+					s.validator_ref = static_cast<int32_t>(i);
+					break;
+				}
+			}
+			if (s.validator_ref < 0) {
+				validators_.push_back(v);
+				s.validator_ref = static_cast<int32_t>(validators_.size() - 1);
+			}
+		}
+		slots_.emplace(p.input_blob, s);
+		if (b->num_rows() > 0) {
+			batches.push_back(b);
+		}
+		cursor += p.rows;
+	}
+	base_ = batches.empty() ? Unwrap(arrow::RecordBatch::MakeEmpty(schema_), "empty base") : ConcatBatches(batches);
+	base_rows_ = cursor;
+	return RecomputeFootprintLocked();
 }
 
 bool VgiMemoArena::ShouldCompactLocked() const {
@@ -351,22 +479,51 @@ std::shared_ptr<VgiMemoArena> VgiMemoArenaRegistry::GetOrCreate(const std::strin
 		return it->second.arena;
 	}
 	auto arena = std::make_shared<VgiMemoArena>(schema);
+	int64_t fp_bytes = 0;
+	if (backend_) {
+		arena->SetPersistence(backend_.get(), static_fp);
+		fp_bytes = arena->LoadFromBackend(NowUnix()); // hydrate prior-process / peer slots
+	}
 	Entry e;
 	e.arena = arena;
-	e.bytes = 0;
+	e.bytes = fp_bytes;
 	e.last_used = tick_;
+	total_bytes_ += fp_bytes;
 	arenas_.emplace(static_fp, std::move(e));
+	if (total_bytes_ > max_bytes_) {
+		EvictToFitLocked(0, static_fp);
+	}
 	return arena;
 }
 
 std::shared_ptr<VgiMemoArena> VgiMemoArenaRegistry::Get(const std::string &static_fp) {
 	std::lock_guard<std::mutex> lg(mu_);
 	auto it = arenas_.find(static_fp);
-	if (it == arenas_.end()) {
-		return nullptr;
+	if (it != arenas_.end()) {
+		it->second.last_used = ++tick_;
+		return it->second.arena;
 	}
-	it->second.last_used = ++tick_;
-	return it->second.arena;
+	// Cold: hydrate from the backend so a warm memo survives a restart and is shared
+	// across same-host processes. Only materialise the arena if the backend actually has
+	// slots for this key (otherwise a probe of an unmemoized function would create empties).
+	if (backend_) {
+		auto arena = std::make_shared<VgiMemoArena>(nullptr);
+		arena->SetPersistence(backend_.get(), static_fp);
+		const int64_t fp_bytes = arena->LoadFromBackend(NowUnix());
+		if (arena->GetStats().live_slots > 0) {
+			Entry e;
+			e.arena = arena;
+			e.bytes = fp_bytes;
+			e.last_used = ++tick_;
+			total_bytes_ += fp_bytes;
+			arenas_.emplace(static_fp, std::move(e));
+			if (total_bytes_ > max_bytes_) {
+				EvictToFitLocked(0, static_fp);
+			}
+			return arena;
+		}
+	}
+	return nullptr;
 }
 
 void VgiMemoArenaRegistry::EvictToFitLocked(int64_t incoming, const std::string &keep) {
@@ -415,10 +572,32 @@ void VgiMemoArenaRegistry::SetMaxBytes(int64_t max_bytes) {
 	}
 }
 
-void VgiMemoArenaRegistry::FlushAll() {
+void VgiMemoArenaRegistry::SetBackend(std::shared_ptr<PerValueDiskBackend> backend) {
 	std::lock_guard<std::mutex> lg(mu_);
-	arenas_.clear();
-	total_bytes_ = 0;
+	backend_ = std::move(backend);
+}
+
+void VgiMemoArenaRegistry::EnsureSqliteBackend(const std::string &dir) {
+	std::lock_guard<std::mutex> lg(mu_);
+	if (dir == backend_dir_) {
+		return; // unchanged — no-op (this is called per operator-state build)
+	}
+	backend_dir_ = dir;
+	backend_ = dir.empty() ? nullptr : MakeSqliteDiskBackend(dir);
+	// Existing in-memory arenas keep serving; new/cold ones will use the new backend.
+}
+
+void VgiMemoArenaRegistry::FlushAll() {
+	std::shared_ptr<PerValueDiskBackend> b;
+	{
+		std::lock_guard<std::mutex> lg(mu_);
+		arenas_.clear();
+		total_bytes_ = 0;
+		b = backend_;
+	}
+	if (b) {
+		b->Flush(); // clear the disk tier too (outside the registry lock)
+	}
 }
 
 std::vector<VgiMemoArenaRegistry::ArenaRow> VgiMemoArenaRegistry::Snapshot() {

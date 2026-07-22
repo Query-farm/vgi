@@ -34,6 +34,46 @@
 namespace duckdb {
 namespace vgi {
 
+// ----------------------------------------------------------------------------
+// PerValueDiskBackend — optional persistence for arena slots
+// ----------------------------------------------------------------------------
+// The arena is the MEMORY tier. A backend persists each slot's rows (as a
+// self-contained Arrow IPC blob — the columnar layout is a memory optimization,
+// disk stays per-slot IPC) so a warm memo survives a restart and is shared across
+// same-host processes. Null by default (memory-only, e.g. WASM). Disk is off the
+// hot path: a backend is only touched on a cold-arena hydrate (once per static key
+// per process) and on a store (a miss, infrequent) — never on a warm serve.
+struct PersistedSlot {
+	std::string input_blob;      // the slot key (raw sort-key blob)
+	std::string ipc;             // self-contained Arrow IPC bytes of this slot's rows
+	int64_t rows = 0;            // row count (0 = negative memo)
+	int64_t expires_unix = -1;   // wall-clock expiry seconds (-1 = never)
+	std::string scope;           // validator...
+	std::string etag;
+	std::string last_modified;
+	bool revalidatable = false;
+};
+
+class PerValueDiskBackend {
+public:
+	virtual ~PerValueDiskBackend() = default;
+	// Persist a batch of slots for a static key. `schema_ipc` is the arena's Arrow schema
+	// serialized once (so a cold process can rebuild the arena's schema before hydrating).
+	virtual void Persist(const std::string &static_fp, const std::string &schema_ipc,
+	                     const std::vector<PersistedSlot> &slots) = 0;
+	// Load all UNEXPIRED slots for a static key (as of `now_unix`). Fills `schema_ipc_out`
+	// and `slots_out`; returns false if the key is absent.
+	virtual bool Hydrate(const std::string &static_fp, int64_t now_unix, std::string &schema_ipc_out,
+	                     std::vector<PersistedSlot> &slots_out) = 0;
+	// Clear everything (for vgi_result_cache_flush()).
+	virtual void Flush() = 0;
+};
+
+// Create a SQLite-backed PerValueDiskBackend rooted at `dir` (WAL mode: concurrent
+// readers + one writer across same-host processes, crash-safe, cross-restart). Returns
+// null if SQLite is not compiled into this build (WASM) or the DB cannot be opened.
+std::shared_ptr<PerValueDiskBackend> MakeSqliteDiskBackend(const std::string &dir);
+
 // The per-value cache-control a slot was stored with. Deduplicated per arena (most
 // slots of one function share one advertisement), referenced by index from a slot.
 struct ArenaValidator {
@@ -95,6 +135,17 @@ class VgiMemoArena {
 public:
 	explicit VgiMemoArena(std::shared_ptr<arrow::Schema> schema) : schema_(std::move(schema)) {}
 
+	// Attach a persistence backend + this arena's static-key fingerprint. When set, Store
+	// also persists new slots and a cold arena can be hydrated (LoadFromBackend). The
+	// backend outlives all arenas (owned by the registry singleton), so a raw pointer.
+	void SetPersistence(PerValueDiskBackend *backend, std::string static_fp) {
+		backend_ = backend;
+		static_fp_ = std::move(static_fp);
+	}
+	// Populate a cold arena from the backend (deserialize each persisted slot's IPC and
+	// append). Returns the footprint after loading. Called once, right after creation.
+	int64_t LoadFromBackend(int64_t now_unix);
+
 	// Deduplicate a validator into this arena, returning a stable ref (or -1 for the
 	// empty validator). Cheap; call before Store to fill ArenaStoreSpec::validator_ref.
 	int32_t ResolveValidator(const ArenaValidator &v);
@@ -141,6 +192,14 @@ private:
 	uint64_t tick_ = 0;
 	std::unordered_map<std::string, VgiMemoSlot> slots_;
 	std::vector<ArenaValidator> validators_;
+	PerValueDiskBackend *backend_ = nullptr; // optional; owned by the registry
+	std::string static_fp_;
+
+	// Serialize the newly-stored slots (their rows sliced from `batch`, offset held in the
+	// slot's row_start) and hand them to the backend. Called under the exclusive lock from
+	// Store when a backend is attached.
+	void PersistNewSlotsLocked(const std::shared_ptr<arrow::RecordBatch> &batch,
+	                           const std::vector<std::pair<std::string, VgiMemoSlot>> &new_slots);
 
 	// Materialize `logical` rows (offsets into base∪tail) into one batch, preserving
 	// the order of `logical`. One Take when all rows are in base (the common path after
@@ -177,6 +236,13 @@ public:
 	bool NoteFootprintDelta(const std::string &static_fp, int64_t delta);
 
 	void SetMaxBytes(int64_t max_bytes);
+	// Attach the persistence backend (null = memory-only). New arenas hydrate from it on
+	// a cold GetOrCreate, and their stores persist through it.
+	void SetBackend(std::shared_ptr<PerValueDiskBackend> backend);
+	// Idempotently attach a SQLite backend rooted at `dir` (empty → detach). Tracks the
+	// current dir so a repeated call with the same value is a no-op. Called from
+	// SyncResultCacheSettings so `SET vgi_result_cache_dir` turns the disk tier on.
+	void EnsureSqliteBackend(const std::string &dir);
 	void FlushAll();
 
 	// Snapshot for diagnostics (one row per arena).
@@ -197,6 +263,8 @@ private:
 		uint64_t last_used = 0;
 	};
 	std::unordered_map<std::string, Entry> arenas_;
+	std::shared_ptr<PerValueDiskBackend> backend_;
+	std::string backend_dir_; // current SQLite dir (for idempotent EnsureSqliteBackend)
 	void EvictToFitLocked(int64_t incoming, const std::string &keep);
 };
 
