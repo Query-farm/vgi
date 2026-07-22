@@ -558,7 +558,18 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 			pv_setting = pvv.GetValue<bool>();
 		}
 	}
-	const bool pv_enabled = pv_setting && dedup_enabled && !is_volatile && local_state.cache_eligible;
+	// Per-value memoization requires the worker's `vgi.cache.per_value` opt-in, which rides
+	// an output batch and so is only visible after an exchange. Seed from the process-wide
+	// advertisement registry (an earlier exchange against this function) and latch from this
+	// state's own exchanges. This gates the PROBE only; the STORE below keys off the live
+	// cache-control, so a function's first exchange still memoizes. `vgi_result_cache_per_value`
+	// is a CEILING over the advertisement, never an enabler. See VGI_CACHE_PER_VALUE_KEY.
+	if (!local_state.cache_pv_opt_in && local_state.cache_eligible) {
+		local_state.cache_pv_opt_in =
+		    VgiResultCache::Instance().HasPerValueOptIn(local_state.cache_static_key);
+	}
+	const bool pv_enabled = pv_setting && local_state.cache_pv_opt_in && dedup_enabled && !is_volatile &&
+	                        local_state.cache_eligible;
 	std::vector<VgiResultCacheKey> pv_keys;
 	std::vector<std::shared_ptr<const VgiResultCacheEntry>> pv_hits;
 	bool full_pv_hit = false;
@@ -739,13 +750,34 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 		}
 
 		// [per-value store] Memoize each MISSED distinct tuple's 1-row output, if the worker
-		// opted into caching. A future chunk sharing that value serves without the worker.
-		if (pv_enabled) {
+		// opted into caching AND asked for per-value memoization. A future chunk sharing
+		// that value serves without the worker.
+		//
+		// A scalar advertises vgi.cache.* on its output batch custom_metadata (via the emit
+		// path — see ScalarExchangeState.exchange in vgi-python), latched by the connection
+		// like the table-in-out path. Gated on this LIVE advertisement rather than on
+		// `pv_enabled`, so the first exchange against a function still memoizes even though
+		// its probe was necessarily disarmed (nothing had told us the opt-in yet).
+		auto cc = local_state.connection->GetLastCacheControl();
+		const bool pv_store =
+		    cc.per_value && pv_setting && dedup_enabled && !is_volatile && local_state.cache_eligible;
+		if (pv_store && !local_state.cache_pv_opt_in) {
+			// Arm this local state's later chunks AND every later scan of this function.
+			local_state.cache_pv_opt_in = true;
+			VgiResultCache::Instance().NotePerValueOptIn(local_state.cache_static_key);
+		}
+		if (pv_store && !pv_enabled) {
+			// Probe was disarmed for this chunk, so the keys were never built. Build them
+			// now over the same shipped set; every tuple counts as a miss.
+			auto pv_hashes = HashInputRowsPerValue(context, *ship);
+			pv_keys.resize(ship->size());
+			for (idx_t d = 0; d < ship->size(); d++) {
+				pv_keys[d] = local_state.cache_static_key;
+				pv_keys[d].input_hash = pv_hashes[d];
+			}
+		}
+		if (pv_store) {
 			VgiResultCache::Instance().RecordExchangeMiss();
-			// A scalar advertises vgi.cache.* on its output batch custom_metadata (via the
-			// emit path — see ScalarExchangeState.exchange in vgi-python), latched by the
-			// connection like the table-in-out path.
-			auto cc = local_state.connection->GetLastCacheControl();
 			if (cc.Cacheable()) {
 				// Cap new stores per chunk (0 = unlimited) — bounds entry-count amplification
 				// on a high-cardinality input. A store cap, not a lookup gate, so store-then-hit
@@ -760,7 +792,7 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 				}
 				uint64_t stored = 0;
 				for (idx_t d = 0; d < ship->size(); d++) {
-					if (pv_hits[d]) {
+					if (!pv_hits.empty() && pv_hits[d]) {
 						continue;
 					}
 					if (store_cap != 0 && stored >= store_cap) {

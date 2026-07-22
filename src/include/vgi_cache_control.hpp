@@ -38,6 +38,17 @@ constexpr const char *VGI_CACHE_NOT_MODIFIED_KEY = "vgi.cache.not_modified";
 // entries. Additive — today's whole-scan entry is still stored/served. See CLAUDE.md
 // "Per-Partition Result Cache".
 constexpr const char *VGI_CACHE_PARTITION_SCOPE_KEY = "vgi.cache.partition_scope";
+// Per-VALUE memoization opt-in for exchange-mode MAPS (scalar / batched correlated
+// LATERAL). When set, the client ALSO memoizes each distinct worker-input tuple's
+// output keyed on that tuple, so the same value serves without the worker on a later
+// chunk / query. DEFAULT OFF, and deliberately so: a per-value serve carries a fixed
+// per-entry cost (key probe + decode + assembly) that only pays back when the worker
+// call it replaces is MORE expensive than that. For a cheap arithmetic map it is a
+// large net loss — measured ~50x slower than simply calling the worker. Only the
+// function author knows whether a call is expensive enough (a model inference, a
+// geocode, a rate-limited HTTP fetch); the engine cannot infer it, so this is an
+// explicit advertisement rather than a heuristic.
+constexpr const char *VGI_CACHE_PER_VALUE_KEY = "vgi.cache.per_value";
 constexpr const char *VGI_CACHE_IF_NONE_MATCH_KEY = "vgi.cache.if_none_match";
 constexpr const char *VGI_CACHE_IF_MODIFIED_SINCE_KEY = "vgi.cache.if_modified_since";
 
@@ -70,6 +81,10 @@ struct VgiCacheControl {
 	// Opt-in to per-partition caching (SINGLE_VALUE_PARTITIONS only). Additive to
 	// the whole-scan cache; the split at capture is gated on this.
 	bool partition_scope = false;
+	// Opt-in to per-VALUE memoization (exchange-mode maps). Default off — see
+	// VGI_CACHE_PER_VALUE_KEY above. Independent of Cacheable(): a function may be
+	// whole-result cacheable without per-value memoization paying off.
+	bool per_value = false;
 
 	// Opt-in: a freshness key present and not explicitly no_store.
 	bool Cacheable() const {

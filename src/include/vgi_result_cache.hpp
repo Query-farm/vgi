@@ -24,6 +24,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "vgi_cache_control.hpp" // vgi.cache.* constants + VgiCacheControl + ParseVgiCacheControl
@@ -313,6 +314,21 @@ public:
 	void RecordPartitionMiss();
 	void RecordPartitionStore();
 
+	// ---- `vgi.cache.per_value` advertisement registry ----------------------
+	// Per-value memoization is a worker opt-in carried on an output batch, which means
+	// it is only observable AFTER an exchange. A probe must therefore be armed by an
+	// earlier exchange — and a scan whose whole input is one chunk has no earlier
+	// exchange of its own, so the advertisement is remembered per function identity for
+	// the process rather than per operator state.
+	//
+	// This is a HINT, not a correctness input: a false positive costs one wasted probe
+	// that misses; a false negative costs a missed memo. Monotonic (entries are only
+	// added), so there is nothing to invalidate — a worker that stops advertising simply
+	// stops storing, and the stale probes find nothing. Flushing the cache does NOT clear
+	// it: the advertisement describes the function, not the cached bytes.
+	void NotePerValueOptIn(const VgiResultCacheKey &static_key);
+	bool HasPerValueOptIn(const VgiResultCacheKey &static_key);
+
 	static VgiResultCache &Instance();
 
 	// Push process-global caps + disk-tier config (takes the lock + evicts-to-fit).
@@ -485,6 +501,12 @@ private:
 	    index_;
 	int64_t total_bytes_ = 0;
 	Settings settings_;
+
+	// `vgi.cache.per_value` advertisements, keyed by function identity (see
+	// NotePerValueOptIn). Its own mutex: probed on a hot path and never together with
+	// the entry index, so it must not queue behind a cache insert.
+	std::mutex per_value_optin_mutex_;
+	std::unordered_set<std::string> per_value_optin_;
 
 	// Atomic so the diagnostic path can read without the big lock.
 	std::atomic<uint64_t> hits_ {0};

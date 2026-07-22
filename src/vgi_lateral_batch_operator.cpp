@@ -187,6 +187,9 @@ struct VgiLateralBatchOperatorState : public OperatorState {
 	int64_t cache_revalidate_min_bytes = 262144;
 	VgiCacheControl cache_cc;   // latched from the first exchange output
 	bool cache_cc_latched = false;
+	// Latched `vgi.cache.per_value` advertisement. Per-value memoization is OFF until the
+	// worker asks for it on an output batch; see the pv_enabled gate in Execute().
+	bool cache_pv_opt_in = false;
 	// MISS capture: the current input chunk's full key + its accumulated POST-STAMP
 	// output slices (serialized). Committed as one entry when the chunk fully drains.
 	VgiResultCacheKey capture_key;
@@ -630,7 +633,24 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 	// tuple's key; a FULL hit (every tuple cached) serves without the worker, catching
 	// cross-chunk / cross-query value reuse the whole-chunk key misses. Skipped while
 	// revalidation is armed (the 304 flow owns this chunk). See docs/exchange_dedup_pervalue.md.
-	const bool pv_enabled = pv_setting && dedup_active && state.cache_eligible && !reval_entry;
+	//
+	// WORKER OPT-IN (default OFF): the worker must advertise `vgi.cache.per_value` on an
+	// output batch. Per-value memoization only pays when one worker call costs more than
+	// one cache probe + decode + assembly; for a cheap map it is a large net loss, and the
+	// engine cannot tell the two apart from the outside. `vgi_result_cache_per_value` is a
+	// CEILING over the advertisement (it can veto, never enable).
+	//
+	// The advertisement rides an output batch, so it is only visible after an exchange.
+	// `cache_pv_opt_in` is seeded from the process-wide registry (an earlier exchange
+	// against this same function, in this or any previous query) and then latched from
+	// this scan's own first exchange. This gates the PROBE only — the STORE below keys off
+	// the live cache-control, so the very first exchange still memoizes what the worker
+	// asked it to, and the next scan probes for it.
+	if (!state.cache_pv_opt_in && state.cache_eligible) {
+		state.cache_pv_opt_in = VgiResultCache::Instance().HasPerValueOptIn(state.cache_static_key);
+	}
+	const bool pv_enabled = pv_setting && state.cache_pv_opt_in && dedup_active && state.cache_eligible &&
+	                        !reval_entry;
 	std::vector<VgiResultCacheKey> pv_keys;
 	std::vector<std::shared_ptr<const VgiResultCacheEntry>> pv_hits;
 	bool full_pv_hit = false;
@@ -674,6 +694,31 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 			served_bytes += h->total_bytes;
 		}
 		VgiResultCache::Instance().RecordExchangeHit(served_bytes);
+		// Latch cache-control off a served per-value entry when this operator state has not
+		// yet seen an exchange. Without this, a scan that is a full per-value hit from its
+		// very FIRST chunk (a warm memo + a fresh operator state) could never store the
+		// coarse whole-chunk entry — cache_cc is normally latched off a worker reply, and
+		// there is no worker reply on this path. The stored entry's own lifetime/validators
+		// are exactly what the worker advertised when the value was memoized, so reusing
+		// them keeps the M2 entry's freshness identical to the per-value entries it derives
+		// from (never longer).
+		if (!state.cache_cc_latched && !pv_hits.empty() && pv_hits[0]) {
+			const auto &src = *pv_hits[0];
+			VgiCacheControl cc;
+			cc.present = true;
+			cc.scope = src.scope;
+			cc.etag = src.etag;
+			cc.last_modified = src.last_modified;
+			cc.revalidatable = src.revalidatable;
+			auto lifetime =
+			    std::chrono::duration_cast<std::chrono::seconds>(src.expires_at - src.stored_at).count();
+			cc.ttl_seconds = src.never_expires ? VGI_CACHE_MAX_TTL_SECONDS : lifetime;
+			// Reaching this branch means per-value memoization is already active for this
+			// scan, which can only happen when the worker advertised the opt-in.
+			cc.per_value = true;
+			state.cache_cc = cc;
+			state.cache_cc_latched = true;
+		}
 		VGI_LOG(client_context, "result_cache.hit",
 		        {{"function", bd.function_name}, {"key_hash", state.capture_key.HexDigest()}, {"tier", "per_value"}});
 		if (parts.empty()) {
@@ -781,6 +826,11 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 		if (state.cache_eligible && !state.cache_cc_latched) {
 			state.cache_cc = state.connection->GetLastCacheControl();
 			state.cache_cc_latched = true;
+			if (state.cache_cc.per_value) {
+				// Arm this scan's later chunks AND every later scan of this function.
+				state.cache_pv_opt_in = true;
+				VgiResultCache::Instance().NotePerValueOptIn(state.cache_static_key);
+			}
 		}
 
 		// Decode the FRESH worker output's provenance (sub-index into the shipped subset).
@@ -853,9 +903,29 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 
 		// [per-value store] Persist each MISSED distinct tuple's output rows (pre-stamp) as
 		// its own per-value entry, so a future chunk with the same value serves without the
-		// worker. Only when the worker opted into caching (cache_cc). A tuple with 0 output
-		// rows (1->0) stores an empty batch (a valid negative memo).
-		if (pv_enabled && state.cache_cc.Cacheable()) {
+		// worker. Only when the worker opted into caching (cache_cc) AND asked for per-value
+		// memoization. A tuple with 0 output rows (1->0) stores an empty batch (a valid
+		// negative memo).
+		//
+		// Gated on the LIVE advertisement, not on `pv_enabled`: the probe needs to know the
+		// opt-in before the exchange and so can be disarmed on a function's very first
+		// exchange, but by the time we get here the worker has told us. Storing anyway is
+		// what makes a single-chunk warm-up query (`... FROM range(25), LATERAL f(x)`)
+		// populate the memo for the next query instead of silently doing nothing.
+		const bool pv_store =
+		    state.cache_cc.per_value && pv_setting && dedup_active && state.cache_eligible && !reval_entry;
+		if (pv_store && !pv_enabled) {
+			// Probe was disarmed for this chunk, so the keys were never built. Build them
+			// now (over the same distinct set the probe would have used) and treat every
+			// tuple as a miss — nothing was looked up, so nothing can be known-cached.
+			auto pv_hashes = HashInputRowsPerValue(client_context, worker_input);
+			pv_keys.resize(dd.k);
+			for (idx_t d = 0; d < dd.k; d++) {
+				pv_keys[d] = state.cache_static_key;
+				pv_keys[d].input_hash = pv_hashes[d];
+			}
+		}
+		if (pv_store && state.cache_cc.Cacheable()) {
 			// Cap new stores per chunk to bound entry-count amplification on a
 			// high-cardinality input (0 = unlimited). A store cap, not a lookup gate, so
 			// low-cardinality (K < cap) stores everything and store-then-hit is preserved.
@@ -873,7 +943,7 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 				rows_by_d[static_cast<idx_t>(worker_parent[m])].push_back(static_cast<int32_t>(m));
 			}
 			for (idx_t d = 0; d < dd.k; d++) {
-				if (pv_hits[d]) {
+				if (!pv_hits.empty() && pv_hits[d]) {
 					continue; // already cached (partial-hit chunk) — don't re-store
 				}
 				if (store_cap != 0 && stored >= store_cap) {
@@ -927,22 +997,16 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 	chunk.SetCardinality(produced);
 
 	// Begin capturing this input chunk's POST-STAMP output for the M2 per-chunk cache (if
-	// the worker opted in). Never on a full per-value hit (nothing new). Coexistence gate:
-	// when per-value memo is active, store the coarse whole-chunk entry only if the distinct
-	// ratio K/N clears the floor — below it, per-value already covers a future identical-chunk
-	// replay, so the redundant whole-chunk copy is skipped (a per-chunk cardinality gate, not
-	// a miss-history back-off — per-value still always stored its misses above).
-	bool m2_capture = !full_pv_hit && state.cache_eligible && state.cache_cc.Cacheable();
-	if (m2_capture && pv_enabled && input.size() > 0) {
-		double min_ratio = 0.5;
-		Value mr;
-		if (client_context.TryGetCurrentSetting("vgi_exchange_per_batch_min_distinct_ratio", mr) && !mr.IsNull()) {
-			min_ratio = mr.GetValue<double>();
-		}
-		if (static_cast<double>(dd.k) / static_cast<double>(input.size()) < min_ratio) {
-			m2_capture = false;
-		}
-	}
+	// the worker opted in). ALWAYS store it when eligible — including on a full per-value
+	// hit. The two tiers are not redundant: an M2 serve is ONE decode per input chunk,
+	// while a per-value serve of the same chunk is K decodes + a K-way assembly. Measured
+	// on the `cached_double` fixture, an M2 whole-chunk replay is ~14x cheaper than the
+	// per-value reassembly of the identical rows. Suppressing the coarse entry because
+	// per-value "already covers" the chunk therefore made the warm path dramatically
+	// SLOWER, not cheaper (it was the cause of the 10x `full`-arm cliff). Per-value's job
+	// is cross-CHUNK / cross-QUERY value reuse that the whole-chunk key cannot see; it is
+	// never a substitute for the whole-chunk entry on an identical-chunk replay.
+	bool m2_capture = state.cache_eligible && state.cache_cc.Cacheable();
 	if (m2_capture) {
 		state.capturing = true;
 		state.capture_pending.clear();

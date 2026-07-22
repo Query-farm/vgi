@@ -451,6 +451,9 @@ VgiCacheControl ParseVgiCacheControl(const std::shared_ptr<const arrow::KeyValue
 	if (get(VGI_CACHE_PARTITION_SCOPE_KEY, tmp)) {
 		cc.partition_scope = (tmp == "1");
 	}
+	if (get(VGI_CACHE_PER_VALUE_KEY, tmp)) {
+		cc.per_value = (tmp == "1");
+	}
 	return cc;
 }
 
@@ -1648,6 +1651,28 @@ void VgiResultCache::RecordPartitionMiss() {
 
 void VgiResultCache::RecordPartitionStore() {
 	partition_stores_.fetch_add(1, std::memory_order_relaxed);
+}
+
+// Function identity for the per-value advertisement registry. Deliberately COARSER
+// than the full cache key: the input_hash, projection and per-call dimensions vary
+// per chunk/query, but "does this function want per-value memoization" does not.
+// identity_scope is included so one principal's advertisement never arms another's
+// probe (the probe would only ever miss, but keeping the identity split makes the
+// registry safe by construction rather than by argument).
+static std::string PerValueOptInIdentity(const VgiResultCacheKey &k) {
+	return k.identity_scope + "\x1f" + k.worker_path + "\x1f" + k.function_name;
+}
+
+void VgiResultCache::NotePerValueOptIn(const VgiResultCacheKey &static_key) {
+	auto id = PerValueOptInIdentity(static_key);
+	std::lock_guard<std::mutex> lock(per_value_optin_mutex_);
+	per_value_optin_.insert(std::move(id));
+}
+
+bool VgiResultCache::HasPerValueOptIn(const VgiResultCacheKey &static_key) {
+	auto id = PerValueOptInIdentity(static_key);
+	std::lock_guard<std::mutex> lock(per_value_optin_mutex_);
+	return per_value_optin_.find(id) != per_value_optin_.end();
 }
 
 void VgiResultCache::RecordExchangeHit(int64_t bytes_served) {

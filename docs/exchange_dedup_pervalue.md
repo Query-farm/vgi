@@ -176,8 +176,9 @@ collision, so `vgi_result_cache()` / stats / flush / disk tier all treat them un
 | Setting | Default | Meaning |
 |---|--:|---|
 | `vgi_exchange_input_dedup` | `true` | Dedup distinct worker-input tuples in a chunk before the exchange (compute win; scalar + streaming + LATERAL). No persistence, no correctness risk beyond the per-row-purity opt-in. |
-| `vgi_result_cache_per_value` | `true` | Per-value memoization layer (durability). Gated by the master `vgi_result_cache` + per-catalog `cache` opt-out like every other cache tier. |
-| `vgi_exchange_per_batch_min_distinct_ratio` | `0.5` | Store the coarse whole-unit (M1/M2) entry only when `K/N ≥` this (else per-value covers replay). 0 = always store the coarse entry (today's behavior); 1 = never. |
+| `vgi_result_cache_per_value` | `true` | **CEILING, not an enabler.** Per-value memoization is OFF unless the worker advertises `vgi.cache.per_value` on an output batch. Setting this `false` vetoes the tier even for a worker that asks; setting it `true` does not enable it. Also gated by the master `vgi_result_cache` + per-catalog `cache` opt-out like every other cache tier. |
+| `vgi.cache.per_value` (worker metadata) | *absent* | The actual switch. A per-value serve costs a key probe, an IPC decode and an assembly step per distinct value; that only pays back when one worker call is dearer than that. Measured on a trivial arithmetic map it is ~50x slower than simply calling the worker, so the tier is opt-in and only the function author can judge it. Advertise it for model inference, geocoding, or a rate-limited remote fetch. |
+| `vgi_exchange_per_batch_min_distinct_ratio` | `0.5` | **DEPRECATED / NO-OP.** Formerly suppressed the coarse whole-unit (M1/M2) entry below this `K/N` on the theory that per-value covered the replay. It does not: an M2 serve is ONE decode per chunk while the per-value reassembly of the same rows is K decodes plus a K-way concat, so suppressing M2 made the warm path ~14x SLOWER. The coarse entry is now always stored when eligible. Still accepted so existing scripts do not error. |
 | `vgi_result_cache_per_value_max_stores_per_chunk` | `256` | Cap on NEW per-value entries a single chunk may store (0 = unlimited). Bounds entry-count amplification on a high-cardinality input. A cap on STORES not lookups, so it never breaks store-then-hit for a low-cardinality workload. |
 
 Dedup is a compute optimization and defaults ON independently of the disk tier; per-value persistence
@@ -249,8 +250,11 @@ for an M2/producer serve — so a hit's origin is always observable.
    field-based `BuildExchangeCacheKeyStaticFields` the scalar shares with the table-in-out key
    builder. Both transports.
 4. **Coexistence + gate** — ✅ M2 layering (per-chunk hit short-circuits; on a miss, dedup + per-value
-   run under it) + the store-then-hit-safe distinct-ratio store gate
-   (`vgi_exchange_per_batch_min_distinct_ratio`). **Dedup is the master switch for both** (per-value
+   run under it). The coarse M2 entry is ALWAYS stored when eligible — never suppressed because
+   per-value covered the chunk. The two tiers are not substitutes: M2 answers an identical-chunk
+   replay in one decode, per-value answers cross-chunk / cross-query VALUE reuse that the whole-chunk
+   key cannot see. Preferring per-value over M2 was a 10x regression on the warm path.
+   **Dedup is the master switch for both** (per-value
    inherently needs the distinct set, so `vgi_exchange_input_dedup=false` disables both). Note: for a
    **direct-column** correlated ref DuckDB's delim-join already feeds the operator the distinct set,
    so M2 alone covers cross-query reuse; per-value's unique win is the **expression-arg** case (delim

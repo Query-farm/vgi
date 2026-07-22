@@ -3400,11 +3400,15 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    "Default 1024",
 	    LogicalType::UBIGINT, Value::UBIGINT(1024));
 	config.AddExtensionOption("vgi_result_cache_per_value",
-	                          "Per-VALUE memoization for exchange-mode maps: after input dedup, memoize the "
-	                          "worker output keyed on the individual input tuple, so a fully-warm distinct set "
-	                          "serves without the worker (cross-chunk / cross-query / cross-restart value "
-	                          "reuse the per-chunk cache misses). Gated by the master vgi_result_cache + the "
-	                          "worker's vgi.cache.* opt-in. Default ON",
+	                          "CEILING (not an enabler) over per-VALUE memoization for exchange-mode maps: "
+	                          "after input dedup, memoize the worker output keyed on the individual input "
+	                          "tuple, so a fully-warm distinct set serves without the worker (cross-chunk / "
+	                          "cross-query / cross-restart value reuse the per-chunk cache misses). The tier "
+	                          "is OFF unless the worker advertises `vgi.cache.per_value` on its output batch, "
+	                          "because a per-value serve's fixed cost (key probe + decode + assembly) only "
+	                          "pays back when one worker call is dearer than that — for a cheap map it is a "
+	                          "large net loss. Setting this false vetoes the tier even for a worker that asks "
+	                          "for it; setting it true does NOT enable it. Default true (no veto)",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
 	config.AddExtensionOption("vgi_result_cache_per_value_max_stores_per_chunk",
 	                          "Cap on how many NEW per-value memo entries a single input chunk may store "
@@ -3415,11 +3419,13 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "stored). Default 256",
 	                          LogicalType::UBIGINT, Value::UBIGINT(256));
 	config.AddExtensionOption("vgi_exchange_per_batch_min_distinct_ratio",
-	                          "Store the COARSE per-chunk (M2) exchange-cache entry only when the chunk's "
-	                          "distinct ratio (K/N) is at least this — below it the per-value tier already "
-	                          "covers a future identical-chunk replay, so the redundant whole-chunk copy is "
-	                          "skipped. A per-chunk cardinality gate, not a miss-history back-off (per-value "
-	                          "still always stores its misses). 0 = always store the coarse entry. Default 0.5",
+	                          "DEPRECATED / NO-OP. Formerly suppressed the coarse per-chunk (M2) exchange-cache "
+	                          "entry when the chunk's distinct ratio (K/N) fell below this, on the theory that "
+	                          "the per-value tier already covered an identical-chunk replay. It does not: an M2 "
+	                          "serve is ONE decode per chunk while the per-value reassembly of the same rows is "
+	                          "K decodes plus a K-way concat, so suppressing M2 made the warm path ~14x slower "
+	                          "rather than cheaper. The coarse entry is now always stored when eligible and this "
+	                          "setting is ignored. Still accepted so existing scripts do not error",
 	                          LogicalType::DOUBLE, Value::DOUBLE(0.5));
 
 	// Cache directory for worker binaries downloaded via github:// / github-auto://

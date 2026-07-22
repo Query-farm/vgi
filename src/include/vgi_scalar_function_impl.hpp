@@ -176,6 +176,10 @@ struct VgiScalarFunctionLocalState : public FunctionLocalState {
 	vgi::VgiResultCacheKey cache_static_key;
 	std::string cache_catalog_name;
 	int64_t cache_default_ttl_seconds = 0;
+	// Latched `vgi.cache.per_value` advertisement. Per-value memoization is OFF until the
+	// worker asks for it (see VGI_CACHE_PER_VALUE_KEY) — the fixed per-entry probe/decode
+	// cost only pays back for an expensive worker call, and only the author knows.
+	bool cache_pv_opt_in = false;
 };
 
 // ============================================================================
