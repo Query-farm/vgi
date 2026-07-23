@@ -356,6 +356,7 @@ AcquireAndBindResult AcquireAndBindConnection(ClientContext &context, const Func
 				conn->SetInputSchema(params.input_schema);
 			}
 			conn->SetAtClause(params.at_unit, params.at_value);
+			conn->SetSchemaName(params.schema_name);
 			if (params.copy_from) {
 				conn->SetCopyFromContext(*params.copy_from);
 			}
@@ -574,7 +575,7 @@ BindResult FunctionConnection::PerformBindRpc() {
 	                                        transaction_opaque_data_, settings_, required_secrets_,
 	                                        worker_path_, transport_fn, at_unit_, at_value_,
 	                                        copy_from_ ? &*copy_from_ : nullptr,
-	                                        copy_to_ ? &*copy_to_ : nullptr);
+	                                        copy_to_ ? &*copy_to_ : nullptr, schema_name_);
 
 	DrainStderrLog();
 

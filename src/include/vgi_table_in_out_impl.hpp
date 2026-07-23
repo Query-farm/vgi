@@ -47,6 +47,10 @@ struct VgiTableInOutBindData : public TableFunctionData {
 	std::vector<uint8_t> attach_opaque_data;
 	std::vector<uint8_t> transaction_opaque_data;
 	std::string function_name;
+	// Catalog schema that owns `function_name`; the worker resolves the pair
+	// because one name may be registered in several schemas. Empty for
+	// non-catalog call sites.
+	std::string schema_name;
 	std::map<std::string, Value> settings;
 	std::vector<vgi::VgiSecretRequirement> required_secrets;
 
@@ -280,6 +284,8 @@ struct VgiTableInOutLocalState : public ArrowScanLocalState {
 struct VgiTableInOutBindParams {
 	std::shared_ptr<VgiAttachParameters> attach_params;  // replaces worker_path, worker_debug, use_pool
 	std::string function_name;
+	// Owning catalog schema; see VgiTableInOutBindData::schema_name.
+	std::string schema_name;
 	std::vector<uint8_t> attach_opaque_data;
 	std::vector<uint8_t> transaction_opaque_data;
 	std::map<std::string, Value> settings;

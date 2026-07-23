@@ -261,6 +261,7 @@ unique_ptr<FunctionData> VgiScalarFunctionBind(ClientContext &context, ScalarFun
 
 		// Set input schema and perform bind to get actual output schema
 		connection->SetInputSchema(input_schema);
+		connection->SetSchemaName(func_info.schema_name);
 		auto bind_result = connection->PerformBindRpc();
 
 		// Get the output schema from bind result
@@ -314,6 +315,7 @@ unique_ptr<FunctionData> VgiScalarFunctionBind(ClientContext &context, ScalarFun
 	bind_data->attach_params = func_info.attach_params;
 	bind_data->attach_opaque_data = func_info.attach_opaque_data;
 	bind_data->function_name = func_info.function_name;
+	bind_data->schema_name = func_info.schema_name;
 	bind_data->settings = settings;
 	bind_data->required_secrets = func_info.required_secrets;
 	bind_data->resolved_output_schema = output_schema;
@@ -386,6 +388,7 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 		const auto &worker_path = bind_data ? bind_data->worker_path() : func_info.worker_path();
 		const auto &attach_opaque_data = bind_data ? bind_data->attach_opaque_data : func_info.attach_opaque_data;
 		const auto &function_name = bind_data ? bind_data->function_name : func_info.function_name;
+		const auto &schema_name = bind_data ? bind_data->schema_name : func_info.schema_name;
 		bool worker_debug = bind_data ? bind_data->worker_debug() : func_info.worker_debug();
 		// Extract settings: from bind_data if available, otherwise extract fresh from context
 		auto settings = bind_data ? bind_data->settings : ExtractVgiSettings(context, func_info.setting_names);
@@ -427,6 +430,7 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 		// casting the DataChunk (below, in the per-batch path) keeps the
 		// wire in sync with what the worker is expecting.
 		connection->SetInputSchema(local_state.input_schema);
+		connection->SetSchemaName(schema_name);
 		auto bind_result = connection->PerformBindRpc();
 		connection->PerformInit(bind_result);
 		connection->OpenInputWriter();

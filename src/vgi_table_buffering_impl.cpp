@@ -493,6 +493,7 @@ FunctionConnectionParams BuildAcquireParams(const VgiTableInOutBindData &bd,
 	params.attach_opaque_data = bd.attach_opaque_data;
 	params.transaction_opaque_data = bd.transaction_opaque_data;
 	params.function_name = bd.function_name;
+	params.schema_name = bd.schema_name;
 	params.settings = bd.settings;
 	params.required_secrets = bd.required_secrets;
 	params.global_execution_id = global_execution_id;

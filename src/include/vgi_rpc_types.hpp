@@ -165,7 +165,12 @@ std::shared_ptr<arrow::RecordBatch> BuildBindRequest(
     const std::string &at_unit = {},    // time travel; empty = null
     const std::string &at_value = {},   // time travel; empty = null
     const CopyFromBindContext *copy_from = nullptr,   // COPY FROM; null = omit field
-    const CopyToBindContext *copy_to = nullptr);      // COPY TO; null = omit field
+    const CopyToBindContext *copy_to = nullptr,       // COPY TO; null = omit field
+    // Catalog schema that owns this function. A worker may register the same
+    // function name in more than one schema, so the bare name is not a unique
+    // key — the worker resolves (schema_name, function_name). Empty = null,
+    // which makes the worker fall back to a cross-schema name lookup.
+    const std::string &schema_name = {});
 
 // Parsed BindResponse
 struct BindResponseResult {

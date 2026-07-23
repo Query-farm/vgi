@@ -54,7 +54,8 @@ BindResult PerformBindProtocol(
     const std::string &at_unit = {},    // time travel; empty = null
     const std::string &at_value = {},   // time travel; empty = null
     const CopyFromBindContext *copy_from = nullptr,  // COPY FROM; null = omit
-    const CopyToBindContext *copy_to = nullptr);     // COPY TO; null = omit
+    const CopyToBindContext *copy_to = nullptr,      // COPY TO; null = omit
+    const std::string &schema_name = {});  // owning catalog schema; empty = null
 
 // Build the IPC-serialized BindRequest bytes that PerformBindProtocol sends
 // over the wire. Factored out so the inline-bind path (which has the
@@ -80,7 +81,8 @@ std::vector<uint8_t> BuildBindRequestBytes(
     const std::string &at_unit = {},    // time travel; empty = null
     const std::string &at_value = {},   // time travel; empty = null
     const CopyFromBindContext *copy_from = nullptr,  // COPY FROM; null = omit
-    const CopyToBindContext *copy_to = nullptr);     // COPY TO; null = omit
+    const CopyToBindContext *copy_to = nullptr,      // COPY TO; null = omit
+    const std::string &schema_name = {});  // owning catalog schema; empty = null
 
 // Non-network entrypoint: given pre-built bind_request_bytes (typically from
 // `BuildBindRequestBytes`) and an inlined bind_response blob (from

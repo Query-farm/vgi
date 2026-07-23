@@ -503,14 +503,23 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 	bool order_preservation_set = false;
 	std::vector<std::string> scan_supported_expression_filters;
 	std::vector<vgi::VgiSecretRequirement> scan_required_secrets;
+	// Which schema the scan function actually resolved in. The worker registers
+	// function names per schema and may reuse one name across schemas, so the
+	// bind request has to name the schema we found it in — not just the table's.
+	std::string scan_function_schema;
 	auto func_entry = catalog_.GetEntry<TableFunctionCatalogEntry>(
 	    context, ParentSchema().name, scan_result.function_name, OnEntryNotFound::RETURN_NULL);
-	if (!func_entry) {
+	if (func_entry) {
+		scan_function_schema = ParentSchema().name;
+	} else {
 		// Function may be in a different schema (e.g., main) than the table's schema (e.g., data)
 		auto &default_schema = vgi_catalog.attach_result()->default_schema;
 		if (default_schema != ParentSchema().name) {
 			func_entry = catalog_.GetEntry<TableFunctionCatalogEntry>(
 			    context, default_schema, scan_result.function_name, OnEntryNotFound::RETURN_NULL);
+			if (func_entry) {
+				scan_function_schema = default_schema;
+			}
 		}
 	}
 	bool from_system_catalog = false;
@@ -652,6 +661,9 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 	auto &vgi_tx = VgiTransaction::Get(context, catalog_);
 	scan_bind_data->transaction_opaque_data = vgi_tx.GetTransactionOpaqueData();
 	scan_bind_data->function_name = scan_result.function_name;
+	// Empty when the scan resolved to a built-in DuckDB function from the
+	// system catalog — those never reach a VGI worker.
+	scan_bind_data->schema_name = scan_function_schema;
 	scan_bind_data->arguments = vgi::BuildArgumentsFromValues(context, scan_result.positional_arguments, named_args_vec);
 	scan_bind_data->projection_pushdown = has_projection_pushdown;
 	scan_bind_data->supported_expression_filters = scan_supported_expression_filters;
@@ -809,8 +821,8 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 		// whole table — a net loss (extra scan + semi-join, no pruning). The
 		// rowid virtual column required by the optimizer is registered just
 		// above (row_id_column >= 0), so this branch is the only place the flag
-		// can be safely set; the direct vgi_table_function() path registers no
-		// rowid callbacks and must stay false.
+		// can be safely set; any path that registers no rowid callbacks must
+		// stay false.
 		func.late_materialization =
 		    has_late_materialization && has_filter_pushdown && has_projection_pushdown;
 	}
@@ -828,8 +840,8 @@ void VgiTableEntry::VgiTableScanSerialize(Serializer &serializer, const optional
 	auto &bind_data = bind_data_p->Cast<vgi::VgiTableFunctionBindData>();
 	if (!bind_data.table_entry) {
 		// Only the catalog-scan path installs these callbacks, and it always
-		// sets table_entry. A null here means the direct vgi_table_function()
-		// bind data reached this callback — a wiring bug, not a user error.
+		// sets table_entry. A null here means foreign bind data reached this
+		// callback — a wiring bug, not a user error.
 		throw SerializationException(
 		    "vgi_table_scan cannot be serialized without an originating table entry");
 	}

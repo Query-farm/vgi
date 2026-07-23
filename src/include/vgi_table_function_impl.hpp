@@ -116,6 +116,10 @@ struct VgiTableFunctionBindData : public TableFunctionData {
 
 	// Function identification
 	std::string function_name;
+	// Catalog schema that owns `function_name`. The same name may be registered
+	// in several schemas of one catalog, so the worker resolves the pair rather
+	// than the bare name. Empty for non-catalog call sites.
+	std::string schema_name;
 
 	// Arguments for creating worker connections
 	ArrowArguments arguments;

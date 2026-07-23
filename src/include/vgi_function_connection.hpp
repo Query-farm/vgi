@@ -47,6 +47,10 @@ struct FunctionConnectionParams {
 	std::shared_ptr<VgiAttachParameters> attach_params;  // replaces worker_path, worker_debug, use_pool
 	std::vector<uint8_t> attach_opaque_data;
 	std::string function_name;
+	// Catalog schema that owns `function_name`. The same name may be registered
+	// in several schemas, so the worker resolves the pair; empty leaves it to a
+	// cross-schema lookup by name (non-catalog call sites).
+	std::string schema_name;
 	ArrowArguments arguments;
 	std::vector<uint8_t> transaction_opaque_data;
 	std::vector<uint8_t> global_execution_id;  // Empty for primary workers
@@ -211,6 +215,10 @@ public:
 	// Must be called before PerformBindRpc() for table-in-out functions
 	// input_schema: Arrow schema describing the input data
 	void SetInputSchema(const std::shared_ptr<arrow::Schema> &input_schema) override;
+
+	void SetSchemaName(const std::string &schema_name) override {
+		schema_name_ = schema_name;
+	}
 
 	void SetAtClause(const std::string &at_unit, const std::string &at_value) override {
 		at_unit_ = at_unit;
@@ -414,6 +422,8 @@ private:
 	// Time-travel AT clause (empty = none) for the bind request. See SetAtClause.
 	std::string at_unit_;
 	std::string at_value_;
+	// Catalog schema owning the function (empty = none). See SetSchemaName.
+	std::string schema_name_;
 
 	// COPY ... FROM context for the bind request (empty = none). See SetCopyFromContext.
 	std::optional<CopyFromBindContext> copy_from_;

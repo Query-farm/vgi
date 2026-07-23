@@ -82,6 +82,7 @@ static unique_ptr<FunctionData> VgiCatalogTableFunctionBind(ClientContext &conte
 	auto &vgi_tx = VgiTransaction::Get(context, vgi_info.catalog());
 	bind_data->transaction_opaque_data = vgi_tx.GetTransactionOpaqueData();
 	bind_data->function_name = vgi_info.function_info().name;
+	bind_data->schema_name = vgi_info.function_info().schema_name;
 	bind_data->projection_pushdown = vgi_info.function_info().projection_pushdown.value_or(false);
 	bind_data->supported_expression_filters = vgi_info.function_info().supported_expression_filters;
 	// Carry the wire flag onto bind_data so InstallBatch knows whether to
@@ -214,6 +215,7 @@ static unique_ptr<FunctionData> VgiCatalogTableInOutFunctionBind(ClientContext &
 	vgi::VgiTableInOutBindParams params;
 	params.attach_params = vgi_info.attach_params();
 	params.function_name = vgi_info.function_info().name;
+	params.schema_name = vgi_info.function_info().schema_name;
 	params.attach_opaque_data = vgi_info.attach_opaque_data();
 	auto &tio_tx = VgiTransaction::Get(context, vgi_info.catalog());
 	params.transaction_opaque_data = tio_tx.GetTransactionOpaqueData();

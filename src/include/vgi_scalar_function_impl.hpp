@@ -38,6 +38,10 @@ struct VgiScalarFunctionInfo : public ScalarFunctionInfo {
 	std::vector<uint8_t> attach_opaque_data;
 	optional_ptr<Catalog> catalog;
 	std::string function_name;
+	// Catalog schema this function was registered into. The same name may exist
+	// in several schemas of one catalog, so it is carried into the bind request
+	// and the worker resolves (schema_name, function_name).
+	std::string schema_name;
 	std::map<std::string, Value> settings;
 	std::vector<std::string> setting_names;
 	std::vector<vgi::VgiSecretRequirement> required_secrets;
@@ -72,6 +76,8 @@ struct VgiScalarFunctionBindData : public FunctionData {
 	std::shared_ptr<vgi::VgiAttachParameters> attach_params;  // replaces worker_path, worker_debug, use_pool
 	std::vector<uint8_t> attach_opaque_data;
 	std::string function_name;
+	// Owning catalog schema; see VgiScalarFunctionInfo::schema_name.
+	std::string schema_name;
 	std::map<std::string, Value> settings;
 	std::vector<vgi::VgiSecretRequirement> required_secrets;
 
@@ -104,6 +110,7 @@ struct VgiScalarFunctionBindData : public FunctionData {
 		copy->attach_params = attach_params;
 		copy->attach_opaque_data = attach_opaque_data;
 		copy->function_name = function_name;
+		copy->schema_name = schema_name;
 		copy->settings = settings;
 		copy->required_secrets = required_secrets;
 		copy->resolved_output_schema = resolved_output_schema;
@@ -119,8 +126,8 @@ struct VgiScalarFunctionBindData : public FunctionData {
 	bool Equals(const FunctionData &other_p) const override {
 		auto &other = other_p.Cast<VgiScalarFunctionBindData>();
 		return worker_path() == other.worker_path() && attach_opaque_data == other.attach_opaque_data &&
-		       function_name == other.function_name && worker_debug() == other.worker_debug() &&
-		       use_pool() == other.use_pool();
+		       function_name == other.function_name && schema_name == other.schema_name &&
+		       worker_debug() == other.worker_debug() && use_pool() == other.use_pool();
 	}
 };
 

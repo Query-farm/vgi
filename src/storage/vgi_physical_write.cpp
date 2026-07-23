@@ -68,6 +68,23 @@ static bool WriteFunctionHasFinalize(ClientContext &context, Catalog &catalog,
 	return false;
 }
 
+// Which schema the write function resolves in. A worker may register the same
+// function name in several schemas, so the bind request has to name the schema
+// the function was actually found in. Mirrors WriteFunctionHasFinalize's
+// table-schema-then-default-schema order. Empty when not found.
+static string ResolveWriteFunctionSchema(ClientContext &context, Catalog &catalog, const string &table_schema,
+                                          const string &function_name) {
+	if (catalog.GetEntry(context, CatalogType::TABLE_FUNCTION_ENTRY, table_schema, function_name,
+	                     OnEntryNotFound::RETURN_NULL)) {
+		return table_schema;
+	}
+	auto default_schema = catalog.GetDefaultSchema();
+	if (catalog.GetEntry(context, CatalogType::TABLE_FUNCTION_ENTRY, default_schema, function_name,
+	                     OnEntryNotFound::RETURN_NULL)) {
+		return default_schema;
+	}
+	return string();
+}
 
 // ============================================================================
 // Helper: Set up a write connection to a VGI worker function
@@ -155,6 +172,8 @@ static SetupWriteResult SetupWriteConnection(ClientContext &context, VgiTableEnt
 	}
 
 	connection->SetInputSchema(input_schema);
+	connection->SetSchemaName(ResolveWriteFunctionSchema(context, catalog, table.GetTableInfo().schema_name,
+	                                                     write_func.function_name));
 	auto bind_result = connection->PerformBindRpc();
 	connection->PerformInit(bind_result, {}, nullptr, {}, "INPUT");
 	connection->OpenInputWriter();
@@ -333,8 +352,8 @@ InsertionOrderPreservingMap<string> VgiPhysicalInsert::ParamsToString() const {
 // refuse on multi-branch tables — the cross-arm-target semantics question
 // has no clean answer (loud-error / silent-scope / refuse each carry UX
 // trade-offs without engine precedent), and the conservative choice is
-// to refuse and direct the user to per-branch dispatch via
-// vgi_table_function(...).
+// to refuse and direct the user to per-branch dispatch via a
+// catalog scan of the specific branch.
 //
 // Both helpers issue a fresh branches RPC (via catalog_table_scan_branches_get,
 // which falls back to the legacy single-function path for older workers).

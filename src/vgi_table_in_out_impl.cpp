@@ -66,6 +66,7 @@ unique_ptr<FunctionData> VgiTableInOutBindData::Copy() const {
 	copy->attach_opaque_data = attach_opaque_data;
 	copy->transaction_opaque_data = transaction_opaque_data;
 	copy->function_name = function_name;
+	copy->schema_name = schema_name;
 	copy->settings = settings;
 	copy->arguments = arguments;
 	copy->output_schema = output_schema;
@@ -88,7 +89,10 @@ unique_ptr<FunctionData> VgiTableInOutBindData::Copy() const {
 
 bool VgiTableInOutBindData::Equals(const FunctionData &other_p) const {
 	auto &other = other_p.Cast<VgiTableInOutBindData>();
-	return worker_path() == other.worker_path() && function_name == other.function_name && attach_opaque_data == other.attach_opaque_data;
+	// schema_name is part of the identity: the same function name in two
+	// schemas is two different functions and must not collapse in the plan cache.
+	return worker_path() == other.worker_path() && function_name == other.function_name &&
+	       schema_name == other.schema_name && attach_opaque_data == other.attach_opaque_data;
 }
 
 // ============================================================================
@@ -143,6 +147,7 @@ unique_ptr<FunctionData> VgiTableInOutBind(ClientContext &context, TableFunction
 	bind_data->attach_opaque_data = params.attach_opaque_data;
 	bind_data->transaction_opaque_data = params.transaction_opaque_data;
 	bind_data->function_name = params.function_name;
+	bind_data->schema_name = params.schema_name;
 	bind_data->settings = params.settings;
 	bind_data->required_secrets = params.required_secrets;
 	bind_data->table_buffering = params.table_buffering;
@@ -428,6 +433,7 @@ unique_ptr<GlobalTableFunctionState> VgiTableInOutInitGlobal(ClientContext &cont
 		acquire_params.attach_params = bind_data.attach_params;
 		acquire_params.attach_opaque_data = bind_data.attach_opaque_data;
 		acquire_params.function_name = bind_data.function_name;
+		acquire_params.schema_name = bind_data.schema_name;
 		acquire_params.arguments = bind_data.arguments;
 		acquire_params.transaction_opaque_data = bind_data.transaction_opaque_data;
 		acquire_params.settings = bind_data.settings;
@@ -626,6 +632,7 @@ AcquireSubstreamConnection(ClientContext &context, const VgiTableInOutBindData &
 	p.attach_params = bind_data.attach_params;
 	p.attach_opaque_data = bind_data.attach_opaque_data;
 	p.function_name = bind_data.function_name;
+	p.schema_name = bind_data.schema_name;
 	p.arguments = bind_data.arguments;
 	p.transaction_opaque_data = bind_data.transaction_opaque_data;
 	p.settings = bind_data.settings;
@@ -670,6 +677,7 @@ AcquireBlendedInputConnection(ClientContext &context, const VgiTableInOutBindDat
 	p.attach_params = bind_data.attach_params;
 	p.attach_opaque_data = bind_data.attach_opaque_data;
 	p.function_name = bind_data.function_name;
+	p.schema_name = bind_data.schema_name;
 	p.arguments = bind_data.arguments;
 	p.transaction_opaque_data = bind_data.transaction_opaque_data;
 	p.settings = bind_data.settings;

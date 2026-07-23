@@ -145,6 +145,10 @@ void VgiScalarFunctionSet::LoadEntries(ClientContext &context, const std::lock_g
 			scalar_func_info->attach_opaque_data = attach_result->attach_opaque_data;
 			scalar_func_info->catalog = &catalog_;
 			scalar_func_info->function_name = func_info.name;
+			// The same function name may be registered in more than one schema
+			// of this catalog; the worker needs the pair to pick the right
+			// implementation, since the bare name is not unique.
+			scalar_func_info->schema_name = schema_.name;
 			scalar_func_info->output_schema = func_info.output_schema;
 			scalar_func_info->has_dynamic_return_type = is_any_output;
 			scalar_func_info->positional_is_const = arg_types.positional_is_const;

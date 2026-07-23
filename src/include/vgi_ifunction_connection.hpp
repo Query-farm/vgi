@@ -79,6 +79,16 @@ public:
 		(void)at_value;
 	}
 
+	// Set the catalog schema that owns this function, carried into the bind
+	// request. A worker may register the same function name in several schemas,
+	// so the bare name does not identify the implementation — the worker
+	// resolves (schema_name, function_name). Empty = none, which leaves the
+	// worker to look the name up across every schema.
+	// Default no-op: only the real subprocess/HTTP/webworker connections override it.
+	virtual void SetSchemaName(const std::string &schema_name) {
+		(void)schema_name;
+	}
+
 	// Set the stable, client-minted per-substream id carried on the InitRequest
 	// for the parallel streaming table-in-out path (see InitRequest.substream_id).
 	// It is the same for this substream's init / process / finalize, so a

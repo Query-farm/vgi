@@ -208,6 +208,7 @@ unique_ptr<FunctionData> VgiTableFunctionBindData::Copy() const {
 	result->attach_opaque_data = attach_opaque_data;
 	result->transaction_opaque_data = transaction_opaque_data;
 	result->function_name = function_name;
+	result->schema_name = schema_name;
 	result->arguments = arguments;
 	result->settings = settings;
 	result->required_secrets = required_secrets;
@@ -289,7 +290,8 @@ void PerformVgiTableFunctionBind(ClientContext &context, VgiTableFunctionBindDat
 				    bind_data.settings, resolved_secrets,
 				    /*resolved_secrets_provided=*/false,
 				    bind_data.worker_path(),
-				    bind_data.at_unit, bind_data.at_value);
+				    bind_data.at_unit, bind_data.at_value,
+				    /*copy_from=*/nullptr, /*copy_to=*/nullptr, bind_data.schema_name);
 				auto bind_result = vgi::BuildBindResultFromInlinedBytes(
 				    std::move(bind_request_bytes), *tinfo.bind_result,
 				    bind_data.worker_path());
@@ -318,6 +320,7 @@ void PerformVgiTableFunctionBind(ClientContext &context, VgiTableFunctionBindDat
 	params.attach_params = bind_data.attach_params;
 	params.attach_opaque_data = bind_data.attach_opaque_data;
 	params.function_name = bind_data.function_name;
+	params.schema_name = bind_data.schema_name;
 	params.arguments = bind_data.arguments;
 	params.transaction_opaque_data = bind_data.transaction_opaque_data;
 	params.settings = bind_data.settings;
@@ -1990,6 +1993,7 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 	acquire_params.attach_params = bind_data.attach_params;
 	acquire_params.attach_opaque_data = bind_data.attach_opaque_data;
 	acquire_params.function_name = bind_data.function_name;
+	acquire_params.schema_name = bind_data.schema_name;
 	acquire_params.arguments = bind_data.arguments;
 	acquire_params.transaction_opaque_data = bind_data.transaction_opaque_data;
 	acquire_params.settings = bind_data.settings;
@@ -2424,6 +2428,7 @@ unique_ptr<LocalTableFunctionState> VgiTableFunctionInitLocal(ExecutionContext &
 		params.attach_params = bind_data.attach_params;
 		params.attach_opaque_data = bind_data.attach_opaque_data;
 		params.function_name = bind_data.function_name;
+		params.schema_name = bind_data.schema_name;
 		params.arguments = bind_data.arguments;
 		params.transaction_opaque_data = bind_data.transaction_opaque_data;
 		params.global_execution_id = global_state.global_execution_id;

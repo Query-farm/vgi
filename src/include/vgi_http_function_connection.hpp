@@ -55,6 +55,10 @@ public:
 	// HTTP has no spawn step; this is a no-op satisfying the interface.
 	void EnsureWorkerSpawned() override {}
 	void SetInputSchema(const std::shared_ptr<arrow::Schema> &input_schema) override;
+	void SetSchemaName(const std::string &schema_name) override {
+		schema_name_ = schema_name;
+	}
+
 	void SetAtClause(const std::string &at_unit, const std::string &at_value) override {
 		at_unit_ = at_unit;
 		at_value_ = at_value;
@@ -189,6 +193,8 @@ private:
 	// Time-travel AT clause (empty = none) for the bind request. See SetAtClause.
 	std::string at_unit_;
 	std::string at_value_;
+	// Catalog schema owning the function (empty = none). See SetSchemaName.
+	std::string schema_name_;
 
 	// COPY ... FROM context for the bind request (empty = none). See SetCopyFromContext.
 	std::optional<CopyFromBindContext> copy_from_;

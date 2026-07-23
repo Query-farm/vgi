@@ -522,7 +522,8 @@ BuildBindRequest(const std::string &function_name, const std::vector<uint8_t> &a
                  const std::vector<uint8_t> &settings_bytes, const std::vector<uint8_t> &secrets_bytes,
                  const std::vector<uint8_t> &attach_opaque_data, const std::vector<uint8_t> &transaction_opaque_data,
                  bool resolved_secrets_provided, const std::string &at_unit, const std::string &at_value,
-                 const CopyFromBindContext *copy_from, const CopyToBindContext *copy_to) {
+                 const CopyFromBindContext *copy_from, const CopyToBindContext *copy_to,
+                 const std::string &schema_name) {
 	// FunctionType enum: SCALAR, TABLE, AGGREGATE
 	static const std::vector<std::string> function_type_values = {"SCALAR", "TABLE", "AGGREGATE"};
 
@@ -540,6 +541,10 @@ BuildBindRequest(const std::string &function_name, const std::vector<uint8_t> &a
 	    // Python BindRequest dataclass fields (matched by name, not position).
 	    arrow::field("at_unit", arrow::utf8(), true),
 	    arrow::field("at_value", arrow::utf8(), true),
+	    // Owning catalog schema; disambiguates a function name registered in
+	    // more than one schema. Empty string serialises as null, which tells
+	    // the worker to fall back to a cross-schema lookup by name.
+	    arrow::field("schema_name", arrow::utf8(), true),
 	};
 
 	std::vector<std::shared_ptr<arrow::Array>> arrays;
@@ -561,6 +566,7 @@ BuildBindRequest(const std::string &function_name, const std::vector<uint8_t> &a
 
 	arrays.push_back(BuildNullableStringScalar(at_unit));
 	arrays.push_back(BuildNullableStringScalar(at_value));
+	arrays.push_back(BuildNullableStringScalar(schema_name));
 
 	// copy_from: nested struct<format, file_path, expected_schema>, only added
 	// for a COPY ... FROM scan. The Python worker matches BindRequest fields by
