@@ -269,7 +269,7 @@ void SyncResultCacheSettings(ClientContext &context) {
 
 bool BuildExchangeCacheKeyStaticFields(ClientContext &context,
                                        const std::shared_ptr<VgiAttachParameters> &attach_params,
-                                       const std::string &function_name,
+                                       const std::string &function_name, const std::string &schema_name,
                                        const std::string &canonical_arguments,
                                        const std::map<std::string, Value> &settings,
                                        const std::vector<int32_t> &projection_ids, VgiResultCacheKey &key,
@@ -331,6 +331,7 @@ bool BuildExchangeCacheKeyStaticFields(ClientContext &context,
 	key.identity_scope = identity_scope;
 	key.worker_path = attach_params->worker_path();
 	key.function_name = function_name;
+	key.schema_name = schema_name;
 	key.canonical_arguments = canonical_arguments;
 	key.canonical_settings = SerializeSettingsForKey(settings);
 	key.attach_options = attach_params->attach_options_canonical();
@@ -349,7 +350,7 @@ bool BuildExchangeCacheKeyStatic(ClientContext &context, const VgiTableInOutBind
                                  const std::vector<int32_t> &projection_ids, VgiResultCacheKey &key,
                                  std::string &catalog_name, int64_t &catalog_version, const char *&reason,
                                  const std::string &operator_kind) {
-	return BuildExchangeCacheKeyStaticFields(context, bd.attach_params, bd.function_name,
+	return BuildExchangeCacheKeyStaticFields(context, bd.attach_params, bd.function_name, bd.schema_name,
 	                                         bd.arguments.array ? bd.arguments.array->ToString() : "",
 	                                         bd.settings, projection_ids, key, catalog_name, catalog_version,
 	                                         reason, operator_kind);

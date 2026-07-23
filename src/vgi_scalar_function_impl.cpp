@@ -555,8 +555,9 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 		// shape (critical once results persist across a restart). See shape_key.
 		const std::string op_kind = "scalar\x1f" + result.GetType().ToString();
 		if (BuildExchangeCacheKeyStaticFields(context, bind_data->attach_params, bind_data->function_name,
-		                                      canon_args, bind_data->settings, {}, local_state.cache_static_key,
-		                                      local_state.cache_catalog_name, cver, reason, op_kind)) {
+		                                      bind_data->schema_name, canon_args, bind_data->settings, {},
+		                                      local_state.cache_static_key, local_state.cache_catalog_name, cver,
+		                                      reason, op_kind)) {
 			local_state.cache_eligible = true;
 			local_state.cache_static_fp = local_state.cache_static_key.Fingerprint();
 			Value ttl_v;

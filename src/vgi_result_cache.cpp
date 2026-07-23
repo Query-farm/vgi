@@ -323,7 +323,8 @@ std::string UniqueTempSuffix() {
 
 bool VgiResultCacheKey::operator==(const VgiResultCacheKey &o) const {
 	return identity_scope == o.identity_scope && worker_path == o.worker_path &&
-	       function_name == o.function_name && canonical_arguments == o.canonical_arguments &&
+	       function_name == o.function_name && schema_name == o.schema_name &&
+	       canonical_arguments == o.canonical_arguments &&
 	       canonical_settings == o.canonical_settings && attach_options == o.attach_options &&
 	       projection == o.projection && attached_data_version == o.attached_data_version &&
 	       implementation_version == o.implementation_version && catalog_version == o.catalog_version &&
@@ -337,6 +338,7 @@ uint64_t VgiResultCacheKey::Hash() const {
 	HashStr(seed, identity_scope);
 	HashStr(seed, worker_path);
 	HashStr(seed, function_name);
+	HashStr(seed, schema_name);
 	HashStr(seed, canonical_arguments);
 	HashStr(seed, canonical_settings);
 	HashStr(seed, attach_options);
@@ -376,6 +378,7 @@ std::string VgiResultCacheKey::Fingerprint() const {
 	add(identity_scope);
 	add(worker_path);
 	add(function_name);
+	add(schema_name);
 	add(canonical_arguments);
 	add(canonical_settings);
 	add(attach_options);

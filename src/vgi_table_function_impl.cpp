@@ -1569,6 +1569,7 @@ CacheEligibility EvaluateCacheEligibility(ClientContext &context,
 	e.key.identity_scope = identity_scope;
 	e.key.worker_path = bind_data.worker_path();
 	e.key.function_name = bind_data.function_name;
+	e.key.schema_name = bind_data.schema_name;
 	e.key.canonical_arguments = bind_data.arguments.array ? bind_data.arguments.array->ToString() : "";
 	e.key.canonical_settings = SerializeSettingsForKey(bind_data.settings);
 	e.key.attach_options = bind_data.attach_params->attach_options_canonical();

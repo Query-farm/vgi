@@ -115,13 +115,17 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 #   test_same_name_buffered (table-buffering), each declared TWICE — once in
 #   `main` and once in `data` — so the pair collides on name and is separated
 #   only by the owning schema. Back table_in_out/same_name_schemas.test.
-# = 142
+# 2 cacheable schema-disambiguation probes: test_same_name_cached, a one-row
+#   producer advertising vgi.cache.ttl, declared in both `main` and `data` so
+#   its two cache entries prove the result-cache key carries the owning schema.
+#   Back cache/same_name_schemas.test.
+# = 144
 query I
 SELECT COUNT(*)
 FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'table';
 ----
-142
+144
 
 # The 34 pure table functions (no TABLE parameter type)
 # Note: make_series appears 5 times (5 overloads), make_pairs appears 3 times,

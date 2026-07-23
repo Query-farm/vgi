@@ -1,0 +1,56 @@
+# name: test/sql/integration/cache/same_name_schemas.test
+# description: The RESULT-CACHE member of the schema-disambiguation family (see
+#   scalar/, table_in_out/ and aggregate/ same_name_schemas.test, which probe
+#   DISPATCH). A function name is unique only within a schema, but the result
+#   cache keyed on catalog + auth + function_name with no schema dimension — so
+#   two same-named functions in different schemas of one catalog produced
+#   byte-identical cache keys and could cross-serve each other's memoized rows,
+#   the caching-layer twin of the (schema, name) dispatch bug.
+#
+#   test_same_name_cached is a one-row producer registered in BOTH main and data,
+#   advertising vgi.cache.ttl and tagging its row with its own schema. A
+#   cross-serve surfaces as example.data.<fn> returning a 'main' row; the fix
+#   gives each schema its own cache entry (two rows in vgi_result_cache()).
+# group: [vgi_integration_cache]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# First call in `main`: a MISS, stores main's entry.
+query T
+SELECT tag FROM example.main.test_same_name_cached();
+----
+main
+
+# Repeat in `main`: served from main's entry — its own tag, unchanged.
+query T
+SELECT tag FROM example.main.test_same_name_cached();
+----
+main
+
+# The load-bearing assertion: `data` must NOT cross-serve `main`'s entry. With a
+# schema-less key this returned 'main'; with the schema in the key it MISSes and
+# returns its own tag.
+query T
+SELECT tag FROM example.data.test_same_name_cached();
+----
+data
+
+# `main` is undisturbed by data's traffic.
+query T
+SELECT tag FROM example.main.test_same_name_cached();
+----
+main
+
+# Two distinct cache entries now exist for the one function name — one per
+# schema. A schema-less key would leave exactly one (the cross-serving entry).
+query I
+SELECT COUNT(*) FROM vgi_result_cache() WHERE function = 'test_same_name_cached';
+----
+2

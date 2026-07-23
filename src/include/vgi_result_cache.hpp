@@ -100,6 +100,16 @@ struct VgiResultCacheKey {
 	std::string identity_scope;        // catalog_name + auth principal fingerprint
 	std::string worker_path;
 	std::string function_name;
+	// Owning catalog schema. A function name is unique only WITHIN a schema, so
+	// two same-named functions in different schemas of one catalog are different
+	// functions and must not share a cache entry — without this field their keys
+	// are byte-identical (identity_scope is catalog+auth, function_name is the
+	// bare name) and one schema's memoized result cross-serves the other, the
+	// caching-layer twin of the (schema, name) dispatch bug. Empty when the
+	// caller names no schema (the direct vgi_table_function() path, or a bind
+	// that genuinely carries none), which preserves the pre-field behaviour for
+	// those keys. Mirrors BindRequest.schema_name.
+	std::string schema_name;
 	std::string canonical_arguments;   // canonical (sorted) serialization — NOT raw IPC framing
 	std::string canonical_settings;    // canonical (sorted) serialization
 	std::string attach_options;        // canonical ATTACH options (excl. secret tokens)

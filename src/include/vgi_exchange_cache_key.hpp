@@ -123,7 +123,7 @@ bool BuildExchangeCacheKeyStatic(ClientContext &context, const VgiTableInOutBind
 //! operator shapes collide, which is the bug this parameter exists to close).
 bool BuildExchangeCacheKeyStaticFields(ClientContext &context,
                                        const std::shared_ptr<VgiAttachParameters> &attach_params,
-                                       const std::string &function_name,
+                                       const std::string &function_name, const std::string &schema_name,
                                        const std::string &canonical_arguments,
                                        const std::map<std::string, Value> &settings,
                                        const std::vector<int32_t> &projection_ids, VgiResultCacheKey &key,
