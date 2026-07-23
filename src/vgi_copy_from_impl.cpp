@@ -19,7 +19,7 @@ TableFunction MakeVgiCopyFromTableFunction() {
 	// + init callbacks verbatim so there is no new streaming code.
 	TableFunction func("vgi_copy_from", {}, vgi::VgiTableFunctionScan, /*bind=*/nullptr,
 	                   vgi::VgiTableFunctionInitGlobal, vgi::VgiTableFunctionInitLocal);
-	// Mirror the diagnostic hooks the direct vgi_table_function() path installs so
+	// Mirror the diagnostic hooks the catalog scan path installs so
 	// EXPLAIN / EXPLAIN ANALYZE / progress annotate the COPY scan.
 	func.cardinality = vgi::VgiTableFunctionCardinality;
 	func.table_scan_progress = vgi::VgiTableFunctionProgress;
@@ -110,7 +110,7 @@ unique_ptr<FunctionData> VgiCopyFromBind(ClientContext &context, CopyFromFunctio
 	auto bind_data = make_uniq<VgiTableFunctionBindData>();
 	bind_data->attach_params = carrier.attach_params;
 	bind_data->attach_opaque_data = carrier.attach_opaque_data;
-	// COPY runs outside a catalog read transaction; the direct vgi_table_function()
+	// COPY runs outside a catalog read transaction; the catalog scan
 	// path also binds with no transaction_opaque_data.
 	bind_data->function_name = carrier.handler;
 	bind_data->arguments = vgi::BuildArgumentsFromValues(context, /*positional=*/{}, named_args);
@@ -148,7 +148,7 @@ unique_ptr<FunctionData> VgiCopyFromBind(ClientContext &context, CopyFromFunctio
 	}
 
 	// Mirror table-function configuration onto the bound copy_from_function, as
-	// the direct path does (vgi_table_function.cpp).
+	// the catalog scan path does (vgi_table_function_set.cpp).
 	info.tf.projection_pushdown = bind_data->projection_pushdown;
 
 	return std::move(bind_data);

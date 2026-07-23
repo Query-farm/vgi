@@ -9,6 +9,9 @@ require vgi
 require httpfs
 
 statement ok
+ATTACH 'example' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
 CALL enable_logging(level := 'debug');
 
 statement ok
@@ -39,7 +42,7 @@ statement ok
 CALL truncate_duckdb_logs();
 
 query II
-SELECT COUNT(*), SUM(v) FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_parallel', [200000]);
+SELECT COUNT(*), SUM(v) FROM ex.main.cache_parallel(200000);
 ----
 200000	19999900000
 
@@ -64,7 +67,7 @@ statement ok
 CALL truncate_duckdb_logs();
 
 query II
-SELECT COUNT(*), SUM(v) FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_parallel', [200000]);
+SELECT COUNT(*), SUM(v) FROM ex.main.cache_parallel(200000);
 ----
 200000	19999900000
 
@@ -78,9 +81,6 @@ true
 # 2. Single-producer spill: cache_big (catalog data Table, one worker) still
 #    spills correctly and serves complete.
 # ---------------------------------------------------------------------------
-statement ok
-ATTACH 'example' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
-
 statement ok
 SELECT * FROM vgi_result_cache_flush();
 

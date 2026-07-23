@@ -2,7 +2,7 @@
 // arrow inlined) and loaded in a cross-origin-isolated page. Exercises the full
 // transport against the real haybarn engine + VGI extension + worker module:
 //   1. LOAD the extension (slot stubs resolve at dlopen)
-//   2. direct  vgi_table_function('worker:...', 'count_to', [5])  => [0..4]
+//   2. catalog wcat.main.count_to(5)  => [0..4]
 //   3. ATTACH 'worker:...' -> discovery -> wcat.main.count_to(3)   => [0..2]
 //   4. multi-threaded: 4 concurrent worker: scans on separate connections
 // Results land on window.__result / window.__done for the puppeteer runner.
@@ -40,14 +40,14 @@ window.__result = {};
     R.loaded = true;
 
     // 2. direct table function
-    const rw = await conn.query("SELECT * FROM vgi_table_function('worker:vgi-worker-boot.js', 'count_to', [5])");
+    const rw = await conn.query("SELECT * FROM wcat.main.count_to(5)");
     const dv = colVals(rw);
     R.workerOk = eq(dv, range(5));
     log('direct count_to(5) => ' + JSON.stringify(dv) + ' ok=' + R.workerOk);
 
     // 2b. multi-batch producer (count_to emits one batch; this streams several)
     const rmb = await conn.query(
-      "SELECT count(*)::INT c, sum(value)::INT s FROM vgi_table_function('worker:vgi-worker-boot.js', 'emit_batches', [3, 4])");
+      "SELECT count(*)::INT c, sum(value)::INT s FROM wcat.main.emit_batches(3, 4)");
     const c = Number(rmb.getChild('c').get(0)), s = Number(rmb.getChild('s').get(0));
     R.multiBatchOk = c === 12 && s === 66; // 12 rows (0..11), sum 66
     log('emit_batches(3,4) => rows=' + c + ' sum=' + s + ' ok=' + R.multiBatchOk);
@@ -69,7 +69,7 @@ window.__result = {};
     const ns = [6, 9];
     const conns = await Promise.all(ns.map(() => db.connect()));
     const rows = await Promise.all(conns.map((c, k) =>
-      c.query("SELECT * FROM vgi_table_function('worker:vgi-worker-boot.js', 'count_to', [" + ns[k] + '])')));
+      c.query('SELECT * FROM wcat.main.count_to(' + ns[k] + ')')));
     R.concurrentOk = rows.every((r, k) => eq(colVals(r), range(ns[k])));
     log('concurrent counts => ' + JSON.stringify(rows.map((r) => r.numRows)) + ' ok=' + R.concurrentOk);
     for (const c of conns) await c.close();
@@ -91,14 +91,14 @@ window.__result = {};
     await conn.query('SET threads=4');
     R.errorOk = false;
     try {
-      await conn.query("SELECT * FROM vgi_table_function('worker:vgi-worker-boot.js', 'boom', [])");
+      await conn.query("SELECT * FROM wcat.main.boom()");
       log('boom() did NOT throw — FAIL');
     } catch (be) {
       R.errorOk = /boom/.test(String(be.message));
       log('boom() threw ("' + String(be.message).slice(0, 60) + '...") ok=' + R.errorOk);
     }
     // and a scan AFTER the error must still work (proves the errored slot freed)
-    const rpost = await conn.query("SELECT * FROM vgi_table_function('worker:vgi-worker-boot.js', 'count_to', [4])");
+    const rpost = await conn.query("SELECT * FROM wcat.main.count_to(4)");
     R.postErrorOk = eq(colVals(rpost), range(4));
     log('post-error count_to(4) => ' + JSON.stringify(colVals(rpost)) + ' ok=' + R.postErrorOk);
 
@@ -114,10 +114,10 @@ window.__result = {};
     // the same-slot-reuse race into a following scan.
     await conn.query('SET threads=4');
     const rpp = await conn.query(
-      "SELECT count(*)::INT c FROM vgi_table_function('worker:vgi-worker-boot.js', 'parallel_probe', [30])");
+      "SELECT count(*)::INT c FROM wcat.main.parallel_probe(30)");
     R.parallelRows = Number(rpp.getChild('c').get(0)); // diagnostic: 2 rows/thread (thread count is scheduler-dependent)
     const rpk = await conn.query(
-      "SELECT * FROM vgi_table_function('worker:vgi-worker-boot.js', 'peek_max_concurrency', [])");
+      "SELECT * FROM wcat.main.peek_max_concurrency()");
     R.maxConcurrency = Number(rpk.getChildAt(0).get(0));
     R.parallelOk = R.maxConcurrency >= 2;
     log('parallel_probe rows=' + R.parallelRows + ' maxConcurrency=' + R.maxConcurrency + ' ok=' + R.parallelOk);

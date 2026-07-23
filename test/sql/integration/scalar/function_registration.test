@@ -25,7 +25,7 @@ SELECT COUNT(*)
 FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'scalar';
 ----
-49
+51
 
 query T
 SELECT function_name
@@ -74,6 +74,8 @@ sha256_hex
 smart_format
 smart_format
 sum_values
+test_same_name_bind
+test_same_name_bind
 type_info
 type_info
 type_info
@@ -392,7 +394,7 @@ SELECT COUNT(*)
 FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'scalar' AND varargs IS NULL;
 ----
-43
+45
 
 # ============================================================================
 # Stability
@@ -416,7 +418,7 @@ SELECT COUNT(*)
 FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'scalar' AND stability = 'CONSISTENT';
 ----
-46
+48
 
 query T
 SELECT function_name

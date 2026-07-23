@@ -84,7 +84,6 @@
 #ifndef __EMSCRIPTEN__
 #include "vgi_subprocess.hpp"
 #endif
-#include "vgi_table_function.hpp"
 #include "vgi_table_function_impl.hpp"
 #include "vgi_transport.hpp"
 #include "vgi_worker_pool.hpp"
@@ -3482,7 +3481,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    LogicalType::BOOLEAN, Value::BOOLEAN(true));
 
 	// Set default pool settings for paths without explicit per-path config
-	// (e.g., direct vgi_table_function() calls that don't go through ATTACH)
+	// (e.g., vgi_catalogs() calls that don't go through ATTACH)
 	vgi::VgiWorkerPool::Instance().SetDefaultSettings({256, 5});
 
 	// Configure the result-cache global byte caps (process-global; match the
@@ -3493,7 +3492,6 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	// Register VGI table functions
 	RegisterVgiCatalogsFunction(loader);
-	RegisterVgiTableFunction(loader);
 
 	// Register the synthetic catalog-scan function under its name. VgiTableEntry
 	// builds an unnamed-in-catalog "vgi_table_scan" TableFunction per scan, but

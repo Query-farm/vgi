@@ -182,7 +182,7 @@ struct VgiScanFunctionResult {
 // re-bound per rewrite) that the rewriter AND's into the branch's scan
 // before pushdown.
 struct VgiScanBranch {
-	std::string function_name;                              // e.g. "vgi_table_function", "iceberg_scan", "read_parquet"
+	std::string function_name;                              // e.g. "vgi_table_scan", "iceberg_scan", "read_parquet"
 	duckdb::vector<Value> positional_arguments;
 	std::map<std::string, Value> named_arguments;
 	std::string branch_filter;                              // Empty == unconstrained

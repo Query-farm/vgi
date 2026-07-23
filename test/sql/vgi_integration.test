@@ -49,6 +49,11 @@ vgi_test	main
 statement ok
 DETACH vgi_test;
 
+# Re-attach for the scan tests below (the DETACH above is the subject of the
+# preceding assertion, not a teardown).
+statement ok
+ATTACH 'example' AS vgi_test (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
 # Test ATTACH with non-existent catalog returns proper error
 statement error
 ATTACH 'nonexistent_catalog' AS vgi_bad (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
@@ -56,7 +61,7 @@ ATTACH 'nonexistent_catalog' AS vgi_bad (TYPE vgi, LOCATION '${VGI_TEST_WORKER}'
 No worker handles catalog 'nonexistent_catalog'
 
 # ============================================================================
-# Test vgi_table_function with multi-worker execution and logging
+# Test a catalog table-function scan with multi-worker execution and logging
 # ============================================================================
 
 require json
@@ -72,7 +77,7 @@ CALL truncate_duckdb_logs();
 # This exercises multi-worker execution via work queue pattern
 query IIII
 SELECT COUNT(*) as total, COUNT(DISTINCT n) as distinct_count, MIN(n) as min_val, MAX(n) as max_val
-FROM vgi_table_function('${VGI_TEST_WORKER}', 'partitioned_sequence', [1000000]);
+FROM vgi_test.main.partitioned_sequence(1000000);
 ----
 1000000	1000000	0	999999
 
@@ -106,11 +111,13 @@ SELECT COUNT(*) > 0 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%sca
 true
 
 # ============================================================================
-# Test EXPLAIN with vgi_table_function
+# Test EXPLAIN with a catalog table-function scan
 # ============================================================================
 
-# EXPLAIN should work without hanging and show Worker/Function in output
+# EXPLAIN should work without hanging and show Worker/Function in output. The
+# catalog scan names the operator after the function itself (SEQUENCE), unlike
+# the removed standalone call form which rendered as VGI_TABLE_FUNCTION.
 query II
-EXPLAIN SELECT * FROM vgi_table_function('${VGI_TEST_WORKER}', 'sequence', [10]);
+EXPLAIN SELECT * FROM vgi_test.main.sequence(10);
 ----
-physical_plan	<REGEX>:.*VGI_TABLE_FUNCTION.*Function: sequence.*
+physical_plan	<REGEX>:.*SEQUENCE.*Function: sequence.*

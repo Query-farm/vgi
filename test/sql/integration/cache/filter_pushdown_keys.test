@@ -1,5 +1,5 @@
 # name: test/sql/integration/cache/filter_pushdown_keys.test
-# description: VGI result cache — STATIC filter pushdown keys the cache (filter_bytes ∈ key). Two different pushed predicates (WHERE n>=5 vs WHERE n>=7) must produce TWO distinct entries, each serving its own filtered rows — the filter analog of the tested projection cross-serve boundary. Filter pushdown is wired on the catalog scan path (not direct vgi_table_function), so this uses ex.data.cache_filtered.
+# description: VGI result cache — STATIC filter pushdown keys the cache (filter_bytes ∈ key). Two different pushed predicates (WHERE n>=5 vs WHERE n>=7) must produce TWO distinct entries, each serving its own filtered rows — the filter analog of the tested projection cross-serve boundary. This uses ex.data.cache_filtered.
 # group: [vgi_integration_cache]
 
 require-env VGI_TEST_WORKER

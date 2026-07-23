@@ -1,5 +1,5 @@
 # name: test/sql/integration/cache/partition_scope_ops.test
-# description: Per-partition result cache — operational concerns: max-enumerated cap, TTL expiry via reap, disk tier (partition entries are MEMORY-ONLY; whole-scan persists), and the direct vgi_table_function() populate path
+# description: Per-partition result cache — operational concerns: max-enumerated cap, TTL expiry via reap, disk tier (partition entries are MEMORY-ONLY; whole-scan persists)
 # group: [vgi_integration_cache]
 
 require-env VGI_TEST_WORKER
@@ -147,40 +147,3 @@ SET vgi_result_cache_dir = '';
 
 statement ok
 SET vgi_result_cache_disk_max_bytes = 0;
-
-# ============================================================================
-# 4. Direct vgi_table_function() path — whole-scan cache only (partition columns are
-#    resolved on the catalog-attached bind path, not the direct one). Documents the
-#    limitation: the direct path still caches + serves the WHOLE scan, but does NOT
-#    split by partition.
-# ============================================================================
-statement ok
-SELECT * FROM vgi_result_cache_flush();
-
-statement ok
-CALL truncate_duckdb_logs();
-
-query I
-SELECT COUNT(*) FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_partition_scope', [3]);
-----
-15
-
-# No per-partition split on the direct path...
-query I
-SELECT COUNT(*) FROM vgi_result_cache() WHERE function = 'cache_partition_scope' AND partition_label != '';
-----
-0
-
-# ...but the whole-scan entry is stored and an identical direct repeat hits it.
-statement ok
-CALL truncate_duckdb_logs();
-
-query I
-SELECT COUNT(*) FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_partition_scope', [3]);
-----
-15
-
-query I
-SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%result_cache.hit%';
-----
-true

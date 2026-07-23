@@ -405,7 +405,7 @@ bool IsContainerRegistered(const std::string &location) {
 void EnsureContainerRegistered(const std::string &location) {
 	// ATTACH pre-registers the (option-suffixed) location with the user's
 	// volumes/env/runtime. Entry points reached *before* ATTACH — vgi_catalogs()
-	// and the standalone vgi_table_function() — pass the raw oci:// location and
+	// and vgi_catalogs() — pass the raw oci:// location and
 	// never hit that path, so resolve it here with defaults (auto runtime,
 	// image-declared volumes, no extra env/args) on first use. Idempotent; the
 	// registry caches the result so the inspect/pull only happens once.
@@ -444,7 +444,7 @@ std::unique_ptr<SubProcess> SpawnWorker(const std::string &worker_path, bool wor
 		return std::make_unique<SubProcess>(worker_path, worker_debug);
 	}
 	// Resolve-on-first-use so pre-ATTACH callers (vgi_catalogs / standalone
-	// vgi_table_function) work without an explicit registration. No-op when ATTACH
+	// vgi_catalogs) work without an explicit registration. No-op when ATTACH
 	// already registered this location.
 	EnsureContainerRegistered(worker_path);
 	ContainerLaunchInfo info;

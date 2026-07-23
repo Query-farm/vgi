@@ -9,6 +9,9 @@ require vgi
 require httpfs
 
 statement ok
+ATTACH 'example' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
 CALL enable_logging(level := 'debug');
 
 statement ok
@@ -38,7 +41,7 @@ statement ok
 CALL truncate_duckdb_logs();
 
 query I
-SELECT COUNT(*) FROM (SELECT v FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_parallel', [400000]) LIMIT 5);
+SELECT COUNT(*) FROM (SELECT v FROM ex.main.cache_parallel(400000) LIMIT 5);
 ----
 5
 
@@ -73,7 +76,7 @@ CALL truncate_duckdb_logs();
 
 # MISS + streaming spill (max_entry_bytes still 1).
 query II
-SELECT COUNT(*), SUM(v) FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_parallel', [100000]);
+SELECT COUNT(*), SUM(v) FROM ex.main.cache_parallel(100000);
 ----
 100000	4999950000
 
@@ -85,7 +88,7 @@ statement ok
 CALL truncate_duckdb_logs();
 
 query II
-SELECT COUNT(*), SUM(v) FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_parallel', [100000]);
+SELECT COUNT(*), SUM(v) FROM ex.main.cache_parallel(100000);
 ----
 100000	4999950000
 
@@ -113,13 +116,13 @@ statement ok
 SELECT * FROM vgi_result_cache_flush();
 
 statement ok
-SELECT nonce FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_revalidatable', []);
+SELECT nonce FROM ex.main.cache_revalidatable();
 
 statement ok
-SELECT nonce FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_revalidatable', []);
+SELECT nonce FROM ex.main.cache_revalidatable();
 
 statement ok
-SELECT nonce FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_revalidatable', []);
+SELECT nonce FROM ex.main.cache_revalidatable();
 
 # No orphan accumulation across repeated spills of the immediately-stale result.
 query I

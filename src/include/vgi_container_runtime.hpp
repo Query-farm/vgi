@@ -92,7 +92,7 @@ bool IsContainerRegistered(const std::string &location);
 
 // Resolve `location` with default options (auto runtime, image-declared volumes,
 // no extra env/args) and register it, unless it is already registered.  Lets
-// pre-ATTACH entry points (vgi_catalogs / standalone vgi_table_function) use a
+// the pre-ATTACH entry point (vgi_catalogs) use a
 // container LOCATION without an explicit ATTACH-time resolution.  Performs image
 // inspection (and a pull on cache miss); throws on no-runtime / inspect failure.
 void EnsureContainerRegistered(const std::string &location);

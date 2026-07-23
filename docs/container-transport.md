@@ -186,11 +186,10 @@ images work as long as the runtime is logged in.
 
 ## Pre-ATTACH usage
 
-`vgi_catalogs('oci://…')` and the standalone `vgi_table_function('oci://…', fn, args)`
-both work against a container LOCATION. They resolve the image with default
-options (auto-detected runtime, image-declared volumes) on first use — no ATTACH
-required. To customize runtime/volumes/env, attach the catalog with
-a struct `LOCATION` instead.
+`vgi_catalogs('oci://…')` works against a container LOCATION without attaching:
+it resolves the image with default options (auto-detected runtime,
+image-declared volumes) on first use. Calling a function requires `ATTACH`. To
+customize runtime/volumes/env, attach the catalog with a struct `LOCATION`.
 
 ## Testing
 

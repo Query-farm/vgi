@@ -6,10 +6,8 @@ This is the WASM-only sibling of the subprocess transport: same streaming `IFunc
 paths, only the byte transport differs (SAB rings + `Atomics` instead of an OS pipe).
 
 ```sql
--- direct
-SELECT * FROM vgi_table_function('worker:/workers/example.js', 'count_to', [5]);
--- catalog
 ATTACH 'worker:/workers/example.js' AS w (TYPE vgi);
+SELECT * FROM w.main.count_to(5);
 SELECT * FROM w.main.some_table;
 ```
 

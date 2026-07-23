@@ -21,7 +21,7 @@ statement ok
 ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
 # example.data.numbers is a single-branch catalog table: one BIGINT column
-# `value` holding 0..99. The catalog-scan path (not the vgi_table_function()
+# `value` holding 0..99. The catalog-scan path (not the standalone
 # call form) is what produces the synthetic "vgi_table_scan" function.
 query III
 SELECT count(*), min(value), max(value) FROM example.data.numbers;

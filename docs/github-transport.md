@@ -20,8 +20,8 @@ ATTACH 'u' AS u (TYPE vgi,
 ATTACH 'u' AS u (TYPE vgi, LOCATION 'github-auto://Query-farm/vgi-units@v0.1.1');
 ```
 
-Both accept the same LOCATION wherever a worker path is accepted: `ATTACH`,
-`vgi_table_function(...)`, `vgi_catalogs(...)`.
+Both accept the same LOCATION wherever a worker path is accepted: `ATTACH`
+and `vgi_catalogs(...)`.
 
 ### `github://owner/repo@tag/asset[#sha256=<hex>][#path=<member>]`
 - `asset` is the exact release asset filename (the segment after the last `/`; tags

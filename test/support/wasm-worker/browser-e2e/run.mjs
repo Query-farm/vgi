@@ -2,7 +2,7 @@
 // Committed browser e2e for the VGI `worker:` SAB transport. Assembles the built
 // haybarn engine + VGI wasm extension + worker module into a temp COI-served dir,
 // bundles test-entry.mjs (esbuild, arrow inlined), drives it in headless Chromium
-// (puppeteer), and asserts: extension LOADs, direct vgi_table_function over
+// (puppeteer), and asserts: extension LOADs, catalog scans over
 // worker:, ATTACH + discovery + catalog call, and 4 concurrent scans (multi-thread
 // serve). Exits 0 = pass, 1 = fail, 2 = skipped (prerequisites missing).
 //

@@ -207,8 +207,8 @@ customer evidence. The design memo documents the implementation path
 for either of the other two options when a ticket arrives.
 
 Customers needing UPDATE/DELETE on hot-cold data today route through
-`vgi_table_function(arm_args, ...)` against the specific writable
-branch — the same fallback the design memo offers as the workaround.
+a direct catalog scan of the specific writable branch — the same fallback
+the design memo offers as the workaround.
 
 ## Diagnostic: `vgi_table_branches()`
 
@@ -228,7 +228,7 @@ WHERE table_name = 'orders';
 | `schema_name` | `VARCHAR` | |
 | `table_name` | `VARCHAR` | |
 | `branch_index` | `BIGINT` | 0-based ordinal within the table's branch list |
-| `function_name` | `VARCHAR` | E.g. `vgi_table_function`, `iceberg_scan`, `read_parquet` |
+| `function_name` | `VARCHAR` | E.g. `vgi_table_scan`, `iceberg_scan`, `read_parquet` |
 | `positional_arguments` | `JSON` | Branch args serialized as JSON literals |
 | `named_arguments` | `JSON` | Named args as `{name: value}` |
 | `branch_filter` | `VARCHAR` | Raw SQL expression text; `NULL` when unset |
@@ -333,8 +333,8 @@ failure doesn't get silently rerouted to the legacy path.
   pick.
 - **You need cross-arm UPDATE/DELETE today.** Multi-branch tables
   support INSERT on the writable arm only. UPDATE/DELETE/MERGE are
-  refused at bind; route through `vgi_table_function(...)` against
-  the specific branch you want to modify. (See *Why UPDATE/DELETE
+  refused at bind; route through a catalog scan against the specific
+  branch you want to modify. (See *Why UPDATE/DELETE
   are deferred* above for the semantics question; the design memo
   documents the implementation path when concrete customer evidence
   arrives.)

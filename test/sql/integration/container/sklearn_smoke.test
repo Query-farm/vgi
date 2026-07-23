@@ -17,12 +17,6 @@ SELECT count(*) FROM vgi_catalogs('${VGI_DOCKER_IMAGE}') WHERE catalog = 'sklear
 ----
 1
 
-# Pre-ATTACH: the standalone table function runs straight from the image too.
-query I
-SELECT count(*) FROM vgi_table_function('${VGI_DOCKER_IMAGE}', 'breast_cancer', []);
-----
-569
-
 # Attach the worker as a private per-process container (connection:'stdio'). The
 # image advertises shared transports (tcp/http) via its label, so we pin 'stdio'
 # here to exercise the per-process path specifically (shared modes are covered by

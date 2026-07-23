@@ -1,0 +1,95 @@
+# name: test/sql/integration/scalar/same_name_schemas.test
+# description: A scalar function registered under the SAME name in two different
+#   catalog schemas must dispatch to the implementation owned by the schema the
+#   call names. The example worker registers `test_same_name_bind` in both
+#   `main` and `data`; each returns a VARCHAR tagged with its own schema, so a
+#   mis-routed call shows up as the wrong tag rather than a plausible answer.
+# group: [vgi_integration_scalar]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# Registration: one entry per schema, not one merged entry with two overloads
+# ============================================================================
+
+query TTT
+SELECT schema_name, function_name, return_type
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_name = 'test_same_name_bind'
+ORDER BY schema_name;
+----
+data	test_same_name_bind	VARCHAR
+main	test_same_name_bind	VARCHAR
+
+# The two registrations carry distinct descriptions, proving they are backed by
+# distinct worker classes and not one class advertised twice.
+query TT
+SELECT schema_name, description
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_name = 'test_same_name_bind'
+ORDER BY schema_name;
+----
+data	Schema-disambiguation probe; the data-schema implementation
+main	Schema-disambiguation probe; the main-schema implementation
+
+# ============================================================================
+# Dispatch: the schema qualifier picks the implementation
+# ============================================================================
+
+query T
+SELECT example.main.test_same_name_bind(1);
+----
+main:1
+
+query T
+SELECT example.data.test_same_name_bind(1);
+----
+data:1
+
+# Both in one query — the two calls must not collapse onto a single binding.
+query TT
+SELECT example.main.test_same_name_bind(7), example.data.test_same_name_bind(7);
+----
+main:7	data:7
+
+# Over a multi-row input, so the per-batch execute path (not just bind) is
+# exercised for each schema.
+query TT
+SELECT example.main.test_same_name_bind(x), example.data.test_same_name_bind(x)
+FROM (VALUES (1), (2), (3)) t(x)
+ORDER BY x;
+----
+main:1	data:1
+main:2	data:2
+main:3	data:3
+
+# Unqualified within the catalog's default schema (`main`) resolves to main's.
+statement ok
+USE example.main;
+
+query T
+SELECT test_same_name_bind(42);
+----
+main:42
+
+# Switching the search path to `data` flips resolution to the other class.
+statement ok
+USE example.data;
+
+query T
+SELECT test_same_name_bind(42);
+----
+data:42
+
+statement ok
+USE memory.main;
+
+statement ok
+DETACH example;

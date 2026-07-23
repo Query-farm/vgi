@@ -43,14 +43,14 @@ function readChannel() {
     await conn.query('INSTALL vgi'); await conn.query('LOAD vgi');
 
     // ---- mirror the full suite's prefix (this is what triggers the flaky hang) ----
-    await conn.query(`SELECT * FROM vgi_table_function(${W}, 'count_to', [5])`);
-    await conn.query(`SELECT count(*)::INT c, sum(value)::INT s FROM vgi_table_function(${W}, 'emit_batches', [3, 4])`);
     await conn.query(`ATTACH ${W} AS wcat (TYPE vgi)`);
+    await conn.query(`SELECT * FROM wcat.main.count_to(5)`);
+    await conn.query(`SELECT count(*)::INT c, sum(value)::INT s FROM wcat.main.emit_batches(3, 4)`);
     await conn.query("SELECT DISTINCT function_name FROM vgi_function_arguments() WHERE catalog_name='wcat'");
     await conn.query('SELECT * FROM wcat.main.count_to(3)');
     await conn.query('SET threads=4');
     const cs = await Promise.all([6, 9].map(() => db.connect()));
-    await Promise.all(cs.map((c, k) => c.query(`SELECT * FROM vgi_table_function(${W}, 'count_to', [${[6, 9][k]}])`)));
+    await Promise.all(cs.map((c, k) => c.query(`SELECT * FROM wcat.main.count_to(${[6, 9][k]})`)));
     for (const c of cs) await c.close();
     log('prefix ok');
 
@@ -60,7 +60,7 @@ function readChannel() {
     let boom;
     const t0 = Date.now();
     try {
-      await Promise.race([bc.query(`SELECT * FROM vgi_table_function(${W}, 'boom', [])`), timeout(15000, 'boom')]);
+      await Promise.race([bc.query(`SELECT * FROM wcat.main.boom()`), timeout(15000, 'boom')]);
       boom = 'no_throw';
     } catch (e) {
       const m = String((e && e.message) || e);

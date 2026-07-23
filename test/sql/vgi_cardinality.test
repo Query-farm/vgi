@@ -35,11 +35,11 @@ EXPLAIN (FORMAT JSON) SELECT * FROM ex.main.ten_thousand();
 physical_plan	<REGEX>:.*"Estimated Cardinality":\s*"10000".*
 
 # ============================================================================
-# Direct vgi_table_function() call
+# Catalog table-function scan
 # ============================================================================
 
 query II
-EXPLAIN (FORMAT JSON) SELECT * FROM vgi_table_function('${VGI_TEST_WORKER}', 'sequence', [50]);
+EXPLAIN (FORMAT JSON) SELECT * FROM ex.main.sequence(50);
 ----
 physical_plan	<REGEX>:.*"Estimated Cardinality":\s*"50".*
 

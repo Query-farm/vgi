@@ -9,6 +9,9 @@ require vgi
 require httpfs
 
 statement ok
+ATTACH 'example' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
 CALL enable_logging(level := 'debug');
 
 statement ok
@@ -34,7 +37,7 @@ CALL truncate_duckdb_logs();
 
 # First direct call → MISS + store to memory + disk (compressed with the default zstd).
 query II
-SELECT COUNT(*), SUM(v) FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_bench', [200000]);
+SELECT COUNT(*), SUM(v) FROM ex.main.cache_bench(200000);
 ----
 200000	19999900000
 
@@ -72,7 +75,7 @@ CALL truncate_duckdb_logs();
 query I
 SELECT bool_and(v = rn) FROM (
     SELECT v, row_number() OVER () - 1 AS rn
-    FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_bench', [200000]));
+    FROM ex.main.cache_bench(200000));
 ----
 true
 
@@ -103,7 +106,7 @@ statement ok
 SELECT * FROM vgi_result_cache_flush();
 
 statement ok
-SELECT COUNT(*) FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_bench', [200000]);
+SELECT COUNT(*) FROM ex.main.cache_bench(200000);
 
 statement ok
 SET vgi_result_cache_dir = '__TEST_DIR__/vgi_rc_z';
@@ -118,7 +121,7 @@ statement ok
 SET vgi_result_cache_max_bytes = 1
 
 statement ok
-SELECT COUNT(*) FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_bench', [200000]);
+SELECT COUNT(*) FROM ex.main.cache_bench(200000);
 
 statement ok
 SET vgi_result_cache_max_bytes = 268435456;
@@ -147,7 +150,7 @@ statement ok
 SELECT * FROM vgi_result_cache_flush();
 
 statement ok
-SELECT COUNT(*) FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_bench', [200000]);
+SELECT COUNT(*) FROM ex.main.cache_bench(200000);
 
 query I
 SELECT codec FROM vgi_result_cache(include_disk := true)
@@ -165,7 +168,7 @@ SET vgi_result_cache_max_bytes = 1
 query I
 SELECT bool_and(v = rn) FROM (
     SELECT v, row_number() OVER () - 1 AS rn
-    FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_bench', [200000]));
+    FROM ex.main.cache_bench(200000));
 ----
 true
 
@@ -188,7 +191,7 @@ statement ok
 SELECT * FROM vgi_result_cache_flush();
 
 statement ok
-SELECT COUNT(*) FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_bench', [200000]);
+SELECT COUNT(*) FROM ex.main.cache_bench(200000);
 
 # Flip the codec OFF and evict memory (max_bytes -> 1, which leaves the disk blob).
 # The next read loads the previously-written ZSTD blob from disk — the batch carries
@@ -200,7 +203,7 @@ statement ok
 SET vgi_result_cache_max_bytes = 1
 
 query II
-SELECT COUNT(*), SUM(v) FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_bench', [200000]);
+SELECT COUNT(*), SUM(v) FROM ex.main.cache_bench(200000);
 ----
 200000	19999900000
 

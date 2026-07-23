@@ -98,7 +98,6 @@ src/vgi_cookie_jar.cpp
 src/vgi_oauth.cpp
 src/vgi_oauth_env.cpp
 src/vgi_catalogs.cpp
-src/vgi_table_function.cpp
 src/vgi_table_function_impl.cpp
 src/vgi_table_in_out_impl.cpp
 src/vgi_scalar_function_impl.cpp

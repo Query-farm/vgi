@@ -76,10 +76,11 @@ double PeakRssMb() {
 }
 
 std::string DirectScan(const std::string &worker, const std::string &rows_expr) {
-	return "SELECT COUNT(*) FROM vgi_table_function('" + worker + "', 'cache_bench', [" + rows_expr + "]);";
+	(void)worker;  // the catalog is attached once in OpenDb
+	return "SELECT COUNT(*) FROM ex.main.cache_bench(" + rows_expr + ");";
 }
 
-std::unique_ptr<DuckDB> OpenDb(const std::string &ext, const std::string &httpfs) {
+std::unique_ptr<DuckDB> OpenDb(const std::string &ext, const std::string &httpfs, const std::string &worker) {
 	DBConfig config;
 	config.SetOptionByName("allow_unsigned_extensions", duckdb::Value::BOOLEAN(true));
 	auto db = std::make_unique<DuckDB>(nullptr, &config);
@@ -88,6 +89,9 @@ std::unique_ptr<DuckDB> OpenDb(const std::string &ext, const std::string &httpfs
 		con.Query("LOAD '" + httpfs + "'");
 	}
 	Must(con, "LOAD '" + ext + "'");
+	// Attached once per instance: VGI functions are reachable only through a
+	// catalog, and attachments are visible to every Connection on this DuckDB.
+	Must(con, "ATTACH 'example' AS ex (TYPE vgi, LOCATION '" + worker + "');");
 	return db;
 }
 
@@ -129,7 +133,7 @@ int main() {
 		return 2;
 	}
 
-	auto db = OpenDb(ext, httpfs);
+	auto db = OpenDb(ext, httpfs, worker);
 
 	if (mode == "throughput" || mode == "both") {
 		const int iters = EnvInt("VGI_BENCH_ITERS", 2000);
@@ -227,8 +231,8 @@ int main() {
 		const std::string setup = "SET vgi_result_cache_dir='" + dir +
 		                          "'; SET vgi_result_cache_disk_max_bytes=4294967296;"
 		                          " SET vgi_result_cache_max_entry_bytes=4096;";
-		const std::string q = "SELECT COUNT(*), SUM(v)::BIGINT FROM vgi_table_function('" + worker +
-		                      "', 'cache_parallel', [" + std::to_string(rows) + "]);";
+		const std::string q =
+		    "SELECT COUNT(*), SUM(v)::BIGINT FROM ex.main.cache_parallel(" + std::to_string(rows) + ");";
 		std::atomic<uint64_t> wrong{0}, errs{0}, runs{0};
 		std::cout << "\n== spill concurrency (" << threads << " threads × " << iters
 		          << " iters, force-spill same key) ==\n";

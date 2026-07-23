@@ -82,8 +82,8 @@ function channel() {
     log('vgi_async_prefetch=' + R.asyncPrefetch);
 
     // Warm the catalog + discovery path once (part of the load that trips it).
-    await conn.query(`SELECT count(*) FROM vgi_table_function(${W}, 'emit_batches', [3, 4])`);
     await conn.query(`ATTACH ${W} AS wcat (TYPE vgi)`);
+    await conn.query(`SELECT count(*) FROM wcat.main.emit_batches(3, 4)`);
     await conn.query("SELECT DISTINCT function_name FROM vgi_function_arguments() WHERE catalog_name='wcat'");
 
     R.attempts = [];
@@ -94,14 +94,14 @@ function channel() {
       try {
         const cs = await Promise.all([6, 9].map(() => db.connect()));
         if (!R.asyncPrefetch) { await Promise.all(cs.map((c) => c.query('SET vgi_async_prefetch=false'))); }
-        await Promise.all(cs.map((c, k) => c.query(`SELECT * FROM vgi_table_function(${W}, 'count_to', [${[6, 9][k]}])`)));
+        await Promise.all(cs.map((c, k) => c.query(`SELECT * FROM wcat.main.count_to(${[6, 9][k]})`)));
         for (const c of cs) await c.close();
       } catch (e) { log(`attempt ${a}: setup err ${String(e.message).slice(0, 60)}`); }
 
       // the throwing scan under threads=4, on the main connection.
       let boom, ms = Date.now();
       try {
-        await Promise.race([conn.query(`SELECT * FROM vgi_table_function(${W}, 'boom', [])`), to(15000, 'boom')]);
+        await Promise.race([conn.query(`SELECT * FROM wcat.main.boom()`), to(15000, 'boom')]);
         boom = 'no_throw';
       } catch (e) { boom = String(e.message).includes('__TIMEOUT__') ? 'HANG' : 'threw'; }
       ms = Date.now() - ms;

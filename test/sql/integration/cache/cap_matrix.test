@@ -9,6 +9,9 @@ require vgi
 require httpfs
 
 statement ok
+ATTACH 'example' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
 CALL enable_logging(level := 'debug');
 
 statement ok
@@ -35,7 +38,7 @@ CALL truncate_duckdb_logs();
 
 # Query still returns the complete correct result (a cache cap never breaks it).
 query II
-SELECT COUNT(*), SUM(v) FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_parallel', [200000]);
+SELECT COUNT(*), SUM(v) FROM ex.main.cache_parallel(200000);
 ----
 200000	19999900000
 
@@ -64,7 +67,7 @@ statement ok
 CALL truncate_duckdb_logs();
 
 query II
-SELECT COUNT(*), SUM(v) FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_parallel', [200000]);
+SELECT COUNT(*), SUM(v) FROM ex.main.cache_parallel(200000);
 ----
 200000	19999900000
 
@@ -95,7 +98,7 @@ statement ok
 CALL truncate_duckdb_logs();
 
 query I
-SELECT COUNT(*) FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_parallel', [200000]);
+SELECT COUNT(*) FROM ex.main.cache_parallel(200000);
 ----
 200000
 

@@ -89,11 +89,9 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 # 1 scaling-bench cache fixture (cache_bench — positional Arg(0) row count; direct
 #   path only, NOT a data Table; backs the C++ concurrency bench + the S8/S5 guards;
 #   see cache/disk_streaming.test + cache/entry_cap.test)
-# 3 parallel/order cache fixtures (cache_parallel — multi-worker cacheable, one
+# 2 parallel/order cache fixtures (cache_parallel — multi-worker cacheable, one
 #   substream per worker, backs cache/parallel_capture.test + cache/parallel_2gb.test_slow;
 #   cache_ordered — FIXED_ORDER/supports_batch_index cacheable, backs cache/ordered_serve.test;
-#   cache_interleaved — batch_index emitted OUT OF ORDER so the cache serve genuinely
-#   reorders multi-batch output, backs cache/spill_correctness.test.
 #   cache_ordered is ALSO a data Table but that surfaces as a table, not a table function)
 # 3 spill-coverage cache fixtures (cache_types — nested/wide/NULL columns through the
 #   spill blob, backs cache/spill_types.test; cache_filtered — static filter pushdown so
@@ -111,6 +109,8 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 #   cache_partition_parallel — work-queue fan-out + a NULL partition; cache_partition_multicol
 #   — (region, year) multi-column; cache_partition_proj — projection pushdown; all back
 #   cache/partition_scope_shapes.test)
+# 1 per-value cache fixture (cached_explode — per-value 1:0 / 1:1 / 1:N with
+#   interleaved output, backs the per-value cache tests)
 # = 138
 query I
 SELECT COUNT(*)

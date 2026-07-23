@@ -1,0 +1,113 @@
+# name: test/sql/integration/scalar/same_name_catalogs.test
+# description: One worker, two catalogs, one function name. `twin_a` and
+#   `twin_b` are separate VGI catalogs served by the SAME worker process; each
+#   declares a schema named `main` holding a scalar named
+#   `test_same_name_catalog`. Neither the function name nor the schema name
+#   distinguishes them — only the attached catalog does. Each returns a VARCHAR
+#   tagged with its own catalog, so a mis-routed call reads as the wrong tag
+#   instead of a plausible answer.
+# group: [vgi_integration_scalar]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+# The same worker LOCATION attached twice, once per catalog. Routing cannot
+# fall back to "which worker process", because it is one process.
+statement ok
+ATTACH 'twin_a' AS a (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+ATTACH 'twin_b' AS b (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# Registration: the collision is real — same schema name, same function name
+# ============================================================================
+
+query TTTT
+SELECT database_name, schema_name, function_name, return_type
+FROM duckdb_functions()
+WHERE function_name = 'test_same_name_catalog'
+ORDER BY database_name;
+----
+a	main	test_same_name_catalog	VARCHAR
+b	main	test_same_name_catalog	VARCHAR
+
+# Distinct descriptions prove two distinct worker classes back these, rather
+# than one class advertised twice.
+query TT
+SELECT database_name, description
+FROM duckdb_functions()
+WHERE function_name = 'test_same_name_catalog'
+ORDER BY database_name;
+----
+a	Catalog-disambiguation probe; the twin_a implementation
+b	Catalog-disambiguation probe; the twin_b implementation
+
+# ============================================================================
+# Dispatch: the catalog qualifier picks the implementation
+# ============================================================================
+
+query T
+SELECT a.main.test_same_name_catalog(1);
+----
+twin_a:1
+
+query T
+SELECT b.main.test_same_name_catalog(1);
+----
+twin_b:1
+
+# Both in one query — the two calls must not collapse onto a single binding.
+query TT
+SELECT a.main.test_same_name_catalog(7), b.main.test_same_name_catalog(7);
+----
+twin_a:7	twin_b:7
+
+# Multi-row, so the per-batch execute path is exercised for each catalog, not
+# just bind.
+query TT
+SELECT a.main.test_same_name_catalog(x), b.main.test_same_name_catalog(x)
+FROM (VALUES (1), (2), (3)) t(x)
+ORDER BY x;
+----
+twin_a:1	twin_b:1
+twin_a:2	twin_b:2
+twin_a:3	twin_b:3
+
+# Unqualified resolution follows the search path, catalog included.
+statement ok
+USE a.main;
+
+query T
+SELECT test_same_name_catalog(42);
+----
+twin_a:42
+
+statement ok
+USE b.main;
+
+query T
+SELECT test_same_name_catalog(42);
+----
+twin_b:42
+
+statement ok
+USE memory.main;
+
+# ============================================================================
+# Detaching one catalog must not disturb the other's routing
+# ============================================================================
+
+statement ok
+DETACH a;
+
+query T
+SELECT b.main.test_same_name_catalog(9);
+----
+twin_b:9
+
+statement ok
+DETACH b;

@@ -24,7 +24,8 @@ cat > "$TMP/a.sql" <<SQL
 SET vgi_result_cache_dir='$RC';
 SET vgi_result_cache_disk_max_bytes=4294967296;
 SET vgi_result_cache_max_entry_bytes=4096;
-SELECT COUNT(*) FROM vgi_table_function('$WORKER','cache_parallel',[$ROWS]);
+ATTACH 'example' AS ex (TYPE vgi, LOCATION '$WORKER');
+SELECT COUNT(*) FROM ex.main.cache_parallel($ROWS);
 SQL
 "$HAYBARN" -unsigned -f "$TMP/a.sql" >/dev/null 2>&1
 BLOBS=$(ls "$RC"/*/objects/*.vrc 2>/dev/null | wc -l | tr -d ' ')
@@ -37,7 +38,8 @@ SET vgi_result_cache_dir='$RC';
 SET vgi_result_cache_disk_max_bytes=4294967296;
 SET vgi_result_cache_max_entry_bytes=1;
 SET vgi_result_cache_max_bytes=1;
-CREATE TEMP TABLE r AS SELECT COUNT(*) c, SUM(v) s FROM vgi_table_function('$WORKER','cache_parallel',[$ROWS]);
+ATTACH 'example' AS ex (TYPE vgi, LOCATION '$WORKER');
+CREATE TEMP TABLE r AS SELECT COUNT(*) c, SUM(v) s FROM ex.main.cache_parallel($ROWS);
 COPY (SELECT 'RESULT ' || c || ' ' || s FROM r) TO '$TMP/result.txt' (HEADER false, DELIMITER '~');
 SQL
 # VGI_STDERR_LOG surfaces the cache decision reliably (duckdb_logs flush timing is

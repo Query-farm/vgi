@@ -154,7 +154,7 @@ public:
 	ReleaseResult Release(std::unique_ptr<PooledWorker> worker);
 
 	// Set default pool settings for paths without explicit per-path config
-	// (e.g., direct vgi_table_function() calls that don't go through ATTACH).
+	// (e.g., vgi_catalogs() discovery that doesn't go through ATTACH).
 	// Called once at extension load time with values from vgi_worker_pool_max / idle_limit settings.
 	void SetDefaultSettings(const PoolSettings &settings);
 

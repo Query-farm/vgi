@@ -7,6 +7,11 @@ require-env VGI_TEST_WORKER
 
 require vgi
 
+# Attached up front so the pool assertions below start from a flushed pool —
+# the ATTACH's own catalog RPCs happen before the first vgi_worker_pool_flush().
+statement ok
+ATTACH 'example' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
 # ============================================================================
 # Test vgi_worker_pool() table function structure
 # ============================================================================
@@ -64,7 +69,7 @@ SELECT flushed FROM vgi_worker_pool_flush();
 
 # Run a query to populate the pool
 query I
-SELECT COUNT(*) FROM vgi_table_function('${VGI_TEST_WORKER}', 'sequence', [10]);
+SELECT COUNT(*) FROM ex.main.sequence(10);
 ----
 10
 
@@ -80,7 +85,7 @@ CREATE TEMP TABLE pool_snapshot AS SELECT * FROM vgi_worker_pool();
 
 # Run another query - should acquire from pool, then return to pool
 query I
-SELECT COUNT(*) FROM vgi_table_function('${VGI_TEST_WORKER}', 'sequence', [5]);
+SELECT COUNT(*) FROM ex.main.sequence(5);
 ----
 5
 
@@ -127,7 +132,7 @@ SELECT flushed >= 0 FROM vgi_worker_pool_flush();
 true
 
 query I
-SELECT COUNT(*) FROM vgi_table_function('${VGI_TEST_WORKER}', 'sequence', [10]);
+SELECT COUNT(*) FROM ex.main.sequence(10);
 ----
 10
 
@@ -139,7 +144,7 @@ true
 
 # Run another query - should hit the pool (worker was returned after first query)
 query I
-SELECT COUNT(*) FROM vgi_table_function('${VGI_TEST_WORKER}', 'sequence', [5]);
+SELECT COUNT(*) FROM ex.main.sequence(5);
 ----
 5
 

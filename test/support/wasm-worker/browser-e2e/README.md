@@ -7,7 +7,7 @@ VGI slot-stub js-library), the VGI wasm extension (`WebWorkerFunctionConnection`
 duplex-ring channel) — asserting:
 
 1. `LOAD vgi` — the extension's `vgi_wasm_slot_*` imports resolve against the engine at `dlopen`.
-2. **direct** — `vgi_table_function('worker:...', 'count_to', [5])` ⇒ `[0..4]`.
+2. **catalog scan** — `wcat.main.count_to(5)` ⇒ `[0..4]`.
 3. **multi-batch** — `emit_batches(3, 4)` streams 3 batches (12 rows) over the tick loop.
 4. **error propagation** — `boom()` (worker errors mid-produce) surfaces as a thrown query
    error (not a hang or a silent empty result).
@@ -171,7 +171,7 @@ mbedtls, but the disk tier is off on WASM — no persistent FS.)
 
 The `worker:` transport is worker-language-agnostic. `test-ts-worker.mjs` proves a
 **TypeScript** worker (vgi-typescript) serves over the same SAB channel at parity with
-the Rust `sabtable` worker: a direct `vgi_table_function('worker:ts-worker-boot.js',
+the Rust `sabtable` worker: a catalog scan against `worker:ts-worker-boot.js`,
 'ts_count', [5])` (producer mode), `ATTACH` + discovery + `tcat.main.ts_count(3)`, a
 `ts_double` scalar (exchange mode), and a **true-parallelism** proof (`peakConcurrency=4`
 — `ts_probe`/`ts_peek`). The worker is `vgi-typescript/examples/sab-worker/boot.ts` — it

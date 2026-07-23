@@ -47,7 +47,7 @@ statement ok
 CALL truncate_duckdb_logs();
 
 statement ok
-SELECT COUNT(*) FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_parallel', [200000]);
+SELECT COUNT(*) FROM ex.main.cache_parallel(200000);
 
 query I
 SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI'

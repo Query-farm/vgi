@@ -33,7 +33,7 @@ const to = (ms, t) => new Promise((_, rej) => setTimeout(() => rej(new Error('__
 
     // 1. direct table scan over the TS worker (producer mode over SAB)
     try {
-      const r = await q(`SELECT * FROM vgi_table_function(${W}, 'ts_count', [5])`);
+      const r = await q(`SELECT * FROM tcat.main.ts_count(5)`);
       const v = []; const c = r.getChildAt(0); for (let i = 0; i < r.numRows; i++) v.push(Number(c.get(i)));
       R.directOk = JSON.stringify(v) === JSON.stringify([0, 1, 2, 3, 4]);
       log('direct ts_count(5) => ' + JSON.stringify(v) + ' ok=' + R.directOk);
@@ -60,8 +60,8 @@ const to = (ms, t) => new Promise((_, rej) => setTimeout(() => rej(new Error('__
     // busy loop blocks => peak concurrency 1; N real sub-Worker threads => peak >= 2.
     try {
       await q('SET threads=4');
-      await q(`SELECT count(*)::INT FROM vgi_table_function(${W}, 'ts_probe', [200])`, 30000);
-      const rp = await q(`SELECT * FROM vgi_table_function(${W}, 'ts_peek', [])`);
+      await q(`SELECT count(*)::INT FROM tcat.main.ts_probe(200)`, 30000);
+      const rp = await q(`SELECT * FROM tcat.main.ts_peek()`);
       R.peakConcurrency = Number(rp.getChildAt(0).get(0));
       R.parallelOk = R.peakConcurrency >= 2;
       log('peakConcurrency=' + R.peakConcurrency + ' parallelOk=' + R.parallelOk);

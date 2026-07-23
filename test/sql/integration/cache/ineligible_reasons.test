@@ -69,12 +69,12 @@ statement ok
 CALL truncate_duckdb_logs();
 
 query I
-SELECT COUNT(*) FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_bench', [0]);
+SELECT COUNT(*) FROM ex.main.cache_bench(0);
 ----
 0
 
 query I
-SELECT COUNT(*) FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_bench', [0]);
+SELECT COUNT(*) FROM ex.main.cache_bench(0);
 ----
 0
 

@@ -67,7 +67,7 @@ statement ok
 SET vgi_result_cache_max_entry_bytes = 4096;
 
 statement ok
-SELECT COUNT(*) FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_bench', [200000]);
+SELECT COUNT(*) FROM ex.main.cache_bench(200000);
 
 query I
 SELECT COUNT(*) FROM vgi_result_cache() WHERE function = 'cache_bench';
@@ -79,7 +79,7 @@ statement ok
 RESET vgi_result_cache_max_entry_bytes;
 
 statement ok
-SELECT COUNT(*) FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_bench', [200000]);
+SELECT COUNT(*) FROM ex.main.cache_bench(200000);
 
 query I
 SELECT COUNT(*) FROM vgi_result_cache() WHERE function = 'cache_bench';

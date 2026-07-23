@@ -9,6 +9,9 @@ require vgi
 require httpfs
 
 statement ok
+ATTACH 'example' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
 CALL enable_logging(level := 'debug');
 
 statement ok
@@ -37,7 +40,7 @@ CALL truncate_duckdb_logs();
 statement ok
 CREATE TEMP TABLE live AS
 SELECT country, COUNT(*) c, SUM(sales) s
-FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_partitioned', [1000]) GROUP BY country;
+FROM ex.main.cache_partitioned(1000) GROUP BY country;
 
 query I
 SELECT COUNT(*) FROM vgi_result_cache() WHERE function = 'cache_partitioned';
@@ -56,7 +59,7 @@ CALL truncate_duckdb_logs();
 statement ok
 CREATE TEMP TABLE served AS
 SELECT country, COUNT(*) c, SUM(sales) s
-FROM vgi_table_function('${VGI_TEST_WORKER}', 'cache_partitioned', [1000]) GROUP BY country;
+FROM ex.main.cache_partitioned(1000) GROUP BY country;
 
 query I
 SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI'

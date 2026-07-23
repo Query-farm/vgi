@@ -107,15 +107,15 @@ async function step(R, name, fn) {
 
     // --- LARGE PAYLOAD: 500 rows * 100 KB = ~50 MB streamed over the 64 KiB ring -
     await step(R, 'largePayloadOk', async () => {
-      const r = await q(`SELECT count(*)::INT c, min(length(value))::INT mn, max(length(value))::INT mx FROM vgi_table_function(${W}, 'sab_big', [500, 100000])`, 30000);
+      const r = await q(`SELECT count(*)::INT c, min(length(value))::INT mn, max(length(value))::INT mx FROM wcat.main.sab_big(500, 100000)`, 30000);
       return Number(r.getChild('c').get(0)) === 500 && Number(r.getChild('mn').get(0)) === 100000 && Number(r.getChild('mx').get(0)) === 100000;
     });
 
     // --- LIMIT early-abandon: client stops after 3 rows of a 1000-batch producer -
     await step(R, 'limitAbandonOk', async () => {
-      const r = await q(`SELECT count(*)::INT c FROM (SELECT * FROM vgi_table_function(${W}, 'emit_batches', [1000, 1000]) LIMIT 3) q`);
+      const r = await q(`SELECT count(*)::INT c FROM (SELECT * FROM wcat.main.emit_batches(1000, 1000) LIMIT 3) q`);
       if (Number(r.getChild('c').get(0)) !== 3) return false;
-      const r2 = await q(`SELECT count(*)::INT c FROM vgi_table_function(${W}, 'count_to', [4])`);
+      const r2 = await q(`SELECT count(*)::INT c FROM wcat.main.count_to(4)`);
       return Number(r2.getChild('c').get(0)) === 4;
     });
 
@@ -124,8 +124,8 @@ async function step(R, name, fn) {
     // row. Two identical scans: if the 2nd returns the SAME nonce, it was served from
     // the result cache (worker NOT re-run). A broken/off cache re-runs → different nonce.
     await step(R, 'cacheHitOk', async () => {
-      const a = await q(`SELECT DISTINCT value v FROM vgi_table_function(${W}, 'sab_cached', [3])`);
-      const b = await q(`SELECT DISTINCT value v FROM vgi_table_function(${W}, 'sab_cached', [3])`);
+      const a = await q(`SELECT DISTINCT value v FROM wcat.main.sab_cached(3)`);
+      const b = await q(`SELECT DISTINCT value v FROM wcat.main.sab_cached(3)`);
       const va = Number(a.getChild('v').get(0)), vb = Number(b.getChild('v').get(0));
       R.cacheNonces = va + ',' + vb;
       const st = await q("SELECT hits::INT h FROM vgi_result_cache_stats()");
@@ -137,7 +137,7 @@ async function step(R, name, fn) {
     // The worker runs in the browser, so it exposes the END USER's navigator, page URL,
     // high-res clock, COI flag, and the browser CSPRNG as SQL.
     await step(R, 'browserInfoOk', async () => {
-      const r = await q(`SELECT * FROM vgi_table_function(${W}, 'browser_info', [])`);
+      const r = await q(`SELECT * FROM wcat.main.browser_info()`);
       if (r.numRows !== 1) return false;
       const ua = String(r.getChild('user_agent').get(0) ?? '');
       const url = String(r.getChild('page_url').get(0) ?? '');
@@ -150,7 +150,7 @@ async function step(R, name, fn) {
     });
     // Browser CSPRNG: two draws differ, and aren't all-zero.
     await step(R, 'clientRandomOk', async () => {
-      const draw = async () => { const r = await q(`SELECT * FROM vgi_table_function(${W}, 'client_random', [4])`);
+      const draw = async () => { const r = await q(`SELECT * FROM wcat.main.client_random(4)`);
         const c = r.getChildAt(0); const v = []; for (let i = 0; i < r.numRows; i++) v.push(String(c.get(i))); return v; };
       const a = await draw(), b = await draw();
       R.rand = a.slice(0, 2);
@@ -159,7 +159,7 @@ async function step(R, name, fn) {
 
     // --- NETWORK FETCH from the worker (sync XHR, same-origin /whoami) ----------
     await step(R, 'networkFetchOk', async () => {
-      const r = await q(`SELECT status::INT s, body FROM vgi_table_function(${W}, 'client_fetch', ['${location.origin}/whoami'])`);
+      const r = await q(`SELECT status::INT s, body FROM wcat.main.client_fetch('${location.origin}/whoami')`);
       const s = Number(r.getChild('s').get(0));
       const body = String(r.getChild('body').get(0) ?? '');
       R.fetch = { s, body: body.slice(0, 80) };
@@ -169,7 +169,7 @@ async function step(R, name, fn) {
     // --- REAL navigator.geolocation of the end user (resolved via the page bridge) ---
     // The test grants geolocation + sets a mock position via Playwright before loading.
     await step(R, 'geoOk', async () => {
-      const r = await q(`SELECT * FROM vgi_table_function(${W}, 'client_geo', [])`, 20000);
+      const r = await q(`SELECT * FROM wcat.main.client_geo()`, 20000);
       const st = String(r.getChild('status').get(0) ?? '');
       const lat = r.getChild('latitude').get(0);
       const lon = r.getChild('longitude').get(0);
