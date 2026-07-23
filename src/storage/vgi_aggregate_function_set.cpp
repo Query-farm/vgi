@@ -158,6 +158,12 @@ void VgiAggregateFunctionSet::LoadEntries(ClientContext &context, const std::loc
 			agg_func_info->attach_opaque_data = attach_result->attach_opaque_data;
 			agg_func_info->catalog = &catalog_;
 			agg_func_info->function_name = func_info.name;
+			// Owning schema — the same source the scalar/table paths use. An
+			// aggregate name declared in two schemas of one catalog is two
+			// distinct implementations, so every aggregate RPC has to name the
+			// schema or the worker re-resolves by bare name and can pick the
+			// other one.
+			agg_func_info->schema_name = func_info.schema_name;
 			agg_func_info->output_schema = func_info.output_schema;
 			agg_func_info->positional_is_const = arg_types.positional_is_const;
 			agg_func_info->positional_names = arg_types.positional_names;

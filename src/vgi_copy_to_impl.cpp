@@ -152,8 +152,11 @@ VgiCopyToGlobalState::~VgiCopyToGlobalState() {
 		auto context_lock = context_weak.lock();
 		if (context_lock) {
 			try {
-				auto rpc_params =
-				    vgi::BuildTableBufferingDestructorInner(function_name, execution_id, attach_opaque_data);
+				// COPY TO has no catalog schema to name (the handler is reached
+				// through a FORMAT alias, not a schema-qualified call), so the
+				// schema stays empty and serialises as null.
+				auto rpc_params = vgi::BuildTableBufferingDestructorInner(function_name, /*schema_name=*/"",
+				                                                             execution_id, attach_opaque_data);
 				vgi::UnaryRpcOptions opts {*context_lock,
 				                            attach_params->worker_path(),
 				                            attach_params->worker_debug(),

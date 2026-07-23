@@ -1,0 +1,115 @@
+# name: test/sql/integration/table_in_out/same_name_schemas.test
+# description: The exchange-mode analogue of scalar/same_name_schemas.test. A
+#   table-in-out function and a table-buffering function are each registered
+#   under one name in BOTH the `main` and `data` schemas of the example
+#   catalog; a schema-qualified call must reach the implementation owned by the
+#   schema it names. These bind through different call sites than a scalar:
+#   VgiTableInOutBind builds its bind-time connection directly instead of going
+#   through AcquireAndBindConnection, and originally never named the schema on
+#   that request — so every exchange-mode bind reached the worker with no
+#   BindRequest.schema_name and was unresolvable across two schemas. Each
+#   implementation tags its rows with its own schema, so a mis-routed bind
+#   reads as the wrong tag rather than a plausible answer.
+# group: [vgi_integration_table_in_out]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# Registration: one entry per schema, not one merged entry with two overloads
+# ============================================================================
+
+query TT
+SELECT schema_name, function_name
+FROM duckdb_functions()
+WHERE database_name = 'example'
+  AND function_name IN ('test_same_name_transform', 'test_same_name_buffered')
+ORDER BY function_name, schema_name;
+----
+data	test_same_name_buffered
+main	test_same_name_buffered
+data	test_same_name_transform
+main	test_same_name_transform
+
+# Distinct descriptions prove two distinct worker classes back each name,
+# rather than one class advertised twice.
+query TT
+SELECT schema_name, description
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_name = 'test_same_name_transform'
+ORDER BY schema_name;
+----
+data	Schema-disambiguation probe; the data-schema table-in-out
+main	Schema-disambiguation probe; the main-schema table-in-out
+
+# ============================================================================
+# Dispatch: table-in-out (streaming exchange)
+# ============================================================================
+
+query T
+SELECT * FROM example.main.test_same_name_transform((SELECT 1 AS n));
+----
+main:1
+
+query T
+SELECT * FROM example.data.test_same_name_transform((SELECT 1 AS n));
+----
+data:1
+
+# Both schemas in one query — neither may collapse into the other's plan-cache
+# entry (schema_name is part of the bind-data identity).
+query TT
+SELECT
+    (SELECT * FROM example.main.test_same_name_transform((SELECT 7 AS n))) AS from_main,
+    (SELECT * FROM example.data.test_same_name_transform((SELECT 7 AS n))) AS from_data;
+----
+main:7	data:7
+
+# Multi-row, to prove the routing holds beyond the single-row bind path.
+query T
+SELECT * FROM example.data.test_same_name_transform((SELECT * FROM range(3) t(n)))
+ORDER BY 1;
+----
+data:0
+data:1
+data:2
+
+# ============================================================================
+# Dispatch: table-buffering (Sink+Source exchange)
+#
+# The buffered pair shares the bind site above but acquires its runtime
+# connections through the buffering operator's own BuildAcquireParams, so it is
+# independent coverage. Each tags in the SINK phase, proving the sink-side
+# worker resolved the right implementation.
+# ============================================================================
+
+query T
+SELECT * FROM example.main.test_same_name_buffered((SELECT 1 AS n));
+----
+main:1
+
+query T
+SELECT * FROM example.data.test_same_name_buffered((SELECT 1 AS n));
+----
+data:1
+
+query TT
+SELECT
+    (SELECT * FROM example.main.test_same_name_buffered((SELECT 7 AS n))) AS from_main,
+    (SELECT * FROM example.data.test_same_name_buffered((SELECT 7 AS n))) AS from_data;
+----
+main:7	data:7
+
+query T
+SELECT * FROM example.data.test_same_name_buffered((SELECT * FROM range(3) t(n)))
+ORDER BY 1;
+----
+data:0
+data:1
+data:2

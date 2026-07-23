@@ -3,7 +3,7 @@
     {
       "attach_options": [],
       "counts": {
-        "functions": 188,
+        "functions": 215,
         "schemas": 2,
         "tables": 59,
         "views": 3
@@ -15,7 +15,46 @@
       "schemas": [
         {
           "doc": "Example tables backed by functions",
-          "functions": [],
+          "functions": [
+            {
+              "args": [
+                {
+                  "desc": "Integer value to accumulate",
+                  "name": "value",
+                  "type": "int64"
+                }
+              ],
+              "doc": "Schema-disambiguation probe; the data-schema aggregate",
+              "name": "test_same_name_agg",
+              "returns": "string",
+              "type": "aggregate"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Integer value to tag",
+                  "name": "value",
+                  "type": "int64"
+                }
+              ],
+              "doc": "Schema-disambiguation probe; the data-schema implementation",
+              "name": "test_same_name_bind",
+              "returns": "string",
+              "type": "scalar"
+            },
+            {
+              "args": [],
+              "doc": "Schema-disambiguation probe; the data-schema table-in-out",
+              "name": "test_same_name_transform",
+              "type": "table"
+            },
+            {
+              "args": [],
+              "doc": "Schema-disambiguation probe; the data-schema buffered function",
+              "name": "test_same_name_buffered",
+              "type": "table_in_out"
+            }
+          ],
           "name": "data",
           "tables": [
             {
@@ -360,6 +399,19 @@
             {
               "args": [
                 {
+                  "desc": "Integer value to accumulate",
+                  "name": "value",
+                  "type": "int64"
+                }
+              ],
+              "doc": "Schema-disambiguation probe; the main-schema aggregate",
+              "name": "test_same_name_agg",
+              "returns": "string",
+              "type": "aggregate"
+            },
+            {
+              "args": [
+                {
                   "desc": "Column to average",
                   "name": "value",
                   "type": "int64"
@@ -658,6 +710,63 @@
             {
               "args": [
                 {
+                  "desc": "Value",
+                  "name": "value",
+                  "type": "int64"
+                },
+                {
+                  "desc": "Constant addend",
+                  "name": "addend",
+                  "type": "int64"
+                }
+              ],
+              "doc": "value + const addend (advertises vgi.cache.ttl)",
+              "name": "cached_add_const",
+              "returns": "int64",
+              "type": "scalar"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Value to double",
+                  "name": "value",
+                  "type": "int64"
+                }
+              ],
+              "doc": "Doubles a BIGINT value (advertises vgi.cache.ttl for per-value memo)",
+              "name": "cached_double_scalar",
+              "returns": "int64",
+              "type": "scalar"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Value",
+                  "name": "value",
+                  "type": "int64"
+                }
+              ],
+              "doc": "value -> 'lbl-<value>' or NULL for negatives (advertises vgi.cache.ttl)",
+              "name": "cached_label",
+              "returns": "string",
+              "type": "scalar"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Positive integer",
+                  "name": "value",
+                  "type": "int64"
+                }
+              ],
+              "doc": "Number of Collatz (3n+1) steps for each integer to reach 1",
+              "name": "collatz_steps",
+              "returns": "int64",
+              "type": "scalar"
+            },
+            {
+              "args": [
+                {
                   "desc": "Integer values to sum",
                   "name": "values",
                   "type": "int64"
@@ -867,6 +976,24 @@
             {
               "args": [
                 {
+                  "desc": "String to stretch",
+                  "name": "value",
+                  "type": "string"
+                },
+                {
+                  "desc": "Number of SHA-256 rounds",
+                  "name": "rounds",
+                  "type": "int64"
+                }
+              ],
+              "doc": "Apply SHA-256 `rounds` times (key-stretching); rounds is a const compute knob",
+              "name": "hash_rounds",
+              "returns": "string",
+              "type": "scalar"
+            },
+            {
+              "args": [
+                {
                   "desc": "Seed value",
                   "name": "seed",
                   "type": "int64"
@@ -978,6 +1105,19 @@
             {
               "args": [
                 {
+                  "desc": "String value",
+                  "name": "value",
+                  "type": "string"
+                }
+              ],
+              "doc": "Returns the input string unchanged (zero-compute wire probe)",
+              "name": "passthru",
+              "returns": "string",
+              "type": "scalar"
+            },
+            {
+              "args": [
+                {
                   "desc": "Value to offset",
                   "name": "value",
                   "type": "int64"
@@ -1054,6 +1194,19 @@
             {
               "args": [
                 {
+                  "desc": "String to hash",
+                  "name": "value",
+                  "type": "string"
+                }
+              ],
+              "doc": "Lowercase hex SHA-256 digest of the UTF-8 string",
+              "name": "sha256_hex",
+              "returns": "string",
+              "type": "scalar"
+            },
+            {
+              "args": [
+                {
                   "desc": "Prefix string",
                   "name": "prefix",
                   "type": "string"
@@ -1098,6 +1251,19 @@
               "doc": "Sum multiple numeric values",
               "name": "sum_values",
               "returns": "null",
+              "type": "scalar"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Integer value to tag",
+                  "name": "value",
+                  "type": "int64"
+                }
+              ],
+              "doc": "Schema-disambiguation probe; the main-schema implementation",
+              "name": "test_same_name_bind",
+              "returns": "string",
               "type": "scalar"
             },
             {
@@ -1262,6 +1428,18 @@
             {
               "args": [
                 {
+                  "desc": "Fan-out count: emit rows 0..n-1 for this input row",
+                  "name": "n",
+                  "type": "int64"
+                }
+              ],
+              "doc": "Blended 1->N fan-out (emit 0..n-1 per input row) with row provenance",
+              "name": "blended_explode",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
                   "desc": "Total rows to attempt to generate",
                   "name": "count",
                   "type": "int64"
@@ -1392,25 +1570,6 @@
             {
               "args": [
                 {
-                  "desc": "Total number of rows to generate",
-                  "name": "rows",
-                  "type": "int64"
-                },
-                {
-                  "default": "20000",
-                  "desc": "Rows per partition",
-                  "name": "chunk_size",
-                  "named": true,
-                  "type": "int64"
-                }
-              ],
-              "doc": "Parallel batch_index-tagged cacheable sequence; cache serve reassembles order",
-              "name": "cache_interleaved",
-              "type": "table"
-            },
-            {
-              "args": [
-                {
                   "default": "10",
                   "desc": "Number of rows to generate",
                   "name": "n",
@@ -1466,6 +1625,54 @@
               ],
               "doc": "Multi-worker cacheable sequence (one substream per worker); parallel-capture fixture",
               "name": "cache_parallel",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Rows per (region, year) partition",
+                  "name": "rows_per_partition",
+                  "type": "int64"
+                }
+              ],
+              "doc": "Per-partition cacheable over (region, year) SINGLE_VALUE partition columns",
+              "name": "cache_partition_multicol",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Rows per country partition",
+                  "name": "rows_per_country",
+                  "type": "int64"
+                }
+              ],
+              "doc": "Per-partition cacheable; work-queue fan-out (parallel capture); one NULL partition",
+              "name": "cache_partition_parallel",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Rows per country partition",
+                  "name": "rows_per_country",
+                  "type": "int64"
+                }
+              ],
+              "doc": "Per-partition cacheable with projection pushdown + explicit partition_values",
+              "name": "cache_partition_proj",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Rows per country partition",
+                  "name": "rows_per_country",
+                  "type": "int64"
+                }
+              ],
+              "doc": "Per-partition cacheable single-value-partitioned result (vgi.cache.partition_scope)",
+              "name": "cache_partition_scope",
               "type": "table"
             },
             {
@@ -1561,6 +1768,54 @@
               ],
               "doc": "Emits n rows [0..n) and advertises a cache TTL",
               "name": "cacheable_numbers",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Input column",
+                  "name": "x",
+                  "type": "int64"
+                }
+              ],
+              "doc": "Cacheable blended map x -> x*2 (advertises vgi.cache.ttl + per_value)",
+              "name": "cached_double",
+              "type": "table"
+            },
+            {
+              "args": [],
+              "doc": "Cacheable classic (TABLE-input) passthrough (advertises vgi.cache.ttl)",
+              "name": "cached_echo",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Fan-out count: emit rows 0..n-1 for this input row",
+                  "name": "n",
+                  "type": "int64"
+                }
+              ],
+              "doc": "Cacheable blended 1->N fan-out (per_value) — 1:0 / 1:1 / 1:N by input",
+              "name": "cached_explode",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Input column",
+                  "name": "x",
+                  "type": "int64"
+                }
+              ],
+              "doc": "Blended map x->x*2 with always-revalidate (304 not_modified) contract",
+              "name": "cached_reval_double",
+              "type": "table"
+            },
+            {
+              "args": [],
+              "doc": "Classic passthrough with always-revalidate (304 not_modified) contract",
+              "name": "cached_reval_echo",
               "type": "table"
             },
             {
@@ -1883,6 +2138,25 @@
               ],
               "doc": "Blended per-row geo encoder (lat, lon, alt -> geohash)",
               "name": "geo_encode",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
+                  "desc": "Input column (echoed as output)",
+                  "name": "x",
+                  "type": "int64"
+                },
+                {
+                  "default": "\"range\"",
+                  "desc": "range | length | base64",
+                  "name": "mode",
+                  "named": true,
+                  "type": "string"
+                }
+              ],
+              "doc": "Adversarial blended fixture emitting malformed vgi_rpc.parent_row",
+              "name": "hostile_provenance",
               "type": "table"
             },
             {
@@ -2305,6 +2579,18 @@
             {
               "args": [
                 {
+                  "desc": "Input column",
+                  "name": "x",
+                  "type": "int64"
+                }
+              ],
+              "doc": "Blended 1->1 map with projection_pushdown + two output columns",
+              "name": "projectable_blended",
+              "type": "table"
+            },
+            {
+              "args": [
+                {
                   "desc": "Number of rows to generate",
                   "name": "count",
                   "type": "int64"
@@ -2637,6 +2923,12 @@
               "type": "table"
             },
             {
+              "args": [],
+              "doc": "Schema-disambiguation probe; the main-schema table-in-out",
+              "name": "test_same_name_transform",
+              "type": "table"
+            },
+            {
               "args": [
                 {
                   "desc": "Resolved data version",
@@ -2813,6 +3105,20 @@
               "args": [],
               "doc": "Collects all input batches and emits during finalization",
               "name": "buffer_input",
+              "type": "table_in_out"
+            },
+            {
+              "args": [
+                {
+                  "default": "false",
+                  "desc": "Whether to log during processing",
+                  "name": "logging",
+                  "named": true,
+                  "type": "bool"
+                }
+              ],
+              "doc": "Cacheable column-wise sum across all input (advertises vgi.cache.ttl)",
+              "name": "cached_sum_all",
               "type": "table_in_out"
             },
             {
@@ -3051,6 +3357,12 @@
               "args": [],
               "doc": "Distributed sum using the buffered (Sink+Combine+Source) model",
               "name": "sum_all_columns_simple_distributed",
+              "type": "table_in_out"
+            },
+            {
+              "args": [],
+              "doc": "Schema-disambiguation probe; the main-schema buffered function",
+              "name": "test_same_name_buffered",
               "type": "table_in_out"
             }
           ],

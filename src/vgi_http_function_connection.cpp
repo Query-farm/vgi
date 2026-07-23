@@ -702,8 +702,8 @@ HttpFunctionConnection::RpcTableBufferingProcess(const std::string &function_nam
                                                     const std::shared_ptr<arrow::RecordBatch> &input_batch,
                                                     std::optional<int64_t> batch_index) {
 	auto batch_bytes = vgi::SerializeToIpcBytes(input_batch);
-	auto rpc_params = vgi::BuildTableBufferingProcessInner(function_name, execution_id, batch_bytes,
-	                                                          attach_opaque_data_, batch_index);
+	auto rpc_params = vgi::BuildTableBufferingProcessInner(function_name, schema_name_, execution_id,
+	                                                          batch_bytes, attach_opaque_data_, batch_index);
 	auto auth = attach_params_ ? attach_params_->auth() : nullptr;
 	auto cached_params = attach_params_
 	    ? attach_params_->GetOrInitHttpParams(context_, base_url_) : nullptr;
@@ -727,7 +727,8 @@ std::vector<std::vector<uint8_t>>
 HttpFunctionConnection::RpcTableBufferingCombine(const std::string &function_name,
                                                     const std::vector<uint8_t> &execution_id,
                                                     const std::vector<std::vector<uint8_t>> &state_ids) {
-	auto rpc_params = vgi::BuildTableBufferingCombineInner(function_name, execution_id, state_ids, attach_opaque_data_);
+	auto rpc_params = vgi::BuildTableBufferingCombineInner(function_name, schema_name_, execution_id, state_ids,
+	                                                          attach_opaque_data_);
 	auto auth = attach_params_ ? attach_params_->auth() : nullptr;
 	auto cached_params = attach_params_
 	    ? attach_params_->GetOrInitHttpParams(context_, base_url_) : nullptr;
@@ -757,7 +758,8 @@ HttpFunctionConnection::RpcTableBufferingCombine(const std::string &function_nam
 
 void HttpFunctionConnection::RpcTableBufferingDestructor(const std::string &function_name,
                                                            const std::vector<uint8_t> &execution_id) {
-	auto rpc_params = vgi::BuildTableBufferingDestructorInner(function_name, execution_id, attach_opaque_data_);
+	auto rpc_params = vgi::BuildTableBufferingDestructorInner(function_name, schema_name_, execution_id,
+	                                                             attach_opaque_data_);
 	auto auth = attach_params_ ? attach_params_->auth() : nullptr;
 	auto cached_params = attach_params_
 	    ? attach_params_->GetOrInitHttpParams(context_, base_url_) : nullptr;

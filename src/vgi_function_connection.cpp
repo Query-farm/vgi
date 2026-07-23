@@ -414,6 +414,15 @@ AcquireForInitResult AcquireConnectionForInit(ClientContext &context, const Func
 	if (params.input_schema) {
 		conn->SetInputSchema(params.input_schema);
 	}
+	// Same reason: PerformBindRpc's caller (AcquireAndBindConnection) sets the
+	// owning schema on the connection, and the no-bind path has to replicate
+	// it. Without this the connection's schema_name_ stays empty and every
+	// subsequent unary RPC built off it (table_buffering_process / _combine /
+	// _destructor) reaches the worker with a null schema — which re-resolves
+	// the function by bare name and can run a *different* schema's
+	// implementation than the bind picked. Empty stays legal (null on the
+	// wire) for callers that genuinely name no schema.
+	conn->SetSchemaName(params.schema_name);
 
 	return AcquireForInitResult {std::move(conn), from_pool};
 }
@@ -1526,8 +1535,8 @@ FunctionConnection::RpcTableBufferingProcess(const std::string &function_name,
                                                 const std::shared_ptr<arrow::RecordBatch> &input_batch,
                                                 std::optional<int64_t> batch_index) {
 	auto batch_bytes = vgi::SerializeToIpcBytes(input_batch);
-	auto rpc_params = vgi::BuildTableBufferingProcessInner(function_name, execution_id, batch_bytes,
-	                                                          attach_opaque_data_, batch_index);
+	auto rpc_params = vgi::BuildTableBufferingProcessInner(function_name, schema_name_, execution_id,
+	                                                          batch_bytes, attach_opaque_data_, batch_index);
 	vgi::ValidateRequestSchema(rpc_params, "table_buffering_process", worker_path_);
 	// The params batch embeds the (potentially large) input batch bytes; offload
 	// it to shm when a segment is attached. The 0-row pointer goes inline and
@@ -1565,7 +1574,8 @@ std::vector<std::vector<uint8_t>>
 FunctionConnection::RpcTableBufferingCombine(const std::string &function_name,
                                                 const std::vector<uint8_t> &execution_id,
                                                 const std::vector<std::vector<uint8_t>> &state_ids) {
-	auto rpc_params = vgi::BuildTableBufferingCombineInner(function_name, execution_id, state_ids, attach_opaque_data_);
+	auto rpc_params = vgi::BuildTableBufferingCombineInner(function_name, schema_name_, execution_id, state_ids,
+	                                                          attach_opaque_data_);
 	vgi::ValidateRequestSchema(rpc_params, "table_buffering_combine", worker_path_);
 	vgi::WriteRpcRequest(proc_->GetStdinFd(), "table_buffering_combine", rpc_params);
 	auto response = vgi::ReadUnaryResponse(proc_->GetStdoutFd(), &context_, worker_path_, proc_->GetPid(),
@@ -1594,7 +1604,8 @@ FunctionConnection::RpcTableBufferingCombine(const std::string &function_name,
 
 void FunctionConnection::RpcTableBufferingDestructor(const std::string &function_name,
                                                        const std::vector<uint8_t> &execution_id) {
-	auto rpc_params = vgi::BuildTableBufferingDestructorInner(function_name, execution_id, attach_opaque_data_);
+	auto rpc_params = vgi::BuildTableBufferingDestructorInner(function_name, schema_name_, execution_id,
+	                                                             attach_opaque_data_);
 	vgi::ValidateRequestSchema(rpc_params, "table_buffering_destructor", worker_path_);
 	vgi::WriteRpcRequest(proc_->GetStdinFd(), "table_buffering_destructor", rpc_params);
 	auto response = vgi::ReadUnaryResponse(proc_->GetStdoutFd(), &context_, worker_path_, proc_->GetPid(),

@@ -33,6 +33,10 @@ namespace vgi {
 struct VgiStreamingSession {
 	std::vector<uint8_t> execution_id;
 	std::string function_name;
+	// Owning catalog schema, snapshotted alongside function_name so the
+	// _chunk / _close RPCs identify the same (schema, name) pair the _open
+	// resolved. Empty = none named; serialises as null.
+	std::string schema_name;
 	std::vector<uint8_t> attach_opaque_data;
 };
 

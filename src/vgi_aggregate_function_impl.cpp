@@ -33,8 +33,15 @@ using vgi::AppendBytesOrNull;
 
 namespace {
 
+// Every aggregate request carries the owning catalog schema alongside the
+// function name: a name is unique only within a schema, so without it the
+// worker re-resolves each unary call by bare name and can land on another
+// schema's implementation after a bind that resolved correctly. Empty string
+// serialises as null (MakeSingleStringArrayOrNull), which is the legitimate
+// "caller names no schema" wire form — the field stays nullable.
 std::shared_ptr<arrow::RecordBatch> BuildAggregateBindRequest(
-    const std::string &function_name, const std::vector<uint8_t> &attach_opaque_data,
+    const std::string &function_name, const std::string &schema_name,
+    const std::vector<uint8_t> &attach_opaque_data,
     const std::shared_ptr<arrow::Schema> &input_schema,
     ClientContext &context, const std::map<std::string, Value> &settings,
     const std::vector<vgi::VgiSecretRequirement> &required_secrets,
@@ -79,6 +86,7 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateBindRequest(
 	    arrow::field("settings", arrow::binary(), true),
 	    arrow::field("secrets", arrow::binary(), true),
 	    arrow::field("attach_opaque_data", arrow::binary(), true),
+	    arrow::field("schema_name", arrow::utf8(), true),
 	});
 
 	return vgi::WrapAsRpcParams(arrow::RecordBatch::Make(schema, 1, {
@@ -88,11 +96,13 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateBindRequest(
 	    vgi::MakeSingleBinaryArrayOrNull(settings_bytes),
 	    vgi::MakeSingleBinaryArrayOrNull(secrets_ipc_bytes),
 	    vgi::MakeSingleBinaryArrayOrNull(attach_opaque_data),
+	    vgi::MakeSingleStringArrayOrNull(schema_name),
 	}));
 }
 
 std::shared_ptr<arrow::RecordBatch> BuildAggregateUpdateRequest(
-    const std::string &function_name, const std::vector<uint8_t> &execution_id,
+    const std::string &function_name, const std::string &schema_name,
+    const std::vector<uint8_t> &execution_id,
     const std::vector<uint8_t> &attach_opaque_data,
     const std::shared_ptr<arrow::RecordBatch> &input_batch) {
 
@@ -103,6 +113,7 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateUpdateRequest(
 	    arrow::field("execution_id", arrow::binary(), false),
 	    arrow::field("input_batch", arrow::binary(), false),
 	    arrow::field("attach_opaque_data", arrow::binary(), true),
+	    arrow::field("schema_name", arrow::utf8(), true),
 	});
 
 	return vgi::WrapAsRpcParams(arrow::RecordBatch::Make(schema, 1, {
@@ -110,11 +121,13 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateUpdateRequest(
 	    vgi::MakeSingleBinaryArray(execution_id),
 	    vgi::MakeSingleBinaryArray(batch_bytes),
 	    vgi::MakeSingleBinaryArrayOrNull(attach_opaque_data),
+	    vgi::MakeSingleStringArrayOrNull(schema_name),
 	}));
 }
 
 std::shared_ptr<arrow::RecordBatch> BuildAggregateCombineRequest(
-    const std::string &function_name, const std::vector<uint8_t> &execution_id,
+    const std::string &function_name, const std::string &schema_name,
+    const std::vector<uint8_t> &execution_id,
     const std::vector<uint8_t> &attach_opaque_data,
     const std::shared_ptr<arrow::RecordBatch> &merge_batch) {
 
@@ -125,6 +138,7 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateCombineRequest(
 	    arrow::field("execution_id", arrow::binary(), false),
 	    arrow::field("merge_batch", arrow::binary(), false),
 	    arrow::field("attach_opaque_data", arrow::binary(), true),
+	    arrow::field("schema_name", arrow::utf8(), true),
 	});
 
 	return vgi::WrapAsRpcParams(arrow::RecordBatch::Make(schema, 1, {
@@ -132,11 +146,13 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateCombineRequest(
 	    vgi::MakeSingleBinaryArray(execution_id),
 	    vgi::MakeSingleBinaryArray(batch_bytes),
 	    vgi::MakeSingleBinaryArrayOrNull(attach_opaque_data),
+	    vgi::MakeSingleStringArrayOrNull(schema_name),
 	}));
 }
 
 std::shared_ptr<arrow::RecordBatch> BuildAggregateFinalizeRequest(
-    const std::string &function_name, const std::vector<uint8_t> &execution_id,
+    const std::string &function_name, const std::string &schema_name,
+    const std::vector<uint8_t> &execution_id,
     const std::vector<uint8_t> &attach_opaque_data,
     const std::shared_ptr<arrow::RecordBatch> &group_ids_batch,
     const std::shared_ptr<arrow::Schema> &output_schema) {
@@ -153,6 +169,7 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateFinalizeRequest(
 	    arrow::field("group_ids_batch", arrow::binary(), false),
 	    arrow::field("output_schema", arrow::binary(), false),
 	    arrow::field("attach_opaque_data", arrow::binary(), true),
+	    arrow::field("schema_name", arrow::utf8(), true),
 	});
 
 	return vgi::WrapAsRpcParams(arrow::RecordBatch::Make(schema, 1, {
@@ -161,11 +178,13 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateFinalizeRequest(
 	    vgi::MakeSingleBinaryArray(gid_bytes),
 	    vgi::MakeSingleBinaryArray(schema_bytes),
 	    vgi::MakeSingleBinaryArrayOrNull(attach_opaque_data),
+	    vgi::MakeSingleStringArrayOrNull(schema_name),
 	}));
 }
 
 std::shared_ptr<arrow::RecordBatch> BuildAggregateDestructorRequest(
-    const std::string &function_name, const std::vector<uint8_t> &execution_id,
+    const std::string &function_name, const std::string &schema_name,
+    const std::vector<uint8_t> &execution_id,
     const std::vector<uint8_t> &attach_opaque_data,
     const std::shared_ptr<arrow::RecordBatch> &group_ids_batch) {
 
@@ -176,6 +195,7 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateDestructorRequest(
 	    arrow::field("execution_id", arrow::binary(), false),
 	    arrow::field("group_ids_batch", arrow::binary(), false),
 	    arrow::field("attach_opaque_data", arrow::binary(), true),
+	    arrow::field("schema_name", arrow::utf8(), true),
 	});
 
 	return vgi::WrapAsRpcParams(arrow::RecordBatch::Make(schema, 1, {
@@ -183,6 +203,7 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateDestructorRequest(
 	    vgi::MakeSingleBinaryArray(execution_id),
 	    vgi::MakeSingleBinaryArray(gid_bytes),
 	    vgi::MakeSingleBinaryArrayOrNull(attach_opaque_data),
+	    vgi::MakeSingleStringArrayOrNull(schema_name),
 	}));
 }
 
@@ -270,6 +291,7 @@ unique_ptr<FunctionData> VgiAggregateBindData::Copy() const {
 	copy->attach_params = attach_params;
 	copy->attach_opaque_data = attach_opaque_data;
 	copy->function_name = function_name;
+	copy->schema_name = schema_name;
 	copy->settings = settings;
 	copy->required_secrets = required_secrets;
 	copy->resolved_output_schema = resolved_output_schema;
@@ -283,8 +305,11 @@ unique_ptr<FunctionData> VgiAggregateBindData::Copy() const {
 
 bool VgiAggregateBindData::Equals(const FunctionData &other_p) const {
 	auto &other = other_p.Cast<VgiAggregateBindData>();
-	if (function_name != other.function_name || attach_opaque_data != other.attach_opaque_data ||
-	    settings != other.settings) {
+	// schema_name participates: the same aggregate name can be declared in two
+	// schemas of one catalog and they are different implementations, so bind
+	// data from one must never satisfy an Equals() check for the other.
+	if (function_name != other.function_name || schema_name != other.schema_name ||
+	    attach_opaque_data != other.attach_opaque_data || settings != other.settings) {
 		return false;
 	}
 	// Null-safe const-argument comparison: Value::operator== throws
@@ -403,7 +428,8 @@ void VgiAggregateUpdate(Vector inputs[], AggregateInputData &aggr_input_data, id
 	auto full_batch = arrow::RecordBatch::Make(full_schema, count, columns);
 
 	// Build RPC request: aggregate_update(function_name, execution_id, input_batch)
-	auto request = BuildAggregateUpdateRequest(bind_data.function_name, bind_data.exec_state->execution_id,
+	auto request = BuildAggregateUpdateRequest(bind_data.function_name, bind_data.schema_name,
+	                                            bind_data.exec_state->execution_id,
 	                                            bind_data.attach_opaque_data, full_batch);
 
 	InvokeAggregateRpc(context, bind_data, "aggregate_update", request);
@@ -458,7 +484,8 @@ void VgiAggregateCombine(Vector &source, Vector &combined, AggregateInputData &a
 	});
 	auto merge_batch = arrow::RecordBatch::Make(merge_schema, count, {src_array, tgt_array});
 
-	auto request = BuildAggregateCombineRequest(bind_data.function_name, bind_data.exec_state->execution_id,
+	auto request = BuildAggregateCombineRequest(bind_data.function_name, bind_data.schema_name,
+	                                             bind_data.exec_state->execution_id,
 	                                             bind_data.attach_opaque_data, merge_batch);
 
 	InvokeAggregateRpc(context, bind_data, "aggregate_combine", request);
@@ -498,8 +525,10 @@ void VgiAggregateFinalize(Vector &state_vector, AggregateInputData &aggr_input_d
 	auto gid_batch = arrow::RecordBatch::Make(gid_schema, count, {gid_array});
 
 	// Call aggregate_finalize RPC
-	auto request = BuildAggregateFinalizeRequest(bind_data.function_name, bind_data.exec_state->execution_id,
-	                                              bind_data.attach_opaque_data, gid_batch, bind_data.resolved_output_schema);
+	auto request = BuildAggregateFinalizeRequest(bind_data.function_name, bind_data.schema_name,
+	                                              bind_data.exec_state->execution_id,
+	                                              bind_data.attach_opaque_data, gid_batch,
+	                                              bind_data.resolved_output_schema);
 
 	auto rpc_result = InvokeAggregateRpc(context, bind_data, "aggregate_finalize", request);
 
@@ -642,7 +671,8 @@ void VgiAggregateDestroy(Vector &state_vector, AggregateInputData &aggr_input_da
 		auto gid_schema = arrow::schema({arrow::field("group_id", arrow::int64())});
 		auto gid_batch = arrow::RecordBatch::Make(gid_schema, 1, {gid_array});
 
-		auto request = BuildAggregateDestructorRequest(bind_data.function_name, bind_data.exec_state->execution_id,
+		auto request = BuildAggregateDestructorRequest(bind_data.function_name, bind_data.schema_name,
+		                                                bind_data.exec_state->execution_id,
 		                                                bind_data.attach_opaque_data, gid_batch);
 		// enable_logging=false: this path runs on task-scheduler threads during
 		// pipeline teardown. VGI_LOG / DrainToLog are unsafe there (crash #A in
@@ -732,7 +762,8 @@ unique_ptr<FunctionData> VgiAggregateFunctionBind(ClientContext &context, Aggreg
 	ArrowArguments arrow_arguments = BuildArgumentsFromValues(context, positional_args, {});
 
 	// Call aggregate_bind RPC
-	auto request = BuildAggregateBindRequest(func_info.function_name, func_info.attach_opaque_data, input_schema,
+	auto request = BuildAggregateBindRequest(func_info.function_name, func_info.schema_name,
+	                                          func_info.attach_opaque_data, input_schema,
 	                                          context, settings, func_info.required_secrets,
 	                                          arrow_arguments);
 
@@ -740,6 +771,7 @@ unique_ptr<FunctionData> VgiAggregateFunctionBind(ClientContext &context, Aggreg
 	bind_data->attach_params = func_info.attach_params;
 	bind_data->attach_opaque_data = func_info.attach_opaque_data;
 	bind_data->function_name = func_info.function_name;
+	bind_data->schema_name = func_info.schema_name;
 	bind_data->settings = settings;
 	bind_data->required_secrets = func_info.required_secrets;
 	bind_data->resolved_output_schema = func_info.output_schema;

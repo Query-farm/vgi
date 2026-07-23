@@ -300,6 +300,16 @@ unique_ptr<FunctionData> VgiTableInOutBind(ClientContext &context, TableFunction
 	// Set the input schema for table-in-out functions
 	connection->SetInputSchema(bind_data->input_schema);
 
+	// Name the owning schema on the bind request. The runtime paths below
+	// (InitGlobal / AcquireSubstreamConnection / AcquireBlendedInputConnection,
+	// and the buffering operator's BuildAcquireParams) carry it via
+	// FunctionConnectionParams::schema_name, which AcquireAndBindConnection
+	// applies — but this bind-time connection is built directly, so it needs
+	// the explicit call or the worker resolves the function by bare name and
+	// cannot tell two same-named table-in-out functions in different schemas
+	// apart. Empty stays permitted (serialises as null).
+	connection->SetSchemaName(bind_data->schema_name);
+
 	// Perform bind
 	auto bind_result = connection->PerformBindRpc();
 

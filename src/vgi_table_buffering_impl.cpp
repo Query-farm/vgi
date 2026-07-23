@@ -195,6 +195,12 @@ public:
 	// the per-RPC wrappers (RpcTableBuffering*) so they don't need to
 	// chase pointers back through the operator.
 	std::string function_name;
+	// Owning catalog schema, snapshotted next to function_name. The
+	// destructor's table_buffering_destructor RPC goes out as a *pooled*
+	// unary call — no bound connection, so the request itself is the only
+	// carrier of the schema and a bare name could resolve to a same-named
+	// function in another schema. Empty = none named; serialises as null.
+	std::string schema_name;
 	std::vector<uint8_t> attach_opaque_data;
 
 	// Captured at GetGlobalSinkState time so the destructor can fire a
@@ -309,8 +315,8 @@ VgiTableBufferingGlobalSinkState::~VgiTableBufferingGlobalSinkState() {
 		auto context_lock = context_weak.lock();
 		if (context_lock) {
 			try {
-				auto rpc_params =
-				    vgi::BuildTableBufferingDestructorInner(function_name, execution_id, attach_opaque_data);
+				auto rpc_params = vgi::BuildTableBufferingDestructorInner(function_name, schema_name, execution_id,
+				                                                             attach_opaque_data);
 				vgi::UnaryRpcOptions opts {*context_lock,
 				                            attach_params->worker_path(),
 				                            attach_params->worker_debug(),
@@ -532,6 +538,7 @@ PhysicalVgiTableBufferingFunction::GetGlobalSinkState(ClientContext &context) co
 	auto gstate = make_uniq<VgiTableBufferingGlobalSinkState>(db);
 	auto &bd = bind_data->Cast<VgiTableInOutBindData>();
 	gstate->function_name = bd.function_name;
+	gstate->schema_name = bd.schema_name;
 	gstate->attach_opaque_data = bd.attach_opaque_data;
 	// Captured for the best-effort destructor RPC fired from
 	// ~VgiTableBufferingGlobalSinkState. context.shared_from_this()

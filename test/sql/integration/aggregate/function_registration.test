@@ -19,6 +19,14 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 # Exclude dynamic-code aggregates (vgi_dynamic_agg, vgi_dynamic_ml_agg) —
 # those are only registered by workers that support dynamic language
 # interpretation (Python / JavaScript). See function_registration_dynamic.test.
+#
+# 2 of the 17 are one schema-disambiguation probe: test_same_name_agg is
+# declared TWICE — once in `main`, once in `data` — so the pair collides on name
+# and is separated only by the owning schema. It backs
+# aggregate/same_name_schemas.test, the aggregate member of the family whose
+# other two members are scalar/same_name_schemas.test and
+# table_in_out/same_name_schemas.test. Every aggregate RPC has to name the
+# schema or the worker re-resolves by bare name and runs the other one.
 
 query I
 SELECT COUNT(*)
@@ -26,7 +34,7 @@ FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'aggregate'
   AND function_name NOT IN ('vgi_dynamic_agg', 'vgi_dynamic_ml_agg');
 ----
-15
+17
 
 query TT
 SELECT function_name, return_type
@@ -37,6 +45,8 @@ ORDER BY function_name;
 ----
 nest_tensor	ANY
 secret_typed_sum	ANY
+test_same_name_agg	VARCHAR
+test_same_name_agg	VARCHAR
 vgi_avg	DOUBLE
 vgi_count	BIGINT
 vgi_generic_sum	ANY

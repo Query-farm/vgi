@@ -1,0 +1,101 @@
+# name: test/sql/integration/aggregate/same_name_schemas.test
+# description: The aggregate member of the schema-disambiguation family (see
+#   scalar/same_name_schemas.test and table_in_out/same_name_schemas.test).
+#   `test_same_name_agg` is declared in BOTH the `main` and `data` schemas of
+#   the example catalog; a schema-qualified call must reach the implementation
+#   owned by the schema it names. Aggregates are the widest surface of the
+#   three: every aggregate RPC (update / combine / finalize / destructor, the
+#   window calls, the streaming calls) resolves through one by-name entry point
+#   in the worker, and none of those requests carried a schema before protocol
+#   1.2.0 — not even the aggregate bind. Each implementation tags its result
+#   with its own schema, so a mis-route reads as the wrong tag. The tag is
+#   stamped at finalize while accumulation happens in update, so a partial
+#   mis-route (bind to one implementation, update/finalize to another) is
+#   visible too.
+# group: [vgi_integration_aggregate]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ============================================================================
+# Registration: one entry per schema
+# ============================================================================
+
+query TTT
+SELECT schema_name, function_name, function_type
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_name = 'test_same_name_agg'
+ORDER BY schema_name;
+----
+data	test_same_name_agg	aggregate
+main	test_same_name_agg	aggregate
+
+# Distinct descriptions prove two distinct worker classes back the one name.
+query TT
+SELECT schema_name, description
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_name = 'test_same_name_agg'
+ORDER BY schema_name;
+----
+data	Schema-disambiguation probe; the data-schema aggregate
+main	Schema-disambiguation probe; the main-schema aggregate
+
+# ============================================================================
+# Dispatch: plain grouped aggregation (bind / update / combine / finalize)
+# ============================================================================
+
+query T
+SELECT example.main.test_same_name_agg(n) FROM range(3) t(n);
+----
+main:3
+
+query T
+SELECT example.data.test_same_name_agg(n) FROM range(3) t(n);
+----
+data:3
+
+# Both in one query — neither may collapse into the other's plan-cache entry.
+query TT
+SELECT
+    (SELECT example.main.test_same_name_agg(n) FROM range(4) t(n)) AS from_main,
+    (SELECT example.data.test_same_name_agg(n) FROM range(4) t(n)) AS from_data;
+----
+main:6	data:6
+
+# Grouped, to exercise multi-group update/combine rather than one global state.
+query IT
+SELECT n % 2 AS g, example.data.test_same_name_agg(n)
+FROM range(5) t(n)
+GROUP BY g
+ORDER BY g;
+----
+0	data:6
+1	data:4
+
+# ============================================================================
+# Dispatch: window mode (window_init / window / window_batch / destructor)
+# ============================================================================
+
+query T
+SELECT example.main.test_same_name_agg(n) OVER (ORDER BY n)
+FROM range(3) t(n)
+ORDER BY n;
+----
+main:0
+main:1
+main:3
+
+query T
+SELECT example.data.test_same_name_agg(n) OVER (ORDER BY n)
+FROM range(3) t(n)
+ORDER BY n;
+----
+data:0
+data:1
+data:3

@@ -122,8 +122,14 @@ std::shared_ptr<arrow::RecordBatch> PartitionToArrow(ClientContext &context,
 // Request builders
 // ============================================================================
 
+// The owning catalog schema rides on every window RPC for the same reason it
+// rides on the aggregate ones: a function name is unique only within a schema,
+// so a bare-name re-resolve on the worker can land on a different schema's
+// implementation than the bind did. Empty string serialises as null (the
+// legitimate "no schema named" form) — the field stays nullable.
 std::shared_ptr<arrow::RecordBatch> BuildAggregateWindowInitRequest(
-    const std::string &function_name, const std::vector<uint8_t> &execution_id,
+    const std::string &function_name, const std::string &schema_name,
+    const std::vector<uint8_t> &execution_id,
     const std::vector<uint8_t> &attach_opaque_data, int64_t partition_id, int64_t row_count,
     const std::shared_ptr<arrow::RecordBatch> &partition_batch,
     const std::shared_ptr<arrow::Schema> &output_schema,
@@ -144,6 +150,7 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateWindowInitRequest(
 	    arrow::field("frame_stats", arrow::binary(), false),
 	    arrow::field("all_valid", arrow::binary(), false),
 	    arrow::field("attach_opaque_data", arrow::binary(), true),
+	    arrow::field("schema_name", arrow::utf8(), true),
 	});
 
 	arrow::StringBuilder fn_b;
@@ -178,11 +185,13 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateWindowInitRequest(
 	ThrowOnArrowError(aid_b.Finish(&aid_a));
 
 	return WrapAsRpcParams(arrow::RecordBatch::Make(
-	    schema, 1, {fn_a, eid_a, pid_a, rc_a, batch_a, os_a, fm_a, fs_a, av_a, aid_a}));
+	    schema, 1, {fn_a, eid_a, pid_a, rc_a, batch_a, os_a, fm_a, fs_a, av_a, aid_a,
+	                MakeSingleStringArrayOrNull(schema_name)}));
 }
 
 std::shared_ptr<arrow::RecordBatch> BuildAggregateWindowRequest(
-    const std::string &function_name, const std::vector<uint8_t> &execution_id,
+    const std::string &function_name, const std::string &schema_name,
+    const std::vector<uint8_t> &execution_id,
     const std::vector<uint8_t> &attach_opaque_data, int64_t partition_id, int64_t rid,
     const SubFrames &subframes) {
 	auto schema = arrow::schema({
@@ -193,6 +202,7 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateWindowRequest(
 	    arrow::field("frame_starts", arrow::list(arrow::field("item", arrow::int64(), true)), false),
 	    arrow::field("frame_ends", arrow::list(arrow::field("item", arrow::int64(), true)), false),
 	    arrow::field("attach_opaque_data", arrow::binary(), true),
+	    arrow::field("schema_name", arrow::utf8(), true),
 	});
 
 	arrow::StringBuilder fn_b;
@@ -231,7 +241,8 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateWindowRequest(
 	ThrowOnArrowError(aid_b.Finish(&aid_a));
 
 	return WrapAsRpcParams(arrow::RecordBatch::Make(
-	    schema, 1, {fn_a, eid_a, pid_a, rid_a, starts_a, ends_a, aid_a}));
+	    schema, 1, {fn_a, eid_a, pid_a, rid_a, starts_a, ends_a, aid_a,
+	                MakeSingleStringArrayOrNull(schema_name)}));
 }
 
 // Batched window request — sends all (rid, subframes) tuples for one
@@ -239,7 +250,8 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateWindowRequest(
 // subframe cardinality per row so the worker can unflatten frame_starts /
 // frame_ends (flat arrays of length sum(frames_per_row)).
 std::shared_ptr<arrow::RecordBatch> BuildAggregateWindowBatchRequest(
-    const std::string &function_name, const std::vector<uint8_t> &execution_id,
+    const std::string &function_name, const std::string &schema_name,
+    const std::vector<uint8_t> &execution_id,
     const std::vector<uint8_t> &attach_opaque_data, int64_t partition_id,
     const SubFrames *subframes_per_row, idx_t count, idx_t row_idx) {
 	auto schema = arrow::schema({
@@ -252,6 +264,7 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateWindowBatchRequest(
 	    arrow::field("frame_starts", arrow::list(arrow::field("item", arrow::int64(), true)), false),
 	    arrow::field("frame_ends", arrow::list(arrow::field("item", arrow::int64(), true)), false),
 	    arrow::field("attach_opaque_data", arrow::binary(), true),
+	    arrow::field("schema_name", arrow::utf8(), true),
 	});
 
 	arrow::StringBuilder fn_b;
@@ -300,17 +313,20 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateWindowBatchRequest(
 	ThrowOnArrowError(aid_b.Finish(&aid_a));
 
 	return WrapAsRpcParams(arrow::RecordBatch::Make(
-	    schema, 1, {fn_a, eid_a, pid_a, row_idx_a, count_a, fpr_a, starts_a, ends_a, aid_a}));
+	    schema, 1, {fn_a, eid_a, pid_a, row_idx_a, count_a, fpr_a, starts_a, ends_a, aid_a,
+	                MakeSingleStringArrayOrNull(schema_name)}));
 }
 
 std::shared_ptr<arrow::RecordBatch> BuildAggregateWindowDestructorRequest(
-    const std::string &function_name, const std::vector<uint8_t> &execution_id,
+    const std::string &function_name, const std::string &schema_name,
+    const std::vector<uint8_t> &execution_id,
     const std::vector<uint8_t> &attach_opaque_data, int64_t partition_id) {
 	auto schema = arrow::schema({
 	    arrow::field("function_name", arrow::utf8(), false),
 	    arrow::field("execution_id", arrow::binary(), false),
 	    arrow::field("partition_id", arrow::int64(), false),
 	    arrow::field("attach_opaque_data", arrow::binary(), true),
+	    arrow::field("schema_name", arrow::utf8(), true),
 	});
 
 	arrow::StringBuilder fn_b;
@@ -332,7 +348,8 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateWindowDestructorRequest(
 	ThrowOnArrowError(pid_b.Finish(&pid_a));
 	ThrowOnArrowError(aid_b.Finish(&aid_a));
 
-	return WrapAsRpcParams(arrow::RecordBatch::Make(schema, 1, {fn_a, eid_a, pid_a, aid_a}));
+	return WrapAsRpcParams(arrow::RecordBatch::Make(
+	    schema, 1, {fn_a, eid_a, pid_a, aid_a, MakeSingleStringArrayOrNull(schema_name)}));
 }
 
 } // anonymous namespace
@@ -344,7 +361,7 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateWindowDestructorRequest(
 void SendAggregateWindowDestructorRpc(ClientContext &context, const VgiAggregateBindData &bind_data,
                                        int64_t partition_id) {
 	auto request = BuildAggregateWindowDestructorRequest(
-	    bind_data.function_name, bind_data.exec_state->execution_id,
+	    bind_data.function_name, bind_data.schema_name, bind_data.exec_state->execution_id,
 	    bind_data.attach_opaque_data, partition_id);
 	// enable_logging=false: this path runs on task-scheduler threads during
 	// pipeline teardown. VGI_LOG / DrainToLog are unsafe there.
@@ -378,7 +395,8 @@ void VgiAggregateWindowInit(AggregateInputData &aggr_input_data, const WindowPar
 	auto filter_mask_bytes = PackValidityMask(partition.filter_mask, partition.count);
 
 	auto request = BuildAggregateWindowInitRequest(
-	    bind_data.function_name, bind_data.exec_state->execution_id, bind_data.attach_opaque_data,
+	    bind_data.function_name, bind_data.schema_name, bind_data.exec_state->execution_id,
+	    bind_data.attach_opaque_data,
 	    ls->partition_id, static_cast<int64_t>(partition.count), partition_batch,
 	    bind_data.resolved_output_schema, filter_mask_bytes, frame_stats_bytes, all_valid_bytes);
 
@@ -409,7 +427,8 @@ void VgiAggregateWindow(AggregateInputData &aggr_input_data, const WindowPartiti
 	auto &context = *context_lock;
 
 	auto request = BuildAggregateWindowRequest(
-	    bind_data.function_name, bind_data.exec_state->execution_id, bind_data.attach_opaque_data,
+	    bind_data.function_name, bind_data.schema_name, bind_data.exec_state->execution_id,
+	    bind_data.attach_opaque_data,
 	    global->partition_id, static_cast<int64_t>(rid), subframes);
 
 	auto rpc_result = InvokeAggregateRpc(context, bind_data, "aggregate_window", request);
@@ -493,7 +512,8 @@ void VgiAggregateWindowBatch(AggregateInputData &aggr_input_data, const WindowPa
 	auto &context = *context_lock;
 
 	auto request = BuildAggregateWindowBatchRequest(
-	    bind_data.function_name, bind_data.exec_state->execution_id, bind_data.attach_opaque_data,
+	    bind_data.function_name, bind_data.schema_name, bind_data.exec_state->execution_id,
+	    bind_data.attach_opaque_data,
 	    global->partition_id, subframes_per_row, count, row_idx);
 
 	auto rpc_result = InvokeAggregateRpc(context, bind_data, "aggregate_window_batch", request);

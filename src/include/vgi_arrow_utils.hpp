@@ -47,6 +47,12 @@ inline void AppendBytesOrNull(arrow::BinaryBuilder &builder, const std::vector<u
 // Throws IOException on builder failure.
 std::shared_ptr<arrow::Array> MakeSingleStringArray(const std::string &value);
 
+// Build a single-row arrow::StringArray; null if the value is empty. Mirrors
+// the "empty string serialises as null" convention used by
+// BuildNullableStringScalar in vgi_rpc_types.cpp — the wire form the Python
+// dataclasses read back as ``None``.
+std::shared_ptr<arrow::Array> MakeSingleStringArrayOrNull(const std::string &value);
+
 // Build a single-row arrow::BinaryArray holding the given bytes (always non-null).
 std::shared_ptr<arrow::Array> MakeSingleBinaryArray(const std::vector<uint8_t> &bytes);
 

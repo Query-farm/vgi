@@ -15,6 +15,7 @@ namespace vgi {
 
 std::shared_ptr<arrow::RecordBatch>
 BuildTableBufferingProcessInner(const std::string &function_name,
+                                  const std::string &schema_name,
                                   const std::vector<uint8_t> &execution_id,
                                   const std::vector<uint8_t> &input_batch_bytes,
                                   const std::vector<uint8_t> &attach_opaque_data,
@@ -28,6 +29,7 @@ BuildTableBufferingProcessInner(const std::string &function_name,
 	    arrow::field("attach_opaque_data", arrow::binary(), true),
 	    arrow::field("transaction_id", arrow::binary(), true),
 	    arrow::field("batch_index", arrow::int64(), true),
+	    arrow::field("schema_name", arrow::utf8(), true),
 	});
 	arrow::Int64Builder bi_builder;
 	if (batch_index.has_value()) {
@@ -48,6 +50,7 @@ BuildTableBufferingProcessInner(const std::string &function_name,
 	    vgi::MakeSingleBinaryArrayOrNull(attach_opaque_data),
 	    txn_array,
 	    bi_array,
+	    vgi::MakeSingleStringArrayOrNull(schema_name),
 	});
 	auto inner_bytes = vgi::SerializeToIpcBytes(inner);
 	return vgi::generated::BuildTableBufferingProcessParams(inner_bytes);
@@ -55,6 +58,7 @@ BuildTableBufferingProcessInner(const std::string &function_name,
 
 std::shared_ptr<arrow::RecordBatch>
 BuildTableBufferingCombineInner(const std::string &function_name,
+                                  const std::string &schema_name,
                                   const std::vector<uint8_t> &execution_id,
                                   const std::vector<std::vector<uint8_t>> &state_ids,
                                   const std::vector<uint8_t> &attach_opaque_data) {
@@ -64,6 +68,7 @@ BuildTableBufferingCombineInner(const std::string &function_name,
 	    arrow::field("state_ids", arrow::list(arrow::binary()), false),
 	    arrow::field("attach_opaque_data", arrow::binary(), true),
 	    arrow::field("transaction_id", arrow::binary(), true),
+	    arrow::field("schema_name", arrow::utf8(), true),
 	});
 	arrow::ListBuilder list_builder(arrow::default_memory_pool(), std::make_shared<arrow::BinaryBuilder>());
 	auto *value_builder = static_cast<arrow::BinaryBuilder *>(list_builder.value_builder());
@@ -83,6 +88,7 @@ BuildTableBufferingCombineInner(const std::string &function_name,
 	    state_ids_array,
 	    vgi::MakeSingleBinaryArrayOrNull(attach_opaque_data),
 	    txn_array,
+	    vgi::MakeSingleStringArrayOrNull(schema_name),
 	});
 	auto inner_bytes = vgi::SerializeToIpcBytes(inner);
 	return vgi::generated::BuildTableBufferingCombineParams(inner_bytes);
@@ -90,6 +96,7 @@ BuildTableBufferingCombineInner(const std::string &function_name,
 
 std::shared_ptr<arrow::RecordBatch>
 BuildTableBufferingDestructorInner(const std::string &function_name,
+                                     const std::string &schema_name,
                                      const std::vector<uint8_t> &execution_id,
                                      const std::vector<uint8_t> &attach_opaque_data) {
 	auto inner_schema = arrow::schema({
@@ -97,6 +104,7 @@ BuildTableBufferingDestructorInner(const std::string &function_name,
 	    arrow::field("execution_id", arrow::binary(), false),
 	    arrow::field("attach_opaque_data", arrow::binary(), true),
 	    arrow::field("transaction_id", arrow::binary(), true),
+	    arrow::field("schema_name", arrow::utf8(), true),
 	});
 	arrow::BinaryBuilder txn_builder;
 	(void)txn_builder.AppendNull();
@@ -107,6 +115,7 @@ BuildTableBufferingDestructorInner(const std::string &function_name,
 	    vgi::MakeSingleBinaryArray(execution_id),
 	    vgi::MakeSingleBinaryArrayOrNull(attach_opaque_data),
 	    txn_array,
+	    vgi::MakeSingleStringArrayOrNull(schema_name),
 	});
 	auto inner_bytes = vgi::SerializeToIpcBytes(inner);
 	return vgi::generated::BuildTableBufferingDestructorParams(inner_bytes);

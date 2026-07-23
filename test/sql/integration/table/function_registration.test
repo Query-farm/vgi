@@ -111,13 +111,17 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 #   cache/partition_scope_shapes.test)
 # 1 per-value cache fixture (cached_explode — per-value 1:0 / 1:1 / 1:N with
 #   interleaved output, backs the per-value cache tests)
-# = 138
+# 4 schema-disambiguation probes: test_same_name_transform (table-in-out) and
+#   test_same_name_buffered (table-buffering), each declared TWICE — once in
+#   `main` and once in `data` — so the pair collides on name and is separated
+#   only by the owning schema. Back table_in_out/same_name_schemas.test.
+# = 142
 query I
 SELECT COUNT(*)
 FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'table';
 ----
-138
+142
 
 # The 34 pure table functions (no TABLE parameter type)
 # Note: make_series appears 5 times (5 overloads), make_pairs appears 3 times,

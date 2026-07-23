@@ -36,6 +36,7 @@ std::vector<uint8_t> SerializeSchemaBytes(const std::shared_ptr<arrow::Schema> &
 // streaming operator until we wire const-arg passing through the operator).
 std::shared_ptr<arrow::RecordBatch> BuildStreamingOpenRequest(
     const std::string &function_name,
+    const std::string &schema_name,
     const std::vector<uint8_t> &arguments,
     const std::shared_ptr<arrow::Schema> &input_schema,
     int64_t partition_key_count,
@@ -56,6 +57,7 @@ std::shared_ptr<arrow::RecordBatch> BuildStreamingOpenRequest(
 	    arrow::field("settings", arrow::binary(), true),
 	    arrow::field("secrets", arrow::binary(), true),
 	    arrow::field("attach_opaque_data", arrow::binary(), true),
+	    arrow::field("schema_name", arrow::utf8(), true),
 	});
 
 	arrow::StringBuilder fn_b;
@@ -88,11 +90,13 @@ std::shared_ptr<arrow::RecordBatch> BuildStreamingOpenRequest(
 	ThrowOnArrowError(aid_b.Finish(&aid_a));
 
 	return WrapAsRpcParams(arrow::RecordBatch::Make(
-	    schema, 1, {fn_a, args_a, is_a, pkc_a, okc_a, os_a, st_a, sc_a, aid_a}));
+	    schema, 1, {fn_a, args_a, is_a, pkc_a, okc_a, os_a, st_a, sc_a, aid_a,
+	                MakeSingleStringArrayOrNull(schema_name)}));
 }
 
 std::shared_ptr<arrow::RecordBatch> BuildStreamingChunkRequest(
     const std::string &function_name,
+    const std::string &schema_name,
     const std::vector<uint8_t> &execution_id,
     const std::shared_ptr<arrow::RecordBatch> &input_batch,
     const std::vector<uint8_t> &attach_opaque_data) {
@@ -104,6 +108,7 @@ std::shared_ptr<arrow::RecordBatch> BuildStreamingChunkRequest(
 	    arrow::field("execution_id", arrow::binary(), false),
 	    arrow::field("input_batch", arrow::binary(), false),
 	    arrow::field("attach_opaque_data", arrow::binary(), true),
+	    arrow::field("schema_name", arrow::utf8(), true),
 	});
 
 	arrow::StringBuilder fn_b;
@@ -124,11 +129,13 @@ std::shared_ptr<arrow::RecordBatch> BuildStreamingChunkRequest(
 	ThrowOnArrowError(batch_b.Finish(&batch_a));
 	ThrowOnArrowError(aid_b.Finish(&aid_a));
 
-	return WrapAsRpcParams(arrow::RecordBatch::Make(schema, 1, {fn_a, eid_a, batch_a, aid_a}));
+	return WrapAsRpcParams(arrow::RecordBatch::Make(
+	    schema, 1, {fn_a, eid_a, batch_a, aid_a, MakeSingleStringArrayOrNull(schema_name)}));
 }
 
 std::shared_ptr<arrow::RecordBatch> BuildStreamingCloseRequest(
     const std::string &function_name,
+    const std::string &schema_name,
     const std::vector<uint8_t> &execution_id,
     const std::vector<uint8_t> &attach_opaque_data) {
 
@@ -136,6 +143,7 @@ std::shared_ptr<arrow::RecordBatch> BuildStreamingCloseRequest(
 	    arrow::field("function_name", arrow::utf8(), false),
 	    arrow::field("execution_id", arrow::binary(), false),
 	    arrow::field("attach_opaque_data", arrow::binary(), true),
+	    arrow::field("schema_name", arrow::utf8(), true),
 	});
 
 	arrow::StringBuilder fn_b;
@@ -154,7 +162,8 @@ std::shared_ptr<arrow::RecordBatch> BuildStreamingCloseRequest(
 	ThrowOnArrowError(eid_b.Finish(&eid_a));
 	ThrowOnArrowError(aid_b.Finish(&aid_a));
 
-	return WrapAsRpcParams(arrow::RecordBatch::Make(schema, 1, {fn_a, eid_a, aid_a}));
+	return WrapAsRpcParams(arrow::RecordBatch::Make(
+	    schema, 1, {fn_a, eid_a, aid_a, MakeSingleStringArrayOrNull(schema_name)}));
 }
 
 // Standard envelope unwrap: outer {result: binary} wrapping the
@@ -215,8 +224,9 @@ VgiStreamingSession VgiAggregateStreamingOpen(
 	}
 
 	auto request = BuildStreamingOpenRequest(
-	    bind_data.function_name, arguments_bytes, input_schema, partition_key_count,
-	    order_key_count, bind_data.resolved_output_schema, bind_data.attach_opaque_data);
+	    bind_data.function_name, bind_data.schema_name, arguments_bytes, input_schema,
+	    partition_key_count, order_key_count, bind_data.resolved_output_schema,
+	    bind_data.attach_opaque_data);
 
 	auto rpc_result = InvokeAggregateRpc(context, bind_data, "aggregate_streaming_open", request);
 	auto inner = UnwrapResponse(rpc_result.response_batch, "aggregate_streaming_open");
@@ -234,6 +244,7 @@ VgiStreamingSession VgiAggregateStreamingOpen(
 	VgiStreamingSession session;
 	session.execution_id.assign(eid_view.data(), eid_view.data() + eid_view.size());
 	session.function_name = bind_data.function_name;
+	session.schema_name = bind_data.schema_name;
 	session.attach_opaque_data = bind_data.attach_opaque_data;
 	return session;
 }
@@ -245,7 +256,8 @@ std::shared_ptr<arrow::RecordBatch> VgiAggregateStreamingChunk(
     const std::shared_ptr<arrow::RecordBatch> &input_batch) {
 
 	auto request = BuildStreamingChunkRequest(
-	    session.function_name, session.execution_id, input_batch, session.attach_opaque_data);
+	    session.function_name, session.schema_name, session.execution_id, input_batch,
+	    session.attach_opaque_data);
 
 	auto rpc_result = InvokeAggregateRpc(context, bind_data, "aggregate_streaming_chunk", request);
 	auto inner = UnwrapResponse(rpc_result.response_batch, "aggregate_streaming_chunk");
@@ -283,7 +295,8 @@ void VgiAggregateStreamingClose(
     bool enable_logging) {
 
 	auto request = BuildStreamingCloseRequest(
-	    session.function_name, session.execution_id, session.attach_opaque_data);
+	    session.function_name, session.schema_name, session.execution_id,
+	    session.attach_opaque_data);
 
 	InvokeAggregateRpc(context, bind_data, "aggregate_streaming_close", request, enable_logging);
 }

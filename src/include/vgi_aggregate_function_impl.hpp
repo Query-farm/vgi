@@ -49,6 +49,11 @@ struct VgiAggregateFunctionInfo : public AggregateFunctionInfo {
 	std::vector<uint8_t> attach_opaque_data;
 	optional_ptr<Catalog> catalog;
 	std::string function_name;
+	// Catalog schema this aggregate was registered into. A function name is
+	// unique only within a schema, so every aggregate RPC carries it and the
+	// worker resolves (schema_name, function_name). Empty = none named, which
+	// serialises as null and leaves the worker on its by-name lookup.
+	std::string schema_name;
 	std::map<std::string, Value> settings;
 	std::vector<std::string> setting_names;
 	std::vector<VgiSecretRequirement> required_secrets;
@@ -88,6 +93,10 @@ struct VgiAggregateBindData : public FunctionData {
 	std::shared_ptr<VgiAttachParameters> attach_params;
 	std::vector<uint8_t> attach_opaque_data;
 	std::string function_name;
+	// Owning catalog schema; see VgiAggregateFunctionInfo::schema_name. Part of
+	// the bind-data identity (Equals) so two same-named aggregates from
+	// different schemas never share a cached plan's bind data.
+	std::string schema_name;
 	std::map<std::string, Value> settings;
 	std::vector<VgiSecretRequirement> required_secrets;
 	std::shared_ptr<arrow::Schema> resolved_output_schema;
