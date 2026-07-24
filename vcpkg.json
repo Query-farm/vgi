@@ -8,6 +8,10 @@
                         "features": [
                                 { "name": "mimalloc", "platform": "(linux | (osx & arm64)) & !emscripten" }
                         ]
+                },
+                {
+                        "name": "sqlite3",
+                        "platform": "!emscripten"
                 }
         ],
         "vcpkg-configuration": {
