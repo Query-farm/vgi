@@ -171,16 +171,34 @@ target_link_libraries(${LOADABLE_EXTENSION_NAME} ${VGI_SSL_LIBS} ${VGI_ARROW_LIB
 
 # SQLite-backed per-value memo disk tier (same-host multi-process + cross-restart).
 # Native only: WASM has no filesystem tier (the cache dir is forced empty), so the
-# backend compiles to a null stub there. macOS/Linux ship libsqlite3; Windows would
-# vendor the amalgamation (follow-up).
+# backend compiles to a null stub there. We build the vendored SQLite amalgamation
+# (third_party/sqlite) rather than linking a system libsqlite3 — this makes the disk
+# tier build identically on macOS/Linux/Windows (Windows has no system libsqlite3)
+# and pins the on-disk behaviour to a known version.
 if(NOT EMSCRIPTEN)
-  find_library(VGI_SQLITE3_LIB sqlite3)
-  if(VGI_SQLITE3_LIB)
-    target_compile_definitions(${EXTENSION_NAME} PRIVATE VGI_ENABLE_SQLITE)
-    target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE VGI_ENABLE_SQLITE)
-    target_link_libraries(${EXTENSION_NAME} ${VGI_SQLITE3_LIB})
-    target_link_libraries(${LOADABLE_EXTENSION_NAME} ${VGI_SQLITE3_LIB})
+  add_library(vgi_sqlite3 STATIC third_party/sqlite/sqlite3.c)
+  target_include_directories(vgi_sqlite3 PUBLIC third_party/sqlite)
+  # Position-independent so it can link into the loadable (shared) extension.
+  set_target_properties(vgi_sqlite3 PROPERTIES POSITION_INDEPENDENT_CODE ON)
+  # Serialized threading (our backend shares one connection; disk is off the hot
+  # path so the internal mutex cost is irrelevant), WAL crash-safety defaults, no
+  # loadable extensions (defence-in-depth), strict quoting.
+  target_compile_definitions(vgi_sqlite3 PRIVATE
+    SQLITE_THREADSAFE=1
+    SQLITE_DEFAULT_MEMSTATUS=0
+    SQLITE_DEFAULT_WAL_SYNCHRONOUS=1
+    SQLITE_OMIT_LOAD_EXTENSION
+    SQLITE_OMIT_DEPRECATED
+    SQLITE_DQS=0)
+  if(NOT MSVC)
+    # The amalgamation is warning-clean under its own build; silence third-party
+    # noise so it doesn't trip -Werror in our targets.
+    target_compile_options(vgi_sqlite3 PRIVATE -w)
   endif()
+  foreach(tgt ${EXTENSION_NAME} ${LOADABLE_EXTENSION_NAME})
+    target_compile_definitions(${tgt} PRIVATE VGI_ENABLE_SQLITE)
+    target_link_libraries(${tgt} vgi_sqlite3)
+  endforeach()
 endif()
 
 install(
@@ -188,6 +206,15 @@ install(
   EXPORT "${DUCKDB_EXPORT_SET}"
   LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
   ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
+
+# The static extension lib links vgi_sqlite3, so a static duckdb that imports the
+# extension's export set needs vgi_sqlite3 in that same set to resolve.
+if(NOT EMSCRIPTEN)
+  install(
+    TARGETS vgi_sqlite3
+    EXPORT "${DUCKDB_EXPORT_SET}"
+    ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
+endif()
 
 # Optional C++ unit-test binary for the launcher's pure helpers.  Built when
 # ``BUILD_VGI_UNIT_TESTS=ON`` is passed to CMake (or as an env var).  Pure
