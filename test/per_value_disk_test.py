@@ -53,7 +53,7 @@ def run(sql, env=None):
     if env:
         e.update(env)
     p = subprocess.run(
-        [HAYBARN, "-unsigned", "-init", "/dev/null"],
+        [HAYBARN, "-unsigned", "-init", os.devnull],
         input=script,
         env=e,
         capture_output=True,
@@ -70,7 +70,7 @@ def run_bg(sql, env=None):
     if env:
         e.update(env)
     return subprocess.Popen(
-        [HAYBARN, "-unsigned", "-init", "/dev/null"],
+        [HAYBARN, "-unsigned", "-init", os.devnull],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -276,12 +276,19 @@ def test_soak(dirroot):
 #    recompute).
 # ---------------------------------------------------------------------------
 def _sqlite_used_bytes(db):
-    def pragma(p):
+    # Read the page pragmas via Python's built-in sqlite3 module (no external CLI —
+    # portable to Windows). Open read-only so we never perturb the file under test.
+    def pragma(conn, p):
         try:
-            return int(subprocess.run(["sqlite3", db, f"PRAGMA {p}"], capture_output=True, text=True).stdout or 0)
+            return int(conn.execute(f"PRAGMA {p}").fetchone()[0])
         except Exception:
             return 0
-    return (pragma("page_count") - pragma("freelist_count")) * pragma("page_size")
+    try:
+        import sqlite3 as _sq
+        with _sq.connect(f"file:{db}?mode=ro", uri=True) as conn:
+            return (pragma(conn, "page_count") - pragma(conn, "freelist_count")) * pragma(conn, "page_size")
+    except Exception:
+        return 0
 
 def test_disk_cap(dirroot):
     d = os.path.join(dirroot, "cap")
