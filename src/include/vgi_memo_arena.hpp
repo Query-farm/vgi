@@ -248,6 +248,11 @@ public:
 	// `SET vgi_result_cache_dir` / `..._per_value_disk_max_bytes` take effect.
 	void EnsureSqliteBackend(const std::string &dir, int64_t disk_max_bytes);
 	void FlushAll();
+	// Close and drop the SQLite backend, releasing its open file handle on
+	// `vgi_per_value.sqlite`. Required before removing the cache directory on Windows,
+	// where an open file cannot be deleted (POSIX unlinks it happily). The next
+	// EnsureSqliteBackend re-opens it (backend_dir_ is cleared so the re-open fires).
+	void ReleaseBackend();
 
 	// Snapshot for diagnostics (one row per arena).
 	struct ArenaRow {

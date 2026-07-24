@@ -602,6 +602,19 @@ void VgiMemoArenaRegistry::FlushAll() {
 	}
 }
 
+void VgiMemoArenaRegistry::ReleaseBackend() {
+	std::shared_ptr<PerValueDiskBackend> b;
+	{
+		std::lock_guard<std::mutex> lg(mu_);
+		arenas_.clear();         // arenas may hold the backend shared_ptr; drop them first
+		total_bytes_ = 0;
+		b = std::move(backend_); // registry drops its ref
+		backend_dir_.clear();    // so the next EnsureSqliteBackend re-opens
+	}
+	// `b`'s destructor (sqlite3_close) runs here, outside the lock — releasing the OS file
+	// handle so the cache directory can be removed on Windows.
+}
+
 std::vector<VgiMemoArenaRegistry::ArenaRow> VgiMemoArenaRegistry::Snapshot() {
 	std::vector<std::shared_ptr<VgiMemoArena>> live;
 	std::vector<std::string> fps;

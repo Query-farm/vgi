@@ -37,10 +37,13 @@ static void VgiResultCacheFlushScan(ClientContext &context, TableFunctionInput &
 	// the disk tier even in a process that set the dir but has not yet called a per-value
 	// function (which is normally what attaches the backend). Idempotent.
 	SyncResultCacheSettings(context);
-	auto count = VgiResultCache::Instance().FlushAll();
 	// The per-value memo arena is a separate registry; flush it too so a flush gives a
-	// genuinely cold per-value tier (tests rely on this).
-	vgi::VgiMemoArenaRegistry::Instance().FlushAll();
+	// genuinely cold per-value tier (tests rely on this). Release its SQLite backend BEFORE
+	// VgiResultCache::FlushAll() removes the cache directory — on Windows the open
+	// vgi_per_value.sqlite handle would otherwise block the delete ("used by another
+	// process"). The next per-value call re-opens the backend.
+	vgi::VgiMemoArenaRegistry::Instance().ReleaseBackend();
+	auto count = VgiResultCache::Instance().FlushAll();
 	output.SetValue(0, 0, Value::BIGINT(static_cast<int64_t>(count)));
 	output.SetCardinality(1);
 	data.finished = true;
