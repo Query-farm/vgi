@@ -13,6 +13,8 @@
 
 #include "vgi_memo_arena.hpp"
 
+#include "duckdb/common/local_file_system.hpp"
+
 #include <chrono>
 #include <cstdio>
 #include <mutex>
@@ -244,7 +246,47 @@ private:
 
 } // namespace
 
+namespace {
+
+// SQLite's sqlite3_open() creates the database file but NOT its parent directories
+// ("unable to open database file" otherwise). The per-value cache dir is user-set and
+// may not exist yet — and per-value opens it at settings-sync time, before any other
+// tier has had a chance to create it — so create the tree ourselves. Recursive, and
+// tolerant of both '/' and '\\' separators (a Windows cache dir arrives mixed).
+void EnsureDirTree(const std::string &dir) {
+	if (dir.empty()) {
+		return;
+	}
+	LocalFileSystem fs;
+	if (fs.DirectoryExists(dir)) {
+		return;
+	}
+	std::string acc;
+	acc.reserve(dir.size());
+	for (size_t i = 0; i < dir.size(); ++i) {
+		const char c = dir[i];
+		acc.push_back(c);
+		const bool sep = (c == '/' || c == '\\');
+		const bool last = (i + 1 == dir.size());
+		if ((sep || last) && !acc.empty()) {
+			// Build a candidate without the trailing separator and create it if missing.
+			std::string cand = sep ? acc.substr(0, acc.size() - 1) : acc;
+			// Skip empties (leading separator, "C:" drive prefix ending in ':').
+			if (!cand.empty() && cand.back() != ':' && !fs.DirectoryExists(cand)) {
+				try {
+					fs.CreateDirectory(cand);
+				} catch (...) {
+					// A racing peer process may have created it; ignore and let the open report.
+				}
+			}
+		}
+	}
+}
+
+} // namespace
+
 std::shared_ptr<PerValueDiskBackend> MakeSqliteDiskBackend(const std::string &dir) {
+	EnsureDirTree(dir);
 	const std::string path = dir + "/vgi_per_value.sqlite";
 	sqlite3 *db = nullptr;
 	if (sqlite3_open(path.c_str(), &db) != SQLITE_OK) {
