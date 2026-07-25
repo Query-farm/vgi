@@ -100,7 +100,7 @@
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/function/table_function.hpp"
 
-#define VGI_EXTENSION_VERSION "2026011201"
+#define VGI_EXTENSION_VERSION "2026072501"
 
 namespace duckdb {
 

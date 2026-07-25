@@ -7,7 +7,6 @@
 #include "duckdb/main/extension_helper.hpp"
 #include "duckdb/main/config.hpp"
 #include <cstdlib>
-#include <future>
 using namespace duckdb_yyjson; // NOLINT
 
 namespace duckdb
@@ -24,6 +23,10 @@ namespace duckdb
 
 			auto &http_util = HTTPUtil::Get(*db);
 			unique_ptr<HTTPParams> params = http_util.InitializeParameters(*db, target_url);
+			// Telemetry is best-effort: bound the request so a stalled connection cannot
+			// keep the detached thread alive. No retries -- a dropped ping is not worth one.
+			params->timeout = 10;
+			params->retries = 0;
 
 			PostRequestInfo post_request(target_url, headers, *params, reinterpret_cast<const_data_ptr_t>(body.data()),
 																	 body.size());
@@ -66,9 +69,11 @@ namespace duckdb
 		}
 
 #ifndef __EMSCRIPTEN__
-		[[maybe_unused]] auto _ = std::async(
-				std::launch::async,
-				[db_ptr = std::move(db), url = target_url, body = json]() mutable { PostJson(std::move(db_ptr), url, body); });
+		// Fire-and-forget. Deliberately not std::async: the future it returns has a
+		// blocking destructor, which would make the caller wait on this HTTP request.
+		std::thread([db_ptr = std::move(db), url = target_url, body = json]() mutable
+					{ PostJson(std::move(db_ptr), url, body); })
+				.detach();
 #else
 		PostJson(std::move(db), target_url, json);
 #endif
