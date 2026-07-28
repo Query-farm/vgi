@@ -65,13 +65,50 @@ SELECT sum(e.v) FROM (VALUES (10),(20),(30)) t(x), LATERAL ex.echo((SELECT t.x A
 
 # ---------------------------------------------------------------------------
 # early termination (LIMIT) — per-substream connections drop cleanly, no hang.
-# range(50000) is large enough that the source is not exhausted before LIMIT 5
-# fires, so this genuinely exercises early-termination teardown; kept below the
-# per-row-HTTP flood threshold so it passes over both transports.
+#
+# The LIMIT must sit DIRECTLY above the INOUT_FUNCTION, with no pipeline-breaking
+# operator between them. Do not rewrite this as a correlated LATERAL: DuckDB
+# decorrelates LATERAL into a delim join, so the plan becomes
+#
+#     DELIM_SCAN -> PROJECTION -> INOUT_FUNCTION -> HASH_JOIN -> ... -> LIMIT
+#
+# and HASH_JOIN is blocking — it materializes its whole build side before
+# emitting a row, so the function runs to completion over EVERY input value
+# before the LIMIT sees anything. Early termination is then impossible for any N,
+# and the assertion below still passes, so the regression is silent. (The
+# previous version of this test was exactly that shape over range(50000): it
+# spent 50,000 worker exchanges / ~134s over HTTP to return 5 rows.) The correct
+# plan has a STREAMING_LIMIT directly above INOUT_FUNCTION — check with EXPLAIN.
+#
+# The input is deliberately enormous. With early termination the cost is O(1) in
+# the input (one exchange, ~0.1s, measured), so a 100M-row source is free when
+# the contract holds and cannot possibly complete when it breaks. That is what
+# makes this assertion falsifiable: a regression fails as a timeout instead of
+# quietly getting slower.
 # ---------------------------------------------------------------------------
 query I
 SELECT count(*) FROM (
-    SELECT * FROM range(50000) t(x), LATERAL ex.echo((SELECT t.x AS v)) e LIMIT 5
+    SELECT * FROM ex.echo((SELECT i AS v FROM range(1, 100000001) t(i))) LIMIT 5
+) s;
+----
+5
+
+# ...and it is the FIRST 5 rows, in order — teardown must not cost us the
+# prefix (nor silently return a later batch).
+query II
+SELECT min(v), max(v) FROM (
+    SELECT * FROM ex.echo((SELECT i AS v FROM range(1, 100000001) t(i))) LIMIT 5
+) s;
+----
+1	5
+
+# The correlated path also has to tear down cleanly, so keep a case for it — but
+# per the note above it CANNOT terminate early (one exchange per input row, all
+# of them), so N stays small and this covers teardown after FULL consumption,
+# not early termination.
+query I
+SELECT count(*) FROM (
+    SELECT * FROM range(200) t(x), LATERAL ex.echo((SELECT t.x AS v)) e LIMIT 5
 ) s;
 ----
 5
