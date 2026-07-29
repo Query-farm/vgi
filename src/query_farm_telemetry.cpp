@@ -43,10 +43,11 @@ namespace duckdb
 	} // namespace
 
 	// Generic transport: fire a pre-serialized JSON body, once, fire-and-forget, at
-	// `target_url`. Honors QUERY_FARM_TELEMETRY_OPT_OUT and requires httpfs. Never
-	// throws — telemetry is best-effort and must not perturb the caller (ATTACH).
+	// `target_url`. Honors QUERY_FARM_TELEMETRY_OPT_OUT and requires httpfs — either
+	// already loaded, or auto-loaded here when `autoload` is ALLOW. Never throws —
+	// telemetry is best-effort and must not perturb the caller (ATTACH).
 	INTERNAL_FUNC void QueryFarmSendEventJson(shared_ptr<DatabaseInstance> db, const string &target_url,
-																						const string &json)
+																						const string &json, QueryFarmHttpfsAutoload autoload)
 	{
 		const char *opt_out = std::getenv("QUERY_FARM_TELEMETRY_OPT_OUT");
 		if (opt_out != nullptr || !db || json.empty())
@@ -54,13 +55,20 @@ namespace duckdb
 			return;
 		}
 
-		try
+		// Auto-loading httpfs is synchronous and can download an extension, so it is
+		// only safe where the caller can afford to block (extension load). On ATTACH
+		// the caller passes DISALLOW and we drop the event rather than stall it; only
+		// the POST below is backgrounded, so anything above it is on the critical path.
+		if (autoload == QueryFarmHttpfsAutoload::ALLOW)
 		{
-			ExtensionHelper::TryAutoLoadExtension(*db, "httpfs");
-		}
-		catch (...)
-		{
-			return;
+			try
+			{
+				ExtensionHelper::TryAutoLoadExtension(*db, "httpfs");
+			}
+			catch (...)
+			{
+				return;
+			}
 		}
 
 		if (!db->ExtensionIsLoaded("httpfs"))
@@ -82,7 +90,7 @@ namespace duckdb
 	// Serialize `doc` (taking ownership — always freed) and hand off to the
 	// JSON transport above.
 	INTERNAL_FUNC void QueryFarmSendEventDoc(shared_ptr<DatabaseInstance> db, const string &target_url,
-																					 duckdb_yyjson::yyjson_mut_doc *doc)
+																					 duckdb_yyjson::yyjson_mut_doc *doc, QueryFarmHttpfsAutoload autoload)
 	{
 		if (doc == nullptr)
 		{
@@ -98,7 +106,7 @@ namespace duckdb
 			free(data);
 		}
 		yyjson_mut_doc_free(doc);
-		QueryFarmSendEventJson(std::move(db), target_url, body);
+		QueryFarmSendEventJson(std::move(db), target_url, body, autoload);
 	}
 
 	INTERNAL_FUNC void QueryFarmAddBaseEnvelope(duckdb_yyjson::yyjson_mut_doc *doc, duckdb_yyjson::yyjson_mut_val *obj,
@@ -126,8 +134,12 @@ namespace duckdb
 		yyjson_mut_doc_set_root(doc, result_obj);
 		QueryFarmAddBaseEnvelope(doc, result_obj, extension_name, extension_version);
 
+		// ALLOW: this is extension-load time, already an initialization path, so a
+		// one-time synchronous httpfs auto-load is acceptable here (and is how this
+		// ping has always reached httpfs). ATTACH makes the opposite choice.
 		const string TARGET_URL("https://duckdb-in.query-farm.services/");
-		QueryFarmSendEventDoc(loader.GetDatabaseInstance().shared_from_this(), TARGET_URL, doc);
+		QueryFarmSendEventDoc(loader.GetDatabaseInstance().shared_from_this(), TARGET_URL, doc,
+													QueryFarmHttpfsAutoload::ALLOW);
 	}
 
 } // namespace duckdb

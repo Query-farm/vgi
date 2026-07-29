@@ -18,8 +18,17 @@ This disables **all** telemetry (both events below), including the per-process s
 ## What is sent, and when
 
 Telemetry is a fire-and-forget HTTPS `POST` of a small JSON body. It is asynchronous and
-best-effort: failures are ignored and never affect your query. It requires the `httpfs`
-extension (auto-loaded); if `httpfs` is unavailable, nothing is sent.
+best-effort: failures are ignored and never affect your query. Both events require the
+`httpfs` extension; if it is unavailable, nothing is sent.
+
+The two events differ in how far they will go to get `httpfs`:
+
+- **`load`** auto-loads `httpfs` if needed. Extension load is already an initialization
+  path, so the one-time cost is acceptable there.
+- **`attach`** does **not** auto-load it. Auto-loading is synchronous and, with
+  autoinstall enabled, can download an extension — that would put a network round trip
+  on the `ATTACH` thread, which telemetry must never do. If `httpfs` is not already
+  loaded when you `ATTACH`, the event is simply dropped.
 
 | Event | When | Endpoint |
 |-------|------|----------|
