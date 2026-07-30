@@ -1232,7 +1232,8 @@ same-arity ties disambiguate via `_filter_by_argument_types` scoring the declare
 types against the **input schema** (coercibly — a literal delivers `DECIMAL` where
 the declared type is `DOUBLE`).
 
-**Inline named args (Haybarn engine patch, `haybarn-v1.5.4-rc3`).** Named args in
+**Inline named args (Haybarn engine patch, first shipped `haybarn-v1.5.4-rc3`;
+carried forward on the `haybarn` branch — `2c631722c6` in `haybarn-v1.5.5-rc1`).** Named args in
 the literal form always worked (STANDARD bind path). The column/LATERAL form needed
 a binder patch: the `TABLE_IN_OUT_FUNCTION` branch in
 `duckdb/src/planner/binder/tableref/bind_table_function.cpp` swept ALL expressions

@@ -17,17 +17,21 @@ duckdb_extension_load(vgi
 # define is set on the compile command line but no `set(...)` CMake variable
 # propagates to this scope), so the stock-DuckDB httpfs was being selected.
 # Force the haybarn fork until the CMake propagation is sorted out.
+#
+# Pins track the engine: 94d8fee is the same SHA the Haybarn engine's own
+# `.github/config/haybarn_extensions.cmake` pins for the v1.5.5 series (the
+# Haybarn HTTP stack rebased onto upstream's v1.5.5 httpfs pin, 827222f).
 set(HTTPFS_GIT_URL https://github.com/Query-farm-haybarn/haybarn-httpfs)
-set(HTTPFS_GIT_TAG fc744096d8fcbd029f7699bd7b1195cac5a913cb)
+set(HTTPFS_GIT_TAG 94d8fee6ea02ce952bab164e22689afe8f0cd8ed)
 # if(DEFINED HAYBARN_VERSION_STRING)
 #     set(HTTPFS_GIT_URL https://github.com/Query-farm-haybarn/haybarn-httpfs)
-#     set(HTTPFS_GIT_TAG 05a708ea2ccec7913bbad286f0a01eb030a3a32e)
+#     set(HTTPFS_GIT_TAG 94d8fee6ea02ce952bab164e22689afe8f0cd8ed)
 # else()
 #     set(HTTPFS_GIT_URL https://github.com/duckdb/duckdb-httpfs)
-#     set(HTTPFS_GIT_TAG 52afb4204a3238d6ee132e83340f8d68c40ee91c)
+#     set(HTTPFS_GIT_TAG 827222fb45a043a7a852d1f7aae46901492a3cda)
 # endif()
 
-# DuckDB 1.5.3's httpfs (52afb42) is curl-based. On the MinGW toolchain
+# httpfs is curl-based. On the MinGW toolchain
 # (x64-mingw-static, rtools GCC) it fails to link against static curl with
 # `undefined reference to __imp_curl_*` — curl's headers emit DLL-import symbols
 # unless CURL_STATICLIB is defined when httpfs compiles, and that flag can't be
