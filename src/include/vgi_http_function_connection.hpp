@@ -234,6 +234,11 @@ private:
 
 	// HTTP streaming state
 	std::string stream_state_token_;
+	// Set once from the /init response and echoed on every later request for
+	// this stream. Unlike stream_state_token_ it is NOT cleared per turn --
+	// the worker never sends it again, so dropping it would leave later
+	// requests unable to resolve their call state on a cold worker.
+	std::string call_state_token_;
 	// Raw vgi_batch_index value parsed off the most recent data batch's
 	// custom_metadata, or INVALID if absent. Validated in
 	// VgiTableFunctionImpl's InstallBatch on the consumer thread.

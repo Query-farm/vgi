@@ -1018,7 +1018,8 @@ void HttpPutBytes(ClientContext &context, const std::string &url,
 
 std::vector<uint8_t> SerializePointerBatch(const std::shared_ptr<arrow::Schema> &schema,
                                              const std::string &location_url,
-                                             const std::string &stream_state_token) {
+                                             const std::string &stream_state_token,
+                                             const std::string &call_state_token) {
 	// Build zero-row batch with empty arrays matching the schema
 	std::vector<std::shared_ptr<arrow::Array>> empty_arrays;
 	for (int i = 0; i < schema->num_fields(); i++) {
@@ -1031,11 +1032,18 @@ std::vector<uint8_t> SerializePointerBatch(const std::shared_ptr<arrow::Schema> 
 	}
 	auto zero_batch = arrow::RecordBatch::Make(schema, 0, empty_arrays);
 
-	// Build metadata: location key + optional stream_state
+	// Build metadata: location key + optional stream_state / call_state.
+	// Both tokens have to ride the pointer batch: the worker strips the
+	// location and reads the request's metadata, so a token left off here is
+	// simply absent from the request.
 	auto metadata = arrow::KeyValueMetadata::Make({RPC_LOCATION_KEY}, {location_url});
 	if (!stream_state_token.empty()) {
 		metadata = metadata->Merge(*arrow::KeyValueMetadata::Make(
 		    {RPC_STREAM_STATE_KEY}, {stream_state_token}));
+	}
+	if (!call_state_token.empty()) {
+		metadata = metadata->Merge(*arrow::KeyValueMetadata::Make(
+		    {RPC_CALL_STATE_KEY}, {call_state_token}));
 	}
 
 	// Serialize as IPC stream

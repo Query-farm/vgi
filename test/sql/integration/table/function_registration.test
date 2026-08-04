@@ -119,13 +119,16 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 #   producer advertising vgi.cache.ttl, declared in both `main` and `data` so
 #   its two cache entries prove the result-cache key carries the owning schema.
 #   Back cache/same_name_schemas.test.
-# = 144
+# 2 global-registration probes (global_table, a producer; global_buffered, a
+#   table-buffering reducer) — one per function type that surfaces as a table,
+#   proving a worker-declared global function is registered into the catalog.
+# = 146
 query I
 SELECT COUNT(*)
 FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'table';
 ----
-144
+146
 
 # The 34 pure table functions (no TABLE parameter type)
 # Note: make_series appears 5 times (5 overloads), make_pairs appears 3 times,

@@ -190,10 +190,13 @@ void HttpPutBytes(ClientContext &context, const std::string &url,
                    const std::vector<uint8_t> &data, HttpEncoding encoding = HttpEncoding::NONE);
 
 // Serialize a pointer batch: zero-row batch with schema + vgi_rpc.location metadata.
-// Optionally includes stream_state token in metadata.
+// Optionally includes the stream_state (cursor) and call_state tokens; both
+// have to ride the pointer batch, since the worker reads them off the request
+// metadata and a token omitted here is simply absent from the request.
 std::vector<uint8_t> SerializePointerBatch(const std::shared_ptr<arrow::Schema> &schema,
                                              const std::string &location_url,
-                                             const std::string &stream_state_token = "");
+                                             const std::string &stream_state_token = "",
+                                             const std::string &call_state_token = "");
 
 } // namespace vgi
 } // namespace duckdb

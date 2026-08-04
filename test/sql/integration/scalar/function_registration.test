@@ -25,7 +25,7 @@ SELECT COUNT(*)
 FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'scalar';
 ----
-51
+52
 
 query T
 SELECT function_name
@@ -55,6 +55,7 @@ geo_centroid_struct
 geo_distance_fixed
 geo_distance_list
 geo_distance_struct
+global_scalar
 hash_rounds
 hash_seed
 multiply
@@ -394,7 +395,7 @@ SELECT COUNT(*)
 FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'scalar' AND varargs IS NULL;
 ----
-45
+46
 
 # ============================================================================
 # Stability
@@ -418,7 +419,7 @@ SELECT COUNT(*)
 FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'scalar' AND stability = 'CONSISTENT';
 ----
-48
+49
 
 query T
 SELECT function_name

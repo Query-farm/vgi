@@ -42,6 +42,13 @@ constexpr const char *RPC_REQUEST_ID_KEY = "vgi_rpc.request_id";
 
 // HTTP streaming state token metadata key
 constexpr const char *RPC_STREAM_STATE_KEY = "vgi_rpc.stream_state#b64";
+// The stream's *call state* -- the half of a stream's state that is fixed for
+// the life of the call (the init request, the resolved schemas). The worker
+// mints it once on /init and never re-issues it; the client holds it and
+// echoes it on every subsequent request so any worker can serve the turn
+// without prior knowledge of the stream. Only RPC_STREAM_STATE_KEY (the
+// cursor) comes back per turn.
+constexpr const char *RPC_CALL_STATE_KEY = "vgi_rpc.call_state#b64";
 
 // External location metadata key (pointer batch)
 constexpr const char *RPC_LOCATION_KEY = "vgi_rpc.location";

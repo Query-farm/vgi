@@ -180,6 +180,10 @@ std::vector<uint8_t> HttpFunctionConnection::SerializeBatchWithState(
 		meta_keys.push_back(RPC_STREAM_STATE_KEY);
 		meta_values.push_back(stream_state_token_);
 	}
+	if (!call_state_token_.empty()) {
+		meta_keys.push_back(RPC_CALL_STATE_KEY);
+		meta_values.push_back(call_state_token_);
+	}
 	if (tick_filter_state_) {
 		lock_guard<mutex> l(tick_filter_state_->lock);
 		if (tick_filter_state_->has_filters) {
@@ -222,6 +226,11 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ExtractStreamState(
 	int idx = metadata->FindKey(RPC_STREAM_STATE_KEY);
 	if (idx >= 0) {
 		stream_state_token_ = metadata->value(idx);
+	}
+	// Only /init carries this; keep the first one we see for the whole stream.
+	int call_idx = metadata->FindKey(RPC_CALL_STATE_KEY);
+	if (call_idx >= 0) {
+		call_state_token_ = metadata->value(call_idx);
 	}
 
 	return batch;
@@ -590,6 +599,9 @@ void HttpFunctionConnection::PerformFinalizeInit(const BindResult &bind_result) 
 	buffered_batches_.clear();
 	buffered_batch_index_ = 0;
 	stream_state_token_.clear();
+	// FINALIZE re-inits, which mints a fresh call token; the INPUT phase's
+	// would no longer match the cursor the new /init returns.
+	call_state_token_.clear();
 	pending_input_.reset();
 	input_writer_opened_ = false;
 	input_writer_closed_ = false;
@@ -883,7 +895,8 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 		auto urls = HttpRequestUploadUrls(context_, base_url_, 1, e_auth);
 		if (!urls.empty()) {
 			HttpPutBytes(context_, urls[0].upload_url, body, HttpEncoding::NONE);
-			body = SerializePointerBatch(input_schema_, urls[0].download_url, stream_state_token_);
+			body = SerializePointerBatch(input_schema_, urls[0].download_url, stream_state_token_,
+			                             call_state_token_);
 		}
 	}
 
@@ -1025,6 +1038,10 @@ void HttpFunctionConnection::CancelStream(const std::vector<uint8_t> &state_toke
 	auto metadata = arrow::KeyValueMetadata::Make(
 	    {RPC_STREAM_STATE_KEY, std::string(generated::VGI_RPC_CANCEL_KEY)},
 	    {token, "1"});
+	if (!call_state_token_.empty()) {
+		metadata = metadata->Merge(*arrow::KeyValueMetadata::Make(
+		    {RPC_CALL_STATE_KEY}, {call_state_token_}));
+	}
 	auto write_status = writer->WriteRecordBatch(*cancel_batch, metadata);
 	if (!write_status.ok()) {
 		return;
