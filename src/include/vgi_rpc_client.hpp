@@ -192,6 +192,24 @@ UnaryResponseResult ReadUnaryResponseFromBuffer(const uint8_t *data, size_t len,
                                                  const std::string &transaction_opaque_data_hex = "",
                                                  const std::string &conn_id_hex = "");
 
+// Dispatch every Arrow IPC stream concatenated in an error response body,
+// throwing on the first batch that carries error metadata.
+//
+// A STREAMING RPC answers with two concatenated IPC streams: a header stream
+// (execution_id / max_workers / opaque_data) and a data stream under the
+// function's own output schema. An IPC stream carries exactly one schema, so
+// the two cannot be merged. That means an error raised AFTER the header was
+// already written — a producer failing on its first next_batch — rides as
+// metadata on a batch in the SECOND stream, where a single-stream read never
+// looks. ReadUnaryResponseFromBuffer stops at the end of stream one, finds a
+// perfectly valid header, and returns without throwing.
+//
+// This walks the whole body so those errors surface with the worker's message
+// instead of a generic transport failure. Safe for a unary body too, which is
+// simply one stream.
+void DispatchErrorStreamsFromBuffer(const uint8_t *data, size_t len, ClientContext *context,
+                                    const std::string &url = "");
+
 // Move-in overload: adopts the response body string as the owning Arrow buffer
 // (arrow::Buffer::FromString) instead of allocating + memcpying a copy of the
 // whole payload. Prefer this whenever the caller owns the body and is done

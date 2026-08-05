@@ -18,6 +18,20 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 # Raises an exception after N batches for testing error propagation
 # ============================================================================
 
+# fail_after := 0 raises on the FIRST producer turn, i.e. during the init RPC and
+# AFTER the stream header has been written. Over HTTP that response body is two
+# concatenated Arrow IPC streams — a header stream (execution_id / max_workers /
+# opaque_data) and a data stream under the function's own output schema — because
+# an IPC stream carries exactly one schema. The error therefore rides as metadata
+# on a batch in the SECOND stream. A client that reads only the first stream sees
+# a perfectly valid header, finds no error, and reports a generic transport
+# failure instead of this message. The other two cases below raise on a LATER
+# turn, which takes a different (single-stream) path and never exercised it.
+statement error
+SELECT * FROM example.generator_exception(0);
+----
+Intentional failure after 0 batches
+
 statement error
 SELECT * FROM example.generator_exception(2);
 ----

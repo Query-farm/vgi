@@ -506,10 +506,14 @@ static std::string HttpPostArrowIpcInternal(ClientContext &context,
 	    out_response->GetHeaderValue("X-VGI-RPC-Error") == "true") {
 		auto &error_body = post.buffer_out;
 		if (!error_body.empty()) {
-			// ReadUnaryResponseFromBuffer dispatches the error batch which
-			// calls HandleBatchLogMessage → ThrowVgiIOException with the
-			// worker's original error message.
-			ReadUnaryResponseFromBuffer(
+			// Walk EVERY concatenated IPC stream in the body, not just the
+			// first. A streaming RPC replies with a header stream plus a data
+			// stream, so a producer that raises on its first next_batch puts
+			// the error in stream two; reading only stream one finds a valid
+			// header, returns without throwing, and loses the message to the
+			// generic throw below. DispatchErrorStreamsFromBuffer dispatches
+			// the error batch, which throws with the worker's own message.
+			DispatchErrorStreamsFromBuffer(
 			    reinterpret_cast<const uint8_t *>(error_body.data()),
 			    error_body.size(), nullptr, url);
 		}

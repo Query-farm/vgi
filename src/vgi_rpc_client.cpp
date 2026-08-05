@@ -465,6 +465,40 @@ static UnaryResponseResult ReadUnaryResponseFromOwnedBuffer(
 	return result;
 }
 
+void DispatchErrorStreamsFromBuffer(const uint8_t *data, size_t len, ClientContext *context,
+                                    const std::string &url) {
+	int64_t offset = 0;
+	const auto total = static_cast<int64_t>(len);
+	while (offset < total) {
+		auto buffer = CopyToOwnedBuffer(data + offset, static_cast<size_t>(total - offset));
+		auto input = std::make_shared<arrow::io::BufferReader>(buffer);
+		auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(input);
+		if (!reader_result.ok()) {
+			// Trailing bytes that are not an IPC stream: nothing more to find.
+			return;
+		}
+		auto reader = reader_result.ValueUnsafe();
+		while (true) {
+			auto next = reader->ReadNext();
+			if (!next.ok()) {
+				break;
+			}
+			auto batch_with_metadata = next.ValueUnsafe();
+			if (!batch_with_metadata.batch) {
+				break; // end of this stream
+			}
+			// Throws when the batch carries error metadata — the whole point.
+			DispatchBatch(batch_with_metadata.batch, batch_with_metadata.custom_metadata, context,
+			              url, -1);
+		}
+		auto pos = input->Tell();
+		if (!pos.ok() || pos.ValueUnsafe() <= 0) {
+			return; // cannot advance; avoid spinning on the same bytes
+		}
+		offset += pos.ValueUnsafe();
+	}
+}
+
 UnaryResponseResult ReadUnaryResponseFromBuffer(const uint8_t *data, size_t len,
                                                  ClientContext *context,
                                                  const std::string &url,
