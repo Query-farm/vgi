@@ -10,11 +10,11 @@
 namespace duckdb {
 namespace vgi {
 
-// Cap on the maximum decompressed size we accept, in bytes.  Same value used
-// historically for zstd in ``vgi_http_client.cpp``: 1 GiB is generous for any
-// realistic VGI RPC response and tight enough to defeat decompression bombs
-// (where a tiny compressed body claims an exabyte of output to OOM the host).
-static constexpr size_t kMaxDecompressedBytes = 1ULL << 30;  // 1 GiB
+// The cap on decompressed output now travels as a parameter so the VGI RPC
+// path can raise it via ``vgi_http_max_decompressed_bytes`` while callers
+// fetching from arbitrary remotes keep the conservative default.  The default
+// itself lives in the header (``kDefaultMaxDecompressedBytes``) because it is
+// part of the contract callers opt out of.
 
 static constexpr int kDefaultZstdLevel = 3;
 // miniz uses MZ_DEFAULT_LEVEL == 6 for deflate; we mirror it explicitly so
@@ -69,7 +69,7 @@ duckdb_zstd::ZSTD_DCtx *GetThreadZstdDCtx() {
 
 } // namespace
 
-static std::string ZstdDecompress(const char *data, size_t size) {
+static std::string ZstdDecompress(const char *data, size_t size, size_t max_bytes) {
 	using namespace duckdb_zstd;
 	auto frame_size = ZSTD_getFrameContentSize(data, size);
 	if (frame_size == ZSTD_CONTENTSIZE_ERROR) {
@@ -77,11 +77,11 @@ static std::string ZstdDecompress(const char *data, size_t size) {
 	}
 
 	if (frame_size != ZSTD_CONTENTSIZE_UNKNOWN) {
-		if (frame_size > kMaxDecompressedBytes) {
+		if (frame_size > max_bytes) {
 			throw IOException(
 			    "VGI zstd decompression rejected: declared frame size %llu bytes exceeds %llu byte cap",
 			    static_cast<unsigned long long>(frame_size),
-			    static_cast<unsigned long long>(kMaxDecompressedBytes));
+			    static_cast<unsigned long long>(max_bytes));
 		}
 		std::string decompressed(frame_size, '\0');
 		auto *dctx = GetThreadZstdDCtx();
@@ -114,11 +114,11 @@ static std::string ZstdDecompress(const char *data, size_t size) {
 			ZSTD_freeDStream(dstream);
 			throw IOException("VGI zstd decompression failed: %s", ZSTD_getErrorName(result));
 		}
-		if (output.size() + output_buf.pos > kMaxDecompressedBytes) {
+		if (output.size() + output_buf.pos > max_bytes) {
 			ZSTD_freeDStream(dstream);
 			throw IOException(
 			    "VGI zstd decompression rejected: streamed output exceeded %llu byte cap",
-			    static_cast<unsigned long long>(kMaxDecompressedBytes));
+			    static_cast<unsigned long long>(max_bytes));
 		}
 		output.append(tmp.data(), output_buf.pos);
 	}
@@ -214,7 +214,7 @@ static std::vector<uint8_t> GzipCompress(const uint8_t *data, size_t size, int l
 	return compressed;
 }
 
-static std::string GzipDecompress(const char *data, size_t size) {
+static std::string GzipDecompress(const char *data, size_t size, size_t max_bytes) {
 	using namespace duckdb_miniz;
 	if (size < kGzipHeaderSize + kGzipFooterSize) {
 		throw IOException("VGI gzip decompression failed: input shorter than gzip frame");
@@ -263,11 +263,11 @@ static std::string GzipDecompress(const char *data, size_t size) {
 		auto status = mz_inflate(&stream, MZ_SYNC_FLUSH);
 		size_t produced = tmp.size() - stream.avail_out;
 		if (produced > 0) {
-			if (output.size() + produced > kMaxDecompressedBytes) {
+			if (output.size() + produced > max_bytes) {
 				mz_inflateEnd(&stream);
 				throw IOException(
 				    "VGI gzip decompression rejected: output exceeded %llu byte cap",
-				    static_cast<unsigned long long>(kMaxDecompressedBytes));
+				    static_cast<unsigned long long>(max_bytes));
 			}
 			output.append(reinterpret_cast<const char *>(tmp.data()), produced);
 		}
@@ -390,12 +390,17 @@ std::vector<uint8_t> Compress(HttpEncoding encoding, const uint8_t *data, size_t
 	}
 }
 
-std::string Decompress(HttpEncoding encoding, const char *data, size_t size) {
+std::string Decompress(HttpEncoding encoding, const char *data, size_t size, size_t max_bytes) {
+	// A zero cap would reject every body; treat it as "unset" and fall back
+	// to the default rather than failing in a way that looks like corruption.
+	if (max_bytes == 0) {
+		max_bytes = kDefaultMaxDecompressedBytes;
+	}
 	switch (encoding) {
 	case HttpEncoding::ZSTD:
-		return ZstdDecompress(data, size);
+		return ZstdDecompress(data, size, max_bytes);
 	case HttpEncoding::GZIP:
-		return GzipDecompress(data, size);
+		return GzipDecompress(data, size, max_bytes);
 	case HttpEncoding::NONE:
 		return std::string(data, size);
 	default:

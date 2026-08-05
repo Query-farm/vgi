@@ -34,11 +34,23 @@ const char *EncodingName(HttpEncoding encoding);
 // codec error.  ``NONE`` returns the input verbatim.
 std::vector<uint8_t> Compress(HttpEncoding encoding, const uint8_t *data, size_t size);
 
-// Decompress with the named codec, capping output bytes at the same 1 GiB
-// limit used for zstd today (decompression-bomb defence).  Throws
-// ``IOException`` on codec error or cap breach.  ``NONE`` returns the
-// input verbatim.
-std::string Decompress(HttpEncoding encoding, const char *data, size_t size);
+// Default cap on decompressed output, in bytes (decompression-bomb defence:
+// a tiny compressed body that claims an enormous output to OOM the host).
+// Deliberately finite rather than advisory -- but see
+// ``vgi_http_max_decompressed_bytes``, which raises it for VGI RPC responses
+// where the peer is a worker the user chose to attach.
+constexpr size_t kDefaultMaxDecompressedBytes = 1ULL << 30; // 1 GiB
+
+// Decompress with the named codec, capping output at ``max_bytes``.  Throws
+// ``IOException`` on codec error or cap breach.  ``NONE`` returns the input
+// verbatim (and is never capped -- an identity body is not amplified, so the
+// peer must actually send every byte it wants us to allocate).
+//
+// Callers fetching from an arbitrary remote (e.g. GitHub release assets)
+// should keep the default; only the VGI RPC path, whose peer is the attached
+// worker, passes a user-configured value.
+std::string Decompress(HttpEncoding encoding, const char *data, size_t size,
+                       size_t max_bytes = kDefaultMaxDecompressedBytes);
 
 } // namespace vgi
 } // namespace duckdb

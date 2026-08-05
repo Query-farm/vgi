@@ -1,6 +1,7 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "vgi_arrow_ipc.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cctype>
 #include <cerrno>
@@ -34,6 +35,22 @@
 
 namespace duckdb {
 namespace vgi {
+
+// Largest byte count handed to a single read()/write()/ReadFile()/_write().
+//
+// A batch whose serialized body exceeds 2 GiB used to fail on macOS with
+// "Read error: Invalid argument": Darwin's read(2)/write(2) reject a count
+// above INT_MAX with EINVAL rather than transferring a prefix. Linux instead
+// caps silently at 0x7ffff000 and returns a short count, which is why the
+// ceiling only ever showed up on macOS. Windows' _write takes an unsigned
+// int, so a count at or above 4 GiB truncates -- at exactly 4 GiB it
+// truncates to zero and the loop spins forever.
+//
+// Every one of these loops already handles a short transfer, so clamping is
+// purely a portability guard: it changes how many syscalls a large payload
+// costs, never how many bytes move. 1 GiB is far below every platform limit
+// and keeps the extra syscalls negligible (one per GiB).
+static constexpr int64_t kMaxIoChunkBytes = 1LL << 30; // 1 GiB
 
 // ============================================================================
 // Protocol State Metadata
@@ -250,8 +267,10 @@ arrow::Result<int64_t> FdInputStream::Read(int64_t nbytes, void *out) {
 	int64_t total_bytes_read = 0;
 
 	while (total_bytes_read < nbytes) {
+		// Clamped per-syscall count; see kMaxIoChunkBytes.
+		const int64_t chunk = std::min<int64_t>(nbytes - total_bytes_read, kMaxIoChunkBytes);
 #if VGI_POSIX_TRANSPORT
-		ssize_t bytes_read = read(fd_, buffer + total_bytes_read, nbytes - total_bytes_read);
+		ssize_t bytes_read = read(fd_, buffer + total_bytes_read, static_cast<size_t>(chunk));
 #else
 		// Windows: overlapped ReadFile so the engine thread blocks at 0% CPU and
 		// wakes the instant bytes arrive (poll()-equivalent), instead of
@@ -260,7 +279,7 @@ arrow::Result<int64_t> FdInputStream::Read(int64_t nbytes, void *out) {
 		// Cancellation: re-check context->interrupted every 250ms.
 		int bytes_read;
 		{
-			DWORD want = static_cast<DWORD>(nbytes - total_bytes_read);
+			DWORD want = static_cast<DWORD>(chunk);
 			DWORD got = 0;
 			HANDLE h = reinterpret_cast<HANDLE>(_get_osfhandle(fd_));
 			OVERLAPPED ov = {};
@@ -422,7 +441,9 @@ arrow::Status FdOutputStream::Write(const void *data, int64_t nbytes) {
 			    std::to_string(nbytes), " bytes written");
 		}
 
-		ssize_t written = write(fd_, bytes + total_written, nbytes - total_written);
+		// Clamped per-syscall count; see kMaxIoChunkBytes.
+		const int64_t chunk = std::min<int64_t>(nbytes - total_written, kMaxIoChunkBytes);
+		ssize_t written = write(fd_, bytes + total_written, static_cast<size_t>(chunk));
 		if (written < 0) {
 			if (errno == EINTR) {
 				continue;
@@ -438,8 +459,11 @@ arrow::Status FdOutputStream::Write(const void *data, int64_t nbytes) {
       // blocking _write loop suffices for the lockstep RPC. (A hung-worker write
       // timeout would need overlapped I/O — deferred; the read side is bounded.)
 	while (total_written < nbytes) {
-		int written =
-		    _write(fd_, bytes + total_written, static_cast<unsigned int>(nbytes - total_written));
+		// Clamped per-syscall count; see kMaxIoChunkBytes. Without this a
+		// count at or above 4 GiB truncates to zero in the unsigned int
+		// conversion and this loop never advances.
+		const int64_t chunk = std::min<int64_t>(nbytes - total_written, kMaxIoChunkBytes);
+		int written = _write(fd_, bytes + total_written, static_cast<unsigned int>(chunk));
 		if (written < 0) {
 			if (errno == EINTR) {
 				continue;

@@ -73,6 +73,21 @@ static void ApplyHttpTimeout(ClientContext &context, HTTPParams &params) {
 	}
 }
 
+// Helper: resolve the configurable cap on decompressed response bodies.
+// Only the VGI RPC path uses this — the peer is a worker the user explicitly
+// attached, so raising the bound is theirs to make. Fetches from arbitrary
+// remotes keep ``Decompress``'s conservative default.
+static size_t ResolveMaxDecompressedBytes(ClientContext &context) {
+	Value cap_val;
+	if (context.TryGetCurrentSetting("vgi_http_max_decompressed_bytes", cap_val) && !cap_val.IsNull()) {
+		auto cap = cap_val.GetValue<uint64_t>();
+		if (cap > 0) {
+			return static_cast<size_t>(cap);
+		}
+	}
+	return kDefaultMaxDecompressedBytes;
+}
+
 // Check whether ``url`` is an https origin — used to gate Secure cookies.
 static bool UrlIsHttps(const std::string &url) {
 	// Case-insensitive prefix match — HTTPUtil accepts both cases.
@@ -322,7 +337,8 @@ static std::string HttpPostArrowIpcInternal(ClientContext &context,
 		auto error_enc = ResolveResponseEncoding(*out_response);
 		if (!error_body.empty() && error_enc != HttpEncoding::NONE) {
 			try {
-				error_body = Decompress(error_enc, error_body.data(), error_body.size());
+				error_body = Decompress(error_enc, error_body.data(), error_body.size(),
+				                        ResolveMaxDecompressedBytes(context));
 			} catch (...) {
 				// Leave body as-is; the raw bytes will appear in the preview.
 			}
@@ -449,7 +465,8 @@ static std::string HttpPostArrowIpcInternal(ClientContext &context,
 	// so post.buffer_out here is still the compressed application body.
 	const size_t resp_wire_bytes = post.buffer_out.size();
 	if (resp_enc != HttpEncoding::NONE && !post.buffer_out.empty()) {
-		post.buffer_out = Decompress(resp_enc, post.buffer_out.data(), post.buffer_out.size());
+		post.buffer_out = Decompress(resp_enc, post.buffer_out.data(), post.buffer_out.size(),
+		                             ResolveMaxDecompressedBytes(context));
 	}
 	const size_t resp_decoded_bytes = post.buffer_out.size();
 
@@ -689,7 +706,7 @@ std::string HttpGetBytes(ClientContext &context, const std::string &url) {
 	// Decompress if the server indicates a codec we know.
 	auto get_enc = ResolveResponseEncoding(*response);
 	if (get_enc != HttpEncoding::NONE && !body.empty()) {
-		return Decompress(get_enc, body.data(), body.size());
+		return Decompress(get_enc, body.data(), body.size(), ResolveMaxDecompressedBytes(context));
 	}
 
 	return body;

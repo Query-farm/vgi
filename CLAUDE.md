@@ -871,6 +871,7 @@ transport in `src/query_farm_telemetry.cpp`. Full field reference: [docs/telemet
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
 | `vgi_http_timeout_seconds` | BIGINT | 300 | Timeout for HTTP requests (catalog, init, exchange). Generous because HTTP workers may do heavy server-side compute per request |
+| `vgi_http_max_decompressed_bytes` | UBIGINT | 1073741824 | Cap on the decompressed size of a single compressed HTTP response body (decompression-bomb defence). Applies only to zstd/gzip responses — an identity body is not amplified, so the peer must actually send every byte it wants allocated. Raise it when a worker legitimately returns batches over 1 GiB; the symptom is a batch that succeeds uncompressed and trips this cap when compressed. 0 restores the default |
 | `vgi_oauth_timeout_seconds` | BIGINT | 120 | Window for a human to complete device-code / browser OAuth. Further capped by the provider's `expires_in` |
 | `vgi_worker_pool_idle_limit_seconds` | BIGINT | 5 | Max idle time before pooled workers are removed |
 | `vgi_worker_pool_max` | BIGINT | 256 | Max workers in pool (0 = disabled) |
