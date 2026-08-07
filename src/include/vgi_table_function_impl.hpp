@@ -20,6 +20,7 @@
 #include "vgi_arrow_utils.hpp"
 #include "vgi_catalog_rpc.hpp"
 #include "vgi_function_connection.hpp"
+#include "vgi_global_functions.hpp" // VgiFunctionRegistrationTarget
 #include "vgi_ifunction_connection.hpp"
 #include "vgi_logging.hpp"
 #include "vgi_result_cache.hpp" // result-cache key/entry/capture types
@@ -40,43 +41,47 @@ namespace vgi {
 //! accessed in the bind function via input.info->Cast<VgiTableFunctionInfo>().
 class VgiTableFunctionInfo final : public TableFunctionInfo {
 public:
-	VgiTableFunctionInfo(Catalog &catalog, std::shared_ptr<VgiAttachParameters> attach_params,
-	                     std::vector<uint8_t> attach_opaque_data, VgiFunctionInfo function_info,
-	                     std::vector<std::string> setting_names)
-	    : catalog_(catalog), attach_params_(std::move(attach_params)), attach_opaque_data_(std::move(attach_opaque_data)),
-	      function_info_(std::move(function_info)), setting_names_(std::move(setting_names)) {
+	VgiTableFunctionInfo(VgiFunctionRegistrationTarget target, VgiFunctionInfo function_info)
+	    : target_(std::move(target)), function_info_(std::move(function_info)) {
 	}
 
 	~VgiTableFunctionInfo() override = default;
 
-	//! Catalog this function belongs to
-	Catalog &catalog() const {
-		return catalog_;
+	//! Where this function was registered + the connection state captured then.
+	//! For a globally-published function (`target().IsGlobal()`) the live state
+	//! is re-resolved at bind — see ResolveVgiFunctionBinding.
+	const VgiFunctionRegistrationTarget &target() const {
+		return target_;
+	}
+
+	//! Attach alias of the owning catalog.
+	const std::string &catalog_name() const {
+		return target_.catalog_name;
 	}
 
 	//! Attach parameters for this catalog
 	const std::shared_ptr<VgiAttachParameters> &attach_params() const {
-		return attach_params_;
+		return target_.attach_params;
 	}
 
 	//! Path to the VGI worker executable
 	const std::string &worker_path() const {
-		return attach_params_->worker_path();
+		return target_.attach_params->worker_path();
 	}
 
 	//! Attach ID for the catalog connection
 	const std::vector<uint8_t> &attach_opaque_data() const {
-		return attach_opaque_data_;
+		return target_.attach_opaque_data;
 	}
 
 	//! Whether to enable worker debug output
 	bool worker_debug() const {
-		return attach_params_->worker_debug();
+		return target_.attach_params->worker_debug();
 	}
 
 	//! Whether pooling is enabled for this function's workers
 	bool use_pool() const {
-		return attach_params_->use_pool();
+		return target_.attach_params->use_pool();
 	}
 
 	//! Full function metadata from the worker
@@ -86,15 +91,12 @@ public:
 
 	//! Names of settings registered by this catalog
 	const std::vector<std::string> &setting_names() const {
-		return setting_names_;
+		return target_.setting_names;
 	}
 
 private:
-	Catalog &catalog_;
-	std::shared_ptr<VgiAttachParameters> attach_params_;
-	std::vector<uint8_t> attach_opaque_data_;
+	VgiFunctionRegistrationTarget target_;
 	VgiFunctionInfo function_info_;
-	std::vector<std::string> setting_names_;
 };
 
 // ============================================================================

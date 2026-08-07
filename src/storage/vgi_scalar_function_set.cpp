@@ -15,6 +15,7 @@
 #include "storage/vgi_transaction.hpp"
 #include "vgi_arrow_utils.hpp"
 #include "vgi_catalog_rpc.hpp"
+#include "vgi_global_functions.hpp"
 #include "vgi_scalar_function_impl.hpp"
 #include "vgi_worker_pool.hpp"
 
@@ -23,6 +24,140 @@ namespace duckdb {
 VgiScalarFunctionSet::VgiScalarFunctionSet(Catalog &catalog, VgiSchemaEntry &schema)
     : VgiCatalogSet(catalog, &schema), schema_(schema) {
 }
+
+namespace vgi {
+
+ScalarFunctionSet BuildVgiScalarFunctionSet(ClientContext &context, const std::string &registered_name,
+                                            const std::vector<vgi::VgiFunctionInfo> &overloads,
+                                            const VgiFunctionRegistrationTarget &target,
+                                            vector<FunctionDescription> &descriptions) {
+	ScalarFunctionSet func_set(registered_name);
+
+	for (const auto &func_info : overloads) {
+		// Parse argument types, distinguishing positional from named arguments
+		// Named arguments have metadata "vgi_arg: named" in the Arrow schema
+		// Note: ScalarFunction doesn't support named_parameters like TableFunction does,
+		// so named arguments would need to be handled differently when execution is implemented
+		vgi::FunctionArgumentTypes arg_types;
+		if (func_info.arguments_schema) {
+			arg_types = vgi::ParseFunctionArgumentSchema(context, func_info.arguments_schema);
+		}
+
+		// Determine return type from output_schema (required, must have exactly 1 field)
+		if (!func_info.output_schema) {
+			throw InvalidInputException("Scalar function '%s' missing required output_schema", func_info.name);
+		}
+		if (func_info.output_schema->num_fields() != 1) {
+			throw InvalidInputException("Scalar function '%s' output_schema must have exactly 1 field, got %d",
+			                            func_info.name, func_info.output_schema->num_fields());
+		}
+
+		// Check if output type is marked as "any" type (dynamic output type)
+		auto output_field = func_info.output_schema->field(0);
+		bool is_any_output = false;
+		if (output_field->HasMetadata()) {
+			auto metadata = output_field->metadata();
+			auto type_idx = metadata->FindKey("vgi:any");
+			if (type_idx >= 0) {
+				is_any_output = true;
+			}
+			// Also check vgi_type metadata
+			type_idx = metadata->FindKey("vgi_type");
+			if (type_idx >= 0 && metadata->value(type_idx) == "any") {
+				is_any_output = true;
+			}
+		}
+
+		LogicalType return_type;
+		if (is_any_output) {
+			// Dynamic return type - use ANY
+			return_type = LogicalType::ANY;
+		} else {
+			// Static return type - convert from Arrow schema
+			ArrowSchemaWrapper c_schema;
+			ArrowTableSchema arrow_table;
+			vector<LogicalType> output_types;
+			vector<string> output_names;
+			vgi::ArrowSchemaToDuckDBTypes(context, func_info.output_schema, c_schema, arrow_table, output_types,
+			                              output_names);
+			return_type = output_types[0];
+		}
+
+		// Create the scalar function with positional arguments only
+		// DuckDB's ScalarFunction doesn't have built-in named parameter support
+		ScalarFunction scalar_func(arg_types.positional_types, return_type, vgi::VgiScalarFunctionExecute);
+
+		// Set stability from function metadata, defaulting to CONSISTENT
+		// to match the DuckDB default.
+		if (func_info.stability.has_value()) {
+			scalar_func.SetStability(func_info.stability.value());
+		} else {
+			scalar_func.SetStability(FunctionStability::CONSISTENT);
+		}
+
+		// Set null handling from function metadata (SPECIAL_HANDLING allows function to receive nulls)
+		if (func_info.null_handling.has_value()) {
+			scalar_func.null_handling = func_info.null_handling.value();
+		}
+
+		// Set varargs if this function accepts variable arguments
+		if (arg_types.has_varargs) {
+			scalar_func.varargs = arg_types.varargs_type;
+		}
+
+		// Create VgiScalarFunctionInfo with worker connection details
+		auto scalar_func_info = make_shared_ptr<VgiScalarFunctionInfo>();
+		scalar_func_info->attach_params = target.attach_params;
+		scalar_func_info->attach_opaque_data = target.attach_opaque_data;
+		scalar_func_info->catalog = target.catalog;
+		scalar_func_info->catalog_name = target.catalog_name;
+		scalar_func_info->global = target.IsGlobal();
+		// Dispatch always uses the worker's own name, never the (possibly
+		// prefixed) name the function is registered under.
+		scalar_func_info->function_name = func_info.name;
+		// The same function name may be registered in more than one schema
+		// of this catalog; the worker needs the pair to pick the right
+		// implementation, since the bare name is not unique.
+		scalar_func_info->schema_name = target.DispatchSchema(func_info);
+		scalar_func_info->output_schema = func_info.output_schema;
+		scalar_func_info->has_dynamic_return_type = is_any_output;
+		scalar_func_info->positional_is_const = arg_types.positional_is_const;
+		scalar_func_info->positional_names = arg_types.positional_names;
+		scalar_func_info->setting_names = target.setting_names;
+		scalar_func_info->required_secrets = func_info.required_secrets;
+
+		// Attach the function info, init callback, and bind callback
+		scalar_func.SetExtraFunctionInfo(scalar_func_info);
+		scalar_func.SetInitStateCallback(vgi::VgiScalarFunctionInitLocalState);
+		scalar_func.SetBindCallback(vgi::VgiScalarFunctionBind);
+
+		func_set.AddFunction(scalar_func);
+
+		// Create function description with full metadata
+		// Include both positional and named parameters so duckdb_functions() shows them correctly
+		FunctionDescription desc;
+		desc.parameter_types = arg_types.positional_types;
+		desc.parameter_names = arg_types.positional_names;
+
+		// Append named parameters to the description
+		for (const auto &[name, type] : arg_types.named_parameters) {
+			desc.parameter_types.push_back(type);
+			desc.parameter_names.push_back(name);
+		}
+		desc.description = func_info.description;
+		for (const auto &ex : func_info.examples) {
+			desc.examples.push_back(ex);
+		}
+		for (const auto &cat : func_info.categories) {
+			desc.categories.push_back(cat);
+		}
+		descriptions.push_back(std::move(desc));
+	}
+
+	return func_set;
+}
+
+} // namespace vgi
 
 void VgiScalarFunctionSet::LoadEntries(ClientContext &context, const std::lock_guard<std::mutex> &/*_load_lock*/) {
 	auto &vgi_catalog = catalog_.Cast<VgiCatalog>();
@@ -60,129 +195,20 @@ void VgiScalarFunctionSet::LoadEntries(ClientContext &context, const std::lock_g
 		functions_by_name[func_info.name].push_back(std::move(func_info));
 	}
 
+	// Registration target: this catalog's own schema.
+	vgi::VgiFunctionRegistrationTarget target;
+	target.catalog = &catalog_;
+	target.catalog_name = catalog_.GetName();
+	target.attach_params = attach_params;
+	target.attach_opaque_data = attach_result->attach_opaque_data;
+	target.setting_names = setting_names;
+	target.schema_name = schema_.name;
+
 	// Create function entries
 	for (const auto &pair : functions_by_name) {
-		ScalarFunctionSet func_set(pair.first);
-
 		// Collect function descriptions for all overloads
 		vector<FunctionDescription> descriptions;
-
-		for (const auto &func_info : pair.second) {
-			// Parse argument types, distinguishing positional from named arguments
-			// Named arguments have metadata "vgi_arg: named" in the Arrow schema
-			// Note: ScalarFunction doesn't support named_parameters like TableFunction does,
-			// so named arguments would need to be handled differently when execution is implemented
-			vgi::FunctionArgumentTypes arg_types;
-			if (func_info.arguments_schema) {
-				arg_types = vgi::ParseFunctionArgumentSchema(context, func_info.arguments_schema);
-			}
-
-			// Determine return type from output_schema (required, must have exactly 1 field)
-			if (!func_info.output_schema) {
-				throw InvalidInputException("Scalar function '%s' missing required output_schema", func_info.name);
-			}
-			if (func_info.output_schema->num_fields() != 1) {
-				throw InvalidInputException("Scalar function '%s' output_schema must have exactly 1 field, got %d",
-				                            func_info.name, func_info.output_schema->num_fields());
-			}
-
-			// Check if output type is marked as "any" type (dynamic output type)
-			auto output_field = func_info.output_schema->field(0);
-			bool is_any_output = false;
-			if (output_field->HasMetadata()) {
-				auto metadata = output_field->metadata();
-				auto type_idx = metadata->FindKey("vgi:any");
-				if (type_idx >= 0) {
-					is_any_output = true;
-				}
-				// Also check vgi_type metadata
-				type_idx = metadata->FindKey("vgi_type");
-				if (type_idx >= 0 && metadata->value(type_idx) == "any") {
-					is_any_output = true;
-				}
-			}
-
-			LogicalType return_type;
-			if (is_any_output) {
-				// Dynamic return type - use ANY
-				return_type = LogicalType::ANY;
-			} else {
-				// Static return type - convert from Arrow schema
-				ArrowSchemaWrapper c_schema;
-				ArrowTableSchema arrow_table;
-				vector<LogicalType> output_types;
-				vector<string> output_names;
-				vgi::ArrowSchemaToDuckDBTypes(context, func_info.output_schema, c_schema, arrow_table, output_types,
-				                              output_names);
-				return_type = output_types[0];
-			}
-
-			// Create the scalar function with positional arguments only
-			// DuckDB's ScalarFunction doesn't have built-in named parameter support
-			ScalarFunction scalar_func(arg_types.positional_types, return_type, vgi::VgiScalarFunctionExecute);
-
-			// Set stability from function metadata, defaulting to CONSISTENT
-			// to match the DuckDB default.
-			if (func_info.stability.has_value()) {
-				scalar_func.SetStability(func_info.stability.value());
-			} else {
-				scalar_func.SetStability(FunctionStability::CONSISTENT);
-			}
-
-			// Set null handling from function metadata (SPECIAL_HANDLING allows function to receive nulls)
-			if (func_info.null_handling.has_value()) {
-				scalar_func.null_handling = func_info.null_handling.value();
-			}
-
-			// Set varargs if this function accepts variable arguments
-			if (arg_types.has_varargs) {
-				scalar_func.varargs = arg_types.varargs_type;
-			}
-
-			// Create VgiScalarFunctionInfo with worker connection details
-			auto scalar_func_info = make_shared_ptr<VgiScalarFunctionInfo>();
-			scalar_func_info->attach_params = attach_params;
-			scalar_func_info->attach_opaque_data = attach_result->attach_opaque_data;
-			scalar_func_info->catalog = &catalog_;
-			scalar_func_info->function_name = func_info.name;
-			// The same function name may be registered in more than one schema
-			// of this catalog; the worker needs the pair to pick the right
-			// implementation, since the bare name is not unique.
-			scalar_func_info->schema_name = schema_.name;
-			scalar_func_info->output_schema = func_info.output_schema;
-			scalar_func_info->has_dynamic_return_type = is_any_output;
-			scalar_func_info->positional_is_const = arg_types.positional_is_const;
-			scalar_func_info->positional_names = arg_types.positional_names;
-			scalar_func_info->setting_names = setting_names;
-			scalar_func_info->required_secrets = func_info.required_secrets;
-
-			// Attach the function info, init callback, and bind callback
-			scalar_func.SetExtraFunctionInfo(scalar_func_info);
-			scalar_func.SetInitStateCallback(vgi::VgiScalarFunctionInitLocalState);
-			scalar_func.SetBindCallback(vgi::VgiScalarFunctionBind);
-
-			func_set.AddFunction(scalar_func);
-
-			// Create function description with full metadata
-			// Include both positional and named parameters so duckdb_functions() shows them correctly
-			FunctionDescription desc;
-			desc.parameter_types = arg_types.positional_types;
-			desc.parameter_names = arg_types.positional_names;
-
-			// Append named parameters to the description
-			for (const auto &[name, type] : arg_types.named_parameters) {
-				desc.parameter_types.push_back(type);
-				desc.parameter_names.push_back(name);
-			}
-			desc.description = func_info.description;
-			for (const auto &ex : func_info.examples) {
-				desc.examples.push_back(ex);
-			}
-			for (const auto &cat : func_info.categories) {
-				desc.categories.push_back(cat);
-			}
-			descriptions.push_back(std::move(desc));
-		}
+		auto func_set = vgi::BuildVgiScalarFunctionSet(context, pair.first, pair.second, target, descriptions);
 
 		// Create function info and entry
 		CreateScalarFunctionInfo info(func_set);

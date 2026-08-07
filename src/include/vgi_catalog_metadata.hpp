@@ -100,6 +100,11 @@ struct VgiAttachCatalogInfo {
 	std::string secret_ref;                     // Optional credential to pre-resolve via Orchard; empty = catch-all
 };
 
+// Defined further down in this header; CatalogAttachResult carries a vector of
+// them for the worker's globally-published functions. Forward-declared so the
+// discovery POD stays where it is in the file's reading order.
+struct VgiFunctionInfo;
+
 // Result of catalog_attach call
 struct CatalogAttachResult {
 	std::vector<uint8_t> attach_opaque_data;
@@ -115,6 +120,16 @@ struct CatalogAttachResult {
 	std::string comment;                          // Optional comment describing this catalog
 	std::map<std::string, std::string> tags;      // Optional key-value tags for this catalog
 	bool supports_column_statistics = false;      // Whether any tables provide column statistics
+	// Functions this catalog asks the client to ALSO publish into DuckDB's
+	// global function namespace (system.main), so they are callable unqualified.
+	// `name`/`schema_name` stay the real dispatch coordinates — the globally
+	// visible name is derived by applying `global_function_prefix`. Empty =
+	// this catalog publishes nothing globally. Protocol 1.3.0+; older workers
+	// omit the field. See docs/global_functions.md.
+	std::vector<VgiFunctionInfo> global_functions;
+	// Prefix applied to each global_functions entry to form its globally visible
+	// name (`<prefix>_<name>`). Empty = publish bare names.
+	std::string global_function_prefix;
 	// Concrete data version the worker resolved for this attach. Empty = worker
 	// has no version opinion. Surfaced via duckdb_databases().
 	std::string resolved_data_version;

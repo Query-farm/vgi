@@ -129,6 +129,7 @@ src/vgi_input_dedup.cpp
 src/vgi_result_cache_functions.cpp
 src/vgi_cached_replay_connection.cpp
 src/vgi_github.cpp
+src/vgi_global_functions.cpp
 src/vgi_github_functions.cpp
 src/vgi_wasm_async_pool.cpp
 src/vgi_table_statistics_function.cpp

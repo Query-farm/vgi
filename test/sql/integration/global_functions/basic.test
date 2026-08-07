@@ -1,0 +1,106 @@
+# name: test/sql/integration/global_functions/basic.test
+# description: Worker-declared functions published into DuckDB's global namespace (system.main)
+# group: [vgi_integration_global_functions]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS acme (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# The catalog advertises four global-registration probes (one per function
+# type) under the prefix `vgi_example`, so the published name is
+# <prefix>_<name> while name/schema_name stay the worker's dispatch key.
+query TTTTT
+SELECT global_name, catalog_name, function_name, schema_name, function_type
+FROM vgi_global_functions()
+ORDER BY global_name;
+----
+vgi_example_global_agg	acme	global_agg	main	aggregate
+vgi_example_global_buffered	acme	global_buffered	main	table_buffering
+vgi_example_global_scalar	acme	global_scalar	main	scalar
+vgi_example_global_table	acme	global_table	main	table
+
+# Every published entry is live while its catalog is attached.
+query I
+SELECT count(*) FROM vgi_global_functions() WHERE live;
+----
+4
+
+# ============================================================================
+# Each function type is callable UNQUALIFIED, with no catalog name.
+# Each probe tags its output with its own name, so these also prove the
+# globally-published name reached the function it was supposed to.
+# ============================================================================
+
+# scalar
+query T
+SELECT vgi_example_global_scalar(7);
+----
+global_scalar:7
+
+query T
+SELECT vgi_example_global_scalar(v) FROM (VALUES (1), (2)) t(v) ORDER BY 1;
+----
+global_scalar:1
+global_scalar:2
+
+# table
+query IT
+SELECT n, label FROM vgi_example_global_table() ORDER BY n;
+----
+0	global_table:0
+1	global_table:1
+2	global_table:2
+
+# aggregate
+query I
+SELECT vgi_example_global_agg(v) FROM (VALUES (1), (2), (3), (4)) t(v);
+----
+10
+
+query II
+SELECT g, vgi_example_global_agg(v)
+FROM (VALUES ('a', 1), ('a', 2), ('b', 5)) t(g, v)
+GROUP BY g ORDER BY g;
+----
+a	3
+b	5
+
+# table-buffering (Sink+Source operator)
+statement ok
+CREATE TABLE src AS SELECT * FROM (VALUES (1), (2), (3)) t(x);
+
+query I
+SELECT x FROM vgi_example_global_buffered((SELECT * FROM src)) ORDER BY x;
+----
+1
+2
+3
+
+# ============================================================================
+# The schema-qualified path keeps working — it is the name with guarantees.
+# Both routes reach the same worker implementation.
+# ============================================================================
+
+query T
+SELECT acme.main.global_scalar(7);
+----
+global_scalar:7
+
+query IT
+SELECT n, label FROM acme.main.global_table() ORDER BY n;
+----
+0	global_table:0
+1	global_table:1
+2	global_table:2
+
+# The globally-published name resolves in the system catalog, not the VGI one.
+query T
+SELECT database_name FROM duckdb_functions()
+WHERE function_name = 'vgi_example_global_scalar';
+----
+system

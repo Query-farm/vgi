@@ -72,9 +72,12 @@
 #include "vgi_function_docs.hpp"
 #include "vgi_http_compression.hpp" // kDefaultMaxDecompressedBytes
 #include "vgi_logging.hpp"
+#include "duckdb/parser/parsed_data/create_aggregate_function_info.hpp"
 #include "duckdb/parser/parsed_data/create_copy_function_info.hpp"
+#include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "vgi_aggregate_function_impl.hpp"
+#include "vgi_global_functions.hpp"
 #include "vgi_oauth.hpp"
 #include "vgi_profiling.hpp"
 #include "vgi_secret_storage.hpp"
@@ -1160,6 +1163,52 @@ public:
 		return out;
 	}
 
+	// ---- Global (system.main) function registry ------------------------------
+	// Tracks the functions VGI catalogs published into DuckDB's global function
+	// namespace via `CatalogAttachResult.global_functions`, so ATTACH can apply
+	// first-attach-wins and vgi_global_functions() can enumerate them. DuckDB
+	// has no API to unregister a function, so — like COPY formats — an entry
+	// here persists past DETACH (calling it then throws; see
+	// ResolveVgiGlobalBinding).
+	//
+	// Concurrency: the registry-check + system-catalog create + record sequence
+	// is performed under GlobalFunctionMutex() to close the TOCTOU between
+	// concurrent ATTACHes.
+	struct GlobalFunctionEntry {
+		std::string global_name;   // name registered into system.main (lowercased)
+		std::string catalog_name;  // owning attach alias (may later be detached)
+		std::string function_name; // worker-declared name (the dispatch key)
+		std::string schema_name;   // worker-declared schema (the dispatch key)
+		std::string function_type; // scalar | table | table_buffering | aggregate
+		std::string worker_path;
+	};
+
+	std::mutex &GlobalFunctionMutex() {
+		return global_function_mutex_;
+	}
+
+	// Caller must hold GlobalFunctionMutex(). key = lowercase global name.
+	const GlobalFunctionEntry *FindGlobalFunctionLocked(const std::string &global_name) const {
+		auto it = global_functions_.find(global_name);
+		return it != global_functions_.end() ? &it->second : nullptr;
+	}
+
+	// Caller must hold GlobalFunctionMutex().
+	void InsertGlobalFunctionLocked(GlobalFunctionEntry entry) {
+		auto key = entry.global_name;
+		global_functions_[key] = std::move(entry);
+	}
+
+	std::vector<GlobalFunctionEntry> AllGlobalFunctions() const {
+		std::lock_guard<std::mutex> lock(global_function_mutex_);
+		std::vector<GlobalFunctionEntry> out;
+		out.reserve(global_functions_.size());
+		for (auto &kv : global_functions_) {
+			out.push_back(kv.second);
+		}
+		return out;
+	}
+
 	// --- Companion catalog registry (lakehouse federation) ---------------
 	// Tracks catalogs the VGI layer attached on behalf of a catalog_attach
 	// `attach_catalogs` manifest, so we never clobber a non-companion catalog
@@ -1254,6 +1303,8 @@ private:
 	int64_t next_secret_offset_ = 100;
 	mutable std::mutex copy_format_mutex_;
 	std::map<std::string, CopyFormatEntry> copy_formats_;
+	mutable std::mutex global_function_mutex_;
+	std::map<std::string, GlobalFunctionEntry> global_functions_;
 
 	struct CompanionRecord {
 		std::string target; // canonical target key (raw manifest target string)
@@ -1304,6 +1355,199 @@ static void InjectCompanionSecret(ClientContext &context, const std::string &sec
 	for (const auto &e : kv->secret_map) {
 		if (options.options.find(e.first) == options.options.end()) {
 			options.options[e.first] = e.second;
+		}
+	}
+}
+
+// ============================================================================
+// Global (system.main) function publishing
+// ============================================================================
+
+// True when *anything* already owns `name` in the system catalog's function
+// namespace. DuckDB keeps scalar / aggregate / table functions and macros in
+// ONE per-schema CatalogSet, so a lookup under any of those types surfaces the
+// others — possibly as a type-mismatch error, which is equally "taken".
+static bool SystemFunctionNameTaken(ClientContext &context, Catalog &system_catalog, const std::string &name) {
+	static const CatalogType kFunctionTypes[] = {CatalogType::SCALAR_FUNCTION_ENTRY,
+	                                             CatalogType::AGGREGATE_FUNCTION_ENTRY,
+	                                             CatalogType::TABLE_FUNCTION_ENTRY, CatalogType::MACRO_ENTRY,
+	                                             CatalogType::TABLE_MACRO_ENTRY, CatalogType::PRAGMA_FUNCTION_ENTRY};
+	for (auto type : kFunctionTypes) {
+		try {
+			CatalogEntryRetriever retriever {context};
+			if (system_catalog.GetEntry(retriever, DEFAULT_SCHEMA, {type, name}, OnEntryNotFound::RETURN_NULL)) {
+				return true;
+			}
+		} catch (const std::exception &) {
+			// A type mismatch on an existing entry — the name is owned.
+			return true;
+		}
+	}
+	return false;
+}
+
+// Which of DuckDB's function namespaces a worker function type registers into.
+// Streaming Table and buffered TableBuffering share the table-function
+// namespace (the distinction is a bind-time dispatch detail).
+static std::string GlobalFunctionKindName(vgi::VgiFunctionType type) {
+	switch (type) {
+	case vgi::VgiFunctionType::Scalar:
+		return "scalar";
+	case vgi::VgiFunctionType::Aggregate:
+		return "aggregate";
+	case vgi::VgiFunctionType::Table:
+	case vgi::VgiFunctionType::TableBuffering:
+		return "table";
+	}
+	return "table";
+}
+
+// Publish `attach_result.global_functions` into system.main under
+// `<global_function_prefix>_<name>`. Best-effort: every failure path logs and
+// continues so a global-name collision can never fail the ATTACH.
+static void RegisterVgiGlobalFunctions(ClientContext &context, const std::string &catalog_alias,
+                                       const std::shared_ptr<vgi::VgiAttachParameters> &attach_params,
+                                       const vgi::CatalogAttachResult &attach_result) {
+	auto *vgi_ext = VgiStorageExtension::Find(*context.db);
+	if (!vgi_ext) {
+		return;
+	}
+	auto &system_catalog = Catalog::GetSystemCatalog(*context.db);
+	auto sys_txn = CatalogTransaction::GetSystemTransaction(*context.db);
+
+	std::vector<std::string> setting_names;
+	setting_names.reserve(attach_result.settings.size());
+	for (const auto &setting : attach_result.settings) {
+		setting_names.push_back(setting.name);
+	}
+
+	// The globally-published functions are NOT registered under a schema of the
+	// VGI catalog, so the target carries no Catalog& — the entry outlives DETACH
+	// and re-resolves the live catalog from `catalog_name` at every bind.
+	vgi::VgiFunctionRegistrationTarget target;
+	target.catalog = nullptr;
+	target.catalog_name = catalog_alias;
+	target.attach_params = attach_params;
+	target.attach_opaque_data = attach_result.attach_opaque_data;
+	target.setting_names = setting_names;
+	// Empty: each function dispatches on the schema the worker declared it in.
+	target.schema_name = std::string();
+
+	// Group overloads by the name users will type. std::map for a stable
+	// registration order (overload order is user-visible in dispatch).
+	struct GlobalGroup {
+		vgi::VgiFunctionType kind = vgi::VgiFunctionType::Scalar;
+		std::vector<vgi::VgiFunctionInfo> overloads;
+	};
+	std::map<std::string, GlobalGroup> groups;
+	for (const auto &func_info : attach_result.global_functions) {
+		const auto global_name = vgi::VgiGlobalFunctionName(attach_result.global_function_prefix, func_info.name);
+		auto it = groups.find(global_name);
+		if (it == groups.end()) {
+			GlobalGroup group;
+			group.kind = func_info.function_type;
+			group.overloads.push_back(func_info);
+			groups.emplace(global_name, std::move(group));
+			continue;
+		}
+		// DuckDB keeps one function namespace per schema, so a name can't be
+		// both (say) a scalar and a table function. Keep the first kind seen.
+		if (GlobalFunctionKindName(it->second.kind) != GlobalFunctionKindName(func_info.function_type)) {
+			VGI_LOG(context, "global_function.register",
+			        {{"catalog", catalog_alias},
+			         {"global_name", global_name},
+			         {"function", func_info.name},
+			         {"outcome", "skipped_kind_conflict"}});
+			continue;
+		}
+		it->second.overloads.push_back(func_info);
+	}
+
+	for (auto &group_pair : groups) {
+		const auto &global_name = group_pair.first;
+		auto &group = group_pair.second;
+		const auto kind = GlobalFunctionKindName(group.kind);
+
+		std::lock_guard<std::mutex> lock(vgi_ext->GlobalFunctionMutex());
+		if (auto *existing = vgi_ext->FindGlobalFunctionLocked(global_name)) {
+			// Same alias → a re-ATTACH: reuse the registration (its binds
+			// resolve the live catalog, so the connection state is already
+			// fresh). Different alias → first attach wins.
+			const bool same_owner = StringUtil::CIEquals(existing->catalog_name, catalog_alias);
+			VGI_LOG(context, "global_function.register",
+			        {{"catalog", catalog_alias},
+			         {"global_name", global_name},
+			         {"owner", existing->catalog_name},
+			         {"outcome", same_owner ? "reused" : "skipped_name_taken"}});
+			continue;
+		}
+
+		if (SystemFunctionNameTaken(context, system_catalog, global_name)) {
+			VGI_LOG(context, "global_function.register",
+			        {{"catalog", catalog_alias},
+			         {"global_name", global_name},
+			         {"outcome", "skipped_name_taken"}});
+			continue;
+		}
+
+		try {
+			vector<FunctionDescription> descriptions;
+			switch (group.kind) {
+			case vgi::VgiFunctionType::Scalar: {
+				auto func_set =
+				    vgi::BuildVgiScalarFunctionSet(context, global_name, group.overloads, target, descriptions);
+				CreateScalarFunctionInfo info(func_set);
+				info.schema = DEFAULT_SCHEMA;
+				info.internal = true;
+				info.descriptions = std::move(descriptions);
+				system_catalog.CreateFunction(sys_txn, info);
+				break;
+			}
+			case vgi::VgiFunctionType::Aggregate: {
+				auto func_set =
+				    vgi::BuildVgiAggregateFunctionSet(context, global_name, group.overloads, target, descriptions);
+				CreateAggregateFunctionInfo info(func_set);
+				info.schema = DEFAULT_SCHEMA;
+				info.internal = true;
+				info.descriptions = std::move(descriptions);
+				system_catalog.CreateFunction(sys_txn, info);
+				break;
+			}
+			default: {
+				auto func_set =
+				    vgi::BuildVgiTableFunctionSet(context, global_name, group.overloads, target, descriptions);
+				CreateTableFunctionInfo info(func_set);
+				info.schema = DEFAULT_SCHEMA;
+				info.internal = true;
+				info.descriptions = std::move(descriptions);
+				system_catalog.CreateFunction(sys_txn, info);
+				break;
+			}
+			}
+
+			VgiStorageExtension::GlobalFunctionEntry entry;
+			entry.global_name = global_name;
+			entry.catalog_name = catalog_alias;
+			entry.function_name = group.overloads.front().name;
+			entry.schema_name = group.overloads.front().schema_name;
+			entry.function_type = vgi::VgiFunctionTypeToString(group.kind);
+			entry.worker_path = attach_params ? attach_params->worker_path() : std::string();
+			vgi_ext->InsertGlobalFunctionLocked(std::move(entry));
+
+			VGI_LOG(context, "global_function.register",
+			        {{"catalog", catalog_alias},
+			         {"global_name", global_name},
+			         {"function", group.overloads.front().name},
+			         {"kind", kind},
+			         {"outcome", "registered"}});
+		} catch (const std::exception &e) {
+			// Publishing is advisory — never fail the ATTACH over it. The
+			// function stays reachable at its schema-qualified name.
+			VGI_LOG(context, "global_function.register",
+			        {{"catalog", catalog_alias},
+			         {"global_name", global_name},
+			         {"outcome", "error"},
+			         {"error_message", e.what()}});
 		}
 	}
 }
@@ -1487,6 +1731,11 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	// user's credentials to an arbitrary host. Data-file creds still resolve via
 	// the Orchard catch-all without this.
 	bool attach_companion_secrets = false;
+	// Opt out of publishing this catalog's advertised `global_functions` into
+	// DuckDB's global function namespace (system.main). Default on: publishing
+	// is best-effort (first-attach-wins, never clobbers an existing name) and
+	// the schema-qualified name always keeps working.
+	bool global_functions_enabled = true;
 	// Unknown-to-the-extension options are forwarded to the worker as
 	// attach-time options after validation against the catalog's declared
 	// AttachOptionSpec list (fetched via InvokeCatalogs when present).
@@ -1536,6 +1785,8 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 			attach_companions_enabled = value.DefaultCastAs(LogicalType::BOOLEAN).GetValue<bool>();
 		} else if (lower_name == "attach_companion_secrets") {
 			attach_companion_secrets = value.DefaultCastAs(LogicalType::BOOLEAN).GetValue<bool>();
+		} else if (lower_name == "global_functions") {
+			global_functions_enabled = value.DefaultCastAs(LogicalType::BOOLEAN).GetValue<bool>();
 		} else if (lower_name == "pool_max") {
 			pool_max_override = value.DefaultCastAs(LogicalType::BIGINT).GetValue<int64_t>();
 		} else if (lower_name == "pool_timeout") {
@@ -2330,6 +2581,22 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 		}
 	}
 
+	// Publish the functions this catalog asked us to put into DuckDB's global
+	// function namespace (system.main), so they are callable unqualified. See
+	// docs/global_functions.md.
+	//
+	// Registration is best-effort and advisory — it must never fail the ATTACH:
+	//   * FIRST ATTACH WINS. A global name already owned by a different catalog
+	//     (or by any other extension / built-in) is skipped and logged; the
+	//     function stays reachable at its schema-qualified path.
+	//   * Re-ATTACH of the same alias is idempotent — the existing registration
+	//     is reused, and its connection state refreshes because the bind
+	//     re-resolves the live catalog (ResolveVgiGlobalBinding).
+	//   * `global_functions false` opts the catalog out entirely.
+	if (global_functions_enabled && attach_result_ptr && !attach_result_ptr->global_functions.empty()) {
+		RegisterVgiGlobalFunctions(context, name, attach_params, *attach_result_ptr);
+	}
+
 	// Capture the companion manifest before attach_result_ptr is moved into the
 	// catalog below.
 	std::vector<vgi::VgiAttachCatalogInfo> companion_manifest;
@@ -3046,6 +3313,74 @@ static void VgiCopyFormatsScan(ClientContext &context, TableFunctionInput &data_
 	output.SetCardinality(count);
 }
 
+// ============================================================================
+// vgi_global_functions() — diagnostic: one row per function an attached VGI
+// catalog published into DuckDB's global function namespace (system.main).
+// `live` reports whether the owning catalog is still attached — a registration
+// persists past DETACH (DuckDB cannot unregister a function), and calling a
+// dead one throws telling the user to re-ATTACH.
+// ============================================================================
+
+struct VgiGlobalFunctionRow {
+	string global_name;
+	string catalog_name;
+	string function_name;
+	string schema_name;
+	string function_type;
+	string worker_path;
+	bool live = false;
+};
+
+struct VgiGlobalFunctionsData : public TableFunctionData {
+	vector<VgiGlobalFunctionRow> rows;
+	idx_t offset = 0;
+};
+
+static unique_ptr<FunctionData> VgiGlobalFunctionsBind(ClientContext &context, TableFunctionBindInput &input,
+                                                       vector<LogicalType> &return_types, vector<string> &names) {
+	names = {"global_name", "catalog_name", "function_name", "schema_name", "function_type", "worker_path", "live"};
+	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	                LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BOOLEAN};
+
+	auto data = make_uniq<VgiGlobalFunctionsData>();
+	auto *ext = VgiStorageExtension::Find(*context.db);
+	if (!ext) {
+		return std::move(data);
+	}
+	auto &db_manager = DatabaseManager::Get(context);
+	for (auto &entry : ext->AllGlobalFunctions()) {
+		VgiGlobalFunctionRow row;
+		row.global_name = entry.global_name;
+		row.catalog_name = entry.catalog_name;
+		row.function_name = entry.function_name;
+		row.schema_name = entry.schema_name;
+		row.function_type = entry.function_type;
+		row.worker_path = entry.worker_path;
+		auto db = db_manager.GetDatabase(context, entry.catalog_name);
+		row.live = db && dynamic_cast<VgiCatalog *>(&db->GetCatalog()) != nullptr;
+		data->rows.push_back(std::move(row));
+	}
+	return std::move(data);
+}
+
+static void VgiGlobalFunctionsScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &data = data_p.bind_data->CastNoConst<VgiGlobalFunctionsData>();
+	idx_t count = 0;
+	while (data.offset < data.rows.size() && count < STANDARD_VECTOR_SIZE) {
+		auto &r = data.rows[data.offset];
+		output.SetValue(0, count, Value(r.global_name));
+		output.SetValue(1, count, Value(r.catalog_name));
+		output.SetValue(2, count, Value(r.function_name));
+		output.SetValue(3, count, Value(r.schema_name));
+		output.SetValue(4, count, Value(r.function_type));
+		output.SetValue(5, count, Value(r.worker_path));
+		output.SetValue(6, count, Value::BOOLEAN(r.live));
+		data.offset++;
+		count++;
+	}
+	output.SetCardinality(count);
+}
+
 static void LoadInternal(ExtensionLoader &loader) {
 #if defined(__EMSCRIPTEN__) && VGI_ASYNC_INIT_ENABLED
 	// Pre-spawn a bounded pool of background workers at extension load. Required
@@ -3592,6 +3927,18 @@ static void LoadInternal(ExtensionLoader &loader) {
 		    "from the handler's argument metadata.",
 		    {}, {}, {"SELECT * FROM vgi_copy_formats();"}));
 		loader.RegisterFunction(std::move(copy_formats_info));
+
+		TableFunction global_functions_func("vgi_global_functions", {}, VgiGlobalFunctionsScan,
+		                                    VgiGlobalFunctionsBind);
+		CreateTableFunctionInfo global_functions_info(global_functions_func);
+		global_functions_info.descriptions.push_back(vgi::MakeFunctionDescription(
+		    "List the functions attached VGI catalogs published into DuckDB's global function namespace "
+		    "(system.main), one row per globally-visible name. 'global_name' is the name to call unqualified; "
+		    "'catalog_name' is the attach alias that owns it (first attach wins); 'live' is false once that "
+		    "catalog is DETACHed — the registration persists for the life of the process, but calling it then "
+		    "throws until the catalog is re-ATTACHed.",
+		    {}, {}, {"SELECT * FROM vgi_global_functions();"}));
+		loader.RegisterFunction(std::move(global_functions_info));
 
 		TableFunction providers_func("vgi_secret_providers", {}, VgiSecretProvidersScan, VgiSecretProvidersBind);
 		CreateTableFunctionInfo providers_info(providers_func);

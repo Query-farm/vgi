@@ -1,0 +1,123 @@
+# name: test/sql/integration/global_functions/lifecycle.test
+# description: Global-function registration policy — first attach wins, opt-out, DETACH liveness, re-ATTACH
+# group: [vgi_integration_global_functions]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+# ============================================================================
+# Opt-out: `global_functions false` publishes nothing for this catalog.
+# ============================================================================
+
+statement ok
+ATTACH 'example' AS quiet (TYPE vgi, LOCATION '${VGI_TEST_WORKER}', global_functions false);
+
+query I
+SELECT count(*) FROM vgi_global_functions();
+----
+0
+
+# The functions are still reachable at their schema-qualified names — the
+# global name is only ever an ergonomic alias.
+query T
+SELECT quiet.main.global_scalar(1);
+----
+global_scalar:1
+
+statement error
+SELECT vgi_example_global_scalar(1);
+----
+<REGEX>:.*vgi_example_global_scalar.*
+
+statement ok
+DETACH quiet;
+
+# ============================================================================
+# First attach wins: a second catalog advertising the same global names is
+# skipped, and its ATTACH still succeeds.
+# ============================================================================
+
+statement ok
+ATTACH 'example' AS owner (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+ATTACH 'example' AS later (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+query TT
+SELECT global_name, catalog_name FROM vgi_global_functions() ORDER BY global_name;
+----
+vgi_example_global_agg	owner
+vgi_example_global_buffered	owner
+vgi_example_global_scalar	owner
+vgi_example_global_table	owner
+
+# The skipped catalog is unaffected — its qualified names still work.
+query T
+SELECT later.main.global_scalar(3);
+----
+global_scalar:3
+
+statement ok
+DETACH later;
+
+# ============================================================================
+# DETACH: DuckDB has no API to unregister a function, so the registration
+# persists — but it goes not-live, and calling it says so instead of silently
+# reconnecting to a detached catalog.
+# ============================================================================
+
+statement ok
+DETACH owner;
+
+query TI
+SELECT catalog_name, count(*) FROM vgi_global_functions() WHERE NOT live GROUP BY 1;
+----
+owner	4
+
+statement error
+SELECT vgi_example_global_scalar(1);
+----
+<REGEX>:.*no longer attached.*re-ATTACH.*
+
+statement error
+SELECT * FROM vgi_example_global_table();
+----
+<REGEX>:.*no longer attached.*re-ATTACH.*
+
+statement error
+SELECT vgi_example_global_agg(v) FROM (VALUES (1)) t(v);
+----
+<REGEX>:.*no longer attached.*re-ATTACH.*
+
+# ============================================================================
+# Re-ATTACH under the same alias is idempotent: the existing registration is
+# reused and its connection state refreshes (binds resolve the live catalog).
+# ============================================================================
+
+statement ok
+ATTACH 'example' AS owner (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+query I
+SELECT count(*) FROM vgi_global_functions() WHERE live;
+----
+4
+
+query T
+SELECT vgi_example_global_scalar(9);
+----
+global_scalar:9
+
+query IT
+SELECT n, label FROM vgi_example_global_table() ORDER BY n;
+----
+0	global_table:0
+1	global_table:1
+2	global_table:2
+
+query I
+SELECT vgi_example_global_agg(v) FROM (VALUES (4), (5)) t(v);
+----
+9

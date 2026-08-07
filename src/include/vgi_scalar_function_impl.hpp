@@ -37,6 +37,14 @@ struct VgiScalarFunctionInfo : public ScalarFunctionInfo {
 	std::shared_ptr<vgi::VgiAttachParameters> attach_params;  // replaces worker_path, worker_debug, use_pool
 	std::vector<uint8_t> attach_opaque_data;
 	optional_ptr<Catalog> catalog;
+	// Attach alias of the owning catalog. Always set; for a globally-published
+	// function (registered into system.main, where `catalog` is null because the
+	// entry outlives DETACH) it is the key used to re-resolve the live catalog
+	// at bind time — see ResolveVgiGlobalBinding.
+	std::string catalog_name;
+	//! True when this registration lives in system.main rather than the VGI
+	//! catalog's own schema.
+	bool global = false;
 	std::string function_name;
 	// Catalog schema this function was registered into. The same name may exist
 	// in several schemas of one catalog, so it is carried into the bind request

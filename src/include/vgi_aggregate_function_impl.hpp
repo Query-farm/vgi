@@ -48,6 +48,14 @@ struct VgiAggregateFunctionInfo : public AggregateFunctionInfo {
 	std::shared_ptr<VgiAttachParameters> attach_params;
 	std::vector<uint8_t> attach_opaque_data;
 	optional_ptr<Catalog> catalog;
+	// Attach alias of the owning catalog. Always set; for a globally-published
+	// aggregate (registered into system.main, where `catalog` is null because
+	// the entry outlives DETACH) it is the key used to re-resolve the live
+	// catalog at bind time — see ResolveVgiGlobalBinding.
+	std::string catalog_name;
+	//! True when this registration lives in system.main rather than the VGI
+	//! catalog's own schema.
+	bool global = false;
 	std::string function_name;
 	// Catalog schema this aggregate was registered into. A function name is
 	// unique only within a schema, so every aggregate RPC carries it and the

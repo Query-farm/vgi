@@ -1824,6 +1824,19 @@ CatalogAttachResult ParseCatalogAttachResult(const std::shared_ptr<arrow::Record
 	// Parse column statistics capability flag (backward-compatible)
 	result.supports_column_statistics = row["supports_column_statistics"].value_or(false);
 
+	// Globally-published functions (protocol 1.3.0+). Each element is a
+	// serialized FunctionInfo; `schema_name`/`name` remain the dispatch
+	// coordinates. Backward-compatible: pre-1.3.0 workers omit the fields.
+	auto global_function_bytes = row["global_functions"].value_or(std::vector<std::vector<uint8_t>> {});
+	for (const auto &gf_bytes : global_function_bytes) {
+		auto gf_batch = DeserializeFromIpcBytes(gf_bytes);
+		if (!gf_batch || gf_batch->num_rows() == 0) {
+			throw IOException("Empty global-function FunctionInfo batch from worker: %s", worker_path);
+		}
+		result.global_functions.push_back(ParseFunctionInfo(gf_batch, 0, worker_path));
+	}
+	result.global_function_prefix = row["global_function_prefix"].value_or(std::string(""));
+
 	// Resolved versions (empty when the worker has no opinion or the request
 	// omitted a constraint)
 	result.resolved_data_version = row["resolved_data_version"].value_or(std::string(""));

@@ -379,6 +379,50 @@ run via `make test_iceberg` (INSTALLs the iceberg community extension, seeds a
 table with `COPY … TO (FORMAT iceberg)`, sets `VGI_TEST_ICEBERG`; skips cleanly
 in the bare suite). See [docs/companion_catalogs.md](docs/companion_catalogs.md).
 
+## Global Functions (system.main)
+
+An attached VGI catalog can ask the client to **also** publish selected functions into DuckDB's
+global function namespace (`system.main`), so they are callable unqualified — the way
+`ducklake_table_info` is reachable after `LOAD ducklake`, except published at ATTACH time.
+
+**Wire (protocol 1.3.0, additive).** `catalog_attach` returns `global_functions`
+(IPC-serialized `FunctionInfo`s) + `global_function_prefix`. `name`/`schema_name` stay the real
+**dispatch coordinates**; the visible name is `<prefix>_<name>`, applied client-side
+(`VgiGlobalFunctionName`). A pre-1.3.0 worker advertises nothing. All four kinds work: scalar,
+aggregate, table, table-buffering. Worker side requires each global to ALSO be schema-resident
+(bind dispatches on `(schema_name, name)`), enforced in vgi-python's `Catalog.__post_init__`.
+
+**Registration** (`RegisterVgiGlobalFunctions`, `vgi_extension.cpp`) creates one system-catalog
+entry per visible name, reusing the **shared function-set builders** the per-catalog path now
+also uses — `BuildVgiScalarFunctionSet` / `BuildVgiAggregateFunctionSet` /
+`BuildVgiTableFunctionSet` (declared in `vgi_global_functions.hpp`, implemented in the
+respective `storage/vgi_*_function_set.cpp`), parameterized by a
+`VgiFunctionRegistrationTarget`. Best-effort and advisory — it must NEVER fail the ATTACH:
+**first attach wins** (a name owned by another catalog / extension / built-in is skipped +
+logged; DuckDB keeps scalar/aggregate/table/macro in ONE per-schema `CatalogSet`, so
+`SystemFunctionNameTaken` probes every function catalog type), re-ATTACH of the same alias is
+idempotent, `global_functions false` opts out, and any build/create exception is logged and
+skipped. Events: `global_function.register` with `outcome` ∈
+`registered`/`reused`/`skipped_name_taken`/`skipped_kind_conflict`/`error`.
+
+**Post-DETACH liveness is the load-bearing design point.** DuckDB has no API to unregister a
+function, so a published entry outlives DETACH — a carrier holding a `Catalog&` captured at
+registration would dangle. A global registration therefore stores only the attach **alias**
+(`VgiFunctionRegistrationTarget::catalog_name`, `catalog == nullptr`) and every bind calls
+`ResolveVgiGlobalBinding` to re-read the live catalog's `attach_params` / `attach_opaque_data` /
+setting names. One mechanism, three behaviours: current state on every bind, transparent
+refresh on re-ATTACH, and a clear "no longer attached — re-ATTACH" `InvalidInputException`
+after DETACH (never a silent reconnect). Same helper (`ResolveVgiFunctionBinding`) serves
+catalog-scoped entries by returning what registration captured.
+
+**Files.** `src/include/vgi_global_functions.hpp`, `src/vgi_global_functions.cpp` (resolution +
+prefix), registration + `vgi_global_functions()` + the per-DB registry on the file-local
+`VgiStorageExtension` in `vgi_extension.cpp`, parse in `vgi_catalog_api.cpp`, builders in
+`src/storage/vgi_{scalar,aggregate,table}_function_set.cpp`. vgi-python: `Catalog.global_functions`
+in `vgi/catalog/descriptors.py`, fixtures `vgi/_test_fixtures/global_functions.py` (published as
+`vgi_example_global_*`). Tests: `test/sql/integration/global_functions/*`. See
+[docs/global_functions.md](docs/global_functions.md).
+
 ## Custom `COPY ... FROM` Formats
 
 An attached VGI catalog can advertise custom `COPY ... FROM` formats, turning a worker into
@@ -925,6 +969,7 @@ Catalogs may register additional settings at `ATTACH` time (e.g., `greeting`, `m
 | `secrets` | BOOLEAN | true | Auto-register the Orchard remote secret provider when the catalog advertises a secret-service URL. Set `false` to opt out for this catalog. See *Remote Secret Provider* |
 | `attach_companions` | BOOLEAN | true | Provision companion catalogs advertised via the catalog_attach `attach_catalogs` manifest (lakehouse federation). Set `false` to opt out. Guarded by a scheme allowlist + never-clobber conflict policy. See *Companion Catalogs* |
 | `attach_companion_secrets` | BOOLEAN | false | Opt IN to injecting a worker-named `secret_ref` credential into a companion's ATTACH options. Off by default: a worker chooses both the secret name and target host, so auto-injection would allow credential exfiltration. See *Companion Catalogs* |
+| `global_functions` | BOOLEAN | true | Publish the functions this catalog advertises via `catalog_attach.global_functions` into DuckDB's global function namespace (`system.main`), callable unqualified as `<prefix>_<name>`. Set `false` to opt out. Publishing is best-effort (first attach wins, never clobbers an existing name) and the schema-qualified name always keeps working. See *Global Functions (system.main)* |
 | `launcher_idle_timeout` | BIGINT seconds | (uses launcher default of 300) | Self-shutdown idle timeout for `launch:` LOCATIONs. Pinned per-LOCATION; conflicting subsequent ATTACHes throw `BinderException`. See [`docs/launcher-tutorial.md`](docs/launcher-tutorial.md). |
 | `launcher_state_dir` | VARCHAR (path) | OS-derived (`$XDG_RUNTIME_DIR/vgi-rpc/` etc.) | Override the launcher's state directory. Escape valve only — does NOT isolate workers from other DuckDB processes with the same `launch:` argv. See [`docs/launcher-options.md`](docs/launcher-options.md). |
 | `LOCATION` / `PATH` (struct form) | STRUCT | — | **Container LOCATIONs only.** `LOCATION` is dynamically typed: a VARCHAR is the plain address; a STRUCT bundles the address + container options — `{image (or location/path), runtime, connection, volumes, env, extra_args}` (`volumes`/`env` accept VARCHAR[] or comma-separated VARCHAR; `extra_args` VARCHAR is shell-tokenized, VARCHAR[] is verbatim). `connection` (`tcp`\|`http`\|`stdio`) selects a transparently-**shared** system-wide container (daemon rendezvous via deterministic `vgi-rpc-<hash>` name) vs the private per-process `stdio`; default auto from the image's `farm.query.vgi.transports` label (prefer tcp > http), else per-process. `tcp` (native vgi-rpc over a loopback-published port) and `http` are implemented; `unix` is rejected (AF_UNIX over docker bind mounts is unreliable). No separate options keyword, so nothing can shadow a worker attach option. See [`docs/container-transport.md`](docs/container-transport.md). |
@@ -965,6 +1010,7 @@ The `launch:` and `unix://` paths share one warm worker process across every Duc
 | `vgi_table_branches()` | Table | Diagnostic: one row per branch per VGI table across every attached VGI catalog. Columns: `catalog_name`, `schema_name`, `table_name`, `branch_index`, `function_name`, `positional_arguments` (JSON), `named_arguments` (JSON), `branch_filter`, `table_required_extensions` (LIST). Used to introspect multi-branch tables. See [docs/multi_branch.md](docs/multi_branch.md). |
 | `vgi_function_arguments()` | Table | Diagnostic: one row per (catalog, schema, function/macro, argument) across every attached VGI catalog. Covers scalar/table/aggregate **functions** and scalar/table **macros** (`function_type` is `scalar`/`table`/`aggregate` for functions, `scalar_macro`/`table_macro` for macros). Columns: `catalog_name`, `schema_name`, `function_name`, `function_type`, `arg_position` (NULL for named/varargs), `field_index`, `arg_name`, `arg_type`, `arg_description` (the `vgi_doc` field metadata; NULL when undocumented), `is_named`, `is_positional`, `is_const`, `is_varargs`, `is_table_input`, `is_any_type`. Surfaces per-argument detail that `duckdb_functions()` flattens away. Filter with `WHERE catalog_name = '...'`. Reports each catalog's current data version (no time travel). |
 | `vgi_copy_formats()` | Table | Diagnostic: one row per (catalog, format, direction, option) for every custom `COPY ... FROM`/`TO` format registered by attached VGI catalogs. Columns: `catalog_name`, `format_name` (alias-scoped — the exact `FORMAT` string to type), `direction` (`from`/`to`/`both`), `ordered` (BOOLEAN — TO single-thread/source-ordered sink), `format_description`, `format_comment`, `format_tags` (MAP), `handler`, `option_name`, `option_type`, `option_description`. See [docs/copy_from.md](docs/copy_from.md), [docs/copy_to.md](docs/copy_to.md) |
+| `vgi_global_functions()` | Table | Diagnostic: one row per function an attached VGI catalog published into DuckDB's global function namespace. Columns: `global_name` (the name to call unqualified), `catalog_name` (owning attach alias — first attach wins), `function_name`, `schema_name` (the worker's dispatch coordinates), `function_type`, `worker_path`, `live` (false once the owning catalog is DETACHed — the registration persists for the process lifetime but calling it then throws). See [docs/global_functions.md](docs/global_functions.md) |
 | `vgi_secret_providers()` | Table | Diagnostic: one row per auto-registered Orchard remote secret provider. Columns: `catalog_name`, `endpoint`, `tie_break_offset`, `active`, `cached_secrets`, `ttl_seconds`. See *Remote Secret Provider* |
 | `vgi_companion_catalogs()` | Table | Diagnostic: one row per companion catalog attached by VGI catalogs (lakehouse federation). Columns: `catalog_name` (alias), `target`, `db_type`, `hidden` (BOOLEAN — surfaces companions invisible to `duckdb_databases()`), `refcount` (how many attached VGI catalogs share it). See *Companion Catalogs* |
 | `vgi_secret_provider_flush(catalog := NULL)` | Table | Clear a provider's TTL cache (all providers when `catalog` omitted). Returns the count of positive secrets dropped |
@@ -1004,6 +1050,7 @@ The `launch:` and `unix://` paths share one warm worker process across every Duc
 | `vgi_logging.cpp` | `VgiLogType`, `VgiStderrLogEnabled()`, `VgiLogToStderr()` |
 | `vgi_catalogs.cpp` | `vgi_catalogs()` SQL function |
 | `vgi_clear_cache.cpp` | `vgi_clear_cache()` SQL function — clears all VGI catalog caches |
+| `vgi_global_functions.cpp` | Global (`system.main`) function publishing: prefix application (`VgiGlobalFunctionName`) + bind-time resolution of the live catalog behind a registration that outlives DETACH (`ResolveVgiGlobalBinding` / `ResolveVgiFunctionBinding`). Registration itself + `vgi_global_functions()` live in `vgi_extension.cpp`; the function-set builders live in the `storage/vgi_*_function_set.cpp` files. See *Global Functions (system.main)* |
 | `vgi_table_branches_function.cpp` | `vgi_table_branches()` SQL diagnostic — one row per branch per VGI table across every attached VGI catalog |
 | `vgi_function_arguments_function.cpp` | `vgi_function_arguments()` SQL diagnostic — one row per function/macro argument across every attached VGI catalog (named/positional/const/varargs/type + `vgi_doc` description; macros surface as scalar_macro/table_macro) |
 | `vgi_copy_from_impl.cpp` | Custom `COPY ... FROM` format support: `VgiCopyFromFunctionInfo` carrier (self-contained, no `Catalog&` — outlives DETACH), `VgiCopyFromBind` (option validation/coercion + bind + hard schema check), and `MakeVgiCopyFromTableFunction` (reuses the producer-mode table-function scan). Attach-time registration + the `vgi_copy_formats()` diagnostic live in `vgi_extension.cpp` (per-DB format registry on `VgiStorageExtension`). See [docs/copy_from.md](docs/copy_from.md) |
@@ -1037,6 +1084,7 @@ The `launch:` and `unix://` paths share one warm worker process across every Duc
 | `vgi_catalog_metadata.hpp` | Discovery POD types (`VgiTableInfo`, `VgiFunctionInfo`, …) + `Parse*` (Arrow forward-declared) |
 | `vgi_catalog_rpc.hpp` | `InvokeCatalog*()` / DDL / stats / secret helpers (Arrow IPC carrier) |
 | `vgi_function_connection.hpp` | `FunctionConnection` class, `FunctionConnectionParams`, `AcquireAndBindConnection()` |
+| `vgi_global_functions.hpp` | `VgiFunctionRegistrationTarget` (catalog-scoped vs global registration + the connection state its binds use), `VgiGlobalBinding`, `Resolve*Binding`, and the shared `BuildVgi{Scalar,Aggregate,Table}FunctionSet` builders |
 | `vgi_rpc_client.hpp` | `WriteRpcRequest()`, `ReadUnaryResponse()`, `ReadStreamHeader()`, `RpcBatchType` |
 | `vgi_subprocess.hpp` | `SubProcess`, `Pipe`, `WaitForReadable()`, `GetCatalogTimeout()` |
 | `vgi_worker_pool.hpp` | `PooledWorker`, `VgiWorkerPool` singleton |

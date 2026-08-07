@@ -4,6 +4,7 @@
 #include "vgi_arrow_utils.hpp"
 #include "vgi_catalog_rpc.hpp"
 #include "vgi_exception.hpp"
+#include "vgi_global_functions.hpp" // ResolveVgiGlobalBinding (system.main registrations)
 #include "vgi_http_client.hpp"
 #include "vgi_logging.hpp"
 #include "vgi_rpc_client.hpp"
@@ -689,7 +690,23 @@ void VgiAggregateDestroy(Vector &state_vector, AggregateInputData &aggr_input_da
 
 unique_ptr<FunctionData> VgiAggregateFunctionBind(ClientContext &context, AggregateFunction &function,
                                                    vector<unique_ptr<Expression>> &arguments) {
-	auto &func_info = function.function_info->Cast<VgiAggregateFunctionInfo>();
+	auto &registered_info = function.function_info->Cast<VgiAggregateFunctionInfo>();
+
+	// A function published into system.main outlives DETACH (DuckDB has no way
+	// to unregister one), so its connection state is resolved from the live
+	// catalog here rather than trusted from registration time: a re-ATTACH
+	// refreshes it transparently, and a DETACHed catalog throws a clear error.
+	shared_ptr<VgiAggregateFunctionInfo> live_info;
+	if (registered_info.global) {
+		auto binding = ResolveVgiGlobalBinding(context, registered_info.catalog_name, function.name);
+		live_info = make_shared_ptr<VgiAggregateFunctionInfo>(registered_info);
+		live_info->attach_params = binding.attach_params;
+		live_info->attach_opaque_data = binding.attach_opaque_data;
+		live_info->catalog = binding.catalog;
+		live_info->setting_names = binding.setting_names;
+	}
+	const auto &func_info = live_info ? *live_info : registered_info;
+
 	auto settings = ExtractVgiSettings(context, func_info.setting_names);
 
 	// ========================================================================

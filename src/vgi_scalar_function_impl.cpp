@@ -5,6 +5,7 @@
 #include "vgi_client_timing.hpp"
 #include "vgi_exchange_cache_key.hpp" // per-value memo: static key + per-tuple hash + store
 #include "vgi_function_connection.hpp"
+#include "vgi_global_functions.hpp" // ResolveVgiGlobalBinding (system.main registrations)
 #include "vgi_ifunction_connection.hpp"
 #include "vgi_input_dedup.hpp" // input dedup (ship only distinct tuples; scatter back)
 #include "vgi_logging.hpp"
@@ -103,7 +104,22 @@ unique_ptr<FunctionData> VgiScalarFunctionBind(ClientContext &context, ScalarFun
 	if (!bound_function.HasExtraFunctionInfo()) {
 		throw InternalException("VgiScalarFunctionBind: missing VgiScalarFunctionInfo");
 	}
-	auto &func_info = bound_function.GetExtraFunctionInfo().Cast<VgiScalarFunctionInfo>();
+	auto &registered_info = bound_function.GetExtraFunctionInfo().Cast<VgiScalarFunctionInfo>();
+
+	// A function published into system.main outlives DETACH (DuckDB has no way
+	// to unregister one), so its connection state is resolved from the live
+	// catalog here rather than trusted from registration time: a re-ATTACH
+	// refreshes it transparently, and a DETACHed catalog throws a clear error.
+	shared_ptr<VgiScalarFunctionInfo> live_info;
+	if (registered_info.global) {
+		auto binding = ResolveVgiGlobalBinding(context, registered_info.catalog_name, bound_function.name);
+		live_info = make_shared_ptr<VgiScalarFunctionInfo>(registered_info);
+		live_info->attach_params = binding.attach_params;
+		live_info->attach_opaque_data = binding.attach_opaque_data;
+		live_info->catalog = binding.catalog;
+		live_info->setting_names = binding.setting_names;
+	}
+	const auto &func_info = live_info ? *live_info : registered_info;
 
 	// Extract settings from context using setting_names registered during catalog load
 	auto settings = ExtractVgiSettings(context, func_info.setting_names);
@@ -235,8 +251,9 @@ unique_ptr<FunctionData> VgiScalarFunctionBind(ClientContext &context, ScalarFun
 		output_schema = func_info.output_schema;
 	} else {
 		// Initial bind - call worker to get output schema
-		auto transaction_opaque_data = func_info.catalog
-		    ? VgiTransaction::Get(context, *func_info.catalog).GetTransactionOpaqueData()
+		auto bind_catalog = func_info.catalog;
+		auto transaction_opaque_data = bind_catalog
+		    ? VgiTransaction::Get(context, *bind_catalog).GetTransactionOpaqueData()
 		    : std::vector<uint8_t>{};
 		std::unique_ptr<IFunctionConnection> connection;
 		if (func_info.use_pool() && !IsHttpTransport(func_info.worker_path())) {
