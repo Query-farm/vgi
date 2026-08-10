@@ -1702,6 +1702,10 @@ VgiAttachOptionSpec ParseAttachOptionSpec(const std::vector<uint8_t> &bytes, con
 		spec.default_value = Value(spec.type);
 	}
 
+	// Added after the original four columns: a worker that predates it simply
+	// doesn't send the column, and value_or() reads that as "not required".
+	spec.required = row["required"].value_or(false);
+
 	return spec;
 }
 

@@ -68,6 +68,7 @@ static unique_ptr<FunctionData> VgiCatalogsBind(ClientContext &context, TableFun
 	option_fields.emplace_back("description", LogicalType::VARCHAR);
 	option_fields.emplace_back("type", LogicalType::VARCHAR);
 	option_fields.emplace_back("default_value", LogicalType::VARCHAR);
+	option_fields.emplace_back("required", LogicalType::BOOLEAN);
 	return_types.push_back(LogicalType::LIST(LogicalType::STRUCT(std::move(option_fields))));
 	names.push_back("attach_options");
 
@@ -123,6 +124,7 @@ static void VgiCatalogsScan(ClientContext &context, TableFunctionInput &input, D
 		struct_child_types.emplace_back("description", LogicalType::VARCHAR);
 		struct_child_types.emplace_back("type", LogicalType::VARCHAR);
 		struct_child_types.emplace_back("default_value", LogicalType::VARCHAR);
+		struct_child_types.emplace_back("required", LogicalType::BOOLEAN);
 		auto struct_type = LogicalType::STRUCT(struct_child_types);
 
 		std::vector<Value> option_values;
@@ -135,6 +137,7 @@ static void VgiCatalogsScan(ClientContext &context, TableFunctionInput &input, D
 			struct_values.emplace_back("default_value",
 			                           spec.default_value.IsNull() ? Value(LogicalType::VARCHAR)
 			                                                       : Value(spec.default_value.ToString()));
+			struct_values.emplace_back("required", Value::BOOLEAN(spec.required));
 			option_values.push_back(Value::STRUCT(std::move(struct_values)));
 		}
 		output.data[3].SetValue(count, Value::LIST(struct_type, std::move(option_values)));

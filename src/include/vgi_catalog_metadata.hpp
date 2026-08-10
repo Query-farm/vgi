@@ -61,6 +61,11 @@ struct VgiAttachOptionSpec {
 	std::string description;
 	LogicalType type;
 	Value default_value;
+	// The caller must supply this option at ATTACH time. Mutually exclusive
+	// with a default: an option that falls back to a value is always
+	// satisfiable without the caller. Absent from a worker that predates the
+	// field, which reads as false.
+	bool required = false;
 };
 
 // A parameter definition for a VGI secret type
