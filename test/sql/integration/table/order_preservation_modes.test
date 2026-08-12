@@ -42,8 +42,13 @@ CALL enable_logging(level := 'debug');
 # conn even though DuckDB *did* schedule N parallel tasks.
 #
 # Run a throwaway parallel scan up front so the pool retains warm workers
-# for the assertion-bearing scans below. Without this, the test is racy on
-# any subprocess transport.
+# for the scans below. Without this, the test is racy on any subprocess
+# transport.
+#
+# Kept even though the "≥2 distinct conn=" assertions it was added for are
+# gone: warm workers are what make the FIXED_ORDER "= 1" assertion mean
+# something. On a cold pool that check passes for the wrong reason — one
+# conn because nothing else was ready, not because the planner serialised.
 statement ok
 SELECT COUNT(*) FROM example.partitioned_preserves_order(100000);
 
@@ -83,8 +88,20 @@ FROM example.partitioned_preserves_order(100000);
 ----
 100000	4999950000
 
+# Deliberately NOT asserted: ">= 2 distinct conn=" here.
+#
+# This mode *lets* the planner parallelise; it does not oblige it to, so a run
+# that happens to serialise is conforming and the assertion was testing the
+# scheduler's mood rather than order_preservation_type. It needs every one of
+# N workers to be warm and to win a task before the primary drains the queue —
+# which the warmup above makes likely, not certain. It went red on
+# macos-latest/launch while all five other lanes passed.
+#
+# The discriminating signal is the FIXED_ORDER "= 1" above: that one holds no
+# matter how many threads DuckDB has, because Pipeline::IsOrderDependent()
+# forces serialisation. Asserting the converse only ever added flake.
 query I
-SELECT COUNT(DISTINCT regexp_extract(message, 'conn=([0-9a-f]+)', 1)) >= 2
+SELECT COUNT(DISTINCT regexp_extract(message, 'conn=([0-9a-f]+)', 1)) >= 1
 FROM duckdb_logs()
 WHERE type = 'VGI' AND message LIKE '%batch_received%';
 ----
@@ -103,8 +120,20 @@ FROM example.partitioned_no_order_guarantee(100000);
 ----
 100000	4999950000
 
+# Deliberately NOT asserted: ">= 2 distinct conn=" here.
+#
+# This mode *lets* the planner parallelise; it does not oblige it to, so a run
+# that happens to serialise is conforming and the assertion was testing the
+# scheduler's mood rather than order_preservation_type. It needs every one of
+# N workers to be warm and to win a task before the primary drains the queue —
+# which the warmup above makes likely, not certain. It went red on
+# macos-latest/launch while all five other lanes passed.
+#
+# The discriminating signal is the FIXED_ORDER "= 1" above: that one holds no
+# matter how many threads DuckDB has, because Pipeline::IsOrderDependent()
+# forces serialisation. Asserting the converse only ever added flake.
 query I
-SELECT COUNT(DISTINCT regexp_extract(message, 'conn=([0-9a-f]+)', 1)) >= 2
+SELECT COUNT(DISTINCT regexp_extract(message, 'conn=([0-9a-f]+)', 1)) >= 1
 FROM duckdb_logs()
 WHERE type = 'VGI' AND message LIKE '%batch_received%';
 ----
