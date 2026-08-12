@@ -1,0 +1,36 @@
+# name: test/sql/vgi_batch_index_fallback.test
+# description: A worker declaring requires_input_batch_index must work over a source that cannot supply one.
+# group: [vgi]
+
+require vgi
+
+statement ok
+ATTACH 'mr' AS mr (TYPE vgi, LOCATION '/Users/rusty/Development/vgi-matchrecognize/target/release/vgi-matchrecognize-worker');
+
+# range() is a TABLE_SCAN without batch-index support. Declaring the flag used to
+# take the whole process down here.
+query I
+SELECT count(*) FROM mr.match_recognize(
+  (SELECT i AS ts FROM range(10) r(i)),
+  order_by := ['ts'], pattern := 'A', define := '{}', measures := '{"n":"COUNT(*)"}');
+----
+10
+
+# VALUES likewise.
+query I
+SELECT count(*) FROM mr.match_recognize(
+  (SELECT * FROM (VALUES (1),(2),(3)) t(ts)),
+  order_by := ['ts'], pattern := 'A', define := '{}', measures := '{"n":"COUNT(*)"}');
+----
+3
+
+# A base table CAN supply a batch index, so this takes the other route.
+statement ok
+CREATE TABLE t AS SELECT i AS ts FROM range(2000) r(i);
+
+query I
+SELECT count(*) FROM mr.match_recognize(
+  (SELECT ts FROM t),
+  order_by := ['ts'], pattern := 'A', define := '{}', measures := '{"n":"COUNT(*)"}');
+----
+2000

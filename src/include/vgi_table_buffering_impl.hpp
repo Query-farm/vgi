@@ -170,7 +170,7 @@ public:
 	                                  vector<string> return_names_p,
 	                                  unique_ptr<FunctionData> bind_data_p, bool source_order_dependent_p,
 	                                  bool sink_order_dependent_p, bool requires_input_batch_index_p,
-	                                  idx_t estimated_cardinality);
+	                                  bool synthesize_batch_index_p, idx_t estimated_cardinality);
 
 	// Owned bind data. The physical operator is the sole long-lived holder
 	// during execution; the LogicalVgiTableBufferingFunction transfers
@@ -183,6 +183,13 @@ public:
 	// requires_input_batch_index → RequiredPartitionInfo()=BatchIndex().
 	bool sink_order_dependent;
 	bool requires_input_batch_index;
+	// Set when the worker asked for input ordering but the pipeline source cannot
+	// supply a batch index (range(), VALUES, and anything else whose
+	// SupportsPartitioning() says no). We then honour the request the other way:
+	// the sink runs single-threaded, so batches arrive in source order, and we
+	// number them ourselves. The worker sees a valid monotonic batch_index either
+	// way and never has to care which route produced it. See CreatePlan.
+	bool synthesize_batch_index;
 
 	// Pushdown data — populated by CreatePlan from the Logical op. Mirrors
 	// the field set on LogicalVgiTableBufferingFunction; see those docstrings.
@@ -214,14 +221,17 @@ public:
 		return true;
 	}
 	bool ParallelSink() const override {
-		return !sink_order_dependent;
+		// Synthesized numbering is only meaningful on a single thread: with a
+		// parallel sink, "the order batches arrived" is not the source order.
+		return !sink_order_dependent && !synthesize_batch_index;
 	}
 	bool SinkOrderDependent() const override {
 		// Distinct from ParallelSink: SinkOrderDependent affects the
 		// optimizer's right-of-join placement etc., and we want the planner
 		// to know that order matters when sink_order_dependent is set so
-		// it doesn't reorder the input pipeline arbitrarily.
-		return sink_order_dependent;
+		// it doesn't reorder the input pipeline arbitrarily. A synthesized
+		// batch index depends on source order just as much.
+		return sink_order_dependent || synthesize_batch_index;
 	}
 	OperatorPartitionInfo RequiredPartitionInfo() const override {
 		return requires_input_batch_index

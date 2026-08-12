@@ -70,6 +70,38 @@ void LogicalVgiTableBufferingFunction::Serialize(Serializer & /*serializer*/) co
 	    "(plan caching across processes is out of scope for v1)");
 }
 
+// The pipeline that feeds our Sink is sourced by the first operator below us that
+// is itself a source; everything between (projections, filters) just passes chunks
+// along. Mirrors how PhysicalOperator::BuildPipelines picks a pipeline source.
+static optional_ptr<const PhysicalOperator> FindPipelineSource(const PhysicalOperator &op) {
+	const PhysicalOperator *current = &op;
+	while (true) {
+		if (current->IsSource()) {
+			return current;
+		}
+		if (current->children.empty()) {
+			return nullptr;
+		}
+		// children[0] is the pipeline's own input; a second child (a join build
+		// side, say) belongs to a different pipeline.
+		current = &current->children[0].get();
+	}
+}
+
+// Whether a batch index can actually be threaded from this plan's source.
+//
+// DuckDB enforces this hard: Pipeline scheduling throws an InternalException if a
+// sink declares RequiredPartitionInfo()=BatchIndex() and the source does not
+// support it. That happens before any of our own code runs, so a worker that opts
+// in must not be able to take a query down with it — hence the plan-time check.
+static bool SourceCanSupplyBatchIndex(const PhysicalOperator &child_plan) {
+	auto source = FindPipelineSource(child_plan);
+	if (!source) {
+		return false;
+	}
+	return source->SupportsPartitioning(OperatorPartitionInfo::BatchIndex());
+}
+
 PhysicalOperator &LogicalVgiTableBufferingFunction::CreatePlan(ClientContext &context,
                                                                 PhysicalPlanGenerator &planner) {
 	// Plan the child (the table-input subquery) first so its data is
@@ -84,14 +116,29 @@ PhysicalOperator &LogicalVgiTableBufferingFunction::CreatePlan(ClientContext &co
 	// advertisement.
 	auto &bd = bind_data->Cast<VgiTableInOutBindData>();
 	const bool source_order_dependent = bd.source_order_dependent;
-	const bool sink_order_dependent = bd.sink_order_dependent;
-	const bool requires_input_batch_index = bd.requires_input_batch_index;
+	bool sink_order_dependent = bd.sink_order_dependent;
+	bool requires_input_batch_index = bd.requires_input_batch_index;
+	// A worker asking for a batch index is really asking for *input order*. Only
+	// some sources can hand one out (a base table scan can; range() and VALUES
+	// cannot), and asking anyway makes DuckDB abort the pipeline. So when the
+	// source cannot, give the worker the same guarantee the other way: serialize
+	// the sink, which delivers batches in source order, and number them here.
+	// Slower than a parallel sink, but it works with every source, and the
+	// alternative — telling the caller to wrap their input in a TEMP TABLE — is
+	// not a reasonable thing to require.
+	bool synthesize_batch_index = false;
+	if (requires_input_batch_index && !SourceCanSupplyBatchIndex(child_plan)) {
+		requires_input_batch_index = false;
+		sink_order_dependent = true;
+		synthesize_batch_index = true;
+	}
 
 	auto types_copy = return_types;
 	auto names_copy = return_names;
 	auto &op_base = planner.Make<PhysicalVgiTableBufferingFunction>(
 	    std::move(types_copy), std::move(names_copy), std::move(bind_data), source_order_dependent,
-	    sink_order_dependent, requires_input_batch_index, estimated_cardinality);
+	    sink_order_dependent, requires_input_batch_index, synthesize_batch_index,
+	    estimated_cardinality);
 	auto &op = op_base.Cast<PhysicalVgiTableBufferingFunction>();
 	// Thread pushdown state captured by the rewriter onto the physical op
 	// (per-query plan data, not per-bind data). All Sink-side and Source-side
@@ -120,6 +167,7 @@ PhysicalVgiTableBufferingFunction::PhysicalVgiTableBufferingFunction(PhysicalPla
                                                                     bool source_order_dependent_p,
                                                                     bool sink_order_dependent_p,
                                                                     bool requires_input_batch_index_p,
+                                                                    bool synthesize_batch_index_p,
                                                                     idx_t estimated_cardinality)
     : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, std::move(return_types_p),
                        estimated_cardinality),
@@ -127,7 +175,8 @@ PhysicalVgiTableBufferingFunction::PhysicalVgiTableBufferingFunction(PhysicalPla
       return_names(std::move(return_names_p)),
       source_order_dependent(source_order_dependent_p),
       sink_order_dependent(sink_order_dependent_p),
-      requires_input_batch_index(requires_input_batch_index_p) {
+      requires_input_batch_index(requires_input_batch_index_p),
+      synthesize_batch_index(synthesize_batch_index_p) {
 }
 
 string PhysicalVgiTableBufferingFunction::GetName() const {
@@ -185,6 +234,12 @@ public:
 	std::mutex workers_mutex;
 	std::vector<std::unique_ptr<IFunctionConnection>> workers;
 	std::vector<std::vector<uint8_t>> state_ids;
+
+	// Sequential batch numbering for the synthesize_batch_index path. Only read on
+	// a single-threaded sink (ParallelSink() returns false whenever we synthesize),
+	// so the counter is the source order; atomic anyway so the invariant does not
+	// rest on that being true.
+	std::atomic<int64_t> next_synthetic_batch_index {0};
 
 	// Populated by Sink::Finalize after combine returns. Drained by the
 	// source phase under finalize_queue_mutex.
@@ -747,17 +802,27 @@ SinkResultType PhysicalVgiTableBufferingFunction::Sink(ExecutionContext &context
 	// Convert DuckDB chunk → Arrow batch and ship to worker.
 	auto input_batch = DataChunkToArrow(context.client, chunk, bd.input_schema);
 
-	// batch_index plumbing: when the operator declared
-	// RequiredPartitionInfo()=BatchIndex(), DuckDB threads a globally-
-	// unique monotonic batch_index into lstate.partition_info. If the
-	// source can't supply it (e.g. range() — single-thread TABLE_SCAN
-	// without batch_index support) the optional_idx is INVALID and we
-	// fail loudly: workers that opted in to ordering depend on having
-	// batch_index per call; silently passing nullopt would result in
-	// quiet wrong answers. Conservative bind-time alternative would
-	// require knowing the source plan — easier to fail at first chunk.
+	// batch_index plumbing. Two routes, decided in CreatePlan:
+	//
+	//  - The source supports batch-index partitioning, so we declared
+	//    RequiredPartitionInfo()=BatchIndex() and DuckDB threads a globally
+	//    unique monotonic index into lstate.partition_info.
+	//  - It does not (range(), VALUES, ...), so the plan serialized this sink
+	//    instead and we number the batches ourselves; arrival order on one
+	//    thread is source order.
+	//
+	// Either way the worker gets a valid index. The throw below is only a
+	// backstop for a source that claims support and then supplies nothing:
+	// passing nullopt to a worker that opted in to ordering would mean quiet
+	// wrong answers, which is worse than failing.
 	std::optional<int64_t> batch_index;
-	if (requires_input_batch_index) {
+	if (synthesize_batch_index) {
+		// The source could not supply one, so the plan serialized this sink and we
+		// number the batches in arrival order — which, single-threaded, is source
+		// order. The worker cannot tell this apart from a DuckDB-supplied index,
+		// which is the point: opting in never fails a query.
+		batch_index = gstate.next_synthetic_batch_index.fetch_add(1);
+	} else if (requires_input_batch_index) {
 		// partition_info is on the LocalSinkState BASE, not our subclass.
 		const auto &bi = input.local_state.partition_info.batch_index;
 		if (!bi.IsValid()) {
