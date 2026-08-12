@@ -70,7 +70,6 @@
 #include "vgi_launcher_internal.hpp"
 #include "vgi_cookie_jar.hpp"
 #include "vgi_function_docs.hpp"
-#include "vgi_http_compression.hpp" // kDefaultMaxDecompressedBytes
 #include "vgi_logging.hpp"
 #include "duckdb/parser/parsed_data/create_aggregate_function_info.hpp"
 #include "duckdb/parser/parsed_data/create_copy_function_info.hpp"
@@ -3491,16 +3490,6 @@ static void LoadInternal(ExtensionLoader &loader) {
 	config.AddExtensionOption("vgi_http_timeout_seconds",
 	                          "Timeout in seconds for VGI HTTP requests (catalog, init, and exchange operations)",
 	                          LogicalType::BIGINT, Value::BIGINT(300));
-
-	config.AddExtensionOption(
-	    "vgi_http_max_decompressed_bytes",
-	    "Cap on the decompressed size (bytes) of a single compressed VGI HTTP response body. Guards against "
-	    "decompression bombs, where a tiny body declares an enormous output to exhaust host memory. Applies "
-	    "only to compressed responses (zstd/gzip): an identity body is not amplified, so a peer must actually "
-	    "send every byte it wants allocated. Raise it when a worker legitimately returns batches over the "
-	    "default -- a batch that fits uncompressed but trips this cap is the symptom. 0 restores the default. "
-	    "Default 1 GiB",
-	    LogicalType::UBIGINT, Value::UBIGINT(vgi::kDefaultMaxDecompressedBytes));
 
 	config.AddExtensionOption(
 	    "vgi_secret_default_ttl_seconds",

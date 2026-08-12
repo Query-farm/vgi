@@ -10,11 +10,10 @@
 namespace duckdb {
 namespace vgi {
 
-// The cap on decompressed output now travels as a parameter so the VGI RPC
-// path can raise it via ``vgi_http_max_decompressed_bytes`` while callers
-// fetching from arbitrary remotes keep the conservative default.  The default
-// itself lives in the header (``kDefaultMaxDecompressedBytes``) because it is
-// part of the contract callers opt out of.
+// The cap on decompressed output travels as a parameter, defaulted to
+// ``kDefaultMaxDecompressedBytes`` in the header.  Every caller takes that
+// default; the parameter exists so a caller with a known-small payload can
+// tighten it, not so anyone can loosen it.
 
 static constexpr int kDefaultZstdLevel = 3;
 // miniz uses MZ_DEFAULT_LEVEL == 6 for deflate; we mirror it explicitly so

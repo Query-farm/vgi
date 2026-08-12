@@ -34,21 +34,22 @@ const char *EncodingName(HttpEncoding encoding);
 // codec error.  ``NONE`` returns the input verbatim.
 std::vector<uint8_t> Compress(HttpEncoding encoding, const uint8_t *data, size_t size);
 
-// Default cap on decompressed output, in bytes (decompression-bomb defence:
-// a tiny compressed body that claims an enormous output to OOM the host).
-// Deliberately finite rather than advisory -- but see
-// ``vgi_http_max_decompressed_bytes``, which raises it for VGI RPC responses
-// where the peer is a worker the user chose to attach.
+// Ceiling on decompressed output, in bytes. A backstop against a malformed or
+// hostile frame that declares an enormous output, so decoding it cannot wedge
+// the process.
+//
+// Not a security boundary, and deliberately not configurable. It bounds only
+// the amplification step: nothing caps an identity body, so any peer that
+// wants a given number of bytes allocated can simply send them uncompressed.
+// It also cannot be relied on to run — the protocol lets the transport decode
+// a standard ``Content-Encoding`` itself, in which case this code never sees
+// the compressed bytes at all.
 constexpr size_t kDefaultMaxDecompressedBytes = 1ULL << 30; // 1 GiB
 
 // Decompress with the named codec, capping output at ``max_bytes``.  Throws
 // ``IOException`` on codec error or cap breach.  ``NONE`` returns the input
 // verbatim (and is never capped -- an identity body is not amplified, so the
 // peer must actually send every byte it wants us to allocate).
-//
-// Callers fetching from an arbitrary remote (e.g. GitHub release assets)
-// should keep the default; only the VGI RPC path, whose peer is the attached
-// worker, passes a user-configured value.
 std::string Decompress(HttpEncoding encoding, const char *data, size_t size,
                        size_t max_bytes = kDefaultMaxDecompressedBytes);
 
