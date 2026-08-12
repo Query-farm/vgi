@@ -40,13 +40,50 @@ SELECT bool_and(v = expected) FROM ordered;
 true
 
 # ----------------------------------------------------------------------------
-# Sources that don't support batch_index — VALUES, range() — fail at
-# DuckDB's pipeline scheduler with `INTERNAL Error: Attempting to schedule
-# a pipeline where the sink requires batch index but source does not
-# support it`. We do NOT assert on this error in sqllogictest because
-# DuckDB's `INTERNAL Error` paths interact poorly with `statement error`
-# matching. The contract is enforced by DuckDB itself; we trust it.
+# Sources that CANNOT supply a batch_index — range(), VALUES — used to take
+# the whole process down: DuckDB's PipelineExecutor constructor asserts
+# `pipeline.source->SupportsPartitioning(BatchIndex())`, which is an
+# INTERNAL Error in a debug build and a segfault in release, before any
+# extension code runs. Declaring the flag therefore forced every caller to
+# wrap their input in a temp table.
 #
+# The operator now detects this at plan time and numbers the batches itself
+# (serializing the Sink so the numbering is meaningful), so a worker sees a
+# valid monotonic batch_index whatever the source. The fixture raises if
+# batch_index is None, so merely returning rows proves it was supplied — and
+# because the synthesized numbering follows ingest order, the output must
+# still come back in source order.
+# ----------------------------------------------------------------------------
+
+query I
+WITH ordered AS (
+    SELECT v, row_number() OVER () - 1 AS expected
+    FROM example.batch_index_buffer_input((SELECT * FROM range(5000) AS t(v)))
+)
+SELECT bool_and(v = expected) FROM ordered;
+----
+true
+
+query I
+SELECT count(*) FROM example.batch_index_buffer_input((SELECT * FROM range(5000) AS t(v)));
+----
+5000
+
+query I
+SELECT list(v) FROM example.batch_index_buffer_input((
+    SELECT * FROM (VALUES (10), (20), (30)) AS t(v)
+));
+----
+[10, 20, 30]
+
+# A subquery whose own source cannot be partitioned, behind an aggregation.
+query I
+SELECT count(*) FROM example.batch_index_buffer_input((
+    SELECT v FROM (SELECT unnest(range(0, 300)) AS v)
+));
+----
+300
+
 # ----------------------------------------------------------------------------
 # UNION ALL of two parallel-scannable sources — batch_index is globally
 # unique across the union, the worker still produces ordered output.
