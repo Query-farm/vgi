@@ -24,7 +24,7 @@ VGI_TEST_BRANCH_DIR ?= $(shell python3 -c 'import tempfile;print(tempfile.gettem
 export VGI_TEST_BRANCH_DIR
 
 # Versioned fixture workers for attach/versioning*.test. Set to overrideable
-# defaults so `require-env` gates pass under `make test_subprocess` by default.
+# defaults so `require-env` gates pass under `make test_spawn` by default.
 VGI_VERSIONED_WORKER ?= uv run --project $(HOME)/Development/vgi-python vgi-fixture-versioned-worker
 VGI_VERSIONED_TABLES_WORKER ?= uv run --project $(HOME)/Development/vgi-python vgi-fixture-versioned-tables-worker
 VGI_ATTACH_OPTIONS_REQUIRED_WORKER ?= uv run --project $(HOME)/Development/vgi-python vgi-fixture-attach-options-worker
@@ -52,7 +52,7 @@ VGI_SIMPLE_WRITABLE_WORKER ?= uv run --project $(HOME)/Development/vgi-python vg
 # Writable tests are excluded from the default targets because they require
 # a vgi-python worker with writable-catalog support enabled; run them
 # explicitly via `make test_writable` when that worker is available.
-.PHONY: test_subprocess test_subprocess_debug test_http test_http_debug \
+.PHONY: test_spawn test_spawn_debug test_http test_http_debug \
 	test_shm test_shm_debug \
 	test_launcher test_launcher_debug \
 	test_launcher_cloudflare_do test_launcher_cloudflare_do_debug \
@@ -66,7 +66,7 @@ VGI_SIMPLE_WRITABLE_WORKER ?= uv run --project $(HOME)/Development/vgi-python vg
 	test_iceberg test_iceberg_debug \
 	test_all test_all_debug
 
-# Shared-memory transport tests — runs the same .test suite as test_subprocess
+# Shared-memory transport tests — runs the same .test suite as test_spawn
 # but with VGI_RPC_SHM_SIZE_BYTES set so the subprocess workers advertise a
 # POSIX shm segment on init and route every data batch through the zero-copy
 # side-channel (see *Shared-Memory Transport* in CLAUDE.md). The worker attaches
@@ -111,11 +111,18 @@ test_shm_debug:
 	VGI_TEST_DEDICATED_WORKER=1 \
 	python3 scripts/run_tests.py --build debug "test/*" "~test/sql/integration/writable/*"
 
+# Cold-spawn transport tests: every worker connection starts a *fresh* Python
+# process (`uv run … vgi-fixture-worker`), so most of the wall clock is interpreter
+# and project-resolution startup rather than extension code. Prefer
+# `make test_launcher`, which runs the same .test suite through the pooled launcher
+# transport and is dramatically faster; reach for this target when you specifically
+# need to exercise the cold per-connection spawn path.
+#
 # Routes through scripts/run_tests.py so each .test file runs in its own
 # unittest subprocess, N at a time (override with VGI_RUN_TESTS_JOBS). Serial
 # unittest wastes wall-clock here because each test is mostly waiting on the
 # subprocess worker's I/O.
-test_subprocess:
+test_spawn:
 	VGI_TRANSACTOR_DB_DIR="$$(mktemp -d)" \
 	VGI_TEST_WORKER="$(VGI_TEST_WORKER)" \
 	VGI_VERSIONED_WORKER="$(VGI_VERSIONED_WORKER)" \
@@ -129,7 +136,7 @@ test_subprocess:
 	VGI_TEST_DEDICATED_WORKER=1 \
 	python3 scripts/run_tests.py --build release "test/*" "~test/sql/integration/writable/*"
 
-test_subprocess_debug:
+test_spawn_debug:
 	VGI_TRANSACTOR_DB_DIR="$$(mktemp -d)" \
 	VGI_TEST_WORKER="$(VGI_TEST_WORKER)" \
 	VGI_VERSIONED_WORKER="$(VGI_VERSIONED_WORKER)" \
@@ -143,7 +150,7 @@ test_subprocess_debug:
 	VGI_TEST_DEDICATED_WORKER=1 \
 	python3 scripts/run_tests.py --build debug "test/*" "~test/sql/integration/writable/*"
 
-# Launcher transport tests — runs the same .test suite as test_subprocess but
+# Launcher transport tests — runs the same .test suite as test_spawn but
 # with each worker fronted by `launch:` so traffic flows through the C++
 # launcher: ResolveLauncherSocketPath → AF_UNIX → UnixSocketWorker.  Validates
 # that the launcher path produces identical query results to the subprocess
@@ -346,7 +353,7 @@ test_writable:
 test_writable_debug:
 	VGI_TRANSACTOR_DB_DIR="$$(mktemp -d)" VGI_TEST_WORKER="$(VGI_TEST_WORKER)" ./build/debug/test/unittest "test/sql/integration/writable/*"
 
-# Minimal-writable tests run by default through test_subprocess (the env var is
+# Minimal-writable tests run by default through test_spawn (the env var is
 # already wired there); this target is for running just the simple-writable
 # sqllogictests in isolation.
 test_simple_writable:
@@ -356,15 +363,15 @@ test_simple_writable_debug:
 	VGI_SIMPLE_WRITABLE_WORKER="$(VGI_SIMPLE_WRITABLE_WORKER)" ./build/debug/test/unittest "test/sql/integration/simple_writable/*"
 
 # Run all transports
-test_all: test_subprocess test_shm test_http test_http_bearer test_http_versioned_tables test_http_attach_options test_http_no_compression
+test_all: test_spawn test_shm test_http test_http_bearer test_http_versioned_tables test_http_attach_options test_http_no_compression
 
-test_all_debug: test_subprocess_debug test_shm_debug test_http_debug test_http_bearer_debug test_http_versioned_tables_debug test_http_attach_options_debug test_http_no_compression_debug
+test_all_debug: test_spawn_debug test_shm_debug test_http_debug test_http_bearer_debug test_http_versioned_tables_debug test_http_attach_options_debug test_http_no_compression_debug
 
 # ---------------------------------------------------------------------------
 # Per-language integration runs
 #
 # The VGI_*_WORKER vars above default to the vgi-python fixtures, so the
-# transport targets (test_subprocess / test_launcher / ...) already exercise
+# transport targets (test_spawn / test_launcher / ...) already exercise
 # the Python implementation. These convenience targets run the SAME
 # test/sql/integration suite against the Go / TypeScript / Java worker
 # implementations by delegating to each SDK repo's own `make test`, which

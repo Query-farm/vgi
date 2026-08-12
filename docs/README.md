@@ -160,7 +160,7 @@ release build:
 
 ```sh
 # Subprocess transport (default, faster)
-make test_subprocess
+make test_launcher
 
 # HTTP transport
 make test_http

@@ -99,7 +99,7 @@ the main connection's `duckdb_logs`.
 
 | Suite | Result |
 |---|---|
-| `make test_subprocess` | 192/192 |
+| `make test_spawn` | 192/192 |
 | `make test_launcher` | 182 cases / 8426 assertions |
 | `make test_http` | 149 cases / 7653 assertions |
 | `tests/test_generated_cpp_secret.py` | 7/7 |

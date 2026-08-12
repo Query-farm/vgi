@@ -32,24 +32,31 @@ using the debug build to isolate failures.
 
 The extension supports two transports: **subprocess** (worker spawned as a child process) and **HTTP** (worker as an HTTP server). Both should be tested, though subprocess is faster.
 
-### Subprocess Transport (default, faster)
+### Start with `make test_launcher`
+
+**`make test_launcher` is the default for regression testing.** It runs the whole
+`.test` suite over the pooled launcher transport, so worker connections come from a
+warm launcher instead of a fresh Python interpreter each time. Same coverage, a
+fraction of the wall clock.
 
 **Always use `tee` to capture output when running tests and analyze that output** so failures are easy to find afterwards, if you don't use tee it means the tests are run twice.:
 
 ```bash
-# Run all tests in release mode (subprocess)
-make test_subprocess 2>&1 | tee /tmp/vgi-test.log
+# The default: whole suite, release build, pooled launcher transport
+make test_launcher 2>&1 | tee /tmp/vgi-test.log
 
-# Run all tests in debug mode (subprocess)
-make test_subprocess_debug 2>&1 | tee /tmp/vgi-test-debug.log
-
-# The legacy `make test` / `make test_debug` also work (run all tests including non-integration)
-make test 2>&1 | tee /tmp/vgi-test.log
-make test_debug 2>&1 | tee /tmp/vgi-test-debug.log
+# Debug build, to isolate a failure the release run surfaced
+make test_launcher_debug 2>&1 | tee /tmp/vgi-test-debug.log
 
 # To see failures:
-make test_subprocess | grep -A 20 "FAILED"
+grep -A 20 "FAILED" /tmp/vgi-test.log
 ```
+
+`make test_spawn` (formerly `test_subprocess`) runs the same suite but cold-starts a
+Python worker per connection, so most of its runtime is interpreter startup rather
+than extension code. Use it only when the cold per-connection spawn path is what you
+are testing. `make test` / `make test_debug` still run everything including
+non-integration tests.
 
 The `VGI_TEST_WORKER` env var controls which worker is used. It defaults to
 `uv run --project ~/Development/vgi-python vgi-fixture-worker` and can be overridden.
@@ -143,7 +150,7 @@ distribution build). The distribution build runs the extension's own
 `make test_<build_type>` step, but the VGI integration `.test` files all carry
 `require-env VGI_TEST_WORKER`, so they **skip** in CI unless the fixture workers are
 present — i.e. green CI today means *built + header-clean*, not "integration suite
-passed". Run the integration suite locally (`make test_subprocess` / `make
+passed". Run the integration suite locally (`make test_launcher` / `make
 test_launcher`). Wiring the reusable build's in-workflow test step to actually run
 the suite needs the `vgi-python` fixture workers installed on the runner via the
 reusable workflow's `post_build_command` + `test_config.test_env_variables` hooks
