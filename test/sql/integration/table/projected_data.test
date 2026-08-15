@@ -68,8 +68,18 @@ SELECT * FROM example.projected_data(5) ORDER BY id DESC;
 0	item_0	0.0	0
 
 # SELECT * with LIMIT
+#
+# ORDER BY is required, not decorative: LIMIT without it returns whichever rows
+# arrive first, so on a 1000-row source the three rows compared here are an
+# arbitrary subset. That is stable under DuckDB and not guaranteed by SQL, so
+# the assertion would drift the moment the scan is parallelised or reordered.
+#
+# Note this is unlike table/batch_index.test and table/rowid.test, where the
+# absence of ORDER BY *is* the assertion — those verify that a scan emits rows
+# in source order, and adding ORDER BY there would make them tautological.
+# Nothing is being tested about ordering here; the subject is projection.
 query IRTI
-SELECT * FROM example.projected_data(1000) LIMIT 3;
+SELECT * FROM example.projected_data(1000) ORDER BY id LIMIT 3;
 ----
 0	item_0	0.0	0
 1	item_1	1.5	1
