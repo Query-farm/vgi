@@ -21,7 +21,7 @@ statement ok
 SET threads=1;
 
 statement ok
-CREATE TEMP TABLE t AS SELECT * FROM range(10) r(x);
+CREATE TABLE t AS SELECT * FROM range(10) r(x);
 
 statement ok
 CALL enable_logging(level := 'debug');
@@ -86,7 +86,7 @@ true
 # ---------------------------------------------------------------------------
 
 statement ok
-CREATE TEMP TABLE reordered AS SELECT x::BIGINT AS x FROM (VALUES (9),(0),(7),(2),(5),(1),(8),(3),(6),(4)) v(x);
+CREATE TABLE reordered AS SELECT x::BIGINT AS x FROM (VALUES (9),(0),(7),(2),(5),(1),(8),(3),(6),(4)) v(x);
 
 statement ok
 CALL truncate_duckdb_logs();

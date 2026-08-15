@@ -98,7 +98,7 @@ statement ok
 SET threads=4;
 
 statement ok
-CREATE TEMP TABLE small_keys AS SELECT * FROM generate_series(0, 9) t(id);
+CREATE TABLE small_keys AS SELECT * FROM generate_series(0, 9) t(id);
 
 # Trigger the VgiJoinOptimizer to raise dynamic_or_filter_threshold for
 # this session (the optimizer extension does this when a join touches a
@@ -115,7 +115,7 @@ true
 # into the probe-side VGI scan's init. The scan still emits batch_index;
 # downstream sink (BatchCollector here) reassembles in partition order.
 statement ok
-CREATE TEMP TABLE large_keys AS SELECT * FROM generate_series(0, 999, 5) t(id);
+CREATE TABLE large_keys AS SELECT * FROM generate_series(0, 999, 5) t(id);
 
 # Result count must match the standalone join: only the 200 sparse keys
 # appear in the partitioned_batch_index(10000) range.

@@ -24,7 +24,7 @@ statement ok
 SET vgi_result_cache_revalidate_min_bytes=0;
 
 statement ok
-CREATE TEMP TABLE t AS SELECT * FROM range(5) r(x);
+CREATE TABLE t AS SELECT * FROM range(5) r(x);
 
 statement ok
 CALL enable_logging(level := 'debug');

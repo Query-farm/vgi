@@ -214,7 +214,7 @@ SELECT id, fruit FROM example.echo_buffering((SELECT * FROM (VALUES (1, 'apple',
 # auto-apply filters wrap the OutputCollector for every tick.
 
 statement ok
-CREATE TEMP TABLE wide AS SELECT v AS n, v*10 AS m, v*100 AS p FROM range(50) t(v);
+CREATE TABLE wide AS SELECT v AS n, v*10 AS m, v*100 AS p FROM range(50) t(v);
 
 query II
 SELECT COUNT(*), SUM(n) FROM (

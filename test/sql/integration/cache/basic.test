@@ -56,7 +56,7 @@ true
 # the first observed value rather than an absolute (the worker's counter is not
 # reset between .test files that share the worker pool).
 statement ok
-CREATE TEMP TABLE nonce_first AS SELECT nonce AS v FROM ex.data.cache_nonce;
+CREATE TABLE nonce_first AS SELECT nonce AS v FROM ex.data.cache_nonce;
 
 query I
 SELECT (SELECT nonce FROM ex.data.cache_nonce) = (SELECT v FROM nonce_first);

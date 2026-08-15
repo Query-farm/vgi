@@ -38,7 +38,7 @@ CALL truncate_duckdb_logs();
 
 # Live (miss) → spills to disk (disk-only, no memory row).
 statement ok
-CREATE TEMP TABLE live AS SELECT * FROM ex.main.cache_types(10000);
+CREATE TABLE live AS SELECT * FROM ex.main.cache_types(10000);
 
 query I
 SELECT COUNT(*) FROM vgi_result_cache() WHERE function = 'cache_types';
@@ -55,7 +55,7 @@ CALL truncate_duckdb_logs();
 
 # Served from the disk blob via streaming.
 statement ok
-CREATE TEMP TABLE served AS SELECT * FROM ex.main.cache_types(10000);
+CREATE TABLE served AS SELECT * FROM ex.main.cache_types(10000);
 
 query I
 SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI'

@@ -49,7 +49,7 @@ statement ok
 SELECT * FROM vgi_result_cache_flush();
 
 statement ok
-CREATE TEMP TABLE t AS SELECT * FROM range(5000) g(x);
+CREATE TABLE t AS SELECT * FROM range(5000) g(x);
 
 query II
 EXPLAIN ANALYZE SELECT x AS total FROM ex.cached_sum_all((SELECT x FROM t));

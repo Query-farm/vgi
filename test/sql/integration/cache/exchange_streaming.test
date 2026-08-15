@@ -22,7 +22,7 @@ statement ok
 SET threads=1;
 
 statement ok
-CREATE TEMP TABLE src AS SELECT * FROM range(5) r(x);
+CREATE TABLE src AS SELECT * FROM range(5) r(x);
 
 statement ok
 CALL enable_logging(level := 'debug');

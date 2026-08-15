@@ -27,14 +27,14 @@ statement ok
 SET vgi_exchange_input_dedup = true;
 
 statement ok
-CREATE TEMP TABLE d_on AS
+CREATE TABLE d_on AS
 SELECT x, i FROM range(20) t(x), LATERAL ex.blended_explode(t.x % 4);
 
 statement ok
 SET vgi_exchange_input_dedup = false;
 
 statement ok
-CREATE TEMP TABLE d_off AS
+CREATE TABLE d_off AS
 SELECT x, i FROM range(20) t(x), LATERAL ex.blended_explode(t.x % 4);
 
 # Symmetric difference is empty (identical multisets).

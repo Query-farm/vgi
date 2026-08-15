@@ -32,7 +32,7 @@ require httpfs
 # pool := false disables the per-DuckDB-process subprocess pool entirely for
 # this catalog. Each acquire forks a fresh worker; nothing is returned to a
 # warm cache between Sink and Source. Set threads=4 so DuckDB actually spreads
-# Sink across processes (against a parallel TEMP TABLE scan that supports
+# Sink across processes (against a parallel base-table scan that supports
 # morsel-level partitioning).
 statement ok
 ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}', pool false);
@@ -50,10 +50,10 @@ SET threads=4;
 statement ok
 SELECT * FROM vgi_worker_pool_flush();
 
-# A parallel input source (TEMP TABLE scan IS parallel; range() isn't) so
+# A parallel input source (base-table scan IS parallel; range() isn't) so
 # multiple Sink threads engage and each picks up its own fresh worker.
 statement ok
-CREATE TEMP TABLE wide AS SELECT v FROM range(100000) AS t(v);
+CREATE TABLE wide AS SELECT v FROM range(100000) AS t(v);
 
 # ----------------------------------------------------------------------------
 # buffer_input — process() does state_append per batch under the execution-

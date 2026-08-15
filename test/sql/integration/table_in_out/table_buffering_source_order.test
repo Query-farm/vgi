@@ -34,7 +34,7 @@ statement ok
 SET threads=4;
 
 statement ok
-CREATE TEMP TABLE parallel_input AS SELECT v FROM range(200) AS t(v);
+CREATE TABLE parallel_input AS SELECT v FROM range(200) AS t(v);
 
 query I
 SELECT * FROM example.ordered_source((SELECT * FROM parallel_input));

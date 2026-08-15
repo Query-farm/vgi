@@ -87,10 +87,10 @@ SET threads=4;
 
 # We need an input that DuckDB actually parallelizes. `range()` is a single-
 # thread TABLE_SCAN, so SELECT FROM range(N) would feed only one Sink thread.
-# A TEMP TABLE scan IS parallel (morsel-driven), which gives the Sink side
+# A base-table scan IS parallel (morsel-driven), which gives the Sink side
 # multiple input threads to spawn workers on.
 statement ok
-CREATE TEMP TABLE parallel_input AS SELECT v FROM range(200000) AS t(v);
+CREATE TABLE parallel_input AS SELECT v FROM range(200000) AS t(v);
 
 # ----------------------------------------------------------------------------
 # Shared-execution invariant — under the TableBuffering API workers

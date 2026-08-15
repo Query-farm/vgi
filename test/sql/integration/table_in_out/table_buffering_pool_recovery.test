@@ -31,7 +31,7 @@ SELECT count(*) FROM example.buffer_input((SELECT * FROM range(5) AS t(v)));
 # a baseline (the counter is process-cumulative and the first acquire of
 # every worker_path is itself a miss).
 statement ok
-CREATE TEMP TABLE misses_baseline AS
+CREATE TABLE misses_baseline AS
 SELECT COALESCE(SUM(misses), 0)::BIGINT AS m FROM vgi_worker_pool_stats();
 
 # Crash once.

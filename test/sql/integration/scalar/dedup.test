@@ -20,7 +20,7 @@ SET threads=1;
 
 # 100 rows, only 5 distinct values (0..4), each repeated 20×.
 statement ok
-CREATE TEMP TABLE t AS SELECT (r % 5)::BIGINT AS v FROM range(100) g(r);
+CREATE TABLE t AS SELECT (r % 5)::BIGINT AS v FROM range(100) g(r);
 
 statement ok
 CALL enable_logging(level := 'debug');
@@ -80,7 +80,7 @@ RESET vgi_exchange_input_dedup;
 # ---------------------------------------------------------------------------
 
 statement ok
-CREATE TEMP TABLE tn AS SELECT CASE WHEN r % 3 = 0 THEN NULL ELSE 7::BIGINT END AS v FROM range(30) g(r);
+CREATE TABLE tn AS SELECT CASE WHEN r % 3 = 0 THEN NULL ELSE 7::BIGINT END AS v FROM range(30) g(r);
 
 query II
 SELECT count(v), sum(example.double(v))::BIGINT FROM tn;
@@ -94,7 +94,7 @@ SELECT count(v), sum(example.double(v))::BIGINT FROM tn;
 # ---------------------------------------------------------------------------
 
 statement ok
-CREATE TEMP TABLE rin AS SELECT 1::BIGINT AS lo, ((r % 5) + 10)::BIGINT AS hi FROM range(100) g(r);
+CREATE TABLE rin AS SELECT 1::BIGINT AS lo, ((r % 5) + 10)::BIGINT AS hi FROM range(100) g(r);
 
 statement ok
 CALL truncate_duckdb_logs();

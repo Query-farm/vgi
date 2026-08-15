@@ -15,10 +15,11 @@ statement ok
 ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
 # ----------------------------------------------------------------------------
-# Source-order reconstruction. Input is a TEMP TABLE of 0..N-1 (TEMP TABLE
-# scan supports batch_index); under threads=4 the rows arrive across
-# multiple Sink threads in non-deterministic order. The fixture's
-# combine() sorts by batch_index so finalize() yields rows in source
+# Source-order reconstruction. Input is a base table of 0..N-1 — a table scan
+# supplies batch_index, which range() and VALUES do not, and that is what the
+# source has to provide here; TEMP is not required for it. Under threads=4 the
+# rows arrive across multiple Sink threads in non-deterministic order. The
+# fixture's combine() sorts by batch_index so finalize() yields rows in source
 # order — assert the output is monotonically increasing.
 # ----------------------------------------------------------------------------
 
@@ -26,7 +27,7 @@ statement ok
 SET threads=4;
 
 statement ok
-CREATE TEMP TABLE ordered_input AS SELECT v FROM range(50000) AS t(v);
+CREATE TABLE ordered_input AS SELECT v FROM range(50000) AS t(v);
 
 # If the sort worked, the i-th row's value is i. Wrap with a CTE so we
 # can use both window and aggregate.
@@ -90,10 +91,10 @@ SELECT count(*) FROM example.batch_index_buffer_input((
 # ----------------------------------------------------------------------------
 
 statement ok
-CREATE TEMP TABLE input_a AS SELECT v FROM range(0, 100) AS t(v);
+CREATE TABLE input_a AS SELECT v FROM range(0, 100) AS t(v);
 
 statement ok
-CREATE TEMP TABLE input_b AS SELECT v FROM range(100, 200) AS t(v);
+CREATE TABLE input_b AS SELECT v FROM range(100, 200) AS t(v);
 
 query I
 SELECT count(*) FROM example.batch_index_buffer_input((

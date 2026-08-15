@@ -42,11 +42,11 @@ statement ok
 SELECT * FROM vgi_result_cache_flush();
 
 statement ok
-CREATE TEMP TABLE live_par AS
+CREATE TABLE live_par AS
 SELECT v FROM ex.main.cache_parallel(200000);
 
 statement ok
-CREATE TEMP TABLE served_par AS
+CREATE TABLE served_par AS
 SELECT v FROM ex.main.cache_parallel(200000);
 
 # Same cardinality, same sum, and the two multisets are identical (symmetric EXCEPT empty).

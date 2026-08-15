@@ -18,7 +18,7 @@ SELECT * FROM vgi_result_cache_flush();
 # the second was served from cache (worker not re-invoked) — over whatever
 # transport the catalog is attached with (subprocess or HTTP).
 statement ok
-CREATE TEMP TABLE http_nonce AS SELECT nonce AS v FROM ex.data.cache_nonce;
+CREATE TABLE http_nonce AS SELECT nonce AS v FROM ex.data.cache_nonce;
 
 query I
 SELECT (SELECT nonce FROM ex.data.cache_nonce) = (SELECT v FROM http_nonce);

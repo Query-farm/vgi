@@ -31,7 +31,7 @@ statement ok
 SELECT * FROM vgi_result_cache_flush();
 
 statement ok
-CREATE TEMP TABLE lat_on AS
+CREATE TABLE lat_on AS
 SELECT x, doubled FROM range(20000) g(x), LATERAL ex.cached_double(x % 50);
 
 statement ok
@@ -41,7 +41,7 @@ statement ok
 SELECT * FROM vgi_result_cache_flush();
 
 statement ok
-CREATE TEMP TABLE lat_off AS
+CREATE TABLE lat_off AS
 SELECT x, doubled FROM range(20000) g(x), LATERAL ex.cached_double(x % 50);
 
 # Identical multisets (symmetric difference empty).

@@ -1,0 +1,107 @@
+# name: test/sql/integration/unary_error_propagation.test
+# description: A worker-raised error in a UNARY RPC reaches SQL with the worker's
+#   own message, on every transport.
+# group: [vgi_integration]
+
+# Errors raised inside a *stream* are covered by table/generator_exception.test:
+# they ride as metadata on a batch, and the message survives. A error raised in a
+# UNARY call — `bind` is the one every query makes — travels a different path
+# entirely: there is no stream to carry it, so the server has to answer the
+# request itself with an error payload. That path had no test.
+#
+# It is also the path that is easiest to lose over HTTP, because HTTP already
+# has a way to say "failed" that carries nothing: a status code. If the server's
+# request handling lets an exception escape the RPC layer, the framework
+# underneath answers with its own error page, the client sees `HTTP 500` with no
+# Arrow body, and the worker's type and message survive only in the server's log.
+# Subprocess transport cannot regress that way — there is no status code to fall
+# back to — so this file is only meaningful when it runs on BOTH transports:
+#   make test_launcher
+#   ./test/run_http_integration.sh test/sql/integration/unary_error_propagation.test
+#
+# The assertions are on substrings the worker itself authored (a predicate name,
+# a constraint phrase). A transport-level failure cannot contain them, which is
+# what makes this a test of propagation rather than of failure.
+#
+# Scope, so the next reader does not over-trust this file: it covers errors the
+# worker's *method* raises. It cannot cover errors raised while the server is
+# still validating the request, because this client only ever sends well-formed
+# requests — reaching that path takes a deliberately malformed one, which SQL
+# has no way to express. (vgi-rpc-python let such an error escape its RPC layer
+# entirely; that is regressed from a client that can malform a request, in
+# vgi-java's PythonWorkerHttpConformanceTest.)
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ---------------------------------------------------------------------------
+# Scalar bind. `double` accepts any numeric type and rejects the rest via a
+# named type-bound predicate, so the rejection is worker-authored and names the
+# predicate — nothing in the client or the transport knows that string.
+# ---------------------------------------------------------------------------
+
+statement error
+SELECT example.main.double('abc');
+----
+_is_multipliable_type
+
+# The C++ side tags an error that came back from the worker, as opposed to one
+# it raised itself about the worker. Asserting the tag pins *whose* error this
+# is: a transport failure would be reported as the extension's own.
+statement error
+SELECT example.main.double('abc');
+----
+VGI Worker Exception
+
+# ---------------------------------------------------------------------------
+# Table-function bind. A different unary bind path (table, not scalar) and a
+# different kind of worker-side rejection (argument constraint, not schema).
+# ---------------------------------------------------------------------------
+
+statement error
+SELECT * FROM example.main.sequence(10, batch_size := 0);
+----
+must be >= 1
+
+statement error
+SELECT * FROM example.main.sequence(10, batch_size := 0);
+----
+VGI Worker Exception
+
+# ---------------------------------------------------------------------------
+# The failures above must leave the attachment usable. A worker that answered
+# an error by tearing down the connection would pass every assertion so far and
+# still be broken; over a pooled transport it would also poison the next query
+# to reuse that worker.
+# ---------------------------------------------------------------------------
+
+query I
+SELECT example.main.double(21);
+----
+42
+
+query I
+SELECT COUNT(*) FROM example.main.sequence(10);
+----
+10
+
+# And an error is still reported correctly *after* a success — the pooled worker
+# is reused by then, so this is not a repeat of the first assertion.
+statement error
+SELECT * FROM example.main.sequence(10, batch_size := 0);
+----
+must be >= 1
+
+query I
+SELECT COUNT(*) FROM example.main.sequence(5);
+----
+5
+
+statement ok
+DETACH example;

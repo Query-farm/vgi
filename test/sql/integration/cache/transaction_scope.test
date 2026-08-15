@@ -29,10 +29,10 @@ statement ok
 BEGIN;
 
 statement ok
-CREATE TEMP TABLE t1a AS SELECT DISTINCT nonce FROM ex.data.cache_scoped_txn;
+CREATE TABLE t1a AS SELECT DISTINCT nonce FROM ex.data.cache_scoped_txn;
 
 statement ok
-CREATE TEMP TABLE t1b AS SELECT DISTINCT nonce FROM ex.data.cache_scoped_txn;
+CREATE TABLE t1b AS SELECT DISTINCT nonce FROM ex.data.cache_scoped_txn;
 
 # Same transaction → same nonce → the second scan was served from cache.
 query I
@@ -48,7 +48,7 @@ statement ok
 BEGIN;
 
 statement ok
-CREATE TEMP TABLE t2 AS SELECT DISTINCT nonce FROM ex.data.cache_scoped_txn;
+CREATE TABLE t2 AS SELECT DISTINCT nonce FROM ex.data.cache_scoped_txn;
 
 statement ok
 COMMIT;

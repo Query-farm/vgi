@@ -27,7 +27,7 @@ CALL enable_logging(level := 'debug');
 # ---------------------------------------------------------------------------
 
 statement ok
-CREATE TEMP TABLE t AS SELECT * FROM range(5) r(x);
+CREATE TABLE t AS SELECT * FROM range(5) r(x);
 
 statement ok
 CALL truncate_duckdb_logs();
@@ -90,7 +90,7 @@ true
 # Same BIGINT column type as `t` (range(5)); the projected column's type is part of
 # the input hash, so a differently-typed literal would legitimately be a distinct entry.
 statement ok
-CREATE TEMP TABLE reordered AS SELECT x::BIGINT AS x FROM (VALUES (4),(0),(3),(1),(2)) v(x);
+CREATE TABLE reordered AS SELECT x::BIGINT AS x FROM (VALUES (4),(0),(3),(1),(2)) v(x);
 
 statement ok
 CALL truncate_duckdb_logs();
@@ -121,10 +121,10 @@ WHERE type = 'VGI'
 # ---------------------------------------------------------------------------
 
 statement ok
-CREATE TEMP TABLE xy1 AS SELECT * FROM (VALUES (1,10),(2,20)) v(x,y);
+CREATE TABLE xy1 AS SELECT * FROM (VALUES (1,10),(2,20)) v(x,y);
 
 statement ok
-CREATE TEMP TABLE xy2 AS SELECT * FROM (VALUES (1,99),(2,88)) v(x,y);
+CREATE TABLE xy2 AS SELECT * FROM (VALUES (1,99),(2,88)) v(x,y);
 
 query II
 SELECT y, doubled FROM xy1, LATERAL ex.cached_double(xy1.x) ORDER BY y;

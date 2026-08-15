@@ -38,7 +38,7 @@ CALL truncate_duckdb_logs();
 
 # Live (miss) → spills to disk (disk-only). Grouped per partition value.
 statement ok
-CREATE TEMP TABLE live AS
+CREATE TABLE live AS
 SELECT country, COUNT(*) c, SUM(sales) s
 FROM ex.main.cache_partitioned(1000) GROUP BY country;
 
@@ -57,7 +57,7 @@ CALL truncate_duckdb_logs();
 
 # Served from the disk blob via streaming.
 statement ok
-CREATE TEMP TABLE served AS
+CREATE TABLE served AS
 SELECT country, COUNT(*) c, SUM(sales) s
 FROM ex.main.cache_partitioned(1000) GROUP BY country;
 

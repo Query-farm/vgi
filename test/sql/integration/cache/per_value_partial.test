@@ -28,7 +28,7 @@ SELECT * FROM vgi_result_cache_flush();
 
 # Warm ONLY the distinct set {0..24}.
 statement ok
-CREATE TEMP TABLE lat_warm AS SELECT x FROM range(25) g(x), LATERAL ex.cached_double(x % 25);
+CREATE TABLE lat_warm AS SELECT x FROM range(25) g(x), LATERAL ex.cached_double(x % 25);
 
 statement ok
 CALL enable_logging(level := 'debug');
@@ -37,7 +37,7 @@ statement ok
 CALL truncate_duckdb_logs();
 
 statement ok
-CREATE TEMP TABLE lat_partial AS SELECT x, doubled FROM range(50) g(x), LATERAL ex.cached_double(x % 50);
+CREATE TABLE lat_partial AS SELECT x, doubled FROM range(50) g(x), LATERAL ex.cached_double(x % 50);
 
 # The single write_input for this partial chunk shipped 25 rows (the misses), NOT 50.
 query I
@@ -69,7 +69,7 @@ statement ok
 SELECT * FROM vgi_result_cache_flush();
 
 statement ok
-CREATE TEMP TABLE lat_off AS SELECT x, doubled FROM range(50) g(x), LATERAL ex.cached_double(x % 50);
+CREATE TABLE lat_off AS SELECT x, doubled FROM range(50) g(x), LATERAL ex.cached_double(x % 50);
 
 query I
 SELECT count(*) FROM (
@@ -90,7 +90,7 @@ statement ok
 SELECT * FROM vgi_result_cache_flush();
 
 statement ok
-CREATE TEMP TABLE sc_warm AS SELECT ex.cached_double_scalar(x % 25) AS d FROM range(25) g(x);
+CREATE TABLE sc_warm AS SELECT ex.cached_double_scalar(x % 25) AS d FROM range(25) g(x);
 
 statement ok
 CALL enable_logging(level := 'debug');
@@ -99,7 +99,7 @@ statement ok
 CALL truncate_duckdb_logs();
 
 statement ok
-CREATE TEMP TABLE sc_partial AS SELECT x, ex.cached_double_scalar(x % 50) AS d FROM range(50) g(x);
+CREATE TABLE sc_partial AS SELECT x, ex.cached_double_scalar(x % 50) AS d FROM range(50) g(x);
 
 query I
 SELECT max(regexp_extract(message, 'input_rows=([0-9]+)', 1)::INT)

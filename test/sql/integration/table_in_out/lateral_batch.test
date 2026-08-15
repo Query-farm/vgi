@@ -62,14 +62,14 @@ SELECT count(*) FROM range(4) t(x), LATERAL ex.blended_explode(t.x);
 # ---------------------------------------------------------------------------
 
 statement ok
-CREATE TEMP TABLE batched_result AS
+CREATE TABLE batched_result AS
 SELECT x, i FROM range(20) t(x), LATERAL ex.blended_explode(t.x % 4);
 
 statement ok
 SET vgi_batch_lateral=false;
 
 statement ok
-CREATE TEMP TABLE rowbyrow_result AS
+CREATE TABLE rowbyrow_result AS
 SELECT x, i FROM range(20) t(x), LATERAL ex.blended_explode(t.x % 4);
 
 query I

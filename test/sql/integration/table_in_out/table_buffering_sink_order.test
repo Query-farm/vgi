@@ -38,7 +38,7 @@ SELECT count(*) FROM example.ordered_buffer_input((
 100
 
 # ----------------------------------------------------------------------------
-# Single-thread invariant — even with threads=4 set and a TEMP TABLE input
+# Single-thread invariant — even with threads=4 set and a base-table input
 # (which DuckDB can scan in parallel), sink_order_dependent=True forces
 # ParallelSink=false, so every process() call runs on one worker
 # connection. Assert COUNT(DISTINCT conn=) == 1 in process events.
@@ -51,7 +51,7 @@ statement ok
 SET threads=4;
 
 statement ok
-CREATE TEMP TABLE parallel_input AS SELECT v FROM range(50000) AS t(v);
+CREATE TABLE parallel_input AS SELECT v FROM range(50000) AS t(v);
 
 statement ok
 CALL truncate_duckdb_logs();

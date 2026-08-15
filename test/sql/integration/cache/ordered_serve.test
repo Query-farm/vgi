@@ -27,7 +27,7 @@ CALL truncate_duckdb_logs();
 # First scan → MISS + capture. The correct output is the monotonic sequence, so
 # n MUST equal its 0-based row position. This is the live (worker) ordering.
 statement ok
-CREATE TEMP TABLE live AS
+CREATE TABLE live AS
 SELECT n, row_number() OVER () - 1 AS rn FROM ex.data.cache_ordered;
 
 query II
@@ -53,7 +53,7 @@ CALL truncate_duckdb_logs();
 # Second scan → HIT, served single-threaded from the cache. The replay must be in
 # batch_index order: n still equals its row position, byte-identical to live.
 statement ok
-CREATE TEMP TABLE served AS
+CREATE TABLE served AS
 SELECT n, row_number() OVER () - 1 AS rn FROM ex.data.cache_ordered;
 
 query II

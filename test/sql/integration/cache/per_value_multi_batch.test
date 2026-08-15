@@ -86,19 +86,19 @@ statement ok
 SELECT * FROM vgi_result_cache_flush();
 
 statement ok
-CREATE TEMP TABLE mb_on AS SELECT x, i FROM range(40) g(x), LATERAL ex.cached_explode(x % 5);
+CREATE TABLE mb_on AS SELECT x, i FROM range(40) g(x), LATERAL ex.cached_explode(x % 5);
 
 statement ok
 SET vgi_result_cache_per_value=false;
 
 statement ok
-CREATE TEMP TABLE mb_off AS SELECT x, i FROM range(40) g(x), LATERAL ex.cached_explode(x % 5);
+CREATE TABLE mb_off AS SELECT x, i FROM range(40) g(x), LATERAL ex.cached_explode(x % 5);
 
 statement ok
 SET vgi_batch_lateral=false;
 
 statement ok
-CREATE TEMP TABLE mb_row AS SELECT x, i FROM range(40) g(x), LATERAL ex.cached_explode(x % 5);
+CREATE TABLE mb_row AS SELECT x, i FROM range(40) g(x), LATERAL ex.cached_explode(x % 5);
 
 # symmetric difference must be empty for both comparisons
 query I

@@ -26,7 +26,7 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 # ============================================================================
 
 statement ok
-CREATE TEMP TABLE large_keys AS SELECT * FROM generate_series(0, 999, 5) t(id);
+CREATE TABLE large_keys AS SELECT * FROM generate_series(0, 999, 5) t(id);
 
 # ============================================================================
 # Join correctness against a multi-branch table.

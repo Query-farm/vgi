@@ -30,7 +30,7 @@ SELECT * FROM vgi_result_cache_flush();
 #    revalidatable), so a 400s advance lapses it in both tiers.
 # ---------------------------------------------------------------------------
 statement ok
-CREATE TEMP TABLE t AS SELECT COUNT(*) c FROM ex.data.cacheable_numbers;
+CREATE TABLE t AS SELECT COUNT(*) c FROM ex.data.cacheable_numbers;
 
 query I
 SELECT COUNT(*) FROM vgi_result_cache() WHERE function = 'cacheable_numbers';

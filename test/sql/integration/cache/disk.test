@@ -29,7 +29,7 @@ CALL truncate_duckdb_logs();
 
 # First scan → MISS + store to BOTH the memory and disk tiers.
 statement ok
-CREATE TEMP TABLE first AS SELECT nonce AS v FROM ex.data.cache_nonce;
+CREATE TABLE first AS SELECT nonce AS v FROM ex.data.cache_nonce;
 
 query I
 SELECT COUNT(*) >= 1 FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%result_cache.miss%';

@@ -22,7 +22,7 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 # a VGI scan is in the plan. Plain VGI scans without joins don't trigger it.
 
 statement ok
-CREATE TEMP TABLE local_keys_small AS SELECT * FROM generate_series(0, 9) t(id);
+CREATE TABLE local_keys_small AS SELECT * FROM generate_series(0, 9) t(id);
 
 # This join triggers the optimizer to raise the threshold
 statement ok
@@ -61,7 +61,7 @@ DROP TABLE local_keys_small;
 # 200 distinct SPARSE keys — not a dense range, so DuckDB creates an InFilter
 # (dense ranges like 0-199 are covered by min/max and DuckDB skips the InFilter)
 statement ok
-CREATE TEMP TABLE large_keys AS SELECT * FROM generate_series(0, 999, 5) t(id);
+CREATE TABLE large_keys AS SELECT * FROM generate_series(0, 999, 5) t(id);
 
 # Join against sequence(10000) — with pushdown, worker receives the join keys
 query I
@@ -135,7 +135,7 @@ RESET vgi_join_keys_threshold;
 # ============================================================================
 
 statement ok
-CREATE TEMP TABLE left_keys AS SELECT * FROM generate_series(9995, 10005) t(id);
+CREATE TABLE left_keys AS SELECT * FROM generate_series(9995, 10005) t(id);
 
 # Left join: keys 9995-9999 match in sequence(10000), 10000-10005 don't
 query I

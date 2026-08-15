@@ -85,13 +85,13 @@ statement ok
 SELECT * FROM vgi_result_cache_flush();
 
 statement ok
-CREATE TEMP TABLE nm_on AS SELECT x, i FROM range(30) g(x), LATERAL ex.cached_explode(x % 3);
+CREATE TABLE nm_on AS SELECT x, i FROM range(30) g(x), LATERAL ex.cached_explode(x % 3);
 
 statement ok
 SET vgi_result_cache_per_value=false;
 
 statement ok
-CREATE TEMP TABLE nm_off AS SELECT x, i FROM range(30) g(x), LATERAL ex.cached_explode(x % 3);
+CREATE TABLE nm_off AS SELECT x, i FROM range(30) g(x), LATERAL ex.cached_explode(x % 3);
 
 query I
 SELECT count(*) FROM (
