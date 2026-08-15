@@ -68,10 +68,12 @@ bool OAuthTokenSet::IsValid() const {
 	if (access_token.empty()) {
 		return false;
 	}
-	if (expires_at != std::chrono::steady_clock::time_point{}) {
-		return std::chrono::steady_clock::now() < expires_at;
-	}
-	return true;
+	// Treat a token inside the skew window as already stale. Letting one expire
+	// in flight is not free: GetToken() then returns "", the request goes out
+	// with no Authorization header, and the 401 costs a re-send of the whole
+	// body including the Arrow IPC payload. Refreshing early trades that for a
+	// single cheap token exchange.
+	return TokenStillFresh(expires_at, std::chrono::steady_clock::now(), kTokenRefreshSkew);
 }
 
 std::string OAuthTokenSet::BearerToken() const {
@@ -335,36 +337,46 @@ static std::string DebugSecret(const std::string &secret) {
 //===--------------------------------------------------------------------===//
 
 std::optional<OAuthChallenge> ParseWWWAuthenticate(const std::string &header) {
-	// Parse: Bearer resource_metadata="<url>", client_id="<id>"
-	// or: Bearer resource_metadata="<url>"
-	if (header.substr(0, 7) != "Bearer ") {
+	// Bearer resource_metadata="<url>"[, client_id="<id>"][, ...]
+	//
+	// The scheme token is matched case-insensitively (RFC 7235 says schemes are)
+	// and the parameters go through a real auth-param parser. The previous
+	// substring search had a concrete failure: `find("client_id=\"")` also
+	// matches inside `device_code_client_id="`, so a challenge carrying both
+	// reported the device client as the ordinary one — and since the ordinary
+	// client is what a browser (PKCE) flow presents, that is the wrong client
+	// for the flow that would use it.
+	static const std::string kScheme = "Bearer";
+	size_t pos = header.find_first_not_of(" \t");
+	if (pos == std::string::npos || header.size() - pos < kScheme.size()) {
+		return std::nullopt;
+	}
+	for (size_t i = 0; i < kScheme.size(); i++) {
+		if (std::tolower(static_cast<unsigned char>(header[pos + i])) !=
+		    std::tolower(static_cast<unsigned char>(kScheme[i]))) {
+			return std::nullopt;
+		}
+	}
+	pos += kScheme.size();
+	// The scheme must be a whole token, not the head of a longer one.
+	if (pos < header.size() && !std::isspace(static_cast<unsigned char>(header[pos]))) {
+		return std::nullopt;
+	}
+
+	const auto params = ParseAuthParams(header.substr(pos));
+	auto rm = params.find("resource_metadata");
+	if (rm == params.end() || rm->second.empty()) {
+		// Without it there is nothing to discover, so this is not a challenge
+		// this client can act on.
 		return std::nullopt;
 	}
 
 	OAuthChallenge challenge;
-
-	// Extract resource_metadata="..."
-	auto rm_pos = header.find("resource_metadata=\"");
-	if (rm_pos == std::string::npos) {
-		return std::nullopt;
+	challenge.resource_metadata_url = rm->second;
+	auto ci = params.find("client_id");
+	if (ci != params.end()) {
+		challenge.client_id = ci->second;
 	}
-	auto rm_start = rm_pos + 19; // length of 'resource_metadata="'
-	auto rm_end = header.find('"', rm_start);
-	if (rm_end == std::string::npos) {
-		return std::nullopt;
-	}
-	challenge.resource_metadata_url = header.substr(rm_start, rm_end - rm_start);
-
-	// Extract client_id="..." (optional in header, may come from resource metadata)
-	auto ci_pos = header.find("client_id=\"");
-	if (ci_pos != std::string::npos) {
-		auto ci_start = ci_pos + 11;
-		auto ci_end = header.find('"', ci_start);
-		if (ci_end != std::string::npos) {
-			challenge.client_id = header.substr(ci_start, ci_end - ci_start);
-		}
-	}
-
 	return challenge;
 }
 
@@ -871,10 +883,22 @@ static void PrintPromptIfColab(const std::string &msg) {
 // Device Code Flow (RFC 8628)
 //===--------------------------------------------------------------------===//
 
+// The interactive-flow budget, in seconds. Read fresh per flow so a `SET` takes
+// effect without re-attaching.
+static int64_t GetOAuthTimeoutSeconds(ClientContext &context) {
+	int64_t timeout_seconds = 120;
+	Value timeout_val;
+	if (context.TryGetCurrentSetting("vgi_oauth_timeout_seconds", timeout_val)) {
+		timeout_seconds = timeout_val.GetValue<int64_t>();
+	}
+	return timeout_seconds;
+}
+
 static OAuthTokenSet PerformDeviceCodeFlowImpl(const OAuthChallenge &challenge,
                                                       const OAuthResourceMetadata &resource_meta,
                                                       const OAuthServerMetadata &server_meta,
-                                                      ClientContext &context) {
+                                                      ClientContext &context,
+                                                      OAuthRefreshContext *refresh_ctx_out) {
 	if (server_meta.device_authorization_endpoint.empty()) {
 		throw IOException("VGI OAuth: device code flow requested but server has no device_authorization_endpoint");
 	}
@@ -883,26 +907,34 @@ static OAuthTokenSet PerformDeviceCodeFlowImpl(const OAuthChallenge &challenge,
 		                  "urn:ietf:params:oauth:grant-type:device_code in grant_types_supported");
 	}
 
-	// Get timeout setting
-	int64_t timeout_seconds = 120;
-	Value timeout_val;
-	if (context.TryGetCurrentSetting("vgi_oauth_timeout_seconds", timeout_val)) {
-		timeout_seconds = timeout_val.GetValue<int64_t>();
-	}
+	const int64_t timeout_seconds = GetOAuthTimeoutSeconds(context);
 
 	VGI_STDERR_DEBUG("[VGI] oauth.device_code_flow resource_metadata=%s\n",
 	                 challenge.resource_metadata_url.c_str());
 
-	// Prefer device_code_client_id for device code flow (e.g., Google requires separate TV-type client)
-	std::string client_id = resource_meta.device_code_client_id;
-	std::string client_secret = resource_meta.device_code_client_secret;
-	if (client_id.empty()) {
-		// Fall back to the standard client_id
-		client_id = resource_meta.client_id.empty() ? challenge.client_id : resource_meta.client_id;
-		client_secret = resource_meta.client_secret;
-	}
+	// Prefer device_code_client_id (e.g. Google requires a separate TV-type client).
+	auto device_client = SelectDeviceCodeClient(resource_meta.device_code_client_id,
+	                                            resource_meta.device_code_client_secret,
+	                                            resource_meta.client_id, resource_meta.client_secret,
+	                                            challenge.client_id);
+	std::string client_id = device_client.client_id;
+	std::string client_secret = device_client.client_secret;
 	if (client_id.empty()) {
 		throw IOException("VGI OAuth: no client_id found in WWW-Authenticate header or resource metadata");
+	}
+
+	// Record the client THIS flow used, overriding the caller's provisional
+	// choice. RFC 6749 §6 requires the refresh request to be authenticated as
+	// the client the grant was issued to; presenting the ordinary client id
+	// against a device-issued refresh token makes Google answer invalid_grant,
+	// which then clears the refresh token and silently forces a full
+	// interactive login on every expiry.
+	if (refresh_ctx_out) {
+		refresh_ctx_out->client_id = client_id;
+		// When the token-endpoint proxy is in use the server injects the secret
+		// upstream, so carrying one locally is both unnecessary and wrong.
+		refresh_ctx_out->client_secret =
+		    resource_meta.token_endpoint.empty() ? client_secret : std::string();
 	}
 
 	// Build scope string
@@ -1174,13 +1206,13 @@ OAuthTokenSet PerformAuthFlow(const OAuthChallenge &challenge,
 		return PerformPKCEFlowImpl(challenge, resource_meta, server_meta, context);
 	}
 	if (has_device_ep) {
-		return PerformDeviceCodeFlowImpl(challenge, resource_meta, server_meta, context);
+		return PerformDeviceCodeFlowImpl(challenge, resource_meta, server_meta, context, &refresh_ctx_out);
 	}
 	throw IOException("VGI OAuth: server supports neither authorization_endpoint (PKCE) nor device_authorization_endpoint");
 #endif
 
 	if (flow == "device_code") {
-		return PerformDeviceCodeFlowImpl(challenge, resource_meta, server_meta, context);
+		return PerformDeviceCodeFlowImpl(challenge, resource_meta, server_meta, context, &refresh_ctx_out);
 	}
 
 	if (flow == "pkce") {
@@ -1194,7 +1226,7 @@ OAuthTokenSet PerformAuthFlow(const OAuthChallenge &challenge,
 	// Server only has device endpoint
 	if (!has_auth_ep && has_device_ep) {
 		VGI_STDERR_DEBUG("[VGI] oauth.auto_flow chose=device_code reason=no_authorization_endpoint\n");
-		return PerformDeviceCodeFlowImpl(challenge, resource_meta, server_meta, context);
+		return PerformDeviceCodeFlowImpl(challenge, resource_meta, server_meta, context, &refresh_ctx_out);
 	}
 
 	// Headless / notebook environment. Colab is checked explicitly: it doesn't
@@ -1202,21 +1234,23 @@ OAuthTokenSet PerformAuthFlow(const OAuthChallenge &challenge,
 	// server-side PKCE/localhost path would open an invisible browser and hang.
 	if (has_device_ep && (IsHeadlessEnvironment() || IsColabEnvironment())) {
 		VGI_STDERR_DEBUG("[VGI] oauth.auto_flow chose=device_code reason=headless_environment\n");
-		return PerformDeviceCodeFlowImpl(challenge, resource_meta, server_meta, context);
+		return PerformDeviceCodeFlowImpl(challenge, resource_meta, server_meta, context, &refresh_ctx_out);
 	}
 
-	// Try PKCE, fallback to device code on socket bind failure
+	// Try PKCE, falling back to device code when the loopback callback server
+	// cannot bind. The fallback keys on a dedicated exception type rather than a
+	// substring of the message: control flow that depends on the wording of an
+	// error string breaks silently the moment anyone rewords it, and would also
+	// fire on an unrelated failure whose text happened to contain the phrase.
 	if (has_auth_ep) {
 		try {
 			return PerformPKCEFlowImpl(challenge, resource_meta, server_meta, context);
-		} catch (const IOException &e) {
-			// Only fallback on socket bind/listen failures
-			std::string msg = e.what();
-			if (has_device_ep && msg.find("failed to bind local callback server") != std::string::npos) {
-				VGI_STDERR_DEBUG("[VGI] oauth.auto_flow chose=device_code reason=pkce_bind_failed\n");
-				return PerformDeviceCodeFlowImpl(challenge, resource_meta, server_meta, context);
+		} catch (const PkceCallbackBindFailure &) {
+			if (!has_device_ep) {
+				throw;
 			}
-			throw;
+			VGI_STDERR_DEBUG("[VGI] oauth.auto_flow chose=device_code reason=pkce_bind_failed\n");
+			return PerformDeviceCodeFlowImpl(challenge, resource_meta, server_meta, context, &refresh_ctx_out);
 		}
 	}
 
@@ -1456,12 +1490,7 @@ static OAuthTokenSet PerformPKCEFlowImpl(const OAuthChallenge &challenge,
 	DUCKDB_LOG_WARNING(context, "Authentication required for " + GetResourceDisplayName(resource_meta) +
 	    ". Opening browser...");
 
-	// Get timeout setting
-	int64_t timeout_seconds = 120;
-	Value timeout_val;
-	if (context.TryGetCurrentSetting("vgi_oauth_timeout_seconds", timeout_val)) {
-		timeout_seconds = timeout_val.GetValue<int64_t>();
-	}
+	const int64_t timeout_seconds = GetOAuthTimeoutSeconds(context);
 
 	// Open popup and block until auth code comes back (or timeout)
 	char *code_ptr = duckdb_wasm_open_auth_url(auth_url.c_str(), static_cast<int>(timeout_seconds * 1000));
@@ -1493,12 +1522,7 @@ static OAuthTokenSet PerformPKCEFlowImpl(const OAuthChallenge &challenge,
                                                 const OAuthResourceMetadata &resource_meta,
                                                 const OAuthServerMetadata &server_meta,
                                                 ClientContext &context) {
-	// Get timeout setting
-	int64_t timeout_seconds = 120;
-	Value timeout_val;
-	if (context.TryGetCurrentSetting("vgi_oauth_timeout_seconds", timeout_val)) {
-		timeout_seconds = timeout_val.GetValue<int64_t>();
-	}
+	const int64_t timeout_seconds = GetOAuthTimeoutSeconds(context);
 
 	VGI_STDERR_DEBUG("[VGI] oauth.pkce_flow resource_metadata=%s\n",
 	                 challenge.resource_metadata_url.c_str());
@@ -1570,7 +1594,7 @@ static OAuthTokenSet PerformPKCEFlowImpl(const OAuthChallenge &challenge,
 
 	int port = svr.bind_to_any_port("127.0.0.1");
 	if (port < 0) {
-		throw IOException("VGI OAuth: failed to bind local callback server");
+		throw PkceCallbackBindFailure();
 	}
 
 	// Use "localhost" instead of "127.0.0.1" in the redirect URI. Azure AD
@@ -1871,11 +1895,24 @@ std::string OAuthCatalogAuth::HandleUnauthorized(const OAuthChallenge &challenge
 			    "discovery endpoint also returned 401.");
 		}
 
-		// Another thread is already doing the auth flow — wait
+		// Another thread is already doing the auth flow — wait for it.
+		//
+		// Bounded, because the leader may be sitting in a device-code poll
+		// waiting for a human to type a code: an unbounded wait turns that into
+		// every other thread hanging for the full flow timeout with nothing to
+		// show for it. The bound is generous enough to cover a completed login
+		// and still report rather than hang.
 		VGI_STDERR_DEBUG("[VGI] oauth.waiting_for_auth\n");
-		state_.cv.wait(lock, [this]() {
-			return state_.status != AuthState::Status::IN_PROGRESS;
-		});
+		const auto wait_budget = std::chrono::seconds(GetOAuthTimeoutSeconds(context)) +
+		                         std::chrono::seconds(30);
+		if (!state_.cv.wait_for(lock, wait_budget, [this]() {
+			    return state_.status != AuthState::Status::IN_PROGRESS;
+		    })) {
+			throw IOException(
+			    "VGI OAuth: timed out waiting for another thread to finish authenticating "
+			    "(waited %llds). The interactive flow may not have been completed.",
+			    static_cast<long long>(wait_budget.count()));
+		}
 
 		if (state_.status == AuthState::Status::COMPLETE && state_.token.IsValid()) {
 			return state_.token.BearerToken();

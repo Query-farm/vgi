@@ -219,6 +219,63 @@ bool IsHeadlessEnvironment();
 // C-level stderr into the notebook cell, so the device-code prompt (URL + user
 // code) is written to stderr there — otherwise it only reaches DUCKDB_LOG_WARNING,
 // which the Python client never surfaces, and login appears to hang.
+// Parse the auth-params of a `WWW-Authenticate` challenge into name -> value.
+//
+// A real RFC 9110 parser rather than a substring search, because searching is
+// wrong in a way that bites: `find("client_id=\"")` also matches *inside*
+// `device_code_client_id="`, so a challenge advertising both would report the
+// device client as the ordinary one. Handles quoted values (which may contain
+// commas and equals signs), backslash escapes, unquoted values, and
+// case-insensitive parameter names.
+std::map<std::string, std::string> ParseAuthParams(const std::string &params);
+
+// The loopback callback server could not bind a port.
+//
+// A dedicated type rather than a plain IOException so the auto-mode fallback to
+// the device-code flow can key on the failure *kind*. Keying on the message text
+// — as this once did — means any rewording silently disables the fallback, and a
+// headless or port-restricted user gets a hard failure instead of a device code.
+class PkceCallbackBindFailure : public IOException {
+public:
+	PkceCallbackBindFailure()
+	    : IOException("VGI OAuth: failed to bind local callback server") {
+	}
+};
+
+// The client credentials a flow presents. OAuth 2.0 (RFC 6749 §6) requires a
+// refresh request to be authenticated as the *same* client the grant was issued
+// to, so whichever flow ran must hand its choice to the refresh context —
+// selecting again later can pick a different client and the refresh is refused.
+struct OAuthClientCredentials {
+	std::string client_id;
+	std::string client_secret;
+};
+
+// Which client the device-code flow presents.
+//
+// Providers such as Google register a separate "TV/device" client, advertised as
+// `device_code_client_id`. When present it wins; otherwise fall back to the
+// ordinary client, preferring resource metadata over the challenge header.
+OAuthClientCredentials SelectDeviceCodeClient(const std::string &device_client_id,
+                                              const std::string &device_client_secret,
+                                              const std::string &client_id,
+                                              const std::string &client_secret,
+                                              const std::string &challenge_client_id);
+
+// Whether an access token is still usable `skew` ahead of now.
+//
+// The margin matters because an expired token is not merely refreshed: the
+// request goes out with no Authorization header at all, so the server answers
+// 401 and the entire body — Arrow IPC payload included — is re-sent. Refreshing
+// slightly early trades that for one cheap token exchange. A zero-valued
+// `expires_at` means the token never expires.
+bool TokenStillFresh(std::chrono::steady_clock::time_point expires_at,
+                     std::chrono::steady_clock::time_point now,
+                     std::chrono::seconds skew);
+
+// How far ahead of expiry a token is treated as already stale.
+static constexpr std::chrono::seconds kTokenRefreshSkew {45};
+
 bool IsColabEnvironment();
 
 // True iff url is a plain-http loopback URL (127.0.0.1 / localhost / [::1]) with a

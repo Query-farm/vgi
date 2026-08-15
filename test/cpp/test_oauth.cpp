@@ -9,7 +9,9 @@
 
 #include "vgi_oauth.hpp"
 
+#include <chrono>
 #include <cstdlib>
+#include <map>
 #include <string>
 
 using duckdb::vgi::IsColabEnvironment;
@@ -86,4 +88,129 @@ TEST_CASE("IsLoopbackHttpUrl rejects look-alike and remote hosts", "[oauth]") {
 	CHECK_FALSE(IsLoopbackHttpUrl("http://evil.com"));
 	CHECK_FALSE(IsLoopbackHttpUrl("https://127.0.0.1")); // https handled separately
 	CHECK_FALSE(IsLoopbackHttpUrl(""));
+}
+
+//===--------------------------------------------------------------------===//
+// SelectDeviceCodeClient — which client the device-code flow presents
+//===--------------------------------------------------------------------===//
+
+TEST_CASE("SelectDeviceCodeClient prefers the dedicated device client", "[oauth]") {
+	// Google registers a separate "TV/device" client; when the resource
+	// metadata advertises one it must win, secret and all.
+	auto c = duckdb::vgi::SelectDeviceCodeClient("tv-client", "tv-secret", "web-client",
+	                                             "web-secret", "challenge-client");
+	REQUIRE(c.client_id == "tv-client");
+	REQUIRE(c.client_secret == "tv-secret");
+}
+
+TEST_CASE("SelectDeviceCodeClient does not pair a device id with the web secret", "[oauth]") {
+	// A device client with no secret keeps no secret. Splicing the web client's
+	// secret onto a device client id is rejected just as surely as the wrong id.
+	auto c = duckdb::vgi::SelectDeviceCodeClient("tv-client", "", "web-client", "web-secret",
+	                                             "challenge-client");
+	REQUIRE(c.client_id == "tv-client");
+	REQUIRE(c.client_secret.empty());
+}
+
+TEST_CASE("SelectDeviceCodeClient falls back to the ordinary client", "[oauth]") {
+	auto c = duckdb::vgi::SelectDeviceCodeClient("", "", "web-client", "web-secret",
+	                                             "challenge-client");
+	REQUIRE(c.client_id == "web-client");
+	REQUIRE(c.client_secret == "web-secret");
+}
+
+TEST_CASE("SelectDeviceCodeClient falls back to the challenge client last", "[oauth]") {
+	auto c = duckdb::vgi::SelectDeviceCodeClient("", "", "", "", "challenge-client");
+	REQUIRE(c.client_id == "challenge-client");
+}
+
+TEST_CASE("SelectDeviceCodeClient reports nothing when nothing is configured", "[oauth]") {
+	// The caller turns this into an actionable error; the selector's job is to
+	// say honestly that it found no client rather than invent one.
+	auto c = duckdb::vgi::SelectDeviceCodeClient("", "", "", "", "");
+	REQUIRE(c.client_id.empty());
+}
+
+//===--------------------------------------------------------------------===//
+// TokenStillFresh — the refresh skew margin
+//===--------------------------------------------------------------------===//
+
+TEST_CASE("TokenStillFresh treats a zero deadline as never expiring", "[oauth]") {
+	const auto now = std::chrono::steady_clock::now();
+	REQUIRE(duckdb::vgi::TokenStillFresh(std::chrono::steady_clock::time_point {}, now,
+	                                     std::chrono::seconds(45)));
+}
+
+TEST_CASE("TokenStillFresh refreshes inside the skew window", "[oauth]") {
+	// The point of the margin: a token with 20s left is treated as stale, so it
+	// is refreshed before a request can go out unauthenticated and cost a
+	// full-body re-send.
+	const auto now = std::chrono::steady_clock::now();
+	const auto expires = now + std::chrono::seconds(20);
+	REQUIRE_FALSE(duckdb::vgi::TokenStillFresh(expires, now, std::chrono::seconds(45)));
+	// With no margin the same token would still read as usable.
+	REQUIRE(duckdb::vgi::TokenStillFresh(expires, now, std::chrono::seconds(0)));
+}
+
+TEST_CASE("TokenStillFresh keeps a token comfortably ahead of expiry", "[oauth]") {
+	const auto now = std::chrono::steady_clock::now();
+	REQUIRE(duckdb::vgi::TokenStillFresh(now + std::chrono::seconds(3600), now,
+	                                     std::chrono::seconds(45)));
+}
+
+TEST_CASE("TokenStillFresh rejects an already-expired token", "[oauth]") {
+	const auto now = std::chrono::steady_clock::now();
+	REQUIRE_FALSE(duckdb::vgi::TokenStillFresh(now - std::chrono::seconds(1), now,
+	                                           std::chrono::seconds(45)));
+}
+
+//===--------------------------------------------------------------------===//
+// ParseAuthParams — the WWW-Authenticate challenge parser
+//===--------------------------------------------------------------------===//
+
+TEST_CASE("ParseAuthParams does not confuse client_id with device_code_client_id", "[oauth]") {
+	// The regression that motivated the rewrite. `device_code_client_id="`
+	// CONTAINS `client_id="` as a substring at offset 12, so a `find()`-based
+	// parser reading whichever comes first would report the device client as
+	// the ordinary one — and the ordinary client is what the browser flow
+	// presents, so the wrong client would be used for the wrong flow.
+	const std::string params =
+	    R"( resource_metadata="https://x/rm", device_code_client_id="tv-client", client_id="web-client")";
+	auto p = duckdb::vgi::ParseAuthParams(params);
+	REQUIRE(p["client_id"] == "web-client");
+	REQUIRE(p["device_code_client_id"] == "tv-client");
+}
+
+TEST_CASE("ParseAuthParams is insensitive to parameter order", "[oauth]") {
+	auto a = duckdb::vgi::ParseAuthParams(R"( client_id="c", resource_metadata="https://x")");
+	auto b = duckdb::vgi::ParseAuthParams(R"( resource_metadata="https://x", client_id="c")");
+	REQUIRE(a == b);
+}
+
+TEST_CASE("ParseAuthParams keeps commas and equals inside a quoted value", "[oauth]") {
+	// Exactly what splitting on ',' gets wrong.
+	auto p = duckdb::vgi::ParseAuthParams(R"( resource_metadata="https://x/rm?a=1,b=2")");
+	REQUIRE(p["resource_metadata"] == "https://x/rm?a=1,b=2");
+}
+
+TEST_CASE("ParseAuthParams unescapes backslash escapes", "[oauth]") {
+	auto p = duckdb::vgi::ParseAuthParams(R"( client_id="say \"hi\"")");
+	REQUIRE(p["client_id"] == "say \"hi\"");
+}
+
+TEST_CASE("ParseAuthParams accepts unquoted values", "[oauth]") {
+	auto p = duckdb::vgi::ParseAuthParams(" resource_metadata=https://x/rm, client_id=abc");
+	REQUIRE(p["resource_metadata"] == "https://x/rm");
+	REQUIRE(p["client_id"] == "abc");
+}
+
+TEST_CASE("ParseAuthParams lowercases parameter names", "[oauth]") {
+	auto p = duckdb::vgi::ParseAuthParams(R"( Resource_Metadata="https://x")");
+	REQUIRE(p["resource_metadata"] == "https://x");
+}
+
+TEST_CASE("ParseAuthParams tolerates extra whitespace", "[oauth]") {
+	auto p = duckdb::vgi::ParseAuthParams("  resource_metadata = \"https://x\"  ,  client_id = \"c\"  ");
+	REQUIRE(p["resource_metadata"] == "https://x");
+	REQUIRE(p["client_id"] == "c");
 }
