@@ -11,26 +11,23 @@ require httpfs
 statement ok
 ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
-statement ok
-USE example;
-
 # ============================================================================
-# Basic ConstParam — vgi_percentile(value, percentile)
+# Basic ConstParam — example.main.vgi_percentile(value, percentile)
 # percentile is constant-folded at bind time
 # ============================================================================
 
 query R
-SELECT vgi_percentile(i::DOUBLE, 0.0) FROM range(10) t(i);
+SELECT example.main.vgi_percentile(i::DOUBLE, 0.0) FROM range(10) t(i);
 ----
 0.0
 
 query R
-SELECT vgi_percentile(i::DOUBLE, 0.5) FROM range(10) t(i);
+SELECT example.main.vgi_percentile(i::DOUBLE, 0.5) FROM range(10) t(i);
 ----
 5.0
 
 query R
-SELECT vgi_percentile(i::DOUBLE, 0.9) FROM range(10) t(i);
+SELECT example.main.vgi_percentile(i::DOUBLE, 0.9) FROM range(10) t(i);
 ----
 9.0
 
@@ -42,7 +39,7 @@ statement ok
 SET threads=1;
 
 query IR
-SELECT i % 3 AS grp, vgi_percentile(i::DOUBLE, 0.5)
+SELECT i % 3 AS grp, example.main.vgi_percentile(i::DOUBLE, 0.5)
 FROM range(9) t(i)
 GROUP BY grp ORDER BY grp;
 ----
@@ -55,7 +52,7 @@ GROUP BY grp ORDER BY grp;
 # ============================================================================
 
 query R
-SELECT vgi_percentile(i::DOUBLE, 0.25 + 0.25) FROM range(10) t(i);
+SELECT example.main.vgi_percentile(i::DOUBLE, 0.25 + 0.25) FROM range(10) t(i);
 ----
 5.0
 
@@ -64,10 +61,10 @@ SELECT vgi_percentile(i::DOUBLE, 0.25 + 0.25) FROM range(10) t(i);
 # ============================================================================
 
 query IR
-SELECT i % 3 AS grp, vgi_percentile(i::DOUBLE, 0.5)
+SELECT i % 3 AS grp, example.main.vgi_percentile(i::DOUBLE, 0.5)
 FROM range(9) t(i)
 GROUP BY grp
-HAVING vgi_percentile(i::DOUBLE, 0.5) > 3.5
+HAVING example.main.vgi_percentile(i::DOUBLE, 0.5) > 3.5
 ORDER BY grp;
 ----
 1	4.0
@@ -81,18 +78,18 @@ ORDER BY grp;
 # ============================================================================
 
 query R
-SELECT vgi_percentile(i::DOUBLE, 0.0) FROM range(10) t(i);
+SELECT example.main.vgi_percentile(i::DOUBLE, 0.0) FROM range(10) t(i);
 ----
 0.0
 
 query R
-SELECT vgi_percentile(i::DOUBLE, 0.9) FROM range(10) t(i);
+SELECT example.main.vgi_percentile(i::DOUBLE, 0.9) FROM range(10) t(i);
 ----
 9.0
 
 # Grouped with phase="finalize" ConstParam
 query IR
-SELECT i % 2 AS grp, vgi_percentile(i::DOUBLE, 0.0)
+SELECT i % 2 AS grp, example.main.vgi_percentile(i::DOUBLE, 0.0)
 FROM range(10) t(i)
 GROUP BY grp ORDER BY grp;
 ----
@@ -107,36 +104,33 @@ GROUP BY grp ORDER BY grp;
 # ============================================================================
 
 statement error
-SELECT vgi_percentile(i::DOUBLE, NULL) FROM range(10) t(i);
+SELECT example.main.vgi_percentile(i::DOUBLE, NULL) FROM range(10) t(i);
 ----
 percentile must not be NULL
 
 statement error
-SELECT vgi_percentile(i::DOUBLE, 'nan'::DOUBLE) FROM range(10) t(i);
+SELECT example.main.vgi_percentile(i::DOUBLE, 'nan'::DOUBLE) FROM range(10) t(i);
 ----
 percentile must be a finite number
 
 statement error
-SELECT vgi_percentile(i::DOUBLE, 'inf'::DOUBLE) FROM range(10) t(i);
+SELECT example.main.vgi_percentile(i::DOUBLE, 'inf'::DOUBLE) FROM range(10) t(i);
 ----
 percentile must be a finite number
 
 statement error
-SELECT vgi_percentile(i::DOUBLE, -0.1) FROM range(10) t(i);
+SELECT example.main.vgi_percentile(i::DOUBLE, -0.1) FROM range(10) t(i);
 ----
 percentile must be in [0, 1]
 
 statement error
-SELECT vgi_percentile(i::DOUBLE, 1.5) FROM range(10) t(i);
+SELECT example.main.vgi_percentile(i::DOUBLE, 1.5) FROM range(10) t(i);
 ----
 percentile must be in [0, 1]
 
 # ============================================================================
 # Cleanup
 # ============================================================================
-
-statement ok
-USE memory;
 
 statement ok
 DETACH example;

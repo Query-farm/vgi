@@ -1,5 +1,5 @@
 # name: test/sql/integration/table_in_out/unnest_tensor_rows.test
-# description: Tests for unnest_tensor_rows (table-in-out variant of unnest_tensor) and LATERAL joins
+# description: Tests for example.main.unnest_tensor_rows (table-in-out variant of unnest_tensor) and LATERAL joins
 # group: [vgi_integration_table_in_out]
 
 require-env VGI_TEST_WORKER
@@ -12,9 +12,6 @@ statement ok
 ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
 statement ok
-USE example;
-
-statement ok
 SET threads=1;
 
 # ============================================================================
@@ -23,8 +20,8 @@ SET threads=1;
 
 query II
 SELECT u.value, u.axes.i
-FROM unnest_tensor_rows((
-  SELECT nest_tensor(v, {i: i})
+FROM example.main.unnest_tensor_rows((
+  SELECT example.main.nest_tensor(v, {i: i})
   FROM (VALUES (10, 0), (20, 1), (30, 2)) t(v, i)
 )) u
 ORDER BY u.axes.i;
@@ -39,8 +36,8 @@ ORDER BY u.axes.i;
 
 query III
 SELECT u.axes.x, u.axes.y, u.value
-FROM unnest_tensor_rows((
-  SELECT nest_tensor(v, {x: x, y: y})
+FROM example.main.unnest_tensor_rows((
+  SELECT example.main.nest_tensor(v, {x: x, y: y})
   FROM (VALUES (1,0,0),(2,0,1),(3,1,0),(4,1,1)) d(v, x, y)
 )) u
 ORDER BY u.axes.x, u.axes.y;
@@ -57,12 +54,12 @@ ORDER BY u.axes.x, u.axes.y;
 # 1D per group via LATERAL
 query III
 WITH grouped AS (
-  SELECT g, nest_tensor(v, {i: i}) AS t
+  SELECT g, example.main.nest_tensor(v, {i: i}) AS t
   FROM (VALUES (0, 10, 0), (0, 20, 1), (1, 100, 0), (1, 200, 1)) d(g, v, i)
   GROUP BY g
 )
 SELECT grouped.g, u.axes.i, u.value
-FROM grouped, LATERAL unnest_tensor_rows((SELECT grouped.t)) u
+FROM grouped, LATERAL example.main.unnest_tensor_rows((SELECT grouped.t)) u
 ORDER BY grouped.g, u.axes.i;
 ----
 0	0	10
@@ -73,13 +70,13 @@ ORDER BY grouped.g, u.axes.i;
 # 2D per group via LATERAL, with a sparse group to exercise null cells
 query IIII
 WITH grouped AS (
-  SELECT g, nest_tensor(v, {x: x, y: y}) AS t
+  SELECT g, example.main.nest_tensor(v, {x: x, y: y}) AS t
   FROM (VALUES (0,1,0,0),(0,2,0,1),(0,3,1,0),(0,4,1,1),
                (1,10,0,0),(1,20,1,1)) d(g, v, x, y)
   GROUP BY g
 )
 SELECT grouped.g, u.axes.x, u.axes.y, u.value
-FROM grouped, LATERAL unnest_tensor_rows((SELECT grouped.t)) u
+FROM grouped, LATERAL example.main.unnest_tensor_rows((SELECT grouped.t)) u
 ORDER BY grouped.g, u.axes.x, u.axes.y;
 ----
 0	0	0	1
@@ -103,11 +100,11 @@ WITH source AS (
   ) d(g, v, x, y, z)
 ),
 grouped AS (
-  SELECT g, nest_tensor(v, {x: x, y: y, z: z}) AS t
+  SELECT g, example.main.nest_tensor(v, {x: x, y: y, z: z}) AS t
   FROM source GROUP BY g
 )
 SELECT grouped.g, u.axes.x, u.axes.y, u.axes.z
-FROM grouped, LATERAL unnest_tensor_rows((SELECT grouped.t)) u
+FROM grouped, LATERAL example.main.unnest_tensor_rows((SELECT grouped.t)) u
 WHERE u.value IS NOT NULL
 ORDER BY grouped.g, u.axes.x, u.axes.y, u.axes.z;
 ----
@@ -127,7 +124,7 @@ ORDER BY grouped.g, u.axes.x, u.axes.y, u.axes.z;
 
 query III
 WITH grouped AS (
-  SELECT g, nest_tensor(v, {k: k}) AS t
+  SELECT g, example.main.nest_tensor(v, {k: k}) AS t
   FROM (VALUES
     (1, 7, 'a'),
     (2, 8, 'b'), (2, 9, 'c'),
@@ -136,7 +133,7 @@ WITH grouped AS (
   GROUP BY g
 )
 SELECT grouped.g, u.axes.k, u.value
-FROM grouped, LATERAL unnest_tensor_rows((SELECT grouped.t)) u
+FROM grouped, LATERAL example.main.unnest_tensor_rows((SELECT grouped.t)) u
 ORDER BY grouped.g, u.axes.k;
 ----
 1	a	7
@@ -152,7 +149,7 @@ ORDER BY grouped.g, u.axes.k;
 
 query IITI
 WITH grouped AS (
-  SELECT g, nest_tensor(v, {kind: kind, idx: idx}) AS t
+  SELECT g, example.main.nest_tensor(v, {kind: kind, idx: idx}) AS t
   FROM (VALUES
     (1, 100, 'alpha', 0), (1, 101, 'alpha', 1),
     (1, 200, 'beta',  0), (1, 201, 'beta',  1)
@@ -160,7 +157,7 @@ WITH grouped AS (
   GROUP BY g
 )
 SELECT grouped.g, u.axes.idx, u.axes.kind, u.value
-FROM grouped, LATERAL unnest_tensor_rows((SELECT grouped.t)) u
+FROM grouped, LATERAL example.main.unnest_tensor_rows((SELECT grouped.t)) u
 ORDER BY grouped.g, u.axes.kind, u.axes.idx;
 ----
 1	0	alpha	100
@@ -180,14 +177,14 @@ WITH outer_tbl AS (
   SELECT 2 AS g, NULL
 )
 SELECT outer_tbl.g, u.value
-FROM outer_tbl, LATERAL unnest_tensor_rows((SELECT outer_tbl.t)) u
+FROM outer_tbl, LATERAL example.main.unnest_tensor_rows((SELECT outer_tbl.t)) u
 ORDER BY outer_tbl.g, u.axes.i;
 ----
 1	10
 1	20
 
 # ============================================================================
-# Multi-column LATERAL: echo (no finalize, >1 output column) exercises the
+# Multi-column LATERAL: example.main.echo (no finalize, >1 output column) exercises the
 # scratch-chunk path where n_children > 1 and we must preserve DuckDB's
 # pre-filled correlated columns while writing multiple function outputs.
 # ============================================================================
@@ -195,7 +192,7 @@ ORDER BY outer_tbl.g, u.axes.i;
 query IIIT
 WITH t(a, b) AS (VALUES (1, 'x'), (2, 'y'), (3, 'z'))
 SELECT t.a, e.a AS echo_a, t.a, e.b AS echo_b
-FROM t, LATERAL echo((SELECT t.a AS a, t.b AS b)) e
+FROM t, LATERAL example.main.echo((SELECT t.a AS a, t.b AS b)) e
 ORDER BY t.a;
 ----
 1	1	1	x
@@ -206,7 +203,7 @@ ORDER BY t.a;
 query IIIII
 WITH src(a, b, c) AS (VALUES (1, 2, 3), (10, 20, 30), (100, 200, 300))
 SELECT src.a, e.a, e.b, e.c, src.c
-FROM src, LATERAL echo((SELECT src.a AS a, src.b AS b, src.c AS c)) e
+FROM src, LATERAL example.main.echo((SELECT src.a AS a, src.b AS b, src.c AS c)) e
 ORDER BY src.a;
 ----
 1	1	2	3	3
@@ -220,13 +217,13 @@ ORDER BY src.a;
 # ============================================================================
 
 query II
-SELECT * FROM sum_all_columns((SELECT unnest(range(5))::BIGINT AS x, (unnest(range(5)) * 2)::BIGINT AS y));
+SELECT * FROM example.main.sum_all_columns((SELECT unnest(range(5))::BIGINT AS x, (unnest(range(5)) * 2)::BIGINT AS y));
 ----
 10	20
 
-# And buffer_input (another has_finalize=True) must still flush its buffer at
+# And example.main.buffer_input (another has_finalize=True) must still flush its buffer at
 # finalize.
 query I
-SELECT COUNT(*) FROM buffer_input((SELECT unnest(range(7)) AS n));
+SELECT COUNT(*) FROM example.main.buffer_input((SELECT unnest(range(7)) AS n));
 ----
 7

@@ -11,24 +11,18 @@ require httpfs
 statement ok
 ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
-statement ok
-USE example;
-
 # ============================================================================
 # Large ungrouped sum with many batches (forces multiple update calls)
 # ============================================================================
 
 query I
-SELECT vgi_sum(i::BIGINT) FROM range(1000000) t(i);
+SELECT example.main.vgi_sum(i::BIGINT) FROM range(1000000) t(i);
 ----
 499999500000
 
 # ============================================================================
 # Cleanup
 # ============================================================================
-
-statement ok
-USE memory;
 
 statement ok
 DETACH example;

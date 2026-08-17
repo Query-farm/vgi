@@ -11,43 +11,40 @@ require httpfs
 statement ok
 ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
-statement ok
-USE example;
-
 # ============================================================================
 # Dynamic return type — output type matches input type
 # ============================================================================
 
 # BIGINT input → BIGINT output
 query I
-SELECT vgi_generic_sum(i::BIGINT) FROM range(10) t(i);
+SELECT example.main.vgi_generic_sum(i::BIGINT) FROM range(10) t(i);
 ----
 45
 
 query T
-SELECT typeof(vgi_generic_sum(i::BIGINT)) FROM range(10) t(i);
+SELECT typeof(example.main.vgi_generic_sum(i::BIGINT)) FROM range(10) t(i);
 ----
 BIGINT
 
 # DOUBLE input → DOUBLE output
 query R
-SELECT vgi_generic_sum(i::DOUBLE) FROM range(10) t(i);
+SELECT example.main.vgi_generic_sum(i::DOUBLE) FROM range(10) t(i);
 ----
 45.0
 
 query T
-SELECT typeof(vgi_generic_sum(i::DOUBLE)) FROM range(10) t(i);
+SELECT typeof(example.main.vgi_generic_sum(i::DOUBLE)) FROM range(10) t(i);
 ----
 DOUBLE
 
 # INTEGER input → INTEGER output
 query I
-SELECT vgi_generic_sum(i::INTEGER) FROM range(10) t(i);
+SELECT example.main.vgi_generic_sum(i::INTEGER) FROM range(10) t(i);
 ----
 45
 
 query T
-SELECT typeof(vgi_generic_sum(i::INTEGER)) FROM range(10) t(i);
+SELECT typeof(example.main.vgi_generic_sum(i::INTEGER)) FROM range(10) t(i);
 ----
 INTEGER
 
@@ -59,7 +56,7 @@ statement ok
 SET threads=1;
 
 query II
-SELECT i % 3 AS grp, vgi_generic_sum(i::BIGINT)
+SELECT i % 3 AS grp, example.main.vgi_generic_sum(i::BIGINT)
 FROM range(9) t(i) GROUP BY grp ORDER BY grp;
 ----
 0	9
@@ -69,9 +66,6 @@ FROM range(9) t(i) GROUP BY grp ORDER BY grp;
 # ============================================================================
 # Cleanup
 # ============================================================================
-
-statement ok
-USE memory;
 
 statement ok
 DETACH example;

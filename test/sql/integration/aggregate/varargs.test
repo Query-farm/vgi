@@ -11,28 +11,25 @@ require httpfs
 statement ok
 ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
-statement ok
-USE example;
-
 # ============================================================================
 # Basic varargs: sum all columns
 # ============================================================================
 
 # Single column
 query I
-SELECT vgi_sum_all(i::BIGINT)::BIGINT FROM range(1, 6) t(i);
+SELECT example.main.vgi_sum_all(i::BIGINT)::BIGINT FROM range(1, 6) t(i);
 ----
 15
 
 # Two columns
 query I
-SELECT vgi_sum_all(i::BIGINT, i::BIGINT)::BIGINT FROM range(1, 6) t(i);
+SELECT example.main.vgi_sum_all(i::BIGINT, i::BIGINT)::BIGINT FROM range(1, 6) t(i);
 ----
 30
 
 # Three columns with different values
 query I
-SELECT vgi_sum_all(a, b, c)::BIGINT
+SELECT example.main.vgi_sum_all(a, b, c)::BIGINT
 FROM (VALUES (1.0, 2.0, 3.0), (4.0, 5.0, 6.0)) AS t(a, b, c);
 ----
 21
@@ -42,7 +39,7 @@ FROM (VALUES (1.0, 2.0, 3.0), (4.0, 5.0, 6.0)) AS t(a, b, c);
 # ============================================================================
 
 query II rowsort
-SELECT category, vgi_sum_all(a, b)::BIGINT AS total
+SELECT category, example.main.vgi_sum_all(a, b)::BIGINT AS total
 FROM (VALUES
     ('x', 1.0, 10.0),
     ('y', 2.0, 20.0),
@@ -59,7 +56,7 @@ y	66
 # ============================================================================
 
 query I
-SELECT vgi_sum_all(1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0)::BIGINT;
+SELECT example.main.vgi_sum_all(1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0)::BIGINT;
 ----
 55
 
@@ -71,16 +68,13 @@ SELECT vgi_sum_all(1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0)::BIGINT;
 # ============================================================================
 
 statement error
-SELECT vgi_sum_all() FROM range(5);
+SELECT example.main.vgi_sum_all() FROM range(5);
 ----
 requires at least 1 value
 
 # ============================================================================
 # Cleanup
 # ============================================================================
-
-statement ok
-USE memory;
 
 statement ok
 DETACH example;

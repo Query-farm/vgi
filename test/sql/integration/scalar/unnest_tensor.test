@@ -12,9 +12,6 @@ statement ok
 ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
 statement ok
-USE example;
-
-statement ok
 SET threads=1;
 
 # ============================================================================
@@ -23,14 +20,14 @@ SET threads=1;
 
 # 1D input yields a list of 3 struct elements.
 query T
-SELECT length(unnest_tensor({tensor: [10, 20, 30], axes: {i: [0, 1, 2]}}));
+SELECT length(example.main.unnest_tensor({tensor: [10, 20, 30], axes: {i: [0, 1, 2]}}));
 ----
 3
 
 # Element shape: {value, axes}.
 query II
 SELECT cell.value, cell.axes.i
-FROM UNNEST(unnest_tensor({tensor: [10, 20, 30], axes: {i: [0, 1, 2]}})) u(cell)
+FROM UNNEST(example.main.unnest_tensor({tensor: [10, 20, 30], axes: {i: [0, 1, 2]}})) u(cell)
 ORDER BY cell.axes.i;
 ----
 10	0
@@ -43,7 +40,7 @@ ORDER BY cell.axes.i;
 
 query III
 SELECT cell.axes.x, cell.axes.y, cell.value
-FROM UNNEST(unnest_tensor(
+FROM UNNEST(example.main.unnest_tensor(
   {tensor: [[1, 2], [3, 4]], axes: {x: [0, 1], y: [0, 1]}}
 )) u(cell)
 ORDER BY cell.axes.x, cell.axes.y;
@@ -56,7 +53,7 @@ ORDER BY cell.axes.x, cell.axes.y;
 # Sparse input: null cells are emitted.
 query III
 SELECT cell.axes.x, cell.axes.y, cell.value
-FROM UNNEST(unnest_tensor(
+FROM UNNEST(example.main.unnest_tensor(
   {tensor: [[10, NULL], [NULL, 20]], axes: {x: [0, 1], y: [0, 1]}}
 )) u(cell)
 ORDER BY cell.axes.x, cell.axes.y;
@@ -77,8 +74,8 @@ FROM range(2) tx(x), range(3) ty(y), range(2) tz(z);
 
 query IIII
 SELECT cell.axes.x, cell.axes.y, cell.axes.z, cell.value
-FROM (SELECT nest_tensor(v, {x: x, y: y, z: z}) AS t FROM grid3) r,
-     UNNEST(unnest_tensor(r.t)) u(cell)
+FROM (SELECT example.main.nest_tensor(v, {x: x, y: y, z: z}) AS t FROM grid3) r,
+     UNNEST(example.main.unnest_tensor(r.t)) u(cell)
 ORDER BY cell.axes.x, cell.axes.y, cell.axes.z;
 ----
 0	0	0	0
@@ -100,7 +97,7 @@ ORDER BY cell.axes.x, cell.axes.y, cell.axes.z;
 
 query TTT
 SELECT cell.axes.x, cell.axes.y, cell.value
-FROM UNNEST(unnest_tensor(
+FROM UNNEST(example.main.unnest_tensor(
   {tensor: [[1, 2], [3, 4]], axes: {x: ['a', 'b'], y: ['c', 'd']}}
 )) u(cell)
 ORDER BY cell.axes.x, cell.axes.y;
@@ -117,11 +114,11 @@ b	d	4
 query III
 SELECT g, cell.axes.i, cell.value
 FROM (
-  SELECT g, nest_tensor(v, {i: i}) AS t
+  SELECT g, example.main.nest_tensor(v, {i: i}) AS t
   FROM (VALUES (0, 1, 0), (0, 2, 1), (1, 10, 0), (1, 20, 1)) d(g, v, i)
   GROUP BY g
 ) r,
-UNNEST(unnest_tensor(r.t)) u(cell)
+UNNEST(example.main.unnest_tensor(r.t)) u(cell)
 ORDER BY g, cell.axes.i;
 ----
 0	0	1
@@ -135,19 +132,19 @@ ORDER BY g, cell.axes.i;
 
 # Non-struct input rejected.
 statement error
-SELECT unnest_tensor(42);
+SELECT example.main.unnest_tensor(42);
 ----
 must be a struct
 
 # Missing 'axes' field rejected.
 statement error
-SELECT unnest_tensor({tensor: [1, 2, 3]});
+SELECT example.main.unnest_tensor({tensor: [1, 2, 3]});
 ----
 'tensor' and 'axes'
 
 # Nesting depth mismatch rejected (tensor depth 1, axes has 2 fields).
 statement error
-SELECT unnest_tensor({tensor: [1, 2], axes: {x: [0, 1], y: [0]}});
+SELECT example.main.unnest_tensor({tensor: [1, 2], axes: {x: [0, 1], y: [0]}});
 ----
 nesting depth
 
@@ -156,7 +153,7 @@ nesting depth
 # ============================================================================
 
 query T
-SELECT unnest_tensor(CAST(NULL AS STRUCT(tensor INTEGER[], axes STRUCT(i INTEGER[]))));
+SELECT example.main.unnest_tensor(CAST(NULL AS STRUCT(tensor INTEGER[], axes STRUCT(i INTEGER[]))));
 ----
 NULL
 

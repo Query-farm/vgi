@@ -20,16 +20,13 @@ require httpfs
 statement ok
 ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
-statement ok
-USE example;
-
 # ============================================================================
 # Cumulative running sum via OVER (PARTITION BY ... ORDER BY ...)
 # Eligible for the streaming path: cumulative frame, no EXCLUDE/DISTINCT/FILTER.
 # ============================================================================
 
 query III
-SELECT k, x, vgi_streaming_sum(x) OVER (PARTITION BY k ORDER BY x) AS running
+SELECT k, x, example.main.vgi_streaming_sum(x) OVER (PARTITION BY k ORDER BY x) AS running
 FROM (VALUES
   ('a', 1), ('a', 2), ('a', 3),
   ('b', 10), ('b', 20), ('b', 30)
@@ -46,7 +43,7 @@ b	30	60
 # Cross-check: agreed with DuckDB's built-in sum() OVER (...) on the same query
 query IIII
 SELECT k, x,
-       vgi_streaming_sum(x::BIGINT) OVER (PARTITION BY k ORDER BY x) AS vgi_running,
+       example.main.vgi_streaming_sum(x::BIGINT) OVER (PARTITION BY k ORDER BY x) AS vgi_running,
        sum(x::BIGINT)                OVER (PARTITION BY k ORDER BY x) AS builtin_running
 FROM (VALUES
   ('a', 1), ('a', 2), ('a', 3),
@@ -68,7 +65,7 @@ b	30	60	60
 # ============================================================================
 
 query II
-SELECT idx, vgi_streaming_sum(idx) OVER (ORDER BY idx) AS running
+SELECT idx, example.main.vgi_streaming_sum(idx) OVER (ORDER BY idx) AS running
 FROM range(1, 6) t(idx)
 ORDER BY idx;
 ----
@@ -82,7 +79,7 @@ ORDER BY idx;
 # concurrent partition states. Each partition's running sum is independent.
 query III
 SELECT k, x,
-       vgi_streaming_sum(x::BIGINT) OVER (PARTITION BY k ORDER BY x) AS running
+       example.main.vgi_streaming_sum(x::BIGINT) OVER (PARTITION BY k ORDER BY x) AS running
 FROM (VALUES
   ('a', 1), ('b', 10), ('a', 2), ('b', 20), ('a', 3), ('b', 30)
 ) t(k, x)
@@ -107,7 +104,7 @@ b	30	60
 # Source rows are shuffled within partition 'a' (3,1,2) and 'b' (30,10,20).
 query IIII
 SELECT k, x,
-       vgi_streaming_sum(x::BIGINT) OVER (PARTITION BY k ORDER BY x) AS vgi_running,
+       example.main.vgi_streaming_sum(x::BIGINT) OVER (PARTITION BY k ORDER BY x) AS vgi_running,
        sum(x::BIGINT)                OVER (PARTITION BY k ORDER BY x) AS builtin_running
 FROM (VALUES
   ('a', 3), ('a', 1), ('a', 2),
@@ -126,7 +123,7 @@ b	30	60	60
 # so the running sum accumulates 3,2,1 (giving 3,5,6) not 1,2,3.
 query III
 SELECT k, x,
-       vgi_streaming_sum(x::BIGINT) OVER (PARTITION BY k ORDER BY x DESC) AS vgi_running
+       example.main.vgi_streaming_sum(x::BIGINT) OVER (PARTITION BY k ORDER BY x DESC) AS vgi_running
 FROM (VALUES ('a', 1), ('a', 2), ('a', 3)) t(k, x)
 ORDER BY k, x;
 ----
@@ -137,7 +134,7 @@ a	3	3
 # No PARTITION BY, shuffled source, single global running sum by ORDER BY idx.
 query III
 SELECT idx,
-       vgi_streaming_sum(idx::BIGINT) OVER (ORDER BY idx) AS vgi_running,
+       example.main.vgi_streaming_sum(idx::BIGINT) OVER (ORDER BY idx) AS vgi_running,
        sum(idx::BIGINT)               OVER (ORDER BY idx) AS builtin_running
 FROM (VALUES (4), (2), (5), (1), (3)) t(idx)
 ORDER BY idx;
@@ -155,8 +152,8 @@ ORDER BY idx;
 
 query IIII
 SELECT k, x,
-       vgi_streaming_sum(x::BIGINT) OVER (PARTITION BY k ORDER BY x) AS s1,
-       vgi_streaming_sum(x::BIGINT) OVER (PARTITION BY k ORDER BY x) AS s2
+       example.main.vgi_streaming_sum(x::BIGINT) OVER (PARTITION BY k ORDER BY x) AS s1,
+       example.main.vgi_streaming_sum(x::BIGINT) OVER (PARTITION BY k ORDER BY x) AS s2
 FROM (VALUES ('a', 1), ('a', 2), ('a', 3)) t(k, x)
 ORDER BY k, x;
 ----
@@ -171,7 +168,7 @@ a	3	6	6
 # ============================================================================
 
 query II
-SELECT k, vgi_streaming_sum(x) AS total
+SELECT k, example.main.vgi_streaming_sum(x) AS total
 FROM (VALUES
   ('a', 1), ('a', 2), ('a', 3),
   ('b', 10), ('b', 20), ('b', 30)
@@ -191,7 +188,7 @@ statement ok
 SET vgi_streaming_window = false;
 
 query III
-SELECT k, x, vgi_streaming_sum(x) OVER (PARTITION BY k ORDER BY x) AS running
+SELECT k, x, example.main.vgi_streaming_sum(x) OVER (PARTITION BY k ORDER BY x) AS running
 FROM (VALUES
   ('a', 1), ('a', 2), ('a', 3),
   ('b', 10), ('b', 20), ('b', 30)
@@ -218,7 +215,7 @@ SET vgi_streaming_window = true;
 # Ineligible; falls back to standard windowed path. The fixture's
 # update/combine/finalize is used by the segment tree.
 query II
-SELECT x, vgi_streaming_sum(x) OVER (
+SELECT x, example.main.vgi_streaming_sum(x) OVER (
   ORDER BY x ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING
 ) AS rolling
 FROM (VALUES (1), (2), (3), (4), (5)) t(x)
@@ -234,4 +231,4 @@ ORDER BY x;
 # VGI_STREAMING_WINDOW in the operator tree; for the sliding-frame query
 # it should show WINDOW. Run interactively to verify:
 #
-#   EXPLAIN SELECT x, vgi_streaming_sum(x) OVER (PARTITION BY x % 2 ORDER BY x) FROM range(10) t(x);
+#   EXPLAIN SELECT x, example.main.vgi_streaming_sum(x) OVER (PARTITION BY x % 2 ORDER BY x) FROM range(10) t(x);

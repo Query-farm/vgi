@@ -11,20 +11,17 @@ require httpfs
 statement ok
 ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
-statement ok
-USE example;
-
 # ============================================================================
 # vgi_sum — single int64 input
 # ============================================================================
 
 query I
-SELECT vgi_sum(i::BIGINT) FROM range(10) t(i);
+SELECT example.main.vgi_sum(i::BIGINT) FROM range(10) t(i);
 ----
 45
 
 query I
-SELECT vgi_sum(i::BIGINT) FROM range(100) t(i);
+SELECT example.main.vgi_sum(i::BIGINT) FROM range(100) t(i);
 ----
 4950
 
@@ -33,12 +30,12 @@ SELECT vgi_sum(i::BIGINT) FROM range(100) t(i);
 # ============================================================================
 
 query I
-SELECT vgi_count() FROM range(100) t(i);
+SELECT example.main.vgi_count() FROM range(100) t(i);
 ----
 100
 
 query I
-SELECT vgi_count() FROM range(1) t(i);
+SELECT example.main.vgi_count() FROM range(1) t(i);
 ----
 1
 
@@ -47,12 +44,12 @@ SELECT vgi_count() FROM range(1) t(i);
 # ============================================================================
 
 query R
-SELECT vgi_avg(i::BIGINT) FROM range(10) t(i);
+SELECT example.main.vgi_avg(i::BIGINT) FROM range(10) t(i);
 ----
 4.5
 
 query R
-SELECT vgi_avg(i::BIGINT) FROM range(4) t(i);
+SELECT example.main.vgi_avg(i::BIGINT) FROM range(4) t(i);
 ----
 1.5
 
@@ -61,7 +58,7 @@ SELECT vgi_avg(i::BIGINT) FROM range(4) t(i);
 # ============================================================================
 
 query I
-SELECT vgi_sum(x) FROM (VALUES (1::BIGINT), (NULL), (3::BIGINT)) t(x);
+SELECT example.main.vgi_sum(x) FROM (VALUES (1::BIGINT), (NULL), (3::BIGINT)) t(x);
 ----
 4
 
@@ -69,7 +66,7 @@ SELECT vgi_sum(x) FROM (VALUES (1::BIGINT), (NULL), (3::BIGINT)) t(x);
 # skips all NULL rows, so update() is never called. The framework passes None
 # for the state in finalize(), and the function returns NULL.
 query I
-SELECT vgi_sum(x) FROM (VALUES (NULL::BIGINT), (NULL), (NULL)) t(x);
+SELECT example.main.vgi_sum(x) FROM (VALUES (NULL::BIGINT), (NULL), (NULL)) t(x);
 ----
 NULL
 
@@ -78,12 +75,12 @@ NULL
 # ============================================================================
 
 query I
-SELECT vgi_sum(i::BIGINT) FROM range(0) t(i);
+SELECT example.main.vgi_sum(i::BIGINT) FROM range(0) t(i);
 ----
 NULL
 
 query I
-SELECT vgi_count() FROM range(0) t(i);
+SELECT example.main.vgi_count() FROM range(0) t(i);
 ----
 0
 
@@ -92,16 +89,16 @@ SELECT vgi_count() FROM range(0) t(i);
 # byte-equal to the initial state. Earlier the framework optimised away the
 # storage write for such groups, conflating "no rows" with "rows whose
 # update was a no-op (all NULL inputs)" — so SUM of zeros returned NULL
-# instead of 0. ``vgi_sum(0)`` must now return 0 just like the built-in.
+# instead of 0. ``example.main.vgi_sum(0)`` must now return 0 just like the built-in.
 # ============================================================================
 
 query I
-SELECT vgi_sum(0::BIGINT) FROM range(5) t(i);
+SELECT example.main.vgi_sum(0::BIGINT) FROM range(5) t(i);
 ----
 0
 
 query I
-SELECT vgi_sum(x) FROM (VALUES (0::BIGINT), (0::BIGINT), (0::BIGINT)) t(x);
+SELECT example.main.vgi_sum(x) FROM (VALUES (0::BIGINT), (0::BIGINT), (0::BIGINT)) t(x);
 ----
 0
 
@@ -109,7 +106,7 @@ SELECT vgi_sum(x) FROM (VALUES (0::BIGINT), (0::BIGINT), (0::BIGINT)) t(x);
 # produces a state byte-equal to initial: built-in ``sum`` returns 0
 # for the single-row frame at row 0, and ``vgi_sum`` must too.
 query II
-SELECT i, vgi_sum(i::BIGINT) OVER (ORDER BY i ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)
+SELECT i, example.main.vgi_sum(i::BIGINT) OVER (ORDER BY i ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)
 FROM range(5) t(i);
 ----
 0	0
@@ -121,9 +118,6 @@ FROM range(5) t(i);
 # ============================================================================
 # Cleanup
 # ============================================================================
-
-statement ok
-USE memory;
 
 statement ok
 DETACH example;

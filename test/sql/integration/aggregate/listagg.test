@@ -12,9 +12,6 @@ statement ok
 ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
 statement ok
-USE example;
-
-statement ok
 SET threads=1;
 
 # ============================================================================
@@ -22,7 +19,7 @@ SET threads=1;
 # ============================================================================
 
 query T
-SELECT vgi_listagg(x) FROM (VALUES ('a'), ('b'), ('c')) t(x);
+SELECT example.main.vgi_listagg(x) FROM (VALUES ('a'), ('b'), ('c')) t(x);
 ----
 a,b,c
 
@@ -31,7 +28,7 @@ a,b,c
 # ============================================================================
 
 query IT
-SELECT grp, vgi_listagg(val)
+SELECT grp, example.main.vgi_listagg(val)
 FROM (VALUES (1, 'x'), (1, 'y'), (2, 'a'), (2, 'b'), (2, 'c')) t(grp, val)
 GROUP BY grp ORDER BY grp;
 ----
@@ -43,7 +40,7 @@ GROUP BY grp ORDER BY grp;
 # ============================================================================
 
 query T
-SELECT vgi_listagg(x) FROM (VALUES ('a'), (NULL), ('c')) t(x);
+SELECT example.main.vgi_listagg(x) FROM (VALUES ('a'), (NULL), ('c')) t(x);
 ----
 a,c
 
@@ -52,16 +49,13 @@ a,c
 # ============================================================================
 
 query T
-SELECT vgi_listagg('hello');
+SELECT example.main.vgi_listagg('hello');
 ----
 hello
 
 # ============================================================================
 # Cleanup
 # ============================================================================
-
-statement ok
-USE memory;
 
 statement ok
 DETACH example;

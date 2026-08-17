@@ -25,9 +25,6 @@ statement ok
 ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
 statement ok
-USE example;
-
-statement ok
 SET threads=1;
 
 # ============================================================================
@@ -35,7 +32,7 @@ SET threads=1;
 # ============================================================================
 
 query II
-SELECT r.range, s.n FROM range(3) r POSITIONAL JOIN sequence(3) s
+SELECT r.range, s.n FROM range(3) r POSITIONAL JOIN example.main.sequence(3) s
 ORDER BY r.range;
 ----
 0	0
@@ -44,7 +41,7 @@ ORDER BY r.range;
 
 query II
 SELECT s1.n AS a, s2.n AS b
-FROM sequence(3) s1 POSITIONAL JOIN sequence(3) s2
+FROM example.main.sequence(3) s1 POSITIONAL JOIN example.main.sequence(3) s2
 ORDER BY a;
 ----
 0	0
@@ -53,7 +50,7 @@ ORDER BY a;
 
 # Uneven lengths: the shorter side pads with NULL.
 query II
-SELECT r.range, s.n FROM range(5) r POSITIONAL JOIN sequence(3) s
+SELECT r.range, s.n FROM range(5) r POSITIONAL JOIN example.main.sequence(3) s
 ORDER BY r.range;
 ----
 0	0
@@ -70,7 +67,7 @@ statement ok
 SET vgi_async_prefetch=true;
 
 statement error
-SELECT s1.n AS a, s2.n AS b FROM sequence(3) s1 POSITIONAL JOIN sequence(3) s2;
+SELECT s1.n AS a, s2.n AS b FROM example.main.sequence(3) s1 POSITIONAL JOIN example.main.sequence(3) s2;
 ----
 Unexpected interrupt from table Source in PositionalTableScanner refill
 
@@ -82,7 +79,7 @@ SET vgi_async_prefetch=false;
 # ============================================================================
 
 query II
-SELECT r.range, s.n FROM range(3) r CROSS JOIN sequence(3) s
+SELECT r.range, s.n FROM range(3) r CROSS JOIN example.main.sequence(3) s
 ORDER BY r.range, s.n;
 ----
 0	0
@@ -96,7 +93,7 @@ ORDER BY r.range, s.n;
 2	2
 
 query II
-SELECT s1.n AS a, s2.n AS b FROM sequence(3) s1 CROSS JOIN sequence(3) s2
+SELECT s1.n AS a, s2.n AS b FROM example.main.sequence(3) s1 CROSS JOIN example.main.sequence(3) s2
 ORDER BY a, b;
 ----
 0	0
@@ -113,7 +110,7 @@ statement ok
 SET vgi_async_prefetch=true;
 
 query II
-SELECT r.range, s.n FROM range(3) r CROSS JOIN sequence(3) s
+SELECT r.range, s.n FROM range(3) r CROSS JOIN example.main.sequence(3) s
 ORDER BY r.range, s.n;
 ----
 0	0
@@ -130,11 +127,11 @@ statement ok
 SET vgi_async_prefetch=false;
 
 # ============================================================================
-# NATURAL JOIN — column n is shared between sequence() outputs
+# NATURAL JOIN — column n is shared between example.main.sequence() outputs
 # ============================================================================
 
 query I
-SELECT n FROM sequence(5) NATURAL JOIN (SELECT unnest([0, 2, 4])::BIGINT AS n)
+SELECT n FROM example.main.sequence(5) NATURAL JOIN (SELECT unnest([0, 2, 4])::BIGINT AS n)
 ORDER BY n;
 ----
 0
@@ -142,7 +139,7 @@ ORDER BY n;
 4
 
 query I
-SELECT n FROM sequence(5) s1 NATURAL JOIN sequence(3) s2 ORDER BY n;
+SELECT n FROM example.main.sequence(5) s1 NATURAL JOIN example.main.sequence(3) s2 ORDER BY n;
 ----
 0
 1
@@ -152,7 +149,7 @@ statement ok
 SET vgi_async_prefetch=true;
 
 query I
-SELECT n FROM sequence(5) s1 NATURAL JOIN sequence(3) s2 ORDER BY n;
+SELECT n FROM example.main.sequence(5) s1 NATURAL JOIN example.main.sequence(3) s2 ORDER BY n;
 ----
 0
 1
@@ -168,7 +165,7 @@ SET vgi_async_prefetch=false;
 query II
 SELECT r.range AS probe, s.n AS matched
 FROM (SELECT * FROM range(5)) r
-ASOF JOIN sequence(5) s ON r.range >= s.n
+ASOF JOIN example.main.sequence(5) s ON r.range >= s.n
 ORDER BY probe;
 ----
 0	0
@@ -179,8 +176,8 @@ ORDER BY probe;
 
 query II
 SELECT s1.n AS probe, s2.n AS matched
-FROM sequence(5) s1
-ASOF JOIN sequence(5) s2 ON s1.n >= s2.n
+FROM example.main.sequence(5) s1
+ASOF JOIN example.main.sequence(5) s2 ON s1.n >= s2.n
 ORDER BY probe;
 ----
 0	0
@@ -194,8 +191,8 @@ SET vgi_async_prefetch=true;
 
 query II
 SELECT s1.n AS probe, s2.n AS matched
-FROM sequence(5) s1
-ASOF JOIN sequence(5) s2 ON s1.n >= s2.n
+FROM example.main.sequence(5) s1
+ASOF JOIN example.main.sequence(5) s2 ON s1.n >= s2.n
 ORDER BY probe;
 ----
 0	0
@@ -214,7 +211,7 @@ SET vgi_async_prefetch=false;
 
 query III
 SELECT p.range, p.n, c.a
-FROM (SELECT r.range, s.n FROM range(3) r POSITIONAL JOIN sequence(3) s) p
+FROM (SELECT r.range, s.n FROM range(3) r POSITIONAL JOIN example.main.sequence(3) s) p
 CROSS JOIN (VALUES (10), (20)) c(a)
 ORDER BY p.range, c.a;
 ----

@@ -12,9 +12,6 @@ statement ok
 ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
 statement ok
-USE example;
-
-statement ok
 SET threads=1;
 
 # ============================================================================
@@ -23,7 +20,7 @@ SET threads=1;
 
 query I
 SELECT count(*) FROM (
-    SELECT i % 10000 AS grp, vgi_sum(i::BIGINT)
+    SELECT i % 10000 AS grp, example.main.vgi_sum(i::BIGINT)
     FROM range(100000) t(i)
     GROUP BY grp
 );
@@ -33,9 +30,6 @@ SELECT count(*) FROM (
 # ============================================================================
 # Cleanup
 # ============================================================================
-
-statement ok
-USE memory;
 
 statement ok
 DETACH example;

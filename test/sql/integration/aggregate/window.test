@@ -11,15 +11,12 @@ require httpfs
 statement ok
 ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
-statement ok
-USE example;
-
 # ============================================================================
 # Simple running-sum via OVER (ORDER BY ...)
 # ============================================================================
 
 query II
-SELECT x, vgi_window_sum(x) OVER (ORDER BY x ROWS BETWEEN 2 PRECEDING AND CURRENT ROW)
+SELECT x, example.main.vgi_window_sum(x) OVER (ORDER BY x ROWS BETWEEN 2 PRECEDING AND CURRENT ROW)
 FROM (VALUES (1), (2), (3), (4), (5)) t(x)
 ORDER BY x;
 ----
@@ -33,7 +30,7 @@ ORDER BY x;
 query II
 SELECT
   x,
-  vgi_window_sum(x::BIGINT) OVER (ORDER BY x ROWS BETWEEN 2 PRECEDING AND CURRENT ROW)
+  example.main.vgi_window_sum(x::BIGINT) OVER (ORDER BY x ROWS BETWEEN 2 PRECEDING AND CURRENT ROW)
   = sum(x::BIGINT) OVER (ORDER BY x ROWS BETWEEN 2 PRECEDING AND CURRENT ROW)
 FROM (VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10)) t(x)
 ORDER BY x;
@@ -56,7 +53,7 @@ ORDER BY x;
 query II
 SELECT
   x,
-  vgi_window_sum(x::BIGINT) OVER (ORDER BY x ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING)
+  example.main.vgi_window_sum(x::BIGINT) OVER (ORDER BY x ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING)
   = sum(x::BIGINT) OVER (ORDER BY x ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING)
 FROM generate_series(1, 20) t(x)
 ORDER BY x;
@@ -89,7 +86,7 @@ ORDER BY x;
 query II
 SELECT
   x,
-  vgi_window_sum(x::BIGINT) OVER (ORDER BY x ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING EXCLUDE CURRENT ROW)
+  example.main.vgi_window_sum(x::BIGINT) OVER (ORDER BY x ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING EXCLUDE CURRENT ROW)
   = sum(x::BIGINT) OVER (ORDER BY x ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING EXCLUDE CURRENT ROW)
 FROM generate_series(1, 10) t(x)
 ORDER BY x;
@@ -113,7 +110,7 @@ query III
 SELECT
   g,
   x,
-  vgi_window_sum(x::BIGINT) OVER (PARTITION BY g ORDER BY x ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+  example.main.vgi_window_sum(x::BIGINT) OVER (PARTITION BY g ORDER BY x ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
 FROM (VALUES
   ('a', 1), ('a', 2), ('a', 3),
   ('b', 10), ('b', 20), ('b', 30)
@@ -134,7 +131,7 @@ b	30	60
 query RR
 SELECT
   x,
-  vgi_window_median(x::DOUBLE) OVER (ORDER BY x ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING)
+  example.main.vgi_window_median(x::DOUBLE) OVER (ORDER BY x ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING)
 FROM generate_series(1, 7) t(x)
 ORDER BY x;
 ----
@@ -157,7 +154,7 @@ SELECT
 FROM (
   SELECT
     x,
-    vgi_window_sum(x::BIGINT) OVER (ORDER BY x ROWS BETWEEN 3 PRECEDING AND 3 FOLLOWING EXCLUDE TIES)
+    example.main.vgi_window_sum(x::BIGINT) OVER (ORDER BY x ROWS BETWEEN 3 PRECEDING AND 3 FOLLOWING EXCLUDE TIES)
     = sum(x::BIGINT) OVER (ORDER BY x ROWS BETWEEN 3 PRECEDING AND 3 FOLLOWING EXCLUDE TIES) AS match
   FROM generate_series(1, 10) t(x)
 );
@@ -170,7 +167,7 @@ SELECT
 FROM (
   SELECT
     x,
-    vgi_window_sum(x::BIGINT) OVER (ORDER BY x ROWS BETWEEN 3 PRECEDING AND 3 FOLLOWING EXCLUDE GROUP)
+    example.main.vgi_window_sum(x::BIGINT) OVER (ORDER BY x ROWS BETWEEN 3 PRECEDING AND 3 FOLLOWING EXCLUDE GROUP)
     = sum(x::BIGINT) OVER (ORDER BY x ROWS BETWEEN 3 PRECEDING AND 3 FOLLOWING EXCLUDE GROUP) AS match
   FROM generate_series(1, 10) t(x)
 );
@@ -184,7 +181,7 @@ FROM (
 query II
 SELECT
   x,
-  vgi_window_sum(x::BIGINT) OVER (ORDER BY x DESC ROWS BETWEEN 2 PRECEDING AND CURRENT ROW)
+  example.main.vgi_window_sum(x::BIGINT) OVER (ORDER BY x DESC ROWS BETWEEN 2 PRECEDING AND CURRENT ROW)
   = sum(x::BIGINT) OVER (ORDER BY x DESC ROWS BETWEEN 2 PRECEDING AND CURRENT ROW)
 FROM generate_series(1, 10) t(x)
 ORDER BY x;
@@ -211,7 +208,7 @@ SELECT
   COUNT(*) FILTER (WHERE NOT match)
 FROM (
   SELECT
-    (vgi_window_sum(x::BIGINT) FILTER (WHERE x % 2 = 0)
+    (example.main.vgi_window_sum(x::BIGINT) FILTER (WHERE x % 2 = 0)
        OVER (ORDER BY x ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW))
     IS NOT DISTINCT FROM
     (sum(x::BIGINT) FILTER (WHERE x % 2 = 0)
@@ -232,9 +229,9 @@ SELECT
 FROM (
   SELECT
     x,
-    vgi_window_sum(x::BIGINT) OVER (ORDER BY x ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)
+    example.main.vgi_window_sum(x::BIGINT) OVER (ORDER BY x ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)
       = sum(x::BIGINT) OVER (ORDER BY x ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS a_ok,
-    vgi_window_sum(x::BIGINT) OVER (ORDER BY x ROWS BETWEEN CURRENT ROW AND 2 FOLLOWING)
+    example.main.vgi_window_sum(x::BIGINT) OVER (ORDER BY x ROWS BETWEEN CURRENT ROW AND 2 FOLLOWING)
       = sum(x::BIGINT) OVER (ORDER BY x ROWS BETWEEN CURRENT ROW AND 2 FOLLOWING) AS b_ok
   FROM generate_series(1, 20) t(x)
 );
@@ -252,7 +249,7 @@ SELECT
 FROM (
   SELECT
     x,
-    vgi_window_sum(x::BIGINT) OVER (ORDER BY x ROWS BETWEEN 5 PRECEDING AND 5 FOLLOWING)
+    example.main.vgi_window_sum(x::BIGINT) OVER (ORDER BY x ROWS BETWEEN 5 PRECEDING AND 5 FOLLOWING)
     = sum(x::BIGINT) OVER (ORDER BY x ROWS BETWEEN 5 PRECEDING AND 5 FOLLOWING) AS match
   FROM generate_series(1, 5000) t(x)
 );
@@ -270,7 +267,7 @@ SELECT
 FROM (
   SELECT
     g, x,
-    vgi_window_sum(x::BIGINT) OVER (PARTITION BY g ORDER BY x ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+    example.main.vgi_window_sum(x::BIGINT) OVER (PARTITION BY g ORDER BY x ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
     = sum(x::BIGINT) OVER (PARTITION BY g ORDER BY x ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS match
   FROM (
     SELECT (i % 100) AS g, i AS x FROM generate_series(1, 2000) t(i)
@@ -287,7 +284,7 @@ query II
 WITH windowed AS (
   SELECT
     x,
-    vgi_window_sum(x::BIGINT) OVER (ORDER BY x ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS s
+    example.main.vgi_window_sum(x::BIGINT) OVER (ORDER BY x ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS s
   FROM generate_series(1, 5) t(x)
 )
 SELECT x, s FROM windowed ORDER BY x;
@@ -306,7 +303,7 @@ SELECT x, s FROM windowed ORDER BY x;
 query IT
 SELECT
   x,
-  vgi_window_listagg(s) OVER (ORDER BY x ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)
+  example.main.vgi_window_listagg(s) OVER (ORDER BY x ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)
 FROM (VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')) t(x, s)
 ORDER BY x;
 ----
@@ -323,7 +320,7 @@ ORDER BY x;
 # ============================================================================
 
 query T
-SELECT vgi_window_listagg(s ORDER BY x)
+SELECT example.main.vgi_window_listagg(s ORDER BY x)
   OVER (ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
 FROM (VALUES (1, 'a'), (2, 'b'), (3, 'c')) t(x, s)
 LIMIT 1;
@@ -336,12 +333,12 @@ a,b,c
 # ============================================================================
 
 query I
-SELECT vgi_window_sum(x::BIGINT) FROM (VALUES (1), (2), (3), (4), (5)) t(x);
+SELECT example.main.vgi_window_sum(x::BIGINT) FROM (VALUES (1), (2), (3), (4), (5)) t(x);
 ----
 15
 
 query II
-SELECT g, vgi_window_sum(x::BIGINT)
+SELECT g, example.main.vgi_window_sum(x::BIGINT)
 FROM (VALUES ('a', 1), ('a', 2), ('b', 3), ('b', 4)) t(g, x)
 GROUP BY g
 ORDER BY g;

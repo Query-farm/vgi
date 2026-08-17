@@ -11,9 +11,6 @@ require httpfs
 statement ok
 ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
-statement ok
-USE example;
-
 # ============================================================================
 # Multi-threaded ungrouped sum
 # ============================================================================
@@ -22,7 +19,7 @@ statement ok
 SET threads=4;
 
 query I
-SELECT vgi_sum(i::BIGINT) FROM range(100000) t(i);
+SELECT example.main.vgi_sum(i::BIGINT) FROM range(100000) t(i);
 ----
 4999950000
 
@@ -34,7 +31,7 @@ statement ok
 SET threads=2;
 
 query II
-SELECT i % 3 AS grp, vgi_sum(i::BIGINT) FROM range(9) t(i) GROUP BY grp ORDER BY grp;
+SELECT i % 3 AS grp, example.main.vgi_sum(i::BIGINT) FROM range(9) t(i) GROUP BY grp ORDER BY grp;
 ----
 0	9
 1	12
@@ -48,7 +45,7 @@ statement ok
 SET threads=4;
 
 query II
-SELECT i % 10 AS grp, vgi_sum(i::BIGINT) FROM range(10000) t(i)
+SELECT i % 10 AS grp, example.main.vgi_sum(i::BIGINT) FROM range(10000) t(i)
 GROUP BY grp ORDER BY grp;
 ----
 0	4995000
@@ -65,9 +62,6 @@ GROUP BY grp ORDER BY grp;
 # ============================================================================
 # Cleanup
 # ============================================================================
-
-statement ok
-USE memory;
 
 statement ok
 DETACH example;

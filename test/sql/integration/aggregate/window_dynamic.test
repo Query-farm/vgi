@@ -14,9 +14,6 @@ require httpfs
 statement ok
 ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
-statement ok
-USE example;
-
 # ============================================================================
 # Dynamic aggregate with window support (vgi_dynamic_agg + supports_window)
 # Falls back to Aggregate.finalize(table) when the user's class does NOT
@@ -24,7 +21,7 @@ USE example;
 # ============================================================================
 
 query R
-SELECT vgi_dynamic_agg(
+SELECT example.main.vgi_dynamic_agg(
   'class Aggregate:
     @staticmethod
     def finalize(table):
@@ -44,7 +41,7 @@ query RRRR
 SELECT
   MIN(w), MAX(w), SUM(w), COUNT(*)
 FROM (
-  SELECT vgi_dynamic_agg(
+  SELECT example.main.vgi_dynamic_agg(
     'class Aggregate:
       @staticmethod
       def finalize(table):
@@ -66,7 +63,7 @@ FROM (
 # ============================================================================
 
 query R
-SELECT vgi_dynamic_ml_agg(
+SELECT example.main.vgi_dynamic_ml_agg(
   'class Aggregate:
     @staticmethod
     def finalize(table, params):
