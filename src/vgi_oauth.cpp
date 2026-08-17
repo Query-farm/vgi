@@ -20,6 +20,7 @@ extern "C" char *duckdb_wasm_get_page_origin(void);
 #include "yyjson.hpp"
 
 #include "vgi_logging.hpp"
+#include "vgi_oauth_assets.hpp" // embedded logo artwork for the callback pages
 #include "duckdb/logging/logger.hpp"
 #include "vgi_subprocess.hpp" // ResetChildSignalDispositions
 
@@ -1328,9 +1329,41 @@ static const char *OAUTH_PAGE_STYLE = R"(
     gap: 2rem;
   }
   .logos { display: flex; flex-direction: column; align-items: center; gap: 0.75rem; flex-shrink: 0; }
-  .logo { width: 120px; height: 120px; }
-  .logo-duckdb { width: 100px; }
-  .content { text-align: left; }
+  /* Both marks are wider than they are tall: set width only and let height
+     follow, so neither is squashed if the artwork is ever re-cut. */
+  .logo { display: block; width: 132px; height: auto; }
+  /* color: inherit is load-bearing — the mark is wrapped in an <a>, and the
+     light cut paints its wordmark currentColor, so without it the wordmark
+     renders in the browser's default link blue instead of the page text color. */
+  .logo-duckdb { display: block; width: 108px; color: inherit; }
+  .logo-duckdb svg { display: block; width: 100%; height: auto; }
+  /* Both upstream cuts are embedded; show the light one unless the viewer
+     prefers dark (which is also the right fallback for "no preference"). The
+     swap has to sit AFTER this default rather than up in the dark palette
+     block: the selectors have equal specificity, so whichever comes last in
+     source order wins — with the swap up there, this `none` beat it and hid
+     both cuts. */
+  .logo-duckdb .duck-dark { display: none; }
+  @media (prefers-color-scheme: dark) {
+    /* --duck-negative paints the duck the dark cut knocks out of its yellow
+       roundel, so it matches the card it sits on. */
+    .logo-duckdb { --duck-negative: #252518; }
+    .logo-duckdb .duck-light { display: none; }
+    .logo-duckdb .duck-dark { display: block; }
+  }
+  /* min-width: 0 is load-bearing: a flex item defaults to min-width:auto, so
+     without it a long resource name or URL can't shrink below its min-content
+     width and widens the card past the viewport instead of wrapping. */
+  .content { text-align: left; min-width: 0; }
+  /* Break long tokens only where they'd otherwise overflow — server URLs and
+     resource names are both attacker-ish inputs length-wise. */
+  .resource, .resource-url { overflow-wrap: anywhere; }
+  .resource-url {
+    margin-top: 0.25rem;
+    font-size: 0.8125rem;
+    font-family: 'JetBrains Mono', 'Fira Code', monospace;
+    opacity: 0.7;
+  }
   .status-row { display: flex; align-items: center; gap: 0.625rem; margin-bottom: 0.5rem; }
   .icon-circle {
     width: 36px; height: 36px;
@@ -1353,8 +1386,41 @@ static const char *OAUTH_PAGE_STYLE = R"(
     text-decoration: none;
     transition: color 0.15s;
   }
+  /* Below the card's own max-width the logo column plus padding leaves the text
+     column almost nothing, so stack instead of squeezing. */
+  @media (max-width: 560px) {
+    body { padding: 1.25rem; }
+    .card { flex-direction: column; align-items: flex-start; gap: 1.25rem; padding: 1.75rem; }
+    .logos { flex-direction: row; align-items: center; gap: 1.25rem; }
+    .logo { width: 96px; }
+    .logo-duckdb { width: 88px; }
+  }
 </style>
 )";
+
+// Logo column shared by the success and failure pages. The artwork is embedded
+// (see vgi_oauth_assets.hpp) rather than fetched: the callback server is torn
+// down the moment the code is captured, so an external — or even a
+// self-hosted — image request would be a race, and the previously-linked
+// remote images had already drifted out from under us.
+static std::string OAuthPageLogos() {
+	// <picture> rather than two CSS-toggled <img>s: the browser resolves exactly
+	// one source, so the unused cut is never decoded, and the <img> fallback is
+	// what a browser reporting no color-scheme preference lands on.
+	// The HTML( ) delimiter is required, not stylistic: the media query below
+	// ends in `dark)"`, which would close a plain R"( )" literal early.
+	return std::string(R"HTML(  <div class="logos">
+    <a href="https://query.farm/vgi"><picture>
+      <source media="(prefers-color-scheme: dark)" srcset=")HTML") +
+	       VGI_OAUTH_LOGO_DARK_DATA_URI + R"HTML(">
+      <img class="logo" src=")HTML" + VGI_OAUTH_LOGO_DATA_URI +
+	       R"HTML(" alt="VGI" width="260" height="189">
+    </picture></a>
+    <a href="https://duckdb.org" class="logo-duckdb" aria-label="DuckDB">)HTML" +
+	       VGI_OAUTH_DUCKDB_LOGO_SVG + VGI_OAUTH_DUCKDB_LOGO_DARK_SVG + R"HTML(</a>
+  </div>
+)HTML";
+}
 
 static std::string OAuthSuccessPage(const std::string &resource_display, const std::string &resource_url) {
 	auto escaped = HtmlEscape(resource_display);
@@ -1363,11 +1429,8 @@ static std::string OAuthSuccessPage(const std::string &resource_display, const s
 	       OAUTH_PAGE_STYLE +
 	       R"(</head><body>
 <div class="card">
-  <div class="logos">
-    <a href="https://query.farm"><img class="logo" src="https://vgi-rpc.query.farm/logo-hero.png" alt="VGI"></a>
-    <a href="https://duckdb.org"><img class="logo-duckdb" src="https://duckdb.org/images/logo-dl/DuckDB_Logo-horizontal.svg" alt="DuckDB"></a>
-  </div>
-  <div class="content">
+)" + OAuthPageLogos() +
+	       R"(  <div class="content">
     <div class="status-row">
       <div class="icon-circle icon-circle-success">
         <svg class="icon-success" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24">
@@ -1377,12 +1440,12 @@ static std::string OAuthSuccessPage(const std::string &resource_display, const s
       <h1>Authentication Successful</h1>
     </div>
     <p class="subtitle">Connected to <span class="resource">)" + escaped + R"(</span></p>
-    <p class="subtitle" style="margin-top:0.25rem;font-size:0.8125rem;font-family:'JetBrains Mono','Fira Code',monospace;opacity:0.7;word-break:break-all;" title=")" + escaped_url + R"(">)" + escaped_url + R"(</p>
+    <p class="subtitle resource-url" title=")" + escaped_url + R"(">)" + escaped_url + R"(</p>
     <p class="subtitle" style="margin-top:0.75rem;">You can close this window.</p>
   </div>
 </div>
 <div class="footer">
-  <span class="footer-text">&copy; 2026 &#x1F69C; <a href="https://query.farm" class="footer-link">Query.Farm LLC</a></span>
+  <span class="footer-text">&copy; 2026 &#x1F69C; <a href="https://query.farm" class="footer-link">Query Farm LLC</a></span>
 </div>
 </body></html>)";
 }
@@ -1394,11 +1457,8 @@ static std::string OAuthErrorPage(const std::string &message, const std::string 
 	       OAUTH_PAGE_STYLE +
 	       R"(</head><body>
 <div class="card">
-  <div class="logos">
-    <a href="https://query.farm"><img class="logo" src="https://vgi-rpc.query.farm/logo-hero.png" alt="VGI"></a>
-    <a href="https://duckdb.org"><img class="logo-duckdb" src="https://duckdb.org/images/logo-dl/DuckDB_Logo-horizontal.svg" alt="DuckDB"></a>
-  </div>
-  <div class="content">
+)" + OAuthPageLogos() +
+	       R"(  <div class="content">
     <div class="status-row">
       <div class="icon-circle icon-circle-error">
         <svg class="icon-error" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24">
@@ -1412,7 +1472,7 @@ static std::string OAuthErrorPage(const std::string &message, const std::string 
   </div>
 </div>
 <div class="footer">
-  <span class="footer-text">&copy; 2026 &#x1F69C; <a href="https://query.farm" class="footer-link">Query.Farm LLC</a></span>
+  <span class="footer-text">&copy; 2026 &#x1F69C; <a href="https://query.farm" class="footer-link">Query Farm LLC</a></span>
 </div>
 </body></html>)";
 }
