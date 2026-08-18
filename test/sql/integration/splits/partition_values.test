@@ -1,0 +1,102 @@
+# name: test/sql/integration/splits/partition_values.test
+# description: Partition values survive greedy split claiming
+# group: [vgi_integration_splits]
+
+# A partition and a split are different things that usually coincide. A partition
+# is a property of the DATA — every row here shares a value. A split is a unit of
+# WORK. A worker that already stores data per partition has its split boundaries
+# handed to it, so one-split-per-partition is the common shape rather than a
+# contrived one.
+#
+# What needs asserting is that the two survive each other. Splits are claimed
+# greedily, in an order nobody chose, by readers that each end up holding several
+# — so the association between a batch and the partition value it carries has to
+# hold through re-init on a reused connection, across readers, and across the
+# boundary where one reader moves from one partition to the next.
+#
+# Losing that association does not raise: it produces a GROUP BY that silently
+# mixes partitions, or attributes one partition's rows to another. That is why
+# every assertion here is per-partition rather than a total — a total would be
+# right even if every row were labelled with the wrong country.
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# Each partition intact and distinct. Equal sums across partitions are what makes
+# a mix-up visible in the ROW COUNTS rather than the totals.
+query III
+SELECT country, count(*), sum(sales)
+FROM example.main.split_partitioned(rows_per_country := 5)
+GROUP BY country ORDER BY country;
+----
+BR	5	15
+DE	5	15
+JP	5	15
+US	5	15
+
+# Every partition present exactly once — a claimed-twice split would show up as a
+# fifth group or as doubled counts above.
+query II
+SELECT count(DISTINCT country), count(*)
+FROM example.main.split_partitioned(rows_per_country := 5);
+----
+4	20
+
+# Under parallelism, where partitions are claimed by different readers and a lost
+# association is most likely.
+statement ok
+SET threads=8;
+
+query III
+SELECT country, count(*), sum(sales)
+FROM example.main.split_partitioned(rows_per_country := 7)
+GROUP BY country ORDER BY country;
+----
+BR	7	28
+DE	7	28
+JP	7	28
+US	7	28
+
+statement ok
+RESET threads;
+
+# Filtering on the partition column: the value must be readable as an ordinary
+# column, not merely tracked internally.
+query II
+SELECT count(*), sum(sales)
+FROM example.main.split_partitioned(rows_per_country := 5)
+WHERE country = 'JP';
+----
+5	15
+
+query I
+SELECT count(*)
+FROM example.main.split_partitioned(rows_per_country := 5)
+WHERE country IN ('US', 'DE');
+----
+10
+
+# An empty partition still leaves the others intact — a split that emits nothing
+# must not take its neighbours' rows with it.
+query I
+SELECT count(*) FROM example.main.split_partitioned(rows_per_country := 0);
+----
+0
+
+# Ordering within a partition survives, so a batch is not being reassembled from
+# pieces of two partitions.
+query II
+SELECT min(sales), max(sales)
+FROM example.main.split_partitioned(rows_per_country := 9)
+WHERE country = 'BR';
+----
+1	9
+
+statement ok
+DETACH example;

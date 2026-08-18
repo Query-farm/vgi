@@ -56,6 +56,7 @@ multi_branch_iceberg	Multi-branch: sequence(50) + iceberg_scan — used by multi
 multi_branch_nopushdown	Multi-branch: VGI + read_csv — used by multi_branch_pushdown_incapable.test
 multi_branch_numbers	Multi-branch: UNION of sequence(50) + sequence(50) — used by multi_branch_scan.test
 multi_branch_recon	Multi-branch: column reconciliation — used by multi_branch_reconciliation.test
+multi_branch_split	Multi-branch: split_sequence(30, splits=6) + sequence(20) — used by splits/multi_branch.test
 multi_branch_two_writable	Multi-branch with two writable=True arms — used by multi_branch_two_writable.test
 numbers	First 100 integers (demonstrates explicit columns)
 products	Product table with column defaults

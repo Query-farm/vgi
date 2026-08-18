@@ -122,19 +122,23 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 # 2 global-registration probes (global_table, a producer; global_buffered, a
 #   table-buffering reducer) — one per function type that surfaces as a table,
 #   proving a worker-declared global function is registered into the catalog.
-# 8 split-capable producers — the plan()/on_split() path. Five are result
+# 14 split-capable producers — the plan()/on_split() path. Five are result
 #   shapes (split_sequence, split_zero, split_empty_ranges, split_skewed,
-#   split_many); three exercise the CLIENT's split machinery rather than a
+#   split_many); six exercise the CLIENT's split machinery rather than a
 #   worker's (split_fail_at poisons a connection or dies mid-stream,
 #   split_endless_cursor never exhausts its cursor, split_echo_filters reports
-#   what pushdown plan() saw). Back splits/*.test.
-# = 154
+#   what pushdown plan() saw, split_stale_plan pins to a version that has moved,
+#   split_short_ttl declares an unusable token lifetime, split_overlap_cursor
+#   re-emits its splits across pages); and three pair splits with another
+#   feature (split_batch_index, split_partitioned, split_dynamic_filter).
+#   Back splits/*.test.
+# = 160
 query I
 SELECT COUNT(*)
 FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'table';
 ----
-154
+160
 
 # The 34 pure table functions (no TABLE parameter type)
 # Note: make_series appears 5 times (5 overloads), make_pairs appears 3 times,

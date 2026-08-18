@@ -1,0 +1,130 @@
+# name: test/sql/integration/splits/dynamic_filters.test
+# description: Pushdown reaches every split, including a function without projection pushdown
+# group: [vgi_integration_splits]
+
+# Pushdown regressions are invisible in the result set, which is the whole reason
+# this file exists. DuckDB re-checks a pushed predicate above the scan, so a scan
+# that stopped receiving filters returns exactly the same rows — just after
+# shipping far more of them across the wire. No assertion about the answer can
+# tell the difference, so the fixture reports the filter it received AS DATA and
+# the assertions read that.
+#
+# The specific hazard for splits: a reader re-initializes the same connection per
+# split, so whatever the client attaches at acquire has to survive every one of
+# those re-inits. A split that lost its filters would prune nothing and say
+# nothing about it.
+#
+# The fixture deliberately does NOT declare projection_pushdown. A live bug had
+# the client attach tick filter state only inside the projection-pushdown branch,
+# so a function with filters and no projection pushdown got none at all — exactly
+# this shape, right answers and no pushdown, with nothing in the results to show
+# for it.
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# A static filter reaches the worker at all — the baseline.
+query I
+SELECT DISTINCT pushed_filters
+FROM example.main.split_dynamic_filter(n := 50, splits := 4)
+WHERE n >= 40;
+----
+PushdownFilters([ConstantFilter(n >= 40)])
+
+# EVERY split sees it, not just the first. Each split re-inits the connection, so
+# a filter attached once at acquire and lost on re-init would show up here as a
+# second distinct value — "(none)" from the splits that came later.
+query I
+SELECT count(DISTINCT pushed_filters)
+FROM example.main.split_dynamic_filter(n := 200, splits := 16)
+WHERE n >= 100;
+----
+1
+
+# ...including when there are far more splits than readers, so each reader claims
+# several and crosses many re-init boundaries.
+query II
+SELECT count(DISTINCT pushed_filters), count(*)
+FROM example.main.split_dynamic_filter(n := 300, splits := 60)
+WHERE n >= 150;
+----
+1	150
+
+# And under parallelism, where different readers claim different splits.
+statement ok
+SET threads=8;
+
+query I
+SELECT count(DISTINCT pushed_filters)
+FROM example.main.split_dynamic_filter(n := 300, splits := 60)
+WHERE n >= 150;
+----
+1
+
+statement ok
+RESET threads;
+
+# The filter is APPLIED, not merely delivered. A worker that received it and
+# ignored it would pass every assertion above and fail this one.
+query II
+SELECT count(*), min(n)
+FROM example.main.split_dynamic_filter(n := 200, splits := 16)
+WHERE n >= 190;
+----
+10	190
+
+# A compound predicate arrives whole rather than half-pushed.
+query I
+SELECT DISTINCT pushed_filters
+FROM example.main.split_dynamic_filter(n := 100, splits := 5)
+WHERE n >= 20 AND n < 30;
+----
+PushdownFilters([AndFilter(ConstantFilter(n >= 20) AND ConstantFilter(n < 30))])
+
+# No predicate means no filter — so "(none)" is a real report rather than the
+# fixture's fallback for everything.
+query I
+SELECT DISTINCT pushed_filters
+FROM example.main.split_dynamic_filter(n := 20, splits := 2);
+----
+(none)
+
+# KNOWN GAP — join-key pushdown does not reach a split scan.
+#
+# A join against a small build side normally reaches a VGI worker as an IN filter
+# over the distinct build-side keys (see table/dynamic_filter.test, where the
+# non-split fixture receives `InFilter(n IN [...])` for exactly this query
+# shape). On the split path the same query delivers nothing, so the worker reads
+# every split in full and DuckDB filters above the scan.
+#
+# The answer is still correct — which is why this is a performance gap and not a
+# correctness bug, and why it is asserted rather than left to be rediscovered.
+# Static pushdown above is unaffected.
+statement ok
+CREATE TABLE keys AS SELECT * FROM (VALUES (3), (17), (42)) t(k);
+
+query I
+SELECT count(*)
+FROM example.main.split_dynamic_filter(n := 200, splits := 8) s
+JOIN keys ON s.n = keys.k;
+----
+3
+
+query I
+SELECT DISTINCT pushed_filters
+FROM example.main.split_dynamic_filter(n := 200, splits := 8) s
+JOIN keys ON s.n = keys.k;
+----
+(none)
+
+statement ok
+DROP TABLE keys;
+
+statement ok
+DETACH example;
