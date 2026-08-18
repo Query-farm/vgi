@@ -95,17 +95,18 @@ FROM example.main.split_dynamic_filter(n := 20, splits := 2);
 ----
 (none)
 
-# KNOWN GAP — join-key pushdown does not reach a split scan.
+# Join-key pushdown reaches a split scan too. A join against a small build side
+# arrives as an IN filter over the distinct build-side keys, plus the min/max
+# bounds DuckDB derives from them — the dynamic half of pushdown, and the reason
+# this file is named for it.
 #
-# A join against a small build side normally reaches a VGI worker as an IN filter
-# over the distinct build-side keys (see table/dynamic_filter.test, where the
-# non-split fixture receives `InFilter(n IN [...])` for exactly this query
-# shape). On the split path the same query delivers nothing, so the worker reads
-# every split in full and DuckDB filters above the scan.
-#
-# The answer is still correct — which is why this is a performance gap and not a
-# correctness bug, and why it is asserted rather than left to be rediscovered.
-# Static pushdown above is unaffected.
+# It is worth stating what nearly hid this. The pushdown only arrives if the VGI
+# scan is on the PROBE side of the hash join, and the optimizer decides that from
+# cardinality. A table function that declines to estimate itself reports
+# "unknown", DuckDB assumes a large default, the scan is planned as the BUILD
+# side instead, and no filter is pushed into it — right answers, no pushdown, and
+# nothing in the result to say so. That looks exactly like a broken transport and
+# is not one; the fixture implements cardinality() for this reason.
 statement ok
 CREATE TABLE keys AS SELECT * FROM (VALUES (3), (17), (42)) t(k);
 
@@ -121,7 +122,16 @@ SELECT DISTINCT pushed_filters
 FROM example.main.split_dynamic_filter(n := 200, splits := 8) s
 JOIN keys ON s.n = keys.k;
 ----
-(none)
+PushdownFilters([AndFilter(InFilter(n IN [3, 17, 42]) AND ConstantFilter(n >= 3) AND ConstantFilter(n <= 42))])
+
+# Every split sees the join keys, not just the first — the same per-re-init
+# question as for static filters, but for a filter that arrives dynamically.
+query I
+SELECT count(DISTINCT pushed_filters)
+FROM example.main.split_dynamic_filter(n := 500, splits := 50) s
+JOIN keys ON s.n = keys.k;
+----
+1
 
 statement ok
 DROP TABLE keys;
