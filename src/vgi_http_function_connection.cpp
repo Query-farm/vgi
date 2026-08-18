@@ -417,7 +417,8 @@ InitResult HttpFunctionConnection::PerformInit(const BindResult &bind_result,
                                                 const std::optional<OrderByHint> &order_by,
                                                 const std::optional<TableSampleHint> &table_sample,
                                                 const std::vector<uint8_t> &init_opaque_data,
-                                                const std::optional<std::vector<uint8_t>> &finalize_state_id) {
+                                                const std::optional<std::vector<uint8_t>> &finalize_state_id,
+                                           const std::vector<std::string> &split_tokens) {
 #ifdef __EMSCRIPTEN__
 #endif
 	if (init_done_) {
@@ -465,7 +466,7 @@ InitResult HttpFunctionConnection::PerformInit(const BindResult &bind_result,
 	    ob_col, ob_dir, ob_null, ob_limit,
 	    ts_percentage, ts_seed,
 	    finalize_state_id,
-	    substream_id_);
+	    substream_id_, split_tokens);
 	auto init_request_bytes = SerializeToIpcBytes(init_request);
 #ifdef __EMSCRIPTEN__
 #endif
@@ -580,6 +581,33 @@ InitResult HttpFunctionConnection::PerformInit(const BindResult &bind_result,
 	}
 
 	return InitResult {init_response.execution_id, init_response.max_workers, init_response.opaque_data};
+}
+
+void HttpFunctionConnection::ResetForNextSplit() {
+	if (!init_done_) {
+		throw IOException("HttpFunctionConnection::ResetForNextSplit called before PerformInit [url: %s]", base_url_);
+	}
+
+	init_done_ = false;
+	data_finished_ = false;
+
+	// Everything buffered belongs to the split that just ended.
+	buffered_batches_.clear();
+	buffered_batch_index_ = 0;
+	stream_state_token_.clear();
+
+	// call_state_token_ is documented as NOT cleared per turn, so it must be
+	// cleared here explicitly: a stale one would address the finished split's
+	// server-side call state from the next split's requests.
+	call_state_token_.clear();
+
+	pending_input_.reset();
+	input_writer_opened_ = false;
+	input_writer_closed_ = false;
+
+	// http_client_ is deliberately KEPT. HTTP has no connection pooling here, so
+	// the keep-alive client *is* the connection; dropping it would pay a fresh
+	// TCP+TLS handshake on every split.
 }
 
 void HttpFunctionConnection::PerformFinalizeInit(const BindResult &bind_result) {

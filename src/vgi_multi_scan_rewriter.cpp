@@ -194,6 +194,28 @@ struct ArmBindResult {
 // scan function + bind_data, and construct the LogicalGet from the table's
 // logical columns. The companion catalog is attached at VGI-attach time (via the
 // attach_catalogs manifest), so this is a pure lookup — no attach here.
+//! Map a declared format name to the DuckDB table function that reads it.
+//!
+//! The convention (``read_<format>``) covers parquet/csv/json and anything an
+//! extension registers the same way, so the table only needs the exceptions.
+//! Unknown formats fall through to the convention rather than erroring here — if
+//! the resulting function does not exist, the ordinary "unknown function" path
+//! reports it with the extension-load hint already attached, which is a better
+//! message than anything this function could produce.
+static std::string VgiFormatReaderFunction(const std::string &format_name) {
+	static const std::map<std::string, std::string> kExceptions = {
+	    {"iceberg", "iceberg_scan"},
+	    {"delta", "delta_scan"},
+	    {"arrow", "read_arrow"},
+	    {"ipc", "read_arrow"},
+	};
+	auto it = kExceptions.find(format_name);
+	if (it != kExceptions.end()) {
+		return it->second;
+	}
+	return "read_" + format_name;
+}
+
 static ArmBindResult BindCatalogTableArm(const VgiScanBranch &branch, ClientContext &context, Binder &binder) {
 	// The companion catalog must already be attached. If it isn't (e.g.
 	// `attach_companions false`, or an optional companion that failed/conflicted),
@@ -263,10 +285,43 @@ static ArmBindResult BindBranchArm(const VgiScanBranch &branch, ClientContext &c
 		(void)marker_column_ids;
 		return BindCatalogTableArm(branch, context, binder);
 	}
+
+	// P4: a FORMAT branch names a format plus locations instead of a function.
+	// It is bound by resolving the format to its reader and then taking the
+	// ordinary function path — resolved here rather than given its own bind so it
+	// inherits overload selection, extension auto-load and pushdown discovery
+	// unchanged. A worker gets to say "these 40 parquet files" without knowing the
+	// reader's argument spelling.
+	//
+	// Only the three fields the function path actually reads are overridden.
+	// VgiScanBranch holds a unique_ptr (parsed_branch_filter) so it is not
+	// copy-assignable, and copying the whole record would be wrong anyway — the
+	// filter belongs to the original branch.
+	std::string eff_function_name = branch.function_name;
+	vector<Value> eff_positional(branch.positional_arguments.begin(), branch.positional_arguments.end());
+	std::map<std::string, Value> eff_named = branch.named_arguments;
+	if (branch.IsFormatBranch()) {
+		eff_function_name = VgiFormatReaderFunction(branch.format_name);
+		// Locations become the reader's single positional argument: a LIST for a
+		// multi-file read, a plain VARCHAR when there is exactly one, because some
+		// readers (iceberg_scan) accept only a scalar path.
+		eff_positional.clear();
+		if (branch.format_locations.size() == 1) {
+			eff_positional.push_back(Value(branch.format_locations[0]));
+		} else {
+			vector<Value> locs;
+			locs.reserve(branch.format_locations.size());
+			for (const auto &loc : branch.format_locations) {
+				locs.push_back(Value(loc));
+			}
+			eff_positional.push_back(Value::LIST(LogicalType::VARCHAR, std::move(locs)));
+		}
+		eff_named = branch.format_options;
+	}
 	// Look up the branch's function. Try the table's catalog/schema first,
 	// fall back to the catalog's default schema, then the system catalog
 	// (read_parquet, iceberg_scan, etc.).
-	EntryLookupInfo lookup(CatalogType::TABLE_FUNCTION_ENTRY, branch.function_name);
+	EntryLookupInfo lookup(CatalogType::TABLE_FUNCTION_ENTRY, eff_function_name);
 	optional_ptr<CatalogEntry> entry = Catalog::GetEntry(context, table_catalog_name, table_schema_name, lookup,
 	                                                      OnEntryNotFound::RETURN_NULL);
 	if (!entry && !default_schema.empty() && default_schema != table_schema_name) {
@@ -279,15 +334,15 @@ static ArmBindResult BindBranchArm(const VgiScanBranch &branch, ClientContext &c
 	if (!entry) {
 		throw BinderException("VGI branch references unknown function '%s'. "
 		                       "Check that any required extensions are loaded.",
-		                       branch.function_name);
+		                       eff_function_name);
 	}
 	auto &fn_entry = entry->Cast<TableFunctionCatalogEntry>();
 
 	// Pick an overload by argument types. Same shape as the throwaway spike.
 	// Note: GetFunctionByArguments expects duckdb::vector (not std::vector).
 	vector<LogicalType> arg_types;
-	arg_types.reserve(branch.positional_arguments.size());
-	for (const auto &v : branch.positional_arguments) {
+	arg_types.reserve(eff_positional.size());
+	for (const auto &v : eff_positional) {
 		arg_types.push_back(v.type());
 	}
 	TableFunction tf = fn_entry.functions.GetFunctionByArguments(context, arg_types);
@@ -295,9 +350,9 @@ static ArmBindResult BindBranchArm(const VgiScanBranch &branch, ClientContext &c
 	// Build the bind input. The Binder + TableFunctionRef are required by
 	// the TableFunctionBindInput constructor; we pass the optimizer's binder
 	// and a default-constructed ref.
-	vector<Value> parameters(branch.positional_arguments.begin(), branch.positional_arguments.end());
+	vector<Value> parameters(eff_positional.begin(), eff_positional.end());
 	named_parameter_map_t named_parameters;
-	for (auto &kv : branch.named_arguments) {
+	for (auto &kv : eff_named) {
 		named_parameters.emplace(kv.first, kv.second);
 	}
 	vector<LogicalType> input_table_types;

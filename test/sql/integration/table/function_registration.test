@@ -122,13 +122,15 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 # 2 global-registration probes (global_table, a producer; global_buffered, a
 #   table-buffering reducer) — one per function type that surfaces as a table,
 #   proving a worker-declared global function is registered into the catalog.
-# = 146
+# 5 split-capable producers (split_sequence, split_zero, split_empty_ranges,
+#   split_skewed, split_many) — the plan()/on_split() path. Back splits/*.test.
+# = 151
 query I
 SELECT COUNT(*)
 FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'table';
 ----
-146
+151
 
 # The 34 pure table functions (no TABLE parameter type)
 # Note: make_series appears 5 times (5 overloads), make_pairs appears 3 times,

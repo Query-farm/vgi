@@ -24,6 +24,24 @@ namespace duckdb {
 
 namespace {
 
+//! Read the client-side ``vgi_split_scans`` kill switch. Defaults to true.
+//!
+//! Read at BIND rather than init: the worker capability and this setting are
+//! folded into one flag on the bind data, so a ``SET`` between bind and execute
+//! cannot leave a bind that assumed splits paired with an init that did not.
+bool VgiSplitScansEnabled(ClientContext &context) {
+	Value v;
+	if (context.TryGetCurrentSetting("vgi_split_scans", v) && !v.IsNull()) {
+		return v.GetValue<bool>();
+	}
+	return true;
+}
+
+} // namespace
+
+
+namespace {
+
 // Extract settings from client context given a list of setting names
 // This is used for catalog-bound functions where we know which settings the catalog registered
 std::map<std::string, Value> ExtractVgiSettings(ClientContext &context,
@@ -92,6 +110,12 @@ static unique_ptr<FunctionData> VgiCatalogTableFunctionBind(ClientContext &conte
 	// require/parse vgi_batch_index from each Arrow record-batch's
 	// KeyValueMetadata.
 	bind_data->supports_batch_index = vgi_info.function_info().supports_batch_index;
+
+	// supports_splits folds the worker's capability together with the client-side
+	// setting, at BIND. Reading the setting here rather than at init is deliberate:
+	// a ``SET vgi_split_scans`` between bind and execute would otherwise produce a
+	// bind that assumed splits and an init that did not.
+	bind_data->supports_splits = vgi_info.function_info().supports_splits && VgiSplitScansEnabled(context);
 	// FIXED_ORDER: clamps MaxThreads to 1 so DuckDB schedules the source
 	// onto a single thread. ``TableFunction::order_preservation_type`` is
 	// already set at function-registration time (see ``AddFunction`` calls

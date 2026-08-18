@@ -466,7 +466,8 @@ InitResult WebWorkerFunctionConnection::PerformInit(const BindResult &bind_resul
                                                     const std::optional<OrderByHint> &order_by,
                                                     const std::optional<TableSampleHint> &table_sample,
                                                     const std::vector<uint8_t> &init_opaque_data,
-                                                    const std::optional<std::vector<uint8_t>> &finalize_state_id) {
+                                                    const std::optional<std::vector<uint8_t>> &finalize_state_id,
+                                           const std::vector<std::string> &split_tokens) {
 	if (slot_ < 0) {
 		ThrowVgiIOException("WebWorkerFunctionConnection::PerformInit called before EnsureWorkerSpawned", location_,
 		                    -1, GetExecutionIdHex());
@@ -503,7 +504,7 @@ InitResult WebWorkerFunctionConnection::PerformInit(const BindResult &bind_resul
 	auto init_request = BuildInitRequest(bind_result.bind_request_bytes, bind_result.output_schema_bytes,
 	                                      bind_result.opaque_data, projection_ids_64, pushdown_filters, join_keys, phase,
 	                                      execution_id, init_opaque_data, ob_col, ob_dir, ob_null, ob_limit,
-	                                      ts_percentage, ts_seed, finalize_state_id, substream_id_);
+	                                      ts_percentage, ts_seed, finalize_state_id, substream_id_, split_tokens);
 	auto init_request_bytes = SerializeToIpcBytes(init_request);
 
 	auto rpc_params = generated::BuildInitParams(init_request_bytes);

@@ -398,6 +398,18 @@ std::unordered_map<std::string, unique_ptr<BaseStatistics>> ParseColumnStatistic
 // Invoke table_function_cardinality RPC: get cardinality estimate for a table function.
 // Uses the serialized BindRequest bytes from a completed bind phase.
 // Returns TableFunctionCardinalityResult with estimate and max (-1 = unknown).
+//! Plan a table-function scan into named, independently redeemable splits.
+//! Bounded by a page cap, a total split cap and a per-page cancellation check;
+//! a breach throws rather than scanning a partial enumeration.
+VgiScanPlan InvokeTableFunctionPlan(const CatalogRpcContext &ctx, const std::vector<uint8_t> &bind_request_bytes,
+                                    const std::vector<uint8_t> &bind_opaque_data,
+                                    const std::vector<int32_t> &projection_ids,
+                                    const std::vector<uint8_t> &pushdown_filters, int64_t min_splits,
+                                    int64_t target_split_bytes, ClientContext &context);
+
+//! Parse one PlanResponse batch into a page.
+VgiScanPlanPage ParseVgiScanPlanPage(const std::shared_ptr<arrow::RecordBatch> &batch, const std::string &worker_path);
+
 TableFunctionCardinalityResult InvokeTableFunctionCardinality(
     const CatalogRpcContext &ctx, const std::vector<uint8_t> &bind_request_bytes,
     const std::vector<uint8_t> &bind_opaque_data, ClientContext &context);

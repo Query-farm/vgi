@@ -1028,6 +1028,190 @@ TableFunctionCardinalityResult InvokeTableFunctionCardinality(
 }
 
 // ============================================================================
+// Scan Planning (splits)
+// ============================================================================
+
+//! Parse one ``PlanResponse`` batch into a page.
+//!
+//! Everything is optional except ``splits`` itself, and an EMPTY splits list is
+//! legal — a fully-pruned scan plans zero splits, and that must produce an empty
+//! result rather than an error.
+VgiScanPlanPage ParseVgiScanPlanPage(const std::shared_ptr<arrow::RecordBatch> &batch,
+                                     const std::string &worker_path) {
+	VgiScanPlanPage page;
+	if (!batch || batch->num_rows() == 0) {
+		return page;
+	}
+
+	// splits: list<binary>, one serialized ScanSplit per entry.
+	if (auto col = batch->GetColumnByName("splits")) {
+		if (auto list = std::dynamic_pointer_cast<arrow::ListArray>(col)) {
+			if (!list->IsNull(0)) {
+				auto values = std::dynamic_pointer_cast<arrow::BinaryArray>(list->values());
+				if (!values) {
+					throw IOException("VGI worker '%s' returned a plan whose 'splits' entries are not binary",
+					                  worker_path);
+				}
+				const auto start = list->value_offset(0);
+				const auto end = list->value_offset(1);
+				page.splits.reserve(static_cast<size_t>(end - start));
+				for (auto i = start; i < end; i++) {
+					// Each entry is a serialized ScanSplit. What gets redeemed is its
+					// ``token`` — the framework-stamped envelope — NOT the whole
+					// record and not the worker's raw payload, which is inside the
+					// envelope and unverifiable on its own.
+					auto view = values->GetView(i);
+					std::vector<uint8_t> split_bytes(view.data(), view.data() + view.size());
+					auto split_batch = DeserializeFromIpcBytes(split_bytes);
+					if (!split_batch || split_batch->num_rows() == 0) {
+						throw IOException("VGI worker '%s' returned an unparseable ScanSplit", worker_path);
+					}
+					auto token_col = split_batch->GetColumnByName("token");
+					auto token_arr = std::dynamic_pointer_cast<arrow::LargeBinaryArray>(token_col);
+					if (!token_arr || token_arr->IsNull(0)) {
+						throw IOException(
+						    "VGI worker '%s' returned a ScanSplit with no token; the framework stamps this, "
+						    "so an absent token means the worker bypassed it.",
+						    worker_path);
+					}
+					auto tok = token_arr->GetView(0);
+					page.splits.emplace_back(tok.data(), tok.size());
+				}
+			}
+		}
+	}
+
+	auto binary_field = [&](const char *name) -> std::vector<uint8_t> {
+		std::vector<uint8_t> out;
+		if (auto col = batch->GetColumnByName(name)) {
+			if (auto arr = std::dynamic_pointer_cast<arrow::BinaryArray>(col)) {
+				if (!arr->IsNull(0)) {
+					auto view = arr->GetView(0);
+					out.assign(view.begin(), view.end());
+				}
+			}
+		}
+		return out;
+	};
+	auto int_field = [&](const char *name) -> int64_t {
+		if (auto col = batch->GetColumnByName(name)) {
+			if (auto arr = std::dynamic_pointer_cast<arrow::Int64Array>(col)) {
+				if (!arr->IsNull(0)) {
+					return arr->Value(0);
+				}
+			}
+		}
+		return 0;
+	};
+
+	// next_cursors: list<binary>. More than one means the worker wants parallel
+	// enumeration, which is only sound if the cursors partition the remainder
+	// disjointly. DuckDB paginates serially, so it follows the first and ignores
+	// the rest rather than pretending to fan out.
+	if (auto col = batch->GetColumnByName("next_cursors")) {
+		if (auto list = std::dynamic_pointer_cast<arrow::ListArray>(col)) {
+			if (!list->IsNull(0) && list->value_length(0) > 0) {
+				auto values = std::dynamic_pointer_cast<arrow::BinaryArray>(list->values());
+				if (values) {
+					auto view = values->GetView(list->value_offset(0));
+					page.next_cursor.assign(view.begin(), view.end());
+				}
+			}
+		}
+	}
+
+	page.max_workers = int_field("max_workers");
+	page.catalog_version = int_field("catalog_version");
+	page.execution_id = binary_field("execution_id");
+	page.init_opaque_data = binary_field("init_opaque_data");
+
+	if (auto col = batch->GetColumnByName("scope")) {
+		if (auto arr = std::dynamic_pointer_cast<arrow::StringArray>(col)) {
+			if (!arr->IsNull(0)) {
+				page.scope = arr->GetString(0);
+			}
+		}
+	}
+
+	return page;
+}
+
+//! Plan a table-function scan into named, independently redeemable splits.
+//!
+//! Bounded on three axes, because this runs on the scheduling thread and a worker
+//! that paginates forever would otherwise hang the query with no diagnosis:
+//! a page cap, a total split cap, and a cancellation check every page.
+//!
+//! A breach THROWS rather than proceeding with what arrived. Scanning a partial
+//! enumeration would silently return a subset of the table — wrong results wearing
+//! the costume of a successful query — so truncate-and-proceed is never correct here.
+VgiScanPlan InvokeTableFunctionPlan(const CatalogRpcContext &ctx,
+                                    const std::vector<uint8_t> &bind_request_bytes,
+                                    const std::vector<uint8_t> &bind_opaque_data,
+                                    const std::vector<int32_t> &projection_ids,
+                                    const std::vector<uint8_t> &pushdown_filters, int64_t min_splits,
+                                    int64_t target_split_bytes, ClientContext &context) {
+	auto &worker_path = ctx.params->worker_path();
+
+	// Bounds. Deliberately generous: they exist to turn a hang into a legible
+	// error, not to second-guess a worker's split count.
+	constexpr idx_t kMaxPages = 1024;
+	constexpr idx_t kMaxSplits = 1u << 20;
+
+	VgiScanPlan plan;
+	std::vector<uint8_t> cursor;
+	idx_t pages = 0;
+
+	while (true) {
+		if (context.interrupted) {
+			throw InterruptException();
+		}
+		if (pages >= kMaxPages) {
+			throw IOException(
+			    "VGI worker '%s' function '%s' exceeded the scan-planning page cap (%llu pages) without "
+			    "exhausting its cursor; refusing to scan a partial split enumeration.",
+			    worker_path, plan.function_name, static_cast<unsigned long long>(kMaxPages));
+		}
+
+		auto request_batch = BuildTableFunctionPlanRequest(bind_request_bytes, bind_opaque_data, projection_ids,
+		                                                   pushdown_filters, min_splits, target_split_bytes, cursor);
+		auto request_bytes = SerializeToIpcBytes(request_batch);
+		auto params = generated::BuildTableFunctionPlanParams(request_bytes);
+
+		auto response = InvokeRpcMethod(ctx, "table_function_plan", params, context);
+		auto result_batch = ExtractAndDeserializeResult(response, "table_function_plan", worker_path);
+		if (!result_batch) {
+			break;
+		}
+		pages++;
+
+		auto page = ParseVgiScanPlanPage(result_batch, worker_path);
+		if (plan.splits.empty()) {
+			// Plan-level facts come from the first page.
+			plan.max_workers = page.max_workers;
+			plan.catalog_version = page.catalog_version;
+			plan.scope = page.scope;
+			plan.execution_id = page.execution_id;
+			plan.init_opaque_data = page.init_opaque_data;
+		}
+		plan.splits.insert(plan.splits.end(), page.splits.begin(), page.splits.end());
+
+		if (plan.splits.size() > kMaxSplits) {
+			throw IOException("VGI worker '%s' returned more than %llu splits for one scan; refusing to "
+			                  "buffer an unbounded split vector.",
+			                  worker_path, static_cast<unsigned long long>(kMaxSplits));
+		}
+
+		if (page.next_cursor.empty()) {
+			break;
+		}
+		cursor = page.next_cursor;
+	}
+
+	return plan;
+}
+
+// ============================================================================
 // Column Statistics
 // ============================================================================
 
@@ -2281,6 +2465,43 @@ VgiScanBranchesResult ParseScanBranchesResult(ClientContext &context,
 		branch.source_schema = branch_row["source_schema"].value_or(std::string{});
 		branch.source_table = branch_row["source_table"].value_or(std::string{});
 
+		// Format-branch fields (P4). A non-empty format_name with no function and
+		// no source_table selects the format kind: read these locations as this
+		// format.
+		branch.format_name = branch_row["format_name"].value_or(std::string{});
+		{
+			auto locs = branch_row["format_locations"].value_or(std::vector<std::string>{});
+			branch.format_locations.assign(locs.begin(), locs.end());
+		}
+
+		// Three-way discriminator, enforced HERE rather than at bind. A branch that
+		// sets two identifying fields is a worker bug; catching it at bind would
+		// blame the query instead of the catalog, and the message would arrive far
+		// from the thing that produced it.
+		{
+			const int kinds = static_cast<int>(branch.IsFunctionBranch()) +
+			                  static_cast<int>(!branch.source_table.empty()) +
+			                  static_cast<int>(!branch.format_name.empty());
+			if (kinds == 0) {
+				throw BinderException(
+				    "VGI scan branch %d declares none of function_name / source_table / format_name; "
+				    "a branch must name exactly one source [worker: %s]",
+				    static_cast<int>(result.branches.size()), worker_path);
+			}
+			if (kinds > 1) {
+				throw BinderException(
+				    "VGI scan branch %d declares more than one of function_name / source_table / "
+				    "format_name; these are mutually exclusive branch kinds [worker: %s]",
+				    static_cast<int>(result.branches.size()), worker_path);
+			}
+			if (branch.IsFormatBranch() && branch.format_locations.empty()) {
+				throw BinderException(
+				    "VGI scan branch %d is a format branch ('%s') but names no locations to read "
+				    "[worker: %s]",
+				    static_cast<int>(result.branches.size()), branch.format_name, worker_path);
+			}
+		}
+
 		result.branches.push_back(std::move(branch));
 	}
 
@@ -2623,6 +2844,14 @@ VgiFunctionInfo ParseFunctionInfo(const std::shared_ptr<arrow::RecordBatch> &bat
 	// reassemble parallel output. Also skips the FIXED_ORDER MaxThreads=1
 	// clamp — see vgi_table_function_set.cpp.
 	info.supports_batch_index = row["supports_batch_index"].value_or(false);
+
+	// supports_splits / filters_exactly_applied / supports_positions — optional
+	// bools, false for pre-1.4.0 workers. split_token_ttl_seconds is nullable and
+	// nullopt means unbounded, NOT "expires immediately".
+	info.supports_splits = row["supports_splits"].value_or(false);
+	info.filters_exactly_applied = row["filters_exactly_applied"].value_or(false);
+	info.supports_positions = row["supports_positions"].value_or(false);
+	info.split_token_ttl_seconds = row["split_token_ttl_seconds"].as<int64_t>();
 
 	// partition_kind — optional string mirroring DuckDB's
 	// TablePartitionInfo enum. Defaults to NOT_PARTITIONED for older

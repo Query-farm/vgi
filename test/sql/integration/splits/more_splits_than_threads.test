@@ -1,0 +1,38 @@
+# name: test/sql/integration/splits/more_splits_than_threads.test
+# description: 1000 splits over 8 threads: no duplicates, no drops
+# group: [vgi_integration_splits]
+
+# Splits outnumber readers, so each reader claims many in sequence. That is the
+# shape that exercises re-initializing a REUSED connection: the previous split's
+# stream has to be closed (IPC EOS on stdin) before the next init is written, or
+# the init request lands inside an unterminated stream and the transport mis-frames.
+#
+# COUNT(DISTINCT) is the assertion that matters, not COUNT(*). A drain loop that
+# re-reads a split would still produce 5000 rows if it also dropped one; only
+# distinctness separates "read everything once" from "read something twice".
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+SET threads=8;
+
+query III
+SELECT count(*), count(DISTINCT n), sum(n)
+FROM example.main.split_many(n := 5000, splits := 1000);
+----
+5000	5000	12497500
+
+# Same claim set, single-threaded: one reader must drain all 1000 sequentially.
+statement ok
+SET threads=1;
+
+query III
+SELECT count(*), count(DISTINCT n), sum(n)
+FROM example.main.split_many(n := 5000, splits := 1000);
+----
+5000	5000	12497500

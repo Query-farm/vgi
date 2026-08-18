@@ -46,6 +46,15 @@ public:
 	~HttpFunctionConnection() override = default;
 
 	// Set shared state for dynamic filter pushdown via tick batches
+	// Reset per-init stream state, KEEPING http_client_ — the keep-alive client is
+	// the connection here (there is no pooling), so dropping it would cost a fresh
+	// TCP+TLS handshake per split.
+	//
+	// call_state_token_ is explicitly documented as NOT cleared per turn, so it has
+	// to be cleared here by hand: a stale one would address the previous split's
+	// server-side call state from the next split's requests.
+	void ResetForNextSplit() override;
+
 	void SetTickFilterState(shared_ptr<TickFilterState> state) override {
 		tick_filter_state_ = std::move(state);
 	}
@@ -83,7 +92,8 @@ public:
 	                       const std::optional<OrderByHint> &order_by = std::nullopt,
 	                       const std::optional<TableSampleHint> &table_sample = std::nullopt,
 	                       const std::vector<uint8_t> &init_opaque_data = {},
-	                       const std::optional<std::vector<uint8_t>> &finalize_state_id = std::nullopt) override;
+	                       const std::optional<std::vector<uint8_t>> &finalize_state_id = std::nullopt,
+	                       const std::vector<std::string> &split_tokens = {}) override;
 	void PerformFinalizeInit(const BindResult &bind_result) override;
 
 	// Phase 3: Data exchange

@@ -3561,6 +3561,33 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// site below. The multi-scan rewriter is intentionally pre-pushdown so
 	// that DuckDB's standard filter-pushdown distributes parent filters
 	// into each arm after we've produced LogicalSetOperation. =========================================
+	// Split-based scans: plan() once for named, independently redeemable units,
+	// then init() per split. Client-side kill switch ONLY — setting it false stops
+	// DuckDB calling plan(); it makes no promise about the worker. A worker that
+	// migrated fully to splits and dropped its queue_push/queue_pop path will fail
+	// loudly here, which is correct: silently returning some other set of rows
+	// would be worse. Same emergency-rollback shape as vgi_multi_branch_scans and
+	// vgi_table_buffering. Read at BIND, not init.
+	config.AddExtensionOption(
+	    "vgi_split_scans",
+	    "Use the split-based scan path for workers that advertise supports_splits: "
+	    "plan() the scan into named, independently redeemable units, then init() per "
+	    "split. Set to false to fall back to primary/secondary init. Emergency-rollback "
+	    "knob; a worker that only implements splits will then fail loudly.",
+	    LogicalType::BOOLEAN, Value::BOOLEAN(true));
+
+	// Requested split size, handed to the worker as ``target_split_bytes``. DuckDB
+	// has no natural byte target of its own — it claims splits greedily as
+	// interchangeable units — so the default is 0, meaning "omit the field and let
+	// the worker size its own splits". A fabricated default would be actively wrong
+	// for a compute-bound worker where bytes do not predict cost.
+	config.AddExtensionOption(
+	    "vgi_target_split_bytes",
+	    "Requested size in bytes for each scan split, passed to the worker's plan() "
+	    "as target_split_bytes. 0 (the default) omits the field, leaving sizing to "
+	    "the worker.",
+	    LogicalType::UBIGINT, Value::UBIGINT(0));
+
 	config.AddExtensionOption(
 	    "vgi_multi_branch_scans",
 	    "Rewrite VGI multi-branch table scans into LogicalSetOperation(UNION_ALL, ...) "

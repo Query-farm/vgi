@@ -199,6 +199,8 @@ public:
 	~FunctionConnection() override;
 
 	// Set shared state for dynamic filter pushdown via tick batches
+	void ResetForNextSplit() override;
+
 	void SetTickFilterState(shared_ptr<TickFilterState> state) override {
 		tick_filter_state_ = std::move(state);
 	}
@@ -255,7 +257,8 @@ public:
 	                       const std::optional<OrderByHint> &order_by = std::nullopt,
 	                       const std::optional<TableSampleHint> &table_sample = std::nullopt,
 	                       const std::vector<uint8_t> &init_opaque_data = {},
-	                       const std::optional<std::vector<uint8_t>> &finalize_state_id = std::nullopt) override;
+	                       const std::optional<std::vector<uint8_t>> &finalize_state_id = std::nullopt,
+	                       const std::vector<std::string> &split_tokens = {}) override;
 
 	// Re-init for table-in-out FINALIZE: closes the current data streams
 	// and sends a new init RPC with phase="FINALIZE" that references the
@@ -499,6 +502,16 @@ private:
 	// ReadDataBatch is called (lockstep: DuckDB has finished with the
 	// previous chunk before requesting the next), and on connection close.
 	int64_t shm_last_offset_ = -1;
+
+	// INVARIANT 14: a split init (or the reset before it) that failed leaves this
+	// connection in an unknown protocol state. ReleaseForPooling gates on
+	// `init_done_ && !data_finished_`, and ResetForNextSplit clears BOTH before the
+	// next init is issued — so without this flag a connection whose init threw
+	// would look perfectly idle and go straight back into the pool with an
+	// unanswered init request in flight on stdin. The next checkout would then read
+	// this split's init response as its own stream header: silent cross-query
+	// corruption, on the `pool true` default.
+	bool split_reset_failed_ = false;
 #endif
 
 	// Stderr reader: owned drainer that spawns a background thread for the

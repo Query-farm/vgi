@@ -607,7 +607,8 @@ InitResult FunctionConnection::PerformInit(const BindResult &bind_result,
                                            const std::optional<OrderByHint> &order_by,
                                            const std::optional<TableSampleHint> &table_sample,
                                            const std::vector<uint8_t> &init_opaque_data,
-                                           const std::optional<std::vector<uint8_t>> &finalize_state_id) {
+                                           const std::optional<std::vector<uint8_t>> &finalize_state_id,
+                                           const std::vector<std::string> &split_tokens) {
 	if (!proc_) {
 		ThrowVgiIOException("FunctionConnection::PerformInit called before PerformBindRpc", worker_path_,
 		                    -1, GetExecutionIdHex());
@@ -659,7 +660,7 @@ InitResult FunctionConnection::PerformInit(const BindResult &bind_result,
 	    ob_col, ob_dir, ob_null, ob_limit,
 	    ts_percentage, ts_seed,
 	    finalize_state_id,
-	    substream_id_);
+	    substream_id_, split_tokens);
 	auto init_request_bytes = SerializeToIpcBytes(init_request);
 
 	// Build RPC params and send request. If shm transport is enabled,
@@ -918,6 +919,65 @@ void FunctionConnection::PerformFinalizeInit(const BindResult &bind_result) {
 
 	// Call PerformInit with phase=FINALIZE and the stored execution_id
 	PerformInit(bind_result, {}, nullptr, {}, "FINALIZE");
+}
+
+void FunctionConnection::ResetForNextSplit() {
+	if (!init_done_) {
+		ThrowVgiIOException("FunctionConnection::ResetForNextSplit called before PerformInit", worker_path_,
+		                    proc_ ? proc_->GetPid() : -1, GetExecutionIdHex());
+	}
+
+	// FIRST: close the input writer. This writes the IPC end-of-stream on stdin so
+	// the worker's tick reader terminates and returns to its RPC dispatch loop.
+	// Doing this after (or not at all) means PerformInit installs a NEW stream
+	// writer over the same fd while the old stream is still open, and the next
+	// init request's bytes land inside an unterminated tick stream. Same ordering
+	// as PerformFinalizeInit, for the same reason.
+	if (input_writer_ && !input_writer_closed_) {
+		auto close_status = input_writer_->Close();
+		if (!close_status.ok()) {
+			// Poison: the stream is in an unknown state, so the connection must not
+			// go back to the pool looking idle.
+			split_reset_failed_ = true;
+			ThrowVgiIOException("Failed to close input writer between splits: %s", worker_path_,
+			                    proc_ ? proc_->GetPid() : -1, GetExecutionIdHex(), close_status.ToString());
+		}
+	}
+	input_writer_.reset();
+	input_writer_opened_ = false;
+	input_writer_closed_ = false;
+
+	// Drain any unread output from this split before the next init request goes
+	// out, or ReadStreamHeader would read the leftover data as the new response.
+	while (data_reader_) {
+		auto drain_result = data_reader_->ReadNext();
+		if (!drain_result.ok() || !drain_result.ValueUnsafe().batch) {
+			break;
+		}
+	}
+	data_reader_.reset();
+	data_stream_.reset();
+
+	// Per-init stream state. Everything below is scoped to ONE split's stream and
+	// would otherwise leak into the next one.
+	init_done_ = false;
+	data_finished_ = false;
+	last_batch_index_ = DConstants::INVALID_INDEX;
+	last_partition_values_bytes_.clear();
+	last_parent_row_bytes_.clear();
+	last_cache_control_ = {};
+	cond_if_none_match_.clear();
+	cond_if_modified_since_.clear();
+
+	// Shared memory: the allocator is reset inside PerformInit's negotiated-shm
+	// branch, but shm_last_offset_ is ours to clear. Leaving a stale offset would
+	// have the next ReadDataBatch free a slot belonging to the previous split.
+	shm_last_offset_ = -1;
+
+	// NOT cleared, deliberately: proc_ and its pipes (the transport), tick_filter_state_
+	// (a shared gstate object PerformInit never touches, so dynamic join-key pushdown
+	// survives into the next split), and substream_id_ (one reader keeps one identity
+	// across the splits it claims).
 }
 
 std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
@@ -1642,6 +1702,12 @@ std::unique_ptr<PooledWorker> FunctionConnection::ReleaseForPooling() {
 	}
 	bool streaming_in_flight = init_done_ && !data_finished_;
 	if (streaming_in_flight) {
+		return nullptr;
+	}
+	// A failed split reset/init clears the flags above, so the check would pass;
+	// refuse explicitly instead of handing back a connection with an unanswered
+	// request in flight. See split_reset_failed_'s declaration.
+	if (split_reset_failed_) {
 		return nullptr;
 	}
 

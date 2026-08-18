@@ -232,7 +232,8 @@ std::shared_ptr<arrow::RecordBatch> BuildInitRequest(
     double tablesample_percentage = -1.0,            // -1.0 = null (no sample)
     int64_t tablesample_seed = -1,                   // -1 = null (no seed)
     const std::optional<std::vector<uint8_t>> &finalize_state_id = std::nullopt,  // TABLE_BUFFERING_FINALIZE only
-    const std::vector<uint8_t> &substream_id = {});  // parallel streaming table-in-out per-substream id
+    const std::vector<uint8_t> &substream_id = {},           // parallel streaming table-in-out per-substream id
+    const std::vector<std::string> &split_tokens = {});  // splits this init redeems (DuckDB sends one)
 
 // ============================================================================
 // GlobalInitResponse
@@ -278,6 +279,16 @@ UnwrapAndValidateItems(const std::shared_ptr<arrow::RecordBatch> &batch,
 // Fields match Python TableFunctionCardinalityRequest dataclass:
 //   bind_call: binary (BindRequest as IPC bytes)
 //   bind_opaque_data: binary|null
+//! Build the inner ``TableFunctionPlanRequest`` record (see the .cpp for why
+//! row_limit is absent and target_split_bytes is omitted when 0).
+std::shared_ptr<arrow::RecordBatch>
+BuildTableFunctionPlanRequest(const std::vector<uint8_t> &bind_call_bytes,
+                              const std::vector<uint8_t> &bind_opaque_data,
+                              const std::vector<int32_t> &projection_ids,
+                              const std::vector<uint8_t> &pushdown_filters,
+                              int64_t min_splits, int64_t target_split_bytes,
+                              const std::vector<uint8_t> &cursor);
+
 std::shared_ptr<arrow::RecordBatch> BuildTableFunctionCardinalityRequest(
     const std::vector<uint8_t> &bind_call_bytes,
     const std::vector<uint8_t> &bind_opaque_data = {});

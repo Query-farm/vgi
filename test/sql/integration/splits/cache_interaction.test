@@ -1,0 +1,50 @@
+# name: test/sql/integration/splits/cache_interaction.test
+# description: The result cache does not learn about splits, and never commits a partial
+# group: [vgi_integration_splits]
+
+# VgiResultCacheKey describes the QUERY (identity, filters, projection,
+# catalog_version); splits are how the rows were produced. So a split scan and a
+# non-split scan of the same query must share a key and be interchangeable —
+# neither should be able to serve the other a different row set.
+#
+# The never-partial half is the one that fails silently. "eos == launched" only
+# proves every reader that STARTED also finished; on the split path a reader
+# destroyed mid-split consumed a claim without reading it, and the surviving
+# readers' completions would paper over the hole — committing a partial result as
+# though it were whole. Hence the extra gate on drained-vs-planned splits.
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+# Repeat an identical split scan; the answer must not drift.
+query II
+SELECT count(*), sum(n) FROM example.main.split_sequence(n := 300, splits := 9);
+----
+300	44850
+
+query II
+SELECT count(*), sum(n) FROM example.main.split_sequence(n := 300, splits := 9);
+----
+300	44850
+
+# Whatever the cache did, it must never have committed a SUBSET. If a partial had
+# been stored and served, this count would drop below 300 on a later read.
+query II
+SELECT count(*), sum(n) FROM example.main.split_sequence(n := 300, splits := 9);
+----
+300	44850
+
+# The plan RPC is observable, so a split scan is provably taking the split path
+# rather than silently falling back.
+query I
+SELECT count(*) > 0 FROM duckdb_logs
+WHERE type='VGI' AND message LIKE '%scan.plan%';
+----
+true

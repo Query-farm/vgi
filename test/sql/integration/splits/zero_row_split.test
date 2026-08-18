@@ -1,0 +1,55 @@
+# name: test/sql/integration/splits/zero_row_split.test
+# description: A zero-ROW split must not end the reader; zero SPLITS is legal
+# group: [vgi_integration_splits]
+
+# Two distinct cases that look alike and fail differently.
+#
+# Zero-ROW splits are the likelier one in practice — a filter prunes a range — and
+# they are the dangerous one: DuckDB reads a 0-row chunk under IMPLICIT as
+# FINISHED, so a drain loop that surfaced one mid-scan would end the reader and
+# silently drop every remaining split. The query would look correct.
+# split_empty_ranges interleaves empty ranges with non-empty ones deliberately; a
+# trailing empty split would not catch it.
+#
+# Zero SPLITS is the other case: a fully-pruned scan plans none at all. That must
+# produce an empty result rather than a crash or a hang, which means the reader
+# count still clamps to at least one and that reader terminates cleanly.
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# Interleaved empty ranges: the full row set still arrives.
+query II
+SELECT count(*), sum(n) FROM example.main.split_empty_ranges(n := 10, splits := 4);
+----
+10	45
+
+query II
+SELECT count(*), sum(n) FROM example.main.split_empty_ranges(n := 200, splits := 16);
+----
+200	19900
+
+# ...and it is the SAME row set, not merely the same count.
+query I
+SELECT count(*) FROM (
+    SELECT n FROM example.main.split_empty_ranges(n := 200, splits := 16)
+    EXCEPT
+    SELECT n FROM example.main.sequence(200)
+);
+----
+0
+
+# Zero splits: legal, empty, no crash.
+query I
+SELECT count(*) FROM example.main.split_zero(n := 100, splits := 4);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT 1 WHERE EXISTS (SELECT 1 FROM example.main.split_zero(n := 100, splits := 4)));
+----
+0

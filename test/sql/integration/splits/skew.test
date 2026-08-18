@@ -1,0 +1,40 @@
+# name: test/sql/integration/splits/skew.test
+# description: Correctness never depends on splits being evenly sized
+# group: [vgi_integration_splits]
+
+# split_skewed puts ~99% of the rows in one split. The client claims greedily —
+# one split at a time via fetch_add — precisely so it needs no cost model: it
+# cannot see per-split cost (estimated_bytes is a nullable hint, and for a worker
+# doing inference or mixing warm cache with cold storage it does not predict time
+# at all), so any grouping it invented would be a guess.
+#
+# This test asserts the correctness half, which is what a test can assert: the row
+# set is unaffected by how lopsided the division is. The makespan half — that fast
+# readers keep working instead of idling behind the big split — is a property of
+# greedy claiming, not something a row count can prove.
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+SET threads=4;
+
+query III
+SELECT count(*), count(DISTINCT n), sum(n)
+FROM example.main.split_skewed(n := 2000, splits := 8);
+----
+2000	2000	1999000
+
+# Identical row set to the evenly-divided twin.
+query I
+SELECT count(*) FROM (
+    SELECT n FROM example.main.split_skewed(n := 2000, splits := 8)
+    EXCEPT
+    SELECT n FROM example.main.split_sequence(n := 2000, splits := 8)
+);
+----
+0

@@ -163,6 +163,13 @@ struct VgiTableFunctionBindData : public TableFunctionData {
 	// global-uniqueness-only).
 	bool supports_batch_index = false;
 
+	// True iff the worker declared ``Meta.supports_splits = True`` AND the
+	// ``vgi_split_scans`` setting is on. Both are folded in at BIND, so this single
+	// flag is the gate for the whole split path — including the invariants that
+	// must hold before it runs (revalidation refusal, the capture accounting, the
+	// MaxThreads clamp).
+	bool supports_splits = false;
+
 	// Partition shape declared by the worker over its annotated bind
 	// schema fields (Meta.partition_kind on the Python side). When non-
 	// ``NotPartitioned``, vgi_table_function_set.cpp installs
@@ -307,7 +314,17 @@ struct VgiResultCaptureCtx {
 	// gstate teardown (commit or abort) so concurrent captures can't OOM the box.
 	std::atomic<int64_t> reserved_inflight_bytes {0};
 	std::atomic<int> launched {0}; // ++ in InitLocal
-	std::atomic<int> eos {0};      // ++ when a local state hits InstallBatch(nullptr)
+	std::atomic<int> eos {0};      // ++ when a local state runs out of work
+
+	//! Split-path never-partial accounting.
+	//!
+	//! ``eos == launched`` only proves every reader that STARTED also finished. A
+	//! reader destroyed mid-split consumed a claim without reading it, and the
+	//! surviving readers' completions hide that. Counting drained splits against
+	//! the planned total closes it: both must agree before anything is committed.
+	bool split_path = false;
+	idx_t total_splits = 0;
+	std::atomic<idx_t> completed_splits {0}; // ++ at a split's true EOS
 	// The never-partial invariant: commit ONLY when every launched local state
 	// reached clean EOS (`eos == launched`) and nothing aborted. A mid-stream
 	// worker error / external-location resolution failure throws out of
@@ -391,6 +408,28 @@ struct VgiTableFunctionGlobalState : public GlobalTableFunctionState {
 	std::shared_ptr<const VgiResultCacheEntry> revalidation_entry;
 	std::string revalidate_if_none_match;   // stored etag ("" = none)
 	std::string revalidate_if_modified_since; // stored last_modified ("" = none)
+
+	//! True iff this scan takes the split path (worker capability AND the
+	//! ``vgi_split_scans`` setting, folded together at bind).
+	bool supports_splits = false;
+
+	//! Split tokens returned by ``plan()``, in the order the worker emitted them.
+	//! Empty is legal and means "no work" — not an error.
+	std::vector<std::string> splits;
+
+	//! Next unclaimed split. Readers claim with ``fetch_add(1)``, which is what
+	//! makes greedy claiming self-balancing under unknown per-split cost: a fast
+	//! reader simply takes more. It is ALSO what keeps ``batch_index`` monotone per
+	//! reader — fetch_add hands out strictly ascending indices and the worker
+	//! derives batch_index from the split's position. Nothing else enforces that,
+	//! so do not replace this with work-stealing or a shuffled assignment.
+	std::atomic<idx_t> next_split {0};
+
+	//! Splits that were claimed AND fully drained. Deliberately distinct from
+	//! ``next_split``: a reader destroyed mid-split consumes a claim without
+	//! reading it, so next_split alone would over-report completion and let a
+	//! partial result be committed to the result cache as though it were whole.
+	std::atomic<idx_t> completed_splits {0};
 	std::atomic<bool> revalidation_served {false};
 
 	// Commits a completed capture to the result cache (never-partial gate).
@@ -575,6 +614,22 @@ struct VgiTableFunctionGlobalState : public GlobalTableFunctionState {
 		if (fixed_order) {
 			return 1;
 		}
+		// Split path: no more readers than there are splits to claim, and never
+		// more than the worker's advertised cap.
+		//
+		// Placing this AFTER the early returns above is what makes it safe. A
+		// naive ``MaxValue(1, MinValue(splits.size(), max_processes))`` used as the
+		// single exit would IGNORE the prior clamps and raise them back — 100
+		// splits with max_workers=8 would yield 8 where serving_from_cache,
+		// revalidating and fixed_order each require exactly 1. Those cases have
+		// already returned by the time control reaches here, so this can only narrow.
+		//
+		// Zero splits is legal (a fully-pruned scan reaches it), hence the
+		// MaxValue(1, ...) floor: DuckDB must still schedule one reader, which then
+		// finds no claims and terminates cleanly.
+		if (supports_splits) {
+			return MaxValue<idx_t>(1, MinValue<idx_t>(splits.size(), max_processes));
+		}
 		return max_processes;
 	}
 };
@@ -661,6 +716,16 @@ struct VgiTableFunctionLocalState : public ArrowScanLocalState {
 	const IFunctionConnection *connection() const {
 		return prefetch_slot_->connection.get();
 	}
+
+	//! True while this reader holds a claimed, not-yet-drained split. Kept apart
+	//! from ``last_split_index`` so a reader destroyed mid-split is distinguishable
+	//! from one that finished: only the latter increments ``completed_splits``.
+	bool has_split = false;
+
+	//! Index of the split this reader most recently claimed. Claims are strictly
+	//! ascending per reader (``next_split.fetch_add``), which is what keeps
+	//! ``batch_index`` monotone across split boundaries.
+	idx_t last_split_index = 0;
 
 	// Completion tracking
 	bool done = false;

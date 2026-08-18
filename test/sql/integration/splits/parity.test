@@ -1,0 +1,67 @@
+# name: test/sql/integration/splits/parity.test
+# description: A split scan returns row-for-row what its non-split twin returns
+# group: [vgi_integration_splits]
+
+# This is the baseline the rest of the splits suite rests on. If split_sequence(n)
+# ever disagrees with sequence(n), no other split test means anything: they would
+# all be asserting properties of the wrong row set.
+#
+# The split COUNT is varied deliberately. Splitting is supposed to be invisible to
+# the answer, so 1, 4, 7 and 37 splits over the same n must all agree — including
+# counts that do not divide n evenly, which is where an off-by-one in the range
+# arithmetic would show up as a missing or duplicated boundary row.
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# One split: the degenerate case must still go through the whole plan/claim path.
+query II
+SELECT count(*), sum(n) FROM example.main.split_sequence(n := 10, splits := 1);
+----
+10	45
+
+# Even division.
+query II
+SELECT count(*), sum(n) FROM example.main.split_sequence(n := 10, splits := 5);
+----
+10	45
+
+# Uneven division — the remainder has to land somewhere, exactly once.
+query II
+SELECT count(*), sum(n) FROM example.main.split_sequence(n := 10, splits := 4);
+----
+10	45
+
+query II
+SELECT count(*), sum(n) FROM example.main.split_sequence(n := 10, splits := 7);
+----
+10	45
+
+# More splits than rows: the surplus splits are empty, and empty must not truncate.
+query II
+SELECT count(*), sum(n) FROM example.main.split_sequence(n := 10, splits := 25);
+----
+10	45
+
+# Identical to the non-split twin, not merely self-consistent.
+query I
+SELECT count(*) FROM (
+    SELECT n FROM example.main.split_sequence(n := 500, splits := 13)
+    EXCEPT
+    SELECT n FROM example.main.sequence(500)
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT n FROM example.main.sequence(500)
+    EXCEPT
+    SELECT n FROM example.main.split_sequence(n := 500, splits := 13)
+);
+----
+0

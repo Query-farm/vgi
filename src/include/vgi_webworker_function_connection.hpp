@@ -85,6 +85,17 @@ public:
 	~WebWorkerFunctionConnection() override;
 
 	// Set shared state for dynamic filter pushdown via tick batches
+	// Reset per-init stream state, keeping the SAB ring channel.
+	void ResetForNextSplit() override {
+		init_done_ = false;
+		data_finished_ = false;
+		data_reader_.reset();
+		data_stream_.reset();
+		last_batch_index_ = DConstants::INVALID_INDEX;
+		last_partition_values_bytes_.clear();
+		last_cache_control_ = {};
+	}
+
 	void SetTickFilterState(shared_ptr<TickFilterState> state) override {
 		tick_filter_state_ = std::move(state);
 	}
@@ -125,7 +136,8 @@ public:
 	                       const std::optional<OrderByHint> &order_by = std::nullopt,
 	                       const std::optional<TableSampleHint> &table_sample = std::nullopt,
 	                       const std::vector<uint8_t> &init_opaque_data = {},
-	                       const std::optional<std::vector<uint8_t>> &finalize_state_id = std::nullopt) override;
+	                       const std::optional<std::vector<uint8_t>> &finalize_state_id = std::nullopt,
+	                       const std::vector<std::string> &split_tokens = {}) override;
 
 	void PerformFinalizeInit(const BindResult &bind_result) override;
 

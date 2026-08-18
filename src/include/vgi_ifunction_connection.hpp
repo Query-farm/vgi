@@ -54,6 +54,23 @@ public:
 	// The connection reads this before each tick and includes it as custom metadata.
 	virtual void SetTickFilterState(shared_ptr<TickFilterState> state) = 0;
 
+	// Reset per-init stream state so PerformInit can run again for the NEXT split,
+	// keeping the transport. Releasing to the pool between splits would mean a
+	// fresh TCP+TLS handshake per split on HTTP, which has no pooling at all.
+	//
+	// Modelled on PerformFinalizeInit, which is the existing tested
+	// re-init-on-a-live-connection path. Its first action is the load-bearing one:
+	// CLOSE THE INPUT WRITER (IPC EOS on stdin) so the worker's tick reader
+	// terminates. Skip that and PerformInit installs a new stream writer over the
+	// same fd while the old stream is still open, writing the next init request
+	// *inside* an unterminated tick stream — the subprocess mis-frames and hangs.
+	//
+	// A failure here must leave the connection POISONED, not idle: ReleaseForPooling
+	// gates on `init_done_ && !data_finished_`, and clearing both before a failed
+	// init would make a broken connection look reusable, so the next checkout would
+	// read this split's init response as its own stream header.
+	virtual void ResetForNextSplit() = 0;
+
 	// Send the VGI bind RPC. Spawns the worker subprocess on first call
 	// (subprocess transport only) and runs the bind protocol — including
 	// any secret-scope retry — returning the resulting BindResult by value.
@@ -142,7 +159,8 @@ public:
 	                               const std::optional<OrderByHint> &order_by = std::nullopt,
 	                               const std::optional<TableSampleHint> &table_sample = std::nullopt,
 	                               const std::vector<uint8_t> &init_opaque_data = {},
-	                               const std::optional<std::vector<uint8_t>> &finalize_state_id = std::nullopt) = 0;
+	                               const std::optional<std::vector<uint8_t>> &finalize_state_id = std::nullopt,
+	                               const std::vector<std::string> &split_tokens = {}) = 0;
 	// Arm conditional-revalidation validators (M6) sent on the NEXT PerformInit
 	// via the init request's custom_metadata (vgi.cache.if_none_match /
 	// vgi.cache.if_modified_since). Empty strings clear the corresponding key.

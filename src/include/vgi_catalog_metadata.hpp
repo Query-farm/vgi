@@ -234,6 +234,33 @@ struct VgiScanBranch {
 	bool IsCatalogTable() const {
 		return function_name.empty() && !source_table.empty();
 	}
+
+	// --- Format branch (P4) ---------------------------------------------------
+	// A branch that names a FORMAT plus locations rather than a function or a
+	// catalog table: "read these paths as this format". The rewriter binds it via
+	// the format's registered reader (parquet, csv, iceberg, ...), so a worker can
+	// hand back "these 40 parquet files" without needing a function per format or
+	// knowing the reader's argument spelling.
+	std::string format_name;
+	std::vector<std::string> format_locations;
+	std::map<std::string, Value> format_options;
+	bool IsFormatBranch() const {
+		return function_name.empty() && source_table.empty() && !format_name.empty();
+	}
+
+	// The three branch kinds are mutually exclusive, and the discriminator is
+	// which of the three identifying fields is populated:
+	//
+	//   function branch  -> function_name
+	//   catalog table    -> source_table   (function_name empty)
+	//   format branch    -> format_name    (function_name AND source_table empty)
+	//
+	// Checked at parse rather than at bind: a branch that sets two of them is a
+	// worker bug, and discovering it at bind time would attribute the failure to
+	// the query instead of to the catalog.
+	bool IsFunctionBranch() const {
+		return !function_name.empty();
+	}
 };
 
 // Result of the new catalog_table_scan_branches_get RPC. New-protocol shape;
@@ -455,6 +482,34 @@ struct VgiCopyFromFormatInfo {
 
 // ============================================================================
 // Function metadata from the worker (matches Python FunctionInfo)
+//! One page of a scan plan, plus the plan-level facts carried on every page.
+struct VgiScanPlanPage {
+	//! Serialized ScanSplit blobs, in the order the worker emitted them.
+	std::vector<std::string> splits;
+	//! Continuation cursor; empty means enumeration is complete.
+	std::vector<uint8_t> next_cursor;
+	//! Normative cap on how many splits may be in flight at once.
+	int64_t max_workers = 0;
+	//! The catalog counter this plan is pinned to.
+	int64_t catalog_version = 0;
+	//! "catalog" or "transaction" — which anchor the tokens bind.
+	std::string scope;
+	std::vector<uint8_t> execution_id;
+	std::vector<uint8_t> init_opaque_data;
+};
+
+//! A complete scan plan: every split, plus the plan-level facts.
+struct VgiScanPlan {
+	std::vector<std::string> splits;
+	int64_t max_workers = 0;
+	int64_t catalog_version = 0;
+	std::string scope;
+	std::vector<uint8_t> execution_id;
+	std::vector<uint8_t> init_opaque_data;
+	//! Only for diagnostics in the bounds errors.
+	std::string function_name;
+};
+
 struct VgiFunctionInfo {
 	std::string name;
 	std::string schema_name;
@@ -498,6 +553,27 @@ struct VgiFunctionInfo {
 	//   2. The FIXED_ORDER ``MaxThreads()=1`` clamp is skipped; the source
 	//      stays parallel and the sink does the ordering.
 	bool supports_batch_index = false;
+
+	// True when the worker implements on_plan()/on_split(), i.e. the scan can be
+	// divided into named, independently redeemable splits. Read at BIND (not init)
+	// so a ``SET vgi_split_scans`` between bind and execute cannot produce a bind
+	// that assumed splits and an init that does not.
+	bool supports_splits = false;
+
+	// True when the worker applies pushed-down filters exactly, so the engine may
+	// drop its own filter above the scan. No DuckDB consumer today.
+	bool filters_exactly_applied = false;
+
+	// True when the function exposes addressable positions in the data
+	// (incremental / streaming reads). No DuckDB consumer today - DuckDB has no
+	// streaming scan - but the field is on the wire so retrofitting it later would
+	// not re-shape plan().
+	bool supports_positions = false;
+
+	// How long a split token stays redeemable; nullopt means UNBOUNDED. A client
+	// must not assume a TTL exists (that would foreclose long-running streams),
+	// and must refuse a plan whose TTL is below its own scheduling horizon.
+	std::optional<int64_t> split_token_ttl_seconds;
 
 	// Partition shape declared by the function over its
 	// ``vgi.partition_column``-annotated bind-schema fields

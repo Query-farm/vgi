@@ -404,7 +404,9 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 		// clause it can't honour. Single-branch tables still honour AT
 		// (the branches.size() == 1 path threads at_unit/at_value into the
 		// branch's scan-function call exactly as the legacy code did).
-		if (!at_unit.empty() && branches_result.branches.size() > 1) {
+		if (!at_unit.empty() &&
+		    (branches_result.branches.size() > 1 || !branches_result.branches[0].branch_filter.empty() ||
+		     branches_result.branches[0].IsCatalogTable() || branches_result.branches[0].IsFormatBranch())) {
 			throw BinderException(
 			    "AT (...) clauses are not supported on multi-branch VGI tables. "
 			    "Query a specific branch's underlying function directly. "
@@ -412,7 +414,19 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 			    ParentSchema().name, name, static_cast<int>(branches_result.branches.size()));
 		}
 
-		if (branches_result.branches.size() > 1) {
+		// A SINGLE branch still needs the rewriter when it carries anything the
+		// legacy ScanFunctionResult shape cannot express. The collapse below
+		// projects branches[0] back into that shape, which has no home for
+		// branch_filter, writable, or the source_* catalog-table coordinates — so
+		// collapsing a branch that uses them SILENTLY DROPS them. A branch_filter
+		// dropped this way is wrong results, not a missing feature: the arm returns
+		// rows it was supposed to exclude.
+		const bool single_branch_needs_rewriter =
+		    branches_result.branches.size() == 1 &&
+		    (!branches_result.branches[0].branch_filter.empty() || branches_result.branches[0].writable ||
+		     branches_result.branches[0].IsCatalogTable() || branches_result.branches[0].IsFormatBranch());
+
+		if (branches_result.branches.size() > 1 || single_branch_needs_rewriter) {
 			// Multi-branch path. Up-front check of the rollback knob — if
 			// the rewriter is disabled, refuse here with a clear
 			// BinderException rather than returning the marker and reaching

@@ -1,0 +1,45 @@
+# name: test/sql/integration/splits/rollback.test
+# description: vgi_split_scans disables the CLIENT path, and says so loudly
+# group: [vgi_integration_splits]
+
+# The flag is an emergency-rollback knob for a bug in OUR drain loop, not a
+# compatibility promise about workers. Setting it false stops DuckDB calling
+# plan(); whether the worker still functions is the worker's business.
+#
+# A worker that kept both work-division paths falls back cleanly. One that
+# migrated fully to splits — like this fixture — cannot, and must FAIL rather than
+# quietly return a different row set. Silently answering 0 rows to a query that
+# should return 10 is worse than an error, so that is what this asserts.
+#
+# Same shape as vgi_table_buffering, which also throws rather than degrading.
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# On: the split path runs.
+query I
+SELECT count(*) FROM example.main.split_sequence(n := 10, splits := 4);
+----
+10
+
+statement ok
+SET vgi_split_scans=false;
+
+# Off: the client stops planning, and this split-only worker says so.
+statement error
+SELECT count(*) FROM example.main.split_sequence(n := 10, splits := 4);
+----
+split-only
+
+statement ok
+SET vgi_split_scans=true;
+
+# Back on: unchanged.
+query I
+SELECT count(*) FROM example.main.split_sequence(n := 10, splits := 4);
+----
+10

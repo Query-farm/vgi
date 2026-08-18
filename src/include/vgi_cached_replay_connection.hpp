@@ -75,6 +75,16 @@ public:
 	// Everything below is a no-op / unreachable on the cache-serve path (the
 	// worker RPC surface). A cache hit skips bind/init entirely.
 	void SetTickFilterState(shared_ptr<TickFilterState>) override {}
+
+	// Unreachable: a cache HIT returns before the plan RPC ever runs and clamps
+	// MaxThreads() to 1, and the split path additionally refuses revalidation. So a
+	// replay connection can never enter the drain loop. Assert rather than no-op —
+	// a future change that routed a replay through here would otherwise silently
+	// replay the WHOLE cached entry once per split.
+	void ResetForNextSplit() override {
+		throw InternalException("CachedReplayConnection::ResetForNextSplit: a cached replay must never "
+		                        "enter the split drain loop");
+	}
 	BindResult PerformBindRpc() override {
 		return {};
 	}
@@ -85,7 +95,8 @@ public:
 	                       std::shared_ptr<arrow::Buffer>, std::vector<std::shared_ptr<arrow::Buffer>>,
 	                       const std::string &, const std::optional<OrderByHint> &,
 	                       const std::optional<TableSampleHint> &, const std::vector<uint8_t> &,
-	                       const std::optional<std::vector<uint8_t>> &) override {
+	                       const std::optional<std::vector<uint8_t>> &,
+	                       const std::vector<std::string> &) override {
 		return {};
 	}
 	void PerformFinalizeInit(const BindResult &) override {}

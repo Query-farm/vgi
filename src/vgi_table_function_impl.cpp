@@ -226,6 +226,7 @@ unique_ptr<FunctionData> VgiTableFunctionBindData::Copy() const {
 	result->max_processes = max_processes;
 	result->fixed_order = fixed_order;
 	result->supports_batch_index = supports_batch_index;
+	result->supports_splits = supports_splits;
 	result->partition_kind = partition_kind;
 	result->partition_column_indices = partition_column_indices;
 	result->cardinality_estimate = cardinality_estimate;
@@ -1668,8 +1669,20 @@ VgiTableFunctionGlobalState::~VgiTableFunctionGlobalState() {
 		          {{"function", cap.key.function_name}, {"key_hash", cap.key.HexDigest()}, {"reason", reason}});
 	};
 
+	// ``eos == launched`` means "every reader that started also finished". On the
+	// split path that is necessary but NOT sufficient: a reader destroyed by
+	// cancellation mid-split consumed a claim without reading it, and every
+	// surviving reader's completion papers over the hole — committing a partial
+	// result as though it were whole, which is exactly what cache/poison*.test
+	// exists to catch, reached through a path those tests do not exercise.
+	//
+	// So the split path additionally requires that every split was both claimed
+	// AND drained. completed_splits is incremented only at a split's true EOS.
+	const bool splits_all_drained =
+	    !cap.split_path || (cap.total_splits > 0 && cap.completed_splits.load() == cap.total_splits);
 	const bool complete = cap.cc_seen && cap.cc.Cacheable() && !cap.aborted.load() &&
-	                      cap.launched.load() > 0 && cap.eos.load() == cap.launched.load();
+	                      cap.launched.load() > 0 && cap.eos.load() == cap.launched.load() &&
+	                      splits_all_drained;
 	// v1: transaction-scoped results are not cached (transaction keying is a later
 	// milestone). Refuse rather than mis-key.
 	if (!complete) {
@@ -1843,7 +1856,19 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 	// conditional request. Set below the eligible block; consumed when the
 	// gstate is built (miss path) to arm revalidation mode. Null otherwise.
 	std::shared_ptr<const VgiResultCacheEntry> revalidation_entry;
-	if (cache_eval.eligible) {
+	// INVARIANT: never revalidate on the split path.
+	//
+	// ``revalidating`` clamps MaxThreads() to 1, so a single local state would
+	// drain EVERY split. A 304 on the first split then swaps in a
+	// CachedReplayConnection over the WHOLE stored entry, and splits 1..N would
+	// stream on top of a complete replay — duplicating the entire result. The
+	// probe is skipped entirely rather than handled downstream, because
+	// LookupForRevalidation() has the side effect of arming revalidation mode.
+	//
+	// Per-split revalidation is a separate design (it needs per-split validators,
+	// which the entry does not carry).
+	const bool split_path = bind_data.supports_splits;
+	if (cache_eval.eligible && !split_path) {
 		auto now_tp = std::chrono::steady_clock::now();
 		// Conditional revalidation takes precedence: probe for a stale
 		// revalidatable entry FIRST, because Lookup() drops stale entries.
@@ -2142,6 +2167,51 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 	// init_local).
 	auto global_state = make_uniq<VgiTableFunctionGlobalState>();
 	global_state->client_context_for_explain = &context;
+	global_state->supports_splits = bind_data.supports_splits;
+
+	// Split path: plan the scan into named units BEFORE any reader starts, then let
+	// readers claim them. The plan is built from STATIC filters only — dynamic
+	// join-key values are not initialized yet at this point, and continue to reach
+	// the worker per-tick exactly as they do on the non-split path. That is not a
+	// regression (today nothing is pruned at split granularity either way), just an
+	// optimization not claimed here.
+	if (bind_data.supports_splits) {
+		std::vector<uint8_t> filter_bytes_vec;
+		if (filter_bytes) {
+			filter_bytes_vec.assign(filter_bytes->data(), filter_bytes->data() + filter_bytes->size());
+		}
+		// min_splits = this instance's thread count: the one sizing fact DuckDB
+		// genuinely knows. target_split_bytes only when the operator set it —
+		// DuckDB has no basis to invent a byte target.
+		const int64_t min_splits = static_cast<int64_t>(TaskScheduler::GetScheduler(context).NumberOfThreads());
+		int64_t target_split_bytes = 0;
+		Value tsb;
+		if (context.TryGetCurrentSetting("vgi_target_split_bytes", tsb) && !tsb.IsNull()) {
+			target_split_bytes = static_cast<int64_t>(tsb.GetValue<uint64_t>());
+		}
+
+		CatalogRpcContext rpc_ctx{bind_data.attach_params, bind_data.attach_opaque_data,
+		                          bind_data.transaction_opaque_data};
+		auto plan = InvokeTableFunctionPlan(rpc_ctx, bind_data.bind_result.bind_request_bytes,
+		                                    bind_data.bind_result.opaque_data, projection_ids, filter_bytes_vec,
+		                                    min_splits, target_split_bytes, context);
+
+		global_state->splits = std::move(plan.splits);
+		if (plan.max_workers > 0) {
+			global_state->max_processes = static_cast<idx_t>(plan.max_workers);
+		}
+		if (!plan.init_opaque_data.empty()) {
+			global_state->init_opaque_data = plan.init_opaque_data;
+		}
+		// The plan supplies everything the primary init would have, so there is no
+		// primary init on this path — readers init per split instead.
+		global_state->init_applied = true;
+
+		VGI_LOG(context, "scan.plan",
+		        {{"function_name", bind_data.function_name},
+		         {"splits", std::to_string(global_state->splits.size())},
+		         {"max_workers", std::to_string(plan.max_workers)}});
+	}
 	global_state->cache_eligible = cache_eval.eligible; // an eligible non-hit is a genuine miss (EXPLAIN)
 	global_state->dynamic_filters = std::move(dynamic_filters);
 	global_state->static_filter_bytes = filter_bytes;
@@ -2455,8 +2525,22 @@ unique_ptr<LocalTableFunctionState> VgiTableFunctionInitLocal(ExecutionContext &
 		// on_init produced — required by any function that round-trips state
 		// through init opaque data (e.g. tx_cached_value).
 		auto secondary_init = [&]() {
+			// Tick filter state is unconditional. It used to sit inside the
+			// projection_pushdown branch, which meant a function with DYNAMIC
+			// FILTERS but no projection pushdown got none on its secondary
+			// connections — right answers, no join-key pushdown, and nothing to
+			// show for it in the results. Every connection needs it.
+			local_state->connection()->SetTickFilterState(global_state.tick_filter_state);
+
+			// Split path: acquire only. There is no primary init to mirror, and each
+			// reader initializes per split in AdvanceToNextSplit with the token it
+			// claimed. Initializing here would burn a claim-less init the worker has
+			// no work for.
+			if (bind_data.supports_splits) {
+				return;
+			}
+
 			if (bind_data.projection_pushdown) {
-				local_state->connection()->SetTickFilterState(global_state.tick_filter_state);
 				local_state->connection()->PerformInit(
 				    secondary_bind_result,
 				    global_state.projection_ids, global_state.static_filter_bytes,
@@ -3159,11 +3243,98 @@ static void MaybeSlideRevalidatedEntry(ClientContext &context, const VgiTableFun
 	                {"outcome", "not_modified"}});
 }
 
+//! Claim and initialize the next split for this reader.
+//!
+//! Returns true when a new split was claimed and the connection re-initialized
+//! (so the caller should keep reading), false when this reader is out of work.
+//!
+//! Greedy per-split claiming: each reader takes ONE split at a time via
+//! `fetch_add(1)`. That needs no cost model and self-balances — a fast reader
+//! simply claims more — which matters because the client cannot see per-split
+//! cost. `estimated_bytes` is a nullable hint a worker may never populate, and for
+//! a worker doing per-split inference or mixing warm cache with cold object
+//! storage it is uncorrelated with time. Any client-side grouping would be a guess
+//! about costs invisible to it.
+//!
+//! `fetch_add` is ALSO what keeps `batch_index` monotone per reader: it hands out
+//! strictly ascending indices, and the worker derives batch_index from the split's
+//! position in a globally-ordered space. Nothing else enforces that.
+static bool AdvanceToNextSplit(ClientContext &context, const VgiTableFunctionBindData &bind_data,
+                               VgiTableFunctionGlobalState &global_state,
+                               VgiTableFunctionLocalState &local_state) {
+	if (!bind_data.supports_splits) {
+		return false;
+	}
+
+	// The split we were reading (if any) is now fully drained. Counted separately
+	// from `next_split` because a claim consumed by a reader that then died is NOT
+	// a drained split, and conflating them would let a partial result commit.
+	const bool had_split = local_state.has_split;
+	if (had_split) {
+		global_state.completed_splits.fetch_add(1, std::memory_order_relaxed);
+		local_state.has_split = false;
+	}
+
+	const idx_t idx = global_state.next_split.fetch_add(1, std::memory_order_relaxed);
+	if (idx >= global_state.splits.size()) {
+		return false; // out of work — the caller ends this reader
+	}
+
+	// Ascending-claim contract (see above). Cheap to assert, and the batch_index
+	// monotonicity check downstream depends on it.
+	D_ASSERT(!local_state.has_split || idx > local_state.last_split_index);
+	local_state.last_split_index = idx;
+
+	auto &conn = *local_state.connection();
+	try {
+		// Only reset when there IS a prior stream. On this reader's first claim the
+		// connection was merely acquired (InitLocal is acquire-only on the split
+		// path), so there is nothing to close or drain yet.
+		if (had_split) {
+			conn.ResetForNextSplit();
+		}
+		// Every per-init input has to be re-supplied: this is a fresh init on the
+		// same connection, so nothing from the previous split carries over except
+		// the transport itself.
+		//
+		// tick_filter_state_ is the exception and is deliberately NOT re-set here —
+		// it is a plain member that PerformInit never touches, so dynamic join-key
+		// pushdown survives into the next split on a reused connection.
+		conn.PerformInit(bind_data.bind_result,          // bind
+		                 global_state.projection_ids,    // projection
+		                 global_state.static_filter_bytes,
+		                 global_state.join_keys_buffers,
+		                 "",                             // phase
+		                 std::nullopt,                   // order_by
+		                 std::nullopt,                   // table_sample
+		                 global_state.init_opaque_data,
+		                 std::nullopt,                   // finalize_state_id
+		                 {global_state.splits[idx]});    // one split per claim
+	} catch (...) {
+		// Do NOT swallow: a failed split init leaves the worker mid-protocol, and
+		// the connection is already marked poisoned so it cannot be pooled.
+		throw;
+	}
+	local_state.has_split = true;
+	return true;
+}
+
 static bool GetNextBatch(ClientContext &context, const VgiTableFunctionBindData &bind_data,
                          VgiTableFunctionGlobalState &global_state,
                          VgiTableFunctionLocalState &local_state) {
 	if (local_state.done) {
 		return false;
+	}
+	// Split path: claim the FIRST split before reading anything. InitLocal only
+	// acquires a connection on this path — there is no primary init to mirror — so
+	// without this the first ReadDataBatch would fire against an uninitialized
+	// connection.
+	if (bind_data.supports_splits && !local_state.has_split) {
+		if (!AdvanceToNextSplit(context, bind_data, global_state, local_state)) {
+			// No splits at all, or none left for this reader. Legal: a fully-pruned
+			// scan plans zero splits and must yield an empty result, not an error.
+			return InstallBatch(context, bind_data, global_state, local_state, nullptr);
+		}
 	}
 	// Read from the worker, skipping empty non-log batches. Log batches
 	// (vgi_rpc.log_* metadata) are already consumed inside ReadDataBatch via
@@ -3174,6 +3345,23 @@ static bool GetNextBatch(ClientContext &context, const VgiTableFunctionBindData 
 		UpdateDynamicFilterState(global_state, context, bind_data);
 		auto arrow_batch = local_state.connection()->ReadDataBatch();
 		if (!arrow_batch) {
+			// End of THIS stream. On the split path that is the end of one split,
+			// not the end of the scan: claim the next one and keep going.
+			//
+			// Doing it here rather than in the scan function is deliberate. This is
+			// the single funnel both the synchronous path and the async prefetch
+			// path use, so the loop covers both. Advancing only in the sync branch
+			// would leave `SET vgi_async_prefetch=true` silently truncating every
+			// multi-split scan — the same defect, arriving by the other route.
+			//
+			// It also means a ZERO-ROW split is handled by construction: an empty
+			// split reaches EOS immediately, we claim the next one, and no 0-row
+			// chunk is ever returned mid-scan. That matters because DuckDB reads a
+			// 0-row chunk under IMPLICIT as FINISHED, so returning one here would
+			// end the reader and silently drop every remaining split.
+			if (AdvanceToNextSplit(context, bind_data, global_state, local_state)) {
+				continue;
+			}
 			return InstallBatch(context, bind_data, global_state, local_state, nullptr);
 		}
 		if (arrow_batch->num_rows() == 0) {

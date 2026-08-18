@@ -738,7 +738,8 @@ BuildInitRequest(const std::vector<uint8_t> &bind_call_bytes, const std::vector<
                  const std::string &order_by_null_order, int64_t order_by_limit,
                  double tablesample_percentage, int64_t tablesample_seed,
                  const std::optional<std::vector<uint8_t>> &finalize_state_id,
-                 const std::vector<uint8_t> &substream_id) {
+                 const std::vector<uint8_t> &substream_id,
+                 const std::vector<std::string> &split_tokens) {
 	static const std::vector<std::string> phase_values = {
 	    "INPUT", "FINALIZE", "TABLE_BUFFERING", "TABLE_BUFFERING_FINALIZE",
 	};
@@ -766,6 +767,7 @@ BuildInitRequest(const std::vector<uint8_t> &bind_call_bytes, const std::vector<
 	    arrow::field("tablesample_seed", arrow::int64(), true),
 	    arrow::field("finalize_state_id", arrow::binary(), true),
 	    arrow::field("substream_id", arrow::binary(), true),
+	    arrow::field("split_tokens", arrow::list(arrow::large_binary()), true),
 	});
 
 	std::vector<std::shared_ptr<arrow::Array>> arrays;
@@ -911,6 +913,28 @@ BuildInitRequest(const std::vector<uint8_t> &bind_call_bytes, const std::vector<
 	// streaming table-in-out). See InitRequest.substream_id in vgi/protocol.py.
 	arrays.push_back(BuildBinaryScalar(substream_id));
 
+	// split_tokens: list<large_binary>|null — the splits this init redeems.
+	//
+	// A list rather than a single token because DataFusion's partition_count() IS
+	// its concurrency: it must bin-pack at planning time and read a whole group per
+	// partition, and without the list that would be N sequential inits. DuckDB always
+	// sends exactly one — it claims greedily, one split at a time, because it cannot
+	// see per-split cost and any grouping it invented would be a guess.
+	{
+		auto value_builder = std::make_shared<arrow::LargeBinaryBuilder>();
+		arrow::ListBuilder list_builder(arrow::default_memory_pool(), value_builder);
+		if (split_tokens.empty()) {
+			CheckStatus(list_builder.AppendNull(), "append null split_tokens");
+		} else {
+			CheckStatus(list_builder.Append(), "start split_tokens list");
+			for (const auto &tok : split_tokens) {
+				CheckStatus(value_builder->Append(tok.data(), static_cast<int64_t>(tok.size())),
+				            "append split token");
+			}
+		}
+		arrays.push_back(FinishArray(list_builder, "split_tokens"));
+	}
+
 	return arrow::RecordBatch::Make(schema, 1, arrays);
 }
 
@@ -1049,6 +1073,85 @@ std::shared_ptr<arrow::RecordBatch> BuildTableFunctionCardinalityRequest(const s
 	return arrow::RecordBatch::Make(schema, 1, arrays);
 }
 
+//! Build the inner ``TableFunctionPlanRequest`` record for the scan-planning RPC.
+//!
+//! Only the fields DuckDB can actually supply are populated. Notably ``row_limit``
+//! is NOT among them: ``TableFunctionInitInput`` carries no limit, and the Top-N
+//! ``order_by_limit`` means something different ("top K by that column"), so
+//! sending it here would be a lie. DataFusion supplies row_limit from
+//! ``TableProvider::scan(limit)``; DuckDB leaves it null.
+//!
+//! ``target_split_bytes`` is omitted when 0. DuckDB has no basis to invent a byte
+//! target — it claims splits greedily as interchangeable units — and a fabricated
+//! default would be actively wrong for a compute-bound worker where bytes do not
+//! predict cost. ``min_splits`` IS sent, because thread count is the one sizing
+//! fact DuckDB genuinely knows.
+std::shared_ptr<arrow::RecordBatch>
+BuildTableFunctionPlanRequest(const std::vector<uint8_t> &bind_call_bytes,
+                              const std::vector<uint8_t> &bind_opaque_data,
+                              const std::vector<int32_t> &projection_ids,
+                              const std::vector<uint8_t> &pushdown_filters,
+                              int64_t min_splits, int64_t target_split_bytes,
+                              const std::vector<uint8_t> &cursor) {
+	auto schema = arrow::schema({
+	    arrow::field("bind_call", arrow::binary(), false),
+	    arrow::field("bind_opaque_data", arrow::binary(), true),
+	    arrow::field("projection_ids", arrow::list(arrow::int64()), true),
+	    arrow::field("pushdown_filters", arrow::large_binary(), true),
+	    arrow::field("min_splits", arrow::int64(), true),
+	    arrow::field("target_split_bytes", arrow::int64(), true),
+	    arrow::field("cursor", arrow::binary(), true),
+	});
+
+	std::vector<std::shared_ptr<arrow::Array>> arrays;
+	arrays.push_back(BuildBinaryScalar(bind_call_bytes));
+	arrays.push_back(BuildBinaryScalar(bind_opaque_data));
+
+	// projection_ids: list<int64>|null
+	{
+		auto value_builder = std::make_shared<arrow::Int64Builder>();
+		arrow::ListBuilder list_builder(arrow::default_memory_pool(), value_builder);
+		if (projection_ids.empty()) {
+			CheckStatus(list_builder.AppendNull(), "append null projection_ids");
+		} else {
+			CheckStatus(list_builder.Append(), "open projection_ids list");
+			for (auto id : projection_ids) {
+				CheckStatus(value_builder->Append(static_cast<int64_t>(id)), "append projection id");
+			}
+		}
+		arrays.push_back(FinishArray(list_builder, "projection_ids"));
+	}
+
+	// pushdown_filters: large_binary|null
+	{
+		arrow::LargeBinaryBuilder builder;
+		if (pushdown_filters.empty()) {
+			CheckStatus(builder.AppendNull(), "append null pushdown_filters");
+		} else {
+			CheckStatus(builder.Append(pushdown_filters.data(), static_cast<int64_t>(pushdown_filters.size())),
+			            "append pushdown_filters");
+		}
+		arrays.push_back(FinishArray(builder, "pushdown_filters"));
+	}
+
+	// min_splits / target_split_bytes: int64|null. Non-positive means "omit" —
+	// the worker then sizes its own splits rather than obeying a fabricated number.
+	auto int_or_null = [](int64_t v, const char *what) -> std::shared_ptr<arrow::Array> {
+		arrow::Int64Builder b;
+		if (v > 0) {
+			CheckStatus(b.Append(v), what);
+		} else {
+			CheckStatus(b.AppendNull(), what);
+		}
+		return FinishArray(b, what);
+	};
+	arrays.push_back(int_or_null(min_splits, "min_splits"));
+	arrays.push_back(int_or_null(target_split_bytes, "target_split_bytes"));
+
+	arrays.push_back(BuildBinaryScalar(cursor));
+	return arrow::RecordBatch::Make(schema, 1, arrays);
+}
+
 std::shared_ptr<arrow::RecordBatch> BuildTableFunctionStatisticsRequest(const std::vector<uint8_t> &bind_call_bytes,
                                                                         const std::vector<uint8_t> &bind_opaque_data) {
 	auto schema = arrow::schema({
@@ -1146,6 +1249,55 @@ TableFunctionCardinalityResult ParseTableFunctionCardinalityResult(const std::sh
 // Inner request builders (Complex bucket — kept hand-coded)
 // ============================================================================
 
+//! Describe what THIS client can do, so a worker can tailor what it advertises.
+//!
+//! Sent on every attach. Without it a worker has to guess, and guessing wrong is
+//! expensive in both directions: assume too much and the client cannot read what
+//! comes back; assume too little and the worker streams rows it could have handed
+//! over as a file reference.
+//!
+//! ``native_formats`` is the load-bearing one — it is what lets a worker return a
+//! FORMAT branch ("read these 40 parquet files") instead of materializing rows.
+//! It lists formats DuckDB reads natively; extension-provided readers are omitted
+//! because whether they are loadable is a per-session question this static list
+//! cannot answer.
+static std::vector<uint8_t> BuildClientCapabilitiesBytes() {
+	auto schema = arrow::schema({
+	    arrow::field("engine", arrow::utf8(), false),
+	    arrow::field("native_formats", arrow::list(arrow::utf8()), false),
+	    arrow::field("catalogs", arrow::list(arrow::utf8()), false),
+	    arrow::field("can_stream", arrow::boolean(), false),
+	    arrow::field("filter_encodings", arrow::list(arrow::utf8()), false),
+	});
+
+	auto string_list = [](const std::vector<std::string> &values) {
+		auto value_builder = std::make_shared<arrow::StringBuilder>();
+		arrow::ListBuilder list_builder(arrow::default_memory_pool(), value_builder);
+		CheckStatus(list_builder.Append(), "open list");
+		for (const auto &v : values) {
+			CheckStatus(value_builder->Append(v), "append list value");
+		}
+		return FinishArray(list_builder, "string list");
+	};
+
+	std::vector<std::shared_ptr<arrow::Array>> arrays;
+	arrays.push_back(BuildStringScalar("duckdb"));
+	arrays.push_back(string_list({"parquet", "csv", "json"}));
+	arrays.push_back(string_list({"ducklake", "iceberg", "postgres", "mysql", "sqlite", "duckdb"}));
+	{
+		arrow::BooleanBuilder b;
+		// DuckDB has no streaming scan: positions ride the wire but nothing reads
+		// them. Saying false here is what stops a worker handing back an unbounded
+		// split this client could never terminate.
+		CheckStatus(b.Append(false), "can_stream");
+		arrays.push_back(FinishArray(b, "can_stream"));
+	}
+	arrays.push_back(string_list({"vgi.filters.v1"}));
+
+	auto batch = arrow::RecordBatch::Make(schema, 1, arrays);
+	return SerializeToIpcBytes(batch);
+}
+
 std::shared_ptr<arrow::RecordBatch> BuildCatalogAttachRequest(
     const std::string &name,
     const std::vector<uint8_t> &options_ipc_bytes,
@@ -1162,12 +1314,14 @@ std::shared_ptr<arrow::RecordBatch> BuildCatalogAttachRequest(
 	    arrow::field("options", arrow::binary(), false),
 	    arrow::field("data_version_spec", arrow::utf8(), true),
 	    arrow::field("implementation_version", arrow::utf8(), true),
+	    arrow::field("client_capabilities", arrow::binary(), true),
 	});
 	std::vector<std::shared_ptr<arrow::Array>> request_arrays;
 	request_arrays.push_back(BuildStringScalar(name));
 	request_arrays.push_back(BuildBinaryScalar(options_ipc_bytes));
 	request_arrays.push_back(BuildNullableStringScalar(data_version_spec));
 	request_arrays.push_back(BuildNullableStringScalar(implementation_version));
+	request_arrays.push_back(BuildBinaryScalar(BuildClientCapabilitiesBytes()));
 	return arrow::RecordBatch::Make(request_schema, 1, request_arrays);
 }
 
