@@ -1,0 +1,116 @@
+# name: test/sql/integration/splits/cancel_midsplit.test
+# description: A scan abandoned with splits outstanding caches nothing and leaves nothing behind
+# group: [vgi_integration_splits]
+
+# The dangerous thing about abandoning a split scan is not the abandonment — it
+# is what might get KEPT.
+#
+# A scan stopped partway leaves splits claimed but unread, and others never
+# claimed at all. If the capture committed what it had, the cache would hold a
+# SUBSET under a key that claims to be the whole answer, and every later
+# identical query would return missing rows with no error whatsoever. The cache
+# is the one place a partial result can outlive the query that produced it, which
+# is why it gets the assertion rather than the row count.
+#
+# The gate is that every reader must have drained everything it claimed. A reader
+# torn down mid-split never reports completion, so the commit is refused for the
+# whole scan — not repaired, refused. cache/poison*.test guards the same gate for
+# non-split scans; this reaches it through the split path, where "finished" is a
+# per-claim question rather than a per-scan one.
+#
+# LIMIT is the abandonment used here because sqllogictest has no interrupt: the
+# operator above the scan is satisfied and stops pulling while most splits are
+# still unclaimed, which is the same shape as a cancel and is reproducible.
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+SET threads=8;
+
+query I
+SELECT flushed >= 0 FROM vgi_result_cache_flush();
+----
+true
+
+# 200 splits, three rows wanted. The scan stops almost immediately, with the vast
+# majority of splits never claimed.
+query I
+SELECT count(*) FROM (
+    SELECT n FROM example.main.split_cacheable(n := 5000, splits := 200) LIMIT 3
+);
+----
+3
+
+# NOTHING was cached. A partial commit here is the silent-wrong-answer failure
+# this whole gate exists for.
+query I
+SELECT entries FROM vgi_result_cache_stats();
+----
+0
+
+# The full scan afterwards is complete — not served from a truncated entry, and
+# not confused by the abandoned one.
+query II
+SELECT count(*), sum(n) FROM example.main.split_cacheable(n := 5000, splits := 200);
+----
+5000	12497500
+
+# ...and now it IS cached, because this one finished. That contrast is what makes
+# the assertion above meaningful rather than a test of a cache that never stores.
+query I
+SELECT entries > 0 FROM vgi_result_cache_stats();
+----
+true
+
+query I
+SELECT flushed >= 0 FROM vgi_result_cache_flush();
+----
+true
+
+# Repeated abandonment: each one must be clean on its own. A reader left holding
+# a claim, or a connection returned to the pool mid-stream, would surface on the
+# next iteration rather than the first.
+query I
+SELECT count(*) FROM (SELECT n FROM example.main.split_cacheable(n := 2000, splits := 100) LIMIT 1);
+----
+1
+
+query I
+SELECT count(*) FROM (SELECT n FROM example.main.split_cacheable(n := 2000, splits := 100) LIMIT 5);
+----
+5
+
+query I
+SELECT count(*) FROM (SELECT n FROM example.main.split_cacheable(n := 2000, splits := 100) LIMIT 50);
+----
+50
+
+query I
+SELECT entries FROM vgi_result_cache_stats();
+----
+0
+
+# The catalog and its pooled connections are healthy afterwards. An abandoned
+# scan that left a connection mid-protocol would corrupt this, not itself.
+query II
+SELECT count(*), sum(n) FROM example.main.split_sequence(n := 300, splits := 11);
+----
+300	44850
+
+query II
+SELECT count(*), count(DISTINCT n) FROM example.main.split_cacheable(n := 2000, splits := 100);
+----
+2000	2000
+
+statement ok
+RESET threads;
+
+statement ok
+DETACH example;
