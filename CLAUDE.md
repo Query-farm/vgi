@@ -87,6 +87,14 @@ request bodies to identity for it; see the renegotiation path in
 `src/vgi_http_client.cpp`. Server logs are at `/tmp/vgi-http-no-compression-server.log`.
 
 **Known HTTP limitations** (these tests fail over HTTP, not regressions):
+- `splits/cursor_overlap.test` — the client dedups repeated splits by comparing raw
+  token bytes, which only works while tokens are plaintext. A keyed worker (HTTP)
+  seals each payload with a fresh random nonce, so one split minted on two
+  enumeration pages yields two different byte strings and the dedup never fires.
+  A worker that honours the cursor-disjointness contract is unaffected; one that
+  violates it returns duplicate ROWS over HTTP. Fixing it needs a stable split
+  identity — deterministic (SIV-style) sealing, or a plaintext `split_id` on
+  `ScanSplit` — so it is a protocol decision, not a client patch
 - `logging_generator.test` — inline log streaming not supported over HTTP
 - `partitioned_sequence.test` — partition-local state not preserved across HTTP exchanges
 - `buffer_input/sizes.test`, `buffer_input/scale.test_slow` — input buffering semantics differ

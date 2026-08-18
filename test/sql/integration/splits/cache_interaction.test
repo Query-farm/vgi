@@ -27,21 +27,49 @@ CALL enable_logging(level := 'debug');
 
 # Repeat an identical split scan; the answer must not drift.
 query II
-SELECT count(*), sum(n) FROM example.main.split_sequence(n := 300, splits := 9);
+SELECT count(*), sum(n) FROM example.main.split_cacheable(n := 300, splits := 9);
 ----
 300	44850
 
 query II
-SELECT count(*), sum(n) FROM example.main.split_sequence(n := 300, splits := 9);
+SELECT count(*), sum(n) FROM example.main.split_cacheable(n := 300, splits := 9);
 ----
 300	44850
 
 # Whatever the cache did, it must never have committed a SUBSET. If a partial had
 # been stored and served, this count would drop below 300 on a later read.
 query II
-SELECT count(*), sum(n) FROM example.main.split_sequence(n := 300, splits := 9);
+SELECT count(*), sum(n) FROM example.main.split_cacheable(n := 300, splits := 9);
 ----
 300	44850
+
+# The entry really exists — without this the assertions above are satisfied by a
+# cache that never stored anything, which is what they were before: the file drove
+# a fixture advertising no cacheability at all, so "it must never have committed a
+# SUBSET" was true of a cache with nothing in it.
+query I
+SELECT entries > 0 FROM vgi_result_cache_stats();
+----
+true
+
+# KNOWN GAP — a split scan POPULATES the cache but never SERVES from it, so an
+# identical repeat re-runs the worker and inserts again (entries stays 1, inserts
+# climbs). The serve path is gated on `!supports_splits`, which is broader than
+# the invariant requires: only REVALIDATION needs refusing on the split path
+# (the stored entry carries no per-split validators), while an ordinary hit
+# short-circuits the worker before splits are ever planned.
+#
+# Asserted rather than left to be rediscovered. Answers are correct either way —
+# this costs a re-scan, not a wrong result.
+query I
+SELECT inserts > 1 FROM vgi_result_cache_stats();
+----
+true
+
+query I
+SELECT hits FROM vgi_result_cache_stats();
+----
+0
 
 # The plan RPC is observable, so a split scan is provably taking the split path
 # rather than silently falling back.

@@ -21,6 +21,17 @@
 # The fixture re-emits the same splits on all three of its pages, so a client
 # taking the contract at face value would return every row three times.
 
+# SUBPROCESS ONLY — and the reason is the defect itself, not a test artifact.
+# The client dedups by comparing raw token bytes. That works only while tokens
+# are plaintext: a keyed worker seals each payload with a fresh random nonce, so
+# the SAME split minted on two pages produces two different byte strings and the
+# dedup never fires. Over HTTP this file therefore returns 90 rows where it
+# asserts 30 — the exact triplication described below, live.
+#
+# Left asserting the correct answer rather than the observed one, and excluded
+# from the HTTP suite, because the fix belongs in the protocol: dedup needs a
+# stable split identity (deterministic sealing, or a plaintext split_id on
+# ScanSplit), not a change here. See the HTTP-limitations list in CLAUDE.md.
 require-env VGI_TEST_WORKER
 
 require vgi

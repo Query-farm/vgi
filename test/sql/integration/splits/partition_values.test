@@ -28,16 +28,18 @@ require httpfs
 statement ok
 ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
-# Each partition intact and distinct. Equal sums across partitions are what makes
-# a mix-up visible in the ROW COUNTS rather than the totals.
+# Each partition intact and distinct. Every partition's values are offset by its
+# own index, so swapping two splits' labels MOVES these sums — with identical
+# values everywhere a mislabeled partition was invisible in both the counts and
+# the totals, and this file asserted nothing it claimed to.
 query III
 SELECT country, count(*), sum(sales)
 FROM example.main.split_partitioned(rows_per_country := 5)
 GROUP BY country ORDER BY country;
 ----
-BR	5	15
-DE	5	15
-JP	5	15
+BR	5	1515
+DE	5	515
+JP	5	1015
 US	5	15
 
 # Every partition present exactly once — a claimed-twice split would show up as a
@@ -58,9 +60,9 @@ SELECT country, count(*), sum(sales)
 FROM example.main.split_partitioned(rows_per_country := 7)
 GROUP BY country ORDER BY country;
 ----
-BR	7	28
-DE	7	28
-JP	7	28
+BR	7	2128
+DE	7	728
+JP	7	1428
 US	7	28
 
 statement ok
@@ -73,7 +75,7 @@ SELECT count(*), sum(sales)
 FROM example.main.split_partitioned(rows_per_country := 5)
 WHERE country = 'JP';
 ----
-5	15
+5	1015
 
 query I
 SELECT count(*)
@@ -96,7 +98,7 @@ SELECT min(sales), max(sales)
 FROM example.main.split_partitioned(rows_per_country := 9)
 WHERE country = 'BR';
 ----
-1	9
+301	309
 
 statement ok
 DETACH example;

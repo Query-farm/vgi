@@ -56,9 +56,13 @@ SELECT count(*) FROM example.main.split_fail_at(n := 80, splits := 8, fail_at :=
 ----
 80
 
-# Nothing was committed to the result cache by either failure. The counter is
-# process-global, so read it as a delta around a repeat of the failing query:
-# an entry stored by the partial scan would make the repeat a HIT.
+# Nothing was committed to the result cache by the failure.
+#
+# The assertion is on `entries`, not on a hit: split_fail_at advertises no
+# cacheability, so a hit could never occur and asserting its absence proved
+# nothing. `entries` at least distinguishes "the partial scan stored something"
+# from "it did not" — and cancel_midsplit.test carries the load-bearing version
+# of this check, against a fixture that genuinely does cache.
 statement ok
 CALL enable_logging(level := 'debug');
 
@@ -68,7 +72,7 @@ SELECT count(*) FROM example.main.split_fail_at(n := 80, splits := 8, fail_at :=
 failed mid-stream
 
 query I
-SELECT count(*) FROM duckdb_logs WHERE type='VGI' AND message LIKE '%result_cache.hit%';
+SELECT entries FROM vgi_result_cache_stats();
 ----
 0
 

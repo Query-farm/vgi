@@ -2168,6 +2168,12 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 	auto global_state = make_uniq<VgiTableFunctionGlobalState>();
 	global_state->client_context_for_explain = &context;
 	global_state->supports_splits = bind_data.supports_splits;
+	// Provisional reader count. On the ordinary path EnsureInitApplied folds in
+	// the worker's max_workers once the init future resolves; the split path
+	// takes it from the plan below and sets init_applied, so this has to be set
+	// BEFORE the plan rather than after it — assigning it later overwrote the
+	// plan's value and silently collapsed every split scan to one reader.
+	global_state->max_processes = 1;
 
 	// Split path: plan the scan into named units BEFORE any reader starts, then let
 	// readers claim them. The plan is built from STATIC filters only — dynamic
@@ -2255,11 +2261,6 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 	// thread for FIXED_ORDER functions even after EnsureInitApplied folds
 	// in the worker's max_workers.
 	global_state->fixed_order = bind_data.fixed_order;
-	// Provisional max_processes — actual value is folded in by
-	// EnsureInitApplied once the init future resolves. Setting 1 here
-	// matches the conservative default; for fan-outs of small metadata
-	// reads (Ducklake bind-time scan plan) it has no observable effect.
-	global_state->max_processes = 1;
 
 	// Result cache: eligible MISS → set up capture. Each local state captures
 	// its own substream; commit happens in the gstate destructor (never-partial).
@@ -2269,6 +2270,12 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 		cap->catalog_name = cache_eval.catalog_name;
 		cap->catalog_version_frozen = cache_eval.catalog_version_frozen;
 		cap->transaction_id = cache_eval.transaction_id;
+		// The split arm of the commit gate. Without these the gate read a
+		// default-constructed `split_path == false` and degenerated to plain
+		// `eos == launched` — which is exactly the check it was added to
+		// strengthen, so the guard existed and could never fire.
+		cap->split_path = bind_data.supports_splits;
+		cap->total_splits = global_state->splits.size();
 		Value sv;
 		cap->max_entry_bytes = context.TryGetCurrentSetting("vgi_result_cache_max_entry_bytes", sv)
 		                           ? static_cast<int64_t>(sv.GetValue<uint64_t>())
@@ -2324,6 +2331,16 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 		global_state->revalidate_if_none_match = revalidation_entry->etag;
 		global_state->revalidate_if_modified_since = revalidation_entry->last_modified;
 		global_state->revalidation_entry = std::move(revalidation_entry);
+	}
+
+	// The split path is done here. Readers initialize per split with the token
+	// they claimed, so there is no primary init to run — and running one anyway
+	// is not merely wasteful: it inits a connection with NO split token, which a
+	// split-only worker rejects, and on success leaves that worker streaming a
+	// whole unsplit scan into a pipe nobody reads until teardown. init_applied is
+	// already true, so the future's exception would never even be observed.
+	if (bind_data.supports_splits) {
+		return std::move(global_state);
 	}
 
 	auto perform_init_with_retry =
@@ -3303,6 +3320,12 @@ static bool AdvanceToNextSplit(ClientContext &context, const VgiTableFunctionBin
 	const bool had_split = local_state.has_split;
 	if (had_split) {
 		global_state.completed_splits.fetch_add(1, std::memory_order_relaxed);
+		// The capture's own counter is what the commit gate compares against; the
+		// gstate copy above is for diagnostics. They are separate objects and
+		// incrementing only one silently disarmed the gate.
+		if (global_state.capture) {
+			global_state.capture->completed_splits.fetch_add(1, std::memory_order_relaxed);
+		}
 		local_state.has_split = false;
 	}
 
@@ -3379,11 +3402,11 @@ static bool GetNextBatch(ClientContext &context, const VgiTableFunctionBindData 
 			// End of THIS stream. On the split path that is the end of one split,
 			// not the end of the scan: claim the next one and keep going.
 			//
-			// Doing it here rather than in the scan function is deliberate. This is
-			// the single funnel both the synchronous path and the async prefetch
-			// path use, so the loop covers both. Advancing only in the sync branch
-			// would leave `SET vgi_async_prefetch=true` silently truncating every
-			// multi-split scan — the same defect, arriving by the other route.
+			// Doing it here rather than in the scan function keeps the claim on the
+			// one path that reads batches synchronously. It is NOT a funnel for the
+			// async prefetch path — that path reads the connection directly from a
+			// task and would drop every split after the first — which is why the
+			// split path disables async prefetch outright (see VgiTableFunctionScan).
 			//
 			// It also means a ZERO-ROW split is handled by construction: an empty
 			// split reaches EOS immediately, we claim the next one, and no 0-row
@@ -3556,6 +3579,15 @@ void VgiTableFunctionScan(ClientContext &context, TableFunctionInput &input, Dat
 			is_async = async_val.GetValue<bool>();
 		}
 	}
+	// Never on the split path. Only the FIRST batch goes through GetNextBatch;
+	// every later one is fetched by VgiPrefetchTask, which reads the connection
+	// directly and so never claims the next split. At split 0's EOS the task
+	// stores a null batch, the reader is marked done, and splits 1..N are dropped
+	// — a correct-looking answer with missing rows, and (since every reader ends
+	// cleanly) one the commit gate would happily cache. Prefetching per split is
+	// a real option, but it needs the claim moved into the task along with the
+	// interrupt and poisoning handling that lives around PerformInit.
+	is_async = is_async && !bind_data.supports_splits;
 
 	// Fast path: current batch still has rows to consume
 	if (!BatchExhausted(local_state)) {
