@@ -1180,6 +1180,13 @@ VgiScanPlan InvokeTableFunctionPlan(const CatalogRpcContext &ctx,
 	VgiScanPlan plan;
 	plan.function_name = function_name;
 	std::vector<uint8_t> cursor;
+	// Dedup by token across pages. The disjointness of a paginated enumeration is
+	// a worker obligation with no enforcement, and violating it produces duplicate
+	// ROWS — the exact failure class splits exist to prevent, arriving through the
+	// mechanism meant to make enumeration faster. A hash set is nothing next to a
+	// plan RPC, and it turns a silent correctness bug into a dropped duplicate.
+	duckdb::unordered_set<std::string> seen_tokens;
+	idx_t duplicate_splits = 0;
 	idx_t pages = 0;
 
 	while (true) {
@@ -1218,15 +1225,21 @@ VgiScanPlan InvokeTableFunctionPlan(const CatalogRpcContext &ctx,
 			plan.execution_id = page.execution_id;
 			plan.init_opaque_data = page.init_opaque_data;
 		}
-		// Moved, not copied: `page` is dead once its cursor is read below.
-		plan.splits.insert(plan.splits.end(), std::make_move_iterator(page.splits.begin()),
-		                   std::make_move_iterator(page.splits.end()));
+		for (auto &token : page.splits) {
+			if (!seen_tokens.insert(token).second) {
+				duplicate_splits++;
+				continue;
+			}
+			plan.splits.push_back(std::move(token));
+		}
 
 		if (plan.splits.size() > kMaxSplits) {
 			throw IOException("VGI worker '%s' returned more than %llu splits for one scan; refusing to "
 			                  "buffer an unbounded split vector.",
 			                  worker_path, static_cast<unsigned long long>(kMaxSplits));
 		}
+
+		plan.duplicate_splits = duplicate_splits;
 
 		if (page.next_cursor.empty()) {
 			break;

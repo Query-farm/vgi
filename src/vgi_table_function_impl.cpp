@@ -2176,6 +2176,36 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 	// regression (today nothing is pruned at split granularity either way), just an
 	// optimization not claimed here.
 	if (bind_data.supports_splits) {
+		// Refuse a plan whose tokens expire sooner than this client can use them,
+		// BEFORE issuing it. Nothing re-plans when a split token expires — a
+		// distributed engine retries the serialized task it was handed and has no
+		// path back to the planner — so an expired token fails the query outright.
+		// Discovering that at read time means discovering it after the work was
+		// scheduled; discovering it here costs one comparison.
+		//
+		// An absent TTL means UNBOUNDED and always passes: assuming a TTL exists
+		// would foreclose long-running streams, whose whole point is a token that
+		// outlives any fixed window.
+		if (bind_data.split_token_ttl_seconds.has_value()) {
+			Value min_ttl_value;
+			int64_t min_ttl = 30;
+			if (context.TryGetCurrentSetting("vgi_split_token_min_ttl_seconds", min_ttl_value) &&
+			    !min_ttl_value.IsNull()) {
+				min_ttl = static_cast<int64_t>(min_ttl_value.GetValue<uint64_t>());
+			}
+			const auto declared = *bind_data.split_token_ttl_seconds;
+			if (min_ttl > 0 && declared < min_ttl) {
+				throw InvalidInputException(
+				    "VGI function '%s' declares a split-token lifetime of %lld second(s), but this client "
+				    "needs at least %lld between planning a scan and reading it. Nothing re-plans when a "
+				    "split token expires, so the scan would fail partway rather than degrade. Raise "
+				    "vgi_split_token_min_ttl_seconds if that horizon is wrong for this deployment, or fix "
+				    "the worker to declare a longer TTL.",
+				    bind_data.function_name, static_cast<long long>(declared),
+				    static_cast<long long>(min_ttl));
+			}
+		}
+
 		std::vector<uint8_t> filter_bytes_vec;
 		if (filter_bytes) {
 			filter_bytes_vec.assign(filter_bytes->data(), filter_bytes->data() + filter_bytes->size());
@@ -2210,7 +2240,8 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 		VGI_LOG(context, "scan.plan",
 		        {{"function_name", bind_data.function_name},
 		         {"splits", std::to_string(global_state->splits.size())},
-		         {"max_workers", std::to_string(plan.max_workers)}});
+		         {"max_workers", std::to_string(plan.max_workers)},
+		         {"duplicate_splits", std::to_string(plan.duplicate_splits)}});
 	}
 	global_state->cache_eligible = cache_eval.eligible; // an eligible non-hit is a genuine miss (EXPLAIN)
 	global_state->dynamic_filters = std::move(dynamic_filters);

@@ -1,0 +1,96 @@
+# name: test/sql/integration/splits/cursor_overlap.test
+# description: Overlapping enumeration pages produce no duplicate rows
+# group: [vgi_integration_splits]
+
+# Split enumeration may be paginated, and may fan out: a worker can return
+# several cursors so a client enumerates a large plan in parallel. That is only
+# sound under a contract — the cursors in one response must partition the
+# remaining enumeration disjointly and exhaustively, with no split reachable from
+# two of them.
+#
+# The contract has no enforcement, and violating it does not fail tidily. It
+# produces DUPLICATE ROWS: the same split redeemed twice, its rows returned
+# twice, through the very mechanism meant to make enumeration faster. That is
+# precisely the failure class splits exist to prevent, which makes it the worst
+# possible thing to leave to a worker's good behaviour.
+#
+# So the client dedups by token regardless of the contract. It costs a hash set
+# against the price of a plan RPC, and it converts a silent correctness bug into
+# a dropped duplicate that can be counted and reported.
+#
+# The fixture re-emits the same splits on all three of its pages, so a client
+# taking the contract at face value would return every row three times.
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# Each row exactly once, though the worker offered its splits three times over.
+# count(*) is the assertion that matters — count(DISTINCT) alone would pass even
+# if every row came back triplicated.
+query III
+SELECT count(*), count(DISTINCT n), sum(n)
+FROM example.main.split_overlap_cursor(n := 30, splits := 3);
+----
+30	30	435
+
+# A different shape, so the result is not an artifact of one split count.
+query II
+SELECT count(*), sum(n)
+FROM example.main.split_overlap_cursor(n := 100, splits := 7);
+----
+100	4950
+
+# Under parallelism, where the duplicates would be claimed by different readers
+# and so could not be caught downstream by accident.
+statement ok
+SET threads=8;
+
+query II
+SELECT count(*), count(DISTINCT n)
+FROM example.main.split_overlap_cursor(n := 100, splits := 7);
+----
+100	100
+
+statement ok
+RESET threads;
+
+# Dropped, but not silently. A worker violating the contract should be
+# diagnosable rather than merely survived — an operator seeing correct results
+# has no other way to learn their worker is misbehaving.
+statement ok
+CALL enable_logging(level := 'debug');
+
+query I
+SELECT count(*) FROM example.main.split_overlap_cursor(n := 30, splits := 3);
+----
+30
+
+query I
+SELECT count(*) > 0 FROM duckdb_logs
+WHERE type='VGI' AND message LIKE '%scan.plan%' AND message NOT LIKE '%duplicate_splits=0%';
+----
+true
+
+statement ok
+CALL disable_logging();
+
+# A well-behaved worker reports no duplicates, so the counter means something.
+statement ok
+CALL enable_logging(level := 'debug');
+
+query I
+SELECT count(*) FROM example.main.split_sequence(n := 30, splits := 3);
+----
+30
+
+statement ok
+CALL disable_logging();
+
+statement ok
+DETACH example;

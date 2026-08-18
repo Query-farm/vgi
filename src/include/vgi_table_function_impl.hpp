@@ -169,6 +169,10 @@ struct VgiTableFunctionBindData : public TableFunctionData {
 	// must hold before it runs (revalidation refusal, the capture accounting, the
 	// MaxThreads clamp).
 	bool supports_splits = false;
+	// The worker's declared split-token lifetime. Absent means UNBOUNDED, not
+	// "expires immediately" — a client that assumed a TTL existed would foreclose
+	// long-running streams, so the check below only fires on a declared value.
+	std::optional<int64_t> split_token_ttl_seconds;
 
 	// Partition shape declared by the worker over its annotated bind
 	// schema fields (Meta.partition_kind on the Python side). When non-

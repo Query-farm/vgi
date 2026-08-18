@@ -3754,6 +3754,16 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    "Additive — the whole-scan entry is still stored/served. Default ON",
 	    LogicalType::BOOLEAN, Value::BOOLEAN(true));
 	config.AddExtensionOption(
+	    "vgi_split_token_min_ttl_seconds",
+	    "Shortest split-token lifetime this client will accept, in seconds. A split token expires, and "
+	    "NOTHING re-plans when it does — a distributed engine retries the serialized task it was handed, "
+	    "with no path back to the planner — so an expired token fails the query outright. The mitigation "
+	    "is to refuse the plan up front, at the one moment the shortfall is cheap to discover, rather "
+	    "than at read time after the work has been scheduled. Raise it to match a longer horizon between "
+	    "planning and reading; a worker declaring no TTL means unbounded and always passes. 0 disables "
+	    "the check. Default 30",
+	    LogicalType::UBIGINT, Value::UBIGINT(30));
+	config.AddExtensionOption(
 	    "vgi_split_plan_max_pages",
 	    "Cap on how many pages of scan-planning the client will follow before refusing. A worker may "
 	    "paginate its split enumeration by returning a cursor; a worker that never exhausts that cursor "

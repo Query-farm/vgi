@@ -1,0 +1,95 @@
+# name: test/sql/integration/splits/ttl_floor.test
+# description: A worker whose split tokens expire too soon is refused at plan time
+# group: [vgi_integration_splits]
+
+# Expiry is unrecoverable, and that is the whole reason this check exists.
+#
+# Nothing re-plans when a split token expires. Spark retries the serialized
+# InputPartition it was handed, with no path back to planInputPartitions();
+# Trino's split source lives only during enumeration; DataFusion bakes the splits
+# into the ExecutionPlan at scan() and executes synchronously. Even here, DuckDB
+# cannot un-emit rows it has already returned. So an expired token fails the
+# query outright — there is no degraded mode to fall into.
+#
+# Which makes the moment of discovery the only thing left to control. A too-short
+# lifetime found at READ time is found after planning, scheduling and (on a
+# cluster) queueing have all been paid for. Found at PLAN time it costs one
+# comparison. That is the entire mitigation, so it is worth a test.
+#
+# The floor is the client's own horizon between planning a scan and reading it.
+# DuckDB's is the shortest of any engine — it plans at execution start — which is
+# why 30s is a sane default here and why a Spark connector would set it to hours.
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# The fixture declares a 1-second lifetime, unusable even at DuckDB's horizon.
+statement error
+SELECT count(*) FROM example.main.split_short_ttl(n := 10, splits := 2);
+----
+split-token lifetime
+
+# The message names the SHORTFALL — both numbers — because an operator seeing
+# only "TTL too short" cannot tell whether to fix the worker or raise the floor.
+statement error
+SELECT count(*) FROM example.main.split_short_ttl(n := 10, splits := 2);
+----
+1 second(s), but this client needs at least 30
+
+# ...and names the knob, so the message is actionable without reading the source.
+statement error
+SELECT count(*) FROM example.main.split_short_ttl(n := 10, splits := 2);
+----
+vgi_split_token_min_ttl_seconds
+
+# It is a FLOOR, not a fixed rule: a deployment whose horizon really is that
+# short may lower it, and the same worker then plans fine. This is what makes the
+# check a policy rather than a hard-coded refusal.
+statement ok
+SET vgi_split_token_min_ttl_seconds=1;
+
+query II
+SELECT count(*), sum(n) FROM example.main.split_short_ttl(n := 10, splits := 2);
+----
+10	45
+
+# Zero disables it outright, for an operator who would rather take the risk.
+statement ok
+SET vgi_split_token_min_ttl_seconds=0;
+
+query I
+SELECT count(*) FROM example.main.split_short_ttl(n := 10, splits := 2);
+----
+10
+
+statement ok
+RESET vgi_split_token_min_ttl_seconds;
+
+# A worker declaring NO lifetime means unbounded, not "expires immediately", and
+# must always pass. Reading an absent TTL as zero would foreclose long-running
+# streams, whose whole point is a token that outlives any fixed window.
+query II
+SELECT count(*), sum(n) FROM example.main.split_sequence(n := 10, splits := 2);
+----
+10	45
+
+# The refusal is at PLAN time, so it costs nothing and leaves nothing behind:
+# the next scan on the same catalog is unaffected.
+statement error
+SELECT count(*) FROM example.main.split_short_ttl(n := 5, splits := 1);
+----
+split-token lifetime
+
+query I
+SELECT count(*) FROM example.main.split_sequence(n := 30, splits := 3);
+----
+30
+
+statement ok
+DETACH example;

@@ -116,6 +116,7 @@ static unique_ptr<FunctionData> VgiCatalogTableFunctionBind(ClientContext &conte
 	// a ``SET vgi_split_scans`` between bind and execute would otherwise produce a
 	// bind that assumed splits and an init that did not.
 	bind_data->supports_splits = vgi_info.function_info().supports_splits && VgiSplitScansEnabled(context);
+	bind_data->split_token_ttl_seconds = vgi_info.function_info().split_token_ttl_seconds;
 	// FIXED_ORDER: clamps MaxThreads to 1 so DuckDB schedules the source
 	// onto a single thread. ``TableFunction::order_preservation_type`` is
 	// already set at function-registration time (see ``AddFunction`` calls
