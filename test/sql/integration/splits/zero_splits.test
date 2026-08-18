@@ -1,0 +1,83 @@
+# name: test/sql/integration/splits/zero_splits.test
+# description: A plan with no splits is a legal empty result, never an error or a crash
+# group: [vgi_integration_splits]
+
+# "No splits" is what a fully-pruned scan looks like: the worker was asked to
+# divide the work and correctly answered that there is none. It must produce an
+# empty result.
+#
+# The failure modes are all downstream of treating zero as impossible. A reader
+# count derived from the split count lands on zero threads; a local state
+# dereferences a connection that was never acquired because there was nothing to
+# claim; an aggregate over the scan divides by a partition count of zero. Each is
+# a crash or a hang rather than a wrong answer, which is why this is worth its own
+# file rather than a line in parity.test — the assertion is mostly that the query
+# comes back at all.
+#
+# Distinct from a zero-ROW split (zero_row_split.test), where splits exist and
+# yield nothing: there the client claims, redeems and drains. Here it never
+# claims at all, so the drain loop is entered with nothing to do — a different
+# path, and the one where an off-by-one in the clamp shows up.
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# The plain shape: no rows, no error.
+query I
+SELECT count(*) FROM example.main.split_zero(n := 100, splits := 8);
+----
+0
+
+# Nothing to select, and selecting it is still legal.
+query I
+SELECT count(*) FROM (SELECT n FROM example.main.split_zero(n := 100, splits := 8));
+----
+0
+
+# An aggregate over an empty split plan returns SQL's answer for an empty input,
+# not the worker's — sum of nothing is NULL, and count of nothing is 0.
+query II
+SELECT count(*), sum(n) FROM example.main.split_zero(n := 100, splits := 8);
+----
+0	NULL
+
+# With threads to spare: the reader count must clamp to at least one even when
+# there is nothing to claim, or the scan has no one to notice it is finished.
+statement ok
+SET threads=8;
+
+query I
+SELECT count(*) FROM example.main.split_zero(n := 100, splits := 8);
+----
+0
+
+statement ok
+RESET threads;
+
+# Composed with a real scan, so an empty plan cannot quietly swallow its
+# neighbour's rows: UNION ALL of empty and non-empty is the non-empty one.
+query II
+SELECT count(*), sum(n) FROM (
+    SELECT n FROM example.main.split_zero(n := 100, splits := 8)
+    UNION ALL
+    SELECT n FROM example.main.split_sequence(n := 10, splits := 3)
+);
+----
+10	45
+
+# ...and joined, where an empty side must produce an empty join rather than an
+# error from a scan that never opened a connection.
+query I
+SELECT count(*) FROM example.main.split_zero(n := 10, splits := 2) z
+JOIN example.main.split_sequence(n := 10, splits := 2) s ON s.n = z.n;
+----
+0
+
+statement ok
+DETACH example;

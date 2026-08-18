@@ -1,0 +1,97 @@
+# name: test/sql/integration/splits/batch_index.test
+# description: Batch indices stay monotonic per reader across split boundaries
+# group: [vgi_integration_splits]
+
+# This is the contract that makes greedy per-split claiming safe, and it is not
+# obvious, so it is worth stating before asserting.
+#
+# A batch index must be monotonic per READER. Greedy claiming re-initializes the
+# same connection for every split it claims, so each split starts a FRESH STREAM
+# on that reader — a worker numbering its batches from zero per split would hand
+# one reader a decreasing index, and the client throws.
+#
+# It survives only because next_split.fetch_add(1) hands each reader strictly
+# ASCENDING split indices, so a worker deriving its index from the split's
+# position in a globally-ordered space is monotonic per reader by construction.
+# That is the real reason claiming is one-at-a-time rather than grouped, and it
+# is NOT something multi-token init would provide: a group's tokens carry no
+# ordering among themselves.
+#
+# The fixture gives each split a slice of the index space (ordinal × stride), so
+# indices ascend across split boundaries as well as within them. Note the budget
+# this implies: the index cap bounds ordinal × stride, so a worker choosing a
+# stride is really choosing cap / n_splits.
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# Every row exactly once. A monotonicity violation surfaces as a thrown error
+# rather than a wrong count, so this is the "it ran at all" baseline.
+query III
+SELECT count(*), count(DISTINCT n), sum(n)
+FROM example.main.split_batch_index(n := 200, splits := 7);
+----
+200	200	19900
+
+# More splits than threads, so readers claim repeatedly and each one crosses
+# several split boundaries — the arrangement where a per-split restart would be
+# caught. Fewer splits than this and a reader might claim only one.
+query II
+SELECT count(*), count(DISTINCT n)
+FROM example.main.split_batch_index(n := 500, splits := 40);
+----
+500	500
+
+statement ok
+SET threads=8;
+
+query II
+SELECT count(*), count(DISTINCT n)
+FROM example.main.split_batch_index(n := 500, splits := 40);
+----
+500	500
+
+statement ok
+RESET threads;
+
+# Feeding a sink that actually consumes the index. CREATE TABLE AS routes through
+# DuckDB's batch-ordered insert, which is what the tagging exists for — an index
+# that went backwards would be rejected here rather than quietly ignored, and a
+# scan whose indices collided across splits would land rows in the wrong order or
+# lose them.
+statement ok
+CREATE TABLE split_bi AS
+SELECT * FROM example.main.split_batch_index(n := 300, splits := 12);
+
+query III
+SELECT count(*), count(DISTINCT n), sum(n) FROM split_bi;
+----
+300	300	44850
+
+statement ok
+DROP TABLE split_bi;
+
+# A single split still numbers from its own base rather than assuming it is the
+# only one — the degenerate case must use the same rule, or the rule only holds
+# when it is not being tested.
+query II
+SELECT count(*), sum(n) FROM example.main.split_batch_index(n := 40, splits := 1);
+----
+40	780
+
+# Empty splits interleaved with the index space: a split that emits nothing
+# consumes its slice of indices and the next split still ascends past it.
+query II
+SELECT count(*), count(DISTINCT n)
+FROM example.main.split_batch_index(n := 5, splits := 20);
+----
+5	5
+
+statement ok
+DETACH example;

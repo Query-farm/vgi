@@ -1,0 +1,93 @@
+# name: test/sql/integration/splits/multi_branch.test
+# description: A split-capable function as one arm of a multi-branch table
+# group: [vgi_integration_splits]
+
+# Two parallelism axes composed, which is why this is worth asserting rather than
+# assuming. A BRANCH divides a table across functions — the rewriter turns the
+# table into a UNION ALL and each arm binds independently. A SPLIT divides one
+# function's scan across readers, decided by a plan call at that arm's own
+# InitGlobal.
+#
+# They are independent by construction, and the failure mode is that they stop
+# being: a split arm planning on behalf of the whole union, a plain arm being
+# asked for a plan it does not implement, or one arm's reader count clamping the
+# other's. None of those would show up as an error — they would show up as a row
+# count, which is why the assertions here are exact sums rather than "> 0".
+#
+# The fixture table has one split-capable arm (30 rows over 6 splits) and one
+# ordinary arm (20 rows), so the two are distinguishable in the result.
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# The union is exactly both arms: 30 + 20, with each arm's values intact.
+query II
+SELECT count(*), sum(n) FROM example.data.multi_branch_split;
+----
+50	625
+
+# Neither arm is truncated or duplicated. The split arm contributes 0..29 and the
+# plain arm 0..19, so values 0..19 appear twice and 20..29 once — a split arm
+# that lost or repeated a split changes these counts and nothing else.
+query III
+SELECT count(*), count(DISTINCT n), max(n) FROM example.data.multi_branch_split;
+----
+50	30	29
+
+query I
+SELECT count(*) FROM example.data.multi_branch_split WHERE n >= 20;
+----
+10
+
+query I
+SELECT count(*) FROM example.data.multi_branch_split WHERE n < 20;
+----
+40
+
+# Under real parallelism, where the arms and the split claims compete for
+# threads: the answer must not move.
+statement ok
+SET threads=8;
+
+query II
+SELECT count(*), sum(n) FROM example.data.multi_branch_split;
+----
+50	625
+
+statement ok
+RESET threads;
+
+# The branches are introspectable, and the split arm is an ordinary function
+# branch — splits are a property of how that function's scan is DIVIDED, not of
+# how the table is composed, so nothing about the branch itself marks it.
+query I
+SELECT count(*) FROM vgi_table_branches()
+WHERE table_name = 'multi_branch_split';
+----
+2
+
+query I
+SELECT function_name FROM vgi_table_branches()
+WHERE table_name = 'multi_branch_split' AND branch_index = 0;
+----
+split_sequence
+
+# Aggregation over the union, which pulls both arms through one operator: a split
+# arm that ended early would show here as a smaller sum, not as an error.
+query II
+SELECT count(*), sum(n) FROM (
+    SELECT n FROM example.data.multi_branch_split
+    UNION ALL
+    SELECT n FROM example.main.split_sequence(n := 10, splits := 2)
+);
+----
+60	670
+
+statement ok
+DETACH example;

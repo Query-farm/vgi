@@ -1,0 +1,67 @@
+# name: test/sql/integration/splits/expired_token.test
+# description: A plan pinned to a version that has moved is refused, distinguishably
+# group: [vgi_integration_splits]
+
+# A split token names a consistency anchor — the catalog version the plan was
+# pinned to. Stamping that anchor and never comparing it would make the whole
+# mechanism decorative: the token would name a version and nothing would ever ask
+# whether that version is still current. So redemption compares, and refuses.
+#
+# The refusal must be DISTINGUISHABLE from an invalid token, because only one of
+# the two is worth reacting to. An expired snapshot means "re-run the query" —
+# re-planning produces a valid token. A wrongly-bound or forged token means the
+# opposite: re-running reproduces exactly the same token, so a connector that
+# retried would burn its retry budget and fail the stage anyway. Keeping the
+# anchor in the token's PLAINTEXT header rather than inside the AEAD is what
+# makes the distinction expressible at all — sealed, both failures would collapse
+# into one indistinguishable tag-check failure.
+#
+# The forged cases (a cleared seal on a keyed worker — the alg:none downgrade —
+# and a mismatched bind fingerprint) are deliberately NOT tested here. They are
+# unreachable through SQL by construction, because the framework owns the
+# envelope and a worker cannot mint a token with a wrong fingerprint or no seal
+# even on purpose. They are covered byte-for-byte instead by the shared
+# cross-SDK vectors in vgi-python's tests/data/split_tokens/, which every SDK
+# both parses and reproduces.
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# The fixture plans against a catalog version the live catalog will not agree
+# with — a plan that outlived its snapshot, which is the situation this error
+# exists for.
+statement error
+SELECT count(*) FROM example.main.split_stale_plan(n := 20, splits := 2);
+----
+SPLIT_SNAPSHOT_EXPIRED
+
+# The message says what to do about it. An operator reading this should not have
+# to know the protocol to learn that the query is re-runnable.
+statement error
+SELECT count(*) FROM example.main.split_stale_plan(n := 20, splits := 2);
+----
+re-run the query
+
+# Expiry FAILS the query. It must never be papered over by silently re-planning:
+# a client that re-planned mid-scan would splice rows from two different catalog
+# versions into one answer, which is worse than the error.
+statement error
+SELECT sum(n) FROM example.main.split_stale_plan(n := 5, splits := 1);
+----
+SPLIT_SNAPSHOT_EXPIRED
+
+# The catalog is unharmed — a refused token is a clean, bounded failure, not a
+# poisoned connection.
+query II
+SELECT count(*), sum(n) FROM example.main.split_sequence(n := 40, splits := 4);
+----
+40	780
+
+statement ok
+DETACH example;

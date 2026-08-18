@@ -1,0 +1,103 @@
+# name: test/sql/integration/splits/transaction_scope.test
+# description: Split scans inside an explicit transaction, and across its boundary
+# group: [vgi_integration_splits]
+
+# DuckDB runs scans inside transactions; Spark, Trino and DataFusion have no
+# read-side transaction concept at all. Splits have to serve both, which is why
+# the token binds whichever consistency anchor is in play — the transaction
+# identity inside one, the catalog version outside.
+#
+# Mechanically this is already threaded: transaction_opaque_data rides the bind
+# request, and both the plan call and every split init carry the whole bind call,
+# so a plan issued inside a transaction and each split redeeming it see the same
+# handle without a new field. What is worth asserting is that nothing about the
+# split path breaks that — a plan RPC that dropped the transaction handle, or a
+# per-split init that re-bound outside it, would read a different snapshot per
+# split and splice two of them into one answer.
+#
+# Note the fixture catalog reports a stable version, so this file asserts the
+# transaction plumbing rather than snapshot divergence; expired_token.test covers
+# what happens when an anchor genuinely goes stale.
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# A split scan inside an explicit transaction is an ordinary scan.
+statement ok
+BEGIN;
+
+query II
+SELECT count(*), sum(n) FROM example.main.split_sequence(n := 200, splits := 9);
+----
+200	19900
+
+# Twice in the same transaction: both reads see the same thing, and the second
+# is not confused by the first's plan.
+query II
+SELECT count(*), sum(n) FROM example.main.split_sequence(n := 200, splits := 9);
+----
+200	19900
+
+# A different split count in the same transaction — the plan is per-scan, not
+# per-transaction, so re-dividing mid-transaction must be fine.
+query II
+SELECT count(*), sum(n) FROM example.main.split_sequence(n := 200, splits := 3);
+----
+200	19900
+
+statement ok
+COMMIT;
+
+# The same query outside the transaction agrees. A split scan that had bound
+# itself to the transaction and outlived it would fail here, not inside.
+query II
+SELECT count(*), sum(n) FROM example.main.split_sequence(n := 200, splits := 9);
+----
+200	19900
+
+# Rolled back rather than committed: a read-only scan has nothing to undo, and
+# the rollback must not leave the connection or the worker in a state that the
+# next scan trips over.
+statement ok
+BEGIN;
+
+query I
+SELECT count(*) FROM example.main.split_sequence(n := 50, splits := 5);
+----
+50
+
+statement ok
+ROLLBACK;
+
+query II
+SELECT count(*), sum(n) FROM example.main.split_sequence(n := 50, splits := 5);
+----
+50	1225
+
+# Zero splits and a failing split inside a transaction: the empty plan is legal
+# and the failure is bounded, so neither should poison the transaction such that
+# a later statement in it cannot run.
+statement ok
+BEGIN;
+
+query I
+SELECT count(*) FROM example.main.split_zero(n := 10, splits := 2);
+----
+0
+
+query I
+SELECT count(*) FROM example.main.split_sequence(n := 10, splits := 2);
+----
+10
+
+statement ok
+COMMIT;
+
+statement ok
+DETACH example;
