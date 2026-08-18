@@ -1060,9 +1060,15 @@ VgiScanPlanPage ParseVgiScanPlanPage(const std::shared_ptr<arrow::RecordBatch> &
 					// ``token`` — the framework-stamped envelope — NOT the whole
 					// record and not the worker's raw payload, which is inside the
 					// envelope and unverifiable on its own.
-					auto view = values->GetView(i);
-					std::vector<uint8_t> split_bytes(view.data(), view.data() + view.size());
-					auto split_batch = DeserializeFromIpcBytes(split_bytes);
+					//
+					// Sliced zero-copy rather than copied out: the blob carries the
+					// full ScanSplit record (estimates, partition bounds, statistics
+					// — everything a bin-packing engine reads), while this client
+					// needs only the token. Materializing it copied ~1.8 KB twice per
+					// split for ~100 bytes of payload, and that runs single-threaded
+					// at the head of every scan, so on a large plan it was hundreds of
+					// milliseconds of dead time before the first reader started.
+					auto split_batch = DeserializeFromIpcBytesZeroCopy(*values, i);
 					if (!split_batch || split_batch->num_rows() == 0) {
 						throw IOException("VGI worker '%s' returned an unparseable ScanSplit", worker_path);
 					}
@@ -1156,7 +1162,19 @@ VgiScanPlan InvokeTableFunctionPlan(const CatalogRpcContext &ctx,
 
 	// Bounds. Deliberately generous: they exist to turn a hang into a legible
 	// error, not to second-guess a worker's split count.
-	constexpr idx_t kMaxPages = 1024;
+	// Read from the session so an operator can raise it for a worker that
+	// legitimately paginates a very large table — this bounds PAGES, not splits,
+	// so the reachable split count is this times the worker's page size, which
+	// may sit far below the split cap below.
+	idx_t max_pages = 1024;
+	Value max_pages_value;
+	if (context.TryGetCurrentSetting("vgi_split_plan_max_pages", max_pages_value) &&
+	    !max_pages_value.IsNull()) {
+		const auto configured = max_pages_value.GetValue<uint64_t>();
+		if (configured > 0) {
+			max_pages = static_cast<idx_t>(configured);
+		}
+	}
 	constexpr idx_t kMaxSplits = 1u << 20;
 
 	VgiScanPlan plan;
@@ -1168,11 +1186,11 @@ VgiScanPlan InvokeTableFunctionPlan(const CatalogRpcContext &ctx,
 		if (context.interrupted) {
 			throw InterruptException();
 		}
-		if (pages >= kMaxPages) {
+		if (pages >= max_pages) {
 			throw IOException(
 			    "VGI worker '%s' function '%s' exceeded the scan-planning page cap (%llu pages) without "
 			    "exhausting its cursor; refusing to scan a partial split enumeration.",
-			    worker_path, function_name, static_cast<unsigned long long>(kMaxPages));
+			    worker_path, function_name, static_cast<unsigned long long>(max_pages));
 		}
 
 		auto request_batch = BuildTableFunctionPlanRequest(bind_request_bytes, bind_opaque_data, projection_ids,
@@ -1188,15 +1206,21 @@ VgiScanPlan InvokeTableFunctionPlan(const CatalogRpcContext &ctx,
 		pages++;
 
 		auto page = ParseVgiScanPlanPage(result_batch, worker_path);
-		if (plan.splits.empty()) {
-			// Plan-level facts come from the first page.
+		// Plan-level facts come from the FIRST page, keyed on the page count
+		// rather than on `splits.empty()`. A leading page may legally carry zero
+		// splits and a cursor (a worker still enumerating), and keying on
+		// emptiness let each such page overwrite these — so what survived was the
+		// LAST empty page's values, not the first page's.
+		if (pages == 1) {
 			plan.max_workers = page.max_workers;
 			plan.catalog_version = page.catalog_version;
 			plan.scope = page.scope;
 			plan.execution_id = page.execution_id;
 			plan.init_opaque_data = page.init_opaque_data;
 		}
-		plan.splits.insert(plan.splits.end(), page.splits.begin(), page.splits.end());
+		// Moved, not copied: `page` is dead once its cursor is read below.
+		plan.splits.insert(plan.splits.end(), std::make_move_iterator(page.splits.begin()),
+		                   std::make_move_iterator(page.splits.end()));
 
 		if (plan.splits.size() > kMaxSplits) {
 			throw IOException("VGI worker '%s' returned more than %llu splits for one scan; refusing to "

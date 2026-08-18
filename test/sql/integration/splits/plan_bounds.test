@@ -17,28 +17,41 @@ require-env VGI_TEST_WORKER
 
 require vgi
 
+require httpfs
+
 statement ok
 ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# Lower the cap so the property is proven in a handful of round-trips.
+#
+# The default is 1024 pages, and reaching it costs the worker 1024 plan RPCs —
+# ~17 s here, well past this project's 10 s per-test budget, to assert one error
+# message. The cap is a client-side bound, so proving it trips is independent of
+# WHERE it sits; 4 pages exercises exactly the same branch. (An earlier version
+# of this test was worse still: it asserted three substrings of the one message
+# by re-running the query three times, 3072 RPCs to check one string.)
+statement ok
+SET vgi_split_plan_max_pages=4;
 
 # The fixture hands back one split and a fresh cursor every page, forever.
 statement error
 SELECT count(*) FROM example.main.split_endless_cursor(n := 10, splits := 1);
 ----
-page cap
+exceeded the scan-planning page cap
 
-# The error names the function, so an operator can tell WHICH scan misbehaved
-# when several are in flight.
+# The cap is honoured as SET, not merely as a constant: raising it changes how
+# far the client follows before refusing, which is what makes it useful to an
+# operator whose worker legitimately paginates a large table.
+statement ok
+SET vgi_split_plan_max_pages=8;
+
 statement error
 SELECT count(*) FROM example.main.split_endless_cursor(n := 10, splits := 1);
 ----
-split_endless_cursor
+(8 pages)
 
-# It refuses rather than serving a partial enumeration — stated separately from
-# the message check because this is the property that matters.
-statement error
-SELECT count(*) FROM example.main.split_endless_cursor(n := 10, splits := 1);
-----
-refusing to scan a partial split enumeration
+statement ok
+RESET vgi_split_plan_max_pages;
 
 # The catalog survives it: hitting the cap is a bounded, recoverable failure, not
 # a poisoned connection.

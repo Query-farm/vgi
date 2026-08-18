@@ -3754,6 +3754,16 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    "Additive — the whole-scan entry is still stored/served. Default ON",
 	    LogicalType::BOOLEAN, Value::BOOLEAN(true));
 	config.AddExtensionOption(
+	    "vgi_split_plan_max_pages",
+	    "Cap on how many pages of scan-planning the client will follow before refusing. A worker may "
+	    "paginate its split enumeration by returning a cursor; a worker that never exhausts that cursor "
+	    "would otherwise hang the query, and stopping early would be worse still — it would scan a "
+	    "PARTIAL enumeration and report it as the whole answer. So a breach throws. Raise it for a "
+	    "worker that legitimately paginates a very large table: this bounds PAGES, not splits, so the "
+	    "reachable split count is this times the worker's page size, which may be far below "
+	    "the 1048576 split cap. Default 1024",
+	    LogicalType::UBIGINT, Value::UBIGINT(1024));
+	config.AddExtensionOption(
 	    "vgi_result_cache_partition_max_enumerated",
 	    "Cap on the number of distinct partitions handled per scan by the per-partition cache: bounds "
 	    "both the enumerated =/IN cross-product at serve time and the distinct-partition count at "
