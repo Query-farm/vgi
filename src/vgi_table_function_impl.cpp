@@ -2194,7 +2194,7 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 		                          bind_data.transaction_opaque_data};
 		auto plan = InvokeTableFunctionPlan(rpc_ctx, bind_data.bind_result.bind_request_bytes,
 		                                    bind_data.bind_result.opaque_data, projection_ids, filter_bytes_vec,
-		                                    min_splits, target_split_bytes, context);
+		                                    min_splits, target_split_bytes, bind_data.function_name, context);
 
 		global_state->splits = std::move(plan.splits);
 		if (plan.max_workers > 0) {

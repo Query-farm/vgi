@@ -1,0 +1,61 @@
+# name: test/sql/integration/splits/pushdown.test
+# description: Filters and projection reach plan(), not merely the per-split init
+# group: [vgi_integration_splits]
+
+# A row-count assertion cannot catch a pushdown regression: the rows come out the
+# same whether the filter reached the worker or DuckDB applied it above the scan.
+# So the fixture makes the pushdown itself the data — it records what the PLAN
+# call received and bakes that into each split's payload, which is precisely the
+# claim under test. Pushdown arriving only at per-split init() would be a real
+# regression (the worker could no longer prune SPLITS, only rows within them) and
+# would be invisible to any assertion about the result set.
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# No filter: the baseline says the fixture reports honestly rather than always
+# claiming to have seen one.
+query III
+SELECT split_ordinal, saw_filters, n_projection
+FROM example.main.split_echo_filters(splits := 3)
+ORDER BY split_ordinal;
+----
+0	false	0
+1	false	0
+2	false	0
+
+# With a filter DuckDB can push, plan() must see it. The predicate is on a column
+# the fixture emits, so it is genuinely pushable rather than something the binder
+# would have to keep above the scan.
+query I
+SELECT DISTINCT saw_filters
+FROM example.main.split_echo_filters(splits := 3)
+WHERE split_ordinal >= 0;
+----
+true
+
+# Every split agrees. A worker planning under a filter must see it once, for the
+# whole plan — not per split, which would be a different (and unsound) shape,
+# since splits are already named by the time any init runs.
+query II
+SELECT count(*), count(DISTINCT saw_filters)
+FROM example.main.split_echo_filters(splits := 5)
+WHERE split_ordinal >= 0;
+----
+5	1
+
+# The filter narrows the answer as well as reaching the worker: a pushdown that
+# arrived but was ignored would pass the assertion above and fail this one.
+query I
+SELECT count(*)
+FROM example.main.split_echo_filters(splits := 5)
+WHERE split_ordinal >= 3;
+----
+2
+
+statement ok
+DETACH example;

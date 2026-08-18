@@ -1,0 +1,59 @@
+# name: test/sql/integration/splits/one_split.test
+# description: The degenerate one-split scan still goes through the whole plan/claim path
+# group: [vgi_integration_splits]
+
+# A single split is the case most likely to be "optimized" into a special path
+# later, and the case where a special path would be least visible: the answer is
+# right either way. So assert the SHAPE as well as the rows — one split must
+# still be planned, claimed and drained like any other, because every guarantee
+# in this suite (never-partial commit, batch_index monotonicity, connection
+# poisoning on a failed init) is stated in terms of the claim loop.
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# Rows first: one split must agree with the many-split answer.
+query II
+SELECT count(*), sum(n) FROM example.main.split_sequence(n := 100, splits := 1);
+----
+100	4950
+
+query II
+SELECT count(*), sum(n) FROM example.main.split_sequence(n := 100, splits := 16);
+----
+100	4950
+
+# And with the parallel machinery fully engaged: raising the thread count must
+# not change a one-split answer, because a claim is taken by exactly one reader.
+statement ok
+SET threads=8;
+
+query II
+SELECT count(*), sum(n) FROM example.main.split_sequence(n := 100, splits := 1);
+----
+100	4950
+
+# Every row exactly once — a second reader "helping" with the single split would
+# show up here as duplicates, and nowhere in the aggregate above.
+query II
+SELECT count(*), count(DISTINCT n) FROM example.main.split_sequence(n := 500, splits := 1);
+----
+500	500
+
+statement ok
+RESET threads;
+
+# A one-split scan whose only split is EMPTY is the intersection of the two
+# degenerate cases, and it is not the same as zero splits: the client claims a
+# split, redeems it, and gets nothing back. It must still terminate cleanly.
+query I
+SELECT count(*) FROM example.main.split_sequence(n := 0, splits := 1);
+----
+0
+
+statement ok
+DETACH example;

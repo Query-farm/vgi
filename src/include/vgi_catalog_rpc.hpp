@@ -405,7 +405,8 @@ VgiScanPlan InvokeTableFunctionPlan(const CatalogRpcContext &ctx, const std::vec
                                     const std::vector<uint8_t> &bind_opaque_data,
                                     const std::vector<int32_t> &projection_ids,
                                     const std::vector<uint8_t> &pushdown_filters, int64_t min_splits,
-                                    int64_t target_split_bytes, ClientContext &context);
+                                    int64_t target_split_bytes, const std::string &function_name,
+                                    ClientContext &context);
 
 //! Parse one PlanResponse batch into a page.
 VgiScanPlanPage ParseVgiScanPlanPage(const std::shared_ptr<arrow::RecordBatch> &batch, const std::string &worker_path);

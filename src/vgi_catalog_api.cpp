@@ -1150,7 +1150,8 @@ VgiScanPlan InvokeTableFunctionPlan(const CatalogRpcContext &ctx,
                                     const std::vector<uint8_t> &bind_opaque_data,
                                     const std::vector<int32_t> &projection_ids,
                                     const std::vector<uint8_t> &pushdown_filters, int64_t min_splits,
-                                    int64_t target_split_bytes, ClientContext &context) {
+                                    int64_t target_split_bytes, const std::string &function_name,
+                                    ClientContext &context) {
 	auto &worker_path = ctx.params->worker_path();
 
 	// Bounds. Deliberately generous: they exist to turn a hang into a legible
@@ -1159,6 +1160,7 @@ VgiScanPlan InvokeTableFunctionPlan(const CatalogRpcContext &ctx,
 	constexpr idx_t kMaxSplits = 1u << 20;
 
 	VgiScanPlan plan;
+	plan.function_name = function_name;
 	std::vector<uint8_t> cursor;
 	idx_t pages = 0;
 
@@ -1170,7 +1172,7 @@ VgiScanPlan InvokeTableFunctionPlan(const CatalogRpcContext &ctx,
 			throw IOException(
 			    "VGI worker '%s' function '%s' exceeded the scan-planning page cap (%llu pages) without "
 			    "exhausting its cursor; refusing to scan a partial split enumeration.",
-			    worker_path, plan.function_name, static_cast<unsigned long long>(kMaxPages));
+			    worker_path, function_name, static_cast<unsigned long long>(kMaxPages));
 		}
 
 		auto request_batch = BuildTableFunctionPlanRequest(bind_request_bytes, bind_opaque_data, projection_ids,

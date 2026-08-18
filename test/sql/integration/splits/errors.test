@@ -1,0 +1,77 @@
+# name: test/sql/integration/splits/errors.test
+# description: A worker failure mid-split surfaces, caches nothing, and leaves the catalog usable
+# group: [vgi_integration_splits]
+
+# Three claims, in increasing order of how quietly they fail if wrong:
+#
+#   1. The error surfaces at all. Easy.
+#   2. The catalog still works afterwards. A failed split leaves a connection in
+#      a known-bad state; if that connection is pooled, the NEXT query reads this
+#      one's leftovers.
+#   3. Nothing is cached. This is the one that fails silently — a partial result
+#      committed as complete answers every later identical query with missing
+#      rows and no error at all, which is exactly the failure class splits exist
+#      to prevent. cache/poison*.test guards the same gate for non-split scans;
+#      this is its split-path twin, reached through a different code path.
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# The baseline: with no failure the scan is whole.
+query I
+SELECT count(*) FROM example.main.split_fail_at(n := 80, splits := 8, fail_at := -1);
+----
+80
+
+# Split 5 of 8 fails after emitting rows, so the scan is genuinely partial when
+# it dies — the case a never-partial gate has to survive, as opposed to a failure
+# before any capture began.
+statement error
+SELECT count(*) FROM example.main.split_fail_at(n := 80, splits := 8, fail_at := 5);
+----
+failed mid-stream
+
+# The catalog is still usable. A worker whose connection was poisoned and then
+# pooled would surface here as a wrong answer or a protocol error, not as a
+# repeat of the failure above.
+query II
+SELECT count(*), sum(n) FROM example.main.split_sequence(n := 50, splits := 4);
+----
+50	1225
+
+# ...including the same function, with a different failure point.
+statement error
+SELECT count(*) FROM example.main.split_fail_at(n := 80, splits := 8, fail_at := 2);
+----
+failed mid-stream
+
+query I
+SELECT count(*) FROM example.main.split_fail_at(n := 80, splits := 8, fail_at := -1);
+----
+80
+
+# Nothing was committed to the result cache by either failure. The counter is
+# process-global, so read it as a delta around a repeat of the failing query:
+# an entry stored by the partial scan would make the repeat a HIT.
+statement ok
+CALL enable_logging(level := 'debug');
+
+statement error
+SELECT count(*) FROM example.main.split_fail_at(n := 80, splits := 8, fail_at := 5);
+----
+failed mid-stream
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE type='VGI' AND message LIKE '%result_cache.hit%';
+----
+0
+
+statement ok
+CALL disable_logging();
+
+statement ok
+DETACH example;
