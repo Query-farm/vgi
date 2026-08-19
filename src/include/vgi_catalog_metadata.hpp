@@ -508,11 +508,10 @@ struct VgiScanPlan {
 	std::vector<uint8_t> init_opaque_data;
 	//! Only for diagnostics in the bounds errors.
 	std::string function_name;
-	//! How many splits arrived more than once across pages and were dropped.
-	//! Non-zero means the worker violated the disjointness contract for its
-	//! cursors — survivable, because the duplicates are dropped, but worth
-	//! reporting: the failure it WOULD have caused is duplicate rows.
-	idx_t duplicate_splits = 0;
+	//! How many enumeration pages this plan took. A worker that paginates is
+	//! trading round trips for a smaller peak; seeing the count is how an operator
+	//! tells "one page" from "thirty" without instrumenting the worker.
+	idx_t pages = 0;
 };
 
 struct VgiFunctionInfo {

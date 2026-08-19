@@ -1,0 +1,74 @@
+# name: test/sql/integration/splits/cursor_pagination.test
+# description: A plan enumerated over several pages returns each split exactly once
+# group: [vgi_integration_splits]
+
+# The control for cursor_overlap.test, and the half that runs everywhere.
+#
+# A worker may paginate its enumeration: return some splits plus a cursor, and be
+# asked again. cursor_overlap.test proves the client REFUSES a worker that repeats
+# a split across pages — but that refusal is only meaningful if ordinary pagination
+# still works. A client that rejected every multi-page plan would satisfy those
+# assertions exactly as well, and would be useless.
+#
+# This is also the assertion that survives the transport split. Detecting a repeat
+# needs deterministic token bytes and so is keyless-only; enumerating correctly
+# across pages is transport-independent, and it is the behaviour anyone actually
+# depends on.
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# 12 splits at 4 per page — three pages, none overlapping. Every row exactly once:
+# count(*) is the assertion that matters, since count(DISTINCT) alone would pass
+# even if a page were read twice.
+query III
+SELECT count(*), count(DISTINCT n), sum(n)
+FROM example.main.split_paginated(n := 200, splits := 12);
+----
+200	200	19900
+
+# A page boundary that falls exactly on the split count, so the last page is full
+# and the worker must still say it is finished rather than cursor once more.
+query II
+SELECT count(*), sum(n) FROM example.main.split_paginated(n := 64, splits := 8);
+----
+64	2016
+
+# Fewer splits than one page: the enumeration ends without ever cursoring.
+query II
+SELECT count(*), sum(n) FROM example.main.split_paginated(n := 10, splits := 2);
+----
+10	45
+
+# Under parallelism, where pages are claimed by different readers.
+statement ok
+SET threads=8;
+
+query II
+SELECT count(*), count(DISTINCT n)
+FROM example.main.split_paginated(n := 500, splits := 30);
+----
+500	500
+
+statement ok
+RESET threads;
+
+# Row-for-row identical to the same data enumerated in one page — pagination is an
+# enumeration detail and must not change the answer.
+query I
+SELECT count(*) FROM (
+    SELECT n FROM example.main.split_paginated(n := 100, splits := 12)
+    EXCEPT
+    SELECT n FROM example.main.split_sequence(n := 100, splits := 12)
+);
+----
+0
+
+statement ok
+DETACH example;

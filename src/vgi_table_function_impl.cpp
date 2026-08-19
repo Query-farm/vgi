@@ -2247,7 +2247,7 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 		        {{"function_name", bind_data.function_name},
 		         {"splits", std::to_string(global_state->splits.size())},
 		         {"max_workers", std::to_string(plan.max_workers)},
-		         {"duplicate_splits", std::to_string(plan.duplicate_splits)}});
+		         {"pages", std::to_string(plan.pages)}});
 	}
 	global_state->cache_eligible = cache_eval.eligible; // an eligible non-hit is a genuine miss (EXPLAIN)
 	global_state->dynamic_filters = std::move(dynamic_filters);

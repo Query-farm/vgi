@@ -86,15 +86,24 @@ a pre-update server and is still assumed to speak zstd. The client must downgrad
 request bodies to identity for it; see the renegotiation path in
 `src/vgi_http_client.cpp`. Server logs are at `/tmp/vgi-http-no-compression-server.log`.
 
+**Split disjointness is a worker contract, unchecked by the client.** A paginated
+enumeration must not hand out the same split twice (`next_cursors` must partition
+the remaining splits disjointly); violating it returns duplicate rows. The client
+briefly deduped by token, then refused on a repeat, and neither earned its keep:
+detection needs a set holding a copy of every token beside the vector already
+holding them (hundreds of MB near the split cap, paid by every split scan, to
+police parallel cursor fan-out no client emits); it compares token bytes, so it
+worked on keyless transports and never on the keyed HTTP one a distributed engine
+uses; and the most a client can do with a duplicate is refuse, swapping one worker
+bug for a different error message. It now sits with the worker's other
+obligations — keeping a `SINGLE_VALUE` split single-valued, keeping splits
+replayable, keeping redemption state cross-process — none of which the client
+checks either. `splits/cursor_pagination.test` asserts ordinary multi-page
+enumeration works, on both transports. If a stable split identity ever lands on
+the wire (deterministic sealing, or a plaintext `split_id`), enforcing this
+becomes cheap and uniform and is worth revisiting.
+
 **Known HTTP limitations** (these tests fail over HTTP, not regressions):
-- `splits/cursor_overlap.test` — the client dedups repeated splits by comparing raw
-  token bytes, which only works while tokens are plaintext. A keyed worker (HTTP)
-  seals each payload with a fresh random nonce, so one split minted on two
-  enumeration pages yields two different byte strings and the dedup never fires.
-  A worker that honours the cursor-disjointness contract is unaffected; one that
-  violates it returns duplicate ROWS over HTTP. Fixing it needs a stable split
-  identity — deterministic (SIV-style) sealing, or a plaintext `split_id` on
-  `ScanSplit` — so it is a protocol decision, not a client patch
 - `logging_generator.test` — inline log streaming not supported over HTTP
 - `partitioned_sequence.test` — partition-local state not preserved across HTTP exchanges
 - `buffer_input/sizes.test`, `buffer_input/scale.test_slow` — input buffering semantics differ

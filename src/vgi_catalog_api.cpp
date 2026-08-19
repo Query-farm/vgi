@@ -1180,13 +1180,32 @@ VgiScanPlan InvokeTableFunctionPlan(const CatalogRpcContext &ctx,
 	VgiScanPlan plan;
 	plan.function_name = function_name;
 	std::vector<uint8_t> cursor;
-	// Dedup by token across pages. The disjointness of a paginated enumeration is
-	// a worker obligation with no enforcement, and violating it produces duplicate
-	// ROWS — the exact failure class splits exist to prevent, arriving through the
-	// mechanism meant to make enumeration faster. A hash set is nothing next to a
-	// plan RPC, and it turns a silent correctness bug into a dropped duplicate.
-	duckdb::unordered_set<std::string> seen_tokens;
-	idx_t duplicate_splits = 0;
+	// Split disjointness is the WORKER's obligation and is not policed here.
+	//
+	// A paginated enumeration must not hand out the same split twice; violating
+	// that returns duplicate rows. The client used to dedup by token, then to
+	// refuse on a repeat, and neither earned its keep:
+	//
+	//   It cost every scan to guard an unused one. Detection needs a set holding a
+	//   COPY of every token beside the vector already holding them — on a plan near
+	//   the cap that is hundreds of MB of duplicated bytes plus the hashing, paid by
+	//   every user of every split scan, to police parallel cursor fan-out that no
+	//   client emits.
+	//
+	//   It could not hold uniformly. Detection compares token bytes; a keyless
+	//   worker stamps deterministically and a keyed one seals under a fresh random
+	//   nonce, so the check ran on the development transport and never on the one a
+	//   distributed engine uses.
+	//
+	//   It could not repair anything. The most a client can do with a duplicate is
+	//   refuse the query — swapping one worker bug for a different error message.
+	//
+	// So it is a contract, like the worker's obligation to keep a SINGLE_VALUE
+	// split single-valued before reporting partitioning, or to keep splits
+	// replayable, or to keep redemption state cross-process. None of those are
+	// checked here either. Should a stable split identity ever land on the wire
+	// (deterministic sealing, or a plaintext split_id), enforcing this becomes
+	// cheap and uniform and is worth revisiting; until then it is the worker's.
 	idx_t pages = 0;
 
 	while (true) {
@@ -1226,10 +1245,6 @@ VgiScanPlan InvokeTableFunctionPlan(const CatalogRpcContext &ctx,
 			plan.init_opaque_data = page.init_opaque_data;
 		}
 		for (auto &token : page.splits) {
-			if (!seen_tokens.insert(token).second) {
-				duplicate_splits++;
-				continue;
-			}
 			plan.splits.push_back(std::move(token));
 		}
 
@@ -1239,7 +1254,8 @@ VgiScanPlan InvokeTableFunctionPlan(const CatalogRpcContext &ctx,
 			                  worker_path, static_cast<unsigned long long>(kMaxSplits));
 		}
 
-		plan.duplicate_splits = duplicate_splits;
+
+		plan.pages = pages;
 
 		if (page.next_cursor.empty()) {
 			break;
