@@ -51,6 +51,7 @@ late_mat_dup	Late-materialization table with deliberately non-unique rowid (cont
 late_mat_nulls	Late-materialization table with NULLs in the ord column
 multi_branch_empty	Multi-branch: empty branches list — used by multi_branch_empty_branches.test
 multi_branch_filtered_numbers	Multi-branch with complementary branch_filters — exercises pruning
+multi_branch_format	Format branch: read_csv with delim/header options — used by multi_branch_format.test
 multi_branch_hetero	Multi-branch: sequence(50) + read_parquet — used by multi_branch_heterogeneous.test
 multi_branch_iceberg	Multi-branch: sequence(50) + iceberg_scan — used by multi_branch_iceberg.test
 multi_branch_nopushdown	Multi-branch: VGI + read_csv — used by multi_branch_pushdown_incapable.test

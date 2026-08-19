@@ -2528,6 +2528,29 @@ VgiScanBranchesResult ParseScanBranchesResult(ClientContext &context,
 			auto locs = branch_row["format_locations"].value_or(std::vector<std::string>{});
 			branch.format_locations.assign(locs.begin(), locs.end());
 		}
+		{
+			// Reader options, carried as a 1-row IPC batch whose COLUMN NAMES are
+			// the option names — the same shape as `arguments`, so the same
+			// decoder reads it. Absent / NULL means no options.
+			//
+			// This column existed on neither side for a while: the rewriter has
+			// always consumed `format_options` as the reader's named arguments,
+			// but nothing ever parsed it, so it was permanently empty. Because
+			// the rewriter ASSIGNS rather than merges, that made it impossible to
+			// pass a single reader option to a format branch — `header`, `delim`,
+			// `union_by_name` all silently unreachable.
+			auto opts_bytes = branch_row["format_options"].value_or(std::vector<uint8_t>{});
+			if (!opts_bytes.empty()) {
+				duckdb::vector<Value> unused_positional;
+				DecodeScanArguments(context, opts_bytes, unused_positional, branch.format_options);
+				if (!unused_positional.empty()) {
+					throw BinderException(
+					    "VGI scan branch %d supplied POSITIONAL format_options; reader options are "
+					    "named arguments and must be keyed by name [worker: %s]",
+					    static_cast<int>(result.branches.size()), worker_path);
+				}
+			}
+		}
 
 		// Three-way discriminator, enforced HERE rather than at bind. A branch that
 		// sets two identifying fields is a worker bug; catching it at bind would

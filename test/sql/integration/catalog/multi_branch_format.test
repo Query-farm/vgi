@@ -1,0 +1,83 @@
+# name: test/sql/integration/catalog/multi_branch_format.test
+# description: A format branch reads its locations with the options the worker supplied
+# group: [vgi_integration_catalog]
+
+# A FORMAT branch lets a worker say "these files, this format" without knowing
+# the reader's argument spelling: the client resolves `csv` to read_csv,
+# `parquet` to read_parquet, and so on. That indirection is only useful if the
+# worker can also pass the reader its OPTIONS — a delimiter, a header flag, a
+# column-type override — because a file the reader cannot parse is no more
+# readable for having been named.
+#
+# Those options had no wire column for a long time. Both ends were built: the
+# worker declared `format_options`, and the rewriter consumed it as the reader's
+# named arguments. Nothing carried it between them, so the map arrived
+# permanently empty — and because the rewriter ASSIGNS the reader's named
+# arguments from it rather than merging, a format branch could not pass a single
+# option to its reader. No error; the reader just ran with defaults.
+#
+# The branch sends three options, and only one of them proves anything. DuckDB's
+# CSV sniffer works out the delimiter and the header unaided — I verified by
+# mutation that this file passed with the options thrown away — so those two are
+# realistic but not load-bearing. `nullstr` is the discriminating one: nothing in
+# the data implies it, so the label it names is NULL if and only if the option
+# arrived. It changes nothing else, which keeps the other assertions honest.
+
+require-env VGI_TEST_WORKER
+
+require-env VGI_TEST_BRANCH_DIR
+
+require vgi
+
+require httpfs
+
+statement ok
+COPY (SELECT range AS n, 'row_' || range AS label FROM range(5))
+    TO '${VGI_TEST_BRANCH_DIR}/vgi_format_branch.csv' (FORMAT 'csv', DELIMITER '|', HEADER);
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# Five rows either way — the option under test does not change the shape.
+query I
+SELECT count(*) FROM example.data.multi_branch_format;
+----
+5
+
+# THE assertion. `nullstr` = 'row_2' means that one label reads as NULL, so four
+# of the five are non-null. Without the option every label is a string and this
+# is 5. Nothing in the file hints at it, so the sniffer cannot produce this
+# result by accident.
+query II
+SELECT count(label), count(*) - count(label)
+FROM example.data.multi_branch_format;
+----
+4	1
+
+query I
+SELECT n FROM example.data.multi_branch_format WHERE label IS NULL;
+----
+2
+
+# The delimiter was applied: `label` holds the second field, not the whole line.
+query I
+SELECT label FROM example.data.multi_branch_format WHERE n = 3;
+----
+row_3
+
+# `n` is an integer, so the header named it and the column typed from the data.
+query II
+SELECT min(n), max(n) FROM example.data.multi_branch_format;
+----
+0	4
+
+# The branch is introspectable as a format branch rather than a function one.
+query II
+SELECT function_name = '', branch_index
+FROM vgi_table_branches()
+WHERE table_name = 'multi_branch_format';
+----
+true	0
+
+statement ok
+DETACH example;
