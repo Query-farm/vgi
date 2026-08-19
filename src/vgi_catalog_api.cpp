@@ -1073,7 +1073,7 @@ VgiScanPlanPage ParseVgiScanPlanPage(const std::shared_ptr<arrow::RecordBatch> &
 						throw IOException("VGI worker '%s' returned an unparseable ScanSplit", worker_path);
 					}
 					auto token_col = split_batch->GetColumnByName("token");
-					auto token_arr = std::dynamic_pointer_cast<arrow::LargeBinaryArray>(token_col);
+					auto token_arr = std::dynamic_pointer_cast<arrow::BinaryArray>(token_col);
 					if (!token_arr || token_arr->IsNull(0)) {
 						throw IOException(
 						    "VGI worker '%s' returned a ScanSplit with no token; the framework stamps this, "
