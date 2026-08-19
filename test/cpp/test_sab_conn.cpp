@@ -124,3 +124,103 @@ TEST_CASE("WebWorkerFunctionConnection surfaces a worker produce error", "[sab-c
 	CHECK(threw);
 	CHECK(msg.find("boom") != std::string::npos);
 }
+
+// --- ResetForNextSplit: reuse ONE connection across several splits -----------
+//
+// Greedy per-split claiming re-inits the SAME connection for each split a reader
+// claims, so the reset between them has to leave both rings BETWEEN frames. Get
+// it wrong and the next init request lands inside an unterminated tick stream,
+// or the next stream header reads the previous split's leftover output — both of
+// which hang or mis-frame rather than failing cleanly, and neither of which a
+// browser is a pleasant place to debug.
+//
+// BOTH ARE TAGGED [.] — hidden from a default run, runnable with [sab-split].
+// The CLIENT half is implemented (ResetForNextSplit mirrors PerformFinalizeInit,
+// which is the tested precedent for re-initializing a live SAB connection). What
+// is missing is on the other side of the ring, and these tests pin it precisely:
+// a second PerformInit fails with "Stream header EOF", because the worker's
+// connection has already ended.
+//
+// Traced as far as: the ring itself is NOT closed (vgi_sab_native_ring only
+// EOFs on close_ring, and only w2c is closed, at the very end of serve). The
+// worker exits because vgi-rpc's _serve_one gets None from read_request — it
+// reads an end-of-stream where it expects the next request frame. The client
+// writes that EOS when it terminates its TICK stream, which on a pipe is just
+// framing the next request follows, and on the ring is being read as the end of
+// the conversation.
+//
+// So finishing SAB splits means settling that framing question between the
+// client's tick-stream teardown and the worker's request loop — not more work in
+// ResetForNextSplit. Turning these on is the acceptance test for that change.
+
+TEST_CASE("WebWorkerFunctionConnection re-inits cleanly after a fully drained split",
+          "[.][sab-split]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	ClientContext &context = *con.context;
+
+	ArrowArguments args = BuildArgumentsFromValues(context, {Value::BIGINT(5)});
+	WebWorkerFunctionConnection conn("worker:test", "count_to", args, {}, {}, context, "TABLE");
+	conn.EnsureWorkerSpawned();
+	std::thread worker([]() { vgi_rust_serve_table_sab_slot(0); });
+
+	BindResult bind_result = conn.PerformBindRpc();
+
+	auto drain = [&conn]() {
+		std::vector<int64_t> out;
+		while (auto batch = conn.ReadDataBatch()) {
+			auto col = std::static_pointer_cast<arrow::Int64Array>(batch->column(0));
+			for (int64_t i = 0; i < col->length(); i++) {
+				out.push_back(col->Value(i));
+			}
+		}
+		return out;
+	};
+
+	conn.PerformInit(bind_result);
+	auto first = drain();
+
+	conn.ResetForNextSplit();
+
+	conn.PerformInit(bind_result);
+	auto second = drain();
+
+	worker.join();
+
+	const std::vector<int64_t> want {0, 1, 2, 3, 4};
+	CHECK(first == want);
+	CHECK(second == want);
+}
+
+TEST_CASE("WebWorkerFunctionConnection re-inits after a split whose output was never read",
+          "[.][sab-split]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	ClientContext &context = *con.context;
+
+	ArrowArguments args = BuildArgumentsFromValues(context, {Value::BIGINT(5)});
+	WebWorkerFunctionConnection conn("worker:test", "count_to", args, {}, {}, context, "TABLE");
+	conn.EnsureWorkerSpawned();
+	std::thread worker([]() { vgi_rust_serve_table_sab_slot(0); });
+
+	BindResult bind_result = conn.PerformBindRpc();
+
+	// Init and abandon WITHOUT reading a batch — the shape the reset exists for:
+	// a reader that claimed a split and wanted nothing from it (a LIMIT satisfied,
+	// a filter that pruned everything). The worker's output sits unconsumed on the
+	// w2c ring and the data reader was never opened, so nothing has drained it.
+	conn.PerformInit(bind_result);
+	conn.ResetForNextSplit();
+
+	conn.PerformInit(bind_result);
+	std::vector<int64_t> got;
+	while (auto batch = conn.ReadDataBatch()) {
+		auto col = std::static_pointer_cast<arrow::Int64Array>(batch->column(0));
+		for (int64_t i = 0; i < col->length(); i++) {
+			got.push_back(col->Value(i));
+		}
+	}
+	worker.join();
+
+	CHECK(got == std::vector<int64_t>({0, 1, 2, 3, 4}));
+}

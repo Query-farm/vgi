@@ -676,6 +676,74 @@ void WebWorkerFunctionConnection::PerformFinalizeInit(const BindResult &bind_res
 	PerformInit(bind_result, {}, nullptr, {}, "FINALIZE");
 }
 
+void WebWorkerFunctionConnection::ResetForNextSplit() {
+	if (!init_done_) {
+		ThrowVgiIOException("WebWorkerFunctionConnection::ResetForNextSplit called before PerformInit", location_,
+		                    -1, GetExecutionIdHex());
+	}
+
+	// Sibling of PerformFinalizeInit, and deliberately the same sequence: both
+	// re-initialize a LIVE connection for another stream, so both have to leave
+	// the rings between frames rather than mid-frame. Greedy split claiming reuses
+	// one connection across every split a reader claims, so this runs once per
+	// split boundary.
+
+	// FIRST: close the input writer, which writes the IPC end-of-stream so the
+	// worker's tick reader terminates and returns to its dispatch loop. Doing this
+	// late — or not at all — means PerformInit installs a NEW stream writer over
+	// the same ring while the old stream is still open, and the next init request
+	// lands inside an unterminated tick stream.
+	if (input_writer_ && !input_writer_closed_) {
+		auto close_status = input_writer_->Close();
+		if (!close_status.ok()) {
+			// No poison flag here, unlike the subprocess connection: the SAB
+			// transport is never pooled (ReleaseForPooling returns nullptr — the JS
+			// bridge owns worker lifecycle), so there is no later checkout to
+			// protect. The throw is the whole remedy.
+			ThrowVgiIOException("Failed to close input writer between splits: %s", location_, -1,
+			                    GetExecutionIdHex(), close_status.ToString());
+		}
+	}
+	input_writer_.reset();
+	input_writer_opened_ = false;
+	input_writer_closed_ = false;
+
+	// A split that produced no rows may never have opened the reader, and the
+	// worker's output stream then sits unconsumed on the w2c ring. Open it just to
+	// drain it: otherwise the next split's SabReadStreamHeader reads THIS split's
+	// leftover output as its own header. Exactly the hazard PerformFinalizeInit
+	// documents for the 0-input-row case, reached here by a different route — an
+	// empty split is the likelier shape, since a filter only has to prune one.
+	if (!data_reader_ && slot_ >= 0) {
+		data_stream_ = std::make_shared<SabInputStream>(slot_, &context_);
+		auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(data_stream_);
+		if (reader_result.ok()) {
+			data_reader_ = reader_result.ValueUnsafe();
+		}
+	}
+	while (data_reader_) {
+		auto drain_result = data_reader_->ReadNext();
+		if (!drain_result.ok() || !drain_result.ValueUnsafe().batch) {
+			break;
+		}
+	}
+	data_reader_.reset();
+	data_stream_.reset();
+
+	// Per-init stream state — everything scoped to ONE split's stream, which would
+	// otherwise leak into the next.
+	init_done_ = false;
+	data_finished_ = false;
+	last_batch_index_ = DConstants::INVALID_INDEX;
+	last_partition_values_bytes_.clear();
+	last_cache_control_ = {};
+
+	// NOT cleared, deliberately: the SAB slot and its rings (the transport),
+	// tick_filter_state_ (a shared gstate object PerformInit never touches, so
+	// dynamic join-key pushdown survives into the next split), and substream_id_
+	// (one reader keeps one identity across every split it claims).
+}
+
 std::shared_ptr<arrow::RecordBatch> WebWorkerFunctionConnection::ReadDataBatch() {
 	if (!init_done_) {
 		ThrowVgiIOException("WebWorkerFunctionConnection::ReadDataBatch called before PerformInit", location_, -1,

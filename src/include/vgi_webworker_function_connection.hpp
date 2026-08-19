@@ -86,23 +86,11 @@ public:
 
 	// Set shared state for dynamic filter pushdown via tick batches
 	// Reset per-init stream state, keeping the SAB ring channel.
-	void ResetForNextSplit() override {
-		// Refused rather than approximated.
-		//
-		// The contract's load-bearing step is closing the input writer FIRST, so
-		// the worker's tick reader sees EOS before a new stream is opened over the
-		// same ring. This override did none of that — it cleared the read side and
-		// left the write side open, so PerformInit would install a second stream
-		// writer over an unterminated one and the worker would mis-frame or hang.
-		//
-		// Mirroring the subprocess implementation is probably a few lines, but
-		// "probably" is not good enough in a framing path that can only be
-		// exercised from a browser, and a silent mis-frame is worse than a clear
-		// refusal. A split-capable worker over SAB gets this message instead of a
-		// hang; wiring it properly is a follow-up with an E2E to prove it.
-		throw NotImplementedException(
-		    "split scans are not supported on the web-worker (SharedArrayBuffer) transport");
-	}
+	// Defined out-of-line (vgi_webworker_function_connection.cpp), as a sibling
+	// of PerformFinalizeInit — it is the same problem: re-initialize a LIVE
+	// connection for another stream without leaving the rings mid-frame.
+	void ResetForNextSplit() override;
+
 
 	void SetTickFilterState(shared_ptr<TickFilterState> state) override {
 		tick_filter_state_ = std::move(state);
