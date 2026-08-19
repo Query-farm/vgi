@@ -30,12 +30,18 @@ statement ok
 ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
 # A static filter reaches the worker at all — the baseline.
+#
+# The rendering is the CANONICAL cross-SDK form (`col>=min` / `col<=max` from
+# get_column_bounds, sorted, comma-joined), not any language's own debug output.
+# This used to assert `repr(PushdownFilters)`, which is Python-shaped: no other
+# SDK can reproduce it, so the assertion could only ever pass against the Python
+# worker — in a file whose whole purpose is to run against all five.
 query I
 SELECT DISTINCT pushed_filters
 FROM example.main.split_dynamic_filter(n := 50, splits := 4)
 WHERE n >= 40;
 ----
-PushdownFilters([ConstantFilter(n >= 40)])
+n>=40
 
 # EVERY split sees it, not just the first. Each split re-inits the connection, so
 # a filter attached once at acquire and lost on re-init would show up here as a
@@ -79,13 +85,16 @@ WHERE n >= 190;
 ----
 10	190
 
-# A compound predicate arrives whole rather than half-pushed.
+# A compound predicate arrives whole rather than half-pushed. Note `n < 30`
+# renders as `n<=29`: the canonical form normalizes to INCLUSIVE integer bounds,
+# because that is the only shape every SDK can produce (Rust's ColumnBounds is
+# integer-coerced and carries no inclusive flag at all).
 query I
 SELECT DISTINCT pushed_filters
 FROM example.main.split_dynamic_filter(n := 100, splits := 5)
 WHERE n >= 20 AND n < 30;
 ----
-PushdownFilters([AndFilter(ConstantFilter(n >= 20) AND ConstantFilter(n < 30))])
+n>=20,n<=29
 
 # No predicate means no filter — so "(none)" is a real report rather than the
 # fixture's fallback for everything.
@@ -122,7 +131,7 @@ SELECT DISTINCT pushed_filters
 FROM example.main.split_dynamic_filter(n := 200, splits := 8) s
 JOIN keys ON s.n = keys.k;
 ----
-PushdownFilters([AndFilter(InFilter(n IN [3, 17, 42]) AND ConstantFilter(n >= 3) AND ConstantFilter(n <= 42))])
+n>=3,n<=42
 
 # Every split sees the join keys, not just the first — the same per-re-init
 # question as for static filters, but for a filter that arrives dynamically.
