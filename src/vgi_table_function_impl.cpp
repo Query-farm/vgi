@@ -2585,6 +2585,16 @@ unique_ptr<LocalTableFunctionState> VgiTableFunctionInitLocal(ExecutionContext &
 			// claimed. Initializing here would burn a claim-less init the worker has
 			// no work for.
 			if (bind_data.supports_splits) {
+				// ...which is also why the stale-pool retry below cannot help here:
+				// it wraps an init this path does not perform. Hand the reader the
+				// means to run it itself at the first split's init instead.
+				if (acquired.from_pool) {
+					local_state->reacquire_fresh_connection =
+					    [params](ClientContext &ctx) mutable -> std::unique_ptr<IFunctionConnection> {
+						auto fresh = AcquireConnectionForInit(ctx, params, /*force_fresh=*/true);
+						return std::unique_ptr<IFunctionConnection>(fresh.connection.release());
+					};
+				}
 				return;
 			}
 
@@ -3339,36 +3349,74 @@ static bool AdvanceToNextSplit(ClientContext &context, const VgiTableFunctionBin
 	D_ASSERT(!local_state.has_split || idx > local_state.last_split_index);
 	local_state.last_split_index = idx;
 
-	auto &conn = *local_state.connection();
-	try {
-		// Only reset when there IS a prior stream. On this reader's first claim the
-		// connection was merely acquired (InitLocal is acquire-only on the split
-		// path), so there is nothing to close or drain yet.
-		if (had_split) {
-			conn.ResetForNextSplit();
+	// A pooled worker that died while idle surfaces HERE — this is the split
+	// path's first init — so absorb it exactly as the non-split path does, once,
+	// on the first claim only.
+	auto retry_stale_pooled = [&](const IOException &e) {
+		if (had_split || !local_state.reacquire_fresh_connection) {
+			return false;
 		}
-		// Every per-init input has to be re-supplied: this is a fresh init on the
-		// same connection, so nothing from the previous split carries over except
-		// the transport itself.
-		//
-		// tick_filter_state_ is the exception and is deliberately NOT re-set here —
-		// it is a plain member that PerformInit never touches, so dynamic join-key
-		// pushdown survives into the next split on a reused connection.
-		conn.PerformInit(bind_data.bind_result,          // bind
-		                 global_state.projection_ids,    // projection
-		                 global_state.static_filter_bytes,
-		                 global_state.join_keys_buffers,
-		                 "",                             // phase
-		                 std::nullopt,                   // order_by
-		                 std::nullopt,                   // table_sample
-		                 global_state.init_opaque_data,
-		                 std::nullopt,                   // finalize_state_id
-		                 {global_state.splits[idx]});    // one split per claim
-	} catch (...) {
-		// Do NOT swallow: a failed split init leaves the worker mid-protocol, and
-		// the connection is already marked poisoned so it cannot be pooled.
-		throw;
+		VGI_LOG(context, "worker_pool.stale",
+		        {{"worker_path", bind_data.worker_path()},
+		         {"function_name", bind_data.function_name},
+		         {"phase", "split_init"},
+		         {"error", e.what()}});
+		local_state.prefetch_slot_->connection = local_state.reacquire_fresh_connection(context);
+		local_state.reacquire_fresh_connection = nullptr;
+		local_state.connection()->SetTickFilterState(global_state.tick_filter_state);
+		return true;
+	};
+
+	// Wrapped so the retry above can re-run it against a DIFFERENT connection —
+	// which is why the connection is re-read from the local state each time
+	// rather than bound once outside.
+	auto do_split_init = [&]() {
+		auto &conn = *local_state.connection();
+		try {
+			// Only reset when there IS a prior stream. On this reader's first claim the
+			// connection was merely acquired (InitLocal is acquire-only on the split
+			// path), so there is nothing to close or drain yet.
+			if (had_split) {
+				conn.ResetForNextSplit();
+			}
+			// Every per-init input has to be re-supplied: this is a fresh init on the
+			// same connection, so nothing from the previous split carries over except
+			// the transport itself.
+			//
+			// tick_filter_state_ is the exception and is deliberately NOT re-set here —
+			// it is a plain member that the init never touches, so dynamic join-key
+			// pushdown survives into the next split on a reused connection.
+			conn.PerformInit(bind_data.bind_result,       // bind
+			                 global_state.projection_ids, // projection
+			                 global_state.static_filter_bytes,
+			                 global_state.join_keys_buffers,
+			                 "",             // phase
+			                 std::nullopt,   // order_by
+			                 std::nullopt,   // table_sample
+			                 global_state.init_opaque_data,
+			                 std::nullopt,                // finalize_state_id
+			                 {global_state.splits[idx]}); // one split per claim
+		} catch (...) {
+			// Poison HERE. The comment used to claim this had already happened, and it
+			// had not: the only thing setting the flag was a failed input-writer close
+			// inside ResetForNextSplit, so an init that threw — an interrupt, a partial
+			// write, a worker that died between reset and response — left the
+			// connection looking idle and pooled it with an unanswered init on the
+			// wire. Every path out of a split init now marks it.
+			conn.MarkSplitInitFailed();
+			throw;
+		}
+	};
+
+	try {
+		do_split_init();
+	} catch (const IOException &e) {
+		if (!retry_stale_pooled(e)) {
+			throw;
+		}
+		do_split_init();
 	}
+	local_state.reacquire_fresh_connection = nullptr;
 	local_state.has_split = true;
 	return true;
 }

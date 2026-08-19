@@ -200,6 +200,7 @@ public:
 
 	// Set shared state for dynamic filter pushdown via tick batches
 	void ResetForNextSplit() override;
+	void MarkSplitInitFailed() override;
 
 	void SetTickFilterState(shared_ptr<TickFilterState> state) override {
 		tick_filter_state_ = std::move(state);
@@ -496,13 +497,6 @@ private:
 	// pointer batches against it. Reset between requests. POSIX-only
 	// (shm_open/mmap) — excluded on Windows so the unique_ptr never needs
 	// VgiShmSegment's (POSIX-only) destructor.
-#if VGI_SHM_TRANSPORT
-	std::unique_ptr<class VgiShmSegment> shm_segment_;
-	// Offset of the most-recently-resolved shm batch. Freed when the next
-	// ReadDataBatch is called (lockstep: DuckDB has finished with the
-	// previous chunk before requesting the next), and on connection close.
-	int64_t shm_last_offset_ = -1;
-
 	// INVARIANT 14: a split init (or the reset before it) that failed leaves this
 	// connection in an unknown protocol state. ReleaseForPooling gates on
 	// `init_done_ && !data_finished_`, and ResetForNextSplit clears BOTH before the
@@ -511,7 +505,19 @@ private:
 	// unanswered init request in flight on stdin. The next checkout would then read
 	// this split's init response as its own stream header: silent cross-query
 	// corruption, on the `pool true` default.
+	//
+	// Outside the shm guard: it is read by ReleaseForPooling on every platform,
+	// and declaring it under #if VGI_SHM_TRANSPORT would not have compiled where
+	// shm is off.
 	bool split_reset_failed_ = false;
+
+#if VGI_SHM_TRANSPORT
+	std::unique_ptr<class VgiShmSegment> shm_segment_;
+	// Offset of the most-recently-resolved shm batch. Freed when the next
+	// ReadDataBatch is called (lockstep: DuckDB has finished with the
+	// previous chunk before requesting the next), and on connection close.
+	int64_t shm_last_offset_ = -1;
+
 #endif
 
 	// Stderr reader: owned drainer that spawns a background thread for the

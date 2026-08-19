@@ -71,6 +71,17 @@ public:
 	// read this split's init response as its own stream header.
 	virtual void ResetForNextSplit() = 0;
 
+	//! Mark this connection unusable because a split init failed partway.
+	//!
+	//! ResetForNextSplit clears the in-flight flags before the next init is
+	//! written, so a throw between the two leaves the connection looking IDLE
+	//! with an unanswered init request on the wire. Pooled, the next checkout
+	//! reads that response as its own stream header. The window is not
+	//! hypothetical: an interrupt during a split init reaches it, because the
+	//! read waits on cancellation before consuming anything.
+	virtual void MarkSplitInitFailed() {
+	}
+
 	// Send the VGI bind RPC. Spawns the worker subprocess on first call
 	// (subprocess transport only) and runs the bind protocol — including
 	// any secret-scope retry — returning the resulting BindResult by value.

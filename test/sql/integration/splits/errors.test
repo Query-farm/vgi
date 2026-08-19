@@ -66,6 +66,16 @@ SELECT count(*) FROM example.main.split_fail_at(n := 80, splits := 8, fail_at :=
 statement ok
 CALL enable_logging(level := 'debug');
 
+# Flush FIRST. vgi_result_cache_stats() is process-global, and the HTTP runner
+# executes every .test file in one process — so without this the assertion below
+# reads entries stored by whichever file ran earlier and fails for a reason that
+# has nothing to do with splits. It passed on subprocess only because that runner
+# gives each file its own process, which is luck, not isolation.
+query I
+SELECT flushed >= 0 FROM vgi_result_cache_flush();
+----
+true
+
 statement error
 SELECT count(*) FROM example.main.split_fail_at(n := 80, splits := 8, fail_at := 5);
 ----

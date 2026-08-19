@@ -25,6 +25,14 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 statement ok
 CALL enable_logging(level := 'debug');
 
+# hits/inserts are PROCESS-GLOBAL CUMULATIVE counters, and vgi_result_cache_flush()
+# clears entries without resetting them — so an absolute assertion on either is
+# really an assertion about every file that ran earlier in the same process. The
+# HTTP runner puts the whole suite in one process, so baseline them here and
+# assert on the DELTA below.
+statement ok
+CREATE TEMP TABLE cache_baseline AS SELECT hits, inserts FROM vgi_result_cache_stats();
+
 # Repeat an identical split scan; the answer must not drift.
 query II
 SELECT count(*), sum(n) FROM example.main.split_cacheable(n := 300, splits := 9);
@@ -62,12 +70,14 @@ true
 # Asserted rather than left to be rediscovered. Answers are correct either way —
 # this costs a re-scan, not a wrong result.
 query I
-SELECT inserts > 1 FROM vgi_result_cache_stats();
+SELECT (SELECT inserts FROM vgi_result_cache_stats())
+     - (SELECT inserts FROM cache_baseline) > 1;
 ----
 true
 
 query I
-SELECT hits FROM vgi_result_cache_stats();
+SELECT (SELECT hits FROM vgi_result_cache_stats())
+     - (SELECT hits FROM cache_baseline);
 ----
 0
 

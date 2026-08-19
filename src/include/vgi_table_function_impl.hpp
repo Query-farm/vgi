@@ -721,6 +721,19 @@ struct VgiTableFunctionLocalState : public ArrowScanLocalState {
 		return prefetch_slot_->connection.get();
 	}
 
+	//! Re-acquire this reader's connection, bypassing the pool. Set only on the
+	//! split path, where InitLocal acquires without initializing: a pooled worker
+	//! that died while idle is therefore not discovered until the FIRST split's
+	//! init, long after the non-split path's stale-pool retry has been skipped
+	//! over. Without this a `pool true` scan fails outright on a worker the
+	//! non-split path would have transparently replaced.
+	//!
+	//! Cleared after the first claim. Retrying a LATER split would be wrong twice
+	//! over: the worker has demonstrably answered, so the failure is real rather
+	//! than staleness, and a fresh connection cannot resume the splits this reader
+	//! already drained.
+	std::function<std::unique_ptr<IFunctionConnection>(ClientContext &)> reacquire_fresh_connection;
+
 	//! True while this reader holds a claimed, not-yet-drained split. Kept apart
 	//! from ``last_split_index`` so a reader destroyed mid-split is distinguishable
 	//! from one that finished: only the latter increments ``completed_splits``.

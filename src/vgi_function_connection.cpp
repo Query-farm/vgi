@@ -921,6 +921,10 @@ void FunctionConnection::PerformFinalizeInit(const BindResult &bind_result) {
 	PerformInit(bind_result, {}, nullptr, {}, "FINALIZE");
 }
 
+void FunctionConnection::MarkSplitInitFailed() {
+	split_reset_failed_ = true;
+}
+
 void FunctionConnection::ResetForNextSplit() {
 	if (!init_done_) {
 		ThrowVgiIOException("FunctionConnection::ResetForNextSplit called before PerformInit", worker_path_,
