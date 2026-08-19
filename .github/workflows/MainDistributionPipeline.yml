@@ -46,3 +46,28 @@ jobs:
       use_prebuilt_wasm_image: true
       prebuilt_image_tag: v1.5.5
       extra_toolchains: parser_tools
+      # Make the in-workflow `make test_<build_type>` step actually RUN the
+      # integration suite instead of skipping it.
+      #
+      # Every VGI integration .test file carries `require-env VGI_TEST_WORKER`,
+      # so with no worker on the runner all ~300 of them SKIP and the run is
+      # reported green — "built + header-clean", not "integration suite passed".
+      # That is how the cross-SDK drift in CLAUDE.md accumulated unnoticed.
+      #
+      # This workflow exposes exactly one hook, `test_env_variables` (env vars,
+      # no setup command), so the install itself hangs off a `ci_fixtures`
+      # prerequisite on the inherited test target — see scripts/ci_install_fixtures.sh.
+      # It clones the PUBLIC vgi-python repo (the fixture workers are dev-only
+      # and deliberately absent from the published wheel) and fails loudly if
+      # the worker will not run, because a broken install would otherwise look
+      # identical to success.
+      #
+      # Pin VGI_FIXTURES_REF when the extension needs a worker newer than
+      # vgi-python's main; a protocol mismatch fails the ATTACH with a message
+      # naming both versions.
+      test_config: >-
+        {"test_env_variables": {
+          "VGI_INSTALL_FIXTURES": "1",
+          "VGI_FIXTURES_DIR": "/tmp/vgi-python",
+          "VGI_TEST_WORKER": "uv run --project /tmp/vgi-python vgi-fixture-worker"
+        }}

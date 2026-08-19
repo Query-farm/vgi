@@ -194,17 +194,35 @@ For debugging failures, write standalone `.sql` files in `/tmp/` and run with `.
 
 `.github/workflows/MainDistributionPipeline.yml` gates `header-hygiene`
 (the `header_reach.py --check` guardrail) and `duckdb-stable-build` (the reusable
-distribution build). The distribution build runs the extension's own
-`make test_<build_type>` step, but the VGI integration `.test` files all carry
-`require-env VGI_TEST_WORKER`, so they **skip** in CI unless the fixture workers are
-present — i.e. green CI today means *built + header-clean*, not "integration suite
-passed". Run the integration suite locally (`make test_launcher` / `make
-test_launcher`). Wiring the reusable build's in-workflow test step to actually run
-the suite needs the `vgi-python` fixture workers installed on the runner via the
-reusable workflow's `post_build_command` + `test_config.test_env_variables` hooks
-(the pattern the airport extension uses); the Linux leg's in-docker test step is the
-remaining obstacle (the host-side worker install isn't visible inside that
-container).
+distribution build).
+
+**The integration suite now runs in CI.** Every VGI integration `.test` file
+carries `require-env VGI_TEST_WORKER`, so without a worker on the runner all
+~300 of them SKIP and the run reports green — *built + header-clean*, not
+"integration suite passed". That silent-skip is how the cross-SDK drift above
+accumulated unnoticed, so it is wired shut:
+
+- `scripts/ci_install_fixtures.sh` clones the **public** `vgi-python` repo and
+  `uv sync`s it. The fixture workers are deliberately absent from the published
+  wheel (they would pollute end-user PATH), so they come from that repo's
+  dev-only `packages/vgi-fixtures` sidecar. The script **verifies the worker
+  actually runs** and fails loudly otherwise — a broken install would otherwise
+  be indistinguishable from success, which is the exact failure it exists to
+  prevent. It is a no-op unless `VGI_INSTALL_FIXTURES=1`, so local `make
+  test_release` is unchanged.
+- The reusable workflow exposes exactly ONE hook — `test_config.test_env_variables`
+  (env vars, no setup command) — so the install hangs off a `ci_fixtures`
+  **prerequisite** on the inherited `test_release`/`test_debug`/`test_reldebug`
+  targets rather than a new target CI would have no way to select. This also
+  works for the Linux in-docker leg, where the env vars are forwarded into the
+  container and the install happens inside it.
+- `VGI_FIXTURES_REF` pins the worker revision. It defaults to `main`, so **the
+  extension's protocol version must not run ahead of vgi-python's pushed main** —
+  a mismatch fails ATTACH with a message naming both versions (which is the
+  right failure, but it will fail the build).
+
+Still local-only: the **cross-SDK matrix** (`make test_languages`) — four extra
+toolchains on one runner is its own piece of work.
 
 ## Debug Environment Variables
 

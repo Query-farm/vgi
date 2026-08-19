@@ -389,6 +389,28 @@ test_all_debug: test_spawn_debug test_shm_debug test_http_debug test_http_bearer
 # cached from a prior run is reused regardless of env, so kill stale workers
 # first if switching tiers mid-session.)
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# CI: make the inherited test targets able to run the integration suite.
+#
+# CI invokes `make test_$(BUILD_TYPE)` from extension-ci-tools, and every VGI
+# integration .test file carries `require-env VGI_TEST_WORKER` — so with no
+# worker on the runner they all SKIP, and a green run means "built +
+# header-clean" rather than "integration suite passed".
+#
+# The reusable distribution workflow exposes exactly ONE hook,
+# `test_config.test_env_variables` (env vars, no setup command), which is why
+# this is wired as a PREREQUISITE on the inherited target rather than a new
+# target CI would have no way to select. The script is a no-op unless
+# VGI_INSTALL_FIXTURES=1, so a local `make test_release` is unchanged.
+.PHONY: ci_fixtures
+ci_fixtures:
+	@./scripts/ci_install_fixtures.sh
+
+test_release: ci_fixtures
+test_debug: ci_fixtures
+test_reldebug: ci_fixtures
+# ---------------------------------------------------------------------------
+
 VGI_GO_DIR   ?= $(HOME)/Development/vgi-go
 VGI_TS_DIR   ?= $(HOME)/Development/vgi-typescript
 VGI_JAVA_DIR ?= $(HOME)/vgi-java
