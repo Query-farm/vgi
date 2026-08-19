@@ -1867,12 +1867,24 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 	//
 	// Per-split revalidation is a separate design (it needs per-split validators,
 	// which the entry does not carry).
+	//
+	// An ORDINARY hit is a different matter and IS allowed on the split path: it
+	// short-circuits before the plan RPC is ever issued (the hit branch below
+	// returns the gstate outright), so no split is planned, claimed or redeemed.
+	// The scan simply never becomes a split scan. Gating the whole block on
+	// !split_path — as this once did — cost every split-capable function its
+	// result cache: it populated on every run and served on none, so an identical
+	// repeat re-ran the worker and inserted again.
 	const bool split_path = bind_data.supports_splits;
-	if (cache_eval.eligible && !split_path) {
+	if (cache_eval.eligible) {
 		auto now_tp = std::chrono::steady_clock::now();
 		// Conditional revalidation takes precedence: probe for a stale
 		// revalidatable entry FIRST, because Lookup() drops stale entries.
-		auto reval = VgiResultCache::Instance().LookupForRevalidation(cache_eval.key, now_tp);
+		// Skipped entirely on the split path per the invariant above — and skipped
+		// rather than handled downstream, because LookupForRevalidation() has the
+		// side effect of arming revalidation mode.
+		auto reval = split_path ? nullptr
+		                        : VgiResultCache::Instance().LookupForRevalidation(cache_eval.key, now_tp);
 		if (reval) {
 			// Only worth a conditional round-trip when re-streaming would cost
 			// more than the check — gate on the payload size threshold.
@@ -3431,7 +3443,14 @@ static bool GetNextBatch(ClientContext &context, const VgiTableFunctionBindData 
 	// acquires a connection on this path — there is no primary init to mirror — so
 	// without this the first ReadDataBatch would fire against an uninitialized
 	// connection.
-	if (bind_data.supports_splits && !local_state.has_split) {
+	//
+	// NOT on a cache serve: the connection is a CachedReplayConnection with the
+	// whole result already in hand, and the gstate carries no splits because the
+	// hit short-circuited before the plan RPC. Claiming here would find nothing
+	// and end the reader immediately — turning a hit into an EMPTY RESULT, which
+	// is why serving a split-capable function from cache stayed switched off
+	// until this guard existed.
+	if (bind_data.supports_splits && !global_state.serving_from_cache && !local_state.has_split) {
 		if (!AdvanceToNextSplit(context, bind_data, global_state, local_state)) {
 			// No splits at all, or none left for this reader. Legal: a fully-pruned
 			// scan plans zero splits and must yield an empty result, not an error.

@@ -60,26 +60,37 @@ SELECT entries > 0 FROM vgi_result_cache_stats();
 ----
 true
 
-# KNOWN GAP — a split scan POPULATES the cache but never SERVES from it, so an
-# identical repeat re-runs the worker and inserts again (entries stays 1, inserts
-# climbs). The serve path is gated on `!supports_splits`, which is broader than
-# the invariant requires: only REVALIDATION needs refusing on the split path
-# (the stored entry carries no per-split validators), while an ordinary hit
-# short-circuits the worker before splits are ever planned.
+# The repeat is SERVED, not re-run. A split scan is cacheable like any other:
+# the hit short-circuits inside InitGlobal, before the plan RPC is issued, so the
+# scan simply never becomes a split scan — no plan, no claim, no redemption.
 #
-# Asserted rather than left to be rediscovered. Answers are correct either way —
-# this costs a re-scan, not a wrong result.
+# This used to be switched off (the whole serve path was gated on
+# `!supports_splits`), which cost every split-capable function its cache: it
+# populated on every run and served on none. Only REVALIDATION genuinely needs
+# refusing here, because the stored entry carries no per-split validators.
+#
+# Three identical scans have run above: one insert, two hits. Asserting the
+# INSERT count is what pins the fix — a scan that re-ran the worker would insert
+# again, which is precisely what the old behaviour did on every repeat.
 query I
 SELECT (SELECT inserts FROM vgi_result_cache_stats())
-     - (SELECT inserts FROM cache_baseline) > 1;
+     - (SELECT inserts FROM cache_baseline);
 ----
-true
+1
 
 query I
 SELECT (SELECT hits FROM vgi_result_cache_stats())
      - (SELECT hits FROM cache_baseline);
 ----
-0
+2
+
+# The served rows are the SAME rows — a serve that dropped or duplicated a
+# split's worth of output would still register as a hit.
+query III
+SELECT count(*), count(DISTINCT n), sum(n)
+FROM example.main.split_cacheable(n := 300, splits := 9);
+----
+300	300	44850
 
 # The plan RPC is observable, so a split scan is provably taking the split path
 # rather than silently falling back.
