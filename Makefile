@@ -392,8 +392,9 @@ test_all_debug: test_spawn_debug test_shm_debug test_http_debug test_http_bearer
 VGI_GO_DIR   ?= $(HOME)/Development/vgi-go
 VGI_TS_DIR   ?= $(HOME)/Development/vgi-typescript
 VGI_JAVA_DIR ?= $(HOME)/vgi-java
+VGI_RUST_DIR ?= $(HOME)/Development/vgi-rust
 
-.PHONY: test_python test_go test_typescript test_java test_languages
+.PHONY: test_python test_go test_typescript test_java test_rust test_languages
 
 # Python uses this repo's default worker set — run the launcher suite directly.
 test_python: test_launcher
@@ -407,12 +408,19 @@ test_typescript:
 test_java:
 	$(MAKE) -C $(VGI_JAVA_DIR) test
 
+# Rust has no Makefile of its own — build the example worker and point the
+# suite at it directly. Same .test files, only the worker differs.
+test_rust:
+	cd $(VGI_RUST_DIR) && cargo build -p vgi-example-worker
+	VGI_TEST_WORKER="$(VGI_RUST_DIR)/target/debug/vgi-example-worker" \
+	    python3 scripts/run_tests.py -j 6 "test/sql/integration/*"
+
 # Run the integration suite against every language implementation. Keeps going
 # on failure so one language's result doesn't mask the others, then exits
 # non-zero if any failed.
 test_languages:
 	@rc=0; \
-	for t in test_python test_go test_typescript test_java; do \
+	for t in test_python test_go test_rust test_typescript test_java; do \
 		echo "==================== $$t ===================="; \
 		$(MAKE) $$t || rc=$$?; \
 	done; \

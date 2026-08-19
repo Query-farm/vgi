@@ -61,6 +61,37 @@ non-integration tests.
 The `VGI_TEST_WORKER` env var controls which worker is used. It defaults to
 `uv run --project ~/Development/vgi-python vgi-fixture-worker` and can be overridden.
 
+### Cross-SDK conformance (`make test_languages`)
+
+**The `.test` files ARE the cross-SDK conformance suite.** Every one carries
+`require-env VGI_TEST_WORKER`, so the same files run unchanged against the
+Python, Rust, Go, TypeScript and Java workers — a wire disagreement between two
+SDKs shows up as the same named test failing under one of them.
+
+```bash
+make test_languages          # every SDK, keeps going on failure
+make test_rust               # one leg (also: test_python/test_go/test_typescript/test_java)
+```
+
+**Run it after touching anything on the wire.** The matrix is the only thing that
+catches drift, and adding more *cases* to the Python suite does not substitute
+for it — a bug that lives in one SDK's serializer is invisible to every test that
+only ever runs against Python. Concretely, when the splits work first ran this
+matrix end to end it found **13 real bugs** across four SDKs, none of them
+fixture problems: dead hooks that were declared and never invoked (TypeScript's
+`plan`, Java's `onSplit`), hand-written request schemas drifted from the
+generated ones so a correct client was rejected at the first catalog call
+(TypeScript, Java), a `ScanBranchSchema` column added by P4 and never supplied so
+*every* multi-branch table died in Arrow's writer (TypeScript), `get_column_bounds`
+ignoring `IN` sets so join-key pushdown silently pruned nothing (Go), exclusive
+comparisons reported as inclusive (Rust), and the split consistency anchor
+minted and verified from different values in three SDKs at once.
+
+Two of those SDKs could not complete a single catalog call, which is the tell:
+the matrix had the machinery but nothing ran it, so the failures accumulated
+silently. It is not wired into CI yet (four toolchains on one runner); until it
+is, running it locally is the guardrail.
+
 ### HTTP Transport
 
 ```bash
