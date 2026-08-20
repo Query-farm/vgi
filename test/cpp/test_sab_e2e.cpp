@@ -40,7 +40,13 @@ TEST_CASE("C++ producer client <-> Rust serve_sab (count_to) over the ring", "[s
 	REQUIRE(tb.Append(3).ok());
 	std::shared_ptr<arrow::Array> ta;
 	REQUIRE(tb.Finish(&ta).ok());
-	auto params = arrow::RecordBatch::Make(arrow::schema({arrow::field("total", arrow::int64())}), 1, {ta});
+	// The nullable flag is load-bearing on an RPC params batch: vgi-rpc
+	// validates it field-by-field before dispatch, and Arrow's two-argument
+	// arrow::field() defaults to NULLABLE while the Rust #[service]-derived
+	// schema declares <i64 as VgiArrow>::nullable() == false. A mismatch is
+	// answered with an exception envelope, whose 0-column batch then
+	// segfaults the column(0) read below rather than failing legibly.
+	auto params = arrow::RecordBatch::Make(arrow::schema({arrow::field("total", arrow::int64(), /*nullable=*/false)}), 1, {ta});
 	std::vector<uint8_t> req = SerializeRpcRequest("count_to", params);
 
 	auto out = std::make_shared<SabOutputStream>(slot);
@@ -100,7 +106,7 @@ TEST_CASE("unary RPC then producer RPC on one slot (bind->init sequencing)", "[s
 		REQUIRE(xb.Append(41).ok());
 		std::shared_ptr<arrow::Array> xa;
 		REQUIRE(xb.Finish(&xa).ok());
-		auto params = arrow::RecordBatch::Make(arrow::schema({arrow::field("x", arrow::int64())}), 1, {xa});
+		auto params = arrow::RecordBatch::Make(arrow::schema({arrow::field("x", arrow::int64(), /*nullable=*/false)}), 1, {xa});
 		auto req = SerializeRpcRequest("add_one", params);
 
 		auto out = std::make_shared<SabOutputStream>(slot);
@@ -124,7 +130,7 @@ TEST_CASE("unary RPC then producer RPC on one slot (bind->init sequencing)", "[s
 		REQUIRE(tb.Append(3).ok());
 		std::shared_ptr<arrow::Array> ta;
 		REQUIRE(tb.Finish(&ta).ok());
-		auto params = arrow::RecordBatch::Make(arrow::schema({arrow::field("total", arrow::int64())}), 1, {ta});
+		auto params = arrow::RecordBatch::Make(arrow::schema({arrow::field("total", arrow::int64(), /*nullable=*/false)}), 1, {ta});
 		auto req = SerializeRpcRequest("count_to", params);
 
 		auto out = std::make_shared<SabOutputStream>(slot); // fresh stream, same slot
@@ -172,7 +178,7 @@ TEST_CASE("exchange RPC (scale) over the ring", "[sab-e2e]") {
 	REQUIRE(fb.Append(10.0).ok());
 	std::shared_ptr<arrow::Array> fa;
 	REQUIRE(fb.Finish(&fa).ok());
-	auto params = arrow::RecordBatch::Make(arrow::schema({arrow::field("factor", arrow::float64())}), 1, {fa});
+	auto params = arrow::RecordBatch::Make(arrow::schema({arrow::field("factor", arrow::float64(), /*nullable=*/false)}), 1, {fa});
 	auto req = SerializeRpcRequest("scale", params);
 
 	auto out = std::make_shared<SabOutputStream>(slot);

@@ -853,6 +853,37 @@ impl TableFunction for ClientGeo {
     }
 }
 
+/// Mark every fixture function unlisted.
+///
+/// These workers are driven by a C++ client that binds *directly* by function
+/// name — it never attaches a catalog, so it has no owning schema to send and
+/// `BindRequest.schema_name` arrives null. Since vgi-rust b181bb9 ("every
+/// function has exactly one home") a bind with no schema_name is refused
+/// unless the function is a COPY handler, a pre-1.1.0 peer, or hidden from the
+/// catalog listing. Hiding is the accurate one here: this worker publishes no
+/// catalog listing at all.
+fn hide_all(worker: &mut vgi::Worker) {
+    for name in [
+        "count_to",
+        "emit_batches",
+        "boom",
+        "slow_count",
+        "peek_max_concurrency",
+        "parallel_probe",
+        "sab_double",
+        "sab_echo",
+        "sab_sum",
+        "sab_big",
+        "sab_cached",
+        "browser_info",
+        "client_random",
+        "client_fetch",
+        "client_geo",
+    ] {
+        worker.hide_function(name);
+    }
+}
+
 /// Serve one slot to completion, then EOS the output ring. Blocking; run on a thread.
 #[no_mangle]
 pub extern "C" fn vgi_rust_serve_table_sab_slot(slot: i32) {
@@ -878,6 +909,7 @@ pub extern "C" fn vgi_rust_serve_table_sab_slot(slot: i32) {
     worker.register_table(ClientGeo);
     // No set_catalog: the dispatcher installs a default CatalogModel, and the C++
     // client binds `count_to` directly by name against the dispatch registry.
+    hide_all(&mut worker);
     worker.serve_reader_writer(SabReader { slot }, SabWriter { slot });
     unsafe { vgi_sab_worker_close(slot) };
 }
