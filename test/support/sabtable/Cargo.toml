@@ -21,13 +21,13 @@ path = "src/lib.rs"
 # staticlib builds with no heavy/C deps.
 vgi = { path = "../../../../vgi-rust/vgi", default-features = false }
 # Must match the exact vgi-rpc that `vgi` resolves to (the local checkout via
-# the [patch.crates-io] below — 0.22.0 today) so the `OutputCollector` /
+# the [patch.crates-io] below — 0.23.0 today) so the `OutputCollector` /
 # `Result` / `RpcError` types are one crate instance, not two. A stale version
 # requirement here silently resolves a SECOND vgi-rpc from crates.io and the
 # build fails on mismatched `RpcError`/`TableProducer` types.
 # Still default-features = false: no `http`, so no axum/tokio/zstd. `vgi` pulls
 # in `crypto` (AEAD split tokens, server-stack-free) via feature unification.
-vgi-rpc = { version = "0.22.0", default-features = false, features = ["macros", "stream-codec"] }
+vgi-rpc = { version = "0.23.0", default-features = false, features = ["macros", "stream-codec"] }
 arrow-array = "59"
 arrow-schema = "59"
 serde = { version = "1", features = ["derive"] }

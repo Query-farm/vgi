@@ -44,6 +44,13 @@ TEST_CASE("WebWorkerFunctionConnection drives count_to(5) over the ring", "[sab-
 	    new WebWorkerFunctionConnection("worker:test", "count_to", args, {}, {}, context, "TABLE"));
 	auto &conn = *conn_owned;
 	conn.EnsureWorkerSpawned(); // claims slot 0 (only connection in this test)
+	// Name the owning schema, exactly as the catalog path does
+	// (FunctionConnectionParams::schema_name -> SetSchemaName). Since
+	// vgi-rust b181bb9 a bind carrying no schema_name is refused, because
+	// resolving by bare name is how example.data.f() lands on
+	// example.main.f(). ATTACH is the only way to reach a worker from SQL,
+	// so a bind without one no longer describes anything reachable.
+	conn.SetSchemaName("main");
 	std::thread worker([]() { vgi_rust_serve_table_sab_slot(0); });
 
 	// bind -> init -> producer scan through the real IFunctionConnection API.
@@ -82,6 +89,7 @@ TEST_CASE("WebWorkerFunctionConnection streams a multi-batch producer", "[sab-co
 	    new WebWorkerFunctionConnection("worker:test", "emit_batches", args, {}, {}, context, "TABLE"));
 	auto &conn = *conn_owned;
 	conn.EnsureWorkerSpawned();
+	conn.SetSchemaName("main"); // see the first case
 	std::thread worker([]() { vgi_rust_serve_table_sab_slot(0); });
 
 	BindResult bind_result = conn.PerformBindRpc();
@@ -126,6 +134,7 @@ TEST_CASE("WebWorkerFunctionConnection surfaces a worker produce error", "[sab-c
 	    new WebWorkerFunctionConnection("worker:test", "boom", args, {}, {}, context, "TABLE"));
 	auto &conn = *conn_owned;
 	conn.EnsureWorkerSpawned();
+	conn.SetSchemaName("main"); // see the first case
 	std::thread worker([]() { vgi_rust_serve_table_sab_slot(0); });
 
 	bool threw = false;
@@ -190,6 +199,7 @@ TEST_CASE("WebWorkerFunctionConnection re-inits cleanly after a fully drained sp
 	    new WebWorkerFunctionConnection("worker:test", "count_to", args, {}, {}, context, "TABLE"));
 	auto &conn = *conn_owned;
 	conn.EnsureWorkerSpawned();
+	conn.SetSchemaName("main"); // see the first case
 	std::thread worker([]() { vgi_rust_serve_table_sab_slot(0); });
 
 	BindResult bind_result = conn.PerformBindRpc();
@@ -237,6 +247,7 @@ TEST_CASE("WebWorkerFunctionConnection re-inits after a split whose output was n
 	    new WebWorkerFunctionConnection("worker:test", "count_to", args, {}, {}, context, "TABLE"));
 	auto &conn = *conn_owned;
 	conn.EnsureWorkerSpawned();
+	conn.SetSchemaName("main"); // see the first case
 	std::thread worker([]() { vgi_rust_serve_table_sab_slot(0); });
 
 	BindResult bind_result = conn.PerformBindRpc();
