@@ -592,9 +592,8 @@ Caches the **complete result** of a table-function scan when the worker advertis
 `vgi.cache.*` metadata on its result's first batch, then serves identical future scans from
 memory (or disk) — skipping the worker round-trip entirely on a fresh hit. Modeled on HTTP caching;
 opt-in per result, on by default, per-catalog opt-out via the `cache` ATTACH option.
-**Implemented:** in-memory + content-addressed disk tiers; catalog-attached **and** direct
-`vgi_table_function()` paths; static-pushdown keying (filter/order/sample); projection-coverage
-reuse; conditional revalidation (304); HTTP serve. Design notes:
+**Implemented:** in-memory + content-addressed disk tiers; static-pushdown keying
+(filter/order/sample); projection-coverage reuse; conditional revalidation (304); HTTP serve. Design notes:
 `~/.claude/plans/i-want-to-add-twinkly-cascade.md`.
 
 **Metadata vocabulary (`vgi.cache.*`, on the first data batch):** `ttl` (opt-in + freshness
@@ -822,9 +821,8 @@ store + its ref-count cap. The whole-scan entry still persists to disk (cross-pr
 full/identical-filter repeats). Enumeration is `=`/`IN`/`OR`-of-those only — note DuckDB rewrites a
 **contiguous-integer** `IN` (e.g. `year IN (2020,2021)`) into a `BETWEEN` range, which is correctly
 non-enumerable (a gap keeps it an `IN_FILTER`). `IS NULL`, ordered/sampled scans, transaction scope,
-and M6 revalidation are out of scope. The **direct `vgi_table_function()` path does NOT split** —
-`partition_column_indices` is resolved only on the catalog-attached bind path — so it uses whole-scan
-caching only. Like the whole producer cache, table-function entries key on worker-path identity (with
+and M6 revalidation are out of scope. Like the whole producer cache, table-function entries key on
+worker-path identity (with
 the auth-principal fingerprint folded in, so cross-identity isolation holds) and are TTL-only, so
 `vgi_clear_cache()` (which flushes by catalog alias) doesn't drop them — TTL/worker freshness governs.
 
@@ -1066,7 +1064,6 @@ The `launch:` and `unix://` paths share one warm worker process across every Duc
 
 | Function | Type | Description |
 |----------|------|-------------|
-| `vgi_table_function(worker_path, function_name, args)` | Table | Direct table function execution. `worker_path` accepts any LOCATION scheme incl. `oci://` (container resolved on first use with default options) |
 | `vgi_catalogs(worker_path)` | Table | List available catalogs from a worker. `worker_path` accepts any LOCATION scheme incl. `oci://` (container resolved on first use with default options) |
 | `vgi_worker_pool()` | Table | Diagnostic: list **subprocess**-pooled workers (worker_path, pid, age_seconds). Returns no rows for `launch:` / `unix://` transports — see *Transports* section. |
 | `vgi_worker_pool_stats()` | Table | Diagnostic: hit/miss statistics by worker_path. Subprocess pool only. |
@@ -1107,7 +1104,6 @@ The `launch:` and `unix://` paths share one warm worker process across every Duc
 | `vgi_worker_pool_functions.cpp` | Pool diagnostic SQL functions |
 | `vgi_github.cpp` | `github://` / `github-auto://` transport (subprocess-capable platforms incl. Windows): coordinate parsing, `github-auto://` convention name-building from `DuckDB::Platform()` (`.zip` on Windows, `.tar.gz` else), authenticated GitHub API GET (+ reuse of `HttpGetBytes` for CDN downloads), SHA256 verify-before-extract, full-tree USTAR + miniz `.zip` extractors with path sanitization, and the content-digest-keyed atomic-directory cache. File I/O via DuckDB's cross-platform `FileSystem` (`CreateLocal()`; cross-process write-lock); only `chmod`/tar-symlink/macOS-codesign stay POSIX (`#if VGI_POSIX_TRANSPORT`). Exposes `ResolveWorkerPath()` (called at both spawn sites: `EnsureWorkerSpawned` + `AttemptUnaryRpc`). See [docs/github-transport.md](docs/github-transport.md) |
 | `vgi_github_functions.cpp` | `vgi_github_cache()` / `vgi_github_cache_flush()` SQL diagnostics |
-| `vgi_table_function.cpp` | Direct `vgi_table_function()` SQL function |
 | `vgi_table_function_impl.cpp` | Shared table function logic (bind/init/scan) |
 | `vgi_scalar_function_impl.cpp` | Scalar function bind/execute with dynamic types and const params |
 | `vgi_aggregate_function_impl.cpp` | Aggregate function bind / update / combine / finalize / destructor RPC client |
@@ -1554,6 +1550,22 @@ plus the `parent_row` parse in `vgi_function_connection.cpp` /
 ### Catalog Integration
 
 Workers expose functions via `ATTACH 'catalog_name' AS name (TYPE vgi, LOCATION 'worker_path')`. The storage layer (`storage/*`) maps worker-provided metadata to DuckDB's catalog interface.
+
+**ATTACH is the only way in — there is no standalone call form.** `vgi_table_function(worker_path,
+fn, args)` was removed in `faf6496` (2026-07-23) and is not coming back. It was the only such
+surface — there was never a scalar, table-in-out, aggregate or COPY equivalent — so it was already
+asymmetric and second-class, and everything added at catalog level (statistics, time travel,
+constraints, multi-branch, write functions, COPY formats) was unreachable through it. Structurally
+it could name neither a schema nor a catalog, so a worker serving two catalogs that both declare
+`main.<fn>` had one of them permanently unreachable. Its last niche was the catalog-less worker
+(`catalog_interface=None` + `catalog_name=None`), which cannot be ATTACHed at all — and that is
+exactly the case where a catalog argument is meaningless; such workers stay reachable from the
+pure-Python `Client`, which binds by `(schema, name)` with no attachment, and vgi-python documents
+that they are not reachable from SQL.
+
+Note `vgi_table_scan` still exists but is **not** that function returning: it is a synthetic entry
+the catalog layer registers so a bound catalog table can be re-planned by name (see
+`storage/vgi_table_entry.cpp`), and it takes no user-facing arguments.
 
 ### Worker Connection Pool
 
