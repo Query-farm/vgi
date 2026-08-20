@@ -38,7 +38,11 @@ TEST_CASE("WebWorkerFunctionConnection drives count_to(5) over the ring", "[sab-
 	// count_to(n=5): a single const i64 argument.
 	ArrowArguments args = BuildArgumentsFromValues(context, {Value::BIGINT(5)});
 
-	WebWorkerFunctionConnection conn("worker:test", "count_to", args, {}, {}, context, "TABLE");
+	// unique_ptr(new …) rather than make_unique: the braced {} arguments are
+	// non-deducible through make_unique's parameter pack.
+	std::unique_ptr<WebWorkerFunctionConnection> conn_owned(
+	    new WebWorkerFunctionConnection("worker:test", "count_to", args, {}, {}, context, "TABLE"));
+	auto &conn = *conn_owned;
 	conn.EnsureWorkerSpawned(); // claims slot 0 (only connection in this test)
 	std::thread worker([]() { vgi_rust_serve_table_sab_slot(0); });
 
@@ -55,6 +59,10 @@ TEST_CASE("WebWorkerFunctionConnection drives count_to(5) over the ring", "[sab-
 		}
 	}
 
+	// Release the connection BEFORE joining: the worker serves until the c2w
+	// ring closes, and that is the connection's teardown, not the end of a
+	// stream. Holding it here would wait on a worker still waiting on us.
+	conn_owned.reset();
 	worker.join();
 	CHECK(got == std::vector<int64_t>({0, 1, 2, 3, 4}));
 }
@@ -68,7 +76,11 @@ TEST_CASE("WebWorkerFunctionConnection streams a multi-batch producer", "[sab-co
 	// 3 batches (count_to emits a single batch — this exercises the multi-batch path).
 	ArrowArguments args = BuildArgumentsFromValues(context, {Value::BIGINT(3), Value::BIGINT(4)});
 
-	WebWorkerFunctionConnection conn("worker:test", "emit_batches", args, {}, {}, context, "TABLE");
+	// unique_ptr(new …) rather than make_unique: the braced {} arguments are
+	// non-deducible through make_unique's parameter pack.
+	std::unique_ptr<WebWorkerFunctionConnection> conn_owned(
+	    new WebWorkerFunctionConnection("worker:test", "emit_batches", args, {}, {}, context, "TABLE"));
+	auto &conn = *conn_owned;
 	conn.EnsureWorkerSpawned();
 	std::thread worker([]() { vgi_rust_serve_table_sab_slot(0); });
 
@@ -84,6 +96,10 @@ TEST_CASE("WebWorkerFunctionConnection streams a multi-batch producer", "[sab-co
 			got.push_back(col->Value(i));
 		}
 	}
+	// Release the connection BEFORE joining: the worker serves until the c2w
+	// ring closes, and that is the connection's teardown, not the end of a
+	// stream. Holding it here would wait on a worker still waiting on us.
+	conn_owned.reset();
 	worker.join();
 
 	CHECK(num_batches == 3);
@@ -104,7 +120,11 @@ TEST_CASE("WebWorkerFunctionConnection surfaces a worker produce error", "[sab-c
 	// empty result.
 	ArrowArguments args = BuildArgumentsFromValues(context, {});
 
-	WebWorkerFunctionConnection conn("worker:test", "boom", args, {}, {}, context, "TABLE");
+	// unique_ptr(new …) rather than make_unique: the braced {} arguments are
+	// non-deducible through make_unique's parameter pack.
+	std::unique_ptr<WebWorkerFunctionConnection> conn_owned(
+	    new WebWorkerFunctionConnection("worker:test", "boom", args, {}, {}, context, "TABLE"));
+	auto &conn = *conn_owned;
 	conn.EnsureWorkerSpawned();
 	std::thread worker([]() { vgi_rust_serve_table_sab_slot(0); });
 
@@ -119,6 +139,10 @@ TEST_CASE("WebWorkerFunctionConnection surfaces a worker produce error", "[sab-c
 		threw = true;
 		msg = e.what();
 	}
+	// Release the connection BEFORE joining: the worker serves until the c2w
+	// ring closes, and that is the connection's teardown, not the end of a
+	// stream. Holding it here would wait on a worker still waiting on us.
+	conn_owned.reset();
 	worker.join();
 
 	CHECK(threw);
@@ -154,13 +178,17 @@ TEST_CASE("WebWorkerFunctionConnection surfaces a worker produce error", "[sab-c
 // ResetForNextSplit. Turning these on is the acceptance test for that change.
 
 TEST_CASE("WebWorkerFunctionConnection re-inits cleanly after a fully drained split",
-          "[.][sab-split]") {
+          "[sab-conn][sab-split]") {
 	DuckDB db(nullptr);
 	Connection con(db);
 	ClientContext &context = *con.context;
 
 	ArrowArguments args = BuildArgumentsFromValues(context, {Value::BIGINT(5)});
-	WebWorkerFunctionConnection conn("worker:test", "count_to", args, {}, {}, context, "TABLE");
+	// unique_ptr(new …) rather than make_unique: the braced {} arguments are
+	// non-deducible through make_unique's parameter pack.
+	std::unique_ptr<WebWorkerFunctionConnection> conn_owned(
+	    new WebWorkerFunctionConnection("worker:test", "count_to", args, {}, {}, context, "TABLE"));
+	auto &conn = *conn_owned;
 	conn.EnsureWorkerSpawned();
 	std::thread worker([]() { vgi_rust_serve_table_sab_slot(0); });
 
@@ -185,6 +213,10 @@ TEST_CASE("WebWorkerFunctionConnection re-inits cleanly after a fully drained sp
 	conn.PerformInit(bind_result);
 	auto second = drain();
 
+	// Release the connection BEFORE joining: the worker serves until the c2w
+	// ring closes, and that is the connection's teardown, not the end of a
+	// stream. Holding it here would wait on a worker still waiting on us.
+	conn_owned.reset();
 	worker.join();
 
 	const std::vector<int64_t> want {0, 1, 2, 3, 4};
@@ -193,13 +225,17 @@ TEST_CASE("WebWorkerFunctionConnection re-inits cleanly after a fully drained sp
 }
 
 TEST_CASE("WebWorkerFunctionConnection re-inits after a split whose output was never read",
-          "[.][sab-split]") {
+          "[sab-conn][sab-split]") {
 	DuckDB db(nullptr);
 	Connection con(db);
 	ClientContext &context = *con.context;
 
 	ArrowArguments args = BuildArgumentsFromValues(context, {Value::BIGINT(5)});
-	WebWorkerFunctionConnection conn("worker:test", "count_to", args, {}, {}, context, "TABLE");
+	// unique_ptr(new …) rather than make_unique: the braced {} arguments are
+	// non-deducible through make_unique's parameter pack.
+	std::unique_ptr<WebWorkerFunctionConnection> conn_owned(
+	    new WebWorkerFunctionConnection("worker:test", "count_to", args, {}, {}, context, "TABLE"));
+	auto &conn = *conn_owned;
 	conn.EnsureWorkerSpawned();
 	std::thread worker([]() { vgi_rust_serve_table_sab_slot(0); });
 
@@ -220,6 +256,10 @@ TEST_CASE("WebWorkerFunctionConnection re-inits after a split whose output was n
 			got.push_back(col->Value(i));
 		}
 	}
+	// Release the connection BEFORE joining: the worker serves until the c2w
+	// ring closes, and that is the connection's teardown, not the end of a
+	// stream. Holding it here would wait on a worker still waiting on us.
+	conn_owned.reset();
 	worker.join();
 
 	CHECK(got == std::vector<int64_t>({0, 1, 2, 3, 4}));

@@ -322,8 +322,16 @@ WebWorkerFunctionConnection::WebWorkerFunctionConnection(
 }
 
 WebWorkerFunctionConnection::~WebWorkerFunctionConnection() {
-	// Release the SAB slot (state -> free). Idempotent; safe if never opened.
 	if (slot_ >= 0) {
+		// Ring EOF on client->worker: the worker's serve loop reads it as the end
+		// of the CONVERSATION and returns, which is what lets it free the slot.
+		// This belongs here rather than at the end of a producer stream — a
+		// connection outlives its streams (every split a reader claims re-inits
+		// this same connection), so closing the ring per stream would end the
+		// worker after the first one. Idempotent, so a connection already torn
+		// down through CloseInputWriter is unaffected.
+		vgi_wasm_slot_write_eos(slot_);
+		// Release the SAB slot (state -> free). Idempotent; safe if never opened.
 		vgi_wasm_slot_release(slot_);
 		slot_ = -1;
 	}
@@ -795,15 +803,25 @@ std::shared_ptr<arrow::RecordBatch> WebWorkerFunctionConnection::ReadDataBatch()
 		}
 	};
 
-	// At producer EOS the worker's serve turn does a final input_reader.drain();
-	// close our tick stream (Arrow EOS marker) + the c2w ring (EOF) so that drain
-	// returns and the worker frees the slot. Without this the worker blocks
-	// forever in drain() (the subprocess path handles this via pooling teardown).
+	// At producer EOS the worker's serve turn does a final input_reader.drain(),
+	// so close our tick stream — the Arrow IPC end-of-stream marker is what makes
+	// that drain return.
+	//
+	// It closes the STREAM, not the ring. This used to also close c2w
+	// (vgi_wasm_slot_write_eos), which ends the worker's whole serve loop —
+	// making one producer stream per connection a structural limit, and split
+	// scans impossible on this transport, since greedy claiming re-inits the same
+	// connection per split.
+	//
+	// The ring close was never needed for drain: vgi-rpc's read_message_bytes
+	// treats a continuation marker with size 0 — exactly what Close() writes — as
+	// end-of-stream and returns None, so drain() terminates on the Arrow marker
+	// alone. The ring EOF is a CONNECTION-level signal and now happens where it
+	// belongs, in the destructor.
 	auto finish_producer_input = [this]() {
 		if (is_producer_mode_ && input_writer_ && !input_writer_closed_) {
 			(void)input_writer_->Close();
 			input_writer_closed_ = true;
-			vgi_wasm_slot_write_eos(slot_);
 		}
 	};
 
