@@ -1,0 +1,79 @@
+# name: test/sql/integration/http/producer_turns.test
+# description: A producer stream is delivered incrementally over HTTP, not in one body
+# group: [vgi_integration_http]
+#
+# A producer's /init must return ONE produce cycle plus a continuation cursor,
+# and the rest must arrive on later turns. A worker that instead drains the
+# whole stream into the /init response looks completely correct — same rows,
+# same order, every row-level assertion in the suite green — while breaking
+# three things that no row assertion can see:
+#
+#   1. Parallelism. HTTP fan-out is N connections pulling turns against the
+#      worker's shared per-execution_id work queue. If the primary drains that
+#      queue inside its own /init, the secondaries connect to an empty queue and
+#      the scan silently runs single-threaded.
+#   2. Memory. The entire result is materialised on both ends — fine for a
+#      fixture, fatal for a real scan.
+#   3. Cancellation. The producer-cancellation contract needs the worker to
+#      yield a turn; one that never yields can never be cancelled.
+#
+# This is not hypothetical: vgi-typescript shipped exactly that bug. Its HTTP
+# turn loop broke only when a byte cap was configured, and no worker configures
+# one, so every TS HTTP worker returned whole streams. It survived because the
+# suite asserted rows and nothing else — three tests DID fail, and all three
+# were excluded from the http lane under a diagnosis ("0 log rows over HTTP")
+# that was simply wrong.
+#
+# The signature was observable the whole time. The extension logs
+# `buffered_batches` and `has_state_token` on every init_result. Nothing looked.
+# That is what this file fixes: it asserts the SHAPE of the exchange, so the
+# next SDK to get this wrong fails here instead of shipping.
+
+require-env VGI_TEST_WORKER
+
+require-env VGI_HTTP_TRANSPORT
+
+require vgi
+
+require httpfs
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+statement ok
+ATTACH 'example' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# A multi-batch producer. sequence() emits well over one batch at this size, so
+# a correct worker cannot serve it in a single turn.
+query I
+SELECT count(*) FROM ex.main.sequence(5000);
+----
+5000
+
+# The init response must NOT carry the whole stream. `has_state_token=true` is
+# the positive form of the assertion — the worker yielded and handed back a
+# cursor — and it is what distinguishes "incremental" from "drained in one go".
+# Asserting the token rather than a batch count keeps this meaningful for a
+# worker that legitimately buffers a few batches per turn under a byte cap.
+query I
+SELECT count(*) FROM duckdb_logs
+WHERE type = 'VGI'
+  AND message LIKE '%http_function_connection.init_result%'
+  AND message LIKE '%is_producer_mode=true%'
+  AND message NOT LIKE '%has_state_token=true%';
+----
+0
+
+# And the stream really was multi-turn: more than one exchange round trip.
+# Without this a worker could mint a cursor and still ship everything at once.
+query I
+SELECT count(*) > 1 AS multi_turn FROM duckdb_logs
+WHERE type = 'VGI' AND message LIKE '%http_function_connection.producer_exchange%';
+----
+true
+
+statement ok
+DETACH ex;
