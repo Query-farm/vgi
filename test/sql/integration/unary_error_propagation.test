@@ -41,19 +41,28 @@ statement ok
 ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
 # ---------------------------------------------------------------------------
-# Scalar bind. `double` accepts any numeric type and rejects the rest via a
-# named type-bound predicate, so the rejection is worker-authored and names the
-# predicate — nothing in the client or the transport knows that string.
+# Scalar bind. `double` accepts any numeric type and rejects the rest, so the
+# rejection is worker-authored: nothing in the client or the transport decides
+# that a string is unacceptable here.
+#
+# The assertion is the TAG, not the prose. This used to require the message to
+# contain `_is_multipliable_type` — the Python fixture's private predicate
+# symbol, reached because that SDK's framework renders a failed type bound as
+# "column type string does not match any of: <predicate names>". No other
+# worker can satisfy it: TypeScript says "Unsupported numeric type for
+# addition: Utf8", and there is no common substring between them, not even the
+# type name (`string` vs `Utf8`). Every `.test` here runs against all five
+# SDKs, so an assertion only one can pass is a cross-SDK failure dressed up as
+# coverage.
+#
+# What IS contractual is whose error this is. The C++ side tags an error that
+# came back from the worker distinctly from one it raised itself about the
+# worker, so a transport failure would surface as the extension's own and fail
+# this. To also assert the REASON, the fixtures would first have to agree on a
+# token to put in the message — a fixture-parity change across five repos, not
+# a test change.
 # ---------------------------------------------------------------------------
 
-statement error
-SELECT example.main.double('abc');
-----
-_is_multipliable_type
-
-# The C++ side tags an error that came back from the worker, as opposed to one
-# it raised itself about the worker. Asserting the tag pins *whose* error this
-# is: a transport failure would be reported as the extension's own.
 statement error
 SELECT example.main.double('abc');
 ----

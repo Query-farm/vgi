@@ -134,12 +134,45 @@ enumeration works, on both transports. If a stable split identity ever lands on
 the wire (deterministic sealing, or a plaintext `split_id`), enforcing this
 becomes cheap and uniform and is worth revisiting.
 
-**Known HTTP limitations** (these tests fail over HTTP, not regressions):
-- `logging_generator.test` — inline log streaming not supported over HTTP
-- `partitioned_sequence.test` — partition-local state not preserved across HTTP exchanges
-- `buffer_input/sizes.test`, `buffer_input/scale.test_slow` — input buffering semantics differ
-- `order_preservation_modes.test` — under HTTP, DuckDB allocates one `FunctionConnection` per worker thread eagerly, so `FIXED_ORDER` (which serializes the pipeline source to a single thread of *execution*) still surfaces N distinct `conn=` ids in the per-batch logs. Subprocess transport collapses to 1 distinct `conn=` because only one worker is actually acquired from the pool. The assertion is meaningful on subprocess only.
-- **Zero-column blended input** (`blended.test` `row_sum()` — a pure-varargs blended call with NO input columns): an Arrow-IPC RecordBatch with no arrays defaults to 0 rows, so over HTTP the worker sees no input row and emits nothing (subprocess yields one 0.0 row). Same root cause as the scalar `SELECT func()` 0-column workaround. The childless scan-mode still terminates cleanly on both transports (no hang) — the test asserts only that, not the row count. Any *non-empty* blended call is unaffected.
+**Known HTTP limitations.** There are none currently known. This section used to
+list five — `logging_generator`, `partitioned_sequence`, `buffer_input/sizes`,
+`order_preservation_modes` and zero-column blended input — each with a plausible
+mechanism (inline log streaming, partition-local state, buffering semantics,
+eager per-thread `FunctionConnection` allocation, empty-RecordBatch row counts).
+On 2026-08-21 all five were measured passing over HTTP against the Python, Rust,
+Go and Java workers, independently, including `order_preservation_modes`'s
+`= 1 distinct conn=` assertion that the entry claimed was subprocess-only.
+
+Whatever those explanations described has been fixed or was never right. They are
+recorded here rather than deleted because the list did active harm: it was cited
+to exclude tests from HTTP lanes, and a stale "known limitation" is
+indistinguishable from a real one — a genuine HTTP defect in `dynamic_filter`
+sat behind exactly that kind of note (in vgi-rust's CI) for weeks.
+
+**If you are about to add an entry here, measure it against at least two SDKs
+first, and date it.** A single worker's behaviour is not a transport limitation:
+of the failures investigated on 2026-08-21, the ones reproducing on two or more
+SDKs were real client/protocol defects, and every single-SDK one was a bug in
+that SDK. See also *Real coverage over HTTP* below — a test that SKIPS reports
+as neither pass nor fail, so "it doesn't work over HTTP" is frequently a test
+that never ran.
+
+**Real coverage over HTTP.** Three separate mechanisms quietly convert skips into
+apparent passes, and all three have bitten:
+- `scripts/run_tests.py` classifies purely on exit code, and a skipped file exits
+  0 — so "325/325 passed" means "325 files exited 0", never "325 tests ran". Get
+  real numbers by running files individually and parsing unittest's skip banner.
+- DuckDB hard-codes `ignore_error_messages = {"HTTP", "Unable to connect"}`
+  (`sqllogic_test_runner.hpp`) as network-flakiness tolerance, matched as a bare
+  SUBSTRING. A `.test` without `require httpfs` fails its `ATTACH 'http://…'`,
+  the message contains "HTTP", and the whole file vanishes. 29 files were in that
+  state. A file whose EXPECTED error text contains "HTTP" is skipped too — which
+  is why `bearer_auth/bearer_token.test` had never executed for any SDK; it now
+  opts out with `set ignore_error_messages Unable to connect`.
+- The HTTP suite expects FIVE servers (main, versioned, versioned_tables,
+  attach_options, and a bearer-auth instance), all started with cwd at the repo
+  root — `copy_to`/`copy_from` write relative paths that resolve against the
+  SERVER's cwd. One server leaves a large slice env-gated away.
 
 ### Container Transport (OCI/Docker)
 
@@ -613,7 +646,8 @@ filters are always ineligible.
 
 **Identity scoping is a security boundary.** `identity_scope` = catalog name **+ the caller's auth
 principal fingerprint** (`ComputeCatalogIdentityFingerprint` in `vgi_oauth.cpp`: OAuth hashes the
-stable `iss`+`sub`; bearer hashes a salted token; no-auth = `anon`). Two attaches of the same
+exact presented bearer credential; static bearer auth hashes its token separately; no-auth =
+`anon`). Unverified ID-token claims are never part of this security boundary. Two attaches of the same
 alias+worker+args under **different** bearer/OAuth identities therefore never share a cache entry —
 without it, one principal's rows would be served to another. A configured-but-unresolved identity
 (e.g. OAuth not yet authenticated) **fails closed** (`ineligible_reason=identity_unresolved`). ATTACH
