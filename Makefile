@@ -158,18 +158,23 @@ test_spawn_debug:
 # 300s), so concurrent test runs don't pile up — each unique worker argv
 # gets one warm process shared across every test that uses it.
 #
-# Two tests are excluded from this target because their assertions are
+# One test is excluded from this target because its assertion is
 # subprocess-pool-specific:
 # - vgi_worker_pool.test               — asserts pool count >= 1
-# - integration/table/filter_echo_partitioned     — asserts >1 distinct
-#                                                   worker_pid across parallel
-#                                                   partitions
-# AF_UNIX workers are pooled by the OS socket (one shared warm worker
-# serves every concurrent caller via internal threading) rather than by
-# DuckDB's per-process subprocess pool; both assertions are incidental
-# to that, not regressions. (versioned_tables_impl used to be excluded too,
-# but its pool-count assertion was removed — version dispatch is per-attach,
-# not per-process, so it now passes under both transports.)
+# AF_UNIX workers are pooled by the OS socket (one shared warm worker serves
+# every concurrent caller via internal threading) rather than by DuckDB's
+# per-process subprocess pool, so that assertion is incidental to the
+# transport, not a regression.
+#
+# filter_echo_partitioned was excluded here too, on the stated grounds that it
+# "asserts >1 distinct worker_pid across parallel partitions". It does not, and
+# has not since 2026-05-14: the only parallelism assertion in that file is
+# `COUNT(DISTINCT conn=…) >= 2` (line 145), and its own comment calls conn= the
+# transport-neutral form precisely because worker_pid is subprocess-only.
+# Verified passing on the launcher transport 2026-08-21. Three SDKs had copied
+# the wrong reason verbatim into their own Makefiles, which is what a stale
+# exclusion comment does — it propagates. (versioned_tables_impl was excluded
+# once too; its pool-count assertion was removed, so it passes on both.)
 test_launcher:
 	VGI_TRANSACTOR_DB_DIR="$$(mktemp -d)" \
 	VGI_TEST_WORKER="launch:$(VGI_TEST_WORKER)" \
@@ -184,8 +189,7 @@ test_launcher:
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
 	./build/release/test/unittest "test/*" \
 	    "~test/sql/integration/writable/*" \
-	    "~test/sql/vgi_worker_pool.test" \
-	    "~test/sql/integration/table/filter_echo_partitioned.test"
+	    "~test/sql/vgi_worker_pool.test"
 
 test_launcher_debug:
 	VGI_TRANSACTOR_DB_DIR="$$(mktemp -d)" \
@@ -201,8 +205,7 @@ test_launcher_debug:
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
 	./build/debug/test/unittest "test/*" \
 	    "~test/sql/integration/writable/*" \
-	    "~test/sql/vgi_worker_pool.test" \
-	    "~test/sql/integration/table/filter_echo_partitioned.test"
+	    "~test/sql/vgi_worker_pool.test"
 
 # Same test suite as test_launcher but with the fixture worker configured
 # to use the Cloudflare Durable Object storage backend
@@ -238,8 +241,7 @@ test_launcher_cloudflare_do:
 	VGI_WORKER_SHARED_STORAGE=cloudflare-do \
 	python3 scripts/run_tests.py --build release "test/*" \
 	    "~test/sql/integration/writable/*" \
-	    "~test/sql/vgi_worker_pool.test" \
-	    "~test/sql/integration/table/filter_echo_partitioned.test"
+	    "~test/sql/vgi_worker_pool.test"
 
 test_launcher_cloudflare_do_debug:
 	@if [ ! -f .cloudflare-do.env ]; then \
@@ -262,8 +264,7 @@ test_launcher_cloudflare_do_debug:
 	VGI_WORKER_SHARED_STORAGE=cloudflare-do \
 	python3 scripts/run_tests.py --build debug "test/*" \
 	    "~test/sql/integration/writable/*" \
-	    "~test/sql/vgi_worker_pool.test" \
-	    "~test/sql/integration/table/filter_echo_partitioned.test"
+	    "~test/sql/vgi_worker_pool.test"
 
 # HTTP transport tests (uses test/run_http_integration.sh)
 #
