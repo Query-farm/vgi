@@ -13,10 +13,25 @@
 #
 # DISABLED: the BOOLEAN-child-of-union round-trip corruption is a Haybarn/DuckDB
 # Arrow serialization bug, not a VGI worker bug, and the pinned expected output
-# is architecture-dependent (matches amd64, not arm64) — so it fails spuriously
-# depending on the runner. `mode skip` disables the whole file (it skips every
-# subsequent directive); remove it to re-enable once the upstream Arrow fix lands
-# (and update the expected outputs to the correct values).
+# is not reproducible across runners — so it fails spuriously depending on where
+# it runs. `mode skip` disables the whole file (it skips every subsequent
+# directive); remove it to re-enable once the upstream Arrow fix lands (and
+# update the expected outputs to the correct values).
+#
+# On the architecture question, do not trust any of the existing claims. This
+# comment used to say the pinned output "matches amd64, not arm64", and the
+# vgi-go, vgi-rust and vgi-java repos each carried an exclusion asserting the
+# exact opposite — arm64 and not amd64. Four statements, two directions, no
+# measurement behind any of them; the three downstream ones were written from
+# this one and then inverted somewhere along the way.
+#
+# The attribution is probably meaningless regardless. This file pins the OUTPUT
+# OF A CORRUPTION, and the header above suspects bit-packed vs byte-packed
+# densification on rebuild — i.e. the bytes come from a path that is reading
+# something it should not. Output pinned from that is a property of the machine
+# that pinned it, not of an ISA. Whoever fixes the upstream bug should replace
+# these expectations with the CORRECT values and delete this paragraph, rather
+# than re-pinning corrupt output against a different architecture.
 mode skip
 
 require-env VGI_TEST_WORKER
