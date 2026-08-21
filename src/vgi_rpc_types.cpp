@@ -176,6 +176,18 @@ std::shared_ptr<arrow::Array> BuildNullableStringScalar(const std::string &value
 	}
 	return FinishArray(builder, "nullable_string");
 }
+
+// A 1-row, all-null struct column. Needed because a declared-but-absent nested
+// field (bind's copy_from / copy_to on a non-COPY call) must still occupy its
+// column: a worker that validates its parameter contract compares field order,
+// name, type AND nullability, so an omitted column is a contract violation
+// rather than an absent value.
+std::shared_ptr<arrow::Array> BuildNullStructScalar(const std::shared_ptr<arrow::DataType> &type) {
+	std::unique_ptr<arrow::ArrayBuilder> builder;
+	CheckStatus(arrow::MakeBuilder(arrow::default_memory_pool(), type, &builder), "make struct builder");
+	CheckStatus(static_cast<arrow::StructBuilder *>(builder.get())->AppendNull(), "append null struct");
+	return FinishArray(*builder, "null_struct");
+}
 } // namespace
 
 // list<T> single-row builders.
@@ -541,10 +553,6 @@ BuildBindRequest(const std::string &function_name, const std::vector<uint8_t> &a
 	    // Python BindRequest dataclass fields (matched by name, not position).
 	    arrow::field("at_unit", arrow::utf8(), true),
 	    arrow::field("at_value", arrow::utf8(), true),
-	    // Owning catalog schema; disambiguates a function name registered in
-	    // more than one schema. Empty string serialises as null, which tells
-	    // the worker to fall back to a cross-schema lookup by name.
-	    arrow::field("schema_name", arrow::utf8(), true),
 	};
 
 	std::vector<std::shared_ptr<arrow::Array>> arrays;
@@ -566,18 +574,28 @@ BuildBindRequest(const std::string &function_name, const std::vector<uint8_t> &a
 
 	arrays.push_back(BuildNullableStringScalar(at_unit));
 	arrays.push_back(BuildNullableStringScalar(at_value));
-	arrays.push_back(BuildNullableStringScalar(schema_name));
 
-	// copy_from: nested struct<format, file_path, expected_schema>, only added
-	// for a COPY ... FROM scan. The Python worker matches BindRequest fields by
-	// name and defaults this to None when absent, so omitting it for ordinary
-	// scans is wire-safe. Built as a 1-row, non-null struct.
+	// copy_from / copy_to: nested structs, ALWAYS present — null when this is
+	// not a COPY bind. They were previously appended only for a COPY, on the
+	// stated grounds that "the Python worker matches BindRequest fields by name
+	// and defaults this to None when absent, so omitting it is wire-safe". That
+	// held only for as long as every worker was permissive. A worker that
+	// validates its declared parameter contract (vgi-rpc-go compares with
+	// arrow Schema.Equal — order, name, type AND nullability) rejects a
+	// 12-column batch outright, and it is right to: the protocol declares 14
+	// fields, so a client sending 12 does not match its own contract.
+	//
+	// Order matters for the same reason, and it is the PROTOCOL's order that
+	// governs: copy_from, copy_to, then schema_name last (vgi/protocol.py's
+	// BindRequest). This builder used to emit schema_name before the copy
+	// fields, so even a 14-column batch would not have matched.
+	auto copy_from_type = arrow::struct_({
+	    arrow::field("format", arrow::utf8(), false),
+	    arrow::field("file_path", arrow::utf8(), false),
+	    arrow::field("expected_schema", arrow::binary(), false),
+	});
+	fields.push_back(arrow::field("copy_from", copy_from_type, true));
 	if (copy_from) {
-		auto copy_from_type = arrow::struct_({
-		    arrow::field("format", arrow::utf8(), false),
-		    arrow::field("file_path", arrow::utf8(), false),
-		    arrow::field("expected_schema", arrow::binary(), false),
-		});
 		std::vector<std::shared_ptr<arrow::Array>> children = {
 		    BuildStringScalar(copy_from->format),
 		    BuildStringScalar(copy_from->file_path),
@@ -587,17 +605,17 @@ BuildBindRequest(const std::string &function_name, const std::vector<uint8_t> &a
 		if (!struct_result.ok()) {
 			throw IOException("Failed to build copy_from struct array: %s", struct_result.status().ToString());
 		}
-		fields.push_back(arrow::field("copy_from", copy_from_type, true));
 		arrays.push_back(struct_result.ValueUnsafe());
+	} else {
+		arrays.push_back(BuildNullStructScalar(copy_from_type));
 	}
 
-	// copy_to: nested struct<format, file_path>, only added for a COPY ... TO
-	// sink. Same wire-safe rationale as copy_from (matched by name, defaults None).
+	auto copy_to_type = arrow::struct_({
+	    arrow::field("format", arrow::utf8(), false),
+	    arrow::field("file_path", arrow::utf8(), false),
+	});
+	fields.push_back(arrow::field("copy_to", copy_to_type, true));
 	if (copy_to) {
-		auto copy_to_type = arrow::struct_({
-		    arrow::field("format", arrow::utf8(), false),
-		    arrow::field("file_path", arrow::utf8(), false),
-		});
 		std::vector<std::shared_ptr<arrow::Array>> children = {
 		    BuildStringScalar(copy_to->format),
 		    BuildStringScalar(copy_to->file_path),
@@ -606,9 +624,16 @@ BuildBindRequest(const std::string &function_name, const std::vector<uint8_t> &a
 		if (!struct_result.ok()) {
 			throw IOException("Failed to build copy_to struct array: %s", struct_result.status().ToString());
 		}
-		fields.push_back(arrow::field("copy_to", copy_to_type, true));
 		arrays.push_back(struct_result.ValueUnsafe());
+	} else {
+		arrays.push_back(BuildNullStructScalar(copy_to_type));
 	}
+
+	// Owning catalog schema; disambiguates a function name registered in more
+	// than one schema. Empty string serialises as null, which tells the worker
+	// to fall back to a cross-schema lookup by name. Last, per the protocol.
+	fields.push_back(arrow::field("schema_name", arrow::utf8(), true));
+	arrays.push_back(BuildNullableStringScalar(schema_name));
 
 	return arrow::RecordBatch::Make(arrow::schema(fields), 1, arrays);
 }
@@ -1311,7 +1336,7 @@ std::shared_ptr<arrow::RecordBatch> BuildCatalogAttachRequest(
 	// while "" is a concrete (and invalid) version string.
 	auto request_schema = arrow::schema({
 	    arrow::field("name", arrow::utf8(), false),
-	    arrow::field("options", arrow::binary(), false),
+	    arrow::field("options", arrow::binary(), true),
 	    arrow::field("data_version_spec", arrow::utf8(), true),
 	    arrow::field("implementation_version", arrow::utf8(), true),
 	    arrow::field("client_capabilities", arrow::binary(), true),
