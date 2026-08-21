@@ -15,6 +15,8 @@ require-env VGI_TEST_COMPANION_TARGET
 
 require vgi
 
+require httpfs
+
 # ducklake / sqlite_scanner are not autoloadable in the unittest binary, so load
 # them explicitly. The runner (run_companion_integration.sh) already skips the
 # whole suite when they are unavailable (it seeds the DuckLake first).

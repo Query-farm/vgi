@@ -9,6 +9,8 @@ require-env VGI_TEST_WORKER
 
 require vgi
 
+require httpfs
+
 # ============================================================================
 # Below-threshold path: the example fixture's ``data`` schema has only a
 # handful of tables; with the default threshold of 1000 they all qualify for

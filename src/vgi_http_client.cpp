@@ -543,24 +543,44 @@ std::string HttpPostArrowIpc(ClientContext &context,
 		                  url);
 	}
 
-	// Check for WWW-Authenticate header (OAuth discovery). If absent, the server
-	// rejected the token outright (e.g., static bearer auth) — let the auth handler decide.
-	if (!response->HasHeader("WWW-Authenticate")) {
-		// Special case: the default auth handler when the user supplied
-		// neither bearer_token nor oauth_refresh_token is an empty
-		// OAuthCatalogAuth. Feeding an empty OAuthChallenge into its
-		// HandleUnauthorized would eventually call FetchResourceMetadata("")
-		// and surface "VGI OAuth: resource metadata URL must use HTTPS:"
-		// — a confusing diagnostic for a non-OAuth situation. Catch it
-		// here while we still have the URL in scope and produce an
-		// actionable error that names the fix.
+	// Look for an OAuth challenge. Two cases lead to "there is none", and they
+	// must be handled IDENTICALLY: no WWW-Authenticate header at all, and a
+	// header that is a perfectly valid challenge carrying no OAuth
+	// resource_metadata — RFC 6750's `Bearer realm="..."`, which is what a
+	// plain bearer-auth server is supposed to send. Treating the second as a
+	// hard error rejected the more standards-compliant server: the vgi-java
+	// worker sends the RFC-6750 form, so a rejected bearer token surfaced as
+	// "no OAuth resource_metadata in WWW-Authenticate header" instead of
+	// "bearer token was rejected" — and because that text contains "HTTP",
+	// DuckDB's sqllogic runner silently SKIPPED the whole bearer_auth test
+	// file rather than failing it, so the suite reported green with zero
+	// bearer coverage.
+	const bool has_www_auth = response->HasHeader("WWW-Authenticate");
+	std::optional<OAuthChallenge> challenge;
+	if (has_www_auth) {
+		challenge = ParseWWWAuthenticate(response->GetHeaderValue("WWW-Authenticate"));
+	}
+
+	if (!challenge.has_value()) {
+		// The server rejected the credential outright (static bearer auth, or
+		// OAuth without challenge advertising) — let the auth handler decide.
+		//
+		// Special case: the default handler when the user supplied neither
+		// bearer_token nor oauth_refresh_token is an empty OAuthCatalogAuth.
+		// Feeding an empty OAuthChallenge into its HandleUnauthorized would
+		// eventually call FetchResourceMetadata("") and surface "VGI OAuth:
+		// resource metadata URL must use HTTPS:" — a confusing diagnostic for
+		// a non-OAuth situation. Catch it here while the URL is still in
+		// scope and produce an actionable error that names the fix.
 		if (!auth->IsExplicitlyConfigured()) {
 			throw IOException(
 			    "VGI HTTP authentication failed (HTTP 401) [url: %s]. The server requires "
-			    "authentication but advertised no OAuth challenge (no WWW-Authenticate "
-			    "header). Pass bearer_token in ATTACH options, or oauth_refresh_token if "
-			    "the server uses OAuth without challenge advertising.",
-			    url);
+			    "authentication but advertised no OAuth challenge (%s). Pass bearer_token "
+			    "in ATTACH options, or oauth_refresh_token if the server uses OAuth "
+			    "without challenge advertising.",
+			    url,
+			    has_www_auth ? "its WWW-Authenticate header carries no resource_metadata"
+			                 : "no WWW-Authenticate header");
 		}
 		// User opted into auth (bearer_token or oauth_refresh_token) — let
 		// the handler decide. BearerTokenCatalogAuth throws a token-rejected
@@ -569,14 +589,6 @@ std::string HttpPostArrowIpc(ClientContext &context,
 		auth->HandleUnauthorized(empty_challenge, context);
 		// If HandleUnauthorized didn't throw (shouldn't happen), surface a generic error
 		throw IOException("VGI HTTP authentication failed (HTTP 401) [url: %s]", url);
-	}
-
-	auto www_auth = response->GetHeaderValue("WWW-Authenticate");
-	auto challenge = ParseWWWAuthenticate(www_auth);
-	if (!challenge.has_value()) {
-		throw IOException("VGI HTTP authentication required (HTTP 401) but no OAuth resource_metadata "
-		                  "in WWW-Authenticate header [url: %s]. Response: %s",
-		                  url, response->body);
 	}
 
 	VGI_STDERR_DEBUG("[VGI] http.401_received url=%s resource_metadata=%s\n",

@@ -13,6 +13,8 @@ require-env VGI_TEST_WORKER
 
 require vgi
 
+require httpfs
+
 require spatial
 
 statement ok

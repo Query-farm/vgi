@@ -10,6 +10,8 @@ require-env VGI_TEST_WORKER
 
 require vgi
 
+require httpfs
+
 # A struct LOCATION must include an image/location/path address key.
 statement error
 ATTACH 'x' AS c_err0 (TYPE vgi, LOCATION {'volumes': ['d:/data']});

@@ -13,6 +13,8 @@ require-env VGI_TEST_COMPANION_HIDDEN
 
 require vgi
 
+require httpfs
+
 statement ok
 LOAD ducklake;
 

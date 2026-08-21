@@ -10,6 +10,18 @@ require vgi
 
 require httpfs
 
+# Drop "HTTP" from the runner's ignore list, keeping the rest of the default.
+# DuckDB defaults ignore_error_messages to {"HTTP", "Unable to connect"} as
+# network-flakiness tolerance (sqllogic_test_runner.hpp:76), and it matches a
+# bare SUBSTRING. Every assertion in this file expects an error that says
+# "(HTTP 401)", so the runner skipped the entire file — silently, reporting it
+# as neither pass nor fail. This test has therefore never executed, for ANY
+# SDK, which is how a client bug in the 401 challenge path survived: a
+# standards-compliant RFC-6750 `WWW-Authenticate: Bearer realm="..."` was
+# rejected as "no OAuth resource_metadata" instead of reaching the auth
+# handler, and nothing noticed.
+set ignore_error_messages Unable to connect
+
 # ============================================================================
 # ATTACH with bearer_token succeeds
 # ============================================================================
@@ -67,13 +79,12 @@ Cannot specify both bearer_token and oauth_refresh_token
 # to feed an empty challenge into the OAuth discovery flow.
 # ============================================================================
 
-statement ok
-ATTACH 'example' AS example_no_auth (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
-
+# The diagnostic arrives at ATTACH, not at the first query: a bearer-protected
+# server 401s on catalog_attach itself. This block previously expected ATTACH to
+# succeed and the SELECT to fail — an assumption that was never true and never
+# checked, because the whole file skipped. Verified against both the Python and
+# Java workers, which agree.
 statement error
-SELECT example_no_auth.double(1);
+ATTACH 'example' AS example_no_auth (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 ----
 The server requires authentication but advertised no OAuth challenge
-
-statement ok
-DETACH example_no_auth;
