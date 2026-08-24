@@ -335,13 +335,13 @@ FROM example.partitioned_sequence(10000);
 ----
 10000	10000	0	9999
 
-# Verify only one worker was used (single conn= in batch_received logs).
+# Verify only one reader was created (single conn= in init_local logs).
 # Uses conn= (transport-neutral, present for both subprocess and HTTP) rather
 # than worker_pid= (subprocess-only — HTTP has no OS pid for the remote worker).
 query I
 SELECT COUNT(DISTINCT regexp_extract(message, 'conn=([0-9a-f]+)', 1)) = 1
 FROM duckdb_logs()
-WHERE type = 'VGI' AND message LIKE '%batch_received%';
+WHERE type = 'VGI' AND message LIKE '%init_local%';
 ----
 true
 
@@ -360,14 +360,20 @@ FROM example.partitioned_sequence(100000);
 ----
 100000	100000	0	99999
 
-# Verify multiple workers were used (at least 2 distinct conn= in
-# batch_received logs). conn= is the transport-neutral per-connection id —
+# Verify multiple readers were created (at least 2 distinct conn= in
+# init_local logs). conn= is the transport-neutral per-connection id —
 # under subprocess each conn maps to a distinct worker pid; under HTTP each
 # conn is a distinct logical worker checkout against the remote server.
+#
+# init_local, not batch_received: this fixture divides work through a shared
+# queue, so a reader that arrives after the queue is drained emits zero
+# batches and never logs batch_received. init_local fires at connection
+# acquire, before any data, so it counts the readers DuckDB created — which
+# is the property this asserts and is not a race. See batch_index.test.
 query I
 SELECT COUNT(DISTINCT regexp_extract(message, 'conn=([0-9a-f]+)', 1)) >= 2
 FROM duckdb_logs()
-WHERE type = 'VGI' AND message LIKE '%batch_received%';
+WHERE type = 'VGI' AND message LIKE '%init_local%';
 ----
 true
 

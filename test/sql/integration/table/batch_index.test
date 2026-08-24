@@ -7,12 +7,22 @@
 #              partition_id order. Drops the FIXED_ORDER MaxThreads=1
 #              clamp for opted-in functions.
 #
-# NOTE: the ">=2 distinct conn=" parallelism assertion is meaningful on
-# subprocess transport only — under HTTP each pipeline task allocates its
-# own logical worker, so the conn count is always >=N regardless of
-# whether the source actually parallelised. See CLAUDE.md's "Known HTTP
-# limitations". Correctness assertions (count/sum/ordering) hold under
-# both transports.
+# NOTE: the ">=2 distinct conn=" parallelism assertions below count
+# `init_local` events, NOT `batch_received`. init_local fires once per
+# local state at connection acquire, before any data — so it counts the
+# readers DuckDB *created*, which is min(MaxThreads(), threads) and is
+# exactly the property being asserted (the FIXED_ORDER MaxThreads=1 clamp
+# was dropped for a supports_batch_index function).
+#
+# Counting batch_received instead is a race and was flaky in CI: these
+# fixtures divide work through a shared queue, so a reader that arrives
+# after the queue is drained emits zero batches and never logs
+# batch_received at all. Measured directly — 2 work items with 4 readers
+# gives init_local=4, batch_received=1 — and CI reproduces it under
+# `run_tests.py -j 4` (four files x threads=4 on a 2-core runner), where
+# one reader can drain all 100 items before the others get CPU. The scan
+# is correct and fully parallel either way, which is why the count/sum
+# assertions passed in the same failing run.
 # group: [vgi_integration_table]
 
 require-env VGI_TEST_WORKER
@@ -203,7 +213,7 @@ SELECT COUNT(*), SUM(n) FROM example.partitioned_batch_index(100000);
 query I
 SELECT COUNT(DISTINCT regexp_extract(message, 'conn=([0-9a-f]+)', 1)) >= 2
 FROM duckdb_logs()
-WHERE type = 'VGI' AND message LIKE '%batch_received%';
+WHERE type = 'VGI' AND message LIKE '%init_local%';
 ----
 true
 
