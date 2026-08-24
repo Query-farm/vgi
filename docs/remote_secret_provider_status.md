@@ -111,10 +111,10 @@ the main connection's `duckdb_logs`.
 2. **Failures surface** — transport/auth/protocol errors throw a clear `IOException` (not silent "no credential"); a real `found=false` stays a quiet miss. Test D (wrong bearer → surfaced 401).
 3. **Single-flight** — concurrent identical `(type, path)` lookups share one RPC (`InflightLookup` + `condition_variable`).
 4. **httpfs/null-context proven** — `orchard_httpfs_e2e.py`.
+5. **Per-provider caches are bounded** — every lookup globally prunes expired entries; access-order eviction caps each provider at 1,024 positive and 4,096 negative entries.
 
 ## Known limitations / deferred (good next steps)
 - **DETACH does not unregister the provider** — `SecretManager` has no unload API, so the storage stays registered (and a catch-all in lookups) for the DB's lifetime; re-attach mints a *new* storage (offset/name) each time → unbounded growth under repeated attach/detach. `vgi_secret_provider_flush()` is the manual control. A safe destructor-based `Deactivate()` was deferred over a teardown-ordering UAF risk (SecretManager vs catalog).
-- **Negative cache is unbounded** — wide httpfs workloads hitting many distinct missing paths grow it (entries only evicted on re-lookup; 30s TTL). No size cap / LRU.
 - **Single-flight dedup count is not load-tested** — implemented + structurally correct, but there's no test asserting N threads → 1 RPC.
 - **Token audience** — the secret service must accept the catalog's token (an Orchard-backend design concern; the extension forwards it verbatim).
 - **OAuth (device-code) auth path** not asserted by a test (bearer is; OAuth rides the same `CatalogAuth`/`HandleUnauthorized` code path).

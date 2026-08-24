@@ -49,6 +49,37 @@ SecretEntry MakeEntry(unique_ptr<const BaseSecret> secret, const std::string &st
 
 } // namespace
 
+void VgiRemoteSecretStorage::PruneExpiredCachesLocked(SteadyTime now) {
+	for (auto it = positive_cache_.begin(); it != positive_cache_.end();) {
+		if (it->second.expires_at <= now) {
+			it = positive_cache_.erase(it);
+		} else {
+			++it;
+		}
+	}
+	for (auto it = negative_cache_.begin(); it != negative_cache_.end();) {
+		if (it->second.expires_at <= now) {
+			it = negative_cache_.erase(it);
+		} else {
+			++it;
+		}
+	}
+}
+
+void VgiRemoteSecretStorage::EnforceCacheLimitsLocked() {
+	auto evict_oldest = [](auto &cache, size_t max_entries) {
+		while (cache.size() > max_entries) {
+			auto oldest = std::min_element(cache.begin(), cache.end(), [](const auto &a, const auto &b) {
+				return a.second.last_access < b.second.last_access;
+			});
+			cache.erase(oldest);
+		}
+	};
+
+	evict_oldest(positive_cache_, kMaxPositiveCacheEntries);
+	evict_oldest(negative_cache_, kMaxNegativeCacheEntries);
+}
+
 SecretMatch VgiRemoteSecretStorage::MatchFromSecret(const KeyValueSecret &secret, const string &path) {
 	SecretMatch best;
 	SecretEntry entry = MakeEntry(secret.Clone(), GetName());
@@ -88,23 +119,30 @@ SecretMatch VgiRemoteSecretStorage::LookupSecret(const string &path, const strin
 	// 1) Cache check + single-flight bookkeeping under the cache lock.
 	{
 		std::lock_guard<std::mutex> lk(cache_mutex_);
+		PruneExpiredCachesLocked(now);
 		SecretMatch best;
+		PositiveEntry *best_entry = nullptr;
 		for (auto &kv : positive_cache_) {
-			if (kv.first.first != type || kv.second.expires_at <= now) {
+			if (kv.first.first != type) {
 				continue;
 			}
+			const auto previous_score = best.score;
+			const std::string previous_name = best.HasMatch() ? best.GetSecret().GetName() : std::string();
 			SecretEntry entry = MakeEntry(kv.second.secret->Clone(), GetName());
 			best = SelectBestMatch(entry, path, tie_break_offset, best);
+			if (best.HasMatch() &&
+			    (best.score != previous_score || best.GetSecret().GetName() != previous_name)) {
+				best_entry = &kv.second;
+			}
 		}
 		if (best.HasMatch()) {
+			best_entry->last_access = now;
 			return best;
 		}
 		auto nit = negative_cache_.find(key);
 		if (nit != negative_cache_.end()) {
-			if (nit->second > now) {
-				return SecretMatch();
-			}
-			negative_cache_.erase(nit);
+			nit->second.last_access = now;
+			return SecretMatch();
 		}
 		// Single-flight: one in-progress fetch per (type, path). Concurrent
 		// scan threads on the same path share the leader's one RPC.
@@ -164,16 +202,23 @@ SecretMatch VgiRemoteSecretStorage::LookupSecret(const string &path, const strin
 	{
 		std::lock_guard<std::mutex> lk(cache_mutex_);
 		inflight_.erase(key);
+		PruneExpiredCachesLocked(now);
 		if (!err) {
-			if (fr.found && fr.secret) {
+			if (fr.found && fr.secret && ttl > 0) {
 				const auto &scope = fr.secret->GetScope();
 				std::string scope_key = scope.empty() ? std::string() : scope.front();
 				positive_cache_[{type, scope_key}] =
-				    PositiveEntry {std::move(fr.secret), now + std::chrono::seconds(ttl)};
+				    PositiveEntry {std::move(fr.secret), now + std::chrono::seconds(ttl), now};
 			} else {
-				negative_cache_[key] =
-				    now + std::min<std::chrono::seconds>(default_ttl_, std::chrono::seconds(30));
+				const auto negative_ttl =
+				    std::max<std::chrono::seconds>(std::chrono::seconds(0),
+				                                   std::min<std::chrono::seconds>(default_ttl_,
+				                                                                  std::chrono::seconds(30)));
+				if (!fr.found && negative_ttl.count() > 0) {
+					negative_cache_[key] = NegativeEntry {now + negative_ttl, now};
+				}
 			}
+			EnforceCacheLimitsLocked();
 		}
 	}
 
@@ -204,14 +249,18 @@ VgiRemoteSecretStorage::FetchRemote(const string &path, const string &type,
                                     optional_ptr<CatalogTransaction> transaction) {
 	// Resolve a usable ClientContext. On the httpfs / DB-filesystem path the
 	// lookup runs under the system transaction whose `context` is null, so mint
-	// a transient connection (cheap; no transaction, no catalog touch). One per
-	// fetch → thread-safe (ClientContext is not safe to share).
+	// a transient connection and transaction. Current DuckDB HTTP secret
+	// resolution consults ClientContext::ActiveTransaction, so a bare connection
+	// fails before the RPC is sent. One per fetch keeps this thread-safe
+	// (ClientContext is not safe to share); destruction rolls the read-only
+	// transaction back after the request.
 	unique_ptr<Connection> owned_conn;
 	ClientContext *ctx = nullptr;
 	if (transaction && transaction->context) {
 		ctx = transaction->context.get();
 	} else {
 		owned_conn = make_uniq<Connection>(db_);
+		owned_conn->BeginTransaction();
 		ctx = owned_conn->context.get();
 	}
 
@@ -352,11 +401,10 @@ unique_ptr<SecretEntry> VgiRemoteSecretStorage::GetSecretByName(const string &na
                                                                optional_ptr<CatalogTransaction> transaction) {
 	std::lock_guard<std::mutex> lk(cache_mutex_);
 	const auto now = std::chrono::steady_clock::now();
+	PruneExpiredCachesLocked(now);
 	for (auto &kv : positive_cache_) {
-		if (kv.second.expires_at <= now) {
-			continue;
-		}
 		if (kv.second.secret->GetName() == name) {
+			kv.second.last_access = now;
 			return make_uniq<SecretEntry>(MakeEntry(kv.second.secret->Clone(), GetName()));
 		}
 	}
@@ -367,10 +415,9 @@ vector<SecretEntry> VgiRemoteSecretStorage::AllSecrets(optional_ptr<CatalogTrans
 	vector<SecretEntry> result;
 	std::lock_guard<std::mutex> lk(cache_mutex_);
 	const auto now = std::chrono::steady_clock::now();
+	PruneExpiredCachesLocked(now);
 	for (auto &kv : positive_cache_) {
-		if (kv.second.expires_at <= now) {
-			continue;
-		}
+		kv.second.last_access = now;
 		result.push_back(MakeEntry(kv.second.secret->Clone(), GetName()));
 	}
 	return result;
@@ -406,14 +453,8 @@ idx_t VgiRemoteSecretStorage::FlushCache() {
 
 idx_t VgiRemoteSecretStorage::CachedSecretCount() {
 	std::lock_guard<std::mutex> lk(cache_mutex_);
-	const auto now = std::chrono::steady_clock::now();
-	idx_t count = 0;
-	for (auto &kv : positive_cache_) {
-		if (kv.second.expires_at > now) {
-			count++;
-		}
-	}
-	return count;
+	PruneExpiredCachesLocked(std::chrono::steady_clock::now());
+	return positive_cache_.size();
 }
 
 } // namespace vgi

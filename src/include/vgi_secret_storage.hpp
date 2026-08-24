@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstddef>
 #include <exception>
 #include <map>
 #include <memory>
@@ -92,7 +93,26 @@ private:
 	struct PositiveEntry {
 		std::unique_ptr<const KeyValueSecret> secret;
 		SteadyTime expires_at;
+		SteadyTime last_access;
 	};
+
+	struct NegativeEntry {
+		SteadyTime expires_at;
+		SteadyTime last_access;
+	};
+
+	// The remote service controls the cardinality of scopes and callers control
+	// lookup paths, so both caches need hard entry limits in addition to TTLs.
+	// Positive entries are larger (they own cloned credentials), while negative
+	// entries are cheap but can have much higher path cardinality.
+	static constexpr size_t kMaxPositiveCacheEntries = 1024;
+	static constexpr size_t kMaxNegativeCacheEntries = 4096;
+
+	//! Remove every expired entry. Caller must hold cache_mutex_.
+	void PruneExpiredCachesLocked(SteadyTime now);
+	//! Apply access-order eviction until both maps satisfy their hard limits.
+	//! Caller must hold cache_mutex_.
+	void EnforceCacheLimitsLocked();
 
 	//! Result of a remote secret_lookup decode.
 	struct FetchResult {
@@ -149,7 +169,7 @@ private:
 	std::map<std::pair<std::string, std::string>, PositiveEntry> positive_cache_;
 	//! Negative cache keyed by (type, exact path). Short-TTL and coarse so it
 	//! cannot shadow a positive scope match.
-	std::map<std::pair<std::string, std::string>, SteadyTime> negative_cache_;
+	std::map<std::pair<std::string, std::string>, NegativeEntry> negative_cache_;
 	//! In-flight lookups keyed by (type, path); guarded by cache_mutex_.
 	std::map<std::pair<std::string, std::string>, std::shared_ptr<InflightLookup>> inflight_;
 };
