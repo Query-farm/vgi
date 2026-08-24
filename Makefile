@@ -433,10 +433,75 @@ test_java:
 
 # Rust has no Makefile of its own — build the example worker and point the
 # suite at it directly. Same .test files, only the worker differs.
+#
+# The auxiliary fixture workers come from vgi-rust's own ci/wrappers/, which
+# route the single example binary into the versioned / versioned_tables /
+# attach_options / bad_protocol catalogs via VGI_WORKER_CATALOG_NAME. They were
+# CI-only, so this lane ran 282 of the suite's cases where CI ran 292 — the
+# expensive lane finding MORE than the cheap one is the wrong way round.
+#
+# Bare subprocess transport, not launch:, deliberately. `cargo build` rewrites
+# the binary in place at a stable path, and a launcher keys its shared worker on
+# that path — so a launch: lane happily serves the PREVIOUS build's code after a
+# rebuild unless you remember to pkill first. A dev lane must not have that
+# footgun. The cost is VGI_REQUIRE_LAUNCHER_TRANSPORT staying unset, so the one
+# launcher-specific file still skips here; vgi-rust's CI covers it.
+# Coverage gates for the SDK lanes.
+#
+# A lane that stops running tests reports green — it has fewer results, and
+# every one of them passes. That is how a fixture worker silently dropping out
+# of the environment went unnoticed for months, and it is why both gates below
+# exist rather than just the skip REPORTING:
+#
+#   --min-executed   a floor on tests that actually ran. Set just under the
+#                    lane's current count; if the drop is intentional, lower it
+#                    in the same commit that causes it.
+#   --allow-skip     the skip reasons this lane expects. An UNLISTED reason
+#                    fails the run, so a newly-gated test cannot quietly leave
+#                    the lane. Mirrors vgi-java's EXPECTED_SKIP_REASONS, which
+#                    is where this idea comes from.
+#
+# The reasons here are the ones no launcher lane can satisfy: an external
+# runtime (docker, iceberg, spatial, network), an HTTP-transport-only file, or
+# a capability this worker genuinely lacks (dynamic code, writable tables).
+VGI_EXPECTED_SKIPS := \
+	--allow-skip 'require spatial' \
+	--allow-skip 'require-env VGI_DOCKER_IMAGE' \
+	--allow-skip 'require-env VGI_DOCKER_TCP_IMAGE' \
+	--allow-skip 'require-env VGI_GITHUB_NETWORK_TESTS' \
+	--allow-skip 'require-env VGI_TEST_ICEBERG' \
+	--allow-skip 'require-env VGI_TEST_COMPANION_TARGET' \
+	--allow-skip 'require-env VGI_TEST_BEARER_TOKEN' \
+	--allow-skip 'require-env VGI_HTTP_TRANSPORT' \
+	--allow-skip 'require-env VGI_HTTP_DISABLE_ZSTD' \
+	--allow-skip 'require-env VGI_HTTP_NO_COMPRESSION' \
+	--allow-skip 'require-env VGI_VERSIONED_HTTP_WORKER' \
+	--allow-skip 'require-env VGI_VERSIONED_TABLES_HTTP_WORKER' \
+	--allow-skip 'require-env VGI_WORKER_SUPPORTS_DYNAMIC_CODE' \
+	--allow-skip 'require-env VGI_SIMPLE_WRITABLE_WORKER' \
+	--allow-skip 'require-env VGI_SCHEMA_RECONCILE_DB' \
+	--allow-skip 'require-env VGI_RULES_WORKER' \
+	--allow-skip 'require-env VGI_REQUIRE_LAUNCHER_TRANSPORT'
+
+# Rust's lane runs 293 today. The floor sits a little under so an unrelated
+# environment wobble doesn't fail the build, while a fixture dropping out does.
+VGI_RUST_MIN_EXECUTED ?= 290
+VGI_COVERAGE_GATE = --min-executed $(VGI_RUST_MIN_EXECUTED) $(VGI_EXPECTED_SKIPS)
+
+VGI_RUST_WORKER   := $(VGI_RUST_DIR)/target/debug/vgi-example-worker
+VGI_RUST_WRAPPERS := $(VGI_RUST_DIR)/ci/wrappers
 test_rust:
 	cd $(VGI_RUST_DIR) && cargo build -p vgi-example-worker
-	VGI_TEST_WORKER="$(VGI_RUST_DIR)/target/debug/vgi-example-worker" \
-	    python3 scripts/run_tests.py -j 6 "test/sql/integration/*"
+	VGI_WORKER_BIN="$(VGI_RUST_WORKER)" \
+	VGI_TEST_WORKER="$(VGI_RUST_WORKER)" \
+	VGI_TEST_DEDICATED_WORKER="$(VGI_RUST_WORKER)" \
+	VGI_VERSIONED_WORKER="$(VGI_RUST_WRAPPERS)/vgi-worker-versioned" \
+	VGI_VERSIONED_TABLES_WORKER="$(VGI_RUST_WRAPPERS)/vgi-worker-versioned-tables" \
+	VGI_ATTACH_OPTIONS_WORKER="$(VGI_RUST_WRAPPERS)/vgi-worker-attach-options" \
+	VGI_ATTACH_OPTIONS_REQUIRED_WORKER="$(VGI_RUST_WRAPPERS)/vgi-worker-attach-options" \
+	VGI_BAD_PROTOCOL_WORKER="$(VGI_RUST_WRAPPERS)/vgi-worker-bad-protocol" \
+	VGI_BAD_ENUM_WORKER="$(VGI_RUST_WRAPPERS)/vgi-worker-bad-enum" \
+	    python3 scripts/run_tests.py -j 6 $(VGI_COVERAGE_GATE) "test/sql/integration/*"
 
 # Run the integration suite against every language implementation. Keeps going
 # on failure so one language's result doesn't mask the others, then exits
@@ -448,6 +513,29 @@ test_languages:
 		$(MAKE) $$t || rc=$$?; \
 	done; \
 	exit $$rc
+
+# ---------------------------------------------------------------------------
+# Schema parity.
+#
+# The protocol's Arrow record shapes are declared once in vgi-python and
+# reproduced in seven places (five SDK codegen outputs, vgi-python's own
+# hand-written records, and this client's hand-built request builders). Each
+# reproduction drifts on its own, and drift is invisible from inside the drifted
+# peer — every implementation is self-consistent right up until it talks to
+# another one. This runs all three layers of check in one command.
+#
+#   make schema_parity            # codegen drift + hand-built records + C++ client
+#   make schema_parity_cpp        # just the C++ client leg (no pytest, fast)
+#
+# The C++ leg needs the unit-test target, which is guarded by an env var read at
+# CONFIGURE time — so if you have never built it:
+#   BUILD_VGI_UNIT_TESTS=1 GEN=ninja make release
+.PHONY: schema_parity schema_parity_cpp
+schema_parity:
+	./scripts/check_schema_parity.sh
+
+schema_parity_cpp:
+	./scripts/check_schema_parity.sh --cpp-only
 
 # Interactive DuckDB shell with the vgi extension loaded and the example
 # python worker pre-attached as the `example` catalog. Use `make shell`

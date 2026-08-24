@@ -122,7 +122,39 @@ def run_one(test_path: Path, unittest: Path, env: dict[str, str]) -> dict:
         "stderr": stderr,
         "duration": time.monotonic() - t0,
         "error": error,
+        "skip_reasons": _parse_skips(stdout),
     }
+
+
+# Catch2's end-of-run banner, e.g.
+#     Skipped tests for the following reasons:
+#     require-env VGI_VERSIONED_WORKER: 1
+_SKIP_BANNER = "Skipped tests for the following reasons:"
+_SKIP_LINE = re.compile(r"^(.+): (\d+)$")
+
+
+def _parse_skips(stdout: str) -> dict[str, int]:
+    """Skip reasons and counts from one file's Catch2 output.
+
+    A skipped .test file EXITS 0, so classifying purely on exit code reports it
+    as a pass. That is not a cosmetic difference: it is how eleven files' worth
+    of fixture-gated behaviour sat unrun in the Rust and Java lanes while both
+    reported "326 passed", and how a `require httpfs` omission can delete a file
+    from a suite without anyone noticing. The runner has the output already —
+    the only thing missing was reading it.
+    """
+    if _SKIP_BANNER not in stdout:
+        return {}
+    reasons: dict[str, int] = {}
+    for line in stdout.split(_SKIP_BANNER, 1)[1].splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        m = _SKIP_LINE.match(line)
+        if not m:
+            break  # past the banner block
+        reasons[m.group(1)] = reasons.get(m.group(1), 0) + int(m.group(2))
+    return reasons
 
 
 def _format_result_line(idx: int, total: int, result: dict) -> str:
@@ -175,9 +207,26 @@ def _print_summary(
         f"Ran {len(results)} tests in {elapsed:.2f}s "
         f"(serial would be ~{total_serial:.2f}s, speedup {speedup:.1f}×)"
     )
-    print(f"  {GREEN(f'passed: {len(passes)}')}")
+    # A file whose every test skipped exits 0 but ran nothing; counting it as a
+    # pass is how a silently-empty lane reports green. Split them out.
+    skipped = [r for r in results if r["exit"] == 0 and r["skip_reasons"]]
+    executed = len(passes) - len(skipped)
+    print(f"  {GREEN(f'passed: {executed}')}")
+    if skipped:
+        print(f"  {YELLOW(f'skipped: {len(skipped)}')} "
+              f"{DIM('(exited 0 but ran nothing — not a pass)')}")
     if fails:
         print(f"  {RED(f'failed: {len(fails)}')}")
+
+    if skipped:
+        totals: dict[str, int] = {}
+        for r in skipped:
+            for reason, n in r["skip_reasons"].items():
+                totals[reason] = totals.get(reason, 0) + n
+        print()
+        print(DIM("  skipped for:"))
+        for reason, n in sorted(totals.items()):
+            print(DIM(f"    {reason}: {n}"))
 
     # Duration distribution — picks up patterns (one slow outlier vs the
     # whole suite being slow) at a glance.
@@ -223,7 +272,9 @@ def _write_timings_csv(results: list[dict], path: Path) -> None:
                 str(r["path"]),
                 f"{r['duration']:.6f}",
                 r["exit"],
-                "PASS" if r["exit"] == 0 else "FAIL",
+                # SKIP, not PASS: a skipped file exits 0 and ran nothing, and a
+                # trend line that counts it as a pass hides a lane going quiet.
+                ("SKIP" if r["skip_reasons"] else "PASS") if r["exit"] == 0 else "FAIL",
             ])
 
 
@@ -299,6 +350,26 @@ def main(argv: Iterable[str] | None = None) -> int:
         help="Also write all per-test durations to this CSV file "
         "(columns: test_path, duration_seconds, exit_code, status).",
     )
+    parser.add_argument(
+        "--min-executed",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Fail unless at least N test files actually EXECUTED (skips excluded). "
+        "A coverage floor: a lane whose fixture workers stop being wired goes quiet "
+        "rather than red, and every gap found in this suite so far hid behind exactly "
+        "that. Set it just below the lane's current count.",
+    )
+    parser.add_argument(
+        "--allow-skip",
+        action="append",
+        default=[],
+        metavar="REASON",
+        help="A skip reason this lane expects, e.g. 'require-env VGI_TEST_ICEBERG'. "
+        "Repeatable. When any --allow-skip is given, an UNLISTED skip reason fails the "
+        "run — so a test that silently stops executing is a failure, not a quieter "
+        "green. Match is on the reason text the runner prints.",
+    )
     args = parser.parse_args(argv)
 
     unittest = _find_unittest(args.root, args.build)
@@ -357,7 +428,37 @@ def main(argv: Iterable[str] | None = None) -> int:
     if args.timings_csv is not None:
         _write_timings_csv(results, args.timings_csv)
         print(DIM(f"wrote timings to {args.timings_csv}"), file=sys.stderr)
-    return 1 if any(r["exit"] != 0 for r in results) else 0
+    failed = any(r["exit"] != 0 for r in results)
+
+    # Coverage gates. These run even when every test passed, because "passed"
+    # is exactly what a lane that stopped running things reports.
+    skipped_results = [r for r in results if r["exit"] == 0 and r["skip_reasons"]]
+    executed = len(results) - len(skipped_results) - sum(1 for r in results if r["exit"] != 0)
+    gate_failed = False
+
+    if args.allow_skip:
+        seen: set[str] = set()
+        for r in skipped_results:
+            seen.update(r["skip_reasons"])
+        unexpected = sorted(seen - set(args.allow_skip))
+        if unexpected:
+            gate_failed = True
+            print()
+            print(RED("unexpected skip reasons (not in --allow-skip):"))
+            for reason in unexpected:
+                print(RED(f"    {reason}"))
+            print(DIM("  A skip this lane did not declare means a test stopped running. "
+                      "Either wire the fixture it needs, or add --allow-skip with the reason."))
+
+    if args.min_executed is not None and executed < args.min_executed:
+        gate_failed = True
+        print()
+        print(RED(f"coverage floor: {executed} tests executed, expected at least "
+                  f"{args.min_executed}"))
+        print(DIM("  Fixture workers this lane used to wire may have stopped resolving. "
+                  "If the drop is intentional, lower --min-executed in the same commit."))
+
+    return 1 if (failed or gate_failed) else 0
 
 
 if __name__ == "__main__":
