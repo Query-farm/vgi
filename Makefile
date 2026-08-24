@@ -391,25 +391,21 @@ test_all_debug: test_spawn_debug test_shm_debug test_http_debug test_http_bearer
 # first if switching tiers mid-session.)
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
-# CI: make the inherited test targets able to run the integration suite.
+# The integration suite does NOT run from `make test_<build_type>`.
 #
-# CI invokes `make test_$(BUILD_TYPE)` from extension-ci-tools, and every VGI
-# integration .test file carries `require-env VGI_TEST_WORKER` — so with no
-# worker on the runner they all SKIP, and a green run means "built +
-# header-clean" rather than "integration suite passed".
+# It used to try: a `ci_fixtures` prerequisite on the inherited target, so the
+# distribution pipeline's test step would install the vgi-python fixture
+# workers first. That could never work. The reusable workflow exposes no hook
+# that runs a command before testing, and its Linux leg runs the tests inside
+# `docker run ... make test_release` — a fresh container the install never
+# reached. Worse than a no-op: VGI_TEST_WORKER was set from `test_env_variables`
+# while the worker it named did not exist, so ~300 tests FAILED rather than
+# skipping.
 #
-# The reusable distribution workflow exposes exactly ONE hook,
-# `test_config.test_env_variables` (env vars, no setup command), which is why
-# this is wired as a PREREQUISITE on the inherited target rather than a new
-# target CI would have no way to select. The script is a no-op unless
-# VGI_INSTALL_FIXTURES=1, so a local `make test_release` is unchanged.
-.PHONY: ci_fixtures
-ci_fixtures:
-	@./scripts/ci_install_fixtures.sh
-
-test_release: ci_fixtures
-test_debug: ci_fixtures
-test_reldebug: ci_fixtures
+# scripts/ci_install_fixtures.sh is still the installer; it is now invoked by
+# .github/workflows/integration.yml, which owns its own steps and can run a
+# command before the suite. Locally, `make test_launcher` already points at a
+# worker directly.
 # ---------------------------------------------------------------------------
 
 VGI_GO_DIR   ?= $(HOME)/Development/vgi-go

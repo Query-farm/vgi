@@ -46,28 +46,18 @@ jobs:
       use_prebuilt_wasm_image: true
       prebuilt_image_tag: v1.5.5
       extra_toolchains: parser_tools
-      # Make the in-workflow `make test_<build_type>` step actually RUN the
-      # integration suite instead of skipping it.
+      # NOTE: this pipeline does NOT run the VGI integration suite.
       #
-      # Every VGI integration .test file carries `require-env VGI_TEST_WORKER`,
-      # so with no worker on the runner all ~300 of them SKIP and the run is
-      # reported green — "built + header-clean", not "integration suite passed".
-      # That is how the cross-SDK drift in CLAUDE.md accumulated unnoticed.
+      # Every integration .test file carries `require-env VGI_TEST_WORKER`, so
+      # with no worker on the runner all ~300 SKIP and this job means "built +
+      # header-clean" — nothing more. That is a real gap, and it is covered by
+      # .github/workflows/integration.yml instead, which owns its own steps and
+      # can therefore install the fixture workers before testing.
       #
-      # This workflow exposes exactly one hook, `test_env_variables` (env vars,
-      # no setup command), so the install itself hangs off a `ci_fixtures`
-      # prerequisite on the inherited test target — see scripts/ci_install_fixtures.sh.
-      # It clones the PUBLIC vgi-python repo (the fixture workers are dev-only
-      # and deliberately absent from the published wheel) and fails loudly if
-      # the worker will not run, because a broken install would otherwise look
-      # identical to success.
-      #
-      # Pin VGI_FIXTURES_REF when the extension needs a worker newer than
-      # vgi-python's main; a protocol mismatch fails the ATTACH with a message
-      # naming both versions.
-      test_config: >-
-        {"test_env_variables": {
-          "VGI_INSTALL_FIXTURES": "1",
-          "VGI_FIXTURES_DIR": "/tmp/vgi-python",
-          "VGI_TEST_WORKER": "uv run --project /tmp/vgi-python vgi-fixture-worker"
-        }}
+      # It was briefly attempted here, via `test_env_variables` plus a
+      # `ci_fixtures` prerequisite on the inherited `make test_<type>` target.
+      # It cannot work: the reusable distribution workflow exposes no hook that
+      # runs a COMMAND before the test step, and on the Linux leg the tests run
+      # inside `docker run ... make test_release`, a fresh container the install
+      # never reached. The result was worse than skipping — VGI_TEST_WORKER was
+      # set, so ~300 tests FAILED against a worker path that did not exist.
