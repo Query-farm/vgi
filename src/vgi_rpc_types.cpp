@@ -774,6 +774,18 @@ BuildInitRequest(const std::vector<uint8_t> &bind_call_bytes, const std::vector<
 	auto order_direction_type = arrow::dictionary(arrow::int16(), arrow::utf8());
 	auto order_null_order_type = arrow::dictionary(arrow::int16(), arrow::utf8());
 
+	// This record must match InitRequestSchema() in the generated header
+	// EXACTLY — every declared field, in the declared order, with the declared
+	// type and nullability. test/cpp/test_request_schema_parity.cpp asserts it.
+	//
+	// Exactly, not approximately: vgi-rpc-go validates a request record against
+	// its declared parameter contract with arrow.Schema.Equal, which is
+	// order-, name-, type- AND nullability-sensitive. Omitting a nullable field
+	// the client has no value for is NOT wire-safe there — it fails every call
+	// of that shape with "parameter schema mismatch", naming two 19-line
+	// schemas that differ in one row. `row_limit` is exactly that case: DuckDB
+	// has no limit to put in it (TableFunctionInitInput carries none), so it
+	// ships as an explicit null rather than being left out.
 	auto schema = arrow::schema({
 	    arrow::field("bind_call", arrow::binary(), false),
 	    arrow::field("output_schema", arrow::binary(), false),
@@ -781,18 +793,19 @@ BuildInitRequest(const std::vector<uint8_t> &bind_call_bytes, const std::vector<
 	    arrow::field("projection_ids", arrow::list(arrow::int64()), true),
 	    arrow::field("pushdown_filters", arrow::large_binary(), true),
 	    arrow::field("join_keys", arrow::list(arrow::large_binary()), true),
+	    arrow::field("split_tokens", arrow::list(arrow::large_binary()), true),
+	    arrow::field("row_limit", arrow::int64(), true),
 	    arrow::field("phase", phase_type, true),
+	    arrow::field("finalize_state_id", arrow::binary(), true),
 	    arrow::field("execution_id", arrow::binary(), true),
 	    arrow::field("init_opaque_data", arrow::binary(), true),
+	    arrow::field("substream_id", arrow::binary(), true),
 	    arrow::field("order_by_column_name", arrow::utf8(), true),
 	    arrow::field("order_by_direction", order_direction_type, true),
 	    arrow::field("order_by_null_order", order_null_order_type, true),
 	    arrow::field("order_by_limit", arrow::int64(), true),
 	    arrow::field("tablesample_percentage", arrow::float64(), true),
 	    arrow::field("tablesample_seed", arrow::int64(), true),
-	    arrow::field("finalize_state_id", arrow::binary(), true),
-	    arrow::field("substream_id", arrow::binary(), true),
-	    arrow::field("split_tokens", arrow::list(arrow::large_binary()), true),
 	});
 
 	std::vector<std::shared_ptr<arrow::Array>> arrays;
@@ -849,6 +862,38 @@ BuildInitRequest(const std::vector<uint8_t> &bind_call_bytes, const std::vector<
 		arrays.push_back(FinishArray(list_builder, "join_keys"));
 	}
 
+	// split_tokens: list<large_binary>|null — the splits this init redeems.
+	//
+	// A list rather than a single token because DataFusion's partition_count() IS
+	// its concurrency: it must bin-pack at planning time and read a whole group per
+	// partition, and without the list that would be N sequential inits. DuckDB always
+	// sends exactly one — it claims greedily, one split at a time, because it cannot
+	// see per-split cost and any grouping it invented would be a guess.
+	{
+		auto value_builder = std::make_shared<arrow::LargeBinaryBuilder>();
+		arrow::ListBuilder list_builder(arrow::default_memory_pool(), value_builder);
+		if (split_tokens.empty()) {
+			CheckStatus(list_builder.AppendNull(), "append null split_tokens");
+		} else {
+			CheckStatus(list_builder.Append(), "start split_tokens list");
+			for (const auto &tok : split_tokens) {
+				CheckStatus(value_builder->Append(tok.data(), static_cast<int64_t>(tok.size())),
+				            "append split token");
+			}
+		}
+		arrays.push_back(FinishArray(list_builder, "split_tokens"));
+	}
+
+	// row_limit: int64|null — always null from DuckDB. TableFunctionInitInput
+	// carries no limit, and the Top-N `order_by_limit` means something
+	// different ("top K by that column"), so reusing it here would be a lie.
+	// DataFusion supplies a real value via TableProvider::scan(limit).
+	{
+		arrow::Int64Builder builder;
+		CheckStatus(builder.AppendNull(), "append null row_limit");
+		arrays.push_back(FinishArray(builder, "row_limit"));
+	}
+
 	// phase: dictionary(int16, utf8)|null
 	if (phase.empty()) {
 		arrays.push_back(BuildNullDictionaryArray(phase_type, phase_values));
@@ -856,11 +901,31 @@ BuildInitRequest(const std::vector<uint8_t> &bind_call_bytes, const std::vector<
 		arrays.push_back(BuildEnumArray(phase, phase_values));
 	}
 
+	// finalize_state_id: binary|null — required for phase=TABLE_BUFFERING_FINALIZE.
+	// Opaque worker-chosen bytes from table_buffering_combine.
+	{
+		arrow::BinaryBuilder builder;
+		if (finalize_state_id.has_value()) {
+			CheckStatus(
+			    builder.Append(finalize_state_id->data(),
+			                   static_cast<int32_t>(finalize_state_id->size())),
+			    "append finalize_state_id");
+		} else {
+			CheckStatus(builder.AppendNull(), "append null finalize_state_id");
+		}
+		arrays.push_back(FinishArray(builder, "finalize_state_id"));
+	}
+
 	// execution_id: binary|null
 	arrays.push_back(BuildBinaryScalar(execution_id));
 
 	// init_opaque_data: binary|null
 	arrays.push_back(BuildBinaryScalar(init_opaque_data));
+
+	// substream_id: binary|null — stable client-minted per-substream id for the
+	// parallel streaming table-in-out path. Empty => null (serial path / not a
+	// streaming table-in-out). See InitRequest.substream_id in vgi/protocol.py.
+	arrays.push_back(BuildBinaryScalar(substream_id));
 
 	// order_by_column_name: utf8|null
 	arrays.push_back(BuildNullableStringScalar(order_by_column_name));
@@ -916,48 +981,6 @@ BuildInitRequest(const std::vector<uint8_t> &bind_call_bytes, const std::vector<
 			CheckStatus(builder.Append(tablesample_seed), "append tablesample_seed");
 		}
 		arrays.push_back(FinishArray(builder, "tablesample_seed"));
-	}
-
-	// finalize_state_id: binary|null — required for phase=TABLE_BUFFERING_FINALIZE.
-	// Opaque worker-chosen bytes from table_buffering_combine.
-	{
-		arrow::BinaryBuilder builder;
-		if (finalize_state_id.has_value()) {
-			CheckStatus(
-			    builder.Append(finalize_state_id->data(),
-			                   static_cast<int32_t>(finalize_state_id->size())),
-			    "append finalize_state_id");
-		} else {
-			CheckStatus(builder.AppendNull(), "append null finalize_state_id");
-		}
-		arrays.push_back(FinishArray(builder, "finalize_state_id"));
-	}
-
-	// substream_id: binary|null — stable client-minted per-substream id for the
-	// parallel streaming table-in-out path. Empty => null (serial path / not a
-	// streaming table-in-out). See InitRequest.substream_id in vgi/protocol.py.
-	arrays.push_back(BuildBinaryScalar(substream_id));
-
-	// split_tokens: list<large_binary>|null — the splits this init redeems.
-	//
-	// A list rather than a single token because DataFusion's partition_count() IS
-	// its concurrency: it must bin-pack at planning time and read a whole group per
-	// partition, and without the list that would be N sequential inits. DuckDB always
-	// sends exactly one — it claims greedily, one split at a time, because it cannot
-	// see per-split cost and any grouping it invented would be a guess.
-	{
-		auto value_builder = std::make_shared<arrow::LargeBinaryBuilder>();
-		arrow::ListBuilder list_builder(arrow::default_memory_pool(), value_builder);
-		if (split_tokens.empty()) {
-			CheckStatus(list_builder.AppendNull(), "append null split_tokens");
-		} else {
-			CheckStatus(list_builder.Append(), "start split_tokens list");
-			for (const auto &tok : split_tokens) {
-				CheckStatus(value_builder->Append(tok.data(), static_cast<int64_t>(tok.size())),
-				            "append split token");
-			}
-		}
-		arrays.push_back(FinishArray(list_builder, "split_tokens"));
 	}
 
 	return arrow::RecordBatch::Make(schema, 1, arrays);
@@ -1098,6 +1121,19 @@ std::shared_ptr<arrow::RecordBatch> BuildTableFunctionCardinalityRequest(const s
 	return arrow::RecordBatch::Make(schema, 1, arrays);
 }
 
+namespace {
+
+//! A single-row int64 column holding null. The plan request declares several
+//! nullable int64 fields DuckDB never has a value for, and they must still be
+//! present (see BuildTableFunctionPlanRequest).
+std::shared_ptr<arrow::Array> NullInt64Scalar(const char *what) {
+	arrow::Int64Builder builder;
+	CheckStatus(builder.AppendNull(), what);
+	return FinishArray(builder, what);
+}
+
+} // namespace
+
 //! Build the inner ``TableFunctionPlanRequest`` record for the scan-planning RPC.
 //!
 //! Only the fields DuckDB can actually supply are populated. Notably ``row_limit``
@@ -1118,14 +1154,45 @@ BuildTableFunctionPlanRequest(const std::vector<uint8_t> &bind_call_bytes,
                               const std::vector<uint8_t> &pushdown_filters,
                               int64_t min_splits, int64_t target_split_bytes,
                               const std::vector<uint8_t> &cursor) {
+	// This record must match TableFunctionPlanRequestSchema() in the generated
+	// header EXACTLY — see BuildInitRequest for why a subset is not wire-safe
+	// (vgi-rpc-go compares with arrow.Schema.Equal). Most of these twenty
+	// fields are null from DuckDB and stay null; they are present because the
+	// protocol declares them, not because there is a value to send:
+	//
+	//   row_limit                — TableFunctionInitInput carries no limit
+	//   max_splits_per_response  — DuckDB enumerates in one page
+	//   refined_filters          — the plan is built from static filters only;
+	//                              join keys land after InitGlobal
+	//   start/end_position       — no streaming scan
+	//   order_by_* / tablesample_* — these reach the worker on the init call
+	//
+	// `filters_complete` is the one that carries real information: it is
+	// non-nullable, and DuckDB genuinely knows the answer. It plans from static
+	// filters only, so no refinement is ever coming and a worker must not hold
+	// splits back waiting for one.
+	auto dict_type = arrow::dictionary(arrow::int16(), arrow::utf8());
 	auto schema = arrow::schema({
 	    arrow::field("bind_call", arrow::binary(), false),
 	    arrow::field("bind_opaque_data", arrow::binary(), true),
 	    arrow::field("projection_ids", arrow::list(arrow::int64()), true),
 	    arrow::field("pushdown_filters", arrow::large_binary(), true),
-	    arrow::field("min_splits", arrow::int64(), true),
+	    arrow::field("join_keys", arrow::list(arrow::large_binary()), true),
+	    arrow::field("row_limit", arrow::int64(), true),
 	    arrow::field("target_split_bytes", arrow::int64(), true),
+	    arrow::field("min_splits", arrow::int64(), true),
+	    arrow::field("max_splits_per_response", arrow::int64(), true),
 	    arrow::field("cursor", arrow::binary(), true),
+	    arrow::field("refined_filters", arrow::large_binary(), true),
+	    arrow::field("filters_complete", arrow::boolean(), false),
+	    arrow::field("start_position", arrow::binary(), true),
+	    arrow::field("end_position", arrow::binary(), true),
+	    arrow::field("order_by_column_name", arrow::utf8(), true),
+	    arrow::field("order_by_direction", dict_type, true),
+	    arrow::field("order_by_null_order", dict_type, true),
+	    arrow::field("order_by_limit", arrow::int64(), true),
+	    arrow::field("tablesample_percentage", arrow::float64(), true),
+	    arrow::field("tablesample_seed", arrow::int64(), true),
 	});
 
 	std::vector<std::shared_ptr<arrow::Array>> arrays;
@@ -1170,10 +1237,56 @@ BuildTableFunctionPlanRequest(const std::vector<uint8_t> &bind_call_bytes,
 		}
 		return FinishArray(b, what);
 	};
-	arrays.push_back(int_or_null(min_splits, "min_splits"));
+	// join_keys: list<large_binary>|null — always null. A plan is built from
+	// STATIC filters only; join-key values arrive after InitGlobal and prune
+	// WITHIN a split rather than deciding the split set.
+	{
+		auto value_builder = std::make_shared<arrow::LargeBinaryBuilder>();
+		arrow::ListBuilder list_builder(arrow::default_memory_pool(), value_builder);
+		CheckStatus(list_builder.AppendNull(), "append null join_keys");
+		arrays.push_back(FinishArray(list_builder, "join_keys"));
+	}
+
+	arrays.push_back(NullInt64Scalar("row_limit"));
 	arrays.push_back(int_or_null(target_split_bytes, "target_split_bytes"));
+	arrays.push_back(int_or_null(min_splits, "min_splits"));
+	arrays.push_back(NullInt64Scalar("max_splits_per_response"));
 
 	arrays.push_back(BuildBinaryScalar(cursor));
+
+	// refined_filters: large_binary|null — always null, for the same reason
+	// join_keys is (see above).
+	{
+		arrow::LargeBinaryBuilder builder;
+		CheckStatus(builder.AppendNull(), "append null refined_filters");
+		arrays.push_back(FinishArray(builder, "refined_filters"));
+	}
+
+	// filters_complete: always true from DuckDB. The field tells a worker
+	// whether to hold splits back awaiting a narrower filter; DuckDB never
+	// sends one, so holding back would stall the scan forever.
+	{
+		arrow::BooleanBuilder builder;
+		CheckStatus(builder.Append(true), "append filters_complete");
+		arrays.push_back(FinishArray(builder, "filters_complete"));
+	}
+
+	// start_position / end_position: no streaming scan, so no position range.
+	arrays.push_back(BuildBinaryScalar({}));
+	arrays.push_back(BuildBinaryScalar({}));
+
+	// The order / sample hints reach the worker on the init call, not here.
+	arrays.push_back(BuildNullableStringScalar(""));
+	arrays.push_back(BuildNullDictionaryArray(dict_type, {"ASC", "DESC"}));
+	arrays.push_back(BuildNullDictionaryArray(dict_type, {"NULLS_FIRST", "NULLS_LAST"}));
+	arrays.push_back(NullInt64Scalar("order_by_limit"));
+	{
+		arrow::DoubleBuilder builder;
+		CheckStatus(builder.AppendNull(), "append null tablesample_percentage");
+		arrays.push_back(FinishArray(builder, "tablesample_percentage"));
+	}
+	arrays.push_back(NullInt64Scalar("tablesample_seed"));
+
 	return arrow::RecordBatch::Make(schema, 1, arrays);
 }
 

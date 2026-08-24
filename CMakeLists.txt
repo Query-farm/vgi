@@ -210,6 +210,7 @@ if((BUILD_VGI_UNIT_TESTS OR DEFINED ENV{BUILD_VGI_UNIT_TESTS}) AND NOT WIN32)
     test/cpp/test_container_runtime.cpp
     test/cpp/test_oauth.cpp
     test/cpp/test_telemetry.cpp
+    test/cpp/test_request_schema_parity.cpp
     test/cpp/test_sab_stream.cpp
     test/cpp/test_sab_e2e.cpp
     test/cpp/test_sab_conn.cpp
