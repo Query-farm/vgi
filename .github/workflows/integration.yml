@@ -74,7 +74,15 @@ jobs:
       - name: Build the extension (release)
         run: make release
 
+      # enable-cache is off deliberately. The only uv project here is the
+      # fixture checkout at /tmp/vgi-python, created after this step runs and
+      # outside the workspace; the action's post-job "Pruning cache" step hung
+      # on it for five minutes and then exited 2 — failing a job whose suite had
+      # already passed 282/282. There is nothing worth caching: the clone is
+      # shallow and the sync is seconds.
       - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: false
 
       # Clones vgi-python and PROVES the worker runs before the suite starts.
       # Without that proof a broken install is indistinguishable from success:
