@@ -1165,10 +1165,38 @@ OperatorFinalizeResultType VgiTableInOutFinalize(ExecutionContext &context, Tabl
 	        {{"conn", conn->GetConnIdHex()},
 	         {"worker_path", bind_data.worker_path()},
 	         {"function_name", bind_data.function_name}});
-	auto output_batch = conn->ReadDataBatch();
+	// EOS is a NULL batch. A 0-ROW batch is not — it is a producer turn that
+	// carried no data, and treating it as end-of-stream silently truncated every
+	// multi-batch FINALIZE over HTTP.
+	//
+	// How it presented: the FINALIZE init response buffers its batches, and the
+	// last one is empty. Over subprocess that empty batch never arrives (the IPC
+	// reader returns null at EOS), so the bug was invisible there; over HTTP the
+	// first read returned the data batch and the second returned the empty one,
+	// which ended the stream while `stream_state_token_` was still live. The
+	// continuation request was never issued at all — measured as 2 reads, 1
+	// emitted batch and 0 producer exchanges for a flush of 200. A worker whose
+	// finalize emits one batch was unaffected, which is every other fixture, in
+	// every SDK.
+	//
+	// It failed SILENTLY rather than loudly: the rows that did arrive were
+	// correct, so only a count betrayed the missing ones.
+	//
+	// Skipping empties here rather than returning HAVE_MORE_OUTPUT keeps the
+	// decision inside this call, so it does not depend on how DuckDB treats an
+	// empty output chunk from FinalExecute. The loop terminates because an
+	// exhausted producer returns null: over HTTP once the response carries no
+	// continuation token, over subprocess at IPC EOS.
+	std::shared_ptr<arrow::RecordBatch> output_batch;
+	for (;;) {
+		output_batch = conn->ReadDataBatch();
+		if (!output_batch || output_batch->num_rows() > 0) {
+			break;
+		}
+	}
 
-	if (!output_batch || output_batch->num_rows() == 0) {
-		// No more output - clean up
+	if (!output_batch) {
+		// End of stream - clean up
 		release_and_finish();
 		return OperatorFinalizeResultType::FINISHED;
 	}

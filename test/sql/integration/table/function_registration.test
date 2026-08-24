@@ -72,6 +72,12 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 # 1 parallel-streaming-finalize fixture (substream_partial_sum, a streaming
 #   TableInOutFunction whose per-substream finalize emits this substream's partial
 #   sum — see table_in_out/parallel_finalize.test)
+# 1 multi-batch-finalize fixture (multi_batch_finish, a streaming
+#   TableInOutFunction whose finalize emits ONE BATCH PER INPUT ROW. Every other
+#   finalize fixture emits a single batch, which is the easy case: over HTTP a
+#   producer is lock-step, so one batch completes in one turn and never needs a
+#   continuation. Two or more do — and that path silently truncated to the first
+#   batch until this fixture existed. See table_in_out/multi_batch_finalize.test)
 # 7 blended ("UNNEST-style") fixtures (geo_encode + geo_encode3, arity-overloaded
 #   RowTransformFunctions sharing the name "geo_encode"; row_sum, a VARARGS blended
 #   fn; blended_drop, a 1->0 scan-mode edge-case map — positional args ARE the
@@ -132,13 +138,13 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 #   re-emits its splits across pages); and four pair splits with another
 #   feature (split_batch_index, split_partitioned, split_dynamic_filter,
 #   split_cacheable). Back splits/*.test.
-# = 161
+# = 162
 query I
 SELECT COUNT(*)
 FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'table';
 ----
-161
+162
 
 # The 34 pure table functions (no TABLE parameter type)
 # Note: make_series appears 5 times (5 overloads), make_pairs appears 3 times,

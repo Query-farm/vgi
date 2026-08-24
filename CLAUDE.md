@@ -250,7 +250,7 @@ accumulated unnoticed, so it is wired shut:
   works for the Linux in-docker leg, where the env vars are forwarded into the
   container and the install happens inside it.
 - `VGI_FIXTURES_REF` pins the worker revision to a **vgi-python release tag**
-  (currently `v0.29.0`), not `main`. **Bump it in lockstep with the protocol
+  (currently `v0.29.1`), not `main`. **Bump it in lockstep with the protocol
   version** — it must name a release speaking the same `VGI_PROTOCOL_VERSION` as
   `src/`, or ATTACH fails with a message naming both versions (the right failure,
   but it fails the build). Override per-run with the `fixtures_ref`

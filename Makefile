@@ -423,7 +423,7 @@ VGI_RUST_DIR ?= $(HOME)/Development/vgi-rust
 # conformance lane, so it gets the same two gates the rust/go/java/typescript
 # lanes have.
 #
-# Python runs 303 today.
+# Python runs 304 today.
 #
 # VGI_TEST_DEDICATED_WORKER is DECLARED as an expected skip rather than wired.
 # Two tests want a non-launcher worker, and pointing the var at the raw `uv run`

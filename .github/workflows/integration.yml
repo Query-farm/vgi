@@ -47,7 +47,7 @@ jobs:
     env:
       VGI_INSTALL_FIXTURES: "1"
       VGI_FIXTURES_DIR: /tmp/vgi-python
-      VGI_FIXTURES_REF: ${{ inputs.fixtures_ref || 'v0.29.0' }}
+      VGI_FIXTURES_REF: ${{ inputs.fixtures_ref || 'v0.29.1' }}
       GEN: ninja
       USE_MERGED_VCPKG_MANIFEST: "1"
       VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"

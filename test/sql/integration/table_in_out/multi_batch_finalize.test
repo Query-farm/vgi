@@ -1,0 +1,107 @@
+# name: test/sql/integration/table_in_out/multi_batch_finalize.test
+# description: A streaming table-in-out FINALIZE that emits MANY batches.
+#
+#   Every other finalize fixture in every SDK returns exactly ONE batch, and one
+#   batch is the easy case: over HTTP a producer is strictly lock-step (one batch
+#   per response), so a single-batch flush completes inside its one turn and never
+#   needs a continuation token. A flush of TWO OR MORE batches does — and in
+#   vgi-rust that path was a hard error instead of a pagination, which nothing
+#   noticed for as long as no fixture emitted a second batch.
+#
+#   `multi_batch_finish` emits one batch per input row the substream saw: `rows`
+#   batches, the first carrying that substream's `total` and the rest carrying 0.
+#   Splitting it that way makes the two failure modes tell themselves apart:
+#
+#     * SUM(n) wrong   -> a batch's CONTENTS were lost, duplicated or reordered.
+#     * COUNT(*) wrong -> a BATCH was lost or repeated. This is the one that
+#       catches a broken continuation, because a flush truncated after its first
+#       batch still SUMS correctly and only the count betrays it.
+#
+#   Both invariants hold however DuckDB fans the input across substreams (each
+#   substream's partials sum to the whole, and its batch count equals its row
+#   count), so nothing here assumes a thread or substream count.
+# group: [vgi_integration_table_in_out]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+# HTTP transport ATTACH needs httpfs loaded (else a "VGI HTTP transport requires
+# the httpfs extension" error — containing "HTTP" — makes the harness silently
+# skip the whole file). Harmless on subprocess.
+require httpfs
+
+statement ok
+ATTACH 'example' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ---------------------------------------------------------------------------
+# Single substream, many batches — the case the HTTP continuation must serve.
+# threads=1 keeps it to ONE substream, so one finalize really does flush 200
+# batches rather than 200 substreams flushing one batch each.
+# ---------------------------------------------------------------------------
+
+statement ok
+SET threads=1;
+
+# 200 input rows -> 200 finalize batches from a single flush.
+query II
+SELECT COUNT(*), SUM(n) FROM ex.multi_batch_finish((SELECT i AS n FROM range(1, 201) t(i)));
+----
+200	20100
+
+# Two rows is the smallest input that needs a continuation at all: one batch
+# fits in a single HTTP turn, two do not.
+query II
+SELECT COUNT(*), SUM(n) FROM ex.multi_batch_finish((SELECT i AS n FROM range(1, 3) t(i)));
+----
+2	3
+
+# One row still works — the single-batch flush keeps its one-turn drain.
+query II
+SELECT COUNT(*), SUM(n) FROM ex.multi_batch_finish((SELECT i AS n FROM range(1, 2) t(i)));
+----
+1	1
+
+# Empty input: no rows accumulated, so no batches to flush.
+query I
+SELECT COUNT(*) FROM ex.multi_batch_finish((SELECT i AS n FROM range(1, 1) t(i)));
+----
+0
+
+# ---------------------------------------------------------------------------
+# Parallel — several substreams, each flushing several batches. The invariants
+# are per-substream sums and counts, so they hold at any fan-out.
+# ---------------------------------------------------------------------------
+
+statement ok
+SET threads=8;
+
+statement ok
+CREATE TABLE big AS SELECT i AS n FROM range(1, 5001) t(i);
+
+# sum(1..5000) = 12502500, and one output row per input row.
+query II
+SELECT COUNT(*), SUM(n) FROM ex.multi_batch_finish((SELECT n FROM big));
+----
+5000	12502500
+
+# UNION ALL: each branch is its own substream, so this is several independent
+# multi-batch flushes unioned together.
+query II
+SELECT COUNT(*), SUM(n) FROM (
+    SELECT n FROM ex.multi_batch_finish((SELECT n FROM big))
+    UNION ALL
+    SELECT n FROM ex.multi_batch_finish((SELECT n FROM big))
+);
+----
+10000	25005000
+
+# pool false → a fresh worker per substream acquire, so a flush that depended on
+# state left behind on a shared worker would show up here.
+statement ok
+ATTACH 'example' AS ex2 (TYPE vgi, LOCATION '${VGI_TEST_WORKER}', pool false);
+
+query II
+SELECT COUNT(*), SUM(n) FROM ex2.multi_batch_finish((SELECT n FROM big));
+----
+5000	12502500
