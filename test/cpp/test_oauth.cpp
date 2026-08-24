@@ -8,6 +8,7 @@
 #include "catch.hpp"
 
 #include "vgi_oauth.hpp"
+#include "vgi_cache_identity.hpp"
 
 #include <chrono>
 #include <cstdlib>
@@ -162,6 +163,41 @@ TEST_CASE("TokenStillFresh rejects an already-expired token", "[oauth]") {
 	const auto now = std::chrono::steady_clock::now();
 	REQUIRE_FALSE(duckdb::vgi::TokenStillFresh(now - std::chrono::seconds(1), now,
 	                                           std::chrono::seconds(45)));
+}
+
+//===--------------------------------------------------------------------===//
+// Cache credential fingerprint — security boundary for result isolation
+//===--------------------------------------------------------------------===//
+
+TEST_CASE("credential cache fingerprints are opaque and domain separated", "[oauth][cache]") {
+	const std::string token = "header.payload.signature";
+	const auto oauth = duckdb::vgi::ComputeCredentialCacheFingerprint("oauth", token);
+	const auto bearer = duckdb::vgi::ComputeCredentialCacheFingerprint("bearer", token);
+
+	REQUIRE(oauth.size() == std::string("oauth:").size() + 64);
+	REQUIRE(bearer.size() == std::string("bearer:").size() + 64);
+	CHECK(oauth != bearer);
+	CHECK(oauth.find(token) == std::string::npos);
+	CHECK(bearer.find(token) == std::string::npos);
+}
+
+TEST_CASE("credential cache fingerprints isolate distinct JWTs with identical claims", "[oauth][cache]") {
+	// These stand in for two signed JWTs whose decoded payload/iss/sub are the
+	// same but whose exact presented credentials differ. Claim-based scoping
+	// would merge them; credential-based scoping must not.
+	const auto first = duckdb::vgi::ComputeCredentialCacheFingerprint(
+	    "oauth", "header.same-claims.signature-a");
+	const auto second = duckdb::vgi::ComputeCredentialCacheFingerprint(
+	    "oauth", "header.same-claims.signature-b");
+
+	CHECK(first != second);
+	CHECK(first == duckdb::vgi::ComputeCredentialCacheFingerprint(
+	                   "oauth", "header.same-claims.signature-a"));
+}
+
+TEST_CASE("credential cache fingerprints fail closed on empty inputs", "[oauth][cache]") {
+	CHECK(duckdb::vgi::ComputeCredentialCacheFingerprint("oauth", "").empty());
+	CHECK(duckdb::vgi::ComputeCredentialCacheFingerprint("", "token").empty());
 }
 
 //===--------------------------------------------------------------------===//

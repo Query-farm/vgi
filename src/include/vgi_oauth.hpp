@@ -314,8 +314,9 @@ std::string ExtractOrigin(const std::string &url);
 // (security-critical — see the result-cache identity_scope). Returns:
 //   - "anon"            : no auth / not explicitly configured (subprocess,
 //                         anonymous HTTP, direct path).
-//   - "oauth:<sha256>"  : OAuth with a resolved identity — hashes the stable
-//                         (iss, sub) claims (survives token refresh).
+//   - "oauth:<sha256>"  : OAuth with a valid resolved token — hashes the exact
+//                         bearer credential sent to the resource server. Token
+//                         refresh deliberately creates a new cache identity.
 //   - "bearer:<sha256>" : static bearer token — salted SHA-256 of the token
 //                         (the raw token never enters the key or disk).
 //   - ""  (empty)       : configured but UNRESOLVABLE (e.g. OAuth opted-in but

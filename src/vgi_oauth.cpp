@@ -21,6 +21,7 @@ extern "C" char *duckdb_wasm_get_page_origin(void);
 
 #include "vgi_logging.hpp"
 #include "vgi_oauth_assets.hpp" // embedded logo artwork for the callback pages
+#include "vgi_cache_identity.hpp"
 #include "duckdb/logging/logger.hpp"
 #include "vgi_subprocess.hpp" // ResetChildSignalDispositions
 
@@ -2125,53 +2126,28 @@ OAuthTokenSet AttemptTokenRefresh(const OAuthRefreshContext &ctx,
 	return tokens;
 }
 
-namespace {
-// Hex SHA-256 of `data` (64 lowercase hex chars). Empty string on the (near-
-// impossible) digest failure so callers can fail closed. Platform-split to
-// mirror ComputeCodeChallenge (WASM has no OpenSSL).
-std::string Sha256HexForFingerprint(const std::string &data) {
-	unsigned char hash[32];
-#ifdef __EMSCRIPTEN__
-	duckdb_wasm_sha256(data.data(), static_cast<int>(data.size()), hash);
-#else
-	unsigned int hash_len = 0;
-	if (EVP_Digest(data.data(), data.size(), hash, &hash_len, EVP_sha256(), nullptr) != 1 || hash_len < 32) {
-		return "";
-	}
-#endif
-	static const char kHex[] = "0123456789abcdef";
-	std::string out;
-	out.reserve(64);
-	for (int i = 0; i < 32; i++) {
-		out += kHex[(hash[i] >> 4) & 0xF];
-		out += kHex[hash[i] & 0xF];
-	}
-	return out;
-}
-} // namespace
-
 std::string ComputeCatalogIdentityFingerprint(const std::shared_ptr<CatalogAuth> &auth) {
 	// No auth, or an OAuth object the user never opted into → anonymous scope.
 	if (!auth || !auth->IsExplicitlyConfigured()) {
 		return "anon";
 	}
-	// OAuth with a resolved identity: hash the STABLE (iss, sub) claims — these
-	// survive token refresh, so the cache scope is stable across re-auth. Reads
-	// only already-resolved state (never launches a flow).
+	// OAuth: scope by the exact credential presented to the resource server, not
+	// by decoded id_token claims. Those claims are intentionally exposed only as
+	// unverified display hints; using them here would turn attacker-controlled JWT
+	// payload bytes into a cache-isolation boundary. A refresh changes the cache
+	// identity by design. Reads only resolved state and never launches a flow.
 	OAuthTokenSet ts;
-	if (auth->GetTokenSetCopy(ts) && ts.identity.present && !ts.identity.sub.empty()) {
-		std::string h = Sha256HexForFingerprint("vgi-cache-oauth:v1\x1f" + ts.identity.issuer + "\x1f" +
-		                                        ts.identity.sub);
-		return h.empty() ? std::string() : ("oauth:" + h);
+	if (auth->GetTokenSetCopy(ts)) {
+		if (!ts.IsValid()) {
+			return "";
+		}
+		return ComputeCredentialCacheFingerprint("oauth", ts.BearerToken());
 	}
 	// Static bearer token: safe to read without triggering a flow. Salted +
 	// hashed so the raw token never enters the cache key or the on-disk digest.
 	if (auto *bearer = dynamic_cast<BearerTokenCatalogAuth *>(auth.get())) {
 		std::string tok = bearer->GetToken();
-		if (!tok.empty()) {
-			std::string h = Sha256HexForFingerprint("vgi-cache-principal:v1\x1f" + tok);
-			return h.empty() ? std::string() : ("bearer:" + h);
-		}
+		return ComputeCredentialCacheFingerprint("bearer", tok);
 	}
 	// Explicitly configured (opted-in) but no resolvable identity/token yet
 	// (e.g. an OAuth catalog not authenticated at bind time). Fail closed: the
