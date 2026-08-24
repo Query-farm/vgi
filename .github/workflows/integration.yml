@@ -10,9 +10,19 @@
 #
 # The fixture workers come from the PUBLIC vgi-python repo's dev-only sidecar —
 # they are deliberately absent from the published wheel, which would otherwise
-# pollute end-user PATH. VGI_FIXTURES_REF pins the revision; it defaults to
-# main, so the extension's protocol version must not run ahead of vgi-python's
-# pushed main, or ATTACH fails with a message naming both versions.
+# pollute end-user PATH.
+#
+# VGI_FIXTURES_REF pins the revision, and it pins to a RELEASE TAG, not `main`.
+# Defaulting to `main` made every run depend on whatever was pushed there at the
+# time: a protocol bump landing on either side flipped CI from green to a failed
+# ATTACH with no change to this repo, and — worse — a green run proved nothing
+# about any released worker. The tag makes the run reproducible and turns
+# "vgi-python moved" into an explicit one-line bump here, which is the only
+# place that decision should be visible.
+#
+# Bump this in lockstep with the protocol: it must name a vgi-python release
+# speaking the same VGI_PROTOCOL_VERSION as src/, or ATTACH fails with a message
+# naming both versions. Override per-run via the workflow_dispatch input.
 name: Integration suite
 
 on:
@@ -37,7 +47,7 @@ jobs:
     env:
       VGI_INSTALL_FIXTURES: "1"
       VGI_FIXTURES_DIR: /tmp/vgi-python
-      VGI_FIXTURES_REF: ${{ inputs.fixtures_ref || 'main' }}
+      VGI_FIXTURES_REF: ${{ inputs.fixtures_ref || 'v0.29.0' }}
       GEN: ninja
       USE_MERGED_VCPKG_MANIFEST: "1"
       VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"

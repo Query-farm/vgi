@@ -249,10 +249,19 @@ accumulated unnoticed, so it is wired shut:
   targets rather than a new target CI would have no way to select. This also
   works for the Linux in-docker leg, where the env vars are forwarded into the
   container and the install happens inside it.
-- `VGI_FIXTURES_REF` pins the worker revision. It defaults to `main`, so **the
-  extension's protocol version must not run ahead of vgi-python's pushed main** —
-  a mismatch fails ATTACH with a message naming both versions (which is the
-  right failure, but it will fail the build).
+- `VGI_FIXTURES_REF` pins the worker revision to a **vgi-python release tag**
+  (currently `v0.29.0`), not `main`. **Bump it in lockstep with the protocol
+  version** — it must name a release speaking the same `VGI_PROTOCOL_VERSION` as
+  `src/`, or ATTACH fails with a message naming both versions (the right failure,
+  but it fails the build). Override per-run with the `fixtures_ref`
+  workflow_dispatch input.
+
+  It defaulted to `main` until 2026-08-24, which made every run depend on
+  whatever was pushed there at the time: a protocol bump on either side flipped
+  CI from green to a failed ATTACH with no change to this repo, and a green run
+  proved nothing about any *released* worker. The tag makes runs reproducible and
+  turns "vgi-python moved" into an explicit one-line bump, which is the only
+  place that decision should be visible.
 
 Still local-only: the **cross-SDK matrix** (`make test_languages`) — four extra
 toolchains on one runner is its own piece of work.
