@@ -415,8 +415,43 @@ VGI_RUST_DIR ?= $(HOME)/Development/vgi-rust
 
 .PHONY: test_python test_go test_typescript test_java test_rust test_languages
 
-# Python uses this repo's default worker set — run the launcher suite directly.
-test_python: test_launcher
+# Python uses this repo's default worker set. It does NOT just chain to
+# test_launcher, which invokes `unittest` bare: a lane that stops running tests
+# reports GREEN under that (fewer results, all passing), which is exactly what
+# the coverage gate exists to catch. test_launcher stays ungated because it is
+# the everyday dev lane and a floor there is friction; test_python is the
+# conformance lane, so it gets the same two gates the rust/go/java/typescript
+# lanes have.
+#
+# Python runs 303 today.
+#
+# VGI_TEST_DEDICATED_WORKER is DECLARED as an expected skip rather than wired.
+# Two tests want a non-launcher worker, and pointing the var at the raw `uv run`
+# command does make them run — but the extra interpreter spawns push this lane
+# over some threshold and eight table_buffering files start failing. That is the
+# same cluster that fails in the java lane at -j 6 (java therefore runs serial;
+# see its Makefile), so it is a real concurrency bug in the buffered path under
+# a shared launcher worker, worth fixing on its own. Until it is, this lane does
+# not trade 2 executed tests for 8 flaky ones.
+VGI_PYTHON_MIN_EXECUTED ?= 300
+test_python:
+	VGI_TRANSACTOR_DB_DIR="$$(mktemp -d)" \
+	VGI_TEST_WORKER="launch:$(VGI_TEST_WORKER)" \
+	VGI_VERSIONED_WORKER="launch:$(VGI_VERSIONED_WORKER)" \
+	VGI_VERSIONED_TABLES_WORKER="launch:$(VGI_VERSIONED_TABLES_WORKER)" \
+	VGI_ATTACH_OPTIONS_WORKER="launch:$(VGI_ATTACH_OPTIONS_WORKER)" \
+	VGI_ATTACH_OPTIONS_REQUIRED_WORKER="launch:$(VGI_ATTACH_OPTIONS_REQUIRED_WORKER)" \
+	VGI_BAD_PROTOCOL_WORKER="launch:$(VGI_BAD_PROTOCOL_WORKER)" \
+	VGI_BAD_ENUM_WORKER="launch:$(VGI_BAD_ENUM_WORKER)" \
+	VGI_SIMPLE_WRITABLE_WORKER="launch:$(VGI_SIMPLE_WRITABLE_WORKER)" \
+	VGI_REQUIRE_LAUNCHER_TRANSPORT=1 \
+	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
+	    python3 scripts/run_tests.py -j 6 \
+	        --min-executed $(VGI_PYTHON_MIN_EXECUTED) $(VGI_EXPECTED_SKIPS) \
+	        --allow-skip 'require-env VGI_TEST_DEDICATED_WORKER' \
+	        "test/*" \
+	        "~test/sql/integration/writable/*" \
+	        "~test/sql/vgi_worker_pool.test"
 
 test_go:
 	$(MAKE) -C $(VGI_GO_DIR) test
