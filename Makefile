@@ -13,6 +13,13 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 # VGI test worker (subprocess transport)
 VGI_TEST_WORKER ?= uv run --project $(HOME)/Development/vgi-python vgi-fixture-worker
 
+# The shared-transport matrix exercises the local RPC checkout when present so
+# protocol/transport fixes can be validated end-to-end before they are released
+# to PyPI. A nonexistent path is harmless (Python falls back to the version in
+# vgi-python's environment); override with VGI_RPC_PYTHON_DIR as needed.
+VGI_RPC_PYTHON_DIR ?= $(HOME)/Development/vgi-rpc-python
+VGI_TRANSPORT_PYTHONPATH = $(VGI_RPC_PYTHON_DIR)$${PYTHONPATH:+:$$PYTHONPATH}
+
 # Shared scratch dir for native-branch fixtures (read_parquet / read_csv arms in
 # the multi_branch_* and required_field_filter_paths_native tests). The vgi-python
 # fixture bakes this into its branch definitions and the coupled .test files write
@@ -52,7 +59,7 @@ VGI_SIMPLE_WRITABLE_WORKER ?= uv run --project $(HOME)/Development/vgi-python vg
 # Writable tests are excluded from the default targets because they require
 # a vgi-python worker with writable-catalog support enabled; run them
 # explicitly via `make test_writable` when that worker is available.
-.PHONY: test_spawn test_spawn_debug test_http test_http_debug \
+.PHONY: test_spawn test_spawn_debug test_unix test_unix_debug test_http test_http_debug \
 	test_shm test_shm_debug \
 	test_launcher test_launcher_debug \
 	test_launcher_cloudflare_do test_launcher_cloudflare_do_debug \
@@ -64,6 +71,7 @@ VGI_SIMPLE_WRITABLE_WORKER ?= uv run --project $(HOME)/Development/vgi-python vg
 	test_docker test_docker_debug \
 	test_companion test_companion_debug \
 	test_iceberg test_iceberg_debug \
+	test_transport_matrix test_transport_matrix_debug \
 	test_all test_all_debug
 
 # Shared-memory transport tests — runs the same .test suite as test_spawn
@@ -266,6 +274,20 @@ test_launcher_cloudflare_do_debug:
 	    "~test/sql/integration/writable/*" \
 	    "~test/sql/vgi_worker_pool.test"
 
+# Shared Unix-socket transport tests. This is deliberately the same suite and
+# exclusions as test_http so transport parity is meaningful.
+test_unix:
+	PYTHONPATH="$(VGI_TRANSPORT_PYTHONPATH)" \
+	    ./test/run_unix_integration.sh "test/sql/integration/*" \
+	    "~test/sql/integration/writable/*" \
+	    "~test/sql/integration/projection_pushdown_repro.test"
+
+test_unix_debug:
+	PYTHONPATH="$(VGI_TRANSPORT_PYTHONPATH)" \
+	    BUILD_DIR=debug ./test/run_unix_integration.sh "test/sql/integration/*" \
+	    "~test/sql/integration/writable/*" \
+	    "~test/sql/integration/projection_pushdown_repro.test"
+
 # HTTP transport tests (uses test/run_http_integration.sh)
 #
 # projection_pushdown_repro.test is excluded: its fixtures use chunk=2 to
@@ -275,12 +297,14 @@ test_launcher_cloudflare_do_debug:
 # covered by the subprocess run, and HTTP transport adds no signal here
 # while inflating the test by 50× in round-trips.
 test_http:
-	./test/run_http_integration.sh "test/sql/integration/*" \
+	PYTHONPATH="$(VGI_TRANSPORT_PYTHONPATH)" \
+	    ./test/run_http_integration.sh "test/sql/integration/*" \
 	    "~test/sql/integration/writable/*" \
 	    "~test/sql/integration/projection_pushdown_repro.test"
 
 test_http_debug:
-	BUILD_DIR=debug ./test/run_http_integration.sh "test/sql/integration/*" \
+	PYTHONPATH="$(VGI_TRANSPORT_PYTHONPATH)" \
+	    BUILD_DIR=debug ./test/run_http_integration.sh "test/sql/integration/*" \
 	    "~test/sql/integration/writable/*" \
 	    "~test/sql/integration/projection_pushdown_repro.test"
 
@@ -363,10 +387,16 @@ test_simple_writable:
 test_simple_writable_debug:
 	VGI_SIMPLE_WRITABLE_WORKER="$(VGI_SIMPLE_WRITABLE_WORKER)" ./build/debug/test/unittest "test/sql/integration/simple_writable/*"
 
-# Run all transports
-test_all: test_spawn test_shm test_http test_http_bearer test_http_versioned_tables test_http_attach_options test_http_no_compression
+# The production shared-transport parity gate: identical SQLLogicTests over a
+# local Unix socket and HTTP.
+test_transport_matrix: test_unix test_http
 
-test_all_debug: test_spawn_debug test_shm_debug test_http_debug test_http_bearer_debug test_http_versioned_tables_debug test_http_attach_options_debug test_http_no_compression_debug
+test_transport_matrix_debug: test_unix_debug test_http_debug
+
+# Run all transports
+test_all: test_spawn test_shm test_unix test_http test_http_bearer test_http_versioned_tables test_http_attach_options test_http_no_compression
+
+test_all_debug: test_spawn_debug test_shm_debug test_unix_debug test_http_debug test_http_bearer_debug test_http_versioned_tables_debug test_http_attach_options_debug test_http_no_compression_debug
 
 # ---------------------------------------------------------------------------
 # Per-language integration runs
