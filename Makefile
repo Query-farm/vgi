@@ -413,7 +413,7 @@ VGI_TS_DIR   ?= $(HOME)/Development/vgi-typescript
 VGI_JAVA_DIR ?= $(HOME)/vgi-java
 VGI_RUST_DIR ?= $(HOME)/Development/vgi-rust
 
-.PHONY: test_python test_go test_typescript test_java test_rust test_languages
+.PHONY: test_python test_python_crash test_go test_typescript test_java test_rust test_languages
 
 # Python uses this repo's default worker set. It does NOT just chain to
 # test_launcher, which invokes `unittest` bare: a lane that stops running tests
@@ -425,14 +425,25 @@ VGI_RUST_DIR ?= $(HOME)/Development/vgi-rust
 #
 # Python runs 304 today.
 #
-# VGI_TEST_DEDICATED_WORKER is DECLARED as an expected skip rather than wired.
-# Two tests want a non-launcher worker, and pointing the var at the raw `uv run`
-# command does make them run — but the extra interpreter spawns push this lane
-# over some threshold and eight table_buffering files start failing. That is the
-# same cluster that fails in the java lane at -j 6 (java therefore runs serial;
-# see its Makefile), so it is a real concurrency bug in the buffered path under
-# a shared launcher worker, worth fixing on its own. Until it is, this lane does
-# not trade 2 executed tests for 8 flaky ones.
+# VGI_TEST_DEDICATED_WORKER is DECLARED as an expected skip, not wired — and
+# wiring it here would be a BUG, not a coverage win.
+#
+# It gates table_buffering_{worker_crash,pool_recovery}.test, whose
+# `crash_on_process` fixture SIGKILLs the worker serving it. Both files ATTACH
+# ${VGI_TEST_WORKER} — the LAUNCHER location on this lane — not a dedicated
+# binary, so the victim is the ONE shared worker every concurrent DuckDB process
+# is talking to. Setting the var un-skips them and the survivors then fail with
+# "RPC response stream EOF" / "Broken pipe": collateral damage, not a race of
+# their own. That is exactly the eight-file failure I first mistook for a
+# concurrency bug in the buffered path; it is neither a concurrency bug nor
+# specific to any SDK. run_tests.py deliberately leaves the var unset for
+# shared-worker transports (see its env.setdefault guard), and setting it here
+# defeats that.
+#
+# To actually run those two, point VGI_TEST_WORKER itself at a bare path so each
+# DuckDB process owns a private worker it can watch die — see vgi-java's
+# `test-crash` target, which runs exactly those files over the subprocess
+# transport after the main suite.
 VGI_PYTHON_MIN_EXECUTED ?= 300
 test_python:
 	VGI_TRANSACTOR_DB_DIR="$$(mktemp -d)" \
@@ -452,6 +463,18 @@ test_python:
 	        "test/*" \
 	        "~test/sql/integration/writable/*" \
 	        "~test/sql/vgi_worker_pool.test"
+	@$(MAKE) test_python_crash
+
+# The two crash/pool-recovery files the launcher lane must skip, run over the
+# SUBPROCESS transport where each DuckDB process owns a private worker it can
+# watch die. That is the shape they were written for; on a shared-worker lane
+# they would SIGKILL the process serving every concurrent test. Mirrors
+# vgi-java's `test-crash`.
+test_python_crash:
+	VGI_TEST_WORKER="$(VGI_TEST_WORKER)" \
+	    python3 scripts/run_tests.py -j 2 --min-executed 2 \
+	        "test/sql/integration/table_in_out/table_buffering_worker_crash.test" \
+	        "test/sql/integration/table_in_out/table_buffering_pool_recovery.test"
 
 test_go:
 	$(MAKE) -C $(VGI_GO_DIR) test
