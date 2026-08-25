@@ -26,7 +26,10 @@
 #if VGI_POSIX_TRANSPORT
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <netdb.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <poll.h>
 #include <signal.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -648,45 +651,127 @@ bool LookupSharedContainer(const std::string &location, ContainerSpec &out_spec,
 
 #if VGI_POSIX_TRANSPORT
 
-// Non-blocking TCP connect with a timeout. Returns a connected (blocking-mode) fd,
-// or -1. Caller closes the fd. Exported (declared in vgi_container_runtime.hpp) so
-// the tcp:// transport reuses it.
-int TcpConnect(const std::string &host, int port, int timeout_ms) {
-	int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-	if (fd < 0) {
+// Resolve and connect under one deadline. DNS resolution is synchronous, but
+// its elapsed time is charged to the same deadline: a slow resolver cannot then
+// receive a fresh timeout for every returned address.
+int TcpConnect(const std::string &host, int port, int timeout_ms, std::string *error_message) {
+	if (error_message) {
+		error_message->clear();
+	}
+	if (host.empty() || port <= 0 || port > 65535) {
+		if (error_message) {
+			*error_message = "invalid TCP endpoint " + host + ":" + std::to_string(port);
+		}
 		return -1;
 	}
-	int flags = ::fcntl(fd, F_GETFL, 0);
-	::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-	struct sockaddr_in addr;
-	std::memset(&addr, 0, sizeof(addr));
-	addr.sin_family = AF_INET;
-	addr.sin_port = htons(static_cast<uint16_t>(port));
-	::inet_pton(AF_INET, host.c_str(), &addr.sin_addr);
-	bool ok = false;
-	int rc = ::connect(fd, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr));
-	if (rc == 0) {
-		ok = true;
-	} else if (errno == EINPROGRESS) {
-		fd_set wf;
-		FD_ZERO(&wf);
-		FD_SET(fd, &wf);
-		struct timeval tv;
-		tv.tv_sec = timeout_ms / 1000;
-		tv.tv_usec = (timeout_ms % 1000) * 1000;
-		if (::select(fd + 1, nullptr, &wf, nullptr, &tv) > 0) {
-			int soerr = 0;
-			socklen_t l = sizeof(soerr);
-			::getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &l);
-			ok = (soerr == 0);
+
+	const int effective_timeout_ms = std::max(timeout_ms, 0);
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(effective_timeout_ms);
+	struct addrinfo hints;
+	std::memset(&hints, 0, sizeof(hints));
+	hints.ai_family = AF_UNSPEC;
+	hints.ai_socktype = SOCK_STREAM;
+	hints.ai_protocol = IPPROTO_TCP;
+	struct addrinfo *addresses = nullptr;
+	const std::string service = std::to_string(port);
+	const int resolve_rc = ::getaddrinfo(host.c_str(), service.c_str(), &hints, &addresses);
+	if (resolve_rc != 0) {
+		if (error_message) {
+			*error_message = "cannot resolve TCP host '" + host + "': " + ::gai_strerror(resolve_rc);
+		}
+		return -1;
+	}
+
+	int last_error = 0;
+	int attempted = 0;
+	for (auto *address = addresses; address != nullptr; address = address->ai_next) {
+		if (address->ai_family != AF_INET && address->ai_family != AF_INET6) {
+			continue;
+		}
+		attempted++;
+		int fd = ::socket(address->ai_family, address->ai_socktype, address->ai_protocol);
+		if (fd < 0) {
+			last_error = errno;
+			continue;
+		}
+		const int flags = ::fcntl(fd, F_GETFL, 0);
+		if (flags < 0 || ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+			last_error = errno;
+			::close(fd);
+			continue;
+		}
+
+		bool connected = false;
+		if (::connect(fd, address->ai_addr, static_cast<socklen_t>(address->ai_addrlen)) == 0) {
+			connected = true;
+		} else if (errno == EINPROGRESS || errno == EWOULDBLOCK) {
+			for (;;) {
+				const auto now = std::chrono::steady_clock::now();
+				if (now >= deadline) {
+					last_error = ETIMEDOUT;
+					break;
+				}
+				auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
+				const int wait_ms = static_cast<int>(std::max<int64_t>(remaining, 1));
+				struct pollfd pfd;
+				pfd.fd = fd;
+				pfd.events = POLLOUT;
+				pfd.revents = 0;
+				const int poll_rc = ::poll(&pfd, 1, wait_ms);
+				if (poll_rc < 0 && errno == EINTR) {
+					continue;
+				}
+				if (poll_rc <= 0) {
+					last_error = poll_rc == 0 ? ETIMEDOUT : errno;
+					break;
+				}
+				int socket_error = 0;
+				socklen_t error_len = sizeof(socket_error);
+				if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &socket_error, &error_len) < 0) {
+					last_error = errno;
+				} else if (socket_error != 0) {
+					last_error = socket_error;
+				} else {
+					connected = true;
+				}
+				break;
+			}
+		} else {
+			last_error = errno;
+		}
+
+		if (connected && ::fcntl(fd, F_SETFL, flags) == 0) {
+			int nodelay = 1;
+			(void)::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+			::freeaddrinfo(addresses);
+			return fd;
+		}
+		if (connected) {
+			last_error = errno;
+		}
+		::close(fd);
+		if (std::chrono::steady_clock::now() >= deadline) {
+			last_error = ETIMEDOUT;
+			break;
 		}
 	}
-	if (!ok) {
-		::close(fd);
-		return -1;
+	::freeaddrinfo(addresses);
+
+	if (error_message) {
+		const std::string endpoint = host + ":" + std::to_string(port);
+		if (attempted == 0) {
+			*error_message = "TCP host '" + host + "' resolved without any usable IPv4/IPv6 addresses";
+		} else if (last_error == ETIMEDOUT) {
+			*error_message = "connect to " + endpoint + " timed out after " +
+			                 std::to_string(effective_timeout_ms) + "ms (tried " + std::to_string(attempted) +
+			                 " resolved address" + (attempted == 1 ? ")" : "es)");
+		} else {
+			*error_message = "connect to " + endpoint + " failed after trying " + std::to_string(attempted) +
+			                 " resolved address" + (attempted == 1 ? ": " : "es: ") +
+			                 std::strerror(last_error != 0 ? last_error : ECONNREFUSED);
+		}
 	}
-	::fcntl(fd, F_SETFL, flags);  // restore blocking
-	return fd;
+	return -1;
 }
 
 namespace {
@@ -920,10 +1005,11 @@ ContainerEndpoint EnsureSharedContainer(const ContainerSpec &spec, ContainerConn
 
 std::unique_ptr<SubProcess> ConnectSharedContainer(const ContainerEndpoint &endpoint) {
 	if (endpoint.mode == ContainerConnMode::TCP) {
-		int fd = TcpConnect(endpoint.host, endpoint.port, 10000);
+		std::string connect_error;
+		int fd = TcpConnect(endpoint.host, endpoint.port, 10000, &connect_error);
 		if (fd < 0) {
-			throw IOException("vgi container: failed to connect to shared tcp endpoint %s:%d",
-			                  endpoint.host, endpoint.port);
+			throw IOException("vgi container: failed to connect to shared tcp endpoint %s:%d: %s",
+			                  endpoint.host, endpoint.port, connect_error);
 		}
 		return std::make_unique<UnixSocketWorker>(fd);
 	}

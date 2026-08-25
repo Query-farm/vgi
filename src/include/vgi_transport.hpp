@@ -15,7 +15,7 @@ namespace vgi {
 //              inside an OCI container via the host container runtime
 //              (docker/podman/…), wired over stdin/stdout like a subprocess.
 //              See vgi_container_runtime.hpp.
-// TCP        — tcp://host:port; connect to an existing out-of-band worker
+// TCP        — tcp://host:port or tcp://[IPv6]:port; connect to an existing out-of-band worker
 //              listening on a raw-TCP socket (vgi-rpc serve_tcp). Connect-only,
 //              like UNIX. Used by wasm workers (wasip2 has TCP sockets but no
 //              AF_UNIX), and for any worker reachable over loopback/trusted TCP.
@@ -43,8 +43,8 @@ bool IsContainerLocation(const std::string &worker_path);
 // shared-container coordinator at connection time. See vgi_container_runtime.hpp.
 bool IsContainerSharedLocation(const std::string &worker_path);
 
-// Raw-TCP location: tcp://host:port. Connect-only against an out-of-band worker
-// (vgi-rpc serve_tcp).
+// Raw-TCP location: tcp://host:port or tcp://[IPv6]:port. Hostnames are resolved
+// at connect time. Connect-only against an out-of-band worker (vgi-rpc serve_tcp).
 bool IsTcpTransport(const std::string &worker_path);
 
 // Web Worker location: worker:<url>. In-browser SharedArrayBuffer transport
@@ -56,8 +56,8 @@ bool IsWebWorkerTransport(const std::string &worker_path);
 // location is not a worker: location.
 std::string StripWebWorkerScheme(const std::string &location);
 
-// Parse a tcp:// location into (host, port). Throws std::invalid_argument if the
-// location is not a well-formed tcp://host:port.
+// Parse a tcp:// location into (host, port), removing IPv6 URI brackets. Throws
+// std::invalid_argument if the authority is malformed or ambiguous.
 void ParseTcpLocation(const std::string &location, std::string &host, int &port);
 
 // Strip the leading scheme prefix from a unix:// or launch: location.

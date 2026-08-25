@@ -16,6 +16,7 @@ using duckdb::vgi::IsContainerLocation;
 using duckdb::vgi::IsContainerSharedLocation;
 using duckdb::vgi::IsHttpTransport;
 using duckdb::vgi::IsLaunchLocation;
+using duckdb::vgi::IsTcpTransport;
 using duckdb::vgi::IsUnixLocation;
 using duckdb::vgi::IsGithubAutoLocation;
 using duckdb::vgi::IsGithubLocation;
@@ -26,6 +27,7 @@ using duckdb::vgi::StripLaunchScheme;
 using duckdb::vgi::StripUnixScheme;
 using duckdb::vgi::StripWebWorkerScheme;
 using duckdb::vgi::IsWebWorkerTransport;
+using duckdb::vgi::ParseTcpLocation;
 using duckdb::vgi::TransportType;
 
 TEST_CASE("DetectTransport routes each scheme correctly", "[transport]") {
@@ -35,12 +37,47 @@ TEST_CASE("DetectTransport routes each scheme correctly", "[transport]") {
 	CHECK(DetectTransport("unix:///tmp/foo.sock") == TransportType::UNIX);
 	CHECK(DetectTransport("oci://ghcr.io/org/img:tag") == TransportType::CONTAINER);
 	CHECK(DetectTransport("docker://library/python:3.13") == TransportType::CONTAINER);
+	CHECK(DetectTransport("tcp://localhost:9400") == TransportType::TCP);
+	CHECK(DetectTransport("TCP://[fd7a:115c:a1e0::1]:9400") == TransportType::TCP);
 	CHECK(DetectTransport("worker:/workers/example.js") == TransportType::WEBWORKER);
 	CHECK(DetectTransport("worker:https://cdn.example.com/w.js") == TransportType::WEBWORKER);
 	CHECK(DetectTransport("worker:example") == TransportType::WEBWORKER);
 	CHECK(DetectTransport("/path/to/worker") == TransportType::SUBPROCESS);
 	CHECK(DetectTransport("/path/with launch: in middle") == TransportType::SUBPROCESS);
 	CHECK(DetectTransport("") == TransportType::SUBPROCESS);
+}
+
+TEST_CASE("TCP locations parse hostnames, IPv4, and bracketed IPv6", "[transport]") {
+	std::string host;
+	int port = 0;
+
+	ParseTcpLocation("tcp://worker.example:9400", host, port);
+	CHECK(host == "worker.example");
+	CHECK(port == 9400);
+
+	ParseTcpLocation("tcp://100.101.102.103:1", host, port);
+	CHECK(host == "100.101.102.103");
+	CHECK(port == 1);
+
+	ParseTcpLocation("TCP://[fd7a:115c:a1e0::1234:5678]:65535", host, port);
+	CHECK(host == "fd7a:115c:a1e0::1234:5678");
+	CHECK(port == 65535);
+}
+
+TEST_CASE("TCP locations reject ambiguous or malformed authorities", "[transport]") {
+	std::string host;
+	int port = 0;
+	CHECK_FALSE(IsTcpTransport("udp://host:9400"));
+	CHECK_THROWS_AS(ParseTcpLocation("http://host:9400", host, port), std::invalid_argument);
+	CHECK_THROWS_AS(ParseTcpLocation("tcp://host", host, port), std::invalid_argument);
+	CHECK_THROWS_AS(ParseTcpLocation("tcp://host:", host, port), std::invalid_argument);
+	CHECK_THROWS_AS(ParseTcpLocation("tcp://host:0", host, port), std::invalid_argument);
+	CHECK_THROWS_AS(ParseTcpLocation("tcp://host:65536", host, port), std::invalid_argument);
+	CHECK_THROWS_AS(ParseTcpLocation("tcp://host:9400/path", host, port), std::invalid_argument);
+	CHECK_THROWS_AS(ParseTcpLocation("tcp://::1:9400", host, port), std::invalid_argument);
+	CHECK_THROWS_AS(ParseTcpLocation("tcp://[]:9400", host, port), std::invalid_argument);
+	CHECK_THROWS_AS(ParseTcpLocation("tcp://[::1]9400", host, port), std::invalid_argument);
+	CHECK_THROWS_AS(ParseTcpLocation("tcp://[::1]:abc", host, port), std::invalid_argument);
 }
 
 TEST_CASE("worker: scheme predicate + strip", "[transport]") {

@@ -244,9 +244,10 @@ UnaryResponseResult InvokePooledUnaryRpc(const UnaryRpcOptions &opts, const std:
 		std::string tcp_host;
 		int tcp_port;
 		ParseTcpLocation(opts.worker_path, tcp_host, tcp_port);
-		int fd = TcpConnect(tcp_host, tcp_port, 10000);
+		std::string connect_error;
+		int fd = TcpConnect(tcp_host, tcp_port, 10000, &connect_error);
 		if (fd < 0) {
-			throw IOException("vgi: failed to connect to tcp worker %s", opts.worker_path);
+			throw IOException("vgi: failed to connect to tcp worker %s: %s", opts.worker_path, connect_error);
 		}
 		UnixSocketWorker worker(fd);
 		if (params) {
@@ -262,9 +263,10 @@ UnaryResponseResult InvokePooledUnaryRpc(const UnaryRpcOptions &opts, const std:
 		std::string tcp_host;
 		int tcp_port;
 		ParseTcpLocation(opts.worker_path, tcp_host, tcp_port);
-		int fd = TcpConnect(tcp_host, tcp_port, 10000);
+		std::string connect_error;
+		int fd = TcpConnect(tcp_host, tcp_port, 10000, &connect_error);
 		if (fd < 0) {
-			throw IOException("vgi: failed to connect to tcp worker %s", opts.worker_path);
+			throw IOException("vgi: failed to connect to tcp worker %s: %s", opts.worker_path, connect_error);
 		}
 		NamedPipeWorker worker(fd);
 		if (params) {

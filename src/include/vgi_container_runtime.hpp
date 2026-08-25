@@ -202,9 +202,12 @@ void InvalidateSharedContainer(const ContainerSpec &spec);
 // HttpFunctionConnection). Throws IOException on connect failure. POSIX-only.
 std::unique_ptr<SubProcess> ConnectSharedContainer(const ContainerEndpoint &endpoint);
 
-// Open a raw TCP connection to host:port, returning a connected fd (or -1 on
-// failure). Shared by the container-shared TCP mode and the tcp:// transport.
-int TcpConnect(const std::string &host, int port, int timeout_ms);
+// Open a raw TCP connection to host:port, resolving DNS and trying IPv4/IPv6
+// addresses under one connect deadline. Returns a connected fd, or -1 on
+// failure. When error_message is non-null, it receives an actionable resolution
+// or connect diagnostic. Shared by container-shared TCP and tcp://.
+int TcpConnect(const std::string &host, int port, int timeout_ms,
+               std::string *error_message = nullptr);
 #endif
 
 // Per-process registry mapping an internal `container-shared:` worker_path to its

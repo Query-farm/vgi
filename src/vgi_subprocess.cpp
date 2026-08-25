@@ -1,6 +1,7 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "vgi_subprocess.hpp"
 
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cstdlib>
@@ -692,64 +693,174 @@ void WaitForReadableUntilCancel(int fd, ClientContext *context) {
 	}
 }
 #elif defined(_WIN32)
-// Windows raw-TCP connect (Winsock). The POSIX definition lives in
-// vgi_container_runtime.cpp; this satisfies the same VGI_SUBPROCESS_TRANSPORT-
-// declared TcpConnect for the tcp:// transport on Windows. Returns a CRT fd that
-// owns the socket (close with _close), so the existing fd-based
-// FunctionConnection / Fd{Input,Output}Stream path drives it unchanged.
-int TcpConnect(const std::string &host, int port, int timeout_ms) {
-	static const bool wsa_ok = []() {
-		WSADATA w;
-		return WSAStartup(MAKEWORD(2, 2), &w) == 0;
-	}();
-	(void)wsa_ok;
-	// WSASocket with dwFlags=0 (NOT the implicit WSA_FLAG_OVERLAPPED that plain
-	// socket() sets) — a non-overlapped socket is what lets the CRT fd layer's
-	// _read/_write (ReadFile/WriteFile) drive it synchronously, exactly like a pipe.
-	SOCKET s = ::WSASocketW(AF_INET, SOCK_STREAM, IPPROTO_TCP, nullptr, 0, 0);
-	if (s == INVALID_SOCKET) {
+// Render Winsock and getaddrinfo errors without making callers interpret a
+// platform-specific integer. FormatMessage text usually ends in CRLF; trim it
+// so the diagnostic embeds cleanly in DuckDB's IOException.
+static std::string WindowsSocketErrorMessage(int error) {
+	LPSTR buffer = nullptr;
+	const DWORD length = ::FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM |
+	                                        FORMAT_MESSAGE_IGNORE_INSERTS,
+	                                      nullptr, static_cast<DWORD>(error), 0,
+	                                      reinterpret_cast<LPSTR>(&buffer), 0, nullptr);
+	std::string message = length != 0 && buffer ? std::string(buffer, length)
+	                                             : "Winsock error " + std::to_string(error);
+	if (buffer) {
+		::LocalFree(buffer);
+	}
+	while (!message.empty() && (message.back() == '\r' || message.back() == '\n' || message.back() == ' ')) {
+		message.pop_back();
+	}
+	return message;
+}
+
+// Windows equivalent of the POSIX resolver/dial loop in
+// vgi_container_runtime.cpp. WSASocketW is deliberately non-overlapped so the
+// connected socket can be owned and driven synchronously through a CRT fd.
+int TcpConnect(const std::string &host, int port, int timeout_ms, std::string *error_message) {
+	if (error_message) {
+		error_message->clear();
+	}
+	if (host.empty() || port <= 0 || port > 65535) {
+		if (error_message) {
+			*error_message = "invalid TCP endpoint " + host + ":" + std::to_string(port);
+		}
 		return -1;
 	}
-	u_long nb = 1;
-	::ioctlsocket(s, FIONBIO, &nb); // non-blocking for the timed connect
-	struct sockaddr_in addr;
-	ZeroMemory(&addr, sizeof(addr));
-	addr.sin_family = AF_INET;
-	addr.sin_port = htons(static_cast<uint16_t>(port));
-	::inet_pton(AF_INET, host.c_str(), &addr.sin_addr);
-	bool ok = false;
-	if (::connect(s, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)) == 0) {
-		ok = true;
-	} else if (WSAGetLastError() == WSAEWOULDBLOCK) {
-		fd_set wf;
-		FD_ZERO(&wf);
-		FD_SET(s, &wf);
-		timeval tv;
-		tv.tv_sec = timeout_ms / 1000;
-		tv.tv_usec = (timeout_ms % 1000) * 1000;
-		if (::select(0, nullptr, &wf, nullptr, &tv) > 0) {
-			int soerr = 0;
-			int l = static_cast<int>(sizeof(soerr));
-			::getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char *>(&soerr), &l);
-			ok = (soerr == 0);
+	static const int wsa_startup_error = []() {
+		WSADATA w;
+		return ::WSAStartup(MAKEWORD(2, 2), &w);
+	}();
+	if (wsa_startup_error != 0) {
+		if (error_message) {
+			*error_message = "Winsock initialization failed: " + WindowsSocketErrorMessage(wsa_startup_error);
+		}
+		return -1;
+	}
+
+	const int effective_timeout_ms = std::max(timeout_ms, 0);
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(effective_timeout_ms);
+	struct addrinfo hints;
+	ZeroMemory(&hints, sizeof(hints));
+	hints.ai_family = AF_UNSPEC;
+	hints.ai_socktype = SOCK_STREAM;
+	hints.ai_protocol = IPPROTO_TCP;
+	struct addrinfo *addresses = nullptr;
+	const std::string service = std::to_string(port);
+	const int resolve_error = ::getaddrinfo(host.c_str(), service.c_str(), &hints, &addresses);
+	if (resolve_error != 0) {
+		if (error_message) {
+			*error_message = "cannot resolve TCP host '" + host + "': " +
+			                 WindowsSocketErrorMessage(resolve_error);
+		}
+		return -1;
+	}
+
+	int last_error = 0;
+	int attempted = 0;
+	for (auto *address = addresses; address != nullptr; address = address->ai_next) {
+		if (address->ai_family != AF_INET && address->ai_family != AF_INET6) {
+			continue;
+		}
+		attempted++;
+		SOCKET socket = ::WSASocketW(address->ai_family, address->ai_socktype, address->ai_protocol,
+		                              nullptr, 0, 0);
+		if (socket == INVALID_SOCKET) {
+			last_error = ::WSAGetLastError();
+			continue;
+		}
+		u_long nonblocking = 1;
+		if (::ioctlsocket(socket, FIONBIO, &nonblocking) != 0) {
+			last_error = ::WSAGetLastError();
+			::closesocket(socket);
+			continue;
+		}
+
+		bool connected = false;
+		if (::connect(socket, address->ai_addr, static_cast<int>(address->ai_addrlen)) == 0) {
+			connected = true;
+		} else {
+			last_error = ::WSAGetLastError();
+			if (last_error == WSAEWOULDBLOCK || last_error == WSAEINPROGRESS || last_error == WSAEALREADY) {
+				for (;;) {
+					const auto now = std::chrono::steady_clock::now();
+					if (now >= deadline) {
+						last_error = WSAETIMEDOUT;
+						break;
+					}
+					auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
+					const auto wait_ms = std::max<int64_t>(remaining, 1);
+					timeval timeout;
+					timeout.tv_sec = static_cast<long>(wait_ms / 1000);
+					timeout.tv_usec = static_cast<long>((wait_ms % 1000) * 1000);
+					fd_set writable;
+					FD_ZERO(&writable);
+					FD_SET(socket, &writable);
+					const int select_rc = ::select(0, nullptr, &writable, nullptr, &timeout);
+					if (select_rc == SOCKET_ERROR && ::WSAGetLastError() == WSAEINTR) {
+						continue;
+					}
+					if (select_rc <= 0) {
+						last_error = select_rc == 0 ? WSAETIMEDOUT : ::WSAGetLastError();
+						break;
+					}
+					int socket_error = 0;
+					int error_len = static_cast<int>(sizeof(socket_error));
+					if (::getsockopt(socket, SOL_SOCKET, SO_ERROR, reinterpret_cast<char *>(&socket_error),
+					                 &error_len) != 0) {
+						last_error = ::WSAGetLastError();
+					} else if (socket_error != 0) {
+						last_error = socket_error;
+					} else {
+						connected = true;
+					}
+					break;
+				}
+			}
+		}
+
+		if (connected) {
+			nonblocking = 0;
+			if (::ioctlsocket(socket, FIONBIO, &nonblocking) == 0) {
+				BOOL nodelay = TRUE;
+				(void)::setsockopt(socket, IPPROTO_TCP, TCP_NODELAY,
+				                   reinterpret_cast<const char *>(&nodelay), sizeof(nodelay));
+				int fd = _open_osfhandle(static_cast<intptr_t>(socket), _O_BINARY);
+				if (fd >= 0) {
+					::freeaddrinfo(addresses);
+					return fd;
+				}
+				if (error_message) {
+					*error_message = "connected to " + host + ":" + std::to_string(port) +
+					                 " but could not create a CRT file descriptor: " + std::strerror(errno);
+				}
+				::closesocket(socket);
+				::freeaddrinfo(addresses);
+				return -1;
+			}
+			last_error = ::WSAGetLastError();
+		}
+		::closesocket(socket);
+		if (std::chrono::steady_clock::now() >= deadline) {
+			last_error = WSAETIMEDOUT;
+			break;
 		}
 	}
-	if (!ok) {
-		::closesocket(s);
-		return -1;
+	::freeaddrinfo(addresses);
+	if (error_message) {
+		const std::string endpoint = host + ":" + std::to_string(port);
+		if (attempted == 0) {
+			*error_message = "TCP host '" + host + "' resolved without any usable IPv4/IPv6 addresses";
+		} else if (last_error == WSAETIMEDOUT) {
+			*error_message = "connect to " + endpoint + " timed out after " +
+			                 std::to_string(effective_timeout_ms) + "ms (tried " + std::to_string(attempted) +
+			                 " resolved address" + (attempted == 1 ? ")" : "es)");
+		} else {
+			*error_message = "connect to " + endpoint + " failed after trying " + std::to_string(attempted) +
+			                 " resolved address" + (attempted == 1 ? ": " : "es: ") +
+			                 WindowsSocketErrorMessage(last_error != 0 ? last_error : WSAECONNREFUSED);
+		}
 	}
-	nb = 0;
-	::ioctlsocket(s, FIONBIO, &nb); // restore blocking for the fd I/O layer
-	// Lockstep request/response RPC — disable Nagle so a small request isn't held
-	// waiting to coalesce (the worker can't reply until it arrives).
-	BOOL nodelay = TRUE;
-	::setsockopt(s, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char *>(&nodelay), sizeof(nodelay));
-	int fd = _open_osfhandle(static_cast<intptr_t>(s), _O_BINARY);
-	if (fd < 0) {
-		::closesocket(s);
-		return -1;
-	}
-	return fd;
+	return -1;
 }
 
 void WaitForReadableUntilCancel(int fd, ClientContext *context) {

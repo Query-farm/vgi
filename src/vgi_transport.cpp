@@ -4,6 +4,8 @@
 #include "duckdb/common/string_util.hpp"
 #include "vgi_launcher_internal.hpp"
 
+#include <algorithm>
+#include <cctype>
 #include <stdexcept>
 
 namespace duckdb {
@@ -67,13 +69,40 @@ void ParseTcpLocation(const std::string &location, std::string &host, int &port)
 		throw std::invalid_argument("vgi: not a tcp:// location: " + location);
 	}
 	std::string rest = location.substr(6); // strip "tcp://"
-	auto colon = rest.rfind(':');
-	if (colon == std::string::npos || colon == 0 || colon + 1 >= rest.size()) {
-		throw std::invalid_argument("vgi: tcp:// location must be tcp://host:port: " + location);
+	std::string port_text;
+	if (!rest.empty() && rest.front() == '[') {
+		// RFC 3986 IP-literal authority: tcp://[IPv6-address]:port. Strip the
+		// brackets before getaddrinfo; they delimit the URI and are not part of
+		// the resolver input.
+		auto close = rest.find(']');
+		if (close == std::string::npos || close == 1 || close + 1 >= rest.size() ||
+		    rest[close + 1] != ':') {
+			throw std::invalid_argument("vgi: bracketed tcp:// IPv6 location must be "
+			                            "tcp://[address]:port: " + location);
+		}
+		if (rest.find('[', 1) != std::string::npos || rest.find(']', close + 1) != std::string::npos) {
+			throw std::invalid_argument("vgi: invalid brackets in tcp:// location: " + location);
+		}
+		host = rest.substr(1, close - 1);
+		port_text = rest.substr(close + 2);
+	} else {
+		auto colon = rest.rfind(':');
+		if (colon == std::string::npos || colon == 0 || colon + 1 >= rest.size()) {
+			throw std::invalid_argument("vgi: tcp:// location must be tcp://host:port: " + location);
+		}
+		if (rest.find(':') != colon) {
+			throw std::invalid_argument("vgi: IPv6 literals in tcp:// locations must be bracketed: "
+			                            "tcp://[address]:port");
+		}
+		host = rest.substr(0, colon);
+		port_text = rest.substr(colon + 1);
 	}
-	host = rest.substr(0, colon);
+	if (port_text.empty() ||
+	    !std::all_of(port_text.begin(), port_text.end(), [](unsigned char c) { return std::isdigit(c) != 0; })) {
+		throw std::invalid_argument("vgi: tcp:// location has a non-numeric port: " + location);
+	}
 	try {
-		port = std::stoi(rest.substr(colon + 1));
+		port = std::stoi(port_text);
 	} catch (...) {
 		throw std::invalid_argument("vgi: tcp:// location has a non-numeric port: " + location);
 	}

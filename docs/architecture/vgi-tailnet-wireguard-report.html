@@ -1,0 +1,571 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>VGI over Tailscale and WireGuard — Architecture Assessment</title>
+  <style>
+    :root {
+      --ink: #16221f;
+      --muted: #52635e;
+      --paper: #fbfaf6;
+      --panel: #ffffff;
+      --line: #dce5df;
+      --green: #176b52;
+      --green-2: #e9f5ef;
+      --blue: #235a83;
+      --blue-2: #eaf2f8;
+      --amber: #976312;
+      --amber-2: #fff6df;
+      --red: #9d3e3e;
+      --red-2: #fceeee;
+      --shadow: 0 12px 34px rgba(34, 61, 52, .08);
+      --radius: 16px;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      --sans: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      --serif: Iowan Old Style, Charter, Georgia, serif;
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 8% 2%, rgba(77, 160, 127, .10), transparent 24rem),
+        radial-gradient(circle at 96% 12%, rgba(70, 125, 170, .09), transparent 25rem),
+        var(--paper);
+      font-family: var(--sans);
+      line-height: 1.58;
+    }
+    a { color: var(--blue); text-decoration-thickness: 1px; text-underline-offset: 3px; }
+    a:hover { color: var(--green); }
+    .shell { width: min(1180px, calc(100% - 36px)); margin: 0 auto; }
+    header { padding: 68px 0 42px; border-bottom: 1px solid var(--line); }
+    .eyebrow { color: var(--green); font-weight: 760; letter-spacing: .12em; text-transform: uppercase; font-size: .76rem; }
+    h1 { margin: 12px 0 14px; max-width: 930px; font-family: var(--serif); font-size: clamp(2.55rem, 6vw, 5.2rem); line-height: .99; letter-spacing: -.045em; }
+    .dek { max-width: 850px; margin: 0; color: var(--muted); font-size: clamp(1.08rem, 2vw, 1.35rem); }
+    .meta { display: flex; flex-wrap: wrap; gap: 10px 22px; margin-top: 28px; color: var(--muted); font-size: .9rem; }
+    nav { position: sticky; top: 0; z-index: 10; background: rgba(251, 250, 246, .92); backdrop-filter: blur(12px); border-bottom: 1px solid var(--line); }
+    nav .shell { display: flex; gap: 22px; overflow-x: auto; padding-top: 13px; padding-bottom: 13px; scrollbar-width: none; }
+    nav a { white-space: nowrap; color: var(--muted); text-decoration: none; font-size: .85rem; font-weight: 680; }
+    nav a:hover { color: var(--green); }
+    main { padding: 44px 0 80px; }
+    section { scroll-margin-top: 72px; margin: 0 0 62px; }
+    h2 { margin: 0 0 18px; font-family: var(--serif); font-size: clamp(2rem, 4vw, 3.15rem); letter-spacing: -.035em; line-height: 1.05; }
+    h3 { margin: 28px 0 10px; font-size: 1.14rem; letter-spacing: -.012em; }
+    p { margin: 10px 0 16px; }
+    .lead { max-width: 860px; color: var(--muted); font-size: 1.12rem; }
+    .verdict { display: grid; grid-template-columns: 150px 1fr; gap: 28px; padding: 30px; background: linear-gradient(135deg, #133e32, #176b52); color: white; border-radius: var(--radius); box-shadow: var(--shadow); }
+    .score { font-family: var(--serif); font-size: 4.9rem; line-height: .86; letter-spacing: -.06em; }
+    .score small { display: block; margin-top: 12px; font-family: var(--sans); font-size: .74rem; line-height: 1.25; letter-spacing: .08em; text-transform: uppercase; opacity: .78; }
+    .verdict h2 { font-family: var(--sans); font-size: 1.5rem; letter-spacing: -.02em; margin-bottom: 8px; }
+    .verdict p { margin: 0; color: rgba(255,255,255,.86); }
+    .verdict code { color: #153e32; background: rgba(255,255,255,.9); border-color: rgba(255,255,255,.35); }
+    .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+    .grid.two { grid-template-columns: repeat(2, 1fr); }
+    .card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 22px; box-shadow: 0 6px 24px rgba(34, 61, 52, .045); }
+    .card h3 { margin-top: 0; }
+    .card p:last-child, .card ul:last-child { margin-bottom: 0; }
+    .tag { display: inline-block; margin-bottom: 11px; padding: 4px 9px; border-radius: 999px; font-size: .72rem; font-weight: 760; letter-spacing: .04em; text-transform: uppercase; }
+    .good { color: var(--green); background: var(--green-2); }
+    .caution { color: var(--amber); background: var(--amber-2); }
+    .later { color: var(--blue); background: var(--blue-2); }
+    .danger { color: var(--red); background: var(--red-2); }
+    .callout { margin: 22px 0; padding: 19px 22px; border: 1px solid #b8d5c8; border-left: 5px solid var(--green); background: var(--green-2); border-radius: 12px; }
+    .callout.warning { border-color: #ead397; border-left-color: var(--amber); background: var(--amber-2); }
+    .callout strong { display: block; margin-bottom: 4px; }
+    code, pre { font-family: var(--mono); }
+    code { font-size: .91em; background: #f0f3f1; border: 1px solid #e1e7e3; border-radius: 5px; padding: .09em .33em; }
+    pre { overflow-x: auto; margin: 16px 0; padding: 18px; color: #e9fff6; background: #14221e; border-radius: 12px; font-size: .84rem; line-height: 1.54; box-shadow: inset 0 0 0 1px rgba(255,255,255,.06); }
+    pre code { padding: 0; color: inherit; background: none; border: 0; }
+    ul, ol { padding-left: 1.3rem; }
+    li { margin: 7px 0; }
+    .layers { display: grid; gap: 8px; max-width: 930px; margin: 25px auto; }
+    .layer { display: grid; grid-template-columns: 175px 1fr; align-items: center; gap: 18px; padding: 14px 18px; background: var(--panel); border: 1px solid var(--line); border-radius: 11px; }
+    .layer b { color: var(--green); }
+    .layer span { color: var(--muted); }
+    .layer.highlight { border-color: #80b59f; box-shadow: 0 0 0 3px rgba(39, 128, 95, .08); }
+    .arrow { text-align: center; color: #89a198; line-height: .6; }
+    .table-wrap { overflow-x: auto; margin: 20px 0; border: 1px solid var(--line); border-radius: 14px; background: var(--panel); }
+    table { width: 100%; border-collapse: collapse; min-width: 780px; font-size: .88rem; }
+    th { color: var(--muted); background: #f3f6f4; text-align: left; font-size: .73rem; letter-spacing: .055em; text-transform: uppercase; }
+    th, td { padding: 13px 14px; vertical-align: top; border-bottom: 1px solid var(--line); }
+    tr:last-child td { border-bottom: 0; }
+    td:first-child { font-weight: 700; }
+    .dot { display: inline-block; width: 8px; height: 8px; margin-right: 7px; border-radius: 50%; background: var(--green); }
+    .dot.amber { background: #d39a35; }
+    .dot.gray { background: #94a09c; }
+    .timeline { position: relative; margin: 22px 0 0 14px; padding-left: 31px; border-left: 2px solid #b9cdc4; }
+    .phase { position: relative; margin: 0 0 26px; padding: 2px 0 0; }
+    .phase::before { content: ""; position: absolute; left: -39px; top: 5px; width: 13px; height: 13px; border: 4px solid var(--paper); border-radius: 50%; background: var(--green); box-shadow: 0 0 0 1px #9db9ad; }
+    .phase h3 { margin: 0 0 3px; }
+    .phase .when { color: var(--green); font-size: .79rem; font-weight: 760; letter-spacing: .06em; text-transform: uppercase; }
+    .phase p { color: var(--muted); margin-top: 6px; }
+    .decision { display: grid; grid-template-columns: 1fr auto 1fr auto 1fr; align-items: stretch; gap: 10px; margin: 24px 0; }
+    .decision .node { padding: 17px; text-align: center; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; }
+    .decision .node b { display: block; margin-bottom: 5px; }
+    .decision .join { display: grid; place-items: center; color: #729085; font-size: 1.5rem; }
+    .small { color: var(--muted); font-size: .84rem; }
+    .source-list { columns: 2; column-gap: 38px; }
+    .source-list li { break-inside: avoid; margin-bottom: 12px; }
+    .local-source { word-break: break-word; font-family: var(--mono); font-size: .78rem; color: var(--muted); }
+    footer { padding: 26px 0 46px; color: var(--muted); border-top: 1px solid var(--line); font-size: .82rem; }
+    @media (max-width: 820px) {
+      .grid, .grid.two { grid-template-columns: 1fr; }
+      .verdict { grid-template-columns: 1fr; }
+      .score { font-size: 3.8rem; }
+      .layer { grid-template-columns: 1fr; gap: 3px; }
+      .decision { grid-template-columns: 1fr; }
+      .decision .join { transform: rotate(90deg); }
+      .source-list { columns: 1; }
+    }
+    @media print {
+      nav { display: none; }
+      body { background: white; }
+      .shell { width: 100%; }
+      header { padding-top: 20px; }
+      .card, .verdict { box-shadow: none; break-inside: avoid; }
+      section { break-inside: auto; }
+      a { color: inherit; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="shell">
+      <div class="eyebrow">Senior architecture assessment · 25 August 2026</div>
+      <h1>VGI over Tailscale and WireGuard</h1>
+      <p class="dek">How VGI can become an easy, secure data-mesh substrate across laptops, offices, clouds, clusters, and partner environments—without creating a new protocol or coupling every worker SDK to one VPN vendor.</p>
+      <div class="meta">
+        <span><strong>Scope:</strong> core VGI connector, vgi-python, and active VGI-RPC language ports</span>
+        <span><strong>Method:</strong> local source inspection + primary vendor documentation</span>
+        <span><strong>Author:</strong> architecture review prepared for Query.Farm</span>
+      </div>
+    </div>
+  </header>
+
+  <nav aria-label="Report sections">
+    <div class="shell">
+      <a href="#verdict">Verdict</a>
+      <a href="#finding">Key finding</a>
+      <a href="#architecture">Architecture</a>
+      <a href="#paths">Deployment paths</a>
+      <a href="#identity">Identity &amp; security</a>
+      <a href="#implementations">Implementation matrix</a>
+      <a href="#roadmap">Roadmap</a>
+      <a href="#risks">Risks</a>
+      <a href="#sources">Sources</a>
+    </div>
+  </nav>
+
+  <main class="shell">
+    <section id="verdict">
+      <div class="verdict">
+        <div class="score">8/10<small>Strategic fit</small></div>
+        <div>
+          <h2>Strong idea—if VGI supports the overlay, rather than becoming the overlay.</h2>
+          <p>Tailscale is an unusually good fit for VGI: it supplies encrypted peer connectivity, NAT traversal, stable naming, deny-by-default policy, service identities, and increasingly capable service routing. The best first release is not a new <code>tailscale://</code> or <code>wireguard://</code> wire transport. It is a hardened and productized way to run VGI’s existing raw TCP or HTTP protocol over an authenticated overlay.</p>
+        </div>
+      </div>
+
+      <div class="grid" style="margin-top:16px">
+        <article class="card">
+          <span class="tag good">Do now</span>
+          <h3>Tailscale product profile</h3>
+          <p>Fix hostname/IPv6 dialing, ship Serve and Services recipes, policy templates, container/Kubernetes examples, diagnostics, and a real integration suite.</p>
+        </article>
+        <article class="card">
+          <span class="tag caution">Keep separate</span>
+          <h3>Generic WireGuard</h3>
+          <p>Document it as an operator-managed network. VGI already works over a WireGuard interface; VGI should not own peer keys, routes, DNS, or NAT traversal.</p>
+        </article>
+        <article class="card">
+          <span class="tag later">Later option</span>
+          <h3>Embedded tsnet</h3>
+          <p>Add an optional Go adapter where embedding a userspace tailnet node is valuable. Do not make a Go-only library the cross-language VGI contract.</p>
+        </article>
+      </div>
+    </section>
+
+    <section id="finding">
+      <h2>The key finding: the data plane already exists</h2>
+      <p class="lead">Tailscale and WireGuard are layer-3 overlays. VGI’s raw Arrow IPC runs over a bidirectional byte stream. The existing <code>tcp://host:port</code> transport is therefore already the correct data plane.</p>
+
+      <div class="callout">
+        <strong>No VGI protocol fork is required.</strong>
+        A worker reachable at a Tailscale IPv4 address can be used today as <code>tcp://100.x.y.z:9400</code>. A WireGuard interface address works the same way. HTTP workers likewise work over the overlay with ordinary <code>http://</code> or <code>https://</code> URLs.
+      </div>
+
+      <div class="grid two">
+        <article class="card">
+          <h3>What is already implemented</h3>
+          <ul>
+            <li>The core DuckDB extension detects <code>tcp://</code> and uses the same framed Arrow RPC path as Unix sockets/subprocesses.</li>
+            <li>Python exposes <code>serve_tcp</code>, <code>tcp_connect</code>, <code>Client.from_tcp</code>, and worker <code>--tcp</code>.</li>
+            <li>Rust, Go, TypeScript, Java, C#, and C++ RPC ports all contain raw TCP server support.</li>
+            <li>The language ports consistently label raw TCP as having no built-in authentication or TLS and default it to loopback.</li>
+          </ul>
+        </article>
+        <article class="card">
+          <span class="tag good">Fixed in working tree</span>
+          <h3>The first concrete engineering gap</h3>
+          <p>At the time of review, the core connector parsed a hostname from <code>tcp://</code>, but its native and Windows dialers fed that string directly to IPv4 <code>inet_pton</code>. The implementation now uses <code>getaddrinfo</code>, tries IPv4/IPv6 candidates under one connect budget, parses bracketed IPv6, and propagates resolver/connect diagnostics. Before that change:</p>
+          <ul>
+            <li>Tailscale MagicDNS names do not reliably work.</li>
+            <li>Tailscale Service names do not work through this path.</li>
+            <li>IPv6 literals and DNS answers are unsupported.</li>
+            <li>DNS failures have poor diagnostics.</li>
+          </ul>
+        </article>
+      </div>
+
+      <h3>Why this distinction matters</h3>
+      <p>Calling Tailscale a “transport” would collapse five independent concerns—wire protocol, routing, encryption, identity, and discovery—into one URI scheme. That would produce duplicated implementations, ambiguous security promises, and vendor lock-in. A clean architecture keeps those concerns composable.</p>
+    </section>
+
+    <section id="architecture">
+      <h2>Recommended architecture</h2>
+      <p class="lead">Preserve VGI’s current protocol boundaries and add an overlay integration layer around deployment, resolution, policy, identity enrichment, and diagnostics.</p>
+
+      <div class="layers" role="img" aria-label="Layered architecture from VGI semantics down to physical network">
+        <div class="layer"><b>VGI semantics</b><span>Catalog discovery, bind/init/scan, Arrow schemas, versioning, errors</span></div>
+        <div class="arrow">↓</div>
+        <div class="layer"><b>Wire protocol</b><span>Raw framed Arrow IPC over TCP, or VGI HTTP over HTTP(S)</span></div>
+        <div class="arrow">↓</div>
+        <div class="layer highlight"><b>Overlay integration</b><span>Names, policy templates, peer identity adapter, health checks, deployment profiles</span></div>
+        <div class="arrow">↓</div>
+        <div class="layer"><b>Secure connectivity</b><span>Tailscale, operator-managed WireGuard, cloud private networking, ordinary LAN</span></div>
+        <div class="arrow">↓</div>
+        <div class="layer"><b>Physical network</b><span>Direct UDP path, peer relay/DERP, Internet, office WAN, cloud backbone</span></div>
+      </div>
+
+      <div class="grid two">
+        <article class="card">
+          <span class="tag good">Canonical endpoints</span>
+          <h3>Keep <code>tcp://</code> and <code>https://</code></h3>
+          <p>The endpoint says how VGI speaks to the worker, not which route the kernel uses. This also means any mesh—Tailscale, Headscale, plain WireGuard, Nebula, cloud VPN, private peering—can carry VGI without SDK changes.</p>
+        </article>
+        <article class="card">
+          <span class="tag later">Optional assertion</span>
+          <h3>Add a network policy, not a network scheme</h3>
+          <p>A future attach option such as <code>NETWORK_REQUIRED 'tailscale'</code> could reject a destination that does not resolve to an approved tailnet range/interface. It should be a fail-closed deployment assertion, not a second wire implementation.</p>
+        </article>
+      </div>
+
+      <h3>Core connector change</h3>
+      <p>Replace the direct IPv4 conversion in <code>TcpConnect</code> with a deadline-bounded resolver/dial loop:</p>
+      <ol>
+        <li>Parse RFC-compliant host/port authorities, including <code>[IPv6]:port</code>.</li>
+        <li>Resolve with <code>getaddrinfo(AF_UNSPEC, SOCK_STREAM)</code>.</li>
+        <li>Attempt IPv6/IPv4 candidates under one overall connection deadline.</li>
+        <li>Preserve <code>TCP_NODELAY</code> and cancellation behavior.</li>
+        <li>Return actionable errors distinguishing invalid URI, DNS failure, policy denial/timeout, and connection refusal.</li>
+      </ol>
+      <p>This unlocks MagicDNS, Tailscale Services, ordinary DNS, and IPv6 for everyone—not just Tailscale users.</p>
+    </section>
+
+    <section id="paths">
+      <h2>Three useful deployment paths</h2>
+
+      <div class="decision" aria-label="Deployment maturity progression">
+        <div class="node"><b>1. Direct tailnet IP</b><span class="small">Immediate proof of value</span></div>
+        <div class="join">→</div>
+        <div class="node"><b>2. Tailscale Serve</b><span class="small">Safe single-node default</span></div>
+        <div class="join">→</div>
+        <div class="node"><b>3. Tailscale Service</b><span class="small">Production name + HA</span></div>
+      </div>
+
+      <div class="grid">
+        <article class="card">
+          <span class="tag caution">Pilot only</span>
+          <h3>Direct bind to a tailnet address</h3>
+          <p>Bind the worker to its <code>100.x</code> Tailscale address and attach by numeric IP. This proves the data plane immediately and preserves the remote source IP for identity lookup.</p>
+          <p><strong>Trade-off:</strong> brittle addressing and a greater chance of binding the wrong interface. Do not recommend <code>0.0.0.0</code> as the easy path.</p>
+        </article>
+        <article class="card">
+          <span class="tag good">Recommended default</span>
+          <h3>Loopback worker + Serve</h3>
+          <p>Keep the unauthenticated worker on loopback. Let <code>tailscaled</code> accept only tailnet traffic and proxy raw TCP or HTTPS to it. The worker cannot accidentally appear on the LAN or public interface.</p>
+          <p><strong>Trade-off:</strong> the backend sees the local proxy unless PROXY protocol is enabled and understood.</p>
+        </article>
+        <article class="card">
+          <span class="tag good">Production mesh</span>
+          <h3>Tailscale Services</h3>
+          <p>Publish a stable service name decoupled from hosts. Services add host approval, granular grants, traffic steering, regional routing, multiple hosts, and drain semantics. TCP is currently the supported transport, which matches VGI.</p>
+          <p><strong>Trade-off:</strong> every host must present compatible catalog semantics and versions.</p>
+        </article>
+      </div>
+
+      <h3>A practical raw-TCP pattern</h3>
+      <pre><code># 1. A language-specific VGI worker listens only on loopback.
+my-vgi-worker --tcp 127.0.0.1:9400
+
+# 2. tailscaled exposes that port privately to the tailnet.
+tailscale serve --bg --tcp=9400 tcp://127.0.0.1:9400
+
+# 3. After the DNS fix, DuckDB uses the ordinary VGI TCP endpoint.
+ATTACH 'risk_mesh' AS risk (
+  TYPE vgi,
+  LOCATION 'tcp://risk-worker.example-tailnet.ts.net:9400'
+);</code></pre>
+
+      <h3>A stable, multi-host service pattern</h3>
+      <pre><code># On each tagged service host; the local worker still listens on 127.0.0.1:9400.
+tailscale serve \
+  --service=svc:vgi-risk \
+  --tcp=9400 \
+  tcp://127.0.0.1:9400
+
+# Tailnet policy: only VGI clients may reach this service and port.
+{
+  "grants": [{
+    "src": ["tag:vgi-client"],
+    "dst": ["svc:vgi-risk"],
+    "ip": ["tcp:9400"]
+  }]
+}</code></pre>
+
+      <div class="callout warning">
+        <strong>Do not enable PROXY protocol yet.</strong>
+        Tailscale Serve can prepend PROXY v1/v2 metadata to preserve the original client IP, but current VGI raw servers expect the Arrow IPC stream immediately. They would interpret the PROXY preamble as corrupt protocol data. Add explicit PROXY v2 parsing across the RPC ports before using that flag.
+      </div>
+
+      <h3>When HTTP is the better VGI transport</h3>
+      <p>Use VGI HTTP over Tailscale when application-layer bearer/OAuth controls, resumable scans, externalized batches, compression, proxy compatibility, or browser/cloud integration matter more than raw streaming simplicity. Tailscale Serve can terminate HTTPS and proxy to a loopback HTTP worker. This is defense in depth: the tailnet gates network reachability while VGI can still authenticate the caller.</p>
+      <p>HTTPS certificates for <code>*.ts.net</code> names are convenient, but certificate names are published to public certificate-transparency logs. Worker names must not contain sensitive project or customer information.</p>
+    </section>
+
+    <section id="identity">
+      <h2>Identity, authorization, and trust boundaries</h2>
+      <p class="lead">WireGuard authenticates peer keys. Tailscale adds a control plane that maps nodes to users/tags and enforces grants. Neither automatically gives a raw VGI worker a portable application identity object.</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Control</th><th>Raw TCP over Tailscale</th><th>HTTP via Tailscale Serve</th><th>Plain WireGuard</th></tr></thead>
+          <tbody>
+            <tr><td>Encryption in transit</td><td>WireGuard, end to end between nodes</td><td>WireGuard; optional TLS to Serve and/or backend</td><td>WireGuard between configured peers</td></tr>
+            <tr><td>Reachability policy</td><td>Tailscale grants by source, destination, port, posture</td><td>Same grants; app capabilities can also be forwarded</td><td>AllowedIPs + host firewall; operator defined</td></tr>
+            <tr><td>Peer identity in VGI</td><td>Possible via LocalAPI WhoIs if original source IP is visible</td><td>Identity/app-capability headers from a trusted loopback proxy</td><td>No standard user identity; key/IP mapping is local convention</td></tr>
+            <tr><td>Application auth</td><td>Absent today</td><td>VGI bearer/OAuth can remain enabled</td><td>Absent for raw TCP; use VGI HTTPS/mTLS where required</td></tr>
+            <tr><td>Discovery / HA</td><td>MagicDNS and Tailscale Services</td><td>MagicDNS, Services, or existing HTTP infrastructure</td><td>Not supplied; add DNS/load balancing separately</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>Recommended security posture</h3>
+      <ol>
+        <li><strong>Bind raw workers to loopback by default.</strong> Publish them with Tailscale Serve or a controlled sidecar. Never make <code>0.0.0.0</code> the tutorial default.</li>
+        <li><strong>Use tagged machine identities for services.</strong> Grant the exact VGI client tag/group to the exact worker/service and port. Keep deny-by-default policy tests in version control.</li>
+        <li><strong>Retain VGI HTTP authentication for sensitive data.</strong> Tailnet membership is a reachability decision; it need not be the only data authorization decision.</li>
+        <li><strong>Trust injected identity headers only from the local Serve proxy.</strong> A directly reachable HTTP backend must strip or reject caller-supplied <code>Tailscale-*</code> headers.</li>
+        <li><strong>Do not use Funnel.</strong> Funnel is intentionally public. VGI’s mesh profile should detect and warn if the same port is configured for Funnel.</li>
+        <li><strong>Treat auth keys/OAuth client secrets as deployment secrets.</strong> Prefer short-lived or ephemeral tagged nodes for CI and transient workers; never bake reusable keys into images.</li>
+      </ol>
+
+      <h3>Phase-two identity contract</h3>
+      <p>If data-level policies need caller identity, define one cross-language RPC concept instead of seven Tailscale-specific APIs:</p>
+      <pre><code>PeerIdentity {
+  network: "tailscale" | "wireguard" | "mtls" | "unknown",
+  node_id?: string,
+  user?: string,
+  tags: string[],
+  source_ip?: string,
+  capabilities: map&lt;string, json&gt;,
+  verified_by: "localapi" | "trusted_proxy" | "certificate" | "none"
+}</code></pre>
+      <p>Populate it from LocalAPI/tsnet, trusted Serve headers, PROXY v2 plus WhoIs, or mTLS as appropriate. Expose it through the existing request/call context. This keeps worker authorization code independent of the overlay vendor and makes verification provenance explicit.</p>
+    </section>
+
+    <section id="implementations">
+      <h2>Cross-implementation readiness</h2>
+      <p class="lead">The active RPC ports are much closer to mesh-ready than expected. The shared work is mostly resolution, deployment, safety, and conformance—not reimplementing RPC.</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Component</th><th>Raw TCP status</th><th>Mesh readiness</th><th>Recommended work</th></tr></thead>
+          <tbody>
+            <tr><td>Core VGI / DuckDB C++ client</td><td><span class="dot"></span>Cross-platform client path</td><td>Numeric Tailscale IPv4 works; DNS/IPv6 gap blocks good UX</td><td><code>getaddrinfo</code>, bracketed IPv6 parsing, deadline/error tests, MagicDNS integration test</td></tr>
+            <tr><td>Python (<code>vgi-python</code> + <code>vgi-rpc</code>)</td><td><span class="dot"></span>Server, client, worker CLI</td><td>Best reference implementation; loopback-safe defaults already documented</td><td>Deployment profile/docs; optional peer context; container examples</td></tr>
+            <tr><td>Rust RPC</td><td><span class="dot"></span><code>serve_tcp</code></td><td>Thread-per-connection serve path and conformance coverage present</td><td>Mesh recipe; listener/address-family review; optional peer adapter later</td></tr>
+            <tr><td>Go RPC</td><td><span class="dot"></span><code>RunTcp</code></td><td>Native <code>net.Listen</code> path is well suited; strongest candidate for optional tsnet</td><td>Accept a <code>net.Listener</code>; optional <code>tsnet.Server.Listen</code>/<code>ListenService</code> package</td></tr>
+            <tr><td>TypeScript RPC</td><td><span class="dot"></span><code>serveTcp</code>/<code>tcpConnect</code></td><td>Works in Node/Bun; edge Worker runtimes cannot listen on sockets</td><td>Node deployment recipe; keep HTTP as the edge-runtime path</td></tr>
+            <tr><td>Java RPC</td><td><span class="dot"></span><code>TcpSocketTransport</code></td><td>Server/client and loopback default present</td><td>Deployment recipe; DNS/IPv6 tests; peer context later</td></tr>
+            <tr><td>C# RPC</td><td><span class="dot amber"></span><code>SocketTransport</code></td><td>Implemented, but local project notes flag excluded/hanging Unix/TCP conformance cases</td><td>Close conformance gaps before calling it production mesh-ready</td></tr>
+            <tr><td>C++ RPC worker library</td><td><span class="dot amber"></span>POSIX server/client</td><td>Raw TCP is implemented; library docs say Windows raw sockets remain unavailable</td><td>Windows parity if Windows-hosted C++ workers are a target; otherwise document boundary</td></tr>
+            <tr><td>Swift RPC</td><td><span class="dot gray"></span>No implementation found</td><td>Local repository is only a placeholder</td><td>Do not block the mesh release; inherit the standard TCP contract when the port begins</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>Compatibility rule for Tailscale Services</h3>
+      <p>A Tailscale Service may steer different connections to different hosts. VGI streaming state is connection-bound, so an individual raw-TCP stream remains naturally pinned. However, catalog attach/discovery and later execution can use separate connections. Every advertised host must therefore expose the same catalog identity, protocol compatibility, schema/version contract, authorization rules, and backing data semantics—or the service needs version-specific names such as <code>svc:vgi-risk-v2</code>.</p>
+      <p>Service drain is a good fit: it stops new connections while allowing existing VGI scans to finish. Rollouts should drain, wait for active connections, upgrade, verify, and re-advertise.</p>
+    </section>
+
+    <section id="wireguard">
+      <h2>What “WireGuard support” should mean</h2>
+      <p>Plain WireGuard creates a secure network interface and uses cryptokey routing: <code>AllowedIPs</code> both selects an outbound peer and constrains valid inbound source addresses. Once configured, VGI sees an ordinary IP route. That is enough for <code>tcp://</code> and <code>https://</code>.</p>
+
+      <div class="grid two">
+        <article class="card">
+          <span class="tag good">VGI-owned</span>
+          <h3>Portable integration surface</h3>
+          <ul>
+            <li>DNS and IPv4/IPv6-capable dialing</li>
+            <li>Safe bind-address guidance</li>
+            <li>Connection diagnostics and timeouts</li>
+            <li>HTTP/mTLS option for application authentication</li>
+            <li>Documented firewall and liveness expectations</li>
+          </ul>
+        </article>
+        <article class="card">
+          <span class="tag danger">Not VGI-owned</span>
+          <h3>VPN control plane</h3>
+          <ul>
+            <li>Peer key generation, storage, rotation, and revocation</li>
+            <li><code>AllowedIPs</code>, routes, DNS, NAT traversal, keepalives</li>
+            <li>Service discovery, load balancing, device enrollment</li>
+            <li>Cross-company trust federation and incident response</li>
+            <li>Kernel/userspace tunnel lifecycle</li>
+          </ul>
+        </article>
+      </div>
+
+      <p>Embedding these responsibilities in VGI would be a large, security-critical, permanent maintenance commitment. Organizations that want an open control plane can pair VGI with their selected WireGuard orchestrator (including Headscale-compatible Tailscale clients where appropriate) without changing VGI.</p>
+    </section>
+
+    <section id="roadmap">
+      <h2>Proposed roadmap and effort</h2>
+      <p class="lead">A useful release can be small. Identity-aware application authorization is valuable, but it should not delay the connectivity win.</p>
+
+      <div class="timeline">
+        <article class="phase">
+          <div class="when">0–2 days · proof</div>
+          <h3>Demonstrate today’s numeric-IP path</h3>
+          <p>Run a Python worker over a Tailscale IPv4 address; validate DuckDB attach, catalog discovery, scalar/table calls, streaming, cancellation, and large Arrow batches. Capture direct versus relayed results.</p>
+        </article>
+        <article class="phase">
+          <div class="when">Completed 25 August 2026 · foundation</div>
+          <h3>Core TCP naming and address families</h3>
+          <p>Implemented DNS/IPv6 parsing and dialing on POSIX and Windows with a shared connect budget, unit tests, end-to-end hostname verification, and actionable failure diagnostics. Transport docs now include DNS and bracketed IPv6.</p>
+        </article>
+        <article class="phase">
+          <div class="when">2–3 weeks · productized baseline</div>
+          <h3>Ship the VGI mesh deployment profile</h3>
+          <p>Add Tailscale Serve and Services recipes, grants/tests, Docker sidecar and Kubernetes Operator examples, a <code>vgi mesh doctor</code>-style diagnostic, CI smoke tests, and production guidance for raw TCP versus HTTPS.</p>
+        </article>
+        <article class="phase">
+          <div class="when">2–4 weeks · optional Go track</div>
+          <h3>Add a tsnet adapter</h3>
+          <p>Teach the Go server to accept an injected <code>net.Listener</code>; provide a separate optional package that creates a tsnet node or Tailscale Service. Avoid adding tsnet to the base RPC dependency graph.</p>
+        </article>
+        <article class="phase">
+          <div class="when">4–8 weeks · identity track</div>
+          <h3>Standardize verified peer identity</h3>
+          <p>Specify <code>PeerIdentity</code>, implement trusted HTTP header ingestion, LocalAPI WhoIs adapters, and optional PROXY v2 parsing across active server ports. Add authorization and spoofing conformance tests.</p>
+        </article>
+      </div>
+
+      <h3>Definition of done for the baseline</h3>
+      <ul>
+        <li>A user can copy a Python, Go, Rust, TypeScript, or Java example and serve a loopback worker through Tailscale without exposing a public/LAN listener.</li>
+        <li>DuckDB attaches with a MagicDNS or Tailscale Service name on macOS, Linux, and Windows.</li>
+        <li>The docs clearly distinguish transport encryption, network authorization, and application authorization.</li>
+        <li>An automated test proves attach + discovery + streaming through a real tailnet in an opt-in CI environment.</li>
+        <li>A diagnostic reports name resolution, destination addresses, route reachability, Tailscale connection type, service status, and likely policy failure without printing secrets.</li>
+      </ul>
+    </section>
+
+    <section id="testing">
+      <h2>Test and observability strategy</h2>
+      <div class="grid two">
+        <article class="card">
+          <h3>Correctness and failure matrix</h3>
+          <ul>
+            <li>Numeric IPv4, MagicDNS FQDN, short name, IPv6 literal, dual-stack result</li>
+            <li>Direct, DERP-relayed, and peer-relayed paths</li>
+            <li>Grant allowed/denied; service host pending approval; wrong port</li>
+            <li>Worker restart, client network roam, tailnet disconnect/reconnect</li>
+            <li>Service drain, rolling upgrade, host loss, incompatible host rejection</li>
+            <li>Large batches, long streams, cancellation, idle timeout, concurrent scans</li>
+          </ul>
+        </article>
+        <article class="card">
+          <h3>Signals worth surfacing</h3>
+          <ul>
+            <li>Resolved endpoint(s), selected address family, connect duration</li>
+            <li>VGI transport and protocol versions—never credentials</li>
+            <li>Tailscale direct / peer-relay / DERP status when locally available</li>
+            <li>Peer identity verification source, without treating IP alone as identity</li>
+            <li>Bytes, batches, backpressure, reconnects, and time-to-first-batch</li>
+            <li>Clear hint: “TCP raw transport has no VGI-layer auth; overlay policy is the boundary”</li>
+          </ul>
+        </article>
+      </div>
+      <p>Performance acceptance should separate VGI overhead from overlay path quality. Tailscale documents direct peer-to-peer connections as the lowest-latency/highest-throughput path; DERP is a reliable encrypted fallback with lower throughput. Record <code>tailscale status</code>/<code>tailscale ping</code> beside every benchmark so a relay regression is not misdiagnosed as an Arrow or VGI regression.</p>
+    </section>
+
+    <section id="risks">
+      <h2>Architectural risks and decisions</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Risk / decision</th><th>Why it matters</th><th>Mitigation</th></tr></thead>
+          <tbody>
+            <tr><td>“Encrypted” mistaken for “authorized”</td><td>Raw TCP has no VGI bearer, tenant, or row-level identity</td><td>Precise docs; deny-by-default grants; retain HTTP auth where data policy requires it</td></tr>
+            <tr><td>Accidental non-tailnet exposure</td><td><code>0.0.0.0</code> may include LAN/public interfaces</td><td>Loopback + Serve default; explicit unsafe-bind warning; deployment lint</td></tr>
+            <tr><td>Identity lost through L4 proxy</td><td>Backend sees loopback and cannot call WhoIs on the original address</td><td>Network grants for baseline; later PROXY v2 + verified WhoIs contract</td></tr>
+            <tr><td>Multi-host semantic drift</td><td>Attach/discovery and execution may land on different service hosts</td><td>Immutable/versioned service names; health validation; compatible replicas only</td></tr>
+            <tr><td>Relay performance surprises</td><td>Arrow streams may be throughput-heavy; DERP is slower</td><td>Expose path type; peer relays for strict NAT; benchmark realistic payloads</td></tr>
+            <tr><td>Vendor-specific API spread</td><td>Seven ports become costly and inconsistent</td><td>Baseline uses OS networking/Serve; optional adapters; vendor-neutral <code>PeerIdentity</code></td></tr>
+            <tr><td>VPN lifecycle enters SDK</td><td>Keys and routing are security-critical operational state</td><td>Keep Tailscale/WireGuard lifecycle outside worker SDKs</td></tr>
+            <tr><td>Serve/Funnel confusion</td><td>Funnel makes the endpoint public</td><td>Never use Funnel in VGI recipes; doctor warns on Funnel-configured port</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="callout">
+        <strong>Go / no-go recommendation</strong>
+        Go forward with a Tailscale-focused VGI mesh profile and generic secure-overlay support. Do not create a new wire scheme in the first release, do not embed WireGuard, and do not promise application identity until the cross-language peer context is specified and tested.
+      </div>
+    </section>
+
+    <section id="sources">
+      <h2>Sources and evidence</h2>
+      <p class="lead">External claims were checked against primary documentation available on 25 August 2026. Implementation claims come from the local VGI workspaces at their current checked-out revisions.</p>
+
+      <h3>Primary external sources</h3>
+      <ol class="source-list">
+        <li><a href="https://tailscale.com/docs/features/tailscale-services">Tailscale Services</a> — stable service names, host approval, endpoint types, routing, drains, grants, and current limitations.</li>
+        <li><a href="https://tailscale.com/docs/reference/tailscale-cli/serve">Tailscale Serve command</a> — raw TCP forwarding, TLS termination, PROXY protocol, and persistence.</li>
+        <li><a href="https://tailscale.com/docs/features/tsnet">tsnet</a> and <a href="https://tailscale.com/docs/reference/tsnet-server-api">tsnet.Server API</a> — embedded Go node and userspace listener model.</li>
+        <li><a href="https://tailscale.com/docs/concepts/tailscale-identity">Tailscale identity</a> — node identity, LocalAPI WhoIs, Serve identity headers, and app capabilities.</li>
+        <li><a href="https://tailscale.com/docs/reference/syntax/grants">Tailscale grants syntax</a> — deny-by-default network/application authorization.</li>
+        <li><a href="https://tailscale.com/docs/reference/connection-types">Tailscale connection types</a> — direct, peer relay, DERP, diagnostics, and performance trade-offs.</li>
+        <li><a href="https://tailscale.com/docs/concepts/userspace-networking">Userspace networking</a> — SOCKS5/HTTP proxy model for restricted containers/serverless.</li>
+        <li><a href="https://tailscale.com/docs/kubernetes-operator">Tailscale Kubernetes Operator</a> — ingress, egress, multi-cluster, and private-service exposure.</li>
+        <li><a href="https://tailscale.com/docs/how-to/set-up-https-certificates">Tailscale HTTPS certificates</a> — MagicDNS FQDNs and certificate-transparency disclosure.</li>
+        <li><a href="https://www.wireguard.com/papers/wireguard.pdf">WireGuard whitepaper</a> — network-interface model and cryptokey routing / AllowedIPs behavior.</li>
+      </ol>
+
+      <h3>Local implementation evidence</h3>
+      <div class="grid two">
+        <article class="card">
+          <h3>Core and Python</h3>
+          <p class="local-source">vgi/src/vgi_transport.cpp<br>vgi/src/vgi_container_runtime.cpp<br>vgi/src/vgi_subprocess.cpp<br>vgi/src/vgi_function_connection.cpp<br>vgi-python/vgi/worker.py<br>vgi-python/vgi/client/client.py<br>vgi-rpc-python/vgi_rpc/rpc/_transport.py</p>
+        </article>
+        <article class="card">
+          <h3>Other RPC ports</h3>
+          <p class="local-source">vgi-rpc-rust/vgi-rpc/src/tcp.rs<br>vgi-rpc-go/vgirpc/server_tcp.go<br>vgi-rpc-typescript/src/launcher/serve-tcp.ts<br>vgi-rpc-java/.../transport/TcpSocketTransport.java<br>vgi-rpc-csharp/.../Transport/SocketTransport.cs<br>vgi-rpc-c++/src/socket_transport.cpp</p>
+        </article>
+      </div>
+
+      <p class="small">Note: this is an architecture assessment, not a security certification. Tailscale feature availability, release stages, and plan requirements should be rechecked when productizing the integration.</p>
+    </section>
+  </main>
+
+  <footer>
+    <div class="shell">VGI mesh architecture assessment · Query.Farm workspace · Generated 25 August 2026</div>
+  </footer>
+</body>
+</html>

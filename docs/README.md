@@ -106,8 +106,9 @@ if __name__ == "__main__":
   DuckDB lazily loads catalog metadata, column statistics, and supports multi-branch
   (UNION-ALL) tables.
 - **Multiple transports** — `LOCATION` accepts a bare command (subprocess, pooled per
-  DuckDB process), `http(s)://` (HTTP), `unix:///path/to.sock` (AF_UNIX), or
-  `launch:<argv>` (launcher-managed shared worker).
+  DuckDB process), `http(s)://` (HTTP), `tcp://host:port` (raw TCP, including DNS
+  and bracketed IPv6), `unix:///path/to.sock` (AF_UNIX), or `launch:<argv>`
+  (launcher-managed shared worker).
 - **Pushdown** — projection, filter, `ORDER BY` + `LIMIT`, and join-key pushdown to
   workers that opt in.
 - **Worker pooling** — subprocess workers are pooled and reused across queries, with

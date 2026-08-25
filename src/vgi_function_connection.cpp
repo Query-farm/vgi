@@ -1866,9 +1866,10 @@ std::unique_ptr<IFunctionConnection> CreateFunctionConnection(
 		std::string host;
 		int port;
 		ParseTcpLocation(worker_path, host, port);
-		int fd = TcpConnect(host, port, 10000);
+		std::string connect_error;
+		int fd = TcpConnect(host, port, 10000, &connect_error);
 		if (fd < 0) {
-			throw IOException("vgi: failed to connect to tcp worker %s", worker_path);
+			throw IOException("vgi: failed to connect to tcp worker %s: %s", worker_path, connect_error);
 		}
 		auto worker = std::make_unique<UnixSocketWorker>(fd);
 		return std::make_unique<FunctionConnection>(
@@ -1882,9 +1883,10 @@ std::unique_ptr<IFunctionConnection> CreateFunctionConnection(
 		std::string host;
 		int port;
 		ParseTcpLocation(worker_path, host, port);
-		int fd = TcpConnect(host, port, 10000);
+		std::string connect_error;
+		int fd = TcpConnect(host, port, 10000, &connect_error);
 		if (fd < 0) {
-			throw IOException("vgi: failed to connect to tcp worker %s", worker_path);
+			throw IOException("vgi: failed to connect to tcp worker %s: %s", worker_path, connect_error);
 		}
 		auto worker = std::make_unique<NamedPipeWorker>(fd);
 		return std::make_unique<FunctionConnection>(

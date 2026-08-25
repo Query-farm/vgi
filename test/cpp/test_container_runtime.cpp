@@ -11,6 +11,12 @@
 
 #include "vgi_container_runtime.hpp"
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <cstring>
 #include <string>
 
 using duckdb::vgi::BuildContainerRunCommandTemplate;
@@ -21,6 +27,7 @@ using duckdb::vgi::ContainerSpecHash;
 using duckdb::vgi::ContainerVolume;
 using duckdb::vgi::kContainerNamePlaceholder;
 using duckdb::vgi::ParseContainerConnMode;
+using duckdb::vgi::TcpConnect;
 
 static ContainerSpec BaseSpec() {
 	ContainerSpec spec;
@@ -90,4 +97,88 @@ TEST_CASE("ContainerSpecHash distinguishes pooling-relevant differences", "[cont
 	CHECK(ContainerSpecHash(base) != ContainerSpecHash(diff_image));
 	CHECK(ContainerSpecHash(base) != ContainerSpecHash(diff_volume));
 	CHECK(ContainerSpecHash(base) != ContainerSpecHash(diff_env));
+}
+
+TEST_CASE("TcpConnect resolves localhost and connects to an IPv4 listener", "[tcp]") {
+	int listener = ::socket(AF_INET, SOCK_STREAM, 0);
+	REQUIRE(listener >= 0);
+	struct sockaddr_in address;
+	std::memset(&address, 0, sizeof(address));
+	address.sin_family = AF_INET;
+	address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	address.sin_port = 0;
+	REQUIRE(::bind(listener, reinterpret_cast<struct sockaddr *>(&address), sizeof(address)) == 0);
+	REQUIRE(::listen(listener, 1) == 0);
+	socklen_t address_len = sizeof(address);
+	REQUIRE(::getsockname(listener, reinterpret_cast<struct sockaddr *>(&address), &address_len) == 0);
+
+	std::string error = "stale";
+	int client = TcpConnect("localhost", ntohs(address.sin_port), 2000, &error);
+	REQUIRE(client >= 0);
+	CHECK(error.empty());
+	int accepted = ::accept(listener, nullptr, nullptr);
+	REQUIRE(accepted >= 0);
+	::close(accepted);
+	::close(client);
+	::close(listener);
+}
+
+TEST_CASE("TcpConnect supports IPv6 loopback when available", "[tcp]") {
+	int listener = ::socket(AF_INET6, SOCK_STREAM, 0);
+	if (listener < 0) {
+		WARN("IPv6 sockets are unavailable on this host");
+		return;
+	}
+	int v6_only = 1;
+	(void)::setsockopt(listener, IPPROTO_IPV6, IPV6_V6ONLY, &v6_only, sizeof(v6_only));
+	struct sockaddr_in6 address;
+	std::memset(&address, 0, sizeof(address));
+	address.sin6_family = AF_INET6;
+	address.sin6_addr = in6addr_loopback;
+	address.sin6_port = 0;
+	if (::bind(listener, reinterpret_cast<struct sockaddr *>(&address), sizeof(address)) != 0) {
+		WARN("IPv6 loopback cannot be bound on this host");
+		::close(listener);
+		return;
+	}
+	REQUIRE(::listen(listener, 1) == 0);
+	socklen_t address_len = sizeof(address);
+	REQUIRE(::getsockname(listener, reinterpret_cast<struct sockaddr *>(&address), &address_len) == 0);
+
+	std::string error;
+	int client = TcpConnect("::1", ntohs(address.sin6_port), 2000, &error);
+	REQUIRE(client >= 0);
+	CHECK(error.empty());
+	int accepted = ::accept(listener, nullptr, nullptr);
+	REQUIRE(accepted >= 0);
+	::close(accepted);
+	::close(client);
+	::close(listener);
+}
+
+TEST_CASE("TcpConnect reports hostname resolution failures", "[tcp]") {
+	std::string error;
+	CHECK(TcpConnect("not a valid hostname", 9400, 100, &error) < 0);
+	CHECK(error.find("cannot resolve TCP host") != std::string::npos);
+	CHECK(error.find("not a valid hostname") != std::string::npos);
+}
+
+TEST_CASE("TcpConnect reports resolved endpoint connection failures", "[tcp]") {
+	int listener = ::socket(AF_INET, SOCK_STREAM, 0);
+	REQUIRE(listener >= 0);
+	struct sockaddr_in address;
+	std::memset(&address, 0, sizeof(address));
+	address.sin_family = AF_INET;
+	address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	address.sin_port = 0;
+	REQUIRE(::bind(listener, reinterpret_cast<struct sockaddr *>(&address), sizeof(address)) == 0);
+	socklen_t address_len = sizeof(address);
+	REQUIRE(::getsockname(listener, reinterpret_cast<struct sockaddr *>(&address), &address_len) == 0);
+	const int port = ntohs(address.sin_port);
+	::close(listener); // the now-unbound endpoint should refuse the connection
+
+	std::string error;
+	CHECK(TcpConnect("127.0.0.1", port, 500, &error) < 0);
+	CHECK(error.find("connect to 127.0.0.1:" + std::to_string(port)) != std::string::npos);
+	CHECK(error.find("resolved address") != std::string::npos);
 }
