@@ -57,11 +57,14 @@ int StderrDrainer::ReleaseFd() {
 }
 
 std::string StderrDrainer::CaptureStderrSnapshot() {
-	// Stop and join the reader thread first. The caller only reaches this after
-	// the worker has exited, so its stderr write-end is closed: the reader hits
-	// EOF, flushes its trailing line_buffer into lines_, and returns promptly —
-	// the join captures the complete stderr with no race against the thread.
-	stop_.store(true, std::memory_order_relaxed);
+	// Ask the reader to drain to EOF, then join. Deliberately NOT stop_: stop_ is
+	// checked at the top of the reader loop, so setting it here would race a
+	// reader thread that has not been scheduled yet (freshly spawned worker that
+	// died immediately) and return an empty snapshot even though the worker's
+	// stderr is sitting unread in the pipe. drain_to_eof_ instead makes the
+	// reader keep reading until the write end closes (the worker has exited, so
+	// that is immediate) or a short idle timeout elapses.
+	drain_to_eof_.store(true, std::memory_order_relaxed);
 	if (thread_.joinable()) {
 		thread_.join();
 	}
@@ -128,6 +131,7 @@ void StderrDrainer::DrainToLog(ClientContext &context, const std::string &worker
 void StderrDrainer::ThreadLoop() {
 	char buffer[4096];
 	std::string line_buffer;
+	int idle_polls_while_draining = 0;
 
 #if VGI_POSIX_TRANSPORT
 	struct pollfd pfd;
@@ -137,7 +141,20 @@ void StderrDrainer::ThreadLoop() {
 	HANDLE h = reinterpret_cast<HANDLE>(_get_osfhandle(fd_));
 #endif
 
+	std::chrono::steady_clock::time_point drain_deadline {};
+	bool drain_deadline_set = false;
+
 	while (!stop_.load(std::memory_order_relaxed)) {
+		// Hard bound on drain-to-EOF mode: a worker that survives the error path
+		// and keeps writing must never hold the caller's join() hostage.
+		if (drain_to_eof_.load(std::memory_order_relaxed)) {
+			if (!drain_deadline_set) {
+				drain_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+				drain_deadline_set = true;
+			} else if (std::chrono::steady_clock::now() > drain_deadline) {
+				break;
+			}
+		}
 		// Wait (with a timeout / poll quantum) so we can periodically check the
 		// stop flag — a blocking read would prevent the destructor from joining.
 #if VGI_POSIX_TRANSPORT
@@ -149,8 +166,15 @@ void StderrDrainer::ThreadLoop() {
 			break;
 		}
 		if (poll_result == 0) {
+			// Idle. In drain-to-EOF mode an idle poll means the worker is not
+			// (yet) writing; give it one quantum, then give up so the caller's
+			// join() can't hang on a worker that outlives the error path.
+			if (drain_to_eof_.load(std::memory_order_relaxed) && ++idle_polls_while_draining >= 2) {
+				break;
+			}
 			continue;
 		}
+		idle_polls_while_draining = 0;
 		ssize_t bytes_read = read(fd_, buffer, sizeof(buffer) - 1);
 #elif defined(_WIN32)
 		DWORD avail = 0;
@@ -158,9 +182,13 @@ void StderrDrainer::ThreadLoop() {
 			break; // pipe closed / broken
 		}
 		if (avail == 0) {
+			if (drain_to_eof_.load(std::memory_order_relaxed) && ++idle_polls_while_draining >= 2) {
+				break;
+			}
 			std::this_thread::sleep_for(std::chrono::milliseconds(100));
 			continue;
 		}
+		idle_polls_while_draining = 0;
 		int bytes_read = _read(fd_, buffer, sizeof(buffer) - 1);
 #endif
 		if (bytes_read <= 0) {

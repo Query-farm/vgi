@@ -1,8 +1,11 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #pragma once
 
+#include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -203,8 +206,32 @@ inline std::string FormatWorkerStderrSuffix(const std::string &worker_stderr) {
 inline bool CheckWorkerExitStatus(SubProcess &proc, const std::string &worker_path, const std::string &error_context,
                                   const std::string &invocation_id_hex = "", const std::string &worker_stderr = "") {
 	int exit_status = 0;
+	// Every caller reaches here from a *transport* failure (EPIPE on write, EOF /
+	// error on read), i.e. the worker's pipe end is already closed. A dying child
+	// closes its fds during process teardown, so the parent routinely observes
+	// that EOF a few scheduler slices BEFORE the child becomes reapable — a bare
+	// waitpid(WNOHANG) then reports "still running", the caller rethrows the raw
+	// "RPC response stream EOF" and the user loses both the exit code and the
+	// captured stderr that explains the crash. Give the child a bounded grace
+	// window to be reaped instead. This costs nothing when it has already exited
+	// (first TryWait wins) and is only ever paid on an error path that is about
+	// to throw anyway.
 	if (!proc.TryWait(&exit_status)) {
-		return false; // Process still running
+		constexpr int kExitGraceMs = 500;
+		auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kExitGraceMs);
+		bool exited = false;
+		int sleep_us = 200;
+		while (std::chrono::steady_clock::now() < deadline) {
+			std::this_thread::sleep_for(std::chrono::microseconds(sleep_us));
+			if (proc.TryWait(&exit_status)) {
+				exited = true;
+				break;
+			}
+			sleep_us = std::min(sleep_us * 2, 5000);
+		}
+		if (!exited) {
+			return false; // Genuinely still running
+		}
 	}
 
 	// Build the messages by concatenation (no printf) so the stderr block lands

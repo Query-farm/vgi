@@ -64,6 +64,11 @@ private:
 	int fd_ = -1;
 	std::thread thread_;
 	std::atomic<bool> stop_ {false};
+	// Set by CaptureStderrSnapshot: "finish what is in the pipe, then stop".
+	// Distinct from stop_ (hard stop, used by the destructor / ReleaseFd) because
+	// a hard stop checked at the top of the reader loop can race a thread that
+	// has not been scheduled yet and drop the whole capture unread.
+	std::atomic<bool> drain_to_eof_ {false};
 	std::mutex mutex_;
 	std::vector<std::string> lines_;
 	size_t dropped_lines_ = 0;
