@@ -181,8 +181,7 @@ void VgiScalarFunctionSet::LoadEntries(ClientContext &context, const std::lock_g
 	rpc_ctx.entity_kind = "schema";
 	rpc_ctx.entity_qualifier = schema_.name;
 
-	auto function_list = vgi::InvokeCatalogSchemaContentsFunctions(rpc_ctx, schema_.name,
-	                                                               "SCALAR_FUNCTION", context);
+	auto function_list = schema_.GetFunctionInventory(rpc_ctx, CatalogType::SCALAR_FUNCTION_ENTRY, context);
 
 	// Group functions by name (overloads). std::map (not unordered_map)
 	// for stable iteration order — see B43 note in vgi_table_function_set.cpp.

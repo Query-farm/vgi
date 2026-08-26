@@ -17,20 +17,36 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
 # ============================================================================
 # Function Inventory
-# All scalar functions must be registered (includes overloads)
+# All 52 portable scalar rows must be registered (including overloads). The
+# Rust fixture additionally exposes two conditional-cache probes and a second
+# global_scalar overload; those three rows are allowed but not required from
+# the other worker implementations.
 # ============================================================================
 
-query I
-SELECT COUNT(*)
+query IIII
+SELECT COUNT(*) BETWEEN 52 AND 55,
+       COUNT(*) FILTER (WHERE function_name = 'cached_reval_double_scalar') BETWEEN 0 AND 1,
+       COUNT(*) FILTER (WHERE function_name = 'cached_reval_policy_scalar') BETWEEN 0 AND 1,
+       COUNT(*) FILTER (WHERE function_name = 'global_scalar') BETWEEN 1 AND 2
 FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'scalar';
 ----
-55
+true	true	true	true
 
 query T
+WITH ranked AS (
+  SELECT function_name,
+         row_number() OVER (
+           PARTITION BY function_name
+           ORDER BY parameters::VARCHAR, parameter_types::VARCHAR, return_type
+         ) AS occurrence
+  FROM duckdb_functions()
+  WHERE database_name = 'example' AND function_type = 'scalar'
+)
 SELECT function_name
-FROM duckdb_functions()
-WHERE database_name = 'example' AND function_type = 'scalar'
+FROM ranked
+WHERE function_name NOT IN ('cached_reval_double_scalar', 'cached_reval_policy_scalar')
+  AND (function_name <> 'global_scalar' OR occurrence = 1)
 ORDER BY function_name;
 ----
 add_values
@@ -41,8 +57,6 @@ binary_packet
 cached_add_const
 cached_double_scalar
 cached_label
-cached_reval_double_scalar
-cached_reval_policy_scalar
 collatz_steps
 concat_values
 concat_values
@@ -57,7 +71,6 @@ geo_centroid_struct
 geo_distance_fixed
 geo_distance_list
 geo_distance_struct
-global_scalar
 global_scalar
 hash_rounds
 hash_seed
@@ -392,17 +405,19 @@ geo_centroid_list	DOUBLE[]
 geo_centroid_struct	STRUCT(lat DOUBLE, lon DOUBLE)
 sum_values	ANY
 
-# Verify all other scalar functions have no varargs
+# Verify all portable non-varargs rows, while allowing the three Rust-only
+# non-varargs additions described above.
 query I
-SELECT COUNT(*)
+SELECT COUNT(*) BETWEEN 46 AND 49
 FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'scalar' AND varargs IS NULL;
 ----
-49
+true
 
 # ============================================================================
 # Stability
-# Most scalar functions are CONSISTENT; bernoulli and random_int are VOLATILE;
+# At least the 49 portable scalar rows are CONSISTENT; the Rust-only additions
+# are CONSISTENT too. bernoulli and random_int are VOLATILE;
 # query_seed is CONSISTENT_WITHIN_QUERY. All three stability variants are
 # emitted by a fixture so the wire enum stays covered (and other-language
 # workers must specify it).
@@ -418,11 +433,11 @@ bernoulli
 random_int
 
 query I
-SELECT COUNT(*)
+SELECT COUNT(*) BETWEEN 49 AND 52
 FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'scalar' AND stability = 'CONSISTENT';
 ----
-52
+true
 
 query T
 SELECT function_name

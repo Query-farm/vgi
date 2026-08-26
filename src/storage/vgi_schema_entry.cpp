@@ -37,6 +37,99 @@ VgiSchemaEntry::VgiSchemaEntry(Catalog &catalog, CreateSchemaInfo &info, const v
 
 VgiSchemaEntry::~VgiSchemaEntry() = default;
 
+std::vector<vgi::VgiMacroInfo> VgiSchemaEntry::GetMacroInventory(const vgi::CatalogRpcContext &rpc_ctx,
+                                                                 CatalogType macro_type, ClientContext &context) {
+	std::lock_guard<std::mutex> lock(macro_discovery_mutex_);
+	auto &inventory = macro_type == CatalogType::MACRO_ENTRY ? scalar_macro_inventory_ : table_macro_inventory_;
+	if (!inventory) {
+		const char *rpc_type = macro_type == CatalogType::MACRO_ENTRY ? "SCALAR_MACRO" : "TABLE_MACRO";
+		inventory = vgi::InvokeCatalogSchemaContentsMacros(rpc_ctx, name, rpc_type, context);
+	}
+	return *inventory;
+}
+
+std::vector<vgi::VgiFunctionInfo> VgiSchemaEntry::GetFunctionInventory(const vgi::CatalogRpcContext &rpc_ctx,
+                                                                       CatalogType function_type,
+                                                                       ClientContext &context) {
+	std::lock_guard<std::mutex> lock(macro_discovery_mutex_);
+	std::optional<std::vector<vgi::VgiFunctionInfo>> *inventory;
+	const char *rpc_type;
+	switch (function_type) {
+	case CatalogType::SCALAR_FUNCTION_ENTRY:
+		inventory = &scalar_function_inventory_;
+		rpc_type = "SCALAR_FUNCTION";
+		break;
+	case CatalogType::AGGREGATE_FUNCTION_ENTRY:
+		inventory = &aggregate_function_inventory_;
+		rpc_type = "AGGREGATE_FUNCTION";
+		break;
+	case CatalogType::TABLE_FUNCTION_ENTRY:
+		inventory = &table_function_inventory_;
+		rpc_type = "TABLE_FUNCTION";
+		break;
+	default:
+		throw InternalException("Unsupported VGI function inventory catalog type");
+	}
+	if (!*inventory) {
+		*inventory = vgi::InvokeCatalogSchemaContentsFunctions(rpc_ctx, name, rpc_type, context);
+	}
+	return **inventory;
+}
+
+std::shared_ptr<const case_insensitive_set_t>
+VgiSchemaEntry::GetMacroCallableNames(const vgi::CatalogRpcContext &rpc_ctx, bool trust_empty_kinds,
+                                      ClientContext &context) {
+	std::lock_guard<std::mutex> lock(macro_discovery_mutex_);
+	if (macro_callable_names_ && (trust_empty_kinds || macro_callable_names_complete_)) {
+		return macro_callable_names_;
+	}
+
+	if (!scalar_macro_inventory_) {
+		scalar_macro_inventory_ = vgi::InvokeCatalogSchemaContentsMacros(rpc_ctx, name, "SCALAR_MACRO", context);
+	}
+	if (!table_macro_inventory_) {
+		table_macro_inventory_ = vgi::InvokeCatalogSchemaContentsMacros(rpc_ctx, name, "TABLE_MACRO", context);
+	}
+
+	auto callable_names = std::make_shared<case_insensitive_set_t>();
+	for (const auto &macro : *scalar_macro_inventory_) {
+		callable_names->insert(macro.name);
+	}
+	for (const auto &macro : *table_macro_inventory_) {
+		callable_names->insert(macro.name);
+	}
+
+	// The caller only asks for callable names after observing a non-empty macro
+	// inventory. Keep this defensive empty check so future callers cannot turn an
+	// empty macro lookup into three unrelated function-inventory RPCs.
+	if (!callable_names->empty()) {
+		const auto add_functions = [&](std::optional<std::vector<vgi::VgiFunctionInfo>> &inventory,
+		                               const char *function_type) {
+			if (!inventory) {
+				inventory = vgi::InvokeCatalogSchemaContentsFunctions(rpc_ctx, name, function_type, context);
+			}
+			for (const auto &function : *inventory) {
+				callable_names->insert(function.name);
+			}
+		};
+		if (!trust_empty_kinds || estimated_counts_.scalar_function != 0) {
+			add_functions(scalar_function_inventory_, "SCALAR_FUNCTION");
+		}
+		if (!trust_empty_kinds || estimated_counts_.aggregate_function != 0) {
+			add_functions(aggregate_function_inventory_, "AGGREGATE_FUNCTION");
+		}
+		if (!trust_empty_kinds || estimated_counts_.table_function != 0) {
+			add_functions(table_function_inventory_, "TABLE_FUNCTION");
+		}
+	}
+
+	macro_callable_names_ = callable_names;
+	macro_callable_names_complete_ = scalar_function_inventory_.has_value() &&
+	                                 aggregate_function_inventory_.has_value() &&
+	                                 table_function_inventory_.has_value();
+	return macro_callable_names_;
+}
+
 namespace {
 // Push the harvested entries from a child catalog set into the parent
 // VgiCatalog's deferred-drop graveyard so any raw CatalogEntry* held by a

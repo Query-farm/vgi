@@ -138,10 +138,45 @@ DETACH example;
 statement ok
 ATTACH 'example' AS renamed (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
+statement ok
+CALL enable_logging(level := 'debug');
+
+statement ok
+CALL truncate_duckdb_logs();
+
 query I
 SELECT renamed.vgi_multiply(3, 4);
 ----
 12
+
+# The Rust fixture implements vgi_clamp through a scalar subquery over the
+# same-schema vgi_range_table macro. Other workers expose the same public
+# result directly, keeping this shared corpus portable.
+query I
+SELECT renamed.vgi_clamp(50);
+----
+50
+
+# Scalar/aggregate/table function and scalar/table macro inventories are each
+# fetched at most once for this schema. Both macro sets share the discovery
+# snapshot, and normal function-set loading reuses it too.
+query I
+SELECT COUNT(*) FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND message LIKE '%catalog.rpc%'
+  AND message LIKE '%method=catalog_schema_contents_functions%'
+  AND message LIKE '%entity_qualifier=main%';
+----
+3
+
+query I
+SELECT COUNT(*) FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND message LIKE '%catalog.rpc%'
+  AND message LIKE '%method=catalog_schema_contents_macros%'
+  AND message LIKE '%entity_qualifier=main%';
+----
+2
 
 statement ok
 DETACH renamed;
