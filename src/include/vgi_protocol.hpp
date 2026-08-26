@@ -28,6 +28,10 @@ struct BindResult {
 	std::vector<uint8_t> opaque_data;            // From BindResponse
 	std::vector<uint8_t> bind_request_bytes;     // Cached serialized BindRequest (needed for init)
 	std::vector<uint8_t> output_schema_bytes;    // Cached serialized output schema (needed for init)
+	// Sanitized cache-safety signal. True when secrets came from function
+	// metadata or the worker requested them during the two-phase bind. Secret
+	// names, scopes, and values deliberately do not escape the bind machinery.
+	bool secret_dependent = false;
 };
 
 // Result from init RPC call

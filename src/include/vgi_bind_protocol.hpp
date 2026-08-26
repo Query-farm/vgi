@@ -92,10 +92,9 @@ std::vector<uint8_t> BuildBindRequestBytes(
 // Throws IOException if the inlined blob is malformed or carries a
 // secret-scope request (which can only be resolved over the RPC path).
 // Callers should catch and fall back to the on-demand bind RPC.
-BindResult BuildBindResultFromInlinedBytes(
-    std::vector<uint8_t> bind_request_bytes,
-    const std::vector<uint8_t> &bind_response_bytes,
-    const std::string &worker_label);
+BindResult BuildBindResultFromInlinedBytes(std::vector<uint8_t> bind_request_bytes,
+                                           const std::vector<uint8_t> &bind_response_bytes,
+                                           const std::string &worker_label, bool secret_dependent);
 
 } // namespace vgi
 } // namespace duckdb

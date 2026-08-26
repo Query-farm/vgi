@@ -26,7 +26,6 @@ struct VgiCachedBatch;         // vgi_result_cache.hpp
 struct VgiCacheControl;        // vgi_cache_control.hpp
 struct VgiTableInOutBindData;  // vgi_table_in_out_impl.hpp
 struct VgiAttachParameters;    // vgi_attach_parameters.hpp
-struct VgiSecretRequirement;   // vgi_catalog_metadata.hpp
 
 // ============================================================================
 // Canonical key-component serializers (shared with the producer path)
@@ -128,10 +127,8 @@ bool BuildExchangeCacheKeyStaticFields(ClientContext &context,
                                        const std::string &function_name, const std::string &schema_name,
                                        const std::string &canonical_arguments,
                                        const std::map<std::string, Value> &settings,
-                                       const std::vector<int32_t> &projection_ids,
-                                       const std::vector<VgiSecretRequirement> &required_secrets,
-                                       VgiResultCacheKey &key,
-                                       std::string &catalog_name, int64_t &catalog_version,
+                                       const std::vector<int32_t> &projection_ids, bool secret_dependent,
+                                       VgiResultCacheKey &key, std::string &catalog_name, int64_t &catalog_version,
                                        const char *&reason, const std::string &operator_kind);
 
 // ============================================================================

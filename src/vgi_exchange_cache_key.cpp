@@ -272,10 +272,8 @@ bool BuildExchangeCacheKeyStaticFields(ClientContext &context,
                                        const std::string &function_name, const std::string &schema_name,
                                        const std::string &canonical_arguments,
                                        const std::map<std::string, Value> &settings,
-                                       const std::vector<int32_t> &projection_ids,
-                                       const std::vector<VgiSecretRequirement> &required_secrets,
-                                       VgiResultCacheKey &key,
-                                       std::string &catalog_name, int64_t &catalog_version,
+                                       const std::vector<int32_t> &projection_ids, bool secret_dependent,
+                                       VgiResultCacheKey &key, std::string &catalog_name, int64_t &catalog_version,
                                        const char *&reason, const std::string &operator_kind) {
 	reason = nullptr;
 	catalog_version = 0;
@@ -299,7 +297,7 @@ bool BuildExchangeCacheKeyStaticFields(ClientContext &context,
 	// safely probe nor populate a result cache: rotation/removal must be visible
 	// on the very next call, and hashing secret material into a key would retain
 	// credentials in process/disk state. Fail closed for every exchange shape.
-	if (!required_secrets.empty()) {
+	if (secret_dependent) {
 		reason = "secret_dependent";
 		return false;
 	}
@@ -362,9 +360,9 @@ bool BuildExchangeCacheKeyStatic(ClientContext &context, const VgiTableInOutBind
                                  std::string &catalog_name, int64_t &catalog_version, const char *&reason,
                                  const std::string &operator_kind) {
 	return BuildExchangeCacheKeyStaticFields(context, bd.attach_params, bd.function_name, bd.schema_name,
-	                                         bd.arguments.array ? bd.arguments.array->ToString() : "",
-	                                         bd.settings, projection_ids, bd.required_secrets, key, catalog_name,
-	                                         catalog_version, reason, operator_kind);
+	                                         bd.arguments.array ? bd.arguments.array->ToString() : "", bd.settings,
+	                                         projection_ids, bd.secret_dependent, key, catalog_name, catalog_version,
+	                                         reason, operator_kind);
 }
 
 // ----------------------------------------------------------------------------

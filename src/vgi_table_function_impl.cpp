@@ -160,6 +160,7 @@ static void ApplyBindResultToBindData(ClientContext &context, VgiTableFunctionBi
                                        vector<string> &names) {
 	bind_data.max_processes = 1;
 	bind_data.cardinality_estimate = -1;
+	bind_data.secret_dependent = bind_data.secret_dependent || bind_result.secret_dependent;
 	bind_data.bind_result = std::move(bind_result);
 
 	try {
@@ -212,6 +213,7 @@ unique_ptr<FunctionData> VgiTableFunctionBindData::Copy() const {
 	result->arguments = arguments;
 	result->settings = settings;
 	result->required_secrets = required_secrets;
+	result->secret_dependent = secret_dependent;
 
 	// Arrow conversion state. arrow_table holds shared_ptr<ArrowType> entries
 	// that are immutable and self-contained, so copy-by-value is safe and needs
@@ -293,9 +295,9 @@ void PerformVgiTableFunctionBind(ClientContext &context, VgiTableFunctionBindDat
 				    bind_data.worker_path(),
 				    bind_data.at_unit, bind_data.at_value,
 				    /*copy_from=*/nullptr, /*copy_to=*/nullptr, bind_data.schema_name);
-				auto bind_result = vgi::BuildBindResultFromInlinedBytes(
-				    std::move(bind_request_bytes), *tinfo.bind_result,
-				    bind_data.worker_path());
+				auto bind_result =
+				    vgi::BuildBindResultFromInlinedBytes(std::move(bind_request_bytes), *tinfo.bind_result,
+				                                         bind_data.worker_path(), !bind_data.required_secrets.empty());
 
 				VGI_LOG(context, "table_function.inline_bind_used",
 				        {{"worker_path", bind_data.worker_path()},
@@ -1467,7 +1469,7 @@ CacheEligibility EvaluateCacheEligibility(ClientContext &context,
 	// Secret values are intentionally neither serialized into the key nor retained
 	// by the cache. Any declared secret dependency makes the result sensitive to
 	// rotation/removal, so probing or storing it would serve stale credentials.
-	if (!bind_data.required_secrets.empty()) {
+	if (bind_data.secret_dependent) {
 		e.ineligible_reason = "secret_dependent";
 		return e;
 	}

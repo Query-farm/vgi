@@ -241,6 +241,7 @@ unique_ptr<FunctionData> VgiScalarFunctionBind(ClientContext &context, ScalarFun
 	// Phase 5: Connect to worker and perform bind to get output schema
 	// ========================================================================
 	std::shared_ptr<arrow::Schema> output_schema;
+	bool secret_dependent = !func_info.required_secrets.empty();
 
 	// Skip the worker call on re-bind when const values were already extracted
 	bool skip_worker_call = const_args_already_erased;
@@ -280,6 +281,7 @@ unique_ptr<FunctionData> VgiScalarFunctionBind(ClientContext &context, ScalarFun
 		connection->SetInputSchema(input_schema);
 		connection->SetSchemaName(func_info.schema_name);
 		auto bind_result = connection->PerformBindRpc();
+		secret_dependent = secret_dependent || bind_result.secret_dependent;
 
 		// Get the output schema from bind result
 		output_schema = bind_result.output_schema;
@@ -335,6 +337,7 @@ unique_ptr<FunctionData> VgiScalarFunctionBind(ClientContext &context, ScalarFun
 	bind_data->schema_name = func_info.schema_name;
 	bind_data->settings = settings;
 	bind_data->required_secrets = func_info.required_secrets;
+	bind_data->secret_dependent = secret_dependent;
 	bind_data->resolved_output_schema = output_schema;
 	bind_data->input_schema = input_schema;
 	bind_data->input_duckdb_types = input_types;
@@ -449,6 +452,13 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 		connection->SetInputSchema(local_state.input_schema);
 		connection->SetSchemaName(schema_name);
 		auto bind_result = connection->PerformBindRpc();
+		// Execute opens a fresh worker connection and therefore performs bind a
+		// second time. Preserve its sanitized provenance too: this is both a
+		// fail-closed guard for deserialized const-argument binds (where the
+		// planner intentionally skips the first RPC) and protection against a
+		// worker whose bind-time secret request is input-dependent.
+		local_state.secret_dependent =
+		    (bind_data && bind_data->secret_dependent) || bind_result.secret_dependent;
 		connection->PerformInit(bind_result);
 		connection->OpenInputWriter();
 
@@ -573,7 +583,7 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 		const std::string op_kind = "scalar\x1f" + result.GetType().ToString();
 		if (BuildExchangeCacheKeyStaticFields(context, bind_data->attach_params, bind_data->function_name,
 		                                      bind_data->schema_name, canon_args, bind_data->settings, {},
-		                                      bind_data->required_secrets, local_state.cache_static_key,
+		                                      local_state.secret_dependent, local_state.cache_static_key,
 		                                      local_state.cache_catalog_name, cver, reason, op_kind)) {
 			local_state.cache_eligible = true;
 			local_state.cache_static_fp = local_state.cache_static_key.Fingerprint();

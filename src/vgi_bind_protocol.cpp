@@ -70,11 +70,9 @@ std::vector<uint8_t> BuildBindRequestBytes(
 	return SerializeToIpcBytes(bind_request);
 }
 
-BindResult BuildBindResultFromInlinedBytes(
-    std::vector<uint8_t> bind_request_bytes,
-    const std::vector<uint8_t> &bind_response_bytes,
-    const std::string &worker_label) {
-
+BindResult BuildBindResultFromInlinedBytes(std::vector<uint8_t> bind_request_bytes,
+                                           const std::vector<uint8_t> &bind_response_bytes,
+                                           const std::string &worker_label, bool secret_dependent) {
 	// Deserialize the inlined BindResponse blob.
 	auto bind_response_batch = DeserializeFromIpcBytes(
 	    bind_response_bytes.data(), bind_response_bytes.size());
@@ -98,12 +96,8 @@ BindResult BuildBindResultFromInlinedBytes(
 	auto bind_response = ParseBindResponse(bind_response_batch, worker_label);
 	auto output_schema_bytes = SerializeSchemaToIpcBytes(bind_response.output_schema);
 
-	return BindResult {
-	    bind_response.output_schema,
-	    bind_response.opaque_data,
-	    std::move(bind_request_bytes),
-	    output_schema_bytes
-	};
+	return BindResult {bind_response.output_schema, bind_response.opaque_data, std::move(bind_request_bytes),
+	                   output_schema_bytes, secret_dependent};
 }
 
 BindResult PerformBindProtocol(
@@ -127,6 +121,7 @@ BindResult PerformBindProtocol(
 	// Resolve unscoped + static-scope/name secrets up front. Scoped secrets
 	// requested by the worker mid-bind are merged in below if needed.
 	auto secrets = ExtractVgiSecrets(context, required_secrets);
+	bool secret_dependent = !required_secrets.empty();
 
 	// First-attempt request bytes (resolved_secrets_provided=false).
 	auto bind_request_bytes = BuildBindRequestBytes(
@@ -141,6 +136,7 @@ BindResult PerformBindProtocol(
 	// secrets, we resolve them and re-send with resolved_secrets_provided=true.
 	auto scope_request = TryParseBindSecretScopeResponse(bind_response_batch);
 	if (scope_request) {
+		secret_dependent = true;
 		std::vector<VgiSecretRequirement> scoped_reqs;
 		for (const auto &lookup : scope_request->lookups) {
 			VgiSecretRequirement req;
@@ -173,12 +169,8 @@ BindResult PerformBindProtocol(
 	auto bind_response = ParseBindResponse(bind_response_batch, worker_label);
 	auto output_schema_bytes = SerializeSchemaToIpcBytes(bind_response.output_schema);
 
-	return BindResult {
-	    bind_response.output_schema,
-	    bind_response.opaque_data,
-	    std::move(bind_request_bytes),
-	    output_schema_bytes
-	};
+	return BindResult {bind_response.output_schema, bind_response.opaque_data, std::move(bind_request_bytes),
+	                   output_schema_bytes, secret_dependent};
 }
 
 } // namespace vgi

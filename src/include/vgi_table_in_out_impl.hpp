@@ -53,6 +53,8 @@ struct VgiTableInOutBindData : public TableFunctionData {
 	std::string schema_name;
 	std::map<std::string, Value> settings;
 	std::vector<vgi::VgiSecretRequirement> required_secrets;
+	// Sanitized union of metadata-declared and bind-discovered secret usage.
+	bool secret_dependent = false;
 
 	// Convenience accessors
 	const std::string &worker_path() const { return attach_params->worker_path(); }

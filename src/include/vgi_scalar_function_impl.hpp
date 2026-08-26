@@ -88,6 +88,8 @@ struct VgiScalarFunctionBindData : public FunctionData {
 	std::string schema_name;
 	std::map<std::string, Value> settings;
 	std::vector<vgi::VgiSecretRequirement> required_secrets;
+	// Sanitized union of metadata-declared and bind-discovered secret usage.
+	bool secret_dependent = false;
 
 	// Convenience accessors
 	const std::string &worker_path() const { return attach_params->worker_path(); }
@@ -121,6 +123,7 @@ struct VgiScalarFunctionBindData : public FunctionData {
 		copy->schema_name = schema_name;
 		copy->settings = settings;
 		copy->required_secrets = required_secrets;
+		copy->secret_dependent = secret_dependent;
 		copy->resolved_output_schema = resolved_output_schema;
 		copy->input_schema = input_schema;
 		copy->input_duckdb_types = input_duckdb_types;
@@ -186,6 +189,9 @@ struct VgiScalarFunctionLocalState : public FunctionLocalState {
 	// Per-value memoization: the static cache key (identity + worker + fn + const args +
 	// settings + versions) built once on the first batch; per-value keys derive from it by
 	// setting input_hash per distinct input tuple. cache_eligible gates the whole tier.
+	// Execute performs a fresh bind, so keep any newly discovered secret provenance
+	// here rather than mutating shared FunctionData from a parallel executor thread.
+	bool secret_dependent = false;
 	bool cache_key_built = false;
 	bool cache_eligible = false;
 	vgi::VgiResultCacheKey cache_static_key;

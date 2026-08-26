@@ -68,6 +68,8 @@ unique_ptr<FunctionData> VgiTableInOutBindData::Copy() const {
 	copy->function_name = function_name;
 	copy->schema_name = schema_name;
 	copy->settings = settings;
+	copy->required_secrets = required_secrets;
+	copy->secret_dependent = secret_dependent;
 	copy->arguments = arguments;
 	copy->output_schema = output_schema;
 	copy->input_schema = input_schema;
@@ -150,6 +152,7 @@ unique_ptr<FunctionData> VgiTableInOutBind(ClientContext &context, TableFunction
 	bind_data->schema_name = params.schema_name;
 	bind_data->settings = params.settings;
 	bind_data->required_secrets = params.required_secrets;
+	bind_data->secret_dependent = !params.required_secrets.empty();
 	bind_data->table_buffering = params.table_buffering;
 	bind_data->source_order_dependent = params.source_order_dependent;
 	bind_data->sink_order_dependent = params.sink_order_dependent;
@@ -312,6 +315,7 @@ unique_ptr<FunctionData> VgiTableInOutBind(ClientContext &context, TableFunction
 
 	// Perform bind
 	auto bind_result = connection->PerformBindRpc();
+	bind_data->secret_dependent = bind_data->secret_dependent || bind_result.secret_dependent;
 
 	// Store output schema (max_processes and cardinality_estimate set from init result later)
 	bind_data->output_schema = bind_result.output_schema;

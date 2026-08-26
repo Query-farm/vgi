@@ -131,6 +131,9 @@ struct VgiTableFunctionBindData : public TableFunctionData {
 
 	// Required secrets for this function (from function metadata)
 	std::vector<VgiSecretRequirement> required_secrets;
+	// Includes both metadata-declared secrets and any secret scope requested by
+	// the worker during its two-phase bind. Cache policy consumes only this bool.
+	bool secret_dependent = false;
 
 	// Schema information (discovered from OutputSpec during bind)
 	// Arrow C ABI schema wrapper for DuckDB conversion
