@@ -21,6 +21,7 @@ FROM duckdb_tables()
 WHERE database_name = 'example' AND schema_name = 'data'
   AND comment IS NOT NULL
   AND table_name != 'geo_points'  -- geo_points requires spatial extension
+  AND table_name != 'cache_revalidation_policy'  -- optional SDK conformance fixture, checked below
   AND table_name NOT LIKE 'rff_%'  -- rff_* fixtures live in required_filters_*.test
 ORDER BY table_name;
 ----
@@ -74,6 +75,22 @@ tt_pushdown_fn	Function-backed: prunes by filter AND time-travels (AT read at in
 versioned_constraints	Table with constraints that evolve across versions
 versioned_data	Versioned data table demonstrating time travel with schema evolution
 volatile_numbers	Numbers with volatile stats (TTL=0, always re-fetched)
+
+# The Rust fixture worker currently carries this additional cache-policy table.
+# Accept absence or one exact registration; partial/misdocumented metadata fails.
+query I
+SELECT CASE
+         WHEN COUNT(*) = 0 THEN 1
+         WHEN COUNT(*) = 1
+          AND MIN(comment) = 'Conditional revalidation fixture for not-modified, revocation, and stale-if-error'
+         THEN 1
+         ELSE 0
+       END
+FROM duckdb_tables()
+WHERE database_name = 'example' AND schema_name = 'data'
+  AND table_name = 'cache_revalidation_policy';
+----
+1
 
 # ============================================================================
 # View comments (via duckdb_views)

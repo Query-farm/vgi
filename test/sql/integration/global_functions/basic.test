@@ -100,7 +100,7 @@ SELECT n, label FROM acme.main.global_table() ORDER BY n;
 
 # The globally-published name resolves in the system catalog, not the VGI one.
 query T
-SELECT database_name FROM duckdb_functions()
+SELECT DISTINCT database_name FROM duckdb_functions()
 WHERE function_name = 'vgi_example_global_scalar';
 ----
 system

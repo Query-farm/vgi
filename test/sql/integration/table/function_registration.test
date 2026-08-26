@@ -138,13 +138,51 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 #   re-emits its splits across pages); and four pair splits with another
 #   feature (split_batch_index, split_partitioned, split_dynamic_filter,
 #   split_cacheable). Back splits/*.test.
-# = 162
+# = 162 portable baseline registrations.
+#
+# SDK fixture workers may additionally ship the all-or-nothing set of nine
+# exchange-cache revalidation/finalization conformance probes listed below.
+# They are deliberately excluded from the portable inventory count, then
+# validated as an exact optional set so a partial registration still fails.
 query I
 SELECT COUNT(*)
 FROM duckdb_functions()
-WHERE database_name = 'example' AND function_type = 'table';
+WHERE database_name = 'example' AND function_type = 'table'
+  AND function_name NOT IN (
+    'cache_revalidation_policy',
+    'cached_finalizing_echo',
+    'cached_reval_error_sum_all',
+    'cached_reval_fresh_no_store_sum_all',
+    'cached_reval_no_store_sum_all',
+    'cached_reval_policy',
+    'cached_reval_sum_all',
+    'cached_serial_echo',
+    'cached_slow_sum_all'
+  );
 ----
 162
+
+query I
+SELECT CASE
+         WHEN COUNT(*) = 0 THEN 1
+         WHEN COUNT(*) = 9 AND COUNT(DISTINCT function_name) = 9 THEN 1
+         ELSE 0
+       END
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_type = 'table'
+  AND function_name IN (
+    'cache_revalidation_policy',
+    'cached_finalizing_echo',
+    'cached_reval_error_sum_all',
+    'cached_reval_fresh_no_store_sum_all',
+    'cached_reval_no_store_sum_all',
+    'cached_reval_policy',
+    'cached_reval_sum_all',
+    'cached_serial_echo',
+    'cached_slow_sum_all'
+  );
+----
+1
 
 # The 34 pure table functions (no TABLE parameter type)
 # Note: make_series appears 5 times (5 overloads), make_pairs appears 3 times,
