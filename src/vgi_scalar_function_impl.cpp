@@ -573,14 +573,17 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 		const std::string op_kind = "scalar\x1f" + result.GetType().ToString();
 		if (BuildExchangeCacheKeyStaticFields(context, bind_data->attach_params, bind_data->function_name,
 		                                      bind_data->schema_name, canon_args, bind_data->settings, {},
-		                                      local_state.cache_static_key, local_state.cache_catalog_name, cver,
-		                                      reason, op_kind)) {
+		                                      bind_data->required_secrets, local_state.cache_static_key,
+		                                      local_state.cache_catalog_name, cver, reason, op_kind)) {
 			local_state.cache_eligible = true;
 			local_state.cache_static_fp = local_state.cache_static_key.Fingerprint();
 			Value ttl_v;
 			if (context.TryGetCurrentSetting("vgi_result_cache_default_ttl_seconds", ttl_v) && !ttl_v.IsNull()) {
 				local_state.cache_default_ttl_seconds = static_cast<int64_t>(ttl_v.GetValue<uint64_t>());
 			}
+		} else if (reason) {
+			VGI_LOG(context, "result_cache.ineligible",
+			        {{"function", bind_data->function_name}, {"reason", reason}});
 		}
 	}
 	bool pv_setting = true;

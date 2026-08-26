@@ -26,6 +26,7 @@ struct VgiCachedBatch;         // vgi_result_cache.hpp
 struct VgiCacheControl;        // vgi_cache_control.hpp
 struct VgiTableInOutBindData;  // vgi_table_in_out_impl.hpp
 struct VgiAttachParameters;    // vgi_attach_parameters.hpp
+struct VgiSecretRequirement;   // vgi_catalog_metadata.hpp
 
 // ============================================================================
 // Canonical key-component serializers (shared with the producer path)
@@ -105,7 +106,8 @@ void SyncResultCacheSettings(ClientContext &context);
 //! producer-only filter/order/sample components). `key.input_hash` is left EMPTY —
 //! the caller sets it per memoization event. Returns false + sets `*reason` when
 //! ineligible (global switch off, per-catalog opt-out, unresolved identity,
-//! unknown catalog version). On true, fills `key`, `catalog_name`, `catalog_version`.
+//! unknown catalog version, or any secret dependency). On true, fills `key`,
+//! `catalog_name`, `catalog_version`.
 //!
 //! SECURITY: identity_scope folds in the caller's auth principal
 //! (BuildCatalogIdentityScope); "" fails closed so two identities never cross-serve.
@@ -126,7 +128,9 @@ bool BuildExchangeCacheKeyStaticFields(ClientContext &context,
                                        const std::string &function_name, const std::string &schema_name,
                                        const std::string &canonical_arguments,
                                        const std::map<std::string, Value> &settings,
-                                       const std::vector<int32_t> &projection_ids, VgiResultCacheKey &key,
+                                       const std::vector<int32_t> &projection_ids,
+                                       const std::vector<VgiSecretRequirement> &required_secrets,
+                                       VgiResultCacheKey &key,
                                        std::string &catalog_name, int64_t &catalog_version,
                                        const char *&reason, const std::string &operator_kind);
 

@@ -132,3 +132,16 @@ SELECT MAX(range) FROM example.vgi_range_table(5);
 
 statement ok
 DETACH example;
+
+# Macro dependencies are qualified to the catalog alias chosen by the caller,
+# rather than the worker's catalog name or the current search path.
+statement ok
+ATTACH 'example' AS renamed (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+query I
+SELECT renamed.vgi_multiply(3, 4);
+----
+12
+
+statement ok
+DETACH renamed;

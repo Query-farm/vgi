@@ -1464,6 +1464,13 @@ CacheEligibility EvaluateCacheEligibility(ClientContext &context,
 		e.ineligible_reason = "disabled_attach";
 		return e;
 	}
+	// Secret values are intentionally neither serialized into the key nor retained
+	// by the cache. Any declared secret dependency makes the result sensitive to
+	// rotation/removal, so probing or storing it would serve stale credentials.
+	if (!bind_data.required_secrets.empty()) {
+		e.ineligible_reason = "secret_dependent";
+		return e;
+	}
 	// Identity + version dimensions. Two paths (M5 adds the direct one):
 	//   - catalog-attached (bind_data.table_entry set): identity = catalog name,
 	//     freshness bounded by the runtime catalog_version (0 = unknown → never

@@ -272,7 +272,9 @@ bool BuildExchangeCacheKeyStaticFields(ClientContext &context,
                                        const std::string &function_name, const std::string &schema_name,
                                        const std::string &canonical_arguments,
                                        const std::map<std::string, Value> &settings,
-                                       const std::vector<int32_t> &projection_ids, VgiResultCacheKey &key,
+                                       const std::vector<int32_t> &projection_ids,
+                                       const std::vector<VgiSecretRequirement> &required_secrets,
+                                       VgiResultCacheKey &key,
                                        std::string &catalog_name, int64_t &catalog_version,
                                        const char *&reason, const std::string &operator_kind) {
 	reason = nullptr;
@@ -290,6 +292,15 @@ bool BuildExchangeCacheKeyStaticFields(ClientContext &context,
 	// Per-catalog opt-out.
 	if (!attach_params || !attach_params->cache()) {
 		reason = "disabled_attach";
+		return false;
+	}
+	// Resolved secret values are deliberately absent from cache identity and
+	// diagnostics. A function that requested any secret can therefore neither
+	// safely probe nor populate a result cache: rotation/removal must be visible
+	// on the very next call, and hashing secret material into a key would retain
+	// credentials in process/disk state. Fail closed for every exchange shape.
+	if (!required_secrets.empty()) {
+		reason = "secret_dependent";
 		return false;
 	}
 
@@ -352,8 +363,8 @@ bool BuildExchangeCacheKeyStatic(ClientContext &context, const VgiTableInOutBind
                                  const std::string &operator_kind) {
 	return BuildExchangeCacheKeyStaticFields(context, bd.attach_params, bd.function_name, bd.schema_name,
 	                                         bd.arguments.array ? bd.arguments.array->ToString() : "",
-	                                         bd.settings, projection_ids, key, catalog_name, catalog_version,
-	                                         reason, operator_kind);
+	                                         bd.settings, projection_ids, bd.required_secrets, key, catalog_name,
+	                                         catalog_version, reason, operator_kind);
 }
 
 // ----------------------------------------------------------------------------
