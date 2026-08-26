@@ -80,9 +80,10 @@ std::shared_ptr<const case_insensitive_set_t>
 VgiSchemaEntry::GetMacroCallableNames(const vgi::CatalogRpcContext &rpc_ctx, bool trust_empty_kinds,
                                       ClientContext &context) {
 	std::lock_guard<std::mutex> lock(macro_discovery_mutex_);
-	if (macro_callable_names_ && (trust_empty_kinds || macro_callable_names_complete_)) {
+	if (macro_callable_names_ && (macro_callable_names_->empty() || macro_callable_names_complete_)) {
 		return macro_callable_names_;
 	}
+	(void)trust_empty_kinds;
 
 	if (!scalar_macro_inventory_) {
 		scalar_macro_inventory_ = vgi::InvokeCatalogSchemaContentsMacros(rpc_ctx, name, "SCALAR_MACRO", context);
@@ -112,15 +113,15 @@ VgiSchemaEntry::GetMacroCallableNames(const vgi::CatalogRpcContext &rpc_ctx, boo
 				callable_names->insert(function.name);
 			}
 		};
-		if (!trust_empty_kinds || estimated_counts_.scalar_function != 0) {
-			add_functions(scalar_function_inventory_, "SCALAR_FUNCTION");
-		}
-		if (!trust_empty_kinds || estimated_counts_.aggregate_function != 0) {
-			add_functions(aggregate_function_inventory_, "AGGREGATE_FUNCTION");
-		}
-		if (!trust_empty_kinds || estimated_counts_.table_function != 0) {
-			add_functions(table_function_inventory_, "TABLE_FUNCTION");
-		}
+		// Estimated counts are a discovery optimization, not an authority for
+		// names referenced by a macro body. Some workers register executable
+		// functions outside their declarative catalog model and report zero here
+		// even though the function inventory is non-empty. Once a macro exists,
+		// fetch all callable inventories exactly once so owner-relative names are
+		// never left on DuckDB's ambient search path.
+		add_functions(scalar_function_inventory_, "SCALAR_FUNCTION");
+		add_functions(aggregate_function_inventory_, "AGGREGATE_FUNCTION");
+		add_functions(table_function_inventory_, "TABLE_FUNCTION");
 	}
 
 	macro_callable_names_ = callable_names;

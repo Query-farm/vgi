@@ -93,9 +93,9 @@ private:
 	std::optional<std::vector<vgi::VgiFunctionInfo>> aggregate_function_inventory_;
 	std::optional<std::vector<vgi::VgiFunctionInfo>> table_function_inventory_;
 	std::shared_ptr<const case_insensitive_set_t> macro_callable_names_;
-	// False when a trust-empty lookup intentionally skipped one or more
-	// function inventories. A later SET vgi_trust_empty_kinds=false upgrades
-	// the snapshot rather than incorrectly reusing the partial one.
+	// True after every function kind has been inspected for macro dependencies.
+	// Estimated zero counts are deliberately not trusted at this correctness
+	// boundary.
 	bool macro_callable_names_complete_ = false;
 };
 
