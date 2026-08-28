@@ -65,12 +65,12 @@ The `VGI_TEST_WORKER` env var controls which worker is used. It defaults to
 
 **The `.test` files ARE the cross-SDK conformance suite.** Every one carries
 `require-env VGI_TEST_WORKER`, so the same files run unchanged against the
-Python, Rust, Go, TypeScript and Java workers — a wire disagreement between two
-SDKs shows up as the same named test failing under one of them.
+Python, Rust, Go, TypeScript, Java and C# workers — a wire disagreement between
+two SDKs shows up as the same named test failing under one of them.
 
 ```bash
 make test_languages          # every SDK, keeps going on failure
-make test_rust               # one leg (also: test_python/test_go/test_typescript/test_java)
+make test_rust               # one leg (also: test_python/test_go/test_typescript/test_java/test_csharp)
 ```
 
 **Run it after touching anything on the wire.** The matrix is the only thing that

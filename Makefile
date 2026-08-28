@@ -404,13 +404,15 @@ test_all_debug: test_spawn_debug test_shm_debug test_unix_debug test_http_debug 
 # The VGI_*_WORKER vars above default to the vgi-python fixtures, so the
 # transport targets (test_spawn / test_launcher / ...) already exercise
 # the Python implementation. These convenience targets run the SAME
-# test/sql/integration suite against the Go / TypeScript / Java worker
-# implementations by delegating to each SDK repo's own `make test`, which
-# builds that language's worker(s) and applies the exclusions for fixtures it
-# doesn't implement. Each SDK Makefile points its UNITTEST back at this repo's
-# build, so all four run identical .test files — only the worker differs.
+# test/sql/integration suite against the Go / TypeScript / Java / C# worker
+# implementations by delegating to each SDK repo's own gated test target
+# (`make test` for go/typescript/java, `make test_integration_gated` for C#,
+# whose bare `test` is its xUnit unit suite instead), which builds that
+# language's worker(s) and applies the exclusions for fixtures it doesn't
+# implement. Each SDK Makefile points its UNITTEST back at this repo's build,
+# so all five run identical .test files — only the worker differs.
 #
-# Override an SDK location with VGI_GO_DIR / VGI_TS_DIR / VGI_JAVA_DIR.
+# Override an SDK location with VGI_GO_DIR / VGI_TS_DIR / VGI_JAVA_DIR / VGI_CSHARP_DIR.
 #
 # Storage backend: each run defaults to the local SQLite tier. The worker
 # inherits VGI_WORKER_SHARED_STORAGE from the environment, so
@@ -438,12 +440,13 @@ test_all_debug: test_spawn_debug test_shm_debug test_unix_debug test_http_debug 
 # worker directly.
 # ---------------------------------------------------------------------------
 
-VGI_GO_DIR   ?= $(HOME)/Development/vgi-go
-VGI_TS_DIR   ?= $(HOME)/Development/vgi-typescript
-VGI_JAVA_DIR ?= $(HOME)/vgi-java
-VGI_RUST_DIR ?= $(HOME)/Development/vgi-rust
+VGI_GO_DIR     ?= $(HOME)/Development/vgi-go
+VGI_TS_DIR     ?= $(HOME)/Development/vgi-typescript
+VGI_JAVA_DIR   ?= $(HOME)/vgi-java
+VGI_RUST_DIR   ?= $(HOME)/Development/vgi-rust
+VGI_CSHARP_DIR ?= $(HOME)/Development/vgi-csharp
 
-.PHONY: test_python test_python_crash test_go test_typescript test_java test_rust test_languages
+.PHONY: test_python test_python_crash test_go test_typescript test_java test_rust test_csharp test_languages
 
 # Python uses this repo's default worker set. It does NOT just chain to
 # test_launcher, which invokes `unittest` bare: a lane that stops running tests
@@ -514,6 +517,14 @@ test_typescript:
 
 test_java:
 	$(MAKE) -C $(VGI_JAVA_DIR) test
+
+# C# has no Makefile-embedded coverage gate of its own to delegate to bare `test` for (its
+# `test` target is the xUnit unit suite) — its `test_integration_gated` target is the
+# gated conformance lane, built to match this one. Full fixture coverage (versioned/
+# versioned_tables/attach_options/attach_options_required/bad_enum) as of the version-resolution
+# + attach-options + bad-enum work — see that Makefile for the gate detail.
+test_csharp:
+	$(MAKE) -C $(VGI_CSHARP_DIR) test_integration_gated
 
 # Rust has no Makefile of its own — build the example worker and point the
 # suite at it directly. Same .test files, only the worker differs.
@@ -592,7 +603,7 @@ test_rust:
 # non-zero if any failed.
 test_languages:
 	@rc=0; \
-	for t in test_python test_go test_rust test_typescript test_java; do \
+	for t in test_python test_go test_rust test_typescript test_java test_csharp; do \
 		echo "==================== $$t ===================="; \
 		$(MAKE) $$t || rc=$$?; \
 	done; \
