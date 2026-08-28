@@ -112,7 +112,7 @@ Example (pretty-printed; the group values are strings on the wire):
 
 | Key | Meaning |
 |-----|---------|
-| `type` | Normalized transport: `subprocess` / `http` / `tcp` / `unix` / `launch` / `container` / `github`. |
+| `type` | Normalized transport: `subprocess` / `http` / `tcp` / `unix` / `launch` / `container` / `github` / `database`. |
 | `scheme` | Exact scheme: `http`/`https`/`oci`/`docker`/`github`/`github-auto`/… |
 | `location` | The scrubbed worker location. |
 | `container` | For container transports: `{runtime, connection, shared}`; otherwise null. |

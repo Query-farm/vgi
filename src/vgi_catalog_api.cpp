@@ -306,7 +306,8 @@ std::vector<VgiCatalogInfo> InvokeCatalogs(const std::string &worker_path, Clien
                                             bool worker_debug, bool use_pool,
                                             const std::shared_ptr<CatalogAuth> &auth,
                                             std::optional<int64_t> launcher_idle_timeout_seconds,
-                                            std::optional<std::string> launcher_state_dir) {
+                                            std::optional<std::string> launcher_state_dir,
+                                            std::shared_ptr<void> worker_artifact_anchor) {
 	// Use the config struct so launcher overrides flow into the temp_params —
 	// same rationale as InvokeCatalogAttach below. Without these, this RPC
 	// would prime the launcher cache with [defaults]; the user's subsequent
@@ -320,6 +321,7 @@ std::vector<VgiCatalogInfo> InvokeCatalogs(const std::string &worker_path, Clien
 	temp_cfg.auth = auth;
 	temp_cfg.launcher_idle_timeout_seconds = launcher_idle_timeout_seconds;
 	temp_cfg.launcher_state_dir = launcher_state_dir;
+	temp_cfg.worker_artifact_anchor = std::move(worker_artifact_anchor);
 	auto temp_params = std::make_shared<VgiAttachParameters>(std::move(temp_cfg));
 	CatalogRpcContext ctx{temp_params, {}, {}};
 	auto response = InvokeRpcMethod(ctx, "catalog_catalogs", nullptr, context);
@@ -401,7 +403,8 @@ CatalogAttachResult InvokeCatalogAttach(const std::string &worker_path, const st
                                         const std::shared_ptr<SessionCookieJar> &cookie_jar,
                                         const std::map<std::string, Value> &attach_options,
                                         std::optional<int64_t> launcher_idle_timeout_seconds,
-                                        std::optional<std::string> launcher_state_dir) {
+                                        std::optional<std::string> launcher_state_dir,
+                                        std::shared_ptr<void> worker_artifact_anchor) {
 	// Use the config struct so launcher overrides flow into the temp_params.
 	// Without these, the catalog_attach RPC would prime the launcher cache
 	// with [defaults]; the subsequent real ATTACH (carrying overrides) would
@@ -417,6 +420,7 @@ CatalogAttachResult InvokeCatalogAttach(const std::string &worker_path, const st
 	temp_cfg.cookie_jar = cookie_jar;
 	temp_cfg.launcher_idle_timeout_seconds = launcher_idle_timeout_seconds;
 	temp_cfg.launcher_state_dir = launcher_state_dir;
+	temp_cfg.worker_artifact_anchor = std::move(worker_artifact_anchor);
 	auto temp_params = std::make_shared<VgiAttachParameters>(std::move(temp_cfg));
 	CatalogRpcContext ctx{temp_params, {}, {}};
 

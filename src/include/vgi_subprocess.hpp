@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 
 #include "vgi_platform.hpp"
@@ -88,6 +89,11 @@ public:
 	Pipe &operator=(const Pipe &) = delete;
 };
 
+struct DirectExecutable {
+	std::string path;
+	std::shared_ptr<void> lifetime_anchor;
+};
+
 // Subprocess wrapper for RAII cleanup.
 //
 // As of the AF_UNIX launcher work, this class is polymorphic: the existing
@@ -107,6 +113,7 @@ public:
 	// If stderr_passthrough is true, worker stderr goes directly to the terminal
 	// instead of being captured (useful for debugging).
 	explicit SubProcess(const std::string &command, bool stderr_passthrough = false);
+	explicit SubProcess(DirectExecutable executable, bool stderr_passthrough = false);
 	virtual ~SubProcess();
 
 	// Accessors for process info and file descriptors.  Virtual so a
@@ -186,11 +193,14 @@ protected:
 	// Default constructor for subclasses that supply their own fds (e.g.
 	// UnixSocketWorker).  Skips the fork+exec path entirely.
 	SubProcess() = default;
+	SubProcess(const std::string &command, bool stderr_passthrough, bool direct_executable,
+	           std::shared_ptr<void> lifetime_anchor);
 
 	pid_t pid_ = -1;
 	int stdin_fd_ = -1;
 	int stdout_fd_ = -1;
 	int stderr_fd_ = -1;
+	std::shared_ptr<void> lifetime_anchor_;
 #if defined(_WIN32)
 	// Windows: the spawned child's process HANDLE (owned; closed in the dtor /
 	// after Wait). pid_ holds GetProcessId(process_handle_) for diagnostics, but

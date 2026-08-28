@@ -1,0 +1,94 @@
+# name: test/sql/integration/database_worker/package.test
+# description: package macro + database:// resolve/cache/lease/cleanup lifecycle
+# group: [vgi_integration_database_worker]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+statement ok
+CREATE TABLE worker_packages AS
+SELECT * FROM vgi_worker_package(
+    'test/support/database_worker_fixture.sh',
+    'fixture',
+    'test-1');
+
+query TITT
+SELECT worker_name, platform = (SELECT platform FROM pragma_platform()), package_version, package_format
+FROM worker_packages;
+----
+fixture	true	test-1	executable
+
+query I
+SELECT octet_length(contents) > 0 AND length(sha256) = 64 FROM worker_packages;
+----
+true
+
+statement ok
+ATTACH 'example' AS db_worker (
+    TYPE vgi,
+    LOCATION 'database://memory/main/worker_packages/fixture?package_version=test-1');
+
+query I
+SELECT count(*) FROM db_worker.main.sequence(5);
+----
+5
+
+# Both transports share the default release-cache root for compatibility, but
+# GitHub cleanup owns only its own top-level entries. It must not remove the
+# lease-protected database-worker namespaces under that root.
+query I
+SELECT flushed FROM vgi_github_cache_flush();
+----
+0
+
+query I
+SELECT count(*) FROM db_worker.main.sequence(4);
+----
+4
+
+# A second catalog reuses the same artifact while the first still holds its
+# runtime lease; installation has a separate short-lived mutex and must not
+# wait for the first catalog to detach.
+statement ok
+ATTACH 'example' AS db_worker_2 (
+    TYPE vgi,
+    LOCATION 'database://memory/main/worker_packages/fixture?package_version=test-1');
+
+query I
+SELECT count(*) FROM db_worker_2.main.sequence(3);
+----
+3
+
+query II
+SELECT count(*), bool_and(in_use) FROM vgi_worker_cache();
+----
+1	true
+
+# The catalog and any pooled processes lease the immutable artifact, so even an
+# explicit flush reports it as skipped instead of racing a running executable.
+query III
+SELECT removed, bytes_removed, skipped_in_use FROM vgi_worker_cache_flush();
+----
+0	0	1
+
+statement ok
+DETACH db_worker;
+
+statement ok
+DETACH db_worker_2;
+
+query I
+SELECT flushed >= 1 FROM vgi_worker_pool_flush();
+----
+true
+
+query II
+SELECT removed, skipped_in_use FROM vgi_worker_cache_flush();
+----
+1	0
+
+query I
+SELECT count(*) FROM vgi_worker_cache();
+----
+0

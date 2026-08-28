@@ -52,6 +52,15 @@ bool IsWebWorkerTransport(const std::string &worker_path) {
 	return StringUtil::StartsWith(lower, "worker:");
 }
 
+bool IsDatabaseLocation(const std::string &worker_path) {
+	auto lower = StringUtil::Lower(worker_path);
+	return StringUtil::StartsWith(lower, "database://");
+}
+
+bool IsResolvedWorkerLocation(const std::string &worker_path) {
+	return StringUtil::StartsWith(worker_path, "vgi-artifact:");
+}
+
 std::string StripWebWorkerScheme(const std::string &location) {
 	if (!IsWebWorkerTransport(location)) {
 		throw std::invalid_argument("Not a worker: location: " + location);
@@ -129,6 +138,9 @@ TransportType DetectTransport(const std::string &worker_path) {
 	}
 	if (IsWebWorkerTransport(worker_path)) {
 		return TransportType::WEBWORKER;
+	}
+	if (IsDatabaseLocation(worker_path)) {
+		return TransportType::DATABASE;
 	}
 	return TransportType::SUBPROCESS;
 }

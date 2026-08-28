@@ -108,7 +108,8 @@ if __name__ == "__main__":
 - **Multiple transports** — `LOCATION` accepts a bare command (subprocess, pooled per
   DuckDB process), `http(s)://` (HTTP), `tcp://host:port` (raw TCP, including DNS
   and bracketed IPv6), `unix:///path/to.sock` (AF_UNIX), or `launch:<argv>`
-  (launcher-managed shared worker).
+  (launcher-managed shared worker), plus cached workers from GitHub releases,
+  OCI images, or a [`database://` package table](database-worker-transport.md).
 - **Pushdown** — projection, filter, `ORDER BY` + `LIMIT`, and join-key pushdown to
   workers that opt in.
 - **Worker pooling** — subprocess workers are pooled and reused across queries, with
@@ -123,6 +124,7 @@ if __name__ == "__main__":
 
 See the [`docs/`](.) directory for deep dives on
 [multi-branch tables](multi_branch.md),
+[database-backed worker packages](database-worker-transport.md),
 [the launcher protocol](launcher-protocol.md),
 [catalog profiling](catalog_profiling.md), and more.
 

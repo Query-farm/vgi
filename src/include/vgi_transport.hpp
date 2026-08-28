@@ -23,7 +23,7 @@ namespace vgi {
 //              ring (DuckDB-WASM only). The <url> is whatever `new Worker(url)`
 //              accepts. No spawn/pool on the C++ side; the JS bridge owns the
 //              worker. See vgi_sab_abi.hpp / docs/sab_transport_abi.md.
-enum class TransportType { SUBPROCESS, HTTP, UNIX, LAUNCH, CONTAINER, TCP, WEBWORKER };
+enum class TransportType { SUBPROCESS, HTTP, UNIX, LAUNCH, CONTAINER, TCP, WEBWORKER, DATABASE };
 
 // Detect what kind of worker location this string represents.  Pure on
 // inputs — no I/O, no ambient state.
@@ -50,6 +50,13 @@ bool IsTcpTransport(const std::string &worker_path);
 // Web Worker location: worker:<url>. In-browser SharedArrayBuffer transport
 // (DuckDB-WASM only); the JS bridge owns worker lifecycle.
 bool IsWebWorkerTransport(const std::string &worker_path);
+
+// Database-backed worker package. The user-facing URI is resolved once during
+// ATTACH into an immutable cached artifact, then executed over SUBPROCESS.
+bool IsDatabaseLocation(const std::string &worker_path);
+
+// Internal token produced by the database package resolver. Never user-typed.
+bool IsResolvedWorkerLocation(const std::string &worker_path);
 
 // Strip the `worker:` scheme prefix, returning the (case-preserved) URL/name the
 // JS bridge resolves to a Web Worker. Throws std::invalid_argument if the

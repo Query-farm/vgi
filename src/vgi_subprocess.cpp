@@ -24,6 +24,7 @@
 #include <ws2tcpip.h> // inet_pton
 #pragma comment(lib, "ws2_32")
 #include <windows.h>
+#include "duckdb/common/windows_util.hpp"
 #endif
 
 #include "duckdb/common/exception.hpp"
@@ -129,7 +130,17 @@ void Pipe::CloseWrite() {
 }
 
 // SubProcess implementation
-SubProcess::SubProcess(const std::string &command, bool stderr_passthrough) {
+SubProcess::SubProcess(const std::string &command, bool stderr_passthrough)
+    : SubProcess(command, stderr_passthrough, false, nullptr) {
+}
+
+SubProcess::SubProcess(DirectExecutable executable, bool stderr_passthrough)
+    : SubProcess(executable.path, stderr_passthrough, true, std::move(executable.lifetime_anchor)) {
+}
+
+SubProcess::SubProcess(const std::string &command, bool stderr_passthrough, bool direct_executable,
+                       std::shared_ptr<void> lifetime_anchor)
+    : lifetime_anchor_(std::move(lifetime_anchor)) {
 	// Also check environment variables
 	if (!stderr_passthrough) {
 		const char *passthrough_env = std::getenv("VGI_WORKER_STDERR_PASSTHROUGH");
@@ -194,8 +205,17 @@ SubProcess::SubProcess(const std::string &command, bool stderr_passthrough) {
 		// If passthrough, stderr remains connected to parent's stderr and
 		// VGI_IPC_DEBUG was already baked into shell_command above (pre-fork).
 
-		// Execute command via shell
-		execl("/bin/sh", "sh", "-c", shell_command.c_str(), nullptr);
+		if (direct_executable) {
+			// Archive-controlled paths are data, never shell command text.
+			if (stderr_passthrough) {
+				execl("/usr/bin/env", "env", "VGI_IPC_DEBUG=1", command.c_str(), nullptr);
+			} else {
+				execl(command.c_str(), command.c_str(), nullptr);
+			}
+		} else {
+			// Legacy bare-command LOCATIONs intentionally retain shell semantics.
+			execl("/bin/sh", "sh", "-c", shell_command.c_str(), nullptr);
+		}
 		_exit(127); // exec failed
 	}
 
@@ -434,7 +454,17 @@ void Pipe::CloseRead() {
 void Pipe::CloseWrite() {
 }
 
-SubProcess::SubProcess(const std::string &command, bool stderr_passthrough) {
+SubProcess::SubProcess(const std::string &command, bool stderr_passthrough)
+    : SubProcess(command, stderr_passthrough, false, nullptr) {
+}
+
+SubProcess::SubProcess(DirectExecutable executable, bool stderr_passthrough)
+    : SubProcess(executable.path, stderr_passthrough, true, std::move(executable.lifetime_anchor)) {
+}
+
+SubProcess::SubProcess(const std::string &command, bool stderr_passthrough, bool direct_executable,
+                       std::shared_ptr<void> lifetime_anchor)
+    : lifetime_anchor_(std::move(lifetime_anchor)) {
 	if (!stderr_passthrough) {
 		const char *passthrough_env = std::getenv("VGI_WORKER_STDERR_PASSTHROUGH");
 		stderr_passthrough = passthrough_env && std::string(passthrough_env) == "1";
@@ -489,20 +519,24 @@ SubProcess::SubProcess(const std::string &command, bool stderr_passthrough) {
 		SetHandleInformation(parent_stderr_rd, HANDLE_FLAG_INHERIT, 0);
 	}
 
-	STARTUPINFOA si {};
+	STARTUPINFOW si {};
 	si.cb = sizeof(si);
 	si.dwFlags = STARTF_USESTDHANDLES;
 	si.hStdInput = child_stdin_rd;
 	si.hStdOutput = child_stdout_wr;
 	si.hStdError = stderr_passthrough ? GetStdHandle(STD_ERROR_HANDLE) : child_stderr_wr;
 
-	// POSIX runs `/bin/sh -c <command>`; the Windows equivalent is `cmd.exe /c`.
-	std::string cmdline = "cmd.exe /c " + command;
-	std::vector<char> mutable_cmd(cmdline.begin(), cmdline.end());
-	mutable_cmd.push_back('\0');
+	// Resolved packages bypass cmd.exe. application_name fixes the executable
+	// independently of command-line parsing, including paths with spaces.
+	std::string cmdline = direct_executable ? ("\"" + command + "\"") : ("cmd.exe /c " + command);
+	auto wide_cmdline = WindowsUtil::UTF8ToUnicode(cmdline.c_str());
+	std::vector<wchar_t> mutable_cmd(wide_cmdline.begin(), wide_cmdline.end());
+	mutable_cmd.push_back(L'\0');
+	auto wide_application = direct_executable ? WindowsUtil::UTF8ToUnicode(command.c_str()) : std::wstring();
 
 	PROCESS_INFORMATION pi {};
-	BOOL ok = CreateProcessA(nullptr, mutable_cmd.data(), nullptr, nullptr, /*bInheritHandles=*/TRUE,
+	BOOL ok = CreateProcessW(direct_executable ? wide_application.c_str() : nullptr, mutable_cmd.data(), nullptr, nullptr,
+	                         /*bInheritHandles=*/TRUE,
 	                         0, nullptr, nullptr, &si, &pi);
 
 	// The child's ends are now owned by the child; close our copies regardless.
@@ -636,6 +670,12 @@ void Pipe::CloseWrite() {
 SubProcess::SubProcess(const std::string &, bool) {
 	throw InvalidInputException("vgi: subprocess (bare command) LOCATIONs require fork() and are "
 	                            "not available in this build; use http://… instead");
+}
+SubProcess::SubProcess(DirectExecutable, bool) {
+	throw InvalidInputException("vgi: resolved executable workers are not available in this build");
+}
+SubProcess::SubProcess(const std::string &, bool, bool, std::shared_ptr<void>) {
+	throw InvalidInputException("vgi: resolved executable workers are not available in this build");
 }
 SubProcess::~SubProcess() {
 }

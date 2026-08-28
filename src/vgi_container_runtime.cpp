@@ -1,5 +1,6 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "vgi_container_runtime.hpp"
+#include "vgi_database_worker.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -443,6 +444,11 @@ std::string GenerateContainerName() {
 } // namespace
 
 std::unique_ptr<SubProcess> SpawnWorker(const std::string &worker_path, bool worker_debug) {
+	if (IsResolvedWorkerLocation(worker_path)) {
+		auto launch = AcquireResolvedWorkerLaunch(worker_path);
+		return std::make_unique<SubProcess>(DirectExecutable {launch.entrypoint, launch.lifetime_anchor},
+		                                    worker_debug);
+	}
 	if (!IsContainerLocation(worker_path)) {
 		return std::make_unique<SubProcess>(worker_path, worker_debug);
 	}
