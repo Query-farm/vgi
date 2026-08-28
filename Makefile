@@ -446,7 +446,33 @@ VGI_JAVA_DIR   ?= $(HOME)/vgi-java
 VGI_RUST_DIR   ?= $(HOME)/Development/vgi-rust
 VGI_CSHARP_DIR ?= $(HOME)/Development/vgi-csharp
 
-.PHONY: test_python test_python_crash test_go test_typescript test_java test_rust test_csharp test_languages
+.PHONY: test_python test_python_crash test_go test_typescript test_java test_rust test_csharp test_languages \
+	build_database_workers test_database_workers
+
+# Real database-package demonstrations. These are intentionally separate from
+# the fast default suite: PyInstaller and Bun each produce a ~100 MiB native
+# executable, and Rust compiles the full example worker. The resulting tests do
+# not delegate to VGI_TEST_WORKER; the BLOB restored from DuckDB is the worker.
+VGI_DATABASE_WORKER_FIXTURE_DIR ?= $(PROJ_DIR)build/database-worker-fixtures
+VGI_DATABASE_PYTHON_DIR ?= $(HOME)/Development/vgi-python
+VGI_DATABASE_RUST_DIR ?= $(HOME)/Development/vgi-rust
+VGI_DATABASE_OPEN_METEO_DIR ?= $(HOME)/Development/vgi-open-meteo
+
+build_database_workers:
+	VGI_DATABASE_WORKER_FIXTURE_DIR="$(VGI_DATABASE_WORKER_FIXTURE_DIR)" \
+	VGI_DATABASE_PYTHON_DIR="$(VGI_DATABASE_PYTHON_DIR)" \
+	VGI_DATABASE_RUST_DIR="$(VGI_DATABASE_RUST_DIR)" \
+	VGI_DATABASE_OPEN_METEO_DIR="$(VGI_DATABASE_OPEN_METEO_DIR)" \
+	./scripts/build_database_worker_fixtures.sh
+
+test_database_workers: build_database_workers
+	database_worker_cache="$$(mktemp -d)"; \
+	trap 'rm -rf "$$database_worker_cache"' 0; \
+	XDG_CACHE_HOME="$$database_worker_cache" \
+	VGI_DATABASE_PYTHON_WORKER="$(VGI_DATABASE_WORKER_FIXTURE_DIR)/vgi-python-worker" \
+	VGI_DATABASE_BUN_WORKER="$(VGI_DATABASE_WORKER_FIXTURE_DIR)/vgi-open-meteo" \
+	VGI_DATABASE_RUST_WORKER="$(VGI_DATABASE_WORKER_FIXTURE_DIR)/vgi-rust-worker.tar.gz" \
+	./build/release/test/unittest "test/sql/integration/database_worker/real_*"
 
 # Python uses this repo's default worker set. It does NOT just chain to
 # test_launcher, which invokes `unittest` bare: a lane that stops running tests

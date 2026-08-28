@@ -92,6 +92,18 @@ the matrix had the machinery but nothing ran it, so the failures accumulated
 silently. It is not wired into CI yet (four toolchains on one runner); until it
 is, running it locally is the guardrail.
 
+### Database-packaged worker artifacts (`make test_database_workers`)
+
+The ordinary `database_worker/package.test` uses a tiny executable wrapper so
+the default regression stays fast. The explicit heavyweight target builds and
+packages three real workers, then restores and executes each one through
+`database://`: a PyInstaller-frozen Python/PyArrow worker, Bun's standalone
+build of `~/Development/vgi-open-meteo`, and a `.tar.gz` containing the native
+Rust example worker plus a metadata file. It expects the sibling vgi-python,
+vgi-open-meteo, and vgi-rust repositories and the `uv`, `bun`, `cargo`, and
+`tar` tools. Repository paths and cross-build targets are overrideable; see
+`docs/database-worker-transport.md`.
+
 ### HTTP Transport
 
 ```bash

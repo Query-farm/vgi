@@ -1,10 +1,19 @@
 # name: test/sql/integration/database_worker/package.test
-# description: package macro + database:// resolve/cache/lease/cleanup lifecycle
+# description: fast wrapper smoke + database:// resolve/cache/lease/cleanup lifecycle
 # group: [vgi_integration_database_worker]
 
 require-env VGI_TEST_WORKER
 
 require vgi
+
+# Keep cache lifecycle tests out of the developer's persistent cache. Pointing
+# both transports at the same test-local root preserves the namespace-safety
+# assertion below.
+statement ok
+SET vgi_worker_cache_dir = '__TEST_DIR__/vgi_database_worker_package_cache';
+
+statement ok
+SET vgi_github_cache_dir = '__TEST_DIR__/vgi_database_worker_package_cache';
 
 statement ok
 CREATE TABLE worker_packages AS
@@ -12,6 +21,10 @@ SELECT * FROM vgi_worker_package(
     'test/support/database_worker_fixture.sh',
     'fixture',
     'test-1');
+
+# This fast default-suite fixture is an executable wrapper around
+# VGI_TEST_WORKER. The heavyweight test_database_workers target separately
+# packages and runs self-contained Python, Bun, and Rust worker artifacts.
 
 query TITT
 SELECT worker_name, platform = (SELECT platform FROM pragma_platform()), package_version, package_format
@@ -61,7 +74,9 @@ SELECT count(*) FROM db_worker_2.main.sequence(3);
 3
 
 query II
-SELECT count(*), bool_and(in_use) FROM vgi_worker_cache();
+SELECT count(*), bool_and(in_use)
+FROM vgi_worker_cache()
+WHERE source = 'database://memory/main/worker_packages/fixture?package_version=test-1';
 ----
 1	true
 
@@ -89,6 +104,8 @@ SELECT removed, skipped_in_use FROM vgi_worker_cache_flush();
 1	0
 
 query I
-SELECT count(*) FROM vgi_worker_cache();
+SELECT count(*)
+FROM vgi_worker_cache()
+WHERE source = 'database://memory/main/worker_packages/fixture?package_version=test-1';
 ----
 0

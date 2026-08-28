@@ -1,5 +1,5 @@
 # name: test/sql/integration/database_worker/errors.test
-# description: database:// URI, row uniqueness, digest, size, and archive-path validation
+# description: database:// URI, row uniqueness, digest, size, and entrypoint validation
 # group: [vgi_integration_database_worker]
 
 require vgi

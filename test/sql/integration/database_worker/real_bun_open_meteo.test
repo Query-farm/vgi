@@ -1,0 +1,48 @@
+# name: test/sql/integration/database_worker/real_bun_open_meteo.test
+# description: compile the real Bun Open Meteo worker, store it as a BLOB, and execute it
+# group: [vgi_integration_database_worker]
+
+require-env VGI_DATABASE_BUN_WORKER
+
+require vgi
+
+statement ok
+SET vgi_worker_cache_dir = '__TEST_DIR__/vgi_database_worker_bun_cache';
+
+statement ok
+CREATE TABLE bun_worker_packages AS
+SELECT * FROM vgi_worker_package(
+    '${VGI_DATABASE_BUN_WORKER}',
+    'open-meteo',
+    'bun-standalone-1');
+
+query IT
+SELECT octet_length(contents) > 1000000, package_format
+FROM bun_worker_packages;
+----
+true	executable
+
+statement ok
+ATTACH 'open_meteo' AS meteo (
+    TYPE vgi,
+    LOCATION 'database://memory/main/bun_worker_packages/open-meteo?package_version=bun-standalone-1');
+
+# Static catalog data makes this deterministic and proves the real worker runs
+# without making the test depend on the live Open-Meteo API.
+query I
+SELECT count(*) > 0 FROM meteo.main.weather_codes;
+----
+true
+
+statement ok
+DETACH meteo;
+
+query I
+SELECT flushed >= 1 FROM vgi_worker_pool_flush();
+----
+true
+
+query II
+SELECT removed, skipped_in_use FROM vgi_worker_cache_flush();
+----
+1	0

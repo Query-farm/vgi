@@ -127,3 +127,41 @@ before retrying when immediate deletion is required.
 This feature executes native code stored in the selected database. Only attach
 package registries whose writers you trust, and use the digest pin when the
 expected build is known out of band.
+
+## Real-worker packaging tests
+
+The fast default regression packages a small executable wrapper so cache and
+lease behavior stays cheap. The explicit heavyweight lane builds and executes
+three complete artifacts instead:
+
+```bash
+make test_database_workers
+```
+
+- Python: `uv` runs PyInstaller against
+  `test/support/database_workers/python_worker.py`, producing one executable
+  containing CPython, PyArrow, VGI, and its dependencies.
+- JavaScript/TypeScript: Bun compiles the actual
+  `~/Development/vgi-open-meteo/src/bin/worker.ts` graph and the Bun runtime
+  into one executable. The test restores it from the BLOB and queries the
+  real catalog's static `weather_codes` view.
+- Rust: Cargo builds `vgi-example-worker`; the lane places it and a metadata
+  file in a `.tar.gz`, then proves VGI extracts `bin/vgi-rust-worker` and runs
+  `sequence(7)`.
+
+Override `VGI_DATABASE_PYTHON_DIR`, `VGI_DATABASE_OPEN_METEO_DIR`, or
+`VGI_DATABASE_RUST_DIR` when the sibling repositories live elsewhere. Bun can
+cross-compile by setting `VGI_BUN_TARGET` (for example,
+`bun-linux-arm64`). Rust cross-compilation uses `VGI_RUST_TARGET` and
+`cargo-zigbuild`, for example:
+
+```bash
+CARGO_ZIGBUILD_ZIG_COMMAND="$(command -v python-zig)" \
+  VGI_RUST_TARGET=x86_64-unknown-linux-gnu make build_database_workers
+```
+
+Use `build_database_workers`, rather than `test_database_workers`, when the
+target architecture differs from the build host. The builder itself is a
+POSIX-host development tool. PyInstaller artifacts always target the build OS
+and architecture; `VGI_BUN_TARGET` affects only the Bun artifact and
+`VGI_RUST_TARGET` affects only the Rust artifact.
