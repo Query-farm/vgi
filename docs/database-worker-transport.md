@@ -149,6 +149,18 @@ make test_database_workers
   file in a `.tar.gz`, then proves VGI extracts `bin/vgi-rust-worker` and runs
   `sequence(7)`.
 
+After the per-worker SQL tests, the lane runs a two-process persistence test.
+The first DuckDB process writes all three packages to a disk-backed registry
+database and exits. A second process starts with an empty artifact cache,
+attaches the registry read-only, and executes all three workers. The reader is
+not given the original artifact paths, proving it reconstructs each worker from
+the persisted BLOB rather than from the build directory or a prior cache entry.
+Run only this restart check (building the fixtures first) with:
+
+```bash
+make test_database_worker_restart
+```
+
 Override `VGI_DATABASE_PYTHON_DIR`, `VGI_DATABASE_OPEN_METEO_DIR`, or
 `VGI_DATABASE_RUST_DIR` when the sibling repositories live elsewhere. Bun can
 cross-compile by setting `VGI_BUN_TARGET` (for example,

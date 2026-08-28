@@ -102,7 +102,9 @@ build of `~/Development/vgi-open-meteo`, and a `.tar.gz` containing the native
 Rust example worker plus a metadata file. It expects the sibling vgi-python,
 vgi-open-meteo, and vgi-rust repositories and the `uv`, `bun`, `cargo`, and
 `tar` tools. Repository paths and cross-build targets are overrideable; see
-`docs/database-worker-transport.md`.
+`docs/database-worker-transport.md`. The target finishes with a two-process
+restart test: one DuckDB process persists all three BLOBs, then a fresh process
+with an empty cache reopens that registry and executes every worker.
 
 ### HTTP Transport
 

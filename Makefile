@@ -447,7 +447,7 @@ VGI_RUST_DIR   ?= $(HOME)/Development/vgi-rust
 VGI_CSHARP_DIR ?= $(HOME)/Development/vgi-csharp
 
 .PHONY: test_python test_python_crash test_go test_typescript test_java test_rust test_csharp test_languages \
-	build_database_workers test_database_workers
+	build_database_workers test_database_workers test_database_worker_restart
 
 # Real database-package demonstrations. These are intentionally separate from
 # the fast default suite: PyInstaller and Bun each produce a ~100 MiB native
@@ -473,6 +473,16 @@ test_database_workers: build_database_workers
 	VGI_DATABASE_BUN_WORKER="$(VGI_DATABASE_WORKER_FIXTURE_DIR)/vgi-open-meteo" \
 	VGI_DATABASE_RUST_WORKER="$(VGI_DATABASE_WORKER_FIXTURE_DIR)/vgi-rust-worker.tar.gz" \
 	./build/release/test/unittest "test/sql/integration/database_worker/real_*"
+	VGI_DATABASE_PYTHON_WORKER="$(VGI_DATABASE_WORKER_FIXTURE_DIR)/vgi-python-worker" \
+	VGI_DATABASE_BUN_WORKER="$(VGI_DATABASE_WORKER_FIXTURE_DIR)/vgi-open-meteo" \
+	VGI_DATABASE_RUST_WORKER="$(VGI_DATABASE_WORKER_FIXTURE_DIR)/vgi-rust-worker.tar.gz" \
+	./scripts/test_database_worker_restart.sh
+
+test_database_worker_restart: build_database_workers
+	VGI_DATABASE_PYTHON_WORKER="$(VGI_DATABASE_WORKER_FIXTURE_DIR)/vgi-python-worker" \
+	VGI_DATABASE_BUN_WORKER="$(VGI_DATABASE_WORKER_FIXTURE_DIR)/vgi-open-meteo" \
+	VGI_DATABASE_RUST_WORKER="$(VGI_DATABASE_WORKER_FIXTURE_DIR)/vgi-rust-worker.tar.gz" \
+	./scripts/test_database_worker_restart.sh
 
 # Python uses this repo's default worker set. It does NOT just chain to
 # test_launcher, which invokes `unittest` bare: a lane that stops running tests
