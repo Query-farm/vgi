@@ -217,7 +217,7 @@ attached VGI catalog. Single-branch tables surface as one row with
 `branch_index = 0`; multi-branch tables surface as N rows.
 
 ```sql
-SELECT branch_index, function_name, branch_filter, table_required_extensions
+SELECT branch_index, branch_kind, function_name, branch_filter, table_required_extensions
 FROM vgi_table_branches()
 WHERE table_name = 'orders';
 ```
@@ -228,12 +228,19 @@ WHERE table_name = 'orders';
 | `schema_name` | `VARCHAR` | |
 | `table_name` | `VARCHAR` | |
 | `branch_index` | `BIGINT` | 0-based ordinal within the table's branch list |
-| `function_name` | `VARCHAR` | E.g. `vgi_table_scan`, `iceberg_scan`, `read_parquet` |
-| `positional_arguments` | `JSON` | Branch args serialized as JSON literals |
-| `named_arguments` | `JSON` | Named args as `{name: value}` |
-| `branch_filter` | `VARCHAR` | Raw SQL expression text; `NULL` when unset |
+| `branch_kind` | `VARCHAR` | `'function'`, `'catalog_table'`, or `'format'` — the three mutually-exclusive branch shapes (see `VgiScanBranch`). Discriminates which of the field groups below is populated; the other two groups are `NULL` |
+| `function_name` | `VARCHAR` | **function branch only.** E.g. `vgi_table_scan`, `iceberg_scan`, `read_parquet`. `NULL` for the other two kinds |
+| `positional_arguments` | `JSON` | **function branch only.** Branch args serialized as JSON literals |
+| `named_arguments` | `JSON` | **function branch only.** Named args as `{name: value}` |
+| `branch_filter` | `VARCHAR` | Raw SQL expression text; `NULL` when unset. Applies to any branch kind |
 | `table_required_extensions` | `LIST(VARCHAR)` | Top-level union; repeated identically on every branch row of the same table (for join-friendly query shapes) |
 | `writable` | `BOOLEAN` | `true` if this branch is the INSERT target for the table. At most one branch per table sets this true. `false` on all branches means the table is read-only. |
+| `source_catalog` | `VARCHAR` | **catalog_table branch only** (companion-catalog federation, e.g. DuckLake/Iceberg — see *Companion Catalogs*). `NULL` for the other two kinds |
+| `source_schema` | `VARCHAR` | **catalog_table branch only.** |
+| `source_table` | `VARCHAR` | **catalog_table branch only.** |
+| `format_name` | `VARCHAR` | **format branch only.** The reader format the client resolves (`csv`, `parquet`, ...). `NULL` for the other two kinds |
+| `format_locations` | `LIST(VARCHAR)` | **format branch only.** Paths handed to the resolved reader |
+| `format_options` | `JSON` | **format branch only.** Reader options as `{name: value}` |
 
 Performance: this issues a fresh `catalog_table_scan_branches_get` RPC
 per table. Acceptable for ad-hoc inspection; **do not** call from a

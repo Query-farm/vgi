@@ -35,6 +35,7 @@ struct BranchesRow {
 	std::string schema_name;
 	std::string table_name;
 	int64_t branch_index;
+	std::string branch_kind;  // "function" | "catalog_table" | "format" — see VgiScanBranch's discriminator
 	std::string function_name;
 	std::string positional_arguments_json;
 	std::string named_arguments_json;
@@ -42,6 +43,14 @@ struct BranchesRow {
 	bool branch_filter_present;
 	std::vector<std::string> table_required_extensions;
 	bool writable;  // INSERT target declaration for multi-branch tables
+	// Catalog-table branch fields (empty unless branch_kind == "catalog_table").
+	std::string source_catalog;
+	std::string source_schema;
+	std::string source_table;
+	// Format branch fields (empty unless branch_kind == "format").
+	std::string format_name;
+	std::vector<std::string> format_locations;
+	std::string format_options_json;
 };
 
 struct VgiTableBranchesData : public TableFunctionData {
@@ -109,16 +118,24 @@ static unique_ptr<FunctionData> VgiTableBranchesBind(ClientContext &context, Tab
 	    LogicalType::VARCHAR,                          // schema_name
 	    LogicalType::VARCHAR,                          // table_name
 	    LogicalType::BIGINT,                           // branch_index
-	    LogicalType::VARCHAR,                          // function_name
+	    LogicalType::VARCHAR,                          // branch_kind ("function" | "catalog_table" | "format")
+	    LogicalType::VARCHAR,                          // function_name (NULL unless branch_kind = 'function')
 	    LogicalType::JSON(),                           // positional_arguments
 	    LogicalType::JSON(),                           // named_arguments
 	    LogicalType::VARCHAR,                          // branch_filter (NULL when unset)
 	    LogicalType::LIST(LogicalType::VARCHAR),       // table_required_extensions
 	    LogicalType::BOOLEAN,                          // writable (INSERT target declaration for multi-branch)
+	    LogicalType::VARCHAR,                          // source_catalog (NULL unless branch_kind = 'catalog_table')
+	    LogicalType::VARCHAR,                          // source_schema (NULL unless branch_kind = 'catalog_table')
+	    LogicalType::VARCHAR,                          // source_table (NULL unless branch_kind = 'catalog_table')
+	    LogicalType::VARCHAR,                          // format_name (NULL unless branch_kind = 'format')
+	    LogicalType::LIST(LogicalType::VARCHAR),       // format_locations
+	    LogicalType::JSON(),                           // format_options
 	};
-	names = {"catalog_name", "schema_name", "table_name", "branch_index", "function_name",
-	         "positional_arguments", "named_arguments", "branch_filter", "table_required_extensions",
-	         "writable"};
+	names = {"catalog_name",   "schema_name",       "table_name",  "branch_index",         "branch_kind",
+	         "function_name",  "positional_arguments", "named_arguments", "branch_filter",  "table_required_extensions",
+	         "writable",       "source_catalog",    "source_schema", "source_table",       "format_name",
+	         "format_locations", "format_options"};
 
 	auto data = make_uniq<VgiTableBranchesData>();
 
@@ -176,6 +193,23 @@ static unique_ptr<FunctionData> VgiTableBranchesBind(ClientContext &context, Tab
 					row.branch_filter_present = !branch.branch_filter.empty();
 					row.table_required_extensions = result.required_extensions;
 					row.writable = branch.writable;
+					// The three branch kinds are mutually exclusive at parse time
+					// (VgiScanBranch's own comment) — dispatch on the same
+					// discriminators the rewriter uses so this diagnostic never
+					// silently blanks out a catalog-table or format branch.
+					if (branch.IsCatalogTable()) {
+						row.branch_kind = "catalog_table";
+						row.source_catalog = branch.source_catalog;
+						row.source_schema = branch.source_schema;
+						row.source_table = branch.source_table;
+					} else if (branch.IsFormatBranch()) {
+						row.branch_kind = "format";
+						row.format_name = branch.format_name;
+						row.format_locations = branch.format_locations;
+						row.format_options_json = EncodeNamedArgsAsJson(branch.format_options);
+					} else {
+						row.branch_kind = "function";
+					}
 					data->rows.push_back(std::move(row));
 				}
 			});
@@ -194,19 +228,31 @@ static void VgiTableBranchesScan(ClientContext &context, TableFunctionInput &inp
 		output.SetValue(1, count, Value(row.schema_name));
 		output.SetValue(2, count, Value(row.table_name));
 		output.SetValue(3, count, Value::BIGINT(row.branch_index));
-		output.SetValue(4, count, Value(row.function_name));
+		output.SetValue(4, count, Value(row.branch_kind));
+		output.SetValue(5, count, row.function_name.empty() ? Value() : Value(row.function_name));
 		// JSON columns: emit as VARCHAR; DuckDB's JSON type is a thin alias.
-		output.SetValue(5, count, Value(row.positional_arguments_json));
-		output.SetValue(6, count, Value(row.named_arguments_json));
-		output.SetValue(7, count, row.branch_filter_present ? Value(row.branch_filter) : Value());
+		output.SetValue(6, count, Value(row.positional_arguments_json));
+		output.SetValue(7, count, Value(row.named_arguments_json));
+		output.SetValue(8, count, row.branch_filter_present ? Value(row.branch_filter) : Value());
 		// LIST(VARCHAR) for required_extensions.
 		duckdb::vector<Value> ext_values;
 		ext_values.reserve(row.table_required_extensions.size());
 		for (const auto &ext : row.table_required_extensions) {
 			ext_values.emplace_back(ext);
 		}
-		output.SetValue(8, count, Value::LIST(LogicalType::VARCHAR, std::move(ext_values)));
-		output.SetValue(9, count, Value::BOOLEAN(row.writable));
+		output.SetValue(9, count, Value::LIST(LogicalType::VARCHAR, std::move(ext_values)));
+		output.SetValue(10, count, Value::BOOLEAN(row.writable));
+		output.SetValue(11, count, row.source_catalog.empty() ? Value() : Value(row.source_catalog));
+		output.SetValue(12, count, row.source_schema.empty() ? Value() : Value(row.source_schema));
+		output.SetValue(13, count, row.source_table.empty() ? Value() : Value(row.source_table));
+		output.SetValue(14, count, row.format_name.empty() ? Value() : Value(row.format_name));
+		duckdb::vector<Value> format_loc_values;
+		format_loc_values.reserve(row.format_locations.size());
+		for (const auto &loc : row.format_locations) {
+			format_loc_values.emplace_back(loc);
+		}
+		output.SetValue(15, count, Value::LIST(LogicalType::VARCHAR, std::move(format_loc_values)));
+		output.SetValue(16, count, row.format_options_json.empty() ? Value() : Value(row.format_options_json));
 		count++;
 	}
 	output.SetCardinality(count);
@@ -218,10 +264,13 @@ void RegisterVgiTableBranchesFunction(ExtensionLoader &loader) {
 	TableFunction func("vgi_table_branches", {}, VgiTableBranchesScan, VgiTableBranchesBind);
 	CreateTableFunctionInfo info(func);
 	info.descriptions.push_back(MakeFunctionDescription(
-	    "Inspect how each attached VGI table is composed from its underlying worker functions, one row per "
-	    "branch per table across every attached VGI catalog. Shows the function_name, positional/named "
-	    "arguments, branch_filter, and required extensions behind every branch — the multi-branch shape the "
-	    "scan rewriter unions together. Single-branch tables surface as one row with branch_index=0.",
+	    "Inspect how each attached VGI table is composed from its underlying branches, one row per branch per "
+	    "table across every attached VGI catalog. branch_kind discriminates the three mutually-exclusive shapes "
+	    "a branch can take: 'function' (function_name, positional/named arguments — a worker table function), "
+	    "'catalog_table' (source_catalog/source_schema/source_table — a companion-catalog base table, e.g. "
+	    "DuckLake/Iceberg federation), or 'format' (format_name/format_locations/format_options — a COPY-style "
+	    "format reader). Also shows branch_filter, required extensions, and writable (INSERT target "
+	    "declaration) for every branch. Single-branch tables surface as one row with branch_index=0.",
 	    {}, {}, {"SELECT * FROM vgi_table_branches();"}));
 	loader.RegisterFunction(std::move(info));
 }

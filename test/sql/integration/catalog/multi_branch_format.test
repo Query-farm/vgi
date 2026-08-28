@@ -71,13 +71,20 @@ SELECT min(n), max(n) FROM example.data.multi_branch_format;
 ----
 0	4
 
-# The branch is introspectable as a format branch rather than a function one.
-query II
-SELECT function_name = '', branch_index
+# The branch is introspectable as a format branch rather than a function one —
+# including the fields the old diagnostic silently dropped for this branch
+# kind (format_name / format_locations), not just its absence of a function_name.
+query IIII
+SELECT branch_kind, branch_index, function_name, format_name
 FROM vgi_table_branches()
 WHERE table_name = 'multi_branch_format';
 ----
-true	0
+format	0	NULL	csv
+
+query I
+SELECT len(format_locations) FROM vgi_table_branches() WHERE table_name = 'multi_branch_format';
+----
+1
 
 statement ok
 DETACH example;

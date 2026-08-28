@@ -93,6 +93,32 @@ SELECT * FROM ex.data.hot_cold WHERE id < 50 ORDER BY id;
 3	cold-c
 
 # ============================================================================
+# vgi_table_branches() introspects the catalog-table branches themselves —
+# regression for the diagnostic's former blind spot on this branch kind
+# (it used to report an empty function_name and no source_* fields at all).
+# ============================================================================
+
+query IIIII
+SELECT branch_index, branch_kind, source_catalog, source_schema, source_table
+FROM vgi_table_branches()
+WHERE table_name = 'hot_cold'
+ORDER BY branch_index;
+----
+0	catalog_table	vgi_companion	main	events
+1	catalog_table	vgi_companion	main	events
+
+# function_name (and the two other branch kinds' fields) stay NULL for a
+# catalog-table branch — it's a distinct discriminated shape, not a
+# function branch with a blank name.
+query II
+SELECT function_name, format_name
+FROM vgi_table_branches()
+WHERE table_name = 'hot_cold';
+----
+NULL	NULL
+NULL	NULL
+
+# ============================================================================
 # Detach removes the companion (refcount → 0)
 # ============================================================================
 
