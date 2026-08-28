@@ -63,6 +63,9 @@ TEST_CASE("VgiClassifyTransport routes each scheme", "[telemetry]") {
 	CHECK(classify("github://owner/repo@v1/asset").type == "github");
 	CHECK(classify("github://owner/repo@v1/asset").scheme == "github");
 	CHECK(classify("github-auto://owner/repo@v1").scheme == "github-auto");
+
+	CHECK(classify("database://memory/main/packages/worker?package_version=1").type == "database");
+	CHECK(classify("database://memory/main/packages/worker?package_version=1").scheme == "database");
 }
 
 TEST_CASE("VgiMapHostKind buckets the duckdb_api value", "[telemetry]") {

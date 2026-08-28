@@ -165,6 +165,9 @@ std::string VgiScrubLocation(const std::string &location) {
 }
 
 VgiTransportClass VgiClassifyTransport(const std::string &raw_location) {
+	if (IsDatabaseLocation(raw_location)) {
+		return {"database", "database"};
+	}
 	if (IsGithubAutoLocation(raw_location)) {
 		return {"github", "github-auto"};
 	}

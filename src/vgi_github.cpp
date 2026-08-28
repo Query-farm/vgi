@@ -10,8 +10,10 @@
 // Windows-port work); the FileSystem refactor keeps that delta small.
 
 #include "vgi_github.hpp"
+#include "vgi_worker_archive.hpp"
 
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/main/database.hpp"
 #include "vgi_platform.hpp"
 #include "vgi_subprocess.hpp" // ResetChildSignalDispositions
@@ -40,6 +42,7 @@
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 
 #if VGI_POSIX_TRANSPORT
 // Platform remainder (no portable API): the executable bit, archive symlinks,
@@ -206,22 +209,12 @@ int64_t GetIntSetting(ClientContext &context, const char *name, int64_t dflt) {
 	return dflt;
 }
 
-std::string ExpandHome(const std::string &p) {
-	if (!p.empty() && p[0] == '~') {
-		const char *home = std::getenv("HOME");
-		if (home && *home) {
-			return std::string(home) + p.substr(1);
-		}
-	}
-	return p;
-}
-
 std::string CacheDir(ClientContext &context) {
 	Value v;
 	if (context.TryGetCurrentSetting("vgi_github_cache_dir", v) && !v.IsNull()) {
 		auto s = v.ToString();
 		if (!s.empty()) {
-			return ExpandHome(s);
+			return LocalFs().ExpandPath(s);
 		}
 	}
 	const char *xdg = std::getenv("XDG_CACHE_HOME");
@@ -229,8 +222,16 @@ std::string CacheDir(ClientContext &context) {
 	if (xdg && *xdg) {
 		base = xdg;
 	} else {
-		const char *home = std::getenv("HOME");
-		base = (home && *home) ? std::string(home) + "/.cache" : "/tmp";
+		auto home = LocalFs().GetHomeDirectory();
+		if (!home.empty()) {
+			base = home + "/.cache";
+		} else {
+#if defined(_WIN32)
+			base = LocalFs().GetWorkingDirectory() + "/.vgi";
+#else
+			base = "/tmp";
+#endif
+		}
 	}
 	return base + "/vgi/releases";
 }
@@ -436,16 +437,21 @@ std::string SanitizeMember(const std::string &name) {
 	if (name.empty()) {
 		throw IOException("github: archive entry with empty name");
 	}
-	if (name[0] == '/') {
+	if (name[0] == '/' || name[0] == '\\' || name.find('\\') != std::string::npos) {
 		throw IOException("github: archive entry has an absolute path: %s", name.c_str());
+	}
+	if (name.find('\0') != std::string::npos) {
+		throw IOException("github: archive entry contains NUL");
 	}
 	size_t start = 0;
 	while (start < name.size()) {
 		size_t slash = name.find('/', start);
 		std::string comp =
 		    name.substr(start, slash == std::string::npos ? std::string::npos : slash - start);
-		if (comp == "..") {
-			throw IOException("github: archive entry escapes via '..': %s", name.c_str());
+		if (comp.empty() || comp == "." || comp == ".." ||
+		    (start == 0 && comp.size() >= 2 && std::isalpha(static_cast<unsigned char>(comp[0])) &&
+		     comp[1] == ':')) {
+			throw IOException("github: archive entry has an unsafe path: %s", name.c_str());
 		}
 		if (slash == std::string::npos) {
 			break;
@@ -485,12 +491,14 @@ uint64_t ReadTarNumeric(const char *p, size_t n) {
 // entrypoint (single executable-bit regular file, or `member_hint` override).
 // File/dir writes go through FileSystem; symlinks + the exec bit are the platform
 // remainder.
-std::string WalkTar(const std::string &tar, const std::string &dest, const std::string &member_hint) {
+std::string WalkTar(const std::string &tar, const std::string &dest, const std::string &member_hint,
+                    uint64_t max_entries, bool allow_symlinks) {
 	auto &fs = LocalFs();
 	const size_t BS = 512;
 	size_t off = 0;
 	std::string pending_long_name;
 	std::vector<std::string> exec_files;
+	std::unordered_set<std::string> extracted_paths;
 	size_t entry_count = 0;
 
 	while (off + BS <= tar.size()) {
@@ -505,13 +513,14 @@ std::string WalkTar(const std::string &tar, const std::string &dest, const std::
 		if (all_zero) {
 			break;
 		}
-		if (++entry_count > 100000) {
-			throw IOException("github: archive has too many entries (>100000)");
+		if (++entry_count > max_entries) {
+			throw IOException("github: archive has too many entries (>%llu)",
+			                  static_cast<unsigned long long>(max_entries));
 		}
 		char typeflag = h[156];
 		uint64_t size = ReadTarNumeric(h + 124, 12);
 		size_t data_off = off + BS;
-		if (data_off + size > tar.size()) {
+		if (size > tar.size() - data_off) {
 			throw IOException("github: truncated archive (entry data past end)");
 		}
 		size_t data_blocks = (size + BS - 1) / BS;
@@ -538,6 +547,9 @@ std::string WalkTar(const std::string &tar, const std::string &dest, const std::
 
 		uint64_t mode = ReadTarNumeric(h + 100, 8);
 		std::string rel = SanitizeMember(name);
+		if (!allow_symlinks && !extracted_paths.insert(rel).second) {
+			throw IOException("vgi: database worker archive repeats path %s", rel.c_str());
+		}
 		std::string full = dest + "/" + rel;
 
 		if (typeflag == '5') {
@@ -553,6 +565,9 @@ std::string WalkTar(const std::string &tar, const std::string &dest, const std::
 				exec_files.push_back(rel);
 			}
 		} else if (typeflag == '2') {
+			if (!allow_symlinks) {
+				throw IOException("vgi: database worker archives cannot contain symlinks (%s)", rel.c_str());
+			}
 			// Symlink: platform remainder (no FileSystem API). Reject escapes.
 			std::string target(h + 157, ::strnlen(h + 157, 100));
 			if (target.empty() || target[0] == '/' || target.find("..") != std::string::npos) {
@@ -616,6 +631,10 @@ std::string ArchiveStem(const std::string &asset) {
 
 void WriteSingleFile(const std::string &dest, const std::string &name, const std::string &bytes) {
 	std::string full = dest + "/" + SanitizeMember(name);
+	auto slash = full.rfind('/');
+	if (slash != std::string::npos) {
+		MkdirP(full.substr(0, slash));
+	}
 	WriteFileBytes(full, bytes.data(), bytes.size());
 	MakeExecutable(full);
 }
@@ -623,7 +642,8 @@ void WriteSingleFile(const std::string &dest, const std::string &name, const std
 // Extract a .zip (Windows release assets) into `dest` via the vendored miniz,
 // returning the absolute entrypoint path. Entrypoint = `member_hint`, else the
 // single .exe member, else the single regular file.
-std::string WalkZip(const std::string &zipbytes, const std::string &dest, const std::string &member_hint) {
+std::string WalkZip(const std::string &zipbytes, const std::string &dest, const std::string &member_hint,
+                    uint64_t max_extracted_bytes, uint64_t max_entries) {
 	using namespace duckdb_miniz;
 	mz_zip_archive zip;
 	memset(&zip, 0, sizeof(zip));
@@ -639,13 +659,22 @@ std::string WalkZip(const std::string &zipbytes, const std::string &dest, const 
 
 	std::vector<std::string> regular_files;
 	std::vector<std::string> exe_files;
+	std::unordered_set<std::string> extracted_paths;
 	mz_uint n = mz_zip_reader_get_num_files(&zip);
+	if (n > max_entries) {
+		throw IOException("github: archive has too many entries (>%llu)",
+		                  static_cast<unsigned long long>(max_entries));
+	}
+	uint64_t extracted_bytes = 0;
 	for (mz_uint i = 0; i < n; i++) {
 		mz_zip_archive_file_stat st;
 		if (!mz_zip_reader_file_stat(&zip, i, &st)) {
 			continue;
 		}
 		std::string rel = SanitizeMember(st.m_filename);
+		if (!extracted_paths.insert(rel).second) {
+			throw IOException("vgi: worker archive repeats path %s", rel.c_str());
+		}
 		std::string full = dest + "/" + rel;
 		if (mz_zip_reader_is_file_a_directory(&zip, i)) {
 			MkdirP(full);
@@ -655,7 +684,13 @@ std::string WalkZip(const std::string &zipbytes, const std::string &dest, const 
 		if (sl != std::string::npos) {
 			MkdirP(full.substr(0, sl));
 		}
-		size_t usize = static_cast<size_t>(st.m_uncomp_size);
+		uint64_t usize64 = static_cast<uint64_t>(st.m_uncomp_size);
+		if (usize64 > max_extracted_bytes || extracted_bytes > max_extracted_bytes - usize64) {
+			throw IOException("vgi: worker archive expands beyond %llu bytes",
+			                  static_cast<unsigned long long>(max_extracted_bytes));
+		}
+		extracted_bytes += usize64;
+		size_t usize = static_cast<size_t>(usize64);
 		std::string buf;
 		buf.resize(usize);
 		if (usize > 0 && !mz_zip_reader_extract_to_mem(&zip, i, &buf[0], usize, 0)) {
@@ -689,32 +724,42 @@ std::string WalkZip(const std::string &zipbytes, const std::string &dest, const 
 // Decompress+extract `bytes` (the downloaded asset) into `dest`; return the
 // absolute entrypoint path. `asset` drives format + single-file naming.
 std::string ExtractFullTree(const std::string &bytes, const std::string &asset, const std::string &dest,
-                            const std::string &member_hint) {
+                            const std::string &member_hint,
+                            uint64_t max_extracted_bytes = kDefaultMaxDecompressedBytes,
+                            uint64_t max_entries = 100000, bool allow_symlinks = true) {
 	if (EndsWith(asset, ".tar.gz") || EndsWith(asset, ".tgz")) {
-		std::string tar = Decompress(HttpEncoding::GZIP, bytes.data(), bytes.size());
-		return WalkTar(tar, dest, member_hint);
+		std::string tar = Decompress(HttpEncoding::GZIP, bytes.data(), bytes.size(), max_extracted_bytes);
+		return WalkTar(tar, dest, member_hint, max_entries, allow_symlinks);
 	}
 	if (EndsWith(asset, ".tar.zst")) {
-		std::string tar = Decompress(HttpEncoding::ZSTD, bytes.data(), bytes.size());
-		return WalkTar(tar, dest, member_hint);
+		std::string tar = Decompress(HttpEncoding::ZSTD, bytes.data(), bytes.size(), max_extracted_bytes);
+		return WalkTar(tar, dest, member_hint, max_entries, allow_symlinks);
 	}
 	if (EndsWith(asset, ".tar")) {
-		return WalkTar(bytes, dest, member_hint);
+		if (bytes.size() > max_extracted_bytes) {
+			throw IOException("vgi: worker archive expands beyond %llu bytes",
+			                  static_cast<unsigned long long>(max_extracted_bytes));
+		}
+		return WalkTar(bytes, dest, member_hint, max_entries, allow_symlinks);
 	}
 	if (EndsWith(asset, ".gz")) {
-		std::string bin = Decompress(HttpEncoding::GZIP, bytes.data(), bytes.size());
+		std::string bin = Decompress(HttpEncoding::GZIP, bytes.data(), bytes.size(), max_extracted_bytes);
 		std::string name = asset.substr(0, asset.size() - 3);
 		WriteSingleFile(dest, name, bin);
 		return dest + "/" + name;
 	}
 	if (EndsWith(asset, ".zst")) {
-		std::string bin = Decompress(HttpEncoding::ZSTD, bytes.data(), bytes.size());
+		std::string bin = Decompress(HttpEncoding::ZSTD, bytes.data(), bytes.size(), max_extracted_bytes);
 		std::string name = asset.substr(0, asset.size() - 4);
 		WriteSingleFile(dest, name, bin);
 		return dest + "/" + name;
 	}
 	if (EndsWith(asset, ".zip")) {
-		return WalkZip(bytes, dest, member_hint);
+		return WalkZip(bytes, dest, member_hint, max_extracted_bytes, max_entries);
+	}
+	if (bytes.size() > max_extracted_bytes) {
+		throw IOException("vgi: worker package exceeds %llu extracted bytes",
+		                  static_cast<unsigned long long>(max_extracted_bytes));
 	}
 	WriteSingleFile(dest, asset, bytes);
 	return dest + "/" + asset;
@@ -809,6 +854,66 @@ std::mutex g_resolved_mu;
 std::unordered_map<std::string, std::string> g_resolved; // location -> entrypoint
 
 } // namespace
+
+std::string NormalizeWorkerPackageFormat(const std::string &package_format) {
+	auto format = StringUtil::Lower(package_format);
+	if (format == "raw" || format == "binary") {
+		format = "executable";
+	} else if (format == "tgz") {
+		format = "tar.gz";
+	} else if (format == "gz") {
+		format = "gzip";
+	} else if (format == "zst") {
+		format = "zstd";
+	}
+	if (format != "executable" && format != "zip" && format != "tar" && format != "tar.gz" &&
+	    format != "tar.zst" && format != "gzip" && format != "zstd") {
+		throw InvalidInputException("vgi: unsupported worker package format '%s'", package_format);
+	}
+	return format;
+}
+
+std::string ExtractWorkerPackage(const std::string &contents, const std::string &package_format,
+                                 const std::string &entrypoint, const std::string &dest,
+                                 uint64_t max_extracted_bytes, uint64_t max_entries) {
+	auto format = NormalizeWorkerPackageFormat(package_format);
+	std::string asset;
+	std::string member_hint = entrypoint;
+	if (format == "executable") {
+		if (entrypoint.empty()) {
+			throw InvalidInputException("vgi: executable worker package requires a non-empty entrypoint");
+		}
+		asset = entrypoint;
+		member_hint.clear();
+	} else if (format == "gzip") {
+		if (entrypoint.empty()) {
+			throw InvalidInputException("vgi: gzip worker package requires a non-empty entrypoint");
+		}
+		asset = entrypoint + ".gz";
+		member_hint.clear();
+	} else if (format == "zstd") {
+		if (entrypoint.empty()) {
+			throw InvalidInputException("vgi: zstd worker package requires a non-empty entrypoint");
+		}
+		asset = entrypoint + ".zst";
+		member_hint.clear();
+	} else if (format == "zip") {
+		asset = "package.zip";
+	} else if (format == "tar") {
+		asset = "package.tar";
+	} else if (format == "tar.gz") {
+		asset = "package.tar.gz";
+	} else {
+		asset = "package.tar.zst";
+	}
+	if (format != "executable" && format != "gzip" && format != "zstd" && entrypoint.empty()) {
+		throw InvalidInputException("vgi: archive worker package requires an explicit entrypoint");
+	}
+	auto result = ExtractFullTree(contents, asset, dest, member_hint, max_extracted_bytes, max_entries,
+	                              false);
+	CodesignAdHoc(result);
+	return result;
+}
 
 std::string ResolveGithubWorker(const std::string &location, ClientContext &context) {
 	auto &fs = LocalFs();
@@ -991,14 +1096,26 @@ int64_t FlushGithubCache(ClientContext &context) {
 	std::string cache = CacheDir(context);
 	int64_t count = 0;
 	if (fs.DirectoryExists(cache)) {
-		fs.ListFiles(cache, [&](const std::string &name, bool /*is_dir*/) {
+		std::vector<std::string> owned_entries;
+		fs.ListFiles(cache, [&](const std::string &name, bool is_dir) {
 			// A digest dir is 64 lowercase hex chars.
-			if (name.size() == 64 && name.find_first_not_of("0123456789abcdef") == std::string::npos) {
+			bool digest_dir = is_dir && name.size() == 64 &&
+			                  name.find_first_not_of("0123456789abcdef") == std::string::npos;
+			bool coordinate_file = !is_dir &&
+			                       ((name.size() == 37 && name.compare(32, 5, ".meta") == 0) ||
+			                        (name.size() == 37 && name.compare(32, 5, ".lock") == 0));
+			bool staging_dir = is_dir && StringUtil::StartsWith(name, ".tmp-");
+			if (digest_dir) {
 				count++;
 			}
+			if (digest_dir || coordinate_file || staging_dir) {
+				owned_entries.push_back(cache + "/" + name);
+			}
 		});
+		for (auto &entry : owned_entries) {
+			RmRf(entry);
+		}
 	}
-	RmRf(cache);
 	{
 		std::lock_guard<std::mutex> lk(g_resolved_mu);
 		g_resolved.clear();
@@ -1007,6 +1124,26 @@ int64_t FlushGithubCache(ClientContext &context) {
 }
 
 #else // !VGI_SUBPROCESS_TRANSPORT (e.g. Emscripten — no child-process transport)
+
+std::string NormalizeWorkerPackageFormat(const std::string &package_format) {
+	auto format = StringUtil::Lower(package_format);
+	if (format == "raw" || format == "binary") {
+		return "executable";
+	}
+	if (format == "tgz") return "tar.gz";
+	if (format == "gz") return "gzip";
+	if (format == "zst") return "zstd";
+	if (format == "executable" || format == "zip" || format == "tar" || format == "tar.gz" ||
+	    format == "tar.zst" || format == "gzip" || format == "zstd") {
+		return format;
+	}
+	throw InvalidInputException("vgi: unsupported worker package format '%s'", package_format);
+}
+
+std::string ExtractWorkerPackage(const std::string &, const std::string &, const std::string &,
+                                 const std::string &, uint64_t, uint64_t) {
+	throw InvalidInputException("vgi: database worker packages require a child-process transport");
+}
 
 std::string ResolveGithubWorker(const std::string &location, ClientContext &) {
 	// Parse the coordinates first so malformed-LOCATION errors are identical on every

@@ -1,0 +1,54 @@
+# name: test/sql/integration/database_worker/real_rust_archive.test
+# description: archive a real Rust VGI worker, store it as a BLOB, extract, and execute it
+# group: [vgi_integration_database_worker]
+
+require-env VGI_DATABASE_RUST_WORKER
+
+require vgi
+
+statement ok
+SET vgi_worker_cache_dir = '__TEST_DIR__/vgi_database_worker_rust_cache';
+
+statement ok
+CREATE TABLE rust_worker_packages AS
+SELECT * FROM vgi_worker_package(
+    '${VGI_DATABASE_RUST_WORKER}',
+    'rust-fixture',
+    'rust-archive-1',
+    entrypoint := 'bin/vgi-rust-worker');
+
+query IT
+SELECT octet_length(contents) > 1000000, package_format
+FROM rust_worker_packages;
+----
+true	tar.gz
+
+statement ok
+ATTACH 'example' AS rust_worker (
+    TYPE vgi,
+    LOCATION 'database://memory/main/rust_worker_packages/rust-fixture?package_version=rust-archive-1');
+
+query II
+SELECT count(*), sum(n) FROM rust_worker.main.sequence(7);
+----
+7	21
+
+query T
+SELECT package_format
+FROM vgi_worker_cache()
+WHERE source = 'database://memory/main/rust_worker_packages/rust-fixture?package_version=rust-archive-1';
+----
+tar.gz
+
+statement ok
+DETACH rust_worker;
+
+query I
+SELECT flushed >= 1 FROM vgi_worker_pool_flush();
+----
+true
+
+query II
+SELECT removed, skipped_in_use FROM vgi_worker_cache_flush();
+----
+1	0

@@ -130,6 +130,8 @@ src/vgi_input_dedup.cpp
 src/vgi_result_cache_functions.cpp
 src/vgi_cached_replay_connection.cpp
 src/vgi_github.cpp
+src/vgi_database_worker.cpp
+src/vgi_worker_package_functions.cpp
 src/vgi_global_functions.cpp
 src/vgi_github_functions.cpp
 src/vgi_wasm_async_pool.cpp
@@ -217,6 +219,7 @@ if((BUILD_VGI_UNIT_TESTS OR DEFINED ENV{BUILD_VGI_UNIT_TESTS}) AND NOT WIN32)
     test/cpp/test_sab_conn.cpp
     test/support/vgi_sab_native_ring.cpp
     test/support/vgi_sab_test_stubs.cpp
+    test/support/vgi_database_worker_test_stubs.cpp
     src/vgi_sab_stream.cpp
     src/vgi_webworker_function_connection.cpp
     src/vgi_rpc_client.cpp

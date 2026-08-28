@@ -118,6 +118,9 @@ jobs:
             --allow-skip 'require spatial' \
             --allow-skip 'require-env VGI_DOCKER_IMAGE' \
             --allow-skip 'require-env VGI_DOCKER_TCP_IMAGE' \
+            --allow-skip 'require-env VGI_DATABASE_BUN_WORKER' \
+            --allow-skip 'require-env VGI_DATABASE_PYTHON_WORKER' \
+            --allow-skip 'require-env VGI_DATABASE_RUST_WORKER' \
             --allow-skip 'require-env VGI_GITHUB_NETWORK_TESTS' \
             --allow-skip 'require-env VGI_TEST_ICEBERG' \
             --allow-skip 'require-env VGI_TEST_COMPANION_TARGET' \

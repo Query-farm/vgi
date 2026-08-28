@@ -97,6 +97,8 @@
 #include "vgi_result_cache.hpp"
 #include "vgi_companion_catalogs.hpp"
 #include "vgi_github_functions.hpp"
+#include "vgi_database_worker.hpp"
+#include "vgi_worker_package_functions.hpp"
 #include "vgi_worker_pool_functions.hpp"
 
 #include "duckdb/catalog/catalog_transaction.hpp"
@@ -2056,6 +2058,16 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 #endif
 	}
 
+	// database:// is a package resolver, not a wire transport. Snapshot the
+	// committed registry row now; every RPC below runs the resulting immutable
+	// artifact through the ordinary subprocess machinery.
+	std::shared_ptr<void> worker_artifact_anchor;
+	if (vgi::IsDatabaseLocation(worker_path)) {
+		auto resolved = vgi::ResolveDatabaseWorker(worker_path, context);
+		worker_path = std::move(resolved.token);
+		worker_artifact_anchor = std::move(resolved.lifetime_anchor);
+	}
+
 #ifdef __EMSCRIPTEN__
 	// WASM: HTTP (duckdb-wasm XHR layer) and the browser `worker:` SAB transport
 	// (a Web Worker over a SharedArrayBuffer duplex ring) are supported; no
@@ -2141,7 +2153,8 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	// Catalogs without options on the explicit form pay no overhead (no RPC).
 	if (discover_catalog || !attach_options.empty()) {
 		auto catalogs = vgi::InvokeCatalogs(worker_path, context, worker_debug, use_pool, auth,
-		                                    launcher_idle_for_attach, launcher_state_dir_for_attach);
+		                                    launcher_idle_for_attach, launcher_state_dir_for_attach,
+		                                    worker_artifact_anchor);
 
 		// Bare form: resolve the (omitted) catalog name from the worker. A
 		// single-catalog worker resolves unambiguously; >1 forces the user to
@@ -2241,7 +2254,7 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	auto attach_result = vgi::InvokeCatalogAttach(worker_path, catalog_name, context, worker_debug, use_pool, auth,
 	                                              data_version_spec, implementation_version, cookie_jar,
 	                                              attach_options, launcher_idle_for_attach,
-	                                              launcher_state_dir_for_attach);
+	                                              launcher_state_dir_for_attach, worker_artifact_anchor);
 
 	// Register extension options for settings exposed by this catalog
 	// Check for type conflicts with existing settings
@@ -2364,6 +2377,7 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	attach_cfg.data_version_spec = attach_result.resolved_data_version;
 	attach_cfg.implementation_version = attach_result.resolved_implementation_version;
 	attach_cfg.cookie_jar = cookie_jar;
+	attach_cfg.worker_artifact_anchor = worker_artifact_anchor;
 	if (launcher_idle_timeout_seconds >= 0) {
 		attach_cfg.launcher_idle_timeout_seconds = launcher_idle_timeout_seconds;
 	}
@@ -3822,6 +3836,25 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "Cache directory for worker binaries downloaded from GitHub releases "
 	                          "(github:// / github-auto:// LOCATIONs); empty = ${XDG_CACHE_HOME:-~/.cache}/vgi/releases",
 	                          LogicalType::VARCHAR, Value(""));
+	config.AddExtensionOption("vgi_worker_cache_dir",
+	                          "Cache directory for immutable database worker packages; empty follows "
+	                          "vgi_github_cache_dir, then the VGI release cache directory",
+	                          LogicalType::VARCHAR, Value(""));
+	config.AddExtensionOption("vgi_worker_cache_max_bytes",
+	                          "Maximum managed worker-package cache size; 0 disables size eviction. Default 5 GiB",
+	                          LogicalType::UBIGINT, Value::UBIGINT(5ULL * 1024ULL * 1024ULL * 1024ULL));
+	config.AddExtensionOption("vgi_worker_cache_ttl_seconds",
+	                          "Evict unused worker packages older than this age; 0 disables TTL eviction. Default 30 days",
+	                          LogicalType::UBIGINT, Value::UBIGINT(30ULL * 24ULL * 60ULL * 60ULL));
+	config.AddExtensionOption("vgi_worker_package_max_bytes",
+	                          "Maximum compressed/raw database worker package size. Default 512 MiB",
+	                          LogicalType::UBIGINT, Value::UBIGINT(512ULL * 1024ULL * 1024ULL));
+	config.AddExtensionOption("vgi_worker_package_max_extracted_bytes",
+	                          "Maximum total extracted database worker package size. Default 1 GiB",
+	                          LogicalType::UBIGINT, Value::UBIGINT(1024ULL * 1024ULL * 1024ULL));
+	config.AddExtensionOption("vgi_worker_package_max_files",
+	                          "Maximum number of entries in a database worker archive. Default 10000",
+	                          LogicalType::UBIGINT, Value::UBIGINT(10000));
 
 	// Eager-load thresholds. Per-kind: a schema's estimated_object_count[kind]
 	// is compared against the corresponding value here; below or equal triggers
@@ -3939,6 +3972,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	vgi::RegisterVgiWorkerPoolFlushFunction(loader);
 	vgi::RegisterVgiGithubCacheFunction(loader);
 	vgi::RegisterVgiGithubCacheFlushFunction(loader);
+	vgi::RegisterVgiWorkerPackageMacro(loader);
+	vgi::RegisterVgiWorkerCacheFunctions(loader);
 
 	// Register table statistics diagnostic function
 	vgi::RegisterVgiTableStatisticsFunction(loader);

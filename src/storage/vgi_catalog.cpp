@@ -51,6 +51,9 @@ VgiCatalog::~VgiCatalog() = default;
 // AttachedDatabase::OnDetach AFTER DetachInternal removed the parent
 // (databases_lock not held) — nested DetachDatabase is safe here.
 void VgiCatalog::OnDetach(ClientContext &context) {
+	// The catalog lifetime pin is no longer needed. Running/pooled subprocesses
+	// carry independent leases, so cleanup remains unable to race live code.
+	attach_parameters_->ReleaseWorkerArtifactAnchor();
 	if (companion_catalogs_.empty()) {
 		return;
 	}

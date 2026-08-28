@@ -61,6 +61,9 @@ struct VgiAttachParametersConfig {
 	// result-cache key so two attaches with different options (which may route
 	// to different data/locations) never share a cache entry. Empty = none.
 	std::string attach_options_canonical;
+	// Opaque lifetime pin for a resolved worker artifact. Null for ordinary
+	// transports. Keeping this on the catalog prevents eviction between calls.
+	std::shared_ptr<void> worker_artifact_anchor;
 };
 
 // Parameters for connecting to a VGI worker
@@ -77,6 +80,7 @@ struct VgiAttachParameters {
 	      launcher_idle_timeout_seconds_(cfg.launcher_idle_timeout_seconds),
 	      launcher_state_dir_(std::move(cfg.launcher_state_dir)),
 	      attach_options_canonical_(std::move(cfg.attach_options_canonical)) {
+		worker_artifact_anchor_ = std::move(cfg.worker_artifact_anchor);
 	}
 
 	// Legacy constructor — thin wrapper for in-tree call sites that haven't
@@ -174,6 +178,13 @@ struct VgiAttachParameters {
 		return attach_options_canonical_;
 	}
 
+	const std::shared_ptr<void> &worker_artifact_anchor() const {
+		return worker_artifact_anchor_;
+	}
+	void ReleaseWorkerArtifactAnchor() {
+		worker_artifact_anchor_.reset();
+	}
+
 public:
 	// Capability cache for the new catalog_table_scan_branches_get RPC.
 	// Tri-state: 0 = unknown (probe), 1 = supported, 2 = not supported.
@@ -228,6 +239,7 @@ private:
 	std::optional<int64_t> launcher_idle_timeout_seconds_;
 	std::optional<std::string> launcher_state_dir_;
 	std::string attach_options_canonical_;
+	std::shared_ptr<void> worker_artifact_anchor_;
 
 	// See GetOrInitHttpParams above for the rationale behind caching these.
 	mutable std::mutex http_params_mutex_;

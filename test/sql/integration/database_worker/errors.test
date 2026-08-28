@@ -1,0 +1,73 @@
+# name: test/sql/integration/database_worker/errors.test
+# description: database:// URI, row uniqueness, digest, size, and entrypoint validation
+# group: [vgi_integration_database_worker]
+
+require vgi
+
+statement error
+ATTACH 'example' AS db_missing_version (
+    TYPE vgi,
+    LOCATION 'database://memory/main/packages/worker');
+----
+requires a non-empty package_version
+
+statement error
+ATTACH 'example' AS db_temp (
+    TYPE vgi,
+    LOCATION 'database://temp/main/packages/worker?package_version=1');
+----
+cannot be read from the temporary catalog
+
+statement error
+ATTACH 'example' AS db_bad_pin (
+    TYPE vgi,
+    LOCATION 'database://memory/main/packages/worker?package_version=1#sha256=abc');
+----
+exactly 64 hex characters
+
+statement ok
+CREATE TABLE duplicate_packages AS
+SELECT * FROM vgi_worker_package(
+    'test/support/database_worker_fixture.sh', 'duplicate', '1')
+UNION ALL
+SELECT * FROM vgi_worker_package(
+    'test/support/database_worker_fixture.sh', 'duplicate', '1');
+
+statement error
+ATTACH 'example' AS db_duplicate (
+    TYPE vgi,
+    LOCATION 'database://memory/main/duplicate_packages/duplicate?package_version=1');
+----
+multiple worker packages match
+
+statement ok
+CREATE TABLE unsafe_packages AS
+SELECT * FROM vgi_worker_package(
+    'test/support/database_worker_fixture.sh',
+    'unsafe',
+    '1',
+    entrypoint := '../worker');
+
+statement error
+ATTACH 'example' AS db_unsafe (
+    TYPE vgi,
+    LOCATION 'database://memory/main/unsafe_packages/unsafe?package_version=1');
+----
+unsafe path
+
+statement error
+ATTACH 'example' AS db_pin_mismatch (
+    TYPE vgi,
+    LOCATION 'database://memory/main/unsafe_packages/unsafe?package_version=1#sha256=0000000000000000000000000000000000000000000000000000000000000000');
+----
+LOCATION pin mismatch
+
+statement ok
+SET vgi_worker_package_max_bytes = 1;
+
+statement error
+ATTACH 'example' AS db_too_large (
+    TYPE vgi,
+    LOCATION 'database://memory/main/unsafe_packages/unsafe?package_version=1');
+----
+exceeding vgi_worker_package_max_bytes=1

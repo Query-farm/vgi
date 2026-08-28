@@ -12,6 +12,8 @@
 #include <stdexcept>
 
 using duckdb::vgi::DetectTransport;
+using duckdb::vgi::IsDatabaseLocation;
+using duckdb::vgi::IsResolvedWorkerLocation;
 using duckdb::vgi::IsContainerLocation;
 using duckdb::vgi::IsContainerSharedLocation;
 using duckdb::vgi::IsHttpTransport;
@@ -42,9 +44,14 @@ TEST_CASE("DetectTransport routes each scheme correctly", "[transport]") {
 	CHECK(DetectTransport("worker:/workers/example.js") == TransportType::WEBWORKER);
 	CHECK(DetectTransport("worker:https://cdn.example.com/w.js") == TransportType::WEBWORKER);
 	CHECK(DetectTransport("worker:example") == TransportType::WEBWORKER);
+	CHECK(DetectTransport("database://memory/main/workers/example?package_version=1") ==
+	      TransportType::DATABASE);
 	CHECK(DetectTransport("/path/to/worker") == TransportType::SUBPROCESS);
 	CHECK(DetectTransport("/path/with launch: in middle") == TransportType::SUBPROCESS);
 	CHECK(DetectTransport("") == TransportType::SUBPROCESS);
+	CHECK(IsDatabaseLocation("DATABASE://memory/main/packages/worker?package_version=1"));
+	CHECK_FALSE(IsDatabaseLocation("/database://not-a-scheme"));
+	CHECK(IsResolvedWorkerLocation("vgi-artifact:012345"));
 }
 
 TEST_CASE("TCP locations parse hostnames, IPv4, and bracketed IPv6", "[transport]") {
