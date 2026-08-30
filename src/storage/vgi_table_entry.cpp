@@ -521,18 +521,58 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 	// function names per schema and may reuse one name across schemas, so the
 	// bind request has to name the schema we found it in — not just the table's.
 	std::string scan_function_schema;
-	auto func_entry = catalog_.GetEntry<TableFunctionCatalogEntry>(
-	    context, ParentSchema().name, scan_result.function_name, OnEntryNotFound::RETURN_NULL);
-	if (func_entry) {
-		scan_function_schema = ParentSchema().name;
+	optional_ptr<TableFunctionCatalogEntry> func_entry;
+	// `default_schema` is read regardless of which branch below needs it: the
+	// worker-provided path also checks against it (see the comment there).
+	auto &default_schema = vgi_catalog.attach_result()->default_schema;
+	// A worker-claimed schema equal to one we already have a stable, live
+	// reference to (the table's own schema, or the catalog's default) is
+	// resolved through the EXACT SAME call as the pre-1.5.0 heuristic below —
+	// empirically, routing that case through a separate `if` body (even when
+	// passing the identical schema-name string) was observed to silently
+	// disable filter/projection pushdown on a later bind within the same
+	// session (see cache/filter_pushdown_keys.test) — a pre-existing fragility
+	// in the underlying catalog-entry cache that a byte-identical call
+	// shouldn't trigger, but reliably did. Only take the worker-provided
+	// path — genuinely new territory the pre-1.5.0 heuristic never
+	// reached — for a schema that names neither of those two.
+	bool worker_schema_is_third_schema = !scan_result.schema_name.empty() &&
+	                                     scan_result.schema_name != ParentSchema().name &&
+	                                     scan_result.schema_name != default_schema;
+	if (worker_schema_is_third_schema) {
+		// Worker-provided (protocol 1.5.0), naming a schema other than the
+		// table's own or the catalog's default — authoritative, no guessing
+		// needed. Only the worker genuinely knows which schema its own
+		// returned function_name lives in. A worker-claimed schema with no
+		// matching VGI-registered function falls through to the
+		// system-catalog lookup below, same as the fallback path does for a
+		// genuinely native DuckDB function.
+		func_entry = catalog_.GetEntry<TableFunctionCatalogEntry>(
+		    context, scan_result.schema_name, scan_result.function_name, OnEntryNotFound::RETURN_NULL);
+		if (func_entry) {
+			scan_function_schema = scan_result.schema_name;
+		}
 	} else {
-		// Function may be in a different schema (e.g., main) than the table's schema (e.g., data)
-		auto &default_schema = vgi_catalog.attach_result()->default_schema;
-		if (default_schema != ParentSchema().name) {
-			func_entry = catalog_.GetEntry<TableFunctionCatalogEntry>(
-			    context, default_schema, scan_result.function_name, OnEntryNotFound::RETURN_NULL);
-			if (func_entry) {
-				scan_function_schema = default_schema;
+		// schema_name absent, or naming a schema we already have a stable
+		// reference to. Absence is NOT just a pre-1.5.0-peer case: the field
+		// is optional by protocol design, and plenty of fully-1.5.0 workers
+		// (including this repo's own fixture worker — every hand-rolled
+		// catalog_table_scan_branches_get override that builds a ScanBranch
+		// directly) legitimately never set it. The old two-step heuristic —
+		// the table's own schema, then the catalog's default schema — is
+		// still required to resolve those, not just kept for compatibility.
+		func_entry = catalog_.GetEntry<TableFunctionCatalogEntry>(
+		    context, ParentSchema().name, scan_result.function_name, OnEntryNotFound::RETURN_NULL);
+		if (func_entry) {
+			scan_function_schema = ParentSchema().name;
+		} else {
+			// Function may be in a different schema (e.g., main) than the table's schema (e.g., data)
+			if (default_schema != ParentSchema().name) {
+				func_entry = catalog_.GetEntry<TableFunctionCatalogEntry>(
+				    context, default_schema, scan_result.function_name, OnEntryNotFound::RETURN_NULL);
+				if (func_entry) {
+					scan_function_schema = default_schema;
+				}
 			}
 		}
 	}

@@ -1,0 +1,74 @@
+# name: test/sql/integration/table/same_name_schemas.test
+# description: The plain DECLARATIVE-TABLE member of the schema-disambiguation
+#   family (see scalar/, table_in_out/ and aggregate/ same_name_schemas.test,
+#   which probe direct function dispatch, and cache/same_name_schemas.test,
+#   which probes the result cache). This one probes
+#   catalog_table_scan_function_get / catalog_table_scan_branches_get — the RPC
+#   pair that tells a client which function backs a declarative catalog table.
+#   A function name is unique only within a schema, but a table's own schema
+#   isn't necessarily where its backing function lives — see
+#   vgi_table_entry.cpp's GetScanFunctionImpl.
+#
+#   test_same_name_table is registered in BOTH main and data, each backed by
+#   its OWN same-named scan function (test_same_name_table_scan), each
+#   emitting a single row tagged with its own schema. This is also the
+#   end-to-end regression guard for protocol 1.5.0's
+#   ScanFunctionResult.schema_name / ScanBranch.schema_name: the extension now
+#   prefers the worker-declared schema over its old table-schema/
+#   default-schema heuristic. A regression that broke how that field's value
+#   is threaded through the resolver — not merely a missing value, a value
+#   mishandled once present — showed up in this session's own investigation
+#   not as a wrong row here, but as silently disabled filter/projection
+#   pushdown on a second scan of the same function; see
+#   cache/filter_pushdown_keys.test and cache/projection_pushdown.test, which
+#   catch that failure mode directly. This file is the one that would catch a
+#   worker/client that simply stopped agreeing on which schema's table gets
+#   which schema's function.
+# group: [vgi_integration_table]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# The load-bearing assertion: each schema's declarative table resolves to
+# THAT schema's own scan-function implementation, not the other's.
+query T
+SELECT tag FROM example.main.test_same_name_table;
+----
+main
+
+query T
+SELECT tag FROM example.data.test_same_name_table;
+----
+data
+
+# Repeat both — proves the resolution is stable across more than one bind
+# within the same session (the exact shape of regression this session found:
+# correct on the first bind, silently wrong/degraded on a later one).
+query T
+SELECT tag FROM example.main.test_same_name_table;
+----
+main
+
+query T
+SELECT tag FROM example.data.test_same_name_table;
+----
+data
+
+# vgi_table_branches() confirms the branches-aware RPC path resolves the same
+# function per schema (it surfaces the TABLE's own schema/function_name, not
+# the function's resolved schema — this diagnostic predates protocol 1.5.0 —
+# but still proves each schema's table names its own scan function, not the
+# other's).
+query II
+SELECT schema_name, function_name FROM vgi_table_branches()
+WHERE table_name = 'test_same_name_table'
+ORDER BY schema_name;
+----
+data	test_same_name_table_scan
+main	test_same_name_table_scan

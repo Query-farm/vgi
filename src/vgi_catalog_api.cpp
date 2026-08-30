@@ -2434,6 +2434,13 @@ VgiScanFunctionResult ParseScanFunctionResult(ClientContext &context, const std:
 	auto arguments_bytes = row["arguments"].value_not_null<std::vector<uint8_t>>();
 	DecodeScanArguments(context, arguments_bytes, result.positional_arguments, result.named_arguments);
 
+	// schema_name (protocol 1.5.0, nullable): absent on the wire entirely for a
+	// pre-1.5.0 peer, or NULL for a native DuckDB function with no VGI-side
+	// schema of its own — either way, empty string means "caller must fall back
+	// to the pre-1.5.0 heuristic", same nullable-string convention as the
+	// ScanBranch fields below.
+	result.schema_name = row["schema_name"].value_or(std::string{});
+
 	return result;
 }
 
@@ -2523,6 +2530,11 @@ VgiScanBranchesResult ParseScanBranchesResult(ClientContext &context,
 		branch.source_catalog = branch_row["source_catalog"].value_or(std::string{});
 		branch.source_schema = branch_row["source_schema"].value_or(std::string{});
 		branch.source_table = branch_row["source_table"].value_or(std::string{});
+
+		// Function branch only (protocol 1.5.0): schema the function_name is
+		// registered in. Empty for a catalog-table/format branch or a pre-1.5.0
+		// peer — same nullable-string convention as source_catalog/etc above.
+		branch.schema_name = branch_row["schema_name"].value_or(std::string{});
 
 		// Format-branch fields (P4). A non-empty format_name with no function and
 		// no source_table selects the format kind: read these locations as this

@@ -318,12 +318,38 @@ static ArmBindResult BindBranchArm(const VgiScanBranch &branch, ClientContext &c
 		}
 		eff_named = branch.format_options;
 	}
-	// Look up the branch's function. Try the table's catalog/schema first,
-	// fall back to the catalog's default schema, then the system catalog
-	// (read_parquet, iceberg_scan, etc.).
+	// Look up the branch's function. A worker-provided schema_name (protocol
+	// 1.5.0, function branches only) is authoritative — only the worker
+	// genuinely knows which schema its own function_name is registered in, so
+	// go straight there rather than guessing. Otherwise (a format/
+	// catalog-table branch which never carries this field, or a function
+	// branch whose worker didn't set it — the field is optional by protocol
+	// design, not just a pre-1.5.0-peer compatibility case) fall back to the
+	// old cascade: the table's catalog/schema first, then the catalog's
+	// default schema, then the system catalog (read_parquet, iceberg_scan, etc.).
 	EntryLookupInfo lookup(CatalogType::TABLE_FUNCTION_ENTRY, eff_function_name);
-	optional_ptr<CatalogEntry> entry = Catalog::GetEntry(context, table_catalog_name, table_schema_name, lookup,
-	                                                      OnEntryNotFound::RETURN_NULL);
+	optional_ptr<CatalogEntry> entry;
+	// Only take the worker-provided schema_name path for a genuinely different
+	// third schema — one that names neither the table's own schema nor the
+	// catalog's default. When it names one of those two, fall through to the
+	// cascade below unconditionally instead: empirically, routing that case
+	// through a separate lookup call — even passing the identical schema-name
+	// string — was observed to silently disable filter/projection pushdown on
+	// a later bind within the same session (confirmed in the single-branch
+	// path, vgi_table_entry.cpp — see cache/filter_pushdown_keys.test), a
+	// pre-existing fragility in the underlying catalog-entry cache that a
+	// byte-identical call shouldn't trigger, but reliably did.
+	bool branch_schema_is_third_schema = branch.IsFunctionBranch() && !branch.schema_name.empty() &&
+	                                     branch.schema_name != table_schema_name &&
+	                                     branch.schema_name != default_schema;
+	if (branch_schema_is_third_schema) {
+		entry = Catalog::GetEntry(context, table_catalog_name, branch.schema_name, lookup,
+		                          OnEntryNotFound::RETURN_NULL);
+	}
+	if (!entry) {
+		entry = Catalog::GetEntry(context, table_catalog_name, table_schema_name, lookup,
+		                          OnEntryNotFound::RETURN_NULL);
+	}
 	if (!entry && !default_schema.empty() && default_schema != table_schema_name) {
 		entry = Catalog::GetEntry(context, table_catalog_name, default_schema, lookup,
 		                          OnEntryNotFound::RETURN_NULL);

@@ -125,6 +125,12 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 #   producer advertising vgi.cache.ttl, declared in both `main` and `data` so
 #   its two cache entries prove the result-cache key carries the owning schema.
 #   Back cache/same_name_schemas.test.
+# 2 table-dispatch schema-disambiguation probes: test_same_name_table_scan, a
+#   one-row producer declared in both `main` and `data`, backing the
+#   declarative `test_same_name_table` in each schema — proves
+#   catalog_table_scan_function_get/catalog_table_scan_branches_get resolve
+#   each schema's own implementation (protocol 1.5.0's schema_name field).
+#   Back table/same_name_schemas.test.
 # 2 global-registration probes (global_table, a producer; global_buffered, a
 #   table-buffering reducer) — one per function type that surfaces as a table,
 #   proving a worker-declared global function is registered into the catalog.
@@ -138,7 +144,7 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 #   re-emits its splits across pages); and four pair splits with another
 #   feature (split_batch_index, split_partitioned, split_dynamic_filter,
 #   split_cacheable). Back splits/*.test.
-# = 162 portable baseline registrations.
+# = 164 portable baseline registrations.
 #
 # SDK fixture workers may additionally ship the all-or-nothing set of nine
 # exchange-cache revalidation/finalization conformance probes listed below.
@@ -160,7 +166,7 @@ WHERE database_name = 'example' AND function_type = 'table'
     'cached_slow_sum_all'
   );
 ----
-162
+164
 
 query I
 SELECT CASE
