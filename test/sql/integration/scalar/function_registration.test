@@ -277,6 +277,18 @@ WHERE database_name = 'example' AND function_name = 'multiply';
 ----
 multiply	[value, factor]	[BIGINT, BIGINT]	BIGINT	CONSISTENT	Multiplies a value by a constant factor
 
+# comment (distinct from description) is worker-declared via Meta.comment,
+# which only the Python fixture sets so far — tolerant of NULL from other
+# SDKs' workers, same idiom as the Rust-only rows above. Proves the C++ side
+# parses FunctionInfo.comment off the wire and wires it into
+# duckdb_functions().comment when it IS set.
+query T
+SELECT comment IS NULL OR comment = 'fixture function for scalar bind-parameter tests'
+FROM duckdb_functions()
+WHERE database_name = 'example' AND function_name = 'multiply';
+----
+true
+
 # ----------------------------------------------------------------------------
 # multiply_by_setting — Setting() parameter (not visible in duckdb_functions)
 # Parameters: value (BIGINT) → BIGINT

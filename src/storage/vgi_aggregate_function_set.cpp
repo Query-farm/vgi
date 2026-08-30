@@ -232,10 +232,14 @@ void VgiAggregateFunctionSet::LoadEntries(ClientContext &context, const std::loc
 		// CreateInfo the way schema/table/view/macro entries do, so the worker's
 		// tags must be set on the constructed entry directly — otherwise they
 		// never reach duckdb_functions().tags. Tags are an entry-level concept
-		// (not per-overload), so union them across overloads.
+		// (not per-overload), so union them across overloads. comment is a
+		// single value (not per-overload either); take the first non-empty one.
 		for (const auto &func_info : pair.second) {
 			for (const auto &[key, val] : func_info.tags) {
 				function_entry->tags[key] = val;
+			}
+			if (function_entry->comment.IsNull() && !func_info.comment.empty()) {
+				function_entry->comment = Value(func_info.comment);
 			}
 		}
 

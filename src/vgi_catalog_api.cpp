@@ -2848,6 +2848,11 @@ VgiFunctionInfo ParseFunctionInfo(const std::shared_ptr<arrow::RecordBatch> &bat
 	// Optional string field for description
 	info.description = row["description"].value_or("");
 
+	// Optional string field for comment (nullable on the wire — no worker sets
+	// it yet unless it declares Meta.comment; empty == unset, same convention
+	// tables/views use).
+	info.comment = row["comment"].value_or("");
+
 	// Parse optional enum fields (nullable per protocol). A missing field is
 	// legitimate ("leave default"); a present-but-unrecognized string throws.
 	auto stability_str = row["stability"].as<std::string>();

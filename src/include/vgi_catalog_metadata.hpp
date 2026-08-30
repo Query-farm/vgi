@@ -531,6 +531,12 @@ struct VgiFunctionInfo {
 	std::string schema_name;
 	VgiFunctionType function_type = VgiFunctionType::Scalar;
 	std::string description;
+	// Short operator-facing note (e.g. "deprecated, use v2"), distinct from
+	// `description`'s intrinsic documentation — mirrors the `comment` field
+	// every other catalog object (table/view/schema) already carries.
+	// Static (worker Meta.comment) only; there is no COMMENT ON FUNCTION RPC,
+	// unlike tables/views. Empty when the worker didn't set one.
+	std::string comment;
 	std::map<std::string, std::string> tags;
 
 	// Arguments and output as deserialized Arrow schemas
