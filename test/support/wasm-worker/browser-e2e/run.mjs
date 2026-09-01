@@ -11,7 +11,8 @@
 //   - VGI wasm extension (haybarn-wasm/extensions/<ver>/wasm_threads/vgi.duckdb_extension.wasm)
 //   - worker module (../vgi_worker.js + .wasm, built via ../build.sh)
 //   - puppeteer + esbuild resolvable from haybarn-wasm/node_modules
-// Env overrides: HAYBARN_WASM, VGI_EXT_WASM, VGI_ENGINE_VERSION_DIR (default "unknown").
+// Env overrides: HAYBARN_WASM, VGI_ENGINE_ROOT, VGI_EXT_WASM,
+// VGI_ENGINE_VERSION_DIR (default "unknown").
 import { createRequire } from 'node:module';
 import { execFileSync, spawn } from 'node:child_process';
 import { existsSync, mkdtempSync, copyFileSync, mkdirSync, writeFileSync, rmSync, symlinkSync } from 'node:fs';
@@ -21,11 +22,14 @@ import { fileURLToPath } from 'node:url';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const HAYBARN = process.env.HAYBARN_WASM || join(process.env.HOME, 'Development/haybarn/haybarn-wasm');
-const DIST = join(HAYBARN, 'packages/duckdb-wasm/dist');
-const BINDINGS = join(HAYBARN, 'packages/duckdb-wasm/src/bindings');
+// Allows a packaged engine artifact to be qualified while retaining the local
+// checkout's node_modules and bridge.
+const ENGINE_ROOT = process.env.VGI_ENGINE_ROOT || HAYBARN;
+const DIST = join(ENGINE_ROOT, 'packages/duckdb-wasm/dist');
+const BINDINGS = join(ENGINE_ROOT, 'packages/duckdb-wasm/src/bindings');
 const NM = join(HAYBARN, 'node_modules');
 const VER_DIR = process.env.VGI_ENGINE_VERSION_DIR || 'unknown';
-const EXT = process.env.VGI_EXT_WASM || join(HAYBARN, 'extensions/v1.5.4/wasm_threads/vgi.duckdb_extension.wasm');
+const EXT = process.env.VGI_EXT_WASM || join(HAYBARN, 'extensions/v1.5.5/wasm_threads/vgi.duckdb_extension.wasm');
 const BRIDGE = process.env.VGI_BRIDGE || join(HAYBARN, 'packages/duckdb-wasm/dist/duckdb-browser-vgi.mjs');
 
 function skip(msg) { console.log('SKIP browser-e2e: ' + msg); process.exit(2); }
@@ -89,7 +93,13 @@ try {
   });
   const page = await browser.newPage();
   page.on('pageerror', (e) => console.error('[pageerror]', e.message));
-  page.on('console', (m) => console.log('[console]', m.text()));
+  page.on('console', async (m) => {
+    const args = await Promise.all(m.args().map(async (arg) => {
+      try { return await arg.jsonValue(); }
+      catch { return arg.toString(); }
+    }));
+    console.log('[console]', ...args);
+  });
   page.on('requestfailed', (r) => console.log('[reqfail]', r.failure()?.errorText, r.url()));
   page.on('response', (r) => { if (r.status() === 404) console.log('[404]', r.url()); });
   await page.goto(`http://127.0.0.1:${port}/index.html`, { waitUntil: 'load' });

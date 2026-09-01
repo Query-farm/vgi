@@ -16,7 +16,7 @@ const DIST = join(HAYBARN, 'packages/duckdb-wasm/dist');
 const BINDINGS = join(HAYBARN, 'packages/duckdb-wasm/src/bindings');
 const NM = join(HAYBARN, 'node_modules');
 const VER_DIR = process.env.VGI_ENGINE_VERSION_DIR || 'unknown';
-const EXT = process.env.VGI_EXT_WASM || join(HAYBARN, 'extensions/v1.5.4/wasm_threads/vgi.duckdb_extension.wasm');
+const EXT = process.env.VGI_EXT_WASM || join(HAYBARN, 'extensions/v1.5.5/wasm_threads/vgi.duckdb_extension.wasm');
 const BRIDGE = join(HAYBARN, 'packages/duckdb-wasm/dist/duckdb-browser-vgi.mjs');
 const PORT = process.argv[2] || '8799';
 

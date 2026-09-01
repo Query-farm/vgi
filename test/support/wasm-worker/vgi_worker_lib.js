@@ -23,6 +23,22 @@ addToLibrary({
       return { ringCap: i[h + 3], slotStride: i[h + 4], slotsOff: i[h + 5] };
     },
     slotByte: function (hdr, slot) { return globalThis.__vgiBase + hdr.slotsOff + slot * hdr.slotStride; },
+    // Lane 10 serializes a worker's state-check + ring mutation with slot_open's
+    // reset + STATE publication. Never hold it across Atomics.wait: release and
+    // reacquire for each bounded ring iteration so cancellation/reclaim can run.
+    lockClaim: function (i, ctl, served) {
+      for (;;) {
+        if (Atomics.load(i, ctl) !== served) return false;
+        if (Atomics.compareExchange(i, ctl + 10, 0, served) === 0) {
+          if (Atomics.load(i, ctl) === served) return true;
+          Atomics.store(i, ctl + 10, 0); Atomics.notify(i, ctl + 10); return false;
+        }
+        Atomics.wait(i, ctl + 10, Atomics.load(i, ctl + 10), 10);
+      }
+    },
+    unlockClaim: function (i, ctl) {
+      Atomics.store(i, ctl + 10, 0); Atomics.notify(i, ctl + 10);
+    },
     // Blocking ring read (ring in delivered buf) -> this module's HEAP at dstPtr.
     // `served` is the claim id this thread is serving (STATE at claim). If STATE (lane 0)
     // leaves `served` while we block (the client released/reclaimed the slot — the error
@@ -31,18 +47,21 @@ addToLibrary({
     ringRead: function (ctl, wLane, rLane, clLane, dataByte, ringCap, dstPtr, n, served) {
       var i = this.i32(); var src = this.u8(); var dst = HEAPU8;
       for (;;) {
+        if (!this.lockClaim(i, ctl, served)) return 0;
         var w = Atomics.load(i, ctl + wLane); var r = Atomics.load(i, ctl + rLane);
         var avail = w - r;
         if (avail === 0) {
-          if (Atomics.load(i, ctl + clLane) === 1) return 0; // client closed c2w (EOS)
+          var closed = Atomics.load(i, ctl + clLane) === 1;
+          this.unlockClaim(i, ctl);
+          if (closed) return 0; // client closed c2w (EOS)
           Atomics.wait(i, ctl + wLane, w, 250);
-          if (Atomics.load(i, ctl) !== served) return 0; // slot released/reclaimed -> end serve
           continue;
         }
         var k = Math.min(avail, n); var pos = r % ringCap; var first = Math.min(k, ringCap - pos);
         dst.set(src.subarray(dataByte + pos, dataByte + pos + first), dstPtr);
         if (k > first) dst.set(src.subarray(dataByte, dataByte + k - first), dstPtr + first);
-        Atomics.store(i, ctl + rLane, r + k); Atomics.notify(i, ctl + rLane); return k;
+        Atomics.store(i, ctl + rLane, r + k); this.unlockClaim(i, ctl);
+        Atomics.notify(i, ctl + rLane); return k;
       }
     },
     // Blocking ring write from this module's HEAP srcPtr -> ring in delivered buf. Same
@@ -53,14 +72,17 @@ addToLibrary({
     ringWrite: function (ctl, wLane, rLane, dataByte, ringCap, srcPtr, n, served) {
       var i = this.i32(); var dst = this.u8(); var src = HEAPU8; var off = 0;
       while (off < n) {
-        if (Atomics.load(i, ctl) !== served) return off; // slot released/reclaimed -> abort
+        if (!this.lockClaim(i, ctl, served)) return off;
         var w = Atomics.load(i, ctl + wLane); var r = Atomics.load(i, ctl + rLane);
         var free = ringCap - (w - r);
-        if (free === 0) { Atomics.wait(i, ctl + rLane, r, 250); continue; }
+        if (free === 0) {
+          this.unlockClaim(i, ctl); Atomics.wait(i, ctl + rLane, r, 250); continue;
+        }
         var k = Math.min(free, n - off); var pos = w % ringCap; var first = Math.min(k, ringCap - pos);
         dst.set(src.subarray(srcPtr + off, srcPtr + off + first), dataByte + pos);
         if (k > first) dst.set(src.subarray(srcPtr + off + first, srcPtr + off + k), dataByte);
-        Atomics.store(i, ctl + wLane, w + k); Atomics.notify(i, ctl + wLane); off += k;
+        Atomics.store(i, ctl + wLane, w + k); this.unlockClaim(i, ctl);
+        Atomics.notify(i, ctl + wLane); off += k;
       }
       return n;
     },
@@ -86,7 +108,9 @@ addToLibrary({
   vgi_sab_worker_close__deps: ['$vgiW'],
   vgi_sab_worker_close: function (slot) {
     var i = vgiW.i32(); var hdr = vgiW.hdr(); var sb = vgiW.slotByte(hdr, slot) >> 2;
-    Atomics.store(i, sb + 6, vgiW.served[slot] | 0); Atomics.notify(i, sb + 4);
+    var served = vgiW.served[slot] | 0;
+    if (!vgiW.lockClaim(i, sb, served)) return;
+    Atomics.store(i, sb + 6, served); vgiW.unlockClaim(i, sb); Atomics.notify(i, sb + 4);
   },
   // Per-thread dispatcher: block until `slot` is CLAIMED (STATE 0 -> claim-id) and
   // ready to serve. Called BEFORE serving. If the slot is already claimed (the client

@@ -38,16 +38,22 @@ slot (at slots_off + i*slot_stride):
     [7] terminal_claim  claim id that owns terminal transport metadata
     [8] terminal_code   adapter-defined stable error category
     [9] terminal_detail adapter-defined bounded detail value
-    [10..15] reserved
+    [10] reservation    0 = idle; else claim owning reset or one worker ring mutation
+    [11..15] reserved
   c2w_data: ring_cap bytes   (byte offset control+64)
   w2c_data: ring_cap bytes   (byte offset control+64+ring_cap)
 
 slot_stride = align_up(64 + 2*ring_cap, 64)
 ```
 
-**`state` carries a UNIQUE claim id, not a constant 1.** `slot_open` writes
-`Atomics.add(header[claim_seq], 1) + 1` (a globally-unique nonzero id) into the slot `state`,
-not `1`. The worker's per-slot dispatcher records the id it is serving and, after serving,
+**`state` carries a UNIQUE claim id, not a constant 1.** `slot_open` obtains
+`Atomics.add(header[claim_seq], 1) + 1` (a globally-unique nonzero id), reserves a free slot
+through lane 10, resets its ring and terminal lanes while `state` remains zero, then
+release-publishes the id into `state`. Workers observe only `state`, so a new claim is never
+visible before its lanes are ready. Worker read/write operations use the same lane around one
+state-check, buffer copy, and position publication; they release it before blocking. That prevents
+a stale worker from crossing a release/reclaim reset after its initial state check. The worker's
+per-slot dispatcher records the id it is serving and, after serving,
 waits for `state` to leave *that* id before accepting the next claim. A constant `1` would make
 a release+immediate-reclaim (`state 1 → 0 → 1`) an **ABA race** — the worker would read the new
 `1` as "my claim not released yet" and block forever. Unique ids make `state != served_id` true
@@ -129,10 +135,11 @@ The default client allocation cap is 32 regions and may be changed at compile ti
 524,608 bytes (64-byte header + 4 × 131,136-byte slot), so the default worst-case allocation is
 16,787,456 bytes.
 
-If feature bit 0 is set, an adapter may terminate a claim by writing code/detail, publishing
-`terminal_claim`, then closing `w2c` with the same claim token. The reader returns `-3` only
-when both tokens still match the current slot `state`; a late failure from a released claim is
-ignored after slot reuse.
+If feature bit 0 is set, an adapter may terminate a claim by writing code/detail, release-publishing
+`terminal_claim`, then closing `w2c` with the same claim token. A reader acquire-loads the token,
+snapshots code/detail, and revalidates both `state` and `terminal_claim` before accepting the
+snapshot. It returns `-3` only when both tokens still match the current slot `state`; a late failure
+from a released claim is ignored after slot reuse.
 
 ## Stub contract (`extern "C"`, the C++↔backend seam)
 

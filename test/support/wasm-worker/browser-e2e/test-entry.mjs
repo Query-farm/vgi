@@ -2,8 +2,8 @@
 // arrow inlined) and loaded in a cross-origin-isolated page. Exercises the full
 // transport against the real haybarn engine + VGI extension + worker module:
 //   1. LOAD the extension (slot stubs resolve at dlopen)
-//   2. catalog wcat.main.count_to(5)  => [0..4]
-//   3. ATTACH 'worker:...' -> discovery -> wcat.main.count_to(3)   => [0..2]
+//   2. ATTACH 'worker:...' -> discovery -> wcat.main.count_to(3)   => [0..2]
+//   3. catalog wcat.main.count_to(5)  => [0..4]
 //   4. multi-threaded: 4 concurrent worker: scans on separate connections
 // Results land on window.__result / window.__done for the puppeteer runner.
 import * as duckdb from './duckdb-browser.mjs';
@@ -39,7 +39,14 @@ window.__result = {};
     log('LOAD vgi OK');
     R.loaded = true;
 
-    // 2. direct table function
+    // Mount the worker before using its catalog-qualified functions. This used
+    // to happen implicitly through vgi_table_function(), but that compatibility
+    // entry point no longer exists.
+    log('ATTACH: issuing...');
+    await conn.query("ATTACH 'worker:vgi-worker-boot.js' AS wcat (TYPE vgi)");
+    log('ATTACH: statement returned; discovering...');
+
+    // 2. mounted catalog function
     const rw = await conn.query("SELECT * FROM wcat.main.count_to(5)");
     const dv = colVals(rw);
     R.workerOk = eq(dv, range(5));
@@ -52,10 +59,7 @@ window.__result = {};
     R.multiBatchOk = c === 12 && s === 66; // 12 rows (0..11), sum 66
     log('emit_batches(3,4) => rows=' + c + ' sum=' + s + ' ok=' + R.multiBatchOk);
 
-    // 3. ATTACH catalog path
-    log('ATTACH: issuing...');
-    await conn.query("ATTACH 'worker:vgi-worker-boot.js' AS wcat (TYPE vgi)");
-    log('ATTACH: statement returned; discovering...');
+    // 3. ATTACH catalog discovery path
     const rf = await conn.query("SELECT DISTINCT function_name FROM vgi_function_arguments() WHERE catalog_name='wcat' ORDER BY 1");
     const fns = []; for (let i = 0; i < rf.numRows; i++) fns.push(String(rf.getChild('function_name').get(i)));
     const rc = await conn.query('SELECT * FROM wcat.main.count_to(3)');

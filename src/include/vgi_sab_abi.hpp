@@ -57,6 +57,11 @@ enum SlotLane : int32_t {
 	SLOT_TERMINAL_CLAIM = 7,
 	SLOT_TERMINAL_CODE = 8,
 	SLOT_TERMINAL_DETAIL = 9,
+	// Slot mutation ownership. slot_open CASes this lane from 0 to its
+	// prospective claim, resets while STATE remains free, then release-publishes
+	// STATE. A worker CASes 0->its served claim around one ring mutation. Neither
+	// reset nor a stale worker can therefore update positions across reuse.
+	SLOT_RESERVATION = 10,
 };
 constexpr int32_t kSlotControlBytes = 64; // control block, cache-line isolated
 
