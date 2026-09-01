@@ -273,7 +273,7 @@ UnaryResponseResult WebWorkerInvokeUnary(ClientContext &context, const std::stri
                                          const std::string &method_name,
                                          const std::shared_ptr<arrow::RecordBatch> &params,
                                          const std::string &protocol_version_override) {
-	const std::string location = StripWebWorkerScheme(worker_path);
+	const std::string location = CanonicalizeBrowserWorkerTarget(worker_path);
 	int region_offset = 0;
 #if defined(__EMSCRIPTEN__)
 	region_offset = EnsureVgiSabRegion(location);
@@ -319,7 +319,8 @@ WebWorkerFunctionConnection::WebWorkerFunctionConnection(
     const std::vector<uint8_t> &attach_opaque_data, const std::vector<uint8_t> &transaction_opaque_data,
     ClientContext &context, const std::string &function_type, const std::vector<uint8_t> &global_execution_id,
     const std::map<std::string, Value> &settings, const std::vector<VgiSecretRequirement> &required_secrets)
-    : conn_id_hex_(VgiGenerateConnId()), location_(StripWebWorkerScheme(location)), function_name_(function_name),
+    : conn_id_hex_(VgiGenerateConnId()), location_(CanonicalizeBrowserWorkerTarget(location)),
+      function_name_(function_name),
       function_type_(function_type), arguments_type_(arguments.type), arguments_array_(arguments.array),
       attach_opaque_data_(attach_opaque_data), transaction_opaque_data_(transaction_opaque_data),
       global_execution_id_(global_execution_id), context_(context), settings_(settings),

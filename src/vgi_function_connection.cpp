@@ -1807,12 +1807,19 @@ std::unique_ptr<IFunctionConnection> CreateFunctionConnection(
 		    attach_params);
 	}
 #if defined(__EMSCRIPTEN__)
-	// worker:<url> — in-browser Web Worker over a SharedArrayBuffer duplex ring.
-	// No spawn/pool here; the JS bridge owns the worker (see vgi_sab_abi.hpp).
-	if (IsWebWorkerTransport(worker_path)) {
+	// worker:<url> and iroh://<EndpointId> use the same in-browser SAB byte
+	// transport. The page bridge owns either the legacy worker or the shared Iroh
+	// adapter worker; C++ owns only the target region and slot.
+	if (IsWebWorkerTransport(worker_path) || IsIrohTransport(worker_path)) {
 		return std::make_unique<WebWorkerFunctionConnection>(
 		    worker_path, function_name, arguments, attach_opaque_data, transaction_opaque_data, context,
 		    function_type, global_execution_id, settings, required_secrets);
+	}
+#endif
+#if !defined(__EMSCRIPTEN__)
+	if (IsIrohTransport(worker_path)) {
+		throw IOException("vgi: iroh:// transport is only available in DuckDB-WASM with an "
+		                  "application-owned Iroh adapter Worker");
 	}
 #endif
 	// Shared container: resolve the live endpoint via the daemon-introspection

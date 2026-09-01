@@ -1,0 +1,17 @@
+# name: test/sql/integration/iroh_native_rejection.test
+# description: Raw Iroh targets are browser-adapter-only in this VGI client
+# group: [vgi_integration_transport]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+# A native build must identify the scheme and fail before treating it as a
+# subprocess command or attempting any network I/O.
+statement error
+ATTACH 'remote' AS iroh_native (
+  TYPE vgi,
+  LOCATION 'iroh://0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
+);
+----
+iroh:// transport is only available in DuckDB-WASM

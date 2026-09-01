@@ -181,9 +181,15 @@ UnaryResponseResult InvokePooledUnaryRpc(const UnaryRpcOptions &opts, const std:
 #if defined(__EMSCRIPTEN__)
 	// Browser worker: SAB transport — catalog RPCs (ATTACH, discovery) as a
 	// self-contained unary over a transient SAB slot (open/write+EOS/read/release).
-	if (IsWebWorkerTransport(opts.worker_path)) {
+	if (IsWebWorkerTransport(opts.worker_path) || IsIrohTransport(opts.worker_path)) {
 		return WebWorkerInvokeUnary(opts.context, opts.worker_path, method_name, params,
 		                            opts.protocol_version_override.value_or(""));
+	}
+#endif
+#if !defined(__EMSCRIPTEN__)
+	if (IsIrohTransport(opts.worker_path)) {
+		throw IOException("vgi: iroh:// transport is only available in DuckDB-WASM with an "
+		                  "application-owned Iroh adapter Worker");
 	}
 #endif
 

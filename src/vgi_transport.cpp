@@ -52,6 +52,41 @@ bool IsWebWorkerTransport(const std::string &worker_path) {
 	return StringUtil::StartsWith(lower, "worker:");
 }
 
+bool IsIrohTransport(const std::string &worker_path) {
+	auto lower = StringUtil::Lower(worker_path);
+	return StringUtil::StartsWith(lower, "iroh://");
+}
+
+std::string CanonicalizeIrohLocation(const std::string &location) {
+	if (!IsIrohTransport(location)) {
+		throw std::invalid_argument("Not an iroh:// location: " + location);
+	}
+	constexpr size_t kSchemeLength = 7; // iroh://
+	constexpr size_t kEndpointIdLength = 64;
+	if (location.size() != kSchemeLength + kEndpointIdLength) {
+		throw std::invalid_argument("vgi: iroh:// location must contain exactly one 64-character "
+		                            "lowercase hexadecimal EndpointId: " + location);
+	}
+	const auto endpoint_id = location.substr(kSchemeLength);
+	if (!std::all_of(endpoint_id.begin(), endpoint_id.end(), [](unsigned char c) {
+		    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+	    })) {
+		throw std::invalid_argument("vgi: iroh:// EndpointId must be 64 lowercase hexadecimal characters: " +
+		                            location);
+	}
+	return "iroh://" + endpoint_id;
+}
+
+std::string CanonicalizeBrowserWorkerTarget(const std::string &location) {
+	if (IsWebWorkerTransport(location)) {
+		return StripWebWorkerScheme(location);
+	}
+	if (IsIrohTransport(location)) {
+		return CanonicalizeIrohLocation(location);
+	}
+	throw std::invalid_argument("Not a browser worker target: " + location);
+}
+
 bool IsDatabaseLocation(const std::string &worker_path) {
 	auto lower = StringUtil::Lower(worker_path);
 	return StringUtil::StartsWith(lower, "database://");
@@ -138,6 +173,9 @@ TransportType DetectTransport(const std::string &worker_path) {
 	}
 	if (IsWebWorkerTransport(worker_path)) {
 		return TransportType::WEBWORKER;
+	}
+	if (IsIrohTransport(worker_path)) {
+		return TransportType::IROH;
 	}
 	if (IsDatabaseLocation(worker_path)) {
 		return TransportType::DATABASE;

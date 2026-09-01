@@ -23,7 +23,10 @@ namespace vgi {
 //              ring (DuckDB-WASM only). The <url> is whatever `new Worker(url)`
 //              accepts. No spawn/pool on the C++ side; the JS bridge owns the
 //              worker. See vgi_sab_abi.hpp / docs/sab_transport_abi.md.
-enum class TransportType { SUBPROCESS, HTTP, UNIX, LAUNCH, CONTAINER, TCP, WEBWORKER, DATABASE };
+// IROH       — iroh://<EndpointId>; browser-only routing target for an
+//              application-owned Iroh adapter Web Worker. It uses the same SAB
+//              byte pump as WEBWORKER but never names a worker script.
+enum class TransportType { SUBPROCESS, HTTP, UNIX, LAUNCH, CONTAINER, TCP, WEBWORKER, IROH, DATABASE };
 
 // Detect what kind of worker location this string represents.  Pure on
 // inputs — no I/O, no ambient state.
@@ -50,6 +53,18 @@ bool IsTcpTransport(const std::string &worker_path);
 // Web Worker location: worker:<url>. In-browser SharedArrayBuffer transport
 // (DuckDB-WASM only); the JS bridge owns worker lifecycle.
 bool IsWebWorkerTransport(const std::string &worker_path);
+
+// Browser Iroh target. Scheme matching is case-insensitive so malformed spellings
+// are never mistaken for subprocess commands; CanonicalizeIrohLocation validates
+// an exact 64-character lowercase-hex EndpointId and returns the canonical
+// lowercase-scheme location.
+bool IsIrohTransport(const std::string &worker_path);
+std::string CanonicalizeIrohLocation(const std::string &location);
+
+// Return the canonical target identifier handed to the page bridge: worker:
+// locations lose their legacy prefix; iroh:// locations remain full canonical
+// targets. Throws for every other transport and for malformed Iroh IDs.
+std::string CanonicalizeBrowserWorkerTarget(const std::string &location);
 
 // Database-backed worker package. The user-facing URI is resolved once during
 // ATTACH into an immutable cached artifact, then executed over SUBPROCESS.

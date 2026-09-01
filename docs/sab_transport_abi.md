@@ -84,6 +84,12 @@ target/offset pairs with one transport-adapter worker. Region reclamation is per
 when every slot `state` is zero. A plain `worker:` URL remains a one-target adapter and receives
 the original `vgi-init` boot message.
 
+An `iroh://<64-lowercase-hex-EndpointId>` location is a browser adapter target,
+not a worker-script URL. Haybarn maps every such target to one application-owned
+Iroh adapter Worker. The adapter owns one local Iroh endpoint identity and
+registers a distinct target/offset region for each remote EndpointId; it must not
+create a new local endpoint identity per target.
+
 The default client allocation cap is 32 regions and may be changed at compile time with
 `VGI_SAB_MAX_TARGET_REGIONS`; the page bridge independently allows a host to choose a lower
 `maxTargetsPerAdapter`. At the default four slots and 64 KiB per directional ring, one region is

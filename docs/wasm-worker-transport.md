@@ -1,4 +1,4 @@
-# In-browser `worker:` (SAB) transport
+# In-browser `worker:` and `iroh://` (SAB) transports
 
 Run a VGI worker **entirely in the browser** — in a Web Worker, exchanging Arrow batches with
 the DuckDB-WASM extension over a **SharedArrayBuffer duplex-ring channel** — with **no server**.
@@ -14,6 +14,19 @@ SELECT * FROM w.main.some_table;
 `LOCATION 'worker:<url>'` is any URL `new Worker(url)` accepts (same-origin by default; the
 host bridge gates which URLs SQL may spawn). The worker's JS entry is either a Rust
 `-pthread`/emscripten worker or a plain JS/TS worker that speaks the slot protocol.
+
+Raw Iroh uses the same byte pump, but SQL names a remote endpoint rather than executable code:
+
+```sql
+ATTACH 'iroh://0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
+  AS remote (TYPE vgi);
+```
+
+The EndpointId must be exactly 64 lowercase hexadecimal characters. This target is available
+only in DuckDB-WASM and only after the host application supplies one Iroh adapter Worker to the
+Haybarn bridge. Every remote target receives its own SAB region, while that one adapter keeps
+one local Iroh endpoint identity and multiplexes the regions. Native VGI rejects `iroh://`
+explicitly; use the native Iroh transport adapter outside the browser instead.
 
 ## How it works (one paragraph)
 

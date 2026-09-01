@@ -2078,12 +2078,13 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	}
 
 #ifdef __EMSCRIPTEN__
-	// WASM: HTTP (duckdb-wasm XHR layer) and the browser `worker:` SAB transport
-	// (a Web Worker over a SharedArrayBuffer duplex ring) are supported; no
-	// subprocess/fork transports exist here.
-	if (!vgi::IsHttpTransport(worker_path) && !vgi::IsWebWorkerTransport(worker_path)) {
+	// WASM: HTTP and browser SAB targets are supported. `worker:` names a legacy
+	// worker script; `iroh://` names a remote EndpointId that the page bridge maps
+	// to its one application-owned Iroh adapter Worker.
+	if (!vgi::IsHttpTransport(worker_path) && !vgi::IsWebWorkerTransport(worker_path) &&
+	    !vgi::IsIrohTransport(worker_path)) {
 		throw BinderException("VGI in WASM only supports HTTP ('http[s]://') or "
-		                      "browser worker ('worker:') transports.");
+		                      "browser SAB ('worker:' or 'iroh://') transports.");
 	}
 	use_pool = false;
 	// HTTP in WASM goes through duckdb-wasm's XHR layer, not httpfs; worker: pools

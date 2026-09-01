@@ -17,6 +17,7 @@ using duckdb::vgi::IsResolvedWorkerLocation;
 using duckdb::vgi::IsContainerLocation;
 using duckdb::vgi::IsContainerSharedLocation;
 using duckdb::vgi::IsHttpTransport;
+using duckdb::vgi::IsIrohTransport;
 using duckdb::vgi::IsLaunchLocation;
 using duckdb::vgi::IsTcpTransport;
 using duckdb::vgi::IsUnixLocation;
@@ -28,6 +29,8 @@ using duckdb::vgi::StripGithubScheme;
 using duckdb::vgi::StripLaunchScheme;
 using duckdb::vgi::StripUnixScheme;
 using duckdb::vgi::StripWebWorkerScheme;
+using duckdb::vgi::CanonicalizeBrowserWorkerTarget;
+using duckdb::vgi::CanonicalizeIrohLocation;
 using duckdb::vgi::IsWebWorkerTransport;
 using duckdb::vgi::ParseTcpLocation;
 using duckdb::vgi::TransportType;
@@ -44,6 +47,8 @@ TEST_CASE("DetectTransport routes each scheme correctly", "[transport]") {
 	CHECK(DetectTransport("worker:/workers/example.js") == TransportType::WEBWORKER);
 	CHECK(DetectTransport("worker:https://cdn.example.com/w.js") == TransportType::WEBWORKER);
 	CHECK(DetectTransport("worker:example") == TransportType::WEBWORKER);
+	CHECK(DetectTransport("iroh://0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef") ==
+	      TransportType::IROH);
 	CHECK(DetectTransport("database://memory/main/workers/example?package_version=1") ==
 	      TransportType::DATABASE);
 	CHECK(DetectTransport("/path/to/worker") == TransportType::SUBPROCESS);
@@ -52,6 +57,29 @@ TEST_CASE("DetectTransport routes each scheme correctly", "[transport]") {
 	CHECK(IsDatabaseLocation("DATABASE://memory/main/packages/worker?package_version=1"));
 	CHECK_FALSE(IsDatabaseLocation("/database://not-a-scheme"));
 	CHECK(IsResolvedWorkerLocation("vgi-artifact:012345"));
+}
+
+TEST_CASE("iroh locations are strict canonical browser targets", "[transport]") {
+	const std::string endpoint = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+	const std::string canonical = "iroh://" + endpoint;
+	CHECK(IsIrohTransport(canonical));
+	CHECK(IsIrohTransport("IROH://" + endpoint));
+	CHECK(CanonicalizeIrohLocation("IROH://" + endpoint) == canonical);
+	CHECK(CanonicalizeBrowserWorkerTarget(canonical) == canonical);
+	CHECK(CanonicalizeBrowserWorkerTarget("worker:/workers/Example.js") == "/workers/Example.js");
+
+	CHECK_THROWS_AS(CanonicalizeIrohLocation("iroh://"), std::invalid_argument);
+	CHECK_THROWS_AS(CanonicalizeIrohLocation("iroh://" + endpoint.substr(1)), std::invalid_argument);
+	CHECK_THROWS_AS(CanonicalizeIrohLocation("iroh://" + endpoint + "0"), std::invalid_argument);
+	auto uppercase_id = endpoint;
+	uppercase_id[10] = 'A';
+	CHECK_THROWS_AS(CanonicalizeIrohLocation("iroh://" + uppercase_id), std::invalid_argument);
+	auto non_hex_id = endpoint;
+	non_hex_id[10] = 'g';
+	CHECK_THROWS_AS(CanonicalizeIrohLocation("iroh://" + non_hex_id), std::invalid_argument);
+	CHECK_THROWS_AS(CanonicalizeIrohLocation(canonical + "/path"), std::invalid_argument);
+	CHECK_THROWS_AS(CanonicalizeIrohLocation(canonical + "?query=1"), std::invalid_argument);
+	CHECK_THROWS_AS(CanonicalizeBrowserWorkerTarget("http://example.test"), std::invalid_argument);
 }
 
 TEST_CASE("TCP locations parse hostnames, IPv4, and bracketed IPv6", "[transport]") {
