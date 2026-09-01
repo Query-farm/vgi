@@ -14,7 +14,9 @@
 #include <arrow/status.h>
 
 #include <cstdint>
+#include <chrono>
 #include <memory>
+#include <optional>
 
 namespace duckdb {
 class ClientContext; // fwd: timeout/cancel polling (parity with FdInputStream)
@@ -23,7 +25,8 @@ namespace vgi {
 // Non-owning input stream reading the worker->client (w2c) ring of `slot`.
 class SabInputStream : public arrow::io::InputStream {
 public:
-	explicit SabInputStream(int region_offset, int slot, ClientContext *context = nullptr);
+	explicit SabInputStream(int region_offset, int slot, ClientContext *context = nullptr,
+	                        std::optional<std::chrono::steady_clock::time_point> deadline = std::nullopt);
 	~SabInputStream() override;
 
 	arrow::Status Close() override;
@@ -38,6 +41,7 @@ private:
 	int64_t position_;
 	bool is_open_;
 	ClientContext *context_;
+	std::optional<std::chrono::steady_clock::time_point> deadline_;
 };
 
 // Non-owning output stream writing the client->worker (c2w) ring of `slot`.

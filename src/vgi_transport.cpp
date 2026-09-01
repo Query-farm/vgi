@@ -57,6 +57,67 @@ bool IsIrohTransport(const std::string &worker_path) {
 	return StringUtil::StartsWith(lower, "iroh://");
 }
 
+bool IsHttpiTransport(const std::string &worker_path) {
+	auto lower = StringUtil::Lower(worker_path);
+	return StringUtil::StartsWith(lower, "httpi://");
+}
+
+HttpiUrlParts ParseHttpiUrl(const std::string &location) {
+	if (!IsHttpiTransport(location)) {
+		throw std::invalid_argument("Not an httpi:// location: " + location);
+	}
+	constexpr size_t kSchemeLength = 8; // httpi://
+	constexpr size_t kEndpointIdLength = 64;
+	if (location.size() < kSchemeLength + kEndpointIdLength) {
+		throw std::invalid_argument(
+		    "vgi: httpi:// location requires a 64-character lowercase hexadecimal EndpointId: " + location);
+	}
+	const auto endpoint_id = location.substr(kSchemeLength, kEndpointIdLength);
+	if (!std::all_of(endpoint_id.begin(), endpoint_id.end(),
+	                 [](unsigned char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); })) {
+		throw std::invalid_argument("vgi: httpi:// EndpointId must be 64 lowercase hexadecimal characters: " +
+		                            location);
+	}
+	std::string path = location.substr(kSchemeLength + kEndpointIdLength);
+	if (!path.empty() && path.front() != '/') {
+		throw std::invalid_argument("vgi: httpi:// base path must begin with '/': " + location);
+	}
+	for (unsigned char c : path) {
+		const bool unreserved = std::isalnum(c) || c == '-' || c == '.' || c == '_' || c == '~';
+		const bool sub_delim = c == '!' || c == '$' || c == '&' || c == '\'' || c == '(' || c == ')' || c == '*' ||
+		                       c == '+' || c == ',' || c == ';' || c == '=';
+		if (!(unreserved || sub_delim || c == ':' || c == '@' || c == '/')) {
+			throw std::invalid_argument("vgi: httpi:// base path contains a forbidden character: " + location);
+		}
+	}
+	size_t start = path.empty() ? std::string::npos : 1;
+	while (start != std::string::npos && start <= path.size()) {
+		auto end = path.find('/', start);
+		auto segment = path.substr(start, end == std::string::npos ? std::string::npos : end - start);
+		if (segment.empty() || segment == "." || segment == "..") {
+			if (!(segment.empty() && end == std::string::npos && start == path.size())) {
+				throw std::invalid_argument("vgi: httpi:// base path contains an empty or dot segment: " + location);
+			}
+		}
+		if (end == std::string::npos) {
+			break;
+		}
+		start = end + 1;
+	}
+	while (path.size() > 1 && path.back() == '/') {
+		path.pop_back();
+	}
+	if (path == "/") {
+		path.clear();
+	}
+	return {endpoint_id, path};
+}
+
+std::string CanonicalizeHttpiLocation(const std::string &location) {
+	auto parts = ParseHttpiUrl(location);
+	return "httpi://" + parts.endpoint_id + parts.path;
+}
+
 std::string CanonicalizeIrohLocation(const std::string &location) {
 	if (!IsIrohTransport(location)) {
 		throw std::invalid_argument("Not an iroh:// location: " + location);
@@ -65,14 +126,13 @@ std::string CanonicalizeIrohLocation(const std::string &location) {
 	constexpr size_t kEndpointIdLength = 64;
 	if (location.size() != kSchemeLength + kEndpointIdLength) {
 		throw std::invalid_argument("vgi: iroh:// location must contain exactly one 64-character "
-		                            "lowercase hexadecimal EndpointId: " + location);
+		                            "lowercase hexadecimal EndpointId: " +
+		                            location);
 	}
 	const auto endpoint_id = location.substr(kSchemeLength);
-	if (!std::all_of(endpoint_id.begin(), endpoint_id.end(), [](unsigned char c) {
-		    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
-	    })) {
-		throw std::invalid_argument("vgi: iroh:// EndpointId must be 64 lowercase hexadecimal characters: " +
-		                            location);
+	if (!std::all_of(endpoint_id.begin(), endpoint_id.end(),
+	                 [](unsigned char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); })) {
+		throw std::invalid_argument("vgi: iroh:// EndpointId must be 64 lowercase hexadecimal characters: " + location);
 	}
 	return "iroh://" + endpoint_id;
 }
@@ -119,10 +179,10 @@ void ParseTcpLocation(const std::string &location, std::string &host, int &port)
 		// brackets before getaddrinfo; they delimit the URI and are not part of
 		// the resolver input.
 		auto close = rest.find(']');
-		if (close == std::string::npos || close == 1 || close + 1 >= rest.size() ||
-		    rest[close + 1] != ':') {
+		if (close == std::string::npos || close == 1 || close + 1 >= rest.size() || rest[close + 1] != ':') {
 			throw std::invalid_argument("vgi: bracketed tcp:// IPv6 location must be "
-			                            "tcp://[address]:port: " + location);
+			                            "tcp://[address]:port: " +
+			                            location);
 		}
 		if (rest.find('[', 1) != std::string::npos || rest.find(']', close + 1) != std::string::npos) {
 			throw std::invalid_argument("vgi: invalid brackets in tcp:// location: " + location);
@@ -177,6 +237,9 @@ TransportType DetectTransport(const std::string &worker_path) {
 	if (IsIrohTransport(worker_path)) {
 		return TransportType::IROH;
 	}
+	if (IsHttpiTransport(worker_path)) {
+		return TransportType::HTTPI;
+	}
 	if (IsDatabaseLocation(worker_path)) {
 		return TransportType::DATABASE;
 	}
@@ -194,16 +257,14 @@ std::string StripUnixScheme(const std::string &location) {
 std::string StripLaunchScheme(const std::string &location) {
 	const std::string prefix = "launch:";
 	if (!IsLaunchLocation(location)) {
-		throw std::invalid_argument("StripLaunchScheme: location is not a launch: URL: " +
-		                             location);
+		throw std::invalid_argument("StripLaunchScheme: location is not a launch: URL: " + location);
 	}
 	return location.substr(prefix.size());
 }
 
 std::string StripContainerScheme(const std::string &location) {
 	if (!IsContainerLocation(location)) {
-		throw std::invalid_argument("StripContainerScheme: location is not an oci:// / docker:// URL: " +
-		                             location);
+		throw std::invalid_argument("StripContainerScheme: location is not an oci:// / docker:// URL: " + location);
 	}
 	// Case-insensitive scheme match, but preserve the original-case remainder
 	// (image refs are case-sensitive on the path component for some registries).

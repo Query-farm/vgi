@@ -90,6 +90,35 @@ Iroh adapter Worker. The adapter owns one local Iroh endpoint identity and
 registers a distinct target/offset region for each remote EndpointId; it must not
 create a new local endpoint identity per target.
 
+An `httpi://<64-lowercase-hex-EndpointId>[/base-path]` target uses the same
+application-owned Iroh adapter and a distinct SAB region. It does not expose raw
+Arrow mux bytes. Each transient claim instead carries this little-endian binary
+envelope:
+
+```text
+request head:  "VGIH" | version=1 | kind=1 | flags=0 |
+               method_len:u16 | reserved:u16 | path_len:u32 | header_count:u32
+               method | path | repeated(name_len:u32,value_len:u32,name,value)
+response head: "VGIH" | version=1 | kind=2 | flags:u16(raw=bit0) |
+               status:u16 | reserved:u16 | header_count:u32 | repeated fields
+body frame:    kind:u8 | stage:u8 | category:u8 | certainty:u8 | length:u32 | bytes
+```
+
+Body frame kinds are chunk=1, end=2, terminal=3. Chunks are at most 64 KiB;
+header count is at most 1024 and total header bytes at most 1 MiB. The C++ client
+buffers at most 1 GiB because the surrounding HTTP implementation currently
+materializes responses; no configurable native HTTP response limit exists.
+Duplicate fields retain order, including `Set-Cookie`, and response bit 0 is
+mandatory because browser Iroh returns raw representation bytes.
+
+Terminal stages are parse, resolve, connect, request, response_head, and
+response_body. Stable categories are invalid_request, unauthorized_target,
+unavailable, timeout, cancelled, protocol, transport, and internal. Dispatch
+certainty is not_dispatched, dispatched, or ambiguous. Details are sanitized
+and capped at 512 bytes. The client never replays an ambiguous POST. Releasing a
+claim cancels the corresponding streaming HTTP response so it cannot drain in
+the adapter after the query has gone away.
+
 The default client allocation cap is 32 regions and may be changed at compile time with
 `VGI_SAB_MAX_TARGET_REGIONS`; the page bridge independently allows a host to choose a lower
 `maxTargetsPerAdapter`. At the default four slots and 64 KiB per directional ring, one region is

@@ -53,9 +53,15 @@ namespace vgi {
 // FunctionConnectionParams Accessors (out-of-line, needs VgiAttachParameters)
 // ============================================================================
 
-const std::string &FunctionConnectionParams::worker_path() const { return attach_params->worker_path(); }
-bool FunctionConnectionParams::worker_debug() const { return attach_params->worker_debug(); }
-bool FunctionConnectionParams::use_pool() const { return attach_params->use_pool(); }
+const std::string &FunctionConnectionParams::worker_path() const {
+	return attach_params->worker_path();
+}
+bool FunctionConnectionParams::worker_debug() const {
+	return attach_params->worker_debug();
+}
+bool FunctionConnectionParams::use_pool() const {
+	return attach_params->use_pool();
+}
 const std::string &FunctionConnectionParams::data_version_spec() const {
 	return attach_params->data_version_spec();
 }
@@ -216,12 +222,12 @@ MaybeWriteBatchToShm(VgiShmSegment *shm, const std::shared_ptr<arrow::RecordBatc
 	}
 	std::memcpy(slot_data + schema_size + batch_size, kEosMarker, sizeof(kEosMarker));
 	auto pointer = arrow::RecordBatch::Make(wire_schema, 0, std::move(empty_columns));
-	auto metadata = arrow::KeyValueMetadata::Make(
-	    {std::string(SHM_OFFSET_KEY), std::string(SHM_LENGTH_KEY)},
+	auto metadata =
+	    arrow::KeyValueMetadata::Make({std::string(SHM_OFFSET_KEY), std::string(SHM_LENGTH_KEY)},
 	    {std::to_string(*offset), std::to_string(static_cast<uint64_t>(total))});
 	if (std::getenv("VGI_RPC_SHM_DEBUG")) {
-		fprintf(stderr, "[shm] wrote input off=%llu len=%lld (direct)\n",
-		        static_cast<unsigned long long>(*offset), static_cast<long long>(total));
+		fprintf(stderr, "[shm] wrote input off=%llu len=%lld (direct)\n", static_cast<unsigned long long>(*offset),
+		        static_cast<long long>(total));
 	}
 	return {pointer, metadata};
 }
@@ -243,8 +249,8 @@ std::mutex g_shm_capability_mutex;
 // (an old worker that 404s the method, an untagged unknown-method error, a
 // transport error) is treated as "no shm" → inline fallback. Result cached
 // per worker path. Runs in lockstep on the same pipe, before the init request.
-bool NegotiateWorkerShmCapability(int in_fd, int out_fd, const std::string &worker_path,
-                                  ClientContext &context, pid_t pid) {
+bool NegotiateWorkerShmCapability(int in_fd, int out_fd, const std::string &worker_path, ClientContext &context,
+                                  pid_t pid) {
 	{
 		std::lock_guard<std::mutex> lk(g_shm_capability_mutex);
 		auto it = g_shm_capability_cache.find(worker_path);
@@ -256,8 +262,8 @@ bool NegotiateWorkerShmCapability(int in_fd, int out_fd, const std::string &work
 	try {
 		// Zero-field, 1-row params batch (the worker decodes empty kwargs); the
 		// client's capabilities ride as metadata under vgi_rpc.transport.*.
-		auto empty_params = arrow::RecordBatch::Make(
-		    arrow::schema({}), 1, std::vector<std::shared_ptr<arrow::Array>>{});
+		auto empty_params =
+		    arrow::RecordBatch::Make(arrow::schema({}), 1, std::vector<std::shared_ptr<arrow::Array>> {});
 		auto client_caps = arrow::KeyValueMetadata::Make({TRANSPORT_CAP_SHM_KEY}, {"true"});
 		WriteRpcRequest(in_fd, TRANSPORT_OPTIONS_METHOD, empty_params, client_caps);
 		auto resp = ReadUnaryResponse(out_fd, &context, worker_path, pid);
@@ -268,8 +274,8 @@ bool NegotiateWorkerShmCapability(int in_fd, int out_fd, const std::string &work
 	} catch (const std::exception &e) {
 		capable = false; // old worker / unknown method / transport error → inline
 		if (std::getenv("VGI_RPC_SHM_DEBUG")) {
-			fprintf(stderr, "[shm] transport_options negotiation failed for %s: %s — inline\n",
-			        worker_path.c_str(), e.what());
+			fprintf(stderr, "[shm] transport_options negotiation failed for %s: %s — inline\n", worker_path.c_str(),
+			        e.what());
 		}
 	}
 	{
@@ -277,8 +283,7 @@ bool NegotiateWorkerShmCapability(int in_fd, int out_fd, const std::string &work
 		g_shm_capability_cache[worker_path] = capable;
 	}
 	if (std::getenv("VGI_RPC_SHM_DEBUG")) {
-		fprintf(stderr, "[shm] worker %s shm-capable=%s\n", worker_path.c_str(),
-		        capable ? "true" : "false");
+		fprintf(stderr, "[shm] worker %s shm-capable=%s\n", worker_path.c_str(), capable ? "true" : "false");
 	}
 	return capable;
 }
@@ -289,9 +294,8 @@ std::unique_ptr<IFunctionConnection> CreateFreshConnection(ClientContext &contex
                                                             const FunctionConnectionParams &params) {
 	return CreateFunctionConnection(params.worker_path(), params.function_name, params.arguments,
 	                                params.attach_opaque_data, params.transaction_opaque_data, context,
-	                                params.function_type, params.global_execution_id,
-	                                params.worker_debug(), params.settings, params.required_secrets,
-	                                params.attach_params);
+	                                params.function_type, params.global_execution_id, params.worker_debug(),
+	                                params.settings, params.required_secrets, params.attach_params);
 }
 
 // Internal: pool-or-spawn a connection. Sets `from_pool` to true when the
@@ -303,10 +307,8 @@ std::unique_ptr<IFunctionConnection> CreateFreshConnection(ClientContext &contex
 // Logs `worker_pool.acquire` with the result tag so the existing observability
 // surface stays identical for both AcquireAndBindConnection and
 // AcquireConnectionForInit.
-std::unique_ptr<IFunctionConnection> AcquireConnection(ClientContext &context,
-                                                        const FunctionConnectionParams &params,
-                                                        bool &from_pool,
-                                                        bool force_fresh = false) {
+std::unique_ptr<IFunctionConnection> AcquireConnection(ClientContext &context, const FunctionConnectionParams &params,
+                                                       bool &from_pool, bool force_fresh = false) {
 	std::unique_ptr<IFunctionConnection> conn;
 	from_pool = false;
 
@@ -317,8 +319,7 @@ std::unique_ptr<IFunctionConnection> AcquireConnection(ClientContext &context,
 			conn = CreateFunctionConnectionFromPool(std::move(pooled), params.function_name, params.arguments,
 			                                        params.attach_opaque_data, params.transaction_opaque_data, context,
 			                                        params.function_type, params.global_execution_id,
-			                                        params.worker_debug(), params.settings,
-			                                        params.required_secrets);
+			                                        params.worker_debug(), params.settings, params.required_secrets);
 			from_pool = true;
 			auto fields = BuildConnLogFields(*conn);
 			fields.emplace_back("worker_path", params.worker_path());
@@ -443,13 +444,12 @@ AcquireForInitResult AcquireConnectionForInit(ClientContext &context, const Func
 
 FunctionConnection::FunctionConnection(const std::string &worker_path, const std::string &function_name,
                                        const ArrowArguments &arguments, const std::vector<uint8_t> &attach_opaque_data,
-                                       const std::vector<uint8_t> &transaction_opaque_data,
-                                       ClientContext &context, const std::string &function_type,
-                                       const std::vector<uint8_t> &global_execution_id,
-                                       bool worker_debug, const std::map<std::string, Value> &settings,
+                                       const std::vector<uint8_t> &transaction_opaque_data, ClientContext &context,
+                                       const std::string &function_type,
+                                       const std::vector<uint8_t> &global_execution_id, bool worker_debug,
+                                       const std::map<std::string, Value> &settings,
                                        const std::vector<VgiSecretRequirement> &required_secrets,
-                                       const std::string &data_version_spec,
-                                       const std::string &implementation_version)
+                                       const std::string &data_version_spec, const std::string &implementation_version)
     : conn_id_hex_(VgiGenerateConnId()), worker_path_(worker_path), data_version_spec_(data_version_spec),
       implementation_version_(implementation_version), function_name_(function_name), function_type_(function_type),
       arguments_type_(arguments.type), arguments_array_(arguments.array), attach_opaque_data_(attach_opaque_data),
@@ -459,20 +459,18 @@ FunctionConnection::FunctionConnection(const std::string &worker_path, const std
 
 FunctionConnection::FunctionConnection(std::unique_ptr<PooledWorker> pooled_worker, const std::string &function_name,
                                        const ArrowArguments &arguments, const std::vector<uint8_t> &attach_opaque_data,
-                                       const std::vector<uint8_t> &transaction_opaque_data,
-                                       ClientContext &context, const std::string &function_type,
-                                       const std::vector<uint8_t> &global_execution_id,
-                                       bool worker_debug, const std::map<std::string, Value> &settings,
+                                       const std::vector<uint8_t> &transaction_opaque_data, ClientContext &context,
+                                       const std::string &function_type,
+                                       const std::vector<uint8_t> &global_execution_id, bool worker_debug,
+                                       const std::map<std::string, Value> &settings,
                                        const std::vector<VgiSecretRequirement> &required_secrets)
-    : conn_id_hex_(VgiGenerateConnId()),
-      worker_path_(pooled_worker->GetKey().worker_path),
+    : conn_id_hex_(VgiGenerateConnId()), worker_path_(pooled_worker->GetKey().worker_path),
       data_version_spec_(pooled_worker->GetKey().data_version_spec),
-      implementation_version_(pooled_worker->GetKey().implementation_version),
-      function_name_(function_name), function_type_(function_type),
-      arguments_type_(arguments.type), arguments_array_(arguments.array), attach_opaque_data_(attach_opaque_data),
-      transaction_opaque_data_(transaction_opaque_data), global_execution_id_(global_execution_id), context_(context),
-      worker_debug_(worker_debug), settings_(settings), required_secrets_(required_secrets),
-      proc_(pooled_worker->Release()) {
+      implementation_version_(pooled_worker->GetKey().implementation_version), function_name_(function_name),
+      function_type_(function_type), arguments_type_(arguments.type), arguments_array_(arguments.array),
+      attach_opaque_data_(attach_opaque_data), transaction_opaque_data_(transaction_opaque_data),
+      global_execution_id_(global_execution_id), context_(context), worker_debug_(worker_debug), settings_(settings),
+      required_secrets_(required_secrets), proc_(pooled_worker->Release()) {
 	// Adopt the drainer that was kept running while the worker was idle
 	// in the pool. Falling back to a fresh drainer is unexpected (pool
 	// invariant: workers always carry a drainer), but cheap if needed.
@@ -485,15 +483,15 @@ FunctionConnection::FunctionConnection(std::unique_ptr<PooledWorker> pooled_work
 FunctionConnection::FunctionConnection(std::unique_ptr<SubProcess> proc, const std::string &worker_path,
                                        const std::string &function_name, const ArrowArguments &arguments,
                                        const std::vector<uint8_t> &attach_opaque_data,
-                                       const std::vector<uint8_t> &transaction_opaque_data,
-                                       ClientContext &context, const std::string &function_type,
+                                       const std::vector<uint8_t> &transaction_opaque_data, ClientContext &context,
+                                       const std::string &function_type,
                                        const std::vector<uint8_t> &global_execution_id, bool worker_debug,
                                        const std::map<std::string, Value> &settings,
                                        const std::vector<VgiSecretRequirement> &required_secrets)
     : conn_id_hex_(VgiGenerateConnId()), worker_path_(worker_path), function_name_(function_name),
       function_type_(function_type), arguments_type_(arguments.type), arguments_array_(arguments.array),
-      attach_opaque_data_(attach_opaque_data), transaction_opaque_data_(transaction_opaque_data), global_execution_id_(global_execution_id),
-      context_(context), worker_debug_(worker_debug), settings_(settings),
+      attach_opaque_data_(attach_opaque_data), transaction_opaque_data_(transaction_opaque_data),
+      global_execution_id_(global_execution_id), context_(context), worker_debug_(worker_debug), settings_(settings),
       required_secrets_(required_secrets), proc_(std::move(proc)) {
 	// AF_UNIX-backed workers (UnixSocketWorker) report stderr_fd_ == -1, so
 	// the drainer attach below is a no-op.  Subprocess-backed adopters do
@@ -579,12 +577,10 @@ BindResult FunctionConnection::PerformBindRpc() {
 		return bind_batch;
 	};
 
-	auto bind_result = PerformBindProtocol(context_, function_name_, function_type_,
-	                                        arguments_array_, input_schema_, attach_opaque_data_,
-	                                        transaction_opaque_data_, settings_, required_secrets_,
-	                                        worker_path_, transport_fn, at_unit_, at_value_,
-	                                        copy_from_ ? &*copy_from_ : nullptr,
-	                                        copy_to_ ? &*copy_to_ : nullptr, schema_name_);
+	auto bind_result = PerformBindProtocol(
+	    context_, function_name_, function_type_, arguments_array_, input_schema_, attach_opaque_data_,
+	    transaction_opaque_data_, settings_, required_secrets_, worker_path_, transport_fn, at_unit_, at_value_,
+	    copy_from_ ? &*copy_from_ : nullptr, copy_to_ ? &*copy_to_ : nullptr, schema_name_);
 
 	DrainStderrLog();
 
@@ -599,19 +595,17 @@ BindResult FunctionConnection::PerformBindRpc() {
 	return bind_result;
 }
 
-InitResult FunctionConnection::PerformInit(const BindResult &bind_result,
-                                           const std::vector<int32_t> &projection_ids,
+InitResult FunctionConnection::PerformInit(const BindResult &bind_result, const std::vector<int32_t> &projection_ids,
                                            std::shared_ptr<arrow::Buffer> pushdown_filters,
                                            std::vector<std::shared_ptr<arrow::Buffer>> join_keys,
-                                           const std::string &phase,
-                                           const std::optional<OrderByHint> &order_by,
+                                           const std::string &phase, const std::optional<OrderByHint> &order_by,
                                            const std::optional<TableSampleHint> &table_sample,
                                            const std::vector<uint8_t> &init_opaque_data,
                                            const std::optional<std::vector<uint8_t>> &finalize_state_id,
                                            const std::vector<std::string> &split_tokens) {
 	if (!proc_) {
-		ThrowVgiIOException("FunctionConnection::PerformInit called before PerformBindRpc", worker_path_,
-		                    -1, GetExecutionIdHex());
+		ThrowVgiIOException("FunctionConnection::PerformInit called before PerformBindRpc", worker_path_, -1,
+		                    GetExecutionIdHex());
 	}
 	if (init_done_) {
 		ThrowVgiIOException("FunctionConnection::PerformInit called twice", worker_path_, proc_ ? proc_->GetPid() : -1,
@@ -647,20 +641,10 @@ InitResult FunctionConnection::PerformInit(const BindResult &bind_result,
 	}
 
 	// Build InitRequest — pass arrow::Buffer directly to avoid copying
-	auto init_request = BuildInitRequest(
-	    bind_result.bind_request_bytes,
-	    bind_result.output_schema_bytes,
-	    bind_result.opaque_data,
-	    projection_ids_64,
-	    pushdown_filters,
-	    join_keys,
-	    phase,
-	    execution_id,
-	    init_opaque_data,
-	    ob_col, ob_dir, ob_null, ob_limit,
-	    ts_percentage, ts_seed,
-	    finalize_state_id,
-	    substream_id_, split_tokens);
+	auto init_request = BuildInitRequest(bind_result.bind_request_bytes, bind_result.output_schema_bytes,
+	                                     bind_result.opaque_data, projection_ids_64, pushdown_filters, join_keys, phase,
+	                                     execution_id, init_opaque_data, ob_col, ob_dir, ob_null, ob_limit,
+	                                     ts_percentage, ts_seed, finalize_state_id, substream_id_, split_tokens);
 	auto init_request_bytes = SerializeToIpcBytes(init_request);
 
 	// Build RPC params and send request. If shm transport is enabled,
@@ -678,9 +662,9 @@ InitResult FunctionConnection::PerformInit(const BindResult &bind_result,
 	// that can't (Java 21 / non-POSIX / old worker) → segment stays null → all
 	// shm use sites no-op → inline (pipe) transport, no silent data loss.
 	if (const char *env = std::getenv("VGI_RPC_SHM_SIZE_BYTES");
-	    env && *env
-	        && NegotiateWorkerShmCapability(proc_->GetStdinFd(), proc_->GetStdoutFd(),
-	                                        worker_path_, context_, proc_->GetPid())) {
+	    env && *env &&
+	    NegotiateWorkerShmCapability(proc_->GetStdinFd(), proc_->GetStdoutFd(), worker_path_, context_,
+	                                 proc_->GetPid())) {
 		try {
 			size_t shm_size = static_cast<size_t>(std::stoull(env));
 			if (!shm_segment_) {
@@ -698,8 +682,7 @@ InitResult FunctionConnection::PerformInit(const BindResult &bind_result,
 			if (!py_name.empty() && py_name[0] == '/') {
 				py_name.erase(0, 1);
 			}
-			shm_metadata = arrow::KeyValueMetadata::Make(
-			    {SHM_SEGMENT_NAME_KEY, SHM_SEGMENT_SIZE_KEY},
+			shm_metadata = arrow::KeyValueMetadata::Make({SHM_SEGMENT_NAME_KEY, SHM_SEGMENT_SIZE_KEY},
 			    {py_name, std::to_string(shm_segment_->size())});
 		} catch (const std::exception &e) {
 			// Best-effort: fall back to inline transport if shm setup fails.
@@ -764,8 +747,8 @@ InitResult FunctionConnection::PerformInit(const BindResult &bind_result,
 		auto sink = std::make_shared<FdOutputStream>(proc_->GetStdinFd());
 		auto writer_result = arrow::ipc::MakeStreamWriter(sink, tick_schema_);
 		if (!writer_result.ok()) {
-			ThrowVgiIOException("Failed to create tick writer: %s", worker_path_, proc_->GetPid(),
-			                    GetExecutionIdHex(), writer_result.status().ToString());
+			ThrowVgiIOException("Failed to create tick writer: %s", worker_path_, proc_->GetPid(), GetExecutionIdHex(),
+			                    writer_result.status().ToString());
 		}
 		input_writer_ = writer_result.ValueUnsafe();
 		input_writer_opened_ = true;
@@ -778,8 +761,7 @@ InitResult FunctionConnection::PerformInit(const BindResult &bind_result,
 		// custom_metadata (where the worker's process() reads them, mirroring
 		// vgi_pushdown_filters) so the worker can answer 304-style with a 0-row
 		// vgi.cache.not_modified batch instead of re-streaming the payload.
-		auto tick_batch = arrow::RecordBatch::Make(
-		    tick_schema_, 0, std::vector<std::shared_ptr<arrow::Array>>{});
+		auto tick_batch = arrow::RecordBatch::Make(tick_schema_, 0, std::vector<std::shared_ptr<arrow::Array>> {});
 		std::shared_ptr<const arrow::KeyValueMetadata> first_tick_metadata;
 		if (!cond_if_none_match_.empty() || !cond_if_modified_since_.empty()) {
 			std::vector<std::string> keys, vals;
@@ -793,8 +775,7 @@ InitResult FunctionConnection::PerformInit(const BindResult &bind_result,
 			}
 			first_tick_metadata = arrow::KeyValueMetadata::Make(std::move(keys), std::move(vals));
 		}
-		auto write_status = first_tick_metadata
-		    ? input_writer_->WriteRecordBatch(*tick_batch, first_tick_metadata)
+		auto write_status = first_tick_metadata ? input_writer_->WriteRecordBatch(*tick_batch, first_tick_metadata)
 		    : input_writer_->WriteRecordBatch(*tick_batch);
 		if (!write_status.ok()) {
 			ThrowVgiIOException("Failed to write initial tick batch: %s", worker_path_, proc_->GetPid(),
@@ -806,8 +787,8 @@ InitResult FunctionConnection::PerformInit(const BindResult &bind_result,
 		data_stream_ = std::make_shared<FdInputStream>(proc_->GetStdoutFd(), &context_);
 		auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(data_stream_);
 		if (!reader_result.ok()) {
-			ThrowVgiIOException("Failed to open data stream: %s", worker_path_, proc_->GetPid(),
-			                    GetExecutionIdHex(), reader_result.status().ToString());
+			ThrowVgiIOException("Failed to open data stream: %s", worker_path_, proc_->GetPid(), GetExecutionIdHex(),
+			                    reader_result.status().ToString());
 		}
 		data_reader_ = reader_result.ValueUnsafe();
 	} else {
@@ -818,8 +799,8 @@ InitResult FunctionConnection::PerformInit(const BindResult &bind_result,
 		auto sink = std::make_shared<FdOutputStream>(proc_->GetStdinFd());
 		auto writer_result = arrow::ipc::MakeStreamWriter(sink, input_schema_);
 		if (!writer_result.ok()) {
-			ThrowVgiIOException("Failed to create input writer: %s", worker_path_, proc_->GetPid(),
-			                    GetExecutionIdHex(), writer_result.status().ToString());
+			ThrowVgiIOException("Failed to create input writer: %s", worker_path_, proc_->GetPid(), GetExecutionIdHex(),
+			                    writer_result.status().ToString());
 		}
 		input_writer_ = writer_result.ValueUnsafe();
 		input_writer_opened_ = true;
@@ -996,14 +977,14 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 	// Lazily open data reader if not yet opened (exchange mode defers this)
 	if (!data_reader_) {
 		if (!proc_) {
-			ThrowVgiIOException("FunctionConnection::ReadDataBatch proc_ is null", worker_path_,
-			                    -1, GetExecutionIdHex());
+			ThrowVgiIOException("FunctionConnection::ReadDataBatch proc_ is null", worker_path_, -1,
+			                    GetExecutionIdHex());
 		}
 		data_stream_ = std::make_shared<FdInputStream>(proc_->GetStdoutFd(), &context_);
 		auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(data_stream_);
 		if (!reader_result.ok()) {
-			ThrowVgiIOException("Failed to open data stream: %s", worker_path_, proc_->GetPid(),
-			                    GetExecutionIdHex(), reader_result.status().ToString());
+			ThrowVgiIOException("Failed to open data stream: %s", worker_path_, proc_->GetPid(), GetExecutionIdHex(),
+			                    reader_result.status().ToString());
 		}
 		data_reader_ = reader_result.ValueUnsafe();
 	}
@@ -1039,13 +1020,12 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 		if (tick_filter_state_) {
 			lock_guard<mutex> l(tick_filter_state_->lock);
 			if (tick_filter_state_->has_filters) {
-				tick_metadata = arrow::KeyValueMetadata::Make(
-				    {"vgi_pushdown_filters"}, {tick_filter_state_->encoded_filters});
+				tick_metadata =
+				    arrow::KeyValueMetadata::Make({"vgi_pushdown_filters"}, {tick_filter_state_->encoded_filters});
 			}
 		}
 
-		auto write_status = tick_metadata
-		    ? input_writer_->WriteRecordBatch(*tick_batch, tick_metadata)
+		auto write_status = tick_metadata ? input_writer_->WriteRecordBatch(*tick_batch, tick_metadata)
 		    : input_writer_->WriteRecordBatch(*tick_batch);
 		if (!write_status.ok()) {
 			// Tick write can fail with EPIPE/broken pipe if the server has already
@@ -1088,14 +1068,12 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 				int exit_status = 0;
 				if (proc_ && proc_->TryWait(&exit_status)) {
 					if (exit_status < 0) {
-						ThrowVgiIOException(
-						    "Worker killed by signal %d before EOS marker; result was truncated: %s",
+						ThrowVgiIOException("Worker killed by signal %d before EOS marker; result was truncated: %s",
 						    worker_path_, proc_->GetPid(), GetExecutionIdHex(), -exit_status,
 						    status.ToString());
 					}
 					if (exit_status != 0) {
-						ThrowVgiIOException(
-						    "Worker exited with status %d before EOS marker; result was truncated: %s",
+						ThrowVgiIOException("Worker exited with status %d before EOS marker; result was truncated: %s",
 						    worker_path_, proc_->GetPid(), GetExecutionIdHex(), exit_status,
 						    status.ToString());
 					}
@@ -1126,13 +1104,11 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 			int exit_status = 0;
 			if (proc_ && proc_->TryWait(&exit_status)) {
 				if (exit_status < 0) {
-					ThrowVgiIOException(
-					    "Worker killed by signal %d before EOS marker; result was truncated",
+					ThrowVgiIOException("Worker killed by signal %d before EOS marker; result was truncated",
 					    worker_path_, proc_->GetPid(), GetExecutionIdHex(), -exit_status);
 				}
 				if (exit_status != 0) {
-					ThrowVgiIOException(
-					    "Worker exited with status %d before EOS marker; result was truncated",
+					ThrowVgiIOException("Worker exited with status %d before EOS marker; result was truncated",
 					    worker_path_, proc_->GetPid(), GetExecutionIdHex(), exit_status);
 				}
 			}
@@ -1160,9 +1136,8 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 		    ClassifyBatch(result.batch, result.custom_metadata) == RpcBatchType::EXTERNAL_LOCATION) {
 			int loc_idx = result.custom_metadata->FindKey(RPC_LOCATION_KEY);
 			const std::string location_url = result.custom_metadata->value(loc_idx);
-			auto resolved = ResolveExternalLocation(context_, location_url, worker_path_,
-			                                        GetExecutionIdHex(), GetAttachOpaqueDataHex(),
-			                                        result.custom_metadata);
+			auto resolved = ResolveExternalLocation(context_, location_url, worker_path_, GetExecutionIdHex(),
+			                                        GetAttachOpaqueDataHex(), result.custom_metadata);
 			result.batch = resolved.batch;
 			result.custom_metadata = resolved.metadata;
 		}
@@ -1181,13 +1156,12 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 				shm_last_offset_ = -1;
 			}
 			int64_t resolved_offset = -1;
-			auto resolved =
-			    shm_segment_->MaybeResolveBatch(result.batch, result.custom_metadata, &resolved_offset);
+			auto resolved = shm_segment_->MaybeResolveBatch(result.batch, result.custom_metadata, &resolved_offset);
 			if (resolved) {
 				shm_last_offset_ = resolved_offset;
 				if (std::getenv("VGI_RPC_SHM_DEBUG")) {
-					fprintf(stderr, "[shm] resolved batch off=%lld len=%lld\n",
-					        (long long)resolved_offset, (long long)resolved->num_rows());
+					fprintf(stderr, "[shm] resolved batch off=%lld len=%lld\n", (long long)resolved_offset,
+					        (long long)resolved->num_rows());
 				}
 				// Swap in the resolved batch but DON'T return here — fall through
 				// to the vgi_partition_values#b64 / vgi_batch_index parsing below.
@@ -1216,9 +1190,7 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 					string_t b64_str(b64_value.data(), static_cast<uint32_t>(b64_value.size()));
 					idx_t decoded_size = Blob::FromBase64Size(b64_str);
 					last_partition_values_bytes_.resize(decoded_size);
-					Blob::FromBase64(b64_str,
-					                 data_ptr_cast(last_partition_values_bytes_.data()),
-					                 decoded_size);
+					Blob::FromBase64(b64_str, data_ptr_cast(last_partition_values_bytes_.data()), decoded_size);
 				} catch (const std::exception &e) {
 					throw IOException("VGI worker emitted invalid base64 payload in "
 					                  "vgi_partition_values#b64: %s [worker: %s, pid: %d]",
@@ -1479,8 +1451,7 @@ void FunctionConnection::CancelStream(const std::vector<uint8_t> &state_token, C
 		return;
 	}
 	auto cancel_batch = arrow::RecordBatch::Make(tick_schema_, 0, std::vector<std::shared_ptr<arrow::Array>>{});
-	auto metadata = arrow::KeyValueMetadata::Make(
-	    {std::string(generated::VGI_RPC_CANCEL_KEY)}, {"1"});
+	auto metadata = arrow::KeyValueMetadata::Make({std::string(generated::VGI_RPC_CANCEL_KEY)}, {"1"});
 	auto write_status = input_writer_->WriteRecordBatch(*cancel_batch, metadata);
 	// Best-effort — dispatcher catches any throw; here we just swallow
 	// to keep the signature simple (status itself isn't an exception).
@@ -1553,8 +1524,8 @@ void ResolveUnaryShm(VgiShmSegment *shm, UnaryResponseResult &response) {
 			shm->FreeAllocation(static_cast<uint64_t>(resolved_offset));
 		}
 		if (std::getenv("VGI_RPC_SHM_DEBUG")) {
-			fprintf(stderr, "[shm] resolved unary response off=%lld rows=%lld\n",
-			        (long long)resolved_offset, (long long)response.batch->num_rows());
+			fprintf(stderr, "[shm] resolved unary response off=%lld rows=%lld\n", (long long)resolved_offset,
+			        (long long)response.batch->num_rows());
 		}
 	}
 }
@@ -1588,19 +1559,17 @@ std::shared_ptr<arrow::RecordBatch> DecodeOuterResponse(const UnaryResponseResul
 
 } // namespace
 
-
 // ===========================================================================
 // Table sink+source RPC family (new buffered API)
 // ===========================================================================
 
 std::vector<uint8_t>
-FunctionConnection::RpcTableBufferingProcess(const std::string &function_name,
-                                                const std::vector<uint8_t> &execution_id,
+FunctionConnection::RpcTableBufferingProcess(const std::string &function_name, const std::vector<uint8_t> &execution_id,
                                                 const std::shared_ptr<arrow::RecordBatch> &input_batch,
                                                 std::optional<int64_t> batch_index) {
 	auto batch_bytes = vgi::SerializeToIpcBytes(input_batch);
-	auto rpc_params = vgi::BuildTableBufferingProcessInner(function_name, schema_name_, execution_id,
-	                                                          batch_bytes, attach_opaque_data_, batch_index);
+	auto rpc_params = vgi::BuildTableBufferingProcessInner(function_name, schema_name_, execution_id, batch_bytes,
+	                                                       attach_opaque_data_, batch_index);
 	vgi::ValidateRequestSchema(rpc_params, "table_buffering_process", worker_path_);
 	// The params batch embeds the (potentially large) input batch bytes; offload
 	// it to shm when a segment is attached. The 0-row pointer goes inline and
@@ -1635,11 +1604,10 @@ FunctionConnection::RpcTableBufferingProcess(const std::string &function_name,
 }
 
 std::vector<std::vector<uint8_t>>
-FunctionConnection::RpcTableBufferingCombine(const std::string &function_name,
-                                                const std::vector<uint8_t> &execution_id,
+FunctionConnection::RpcTableBufferingCombine(const std::string &function_name, const std::vector<uint8_t> &execution_id,
                                                 const std::vector<std::vector<uint8_t>> &state_ids) {
-	auto rpc_params = vgi::BuildTableBufferingCombineInner(function_name, schema_name_, execution_id, state_ids,
-	                                                          attach_opaque_data_);
+	auto rpc_params =
+	    vgi::BuildTableBufferingCombineInner(function_name, schema_name_, execution_id, state_ids, attach_opaque_data_);
 	vgi::ValidateRequestSchema(rpc_params, "table_buffering_combine", worker_path_);
 	vgi::WriteRpcRequest(proc_->GetStdinFd(), "table_buffering_combine", rpc_params);
 	auto response = vgi::ReadUnaryResponse(proc_->GetStdoutFd(), &context_, worker_path_, proc_->GetPid(),
@@ -1668,8 +1636,8 @@ FunctionConnection::RpcTableBufferingCombine(const std::string &function_name,
 
 void FunctionConnection::RpcTableBufferingDestructor(const std::string &function_name,
                                                        const std::vector<uint8_t> &execution_id) {
-	auto rpc_params = vgi::BuildTableBufferingDestructorInner(function_name, schema_name_, execution_id,
-	                                                             attach_opaque_data_);
+	auto rpc_params =
+	    vgi::BuildTableBufferingDestructorInner(function_name, schema_name_, execution_id, attach_opaque_data_);
 	vgi::ValidateRequestSchema(rpc_params, "table_buffering_destructor", worker_path_);
 	vgi::WriteRpcRequest(proc_->GetStdinFd(), "table_buffering_destructor", rpc_params);
 	auto response = vgi::ReadUnaryResponse(proc_->GetStdoutFd(), &context_, worker_path_, proc_->GetPid(),
@@ -1790,30 +1758,38 @@ void FunctionConnection::DrainStderrLog() {
 // Factory Functions
 // ============================================================================
 
-std::unique_ptr<IFunctionConnection> CreateFunctionConnection(
-    const std::string &worker_path, const std::string &function_name,
+std::unique_ptr<IFunctionConnection>
+CreateFunctionConnection(const std::string &worker_path, const std::string &function_name,
     const ArrowArguments &arguments, const std::vector<uint8_t> &attach_opaque_data,
-    const std::vector<uint8_t> &transaction_opaque_data,
-    ClientContext &context, const std::string &function_type,
-    const std::vector<uint8_t> &global_execution_id,
-    bool worker_debug,
-    const std::map<std::string, Value> &settings,
+                         const std::vector<uint8_t> &transaction_opaque_data, ClientContext &context,
+                         const std::string &function_type, const std::vector<uint8_t> &global_execution_id,
+                         bool worker_debug, const std::map<std::string, Value> &settings,
     const std::vector<VgiSecretRequirement> &required_secrets,
     const std::shared_ptr<VgiAttachParameters> &attach_params) {
 	if (IsHttpTransport(worker_path)) {
 		return std::make_unique<HttpFunctionConnection>(
-		    worker_path, function_name, arguments, attach_opaque_data, transaction_opaque_data, context,
-		    function_type, global_execution_id, worker_debug, settings, required_secrets,
-		    attach_params);
+		    worker_path, function_name, arguments, attach_opaque_data, transaction_opaque_data, context, function_type,
+		    global_execution_id, worker_debug, settings, required_secrets, attach_params);
+	}
+	if (IsHttpiTransport(worker_path)) {
+#if defined(__EMSCRIPTEN__)
+		return std::make_unique<HttpFunctionConnection>(CanonicalizeHttpiLocation(worker_path), function_name,
+		                                                arguments, attach_opaque_data, transaction_opaque_data, context,
+		                                                function_type, global_execution_id, worker_debug, settings,
+		                                                required_secrets, attach_params);
+#else
+		throw IOException("vgi: httpi:// transport is only available in DuckDB-WASM with an "
+		                  "application-owned Iroh adapter Worker");
+#endif
 	}
 #if defined(__EMSCRIPTEN__)
 	// worker:<url> and iroh://<EndpointId> use the same in-browser SAB byte
 	// transport. The page bridge owns either the legacy worker or the shared Iroh
 	// adapter worker; C++ owns only the target region and slot.
 	if (IsWebWorkerTransport(worker_path) || IsIrohTransport(worker_path)) {
-		return std::make_unique<WebWorkerFunctionConnection>(
-		    worker_path, function_name, arguments, attach_opaque_data, transaction_opaque_data, context,
-		    function_type, global_execution_id, settings, required_secrets);
+		return std::make_unique<WebWorkerFunctionConnection>(worker_path, function_name, arguments, attach_opaque_data,
+		                                                     transaction_opaque_data, context, function_type,
+		                                                     global_execution_id, settings, required_secrets);
 	}
 #endif
 #if !defined(__EMSCRIPTEN__)
@@ -1843,16 +1819,15 @@ std::unique_ptr<IFunctionConnection> CreateFunctionConnection(
 				if (ep.mode == ContainerConnMode::HTTP) {
 					return std::make_unique<HttpFunctionConnection>(
 					    ep.url, function_name, arguments, attach_opaque_data, transaction_opaque_data, context,
-					    function_type, global_execution_id, worker_debug, settings, required_secrets,
-					    attach_params);
+					    function_type, global_execution_id, worker_debug, settings, required_secrets, attach_params);
 				}
 				// tcp (and, later, unix): native vgi-rpc over a connected fd, driven by
 				// the same FunctionConnection machinery as the launch:/unix:// transports.
 				auto worker = ConnectSharedContainer(ep);
-				return std::make_unique<FunctionConnection>(
-				    std::move(worker), worker_path, function_name, arguments, attach_opaque_data,
-				    transaction_opaque_data, context, function_type, global_execution_id, worker_debug,
-				    settings, required_secrets);
+				return std::make_unique<FunctionConnection>(std::move(worker), worker_path, function_name, arguments,
+				                                            attach_opaque_data, transaction_opaque_data, context,
+				                                            function_type, global_execution_id, worker_debug, settings,
+				                                            required_secrets);
 			} catch (const IOException &) {
 				if (attempt >= 1) {
 					throw;
@@ -1880,10 +1855,9 @@ std::unique_ptr<IFunctionConnection> CreateFunctionConnection(
 			throw IOException("vgi: failed to connect to tcp worker %s: %s", worker_path, connect_error);
 		}
 		auto worker = std::make_unique<UnixSocketWorker>(fd);
-		return std::make_unique<FunctionConnection>(
-		    std::move(worker), worker_path, function_name, arguments, attach_opaque_data,
-		    transaction_opaque_data, context, function_type, global_execution_id, worker_debug, settings,
-		    required_secrets);
+		return std::make_unique<FunctionConnection>(std::move(worker), worker_path, function_name, arguments,
+		                                            attach_opaque_data, transaction_opaque_data, context, function_type,
+		                                            global_execution_id, worker_debug, settings, required_secrets);
 #elif defined(_WIN32)
 		// tcp://host:port on Windows — connect a raw TCP socket (Winsock) and wrap
 		// the connected fd in a NamedPipeWorker (the generic fd worker on Windows),
@@ -1898,10 +1872,9 @@ std::unique_ptr<IFunctionConnection> CreateFunctionConnection(
 			throw IOException("vgi: failed to connect to tcp worker %s: %s", worker_path, connect_error);
 		}
 		auto worker = std::make_unique<NamedPipeWorker>(fd);
-		return std::make_unique<FunctionConnection>(
-		    std::move(worker), worker_path, function_name, arguments, attach_opaque_data,
-		    transaction_opaque_data, context, function_type, global_execution_id, worker_debug, settings,
-		    required_secrets);
+		return std::make_unique<FunctionConnection>(std::move(worker), worker_path, function_name, arguments,
+		                                            attach_opaque_data, transaction_opaque_data, context, function_type,
+		                                            global_execution_id, worker_debug, settings, required_secrets);
 #else
 		throw InvalidInputException("vgi: tcp:// LOCATIONs are not available in this build");
 #endif
@@ -1926,17 +1899,16 @@ std::unique_ptr<IFunctionConnection> CreateFunctionConnection(
 		// a second ATTACH with conflicting overrides fails fast.
 		LaunchOverrides overrides;
 		if (attach_params && attach_params->launcher_idle_timeout_seconds().has_value()) {
-			overrides.idle_timeout =
-			    std::chrono::seconds(*attach_params->launcher_idle_timeout_seconds());
+			overrides.idle_timeout = std::chrono::seconds(*attach_params->launcher_idle_timeout_seconds());
 		}
 		if (attach_params && attach_params->launcher_state_dir().has_value()) {
 			overrides.state_dir = *attach_params->launcher_state_dir();
 		}
 		auto sock = ResolveAndConnect(worker_path, std::chrono::seconds(10), overrides);
 		auto worker = std::make_unique<UnixSocketWorker>(sock.Release());
-		return std::make_unique<FunctionConnection>(
-		    std::move(worker), worker_path, function_name, arguments, attach_opaque_data, transaction_opaque_data,
-		    context, function_type, global_execution_id, worker_debug, settings, required_secrets);
+		return std::make_unique<FunctionConnection>(std::move(worker), worker_path, function_name, arguments,
+		                                            attach_opaque_data, transaction_opaque_data, context, function_type,
+		                                            global_execution_id, worker_debug, settings, required_secrets);
 #elif defined(_WIN32)
 		// Windows: launch:/unix:// rendezvous over a Windows named pipe. unix://
 		// connects to an out-of-band worker; launch: spawns (or reuses) one via
@@ -1957,12 +1929,11 @@ std::unique_ptr<IFunctionConnection> CreateFunctionConnection(
 		}
 		int fd = NamedPipeConnect(pipe_name, std::chrono::seconds(10));
 		auto worker = std::make_unique<NamedPipeWorker>(fd);
-		return std::make_unique<FunctionConnection>(
-		    std::move(worker), worker_path, function_name, arguments, attach_opaque_data, transaction_opaque_data,
-		    context, function_type, global_execution_id, worker_debug, settings, required_secrets);
+		return std::make_unique<FunctionConnection>(std::move(worker), worker_path, function_name, arguments,
+		                                            attach_opaque_data, transaction_opaque_data, context, function_type,
+		                                            global_execution_id, worker_debug, settings, required_secrets);
 #else
-		throw InvalidInputException(
-		    "vgi: launch:/unix:// LOCATION schemes are not available in this build "
+		throw InvalidInputException("vgi: launch:/unix:// LOCATION schemes are not available in this build "
 		    "(worker_path=%s); use http://… instead",
 		    worker_path);
 #endif
@@ -1982,13 +1953,12 @@ std::unique_ptr<IFunctionConnection> CreateFunctionConnection(
 			gh_data_version_spec = attach_params->data_version_spec();
 			gh_implementation_version = attach_params->implementation_version();
 		}
-		return std::make_unique<FunctionConnection>(
-		    worker_path, function_name, arguments, attach_opaque_data, transaction_opaque_data, context,
-		    function_type, global_execution_id, worker_debug, settings, required_secrets,
+		return std::make_unique<FunctionConnection>(worker_path, function_name, arguments, attach_opaque_data,
+		                                            transaction_opaque_data, context, function_type,
+		                                            global_execution_id, worker_debug, settings, required_secrets,
 		    gh_data_version_spec, gh_implementation_version);
 #else
-		throw InvalidInputException(
-		    "vgi: github:// / github-auto:// LOCATIONs require a child-process transport "
+		throw InvalidInputException("vgi: github:// / github-auto:// LOCATIONs require a child-process transport "
 		    "not available in this build (worker_path=%s)",
 		    worker_path);
 #endif
@@ -1996,8 +1966,7 @@ std::unique_ptr<IFunctionConnection> CreateFunctionConnection(
 	// Bare-command path → subprocess transport. Available on POSIX (fork/exec)
 	// and Windows (CreateProcess); only Emscripten lacks a child-process transport.
 #if !VGI_SUBPROCESS_TRANSPORT
-	throw InvalidInputException(
-	    "vgi: subprocess (bare command) LOCATIONs require a child-process transport "
+	throw InvalidInputException("vgi: subprocess (bare command) LOCATIONs require a child-process transport "
 	    "not available in this build (worker_path=%s); use http://… instead",
 	    worker_path);
 #else
@@ -2010,27 +1979,24 @@ std::unique_ptr<IFunctionConnection> CreateFunctionConnection(
 		implementation_version = attach_params->implementation_version();
 	}
 	return std::make_unique<FunctionConnection>(
-	    worker_path, function_name, arguments, attach_opaque_data, transaction_opaque_data, context,
-	    function_type, global_execution_id, worker_debug, settings, required_secrets,
-	    data_version_spec, implementation_version);
+	    worker_path, function_name, arguments, attach_opaque_data, transaction_opaque_data, context, function_type,
+	    global_execution_id, worker_debug, settings, required_secrets, data_version_spec, implementation_version);
 #endif
 }
 
-std::unique_ptr<IFunctionConnection> CreateFunctionConnectionFromPool(
-    std::unique_ptr<PooledWorker> pooled_worker, const std::string &function_name,
+std::unique_ptr<IFunctionConnection>
+CreateFunctionConnectionFromPool(std::unique_ptr<PooledWorker> pooled_worker, const std::string &function_name,
     const ArrowArguments &arguments, const std::vector<uint8_t> &attach_opaque_data,
-    const std::vector<uint8_t> &transaction_opaque_data,
-    ClientContext &context, const std::string &function_type,
-    const std::vector<uint8_t> &global_execution_id,
-    bool worker_debug,
-    const std::map<std::string, Value> &settings,
+                                 const std::vector<uint8_t> &transaction_opaque_data, ClientContext &context,
+                                 const std::string &function_type, const std::vector<uint8_t> &global_execution_id,
+                                 bool worker_debug, const std::map<std::string, Value> &settings,
     const std::vector<VgiSecretRequirement> &required_secrets) {
 	// Only subprocess connections use the pool. The pool is empty on builds
 	// without a child-process transport (Emscripten), so this is never reached there.
 #if VGI_SUBPROCESS_TRANSPORT
-	return std::make_unique<FunctionConnection>(
-	    std::move(pooled_worker), function_name, arguments, attach_opaque_data, transaction_opaque_data, context,
-	    function_type, global_execution_id, worker_debug, settings, required_secrets);
+	return std::make_unique<FunctionConnection>(std::move(pooled_worker), function_name, arguments, attach_opaque_data,
+	                                            transaction_opaque_data, context, function_type, global_execution_id,
+	                                            worker_debug, settings, required_secrets);
 #else
 	throw InvalidInputException("vgi: subprocess transport unavailable in this build");
 #endif

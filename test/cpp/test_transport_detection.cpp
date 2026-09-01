@@ -11,28 +11,31 @@
 
 #include <stdexcept>
 
+using duckdb::vgi::CanonicalizeBrowserWorkerTarget;
+using duckdb::vgi::CanonicalizeHttpiLocation;
+using duckdb::vgi::CanonicalizeIrohLocation;
 using duckdb::vgi::DetectTransport;
-using duckdb::vgi::IsDatabaseLocation;
-using duckdb::vgi::IsResolvedWorkerLocation;
 using duckdb::vgi::IsContainerLocation;
 using duckdb::vgi::IsContainerSharedLocation;
+using duckdb::vgi::IsDatabaseLocation;
+using duckdb::vgi::IsGithubAutoLocation;
+using duckdb::vgi::IsGithubLocation;
+using duckdb::vgi::IsHttpiTransport;
 using duckdb::vgi::IsHttpTransport;
 using duckdb::vgi::IsIrohTransport;
 using duckdb::vgi::IsLaunchLocation;
+using duckdb::vgi::IsResolvedWorkerLocation;
 using duckdb::vgi::IsTcpTransport;
 using duckdb::vgi::IsUnixLocation;
-using duckdb::vgi::IsGithubAutoLocation;
-using duckdb::vgi::IsGithubLocation;
+using duckdb::vgi::IsWebWorkerTransport;
+using duckdb::vgi::ParseHttpiUrl;
+using duckdb::vgi::ParseTcpLocation;
 using duckdb::vgi::StripContainerScheme;
 using duckdb::vgi::StripGithubAutoScheme;
 using duckdb::vgi::StripGithubScheme;
 using duckdb::vgi::StripLaunchScheme;
 using duckdb::vgi::StripUnixScheme;
 using duckdb::vgi::StripWebWorkerScheme;
-using duckdb::vgi::CanonicalizeBrowserWorkerTarget;
-using duckdb::vgi::CanonicalizeIrohLocation;
-using duckdb::vgi::IsWebWorkerTransport;
-using duckdb::vgi::ParseTcpLocation;
 using duckdb::vgi::TransportType;
 
 TEST_CASE("DetectTransport routes each scheme correctly", "[transport]") {
@@ -49,14 +52,35 @@ TEST_CASE("DetectTransport routes each scheme correctly", "[transport]") {
 	CHECK(DetectTransport("worker:example") == TransportType::WEBWORKER);
 	CHECK(DetectTransport("iroh://0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef") ==
 	      TransportType::IROH);
-	CHECK(DetectTransport("database://memory/main/workers/example?package_version=1") ==
-	      TransportType::DATABASE);
+	CHECK(DetectTransport("httpi://0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef/vgi") ==
+	      TransportType::HTTPI);
+	CHECK(DetectTransport("database://memory/main/workers/example?package_version=1") == TransportType::DATABASE);
 	CHECK(DetectTransport("/path/to/worker") == TransportType::SUBPROCESS);
 	CHECK(DetectTransport("/path/with launch: in middle") == TransportType::SUBPROCESS);
 	CHECK(DetectTransport("") == TransportType::SUBPROCESS);
 	CHECK(IsDatabaseLocation("DATABASE://memory/main/packages/worker?package_version=1"));
 	CHECK_FALSE(IsDatabaseLocation("/database://not-a-scheme"));
 	CHECK(IsResolvedWorkerLocation("vgi-artifact:012345"));
+}
+
+TEST_CASE("httpi locations preserve a strict canonical base path", "[transport]") {
+	const std::string endpoint = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+	CHECK(IsHttpiTransport("HTTPI://" + endpoint));
+	CHECK(CanonicalizeHttpiLocation("HTTPI://" + endpoint + "/vgi/") == "httpi://" + endpoint + "/vgi");
+	auto parsed = ParseHttpiUrl("httpi://" + endpoint + "/api/v1/catalog_attach");
+	CHECK(parsed.endpoint_id == endpoint);
+	CHECK(parsed.path == "/api/v1/catalog_attach");
+	CHECK(ParseHttpiUrl("httpi://" + endpoint).path.empty());
+
+	CHECK_THROWS_AS(ParseHttpiUrl("httpi://" + endpoint.substr(1)), std::invalid_argument);
+	CHECK_THROWS_AS(ParseHttpiUrl("httpi://" + std::string(64, 'A')), std::invalid_argument);
+	CHECK_THROWS_AS(ParseHttpiUrl("httpi://" + endpoint + "relative"), std::invalid_argument);
+	CHECK_THROWS_AS(ParseHttpiUrl("httpi://" + endpoint + "/a//b"), std::invalid_argument);
+	CHECK_THROWS_AS(ParseHttpiUrl("httpi://" + endpoint + "/a/../b"), std::invalid_argument);
+	CHECK_THROWS_AS(ParseHttpiUrl("httpi://" + endpoint + "/a%2fb"), std::invalid_argument);
+	CHECK_THROWS_AS(ParseHttpiUrl("httpi://" + endpoint + "/a?x=1"), std::invalid_argument);
+	CHECK_THROWS_AS(ParseHttpiUrl("httpi://" + endpoint + "/a#fragment"), std::invalid_argument);
+	CHECK_THROWS_AS(ParseHttpiUrl("httpi://" + endpoint + "/has space"), std::invalid_argument);
 }
 
 TEST_CASE("iroh locations are strict canonical browser targets", "[transport]") {
@@ -158,12 +182,8 @@ TEST_CASE("Scheme predicates are mutually exclusive", "[transport]") {
 		bool launch;
 		bool unix_;
 	} cases[] = {
-	    {"http://x", true, false, false},
-	    {"https://x", true, false, false},
-	    {"launch:foo", false, true, false},
-	    {"unix:///x", false, false, true},
-	    {"/some/path", false, false, false},
-	    {"", false, false, false},
+	    {"http://x", true, false, false},  {"https://x", true, false, false},   {"launch:foo", false, true, false},
+	    {"unix:///x", false, false, true}, {"/some/path", false, false, false}, {"", false, false, false},
 	};
 	for (const auto &c : cases) {
 		INFO("location: " << c.loc);

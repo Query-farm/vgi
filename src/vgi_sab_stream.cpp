@@ -16,8 +16,9 @@ void VgiSabEnsureChannelOnRealm(int region_offset);
 
 // ---- SabInputStream ---------------------------------------------------------
 
-SabInputStream::SabInputStream(int region_offset, int slot, ClientContext *context)
-    : slot_(slot), region_offset_(region_offset), position_(0), is_open_(true), context_(context) {
+SabInputStream::SabInputStream(int region_offset, int slot, ClientContext *context,
+                               std::optional<std::chrono::steady_clock::time_point> deadline)
+    : slot_(slot), region_offset_(region_offset), position_(0), is_open_(true), context_(context), deadline_(deadline) {
 }
 
 SabInputStream::~SabInputStream() = default;
@@ -58,6 +59,9 @@ arrow::Result<int64_t> SabInputStream::Read(int64_t nbytes, void *out) {
 			// engine. Mirrors the subprocess WaitForReadableUntilCancel poll.
 			if (context_ && context_->interrupted) {
 				return arrow::Status::IOError("SabInputStream: read interrupted (query cancelled)");
+			}
+			if (deadline_ && std::chrono::steady_clock::now() >= *deadline_) {
+				return arrow::Status::IOError("SabInputStream: read timed out");
 			}
 			continue;
 		}

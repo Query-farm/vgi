@@ -131,8 +131,7 @@ UnaryResponseResult AttemptUnaryRpc(const UnaryRpcOptions &opts, const std::stri
 				lf.worker_pid = released_pid;
 				lf.method_name = method_name;
 				lf.phase = opts.phase;
-				LogWorkerPoolRelease(opts.context, lf, rr.pooled, rr.skip_reason, rr.pool_size,
-				                     rr.total_pool_size);
+				LogWorkerPoolRelease(opts.context, lf, rr.pooled, rr.skip_reason, rr.pool_size, rr.total_pool_size);
 			}
 		}
 	}
@@ -162,13 +161,11 @@ UnaryResponseResult InvokePooledUnaryRpc(const UnaryRpcOptions &opts, const std:
 		if (opts.server_caps) {
 			caps = opts.server_caps->Load();
 		}
-		auto result = HttpInvokeUnary(opts.context, opts.worker_path, method_name, params, opts.auth,
-		                              opts.cookie_jar, opts.cached_http_params,
+		auto result = HttpInvokeUnary(
+		    opts.context, opts.worker_path, method_name, params, opts.auth, opts.cookie_jar, opts.cached_http_params,
 		                              /*invocation_id_hex=*/"", /*attach_opaque_data_hex=*/"",
-		                              /*transaction_opaque_data_hex=*/"", /*conn_id_hex=*/"",
-		                              opts.protocol_version_override.value_or(""),
-		                              opts.http_client_pool ? &pooled : nullptr,
-		                              opts.server_caps ? &caps : nullptr);
+		    /*transaction_opaque_data_hex=*/"", /*conn_id_hex=*/"", opts.protocol_version_override.value_or(""),
+		    opts.http_client_pool ? &pooled : nullptr, opts.server_caps ? &caps : nullptr);
 		if (opts.server_caps) {
 			opts.server_caps->Store(caps);
 		}
@@ -176,6 +173,16 @@ UnaryResponseResult InvokePooledUnaryRpc(const UnaryRpcOptions &opts, const std:
 			opts.http_client_pool->Return(std::move(pooled));
 		}
 		return result;
+	}
+	if (IsHttpiTransport(opts.worker_path)) {
+#if defined(__EMSCRIPTEN__)
+		return HttpInvokeUnary(opts.context, CanonicalizeHttpiLocation(opts.worker_path), method_name, params,
+		                       opts.auth, opts.cookie_jar, opts.cached_http_params, "", "", "", "",
+		                       opts.protocol_version_override.value_or(""), nullptr, opts.server_caps);
+#else
+		throw IOException("vgi: httpi:// transport is only available in DuckDB-WASM with an "
+		                  "application-owned Iroh adapter Worker");
+#endif
 	}
 
 #if defined(__EMSCRIPTEN__)
@@ -215,8 +222,8 @@ UnaryResponseResult InvokePooledUnaryRpc(const UnaryRpcOptions &opts, const std:
 			try {
 				auto ep = EnsureSharedContainer(shared_spec, shared_mode);
 				if (ep.mode == ContainerConnMode::HTTP) {
-					return HttpInvokeUnary(opts.context, ep.url, method_name, params, opts.auth,
-					                        opts.cookie_jar, /*cached_http_params=*/nullptr, "", "", "", "",
+					return HttpInvokeUnary(opts.context, ep.url, method_name, params, opts.auth, opts.cookie_jar,
+					                       /*cached_http_params=*/nullptr, "", "", "", "",
 					                        opts.protocol_version_override.value_or(""));
 				}
 				// tcp (and, later, unix): native vgi-rpc over the connected fd.
@@ -342,8 +349,7 @@ UnaryResponseResult InvokePooledUnaryRpc(const UnaryRpcOptions &opts, const std:
 		auto *log_ctx = opts.enable_logging ? &opts.context : nullptr;
 		return ReadUnaryResponse(worker.GetStdoutFd(), log_ctx, opts.worker_path, /*pid=*/-1);
 #else
-		throw InvalidInputException(
-		    "vgi: launch:/unix:// LOCATION schemes are not available in this build "
+		throw InvalidInputException("vgi: launch:/unix:// LOCATION schemes are not available in this build "
 		    "(worker_path=%s); use http://… instead",
 		    opts.worker_path);
 #endif
@@ -352,8 +358,7 @@ UnaryResponseResult InvokePooledUnaryRpc(const UnaryRpcOptions &opts, const std:
 	// Bare-command path → subprocess transport (POSIX fork/exec or Windows
 	// CreateProcess); only Emscripten lacks it.
 #if !VGI_SUBPROCESS_TRANSPORT
-	throw InvalidInputException(
-	    "vgi: subprocess (bare command) LOCATIONs require a child-process transport "
+	throw InvalidInputException("vgi: subprocess (bare command) LOCATIONs require a child-process transport "
 	    "not available in this build (worker_path=%s); use http://… instead",
 	    opts.worker_path);
 #else

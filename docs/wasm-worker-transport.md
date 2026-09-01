@@ -1,4 +1,4 @@
-# In-browser `worker:` and `iroh://` (SAB) transports
+# In-browser `worker:`, `iroh://`, and `httpi://` transports
 
 Run a VGI worker **entirely in the browser** — in a Web Worker, exchanging Arrow batches with
 the DuckDB-WASM extension over a **SharedArrayBuffer duplex-ring channel** — with **no server**.
@@ -27,6 +27,23 @@ only in DuckDB-WASM and only after the host application supplies one Iroh adapte
 Haybarn bridge. Every remote target receives its own SAB region, while that one adapter keeps
 one local Iroh endpoint identity and multiplexes the regions. Native VGI rejects `iroh://`
 explicitly; use the native Iroh transport adapter outside the browser instead.
+
+HTTP over Iroh keeps the mature HTTP client state machine and changes only how
+the request reaches the server:
+
+```sql
+ATTACH 'httpi://0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef/vgi'
+  AS remote_http (TYPE vgi);
+```
+
+`httpi://` supports an optional strict base path. OAuth/bearer challenges,
+Secure cookies, compression negotiation, continuation batches, and HTTP status
+handling remain in `HttpFunctionConnection`. Ordered duplicate headers and raw
+response bytes cross a binary SAB envelope; the shared application adapter calls
+browser Iroh `fetchHttpi`. Transport failures carry stage, stable category, and
+dispatch certainty. An ambiguous POST is never replayed. External-location
+pointers must remain `https://`; `httpi://` external locations are rejected.
+Native builds reject this scheme explicitly.
 
 ## How it works (one paragraph)
 

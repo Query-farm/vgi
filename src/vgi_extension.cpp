@@ -2082,9 +2082,9 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	// worker script; `iroh://` names a remote EndpointId that the page bridge maps
 	// to its one application-owned Iroh adapter Worker.
 	if (!vgi::IsHttpTransport(worker_path) && !vgi::IsWebWorkerTransport(worker_path) &&
-	    !vgi::IsIrohTransport(worker_path)) {
+	    !vgi::IsIrohTransport(worker_path) && !vgi::IsHttpiTransport(worker_path)) {
 		throw BinderException("VGI in WASM only supports HTTP ('http[s]://') or "
-		                      "browser SAB ('worker:' or 'iroh://') transports.");
+		                      "browser SAB ('worker:', 'iroh://', or 'httpi://') transports.");
 	}
 	use_pool = false;
 	// HTTP in WASM goes through duckdb-wasm's XHR layer, not httpfs; worker: pools
@@ -2108,17 +2108,17 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	// Create per-catalog auth state
 	std::shared_ptr<vgi::CatalogAuth> auth;
 	if (!bearer_token.empty()) {
-		if (!vgi::IsHttpTransport(worker_path)) {
+		if (!vgi::IsHttpTransport(worker_path) && !vgi::IsHttpiTransport(worker_path)) {
 			throw BinderException("bearer_token is only valid for HTTP transport "
-			                      "(LOCATION must be an HTTP/HTTPS URL)");
+			                      "(LOCATION must be an HTTP/HTTPS or httpi:// URL)");
 		}
 		auth = std::make_shared<vgi::BearerTokenCatalogAuth>(bearer_token);
 	} else {
 		auto oauth_auth = std::make_shared<vgi::OAuthCatalogAuth>();
 		if (!oauth_refresh_token.empty()) {
-			if (!vgi::IsHttpTransport(worker_path)) {
+			if (!vgi::IsHttpTransport(worker_path) && !vgi::IsHttpiTransport(worker_path)) {
 				throw BinderException("oauth_refresh_token is only valid for HTTP transport "
-				                      "(LOCATION must be an HTTP/HTTPS URL)");
+				                      "(LOCATION must be an HTTP/HTTPS or httpi:// URL)");
 			}
 			oauth_auth->SeedRefreshToken(oauth_refresh_token);
 		}
@@ -2131,7 +2131,7 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 		tele.auth_mode = "bearer";
 	} else if (!oauth_refresh_token.empty()) {
 		tele.auth_mode = "oauth_refresh_token";
-	} else if (vgi::IsHttpTransport(worker_path)) {
+	} else if (vgi::IsHttpTransport(worker_path) || vgi::IsHttpiTransport(worker_path)) {
 		tele.auth_mode = "oauth";
 	} else {
 		tele.auth_mode = "none";

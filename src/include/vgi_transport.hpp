@@ -26,7 +26,9 @@ namespace vgi {
 // IROH       — iroh://<EndpointId>; browser-only routing target for an
 //              application-owned Iroh adapter Web Worker. It uses the same SAB
 //              byte pump as WEBWORKER but never names a worker script.
-enum class TransportType { SUBPROCESS, HTTP, UNIX, LAUNCH, CONTAINER, TCP, WEBWORKER, IROH, DATABASE };
+// HTTPI      — httpi://<EndpointId>[/base/path]; the ordinary VGI HTTP state
+//              machine with only its HTTP backend delegated to that adapter.
+enum class TransportType { SUBPROCESS, HTTP, UNIX, LAUNCH, CONTAINER, TCP, WEBWORKER, IROH, HTTPI, DATABASE };
 
 // Detect what kind of worker location this string represents.  Pure on
 // inputs — no I/O, no ambient state.
@@ -60,6 +62,21 @@ bool IsWebWorkerTransport(const std::string &worker_path);
 // lowercase-scheme location.
 bool IsIrohTransport(const std::string &worker_path);
 std::string CanonicalizeIrohLocation(const std::string &location);
+
+// Browser HTTP-over-Iroh target. The EndpointId is strict lowercase hex. The
+// optional base path is absolute, contains no query/fragment/backslash/control
+// characters or dot segments, and is canonicalized without a trailing slash.
+bool IsHttpiTransport(const std::string &worker_path);
+std::string CanonicalizeHttpiLocation(const std::string &location);
+
+struct HttpiUrlParts {
+	std::string endpoint_id;
+	std::string path;
+};
+
+// Parse either a base LOCATION or the per-method URL derived from it. `path` is
+// empty for a bare endpoint and otherwise begins with '/'.
+HttpiUrlParts ParseHttpiUrl(const std::string &location);
 
 // Return the canonical target identifier handed to the page bridge: worker:
 // locations lose their legacy prefix; iroh:// locations remain full canonical

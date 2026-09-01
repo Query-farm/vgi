@@ -19,6 +19,7 @@
 #include "generated/vgi_request_builders.hpp"
 #include "vgi_exception.hpp"
 #include "vgi_logging.hpp"
+#include "vgi_httpi.hpp"
 #include "vgi_rpc_client.hpp"
 #include "vgi_rpc_types.hpp"
 #include "vgi_sab_abi.hpp"
@@ -27,11 +28,16 @@
 #include "vgi_table_buffering_builders.hpp"
 #include "vgi_transport.hpp"
 
+#include <algorithm>
 #include <atomic>
+#include <cctype>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
 #include <map>
 #include <mutex>
+#include <optional>
 
 namespace duckdb {
 namespace vgi {
@@ -77,8 +83,7 @@ bool SabDispatchBatch(const std::shared_ptr<arrow::RecordBatch> &batch,
 // SAB analog of ReadUnaryResponse: open a reader on the worker->client ring,
 // dispatch log/error until the first data batch, then drain to EOS.
 UnaryResponseResult SabReadUnaryResponse(int region_offset, int slot, ClientContext *context,
-                                         const std::string &worker_path,
-                                         const std::string &invocation_id_hex = "",
+                                         const std::string &worker_path, const std::string &invocation_id_hex = "",
                                          const std::string &attach_opaque_data_hex = "",
                                          const std::string &transaction_opaque_data_hex = "",
                                          const std::string &conn_id_hex = "") {
@@ -258,7 +263,8 @@ void VgiSabEnsureChannelOnRealm(int region_offset) {
 	vgi_wasm_set_channel(region_offset);
 }
 #else
-void VgiSabEnsureChannelOnRealm(int) {}
+void VgiSabEnsureChannelOnRealm(int) {
+}
 #endif
 
 // Standalone unary RPC over the `worker:` SAB transport, for catalog RPCs (ATTACH
@@ -320,11 +326,10 @@ WebWorkerFunctionConnection::WebWorkerFunctionConnection(
     ClientContext &context, const std::string &function_type, const std::vector<uint8_t> &global_execution_id,
     const std::map<std::string, Value> &settings, const std::vector<VgiSecretRequirement> &required_secrets)
     : conn_id_hex_(VgiGenerateConnId()), location_(CanonicalizeBrowserWorkerTarget(location)),
-      function_name_(function_name),
-      function_type_(function_type), arguments_type_(arguments.type), arguments_array_(arguments.array),
-      attach_opaque_data_(attach_opaque_data), transaction_opaque_data_(transaction_opaque_data),
-      global_execution_id_(global_execution_id), context_(context), settings_(settings),
-      required_secrets_(required_secrets) {
+      function_name_(function_name), function_type_(function_type), arguments_type_(arguments.type),
+      arguments_array_(arguments.array), attach_opaque_data_(attach_opaque_data),
+      transaction_opaque_data_(transaction_opaque_data), global_execution_id_(global_execution_id), context_(context),
+      settings_(settings), required_secrets_(required_secrets) {
 }
 
 WebWorkerFunctionConnection::~WebWorkerFunctionConnection() {
@@ -439,6 +444,241 @@ int EnsureVgiSabRegion(const std::string &canonical_target) {
 } // namespace
 #endif
 
+#if defined(__EMSCRIPTEN__)
+namespace httpi {
+namespace {
+
+void AppendU16(std::vector<uint8_t> &out, uint16_t value) {
+	out.push_back(static_cast<uint8_t>(value));
+	out.push_back(static_cast<uint8_t>(value >> 8));
+}
+
+void AppendU32(std::vector<uint8_t> &out, uint32_t value) {
+	for (int shift = 0; shift < 32; shift += 8) {
+		out.push_back(static_cast<uint8_t>(value >> shift));
+	}
+}
+
+void AppendBytes(std::vector<uint8_t> &out, const std::string &value) {
+	out.insert(out.end(), value.begin(), value.end());
+}
+
+void WriteAll(SabOutputStream &out, const uint8_t *data, size_t size, const std::string &url) {
+	auto status = out.Write(data, static_cast<int64_t>(size));
+	if (!status.ok()) {
+		throw IOException("VGI HTTPI request write failed: %s [url: %s]", status.ToString(), url);
+	}
+}
+
+void ReadExact(SabInputStream &in, void *data, size_t size, const std::string &url) {
+	auto result = in.Read(static_cast<int64_t>(size), data);
+	if (!result.ok()) {
+		throw IOException("VGI HTTPI response read failed: %s [url: %s]", result.status().ToString(), url);
+	}
+	if (static_cast<size_t>(*result) != size) {
+		throw IOException("VGI HTTPI response ended early (wanted %llu bytes, got %llu) [url: %s]",
+		                  static_cast<unsigned long long>(size), static_cast<unsigned long long>(*result), url);
+	}
+}
+
+uint16_t ReadU16(SabInputStream &in, const std::string &url) {
+	uint8_t bytes[2];
+	ReadExact(in, bytes, sizeof(bytes), url);
+	return static_cast<uint16_t>(bytes[0]) | (static_cast<uint16_t>(bytes[1]) << 8);
+}
+
+uint32_t ReadU32(SabInputStream &in, const std::string &url) {
+	uint8_t bytes[4];
+	ReadExact(in, bytes, sizeof(bytes), url);
+	return static_cast<uint32_t>(bytes[0]) | (static_cast<uint32_t>(bytes[1]) << 8) |
+	       (static_cast<uint32_t>(bytes[2]) << 16) | (static_cast<uint32_t>(bytes[3]) << 24);
+}
+
+std::string ReadString(SabInputStream &in, uint32_t size, const std::string &url) {
+	std::string result(size, '\0');
+	if (size > 0) {
+		ReadExact(in, result.data(), size, url);
+	}
+	return result;
+}
+
+bool ValidHeaderName(const std::string &name) {
+	if (name.empty())
+		return false;
+	for (unsigned char c : name) {
+		const bool alnum = std::isalnum(c);
+		const bool token = c == '!' || c == '#' || c == '$' || c == '%' || c == '&' || c == '\'' || c == '*' ||
+		                   c == '+' || c == '-' || c == '.' || c == '^' || c == '_' || c == '`' || c == '|' || c == '~';
+		if (!alnum && !token)
+			return false;
+	}
+	return true;
+}
+
+bool ValidHeaderValue(const std::string &value) {
+	return std::none_of(value.begin(), value.end(),
+	                    [](unsigned char c) { return (c < 0x20 && c != '\t') || c == 0x7f; });
+}
+
+} // namespace
+
+Response BrowserPost(ClientContext &context, const std::string &url, const std::vector<Header> &headers,
+                     const uint8_t *body, size_t body_size, uint64_t timeout_seconds) {
+	auto parsed = ParseHttpiUrl(url);
+	const std::string target = "httpi://" + parsed.endpoint_id;
+	const std::string path = parsed.path.empty() ? "/" : parsed.path;
+	if (headers.size() > kMaxHeaders || path.size() > UINT32_MAX || body_size > INT64_MAX) {
+		throw IOException("VGI HTTPI request exceeds envelope limits [url: %s]", url);
+	}
+	size_t header_bytes = 0;
+	for (const auto &header : headers) {
+		header_bytes += header.name.size() + header.value.size();
+		if (header.name.size() > UINT32_MAX || header.value.size() > UINT32_MAX || header_bytes > kMaxHeaderBytes) {
+			throw IOException("VGI HTTPI request headers exceed envelope limits [url: %s]", url);
+		}
+	}
+
+	const int region_offset = EnsureVgiSabRegion(target);
+	vgi_wasm_set_channel(region_offset);
+	if (vgi_wasm_ensure_worker(target.c_str(), region_offset) != 0) {
+		throw IOException("VGI HTTPI adapter rejected target before dispatch [url: %s]", url);
+	}
+	int slot = vgi_wasm_slot_open(target.c_str(), region_offset);
+	if (slot < 0) {
+		throw IOException("VGI HTTPI adapter has no available SAB slot [url: %s]", url);
+	}
+	struct SlotReleaser {
+		int region_offset;
+		int slot;
+		~SlotReleaser() {
+			if (slot >= 0)
+				vgi_wasm_slot_release(region_offset, slot);
+		}
+	} releaser {region_offset, slot};
+
+	std::vector<uint8_t> request;
+	request.reserve(32 + path.size() + header_bytes);
+	request.insert(request.end(), std::begin(kMagic), std::end(kMagic));
+	request.push_back(kVersion);
+	request.push_back(kRequest);
+	AppendU16(request, 0);
+	AppendU16(request, 4); // POST
+	AppendU16(request, 0);
+	AppendU32(request, static_cast<uint32_t>(path.size()));
+	AppendU32(request, static_cast<uint32_t>(headers.size()));
+	AppendBytes(request, "POST");
+	AppendBytes(request, path);
+	for (const auto &header : headers) {
+		AppendU32(request, static_cast<uint32_t>(header.name.size()));
+		AppendU32(request, static_cast<uint32_t>(header.value.size()));
+		AppendBytes(request, header.name);
+		AppendBytes(request, header.value);
+	}
+	SabOutputStream output(region_offset, slot);
+	WriteAll(output, request.data(), request.size(), url);
+	for (size_t offset = 0; offset < body_size;) {
+		const size_t length = std::min(kChunkBytes, body_size - offset);
+		uint8_t frame[8] = {kBodyChunk,
+		                    0,
+		                    0,
+		                    0,
+		                    static_cast<uint8_t>(length),
+		                    static_cast<uint8_t>(length >> 8),
+		                    static_cast<uint8_t>(length >> 16),
+		                    static_cast<uint8_t>(length >> 24)};
+		WriteAll(output, frame, sizeof(frame), url);
+		WriteAll(output, body + offset, length, url);
+		offset += length;
+	}
+	const uint8_t end_frame[8] = {kBodyEnd, 0, 0, 0, 0, 0, 0, 0};
+	WriteAll(output, end_frame, sizeof(end_frame), url);
+	vgi_wasm_slot_write_eos(region_offset, slot);
+
+	std::optional<std::chrono::steady_clock::time_point> deadline;
+	if (timeout_seconds > 0) {
+		deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout_seconds);
+	}
+	SabInputStream input(region_offset, slot, &context, deadline);
+	uint8_t prefix[8];
+	ReadExact(input, prefix, sizeof(prefix), url);
+	if (!std::equal(std::begin(kMagic), std::end(kMagic), prefix) || prefix[4] != kVersion || prefix[5] != kResponse) {
+		throw IOException("VGI HTTPI adapter returned an invalid response envelope [url: %s]", url);
+	}
+	const uint16_t flags = static_cast<uint16_t>(prefix[6]) | (static_cast<uint16_t>(prefix[7]) << 8);
+	if ((flags & kRawRepresentation) == 0) {
+		throw IOException("VGI HTTPI adapter did not mark response bytes as raw representation [url: %s]", url);
+	}
+	Response response;
+	response.raw_representation = true;
+	response.status = ReadU16(input, url);
+	if (response.status < 100 || response.status > 999) {
+		throw IOException("VGI HTTPI adapter returned an invalid HTTP status [url: %s]", url);
+	}
+	(void)ReadU16(input, url);
+	const uint32_t header_count = ReadU32(input, url);
+	if (header_count > kMaxHeaders) {
+		throw IOException("VGI HTTPI response has too many headers [url: %s]", url);
+	}
+	header_bytes = 0;
+	response.headers.reserve(header_count);
+	for (uint32_t i = 0; i < header_count; ++i) {
+		const uint32_t name_size = ReadU32(input, url);
+		const uint32_t value_size = ReadU32(input, url);
+		header_bytes += static_cast<size_t>(name_size) + value_size;
+		if (header_bytes > kMaxHeaderBytes) {
+			throw IOException("VGI HTTPI response headers exceed envelope limits [url: %s]", url);
+		}
+		auto name = ReadString(input, name_size, url);
+		auto value = ReadString(input, value_size, url);
+		if (!ValidHeaderName(name) || !ValidHeaderValue(value)) {
+			throw IOException("VGI HTTPI adapter returned an invalid response header [url: %s]", url);
+		}
+		response.headers.push_back({std::move(name), std::move(value)});
+	}
+	for (;;) {
+		uint8_t frame[8];
+		ReadExact(input, frame, sizeof(frame), url);
+		const uint32_t length = static_cast<uint32_t>(frame[4]) | (static_cast<uint32_t>(frame[5]) << 8) |
+		                        (static_cast<uint32_t>(frame[6]) << 16) | (static_cast<uint32_t>(frame[7]) << 24);
+		if (frame[0] == kBodyChunk) {
+			if (length > kChunkBytes) {
+				throw IOException("VGI HTTPI response chunk exceeds envelope limit [url: %s]", url);
+			}
+			if (response.body.size() > kMaxBufferedBodyBytes - length) {
+				throw IOException("VGI HTTPI response exceeds the 1 GiB buffered-body limit [url: %s]", url);
+			}
+			auto chunk = ReadString(input, length, url);
+			response.body.append(chunk);
+			continue;
+		}
+		if (frame[0] == kBodyEnd && length == 0) {
+			break;
+		}
+		if (frame[0] == kBodyTerminal && length <= kMaxTerminalDetailBytes) {
+			auto detail = ReadString(input, length, url);
+			auto stage = static_cast<Stage>(frame[1]);
+			auto category = static_cast<Category>(frame[2]);
+			auto certainty = static_cast<DispatchCertainty>(frame[3]);
+			if (frame[1] < static_cast<uint8_t>(Stage::PARSE) ||
+			    frame[1] > static_cast<uint8_t>(Stage::RESPONSE_BODY) ||
+			    frame[2] < static_cast<uint8_t>(Category::INVALID_REQUEST) ||
+			    frame[2] > static_cast<uint8_t>(Category::INTERNAL) ||
+			    frame[3] < static_cast<uint8_t>(DispatchCertainty::NOT_DISPATCHED) ||
+			    frame[3] > static_cast<uint8_t>(DispatchCertainty::AMBIGUOUS)) {
+				throw IOException("VGI HTTPI adapter returned invalid terminal evidence [url: %s]", url);
+			}
+			throw IOException("VGI HTTPI transport failed stage=%s category=%s dispatch=%s detail=%s; "
+			                  "ambiguous requests are never replayed [url: %s]",
+			                  StageName(stage), CategoryName(category), CertaintyName(certainty), detail, url);
+		}
+		throw IOException("VGI HTTPI adapter returned an invalid body frame [url: %s]", url);
+	}
+	return response;
+}
+
+} // namespace httpi
+#endif
+
 void WebWorkerFunctionConnection::EnsureWorkerSpawned() {
 	// Lazy slot open (analog of the subprocess lazy fork/exec). The JS bridge
 	// already ensured the Web Worker exists at attach time (vgi_wasm_ensure_worker);
@@ -506,11 +746,10 @@ BindResult WebWorkerFunctionConnection::PerformBindRpc() {
 		return bind_batch;
 	};
 
-	auto bind_result = PerformBindProtocol(context_, function_name_, function_type_, arguments_array_, input_schema_,
-	                                       attach_opaque_data_, transaction_opaque_data_, settings_, required_secrets_,
-	                                       location_, transport_fn, at_unit_, at_value_,
-	                                       copy_from_ ? &*copy_from_ : nullptr, copy_to_ ? &*copy_to_ : nullptr,
-	                                       schema_name_);
+	auto bind_result = PerformBindProtocol(
+	    context_, function_name_, function_type_, arguments_array_, input_schema_, attach_opaque_data_,
+	    transaction_opaque_data_, settings_, required_secrets_, location_, transport_fn, at_unit_, at_value_,
+	    copy_from_ ? &*copy_from_ : nullptr, copy_to_ ? &*copy_to_ : nullptr, schema_name_);
 
 	{
 		auto fields = BuildConnLogFields(*this);
@@ -522,19 +761,15 @@ BindResult WebWorkerFunctionConnection::PerformBindRpc() {
 	return bind_result;
 }
 
-InitResult WebWorkerFunctionConnection::PerformInit(const BindResult &bind_result,
-                                                    const std::vector<int32_t> &projection_ids,
-                                                    std::shared_ptr<arrow::Buffer> pushdown_filters,
-                                                    std::vector<std::shared_ptr<arrow::Buffer>> join_keys,
-                                                    const std::string &phase,
-                                                    const std::optional<OrderByHint> &order_by,
-                                                    const std::optional<TableSampleHint> &table_sample,
-                                                    const std::vector<uint8_t> &init_opaque_data,
-                                                    const std::optional<std::vector<uint8_t>> &finalize_state_id,
-                                           const std::vector<std::string> &split_tokens) {
+InitResult WebWorkerFunctionConnection::PerformInit(
+    const BindResult &bind_result, const std::vector<int32_t> &projection_ids,
+    std::shared_ptr<arrow::Buffer> pushdown_filters, std::vector<std::shared_ptr<arrow::Buffer>> join_keys,
+    const std::string &phase, const std::optional<OrderByHint> &order_by,
+    const std::optional<TableSampleHint> &table_sample, const std::vector<uint8_t> &init_opaque_data,
+    const std::optional<std::vector<uint8_t>> &finalize_state_id, const std::vector<std::string> &split_tokens) {
 	if (slot_ < 0) {
-		ThrowVgiIOException("WebWorkerFunctionConnection::PerformInit called before EnsureWorkerSpawned", location_,
-		                    -1, GetExecutionIdHex());
+		ThrowVgiIOException("WebWorkerFunctionConnection::PerformInit called before EnsureWorkerSpawned", location_, -1,
+		                    GetExecutionIdHex());
 	}
 	if (init_done_) {
 		ThrowVgiIOException("WebWorkerFunctionConnection::PerformInit called twice", location_, -1,
@@ -613,8 +848,7 @@ InitResult WebWorkerFunctionConnection::PerformInit(const BindResult &bind_resul
 
 		// Send the first tick immediately. Conditional-revalidation validators
 		// (M6) ride the FIRST tick's custom_metadata.
-		auto tick_batch =
-		    arrow::RecordBatch::Make(tick_schema_, 0, std::vector<std::shared_ptr<arrow::Array>>{});
+		auto tick_batch = arrow::RecordBatch::Make(tick_schema_, 0, std::vector<std::shared_ptr<arrow::Array>> {});
 		std::shared_ptr<const arrow::KeyValueMetadata> first_tick_metadata;
 		if (!cond_if_none_match_.empty() || !cond_if_modified_since_.empty()) {
 			std::vector<std::string> keys, vals;
@@ -628,8 +862,7 @@ InitResult WebWorkerFunctionConnection::PerformInit(const BindResult &bind_resul
 			}
 			first_tick_metadata = arrow::KeyValueMetadata::Make(std::move(keys), std::move(vals));
 		}
-		auto write_status = first_tick_metadata
-		                        ? input_writer_->WriteRecordBatch(*tick_batch, first_tick_metadata)
+		auto write_status = first_tick_metadata ? input_writer_->WriteRecordBatch(*tick_batch, first_tick_metadata)
 		                        : input_writer_->WriteRecordBatch(*tick_batch);
 		if (!write_status.ok()) {
 			ThrowVgiIOException("Failed to write initial tick batch: %s", location_, -1, GetExecutionIdHex(),
@@ -675,8 +908,8 @@ InitResult WebWorkerFunctionConnection::PerformInit(const BindResult &bind_resul
 
 void WebWorkerFunctionConnection::PerformFinalizeInit(const BindResult &bind_result) {
 	if (!init_done_) {
-		ThrowVgiIOException("WebWorkerFunctionConnection::PerformFinalizeInit called before PerformInit", location_,
-		                    -1, GetExecutionIdHex());
+		ThrowVgiIOException("WebWorkerFunctionConnection::PerformFinalizeInit called before PerformInit", location_, -1,
+		                    GetExecutionIdHex());
 	}
 
 	{
@@ -689,8 +922,8 @@ void WebWorkerFunctionConnection::PerformFinalizeInit(const BindResult &bind_res
 	if (input_writer_ && !input_writer_closed_) {
 		auto close_status = input_writer_->Close();
 		if (!close_status.ok()) {
-			ThrowVgiIOException("Failed to close input writer for finalize: %s", location_, -1,
-			                    GetExecutionIdHex(), close_status.ToString());
+			ThrowVgiIOException("Failed to close input writer for finalize: %s", location_, -1, GetExecutionIdHex(),
+			                    close_status.ToString());
 		}
 	}
 	input_writer_.reset();
@@ -742,8 +975,8 @@ void WebWorkerFunctionConnection::PerformFinalizeInit(const BindResult &bind_res
 
 void WebWorkerFunctionConnection::ResetForNextSplit() {
 	if (!init_done_) {
-		ThrowVgiIOException("WebWorkerFunctionConnection::ResetForNextSplit called before PerformInit", location_,
-		                    -1, GetExecutionIdHex());
+		ThrowVgiIOException("WebWorkerFunctionConnection::ResetForNextSplit called before PerformInit", location_, -1,
+		                    GetExecutionIdHex());
 	}
 
 	// Sibling of PerformFinalizeInit, and deliberately the same sequence: both
@@ -764,8 +997,8 @@ void WebWorkerFunctionConnection::ResetForNextSplit() {
 			// transport is never pooled (ReleaseForPooling returns nullptr — the JS
 			// bridge owns worker lifecycle), so there is no later checkout to
 			// protect. The throw is the whole remedy.
-			ThrowVgiIOException("Failed to close input writer between splits: %s", location_, -1,
-			                    GetExecutionIdHex(), close_status.ToString());
+			ThrowVgiIOException("Failed to close input writer between splits: %s", location_, -1, GetExecutionIdHex(),
+			                    close_status.ToString());
 		}
 	}
 	input_writer_.reset();
@@ -893,8 +1126,7 @@ std::shared_ptr<arrow::RecordBatch> WebWorkerFunctionConnection::ReadDataBatch()
 				data_finished_ = true;
 				return nullptr;
 			}
-			ThrowVgiIOException("Failed to read data batch: %s", location_, -1, GetExecutionIdHex(),
-			                    status.ToString());
+			ThrowVgiIOException("Failed to read data batch: %s", location_, -1, GetExecutionIdHex(), status.ToString());
 		}
 		auto result = read_result.ValueUnsafe();
 
@@ -1080,12 +1312,12 @@ void WebWorkerFunctionConnection::OpenInputWriter() {
 
 void WebWorkerFunctionConnection::WriteInputBatch(const std::shared_ptr<arrow::RecordBatch> &batch) {
 	if (!input_writer_opened_) {
-		ThrowVgiIOException("WebWorkerFunctionConnection::WriteInputBatch called before OpenInputWriter", location_,
-		                    -1, GetExecutionIdHex());
+		ThrowVgiIOException("WebWorkerFunctionConnection::WriteInputBatch called before OpenInputWriter", location_, -1,
+		                    GetExecutionIdHex());
 	}
 	if (input_writer_closed_) {
-		ThrowVgiIOException("WebWorkerFunctionConnection::WriteInputBatch called after CloseInputWriter", location_,
-		                    -1, GetExecutionIdHex());
+		ThrowVgiIOException("WebWorkerFunctionConnection::WriteInputBatch called after CloseInputWriter", location_, -1,
+		                    GetExecutionIdHex());
 	}
 
 	// Reconcile the batch's schema to the writer's declared (worker-facing)
@@ -1170,11 +1402,9 @@ void WebWorkerFunctionConnection::CloseInputWriter() {
 // inner-request builders + outer-response decoder. Bind+init must have run on
 // this connection first (phase "TABLE_BUFFERING"), establishing execution_id.
 
-std::vector<uint8_t>
-WebWorkerFunctionConnection::RpcTableBufferingProcess(const std::string &function_name,
-                                                      const std::vector<uint8_t> &execution_id,
-                                                      const std::shared_ptr<arrow::RecordBatch> &input_batch,
-                                                      std::optional<int64_t> batch_index) {
+std::vector<uint8_t> WebWorkerFunctionConnection::RpcTableBufferingProcess(
+    const std::string &function_name, const std::vector<uint8_t> &execution_id,
+    const std::shared_ptr<arrow::RecordBatch> &input_batch, std::optional<int64_t> batch_index) {
 	auto batch_bytes = vgi::SerializeToIpcBytes(input_batch);
 	auto rpc_params = vgi::BuildTableBufferingProcessInner(function_name, schema_name_, execution_id, batch_bytes,
 	                                                       attach_opaque_data_, batch_index);
@@ -1184,11 +1414,11 @@ WebWorkerFunctionConnection::RpcTableBufferingProcess(const std::string &functio
 	auto out = std::make_shared<SabOutputStream>(region_offset_, slot_);
 	auto write_status = out->Write(request.data(), static_cast<int64_t>(request.size()));
 	if (!write_status.ok()) {
-		ThrowVgiIOException("Failed to write table_buffering_process request: %s", location_, -1,
-		                    GetExecutionIdHex(), write_status.ToString());
+		ThrowVgiIOException("Failed to write table_buffering_process request: %s", location_, -1, GetExecutionIdHex(),
+		                    write_status.ToString());
 	}
-	auto response = SabReadUnaryResponse(region_offset_, slot_, &context_, location_, GetExecutionIdHex(), GetAttachOpaqueDataHex(),
-	                                     "", GetConnIdHex());
+	auto response = SabReadUnaryResponse(region_offset_, slot_, &context_, location_, GetExecutionIdHex(),
+	                                     GetAttachOpaqueDataHex(), "", GetConnIdHex());
 	auto inner = DecodeOuterResponse(response, "table_buffering_process", location_);
 	vgi::ValidateResponseSchema(inner, "table_buffering_process", location_);
 	if (!inner || inner->num_rows() == 0) {
@@ -1205,19 +1435,18 @@ WebWorkerFunctionConnection::RpcTableBufferingCombine(const std::string &functio
                                                       const std::vector<uint8_t> &execution_id,
                                                       const std::vector<std::vector<uint8_t>> &state_ids) {
 	auto rpc_params =
-	    vgi::BuildTableBufferingCombineInner(function_name, schema_name_, execution_id, state_ids,
-	                                            attach_opaque_data_);
+	    vgi::BuildTableBufferingCombineInner(function_name, schema_name_, execution_id, state_ids, attach_opaque_data_);
 	vgi::ValidateRequestSchema(rpc_params, "table_buffering_combine", location_);
 
 	auto request = SerializeRpcRequest("table_buffering_combine", rpc_params);
 	auto out = std::make_shared<SabOutputStream>(region_offset_, slot_);
 	auto write_status = out->Write(request.data(), static_cast<int64_t>(request.size()));
 	if (!write_status.ok()) {
-		ThrowVgiIOException("Failed to write table_buffering_combine request: %s", location_, -1,
-		                    GetExecutionIdHex(), write_status.ToString());
+		ThrowVgiIOException("Failed to write table_buffering_combine request: %s", location_, -1, GetExecutionIdHex(),
+		                    write_status.ToString());
 	}
-	auto response = SabReadUnaryResponse(region_offset_, slot_, &context_, location_, GetExecutionIdHex(), GetAttachOpaqueDataHex(),
-	                                     "", GetConnIdHex());
+	auto response = SabReadUnaryResponse(region_offset_, slot_, &context_, location_, GetExecutionIdHex(),
+	                                     GetAttachOpaqueDataHex(), "", GetConnIdHex());
 	auto inner = DecodeOuterResponse(response, "table_buffering_combine", location_);
 	vgi::ValidateResponseSchema(inner, "table_buffering_combine", location_);
 	if (!inner || inner->num_rows() == 0) {
@@ -1239,8 +1468,8 @@ WebWorkerFunctionConnection::RpcTableBufferingCombine(const std::string &functio
 
 void WebWorkerFunctionConnection::RpcTableBufferingDestructor(const std::string &function_name,
                                                               const std::vector<uint8_t> &execution_id) {
-	auto rpc_params = vgi::BuildTableBufferingDestructorInner(function_name, schema_name_, execution_id,
-	                                                             attach_opaque_data_);
+	auto rpc_params =
+	    vgi::BuildTableBufferingDestructorInner(function_name, schema_name_, execution_id, attach_opaque_data_);
 	vgi::ValidateRequestSchema(rpc_params, "table_buffering_destructor", location_);
 
 	auto request = SerializeRpcRequest("table_buffering_destructor", rpc_params);
@@ -1250,8 +1479,8 @@ void WebWorkerFunctionConnection::RpcTableBufferingDestructor(const std::string 
 		ThrowVgiIOException("Failed to write table_buffering_destructor request: %s", location_, -1,
 		                    GetExecutionIdHex(), write_status.ToString());
 	}
-	auto response = SabReadUnaryResponse(region_offset_, slot_, &context_, location_, GetExecutionIdHex(), GetAttachOpaqueDataHex(),
-	                                     "", GetConnIdHex());
+	auto response = SabReadUnaryResponse(region_offset_, slot_, &context_, location_, GetExecutionIdHex(),
+	                                     GetAttachOpaqueDataHex(), "", GetConnIdHex());
 	auto inner = DecodeOuterResponse(response, "table_buffering_destructor", location_);
 	vgi::ValidateResponseSchema(inner, "table_buffering_destructor", location_);
 }

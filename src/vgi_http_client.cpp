@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <optional>
 
 #include "duckdb.hpp"
 #include "duckdb/common/http_util.hpp"
@@ -12,9 +13,11 @@
 
 #include "vgi_cookie_jar.hpp"
 #include "vgi_http_compression.hpp"
+#include "vgi_httpi.hpp"
 #include "vgi_logging.hpp"
 #include "vgi_oauth.hpp"
 #include "vgi_rpc_client.hpp"
+#include "vgi_transport.hpp"
 
 #include "mbedtls_wrapper.hpp"
 
@@ -34,12 +37,86 @@ static std::string ClientAcceptEncoding() {
 	return "zstd, gzip";
 }
 
+static bool HeaderNameEqual(const std::string &left, const std::string &right) {
+	if (left.size() != right.size())
+		return false;
+	for (size_t i = 0; i < left.size(); ++i) {
+		if (std::tolower(static_cast<unsigned char>(left[i])) != std::tolower(static_cast<unsigned char>(right[i])))
+			return false;
+	}
+	return true;
+}
+
+// Preserve the native HTTPResponse behavior for http(s), while retaining the
+// ordered duplicate header fields and explicit raw representation marker that
+// arrive through the browser HTTPI SAB envelope.
+struct RpcHttpResponse {
+	std::unique_ptr<HTTPResponse> native;
+	std::optional<httpi::Response> browser;
+
+	bool HasHeader(const std::string &name) const {
+		if (native)
+			return native->HasHeader(name);
+		for (const auto &header : browser->headers) {
+			if (HeaderNameEqual(header.name, name))
+				return true;
+		}
+		return false;
+	}
+
+	std::string GetHeaderValue(const std::string &name) const {
+		if (native)
+			return native->GetHeaderValue(name);
+		for (auto it = browser->headers.rbegin(); it != browser->headers.rend(); ++it) {
+			if (HeaderNameEqual(it->name, name))
+				return it->value;
+		}
+		return "";
+	}
+
+	std::vector<std::string> HeaderValues(const std::string &name) const {
+		if (native) {
+			if (!native->HasHeader(name))
+				return {};
+			return {native->GetHeaderValue(name)};
+		}
+		std::vector<std::string> result;
+		for (const auto &header : browser->headers) {
+			if (HeaderNameEqual(header.name, name))
+				result.push_back(header.value);
+		}
+		return result;
+	}
+
+	HTTPStatusCode Status() const {
+		return native ? native->status : static_cast<HTTPStatusCode>(browser->status);
+	}
+	bool Success() const {
+		if (native)
+			return native->Success();
+		return browser->status >= 200 && browser->status < 300;
+	}
+	bool HasRequestError() const {
+		return native && native->HasRequestError();
+	}
+	std::string GetError() const {
+		return native ? native->GetError() : std::string();
+	}
+	std::string FallbackBody() const {
+		return native ? native->body : browser->body;
+	}
+	bool RawRepresentation() const {
+		return browser.has_value() && browser->raw_representation;
+	}
+};
+
 // Resolve the encoding advertised on a response.  Prefer the custom
 // ``X-VGI-Content-Encoding`` header (older servers stamp this on every
 // response — generic proxies don't fold it), falling back to the standard
 // ``Content-Encoding``.  Returns ``NONE`` when no codec is advertised or
 // when the token is unknown.
-static HttpEncoding ResolveResponseEncoding(const HTTPResponse &response) {
+template <class RESPONSE>
+static HttpEncoding ResolveResponseEncoding(const RESPONSE &response) {
 	if (response.HasHeader("X-VGI-Content-Encoding")) {
 		auto enc = ParseEncoding(response.GetHeaderValue("X-VGI-Content-Encoding"));
 		if (enc != HttpEncoding::NONE) {
@@ -64,24 +141,28 @@ static std::string NormalizeBaseUrl(const std::string &url) {
 }
 
 // Helper: apply the configurable HTTP timeout setting to request params.
-static void ApplyHttpTimeout(ClientContext &context, HTTPParams &params) {
+static uint64_t GetHttpTimeoutSeconds(ClientContext &context) {
 	Value timeout_val;
 	if (context.TryGetCurrentSetting("vgi_http_timeout_seconds", timeout_val)) {
-		params.timeout = static_cast<uint64_t>(timeout_val.GetValue<int64_t>());
-	} else {
-		params.timeout = 300; // fallback: 5 minutes
+		return static_cast<uint64_t>(timeout_val.GetValue<int64_t>());
 	}
+	return 300; // fallback: 5 minutes
+}
+
+static void ApplyHttpTimeout(ClientContext &context, HTTPParams &params) {
+	params.timeout = GetHttpTimeoutSeconds(context);
 }
 
 // Check whether ``url`` is an https origin — used to gate Secure cookies.
-static bool UrlIsHttps(const std::string &url) {
+static bool UrlIsSecure(const std::string &url) {
 	// Case-insensitive prefix match — HTTPUtil accepts both cases.
 	if (url.size() < 8) {
 		return false;
 	}
-	return (url[0] == 'h' || url[0] == 'H') && (url[1] == 't' || url[1] == 'T') &&
+	const bool https = (url[0] == 'h' || url[0] == 'H') && (url[1] == 't' || url[1] == 'T') &&
 	       (url[2] == 't' || url[2] == 'T') && (url[3] == 'p' || url[3] == 'P') &&
 	       (url[4] == 's' || url[4] == 'S') && url[5] == ':';
+	return https || IsHttpiTransport(url);
 }
 
 // Collect all Set-Cookie response headers.
@@ -98,10 +179,13 @@ static bool UrlIsHttps(const std::string &url) {
 // safely splittable. Splitting on commas is unsafe and is intentionally not
 // attempted — at worst we recover one cookie under (a)/(c), which matches the
 // pre-fix behavior, and recover all of them under (b).
-static std::vector<std::string> CollectSetCookieHeaders(const HTTPResponse &response) {
+static std::vector<std::string> CollectSetCookieHeaders(const RpcHttpResponse &response) {
 	std::vector<std::string> out;
 	if (!response.HasHeader("Set-Cookie")) {
 		return out;
+	}
+	if (response.browser) {
+		return response.HeaderValues("Set-Cookie");
 	}
 	const std::string raw = response.GetHeaderValue("Set-Cookie");
 	// Split on \n; tolerate \r\n by trimming trailing \r.
@@ -125,8 +209,10 @@ static std::vector<std::string> CollectSetCookieHeaders(const HTTPResponse &resp
 }
 
 // Forward declarations — defined below with the capability-header parsing.
-static ServerCapabilities ParseCapabilityHeaders(const HTTPResponse &response);
-static bool HasCapabilityHeaders(const HTTPResponse &response);
+template <class RESPONSE>
+static ServerCapabilities ParseCapabilityHeaders(const RESPONSE &response);
+template <class RESPONSE>
+static bool HasCapabilityHeaders(const RESPONSE &response);
 
 // Internal: perform a single HTTP POST with optional auth header.
 //
@@ -141,33 +227,14 @@ static bool HasCapabilityHeaders(const HTTPResponse &response);
 // the renegotiate-and-retry path below re-encodes once (gated by
 // allow_codec_retry so a retry can't recurse).
 // harvested_caps: in/out — refreshed from this response's capability headers.
-static std::string HttpPostArrowIpcInternal(ClientContext &context,
-                                             const std::string &url,
-                                             const std::vector<uint8_t> &body,
-                                             const std::string &bearer_token,
-                                             const std::shared_ptr<SessionCookieJar> &cookie_jar,
-                                             std::unique_ptr<HTTPResponse> &out_response,
-                                             const std::shared_ptr<HTTPParams> &cached_http_params = nullptr,
-                                             HttpEncoding request_encoding = HttpEncoding::ZSTD,
-                                             bool allow_codec_retry = true,
-                                             duckdb::unique_ptr<HTTPClient> *client_holder = nullptr,
+static std::string HttpPostArrowIpcInternal(
+    ClientContext &context, const std::string &url, const std::vector<uint8_t> &body, const std::string &bearer_token,
+    const std::shared_ptr<SessionCookieJar> &cookie_jar, std::unique_ptr<RpcHttpResponse> &out_response,
+    const std::shared_ptr<HTTPParams> &cached_http_params = nullptr, HttpEncoding request_encoding = HttpEncoding::ZSTD,
+    bool allow_codec_retry = true, duckdb::unique_ptr<HTTPClient> *client_holder = nullptr,
                                              ServerCapabilities *harvested_caps = nullptr) {
-	auto &db = *context.db;
-	auto &http_util = HTTPUtil::Get(db);
-
-	// Reuse the cached HTTPParams when available (see cache rationale above);
-	// otherwise fall back to a per-request InitializeParameters (still used by
-	// call sites that don't have a VgiAttachParameters to cache on, e.g. the
-	// very first catalog_attach before we have an attach handle).
-	std::shared_ptr<HTTPParams> params = cached_http_params;
-	if (!params) {
-		auto owned = http_util.InitializeParameters(context, url);
-		params = std::shared_ptr<HTTPParams>(owned.release());
-	}
-	// Always re-apply the timeout from the current setting. The cached path
-	// was previously skipping this, so users who tweaked vgi_http_timeout_seconds
-	// to debug a stuck endpoint saw no effect until re-ATTACH.
-	ApplyHttpTimeout(context, *params);
+	const bool is_httpi = IsHttpiTransport(url);
+	const uint64_t timeout_seconds = GetHttpTimeoutSeconds(context);
 
 	// Skip compression for tiny bodies (producer ticks, small unary
 	// envelopes): zstd adds CPU on the per-request hot path and often GROWS a
@@ -195,56 +262,71 @@ static std::string HttpPostArrowIpcInternal(ClientContext &context,
 	}
 
 	HTTPHeaders headers;
-	headers.Insert("Content-Type", ARROW_IPC_CONTENT_TYPE);
+	std::vector<httpi::Header> httpi_headers;
+	auto add_header = [&](const std::string &name, const std::string &value) {
+		headers.Insert(name, value);
+		httpi_headers.push_back({name, value});
+	};
+	add_header("Content-Type", ARROW_IPC_CONTENT_TYPE);
 	if (request_encoding != HttpEncoding::NONE) {
-		headers.Insert("Content-Encoding", EncodingName(request_encoding));
+		add_header("Content-Encoding", EncodingName(request_encoding));
 	}
-	headers.Insert("X-VGI-Accept-Encoding", ClientAcceptEncoding());
+	add_header("X-VGI-Accept-Encoding", ClientAcceptEncoding());
 	if (!bearer_token.empty()) {
-		headers.Insert("Authorization", "Bearer " + bearer_token);
+		add_header("Authorization", "Bearer " + bearer_token);
 	}
 	if (cookie_jar) {
 		auto cookie_header = cookie_jar->BuildCookieHeader();
 		if (!cookie_header.empty()) {
-			headers.Insert("Cookie", cookie_header);
+			add_header("Cookie", cookie_header);
 		}
 	}
 
-	PostRequestInfo post(url, headers, *params,
-	                     reinterpret_cast<const_data_ptr_t>(req_body_data),
-	                     static_cast<idx_t>(req_body_size));
-
-	// Hand failed responses back to us instead of letting HTTPUtil throw its
-	// generic HTTPException. Two reasons, both about the response HEADERS:
-	//   1) the VGI capability headers (VGI-Supported-Encodings and friends)
-	//      ride on EVERY response, errors included — that is precisely the
-	//      signal we need when the failure IS a codec mismatch, and a thrown
-	//      HTTPException buries it in an extra-info map.
-	//   2) the error-reporting block below already knows how to decode a VGI
-	//      error batch into the worker's own message; without this it only ever
-	//      ran for non-retryable statuses (HTTPResponse::ShouldRetry treats
-	//      408/418/429/500/503/504 as retryable and those threw instead).
-	// Retry/backoff behaviour is unchanged — try_request only replaces the
-	// terminal throw with a returned response.
-	post.try_request = true;
-
-	// When the caller supplies a client holder, reuse its keep-alive HTTP
-	// client (and TCP connection) across calls; the 2-arg overload creates
-	// the client lazily on first use and refreshes it on retry. Otherwise
-	// fall back to a fresh per-call client (the single-arg overload).
-	if (client_holder) {
-		out_response = http_util.Request(post, *client_holder);
+	std::string response_body;
+	out_response = std::make_unique<RpcHttpResponse>();
+	if (is_httpi) {
+#if defined(__EMSCRIPTEN__)
+		// Only the backend changes: the surrounding auth, cookie, capability,
+		// compression, error and continuation state machine remains identical.
+		// BrowserPost never retries a transport failure, because POST dispatch may
+		// be ambiguous once Iroh accepted request bytes.
+		out_response->browser =
+		    httpi::BrowserPost(context, url, httpi_headers, req_body_data, req_body_size, timeout_seconds);
+		response_body = out_response->browser->body;
+#else
+		throw IOException("vgi: httpi:// transport is only available in DuckDB-WASM with an "
+		                  "application-owned Iroh adapter Worker");
+#endif
 	} else {
-		out_response = http_util.Request(post);
+		auto &http_util = HTTPUtil::Get(*context.db);
+		// Reuse cached parameters when available; unlike httpi:// this remains an
+		// ordinary DuckDB HTTP request, including its established retry behavior.
+		std::shared_ptr<HTTPParams> params = cached_http_params;
+		if (!params) {
+			auto owned = http_util.InitializeParameters(context, url);
+			params = std::shared_ptr<HTTPParams>(owned.release());
+		}
+		params->timeout = timeout_seconds;
+		PostRequestInfo post(url, headers, *params, reinterpret_cast<const_data_ptr_t>(req_body_data),
+	                     static_cast<idx_t>(req_body_size));
+	post.try_request = true;
+	if (client_holder) {
+			out_response->native = http_util.Request(post, *client_holder);
+	} else {
+			out_response->native = http_util.Request(post);
 	}
-	if (!out_response) {
+		if (!out_response->native) {
 		throw IOException("VGI HTTP POST returned no response (transport failure) [url: %s]", url);
+	}
+		if (!post.buffer_out.empty()) {
+			response_body.assign(post.buffer_out.data(), post.buffer_out.data() + post.buffer_out.size());
+		}
 	}
 
 	if (cookie_jar) {
 		auto set_cookie_headers = CollectSetCookieHeaders(*out_response);
 		if (!set_cookie_headers.empty()) {
-			cookie_jar->UpdateFromSetCookie(set_cookie_headers, UrlIsHttps(url));
+			cookie_jar->UpdateFromSetCookie(set_cookie_headers, UrlIsSecure(url));
 		}
 	}
 
@@ -265,7 +347,7 @@ static std::string HttpPostArrowIpcInternal(ClientContext &context,
 		}
 	}
 
-	if (out_response->status == HTTPStatusCode::Unauthorized_401) {
+	if (out_response->Status() == HTTPStatusCode::Unauthorized_401) {
 		// Return empty — caller handles 401
 		return "";
 	}
@@ -295,10 +377,9 @@ static std::string HttpPostArrowIpcInternal(ClientContext &context,
 	    !ServerAcceptsRequestEncoding(response_caps, request_encoding)) {
 		auto alternate = ChooseRequestEncoding(response_caps);
 		if (alternate != request_encoding) {
-			return HttpPostArrowIpcInternal(context, url, body, bearer_token, cookie_jar,
-			                                 out_response, cached_http_params, alternate,
-			                                 /*allow_codec_retry=*/false, client_holder,
-			                                 harvested_caps);
+			return HttpPostArrowIpcInternal(context, url, body, bearer_token, cookie_jar, out_response,
+			                                cached_http_params, alternate,
+			                                /*allow_codec_retry=*/false, client_holder, harvested_caps);
 		}
 	}
 
@@ -308,14 +389,11 @@ static std::string HttpPostArrowIpcInternal(ClientContext &context,
 	// report, so surface the transport error directly instead of falling into
 	// the status-code formatting below.
 	if (out_response->HasRequestError()) {
-		throw IOException("VGI HTTP request failed (transport error): %s [url: %s]",
-		                  out_response->GetError(), url);
+		throw IOException("VGI HTTP request failed (transport error): %s [url: %s]", out_response->GetError(), url);
 	}
 
 	if (!out_response->Success()) {
-		std::string error_body = post.buffer_out.empty() ? out_response->body
-		                                                 : std::string(post.buffer_out.data(),
-		                                                               post.buffer_out.data() + post.buffer_out.size());
+		std::string error_body = response_body.empty() ? out_response->FallbackBody() : response_body;
 		// Decompress if the server advertised a codec we know — otherwise
 		// Arrow IPC parsing would see compressed-stream magic bytes and
 		// throw "negative continuation token".
@@ -327,9 +405,8 @@ static std::string HttpPostArrowIpcInternal(ClientContext &context,
 				// Leave body as-is; the raw bytes will appear in the preview.
 			}
 		}
-		std::string content_type = out_response->HasHeader("Content-Type")
-		                               ? out_response->GetHeaderValue("Content-Type")
-		                               : std::string();
+		std::string content_type =
+		    out_response->HasHeader("Content-Type") ? out_response->GetHeaderValue("Content-Type") : std::string();
 		bool is_arrow_ipc = content_type.find(ARROW_IPC_CONTENT_TYPE) != std::string::npos;
 
 		// If the body looks like Arrow IPC, parse it. Two outcomes:
@@ -341,8 +418,7 @@ static std::string HttpPostArrowIpcInternal(ClientContext &context,
 		std::string body_preview;
 		if (is_arrow_ipc && !error_body.empty()) {
 			try {
-				auto error_result = ReadUnaryResponseFromBuffer(
-				    reinterpret_cast<const uint8_t *>(error_body.data()),
+				auto error_result = ReadUnaryResponseFromBuffer(reinterpret_cast<const uint8_t *>(error_body.data()),
 				    error_body.size(), nullptr, url);
 				if (error_result.batch) {
 					const auto &batch = error_result.batch;
@@ -368,7 +444,8 @@ static std::string HttpPostArrowIpcInternal(ClientContext &context,
 							} else {
 								continue;
 							}
-							if (!body_preview.empty()) body_preview += "; ";
+							if (!body_preview.empty())
+								body_preview += "; ";
 							body_preview += name + "=" + val;
 						}
 					}
@@ -386,11 +463,9 @@ static std::string HttpPostArrowIpcInternal(ClientContext &context,
 			body_preview.resize(1024);
 			body_preview += "...<truncated>";
 		}
-		throw IOException(
-		    "VGI HTTP request failed (HTTP %d)%s%s: %s [url: %s]",
-		    static_cast<int>(out_response->status),
-		    content_type.empty() ? "" : " Content-Type=",
-		    content_type,
+		throw IOException("VGI HTTP request failed (HTTP %d)%s%s: %s [url: %s]",
+		                  static_cast<int>(out_response->Status()),
+		                  content_type.empty() ? "" : " Content-Type=", content_type,
 		    body_preview.empty() ? out_response->GetError() : body_preview, url);
 	}
 
@@ -411,7 +486,7 @@ static std::string HttpPostArrowIpcInternal(ClientContext &context,
 	// body is already final (browser-decoded or uncompressed): skip the
 	// Content-Length check and our own decompress. We deliberately do NOT gate on
 	// HasHeader("Content-Encoding") — that header is unreliable post-decompression.
-	browser_decoded = !out_response->HasHeader("X-VGI-Content-Encoding");
+	browser_decoded = !out_response->RawRepresentation() && !out_response->HasHeader("X-VGI-Content-Encoding");
 #endif
 
 	// Defensive: if the server sent a Content-Length header, ensure the
@@ -425,11 +500,10 @@ static std::string HttpPostArrowIpcInternal(ClientContext &context,
 		const auto content_length_str = out_response->GetHeaderValue("Content-Length");
 		try {
 			auto declared = std::stoull(content_length_str);
-			if (declared != post.buffer_out.size()) {
-				throw IOException(
-				    "VGI HTTP response body size mismatch: Content-Length=%llu, got %llu bytes [url: %s]",
+			if (declared != response_body.size()) {
+				throw IOException("VGI HTTP response body size mismatch: Content-Length=%llu, got %llu bytes [url: %s]",
 				    static_cast<unsigned long long>(declared),
-				    static_cast<unsigned long long>(post.buffer_out.size()), url);
+				                  static_cast<unsigned long long>(response_body.size()), url);
 			}
 		} catch (const std::invalid_argument &) {
 			// Malformed Content-Length — let the caller's Arrow parser
@@ -446,12 +520,12 @@ static std::string HttpPostArrowIpcInternal(ClientContext &context,
 	// Capture the on-the-wire size before app-level decompression so the log
 	// below reflects what was actually read off the socket. VGI uses the custom
 	// X-VGI-Content-Encoding header (which generic proxies/clients don't fold),
-	// so post.buffer_out here is still the compressed application body.
-	const size_t resp_wire_bytes = post.buffer_out.size();
-	if (resp_enc != HttpEncoding::NONE && !post.buffer_out.empty()) {
-		post.buffer_out = Decompress(resp_enc, post.buffer_out.data(), post.buffer_out.size());
+	// so response_body here is still the compressed application body.
+	const size_t resp_wire_bytes = response_body.size();
+	if (resp_enc != HttpEncoding::NONE && !response_body.empty()) {
+		response_body = Decompress(resp_enc, response_body.data(), response_body.size());
 	}
-	const size_t resp_decoded_bytes = post.buffer_out.size();
+	const size_t resp_decoded_bytes = response_body.size();
 
 	// Per-response payload accounting for HTTP-transport debugging: how many
 	// bytes were read, whether the response was compressed (and with which
@@ -464,15 +538,13 @@ static std::string HttpPostArrowIpcInternal(ClientContext &context,
 	if (VgiInfoLogActive(context)) {
 		const bool resp_compressed = resp_enc != HttpEncoding::NONE;
 		char ratio_buf[32];
-		std::snprintf(ratio_buf, sizeof(ratio_buf), "%.2f",
-		              resp_wire_bytes > 0
-		                  ? static_cast<double>(resp_decoded_bytes) / static_cast<double>(resp_wire_bytes)
-		                  : 0.0);
+		std::snprintf(
+		    ratio_buf, sizeof(ratio_buf), "%.2f",
+		    resp_wire_bytes > 0 ? static_cast<double>(resp_decoded_bytes) / static_cast<double>(resp_wire_bytes) : 0.0);
 		VGI_LOG(context, "http.response",
 		        {{"url", url},
-		         {"status", std::to_string(static_cast<int>(out_response->status))},
-		         {"req_encoding", request_encoding == HttpEncoding::NONE ? "none"
-		                                                                 : EncodingName(request_encoding)},
+		         {"status", std::to_string(static_cast<int>(out_response->Status()))},
+		         {"req_encoding", request_encoding == HttpEncoding::NONE ? "none" : EncodingName(request_encoding)},
 		         {"req_raw_bytes", std::to_string(body.size())},
 		         {"req_wire_bytes", std::to_string(req_body_size)},
 		         {"resp_compressed", resp_compressed ? "true" : "false"},
@@ -485,9 +557,8 @@ static std::string HttpPostArrowIpcInternal(ClientContext &context,
 	// Server errors are sent as HTTP 200 with X-VGI-RPC-Error: true header
 	// (so that clients which discard response bodies on 5xx still receive
 	// the Arrow IPC error metadata). Parse the error batch and throw.
-	if (out_response->HasHeader("X-VGI-RPC-Error") &&
-	    out_response->GetHeaderValue("X-VGI-RPC-Error") == "true") {
-		auto &error_body = post.buffer_out;
+	if (out_response->HasHeader("X-VGI-RPC-Error") && out_response->GetHeaderValue("X-VGI-RPC-Error") == "true") {
+		auto &error_body = response_body;
 		if (!error_body.empty()) {
 			// Walk EVERY concatenated IPC stream in the body, not just the
 			// first. A streaming RPC replies with a header stream plus a data
@@ -496,24 +567,20 @@ static std::string HttpPostArrowIpcInternal(ClientContext &context,
 			// header, returns without throwing, and loses the message to the
 			// generic throw below. DispatchErrorStreamsFromBuffer dispatches
 			// the error batch, which throws with the worker's own message.
-			DispatchErrorStreamsFromBuffer(
-			    reinterpret_cast<const uint8_t *>(error_body.data()),
-			    error_body.size(), nullptr, url);
+			DispatchErrorStreamsFromBuffer(reinterpret_cast<const uint8_t *>(error_body.data()), error_body.size(),
+			                               nullptr, url);
 		}
 		throw IOException("VGI HTTP RPC error [url: %s]", url);
 	}
 
-	return std::move(post.buffer_out);
+	return response_body;
 }
 
-std::string HttpPostArrowIpc(ClientContext &context,
-                              const std::string &url,
-                              const std::vector<uint8_t> &body,
+std::string HttpPostArrowIpc(ClientContext &context, const std::string &url, const std::vector<uint8_t> &body,
                               const std::shared_ptr<CatalogAuth> &auth,
                               const std::shared_ptr<SessionCookieJar> &cookie_jar,
                               const std::shared_ptr<HTTPParams> &cached_http_params,
-                              duckdb::unique_ptr<HTTPClient> *client_holder,
-                              ServerCapabilities *harvested_caps) {
+                             duckdb::unique_ptr<HTTPClient> *client_holder, ServerCapabilities *harvested_caps) {
 	// Get cached token from per-catalog auth (if any)
 	std::string token;
 	if (auth) {
@@ -524,15 +591,13 @@ std::string HttpPostArrowIpc(ClientContext &context,
 	// the request codec (so a server that already told us it speaks no
 	// compression is never sent a compressed body again), and it is refreshed
 	// from this response's capability headers on the way out.
-	const HttpEncoding request_encoding =
-	    harvested_caps ? ChooseRequestEncoding(*harvested_caps) : HttpEncoding::ZSTD;
+	const HttpEncoding request_encoding = harvested_caps ? ChooseRequestEncoding(*harvested_caps) : HttpEncoding::ZSTD;
 
-	std::unique_ptr<HTTPResponse> response;
+	std::unique_ptr<RpcHttpResponse> response;
 	auto result = HttpPostArrowIpcInternal(context, url, body, token, cookie_jar, response, cached_http_params,
-	                                       request_encoding, /*allow_codec_retry=*/true, client_holder,
-	                                       harvested_caps);
+	                                       request_encoding, /*allow_codec_retry=*/true, client_holder, harvested_caps);
 
-	if (response->status != HTTPStatusCode::Unauthorized_401) {
+	if (response->Status() != HTTPStatusCode::Unauthorized_401) {
 		return result;
 	}
 
@@ -573,8 +638,7 @@ std::string HttpPostArrowIpc(ClientContext &context,
 		// a non-OAuth situation. Catch it here while the URL is still in
 		// scope and produce an actionable error that names the fix.
 		if (!auth->IsExplicitlyConfigured()) {
-			throw IOException(
-			    "VGI HTTP authentication failed (HTTP 401) [url: %s]. The server requires "
+			throw IOException("VGI HTTP authentication failed (HTTP 401) [url: %s]. The server requires "
 			    "authentication but advertised no OAuth challenge (%s). Pass bearer_token "
 			    "in ATTACH options, or oauth_refresh_token if the server uses OAuth "
 			    "without challenge advertising.",
@@ -591,8 +655,8 @@ std::string HttpPostArrowIpc(ClientContext &context,
 		throw IOException("VGI HTTP authentication failed (HTTP 401) [url: %s]", url);
 	}
 
-	VGI_STDERR_DEBUG("[VGI] http.401_received url=%s resource_metadata=%s\n",
-	                 url.c_str(), challenge->resource_metadata_url.c_str());
+	VGI_STDERR_DEBUG("[VGI] http.401_received url=%s resource_metadata=%s\n", url.c_str(),
+	                 challenge->resource_metadata_url.c_str());
 
 	// Perform or wait for auth flow (OAuth PKCE/device code)
 	auto new_token = auth->HandleUnauthorized(*challenge, context);
@@ -601,36 +665,31 @@ std::string HttpPostArrowIpc(ClientContext &context,
 	result = HttpPostArrowIpcInternal(context, url, body, new_token, cookie_jar, response, cached_http_params,
 	                                  harvested_caps ? ChooseRequestEncoding(*harvested_caps) : request_encoding,
 	                                  /*allow_codec_retry=*/true, client_holder, harvested_caps);
-	if (response->status == HTTPStatusCode::Unauthorized_401) {
+	if (response->Status() == HTTPStatusCode::Unauthorized_401) {
 		throw IOException("VGI HTTP authentication failed after auth flow (HTTP 401) [url: %s]. "
-		                  "Response: %s", url, response->body);
+		                  "Response: %s",
+		                  url, response->FallbackBody());
 	}
 
 	return result;
 }
 
-UnaryResponseResult HttpInvokeUnary(ClientContext &context,
-                                     const std::string &worker_path,
-                                     const std::string &method_name,
-                                     const std::shared_ptr<arrow::RecordBatch> &params,
+UnaryResponseResult HttpInvokeUnary(ClientContext &context, const std::string &worker_path,
+                                    const std::string &method_name, const std::shared_ptr<arrow::RecordBatch> &params,
                                      const std::shared_ptr<CatalogAuth> &auth,
                                      const std::shared_ptr<SessionCookieJar> &cookie_jar,
                                      const std::shared_ptr<HTTPParams> &cached_http_params,
-                                     const std::string &invocation_id_hex,
-                                     const std::string &attach_opaque_data_hex,
-                                     const std::string &transaction_opaque_data_hex,
-                                     const std::string &conn_id_hex,
+                                    const std::string &invocation_id_hex, const std::string &attach_opaque_data_hex,
+                                    const std::string &transaction_opaque_data_hex, const std::string &conn_id_hex,
                                      const std::string &protocol_version_override,
-                                     duckdb::unique_ptr<HTTPClient> *client_holder,
-                                     ServerCapabilities *caps) {
+                                    duckdb::unique_ptr<HTTPClient> *client_holder, ServerCapabilities *caps) {
 	std::string base_url = NormalizeBaseUrl(worker_path);
 	std::string url = base_url + "/" + method_name;
 
 	// Gated: fires once per unary RPC (hot on catalog bursts / buffered sinks).
 	const bool log_active = VgiInfoLogActive(context);
 	if (log_active) {
-		VGI_LOG(context, "http.invoke_unary",
-		        {{"url", url}, {"method", method_name}});
+		VGI_LOG(context, "http.invoke_unary", {{"url", url}, {"method", method_name}});
 	}
 
 	// Serialize the RPC request to Arrow IPC bytes. A non-empty
@@ -644,24 +703,20 @@ UnaryResponseResult HttpInvokeUnary(ClientContext &context,
 	}
 
 	// POST to {worker_path}/{method_name} using standard HTTP timeout
-	auto response_body = HttpPostArrowIpc(context, url, body, auth, cookie_jar, cached_http_params,
-	                                       client_holder, caps);
+	auto response_body =
+	    HttpPostArrowIpc(context, url, body, auth, cookie_jar, cached_http_params, client_holder, caps);
 
 	// Parse the Arrow IPC response. Move the body in — the string becomes the
 	// owning Arrow buffer, avoiding an alloc+memcpy of the whole payload.
-	auto result = ReadUnaryResponseFromBuffer(
-	    std::move(response_body), &context, url,
-	    invocation_id_hex, attach_opaque_data_hex,
-	    transaction_opaque_data_hex, conn_id_hex);
+	auto result = ReadUnaryResponseFromBuffer(std::move(response_body), &context, url, invocation_id_hex,
+	                                          attach_opaque_data_hex, transaction_opaque_data_hex, conn_id_hex);
 
 	// Resolve external location pointer batches
 	result = MaybeResolveExternalLocation(context, result, base_url);
 
 	if (log_active) {
 		VGI_LOG(context, "http.invoke_unary_result",
-		        {{"url", url},
-		         {"method", method_name},
-		         {"has_batch", result.batch ? "true" : "false"}});
+		        {{"url", url}, {"method", method_name}, {"has_batch", result.batch ? "true" : "false"}});
 	}
 
 	return result;
@@ -684,7 +739,9 @@ std::string HttpGetBytes(ClientContext &context, const std::string &url) {
 
 	// Accumulate response body via content handler
 	std::string body;
-	auto response_handler = [](const HTTPResponse &) { return true; };
+	auto response_handler = [](const HTTPResponse &) {
+		return true;
+	};
 	auto content_handler = [&body](const_data_ptr_t data, idx_t data_length) {
 		body.append(reinterpret_cast<const char *>(data), data_length);
 		return true;
@@ -693,13 +750,12 @@ std::string HttpGetBytes(ClientContext &context, const std::string &url) {
 	GetRequestInfo get(url, headers, *params, response_handler, content_handler);
 	auto response = http_util.Request(get);
 	if (!response) {
-		throw IOException("VGI external location fetch returned no response (transport failure) [url: %s]",
-		                  url);
+		throw IOException("VGI external location fetch returned no response (transport failure) [url: %s]", url);
 	}
 
 	if (!response->Success()) {
-		throw IOException("VGI external location fetch failed (HTTP %d) [url: %s]",
-		                  static_cast<int>(response->status), url);
+		throw IOException("VGI external location fetch failed (HTTP %d) [url: %s]", static_cast<int>(response->status),
+		                  url);
 	}
 
 	// Decompress if the server indicates a codec we know.
@@ -711,12 +767,15 @@ std::string HttpGetBytes(ClientContext &context, const std::string &url) {
 	return body;
 }
 
-UnaryResponseResult ResolveExternalLocation(ClientContext &context,
-                                             const std::string &location_url,
-                                             const std::string &worker_path,
-                                             const std::string &invocation_id_hex,
+UnaryResponseResult ResolveExternalLocation(ClientContext &context, const std::string &location_url,
+                                            const std::string &worker_path, const std::string &invocation_id_hex,
                                              const std::string &attach_opaque_data_hex,
                                              const std::shared_ptr<arrow::KeyValueMetadata> &pointer_metadata) {
+	if (IsHttpiTransport(location_url)) {
+		throw IOException("VGI external locations over httpi:// are unsupported; the worker must return an "
+		                  "https:// pre-signed URL [url: %s]",
+		                  location_url);
+	}
 	// Fetch the external data
 	auto body = HttpGetBytes(context, location_url);
 
@@ -775,18 +834,19 @@ UnaryResponseResult ResolveExternalLocation(ClientContext &context,
 		auto batch_type = ClassifyBatch(bwm.batch, bwm.custom_metadata);
 
 		if (batch_type == RpcBatchType::ERROR) {
-			HandleBatchLogMessage(bwm.batch, bwm.custom_metadata, &context, log_worker_path,
-			                     -1, invocation_id_hex, attach_opaque_data_hex);
+			HandleBatchLogMessage(bwm.batch, bwm.custom_metadata, &context, log_worker_path, -1, invocation_id_hex,
+			                      attach_opaque_data_hex);
 			throw IOException("VGI external location error [url: %s]", location_url);
 		}
 		if (batch_type == RpcBatchType::LOG) {
-			HandleBatchLogMessage(bwm.batch, bwm.custom_metadata, &context, log_worker_path,
-			                     -1, invocation_id_hex, attach_opaque_data_hex);
+			HandleBatchLogMessage(bwm.batch, bwm.custom_metadata, &context, log_worker_path, -1, invocation_id_hex,
+			                      attach_opaque_data_hex);
 			continue;
 		}
 		if (batch_type == RpcBatchType::EXTERNAL_LOCATION) {
 			throw IOException("VGI external location redirect loop: resolved batch from %s "
-			                  "contains another vgi_rpc.location", location_url);
+			                  "contains another vgi_rpc.location",
+			                  location_url);
 		}
 
 		// Data batch
@@ -804,8 +864,8 @@ UnaryResponseResult ResolveExternalLocation(ClientContext &context,
 		auto &bwm = drain_result.ValueUnsafe();
 		auto bt = ClassifyBatch(bwm.batch, bwm.custom_metadata);
 		if (bt == RpcBatchType::LOG || bt == RpcBatchType::ERROR) {
-			HandleBatchLogMessage(bwm.batch, bwm.custom_metadata, &context, log_worker_path,
-			                     -1, invocation_id_hex, attach_opaque_data_hex);
+			HandleBatchLogMessage(bwm.batch, bwm.custom_metadata, &context, log_worker_path, -1, invocation_id_hex,
+			                      attach_opaque_data_hex);
 		}
 	}
 
@@ -816,8 +876,7 @@ UnaryResponseResult ResolveExternalLocation(ClientContext &context,
 	return result;
 }
 
-UnaryResponseResult MaybeResolveExternalLocation(ClientContext &context,
-                                                   UnaryResponseResult &result,
+UnaryResponseResult MaybeResolveExternalLocation(ClientContext &context, UnaryResponseResult &result,
                                                    const std::string &worker_path) {
 	if (!result.metadata) {
 		return std::move(result);
@@ -837,7 +896,8 @@ UnaryResponseResult MaybeResolveExternalLocation(ClientContext &context,
 
 // Parse "Cache-Control: max-age=N" (seconds) from a response, if present.
 // Returns 0 seconds when no max-age directive is found or it does not parse.
-static std::chrono::seconds ParseCacheControlMaxAge(const HTTPResponse &response) {
+template <class RESPONSE>
+static std::chrono::seconds ParseCacheControlMaxAge(const RESPONSE &response) {
 	const char *header_names[] = {"Cache-Control", "cache-control"};
 	for (const char *name : header_names) {
 		if (!response.HasHeader(name)) {
@@ -890,20 +950,23 @@ static std::chrono::seconds ParseCacheControlMaxAge(const HTTPResponse &response
 // page synthesized by an intermediary carries none of these headers, and
 // caching it as a discovered snapshot would look identical to a server that
 // genuinely advertises nothing.
-static bool HasCapabilityHeaders(const HTTPResponse &response) {
+template <class RESPONSE>
+static bool HasCapabilityHeaders(const RESPONSE &response) {
 	return response.HasHeader(kSupportedEncodingsHeader) || response.HasHeader("VGI-Max-Request-Bytes") ||
 	       response.HasHeader("VGI-Upload-URL-Support") || response.HasHeader("VGI-Max-Upload-Bytes");
 }
 
 // Parse capability headers from an HTTP response (set by middleware on every response).
-static ServerCapabilities ParseCapabilityHeaders(const HTTPResponse &response) {
+template <class RESPONSE>
+static ServerCapabilities ParseCapabilityHeaders(const RESPONSE &response) {
 	ServerCapabilities caps;
 	caps.discovered = true;
 
 	if (response.HasHeader("VGI-Max-Request-Bytes")) {
 		try {
 			caps.max_request_bytes = std::stoll(response.GetHeaderValue("VGI-Max-Request-Bytes"));
-		} catch (...) {}
+		} catch (...) {
+		}
 	}
 	if (response.HasHeader("VGI-Upload-URL-Support")) {
 		caps.upload_url_support = response.GetHeaderValue("VGI-Upload-URL-Support") == "true";
@@ -911,7 +974,8 @@ static ServerCapabilities ParseCapabilityHeaders(const HTTPResponse &response) {
 	if (response.HasHeader("VGI-Max-Upload-Bytes")) {
 		try {
 			caps.max_upload_bytes = std::stoll(response.GetHeaderValue("VGI-Max-Upload-Bytes"));
-		} catch (...) {}
+		} catch (...) {
+		}
 	}
 	// Three-valued, and the empty case matters: an absent header is a
 	// pre-update server (assume zstd), whereas a present-but-empty one is the
@@ -935,6 +999,12 @@ ServerCapabilities HttpDiscoverCapabilities(ClientContext &context, const std::s
 	// {base_url}/health: it is mandatory in every implementation and exempt
 	// from auth, matching the Python reference client.
 	auto url = NormalizeBaseUrl(base_url) + "/health";
+	if (IsHttpiTransport(url)) {
+		// The browser adapter deliberately exposes only POST. Normal VGI traffic
+		// harvests the same capability headers from every response, so avoid
+		// inventing a HEAD replay/control path for Iroh.
+		return ServerCapabilities {};
+	}
 
 	// This explicit probe is the FALLBACK — capabilities are normally harvested
 	// off responses the connection already receives (see HttpPostArrowIpc's
@@ -960,9 +1030,7 @@ ServerCapabilities HttpDiscoverCapabilities(ClientContext &context, const std::s
 	return ParseCapabilityHeaders(*response);
 }
 
-std::vector<UploadUrl> HttpRequestUploadUrls(ClientContext &context,
-                                               const std::string &base_url,
-                                               int count,
+std::vector<UploadUrl> HttpRequestUploadUrls(ClientContext &context, const std::string &base_url, int count,
                                                const std::shared_ptr<CatalogAuth> &auth) {
 	// Serialize Arrow batch {count: int64}
 	auto count_field = arrow::field("count", arrow::int64());
@@ -995,8 +1063,8 @@ std::vector<UploadUrl> HttpRequestUploadUrls(ClientContext &context,
 	return urls;
 }
 
-void HttpPutBytes(ClientContext &context, const std::string &url,
-                   const std::vector<uint8_t> &data, HttpEncoding encoding) {
+void HttpPutBytes(ClientContext &context, const std::string &url, const std::vector<uint8_t> &data,
+                  HttpEncoding encoding) {
 	auto &db = *context.db;
 	auto &http_util = HTTPUtil::Get(db);
 	auto params = http_util.InitializeParameters(context, url);
@@ -1017,32 +1085,27 @@ void HttpPutBytes(ClientContext &context, const std::string &url,
 		headers.Insert("X-VGI-Content-Encoding", EncodingName(encoding));
 	}
 
-	PutRequestInfo put(url, headers, *params,
-	                   reinterpret_cast<const_data_ptr_t>(body_data),
-	                   static_cast<idx_t>(body_size),
-	                   content_type);
+	PutRequestInfo put(url, headers, *params, reinterpret_cast<const_data_ptr_t>(body_data),
+	                   static_cast<idx_t>(body_size), content_type);
 	auto response = http_util.Request(put);
 	if (!response) {
 		throw IOException("VGI upload returned no response (transport failure) [url: %s]", url);
 	}
 
 	if (!response->Success()) {
-		throw IOException("VGI upload failed (HTTP %d) [url: %s]",
-		                  static_cast<int>(response->status), url);
+		throw IOException("VGI upload failed (HTTP %d) [url: %s]", static_cast<int>(response->status), url);
 	}
 }
 
 std::vector<uint8_t> SerializePointerBatch(const std::shared_ptr<arrow::Schema> &schema,
-                                             const std::string &location_url,
-                                             const std::string &stream_state_token,
+                                           const std::string &location_url, const std::string &stream_state_token,
                                              const std::string &call_state_token) {
 	// Build zero-row batch with empty arrays matching the schema
 	std::vector<std::shared_ptr<arrow::Array>> empty_arrays;
 	for (int i = 0; i < schema->num_fields(); i++) {
 		auto empty_result = arrow::MakeEmptyArray(schema->field(i)->type());
 		if (!empty_result.ok()) {
-			throw IOException("Failed to create empty array for pointer batch: %s",
-			                  empty_result.status().ToString());
+			throw IOException("Failed to create empty array for pointer batch: %s", empty_result.status().ToString());
 		}
 		empty_arrays.push_back(empty_result.ValueUnsafe());
 	}
@@ -1054,12 +1117,10 @@ std::vector<uint8_t> SerializePointerBatch(const std::shared_ptr<arrow::Schema> 
 	// simply absent from the request.
 	auto metadata = arrow::KeyValueMetadata::Make({RPC_LOCATION_KEY}, {location_url});
 	if (!stream_state_token.empty()) {
-		metadata = metadata->Merge(*arrow::KeyValueMetadata::Make(
-		    {RPC_STREAM_STATE_KEY}, {stream_state_token}));
+		metadata = metadata->Merge(*arrow::KeyValueMetadata::Make({RPC_STREAM_STATE_KEY}, {stream_state_token}));
 	}
 	if (!call_state_token.empty()) {
-		metadata = metadata->Merge(*arrow::KeyValueMetadata::Make(
-		    {RPC_CALL_STATE_KEY}, {call_state_token}));
+		metadata = metadata->Merge(*arrow::KeyValueMetadata::Make({RPC_CALL_STATE_KEY}, {call_state_token}));
 	}
 
 	// Serialize as IPC stream
