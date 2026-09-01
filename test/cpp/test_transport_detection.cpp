@@ -8,6 +8,7 @@
 #include "catch.hpp"
 
 #include "vgi_transport.hpp"
+#include "vgi_httpi.hpp"
 
 #include <stdexcept>
 
@@ -81,6 +82,16 @@ TEST_CASE("httpi locations preserve a strict canonical base path", "[transport]"
 	CHECK_THROWS_AS(ParseHttpiUrl("httpi://" + endpoint + "/a?x=1"), std::invalid_argument);
 	CHECK_THROWS_AS(ParseHttpiUrl("httpi://" + endpoint + "/a#fragment"), std::invalid_argument);
 	CHECK_THROWS_AS(ParseHttpiUrl("httpi://" + endpoint + "/has space"), std::invalid_argument);
+}
+
+TEST_CASE("httpi response heads distinguish HTTP from pre-response terminal evidence", "[transport]") {
+	using namespace duckdb::vgi::httpi;
+	CHECK(ClassifyResponseHead(kRawRepresentation, 200, 2) == ResponseHeadKind::HTTP);
+	CHECK(ClassifyResponseHead(kRawRepresentation | kTerminalOnly, 0, 0) == ResponseHeadKind::TERMINAL_ONLY);
+	CHECK(ClassifyResponseHead(kRawRepresentation, 0, 0) == ResponseHeadKind::INVALID);
+	CHECK(ClassifyResponseHead(kRawRepresentation | kTerminalOnly, 200, 0) == ResponseHeadKind::INVALID);
+	CHECK(ClassifyResponseHead(kRawRepresentation | kTerminalOnly, 0, 1) == ResponseHeadKind::INVALID);
+	CHECK(ClassifyResponseHead(kRawRepresentation | 0x8000, 200, 0) == ResponseHeadKind::INVALID);
 }
 
 TEST_CASE("iroh locations are strict canonical browser targets", "[transport]") {

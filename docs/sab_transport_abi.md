@@ -99,15 +99,19 @@ envelope:
 request head:  "VGIH" | version=1 | kind=1 | flags=0 |
                method_len:u16 | reserved:u16 | path_len:u32 | header_count:u32
                method | path | repeated(name_len:u32,value_len:u32,name,value)
-response head: "VGIH" | version=1 | kind=2 | flags:u16(raw=bit0) |
+response head: "VGIH" | version=1 | kind=2 | flags:u16(raw=bit0, terminal-only=bit1) |
                status:u16 | reserved:u16 | header_count:u32 | repeated fields
 body frame:    kind:u8 | stage:u8 | category:u8 | certainty:u8 | length:u32 | bytes
 ```
 
-Body frame kinds are chunk=1, end=2, terminal=3. Chunks are at most 64 KiB;
-header count is at most 1024 and total header bytes at most 1 MiB. The C++ client
-buffers at most 1 GiB because the surrounding HTTP implementation currently
-materializes responses; no configurable native HTTP response limit exists.
+Body frame kinds are chunk=1, end=2, terminal=3. A failure before an HTTP head
+uses flags=3, status=0, no headers, and exactly one terminal frame; status zero
+without terminal-only is invalid. Chunks are at most 64 KiB;
+header count is at most 1024 and total header bytes at most 1 MiB. The browser
+adapter defaults to 64 MiB per materialized request and 128 MiB aggregate across
+active claims. The C++ client buffers at most 1 GiB per response because the
+surrounding HTTP implementation currently materializes responses; no
+configurable native HTTP response limit exists.
 Duplicate fields retain order, including `Set-Cookie`, and response bit 0 is
 mandatory because browser Iroh returns raw representation bytes.
 

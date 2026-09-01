@@ -605,20 +605,19 @@ Response BrowserPost(ClientContext &context, const std::string &url, const std::
 		throw IOException("VGI HTTPI adapter returned an invalid response envelope [url: %s]", url);
 	}
 	const uint16_t flags = static_cast<uint16_t>(prefix[6]) | (static_cast<uint16_t>(prefix[7]) << 8);
-	if ((flags & kRawRepresentation) == 0) {
-		throw IOException("VGI HTTPI adapter did not mark response bytes as raw representation [url: %s]", url);
-	}
 	Response response;
 	response.raw_representation = true;
 	response.status = ReadU16(input, url);
-	if (response.status < 100 || response.status > 999) {
-		throw IOException("VGI HTTPI adapter returned an invalid HTTP status [url: %s]", url);
-	}
 	(void)ReadU16(input, url);
 	const uint32_t header_count = ReadU32(input, url);
 	if (header_count > kMaxHeaders) {
 		throw IOException("VGI HTTPI response has too many headers [url: %s]", url);
 	}
+	const auto head_kind = ClassifyResponseHead(flags, static_cast<uint16_t>(response.status), header_count);
+	if (head_kind == ResponseHeadKind::INVALID) {
+		throw IOException("VGI HTTPI adapter returned an invalid response head [url: %s]", url);
+	}
+	const bool terminal_only = head_kind == ResponseHeadKind::TERMINAL_ONLY;
 	header_bytes = 0;
 	response.headers.reserve(header_count);
 	for (uint32_t i = 0; i < header_count; ++i) {
@@ -641,6 +640,9 @@ Response BrowserPost(ClientContext &context, const std::string &url, const std::
 		const uint32_t length = static_cast<uint32_t>(frame[4]) | (static_cast<uint32_t>(frame[5]) << 8) |
 		                        (static_cast<uint32_t>(frame[6]) << 16) | (static_cast<uint32_t>(frame[7]) << 24);
 		if (frame[0] == kBodyChunk) {
+			if (terminal_only) {
+				throw IOException("VGI HTTPI terminal-only response contained body bytes [url: %s]", url);
+			}
 			if (length > kChunkBytes) {
 				throw IOException("VGI HTTPI response chunk exceeds envelope limit [url: %s]", url);
 			}
@@ -652,6 +654,9 @@ Response BrowserPost(ClientContext &context, const std::string &url, const std::
 			continue;
 		}
 		if (frame[0] == kBodyEnd && length == 0) {
+			if (terminal_only) {
+				throw IOException("VGI HTTPI terminal-only response ended without evidence [url: %s]", url);
+			}
 			break;
 		}
 		if (frame[0] == kBodyTerminal && length <= kMaxTerminalDetailBytes) {

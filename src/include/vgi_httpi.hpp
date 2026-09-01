@@ -19,6 +19,7 @@ constexpr uint8_t kVersion = 1;
 constexpr uint8_t kRequest = 1;
 constexpr uint8_t kResponse = 2;
 constexpr uint16_t kRawRepresentation = 1;
+constexpr uint16_t kTerminalOnly = 2;
 constexpr uint8_t kBodyChunk = 1;
 constexpr uint8_t kBodyEnd = 2;
 constexpr uint8_t kBodyTerminal = 3;
@@ -27,6 +28,18 @@ constexpr size_t kMaxHeaders = 1024;
 constexpr size_t kMaxHeaderBytes = 1024 * 1024;
 constexpr size_t kMaxTerminalDetailBytes = 512;
 constexpr size_t kMaxBufferedBodyBytes = 1024ULL * 1024ULL * 1024ULL;
+
+enum class ResponseHeadKind { INVALID, HTTP, TERMINAL_ONLY };
+
+inline ResponseHeadKind ClassifyResponseHead(uint16_t flags, uint16_t status, uint32_t header_count) {
+	if ((flags & kRawRepresentation) == 0 || (flags & ~(kRawRepresentation | kTerminalOnly)) != 0) {
+		return ResponseHeadKind::INVALID;
+	}
+	if ((flags & kTerminalOnly) != 0) {
+		return status == 0 && header_count == 0 ? ResponseHeadKind::TERMINAL_ONLY : ResponseHeadKind::INVALID;
+	}
+	return status >= 100 && status <= 999 ? ResponseHeadKind::HTTP : ResponseHeadKind::INVALID;
+}
 
 enum class Stage : uint8_t {
 	NONE = 0,
