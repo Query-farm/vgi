@@ -238,6 +238,9 @@ private:
 	// destruction. A non-negative slot_ is the "worker exists" flag (analog of
 	// the subprocess proc_).
 	int slot_ = -1;
+	// Byte offset of this canonical target's independent ABI-v1 region. Zero is
+	// the native-test region; wasm regions are nonzero malloc offsets.
+	int region_offset_ = 0;
 
 	// Streaming-state flags. Bind is just an RPC; no state is tracked for it.
 	bool init_done_ = false;

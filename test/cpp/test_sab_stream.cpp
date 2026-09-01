@@ -13,6 +13,7 @@
 #include <arrow/api.h>
 #include <arrow/ipc/api.h>
 
+#include <atomic>
 #include <memory>
 #include <thread>
 #include <vector>
@@ -25,10 +26,14 @@ extern "C" {
 int vgi_sab_worker_read(int slot, uint8_t *d, int n);
 int vgi_sab_worker_write(int slot, const uint8_t *d, int n);
 void vgi_sab_worker_close(int slot);
+void vgi_sab_native_worker_fail(int region_offset, int slot, int code, int detail);
+int vgi_sab_native_slot_claim(int region_offset, int slot);
+void vgi_sab_native_worker_fail_claim(int region_offset, int slot, int claim, int code, int detail);
 }
 
 TEST_CASE("SabInput/OutputStream round-trip an Arrow IPC stream over the ring", "[sab]") {
-	int slot = vgi_wasm_slot_open("test");
+	constexpr int region = 0;
+	int slot = vgi_wasm_slot_open("test", region);
 	REQUIRE(slot >= 0);
 
 	// Echo worker: copy c2w -> w2c until the client closes c2w (EOF), then EOS w2c.
@@ -54,17 +59,17 @@ TEST_CASE("SabInput/OutputStream round-trip an Arrow IPC stream over the ring", 
 
 	// Write it as an IPC stream to c2w (SabOutputStream), then EOS marker + ring EOF.
 	{
-		auto out = std::make_shared<SabOutputStream>(slot);
+		auto out = std::make_shared<SabOutputStream>(region, slot);
 		auto writer_res = arrow::ipc::MakeStreamWriter(out, schema);
 		REQUIRE(writer_res.ok());
 		auto writer = *writer_res;
 		REQUIRE(writer->WriteRecordBatch(*batch).ok());
 		REQUIRE(writer->Close().ok());
 	}
-	vgi_wasm_slot_write_eos(slot);
+	vgi_wasm_slot_write_eos(region, slot);
 
 	// Read it back from w2c (SabInputStream) and verify byte-for-byte.
-	auto in = std::make_shared<SabInputStream>(slot);
+	auto in = std::make_shared<SabInputStream>(region, slot);
 	auto reader_res = arrow::ipc::RecordBatchStreamReader::Open(in);
 	REQUIRE(reader_res.ok());
 	auto reader = *reader_res;
@@ -83,5 +88,90 @@ TEST_CASE("SabInput/OutputStream round-trip an Arrow IPC stream over the ring", 
 	CHECK(got == nullptr);
 
 	worker.join();
-	vgi_wasm_slot_release(slot);
+	vgi_wasm_slot_release(region, slot);
+}
+
+TEST_CASE("SAB operations carry an explicit target-region offset", "[sab]") {
+	constexpr int first_region = 101;
+	constexpr int second_region = 202;
+	int first_slot = vgi_wasm_slot_open("first", first_region);
+	int second_slot = vgi_wasm_slot_open("second", second_region);
+	REQUIRE(first_slot == 0);
+	REQUIRE(second_slot == 0);
+	std::atomic<int> first_worker_status {0};
+	std::atomic<int> second_worker_status {0};
+
+	std::thread first_worker([&]() {
+		vgi_wasm_set_channel(first_region);
+		uint8_t byte = 0;
+		if (vgi_sab_worker_read(first_slot, &byte, 1) != 1) {
+			first_worker_status.store(-1);
+			return;
+		}
+		byte += 10;
+		if (vgi_sab_worker_write(first_slot, &byte, 1) != 1) {
+			first_worker_status.store(-2);
+			return;
+		}
+		vgi_sab_worker_close(first_slot);
+		first_worker_status.store(1);
+	});
+	std::thread second_worker([&]() {
+		vgi_wasm_set_channel(second_region);
+		uint8_t byte = 0;
+		if (vgi_sab_worker_read(second_slot, &byte, 1) != 1) {
+			second_worker_status.store(-1);
+			return;
+		}
+		byte += 20;
+		if (vgi_sab_worker_write(second_slot, &byte, 1) != 1) {
+			second_worker_status.store(-2);
+			return;
+		}
+		vgi_sab_worker_close(second_slot);
+		second_worker_status.store(1);
+	});
+
+	uint8_t first = 1;
+	uint8_t second = 2;
+	REQUIRE(vgi_wasm_slot_write(first_region, first_slot, &first, 1) == 1);
+	REQUIRE(vgi_wasm_slot_write(second_region, second_slot, &second, 1) == 1);
+	vgi_wasm_slot_write_eos(first_region, first_slot);
+	vgi_wasm_slot_write_eos(second_region, second_slot);
+	REQUIRE(vgi_wasm_slot_read(second_region, second_slot, &second, 1) == 1);
+	REQUIRE(vgi_wasm_slot_read(first_region, first_slot, &first, 1) == 1);
+	CHECK(first == 11);
+	CHECK(second == 22);
+
+	first_worker.join();
+	second_worker.join();
+	CHECK(first_worker_status.load() == 1);
+	CHECK(second_worker_status.load() == 1);
+	vgi_wasm_slot_release(first_region, first_slot);
+	vgi_wasm_slot_release(second_region, second_slot);
+}
+
+TEST_CASE("SAB terminal transport metadata is claim-safe", "[sab]") {
+	constexpr int region = 303;
+	int slot = vgi_wasm_slot_open("terminal", region);
+	REQUIRE(slot == 0);
+	const int old_claim = vgi_sab_native_slot_claim(region, slot);
+	vgi_sab_native_worker_fail(region, slot, 41, 9001);
+
+	uint8_t byte = 0;
+	CHECK(vgi_wasm_slot_read(region, slot, &byte, 1) == duckdb::vgi::sab::kSabTerminalTransportError);
+	int code = 0;
+	int detail = 0;
+	REQUIRE(vgi_wasm_slot_terminal_error(region, slot, &code, &detail) == 1);
+	CHECK(code == 41);
+	CHECK(detail == 9001);
+
+	vgi_wasm_slot_release(region, slot);
+	slot = vgi_wasm_slot_open("terminal", region);
+	REQUIRE(slot == 0);
+	REQUIRE(vgi_sab_native_slot_claim(region, slot) != old_claim);
+	vgi_sab_native_worker_fail_claim(region, slot, old_claim, 99, 7);
+	CHECK(vgi_wasm_slot_read(region, slot, &byte, 1) == 0);
+	CHECK(vgi_wasm_slot_terminal_error(region, slot, &code, &detail) == 0);
+	vgi_wasm_slot_release(region, slot);
 }

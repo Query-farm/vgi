@@ -22,6 +22,7 @@ enum HeaderLane : int32_t {
 	HDR_RING_CAP = 3,     // bytes per ring (per direction)
 	HDR_SLOT_STRIDE = 4,  // bytes per slot
 	HDR_SLOTS_OFF = 5,    // byte offset of slot[0]
+	HDR_FEATURES = 6,     // additive feature bits understood by both endpoints
 	// lane 7 = ensure-worker ready flag (client-side, js-stubs.js)
 	HDR_CLAIM_SEQ = 8,    // monotonic global claim-id counter (Atomics.add on slot_open)
 };
@@ -49,11 +50,24 @@ enum SlotLane : int32_t {
 	// still reads as "closed" for a same-claim reader iff STATE==1, but the C++ side never
 	// uses claim id 1, so mixed old workers simply never spuriously-close a reused slot.
 	W2C_CLOSED = 6,
+	// Optional claim-safe terminal transport metadata. A terminal error belongs
+	// to the current claim only when SLOT_TERMINAL_CLAIM == SLOT_STATE. This is
+	// the same stale-writer guard as W2C_CLOSED and prevents a late adapter error
+	// from poisoning a region slot after release + reclaim.
+	SLOT_TERMINAL_CLAIM = 7,
+	SLOT_TERMINAL_CODE = 8,
+	SLOT_TERMINAL_DETAIL = 9,
 };
 constexpr int32_t kSlotControlBytes = 64; // control block, cache-line isolated
 
 // vgi_wasm_slot_read sentinel: ring empty after a bounded wait — poll cancellation + retry.
 constexpr int32_t kSabWouldBlock = -2;
+constexpr int32_t kSabTerminalTransportError = -3;
+
+enum Feature : uint32_t {
+	kFeatureTerminalTransportError = 1u << 0,
+};
+constexpr uint32_t kSupportedFeatures = kFeatureTerminalTransportError;
 
 // state values. STATE=0 is free; a claim stores a UNIQUE nonzero id (from the
 // HDR_CLAIM_SEQ counter) rather than a constant 1, so the per-slot worker
@@ -85,21 +99,24 @@ inline int32_t SlotStride(int32_t ring_cap) {
 // docs/sab_transport_abi.md for full semantics.
 extern "C" {
 // Ensure the worker for `location` exists and is wired to the channel. 0 = ok.
-int vgi_wasm_ensure_worker(const char *location);
+int vgi_wasm_ensure_worker(const char *location, int region_offset);
 // Claim a free slot (CAS state 0->1, reset rings). >=0 slot id, or <0 on exhaustion.
-int vgi_wasm_slot_open(const char *location);
+int vgi_wasm_slot_open(const char *location, int region_offset);
 // Blocking write of all n bytes into the slot's c2w ring. Returns n, or <0 on cancel.
-int vgi_wasm_slot_write(int slot, const uint8_t *data, int n);
+int vgi_wasm_slot_write(int region_offset, int slot, const uint8_t *data, int n);
 // Signal EOS on the c2w (input) ring (CloseInputWriter).
-void vgi_wasm_slot_write_eos(int slot);
+void vgi_wasm_slot_write_eos(int region_offset, int slot);
 // Read up to n bytes from the w2c ring. >0 = bytes read, 0 = EOS (worker closed +
 // drained). Two negative sentinels: VGI_SAB_WOULD_BLOCK (-2) = the ring was empty for a
 // bounded wait (the caller must poll query-cancellation and retry, so an in-flight
 // prefetch read on a DuckDB task thread doesn't block DuckDB's error/cancel busy-wait
 // forever — see docs/sab_transport_abi.md "Cancellation"); any other <0 = hard error.
-int vgi_wasm_slot_read(int slot, uint8_t *data, int n);
+int vgi_wasm_slot_read(int region_offset, int slot, uint8_t *data, int n);
+// Read claim-safe metadata after kSabTerminalTransportError. Returns 1 only
+// when metadata belongs to the slot's current claim, otherwise 0.
+int vgi_wasm_slot_terminal_error(int region_offset, int slot, int *code, int *detail);
 // Release the slot (state -> 0). Idempotent.
-void vgi_wasm_slot_release(int slot);
+void vgi_wasm_slot_release(int region_offset, int slot);
 // Push the channel's byte offset in linear memory onto the calling pthread's JS
 // runtime (the slot stubs read the channel via Module.HEAP at this offset). C++
 // calls this per connection with the shared channel offset. wasm build only; the

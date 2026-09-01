@@ -76,12 +76,13 @@ bool SabDispatchBatch(const std::shared_ptr<arrow::RecordBatch> &batch,
 
 // SAB analog of ReadUnaryResponse: open a reader on the worker->client ring,
 // dispatch log/error until the first data batch, then drain to EOS.
-UnaryResponseResult SabReadUnaryResponse(int slot, ClientContext *context, const std::string &worker_path,
+UnaryResponseResult SabReadUnaryResponse(int region_offset, int slot, ClientContext *context,
+                                         const std::string &worker_path,
                                          const std::string &invocation_id_hex = "",
                                          const std::string &attach_opaque_data_hex = "",
                                          const std::string &transaction_opaque_data_hex = "",
                                          const std::string &conn_id_hex = "") {
-	auto input = std::make_shared<SabInputStream>(slot, context);
+	auto input = std::make_shared<SabInputStream>(region_offset, slot, context);
 	auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(input);
 	if (!reader_result.ok()) {
 		auto status = reader_result.status();
@@ -132,8 +133,9 @@ UnaryResponseResult SabReadUnaryResponse(int slot, ClientContext *context, const
 // dispatch log/error until the header data batch, then drain to EOS. After EOS
 // the data IPC stream begins on the same ring (a fresh SabInputStream/reader
 // picks it up), exactly as on the subprocess fd.
-StreamHeaderResult SabReadStreamHeader(int slot, ClientContext *context, const std::string &worker_path) {
-	auto input = std::make_shared<SabInputStream>(slot, context);
+StreamHeaderResult SabReadStreamHeader(int region_offset, int slot, ClientContext *context,
+                                       const std::string &worker_path) {
+	auto input = std::make_shared<SabInputStream>(region_offset, slot, context);
 	auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(input);
 	if (!reader_result.ok()) {
 		auto status = reader_result.status();
@@ -241,7 +243,7 @@ namespace {
 // Forward declaration — defined below in its own __EMSCRIPTEN__-guarded
 // anon-namespace block (same TU-local anon namespace, so this links). Needed here
 // because WebWorkerInvokeUnary (below) calls it before that definition.
-int EnsureVgiSabChannel();
+int EnsureVgiSabRegion(const std::string &canonical_target);
 } // namespace
 
 // Publish the shared channel's byte offset onto the CALLING pthread's JS realm.
@@ -252,11 +254,11 @@ int EnsureVgiSabChannel();
 // location and block forever (an intermittent, thread-scheduling-dependent hang). The
 // SAB stream Read/Write call this first so the current realm is always correct. Cheap:
 // EnsureVgiSabChannel is a cached atomic load and set_channel is a JS field store.
-void VgiSabEnsureChannelOnRealm() {
-	vgi_wasm_set_channel(EnsureVgiSabChannel());
+void VgiSabEnsureChannelOnRealm(int region_offset) {
+	vgi_wasm_set_channel(region_offset);
 }
 #else
-void VgiSabEnsureChannelOnRealm() {}
+void VgiSabEnsureChannelOnRealm(int) {}
 #endif
 
 // Standalone unary RPC over the `worker:` SAB transport, for catalog RPCs (ATTACH
@@ -272,37 +274,40 @@ UnaryResponseResult WebWorkerInvokeUnary(ClientContext &context, const std::stri
                                          const std::shared_ptr<arrow::RecordBatch> &params,
                                          const std::string &protocol_version_override) {
 	const std::string location = StripWebWorkerScheme(worker_path);
+	int region_offset = 0;
 #if defined(__EMSCRIPTEN__)
-	vgi_wasm_set_channel(EnsureVgiSabChannel());
+	region_offset = EnsureVgiSabRegion(location);
+	vgi_wasm_set_channel(region_offset);
 #endif
-	if (vgi_wasm_ensure_worker(location.c_str()) != 0) {
+	if (vgi_wasm_ensure_worker(location.c_str(), region_offset) != 0) {
 		ThrowVgiIOException("Failed to spawn/ready the VGI Web Worker", location, -1, "");
 	}
-	int slot = vgi_wasm_slot_open(location.c_str());
+	int slot = vgi_wasm_slot_open(location.c_str(), region_offset);
 	if (slot < 0) {
 		ThrowVgiIOException("Failed to open SAB slot (channel exhausted)", location, -1, "");
 	}
 	// RAII: always release the transient slot (the dispatcher then serves the next).
 	struct SlotReleaser {
+		int region_offset;
 		int slot;
 		~SlotReleaser() {
 			if (slot >= 0) {
-				vgi_wasm_slot_release(slot);
+				vgi_wasm_slot_release(region_offset, slot);
 			}
 		}
-	} releaser {slot};
+	} releaser {region_offset, slot};
 
 	std::vector<uint8_t> request = params ? SerializeRpcRequest(method_name, params, protocol_version_override)
 	                                      : SerializeEmptyRpcRequest(method_name);
-	auto out = std::make_shared<SabOutputStream>(slot);
+	auto out = std::make_shared<SabOutputStream>(region_offset, slot);
 	auto write_status = out->Write(request.data(), static_cast<int64_t>(request.size()));
 	if (!write_status.ok()) {
 		ThrowVgiIOException("Failed to write unary request: %s", location, -1, "", write_status.ToString());
 	}
 	// EOS on c2w so the worker's serve loop reads exactly this one request,
 	// responds on w2c, then returns (transient slot = one request lifecycle).
-	vgi_wasm_slot_write_eos(slot);
-	return SabReadUnaryResponse(slot, &context, location);
+	vgi_wasm_slot_write_eos(region_offset, slot);
+	return SabReadUnaryResponse(region_offset, slot, &context, location);
 }
 
 // ============================================================================
@@ -330,45 +335,51 @@ WebWorkerFunctionConnection::~WebWorkerFunctionConnection() {
 		// this same connection), so closing the ring per stream would end the
 		// worker after the first one. Idempotent, so a connection already torn
 		// down through CloseInputWriter is unaffected.
-		vgi_wasm_slot_write_eos(slot_);
+		vgi_wasm_slot_write_eos(region_offset_, slot_);
 		// Release the SAB slot (state -> free). Idempotent; safe if never opened.
-		vgi_wasm_slot_release(slot_);
+		vgi_wasm_slot_release(region_offset_, slot_);
 		slot_ = -1;
 	}
 }
 
 #if defined(__EMSCRIPTEN__)
 namespace {
-// Lazily create the one shared SAB channel in DuckDB's linear memory and return
-// its byte offset. All connections/pthreads share it (decision #1); the ABI
-// header is written here so the JS slot stubs are self-describing. wasm-only —
-// the native test uses the static in-process ring backend and never calls this.
-int EnsureVgiSabChannel() {
-	static std::atomic<int> g_channel{0};
-	static std::mutex g_mutex;
-	int existing = g_channel.load(std::memory_order_acquire);
-	if (existing != 0) {
-		return existing;
+// Each canonical target owns an independent ABI-v1 region. A region can be
+// recycled only while every slot is free, so a live connection can never be
+// rebound underneath an operation. Keeping each region byte-compatible with v1
+// lets legacy worker modules continue to serve one region unchanged while an
+// adapter-aware worker may register several offsets.
+struct SabRegionEntry {
+	int offset;
+	uint64_t last_used;
+};
+
+#ifndef VGI_SAB_MAX_TARGET_REGIONS
+#define VGI_SAB_MAX_TARGET_REGIONS 32
+#endif
+static_assert(VGI_SAB_MAX_TARGET_REGIONS > 0, "VGI_SAB_MAX_TARGET_REGIONS must be positive");
+constexpr size_t kMaximumSabTargetRegions = VGI_SAB_MAX_TARGET_REGIONS;
+
+bool SabRegionIsIdle(int offset) {
+	auto *h = reinterpret_cast<int32_t *>(static_cast<intptr_t>(offset));
+	const int n_slots = h[sab::HDR_N_SLOTS];
+	const int stride = h[sab::HDR_SLOT_STRIDE];
+	const int slots_off = h[sab::HDR_SLOTS_OFF];
+	for (int slot = 0; slot < n_slots; ++slot) {
+		auto *control = reinterpret_cast<int32_t *>(reinterpret_cast<uint8_t *>(h) + slots_off + slot * stride);
+		if (__atomic_load_n(&control[sab::SLOT_STATE], __ATOMIC_ACQUIRE) != sab::kSlotFree) {
+			return false;
+		}
 	}
-	std::lock_guard<std::mutex> lk(g_mutex);
-	existing = g_channel.load(std::memory_order_relaxed);
-	if (existing != 0) {
-		return existing;
-	}
-	// Concurrent slot count = the worker's serve-thread count, matched to the engine's
-	// max scan threads (4). Same-slot reuse is made safe by the worker-done-aware
-	// release (AwaitWorkerDoneThenRelease) + the unique claim-id STATE handoff, so no
-	// extra headroom is needed — a released slot is provably idle and cleanly reusable.
-	// (A bare Web Worker with many pthreads is heavy on the browser; keep this modest.
-	// PTHREAD_POOL_SIZE in the worker build must be >= this.)
+	return true;
+}
+
+void InitializeSabRegion(int offset) {
 	const int n_slots = 4;
 	const int ring_cap = sab::kDefaultRingCap;
 	const int stride = sab::SlotStride(ring_cap);
 	const int bytes = sab::kHeaderBytes + n_slots * stride;
-	void *mem = std::malloc(static_cast<size_t>(bytes));
-	if (mem == nullptr) {
-		throw IOException("VGI worker: failed to allocate SAB channel (%d bytes)", bytes);
-	}
+	auto *mem = reinterpret_cast<void *>(static_cast<intptr_t>(offset));
 	std::memset(mem, 0, static_cast<size_t>(bytes));
 	auto *h = reinterpret_cast<int32_t *>(mem);
 	h[sab::HDR_MAGIC] = static_cast<int32_t>(sab::kMagic);
@@ -377,9 +388,52 @@ int EnsureVgiSabChannel() {
 	h[sab::HDR_RING_CAP] = ring_cap;
 	h[sab::HDR_SLOT_STRIDE] = stride;
 	h[sab::HDR_SLOTS_OFF] = sab::kHeaderBytes;
-	const int off = static_cast<int>(reinterpret_cast<intptr_t>(mem));
-	g_channel.store(off, std::memory_order_release);
-	return off;
+	h[sab::HDR_FEATURES] = static_cast<int32_t>(sab::kSupportedFeatures);
+}
+
+int AllocateSabRegion() {
+	const int stride = sab::SlotStride(sab::kDefaultRingCap);
+	const int bytes = sab::kHeaderBytes + 4 * stride;
+	void *mem = std::malloc(static_cast<size_t>(bytes));
+	if (mem == nullptr) {
+		throw IOException("VGI worker: failed to allocate SAB target region (%d bytes)", bytes);
+	}
+	const int offset = static_cast<int>(reinterpret_cast<intptr_t>(mem));
+	InitializeSabRegion(offset);
+	return offset;
+}
+
+int EnsureVgiSabRegion(const std::string &canonical_target) {
+	static std::map<std::string, SabRegionEntry> g_regions;
+	static uint64_t g_touch = 0;
+	static std::mutex g_mutex;
+	std::lock_guard<std::mutex> lk(g_mutex);
+	auto found = g_regions.find(canonical_target);
+	if (found != g_regions.end()) {
+		found->second.last_used = ++g_touch;
+		return found->second.offset;
+	}
+	int offset = 0;
+	if (g_regions.size() < kMaximumSabTargetRegions) {
+		offset = AllocateSabRegion();
+	} else {
+		auto victim = g_regions.end();
+		for (auto it = g_regions.begin(); it != g_regions.end(); ++it) {
+			if (SabRegionIsIdle(it->second.offset) &&
+			    (victim == g_regions.end() || it->second.last_used < victim->second.last_used)) {
+				victim = it;
+			}
+		}
+		if (victim == g_regions.end()) {
+			throw IOException("VGI worker: target region limit reached (%d active targets)",
+			                  static_cast<int>(kMaximumSabTargetRegions));
+		}
+		offset = victim->second.offset;
+		g_regions.erase(victim);
+		InitializeSabRegion(offset);
+	}
+	g_regions.emplace(canonical_target, SabRegionEntry {offset, ++g_touch});
+	return offset;
 }
 } // namespace
 #endif
@@ -392,16 +446,17 @@ void WebWorkerFunctionConnection::EnsureWorkerSpawned() {
 #if defined(__EMSCRIPTEN__)
 		// Create/reuse the shared channel and push its offset onto this pthread's
 		// JS runtime before the slot stubs touch it. (Native test: static ring.)
-		vgi_wasm_set_channel(EnsureVgiSabChannel());
+		region_offset_ = EnsureVgiSabRegion(location_);
+		vgi_wasm_set_channel(region_offset_);
 #endif
 		// Ensure the Web Worker for this location exists and is serving the channel
 		// before we claim a slot. Idempotent (spawns once per location); blocks
 		// until the worker booted. On the native test the stub is a no-op (returns
 		// 0) — the in-process ring backend needs no spawn.
-		if (vgi_wasm_ensure_worker(location_.c_str()) != 0) {
+		if (vgi_wasm_ensure_worker(location_.c_str(), region_offset_) != 0) {
 			ThrowVgiIOException("Failed to spawn/ready the VGI Web Worker", location_, -1, "");
 		}
-		slot_ = vgi_wasm_slot_open(location_.c_str());
+		slot_ = vgi_wasm_slot_open(location_.c_str(), region_offset_);
 		if (slot_ < 0) {
 			ThrowVgiIOException("Failed to open SAB slot (channel exhausted)", location_, -1, "");
 		}
@@ -426,13 +481,13 @@ BindResult WebWorkerFunctionConnection::PerformBindRpc() {
 		ValidateRequestSchema(rpc_params, "bind", location_);
 
 		auto request = SerializeRpcRequest("bind", rpc_params);
-		auto out = std::make_shared<SabOutputStream>(slot_);
+		auto out = std::make_shared<SabOutputStream>(region_offset_, slot_);
 		auto write_status = out->Write(request.data(), static_cast<int64_t>(request.size()));
 		if (!write_status.ok()) {
 			ThrowVgiIOException("Failed to write bind request: %s", location_, -1, "", write_status.ToString());
 		}
 
-		auto response = SabReadUnaryResponse(slot_, &context_, location_);
+		auto response = SabReadUnaryResponse(region_offset_, slot_, &context_, location_);
 		if (!response.batch || response.batch->num_rows() == 0) {
 			ThrowVgiIOException("Empty bind response from worker", location_, -1, "");
 		}
@@ -522,7 +577,7 @@ InitResult WebWorkerFunctionConnection::PerformInit(const BindResult &bind_resul
 	// channel on this transport; the SAB ring is the transfer medium.)
 	{
 		auto request = SerializeRpcRequest("init", rpc_params);
-		auto out = std::make_shared<SabOutputStream>(slot_);
+		auto out = std::make_shared<SabOutputStream>(region_offset_, slot_);
 		auto write_status = out->Write(request.data(), static_cast<int64_t>(request.size()));
 		if (!write_status.ok()) {
 			ThrowVgiIOException("Failed to write init request: %s", location_, -1, GetExecutionIdHex(),
@@ -530,7 +585,7 @@ InitResult WebWorkerFunctionConnection::PerformInit(const BindResult &bind_resul
 		}
 	}
 
-	auto header = SabReadStreamHeader(slot_, &context_, location_);
+	auto header = SabReadStreamHeader(region_offset_, slot_, &context_, location_);
 	auto init_response = ParseGlobalInitResponse(header.header_batch, location_);
 	execution_id_ = init_response.execution_id;
 
@@ -546,7 +601,7 @@ InitResult WebWorkerFunctionConnection::PerformInit(const BindResult &bind_resul
 		is_producer_mode_ = true;
 		tick_schema_ = arrow::schema({});
 
-		auto sink = std::make_shared<SabOutputStream>(slot_);
+		auto sink = std::make_shared<SabOutputStream>(region_offset_, slot_);
 		auto writer_result = arrow::ipc::MakeStreamWriter(sink, tick_schema_);
 		if (!writer_result.ok()) {
 			ThrowVgiIOException("Failed to create tick writer: %s", location_, -1, GetExecutionIdHex(),
@@ -582,7 +637,7 @@ InitResult WebWorkerFunctionConnection::PerformInit(const BindResult &bind_resul
 
 		// Open the data reader — the worker has processed the tick and flushed
 		// the output schema + first data batch.
-		data_stream_ = std::make_shared<SabInputStream>(slot_, &context_);
+		data_stream_ = std::make_shared<SabInputStream>(region_offset_, slot_, &context_);
 		auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(data_stream_);
 		if (!reader_result.ok()) {
 			ThrowVgiIOException("Failed to open data stream: %s", location_, -1, GetExecutionIdHex(),
@@ -592,7 +647,7 @@ InitResult WebWorkerFunctionConnection::PerformInit(const BindResult &bind_resul
 	} else {
 		is_producer_mode_ = false;
 
-		auto sink = std::make_shared<SabOutputStream>(slot_);
+		auto sink = std::make_shared<SabOutputStream>(region_offset_, slot_);
 		auto writer_result = arrow::ipc::MakeStreamWriter(sink, input_schema_);
 		if (!writer_result.ok()) {
 			ThrowVgiIOException("Failed to create input writer: %s", location_, -1, GetExecutionIdHex(),
@@ -646,7 +701,7 @@ void WebWorkerFunctionConnection::PerformFinalizeInit(const BindResult &bind_res
 	// sending the FINALIZE init, otherwise SabReadStreamHeader reads leftover
 	// INPUT-phase output instead of the FINALIZE header.
 	if (!data_reader_ && slot_ >= 0) {
-		data_stream_ = std::make_shared<SabInputStream>(slot_, &context_);
+		data_stream_ = std::make_shared<SabInputStream>(region_offset_, slot_, &context_);
 		auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(data_stream_);
 		if (reader_result.ok()) {
 			data_reader_ = reader_result.ValueUnsafe();
@@ -723,7 +778,7 @@ void WebWorkerFunctionConnection::ResetForNextSplit() {
 	// documents for the 0-input-row case, reached here by a different route — an
 	// empty split is the likelier shape, since a filter only has to prune one.
 	if (!data_reader_ && slot_ >= 0) {
-		data_stream_ = std::make_shared<SabInputStream>(slot_, &context_);
+		data_stream_ = std::make_shared<SabInputStream>(region_offset_, slot_, &context_);
 		auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(data_stream_);
 		if (reader_result.ok()) {
 			data_reader_ = reader_result.ValueUnsafe();
@@ -767,7 +822,7 @@ std::shared_ptr<arrow::RecordBatch> WebWorkerFunctionConnection::ReadDataBatch()
 			ThrowVgiIOException("WebWorkerFunctionConnection::ReadDataBatch slot is not open", location_, -1,
 			                    GetExecutionIdHex());
 		}
-		data_stream_ = std::make_shared<SabInputStream>(slot_, &context_);
+		data_stream_ = std::make_shared<SabInputStream>(region_offset_, slot_, &context_);
 		auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(data_stream_);
 		if (!reader_result.ok()) {
 			ThrowVgiIOException("Failed to open data stream: %s", location_, -1, GetExecutionIdHex(),
@@ -878,8 +933,8 @@ std::shared_ptr<arrow::RecordBatch> WebWorkerFunctionConnection::ReadDataBatch()
 			data_finished_ = true;
 			input_writer_closed_ = true; // abandon the Arrow writer; ring EOS below drives teardown
 			if (slot_ >= 0) {
-				vgi_wasm_slot_write_eos(slot_);
-				vgi_wasm_slot_release(slot_);
+				vgi_wasm_slot_write_eos(region_offset_, slot_);
+				vgi_wasm_slot_release(region_offset_, slot_);
 				slot_ = -1;
 			}
 			throw;
@@ -1005,7 +1060,7 @@ void WebWorkerFunctionConnection::OpenInputWriter() {
 		                    location_, -1, GetExecutionIdHex());
 	}
 
-	auto sink = std::make_shared<SabOutputStream>(slot_);
+	auto sink = std::make_shared<SabOutputStream>(region_offset_, slot_);
 	auto writer_result = arrow::ipc::MakeStreamWriter(sink, input_schema_);
 	if (!writer_result.ok()) {
 		ThrowVgiIOException("Failed to create input stream writer: %s", location_, -1, GetExecutionIdHex(),
@@ -1096,7 +1151,7 @@ void WebWorkerFunctionConnection::CloseInputWriter() {
 	// Signal ring-level EOF on the client->worker direction so the worker's serve
 	// loop for this slot terminates (analog of closing the subprocess stdin pipe).
 	if (slot_ >= 0) {
-		vgi_wasm_slot_write_eos(slot_);
+		vgi_wasm_slot_write_eos(region_offset_, slot_);
 	}
 
 	{
@@ -1125,13 +1180,13 @@ WebWorkerFunctionConnection::RpcTableBufferingProcess(const std::string &functio
 	vgi::ValidateRequestSchema(rpc_params, "table_buffering_process", location_);
 
 	auto request = SerializeRpcRequest("table_buffering_process", rpc_params);
-	auto out = std::make_shared<SabOutputStream>(slot_);
+	auto out = std::make_shared<SabOutputStream>(region_offset_, slot_);
 	auto write_status = out->Write(request.data(), static_cast<int64_t>(request.size()));
 	if (!write_status.ok()) {
 		ThrowVgiIOException("Failed to write table_buffering_process request: %s", location_, -1,
 		                    GetExecutionIdHex(), write_status.ToString());
 	}
-	auto response = SabReadUnaryResponse(slot_, &context_, location_, GetExecutionIdHex(), GetAttachOpaqueDataHex(),
+	auto response = SabReadUnaryResponse(region_offset_, slot_, &context_, location_, GetExecutionIdHex(), GetAttachOpaqueDataHex(),
 	                                     "", GetConnIdHex());
 	auto inner = DecodeOuterResponse(response, "table_buffering_process", location_);
 	vgi::ValidateResponseSchema(inner, "table_buffering_process", location_);
@@ -1154,13 +1209,13 @@ WebWorkerFunctionConnection::RpcTableBufferingCombine(const std::string &functio
 	vgi::ValidateRequestSchema(rpc_params, "table_buffering_combine", location_);
 
 	auto request = SerializeRpcRequest("table_buffering_combine", rpc_params);
-	auto out = std::make_shared<SabOutputStream>(slot_);
+	auto out = std::make_shared<SabOutputStream>(region_offset_, slot_);
 	auto write_status = out->Write(request.data(), static_cast<int64_t>(request.size()));
 	if (!write_status.ok()) {
 		ThrowVgiIOException("Failed to write table_buffering_combine request: %s", location_, -1,
 		                    GetExecutionIdHex(), write_status.ToString());
 	}
-	auto response = SabReadUnaryResponse(slot_, &context_, location_, GetExecutionIdHex(), GetAttachOpaqueDataHex(),
+	auto response = SabReadUnaryResponse(region_offset_, slot_, &context_, location_, GetExecutionIdHex(), GetAttachOpaqueDataHex(),
 	                                     "", GetConnIdHex());
 	auto inner = DecodeOuterResponse(response, "table_buffering_combine", location_);
 	vgi::ValidateResponseSchema(inner, "table_buffering_combine", location_);
@@ -1188,13 +1243,13 @@ void WebWorkerFunctionConnection::RpcTableBufferingDestructor(const std::string 
 	vgi::ValidateRequestSchema(rpc_params, "table_buffering_destructor", location_);
 
 	auto request = SerializeRpcRequest("table_buffering_destructor", rpc_params);
-	auto out = std::make_shared<SabOutputStream>(slot_);
+	auto out = std::make_shared<SabOutputStream>(region_offset_, slot_);
 	auto write_status = out->Write(request.data(), static_cast<int64_t>(request.size()));
 	if (!write_status.ok()) {
 		ThrowVgiIOException("Failed to write table_buffering_destructor request: %s", location_, -1,
 		                    GetExecutionIdHex(), write_status.ToString());
 	}
-	auto response = SabReadUnaryResponse(slot_, &context_, location_, GetExecutionIdHex(), GetAttachOpaqueDataHex(),
+	auto response = SabReadUnaryResponse(region_offset_, slot_, &context_, location_, GetExecutionIdHex(), GetAttachOpaqueDataHex(),
 	                                     "", GetConnIdHex());
 	auto inner = DecodeOuterResponse(response, "table_buffering_destructor", location_);
 	vgi::ValidateResponseSchema(inner, "table_buffering_destructor", location_);

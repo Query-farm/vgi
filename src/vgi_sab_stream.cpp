@@ -9,17 +9,15 @@
 namespace duckdb {
 namespace vgi {
 
-// Publish the shared channel offset onto the calling pthread's JS realm before ring
-// I/O (defined in vgi_webworker_function_connection.cpp). A connection is bound on one
-// pthread but DuckDB may run its ring reads/writes on a different pool pthread whose
-// realm never had the offset set; without this the JS ring stubs read the wrong
-// linear-memory location and block. wasm-only; a no-op on the native test harness.
-void VgiSabEnsureChannelOnRealm();
+// Preserve the ABI-v1 worker-side channel selector on the calling pthread's JS
+// realm. Client ring operations carry region_offset explicitly and do not rely
+// on this mutable selector. wasm-only; a no-op on the native test harness.
+void VgiSabEnsureChannelOnRealm(int region_offset);
 
 // ---- SabInputStream ---------------------------------------------------------
 
-SabInputStream::SabInputStream(int slot, ClientContext *context)
-    : slot_(slot), position_(0), is_open_(true), context_(context) {
+SabInputStream::SabInputStream(int region_offset, int slot, ClientContext *context)
+    : slot_(slot), region_offset_(region_offset), position_(0), is_open_(true), context_(context) {
 }
 
 SabInputStream::~SabInputStream() = default;
@@ -45,12 +43,12 @@ arrow::Result<int64_t> SabInputStream::Read(int64_t nbytes, void *out) {
 	if (!is_open_) {
 		return arrow::Status::IOError("SabInputStream: read on closed stream");
 	}
-	VgiSabEnsureChannelOnRealm(); // this pthread's realm must know the channel offset
+	VgiSabEnsureChannelOnRealm(region_offset_);
 	auto *dst = static_cast<uint8_t *>(out);
 	int64_t total = 0;
 	while (total < nbytes) {
 		int want = static_cast<int>(nbytes - total > INT32_MAX ? INT32_MAX : nbytes - total);
-		int n = vgi_wasm_slot_read(slot_, dst + total, want);
+		int n = vgi_wasm_slot_read(region_offset_, slot_, dst + total, want);
 		if (n == sab::kSabWouldBlock) {
 			// The ring was empty for a bounded wait. Poll query cancellation and retry —
 			// this is what keeps a read running as a DuckDB async prefetch task
@@ -62,6 +60,15 @@ arrow::Result<int64_t> SabInputStream::Read(int64_t nbytes, void *out) {
 				return arrow::Status::IOError("SabInputStream: read interrupted (query cancelled)");
 			}
 			continue;
+		}
+		if (n == sab::kSabTerminalTransportError) {
+			int code = 0;
+			int detail = 0;
+			if (vgi_wasm_slot_terminal_error(region_offset_, slot_, &code, &detail) == 1) {
+				return arrow::Status::IOError("SabInputStream: terminal transport error (code=", code,
+				                              ", detail=", detail, ")");
+			}
+			return arrow::Status::IOError("SabInputStream: terminal transport error metadata unavailable");
 		}
 		if (n < 0) {
 			return arrow::Status::IOError("SabInputStream: slot_read error/cancel");
@@ -84,7 +91,8 @@ arrow::Result<std::shared_ptr<arrow::Buffer>> SabInputStream::Read(int64_t nbyte
 
 // ---- SabOutputStream --------------------------------------------------------
 
-SabOutputStream::SabOutputStream(int slot) : slot_(slot), position_(0), is_open_(true) {
+SabOutputStream::SabOutputStream(int region_offset, int slot)
+    : slot_(slot), region_offset_(region_offset), position_(0), is_open_(true) {
 }
 
 arrow::Status SabOutputStream::Close() {
@@ -106,12 +114,12 @@ arrow::Status SabOutputStream::Write(const void *data, int64_t nbytes) {
 	if (!is_open_) {
 		return arrow::Status::IOError("SabOutputStream: write on closed stream");
 	}
-	VgiSabEnsureChannelOnRealm(); // this pthread's realm must know the channel offset
+	VgiSabEnsureChannelOnRealm(region_offset_);
 	const auto *src = static_cast<const uint8_t *>(data);
 	int64_t total = 0;
 	while (total < nbytes) {
 		int want = static_cast<int>(nbytes - total > INT32_MAX ? INT32_MAX : nbytes - total);
-		int n = vgi_wasm_slot_write(slot_, src + total, want);
+		int n = vgi_wasm_slot_write(region_offset_, slot_, src + total, want);
 		if (n < 0) {
 			return arrow::Status::IOError("SabOutputStream: slot_write error/cancel");
 		}

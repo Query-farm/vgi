@@ -18,6 +18,7 @@
 #include <condition_variable>
 #include <cstring>
 #include <memory>
+#include <map>
 #include <mutex>
 #include <vector>
 
@@ -98,6 +99,9 @@ struct NativeRing {
 
 struct NativeSlot {
 	std::atomic<int> state{0}; // 0 free, 1 claimed
+	std::atomic<int> terminal_claim{0};
+	std::atomic<int> terminal_code{0};
+	std::atomic<int> terminal_detail{0};
 	NativeRing c2w;
 	NativeRing w2c;
 	explicit NativeSlot(int cap) : c2w(cap), w2c(cap) {
@@ -105,6 +109,7 @@ struct NativeSlot {
 };
 
 struct NativeChannel {
+	std::atomic<int> claim_seq{0};
 	std::vector<std::unique_ptr<NativeSlot>> slots;
 	NativeChannel(int n, int cap) {
 		for (int i = 0; i < n; i++) {
@@ -113,59 +118,117 @@ struct NativeChannel {
 	}
 };
 
-NativeChannel &channel() {
-	static NativeChannel ch(16, duckdb::vgi::sab::kDefaultRingCap);
-	return ch;
+NativeChannel &channel(int region_offset) {
+	static std::mutex regions_mutex;
+	static std::map<int, std::unique_ptr<NativeChannel>> regions;
+	std::lock_guard<std::mutex> guard(regions_mutex);
+	auto &region = regions[region_offset];
+	if (!region) {
+		region = std::make_unique<NativeChannel>(16, duckdb::vgi::sab::kDefaultRingCap);
+	}
+	return *region;
 }
 
-NativeSlot &slot_at(int slot) {
-	return *channel().slots[static_cast<size_t>(slot)];
+NativeSlot &slot_at(int region_offset, int slot) {
+	return *channel(region_offset).slots[static_cast<size_t>(slot)];
 }
+
+thread_local int worker_region_offset = 0;
 
 } // namespace
 
 extern "C" {
 
 // ---- client stubs (vgi_sab_abi.hpp) ----
-int vgi_wasm_ensure_worker(const char *) {
+int vgi_wasm_ensure_worker(const char *, int) {
 	return 0;
 }
-int vgi_wasm_slot_open(const char *) {
-	auto &ch = channel();
+int vgi_wasm_slot_open(const char *, int region_offset) {
+	auto &ch = channel(region_offset);
+	int claim = ch.claim_seq.fetch_add(1) + 1;
+	if (claim == 0) {
+		claim = 1;
+	}
 	for (size_t i = 0; i < ch.slots.size(); i++) {
 		int expected = 0;
-		if (ch.slots[i]->state.compare_exchange_strong(expected, 1)) {
+		if (ch.slots[i]->state.compare_exchange_strong(expected, claim)) {
 			ch.slots[i]->c2w.reset();
 			ch.slots[i]->w2c.reset();
+			ch.slots[i]->terminal_claim.store(0);
+			ch.slots[i]->terminal_code.store(0);
+			ch.slots[i]->terminal_detail.store(0);
 			return static_cast<int>(i);
 		}
 	}
 	return -1;
 }
-int vgi_wasm_slot_write(int slot, const uint8_t *d, int n) {
-	slot_at(slot).c2w.write_all(d, n);
+int vgi_wasm_slot_write(int region_offset, int slot, const uint8_t *d, int n) {
+	slot_at(region_offset, slot).c2w.write_all(d, n);
 	return n;
 }
-void vgi_wasm_slot_write_eos(int slot) {
-	slot_at(slot).c2w.close_ring();
+void vgi_wasm_slot_write_eos(int region_offset, int slot) {
+	slot_at(region_offset, slot).c2w.close_ring();
 }
-int vgi_wasm_slot_read(int slot, uint8_t *d, int n) {
-	return slot_at(slot).w2c.read_some(d, n);
+int vgi_wasm_slot_read(int region_offset, int slot, uint8_t *d, int n) {
+	auto &native_slot = slot_at(region_offset, slot);
+	int read = native_slot.w2c.read_some(d, n);
+	const int claim = native_slot.state.load();
+	if (read == 0 && claim != 0 && native_slot.terminal_claim.load() == claim) {
+		return duckdb::vgi::sab::kSabTerminalTransportError;
+	}
+	return read;
 }
-void vgi_wasm_slot_release(int slot) {
-	slot_at(slot).state.store(0);
+int vgi_wasm_slot_terminal_error(int region_offset, int slot, int *code, int *detail) {
+	auto &native_slot = slot_at(region_offset, slot);
+	const int claim = native_slot.state.load();
+	if (claim == 0 || native_slot.terminal_claim.load() != claim) {
+		return 0;
+	}
+	if (code) {
+		*code = native_slot.terminal_code.load();
+	}
+	if (detail) {
+		*detail = native_slot.terminal_detail.load();
+	}
+	return 1;
+}
+void vgi_wasm_slot_release(int region_offset, int slot) {
+	slot_at(region_offset, slot).state.store(0);
+}
+void vgi_wasm_set_channel(int region_offset) {
+	worker_region_offset = region_offset;
 }
 
 // ---- worker-side ops (the serve() end of a slot) ----
 int vgi_sab_worker_read(int slot, uint8_t *d, int n) {
-	return slot_at(slot).c2w.read_some(d, n);
+	return slot_at(worker_region_offset, slot).c2w.read_some(d, n);
 }
 int vgi_sab_worker_write(int slot, const uint8_t *d, int n) {
-	slot_at(slot).w2c.write_all(d, n);
+	slot_at(worker_region_offset, slot).w2c.write_all(d, n);
 	return n;
 }
 void vgi_sab_worker_close(int slot) {
-	slot_at(slot).w2c.close_ring();
+	slot_at(worker_region_offset, slot).w2c.close_ring();
+}
+// Test/adapter seam: publish claim-tokened terminal metadata and wake the
+// client. A late failure after release/reclaim is ignored by the reader because
+// terminal_claim no longer matches STATE.
+void vgi_sab_native_worker_fail(int region_offset, int slot, int code, int detail) {
+	auto &native_slot = slot_at(region_offset, slot);
+	native_slot.terminal_claim.store(native_slot.state.load());
+	native_slot.terminal_code.store(code);
+	native_slot.terminal_detail.store(detail);
+	native_slot.w2c.close_ring();
+}
+int vgi_sab_native_slot_claim(int region_offset, int slot) {
+	return slot_at(region_offset, slot).state.load();
+}
+void vgi_sab_native_worker_fail_claim(int region_offset, int slot, int claim, int code, int detail) {
+	auto &native_slot = slot_at(region_offset, slot);
+	native_slot.terminal_claim.store(claim);
+	native_slot.terminal_code.store(code);
+	native_slot.terminal_detail.store(detail);
+	native_slot.w2c.close_ring();
 }
 // Browser pthread-pool dispatcher hook — unused natively (the native tests drive a
 // single slot via vgi_rust_serve_table_sab_slot directly, not the multi-thread

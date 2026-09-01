@@ -28,7 +28,8 @@ using duckdb::vgi::SerializeRpcRequest;
 extern "C" void vgi_rust_serve_sab_slot(int slot);
 
 TEST_CASE("C++ producer client <-> Rust serve_sab (count_to) over the ring", "[sab-e2e]") {
-	int slot = vgi_wasm_slot_open("test");
+	constexpr int region = 0;
+	int slot = vgi_wasm_slot_open("test", region);
 	REQUIRE(slot >= 0);
 
 	// The Rust worker serves this slot on its own thread.
@@ -49,7 +50,7 @@ TEST_CASE("C++ producer client <-> Rust serve_sab (count_to) over the ring", "[s
 	auto params = arrow::RecordBatch::Make(arrow::schema({arrow::field("total", arrow::int64(), /*nullable=*/false)}), 1, {ta});
 	std::vector<uint8_t> req = SerializeRpcRequest("count_to", params);
 
-	auto out = std::make_shared<SabOutputStream>(slot);
+	auto out = std::make_shared<SabOutputStream>(region, slot);
 	REQUIRE(out->Write(req.data(), static_cast<int64_t>(req.size())).ok());
 
 	// 2. Tick stream (empty schema) on the same c2w + tick #1 (bootstrap).
@@ -61,7 +62,7 @@ TEST_CASE("C++ producer client <-> Rust serve_sab (count_to) over the ring", "[s
 	REQUIRE(tick_writer->WriteRecordBatch(*tick).ok());
 
 	// 3. Data reader on the server's output stream (w2c).
-	auto in = std::make_shared<SabInputStream>(slot);
+	auto in = std::make_shared<SabInputStream>(region, slot);
 	auto reader_res = arrow::ipc::RecordBatchStreamReader::Open(in);
 	REQUIRE(reader_res.ok());
 	auto reader = *reader_res;
@@ -82,10 +83,10 @@ TEST_CASE("C++ producer client <-> Rust serve_sab (count_to) over the ring", "[s
 	}
 	// 5. Close the tick stream (Arrow EOS) + the c2w ring (EOF) so serve() returns.
 	REQUIRE(tick_writer->Close().ok());
-	vgi_wasm_slot_write_eos(slot);
+	vgi_wasm_slot_write_eos(region, slot);
 
 	rust_worker.join();
-	vgi_wasm_slot_release(slot);
+	vgi_wasm_slot_release(region, slot);
 
 	CHECK(got == std::vector<int64_t>({0, 1, 2}));
 }
@@ -96,7 +97,8 @@ TEST_CASE("C++ producer client <-> Rust serve_sab (count_to) over the ring", "[s
 // relies on. This validates the port's #1 flagged uncertainty (multi-stream
 // sequencing / ring position persistence across stream recreation).
 TEST_CASE("unary RPC then producer RPC on one slot (bind->init sequencing)", "[sab-e2e]") {
-	int slot = vgi_wasm_slot_open("test");
+	constexpr int region = 0;
+	int slot = vgi_wasm_slot_open("test", region);
 	REQUIRE(slot >= 0);
 	std::thread rust_worker([slot]() { vgi_rust_serve_sab_slot(slot); });
 
@@ -109,10 +111,10 @@ TEST_CASE("unary RPC then producer RPC on one slot (bind->init sequencing)", "[s
 		auto params = arrow::RecordBatch::Make(arrow::schema({arrow::field("x", arrow::int64(), /*nullable=*/false)}), 1, {xa});
 		auto req = SerializeRpcRequest("add_one", params);
 
-		auto out = std::make_shared<SabOutputStream>(slot);
+		auto out = std::make_shared<SabOutputStream>(region, slot);
 		REQUIRE(out->Write(req.data(), static_cast<int64_t>(req.size())).ok());
 
-		auto in = std::make_shared<SabInputStream>(slot);
+		auto in = std::make_shared<SabInputStream>(region, slot);
 		auto reader = *arrow::ipc::RecordBatchStreamReader::Open(in);
 		std::shared_ptr<arrow::RecordBatch> resp;
 		REQUIRE(reader->ReadNext(&resp).ok());
@@ -133,7 +135,7 @@ TEST_CASE("unary RPC then producer RPC on one slot (bind->init sequencing)", "[s
 		auto params = arrow::RecordBatch::Make(arrow::schema({arrow::field("total", arrow::int64(), /*nullable=*/false)}), 1, {ta});
 		auto req = SerializeRpcRequest("count_to", params);
 
-		auto out = std::make_shared<SabOutputStream>(slot); // fresh stream, same slot
+		auto out = std::make_shared<SabOutputStream>(region, slot); // fresh stream, same slot
 		REQUIRE(out->Write(req.data(), static_cast<int64_t>(req.size())).ok());
 
 		auto empty_schema = arrow::schema({});
@@ -141,7 +143,7 @@ TEST_CASE("unary RPC then producer RPC on one slot (bind->init sequencing)", "[s
 		auto tick_writer = *arrow::ipc::MakeStreamWriter(out, empty_schema);
 		REQUIRE(tick_writer->WriteRecordBatch(*tick).ok());
 
-		auto in = std::make_shared<SabInputStream>(slot); // fresh reader, same slot
+		auto in = std::make_shared<SabInputStream>(region, slot); // fresh reader, same slot
 		auto reader = *arrow::ipc::RecordBatchStreamReader::Open(in);
 		std::shared_ptr<arrow::RecordBatch> batch;
 		for (;;) {
@@ -156,11 +158,11 @@ TEST_CASE("unary RPC then producer RPC on one slot (bind->init sequencing)", "[s
 			REQUIRE(tick_writer->WriteRecordBatch(*tick).ok());
 		}
 		REQUIRE(tick_writer->Close().ok());
-		vgi_wasm_slot_write_eos(slot);
+		vgi_wasm_slot_write_eos(region, slot);
 	}
 
 	rust_worker.join();
-	vgi_wasm_slot_release(slot);
+	vgi_wasm_slot_release(region, slot);
 	CHECK(got == std::vector<int64_t>({0, 1, 2}));
 }
 
@@ -169,7 +171,8 @@ TEST_CASE("unary RPC then producer RPC on one slot (bind->init sequencing)", "[s
 // CloseInputWriter over the ring (validates the port's #2 flagged uncertainty:
 // CloseInputWriter -> slot_write_eos ordering in exchange mode).
 TEST_CASE("exchange RPC (scale) over the ring", "[sab-e2e]") {
-	int slot = vgi_wasm_slot_open("test");
+	constexpr int region = 0;
+	int slot = vgi_wasm_slot_open("test", region);
 	REQUIRE(slot >= 0);
 	std::thread rust_worker([slot]() { vgi_rust_serve_sab_slot(slot); });
 
@@ -181,7 +184,7 @@ TEST_CASE("exchange RPC (scale) over the ring", "[sab-e2e]") {
 	auto params = arrow::RecordBatch::Make(arrow::schema({arrow::field("factor", arrow::float64(), /*nullable=*/false)}), 1, {fa});
 	auto req = SerializeRpcRequest("scale", params);
 
-	auto out = std::make_shared<SabOutputStream>(slot);
+	auto out = std::make_shared<SabOutputStream>(region, slot);
 	REQUIRE(out->Write(req.data(), static_cast<int64_t>(req.size())).ok());
 
 	// 2. input stream (single "value" f64 column) + one input batch [1,2,3].
@@ -195,7 +198,7 @@ TEST_CASE("exchange RPC (scale) over the ring", "[sab-e2e]") {
 	REQUIRE(input_writer->WriteRecordBatch(*input_batch).ok());
 
 	// 3. read the 1:1 scaled output batch.
-	auto in = std::make_shared<SabInputStream>(slot);
+	auto in = std::make_shared<SabInputStream>(region, slot);
 	auto reader = *arrow::ipc::RecordBatchStreamReader::Open(in);
 	std::shared_ptr<arrow::RecordBatch> outb;
 	REQUIRE(reader->ReadNext(&outb).ok());
@@ -209,10 +212,10 @@ TEST_CASE("exchange RPC (scale) over the ring", "[sab-e2e]") {
 
 	// 4. close input (Arrow EOS + ring EOF), drain output EOS.
 	REQUIRE(input_writer->Close().ok());
-	vgi_wasm_slot_write_eos(slot);
+	vgi_wasm_slot_write_eos(region, slot);
 	REQUIRE(reader->ReadNext(&outb).ok());
 	CHECK(outb == nullptr);
 
 	rust_worker.join();
-	vgi_wasm_slot_release(slot);
+	vgi_wasm_slot_release(region, slot);
 }

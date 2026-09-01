@@ -21,7 +21,7 @@ header (i32 lanes):
   [3] ring_cap       = bytes per ring (per direction)
   [4] slot_stride    = bytes per slot
   [5] slots_off      = byte offset of slot[0]  (= 64)
-  [6] reserved
+  [6] features       additive feature bitmap (bit 0 = claim-safe terminal transport error)
   [7] ensure-worker ready flag (client-side dedup; 1 = worker booted)
   [8] claim_seq      monotonic global claim-id counter (Atomics.add on slot_open)
   [9..15] reserved
@@ -35,7 +35,10 @@ slot (at slots_off + i*slot_stride):
     [4] w2c_write_pos  monotonic (worker → client)
     [5] w2c_read_pos
     [6] w2c_closed     0 = open; else the CLOSING WORKER's claim id (a token, not a bare 1)
-    [7..15] reserved
+    [7] terminal_claim  claim id that owns terminal transport metadata
+    [8] terminal_code   adapter-defined stable error category
+    [9] terminal_detail adapter-defined bounded detail value
+    [10..15] reserved
   c2w_data: ring_cap bytes   (byte offset control+64)
   w2c_data: ring_cap bytes   (byte offset control+64+ring_cap)
 
@@ -74,9 +77,23 @@ input, or `w2c_closed == state` for the client reading output — the claim-id t
 `notify`s the word it advanced. This is the SAB analog of an OS pipe buffer — the ring is
 the chunker, so payloads larger than `ring_cap` stream through in bounded pieces.
 
-**Multi-worker (Phase 2):** a directory/worker-registry (`url_hash → region offset`) is
-prepended so several worker modules share one channel with disjoint slot regions. v1 / the
-native harness uses a single region of `n_slots`; the header above is the region header.
+**Multi-target adapters:** every canonical target owns a disjoint region with the exact v1
+layout above. The region byte offset is carried on every client-side stub call; there is no
+new directory in shared memory and therefore no ABI-version bump. Page glue may register many
+target/offset pairs with one transport-adapter worker. Region reclamation is permitted only
+when every slot `state` is zero. A plain `worker:` URL remains a one-target adapter and receives
+the original `vgi-init` boot message.
+
+The default client allocation cap is 32 regions and may be changed at compile time with
+`VGI_SAB_MAX_TARGET_REGIONS`; the page bridge independently allows a host to choose a lower
+`maxTargetsPerAdapter`. At the default four slots and 64 KiB per directional ring, one region is
+524,608 bytes (64-byte header + 4 × 131,136-byte slot), so the default worst-case allocation is
+16,787,456 bytes.
+
+If feature bit 0 is set, an adapter may terminate a claim by writing code/detail, publishing
+`terminal_claim`, then closing `w2c` with the same claim token. The reader returns `-3` only
+when both tokens still match the current slot `state`; a late failure from a released claim is
+ignored after slot reuse.
 
 ## Stub contract (`extern "C"`, the C++↔backend seam)
 
@@ -87,25 +104,28 @@ them against a POSIX-shm + futex implementation. Same signatures, same semantics
 ```c
 // Ensure the worker for `location` exists and its region is wired to the channel.
 // Returns 0 on success; negative on whitelist-reject / spawn failure.
-int  vgi_wasm_ensure_worker(const char *location);
+int  vgi_wasm_ensure_worker(const char *location, int region_offset);
 
 // Claim a free slot in the worker's region (CAS state 0->1). Resets both rings.
 // Returns slot id >= 0, or negative on exhaustion.
-int  vgi_wasm_slot_open(const char *location);
+int  vgi_wasm_slot_open(const char *location, int region_offset);
 
 // Blocking write of all n bytes into the slot's c2w ring (blocks on backpressure).
 // Returns n on success; negative on cancel/error.
-int  vgi_wasm_slot_write(int slot, const uint8_t *data, int n);
+int  vgi_wasm_slot_write(int region_offset, int slot, const uint8_t *data, int n);
 
 // Signal EOS on the c2w (input) ring — the client is done writing (CloseInputWriter).
-void vgi_wasm_slot_write_eos(int slot);
+void vgi_wasm_slot_write_eos(int region_offset, int slot);
 
 // Blocking read of up to n bytes from the slot's w2c ring.
 // Returns bytes read (>0); 0 on EOS (w2c_closed && drained); negative on cancel/error.
-int  vgi_wasm_slot_read(int slot, uint8_t *data, int n);
+int  vgi_wasm_slot_read(int region_offset, int slot, uint8_t *data, int n);
+
+// Read terminal metadata after -3. Returns 1 iff it belongs to the current claim.
+int  vgi_wasm_slot_terminal_error(int region_offset, int slot, int *code, int *detail);
 
 // Release the slot (state -> 0) once the connection is fully done. Idempotent.
-void vgi_wasm_slot_release(int slot);
+void vgi_wasm_slot_release(int region_offset, int slot);
 ```
 
 ### Mapping to `IFunctionConnection`
@@ -113,13 +133,14 @@ void vgi_wasm_slot_release(int slot);
 | Connection op | Stub calls |
 |---|---|
 | `OpenInputWriter` | (slot already open from bind/init) — no-op or first tick |
-| `WriteInputBatch(b)` | serialize `b` to Arrow IPC, `vgi_wasm_slot_write(slot, …)` |
-| `CloseInputWriter` | `vgi_wasm_slot_write_eos(slot)` |
-| `ReadDataBatch` | `vgi_wasm_slot_read(slot, …)` into the Arrow IPC `StreamReader`; 0 ⇒ EOS ⇒ return null |
-| connection dtor / release | `vgi_wasm_slot_release(slot)` |
+| `WriteInputBatch(b)` | serialize `b` to Arrow IPC, `vgi_wasm_slot_write(region, slot, …)` |
+| `CloseInputWriter` | `vgi_wasm_slot_write_eos(region, slot)` |
+| `ReadDataBatch` | `vgi_wasm_slot_read(region, slot, …)` into the Arrow IPC `StreamReader`; 0 ⇒ EOS ⇒ return null |
+| connection dtor / release | `vgi_wasm_slot_release(region, slot)` |
 
-Errors surface **in-band** as Arrow error batches (reuse `ClassifyBatch`/
-`HandleBatchLogMessage`), never as a transport error code. Cancellation: `slot_write`/
+Application errors surface **in-band** as Arrow error batches (reuse `ClassifyBatch`/
+`HandleBatchLogMessage`). Adapters that negotiate feature bit 0 may additionally report a
+terminal transport failure via `-3` plus claim-safe metadata. Cancellation: `slot_write`/
 `slot_read` block with a bounded timeout and re-check `context.client.interrupted`
 (adaptive backoff), mirroring `FdInputStream::Read`.
 
@@ -137,12 +158,10 @@ native tests and flakes only in the real threaded browser):
    The JS ring stubs must derive their views from `wasmMemory.buffer` (a live getter) on every op,
    not `Module.HEAPU8.buffer`. This was the primary cause of the early flaky hangs.
 
-2. **Re-publish the channel offset onto the executing pthread's realm before each ring op.**
-   `vgiSab.base` (the offset the JS ring stubs index through) is per-realm JS state. A connection is
-   bound on one pthread, but DuckDB can schedule its ring I/O (tick/scan reads, input writes) onto a
-   different pool pthread whose realm never had the offset set → it indexes the wrong linear-memory
-   location. The C++ `SabInputStream::Read` / `SabOutputStream::Write` call a
-   `vgi_wasm_set_channel(EnsureVgiSabChannel())` shim first so the current realm is always correct.
+2. **Carry the region offset on every operation.** Per-realm mutable JS state is not a safe client
+   selector: DuckDB can schedule ring I/O onto a different pool pthread. The ABI therefore passes
+   `region_offset` explicitly to open/read/write/close/release. `vgi_wasm_set_channel` remains only
+   as an ABI-v1 worker-side compatibility hook.
 
 The native (POSIX-shm) harness has neither issue (native pointers + a single serve thread), so
 **both must be covered by the browser E2E** (`test/support/wasm-worker/browser-e2e/`), not the

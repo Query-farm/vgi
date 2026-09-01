@@ -23,7 +23,7 @@ namespace vgi {
 // Non-owning input stream reading the worker->client (w2c) ring of `slot`.
 class SabInputStream : public arrow::io::InputStream {
 public:
-	explicit SabInputStream(int slot, ClientContext *context = nullptr);
+	explicit SabInputStream(int region_offset, int slot, ClientContext *context = nullptr);
 	~SabInputStream() override;
 
 	arrow::Status Close() override;
@@ -34,6 +34,7 @@ public:
 
 private:
 	int slot_;
+	int region_offset_;
 	int64_t position_;
 	bool is_open_;
 	ClientContext *context_;
@@ -42,7 +43,7 @@ private:
 // Non-owning output stream writing the client->worker (c2w) ring of `slot`.
 class SabOutputStream : public arrow::io::OutputStream {
 public:
-	explicit SabOutputStream(int slot);
+	explicit SabOutputStream(int region_offset, int slot);
 	~SabOutputStream() override = default;
 
 	arrow::Status Close() override;
@@ -53,6 +54,7 @@ public:
 
 private:
 	int slot_;
+	int region_offset_;
 	int64_t position_;
 	bool is_open_;
 };
