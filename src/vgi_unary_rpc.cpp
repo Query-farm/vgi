@@ -176,9 +176,18 @@ UnaryResponseResult InvokePooledUnaryRpc(const UnaryRpcOptions &opts, const std:
 	}
 	if (IsHttpiTransport(opts.worker_path)) {
 #if defined(__EMSCRIPTEN__)
-		return HttpInvokeUnary(opts.context, CanonicalizeHttpiLocation(opts.worker_path), method_name, params,
-		                       opts.auth, opts.cookie_jar, opts.cached_http_params, "", "", "", "",
-		                       opts.protocol_version_override.value_or(""), nullptr, opts.server_caps);
+		ServerCapabilities caps;
+		if (opts.server_caps) {
+			caps = opts.server_caps->Load();
+		}
+		auto result = HttpInvokeUnary(opts.context, CanonicalizeHttpiLocation(opts.worker_path), method_name, params,
+		                              opts.auth, opts.cookie_jar, opts.cached_http_params, "", "", "", "",
+		                              opts.protocol_version_override.value_or(""), nullptr,
+		                              opts.server_caps ? &caps : nullptr);
+		if (opts.server_caps) {
+			opts.server_caps->Store(caps);
+		}
+		return result;
 #else
 		throw IOException("vgi: httpi:// transport is only available in DuckDB-WASM with an "
 		                  "application-owned Iroh adapter Worker");
