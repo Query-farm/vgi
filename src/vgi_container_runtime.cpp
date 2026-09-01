@@ -14,6 +14,7 @@
 #include <mutex>
 #include <sstream>
 #include <thread>
+#include <vector>
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -657,10 +658,154 @@ bool LookupSharedContainer(const std::string &location, ContainerSpec &out_spec,
 
 #if VGI_POSIX_TRANSPORT
 
-// Resolve and connect under one deadline. DNS resolution is synchronous, but
-// its elapsed time is charged to the same deadline: a slow resolver cannot then
-// receive a fresh timeout for every returned address.
-int TcpConnect(const std::string &host, int port, int timeout_ms, std::string *error_message) {
+static bool ParseSocks5hProxy(const std::string &uri, std::string &host, int &port, std::string &error) {
+	const std::string prefix = "socks5h://";
+	if (uri.rfind(prefix, 0) != 0 || uri.find('@') != std::string::npos) {
+		error = "tcp_proxy must be a credential-free socks5h://host:port URI";
+		return false;
+	}
+	const std::string authority = uri.substr(prefix.size());
+	if (authority.empty() || authority.find_first_of("/?#") != std::string::npos) {
+		error = "tcp_proxy URI must contain only host and port";
+		return false;
+	}
+	std::string port_text;
+	if (authority.front() == '[') {
+		auto close = authority.find(']');
+		if (close == std::string::npos || close == 1 || close + 1 >= authority.size() || authority[close + 1] != ':') {
+			error = "invalid bracketed IPv6 tcp_proxy URI";
+			return false;
+		}
+		host = authority.substr(1, close - 1);
+		port_text = authority.substr(close + 2);
+	} else {
+		auto colon = authority.rfind(':');
+		if (colon == std::string::npos || colon == 0 || authority.find(':') != colon) {
+			error = "tcp_proxy must be socks5h://host:port";
+			return false;
+		}
+		host = authority.substr(0, colon);
+		port_text = authority.substr(colon + 1);
+	}
+	try {
+		size_t consumed = 0;
+		port = std::stoi(port_text, &consumed);
+		if (consumed != port_text.size() || port <= 0 || port > 65535) throw std::invalid_argument("port");
+	} catch (...) {
+		error = "tcp_proxy port must be numeric and in [1, 65535]";
+		return false;
+	}
+	return true;
+}
+
+static bool IsAsciiDnsALabelName(const std::string &host) {
+	if (host.empty() || host.size() > 253) return false;
+	size_t label_start = 0;
+	for (size_t i = 0; i <= host.size(); ++i) {
+		if (i != host.size() && host[i] != '.') {
+			const auto byte = static_cast<unsigned char>(host[i]);
+			const bool alnum = (byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') ||
+			                   (byte >= '0' && byte <= '9');
+			if (!alnum && byte != '-') return false;
+			continue;
+		}
+		const size_t label_size = i - label_start;
+		if (label_size == 0 || label_size > 63 || host[label_start] == '-' || host[i - 1] == '-') return false;
+		label_start = i + 1;
+	}
+	return true;
+}
+
+static bool PerformSocks5hHandshake(int fd, const std::string &host, int port,
+                                   std::chrono::steady_clock::time_point deadline, int &last_error,
+                                   std::string &error) {
+	auto wait_for = [&](short events) {
+		for (;;) {
+			auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+			                     deadline - std::chrono::steady_clock::now()).count();
+			if (remaining <= 0) { last_error = ETIMEDOUT; return false; }
+			pollfd pfd {fd, events, 0};
+			int rc = ::poll(&pfd, 1, static_cast<int>(std::max<int64_t>(remaining, 1)));
+			if (rc < 0 && errno == EINTR) continue;
+			if (rc <= 0) { last_error = rc == 0 ? ETIMEDOUT : errno; return false; }
+			if (pfd.revents & events) return true;
+			if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) { last_error = ECONNRESET; return false; }
+		}
+	};
+	auto write_all = [&](const std::vector<uint8_t> &bytes) {
+		size_t offset = 0;
+		while (offset < bytes.size()) {
+			if (!wait_for(POLLOUT)) return false;
+			int flags = 0;
+#ifdef MSG_NOSIGNAL
+			flags = MSG_NOSIGNAL;
+#endif
+			ssize_t count = ::send(fd, bytes.data() + offset, bytes.size() - offset, flags);
+			if (count > 0) offset += static_cast<size_t>(count);
+			else if (count < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) continue;
+			else { last_error = count == 0 ? EPIPE : errno; return false; }
+		}
+		return true;
+	};
+	auto read_exact = [&](uint8_t *bytes, size_t size) {
+		size_t offset = 0;
+		while (offset < size) {
+			if (!wait_for(POLLIN)) return false;
+			ssize_t count = ::recv(fd, bytes + offset, size - offset, 0);
+			if (count > 0) offset += static_cast<size_t>(count);
+			else if (count < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) continue;
+			else { last_error = count == 0 ? ECONNRESET : errno; return false; }
+		}
+		return true;
+	};
+
+	std::vector<uint8_t> request {0x05, 0x01, 0x00};
+	uint8_t reply[4] = {};
+	if (!write_all(request) || !read_exact(reply, 2) || reply[0] != 0x05 || reply[1] != 0x00) {
+		error = "SOCKS5h proxy did not accept NO AUTH";
+		return false;
+	}
+	request = {0x05, 0x01, 0x00};
+	uint8_t raw_address[16];
+	if (::inet_pton(AF_INET, host.c_str(), raw_address) == 1) {
+		request.push_back(0x01);
+		request.insert(request.end(), raw_address, raw_address + 4);
+	} else if (::inet_pton(AF_INET6, host.c_str(), raw_address) == 1) {
+		request.push_back(0x04);
+		request.insert(request.end(), raw_address, raw_address + 16);
+	} else if (IsAsciiDnsALabelName(host)) {
+		request.push_back(0x03);
+		request.push_back(static_cast<uint8_t>(host.size()));
+		request.insert(request.end(), host.begin(), host.end());
+	} else {
+		error = "SOCKS5h target must be an ASCII DNS A-label; encode Unicode with IDNA first";
+		return false;
+	}
+	request.push_back(static_cast<uint8_t>(port >> 8));
+	request.push_back(static_cast<uint8_t>(port));
+	if (!write_all(request) || !read_exact(reply, 4) || reply[0] != 0x05 || reply[2] != 0x00) {
+		error = "malformed SOCKS5h connect reply";
+		return false;
+	}
+	if (reply[1] != 0x00) {
+		error = "SOCKS5h proxy rejected target (reply " + std::to_string(reply[1]) + ")";
+		return false;
+	}
+	size_t tail = reply[3] == 0x01 ? 6 : (reply[3] == 0x04 ? 18 : 0);
+	if (reply[3] == 0x03) {
+		uint8_t length = 0;
+		if (!read_exact(&length, 1)) return false;
+		tail = length + 2;
+	}
+	if (tail == 0) { error = "unknown SOCKS5h reply address type"; return false; }
+	std::vector<uint8_t> discard(tail);
+	return read_exact(discard.data(), discard.size());
+}
+
+// Blocking system DNS cannot itself be preempted, but elapsed resolution time
+// is charged to the same deadline before resolved addresses are attempted.
+int TcpConnect(const std::string &host, int port, int timeout_ms, std::string *error_message,
+               const std::string &socks5h_proxy) {
 	if (error_message) {
 		error_message->clear();
 	}
@@ -673,17 +818,40 @@ int TcpConnect(const std::string &host, int port, int timeout_ms, std::string *e
 
 	const int effective_timeout_ms = std::max(timeout_ms, 0);
 	const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(effective_timeout_ms);
+	std::string dial_host = host;
+	int dial_port = port;
+	std::string socks_error;
+	if (!socks5h_proxy.empty()) {
+		for (unsigned char byte : host) {
+			if (byte < 0x20 || byte == 0x7f) {
+				if (error_message) *error_message = "SOCKS5h target contains a control character";
+				return -1;
+			}
+		}
+		uint8_t address[16];
+		if (::inet_pton(AF_INET, host.c_str(), address) != 1 && ::inet_pton(AF_INET6, host.c_str(), address) != 1 &&
+		    !IsAsciiDnsALabelName(host)) {
+			if (error_message) {
+				*error_message = "SOCKS5h target must be an ASCII DNS A-label; encode Unicode with IDNA first";
+			}
+			return -1;
+		}
+		if (!ParseSocks5hProxy(socks5h_proxy, dial_host, dial_port, socks_error)) {
+			if (error_message) *error_message = socks_error;
+			return -1;
+		}
+	}
 	struct addrinfo hints;
 	std::memset(&hints, 0, sizeof(hints));
 	hints.ai_family = AF_UNSPEC;
 	hints.ai_socktype = SOCK_STREAM;
 	hints.ai_protocol = IPPROTO_TCP;
 	struct addrinfo *addresses = nullptr;
-	const std::string service = std::to_string(port);
-	const int resolve_rc = ::getaddrinfo(host.c_str(), service.c_str(), &hints, &addresses);
+	const std::string service = std::to_string(dial_port);
+	const int resolve_rc = ::getaddrinfo(dial_host.c_str(), service.c_str(), &hints, &addresses);
 	if (resolve_rc != 0) {
 		if (error_message) {
-			*error_message = "cannot resolve TCP host '" + host + "': " + ::gai_strerror(resolve_rc);
+			*error_message = "cannot resolve TCP host '" + dial_host + "': " + ::gai_strerror(resolve_rc);
 		}
 		return -1;
 	}
@@ -746,6 +914,10 @@ int TcpConnect(const std::string &host, int port, int timeout_ms, std::string *e
 			last_error = errno;
 		}
 
+		if (connected && !socks5h_proxy.empty() &&
+		    !PerformSocks5hHandshake(fd, host, port, deadline, last_error, socks_error)) {
+			connected = false;
+		}
 		if (connected && ::fcntl(fd, F_SETFL, flags) == 0) {
 			int nodelay = 1;
 			(void)::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
@@ -764,6 +936,10 @@ int TcpConnect(const std::string &host, int port, int timeout_ms, std::string *e
 	::freeaddrinfo(addresses);
 
 	if (error_message) {
+		if (!socks_error.empty()) {
+			*error_message = socks_error;
+			return -1;
+		}
 		const std::string endpoint = host + ":" + std::to_string(port);
 		if (attempted == 0) {
 			*error_message = "TCP host '" + host + "' resolved without any usable IPv4/IPv6 addresses";

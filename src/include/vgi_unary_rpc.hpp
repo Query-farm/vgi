@@ -89,6 +89,9 @@ struct UnaryRpcOptions {
 	// sharing: each call starts from the pre-discovery default (zstd) and
 	// renegotiates on its own if the server rejects it. Ignored for subprocess.
 	std::shared_ptr<ServerCapabilitiesCache> server_caps;
+	// Explicit SOCKS5h proxy for tcp://. Transport-only: never serialized as a
+	// worker/catalog option.
+	std::string tcp_proxy;
 };
 
 // Send a single unary RPC and return the response.

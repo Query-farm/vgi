@@ -245,7 +245,7 @@ UnaryResponseResult InvokePooledUnaryRpc(const UnaryRpcOptions &opts, const std:
 		int tcp_port;
 		ParseTcpLocation(opts.worker_path, tcp_host, tcp_port);
 		std::string connect_error;
-		int fd = TcpConnect(tcp_host, tcp_port, 10000, &connect_error);
+		int fd = TcpConnect(tcp_host, tcp_port, 10000, &connect_error, opts.tcp_proxy);
 		if (fd < 0) {
 			throw IOException("vgi: failed to connect to tcp worker %s: %s", opts.worker_path, connect_error);
 		}
@@ -264,7 +264,7 @@ UnaryResponseResult InvokePooledUnaryRpc(const UnaryRpcOptions &opts, const std:
 		int tcp_port;
 		ParseTcpLocation(opts.worker_path, tcp_host, tcp_port);
 		std::string connect_error;
-		int fd = TcpConnect(tcp_host, tcp_port, 10000, &connect_error);
+		int fd = TcpConnect(tcp_host, tcp_port, 10000, &connect_error, opts.tcp_proxy);
 		if (fd < 0) {
 			throw IOException("vgi: failed to connect to tcp worker %s: %s", opts.worker_path, connect_error);
 		}

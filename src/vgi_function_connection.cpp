@@ -1867,7 +1867,8 @@ std::unique_ptr<IFunctionConnection> CreateFunctionConnection(
 		int port;
 		ParseTcpLocation(worker_path, host, port);
 		std::string connect_error;
-		int fd = TcpConnect(host, port, 10000, &connect_error);
+		int fd = TcpConnect(host, port, 10000, &connect_error,
+		                    attach_params ? attach_params->tcp_proxy() : std::string());
 		if (fd < 0) {
 			throw IOException("vgi: failed to connect to tcp worker %s: %s", worker_path, connect_error);
 		}
@@ -1884,7 +1885,8 @@ std::unique_ptr<IFunctionConnection> CreateFunctionConnection(
 		int port;
 		ParseTcpLocation(worker_path, host, port);
 		std::string connect_error;
-		int fd = TcpConnect(host, port, 10000, &connect_error);
+		int fd = TcpConnect(host, port, 10000, &connect_error,
+		                    attach_params ? attach_params->tcp_proxy() : std::string());
 		if (fd < 0) {
 			throw IOException("vgi: failed to connect to tcp worker %s: %s", worker_path, connect_error);
 		}

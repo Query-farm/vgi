@@ -64,6 +64,10 @@ struct VgiAttachParametersConfig {
 	// Opaque lifetime pin for a resolved worker artifact. Null for ordinary
 	// transports. Keeping this on the catalog prevents eviction between calls.
 	std::shared_ptr<void> worker_artifact_anchor;
+	// Explicit userspace-networking proxy for tcp:// only. Consumed by the
+	// transport and never forwarded in catalog_attach worker options. Kept last
+	// so existing aggregate initializers retain their positional meaning.
+	std::string tcp_proxy;
 };
 
 // Parameters for connecting to a VGI worker
@@ -79,6 +83,7 @@ struct VgiAttachParameters {
 	      cookie_jar_(std::move(cfg.cookie_jar)),
 	      launcher_idle_timeout_seconds_(cfg.launcher_idle_timeout_seconds),
 	      launcher_state_dir_(std::move(cfg.launcher_state_dir)),
+	      tcp_proxy_(std::move(cfg.tcp_proxy)),
 	      attach_options_canonical_(std::move(cfg.attach_options_canonical)) {
 		worker_artifact_anchor_ = std::move(cfg.worker_artifact_anchor);
 	}
@@ -118,6 +123,10 @@ struct VgiAttachParameters {
 
 	const std::string &worker_path() const {
 		return worker_path_;
+	}
+
+	const std::string &tcp_proxy() const {
+		return tcp_proxy_;
 	}
 
 	const std::string &catalog_name() const {
@@ -238,6 +247,7 @@ private:
 	std::shared_ptr<SessionCookieJar> cookie_jar_;
 	std::optional<int64_t> launcher_idle_timeout_seconds_;
 	std::optional<std::string> launcher_state_dir_;
+	std::string tcp_proxy_;
 	std::string attach_options_canonical_;
 	std::shared_ptr<void> worker_artifact_anchor_;
 

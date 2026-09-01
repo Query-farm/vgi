@@ -1705,6 +1705,7 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	int64_t pool_timeout_override = -1;  // -1 = not set
 	string oauth_refresh_token;
 	string bearer_token;
+	string tcp_proxy;
 	string data_version_spec;
 	string implementation_version;
 	// Per-LOCATION launcher overrides — only valid with ``launch:`` LOCATIONs;
@@ -1796,6 +1797,11 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 			oauth_refresh_token = value.ToString();
 		} else if (lower_name == "bearer_token") {
 			bearer_token = value.ToString();
+		} else if (lower_name == "tcp_proxy") {
+			tcp_proxy = value.ToString();
+			if (tcp_proxy.empty()) {
+				throw BinderException("tcp_proxy, if set, must not be empty");
+			}
 		} else if (lower_name == "data_version_spec") {
 			data_version_spec = value.ToString();
 		} else if (lower_name == "implementation_version") {
@@ -1902,6 +1908,9 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 
 	if (worker_path.empty()) {
 		throw BinderException("VGI ATTACH requires LOCATION option specifying the worker path");
+	}
+	if (!tcp_proxy.empty() && !vgi::IsTcpTransport(worker_path)) {
+		throw BinderException("tcp_proxy is only valid for tcp:// LOCATIONs");
 	}
 
 	// Telemetry capture — the event fires only on the success path, near the
@@ -2154,7 +2163,7 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	if (discover_catalog || !attach_options.empty()) {
 		auto catalogs = vgi::InvokeCatalogs(worker_path, context, worker_debug, use_pool, auth,
 		                                    launcher_idle_for_attach, launcher_state_dir_for_attach,
-		                                    worker_artifact_anchor);
+		                                    worker_artifact_anchor, tcp_proxy);
 
 		// Bare form: resolve the (omitted) catalog name from the worker. A
 		// single-catalog worker resolves unambiguously; >1 forces the user to
@@ -2254,7 +2263,7 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	auto attach_result = vgi::InvokeCatalogAttach(worker_path, catalog_name, context, worker_debug, use_pool, auth,
 	                                              data_version_spec, implementation_version, cookie_jar,
 	                                              attach_options, launcher_idle_for_attach,
-	                                              launcher_state_dir_for_attach, worker_artifact_anchor);
+	                                              launcher_state_dir_for_attach, worker_artifact_anchor, tcp_proxy);
 
 	// Register extension options for settings exposed by this catalog
 	// Check for type conflicts with existing settings
@@ -2378,6 +2387,7 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	attach_cfg.implementation_version = attach_result.resolved_implementation_version;
 	attach_cfg.cookie_jar = cookie_jar;
 	attach_cfg.worker_artifact_anchor = worker_artifact_anchor;
+	attach_cfg.tcp_proxy = tcp_proxy;
 	if (launcher_idle_timeout_seconds >= 0) {
 		attach_cfg.launcher_idle_timeout_seconds = launcher_idle_timeout_seconds;
 	}

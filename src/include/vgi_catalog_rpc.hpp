@@ -73,7 +73,8 @@ CatalogAttachResult InvokeCatalogAttach(const std::string &worker_path, const st
                                         const std::map<std::string, Value> &attach_options = {},
                                         std::optional<int64_t> launcher_idle_timeout_seconds = std::nullopt,
                                         std::optional<std::string> launcher_state_dir = std::nullopt,
-                                        std::shared_ptr<void> worker_artifact_anchor = nullptr);
+                                        std::shared_ptr<void> worker_artifact_anchor = nullptr,
+                                        const std::string &tcp_proxy = "");
 
 // List catalogs exposed by a worker. Returns per-catalog discovery records
 // carrying implementation_version and data_version_spec metadata alongside the
@@ -90,7 +91,8 @@ std::vector<VgiCatalogInfo> InvokeCatalogs(const std::string &worker_path, Clien
                                            const std::shared_ptr<CatalogAuth> &auth = nullptr,
                                            std::optional<int64_t> launcher_idle_timeout_seconds = std::nullopt,
                                            std::optional<std::string> launcher_state_dir = std::nullopt,
-                                           std::shared_ptr<void> worker_artifact_anchor = nullptr);
+                                           std::shared_ptr<void> worker_artifact_anchor = nullptr,
+                                           const std::string &tcp_proxy = "");
 
 // Invoke catalog_schemas: list schemas in an attached catalog
 std::vector<VgiSchemaInfo> InvokeCatalogSchemas(const CatalogRpcContext &ctx, ClientContext &context);

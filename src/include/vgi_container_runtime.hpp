@@ -207,7 +207,7 @@ std::unique_ptr<SubProcess> ConnectSharedContainer(const ContainerEndpoint &endp
 // failure. When error_message is non-null, it receives an actionable resolution
 // or connect diagnostic. Shared by container-shared TCP and tcp://.
 int TcpConnect(const std::string &host, int port, int timeout_ms,
-               std::string *error_message = nullptr);
+               std::string *error_message = nullptr, const std::string &socks5h_proxy = "");
 #endif
 
 // Per-process registry mapping an internal `container-shared:` worker_path to its

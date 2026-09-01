@@ -16,8 +16,12 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <array>
+#include <chrono>
 #include <cstring>
 #include <string>
+#include <thread>
+#include <vector>
 
 using duckdb::vgi::BuildContainerRunCommandTemplate;
 using duckdb::vgi::ContainerConnMode;
@@ -181,4 +185,85 @@ TEST_CASE("TcpConnect reports resolved endpoint connection failures", "[tcp]") {
 	CHECK(TcpConnect("127.0.0.1", port, 500, &error) < 0);
 	CHECK(error.find("connect to 127.0.0.1:" + std::to_string(port)) != std::string::npos);
 	CHECK(error.find("resolved address") != std::string::npos);
+}
+
+TEST_CASE("TcpConnect SOCKS5h sends target hostname to the proxy", "[tcp][socks5h]") {
+	int listener = ::socket(AF_INET, SOCK_STREAM, 0);
+	REQUIRE(listener >= 0);
+	struct sockaddr_in address {};
+	address.sin_family = AF_INET;
+	address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	REQUIRE(::bind(listener, reinterpret_cast<struct sockaddr *>(&address), sizeof(address)) == 0);
+	REQUIRE(::listen(listener, 1) == 0);
+	socklen_t address_len = sizeof(address);
+	REQUIRE(::getsockname(listener, reinterpret_cast<struct sockaddr *>(&address), &address_len) == 0);
+
+	bool proxy_ok = false;
+	std::string observed_host;
+	int observed_port = 0;
+	std::thread proxy([&]() {
+		int peer = ::accept(listener, nullptr, nullptr);
+		if (peer < 0) return;
+		auto read_exact = [&](uint8_t *data, size_t size) {
+			size_t offset = 0;
+			while (offset < size) {
+				ssize_t count = ::recv(peer, data + offset, size - offset, 0);
+				if (count <= 0) return false;
+				offset += static_cast<size_t>(count);
+			}
+			return true;
+		};
+		auto send_fragmented = [&](const std::vector<uint8_t> &data) {
+			for (uint8_t byte : data) {
+				if (::send(peer, &byte, 1, 0) != 1) return false;
+				std::this_thread::sleep_for(std::chrono::milliseconds(1));
+			}
+			return true;
+		};
+		std::array<uint8_t, 3> greeting {};
+		if (!read_exact(greeting.data(), greeting.size()) || greeting != std::array<uint8_t, 3> {5, 1, 0} ||
+		    !send_fragmented({5, 0})) {
+			::close(peer);
+			return;
+		}
+		std::array<uint8_t, 5> request_header {};
+		if (!read_exact(request_header.data(), request_header.size()) || request_header[3] != 3) {
+			::close(peer);
+			return;
+		}
+		const size_t host_size = request_header[4];
+		std::vector<uint8_t> target(host_size + 2);
+		if (!read_exact(target.data(), target.size())) {
+			::close(peer);
+			return;
+		}
+		observed_host.assign(target.begin(), target.begin() + static_cast<std::ptrdiff_t>(host_size));
+		observed_port = (static_cast<int>(target[host_size]) << 8) | target[host_size + 1];
+		proxy_ok = send_fragmented({5, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0x24, 0xb8});
+		::close(peer);
+	});
+
+	const std::string target = "must-not-resolve.invalid";
+	const int target_port = 19400;
+	const std::string proxy_uri = "socks5h://127.0.0.1:" + std::to_string(ntohs(address.sin_port));
+	std::string error;
+	int client = TcpConnect(target, target_port, 2000, &error, proxy_uri);
+	if (client >= 0) ::close(client);
+	::close(listener);
+	proxy.join();
+	REQUIRE(client >= 0);
+	CHECK(error.empty());
+	CHECK(proxy_ok);
+	CHECK(observed_host == target);
+	CHECK(observed_port == target_port);
+}
+
+TEST_CASE("TcpConnect rejects unsafe SOCKS5h configuration", "[tcp][socks5h]") {
+	std::string error;
+	CHECK(TcpConnect("must-not-resolve.invalid", 9400, 100, &error,
+	                 "socks5h://user:password@127.0.0.1:1080") < 0);
+	CHECK(error.find("credential-free") != std::string::npos);
+	CHECK(TcpConnect(std::string("safe.example\0hidden", 19), 9400, 100, &error,
+	                 "socks5h://127.0.0.1:1080") < 0);
+	CHECK(error.find("control") != std::string::npos);
 }
