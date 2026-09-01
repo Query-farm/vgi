@@ -115,6 +115,11 @@ impl TableProducer for CountProducer {
             .map_err(|e| RpcError::runtime_error(e.to_string()))?;
         Ok(Some(batch))
     }
+
+    fn resume_supported(&self) -> bool {
+        // The producer returns at most one batch.
+        false
+    }
 }
 
 impl TableFunction for CountTo {
@@ -167,6 +172,8 @@ impl TableProducer for EmitProducer {
         Ok(Some(RecordBatch::try_new(self.schema.clone(), vec![col])
             .map_err(|e| RpcError::runtime_error(e.to_string()))?))
     }
+
+    vgi::resume_fields!(batch_idx, counter);
 }
 impl TableFunction for EmitBatches {
     fn name(&self) -> &str {
@@ -203,6 +210,11 @@ struct BoomProducer;
 impl TableProducer for BoomProducer {
     fn next_batch(&mut self, _out: &mut OutputCollector) -> Result<Option<RecordBatch>> {
         Err(RpcError::runtime_error("boom: intentional worker error"))
+    }
+
+    fn resume_supported(&self) -> bool {
+        // This fixture errors before it can emit a batch.
+        false
     }
 }
 impl TableFunction for Boom {
@@ -265,6 +277,8 @@ impl TableProducer for SlowProducer {
         Ok(Some(RecordBatch::try_new(self.schema.clone(), vec![col])
             .map_err(|e| RpcError::runtime_error(e.to_string()))?))
     }
+
+    vgi::resume_fields!(i);
 }
 impl TableFunction for SlowCount {
     fn name(&self) -> &str {
@@ -308,6 +322,11 @@ impl TableProducer for PeekProducer {
         let col: ArrayRef = Arc::new(Int64Array::from(vec![v]));
         Ok(Some(RecordBatch::try_new(self.schema.clone(), vec![col])
             .map_err(|e| RpcError::runtime_error(e.to_string()))?))
+    }
+
+    fn resume_supported(&self) -> bool {
+        // The producer returns at most one batch.
+        false
     }
 }
 impl TableFunction for PeekMaxConcurrency {
@@ -353,6 +372,8 @@ impl TableProducer for ParallelProbeProducer {
         Ok(Some(RecordBatch::try_new(self.schema.clone(), vec![col])
             .map_err(|e| RpcError::runtime_error(e.to_string()))?))
     }
+
+    vgi::resume_fields!(i);
 }
 impl TableFunction for ParallelProbe {
     fn name(&self) -> &str {
@@ -519,6 +540,8 @@ impl TableProducer for SabBigProducer {
         Ok(Some(RecordBatch::try_new(self.schema.clone(), vec![col])
             .map_err(|e| RpcError::runtime_error(e.to_string()))?))
     }
+
+    vgi::resume_fields!(emitted);
 }
 impl TableFunction for SabBig {
     fn name(&self) -> &str {
@@ -578,6 +601,11 @@ impl TableProducer for SabCachedProducer {
     fn last_metadata(&self) -> Option<HashMap<String, String>> {
         self.meta.clone()
     }
+
+    fn resume_supported(&self) -> bool {
+        // The cache fixture deliberately returns one metadata-bearing batch.
+        false
+    }
 }
 impl TableFunction for SabCached {
     fn name(&self) -> &str {
@@ -635,6 +663,11 @@ impl TableProducer for BrowserInfoProducer {
         ];
         Ok(Some(RecordBatch::try_new(self.schema.clone(), cols)
             .map_err(|e| RpcError::runtime_error(e.to_string()))?))
+    }
+
+    fn resume_supported(&self) -> bool {
+        // The browser snapshot is returned in one batch.
+        false
     }
 }
 #[cfg(target_os = "emscripten")]
@@ -695,6 +728,11 @@ impl TableProducer for ClientRandomProducer {
         let col: ArrayRef = Arc::new(Int64Array::from(vals));
         Ok(Some(RecordBatch::try_new(self.schema.clone(), vec![col])
             .map_err(|e| RpcError::runtime_error(e.to_string()))?))
+    }
+
+    fn resume_supported(&self) -> bool {
+        // All requested random values are returned in one batch.
+        false
     }
 }
 #[cfg(target_os = "emscripten")]
@@ -759,6 +797,11 @@ impl TableProducer for ClientFetchProducer {
         ];
         Ok(Some(RecordBatch::try_new(self.schema.clone(), cols)
             .map_err(|e| RpcError::runtime_error(e.to_string()))?))
+    }
+
+    fn resume_supported(&self) -> bool {
+        // One fetch produces one response batch.
+        false
     }
 }
 #[cfg(target_os = "emscripten")]
@@ -826,6 +869,11 @@ impl TableProducer for ClientGeoProducer {
         ];
         Ok(Some(RecordBatch::try_new(self.schema.clone(), cols)
             .map_err(|e| RpcError::runtime_error(e.to_string()))?))
+    }
+
+    fn resume_supported(&self) -> bool {
+        // One geolocation lookup produces one snapshot batch.
+        false
     }
 }
 #[cfg(target_os = "emscripten")]
