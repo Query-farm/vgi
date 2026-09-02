@@ -1,6 +1,7 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "vgi_http_client.hpp"
 
+#include <algorithm>
 #include <cctype>
 #include <chrono>
 #include <cstdio>
@@ -27,6 +28,22 @@ namespace vgi {
 // Header used to advertise / negotiate the set of supported content
 // encodings.  Mirrors the constant in ``vgi_rpc/http/_common.py``.
 static constexpr const char *kSupportedEncodingsHeader = "VGI-Supported-Encodings";
+static constexpr const char *kAcceptMaxResponseBytesHeader = "VGI-Accept-Max-Response-Bytes";
+static constexpr const char *kAcceptMaxResponseBytesSupportHeader =
+    "VGI-Accept-Max-Response-Bytes-Support";
+static constexpr int64_t kMinAcceptedMaxResponseBytes = 64LL << 10;
+static constexpr int64_t kMaxSafeInteger = 9007199254740991LL;
+// Independent safety ceiling for a buffered HTTP representation. This is not
+// the VGI decoded Arrow budget: a compressed representation can legitimately
+// be larger than the bytes produced after decoding. HTTPI enforces this while
+// streaming chunks into WASM; DuckDB's native POST API currently exposes the
+// completed string only, so its check is necessarily post-read.
+static constexpr size_t kMaxBufferedRepresentationBytes = 1024ULL * 1024ULL * 1024ULL;
+#if defined(__EMSCRIPTEN__)
+static constexpr int64_t kDefaultAcceptedMaxResponseBytes = 64LL << 20;
+#else
+static constexpr int64_t kDefaultAcceptedMaxResponseBytes = 256LL << 20;
+#endif
 
 // Comma-joined list of codecs we can produce / decode, in our preference
 // order — sent on every request so the server can pick a codec for its
@@ -149,6 +166,25 @@ static uint64_t GetHttpTimeoutSeconds(ClientContext &context) {
 	return 300; // fallback: 5 minutes
 }
 
+static int64_t GetAcceptedMaxResponseBytes(ClientContext &context) {
+	Value value;
+	int64_t result = kDefaultAcceptedMaxResponseBytes;
+	if (context.TryGetCurrentSetting("vgi_http_accepted_max_response_bytes", value)) {
+		result = value.GetValue<int64_t>();
+	}
+	if (result < kMinAcceptedMaxResponseBytes || result > kMaxSafeInteger) {
+		throw InvalidInputException(
+		    "vgi_http_accepted_max_response_bytes must be between 65536 and 9007199254740991");
+	}
+#if defined(__EMSCRIPTEN__)
+	// The current HTTPI bridge materializes one response in wasm32 linear
+	// memory. Advertise the tighter transport cap so the server never relies on
+	// a value the browser envelope cannot honor.
+	result = std::min<int64_t>(result, static_cast<int64_t>(httpi::kMaxBufferedBodyBytes));
+#endif
+	return result;
+}
+
 static void ApplyHttpTimeout(ClientContext &context, HTTPParams &params) {
 	params.timeout = GetHttpTimeoutSeconds(context);
 }
@@ -235,6 +271,12 @@ static std::string HttpPostArrowIpcInternal(
                                              ServerCapabilities *harvested_caps = nullptr) {
 	const bool is_httpi = IsHttpiTransport(url);
 	const uint64_t timeout_seconds = GetHttpTimeoutSeconds(context);
+	const int64_t accepted_max_response_bytes = GetAcceptedMaxResponseBytes(context);
+	int64_t effective_max_response_bytes = accepted_max_response_bytes;
+	if (harvested_caps && harvested_caps->max_response_bytes >= kMinAcceptedMaxResponseBytes) {
+		effective_max_response_bytes =
+		    std::min(effective_max_response_bytes, harvested_caps->max_response_bytes);
+	}
 
 	// Skip compression for tiny bodies (producer ticks, small unary
 	// envelopes): zstd adds CPU on the per-request hot path and often GROWS a
@@ -272,6 +314,7 @@ static std::string HttpPostArrowIpcInternal(
 		add_header("Content-Encoding", EncodingName(request_encoding));
 	}
 	add_header("X-VGI-Accept-Encoding", ClientAcceptEncoding());
+	add_header(kAcceptMaxResponseBytesHeader, std::to_string(accepted_max_response_bytes));
 	if (!bearer_token.empty()) {
 		add_header("Authorization", "Bearer " + bearer_token);
 	}
@@ -290,8 +333,10 @@ static std::string HttpPostArrowIpcInternal(
 		// compression, error and continuation state machine remains identical.
 		// BrowserPost never retries a transport failure, because POST dispatch may
 		// be ambiguous once Iroh accepted request bytes.
-		out_response->browser =
-		    httpi::BrowserPost(context, url, httpi_headers, req_body_data, req_body_size, timeout_seconds);
+		out_response->browser = httpi::BrowserPost(context, url, httpi_headers, req_body_data,
+		                                        req_body_size, timeout_seconds,
+		                                        kMaxBufferedRepresentationBytes,
+		                                        static_cast<size_t>(effective_max_response_bytes));
 		response_body = out_response->browser->body;
 #else
 		throw IOException("vgi: httpi:// transport is only available in DuckDB-WASM with an "
@@ -322,6 +367,11 @@ static std::string HttpPostArrowIpcInternal(
 			response_body.assign(post.buffer_out.data(), post.buffer_out.data() + post.buffer_out.size());
 		}
 	}
+	if (response_body.size() > kMaxBufferedRepresentationBytes) {
+		throw IOException("VGI HTTP response representation exceeds buffered transport limit (%llu > %llu) [url: %s]",
+		                  static_cast<unsigned long long>(response_body.size()),
+		                  static_cast<unsigned long long>(kMaxBufferedRepresentationBytes), url);
+	}
 
 	if (cookie_jar) {
 		auto set_cookie_headers = CollectSetCookieHeaders(*out_response);
@@ -333,7 +383,8 @@ static std::string HttpPostArrowIpcInternal(
 	// Harvest server capabilities off this response — ANY response, whatever
 	// its status. The server middleware stamps the capability headers on every
 	// one, so callers that pass a harvest slot learn ServerCapabilities from
-	// traffic they were already generating (no separate HEAD /health probe),
+	// traffic they were already generating (avoiding later re-probes after the
+	// mandatory initial discovery),
 	// and — the reason this runs before the status handling below — a failure
 	// caused by a codec the server can't decode still tells us which codecs it
 	// can. Responses with no VGI capability header at all (a proxy error page,
@@ -342,9 +393,36 @@ static std::string HttpPostArrowIpcInternal(
 	ServerCapabilities response_caps;
 	if (HasCapabilityHeaders(*out_response)) {
 		response_caps = ParseCapabilityHeaders(*out_response);
+		if (response_caps.max_response_bytes >= kMinAcceptedMaxResponseBytes) {
+			effective_max_response_bytes =
+			    std::min(effective_max_response_bytes, response_caps.max_response_bytes);
+		}
 		if (harvested_caps) {
+			// Optional capability fields refine the discovery snapshot; omission
+			// does not revoke a previously advertised hard bound. Exact support is
+			// intentionally not inherited because every response must prove it.
+			if (response_caps.max_response_bytes < 0) {
+				response_caps.max_response_bytes = harvested_caps->max_response_bytes;
+			}
+			if (response_caps.max_request_bytes < 0) {
+				response_caps.max_request_bytes = harvested_caps->max_request_bytes;
+			}
+			if (response_caps.max_upload_bytes < 0) {
+				response_caps.max_upload_bytes = harvested_caps->max_upload_bytes;
+			}
+			if (!response_caps.encodings_advertised && harvested_caps->encodings_advertised) {
+				response_caps.encodings_advertised = true;
+				response_caps.supported_encodings = harvested_caps->supported_encodings;
+			}
+			if (response_caps.cache_expires_at == std::chrono::steady_clock::time_point{}) {
+				response_caps.cache_expires_at = harvested_caps->cache_expires_at;
+			}
 			*harvested_caps = response_caps;
 		}
+	}
+	if (!response_caps.discovered || !response_caps.accept_max_response_bytes_support) {
+		throw IOException("VGI HTTP response does not advertise %s: true [url: %s]",
+		                  kAcceptMaxResponseBytesSupportHeader, url);
 	}
 
 	if (out_response->Status() == HTTPStatusCode::Unauthorized_401) {
@@ -394,16 +472,23 @@ static std::string HttpPostArrowIpcInternal(
 
 	if (!out_response->Success()) {
 		std::string error_body = response_body.empty() ? out_response->FallbackBody() : response_body;
+		if (error_body.size() > kMaxBufferedRepresentationBytes) {
+			throw IOException("VGI HTTP response representation exceeds buffered transport limit (%llu > %llu) [url: %s]",
+			                  static_cast<unsigned long long>(error_body.size()),
+			                  static_cast<unsigned long long>(kMaxBufferedRepresentationBytes), url);
+		}
 		// Decompress if the server advertised a codec we know — otherwise
 		// Arrow IPC parsing would see compressed-stream magic bytes and
 		// throw "negative continuation token".
 		auto error_enc = ResolveResponseEncoding(*out_response);
 		if (!error_body.empty() && error_enc != HttpEncoding::NONE) {
-			try {
-				error_body = Decompress(error_enc, error_body.data(), error_body.size());
-			} catch (...) {
-				// Leave body as-is; the raw bytes will appear in the preview.
-			}
+			error_body = Decompress(error_enc, error_body.data(), error_body.size(),
+			                           static_cast<size_t>(effective_max_response_bytes));
+		}
+		if (error_body.size() > static_cast<uint64_t>(effective_max_response_bytes)) {
+			throw IOException("VGI HTTP response exceeds max_response_bytes (%llu > %llu) [url: %s]",
+			                  static_cast<unsigned long long>(error_body.size()),
+			                  static_cast<unsigned long long>(effective_max_response_bytes), url);
 		}
 		std::string content_type =
 		    out_response->HasHeader("Content-Type") ? out_response->GetHeaderValue("Content-Type") : std::string();
@@ -523,9 +608,15 @@ static std::string HttpPostArrowIpcInternal(
 	// so response_body here is still the compressed application body.
 	const size_t resp_wire_bytes = response_body.size();
 	if (resp_enc != HttpEncoding::NONE && !response_body.empty()) {
-		response_body = Decompress(resp_enc, response_body.data(), response_body.size());
+		response_body = Decompress(resp_enc, response_body.data(), response_body.size(),
+		                           static_cast<size_t>(effective_max_response_bytes));
 	}
 	const size_t resp_decoded_bytes = response_body.size();
+	if (resp_decoded_bytes > static_cast<uint64_t>(effective_max_response_bytes)) {
+		throw IOException("VGI HTTP response exceeds max_response_bytes (%llu > %llu) [url: %s]",
+		                  static_cast<unsigned long long>(resp_decoded_bytes),
+		                  static_cast<unsigned long long>(effective_max_response_bytes), url);
+	}
 
 	// Per-response payload accounting for HTTP-transport debugging: how many
 	// bytes were read, whether the response was compressed (and with which
@@ -685,6 +776,17 @@ UnaryResponseResult HttpInvokeUnary(ClientContext &context, const std::string &w
                                     duckdb::unique_ptr<HTTPClient> *client_holder, ServerCapabilities *caps) {
 	std::string base_url = NormalizeBaseUrl(worker_path);
 	std::string url = base_url + "/" + method_name;
+	ServerCapabilities local_caps;
+	auto *effective_caps = caps ? caps : &local_caps;
+	if (!effective_caps->discovered ||
+	    (effective_caps->cache_expires_at != std::chrono::steady_clock::time_point{} &&
+	     std::chrono::steady_clock::now() >= effective_caps->cache_expires_at)) {
+		*effective_caps = HttpDiscoverCapabilities(context, base_url);
+	}
+	if (!effective_caps->discovered || !effective_caps->accept_max_response_bytes_support) {
+		throw IOException("VGI HTTP server does not advertise %s: true [url: %s]",
+		                  kAcceptMaxResponseBytesSupportHeader, base_url);
+	}
 
 	// Gated: fires once per unary RPC (hot on catalog bursts / buffered sinks).
 	const bool log_active = VgiInfoLogActive(context);
@@ -704,7 +806,8 @@ UnaryResponseResult HttpInvokeUnary(ClientContext &context, const std::string &w
 
 	// POST to {worker_path}/{method_name} using standard HTTP timeout
 	auto response_body =
-	    HttpPostArrowIpc(context, url, body, auth, cookie_jar, cached_http_params, client_holder, caps);
+	    HttpPostArrowIpc(context, url, body, auth, cookie_jar, cached_http_params, client_holder,
+	                     effective_caps);
 
 	// Parse the Arrow IPC response. Move the body in — the string becomes the
 	// owning Arrow buffer, avoiding an alloc+memcpy of the whole payload.
@@ -952,8 +1055,60 @@ static std::chrono::seconds ParseCacheControlMaxAge(const RESPONSE &response) {
 // genuinely advertises nothing.
 template <class RESPONSE>
 static bool HasCapabilityHeaders(const RESPONSE &response) {
-	return response.HasHeader(kSupportedEncodingsHeader) || response.HasHeader("VGI-Max-Request-Bytes") ||
+	return response.HasHeader(kAcceptMaxResponseBytesSupportHeader) ||
+	       response.HasHeader(kSupportedEncodingsHeader) || response.HasHeader("VGI-Max-Request-Bytes") ||
 	       response.HasHeader("VGI-Upload-URL-Support") || response.HasHeader("VGI-Max-Upload-Bytes");
+}
+
+template <class RESPONSE>
+static bool HasSingleResponseBudgetSupport(const RESPONSE &response) {
+	return response.HasHeader(kAcceptMaxResponseBytesSupportHeader) &&
+	       response.GetHeaderValue(kAcceptMaxResponseBytesSupportHeader) == "true";
+}
+
+static bool HasSingleResponseBudgetSupport(const RpcHttpResponse &response) {
+	const auto values = response.HeaderValues(kAcceptMaxResponseBytesSupportHeader);
+	return values.size() == 1 && values[0] == "true";
+}
+
+static int64_t ParseCanonicalResponseMaximum(const std::string &value) {
+	if (value.empty() || value.front() == '0') {
+		throw IOException("VGI-Max-Response-Bytes must match [1-9][0-9]*");
+	}
+	int64_t parsed = 0;
+	for (const auto byte : value) {
+		if (byte < '0' || byte > '9') {
+			throw IOException("VGI-Max-Response-Bytes must match [1-9][0-9]*");
+		}
+		const auto digit = static_cast<int64_t>(byte - '0');
+		if (parsed > (kMaxSafeInteger - digit) / 10) {
+			throw IOException("VGI-Max-Response-Bytes must be between 65536 and 9007199254740991");
+		}
+		parsed = parsed * 10 + digit;
+	}
+	if (parsed < kMinAcceptedMaxResponseBytes || parsed > kMaxSafeInteger) {
+		throw IOException("VGI-Max-Response-Bytes must be between 65536 and 9007199254740991");
+	}
+	return parsed;
+}
+
+template <class RESPONSE>
+static std::optional<int64_t> ParseAdvertisedResponseMaximum(const RESPONSE &response) {
+	if (!response.HasHeader("VGI-Max-Response-Bytes")) {
+		return std::nullopt;
+	}
+	return ParseCanonicalResponseMaximum(response.GetHeaderValue("VGI-Max-Response-Bytes"));
+}
+
+static std::optional<int64_t> ParseAdvertisedResponseMaximum(const RpcHttpResponse &response) {
+	const auto values = response.HeaderValues("VGI-Max-Response-Bytes");
+	if (values.empty()) {
+		return std::nullopt;
+	}
+	if (values.size() != 1) {
+		throw IOException("VGI-Max-Response-Bytes must occur exactly once");
+	}
+	return ParseCanonicalResponseMaximum(values[0]);
 }
 
 // Parse capability headers from an HTTP response (set by middleware on every response).
@@ -961,12 +1116,16 @@ template <class RESPONSE>
 static ServerCapabilities ParseCapabilityHeaders(const RESPONSE &response) {
 	ServerCapabilities caps;
 	caps.discovered = true;
+	caps.accept_max_response_bytes_support = HasSingleResponseBudgetSupport(response);
 
 	if (response.HasHeader("VGI-Max-Request-Bytes")) {
 		try {
 			caps.max_request_bytes = std::stoll(response.GetHeaderValue("VGI-Max-Request-Bytes"));
 		} catch (...) {
 		}
+	}
+	if (const auto max_response = ParseAdvertisedResponseMaximum(response)) {
+		caps.max_response_bytes = *max_response;
 	}
 	if (response.HasHeader("VGI-Upload-URL-Support")) {
 		caps.upload_url_support = response.GetHeaderValue("VGI-Upload-URL-Support") == "true";
@@ -999,17 +1158,30 @@ ServerCapabilities HttpDiscoverCapabilities(ClientContext &context, const std::s
 	// {base_url}/health: it is mandatory in every implementation and exempt
 	// from auth, matching the Python reference client.
 	auto url = NormalizeBaseUrl(base_url) + "/health";
+	const auto accepted_max_response_bytes = GetAcceptedMaxResponseBytes(context);
 	if (IsHttpiTransport(url)) {
-		// The browser adapter deliberately exposes only POST. Normal VGI traffic
-		// harvests the same capability headers from every response, so avoid
-		// inventing a HEAD replay/control path for Iroh.
+		// HTTPI carries an explicit OPTIONS envelope over Iroh. It is safe to
+		// retry because it never dispatches an application method.
+#if defined(__EMSCRIPTEN__)
+		RpcHttpResponse response;
+		response.browser = httpi::BrowserRequest(
+		    context, url, "OPTIONS",
+		    {{kAcceptMaxResponseBytesHeader, std::to_string(accepted_max_response_bytes)}}, nullptr, 0,
+		    GetHttpTimeoutSeconds(context), kMaxBufferedRepresentationBytes,
+		    static_cast<size_t>(accepted_max_response_bytes));
+		if (!response.Success()) {
+			throw IOException("VGI HTTPI capability discovery failed (HTTP %d) [url: %s]",
+			                  static_cast<int>(response.Status()), url);
+		}
+		return ParseCapabilityHeaders(response);
+#else
 		return ServerCapabilities {};
+#endif
 	}
 
-	// This explicit probe is the FALLBACK — capabilities are normally harvested
-	// off responses the connection already receives (see HttpPostArrowIpc's
-	// harvested_caps). Log so an unexpected probe on a hot path is visible in
-	// duckdb_logs; a healthy scan should show zero of these events.
+	// DuckDB's native HTTP abstraction has no OPTIONS request type. HEAD against
+	// the mandatory health route is the native equivalent and reads the same
+	// capability middleware headers before the first application POST.
 	VGI_LOG(context, "http.capability_probe", {{"url", url}});
 
 	auto &db = *context.db;
@@ -1018,15 +1190,17 @@ ServerCapabilities HttpDiscoverCapabilities(ClientContext &context, const std::s
 	ApplyHttpTimeout(context, *params);
 
 	HTTPHeaders headers;
+	headers.Insert(kAcceptMaxResponseBytesHeader, std::to_string(accepted_max_response_bytes));
 	HeadRequestInfo head(url, headers, *params);
 	auto response = http_util.Request(head);
 	if (!response) {
-		// Transport failure — treat as "no capabilities discovered" rather
-		// than crashing. Caller's defaults apply.
-		return ServerCapabilities{};
+		throw IOException("VGI HTTP capability discovery returned no response [url: %s]", url);
+	}
+	const auto status = static_cast<int>(response->status);
+	if (status < 200 || status >= 300) {
+		throw IOException("VGI HTTP capability discovery failed (HTTP %d) [url: %s]", status, url);
 	}
 
-	// Parse capability headers regardless of status code — middleware adds them to all responses
 	return ParseCapabilityHeaders(*response);
 }
 

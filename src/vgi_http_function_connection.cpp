@@ -901,10 +901,10 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 	auto body = SerializeBatchWithState(input_batch, input_schema_);
 
 	// Check if batch exceeds max_request_bytes and upload URL support is available.
-	// Capabilities are primarily HARVESTED off the responses this connection (and
-	// its per-catalog siblings) already received — the /init POST always precedes
-	// the first exchange, so capabilities_ is normally warm by now. The explicit
-	// HEAD /health probe survives only as a last-resort fallback (plus the
+	// Capabilities are HARVESTED off the responses this connection (and its
+	// per-catalog siblings) already received after mandatory discovery. The
+	// /init POST always precedes the first exchange, so capabilities_ is normally
+	// warm by now. A health probe is used when no positive snapshot exists (plus the
 	// Cache-Control re-probe for a probed snapshot whose max-age elapsed;
 	// harvested snapshots refresh on every response and never carry an expiry).
 	if (!capabilities_.discovered && attach_params_) {

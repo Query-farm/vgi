@@ -3517,6 +3517,16 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          LogicalType::BIGINT, Value::BIGINT(300));
 
 	config.AddExtensionOption(
+	    "vgi_http_accepted_max_response_bytes",
+	    "Decoded Arrow IPC bytes accepted per VGI HTTP response (minimum 65536; advertised to the worker)",
+	    LogicalType::BIGINT,
+#if defined(__EMSCRIPTEN__)
+	    Value::BIGINT(64LL << 20));
+#else
+	    Value::BIGINT(256LL << 20));
+#endif
+
+	config.AddExtensionOption(
 	    "vgi_secret_default_ttl_seconds",
 	    "Default cache TTL (seconds) for credentials fetched from an Orchard remote secret provider. "
 	    "Capped per-credential by the credential's own expiry. Read at ATTACH and frozen per-provider.",

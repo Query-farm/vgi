@@ -115,9 +115,13 @@ uses flags=3, status=0, no headers, and exactly one terminal frame; status zero
 without terminal-only is invalid. Chunks are at most 64 KiB;
 header count is at most 1024 and total header bytes at most 1 MiB. The browser
 adapter defaults to 64 MiB per materialized request and 128 MiB aggregate across
-active claims. The C++ client buffers at most 1 GiB per response because the
-surrounding HTTP implementation currently materializes responses; no
-configurable native HTTP response limit exists.
+active claims. The VGI client advertises and enforces
+`vgi_http_accepted_max_response_bytes` for each decoded Arrow response: 64 MiB
+by default in DuckDB-WASM and 256 MiB in native builds. The configured value is
+the HTTPI streaming accumulation cap for identity responses, further tightened
+by `VGI-Max-Response-Bytes`. Compressed representations use an independent
+1 GiB transport ceiling and are checked against the decoded limit during
+bounded decompression, so wire size and decoded Arrow size are not conflated.
 Duplicate fields retain order, including `Set-Cookie`, and response bit 0 is
 mandatory because browser Iroh returns raw representation bytes.
 

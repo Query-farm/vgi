@@ -1,0 +1,20 @@
+# name: test/sql/vgi_http_response_budget.test
+# description: VGI HTTP client receive-budget setting
+# group: [vgi]
+
+require vgi
+
+query I
+SELECT value::BIGINT
+FROM duckdb_settings()
+WHERE name = 'vgi_http_accepted_max_response_bytes';
+----
+268435456
+
+statement ok
+SET vgi_http_accepted_max_response_bytes = 65536;
+
+query I
+SELECT current_setting('vgi_http_accepted_max_response_bytes')::BIGINT;
+----
+65536

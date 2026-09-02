@@ -16,14 +16,17 @@ namespace duckdb {
 namespace vgi {
 
 // Server capabilities harvested from HTTP response headers.
-// Capability headers (VGI-Max-Request-Bytes, VGI-Upload-URL-Support,
+// Capability headers (VGI-Accept-Max-Response-Bytes-Support,
+// VGI-Max-Request-Bytes, VGI-Upload-URL-Support,
 // VGI-Max-Upload-Bytes, VGI-Supported-Encodings) are emitted by the
-// server middleware on EVERY response, so the primary source is the
-// responses a connection is already receiving (bind/init/exchange);
-// HEAD {base_url}/health remains as a last-resort explicit probe.
+// server middleware on EVERY response. A positive discovery is mandatory
+// before the first application call; later bind/init/exchange responses
+// refresh that snapshot and avoid unnecessary re-probes.
 struct ServerCapabilities {
 	bool discovered = false;
+	bool accept_max_response_bytes_support = false;
 	int64_t max_request_bytes = -1;   // -1 = no limit advertised
+	int64_t max_response_bytes = -1;  // -1 = no limit advertised
 	bool upload_url_support = false;
 	int64_t max_upload_bytes = -1;    // -1 = no limit advertised
 	// Content-encoding codecs the server can decompress on request bodies

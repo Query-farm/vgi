@@ -520,14 +520,68 @@ bool ValidHeaderValue(const std::string &value) {
 	                    [](unsigned char c) { return (c < 0x20 && c != '\t') || c == 0x7f; });
 }
 
+bool HeaderNameIs(const std::string &actual, const char *expected) {
+	const auto expected_size = std::strlen(expected);
+	if (actual.size() != expected_size)
+		return false;
+	for (size_t i = 0; i < expected_size; ++i) {
+		if (std::tolower(static_cast<unsigned char>(actual[i])) !=
+		    std::tolower(static_cast<unsigned char>(expected[i])))
+			return false;
+	}
+	return true;
+}
+
+uint64_t ParseResponseMaximum(const std::string &value, const std::string &url) {
+	static constexpr uint64_t kMinimum = 65536;
+	static constexpr uint64_t kMaximum = 9007199254740991ULL;
+	if (value.empty() || value.front() == '0') {
+		throw IOException("VGI-Max-Response-Bytes must match [1-9][0-9]* [url: %s]", url);
+	}
+	uint64_t parsed = 0;
+	for (const auto byte : value) {
+		if (byte < '0' || byte > '9') {
+			throw IOException("VGI-Max-Response-Bytes must match [1-9][0-9]* [url: %s]", url);
+		}
+		const auto digit = static_cast<uint64_t>(byte - '0');
+		if (parsed > (kMaximum - digit) / 10) {
+			throw IOException("VGI-Max-Response-Bytes is outside 65536..=2^53-1 [url: %s]", url);
+		}
+		parsed = parsed * 10 + digit;
+	}
+	if (parsed < kMinimum || parsed > kMaximum) {
+		throw IOException("VGI-Max-Response-Bytes is outside 65536..=2^53-1 [url: %s]", url);
+	}
+	return parsed;
+}
+
+bool KnownCompressedRepresentation(const Header &header) {
+	if (!HeaderNameIs(header.name, "Content-Encoding") &&
+	    !HeaderNameIs(header.name, "X-VGI-Content-Encoding")) {
+		return false;
+	}
+	std::string value;
+	value.reserve(header.value.size());
+	for (const auto byte : header.value) {
+		if (byte != ' ' && byte != '\t')
+			value.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(byte))));
+	}
+	return value == "gzip" || value == "zstd";
+}
+
 } // namespace
 
-Response BrowserPost(ClientContext &context, const std::string &url, const std::vector<Header> &headers,
-                     const uint8_t *body, size_t body_size, uint64_t timeout_seconds) {
+Response BrowserRequest(ClientContext &context, const std::string &url, const std::string &method,
+                        const std::vector<Header> &headers, const uint8_t *body, size_t body_size,
+                        uint64_t timeout_seconds, size_t max_buffered_response_bytes,
+                        size_t max_decoded_response_bytes) {
 	auto parsed = ParseHttpiUrl(url);
 	const std::string target = "httpi://" + parsed.endpoint_id;
 	const std::string path = parsed.path.empty() ? "/" : parsed.path;
-	if (headers.size() > kMaxHeaders || path.size() > UINT32_MAX || body_size > INT64_MAX) {
+	if ((method != "POST" && method != "OPTIONS") || method.size() > UINT16_MAX ||
+	    headers.size() > kMaxHeaders || path.size() > UINT32_MAX || body_size > INT64_MAX ||
+	    max_buffered_response_bytes == 0 || max_buffered_response_bytes > kMaxBufferedBodyBytes ||
+	    max_decoded_response_bytes == 0) {
 		throw IOException("VGI HTTPI request exceeds envelope limits [url: %s]", url);
 	}
 	size_t header_bytes = 0;
@@ -562,11 +616,11 @@ Response BrowserPost(ClientContext &context, const std::string &url, const std::
 	request.push_back(kVersion);
 	request.push_back(kRequest);
 	AppendU16(request, 0);
-	AppendU16(request, 4); // POST
+	AppendU16(request, static_cast<uint16_t>(method.size()));
 	AppendU16(request, 0);
 	AppendU32(request, static_cast<uint32_t>(path.size()));
 	AppendU32(request, static_cast<uint32_t>(headers.size()));
-	AppendBytes(request, "POST");
+	AppendBytes(request, method);
 	AppendBytes(request, path);
 	for (const auto &header : headers) {
 		AppendU32(request, static_cast<uint32_t>(header.name.size()));
@@ -634,6 +688,25 @@ Response BrowserPost(ClientContext &context, const std::string &url, const std::
 		}
 		response.headers.push_back({std::move(name), std::move(value)});
 	}
+	size_t response_body_limit = max_buffered_response_bytes;
+	bool compressed_representation = false;
+	std::optional<uint64_t> advertised_maximum;
+	for (const auto &header : response.headers) {
+		compressed_representation = compressed_representation || KnownCompressedRepresentation(header);
+		if (HeaderNameIs(header.name, "VGI-Max-Response-Bytes")) {
+			if (advertised_maximum.has_value()) {
+				throw IOException("VGI-Max-Response-Bytes must occur exactly once [url: %s]", url);
+			}
+			advertised_maximum = ParseResponseMaximum(header.value, url);
+		}
+	}
+	if (!compressed_representation) {
+		response_body_limit = std::min(response_body_limit, max_decoded_response_bytes);
+		if (advertised_maximum) {
+			response_body_limit = static_cast<size_t>(
+			    std::min<uint64_t>(response_body_limit, *advertised_maximum));
+		}
+	}
 	for (;;) {
 		uint8_t frame[8];
 		ReadExact(input, frame, sizeof(frame), url);
@@ -646,8 +719,9 @@ Response BrowserPost(ClientContext &context, const std::string &url, const std::
 			if (length > kChunkBytes) {
 				throw IOException("VGI HTTPI response chunk exceeds envelope limit [url: %s]", url);
 			}
-			if (response.body.size() > kMaxBufferedBodyBytes - length) {
-				throw IOException("VGI HTTPI response exceeds the 1 GiB buffered-body limit [url: %s]", url);
+			if (length > response_body_limit || response.body.size() > response_body_limit - length) {
+				throw IOException("VGI HTTPI response representation exceeds buffered transport limit (%llu) [url: %s]",
+				                  static_cast<unsigned long long>(response_body_limit), url);
 			}
 			auto chunk = ReadString(input, length, url);
 			response.body.append(chunk);
@@ -679,6 +753,13 @@ Response BrowserPost(ClientContext &context, const std::string &url, const std::
 		throw IOException("VGI HTTPI adapter returned an invalid body frame [url: %s]", url);
 	}
 	return response;
+}
+
+Response BrowserPost(ClientContext &context, const std::string &url, const std::vector<Header> &headers,
+                     const uint8_t *body, size_t body_size, uint64_t timeout_seconds,
+                     size_t max_buffered_response_bytes, size_t max_decoded_response_bytes) {
+	return BrowserRequest(context, url, "POST", headers, body, body_size, timeout_seconds,
+	                      max_buffered_response_bytes, max_decoded_response_bytes);
 }
 
 } // namespace httpi

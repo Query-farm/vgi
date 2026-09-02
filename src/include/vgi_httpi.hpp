@@ -138,8 +138,13 @@ inline const char *CertaintyName(DispatchCertainty certainty) {
 }
 
 #if defined(__EMSCRIPTEN__)
+Response BrowserRequest(ClientContext &context, const std::string &url, const std::string &method,
+                        const std::vector<Header> &headers, const uint8_t *body, size_t body_size,
+                        uint64_t timeout_seconds, size_t max_buffered_response_bytes,
+                        size_t max_decoded_response_bytes);
 Response BrowserPost(ClientContext &context, const std::string &url, const std::vector<Header> &headers,
-                     const uint8_t *body, size_t body_size, uint64_t timeout_seconds);
+                     const uint8_t *body, size_t body_size, uint64_t timeout_seconds,
+                     size_t max_buffered_response_bytes, size_t max_decoded_response_bytes);
 #endif
 
 } // namespace httpi

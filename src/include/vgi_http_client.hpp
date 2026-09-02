@@ -106,6 +106,9 @@ private:
 // POST Arrow IPC bytes to a URL, return raw response body bytes.
 // Used for catalog, stream init, and exchange operations.
 // Timeout is controlled by the vgi_http_timeout_seconds setting (default 300s).
+// The decoded response budget is controlled by
+// vgi_http_accepted_max_response_bytes (256 MiB native, 64 MiB WASM) and is
+// advertised on every request after mandatory capability discovery.
 // auth: per-catalog auth state for bearer token injection and 401 handling.
 // cookie_jar: per-catalog HTTP cookie store (see HttpInvokeUnary).
 // client_holder: optional caller-owned HTTP client cache. When non-null, the
@@ -170,7 +173,9 @@ struct UploadUrl {
 	std::string download_url;
 };
 
-// Discover server capabilities via HEAD {base_url}/health.
+// Discover server capabilities before method dispatch. Native DuckDB uses
+// HEAD {base_url}/health because its HTTP abstraction has no OPTIONS request
+// type; HTTPI sends OPTIONS through the Iroh envelope.
 // Capability headers are returned on every response; /health is the
 // canonical mandatory, auth-exempt target. Honours Cache-Control:
 // max-age=N to schedule a future re-probe via cache_expires_at.
