@@ -44,6 +44,12 @@ jobs:
       extension_name: vgi
       use_prebuilt_images: true
       use_prebuilt_wasm_image: true
+      # The embedded Iroh connector is compiled from the pinned Rust source as
+      # part of the extension, so both native Linux and WASM builders need the
+      # prebuilt image variants that contain Cargo. `extra_toolchains` controls
+      # inline image builds, but does not alter an already-published image.
+      image_variant: rust
+      wasm_image_variant: rust
       prebuilt_image_tag: v1.5.5
       extra_toolchains: parser_tools;rust
       # NOTE: this pipeline does NOT run the VGI integration suite.
