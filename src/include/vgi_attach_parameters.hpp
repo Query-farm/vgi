@@ -32,6 +32,7 @@ class CatalogAuth;
 class SessionCookieJar;
 // Forward declaration — full definition in vgi_http_client.hpp
 class VgiHttpClientPool;
+struct IrohClientConfig;
 
 // POD constructor argument for ``VgiAttachParameters``.  Replaces the
 // 8-positional-default-param constructor that previous versions of this
@@ -51,6 +52,9 @@ struct VgiAttachParametersConfig {
 	std::string data_version_spec;
 	std::string implementation_version;
 	std::shared_ptr<SessionCookieJar> cookie_jar;
+	// Native Iroh endpoint/identity configuration. Null for non-Iroh transports
+	// and for Emscripten, where the page-owned adapter owns the endpoint.
+	std::shared_ptr<IrohClientConfig> iroh;
 	// Per-LOCATION launcher overrides.  Both nullopt by default; when set,
 	// they're applied to the spawn-time ``LaunchConfig`` for `launch:`
 	// LOCATIONs and rejected at parse time for any other transport.
@@ -80,7 +84,7 @@ struct VgiAttachParameters {
 	      auth_(std::move(cfg.auth)),
 	      data_version_spec_(std::move(cfg.data_version_spec)),
 	      implementation_version_(std::move(cfg.implementation_version)),
-	      cookie_jar_(std::move(cfg.cookie_jar)),
+	      cookie_jar_(std::move(cfg.cookie_jar)), iroh_(std::move(cfg.iroh)),
 	      launcher_idle_timeout_seconds_(cfg.launcher_idle_timeout_seconds),
 	      launcher_state_dir_(std::move(cfg.launcher_state_dir)),
 	      tcp_proxy_(std::move(cfg.tcp_proxy)),
@@ -99,6 +103,7 @@ struct VgiAttachParameters {
 	                                                     /*cache=*/true, std::move(auth),
 	                                                     std::move(data_version_spec),
 	                                                     std::move(implementation_version), std::move(cookie_jar),
+	                                                     /*iroh=*/nullptr,
 	                                                     std::nullopt, std::nullopt,
 	                                                     /*attach_options_canonical=*/std::string()}) {
 	}
@@ -148,6 +153,10 @@ struct VgiAttachParameters {
 
 	const std::shared_ptr<CatalogAuth> &auth() const {
 		return auth_;
+	}
+
+	const std::shared_ptr<IrohClientConfig> &iroh() const {
+		return iroh_;
 	}
 
 	// Requested semver constraint for the catalog's data version. Empty string
@@ -245,6 +254,7 @@ private:
 	std::string data_version_spec_;
 	std::string implementation_version_;
 	std::shared_ptr<SessionCookieJar> cookie_jar_;
+	std::shared_ptr<IrohClientConfig> iroh_;
 	std::optional<int64_t> launcher_idle_timeout_seconds_;
 	std::optional<std::string> launcher_state_dir_;
 	std::string tcp_proxy_;

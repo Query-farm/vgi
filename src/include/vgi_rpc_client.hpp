@@ -6,6 +6,7 @@
 #include <arrow/ipc/api.h>
 
 #include <memory>
+#include <functional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -108,6 +109,14 @@ void WriteRpcRequest(int fd, const std::string &method_name,
                      const std::shared_ptr<arrow::RecordBatch> &params_batch,
                      const std::shared_ptr<arrow::KeyValueMetadata> &extra_metadata = nullptr);
 
+// Stream-based form used by transports that are not represented by an OS file
+// descriptor (notably native Iroh QUIC streams). The framing is byte-for-byte
+// identical to the fd form above.
+void WriteRpcRequest(const std::shared_ptr<arrow::io::OutputStream> &sink,
+                     const std::string &method_name,
+                     const std::shared_ptr<arrow::RecordBatch> &params_batch,
+                     const std::shared_ptr<arrow::KeyValueMetadata> &extra_metadata = nullptr);
+
 // Write an RPC request with no parameters (zero-field schema, 1-row batch).
 // Used for parameterless methods like catalog_catalogs.
 void WriteEmptyRpcRequest(int fd, const std::string &method_name);
@@ -142,6 +151,18 @@ UnaryResponseResult ReadUnaryResponse(int fd, ClientContext *context,
                                       const std::string &transaction_opaque_data_hex = "",
                                       const std::string &conn_id_hex = "");
 
+// Stream-based response reader. Cancellation/deadline polling is provided by
+// the InputStream implementation; the native Iroh stream uses short timed
+// reads and cancels its QUIC stream when ClientContext is interrupted.
+UnaryResponseResult ReadUnaryResponse(const std::shared_ptr<arrow::io::InputStream> &input,
+                                      ClientContext *context,
+                                      const std::string &worker_path = "",
+                                      pid_t worker_pid = -1,
+                                      const std::string &invocation_id_hex = "",
+                                      const std::string &attach_opaque_data_hex = "",
+                                      const std::string &transaction_opaque_data_hex = "",
+                                      const std::string &conn_id_hex = "");
+
 // Result from reading a stream header
 struct StreamHeaderResult {
 	std::shared_ptr<arrow::RecordBatch> header_batch;    // The header data batch (1-row)
@@ -153,6 +174,11 @@ struct StreamHeaderResult {
 // returns the header data batch, and drains to EOS.
 // Used for streaming RPC methods that declare a header type (e.g., init()).
 StreamHeaderResult ReadStreamHeader(int fd, ClientContext *context,
+                                    const std::string &worker_path = "",
+                                    pid_t worker_pid = -1);
+
+StreamHeaderResult ReadStreamHeader(const std::shared_ptr<arrow::io::InputStream> &input,
+                                    ClientContext *context,
                                     const std::string &worker_path = "",
                                     pid_t worker_pid = -1);
 

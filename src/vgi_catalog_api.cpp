@@ -213,12 +213,15 @@ static UnaryResponseResult InvokeRpcMethod(const CatalogRpcContext &ctx, const s
 		                      ctx.params->auth(),
 		                      ctx.params->cookie_jar()};
 		opts.tcp_proxy = ctx.params->tcp_proxy();
+		opts.iroh = ctx.params->iroh();
 		// Cache-hit on the HTTP path: avoids re-entering the secret manager (and
 		// thus the MetaTransaction mutex) for RPCs invoked from inside
 		// VgiTransaction::Start. No-op for subprocess transport. See the TODO on
 		// VgiAttachParameters::GetOrInitHttpParams.
-		if (IsHttpTransport(ctx.params->worker_path())) {
+		if (IsHttpTransport(ctx.params->worker_path()) || IsHttpiTransport(ctx.params->worker_path())) {
+			if (IsHttpTransport(ctx.params->worker_path())) {
 			opts.cached_http_params = ctx.params->GetOrInitHttpParams(context, ctx.params->worker_path());
+			}
 			// Keep-alive client pool: consecutive catalog RPCs reuse TCP/TLS
 			// connections instead of handshaking per call.
 			opts.http_client_pool = ctx.params->GetOrInitHttpClientPool();
@@ -309,7 +312,8 @@ std::vector<VgiCatalogInfo> InvokeCatalogs(const std::string &worker_path, Clien
 	                                            std::optional<int64_t> launcher_idle_timeout_seconds,
 	                                            std::optional<std::string> launcher_state_dir,
 	                                            std::shared_ptr<void> worker_artifact_anchor,
-	                                            const std::string &tcp_proxy) {
+	                                            const std::string &tcp_proxy,
+	                                            std::shared_ptr<IrohClientConfig> iroh) {
 	// Use the config struct so launcher overrides flow into the temp_params —
 	// same rationale as InvokeCatalogAttach below. Without these, this RPC
 	// would prime the launcher cache with [defaults]; the user's subsequent
@@ -321,6 +325,7 @@ std::vector<VgiCatalogInfo> InvokeCatalogs(const std::string &worker_path, Clien
 	temp_cfg.worker_debug = worker_debug;
 	temp_cfg.use_pool = use_pool;
 	temp_cfg.auth = auth;
+	temp_cfg.iroh = std::move(iroh);
 	temp_cfg.launcher_idle_timeout_seconds = launcher_idle_timeout_seconds;
 	temp_cfg.launcher_state_dir = launcher_state_dir;
 	temp_cfg.worker_artifact_anchor = std::move(worker_artifact_anchor);
@@ -408,7 +413,8 @@ CatalogAttachResult InvokeCatalogAttach(const std::string &worker_path, const st
 	                                    std::optional<int64_t> launcher_idle_timeout_seconds,
 	                                    std::optional<std::string> launcher_state_dir,
 	                                    std::shared_ptr<void> worker_artifact_anchor,
-	                                    const std::string &tcp_proxy) {
+	                                    const std::string &tcp_proxy,
+	                                    std::shared_ptr<IrohClientConfig> iroh) {
 	// Use the config struct so launcher overrides flow into the temp_params.
 	// Without these, the catalog_attach RPC would prime the launcher cache
 	// with [defaults]; the subsequent real ATTACH (carrying overrides) would
@@ -422,6 +428,7 @@ CatalogAttachResult InvokeCatalogAttach(const std::string &worker_path, const st
 	temp_cfg.data_version_spec = data_version_spec;
 	temp_cfg.implementation_version = implementation_version;
 	temp_cfg.cookie_jar = cookie_jar;
+	temp_cfg.iroh = std::move(iroh);
 	temp_cfg.launcher_idle_timeout_seconds = launcher_idle_timeout_seconds;
 	temp_cfg.launcher_state_dir = launcher_state_dir;
 	temp_cfg.worker_artifact_anchor = std::move(worker_artifact_anchor);

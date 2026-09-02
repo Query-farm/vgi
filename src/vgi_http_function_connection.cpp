@@ -19,6 +19,7 @@
 #include "vgi_rpc_client.hpp"
 #include "vgi_rpc_types.hpp"
 #include "vgi_protocol.hpp" // BindResult
+#include "vgi_transport.hpp"
 #include "generated/vgi_request_builders.hpp"
 
 namespace duckdb {
@@ -365,14 +366,15 @@ BindResult HttpFunctionConnection::PerformBindRpc() {
 	auto transport_fn = [&](const std::vector<uint8_t> &request_bytes) -> std::shared_ptr<arrow::RecordBatch> {
 		auto rpc_params = ::duckdb::vgi::generated::BuildBindParams(request_bytes);
 		auto auth = attach_params_ ? attach_params_->auth() : nullptr;
-		auto cached_params = attach_params_
+		auto cached_params = attach_params_ && IsHttpTransport(base_url_)
 		    ? attach_params_->GetOrInitHttpParams(context_, base_url_) : nullptr;
 		// In/out capability snapshot: picks this request's Content-Encoding and
 		// is refreshed from the response (see CurrentCapabilities).
 		ServerCapabilities b_caps = CurrentCapabilities();
 		auto resp = HttpInvokeUnary(context_, base_url_, "bind", rpc_params, auth,
 		                             /*cookie_jar=*/nullptr, cached_params,
-		                             "", "", "", "", "", &http_client_, &b_caps);
+		                             "", "", "", "", "", &http_client_, &b_caps,
+		                             attach_params_ ? attach_params_->iroh() : nullptr);
 		PublishHarvestedCapabilities(b_caps);
 		if (!resp.batch || resp.batch->num_rows() == 0) {
 			throw IOException("Empty bind response from HTTP server [url: %s]", base_url_);
@@ -513,7 +515,7 @@ InitResult HttpFunctionConnection::PerformInit(const BindResult &bind_result,
 	auto auth = attach_params_ ? attach_params_->auth() : nullptr;
 #ifdef __EMSCRIPTEN__
 #endif
-	auto cached_params_init = attach_params_
+	auto cached_params_init = attach_params_ && IsHttpTransport(init_url)
 	    ? attach_params_->GetOrInitHttpParams(context_, init_url) : nullptr;
 #ifdef __EMSCRIPTEN__
 #endif
@@ -523,7 +525,7 @@ InitResult HttpFunctionConnection::PerformInit(const BindResult &bind_result,
 	ServerCapabilities harvested = CurrentCapabilities();
 	auto response_body = HttpPostArrowIpc(context_, init_url, body, auth,
 	                                        /*cookie_jar=*/nullptr, cached_params_init, &http_client_,
-	                                        &harvested);
+	                                        &harvested, attach_params_ ? attach_params_->iroh() : nullptr);
 	PublishHarvestedCapabilities(harvested);
 #ifdef __EMSCRIPTEN__
 #endif
@@ -745,13 +747,14 @@ HttpFunctionConnection::RpcTableBufferingProcess(const std::string &function_nam
 	auto rpc_params = vgi::BuildTableBufferingProcessInner(function_name, schema_name_, execution_id,
 	                                                          batch_bytes, attach_opaque_data_, batch_index);
 	auto auth = attach_params_ ? attach_params_->auth() : nullptr;
-	auto cached_params = attach_params_
+	auto cached_params = attach_params_ && IsHttpTransport(base_url_)
 	    ? attach_params_->GetOrInitHttpParams(context_, base_url_) : nullptr;
 	ServerCapabilities tb_caps = CurrentCapabilities();
 	auto resp = HttpInvokeUnary(context_, base_url_, "table_buffering_process", rpc_params, auth,
 	                             /*cookie_jar=*/nullptr, cached_params,
 	                             GetExecutionIdHex(), GetAttachOpaqueDataHex(), "", GetConnIdHex(),
-	                             /*protocol_version_override=*/"", &http_client_, &tb_caps);
+	                             /*protocol_version_override=*/"", &http_client_, &tb_caps,
+	                             attach_params_ ? attach_params_->iroh() : nullptr);
 	PublishHarvestedCapabilities(tb_caps);
 	auto inner = DecodeHttpOuterResponse(resp, "table_buffering_process", base_url_);
 	if (!inner || inner->num_rows() == 0) {
@@ -770,13 +773,14 @@ HttpFunctionConnection::RpcTableBufferingCombine(const std::string &function_nam
 	auto rpc_params = vgi::BuildTableBufferingCombineInner(function_name, schema_name_, execution_id, state_ids,
 	                                                          attach_opaque_data_);
 	auto auth = attach_params_ ? attach_params_->auth() : nullptr;
-	auto cached_params = attach_params_
+	auto cached_params = attach_params_ && IsHttpTransport(base_url_)
 	    ? attach_params_->GetOrInitHttpParams(context_, base_url_) : nullptr;
 	ServerCapabilities tb_caps = CurrentCapabilities();
 	auto resp = HttpInvokeUnary(context_, base_url_, "table_buffering_combine", rpc_params, auth,
 	                             /*cookie_jar=*/nullptr, cached_params,
 	                             GetExecutionIdHex(), GetAttachOpaqueDataHex(), "", GetConnIdHex(),
-	                             /*protocol_version_override=*/"", &http_client_, &tb_caps);
+	                             /*protocol_version_override=*/"", &http_client_, &tb_caps,
+	                             attach_params_ ? attach_params_->iroh() : nullptr);
 	PublishHarvestedCapabilities(tb_caps);
 	auto inner = DecodeHttpOuterResponse(resp, "table_buffering_combine", base_url_);
 	if (!inner || inner->num_rows() == 0) {
@@ -801,13 +805,14 @@ void HttpFunctionConnection::RpcTableBufferingDestructor(const std::string &func
 	auto rpc_params = vgi::BuildTableBufferingDestructorInner(function_name, schema_name_, execution_id,
 	                                                             attach_opaque_data_);
 	auto auth = attach_params_ ? attach_params_->auth() : nullptr;
-	auto cached_params = attach_params_
+	auto cached_params = attach_params_ && IsHttpTransport(base_url_)
 	    ? attach_params_->GetOrInitHttpParams(context_, base_url_) : nullptr;
 	ServerCapabilities tb_caps = CurrentCapabilities();
 	auto resp = HttpInvokeUnary(context_, base_url_, "table_buffering_destructor", rpc_params, auth,
 	                             /*cookie_jar=*/nullptr, cached_params,
 	                             GetExecutionIdHex(), GetAttachOpaqueDataHex(), "", GetConnIdHex(),
-	                             /*protocol_version_override=*/"", &http_client_, &tb_caps);
+	                             /*protocol_version_override=*/"", &http_client_, &tb_caps,
+	                             attach_params_ ? attach_params_->iroh() : nullptr);
 	PublishHarvestedCapabilities(tb_caps);
 	auto inner = DecodeHttpOuterResponse(resp, "table_buffering_destructor", base_url_);
 	(void)inner;
@@ -856,12 +861,12 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 		}
 
 		auto p_auth = attach_params_ ? attach_params_->auth() : nullptr;
-		auto p_cached_params = attach_params_
+		auto p_cached_params = attach_params_ && IsHttpTransport(exchange_url)
 		    ? attach_params_->GetOrInitHttpParams(context_, exchange_url) : nullptr;
 		ServerCapabilities p_harvested = CurrentCapabilities();
 		auto response_body = HttpPostArrowIpc(context_, exchange_url, body, p_auth,
 		                                        /*cookie_jar=*/nullptr, p_cached_params, &http_client_,
-		                                        &p_harvested);
+		                                        &p_harvested, attach_params_ ? attach_params_->iroh() : nullptr);
 		PublishHarvestedCapabilities(p_harvested);
 
 		// Parse response — buffer new data batches (adopt the body, no copy)
@@ -913,14 +918,16 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 	if (!capabilities_.discovered ||
 	    (capabilities_.cache_expires_at != std::chrono::steady_clock::time_point{} &&
 	     std::chrono::steady_clock::now() >= capabilities_.cache_expires_at)) {
-		capabilities_ = HttpDiscoverCapabilities(context_, base_url_);
+		capabilities_ = HttpDiscoverCapabilities(context_, base_url_,
+		                                            attach_params_ ? attach_params_->iroh() : nullptr);
 	}
 	if (capabilities_.max_request_bytes > 0 &&
 	    static_cast<int64_t>(body.size()) > capabilities_.max_request_bytes &&
 	    capabilities_.upload_url_support) {
 		// Upload via server-vended URL, send pointer batch instead
 		auto e_auth = attach_params_ ? attach_params_->auth() : nullptr;
-		auto urls = HttpRequestUploadUrls(context_, base_url_, 1, e_auth);
+		auto urls = HttpRequestUploadUrls(context_, base_url_, 1, e_auth,
+		                                  attach_params_ ? attach_params_->iroh() : nullptr);
 		if (!urls.empty()) {
 			HttpPutBytes(context_, urls[0].upload_url, body, HttpEncoding::NONE);
 			body = SerializePointerBatch(input_schema_, urls[0].download_url, stream_state_token_,
@@ -931,12 +938,12 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 	std::string exchange_url = base_url_ + "/init/exchange";
 
 	auto x_auth = attach_params_ ? attach_params_->auth() : nullptr;
-	auto x_cached_params = attach_params_
+	auto x_cached_params = attach_params_ && IsHttpTransport(exchange_url)
 	    ? attach_params_->GetOrInitHttpParams(context_, exchange_url) : nullptr;
 	ServerCapabilities x_harvested = CurrentCapabilities();
 	auto response_body = HttpPostArrowIpc(context_, exchange_url, body, x_auth,
 	                                        /*cookie_jar=*/nullptr, x_cached_params, &http_client_,
-	                                        &x_harvested);
+	                                        &x_harvested, attach_params_ ? attach_params_->iroh() : nullptr);
 	PublishHarvestedCapabilities(x_harvested);
 
 	// Parse response — copy into owning buffer since Arrow IPC reads zero-copy reference it
@@ -1090,11 +1097,12 @@ void HttpFunctionConnection::CancelStream(const std::vector<uint8_t> &state_toke
 	// Route through ``live_context`` (dispatcher's bot context), NOT ``context_``:
 	// this runs off-thread after the originating query's ClientContext (and its
 	// Logger) may already be destroyed — see CancelStream contract in the header.
-	auto c_cached_params = attach_params_
+	auto c_cached_params = attach_params_ && IsHttpTransport(exchange_url)
 	    ? attach_params_->GetOrInitHttpParams(live_context, exchange_url) : nullptr;
 	// Best-effort: dispatcher catches any thrown exception.
 	(void)HttpPostArrowIpc(live_context, exchange_url, body, c_auth,
-	                        /*cookie_jar=*/nullptr, c_cached_params);
+	                        /*cookie_jar=*/nullptr, c_cached_params, nullptr, nullptr,
+	                        attach_params_ ? attach_params_->iroh() : nullptr);
 }
 
 } // namespace vgi

@@ -23,10 +23,11 @@ ATTACH 'iroh://0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
 ```
 
 The EndpointId must be exactly 64 lowercase hexadecimal characters. This target is available
-only in DuckDB-WASM and only after the host application supplies one Iroh adapter Worker to the
+in DuckDB-WASM only after the host application supplies one Iroh adapter Worker to the
 Haybarn bridge. Every remote target receives its own SAB region, while that one adapter keeps
-one local Iroh endpoint identity and multiplexes the regions. Native VGI rejects `iroh://`
-explicitly; use the native Iroh transport adapter outside the browser instead.
+one local Iroh endpoint identity and multiplexes the regions. Native VGI embeds the same
+Arrow-free Rust transport core directly in the extension; it does not download or spawn an
+adapter executable.
 
 HTTP over Iroh keeps the mature HTTP client state machine and changes only how
 the request reaches the server:

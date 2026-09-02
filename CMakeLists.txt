@@ -38,6 +38,128 @@ set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 
 project(${TARGET_NAME})
 
+# Native Iroh is compiled into the DuckDB extension as a Rust static library.
+# Emscripten keeps using the application-owned browser adapter. Release builds
+# build from pinned source; local developers may point at a sibling checkout or
+# disable the native transport for C++-only iteration.
+if(EMSCRIPTEN)
+  set(VGI_ENABLE_IROH OFF CACHE BOOL "Embed native Iroh transport" FORCE)
+else()
+  option(VGI_ENABLE_IROH "Embed native Iroh transport" ON)
+endif()
+
+if(VGI_ENABLE_IROH)
+  set(VGI_IROH_SOURCE_DIR "" CACHE PATH
+      "Optional path to a local vgi-rpc-rust source tree")
+  if(NOT VGI_IROH_SOURCE_DIR)
+    include(FetchContent)
+    FetchContent_Declare(vgi_iroh_source
+      GIT_REPOSITORY https://github.com/Query-farm/vgi-rpc-rust.git
+      GIT_TAG c105d7b047e912355a79420ced81cf296ec52c73
+      GIT_SHALLOW FALSE)
+    FetchContent_GetProperties(vgi_iroh_source)
+    if(NOT vgi_iroh_source_POPULATED)
+      FetchContent_Populate(vgi_iroh_source)
+    endif()
+    set(VGI_IROH_SOURCE_DIR "${vgi_iroh_source_SOURCE_DIR}")
+  endif()
+  if(NOT EXISTS "${VGI_IROH_SOURCE_DIR}/vgi-iroh-cabi/Cargo.toml")
+    message(FATAL_ERROR
+      "VGI_ENABLE_IROH requires vgi-iroh-cabi source. Set VGI_IROH_SOURCE_DIR "
+      "to a pinned vgi-rpc-rust checkout or configure -DVGI_ENABLE_IROH=OFF.")
+  endif()
+
+  set(VGI_IROH_CARGO_ENV)
+  if(APPLE)
+    # rustc otherwise defaults native objects to the host OS version, which can
+    # make a distributable extension unloadable on older supported macOS hosts.
+    # Apple Silicon starts at macOS 11; use an explicitly configured higher
+    # deployment target when the enclosing DuckDB build supplies one.
+    set(VGI_IROH_MACOS_DEPLOYMENT_TARGET "${CMAKE_OSX_DEPLOYMENT_TARGET}")
+    if(NOT VGI_IROH_MACOS_DEPLOYMENT_TARGET)
+      set(VGI_IROH_MACOS_DEPLOYMENT_TARGET "11.0")
+    endif()
+    list(APPEND VGI_IROH_CARGO_ENV
+      "MACOSX_DEPLOYMENT_TARGET=${VGI_IROH_MACOS_DEPLOYMENT_TARGET}")
+  endif()
+  find_program(VGI_CARGO_EXECUTABLE cargo REQUIRED)
+
+  if(CMAKE_CROSSCOMPILING)
+    message(FATAL_ERROR
+      "Native VGI Iroh currently requires a native Rust build host; CMake cross-compilation "
+      "is not yet supported. Configure with -DVGI_ENABLE_IROH=OFF for unsupported builders.")
+  elseif(APPLE)
+    if(CMAKE_OSX_ARCHITECTURES MATCHES "x86_64" OR CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64")
+      set(VGI_IROH_RUST_TARGET x86_64-apple-darwin)
+    elseif(CMAKE_OSX_ARCHITECTURES MATCHES "arm64" OR CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
+      set(VGI_IROH_RUST_TARGET aarch64-apple-darwin)
+    else()
+      message(FATAL_ERROR "Native VGI Iroh supports only x86_64 and arm64 macOS")
+    endif()
+  elseif(WIN32)
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "ARM|arm|aarch64")
+      message(FATAL_ERROR "Native VGI Iroh does not yet support Windows ARM")
+    endif()
+    if(MINGW)
+      set(VGI_IROH_RUST_TARGET x86_64-pc-windows-gnu)
+    else()
+      set(VGI_IROH_RUST_TARGET x86_64-pc-windows-msvc)
+      # The enclosing DuckDB/Haybarn build uses /MT. Keep Rust on the same
+      # static CRT so one extension never crosses allocator/CRT boundaries.
+      # Preserve any target-specific caller flags rather than replacing them.
+      set(VGI_IROH_MSVC_RUSTFLAGS "$ENV{CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS}")
+      string(STRIP "${VGI_IROH_MSVC_RUSTFLAGS} -Ctarget-feature=+crt-static"
+             VGI_IROH_MSVC_RUSTFLAGS)
+      list(APPEND VGI_IROH_CARGO_ENV
+        "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS=${VGI_IROH_MSVC_RUSTFLAGS}")
+    endif()
+  elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    if(CMAKE_CXX_COMPILER_TARGET MATCHES "musl")
+      message(FATAL_ERROR "Native VGI Iroh does not yet support musl targets")
+    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+      set(VGI_IROH_RUST_TARGET aarch64-unknown-linux-gnu)
+    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
+      set(VGI_IROH_RUST_TARGET x86_64-unknown-linux-gnu)
+    else()
+      message(FATAL_ERROR "Native VGI Iroh supports only x86_64 and arm64 glibc Linux")
+    endif()
+  else()
+    message(FATAL_ERROR "Native VGI Iroh is currently supported on macOS, Windows x86_64, and glibc Linux")
+  endif()
+
+  set(VGI_IROH_CARGO_TARGET_DIR "${CMAKE_CURRENT_BINARY_DIR}/vgi-iroh-cargo")
+  if(WIN32 AND NOT MINGW)
+    set(VGI_IROH_STATIC_LIB
+      "${VGI_IROH_CARGO_TARGET_DIR}/${VGI_IROH_RUST_TARGET}/release/vgi_iroh_cabi.lib")
+  else()
+    set(VGI_IROH_STATIC_LIB
+      "${VGI_IROH_CARGO_TARGET_DIR}/${VGI_IROH_RUST_TARGET}/release/libvgi_iroh_cabi.a")
+  endif()
+  file(GLOB_RECURSE VGI_IROH_RUST_INPUTS CONFIGURE_DEPENDS
+    "${VGI_IROH_SOURCE_DIR}/vgi-iroh-cabi/*"
+    "${VGI_IROH_SOURCE_DIR}/vgi-iroh-transport/*")
+  list(APPEND VGI_IROH_RUST_INPUTS
+    "${VGI_IROH_SOURCE_DIR}/Cargo.toml"
+    "${VGI_IROH_SOURCE_DIR}/Cargo.lock")
+  add_custom_command(
+    OUTPUT "${VGI_IROH_STATIC_LIB}"
+    COMMAND "${CMAKE_COMMAND}" -E env ${VGI_IROH_CARGO_ENV}
+            "${VGI_CARGO_EXECUTABLE}" build --locked --release
+            --manifest-path "${VGI_IROH_SOURCE_DIR}/Cargo.toml"
+            --package vgi-iroh-cabi --target "${VGI_IROH_RUST_TARGET}"
+            --target-dir "${VGI_IROH_CARGO_TARGET_DIR}"
+    DEPENDS ${VGI_IROH_RUST_INPUTS}
+    WORKING_DIRECTORY "${VGI_IROH_SOURCE_DIR}"
+    COMMENT "Building embedded VGI Iroh transport (${VGI_IROH_RUST_TARGET})"
+    VERBATIM)
+  add_custom_target(vgi_iroh_rust DEPENDS "${VGI_IROH_STATIC_LIB}")
+  add_library(vgi_iroh_cabi STATIC IMPORTED GLOBAL)
+  set_target_properties(vgi_iroh_cabi PROPERTIES IMPORTED_LOCATION "${VGI_IROH_STATIC_LIB}")
+  add_dependencies(vgi_iroh_cabi vgi_iroh_rust)
+  include_directories("${VGI_IROH_SOURCE_DIR}/vgi-iroh-cabi/include")
+  add_compile_definitions(VGI_ENABLE_IROH=1)
+endif()
+
 # Windows: keep <windows.h> from pulling in the legacy <winsock.h>, which
 # collides ("redefinition; different linkage") with the <winsock2.h> that
 # cpp-httplib (HTTP transport) uses. NOMINMAX stops windows.h's min/max macros
@@ -94,6 +216,8 @@ src/vgi_container_runtime.cpp
 src/vgi_http_compression.cpp
 src/vgi_http_client.cpp
 src/vgi_http_function_connection.cpp
+src/vgi_iroh_config.cpp
+src/vgi_iroh_native.cpp
 src/vgi_cookie_jar.cpp
 src/vgi_oauth.cpp
 src/vgi_oauth_env.cpp
@@ -172,6 +296,22 @@ build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 # Link OpenSSL in both the static library as the loadable extension
 target_link_libraries(${EXTENSION_NAME} ${VGI_SSL_LIBS} ${VGI_ARROW_LIB})
 target_link_libraries(${LOADABLE_EXTENSION_NAME} ${VGI_SSL_LIBS} ${VGI_ARROW_LIB})
+
+if(VGI_ENABLE_IROH)
+  add_dependencies(${EXTENSION_NAME} vgi_iroh_rust)
+  add_dependencies(${LOADABLE_EXTENSION_NAME} vgi_iroh_rust)
+  target_link_libraries(${EXTENSION_NAME} vgi_iroh_cabi)
+  target_link_libraries(${LOADABLE_EXTENSION_NAME} vgi_iroh_cabi)
+  if(APPLE)
+    target_link_libraries(${EXTENSION_NAME} "-framework Security" "-framework CoreFoundation"
+                          "-framework SystemConfiguration")
+    target_link_libraries(${LOADABLE_EXTENSION_NAME} "-framework Security" "-framework CoreFoundation"
+                          "-framework SystemConfiguration")
+  elseif(WIN32)
+    target_link_libraries(${EXTENSION_NAME} Crypt32)
+    target_link_libraries(${LOADABLE_EXTENSION_NAME} Crypt32)
+  endif()
+endif()
 
 # SQLite-backed per-value memo disk tier (same-host multi-process + cross-restart).
 # sqlite3 comes from vcpkg (see vcpkg.json), like every other native dependency, so it

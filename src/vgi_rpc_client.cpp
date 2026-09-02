@@ -109,11 +109,11 @@ static bool DispatchBatch(const std::shared_ptr<arrow::RecordBatch> &batch,
 // buffer-based equivalents further down. See vgi_platform.hpp.
 #if VGI_SUBPROCESS_TRANSPORT
 
-void WriteRpcRequest(int fd, const std::string &method_name,
+void WriteRpcRequest(const std::shared_ptr<arrow::io::OutputStream> &sink,
+                     const std::string &method_name,
                      const std::shared_ptr<arrow::RecordBatch> &params_batch,
                      const std::shared_ptr<arrow::KeyValueMetadata> &extra_metadata) {
 	// Create an IPC stream writer with the params schema
-	auto sink = std::make_shared<FdOutputStream>(fd);
 	auto writer_result = arrow::ipc::MakeStreamWriter(sink, params_batch->schema());
 	if (!writer_result.ok()) {
 		throw IOException("Failed to create RPC request writer: " + writer_result.status().ToString());
@@ -153,6 +153,12 @@ void WriteRpcRequest(int fd, const std::string &method_name,
 	}
 }
 
+void WriteRpcRequest(int fd, const std::string &method_name,
+                     const std::shared_ptr<arrow::RecordBatch> &params_batch,
+                     const std::shared_ptr<arrow::KeyValueMetadata> &extra_metadata) {
+	WriteRpcRequest(std::make_shared<FdOutputStream>(fd), method_name, params_batch, extra_metadata);
+}
+
 void WriteEmptyRpcRequest(int fd, const std::string &method_name) {
 	// Create an empty schema with zero fields
 	auto schema = arrow::schema({});
@@ -167,22 +173,12 @@ void WriteEmptyRpcRequest(int fd, const std::string &method_name) {
 // Response Reading
 // ============================================================================
 
-UnaryResponseResult ReadUnaryResponse(int fd, ClientContext *context,
-                                      const std::string &worker_path, pid_t worker_pid,
-                                      const std::string &invocation_id_hex,
-                                      const std::string &attach_opaque_data_hex,
-                                      const std::string &transaction_opaque_data_hex,
-                                      const std::string &conn_id_hex) {
-	// Block until the worker speaks or the query is cancelled — no wall-clock
-	// deadline. Cancellation comes via the context's `interrupted` flag
-	// (Ctrl-C / query cancel), polled every 250ms. This covers both data-phase
-	// RPCs (table_buffering_*) and catalog RPCs: a wedged worker is broken out
-	// of by cancellation, while a legitimately-slow response (cold worker
-	// start, large catalog, slow upstream) is never killed by an arbitrary
-	// deadline.
-	WaitForReadableUntilCancel(fd, context);
-
-	auto input = std::make_shared<FdInputStream>(fd, context);
+static UnaryResponseResult ReadUnaryResponseImpl(
+    const std::shared_ptr<arrow::io::InputStream> &input, ClientContext *context,
+    const std::string &worker_path, pid_t worker_pid, const std::string &invocation_id_hex,
+    const std::string &attach_opaque_data_hex, const std::string &transaction_opaque_data_hex,
+    const std::string &conn_id_hex, const std::function<void()> &before_read) {
+	before_read();
 	auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(input);
 	if (!reader_result.ok()) {
 		auto status = reader_result.status();
@@ -200,13 +196,12 @@ UnaryResponseResult ReadUnaryResponse(int fd, ClientContext *context,
 		// Gate every read on cancellation: WaitForReadableUntilCancel was called
 		// only before stream open, so without this a worker that stalls mid-stream
 		// (schema sent, body withheld) would wedge the query with Ctrl-C ignored.
-		WaitForReadableUntilCancel(fd, context);
+		before_read();
 		auto read_result = reader->ReadNext();
 		if (!read_result.ok()) {
 			auto status = read_result.status();
-			if (status.IsInvalid()) {
-				// End of stream without data batch - void return
-				break;
+			if (status.IsCancelled()) {
+				throw InterruptException();
 			}
 			ThrowVgiIOException("Failed to read RPC response batch: %s", worker_path, worker_pid, "",
 			                    status.ToString());
@@ -234,9 +229,17 @@ UnaryResponseResult ReadUnaryResponse(int fd, ClientContext *context,
 
 	// Drain remaining stream to EOS
 	while (true) {
-		WaitForReadableUntilCancel(fd, context);
+		before_read();
 		auto drain_result = reader->ReadNext();
-		if (!drain_result.ok() || !drain_result.ValueUnsafe().batch) {
+		if (!drain_result.ok()) {
+			auto status = drain_result.status();
+			if (status.IsCancelled()) {
+				throw InterruptException();
+			}
+			ThrowVgiIOException("Failed while draining RPC response: %s", worker_path, worker_pid, "",
+			                    status.ToString());
+		}
+		if (!drain_result.ValueUnsafe().batch) {
 			break;
 		}
 		// Dispatch any remaining log batches after the data batch
@@ -249,13 +252,34 @@ UnaryResponseResult ReadUnaryResponse(int fd, ClientContext *context,
 	return result;
 }
 
-StreamHeaderResult ReadStreamHeader(int fd, ClientContext *context,
-                                    const std::string &worker_path, pid_t worker_pid) {
-	// Block until the worker speaks or the query is cancelled (Ctrl-C),
-	// polled every 250ms — no arbitrary wall-clock deadline.
-	WaitForReadableUntilCancel(fd, context);
+UnaryResponseResult ReadUnaryResponse(int fd, ClientContext *context,
+                                      const std::string &worker_path, pid_t worker_pid,
+                                      const std::string &invocation_id_hex,
+                                      const std::string &attach_opaque_data_hex,
+                                      const std::string &transaction_opaque_data_hex,
+                                      const std::string &conn_id_hex) {
+	auto wait = [fd, context]() { WaitForReadableUntilCancel(fd, context); };
+	return ReadUnaryResponseImpl(std::make_shared<FdInputStream>(fd, context), context, worker_path,
+	                             worker_pid, invocation_id_hex, attach_opaque_data_hex,
+	                             transaction_opaque_data_hex, conn_id_hex, wait);
+}
 
-	auto input = std::make_shared<FdInputStream>(fd, context);
+UnaryResponseResult ReadUnaryResponse(const std::shared_ptr<arrow::io::InputStream> &input,
+                                      ClientContext *context, const std::string &worker_path,
+                                      pid_t worker_pid, const std::string &invocation_id_hex,
+                                      const std::string &attach_opaque_data_hex,
+                                      const std::string &transaction_opaque_data_hex,
+                                      const std::string &conn_id_hex) {
+	return ReadUnaryResponseImpl(input, context, worker_path, worker_pid, invocation_id_hex,
+	                             attach_opaque_data_hex, transaction_opaque_data_hex, conn_id_hex,
+	                             []() {});
+}
+
+static StreamHeaderResult ReadStreamHeaderImpl(const std::shared_ptr<arrow::io::InputStream> &input,
+                                               ClientContext *context,
+                                               const std::string &worker_path, pid_t worker_pid,
+                                               const std::function<void()> &before_read) {
+	before_read();
 	auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(input);
 	if (!reader_result.ok()) {
 		auto status = reader_result.status();
@@ -272,9 +296,16 @@ StreamHeaderResult ReadStreamHeader(int fd, ClientContext *context,
 	if (response_schema->num_fields() == 0) {
 		// Error stream - read the error batch, capturing any exception so we can drain first
 		std::exception_ptr caught_exception;
-		WaitForReadableUntilCancel(fd, context);
+		before_read();
 		auto read_result = reader->ReadNext();
-		if (read_result.ok()) {
+		if (!read_result.ok()) {
+			auto status = read_result.status();
+			if (status.IsCancelled()) {
+				throw InterruptException();
+			}
+			ThrowVgiIOException("Failed to read stream error batch: %s", worker_path, worker_pid, "",
+			                    status.ToString());
+		} else {
 			auto bwm = read_result.ValueUnsafe();
 			if (bwm.batch) {
 				try {
@@ -286,8 +317,22 @@ StreamHeaderResult ReadStreamHeader(int fd, ClientContext *context,
 		}
 		// Drain remaining stream data before rethrowing
 		while (true) {
+			before_read();
 			auto drain = reader->ReadNext();
-			if (!drain.ok() || !drain.ValueUnsafe().batch) {
+			if (!drain.ok()) {
+				auto status = drain.status();
+				if (status.IsCancelled()) {
+					throw InterruptException();
+				}
+				// Preserve a worker-supplied error already decoded above. Otherwise
+				// truncation or an idle timeout must not masquerade as clean EOS.
+				if (!caught_exception) {
+					ThrowVgiIOException("Failed while draining stream error response: %s", worker_path,
+					                    worker_pid, "", status.ToString());
+				}
+				break;
+			}
+			if (!drain.ValueUnsafe().batch) {
 				break;
 			}
 		}
@@ -300,12 +345,12 @@ StreamHeaderResult ReadStreamHeader(int fd, ClientContext *context,
 	// Read batches, dispatching log/error until we find the header data batch
 	StreamHeaderResult result;
 	while (true) {
-		WaitForReadableUntilCancel(fd, context);
+		before_read();
 		auto read_result = reader->ReadNext();
 		if (!read_result.ok()) {
 			auto status = read_result.status();
-			if (status.IsInvalid()) {
-				break;
+			if (status.IsCancelled()) {
+				throw InterruptException();
 			}
 			ThrowVgiIOException("Failed to read stream header batch: %s", worker_path, worker_pid, "",
 			                    status.ToString());
@@ -330,9 +375,17 @@ StreamHeaderResult ReadStreamHeader(int fd, ClientContext *context,
 	// The header is a complete IPC stream that ends with EOS marker.
 	// After EOS, a new data IPC stream begins on the same fd.
 	while (true) {
-		WaitForReadableUntilCancel(fd, context);
+		before_read();
 		auto drain_result = reader->ReadNext();
-		if (!drain_result.ok() || !drain_result.ValueUnsafe().batch) {
+		if (!drain_result.ok()) {
+			auto status = drain_result.status();
+			if (status.IsCancelled()) {
+				throw InterruptException();
+			}
+			ThrowVgiIOException("Failed while draining stream header: %s", worker_path, worker_pid, "",
+			                    status.ToString());
+		}
+		if (!drain_result.ValueUnsafe().batch) {
 			break;
 		}
 		auto &bwm = drain_result.ValueUnsafe();
@@ -344,6 +397,19 @@ StreamHeaderResult ReadStreamHeader(int fd, ClientContext *context,
 	}
 
 	return result;
+}
+
+StreamHeaderResult ReadStreamHeader(int fd, ClientContext *context,
+                                    const std::string &worker_path, pid_t worker_pid) {
+	auto wait = [fd, context]() { WaitForReadableUntilCancel(fd, context); };
+	return ReadStreamHeaderImpl(std::make_shared<FdInputStream>(fd, context), context, worker_path,
+	                            worker_pid, wait);
+}
+
+StreamHeaderResult ReadStreamHeader(const std::shared_ptr<arrow::io::InputStream> &input,
+                                    ClientContext *context, const std::string &worker_path,
+                                    pid_t worker_pid) {
+	return ReadStreamHeaderImpl(input, context, worker_path, worker_pid, []() {});
 }
 
 #endif // VGI_SUBPROCESS_TRANSPORT

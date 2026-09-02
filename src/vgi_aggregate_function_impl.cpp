@@ -241,6 +241,7 @@ AggregateRpcResult InvokeAggregateRpc(ClientContext &context, const VgiAggregate
 	                      bind_data.attach_params->auth(),
 	                      bind_data.attach_params->cookie_jar(),
 	                      enable_logging};
+	opts.iroh = bind_data.attach_params->iroh();
 	// Forward launcher overrides for `launch:` LOCATIONs (no-op for other transports).
 	if (bind_data.attach_params->launcher_idle_timeout_seconds().has_value()) {
 		opts.launcher_idle_timeout =

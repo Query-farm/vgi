@@ -15,6 +15,7 @@
 #include "vgi_exception.hpp"
 #include "vgi_http_client.hpp" // ResolveExternalLocation (externalized-batch resolution)
 #include "vgi_http_function_connection.hpp"
+#include "vgi_iroh_native.hpp"
 #if defined(__EMSCRIPTEN__)
 #include "vgi_webworker_function_connection.hpp"
 #endif
@@ -449,12 +450,14 @@ FunctionConnection::FunctionConnection(const std::string &worker_path, const std
                                        const std::vector<uint8_t> &global_execution_id, bool worker_debug,
                                        const std::map<std::string, Value> &settings,
                                        const std::vector<VgiSecretRequirement> &required_secrets,
-                                       const std::string &data_version_spec, const std::string &implementation_version)
+                                       const std::string &data_version_spec, const std::string &implementation_version,
+                                       std::shared_ptr<IrohClientConfig> iroh_config)
     : conn_id_hex_(VgiGenerateConnId()), worker_path_(worker_path), data_version_spec_(data_version_spec),
       implementation_version_(implementation_version), function_name_(function_name), function_type_(function_type),
       arguments_type_(arguments.type), arguments_array_(arguments.array), attach_opaque_data_(attach_opaque_data),
       transaction_opaque_data_(transaction_opaque_data), global_execution_id_(global_execution_id), context_(context),
-      worker_debug_(worker_debug), settings_(settings), required_secrets_(required_secrets) {
+      worker_debug_(worker_debug), settings_(settings), required_secrets_(required_secrets),
+      iroh_config_(std::move(iroh_config)) {
 }
 
 FunctionConnection::FunctionConnection(std::unique_ptr<PooledWorker> pooled_worker, const std::string &function_name,
@@ -508,12 +511,72 @@ FunctionConnection::~FunctionConnection() {
 	stderr_drainer_.reset();
 }
 
+bool FunctionConnection::TransportReady() const {
+	return proc_ != nullptr || (transport_input_ && transport_output_);
+}
+
+pid_t FunctionConnection::TransportPid() const {
+	return proc_ ? proc_->GetPid() : -1;
+}
+
+std::shared_ptr<arrow::io::InputStream> FunctionConnection::TransportInput() {
+	if (transport_input_) {
+		return transport_input_;
+	}
+	if (!proc_) {
+		throw InternalException("VGI byte transport is not connected");
+	}
+	return std::make_shared<FdInputStream>(proc_->GetStdoutFd(), &context_);
+}
+
+std::shared_ptr<arrow::io::OutputStream> FunctionConnection::TransportOutput() {
+	if (transport_output_) {
+		return transport_output_;
+	}
+	if (!proc_) {
+		throw InternalException("VGI byte transport is not connected");
+	}
+	return std::make_shared<FdOutputStream>(proc_->GetStdinFd());
+}
+
+void FunctionConnection::WriteTransportRpc(
+    const std::string &method, const std::shared_ptr<arrow::RecordBatch> &params,
+    const std::shared_ptr<arrow::KeyValueMetadata> &metadata) {
+	WriteRpcRequest(TransportOutput(), method, params, metadata);
+}
+
+UnaryResponseResult FunctionConnection::ReadTransportUnary() {
+	if (transport_input_) {
+		return ReadUnaryResponse(transport_input_, &context_, worker_path_, TransportPid(), GetExecutionIdHex(),
+		                         GetAttachOpaqueDataHex(), GetTransactionOpaqueDataHex(), GetConnIdHex());
+	}
+	return ReadUnaryResponse(proc_->GetStdoutFd(), &context_, worker_path_, TransportPid(), GetExecutionIdHex(),
+	                         GetAttachOpaqueDataHex(), GetTransactionOpaqueDataHex(), GetConnIdHex());
+}
+
+StreamHeaderResult FunctionConnection::ReadTransportHeader() {
+	if (transport_input_) {
+		return ReadStreamHeader(transport_input_, &context_, worker_path_, TransportPid());
+	}
+	return ReadStreamHeader(proc_->GetStdoutFd(), &context_, worker_path_, TransportPid());
+}
+
 void FunctionConnection::EnsureWorkerSpawned() {
 	// Lazy-spawn for subprocess transport. Pool-acquired connections arrive
 	// with proc_ already set; fresh constructions defer the spawn until the
 	// first RPC needs it. PerformBindRpc has historically been that hook;
 	// callers that skip the on-wire bind (cached BindResult → straight to
 	// PerformInit) call this directly so proc_ exists before the init write.
+	if (TransportReady()) {
+		return;
+	}
+	if (iroh_config_) {
+		auto duplex = OpenIrohArrowMuxStream(iroh_config_, &context_);
+		transport_input_ = std::move(duplex.input);
+		transport_output_ = std::move(duplex.output);
+		transport_cancel_ = std::move(duplex.cancel);
+		return;
+	}
 	if (!proc_) {
 		// worker_path_ stays the (github://) LOCATION so the pool keys consistently;
 		// ResolveWorkerPath turns a github scheme into the local cached entrypoint
@@ -541,34 +604,38 @@ BindResult FunctionConnection::PerformBindRpc() {
 		auto rpc_params = generated::BuildBindParams(request_bytes);
 		ValidateRequestSchema(rpc_params, "bind", worker_path_);
 		try {
-			WriteRpcRequest(proc_->GetStdinFd(), "bind", rpc_params);
+			WriteTransportRpc("bind", rpc_params);
 		} catch (const IOException &e) {
-			CheckWorkerExitStatus(*proc_, worker_path_, "failed to start", "",
-			                      stderr_drainer_ ? stderr_drainer_->CaptureStderrSnapshot() : std::string());
+			if (proc_) {
+				CheckWorkerExitStatus(*proc_, worker_path_, "failed to start", "",
+				                      stderr_drainer_ ? stderr_drainer_->CaptureStderrSnapshot() : std::string());
+			}
 			throw;
 		}
 
 		UnaryResponseResult response;
 		try {
-			response = ReadUnaryResponse(proc_->GetStdoutFd(), &context_, worker_path_, proc_->GetPid());
+			response = ReadTransportUnary();
 		} catch (const IOException &e) {
-			CheckWorkerExitStatus(*proc_, worker_path_, "failed during bind", "",
-			                      stderr_drainer_ ? stderr_drainer_->CaptureStderrSnapshot() : std::string());
+			if (proc_) {
+				CheckWorkerExitStatus(*proc_, worker_path_, "failed during bind", "",
+				                      stderr_drainer_ ? stderr_drainer_->CaptureStderrSnapshot() : std::string());
+			}
 			throw;
 		}
 
 		if (!response.batch || response.batch->num_rows() == 0) {
-			ThrowVgiIOException("Empty bind response from worker", worker_path_, proc_->GetPid(), "");
+			ThrowVgiIOException("Empty bind response from worker", worker_path_, TransportPid(), "");
 		}
 
 		auto result_col = response.batch->GetColumnByName("result");
 		if (!result_col) {
-			ThrowVgiIOException("Bind response missing 'result' column", worker_path_, proc_->GetPid(), "");
+			ThrowVgiIOException("Bind response missing 'result' column", worker_path_, TransportPid(), "");
 		}
 
 		auto bin_array = std::dynamic_pointer_cast<arrow::BinaryArray>(result_col);
 		if (!bin_array || bin_array->IsNull(0)) {
-			ThrowVgiIOException("Bind response 'result' column is null", worker_path_, proc_->GetPid(), "");
+			ThrowVgiIOException("Bind response 'result' column is null", worker_path_, TransportPid(), "");
 		}
 
 		auto v = bin_array->GetView(0);
@@ -603,12 +670,12 @@ InitResult FunctionConnection::PerformInit(const BindResult &bind_result, const 
                                            const std::vector<uint8_t> &init_opaque_data,
                                            const std::optional<std::vector<uint8_t>> &finalize_state_id,
                                            const std::vector<std::string> &split_tokens) {
-	if (!proc_) {
+	if (!TransportReady()) {
 		ThrowVgiIOException("FunctionConnection::PerformInit called before PerformBindRpc", worker_path_, -1,
 		                    GetExecutionIdHex());
 	}
 	if (init_done_) {
-		ThrowVgiIOException("FunctionConnection::PerformInit called twice", worker_path_, proc_ ? proc_->GetPid() : -1,
+		ThrowVgiIOException("FunctionConnection::PerformInit called twice", worker_path_, TransportPid(),
 		                    GetExecutionIdHex());
 	}
 
@@ -662,7 +729,7 @@ InitResult FunctionConnection::PerformInit(const BindResult &bind_result, const 
 	// that can't (Java 21 / non-POSIX / old worker) → segment stays null → all
 	// shm use sites no-op → inline (pipe) transport, no silent data loss.
 	if (const char *env = std::getenv("VGI_RPC_SHM_SIZE_BYTES");
-	    env && *env &&
+	    proc_ && env && *env &&
 	    NegotiateWorkerShmCapability(proc_->GetStdinFd(), proc_->GetStdoutFd(), worker_path_, context_,
 	                                 proc_->GetPid())) {
 		try {
@@ -692,20 +759,24 @@ InitResult FunctionConnection::PerformInit(const BindResult &bind_result, const 
 	}
 #endif // VGI_POSIX_TRANSPORT (shm)
 	try {
-		WriteRpcRequest(proc_->GetStdinFd(), "init", rpc_params, shm_metadata);
+		WriteTransportRpc("init", rpc_params, shm_metadata);
 	} catch (const IOException &e) {
-		CheckWorkerExitStatus(*proc_, worker_path_, "failed during init request", "",
-		                      stderr_drainer_ ? stderr_drainer_->CaptureStderrSnapshot() : std::string());
+		if (proc_) {
+			CheckWorkerExitStatus(*proc_, worker_path_, "failed during init request", "",
+			                      stderr_drainer_ ? stderr_drainer_->CaptureStderrSnapshot() : std::string());
+		}
 		throw;
 	}
 
 	// Read stream header (GlobalInitResponse)
 	StreamHeaderResult header;
 	try {
-		header = ReadStreamHeader(proc_->GetStdoutFd(), &context_, worker_path_, proc_->GetPid());
+		header = ReadTransportHeader();
 	} catch (const IOException &e) {
-		CheckWorkerExitStatus(*proc_, worker_path_, "failed during init response", "",
-		                      stderr_drainer_ ? stderr_drainer_->CaptureStderrSnapshot() : std::string());
+		if (proc_) {
+			CheckWorkerExitStatus(*proc_, worker_path_, "failed during init response", "",
+			                      stderr_drainer_ ? stderr_drainer_->CaptureStderrSnapshot() : std::string());
+		}
 		throw;
 	}
 
@@ -744,10 +815,10 @@ InitResult FunctionConnection::PerformInit(const BindResult &bind_result, const 
 		tick_schema_ = arrow::schema({});
 
 		// Create tick writer on stdin (C++ MakeStreamWriter writes schema immediately)
-		auto sink = std::make_shared<FdOutputStream>(proc_->GetStdinFd());
+		auto sink = TransportOutput();
 		auto writer_result = arrow::ipc::MakeStreamWriter(sink, tick_schema_);
 		if (!writer_result.ok()) {
-			ThrowVgiIOException("Failed to create tick writer: %s", worker_path_, proc_->GetPid(), GetExecutionIdHex(),
+			ThrowVgiIOException("Failed to create tick writer: %s", worker_path_, TransportPid(), GetExecutionIdHex(),
 			                    writer_result.status().ToString());
 		}
 		input_writer_ = writer_result.ValueUnsafe();
@@ -778,16 +849,16 @@ InitResult FunctionConnection::PerformInit(const BindResult &bind_result, const 
 		auto write_status = first_tick_metadata ? input_writer_->WriteRecordBatch(*tick_batch, first_tick_metadata)
 		    : input_writer_->WriteRecordBatch(*tick_batch);
 		if (!write_status.ok()) {
-			ThrowVgiIOException("Failed to write initial tick batch: %s", worker_path_, proc_->GetPid(),
+			ThrowVgiIOException("Failed to write initial tick batch: %s", worker_path_, TransportPid(),
 			                    GetExecutionIdHex(), write_status.ToString());
 		}
 
 		// Now open data reader on stdout — the server has processed the tick and
 		// flushed the output schema + first data batch to stdout
-		data_stream_ = std::make_shared<FdInputStream>(proc_->GetStdoutFd(), &context_);
+		data_stream_ = TransportInput();
 		auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(data_stream_);
 		if (!reader_result.ok()) {
-			ThrowVgiIOException("Failed to open data stream: %s", worker_path_, proc_->GetPid(), GetExecutionIdHex(),
+			ThrowVgiIOException("Failed to open data stream: %s", worker_path_, TransportPid(), GetExecutionIdHex(),
 			                    reader_result.status().ToString());
 		}
 		data_reader_ = reader_result.ValueUnsafe();
@@ -796,10 +867,10 @@ InitResult FunctionConnection::PerformInit(const BindResult &bind_result, const 
 		is_producer_mode_ = false;
 
 		// Create input writer on stdin (writes schema immediately)
-		auto sink = std::make_shared<FdOutputStream>(proc_->GetStdinFd());
+		auto sink = TransportOutput();
 		auto writer_result = arrow::ipc::MakeStreamWriter(sink, input_schema_);
 		if (!writer_result.ok()) {
-			ThrowVgiIOException("Failed to create input writer: %s", worker_path_, proc_->GetPid(), GetExecutionIdHex(),
+			ThrowVgiIOException("Failed to create input writer: %s", worker_path_, TransportPid(), GetExecutionIdHex(),
 			                    writer_result.status().ToString());
 		}
 		input_writer_ = writer_result.ValueUnsafe();
@@ -831,7 +902,7 @@ InitResult FunctionConnection::PerformInit(const BindResult &bind_result, const 
 void FunctionConnection::PerformFinalizeInit(const BindResult &bind_result) {
 	if (!init_done_) {
 		ThrowVgiIOException("FunctionConnection::PerformFinalizeInit called before PerformInit", worker_path_,
-		                    proc_ ? proc_->GetPid() : -1, GetExecutionIdHex());
+		                    TransportPid(), GetExecutionIdHex());
 	}
 
 	{
@@ -845,7 +916,7 @@ void FunctionConnection::PerformFinalizeInit(const BindResult &bind_result) {
 		auto close_status = input_writer_->Close();
 		if (!close_status.ok()) {
 			ThrowVgiIOException("Failed to close input writer for finalize: %s", worker_path_,
-			                    proc_ ? proc_->GetPid() : -1, GetExecutionIdHex(), close_status.ToString());
+			                    TransportPid(), GetExecutionIdHex(), close_status.ToString());
 		}
 	}
 	input_writer_.reset();
@@ -857,18 +928,41 @@ void FunctionConnection::PerformFinalizeInit(const BindResult &bind_result) {
 	// from the INPUT phase still sits unconsumed on stdout. We must open and drain
 	// it before sending the FINALIZE init request, otherwise ReadStreamHeader will
 	// read the leftover INPUT-phase output instead of the FINALIZE response header.
-	if (!data_reader_ && proc_) {
-		data_stream_ = std::make_shared<FdInputStream>(proc_->GetStdoutFd(), &context_);
+	if (!data_reader_ && TransportReady()) {
+		data_stream_ = TransportInput();
 		auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(data_stream_);
 		if (reader_result.ok()) {
 			data_reader_ = reader_result.ValueUnsafe();
+		} else if (iroh_config_) {
+			auto status = reader_result.status();
+			if (status.IsCancelled()) {
+				throw InterruptException();
+			}
+			// The next bytes cannot be assumed to begin FINALIZE when the
+			// preceding stateful stream failed before even yielding its schema.
+			ThrowVgiIOException("Failed to open Iroh output stream before finalize: %s", worker_path_,
+			                    TransportPid(), GetExecutionIdHex(), status.ToString());
 		}
 	}
 
 	// Drain remaining output from current stream
 	while (data_reader_) {
 		auto drain_result = data_reader_->ReadNext();
-		if (!drain_result.ok() || !drain_result.ValueUnsafe().batch) {
+		if (!drain_result.ok()) {
+			auto status = drain_result.status();
+			if (status.IsCancelled()) {
+				throw InterruptException();
+			}
+			// A raw Iroh stream is a persistent stateful byte transport. Any
+			// failure before Arrow's explicit EOS marker leaves the next RPC
+			// boundary unknowable, so it cannot be treated as an empty drain.
+			if (iroh_config_) {
+				ThrowVgiIOException("Failed while draining Iroh output before finalize: %s", worker_path_,
+				                    TransportPid(), GetExecutionIdHex(), status.ToString());
+			}
+			break;
+		}
+		if (!drain_result.ValueUnsafe().batch) {
 			break;
 		}
 	}
@@ -909,7 +1003,7 @@ void FunctionConnection::MarkSplitInitFailed() {
 void FunctionConnection::ResetForNextSplit() {
 	if (!init_done_) {
 		ThrowVgiIOException("FunctionConnection::ResetForNextSplit called before PerformInit", worker_path_,
-		                    proc_ ? proc_->GetPid() : -1, GetExecutionIdHex());
+		                    TransportPid(), GetExecutionIdHex());
 	}
 
 	// FIRST: close the input writer. This writes the IPC end-of-stream on stdin so
@@ -925,7 +1019,7 @@ void FunctionConnection::ResetForNextSplit() {
 			// go back to the pool looking idle.
 			split_reset_failed_ = true;
 			ThrowVgiIOException("Failed to close input writer between splits: %s", worker_path_,
-			                    proc_ ? proc_->GetPid() : -1, GetExecutionIdHex(), close_status.ToString());
+			                    TransportPid(), GetExecutionIdHex(), close_status.ToString());
 		}
 	}
 	input_writer_.reset();
@@ -936,7 +1030,20 @@ void FunctionConnection::ResetForNextSplit() {
 	// out, or ReadStreamHeader would read the leftover data as the new response.
 	while (data_reader_) {
 		auto drain_result = data_reader_->ReadNext();
-		if (!drain_result.ok() || !drain_result.ValueUnsafe().batch) {
+		if (!drain_result.ok()) {
+			auto status = drain_result.status();
+			if (status.IsCancelled()) {
+				split_reset_failed_ = true;
+				throw InterruptException();
+			}
+			if (iroh_config_) {
+				split_reset_failed_ = true;
+				ThrowVgiIOException("Failed while draining Iroh output between splits: %s", worker_path_,
+				                    TransportPid(), GetExecutionIdHex(), status.ToString());
+			}
+			break;
+		}
+		if (!drain_result.ValueUnsafe().batch) {
 			break;
 		}
 	}
@@ -968,7 +1075,7 @@ void FunctionConnection::ResetForNextSplit() {
 std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 	if (!init_done_) {
 		ThrowVgiIOException("FunctionConnection::ReadDataBatch called before PerformInit", worker_path_,
-		                    proc_ ? proc_->GetPid() : -1, GetExecutionIdHex());
+		                    TransportPid(), GetExecutionIdHex());
 	}
 	if (data_finished_) {
 		return nullptr;
@@ -976,14 +1083,14 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 
 	// Lazily open data reader if not yet opened (exchange mode defers this)
 	if (!data_reader_) {
-		if (!proc_) {
-			ThrowVgiIOException("FunctionConnection::ReadDataBatch proc_ is null", worker_path_, -1,
+		if (!TransportReady()) {
+			ThrowVgiIOException("FunctionConnection::ReadDataBatch transport is not connected", worker_path_, -1,
 			                    GetExecutionIdHex());
 		}
-		data_stream_ = std::make_shared<FdInputStream>(proc_->GetStdoutFd(), &context_);
+		data_stream_ = TransportInput();
 		auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(data_stream_);
 		if (!reader_result.ok()) {
-			ThrowVgiIOException("Failed to open data stream: %s", worker_path_, proc_->GetPid(), GetExecutionIdHex(),
+			ThrowVgiIOException("Failed to open data stream: %s", worker_path_, TransportPid(), GetExecutionIdHex(),
 			                    reader_result.status().ToString());
 		}
 		data_reader_ = reader_result.ValueUnsafe();
@@ -1045,12 +1152,24 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 		// ignored — ReadNext() bottoms out in a bare blocking read(). proc_ is
 		// always non-null here (the lazy open above throws otherwise; HTTP uses a
 		// separate connection class), so polling its stdout fd is safe.
-		WaitForReadableUntilCancel(proc_->GetStdoutFd(), &context_);
+		if (proc_) {
+			WaitForReadableUntilCancel(proc_->GetStdoutFd(), &context_);
+		}
 
 		// Read from the data stream reader
 		auto read_result = data_reader_->ReadNext();
 		if (!read_result.ok()) {
 			auto status = read_result.status();
+			if (status.IsCancelled()) {
+				throw InterruptException();
+			}
+			// QUIC FIN is only transport EOF. Raw Arrow-mux still requires the
+			// Arrow IPC EOS marker; accepting Invalid here would silently return
+			// a truncated result and leave this stateful connection desynchronized.
+			if (iroh_config_) {
+				ThrowVgiIOException("Iroh data stream ended before the Arrow EOS marker: %s", worker_path_,
+				                    TransportPid(), GetExecutionIdHex(), status.ToString());
+			}
 			// Arrow's IPC stream uses an explicit EOS marker (0xFFFFFFFF +
 			// 0-length); a clean stream-end surfaces *below* as Status::OK
 			// + batch == nullptr. A non-OK status here means the bytes
@@ -1117,7 +1236,7 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 		}
 
 		// Check for log/error batches via HandleBatchLogMessage
-		if (HandleBatchLogMessage(result.batch, result.custom_metadata, &context_, worker_path_, proc_->GetPid(),
+		if (HandleBatchLogMessage(result.batch, result.custom_metadata, &context_, worker_path_, TransportPid(),
 		                          GetExecutionIdHex(), GetAttachOpaqueDataHex(), "", GetConnIdHex())) {
 			continue;  // Skip log batch, read next
 		}
@@ -1332,7 +1451,7 @@ void FunctionConnection::OpenInputWriter() {
 	}
 
 	// Create an IPC stream writer for stdin
-	auto sink = std::make_shared<FdOutputStream>(proc_->GetStdinFd());
+	auto sink = TransportOutput();
 	auto writer_result = arrow::ipc::MakeStreamWriter(sink, input_schema_);
 	if (!writer_result.ok()) {
 		ThrowVgiIOException("Failed to create input stream writer: %s", worker_path_, proc_ ? proc_->GetPid() : -1,
@@ -1433,7 +1552,15 @@ void FunctionConnection::WriteInputBatch(const std::shared_ptr<arrow::RecordBatc
 
 void FunctionConnection::CancelStream(const std::vector<uint8_t> &state_token, ClientContext &live_context) {
 	(void)state_token;
-	(void)live_context; // subprocess cancel writes to the pipe; no context-bound logging/HTTP
+	(void)live_context; // raw transports cancel without context-bound logging/HTTP
+	// The Iroh cancellation handle owns only the native stream. Never route the
+	// off-thread dispatcher through Arrow's writer: its output wrapper retains
+	// the originating query context for in-flight write cancellation, and that
+	// context may already have been destroyed by the time this method runs.
+	if (transport_cancel_) {
+		transport_cancel_();
+		return;
+	}
 	// Best-effort: if the writer isn't open or is already closed, the
 	// worker has already learned the stream is done via EOS or pipe
 	// close; no cancel is needed.
@@ -1586,16 +1713,15 @@ FunctionConnection::RpcTableBufferingProcess(const std::string &function_name, c
 		process_meta = shm_meta;
 	}
 #endif
-	vgi::WriteRpcRequest(proc_->GetStdinFd(), "table_buffering_process", process_params, process_meta);
-	auto response = vgi::ReadUnaryResponse(proc_->GetStdoutFd(), &context_, worker_path_, proc_->GetPid(),
-	                                       GetExecutionIdHex(), GetAttachOpaqueDataHex(), "", GetConnIdHex());
+	WriteTransportRpc("table_buffering_process", process_params, process_meta);
+	auto response = ReadTransportUnary();
 #if VGI_SHM_TRANSPORT
 	ResolveUnaryShm(shm_segment_.get(), response);
 #endif
 	auto inner = DecodeOuterResponse(response, "table_buffering_process", worker_path_);
 	vgi::ValidateResponseSchema(inner, "table_buffering_process", worker_path_);
 	if (!inner || inner->num_rows() == 0) {
-		ThrowVgiIOException("table_buffering_process response missing data", worker_path_, proc_->GetPid(), "");
+		ThrowVgiIOException("table_buffering_process response missing data", worker_path_, TransportPid(), "");
 	}
 	auto col = inner->GetColumnByName("state_id");
 	auto bin_array = std::static_pointer_cast<arrow::BinaryArray>(col);
@@ -1609,16 +1735,15 @@ FunctionConnection::RpcTableBufferingCombine(const std::string &function_name, c
 	auto rpc_params =
 	    vgi::BuildTableBufferingCombineInner(function_name, schema_name_, execution_id, state_ids, attach_opaque_data_);
 	vgi::ValidateRequestSchema(rpc_params, "table_buffering_combine", worker_path_);
-	vgi::WriteRpcRequest(proc_->GetStdinFd(), "table_buffering_combine", rpc_params);
-	auto response = vgi::ReadUnaryResponse(proc_->GetStdoutFd(), &context_, worker_path_, proc_->GetPid(),
-	                                       GetExecutionIdHex(), GetAttachOpaqueDataHex(), "", GetConnIdHex());
+	WriteTransportRpc("table_buffering_combine", rpc_params);
+	auto response = ReadTransportUnary();
 #if VGI_SHM_TRANSPORT
 	ResolveUnaryShm(shm_segment_.get(), response);
 #endif
 	auto inner = DecodeOuterResponse(response, "table_buffering_combine", worker_path_);
 	vgi::ValidateResponseSchema(inner, "table_buffering_combine", worker_path_);
 	if (!inner || inner->num_rows() == 0) {
-		ThrowVgiIOException("table_buffering_combine response missing data", worker_path_, proc_->GetPid(), "");
+		ThrowVgiIOException("table_buffering_combine response missing data", worker_path_, TransportPid(), "");
 	}
 	auto col = inner->GetColumnByName("finalize_state_ids");
 	auto list_array = std::static_pointer_cast<arrow::ListArray>(col);
@@ -1639,9 +1764,8 @@ void FunctionConnection::RpcTableBufferingDestructor(const std::string &function
 	auto rpc_params =
 	    vgi::BuildTableBufferingDestructorInner(function_name, schema_name_, execution_id, attach_opaque_data_);
 	vgi::ValidateRequestSchema(rpc_params, "table_buffering_destructor", worker_path_);
-	vgi::WriteRpcRequest(proc_->GetStdinFd(), "table_buffering_destructor", rpc_params);
-	auto response = vgi::ReadUnaryResponse(proc_->GetStdoutFd(), &context_, worker_path_, proc_->GetPid(),
-	                                       GetExecutionIdHex(), GetAttachOpaqueDataHex(), "", GetConnIdHex());
+	WriteTransportRpc("table_buffering_destructor", rpc_params);
+	auto response = ReadTransportUnary();
 #if VGI_SHM_TRANSPORT
 	ResolveUnaryShm(shm_segment_.get(), response);
 #endif
@@ -1778,8 +1902,13 @@ CreateFunctionConnection(const std::string &worker_path, const std::string &func
 		                                                function_type, global_execution_id, worker_debug, settings,
 		                                                required_secrets, attach_params);
 #else
-		throw IOException("vgi: httpi:// transport is only available in DuckDB-WASM with an "
-		                  "application-owned Iroh adapter Worker");
+		if (!attach_params || !attach_params->iroh()) {
+			throw InternalException("vgi: native httpi:// connection is missing its ATTACH configuration");
+		}
+		return std::make_unique<HttpFunctionConnection>(CanonicalizeHttpiLocation(worker_path), function_name,
+		                                                arguments, attach_opaque_data, transaction_opaque_data, context,
+		                                                function_type, global_execution_id, worker_debug, settings,
+		                                                required_secrets, attach_params);
 #endif
 	}
 #if defined(__EMSCRIPTEN__)
@@ -1794,8 +1923,13 @@ CreateFunctionConnection(const std::string &worker_path, const std::string &func
 #endif
 #if !defined(__EMSCRIPTEN__)
 	if (IsIrohTransport(worker_path)) {
-		throw IOException("vgi: iroh:// transport is only available in DuckDB-WASM with an "
-		                  "application-owned Iroh adapter Worker");
+		if (!attach_params || !attach_params->iroh()) {
+			throw InternalException("vgi: native iroh:// connection is missing its ATTACH configuration");
+		}
+		return std::make_unique<FunctionConnection>(
+		    worker_path, function_name, arguments, attach_opaque_data, transaction_opaque_data, context,
+		    function_type, global_execution_id, worker_debug, settings, required_secrets,
+		    attach_params->data_version_spec(), attach_params->implementation_version(), attach_params->iroh());
 	}
 #endif
 	// Shared container: resolve the live endpoint via the daemon-introspection

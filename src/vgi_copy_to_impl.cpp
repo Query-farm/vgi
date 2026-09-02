@@ -167,6 +167,7 @@ VgiCopyToGlobalState::~VgiCopyToGlobalState() {
 				                            attach_params->auth(),
 				                            attach_params->cookie_jar(),
 				                            /*enable_logging=*/false};
+				opts.iroh = attach_params->iroh();
 				if (attach_params->launcher_idle_timeout_seconds().has_value()) {
 					opts.launcher_idle_timeout =
 					    std::chrono::seconds(*attach_params->launcher_idle_timeout_seconds());

@@ -1,16 +1,14 @@
 # name: test/sql/integration/httpi_native_rejection.test
-# description: HTTP-over-Iroh targets are browser-adapter-only in this VGI client
+# description: Invalid HTTP-over-Iroh paths fail before native network I/O
 # group: [vgi_integration_transport]
-
-require-env VGI_TEST_WORKER
 
 require vgi
 
-# Native builds reject before HTTP parameter initialization, DNS, or process spawn.
+# Query strings are intentionally not part of the canonical HTTPI target.
 statement error
 ATTACH 'remote' AS httpi_native (
   TYPE vgi,
-  LOCATION 'httpi://0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef/vgi'
+  LOCATION 'httpi://0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef/vgi?x=1'
 );
 ----
-httpi:// transport is only available in DuckDB-WASM
+base path contains a forbidden character

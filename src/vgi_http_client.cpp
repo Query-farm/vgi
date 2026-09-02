@@ -15,6 +15,7 @@
 #include "vgi_cookie_jar.hpp"
 #include "vgi_http_compression.hpp"
 #include "vgi_httpi.hpp"
+#include "vgi_iroh_native.hpp"
 #include "vgi_logging.hpp"
 #include "vgi_oauth.hpp"
 #include "vgi_rpc_client.hpp"
@@ -70,12 +71,20 @@ static bool HeaderNameEqual(const std::string &left, const std::string &right) {
 struct RpcHttpResponse {
 	std::unique_ptr<HTTPResponse> native;
 	std::optional<httpi::Response> browser;
+	std::optional<IrohNativeHttpResponse> iroh;
 
 	bool HasHeader(const std::string &name) const {
 		if (native)
 			return native->HasHeader(name);
-		for (const auto &header : browser->headers) {
-			if (HeaderNameEqual(header.name, name))
+		if (browser) {
+			for (const auto &header : browser->headers) {
+				if (HeaderNameEqual(header.name, name))
+					return true;
+			}
+			return false;
+		}
+		for (const auto &header : iroh->headers) {
+			if (HeaderNameEqual(header.first, name))
 				return true;
 		}
 		return false;
@@ -84,9 +93,16 @@ struct RpcHttpResponse {
 	std::string GetHeaderValue(const std::string &name) const {
 		if (native)
 			return native->GetHeaderValue(name);
-		for (auto it = browser->headers.rbegin(); it != browser->headers.rend(); ++it) {
-			if (HeaderNameEqual(it->name, name))
-				return it->value;
+		if (browser) {
+			for (auto it = browser->headers.rbegin(); it != browser->headers.rend(); ++it) {
+				if (HeaderNameEqual(it->name, name))
+					return it->value;
+			}
+			return "";
+		}
+		for (auto it = iroh->headers.rbegin(); it != iroh->headers.rend(); ++it) {
+			if (HeaderNameEqual(it->first, name))
+				return it->second;
 		}
 		return "";
 	}
@@ -98,20 +114,28 @@ struct RpcHttpResponse {
 			return {native->GetHeaderValue(name)};
 		}
 		std::vector<std::string> result;
-		for (const auto &header : browser->headers) {
-			if (HeaderNameEqual(header.name, name))
-				result.push_back(header.value);
+		if (browser) {
+			for (const auto &header : browser->headers) {
+				if (HeaderNameEqual(header.name, name))
+					result.push_back(header.value);
+			}
+		} else {
+			for (const auto &header : iroh->headers) {
+				if (HeaderNameEqual(header.first, name))
+					result.push_back(header.second);
+			}
 		}
 		return result;
 	}
 
 	HTTPStatusCode Status() const {
-		return native ? native->status : static_cast<HTTPStatusCode>(browser->status);
+		return native ? native->status : static_cast<HTTPStatusCode>(browser ? browser->status : iroh->status);
 	}
 	bool Success() const {
 		if (native)
 			return native->Success();
-		return browser->status >= 200 && browser->status < 300;
+		auto status = browser ? browser->status : iroh->status;
+		return status >= 200 && status < 300;
 	}
 	bool HasRequestError() const {
 		return native && native->HasRequestError();
@@ -120,10 +144,14 @@ struct RpcHttpResponse {
 		return native ? native->GetError() : std::string();
 	}
 	std::string FallbackBody() const {
-		return native ? native->body : browser->body;
+		if (native)
+			return native->body;
+		if (browser)
+			return browser->body;
+		return std::string(reinterpret_cast<const char *>(iroh->body.data()), iroh->body.size());
 	}
 	bool RawRepresentation() const {
-		return browser.has_value() && browser->raw_representation;
+		return iroh.has_value() || (browser.has_value() && browser->raw_representation);
 	}
 };
 
@@ -220,7 +248,7 @@ static std::vector<std::string> CollectSetCookieHeaders(const RpcHttpResponse &r
 	if (!response.HasHeader("Set-Cookie")) {
 		return out;
 	}
-	if (response.browser) {
+	if (response.browser || response.iroh) {
 		return response.HeaderValues("Set-Cookie");
 	}
 	const std::string raw = response.GetHeaderValue("Set-Cookie");
@@ -268,7 +296,8 @@ static std::string HttpPostArrowIpcInternal(
     const std::shared_ptr<SessionCookieJar> &cookie_jar, std::unique_ptr<RpcHttpResponse> &out_response,
     const std::shared_ptr<HTTPParams> &cached_http_params = nullptr, HttpEncoding request_encoding = HttpEncoding::ZSTD,
     bool allow_codec_retry = true, duckdb::unique_ptr<HTTPClient> *client_holder = nullptr,
-                                             ServerCapabilities *harvested_caps = nullptr) {
+                                             ServerCapabilities *harvested_caps = nullptr,
+                                             const std::shared_ptr<IrohClientConfig> &iroh_config = nullptr) {
 	const bool is_httpi = IsHttpiTransport(url);
 	const uint64_t timeout_seconds = GetHttpTimeoutSeconds(context);
 	const int64_t accepted_max_response_bytes = GetAcceptedMaxResponseBytes(context);
@@ -339,8 +368,23 @@ static std::string HttpPostArrowIpcInternal(
 		                                        static_cast<size_t>(effective_max_response_bytes));
 		response_body = out_response->browser->body;
 #else
-		throw IOException("vgi: httpi:// transport is only available in DuckDB-WASM with an "
-		                  "application-owned Iroh adapter Worker");
+		if (!iroh_config) {
+			throw InternalException("vgi: native httpi:// request is missing its ATTACH configuration");
+		}
+		auto parsed = ParseHttpiUrl(url);
+		out_response->iroh = PerformIrohHttpRequest(
+		    iroh_config, &context, "POST", parsed.path.empty() ? "/" : parsed.path,
+		    [&]() {
+			    std::vector<std::pair<std::string, std::string>> result;
+			    result.reserve(httpi_headers.size());
+			    for (const auto &header : httpi_headers) result.emplace_back(header.name, header.value);
+			    return result;
+		    }(),
+		    req_body_data, req_body_size,
+		    std::min<uint64_t>(kMaxBufferedRepresentationBytes,
+		                       static_cast<uint64_t>(effective_max_response_bytes)));
+		response_body.assign(reinterpret_cast<const char *>(out_response->iroh->body.data()),
+		                     out_response->iroh->body.size());
 #endif
 	} else {
 		auto &http_util = HTTPUtil::Get(*context.db);
@@ -457,7 +501,7 @@ static std::string HttpPostArrowIpcInternal(
 		if (alternate != request_encoding) {
 			return HttpPostArrowIpcInternal(context, url, body, bearer_token, cookie_jar, out_response,
 			                                cached_http_params, alternate,
-			                                /*allow_codec_retry=*/false, client_holder, harvested_caps);
+			                                /*allow_codec_retry=*/false, client_holder, harvested_caps, iroh_config);
 		}
 	}
 
@@ -671,7 +715,8 @@ std::string HttpPostArrowIpc(ClientContext &context, const std::string &url, con
                               const std::shared_ptr<CatalogAuth> &auth,
                               const std::shared_ptr<SessionCookieJar> &cookie_jar,
                               const std::shared_ptr<HTTPParams> &cached_http_params,
-                             duckdb::unique_ptr<HTTPClient> *client_holder, ServerCapabilities *harvested_caps) {
+                             duckdb::unique_ptr<HTTPClient> *client_holder, ServerCapabilities *harvested_caps,
+                             const std::shared_ptr<IrohClientConfig> &iroh_config) {
 	// Get cached token from per-catalog auth (if any)
 	std::string token;
 	if (auth) {
@@ -686,7 +731,8 @@ std::string HttpPostArrowIpc(ClientContext &context, const std::string &url, con
 
 	std::unique_ptr<RpcHttpResponse> response;
 	auto result = HttpPostArrowIpcInternal(context, url, body, token, cookie_jar, response, cached_http_params,
-	                                       request_encoding, /*allow_codec_retry=*/true, client_holder, harvested_caps);
+	                                       request_encoding, /*allow_codec_retry=*/true, client_holder, harvested_caps,
+	                                       iroh_config);
 
 	if (response->Status() != HTTPStatusCode::Unauthorized_401) {
 		return result;
@@ -755,7 +801,7 @@ std::string HttpPostArrowIpc(ClientContext &context, const std::string &url, con
 	// Retry with new token
 	result = HttpPostArrowIpcInternal(context, url, body, new_token, cookie_jar, response, cached_http_params,
 	                                  harvested_caps ? ChooseRequestEncoding(*harvested_caps) : request_encoding,
-	                                  /*allow_codec_retry=*/true, client_holder, harvested_caps);
+	                                  /*allow_codec_retry=*/true, client_holder, harvested_caps, iroh_config);
 	if (response->Status() == HTTPStatusCode::Unauthorized_401) {
 		throw IOException("VGI HTTP authentication failed after auth flow (HTTP 401) [url: %s]. "
 		                  "Response: %s",
@@ -773,7 +819,8 @@ UnaryResponseResult HttpInvokeUnary(ClientContext &context, const std::string &w
                                     const std::string &invocation_id_hex, const std::string &attach_opaque_data_hex,
                                     const std::string &transaction_opaque_data_hex, const std::string &conn_id_hex,
                                      const std::string &protocol_version_override,
-                                    duckdb::unique_ptr<HTTPClient> *client_holder, ServerCapabilities *caps) {
+                                    duckdb::unique_ptr<HTTPClient> *client_holder, ServerCapabilities *caps,
+                                    const std::shared_ptr<IrohClientConfig> &iroh_config) {
 	std::string base_url = NormalizeBaseUrl(worker_path);
 	std::string url = base_url + "/" + method_name;
 	ServerCapabilities local_caps;
@@ -781,7 +828,7 @@ UnaryResponseResult HttpInvokeUnary(ClientContext &context, const std::string &w
 	if (!effective_caps->discovered ||
 	    (effective_caps->cache_expires_at != std::chrono::steady_clock::time_point{} &&
 	     std::chrono::steady_clock::now() >= effective_caps->cache_expires_at)) {
-		*effective_caps = HttpDiscoverCapabilities(context, base_url);
+		*effective_caps = HttpDiscoverCapabilities(context, base_url, iroh_config);
 	}
 	if (!effective_caps->discovered || !effective_caps->accept_max_response_bytes_support) {
 		throw IOException("VGI HTTP server does not advertise %s: true [url: %s]",
@@ -807,7 +854,7 @@ UnaryResponseResult HttpInvokeUnary(ClientContext &context, const std::string &w
 	// POST to {worker_path}/{method_name} using standard HTTP timeout
 	auto response_body =
 	    HttpPostArrowIpc(context, url, body, auth, cookie_jar, cached_http_params, client_holder,
-	                     effective_caps);
+	                     effective_caps, iroh_config);
 
 	// Parse the Arrow IPC response. Move the body in — the string becomes the
 	// owning Arrow buffer, avoiding an alloc+memcpy of the whole payload.
@@ -1153,7 +1200,8 @@ static ServerCapabilities ParseCapabilityHeaders(const RESPONSE &response) {
 	return caps;
 }
 
-ServerCapabilities HttpDiscoverCapabilities(ClientContext &context, const std::string &base_url) {
+ServerCapabilities HttpDiscoverCapabilities(ClientContext &context, const std::string &base_url,
+                                             const std::shared_ptr<IrohClientConfig> &iroh_config) {
 	// Capability headers are emitted by middleware on every response. Probe
 	// {base_url}/health: it is mandatory in every implementation and exempt
 	// from auth, matching the Python reference client.
@@ -1175,7 +1223,20 @@ ServerCapabilities HttpDiscoverCapabilities(ClientContext &context, const std::s
 		}
 		return ParseCapabilityHeaders(response);
 #else
-		return ServerCapabilities {};
+		if (!iroh_config) {
+			throw InternalException("vgi: native httpi:// capability discovery is missing its ATTACH configuration");
+		}
+		auto parsed = ParseHttpiUrl(url);
+		RpcHttpResponse response;
+		response.iroh = PerformIrohHttpRequest(
+		    iroh_config, &context, "OPTIONS", parsed.path.empty() ? "/" : parsed.path,
+		    {{kAcceptMaxResponseBytesHeader, std::to_string(accepted_max_response_bytes)}}, nullptr, 0,
+		    static_cast<uint64_t>(accepted_max_response_bytes));
+		if (!response.Success()) {
+			throw IOException("VGI HTTPI capability discovery failed (HTTP %d) [url: %s]",
+			                  static_cast<int>(response.Status()), url);
+		}
+		return ParseCapabilityHeaders(response);
 #endif
 	}
 
@@ -1205,7 +1266,8 @@ ServerCapabilities HttpDiscoverCapabilities(ClientContext &context, const std::s
 }
 
 std::vector<UploadUrl> HttpRequestUploadUrls(ClientContext &context, const std::string &base_url, int count,
-                                               const std::shared_ptr<CatalogAuth> &auth) {
+                                               const std::shared_ptr<CatalogAuth> &auth,
+                                               const std::shared_ptr<IrohClientConfig> &iroh_config) {
 	// Serialize Arrow batch {count: int64}
 	auto count_field = arrow::field("count", arrow::int64());
 	auto schema = arrow::schema({count_field});
@@ -1216,7 +1278,8 @@ std::vector<UploadUrl> HttpRequestUploadUrls(ClientContext &context, const std::
 	auto batch = arrow::RecordBatch::Make(schema, 1, {count_array_result.ValueUnsafe()});
 
 	// POST to __upload_url__/init (HttpInvokeUnary normalizes base_url internally)
-	auto result = HttpInvokeUnary(context, base_url, "__upload_url__/init", batch, auth);
+	auto result = HttpInvokeUnary(context, base_url, "__upload_url__/init", batch, auth, nullptr, nullptr,
+	                              "", "", "", "", "", nullptr, nullptr, iroh_config);
 
 	if (!result.batch || result.batch->num_rows() == 0) {
 		throw IOException("VGI server returned no upload URLs [url: %s]", base_url);

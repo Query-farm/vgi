@@ -1,17 +1,14 @@
 # name: test/sql/integration/iroh_native_rejection.test
-# description: Raw Iroh targets are browser-adapter-only in this VGI client
+# description: Invalid raw Iroh EndpointIds fail before native network I/O
 # group: [vgi_integration_transport]
-
-require-env VGI_TEST_WORKER
 
 require vgi
 
-# A native build must identify the scheme and fail before treating it as a
-# subprocess command or attempting any network I/O.
+# Endpoint IDs are canonical lowercase hexadecimal and have an exact length.
 statement error
 ATTACH 'remote' AS iroh_native (
   TYPE vgi,
-  LOCATION 'iroh://0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
+  LOCATION 'iroh://0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF'
 );
 ----
-iroh:// transport is only available in DuckDB-WASM
+EndpointId must be 64 lowercase hexadecimal characters

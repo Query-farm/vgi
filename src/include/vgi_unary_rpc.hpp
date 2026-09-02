@@ -24,6 +24,7 @@ class SessionCookieJar;
 class VgiHttpClientPool;
 // Forward declaration — full definition in vgi_server_capabilities.hpp
 class ServerCapabilitiesCache;
+struct IrohClientConfig;
 
 // Options for a pooled unary RPC invocation.
 // context outlives the call; worker_path/phase may be string_view-like but we
@@ -92,6 +93,9 @@ struct UnaryRpcOptions {
 	// Explicit SOCKS5h proxy for tcp://. Transport-only: never serialized as a
 	// worker/catalog option.
 	std::string tcp_proxy;
+	// Immutable native Iroh identity/relay configuration captured by ATTACH.
+	// Null for all non-Iroh transports and for browser Iroh (page-owned adapter).
+	std::shared_ptr<IrohClientConfig> iroh;
 };
 
 // Send a single unary RPC and return the response.

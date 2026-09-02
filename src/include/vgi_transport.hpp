@@ -23,9 +23,8 @@ namespace vgi {
 //              ring (DuckDB-WASM only). The <url> is whatever `new Worker(url)`
 //              accepts. No spawn/pool on the C++ side; the JS bridge owns the
 //              worker. See vgi_sab_abi.hpp / docs/sab_transport_abi.md.
-// IROH       — iroh://<EndpointId>; browser-only routing target for an
-//              application-owned Iroh adapter Web Worker. It uses the same SAB
-//              byte pump as WEBWORKER but never names a worker script.
+// IROH       — iroh://<EndpointId>; native builds use an embedded Iroh client;
+//              browser builds delegate to an application-owned adapter worker.
 // HTTPI      — httpi://<EndpointId>[/base/path]; the ordinary VGI HTTP state
 //              machine with only its HTTP backend delegated to that adapter.
 enum class TransportType { SUBPROCESS, HTTP, UNIX, LAUNCH, CONTAINER, TCP, WEBWORKER, IROH, HTTPI, DATABASE };
@@ -56,10 +55,8 @@ bool IsTcpTransport(const std::string &worker_path);
 // (DuckDB-WASM only); the JS bridge owns worker lifecycle.
 bool IsWebWorkerTransport(const std::string &worker_path);
 
-// Browser Iroh target. Scheme matching is case-insensitive so malformed spellings
-// are never mistaken for subprocess commands; CanonicalizeIrohLocation validates
-// an exact 64-character lowercase-hex EndpointId and returns the canonical
-// lowercase-scheme location.
+// Iroh target. The scheme and 64-character hexadecimal EndpointId are both
+// strict lowercase, matching the cross-language transport contract.
 bool IsIrohTransport(const std::string &worker_path);
 std::string CanonicalizeIrohLocation(const std::string &location);
 

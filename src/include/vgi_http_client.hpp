@@ -24,6 +24,7 @@ namespace vgi {
 class CatalogAuth;
 // Forward declaration — full definition in vgi_cookie_jar.hpp
 class SessionCookieJar;
+struct IrohClientConfig;
 
 // Content type for Arrow IPC streams over HTTP
 constexpr const char *ARROW_IPC_CONTENT_TYPE = "application/vnd.apache.arrow.stream";
@@ -62,7 +63,8 @@ UnaryResponseResult HttpInvokeUnary(ClientContext &context,
                                      const std::string &conn_id_hex = "",
                                      const std::string &protocol_version_override = "",
                                      duckdb::unique_ptr<HTTPClient> *client_holder = nullptr,
-                                     ServerCapabilities *caps = nullptr);
+                                     ServerCapabilities *caps = nullptr,
+                                     const std::shared_ptr<IrohClientConfig> &iroh_config = nullptr);
 
 // Small thread-safe pool of keep-alive HTTPClients for unary RPCs against ONE
 // base URL (a pool instance lives on a catalog's VgiAttachParameters, whose
@@ -137,7 +139,8 @@ std::string HttpPostArrowIpc(ClientContext &context,
                               const std::shared_ptr<SessionCookieJar> &cookie_jar = nullptr,
                               const std::shared_ptr<HTTPParams> &cached_http_params = nullptr,
                               duckdb::unique_ptr<HTTPClient> *client_holder = nullptr,
-                              ServerCapabilities *harvested_caps = nullptr);
+                              ServerCapabilities *harvested_caps = nullptr,
+                              const std::shared_ptr<IrohClientConfig> &iroh_config = nullptr);
 
 // HTTP GET raw bytes from a URL. Used for fetching externalized batches.
 // Handles X-VGI-Content-Encoding decompression (zstd or gzip). No auth
@@ -179,13 +182,16 @@ struct UploadUrl {
 // Capability headers are returned on every response; /health is the
 // canonical mandatory, auth-exempt target. Honours Cache-Control:
 // max-age=N to schedule a future re-probe via cache_expires_at.
-ServerCapabilities HttpDiscoverCapabilities(ClientContext &context, const std::string &base_url);
+ServerCapabilities HttpDiscoverCapabilities(
+    ClientContext &context, const std::string &base_url,
+    const std::shared_ptr<IrohClientConfig> &iroh_config = nullptr);
 
 // Request upload URLs from the server. Posts to {base_url}/__upload_url__/init.
 std::vector<UploadUrl> HttpRequestUploadUrls(ClientContext &context,
                                                const std::string &base_url,
                                                int count,
-                                               const std::shared_ptr<CatalogAuth> &auth = nullptr);
+                                               const std::shared_ptr<CatalogAuth> &auth = nullptr,
+                                               const std::shared_ptr<IrohClientConfig> &iroh_config = nullptr);
 
 // HTTP PUT raw bytes to a URL with optional compression.  ``encoding`` ==
 // ``HttpEncoding::NONE`` (the default) writes the body verbatim; any other

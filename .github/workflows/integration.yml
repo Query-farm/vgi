@@ -66,6 +66,8 @@ jobs:
         with:
           key: vgi-integration-${{ runner.os }}
 
+      - uses: dtolnay/rust-toolchain@1.97
+
       # vcpkg's GitHub-Actions binary cache needs these two, and they are only
       # readable from a step's env — hence the explicit export rather than the
       # workflow-level `env:` block above.
@@ -99,6 +101,22 @@ jobs:
       # every test would skip and the run would report green.
       - name: Install the vgi-python fixture workers
         run: ./scripts/ci_install_fixtures.sh
+
+      - name: Build pinned Iroh qualification bridge
+        run: |
+          git clone --filter=blob:none https://github.com/Query-farm/vgi-rpc-rust.git /tmp/vgi-rpc-rust
+          git -C /tmp/vgi-rpc-rust checkout c105d7b047e912355a79420ced81cf296ec52c73
+          cargo build --locked --release --manifest-path /tmp/vgi-rpc-rust/Cargo.toml -p vgi-iroh-bridge
+          git clone --filter=blob:none https://github.com/Query-farm/vgi-rpc-python.git /tmp/vgi-rpc-python
+          git -C /tmp/vgi-rpc-python checkout 365395a6144256ec163b17cf9b755b9b5f6a386c
+
+      - name: Run native Iroh raw and HTTP integration
+        env:
+          BUILD_DIR: release
+          VGI_PYTHON_DIR: /tmp/vgi-python
+          VGI_RPC_PYTHON_DIR: /tmp/vgi-rpc-python
+          VGI_IROH_BRIDGE_BIN: /tmp/vgi-rpc-rust/target/release/vgi-iroh-bridge
+        run: ./test/run_iroh_integration.sh
 
       # --min-executed is the guard that makes this job worth having. A lane
       # that stops running tests still reports green — fewer results, all of

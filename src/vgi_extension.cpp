@@ -77,6 +77,7 @@
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "vgi_aggregate_function_impl.hpp"
 #include "vgi_global_functions.hpp"
+#include "vgi_iroh_config.hpp"
 #include "vgi_oauth.hpp"
 #include "vgi_profiling.hpp"
 #include "vgi_secret_storage.hpp"
@@ -111,6 +112,7 @@ namespace duckdb {
 
 // Forward declarations — functions defined below after VgiStorageExtension class
 static unique_ptr<BaseSecret> VgiCreateSecret(ClientContext &context, CreateSecretInput &input);
+static unique_ptr<BaseSecret> IrohCreateSecret(ClientContext &context, CreateSecretInput &input);
 static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> storage_info, ClientContext &context,
                                             AttachedDatabase &db, const string &name, AttachInfo &info,
                                             AttachOptions &options);
@@ -1600,6 +1602,17 @@ static unique_ptr<BaseSecret> VgiCreateSecret(ClientContext &context, CreateSecr
 	return secret;
 }
 
+// Iroh transport identities are extension-owned rather than advertised by a
+// worker. SECRET_KEY is always redacted, including from duckdb_secrets().
+static unique_ptr<BaseSecret> IrohCreateSecret(ClientContext &, CreateSecretInput &input) {
+	auto secret = make_uniq<KeyValueSecret>(input.scope, input.type, input.provider, input.name);
+	secret->redact_keys.insert("secret_key");
+	for (const auto &entry : input.options) {
+		secret->secret_map[entry.first] = entry.second;
+	}
+	return secret;
+}
+
 namespace {
 
 // Container-transport configuration extracted from a struct-valued LOCATION.
@@ -1706,6 +1719,11 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	string oauth_refresh_token;
 	string bearer_token;
 	string tcp_proxy;
+	string iroh_secret_key;
+	std::vector<string> iroh_relay_urls;
+	bool iroh_no_relay = false;
+	string iroh_remote_relay_url;
+	std::vector<string> iroh_direct_addresses;
 	string data_version_spec;
 	string implementation_version;
 	// Per-LOCATION launcher overrides — only valid with ``launch:`` LOCATIONs;
@@ -1757,6 +1775,7 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 		// must never enter the key or the on-disk digest).
 		if (lower_name != "type" && lower_name != "location" && lower_name != "path" &&
 		    lower_name != "bearer_token" && lower_name != "oauth_refresh_token" &&
+		    lower_name != "iroh_secret_key" &&
 		    value.type().id() != LogicalTypeId::STRUCT) {
 			key_options[lower_name] = value.ToString();
 		}
@@ -1801,6 +1820,62 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 			tcp_proxy = value.ToString();
 			if (tcp_proxy.empty()) {
 				throw BinderException("tcp_proxy, if set, must not be empty");
+			}
+		} else if (lower_name == "iroh_secret_key") {
+			iroh_secret_key = value.ToString();
+			if (iroh_secret_key.empty()) {
+				throw BinderException("iroh_secret_key must not be empty");
+			}
+		} else if (lower_name == "iroh_no_relay") {
+			iroh_no_relay = value.DefaultCastAs(LogicalType::BOOLEAN).GetValue<bool>();
+		} else if (lower_name == "iroh_relay_urls") {
+			iroh_relay_urls.clear();
+			if (value.type().id() == LogicalTypeId::LIST || value.type().id() == LogicalTypeId::ARRAY) {
+				for (const auto &child : ListValue::GetChildren(value)) {
+					iroh_relay_urls.push_back(child.DefaultCastAs(LogicalType::VARCHAR).ToString());
+				}
+			} else {
+				// Connection-string values are VARCHAR. Accept a comma-separated
+				// spelling there while the typed ATTACH form uses VARCHAR[].
+				auto encoded = value.ToString();
+				size_t start = 0;
+				while (start <= encoded.size()) {
+					auto comma = encoded.find(',', start);
+					auto relay = encoded.substr(start, comma == string::npos ? string::npos : comma - start);
+					if (!relay.empty()) {
+						iroh_relay_urls.push_back(std::move(relay));
+					}
+					if (comma == string::npos) {
+						break;
+					}
+					start = comma + 1;
+				}
+			}
+		} else if (lower_name == "iroh_remote_relay_url") {
+			iroh_remote_relay_url = value.ToString();
+			if (iroh_remote_relay_url.empty()) {
+				throw BinderException("iroh_remote_relay_url must not be empty");
+			}
+		} else if (lower_name == "iroh_direct_addresses") {
+			iroh_direct_addresses.clear();
+			if (value.type().id() == LogicalTypeId::LIST || value.type().id() == LogicalTypeId::ARRAY) {
+				for (const auto &child : ListValue::GetChildren(value)) {
+					iroh_direct_addresses.push_back(child.DefaultCastAs(LogicalType::VARCHAR).ToString());
+				}
+			} else {
+				auto encoded = value.ToString();
+				size_t start = 0;
+				while (start <= encoded.size()) {
+					auto comma = encoded.find(',', start);
+					auto address = encoded.substr(start, comma == string::npos ? string::npos : comma - start);
+					if (!address.empty()) {
+						iroh_direct_addresses.push_back(std::move(address));
+					}
+					if (comma == string::npos) {
+						break;
+					}
+					start = comma + 1;
+				}
 			}
 		} else if (lower_name == "data_version_spec") {
 			data_version_spec = value.ToString();
@@ -1849,7 +1924,8 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 					string key = (eq == string::npos) ? token : token.substr(0, eq);
 					string val = (eq == string::npos) ? string() : token.substr(eq + 1);
 					auto lower_key = StringUtil::Lower(key);
-					if (lower_key == "oauth_refresh_token" || lower_key == "bearer_token") {
+					if (lower_key == "oauth_refresh_token" || lower_key == "bearer_token" ||
+					    lower_key == "iroh_secret_key") {
 						secret_in_path = true;
 					}
 					apply_option(lower_key, Value(val));
@@ -1875,7 +1951,8 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	for (auto &entry : info.options) {
 		auto lower_name = StringUtil::Lower(entry.first);
 		apply_option(lower_name, entry.second);
-		if (lower_name == "oauth_refresh_token" || lower_name == "bearer_token") {
+		if (lower_name == "oauth_refresh_token" || lower_name == "bearer_token" ||
+		    lower_name == "iroh_secret_key") {
 			entry.second = Value("<redacted>");
 		}
 	}
@@ -1911,6 +1988,38 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	}
 	if (!tcp_proxy.empty() && !vgi::IsTcpTransport(worker_path)) {
 		throw BinderException("tcp_proxy is only valid for tcp:// LOCATIONs");
+	}
+
+	std::shared_ptr<vgi::IrohClientConfig> iroh_config;
+	const bool is_iroh_location = vgi::IsIrohTransport(worker_path) || vgi::IsHttpiTransport(worker_path);
+	if (!is_iroh_location &&
+	    (!iroh_secret_key.empty() || !iroh_relay_urls.empty() || iroh_no_relay ||
+	     !iroh_remote_relay_url.empty() || !iroh_direct_addresses.empty())) {
+		throw BinderException("Iroh ATTACH options require an "
+		                      "iroh:// or httpi:// LOCATION");
+	}
+	if (is_iroh_location) {
+		use_pool = false; // Iroh owns its endpoint/QUIC connection pool.
+#if defined(__EMSCRIPTEN__)
+		if (!iroh_secret_key.empty() || !iroh_relay_urls.empty() || iroh_no_relay ||
+		    !iroh_remote_relay_url.empty() || !iroh_direct_addresses.empty()) {
+			throw BinderException("DuckDB-WASM Iroh identity and address resolution are owned by the application adapter");
+		}
+#else
+		auto positive_setting = [&](const char *name, int64_t fallback) -> uint64_t {
+			Value value;
+			auto configured = context.TryGetCurrentSetting(name, value) ? value.GetValue<int64_t>() : fallback;
+			if (configured <= 0) {
+				throw BinderException("%s must be greater than zero", name);
+			}
+			return static_cast<uint64_t>(configured);
+		};
+		iroh_config = vgi::ResolveIrohClientConfig(
+		    context, worker_path, std::move(iroh_secret_key), std::move(iroh_relay_urls), iroh_no_relay,
+		    std::move(iroh_remote_relay_url), std::move(iroh_direct_addresses),
+		    positive_setting("vgi_iroh_connect_timeout_seconds", 30),
+		    positive_setting("vgi_iroh_io_timeout_seconds", 300));
+#endif
 	}
 
 	// Telemetry capture — the event fires only on the success path, near the
@@ -2140,7 +2249,7 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	// HTTP cookie jar — carries proxy-issued Set-Cookie / Cookie headers for
 	// sticky version-aware routing. Subprocess transport doesn't use this.
 	std::shared_ptr<vgi::SessionCookieJar> cookie_jar;
-	if (vgi::IsHttpTransport(worker_path)) {
+	if (vgi::IsHttpTransport(worker_path) || vgi::IsHttpiTransport(worker_path)) {
 		cookie_jar = std::make_shared<vgi::SessionCookieJar>();
 	}
 
@@ -2164,7 +2273,7 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	if (discover_catalog || !attach_options.empty()) {
 		auto catalogs = vgi::InvokeCatalogs(worker_path, context, worker_debug, use_pool, auth,
 		                                    launcher_idle_for_attach, launcher_state_dir_for_attach,
-		                                    worker_artifact_anchor, tcp_proxy);
+		                                    worker_artifact_anchor, tcp_proxy, iroh_config);
 
 		// Bare form: resolve the (omitted) catalog name from the worker. A
 		// single-catalog worker resolves unambiguously; >1 forces the user to
@@ -2264,7 +2373,8 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	auto attach_result = vgi::InvokeCatalogAttach(worker_path, catalog_name, context, worker_debug, use_pool, auth,
 	                                              data_version_spec, implementation_version, cookie_jar,
 	                                              attach_options, launcher_idle_for_attach,
-	                                              launcher_state_dir_for_attach, worker_artifact_anchor, tcp_proxy);
+	                                              launcher_state_dir_for_attach, worker_artifact_anchor, tcp_proxy,
+	                                              iroh_config);
 
 	// Register extension options for settings exposed by this catalog
 	// Check for type conflicts with existing settings
@@ -2387,6 +2497,7 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	attach_cfg.data_version_spec = attach_result.resolved_data_version;
 	attach_cfg.implementation_version = attach_result.resolved_implementation_version;
 	attach_cfg.cookie_jar = cookie_jar;
+	attach_cfg.iroh = iroh_config;
 	attach_cfg.worker_artifact_anchor = worker_artifact_anchor;
 	attach_cfg.tcp_proxy = tcp_proxy;
 	if (launcher_idle_timeout_seconds >= 0) {
@@ -3445,6 +3556,21 @@ static void LoadInternal(ExtensionLoader &loader) {
 	auto &config = DBConfig::GetConfig(loader.GetDatabaseInstance());
 	StorageExtension::Register(config, "vgi", make_shared_ptr<VgiStorageExtension>(loader.GetDatabaseInstance()));
 
+	// Register the transport-owned Iroh identity secret independently of any
+	// worker-advertised secret types so it is available immediately after LOAD.
+	SecretType iroh_secret_type;
+	iroh_secret_type.name = "iroh";
+	iroh_secret_type.deserializer = KeyValueSecret::Deserialize<KeyValueSecret>;
+	iroh_secret_type.default_provider = "config";
+	iroh_secret_type.extension = "vgi";
+	loader.RegisterSecretType(std::move(iroh_secret_type));
+	CreateSecretFunction iroh_secret_function;
+	iroh_secret_function.secret_type = "iroh";
+	iroh_secret_function.provider = "config";
+	iroh_secret_function.function = IrohCreateSecret;
+	iroh_secret_function.named_parameters["secret_key"] = LogicalType::VARCHAR;
+	loader.RegisterFunction(std::move(iroh_secret_function));
+
 	// -------------------------------------------------------------------------
 	// Register native GeoArrow Arrow extension types
 	// -------------------------------------------------------------------------
@@ -3514,6 +3640,12 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// Register HTTP timeout setting
 	config.AddExtensionOption("vgi_http_timeout_seconds",
 	                          "Timeout in seconds for VGI HTTP requests (catalog, init, and exchange operations)",
+	                          LogicalType::BIGINT, Value::BIGINT(300));
+	config.AddExtensionOption("vgi_iroh_connect_timeout_seconds",
+	                          "Timeout in seconds for Iroh endpoint resolution and QUIC connection establishment",
+	                          LogicalType::BIGINT, Value::BIGINT(30));
+	config.AddExtensionOption("vgi_iroh_io_timeout_seconds",
+	                          "Idle read/write timeout in seconds for native Iroh VGI streams",
 	                          LogicalType::BIGINT, Value::BIGINT(300));
 
 	config.AddExtensionOption(

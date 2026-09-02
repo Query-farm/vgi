@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -33,6 +34,9 @@ namespace vgi {
 // Forward declarations — full definitions in vgi_catalog_api.hpp
 struct VgiAttachParameters;
 struct VgiSecretRequirement;
+struct IrohClientConfig;
+struct UnaryResponseResult;
+struct StreamHeaderResult;
 
 // ============================================================================
 // Connection Acquisition with Retry
@@ -172,7 +176,8 @@ public:
 	                   const std::map<std::string, Value> &settings = {},
 	                   const std::vector<VgiSecretRequirement> &required_secrets = {},
 	                   const std::string &data_version_spec = "",
-	                   const std::string &implementation_version = "");
+	                   const std::string &implementation_version = "",
+	                   std::shared_ptr<IrohClientConfig> iroh_config = nullptr);
 
 	// Create connection using a pooled worker (skips spawning new subprocess)
 	FunctionConnection(std::unique_ptr<PooledWorker> pooled_worker, const std::string &function_name,
@@ -398,11 +403,25 @@ private:
 	bool worker_debug_;
 	std::map<std::string, Value> settings_;
 	std::vector<VgiSecretRequirement> required_secrets_;
+	std::shared_ptr<IrohClientConfig> iroh_config_;
+	std::shared_ptr<arrow::io::InputStream> transport_input_;
+	std::shared_ptr<arrow::io::OutputStream> transport_output_;
+	std::function<void()> transport_cancel_;
 
 	// Worker process (spawned lazily by PerformBindRpc, or adopted from the
 	// pool). Used as the spawn-once flag too: a non-null proc_ means the
 	// worker exists and at least bind has been attempted.
 	std::unique_ptr<SubProcess> proc_;
+
+	bool TransportReady() const;
+	pid_t TransportPid() const;
+	std::shared_ptr<arrow::io::InputStream> TransportInput();
+	std::shared_ptr<arrow::io::OutputStream> TransportOutput();
+	void WriteTransportRpc(const std::string &method,
+	                       const std::shared_ptr<arrow::RecordBatch> &params,
+	                       const std::shared_ptr<arrow::KeyValueMetadata> &metadata = nullptr);
+	UnaryResponseResult ReadTransportUnary();
+	StreamHeaderResult ReadTransportHeader();
 
 	// Streaming-state flags. Bind is just an RPC; no state is tracked for
 	// it on the connection.

@@ -10,6 +10,7 @@
 #include "vgi_container_runtime.hpp"
 #include "vgi_exception.hpp"
 #include "vgi_http_client.hpp"
+#include "vgi_iroh_native.hpp"
 #include "vgi_logging.hpp"
 #include "vgi_stderr_drainer.hpp"
 #include "vgi_github.hpp"
@@ -165,7 +166,7 @@ UnaryResponseResult InvokePooledUnaryRpc(const UnaryRpcOptions &opts, const std:
 		    opts.context, opts.worker_path, method_name, params, opts.auth, opts.cookie_jar, opts.cached_http_params,
 		                              /*invocation_id_hex=*/"", /*attach_opaque_data_hex=*/"",
 		    /*transaction_opaque_data_hex=*/"", /*conn_id_hex=*/"", opts.protocol_version_override.value_or(""),
-		    opts.http_client_pool ? &pooled : nullptr, opts.server_caps ? &caps : nullptr);
+		    opts.http_client_pool ? &pooled : nullptr, opts.server_caps ? &caps : nullptr, opts.iroh);
 		if (opts.server_caps) {
 			opts.server_caps->Store(caps);
 		}
@@ -175,23 +176,25 @@ UnaryResponseResult InvokePooledUnaryRpc(const UnaryRpcOptions &opts, const std:
 		return result;
 	}
 	if (IsHttpiTransport(opts.worker_path)) {
-#if defined(__EMSCRIPTEN__)
 		ServerCapabilities caps;
 		if (opts.server_caps) {
 			caps = opts.server_caps->Load();
 		}
+#if defined(__EMSCRIPTEN__)
 		auto result = HttpInvokeUnary(opts.context, CanonicalizeHttpiLocation(opts.worker_path), method_name, params,
-		                              opts.auth, opts.cookie_jar, opts.cached_http_params, "", "", "", "",
-		                              opts.protocol_version_override.value_or(""), nullptr,
-		                              opts.server_caps ? &caps : nullptr);
+		                       opts.auth, opts.cookie_jar, opts.cached_http_params, "", "", "", "",
+		                       opts.protocol_version_override.value_or(""), nullptr,
+		                       opts.server_caps ? &caps : nullptr);
+#else
+		auto result = HttpInvokeUnary(opts.context, CanonicalizeHttpiLocation(opts.worker_path), method_name, params,
+		                       opts.auth, opts.cookie_jar, nullptr, "", "", "", "",
+		                       opts.protocol_version_override.value_or(""), nullptr,
+		                       opts.server_caps ? &caps : nullptr, opts.iroh);
+#endif
 		if (opts.server_caps) {
 			opts.server_caps->Store(caps);
 		}
 		return result;
-#else
-		throw IOException("vgi: httpi:// transport is only available in DuckDB-WASM with an "
-		                  "application-owned Iroh adapter Worker");
-#endif
 	}
 
 #if defined(__EMSCRIPTEN__)
@@ -204,8 +207,18 @@ UnaryResponseResult InvokePooledUnaryRpc(const UnaryRpcOptions &opts, const std:
 #endif
 #if !defined(__EMSCRIPTEN__)
 	if (IsIrohTransport(opts.worker_path)) {
-		throw IOException("vgi: iroh:// transport is only available in DuckDB-WASM with an "
-		                  "application-owned Iroh adapter Worker");
+		if (!opts.iroh) {
+			throw InternalException("vgi: native iroh:// unary RPC is missing its ATTACH configuration");
+		}
+		auto duplex = OpenIrohArrowMuxStream(opts.iroh, &opts.context);
+		if (params) {
+			WriteRpcRequest(duplex.output, method_name, params);
+		} else {
+			auto empty = arrow::RecordBatch::Make(arrow::schema({}), 1,
+			                                      std::vector<std::shared_ptr<arrow::Array>> {});
+			WriteRpcRequest(duplex.output, method_name, empty);
+		}
+		return ReadUnaryResponse(duplex.input, &opts.context, opts.worker_path);
 	}
 #endif
 

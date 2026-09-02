@@ -53,13 +53,11 @@ bool IsWebWorkerTransport(const std::string &worker_path) {
 }
 
 bool IsIrohTransport(const std::string &worker_path) {
-	auto lower = StringUtil::Lower(worker_path);
-	return StringUtil::StartsWith(lower, "iroh://");
+	return StringUtil::StartsWith(worker_path, "iroh://");
 }
 
 bool IsHttpiTransport(const std::string &worker_path) {
-	auto lower = StringUtil::Lower(worker_path);
-	return StringUtil::StartsWith(lower, "httpi://");
+	return StringUtil::StartsWith(worker_path, "httpi://");
 }
 
 HttpiUrlParts ParseHttpiUrl(const std::string &location) {
@@ -82,8 +80,14 @@ HttpiUrlParts ParseHttpiUrl(const std::string &location) {
 	if (!path.empty() && path.front() != '/') {
 		throw std::invalid_argument("vgi: httpi:// base path must begin with '/': " + location);
 	}
+	if (path == "/") {
+		path.clear();
+		return {endpoint_id, path};
+	}
 	for (unsigned char c : path) {
-		const bool unreserved = std::isalnum(c) || c == '-' || c == '.' || c == '_' || c == '~';
+		const bool ascii_alnum = (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') ||
+		                         (c >= 'a' && c <= 'z');
+		const bool unreserved = ascii_alnum || c == '-' || c == '.' || c == '_' || c == '~';
 		const bool sub_delim = c == '!' || c == '$' || c == '&' || c == '\'' || c == '(' || c == ')' || c == '*' ||
 		                       c == '+' || c == ',' || c == ';' || c == '=';
 		if (!(unreserved || sub_delim || c == ':' || c == '@' || c == '/')) {
@@ -95,20 +99,12 @@ HttpiUrlParts ParseHttpiUrl(const std::string &location) {
 		auto end = path.find('/', start);
 		auto segment = path.substr(start, end == std::string::npos ? std::string::npos : end - start);
 		if (segment.empty() || segment == "." || segment == "..") {
-			if (!(segment.empty() && end == std::string::npos && start == path.size())) {
-				throw std::invalid_argument("vgi: httpi:// base path contains an empty or dot segment: " + location);
-			}
+			throw std::invalid_argument("vgi: httpi:// base path contains an empty or dot segment: " + location);
 		}
 		if (end == std::string::npos) {
 			break;
 		}
 		start = end + 1;
-	}
-	while (path.size() > 1 && path.back() == '/') {
-		path.pop_back();
-	}
-	if (path == "/") {
-		path.clear();
 	}
 	return {endpoint_id, path};
 }

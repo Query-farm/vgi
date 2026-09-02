@@ -9,7 +9,13 @@
 
 #include "vgi_transport.hpp"
 #include "vgi_httpi.hpp"
+#include "vgi_rpc_client.hpp"
 
+#include <arrow/io/memory.h>
+#include <arrow/ipc/writer.h>
+
+#include <algorithm>
+#include <cstring>
 #include <stdexcept>
 
 using duckdb::vgi::CanonicalizeBrowserWorkerTarget;
@@ -39,6 +45,53 @@ using duckdb::vgi::StripUnixScheme;
 using duckdb::vgi::StripWebWorkerScheme;
 using duckdb::vgi::TransportType;
 
+namespace {
+
+// Models a transport that delivered a valid batch and then failed before the
+// Arrow EOS marker. Physical EOF is deliberately an I/O error, matching an
+// Iroh idle timeout/reset rather than a clean half-close.
+class ErrorAtEofInputStream final : public arrow::io::InputStream {
+public:
+	explicit ErrorAtEofInputStream(std::shared_ptr<arrow::Buffer> bytes) : bytes_(std::move(bytes)) {
+	}
+
+	arrow::Status Close() override {
+		closed_ = true;
+		return arrow::Status::OK();
+	}
+	bool closed() const override {
+		return closed_;
+	}
+	arrow::Result<int64_t> Tell() const override {
+		return position_;
+	}
+	arrow::Result<int64_t> Read(int64_t nbytes, void *out) override {
+		if (closed_) {
+			return arrow::Status::Invalid("test stream is closed");
+		}
+		if (position_ >= bytes_->size()) {
+			return arrow::Status::IOError("injected transport reset before EOS");
+		}
+		auto count = std::min(nbytes, bytes_->size() - position_);
+		std::memcpy(out, bytes_->data() + position_, static_cast<size_t>(count));
+		position_ += count;
+		return count;
+	}
+	arrow::Result<std::shared_ptr<arrow::Buffer>> Read(int64_t nbytes) override {
+		ARROW_ASSIGN_OR_RAISE(auto buffer, arrow::AllocateResizableBuffer(nbytes));
+		ARROW_ASSIGN_OR_RAISE(auto count, Read(nbytes, buffer->mutable_data()));
+		ARROW_RETURN_NOT_OK(buffer->Resize(count, false));
+		return std::shared_ptr<arrow::Buffer>(std::move(buffer));
+	}
+
+private:
+	std::shared_ptr<arrow::Buffer> bytes_;
+	int64_t position_ = 0;
+	bool closed_ = false;
+};
+
+} // namespace
+
 TEST_CASE("DetectTransport routes each scheme correctly", "[transport]") {
 	CHECK(DetectTransport("http://localhost:8080") == TransportType::HTTP);
 	CHECK(DetectTransport("HTTPS://example.com") == TransportType::HTTP);
@@ -66,8 +119,10 @@ TEST_CASE("DetectTransport routes each scheme correctly", "[transport]") {
 
 TEST_CASE("httpi locations preserve a strict canonical base path", "[transport]") {
 	const std::string endpoint = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-	CHECK(IsHttpiTransport("HTTPI://" + endpoint));
-	CHECK(CanonicalizeHttpiLocation("HTTPI://" + endpoint + "/vgi/") == "httpi://" + endpoint + "/vgi");
+	CHECK_FALSE(IsHttpiTransport("HTTPI://" + endpoint));
+	CHECK_THROWS_AS(CanonicalizeHttpiLocation("HTTPI://" + endpoint + "/vgi/"), std::invalid_argument);
+	CHECK(CanonicalizeHttpiLocation("httpi://" + endpoint + "/") == "httpi://" + endpoint);
+	CHECK_THROWS_AS(CanonicalizeHttpiLocation("httpi://" + endpoint + "/vgi/"), std::invalid_argument);
 	auto parsed = ParseHttpiUrl("httpi://" + endpoint + "/api/v1/catalog_attach");
 	CHECK(parsed.endpoint_id == endpoint);
 	CHECK(parsed.path == "/api/v1/catalog_attach");
@@ -78,7 +133,10 @@ TEST_CASE("httpi locations preserve a strict canonical base path", "[transport]"
 	CHECK_THROWS_AS(ParseHttpiUrl("httpi://" + endpoint + "relative"), std::invalid_argument);
 	CHECK_THROWS_AS(ParseHttpiUrl("httpi://" + endpoint + "/a//b"), std::invalid_argument);
 	CHECK_THROWS_AS(ParseHttpiUrl("httpi://" + endpoint + "/a/../b"), std::invalid_argument);
+	CHECK_THROWS_AS(ParseHttpiUrl("httpi://" + endpoint + "/a/%2e%2e/b"), std::invalid_argument);
 	CHECK_THROWS_AS(ParseHttpiUrl("httpi://" + endpoint + "/a%2fb"), std::invalid_argument);
+	CHECK_THROWS_AS(ParseHttpiUrl("httpi://" + endpoint + "/a%5cb"), std::invalid_argument);
+	CHECK_THROWS_AS(ParseHttpiUrl("httpi://" + endpoint + "/a\x7f" "b"), std::invalid_argument);
 	CHECK_THROWS_AS(ParseHttpiUrl("httpi://" + endpoint + "/a?x=1"), std::invalid_argument);
 	CHECK_THROWS_AS(ParseHttpiUrl("httpi://" + endpoint + "/a#fragment"), std::invalid_argument);
 	CHECK_THROWS_AS(ParseHttpiUrl("httpi://" + endpoint + "/has space"), std::invalid_argument);
@@ -94,12 +152,40 @@ TEST_CASE("httpi response heads distinguish HTTP from pre-response terminal evid
 	CHECK(ClassifyResponseHead(kRawRepresentation | 0x8000, 200, 0) == ResponseHeadKind::INVALID);
 }
 
+TEST_CASE("stream drain rejects a transport failure before Arrow EOS", "[transport]") {
+	auto schema = arrow::schema({arrow::field("result", arrow::int32())});
+	arrow::Int32Builder builder;
+	REQUIRE(builder.Append(42).ok());
+	std::shared_ptr<arrow::Array> values;
+	REQUIRE(builder.Finish(&values).ok());
+	auto batch = arrow::RecordBatch::Make(schema, 1, {values});
+
+	auto sink_result = arrow::io::BufferOutputStream::Create();
+	REQUIRE(sink_result.ok());
+	auto sink = sink_result.ValueUnsafe();
+	auto writer_result = arrow::ipc::MakeStreamWriter(sink, schema);
+	REQUIRE(writer_result.ok());
+	auto writer = writer_result.ValueUnsafe();
+	REQUIRE(writer->WriteRecordBatch(*batch).ok());
+	REQUIRE(writer->Close().ok());
+	auto bytes_result = sink->Finish();
+	REQUIRE(bytes_result.ok());
+	auto bytes = bytes_result.ValueUnsafe();
+	REQUIRE(bytes->size() > 8);
+
+	// Arrow stream EOS is an 8-byte continuation + zero-length marker. Remove
+	// it so the next drain read reaches the transport error instead.
+	auto truncated = arrow::SliceBuffer(bytes, 0, bytes->size() - 8);
+	auto input = std::make_shared<ErrorAtEofInputStream>(std::move(truncated));
+	CHECK_THROWS(duckdb::vgi::ReadUnaryResponse(input, nullptr, "iroh://test"));
+}
+
 TEST_CASE("iroh locations are strict canonical browser targets", "[transport]") {
 	const std::string endpoint = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 	const std::string canonical = "iroh://" + endpoint;
 	CHECK(IsIrohTransport(canonical));
-	CHECK(IsIrohTransport("IROH://" + endpoint));
-	CHECK(CanonicalizeIrohLocation("IROH://" + endpoint) == canonical);
+	CHECK_FALSE(IsIrohTransport("IROH://" + endpoint));
+	CHECK_THROWS_AS(CanonicalizeIrohLocation("IROH://" + endpoint), std::invalid_argument);
 	CHECK(CanonicalizeBrowserWorkerTarget(canonical) == canonical);
 	CHECK(CanonicalizeBrowserWorkerTarget("worker:/workers/Example.js") == "/workers/Example.js");
 
