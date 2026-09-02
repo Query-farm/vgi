@@ -102,6 +102,96 @@ if(VGI_ENABLE_IROH)
     endif()
     if(MINGW)
       set(VGI_IROH_RUST_TARGET x86_64-pc-windows-gnu)
+      set(VGI_IROH_MINGW_LINKER "" CACHE FILEPATH
+          "GCC linker for the embedded Rust x86_64-pc-windows-gnu target")
+      set(VGI_IROH_MINGW_AR "" CACHE FILEPATH
+          "Archiver for Rust C dependencies on x86_64-pc-windows-gnu")
+
+      # The extension's MinGW build may intentionally use RTools, whose copied
+      # target-prefixed GCC does not provide libgcc_eh. Rust's GNU target needs
+      # that library, so select its linker independently and validate the
+      # runtime rather than relying on PATH ordering.
+      set(VGI_IROH_MINGW_LINKER_CANDIDATES)
+      if(VGI_IROH_MINGW_LINKER)
+        list(APPEND VGI_IROH_MINGW_LINKER_CANDIDATES
+             "${VGI_IROH_MINGW_LINKER}")
+      else()
+        list(APPEND VGI_IROH_MINGW_LINKER_CANDIDATES
+          "C:/msys64/mingw64/bin/gcc.exe"
+          "C:/msys64/ucrt64/bin/gcc.exe"
+          "${CMAKE_C_COMPILER}")
+        find_program(VGI_IROH_MINGW_PATH_LINKER
+          NAMES x86_64-w64-mingw32-gcc gcc)
+        if(VGI_IROH_MINGW_PATH_LINKER)
+          list(APPEND VGI_IROH_MINGW_LINKER_CANDIDATES
+               "${VGI_IROH_MINGW_PATH_LINKER}")
+        endif()
+      endif()
+
+      set(VGI_IROH_MINGW_VALID_LINKER "")
+      foreach(VGI_IROH_MINGW_LINKER_CANDIDATE IN LISTS VGI_IROH_MINGW_LINKER_CANDIDATES)
+        if(NOT EXISTS "${VGI_IROH_MINGW_LINKER_CANDIDATE}")
+          continue()
+        endif()
+        execute_process(
+          COMMAND "${VGI_IROH_MINGW_LINKER_CANDIDATE}"
+                  -print-file-name=libgcc_eh.a
+          RESULT_VARIABLE VGI_IROH_MINGW_LINKER_RESULT
+          OUTPUT_VARIABLE VGI_IROH_MINGW_LIBGCC_EH
+          ERROR_QUIET
+          OUTPUT_STRIP_TRAILING_WHITESPACE)
+        if(VGI_IROH_MINGW_LINKER_RESULT EQUAL 0
+           AND NOT VGI_IROH_MINGW_LIBGCC_EH STREQUAL "libgcc_eh.a"
+           AND EXISTS "${VGI_IROH_MINGW_LIBGCC_EH}")
+          set(VGI_IROH_MINGW_VALID_LINKER
+              "${VGI_IROH_MINGW_LINKER_CANDIDATE}")
+          break()
+        endif()
+      endforeach()
+      if(NOT VGI_IROH_MINGW_VALID_LINKER)
+        message(FATAL_ERROR
+          "Native VGI Iroh requires a MinGW GCC with libgcc_eh for Rust's "
+          "x86_64-pc-windows-gnu target. Set VGI_IROH_MINGW_LINKER to a "
+          "compatible gcc executable (for example C:/msys64/mingw64/bin/gcc.exe).")
+      endif()
+      set(VGI_IROH_MINGW_LINKER "${VGI_IROH_MINGW_VALID_LINKER}"
+          CACHE FILEPATH
+          "GCC linker for the embedded Rust x86_64-pc-windows-gnu target"
+          FORCE)
+
+      if(NOT VGI_IROH_MINGW_AR)
+        get_filename_component(VGI_IROH_MINGW_TOOLCHAIN_DIR
+                               "${VGI_IROH_MINGW_LINKER}" DIRECTORY)
+        foreach(VGI_IROH_MINGW_AR_NAME
+                ar.exe x86_64-w64-mingw32-ar.exe)
+          if(EXISTS "${VGI_IROH_MINGW_TOOLCHAIN_DIR}/${VGI_IROH_MINGW_AR_NAME}")
+            set(VGI_IROH_MINGW_AR
+                "${VGI_IROH_MINGW_TOOLCHAIN_DIR}/${VGI_IROH_MINGW_AR_NAME}")
+            break()
+          endif()
+        endforeach()
+      endif()
+      if(NOT EXISTS "${VGI_IROH_MINGW_AR}")
+        message(FATAL_ERROR
+          "Could not find the archiver matching ${VGI_IROH_MINGW_LINKER}. "
+          "Set VGI_IROH_MINGW_AR to its ar executable.")
+      endif()
+      execute_process(
+        COMMAND "${VGI_IROH_MINGW_AR}" --version
+        RESULT_VARIABLE VGI_IROH_MINGW_AR_RESULT
+        OUTPUT_QUIET ERROR_QUIET)
+      if(NOT VGI_IROH_MINGW_AR_RESULT EQUAL 0)
+        message(FATAL_ERROR
+          "VGI_IROH_MINGW_AR is not executable: ${VGI_IROH_MINGW_AR}")
+      endif()
+      set(VGI_IROH_MINGW_AR "${VGI_IROH_MINGW_AR}"
+          CACHE FILEPATH
+          "Archiver for Rust C dependencies on x86_64-pc-windows-gnu"
+          FORCE)
+      list(APPEND VGI_IROH_CARGO_ENV
+        "CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=${VGI_IROH_MINGW_LINKER}"
+        "CC_x86_64_pc_windows_gnu=${VGI_IROH_MINGW_LINKER}"
+        "AR_x86_64_pc_windows_gnu=${VGI_IROH_MINGW_AR}")
     else()
       set(VGI_IROH_RUST_TARGET x86_64-pc-windows-msvc)
       # The enclosing DuckDB/Haybarn build uses /MT. Keep Rust on the same
