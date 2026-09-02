@@ -117,6 +117,7 @@ if(VGI_ENABLE_IROH)
              "${VGI_IROH_MINGW_LINKER}")
       else()
         list(APPEND VGI_IROH_MINGW_LINKER_CANDIDATES
+          "C:/mingw64/bin/gcc.exe"
           "C:/msys64/mingw64/bin/gcc.exe"
           "C:/msys64/ucrt64/bin/gcc.exe"
           "${CMAKE_C_COMPILER}")
@@ -152,7 +153,7 @@ if(VGI_ENABLE_IROH)
         message(FATAL_ERROR
           "Native VGI Iroh requires a MinGW GCC with libgcc_eh for Rust's "
           "x86_64-pc-windows-gnu target. Set VGI_IROH_MINGW_LINKER to a "
-          "compatible gcc executable (for example C:/msys64/mingw64/bin/gcc.exe).")
+          "compatible gcc executable (for example C:/mingw64/bin/gcc.exe).")
       endif()
       set(VGI_IROH_MINGW_LINKER "${VGI_IROH_MINGW_VALID_LINKER}"
           CACHE FILEPATH
