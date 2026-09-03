@@ -109,6 +109,7 @@ jobs:
           cargo build --locked --release --manifest-path /tmp/vgi-rpc-rust/Cargo.toml -p vgi-iroh-bridge
           git clone --filter=blob:none https://github.com/Query-farm/vgi-rpc-python.git /tmp/vgi-rpc-python
           git -C /tmp/vgi-rpc-python checkout 365395a6144256ec163b17cf9b755b9b5f6a386c
+          uv pip install --python /tmp/vgi-python/.venv/bin/python --editable '/tmp/vgi-rpc-python[http]'
 
       - name: Run native Iroh raw and HTTP integration
         env:

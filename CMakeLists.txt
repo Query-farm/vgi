@@ -401,8 +401,8 @@ if(VGI_ENABLE_IROH)
   elseif(WIN32)
     # Rust's stdlib and Tokio use the Windows profile and native APIs directly.
     # These dependencies are not emitted transitively by a Rust staticlib.
-    target_link_libraries(${EXTENSION_NAME} Crypt32 Userenv Ntdll)
-    target_link_libraries(${LOADABLE_EXTENSION_NAME} Crypt32 Userenv Ntdll)
+    target_link_libraries(${EXTENSION_NAME} Bcrypt Crypt32 Userenv Ntdll)
+    target_link_libraries(${LOADABLE_EXTENSION_NAME} Bcrypt Crypt32 Userenv Ntdll)
   endif()
 endif()
 
