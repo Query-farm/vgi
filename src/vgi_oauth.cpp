@@ -21,6 +21,7 @@ extern "C" char *duckdb_wasm_get_page_origin(void);
 
 #include "vgi_logging.hpp"
 #include "vgi_oauth_assets.hpp" // embedded logo artwork for the callback pages
+#include "vgi_oauth_store.hpp"
 #include "vgi_cache_identity.hpp"
 #include "duckdb/logging/logger.hpp"
 #include "vgi_subprocess.hpp" // ResetChildSignalDispositions
@@ -314,24 +315,14 @@ std::string UrlEncode(const std::string &str) {
 	return result;
 }
 
-// Render a secret for inclusion in debug error messages. The previous version
-// echoed the full secret to keep IdP-failure debugging tractable, but
-// IOException messages travel further than "the user's shell" — DuckDB's log
-// manager, telemetry, JDBC clients, and any caller that catches IOException
-// and forwards .what() to logs all see them. A leaked refresh_token is
-// effectively account compromise. Render a fingerprint instead: length plus
-// 4-char prefix/suffix is enough to correlate against IdP logs without
-// exposing the bytes.
+// Render a secret for inclusion in error messages without disclosing any of its
+// bytes. IOException text reaches log managers, telemetry, ODBC/JDBC clients,
+// and support bundles; even a prefix/suffix "fingerprint" is credential data.
 static std::string DebugSecret(const std::string &secret) {
 	if (secret.empty()) {
 		return "(empty)";
 	}
-	std::string fingerprint = "(" + std::to_string(secret.size()) + " chars)";
-	if (secret.size() <= 8) {
-		// Short enough that prefix+suffix overlap; just say redacted.
-		return fingerprint + " <redacted>";
-	}
-	return fingerprint + " " + secret.substr(0, 4) + "..." + secret.substr(secret.size() - 4);
+	return "<redacted:" + std::to_string(secret.size()) + " chars>";
 }
 
 //===--------------------------------------------------------------------===//
@@ -569,6 +560,11 @@ OAuthServerMetadata FetchAuthServerMetadata(ClientContext &context, const std::s
 	OAuthServerMetadata meta;
 	auto root = yyjson_doc_get_root(doc);
 
+	auto issuer = yyjson_obj_get(root, "issuer");
+	if (issuer && yyjson_is_str(issuer)) {
+		meta.issuer = yyjson_get_str(issuer);
+	}
+
 	auto auth_ep = yyjson_obj_get(root, "authorization_endpoint");
 	if (auth_ep && yyjson_is_str(auth_ep)) {
 		meta.authorization_endpoint = yyjson_get_str(auth_ep);
@@ -595,6 +591,18 @@ OAuthServerMetadata FetchAuthServerMetadata(ClientContext &context, const std::s
 		}
 	}
 
+	if (meta.issuer.empty()) {
+		throw IOException("VGI OAuth: OpenID configuration at %s missing issuer", url);
+	}
+	EnforceHttpsUrl(meta.issuer, "OpenID issuer");
+	auto canonical_server = server_url;
+	auto canonical_issuer = meta.issuer;
+	while (!canonical_server.empty() && canonical_server.back() == '/') canonical_server.pop_back();
+	while (!canonical_issuer.empty() && canonical_issuer.back() == '/') canonical_issuer.pop_back();
+	if (canonical_server != canonical_issuer) {
+		throw IOException("VGI OAuth: discovered issuer '%s' does not match authorization server '%s'",
+		                  meta.issuer, server_url);
+	}
 	if (meta.token_endpoint.empty()) {
 		throw IOException("VGI OAuth: OpenID configuration at %s missing token_endpoint", url);
 	}
@@ -805,8 +813,7 @@ static OAuthTokenSet ExchangeCodeForTokens(ClientContext &context,
 		// Surface the request shape through the exception so IdP-specific
 		// failures (Microsoft Entra "AADSTS9002313: Invalid request") are
 		// diagnosable from the user-visible error alone. Secrets are
-		// fingerprinted (length + first/last 4 chars) so server-side IdP
-		// logs can be correlated without leaking the bytes — IOException
+		// fully redacted (length only) because IOException
 		// messages travel to log manager / telemetry / JDBC clients.
 		throw IOException(
 		    "VGI OAuth: token exchange failed (HTTP %d): %s\n"
@@ -1195,6 +1202,8 @@ OAuthTokenSet PerformAuthFlow(const OAuthChallenge &challenge,
 	refresh_ctx_out.use_id_token = resource_meta.use_id_token_as_bearer;
 	refresh_ctx_out.resource_metadata_url = challenge.resource_metadata_url;
 	refresh_ctx_out.scope = BuildScopeString(resource_meta);
+	refresh_ctx_out.issuer = server_meta.issuer;
+	refresh_ctx_out.resource = resource_meta.resource;
 
 	bool has_device_ep = !server_meta.device_authorization_endpoint.empty() &&
 	                     server_meta.SupportsGrantType("urn:ietf:params:oauth:grant-type:device_code");
@@ -1776,21 +1785,97 @@ void BearerTokenCatalogAuth::ClearTokens() {
 // OAuthCatalogAuth
 //===--------------------------------------------------------------------===//
 
-OAuthCatalogAuth::OAuthCatalogAuth() {
+namespace {
+
+std::mutex &OAuthSessionRegistryMutex() {
+	static std::mutex mutex;
+	return mutex;
+}
+
+struct OAuthSessionRegistryEntry {
+	std::shared_ptr<AuthState> state;
+	uint64_t last_access = 0;
+};
+
+std::map<std::string, OAuthSessionRegistryEntry> &OAuthSessionRegistry() {
+	// Intentionally strong references: Excel creates and destroys short-lived
+	// DuckDB connections, but a successful login must remain reusable by later
+	// connections in the same host process.
+	static std::map<std::string, OAuthSessionRegistryEntry> sessions;
+	return sessions;
+}
+
+uint64_t &OAuthSessionRegistryClock() {
+	static uint64_t clock = 0;
+	return clock;
+}
+
+std::string OAuthSessionKey(const std::string &profile, const OAuthRefreshContext &ctx) {
+	const auto &resource = ctx.resource.empty() ? ctx.resource_metadata_url : ctx.resource;
+	return profile + "\x1f" + ctx.issuer + "\x1f" + resource + "\x1f" + ctx.client_id + "\x1f" + ctx.scope;
+}
+
+} // namespace
+
+OAuthCatalogAuth::OAuthCatalogAuth(std::string profile, std::string cache_mode)
+    : state_(std::make_shared<AuthState>()), profile_(std::move(profile)), cache_mode_(std::move(cache_mode)) {
+	if (profile_.empty()) {
+		profile_ = "default";
+	}
+}
+
+std::shared_ptr<AuthState> OAuthCatalogAuth::AdoptSharedSession(const OAuthRefreshContext &refresh_ctx) {
+	std::lock_guard<std::mutex> binding_lock(binding_mutex_);
+	if (cache_mode_ == "none" || refresh_ctx.issuer.empty()) {
+		return state_;
+	}
+
+	std::shared_ptr<AuthState> shared;
+	{
+		std::lock_guard<std::mutex> registry_lock(OAuthSessionRegistryMutex());
+		auto &registry = OAuthSessionRegistry();
+		const auto key = OAuthSessionKey(profile_, refresh_ctx);
+		auto &slot = registry[key];
+		if (!slot.state) {
+			slot.state = std::make_shared<AuthState>();
+		}
+		slot.last_access = ++OAuthSessionRegistryClock();
+		shared = slot.state;
+		if (registry.size() > 128) {
+			auto victim = registry.end();
+			for (auto it = registry.begin(); it != registry.end(); ++it) {
+				if (it->first != key && (victim == registry.end() || it->second.last_access < victim->second.last_access)) {
+					victim = it;
+				}
+			}
+			if (victim != registry.end()) registry.erase(victim);
+		}
+	}
+
+	if (shared != state_) {
+		std::scoped_lock<std::mutex, std::mutex> lock(state_->mutex, shared->mutex);
+		if (shared->token.refresh_token.empty() && !state_->token.refresh_token.empty()) {
+			shared->token.refresh_token = std::move(state_->token.refresh_token);
+		}
+		state_ = shared;
+	}
+	return state_;
 }
 
 std::string OAuthCatalogAuth::GetToken() {
-	std::lock_guard<std::mutex> lock(mutex_);
-	if (state_.status != AuthState::Status::COMPLETE || !state_.token.IsValid()) {
+	std::lock_guard<std::mutex> binding_lock(binding_mutex_);
+	std::lock_guard<std::mutex> lock(state_->mutex);
+	if (state_->status != AuthState::Status::COMPLETE || !state_->token.IsValid()) {
 		return "";
 	}
-	return state_.token.BearerToken();
+	return state_->token.BearerToken();
 }
 
 void OAuthCatalogAuth::SeedRefreshToken(const std::string &refresh_token) {
-	std::lock_guard<std::mutex> lock(mutex_);
-	if (state_.status == AuthState::Status::IDLE) {
-		state_.token.refresh_token = refresh_token;
+	std::lock_guard<std::mutex> binding_lock(binding_mutex_);
+	std::lock_guard<std::mutex> lock(state_->mutex);
+	if (state_->status == AuthState::Status::IDLE) {
+		state_->token.refresh_token = refresh_token;
 	}
 }
 
@@ -1802,19 +1887,21 @@ bool OAuthCatalogAuth::IsExplicitlyConfigured() const {
 	// set — returns false so the 401-handler in vgi_http_client.cpp can
 	// surface a clean "no credential" diagnostic instead of launching an
 	// OAuth discovery flow against an empty challenge URL.
-	std::lock_guard<std::mutex> lock(mutex_);
-	if (!state_.token.refresh_token.empty()) {
+	std::lock_guard<std::mutex> binding_lock(binding_mutex_);
+	std::lock_guard<std::mutex> lock(state_->mutex);
+	if (!state_->token.refresh_token.empty()) {
 		return true;
 	}
-	if (state_.status == AuthState::Status::COMPLETE && state_.token.IsValid()) {
+	if (state_->status == AuthState::Status::COMPLETE && state_->token.IsValid()) {
 		return true;
 	}
 	return false;
 }
 
 bool OAuthCatalogAuth::WasInteractive() const {
-	std::lock_guard<std::mutex> lock(mutex_);
-	return state_.interactive;
+	std::lock_guard<std::mutex> binding_lock(binding_mutex_);
+	std::lock_guard<std::mutex> lock(state_->mutex);
+	return state_->interactive;
 }
 
 std::string OAuthCatalogAuth::HandleUnauthorized(const OAuthChallenge &challenge, ClientContext &context) {
@@ -1827,31 +1914,81 @@ std::string OAuthCatalogAuth::HandleUnauthorized(const OAuthChallenge &challenge
 		}
 	}
 
-	std::unique_lock<std::mutex> lock(mutex_);
+	std::shared_ptr<AuthState> prior_state;
+	{
+		std::lock_guard<std::mutex> binding_lock(binding_mutex_);
+		prior_state = state_;
+	}
+	OAuthRefreshContext discovered_ctx;
+	std::shared_ptr<AuthState> state = prior_state;
+	std::string canonical_key;
+	if (!challenge.resource_metadata_url.empty()) {
+		discovered_ctx = DiscoverRefreshContext(challenge, context);
+		canonical_key = OAuthSessionKey(profile_, discovered_ctx);
+		state = AdoptSharedSession(discovered_ctx);
+	}
+	std::unique_lock<std::mutex> lock(state->mutex);
+	if (state != prior_state && state->status == AuthState::Status::COMPLETE && state->token.IsValid()) {
+		return state->token.BearerToken();
+	}
+	if (state->refresh_ctx.token_endpoint.empty() && !discovered_ctx.token_endpoint.empty()) {
+		state->refresh_ctx = discovered_ctx;
+	}
+
+	uint64_t auth_epoch = state->epoch;
 
 	// Helper: store successful auth result in state (must hold lock).
 	// Helpers below assume `lock` is HELD when called. They publish the
 	// new state, clear the IN_PROGRESS owner, and notify all waiters.
 	auto StoreSuccess = [&](OAuthTokenSet tokens, const OAuthRefreshContext &rctx) -> std::string {
-		state_.token = std::move(tokens);
-		state_.refresh_ctx = rctx;
-		state_.status = AuthState::Status::COMPLETE;
-		state_.owner = std::thread::id();
-		state_.cv.notify_all();
-		return state_.token.BearerToken();
+		if (state->epoch != auth_epoch) {
+			state->status = AuthState::Status::IDLE;
+			state->owner = std::thread::id();
+			state->cv.notify_all();
+			throw IOException("VGI OAuth: tokens were cleared while authentication was in progress");
+		}
+		if (!canonical_key.empty() && !tokens.refresh_token.empty()) {
+			StoreOAuthRefreshToken(canonical_key, rctx, cache_mode_, tokens.refresh_token);
+		}
+		state->token = std::move(tokens);
+		state->refresh_ctx = rctx;
+		state->status = AuthState::Status::COMPLETE;
+		state->owner = std::thread::id();
+		state->cv.notify_all();
+		return state->token.BearerToken();
 	};
 
 	// Helper: store failure in state (must hold lock).
 	auto StoreFailed = [&](const std::string &error_msg) {
-		state_.status = AuthState::Status::FAILED;
-		state_.error_message = error_msg;
-		state_.owner = std::thread::id();
-		state_.cv.notify_all();
+		state->status = AuthState::Status::FAILED;
+		state->error_message = error_msg;
+		state->owner = std::thread::id();
+		state->cv.notify_all();
+	};
+	auto WasCleared = [&]() {
+		if (state->epoch == auth_epoch) return false;
+		state->status = AuthState::Status::IDLE;
+		state->owner = std::thread::id();
+		state->error_message.clear();
+		state->cv.notify_all();
+		return true;
 	};
 
 	// Helper: attempt refresh, then fall back to full auth flow.
 	// Called with lock released. Re-acquires lock on success/failure.
 	auto RefreshOrFullAuth = [&](std::string refresh_token, OAuthRefreshContext refresh_ctx) -> std::string {
+		std::unique_ptr<OAuthCredentialLease> persistent_lease;
+		if (!canonical_key.empty()) {
+			persistent_lease = AcquireOAuthCredentialLease(canonical_key, cache_mode_);
+		}
+		if (persistent_lease && !canonical_key.empty()) {
+			std::string persisted_token;
+			const auto &binding = discovered_ctx.token_endpoint.empty() ? refresh_ctx : discovered_ctx;
+			if (LoadOAuthRefreshToken(canonical_key, binding, cache_mode_, persisted_token)) {
+				refresh_token = std::move(persisted_token);
+				refresh_ctx = binding;
+			}
+		}
 		// Attempt token refresh if we have a refresh_token
 		if (!refresh_token.empty()) {
 			// Discover metadata if we have a token but no refresh context
@@ -1875,7 +2012,7 @@ std::string OAuthCatalogAuth::HandleUnauthorized(const OAuthChallenge &challenge
 					if (tokens.refresh_token.empty()) {
 						tokens.refresh_token = refresh_token;
 					}
-					lock.lock();
+					if (!lock.owns_lock()) lock.lock();
 					return StoreSuccess(std::move(tokens), refresh_ctx);
 				} catch (const std::exception &e) {
 					// Do NOT silently fall through to PerformAuthFlow.
@@ -1887,11 +2024,15 @@ std::string OAuthCatalogAuth::HandleUnauthorized(const OAuthChallenge &challenge
 					std::string refresh_err = e.what();
 					if (refresh_err.find("invalid_grant") != std::string::npos) {
 						VGI_STDERR_DEBUG("[VGI] oauth.clearing_stale_refresh_token\n");
+						if (!canonical_key.empty()) {
+							DeleteOAuthRefreshToken(canonical_key, cache_mode_);
+						}
 					}
-					lock.lock();
+					if (!lock.owns_lock()) lock.lock();
+					if (WasCleared()) throw;
 					// Clear stale refresh token on invalid_grant
 					if (refresh_err.find("invalid_grant") != std::string::npos) {
-						state_.token.refresh_token.clear();
+						state->token.refresh_token.clear();
 					}
 					StoreFailed(refresh_err);
 					throw;
@@ -1900,7 +2041,8 @@ std::string OAuthCatalogAuth::HandleUnauthorized(const OAuthChallenge &challenge
 					// nested code). Without this catch the IN_PROGRESS
 					// state would never be cleared and cv.notify_all
 					// never fires — every waiter hangs forever.
-					lock.lock();
+					if (!lock.owns_lock()) lock.lock();
+					if (WasCleared()) throw;
 					StoreFailed("unknown error during token refresh");
 					throw;
 				}
@@ -1911,19 +2053,21 @@ std::string OAuthCatalogAuth::HandleUnauthorized(const OAuthChallenge &challenge
 		try {
 			OAuthRefreshContext new_refresh_ctx;
 			auto tokens = PerformAuthFlow(challenge, context, new_refresh_ctx);
-			lock.lock();
+			if (!lock.owns_lock()) lock.lock();
 			// Reaching here means an interactive flow (device-code / browser)
 			// completed — the refresh branch above never falls through. Record
 			// it for telemetry (sticky for the auth object's lifetime).
-			state_.interactive = true;
+			state->interactive = true;
 			return StoreSuccess(std::move(tokens), new_refresh_ctx);
 		} catch (const std::exception &e) {
-			lock.lock();
+			if (!lock.owns_lock()) lock.lock();
+			if (WasCleared()) throw;
 			StoreFailed(e.what());
 			throw;
 		} catch (...) {
 			// Same hang-prevention as the refresh catch above.
-			lock.lock();
+			if (!lock.owns_lock()) lock.lock();
+			if (WasCleared()) throw;
 			StoreFailed("unknown error during interactive auth flow");
 			throw;
 		}
@@ -1931,14 +2075,15 @@ std::string OAuthCatalogAuth::HandleUnauthorized(const OAuthChallenge &challenge
 
 	const auto this_thread = std::this_thread::get_id();
 
-	switch (state_.status) {
+	switch (state->status) {
 	case AuthState::Status::IDLE:
 	case AuthState::Status::FAILED: {
-		state_.status = AuthState::Status::IN_PROGRESS;
-		state_.owner = this_thread;
-		state_.error_message.clear();
-		std::string refresh_token = state_.token.refresh_token;
-		OAuthRefreshContext refresh_ctx = state_.refresh_ctx;
+		state->status = AuthState::Status::IN_PROGRESS;
+		auth_epoch = state->epoch;
+		state->owner = this_thread;
+		state->error_message.clear();
+		std::string refresh_token = state->token.refresh_token;
+		OAuthRefreshContext refresh_ctx = state->refresh_ctx;
 		lock.unlock();
 		return RefreshOrFullAuth(std::move(refresh_token), std::move(refresh_ctx));
 	}
@@ -1949,7 +2094,7 @@ std::string OAuthCatalogAuth::HandleUnauthorized(const OAuthChallenge &challenge
 		// endpoint requires auth from this same auth object, or the token
 		// endpoint host returns 401 mid-refresh). Waiting on cv would
 		// deadlock against ourselves. Throw cleanly instead.
-		if (state_.owner == this_thread) {
+		if (state->owner == this_thread) {
 			throw IOException(
 			    "VGI OAuth: nested 401 inside the auth flow on the same thread; aborting "
 			    "to avoid self-deadlock. Likely cause: the token-endpoint or "
@@ -1966,8 +2111,8 @@ std::string OAuthCatalogAuth::HandleUnauthorized(const OAuthChallenge &challenge
 		VGI_STDERR_DEBUG("[VGI] oauth.waiting_for_auth\n");
 		const auto wait_budget = std::chrono::seconds(GetOAuthTimeoutSeconds(context)) +
 		                         std::chrono::seconds(30);
-		if (!state_.cv.wait_for(lock, wait_budget, [this]() {
-			    return state_.status != AuthState::Status::IN_PROGRESS;
+		if (!state->cv.wait_for(lock, wait_budget, [state]() {
+			    return state->status != AuthState::Status::IN_PROGRESS;
 		    })) {
 			throw IOException(
 			    "VGI OAuth: timed out waiting for another thread to finish authenticating "
@@ -1975,22 +2120,23 @@ std::string OAuthCatalogAuth::HandleUnauthorized(const OAuthChallenge &challenge
 			    static_cast<long long>(wait_budget.count()));
 		}
 
-		if (state_.status == AuthState::Status::COMPLETE && state_.token.IsValid()) {
-			return state_.token.BearerToken();
+		if (state->status == AuthState::Status::COMPLETE && state->token.IsValid()) {
+			return state->token.BearerToken();
 		}
-		if (state_.status == AuthState::Status::IDLE) {
+		if (state->status == AuthState::Status::IDLE) {
 			throw IOException("VGI OAuth: tokens were cleared during authentication, please retry");
 		}
-		throw IOException("VGI OAuth: authentication failed: %s", state_.error_message);
+		throw IOException("VGI OAuth: authentication failed: %s", state->error_message);
 	}
 
 	case AuthState::Status::COMPLETE: {
 		// Token exists but server returned 401 — token may be stale.
-		state_.status = AuthState::Status::IN_PROGRESS;
-		state_.owner = this_thread;
-		state_.error_message.clear();
-		std::string refresh_token = state_.token.refresh_token;
-		OAuthRefreshContext refresh_ctx = state_.refresh_ctx;
+		state->status = AuthState::Status::IN_PROGRESS;
+		auth_epoch = state->epoch;
+		state->owner = this_thread;
+		state->error_message.clear();
+		std::string refresh_token = state->token.refresh_token;
+		OAuthRefreshContext refresh_ctx = state->refresh_ctx;
 		lock.unlock();
 		return RefreshOrFullAuth(std::move(refresh_token), std::move(refresh_ctx));
 	}
@@ -2000,26 +2146,39 @@ std::string OAuthCatalogAuth::HandleUnauthorized(const OAuthChallenge &challenge
 }
 
 void OAuthCatalogAuth::ClearTokens() {
-	std::lock_guard<std::mutex> lock(mutex_);
-	state_.token = OAuthTokenSet();
-	state_.refresh_ctx = OAuthRefreshContext();
-	state_.status = AuthState::Status::IDLE;
-	state_.owner = std::thread::id();
-	state_.error_message.clear();
-	state_.cv.notify_all();
+	std::lock_guard<std::mutex> binding_lock(binding_mutex_);
+	std::string key;
+	{
+		std::lock_guard<std::mutex> lock(state_->mutex);
+		state_->epoch++;
+		if (!state_->refresh_ctx.issuer.empty()) {
+			key = OAuthSessionKey(profile_, state_->refresh_ctx);
+		}
+		state_->token = OAuthTokenSet();
+		state_->refresh_ctx = OAuthRefreshContext();
+		state_->status = AuthState::Status::IDLE;
+		state_->owner = std::thread::id();
+		state_->error_message.clear();
+		state_->cv.notify_all();
+	}
+	if (!key.empty()) {
+		auto lease = AcquireOAuthCredentialLease(key, cache_mode_);
+		DeleteOAuthRefreshToken(key, cache_mode_);
+	}
 }
 
 bool OAuthCatalogAuth::GetTokenInfo(TokenInfo &info) {
-	std::lock_guard<std::mutex> lock(mutex_);
-	if (state_.status != AuthState::Status::COMPLETE) {
+	std::lock_guard<std::mutex> binding_lock(binding_mutex_);
+	std::lock_guard<std::mutex> lock(state_->mutex);
+	if (state_->status != AuthState::Status::COMPLETE) {
 		return false;
 	}
-	info.has_refresh_token = !state_.token.refresh_token.empty();
+	info.has_refresh_token = !state_->token.refresh_token.empty();
 	auto now = std::chrono::steady_clock::now();
-	if (state_.token.expires_at > std::chrono::steady_clock::time_point()) {
+	if (state_->token.expires_at > std::chrono::steady_clock::time_point()) {
 		info.has_expires = true;
 		info.expires_in_seconds = std::chrono::duration_cast<std::chrono::seconds>(
-		    state_.token.expires_at - now).count();
+		    state_->token.expires_at - now).count();
 	} else {
 		info.has_expires = false;
 		info.expires_in_seconds = 0;
@@ -2028,11 +2187,12 @@ bool OAuthCatalogAuth::GetTokenInfo(TokenInfo &info) {
 }
 
 bool OAuthCatalogAuth::GetTokenSetCopy(OAuthTokenSet &out) {
-	std::lock_guard<std::mutex> lock(mutex_);
-	if (state_.status != AuthState::Status::COMPLETE) {
+	std::lock_guard<std::mutex> binding_lock(binding_mutex_);
+	std::lock_guard<std::mutex> lock(state_->mutex);
+	if (state_->status != AuthState::Status::COMPLETE) {
 		return false;
 	}
-	out = state_.token;
+	out = state_->token;
 	return true;
 }
 
@@ -2070,6 +2230,8 @@ OAuthRefreshContext DiscoverRefreshContext(const OAuthChallenge &challenge, Clie
 	ctx.use_id_token = resource_meta.use_id_token_as_bearer;
 	ctx.resource_metadata_url = challenge.resource_metadata_url;
 	ctx.scope = BuildScopeString(resource_meta);
+	ctx.issuer = server_meta.issuer;
+	ctx.resource = resource_meta.resource;
 	return ctx;
 }
 
@@ -2097,7 +2259,7 @@ OAuthTokenSet AttemptTokenRefresh(const OAuthRefreshContext &ctx,
 		// Surface the request shape through the exception. The IdP's
 		// "invalid_grant" / "AADSTS9002313" body doesn't tell you which
 		// parameter is wrong; the request shape does. Refresh tokens are
-		// fingerprinted (length + first/last 4 chars) — IOException text
+		// fully redacted (length only) — IOException text
 		// travels to log manager / telemetry / JDBC clients, so a leaked
 		// refresh_token is a credential leak.
 		throw IOException(
@@ -2123,6 +2285,10 @@ OAuthTokenSet AttemptTokenRefresh(const OAuthRefreshContext &ctx,
 
 	auto tokens = ParseTokenResponse(resp.body, "refresh token response");
 	tokens.use_id_token = ctx.use_id_token;
+	if (ctx.use_id_token && tokens.id_token.empty()) {
+		throw IOException("VGI OAuth: refresh response omitted id_token required by use_id_token_as_bearer; "
+		                  "interactive authentication is required");
+	}
 	return tokens;
 }
 

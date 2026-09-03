@@ -1,0 +1,22 @@
+# OAuth cache configuration is registered and ATTACH validates local overrides
+# before attempting transport or discovery.
+
+require vgi
+
+query T
+SELECT current_setting('vgi_oauth_cache')
+----
+auto
+
+statement ok
+SET vgi_oauth_cache = 'memory'
+
+query T
+SELECT current_setting('vgi_oauth_cache')
+----
+memory
+
+statement error
+ATTACH 'mock' AS mock (TYPE vgi, LOCATION 'https://127.0.0.1', oauth_cache 'bogus');
+----
+oauth_cache must be auto, persistent, memory, or none

@@ -1717,6 +1717,8 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	int64_t pool_max_override = -1;      // -1 = not set
 	int64_t pool_timeout_override = -1;  // -1 = not set
 	string oauth_refresh_token;
+	string oauth_profile;
+	string oauth_cache_mode;
 	string bearer_token;
 	string tcp_proxy;
 	string iroh_secret_key;
@@ -1814,6 +1816,13 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 			pool_timeout_override = value.DefaultCastAs(LogicalType::BIGINT).GetValue<int64_t>();
 		} else if (lower_name == "oauth_refresh_token") {
 			oauth_refresh_token = value.ToString();
+		} else if (lower_name == "oauth_profile") {
+			oauth_profile = value.ToString();
+			if (oauth_profile.empty()) {
+				throw BinderException("oauth_profile must not be empty");
+			}
+		} else if (lower_name == "oauth_cache") {
+			oauth_cache_mode = StringUtil::Lower(value.ToString());
 		} else if (lower_name == "bearer_token") {
 			bearer_token = value.ToString();
 		} else if (lower_name == "tcp_proxy") {
@@ -1969,6 +1978,20 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	// Validate mutual exclusivity of auth options
 	if (!bearer_token.empty() && !oauth_refresh_token.empty()) {
 		throw BinderException("Cannot specify both bearer_token and oauth_refresh_token");
+	}
+	if (oauth_profile.empty()) {
+		oauth_profile = name;
+	}
+	if (oauth_cache_mode.empty()) {
+		Value cache_value;
+		oauth_cache_mode = context.TryGetCurrentSetting("vgi_oauth_cache", cache_value)
+		                       ? StringUtil::Lower(cache_value.ToString())
+		                       : "auto";
+	}
+	if (oauth_cache_mode != "auto" && oauth_cache_mode != "persistent" &&
+	    oauth_cache_mode != "memory" && oauth_cache_mode != "none") {
+		throw BinderException("oauth_cache must be auto, persistent, memory, or none (got '%s')",
+		                      oauth_cache_mode);
 	}
 
 	// Bare connection-string form: when no LOCATION was given and the path
@@ -2223,7 +2246,7 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 		}
 		auth = std::make_shared<vgi::BearerTokenCatalogAuth>(bearer_token);
 	} else {
-		auto oauth_auth = std::make_shared<vgi::OAuthCatalogAuth>();
+		auto oauth_auth = std::make_shared<vgi::OAuthCatalogAuth>(oauth_profile, oauth_cache_mode);
 		if (!oauth_refresh_token.empty()) {
 			if (!vgi::IsHttpTransport(worker_path) && !vgi::IsHttpiTransport(worker_path)) {
 				throw BinderException("oauth_refresh_token is only valid for HTTP transport "
@@ -3679,6 +3702,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 	config.AddExtensionOption("vgi_oauth_prompt",
 	                          "OAuth prompt behavior: none (default), login, select_account, or consent",
 	                          LogicalType::VARCHAR, Value("none"));
+	config.AddExtensionOption("vgi_oauth_cache",
+	                          "OAuth credential cache: auto (persistent on macOS/Windows, memory on Linux), "
+	                          "persistent, memory, or none",
+	                          LogicalType::VARCHAR, Value("auto"));
 
 	// Register async prefetch setting. Default is off: async prefetch returns
 	// SourceResultType::BLOCKED from table-scan sources, which DuckDB's

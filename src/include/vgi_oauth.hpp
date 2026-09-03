@@ -3,8 +3,10 @@
 
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <thread>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -42,6 +44,7 @@ struct OAuthResourceMetadata {
 };
 
 struct OAuthServerMetadata {
+	std::string issuer;
 	std::string authorization_endpoint;
 	std::string token_endpoint;
 	std::string device_authorization_endpoint; // RFC 8628
@@ -88,6 +91,8 @@ struct OAuthRefreshContext {
 	std::string client_id;
 	std::string client_secret;
 	std::string scope;
+	std::string issuer;
+	std::string resource;
 	bool use_id_token = false;
 	std::string resource_metadata_url;
 };
@@ -110,6 +115,8 @@ struct AuthState {
 	// silent refresh or an already-cached token. Sticky for the auth object's
 	// lifetime; read by telemetry to distinguish human-in-the-loop attaches.
 	bool interactive = false;
+	uint64_t epoch = 0; // incremented by logout; in-flight auth may not publish across it
+	mutable std::mutex mutex;
 };
 
 // ============================================================================
@@ -179,7 +186,7 @@ private:
 // same thread synchronization, but operating on a single AuthState.
 class OAuthCatalogAuth : public CatalogAuth {
 public:
-	OAuthCatalogAuth();
+	explicit OAuthCatalogAuth(std::string profile = "default", std::string cache_mode = "auto");
 
 	std::string GetToken() override;
 	std::string HandleUnauthorized(const OAuthChallenge &challenge, ClientContext &context) override;
@@ -195,8 +202,11 @@ public:
 	bool WasInteractive() const override;
 
 private:
-	mutable std::mutex mutex_;
-	AuthState state_;
+	std::shared_ptr<AuthState> AdoptSharedSession(const OAuthRefreshContext &refresh_ctx);
+	mutable std::mutex binding_mutex_;
+	std::shared_ptr<AuthState> state_;
+	std::string profile_;
+	std::string cache_mode_;
 };
 
 // ============================================================================
