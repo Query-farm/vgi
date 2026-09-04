@@ -55,7 +55,7 @@ if(VGI_ENABLE_IROH)
     include(FetchContent)
     FetchContent_Declare(vgi_iroh_source
       GIT_REPOSITORY https://github.com/Query-farm/vgi-rpc-rust.git
-      GIT_TAG c105d7b047e912355a79420ced81cf296ec52c73
+      GIT_TAG 9e7dfb59686682be0ff4a46183988e2724416393
       GIT_SHALLOW FALSE)
     FetchContent_GetProperties(vgi_iroh_source)
     if(NOT vgi_iroh_source_POPULATED)

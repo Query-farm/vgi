@@ -105,7 +105,7 @@ jobs:
       - name: Build pinned Iroh qualification bridge
         run: |
           git clone --filter=blob:none https://github.com/Query-farm/vgi-rpc-rust.git /tmp/vgi-rpc-rust
-          git -C /tmp/vgi-rpc-rust checkout c105d7b047e912355a79420ced81cf296ec52c73
+          git -C /tmp/vgi-rpc-rust checkout 9e7dfb59686682be0ff4a46183988e2724416393
           cargo build --locked --release --manifest-path /tmp/vgi-rpc-rust/Cargo.toml -p vgi-iroh-bridge
           git clone --filter=blob:none https://github.com/Query-farm/vgi-rpc-python.git /tmp/vgi-rpc-python
           git -C /tmp/vgi-rpc-python checkout 365395a6144256ec163b17cf9b755b9b5f6a386c
