@@ -70,6 +70,16 @@ ORDER BY arg_name;
 latitude	DOUBLE
 longitude	DOUBLE
 
+# Correlated-input capability is discovered from FunctionInfo, not duplicated
+# in tags. It is repeated on argument rows because this diagnostic is the
+# function-signature discovery surface.
+query T
+SELECT DISTINCT input_from_args::VARCHAR
+FROM vgi_function_arguments()
+WHERE catalog_name = 'ex' AND function_name = 'geo_encode';
+----
+true
+
 # ---------------------------------------------------------------------------
 # arity overload: geo_encode3 shares the name "geo_encode" with a 3rd column
 # ---------------------------------------------------------------------------

@@ -55,6 +55,10 @@ struct ArgRow {
 	bool is_varargs;
 	bool is_table_input;
 	bool is_any_type;
+	// Function-level capability repeated on each argument row. True only for
+	// row-transform table functions whose positional arguments may be bound to
+	// columns from a correlated LATERAL driver.
+	bool input_from_args;
 	// Per-argument constraint metadata (agent discovery); empty -> NULL.
 	std::string arg_default; // presence-only vgi_default (JSON scalar text)
 	bool arg_default_present;
@@ -87,7 +91,8 @@ static std::string MetadataValue(const std::shared_ptr<const arrow::KeyValueMeta
 // rows. function_type is the display string (e.g. "scalar", "table_macro").
 static void EmitArgsFromSchema(ClientContext &context, const std::string &catalog_name, const std::string &schema_name,
                                const std::string &function_name, const std::string &function_type,
-                               const std::shared_ptr<arrow::Schema> &arguments_schema, std::vector<ArgRow> &out) {
+                               const std::shared_ptr<arrow::Schema> &arguments_schema, bool input_from_args,
+                               std::vector<ArgRow> &out) {
 	if (!arguments_schema || arguments_schema->num_fields() == 0) {
 		return; // No declared arguments — emit no rows.
 	}
@@ -158,6 +163,7 @@ static void EmitArgsFromSchema(ClientContext &context, const std::string &catalo
 		row.is_varargs = is_varargs;
 		row.is_table_input = is_table_input;
 		row.is_any_type = is_any_type;
+		row.input_from_args = input_from_args;
 		row.arg_default = arg_default;
 		row.arg_default_present = !arg_default.empty();
 		row.arg_choices = arg_choices;
@@ -174,7 +180,7 @@ static void EmitArgsFromSchema(ClientContext &context, const std::string &catalo
 static void EmitFunctionArgs(ClientContext &context, const std::string &catalog_name, const std::string &schema_name,
                              const VgiFunctionInfo &func, std::vector<ArgRow> &out) {
 	EmitArgsFromSchema(context, catalog_name, schema_name, func.name, VgiFunctionTypeToString(func.function_type),
-	                   func.arguments_schema, out);
+	                   func.arguments_schema, func.input_from_args, out);
 }
 
 // Expand one macro's arguments_schema into per-argument rows. macro_type is the
@@ -186,7 +192,8 @@ static void EmitMacroArgs(ClientContext &context, const std::string &catalog_nam
 	// lowercase value form too for resilience.
 	const bool is_table = macro.macro_type == "TABLE" || macro.macro_type == "table";
 	const std::string function_type = is_table ? "table_macro" : "scalar_macro";
-	EmitArgsFromSchema(context, catalog_name, schema_name, macro.name, function_type, macro.arguments_schema, out);
+	EmitArgsFromSchema(context, catalog_name, schema_name, macro.name, function_type, macro.arguments_schema, false,
+	                   out);
 }
 
 static unique_ptr<FunctionData> VgiFunctionArgumentsBind(ClientContext &context, TableFunctionBindInput &input,
@@ -211,11 +218,12 @@ static unique_ptr<FunctionData> VgiFunctionArgumentsBind(ClientContext &context,
 	    LogicalType::VARCHAR, // arg_choices (NULL when unconstrained; JSON array)
 	    LogicalType::VARCHAR, // arg_range (NULL when unbounded; interval notation)
 	    LogicalType::VARCHAR, // arg_pattern (NULL when no pattern; regex)
+	    LogicalType::BOOLEAN, // input_from_args (function-level capability)
 	};
 	names = {"catalog_name",  "schema_name", "function_name", "function_type",   "arg_position",
 	         "field_index",   "arg_name",    "arg_type",      "arg_description", "is_named",
 	         "is_positional", "is_const",    "is_varargs",    "is_table_input",  "is_any_type",
-	         "arg_default",   "arg_choices", "arg_range",     "arg_pattern"};
+	         "arg_default",   "arg_choices", "arg_range",     "arg_pattern",     "input_from_args"};
 
 	auto data = make_uniq<VgiFunctionArgumentsData>();
 
@@ -310,6 +318,7 @@ static void VgiFunctionArgumentsScan(ClientContext &context, TableFunctionInput 
 		output.SetValue(16, count, row.arg_choices_present ? Value(row.arg_choices) : Value());
 		output.SetValue(17, count, row.arg_range_present ? Value(row.arg_range) : Value());
 		output.SetValue(18, count, row.arg_pattern_present ? Value(row.arg_pattern) : Value());
+		output.SetValue(19, count, Value::BOOLEAN(row.input_from_args));
 		count++;
 	}
 	output.SetCardinality(count);
@@ -324,7 +333,8 @@ void RegisterVgiFunctionArgumentsFunction(ExtensionLoader &loader) {
 	    "Inspect the arguments of every function and macro exposed by every attached VGI catalog, one row per "
 	    "argument. function_type is scalar/table/aggregate for functions and scalar_macro/table_macro for macros. "
 	    "Surfaces per-argument detail that duckdb_functions() flattens away: named-vs-positional, const, "
-	    "varargs, table-input, any-type, the per-argument description (vgi_doc), and discovery-facing "
+	    "varargs, table-input, any-type, function-level input_from_args correlated-input capability, the "
+	    "per-argument description (vgi_doc), and discovery-facing "
 	    "constraints (arg_default, arg_choices, arg_range, arg_pattern) so an agent can read valid inputs "
 	    "before calling. Filter with WHERE catalog_name = '...'. Reports each catalog's current data "
 	    "version; does not honor time travel.",
