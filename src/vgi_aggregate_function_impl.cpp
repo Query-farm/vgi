@@ -14,6 +14,7 @@
 #include "vgi_transport.hpp"
 #include "vgi_unary_rpc.hpp"
 #include "vgi_worker_pool.hpp"
+#include "generated/vgi_request_builders.hpp"
 
 #include "duckdb/common/arrow/arrow_appender.hpp"
 #include "duckdb/common/arrow/arrow_converter.hpp"
@@ -38,7 +39,7 @@ namespace {
 // function name: a name is unique only within a schema, so without it the
 // worker re-resolves each unary call by bare name and can land on another
 // schema's implementation after a bind that resolved correctly. Empty string
-// serialises as null (MakeSingleStringArrayOrNull), which is the legitimate
+// serialises as null, which is the legitimate
 // "caller names no schema" wire form — the field stays nullable.
 std::shared_ptr<arrow::RecordBatch> BuildAggregateBindRequest(
     const std::string &function_name, const std::string &schema_name,
@@ -80,25 +81,18 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateBindRequest(
 	auto secrets = vgi::ExtractVgiSecrets(context, required_secrets);
 	auto secrets_ipc_bytes = vgi::BuildSecretsBatch(context, secrets);
 
-	auto schema = arrow::schema({
-	    arrow::field("function_name", arrow::utf8(), false),
-	    arrow::field("arguments", arrow::binary(), false),
-	    arrow::field("input_schema", arrow::binary(), true),
-	    arrow::field("settings", arrow::binary(), true),
-	    arrow::field("secrets", arrow::binary(), true),
-	    arrow::field("attach_opaque_data", arrow::binary(), true),
-	    arrow::field("schema_name", arrow::utf8(), true),
-	});
-
-	return vgi::WrapAsRpcParams(arrow::RecordBatch::Make(schema, 1, {
-	    vgi::MakeSingleStringArray(function_name),
-	    vgi::MakeSingleBinaryArray(arguments_bytes),
-	    vgi::MakeSingleBinaryArray(schema_bytes),
-	    vgi::MakeSingleBinaryArrayOrNull(settings_bytes),
-	    vgi::MakeSingleBinaryArrayOrNull(secrets_ipc_bytes),
-	    vgi::MakeSingleBinaryArrayOrNull(attach_opaque_data),
-	    vgi::MakeSingleStringArrayOrNull(schema_name),
-	}));
+	auto request =
+	    arrow::RecordBatch::Make(vgi::generated::AggregateBindRequestSchema(), 1,
+	                             {
+	                                 vgi::MakeSingleStringArray(function_name),
+	                                 vgi::MakeSingleBinaryArray(arguments_bytes),
+	                                 vgi::MakeSingleBinaryArray(schema_bytes),
+	                                 vgi::MakeSingleBinaryArrayOrNull(settings_bytes),
+	                                 vgi::MakeSingleBinaryArrayOrNull(secrets_ipc_bytes),
+	                                 vgi::MakeSingleBinaryArrayOrNull(attach_opaque_data),
+	                                 vgi::BuildOptionalStringListScalar(vgi::OptionalSingleSchemaPath(schema_name)),
+	                             });
+	return vgi::generated::BuildAggregateBindParams(vgi::SerializeToIpcBytes(request));
 }
 
 std::shared_ptr<arrow::RecordBatch> BuildAggregateUpdateRequest(
@@ -109,21 +103,16 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateUpdateRequest(
 
 	auto batch_bytes = vgi::SerializeToIpcBytes(input_batch);
 
-	auto schema = arrow::schema({
-	    arrow::field("function_name", arrow::utf8(), false),
-	    arrow::field("execution_id", arrow::binary(), false),
-	    arrow::field("input_batch", arrow::binary(), false),
-	    arrow::field("attach_opaque_data", arrow::binary(), true),
-	    arrow::field("schema_name", arrow::utf8(), true),
-	});
-
-	return vgi::WrapAsRpcParams(arrow::RecordBatch::Make(schema, 1, {
-	    vgi::MakeSingleStringArray(function_name),
-	    vgi::MakeSingleBinaryArray(execution_id),
-	    vgi::MakeSingleBinaryArray(batch_bytes),
-	    vgi::MakeSingleBinaryArrayOrNull(attach_opaque_data),
-	    vgi::MakeSingleStringArrayOrNull(schema_name),
-	}));
+	auto request =
+	    arrow::RecordBatch::Make(vgi::generated::AggregateUpdateRequestSchema(), 1,
+	                             {
+	                                 vgi::MakeSingleStringArray(function_name),
+	                                 vgi::MakeSingleBinaryArray(execution_id),
+	                                 vgi::MakeSingleBinaryArray(batch_bytes),
+	                                 vgi::MakeSingleBinaryArrayOrNull(attach_opaque_data),
+	                                 vgi::BuildOptionalStringListScalar(vgi::OptionalSingleSchemaPath(schema_name)),
+	                             });
+	return vgi::generated::BuildAggregateUpdateParams(vgi::SerializeToIpcBytes(request));
 }
 
 std::shared_ptr<arrow::RecordBatch> BuildAggregateCombineRequest(
@@ -134,21 +123,16 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateCombineRequest(
 
 	auto batch_bytes = vgi::SerializeToIpcBytes(merge_batch);
 
-	auto schema = arrow::schema({
-	    arrow::field("function_name", arrow::utf8(), false),
-	    arrow::field("execution_id", arrow::binary(), false),
-	    arrow::field("merge_batch", arrow::binary(), false),
-	    arrow::field("attach_opaque_data", arrow::binary(), true),
-	    arrow::field("schema_name", arrow::utf8(), true),
-	});
-
-	return vgi::WrapAsRpcParams(arrow::RecordBatch::Make(schema, 1, {
-	    vgi::MakeSingleStringArray(function_name),
-	    vgi::MakeSingleBinaryArray(execution_id),
-	    vgi::MakeSingleBinaryArray(batch_bytes),
-	    vgi::MakeSingleBinaryArrayOrNull(attach_opaque_data),
-	    vgi::MakeSingleStringArrayOrNull(schema_name),
-	}));
+	auto request =
+	    arrow::RecordBatch::Make(vgi::generated::AggregateCombineRequestSchema(), 1,
+	                             {
+	                                 vgi::MakeSingleStringArray(function_name),
+	                                 vgi::MakeSingleBinaryArray(execution_id),
+	                                 vgi::MakeSingleBinaryArray(batch_bytes),
+	                                 vgi::MakeSingleBinaryArrayOrNull(attach_opaque_data),
+	                                 vgi::BuildOptionalStringListScalar(vgi::OptionalSingleSchemaPath(schema_name)),
+	                             });
+	return vgi::generated::BuildAggregateCombineParams(vgi::SerializeToIpcBytes(request));
 }
 
 std::shared_ptr<arrow::RecordBatch> BuildAggregateFinalizeRequest(
@@ -164,23 +148,17 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateFinalizeRequest(
 	auto &os_buf = os_buf_result.ValueUnsafe();
 	auto schema_bytes = std::vector<uint8_t>(os_buf->data(), os_buf->data() + os_buf->size());
 
-	auto schema = arrow::schema({
-	    arrow::field("function_name", arrow::utf8(), false),
-	    arrow::field("execution_id", arrow::binary(), false),
-	    arrow::field("group_ids_batch", arrow::binary(), false),
-	    arrow::field("output_schema", arrow::binary(), false),
-	    arrow::field("attach_opaque_data", arrow::binary(), true),
-	    arrow::field("schema_name", arrow::utf8(), true),
-	});
-
-	return vgi::WrapAsRpcParams(arrow::RecordBatch::Make(schema, 1, {
-	    vgi::MakeSingleStringArray(function_name),
-	    vgi::MakeSingleBinaryArray(execution_id),
-	    vgi::MakeSingleBinaryArray(gid_bytes),
-	    vgi::MakeSingleBinaryArray(schema_bytes),
-	    vgi::MakeSingleBinaryArrayOrNull(attach_opaque_data),
-	    vgi::MakeSingleStringArrayOrNull(schema_name),
-	}));
+	auto request =
+	    arrow::RecordBatch::Make(vgi::generated::AggregateFinalizeRequestSchema(), 1,
+	                             {
+	                                 vgi::MakeSingleStringArray(function_name),
+	                                 vgi::MakeSingleBinaryArray(execution_id),
+	                                 vgi::MakeSingleBinaryArray(gid_bytes),
+	                                 vgi::MakeSingleBinaryArray(schema_bytes),
+	                                 vgi::MakeSingleBinaryArrayOrNull(attach_opaque_data),
+	                                 vgi::BuildOptionalStringListScalar(vgi::OptionalSingleSchemaPath(schema_name)),
+	                             });
+	return vgi::generated::BuildAggregateFinalizeParams(vgi::SerializeToIpcBytes(request));
 }
 
 std::shared_ptr<arrow::RecordBatch> BuildAggregateDestructorRequest(
@@ -191,21 +169,16 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateDestructorRequest(
 
 	auto gid_bytes = vgi::SerializeToIpcBytes(group_ids_batch);
 
-	auto schema = arrow::schema({
-	    arrow::field("function_name", arrow::utf8(), false),
-	    arrow::field("execution_id", arrow::binary(), false),
-	    arrow::field("group_ids_batch", arrow::binary(), false),
-	    arrow::field("attach_opaque_data", arrow::binary(), true),
-	    arrow::field("schema_name", arrow::utf8(), true),
-	});
-
-	return vgi::WrapAsRpcParams(arrow::RecordBatch::Make(schema, 1, {
-	    vgi::MakeSingleStringArray(function_name),
-	    vgi::MakeSingleBinaryArray(execution_id),
-	    vgi::MakeSingleBinaryArray(gid_bytes),
-	    vgi::MakeSingleBinaryArrayOrNull(attach_opaque_data),
-	    vgi::MakeSingleStringArrayOrNull(schema_name),
-	}));
+	auto request =
+	    arrow::RecordBatch::Make(vgi::generated::AggregateDestructorRequestSchema(), 1,
+	                             {
+	                                 vgi::MakeSingleStringArray(function_name),
+	                                 vgi::MakeSingleBinaryArray(execution_id),
+	                                 vgi::MakeSingleBinaryArray(gid_bytes),
+	                                 vgi::MakeSingleBinaryArrayOrNull(attach_opaque_data),
+	                                 vgi::BuildOptionalStringListScalar(vgi::OptionalSingleSchemaPath(schema_name)),
+	                             });
+	return vgi::generated::BuildAggregateDestructorParams(vgi::SerializeToIpcBytes(request));
 }
 
 } // anonymous namespace
@@ -217,12 +190,6 @@ namespace vgi {
 // ============================================================================
 // Moved out of the anonymous namespace so aggregate_window_impl.cpp can share
 // the same connection-pool / subprocess / HTTP transport plumbing.
-
-std::shared_ptr<arrow::RecordBatch> WrapAsRpcParams(const std::shared_ptr<arrow::RecordBatch> &request_batch) {
-	auto request_bytes = SerializeToIpcBytes(request_batch);
-	auto schema = arrow::schema({arrow::field("request", arrow::binary(), false)});
-	return arrow::RecordBatch::Make(schema, 1, {MakeSingleBinaryArray(request_bytes)});
-}
 
 AggregateRpcResult InvokeAggregateRpc(ClientContext &context, const VgiAggregateBindData &bind_data,
                                       const std::string &method_name,

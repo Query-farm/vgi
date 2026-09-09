@@ -202,6 +202,51 @@ std::shared_ptr<arrow::Array> BuildStringListScalar(const std::vector<std::strin
 	return FinishArray(list_builder, "string_list");
 }
 
+std::shared_ptr<arrow::Array> BuildOptionalStringListScalar(const std::optional<std::vector<std::string>> &values) {
+	auto value_builder = std::make_shared<arrow::StringBuilder>();
+	arrow::ListBuilder list_builder(arrow::default_memory_pool(), value_builder);
+	if (!values.has_value()) {
+		CheckStatus(list_builder.AppendNull(), "append null string list");
+	} else {
+		CheckStatus(list_builder.Append(), "start optional string list");
+		for (const auto &value : *values) {
+			CheckStatus(value_builder->Append(value), "append optional string item");
+		}
+	}
+	return FinishArray(list_builder, "optional_string_list");
+}
+
+std::vector<std::string> SingleSchemaPath(const std::string &schema_name) {
+	if (schema_name.empty()) {
+		throw IOException("VGI schema name cannot be empty");
+	}
+	return {schema_name};
+}
+
+std::optional<std::vector<std::string>> OptionalSingleSchemaPath(const std::string &schema_name) {
+	if (schema_name.empty()) {
+		return std::nullopt;
+	}
+	return SingleSchemaPath(schema_name);
+}
+
+std::string SchemaNameFromPath(const std::vector<std::string> &schema_path, const std::string &field_name) {
+	if (schema_path.size() != 1 || schema_path[0].empty()) {
+		throw IOException(
+		    "DuckDB 1.5 VGI requires %s to contain exactly one non-empty schema component; got depth %llu", field_name,
+		    static_cast<unsigned long long>(schema_path.size()));
+	}
+	return schema_path[0];
+}
+
+std::string OptionalSchemaNameFromPath(const std::optional<std::vector<std::string>> &schema_path,
+                                       const std::string &field_name) {
+	if (!schema_path.has_value()) {
+		return {};
+	}
+	return SchemaNameFromPath(*schema_path, field_name);
+}
+
 std::shared_ptr<arrow::Array> BuildBinaryListScalar(const std::vector<std::vector<uint8_t>> &values) {
 	auto value_builder = std::make_shared<arrow::BinaryBuilder>();
 	arrow::ListBuilder list_builder(arrow::default_memory_pool(), value_builder);
@@ -430,13 +475,13 @@ std::vector<uint8_t> SerializeForeignKeyToIpcBytes(const std::vector<std::string
                                                     const std::vector<std::string> &pk_columns,
                                                     const std::string &referenced_table,
                                                     const std::string &referenced_schema) {
-	// Build a single-row batch matching the Python FK format:
-	// fk_columns: list<utf8>, pk_columns: list<utf8>, referenced_table: utf8, referenced_schema: utf8
+	// Build a single-row batch matching the Python ForeignKeyDef format. This
+	// nested dataclass is not currently emitted as a standalone generated schema.
 	auto fk_schema = arrow::schema({
 	    arrow::field("fk_columns", arrow::list(arrow::utf8())),
 	    arrow::field("pk_columns", arrow::list(arrow::utf8())),
 	    arrow::field("referenced_table", arrow::utf8()),
-	    arrow::field("referenced_schema", arrow::utf8()),
+	    arrow::field("referenced_schema_path", arrow::list(arrow::utf8())),
 	});
 
 	// Build fk_columns array
@@ -467,14 +512,10 @@ std::vector<uint8_t> SerializeForeignKeyToIpcBytes(const std::vector<std::string
 	auto ref_table_result = ref_table_builder.Finish();
 	CheckStatus(ref_table_result.status(), "ref table finish");
 
-	arrow::StringBuilder ref_schema_builder;
-	CheckStatus(ref_schema_builder.Append(referenced_schema), "ref schema");
-	auto ref_schema_result = ref_schema_builder.Finish();
-	CheckStatus(ref_schema_result.status(), "ref schema finish");
-
 	auto batch = arrow::RecordBatch::Make(fk_schema, 1,
-	    {fk_arr_result.ValueUnsafe(), pk_arr_result.ValueUnsafe(),
-	     ref_table_result.ValueUnsafe(), ref_schema_result.ValueUnsafe()});
+	                                      {fk_arr_result.ValueUnsafe(), pk_arr_result.ValueUnsafe(),
+	                                       ref_table_result.ValueUnsafe(),
+	                                       BuildStringListScalar(SingleSchemaPath(referenced_schema))});
 	return SerializeToIpcBytes(batch);
 }
 
@@ -539,22 +580,6 @@ BuildBindRequest(const std::string &function_name, const std::vector<uint8_t> &a
 	// FunctionType enum: SCALAR, TABLE, AGGREGATE
 	static const std::vector<std::string> function_type_values = {"SCALAR", "TABLE", "AGGREGATE"};
 
-	std::vector<std::shared_ptr<arrow::Field>> fields = {
-	    arrow::field("function_name", arrow::utf8(), false),
-	    arrow::field("arguments", arrow::binary(), false),
-	    arrow::field("function_type", arrow::dictionary(arrow::int16(), arrow::utf8()), false),
-	    arrow::field("input_schema", arrow::binary(), true),
-	    arrow::field("settings", arrow::binary(), true),
-	    arrow::field("secrets", arrow::binary(), true),
-	    arrow::field("attach_opaque_data", arrow::binary(), true),
-	    arrow::field("transaction_opaque_data", arrow::binary(), true),
-	    arrow::field("resolved_secrets_provided", arrow::boolean(), false),
-	    // Time travel (AT clause); empty string serialises as null. Matches the
-	    // Python BindRequest dataclass fields (matched by name, not position).
-	    arrow::field("at_unit", arrow::utf8(), true),
-	    arrow::field("at_value", arrow::utf8(), true),
-	};
-
 	std::vector<std::shared_ptr<arrow::Array>> arrays;
 	arrays.push_back(BuildStringScalar(function_name));
 	arrays.push_back(BuildBinaryScalar(arguments_ipc_bytes));
@@ -594,7 +619,6 @@ BuildBindRequest(const std::string &function_name, const std::vector<uint8_t> &a
 	    arrow::field("file_path", arrow::utf8(), false),
 	    arrow::field("expected_schema", arrow::binary(), false),
 	});
-	fields.push_back(arrow::field("copy_from", copy_from_type, true));
 	if (copy_from) {
 		std::vector<std::shared_ptr<arrow::Array>> children = {
 		    BuildStringScalar(copy_from->format),
@@ -614,7 +638,6 @@ BuildBindRequest(const std::string &function_name, const std::vector<uint8_t> &a
 	    arrow::field("format", arrow::utf8(), false),
 	    arrow::field("file_path", arrow::utf8(), false),
 	});
-	fields.push_back(arrow::field("copy_to", copy_to_type, true));
 	if (copy_to) {
 		std::vector<std::shared_ptr<arrow::Array>> children = {
 		    BuildStringScalar(copy_to->format),
@@ -632,10 +655,9 @@ BuildBindRequest(const std::string &function_name, const std::vector<uint8_t> &a
 	// Owning catalog schema; disambiguates a function name registered in more
 	// than one schema. Empty string serialises as null, which tells the worker
 	// to fall back to a cross-schema lookup by name. Last, per the protocol.
-	fields.push_back(arrow::field("schema_name", arrow::utf8(), true));
-	arrays.push_back(BuildNullableStringScalar(schema_name));
+	arrays.push_back(BuildOptionalStringListScalar(OptionalSingleSchemaPath(schema_name)));
 
-	return arrow::RecordBatch::Make(arrow::schema(fields), 1, arrays);
+	return arrow::RecordBatch::Make(generated::BindRequestSchema(), 1, arrays);
 }
 
 // ============================================================================
@@ -786,28 +808,6 @@ BuildInitRequest(const std::vector<uint8_t> &bind_call_bytes, const std::vector<
 	// schemas that differ in one row. `row_limit` is exactly that case: DuckDB
 	// has no limit to put in it (TableFunctionInitInput carries none), so it
 	// ships as an explicit null rather than being left out.
-	auto schema = arrow::schema({
-	    arrow::field("bind_call", arrow::binary(), false),
-	    arrow::field("output_schema", arrow::binary(), false),
-	    arrow::field("bind_opaque_data", arrow::binary(), true),
-	    arrow::field("projection_ids", arrow::list(arrow::int64()), true),
-	    arrow::field("pushdown_filters", arrow::large_binary(), true),
-	    arrow::field("join_keys", arrow::list(arrow::large_binary()), true),
-	    arrow::field("split_tokens", arrow::list(arrow::large_binary()), true),
-	    arrow::field("row_limit", arrow::int64(), true),
-	    arrow::field("phase", phase_type, true),
-	    arrow::field("finalize_state_id", arrow::binary(), true),
-	    arrow::field("execution_id", arrow::binary(), true),
-	    arrow::field("init_opaque_data", arrow::binary(), true),
-	    arrow::field("substream_id", arrow::binary(), true),
-	    arrow::field("order_by_column_name", arrow::utf8(), true),
-	    arrow::field("order_by_direction", order_direction_type, true),
-	    arrow::field("order_by_null_order", order_null_order_type, true),
-	    arrow::field("order_by_limit", arrow::int64(), true),
-	    arrow::field("tablesample_percentage", arrow::float64(), true),
-	    arrow::field("tablesample_seed", arrow::int64(), true),
-	});
-
 	std::vector<std::shared_ptr<arrow::Array>> arrays;
 
 	// bind_call: binary (required)
@@ -983,7 +983,7 @@ BuildInitRequest(const std::vector<uint8_t> &bind_call_bytes, const std::vector<
 		arrays.push_back(FinishArray(builder, "tablesample_seed"));
 	}
 
-	return arrow::RecordBatch::Make(schema, 1, arrays);
+	return arrow::RecordBatch::Make(generated::InitRequestSchema(), 1, arrays);
 }
 
 // ============================================================================
@@ -1111,14 +1111,10 @@ std::vector<std::string> UnwrapStringResponseItems(const std::shared_ptr<arrow::
 
 std::shared_ptr<arrow::RecordBatch> BuildTableFunctionCardinalityRequest(const std::vector<uint8_t> &bind_call_bytes,
                                                                          const std::vector<uint8_t> &bind_opaque_data) {
-	auto schema = arrow::schema({
-	    arrow::field("bind_call", arrow::binary(), false),
-	    arrow::field("bind_opaque_data", arrow::binary(), true),
-	});
 	std::vector<std::shared_ptr<arrow::Array>> arrays;
 	arrays.push_back(BuildBinaryScalar(bind_call_bytes));
 	arrays.push_back(BuildBinaryScalar(bind_opaque_data));
-	return arrow::RecordBatch::Make(schema, 1, arrays);
+	return arrow::RecordBatch::Make(generated::TableFunctionCardinalityRequestSchema(), 1, arrays);
 }
 
 namespace {
@@ -1172,29 +1168,6 @@ BuildTableFunctionPlanRequest(const std::vector<uint8_t> &bind_call_bytes,
 	// filters only, so no refinement is ever coming and a worker must not hold
 	// splits back waiting for one.
 	auto dict_type = arrow::dictionary(arrow::int16(), arrow::utf8());
-	auto schema = arrow::schema({
-	    arrow::field("bind_call", arrow::binary(), false),
-	    arrow::field("bind_opaque_data", arrow::binary(), true),
-	    arrow::field("projection_ids", arrow::list(arrow::int64()), true),
-	    arrow::field("pushdown_filters", arrow::large_binary(), true),
-	    arrow::field("join_keys", arrow::list(arrow::large_binary()), true),
-	    arrow::field("row_limit", arrow::int64(), true),
-	    arrow::field("target_split_bytes", arrow::int64(), true),
-	    arrow::field("min_splits", arrow::int64(), true),
-	    arrow::field("max_splits_per_response", arrow::int64(), true),
-	    arrow::field("cursor", arrow::binary(), true),
-	    arrow::field("refined_filters", arrow::large_binary(), true),
-	    arrow::field("filters_complete", arrow::boolean(), false),
-	    arrow::field("start_position", arrow::binary(), true),
-	    arrow::field("end_position", arrow::binary(), true),
-	    arrow::field("order_by_column_name", arrow::utf8(), true),
-	    arrow::field("order_by_direction", dict_type, true),
-	    arrow::field("order_by_null_order", dict_type, true),
-	    arrow::field("order_by_limit", arrow::int64(), true),
-	    arrow::field("tablesample_percentage", arrow::float64(), true),
-	    arrow::field("tablesample_seed", arrow::int64(), true),
-	});
-
 	std::vector<std::shared_ptr<arrow::Array>> arrays;
 	arrays.push_back(BuildBinaryScalar(bind_call_bytes));
 	arrays.push_back(BuildBinaryScalar(bind_opaque_data));
@@ -1287,19 +1260,15 @@ BuildTableFunctionPlanRequest(const std::vector<uint8_t> &bind_call_bytes,
 	}
 	arrays.push_back(NullInt64Scalar("tablesample_seed"));
 
-	return arrow::RecordBatch::Make(schema, 1, arrays);
+	return arrow::RecordBatch::Make(generated::TableFunctionPlanRequestSchema(), 1, arrays);
 }
 
 std::shared_ptr<arrow::RecordBatch> BuildTableFunctionStatisticsRequest(const std::vector<uint8_t> &bind_call_bytes,
                                                                         const std::vector<uint8_t> &bind_opaque_data) {
-	auto schema = arrow::schema({
-	    arrow::field("bind_call", arrow::binary(), false),
-	    arrow::field("bind_opaque_data", arrow::binary(), true),
-	});
 	std::vector<std::shared_ptr<arrow::Array>> arrays;
 	arrays.push_back(BuildBinaryScalar(bind_call_bytes));
 	arrays.push_back(BuildBinaryScalar(bind_opaque_data));
-	return arrow::RecordBatch::Make(schema, 1, arrays);
+	return arrow::RecordBatch::Make(generated::TableFunctionStatisticsRequestSchema(), 1, arrays);
 }
 
 // ============================================================================
@@ -1310,16 +1279,11 @@ std::shared_ptr<arrow::RecordBatch>
 BuildTableFunctionDynamicToStringRequest(const std::vector<uint8_t> &bind_call_bytes,
                                          const std::vector<uint8_t> &bind_opaque_data,
                                          const std::vector<uint8_t> &global_execution_id) {
-	auto schema = arrow::schema({
-	    arrow::field("bind_call", arrow::binary(), false),
-	    arrow::field("bind_opaque_data", arrow::binary(), true),
-	    arrow::field("global_execution_id", arrow::binary(), false),
-	});
 	std::vector<std::shared_ptr<arrow::Array>> arrays;
 	arrays.push_back(BuildBinaryScalar(bind_call_bytes));
 	arrays.push_back(BuildBinaryScalar(bind_opaque_data));
 	arrays.push_back(BuildBinaryScalarRequired(global_execution_id));
-	return arrow::RecordBatch::Make(schema, 1, arrays);
+	return arrow::RecordBatch::Make(generated::TableFunctionDynamicToStringRequestSchema(), 1, arrays);
 }
 
 InsertionOrderPreservingMap<std::string>
@@ -1447,46 +1411,28 @@ std::shared_ptr<arrow::RecordBatch> BuildCatalogAttachRequest(
 	// `implementation_version` as nullable. Empty caller-supplied strings
 	// must be encoded as null — the worker treats None as "unconstrained",
 	// while "" is a concrete (and invalid) version string.
-	auto request_schema = arrow::schema({
-	    arrow::field("name", arrow::utf8(), false),
-	    arrow::field("options", arrow::binary(), true),
-	    arrow::field("data_version_spec", arrow::utf8(), true),
-	    arrow::field("implementation_version", arrow::utf8(), true),
-	    arrow::field("client_capabilities", arrow::binary(), true),
-	});
 	std::vector<std::shared_ptr<arrow::Array>> request_arrays;
 	request_arrays.push_back(BuildStringScalar(name));
 	request_arrays.push_back(BuildBinaryScalar(options_ipc_bytes));
 	request_arrays.push_back(BuildNullableStringScalar(data_version_spec));
 	request_arrays.push_back(BuildNullableStringScalar(implementation_version));
 	request_arrays.push_back(BuildBinaryScalar(BuildClientCapabilitiesBytes()));
-	return arrow::RecordBatch::Make(request_schema, 1, request_arrays);
+	return arrow::RecordBatch::Make(generated::CatalogAttachRequestSchema(), 1, request_arrays);
 }
 
 std::shared_ptr<arrow::RecordBatch> BuildTableCreateRequest(
-    const std::vector<uint8_t> &attach_opaque_data, const std::string &schema_name, const std::string &name,
-    const std::shared_ptr<arrow::Schema> &columns_schema, const std::string &on_conflict,
+    const std::vector<uint8_t> &attach_opaque_data, const std::vector<std::string> &schema_path,
+    const std::string &name, const std::shared_ptr<arrow::Schema> &columns_schema, const std::string &on_conflict,
     const std::vector<int> &not_null_constraints, const std::vector<std::vector<int>> &unique_constraints,
     const std::vector<std::string> &check_constraints, const std::vector<std::vector<int>> &primary_key_constraints,
-    const std::vector<std::vector<uint8_t>> &foreign_key_constraints, const std::vector<uint8_t> &transaction_opaque_data) {
+    const std::vector<std::vector<uint8_t>> &foreign_key_constraints,
+    const std::vector<uint8_t> &transaction_opaque_data) {
 	static const std::vector<std::string> on_conflict_values = {"ERROR", "IGNORE", "REPLACE"};
 
 	// Serialize the columns schema to IPC bytes
 	auto columns_bytes = SerializeSchemaToIpcBytes(columns_schema);
 
-	auto batch_schema = arrow::schema({
-	    arrow::field("attach_opaque_data", arrow::binary(), false),
-	    arrow::field("schema_name", arrow::utf8(), false),
-	    arrow::field("name", arrow::utf8(), false),
-	    arrow::field("columns", arrow::binary(), false),
-	    arrow::field("on_conflict", arrow::dictionary(arrow::int16(), arrow::utf8()), false),
-	    arrow::field("not_null_constraints", arrow::list(arrow::int32()), false),
-	    arrow::field("unique_constraints", arrow::list(arrow::list(arrow::int32())), false),
-	    arrow::field("check_constraints", arrow::list(arrow::utf8()), false),
-	    arrow::field("primary_key_constraints", arrow::list(arrow::list(arrow::int32())), false),
-	    arrow::field("foreign_key_constraints", arrow::list(arrow::binary()), false),
-	    arrow::field("transaction_opaque_data", arrow::binary(), true),
-	});
+	auto batch_schema = generated::TableCreateRequestSchema();
 
 	std::vector<std::shared_ptr<arrow::Array>> arrays;
 
@@ -1497,8 +1443,8 @@ std::shared_ptr<arrow::RecordBatch> BuildTableCreateRequest(
 		arrays.push_back(FinishArray(builder, "attach_opaque_data"));
 	}
 
-	// schema_name: utf8
-	arrays.push_back(BuildStringScalar(schema_name));
+	// schema_path: list<utf8>
+	arrays.push_back(BuildStringListScalar(schema_path));
 
 	// name: utf8
 	arrays.push_back(BuildStringScalar(name));

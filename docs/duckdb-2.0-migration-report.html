@@ -1,0 +1,476 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VGI → DuckDB 2.0 migration report</title>
+  <style>
+    :root {
+      --ink: #17211d;
+      --muted: #64716b;
+      --paper: #f6f3eb;
+      --card: #fffdfa;
+      --line: #d9d7ce;
+      --green: #0f6b52;
+      --green-soft: #dceee7;
+      --amber: #9a5b08;
+      --amber-soft: #fff0ce;
+      --red: #9d342b;
+      --red-soft: #fbe3df;
+      --blue: #365b88;
+      --blue-soft: #e4edf8;
+      --shadow: 0 18px 50px rgba(29, 43, 37, .09);
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 88% 0%, rgba(15,107,82,.10), transparent 28rem),
+        linear-gradient(180deg, #f9f7f0 0, var(--paper) 38rem);
+      font: 15.5px/1.62 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    a { color: var(--green); text-decoration-thickness: 1px; text-underline-offset: 3px; }
+    a:hover { color: #084b39; }
+    code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .91em; }
+    code { background: #eeece5; border-radius: 5px; padding: .13em .34em; }
+    .shell { max-width: 1400px; margin: 0 auto; display: grid; grid-template-columns: 245px minmax(0, 1fr); gap: 34px; padding: 32px; }
+    nav { position: sticky; top: 24px; align-self: start; max-height: calc(100vh - 48px); overflow: auto; }
+    .brand { font: 750 20px/1.1 Georgia, serif; letter-spacing: -.02em; margin-bottom: 8px; }
+    .brand small { display: block; margin-top: 9px; color: var(--muted); font: 500 11px/1.4 ui-monospace, monospace; letter-spacing: .04em; text-transform: uppercase; }
+    nav ol { list-style: none; margin: 24px 0; padding: 0; border-left: 1px solid var(--line); }
+    nav a { display: block; padding: 7px 13px; color: #48544e; text-decoration: none; font-size: 13px; }
+    nav a:hover { border-left: 2px solid var(--green); margin-left: -1px; color: var(--ink); }
+    .nav-note { font-size: 12px; color: var(--muted); border-top: 1px solid var(--line); padding-top: 15px; }
+    main { min-width: 0; }
+    header.hero { padding: 54px 56px 46px; border-radius: 20px; color: #f4fbf8; background: #123f34; box-shadow: var(--shadow); overflow: hidden; position: relative; }
+    header.hero:after { content: "2.0"; position: absolute; right: -16px; bottom: -78px; font: 800 190px/1 Georgia, serif; color: rgba(255,255,255,.06); }
+    .eyebrow { color: #a9d8c7; font: 700 12px/1.2 ui-monospace, monospace; letter-spacing: .11em; text-transform: uppercase; }
+    h1 { margin: 14px 0 16px; max-width: 780px; font: 700 clamp(39px, 6vw, 73px)/.98 Georgia, serif; letter-spacing: -.045em; }
+    .lede { max-width: 800px; margin: 0; color: #dcebe5; font-size: 19px; }
+    .verdict { max-width: 800px; margin-top: 25px; padding: 18px 20px; border-left: 4px solid #62c4a1; background: rgba(255,255,255,.07); border-radius: 0 9px 9px 0; }
+    .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin: 22px 0 0; }
+    .stat { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 17px; box-shadow: 0 8px 25px rgba(29,43,37,.04); }
+    .stat strong { display: block; font: 700 29px/1 Georgia, serif; color: var(--green); }
+    .stat span { color: var(--muted); font-size: 12px; }
+    section { scroll-margin-top: 24px; margin-top: 48px; }
+    h2 { margin: 0 0 16px; font: 700 34px/1.12 Georgia, serif; letter-spacing: -.025em; }
+    h3 { margin: 0 0 8px; font: 700 19px/1.25 Georgia, serif; }
+    h4 { margin: 18px 0 5px; font-size: 14px; }
+    p { margin: 8px 0 14px; }
+    .section-intro { max-width: 850px; color: var(--muted); font-size: 16px; }
+    .callout { border: 1px solid #bfd9cf; background: var(--green-soft); padding: 19px 22px; border-radius: 11px; margin: 18px 0; }
+    .callout.warn { border-color: #e8c87f; background: var(--amber-soft); }
+    .callout.danger { border-color: #e6b6ae; background: var(--red-soft); }
+    .grid { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 16px; }
+    .card { background: var(--card); border: 1px solid var(--line); border-radius: 13px; padding: 21px; box-shadow: 0 7px 24px rgba(29,43,37,.035); }
+    .card p:last-child, .card ul:last-child { margin-bottom: 0; }
+    .tag { display: inline-block; padding: 4px 8px; margin-bottom: 10px; border-radius: 100px; font: 700 10px/1 ui-monospace, monospace; letter-spacing: .06em; text-transform: uppercase; }
+    .tag.blocker { background: var(--red-soft); color: var(--red); }
+    .tag.high { background: var(--amber-soft); color: var(--amber); }
+    .tag.medium { background: var(--blue-soft); color: var(--blue); }
+    .tag.confirmed { background: var(--green-soft); color: var(--green); }
+    ul, ol { padding-left: 21px; }
+    li { margin: 5px 0; }
+    table { width: 100%; border-collapse: separate; border-spacing: 0; background: var(--card); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; font-size: 13.5px; }
+    th { text-align: left; padding: 12px 14px; background: #eae7de; font-size: 11px; letter-spacing: .06em; text-transform: uppercase; }
+    td { vertical-align: top; padding: 12px 14px; border-top: 1px solid var(--line); }
+    tr:first-child td { border-top: 0; }
+    .priority { white-space: nowrap; font-weight: 700; }
+    .p0 { color: var(--red); } .p1 { color: var(--amber); } .p2 { color: var(--blue); }
+    .flow { display: grid; grid-template-columns: 1fr 42px 1fr 42px 1fr; align-items: stretch; margin: 22px 0; }
+    .flow .node { border: 1px solid var(--line); border-radius: 11px; background: var(--card); padding: 16px; }
+    .flow .arrow { display: grid; place-items: center; color: var(--green); font-size: 24px; }
+    .node b { display: block; margin-bottom: 6px; }
+    .codeblock { overflow: auto; padding: 17px 19px; border-radius: 10px; color: #dff3eb; background: #17372f; font: 12.5px/1.6 ui-monospace, monospace; white-space: pre; }
+    .roadmap { counter-reset: phase; display: grid; gap: 13px; }
+    .phase { position: relative; padding: 19px 20px 19px 64px; background: var(--card); border: 1px solid var(--line); border-radius: 12px; }
+    .phase:before { counter-increment: phase; content: counter(phase); position: absolute; left: 18px; top: 19px; width: 29px; height: 29px; display: grid; place-items: center; border-radius: 50%; color: white; background: var(--green); font-weight: 750; }
+    .phase h3 { margin-bottom: 5px; }
+    .checklist { columns: 2; column-gap: 35px; }
+    .checklist li { break-inside: avoid; margin-bottom: 8px; }
+    details { background: var(--card); border: 1px solid var(--line); border-radius: 10px; margin: 10px 0; padding: 12px 16px; }
+    summary { cursor: pointer; font-weight: 700; }
+    .tiny { color: var(--muted); font-size: 12px; }
+    footer { border-top: 1px solid var(--line); margin-top: 52px; padding: 24px 0 54px; color: var(--muted); font-size: 12px; }
+    @media (max-width: 900px) {
+      .shell { display: block; padding: 17px; }
+      nav { position: static; max-height: none; margin-bottom: 24px; }
+      nav ol { columns: 2; }
+      header.hero { padding: 38px 28px; }
+      .stats, .grid { grid-template-columns: 1fr 1fr; }
+      .flow { grid-template-columns: 1fr; gap: 7px; }
+      .flow .arrow { transform: rotate(90deg); }
+    }
+    @media (max-width: 570px) {
+      .stats, .grid { grid-template-columns: 1fr; }
+      .checklist { columns: 1; }
+      table { display: block; overflow-x: auto; }
+      nav ol { columns: 1; }
+    }
+    @media print {
+      body { background: white; font-size: 11pt; }
+      .shell { display: block; max-width: none; padding: 0; }
+      nav { display: none; }
+      header.hero { box-shadow: none; print-color-adjust: exact; }
+      section { break-inside: avoid; }
+    }
+  </style>
+</head>
+<body>
+<div class="shell">
+  <nav aria-label="Report navigation">
+    <div class="brand">VGI migration brief<small>DuckDB 1.5 → 2.0<br>analysis snapshot · 2026-09-09</small></div>
+    <ol>
+      <li><a href="#verdict">1. Verdict</a></li>
+      <li><a href="#evidence">2. Evidence &amp; scope</a></li>
+      <li><a href="#schemas">3. Nested schemas</a></li>
+      <li><a href="#matrix">4. Migration matrix</a></li>
+      <li><a href="#apis">5. API adaptations</a></li>
+      <li><a href="#runtime">6. Runtime risks</a></li>
+      <li><a href="#build">7. Build &amp; packaging</a></li>
+      <li><a href="#roadmap">8. Recommended sequence</a></li>
+      <li><a href="#tests">9. Verification plan</a></li>
+      <li><a href="#commits">10. Commit landmarks</a></li>
+    </ol>
+    <div class="nav-note">This is an analysis report. It does not modify VGI source code or dependency pins.</div>
+  </nav>
+
+  <main>
+    <header class="hero" id="verdict">
+      <div class="eyebrow">Engineering assessment</div>
+      <h1>VGI is not a drop-in DuckDB 2.0 rebuild.</h1>
+      <p class="lede">The extension reaches deeply into catalog, planner, expression, filter, function, physical-operator and secret APIs. The port is tractable, but it is a real compatibility project—and nested schemas require a protocol and data-model decision, not only C++ fixes.</p>
+      <div class="verdict"><strong>Bottom line:</strong> your schema suspicion is correct. DuckDB 2.0 represents names as paths and permits schemas nested several levels deep. VGI currently collapses schema identity to one <code>schema_name</code>, so it cannot faithfully implement the new catalog contract without widening that model.</div>
+    </header>
+
+    <div class="stats" aria-label="Analysis summary">
+      <div class="stat"><strong>42 / 88</strong><span>unique VGI translation units failed syntax checks</span></div>
+      <div class="stat"><strong>141 / 179</strong><span>directly included DuckDB headers changed</span></div>
+      <div class="stat"><strong>12,990</strong><span>commits in the local v1.5.5 → 2.0 ancestry range</span></div>
+      <div class="stat"><strong>P0</strong><span>catalog/name/filter APIs are the critical path</span></div>
+    </div>
+
+    <section id="evidence">
+      <h2>Evidence and scope</h2>
+      <p class="section-intro">The assessment compares VGI’s current source against the local DuckDB 2.0 development branch and uses a compile-only probe to distinguish theoretical churn from APIs VGI actually touches.</p>
+      <div class="grid">
+        <div class="card">
+          <span class="tag confirmed">VGI baseline</span>
+          <h3>Haybarn-flavored DuckDB 1.5.5</h3>
+          <p>VGI’s DuckDB submodule is <code>105edd31</code>, tagged <code>haybarn-v1.5.5-rc1</code>. VGI itself was inspected at <code>588bb2fd</code>. The native extension configuration hard-pins a matching Haybarn <code>httpfs</code>.</p>
+        </div>
+        <div class="card">
+          <span class="tag medium">2.0 snapshot</span>
+          <h3>Development branch, not a frozen ABI</h3>
+          <p>The target was local branch <code>v2.0-cyanoptera</code> at <code>a0315f712c</code> (2026-09-09). This branch is still moving; re-run the probe at the revision ultimately chosen for release.</p>
+        </div>
+        <div class="card">
+          <span class="tag confirmed">Probe</span>
+          <h3>Header-substitution syntax check</h3>
+          <p>VGI’s existing release compile commands were replayed with include paths pointed at DuckDB 2.0, using <code>-fsyntax-only</code>. Of 88 unique VGI source units, 46 passed and 42 failed.</p>
+        </div>
+        <div class="card">
+          <span class="tag high">Limit</span>
+          <h3>Useful lower bound, not a completed build</h3>
+          <p>The probe did not compile DuckDB, link VGI, load the extension, run SQL tests, exercise WASM, or include future Haybarn 2.0 patches. Error limits and shared headers also mask downstream failures.</p>
+        </div>
+      </div>
+      <div class="callout warn"><strong>Interpret the counts carefully.</strong> DuckDB’s merge-heavy development history makes the raw commit count noisy. More useful signals are the 42 failing VGI units, the concrete diagnostics, and the focused API commits cited below. All 179 DuckDB include paths used by VGI still exist; the problem is semantic/API churn, not wholesale header relocation.</div>
+    </section>
+
+    <section id="schemas">
+      <h2>Nested schemas: the architectural change</h2>
+      <p class="section-intro">DuckDB 2.0 stops treating an object as the fixed tuple <code>(catalog, schema, name)</code>. A <code>QualifiedName</code> holds a path whose final component is the object and whose preceding components can contain a catalog plus an arbitrarily deep schema chain.</p>
+      <div class="codeblock">-- DuckDB 2.0 examples from its nested-schema tests
+CREATE SCHEMA s1.child;
+CREATE SCHEMA s1.child.grandchild;
+CREATE TABLE s1.child.grandchild.events(id BIGINT);
+
+QualifiedName path: [catalog, s1, child, grandchild, events]
+                                           └ object name</div>
+      <div class="flow" aria-label="Recommended schema representation">
+        <div class="node"><b>DuckDB boundary</b><code>QualifiedName</code><br><code>vector&lt;Identifier&gt;</code></div>
+        <div class="arrow">→</div>
+        <div class="node"><b>VGI internal identity</b><code>SchemaPath</code><br>lossless components, never a dotted string</div>
+        <div class="arrow">→</div>
+        <div class="node"><b>Worker protocol</b><code>schema_path: list&lt;string&gt;</code><br>legacy <code>schema_name</code> for compatibility</div>
+      </div>
+
+      <div class="grid">
+        <div class="card">
+          <span class="tag blocker">Current mismatch</span>
+          <h3>VGI has one flat schema set</h3>
+          <p><code>VgiCatalog</code> owns one <code>VgiSchemaSet</code>. Each <code>VgiSchemaEntry</code> owns tables, views, functions and macros, but no child-schema set and no parent pointer. Lookup uses only <code>schema_lookup.GetEntryName()</code>; scans are not recursive.</p>
+        </div>
+        <div class="card">
+          <span class="tag blocker">Wire mismatch</span>
+          <h3>The RPC surface carries one string</h3>
+          <p>Catalog list/get/create/drop/alter, function dispatch, scans, branches, statistics, writes and comments all pass <code>schema_name</code>. A dotted string is unsafe because quoted identifiers may themselves contain dots and case must remain meaningful.</p>
+        </div>
+        <div class="card">
+          <span class="tag confirmed">DuckDB contract</span>
+          <h3>New navigation hooks</h3>
+          <p><code>EntryLookupInfo</code> carries a full <code>QualifiedName</code>; <code>SchemaCatalogEntry</code> exposes <code>GetParentSchema()</code>, <code>GetSchemaPath()</code>, <code>GetQualifiedName()</code>, and detailed lookup. <code>CreateInfo</code>, <code>DropInfo</code> and <code>AlterInfo</code> now own qualified names.</p>
+        </div>
+        <div class="card">
+          <span class="tag high">2.0 limitation</span>
+          <h3>Nested schemas are not a search path</h3>
+          <p>The current engine deliberately rejects a nested schema in <code>search_path</code> / <code>SET schema</code>. Nested objects must be explicitly qualified. VGI should mirror this rather than inventing implicit resolution.</p>
+        </div>
+      </div>
+
+      <h3 style="margin-top:26px">Recommended VGI design</h3>
+      <ol>
+        <li>Introduce one lossless schema-path type at the catalog/RPC boundary: components as <code>Identifier</code> inside DuckDB-facing code and strings only in serialization.</li>
+        <li>Add a child <code>VgiSchemaSet</code> and parent pointer to every <code>VgiSchemaEntry</code>. Override <code>GetParentSchema()</code>; support <code>SCHEMA_ENTRY</code> in lookup and scans.</li>
+        <li>Navigate <code>CreateSchemaInfo::ParentSchemas()</code> and <code>EntryLookupInfo::GetQualifiedName().Path()</code>, matching <code>DuckCatalog</code> behavior. Make <code>ScanSchemas</code> recursive.</li>
+        <li>Add <code>schema_path</code> to protocol payloads and capability-negotiate it. During transition, decode a missing path as <code>[schema_name]</code>; only emit the old field when path depth is one.</li>
+        <li>Include the complete path in caches, global-function aliases, branch metadata, statistics keys, logs, transaction operations and invalidation. Otherwise identically named children under different parents collide.</li>
+        <li>Test quoted path components, including an identifier containing <code>.</code>; never split or join identity using a literal dot.</li>
+      </ol>
+      <div class="callout"><strong>Compatibility choice:</strong> VGI can compile first while rejecting nested schemas with an explicit “not supported by this worker protocol” error. That is a valid staging step. Silently reducing <code>s1.s2</code> to <code>s2</code> is not.</div>
+    </section>
+
+    <section id="matrix">
+      <h2>Migration matrix</h2>
+      <p class="section-intro">Priorities reflect both compile impact and likelihood of silent wrong results.</p>
+      <table>
+        <thead><tr><th>Priority</th><th>Area</th><th>What changed</th><th>VGI action</th></tr></thead>
+        <tbody>
+          <tr><td class="priority p0">P0 · Blocker</td><td>Identifiers &amp; qualified names</td><td>SQL identifiers are <code>Identifier</code>; catalog objects carry <code>QualifiedName</code> paths.</td><td>Keep identifiers typed inside the engine boundary; replace removed public <code>.schema</code>/<code>.name</code> fields with accessors and paths.</td></tr>
+          <tr><td class="priority p0">P0 · Blocker</td><td>VGI catalog hierarchy</td><td>Schemas can own schemas; scans and lookup navigate parent chains.</td><td>Add child schema sets, parent links, recursive scan/lookup, and path-aware RPCs/cache keys.</td></tr>
+          <tr><td class="priority p0">P0 · Correctness</td><td>Table filters</td><td>Runtime filters are bound expressions; filter sets are encapsulated and can span multiple columns.</td><td>Replace the legacy enum/cast serializer. Preserve optional/dynamic-filter semantics and multi-column references.</td></tr>
+          <tr><td class="priority p0">P0 · Blocker</td><td>Functions &amp; expressions</td><td>Signatures separated; members private; bound comparisons/casts are function expressions.</td><td>Use getter/setter/bind-input APIs and helper constructors; audit custom optimizer rewrites.</td></tr>
+          <tr><td class="priority p0">P0 · Blocker</td><td>Table catalog ownership</td><td><code>TableCatalogEntry</code> no longer owns columns and <code>GetColumns()</code> is pure virtual.</td><td>Store <code>ColumnList</code> in <code>VgiTableEntry</code>, move it from <code>CreateTableInfo</code>, and override <code>GetColumns()</code>.</td></tr>
+          <tr><td class="priority p1">P1 · High</td><td>Planner/operator IDs</td><td><code>TableIndex</code> and <code>ProjectionIndex</code> replace plain <code>idx_t</code> in public planning/filter APIs.</td><td>Type VGI logical operator IDs end-to-end; fix <code>ColumnBinding</code> construction and remapping.</td></tr>
+          <tr><td class="priority p1">P1 · High</td><td>COPY and table functions</td><td>Name lists use <code>Identifier</code>; callbacks and COPY rotation changed.</td><td>Convert to strings only at Arrow/wire boundary; update <code>to_string</code> and COPY lifecycle hooks.</td></tr>
+          <tr><td class="priority p1">P1 · High</td><td>Cancellation &amp; metrics</td><td>Direct interruption state and old profiler/extra-source hooks disappeared.</td><td>Use <code>IsInterrupted()</code>/<code>InterruptCheck()</code> and <code>OperatorMetrics::AddExtraInfo()</code>.</td></tr>
+          <tr><td class="priority p1">P1 · High</td><td>Build ecosystem</td><td>Extension packaging/repositories evolved; every binary must match 2.0.</td><td>Choose stock vs Haybarn 2.0, then repin DuckDB/httpfs/ducklake/WASM/tooling together.</td></tr>
+          <tr><td class="priority p2">P2 · Cleanup</td><td>Vector &amp; value APIs</td><td>Iterators/writers are preferred; <code>Value</code> is immutable.</td><td>Use <code>Values&lt;T&gt;()</code>, writers, and <code>WithType()</code>; retain unified format only where genuinely type-erased.</td></tr>
+          <tr><td class="priority p2">P2 · Audit</td><td>Secrets, indexes, settings</td><td>Identifier propagation, scoped secret stores, index lifetime, and setting deprecations landed.</td><td>Fix signatures and add lifecycle/precedence tests; explicitly include headers previously obtained transitively.</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section id="apis">
+      <h2>Concrete API adaptations</h2>
+      <p class="section-intro">These are the replacements visible in VGI’s compile diagnostics and source paths.</p>
+
+      <details open>
+        <summary>1. Identifier and catalog APIs</summary>
+        <table style="margin-top:12px">
+          <thead><tr><th>1.5-era use in VGI</th><th>2.0 form</th><th>Notes</th></tr></thead>
+          <tbody>
+            <tr><td><code>string</code> as SQL name</td><td><code>Identifier(s)</code>; convert via <code>Identifier(s)</code> and <code>.GetIdentifierName()</code></td><td>The constructor from a runtime string is explicit. Maps are often <code>identifier_map_t</code>/<code>identifier_tree_t</code>.</td></tr>
+            <tr><td><code>CreateSchemaInfo.schema</code></td><td><code>SchemaName()</code>, <code>SchemaCatalog()</code>, <code>ParentSchemas()</code>, <code>IsNested()</code></td><td>Do not recover parents by parsing text.</td></tr>
+            <tr><td><code>CreateTableInfo.table/schema</code></td><td><code>GetTableName()</code>, <code>GetQualifiedName()</code>, setters</td><td>Likewise for views, macros, functions, drops, alters and comments.</td></tr>
+            <tr><td>Catalog get with catalog/schema/name strings</td><td><code>EntryLookupInfo(type, QualifiedName(...))</code>; path-aware <code>Catalog::GetEntry</code></td><td>Some old overloads are deprecated; others no longer match.</td></tr>
+            <tr><td><code>Catalog::GetDefaultSchema() → string</code></td><td><code>optional&lt;Identifier&gt;</code></td><td>VGI’s override is currently a hard compile error.</td></tr>
+            <tr><td><code>IndexCatalogEntry::GetSchemaName/TableName → string</code></td><td><code>Identifier</code></td><td>Both VGI index overrides need new return types.</td></tr>
+          </tbody>
+        </table>
+      </details>
+
+      <details open>
+        <summary>2. Function registration and binding</summary>
+        <ul>
+          <li>Function signature state is encapsulated. Replace direct <code>arguments</code>, <code>return_type</code>, <code>varargs</code>, <code>null_handling</code>, <code>stability</code> and <code>function_info</code> access with current getters/setters and callback setters.</li>
+          <li>Scalar bind callbacks now receive <code>BindScalarFunctionInput&amp;</code>; obtain context, arguments, binder and bound function from that input.</li>
+          <li><code>Function::EraseArgument</code> is removed. Construct/mutate the new signature/parameter representation rather than editing the old vector.</li>
+          <li><code>FunctionSet</code> is immutable/shared, and bound functions link to definitions. Audit code that copies a catalog function and mutates it after registration.</li>
+          <li>Runtime names passed to <code>TableFunction</code>, <code>ScalarFunctionSet</code> and <code>AggregateFunctionSet</code> must be wrapped as <code>Identifier(name)</code>.</li>
+          <li><code>TableFunctionDynamicToStringInput</code> / <code>dynamic_to_string</code> became <code>TableFunctionToStringInput</code> / <code>to_string</code>.</li>
+        </ul>
+        <p class="tiny">Primary VGI hotspots: <code>vgi_extension.cpp</code>, scalar/aggregate/table function sets and implementations, macro set, worker package and catalog API.</p>
+      </details>
+
+      <details open>
+        <summary>3. Expression and custom optimizer rewrites</summary>
+        <ul>
+          <li><code>BoundComparisonExpression</code> is no longer an expression subclass. Use <code>BoundComparisonExpression::Create(...)</code> and inspect/manipulate the resulting <code>BoundFunctionExpression</code> through comparison helpers.</li>
+          <li><code>ExpressionClass::BOUND_COMPARISON</code> (and old cast-class assumptions) no longer exist. Prefer expression type and helper predicates.</li>
+          <li>Parsed and bound expression members are private: use <code>Left()</code>/<code>Right()</code>, <code>GetChildren()</code>, <code>Function()</code>/<code>FunctionMutable()</code>, <code>BindInfo()</code>, <code>GetReturnType()</code>/<code>SetReturnType()</code>, <code>Partitions()</code>, <code>OrderBy()</code>, and window-bound accessors.</li>
+          <li>VGI’s multi-scan, required-filter, lateral batching, streaming-window and buffering rewrites should be ported as one cluster. They exchange bound expressions and table/column IDs, so partial conversion is risky.</li>
+        </ul>
+      </details>
+
+      <details open>
+        <summary>4. Table filters—the highest silent-correctness risk</summary>
+        <p><code>TableFilterSet::filters</code> is private and indexes are <code>ProjectionIndex</code>. More importantly, runtime filters are now primarily <code>ExpressionFilter</code> objects containing arbitrary bound expressions, including multi-column expressions. The familiar constant/null/IN/conjunction/optional/dynamic classes remain only as <code>Legacy*</code> machinery for old serialization.</p>
+        <p>VGI currently walks the old enum tree in several places and directly reads/writes <code>.filters</code>. Replace that with the filter-set iterator (<code>entry.GetIndex()</code>, <code>entry.Filter()</code>, <code>TakeFilter()</code>, set/push/remove APIs) and serialize <code>ExpressionFilter::GetExpressionFilter(...).expr</code> by traversing the bound expression.</p>
+        <div class="callout danger"><strong>Do not mechanically rename old filter classes.</strong> VGI’s Top-N pushdown deliberately avoids serializing an uninitialized dynamic filter. In 2.0, use <code>ExpressionFilter::IsOptionalFilter</code>, <code>IsRootOptionalFilter</code> and <code>GetRootOptionalDynamicFilterData</code> to retain that behavior. Also carry all referenced column indexes; assuming one filter key equals one column can return wrong rows.</div>
+      </details>
+
+      <details>
+        <summary>5. Table entries, values, vectors and includes</summary>
+        <ul>
+          <li><strong>New late blocker:</strong> <code>TableCatalogEntry::GetColumns()</code> is now pure virtual and the base no longer moves <code>info.columns</code>. Add a VGI-owned <code>ColumnList</code>, initialize it from <code>CreateTableInfo</code>, and return it from the override.</li>
+          <li><code>Value</code> became immutable. VGI’s BLOB→GEOMETRY fallback should return <code>val.WithType(duck_type)</code> instead of copying and calling <code>Reinterpret</code>. <code>TryCastAs</code> now returns <code>optional&lt;Value&gt;</code>.</li>
+          <li>Prefer <code>Vector::Values&lt;T&gt;()</code> and <code>FlatVector::Writer&lt;T&gt;</code>. VGI still has about 20 direct unified-format/flat-data references. Type-erased internals may keep unified format; typed aggregate-state loops should migrate.</li>
+          <li>Several failures are transitive-include cleanup: explicitly include <code>binder_exception.hpp</code> and the physical-plan-generator header where their types are used.</li>
+        </ul>
+      </details>
+
+      <details>
+        <summary>6. COPY, Arrow boundaries and callback names</summary>
+        <ul>
+          <li>COPY/table-function column names are <code>vector&lt;Identifier&gt;</code>. VGI’s Arrow schema helper still correctly wants string labels; call <code>IdentifiersToStrings</code> at that boundary.</li>
+          <li><code>PhysicalCopyToFile::rotate</code> is no longer public; use <code>Rotate()</code>. The COPY operator’s rotation/abort/parallel lifecycle was reworked, so validate more than compilation.</li>
+          <li>Options maps are identifier-keyed. Wrap runtime keys or keep them typed instead of indexing with <code>std::string</code>.</li>
+          <li>Re-test partitioned output, per-thread output, byte-based file-size rotation, headers/empty output, temporary names and abort cleanup.</li>
+        </ul>
+      </details>
+
+      <details>
+        <summary>7. Logical IDs, interruption and profiling</summary>
+        <ul>
+          <li>VGI’s three custom logical operators override <code>GetTableIndex()</code> as <code>vector&lt;idx_t&gt;</code>; 2.0 requires <code>vector&lt;TableIndex&gt;</code>. Filter positions similarly use <code>ProjectionIndex</code>.</li>
+          <li>Replace direct <code>ClientContext::interrupted</code> reads with <code>IsInterrupted()</code>. Use <code>InterruptCheck()</code> at cooperative cancellation points so both explicit interrupts and <code>max_execution_time</code> deadlines are honored.</li>
+          <li><code>OperatorProfiler::GetOperatorInfo()</code> is gone. Use <code>GetOperatorMetrics(op).AddExtraInfo(key, value)</code>.</li>
+          <li><code>PhysicalOperator::ExtraSourceParams</code> is gone. Move static display data to <code>ParamsToString()</code>; attach runtime data through current operator metrics where appropriate.</li>
+        </ul>
+      </details>
+
+      <details>
+        <summary>8. Secrets and lifecycle semantics</summary>
+        <ul>
+          <li><code>SecretStorage::DropSecretByName</code> now accepts <code>const Identifier&amp;</code>; VGI’s string override does not override anything in 2.0.</li>
+          <li>Secret/config key maps received Identifier propagation. Convert keys deliberately at external serialization boundaries.</li>
+          <li>DuckDB added connection- and transaction-scoped secret stores. Re-test VGI’s registered storage precedence, connection isolation, transaction rollback/commit, cleanup and same-name shadowing.</li>
+        </ul>
+      </details>
+    </section>
+
+    <section id="runtime">
+      <h2>Runtime and behavioral risks after it compiles</h2>
+      <p class="section-intro">The compile pass catches interface breaks. These areas can compile and still be wrong.</p>
+      <div class="grid">
+        <div class="card"><span class="tag blocker">Correctness</span><h3>Filter pushdown</h3><p>Multi-column expression filters and optional dynamic filters change the semantic contract. A lossy serializer can over-filter remote data.</p></div>
+        <div class="card"><span class="tag high">Lifetime</span><h3>Catalog entries &amp; indexes</h3><p>Table column ownership changed and index lifetime was refactored. VGI’s deferred-drop graveyard, cached entry pointers, prepared statements and index metadata need ASAN/transaction stress tests.</p></div>
+        <div class="card"><span class="tag high">Planning</span><h3>Custom operators</h3><p>Typed table IDs, private expression state, immutable function definitions and evolving physical planning can invalidate bindings across VGI’s custom rewrites.</p></div>
+        <div class="card"><span class="tag high">Cancellation</span><h3>Network and worker loops</h3><p>Merely polling cancellation is insufficient if long RPC/subprocess waits never reach <code>InterruptCheck()</code>. Test explicit cancel and query deadlines on every transport.</p></div>
+        <div class="card"><span class="tag medium">Compatibility</span><h3>Storage/protocol versions</h3><p>DuckDB gates persistent nested-schema metadata on its 2.0 storage version. VGI’s own catalog protocol needs a corresponding capability/version story.</p></div>
+        <div class="card"><span class="tag medium">Semantics</span><h3>Function definitions</h3><p>Bound functions now link to immutable shared definitions. Any VGI pattern that mutates copied overloads at bind time needs explicit bind data instead.</p></div>
+      </div>
+    </section>
+
+    <section id="build">
+      <h2>Build, dependency and distribution work</h2>
+      <p class="section-intro">A 1.5 extension binary is not a 2.0 artifact. All target variants and companion extensions have to move together.</p>
+      <ul>
+        <li><strong>Choose the actual engine first:</strong> stock DuckDB 2.0 or a future Haybarn 2.0 fork. The probe used stock 2.0 headers and removed the Haybarn version define; fork-only changes are therefore outside its scope.</li>
+        <li>Update VGI’s DuckDB submodule, then repin the hard-coded Haybarn <code>httpfs</code>, local <code>ducklake</code>, WASM <code>httpfs</code>, bundled extensions and <code>extension-ci-tools</code> to mutually compatible 2.0 revisions.</li>
+        <li>Revalidate DuckDB 2.0’s evolved extension build/signing/repository behavior, including external repository trust and namespaced install/load paths, against VGI’s distribution pipeline.</li>
+        <li>Build every supported platform from source: macOS/Linux/Windows, static/loadable, release/debug/reldebug and WASM/threads. Never attempt to reuse a 1.5 loadable binary.</li>
+        <li>No direct DuckDB C API dependency was found in VGI’s main extension integration, so the new C API is not currently a primary port item. Reassess any separately maintained host wrappers.</li>
+      </ul>
+      <div class="callout warn"><strong>Pin a checkpoint.</strong> Because the inspected 2.0 branch is still changing—including a <code>TableCatalogEntry</code> break only days before this report—do the port against one recorded SHA and rebase deliberately, not continuously.</div>
+    </section>
+
+    <section id="roadmap">
+      <h2>Recommended migration sequence</h2>
+      <div class="roadmap">
+        <div class="phase"><h3>Freeze a target and add a dual-version branch</h3><p>Record the DuckDB 2.0 SHA and stock-vs-Haybarn decision. Make CI expose both the existing 1.5 lane and an allowed-to-fail 2.0 lane until parity is reached.</p></div>
+        <div class="phase"><h3>Introduce compatibility types at VGI boundaries</h3><p>Add identifier/string conversion helpers and a <code>SchemaPath</code> abstraction. Avoid scattering <code>.GetIdentifierName()</code> throughout business logic.</p></div>
+        <div class="phase"><h3>Port the catalog core</h3><p>Fix <code>GetDefaultSchema</code>, qualified create/drop/alter/comment APIs, child schema sets, recursive lookup, table-owned columns, index names and path-aware cache identity. At this point basic attach/catalog DDL should compile.</p></div>
+        <div class="phase"><h3>Port functions, expressions and logical IDs</h3><p>Adapt registration/bind APIs, private expression accessors, comparison helpers and typed table/projection indexes. Restore the custom rewriters and EXPLAIN output before touching optimization behavior.</p></div>
+        <div class="phase"><h3>Redesign filter serialization</h3><p>Treat this as an isolated correctness deliverable: bound-expression serialization, multi-column bindings and dynamic optional filters, with differential tests against pushdown disabled.</p></div>
+        <div class="phase"><h3>Port execution edges</h3><p>Update COPY, table-function names/callbacks, profiling, cancellation, Value immutability, vectors, secrets, custom writes and explicit includes. Perform a full link/load.</p></div>
+        <div class="phase"><h3>Widen the worker protocol</h3><p>Add negotiated <code>schema_path</code> support to schemas, generated builders, server implementations and SDKs. Keep the one-level legacy bridge until all workers advertise the capability.</p></div>
+        <div class="phase"><h3>Repin and qualify the release matrix</h3><p>Update companion extensions/tooling, run sanitizers and all platforms, then remove the 1.5 lane only after worker protocol rollout and compatibility tests pass.</p></div>
+      </div>
+    </section>
+
+    <section id="tests">
+      <h2>Verification plan</h2>
+      <p class="section-intro">The highest-value acceptance test is differential: execute with VGI pushdowns/rewrites enabled and disabled and require identical results.</p>
+      <ul class="checklist">
+        <li>Attach and enumerate top-level and three-level schemas</li>
+        <li>Quoted schema/object names, including dots and mixed case</li>
+        <li>Create/drop/rename/comment table, view, function and schema at depth</li>
+        <li>INSERT/UPDATE/DELETE/MERGE/RETURNING in nested schemas</li>
+        <li>Foreign keys, indexes and column changes across schema paths</li>
+        <li>Prepared statements survive cache invalidation/deferred drop</li>
+        <li>Filter comparisons, IN, NULL, AND/OR and struct extraction</li>
+        <li>Multi-column filters and expression filters</li>
+        <li>Top-N dynamic filters with NULLS FIRST/LAST</li>
+        <li>Filter pushdown enabled vs disabled differential results</li>
+        <li>Single/multi-branch scans and required filters</li>
+        <li>Streaming windows and lateral batching plan/result parity</li>
+        <li>COPY empty/header, parallel, partitioned and rotation paths</li>
+        <li>COPY/Parquet abort leaves no partial committed output</li>
+        <li>Explicit interrupt and <code>max_execution_time</code> per transport</li>
+        <li>Secret precedence, connection isolation and transaction rollback</li>
+        <li>Native and WASM; debug/reldebug with sanitizers/assertions</li>
+        <li>Loadability/signature tests from a clean install repository</li>
+      </ul>
+      <div class="codeblock"># DuckDB-side validation guidance from this checkout
+make reldebug
+build/reldebug/test/unittest
+
+# VGI-specific sequence after compilation is restored
+syntax-only probe → full native link/load → targeted catalog/filter tests
+→ complete VGI SQL suite → ASAN/reldebug → WASM/platform matrix</div>
+    </section>
+
+    <section id="commits">
+      <h2>Commit landmarks and local source trail</h2>
+      <p class="section-intro">Selected commits explain the breaking themes better than the raw 12,990-commit ancestry range. Links below open the corresponding upstream commit page; local file links open the exact sources inspected.</p>
+      <table>
+        <thead><tr><th>Date / commit</th><th>Change</th><th>Why VGI cares</th></tr></thead>
+        <tbody>
+          <tr><td>2026-03-06 · <a href="https://github.com/duckdb/duckdb/commit/692aff13ab"><code>692aff13ab</code></a></td><td>Logical table indexes become <code>TableIndex</code></td><td>Three VGI logical operator overrides fail.</td></tr>
+          <tr><td>2026-03-06 · <a href="https://github.com/duckdb/duckdb/commit/c4842882bc"><code>c4842882bc</code></a></td><td>Encapsulate <code>TableFilterSet</code></td><td>VGI directly accesses its map.</td></tr>
+          <tr><td>2026-04-22 onward · <a href="https://github.com/duckdb/duckdb/commit/3bff398027"><code>3bff398027</code></a></td><td>Function callback/signature encapsulation series</td><td>Direct scalar/aggregate member accesses fail.</td></tr>
+          <tr><td>2026-05-06 · <a href="https://github.com/duckdb/duckdb/commit/3b0d794f1c"><code>3b0d794f1c</code></a></td><td>Comparison becomes a bound function expression</td><td>VGI comparison construction and optimizer matching change.</td></tr>
+          <tr><td>2026-06-03 · <a href="https://github.com/duckdb/duckdb/commit/14b185116e"><code>14b185116e</code></a></td><td>Start of broad <code>Identifier</code> propagation</td><td>Explains many string conversion and map failures.</td></tr>
+          <tr><td>2026-06-23/25 · <a href="https://github.com/duckdb/duckdb/commit/0e7c207a56"><code>0e7c207a56</code></a>, <a href="https://github.com/duckdb/duckdb/commit/c2307c2196"><code>c2307c2196</code></a>, <a href="https://github.com/duckdb/duckdb/commit/775cbe9cfc"><code>775cbe9cfc</code></a></td><td>Qualified lookup/create/drop/alter</td><td>Old public schema/name fields disappear.</td></tr>
+          <tr><td>2026-06-26 · <a href="https://github.com/duckdb/duckdb/commit/99079b3c99"><code>99079b3c99</code></a></td><td>Nested schemas in memory, navigation and introspection</td><td>VGI needs a hierarchical schema implementation.</td></tr>
+          <tr><td>2026-07-10 onward · <a href="https://github.com/duckdb/duckdb/commit/1fb649f90a"><code>1fb649f90a</code></a>, <a href="https://github.com/duckdb/duckdb/commit/f1088dcf7d"><code>f1088dcf7d</code></a></td><td>Tables and DML inside nested schemas</td><td>Path handling must reach writes, not only catalog listing.</td></tr>
+          <tr><td>2026-08-13 · <a href="https://github.com/duckdb/duckdb/commit/259326f7c2"><code>259326f7c2</code></a></td><td><code>Value</code> becomes immutable</td><td><code>Reinterpret</code> becomes <code>WithType</code>; casts return optionals.</td></tr>
+          <tr><td>2026-08-14/17 · <a href="https://github.com/duckdb/duckdb/commit/30370c11f7"><code>30370c11f7</code></a>, <a href="https://github.com/duckdb/duckdb/commit/ef1a7ca225"><code>ef1a7ca225</code></a></td><td>Expression and multi-column table filters</td><td>Requires a VGI filter serializer redesign.</td></tr>
+          <tr><td>2026-08-23/24 · <a href="https://github.com/duckdb/duckdb/commit/db751b3448"><code>db751b3448</code></a>, <a href="https://github.com/duckdb/duckdb/commit/4dbe30e6c1"><code>4dbe30e6c1</code></a></td><td>Bound functions link to immutable shared definitions</td><td>Audit bind-time mutation/copy patterns.</td></tr>
+          <tr><td>2026-08-28 · <a href="https://github.com/duckdb/duckdb/commit/a408c9fa12"><code>a408c9fa12</code></a></td><td>Index lifetime refactor</td><td>Stress custom catalog entry lifetime and cached handles.</td></tr>
+          <tr><td>2026-09-07 · <a href="https://github.com/duckdb/duckdb/commit/ef1ffd499e"><code>ef1ffd499e</code></a></td><td>Remove columns from <code>TableCatalogEntry</code></td><td>VGI must own columns and implement a new pure virtual.</td></tr>
+        </tbody>
+      </table>
+
+      <h3 style="margin-top:28px">High-value local files</h3>
+      <div class="grid">
+        <div class="card">
+          <h3>VGI</h3>
+          <ul>
+            <li><a href="../src/storage/vgi_catalog.cpp">Catalog entry point</a></li>
+            <li><a href="../src/storage/vgi_schema_entry.cpp">Schema entry and contained sets</a></li>
+            <li><a href="../src/storage/vgi_schema_set.cpp">Flat schema loader</a></li>
+            <li><a href="../src/vgi_catalog_api.cpp">Catalog RPC boundary</a></li>
+            <li><a href="../src/vgi_table_function_impl.cpp">Filter serialization / dynamic pushdown</a></li>
+            <li><a href="../src/vgi_extension.cpp">Registration and optimizer rewrites</a></li>
+            <li><a href="../extension_config.cmake">Native dependency pins</a></li>
+            <li><a href="../extension_config_wasm.cmake">WASM dependency pins</a></li>
+          </ul>
+        </div>
+        <div class="card">
+          <h3>DuckDB 2.0 checkout</h3>
+          <ul>
+            <li><a href="../../duckdb-2/duckdb/src/include/duckdb/parser/qualified_name.hpp">QualifiedName</a></li>
+            <li><a href="../../duckdb-2/duckdb/src/include/duckdb/catalog/entry_lookup_info.hpp">EntryLookupInfo</a></li>
+            <li><a href="../../duckdb-2/duckdb/src/include/duckdb/catalog/catalog_entry/schema_catalog_entry.hpp">SchemaCatalogEntry</a></li>
+            <li><a href="../../duckdb-2/duckdb/src/catalog/duck_catalog.cpp">Reference nested-schema implementation</a></li>
+            <li><a href="../../duckdb-2/duckdb/src/include/duckdb/planner/table_filter.hpp">Table filter API</a></li>
+            <li><a href="../../duckdb-2/duckdb/src/include/duckdb/catalog/catalog_entry/table_catalog_entry.hpp">TableCatalogEntry</a></li>
+            <li><a href="../../duckdb-2/duckdb/test/sql/catalog/nested_schema/deeply_nested_entries.test">Deep nested-schema tests</a></li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <footer>
+      Generated from local repositories on 2026-09-09. VGI source was read-only during analysis; only this report was added. Findings are tied to DuckDB <code>a0315f712c</code> and should be refreshed against the final 2.0 pin.
+    </footer>
+  </main>
+</div>
+</body>
+</html>

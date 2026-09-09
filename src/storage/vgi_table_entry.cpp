@@ -540,7 +540,7 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 	                                     scan_result.schema_name != ParentSchema().name &&
 	                                     scan_result.schema_name != default_schema;
 	if (worker_schema_is_third_schema) {
-		// Worker-provided (protocol 1.5.0), naming a schema other than the
+		// Worker-provided through VGI 2.0 schema_path, naming a schema other than the
 		// table's own or the catalog's default — authoritative, no guessing
 		// needed. Only the worker genuinely knows which schema its own
 		// returned function_name lives in. A worker-claimed schema with no

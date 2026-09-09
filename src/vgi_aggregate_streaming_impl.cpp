@@ -12,6 +12,7 @@
 #include "vgi_arrow_utils.hpp"
 #include "vgi_logging.hpp"
 #include "vgi_rpc_types.hpp" // SerializeToIpcBytes / DeserializeFromIpcBytes
+#include "generated/vgi_request_builders.hpp"
 
 namespace duckdb {
 namespace vgi {
@@ -47,19 +48,6 @@ std::shared_ptr<arrow::RecordBatch> BuildStreamingOpenRequest(
 	auto input_schema_bytes = SerializeSchemaBytes(input_schema);
 	auto output_schema_bytes = SerializeSchemaBytes(output_schema);
 
-	auto schema = arrow::schema({
-	    arrow::field("function_name", arrow::utf8(), false),
-	    arrow::field("arguments", arrow::binary(), false),
-	    arrow::field("input_schema", arrow::binary(), false),
-	    arrow::field("partition_key_count", arrow::int64(), false),
-	    arrow::field("order_key_count", arrow::int64(), false),
-	    arrow::field("output_schema", arrow::binary(), false),
-	    arrow::field("settings", arrow::binary(), true),
-	    arrow::field("secrets", arrow::binary(), true),
-	    arrow::field("attach_opaque_data", arrow::binary(), true),
-	    arrow::field("schema_name", arrow::utf8(), true),
-	});
-
 	arrow::StringBuilder fn_b;
 	arrow::BinaryBuilder args_b, input_schema_b, output_schema_b, settings_b, secrets_b, aid_b;
 	arrow::Int64Builder pkc_b, okc_b;
@@ -89,9 +77,10 @@ std::shared_ptr<arrow::RecordBatch> BuildStreamingOpenRequest(
 	ThrowOnArrowError(secrets_b.Finish(&sc_a));
 	ThrowOnArrowError(aid_b.Finish(&aid_a));
 
-	return WrapAsRpcParams(arrow::RecordBatch::Make(
-	    schema, 1, {fn_a, args_a, is_a, pkc_a, okc_a, os_a, st_a, sc_a, aid_a,
-	                MakeSingleStringArrayOrNull(schema_name)}));
+	auto request = arrow::RecordBatch::Make(generated::AggregateStreamingOpenRequestSchema(), 1,
+	                                        {fn_a, args_a, is_a, pkc_a, okc_a, os_a, st_a, sc_a, aid_a,
+	                                         BuildOptionalStringListScalar(OptionalSingleSchemaPath(schema_name))});
+	return generated::BuildAggregateStreamingOpenParams(SerializeToIpcBytes(request));
 }
 
 std::shared_ptr<arrow::RecordBatch> BuildStreamingChunkRequest(
@@ -102,14 +91,6 @@ std::shared_ptr<arrow::RecordBatch> BuildStreamingChunkRequest(
     const std::vector<uint8_t> &attach_opaque_data) {
 
 	auto batch_bytes = SerializeToIpcBytes(input_batch);
-
-	auto schema = arrow::schema({
-	    arrow::field("function_name", arrow::utf8(), false),
-	    arrow::field("execution_id", arrow::binary(), false),
-	    arrow::field("input_batch", arrow::binary(), false),
-	    arrow::field("attach_opaque_data", arrow::binary(), true),
-	    arrow::field("schema_name", arrow::utf8(), true),
-	});
 
 	arrow::StringBuilder fn_b;
 	arrow::BinaryBuilder eid_b, batch_b, aid_b;
@@ -129,8 +110,10 @@ std::shared_ptr<arrow::RecordBatch> BuildStreamingChunkRequest(
 	ThrowOnArrowError(batch_b.Finish(&batch_a));
 	ThrowOnArrowError(aid_b.Finish(&aid_a));
 
-	return WrapAsRpcParams(arrow::RecordBatch::Make(
-	    schema, 1, {fn_a, eid_a, batch_a, aid_a, MakeSingleStringArrayOrNull(schema_name)}));
+	auto request = arrow::RecordBatch::Make(
+	    generated::AggregateStreamingChunkRequestSchema(), 1,
+	    {fn_a, eid_a, batch_a, aid_a, BuildOptionalStringListScalar(OptionalSingleSchemaPath(schema_name))});
+	return generated::BuildAggregateStreamingChunkParams(SerializeToIpcBytes(request));
 }
 
 std::shared_ptr<arrow::RecordBatch> BuildStreamingCloseRequest(
@@ -138,13 +121,6 @@ std::shared_ptr<arrow::RecordBatch> BuildStreamingCloseRequest(
     const std::string &schema_name,
     const std::vector<uint8_t> &execution_id,
     const std::vector<uint8_t> &attach_opaque_data) {
-
-	auto schema = arrow::schema({
-	    arrow::field("function_name", arrow::utf8(), false),
-	    arrow::field("execution_id", arrow::binary(), false),
-	    arrow::field("attach_opaque_data", arrow::binary(), true),
-	    arrow::field("schema_name", arrow::utf8(), true),
-	});
 
 	arrow::StringBuilder fn_b;
 	arrow::BinaryBuilder eid_b, aid_b;
@@ -162,8 +138,10 @@ std::shared_ptr<arrow::RecordBatch> BuildStreamingCloseRequest(
 	ThrowOnArrowError(eid_b.Finish(&eid_a));
 	ThrowOnArrowError(aid_b.Finish(&aid_a));
 
-	return WrapAsRpcParams(arrow::RecordBatch::Make(
-	    schema, 1, {fn_a, eid_a, aid_a, MakeSingleStringArrayOrNull(schema_name)}));
+	auto request = arrow::RecordBatch::Make(
+	    generated::AggregateStreamingCloseRequestSchema(), 1,
+	    {fn_a, eid_a, aid_a, BuildOptionalStringListScalar(OptionalSingleSchemaPath(schema_name))});
+	return generated::BuildAggregateStreamingCloseParams(SerializeToIpcBytes(request));
 }
 
 // Standard envelope unwrap: outer {result: binary} wrapping the

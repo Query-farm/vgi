@@ -193,7 +193,7 @@ struct VgiScanFunctionResult {
 	duckdb::vector<Value> positional_arguments;             // Positional arguments for the function
 	std::map<std::string, Value> named_arguments;           // Named arguments for the function
 	std::vector<std::string> required_extensions;           // Extensions to load before calling
-	// Catalog schema function_name is registered in (protocol 1.5.0). Empty when
+	// DuckDB 1.5 schema containing function_name; adapted from VGI 2.0 schema_path. Empty when
 	// the worker doesn't know (pre-1.5.0 peer) or the function is a native DuckDB
 	// function with no VGI-side schema of its own (e.g. read_parquet) — callers
 	// fall back to the pre-1.5.0 table-schema/default-schema heuristic in that case.
@@ -267,7 +267,7 @@ struct VgiScanBranch {
 		return !function_name.empty();
 	}
 
-	// Function branch only (protocol 1.5.0): catalog schema function_name is
+	// Function branch only: DuckDB 1.5 schema containing function_name, adapted from schema_path. Empty when
 	// registered in. Empty for a catalog-table/format branch, a pre-1.5.0 peer,
 	// or a native DuckDB function — not to be confused with source_schema above,
 	// which names a catalog-table branch's SOURCE table's schema, a different,

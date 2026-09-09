@@ -184,9 +184,22 @@ TEST_CASE("BuildBindRequest matches with a COPY TO context", "[schema-parity]") 
 }
 
 TEST_CASE("BuildBindRequest matches with time travel and a schema name", "[schema-parity]") {
-	RequireMatches("BindRequest(at + schema_name)", generated::BindRequestSchema(),
-	               BuildBindRequest("f", {}, "TABLE", {}, {}, {}, {}, {}, false, "version", "3", nullptr, nullptr,
-	                                "data"));
+	RequireMatches(
+	    "BindRequest(at + schema_path)", generated::BindRequestSchema(),
+	    BuildBindRequest("f", {}, "TABLE", {}, {}, {}, {}, {}, false, "version", "3", nullptr, nullptr, "data"));
+}
+
+TEST_CASE("DuckDB 1.5 schema paths preserve one component and reject nesting", "[schema-path]") {
+	REQUIRE(SingleSchemaPath("analytics") == std::vector<std::string> {"analytics"});
+	REQUIRE(SchemaNameFromPath({"analytics"}, "test.path") == "analytics");
+	REQUIRE(OptionalSchemaNameFromPath(std::nullopt, "test.path").empty());
+	try {
+		(void)SchemaNameFromPath({"analytics", "sales"}, "test.path");
+		FAIL("nested schema path was accepted");
+	} catch (const std::exception &ex) {
+		REQUIRE(std::string(ex.what()).find("requires test.path to contain exactly one non-empty schema component; "
+		                                    "got depth 2") != std::string::npos);
+	}
 }
 
 // ---------------------------------------------------------------------------

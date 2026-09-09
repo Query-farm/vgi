@@ -109,6 +109,7 @@ std::shared_ptr<arrow::Array> BuildOptionalInt64Scalar(std::optional<int64_t> va
 
 // list<utf8>, list<binary>, list<int32>, list<int64> — single-row lists, always non-null.
 std::shared_ptr<arrow::Array> BuildStringListScalar(const std::vector<std::string> &values);
+std::shared_ptr<arrow::Array> BuildOptionalStringListScalar(const std::optional<std::vector<std::string>> &values);
 std::shared_ptr<arrow::Array> BuildBinaryListScalar(const std::vector<std::vector<uint8_t>> &values);
 std::shared_ptr<arrow::Array> BuildInt32ListScalar(const std::vector<int32_t> &values);
 std::shared_ptr<arrow::Array> BuildInt64ListScalar(const std::vector<int64_t> &values);
@@ -117,6 +118,15 @@ std::shared_ptr<arrow::Array> BuildInt64ListScalar(const std::vector<int64_t> &v
 std::shared_ptr<arrow::Array> BuildStringMapScalar(const std::vector<std::pair<std::string, std::string>> &entries);
 std::shared_ptr<arrow::Array>
 BuildOptionalStringMapScalar(const std::optional<std::vector<std::pair<std::string, std::string>>> &entries);
+
+// DuckDB 1.5 exposes a single schema identifier. These helpers adapt that
+// boundary to VGI 2.0's structural schema paths without ever flattening a
+// multi-component path.
+std::vector<std::string> SingleSchemaPath(const std::string &schema_name);
+std::optional<std::vector<std::string>> OptionalSingleSchemaPath(const std::string &schema_name);
+std::string SchemaNameFromPath(const std::vector<std::string> &schema_path, const std::string &field_name);
+std::string OptionalSchemaNameFromPath(const std::optional<std::vector<std::string>> &schema_path,
+                                       const std::string &field_name);
 
 // ============================================================================
 // BindRequest / BindResponse
@@ -152,25 +162,23 @@ struct CopyToBindContext {
 //   attach_opaque_data: binary|null
 //   transaction_opaque_data: binary|null
 //   resolved_secrets_provided: bool (true when scoped secrets have been resolved)
-std::shared_ptr<arrow::RecordBatch> BuildBindRequest(
-    const std::string &function_name,
-    const std::vector<uint8_t> &arguments_ipc_bytes,
-    const std::string &function_type,   // "SCALAR", "TABLE", "AGGREGATE"
-    const std::vector<uint8_t> &input_schema_bytes = {},   // Empty = null
-    const std::vector<uint8_t> &settings_bytes = {},       // Empty = null
-    const std::vector<uint8_t> &secrets_bytes = {},        // Empty = null
-    const std::vector<uint8_t> &attach_opaque_data = {},
-    const std::vector<uint8_t> &transaction_opaque_data = {},
-    bool resolved_secrets_provided = false,
-    const std::string &at_unit = {},    // time travel; empty = null
-    const std::string &at_value = {},   // time travel; empty = null
-    const CopyFromBindContext *copy_from = nullptr,   // COPY FROM; null = omit field
-    const CopyToBindContext *copy_to = nullptr,       // COPY TO; null = omit field
-    // Catalog schema that owns this function. A worker may register the same
-    // function name in more than one schema, so the bare name is not a unique
-    // key — the worker resolves (schema_name, function_name). Empty = null,
-    // which makes the worker fall back to a cross-schema name lookup.
-    const std::string &schema_name = {});
+std::shared_ptr<arrow::RecordBatch>
+BuildBindRequest(const std::string &function_name, const std::vector<uint8_t> &arguments_ipc_bytes,
+                 const std::string &function_type,                    // "SCALAR", "TABLE", "AGGREGATE"
+                 const std::vector<uint8_t> &input_schema_bytes = {}, // Empty = null
+                 const std::vector<uint8_t> &settings_bytes = {},     // Empty = null
+                 const std::vector<uint8_t> &secrets_bytes = {},      // Empty = null
+                 const std::vector<uint8_t> &attach_opaque_data = {},
+                 const std::vector<uint8_t> &transaction_opaque_data = {}, bool resolved_secrets_provided = false,
+                 const std::string &at_unit = {},                // time travel; empty = null
+                 const std::string &at_value = {},               // time travel; empty = null
+                 const CopyFromBindContext *copy_from = nullptr, // COPY FROM; null = omit field
+                 const CopyToBindContext *copy_to = nullptr,     // COPY TO; null = omit field
+                 // Catalog schema that owns this function. A worker may register the same
+                 // function name in more than one schema, so the bare name is not a unique
+                 // key — the worker resolves (schema_path, function_name). Empty = null,
+                 // which makes the worker fall back to a cross-schema name lookup.
+                 const std::string &schema_name = {});
 
 // Parsed BindResponse
 struct BindResponseResult {
@@ -368,13 +376,12 @@ std::shared_ptr<arrow::RecordBatch> BuildCatalogAttachRequest(
 // Fields match Python TableCreateRequest dataclass; serialise + wrap with
 // ``generated::BuildCatalogTableCreateParams`` for the wire params.
 std::shared_ptr<arrow::RecordBatch> BuildTableCreateRequest(
-    const std::vector<uint8_t> &attach_opaque_data, const std::string &schema_name, const std::string &name,
-    const std::shared_ptr<arrow::Schema> &columns_schema, const std::string &on_conflict,
+    const std::vector<uint8_t> &attach_opaque_data, const std::vector<std::string> &schema_path,
+    const std::string &name, const std::shared_ptr<arrow::Schema> &columns_schema, const std::string &on_conflict,
     const std::vector<int> &not_null_constraints, const std::vector<std::vector<int>> &unique_constraints,
     const std::vector<std::string> &check_constraints, const std::vector<std::vector<int>> &primary_key_constraints,
     const std::vector<std::vector<uint8_t>> &foreign_key_constraints,
     const std::vector<uint8_t> &transaction_opaque_data = {});
-
 
 } // namespace vgi
 } // namespace duckdb

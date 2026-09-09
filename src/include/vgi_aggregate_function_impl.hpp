@@ -166,9 +166,6 @@ struct AggregateRpcResult {
 	std::shared_ptr<arrow::RecordBatch> inner_batch;
 };
 
-// Wrap a request batch in the standard vgi_rpc envelope: {request: binary}.
-std::shared_ptr<arrow::RecordBatch> WrapAsRpcParams(const std::shared_ptr<arrow::RecordBatch> &request_batch);
-
 // Dispatch an aggregate-flavored unary RPC. Handles subprocess or HTTP
 // transport, pool reuse, stale-pool retry — same path as the standard
 // aggregate_{bind,update,combine,finalize,destructor} callbacks.

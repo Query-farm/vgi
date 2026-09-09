@@ -16,6 +16,7 @@
 #include "vgi_exception.hpp"
 #include "vgi_logging.hpp"
 #include "vgi_rpc_types.hpp"
+#include "generated/vgi_request_builders.hpp"
 
 namespace duckdb {
 namespace vgi {
@@ -139,20 +140,6 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateWindowInitRequest(
 	auto batch_bytes = SerializeToIpcBytes(partition_batch);
 	auto output_schema_bytes = SerializeSchemaBytes(output_schema);
 
-	auto schema = arrow::schema({
-	    arrow::field("function_name", arrow::utf8(), false),
-	    arrow::field("execution_id", arrow::binary(), false),
-	    arrow::field("partition_id", arrow::int64(), false),
-	    arrow::field("row_count", arrow::int64(), false),
-	    arrow::field("partition_batch", arrow::binary(), false),
-	    arrow::field("output_schema", arrow::binary(), false),
-	    arrow::field("filter_mask", arrow::binary(), false),
-	    arrow::field("frame_stats", arrow::binary(), false),
-	    arrow::field("all_valid", arrow::binary(), false),
-	    arrow::field("attach_opaque_data", arrow::binary(), true),
-	    arrow::field("schema_name", arrow::utf8(), true),
-	});
-
 	arrow::StringBuilder fn_b;
 	arrow::BinaryBuilder eid_b, batch_b, os_b, fm_b, fs_b, av_b, aid_b;
 	arrow::Int64Builder pid_b, rc_b;
@@ -184,9 +171,10 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateWindowInitRequest(
 	ThrowOnArrowError(av_b.Finish(&av_a));
 	ThrowOnArrowError(aid_b.Finish(&aid_a));
 
-	return WrapAsRpcParams(arrow::RecordBatch::Make(
-	    schema, 1, {fn_a, eid_a, pid_a, rc_a, batch_a, os_a, fm_a, fs_a, av_a, aid_a,
-	                MakeSingleStringArrayOrNull(schema_name)}));
+	auto request = arrow::RecordBatch::Make(generated::AggregateWindowInitRequestSchema(), 1,
+	                                        {fn_a, eid_a, pid_a, rc_a, batch_a, os_a, fm_a, fs_a, av_a, aid_a,
+	                                         BuildOptionalStringListScalar(OptionalSingleSchemaPath(schema_name))});
+	return generated::BuildAggregateWindowInitParams(SerializeToIpcBytes(request));
 }
 
 std::shared_ptr<arrow::RecordBatch> BuildAggregateWindowRequest(
@@ -194,17 +182,6 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateWindowRequest(
     const std::vector<uint8_t> &execution_id,
     const std::vector<uint8_t> &attach_opaque_data, int64_t partition_id, int64_t rid,
     const SubFrames &subframes) {
-	auto schema = arrow::schema({
-	    arrow::field("function_name", arrow::utf8(), false),
-	    arrow::field("execution_id", arrow::binary(), false),
-	    arrow::field("partition_id", arrow::int64(), false),
-	    arrow::field("rid", arrow::int64(), false),
-	    arrow::field("frame_starts", arrow::list(arrow::field("item", arrow::int64(), true)), false),
-	    arrow::field("frame_ends", arrow::list(arrow::field("item", arrow::int64(), true)), false),
-	    arrow::field("attach_opaque_data", arrow::binary(), true),
-	    arrow::field("schema_name", arrow::utf8(), true),
-	});
-
 	arrow::StringBuilder fn_b;
 	arrow::BinaryBuilder eid_b, aid_b;
 	arrow::Int64Builder pid_b, rid_b;
@@ -240,9 +217,10 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateWindowRequest(
 	ThrowOnArrowError(ends_b.Finish(&ends_a));
 	ThrowOnArrowError(aid_b.Finish(&aid_a));
 
-	return WrapAsRpcParams(arrow::RecordBatch::Make(
-	    schema, 1, {fn_a, eid_a, pid_a, rid_a, starts_a, ends_a, aid_a,
-	                MakeSingleStringArrayOrNull(schema_name)}));
+	auto request = arrow::RecordBatch::Make(generated::AggregateWindowRequestSchema(), 1,
+	                                        {fn_a, eid_a, pid_a, rid_a, starts_a, ends_a, aid_a,
+	                                         BuildOptionalStringListScalar(OptionalSingleSchemaPath(schema_name))});
+	return generated::BuildAggregateWindowParams(SerializeToIpcBytes(request));
 }
 
 // Batched window request — sends all (rid, subframes) tuples for one
@@ -254,19 +232,6 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateWindowBatchRequest(
     const std::vector<uint8_t> &execution_id,
     const std::vector<uint8_t> &attach_opaque_data, int64_t partition_id,
     const SubFrames *subframes_per_row, idx_t count, idx_t row_idx) {
-	auto schema = arrow::schema({
-	    arrow::field("function_name", arrow::utf8(), false),
-	    arrow::field("execution_id", arrow::binary(), false),
-	    arrow::field("partition_id", arrow::int64(), false),
-	    arrow::field("row_idx", arrow::int64(), false),
-	    arrow::field("count", arrow::int64(), false),
-	    arrow::field("frames_per_row", arrow::list(arrow::field("item", arrow::int64(), true)), false),
-	    arrow::field("frame_starts", arrow::list(arrow::field("item", arrow::int64(), true)), false),
-	    arrow::field("frame_ends", arrow::list(arrow::field("item", arrow::int64(), true)), false),
-	    arrow::field("attach_opaque_data", arrow::binary(), true),
-	    arrow::field("schema_name", arrow::utf8(), true),
-	});
-
 	arrow::StringBuilder fn_b;
 	arrow::BinaryBuilder eid_b, aid_b;
 	arrow::Int64Builder pid_b, row_idx_b, count_b;
@@ -312,23 +277,16 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateWindowBatchRequest(
 	ThrowOnArrowError(ends_b.Finish(&ends_a));
 	ThrowOnArrowError(aid_b.Finish(&aid_a));
 
-	return WrapAsRpcParams(arrow::RecordBatch::Make(
-	    schema, 1, {fn_a, eid_a, pid_a, row_idx_a, count_a, fpr_a, starts_a, ends_a, aid_a,
-	                MakeSingleStringArrayOrNull(schema_name)}));
+	auto request = arrow::RecordBatch::Make(generated::AggregateWindowBatchRequestSchema(), 1,
+	                                        {fn_a, eid_a, pid_a, row_idx_a, count_a, fpr_a, starts_a, ends_a, aid_a,
+	                                         BuildOptionalStringListScalar(OptionalSingleSchemaPath(schema_name))});
+	return generated::BuildAggregateWindowBatchParams(SerializeToIpcBytes(request));
 }
 
 std::shared_ptr<arrow::RecordBatch> BuildAggregateWindowDestructorRequest(
     const std::string &function_name, const std::string &schema_name,
     const std::vector<uint8_t> &execution_id,
     const std::vector<uint8_t> &attach_opaque_data, int64_t partition_id) {
-	auto schema = arrow::schema({
-	    arrow::field("function_name", arrow::utf8(), false),
-	    arrow::field("execution_id", arrow::binary(), false),
-	    arrow::field("partition_id", arrow::int64(), false),
-	    arrow::field("attach_opaque_data", arrow::binary(), true),
-	    arrow::field("schema_name", arrow::utf8(), true),
-	});
-
 	arrow::StringBuilder fn_b;
 	arrow::BinaryBuilder eid_b, aid_b;
 	arrow::Int64Builder pid_b;
@@ -348,8 +306,10 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateWindowDestructorRequest(
 	ThrowOnArrowError(pid_b.Finish(&pid_a));
 	ThrowOnArrowError(aid_b.Finish(&aid_a));
 
-	return WrapAsRpcParams(arrow::RecordBatch::Make(
-	    schema, 1, {fn_a, eid_a, pid_a, aid_a, MakeSingleStringArrayOrNull(schema_name)}));
+	auto request = arrow::RecordBatch::Make(
+	    generated::AggregateWindowDestructorRequestSchema(), 1,
+	    {fn_a, eid_a, pid_a, aid_a, BuildOptionalStringListScalar(OptionalSingleSchemaPath(schema_name))});
+	return generated::BuildAggregateWindowDestructorParams(SerializeToIpcBytes(request));
 }
 
 } // anonymous namespace
