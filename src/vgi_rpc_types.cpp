@@ -475,48 +475,8 @@ std::vector<uint8_t> SerializeForeignKeyToIpcBytes(const std::vector<std::string
                                                     const std::vector<std::string> &pk_columns,
                                                     const std::string &referenced_table,
                                                     const std::string &referenced_schema) {
-	// Build a single-row batch matching the Python ForeignKeyDef format. This
-	// nested dataclass is not currently emitted as a standalone generated schema.
-	auto fk_schema = arrow::schema({
-	    arrow::field("fk_columns", arrow::list(arrow::utf8())),
-	    arrow::field("pk_columns", arrow::list(arrow::utf8())),
-	    arrow::field("referenced_table", arrow::utf8()),
-	    arrow::field("referenced_schema_path", arrow::list(arrow::utf8())),
-	});
-
-	// Build fk_columns array
-	auto fk_builder = std::make_shared<arrow::ListBuilder>(arrow::default_memory_pool(),
-	                                                        std::make_shared<arrow::StringBuilder>());
-	auto fk_val_builder = dynamic_cast<arrow::StringBuilder *>(fk_builder->value_builder());
-	CheckStatus(fk_builder->Append(), "fk list append");
-	for (auto &col : fk_columns) {
-		CheckStatus(fk_val_builder->Append(col), "fk col append");
-	}
-	auto fk_arr_result = fk_builder->Finish();
-	CheckStatus(fk_arr_result.status(), "fk finish");
-
-	// Build pk_columns array
-	auto pk_builder = std::make_shared<arrow::ListBuilder>(arrow::default_memory_pool(),
-	                                                        std::make_shared<arrow::StringBuilder>());
-	auto pk_val_builder = dynamic_cast<arrow::StringBuilder *>(pk_builder->value_builder());
-	CheckStatus(pk_builder->Append(), "pk list append");
-	for (auto &col : pk_columns) {
-		CheckStatus(pk_val_builder->Append(col), "pk col append");
-	}
-	auto pk_arr_result = pk_builder->Finish();
-	CheckStatus(pk_arr_result.status(), "pk finish");
-
-	// Build scalar string arrays
-	arrow::StringBuilder ref_table_builder;
-	CheckStatus(ref_table_builder.Append(referenced_table), "ref table");
-	auto ref_table_result = ref_table_builder.Finish();
-	CheckStatus(ref_table_result.status(), "ref table finish");
-
-	auto batch = arrow::RecordBatch::Make(fk_schema, 1,
-	                                      {fk_arr_result.ValueUnsafe(), pk_arr_result.ValueUnsafe(),
-	                                       ref_table_result.ValueUnsafe(),
-	                                       BuildStringListScalar(SingleSchemaPath(referenced_schema))});
-	return SerializeToIpcBytes(batch);
+	return SerializeToIpcBytes(
+	    generated::BuildForeignKeyInfo(fk_columns, pk_columns, referenced_table, SingleSchemaPath(referenced_schema)));
 }
 
 // ============================================================================
@@ -1364,40 +1324,11 @@ TableFunctionCardinalityResult ParseTableFunctionCardinalityResult(const std::sh
 //! because whether they are loadable is a per-session question this static list
 //! cannot answer.
 static std::vector<uint8_t> BuildClientCapabilitiesBytes() {
-	auto schema = arrow::schema({
-	    arrow::field("engine", arrow::utf8(), false),
-	    arrow::field("native_formats", arrow::list(arrow::utf8()), false),
-	    arrow::field("catalogs", arrow::list(arrow::utf8()), false),
-	    arrow::field("can_stream", arrow::boolean(), false),
-	    arrow::field("filter_encodings", arrow::list(arrow::utf8()), false),
-	});
-
-	auto string_list = [](const std::vector<std::string> &values) {
-		auto value_builder = std::make_shared<arrow::StringBuilder>();
-		arrow::ListBuilder list_builder(arrow::default_memory_pool(), value_builder);
-		CheckStatus(list_builder.Append(), "open list");
-		for (const auto &v : values) {
-			CheckStatus(value_builder->Append(v), "append list value");
-		}
-		return FinishArray(list_builder, "string list");
-	};
-
-	std::vector<std::shared_ptr<arrow::Array>> arrays;
-	arrays.push_back(BuildStringScalar("duckdb"));
-	arrays.push_back(string_list({"parquet", "csv", "json"}));
-	arrays.push_back(string_list({"ducklake", "iceberg", "postgres", "mysql", "sqlite", "duckdb"}));
-	{
-		arrow::BooleanBuilder b;
-		// DuckDB has no streaming scan: positions ride the wire but nothing reads
-		// them. Saying false here is what stops a worker handing back an unbounded
-		// split this client could never terminate.
-		CheckStatus(b.Append(false), "can_stream");
-		arrays.push_back(FinishArray(b, "can_stream"));
-	}
-	arrays.push_back(string_list({"vgi.filters.v1"}));
-
-	auto batch = arrow::RecordBatch::Make(schema, 1, arrays);
-	return SerializeToIpcBytes(batch);
+	// DuckDB has no streaming scan: saying false prevents a worker from
+	// returning an unbounded split this client could never terminate.
+	return SerializeToIpcBytes(generated::BuildClientCapabilities(
+	    "duckdb", {"parquet", "csv", "json"}, {"ducklake", "iceberg", "postgres", "mysql", "sqlite", "duckdb"}, false,
+	    {"vgi.filters.v1"}));
 }
 
 std::shared_ptr<arrow::RecordBatch> BuildCatalogAttachRequest(
