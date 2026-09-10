@@ -15,6 +15,7 @@
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
+#include "duckdb/planner/expression/bound_operator_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/planner/filter/optional_filter.hpp"
@@ -211,6 +212,95 @@ TEST_CASE("filter v2 chooses exact inline and external IN encodings", "[filter-v
 	REQUIRE(empty.join_keys_buffers.empty());
 	REQUIRE(empty_batch->schema()->field(1)->name() == "value_0");
 	REQUIRE(FilterSpec(empty_batch).find("\"node\":\"literal\",\"value_ref\":0") != std::string::npos);
+}
+
+TEST_CASE("filter v2 safely serializes expression IN lists", "[filter-v2]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	for (auto expression_type : {ExpressionType::COMPARE_IN, ExpressionType::COMPARE_NOT_IN}) {
+		CAPTURE(expression_type);
+		auto expression = make_uniq<BoundOperatorExpression>(expression_type, LogicalType::BOOLEAN);
+		expression->children.push_back(make_uniq<BoundReferenceExpression>(LogicalType::VARCHAR, 0));
+		expression->children.push_back(make_uniq<BoundConstantExpression>(Value("green")));
+		expression->children.push_back(make_uniq<BoundConstantExpression>(Value("blue")));
+		TableFilterSet filters;
+		filters.filters[0] = make_uniq<ExpressionFilter>(std::move(expression));
+
+		auto batch = ReadBatch(VgiSerializeFilters(*con.context, {0}, &filters, {"color"}, "test-worker").filter_bytes);
+		auto json = FilterSpec(batch);
+		REQUIRE(json.find("\"node\":\"in\"") != std::string::npos);
+		REQUIRE(json.find(expression_type == ExpressionType::COMPARE_NOT_IN ? "\"negated\":true"
+		                                                                      : "\"negated\":false") !=
+		        std::string::npos);
+		REQUIRE(batch->schema()->field(1)->type()->id() == arrow::Type::LIST);
+	}
+}
+
+TEST_CASE("filter v2 maps DuckDB standard functions to canonical names", "[filter-v2]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	struct StandardFunctionCase {
+		const char *bound_name;
+		const char *wire_name;
+		LogicalType input_type;
+	};
+	const StandardFunctionCase cases[] = {
+	    {"prefix", "starts_with", LogicalType::VARCHAR},
+	    {"suffix", "ends_with", LogicalType::VARCHAR},
+	    {"contains", "contains", LogicalType::VARCHAR},
+	    {"list_contains", "list_contains", LogicalType::LIST(LogicalType::VARCHAR)},
+	};
+	for (const auto &entry : cases) {
+		CAPTURE(entry.bound_name);
+		vector<unique_ptr<Expression>> arguments;
+		arguments.push_back(make_uniq<BoundReferenceExpression>(entry.input_type, 0));
+		arguments.push_back(make_uniq<BoundConstantExpression>(Value("needle")));
+		ScalarFunction function(entry.bound_name, {entry.input_type, LogicalType::VARCHAR}, LogicalType::BOOLEAN,
+		                        scalar_function_t {});
+		function.catalog_name = "system";
+		function.schema_name = "main";
+		auto call = make_uniq<BoundFunctionExpression>(LogicalType::BOOLEAN, std::move(function), std::move(arguments),
+		                                               nullptr);
+		TableFilterSet filters;
+		filters.filters[0] = make_uniq<ExpressionFilter>(std::move(call));
+
+		auto json = FilterSpec(
+		    ReadBatch(VgiSerializeFilters(*con.context, {0}, &filters, {"input"}, "test-worker").filter_bytes));
+		REQUIRE(json.find(string("\"function\":\"") + entry.wire_name + "\"") != std::string::npos);
+	}
+
+	vector<unique_ptr<Expression>> arguments;
+	arguments.push_back(make_uniq<BoundReferenceExpression>(LogicalType::VARCHAR, 0));
+	arguments.push_back(make_uniq<BoundConstantExpression>(Value("needle")));
+	ScalarFunction shadowed_function("contains", {LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::BOOLEAN,
+	                                 scalar_function_t {});
+	shadowed_function.catalog_name = "user_catalog";
+	shadowed_function.schema_name = "main";
+	auto call = make_uniq<BoundFunctionExpression>(LogicalType::BOOLEAN, std::move(shadowed_function),
+	                                               std::move(arguments), nullptr);
+	TableFilterSet filters;
+	filters.filters[0] = make_uniq<ExpressionFilter>(std::move(call));
+	REQUIRE_THROWS_AS(VgiSerializeFilters(*con.context, {0}, &filters, {"input"}, "test-worker"),
+	                  InvalidInputException);
+
+	auto require_unsupported = [&](const char *name, const LogicalType &first_type, const LogicalType &second_type) {
+		vector<unique_ptr<Expression>> rejected_arguments;
+		rejected_arguments.push_back(make_uniq<BoundReferenceExpression>(first_type, 0));
+		rejected_arguments.push_back(make_uniq<BoundConstantExpression>(Value(second_type)));
+		ScalarFunction rejected_function(name, {first_type, second_type}, LogicalType::BOOLEAN, scalar_function_t {});
+		rejected_function.catalog_name = "system";
+		rejected_function.schema_name = "main";
+		auto rejected_call = make_uniq<BoundFunctionExpression>(LogicalType::BOOLEAN, std::move(rejected_function),
+		                                                       std::move(rejected_arguments), nullptr);
+		TableFilterSet rejected_filters;
+		rejected_filters.filters[0] = make_uniq<ExpressionFilter>(std::move(rejected_call));
+		REQUIRE_THROWS_AS(VgiSerializeFilters(*con.context, {0}, &rejected_filters, {"input"}, "test-worker"),
+		                  InvalidInputException);
+	};
+	require_unsupported("list_contains", LogicalType::LIST(LogicalType::INTEGER), LogicalType::VARCHAR);
+	require_unsupported("contains", LogicalType::VARCHAR_COLLATION("nocase"), LogicalType::VARCHAR);
+	require_unsupported("list_contains", LogicalType::LIST(LogicalType::VARCHAR_COLLATION("nocase")),
+	                    LogicalType::VARCHAR_COLLATION("nocase"));
 }
 
 TEST_CASE("required IN exceeding the transport limit fails closed", "[filter-v2]") {
