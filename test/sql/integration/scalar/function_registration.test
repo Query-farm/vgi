@@ -417,11 +417,13 @@ geo_centroid_struct	STRUCT(lat DOUBLE, lon DOUBLE)
 sum_values	ANY
 
 # Verify all portable non-varargs rows, while allowing the three Rust-only
-# non-varargs additions described above.
+# non-varargs additions described above. The named-argument probe is asserted
+# separately in the inventory section.
 query I
 SELECT COUNT(*) BETWEEN 46 AND 49
 FROM duckdb_functions()
-WHERE database_name = 'example' AND function_type = 'scalar' AND varargs IS NULL;
+WHERE database_name = 'example' AND function_type = 'scalar' AND varargs IS NULL
+  AND function_name <> 'argument_names_probe';
 ----
 true
 
@@ -446,7 +448,8 @@ random_int
 query I
 SELECT COUNT(*) BETWEEN 49 AND 52
 FROM duckdb_functions()
-WHERE database_name = 'example' AND function_type = 'scalar' AND stability = 'CONSISTENT';
+WHERE database_name = 'example' AND function_type = 'scalar' AND stability = 'CONSISTENT'
+  AND function_name <> 'argument_names_probe';
 ----
 true
 
