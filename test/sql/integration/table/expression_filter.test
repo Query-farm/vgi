@@ -124,6 +124,28 @@ WHERE list_contains(tags, 'tag_0');
 physical_plan	<!REGEX>:(?s).*FILTER.*EXPRESSION_FILTER_TEST.*
 
 # ============================================================================
+# NON-SPATIAL: Prove bound string functions are pushed down
+# ============================================================================
+
+query II
+EXPLAIN SELECT * FROM example.expression_filter_test(100)
+WHERE starts_with(name, 'item_9');
+----
+physical_plan	<!REGEX>:(?s).*FILTER.*EXPRESSION_FILTER_TEST.*
+
+query II
+EXPLAIN SELECT * FROM example.expression_filter_test(100)
+WHERE ends_with(name, '_9');
+----
+physical_plan	<!REGEX>:(?s).*FILTER.*EXPRESSION_FILTER_TEST.*
+
+query II
+EXPLAIN SELECT * FROM example.expression_filter_test(100)
+WHERE contains(name, '_5');
+----
+physical_plan	<!REGEX>:(?s).*FILTER.*EXPRESSION_FILTER_TEST.*
+
+# ============================================================================
 # NON-SPATIAL: Prove unsupported function is NOT pushed (FILTER node exists)
 # ============================================================================
 
