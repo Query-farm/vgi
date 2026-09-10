@@ -400,6 +400,32 @@ bool IsIntersectsExtentFunction(const BoundFunctionExpression &function,
 	       HasFilterFunctionCapability(additional_functions, "duckdb.spatial", "intersects_extent", 1);
 }
 
+const char *StandardFilterFunctionName(const BoundFunctionExpression &function) {
+	if (function.children.size() != 2 || function.return_type.id() != LogicalTypeId::BOOLEAN ||
+	    function.function.catalog_name != "system" || function.function.schema_name != "main") {
+		return nullptr;
+	}
+	auto name = StringUtil::Lower(function.function.name);
+	auto first_type = function.children[0]->return_type.id();
+	auto second_type = function.children[1]->return_type.id();
+	if ((name == "starts_with" || name == "prefix") && first_type == LogicalTypeId::VARCHAR &&
+	    second_type == LogicalTypeId::VARCHAR) {
+		return "starts_with";
+	}
+	if ((name == "ends_with" || name == "suffix") && first_type == LogicalTypeId::VARCHAR &&
+	    second_type == LogicalTypeId::VARCHAR) {
+		return "ends_with";
+	}
+	if (name == "contains" && first_type == LogicalTypeId::VARCHAR && second_type == LogicalTypeId::VARCHAR) {
+		return "contains";
+	}
+	if ((name == "list_contains" || name == "array_contains" || name == "contains") &&
+	    first_type == LogicalTypeId::LIST) {
+		return "list_contains";
+	}
+	return nullptr;
+}
+
 //! Pure eligibility check shared by the pushdown callback and v2 serializer.
 //! DuckDB 1.5 calls this before replacing the sole BoundColumnRef with a
 //! BoundReferenceExpression, so both forms are accepted as the same root.
@@ -413,7 +439,8 @@ bool ExpressionTreeIsSupported(const Expression &expr,
 		return true;
 	case ExpressionClass::BOUND_FUNCTION: {
 		auto &function = expr.Cast<BoundFunctionExpression>();
-		if (!IsIntersectsExtentFunction(function, additional_functions)) {
+		auto standard_name = StandardFilterFunctionName(function);
+		if (!standard_name && !IsIntersectsExtentFunction(function, additional_functions)) {
 			return false;
 		}
 		for (const auto &child : function.children) {
@@ -844,15 +871,18 @@ private:
 			return Literal(expr.Cast<BoundConstantExpression>().value);
 		case ExpressionClass::BOUND_FUNCTION: {
 			auto &function = expr.Cast<BoundFunctionExpression>();
-			if (!IsIntersectsExtentFunction(function, additional_functions_)) {
+			yyjson_mut_obj_add_str(doc_, obj, "node", "call");
+			if (auto standard_name = StandardFilterFunctionName(function)) {
+				yyjson_mut_obj_add_str(doc_, obj, "function", standard_name);
+			} else if (IsIntersectsExtentFunction(function, additional_functions_)) {
+				auto identity = yyjson_mut_obj(doc_);
+				yyjson_mut_obj_add_str(doc_, identity, "namespace", "duckdb.spatial");
+				yyjson_mut_obj_add_str(doc_, identity, "name", "intersects_extent");
+				yyjson_mut_obj_add_uint(doc_, identity, "version", 1);
+				yyjson_mut_obj_add_val(doc_, obj, "function", identity);
+			} else {
 				break;
 			}
-			yyjson_mut_obj_add_str(doc_, obj, "node", "call");
-			auto identity = yyjson_mut_obj(doc_);
-			yyjson_mut_obj_add_str(doc_, identity, "namespace", "duckdb.spatial");
-			yyjson_mut_obj_add_str(doc_, identity, "name", "intersects_extent");
-			yyjson_mut_obj_add_uint(doc_, identity, "version", 1);
-			yyjson_mut_obj_add_val(doc_, obj, "function", identity);
 			auto arguments = yyjson_mut_arr(doc_);
 			for (const auto &child : function.children) {
 				yyjson_mut_arr_append(arguments, SerializeExpression(*child, column_index, column_name));
