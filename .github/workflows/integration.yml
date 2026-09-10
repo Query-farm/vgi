@@ -12,17 +12,15 @@
 # they are deliberately absent from the published wheel, which would otherwise
 # pollute end-user PATH.
 #
-# VGI_FIXTURES_REF pins the revision, and it pins to a RELEASE TAG, not `main`.
-# Defaulting to `main` made every run depend on whatever was pushed there at the
-# time: a protocol bump landing on either side flipped CI from green to a failed
-# ATTACH with no change to this repo, and — worse — a green run proved nothing
-# about any released worker. The tag makes the run reproducible and turns
-# "vgi-python moved" into an explicit one-line bump here, which is the only
-# place that decision should be visible.
+# VGI_FIXTURES_REF pins the revision to a release tag, or to an exact commit
+# while the matching protocol release is being prepared. Never default it to
+# `main`: a protocol bump landing on either side would make otherwise unchanged
+# integration runs non-reproducible.
 #
-# Bump this in lockstep with the protocol: it must name a vgi-python release
+# Bump this in lockstep with the protocol: it must name a vgi-python revision
 # speaking the same VGI_PROTOCOL_VERSION as src/, or ATTACH fails with a message
-# naming both versions. Override per-run via the workflow_dispatch input.
+# naming both versions. Replace an interim commit with its release tag once the
+# release exists. Override per-run via the workflow_dispatch input.
 name: Integration suite
 
 on:
@@ -33,7 +31,7 @@ on:
       fixtures_ref:
         description: "vgi-python revision to take the fixture workers from"
         required: false
-        default: main
+        default: 023906a7cf8df699415a36cdb2c08462a9eef183
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -47,7 +45,8 @@ jobs:
     env:
       VGI_INSTALL_FIXTURES: "1"
       VGI_FIXTURES_DIR: /tmp/vgi-python
-      VGI_FIXTURES_REF: ${{ inputs.fixtures_ref || 'v0.31.2' }}
+      # vgi-python protocol 2.0.0; replace with its release tag when published.
+      VGI_FIXTURES_REF: ${{ inputs.fixtures_ref || '023906a7cf8df699415a36cdb2c08462a9eef183' }}
       GEN: ninja
       BUILD_VGI_FILTER_V2_TESTS: "1"
       USE_MERGED_VCPKG_MANIFEST: "1"
