@@ -216,6 +216,25 @@ std::shared_ptr<arrow::Array> BuildOptionalStringListScalar(const std::optional<
 	return FinishArray(list_builder, "optional_string_list");
 }
 
+std::shared_ptr<arrow::Array>
+BuildNullableStringListScalar(const std::optional<std::vector<std::optional<std::string>>> &values) {
+	auto value_builder = std::make_shared<arrow::StringBuilder>();
+	arrow::ListBuilder list_builder(arrow::default_memory_pool(), value_builder);
+	if (!values.has_value()) {
+		CheckStatus(list_builder.AppendNull(), "append null nullable string list");
+	} else {
+		CheckStatus(list_builder.Append(), "start nullable string list");
+		for (const auto &value : *values) {
+			if (value.has_value()) {
+				CheckStatus(value_builder->Append(*value), "append nullable string item");
+			} else {
+				CheckStatus(value_builder->AppendNull(), "append null string item");
+			}
+		}
+	}
+	return FinishArray(list_builder, "nullable_string_list");
+}
+
 std::vector<std::string> SingleSchemaPath(const std::string &schema_name) {
 	if (schema_name.empty()) {
 		throw IOException("VGI schema name cannot be empty");
@@ -536,7 +555,8 @@ BuildBindRequest(const std::string &function_name, const std::vector<uint8_t> &a
                  const std::vector<uint8_t> &attach_opaque_data, const std::vector<uint8_t> &transaction_opaque_data,
                  bool resolved_secrets_provided, const std::string &at_unit, const std::string &at_value,
                  const CopyFromBindContext *copy_from, const CopyToBindContext *copy_to,
-                 const std::string &schema_name) {
+                 const std::string &schema_name,
+                 const std::optional<std::vector<std::optional<std::string>>> &argument_names) {
 	// FunctionType enum: SCALAR, TABLE, AGGREGATE
 	static const std::vector<std::string> function_type_values = {"SCALAR", "TABLE", "AGGREGATE"};
 
@@ -616,6 +636,7 @@ BuildBindRequest(const std::string &function_name, const std::vector<uint8_t> &a
 	// than one schema. Empty string serialises as null, which tells the worker
 	// to fall back to a cross-schema lookup by name. Last, per the protocol.
 	arrays.push_back(BuildOptionalStringListScalar(OptionalSingleSchemaPath(schema_name)));
+	arrays.push_back(BuildNullableStringListScalar(argument_names));
 
 	return arrow::RecordBatch::Make(generated::BindRequestSchema(), 1, arrays);
 }

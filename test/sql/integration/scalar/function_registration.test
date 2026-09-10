@@ -52,6 +52,7 @@ ORDER BY function_name;
 add_values
 any_mixed
 any_mixed
+argument_names_probe
 bernoulli
 binary_packet
 cached_add_const

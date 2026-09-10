@@ -110,6 +110,8 @@ std::shared_ptr<arrow::Array> BuildOptionalInt64Scalar(std::optional<int64_t> va
 // list<utf8>, list<binary>, list<int32>, list<int64> — single-row lists, always non-null.
 std::shared_ptr<arrow::Array> BuildStringListScalar(const std::vector<std::string> &values);
 std::shared_ptr<arrow::Array> BuildOptionalStringListScalar(const std::optional<std::vector<std::string>> &values);
+std::shared_ptr<arrow::Array>
+BuildNullableStringListScalar(const std::optional<std::vector<std::optional<std::string>>> &values);
 std::shared_ptr<arrow::Array> BuildBinaryListScalar(const std::vector<std::vector<uint8_t>> &values);
 std::shared_ptr<arrow::Array> BuildInt32ListScalar(const std::vector<int32_t> &values);
 std::shared_ptr<arrow::Array> BuildInt64ListScalar(const std::vector<int64_t> &values);
@@ -178,7 +180,10 @@ BuildBindRequest(const std::string &function_name, const std::vector<uint8_t> &a
                  // function name in more than one schema, so the bare name is not a unique
                  // key — the worker resolves (schema_path, function_name). Empty = null,
                  // which makes the worker fall back to a cross-schema name lookup.
-                 const std::string &schema_name = {});
+                 const std::string &schema_name = {},
+                 // Resolved names aligned with the complete logical argument list.
+                 // A null list means unavailable; null elements are unnamed varargs.
+                 const std::optional<std::vector<std::optional<std::string>>> &argument_names = std::nullopt);
 
 // Parsed BindResponse
 struct BindResponseResult {

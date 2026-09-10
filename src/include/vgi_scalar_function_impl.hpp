@@ -2,6 +2,7 @@
 #pragma once
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 #include <map>
@@ -103,6 +104,7 @@ struct VgiScalarFunctionBindData : public FunctionData {
 
 	// Input schema built from argument types during bind (after const params erased)
 	std::shared_ptr<arrow::Schema> input_schema;
+	std::optional<std::vector<std::optional<std::string>>> argument_names;
 
 	// DuckDB-side input types corresponding to `input_schema`, captured at
 	// bind time. Used at execute time to cast incoming DataChunk columns back
@@ -126,6 +128,7 @@ struct VgiScalarFunctionBindData : public FunctionData {
 		copy->secret_dependent = secret_dependent;
 		copy->resolved_output_schema = resolved_output_schema;
 		copy->input_schema = input_schema;
+		copy->argument_names = argument_names;
 		copy->input_duckdb_types = input_duckdb_types;
 		copy->const_values = const_values;
 		return copy;

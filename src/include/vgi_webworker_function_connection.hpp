@@ -104,6 +104,10 @@ public:
 	void SetSchemaName(const std::string &schema_name) override {
 		schema_name_ = schema_name;
 	}
+	void SetArgumentNames(
+	    const std::optional<std::vector<std::optional<std::string>>> &argument_names) override {
+		argument_names_ = argument_names;
+	}
 
 	void SetAtClause(const std::string &at_unit, const std::string &at_value) override {
 		at_unit_ = at_unit;
@@ -265,6 +269,7 @@ private:
 	std::string at_value_;
 	// Catalog schema owning the function (empty = none). See SetSchemaName.
 	std::string schema_name_;
+	std::optional<std::vector<std::optional<std::string>>> argument_names_;
 
 	// COPY ... FROM / TO context for the bind request (empty = none).
 	std::optional<CopyFromBindContext> copy_from_;

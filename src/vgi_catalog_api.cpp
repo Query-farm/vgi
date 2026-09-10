@@ -2970,6 +2970,66 @@ VgiFunctionInfo ParseFunctionInfo(const std::shared_ptr<arrow::RecordBatch> &bat
 		info.output_schema = DeserializeSchema(output_data);
 	}
 
+	// Typed parameter defaults are transported as an IPC-serialized one-row
+	// RecordBatch. Keep the bytes on VgiFunctionInfo so DuckDB 1.5 can preserve
+	// the VGI 2.0 contract even though its scalar/aggregate registration API
+	// cannot install defaults yet.
+	auto parameter_defaults = row["parameter_default_values"].as<std::vector<uint8_t>>();
+	if (parameter_defaults) {
+		auto defaults_batch = DeserializeFromIpcBytes(parameter_defaults->data(), parameter_defaults->size());
+		if (!defaults_batch || defaults_batch->num_rows() != 1) {
+			throw IOException("Function '%s' parameter_default_values must contain exactly one row", info.name);
+		}
+		if (!info.arguments_schema) {
+			throw IOException("Function '%s' has parameter_default_values without an arguments schema", info.name);
+		}
+
+		int previous_argument_index = -1;
+		for (const auto &default_field : defaults_batch->schema()->fields()) {
+			const auto argument_index = info.arguments_schema->GetFieldIndex(default_field->name());
+			if (argument_index < 0) {
+				throw IOException("Function '%s' has a default for unknown parameter '%s'", info.name,
+				                  default_field->name());
+			}
+			if (argument_index <= previous_argument_index) {
+				throw IOException("Function '%s' parameter defaults are not in signature order", info.name);
+			}
+			const auto &argument_field = info.arguments_schema->field(argument_index);
+			if (!argument_field->type()->Equals(default_field->type())) {
+				throw IOException("Function '%s' default for parameter '%s' has type %s, expected %s", info.name,
+				                  default_field->name(), default_field->type()->ToString(),
+				                  argument_field->type()->ToString());
+			}
+			previous_argument_index = argument_index;
+		}
+
+		if (info.function_type == VgiFunctionType::Scalar || info.function_type == VgiFunctionType::Aggregate) {
+			const auto default_count = defaults_batch->num_columns();
+			int fixed_parameter_count = info.arguments_schema->num_fields();
+			if (fixed_parameter_count > 0) {
+				const auto &last_field = info.arguments_schema->field(fixed_parameter_count - 1);
+				if (last_field->HasMetadata()) {
+					const auto metadata = last_field->metadata();
+					const auto varargs_index = metadata->FindKey(VGI_VARARGS_METADATA_KEY);
+					if (varargs_index >= 0 && metadata->value(varargs_index) == VGI_VARARGS_TRUE_VALUE) {
+						fixed_parameter_count--;
+					}
+				}
+			}
+			if (default_count > fixed_parameter_count) {
+				throw IOException("Function '%s' has more defaults than parameters", info.name);
+			}
+			for (int default_index = 0; default_index < default_count; default_index++) {
+				const auto expected_parameter = fixed_parameter_count - default_count + default_index;
+				if (defaults_batch->schema()->field(default_index)->name() !=
+				    info.arguments_schema->field(expected_parameter)->name()) {
+					throw IOException("Function '%s' defaults must form a trailing parameter sequence", info.name);
+				}
+			}
+		}
+		info.parameter_default_values_bytes = std::move(*parameter_defaults);
+	}
+
 	// Table function capabilities (nullable booleans, stored as optional)
 	info.projection_pushdown = row["projection_pushdown"].as<bool>();
 	info.filter_pushdown = row["filter_pushdown"].as<bool>();

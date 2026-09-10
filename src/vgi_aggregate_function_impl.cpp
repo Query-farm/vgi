@@ -47,7 +47,8 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateBindRequest(
     const std::shared_ptr<arrow::Schema> &input_schema,
     ClientContext &context, const std::map<std::string, Value> &settings,
     const std::vector<vgi::VgiSecretRequirement> &required_secrets,
-    const vgi::ArrowArguments &arrow_arguments = {}) {
+    const vgi::ArrowArguments &arrow_arguments,
+    const std::optional<std::vector<std::optional<std::string>>> &argument_names) {
 
 	auto schema_buf_result = arrow::ipc::SerializeSchema(*input_schema);
 	ThrowOnArrowError(schema_buf_result.status());
@@ -91,6 +92,7 @@ std::shared_ptr<arrow::RecordBatch> BuildAggregateBindRequest(
 	                                 vgi::MakeSingleBinaryArrayOrNull(secrets_ipc_bytes),
 	                                 vgi::MakeSingleBinaryArrayOrNull(attach_opaque_data),
 	                                 vgi::BuildOptionalStringListScalar(vgi::OptionalSingleSchemaPath(schema_name)),
+	                                 vgi::BuildNullableStringListScalar(argument_names),
 	                             });
 	return vgi::generated::BuildAggregateBindParams(vgi::SerializeToIpcBytes(request));
 }
@@ -693,6 +695,18 @@ unique_ptr<FunctionData> VgiAggregateFunctionBind(ClientContext &context, Aggreg
 	}
 	bool const_args_already_erased = !func_info.positional_is_const.empty() &&
 	                                  arguments.size() == expected_non_const;
+	idx_t const_parameter_count = func_info.positional_is_const.size() - expected_non_const;
+	idx_t logical_argument_count =
+	    const_args_already_erased ? arguments.size() + const_parameter_count : arguments.size();
+	std::vector<std::optional<std::string>> resolved_argument_names;
+	resolved_argument_names.reserve(logical_argument_count);
+	for (idx_t i = 0; i < logical_argument_count; i++) {
+		if (i < func_info.positional_names.size()) {
+			resolved_argument_names.emplace_back(func_info.positional_names[i]);
+		} else {
+			resolved_argument_names.emplace_back(std::nullopt);
+		}
+	}
 
 	if (!const_args_already_erased) {
 		for (idx_t i = 0; i < arguments.size() && i < func_info.positional_is_const.size(); i++) {
@@ -750,7 +764,7 @@ unique_ptr<FunctionData> VgiAggregateFunctionBind(ClientContext &context, Aggreg
 	auto request = BuildAggregateBindRequest(func_info.function_name, func_info.schema_name,
 	                                          func_info.attach_opaque_data, input_schema,
 	                                          context, settings, func_info.required_secrets,
-	                                          arrow_arguments);
+	                                          arrow_arguments, resolved_argument_names);
 
 	auto bind_data = make_uniq<VgiAggregateBindData>();
 	bind_data->attach_params = func_info.attach_params;

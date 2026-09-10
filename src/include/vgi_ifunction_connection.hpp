@@ -117,6 +117,14 @@ public:
 		(void)schema_name;
 	}
 
+	// Set resolved argument names for the bind request. The list is aligned
+	// with the complete logical argument order; null elements are unnamed
+	// varargs. A null list means the engine cannot provide names.
+	virtual void SetArgumentNames(
+	    const std::optional<std::vector<std::optional<std::string>>> &argument_names) {
+		(void)argument_names;
+	}
+
 	// Set the stable, client-minted per-substream id carried on the InitRequest
 	// for the parallel streaming table-in-out path (see InitRequest.substream_id).
 	// It is the same for this substream's init / process / finalize, so a

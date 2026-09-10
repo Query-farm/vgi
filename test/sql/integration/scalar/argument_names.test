@@ -1,0 +1,20 @@
+# name: test/sql/integration/scalar/argument_names.test
+# description: VGI 2.0 resolved scalar argument names on DuckDB 1.5
+# group: [vgi_integration_scalar]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# The fixture rejects bind unless it sees all three logical names, including
+# the ConstParam that the extension removes before execution. DuckDB 1.5 still
+# requires the defaulted argument to be supplied positionally.
+query I
+SELECT example.argument_names_probe(3, 4, 5);
+----
+35

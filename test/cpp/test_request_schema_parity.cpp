@@ -189,6 +189,23 @@ TEST_CASE("BuildBindRequest matches with time travel and a schema name", "[schem
 	    BuildBindRequest("f", {}, "TABLE", {}, {}, {}, {}, {}, false, "version", "3", nullptr, nullptr, "data"));
 }
 
+TEST_CASE("BuildBindRequest carries resolved argument names", "[schema-parity]") {
+	std::optional<std::vector<std::optional<std::string>>> argument_names = {
+	    std::vector<std::optional<std::string>> {"value", std::nullopt, "named_tail"}};
+	auto request = BuildBindRequest("f", {}, "SCALAR", {}, {}, {}, {}, {}, false, {}, {}, nullptr, nullptr,
+	                                "main", argument_names);
+	RequireMatches("BindRequest(argument_names)", generated::BindRequestSchema(), request);
+
+	auto names = std::dynamic_pointer_cast<arrow::ListArray>(request->GetColumnByName("argument_names"));
+	REQUIRE(names);
+	REQUIRE_FALSE(names->IsNull(0));
+	auto values = std::dynamic_pointer_cast<arrow::StringArray>(names->values());
+	REQUIRE(values);
+	REQUIRE(values->GetString(0) == "value");
+	REQUIRE(values->IsNull(1));
+	REQUIRE(values->GetString(2) == "named_tail");
+}
+
 TEST_CASE("DuckDB 1.5 schema paths preserve one component and reject nesting", "[schema-path]") {
 	REQUIRE(SingleSchemaPath("analytics") == std::vector<std::string> {"analytics"});
 	REQUIRE(SchemaNameFromPath({"analytics"}, "test.path") == "analytics");

@@ -121,6 +121,20 @@ unique_ptr<FunctionData> VgiScalarFunctionBind(ClientContext &context, ScalarFun
 	}
 	const auto &func_info = live_info ? *live_info : registered_info;
 
+	// DuckDB 1.5 has no named scalar-call syntax, but VGI 2.0 still carries the
+	// resolved parameter names so every engine presents the worker with the same
+	// bind shape. Fixed slots use the declared schema names; extra varargs are
+	// unnamed. Capture this before ConstParam expressions are erased below.
+	std::vector<std::optional<std::string>> resolved_argument_names;
+	resolved_argument_names.reserve(arguments.size());
+	for (idx_t i = 0; i < arguments.size(); i++) {
+		if (i < func_info.positional_names.size()) {
+			resolved_argument_names.emplace_back(func_info.positional_names[i]);
+		} else {
+			resolved_argument_names.emplace_back(std::nullopt);
+		}
+	}
+
 	// Extract settings from context using setting_names registered during catalog load
 	auto settings = ExtractVgiSettings(context, func_info.setting_names);
 
@@ -280,6 +294,7 @@ unique_ptr<FunctionData> VgiScalarFunctionBind(ClientContext &context, ScalarFun
 		// Set input schema and perform bind to get actual output schema
 		connection->SetInputSchema(input_schema);
 		connection->SetSchemaName(func_info.schema_name);
+		connection->SetArgumentNames(resolved_argument_names);
 		auto bind_result = connection->PerformBindRpc();
 		secret_dependent = secret_dependent || bind_result.secret_dependent;
 
@@ -340,6 +355,7 @@ unique_ptr<FunctionData> VgiScalarFunctionBind(ClientContext &context, ScalarFun
 	bind_data->secret_dependent = secret_dependent;
 	bind_data->resolved_output_schema = output_schema;
 	bind_data->input_schema = input_schema;
+	bind_data->argument_names = resolved_argument_names;
 	bind_data->input_duckdb_types = input_types;
 	bind_data->const_values = const_values;
 
@@ -451,6 +467,9 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 		// wire in sync with what the worker is expecting.
 		connection->SetInputSchema(local_state.input_schema);
 		connection->SetSchemaName(schema_name);
+		if (bind_data) {
+			connection->SetArgumentNames(bind_data->argument_names);
+		}
 		auto bind_result = connection->PerformBindRpc();
 		// Execute opens a fresh worker connection and therefore performs bind a
 		// second time. Preserve its sanitized provenance too: this is both a

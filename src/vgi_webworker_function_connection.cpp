@@ -835,7 +835,7 @@ BindResult WebWorkerFunctionConnection::PerformBindRpc() {
 	auto bind_result = PerformBindProtocol(
 	    context_, function_name_, function_type_, arguments_array_, input_schema_, attach_opaque_data_,
 	    transaction_opaque_data_, settings_, required_secrets_, location_, transport_fn, at_unit_, at_value_,
-	    copy_from_ ? &*copy_from_ : nullptr, copy_to_ ? &*copy_to_ : nullptr, schema_name_);
+	    copy_from_ ? &*copy_from_ : nullptr, copy_to_ ? &*copy_to_ : nullptr, schema_name_, argument_names_);
 
 	{
 		auto fields = BuildConnLogFields(*this);

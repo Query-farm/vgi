@@ -542,6 +542,12 @@ struct VgiFunctionInfo {
 	// Arguments and output as deserialized Arrow schemas
 	std::shared_ptr<arrow::Schema> arguments_schema;
 	std::shared_ptr<arrow::Schema> output_schema;
+	// IPC-serialized one-row RecordBatch containing only parameters with
+	// defaults, in signature order. Column presence distinguishes "no default"
+	// from an explicit NULL default. DuckDB 1.5 stores this for discovery and
+	// forwards-compatible registration; DuckDB 2.0 adapters can install the
+	// values directly on FunctionSignature.
+	std::vector<uint8_t> parameter_default_values_bytes;
 
 	// Documentation fields
 	std::vector<std::string> examples;    // SQL examples showing function usage

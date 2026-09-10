@@ -395,7 +395,7 @@ BindResult HttpFunctionConnection::PerformBindRpc() {
 	                                        transaction_opaque_data_, settings_, required_secrets_,
 	                                        base_url_, transport_fn, at_unit_, at_value_,
 	                                        copy_from_ ? &*copy_from_ : nullptr,
-	                                        copy_to_ ? &*copy_to_ : nullptr, schema_name_);
+	                                        copy_to_ ? &*copy_to_ : nullptr, schema_name_, argument_names_);
 
 	{
 		auto fields = BuildConnLogFields(*this);
