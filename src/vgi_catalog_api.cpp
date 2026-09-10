@@ -2977,7 +2977,7 @@ VgiFunctionInfo ParseFunctionInfo(const std::shared_ptr<arrow::RecordBatch> &bat
 	// nullopt for older workers whose metadata schema lacks the column — the
 	// gate in vgi_table_entry.cpp treats that as "not capable".
 	info.late_materialization = row["late_materialization"].as<bool>();
-	info.supported_expression_filters = row["supported_expression_filters"].value_or(std::vector<std::string> {});
+	info.filter_semantic_profiles = row["filter_semantic_profiles"].value_or(std::vector<std::string> {});
 
 	// max_workers (nullable int, stored as optional)
 	info.max_workers = row["max_workers"].as<int32_t>();

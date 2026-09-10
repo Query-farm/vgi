@@ -72,10 +72,9 @@ public:
 	// Worker-schema column indices DuckDB requested. Empty when no projection.
 	// Mirrors the streaming pure-table path's int32_t projection_ids vector.
 	std::vector<int32_t> projection_ids;
-	// DuckDB-side column index list — what's referenced by table_filters' col
-	// indices. Same as ``LogicalGet::GetColumnIds()`` at rewriter time, mapped
-	// to int32_t for transit. Needed by the Source-side ArrowScan to do the
-	// projected→worker-schema index lookup in ArrowToDuckDB.
+	// Projected output-to-worker index mapping from LogicalGet::GetColumnIds().
+	// Table-filter keys are already bind-schema indexes at rewriter time and do
+	// not index this vector. Source-side ArrowScan uses it for ArrowToDuckDB.
 	std::vector<int32_t> column_ids;
 	// Serialized table_filters (Arrow IPC bytes with json filter_spec + value
 	// columns) — null if no filters. Reuses VgiSerializeFilters from the

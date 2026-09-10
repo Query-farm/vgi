@@ -120,87 +120,6 @@ static unique_ptr<TransactionManager> CreateVgiTransactionManager(optional_ptr<S
                                                                   AttachedDatabase &db, Catalog &catalog);
 
 // ============================================================================
-// VgiJoinOptimizer — auto-raise InFilter threshold for queries with VGI scans
-// ============================================================================
-// When DuckDB joins a local table against a VGI remote table, the hash join
-// can push an InFilter containing the build-side's distinct key values to the
-// probe-side scan. DuckDB's default threshold (dynamic_or_filter_threshold=50)
-// is too low for remote scans where network savings justify sending more keys.
-// This optimizer raises the threshold to vgi_join_keys_threshold when a VGI scan
-// is detected in the plan.
-
-class VgiJoinOptimizer : public OptimizerExtension {
-public:
-	VgiJoinOptimizer() {
-		pre_optimize_function = Optimize;
-	}
-
-private:
-	static bool IsVgiScan(LogicalOperator &op) {
-		if (op.type == LogicalOperatorType::LOGICAL_GET) {
-			auto &get = op.Cast<LogicalGet>();
-			return get.function.function == vgi::VgiTableFunctionScan;
-		}
-		return false;
-	}
-
-	static bool SubtreeContainsVgiScan(LogicalOperator &op) {
-		if (IsVgiScan(op)) {
-			return true;
-		}
-		for (auto &child : op.children) {
-			if (SubtreeContainsVgiScan(*child)) {
-				return true;
-			}
-		}
-		return false;
-	}
-
-	//! Check if the plan has a comparison join where any child subtree contains a VGI scan.
-	//! Only raises the threshold when there's an actual join involving VGI — a plain
-	//! SELECT * FROM vgi_table doesn't trigger it.
-	static bool HasJoinWithVgiScan(LogicalOperator &op) {
-		if (op.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
-		    op.type == LogicalOperatorType::LOGICAL_ANY_JOIN) {
-			for (auto &child : op.children) {
-				if (SubtreeContainsVgiScan(*child)) {
-					return true;
-				}
-			}
-		}
-		for (auto &child : op.children) {
-			if (HasJoinWithVgiScan(*child)) {
-				return true;
-			}
-		}
-		return false;
-	}
-
-	static void Optimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
-		if (!HasJoinWithVgiScan(*plan)) {
-			return;
-		}
-
-		Value threshold_val;
-		if (!input.context.TryGetCurrentSetting("vgi_join_keys_threshold", threshold_val) || threshold_val.IsNull()) {
-			return;
-		}
-		auto vgi_threshold = threshold_val.GetValue<idx_t>();
-		if (vgi_threshold == 0) {
-			return; // disabled
-		}
-
-		// Only raise, never lower a user-set threshold
-		auto current = Settings::Get<DynamicOrFilterThresholdSetting>(input.context);
-		if (current < vgi_threshold) {
-			auto &client_config = ClientConfig::GetConfig(input.context);
-			client_config.user_settings.SetUserSetting(DynamicOrFilterThresholdSetting::SettingIndex,
-			                                           Value::UBIGINT(vgi_threshold));
-		}
-	}
-};
-
-// ============================================================================
 // VgiStreamingWindowOptimizer — rewrite eligible LogicalWindow → streaming op
 // ============================================================================
 // Walks the plan post-optimize. For each LogicalWindow whose every window
@@ -463,54 +382,30 @@ private:
 				}
 			}
 		}
-		// column_ids: what TableFilter col indices reference. Empty when no
-		// filters were pushed. VgiSerializeFilters indexes into
-		// all_column_names through this list.
+		// column_ids is the projected output-to-worker mapping used later by
+		// ArrowToDuckDB. At this post-optimizer point table_filters keys are
+		// already bind-schema indexes and do not index this vector.
 		rewritten->column_ids.reserve(all_col_ids.size());
 		for (const auto &idx : all_col_ids) {
 			rewritten->column_ids.push_back(static_cast<int32_t>(
 			    idx.IsVirtualColumn() ? COLUMN_IDENTIFIER_ROW_ID : idx.GetPrimaryIndex()));
 		}
 
-		// Serialize filters via the shared utility (declared in
-		// vgi_table_function_impl.hpp). Catches and swallows
-		// InvalidInputException — same convention as the streaming path:
-		// unsupported filter types skip pushdown and DuckDB will filter
-		// locally above us.
+		// Serialize filters via the shared utility. FilterPushdown has already
+		// delegated required predicates to this scan, so failures must abort.
 		if (!get.table_filters.filters.empty()) {
-			try {
-				auto bd = rewritten->bind_data.get();
-				auto bd_typed = static_cast<vgi::VgiTableInOutBindData *>(bd);
-				auto worker_path = bd_typed && bd_typed->attach_params
-				                       ? bd_typed->attach_params->worker_path()
-				                       : std::string{};
-				// VgiSerializeFilters takes column_ids as the DuckDB-side post-
-				// projection list — what filter col_idx indexes into. Use the
-				// raw column_t form via GetColumnIds() which mirrors what the
-				// streaming path's InitGlobal uses (input.column_ids).
-				vector<column_t> col_ids_raw;
-				col_ids_raw.reserve(all_col_ids.size());
-				for (const auto &idx : all_col_ids) {
-					col_ids_raw.push_back(idx.IsVirtualColumn() ? COLUMN_IDENTIFIER_ROW_ID
-					                                            : idx.GetPrimaryIndex());
-				}
-				// NOTE: this is the only site that produces COLUMN_IDENTIFIER_ROW_ID
-				// without passing a rowid_column_name to VgiSerializeFilters, so a
-				// rowid filter here would serialize with the literal sentinel name.
-				// This is currently unreachable: multi-branch tables rewrite to a
-				// UNION ALL of branch functions (not a single rowid scan), and
-				// late_materialization is gated to the catalog-table scan path. If
-				// rowid pushdown is ever added here, thread the rowid field name
-				// through (see VgiTableFunctionBindData::rowid_column_name).
-				auto serialized = vgi::VgiSerializeFilters(
-				    context, col_ids_raw, &get.table_filters,
-				    rewritten->all_column_names, worker_path);
-				rewritten->pushdown_filters = std::move(serialized.filter_bytes);
-				rewritten->join_keys_buffers = std::move(serialized.join_keys_buffers);
-			} catch (const InvalidInputException &) {
-				// Unsupported filter — leave pushdown_filters null; DuckDB
-				// will filter locally above the operator.
-			}
+			auto bd_typed = static_cast<vgi::VgiTableInOutBindData *>(rewritten->bind_data.get());
+			auto worker_path = bd_typed && bd_typed->attach_params
+			                       ? bd_typed->attach_params->worker_path()
+			                       : std::string{};
+			// LogicalGet::table_filters keys are already bind-schema indexes at
+			// this post-optimizer rewrite point. They must not be mapped through
+			// the projected output list a second time.
+			auto serialized = vgi::VgiSerializeFilters(
+			    context, {}, &get.table_filters, rewritten->all_column_names, worker_path, "", -1, nullptr,
+			    vgi::VgiFilterColumnIndexDomain::BIND_SCHEMA);
+			rewritten->pushdown_filters = std::move(serialized.filter_bytes);
+			rewritten->join_keys_buffers = std::move(serialized.join_keys_buffers);
 		}
 
 		// Pre-build the EXPLAIN summary while we still have the raw
@@ -540,21 +435,15 @@ private:
 				}
 				summary += "Filters: ";
 				bool first = true;
-				// table_filters.filters keys are indices into column_ids (the
-				// post-projection list), not direct worker-schema indices.
-				// Resolve through column_ids → worker-schema → all_column_names.
+				// table_filters keys are bind-schema indexes at this rewrite point.
 				for (auto &kv : get.table_filters.filters) {
 					if (!first) {
 						summary += " AND ";
 					}
 					first = false;
 					std::string name = "<unknown>";
-					if (kv.first < all_col_ids.size()) {
-						const auto &idx = all_col_ids[kv.first];
-						if (!idx.IsVirtualColumn() &&
-						    idx.GetPrimaryIndex() < rewritten->all_column_names.size()) {
-							name = rewritten->all_column_names[idx.GetPrimaryIndex()];
-						}
+					if (kv.first < rewritten->all_column_names.size()) {
+						name = rewritten->all_column_names[kv.first];
 					}
 					summary += kv.second->ToString(name);
 				}
@@ -3726,29 +3615,16 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "workers learn the stream is gone only via normal stream-close / HTTP TTL.",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
 
-	// Register join key pushdown settings + optimizer
-	config.AddExtensionOption("vgi_join_keys_threshold",
-	                          "When a join has a VGI scan on one side, raise DuckDB's "
-	                          "dynamic_or_filter_threshold to this value so the build side's distinct join "
-	                          "keys are pushed to the worker as an IN filter. This is a threshold, not a "
-	                          "cap on keys sent: if the distinct count exceeds it, NO keys are pushed (the "
-	                          "filter is not built). Raise-only — never lowers a user-set threshold. "
-	                          "0 = disabled. See also vgi_join_keys_max_bytes for the byte-size cap.",
-	                          LogicalType::UBIGINT, Value::UBIGINT(100000));
+	// DuckDB's dynamic_or_filter_threshold is authoritative for exact runtime
+	// IN filters. VGI only applies an independent encoded-size limit.
 	config.AddExtensionOption("vgi_join_keys_max_bytes",
 	                          "Max estimated byte size for join keys batch (skip pushdown if exceeded)",
 	                          LogicalType::UBIGINT, Value::UBIGINT(67108864)); // 64MB
 
 	// =========================================================================
-	// Multi-scan rewriter MUST register BEFORE VgiJoinOptimizer. Both are
-	// pre_optimize_function; they fire in registration order. The rewriter
+	// The multi-scan rewriter runs pre-optimize. It
 	// replaces the marker LogicalGet with a LogicalSetOperation(UNION_ALL,
-	// [LogicalGet(vgi_fn), ...]) — only after that swap do the inner
-	// LogicalGets carry `function == VgiTableFunctionScan`, which is what
-	// VgiJoinOptimizer's IsVgiScan() detects to raise the InFilter
-	// threshold. If JoinOptimizer ran first, it would walk the unrewritten
-	// plan, see only markers (function == MultiBranchMarkerExecute), and
-	// miss the join+VGI heuristic.
+	// [LogicalGet(vgi_fn), ...]) before DuckDB's standard filter pushdown.
 	//
 	// Phase-split rationale (PRE-pushdown rewrite vs. POST-pushdown rewrite
 	// for buffered_table) is documented at the buffered_table registration
@@ -3790,8 +3666,6 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    "Emergency-rollback knob; not generally useful.",
 	    LogicalType::BOOLEAN, Value::BOOLEAN(true));
 	vgi::RegisterVgiMultiScanRewriter(config);
-
-	OptimizerExtension::Register(config, VgiJoinOptimizer());
 
 	// Streaming-window optimizer rule: rewrite eligible LogicalWindow ->
 	// LogicalVgiStreamingWindow. Gate on a session setting so benchmarks /
@@ -3836,9 +3710,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// required-paths list return immediately after the VgiTableEntry cast).
 	OptimizerExtension::Register(config, VgiRequiredFiltersOptimizer());
 
-	// VgiMultiScanRewriter is registered BEFORE VgiJoinOptimizer above —
-	// see the comment block at that site for ordering rationale. It's
-	// pre_optimize_function (rewrites into standard DuckDB operators that
+	// VgiMultiScanRewriter is pre_optimize_function (rewrites into standard DuckDB operators that
 	// benefit from filter pushdown). VgiStreamingWindowOptimizer and
 	// VgiTableBufferingRewriter above are optimize_function (post-pushdown)
 	// because their LogicalExtensionOperator outputs are opaque to pushdown.

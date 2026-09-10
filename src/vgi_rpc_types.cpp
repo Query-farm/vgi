@@ -1328,7 +1328,7 @@ static std::vector<uint8_t> BuildClientCapabilitiesBytes() {
 	// returning an unbounded split this client could never terminate.
 	return SerializeToIpcBytes(generated::BuildClientCapabilities(
 	    "duckdb", {"parquet", "csv", "json"}, {"ducklake", "iceberg", "postgres", "mysql", "sqlite", "duckdb"}, false,
-	    {"vgi.filters.v1"}));
+	    {"vgi.filters.v2"}));
 }
 
 std::shared_ptr<arrow::RecordBatch> BuildCatalogAttachRequest(

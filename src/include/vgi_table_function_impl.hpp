@@ -205,7 +205,7 @@ struct VgiTableFunctionBindData : public TableFunctionData {
 	bool projection_pushdown = false;
 
 	// Expression filter function names the worker supports (e.g., ["&&", "st_intersects_extent"])
-	std::vector<std::string> supported_expression_filters;
+	std::vector<std::string> filter_semantic_profiles;
 
 	vector<string> all_column_names;
 	// Parallel to all_column_names — populated during bind for the stats callback so it
@@ -294,6 +294,10 @@ struct VgiDynamicFilterInfo {
 	ExpressionType comparison_type;
 	//! Whether this filter is wrapped in ConjunctionOr with IsNull (NULLS_FIRST)
 	bool nulls_first = false;
+	//! Stable v2 predicate identity and monotonic revision for tick deltas.
+	string predicate_id;
+	uint64_t revision = 0;
+	bool active = false;
 };
 
 // ============================================================================
@@ -826,29 +830,30 @@ void PerformVgiTableFunctionBind(ClientContext &context, VgiTableFunctionBindDat
 
 //! Serialize filters to Arrow IPC bytes for worker.
 //! Returns nullptr if filters is empty/null.
-//! Throws InvalidInputException if filters contain unsupported types (e.g., DynamicFilter, BloomFilter).
+//! Throws InvalidInputException if a required filter cannot be encoded exactly.
 //! Result of filter serialization — contains the filter batch and optional join keys batch.
 struct SerializedFilters {
 	std::shared_ptr<arrow::Buffer> filter_bytes;                    //! Arrow IPC bytes of the filter RecordBatch (or nullptr)
 	std::vector<std::shared_ptr<arrow::Buffer>> join_keys_buffers;  //! Arrow IPC bytes per join key column (one single-column batch each)
 };
 
+enum class VgiFilterColumnIndexDomain : uint8_t {
+	PROJECTED,
+	BIND_SCHEMA,
+};
+
 //! Serialize a TableFilterSet into Arrow IPC bytes for the VGI worker.
 //! The filter RecordBatch has:
-//!   - Column 0: filter_spec (string) - JSON-encoded filter structure
-//!   - Columns 1..N: Values referenced by filters, with exact Arrow types
-//! Version is stored in Arrow schema metadata on filter_spec field: {"vgi_filter_version": "1"}
+//!   - Column 0: non-null filter_spec (string) containing a v2 snapshot document
+//!   - Columns 1..N: canonical value_N/type_N typed payload fields
+//! Encoding, version, and evaluation context are stored on the batch schema.
 //!
 //! If InFilter values are present and within size limits, each IN filter's values are
 //! serialized as a separate single-column Arrow IPC RecordBatch in join_keys_buffers.
 //!
-//! ``rowid_column_name`` (default empty = none) is the worker-schema field name
-//! of the table's rowid column. A filter on the rowid virtual column arrives with
-//! ``column_ids[col_idx] == COLUMN_IDENTIFIER_ROW_ID`` (UINT64_MAX); we name it
-//! with this so the worker — which matches pushed/join-key columns by name — can
-//! apply it (e.g. the rowid IN-list / min-max range pushed by DuckDB's
-//! late-materialization semi-join). It is passed explicitly (not looked up in
-//! ``column_names``) because ``column_names`` has the rowid column erased.
+//! ``rowid_column_name`` and ``rowid_worker_col_index`` identify the field that
+//! DuckDB hides from ``column_names``. They restore worker-schema indexes for
+//! rowid and for ordinary fields shifted by the erased field.
 //! ``exclude_filter_keys`` (default null): projected filter-map keys (``filters->filters``
 //! entry keys, i.e. the projected col_idx) to SKIP. Used by the per-partition result
 //! cache to serialize the RESIDUAL filter — everything except the partition-column
@@ -857,7 +862,24 @@ SerializedFilters VgiSerializeFilters(ClientContext &context, const vector<colum
                                       optional_ptr<TableFilterSet> filters,
                                       const vector<string> &column_names, const string &worker_path,
                                       const string &rowid_column_name = "",
-                                      const std::set<idx_t> *exclude_filter_keys = nullptr);
+                                      int64_t rowid_worker_col_index = -1,
+                                      const std::set<idx_t> *exclude_filter_keys = nullptr,
+                                      VgiFilterColumnIndexDomain index_domain = VgiFilterColumnIndexDomain::PROJECTED);
+
+//! One revisioned runtime-filter mutation carried in a v2 delta batch.
+//! A remove has a null filter; an upsert points at a filter that remains alive
+//! for the duration of VgiSerializeDynamicFilterDelta.
+struct VgiDynamicFilterDeltaUpdate {
+	string predicate_id;
+	uint64_t revision;
+	idx_t column_index;
+	string column_name;
+	const TableFilter *filter;
+};
+
+//! Serialize the advisory Top-N mutations sent in tick metadata.
+std::shared_ptr<arrow::Buffer> VgiSerializeDynamicFilterDelta(ClientContext &context, const string &worker_path,
+                                                              const vector<VgiDynamicFilterDeltaUpdate> &updates);
 
 //! Returns true if any descendant of ``filter`` is a DynamicFilter (Top-N
 //! tick-time bound). Consumers that walk TableFilter trees for *static*

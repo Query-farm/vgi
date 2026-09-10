@@ -521,4 +521,19 @@ if((BUILD_VGI_UNIT_TESTS OR DEFINED ENV{BUILD_VGI_UNIT_TESTS}) AND NOT WIN32)
   # ``$<TARGET_FILE:…>`` resolves at generate time to the real on-disk path.
   target_compile_definitions(vgi_unit_tests PRIVATE
     "VGI_LAUNCHER_TEST_WORKER_PATH=\"$<TARGET_FILE:launcher_test_worker>\"")
+
+  # Wire-level filter tests exercise the real producer in the static extension.
+  # Keep them separate from vgi_unit_tests, whose SAB test doubles intentionally
+  # replace several production symbols.
+  add_executable(vgi_filter_v2_tests
+    test/cpp/test_main.cpp
+    test/cpp/test_filter_encoding_v2.cpp)
+  target_include_directories(vgi_filter_v2_tests PRIVATE
+    src/include
+    duckdb/src/include
+    duckdb/third_party/catch)
+  target_link_libraries(vgi_filter_v2_tests
+    ${EXTENSION_NAME}
+    duckdb_static
+    dummy_static_extension_loader)
 endif()

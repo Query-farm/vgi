@@ -166,7 +166,7 @@ SELECT pushed_filters FROM example.filter_echo(1000)
 WHERE n >= 500
 ORDER BY n LIMIT 1;
 ----
-(n >= 500)
+n >= 500
 
 # Correct results: static filter narrows to [500, 999], Top-N takes first 5
 query I

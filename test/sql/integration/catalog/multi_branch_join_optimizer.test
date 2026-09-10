@@ -1,10 +1,6 @@
 # name: test/sql/integration/catalog/multi_branch_join_optimizer.test
-# description: E2 — VgiJoinOptimizer must see through the multi-branch rewrite.
-#              When a multi-branch VGI table is on the probe side of a hash join,
-#              the InFilter threshold must still be raised so join keys push into
-#              the VGI arms of the union. Requires VgiMultiScanRewriter to register
-#              BEFORE VgiJoinOptimizer so the rewrite has happened by the time
-#              HasJoinWithVgiScan walks the plan looking for VgiTableFunctionScan.
+# description: DuckDB's dynamic_or_filter_threshold remains authoritative for
+#              joins involving rewritten multi-branch VGI scans.
 # group: [vgi_integration_catalog]
 
 require-env VGI_TEST_WORKER
@@ -48,10 +44,7 @@ SELECT MIN(m.n), MAX(m.n) FROM large_keys l JOIN example.data.multi_branch_numbe
 0	45
 
 # ============================================================================
-# Threshold-raise: the JoinOptimizer must detect the post-rewrite plan
-# contains a VGI scan inside the LogicalSetOperation and raise the threshold
-# to at least vgi_join_keys_threshold. Reset the threshold to a low value first
-# to make the raise observable.
+# VGI must not mutate DuckDB's effective threshold while optimizing the join.
 # ============================================================================
 
 statement ok
@@ -61,19 +54,13 @@ RESET dynamic_or_filter_threshold;
 statement ok
 SELECT COUNT(*) FROM large_keys l JOIN example.data.multi_branch_numbers m ON l.id = m.n;
 
-# Assert the threshold was raised to vgi_join_keys_threshold (default 100000).
-# If JoinOptimizer ran BEFORE the rewriter, it would have walked the unrewritten
-# plan, seen only the marker (function != VgiTableFunctionScan), and left the
-# threshold alone. Asserting it WAS raised proves the rewriter runs first.
 query I
 SELECT CURRENT_SETTING('dynamic_or_filter_threshold')::BIGINT;
 ----
-100000
+50
 
 # ============================================================================
-# Threshold-raise with the heterogeneous multi-branch (one VGI arm + one
-# read_parquet arm). At least one arm post-rewrite is a VGI scan, so the
-# threshold still raises.
+# The heterogeneous form (one VGI arm plus read_parquet) also leaves it alone.
 # ============================================================================
 
 statement ok
@@ -89,7 +76,7 @@ SELECT COUNT(*) FROM large_keys l JOIN example.data.multi_branch_hetero m ON l.i
 query I
 SELECT CURRENT_SETTING('dynamic_or_filter_threshold')::BIGINT;
 ----
-100000
+50
 
 # Correctness check: large_keys covers 0..995 step 5; multi_branch_hetero
 # covers 0..99 distinct. Matches at l.id ∈ {0, 5, 10, ..., 95} → 20 rows.

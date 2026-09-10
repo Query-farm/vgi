@@ -90,26 +90,25 @@ SELECT n FROM example.partitioned_batch_index(10000) ORDER BY n DESC LIMIT 3;
 # Hash-join dynamic-filter pushdown + batch_index together
 # ============================================================================
 
-# Set the join_keys threshold above DuckDB's default so the optimizer
-# pushes the InFilter through. Mirrors the pattern from
-# join_keys_pushdown.test.
+# Explicitly raise DuckDB's own threshold for this test. VGI preserves the
+# configured value and transports the exact InFilter DuckDB chooses to build.
 
 statement ok
 SET threads=4;
 
 statement ok
+SET dynamic_or_filter_threshold=250;
+
+statement ok
 CREATE TABLE small_keys AS SELECT * FROM generate_series(0, 9) t(id);
 
-# Trigger the VgiJoinOptimizer to raise dynamic_or_filter_threshold for
-# this session (the optimizer extension does this when a join touches a
-# VGI scan).
 statement ok
 SELECT COUNT(*) FROM small_keys l JOIN example.partitioned_batch_index(20) s ON l.id = s.n;
 
 query I
-SELECT CURRENT_SETTING('dynamic_or_filter_threshold')::BIGINT >= 100;
+SELECT CURRENT_SETTING('dynamic_or_filter_threshold')::BIGINT;
 ----
-true
+250
 
 # 200 sparse keys — DuckDB's hash join builds the InFilter and pushes it
 # into the probe-side VGI scan's init. The scan still emits batch_index;
@@ -137,6 +136,9 @@ DROP TABLE small_keys;
 
 statement ok
 DROP TABLE large_keys;
+
+statement ok
+RESET dynamic_or_filter_threshold;
 
 # ============================================================================
 # Projection pushdown on the single-column fixture (which DOES support it)

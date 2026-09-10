@@ -108,7 +108,7 @@ SELECT COUNT(*) FROM example.filter_echo(10) WHERE n IS NULL;
 0
 
 # ============================================================================
-# IS NOT NULL — not pushed down by DuckDB (shows (none))
+# IS NOT NULL — represented directly by filter encoding v2
 # ============================================================================
 
 query I
@@ -119,7 +119,7 @@ SELECT COUNT(*) FROM example.filter_echo(5) WHERE n IS NOT NULL;
 query T
 SELECT DISTINCT pushed_filters FROM example.filter_echo(5) WHERE n IS NOT NULL;
 ----
-(none)
+n IS NOT NULL
 
 # ============================================================================
 # AND — conjunction of filters on the same column

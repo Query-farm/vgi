@@ -18,11 +18,18 @@
 #include "vgi_table_function_impl.hpp"
 #include "vgi_table_in_out_impl.hpp"
 
+#include <algorithm>
 #include <cstdint>
 
 namespace duckdb {
 
 namespace {
+
+bool SupportsVgiFilterV2(const vgi::VgiFunctionInfo &info) {
+	return info.filter_pushdown.value_or(false) &&
+	       std::find(info.filter_semantic_profiles.begin(), info.filter_semantic_profiles.end(),
+	                 "vgi.duckdb.standard.v1") != info.filter_semantic_profiles.end();
+}
 
 //! Read the client-side ``vgi_split_scans`` kill switch. Defaults to true.
 //!
@@ -105,7 +112,7 @@ static unique_ptr<FunctionData> VgiCatalogTableFunctionBind(ClientContext &conte
 	bind_data->function_name = vgi_info.function_info().name;
 	bind_data->schema_name = vgi_info.function_info().schema_name;
 	bind_data->projection_pushdown = vgi_info.function_info().projection_pushdown.value_or(false);
-	bind_data->supported_expression_filters = vgi_info.function_info().supported_expression_filters;
+	bind_data->filter_semantic_profiles = vgi_info.function_info().filter_semantic_profiles;
 	// Carry the wire flag onto bind_data so InstallBatch knows whether to
 	// require/parse vgi_batch_index from each Arrow record-batch's
 	// KeyValueMetadata.
@@ -258,7 +265,7 @@ static unique_ptr<FunctionData> VgiCatalogTableInOutFunctionBind(ClientContext &
 	params.sink_order_dependent = vgi_info.function_info().sink_order_dependent;
 	params.requires_input_batch_index = vgi_info.function_info().requires_input_batch_index;
 	params.projection_pushdown = vgi_info.function_info().projection_pushdown.value_or(false);
-	params.filter_pushdown = vgi_info.function_info().filter_pushdown.value_or(false);
+	params.filter_pushdown = SupportsVgiFilterV2(vgi_info.function_info());
 	// A3 serial opt-out: a worker that declares Meta.max_workers=1 keeps its
 	// streaming table-in-out on a single shared worker (MaxThreads()=1).
 	params.max_workers = vgi_info.function_info().max_workers.value_or(0);
@@ -388,8 +395,8 @@ TableFunctionSet BuildVgiTableFunctionSet(ClientContext &context, const std::str
 			// skipped for the same reason.
 			table_func.projection_pushdown = func_info.projection_pushdown.value_or(false);
 			if (is_buffering) {
-				table_func.filter_pushdown = func_info.filter_pushdown.value_or(false);
-				if (!func_info.supported_expression_filters.empty()) {
+				table_func.filter_pushdown = SupportsVgiFilterV2(func_info);
+				if (table_func.filter_pushdown) {
 					table_func.pushdown_expression = vgi::VgiPushdownExpression;
 				}
 			}
@@ -417,10 +424,10 @@ TableFunctionSet BuildVgiTableFunctionSet(ClientContext &context, const std::str
 			                         VgiCatalogTableFunctionBind, vgi::VgiTableFunctionInitGlobal,
 			                         vgi::VgiTableFunctionInitLocal);
 			table_func.projection_pushdown = func_info.projection_pushdown.value_or(false);
-			table_func.filter_pushdown = func_info.filter_pushdown.value_or(false);
+			table_func.filter_pushdown = SupportsVgiFilterV2(func_info);
 			table_func.sampling_pushdown = func_info.sampling_pushdown.value_or(false);
 			table_func.order_preservation_type = MapOrderPreservation(func_info.order_preservation);
-			if (!func_info.supported_expression_filters.empty()) {
+			if (table_func.filter_pushdown) {
 				table_func.pushdown_expression = vgi::VgiPushdownExpression;
 			}
 			table_func.cardinality = vgi::VgiTableFunctionCardinality;

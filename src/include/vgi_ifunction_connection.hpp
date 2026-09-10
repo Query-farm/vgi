@@ -40,9 +40,9 @@ struct CopyToBindContext;
 // Written by the table scan (after Top-N sink updates), read by the connection (before tick).
 struct TickFilterState {
 	mutex lock;
-	//! Base64-encoded Arrow IPC bytes of the complete filter set (static + dynamic merged)
+	//! Base64-encoded Arrow IPC bytes of the latest v2 delta document.
 	string encoded_filters;
-	//! True if encoded_filters has been set at least once
+	//! True when encoded_filters contains the latest delta.
 	bool has_filters = false;
 };
 

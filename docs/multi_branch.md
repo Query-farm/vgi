@@ -359,8 +359,8 @@ failure doesn't get silently rerouted to the legacy path.
   `src/generated/vgi_protocol_schemas.hpp`,
   `src/generated/vgi_request_builders.hpp`.
 - **C++ rewriter**: `src/vgi_multi_scan_rewriter.cpp`. Pre-pushdown
-  (`pre_optimize_function`), registered before `VgiJoinOptimizer` so
-  the latter sees post-rewrite VGI scans inside the union.
+  (`pre_optimize_function`) so DuckDB's standard filter pushdown sees the
+  rewritten VGI scans inside the union.
 - **C++ dispatcher** (try-catch fallback + capability cache):
   `InvokeCatalogTableScanBranchesGet` in `src/vgi_catalog_api.cpp`.
 - **Per-attach capability cache**: tri-state atomic on

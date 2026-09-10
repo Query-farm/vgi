@@ -613,8 +613,10 @@ struct VgiFunctionInfo {
 	// the matching column indices on bind_data.
 	VgiPartitionKind partition_kind = VgiPartitionKind::NotPartitioned;
 
-	// Expression filter function names the worker can evaluate (e.g., ["&&", "st_intersects_extent"])
-	std::vector<std::string> supported_expression_filters;
+	// VGI filter-expression semantic profiles implemented by the worker.
+	// Protocol 2.0 removes the v1 supported_expression_filters name allowlist;
+	// extension functions and runtime artifacts are capability records of their own.
+	std::vector<std::string> filter_semantic_profiles;
 
 	// Aggregate function fields - uses DuckDB's enums
 	AggregateOrderDependent order_dependent = AggregateOrderDependent::NOT_ORDER_DEPENDENT;

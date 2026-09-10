@@ -112,6 +112,13 @@ SELECT * FROM example.echo_buffering((SELECT * FROM (VALUES (1, 'a'), (2, 'b'), 
 1	a
 3	c
 
+# Filter keys at the post-optimizer buffering rewrite are bind-schema indexes,
+# even when projection omits and reorders the filtered column.
+query I
+SELECT y FROM example.echo_buffering((SELECT * FROM (VALUES (1, 10), (2, 20), (3, 30)) t(x, y))) WHERE x = 2;
+----
+20
+
 # ============================================================================
 # Filter pushdown — string filters
 # ============================================================================

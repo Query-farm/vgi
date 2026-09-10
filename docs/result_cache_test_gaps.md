@@ -101,7 +101,8 @@ missing coverage.
 
 11. **Cached VGI scan on one side of a JOIN (both regimes).** (a) small build side → cached scan still
     serves, join correct; (b) build side triggers join-key IN pushdown → `ineligible reason=dynamic_filter`
-    logged AND join result still correct. Untested semantic fork on `vgi_join_keys_threshold`.
+    logged AND join result still correct. Exercise both the default and an explicit
+    `dynamic_or_filter_threshold` value.
 
 ## Tier 2 — DuckDB-integration semantics (freeze the contract)
 

@@ -48,6 +48,7 @@
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
+#include "duckdb/planner/expression/bound_operator_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 
@@ -56,6 +57,10 @@
 #include <arrow/c/bridge.h>
 #include <arrow/io/memory.h>
 #include <arrow/ipc/writer.h>
+
+#include <algorithm>
+#include <functional>
+#include <limits>
 
 using namespace duckdb_yyjson; // NOLINT
 
@@ -235,7 +240,7 @@ unique_ptr<FunctionData> VgiTableFunctionBindData::Copy() const {
 	result->cardinality_max = cardinality_max;
 	result->cardinality_fetched = cardinality_fetched;
 	result->projection_pushdown = projection_pushdown;
-	result->supported_expression_filters = supported_expression_filters;
+	result->filter_semantic_profiles = filter_semantic_profiles;
 
 	result->all_column_names = all_column_names;
 	result->all_column_types = all_column_types;
@@ -374,52 +379,80 @@ void PerformVgiTableFunctionBind(ClientContext &context, VgiTableFunctionBindDat
 
 namespace {
 
-//! Recursively check whether an expression tree only contains functions
-//! that the worker has declared support for.
-//! Returns false if any unsupported function or unsupported node type is found.
-bool ExpressionTreeIsSupported(const Expression &expr, const std::vector<std::string> &supported_functions) {
+//! Pure eligibility check shared by the pushdown callback and v2 serializer.
+//! DuckDB 1.5 calls this before replacing the sole BoundColumnRef with a
+//! BoundReferenceExpression, so both forms are accepted as the same root.
+bool ExpressionTreeIsSupported(const Expression &expr) {
 	switch (expr.GetExpressionClass()) {
 	case ExpressionClass::BOUND_REF:
+		return expr.Cast<BoundReferenceExpression>().index == 0;
 	case ExpressionClass::BOUND_COLUMN_REF:
-		return true;
 	case ExpressionClass::BOUND_CONSTANT:
 		return true;
-	case ExpressionClass::BOUND_FUNCTION: {
-		auto &func_expr = expr.Cast<BoundFunctionExpression>();
-		bool found = false;
-		for (auto &s : supported_functions) {
-			if (s == func_expr.function.name) {
-				found = true;
-				break;
-			}
-		}
-		if (!found) {
-			return false;
-		}
-		for (auto &child : func_expr.children) {
-			if (!ExpressionTreeIsSupported(*child, supported_functions)) {
-				return false;
-			}
-		}
-		return true;
-	}
+	case ExpressionClass::BOUND_FUNCTION:
+		// DuckDB 1.5 exposes no stable semantic identity for these overloads.
+		// A displayed name alone cannot prove vgi.duckdb.standard.v1 semantics.
+		return false;
 	case ExpressionClass::BOUND_COMPARISON: {
 		auto &comp_expr = expr.Cast<BoundComparisonExpression>();
-		return ExpressionTreeIsSupported(*comp_expr.left, supported_functions) &&
-		       ExpressionTreeIsSupported(*comp_expr.right, supported_functions);
+		switch (comp_expr.GetExpressionType()) {
+		case ExpressionType::COMPARE_EQUAL:
+		case ExpressionType::COMPARE_NOTEQUAL:
+		case ExpressionType::COMPARE_GREATERTHAN:
+		case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+		case ExpressionType::COMPARE_LESSTHAN:
+		case ExpressionType::COMPARE_LESSTHANOREQUALTO:
+		case ExpressionType::COMPARE_DISTINCT_FROM:
+		case ExpressionType::COMPARE_NOT_DISTINCT_FROM:
+			return ExpressionTreeIsSupported(*comp_expr.left) && ExpressionTreeIsSupported(*comp_expr.right);
+		default:
+			return false;
+		}
 	}
 	case ExpressionClass::BOUND_CONJUNCTION: {
 		auto &conj_expr = expr.Cast<BoundConjunctionExpression>();
+		if ((conj_expr.GetExpressionType() != ExpressionType::CONJUNCTION_AND &&
+		     conj_expr.GetExpressionType() != ExpressionType::CONJUNCTION_OR) ||
+		    conj_expr.children.size() < 2) {
+			return false;
+		}
 		for (auto &child : conj_expr.children) {
-			if (!ExpressionTreeIsSupported(*child, supported_functions)) {
+			if (!ExpressionTreeIsSupported(*child)) {
 				return false;
 			}
 		}
 		return true;
 	}
-	case ExpressionClass::BOUND_CAST:
-		// v1: reject casts rather than serializing them
-		return false;
+	case ExpressionClass::BOUND_OPERATOR: {
+		auto &op = expr.Cast<BoundOperatorExpression>();
+		switch (op.GetExpressionType()) {
+		case ExpressionType::OPERATOR_IS_NULL:
+		case ExpressionType::OPERATOR_IS_NOT_NULL:
+		case ExpressionType::OPERATOR_NOT:
+			return op.children.size() == 1 && ExpressionTreeIsSupported(*op.children[0]);
+		case ExpressionType::COMPARE_IN:
+		case ExpressionType::COMPARE_NOT_IN:
+			if (op.children.size() < 2 || !ExpressionTreeIsSupported(*op.children[0])) {
+				return false;
+			}
+			for (idx_t i = 1; i < op.children.size(); i++) {
+				if (op.children[i]->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
+					return false;
+				}
+			}
+			return true;
+		default:
+			return false;
+		}
+	}
+	case ExpressionClass::BOUND_CAST: {
+		auto &cast = expr.Cast<BoundCastExpression>();
+		// The initial 1.5 producer selects vgi.none.v1. Restrict casts to
+		// context-independent numeric coercions until session-profile capture is
+		// available from generated capability metadata.
+		return !cast.try_cast && cast.child->return_type.IsNumeric() && cast.return_type.IsNumeric() &&
+		       ExpressionTreeIsSupported(*cast.child);
+	}
 	default:
 		return false;
 	}
@@ -432,10 +465,11 @@ bool VgiPushdownExpression(ClientContext &context, const LogicalGet &get, Expres
 		return false;
 	}
 	auto &bind_data = get.bind_data->Cast<VgiTableFunctionBindData>();
-	if (bind_data.supported_expression_filters.empty()) {
+	if (std::find(bind_data.filter_semantic_profiles.begin(), bind_data.filter_semantic_profiles.end(),
+	              "vgi.duckdb.standard.v1") == bind_data.filter_semantic_profiles.end()) {
 		return false;
 	}
-	bool supported = ExpressionTreeIsSupported(expr, bind_data.supported_expression_filters);
+	bool supported = ExpressionTreeIsSupported(expr);
 	if (supported) {
 		VGI_LOG(context, "table_function.expression_filter_accepted",
 		        {{"function_name", bind_data.function_name}, {"expression", expr.ToString()}});
@@ -469,6 +503,10 @@ const char *ExpressionTypeToOp(ExpressionType type) {
 		return "lt";
 	case ExpressionType::COMPARE_LESSTHANOREQUALTO:
 		return "le";
+	case ExpressionType::COMPARE_DISTINCT_FROM:
+		return "distinct_from";
+	case ExpressionType::COMPARE_NOT_DISTINCT_FROM:
+		return "not_distinct_from";
 	default:
 		return "unknown";
 	}
@@ -532,14 +570,43 @@ bool VgiContainsDynamicFilter(const TableFilter &filter) {
 	}
 }
 
+static bool VgiAdvisoryFilterCanThrow(const TableFilter &filter) {
+	switch (filter.filter_type) {
+	case TableFilterType::EXPRESSION_FILTER:
+		return filter.Cast<ExpressionFilter>().expr->CanThrow();
+	case TableFilterType::CONJUNCTION_AND:
+	case TableFilterType::CONJUNCTION_OR: {
+		auto &conjunction = filter.filter_type == TableFilterType::CONJUNCTION_AND
+		                        ? static_cast<const ConjunctionFilter &>(filter.Cast<ConjunctionAndFilter>())
+		                        : static_cast<const ConjunctionFilter &>(filter.Cast<ConjunctionOrFilter>());
+		for (auto &child : conjunction.child_filters) {
+			if (VgiAdvisoryFilterCanThrow(*child)) {
+				return true;
+			}
+		}
+		return false;
+	}
+	case TableFilterType::OPTIONAL_FILTER: {
+		auto &optional = filter.Cast<OptionalFilter>();
+		return optional.child_filter && VgiAdvisoryFilterCanThrow(*optional.child_filter);
+	}
+	case TableFilterType::STRUCT_EXTRACT: {
+		auto &structure = filter.Cast<StructFilter>();
+		return structure.child_filter && VgiAdvisoryFilterCanThrow(*structure.child_filter);
+	}
+	default:
+		return false;
+	}
+}
+
 namespace { // reopen anonymous namespace for the file-local FilterSerializer.
 
 //! FilterSerializer walks the filter tree, builds JSON, and collects values
 class FilterSerializer {
 public:
-	FilterSerializer(const string &worker_path, idx_t join_keys_max_bytes = 0)
-	    : doc_(yyjson_mut_doc_new(nullptr)), worker_path_(worker_path),
-	      join_keys_max_bytes_(join_keys_max_bytes) {
+	FilterSerializer(const string &worker_path, idx_t join_keys_max_bytes, bool allow_external_sets = true)
+	    : doc_(yyjson_mut_doc_new(nullptr)), worker_path_(worker_path), join_keys_max_bytes_(join_keys_max_bytes),
+	      allow_external_sets_(allow_external_sets) {
 	}
 
 	~FilterSerializer() {
@@ -548,315 +615,324 @@ public:
 		}
 	}
 
-	//! Serialize a single filter for a column. Returns nullptr if the filter was skipped
-	//! (e.g., join keys exceeded byte-size limit).
-	yyjson_mut_val *SerializeColumnFilter(idx_t column_index, const string &column_name, const TableFilter &filter) {
-		auto obj = yyjson_mut_obj(doc_);
-		yyjson_mut_obj_add_strcpy(doc_, obj, "column_name", column_name.c_str());
-		yyjson_mut_obj_add_uint(doc_, obj, "column_index", column_index);
-
-		if (!SerializeFilterInto(obj, filter, column_index, column_name)) {
-			return nullptr; // filter was skipped
-		}
-		return obj;
+	yyjson_mut_val *SerializeFilter(const TableFilter &filter, idx_t column_index, const string &column_name,
+	                                bool &advisory) {
+		auto input = ColumnRef(column_index, column_name);
+		return SerializeFilterExpression(filter, input, column_index, column_name, advisory);
 	}
 
-	//! Get the collected values
 	const vector<Value> &GetValues() const {
 		return values_;
 	}
 
-	//! Get the collected value types
 	const vector<LogicalType> &GetValueTypes() const {
 		return value_types_;
 	}
+	const vector<string> &GetValueNames() const {
+		return value_names_;
+	}
 
-	//! Write the JSON to a string (caller must free with free())
 	char *WriteJson(yyjson_mut_val *root) {
 		return yyjson_mut_val_write(root, 0, nullptr);
 	}
 
-	//! Get the document for creating arrays
 	yyjson_mut_doc *GetDoc() {
 		return doc_;
 	}
 
-	//! Whether any join key columns were accumulated
 	bool HasJoinKeys() const {
 		return !join_key_columns_.empty();
 	}
 
-	//! Get the accumulated join key columns
 	const vector<JoinKeysInfo> &GetJoinKeyColumns() const {
 		return join_key_columns_;
 	}
 
 private:
-	//! Serialize filter fields into an existing object. Returns false if the filter was
-	//! skipped (e.g., join keys exceeded byte-size limit), in which case the obj should be discarded.
-	//! column_index and column_name are passed through for child filters in conjunctions
-	bool SerializeFilterInto(yyjson_mut_val *obj, const TableFilter &filter, idx_t column_index,
-	                         const string &column_name) {
+	yyjson_mut_val *ColumnRef(idx_t column_index, const string &column_name) {
+		auto obj = yyjson_mut_obj(doc_);
+		yyjson_mut_obj_add_str(doc_, obj, "node", "column_ref");
+		yyjson_mut_obj_add_uint(doc_, obj, "column_index", column_index);
+		yyjson_mut_obj_add_strcpy(doc_, obj, "column_name", column_name.c_str());
+		return obj;
+	}
+
+	yyjson_mut_val *Literal(const Value &value) {
+		auto obj = yyjson_mut_obj(doc_);
+		yyjson_mut_obj_add_str(doc_, obj, "node", "literal");
+		yyjson_mut_obj_add_uint(doc_, obj, "value_ref", AddValue(value));
+		return obj;
+	}
+
+	yyjson_mut_val *SerializeFilterExpression(const TableFilter &filter, yyjson_mut_val *input, idx_t column_index,
+	                                          const string &column_name, bool &advisory) {
 		switch (filter.filter_type) {
 		case TableFilterType::CONSTANT_COMPARISON: {
-			auto &const_filter = filter.Cast<ConstantFilter>();
-			yyjson_mut_obj_add_str(doc_, obj, "type", "constant");
-			yyjson_mut_obj_add_str(doc_, obj, "op", ExpressionTypeToOp(const_filter.comparison_type));
-			yyjson_mut_obj_add_uint(doc_, obj, "value_ref", AddValue(const_filter.constant));
-			break;
+			auto &constant = filter.Cast<ConstantFilter>();
+			auto op = ExpressionTypeToOp(constant.comparison_type);
+			if (string(op) == "unknown") {
+				throw InvalidInputException("Unsupported VGI constant comparison operator");
+			}
+			auto obj = yyjson_mut_obj(doc_);
+			yyjson_mut_obj_add_str(doc_, obj, "node", "comparison");
+			yyjson_mut_obj_add_str(doc_, obj, "op", op);
+			yyjson_mut_obj_add_val(doc_, obj, "left", input);
+			yyjson_mut_obj_add_val(doc_, obj, "right", Literal(constant.constant));
+			return obj;
 		}
-		case TableFilterType::IS_NULL: {
-			yyjson_mut_obj_add_str(doc_, obj, "type", "is_null");
-			break;
-		}
+		case TableFilterType::IS_NULL:
 		case TableFilterType::IS_NOT_NULL: {
-			yyjson_mut_obj_add_str(doc_, obj, "type", "is_not_null");
-			break;
+			auto obj = yyjson_mut_obj(doc_);
+			yyjson_mut_obj_add_str(doc_, obj, "node", "is_null");
+			yyjson_mut_obj_add_val(doc_, obj, "expression", input);
+			yyjson_mut_obj_add_bool(doc_, obj, "negated", filter.filter_type == TableFilterType::IS_NOT_NULL);
+			return obj;
 		}
 		case TableFilterType::IN_FILTER: {
 			auto &in_filter = filter.Cast<InFilter>();
 			if (in_filter.values.empty()) {
-				return false; // empty IN filter — skip
+				// An empty exact set is always FALSE. Encoding a Boolean literal
+				// preserves that meaning without needing an unavailable element type.
+				return Literal(Value::BOOLEAN(false));
 			}
-			// Estimate serialized byte size to decide whether to push join keys
 			auto estimated_bytes = EstimateJoinKeyBytes(in_filter.values);
 			if (join_keys_max_bytes_ > 0 && estimated_bytes > join_keys_max_bytes_) {
-				// Too large — skip this filter. DuckDB still applies it client-side.
-				return false;
+				return nullptr;
 			}
-			// Each IN filter gets its own single-column batch in the join_keys array.
-			yyjson_mut_obj_add_str(doc_, obj, "type", "join_keys");
-			yyjson_mut_obj_add_strcpy(doc_, obj, "keys_column", column_name.c_str());
-			join_key_columns_.push_back({column_name, column_index, in_filter.values[0].type(), &in_filter.values});
-			break;
+			auto obj = yyjson_mut_obj(doc_);
+			yyjson_mut_obj_add_str(doc_, obj, "node", "in");
+			yyjson_mut_obj_add_val(doc_, obj, "expression", input);
+			auto set = yyjson_mut_obj(doc_);
+			if (!allow_external_sets_ || estimated_bytes <= INLINE_SET_MAX_BYTES) {
+				yyjson_mut_obj_add_str(doc_, set, "kind", "literal");
+				yyjson_mut_obj_add_uint(doc_, set, "value_ref",
+				                        AddValue(Value::LIST(in_filter.values[0].type(), in_filter.values)));
+			} else {
+				auto batch_index = join_key_columns_.size();
+				yyjson_mut_obj_add_str(doc_, set, "kind", "external");
+				yyjson_mut_obj_add_uint(doc_, set, "batch_index", batch_index);
+				yyjson_mut_obj_add_uint(doc_, set, "column_index", 0);
+				yyjson_mut_obj_add_strcpy(doc_, set, "column_name", column_name.c_str());
+				join_key_columns_.push_back({column_name, column_index, in_filter.values[0].type(), &in_filter.values});
+			}
+			yyjson_mut_obj_add_val(doc_, obj, "set", set);
+			yyjson_mut_obj_add_bool(doc_, obj, "negated", false);
+			return obj;
 		}
-		case TableFilterType::CONJUNCTION_AND: {
-			auto &conj_filter = filter.Cast<ConjunctionAndFilter>();
-			yyjson_mut_obj_add_str(doc_, obj, "type", "and");
-			auto children = yyjson_mut_arr(doc_);
-			for (auto &child : conj_filter.child_filters) {
-				auto child_obj = yyjson_mut_obj(doc_);
-				yyjson_mut_obj_add_strcpy(doc_, child_obj, "column_name", column_name.c_str());
-				yyjson_mut_obj_add_uint(doc_, child_obj, "column_index", column_index);
-				try {
-					if (!SerializeFilterInto(child_obj, *child, column_index, column_name)) {
-						continue; // child skipped (e.g., DynamicFilter not yet initialized)
-					}
-				} catch (const InvalidInputException &) {
-					continue; // skip unserializable children (e.g., BloomFilter)
-				}
-				yyjson_mut_arr_append(children, child_obj);
-			}
-			if (yyjson_mut_arr_size(children) == 0) {
-				return false; // all children skipped
-			}
-			yyjson_mut_obj_add_val(doc_, obj, "children", children);
-			break;
-		}
+		case TableFilterType::CONJUNCTION_AND:
 		case TableFilterType::CONJUNCTION_OR: {
-			auto &conj_filter = filter.Cast<ConjunctionOrFilter>();
-			yyjson_mut_obj_add_str(doc_, obj, "type", "or");
+			auto &conjunction = filter.filter_type == TableFilterType::CONJUNCTION_AND
+			                        ? static_cast<const ConjunctionFilter &>(filter.Cast<ConjunctionAndFilter>())
+			                        : static_cast<const ConjunctionFilter &>(filter.Cast<ConjunctionOrFilter>());
 			auto children = yyjson_mut_arr(doc_);
-			for (auto &child : conj_filter.child_filters) {
-				auto child_obj = yyjson_mut_obj(doc_);
-				yyjson_mut_obj_add_strcpy(doc_, child_obj, "column_name", column_name.c_str());
-				yyjson_mut_obj_add_uint(doc_, child_obj, "column_index", column_index);
-				try {
-					if (!SerializeFilterInto(child_obj, *child, column_index, column_name)) {
-						continue;
-					}
-				} catch (const InvalidInputException &) {
-					continue;
+			for (auto &child : conjunction.child_filters) {
+				auto child_advisory = advisory;
+				auto child_expr = SerializeFilterExpression(*child, ColumnRef(column_index, column_name), column_index,
+				                                            column_name, child_advisory);
+				if (!child_expr) {
+					return nullptr;
 				}
-				yyjson_mut_arr_append(children, child_obj);
+				advisory = advisory || child_advisory;
+				yyjson_mut_arr_append(children, child_expr);
 			}
-			if (yyjson_mut_arr_size(children) == 0) {
-				return false;
+			if (yyjson_mut_arr_size(children) < 2) {
+				return nullptr;
 			}
+			auto obj = yyjson_mut_obj(doc_);
+			yyjson_mut_obj_add_str(doc_, obj, "node",
+			                       filter.filter_type == TableFilterType::CONJUNCTION_AND ? "and" : "or");
 			yyjson_mut_obj_add_val(doc_, obj, "children", children);
-			break;
+			return obj;
 		}
 		case TableFilterType::STRUCT_EXTRACT: {
 			auto &struct_filter = filter.Cast<StructFilter>();
-			yyjson_mut_obj_add_str(doc_, obj, "type", "struct");
-			yyjson_mut_obj_add_uint(doc_, obj, "child_index", struct_filter.child_idx);
-			yyjson_mut_obj_add_strcpy(doc_, obj, "child_name", struct_filter.child_name.c_str());
-			auto child_filter_obj = yyjson_mut_obj(doc_);
-			// Struct child filter inherits column info from parent struct column
-			yyjson_mut_obj_add_strcpy(doc_, child_filter_obj, "column_name", column_name.c_str());
-			yyjson_mut_obj_add_uint(doc_, child_filter_obj, "column_index", column_index);
-			// Propagate a skipped child instead of emitting a half-built struct with a
-			// "type"-less child_filter (which would make the worker fail to parse). This
-			// matches the CONJUNCTION_AND/OR/OPTIONAL_FILTER handling. DuckDB only ever
-			// places ConstantFilter/IsNull/IsNotNull under a struct_extract today (never
-			// a DynamicFilter/BloomFilter/IN — those optimizers reject nested expressions),
-			// so this is currently unreachable, but keeps the contract consistent.
-			if (!SerializeFilterInto(child_filter_obj, *struct_filter.child_filter, column_index, column_name)) {
-				return false;
+			if (!struct_filter.child_filter) {
+				return nullptr;
 			}
-			yyjson_mut_obj_add_val(doc_, obj, "child_filter", child_filter_obj);
-			break;
-		}
-		case TableFilterType::DYNAMIC_FILTER: {
-			// DynamicFilter values are not available at init time (Top-N hasn't
-			// processed any rows yet). They are sent per-tick via custom metadata
-			// once the Top-N heap establishes a boundary. Skip without throwing
-			// so sibling filters in a ConjunctionAnd are still serialized.
-			return false;
+			auto field = yyjson_mut_obj(doc_);
+			yyjson_mut_obj_add_str(doc_, field, "node", "field_ref");
+			yyjson_mut_obj_add_val(doc_, field, "expression", input);
+			yyjson_mut_obj_add_uint(doc_, field, "field_index", struct_filter.child_idx);
+			yyjson_mut_obj_add_strcpy(doc_, field, "field_name", struct_filter.child_name.c_str());
+			return SerializeFilterExpression(*struct_filter.child_filter, field, column_index, column_name, advisory);
 		}
 		case TableFilterType::EXPRESSION_FILTER: {
 			auto &expr_filter = filter.Cast<ExpressionFilter>();
-			yyjson_mut_obj_add_str(doc_, obj, "type", "expression");
-			auto expr_json = SerializeExpression(*expr_filter.expr);
-			yyjson_mut_obj_add_val(doc_, obj, "expr", expr_json);
-			break;
-		}
-		case TableFilterType::BLOOM_FILTER: {
-			// A BloomFilter is a probabilistic filter the optimizer pushes onto the
-			// probe side of a (semi/hash) join; its large binary buffer can't be put
-			// on the wire. Skip it instead of throwing: the join above the scan still
-			// enforces exact membership, so dropping this redundant optimization never
-			// changes results — it only means the worker isn't pre-filtered. This
-			// mirrors DYNAMIC_FILTER above and the CONJUNCTION_AND/OR handling that
-			// already catches and skips unserializable bloom-filter children.
-			return false;
+			if (!ExpressionTreeIsSupported(*expr_filter.expr)) {
+				throw InvalidInputException("VGI required expression filter is not eligible for v2 serialization");
+			}
+			return SerializeExpression(*expr_filter.expr, column_index, column_name);
 		}
 		case TableFilterType::OPTIONAL_FILTER: {
 			auto &optional_filter = filter.Cast<OptionalFilter>();
-			if (!optional_filter.child_filter) {
-				return false;
+			advisory = true;
+			if (!optional_filter.child_filter || VgiContainsDynamicFilter(*optional_filter.child_filter)) {
+				return nullptr;
 			}
-			// Skip the entire OptionalFilter when its subtree contains a
-			// DynamicFilter — see the comment on VgiContainsDynamicFilter for why.
-			// The dynamic-filter mechanism captures DynamicFilters via
-			// try_capture_from_optional and pushes them per-tick once Top-N
-			// has established a threshold; serializing the static portion
-			// here would produce a stricter filter than the OptionalFilter
-			// promised and silently drop correct rows. (Repro:
-			// SELECT n FROM filter_echo(10) ORDER BY n NULLS FIRST LIMIT 3
-			// returned 0 rows because OR(IsNull, DynamicFilter) collapsed
-			// to a one-child OR(IsNull) once the DynamicFilter was elided.)
-			if (VgiContainsDynamicFilter(*optional_filter.child_filter)) {
-				return false;
-			}
-			return SerializeFilterInto(obj, *optional_filter.child_filter, column_index, column_name);
+			return SerializeFilterExpression(*optional_filter.child_filter, input, column_index, column_name, advisory);
 		}
-		default: {
+		case TableFilterType::DYNAMIC_FILTER:
+		case TableFilterType::BLOOM_FILTER:
+			// DuckDB 1.5 exposes neither immutable runtime artifact on the wire.
+			return nullptr;
+		default:
 			throw InvalidInputException(
-			    "VGI filter pushdown failed for worker '%s': unknown filter type %d cannot be serialized",
-			    worker_path_, static_cast<int>(filter.filter_type));
+			    "VGI filter pushdown failed for worker '%s': unknown filter type %d cannot be serialized", worker_path_,
+			    static_cast<int>(filter.filter_type));
 		}
-		}
-		return true;
 	}
 
-	//! Add a value and return its reference index
 	idx_t AddValue(const Value &value) {
-		idx_t ref = values_.size();
+		auto ref = value_ref_count_++;
 		values_.push_back(value);
 		value_types_.push_back(value.type());
+		value_names_.push_back("value_" + std::to_string(ref));
 		return ref;
 	}
 
-	//! Recursively serialize a bound expression tree to JSON
-	yyjson_mut_val *SerializeExpression(const Expression &expr) {
-		auto obj = yyjson_mut_obj(doc_);
-
-		switch (expr.GetExpressionClass()) {
-		case ExpressionClass::BOUND_REF: {
-			auto &ref_expr = expr.Cast<BoundReferenceExpression>();
-			yyjson_mut_obj_add_str(doc_, obj, "expr_type", "column_ref");
-			yyjson_mut_obj_add_uint(doc_, obj, "index", ref_expr.index);
-			break;
-		}
-		case ExpressionClass::BOUND_COLUMN_REF: {
-			// BOUND_COLUMN_REF is replaced with BOUND_REF by ReplaceWithBoundReference
-			// before ExpressionFilter is created, so this case should not be reached.
-			// Handle it defensively by serializing as column_ref with index 0.
-			yyjson_mut_obj_add_str(doc_, obj, "expr_type", "column_ref");
-			yyjson_mut_obj_add_uint(doc_, obj, "index", 0);
-			break;
-		}
-		case ExpressionClass::BOUND_CONSTANT: {
-			auto &const_expr = expr.Cast<BoundConstantExpression>();
-			yyjson_mut_obj_add_str(doc_, obj, "expr_type", "constant");
-			yyjson_mut_obj_add_uint(doc_, obj, "value_ref", AddValue(const_expr.value));
-			break;
-		}
-		case ExpressionClass::BOUND_FUNCTION: {
-			auto &func_expr = expr.Cast<BoundFunctionExpression>();
-			yyjson_mut_obj_add_str(doc_, obj, "expr_type", "function");
-			yyjson_mut_obj_add_strcpy(doc_, obj, "function_name", func_expr.function.name.c_str());
-			auto children = yyjson_mut_arr(doc_);
-			for (auto &child : func_expr.children) {
-				yyjson_mut_arr_append(children, SerializeExpression(*child));
-			}
-			yyjson_mut_obj_add_val(doc_, obj, "children", children);
-			break;
-		}
-		case ExpressionClass::BOUND_COMPARISON: {
-			auto &comp_expr = expr.Cast<BoundComparisonExpression>();
-			yyjson_mut_obj_add_str(doc_, obj, "expr_type", "comparison");
-			yyjson_mut_obj_add_str(doc_, obj, "op", ExpressionTypeToOp(comp_expr.GetExpressionType()));
-			yyjson_mut_obj_add_val(doc_, obj, "left", SerializeExpression(*comp_expr.left));
-			yyjson_mut_obj_add_val(doc_, obj, "right", SerializeExpression(*comp_expr.right));
-			break;
-		}
-		case ExpressionClass::BOUND_CONJUNCTION: {
-			auto &conj_expr = expr.Cast<BoundConjunctionExpression>();
-			yyjson_mut_obj_add_str(doc_, obj, "expr_type", "conjunction");
-			yyjson_mut_obj_add_str(
-			    doc_, obj, "conjunction_type",
-			    conj_expr.GetExpressionType() == ExpressionType::CONJUNCTION_AND ? "and" : "or");
-			auto children = yyjson_mut_arr(doc_);
-			for (auto &child : conj_expr.children) {
-				yyjson_mut_arr_append(children, SerializeExpression(*child));
-			}
-			yyjson_mut_obj_add_val(doc_, obj, "children", children);
-			break;
-		}
-		default: {
-			throw InvalidInputException(
-			    "VGI expression filter serialization failed for worker '%s': unsupported expression class %d",
-			    worker_path_, static_cast<int>(expr.GetExpressionClass()));
-		}
-		}
-
-		return obj;
+	idx_t AddType(const LogicalType &type) {
+		auto ref = type_ref_count_++;
+		values_.push_back(Value(type));
+		value_types_.push_back(type);
+		value_names_.push_back("type_" + std::to_string(ref));
+		return ref;
 	}
 
-	//! Estimate the serialized byte size of join key values.
-	//! For fixed-width types this is exact; for strings, samples the first 64 values.
+	yyjson_mut_val *SerializeExpression(const Expression &expr, idx_t column_index, const string &column_name) {
+		auto obj = yyjson_mut_obj(doc_);
+		switch (expr.GetExpressionClass()) {
+		case ExpressionClass::BOUND_REF: {
+			auto &ref = expr.Cast<BoundReferenceExpression>();
+			if (ref.index != 0) {
+				throw InvalidInputException("VGI DuckDB 1.5 filter references more than one column");
+			}
+			return ColumnRef(column_index, column_name);
+		}
+		case ExpressionClass::BOUND_CONSTANT:
+			return Literal(expr.Cast<BoundConstantExpression>().value);
+		case ExpressionClass::BOUND_COMPARISON: {
+			auto &comparison = expr.Cast<BoundComparisonExpression>();
+			auto op = ExpressionTypeToOp(comparison.GetExpressionType());
+			if (string(op) == "unknown") {
+				throw InvalidInputException("Unsupported VGI comparison operator");
+			}
+			yyjson_mut_obj_add_str(doc_, obj, "node", "comparison");
+			yyjson_mut_obj_add_str(doc_, obj, "op", op);
+			yyjson_mut_obj_add_val(doc_, obj, "left", SerializeExpression(*comparison.left, column_index, column_name));
+			yyjson_mut_obj_add_val(doc_, obj, "right",
+			                       SerializeExpression(*comparison.right, column_index, column_name));
+			return obj;
+		}
+		case ExpressionClass::BOUND_CONJUNCTION: {
+			auto &conjunction = expr.Cast<BoundConjunctionExpression>();
+			if (conjunction.children.size() < 2) {
+				throw InvalidInputException("VGI boolean conjunction requires at least two children");
+			}
+			yyjson_mut_obj_add_str(doc_, obj, "node",
+			                       conjunction.GetExpressionType() == ExpressionType::CONJUNCTION_AND ? "and" : "or");
+			auto children = yyjson_mut_arr(doc_);
+			for (auto &child : conjunction.children) {
+				yyjson_mut_arr_append(children, SerializeExpression(*child, column_index, column_name));
+			}
+			yyjson_mut_obj_add_val(doc_, obj, "children", children);
+			return obj;
+		}
+		case ExpressionClass::BOUND_OPERATOR: {
+			auto &op = expr.Cast<BoundOperatorExpression>();
+			if ((op.GetExpressionType() == ExpressionType::OPERATOR_IS_NULL ||
+			     op.GetExpressionType() == ExpressionType::OPERATOR_IS_NOT_NULL) &&
+			    op.children.size() == 1) {
+				yyjson_mut_obj_add_str(doc_, obj, "node", "is_null");
+				yyjson_mut_obj_add_val(doc_, obj, "expression",
+				                       SerializeExpression(*op.children[0], column_index, column_name));
+				yyjson_mut_obj_add_bool(doc_, obj, "negated",
+				                        op.GetExpressionType() == ExpressionType::OPERATOR_IS_NOT_NULL);
+				return obj;
+			}
+			if (op.GetExpressionType() == ExpressionType::OPERATOR_NOT && op.children.size() == 1) {
+				yyjson_mut_obj_add_str(doc_, obj, "node", "not");
+				yyjson_mut_obj_add_val(doc_, obj, "expression",
+				                       SerializeExpression(*op.children[0], column_index, column_name));
+				return obj;
+			}
+			if ((op.GetExpressionType() == ExpressionType::COMPARE_IN ||
+			     op.GetExpressionType() == ExpressionType::COMPARE_NOT_IN) &&
+			    op.children.size() > 1) {
+				vector<Value> values;
+				for (idx_t i = 1; i < op.children.size(); i++) {
+					if (op.children[i]->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
+						throw InvalidInputException("VGI IN expression candidates must be constants");
+					}
+					values.push_back(op.children[i]->Cast<BoundConstantExpression>().value);
+				}
+				yyjson_mut_obj_add_str(doc_, obj, "node", "in");
+				yyjson_mut_obj_add_val(doc_, obj, "expression",
+				                       SerializeExpression(*op.children[0], column_index, column_name));
+				auto set = yyjson_mut_obj(doc_);
+				yyjson_mut_obj_add_str(doc_, set, "kind", "literal");
+				yyjson_mut_obj_add_uint(doc_, set, "value_ref",
+				                        AddValue(Value::LIST(values[0].type(), std::move(values))));
+				yyjson_mut_obj_add_val(doc_, obj, "set", set);
+				yyjson_mut_obj_add_bool(doc_, obj, "negated", op.GetExpressionType() == ExpressionType::COMPARE_NOT_IN);
+				return obj;
+			}
+			break;
+		}
+		case ExpressionClass::BOUND_CAST: {
+			auto &cast = expr.Cast<BoundCastExpression>();
+			if (cast.try_cast || !cast.child->return_type.IsNumeric() || !cast.return_type.IsNumeric()) {
+				break;
+			}
+			yyjson_mut_obj_add_str(doc_, obj, "node", "cast");
+			yyjson_mut_obj_add_val(doc_, obj, "expression",
+			                       SerializeExpression(*cast.child, column_index, column_name));
+			yyjson_mut_obj_add_uint(doc_, obj, "type_ref", AddType(cast.return_type));
+			return obj;
+		}
+		default:
+			break;
+		}
+		throw InvalidInputException(
+		    "VGI expression filter serialization failed for worker '%s': unsupported expression class %d", worker_path_,
+		    static_cast<int>(expr.GetExpressionClass()));
+	}
+
+	//! Estimate the serialized byte size of join key values without overflow.
 	static idx_t EstimateJoinKeyBytes(const vector<Value> &values) {
 		if (values.empty()) {
 			return 0;
 		}
 		auto internal_type = values[0].type().InternalType();
 		if (internal_type == PhysicalType::VARCHAR) {
-			// Sample first N values to estimate average string length
-			constexpr idx_t SAMPLE_SIZE = 64;
-			idx_t sample_count = MinValue<idx_t>(SAMPLE_SIZE, values.size());
-			idx_t total_sample_bytes = 0;
-			idx_t non_null_count = 0;
-			for (idx_t i = 0; i < sample_count; i++) {
-				if (!values[i].IsNull()) {
-					total_sample_bytes += StringValue::Get(values[i]).size();
-					non_null_count++;
+			idx_t total_bytes = 0;
+			for (auto &value : values) {
+				auto value_bytes = value.IsNull() ? 0 : StringValue::Get(value).size();
+				if (total_bytes > std::numeric_limits<idx_t>::max() - 4 ||
+				    value_bytes > std::numeric_limits<idx_t>::max() - total_bytes - 4) {
+					return std::numeric_limits<idx_t>::max();
 				}
+				total_bytes += value_bytes + 4;
 			}
-			idx_t avg_len = non_null_count > 0 ? total_sample_bytes / non_null_count : 0;
-			return values.size() * (avg_len + 4); // +4 for Arrow string offsets
+			return total_bytes;
 		}
-		// Fixed-width: exact calculation
-		return values.size() * GetTypeIdSize(internal_type);
+		auto type_size = GetTypeIdSize(internal_type);
+		if (type_size > 0 && values.size() > std::numeric_limits<idx_t>::max() / type_size) {
+			return std::numeric_limits<idx_t>::max();
+		}
+		return values.size() * type_size;
 	}
 
 	yyjson_mut_doc *doc_;
 	string worker_path_;
 	idx_t join_keys_max_bytes_;
+	bool allow_external_sets_;
 	vector<Value> values_;
 	vector<LogicalType> value_types_;
+	vector<string> value_names_;
 	vector<JoinKeysInfo> join_key_columns_;
+	idx_t value_ref_count_ = 0;
+	idx_t type_ref_count_ = 0;
+	static constexpr idx_t INLINE_SET_MAX_BYTES = 4096;
 };
 
 } // anonymous namespace
@@ -866,10 +942,10 @@ private:
 // ============================================================================
 
 SerializedFilters VgiSerializeFilters(ClientContext &context, const vector<column_t> &column_ids,
-                                      optional_ptr<TableFilterSet> filters,
-                                      const vector<string> &column_names, const string &worker_path,
-                                      const string &rowid_column_name,
-                                      const std::set<idx_t> *exclude_filter_keys) {
+                                      optional_ptr<TableFilterSet> filters, const vector<string> &column_names,
+                                      const string &worker_path, const string &rowid_column_name,
+                                      int64_t rowid_worker_col_index, const std::set<idx_t> *exclude_filter_keys,
+                                      VgiFilterColumnIndexDomain index_domain) {
 	// Return empty if no filters
 	if (!filters || filters->filters.empty()) {
 		return {nullptr, {}};
@@ -882,9 +958,15 @@ SerializedFilters VgiSerializeFilters(ClientContext &context, const vector<colum
 		join_keys_max_bytes = max_bytes_val.GetValue<idx_t>();
 	}
 
-	// Build JSON filter structure and collect values
+	// Build a v2 snapshot. DuckDB 1.5 table filters are single-column, but
+	// every reference still names the unprojected bind-schema field.
 	FilterSerializer serializer(worker_path, join_keys_max_bytes);
-	auto filter_array = yyjson_mut_arr(serializer.GetDoc());
+	auto document = yyjson_mut_obj(serializer.GetDoc());
+	yyjson_mut_obj_add_str(serializer.GetDoc(), document, "encoding", "vgi.filters.v2");
+	yyjson_mut_obj_add_str(serializer.GetDoc(), document, "semantics", "vgi.duckdb.standard.v1");
+	yyjson_mut_obj_add_str(serializer.GetDoc(), document, "kind", "snapshot");
+	auto predicates = yyjson_mut_arr(serializer.GetDoc());
+	idx_t predicate_index = 0;
 
 	for (auto &entry : filters->filters) {
 		idx_t col_idx = entry.first;
@@ -896,10 +978,19 @@ SerializedFilters VgiSerializeFilters(ClientContext &context, const vector<colum
 			continue;
 		}
 
-		// DuckDB's TableFilterSet uses indices into the projected column list (column_ids).
-		// Map through column_ids to get the original schema column name, but keep the
-		// projected index as column_index since the worker output follows projection order.
-		idx_t original_col_idx = col_idx < column_ids.size() ? column_ids[col_idx] : col_idx;
+		// DuckDB's TableFilterSet uses indices into the projected column list.
+		// VGI v2 column_ref instead identifies the unprojected bind schema.
+		idx_t original_col_idx;
+		if (index_domain == VgiFilterColumnIndexDomain::BIND_SCHEMA) {
+			original_col_idx = col_idx;
+		} else {
+			if (col_idx >= column_ids.size()) {
+				throw InvalidInputException(
+				    "VGI filter column %llu has no projected-to-bind-schema mapping for worker '%s'",
+				    static_cast<unsigned long long>(col_idx), worker_path);
+			}
+			original_col_idx = column_ids[col_idx];
+		}
 		// A filter on the rowid virtual column carries the COLUMN_IDENTIFIER_ROW_ID
 		// sentinel (UINT64_MAX). Without remapping, col_name would become the literal
 		// "18446744073709551615" and the worker — which resolves pushed/join-key columns
@@ -908,42 +999,85 @@ SerializedFilters VgiSerializeFilters(ClientContext &context, const vector<colum
 		// Resolve to the worker's actual rowid field name (passed explicitly because
 		// column_names has the rowid column erased — indexing it would mis-resolve).
 		string col_name;
+		idx_t worker_col_idx;
 		if (original_col_idx == COLUMN_IDENTIFIER_ROW_ID && !rowid_column_name.empty()) {
 			col_name = rowid_column_name;
+			if (rowid_worker_col_index < 0) {
+				throw InvalidInputException("VGI rowid filter has no worker-schema index for worker '%s'", worker_path);
+			}
+			worker_col_idx = NumericCast<idx_t>(rowid_worker_col_index);
 		} else {
-			col_name =
-			    original_col_idx < column_names.size() ? column_names[original_col_idx] : std::to_string(original_col_idx);
+			if (original_col_idx == COLUMN_IDENTIFIER_ROW_ID || original_col_idx >= column_names.size()) {
+				throw InvalidInputException("VGI filter bind-schema column %llu is invalid for worker '%s'",
+				                            static_cast<unsigned long long>(original_col_idx), worker_path);
+			}
+			col_name = column_names[original_col_idx];
+			worker_col_idx = original_col_idx;
+			if (rowid_worker_col_index >= 0 && worker_col_idx >= NumericCast<idx_t>(rowid_worker_col_index)) {
+				worker_col_idx++;
+			}
 		}
 
-		// `col_idx` is the filter's position in the projected column_ids and is
-		// sent as the wire `column_index`. The worker applies ConstantFilter /
-		// InFilter by INDEX (`batch.column(column_index)`), so this only resolves
-		// correctly because the worker emits its output batch in the same
-		// projected order (`project_schema(projection_ids, ...)`): emitted-batch
-		// position == projected column_ids position. A worker that reorders its
-		// emitted columns relative to projection_ids would mis-apply pushed
-		// filters. (Join-key IN filters are additionally matched by name.)
-		if (filter.filter_type == TableFilterType::OPTIONAL_FILTER) {
-			// Optional filters (e.g., DynamicFilter from TOP-N) may contain unserializable
-			// children. Skip them rather than failing the entire filter set.
+		auto append_filter = [&](const TableFilter &candidate, bool inherited_advisory) {
+			bool advisory = inherited_advisory || candidate.filter_type == TableFilterType::OPTIONAL_FILTER ||
+			                candidate.filter_type == TableFilterType::DYNAMIC_FILTER ||
+			                candidate.filter_type == TableFilterType::BLOOM_FILTER;
 			try {
-				auto filter_obj = serializer.SerializeColumnFilter(col_idx, col_name, filter);
-				if (filter_obj) {
-					yyjson_mut_arr_append(filter_array, filter_obj);
+				auto expression = serializer.SerializeFilter(candidate, worker_col_idx, col_name, advisory);
+				if (!expression) {
+					if (advisory) {
+						return;
+					}
+					throw InvalidInputException(
+					    "VGI required filter for worker '%s' could not be serialized atomically", worker_path);
 				}
+				auto predicate = yyjson_mut_obj(serializer.GetDoc());
+				auto id = string(advisory ? "advisory:" : "query:") + std::to_string(predicate_index++);
+				yyjson_mut_obj_add_strcpy(serializer.GetDoc(), predicate, "id", id.c_str());
+				yyjson_mut_obj_add_uint(serializer.GetDoc(), predicate, "revision", 0);
+				yyjson_mut_obj_add_str(serializer.GetDoc(), predicate, "mode", advisory ? "advisory" : "required");
+				yyjson_mut_obj_add_str(serializer.GetDoc(), predicate, "source", advisory ? "other" : "query");
+				yyjson_mut_obj_add_val(serializer.GetDoc(), predicate, "expression", expression);
+				yyjson_mut_arr_append(predicates, predicate);
 			} catch (const InvalidInputException &) {
-				continue;
+				if (!advisory) {
+					throw;
+				}
 			}
-		} else {
-			auto filter_obj = serializer.SerializeColumnFilter(col_idx, col_name, filter);
-			if (filter_obj) {
-				yyjson_mut_arr_append(filter_array, filter_obj);
+		};
+
+		if (filter.filter_type != TableFilterType::CONJUNCTION_AND) {
+			append_filter(filter, false);
+			continue;
+		}
+
+		// Keep required conjuncts in one expression so DuckDB's evaluation and
+		// error ordering are not weakened. Explicit advisory children may be
+		// separated only when they cannot throw; DuckDB retains their residual.
+		auto &conjunction = filter.Cast<ConjunctionAndFilter>();
+		auto required = make_uniq<ConjunctionAndFilter>();
+		for (auto &child : conjunction.child_filters) {
+			bool advisory = child->filter_type == TableFilterType::OPTIONAL_FILTER ||
+			                child->filter_type == TableFilterType::DYNAMIC_FILTER ||
+			                child->filter_type == TableFilterType::BLOOM_FILTER;
+			if (advisory) {
+				if (!VgiAdvisoryFilterCanThrow(*child)) {
+					append_filter(*child, true);
+				}
+			} else {
+				required->child_filters.push_back(child->Copy());
 			}
+		}
+		if (required->child_filters.size() == 1) {
+			append_filter(*required->child_filters[0], false);
+		} else if (!required->child_filters.empty()) {
+			append_filter(*required, false);
 		}
 	}
+	yyjson_mut_obj_add_val(serializer.GetDoc(), document, "predicates", predicates);
 
 	// Write JSON string
-	char *json_str = serializer.WriteJson(filter_array);
+	char *json_str = serializer.WriteJson(document);
 	if (!json_str) {
 		throw IOException("Failed to serialize filters to JSON");
 	}
@@ -953,6 +1087,7 @@ SerializedFilters VgiSerializeFilters(ClientContext &context, const vector<colum
 	// Build Arrow RecordBatch with filter_spec + value columns
 	auto &values = serializer.GetValues();
 	auto &value_types = serializer.GetValueTypes();
+	auto &value_names = serializer.GetValueNames();
 
 	// Build types and names: filter_spec (VARCHAR) + value columns
 	vector<LogicalType> types;
@@ -961,7 +1096,7 @@ SerializedFilters VgiSerializeFilters(ClientContext &context, const vector<colum
 	names.push_back("filter_spec");
 	for (idx_t i = 0; i < value_types.size(); i++) {
 		types.push_back(value_types[i]);
-		names.push_back("_val_" + std::to_string(i));
+		names.push_back(value_names[i]);
 	}
 
 	// Create single-row DataChunk and populate
@@ -990,19 +1125,16 @@ SerializedFilters VgiSerializeFilters(ClientContext &context, const vector<colum
 	}
 	auto record_batch = import_result.ValueUnsafe();
 
-	// Add version metadata to filter_spec field (field 0)
-	// We need to rebuild the schema with the metadata
-	auto filter_spec_field = record_batch->schema()->field(0);
-	auto metadata = arrow::KeyValueMetadata::Make({"vgi_filter_version"}, {"1"});
-	auto new_field = filter_spec_field->WithMetadata(metadata);
-
-	// Build new schema with the updated field
+	// V2 metadata is schema-level. The filter_spec cell itself is required.
+	auto metadata =
+	    arrow::KeyValueMetadata::Make({"vgi_filter_encoding", "vgi_filter_version", "vgi_evaluation_context"},
+	                                  {"vgi.filters.v2", "2", "vgi.none.v1"});
 	std::vector<std::shared_ptr<arrow::Field>> new_fields;
-	new_fields.push_back(new_field);
+	new_fields.push_back(arrow::field("filter_spec", arrow::utf8(), /*nullable=*/false));
 	for (int i = 1; i < record_batch->schema()->num_fields(); i++) {
 		new_fields.push_back(record_batch->schema()->field(i));
 	}
-	auto new_schema = arrow::schema(new_fields);
+	auto new_schema = arrow::schema(new_fields, metadata);
 
 	// Create new RecordBatch with updated schema
 	record_batch = arrow::RecordBatch::Make(new_schema, record_batch->num_rows(), record_batch->columns());
@@ -1067,8 +1199,8 @@ SerializedFilters VgiSerializeFilters(ClientContext &context, const vector<colum
 
 			auto import_res = arrow::ImportRecordBatch(&arr, &c_schema);
 			if (!import_res.ok()) {
-				throw IOException("Failed to import join keys RecordBatch for '%s': %s",
-				                  kc.column_name, import_res.status().ToString());
+				throw IOException("Failed to import join keys RecordBatch for '%s': %s", kc.column_name,
+				                  import_res.status().ToString());
 			}
 			auto key_batch = import_res.ValueUnsafe();
 
@@ -1363,7 +1495,8 @@ static void ClassifyPartitionFilters(ClientContext &context, const VgiTableFunct
 		try {
 			auto sf = VgiSerializeFilters(context, input.column_ids, input.filters,
 			                              bind_data.all_column_names, bind_data.worker_path(),
-			                              bind_data.rowid_column_name, &exclude_keys);
+			                              bind_data.rowid_column_name, bind_data.rowid_worker_col_index,
+			                              &exclude_keys);
 			if (sf.filter_bytes) {
 				e.partition_residual_filter_bytes.append(reinterpret_cast<const char *>(sf.filter_bytes->data()),
 				                                         static_cast<size_t>(sf.filter_bytes->size()));
@@ -1542,7 +1675,7 @@ CacheEligibility EvaluateCacheEligibility(ClientContext &context,
 			try {
 				auto sf = VgiSerializeFilters(context, input.column_ids, input.filters,
 				                              bind_data.all_column_names, bind_data.worker_path(),
-				                              bind_data.rowid_column_name);
+				                              bind_data.rowid_column_name, bind_data.rowid_worker_col_index);
 				if (sf.filter_bytes) {
 					filter_key.append(reinterpret_cast<const char *>(sf.filter_bytes->data()),
 					                  static_cast<size_t>(sf.filter_bytes->size()));
@@ -2051,32 +2184,26 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 	auto connection = std::move(acquired.connection);
 	const auto &bind_result = bind_data.bind_result;
 
-	// Serialize the filters (returns empty if no filters or if serialization fails)
-	SerializedFilters serialized_filters;
-	try {
-		serialized_filters =
-		    VgiSerializeFilters(context, input.column_ids, input.filters, bind_data.all_column_names,
-		                        bind_data.worker_path(), bind_data.rowid_column_name);
-		if (serialized_filters.filter_bytes) {
-			VGI_LOG(context, "table_function.filters_serialized",
-			        {{"function_name", bind_data.function_name},
-			         {"filter_bytes_size", std::to_string(serialized_filters.filter_bytes->size())}});
-		}
-		if (!serialized_filters.join_keys_buffers.empty()) {
-			idx_t total_size = 0;
-			for (auto &buf : serialized_filters.join_keys_buffers) {
-				total_size += buf->size();
-			}
-			VGI_LOG(context, "table_function.join_keys_serialized",
-			        {{"function_name", bind_data.function_name},
-			         {"join_keys_count", std::to_string(serialized_filters.join_keys_buffers.size())},
-			         {"join_keys_total_bytes", std::to_string(total_size)}});
-		}
-	} catch (const InvalidInputException &e) {
-		// Filter contains unsupported types - skip pushdown, let DuckDB filter locally
-		VGI_LOG(context, "table_function.filter_pushdown_skipped",
+	// A required TableFilter reaches this point only after DuckDB has delegated
+	// evaluation to the scan. Serialization failure must therefore fail closed;
+	// silently continuing would run the remote scan without the removed residual.
+	auto serialized_filters =
+	    VgiSerializeFilters(context, input.column_ids, input.filters, bind_data.all_column_names,
+	                        bind_data.worker_path(), bind_data.rowid_column_name, bind_data.rowid_worker_col_index);
+	if (serialized_filters.filter_bytes) {
+		VGI_LOG(context, "table_function.filters_serialized",
 		        {{"function_name", bind_data.function_name},
-		         {"reason", e.what()}});
+		         {"filter_bytes_size", std::to_string(serialized_filters.filter_bytes->size())}});
+	}
+	if (!serialized_filters.join_keys_buffers.empty()) {
+		idx_t total_size = 0;
+		for (auto &buf : serialized_filters.join_keys_buffers) {
+			total_size += buf->size();
+		}
+		VGI_LOG(context, "table_function.join_keys_serialized",
+		        {{"function_name", bind_data.function_name},
+		         {"join_keys_count", std::to_string(serialized_filters.join_keys_buffers.size())},
+		         {"join_keys_total_bytes", std::to_string(total_size)}});
 	}
 	auto &filter_bytes = serialized_filters.filter_bytes;
 	auto &join_keys_buffers = serialized_filters.join_keys_buffers;
@@ -2160,6 +2287,9 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 	}
 
 	if (!dynamic_filters.empty()) {
+		for (idx_t i = 0; i < dynamic_filters.size(); i++) {
+			dynamic_filters[i].predicate_id = "top_n:" + std::to_string(i);
+		}
 		VGI_LOG(context, "table_function.dynamic_filters_captured",
 		        {{"function_name", bind_data.function_name},
 		         {"count", std::to_string(dynamic_filters.size())}});
@@ -2171,14 +2301,6 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 	shared_ptr<TickFilterState> tick_filter_state;
 	if (!dynamic_filters.empty()) {
 		tick_filter_state = make_shared_ptr<TickFilterState>();
-		// If we have static filters, pre-populate with those (they'll be merged with dynamic on each update)
-		if (filter_bytes) {
-			// Base64-encode the static filter bytes for the initial tick state
-			auto encoded = Blob::ToBase64(string_t(reinterpret_cast<const char *>(filter_bytes->data()),
-			                                       static_cast<idx_t>(filter_bytes->size())));
-			tick_filter_state->encoded_filters = encoded;
-			tick_filter_state->has_filters = true;
-		}
 		connection->SetTickFilterState(tick_filter_state);
 	}
 
@@ -2674,6 +2796,102 @@ unique_ptr<LocalTableFunctionState> VgiTableFunctionInitLocal(ExecutionContext &
 // Helper: Get next batch from worker and convert to Arrow C ABI
 // ============================================================================
 
+std::shared_ptr<arrow::Buffer> VgiSerializeDynamicFilterDelta(ClientContext &context, const string &worker_path,
+                                                              const vector<VgiDynamicFilterDeltaUpdate> &updates) {
+	FilterSerializer serializer(worker_path, 0, /*allow_external_sets=*/false);
+	auto document = yyjson_mut_obj(serializer.GetDoc());
+	yyjson_mut_obj_add_str(serializer.GetDoc(), document, "encoding", "vgi.filters.v2");
+	yyjson_mut_obj_add_str(serializer.GetDoc(), document, "semantics", "vgi.duckdb.standard.v1");
+	yyjson_mut_obj_add_str(serializer.GetDoc(), document, "kind", "delta");
+	auto json_updates = yyjson_mut_arr(serializer.GetDoc());
+	for (auto &update : updates) {
+		auto obj = yyjson_mut_obj(serializer.GetDoc());
+		bool remove = update.filter == nullptr;
+		yyjson_mut_obj_add_str(serializer.GetDoc(), obj, "operation", remove ? "remove" : "upsert");
+		yyjson_mut_obj_add_strcpy(serializer.GetDoc(), obj, "id", update.predicate_id.c_str());
+		yyjson_mut_obj_add_uint(serializer.GetDoc(), obj, "revision", update.revision);
+		if (!remove) {
+			bool advisory = true;
+			auto expression =
+			    serializer.SerializeFilter(*update.filter, update.column_index, update.column_name, advisory);
+			if (!expression) {
+				throw InvalidInputException("VGI dynamic filter could not be serialized atomically");
+			}
+			yyjson_mut_obj_add_str(serializer.GetDoc(), obj, "mode", "advisory");
+			yyjson_mut_obj_add_str(serializer.GetDoc(), obj, "source", "top_n");
+			yyjson_mut_obj_add_val(serializer.GetDoc(), obj, "expression", expression);
+		}
+		yyjson_mut_arr_append(json_updates, obj);
+	}
+	yyjson_mut_obj_add_val(serializer.GetDoc(), document, "updates", json_updates);
+
+	auto json = serializer.WriteJson(document);
+	if (!json) {
+		throw IOException("Failed to serialize dynamic filter delta to JSON");
+	}
+	string filter_spec(json);
+	free(json);
+
+	auto &values = serializer.GetValues();
+	auto &value_types = serializer.GetValueTypes();
+	auto &value_names = serializer.GetValueNames();
+	vector<LogicalType> types {LogicalType::VARCHAR};
+	vector<string> names {"filter_spec"};
+	for (idx_t i = 0; i < value_types.size(); i++) {
+		types.push_back(value_types[i]);
+		names.push_back(value_names[i]);
+	}
+	DataChunk chunk;
+	chunk.Initialize(Allocator::DefaultAllocator(), types);
+	chunk.SetCardinality(1);
+	chunk.SetValue(0, 0, Value(filter_spec));
+	for (idx_t i = 0; i < values.size(); i++) {
+		chunk.SetValue(i + 1, 0, values[i]);
+	}
+
+	auto client_props = context.GetClientProperties();
+	ArrowAppender appender(types, 1, client_props, ArrowTypeExtensionData::GetExtensionTypes(context, types));
+	appender.Append(chunk, 0, 1, 1);
+	auto array = appender.Finalize();
+	ArrowSchema c_schema;
+	ArrowConverter::ToArrowSchema(&c_schema, types, names, client_props);
+	auto imported = arrow::ImportRecordBatch(&array, &c_schema);
+	if (!imported.ok()) {
+		throw IOException("Failed to import dynamic filter delta: %s", imported.status().ToString());
+	}
+	auto batch = imported.ValueUnsafe();
+	auto metadata =
+	    arrow::KeyValueMetadata::Make({"vgi_filter_encoding", "vgi_filter_version", "vgi_evaluation_context"},
+	                                  {"vgi.filters.v2", "2", "vgi.none.v1"});
+	auto fields = batch->schema()->fields();
+	fields[0] = arrow::field("filter_spec", arrow::utf8(), /*nullable=*/false);
+	batch = arrow::RecordBatch::Make(arrow::schema(fields, metadata), 1, batch->columns());
+
+	auto output_result = arrow::io::BufferOutputStream::Create();
+	if (!output_result.ok()) {
+		throw IOException("Failed to create dynamic filter delta buffer: %s", output_result.status().ToString());
+	}
+	auto output = output_result.ValueUnsafe();
+	auto writer_result = arrow::ipc::MakeStreamWriter(output, batch->schema());
+	if (!writer_result.ok()) {
+		throw IOException("Failed to create dynamic filter delta writer: %s", writer_result.status().ToString());
+	}
+	auto writer = writer_result.ValueUnsafe();
+	auto status = writer->WriteRecordBatch(*batch);
+	if (!status.ok()) {
+		throw IOException("Failed to write dynamic filter delta: %s", status.ToString());
+	}
+	status = writer->Close();
+	if (!status.ok()) {
+		throw IOException("Failed to close dynamic filter delta: %s", status.ToString());
+	}
+	auto finished = output->Finish();
+	if (!finished.ok()) {
+		throw IOException("Failed to finish dynamic filter delta: %s", finished.status().ToString());
+	}
+	return finished.ValueUnsafe();
+}
+
 //! Update the TickFilterState with current DynamicFilter values.
 //! Called before each ReadDataBatch to ensure the tick carries the latest filter.
 static void UpdateDynamicFilterState(VgiTableFunctionGlobalState &global_state, ClientContext &context,
@@ -2682,20 +2900,20 @@ static void UpdateDynamicFilterState(VgiTableFunctionGlobalState &global_state, 
 		return;
 	}
 
-	// Build a merged TableFilterSet with static + current dynamic filters
-	TableFilterSet merged;
-
-	// Add all static filters (from init-time serialization)
-	// We need to re-create them from the original input.filters that were serialized.
-	// For now, we serialize just the dynamic filters as ConstantFilters.
-	// The static filters were already sent at init time — the worker has them.
-
-	bool any_initialized = false;
+	// Revisions and active/tombstone transitions are protected with the same
+	// lock the connection uses to read encoded tick metadata.
+	lock_guard<mutex> state_lock(global_state.tick_filter_state->lock);
+	vector<unique_ptr<TableFilter>> update_filters;
+	vector<VgiDynamicFilterDeltaUpdate> updates;
 	for (auto &df : global_state.dynamic_filters) {
 		if (!df.filter_data->initialized.load()) {
+			if (df.active) {
+				df.revision++;
+				df.active = false;
+				updates.push_back({df.predicate_id, df.revision, df.column_index, df.column_name, nullptr});
+			}
 			continue;
 		}
-		any_initialized = true;
 
 		// Read the current value under lock
 		lock_guard<mutex> l(df.filter_data->lock);
@@ -2712,33 +2930,30 @@ static void UpdateDynamicFilterState(VgiTableFunctionGlobalState &global_state, 
 			pushed = std::move(filter_copy);
 		}
 
-		merged.filters[df.column_index] = std::move(pushed);
+		df.revision++;
+		df.active = true;
+		auto filter_ptr = pushed.get();
+		update_filters.push_back(std::move(pushed));
+		updates.push_back({df.predicate_id, df.revision, df.column_index, df.column_name, filter_ptr});
 	}
 
-	if (!any_initialized) {
-		// No dynamic filters initialized yet (or Reset was called for recursive CTEs).
-		// Clear any stale filter state from a previous iteration.
-		lock_guard<mutex> l(global_state.tick_filter_state->lock);
-		if (global_state.tick_filter_state->has_filters) {
-			global_state.tick_filter_state->encoded_filters.clear();
-			global_state.tick_filter_state->has_filters = false;
-		}
+	if (updates.empty()) {
+		global_state.tick_filter_state->encoded_filters.clear();
+		global_state.tick_filter_state->has_filters = false;
 		return;
 	}
 
-	// Serialize the merged filters
+	// Runtime metadata carries a delta, never a replacement snapshot. Every
+	// upsert is advisory; a reset emits a revisioned remove tombstone.
 	try {
-		auto serialized = VgiSerializeFilters(context, {}, &merged, bind_data.all_column_names, bind_data.worker_path());
-		if (serialized.filter_bytes) {
-			auto &fb = serialized.filter_bytes;
-			auto encoded = Blob::ToBase64(string_t(reinterpret_cast<const char *>(fb->data()),
-			                                       static_cast<idx_t>(fb->size())));
-			lock_guard<mutex> l(global_state.tick_filter_state->lock);
-			global_state.tick_filter_state->encoded_filters = encoded;
-			global_state.tick_filter_state->has_filters = true;
-		}
+		auto bytes = VgiSerializeDynamicFilterDelta(context, bind_data.worker_path(), updates);
+		global_state.tick_filter_state->encoded_filters =
+		    Blob::ToBase64(string_t(reinterpret_cast<const char *>(bytes->data()), static_cast<idx_t>(bytes->size())));
+		global_state.tick_filter_state->has_filters = true;
 	} catch (...) {
-		// Serialization failure is not fatal — the filter is optional
+		// Dynamic filters are advisory. A failure omits this complete delta.
+		global_state.tick_filter_state->encoded_filters.clear();
+		global_state.tick_filter_state->has_filters = false;
 	}
 }
 

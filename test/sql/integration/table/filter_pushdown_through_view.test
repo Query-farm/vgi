@@ -9,7 +9,7 @@
 
 # example.data.filter_echo_table is backed by FilterEchoTableScanFunction
 # (filter_pushdown=True, auto_apply_filters=True, projection_pushdown=True,
-# supported_expression_filters=["prefix","starts_with"]). Its pushed_filters
+# filter_semantic_profiles=["vgi.duckdb.standard.v1"]). Its pushed_filters
 # column echoes the SQL representation of whatever DuckDB pushed to the worker;
 # the framework auto-applies the filters so results stay correct. 100 rows:
 # n in 0..99, s = 'row_<n>'.
@@ -65,7 +65,7 @@ s = 'row_5'
 
 # LIKE 'prefix%' — DuckDB's LikeOptimizationRule lowers a constant-prefix LIKE to
 # a RANGE ConstantFilter (NOT an expression filter), so it pushes down with no
-# supported_expression_filters needed. The '_' in 'row_1%' is a single-char
+# filter_semantic_profiles opt-in needed. The '_' in 'row_1%' is a single-char
 # wildcard, so the constant prefix is just 'row' -> range [ 'row', 'rox' ).
 # The residual LIKE is applied above the scan, so results are exact.
 query T
@@ -186,8 +186,8 @@ SELECT count(*) FROM v_upper WHERE su LIKE 'ROW_1%';
 11
 
 # 4b. LIKE with no constant prefix (leading wildcard) -> no range rewrite, and
-#     'contains'/'suffix' are not in supported_expression_filters, so nothing
-#     pushes. True both directly and through the plain view.
+#     the adapter cannot encode the pattern as an exact standard call, so
+#     nothing pushes. True both directly and through the plain view.
 query T
 SELECT DISTINCT pushed_filters FROM v_echo WHERE s LIKE '%row%';
 ----
@@ -202,8 +202,8 @@ SELECT DISTINCT pushed_filters FROM v_echo WHERE s LIKE '%5';
 #     The LIKE -> range rewrite only fires for case-SENSITIVE LIKE; a
 #     case-insensitive match can't be expressed as a single byte range
 #     (>= 'row' AND < 'rox' would miss 'ROW'/'Row'), so DuckDB keeps ILIKE as a
-#     residual expression above the scan. With no 'ilike'/'lower' in
-#     supported_expression_filters, nothing reaches the worker. This is a likely
+#     residual expression above the scan. The selected semantic profile has no
+#     case-insensitive string-call contract, so nothing reaches the worker. This is a likely
 #     real-world cause of "my view's LIKE filter wasn't pushed down" when the
 #     predicate is actually a case-insensitive ILIKE. Results stay correct.
 
@@ -235,6 +235,23 @@ query I
 SELECT count(*) FROM v_echo WHERE s ILIKE '%ROW%';
 ----
 100
+
+# 4d. Raw VARCHAR filters above use DuckDB's binary comparison semantics and are
+# safe under vgi.none.v1. A non-binary collation is represented as a function;
+# the 1.5 adapter cannot prove that function's protocol identity, so it declines
+# pushdown and leaves the exact predicate in DuckDB.
+statement ok
+PRAGMA default_collation='NOCASE';
+
+query T
+SELECT DISTINCT pushed_filters FROM v_echo WHERE s = 'ROW_5';
+----
+(none)
+
+query I
+SELECT count(*) FROM v_echo WHERE s = 'ROW_5';
+----
+1
 
 # ============================================================================
 # Cleanup

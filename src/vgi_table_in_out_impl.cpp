@@ -414,22 +414,14 @@ unique_ptr<GlobalTableFunctionState> VgiTableInOutInitGlobal(ClientContext &cont
 		for (int i = 0; i < bind_data.output_schema->num_fields(); ++i) {
 			output_names.push_back(bind_data.output_schema->field(i)->name());
 		}
-		try {
-			auto serialized = vgi::VgiSerializeFilters(
-			    context, input.column_ids, input.filters,
-			    output_names, bind_data.worker_path());
-			global_state->static_filter_bytes = std::move(serialized.filter_bytes);
-			global_state->join_keys_buffers = std::move(serialized.join_keys_buffers);
-			if (global_state->static_filter_bytes) {
-				VGI_LOG(context, "table_in_out.filters_serialized",
-				        {{"function_name", bind_data.function_name},
-				         {"filter_bytes_size",
-				          std::to_string(global_state->static_filter_bytes->size())}});
-			}
-		} catch (const InvalidInputException &e) {
-			// Unsupported filter — skip pushdown; DuckDB filters locally.
-			VGI_LOG(context, "table_in_out.filter_pushdown_skipped",
-			        {{"function_name", bind_data.function_name}, {"reason", e.what()}});
+		auto serialized =
+		    vgi::VgiSerializeFilters(context, input.column_ids, input.filters, output_names, bind_data.worker_path());
+		global_state->static_filter_bytes = std::move(serialized.filter_bytes);
+		global_state->join_keys_buffers = std::move(serialized.join_keys_buffers);
+		if (global_state->static_filter_bytes) {
+			VGI_LOG(context, "table_in_out.filters_serialized",
+			        {{"function_name", bind_data.function_name},
+			         {"filter_bytes_size", std::to_string(global_state->static_filter_bytes->size())}});
 		}
 	}
 
