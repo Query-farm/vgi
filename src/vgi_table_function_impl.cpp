@@ -380,8 +380,8 @@ void PerformVgiTableFunctionBind(ClientContext &context, VgiTableFunctionBindDat
 
 namespace {
 
-bool HasFilterFunctionCapability(const vector<VgiFilterFunctionCapability> &capabilities, const string &namespace_name,
-                                 const string &name, uint64_t version) {
+bool HasFilterFunctionCapability(const std::vector<VgiFilterFunctionCapability> &capabilities,
+                                 const string &namespace_name, const string &name, uint64_t version) {
 	for (const auto &capability : capabilities) {
 		if (capability.namespace_name == namespace_name && capability.name == name && capability.version == version) {
 			return true;
@@ -394,7 +394,7 @@ bool HasFilterFunctionCapability(const vector<VgiFilterFunctionCapability> &capa
 //! DuckDB 1.5 calls this before replacing the sole BoundColumnRef with a
 //! BoundReferenceExpression, so both forms are accepted as the same root.
 bool ExpressionTreeIsSupported(const Expression &expr,
-                               const vector<VgiFilterFunctionCapability> &additional_functions) {
+                               const std::vector<VgiFilterFunctionCapability> &additional_functions) {
 	switch (expr.GetExpressionClass()) {
 	case ExpressionClass::BOUND_REF:
 		return expr.Cast<BoundReferenceExpression>().index == 0;
@@ -629,7 +629,7 @@ namespace { // reopen anonymous namespace for the file-local FilterSerializer.
 class FilterSerializer {
 public:
 	FilterSerializer(const string &worker_path, idx_t join_keys_max_bytes, bool allow_external_sets = true,
-	                 vector<VgiFilterFunctionCapability> additional_functions = {})
+	                 std::vector<VgiFilterFunctionCapability> additional_functions = {})
 	    : doc_(yyjson_mut_doc_new(nullptr)), worker_path_(worker_path), join_keys_max_bytes_(join_keys_max_bytes),
 	      allow_external_sets_(allow_external_sets), additional_functions_(std::move(additional_functions)) {
 	}
@@ -971,7 +971,7 @@ private:
 	string worker_path_;
 	idx_t join_keys_max_bytes_;
 	bool allow_external_sets_;
-	vector<VgiFilterFunctionCapability> additional_functions_;
+	std::vector<VgiFilterFunctionCapability> additional_functions_;
 	vector<Value> values_;
 	vector<LogicalType> value_types_;
 	vector<string> value_names_;
@@ -992,7 +992,7 @@ SerializedFilters VgiSerializeFilters(ClientContext &context, const vector<colum
                                       const string &worker_path, const string &rowid_column_name,
                                       int64_t rowid_worker_col_index, const std::set<idx_t> *exclude_filter_keys,
                                       VgiFilterColumnIndexDomain index_domain,
-                                      const vector<VgiFilterFunctionCapability> &additional_functions) {
+                                      const std::vector<VgiFilterFunctionCapability> &additional_functions) {
 	// Return empty if no filters
 	if (!filters || filters->filters.empty()) {
 		return {nullptr, {}};

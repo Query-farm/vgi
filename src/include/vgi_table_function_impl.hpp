@@ -866,7 +866,7 @@ SerializedFilters VgiSerializeFilters(ClientContext &context, const vector<colum
                                       int64_t rowid_worker_col_index = -1,
                                       const std::set<idx_t> *exclude_filter_keys = nullptr,
                                       VgiFilterColumnIndexDomain index_domain = VgiFilterColumnIndexDomain::PROJECTED,
-                                      const vector<VgiFilterFunctionCapability> &additional_functions = {});
+                                      const std::vector<VgiFilterFunctionCapability> &additional_functions = {});
 
 //! One revisioned runtime-filter mutation carried in a v2 delta batch.
 //! A remove has a null filter; an upsert points at a filter that remains alive
