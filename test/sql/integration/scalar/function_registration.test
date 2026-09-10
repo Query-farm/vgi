@@ -17,14 +17,12 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
 # ============================================================================
 # Function Inventory
-# All 52 portable scalar rows must be registered (including overloads). The
-# Rust fixture additionally exposes two conditional-cache probes and a second
-# global_scalar overload; those three rows are allowed but not required from
-# the other worker implementations.
+# The exact portable inventory is asserted below. SDK fixtures may additionally
+# expose two conditional-cache probes and a second global_scalar overload.
 # ============================================================================
 
 query IIII
-SELECT COUNT(*) BETWEEN 52 AND 55,
+SELECT COUNT(*) FILTER (WHERE function_name = 'argument_names_probe') = 1,
        COUNT(*) FILTER (WHERE function_name = 'cached_reval_double_scalar') BETWEEN 0 AND 1,
        COUNT(*) FILTER (WHERE function_name = 'cached_reval_policy_scalar') BETWEEN 0 AND 1,
        COUNT(*) FILTER (WHERE function_name = 'global_scalar') BETWEEN 1 AND 2
