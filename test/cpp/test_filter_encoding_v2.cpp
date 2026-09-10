@@ -280,7 +280,7 @@ TEST_CASE("filter v2 gates structured extension calls on exact capabilities", "[
 	Connection con(db);
 	vector<unique_ptr<Expression>> arguments;
 	arguments.push_back(make_uniq<BoundReferenceExpression>(LogicalType::GEOMETRY(), 0));
-	arguments.push_back(make_uniq<BoundConstantExpression>(Value::NULLVALUE(LogicalType::GEOMETRY())));
+	arguments.push_back(make_uniq<BoundConstantExpression>(Value(LogicalType::GEOMETRY())));
 	ScalarFunction function("&&", {LogicalType::GEOMETRY(), LogicalType::GEOMETRY()}, LogicalType::BOOLEAN,
 	                        scalar_function_t {});
 	auto call = make_uniq<BoundFunctionExpression>(LogicalType::BOOLEAN, std::move(function), std::move(arguments),
