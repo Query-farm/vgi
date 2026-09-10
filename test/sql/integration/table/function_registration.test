@@ -146,10 +146,12 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 #   split_cacheable). Back splits/*.test.
 # = 164 portable baseline registrations.
 #
-# SDK fixture workers may additionally ship the all-or-nothing set of nine
-# exchange-cache revalidation/finalization conformance probes listed below.
-# They are deliberately excluded from the portable inventory count, then
-# validated as an exact optional set so a partial registration still fails.
+# SDK fixture workers may additionally ship implementation-specific backing
+# scans that are not part of the portable fixture surface. C# uses
+# generated_sequence_scan because its generated-columns table needs a distinct
+# three-column projected scanner. The exchange-cache probes are also excluded
+# from the portable inventory count, then validated as an exact optional set so
+# a partial registration still fails.
 query I
 SELECT COUNT(*)
 FROM duckdb_functions()
@@ -163,7 +165,8 @@ WHERE database_name = 'example' AND function_type = 'table'
     'cached_reval_policy',
     'cached_reval_sum_all',
     'cached_serial_echo',
-    'cached_slow_sum_all'
+    'cached_slow_sum_all',
+    'generated_sequence_scan'
   );
 ----
 164
