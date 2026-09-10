@@ -664,12 +664,18 @@ test_languages:
 # The C++ leg needs the unit-test target, which is guarded by an env var read at
 # CONFIGURE time — so if you have never built it:
 #   BUILD_VGI_UNIT_TESTS=1 GEN=ninja make release
-.PHONY: schema_parity schema_parity_cpp
+.PHONY: schema_parity schema_parity_cpp test_filter_v2
 schema_parity:
 	./scripts/check_schema_parity.sh
 
 schema_parity_cpp:
 	./scripts/check_schema_parity.sh --cpp-only
+
+# Configure with BUILD_VGI_FILTER_V2_TESTS=1, then run the real C++ producer
+# tests independently of the launcher/SAB unit-test target.
+test_filter_v2:
+	cmake --build build/release --target vgi_filter_v2_tests
+	./build/release/extension/vgi/vgi_filter_v2_tests
 
 # Interactive DuckDB shell with the vgi extension loaded and the example
 # python worker pre-attached as the `example` catalog. Use `make shell`
