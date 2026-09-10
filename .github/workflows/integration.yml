@@ -49,6 +49,7 @@ jobs:
       VGI_FIXTURES_DIR: /tmp/vgi-python
       VGI_FIXTURES_REF: ${{ inputs.fixtures_ref || 'v0.31.2' }}
       GEN: ninja
+      BUILD_VGI_FILTER_V2_TESTS: "1"
       USE_MERGED_VCPKG_MANIFEST: "1"
       VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
 
@@ -85,6 +86,9 @@ jobs:
 
       - name: Build the extension (release)
         run: make release
+
+      - name: Run Filter v2 producer tests
+        run: make test_filter_v2
 
       # enable-cache is off deliberately. The only uv project here is the
       # fixture checkout at /tmp/vgi-python, created after this step runs and
