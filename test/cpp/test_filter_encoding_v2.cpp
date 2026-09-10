@@ -281,7 +281,7 @@ TEST_CASE("filter v2 maps DuckDB standard functions to canonical names", "[filte
 	TableFilterSet filters;
 	filters.filters[0] = make_uniq<ExpressionFilter>(std::move(call));
 	REQUIRE_THROWS_AS(VgiSerializeFilters(*con.context, {0}, &filters, {"input"}, "test-worker"),
-	                  NotImplementedException);
+	                  InvalidInputException);
 
 	auto require_unsupported = [&](const char *name, const LogicalType &first_type, const LogicalType &second_type) {
 		vector<unique_ptr<Expression>> rejected_arguments;
@@ -295,7 +295,7 @@ TEST_CASE("filter v2 maps DuckDB standard functions to canonical names", "[filte
 		TableFilterSet rejected_filters;
 		rejected_filters.filters[0] = make_uniq<ExpressionFilter>(std::move(rejected_call));
 		REQUIRE_THROWS_AS(VgiSerializeFilters(*con.context, {0}, &rejected_filters, {"input"}, "test-worker"),
-		                  NotImplementedException);
+		                  InvalidInputException);
 	};
 	require_unsupported("list_contains", LogicalType::LIST(LogicalType::INTEGER), LogicalType::VARCHAR);
 	require_unsupported("contains", LogicalType::VARCHAR_COLLATION("nocase"), LogicalType::VARCHAR);
