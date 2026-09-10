@@ -37,7 +37,7 @@ query II
 EXPLAIN SELECT * FROM example.spatial_filter_example(100)
 WHERE geom && ST_MakeEnvelope(0, 0, 0.5, 0.5);
 ----
-physical_plan	<!REGEX>:(?s).*FILTER.*SPATIAL_FILTER_EXAMPLE.*
+physical_plan	<!REGEX>:.*FILTER.*SPATIAL_FILTER_EXAMPLE.*
 
 # ============================================================================
 # SPATIAL: && bbox filter

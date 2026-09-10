@@ -3,19 +3,19 @@
 
 #include "duckdb.hpp"
 #include "duckdb/catalog/catalog_transaction.hpp"
-#include "duckdb/common/types/value.hpp"
-#include "duckdb/function/table/arrow.hpp"
+#include "duckdb/main/secret/secret_manager.hpp"
 #include "duckdb/function/table/arrow/arrow_duck_schema.hpp"
 #include "duckdb/logging/log_manager.hpp"
-#include "duckdb/main/secret/secret_manager.hpp"
-#include "duckdb/parser/constraints/check_constraint.hpp"
-#include "duckdb/parser/constraints/foreign_key_constraint.hpp"
-#include "duckdb/parser/constraints/not_null_constraint.hpp"
-#include "duckdb/parser/constraints/unique_constraint.hpp"
-#include "duckdb/parser/parsed_data/create_table_info.hpp"
-#include "duckdb/parser/parser.hpp"
+#include "duckdb/common/types/value.hpp"
+#include "duckdb/function/table/arrow.hpp"
 #include "duckdb/storage/statistics/numeric_stats.hpp"
 #include "duckdb/storage/statistics/string_stats.hpp"
+#include "duckdb/parser/parsed_data/create_table_info.hpp"
+#include "duckdb/parser/constraints/not_null_constraint.hpp"
+#include "duckdb/parser/constraints/unique_constraint.hpp"
+#include "duckdb/parser/constraints/check_constraint.hpp"
+#include "duckdb/parser/constraints/foreign_key_constraint.hpp"
+#include "duckdb/parser/parser.hpp"
 #include "vgi_arrow_ipc.hpp"
 #include "vgi_arrow_utils.hpp"
 #include "vgi_exception.hpp"
@@ -24,14 +24,14 @@
 #include "vgi_profiling.hpp"
 #include "vgi_protocol_constants.hpp"
 
-#include "generated/vgi_request_builders.hpp"
+#include <typeinfo>
 #include "vgi_rpc_client.hpp"
 #include "vgi_rpc_types.hpp"
+#include "generated/vgi_request_builders.hpp"
 #include "vgi_schema_registry.hpp"
 #include "vgi_transport.hpp"
 #include "vgi_unary_rpc.hpp"
 #include "yyjson.hpp"
-#include <typeinfo>
 
 using namespace duckdb_yyjson; // NOLINT
 
@@ -40,31 +40,29 @@ namespace vgi {
 
 namespace {
 
-// Adapt CatalogRpcContext::transaction_opaque_data (`std::vector<uint8_t>`,
-// empty == none) to the std::optional<std::vector<uint8_t>> shape the generated
-// request builders expect. The empty-as-absent convention predates the
-// generators; rather than thread std::optional through every storage-layer ctx
-// construction, we wrap here at the catalog-API boundary.
-inline std::optional<std::vector<uint8_t>>
-OptTxn(const CatalogRpcContext &ctx) {
-  return ctx.transaction_opaque_data.empty()
-             ? std::nullopt
-             : std::optional<std::vector<uint8_t>>(ctx.transaction_opaque_data);
+// Adapt CatalogRpcContext::transaction_opaque_data (`std::vector<uint8_t>`, empty == none)
+// to the std::optional<std::vector<uint8_t>> shape the generated request builders
+// expect. The empty-as-absent convention predates the generators; rather than
+// thread std::optional through every storage-layer ctx construction, we wrap
+// here at the catalog-API boundary.
+inline std::optional<std::vector<uint8_t>> OptTxn(const CatalogRpcContext &ctx) {
+	return ctx.transaction_opaque_data.empty()
+	           ? std::nullopt
+	           : std::optional<std::vector<uint8_t>>(ctx.transaction_opaque_data);
 }
 
 // Adapt empty-string-as-absent strings (e.g. at_unit/at_value time-travel args)
 // to std::optional<std::string>. Mirrors the legacy BuildNullableStringScalar
 // behaviour the hand-coded builders relied on.
 inline std::optional<std::string> OptStrIfNonEmpty(const std::string &s) {
-  return s.empty() ? std::nullopt : std::optional<std::string>(s);
+	return s.empty() ? std::nullopt : std::optional<std::string>(s);
 }
 
 // Adapt explicit (value, is_null) pairs from the existing Invoke* signatures
 // to std::optional<std::string>. Used for COMMENT ON ... and similar where the
 // caller carries an out-of-band null flag.
-inline std::optional<std::string> OptStrNullable(const std::string &s,
-                                                 bool is_null) {
-  return is_null ? std::nullopt : std::optional<std::string>(s);
+inline std::optional<std::string> OptStrNullable(const std::string &s, bool is_null) {
+	return is_null ? std::nullopt : std::optional<std::string>(s);
 }
 
 // Wraps every catalog RPC dispatch with an `outcome=ok|error` `catalog.rpc`
@@ -78,72 +76,75 @@ inline std::optional<std::string> OptStrNullable(const std::string &s,
 // ScopedTimer so VGI_PROFILE=1 runs aggregate per-method totals at exit.
 class CatalogRpcInstrumentation {
 public:
-  CatalogRpcInstrumentation(ClientContext &context,
-                            const CatalogRpcContext &ctx,
-                            const std::string &method_name)
-      : context_(context), ctx_(ctx), method_name_(method_name),
-        timer_("catalog." + method_name),
-        start_(std::chrono::steady_clock::now()) {}
+	CatalogRpcInstrumentation(ClientContext &context, const CatalogRpcContext &ctx,
+	                          const std::string &method_name)
+	    : context_(context),
+	      ctx_(ctx),
+	      method_name_(method_name),
+	      timer_("catalog." + method_name),
+	      start_(std::chrono::steady_clock::now()) {
+	}
 
-  void MarkOk() { ok_ = true; }
+	void MarkOk() {
+		ok_ = true;
+	}
 
-  // Stash the exception type/message we caught so the destructor can include
-  // them. Used by the explicit catch-then-rethrow path; std::current_exception
-  // is unreliable to inspect during stack unwind without a catch.
-  void NoteException(const std::string &kind, const std::string &what) {
-    err_kind_ = kind;
-    err_what_ = what;
-  }
+	// Stash the exception type/message we caught so the destructor can include
+	// them. Used by the explicit catch-then-rethrow path; std::current_exception
+	// is unreliable to inspect during stack unwind without a catch.
+	void NoteException(const std::string &kind, const std::string &what) {
+		err_kind_ = kind;
+		err_what_ = what;
+	}
 
-  ~CatalogRpcInstrumentation() {
-    auto end = std::chrono::steady_clock::now();
-    double duration_ms =
-        std::chrono::duration<double, std::milli>(end - start_).count();
-    vector<pair<string, string>> info;
-    info.reserve(8);
-    info.emplace_back("method", method_name_);
-    info.emplace_back("worker_path", ctx_.params->worker_path());
-    auto attach_hex = BytesToHex(ctx_.attach_opaque_data);
-    if (!attach_hex.empty()) {
-      info.emplace_back("attach_opaque_data", attach_hex);
-    }
-    auto txn_hex = BytesToHex(ctx_.transaction_opaque_data);
-    if (!txn_hex.empty()) {
-      info.emplace_back("transaction_opaque_data", txn_hex);
-    }
-    if (!ctx_.entity_kind.empty()) {
-      info.emplace_back("entity_kind", ctx_.entity_kind);
-    }
-    if (!ctx_.entity_qualifier.empty()) {
-      info.emplace_back("entity_qualifier", ctx_.entity_qualifier);
-    }
-    info.emplace_back("duration_ms", std::to_string(duration_ms));
-    if (ok_) {
-      info.emplace_back("outcome", "ok");
-    } else {
-      info.emplace_back("outcome", "error");
-      if (!err_kind_.empty()) {
-        info.emplace_back("error_kind", err_kind_);
-      }
-      if (!err_what_.empty()) {
-        info.emplace_back("error_message", err_what_);
-      }
-    }
-    VGI_LOG(context_, "catalog.rpc", info);
-  }
+	~CatalogRpcInstrumentation() {
+		auto end = std::chrono::steady_clock::now();
+		double duration_ms = std::chrono::duration<double, std::milli>(end - start_).count();
+		vector<pair<string, string>> info;
+		info.reserve(8);
+		info.emplace_back("method", method_name_);
+		info.emplace_back("worker_path", ctx_.params->worker_path());
+		auto attach_hex = BytesToHex(ctx_.attach_opaque_data);
+		if (!attach_hex.empty()) {
+			info.emplace_back("attach_opaque_data", attach_hex);
+		}
+		auto txn_hex = BytesToHex(ctx_.transaction_opaque_data);
+		if (!txn_hex.empty()) {
+			info.emplace_back("transaction_opaque_data", txn_hex);
+		}
+		if (!ctx_.entity_kind.empty()) {
+			info.emplace_back("entity_kind", ctx_.entity_kind);
+		}
+		if (!ctx_.entity_qualifier.empty()) {
+			info.emplace_back("entity_qualifier", ctx_.entity_qualifier);
+		}
+		info.emplace_back("duration_ms", std::to_string(duration_ms));
+		if (ok_) {
+			info.emplace_back("outcome", "ok");
+		} else {
+			info.emplace_back("outcome", "error");
+			if (!err_kind_.empty()) {
+				info.emplace_back("error_kind", err_kind_);
+			}
+			if (!err_what_.empty()) {
+				info.emplace_back("error_message", err_what_);
+			}
+		}
+		VGI_LOG(context_, "catalog.rpc", info);
+	}
 
 private:
-  ClientContext &context_;
-  const CatalogRpcContext &ctx_;
-  std::string method_name_;
-  vgi::ScopedTimer timer_;
-  std::chrono::steady_clock::time_point start_;
-  bool ok_ = false;
-  std::string err_kind_;
-  std::string err_what_;
+	ClientContext &context_;
+	const CatalogRpcContext &ctx_;
+	std::string method_name_;
+	vgi::ScopedTimer timer_;
+	std::chrono::steady_clock::time_point start_;
+	bool ok_ = false;
+	std::string err_kind_;
+	std::string err_what_;
 };
 
-} // namespace
+}  // namespace
 
 // ============================================================================
 // VgiAttachParameters — HTTPParams cache accessor
@@ -154,37 +155,34 @@ private:
 // the same HTTPParams, which is how we avoid re-entering the secret manager
 // (and its MetaTransaction mutex) from under VgiTransaction::Start on HTTP
 // transport.
-std::shared_ptr<HTTPParams>
-VgiAttachParameters::GetOrInitHttpParams(ClientContext &context,
-                                         const std::string &url) const {
-  std::lock_guard<std::mutex> lock(http_params_mutex_);
-  if (!cached_http_params_) {
-    auto &db = *context.db;
-    auto &http_util = HTTPUtil::Get(db);
-    auto owned = http_util.InitializeParameters(context, url);
-    cached_http_params_ = std::shared_ptr<HTTPParams>(owned.release());
-    // Mirror the per-call ApplyHttpTimeout that HttpPostArrowIpcInternal
-    // used to do. Captured once at cache-init time — vgi_http_timeout_seconds
-    // changes won't be picked up without re-ATTACH. See the TODO on the
-    // method declaration.
-    Value timeout_val;
-    if (context.TryGetCurrentSetting("vgi_http_timeout_seconds", timeout_val)) {
-      cached_http_params_->timeout =
-          static_cast<uint64_t>(timeout_val.GetValue<int64_t>());
-    } else {
-      cached_http_params_->timeout = 300;
-    }
-  }
-  return cached_http_params_;
+std::shared_ptr<HTTPParams> VgiAttachParameters::GetOrInitHttpParams(
+    ClientContext &context, const std::string &url) const {
+	std::lock_guard<std::mutex> lock(http_params_mutex_);
+	if (!cached_http_params_) {
+		auto &db = *context.db;
+		auto &http_util = HTTPUtil::Get(db);
+		auto owned = http_util.InitializeParameters(context, url);
+		cached_http_params_ = std::shared_ptr<HTTPParams>(owned.release());
+		// Mirror the per-call ApplyHttpTimeout that HttpPostArrowIpcInternal
+		// used to do. Captured once at cache-init time — vgi_http_timeout_seconds
+		// changes won't be picked up without re-ATTACH. See the TODO on the
+		// method declaration.
+		Value timeout_val;
+		if (context.TryGetCurrentSetting("vgi_http_timeout_seconds", timeout_val)) {
+			cached_http_params_->timeout = static_cast<uint64_t>(timeout_val.GetValue<int64_t>());
+		} else {
+			cached_http_params_->timeout = 300;
+		}
+	}
+	return cached_http_params_;
 }
 
-std::shared_ptr<VgiHttpClientPool>
-VgiAttachParameters::GetOrInitHttpClientPool() const {
-  std::lock_guard<std::mutex> lock(http_params_mutex_);
-  if (!http_client_pool_) {
-    http_client_pool_ = std::make_shared<VgiHttpClientPool>();
-  }
-  return http_client_pool_;
+std::shared_ptr<VgiHttpClientPool> VgiAttachParameters::GetOrInitHttpClientPool() const {
+	std::lock_guard<std::mutex> lock(http_params_mutex_);
+	if (!http_client_pool_) {
+		http_client_pool_ = std::make_shared<VgiHttpClientPool>();
+	}
+	return http_client_pool_;
 }
 
 // ============================================================================
@@ -195,611 +193,533 @@ VgiAttachParameters::GetOrInitHttpClientPool() const {
 // Delegates to InvokePooledUnaryRpc which handles pool acquire/release, stderr
 // draining (critical — without it, long-running catalogs hang when the worker
 // stderr pipe buffer fills), and stale-pool retry.
-static UnaryResponseResult
-InvokeRpcMethod(const CatalogRpcContext &ctx, const std::string &method_name,
-                const std::shared_ptr<arrow::RecordBatch> &params,
-                ClientContext &context) {
-  CatalogRpcInstrumentation instr(context, ctx, method_name);
-  try {
-    // Validate the outgoing request against the registered params schema.
-    // Catches encoder drift in BuildXxxParams (e.g. flipped nullability,
-    // missing fields) at the C++ boundary, before it turns into an opaque
-    // failure on the worker side.
-    ValidateRequestSchema(params, method_name, ctx.params->worker_path());
+static UnaryResponseResult InvokeRpcMethod(const CatalogRpcContext &ctx, const std::string &method_name,
+                                            const std::shared_ptr<arrow::RecordBatch> &params, ClientContext &context) {
+	CatalogRpcInstrumentation instr(context, ctx, method_name);
+	try {
+		// Validate the outgoing request against the registered params schema.
+		// Catches encoder drift in BuildXxxParams (e.g. flipped nullability,
+		// missing fields) at the C++ boundary, before it turns into an opaque
+		// failure on the worker side.
+		ValidateRequestSchema(params, method_name, ctx.params->worker_path());
 
-    UnaryRpcOptions opts{context,
-                         ctx.params->worker_path(),
-                         ctx.params->worker_debug(),
-                         ctx.params->use_pool(),
-                         ctx.params->data_version_spec(),
-                         ctx.params->implementation_version(),
-                         "rpc_catalog",
-                         ctx.params->auth(),
-                         ctx.params->cookie_jar()};
-    opts.tcp_proxy = ctx.params->tcp_proxy();
-    opts.iroh = ctx.params->iroh();
-    // Cache-hit on the HTTP path: avoids re-entering the secret manager (and
-    // thus the MetaTransaction mutex) for RPCs invoked from inside
-    // VgiTransaction::Start. No-op for subprocess transport. See the TODO on
-    // VgiAttachParameters::GetOrInitHttpParams.
-    if (IsHttpTransport(ctx.params->worker_path()) ||
-        IsHttpiTransport(ctx.params->worker_path())) {
-      if (IsHttpTransport(ctx.params->worker_path())) {
-        opts.cached_http_params =
-            ctx.params->GetOrInitHttpParams(context, ctx.params->worker_path());
-      }
-      // Keep-alive client pool: consecutive catalog RPCs reuse TCP/TLS
-      // connections instead of handshaking per call.
-      opts.http_client_pool = ctx.params->GetOrInitHttpClientPool();
-      // Share the catalog's capability snapshot with the streaming
-      // connections: whichever path first sees the server's
-      // VGI-Supported-Encodings settles the codec for both.
-      opts.server_caps = ctx.params->server_caps();
-    }
-    // Forward launcher overrides for `launch:` LOCATIONs.  Empty
-    // optionals on every other transport — no per-call cost.
-    if (ctx.params->launcher_idle_timeout_seconds().has_value()) {
-      opts.launcher_idle_timeout =
-          std::chrono::seconds(*ctx.params->launcher_idle_timeout_seconds());
-    }
-    if (ctx.params->launcher_state_dir().has_value()) {
-      opts.launcher_state_dir = *ctx.params->launcher_state_dir();
-    }
-    auto result = InvokePooledUnaryRpc(opts, method_name, params);
-    instr.MarkOk();
-    return result;
-  } catch (const std::exception &e) {
-    // typeid().name() gives the demangled-or-mangled C++ type — close enough
-    // for triage. The full message goes in error_message; consumers that need
-    // the DuckDB ExceptionType can re-parse there.
-    instr.NoteException(typeid(e).name(), e.what());
-    throw;
-  }
+		UnaryRpcOptions opts {context,
+		                      ctx.params->worker_path(),
+		                      ctx.params->worker_debug(),
+		                      ctx.params->use_pool(),
+		                      ctx.params->data_version_spec(),
+		                      ctx.params->implementation_version(),
+		                      "rpc_catalog",
+		                      ctx.params->auth(),
+		                      ctx.params->cookie_jar()};
+		opts.tcp_proxy = ctx.params->tcp_proxy();
+		opts.iroh = ctx.params->iroh();
+		// Cache-hit on the HTTP path: avoids re-entering the secret manager (and
+		// thus the MetaTransaction mutex) for RPCs invoked from inside
+		// VgiTransaction::Start. No-op for subprocess transport. See the TODO on
+		// VgiAttachParameters::GetOrInitHttpParams.
+		if (IsHttpTransport(ctx.params->worker_path()) || IsHttpiTransport(ctx.params->worker_path())) {
+			if (IsHttpTransport(ctx.params->worker_path())) {
+			opts.cached_http_params = ctx.params->GetOrInitHttpParams(context, ctx.params->worker_path());
+			}
+			// Keep-alive client pool: consecutive catalog RPCs reuse TCP/TLS
+			// connections instead of handshaking per call.
+			opts.http_client_pool = ctx.params->GetOrInitHttpClientPool();
+			// Share the catalog's capability snapshot with the streaming
+			// connections: whichever path first sees the server's
+			// VGI-Supported-Encodings settles the codec for both.
+			opts.server_caps = ctx.params->server_caps();
+		}
+		// Forward launcher overrides for `launch:` LOCATIONs.  Empty
+		// optionals on every other transport — no per-call cost.
+		if (ctx.params->launcher_idle_timeout_seconds().has_value()) {
+			opts.launcher_idle_timeout =
+			    std::chrono::seconds(*ctx.params->launcher_idle_timeout_seconds());
+		}
+		if (ctx.params->launcher_state_dir().has_value()) {
+			opts.launcher_state_dir = *ctx.params->launcher_state_dir();
+		}
+		auto result = InvokePooledUnaryRpc(opts, method_name, params);
+		instr.MarkOk();
+		return result;
+	} catch (const std::exception &e) {
+		// typeid().name() gives the demangled-or-mangled C++ type — close enough
+		// for triage. The full message goes in error_message; consumers that need
+		// the DuckDB ExceptionType can re-parse there.
+		instr.NoteException(typeid(e).name(), e.what());
+		throw;
+	}
 }
 
 // Extract result binary bytes from a unary RPC response batch,
 // then deserialize to a RecordBatch.
-static std::shared_ptr<arrow::RecordBatch>
-ExtractAndDeserializeResult(const UnaryResponseResult &response,
-                            const std::string &method_name,
-                            const std::string &worker_path) {
-  std::shared_ptr<arrow::RecordBatch> result;
+static std::shared_ptr<arrow::RecordBatch> ExtractAndDeserializeResult(
+    const UnaryResponseResult &response, const std::string &method_name, const std::string &worker_path) {
+	std::shared_ptr<arrow::RecordBatch> result;
 
-  if (response.batch && response.batch->num_rows() != 0) {
-    auto result_col = response.batch->GetColumnByName("result");
-    if (!result_col) {
-      throw IOException("Response missing 'result' column from %s [worker: %s]",
-                        method_name, worker_path);
-    }
-    // The outer envelope column must be Binary (not Utf8 or any other type).
-    // Use type-id comparison instead of dynamic_pointer_cast<BinaryArray>:
-    // arrow::StringArray derives from arrow::BinaryArray, so the cast would
-    // silently accept a String-typed column and feed raw UTF-8 bytes into
-    // DeserializeFromIpcBytes — an invariant we must enforce here.
-    if (result_col->type()->id() != arrow::Type::BINARY) {
-      throw IOException("Response 'result' column from %s has type %s, "
-                        "expected Binary [worker: %s]. "
-                        "The vgi-rpc unary envelope must wrap the inner IPC "
-                        "payload in a Binary column.",
-                        method_name, result_col->type()->ToString(),
-                        worker_path);
-    }
-    auto binary_array =
-        std::static_pointer_cast<arrow::BinaryArray>(result_col);
-    if (!binary_array->IsNull(0)) {
-      try {
-        // Zero-copy: the inner batch's arrays refcount-share the outer
-        // envelope's values buffer — no copy of the payload.
-        result = DeserializeFromIpcBytesZeroCopy(*binary_array, 0);
-      } catch (const std::exception &e) {
-        throw IOException("Failed to deserialize IPC response for %s from "
-                          "worker [worker: %s]: %s. "
-                          "The worker likely returned a malformed or "
-                          "out-of-date response shape for this method.",
-                          method_name, worker_path, e.what());
-      }
-    }
-  }
+	if (response.batch && response.batch->num_rows() != 0) {
+		auto result_col = response.batch->GetColumnByName("result");
+		if (!result_col) {
+			throw IOException("Response missing 'result' column from %s [worker: %s]", method_name, worker_path);
+		}
+		// The outer envelope column must be Binary (not Utf8 or any other type).
+		// Use type-id comparison instead of dynamic_pointer_cast<BinaryArray>:
+		// arrow::StringArray derives from arrow::BinaryArray, so the cast would
+		// silently accept a String-typed column and feed raw UTF-8 bytes into
+		// DeserializeFromIpcBytes — an invariant we must enforce here.
+		if (result_col->type()->id() != arrow::Type::BINARY) {
+			throw IOException(
+			    "Response 'result' column from %s has type %s, expected Binary [worker: %s]. "
+			    "The vgi-rpc unary envelope must wrap the inner IPC payload in a Binary column.",
+			    method_name, result_col->type()->ToString(), worker_path);
+		}
+		auto binary_array = std::static_pointer_cast<arrow::BinaryArray>(result_col);
+		if (!binary_array->IsNull(0)) {
+			try {
+				// Zero-copy: the inner batch's arrays refcount-share the outer
+				// envelope's values buffer — no copy of the payload.
+				result = DeserializeFromIpcBytesZeroCopy(*binary_array, 0);
+			} catch (const std::exception &e) {
+				throw IOException(
+				    "Failed to deserialize IPC response for %s from worker [worker: %s]: %s. "
+				    "The worker likely returned a malformed or out-of-date response shape for this method.",
+				    method_name, worker_path, e.what());
+			}
+		}
+	}
 
-  ValidateResponseSchema(result, method_name, worker_path);
-  return result;
+	ValidateResponseSchema(result, method_name, worker_path);
+	return result;
 }
 
 // Invoke a void-response RPC. After dispatch, run the response through the
 // schema registry to catch drift: the worker must return an empty envelope
 // (or empty inner batch) for methods registered as void. Any payload triggers
 // a clear mismatch error instead of being silently discarded.
-static void InvokeVoidRpc(const CatalogRpcContext &ctx,
-                          const std::string &method_name,
-                          const std::shared_ptr<arrow::RecordBatch> &params,
-                          ClientContext &context) {
-  auto response = InvokeRpcMethod(ctx, method_name, params, context);
-  ExtractAndDeserializeResult(response, method_name, ctx.params->worker_path());
+static void InvokeVoidRpc(const CatalogRpcContext &ctx, const std::string &method_name,
+                          const std::shared_ptr<arrow::RecordBatch> &params, ClientContext &context) {
+	auto response = InvokeRpcMethod(ctx, method_name, params, context);
+	ExtractAndDeserializeResult(response, method_name, ctx.params->worker_path());
 }
 
 // ============================================================================
 // Typed Catalog RPC Functions
 // ============================================================================
 
-std::vector<VgiCatalogInfo> InvokeCatalogs(
-    const std::string &worker_path, ClientContext &context, bool worker_debug,
-    bool use_pool, const std::shared_ptr<CatalogAuth> &auth,
-    std::optional<int64_t> launcher_idle_timeout_seconds,
-    std::optional<std::string> launcher_state_dir,
-    std::shared_ptr<void> worker_artifact_anchor, const std::string &tcp_proxy,
-    std::shared_ptr<IrohClientConfig> iroh) {
-  // Use the config struct so launcher overrides flow into the temp_params —
-  // same rationale as InvokeCatalogAttach below. Without these, this RPC
-  // would prime the launcher cache with [defaults]; the user's subsequent
-  // ATTACH (carrying overrides) would then trip the cache-pin's
-  // BinderException, breaking even one-shot queries with custom launcher
-  // options.
-  VgiAttachParametersConfig temp_cfg;
-  temp_cfg.worker_path = worker_path;
-  temp_cfg.worker_debug = worker_debug;
-  temp_cfg.use_pool = use_pool;
-  temp_cfg.auth = auth;
-  temp_cfg.iroh = std::move(iroh);
-  temp_cfg.launcher_idle_timeout_seconds = launcher_idle_timeout_seconds;
-  temp_cfg.launcher_state_dir = launcher_state_dir;
-  temp_cfg.worker_artifact_anchor = std::move(worker_artifact_anchor);
-  temp_cfg.tcp_proxy = tcp_proxy;
-  auto temp_params = std::make_shared<VgiAttachParameters>(std::move(temp_cfg));
-  CatalogRpcContext ctx{temp_params, {}, {}};
-  auto response = InvokeRpcMethod(ctx, "catalog_catalogs", nullptr, context);
-  auto result_batch =
-      ExtractAndDeserializeResult(response, "catalog_catalogs", worker_path);
-  if (!result_batch) {
-    return {};
-  }
+std::vector<VgiCatalogInfo> InvokeCatalogs(const std::string &worker_path, ClientContext &context,
+                                            bool worker_debug, bool use_pool,
+	                                            const std::shared_ptr<CatalogAuth> &auth,
+	                                            std::optional<int64_t> launcher_idle_timeout_seconds,
+	                                            std::optional<std::string> launcher_state_dir,
+	                                            std::shared_ptr<void> worker_artifact_anchor,
+	                                            const std::string &tcp_proxy,
+	                                            std::shared_ptr<IrohClientConfig> iroh) {
+	// Use the config struct so launcher overrides flow into the temp_params —
+	// same rationale as InvokeCatalogAttach below. Without these, this RPC
+	// would prime the launcher cache with [defaults]; the user's subsequent
+	// ATTACH (carrying overrides) would then trip the cache-pin's
+	// BinderException, breaking even one-shot queries with custom launcher
+	// options.
+	VgiAttachParametersConfig temp_cfg;
+	temp_cfg.worker_path = worker_path;
+	temp_cfg.worker_debug = worker_debug;
+	temp_cfg.use_pool = use_pool;
+	temp_cfg.auth = auth;
+	temp_cfg.iroh = std::move(iroh);
+	temp_cfg.launcher_idle_timeout_seconds = launcher_idle_timeout_seconds;
+	temp_cfg.launcher_state_dir = launcher_state_dir;
+	temp_cfg.worker_artifact_anchor = std::move(worker_artifact_anchor);
+	temp_cfg.tcp_proxy = tcp_proxy;
+	auto temp_params = std::make_shared<VgiAttachParameters>(std::move(temp_cfg));
+	CatalogRpcContext ctx{temp_params, {}, {}};
+	auto response = InvokeRpcMethod(ctx, "catalog_catalogs", nullptr, context);
+	auto result_batch = ExtractAndDeserializeResult(response, "catalog_catalogs", worker_path);
+	if (!result_batch) {
+		return {};
+	}
 
-  // CatalogsResponse = {items: List<Binary>} — each item is an IPC-serialized
-  // CatalogInfo batch. Both outer and item schemas are validated by the
-  // schema registry; see
-  // vgi-python/vgi/catalog/catalog_interface.py:CatalogInfo.
-  auto info_batches =
-      UnwrapAndValidateItems(result_batch, "catalog_catalogs", worker_path);
-  std::vector<VgiCatalogInfo> out;
-  out.reserve(info_batches.size());
-  for (const auto &info_batch : info_batches) {
-    RecordBatchSingleRow row(info_batch, 0, "CatalogInfo", worker_path);
-    VgiCatalogInfo info;
-    info.name = row["name"].value_not_null<std::string>();
-    info.implementation_version =
-        row["implementation_version"].value_or(std::string(""));
-    info.data_version_spec = row["data_version_spec"].value_or(std::string(""));
+	// CatalogsResponse = {items: List<Binary>} — each item is an IPC-serialized
+	// CatalogInfo batch. Both outer and item schemas are validated by the
+	// schema registry; see vgi-python/vgi/catalog/catalog_interface.py:CatalogInfo.
+	auto info_batches = UnwrapAndValidateItems(result_batch, "catalog_catalogs", worker_path);
+	std::vector<VgiCatalogInfo> out;
+	out.reserve(info_batches.size());
+	for (const auto &info_batch : info_batches) {
+		RecordBatchSingleRow row(info_batch, 0, "CatalogInfo", worker_path);
+		VgiCatalogInfo info;
+		info.name = row["name"].value_not_null<std::string>();
+		info.implementation_version = row["implementation_version"].value_or(std::string(""));
+		info.data_version_spec = row["data_version_spec"].value_or(std::string(""));
 
-    // Parse attach_option_specs (list[bytes] of serialized AttachOptionSpec).
-    // Older workers that predate attach-option discovery omit this field —
-    // treat as empty.
-    auto spec_bytes_list = row["attach_option_specs"].value_or(
-        std::vector<std::vector<uint8_t>>{});
-    for (const auto &spec_bytes : spec_bytes_list) {
-      info.attach_option_specs.push_back(
-          ParseAttachOptionSpec(spec_bytes, worker_path, context));
-    }
+		// Parse attach_option_specs (list[bytes] of serialized AttachOptionSpec).
+		// Older workers that predate attach-option discovery omit this field — treat as empty.
+		auto spec_bytes_list = row["attach_option_specs"].value_or(std::vector<std::vector<uint8_t>> {});
+		for (const auto &spec_bytes : spec_bytes_list) {
+			info.attach_option_specs.push_back(ParseAttachOptionSpec(spec_bytes, worker_path, context));
+		}
 
-    // Parse releases (list<struct<version, released_at, summary, notes_url>>).
-    // Older workers that predate release-history discovery omit this field —
-    // treat as empty.
-    auto releases_col = info_batch->GetColumnByName("releases");
-    if (releases_col) {
-      auto list_array =
-          std::dynamic_pointer_cast<arrow::ListArray>(releases_col);
-      if (list_array && !list_array->IsNull(0)) {
-        auto start = list_array->value_offset(0);
-        auto end = list_array->value_offset(1);
-        auto struct_array =
-            std::dynamic_pointer_cast<arrow::StructArray>(list_array->values());
-        if (struct_array) {
-          auto version_array = std::dynamic_pointer_cast<arrow::StringArray>(
-              struct_array->GetFieldByName("version"));
-          auto released_at_array =
-              std::dynamic_pointer_cast<arrow::TimestampArray>(
-                  struct_array->GetFieldByName("released_at"));
-          auto summary_array = std::dynamic_pointer_cast<arrow::StringArray>(
-              struct_array->GetFieldByName("summary"));
-          auto notes_url_array = std::dynamic_pointer_cast<arrow::StringArray>(
-              struct_array->GetFieldByName("notes_url"));
-          for (auto i = start; i < end; i++) {
-            VgiCatalogReleaseInfo release;
-            if (version_array && !version_array->IsNull(i)) {
-              release.version = version_array->GetString(i);
-            }
-            if (released_at_array && !released_at_array->IsNull(i)) {
-              release.released_at_us = released_at_array->Value(i);
-            }
-            if (summary_array && !summary_array->IsNull(i)) {
-              release.summary = summary_array->GetString(i);
-            }
-            if (notes_url_array && !notes_url_array->IsNull(i)) {
-              release.notes_url = notes_url_array->GetString(i);
-            }
-            info.releases.push_back(std::move(release));
-          }
-        }
-      }
-    }
+		// Parse releases (list<struct<version, released_at, summary, notes_url>>).
+		// Older workers that predate release-history discovery omit this field — treat as empty.
+		auto releases_col = info_batch->GetColumnByName("releases");
+		if (releases_col) {
+			auto list_array = std::dynamic_pointer_cast<arrow::ListArray>(releases_col);
+			if (list_array && !list_array->IsNull(0)) {
+				auto start = list_array->value_offset(0);
+				auto end = list_array->value_offset(1);
+				auto struct_array = std::dynamic_pointer_cast<arrow::StructArray>(list_array->values());
+				if (struct_array) {
+					auto version_array =
+					    std::dynamic_pointer_cast<arrow::StringArray>(struct_array->GetFieldByName("version"));
+					auto released_at_array =
+					    std::dynamic_pointer_cast<arrow::TimestampArray>(struct_array->GetFieldByName("released_at"));
+					auto summary_array =
+					    std::dynamic_pointer_cast<arrow::StringArray>(struct_array->GetFieldByName("summary"));
+					auto notes_url_array =
+					    std::dynamic_pointer_cast<arrow::StringArray>(struct_array->GetFieldByName("notes_url"));
+					for (auto i = start; i < end; i++) {
+						VgiCatalogReleaseInfo release;
+						if (version_array && !version_array->IsNull(i)) {
+							release.version = version_array->GetString(i);
+						}
+						if (released_at_array && !released_at_array->IsNull(i)) {
+							release.released_at_us = released_at_array->Value(i);
+						}
+						if (summary_array && !summary_array->IsNull(i)) {
+							release.summary = summary_array->GetString(i);
+						}
+						if (notes_url_array && !notes_url_array->IsNull(i)) {
+							release.notes_url = notes_url_array->GetString(i);
+						}
+						info.releases.push_back(std::move(release));
+					}
+				}
+			}
+		}
 
-    info.source_url = row["source_url"].value_or(std::string(""));
+		info.source_url = row["source_url"].value_or(std::string(""));
 
-    out.push_back(std::move(info));
-  }
-  return out;
+		out.push_back(std::move(info));
+	}
+	return out;
 }
 
-CatalogAttachResult InvokeCatalogAttach(
-    const std::string &worker_path, const std::string &catalog_name,
-    ClientContext &context, bool worker_debug, bool use_pool,
-    const std::shared_ptr<CatalogAuth> &auth,
-    const std::string &data_version_spec,
-    const std::string &implementation_version,
-    const std::shared_ptr<SessionCookieJar> &cookie_jar,
-    const std::map<std::string, Value> &attach_options,
-    std::optional<int64_t> launcher_idle_timeout_seconds,
-    std::optional<std::string> launcher_state_dir,
-    std::shared_ptr<void> worker_artifact_anchor, const std::string &tcp_proxy,
-    std::shared_ptr<IrohClientConfig> iroh) {
-  // Use the config struct so launcher overrides flow into the temp_params.
-  // Without these, the catalog_attach RPC would prime the launcher cache
-  // with [defaults]; the subsequent real ATTACH (carrying overrides) would
-  // then trip the cache pin's BinderException, breaking even one-shot
-  // queries with custom launcher options.
-  VgiAttachParametersConfig temp_cfg;
-  temp_cfg.worker_path = worker_path;
-  temp_cfg.worker_debug = worker_debug;
-  temp_cfg.use_pool = use_pool;
-  temp_cfg.auth = auth;
-  temp_cfg.data_version_spec = data_version_spec;
-  temp_cfg.implementation_version = implementation_version;
-  temp_cfg.cookie_jar = cookie_jar;
-  temp_cfg.iroh = std::move(iroh);
-  temp_cfg.launcher_idle_timeout_seconds = launcher_idle_timeout_seconds;
-  temp_cfg.launcher_state_dir = launcher_state_dir;
-  temp_cfg.worker_artifact_anchor = std::move(worker_artifact_anchor);
-  temp_cfg.tcp_proxy = tcp_proxy;
-  auto temp_params = std::make_shared<VgiAttachParameters>(std::move(temp_cfg));
-  CatalogRpcContext ctx{temp_params, {}, {}};
+CatalogAttachResult InvokeCatalogAttach(const std::string &worker_path, const std::string &catalog_name,
+                                        ClientContext &context, bool worker_debug, bool use_pool,
+                                        const std::shared_ptr<CatalogAuth> &auth,
+                                        const std::string &data_version_spec,
+                                        const std::string &implementation_version,
+                                        const std::shared_ptr<SessionCookieJar> &cookie_jar,
+                                        const std::map<std::string, Value> &attach_options,
+	                                    std::optional<int64_t> launcher_idle_timeout_seconds,
+	                                    std::optional<std::string> launcher_state_dir,
+	                                    std::shared_ptr<void> worker_artifact_anchor,
+	                                    const std::string &tcp_proxy,
+	                                    std::shared_ptr<IrohClientConfig> iroh) {
+	// Use the config struct so launcher overrides flow into the temp_params.
+	// Without these, the catalog_attach RPC would prime the launcher cache
+	// with [defaults]; the subsequent real ATTACH (carrying overrides) would
+	// then trip the cache pin's BinderException, breaking even one-shot
+	// queries with custom launcher options.
+	VgiAttachParametersConfig temp_cfg;
+	temp_cfg.worker_path = worker_path;
+	temp_cfg.worker_debug = worker_debug;
+	temp_cfg.use_pool = use_pool;
+	temp_cfg.auth = auth;
+	temp_cfg.data_version_spec = data_version_spec;
+	temp_cfg.implementation_version = implementation_version;
+	temp_cfg.cookie_jar = cookie_jar;
+	temp_cfg.iroh = std::move(iroh);
+	temp_cfg.launcher_idle_timeout_seconds = launcher_idle_timeout_seconds;
+	temp_cfg.launcher_state_dir = launcher_state_dir;
+	temp_cfg.worker_artifact_anchor = std::move(worker_artifact_anchor);
+	temp_cfg.tcp_proxy = tcp_proxy;
+	auto temp_params = std::make_shared<VgiAttachParameters>(std::move(temp_cfg));
+	CatalogRpcContext ctx{temp_params, {}, {}};
 
-  std::vector<uint8_t> options_ipc_bytes;
-  if (!attach_options.empty()) {
-    auto options_batch = BuildSettingsBatch(context, attach_options);
-    options_ipc_bytes = SerializeToIpcBytes(options_batch);
-  }
+	std::vector<uint8_t> options_ipc_bytes;
+	if (!attach_options.empty()) {
+		auto options_batch = BuildSettingsBatch(context, attach_options);
+		options_ipc_bytes = SerializeToIpcBytes(options_batch);
+	}
 
-  auto request_batch =
-      BuildCatalogAttachRequest(catalog_name, options_ipc_bytes,
-                                data_version_spec, implementation_version);
-  auto request_bytes = SerializeToIpcBytes(request_batch);
-  auto params = generated::BuildCatalogAttachParams(request_bytes);
-  auto response = InvokeRpcMethod(ctx, "catalog_attach", params, context);
-  auto result_batch =
-      ExtractAndDeserializeResult(response, "catalog_attach", worker_path);
-  if (!result_batch) {
-    throw IOException("Empty response from catalog_attach [worker: %s]",
-                      worker_path);
-  }
-  return ParseCatalogAttachResult(result_batch, worker_path, context);
+	auto request_batch = BuildCatalogAttachRequest(catalog_name, options_ipc_bytes, data_version_spec, implementation_version);
+	auto request_bytes = SerializeToIpcBytes(request_batch);
+	auto params = generated::BuildCatalogAttachParams(request_bytes);
+	auto response = InvokeRpcMethod(ctx, "catalog_attach", params, context);
+	auto result_batch = ExtractAndDeserializeResult(response, "catalog_attach", worker_path);
+	if (!result_batch) {
+		throw IOException("Empty response from catalog_attach [worker: %s]", worker_path);
+	}
+	return ParseCatalogAttachResult(result_batch, worker_path, context);
 }
 
-std::vector<VgiSchemaInfo> InvokeCatalogSchemas(const CatalogRpcContext &ctx,
-                                                ClientContext &context) {
-  auto &worker_path = ctx.params->worker_path();
-  auto params =
-      generated::BuildCatalogSchemasParams(ctx.attach_opaque_data, OptTxn(ctx));
-  auto response = InvokeRpcMethod(ctx, "catalog_schemas", params, context);
-  auto result_batch =
-      ExtractAndDeserializeResult(response, "catalog_schemas", worker_path);
-  if (!result_batch) {
-    return {};
-  }
+std::vector<VgiSchemaInfo> InvokeCatalogSchemas(const CatalogRpcContext &ctx, ClientContext &context) {
+	auto &worker_path = ctx.params->worker_path();
+	auto params = generated::BuildCatalogSchemasParams(ctx.attach_opaque_data, OptTxn(ctx));
+	auto response = InvokeRpcMethod(ctx, "catalog_schemas", params, context);
+	auto result_batch = ExtractAndDeserializeResult(response, "catalog_schemas", worker_path);
+	if (!result_batch) {
+		return {};
+	}
 
-  auto info_batches =
-      UnwrapAndValidateItems(result_batch, "catalog_schemas", worker_path);
-  std::vector<VgiSchemaInfo> schemas;
-  schemas.reserve(info_batches.size());
-  for (const auto &info_batch : info_batches) {
-    schemas.push_back(ParseSchemaInfo(info_batch, worker_path));
-  }
-  return schemas;
+	auto info_batches = UnwrapAndValidateItems(result_batch, "catalog_schemas", worker_path);
+	std::vector<VgiSchemaInfo> schemas;
+	schemas.reserve(info_batches.size());
+	for (const auto &info_batch : info_batches) {
+		schemas.push_back(ParseSchemaInfo(info_batch, worker_path));
+	}
+	return schemas;
 }
 
-std::vector<VgiTableInfo>
-InvokeCatalogSchemaContentsTables(const CatalogRpcContext &ctx,
-                                  const std::string &schema_name,
-                                  ClientContext &context) {
-  auto &worker_path = ctx.params->worker_path();
-  auto params = generated::BuildCatalogSchemaContentsTablesParams(
-      ctx.attach_opaque_data, SingleSchemaPath(schema_name), OptTxn(ctx));
-  auto response =
-      InvokeRpcMethod(ctx, "catalog_schema_contents_tables", params, context);
-  auto result_batch = ExtractAndDeserializeResult(
-      response, "catalog_schema_contents_tables", worker_path);
-  if (!result_batch) {
-    return {};
-  }
+std::vector<VgiTableInfo> InvokeCatalogSchemaContentsTables(const CatalogRpcContext &ctx,
+                                                            const std::string &schema_name, ClientContext &context) {
+	auto &worker_path = ctx.params->worker_path();
+	auto params = generated::BuildCatalogSchemaContentsTablesParams(ctx.attach_opaque_data,
+	                                                                SingleSchemaPath(schema_name), OptTxn(ctx));
+	auto response = InvokeRpcMethod(ctx, "catalog_schema_contents_tables", params, context);
+	auto result_batch = ExtractAndDeserializeResult(response, "catalog_schema_contents_tables", worker_path);
+	if (!result_batch) {
+		return {};
+	}
 
-  auto info_batches = UnwrapAndValidateItems(
-      result_batch, "catalog_schema_contents_tables", worker_path);
-  std::vector<VgiTableInfo> tables;
-  tables.reserve(info_batches.size());
-  for (const auto &info_batch : info_batches) {
-    tables.push_back(ParseTableInfo(context, info_batch, worker_path));
-  }
-  return tables;
+	auto info_batches = UnwrapAndValidateItems(result_batch, "catalog_schema_contents_tables", worker_path);
+	std::vector<VgiTableInfo> tables;
+	tables.reserve(info_batches.size());
+	for (const auto &info_batch : info_batches) {
+		tables.push_back(ParseTableInfo(context, info_batch, worker_path));
+	}
+	return tables;
 }
 
-std::vector<VgiViewInfo>
-InvokeCatalogSchemaContentsViews(const CatalogRpcContext &ctx,
-                                 const std::string &schema_name,
-                                 ClientContext &context) {
-  auto &worker_path = ctx.params->worker_path();
-  auto params = generated::BuildCatalogSchemaContentsViewsParams(
-      ctx.attach_opaque_data, SingleSchemaPath(schema_name), OptTxn(ctx));
-  auto response =
-      InvokeRpcMethod(ctx, "catalog_schema_contents_views", params, context);
-  auto result_batch = ExtractAndDeserializeResult(
-      response, "catalog_schema_contents_views", worker_path);
-  if (!result_batch) {
-    return {};
-  }
+std::vector<VgiViewInfo> InvokeCatalogSchemaContentsViews(const CatalogRpcContext &ctx,
+                                                          const std::string &schema_name, ClientContext &context) {
+	auto &worker_path = ctx.params->worker_path();
+	auto params = generated::BuildCatalogSchemaContentsViewsParams(ctx.attach_opaque_data,
+	                                                               SingleSchemaPath(schema_name), OptTxn(ctx));
+	auto response = InvokeRpcMethod(ctx, "catalog_schema_contents_views", params, context);
+	auto result_batch = ExtractAndDeserializeResult(response, "catalog_schema_contents_views", worker_path);
+	if (!result_batch) {
+		return {};
+	}
 
-  auto info_batches = UnwrapAndValidateItems(
-      result_batch, "catalog_schema_contents_views", worker_path);
-  std::vector<VgiViewInfo> views;
-  views.reserve(info_batches.size());
-  for (const auto &info_batch : info_batches) {
-    views.push_back(ParseViewInfo(info_batch, worker_path));
-  }
-  return views;
+	auto info_batches = UnwrapAndValidateItems(result_batch, "catalog_schema_contents_views", worker_path);
+	std::vector<VgiViewInfo> views;
+	views.reserve(info_batches.size());
+	for (const auto &info_batch : info_batches) {
+		views.push_back(ParseViewInfo(info_batch, worker_path));
+	}
+	return views;
 }
 
 std::vector<VgiFunctionInfo> InvokeCatalogSchemaContentsFunctions(
     const CatalogRpcContext &ctx, const std::string &schema_name,
     const std::string &function_type, ClientContext &context) {
-  auto &worker_path = ctx.params->worker_path();
-  auto params = generated::BuildCatalogSchemaContentsFunctionsParams(
-      ctx.attach_opaque_data, SingleSchemaPath(schema_name), function_type,
-      OptTxn(ctx));
-  auto response = InvokeRpcMethod(ctx, "catalog_schema_contents_functions",
-                                  params, context);
-  auto result_batch = ExtractAndDeserializeResult(
-      response, "catalog_schema_contents_functions", worker_path);
-  if (!result_batch) {
-    return {};
-  }
+	auto &worker_path = ctx.params->worker_path();
+	auto params = generated::BuildCatalogSchemaContentsFunctionsParams(
+	    ctx.attach_opaque_data, SingleSchemaPath(schema_name), function_type, OptTxn(ctx));
+	auto response = InvokeRpcMethod(ctx, "catalog_schema_contents_functions", params, context);
+	auto result_batch = ExtractAndDeserializeResult(response, "catalog_schema_contents_functions", worker_path);
+	if (!result_batch) {
+		return {};
+	}
 
-  auto info_batches = UnwrapAndValidateItems(
-      result_batch, "catalog_schema_contents_functions", worker_path);
-  std::vector<VgiFunctionInfo> functions;
-  functions.reserve(info_batches.size());
-  for (const auto &info_batch : info_batches) {
-    functions.push_back(ParseFunctionInfo(info_batch, 0, worker_path));
-  }
-  return functions;
+	auto info_batches = UnwrapAndValidateItems(result_batch, "catalog_schema_contents_functions", worker_path);
+	std::vector<VgiFunctionInfo> functions;
+	functions.reserve(info_batches.size());
+	for (const auto &info_batch : info_batches) {
+		functions.push_back(ParseFunctionInfo(info_batch, 0, worker_path));
+	}
+	return functions;
 }
 
 std::vector<VgiMacroInfo> InvokeCatalogSchemaContentsMacros(
     const CatalogRpcContext &ctx, const std::string &schema_name,
     const std::string &macro_type, ClientContext &context) {
-  auto &worker_path = ctx.params->worker_path();
-  auto params = generated::BuildCatalogSchemaContentsMacrosParams(
-      ctx.attach_opaque_data, SingleSchemaPath(schema_name), macro_type,
-      OptTxn(ctx));
-  auto response =
-      InvokeRpcMethod(ctx, "catalog_schema_contents_macros", params, context);
-  auto result_batch = ExtractAndDeserializeResult(
-      response, "catalog_schema_contents_macros", worker_path);
-  if (!result_batch) {
-    return {};
-  }
+	auto &worker_path = ctx.params->worker_path();
+	auto params = generated::BuildCatalogSchemaContentsMacrosParams(
+	    ctx.attach_opaque_data, SingleSchemaPath(schema_name), macro_type, OptTxn(ctx));
+	auto response = InvokeRpcMethod(ctx, "catalog_schema_contents_macros", params, context);
+	auto result_batch = ExtractAndDeserializeResult(response, "catalog_schema_contents_macros", worker_path);
+	if (!result_batch) {
+		return {};
+	}
 
-  auto info_batches = UnwrapAndValidateItems(
-      result_batch, "catalog_schema_contents_macros", worker_path);
-  std::vector<VgiMacroInfo> macros;
-  macros.reserve(info_batches.size());
-  for (const auto &info_batch : info_batches) {
-    macros.push_back(ParseMacroInfo(info_batch, worker_path));
-  }
-  return macros;
+	auto info_batches = UnwrapAndValidateItems(result_batch, "catalog_schema_contents_macros", worker_path);
+	std::vector<VgiMacroInfo> macros;
+	macros.reserve(info_batches.size());
+	for (const auto &info_batch : info_batches) {
+		macros.push_back(ParseMacroInfo(info_batch, worker_path));
+	}
+	return macros;
 }
 
-std::vector<VgiCopyFromFormatInfo>
-InvokeCatalogCopyFromFormats(const CatalogRpcContext &ctx,
-                             ClientContext &context) {
-  auto &worker_path = ctx.params->worker_path();
-  auto params = generated::BuildCatalogCopyFromFormatsParams(
-      ctx.attach_opaque_data, OptTxn(ctx));
-  auto response =
-      InvokeRpcMethod(ctx, "catalog_copy_from_formats", params, context);
-  auto result_batch = ExtractAndDeserializeResult(
-      response, "catalog_copy_from_formats", worker_path);
-  if (!result_batch) {
-    return {};
-  }
+std::vector<VgiCopyFromFormatInfo> InvokeCatalogCopyFromFormats(const CatalogRpcContext &ctx, ClientContext &context) {
+	auto &worker_path = ctx.params->worker_path();
+	auto params = generated::BuildCatalogCopyFromFormatsParams(ctx.attach_opaque_data, OptTxn(ctx));
+	auto response = InvokeRpcMethod(ctx, "catalog_copy_from_formats", params, context);
+	auto result_batch = ExtractAndDeserializeResult(response, "catalog_copy_from_formats", worker_path);
+	if (!result_batch) {
+		return {};
+	}
 
-  auto info_batches = UnwrapAndValidateItems(
-      result_batch, "catalog_copy_from_formats", worker_path);
-  std::vector<VgiCopyFromFormatInfo> formats;
-  formats.reserve(info_batches.size());
-  for (const auto &info_batch : info_batches) {
-    formats.push_back(ParseCopyFromFormatInfo(info_batch, worker_path));
-  }
-  return formats;
+	auto info_batches = UnwrapAndValidateItems(result_batch, "catalog_copy_from_formats", worker_path);
+	std::vector<VgiCopyFromFormatInfo> formats;
+	formats.reserve(info_batches.size());
+	for (const auto &info_batch : info_batches) {
+		formats.push_back(ParseCopyFromFormatInfo(info_batch, worker_path));
+	}
+	return formats;
 }
 
-std::optional<VgiTableInfo>
-InvokeCatalogTableGet(const CatalogRpcContext &ctx,
-                      const std::string &schema_name,
-                      const std::string &table_name, ClientContext &context) {
-  auto &worker_path = ctx.params->worker_path();
-  // catalog_table_get's Protocol schema always includes at_unit/at_value
-  // (nullable); the overload without time-travel passes std::nullopt for both.
-  auto params = generated::BuildCatalogTableGetParams(
-      ctx.attach_opaque_data, SingleSchemaPath(schema_name), table_name,
-      /*at_unit=*/std::nullopt, /*at_value=*/std::nullopt, OptTxn(ctx));
-  auto response = InvokeRpcMethod(ctx, "catalog_table_get", params, context);
-  auto result_batch =
-      ExtractAndDeserializeResult(response, "catalog_table_get", worker_path);
-  if (!result_batch) {
-    return std::nullopt;
-  }
+std::optional<VgiTableInfo> InvokeCatalogTableGet(const CatalogRpcContext &ctx,
+                                                   const std::string &schema_name, const std::string &table_name,
+                                                   ClientContext &context) {
+	auto &worker_path = ctx.params->worker_path();
+	// catalog_table_get's Protocol schema always includes at_unit/at_value (nullable);
+	// the overload without time-travel passes std::nullopt for both.
+	auto params =
+	    generated::BuildCatalogTableGetParams(ctx.attach_opaque_data, SingleSchemaPath(schema_name), table_name,
+	                                          /*at_unit=*/std::nullopt, /*at_value=*/std::nullopt, OptTxn(ctx));
+	auto response = InvokeRpcMethod(ctx, "catalog_table_get", params, context);
+	auto result_batch = ExtractAndDeserializeResult(response, "catalog_table_get", worker_path);
+	if (!result_batch) {
+		return std::nullopt;
+	}
 
-  // Result is TablesResponse with items: list<binary> (0 or 1 items)
-  auto info_batches =
-      UnwrapAndValidateItems(result_batch, "catalog_table_get", worker_path);
-  if (info_batches.empty()) {
-    return std::nullopt;
-  }
-  return ParseTableInfo(context, info_batches[0], worker_path);
+	// Result is TablesResponse with items: list<binary> (0 or 1 items)
+	auto info_batches = UnwrapAndValidateItems(result_batch, "catalog_table_get", worker_path);
+	if (info_batches.empty()) {
+		return std::nullopt;
+	}
+	return ParseTableInfo(context, info_batches[0], worker_path);
 }
 
-std::optional<VgiTableInfo>
-InvokeCatalogTableGet(const CatalogRpcContext &ctx,
-                      const std::string &schema_name,
-                      const std::string &table_name, ClientContext &context,
-                      const std::string &at_unit, const std::string &at_value) {
-  auto &worker_path = ctx.params->worker_path();
-  auto params = generated::BuildCatalogTableGetParams(
-      ctx.attach_opaque_data, SingleSchemaPath(schema_name), table_name,
-      OptStrIfNonEmpty(at_unit), OptStrIfNonEmpty(at_value), OptTxn(ctx));
-  auto response = InvokeRpcMethod(ctx, "catalog_table_get", params, context);
-  auto result_batch =
-      ExtractAndDeserializeResult(response, "catalog_table_get", worker_path);
-  if (!result_batch) {
-    return std::nullopt;
-  }
+std::optional<VgiTableInfo> InvokeCatalogTableGet(const CatalogRpcContext &ctx,
+                                                   const std::string &schema_name, const std::string &table_name,
+                                                   ClientContext &context,
+                                                   const std::string &at_unit, const std::string &at_value) {
+	auto &worker_path = ctx.params->worker_path();
+	auto params =
+	    generated::BuildCatalogTableGetParams(ctx.attach_opaque_data, SingleSchemaPath(schema_name), table_name,
+	                                          OptStrIfNonEmpty(at_unit), OptStrIfNonEmpty(at_value), OptTxn(ctx));
+	auto response = InvokeRpcMethod(ctx, "catalog_table_get", params, context);
+	auto result_batch = ExtractAndDeserializeResult(response, "catalog_table_get", worker_path);
+	if (!result_batch) {
+		return std::nullopt;
+	}
 
-  auto info_batches =
-      UnwrapAndValidateItems(result_batch, "catalog_table_get", worker_path);
-  if (info_batches.empty()) {
-    return std::nullopt;
-  }
-  return ParseTableInfo(context, info_batches[0], worker_path);
+	auto info_batches = UnwrapAndValidateItems(result_batch, "catalog_table_get", worker_path);
+	if (info_batches.empty()) {
+		return std::nullopt;
+	}
+	return ParseTableInfo(context, info_batches[0], worker_path);
 }
 
 std::optional<VgiViewInfo> InvokeCatalogViewGet(const CatalogRpcContext &ctx,
-                                                const std::string &schema_name,
-                                                const std::string &view_name,
-                                                ClientContext &context) {
-  auto &worker_path = ctx.params->worker_path();
-  auto params = generated::BuildCatalogViewGetParams(
-      ctx.attach_opaque_data, SingleSchemaPath(schema_name), view_name,
-      OptTxn(ctx));
-  auto response = InvokeRpcMethod(ctx, "catalog_view_get", params, context);
-  auto result_batch =
-      ExtractAndDeserializeResult(response, "catalog_view_get", worker_path);
-  if (!result_batch) {
-    return std::nullopt;
-  }
+                                                 const std::string &schema_name, const std::string &view_name,
+                                                 ClientContext &context) {
+	auto &worker_path = ctx.params->worker_path();
+	auto params = generated::BuildCatalogViewGetParams(ctx.attach_opaque_data, SingleSchemaPath(schema_name), view_name,
+	                                                   OptTxn(ctx));
+	auto response = InvokeRpcMethod(ctx, "catalog_view_get", params, context);
+	auto result_batch = ExtractAndDeserializeResult(response, "catalog_view_get", worker_path);
+	if (!result_batch) {
+		return std::nullopt;
+	}
 
-  // Result is ViewsResponse with items: list<binary> (0 or 1 items)
-  auto info_batches =
-      UnwrapAndValidateItems(result_batch, "catalog_view_get", worker_path);
-  if (info_batches.empty()) {
-    return std::nullopt;
-  }
-  return ParseViewInfo(info_batches[0], worker_path);
+	// Result is ViewsResponse with items: list<binary> (0 or 1 items)
+	auto info_batches = UnwrapAndValidateItems(result_batch, "catalog_view_get", worker_path);
+	if (info_batches.empty()) {
+		return std::nullopt;
+	}
+	return ParseViewInfo(info_batches[0], worker_path);
 }
 
 VgiScanFunctionResult InvokeCatalogTableScanFunctionGet(
     const CatalogRpcContext &ctx, const std::string &schema_name,
-    const std::string &table_name, ClientContext &context,
-    const std::string &at_unit, const std::string &at_value) {
-  auto &worker_path = ctx.params->worker_path();
-  auto params = generated::BuildCatalogTableScanFunctionGetParams(
-      ctx.attach_opaque_data, SingleSchemaPath(schema_name), table_name,
-      OptStrIfNonEmpty(at_unit), OptStrIfNonEmpty(at_value), OptTxn(ctx));
-  auto response =
-      InvokeRpcMethod(ctx, "catalog_table_scan_function_get", params, context);
-  auto result_batch = ExtractAndDeserializeResult(
-      response, "catalog_table_scan_function_get", worker_path);
-  if (!result_batch || result_batch->num_rows() == 0) {
-    throw IOException(
-        "Empty response from catalog_table_scan_function_get [worker: %s]",
-        worker_path);
-  }
-  return ParseScanFunctionResult(context, result_batch, worker_path);
+    const std::string &table_name, ClientContext &context, const std::string &at_unit, const std::string &at_value) {
+	auto &worker_path = ctx.params->worker_path();
+	auto params = generated::BuildCatalogTableScanFunctionGetParams(
+	    ctx.attach_opaque_data, SingleSchemaPath(schema_name), table_name, OptStrIfNonEmpty(at_unit),
+	    OptStrIfNonEmpty(at_value), OptTxn(ctx));
+	auto response = InvokeRpcMethod(ctx, "catalog_table_scan_function_get", params, context);
+	auto result_batch = ExtractAndDeserializeResult(response, "catalog_table_scan_function_get", worker_path);
+	if (!result_batch || result_batch->num_rows() == 0) {
+		throw IOException("Empty response from catalog_table_scan_function_get [worker: %s]", worker_path);
+	}
+	return ParseScanFunctionResult(context, result_batch, worker_path);
 }
 
 // Helper: wrap a single-function (legacy) result as a one-branch
 // VgiScanBranchesResult. The branch carries no branch_filter (unconstrained)
 // and inherits required_extensions from the legacy result.
-static VgiScanBranchesResult
-WrapLegacyAsOneBranch(VgiScanFunctionResult legacy) {
-  VgiScanBranchesResult out;
-  VgiScanBranch branch;
-  branch.function_name = std::move(legacy.function_name);
-  branch.positional_arguments = std::move(legacy.positional_arguments);
-  branch.named_arguments = std::move(legacy.named_arguments);
-  branch.branch_filter.clear();
-  // parsed_branch_filter stays null — no filter to parse.
-  out.branches.push_back(std::move(branch));
-  out.required_extensions = std::move(legacy.required_extensions);
-  return out;
+static VgiScanBranchesResult WrapLegacyAsOneBranch(VgiScanFunctionResult legacy) {
+	VgiScanBranchesResult out;
+	VgiScanBranch branch;
+	branch.function_name = std::move(legacy.function_name);
+	branch.positional_arguments = std::move(legacy.positional_arguments);
+	branch.named_arguments = std::move(legacy.named_arguments);
+	branch.branch_filter.clear();
+	// parsed_branch_filter stays null — no filter to parse.
+	out.branches.push_back(std::move(branch));
+	out.required_extensions = std::move(legacy.required_extensions);
+	return out;
 }
 
 VgiScanBranchesResult InvokeCatalogTableScanBranchesGet(
     const CatalogRpcContext &ctx, const std::string &schema_name,
-    const std::string &table_name, ClientContext &context,
-    const std::string &at_unit, const std::string &at_value) {
-  auto &worker_path = ctx.params->worker_path();
+    const std::string &table_name, ClientContext &context, const std::string &at_unit, const std::string &at_value) {
+	auto &worker_path = ctx.params->worker_path();
 
-  // Capability-detection cache (A8): if a prior call against this attach
-  // already determined the worker doesn't implement the new method, skip
-  // the doomed RPC + exception entirely and go straight to the legacy
-  // fallback. State machine: 0 = unknown (probe), 1 = supported,
-  // 2 = not supported. Set by this function after each probe.
-  const int cap = ctx.params->LoadBranchesCapability();
-  if (cap == 2) {
-    auto legacy = InvokeCatalogTableScanFunctionGet(
-        ctx, schema_name, table_name, context, at_unit, at_value);
-    return WrapLegacyAsOneBranch(std::move(legacy));
-  }
+	// Capability-detection cache (A8): if a prior call against this attach
+	// already determined the worker doesn't implement the new method, skip
+	// the doomed RPC + exception entirely and go straight to the legacy
+	// fallback. State machine: 0 = unknown (probe), 1 = supported,
+	// 2 = not supported. Set by this function after each probe.
+	const int cap = ctx.params->LoadBranchesCapability();
+	if (cap == 2) {
+		auto legacy = InvokeCatalogTableScanFunctionGet(ctx, schema_name, table_name, context, at_unit, at_value);
+		return WrapLegacyAsOneBranch(std::move(legacy));
+	}
 
-  // Try the new method (either because cap == 1 / known-supported, or
-  // cap == 0 / unknown — probe). If the worker doesn't implement it, the
-  // Python-side dispatcher raises MethodNotImplementedError, which gets
-  // serialised to an EXCEPTION batch with metadata
-  // vgi_rpc.error_kind=method_not_implemented (see vgi-rpc commit adding
-  // the typed marker). The C++ side surfaces that as VgiRpcException,
-  // which we catch narrowly here.
-  auto params = generated::BuildCatalogTableScanBranchesGetParams(
-      ctx.attach_opaque_data, SingleSchemaPath(schema_name), table_name,
-      OptStrIfNonEmpty(at_unit), OptStrIfNonEmpty(at_value), OptTxn(ctx));
-  try {
-    auto response = InvokeRpcMethod(ctx, "catalog_table_scan_branches_get",
-                                    params, context);
-    auto result_batch = ExtractAndDeserializeResult(
-        response, "catalog_table_scan_branches_get", worker_path);
-    if (!result_batch || result_batch->num_rows() == 0) {
-      throw IOException(
-          "Empty response from catalog_table_scan_branches_get [worker: %s]",
-          worker_path);
-    }
-    auto parsed = ParseScanBranchesResult(context, result_batch, worker_path);
-    // Probe succeeded — pin the cache so future calls skip the legacy
-    // fallback path entirely. Idempotent on warm-cache hit (cap == 1).
-    ctx.params->StoreBranchesCapability(true);
-    return parsed;
-  } catch (const VgiRpcException &e) {
-    if (e.GetErrorKind() == error_kind::kMethodNotImplemented) {
-      // Old worker: fall back to the legacy single-function RPC and
-      // synthesise a one-branch result. Pin the cache so the next
-      // catalog read skips the doomed-RPC round-trip — saves the
-      // IPC round-trip + EXCEPTION-batch parsing on every subsequent
-      // scan against this attach.
-      ctx.params->StoreBranchesCapability(false);
-      VGI_LOG(context, "catalog.rpc.scan_branches.fallback",
-              {{"worker_path", worker_path},
-               {"schema_name", schema_name},
-               {"table_name", table_name}});
-      auto legacy = InvokeCatalogTableScanFunctionGet(
-          ctx, schema_name, table_name, context, at_unit, at_value);
-      return WrapLegacyAsOneBranch(std::move(legacy));
-    }
-    throw;
-  }
+	// Try the new method (either because cap == 1 / known-supported, or
+	// cap == 0 / unknown — probe). If the worker doesn't implement it, the
+	// Python-side dispatcher raises MethodNotImplementedError, which gets
+	// serialised to an EXCEPTION batch with metadata
+	// vgi_rpc.error_kind=method_not_implemented (see vgi-rpc commit adding
+	// the typed marker). The C++ side surfaces that as VgiRpcException,
+	// which we catch narrowly here.
+	auto params = generated::BuildCatalogTableScanBranchesGetParams(
+	    ctx.attach_opaque_data, SingleSchemaPath(schema_name), table_name, OptStrIfNonEmpty(at_unit),
+	    OptStrIfNonEmpty(at_value), OptTxn(ctx));
+	try {
+		auto response = InvokeRpcMethod(ctx, "catalog_table_scan_branches_get", params, context);
+		auto result_batch = ExtractAndDeserializeResult(response, "catalog_table_scan_branches_get", worker_path);
+		if (!result_batch || result_batch->num_rows() == 0) {
+			throw IOException("Empty response from catalog_table_scan_branches_get [worker: %s]", worker_path);
+		}
+		auto parsed = ParseScanBranchesResult(context, result_batch, worker_path);
+		// Probe succeeded — pin the cache so future calls skip the legacy
+		// fallback path entirely. Idempotent on warm-cache hit (cap == 1).
+		ctx.params->StoreBranchesCapability(true);
+		return parsed;
+	} catch (const VgiRpcException &e) {
+		if (e.GetErrorKind() == error_kind::kMethodNotImplemented) {
+			// Old worker: fall back to the legacy single-function RPC and
+			// synthesise a one-branch result. Pin the cache so the next
+			// catalog read skips the doomed-RPC round-trip — saves the
+			// IPC round-trip + EXCEPTION-batch parsing on every subsequent
+			// scan against this attach.
+			ctx.params->StoreBranchesCapability(false);
+			VGI_LOG(context, "catalog.rpc.scan_branches.fallback",
+			    {{"worker_path", worker_path},
+			     {"schema_name", schema_name},
+			     {"table_name", table_name}});
+			auto legacy = InvokeCatalogTableScanFunctionGet(ctx, schema_name, table_name, context, at_unit, at_value);
+			return WrapLegacyAsOneBranch(std::move(legacy));
+		}
+		throw;
+	}
 }
 
 // ============================================================================
@@ -808,117 +728,95 @@ VgiScanBranchesResult InvokeCatalogTableScanBranchesGet(
 
 static VgiWriteFunctionResult InvokeCatalogTableWriteFunctionGet(
     const CatalogRpcContext &ctx, const std::string &rpc_method,
-    const std::string &schema_name, const std::string &table_name,
-    ClientContext &context,
-    const std::optional<std::string> &writable_branch_function_name =
-        std::nullopt) {
-  auto &worker_path = ctx.params->worker_path();
-  std::shared_ptr<arrow::RecordBatch> params;
-  if (rpc_method == "catalog_table_insert_function_get") {
-    params = generated::BuildCatalogTableInsertFunctionGetParams(
-        ctx.attach_opaque_data, SingleSchemaPath(schema_name), table_name,
-        OptTxn(ctx), writable_branch_function_name);
-  } else if (rpc_method == "catalog_table_update_function_get") {
-    params = generated::BuildCatalogTableUpdateFunctionGetParams(
-        ctx.attach_opaque_data, SingleSchemaPath(schema_name), table_name,
-        OptTxn(ctx));
-  } else {
-    params = generated::BuildCatalogTableDeleteFunctionGetParams(
-        ctx.attach_opaque_data, SingleSchemaPath(schema_name), table_name,
-        OptTxn(ctx));
-  }
-  auto response = InvokeRpcMethod(ctx, rpc_method, params, context);
-  auto result_batch =
-      ExtractAndDeserializeResult(response, rpc_method, worker_path);
-  if (!result_batch || result_batch->num_rows() == 0) {
-    throw IOException("Empty response from %s [worker: %s]", rpc_method,
-                      worker_path);
-  }
-  return ParseScanFunctionResult(context, result_batch, worker_path);
+    const std::string &schema_name, const std::string &table_name, ClientContext &context,
+    const std::optional<std::string> &writable_branch_function_name = std::nullopt) {
+	auto &worker_path = ctx.params->worker_path();
+	std::shared_ptr<arrow::RecordBatch> params;
+	if (rpc_method == "catalog_table_insert_function_get") {
+		params =
+		    generated::BuildCatalogTableInsertFunctionGetParams(ctx.attach_opaque_data, SingleSchemaPath(schema_name),
+		                                                        table_name, OptTxn(ctx), writable_branch_function_name);
+	} else if (rpc_method == "catalog_table_update_function_get") {
+		params = generated::BuildCatalogTableUpdateFunctionGetParams(
+		    ctx.attach_opaque_data, SingleSchemaPath(schema_name), table_name, OptTxn(ctx));
+	} else {
+		params = generated::BuildCatalogTableDeleteFunctionGetParams(
+		    ctx.attach_opaque_data, SingleSchemaPath(schema_name), table_name, OptTxn(ctx));
+	}
+	auto response = InvokeRpcMethod(ctx, rpc_method, params, context);
+	auto result_batch = ExtractAndDeserializeResult(response, rpc_method, worker_path);
+	if (!result_batch || result_batch->num_rows() == 0) {
+		throw IOException("Empty response from %s [worker: %s]", rpc_method, worker_path);
+	}
+	return ParseScanFunctionResult(context, result_batch, worker_path);
 }
 
 VgiWriteFunctionResult InvokeCatalogTableInsertFunctionGet(
     const CatalogRpcContext &ctx, const std::string &schema_name,
     const std::string &table_name, ClientContext &context,
     const std::optional<std::string> &writable_branch_function_name) {
-  return InvokeCatalogTableWriteFunctionGet(
-      ctx, "catalog_table_insert_function_get", schema_name, table_name,
-      context, writable_branch_function_name);
+	return InvokeCatalogTableWriteFunctionGet(ctx, "catalog_table_insert_function_get",
+	                                          schema_name, table_name, context,
+	                                          writable_branch_function_name);
 }
 
 VgiWriteFunctionResult InvokeCatalogTableUpdateFunctionGet(
     const CatalogRpcContext &ctx, const std::string &schema_name,
     const std::string &table_name, ClientContext &context) {
-  return InvokeCatalogTableWriteFunctionGet(ctx,
-                                            "catalog_table_update_function_get",
-                                            schema_name, table_name, context);
+	return InvokeCatalogTableWriteFunctionGet(ctx, "catalog_table_update_function_get",
+	                                          schema_name, table_name, context);
 }
 
 VgiWriteFunctionResult InvokeCatalogTableDeleteFunctionGet(
     const CatalogRpcContext &ctx, const std::string &schema_name,
     const std::string &table_name, ClientContext &context) {
-  return InvokeCatalogTableWriteFunctionGet(ctx,
-                                            "catalog_table_delete_function_get",
-                                            schema_name, table_name, context);
+	return InvokeCatalogTableWriteFunctionGet(ctx, "catalog_table_delete_function_get",
+	                                          schema_name, table_name, context);
 }
 
 // ============================================================================
 // Transaction Lifecycle
 // ============================================================================
 
-int64_t InvokeCatalogVersion(const CatalogRpcContext &ctx,
-                             ClientContext &context) {
-  auto &worker_path = ctx.params->worker_path();
-  auto params =
-      generated::BuildCatalogVersionParams(ctx.attach_opaque_data, OptTxn(ctx));
-  try {
-    auto response = InvokeRpcMethod(ctx, "catalog_version", params, context);
-    auto result_batch =
-        ExtractAndDeserializeResult(response, "catalog_version", worker_path);
-    if (!result_batch || result_batch->num_rows() == 0) {
-      return 0; // Not implemented by worker
-    }
-    RecordBatchSingleRow row(result_batch, 0, "CatalogVersionResponse",
-                             worker_path);
-    return row["version"].value_not_null<int64_t>();
-  } catch (...) {
-    // RPC failure (e.g., older worker that doesn't implement catalog_version).
-    // Return 0 to signal unknown version — caller will clear cache as a safe
-    // fallback.
-    return 0;
-  }
+int64_t InvokeCatalogVersion(const CatalogRpcContext &ctx, ClientContext &context) {
+	auto &worker_path = ctx.params->worker_path();
+	auto params = generated::BuildCatalogVersionParams(ctx.attach_opaque_data, OptTxn(ctx));
+	try {
+		auto response = InvokeRpcMethod(ctx, "catalog_version", params, context);
+		auto result_batch = ExtractAndDeserializeResult(response, "catalog_version", worker_path);
+		if (!result_batch || result_batch->num_rows() == 0) {
+			return 0;  // Not implemented by worker
+		}
+		RecordBatchSingleRow row(result_batch, 0, "CatalogVersionResponse", worker_path);
+		return row["version"].value_not_null<int64_t>();
+	} catch (...) {
+		// RPC failure (e.g., older worker that doesn't implement catalog_version).
+		// Return 0 to signal unknown version — caller will clear cache as a safe fallback.
+		return 0;
+	}
 }
 
-std::vector<uint8_t> InvokeCatalogTransactionBegin(const CatalogRpcContext &ctx,
-                                                   ClientContext &context) {
-  auto &worker_path = ctx.params->worker_path();
-  auto params =
-      generated::BuildCatalogTransactionBeginParams(ctx.attach_opaque_data);
-  auto response =
-      InvokeRpcMethod(ctx, "catalog_transaction_begin", params, context);
-  auto result_batch = ExtractAndDeserializeResult(
-      response, "catalog_transaction_begin", worker_path);
-  if (!result_batch || result_batch->num_rows() == 0) {
-    return {}; // Transaction not supported
-  }
+std::vector<uint8_t> InvokeCatalogTransactionBegin(const CatalogRpcContext &ctx, ClientContext &context) {
+	auto &worker_path = ctx.params->worker_path();
+	auto params = generated::BuildCatalogTransactionBeginParams(ctx.attach_opaque_data);
+	auto response = InvokeRpcMethod(ctx, "catalog_transaction_begin", params, context);
+	auto result_batch = ExtractAndDeserializeResult(response, "catalog_transaction_begin", worker_path);
+	if (!result_batch || result_batch->num_rows() == 0) {
+		return {};  // Transaction not supported
+	}
 
-  RecordBatchSingleRow row(result_batch, 0, "TransactionBeginResponse",
-                           worker_path);
-  return row["transaction_opaque_data"].value_or(std::vector<uint8_t>{});
+	RecordBatchSingleRow row(result_batch, 0, "TransactionBeginResponse", worker_path);
+	return row["transaction_opaque_data"].value_or(std::vector<uint8_t>{});
 }
 
-void InvokeCatalogTransactionCommit(const CatalogRpcContext &ctx,
-                                    ClientContext &context) {
-  auto params = generated::BuildCatalogTransactionCommitParams(
-      ctx.attach_opaque_data, ctx.transaction_opaque_data);
-  InvokeVoidRpc(ctx, "catalog_transaction_commit", params, context);
+void InvokeCatalogTransactionCommit(const CatalogRpcContext &ctx, ClientContext &context) {
+	auto params = generated::BuildCatalogTransactionCommitParams(ctx.attach_opaque_data, ctx.transaction_opaque_data);
+	InvokeVoidRpc(ctx, "catalog_transaction_commit", params, context);
 }
 
-void InvokeCatalogTransactionRollback(const CatalogRpcContext &ctx,
-                                      ClientContext &context) {
-  auto params = generated::BuildCatalogTransactionRollbackParams(
-      ctx.attach_opaque_data, ctx.transaction_opaque_data);
-  InvokeVoidRpc(ctx, "catalog_transaction_rollback", params, context);
+void InvokeCatalogTransactionRollback(const CatalogRpcContext &ctx, ClientContext &context) {
+	auto params = generated::BuildCatalogTransactionRollbackParams(ctx.attach_opaque_data, ctx.transaction_opaque_data);
+	InvokeVoidRpc(ctx, "catalog_transaction_rollback", params, context);
 }
 
 // ============================================================================
@@ -926,8 +824,8 @@ void InvokeCatalogTransactionRollback(const CatalogRpcContext &ctx,
 // ============================================================================
 
 void InvokeCatalogTableCreate(
-    const CatalogRpcContext &ctx, const std::string &schema_name,
-    const std::string &table_name,
+    const CatalogRpcContext &ctx,
+    const std::string &schema_name, const std::string &table_name,
     const std::shared_ptr<arrow::Schema> &columns_schema,
     const std::string &on_conflict,
     const std::vector<int> &not_null_constraints,
@@ -936,264 +834,242 @@ void InvokeCatalogTableCreate(
     const std::vector<std::vector<int>> &primary_key_constraints,
     const std::vector<std::vector<uint8_t>> &foreign_key_constraints,
     ClientContext &context) {
-  auto request_batch = BuildTableCreateRequest(
-      ctx.attach_opaque_data, SingleSchemaPath(schema_name), table_name,
-      columns_schema, on_conflict, not_null_constraints, unique_constraints,
-      check_constraints, primary_key_constraints, foreign_key_constraints,
-      ctx.transaction_opaque_data);
-  auto request_bytes = SerializeToIpcBytes(request_batch);
-  auto params = generated::BuildCatalogTableCreateParams(request_bytes);
-  InvokeVoidRpc(ctx, "catalog_table_create", params, context);
+	auto request_batch =
+	    BuildTableCreateRequest(ctx.attach_opaque_data, SingleSchemaPath(schema_name), table_name, columns_schema,
+	                            on_conflict, not_null_constraints, unique_constraints, check_constraints,
+	                            primary_key_constraints, foreign_key_constraints, ctx.transaction_opaque_data);
+	auto request_bytes = SerializeToIpcBytes(request_batch);
+	auto params = generated::BuildCatalogTableCreateParams(request_bytes);
+	InvokeVoidRpc(ctx, "catalog_table_create", params, context);
 }
 
-void InvokeCatalogTableDrop(const CatalogRpcContext &ctx,
-                            const std::string &schema_name,
-                            const std::string &table_name,
-                            bool ignore_not_found, bool cascade,
-                            ClientContext &context) {
-  auto params = generated::BuildCatalogTableDropParams(
-      ctx.attach_opaque_data, SingleSchemaPath(schema_name), table_name,
-      ignore_not_found, cascade, OptTxn(ctx));
-  InvokeVoidRpc(ctx, "catalog_table_drop", params, context);
+void InvokeCatalogTableDrop(
+    const CatalogRpcContext &ctx,
+    const std::string &schema_name, const std::string &table_name,
+    bool ignore_not_found, bool cascade,
+    ClientContext &context) {
+	auto params = generated::BuildCatalogTableDropParams(ctx.attach_opaque_data, SingleSchemaPath(schema_name),
+	                                                     table_name, ignore_not_found, cascade, OptTxn(ctx));
+	InvokeVoidRpc(ctx, "catalog_table_drop", params, context);
 }
 
-void InvokeCatalogTableRename(const CatalogRpcContext &ctx,
-                              const std::string &schema_name,
-                              const std::string &table_name,
-                              const std::string &new_name,
-                              bool ignore_not_found, ClientContext &context) {
-  auto params = generated::BuildCatalogTableRenameParams(
-      ctx.attach_opaque_data, SingleSchemaPath(schema_name), table_name,
-      new_name, ignore_not_found, OptTxn(ctx));
-  InvokeVoidRpc(ctx, "catalog_table_rename", params, context);
+void InvokeCatalogTableRename(
+    const CatalogRpcContext &ctx,
+    const std::string &schema_name, const std::string &table_name,
+    const std::string &new_name, bool ignore_not_found,
+    ClientContext &context) {
+	auto params = generated::BuildCatalogTableRenameParams(ctx.attach_opaque_data, SingleSchemaPath(schema_name),
+	                                                       table_name, new_name, ignore_not_found, OptTxn(ctx));
+	InvokeVoidRpc(ctx, "catalog_table_rename", params, context);
 }
 
 void InvokeCatalogTableColumnAdd(
-    const CatalogRpcContext &ctx, const std::string &schema_name,
-    const std::string &table_name,
+    const CatalogRpcContext &ctx,
+    const std::string &schema_name, const std::string &table_name,
     const std::shared_ptr<arrow::Schema> &column_definition,
-    bool if_column_not_exists, ClientContext &context) {
-  auto column_bytes = SerializeSchemaToIpcBytes(column_definition);
-  auto params = generated::BuildCatalogTableColumnAddParams(
-      ctx.attach_opaque_data, SingleSchemaPath(schema_name), table_name,
-      column_bytes,
-      /*ignore_not_found=*/false, if_column_not_exists, OptTxn(ctx));
-  InvokeVoidRpc(ctx, "catalog_table_column_add", params, context);
+    bool if_column_not_exists,
+    ClientContext &context) {
+	auto column_bytes = SerializeSchemaToIpcBytes(column_definition);
+	auto params = generated::BuildCatalogTableColumnAddParams(
+	    ctx.attach_opaque_data, SingleSchemaPath(schema_name), table_name, column_bytes,
+	    /*ignore_not_found=*/false, if_column_not_exists, OptTxn(ctx));
+	InvokeVoidRpc(ctx, "catalog_table_column_add", params, context);
 }
 
-void InvokeCatalogTableColumnDrop(const CatalogRpcContext &ctx,
-                                  const std::string &schema_name,
-                                  const std::string &table_name,
-                                  const std::string &column_name,
-                                  bool if_column_exists, bool cascade,
-                                  ClientContext &context) {
-  auto params = generated::BuildCatalogTableColumnDropParams(
-      ctx.attach_opaque_data, SingleSchemaPath(schema_name), table_name,
-      column_name,
-      /*ignore_not_found=*/false, if_column_exists, cascade, OptTxn(ctx));
-  InvokeVoidRpc(ctx, "catalog_table_column_drop", params, context);
+void InvokeCatalogTableColumnDrop(
+    const CatalogRpcContext &ctx,
+    const std::string &schema_name, const std::string &table_name,
+    const std::string &column_name, bool if_column_exists, bool cascade,
+    ClientContext &context) {
+	auto params = generated::BuildCatalogTableColumnDropParams(
+	    ctx.attach_opaque_data, SingleSchemaPath(schema_name), table_name, column_name,
+	    /*ignore_not_found=*/false, if_column_exists, cascade, OptTxn(ctx));
+	InvokeVoidRpc(ctx, "catalog_table_column_drop", params, context);
 }
 
-void InvokeCatalogTableColumnRename(const CatalogRpcContext &ctx,
-                                    const std::string &schema_name,
-                                    const std::string &table_name,
-                                    const std::string &old_column_name,
-                                    const std::string &new_column_name,
-                                    ClientContext &context) {
-  auto params = generated::BuildCatalogTableColumnRenameParams(
-      ctx.attach_opaque_data, SingleSchemaPath(schema_name), table_name,
-      old_column_name, new_column_name,
-      /*ignore_not_found=*/false, OptTxn(ctx));
-  InvokeVoidRpc(ctx, "catalog_table_column_rename", params, context);
+void InvokeCatalogTableColumnRename(
+    const CatalogRpcContext &ctx,
+    const std::string &schema_name, const std::string &table_name,
+    const std::string &old_column_name, const std::string &new_column_name,
+    ClientContext &context) {
+	auto params = generated::BuildCatalogTableColumnRenameParams(ctx.attach_opaque_data, SingleSchemaPath(schema_name),
+	                                                             table_name, old_column_name, new_column_name,
+	                                                             /*ignore_not_found=*/false, OptTxn(ctx));
+	InvokeVoidRpc(ctx, "catalog_table_column_rename", params, context);
 }
 
-void InvokeCatalogTableCommentSet(const CatalogRpcContext &ctx,
-                                  const std::string &schema_name,
-                                  const std::string &table_name,
-                                  const std::string &comment,
-                                  bool comment_is_null, bool ignore_not_found,
-                                  ClientContext &context) {
-  auto params = generated::BuildCatalogTableCommentSetParams(
-      ctx.attach_opaque_data, SingleSchemaPath(schema_name), table_name,
-      OptStrNullable(comment, comment_is_null), ignore_not_found, OptTxn(ctx));
-  InvokeVoidRpc(ctx, "catalog_table_comment_set", params, context);
+void InvokeCatalogTableCommentSet(
+    const CatalogRpcContext &ctx,
+    const std::string &schema_name, const std::string &table_name,
+    const std::string &comment, bool comment_is_null,
+    bool ignore_not_found,
+    ClientContext &context) {
+	auto params = generated::BuildCatalogTableCommentSetParams(ctx.attach_opaque_data, SingleSchemaPath(schema_name),
+	                                                           table_name, OptStrNullable(comment, comment_is_null),
+	                                                           ignore_not_found, OptTxn(ctx));
+	InvokeVoidRpc(ctx, "catalog_table_comment_set", params, context);
 }
 
 void InvokeCatalogTableColumnCommentSet(
-    const CatalogRpcContext &ctx, const std::string &schema_name,
-    const std::string &table_name, const std::string &column_name,
-    const std::string &comment, bool comment_is_null, bool ignore_not_found,
+    const CatalogRpcContext &ctx,
+    const std::string &schema_name, const std::string &table_name,
+    const std::string &column_name,
+    const std::string &comment, bool comment_is_null,
+    bool ignore_not_found,
     ClientContext &context) {
-  auto params = generated::BuildCatalogTableColumnCommentSetParams(
-      ctx.attach_opaque_data, SingleSchemaPath(schema_name), table_name,
-      column_name, OptStrNullable(comment, comment_is_null), ignore_not_found,
-      OptTxn(ctx));
-  InvokeVoidRpc(ctx, "catalog_table_column_comment_set", params, context);
+	auto params = generated::BuildCatalogTableColumnCommentSetParams(
+	    ctx.attach_opaque_data, SingleSchemaPath(schema_name), table_name, column_name,
+	    OptStrNullable(comment, comment_is_null), ignore_not_found, OptTxn(ctx));
+	InvokeVoidRpc(ctx, "catalog_table_column_comment_set", params, context);
 }
 
 void InvokeCatalogTableColumnTypeChange(
-    const CatalogRpcContext &ctx, const std::string &schema_name,
-    const std::string &table_name,
+    const CatalogRpcContext &ctx,
+    const std::string &schema_name, const std::string &table_name,
     const std::shared_ptr<arrow::Schema> &column_definition,
-    const std::string &expression, ClientContext &context) {
-  auto column_bytes = SerializeSchemaToIpcBytes(column_definition);
-  auto params = generated::BuildCatalogTableColumnTypeChangeParams(
-      ctx.attach_opaque_data, SingleSchemaPath(schema_name), table_name,
-      column_bytes, OptStrIfNonEmpty(expression),
-      /*ignore_not_found=*/false, OptTxn(ctx));
-  InvokeVoidRpc(ctx, "catalog_table_column_type_change", params, context);
+    const std::string &expression,
+    ClientContext &context) {
+	auto column_bytes = SerializeSchemaToIpcBytes(column_definition);
+	auto params = generated::BuildCatalogTableColumnTypeChangeParams(
+	    ctx.attach_opaque_data, SingleSchemaPath(schema_name), table_name, column_bytes, OptStrIfNonEmpty(expression),
+	    /*ignore_not_found=*/false, OptTxn(ctx));
+	InvokeVoidRpc(ctx, "catalog_table_column_type_change", params, context);
 }
 
-void InvokeCatalogTableColumnDefaultSet(const CatalogRpcContext &ctx,
-                                        const std::string &schema_name,
-                                        const std::string &table_name,
-                                        const std::string &column_name,
-                                        const std::string &expression,
-                                        ClientContext &context) {
-  auto params = generated::BuildCatalogTableColumnDefaultSetParams(
-      ctx.attach_opaque_data, SingleSchemaPath(schema_name), table_name,
-      column_name, expression,
-      /*ignore_not_found=*/false, OptTxn(ctx));
-  InvokeVoidRpc(ctx, "catalog_table_column_default_set", params, context);
+void InvokeCatalogTableColumnDefaultSet(
+    const CatalogRpcContext &ctx,
+    const std::string &schema_name, const std::string &table_name,
+    const std::string &column_name, const std::string &expression,
+    ClientContext &context) {
+	auto params = generated::BuildCatalogTableColumnDefaultSetParams(
+	    ctx.attach_opaque_data, SingleSchemaPath(schema_name), table_name, column_name, expression,
+	    /*ignore_not_found=*/false, OptTxn(ctx));
+	InvokeVoidRpc(ctx, "catalog_table_column_default_set", params, context);
 }
 
-void InvokeCatalogTableColumnDefaultDrop(const CatalogRpcContext &ctx,
-                                         const std::string &schema_name,
-                                         const std::string &table_name,
-                                         const std::string &column_name,
-                                         ClientContext &context) {
-  auto params = generated::BuildCatalogTableColumnDefaultDropParams(
-      ctx.attach_opaque_data, SingleSchemaPath(schema_name), table_name,
-      column_name,
-      /*ignore_not_found=*/false, OptTxn(ctx));
-  InvokeVoidRpc(ctx, "catalog_table_column_default_drop", params, context);
+void InvokeCatalogTableColumnDefaultDrop(
+    const CatalogRpcContext &ctx,
+    const std::string &schema_name, const std::string &table_name,
+    const std::string &column_name,
+    ClientContext &context) {
+	auto params = generated::BuildCatalogTableColumnDefaultDropParams(
+	    ctx.attach_opaque_data, SingleSchemaPath(schema_name), table_name, column_name,
+	    /*ignore_not_found=*/false, OptTxn(ctx));
+	InvokeVoidRpc(ctx, "catalog_table_column_default_drop", params, context);
 }
 
-void InvokeCatalogTableNotNullSet(const CatalogRpcContext &ctx,
-                                  const std::string &schema_name,
-                                  const std::string &table_name,
-                                  const std::string &column_name,
-                                  ClientContext &context) {
-  auto params = generated::BuildCatalogTableNotNullSetParams(
-      ctx.attach_opaque_data, SingleSchemaPath(schema_name), table_name,
-      column_name,
-      /*ignore_not_found=*/false, OptTxn(ctx));
-  InvokeVoidRpc(ctx, "catalog_table_not_null_set", params, context);
+void InvokeCatalogTableNotNullSet(
+    const CatalogRpcContext &ctx,
+    const std::string &schema_name, const std::string &table_name,
+    const std::string &column_name,
+    ClientContext &context) {
+	auto params = generated::BuildCatalogTableNotNullSetParams(ctx.attach_opaque_data, SingleSchemaPath(schema_name),
+	                                                           table_name, column_name,
+	                                                           /*ignore_not_found=*/false, OptTxn(ctx));
+	InvokeVoidRpc(ctx, "catalog_table_not_null_set", params, context);
 }
 
-void InvokeCatalogTableNotNullDrop(const CatalogRpcContext &ctx,
-                                   const std::string &schema_name,
-                                   const std::string &table_name,
-                                   const std::string &column_name,
-                                   ClientContext &context) {
-  auto params = generated::BuildCatalogTableNotNullDropParams(
-      ctx.attach_opaque_data, SingleSchemaPath(schema_name), table_name,
-      column_name,
-      /*ignore_not_found=*/false, OptTxn(ctx));
-  InvokeVoidRpc(ctx, "catalog_table_not_null_drop", params, context);
+void InvokeCatalogTableNotNullDrop(
+    const CatalogRpcContext &ctx,
+    const std::string &schema_name, const std::string &table_name,
+    const std::string &column_name,
+    ClientContext &context) {
+	auto params = generated::BuildCatalogTableNotNullDropParams(ctx.attach_opaque_data, SingleSchemaPath(schema_name),
+	                                                            table_name, column_name,
+	                                                            /*ignore_not_found=*/false, OptTxn(ctx));
+	InvokeVoidRpc(ctx, "catalog_table_not_null_drop", params, context);
 }
 
 // ============================================================================
 // View DDL Operations
 // ============================================================================
 
-void InvokeCatalogViewCreate(const CatalogRpcContext &ctx,
-                             const std::string &schema_name,
-                             const std::string &view_name,
-                             const std::string &definition,
-                             const std::string &on_conflict,
-                             ClientContext &context) {
-  auto params = generated::BuildCatalogViewCreateParams(
-      ctx.attach_opaque_data, SingleSchemaPath(schema_name), view_name,
-      definition, on_conflict, OptTxn(ctx));
-  InvokeVoidRpc(ctx, "catalog_view_create", params, context);
+void InvokeCatalogViewCreate(
+    const CatalogRpcContext &ctx,
+    const std::string &schema_name, const std::string &view_name,
+    const std::string &definition, const std::string &on_conflict,
+    ClientContext &context) {
+	auto params = generated::BuildCatalogViewCreateParams(ctx.attach_opaque_data, SingleSchemaPath(schema_name),
+	                                                      view_name, definition, on_conflict, OptTxn(ctx));
+	InvokeVoidRpc(ctx, "catalog_view_create", params, context);
 }
 
-void InvokeCatalogViewDrop(const CatalogRpcContext &ctx,
-                           const std::string &schema_name,
-                           const std::string &view_name, bool ignore_not_found,
-                           bool cascade, ClientContext &context) {
-  auto params = generated::BuildCatalogViewDropParams(
-      ctx.attach_opaque_data, SingleSchemaPath(schema_name), view_name,
-      ignore_not_found, cascade, OptTxn(ctx));
-  InvokeVoidRpc(ctx, "catalog_view_drop", params, context);
+void InvokeCatalogViewDrop(
+    const CatalogRpcContext &ctx,
+    const std::string &schema_name, const std::string &view_name,
+    bool ignore_not_found, bool cascade,
+    ClientContext &context) {
+	auto params = generated::BuildCatalogViewDropParams(ctx.attach_opaque_data, SingleSchemaPath(schema_name),
+	                                                    view_name, ignore_not_found, cascade, OptTxn(ctx));
+	InvokeVoidRpc(ctx, "catalog_view_drop", params, context);
 }
 
-void InvokeCatalogViewRename(const CatalogRpcContext &ctx,
-                             const std::string &schema_name,
-                             const std::string &view_name,
-                             const std::string &new_name, bool ignore_not_found,
-                             ClientContext &context) {
-  auto params = generated::BuildCatalogViewRenameParams(
-      ctx.attach_opaque_data, SingleSchemaPath(schema_name), view_name,
-      new_name, ignore_not_found, OptTxn(ctx));
-  InvokeVoidRpc(ctx, "catalog_view_rename", params, context);
+void InvokeCatalogViewRename(
+    const CatalogRpcContext &ctx,
+    const std::string &schema_name, const std::string &view_name,
+    const std::string &new_name, bool ignore_not_found,
+    ClientContext &context) {
+	auto params = generated::BuildCatalogViewRenameParams(ctx.attach_opaque_data, SingleSchemaPath(schema_name),
+	                                                      view_name, new_name, ignore_not_found, OptTxn(ctx));
+	InvokeVoidRpc(ctx, "catalog_view_rename", params, context);
 }
 
-void InvokeCatalogViewCommentSet(const CatalogRpcContext &ctx,
-                                 const std::string &schema_name,
-                                 const std::string &view_name,
-                                 const std::string &comment,
-                                 bool comment_is_null, bool ignore_not_found,
-                                 ClientContext &context) {
-  auto params = generated::BuildCatalogViewCommentSetParams(
-      ctx.attach_opaque_data, SingleSchemaPath(schema_name), view_name,
-      OptStrNullable(comment, comment_is_null), ignore_not_found, OptTxn(ctx));
-  InvokeVoidRpc(ctx, "catalog_view_comment_set", params, context);
+void InvokeCatalogViewCommentSet(
+    const CatalogRpcContext &ctx,
+    const std::string &schema_name, const std::string &view_name,
+    const std::string &comment, bool comment_is_null,
+    bool ignore_not_found,
+    ClientContext &context) {
+	auto params = generated::BuildCatalogViewCommentSetParams(ctx.attach_opaque_data, SingleSchemaPath(schema_name),
+	                                                          view_name, OptStrNullable(comment, comment_is_null),
+	                                                          ignore_not_found, OptTxn(ctx));
+	InvokeVoidRpc(ctx, "catalog_view_comment_set", params, context);
 }
 
-void InvokeCatalogSchemaCreate(const CatalogRpcContext &ctx,
-                               const std::string &schema_name,
-                               const std::string &on_conflict,
-                               ClientContext &context) {
-  // CREATE SCHEMA ... TAGS (...) is not yet exposed by the C++ extension; we
-  // always send std::nullopt for tags. catalog_schema_create's wire shape
-  // requires the field, but the value is always absent until we plumb it
-  // through DDL parsing.
-  auto params = generated::BuildCatalogSchemaCreateParams(
-      ctx.attach_opaque_data, SingleSchemaPath(schema_name), on_conflict,
-      /*comment=*/std::nullopt, /*tags=*/std::nullopt, OptTxn(ctx));
-  InvokeVoidRpc(ctx, "catalog_schema_create", params, context);
+void InvokeCatalogSchemaCreate(
+    const CatalogRpcContext &ctx,
+    const std::string &schema_name, const std::string &on_conflict,
+    ClientContext &context) {
+	// CREATE SCHEMA ... TAGS (...) is not yet exposed by the C++ extension; we
+	// always send std::nullopt for tags. catalog_schema_create's wire shape requires
+	// the field, but the value is always absent until we plumb it through DDL parsing.
+	auto params =
+	    generated::BuildCatalogSchemaCreateParams(ctx.attach_opaque_data, SingleSchemaPath(schema_name), on_conflict,
+	                                              /*comment=*/std::nullopt, /*tags=*/std::nullopt, OptTxn(ctx));
+	InvokeVoidRpc(ctx, "catalog_schema_create", params, context);
 }
 
-void InvokeCatalogSchemaDrop(const CatalogRpcContext &ctx,
-                             const std::string &schema_name,
-                             bool ignore_not_found, bool cascade,
-                             ClientContext &context) {
-  auto params = generated::BuildCatalogSchemaDropParams(
-      ctx.attach_opaque_data, SingleSchemaPath(schema_name), ignore_not_found,
-      cascade, OptTxn(ctx));
-  InvokeVoidRpc(ctx, "catalog_schema_drop", params, context);
+void InvokeCatalogSchemaDrop(
+    const CatalogRpcContext &ctx,
+    const std::string &schema_name, bool ignore_not_found, bool cascade,
+    ClientContext &context) {
+	auto params = generated::BuildCatalogSchemaDropParams(ctx.attach_opaque_data, SingleSchemaPath(schema_name),
+	                                                      ignore_not_found, cascade, OptTxn(ctx));
+	InvokeVoidRpc(ctx, "catalog_schema_drop", params, context);
 }
 
 // ============================================================================
 // Table Function Cardinality
 // ============================================================================
 
-TableFunctionCardinalityResult
-InvokeTableFunctionCardinality(const CatalogRpcContext &ctx,
-                               const std::vector<uint8_t> &bind_request_bytes,
-                               const std::vector<uint8_t> &bind_opaque_data,
-                               ClientContext &context) {
-  auto &worker_path = ctx.params->worker_path();
+TableFunctionCardinalityResult InvokeTableFunctionCardinality(
+    const CatalogRpcContext &ctx, const std::vector<uint8_t> &bind_request_bytes,
+    const std::vector<uint8_t> &bind_opaque_data, ClientContext &context) {
+	auto &worker_path = ctx.params->worker_path();
 
-  // Build the TableFunctionCardinalityRequest batch and serialize to IPC bytes
-  auto request_batch = BuildTableFunctionCardinalityRequest(bind_request_bytes,
-                                                            bind_opaque_data);
-  auto request_bytes = SerializeToIpcBytes(request_batch);
+	// Build the TableFunctionCardinalityRequest batch and serialize to IPC bytes
+	auto request_batch = BuildTableFunctionCardinalityRequest(bind_request_bytes, bind_opaque_data);
+	auto request_bytes = SerializeToIpcBytes(request_batch);
 
-  // Wrap in {request: binary} (the protocol's TableFunctionCardinalityParams
-  // shape)
-  auto params = generated::BuildTableFunctionCardinalityParams(request_bytes);
+	// Wrap in {request: binary} (the protocol's TableFunctionCardinalityParams shape)
+	auto params = generated::BuildTableFunctionCardinalityParams(request_bytes);
 
-  auto response =
-      InvokeRpcMethod(ctx, "table_function_cardinality", params, context);
-  auto result_batch = ExtractAndDeserializeResult(
-      response, "table_function_cardinality", worker_path);
-  if (!result_batch) {
-    return {}; // Unknown cardinality
-  }
-  return ParseTableFunctionCardinalityResult(result_batch, worker_path);
+	auto response = InvokeRpcMethod(ctx, "table_function_cardinality", params, context);
+	auto result_batch = ExtractAndDeserializeResult(response, "table_function_cardinality", worker_path);
+	if (!result_batch) {
+		return {};  // Unknown cardinality
+	}
+	return ParseTableFunctionCardinalityResult(result_batch, worker_path);
 }
 
 // ============================================================================
@@ -1203,256 +1079,236 @@ InvokeTableFunctionCardinality(const CatalogRpcContext &ctx,
 //! Parse one ``PlanResponse`` batch into a page.
 //!
 //! Everything is optional except ``splits`` itself, and an EMPTY splits list is
-//! legal — a fully-pruned scan plans zero splits, and that must produce an
-//! empty result rather than an error.
-VgiScanPlanPage
-ParseVgiScanPlanPage(const std::shared_ptr<arrow::RecordBatch> &batch,
-                     const std::string &worker_path) {
-  VgiScanPlanPage page;
-  if (!batch || batch->num_rows() == 0) {
-    return page;
-  }
+//! legal — a fully-pruned scan plans zero splits, and that must produce an empty
+//! result rather than an error.
+VgiScanPlanPage ParseVgiScanPlanPage(const std::shared_ptr<arrow::RecordBatch> &batch,
+                                     const std::string &worker_path) {
+	VgiScanPlanPage page;
+	if (!batch || batch->num_rows() == 0) {
+		return page;
+	}
 
-  // splits: list<binary>, one serialized ScanSplit per entry.
-  if (auto col = batch->GetColumnByName("splits")) {
-    if (auto list = std::dynamic_pointer_cast<arrow::ListArray>(col)) {
-      if (!list->IsNull(0)) {
-        auto values =
-            std::dynamic_pointer_cast<arrow::BinaryArray>(list->values());
-        if (!values) {
-          throw IOException("VGI worker '%s' returned a plan whose 'splits' "
-                            "entries are not binary",
-                            worker_path);
-        }
-        const auto start = list->value_offset(0);
-        const auto end = list->value_offset(1);
-        page.splits.reserve(static_cast<size_t>(end - start));
-        for (auto i = start; i < end; i++) {
-          // Each entry is a serialized ScanSplit. What gets redeemed is its
-          // ``token`` — the framework-stamped envelope — NOT the whole
-          // record and not the worker's raw payload, which is inside the
-          // envelope and unverifiable on its own.
-          //
-          // Sliced zero-copy rather than copied out: the blob carries the
-          // full ScanSplit record (estimates, partition bounds, statistics
-          // — everything a bin-packing engine reads), while this client
-          // needs only the token. Materializing it copied ~1.8 KB twice per
-          // split for ~100 bytes of payload, and that runs single-threaded
-          // at the head of every scan, so on a large plan it was hundreds of
-          // milliseconds of dead time before the first reader started.
-          auto split_batch = DeserializeFromIpcBytesZeroCopy(*values, i);
-          if (!split_batch || split_batch->num_rows() == 0) {
-            throw IOException(
-                "VGI worker '%s' returned an unparseable ScanSplit",
-                worker_path);
-          }
-          auto token_col = split_batch->GetColumnByName("token");
-          auto token_arr =
-              std::dynamic_pointer_cast<arrow::BinaryArray>(token_col);
-          if (!token_arr || token_arr->IsNull(0)) {
-            throw IOException(
-                "VGI worker '%s' returned a ScanSplit with no token; the "
-                "framework stamps this, "
-                "so an absent token means the worker bypassed it.",
-                worker_path);
-          }
-          auto tok = token_arr->GetView(0);
-          page.splits.emplace_back(tok.data(), tok.size());
-        }
-      }
-    }
-  }
+	// splits: list<binary>, one serialized ScanSplit per entry.
+	if (auto col = batch->GetColumnByName("splits")) {
+		if (auto list = std::dynamic_pointer_cast<arrow::ListArray>(col)) {
+			if (!list->IsNull(0)) {
+				auto values = std::dynamic_pointer_cast<arrow::BinaryArray>(list->values());
+				if (!values) {
+					throw IOException("VGI worker '%s' returned a plan whose 'splits' entries are not binary",
+					                  worker_path);
+				}
+				const auto start = list->value_offset(0);
+				const auto end = list->value_offset(1);
+				page.splits.reserve(static_cast<size_t>(end - start));
+				for (auto i = start; i < end; i++) {
+					// Each entry is a serialized ScanSplit. What gets redeemed is its
+					// ``token`` — the framework-stamped envelope — NOT the whole
+					// record and not the worker's raw payload, which is inside the
+					// envelope and unverifiable on its own.
+					//
+					// Sliced zero-copy rather than copied out: the blob carries the
+					// full ScanSplit record (estimates, partition bounds, statistics
+					// — everything a bin-packing engine reads), while this client
+					// needs only the token. Materializing it copied ~1.8 KB twice per
+					// split for ~100 bytes of payload, and that runs single-threaded
+					// at the head of every scan, so on a large plan it was hundreds of
+					// milliseconds of dead time before the first reader started.
+					auto split_batch = DeserializeFromIpcBytesZeroCopy(*values, i);
+					if (!split_batch || split_batch->num_rows() == 0) {
+						throw IOException("VGI worker '%s' returned an unparseable ScanSplit", worker_path);
+					}
+					auto token_col = split_batch->GetColumnByName("token");
+					auto token_arr = std::dynamic_pointer_cast<arrow::BinaryArray>(token_col);
+					if (!token_arr || token_arr->IsNull(0)) {
+						throw IOException(
+						    "VGI worker '%s' returned a ScanSplit with no token; the framework stamps this, "
+						    "so an absent token means the worker bypassed it.",
+						    worker_path);
+					}
+					auto tok = token_arr->GetView(0);
+					page.splits.emplace_back(tok.data(), tok.size());
+				}
+			}
+		}
+	}
 
-  auto binary_field = [&](const char *name) -> std::vector<uint8_t> {
-    std::vector<uint8_t> out;
-    if (auto col = batch->GetColumnByName(name)) {
-      if (auto arr = std::dynamic_pointer_cast<arrow::BinaryArray>(col)) {
-        if (!arr->IsNull(0)) {
-          auto view = arr->GetView(0);
-          out.assign(view.begin(), view.end());
-        }
-      }
-    }
-    return out;
-  };
-  auto int_field = [&](const char *name) -> int64_t {
-    if (auto col = batch->GetColumnByName(name)) {
-      if (auto arr = std::dynamic_pointer_cast<arrow::Int64Array>(col)) {
-        if (!arr->IsNull(0)) {
-          return arr->Value(0);
-        }
-      }
-    }
-    return 0;
-  };
+	auto binary_field = [&](const char *name) -> std::vector<uint8_t> {
+		std::vector<uint8_t> out;
+		if (auto col = batch->GetColumnByName(name)) {
+			if (auto arr = std::dynamic_pointer_cast<arrow::BinaryArray>(col)) {
+				if (!arr->IsNull(0)) {
+					auto view = arr->GetView(0);
+					out.assign(view.begin(), view.end());
+				}
+			}
+		}
+		return out;
+	};
+	auto int_field = [&](const char *name) -> int64_t {
+		if (auto col = batch->GetColumnByName(name)) {
+			if (auto arr = std::dynamic_pointer_cast<arrow::Int64Array>(col)) {
+				if (!arr->IsNull(0)) {
+					return arr->Value(0);
+				}
+			}
+		}
+		return 0;
+	};
 
-  // next_cursors: list<binary>. More than one means the worker wants parallel
-  // enumeration, which is only sound if the cursors partition the remainder
-  // disjointly. DuckDB paginates serially, so it follows the first and ignores
-  // the rest rather than pretending to fan out.
-  if (auto col = batch->GetColumnByName("next_cursors")) {
-    if (auto list = std::dynamic_pointer_cast<arrow::ListArray>(col)) {
-      if (!list->IsNull(0) && list->value_length(0) > 0) {
-        auto values =
-            std::dynamic_pointer_cast<arrow::BinaryArray>(list->values());
-        if (values) {
-          auto view = values->GetView(list->value_offset(0));
-          page.next_cursor.assign(view.begin(), view.end());
-        }
-      }
-    }
-  }
+	// next_cursors: list<binary>. More than one means the worker wants parallel
+	// enumeration, which is only sound if the cursors partition the remainder
+	// disjointly. DuckDB paginates serially, so it follows the first and ignores
+	// the rest rather than pretending to fan out.
+	if (auto col = batch->GetColumnByName("next_cursors")) {
+		if (auto list = std::dynamic_pointer_cast<arrow::ListArray>(col)) {
+			if (!list->IsNull(0) && list->value_length(0) > 0) {
+				auto values = std::dynamic_pointer_cast<arrow::BinaryArray>(list->values());
+				if (values) {
+					auto view = values->GetView(list->value_offset(0));
+					page.next_cursor.assign(view.begin(), view.end());
+				}
+			}
+		}
+	}
 
-  page.max_workers = int_field("max_workers");
-  page.catalog_version = int_field("catalog_version");
-  page.execution_id = binary_field("execution_id");
-  page.init_opaque_data = binary_field("init_opaque_data");
+	page.max_workers = int_field("max_workers");
+	page.catalog_version = int_field("catalog_version");
+	page.execution_id = binary_field("execution_id");
+	page.init_opaque_data = binary_field("init_opaque_data");
 
-  if (auto col = batch->GetColumnByName("scope")) {
-    if (auto arr = std::dynamic_pointer_cast<arrow::StringArray>(col)) {
-      if (!arr->IsNull(0)) {
-        page.scope = arr->GetString(0);
-      }
-    }
-  }
+	if (auto col = batch->GetColumnByName("scope")) {
+		if (auto arr = std::dynamic_pointer_cast<arrow::StringArray>(col)) {
+			if (!arr->IsNull(0)) {
+				page.scope = arr->GetString(0);
+			}
+		}
+	}
 
-  return page;
+	return page;
 }
 
 //! Plan a table-function scan into named, independently redeemable splits.
 //!
-//! Bounded on three axes, because this runs on the scheduling thread and a
-//! worker that paginates forever would otherwise hang the query with no
-//! diagnosis: a page cap, a total split cap, and a cancellation check every
-//! page.
+//! Bounded on three axes, because this runs on the scheduling thread and a worker
+//! that paginates forever would otherwise hang the query with no diagnosis:
+//! a page cap, a total split cap, and a cancellation check every page.
 //!
 //! A breach THROWS rather than proceeding with what arrived. Scanning a partial
-//! enumeration would silently return a subset of the table — wrong results
-//! wearing the costume of a successful query — so truncate-and-proceed is never
-//! correct here.
-VgiScanPlan
-InvokeTableFunctionPlan(const CatalogRpcContext &ctx,
-                        const std::vector<uint8_t> &bind_request_bytes,
-                        const std::vector<uint8_t> &bind_opaque_data,
-                        const std::vector<int32_t> &projection_ids,
-                        const std::vector<uint8_t> &pushdown_filters,
-                        int64_t min_splits, int64_t target_split_bytes,
-                        const std::string &function_name,
-                        ClientContext &context) {
-  auto &worker_path = ctx.params->worker_path();
+//! enumeration would silently return a subset of the table — wrong results wearing
+//! the costume of a successful query — so truncate-and-proceed is never correct here.
+VgiScanPlan InvokeTableFunctionPlan(const CatalogRpcContext &ctx,
+                                    const std::vector<uint8_t> &bind_request_bytes,
+                                    const std::vector<uint8_t> &bind_opaque_data,
+                                    const std::vector<int32_t> &projection_ids,
+                                    const std::vector<uint8_t> &pushdown_filters, int64_t min_splits,
+                                    int64_t target_split_bytes, const std::string &function_name,
+                                    ClientContext &context) {
+	auto &worker_path = ctx.params->worker_path();
 
-  // Bounds. Deliberately generous: they exist to turn a hang into a legible
-  // error, not to second-guess a worker's split count.
-  // Read from the session so an operator can raise it for a worker that
-  // legitimately paginates a very large table — this bounds PAGES, not splits,
-  // so the reachable split count is this times the worker's page size, which
-  // may sit far below the split cap below.
-  idx_t max_pages = 1024;
-  Value max_pages_value;
-  if (context.TryGetCurrentSetting("vgi_split_plan_max_pages",
-                                   max_pages_value) &&
-      !max_pages_value.IsNull()) {
-    const auto configured = max_pages_value.GetValue<uint64_t>();
-    if (configured > 0) {
-      max_pages = static_cast<idx_t>(configured);
-    }
-  }
-  constexpr idx_t kMaxSplits = 1u << 20;
+	// Bounds. Deliberately generous: they exist to turn a hang into a legible
+	// error, not to second-guess a worker's split count.
+	// Read from the session so an operator can raise it for a worker that
+	// legitimately paginates a very large table — this bounds PAGES, not splits,
+	// so the reachable split count is this times the worker's page size, which
+	// may sit far below the split cap below.
+	idx_t max_pages = 1024;
+	Value max_pages_value;
+	if (context.TryGetCurrentSetting("vgi_split_plan_max_pages", max_pages_value) &&
+	    !max_pages_value.IsNull()) {
+		const auto configured = max_pages_value.GetValue<uint64_t>();
+		if (configured > 0) {
+			max_pages = static_cast<idx_t>(configured);
+		}
+	}
+	constexpr idx_t kMaxSplits = 1u << 20;
 
-  VgiScanPlan plan;
-  plan.function_name = function_name;
-  std::vector<uint8_t> cursor;
-  // Split disjointness is the WORKER's obligation and is not policed here.
-  //
-  // A paginated enumeration must not hand out the same split twice; violating
-  // that returns duplicate rows. The client used to dedup by token, then to
-  // refuse on a repeat, and neither earned its keep:
-  //
-  //   It cost every scan to guard an unused one. Detection needs a set holding
-  //   a COPY of every token beside the vector already holding them — on a plan
-  //   near the cap that is hundreds of MB of duplicated bytes plus the hashing,
-  //   paid by every user of every split scan, to police parallel cursor fan-out
-  //   that no client emits.
-  //
-  //   It could not hold uniformly. Detection compares token bytes; a keyless
-  //   worker stamps deterministically and a keyed one seals under a fresh
-  //   random nonce, so the check ran on the development transport and never on
-  //   the one a distributed engine uses.
-  //
-  //   It could not repair anything. The most a client can do with a duplicate
-  //   is refuse the query — swapping one worker bug for a different error
-  //   message.
-  //
-  // So it is a contract, like the worker's obligation to keep a SINGLE_VALUE
-  // split single-valued before reporting partitioning, or to keep splits
-  // replayable, or to keep redemption state cross-process. None of those are
-  // checked here either. Should a stable split identity ever land on the wire
-  // (deterministic sealing, or a plaintext split_id), enforcing this becomes
-  // cheap and uniform and is worth revisiting; until then it is the worker's.
-  idx_t pages = 0;
+	VgiScanPlan plan;
+	plan.function_name = function_name;
+	std::vector<uint8_t> cursor;
+	// Split disjointness is the WORKER's obligation and is not policed here.
+	//
+	// A paginated enumeration must not hand out the same split twice; violating
+	// that returns duplicate rows. The client used to dedup by token, then to
+	// refuse on a repeat, and neither earned its keep:
+	//
+	//   It cost every scan to guard an unused one. Detection needs a set holding a
+	//   COPY of every token beside the vector already holding them — on a plan near
+	//   the cap that is hundreds of MB of duplicated bytes plus the hashing, paid by
+	//   every user of every split scan, to police parallel cursor fan-out that no
+	//   client emits.
+	//
+	//   It could not hold uniformly. Detection compares token bytes; a keyless
+	//   worker stamps deterministically and a keyed one seals under a fresh random
+	//   nonce, so the check ran on the development transport and never on the one a
+	//   distributed engine uses.
+	//
+	//   It could not repair anything. The most a client can do with a duplicate is
+	//   refuse the query — swapping one worker bug for a different error message.
+	//
+	// So it is a contract, like the worker's obligation to keep a SINGLE_VALUE
+	// split single-valued before reporting partitioning, or to keep splits
+	// replayable, or to keep redemption state cross-process. None of those are
+	// checked here either. Should a stable split identity ever land on the wire
+	// (deterministic sealing, or a plaintext split_id), enforcing this becomes
+	// cheap and uniform and is worth revisiting; until then it is the worker's.
+	idx_t pages = 0;
 
-  while (true) {
-    if (context.interrupted) {
-      throw InterruptException();
-    }
-    if (pages >= max_pages) {
-      throw IOException("VGI worker '%s' function '%s' exceeded the "
-                        "scan-planning page cap (%llu pages) without "
-                        "exhausting its cursor; refusing to scan a partial "
-                        "split enumeration.",
-                        worker_path, function_name,
-                        static_cast<unsigned long long>(max_pages));
-    }
+	while (true) {
+		if (context.interrupted) {
+			throw InterruptException();
+		}
+		if (pages >= max_pages) {
+			throw IOException(
+			    "VGI worker '%s' function '%s' exceeded the scan-planning page cap (%llu pages) without "
+			    "exhausting its cursor; refusing to scan a partial split enumeration.",
+			    worker_path, function_name, static_cast<unsigned long long>(max_pages));
+		}
 
-    auto request_batch = BuildTableFunctionPlanRequest(
-        bind_request_bytes, bind_opaque_data, projection_ids, pushdown_filters,
-        min_splits, target_split_bytes, cursor);
-    auto request_bytes = SerializeToIpcBytes(request_batch);
-    auto params = generated::BuildTableFunctionPlanParams(request_bytes);
+		auto request_batch = BuildTableFunctionPlanRequest(bind_request_bytes, bind_opaque_data, projection_ids,
+		                                                   pushdown_filters, min_splits, target_split_bytes, cursor);
+		auto request_bytes = SerializeToIpcBytes(request_batch);
+		auto params = generated::BuildTableFunctionPlanParams(request_bytes);
 
-    auto response =
-        InvokeRpcMethod(ctx, "table_function_plan", params, context);
-    auto result_batch = ExtractAndDeserializeResult(
-        response, "table_function_plan", worker_path);
-    if (!result_batch) {
-      break;
-    }
-    pages++;
+		auto response = InvokeRpcMethod(ctx, "table_function_plan", params, context);
+		auto result_batch = ExtractAndDeserializeResult(response, "table_function_plan", worker_path);
+		if (!result_batch) {
+			break;
+		}
+		pages++;
 
-    auto page = ParseVgiScanPlanPage(result_batch, worker_path);
-    // Plan-level facts come from the FIRST page, keyed on the page count
-    // rather than on `splits.empty()`. A leading page may legally carry zero
-    // splits and a cursor (a worker still enumerating), and keying on
-    // emptiness let each such page overwrite these — so what survived was the
-    // LAST empty page's values, not the first page's.
-    if (pages == 1) {
-      plan.max_workers = page.max_workers;
-      plan.catalog_version = page.catalog_version;
-      plan.scope = page.scope;
-      plan.execution_id = page.execution_id;
-      plan.init_opaque_data = page.init_opaque_data;
-    }
-    for (auto &token : page.splits) {
-      plan.splits.push_back(std::move(token));
-    }
+		auto page = ParseVgiScanPlanPage(result_batch, worker_path);
+		// Plan-level facts come from the FIRST page, keyed on the page count
+		// rather than on `splits.empty()`. A leading page may legally carry zero
+		// splits and a cursor (a worker still enumerating), and keying on
+		// emptiness let each such page overwrite these — so what survived was the
+		// LAST empty page's values, not the first page's.
+		if (pages == 1) {
+			plan.max_workers = page.max_workers;
+			plan.catalog_version = page.catalog_version;
+			plan.scope = page.scope;
+			plan.execution_id = page.execution_id;
+			plan.init_opaque_data = page.init_opaque_data;
+		}
+		for (auto &token : page.splits) {
+			plan.splits.push_back(std::move(token));
+		}
 
-    if (plan.splits.size() > kMaxSplits) {
-      throw IOException("VGI worker '%s' returned more than %llu splits for "
-                        "one scan; refusing to "
-                        "buffer an unbounded split vector.",
-                        worker_path,
-                        static_cast<unsigned long long>(kMaxSplits));
-    }
+		if (plan.splits.size() > kMaxSplits) {
+			throw IOException("VGI worker '%s' returned more than %llu splits for one scan; refusing to "
+			                  "buffer an unbounded split vector.",
+			                  worker_path, static_cast<unsigned long long>(kMaxSplits));
+		}
 
-    plan.pages = pages;
 
-    if (page.next_cursor.empty()) {
-      break;
-    }
-    cursor = page.next_cursor;
-  }
+		plan.pages = pages;
 
-  return plan;
+		if (page.next_cursor.empty()) {
+			break;
+		}
+		cursor = page.next_cursor;
+	}
+
+	return plan;
 }
 
 // ============================================================================
@@ -1462,342 +1318,312 @@ InvokeTableFunctionPlan(const CatalogRpcContext &ctx,
 // Build DuckDB BaseStatistics from min/max Values and metadata.
 // Uses DuckDB's BaseStatistics::FromConstantType + Merge to handle all types
 // (numeric, string, decimal, list, struct, etc.) without manual type dispatch.
-static unique_ptr<BaseStatistics>
-BuildColumnStatistics(const LogicalType &duck_type, const Value &min_val,
-                      const Value &max_val, bool has_null, bool has_not_null,
-                      int64_t distinct_count, bool has_contains_unicode,
-                      bool contains_unicode, bool has_max_string_length,
-                      uint64_t max_string_length) {
+static unique_ptr<BaseStatistics> BuildColumnStatistics(
+    const LogicalType &duck_type, const Value &min_val, const Value &max_val,
+    bool has_null, bool has_not_null, int64_t distinct_count,
+    bool has_contains_unicode, bool contains_unicode,
+    bool has_max_string_length, uint64_t max_string_length) {
 
-  // Use DuckDB's FromConstant to build stats from min, then Merge with max to
-  // expand the range. This delegates all type-specific logic (NumericStats,
-  // StringStats, ListStats, etc.) to DuckDB internals — no manual type
-  // dispatch.
-  if (min_val.IsNull() && max_val.IsNull()) {
-    return make_uniq<BaseStatistics>(BaseStatistics::CreateUnknown(duck_type));
-  }
+	// Use DuckDB's FromConstant to build stats from min, then Merge with max to
+	// expand the range. This delegates all type-specific logic (NumericStats,
+	// StringStats, ListStats, etc.) to DuckDB internals — no manual type dispatch.
+	if (min_val.IsNull() && max_val.IsNull()) {
+		return make_uniq<BaseStatistics>(BaseStatistics::CreateUnknown(duck_type));
+	}
 
-  // Cast values to the target type so FromConstant dispatches to the correct
-  // stats type (e.g., GEOMETRY_STATS for geometry columns). For types that
-  // share the same physical representation but have no registered cast
-  // (e.g., BLOB → GEOMETRY), reinterpret the value with the target type.
-  auto cast_value = [&](const Value &val) -> Value {
-    if (val.IsNull()) {
-      return val;
-    }
-    if (val.type() == duck_type) {
-      return val;
-    }
-    try {
-      return val.DefaultCastAs(duck_type);
-    } catch (...) {
-      // Cast not available — if the physical types match, reinterpret
-      // the value with the target logical type (e.g., BLOB → GEOMETRY)
-      if (val.type().InternalType() == duck_type.InternalType()) {
-        auto reinterpreted = val;
-        reinterpreted.Reinterpret(duck_type);
-        return reinterpreted;
-      }
-      return val;
-    }
-  };
+	// Cast values to the target type so FromConstant dispatches to the correct
+	// stats type (e.g., GEOMETRY_STATS for geometry columns). For types that
+	// share the same physical representation but have no registered cast
+	// (e.g., BLOB → GEOMETRY), reinterpret the value with the target type.
+	auto cast_value = [&](const Value &val) -> Value {
+		if (val.IsNull()) {
+			return val;
+		}
+		if (val.type() == duck_type) {
+			return val;
+		}
+		try {
+			return val.DefaultCastAs(duck_type);
+		} catch (...) {
+			// Cast not available — if the physical types match, reinterpret
+			// the value with the target logical type (e.g., BLOB → GEOMETRY)
+			if (val.type().InternalType() == duck_type.InternalType()) {
+				auto reinterpreted = val;
+				reinterpreted.Reinterpret(duck_type);
+				return reinterpreted;
+			}
+			return val;
+		}
+	};
 
-  BaseStatistics result =
-      !min_val.IsNull() ? BaseStatistics::FromConstant(cast_value(min_val))
-                        : BaseStatistics::FromConstant(cast_value(max_val));
+	BaseStatistics result = !min_val.IsNull()
+	    ? BaseStatistics::FromConstant(cast_value(min_val))
+	    : BaseStatistics::FromConstant(cast_value(max_val));
 
-  if (!min_val.IsNull() && !max_val.IsNull()) {
-    result.Merge(BaseStatistics::FromConstant(cast_value(max_val)));
-  }
+	if (!min_val.IsNull() && !max_val.IsNull()) {
+		result.Merge(BaseStatistics::FromConstant(cast_value(max_val)));
+	}
 
-  // Override null/valid flags (FromConstantType sets CANNOT_HAVE_NULL by
-  // default)
-  if (has_null) {
-    result.SetHasNull();
-  }
-  if (has_not_null) {
-    result.SetHasNoNull();
-  }
-  if (distinct_count >= 0) {
-    result.SetDistinctCount(static_cast<idx_t>(distinct_count));
-  }
+	// Override null/valid flags (FromConstantType sets CANNOT_HAVE_NULL by default)
+	if (has_null) {
+		result.SetHasNull();
+	}
+	if (has_not_null) {
+		result.SetHasNoNull();
+	}
+	if (distinct_count >= 0) {
+		result.SetDistinctCount(static_cast<idx_t>(distinct_count));
+	}
 
-  // String-specific fields — must guard with type check to avoid accessing
-  // the wrong union member (UB if called on NUMERIC_STATS etc.)
-  if (result.GetStatsType() == StatisticsType::STRING_STATS) {
-    if (has_contains_unicode && contains_unicode) {
-      StringStats::SetContainsUnicode(result);
-    }
-    if (has_max_string_length) {
-      StringStats::SetMaxStringLength(result,
-                                      static_cast<uint32_t>(max_string_length));
-    }
-  }
+	// String-specific fields — must guard with type check to avoid accessing
+	// the wrong union member (UB if called on NUMERIC_STATS etc.)
+	if (result.GetStatsType() == StatisticsType::STRING_STATS) {
+		if (has_contains_unicode && contains_unicode) {
+			StringStats::SetContainsUnicode(result);
+		}
+		if (has_max_string_length) {
+			StringStats::SetMaxStringLength(result, static_cast<uint32_t>(max_string_length));
+		}
+	}
 
-  return result.ToUnique();
+	return result.ToUnique();
 }
 
-// Convert a deserialized ColumnStatistics RecordBatch into a name →
-// BaseStatistics map. Shared by `catalog_table_column_statistics_get` and
-// `table_function_statistics`, which use the same wire shape (columns:
-// column_name, min [union], max [union], has_null, has_not_null,
-// distinct_count, contains_unicode?, max_string_length?). `log_source_key` /
-// `log_source_value` identify the RPC source in log records (e.g. {"table",
-// "public.users"} or {"function_name", "sequence"}).
-std::unordered_map<std::string, unique_ptr<BaseStatistics>>
-ParseColumnStatisticsBatch(
+// Convert a deserialized ColumnStatistics RecordBatch into a name → BaseStatistics map.
+// Shared by `catalog_table_column_statistics_get` and `table_function_statistics`, which
+// use the same wire shape (columns: column_name, min [union], max [union], has_null,
+// has_not_null, distinct_count, contains_unicode?, max_string_length?).
+// `log_source_key` / `log_source_value` identify the RPC source in log records
+// (e.g. {"table", "public.users"} or {"function_name", "sequence"}).
+std::unordered_map<std::string, unique_ptr<BaseStatistics>> ParseColumnStatisticsBatch(
     const std::shared_ptr<arrow::RecordBatch> &result_batch,
     const std::vector<LogicalType> &column_types,
     const std::vector<std::string> &column_names,
     const std::string &worker_path, const std::string &log_source_key,
     const std::string &log_source_value, ClientContext &context) {
-  std::unordered_map<std::string, unique_ptr<BaseStatistics>> out;
-  if (!result_batch || result_batch->num_rows() == 0) {
-    return out;
-  }
+	std::unordered_map<std::string, unique_ptr<BaseStatistics>> out;
+	if (!result_batch || result_batch->num_rows() == 0) {
+		return out;
+	}
 
-  // Convert Arrow RecordBatch → DuckDB DataChunk using DuckDB's Arrow scanner.
-  // Correctly handles all types (string, decimal, timestamp, union, etc.)
-  // without manual per-type conversion.
-  ArrowSchemaWrapper schema_root;
-  ExportSchema(result_batch->schema(), schema_root);
+	// Convert Arrow RecordBatch → DuckDB DataChunk using DuckDB's Arrow scanner.
+	// Correctly handles all types (string, decimal, timestamp, union, etc.)
+	// without manual per-type conversion.
+	ArrowSchemaWrapper schema_root;
+	ExportSchema(result_batch->schema(), schema_root);
 
-  vector<LogicalType> all_types;
-  ArrowTableSchema arrow_table;
-  std::unordered_map<std::string, idx_t> name_indexes;
+	vector<LogicalType> all_types;
+	ArrowTableSchema arrow_table;
+	std::unordered_map<std::string, idx_t> name_indexes;
 
-  for (idx_t col_idx = 0;
-       col_idx < static_cast<idx_t>(schema_root.arrow_schema.n_children);
-       col_idx++) {
-    auto &schema_item = *schema_root.arrow_schema.children[col_idx];
-    auto arrow_type = ArrowType::GetArrowLogicalType(context, schema_item);
-    all_types.push_back(arrow_type->GetDuckType());
-    arrow_table.AddColumn(col_idx, std::move(arrow_type), schema_item.name);
-    name_indexes[schema_item.name] = col_idx;
-  }
+	for (idx_t col_idx = 0; col_idx < static_cast<idx_t>(schema_root.arrow_schema.n_children); col_idx++) {
+		auto &schema_item = *schema_root.arrow_schema.children[col_idx];
+		auto arrow_type = ArrowType::GetArrowLogicalType(context, schema_item);
+		all_types.push_back(arrow_type->GetDuckType());
+		arrow_table.AddColumn(col_idx, std::move(arrow_type), schema_item.name);
+		name_indexes[schema_item.name] = col_idx;
+	}
 
-  auto current_chunk = make_uniq<ArrowArrayWrapper>();
-  ExportRecordBatch(result_batch, *current_chunk);
+	auto current_chunk = make_uniq<ArrowArrayWrapper>();
+	ExportRecordBatch(result_batch, *current_chunk);
 
-  DataChunk stats_chunk;
-  stats_chunk.Initialize(Allocator::Get(context), all_types,
-                         static_cast<idx_t>(current_chunk->arrow_array.length));
-  stats_chunk.SetCardinality(
-      static_cast<idx_t>(current_chunk->arrow_array.length));
+	DataChunk stats_chunk;
+	stats_chunk.Initialize(Allocator::Get(context), all_types,
+	                        static_cast<idx_t>(current_chunk->arrow_array.length));
+	stats_chunk.SetCardinality(static_cast<idx_t>(current_chunk->arrow_array.length));
 
-  ArrowScanLocalState fake_local_state(std::move(current_chunk), context);
-  ArrowTableFunction::ArrowToDuckDB(fake_local_state, arrow_table.GetColumns(),
-                                    stats_chunk, false);
-  stats_chunk.Verify();
+	ArrowScanLocalState fake_local_state(std::move(current_chunk), context);
+	ArrowTableFunction::ArrowToDuckDB(fake_local_state, arrow_table.GetColumns(), stats_chunk, false);
+	stats_chunk.Verify();
 
-  for (const auto &field : {"column_name", "min", "max", "has_null",
-                            "has_not_null", "distinct_count"}) {
-    if (name_indexes.find(field) == name_indexes.end()) {
-      VGI_LOG(context, "column_statistics.missing_fields",
-              {{"worker_path", worker_path},
-               {log_source_key, log_source_value},
-               {"missing_field", field}});
-      return out;
-    }
-  }
+	for (const auto &field : {"column_name", "min", "max", "has_null", "has_not_null", "distinct_count"}) {
+		if (name_indexes.find(field) == name_indexes.end()) {
+			VGI_LOG(context, "column_statistics.missing_fields",
+			        {{"worker_path", worker_path},
+			         {log_source_key, log_source_value},
+			         {"missing_field", field}});
+			return out;
+		}
+	}
 
-  std::unordered_map<std::string, LogicalType> col_type_map;
-  for (size_t i = 0; i < column_names.size(); i++) {
-    col_type_map[column_names[i]] = column_types[i];
-  }
+	std::unordered_map<std::string, LogicalType> col_type_map;
+	for (size_t i = 0; i < column_names.size(); i++) {
+		col_type_map[column_names[i]] = column_types[i];
+	}
 
-  bool has_contains_unicode_col = name_indexes.count("contains_unicode") > 0;
-  bool has_max_string_length_col = name_indexes.count("max_string_length") > 0;
+	bool has_contains_unicode_col = name_indexes.count("contains_unicode") > 0;
+	bool has_max_string_length_col = name_indexes.count("max_string_length") > 0;
 
-  for (idx_t i = 0; i < stats_chunk.size(); i++) {
-    try {
-      auto column_name = stats_chunk.data[name_indexes["column_name"]]
-                             .GetValue(i)
-                             .GetValue<string>();
+	for (idx_t i = 0; i < stats_chunk.size(); i++) {
+		try {
+			auto column_name = stats_chunk.data[name_indexes["column_name"]].GetValue(i).GetValue<string>();
 
-      auto type_it = col_type_map.find(column_name);
-      if (type_it == col_type_map.end()) {
-        continue;
-      }
-      auto &duck_type = type_it->second;
+			auto type_it = col_type_map.find(column_name);
+			if (type_it == col_type_map.end()) {
+				continue;
+			}
+			auto &duck_type = type_it->second;
 
-      // Extract min/max from the UNION-typed columns.
-      auto min_union_val = stats_chunk.data[name_indexes["min"]].GetValue(i);
-      auto max_union_val = stats_chunk.data[name_indexes["max"]].GetValue(i);
+			// Extract min/max from the UNION-typed columns.
+			auto min_union_val = stats_chunk.data[name_indexes["min"]].GetValue(i);
+			auto max_union_val = stats_chunk.data[name_indexes["max"]].GetValue(i);
 
-      Value min_val, max_val;
-      if (!min_union_val.IsNull()) {
-        min_val = UnionValue::GetValue(min_union_val);
-      }
-      if (!max_union_val.IsNull()) {
-        max_val = UnionValue::GetValue(max_union_val);
-      }
+			Value min_val, max_val;
+			if (!min_union_val.IsNull()) {
+				min_val = UnionValue::GetValue(min_union_val);
+			}
+			if (!max_union_val.IsNull()) {
+				max_val = UnionValue::GetValue(max_union_val);
+			}
 
-      bool has_null = stats_chunk.data[name_indexes["has_null"]]
-                          .GetValue(i)
-                          .GetValue<bool>();
-      bool has_not_null = stats_chunk.data[name_indexes["has_not_null"]]
-                              .GetValue(i)
-                              .GetValue<bool>();
-      auto dc_val =
-          stats_chunk.data[name_indexes["distinct_count"]].GetValue(i);
-      int64_t distinct_count =
-          dc_val.IsNull() ? -1 : dc_val.GetValue<int64_t>();
+			bool has_null = stats_chunk.data[name_indexes["has_null"]].GetValue(i).GetValue<bool>();
+			bool has_not_null = stats_chunk.data[name_indexes["has_not_null"]].GetValue(i).GetValue<bool>();
+			auto dc_val = stats_chunk.data[name_indexes["distinct_count"]].GetValue(i);
+			int64_t distinct_count = dc_val.IsNull() ? -1 : dc_val.GetValue<int64_t>();
 
-      bool has_unicode_flag = false;
-      bool unicode_val = false;
-      if (has_contains_unicode_col) {
-        auto cu_val =
-            stats_chunk.data[name_indexes["contains_unicode"]].GetValue(i);
-        if (!cu_val.IsNull()) {
-          has_unicode_flag = true;
-          unicode_val = cu_val.GetValue<bool>();
-        }
-      }
-      bool has_max_str_len = false;
-      uint64_t max_str_len = 0;
-      if (has_max_string_length_col) {
-        auto msl_val =
-            stats_chunk.data[name_indexes["max_string_length"]].GetValue(i);
-        if (!msl_val.IsNull()) {
-          has_max_str_len = true;
-          max_str_len = msl_val.GetValue<uint64_t>();
-        }
-      }
+			bool has_unicode_flag = false;
+			bool unicode_val = false;
+			if (has_contains_unicode_col) {
+				auto cu_val = stats_chunk.data[name_indexes["contains_unicode"]].GetValue(i);
+				if (!cu_val.IsNull()) {
+					has_unicode_flag = true;
+					unicode_val = cu_val.GetValue<bool>();
+				}
+			}
+			bool has_max_str_len = false;
+			uint64_t max_str_len = 0;
+			if (has_max_string_length_col) {
+				auto msl_val = stats_chunk.data[name_indexes["max_string_length"]].GetValue(i);
+				if (!msl_val.IsNull()) {
+					has_max_str_len = true;
+					max_str_len = msl_val.GetValue<uint64_t>();
+				}
+			}
 
-      auto stats = BuildColumnStatistics(
-          duck_type, min_val, max_val, has_null, has_not_null, distinct_count,
-          has_unicode_flag, unicode_val, has_max_str_len, max_str_len);
-      if (stats) {
-        out[column_name] = std::move(stats);
-      }
-    } catch (const std::exception &e) {
-      VGI_LOG(context, "column_statistics.parse_error",
-              {{"worker_path", worker_path},
-               {log_source_key, log_source_value},
-               {"row", std::to_string(i)},
-               {"error", e.what()}});
-    }
-  }
+			auto stats = BuildColumnStatistics(duck_type, min_val, max_val, has_null, has_not_null,
+			                                    distinct_count, has_unicode_flag, unicode_val,
+			                                    has_max_str_len, max_str_len);
+			if (stats) {
+				out[column_name] = std::move(stats);
+			}
+		} catch (const std::exception &e) {
+			VGI_LOG(context, "column_statistics.parse_error",
+			        {{"worker_path", worker_path},
+			         {log_source_key, log_source_value},
+			         {"row", std::to_string(i)},
+			         {"error", e.what()}});
+		}
+	}
 
-  return out;
+	return out;
 }
 
 ColumnStatisticsRpcResult InvokeCatalogTableColumnStatisticsGet(
-    const CatalogRpcContext &ctx, const std::string &schema_name,
-    const std::string &table_name, const std::vector<LogicalType> &column_types,
-    const std::vector<std::string> &column_names, ClientContext &context) {
-  auto &worker_path = ctx.params->worker_path();
+    const CatalogRpcContext &ctx,
+    const std::string &schema_name, const std::string &table_name,
+    const std::vector<LogicalType> &column_types,
+    const std::vector<std::string> &column_names,
+    ClientContext &context) {
+	auto &worker_path = ctx.params->worker_path();
 
-  ColumnStatisticsRpcResult rpc_result;
+	ColumnStatisticsRpcResult rpc_result;
 
-  auto params = generated::BuildCatalogTableColumnStatisticsGetParams(
-      ctx.attach_opaque_data, SingleSchemaPath(schema_name), table_name,
-      OptTxn(ctx));
-  const char *method_name = "catalog_table_column_statistics_get";
-  auto response = InvokeRpcMethod(ctx, method_name, params, context);
+	auto params = generated::BuildCatalogTableColumnStatisticsGetParams(
+	    ctx.attach_opaque_data, SingleSchemaPath(schema_name), table_name, OptTxn(ctx));
+	const char *method_name = "catalog_table_column_statistics_get";
+	auto response = InvokeRpcMethod(ctx, method_name, params, context);
 
-  // Custom decode path (uses DeserializeFromIpcBytesWithMetadata to preserve
-  // IPC batch custom_metadata, where cache_max_age_seconds lives). The outer
-  // envelope is validated here with the same rigor as
-  // ExtractAndDeserializeResult, then ValidateResponseSchema is a no-op (method
-  // is registered dynamic) but we keep it for symmetry with the rest of the
-  // codebase.
-  if (!response.batch || response.batch->num_rows() == 0) {
-    ValidateResponseSchema(nullptr, method_name, worker_path);
-    return rpc_result;
-  }
-  auto result_col = response.batch->GetColumnByName("result");
-  if (!result_col) {
-    throw IOException("Response missing 'result' column from %s [worker: %s]",
-                      method_name, worker_path);
-  }
-  if (result_col->type()->id() != arrow::Type::BINARY) {
-    throw IOException("Response 'result' column from %s has type %s, expected "
-                      "Binary [worker: %s]",
-                      method_name, result_col->type()->ToString(), worker_path);
-  }
-  auto binary_array = std::static_pointer_cast<arrow::BinaryArray>(result_col);
-  if (binary_array->IsNull(0)) {
-    ValidateResponseSchema(nullptr, method_name, worker_path);
-    return rpc_result;
-  }
-  auto view = binary_array->GetView(0);
-  auto deserialized = DeserializeFromIpcBytesWithMetadata(
-      reinterpret_cast<const uint8_t *>(view.data()), view.size());
-  ValidateResponseSchema(deserialized.batch, method_name, worker_path);
+	// Custom decode path (uses DeserializeFromIpcBytesWithMetadata to preserve
+	// IPC batch custom_metadata, where cache_max_age_seconds lives). The outer
+	// envelope is validated here with the same rigor as ExtractAndDeserializeResult,
+	// then ValidateResponseSchema is a no-op (method is registered dynamic) but we
+	// keep it for symmetry with the rest of the codebase.
+	if (!response.batch || response.batch->num_rows() == 0) {
+		ValidateResponseSchema(nullptr, method_name, worker_path);
+		return rpc_result;
+	}
+	auto result_col = response.batch->GetColumnByName("result");
+	if (!result_col) {
+		throw IOException("Response missing 'result' column from %s [worker: %s]", method_name, worker_path);
+	}
+	if (result_col->type()->id() != arrow::Type::BINARY) {
+		throw IOException(
+		    "Response 'result' column from %s has type %s, expected Binary [worker: %s]",
+		    method_name, result_col->type()->ToString(), worker_path);
+	}
+	auto binary_array = std::static_pointer_cast<arrow::BinaryArray>(result_col);
+	if (binary_array->IsNull(0)) {
+		ValidateResponseSchema(nullptr, method_name, worker_path);
+		return rpc_result;
+	}
+	auto view = binary_array->GetView(0);
+	auto deserialized = DeserializeFromIpcBytesWithMetadata(
+	    reinterpret_cast<const uint8_t *>(view.data()), view.size());
+	ValidateResponseSchema(deserialized.batch, method_name, worker_path);
 
-  // Extract cache_max_age_seconds from IPC batch custom_metadata
-  if (deserialized.custom_metadata) {
-    int key_idx =
-        deserialized.custom_metadata->FindKey("cache_max_age_seconds");
-    if (key_idx >= 0) {
-      try {
-        rpc_result.cache_max_age_seconds =
-            std::stoll(deserialized.custom_metadata->value(key_idx));
-      } catch (const std::exception &e) {
-        VGI_LOG(context, "column_statistics.invalid_cache_ttl",
-                {{"worker_path", worker_path},
-                 {"value", deserialized.custom_metadata->value(key_idx)},
-                 {"error", e.what()}});
-      }
-    }
-  }
+	// Extract cache_max_age_seconds from IPC batch custom_metadata
+	if (deserialized.custom_metadata) {
+		int key_idx = deserialized.custom_metadata->FindKey("cache_max_age_seconds");
+		if (key_idx >= 0) {
+			try {
+				rpc_result.cache_max_age_seconds = std::stoll(deserialized.custom_metadata->value(key_idx));
+			} catch (const std::exception &e) {
+				VGI_LOG(context, "column_statistics.invalid_cache_ttl",
+				        {{"worker_path", worker_path},
+				         {"value", deserialized.custom_metadata->value(key_idx)},
+				         {"error", e.what()}});
+			}
+		}
+	}
 
-  rpc_result.stats = ParseColumnStatisticsBatch(
-      deserialized.batch, column_types, column_names, worker_path, "table",
-      schema_name + "." + table_name, context);
-  return rpc_result;
+	rpc_result.stats = ParseColumnStatisticsBatch(deserialized.batch, column_types, column_names,
+	                                               worker_path, "table", schema_name + "." + table_name, context);
+	return rpc_result;
 }
 
-std::unordered_map<std::string, unique_ptr<BaseStatistics>>
-InvokeTableFunctionStatistics(const CatalogRpcContext &ctx,
-                              const std::vector<uint8_t> &bind_request_bytes,
-                              const std::vector<uint8_t> &bind_opaque_data,
-                              const std::vector<LogicalType> &column_types,
-                              const std::vector<std::string> &column_names,
-                              const std::string &function_name,
-                              ClientContext &context) {
-  auto &worker_path = ctx.params->worker_path();
+std::unordered_map<std::string, unique_ptr<BaseStatistics>> InvokeTableFunctionStatistics(
+    const CatalogRpcContext &ctx, const std::vector<uint8_t> &bind_request_bytes,
+    const std::vector<uint8_t> &bind_opaque_data,
+    const std::vector<LogicalType> &column_types,
+    const std::vector<std::string> &column_names,
+    const std::string &function_name, ClientContext &context) {
+	auto &worker_path = ctx.params->worker_path();
 
-  auto request_batch =
-      BuildTableFunctionStatisticsRequest(bind_request_bytes, bind_opaque_data);
-  auto request_bytes = SerializeToIpcBytes(request_batch);
-  auto params = generated::BuildTableFunctionStatisticsParams(request_bytes);
+	auto request_batch = BuildTableFunctionStatisticsRequest(bind_request_bytes, bind_opaque_data);
+	auto request_bytes = SerializeToIpcBytes(request_batch);
+	auto params = generated::BuildTableFunctionStatisticsParams(request_bytes);
 
-  const char *method_name = "table_function_statistics";
-  auto response = InvokeRpcMethod(ctx, method_name, params, context);
+	const char *method_name = "table_function_statistics";
+	auto response = InvokeRpcMethod(ctx, method_name, params, context);
 
-  // Response envelope: {result: binary|null}. Null result → no stats available
-  // (method returns Optional[bytes] in vgi-python; shape of the bytes varies
-  // per function and is validated by ParseColumnStatisticsBatch downstream).
-  if (!response.batch || response.batch->num_rows() == 0) {
-    ValidateResponseSchema(nullptr, method_name, worker_path);
-    return {};
-  }
-  auto result_col = response.batch->GetColumnByName("result");
-  if (!result_col) {
-    throw IOException("Response missing 'result' column from %s [worker: %s]",
-                      method_name, worker_path);
-  }
-  if (result_col->type()->id() != arrow::Type::BINARY) {
-    throw IOException("Response 'result' column from %s has type %s, expected "
-                      "Binary [worker: %s]",
-                      method_name, result_col->type()->ToString(), worker_path);
-  }
-  auto binary_array = std::static_pointer_cast<arrow::BinaryArray>(result_col);
-  if (binary_array->IsNull(0)) {
-    ValidateResponseSchema(nullptr, method_name, worker_path);
-    return {};
-  }
-  auto view = binary_array->GetView(0);
-  auto result_batch = DeserializeFromIpcBytes(
-      reinterpret_cast<const uint8_t *>(view.data()), view.size());
-  ValidateResponseSchema(result_batch, method_name, worker_path);
+	// Response envelope: {result: binary|null}. Null result → no stats available
+	// (method returns Optional[bytes] in vgi-python; shape of the bytes varies
+	// per function and is validated by ParseColumnStatisticsBatch downstream).
+	if (!response.batch || response.batch->num_rows() == 0) {
+		ValidateResponseSchema(nullptr, method_name, worker_path);
+		return {};
+	}
+	auto result_col = response.batch->GetColumnByName("result");
+	if (!result_col) {
+		throw IOException("Response missing 'result' column from %s [worker: %s]", method_name, worker_path);
+	}
+	if (result_col->type()->id() != arrow::Type::BINARY) {
+		throw IOException(
+		    "Response 'result' column from %s has type %s, expected Binary [worker: %s]",
+		    method_name, result_col->type()->ToString(), worker_path);
+	}
+	auto binary_array = std::static_pointer_cast<arrow::BinaryArray>(result_col);
+	if (binary_array->IsNull(0)) {
+		ValidateResponseSchema(nullptr, method_name, worker_path);
+		return {};
+	}
+	auto view = binary_array->GetView(0);
+	auto result_batch = DeserializeFromIpcBytes(
+	    reinterpret_cast<const uint8_t *>(view.data()), view.size());
+	ValidateResponseSchema(result_batch, method_name, worker_path);
 
-  return ParseColumnStatisticsBatch(result_batch, column_types, column_names,
-                                    worker_path, "function_name", function_name,
-                                    context);
+	return ParseColumnStatisticsBatch(result_batch, column_types, column_names,
+	                                   worker_path, "function_name", function_name, context);
 }
 
 // ============================================================================
@@ -1805,35 +1631,32 @@ InvokeTableFunctionStatistics(const CatalogRpcContext &ctx,
 // ============================================================================
 
 InsertionOrderPreservingMap<std::string> InvokeTableFunctionDynamicToString(
-    const CatalogRpcContext &ctx,
-    const std::vector<uint8_t> &bind_request_bytes,
+    const CatalogRpcContext &ctx, const std::vector<uint8_t> &bind_request_bytes,
     const std::vector<uint8_t> &bind_opaque_data,
-    const std::vector<uint8_t> &global_execution_id, ClientContext &context) {
-  auto &worker_path = ctx.params->worker_path();
+    const std::vector<uint8_t> &global_execution_id,
+    ClientContext &context) {
+	auto &worker_path = ctx.params->worker_path();
 
-  try {
-    auto request_batch = BuildTableFunctionDynamicToStringRequest(
-        bind_request_bytes, bind_opaque_data, global_execution_id);
-    auto request_bytes = SerializeToIpcBytes(request_batch);
-    auto params =
-        generated::BuildTableFunctionDynamicToStringParams(request_bytes);
+	try {
+		auto request_batch = BuildTableFunctionDynamicToStringRequest(
+		    bind_request_bytes, bind_opaque_data, global_execution_id);
+		auto request_bytes = SerializeToIpcBytes(request_batch);
+		auto params = generated::BuildTableFunctionDynamicToStringParams(request_bytes);
 
-    auto response = InvokeRpcMethod(ctx, "table_function_dynamic_to_string",
-                                    params, context);
-    auto result_batch = ExtractAndDeserializeResult(
-        response, "table_function_dynamic_to_string", worker_path);
-    if (!result_batch) {
-      return {};
-    }
-    return ParseTableFunctionDynamicToStringResult(result_batch, worker_path);
-  } catch (const std::exception &e) {
-    // EXPLAIN ANALYZE must never fail because of a profiler-only RPC.
-    // Log and surface an empty map; the caller will append the intrinsic
-    // keys it knows from the global state.
-    VGI_LOG(context, "table_function.dynamic_to_string_error",
-            {{"worker_path", worker_path}, {"error", e.what()}});
-    return {};
-  }
+		auto response = InvokeRpcMethod(ctx, "table_function_dynamic_to_string", params, context);
+		auto result_batch = ExtractAndDeserializeResult(response, "table_function_dynamic_to_string", worker_path);
+		if (!result_batch) {
+			return {};
+		}
+		return ParseTableFunctionDynamicToStringResult(result_batch, worker_path);
+	} catch (const std::exception &e) {
+		// EXPLAIN ANALYZE must never fail because of a profiler-only RPC.
+		// Log and surface an empty map; the caller will append the intrinsic
+		// keys it knows from the global state.
+		VGI_LOG(context, "table_function.dynamic_to_string_error",
+		        {{"worker_path", worker_path}, {"error", e.what()}});
+		return {};
+	}
 }
 
 // ============================================================================
@@ -1846,927 +1669,822 @@ InsertionOrderPreservingMap<std::string> InvokeTableFunctionDynamicToString(
 // variant surfaces instead of being silently masked as a default (which would
 // run with behavior inconsistent with what the worker declared).
 template <typename T>
-static T RequireKnownEnum(std::optional<T> parsed, const std::string &raw,
-                          const char *field_name,
-                          const std::string &worker_path,
-                          const std::string &fn_name) {
-  if (!parsed) {
-    throw IOException(
-        "VGI worker '%s' returned unknown %s '%s' for function '%s'",
-        worker_path, field_name, raw, fn_name);
-  }
-  return *parsed;
+static T RequireKnownEnum(std::optional<T> parsed, const std::string &raw, const char *field_name,
+                          const std::string &worker_path, const std::string &fn_name) {
+	if (!parsed) {
+		throw IOException("VGI worker '%s' returned unknown %s '%s' for function '%s'", worker_path, field_name, raw,
+		                  fn_name);
+	}
+	return *parsed;
 }
 
 std::optional<VgiFunctionType> ParseVgiFunctionType(const std::string &value) {
-  if (value == "scalar" || value == "SCALAR") {
-    return VgiFunctionType::Scalar;
-  } else if (value == "table" || value == "TABLE" || value == "table_in_out") {
-    // Both "table" and the legacy "table_in_out" map to streaming Table.
-    return VgiFunctionType::Table;
-  } else if (value == "table_buffering" || value == "TABLE_BUFFERING") {
-    return VgiFunctionType::TableBuffering;
-  } else if (value == "aggregate" || value == "AGGREGATE") {
-    return VgiFunctionType::Aggregate;
-  }
-  return std::nullopt;
+	if (value == "scalar" || value == "SCALAR") {
+		return VgiFunctionType::Scalar;
+	} else if (value == "table" || value == "TABLE" || value == "table_in_out") {
+		// Both "table" and the legacy "table_in_out" map to streaming Table.
+		return VgiFunctionType::Table;
+	} else if (value == "table_buffering" || value == "TABLE_BUFFERING") {
+		return VgiFunctionType::TableBuffering;
+	} else if (value == "aggregate" || value == "AGGREGATE") {
+		return VgiFunctionType::Aggregate;
+	}
+	return std::nullopt;
 }
 
 std::string VgiFunctionTypeToString(VgiFunctionType type) {
-  switch (type) {
-  case VgiFunctionType::Scalar:
-    return "scalar";
-  case VgiFunctionType::Table:
-    return "table";
-  case VgiFunctionType::TableBuffering:
-    return "table_buffering";
-  case VgiFunctionType::Aggregate:
-    return "aggregate";
-  default:
-    return "unknown";
-  }
+	switch (type) {
+	case VgiFunctionType::Scalar:
+		return "scalar";
+	case VgiFunctionType::Table:
+		return "table";
+	case VgiFunctionType::TableBuffering:
+		return "table_buffering";
+	case VgiFunctionType::Aggregate:
+		return "aggregate";
+	default:
+		return "unknown";
+	}
 }
 
 // Parse FunctionStability from wire format (Python enum .name)
 // Wire format: "CONSISTENT", "VOLATILE", "CONSISTENT_WITHIN_QUERY"
-static std::optional<FunctionStability>
-ParseFunctionStability(const std::string &value) {
-  if (value == "CONSISTENT") {
-    return FunctionStability::CONSISTENT;
-  } else if (value == "VOLATILE") {
-    return FunctionStability::VOLATILE;
-  } else if (value == "CONSISTENT_WITHIN_QUERY") {
-    return FunctionStability::CONSISTENT_WITHIN_QUERY;
-  }
-  return std::nullopt;
+static std::optional<FunctionStability> ParseFunctionStability(const std::string &value) {
+	if (value == "CONSISTENT") {
+		return FunctionStability::CONSISTENT;
+	} else if (value == "VOLATILE") {
+		return FunctionStability::VOLATILE;
+	} else if (value == "CONSISTENT_WITHIN_QUERY") {
+		return FunctionStability::CONSISTENT_WITHIN_QUERY;
+	}
+	return std::nullopt;
 }
 
 // Parse FunctionNullHandling from wire format (Python enum .name)
 // Wire format: "DEFAULT", "SPECIAL"
-static std::optional<FunctionNullHandling>
-ParseFunctionNullHandling(const std::string &value) {
-  if (value == "DEFAULT") {
-    return FunctionNullHandling::DEFAULT_NULL_HANDLING;
-  } else if (value == "SPECIAL") {
-    return FunctionNullHandling::SPECIAL_HANDLING;
-  }
-  return std::nullopt;
+static std::optional<FunctionNullHandling> ParseFunctionNullHandling(const std::string &value) {
+	if (value == "DEFAULT") {
+		return FunctionNullHandling::DEFAULT_NULL_HANDLING;
+	} else if (value == "SPECIAL") {
+		return FunctionNullHandling::SPECIAL_HANDLING;
+	}
+	return std::nullopt;
 }
 
-std::optional<VgiOrderPreservation>
-ParseVgiOrderPreservation(const std::string &value) {
-  if (value == "PRESERVES_ORDER") {
-    return VgiOrderPreservation::PreservesOrder;
-  } else if (value == "NO_ORDER_GUARANTEE") {
-    return VgiOrderPreservation::NoOrderGuarantee;
-  } else if (value == "FIXED_ORDER") {
-    return VgiOrderPreservation::FixedOrder;
-  }
-  return std::nullopt;
+std::optional<VgiOrderPreservation> ParseVgiOrderPreservation(const std::string &value) {
+	if (value == "PRESERVES_ORDER") {
+		return VgiOrderPreservation::PreservesOrder;
+	} else if (value == "NO_ORDER_GUARANTEE") {
+		return VgiOrderPreservation::NoOrderGuarantee;
+	} else if (value == "FIXED_ORDER") {
+		return VgiOrderPreservation::FixedOrder;
+	}
+	return std::nullopt;
 }
 
-std::optional<VgiPartitionKind>
-ParseVgiPartitionKind(const std::string &value) {
-  if (value == "NOT_PARTITIONED") {
-    return VgiPartitionKind::NotPartitioned;
-  } else if (value == "SINGLE_VALUE_PARTITIONS") {
-    return VgiPartitionKind::SingleValuePartitions;
-  } else if (value == "OVERLAPPING_PARTITIONS") {
-    return VgiPartitionKind::OverlappingPartitions;
-  } else if (value == "DISJOINT_PARTITIONS") {
-    return VgiPartitionKind::DisjointPartitions;
-  }
-  return std::nullopt;
+std::optional<VgiPartitionKind> ParseVgiPartitionKind(const std::string &value) {
+	if (value == "NOT_PARTITIONED") {
+		return VgiPartitionKind::NotPartitioned;
+	} else if (value == "SINGLE_VALUE_PARTITIONS") {
+		return VgiPartitionKind::SingleValuePartitions;
+	} else if (value == "OVERLAPPING_PARTITIONS") {
+		return VgiPartitionKind::OverlappingPartitions;
+	} else if (value == "DISJOINT_PARTITIONS") {
+		return VgiPartitionKind::DisjointPartitions;
+	}
+	return std::nullopt;
 }
 
 // Parse AggregateOrderDependent from wire format (Python enum .name)
 // Wire format: "ORDER_DEPENDENT", "NOT_ORDER_DEPENDENT"
-static std::optional<AggregateOrderDependent>
-ParseAggregateOrderDependent(const std::string &value) {
-  if (value == "ORDER_DEPENDENT") {
-    return AggregateOrderDependent::ORDER_DEPENDENT;
-  } else if (value == "NOT_ORDER_DEPENDENT") {
-    return AggregateOrderDependent::NOT_ORDER_DEPENDENT;
-  }
-  return std::nullopt;
+static std::optional<AggregateOrderDependent> ParseAggregateOrderDependent(const std::string &value) {
+	if (value == "ORDER_DEPENDENT") {
+		return AggregateOrderDependent::ORDER_DEPENDENT;
+	} else if (value == "NOT_ORDER_DEPENDENT") {
+		return AggregateOrderDependent::NOT_ORDER_DEPENDENT;
+	}
+	return std::nullopt;
 }
 
 // Parse AggregateDistinctDependent from wire format (Python enum .name)
 // Wire format: "DISTINCT_DEPENDENT", "NOT_DISTINCT_DEPENDENT"
-static std::optional<AggregateDistinctDependent>
-ParseAggregateDistinctDependent(const std::string &value) {
-  if (value == "DISTINCT_DEPENDENT") {
-    return AggregateDistinctDependent::DISTINCT_DEPENDENT;
-  } else if (value == "NOT_DISTINCT_DEPENDENT") {
-    return AggregateDistinctDependent::NOT_DISTINCT_DEPENDENT;
-  }
-  return std::nullopt;
+static std::optional<AggregateDistinctDependent> ParseAggregateDistinctDependent(const std::string &value) {
+	if (value == "DISTINCT_DEPENDENT") {
+		return AggregateDistinctDependent::DISTINCT_DEPENDENT;
+	} else if (value == "NOT_DISTINCT_DEPENDENT") {
+		return AggregateDistinctDependent::NOT_DISTINCT_DEPENDENT;
+	}
+	return std::nullopt;
 }
+
 
 // ============================================================================
 // Result parsing using RecordBatchSingleRow
 // ============================================================================
 
 // Helper to extract a single value from an Arrow array at given row index
-// Uses DuckDB type from ArrowSchemaToDuckDBTypes and constructs Value
-// appropriately
-static Value ExtractArrowValue(const std::shared_ptr<arrow::Array> &array,
-                               int64_t row_idx, const LogicalType &duck_type) {
-  if (!array || array->IsNull(row_idx)) {
-    return Value(duck_type);
-  }
+// Uses DuckDB type from ArrowSchemaToDuckDBTypes and constructs Value appropriately
+static Value ExtractArrowValue(const std::shared_ptr<arrow::Array> &array, int64_t row_idx,
+                               const LogicalType &duck_type) {
+	if (!array || array->IsNull(row_idx)) {
+		return Value(duck_type);
+	}
 
-  // Extract value based on Arrow type and construct DuckDB Value
-  switch (array->type()->id()) {
-  case arrow::Type::BOOL: {
-    auto typed = std::static_pointer_cast<arrow::BooleanArray>(array);
-    return Value::BOOLEAN(typed->Value(row_idx));
-  }
-  case arrow::Type::INT8: {
-    auto typed = std::static_pointer_cast<arrow::Int8Array>(array);
-    return Value::TINYINT(typed->Value(row_idx));
-  }
-  case arrow::Type::INT16: {
-    auto typed = std::static_pointer_cast<arrow::Int16Array>(array);
-    return Value::SMALLINT(typed->Value(row_idx));
-  }
-  case arrow::Type::INT32: {
-    auto typed = std::static_pointer_cast<arrow::Int32Array>(array);
-    return Value::INTEGER(typed->Value(row_idx));
-  }
-  case arrow::Type::INT64: {
-    auto typed = std::static_pointer_cast<arrow::Int64Array>(array);
-    return Value::BIGINT(typed->Value(row_idx));
-  }
-  case arrow::Type::UINT8: {
-    auto typed = std::static_pointer_cast<arrow::UInt8Array>(array);
-    return Value::UTINYINT(typed->Value(row_idx));
-  }
-  case arrow::Type::UINT16: {
-    auto typed = std::static_pointer_cast<arrow::UInt16Array>(array);
-    return Value::USMALLINT(typed->Value(row_idx));
-  }
-  case arrow::Type::UINT32: {
-    auto typed = std::static_pointer_cast<arrow::UInt32Array>(array);
-    return Value::UINTEGER(typed->Value(row_idx));
-  }
-  case arrow::Type::UINT64: {
-    auto typed = std::static_pointer_cast<arrow::UInt64Array>(array);
-    return Value::UBIGINT(typed->Value(row_idx));
-  }
-  case arrow::Type::FLOAT: {
-    auto typed = std::static_pointer_cast<arrow::FloatArray>(array);
-    return Value::FLOAT(typed->Value(row_idx));
-  }
-  case arrow::Type::DOUBLE: {
-    auto typed = std::static_pointer_cast<arrow::DoubleArray>(array);
-    return Value::DOUBLE(typed->Value(row_idx));
-  }
-  case arrow::Type::STRING: {
-    auto typed = std::static_pointer_cast<arrow::StringArray>(array);
-    return Value(typed->GetString(row_idx));
-  }
-  case arrow::Type::LARGE_STRING: {
-    auto typed = std::static_pointer_cast<arrow::LargeStringArray>(array);
-    return Value(typed->GetString(row_idx));
-  }
-  case arrow::Type::BINARY: {
-    auto typed = std::static_pointer_cast<arrow::BinaryArray>(array);
-    auto view = typed->GetView(row_idx);
-    return Value::BLOB(reinterpret_cast<const_data_ptr_t>(view.data()),
-                       view.size());
-  }
-  case arrow::Type::LARGE_BINARY: {
-    auto typed = std::static_pointer_cast<arrow::LargeBinaryArray>(array);
-    auto view = typed->GetView(row_idx);
-    return Value::BLOB(reinterpret_cast<const_data_ptr_t>(view.data()),
-                       view.size());
-  }
-  default:
-    // For complex/unsupported types, try to get string representation
-    auto scalar_result = array->GetScalar(row_idx);
-    if (scalar_result.ok()) {
-      return Value(scalar_result.ValueUnsafe()->ToString());
-    }
-    return Value(duck_type);
-  }
+	// Extract value based on Arrow type and construct DuckDB Value
+	switch (array->type()->id()) {
+	case arrow::Type::BOOL: {
+		auto typed = std::static_pointer_cast<arrow::BooleanArray>(array);
+		return Value::BOOLEAN(typed->Value(row_idx));
+	}
+	case arrow::Type::INT8: {
+		auto typed = std::static_pointer_cast<arrow::Int8Array>(array);
+		return Value::TINYINT(typed->Value(row_idx));
+	}
+	case arrow::Type::INT16: {
+		auto typed = std::static_pointer_cast<arrow::Int16Array>(array);
+		return Value::SMALLINT(typed->Value(row_idx));
+	}
+	case arrow::Type::INT32: {
+		auto typed = std::static_pointer_cast<arrow::Int32Array>(array);
+		return Value::INTEGER(typed->Value(row_idx));
+	}
+	case arrow::Type::INT64: {
+		auto typed = std::static_pointer_cast<arrow::Int64Array>(array);
+		return Value::BIGINT(typed->Value(row_idx));
+	}
+	case arrow::Type::UINT8: {
+		auto typed = std::static_pointer_cast<arrow::UInt8Array>(array);
+		return Value::UTINYINT(typed->Value(row_idx));
+	}
+	case arrow::Type::UINT16: {
+		auto typed = std::static_pointer_cast<arrow::UInt16Array>(array);
+		return Value::USMALLINT(typed->Value(row_idx));
+	}
+	case arrow::Type::UINT32: {
+		auto typed = std::static_pointer_cast<arrow::UInt32Array>(array);
+		return Value::UINTEGER(typed->Value(row_idx));
+	}
+	case arrow::Type::UINT64: {
+		auto typed = std::static_pointer_cast<arrow::UInt64Array>(array);
+		return Value::UBIGINT(typed->Value(row_idx));
+	}
+	case arrow::Type::FLOAT: {
+		auto typed = std::static_pointer_cast<arrow::FloatArray>(array);
+		return Value::FLOAT(typed->Value(row_idx));
+	}
+	case arrow::Type::DOUBLE: {
+		auto typed = std::static_pointer_cast<arrow::DoubleArray>(array);
+		return Value::DOUBLE(typed->Value(row_idx));
+	}
+	case arrow::Type::STRING: {
+		auto typed = std::static_pointer_cast<arrow::StringArray>(array);
+		return Value(typed->GetString(row_idx));
+	}
+	case arrow::Type::LARGE_STRING: {
+		auto typed = std::static_pointer_cast<arrow::LargeStringArray>(array);
+		return Value(typed->GetString(row_idx));
+	}
+	case arrow::Type::BINARY: {
+		auto typed = std::static_pointer_cast<arrow::BinaryArray>(array);
+		auto view = typed->GetView(row_idx);
+		return Value::BLOB(reinterpret_cast<const_data_ptr_t>(view.data()), view.size());
+	}
+	case arrow::Type::LARGE_BINARY: {
+		auto typed = std::static_pointer_cast<arrow::LargeBinaryArray>(array);
+		auto view = typed->GetView(row_idx);
+		return Value::BLOB(reinterpret_cast<const_data_ptr_t>(view.data()), view.size());
+	}
+	default:
+		// For complex/unsupported types, try to get string representation
+		auto scalar_result = array->GetScalar(row_idx);
+		if (scalar_result.ok()) {
+			return Value(scalar_result.ValueUnsafe()->ToString());
+		}
+		return Value(duck_type);
+	}
 }
 
 // Helper to convert Arrow RecordBatch to vector of DuckDB Values
 // Uses DuckDB's ArrowSchemaToDuckDBTypes for proper type mapping
-static vector<Value>
-ArrowBatchToValues(ClientContext &context,
-                   const std::shared_ptr<arrow::RecordBatch> &batch) {
-  vector<Value> result;
-  if (!batch || batch->num_rows() == 0) {
-    return result;
-  }
+static vector<Value> ArrowBatchToValues(ClientContext &context, const std::shared_ptr<arrow::RecordBatch> &batch) {
+	vector<Value> result;
+	if (!batch || batch->num_rows() == 0) {
+		return result;
+	}
 
-  // Use DuckDB's proper Arrow schema conversion to get correct types
-  ArrowSchemaWrapper c_schema;
-  ArrowTableSchema arrow_table;
-  vector<LogicalType> types;
-  vector<string> names;
-  ArrowSchemaToDuckDBTypes(context, batch->schema(), c_schema, arrow_table,
-                           types, names);
+	// Use DuckDB's proper Arrow schema conversion to get correct types
+	ArrowSchemaWrapper c_schema;
+	ArrowTableSchema arrow_table;
+	vector<LogicalType> types;
+	vector<string> names;
+	ArrowSchemaToDuckDBTypes(context, batch->schema(), c_schema, arrow_table, types, names);
 
-  // Extract value from each column at row 0
-  for (int64_t col_idx = 0; col_idx < batch->num_columns(); col_idx++) {
-    auto array = batch->column(col_idx);
-    auto &duck_type = types[col_idx];
-    result.push_back(ExtractArrowValue(array, 0, duck_type));
-  }
+	// Extract value from each column at row 0
+	for (int64_t col_idx = 0; col_idx < batch->num_columns(); col_idx++) {
+		auto array = batch->column(col_idx);
+		auto &duck_type = types[col_idx];
+		result.push_back(ExtractArrowValue(array, 0, duck_type));
+	}
 
-  return result;
+	return result;
 }
 
-VgiSetting ParseVgiSetting(const std::vector<uint8_t> &bytes,
-                           const std::string &worker_path,
+VgiSetting ParseVgiSetting(const std::vector<uint8_t> &bytes, const std::string &worker_path,
                            ClientContext &context) {
-  // Deserialize the Setting RecordBatch
-  auto batch = DeserializeFromIpcBytes(bytes);
-  if (!batch || batch->num_rows() == 0) {
-    throw IOException("Empty Setting batch from worker: %s", worker_path);
-  }
+	// Deserialize the Setting RecordBatch
+	auto batch = DeserializeFromIpcBytes(bytes);
+	if (!batch || batch->num_rows() == 0) {
+		throw IOException("Empty Setting batch from worker: %s", worker_path);
+	}
 
-  RecordBatchSingleRow row(batch, 0, "Setting", worker_path);
+	RecordBatchSingleRow row(batch, 0, "Setting", worker_path);
 
-  VgiSetting setting;
-  setting.name = row["name"].value_not_null<std::string>();
-  setting.description = row["description"].value_not_null<std::string>();
+	VgiSetting setting;
+	setting.name = row["name"].value_not_null<std::string>();
+	setting.description = row["description"].value_not_null<std::string>();
 
-  // Parse the type from the serialized schema bytes
-  auto type_bytes = row["type"].value_not_null<std::vector<uint8_t>>();
-  auto type_buffer = arrow::Buffer::Wrap(type_bytes.data(), type_bytes.size());
-  auto type_stream = std::make_shared<arrow::io::BufferReader>(type_buffer);
-  arrow::ipc::DictionaryMemo type_dict_memo;
-  auto type_schema_result =
-      arrow::ipc::ReadSchema(type_stream.get(), &type_dict_memo);
-  if (!type_schema_result.ok()) {
-    throw IOException("Failed to read type schema for setting '%s': %s",
-                      setting.name, type_schema_result.status().ToString());
-  }
-  auto type_schema = type_schema_result.ValueUnsafe();
-  auto arrow_type = type_schema->field(0)->type();
+	// Parse the type from the serialized schema bytes
+	auto type_bytes = row["type"].value_not_null<std::vector<uint8_t>>();
+	auto type_buffer = arrow::Buffer::Wrap(type_bytes.data(), type_bytes.size());
+	auto type_stream = std::make_shared<arrow::io::BufferReader>(type_buffer);
+	arrow::ipc::DictionaryMemo type_dict_memo;
+	auto type_schema_result = arrow::ipc::ReadSchema(type_stream.get(), &type_dict_memo);
+	if (!type_schema_result.ok()) {
+		throw IOException("Failed to read type schema for setting '%s': %s", setting.name,
+		                  type_schema_result.status().ToString());
+	}
+	auto type_schema = type_schema_result.ValueUnsafe();
+	auto arrow_type = type_schema->field(0)->type();
 
-  // Convert Arrow type to DuckDB type using the standard conversion pipeline
-  {
-    ArrowSchemaWrapper c_schema;
-    ArrowTableSchema arrow_table;
-    vector<LogicalType> types;
-    vector<string> names;
-    ArrowSchemaToDuckDBTypes(context, type_schema, c_schema, arrow_table, types,
-                             names);
-    setting.type = types[0];
-  }
+	// Convert Arrow type to DuckDB type using the standard conversion pipeline
+	{
+		ArrowSchemaWrapper c_schema;
+		ArrowTableSchema arrow_table;
+		vector<LogicalType> types;
+		vector<string> names;
+		ArrowSchemaToDuckDBTypes(context, type_schema, c_schema, arrow_table, types, names);
+		setting.type = types[0];
+	}
 
-  // Parse the default value if present
-  auto default_bytes_opt = row["default_value"].as<std::vector<uint8_t>>();
-  if (default_bytes_opt && !default_bytes_opt->empty()) {
-    auto default_batch = DeserializeFromIpcBytes(*default_bytes_opt);
-    if (default_batch && default_batch->num_rows() > 0 &&
-        default_batch->num_columns() > 0) {
-      setting.default_value =
-          ExtractArrowValue(default_batch->column(0), 0, setting.type);
-    } else {
-      setting.default_value = Value(setting.type);
-    }
-  } else {
-    setting.default_value = Value(setting.type);
-  }
+	// Parse the default value if present
+	auto default_bytes_opt = row["default_value"].as<std::vector<uint8_t>>();
+	if (default_bytes_opt && !default_bytes_opt->empty()) {
+		auto default_batch = DeserializeFromIpcBytes(*default_bytes_opt);
+		if (default_batch && default_batch->num_rows() > 0 && default_batch->num_columns() > 0) {
+			setting.default_value = ExtractArrowValue(default_batch->column(0), 0, setting.type);
+		} else {
+			setting.default_value = Value(setting.type);
+		}
+	} else {
+		setting.default_value = Value(setting.type);
+	}
 
-  return setting;
+	return setting;
 }
 
-VgiAttachOptionSpec ParseAttachOptionSpec(const std::vector<uint8_t> &bytes,
-                                          const std::string &worker_path,
+VgiAttachOptionSpec ParseAttachOptionSpec(const std::vector<uint8_t> &bytes, const std::string &worker_path,
                                           ClientContext &context) {
-  auto batch = DeserializeFromIpcBytes(bytes);
-  if (!batch || batch->num_rows() == 0) {
-    throw IOException("Empty AttachOptionSpec batch from worker: %s",
-                      worker_path);
-  }
+	auto batch = DeserializeFromIpcBytes(bytes);
+	if (!batch || batch->num_rows() == 0) {
+		throw IOException("Empty AttachOptionSpec batch from worker: %s", worker_path);
+	}
 
-  RecordBatchSingleRow row(batch, 0, "AttachOptionSpec", worker_path);
+	RecordBatchSingleRow row(batch, 0, "AttachOptionSpec", worker_path);
 
-  VgiAttachOptionSpec spec;
-  spec.name = row["name"].value_not_null<std::string>();
-  spec.description = row["description"].value_not_null<std::string>();
+	VgiAttachOptionSpec spec;
+	spec.name = row["name"].value_not_null<std::string>();
+	spec.description = row["description"].value_not_null<std::string>();
 
-  auto type_bytes = row["type"].value_not_null<std::vector<uint8_t>>();
-  auto type_buffer = arrow::Buffer::Wrap(type_bytes.data(), type_bytes.size());
-  auto type_stream = std::make_shared<arrow::io::BufferReader>(type_buffer);
-  arrow::ipc::DictionaryMemo type_dict_memo;
-  auto type_schema_result =
-      arrow::ipc::ReadSchema(type_stream.get(), &type_dict_memo);
-  if (!type_schema_result.ok()) {
-    throw IOException("Failed to read type schema for attach option '%s': %s",
-                      spec.name, type_schema_result.status().ToString());
-  }
-  auto type_schema = type_schema_result.ValueUnsafe();
+	auto type_bytes = row["type"].value_not_null<std::vector<uint8_t>>();
+	auto type_buffer = arrow::Buffer::Wrap(type_bytes.data(), type_bytes.size());
+	auto type_stream = std::make_shared<arrow::io::BufferReader>(type_buffer);
+	arrow::ipc::DictionaryMemo type_dict_memo;
+	auto type_schema_result = arrow::ipc::ReadSchema(type_stream.get(), &type_dict_memo);
+	if (!type_schema_result.ok()) {
+		throw IOException("Failed to read type schema for attach option '%s': %s", spec.name,
+		                  type_schema_result.status().ToString());
+	}
+	auto type_schema = type_schema_result.ValueUnsafe();
 
-  {
-    ArrowSchemaWrapper c_schema;
-    ArrowTableSchema arrow_table;
-    vector<LogicalType> types;
-    vector<string> names;
-    ArrowSchemaToDuckDBTypes(context, type_schema, c_schema, arrow_table, types,
-                             names);
-    spec.type = types[0];
-  }
+	{
+		ArrowSchemaWrapper c_schema;
+		ArrowTableSchema arrow_table;
+		vector<LogicalType> types;
+		vector<string> names;
+		ArrowSchemaToDuckDBTypes(context, type_schema, c_schema, arrow_table, types, names);
+		spec.type = types[0];
+	}
 
-  auto default_bytes_opt = row["default_value"].as<std::vector<uint8_t>>();
-  if (default_bytes_opt && !default_bytes_opt->empty()) {
-    auto default_batch = DeserializeFromIpcBytes(*default_bytes_opt);
-    if (default_batch && default_batch->num_rows() > 0 &&
-        default_batch->num_columns() > 0) {
-      spec.default_value =
-          ExtractArrowValue(default_batch->column(0), 0, spec.type);
-    } else {
-      spec.default_value = Value(spec.type);
-    }
-  } else {
-    spec.default_value = Value(spec.type);
-  }
+	auto default_bytes_opt = row["default_value"].as<std::vector<uint8_t>>();
+	if (default_bytes_opt && !default_bytes_opt->empty()) {
+		auto default_batch = DeserializeFromIpcBytes(*default_bytes_opt);
+		if (default_batch && default_batch->num_rows() > 0 && default_batch->num_columns() > 0) {
+			spec.default_value = ExtractArrowValue(default_batch->column(0), 0, spec.type);
+		} else {
+			spec.default_value = Value(spec.type);
+		}
+	} else {
+		spec.default_value = Value(spec.type);
+	}
 
-  // Added after the original four columns: a worker that predates it simply
-  // doesn't send the column, and value_or() reads that as "not required".
-  spec.required = row["required"].value_or(false);
+	// Added after the original four columns: a worker that predates it simply
+	// doesn't send the column, and value_or() reads that as "not required".
+	spec.required = row["required"].value_or(false);
 
-  return spec;
+	return spec;
 }
 
-VgiSecretType ParseVgiSecretType(const std::vector<uint8_t> &bytes,
-                                 const std::string &worker_path,
-                                 ClientContext &context) {
-  // Deserialize the SecretTypeSpec RecordBatch
-  auto batch = DeserializeFromIpcBytes(bytes);
-  if (!batch || batch->num_rows() == 0) {
-    throw IOException("Empty SecretTypeSpec batch from worker: %s",
-                      worker_path);
-  }
+VgiSecretType ParseVgiSecretType(const std::vector<uint8_t> &bytes, const std::string &worker_path,
+                                  ClientContext &context) {
+	// Deserialize the SecretTypeSpec RecordBatch
+	auto batch = DeserializeFromIpcBytes(bytes);
+	if (!batch || batch->num_rows() == 0) {
+		throw IOException("Empty SecretTypeSpec batch from worker: %s", worker_path);
+	}
 
-  RecordBatchSingleRow row(batch, 0, "SecretTypeSpec", worker_path);
+	RecordBatchSingleRow row(batch, 0, "SecretTypeSpec", worker_path);
 
-  VgiSecretType secret_type;
-  secret_type.name = row["name"].value_not_null<std::string>();
-  secret_type.description = row["description"].value_not_null<std::string>();
+	VgiSecretType secret_type;
+	secret_type.name = row["name"].value_not_null<std::string>();
+	secret_type.description = row["description"].value_not_null<std::string>();
 
-  // Parse the parameters schema from IPC-serialized Arrow schema bytes
-  auto schema_bytes =
-      row["parameters_schema"].value_not_null<std::vector<uint8_t>>();
-  auto schema_buffer =
-      arrow::Buffer::Wrap(schema_bytes.data(), schema_bytes.size());
-  auto schema_stream = std::make_shared<arrow::io::BufferReader>(schema_buffer);
-  arrow::ipc::DictionaryMemo dict_memo;
-  auto schema_result = arrow::ipc::ReadSchema(schema_stream.get(), &dict_memo);
-  if (!schema_result.ok()) {
-    throw IOException(
-        "Failed to read parameters schema for secret type '%s': %s",
-        secret_type.name, schema_result.status().ToString());
-  }
-  auto params_schema = schema_result.ValueUnsafe();
+	// Parse the parameters schema from IPC-serialized Arrow schema bytes
+	auto schema_bytes = row["parameters_schema"].value_not_null<std::vector<uint8_t>>();
+	auto schema_buffer = arrow::Buffer::Wrap(schema_bytes.data(), schema_bytes.size());
+	auto schema_stream = std::make_shared<arrow::io::BufferReader>(schema_buffer);
+	arrow::ipc::DictionaryMemo dict_memo;
+	auto schema_result = arrow::ipc::ReadSchema(schema_stream.get(), &dict_memo);
+	if (!schema_result.ok()) {
+		throw IOException("Failed to read parameters schema for secret type '%s': %s", secret_type.name,
+		                  schema_result.status().ToString());
+	}
+	auto params_schema = schema_result.ValueUnsafe();
 
-  // Convert Arrow schema to DuckDB types in one pass
-  ArrowSchemaWrapper c_schema;
-  ArrowTableSchema arrow_table;
-  vector<LogicalType> types;
-  vector<string> names;
-  ArrowSchemaToDuckDBTypes(context, params_schema, c_schema, arrow_table, types,
-                           names);
+	// Convert Arrow schema to DuckDB types in one pass
+	ArrowSchemaWrapper c_schema;
+	ArrowTableSchema arrow_table;
+	vector<LogicalType> types;
+	vector<string> names;
+	ArrowSchemaToDuckDBTypes(context, params_schema, c_schema, arrow_table, types, names);
 
-  // Build VgiSecretTypeParam for each field
-  for (int i = 0; i < params_schema->num_fields(); i++) {
-    VgiSecretTypeParam param;
-    param.name = names[i];
-    param.type = types[i];
+	// Build VgiSecretTypeParam for each field
+	for (int i = 0; i < params_schema->num_fields(); i++) {
+		VgiSecretTypeParam param;
+		param.name = names[i];
+		param.type = types[i];
 
-    // Check for redact metadata
-    auto field_metadata = params_schema->field(i)->metadata();
-    if (field_metadata) {
-      auto redact_idx = field_metadata->FindKey("redact");
-      if (redact_idx >= 0 && field_metadata->value(redact_idx) == "true") {
-        param.redact = true;
-      }
-    }
+		// Check for redact metadata
+		auto field_metadata = params_schema->field(i)->metadata();
+		if (field_metadata) {
+			auto redact_idx = field_metadata->FindKey("redact");
+			if (redact_idx >= 0 && field_metadata->value(redact_idx) == "true") {
+				param.redact = true;
+			}
+		}
 
-    secret_type.parameters.push_back(std::move(param));
-  }
+		secret_type.parameters.push_back(std::move(param));
+	}
 
-  return secret_type;
+	return secret_type;
 }
 
 // Parse one serialized AttachCatalogInfo (companion catalog). Fields beyond
 // alias/target are backward-compatible via value_or.
-static VgiAttachCatalogInfo
-ParseVgiAttachCatalog(const std::vector<uint8_t> &bytes,
-                      const std::string &worker_path) {
-  auto batch = DeserializeFromIpcBytes(bytes);
-  if (!batch || batch->num_rows() == 0) {
-    throw IOException("Empty AttachCatalogInfo batch from worker: %s",
-                      worker_path);
-  }
-  RecordBatchSingleRow row(batch, 0, "AttachCatalogInfo", worker_path);
-  VgiAttachCatalogInfo info;
-  info.alias = row["alias"].value_not_null<std::string>();
-  info.target = row["target"].value_not_null<std::string>();
-  info.db_type = row["db_type"].value_or(std::string(""));
-  info.options = row["options"].value_or(std::map<std::string, std::string>{});
-  info.hidden = row["hidden"].value_or(false);
-  info.required = row["required"].value_or(false);
-  info.secret_ref = row["secret_ref"].value_or(std::string(""));
-  return info;
+static VgiAttachCatalogInfo ParseVgiAttachCatalog(const std::vector<uint8_t> &bytes, const std::string &worker_path) {
+	auto batch = DeserializeFromIpcBytes(bytes);
+	if (!batch || batch->num_rows() == 0) {
+		throw IOException("Empty AttachCatalogInfo batch from worker: %s", worker_path);
+	}
+	RecordBatchSingleRow row(batch, 0, "AttachCatalogInfo", worker_path);
+	VgiAttachCatalogInfo info;
+	info.alias = row["alias"].value_not_null<std::string>();
+	info.target = row["target"].value_not_null<std::string>();
+	info.db_type = row["db_type"].value_or(std::string(""));
+	info.options = row["options"].value_or(std::map<std::string, std::string> {});
+	info.hidden = row["hidden"].value_or(false);
+	info.required = row["required"].value_or(false);
+	info.secret_ref = row["secret_ref"].value_or(std::string(""));
+	return info;
 }
 
-CatalogAttachResult
-ParseCatalogAttachResult(const std::shared_ptr<arrow::RecordBatch> &batch,
-                         const std::string &worker_path,
-                         ClientContext &context) {
-  CatalogAttachResult result;
+CatalogAttachResult ParseCatalogAttachResult(const std::shared_ptr<arrow::RecordBatch> &batch,
+                                             const std::string &worker_path, ClientContext &context) {
+	CatalogAttachResult result;
 
-  if (!batch || batch->num_rows() == 0) {
-    throw IOException("Empty response from catalog_attach");
-  }
+	if (!batch || batch->num_rows() == 0) {
+		throw IOException("Empty response from catalog_attach");
+	}
 
-  RecordBatchSingleRow row(batch, 0, "CatalogAttachResult", worker_path);
-  result.attach_opaque_data =
-      row["attach_opaque_data"].value_not_null<std::vector<uint8_t>>();
-  result.supports_transactions =
-      row["supports_transactions"].value_not_null<bool>();
-  result.supports_time_travel =
-      row["supports_time_travel"].value_not_null<bool>();
-  result.catalog_version_frozen =
-      row["catalog_version_frozen"].value_not_null<bool>();
-  result.catalog_version = row["catalog_version"].value_not_null<int64_t>();
-  result.attach_opaque_data_required =
-      row["attach_opaque_data_required"].value_not_null<bool>();
-  result.default_schema = row["default_schema"].value_not_null<std::string>();
-  if (result.default_schema.empty()) {
-    result.default_schema = "main";
-  }
+	RecordBatchSingleRow row(batch, 0, "CatalogAttachResult", worker_path);
+	result.attach_opaque_data = row["attach_opaque_data"].value_not_null<std::vector<uint8_t>>();
+	result.supports_transactions = row["supports_transactions"].value_not_null<bool>();
+	result.supports_time_travel = row["supports_time_travel"].value_not_null<bool>();
+	result.catalog_version_frozen = row["catalog_version_frozen"].value_not_null<bool>();
+	result.catalog_version = row["catalog_version"].value_not_null<int64_t>();
+	result.attach_opaque_data_required = row["attach_opaque_data_required"].value_not_null<bool>();
+	result.default_schema = row["default_schema"].value_not_null<std::string>();
+	if (result.default_schema.empty()) {
+		result.default_schema = "main";
+	}
 
-  // Parse settings list - each element is a serialized Setting
-  auto settings_bytes =
-      row["settings"].value_or(std::vector<std::vector<uint8_t>>{});
-  for (const auto &setting_bytes : settings_bytes) {
-    result.settings.push_back(
-        ParseVgiSetting(setting_bytes, worker_path, context));
-  }
+	// Parse settings list - each element is a serialized Setting
+	auto settings_bytes = row["settings"].value_or(std::vector<std::vector<uint8_t>> {});
+	for (const auto &setting_bytes : settings_bytes) {
+		result.settings.push_back(ParseVgiSetting(setting_bytes, worker_path, context));
+	}
 
-  // Parse secret_types list - each element is a serialized SecretTypeSpec
-  auto secret_types_bytes =
-      row["secret_types"].value_or(std::vector<std::vector<uint8_t>>{});
-  for (const auto &st_bytes : secret_types_bytes) {
-    result.secret_types.push_back(
-        ParseVgiSecretType(st_bytes, worker_path, context));
-  }
+	// Parse secret_types list - each element is a serialized SecretTypeSpec
+	auto secret_types_bytes = row["secret_types"].value_or(std::vector<std::vector<uint8_t>> {});
+	for (const auto &st_bytes : secret_types_bytes) {
+		result.secret_types.push_back(ParseVgiSecretType(st_bytes, worker_path, context));
+	}
 
-  // Parse companion catalogs (attach_catalogs) — backward-compatible: older
-  // workers omit the field entirely, yielding an empty list.
-  auto attach_catalogs_bytes =
-      row["attach_catalogs"].value_or(std::vector<std::vector<uint8_t>>{});
-  for (const auto &ac_bytes : attach_catalogs_bytes) {
-    result.attach_catalogs.push_back(
-        ParseVgiAttachCatalog(ac_bytes, worker_path));
-  }
+	// Parse companion catalogs (attach_catalogs) — backward-compatible: older
+	// workers omit the field entirely, yielding an empty list.
+	auto attach_catalogs_bytes = row["attach_catalogs"].value_or(std::vector<std::vector<uint8_t>> {});
+	for (const auto &ac_bytes : attach_catalogs_bytes) {
+		result.attach_catalogs.push_back(ParseVgiAttachCatalog(ac_bytes, worker_path));
+	}
 
-  // Parse optional comment and tags (backward-compatible with older workers)
-  result.comment = row["comment"].value_or(std::string(""));
-  result.tags = row["tags"].value_or(std::map<std::string, std::string>{});
+	// Parse optional comment and tags (backward-compatible with older workers)
+	result.comment = row["comment"].value_or(std::string(""));
+	result.tags = row["tags"].value_or(std::map<std::string, std::string> {});
 
-  // Parse column statistics capability flag (backward-compatible)
-  result.supports_column_statistics =
-      row["supports_column_statistics"].value_or(false);
+	// Parse column statistics capability flag (backward-compatible)
+	result.supports_column_statistics = row["supports_column_statistics"].value_or(false);
 
-  // Globally-published functions (protocol 1.3.0+). Each element is a
-  // serialized FunctionInfo; `schema_name`/`name` remain the dispatch
-  // coordinates. Backward-compatible: pre-1.3.0 workers omit the fields.
-  auto global_function_bytes =
-      row["global_functions"].value_or(std::vector<std::vector<uint8_t>>{});
-  for (const auto &gf_bytes : global_function_bytes) {
-    auto gf_batch = DeserializeFromIpcBytes(gf_bytes);
-    if (!gf_batch || gf_batch->num_rows() == 0) {
-      throw IOException(
-          "Empty global-function FunctionInfo batch from worker: %s",
-          worker_path);
-    }
-    result.global_functions.push_back(
-        ParseFunctionInfo(gf_batch, 0, worker_path));
-  }
-  result.global_function_prefix =
-      row["global_function_prefix"].value_or(std::string(""));
+	// Globally-published functions (protocol 1.3.0+). Each element is a
+	// serialized FunctionInfo; `schema_name`/`name` remain the dispatch
+	// coordinates. Backward-compatible: pre-1.3.0 workers omit the fields.
+	auto global_function_bytes = row["global_functions"].value_or(std::vector<std::vector<uint8_t>> {});
+	for (const auto &gf_bytes : global_function_bytes) {
+		auto gf_batch = DeserializeFromIpcBytes(gf_bytes);
+		if (!gf_batch || gf_batch->num_rows() == 0) {
+			throw IOException("Empty global-function FunctionInfo batch from worker: %s", worker_path);
+		}
+		result.global_functions.push_back(ParseFunctionInfo(gf_batch, 0, worker_path));
+	}
+	result.global_function_prefix = row["global_function_prefix"].value_or(std::string(""));
 
-  // Resolved versions (empty when the worker has no opinion or the request
-  // omitted a constraint)
-  result.resolved_data_version =
-      row["resolved_data_version"].value_or(std::string(""));
-  result.resolved_implementation_version =
-      row["resolved_implementation_version"].value_or(std::string(""));
+	// Resolved versions (empty when the worker has no opinion or the request
+	// omitted a constraint)
+	result.resolved_data_version = row["resolved_data_version"].value_or(std::string(""));
+	result.resolved_implementation_version = row["resolved_implementation_version"].value_or(std::string(""));
 
-  return result;
+	return result;
 }
 
-VgiSchemaInfo ParseSchemaInfo(const std::shared_ptr<arrow::RecordBatch> &batch,
-                              const std::string &worker_path) {
-  VgiSchemaInfo info;
+VgiSchemaInfo ParseSchemaInfo(const std::shared_ptr<arrow::RecordBatch> &batch, const std::string &worker_path) {
+	VgiSchemaInfo info;
 
-  if (!batch || batch->num_rows() == 0) {
-    throw IOException("Empty response from schema_get");
-  }
+	if (!batch || batch->num_rows() == 0) {
+		throw IOException("Empty response from schema_get");
+	}
 
-  RecordBatchSingleRow row(batch, 0, "SchemaInfo", worker_path);
-  info.name =
-      SchemaNameFromPath(row["path"].value_not_null<std::vector<std::string>>(),
-                         "SchemaInfo.path");
-  info.comment = row["comment"].value_or("");
-  info.tags = row["tags"].value_not_null<std::map<std::string, std::string>>();
-  // nullable map — workers may omit it entirely; downstream defaults missing
-  // keys to 1
-  info.estimated_object_count =
-      row["estimated_object_count"].value_or(std::map<std::string, int64_t>{});
+	RecordBatchSingleRow row(batch, 0, "SchemaInfo", worker_path);
+	info.name = SchemaNameFromPath(row["path"].value_not_null<std::vector<std::string>>(), "SchemaInfo.path");
+	info.comment = row["comment"].value_or("");
+	info.tags = row["tags"].value_not_null<std::map<std::string, std::string>>();
+	// nullable map — workers may omit it entirely; downstream defaults missing keys to 1
+	info.estimated_object_count = row["estimated_object_count"].value_or(std::map<std::string, int64_t>{});
 
-  return info;
+	return info;
 }
 
-VgiTableInfo ParseTableInfo(ClientContext &context,
-                            const std::shared_ptr<arrow::RecordBatch> &batch,
+VgiTableInfo ParseTableInfo(ClientContext &context, const std::shared_ptr<arrow::RecordBatch> &batch,
                             int64_t row_idx, const std::string &worker_path) {
-  VgiTableInfo info;
+	VgiTableInfo info;
 
-  if (!batch || batch->num_rows() == 0) {
-    throw IOException("Empty response from table_get");
-  }
+	if (!batch || batch->num_rows() == 0) {
+		throw IOException("Empty response from table_get");
+	}
 
-  if (row_idx >= batch->num_rows()) {
-    throw IOException("Row index %lld out of range (batch has %lld rows)",
-                      row_idx, batch->num_rows());
-  }
+	if (row_idx >= batch->num_rows()) {
+		throw IOException("Row index %lld out of range (batch has %lld rows)", row_idx, batch->num_rows());
+	}
 
-  RecordBatchSingleRow row(batch, row_idx, "TableInfo", worker_path);
-  info.name = row["name"].value_not_null<std::string>();
-  info.schema_name = SchemaNameFromPath(
-      row["schema_path"].value_not_null<std::vector<std::string>>(),
-      "TableInfo.schema_path");
-  info.comment = row["comment"].value_or("");
-  info.tags = row["tags"].value_not_null<std::map<std::string, std::string>>();
+	RecordBatchSingleRow row(batch, row_idx, "TableInfo", worker_path);
+	info.name = row["name"].value_not_null<std::string>();
+	info.schema_name =
+	    SchemaNameFromPath(row["schema_path"].value_not_null<std::vector<std::string>>(), "TableInfo.schema_path");
+	info.comment = row["comment"].value_or("");
+	info.tags = row["tags"].value_not_null<std::map<std::string, std::string>>();
 
-  // Parse the columns field which contains a serialized Arrow schema
-  auto columns_data = row["columns"].value_not_null<std::vector<uint8_t>>();
-  info.arrow_schema = DeserializeSchema(columns_data);
+	// Parse the columns field which contains a serialized Arrow schema
+	auto columns_data = row["columns"].value_not_null<std::vector<uint8_t>>();
+	info.arrow_schema = DeserializeSchema(columns_data);
 
-  // Detect is_row_id field metadata
-  for (int i = 0; i < info.arrow_schema->num_fields(); i++) {
-    auto &field = info.arrow_schema->field(i);
-    if (field->HasMetadata() &&
-        field->metadata()->FindKey(VGI_ROW_ID_METADATA_KEY) >= 0) {
-      if (info.row_id_column >= 0) {
-        throw InvalidInputException("Table '%s' has multiple is_row_id columns "
-                                    "— at most one is allowed",
-                                    info.name);
-      }
-      info.row_id_column = i;
-    }
-  }
+	// Detect is_row_id field metadata
+	for (int i = 0; i < info.arrow_schema->num_fields(); i++) {
+		auto &field = info.arrow_schema->field(i);
+		if (field->HasMetadata() && field->metadata()->FindKey(VGI_ROW_ID_METADATA_KEY) >= 0) {
+			if (info.row_id_column >= 0) {
+				throw InvalidInputException("Table '%s' has multiple is_row_id columns — at most one is allowed",
+				                            info.name);
+			}
+			info.row_id_column = i;
+		}
+	}
 
-  // Parse constraints (non-nullable arrays per protocol)
-  auto not_null =
-      row["not_null_constraints"].value_not_null<std::vector<int32_t>>();
-  info.not_null_constraints =
-      std::vector<int>(not_null.begin(), not_null.end());
-  auto unique = row["unique_constraints"]
-                    .value_not_null<std::vector<std::vector<int32_t>>>();
-  for (const auto &u : unique) {
-    info.unique_constraints.push_back(std::vector<int>(u.begin(), u.end()));
-  }
-  info.check_constraints =
-      row["check_constraints"].value_not_null<std::vector<std::string>>();
+	// Parse constraints (non-nullable arrays per protocol)
+	auto not_null = row["not_null_constraints"].value_not_null<std::vector<int32_t>>();
+	info.not_null_constraints = std::vector<int>(not_null.begin(), not_null.end());
+	auto unique = row["unique_constraints"].value_not_null<std::vector<std::vector<int32_t>>>();
+	for (const auto &u : unique) {
+		info.unique_constraints.push_back(std::vector<int>(u.begin(), u.end()));
+	}
+	info.check_constraints = row["check_constraints"].value_not_null<std::vector<std::string>>();
 
-  // Parse primary_key_constraints (optional, backward-compatible)
-  auto pk = row["primary_key_constraints"].value_or(
-      std::vector<std::vector<int32_t>>{});
-  for (const auto &p : pk) {
-    info.primary_key_constraints.push_back(
-        std::vector<int>(p.begin(), p.end()));
-  }
+	// Parse primary_key_constraints (optional, backward-compatible)
+	auto pk = row["primary_key_constraints"].value_or(std::vector<std::vector<int32_t>>{});
+	for (const auto &p : pk) {
+		info.primary_key_constraints.push_back(std::vector<int>(p.begin(), p.end()));
+	}
 
-  // Parse foreign_key_constraints (optional, backward-compatible)
-  // Each element is IPC-serialized bytes containing fk_columns, pk_columns,
-  // referenced_table, referenced_schema_path
-  auto fk_bytes_list = row["foreign_key_constraints"].value_or(
-      std::vector<std::vector<uint8_t>>{});
-  for (const auto &fk_bytes : fk_bytes_list) {
-    auto fk_batch = DeserializeFromIpcBytes(fk_bytes);
-    if (!fk_batch || fk_batch->num_rows() == 0) {
-      continue;
-    }
-    RecordBatchSingleRow fk_row(fk_batch, 0, "ForeignKeyInfo", worker_path);
+	// Parse foreign_key_constraints (optional, backward-compatible)
+	// Each element is IPC-serialized bytes containing fk_columns, pk_columns,
+	// referenced_table, referenced_schema_path
+	auto fk_bytes_list = row["foreign_key_constraints"].value_or(std::vector<std::vector<uint8_t>>{});
+	for (const auto &fk_bytes : fk_bytes_list) {
+		auto fk_batch = DeserializeFromIpcBytes(fk_bytes);
+		if (!fk_batch || fk_batch->num_rows() == 0) {
+			continue;
+		}
+		RecordBatchSingleRow fk_row(fk_batch, 0, "ForeignKeyInfo", worker_path);
 
-    VgiTableInfo::ForeignKey fk;
-    fk.fk_columns =
-        fk_row["fk_columns"].value_not_null<std::vector<std::string>>();
-    fk.pk_columns =
-        fk_row["pk_columns"].value_not_null<std::vector<std::string>>();
-    fk.referenced_table =
-        fk_row["referenced_table"].value_not_null<std::string>();
-    fk.referenced_schema =
-        SchemaNameFromPath(fk_row["referenced_schema_path"]
-                               .value_not_null<std::vector<std::string>>(),
-                           "ForeignKeyDef.referenced_schema_path");
-    info.foreign_key_constraints.push_back(std::move(fk));
-  }
+		VgiTableInfo::ForeignKey fk;
+		fk.fk_columns = fk_row["fk_columns"].value_not_null<std::vector<std::string>>();
+		fk.pk_columns = fk_row["pk_columns"].value_not_null<std::vector<std::string>>();
+		fk.referenced_table = fk_row["referenced_table"].value_not_null<std::string>();
+		fk.referenced_schema =
+		    SchemaNameFromPath(fk_row["referenced_schema_path"].value_not_null<std::vector<std::string>>(),
+		                       "ForeignKeyDef.referenced_schema_path");
+		info.foreign_key_constraints.push_back(std::move(fk));
+	}
 
-  // Parse write support flags (optional, backward-compatible with old workers)
-  info.supports_insert = row["supports_insert"].value_or(false);
-  info.supports_update = row["supports_update"].value_or(false);
-  info.supports_delete = row["supports_delete"].value_or(false);
-  // Workers must opt in: defaults to false so a worker that supports
-  // INSERT/UPDATE/DELETE but never wired up RETURNING handling doesn't get
-  // surprised by a planner that sends RETURNING through.
-  info.supports_returning = row["supports_returning"].value_or(false);
+	// Parse write support flags (optional, backward-compatible with old workers)
+	info.supports_insert = row["supports_insert"].value_or(false);
+	info.supports_update = row["supports_update"].value_or(false);
+	info.supports_delete = row["supports_delete"].value_or(false);
+	// Workers must opt in: defaults to false so a worker that supports
+	// INSERT/UPDATE/DELETE but never wired up RETURNING handling doesn't get
+	// surprised by a planner that sends RETURNING through.
+	info.supports_returning = row["supports_returning"].value_or(false);
 
-  // Parse column statistics capability flag (backward-compatible)
-  info.supports_column_statistics =
-      row["supports_column_statistics"].value_or(false);
+	// Parse column statistics capability flag (backward-compatible)
+	info.supports_column_statistics = row["supports_column_statistics"].value_or(false);
 
-  // Parse optional inlined function-discovery results (backward-compatible).
-  // When present, the extension uses these directly and skips the
-  // corresponding catalog_table_*_function_get RPC.
-  auto decode_inlined =
-      [&](const char *field_name) -> std::optional<VgiScanFunctionResult> {
-    auto bytes = row[field_name].value_or(std::vector<uint8_t>{});
-    if (bytes.empty()) {
-      return std::nullopt;
-    }
-    auto sf_batch = DeserializeFromIpcBytes(bytes);
-    if (!sf_batch || sf_batch->num_rows() == 0) {
-      return std::nullopt;
-    }
-    return ParseScanFunctionResult(context, sf_batch, worker_path);
-  };
-  info.scan_function = decode_inlined("scan_function");
-  info.insert_function = decode_inlined("insert_function");
-  info.update_function = decode_inlined("update_function");
-  info.delete_function = decode_inlined("delete_function");
+	// Parse optional inlined function-discovery results (backward-compatible).
+	// When present, the extension uses these directly and skips the
+	// corresponding catalog_table_*_function_get RPC.
+	auto decode_inlined = [&](const char *field_name) -> std::optional<VgiScanFunctionResult> {
+		auto bytes = row[field_name].value_or(std::vector<uint8_t>{});
+		if (bytes.empty()) {
+			return std::nullopt;
+		}
+		auto sf_batch = DeserializeFromIpcBytes(bytes);
+		if (!sf_batch || sf_batch->num_rows() == 0) {
+			return std::nullopt;
+		}
+		return ParseScanFunctionResult(context, sf_batch, worker_path);
+	};
+	info.scan_function = decode_inlined("scan_function");
+	info.insert_function = decode_inlined("insert_function");
+	info.update_function = decode_inlined("update_function");
+	info.delete_function = decode_inlined("delete_function");
 
-  // Parse optional inlined cardinality (backward-compatible). When present,
-  // the extension uses these values instead of firing the per-bind
-  // table_function_cardinality RPC.
-  info.cardinality_estimate = row["cardinality_estimate"].as<int64_t>();
-  info.cardinality_max = row["cardinality_max"].as<int64_t>();
+	// Parse optional inlined cardinality (backward-compatible). When present,
+	// the extension uses these values instead of firing the per-bind
+	// table_function_cardinality RPC.
+	info.cardinality_estimate = row["cardinality_estimate"].as<int64_t>();
+	info.cardinality_max = row["cardinality_max"].as<int64_t>();
 
-  // Parse optional inlined column statistics (backward-compatible). The
-  // bytes are the IPC payload of `serialize_column_statistics` from the
-  // worker — same wire shape as the on-demand
-  // catalog_table_column_statistics_get RPC's response. We hold the raw bytes
-  // here and let VgiTableEntry::GetStatistics deserialize lazily on first call
-  // (it has a ClientContext &; this code path doesn't).
-  {
-    auto stats_bytes =
-        row["column_statistics"].value_or(std::vector<uint8_t>{});
-    info.column_statistics = stats_bytes.empty()
-                                 ? std::nullopt
-                                 : std::make_optional(std::move(stats_bytes));
-  }
+	// Parse optional inlined column statistics (backward-compatible). The
+	// bytes are the IPC payload of `serialize_column_statistics` from the
+	// worker — same wire shape as the on-demand catalog_table_column_statistics_get
+	// RPC's response. We hold the raw bytes here and let
+	// VgiTableEntry::GetStatistics deserialize lazily on first call (it has a
+	// ClientContext &; this code path doesn't).
+	{
+		auto stats_bytes = row["column_statistics"].value_or(std::vector<uint8_t>{});
+		info.column_statistics =
+		    stats_bytes.empty() ? std::nullopt : std::make_optional(std::move(stats_bytes));
+	}
 
-  // Parse optional inlined bind result (backward-compatible). The bytes
-  // are the IPC payload of `BindResponse.serialize_to_bytes()` — same wire
-  // shape a worker's `bind` RPC returns. PerformVgiTableFunctionBind
-  // short-circuits when this is set and feeds the bytes through
-  // `BuildBindResultFromInlinedBytes`.
-  {
-    auto bind_bytes = row["bind_result"].value_or(std::vector<uint8_t>{});
-    info.bind_result = bind_bytes.empty()
-                           ? std::nullopt
-                           : std::make_optional(std::move(bind_bytes));
-  }
+	// Parse optional inlined bind result (backward-compatible). The bytes
+	// are the IPC payload of `BindResponse.serialize_to_bytes()` — same wire
+	// shape a worker's `bind` RPC returns. PerformVgiTableFunctionBind
+	// short-circuits when this is set and feeds the bytes through
+	// `BuildBindResultFromInlinedBytes`.
+	{
+		auto bind_bytes = row["bind_result"].value_or(std::vector<uint8_t>{});
+		info.bind_result =
+		    bind_bytes.empty() ? std::nullopt : std::make_optional(std::move(bind_bytes));
+	}
 
-  // Parse required_filters (optional — missing column or empty list means no
-  // enforcement). CNF: an AND (outer) of OR-groups (inner) of dotted paths.
-  // The optimizer extension VgiRequiredFiltersOptimizer reads these from the
-  // cached VgiTableInfo at bind/optimize time.
-  info.required_filters =
-      row["required_filters"].value_or(std::vector<std::vector<std::string>>{});
+	// Parse required_filters (optional — missing column or empty list means no
+	// enforcement). CNF: an AND (outer) of OR-groups (inner) of dotted paths.
+	// The optimizer extension VgiRequiredFiltersOptimizer reads these from the
+	// cached VgiTableInfo at bind/optimize time.
+	info.required_filters =
+	    row["required_filters"].value_or(std::vector<std::vector<std::string>>{});
 
-  // Validate: UPDATE/DELETE require a row ID column
-  if ((info.supports_update || info.supports_delete) &&
-      info.row_id_column < 0) {
-    throw InvalidInputException(
-        "Table '%s' declares update/delete support but has no row ID column "
-        "(mark a column with is_row_id metadata)",
-        info.name);
-  }
+	// Validate: UPDATE/DELETE require a row ID column
+	if ((info.supports_update || info.supports_delete) && info.row_id_column < 0) {
+		throw InvalidInputException(
+		    "Table '%s' declares update/delete support but has no row ID column "
+		    "(mark a column with is_row_id metadata)",
+		    info.name);
+	}
 
-  return info;
+	return info;
 }
 
-VgiTableInfo ParseTableInfo(ClientContext &context,
-                            const std::shared_ptr<arrow::RecordBatch> &batch,
+VgiTableInfo ParseTableInfo(ClientContext &context, const std::shared_ptr<arrow::RecordBatch> &batch,
                             const std::string &worker_path) {
-  return ParseTableInfo(context, batch, 0, worker_path);
+	return ParseTableInfo(context, batch, 0, worker_path);
 }
 
-std::vector<VgiSchemaInfo>
-ParseSchemaList(const std::shared_ptr<arrow::RecordBatch> &batch,
-                const std::string &worker_path) {
-  std::vector<VgiSchemaInfo> schemas;
+std::vector<VgiSchemaInfo> ParseSchemaList(const std::shared_ptr<arrow::RecordBatch> &batch,
+                                           const std::string &worker_path) {
+	std::vector<VgiSchemaInfo> schemas;
 
-  if (!batch || batch->num_rows() == 0) {
-    return schemas;
-  }
+	if (!batch || batch->num_rows() == 0) {
+		return schemas;
+	}
 
-  for (int64_t i = 0; i < batch->num_rows(); i++) {
-    RecordBatchSingleRow row(batch, i, "SchemaInfo", worker_path);
-    VgiSchemaInfo info;
-    info.name = SchemaNameFromPath(
-        row["path"].value_not_null<std::vector<std::string>>(),
-        "SchemaInfo.path");
-    info.comment = row["comment"].value_or("");
-    info.tags =
-        row["tags"].value_not_null<std::map<std::string, std::string>>();
-    schemas.push_back(std::move(info));
-  }
+	for (int64_t i = 0; i < batch->num_rows(); i++) {
+		RecordBatchSingleRow row(batch, i, "SchemaInfo", worker_path);
+		VgiSchemaInfo info;
+		info.name = SchemaNameFromPath(row["path"].value_not_null<std::vector<std::string>>(), "SchemaInfo.path");
+		info.comment = row["comment"].value_or("");
+		info.tags = row["tags"].value_not_null<std::map<std::string, std::string>>();
+		schemas.push_back(std::move(info));
+	}
 
-  return schemas;
+	return schemas;
 }
 
-VgiViewInfo ParseViewInfo(const std::shared_ptr<arrow::RecordBatch> &batch,
-                          const std::string &worker_path) {
-  VgiViewInfo info;
+VgiViewInfo ParseViewInfo(const std::shared_ptr<arrow::RecordBatch> &batch, const std::string &worker_path) {
+	VgiViewInfo info;
 
-  if (!batch || batch->num_rows() == 0) {
-    throw IOException("Empty response from view_get");
-  }
+	if (!batch || batch->num_rows() == 0) {
+		throw IOException("Empty response from view_get");
+	}
 
-  RecordBatchSingleRow row(batch, 0, "ViewInfo", worker_path);
-  info.name = row["name"].value_not_null<std::string>();
-  info.schema_name = SchemaNameFromPath(
-      row["schema_path"].value_not_null<std::vector<std::string>>(),
-      "ViewInfo.schema_path");
-  info.definition = row["definition"].value_not_null<std::string>();
-  info.comment = row["comment"].value_or("");
-  info.tags = row["tags"].value_not_null<std::map<std::string, std::string>>();
-  info.column_comments =
-      row["column_comments"]
-          .value_not_null<std::map<std::string, std::string>>();
+	RecordBatchSingleRow row(batch, 0, "ViewInfo", worker_path);
+	info.name = row["name"].value_not_null<std::string>();
+	info.schema_name =
+	    SchemaNameFromPath(row["schema_path"].value_not_null<std::vector<std::string>>(), "ViewInfo.schema_path");
+	info.definition = row["definition"].value_not_null<std::string>();
+	info.comment = row["comment"].value_or("");
+	info.tags = row["tags"].value_not_null<std::map<std::string, std::string>>();
+	info.column_comments = row["column_comments"].value_not_null<std::map<std::string, std::string>>();
 
-  return info;
+	return info;
 }
 
-VgiCopyFromFormatInfo
-ParseCopyFromFormatInfo(const std::shared_ptr<arrow::RecordBatch> &batch,
-                        const std::string &worker_path) {
-  VgiCopyFromFormatInfo info;
+VgiCopyFromFormatInfo ParseCopyFromFormatInfo(const std::shared_ptr<arrow::RecordBatch> &batch,
+                                              const std::string &worker_path) {
+	VgiCopyFromFormatInfo info;
 
-  if (!batch || batch->num_rows() == 0) {
-    throw IOException(
-        "Empty response from catalog_copy_from_formats [worker: %s]",
-        worker_path);
-  }
+	if (!batch || batch->num_rows() == 0) {
+		throw IOException("Empty response from catalog_copy_from_formats [worker: %s]", worker_path);
+	}
 
-  RecordBatchSingleRow row(batch, 0, "CopyFromFormatInfo", worker_path);
-  info.format_name = row["format_name"].value_not_null<std::string>();
-  info.handler = row["handler"].value_not_null<std::string>();
-  info.direction = row["direction"].value_or(std::string("from"));
-  info.ordered = row["ordered"].value_or(false);
-  info.description = row["description"].value_or("");
-  if (auto comment = row["comment"].as<std::string>()) {
-    info.comment = *comment;
-  }
-  info.tags = row["tags"].value_not_null<std::map<std::string, std::string>>();
+	RecordBatchSingleRow row(batch, 0, "CopyFromFormatInfo", worker_path);
+	info.format_name = row["format_name"].value_not_null<std::string>();
+	info.handler = row["handler"].value_not_null<std::string>();
+	info.direction = row["direction"].value_or(std::string("from"));
+	info.ordered = row["ordered"].value_or(false);
+	info.description = row["description"].value_or("");
+	if (auto comment = row["comment"].as<std::string>()) {
+		info.comment = *comment;
+	}
+	info.tags = row["tags"].value_not_null<std::map<std::string, std::string>>();
 
-  // options: serialized Arrow schema (the handler's arg schema). Non-nullable
-  // per protocol but may be an empty (zero-field) schema when no options.
-  auto options_data = row["options"].value_not_null<std::vector<uint8_t>>();
-  if (!options_data.empty()) {
-    info.options_schema = DeserializeSchema(options_data);
-  }
+	// options: serialized Arrow schema (the handler's arg schema). Non-nullable
+	// per protocol but may be an empty (zero-field) schema when no options.
+	auto options_data = row["options"].value_not_null<std::vector<uint8_t>>();
+	if (!options_data.empty()) {
+		info.options_schema = DeserializeSchema(options_data);
+	}
 
-  return info;
+	return info;
 }
 
-VgiMacroInfo ParseMacroInfo(const std::shared_ptr<arrow::RecordBatch> &batch,
-                            const std::string &worker_path) {
-  VgiMacroInfo info;
+VgiMacroInfo ParseMacroInfo(const std::shared_ptr<arrow::RecordBatch> &batch, const std::string &worker_path) {
+	VgiMacroInfo info;
 
-  if (!batch || batch->num_rows() == 0) {
-    throw IOException("Empty response from macro_get");
-  }
+	if (!batch || batch->num_rows() == 0) {
+		throw IOException("Empty response from macro_get");
+	}
 
-  RecordBatchSingleRow row(batch, 0, "MacroInfo", worker_path);
-  info.name = row["name"].value_not_null<std::string>();
-  info.schema_name = SchemaNameFromPath(
-      row["schema_path"].value_not_null<std::vector<std::string>>(),
-      "MacroInfo.schema_path");
-  info.macro_type = row["macro_type"].value_not_null<std::string>();
-  info.definition = row["definition"].value_not_null<std::string>();
-  info.comment = row["comment"].value_or("");
-  info.tags = row["tags"].value_not_null<std::map<std::string, std::string>>();
-  info.parameters =
-      row["parameters"].value_not_null<std::vector<std::string>>();
+	RecordBatchSingleRow row(batch, 0, "MacroInfo", worker_path);
+	info.name = row["name"].value_not_null<std::string>();
+	info.schema_name =
+	    SchemaNameFromPath(row["schema_path"].value_not_null<std::vector<std::string>>(), "MacroInfo.schema_path");
+	info.macro_type = row["macro_type"].value_not_null<std::string>();
+	info.definition = row["definition"].value_not_null<std::string>();
+	info.comment = row["comment"].value_or("");
+	info.tags = row["tags"].value_not_null<std::map<std::string, std::string>>();
+	info.parameters = row["parameters"].value_not_null<std::vector<std::string>>();
 
-  // parameter_default_values is nullable binary (IPC bytes)
-  auto default_bytes =
-      row["parameter_default_values"].as<std::vector<uint8_t>>();
-  if (default_bytes && !default_bytes->empty()) {
-    info.parameter_default_values_bytes = std::move(*default_bytes);
-  }
+	// parameter_default_values is nullable binary (IPC bytes)
+	auto default_bytes = row["parameter_default_values"].as<std::vector<uint8_t>>();
+	if (default_bytes && !default_bytes->empty()) {
+		info.parameter_default_values_bytes = std::move(*default_bytes);
+	}
 
-  // arguments_schema is an additive binary (IPC schema bytes) carrying per-
-  // parameter docs via vgi_doc field metadata. Absent on older workers — guard
-  // on the column existing so we stay compatible with pre-feature listings.
-  if (batch->schema()->GetFieldByName("arguments_schema")) {
-    auto args_bytes = row["arguments_schema"].as<std::vector<uint8_t>>();
-    if (args_bytes && !args_bytes->empty()) {
-      info.arguments_schema = DeserializeSchema(*args_bytes);
-    }
-  }
+	// arguments_schema is an additive binary (IPC schema bytes) carrying per-
+	// parameter docs via vgi_doc field metadata. Absent on older workers — guard
+	// on the column existing so we stay compatible with pre-feature listings.
+	if (batch->schema()->GetFieldByName("arguments_schema")) {
+		auto args_bytes = row["arguments_schema"].as<std::vector<uint8_t>>();
+		if (args_bytes && !args_bytes->empty()) {
+			info.arguments_schema = DeserializeSchema(*args_bytes);
+		}
+	}
 
-  return info;
+	return info;
 }
 
 // Shared helper: decode the nested-IPC argument batch (the "arguments" binary
-// field on both ScanFunctionResult and ScanBranch) into positional+named
-// Values. Field names matching ``arg_<N>`` are routed to positional slot N;
-// everything else becomes a named argument.
+// field on both ScanFunctionResult and ScanBranch) into positional+named Values.
+// Field names matching ``arg_<N>`` are routed to positional slot N; everything
+// else becomes a named argument.
 static void DecodeScanArguments(ClientContext &context,
                                 const std::vector<uint8_t> &arguments_bytes,
                                 duckdb::vector<Value> &positional_out,
                                 std::map<std::string, Value> &named_out) {
-  if (arguments_bytes.empty()) {
-    return;
-  }
-  auto arguments_batch = DeserializeFromIpcBytes(arguments_bytes);
-  if (!arguments_batch || arguments_batch->num_rows() == 0) {
-    return;
-  }
-  auto values = ArrowBatchToValues(context, arguments_batch);
-  auto &schema = arguments_batch->schema();
-  for (int i = 0; i < schema->num_fields(); i++) {
-    const auto &field_name = schema->field(i)->name();
-    auto &duck_value = values[i];
-    if (field_name.rfind("arg_", 0) == 0) {
-      // Cap to a sane ceiling: a worker-supplied index is used to size the
-      // positional vector, so an unbounded value (e.g. "arg_9999999999")
-      // would force a multi-GB allocation. >1000 positional args to a
-      // single function is not a real workload — treat it as a protocol
-      // error rather than honoring the resize.
-      constexpr size_t kMaxPositionalArgs = 1000;
-      size_t idx;
-      bool is_positional = false;
-      try {
-        idx = std::stoul(field_name.substr(4));
-        is_positional = true;
-      } catch (const std::exception &) {
-        // Not a numeric arg_<N> suffix — fall through to named handling.
-        named_out[field_name] = duck_value;
-      }
-      if (is_positional) {
-        if (idx >= kMaxPositionalArgs) {
-          throw IOException(
-              "VGI: positional argument index %llu exceeds maximum of %llu",
-              (unsigned long long)idx, (unsigned long long)kMaxPositionalArgs);
-        }
-        if (idx >= positional_out.size()) {
-          positional_out.resize(idx + 1);
-        }
-        positional_out[idx] = duck_value;
-      }
-    } else {
-      named_out[field_name] = duck_value;
-    }
-  }
+	if (arguments_bytes.empty()) {
+		return;
+	}
+	auto arguments_batch = DeserializeFromIpcBytes(arguments_bytes);
+	if (!arguments_batch || arguments_batch->num_rows() == 0) {
+		return;
+	}
+	auto values = ArrowBatchToValues(context, arguments_batch);
+	auto &schema = arguments_batch->schema();
+	for (int i = 0; i < schema->num_fields(); i++) {
+		const auto &field_name = schema->field(i)->name();
+		auto &duck_value = values[i];
+		if (field_name.rfind("arg_", 0) == 0) {
+			// Cap to a sane ceiling: a worker-supplied index is used to size the
+			// positional vector, so an unbounded value (e.g. "arg_9999999999")
+			// would force a multi-GB allocation. >1000 positional args to a
+			// single function is not a real workload — treat it as a protocol
+			// error rather than honoring the resize.
+			constexpr size_t kMaxPositionalArgs = 1000;
+			size_t idx;
+			bool is_positional = false;
+			try {
+				idx = std::stoul(field_name.substr(4));
+				is_positional = true;
+			} catch (const std::exception &) {
+				// Not a numeric arg_<N> suffix — fall through to named handling.
+				named_out[field_name] = duck_value;
+			}
+			if (is_positional) {
+				if (idx >= kMaxPositionalArgs) {
+					throw IOException("VGI: positional argument index %llu exceeds maximum of %llu",
+					                  (unsigned long long)idx, (unsigned long long)kMaxPositionalArgs);
+				}
+				if (idx >= positional_out.size()) {
+					positional_out.resize(idx + 1);
+				}
+				positional_out[idx] = duck_value;
+			}
+		} else {
+			named_out[field_name] = duck_value;
+		}
+	}
 }
 
-VgiScanFunctionResult
-ParseScanFunctionResult(ClientContext &context,
-                        const std::shared_ptr<arrow::RecordBatch> &batch,
-                        const std::string &worker_path) {
-  VgiScanFunctionResult result;
+VgiScanFunctionResult ParseScanFunctionResult(ClientContext &context, const std::shared_ptr<arrow::RecordBatch> &batch,
+                                               const std::string &worker_path) {
+	VgiScanFunctionResult result;
 
-  if (!batch || batch->num_rows() == 0) {
-    throw IOException("Empty response from table_scan_function_get");
-  }
+	if (!batch || batch->num_rows() == 0) {
+		throw IOException("Empty response from table_scan_function_get");
+	}
 
-  RecordBatchSingleRow row(batch, 0, "ScanFunctionResult", worker_path);
+	RecordBatchSingleRow row(batch, 0, "ScanFunctionResult", worker_path);
 
-  // Get function_name (required, non-nullable)
-  result.function_name = row["function_name"].value_not_null<std::string>();
+	// Get function_name (required, non-nullable)
+	result.function_name = row["function_name"].value_not_null<std::string>();
 
-  // Get required_extensions (required, non-nullable list<string>)
-  result.required_extensions =
-      row["required_extensions"].value_or(std::vector<std::string>{});
+	// Get required_extensions (required, non-nullable list<string>)
+	result.required_extensions = row["required_extensions"].value_or(std::vector<std::string> {});
 
-  // Get arguments as binary and deserialize the nested IPC batch
-  auto arguments_bytes =
-      row["arguments"].value_not_null<std::vector<uint8_t>>();
-  DecodeScanArguments(context, arguments_bytes, result.positional_arguments,
-                      result.named_arguments);
+	// Get arguments as binary and deserialize the nested IPC batch
+	auto arguments_bytes = row["arguments"].value_not_null<std::vector<uint8_t>>();
+	DecodeScanArguments(context, arguments_bytes, result.positional_arguments, result.named_arguments);
 
-  result.schema_name = OptionalSchemaNameFromPath(
-      row["schema_path"].as<std::vector<std::string>>(),
-      "ScanFunctionResult.schema_path");
+	result.schema_name =
+	    OptionalSchemaNameFromPath(row["schema_path"].as<std::vector<std::string>>(), "ScanFunctionResult.schema_path");
 
-  return result;
+	return result;
 }
 
 // Parse the result of catalog_table_scan_branches_get. The outer batch is a
@@ -2778,196 +2496,174 @@ ParseScanFunctionResult(ClientContext &context,
 // We do NOT bind the expression here; binding happens in the rewriter where
 // a Binder + the branch's column list are in hand. See plan: §C++ wiring
 // sketch "branch_filter parse-at-attach, re-bind-per-rewrite, no bound cache".
-VgiScanBranchesResult
-ParseScanBranchesResult(ClientContext &context,
-                        const std::shared_ptr<arrow::RecordBatch> &batch,
-                        const std::string &worker_path) {
-  VgiScanBranchesResult result;
+VgiScanBranchesResult ParseScanBranchesResult(ClientContext &context,
+                                               const std::shared_ptr<arrow::RecordBatch> &batch,
+                                               const std::string &worker_path) {
+	VgiScanBranchesResult result;
 
-  if (!batch || batch->num_rows() == 0) {
-    throw IOException("Empty response from table_scan_branches_get [worker: " +
-                      worker_path + "]");
-  }
+	if (!batch || batch->num_rows() == 0) {
+		throw IOException("Empty response from table_scan_branches_get [worker: " + worker_path + "]");
+	}
 
-  RecordBatchSingleRow row(batch, 0, "ScanBranchesResult", worker_path);
+	RecordBatchSingleRow row(batch, 0, "ScanBranchesResult", worker_path);
 
-  // Top-level required_extensions (union across branches; hoisted from
-  // the per-branch shape that ScanFunctionResult used).
-  result.required_extensions =
-      row["required_extensions"].value_or(std::vector<std::string>{});
+	// Top-level required_extensions (union across branches; hoisted from
+	// the per-branch shape that ScanFunctionResult used).
+	result.required_extensions = row["required_extensions"].value_or(std::vector<std::string> {});
 
-  // branches is a list<binary>; each element is the IPC bytes of a 1-row
-  // ScanBranch batch. The Python-side serialiser produced these via
-  // `[branch.serialize() for branch in self.branches]`.
-  auto branch_blobs =
-      row["branches"].value_not_null<std::vector<std::vector<uint8_t>>>();
-  if (branch_blobs.empty()) {
-    // Loud-fail at parse time — workers must return at least one branch.
-    // Catches "worker bug returned empty" before silent zero-row queries.
-    throw BinderException(
-        "VGI table returned zero scan branches [worker: " + worker_path + "]");
-  }
+	// branches is a list<binary>; each element is the IPC bytes of a 1-row
+	// ScanBranch batch. The Python-side serialiser produced these via
+	// `[branch.serialize() for branch in self.branches]`.
+	auto branch_blobs = row["branches"].value_not_null<std::vector<std::vector<uint8_t>>>();
+	if (branch_blobs.empty()) {
+		// Loud-fail at parse time — workers must return at least one branch.
+		// Catches "worker bug returned empty" before silent zero-row queries.
+		throw BinderException("VGI table returned zero scan branches [worker: " + worker_path + "]");
+	}
 
-  result.branches.reserve(branch_blobs.size());
-  std::vector<size_t> writable_ordinals;
-  for (size_t i = 0; i < branch_blobs.size(); i++) {
-    auto branch_batch = DeserializeFromIpcBytes(branch_blobs[i]);
-    if (!branch_batch || branch_batch->num_rows() == 0) {
-      throw IOException("ScanBranch #" + std::to_string(i) +
-                        " is empty [worker: " + worker_path + "]");
-    }
-    RecordBatchSingleRow branch_row(branch_batch, 0, "ScanBranch", worker_path);
+	result.branches.reserve(branch_blobs.size());
+	std::vector<size_t> writable_ordinals;
+	for (size_t i = 0; i < branch_blobs.size(); i++) {
+		auto branch_batch = DeserializeFromIpcBytes(branch_blobs[i]);
+		if (!branch_batch || branch_batch->num_rows() == 0) {
+			throw IOException("ScanBranch #" + std::to_string(i) + " is empty [worker: " + worker_path + "]");
+		}
+		RecordBatchSingleRow branch_row(branch_batch, 0, "ScanBranch", worker_path);
 
-    VgiScanBranch branch;
-    branch.function_name =
-        branch_row["function_name"].value_not_null<std::string>();
+		VgiScanBranch branch;
+		branch.function_name = branch_row["function_name"].value_not_null<std::string>();
 
-    auto arguments_bytes =
-        branch_row["arguments"].value_not_null<std::vector<uint8_t>>();
-    DecodeScanArguments(context, arguments_bytes, branch.positional_arguments,
-                        branch.named_arguments);
+		auto arguments_bytes = branch_row["arguments"].value_not_null<std::vector<uint8_t>>();
+		DecodeScanArguments(context, arguments_bytes, branch.positional_arguments, branch.named_arguments);
 
-    // branch_filter is nullable; absent / NULL → empty string == unconstrained.
-    auto filter_opt = branch_row["branch_filter"].value_or(std::string{});
-    branch.branch_filter = filter_opt;
-    if (!branch.branch_filter.empty()) {
-      try {
-        auto exprs = Parser::ParseExpressionList(branch.branch_filter);
-        if (exprs.empty()) {
-          throw BinderException(
-              "VGI branch_filter parsed to no expressions [worker: " +
-              worker_path + ", filter: " + branch.branch_filter + "]");
-        }
-        // If the worker supplied multiple comma-separated expressions,
-        // AND them together. (Single expression is the typical case.)
-        branch.parsed_branch_filter = std::move(exprs[0]);
-        // Multi-expression case: leave as a single expression by AND-ing.
-        // Skipped here for simplicity — typical worker emits one
-        // predicate; multi-AND can be added if it shows up in practice.
-      } catch (const std::exception &e) {
-        throw BinderException(
-            "VGI branch_filter parse error [worker: " + worker_path +
-            ", filter: " + branch.branch_filter + "]: " + e.what());
-      }
-    }
+		// branch_filter is nullable; absent / NULL → empty string == unconstrained.
+		auto filter_opt = branch_row["branch_filter"].value_or(std::string{});
+		branch.branch_filter = filter_opt;
+		if (!branch.branch_filter.empty()) {
+			try {
+				auto exprs = Parser::ParseExpressionList(branch.branch_filter);
+				if (exprs.empty()) {
+					throw BinderException("VGI branch_filter parsed to no expressions [worker: " + worker_path +
+					                       ", filter: " + branch.branch_filter + "]");
+				}
+				// If the worker supplied multiple comma-separated expressions,
+				// AND them together. (Single expression is the typical case.)
+				branch.parsed_branch_filter = std::move(exprs[0]);
+				// Multi-expression case: leave as a single expression by AND-ing.
+				// Skipped here for simplicity — typical worker emits one
+				// predicate; multi-AND can be added if it shows up in practice.
+			} catch (const std::exception &e) {
+				throw BinderException("VGI branch_filter parse error [worker: " + worker_path +
+				                       ", filter: " + branch.branch_filter + "]: " + e.what());
+			}
+		}
 
-    // writable flag is non-nullable on the wire — surface a loud error
-    // if the worker emits NULL. (Legacy single-function workers go
-    // through WrapLegacyAsOneBranch and never reach this parser, so
-    // they don't need a fallback default here.)
-    branch.writable = branch_row["writable"].value_not_null<bool>();
-    if (branch.writable) {
-      writable_ordinals.push_back(i);
-    }
+		// writable flag is non-nullable on the wire — surface a loud error
+		// if the worker emits NULL. (Legacy single-function workers go
+		// through WrapLegacyAsOneBranch and never reach this parser, so
+		// they don't need a fallback default here.)
+		branch.writable = branch_row["writable"].value_not_null<bool>();
+		if (branch.writable) {
+			writable_ordinals.push_back(i);
+		}
 
-    // Catalog-table branch fields (nullable; empty ⇒ function branch). A
-    // non-empty source_table selects the catalog-table kind — the branch
-    // scans source_catalog.source_schema.source_table in a companion catalog.
-    branch.source_catalog =
-        branch_row["source_catalog"].value_or(std::string{});
-    branch.source_schema = OptionalSchemaNameFromPath(
-        branch_row["source_schema_path"].as<std::vector<std::string>>(),
-        "ScanBranch.source_schema_path");
-    branch.source_table = branch_row["source_table"].value_or(std::string{});
+		// Catalog-table branch fields (nullable; empty ⇒ function branch). A
+		// non-empty source_table selects the catalog-table kind — the branch
+		// scans source_catalog.source_schema.source_table in a companion catalog.
+		branch.source_catalog = branch_row["source_catalog"].value_or(std::string{});
+		branch.source_schema = OptionalSchemaNameFromPath(
+		    branch_row["source_schema_path"].as<std::vector<std::string>>(), "ScanBranch.source_schema_path");
+		branch.source_table = branch_row["source_table"].value_or(std::string{});
 
-    // Function branch only: DuckDB 1.5 schema the function_name is
-    // registered in. Empty for a catalog-table/format branch or a pre-1.5.0
-    // peer — same nullable-string convention as source_catalog/etc above.
-    branch.schema_name = OptionalSchemaNameFromPath(
-        branch_row["schema_path"].as<std::vector<std::string>>(),
-        "ScanBranch.schema_path");
+		// Function branch only: DuckDB 1.5 schema the function_name is
+		// registered in. Empty for a catalog-table/format branch or a pre-1.5.0
+		// peer — same nullable-string convention as source_catalog/etc above.
+		branch.schema_name = OptionalSchemaNameFromPath(branch_row["schema_path"].as<std::vector<std::string>>(),
+		                                                "ScanBranch.schema_path");
 
-    // Format-branch fields (P4). A non-empty format_name with no function and
-    // no source_table selects the format kind: read these locations as this
-    // format.
-    branch.format_name = branch_row["format_name"].value_or(std::string{});
-    {
-      auto locs =
-          branch_row["format_locations"].value_or(std::vector<std::string>{});
-      branch.format_locations.assign(locs.begin(), locs.end());
-    }
-    {
-      // Reader options, carried as a 1-row IPC batch whose COLUMN NAMES are
-      // the option names — the same shape as `arguments`, so the same
-      // decoder reads it. Absent / NULL means no options.
-      //
-      // This column existed on neither side for a while: the rewriter has
-      // always consumed `format_options` as the reader's named arguments,
-      // but nothing ever parsed it, so it was permanently empty. Because
-      // the rewriter ASSIGNS rather than merges, that made it impossible to
-      // pass a single reader option to a format branch — `header`, `delim`,
-      // `union_by_name` all silently unreachable.
-      auto opts_bytes =
-          branch_row["format_options"].value_or(std::vector<uint8_t>{});
-      if (!opts_bytes.empty()) {
-        duckdb::vector<Value> unused_positional;
-        DecodeScanArguments(context, opts_bytes, unused_positional,
-                            branch.format_options);
-        if (!unused_positional.empty()) {
-          throw BinderException(
-              "VGI scan branch %d supplied POSITIONAL format_options; reader "
-              "options are "
-              "named arguments and must be keyed by name [worker: %s]",
-              static_cast<int>(result.branches.size()), worker_path);
-        }
-      }
-    }
+		// Format-branch fields (P4). A non-empty format_name with no function and
+		// no source_table selects the format kind: read these locations as this
+		// format.
+		branch.format_name = branch_row["format_name"].value_or(std::string{});
+		{
+			auto locs = branch_row["format_locations"].value_or(std::vector<std::string>{});
+			branch.format_locations.assign(locs.begin(), locs.end());
+		}
+		{
+			// Reader options, carried as a 1-row IPC batch whose COLUMN NAMES are
+			// the option names — the same shape as `arguments`, so the same
+			// decoder reads it. Absent / NULL means no options.
+			//
+			// This column existed on neither side for a while: the rewriter has
+			// always consumed `format_options` as the reader's named arguments,
+			// but nothing ever parsed it, so it was permanently empty. Because
+			// the rewriter ASSIGNS rather than merges, that made it impossible to
+			// pass a single reader option to a format branch — `header`, `delim`,
+			// `union_by_name` all silently unreachable.
+			auto opts_bytes = branch_row["format_options"].value_or(std::vector<uint8_t>{});
+			if (!opts_bytes.empty()) {
+				duckdb::vector<Value> unused_positional;
+				DecodeScanArguments(context, opts_bytes, unused_positional, branch.format_options);
+				if (!unused_positional.empty()) {
+					throw BinderException(
+					    "VGI scan branch %d supplied POSITIONAL format_options; reader options are "
+					    "named arguments and must be keyed by name [worker: %s]",
+					    static_cast<int>(result.branches.size()), worker_path);
+				}
+			}
+		}
 
-    // Three-way discriminator, enforced HERE rather than at bind. A branch that
-    // sets two identifying fields is a worker bug; catching it at bind would
-    // blame the query instead of the catalog, and the message would arrive far
-    // from the thing that produced it.
-    {
-      const int kinds = static_cast<int>(branch.IsFunctionBranch()) +
-                        static_cast<int>(!branch.source_table.empty()) +
-                        static_cast<int>(!branch.format_name.empty());
-      if (kinds == 0) {
-        throw BinderException(
-            "VGI scan branch %d declares none of function_name / source_table "
-            "/ format_name; "
-            "a branch must name exactly one source [worker: %s]",
-            static_cast<int>(result.branches.size()), worker_path);
-      }
-      if (kinds > 1) {
-        throw BinderException("VGI scan branch %d declares more than one of "
-                              "function_name / source_table / "
-                              "format_name; these are mutually exclusive "
-                              "branch kinds [worker: %s]",
-                              static_cast<int>(result.branches.size()),
-                              worker_path);
-      }
-      if (branch.IsFormatBranch() && branch.format_locations.empty()) {
-        throw BinderException("VGI scan branch %d is a format branch ('%s') "
-                              "but names no locations to read "
-                              "[worker: %s]",
-                              static_cast<int>(result.branches.size()),
-                              branch.format_name, worker_path);
-      }
-    }
+		// Three-way discriminator, enforced HERE rather than at bind. A branch that
+		// sets two identifying fields is a worker bug; catching it at bind would
+		// blame the query instead of the catalog, and the message would arrive far
+		// from the thing that produced it.
+		{
+			const int kinds = static_cast<int>(branch.IsFunctionBranch()) +
+			                  static_cast<int>(!branch.source_table.empty()) +
+			                  static_cast<int>(!branch.format_name.empty());
+			if (kinds == 0) {
+				throw BinderException(
+				    "VGI scan branch %d declares none of function_name / source_table / format_name; "
+				    "a branch must name exactly one source [worker: %s]",
+				    static_cast<int>(result.branches.size()), worker_path);
+			}
+			if (kinds > 1) {
+				throw BinderException(
+				    "VGI scan branch %d declares more than one of function_name / source_table / "
+				    "format_name; these are mutually exclusive branch kinds [worker: %s]",
+				    static_cast<int>(result.branches.size()), worker_path);
+			}
+			if (branch.IsFormatBranch() && branch.format_locations.empty()) {
+				throw BinderException(
+				    "VGI scan branch %d is a format branch ('%s') but names no locations to read "
+				    "[worker: %s]",
+				    static_cast<int>(result.branches.size()), branch.format_name, worker_path);
+			}
+		}
 
-    result.branches.push_back(std::move(branch));
-  }
+		result.branches.push_back(std::move(branch));
+	}
 
-  // At-most-one-writable invariant. Multiple writable arms would violate
-  // DuckDB's single-writable-catalog-per-transaction rule
-  // (duckdb/src/transaction/meta_transaction.cpp:257-261) if UPDATE/DELETE
-  // ever land, and even for INSERT it makes the routing target ambiguous.
-  // Reject loudly at catalog-load.
-  if (writable_ordinals.size() > 1) {
-    std::string ordinals_csv;
-    for (size_t i = 0; i < writable_ordinals.size(); i++) {
-      if (i > 0) {
-        ordinals_csv += ", ";
-      }
-      ordinals_csv += std::to_string(writable_ordinals[i]);
-    }
-    throw BinderException(
-        "VGI multi-branch table declared %d writable branches (ordinals: %s); "
-        "exactly zero or one is allowed [worker: %s]",
-        static_cast<int>(writable_ordinals.size()), ordinals_csv, worker_path);
-  }
+	// At-most-one-writable invariant. Multiple writable arms would violate
+	// DuckDB's single-writable-catalog-per-transaction rule
+	// (duckdb/src/transaction/meta_transaction.cpp:257-261) if UPDATE/DELETE
+	// ever land, and even for INSERT it makes the routing target ambiguous.
+	// Reject loudly at catalog-load.
+	if (writable_ordinals.size() > 1) {
+		std::string ordinals_csv;
+		for (size_t i = 0; i < writable_ordinals.size(); i++) {
+			if (i > 0) {
+				ordinals_csv += ", ";
+			}
+			ordinals_csv += std::to_string(writable_ordinals[i]);
+		}
+		throw BinderException(
+		    "VGI multi-branch table declared %d writable branches (ordinals: %s); "
+		    "exactly zero or one is allowed [worker: %s]",
+		    static_cast<int>(writable_ordinals.size()), ordinals_csv, worker_path);
+	}
 
-  return result;
+	return result;
 }
 
 // ============================================================================
@@ -2976,608 +2672,488 @@ ParseScanBranchesResult(ClientContext &context,
 
 // Render required_filters (CNF: an AND of OR-groups) as a compact JSON array of
 // arrays of strings, e.g. [["accession_number"],["ticker","cik"]]. Surfaced on
-// the extension-injected `vgi_required_filters` table tag so callers can
-// discover the requirement via duckdb_tables().tags before hitting the
-// BinderException.
-static std::string
-RenderRequiredFiltersJson(const std::vector<std::vector<std::string>> &groups) {
-  yyjson_mut_doc *doc = yyjson_mut_doc_new(nullptr);
-  yyjson_mut_val *outer = yyjson_mut_arr(doc);
-  for (const auto &group : groups) {
-    yyjson_mut_val *inner = yyjson_mut_arr(doc);
-    for (const auto &path : group) {
-      yyjson_mut_arr_append(inner,
-                            yyjson_mut_strncpy(doc, path.c_str(), path.size()));
-    }
-    yyjson_mut_arr_append(outer, inner);
-  }
-  char *json_str = yyjson_mut_val_write(outer, 0, nullptr);
-  std::string out = json_str ? json_str : "[]";
-  if (json_str) {
-    free(json_str);
-  }
-  yyjson_mut_doc_free(doc);
-  return out;
+// the extension-injected `vgi_required_filters` table tag so callers can discover
+// the requirement via duckdb_tables().tags before hitting the BinderException.
+static std::string RenderRequiredFiltersJson(const std::vector<std::vector<std::string>> &groups) {
+	yyjson_mut_doc *doc = yyjson_mut_doc_new(nullptr);
+	yyjson_mut_val *outer = yyjson_mut_arr(doc);
+	for (const auto &group : groups) {
+		yyjson_mut_val *inner = yyjson_mut_arr(doc);
+		for (const auto &path : group) {
+			yyjson_mut_arr_append(inner, yyjson_mut_strncpy(doc, path.c_str(), path.size()));
+		}
+		yyjson_mut_arr_append(outer, inner);
+	}
+	char *json_str = yyjson_mut_val_write(outer, 0, nullptr);
+	std::string out = json_str ? json_str : "[]";
+	if (json_str) {
+		free(json_str);
+	}
+	yyjson_mut_doc_free(doc);
+	return out;
 }
 
-CreateTableInfo CreateTableInfoFromVgiTable(ClientContext &context,
-                                            VgiTableInfo &table_info,
+CreateTableInfo CreateTableInfoFromVgiTable(ClientContext &context, VgiTableInfo &table_info,
                                             const std::string &schema_name) {
-  CreateTableInfo create_info;
-  create_info.table = table_info.name;
-  create_info.schema = schema_name;
-  if (!table_info.comment.empty()) {
-    create_info.comment = Value(table_info.comment);
-  }
-  for (auto &[key, val] : table_info.tags) {
-    create_info.tags[key] = val;
-  }
-  // Expose the required-filter requirement to SQL callers as a reserved tag
-  // (extension-injected, `vgi_`-prefixed) so it's discoverable pre-query.
-  if (!table_info.required_filters.empty()) {
-    create_info.tags["vgi_required_filters"] =
-        RenderRequiredFiltersJson(table_info.required_filters);
-  }
+	CreateTableInfo create_info;
+	create_info.table = table_info.name;
+	create_info.schema = schema_name;
+	if (!table_info.comment.empty()) {
+		create_info.comment = Value(table_info.comment);
+	}
+	for (auto &[key, val] : table_info.tags) {
+		create_info.tags[key] = val;
+	}
+	// Expose the required-filter requirement to SQL callers as a reserved tag
+	// (extension-injected, `vgi_`-prefixed) so it's discoverable pre-query.
+	if (!table_info.required_filters.empty()) {
+		create_info.tags["vgi_required_filters"] = RenderRequiredFiltersJson(table_info.required_filters);
+	}
 
-  if (table_info.arrow_schema) {
-    if (table_info.row_id_column >= 0) {
-      // Convert the row_id field type to DuckDB LogicalType
-      auto rowid_field =
-          table_info.arrow_schema->field(table_info.row_id_column);
-      auto rowid_schema = arrow::schema({rowid_field});
-      ArrowSchemaWrapper c_schema;
-      ArrowTableSchema arrow_table;
-      vector<LogicalType> types;
-      vector<string> names;
-      ArrowSchemaToDuckDBTypes(context, rowid_schema, c_schema, arrow_table,
-                               types, names);
-      table_info.rowid_type = types[0];
+	if (table_info.arrow_schema) {
+		if (table_info.row_id_column >= 0) {
+			// Convert the row_id field type to DuckDB LogicalType
+			auto rowid_field = table_info.arrow_schema->field(table_info.row_id_column);
+			auto rowid_schema = arrow::schema({rowid_field});
+			ArrowSchemaWrapper c_schema;
+			ArrowTableSchema arrow_table;
+			vector<LogicalType> types;
+			vector<string> names;
+			ArrowSchemaToDuckDBTypes(context, rowid_schema, c_schema, arrow_table, types, names);
+			table_info.rowid_type = types[0];
 
-      // Build filtered schema excluding the row_id field
-      std::vector<std::shared_ptr<arrow::Field>> filtered_fields;
-      for (int i = 0; i < table_info.arrow_schema->num_fields(); i++) {
-        if (i != table_info.row_id_column) {
-          filtered_fields.push_back(table_info.arrow_schema->field(i));
-        }
-      }
-      auto filtered_schema = arrow::schema(filtered_fields);
-      ArrowSchemaToColumnList(context, filtered_schema, create_info.columns);
-    } else {
-      ArrowSchemaToColumnList(context, table_info.arrow_schema,
-                              create_info.columns);
-    }
-  }
+			// Build filtered schema excluding the row_id field
+			std::vector<std::shared_ptr<arrow::Field>> filtered_fields;
+			for (int i = 0; i < table_info.arrow_schema->num_fields(); i++) {
+				if (i != table_info.row_id_column) {
+					filtered_fields.push_back(table_info.arrow_schema->field(i));
+				}
+			}
+			auto filtered_schema = arrow::schema(filtered_fields);
+			ArrowSchemaToColumnList(context, filtered_schema, create_info.columns);
+		} else {
+			ArrowSchemaToColumnList(context, table_info.arrow_schema, create_info.columns);
+		}
+	}
 
-  // Apply NOT NULL constraints
-  for (auto idx : table_info.not_null_constraints) {
-    int adjusted = idx;
-    if (table_info.row_id_column >= 0) {
-      if (idx == table_info.row_id_column) {
-        continue; // Skip row_id column
-      }
-      if (idx > table_info.row_id_column) {
-        adjusted--;
-      }
-    }
-    create_info.constraints.push_back(
-        make_uniq<NotNullConstraint>(LogicalIndex(adjusted)));
-  }
+	// Apply NOT NULL constraints
+	for (auto idx : table_info.not_null_constraints) {
+		int adjusted = idx;
+		if (table_info.row_id_column >= 0) {
+			if (idx == table_info.row_id_column) {
+				continue; // Skip row_id column
+			}
+			if (idx > table_info.row_id_column) {
+				adjusted--;
+			}
+		}
+		create_info.constraints.push_back(make_uniq<NotNullConstraint>(LogicalIndex(adjusted)));
+	}
 
-  // Apply UNIQUE constraints
-  for (auto &cols : table_info.unique_constraints) {
-    vector<string> col_names;
-    for (auto idx : cols) {
-      int adjusted = idx;
-      if (table_info.row_id_column >= 0) {
-        if (idx == table_info.row_id_column) {
-          continue; // Skip row_id column
-        }
-        if (idx > table_info.row_id_column) {
-          adjusted--;
-        }
-      }
-      if (adjusted < 0 ||
-          (idx_t)adjusted >= create_info.columns.LogicalColumnCount()) {
-        throw InvalidInputException(
-            "VGI: UNIQUE constraint references column index %d out of range "
-            "(table '%s' has %llu columns)",
-            adjusted, create_info.table,
-            (unsigned long long)create_info.columns.LogicalColumnCount());
-      }
-      col_names.push_back(
-          create_info.columns.GetColumn(LogicalIndex(adjusted)).Name());
-    }
-    create_info.constraints.push_back(
-        make_uniq<UniqueConstraint>(std::move(col_names), false));
-  }
+	// Apply UNIQUE constraints
+	for (auto &cols : table_info.unique_constraints) {
+		vector<string> col_names;
+		for (auto idx : cols) {
+			int adjusted = idx;
+			if (table_info.row_id_column >= 0) {
+				if (idx == table_info.row_id_column) {
+					continue; // Skip row_id column
+				}
+				if (idx > table_info.row_id_column) {
+					adjusted--;
+				}
+			}
+			if (adjusted < 0 || (idx_t)adjusted >= create_info.columns.LogicalColumnCount()) {
+				throw InvalidInputException(
+				    "VGI: UNIQUE constraint references column index %d out of range (table '%s' has %llu columns)",
+				    adjusted, create_info.table, (unsigned long long)create_info.columns.LogicalColumnCount());
+			}
+			col_names.push_back(create_info.columns.GetColumn(LogicalIndex(adjusted)).Name());
+		}
+		create_info.constraints.push_back(make_uniq<UniqueConstraint>(std::move(col_names), false));
+	}
 
-  // Apply PRIMARY KEY constraints (UniqueConstraint with is_primary_key=true)
-  for (auto &cols : table_info.primary_key_constraints) {
-    vector<string> col_names;
-    for (auto idx : cols) {
-      int adjusted = idx;
-      if (table_info.row_id_column >= 0) {
-        if (idx == table_info.row_id_column) {
-          continue; // Skip row_id column
-        }
-        if (idx > table_info.row_id_column) {
-          adjusted--;
-        }
-      }
-      if (adjusted < 0 ||
-          (idx_t)adjusted >= create_info.columns.LogicalColumnCount()) {
-        throw InvalidInputException(
-            "VGI: PRIMARY KEY constraint references column index %d out of "
-            "range (table '%s' has %llu columns)",
-            adjusted, create_info.table,
-            (unsigned long long)create_info.columns.LogicalColumnCount());
-      }
-      col_names.push_back(
-          create_info.columns.GetColumn(LogicalIndex(adjusted)).Name());
-    }
-    create_info.constraints.push_back(
-        make_uniq<UniqueConstraint>(std::move(col_names), true));
-  }
+	// Apply PRIMARY KEY constraints (UniqueConstraint with is_primary_key=true)
+	for (auto &cols : table_info.primary_key_constraints) {
+		vector<string> col_names;
+		for (auto idx : cols) {
+			int adjusted = idx;
+			if (table_info.row_id_column >= 0) {
+				if (idx == table_info.row_id_column) {
+					continue; // Skip row_id column
+				}
+				if (idx > table_info.row_id_column) {
+					adjusted--;
+				}
+			}
+			if (adjusted < 0 || (idx_t)adjusted >= create_info.columns.LogicalColumnCount()) {
+				throw InvalidInputException(
+				    "VGI: PRIMARY KEY constraint references column index %d out of range (table '%s' has %llu columns)",
+				    adjusted, create_info.table, (unsigned long long)create_info.columns.LogicalColumnCount());
+			}
+			col_names.push_back(create_info.columns.GetColumn(LogicalIndex(adjusted)).Name());
+		}
+		create_info.constraints.push_back(make_uniq<UniqueConstraint>(std::move(col_names), true));
+	}
 
-  // Apply CHECK constraints
-  for (auto &expr_str : table_info.check_constraints) {
-    auto expressions = Parser::ParseExpressionList(expr_str);
-    if (!expressions.empty()) {
-      create_info.constraints.push_back(
-          make_uniq<CheckConstraint>(expressions[0]->Copy()));
-    }
-  }
+	// Apply CHECK constraints
+	for (auto &expr_str : table_info.check_constraints) {
+		auto expressions = Parser::ParseExpressionList(expr_str);
+		if (!expressions.empty()) {
+			create_info.constraints.push_back(make_uniq<CheckConstraint>(expressions[0]->Copy()));
+		}
+	}
 
-  // Apply FOREIGN KEY constraints
-  for (auto &fk : table_info.foreign_key_constraints) {
-    ForeignKeyInfo fk_info;
-    fk_info.type = ForeignKeyType::FK_TYPE_FOREIGN_KEY_TABLE;
-    fk_info.schema = fk.referenced_schema;
-    fk_info.table = fk.referenced_table;
-    // Physical indices are not populated — VGI tables are read-only so
-    // DML enforcement is not needed. The constraint is metadata-only.
-    vector<string> pk_cols(fk.pk_columns.begin(), fk.pk_columns.end());
-    vector<string> fk_cols(fk.fk_columns.begin(), fk.fk_columns.end());
-    create_info.constraints.push_back(make_uniq<ForeignKeyConstraint>(
-        std::move(pk_cols), std::move(fk_cols), std::move(fk_info)));
-  }
+	// Apply FOREIGN KEY constraints
+	for (auto &fk : table_info.foreign_key_constraints) {
+		ForeignKeyInfo fk_info;
+		fk_info.type = ForeignKeyType::FK_TYPE_FOREIGN_KEY_TABLE;
+		fk_info.schema = fk.referenced_schema;
+		fk_info.table = fk.referenced_table;
+		// Physical indices are not populated — VGI tables are read-only so
+		// DML enforcement is not needed. The constraint is metadata-only.
+		vector<string> pk_cols(fk.pk_columns.begin(), fk.pk_columns.end());
+		vector<string> fk_cols(fk.fk_columns.begin(), fk.fk_columns.end());
+		create_info.constraints.push_back(
+		    make_uniq<ForeignKeyConstraint>(std::move(pk_cols), std::move(fk_cols), std::move(fk_info)));
+	}
 
-  // Apply column metadata (defaults, comments) from Arrow field metadata
-  if (table_info.arrow_schema) {
-    for (int i = 0; i < table_info.arrow_schema->num_fields(); i++) {
-      if (table_info.row_id_column >= 0 && i == table_info.row_id_column) {
-        continue;
-      }
-      auto &arrow_field = table_info.arrow_schema->field(i);
-      if (!arrow_field->HasMetadata()) {
-        continue;
-      }
+	// Apply column metadata (defaults, comments) from Arrow field metadata
+	if (table_info.arrow_schema) {
+		for (int i = 0; i < table_info.arrow_schema->num_fields(); i++) {
+			if (table_info.row_id_column >= 0 && i == table_info.row_id_column) {
+				continue;
+			}
+			auto &arrow_field = table_info.arrow_schema->field(i);
+			if (!arrow_field->HasMetadata()) {
+				continue;
+			}
 
-      int adjusted = i;
-      if (table_info.row_id_column >= 0 && i > table_info.row_id_column) {
-        adjusted--;
-      }
-      auto &col = create_info.columns.GetColumnMutable(LogicalIndex(adjusted));
+			int adjusted = i;
+			if (table_info.row_id_column >= 0 && i > table_info.row_id_column) {
+				adjusted--;
+			}
+			auto &col = create_info.columns.GetColumnMutable(LogicalIndex(adjusted));
 
-      // Generated expression (mutually exclusive with default)
-      auto gen_idx = arrow_field->metadata()->FindKey(
-          VGI_GENERATED_EXPRESSION_METADATA_KEY);
-      if (gen_idx >= 0) {
-        auto gen_expr_str = arrow_field->metadata()->value(gen_idx);
-        auto gen_expressions = Parser::ParseExpressionList(gen_expr_str);
-        if (!gen_expressions.empty()) {
-          col.SetGeneratedExpression(std::move(gen_expressions[0]));
-        }
-      } else {
-        // Default value (only for non-generated columns)
-        auto default_idx = arrow_field->metadata()->FindKey("default");
-        if (default_idx >= 0) {
-          auto default_expr = arrow_field->metadata()->value(default_idx);
-          auto expressions = Parser::ParseExpressionList(default_expr);
-          if (!expressions.empty()) {
-            col.SetDefaultValue(std::move(expressions[0]));
-          }
-        }
-      }
+			// Generated expression (mutually exclusive with default)
+			auto gen_idx = arrow_field->metadata()->FindKey(VGI_GENERATED_EXPRESSION_METADATA_KEY);
+			if (gen_idx >= 0) {
+				auto gen_expr_str = arrow_field->metadata()->value(gen_idx);
+				auto gen_expressions = Parser::ParseExpressionList(gen_expr_str);
+				if (!gen_expressions.empty()) {
+					col.SetGeneratedExpression(std::move(gen_expressions[0]));
+				}
+			} else {
+				// Default value (only for non-generated columns)
+				auto default_idx = arrow_field->metadata()->FindKey("default");
+				if (default_idx >= 0) {
+					auto default_expr = arrow_field->metadata()->value(default_idx);
+					auto expressions = Parser::ParseExpressionList(default_expr);
+					if (!expressions.empty()) {
+						col.SetDefaultValue(std::move(expressions[0]));
+					}
+				}
+			}
 
-      // Column comment (applies to both generated and non-generated)
-      auto comment_idx = arrow_field->metadata()->FindKey("comment");
-      if (comment_idx >= 0) {
-        col.SetComment(Value(arrow_field->metadata()->value(comment_idx)));
-      }
-    }
-  }
+			// Column comment (applies to both generated and non-generated)
+			auto comment_idx = arrow_field->metadata()->FindKey("comment");
+			if (comment_idx >= 0) {
+				col.SetComment(Value(arrow_field->metadata()->value(comment_idx)));
+			}
+		}
+	}
 
-  return create_info;
+	return create_info;
 }
 
-VgiFunctionInfo
-ParseFunctionInfo(const std::shared_ptr<arrow::RecordBatch> &batch,
-                  int64_t row_idx, const std::string &worker_path) {
-  VgiFunctionInfo info;
+VgiFunctionInfo ParseFunctionInfo(const std::shared_ptr<arrow::RecordBatch> &batch, int64_t row_idx,
+                                  const std::string &worker_path) {
+	VgiFunctionInfo info;
 
-  if (!batch || batch->num_rows() == 0) {
-    throw IOException("Empty response from function_get");
-  }
+	if (!batch || batch->num_rows() == 0) {
+		throw IOException("Empty response from function_get");
+	}
 
-  if (row_idx >= batch->num_rows()) {
-    throw IOException("Row index %lld out of range (batch has %lld rows)",
-                      row_idx, batch->num_rows());
-  }
+	if (row_idx >= batch->num_rows()) {
+		throw IOException("Row index %lld out of range (batch has %lld rows)", row_idx, batch->num_rows());
+	}
 
-  RecordBatchSingleRow row(batch, row_idx, "FunctionInfo", worker_path);
+	RecordBatchSingleRow row(batch, row_idx, "FunctionInfo", worker_path);
 
-  // Required fields (non-nullable per protocol)
-  info.name = row["name"].value_not_null<std::string>();
-  info.schema_name = SchemaNameFromPath(
-      row["schema_path"].value_not_null<std::vector<std::string>>(),
-      "FunctionInfo.schema_path");
-  info.tags = row["tags"].value_not_null<std::map<std::string, std::string>>();
+	// Required fields (non-nullable per protocol)
+	info.name = row["name"].value_not_null<std::string>();
+	info.schema_name =
+	    SchemaNameFromPath(row["schema_path"].value_not_null<std::vector<std::string>>(), "FunctionInfo.schema_path");
+	info.tags = row["tags"].value_not_null<std::map<std::string, std::string>>();
 
-  // Parse function_type as enum (required, non-nullable)
-  auto function_type_str = row["function_type"].value_not_null<std::string>();
-  info.function_type = RequireKnownEnum(ParseVgiFunctionType(function_type_str),
-                                        function_type_str, "function_type",
-                                        worker_path, info.name);
+	// Parse function_type as enum (required, non-nullable)
+	auto function_type_str = row["function_type"].value_not_null<std::string>();
+	info.function_type = RequireKnownEnum(ParseVgiFunctionType(function_type_str), function_type_str, "function_type",
+	                                      worker_path, info.name);
 
-  // Optional string field for description
-  info.description = row["description"].value_or("");
+	// Optional string field for description
+	info.description = row["description"].value_or("");
 
-  // Optional string field for comment (nullable on the wire — no worker sets
-  // it yet unless it declares Meta.comment; empty == unset, same convention
-  // tables/views use).
-  info.comment = row["comment"].value_or("");
+	// Optional string field for comment (nullable on the wire — no worker sets
+	// it yet unless it declares Meta.comment; empty == unset, same convention
+	// tables/views use).
+	info.comment = row["comment"].value_or("");
 
-  // Parse optional enum fields (nullable per protocol). A missing field is
-  // legitimate ("leave default"); a present-but-unrecognized string throws.
-  auto stability_str = row["stability"].as<std::string>();
-  if (stability_str) {
-    info.stability =
-        RequireKnownEnum(ParseFunctionStability(*stability_str), *stability_str,
-                         "stability", worker_path, info.name);
-  }
+	// Parse optional enum fields (nullable per protocol). A missing field is
+	// legitimate ("leave default"); a present-but-unrecognized string throws.
+	auto stability_str = row["stability"].as<std::string>();
+	if (stability_str) {
+		info.stability = RequireKnownEnum(ParseFunctionStability(*stability_str), *stability_str, "stability",
+		                                  worker_path, info.name);
+	}
 
-  auto null_handling_str = row["null_handling"].as<std::string>();
-  if (null_handling_str) {
-    info.null_handling = RequireKnownEnum(
-        ParseFunctionNullHandling(*null_handling_str), *null_handling_str,
-        "null_handling", worker_path, info.name);
-  }
+	auto null_handling_str = row["null_handling"].as<std::string>();
+	if (null_handling_str) {
+		info.null_handling = RequireKnownEnum(ParseFunctionNullHandling(*null_handling_str), *null_handling_str,
+		                                      "null_handling", worker_path, info.name);
+	}
 
-  auto order_preservation_str = row["order_preservation"].as<std::string>();
-  if (order_preservation_str) {
-    info.order_preservation = RequireKnownEnum(
-        ParseVgiOrderPreservation(*order_preservation_str),
-        *order_preservation_str, "order_preservation", worker_path, info.name);
-  }
+	auto order_preservation_str = row["order_preservation"].as<std::string>();
+	if (order_preservation_str) {
+		info.order_preservation = RequireKnownEnum(ParseVgiOrderPreservation(*order_preservation_str),
+		                                           *order_preservation_str, "order_preservation", worker_path,
+		                                           info.name);
+	}
 
-  // Documentation fields
-  // examples is a list of structs with {sql, description, expected_output} -
-  // extract sql strings. Some Arrow producers (depending on version / language
-  // binding) emit LargeListArray instead of ListArray; handle both so a
-  // wire-format drift doesn't silently drop the examples list.
-  auto examples_col = batch->GetColumnByName("examples");
-  auto extract_examples = [&](auto list_array) {
-    if (!list_array || list_array->IsNull(row_idx)) {
-      return;
-    }
-    auto start = list_array->value_offset(row_idx);
-    auto end = list_array->value_offset(row_idx + 1);
-    auto struct_array =
-        std::dynamic_pointer_cast<arrow::StructArray>(list_array->values());
-    if (!struct_array) {
-      return;
-    }
-    auto sql_field = struct_array->GetFieldByName("sql");
-    auto sql_array = std::dynamic_pointer_cast<arrow::StringArray>(sql_field);
-    if (!sql_array) {
-      return;
-    }
-    for (auto i = start; i < end; i++) {
-      if (!sql_array->IsNull(i)) {
-        info.examples.push_back(sql_array->GetString(i));
-      }
-    }
-  };
-  if (examples_col) {
-    if (auto list_array =
-            std::dynamic_pointer_cast<arrow::ListArray>(examples_col)) {
-      extract_examples(list_array);
-    } else if (auto large_list_array =
-                   std::dynamic_pointer_cast<arrow::LargeListArray>(
-                       examples_col)) {
-      extract_examples(large_list_array);
-    }
-  }
-  // categories is a simple list of strings
-  info.categories = row["categories"].value_or(std::vector<std::string>{});
+	// Documentation fields
+	// examples is a list of structs with {sql, description, expected_output} - extract sql strings.
+	// Some Arrow producers (depending on version / language binding) emit
+	// LargeListArray instead of ListArray; handle both so a wire-format
+	// drift doesn't silently drop the examples list.
+	auto examples_col = batch->GetColumnByName("examples");
+	auto extract_examples = [&](auto list_array) {
+		if (!list_array || list_array->IsNull(row_idx)) {
+			return;
+		}
+		auto start = list_array->value_offset(row_idx);
+		auto end = list_array->value_offset(row_idx + 1);
+		auto struct_array = std::dynamic_pointer_cast<arrow::StructArray>(list_array->values());
+		if (!struct_array) {
+			return;
+		}
+		auto sql_field = struct_array->GetFieldByName("sql");
+		auto sql_array = std::dynamic_pointer_cast<arrow::StringArray>(sql_field);
+		if (!sql_array) {
+			return;
+		}
+		for (auto i = start; i < end; i++) {
+			if (!sql_array->IsNull(i)) {
+				info.examples.push_back(sql_array->GetString(i));
+			}
+		}
+	};
+	if (examples_col) {
+		if (auto list_array = std::dynamic_pointer_cast<arrow::ListArray>(examples_col)) {
+			extract_examples(list_array);
+		} else if (auto large_list_array =
+		               std::dynamic_pointer_cast<arrow::LargeListArray>(examples_col)) {
+			extract_examples(large_list_array);
+		}
+	}
+	// categories is a simple list of strings
+	info.categories = row["categories"].value_or(std::vector<std::string> {});
 
-  // Parse the arguments field which contains a serialized Arrow schema
-  // (non-nullable)
-  auto args_data = row["arguments"].value_not_null<std::vector<uint8_t>>();
-  if (!args_data.empty()) {
-    info.arguments_schema = DeserializeSchema(args_data);
-  }
+	// Parse the arguments field which contains a serialized Arrow schema (non-nullable)
+	auto args_data = row["arguments"].value_not_null<std::vector<uint8_t>>();
+	if (!args_data.empty()) {
+		info.arguments_schema = DeserializeSchema(args_data);
+	}
 
-  // Parse the output_schema field which contains a serialized Arrow schema
-  // (non-nullable)
-  auto output_data =
-      row["output_schema"].value_not_null<std::vector<uint8_t>>();
-  if (!output_data.empty()) {
-    info.output_schema = DeserializeSchema(output_data);
-  }
+	// Parse the output_schema field which contains a serialized Arrow schema (non-nullable)
+	auto output_data = row["output_schema"].value_not_null<std::vector<uint8_t>>();
+	if (!output_data.empty()) {
+		info.output_schema = DeserializeSchema(output_data);
+	}
 
-  // Typed parameter defaults are transported as an IPC-serialized one-row
-  // RecordBatch. Keep the bytes on VgiFunctionInfo so DuckDB 1.5 can preserve
-  // the VGI 2.0 contract even though its scalar/aggregate registration API
-  // cannot install defaults yet.
-  auto parameter_defaults =
-      row["parameter_default_values"].as<std::vector<uint8_t>>();
-  if (parameter_defaults) {
-    auto defaults_batch = DeserializeFromIpcBytes(parameter_defaults->data(),
-                                                  parameter_defaults->size());
-    if (!defaults_batch || defaults_batch->num_rows() != 1) {
-      throw IOException(
-          "Function '%s' parameter_default_values must contain exactly one row",
-          info.name);
-    }
-    if (!info.arguments_schema) {
-      throw IOException("Function '%s' has parameter_default_values without an "
-                        "arguments schema",
-                        info.name);
-    }
+	// Typed parameter defaults are transported as an IPC-serialized one-row
+	// RecordBatch. Keep the bytes on VgiFunctionInfo so DuckDB 1.5 can preserve
+	// the VGI 2.0 contract even though its scalar/aggregate registration API
+	// cannot install defaults yet.
+	auto parameter_defaults = row["parameter_default_values"].as<std::vector<uint8_t>>();
+	if (parameter_defaults) {
+		auto defaults_batch = DeserializeFromIpcBytes(parameter_defaults->data(), parameter_defaults->size());
+		if (!defaults_batch || defaults_batch->num_rows() != 1) {
+			throw IOException("Function '%s' parameter_default_values must contain exactly one row", info.name);
+		}
+		if (!info.arguments_schema) {
+			throw IOException("Function '%s' has parameter_default_values without an arguments schema", info.name);
+		}
 
-    int previous_argument_index = -1;
-    for (const auto &default_field : defaults_batch->schema()->fields()) {
-      const auto argument_index =
-          info.arguments_schema->GetFieldIndex(default_field->name());
-      if (argument_index < 0) {
-        throw IOException(
-            "Function '%s' has a default for unknown parameter '%s'", info.name,
-            default_field->name());
-      }
-      if (argument_index <= previous_argument_index) {
-        throw IOException(
-            "Function '%s' parameter defaults are not in signature order",
-            info.name);
-      }
-      const auto &argument_field = info.arguments_schema->field(argument_index);
-      if (!argument_field->type()->Equals(default_field->type())) {
-        throw IOException(
-            "Function '%s' default for parameter '%s' has type %s, expected %s",
-            info.name, default_field->name(), default_field->type()->ToString(),
-            argument_field->type()->ToString());
-      }
-      previous_argument_index = argument_index;
-    }
+		int previous_argument_index = -1;
+		for (const auto &default_field : defaults_batch->schema()->fields()) {
+			const auto argument_index = info.arguments_schema->GetFieldIndex(default_field->name());
+			if (argument_index < 0) {
+				throw IOException("Function '%s' has a default for unknown parameter '%s'", info.name,
+				                  default_field->name());
+			}
+			if (argument_index <= previous_argument_index) {
+				throw IOException("Function '%s' parameter defaults are not in signature order", info.name);
+			}
+			const auto &argument_field = info.arguments_schema->field(argument_index);
+			if (!argument_field->type()->Equals(default_field->type())) {
+				throw IOException("Function '%s' default for parameter '%s' has type %s, expected %s", info.name,
+				                  default_field->name(), default_field->type()->ToString(),
+				                  argument_field->type()->ToString());
+			}
+			previous_argument_index = argument_index;
+		}
 
-    if (info.function_type == VgiFunctionType::Scalar ||
-        info.function_type == VgiFunctionType::Aggregate) {
-      const auto default_count = defaults_batch->num_columns();
-      int fixed_parameter_count = info.arguments_schema->num_fields();
-      if (fixed_parameter_count > 0) {
-        const auto &last_field =
-            info.arguments_schema->field(fixed_parameter_count - 1);
-        if (last_field->HasMetadata()) {
-          const auto metadata = last_field->metadata();
-          const auto varargs_index =
-              metadata->FindKey(VGI_VARARGS_METADATA_KEY);
-          if (varargs_index >= 0 &&
-              metadata->value(varargs_index) == VGI_VARARGS_TRUE_VALUE) {
-            fixed_parameter_count--;
-          }
-        }
-      }
-      if (default_count > fixed_parameter_count) {
-        throw IOException("Function '%s' has more defaults than parameters",
-                          info.name);
-      }
-      for (int default_index = 0; default_index < default_count;
-           default_index++) {
-        const auto expected_parameter =
-            fixed_parameter_count - default_count + default_index;
-        if (defaults_batch->schema()->field(default_index)->name() !=
-            info.arguments_schema->field(expected_parameter)->name()) {
-          throw IOException(
-              "Function '%s' defaults must form a trailing parameter sequence",
-              info.name);
-        }
-      }
-    }
-    info.parameter_default_values_bytes = std::move(*parameter_defaults);
-  }
+		if (info.function_type == VgiFunctionType::Scalar || info.function_type == VgiFunctionType::Aggregate) {
+			const auto default_count = defaults_batch->num_columns();
+			int fixed_parameter_count = info.arguments_schema->num_fields();
+			if (fixed_parameter_count > 0) {
+				const auto &last_field = info.arguments_schema->field(fixed_parameter_count - 1);
+				if (last_field->HasMetadata()) {
+					const auto metadata = last_field->metadata();
+					const auto varargs_index = metadata->FindKey(VGI_VARARGS_METADATA_KEY);
+					if (varargs_index >= 0 && metadata->value(varargs_index) == VGI_VARARGS_TRUE_VALUE) {
+						fixed_parameter_count--;
+					}
+				}
+			}
+			if (default_count > fixed_parameter_count) {
+				throw IOException("Function '%s' has more defaults than parameters", info.name);
+			}
+			for (int default_index = 0; default_index < default_count; default_index++) {
+				const auto expected_parameter = fixed_parameter_count - default_count + default_index;
+				if (defaults_batch->schema()->field(default_index)->name() !=
+				    info.arguments_schema->field(expected_parameter)->name()) {
+					throw IOException("Function '%s' defaults must form a trailing parameter sequence", info.name);
+				}
+			}
+		}
+		info.parameter_default_values_bytes = std::move(*parameter_defaults);
+	}
 
-  // Table function capabilities (nullable booleans, stored as optional)
-  info.projection_pushdown = row["projection_pushdown"].as<bool>();
-  info.filter_pushdown = row["filter_pushdown"].as<bool>();
-  info.sampling_pushdown = row["sampling_pushdown"].as<bool>();
-  // nullopt for older workers whose metadata schema lacks the column — the
-  // gate in vgi_table_entry.cpp treats that as "not capable".
-  info.late_materialization = row["late_materialization"].as<bool>();
-  info.filter_semantic_profiles =
-      row["filter_semantic_profiles"].value_or(std::vector<std::string>{});
+	// Table function capabilities (nullable booleans, stored as optional)
+	info.projection_pushdown = row["projection_pushdown"].as<bool>();
+	info.filter_pushdown = row["filter_pushdown"].as<bool>();
+	info.sampling_pushdown = row["sampling_pushdown"].as<bool>();
+	// nullopt for older workers whose metadata schema lacks the column — the
+	// gate in vgi_table_entry.cpp treats that as "not capable".
+	info.late_materialization = row["late_materialization"].as<bool>();
+	info.filter_semantic_profiles = row["filter_semantic_profiles"].value_or(std::vector<std::string> {});
 
-  auto additional_functions =
-      batch->GetColumnByName("additional_filter_functions");
-  auto extract_filter_functions = [&](auto list_array) {
-    if (!list_array || list_array->IsNull(row_idx)) {
-      return;
-    }
-    auto values =
-        std::dynamic_pointer_cast<arrow::StructArray>(list_array->values());
-    if (!values) {
-      throw IOException(
-          "Function '%s' additional_filter_functions must contain structs",
-          info.name);
-    }
-    auto namespaces = std::dynamic_pointer_cast<arrow::StringArray>(
-        values->GetFieldByName("namespace"));
-    auto names = std::dynamic_pointer_cast<arrow::StringArray>(
-        values->GetFieldByName("name"));
-    auto versions = std::dynamic_pointer_cast<arrow::UInt64Array>(
-        values->GetFieldByName("version"));
-    if (!namespaces || !names || !versions) {
-      throw IOException("Function '%s' additional_filter_functions has an "
-                        "invalid struct schema",
-                        info.name);
-    }
-    for (auto i = list_array->value_offset(row_idx);
-         i < list_array->value_offset(row_idx + 1); i++) {
-      if (values->IsNull(i) || namespaces->IsNull(i) || names->IsNull(i) ||
-          versions->IsNull(i)) {
-        throw IOException(
-            "Function '%s' additional_filter_functions contains NULL",
-            info.name);
-      }
-      info.additional_filter_functions.push_back(
-          {namespaces->GetString(i), names->GetString(i), versions->Value(i)});
-    }
-  };
-  if (additional_functions) {
-    if (auto list_array =
-            std::dynamic_pointer_cast<arrow::ListArray>(additional_functions)) {
-      extract_filter_functions(list_array);
-    } else if (auto list_array =
-                   std::dynamic_pointer_cast<arrow::LargeListArray>(
-                       additional_functions)) {
-      extract_filter_functions(list_array);
-    } else {
-      throw IOException(
-          "Function '%s' additional_filter_functions must be a list",
-          info.name);
-    }
-  }
+	// max_workers (nullable int, stored as optional)
+	info.max_workers = row["max_workers"].as<int32_t>();
 
-  // max_workers (nullable int, stored as optional)
-  info.max_workers = row["max_workers"].as<int32_t>();
+	// supports_batch_index — optional bool (defaults to false for older
+	// workers). When true, the function emits ``vgi_batch_index`` in each
+	// Arrow batch's KeyValueMetadata; the extension threads the value
+	// through ``TableFunction::get_partition_data`` so ordered sinks can
+	// reassemble parallel output. Also skips the FIXED_ORDER MaxThreads=1
+	// clamp — see vgi_table_function_set.cpp.
+	info.supports_batch_index = row["supports_batch_index"].value_or(false);
 
-  // supports_batch_index — optional bool (defaults to false for older
-  // workers). When true, the function emits ``vgi_batch_index`` in each
-  // Arrow batch's KeyValueMetadata; the extension threads the value
-  // through ``TableFunction::get_partition_data`` so ordered sinks can
-  // reassemble parallel output. Also skips the FIXED_ORDER MaxThreads=1
-  // clamp — see vgi_table_function_set.cpp.
-  info.supports_batch_index = row["supports_batch_index"].value_or(false);
+	// supports_splits / filters_exactly_applied / supports_positions — optional
+	// bools, false for pre-1.4.0 workers. split_token_ttl_seconds is nullable and
+	// nullopt means unbounded, NOT "expires immediately".
+	info.supports_splits = row["supports_splits"].value_or(false);
+	info.filters_exactly_applied = row["filters_exactly_applied"].value_or(false);
+	info.supports_positions = row["supports_positions"].value_or(false);
+	info.split_token_ttl_seconds = row["split_token_ttl_seconds"].as<int64_t>();
 
-  // supports_splits / filters_exactly_applied / supports_positions — optional
-  // bools, false for pre-1.4.0 workers. split_token_ttl_seconds is nullable and
-  // nullopt means unbounded, NOT "expires immediately".
-  info.supports_splits = row["supports_splits"].value_or(false);
-  info.filters_exactly_applied = row["filters_exactly_applied"].value_or(false);
-  info.supports_positions = row["supports_positions"].value_or(false);
-  info.split_token_ttl_seconds = row["split_token_ttl_seconds"].as<int64_t>();
+	// partition_kind — optional string mirroring DuckDB's
+	// TablePartitionInfo enum. Defaults to NOT_PARTITIONED for older
+	// workers. When non-default, vgi_table_function_set.cpp installs
+	// ``TableFunction::get_partition_info`` returning the corresponding
+	// value so the planner can pick PhysicalPartitionedAggregate for
+	// matching GROUP BY queries. Only ``SINGLE_VALUE_PARTITIONS``
+	// materially affects planner behavior today.
+	// .value_or() supplies a valid default when the field is absent, so any
+	// parse failure here is a genuinely unrecognized non-empty wire string.
+	auto partition_kind_str = row["partition_kind"].value_or(std::string {"NOT_PARTITIONED"});
+	info.partition_kind = RequireKnownEnum(ParseVgiPartitionKind(partition_kind_str), partition_kind_str,
+	                                       "partition_kind", worker_path, info.name);
 
-  // partition_kind — optional string mirroring DuckDB's
-  // TablePartitionInfo enum. Defaults to NOT_PARTITIONED for older
-  // workers. When non-default, vgi_table_function_set.cpp installs
-  // ``TableFunction::get_partition_info`` returning the corresponding
-  // value so the planner can pick PhysicalPartitionedAggregate for
-  // matching GROUP BY queries. Only ``SINGLE_VALUE_PARTITIONS``
-  // materially affects planner behavior today.
-  // .value_or() supplies a valid default when the field is absent, so any
-  // parse failure here is a genuinely unrecognized non-empty wire string.
-  auto partition_kind_str =
-      row["partition_kind"].value_or(std::string{"NOT_PARTITIONED"});
-  info.partition_kind = RequireKnownEnum(
-      ParseVgiPartitionKind(partition_kind_str), partition_kind_str,
-      "partition_kind", worker_path, info.name);
+	// Aggregate function fields (non-nullable with defaults)
+	auto order_dependent_str = row["order_dependent"].value_or(std::string {"NOT_ORDER_DEPENDENT"});
+	info.order_dependent = RequireKnownEnum(ParseAggregateOrderDependent(order_dependent_str), order_dependent_str,
+	                                        "order_dependent", worker_path, info.name);
 
-  // Aggregate function fields (non-nullable with defaults)
-  auto order_dependent_str =
-      row["order_dependent"].value_or(std::string{"NOT_ORDER_DEPENDENT"});
-  info.order_dependent = RequireKnownEnum(
-      ParseAggregateOrderDependent(order_dependent_str), order_dependent_str,
-      "order_dependent", worker_path, info.name);
+	auto distinct_dependent_str = row["distinct_dependent"].value_or(std::string {"NOT_DISTINCT_DEPENDENT"});
+	info.distinct_dependent = RequireKnownEnum(ParseAggregateDistinctDependent(distinct_dependent_str),
+	                                           distinct_dependent_str, "distinct_dependent", worker_path, info.name);
 
-  auto distinct_dependent_str =
-      row["distinct_dependent"].value_or(std::string{"NOT_DISTINCT_DEPENDENT"});
-  info.distinct_dependent = RequireKnownEnum(
-      ParseAggregateDistinctDependent(distinct_dependent_str),
-      distinct_dependent_str, "distinct_dependent", worker_path, info.name);
+	// supports_window — optional bool (defaults to false for older workers).
+	info.supports_window = row["supports_window"].value_or(false);
 
-  // supports_window — optional bool (defaults to false for older workers).
-  info.supports_window = row["supports_window"].value_or(false);
+	// streaming_partitioned — optional bool (defaults to false for older
+	// workers). When true, the function declares the
+	// aggregate_streaming_open/_chunk/_close protocol; the extension's
+	// optimizer rule may rewrite eligible LogicalWindow nodes to use it.
+	info.streaming_partitioned = row["streaming_partitioned"].value_or(false);
 
-  // streaming_partitioned — optional bool (defaults to false for older
-  // workers). When true, the function declares the
-  // aggregate_streaming_open/_chunk/_close protocol; the extension's
-  // optimizer rule may rewrite eligible LogicalWindow nodes to use it.
-  info.streaming_partitioned = row["streaming_partitioned"].value_or(false);
+	// has_finalize — optional bool (defaults to false for older workers).
+	// When false, the table-in-out registration omits in_out_function_final,
+	// which lets the function be used under LATERAL with correlated input.
+	info.has_finalize = row["has_finalize"].value_or(false);
 
-  // has_finalize — optional bool (defaults to false for older workers).
-  // When false, the table-in-out registration omits in_out_function_final,
-  // which lets the function be used under LATERAL with correlated input.
-  info.has_finalize = row["has_finalize"].value_or(false);
+	// Whether the function uses the buffered Sink+Source path is encoded in
+	// ``function_type`` (TableBuffering vs Table) — parsed above. No
+	// separate boolean column on the wire.
 
-  // Whether the function uses the buffered Sink+Source path is encoded in
-  // ``function_type`` (TableBuffering vs Table) — parsed above. No
-  // separate boolean column on the wire.
+	// source_order_dependent — optional bool. Only meaningful when
+	// function_type == TableBuffering; controls ParallelSource on the buffered op.
+	info.source_order_dependent = row["source_order_dependent"].value_or(false);
 
-  // source_order_dependent — optional bool. Only meaningful when
-  // function_type == TableBuffering; controls ParallelSource on the buffered
-  // op.
-  info.source_order_dependent = row["source_order_dependent"].value_or(false);
+	// sink_order_dependent — optional bool. Only meaningful when
+	// function_type == TableBuffering; controls ParallelSink (single-thread ingest).
+	info.sink_order_dependent = row["sink_order_dependent"].value_or(false);
 
-  // sink_order_dependent — optional bool. Only meaningful when
-  // function_type == TableBuffering; controls ParallelSink (single-thread
-  // ingest).
-  info.sink_order_dependent = row["sink_order_dependent"].value_or(false);
+	// requires_input_batch_index — optional bool. Only meaningful when
+	// function_type == TableBuffering; advertises RequiredPartitionInfo()=BatchIndex()
+	// so DuckDB threads source-position metadata to every Sink call.
+	info.requires_input_batch_index = row["requires_input_batch_index"].value_or(false);
 
-  // requires_input_batch_index — optional bool. Only meaningful when
-  // function_type == TableBuffering; advertises
-  // RequiredPartitionInfo()=BatchIndex() so DuckDB threads source-position
-  // metadata to every Sink call.
-  info.requires_input_batch_index =
-      row["requires_input_batch_index"].value_or(false);
+	// input_from_args — optional bool (defaults to false for older workers). A
+	// blended ("UNNEST-style") table-in-out whose positional args ARE its per-row
+	// input columns.
+	info.input_from_args = row["input_from_args"].value_or(false);
 
-  // input_from_args — optional bool (defaults to false for older workers). A
-  // blended ("UNNEST-style") table-in-out whose positional args ARE its per-row
-  // input columns.
-  info.input_from_args = row["input_from_args"].value_or(false);
+	// Required settings for this function (list of strings)
+	info.required_settings = row["required_settings"].value_or(std::vector<std::string> {});
 
-  // Required settings for this function (list of strings)
-  info.required_settings =
-      row["required_settings"].value_or(std::vector<std::string>{});
+	// Required secrets for this function (list of struct<secret_type, secret_name, scope>)
+	// Parse from the Arrow list<struct> column
+	auto secrets_col = batch->GetColumnByName("required_secrets");
+	if (secrets_col && !secrets_col->IsNull(row_idx)) {
+		auto list_array = std::dynamic_pointer_cast<arrow::ListArray>(secrets_col);
+		if (list_array) {
+			auto struct_array = std::dynamic_pointer_cast<arrow::StructArray>(list_array->values());
+			if (struct_array) {
+				int64_t start = list_array->value_offset(row_idx);
+				int64_t end = list_array->value_offset(row_idx + 1);
 
-  // Required secrets for this function (list of struct<secret_type,
-  // secret_name, scope>) Parse from the Arrow list<struct> column
-  auto secrets_col = batch->GetColumnByName("required_secrets");
-  if (secrets_col && !secrets_col->IsNull(row_idx)) {
-    auto list_array = std::dynamic_pointer_cast<arrow::ListArray>(secrets_col);
-    if (list_array) {
-      auto struct_array =
-          std::dynamic_pointer_cast<arrow::StructArray>(list_array->values());
-      if (struct_array) {
-        int64_t start = list_array->value_offset(row_idx);
-        int64_t end = list_array->value_offset(row_idx + 1);
+				auto type_col = std::dynamic_pointer_cast<arrow::StringArray>(struct_array->GetFieldByName("secret_type"));
+				auto name_col = std::dynamic_pointer_cast<arrow::StringArray>(struct_array->GetFieldByName("secret_name"));
+				auto scope_col = std::dynamic_pointer_cast<arrow::StringArray>(struct_array->GetFieldByName("scope"));
 
-        auto type_col = std::dynamic_pointer_cast<arrow::StringArray>(
-            struct_array->GetFieldByName("secret_type"));
-        auto name_col = std::dynamic_pointer_cast<arrow::StringArray>(
-            struct_array->GetFieldByName("secret_name"));
-        auto scope_col = std::dynamic_pointer_cast<arrow::StringArray>(
-            struct_array->GetFieldByName("scope"));
+				for (int64_t i = start; i < end; i++) {
+					VgiSecretRequirement req;
+					if (type_col && !type_col->IsNull(i)) {
+						req.secret_type = type_col->GetString(i);
+					}
+					if (name_col && !name_col->IsNull(i)) {
+						req.name = name_col->GetString(i);
+					}
+					if (scope_col && !scope_col->IsNull(i)) {
+						req.scope = scope_col->GetString(i);
+					}
+					if (!req.secret_type.empty()) {
+						info.required_secrets.push_back(std::move(req));
+					}
+				}
+			}
+		}
+	}
 
-        for (int64_t i = start; i < end; i++) {
-          VgiSecretRequirement req;
-          if (type_col && !type_col->IsNull(i)) {
-            req.secret_type = type_col->GetString(i);
-          }
-          if (name_col && !name_col->IsNull(i)) {
-            req.name = name_col->GetString(i);
-          }
-          if (scope_col && !scope_col->IsNull(i)) {
-            req.scope = scope_col->GetString(i);
-          }
-          if (!req.secret_type.empty()) {
-            info.required_secrets.push_back(std::move(req));
-          }
-        }
-      }
-    }
-  }
-
-  return info;
+	return info;
 }
 
 // ============================================================================
@@ -3586,31 +3162,30 @@ ParseFunctionInfo(const std::shared_ptr<arrow::RecordBatch> &batch,
 
 // Extract key-value pairs from a KeyValueSecret into a map.
 // Must be called while the secret reference is still valid.
-static std::map<std::string, Value>
-ExtractSecretKeyValues(const KeyValueSecret &kv_secret) {
-  std::map<std::string, Value> kv_pairs;
-  // Add standard fields from BaseSecret
-  kv_pairs["type"] = Value(kv_secret.GetType());
-  kv_pairs["provider"] = Value(kv_secret.GetProvider());
-  kv_pairs["name"] = Value(kv_secret.GetName());
-  // Add all custom key-value entries
-  for (const auto &[k, v] : kv_secret.secret_map) {
-    kv_pairs[k] = v;
-  }
-  // Add the secret's scope prefixes (newline-joined), set AFTER the secret_map
-  // loop so it is reliable for worker-side scope matching. Lets a worker that
-  // requested several scopes pick the right secret per path (e.g. per S3
-  // bucket). Empty for an unscoped secret (matches anything as a fallback).
-  const auto &scope = kv_secret.GetScope();
-  std::string joined_scope;
-  for (idx_t i = 0; i < scope.size(); i++) {
-    if (i > 0) {
-      joined_scope += "\n";
-    }
-    joined_scope += scope[i];
-  }
-  kv_pairs["scope"] = Value(joined_scope);
-  return kv_pairs;
+static std::map<std::string, Value> ExtractSecretKeyValues(const KeyValueSecret &kv_secret) {
+	std::map<std::string, Value> kv_pairs;
+	// Add standard fields from BaseSecret
+	kv_pairs["type"] = Value(kv_secret.GetType());
+	kv_pairs["provider"] = Value(kv_secret.GetProvider());
+	kv_pairs["name"] = Value(kv_secret.GetName());
+	// Add all custom key-value entries
+	for (const auto &[k, v] : kv_secret.secret_map) {
+		kv_pairs[k] = v;
+	}
+	// Add the secret's scope prefixes (newline-joined), set AFTER the secret_map
+	// loop so it is reliable for worker-side scope matching. Lets a worker that
+	// requested several scopes pick the right secret per path (e.g. per S3
+	// bucket). Empty for an unscoped secret (matches anything as a fallback).
+	const auto &scope = kv_secret.GetScope();
+	std::string joined_scope;
+	for (idx_t i = 0; i < scope.size(); i++) {
+		if (i > 0) {
+			joined_scope += "\n";
+		}
+		joined_scope += scope[i];
+	}
+	kv_pairs["scope"] = Value(joined_scope);
+	return kv_pairs;
 }
 
 // Insert a resolved secret's fields into `result`, keyed by the secret's unique
@@ -3619,57 +3194,52 @@ ExtractSecretKeyValues(const KeyValueSecret &kv_secret) {
 // name). The serialized `type`/`scope`/... fields let the worker select per
 // path via `Secrets::for_scope`. (No name should be empty, but fall back to the
 // type to avoid an empty key colliding.)
-static void InsertResolvedSecret(
-    std::map<std::string, std::map<std::string, Value>> &result,
-    const std::string &secret_type, const KeyValueSecret &kv_secret) {
-  std::string key = kv_secret.GetName();
-  if (key.empty()) {
-    key = secret_type;
-  }
-  result[key] = ExtractSecretKeyValues(kv_secret);
+static void InsertResolvedSecret(std::map<std::string, std::map<std::string, Value>> &result,
+                                 const std::string &secret_type, const KeyValueSecret &kv_secret) {
+	std::string key = kv_secret.GetName();
+	if (key.empty()) {
+		key = secret_type;
+	}
+	result[key] = ExtractSecretKeyValues(kv_secret);
 }
 
-std::map<std::string, std::map<std::string, Value>>
-ExtractVgiSecrets(ClientContext &context,
-                  const std::vector<VgiSecretRequirement> &requirements) {
-  std::map<std::string, std::map<std::string, Value>> result;
+std::map<std::string, std::map<std::string, Value>> ExtractVgiSecrets(
+    ClientContext &context, const std::vector<VgiSecretRequirement> &requirements) {
+	std::map<std::string, std::map<std::string, Value>> result;
 
-  if (requirements.empty()) {
-    return result;
-  }
+	if (requirements.empty()) {
+		return result;
+	}
 
-  auto &secret_manager = SecretManager::Get(context);
-  auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
+	auto &secret_manager = SecretManager::Get(context);
+	auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
 
-  for (const auto &req : requirements) {
-    if (!req.name.empty()) {
-      // Name-based lookup (optionally constrained by type)
-      auto secret_entry = secret_manager.GetSecretByName(transaction, req.name);
-      if (secret_entry) {
-        auto &base_secret = secret_entry->secret;
-        if (base_secret->GetType() == req.secret_type) {
-          auto *kv_secret =
-              dynamic_cast<const KeyValueSecret *>(base_secret.get());
-          if (kv_secret) {
-            InsertResolvedSecret(result, req.secret_type, *kv_secret);
-          }
-        }
-      }
-    } else {
-      // Scope-based lookup (unscoped if scope is empty)
-      auto match =
-          secret_manager.LookupSecret(transaction, req.scope, req.secret_type);
-      if (match.HasMatch()) {
-        auto *kv_secret =
-            dynamic_cast<const KeyValueSecret *>(&match.GetSecret());
-        if (kv_secret) {
-          InsertResolvedSecret(result, req.secret_type, *kv_secret);
-        }
-      }
-    }
-  }
+	for (const auto &req : requirements) {
+		if (!req.name.empty()) {
+			// Name-based lookup (optionally constrained by type)
+			auto secret_entry = secret_manager.GetSecretByName(transaction, req.name);
+			if (secret_entry) {
+				auto &base_secret = secret_entry->secret;
+				if (base_secret->GetType() == req.secret_type) {
+					auto *kv_secret = dynamic_cast<const KeyValueSecret *>(base_secret.get());
+					if (kv_secret) {
+						InsertResolvedSecret(result, req.secret_type, *kv_secret);
+					}
+				}
+			}
+		} else {
+			// Scope-based lookup (unscoped if scope is empty)
+			auto match = secret_manager.LookupSecret(transaction, req.scope, req.secret_type);
+			if (match.HasMatch()) {
+				auto *kv_secret = dynamic_cast<const KeyValueSecret *>(&match.GetSecret());
+				if (kv_secret) {
+					InsertResolvedSecret(result, req.secret_type, *kv_secret);
+				}
+			}
+		}
+	}
 
-  return result;
+	return result;
 }
 
 } // namespace vgi
