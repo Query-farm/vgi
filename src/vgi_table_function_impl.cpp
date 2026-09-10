@@ -241,6 +241,7 @@ unique_ptr<FunctionData> VgiTableFunctionBindData::Copy() const {
 	result->cardinality_fetched = cardinality_fetched;
 	result->projection_pushdown = projection_pushdown;
 	result->filter_semantic_profiles = filter_semantic_profiles;
+	result->additional_filter_functions = additional_filter_functions;
 
 	result->all_column_names = all_column_names;
 	result->all_column_types = all_column_types;
@@ -379,20 +380,42 @@ void PerformVgiTableFunctionBind(ClientContext &context, VgiTableFunctionBindDat
 
 namespace {
 
+bool HasFilterFunctionCapability(const vector<VgiFilterFunctionCapability> &capabilities, const string &namespace_name,
+                                 const string &name, uint64_t version) {
+	for (const auto &capability : capabilities) {
+		if (capability.namespace_name == namespace_name && capability.name == name && capability.version == version) {
+			return true;
+		}
+	}
+	return false;
+}
+
 //! Pure eligibility check shared by the pushdown callback and v2 serializer.
 //! DuckDB 1.5 calls this before replacing the sole BoundColumnRef with a
 //! BoundReferenceExpression, so both forms are accepted as the same root.
-bool ExpressionTreeIsSupported(const Expression &expr) {
+bool ExpressionTreeIsSupported(const Expression &expr,
+                               const vector<VgiFilterFunctionCapability> &additional_functions) {
 	switch (expr.GetExpressionClass()) {
 	case ExpressionClass::BOUND_REF:
 		return expr.Cast<BoundReferenceExpression>().index == 0;
 	case ExpressionClass::BOUND_COLUMN_REF:
 	case ExpressionClass::BOUND_CONSTANT:
 		return true;
-	case ExpressionClass::BOUND_FUNCTION:
-		// DuckDB 1.5 exposes no stable semantic identity for these overloads.
-		// A displayed name alone cannot prove vgi.duckdb.standard.v1 semantics.
-		return false;
+	case ExpressionClass::BOUND_FUNCTION: {
+		auto &function = expr.Cast<BoundFunctionExpression>();
+		auto name = StringUtil::Lower(function.function.name);
+		if ((name != "&&" && name != "st_intersects_extent") || function.children.size() != 2 ||
+		    function.return_type.id() != LogicalTypeId::BOOLEAN ||
+		    !HasFilterFunctionCapability(additional_functions, "duckdb.spatial", "intersects_extent", 1)) {
+			return false;
+		}
+		for (const auto &child : function.children) {
+			if (!ExpressionTreeIsSupported(*child, additional_functions)) {
+				return false;
+			}
+		}
+		return true;
+	}
 	case ExpressionClass::BOUND_COMPARISON: {
 		auto &comp_expr = expr.Cast<BoundComparisonExpression>();
 		switch (comp_expr.GetExpressionType()) {
@@ -404,7 +427,8 @@ bool ExpressionTreeIsSupported(const Expression &expr) {
 		case ExpressionType::COMPARE_LESSTHANOREQUALTO:
 		case ExpressionType::COMPARE_DISTINCT_FROM:
 		case ExpressionType::COMPARE_NOT_DISTINCT_FROM:
-			return ExpressionTreeIsSupported(*comp_expr.left) && ExpressionTreeIsSupported(*comp_expr.right);
+			return ExpressionTreeIsSupported(*comp_expr.left, additional_functions) &&
+			       ExpressionTreeIsSupported(*comp_expr.right, additional_functions);
 		default:
 			return false;
 		}
@@ -417,7 +441,7 @@ bool ExpressionTreeIsSupported(const Expression &expr) {
 			return false;
 		}
 		for (auto &child : conj_expr.children) {
-			if (!ExpressionTreeIsSupported(*child)) {
+			if (!ExpressionTreeIsSupported(*child, additional_functions)) {
 				return false;
 			}
 		}
@@ -429,10 +453,10 @@ bool ExpressionTreeIsSupported(const Expression &expr) {
 		case ExpressionType::OPERATOR_IS_NULL:
 		case ExpressionType::OPERATOR_IS_NOT_NULL:
 		case ExpressionType::OPERATOR_NOT:
-			return op.children.size() == 1 && ExpressionTreeIsSupported(*op.children[0]);
+			return op.children.size() == 1 && ExpressionTreeIsSupported(*op.children[0], additional_functions);
 		case ExpressionType::COMPARE_IN:
 		case ExpressionType::COMPARE_NOT_IN:
-			if (op.children.size() < 2 || !ExpressionTreeIsSupported(*op.children[0])) {
+			if (op.children.size() < 2 || !ExpressionTreeIsSupported(*op.children[0], additional_functions)) {
 				return false;
 			}
 			for (idx_t i = 1; i < op.children.size(); i++) {
@@ -451,7 +475,7 @@ bool ExpressionTreeIsSupported(const Expression &expr) {
 		// context-independent numeric coercions until session-profile capture is
 		// available from generated capability metadata.
 		return !cast.try_cast && cast.child->return_type.IsNumeric() && cast.return_type.IsNumeric() &&
-		       ExpressionTreeIsSupported(*cast.child);
+		       ExpressionTreeIsSupported(*cast.child, additional_functions);
 	}
 	default:
 		return false;
@@ -469,7 +493,7 @@ bool VgiPushdownExpression(ClientContext &context, const LogicalGet &get, Expres
 	              "vgi.duckdb.standard.v1") == bind_data.filter_semantic_profiles.end()) {
 		return false;
 	}
-	bool supported = ExpressionTreeIsSupported(expr);
+	bool supported = ExpressionTreeIsSupported(expr, bind_data.additional_filter_functions);
 	if (supported) {
 		VGI_LOG(context, "table_function.expression_filter_accepted",
 		        {{"function_name", bind_data.function_name}, {"expression", expr.ToString()}});
@@ -604,9 +628,10 @@ namespace { // reopen anonymous namespace for the file-local FilterSerializer.
 //! FilterSerializer walks the filter tree, builds JSON, and collects values
 class FilterSerializer {
 public:
-	FilterSerializer(const string &worker_path, idx_t join_keys_max_bytes, bool allow_external_sets = true)
+	FilterSerializer(const string &worker_path, idx_t join_keys_max_bytes, bool allow_external_sets = true,
+	                 vector<VgiFilterFunctionCapability> additional_functions = {})
 	    : doc_(yyjson_mut_doc_new(nullptr)), worker_path_(worker_path), join_keys_max_bytes_(join_keys_max_bytes),
-	      allow_external_sets_(allow_external_sets) {
+	      allow_external_sets_(allow_external_sets), additional_functions_(std::move(additional_functions)) {
 	}
 
 	~FilterSerializer() {
@@ -758,7 +783,7 @@ private:
 		}
 		case TableFilterType::EXPRESSION_FILTER: {
 			auto &expr_filter = filter.Cast<ExpressionFilter>();
-			if (!ExpressionTreeIsSupported(*expr_filter.expr)) {
+			if (!ExpressionTreeIsSupported(*expr_filter.expr, additional_functions_)) {
 				throw InvalidInputException("VGI required expression filter is not eligible for v2 serialization");
 			}
 			return SerializeExpression(*expr_filter.expr, column_index, column_name);
@@ -810,6 +835,26 @@ private:
 		}
 		case ExpressionClass::BOUND_CONSTANT:
 			return Literal(expr.Cast<BoundConstantExpression>().value);
+		case ExpressionClass::BOUND_FUNCTION: {
+			auto &function = expr.Cast<BoundFunctionExpression>();
+			auto name = StringUtil::Lower(function.function.name);
+			if ((name != "&&" && name != "st_intersects_extent") || function.children.size() != 2 ||
+			    !HasFilterFunctionCapability(additional_functions_, "duckdb.spatial", "intersects_extent", 1)) {
+				break;
+			}
+			yyjson_mut_obj_add_str(doc_, obj, "node", "call");
+			auto identity = yyjson_mut_obj(doc_);
+			yyjson_mut_obj_add_str(doc_, identity, "namespace", "duckdb.spatial");
+			yyjson_mut_obj_add_str(doc_, identity, "name", "intersects_extent");
+			yyjson_mut_obj_add_uint(doc_, identity, "version", 1);
+			yyjson_mut_obj_add_val(doc_, obj, "function", identity);
+			auto arguments = yyjson_mut_arr(doc_);
+			for (const auto &child : function.children) {
+				yyjson_mut_arr_append(arguments, SerializeExpression(*child, column_index, column_name));
+			}
+			yyjson_mut_obj_add_val(doc_, obj, "arguments", arguments);
+			return obj;
+		}
 		case ExpressionClass::BOUND_COMPARISON: {
 			auto &comparison = expr.Cast<BoundComparisonExpression>();
 			auto op = ExpressionTypeToOp(comparison.GetExpressionType());
@@ -926,6 +971,7 @@ private:
 	string worker_path_;
 	idx_t join_keys_max_bytes_;
 	bool allow_external_sets_;
+	vector<VgiFilterFunctionCapability> additional_functions_;
 	vector<Value> values_;
 	vector<LogicalType> value_types_;
 	vector<string> value_names_;
@@ -945,7 +991,8 @@ SerializedFilters VgiSerializeFilters(ClientContext &context, const vector<colum
                                       optional_ptr<TableFilterSet> filters, const vector<string> &column_names,
                                       const string &worker_path, const string &rowid_column_name,
                                       int64_t rowid_worker_col_index, const std::set<idx_t> *exclude_filter_keys,
-                                      VgiFilterColumnIndexDomain index_domain) {
+                                      VgiFilterColumnIndexDomain index_domain,
+                                      const vector<VgiFilterFunctionCapability> &additional_functions) {
 	// Return empty if no filters
 	if (!filters || filters->filters.empty()) {
 		return {nullptr, {}};
@@ -960,7 +1007,7 @@ SerializedFilters VgiSerializeFilters(ClientContext &context, const vector<colum
 
 	// Build a v2 snapshot. DuckDB 1.5 table filters are single-column, but
 	// every reference still names the unprojected bind-schema field.
-	FilterSerializer serializer(worker_path, join_keys_max_bytes);
+	FilterSerializer serializer(worker_path, join_keys_max_bytes, true, additional_functions);
 	auto document = yyjson_mut_obj(serializer.GetDoc());
 	yyjson_mut_obj_add_str(serializer.GetDoc(), document, "encoding", "vgi.filters.v2");
 	yyjson_mut_obj_add_str(serializer.GetDoc(), document, "semantics", "vgi.duckdb.standard.v1");
@@ -1496,7 +1543,8 @@ static void ClassifyPartitionFilters(ClientContext &context, const VgiTableFunct
 			auto sf = VgiSerializeFilters(context, input.column_ids, input.filters,
 			                              bind_data.all_column_names, bind_data.worker_path(),
 			                              bind_data.rowid_column_name, bind_data.rowid_worker_col_index,
-			                              &exclude_keys);
+			                              &exclude_keys, VgiFilterColumnIndexDomain::PROJECTED,
+			                              bind_data.additional_filter_functions);
 			if (sf.filter_bytes) {
 				e.partition_residual_filter_bytes.append(reinterpret_cast<const char *>(sf.filter_bytes->data()),
 				                                         static_cast<size_t>(sf.filter_bytes->size()));
@@ -1675,7 +1723,9 @@ CacheEligibility EvaluateCacheEligibility(ClientContext &context,
 			try {
 				auto sf = VgiSerializeFilters(context, input.column_ids, input.filters,
 				                              bind_data.all_column_names, bind_data.worker_path(),
-				                              bind_data.rowid_column_name, bind_data.rowid_worker_col_index);
+				                              bind_data.rowid_column_name, bind_data.rowid_worker_col_index, nullptr,
+				                              VgiFilterColumnIndexDomain::PROJECTED,
+				                              bind_data.additional_filter_functions);
 				if (sf.filter_bytes) {
 					filter_key.append(reinterpret_cast<const char *>(sf.filter_bytes->data()),
 					                  static_cast<size_t>(sf.filter_bytes->size()));
@@ -2189,7 +2239,9 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 	// silently continuing would run the remote scan without the removed residual.
 	auto serialized_filters =
 	    VgiSerializeFilters(context, input.column_ids, input.filters, bind_data.all_column_names,
-	                        bind_data.worker_path(), bind_data.rowid_column_name, bind_data.rowid_worker_col_index);
+	                        bind_data.worker_path(), bind_data.rowid_column_name, bind_data.rowid_worker_col_index,
+	                        nullptr, VgiFilterColumnIndexDomain::PROJECTED,
+	                        bind_data.additional_filter_functions);
 	if (serialized_filters.filter_bytes) {
 		VGI_LOG(context, "table_function.filters_serialized",
 		        {{"function_name", bind_data.function_name},
@@ -2263,23 +2315,35 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 			// DynamicFilter, so it normally doesn't reach this loop, but a future
 			// rowid DynamicFilter would otherwise be misnamed.
 			string col_name;
+			idx_t worker_col_idx;
 			if (original_col_idx == COLUMN_IDENTIFIER_ROW_ID && !bind_data.rowid_column_name.empty()) {
 				col_name = bind_data.rowid_column_name;
+				if (bind_data.rowid_worker_col_index < 0) {
+					continue;
+				}
+				worker_col_idx = NumericCast<idx_t>(bind_data.rowid_worker_col_index);
 			} else {
-				col_name = original_col_idx < bind_data.all_column_names.size()
-				               ? bind_data.all_column_names[original_col_idx]
-				               : std::to_string(original_col_idx);
+				if (original_col_idx == COLUMN_IDENTIFIER_ROW_ID ||
+				    original_col_idx >= bind_data.all_column_names.size()) {
+					continue;
+				}
+				col_name = bind_data.all_column_names[original_col_idx];
+				worker_col_idx = original_col_idx;
+				if (bind_data.rowid_worker_col_index >= 0 &&
+				    worker_col_idx >= NumericCast<idx_t>(bind_data.rowid_worker_col_index)) {
+					worker_col_idx++;
+				}
 			}
 
 			if (filter.filter_type == TableFilterType::OPTIONAL_FILTER) {
-				try_capture_from_optional(original_col_idx, col_name, filter.Cast<OptionalFilter>());
+				try_capture_from_optional(worker_col_idx, col_name, filter.Cast<OptionalFilter>());
 			} else if (filter.filter_type == TableFilterType::CONJUNCTION_AND) {
 				// DuckDB may combine ConstantFilter + OptionalFilter(DynamicFilter)
 				// on the same column into a ConjunctionAndFilter
 				auto &conj = filter.Cast<ConjunctionAndFilter>();
 				for (auto &child : conj.child_filters) {
 					if (child->filter_type == TableFilterType::OPTIONAL_FILTER) {
-						try_capture_from_optional(original_col_idx, col_name, child->Cast<OptionalFilter>());
+						try_capture_from_optional(worker_col_idx, col_name, child->Cast<OptionalFilter>());
 					}
 				}
 			}
@@ -2749,7 +2813,8 @@ unique_ptr<LocalTableFunctionState> VgiTableFunctionInitLocal(ExecutionContext &
 				    global_state.table_sample_hint, global_state.init_opaque_data);
 			} else {
 				local_state->connection()->PerformInit(
-				    secondary_bind_result, {}, nullptr, {}, "",
+				    secondary_bind_result, {}, global_state.static_filter_bytes,
+				    global_state.join_keys_buffers, "",
 				    std::nullopt, std::nullopt, global_state.init_opaque_data);
 			}
 		};

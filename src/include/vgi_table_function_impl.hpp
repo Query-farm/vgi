@@ -204,8 +204,9 @@ struct VgiTableFunctionBindData : public TableFunctionData {
 	// Whether this function supports projection pushdown (from FunctionInfo)
 	bool projection_pushdown = false;
 
-	// Expression filter function names the worker supports (e.g., ["&&", "st_intersects_extent"])
+	// VGI v2 expression-filter capabilities advertised by the worker.
 	std::vector<std::string> filter_semantic_profiles;
+	std::vector<VgiFilterFunctionCapability> additional_filter_functions;
 
 	vector<string> all_column_names;
 	// Parallel to all_column_names — populated during bind for the stats callback so it
@@ -286,7 +287,7 @@ struct VgiTableFunctionBindData : public TableFunctionData {
 struct VgiDynamicFilterInfo {
 	//! The shared dynamic filter data (holds the mutable ConstantFilter value)
 	shared_ptr<DynamicFilterData> filter_data;
-	//! Column index in the projected column list
+	//! Column index in the worker's unprojected output schema
 	idx_t column_index;
 	//! Column name for serialization
 	string column_name;
@@ -864,7 +865,8 @@ SerializedFilters VgiSerializeFilters(ClientContext &context, const vector<colum
                                       const string &rowid_column_name = "",
                                       int64_t rowid_worker_col_index = -1,
                                       const std::set<idx_t> *exclude_filter_keys = nullptr,
-                                      VgiFilterColumnIndexDomain index_domain = VgiFilterColumnIndexDomain::PROJECTED);
+                                      VgiFilterColumnIndexDomain index_domain = VgiFilterColumnIndexDomain::PROJECTED,
+                                      const vector<VgiFilterFunctionCapability> &additional_functions = {});
 
 //! One revisioned runtime-filter mutation carried in a v2 delta batch.
 //! A remove has a null filter; an upsert points at a filter that remains alive
