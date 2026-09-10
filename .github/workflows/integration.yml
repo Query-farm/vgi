@@ -12,15 +12,9 @@
 # they are deliberately absent from the published wheel, which would otherwise
 # pollute end-user PATH.
 #
-# VGI_FIXTURES_REF pins the revision to a release tag, or to an exact commit
-# while the matching protocol release is being prepared. Never default it to
-# `main`: a protocol bump landing on either side would make otherwise unchanged
-# integration runs non-reproducible.
-#
-# Bump this in lockstep with the protocol: it must name a vgi-python revision
-# speaking the same VGI_PROTOCOL_VERSION as src/, or ATTACH fails with a message
-# naming both versions. Replace an interim commit with its release tag once the
-# release exists. Override per-run via the workflow_dispatch input.
+# Integration follows vgi-python's default branch so changes merged across the
+# two repositories are continuously tested together. workflow_dispatch accepts
+# an explicit revision only for targeted qualification runs.
 name: Integration suite
 
 on:
@@ -31,7 +25,6 @@ on:
       fixtures_ref:
         description: "vgi-python revision to take the fixture workers from"
         required: false
-        default: 023906a7cf8df699415a36cdb2c08462a9eef183
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -45,8 +38,7 @@ jobs:
     env:
       VGI_INSTALL_FIXTURES: "1"
       VGI_FIXTURES_DIR: /tmp/vgi-python
-      # vgi-python protocol 2.0.0; replace with its release tag when published.
-      VGI_FIXTURES_REF: ${{ inputs.fixtures_ref || '023906a7cf8df699415a36cdb2c08462a9eef183' }}
+      VGI_FIXTURES_REF: ${{ inputs.fixtures_ref }}
       GEN: ninja
       BUILD_VGI_FILTER_V2_TESTS: "1"
       USE_MERGED_VCPKG_MANIFEST: "1"
