@@ -522,9 +522,13 @@ if((BUILD_VGI_UNIT_TESTS OR DEFINED ENV{BUILD_VGI_UNIT_TESTS}) AND NOT WIN32)
   target_compile_definitions(vgi_unit_tests PRIVATE
     "VGI_LAUNCHER_TEST_WORKER_PATH=\"$<TARGET_FILE:launcher_test_worker>\"")
 
-  # Wire-level filter tests exercise the real producer in the static extension.
-  # Keep them separate from vgi_unit_tests, whose SAB test doubles intentionally
-  # replace several production symbols.
+endif()
+
+# Wire-level filter tests exercise the real producer in the static extension.
+# Keep them independently selectable: vgi_unit_tests needs additional Rust
+# static libraries, while this target only needs the normal extension build.
+if((BUILD_VGI_FILTER_V2_TESTS OR DEFINED ENV{BUILD_VGI_FILTER_V2_TESTS} OR BUILD_VGI_UNIT_TESTS OR
+    DEFINED ENV{BUILD_VGI_UNIT_TESTS}) AND NOT WIN32)
   add_executable(vgi_filter_v2_tests
     test/cpp/test_main.cpp
     test/cpp/test_filter_encoding_v2.cpp)

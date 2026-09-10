@@ -8,6 +8,7 @@
 #include "duckdb/planner/filter/constant_filter.hpp"
 #include "duckdb/planner/filter/dynamic_filter.hpp"
 #include "duckdb/planner/filter/in_filter.hpp"
+#include "duckdb/planner/filter/null_filter.hpp"
 #include "duckdb/planner/filter/struct_filter.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
@@ -75,6 +76,51 @@ TEST_CASE("filter v2 snapshot uses schema metadata and unprojected column refs",
 	REQUIRE(json.find("\"mode\":\"required\"") != std::string::npos);
 	REQUIRE(json.find("\"column_index\":1") != std::string::npos);
 	REQUIRE(json.find("\"column_name\":\"actual\"") != std::string::npos);
+}
+
+TEST_CASE("filter v2 maps every comparison operator", "[filter-v2]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	struct ComparisonCase {
+		ExpressionType type;
+		const char *name;
+	};
+	const ComparisonCase cases[] = {
+	    {ExpressionType::COMPARE_EQUAL, "eq"},
+	    {ExpressionType::COMPARE_NOTEQUAL, "ne"},
+	    {ExpressionType::COMPARE_LESSTHAN, "lt"},
+	    {ExpressionType::COMPARE_LESSTHANOREQUALTO, "le"},
+	    {ExpressionType::COMPARE_GREATERTHAN, "gt"},
+	    {ExpressionType::COMPARE_GREATERTHANOREQUALTO, "ge"},
+	    {ExpressionType::COMPARE_DISTINCT_FROM, "distinct_from"},
+	    {ExpressionType::COMPARE_NOT_DISTINCT_FROM, "not_distinct_from"},
+	};
+	for (auto &entry : cases) {
+		CAPTURE(entry.name);
+		TableFilterSet filters;
+		filters.filters[0] = make_uniq<ConstantFilter>(entry.type, Value::INTEGER(1));
+		auto json = FilterSpec(ReadBatch(VgiSerializeFilters(*con.context, {0}, &filters, {"n"}, "test-worker")
+		                                     .filter_bytes));
+		REQUIRE(json.find(string("\"op\":\"") + entry.name + "\"") != std::string::npos);
+	}
+}
+
+TEST_CASE("filter v2 maps null predicates", "[filter-v2]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	for (bool negated : {false, true}) {
+		CAPTURE(negated);
+		TableFilterSet filters;
+		if (negated) {
+			filters.filters[0] = make_uniq<IsNotNullFilter>();
+		} else {
+			filters.filters[0] = make_uniq<IsNullFilter>();
+		}
+		auto json = FilterSpec(ReadBatch(VgiSerializeFilters(*con.context, {0}, &filters, {"n"}, "test-worker")
+		                                     .filter_bytes));
+		REQUIRE(json.find("\"node\":\"is_null\"") != std::string::npos);
+		REQUIRE(json.find(negated ? "\"negated\":true" : "\"negated\":false") != std::string::npos);
+	}
 }
 
 TEST_CASE("filter v2 preserves arbitrarily nested field_ref nodes", "[filter-v2]") {
