@@ -920,8 +920,9 @@ private:
 				                       SerializeExpression(*op.children[0], column_index, column_name));
 				auto set = yyjson_mut_obj(doc_);
 				yyjson_mut_obj_add_str(doc_, set, "kind", "literal");
+				auto value_type = values[0].type();
 				yyjson_mut_obj_add_uint(doc_, set, "value_ref",
-				                        AddValue(Value::LIST(values[0].type(), std::move(values))));
+				                        AddValue(Value::LIST(value_type, std::move(values))));
 				yyjson_mut_obj_add_val(doc_, obj, "set", set);
 				yyjson_mut_obj_add_bool(doc_, obj, "negated", op.GetExpressionType() == ExpressionType::COMPARE_NOT_IN);
 				return obj;
