@@ -282,6 +282,25 @@ TEST_CASE("filter v2 maps DuckDB standard functions to canonical names", "[filte
 	filters.filters[0] = make_uniq<ExpressionFilter>(std::move(call));
 	REQUIRE_THROWS_AS(VgiSerializeFilters(*con.context, {0}, &filters, {"input"}, "test-worker"),
 	                  NotImplementedException);
+
+	auto require_unsupported = [&](const char *name, const LogicalType &first_type, const LogicalType &second_type) {
+		vector<unique_ptr<Expression>> rejected_arguments;
+		rejected_arguments.push_back(make_uniq<BoundReferenceExpression>(first_type, 0));
+		rejected_arguments.push_back(make_uniq<BoundConstantExpression>(Value(second_type)));
+		ScalarFunction rejected_function(name, {first_type, second_type}, LogicalType::BOOLEAN, scalar_function_t {});
+		rejected_function.catalog_name = "system";
+		rejected_function.schema_name = "main";
+		auto rejected_call = make_uniq<BoundFunctionExpression>(LogicalType::BOOLEAN, std::move(rejected_function),
+		                                                       std::move(rejected_arguments), nullptr);
+		TableFilterSet rejected_filters;
+		rejected_filters.filters[0] = make_uniq<ExpressionFilter>(std::move(rejected_call));
+		REQUIRE_THROWS_AS(VgiSerializeFilters(*con.context, {0}, &rejected_filters, {"input"}, "test-worker"),
+		                  NotImplementedException);
+	};
+	require_unsupported("list_contains", LogicalType::LIST(LogicalType::INTEGER), LogicalType::VARCHAR);
+	require_unsupported("contains", LogicalType::VARCHAR_COLLATION("nocase"), LogicalType::VARCHAR);
+	require_unsupported("list_contains", LogicalType::LIST(LogicalType::VARCHAR_COLLATION("nocase")),
+	                    LogicalType::VARCHAR_COLLATION("nocase"));
 }
 
 TEST_CASE("required IN exceeding the transport limit fails closed", "[filter-v2]") {

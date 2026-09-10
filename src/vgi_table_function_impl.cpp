@@ -30,6 +30,7 @@
 #include "duckdb/common/arrow/arrow_converter.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/type_visitor.hpp"
 #include "duckdb/function/table/arrow.hpp"
 #include "duckdb/planner/filter/conjunction_filter.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
@@ -406,21 +407,28 @@ const char *StandardFilterFunctionName(const BoundFunctionExpression &function) 
 		return nullptr;
 	}
 	auto name = StringUtil::Lower(function.function.name);
-	auto first_type = function.children[0]->return_type.id();
-	auto second_type = function.children[1]->return_type.id();
-	if ((name == "starts_with" || name == "prefix") && first_type == LogicalTypeId::VARCHAR &&
-	    second_type == LogicalTypeId::VARCHAR) {
+	auto &first_type = function.children[0]->return_type;
+	auto &second_type = function.children[1]->return_type;
+	auto has_collation = [](const LogicalType &type) {
+		return TypeVisitor::Contains(type, [](const LogicalType &nested_type) {
+			return nested_type.id() == LogicalTypeId::VARCHAR && !StringType::GetCollation(nested_type).empty();
+		});
+	};
+	if ((name == "starts_with" || name == "prefix") && first_type.id() == LogicalTypeId::VARCHAR &&
+	    second_type.id() == LogicalTypeId::VARCHAR && !has_collation(first_type) && !has_collation(second_type)) {
 		return "starts_with";
 	}
-	if ((name == "ends_with" || name == "suffix") && first_type == LogicalTypeId::VARCHAR &&
-	    second_type == LogicalTypeId::VARCHAR) {
+	if ((name == "ends_with" || name == "suffix") && first_type.id() == LogicalTypeId::VARCHAR &&
+	    second_type.id() == LogicalTypeId::VARCHAR && !has_collation(first_type) && !has_collation(second_type)) {
 		return "ends_with";
 	}
-	if (name == "contains" && first_type == LogicalTypeId::VARCHAR && second_type == LogicalTypeId::VARCHAR) {
+	if (name == "contains" && first_type.id() == LogicalTypeId::VARCHAR && second_type.id() == LogicalTypeId::VARCHAR &&
+	    !has_collation(first_type) && !has_collation(second_type)) {
 		return "contains";
 	}
 	if ((name == "list_contains" || name == "array_contains" || name == "contains") &&
-	    first_type == LogicalTypeId::LIST) {
+	    first_type.id() == LogicalTypeId::LIST && ListType::GetChildType(first_type) == second_type &&
+	    !has_collation(first_type)) {
 		return "list_contains";
 	}
 	return nullptr;
