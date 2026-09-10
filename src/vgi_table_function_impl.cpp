@@ -390,6 +390,16 @@ bool HasFilterFunctionCapability(const std::vector<VgiFilterFunctionCapability> 
 	return false;
 }
 
+bool IsIntersectsExtentFunction(const BoundFunctionExpression &function,
+                                const std::vector<VgiFilterFunctionCapability> &additional_functions) {
+	auto name = StringUtil::Lower(function.function.name);
+	return (name == "&&" || name == "st_intersects_extent") && function.children.size() == 2 &&
+	       function.return_type.id() == LogicalTypeId::BOOLEAN &&
+	       function.children[0]->return_type.id() == LogicalTypeId::GEOMETRY &&
+	       function.children[1]->return_type.id() == LogicalTypeId::GEOMETRY &&
+	       HasFilterFunctionCapability(additional_functions, "duckdb.spatial", "intersects_extent", 1);
+}
+
 //! Pure eligibility check shared by the pushdown callback and v2 serializer.
 //! DuckDB 1.5 calls this before replacing the sole BoundColumnRef with a
 //! BoundReferenceExpression, so both forms are accepted as the same root.
@@ -403,10 +413,7 @@ bool ExpressionTreeIsSupported(const Expression &expr,
 		return true;
 	case ExpressionClass::BOUND_FUNCTION: {
 		auto &function = expr.Cast<BoundFunctionExpression>();
-		auto name = StringUtil::Lower(function.function.name);
-		if ((name != "&&" && name != "st_intersects_extent") || function.children.size() != 2 ||
-		    function.return_type.id() != LogicalTypeId::BOOLEAN ||
-		    !HasFilterFunctionCapability(additional_functions, "duckdb.spatial", "intersects_extent", 1)) {
+		if (!IsIntersectsExtentFunction(function, additional_functions)) {
 			return false;
 		}
 		for (const auto &child : function.children) {
@@ -837,9 +844,7 @@ private:
 			return Literal(expr.Cast<BoundConstantExpression>().value);
 		case ExpressionClass::BOUND_FUNCTION: {
 			auto &function = expr.Cast<BoundFunctionExpression>();
-			auto name = StringUtil::Lower(function.function.name);
-			if ((name != "&&" && name != "st_intersects_extent") || function.children.size() != 2 ||
-			    !HasFilterFunctionCapability(additional_functions_, "duckdb.spatial", "intersects_extent", 1)) {
+			if (!IsIntersectsExtentFunction(function, additional_functions_)) {
 				break;
 			}
 			yyjson_mut_obj_add_str(doc_, obj, "node", "call");

@@ -14,6 +14,7 @@
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/planner/filter/optional_filter.hpp"
@@ -272,6 +273,29 @@ TEST_CASE("filter v2 encodes advisory mode and canonical type references", "[fil
 	REQUIRE(json.find("\"type_ref\":0") != std::string::npos);
 	REQUIRE(json.find("\"value_ref\":0") != std::string::npos);
 	REQUIRE(json.find("\"mode\":\"advisory\",\"source\":\"other\"") != std::string::npos);
+}
+
+TEST_CASE("filter v2 gates structured extension calls on exact capabilities", "[filter-v2]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+	vector<unique_ptr<Expression>> arguments;
+	arguments.push_back(make_uniq<BoundReferenceExpression>(LogicalType::GEOMETRY(), 0));
+	arguments.push_back(make_uniq<BoundConstantExpression>(Value::NULLVALUE(LogicalType::GEOMETRY())));
+	ScalarFunction function("&&", {LogicalType::GEOMETRY(), LogicalType::GEOMETRY()}, LogicalType::BOOLEAN,
+	                        scalar_function_t {});
+	auto call = make_uniq<BoundFunctionExpression>(LogicalType::BOOLEAN, std::move(function), std::move(arguments),
+	                                               nullptr, true);
+	TableFilterSet filters;
+	filters.filters[0] = make_uniq<ExpressionFilter>(std::move(call));
+
+	REQUIRE_THROWS_AS(VgiSerializeFilters(*con.context, {0}, &filters, {"geom"}, "test-worker"),
+	                  InvalidInputException);
+	std::vector<VgiFilterFunctionCapability> capabilities {{"duckdb.spatial", "intersects_extent", 1}};
+	auto encoded = VgiSerializeFilters(*con.context, {0}, &filters, {"geom"}, "test-worker", "", -1, nullptr,
+	                                  VgiFilterColumnIndexDomain::PROJECTED, capabilities);
+	auto json = FilterSpec(ReadBatch(encoded.filter_bytes));
+	REQUIRE(json.find("\"function\":{\"namespace\":\"duckdb.spatial\",\"name\":\"intersects_extent\","
+	                  "\"version\":1}") != std::string::npos);
 }
 
 TEST_CASE("filter v2 tick delta carries revisioned upsert and remove", "[filter-v2]") {
