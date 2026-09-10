@@ -3039,6 +3039,39 @@ VgiFunctionInfo ParseFunctionInfo(const std::shared_ptr<arrow::RecordBatch> &bat
 	info.late_materialization = row["late_materialization"].as<bool>();
 	info.filter_semantic_profiles = row["filter_semantic_profiles"].value_or(std::vector<std::string> {});
 
+	auto additional_functions = batch->GetColumnByName("additional_filter_functions");
+	auto extract_filter_functions = [&](auto list_array) {
+		if (!list_array || list_array->IsNull(row_idx)) {
+			return;
+		}
+		auto values = std::dynamic_pointer_cast<arrow::StructArray>(list_array->values());
+		if (!values) {
+			throw IOException("Function '%s' additional_filter_functions must contain structs", info.name);
+		}
+		auto namespaces = std::dynamic_pointer_cast<arrow::StringArray>(values->GetFieldByName("namespace"));
+		auto names = std::dynamic_pointer_cast<arrow::StringArray>(values->GetFieldByName("name"));
+		auto versions = std::dynamic_pointer_cast<arrow::UInt64Array>(values->GetFieldByName("version"));
+		if (!namespaces || !names || !versions) {
+			throw IOException("Function '%s' additional_filter_functions has an invalid struct schema", info.name);
+		}
+		for (auto i = list_array->value_offset(row_idx); i < list_array->value_offset(row_idx + 1); i++) {
+			if (values->IsNull(i) || namespaces->IsNull(i) || names->IsNull(i) || versions->IsNull(i)) {
+				throw IOException("Function '%s' additional_filter_functions contains NULL", info.name);
+			}
+			info.additional_filter_functions.push_back(
+			    {namespaces->GetString(i), names->GetString(i), versions->Value(i)});
+		}
+	};
+	if (additional_functions) {
+		if (auto list_array = std::dynamic_pointer_cast<arrow::ListArray>(additional_functions)) {
+			extract_filter_functions(list_array);
+		} else if (auto list_array = std::dynamic_pointer_cast<arrow::LargeListArray>(additional_functions)) {
+			extract_filter_functions(list_array);
+		} else {
+			throw IOException("Function '%s' additional_filter_functions must be a list", info.name);
+		}
+	}
+
 	// max_workers (nullable int, stored as optional)
 	info.max_workers = row["max_workers"].as<int32_t>();
 

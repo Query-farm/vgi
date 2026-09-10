@@ -518,6 +518,7 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 	OrderPreservationType resolved_order_preservation = OrderPreservationType::INSERTION_ORDER;
 	bool order_preservation_set = false;
 	std::vector<std::string> scan_filter_semantic_profiles;
+	std::vector<vgi::VgiFilterFunctionCapability> scan_additional_filter_functions;
 	std::vector<vgi::VgiSecretRequirement> scan_required_secrets;
 	// Which schema the scan function actually resolved in. The worker registers
 	// function names per schema and may reuse one name across schemas, so the
@@ -700,6 +701,7 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 				auto &vgi_tf_info = tf.function_info->Cast<vgi::VgiTableFunctionInfo>();
 				scan_required_secrets = vgi_tf_info.function_info().required_secrets;
 				scan_filter_semantic_profiles = vgi_tf_info.function_info().filter_semantic_profiles;
+				scan_additional_filter_functions = vgi_tf_info.function_info().additional_filter_functions;
 				// late_materialization is advertised on the parsed worker metadata
 				// (VgiFunctionInfo), not on DuckDB's TableFunction — the synthetic
 				// vgi_table_scan below is constructed fresh, so read the capability
@@ -723,6 +725,7 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 	scan_bind_data->arguments = vgi::BuildArgumentsFromValues(context, scan_result.positional_arguments, named_args_vec);
 	scan_bind_data->projection_pushdown = has_projection_pushdown;
 	scan_bind_data->filter_semantic_profiles = scan_filter_semantic_profiles;
+	scan_bind_data->additional_filter_functions = scan_additional_filter_functions;
 	scan_bind_data->required_secrets = scan_required_secrets;
 
 	// Store table entry reference for get_bind_info callback

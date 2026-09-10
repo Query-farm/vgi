@@ -526,6 +526,12 @@ struct VgiScanPlan {
 	idx_t pages = 0;
 };
 
+struct VgiFilterFunctionCapability {
+	std::string namespace_name;
+	std::string name;
+	uint64_t version = 0;
+};
+
 struct VgiFunctionInfo {
 	std::string name;
 	std::string schema_name;
@@ -623,6 +629,7 @@ struct VgiFunctionInfo {
 	// Protocol 2.0 removes the v1 supported_expression_filters name allowlist;
 	// extension functions and runtime artifacts are capability records of their own.
 	std::vector<std::string> filter_semantic_profiles;
+	std::vector<VgiFilterFunctionCapability> additional_filter_functions;
 
 	// Aggregate function fields - uses DuckDB's enums
 	AggregateOrderDependent order_dependent = AggregateOrderDependent::NOT_ORDER_DEPENDENT;

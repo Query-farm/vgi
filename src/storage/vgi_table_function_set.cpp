@@ -113,6 +113,7 @@ static unique_ptr<FunctionData> VgiCatalogTableFunctionBind(ClientContext &conte
 	bind_data->schema_name = vgi_info.function_info().schema_name;
 	bind_data->projection_pushdown = vgi_info.function_info().projection_pushdown.value_or(false);
 	bind_data->filter_semantic_profiles = vgi_info.function_info().filter_semantic_profiles;
+	bind_data->additional_filter_functions = vgi_info.function_info().additional_filter_functions;
 	// Carry the wire flag onto bind_data so InstallBatch knows whether to
 	// require/parse vgi_batch_index from each Arrow record-batch's
 	// KeyValueMetadata.
