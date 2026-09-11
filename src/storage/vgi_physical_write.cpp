@@ -95,7 +95,8 @@ static string ResolveWriteFunctionSchema(ClientContext &context, Catalog &catalo
 static std::shared_ptr<arrow::RecordBatch> BuildWriteOptions(bool return_chunk,
                                                               OnConflictAction action_type,
                                                               const vector<string> &conflict_columns) {
-	auto return_chunks_arr = arrow::MakeArrayFromScalar(*arrow::MakeScalar(return_chunk), 1).ValueOrDie();
+	auto result_mode_arr =
+	    arrow::MakeArrayFromScalar(*arrow::MakeScalar(return_chunk ? "rows" : "count"), 1).ValueOrDie();
 
 	string action_str;
 	switch (action_type) {
@@ -121,11 +122,11 @@ static std::shared_ptr<arrow::RecordBatch> BuildWriteOptions(bool return_chunk,
 	auto conflict_cols_arr = list_builder->Finish().ValueOrDie();
 
 	auto schema = arrow::schema({
-	    arrow::field("return_chunks", arrow::boolean()),
+	    arrow::field("result_mode", arrow::utf8(), false),
 	    arrow::field("on_conflict", arrow::utf8()),
 	    arrow::field("on_conflict_columns", arrow::list(arrow::utf8())),
 	});
-	return arrow::RecordBatch::Make(schema, 1, {return_chunks_arr, action_arr, conflict_cols_arr});
+	return arrow::RecordBatch::Make(schema, 1, {result_mode_arr, action_arr, conflict_cols_arr});
 }
 
 struct SetupWriteResult {
@@ -198,11 +199,10 @@ static void ValidateReturningSchema(const std::shared_ptr<arrow::Schema> &expect
 		                        op_name, table_name);
 	}
 	auto fail = [&](const string &reason) {
-		throw IOException(
-		    "VGI worker emitted an incompatible RETURNING batch for %s on table '%s': %s. "
-		    "Expected schema: %s. Actual schema: %s. "
-		    "If this worker doesn't support RETURNING, advertise supports_returning=false on the table.",
-		    op_name, table_name, reason, expected->ToString(), actual ? actual->ToString() : "<null>");
+		throw IOException("VGI worker emitted an incompatible RETURNING batch for %s on table '%s': %s. "
+		                  "Expected schema: %s. Actual schema: %s. "
+		                  "The worker must advertise at least result mode 'rows' for this operation.",
+		                  op_name, table_name, reason, expected->ToString(), actual ? actual->ToString() : "<null>");
 	};
 	if (!actual) {
 		fail("response had no schema");
@@ -228,13 +228,22 @@ static idx_t ReadCountFromBatch(const std::shared_ptr<arrow::RecordBatch> &batch
 	if (!batch || batch->num_rows() == 0) {
 		return 0;
 	}
-	auto count_col = batch->GetColumnByName("count");
-	if (!count_col) {
-		return NumericCast<idx_t>(batch->num_rows());
+	auto schema = batch->schema();
+	if (!schema || schema->num_fields() != 1 || schema->field(0)->name() != "count" ||
+	    schema->field(0)->type()->id() != arrow::Type::INT64 || schema->field(0)->nullable()) {
+		throw IOException(
+		    "VGI worker emitted an incompatible count result: expected exactly 'count: int64 not null', got %s",
+		    schema ? schema->ToString() : "<null>");
 	}
-	auto int_array = std::static_pointer_cast<arrow::Int64Array>(count_col);
+	auto int_array = std::dynamic_pointer_cast<arrow::Int64Array>(batch->column(0));
+	if (!int_array) {
+		throw IOException("VGI worker emitted an incompatible count result array");
+	}
 	idx_t total = 0;
 	for (int64_t i = 0; i < int_array->length(); i++) {
+		if (int_array->IsNull(i)) {
+			throw IOException("VGI worker emitted a null count result");
+		}
 		total += NumericCast<idx_t>(int_array->Value(i));
 	}
 	return total;

@@ -61,13 +61,13 @@ INSERT INTO w.main.items VALUES (200, 'z', 99) RETURNING id + 1, upper(name);
 201	Z
 
 # ============================================================================
-# supports_returning=False — INSERT ... RETURNING must be rejected at plan time
+# count-only INSERT — RETURNING must be rejected at plan time
 # ============================================================================
 
 statement error
 INSERT INTO w.main.items_no_returning VALUES (1, 'a', 10) RETURNING *;
 ----
-does not support RETURNING on INSERT
+does not support result mode 'rows' for INSERT
 
 # Without RETURNING, INSERT into the same table works.
 statement ok

@@ -400,7 +400,7 @@ through *different DuckDB mechanisms*, so they do not literally share one
 DuckDB-boundary response.
 
 **Shareable — the egress options bag (worker-side).** The existing `settings` /
-`write_options` `RecordBatch`: `INSERT` uses `{return_chunks, on_conflict, ...}`;
+`write_options` `RecordBatch`: `INSERT` uses `{result_mode, on_conflict, ...}`;
 COPY TO uses `{destination, vgi_format, format_options...}`. Same wire field,
 worker reads what it needs.
 
