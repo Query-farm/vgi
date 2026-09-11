@@ -9,7 +9,7 @@ require vgi
 statement ok
 ATTACH 'simple_writable' AS w (TYPE vgi, LOCATION '${VGI_SIMPLE_WRITABLE_WORKER}');
 
-# items_broken_returning: catalog advertises supports_returning=true, but the
+# items_broken_returning: catalog advertises rows support, but the
 # insert function always emits a (count BIGINT) batch — the same shape that
 # triggered the SIGSEGV in the kafka topics-insert path. The C++ extension
 # should now reject that batch with an IOException at runtime instead of

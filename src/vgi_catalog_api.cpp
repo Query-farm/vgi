@@ -24,6 +24,7 @@
 #include "vgi_profiling.hpp"
 #include "vgi_protocol_constants.hpp"
 
+#include <set>
 #include <typeinfo>
 #include "vgi_rpc_client.hpp"
 #include "vgi_rpc_types.hpp"
@@ -2239,14 +2240,37 @@ VgiTableInfo ParseTableInfo(ClientContext &context, const std::shared_ptr<arrow:
 		info.foreign_key_constraints.push_back(std::move(fk));
 	}
 
-	// Parse write support flags (optional, backward-compatible with old workers)
-	info.supports_insert = row["supports_insert"].value_or(false);
-	info.supports_update = row["supports_update"].value_or(false);
-	info.supports_delete = row["supports_delete"].value_or(false);
-	// Workers must opt in: defaults to false so a worker that supports
-	// INSERT/UPDATE/DELETE but never wired up RETURNING handling doesn't get
-	// surprised by a planner that sends RETURNING through.
-	info.supports_returning = row["supports_returning"].value_or(false);
+	auto modes_column = row.batch()->GetColumnByName("write_result_modes");
+	auto modes_array = std::dynamic_pointer_cast<arrow::MapArray>(modes_column);
+	if (!modes_array || modes_array->IsNull(row.row_idx())) {
+		throw InvalidInputException("Table '%s' has a null or malformed write_result_modes map", info.name);
+	}
+	auto mode_keys = std::dynamic_pointer_cast<arrow::StringArray>(modes_array->keys());
+	auto mode_values = std::dynamic_pointer_cast<arrow::StringArray>(modes_array->items());
+	if (!mode_keys || !mode_values) {
+		throw InvalidInputException("Table '%s' has a malformed write_result_modes map", info.name);
+	}
+	std::set<std::string> seen_operations;
+	const auto mode_start = modes_array->value_offset(row.row_idx());
+	const auto mode_end = modes_array->value_offset(row.row_idx() + 1);
+	for (auto mode_idx = mode_start; mode_idx < mode_end; mode_idx++) {
+		if (mode_keys->IsNull(mode_idx) || mode_values->IsNull(mode_idx)) {
+			throw InvalidInputException("Table '%s' has a null write_result_modes key or value", info.name);
+		}
+		auto operation = mode_keys->GetString(mode_idx);
+		auto mode = mode_values->GetString(mode_idx);
+		if (!seen_operations.insert(operation).second) {
+			throw InvalidInputException("Table '%s' declares duplicate write operation '%s'", info.name, operation);
+		}
+		if (operation != "insert" && operation != "update" && operation != "delete") {
+			throw InvalidInputException("Table '%s' declares unknown write operation '%s'", info.name, operation);
+		}
+		if (mode != "count" && mode != "rows" && mode != "changes") {
+			throw InvalidInputException("Table '%s' declares unknown write result mode '%s' for %s", info.name, mode,
+			                            operation);
+		}
+		info.write_result_modes.emplace(std::move(operation), std::move(mode));
+	}
 
 	// Parse column statistics capability flag (backward-compatible)
 	info.supports_column_statistics = row["supports_column_statistics"].value_or(false);
@@ -2307,7 +2331,8 @@ VgiTableInfo ParseTableInfo(ClientContext &context, const std::shared_ptr<arrow:
 	    row["required_filters"].value_or(std::vector<std::vector<std::string>>{});
 
 	// Validate: UPDATE/DELETE require a row ID column
-	if ((info.supports_update || info.supports_delete) && info.row_id_column < 0) {
+	if ((info.write_result_modes.count("update") || info.write_result_modes.count("delete")) &&
+	    info.row_id_column < 0) {
 		throw InvalidInputException(
 		    "Table '%s' declares update/delete support but has no row ID column "
 		    "(mark a column with is_row_id metadata)",

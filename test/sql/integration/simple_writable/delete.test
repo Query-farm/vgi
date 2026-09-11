@@ -56,7 +56,7 @@ SELECT COUNT(*) FROM w.main.items;
 0
 
 # ============================================================================
-# supports_returning=False — DELETE ... RETURNING must be rejected
+# count-only DELETE — RETURNING must be rejected
 # ============================================================================
 
 statement ok
@@ -65,7 +65,7 @@ INSERT INTO w.main.items_no_returning VALUES (10, 'x', 100), (11, 'y', 200);
 statement error
 DELETE FROM w.main.items_no_returning WHERE id = 10 RETURNING *;
 ----
-does not support RETURNING on DELETE
+does not support result mode 'rows' for DELETE
 
 # Without RETURNING the DELETE goes through.
 statement ok

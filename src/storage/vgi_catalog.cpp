@@ -30,6 +30,32 @@
 
 namespace duckdb {
 
+static int WriteResultModeRank(const string &mode) {
+	if (mode == "count") {
+		return 0;
+	}
+	if (mode == "rows") {
+		return 1;
+	}
+	if (mode == "changes") {
+		return 2;
+	}
+	throw InternalException("Unknown validated VGI write result mode '%s'", mode);
+}
+
+static void RequireWriteResultMode(const VgiTableEntry &table, const string &operation, bool return_chunk) {
+	const auto requested = return_chunk ? "rows" : "count";
+	const auto &modes = table.GetTableInfo().write_result_modes;
+	auto entry = modes.find(operation);
+	if (entry == modes.end()) {
+		throw BinderException("Table '%s' does not support %s", table.name, StringUtil::Upper(operation));
+	}
+	if (WriteResultModeRank(entry->second) < WriteResultModeRank(requested)) {
+		throw BinderException("Table '%s' does not support result mode '%s' for %s (maximum is '%s')", table.name,
+		                      requested, StringUtil::Upper(operation), entry->second);
+	}
+}
+
 VgiCatalog::VgiCatalog(AttachedDatabase &db_p, const std::string &internal_name, AccessMode access_mode,
                        std::shared_ptr<vgi::VgiAttachParameters> attach_params,
                        std::shared_ptr<vgi::CatalogAttachResult> attach_result,
@@ -124,12 +150,7 @@ PhysicalOperator &VgiCatalog::PlanCreateTableAs(ClientContext &context, Physical
 PhysicalOperator &VgiCatalog::PlanInsert(ClientContext &context, PhysicalPlanGenerator &planner, LogicalInsert &op,
                                          optional_ptr<PhysicalOperator> plan) {
 	auto &table = op.table.Cast<VgiTableEntry>();
-	if (!table.GetTableInfo().supports_insert) {
-		throw BinderException("Table '%s' does not support INSERT", table.name);
-	}
-	if (op.return_chunk && !table.GetTableInfo().supports_returning) {
-		throw BinderException("Table '%s' does not support RETURNING on INSERT", table.name);
-	}
+	RequireWriteResultMode(table, "insert", op.return_chunk);
 	// Use DuckDB's built-in default resolution: insert a PhysicalProjection child
 	// that evaluates default expressions for omitted columns. This means Sink
 	// always receives full-width rows with defaults already filled in.
@@ -147,12 +168,7 @@ PhysicalOperator &VgiCatalog::PlanInsert(ClientContext &context, PhysicalPlanGen
 PhysicalOperator &VgiCatalog::PlanDelete(ClientContext &context, PhysicalPlanGenerator &planner, LogicalDelete &op,
                                          PhysicalOperator &plan) {
 	auto &table = op.table.Cast<VgiTableEntry>();
-	if (!table.GetTableInfo().supports_delete) {
-		throw BinderException("Table '%s' does not support DELETE", table.name);
-	}
-	if (op.return_chunk && !table.GetTableInfo().supports_returning) {
-		throw BinderException("Table '%s' does not support RETURNING on DELETE", table.name);
-	}
+	RequireWriteResultMode(table, "delete", op.return_chunk);
 	auto &bound_ref = op.expressions[0]->Cast<BoundReferenceExpression>();
 	auto &del = planner.Make<VgiPhysicalDelete>(op, table, op.return_chunk, bound_ref.index);
 	del.children.push_back(plan);
@@ -162,12 +178,7 @@ PhysicalOperator &VgiCatalog::PlanDelete(ClientContext &context, PhysicalPlanGen
 PhysicalOperator &VgiCatalog::PlanUpdate(ClientContext &context, PhysicalPlanGenerator &planner, LogicalUpdate &op,
                                          PhysicalOperator &plan) {
 	auto &table = op.table.Cast<VgiTableEntry>();
-	if (!table.GetTableInfo().supports_update) {
-		throw BinderException("Table '%s' does not support UPDATE", table.name);
-	}
-	if (op.return_chunk && !table.GetTableInfo().supports_returning) {
-		throw BinderException("Table '%s' does not support RETURNING on UPDATE", table.name);
-	}
+	RequireWriteResultMode(table, "update", op.return_chunk);
 	auto &upd = planner.Make<VgiPhysicalUpdate>(op, table, op.return_chunk);
 	upd.children.push_back(plan);
 	return upd;
@@ -185,26 +196,20 @@ static unique_ptr<MergeIntoOperator> VgiPlanMergeIntoAction(ClientContext &conte
 
 	switch (action.action_type) {
 	case MergeActionType::MERGE_UPDATE: {
-		if (!table.GetTableInfo().supports_update) {
-			throw BinderException("Table '%s' does not support UPDATE", table.name);
-		}
+		RequireWriteResultMode(table, "update", op.return_chunk);
 		auto &upd = planner.Make<VgiPhysicalUpdate>(op, table, op.return_chunk,
 		                                             std::move(action.columns), std::move(action.expressions));
 		result->op = upd;
 		break;
 	}
 	case MergeActionType::MERGE_DELETE: {
-		if (!table.GetTableInfo().supports_delete) {
-			throw BinderException("Table '%s' does not support DELETE", table.name);
-		}
+		RequireWriteResultMode(table, "delete", op.return_chunk);
 		auto &del = planner.Make<VgiPhysicalDelete>(op, table, op.return_chunk, op.row_id_start);
 		result->op = del;
 		break;
 	}
 	case MergeActionType::MERGE_INSERT: {
-		if (!table.GetTableInfo().supports_insert) {
-			throw BinderException("Table '%s' does not support INSERT", table.name);
-		}
+		RequireWriteResultMode(table, "insert", op.return_chunk);
 		auto &ins = planner.Make<VgiPhysicalInsert>(op, table, op.return_chunk);
 		if (!action.column_index_map.empty()) {
 			vector<unique_ptr<Expression>> new_expressions;
@@ -264,10 +269,6 @@ PhysicalOperator &VgiCatalog::PlanMergeInto(ClientContext &context, PhysicalPlan
 		}
 	}
 
-	if (op.return_chunk && !table_for_returning.GetTableInfo().supports_returning) {
-		throw BinderException("Table '%s' does not support RETURNING on MERGE",
-		                      table_for_returning.name);
-	}
 	map<MergeActionCondition, vector<unique_ptr<MergeIntoOperator>>> actions;
 
 	idx_t append_count = 0;

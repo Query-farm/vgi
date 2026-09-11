@@ -311,15 +311,9 @@ struct VgiTableInfo {
 	};
 	std::vector<ForeignKey> foreign_key_constraints;
 
-	// Write support flags — indicate which DML operations the table supports
-	bool supports_insert = false;
-	bool supports_update = false;
-	bool supports_delete = false;
-	// Workers must opt in to RETURNING support per-table. When false, the
-	// extension rejects INSERT/UPDATE/DELETE ... RETURNING at plan time with a
-	// BinderException; only workers whose write functions can emit the
-	// affected rows should set this true.
-	bool supports_returning = false;
+	// Maximum result mode for each supported DML operation. Missing means the
+	// operation is unsupported; modes are ordered count < rows < changes.
+	std::map<std::string, std::string> write_result_modes;
 
 	// Column statistics capability — indicates this table can provide column-level statistics
 	bool supports_column_statistics = false;
