@@ -47,13 +47,9 @@ jobs:
       # rebuilt every dependency despite exporting Actions cache credentials.
       VCPKG_BINARY_SOURCES: "clear;http,https://haybarn-vcpkg-cache.rusty-bb6.workers.dev,readwrite,Authorization: Bearer ${{ secrets.HAYBARN_VCPKG_TOKEN }}"
       X_VCPKG_ASSET_SOURCES: "clear;x-azurl,https://haybarn-vcpkg-cache.rusty-bb6.workers.dev/assets/,auth=${{ secrets.HAYBARN_VCPKG_TOKEN }},readwrite"
-      # Keep the GitHub ccache restored below as a fast L1 and use R2 as the
-      # cross-repository L2. Normalize the checkout prefix and tolerate the
-      # same harmless generated-file variance as Haybarn's native builds.
-      CCACHE_BASEDIR: ${{ github.workspace }}
-      CCACHE_NOHASHDIR: "1"
-      CCACHE_SLOPPINESS: "time_macros,include_file_mtime,pch_defines"
-      CCACHE_COMPILERCHECK: content
+      # Keep the existing GitHub ccache namespace below as a fast L1 and use
+      # R2 as the cross-repository L2. Do not change the hash settings here:
+      # doing so invalidates the already-warm integration cache.
       CCACHE_REMOTE_STORAGE: "http://haybarn-vcpkg-cache.rusty-bb6.workers.dev/ccache|bearer-token=${{ secrets.HAYBARN_VCPKG_TOKEN }}|connect-timeout=10000|operation-timeout=30000"
       # Cargo's registry/source cache is small compared with compilation. Use
       # sccache for rustc output from both the CMake build and the qualification

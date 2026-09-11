@@ -42,6 +42,9 @@ jobs:
       ci_tools_version: haybarn
       override_ci_tools_repository: 'Query-farm-haybarn/haybarn-extension-ci-tools'
       extension_name: vgi
+      # This artifact is not consumed and is consistently the slowest matrix
+      # leg (roughly 20 minutes even with warm vcpkg and ccache state).
+      exclude_archs: 'windows_amd64_mingw'
       use_prebuilt_images: true
       use_prebuilt_wasm_image: true
       # The embedded Iroh connector is compiled from the pinned Rust source as
