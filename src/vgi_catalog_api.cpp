@@ -1731,6 +1731,23 @@ static std::optional<FunctionNullHandling> ParseFunctionNullHandling(const std::
 	return std::nullopt;
 }
 
+std::optional<VgiArgumentMonotonicity> ParseVgiArgumentMonotonicity(const std::string &value) {
+	if (value == "UNKNOWN") {
+		return VgiArgumentMonotonicity::Unknown;
+	} else if (value == "CONSTANT") {
+		return VgiArgumentMonotonicity::Constant;
+	} else if (value == "NON_DECREASING") {
+		return VgiArgumentMonotonicity::NonDecreasing;
+	} else if (value == "STRICTLY_INCREASING") {
+		return VgiArgumentMonotonicity::StrictlyIncreasing;
+	} else if (value == "NON_INCREASING") {
+		return VgiArgumentMonotonicity::NonIncreasing;
+	} else if (value == "STRICTLY_DECREASING") {
+		return VgiArgumentMonotonicity::StrictlyDecreasing;
+	}
+	return std::nullopt;
+}
+
 std::optional<VgiOrderPreservation> ParseVgiOrderPreservation(const std::string &value) {
 	if (value == "PRESERVES_ORDER") {
 		return VgiOrderPreservation::PreservesOrder;
@@ -2962,6 +2979,45 @@ VgiFunctionInfo ParseFunctionInfo(const std::shared_ptr<arrow::RecordBatch> &bat
 	auto args_data = row["arguments"].value_not_null<std::vector<uint8_t>>();
 	if (!args_data.empty()) {
 		info.arguments_schema = DeserializeSchema(args_data);
+	}
+
+	std::optional<std::vector<std::string>> argument_monotonicity;
+	auto argument_monotonicity_column = batch->GetColumnByName("argument_monotonicity");
+	if (argument_monotonicity_column && !argument_monotonicity_column->IsNull(row_idx)) {
+		auto list = std::dynamic_pointer_cast<arrow::ListArray>(argument_monotonicity_column);
+		auto values = list ? std::dynamic_pointer_cast<arrow::StringArray>(list->values()) : nullptr;
+		if (!list || !values) {
+			throw IOException("Function '%s' argument_monotonicity has an invalid Arrow type", info.name);
+		}
+		argument_monotonicity.emplace();
+		const auto start = list->value_offset(row_idx);
+		const auto end = list->value_offset(row_idx + 1);
+		argument_monotonicity->reserve(static_cast<idx_t>(end - start));
+		for (auto value_idx = start; value_idx < end; value_idx++) {
+			if (values->IsNull(value_idx)) {
+				throw IOException("Function '%s' argument_monotonicity contains a null entry", info.name);
+			}
+			argument_monotonicity->push_back(values->GetString(value_idx));
+		}
+	}
+	if (argument_monotonicity) {
+		if (info.function_type != VgiFunctionType::Scalar) {
+			throw IOException("Function '%s' declares argument_monotonicity but is not scalar", info.name);
+		}
+		if (!info.arguments_schema) {
+			throw IOException("Function '%s' has argument_monotonicity without an arguments schema", info.name);
+		}
+		if (argument_monotonicity->size() != static_cast<idx_t>(info.arguments_schema->num_fields())) {
+			throw IOException("Function '%s' argument_monotonicity has %llu entries, expected %d", info.name,
+			                  argument_monotonicity->size(), info.arguments_schema->num_fields());
+		}
+		std::vector<VgiArgumentMonotonicity> parsed;
+		parsed.reserve(argument_monotonicity->size());
+		for (const auto &value : *argument_monotonicity) {
+			parsed.push_back(RequireKnownEnum(ParseVgiArgumentMonotonicity(value), value, "argument_monotonicity",
+			                                  worker_path, info.name));
+		}
+		info.argument_monotonicity = std::move(parsed);
 	}
 
 	// Parse the output_schema field which contains a serialized Arrow schema (non-nullable)

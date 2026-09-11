@@ -71,6 +71,9 @@ struct VgiScalarFunctionInfo : public ScalarFunctionInfo {
 	// Const parameter support: which positional params are constants
 	std::vector<bool> positional_is_const;
 	std::vector<std::string> positional_names;
+	// Preserved for a future DuckDB optimizer adapter; DuckDB 1.5 has no API
+	// for installing per-argument monotonicity on ScalarFunction.
+	std::optional<std::vector<vgi::VgiArgumentMonotonicity>> argument_monotonicity;
 };
 
 // ============================================================================

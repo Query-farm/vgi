@@ -123,6 +123,7 @@ ScalarFunctionSet BuildVgiScalarFunctionSet(ClientContext &context, const std::s
 		scalar_func_info->has_dynamic_return_type = is_any_output;
 		scalar_func_info->positional_is_const = arg_types.positional_is_const;
 		scalar_func_info->positional_names = arg_types.positional_names;
+		scalar_func_info->argument_monotonicity = func_info.argument_monotonicity;
 		scalar_func_info->setting_names = target.setting_names;
 		scalar_func_info->required_secrets = func_info.required_secrets;
 

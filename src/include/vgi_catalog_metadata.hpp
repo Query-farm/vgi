@@ -474,6 +474,21 @@ enum class VgiPartitionKind {
 // older-worker compatibility).
 std::optional<VgiPartitionKind> ParseVgiPartitionKind(const std::string &value);
 
+// Scalar-function monotonicity in one argument while all other arguments are
+// held constant. This VGI-owned enum deliberately avoids DuckDB 2.0 headers so
+// the DuckDB 1.5 extension can validate and preserve the protocol metadata.
+enum class VgiArgumentMonotonicity {
+	Unknown,
+	Constant,
+	NonDecreasing,
+	StrictlyIncreasing,
+	NonIncreasing,
+	StrictlyDecreasing,
+};
+
+// Parse the uppercase VGI wire spelling. Returns nullopt for unknown values.
+std::optional<VgiArgumentMonotonicity> ParseVgiArgumentMonotonicity(const std::string &value);
+
 // ============================================================================
 // Custom COPY ... FROM format advertised by a catalog (matches Python
 // CopyFromFormatInfo). The extension registers one DuckDB CopyFunction per
@@ -564,6 +579,9 @@ struct VgiFunctionInfo {
 	std::optional<FunctionStability> stability;
 	// Uses DuckDB's FunctionNullHandling enum (DEFAULT_NULL_HANDLING, SPECIAL_HANDLING)
 	std::optional<FunctionNullHandling> null_handling;
+	// Scalar-only claims aligned exactly with arguments_schema declaration
+	// slots. nullopt means no claims; a vararg occupies one slot.
+	std::optional<std::vector<VgiArgumentMonotonicity>> argument_monotonicity;
 
 	// Table function capabilities (nullopt if not applicable)
 	std::optional<bool> projection_pushdown;
