@@ -42,7 +42,26 @@ jobs:
       GEN: ninja
       BUILD_VGI_FILTER_V2_TESTS: "1"
       USE_MERGED_VCPKG_MANIFEST: "1"
-      VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+      # Share the same R2-backed caches as the distribution pipeline. The
+      # x-gha provider was removed from vcpkg, so its previous configuration
+      # rebuilt every dependency despite exporting Actions cache credentials.
+      VCPKG_BINARY_SOURCES: "clear;http,https://haybarn-vcpkg-cache.rusty-bb6.workers.dev,readwrite,Authorization: Bearer ${{ secrets.HAYBARN_VCPKG_TOKEN }}"
+      X_VCPKG_ASSET_SOURCES: "clear;x-azurl,https://haybarn-vcpkg-cache.rusty-bb6.workers.dev/assets/,auth=${{ secrets.HAYBARN_VCPKG_TOKEN }},readwrite"
+      # Keep the GitHub ccache restored below as a fast L1 and use R2 as the
+      # cross-repository L2. Normalize the checkout prefix and tolerate the
+      # same harmless generated-file variance as Haybarn's native builds.
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      CCACHE_NOHASHDIR: "1"
+      CCACHE_SLOPPINESS: "time_macros,include_file_mtime,pch_defines"
+      CCACHE_COMPILERCHECK: content
+      CCACHE_REMOTE_STORAGE: "http://haybarn-vcpkg-cache.rusty-bb6.workers.dev/ccache|bearer-token=${{ secrets.HAYBARN_VCPKG_TOKEN }}|connect-timeout=10000|operation-timeout=30000"
+      # Cargo's registry/source cache is small compared with compilation. Use
+      # sccache for rustc output from both the CMake build and the qualification
+      # bridge, backed by the worker's separate WebDAV keyspace.
+      RUSTC_WRAPPER: sccache
+      SCCACHE_WEBDAV_ENDPOINT: https://haybarn-vcpkg-cache.rusty-bb6.workers.dev/sccache/
+      SCCACHE_WEBDAV_TOKEN: ${{ secrets.HAYBARN_VCPKG_TOKEN }}
+      CARGO_INCREMENTAL: "0"
 
     steps:
       - uses: actions/checkout@v5
@@ -54,21 +73,50 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ninja-build ccache
 
+          # Match Haybarn's prebuilt CI images. Ubuntu's ccache 4.9.1 cannot
+          # reliably write to an HTTP backend with bearer auth; 4.13.6 fixes
+          # that. The static binaries avoid adding build-time dependencies.
+          curl -fsSL \
+            https://github.com/ccache/ccache/releases/download/v4.13.6/ccache-4.13.6-linux-x86_64-musl-static.tar.xz \
+            -o /tmp/ccache.tar.xz
+          tar -xJf /tmp/ccache.tar.xz -C /tmp
+          sudo install -m 0755 \
+            /tmp/ccache-4.13.6-linux-x86_64-musl-static/ccache \
+            /usr/local/bin/ccache
+
+          curl -fsSL \
+            https://github.com/mozilla/sccache/releases/download/v0.8.2/sccache-v0.8.2-x86_64-unknown-linux-musl.tar.gz \
+            -o /tmp/sccache.tar.gz
+          tar -xzf /tmp/sccache.tar.gz -C /tmp
+          sudo install -m 0755 \
+            /tmp/sccache-v0.8.2-x86_64-unknown-linux-musl/sccache \
+            /usr/local/bin/sccache
+          rm -rf \
+            /tmp/ccache.tar.xz \
+            /tmp/ccache-4.13.6-linux-x86_64-musl-static \
+            /tmp/sccache.tar.gz \
+            /tmp/sccache-v0.8.2-x86_64-unknown-linux-musl
+
+          ccache --version
+          sccache --version
+
       - uses: hendrikmuhs/ccache-action@v1
         with:
           key: vgi-integration-${{ runner.os }}
 
       - uses: dtolnay/rust-toolchain@1.97
 
-      # vcpkg's GitHub-Actions binary cache needs these two, and they are only
-      # readable from a step's env — hence the explicit export rather than the
-      # workflow-level `env:` block above.
-      - name: Export vcpkg cache credentials
-        uses: actions/github-script@v7
+      # Cache Cargo's downloaded registry and git sources separately from
+      # rustc output (which sccache handles). The upstream revision is part of
+      # the key because both Rust builds below use that pinned workspace.
+      - name: Restore Cargo sources
+        uses: actions/cache@v4
         with:
-          script: |
-            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-sources-${{ runner.os }}-rust-1.97-vgi-rpc-9e7dfb59686682be0ff4a46183988e2724416393-${{ hashFiles('test/support/**/Cargo.lock') }}
 
       - name: Bootstrap vcpkg
         run: |
@@ -157,3 +205,9 @@ jobs:
             --allow-skip 'require-env VGI_REQUIRE_LAUNCHER_TRANSPORT' \
             --allow-skip 'require-env VGI_WORKER_SUPPORTS_DYNAMIC_CODE' \
             "test/sql/integration/*"
+
+      - name: Cache statistics
+        if: always()
+        run: |
+          ccache -s -v || true
+          sccache --show-stats || true
