@@ -231,7 +231,11 @@ public:
 	explicit WindowsLease(const std::string &key) {
 		std::string name = "Local\\QueryFarm.VGI.OAuth." + VgiSha256Hex(key);
 		handle_ = CreateMutexA(nullptr, FALSE, name.c_str());
-		if (!handle_ || WaitForSingleObject(handle_, INFINITE) != WAIT_OBJECT_0) {
+		const auto result = handle_ ? WaitForSingleObject(handle_, INFINITE) : WAIT_FAILED;
+		// WAIT_ABANDONED grants ownership after the previous owner exits. Keep
+		// the lease; the caller reloads and validates the protected record before
+		// using it, and the destructor must release this ownership normally.
+		if (result != WAIT_OBJECT_0 && result != WAIT_ABANDONED) {
 			if (handle_)
 				CloseHandle(handle_);
 			throw IOException("VGI OAuth: could not acquire credential cache lease");
@@ -307,6 +311,9 @@ void PlatformStore(const std::string &key, const std::string &data) {
 void PlatformDelete(const std::string &key) {
 	std::error_code ec;
 	std::filesystem::remove(StorePath(key), ec);
+	if (ec) {
+		throw IOException("VGI OAuth: DPAPI cache delete failed (Windows error %d)", ec.value());
+	}
 }
 
 void PlatformPrune() {
@@ -389,12 +396,9 @@ void DeleteOAuthRefreshToken(const std::string &key, const std::string &mode) {
 	if (!WantsPersistence(mode))
 		return;
 #if defined(__APPLE__) || defined(_WIN32)
-	try {
-		PlatformDelete(key);
-	} catch (...) {
-		if (mode != "auto")
-			throw;
-	}
+	// Forgetting an existing credential must report failure even in auto mode:
+	// falling back to memory would leave the saved token available to reconnect.
+	PlatformDelete(key);
 #endif
 }
 

@@ -2022,19 +2022,20 @@ std::string OAuthCatalogAuth::HandleUnauthorized(const OAuthChallenge &challenge
 					// registered OAuth client — falling through would mask the
 					// real error behind a misleading "token exchange failed" message.
 					std::string refresh_err = e.what();
-					if (refresh_err.find("invalid_grant") != std::string::npos) {
-						VGI_STDERR_DEBUG("[VGI] oauth.clearing_stale_refresh_token\n");
-						if (!canonical_key.empty()) {
-							DeleteOAuthRefreshToken(canonical_key, cache_mode_);
-						}
-					}
+					const bool invalid_grant = refresh_err.find("invalid_grant") != std::string::npos;
 					if (!lock.owns_lock()) lock.lock();
 					if (WasCleared()) throw;
 					// Clear stale refresh token on invalid_grant
-					if (refresh_err.find("invalid_grant") != std::string::npos) {
+					if (invalid_grant) {
 						state->token.refresh_token.clear();
 					}
+					// Finish the state transition before deletion, which can itself
+					// fail. Otherwise other connections remain stuck IN_PROGRESS.
 					StoreFailed(refresh_err);
+					if (invalid_grant && !canonical_key.empty()) {
+						VGI_STDERR_DEBUG("[VGI] oauth.clearing_stale_refresh_token\n");
+						DeleteOAuthRefreshToken(canonical_key, cache_mode_);
+					}
 					throw;
 				} catch (...) {
 					// Non-std::exception throw (rare, but possible from
@@ -2148,14 +2149,16 @@ std::string OAuthCatalogAuth::HandleUnauthorized(const OAuthChallenge &challenge
 void OAuthCatalogAuth::ClearTokens() {
 	std::lock_guard<std::mutex> binding_lock(binding_mutex_);
 	std::string key;
+	uint64_t logout_epoch;
 	{
 		std::lock_guard<std::mutex> lock(state_->mutex);
-		state_->epoch++;
+		logout_epoch = ++state_->epoch;
 		if (!state_->refresh_ctx.issuer.empty()) {
 			key = OAuthSessionKey(profile_, state_->refresh_ctx);
 		}
 		state_->token = OAuthTokenSet();
-		state_->refresh_ctx = OAuthRefreshContext();
+		// Retain the binding until deletion succeeds so a failed logout can be
+		// retried against the same stored credential.
 		state_->status = AuthState::Status::IDLE;
 		state_->owner = std::thread::id();
 		state_->error_message.clear();
@@ -2164,6 +2167,12 @@ void OAuthCatalogAuth::ClearTokens() {
 	if (!key.empty()) {
 		auto lease = AcquireOAuthCredentialLease(key, cache_mode_);
 		DeleteOAuthRefreshToken(key, cache_mode_);
+	}
+	{
+		std::lock_guard<std::mutex> lock(state_->mutex);
+		if (state_->epoch == logout_epoch && state_->status == AuthState::Status::IDLE) {
+			state_->refresh_ctx = OAuthRefreshContext();
+		}
 	}
 }
 

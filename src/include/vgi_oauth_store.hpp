@@ -26,6 +26,8 @@ bool LoadOAuthRefreshToken(const std::string &canonical_key, const OAuthRefreshC
 void StoreOAuthRefreshToken(const std::string &canonical_key, const OAuthRefreshContext &binding,
                             const std::string &cache_mode, const std::string &refresh_token);
 
+// Missing credentials are already deleted. Backend errors propagate in both
+// auto and persistent modes so logout cannot report success with a saved token.
 void DeleteOAuthRefreshToken(const std::string &canonical_key, const std::string &cache_mode);
 
 } // namespace vgi

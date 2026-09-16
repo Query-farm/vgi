@@ -425,6 +425,25 @@ install(
   LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
   ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
 
+# Native Windows credential tests use real DPAPI files and separate processes.
+# Keep this independent of the POSIX-only launcher/unit-test target below.
+option(BUILD_VGI_OAUTH_STORE_TESTS "Build native Windows OAuth credential tests" OFF)
+if(WIN32 AND BUILD_VGI_OAUTH_STORE_TESTS)
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  add_executable(vgi_oauth_store_probe test/support/oauth_store_probe.cpp)
+  target_include_directories(vgi_oauth_store_probe PRIVATE src/include duckdb/src/include)
+  target_link_libraries(vgi_oauth_store_probe
+    ${EXTENSION_NAME}
+    duckdb_static
+    dummy_static_extension_loader)
+  add_custom_target(test_vgi_oauth_store
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/test_oauth_store_windows.py
+      --probe $<TARGET_FILE:vgi_oauth_store_probe>
+    DEPENDS vgi_oauth_store_probe
+    USES_TERMINAL
+    VERBATIM)
+endif()
+
 # Optional C++ unit-test binary for the launcher's pure helpers.  Built when
 # ``BUILD_VGI_UNIT_TESTS=ON`` is passed to CMake (or as an env var).  Pure
 # helpers are intentionally DuckDB-free (they throw std::invalid_argument and
