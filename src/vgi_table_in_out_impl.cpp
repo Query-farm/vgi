@@ -18,6 +18,7 @@
 
 #include "duckdb/common/arrow/arrow_appender.hpp"
 #include "duckdb/common/arrow/arrow_converter.hpp"
+#include "duckdb/common/type_visitor.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/function/table/arrow.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -228,10 +229,21 @@ unique_ptr<FunctionData> VgiTableInOutBind(ClientContext &context, TableFunction
 			// a column already casts to the signature). Fixed args use their declared
 			// type; varargs columns use the vararg element type; fall back to the
 			// incoming type only if neither is available (shouldn't happen).
+			//
+			// An ANY-typed arg (AnyArrow on the worker) declares no concrete type:
+			// ANY is a binder placeholder, not something Arrow can carry, so forcing
+			// it here fails the schema build with "Unsupported Arrow type ANY". DuckDB
+			// has already resolved the real type into input.input_table_types, so use
+			// that — for a literal, the constant's natural type is the right answer
+			// for an arg that accepts anything. Nested ANY (LIST(ANY), ...) likewise.
+			// Mirrors the declared-is-ANY handling in vgi_scalar_function_impl.cpp.
+			const auto resolve_declared = [&](const LogicalType &declared) -> LogicalType {
+				return TypeVisitor::Contains(declared, LogicalTypeId::ANY) ? input.input_table_types[i] : declared;
+			};
 			if (i < params.positional_input_types.size()) {
-				in_types.push_back(params.positional_input_types[i]);
+				in_types.push_back(resolve_declared(params.positional_input_types[i]));
 			} else if (params.has_varargs && params.varargs_input_type.id() != LogicalTypeId::INVALID) {
-				in_types.push_back(params.varargs_input_type);
+				in_types.push_back(resolve_declared(params.varargs_input_type));
 			} else {
 				in_types.push_back(input.input_table_types[i]);
 			}
