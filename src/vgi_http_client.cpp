@@ -829,7 +829,7 @@ UnaryResponseResult HttpInvokeUnary(ClientContext &context, const std::string &w
 	// belong to no protocol and stay flat at {base}/{method}.
 	std::string url = IsReservedRpcMethod(method_name)
 	                      ? base_url + "/" + method_name
-	                      : base_url + "/" + protocol.name + "/" + method_name;
+	                      : base_url + "/" + std::string(protocol.name) + "/" + method_name;
 	ServerCapabilities local_caps;
 	auto *effective_caps = caps ? caps : &local_caps;
 	if (!effective_caps->discovered ||

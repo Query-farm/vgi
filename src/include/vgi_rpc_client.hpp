@@ -15,6 +15,7 @@
 #include "duckdb/main/client_context.hpp"
 // Relative: only ``src/include`` is on the include path, and these generated
 // headers live beside it in ``src/generated``.
+#include "../generated/vgi_protocol_names.hpp"
 #include "../generated/vgi_protocol_version.hpp"
 #include "../generated/vgi_secret_protocol_version.hpp"
 #include "vgi_platform.hpp" // pid_t (real on POSIX, shim on Windows)
@@ -62,23 +63,24 @@ constexpr const char *RPC_PROTOCOL_KEY = "vgi_rpc.protocol";
 // another's version is routed to a binding that then rejects it — so they are
 // carried as a pair rather than as two loose strings.
 //
-// SOURCE OF TRUTH: vgi-python. A Protocol's wire name is
-// ``vars(Protocol).get("protocol_name")`` when it declares one, else the class
-// name (``vgi_rpc.rpc._types._protocol_wire_name``); neither VgiProtocol nor
-// VgiSecretProtocol declares one today, so both names are their class names.
-// The versions are generated into ``src/generated/vgi_*protocol_version.hpp``.
+// SOURCE OF TRUTH: vgi-python, and both halves are GENERATED — the names by
+// ``vgi.codegen.cpp_protocol_name`` into ``vgi_protocol_names.hpp``, the versions
+// by ``vgi.codegen.cpp_protocol_version`` / ``cpp_secret_protocol_version``.
+// Regenerate with ``scripts/regen_generated.py``; vgi-python's
+// ``tests/test_generated_cpp_*`` fail the build if either drifts.
 //
-// The names below are hand-written because vgi-python ships no name generator
-// yet (it has ``vgi.codegen.cpp_protocol_version`` for the version and
-// ``vgi.codegen.cpp_constants`` for the metadata keys, but nothing that emits
-// the routing key itself). They should become generated — see the note in
-// ``test/cpp/test_protocol_routing.cpp``.
-constexpr const char *VGI_PROTOCOL_NAME = "VgiProtocol";
-constexpr const char *VGI_SECRET_PROTOCOL_NAME = "VgiSecretProtocol";
-
+// The names were hand-written on both sides until a rename proved why they
+// should not be: a version bump that missed this tree was a red build, while a
+// rename that missed it was a silent misroute that surfaced only as every
+// request naming a protocol the server no longer hosted.
+//
+// Note the major version is part of the name. An incompatible major is a
+// DIFFERENT protocol, so a stale client's request 404s instead of reaching a
+// handler that then rejects it — an answer any proxy understands without an
+// Arrow parser.
 struct VgiProtocolId {
 	// Value of RPC_PROTOCOL_KEY, and the HTTP path's protocol segment.
-	const char *name;
+	std::string_view name;
 	// Value of RPC_PROTOCOL_VERSION_KEY. Each protocol is versioned on its own:
 	// the secret protocol's 1.x has nothing to do with the worker protocol's 2.x.
 	std::string_view version;
@@ -86,14 +88,15 @@ struct VgiProtocolId {
 
 // The worker/catalog protocol: bind/init, the catalog_* family, aggregates,
 // table_buffering_*. Everything this extension sends except secret_lookup.
-inline constexpr VgiProtocolId VGI_MAIN_PROTOCOL {VGI_PROTOCOL_NAME,
+inline constexpr VgiProtocolId VGI_MAIN_PROTOCOL {::duckdb::vgi::generated::VGI_PROTOCOL_NAME,
                                                  ::duckdb::vgi::generated::VGI_PROTOCOL_VERSION};
 
 // Orchard's standalone secret service: the single unary ``secret_lookup``.
 // Versioned independently of the worker protocol, which is why the per-call
 // version override existed before the routing key did.
-inline constexpr VgiProtocolId VGI_SECRET_PROTOCOL {VGI_SECRET_PROTOCOL_NAME,
-                                                   ::duckdb::vgi::generated::VGI_SECRET_PROTOCOL_VERSION};
+inline constexpr VgiProtocolId VGI_SECRET_PROTOCOL {
+    ::duckdb::vgi::generated::VGI_SECRET_PROTOCOL_NAME,
+    ::duckdb::vgi::generated::VGI_SECRET_PROTOCOL_VERSION};
 
 // Reserved, server-level methods (``__transport_options__``, ``__upload_url__``,
 // ``__introspect_token__``) belong to no protocol: the server resolves them from

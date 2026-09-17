@@ -139,7 +139,7 @@ void WriteRpcRequest(const std::shared_ptr<arrow::io::OutputStream> &sink,
 	};
 	if (!IsReservedRpcMethod(method_name)) {
 		keys.push_back(RPC_PROTOCOL_KEY);
-		values.push_back(protocol.name);
+		values.emplace_back(protocol.name);
 	}
 	if (extra_metadata) {
 		for (int64_t i = 0; i < extra_metadata->size(); ++i) {

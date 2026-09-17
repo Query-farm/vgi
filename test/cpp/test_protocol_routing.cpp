@@ -29,23 +29,20 @@
 //     method's (empty) protocol name and rejects the mismatch.
 //
 // ---------------------------------------------------------------------------
-// The names should be generated, and are not
+// What this does NOT check, and why that is fine
 // ---------------------------------------------------------------------------
 //
-// VGI_PROTOCOL_NAME / VGI_SECRET_PROTOCOL_NAME in vgi_rpc_client.hpp are
-// hand-written. Their source of truth is vgi-python: a Protocol's wire name is
-// `vars(Protocol).get("protocol_name")` if it declares one, else the class name
-// (`vgi_rpc.rpc._types._protocol_wire_name`). Neither VgiProtocol nor
-// VgiSecretProtocol declares one today, so both names are their class names —
-// which means a future `protocol_name: ClassVar[str] = "vgi"` in vgi-python
-// silently renames the routing key and breaks every client that hardcoded it.
+// It does not check that the name literals are correct. They are generated:
+// `vgi.codegen.cpp_protocol_name` emits `vgi_protocol_names.hpp` from the same
+// `_protocol_wire_name` the dispatcher routes on, and vgi-python's
+// `tests/test_generated_cpp_protocol_name.py` fails if the checked-in header
+// drifts from it. Asserting a literal here would just be a second, weaker copy
+// of the contract — exactly the hand-spelling that caused the break these tests
+// were written for.
 //
-// vgi-python generates the protocol *versions* into src/generated/ and guards
-// them with a drift test; it ships no generator for the *name*. It should: a
-// `vgi.codegen.cpp_protocol_name` emitting both names, wired into
-// scripts/regen_generated.py and tests/test_generated_*, would make the rename
-// above a red build instead of a production misroute. Until then this test is
-// the tripwire — it fails loudly, and the fix is one constant.
+// What is checked here is everything the generator cannot see: that the value
+// actually reaches the wire, on the right method, and is absent where its
+// presence would be rejected.
 
 #include "catch.hpp"
 
@@ -89,7 +86,7 @@ std::string MetadataValue(const std::shared_ptr<arrow::KeyValueMetadata> &md, co
 TEST_CASE("a worker-protocol request names the worker protocol", "[protocol-routing]") {
 	auto md = RequestMetadata(SerializeRpcRequest("bind", EmptyParams()));
 
-	REQUIRE(MetadataValue(md, RPC_PROTOCOL_KEY) == std::string(VGI_PROTOCOL_NAME));
+	REQUIRE(MetadataValue(md, RPC_PROTOCOL_KEY) == std::string(generated::VGI_PROTOCOL_NAME));
 	REQUIRE(MetadataValue(md, RPC_PROTOCOL_VERSION_KEY) ==
 	        std::string(generated::VGI_PROTOCOL_VERSION));
 	REQUIRE(MetadataValue(md, RPC_METHOD_KEY) == "bind");
@@ -99,14 +96,14 @@ TEST_CASE("a secret-service request names the secret protocol, not the worker pr
           "[protocol-routing]") {
 	auto md = RequestMetadata(SerializeRpcRequest("secret_lookup", EmptyParams(), VGI_SECRET_PROTOCOL));
 
-	REQUIRE(MetadataValue(md, RPC_PROTOCOL_KEY) == std::string(VGI_SECRET_PROTOCOL_NAME));
+	REQUIRE(MetadataValue(md, RPC_PROTOCOL_KEY) == std::string(generated::VGI_SECRET_PROTOCOL_NAME));
 	// The two protocols are versioned independently — the secret service's 1.x
 	// has nothing to do with the worker protocol's 2.x. Name and version travel
 	// together so a request can never carry one protocol's name and another's
 	// version, which routes to a binding that then rejects it.
 	REQUIRE(MetadataValue(md, RPC_PROTOCOL_VERSION_KEY) ==
 	        std::string(generated::VGI_SECRET_PROTOCOL_VERSION));
-	REQUIRE(std::string(VGI_SECRET_PROTOCOL_NAME) != std::string(VGI_PROTOCOL_NAME));
+	REQUIRE(VGI_SECRET_PROTOCOL.name != VGI_MAIN_PROTOCOL.name);
 }
 
 TEST_CASE("reserved server-level methods carry no routing key", "[protocol-routing]") {

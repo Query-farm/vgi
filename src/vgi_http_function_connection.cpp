@@ -499,7 +499,7 @@ InitResult HttpFunctionConnection::PerformInit(const BindResult &bind_result,
 
 	// POST to {base}/{protocol}/init/init -- the protocol segment projects the routing
 	// key the body carries; the server rejects a request whose two disagree.
-	std::string init_url = base_url_ + "/" + VGI_MAIN_PROTOCOL.name + "/init/init";
+	std::string init_url = base_url_ + "/" + std::string(VGI_MAIN_PROTOCOL.name) + "/init/init";
 
 	{
 		auto fields = BuildConnLogFields(*this);
@@ -852,7 +852,7 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 
 		auto body = SerializeBatchWithState(tick_batch, tick_schema);
 
-		std::string exchange_url = base_url_ + "/" + VGI_MAIN_PROTOCOL.name + "/init/exchange";
+		std::string exchange_url = base_url_ + "/" + std::string(VGI_MAIN_PROTOCOL.name) + "/init/exchange";
 
 		// Gated: fires once per continuation on the producer hot path.
 		if (VgiInfoLogActive(context_)) {
@@ -936,7 +936,7 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 		}
 	}
 
-	std::string exchange_url = base_url_ + "/" + VGI_MAIN_PROTOCOL.name + "/init/exchange";
+	std::string exchange_url = base_url_ + "/" + std::string(VGI_MAIN_PROTOCOL.name) + "/init/exchange";
 
 	auto x_auth = attach_params_ ? attach_params_->auth() : nullptr;
 	auto x_cached_params = attach_params_ && IsHttpTransport(exchange_url)
@@ -1093,7 +1093,7 @@ void HttpFunctionConnection::CancelStream(const std::vector<uint8_t> &state_toke
 	auto buffer = finish_result.ValueUnsafe();
 	std::vector<uint8_t> body(buffer->data(), buffer->data() + buffer->size());
 
-	std::string exchange_url = base_url_ + "/" + VGI_MAIN_PROTOCOL.name + "/init/exchange";
+	std::string exchange_url = base_url_ + "/" + std::string(VGI_MAIN_PROTOCOL.name) + "/init/exchange";
 	auto c_auth = attach_params_ ? attach_params_->auth() : nullptr;
 	// Route through ``live_context`` (dispatcher's bot context), NOT ``context_``:
 	// this runs off-thread after the originating query's ClientContext (and its

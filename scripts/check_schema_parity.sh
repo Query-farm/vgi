@@ -73,6 +73,7 @@ if [ "$CPP_ONLY" -eq 0 ]; then
                 "$VGI_PYTHON_DIR/tests/test_generated_cpp_request_builders.py" \
                 "$VGI_PYTHON_DIR/tests/test_generated_cpp_constants.py" \
                 "$VGI_PYTHON_DIR/tests/test_generated_cpp_protocol_version.py" \
+                "$VGI_PYTHON_DIR/tests/test_generated_cpp_protocol_name.py" \
                 "$VGI_PYTHON_DIR/tests/test_generated_cpp_secret.py" \
                 "$VGI_PYTHON_DIR/tests/test_generated_go_schemas.py" \
                 "$VGI_PYTHON_DIR/tests/test_generated_java_schemas.py" \

@@ -1246,6 +1246,7 @@ edit these files by hand; regenerate.
 | `vgi_secret_protocol_schemas.hpp` | `python -m vgi.codegen.cpp_secret_schemas` | Schema factories for the separately-versioned `VgiSecretProtocol` (`SecretLookupParamsSchema` / `SecretLookupResultSchema`) |
 | `vgi_secret_request_builders.hpp` | `python -m vgi.codegen.cpp_secret_request_builders` | `BuildSecretLookupParams(path, type)` builder for the secret protocol |
 | `vgi_protocol_version.hpp` | `python -m vgi.codegen.cpp_protocol_version` | `VGI_PROTOCOL_VERSION` — the worker/catalog protocol's surface version |
+| `vgi_protocol_names.hpp` | `python -m vgi.codegen.cpp_protocol_name` | `VGI_PROTOCOL_NAME` / `VGI_SECRET_PROTOCOL_NAME` — the `vgi_rpc.protocol` routing keys |
 | `vgi_protocol_constants.hpp` | `python -m vgi.codegen.cpp_constants` | Well-known `vgi_rpc.*` metadata keys mirrored from `vgi_rpc.metadata` |
 | `vgi_secret_protocol_version.hpp` | `python -m vgi.codegen.cpp_secret_protocol_version` | `VGI_SECRET_PROTOCOL_VERSION` — the secret protocol's own version, carried per-call on `VgiProtocolId` |
 
@@ -1290,8 +1291,14 @@ version):
 
 | Constant | Routing key | Used by |
 |---|---|---|
-| `VGI_MAIN_PROTOCOL` | `VgiProtocol` | everything: `bind`, `init`, `catalog_*`, aggregates, `table_buffering_*` |
-| `VGI_SECRET_PROTOCOL` | `VgiSecretProtocol` | `secret_lookup` against Orchard's standalone secret service |
+| `VGI_MAIN_PROTOCOL` | `vgi.v2` | everything: `bind`, `init`, `catalog_*`, aggregates, `table_buffering_*` |
+| `VGI_SECRET_PROTOCOL` | `vgi.secret.v1` | `secret_lookup` against Orchard's standalone secret service |
+
+The major version is part of the name, so an incompatible major is a *different*
+protocol: a stale client's request 404s instead of reaching a handler that then
+rejects it — an answer any proxy or load balancer understands without an Arrow
+parser. `vgi.v2` and a future `vgi.v3` are co-hostable on one server during a
+migration for the same reason.
 
 Reserved server-level methods (`__transport_options__`, `__upload_url__`) belong
 to no protocol: the server resolves them from a built-in table *before* routing
@@ -1300,17 +1307,25 @@ routing key and the URL shape for them — stamping a key on one is not harmless
 redundant, because over HTTP the server compares it against the resolved
 method's empty protocol name and rejects the mismatch.
 
-**The names are hand-written, and should not be.** A protocol's wire name is
-`vars(Protocol).get("protocol_name")` in vgi-python when it declares one, else
-the class name. Neither `VgiProtocol` nor `VgiSecretProtocol` declares one today,
-so both names *are* their class names — which means a later
-`protocol_name: ClassVar[str] = "vgi"` in vgi-python would silently rename the
-routing key and break every client that hardcoded it. vgi-python generates the
-protocol *versions* and guards them with drift tests but ships no generator for
-the *name*; adding `vgi.codegen.cpp_protocol_name` (wired into
-`scripts/regen_generated.py` and a `tests/test_generated_*` drift test) would turn
-that rename into a red build. Until then `test/cpp/test_protocol_routing.cpp` is
-the tripwire.
+**The names are generated — do not hand-write them.** They come from
+`vgi_protocol_names.hpp`, emitted by `vgi.codegen.cpp_protocol_name` from the
+same `_protocol_wire_name` function the dispatcher routes on, and guarded by
+`tests/test_generated_cpp_protocol_name.py` in vgi-python.
+
+That generator exists because its absence already cost a wire break. Neither
+Protocol declared a `protocol_name`, so each implementation's wire name defaulted
+to whatever its local class was called — six implementations, four different
+answers (`VgiProtocol`, `VgiService`, `Service`, `vgi`). Invisible until
+`vgi_rpc.protocol` became required, at which point there was no single string
+this client could send. The version was generated and drift-guarded, so a version
+bump that missed this tree was a red build; the name was hand-written on both
+sides, so a rename was a silent misroute. Same contract, two different failure
+modes, and only one of them was cheap.
+
+`test/cpp/test_protocol_routing.cpp` stays regardless — it covers what the
+generator cannot see: that the value reaches the wire, on the right method, and
+is absent on reserved methods where its presence is rejected. Those are the
+secret-protocol and reserved-method cases the integration suite never reaches.
 
 ## Coding Conventions
 
