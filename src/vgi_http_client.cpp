@@ -818,11 +818,18 @@ UnaryResponseResult HttpInvokeUnary(ClientContext &context, const std::string &w
                                      const std::shared_ptr<HTTPParams> &cached_http_params,
                                     const std::string &invocation_id_hex, const std::string &attach_opaque_data_hex,
                                     const std::string &transaction_opaque_data_hex, const std::string &conn_id_hex,
-                                     const std::string &protocol_version_override,
+                                     const VgiProtocolId &protocol,
                                     duckdb::unique_ptr<HTTPClient> *client_holder, ServerCapabilities *caps,
                                     const std::shared_ptr<IrohClientConfig> &iroh_config) {
 	std::string base_url = NormalizeBaseUrl(worker_path);
-	std::string url = base_url + "/" + method_name;
+	// Route shape: {base}/{protocol}/{method}. The protocol segment is the
+	// projection of the vgi_rpc.protocol routing key the body also carries --
+	// present so an edge device can act on the protocol without an Arrow parser,
+	// and checked against the body by the server. Reserved server-level methods
+	// belong to no protocol and stay flat at {base}/{method}.
+	std::string url = IsReservedRpcMethod(method_name)
+	                      ? base_url + "/" + method_name
+	                      : base_url + "/" + protocol.name + "/" + method_name;
 	ServerCapabilities local_caps;
 	auto *effective_caps = caps ? caps : &local_caps;
 	if (!effective_caps->discovered ||
@@ -841,17 +848,16 @@ UnaryResponseResult HttpInvokeUnary(ClientContext &context, const std::string &w
 		VGI_LOG(context, "http.invoke_unary", {{"url", url}, {"method", method_name}});
 	}
 
-	// Serialize the RPC request to Arrow IPC bytes. A non-empty
-	// protocol_version_override stamps a different application protocol version
-	// (the secret protocol) into the request metadata.
+	// Serialize the RPC request to Arrow IPC bytes, stamping the addressed
+	// protocol's routing key and surface version into the request metadata.
 	std::vector<uint8_t> body;
 	if (params) {
-		body = SerializeRpcRequest(method_name, params, protocol_version_override);
+		body = SerializeRpcRequest(method_name, params, protocol);
 	} else {
-		body = SerializeEmptyRpcRequest(method_name);
+		body = SerializeEmptyRpcRequest(method_name, protocol);
 	}
 
-	// POST to {worker_path}/{method_name} using standard HTTP timeout
+	// POST to the route built above, using the standard HTTP timeout
 	auto response_body =
 	    HttpPostArrowIpc(context, url, body, auth, cookie_jar, cached_http_params, client_holder,
 	                     effective_caps, iroh_config);
@@ -1279,7 +1285,7 @@ std::vector<UploadUrl> HttpRequestUploadUrls(ClientContext &context, const std::
 
 	// POST to __upload_url__/init (HttpInvokeUnary normalizes base_url internally)
 	auto result = HttpInvokeUnary(context, base_url, "__upload_url__/init", batch, auth, nullptr, nullptr,
-	                              "", "", "", "", "", nullptr, nullptr, iroh_config);
+	                              "", "", "", "", VGI_MAIN_PROTOCOL, nullptr, nullptr, iroh_config);
 
 	if (!result.batch || result.batch->num_rows() == 0) {
 		throw IOException("VGI server returned no upload URLs [url: %s]", base_url);

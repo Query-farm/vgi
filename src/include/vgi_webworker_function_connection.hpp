@@ -37,7 +37,7 @@ struct VgiSecretRequirement;
 UnaryResponseResult WebWorkerInvokeUnary(ClientContext &context, const std::string &worker_path,
                                          const std::string &method_name,
                                          const std::shared_ptr<arrow::RecordBatch> &params,
-                                         const std::string &protocol_version_override);
+                                         const VgiProtocolId &protocol);
 
 // ============================================================================
 // WebWorkerFunctionConnection - vgi_rpc Protocol over the `worker:` SAB transport

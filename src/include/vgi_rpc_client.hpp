@@ -8,10 +8,15 @@
 #include <memory>
 #include <functional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
 #include "duckdb/main/client_context.hpp"
+// Relative: only ``src/include`` is on the include path, and these generated
+// headers live beside it in ``src/generated``.
+#include "../generated/vgi_protocol_version.hpp"
+#include "../generated/vgi_secret_protocol_version.hpp"
 #include "vgi_platform.hpp" // pid_t (real on POSIX, shim on Windows)
 
 namespace duckdb {
@@ -33,6 +38,72 @@ constexpr const char *RPC_REQUEST_VERSION_VALUE = "1";
 // dispatch boundary; mismatches surface as IOException with directional
 // "upgrade the client" / "upgrade the worker" guidance.
 constexpr const char *RPC_PROTOCOL_VERSION_KEY = "vgi_rpc.protocol_version";
+
+// Protocol routing key. A vgi-rpc server dispatches on the pair
+// (protocol, method), not on the method alone: one server may co-host several
+// protocols, method names are allowed to collide between them, and on the raw
+// transports (subprocess, AF_UNIX, TCP, stdio, SAB, Iroh) this metadata key is
+// the *only* carrier of which protocol a request addresses. Over HTTP the same
+// value is also projected into the URL path segment, and the server rejects a
+// request whose two carriers disagree.
+//
+// Required on every protocol-owned request. A request that omits it is
+// unroutable — the server raises ProtocolNotSpecifiedError rather than guessing
+// a default, precisely so a co-hosting server can never silently pick wrong.
+constexpr const char *RPC_PROTOCOL_KEY = "vgi_rpc.protocol";
+
+// ============================================================================
+// Protocol Identity
+// ============================================================================
+//
+// One application protocol this client addresses: the wire routing key it is
+// reached by, and its independently-versioned method-and-schema surface. The
+// two always travel together — a request stamped with one protocol's name and
+// another's version is routed to a binding that then rejects it — so they are
+// carried as a pair rather than as two loose strings.
+//
+// SOURCE OF TRUTH: vgi-python. A Protocol's wire name is
+// ``vars(Protocol).get("protocol_name")`` when it declares one, else the class
+// name (``vgi_rpc.rpc._types._protocol_wire_name``); neither VgiProtocol nor
+// VgiSecretProtocol declares one today, so both names are their class names.
+// The versions are generated into ``src/generated/vgi_*protocol_version.hpp``.
+//
+// The names below are hand-written because vgi-python ships no name generator
+// yet (it has ``vgi.codegen.cpp_protocol_version`` for the version and
+// ``vgi.codegen.cpp_constants`` for the metadata keys, but nothing that emits
+// the routing key itself). They should become generated — see the note in
+// ``test/cpp/test_protocol_routing.cpp``.
+constexpr const char *VGI_PROTOCOL_NAME = "VgiProtocol";
+constexpr const char *VGI_SECRET_PROTOCOL_NAME = "VgiSecretProtocol";
+
+struct VgiProtocolId {
+	// Value of RPC_PROTOCOL_KEY, and the HTTP path's protocol segment.
+	const char *name;
+	// Value of RPC_PROTOCOL_VERSION_KEY. Each protocol is versioned on its own:
+	// the secret protocol's 1.x has nothing to do with the worker protocol's 2.x.
+	std::string_view version;
+};
+
+// The worker/catalog protocol: bind/init, the catalog_* family, aggregates,
+// table_buffering_*. Everything this extension sends except secret_lookup.
+inline constexpr VgiProtocolId VGI_MAIN_PROTOCOL {VGI_PROTOCOL_NAME,
+                                                 ::duckdb::vgi::generated::VGI_PROTOCOL_VERSION};
+
+// Orchard's standalone secret service: the single unary ``secret_lookup``.
+// Versioned independently of the worker protocol, which is why the per-call
+// version override existed before the routing key did.
+inline constexpr VgiProtocolId VGI_SECRET_PROTOCOL {VGI_SECRET_PROTOCOL_NAME,
+                                                   ::duckdb::vgi::generated::VGI_SECRET_PROTOCOL_VERSION};
+
+// Reserved, server-level methods (``__transport_options__``, ``__upload_url__``,
+// ``__introspect_token__``) belong to no protocol: the server resolves them from
+// a built-in table *before* routing, and over HTTP they are mounted flat at
+// ``{prefix}/{method}`` rather than under a protocol segment. Stamping a routing
+// key on one is not merely redundant — over HTTP the server compares the key
+// against the resolved method's (empty) protocol name and rejects the mismatch.
+inline bool IsReservedRpcMethod(const std::string &method_name) {
+	return method_name.rfind("__", 0) == 0;
+}
 
 // Response/log/error metadata keys (read from response batches)
 constexpr const char *RPC_LOG_LEVEL_KEY = "vgi_rpc.log_level";
@@ -107,7 +178,8 @@ RpcBatchType ClassifyBatch(const std::shared_ptr<arrow::RecordBatch> &batch,
 // The params_batch must have exactly 1 row with one field per method parameter.
 void WriteRpcRequest(int fd, const std::string &method_name,
                      const std::shared_ptr<arrow::RecordBatch> &params_batch,
-                     const std::shared_ptr<arrow::KeyValueMetadata> &extra_metadata = nullptr);
+                     const std::shared_ptr<arrow::KeyValueMetadata> &extra_metadata = nullptr,
+                     const VgiProtocolId &protocol = VGI_MAIN_PROTOCOL);
 
 // Stream-based form used by transports that are not represented by an OS file
 // descriptor (notably native Iroh QUIC streams). The framing is byte-for-byte
@@ -115,11 +187,13 @@ void WriteRpcRequest(int fd, const std::string &method_name,
 void WriteRpcRequest(const std::shared_ptr<arrow::io::OutputStream> &sink,
                      const std::string &method_name,
                      const std::shared_ptr<arrow::RecordBatch> &params_batch,
-                     const std::shared_ptr<arrow::KeyValueMetadata> &extra_metadata = nullptr);
+                     const std::shared_ptr<arrow::KeyValueMetadata> &extra_metadata = nullptr,
+                     const VgiProtocolId &protocol = VGI_MAIN_PROTOCOL);
 
 // Write an RPC request with no parameters (zero-field schema, 1-row batch).
 // Used for parameterless methods like catalog_catalogs.
-void WriteEmptyRpcRequest(int fd, const std::string &method_name);
+void WriteEmptyRpcRequest(int fd, const std::string &method_name,
+                          const VgiProtocolId &protocol = VGI_MAIN_PROTOCOL);
 
 // ============================================================================
 // Response Reading
@@ -188,10 +262,10 @@ StreamHeaderResult ReadStreamHeader(const std::shared_ptr<arrow::io::InputStream
 
 // Serialize an RPC request to bytes (same format as WriteRpcRequest but to buffer).
 // Returns a complete Arrow IPC stream: schema + 1-row batch with method metadata + EOS.
-// protocol_version_override: when non-empty, stamps this value into the
-// `vgi_rpc.protocol_version` metadata instead of the global VGI_PROTOCOL_VERSION.
-// Used by the separately-versioned secret protocol (VGI_SECRET_PROTOCOL_VERSION);
-// all worker/catalog call sites leave it empty.
+// protocol: which application protocol this request addresses. Stamps both
+// `vgi_rpc.protocol` (the routing key the server dispatches on) and
+// `vgi_rpc.protocol_version`. Defaults to the worker/catalog protocol; the
+// separately-versioned secret protocol passes VGI_SECRET_PROTOCOL.
 // extra_metadata: additional (key,value) pairs folded into the request's
 // custom_metadata alongside the method/version keys. Used by the HTTP transport to
 // carry the result-cache conditional-revalidation validators (vgi.cache.if_none_match
@@ -199,11 +273,12 @@ StreamHeaderResult ReadStreamHeader(const std::shared_ptr<arrow::io::InputStream
 // producer turn runs inside /init and must see the validators before it produces.
 std::vector<uint8_t> SerializeRpcRequest(
     const std::string &method_name, const std::shared_ptr<arrow::RecordBatch> &params_batch,
-    const std::string &protocol_version_override = "",
+    const VgiProtocolId &protocol = VGI_MAIN_PROTOCOL,
     const std::vector<std::pair<std::string, std::string>> &extra_metadata = {});
 
 // Serialize an RPC request with no parameters (zero-field schema, 1-row batch).
-std::vector<uint8_t> SerializeEmptyRpcRequest(const std::string &method_name);
+std::vector<uint8_t> SerializeEmptyRpcRequest(const std::string &method_name,
+                                              const VgiProtocolId &protocol = VGI_MAIN_PROTOCOL);
 
 // Parse a unary response from bytes (same logic as ReadUnaryResponse but from buffer).
 // url is used for error context (replaces worker_path in fd-based version).

@@ -1245,29 +1245,24 @@ edit these files by hand; regenerate.
 | `vgi_request_builders.hpp` | `python -m vgi.codegen.cpp_request_builders` | One `BuildXxxParams(...)` builder per RPC method, taking `std::optional<T>` for nullable fields |
 | `vgi_secret_protocol_schemas.hpp` | `python -m vgi.codegen.cpp_secret_schemas` | Schema factories for the separately-versioned `VgiSecretProtocol` (`SecretLookupParamsSchema` / `SecretLookupResultSchema`) |
 | `vgi_secret_request_builders.hpp` | `python -m vgi.codegen.cpp_secret_request_builders` | `BuildSecretLookupParams(path, type)` builder for the secret protocol |
-| `vgi_secret_protocol_version.hpp` | `python -m vgi.codegen.cpp_secret_protocol_version` | `VGI_SECRET_PROTOCOL_VERSION` — the secret protocol's own version, passed as a per-call `protocol_version_override` |
+| `vgi_protocol_version.hpp` | `python -m vgi.codegen.cpp_protocol_version` | `VGI_PROTOCOL_VERSION` — the worker/catalog protocol's surface version |
+| `vgi_protocol_constants.hpp` | `python -m vgi.codegen.cpp_constants` | Well-known `vgi_rpc.*` metadata keys mirrored from `vgi_rpc.metadata` |
+| `vgi_secret_protocol_version.hpp` | `python -m vgi.codegen.cpp_secret_protocol_version` | `VGI_SECRET_PROTOCOL_VERSION` — the secret protocol's own version, carried per-call on `VgiProtocolId` |
 
-Regenerate after changing `VgiProtocol`:
-
-```bash
-cd ~/Development/vgi-python
-uv run python -m vgi.codegen.cpp_schemas \
-    > ~/Development/vgi/src/generated/vgi_protocol_schemas.hpp
-uv run python -m vgi.codegen.cpp_request_builders \
-    > ~/Development/vgi/src/generated/vgi_request_builders.hpp
-```
-
-Regenerate after changing `VgiSecretProtocol` (`vgi/secret_protocol.py`):
+Regenerate after changing `VgiProtocol` or `VgiSecretProtocol`:
 
 ```bash
-cd ~/Development/vgi-python
-uv run python -m vgi.codegen.cpp_secret_protocol_version \
-    > ~/Development/vgi/src/generated/vgi_secret_protocol_version.hpp
-uv run python -m vgi.codegen.cpp_secret_schemas \
-    > ~/Development/vgi/src/generated/vgi_secret_protocol_schemas.hpp
-uv run python -m vgi.codegen.cpp_secret_request_builders \
-    > ~/Development/vgi/src/generated/vgi_secret_request_builders.hpp
+uv run --project ~/Development/vgi-python python \
+    ~/Development/vgi-python/scripts/regen_generated.py
 ```
+
+Use that script, not `python -m vgi.codegen.X > dest`. The shell truncates the
+destination *before* the generator runs, so a failing generator — a missing
+sibling checkout, a typo in the module name — silently destroys the file it was
+meant to update, and the loss only surfaces as an unrelated build error later.
+`regen_generated.py` renders each artifact into memory, checks it non-empty, and
+only then writes; `--check` reports drift without writing. Sibling repos that
+are not checked out are skipped, not failed.
 
 The codegen is parametrized by protocol class — `collect_schemas(protocol_cls, ...)` in
 `vgi/codegen/_common.py` and the reusable `emit_schemas` / `emit_builders` /
@@ -1276,6 +1271,46 @@ The codegen is parametrized by protocol class — `collect_schemas(protocol_cls,
 Drift is enforced by `tests/test_generated_cpp_schemas.py`,
 `tests/test_generated_cpp_request_builders.py`, and `tests/test_generated_cpp_secret.py`
 in `vgi-python` (CI fails if the checked-in headers diverge from the generators).
+
+### Protocol Routing (`vgi_rpc.protocol`)
+
+A vgi-rpc server dispatches on the pair **(protocol, method)**, not on the
+method alone. One server may co-host several protocols, method names may collide
+between them, and on the raw transports — subprocess, AF_UNIX, TCP, stdio, SAB,
+Iroh — the `vgi_rpc.protocol` request metadata key is the *only* carrier of that
+routing decision. A request that omits it is unroutable: the server raises
+`ProtocolNotSpecifiedError` rather than guessing a default. Over HTTP the same
+value is projected into the URL as `{base}/{protocol}/{method}`, and the server
+rejects a request whose two carriers disagree.
+
+This client addresses **two** protocols, both declared as `VgiProtocolId`
+constants in `vgi_rpc_client.hpp` (name + that protocol's own surface version,
+carried as a pair so a request can never mix one protocol's name with another's
+version):
+
+| Constant | Routing key | Used by |
+|---|---|---|
+| `VGI_MAIN_PROTOCOL` | `VgiProtocol` | everything: `bind`, `init`, `catalog_*`, aggregates, `table_buffering_*` |
+| `VGI_SECRET_PROTOCOL` | `VgiSecretProtocol` | `secret_lookup` against Orchard's standalone secret service |
+
+Reserved server-level methods (`__transport_options__`, `__upload_url__`) belong
+to no protocol: the server resolves them from a built-in table *before* routing
+and mounts them flat at `{base}/{method}`. `IsReservedRpcMethod()` gates both the
+routing key and the URL shape for them — stamping a key on one is not harmlessly
+redundant, because over HTTP the server compares it against the resolved
+method's empty protocol name and rejects the mismatch.
+
+**The names are hand-written, and should not be.** A protocol's wire name is
+`vars(Protocol).get("protocol_name")` in vgi-python when it declares one, else
+the class name. Neither `VgiProtocol` nor `VgiSecretProtocol` declares one today,
+so both names *are* their class names — which means a later
+`protocol_name: ClassVar[str] = "vgi"` in vgi-python would silently rename the
+routing key and break every client that hardcoded it. vgi-python generates the
+protocol *versions* and guards them with drift tests but ships no generator for
+the *name*; adding `vgi.codegen.cpp_protocol_name` (wired into
+`scripts/regen_generated.py` and a `tests/test_generated_*` drift test) would turn
+that rename into a red build. Until then `test/cpp/test_protocol_routing.cpp` is
+the tripwire.
 
 ## Coding Conventions
 

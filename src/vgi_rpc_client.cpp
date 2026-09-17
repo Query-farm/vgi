@@ -2,7 +2,6 @@
 #include "vgi_rpc_client.hpp"
 
 #include "duckdb/common/exception.hpp"
-#include "generated/vgi_protocol_version.hpp"
 #include "vgi_arrow_ipc.hpp"
 #include "vgi_exception.hpp"
 #include "vgi_logging.hpp"
@@ -112,7 +111,8 @@ static bool DispatchBatch(const std::shared_ptr<arrow::RecordBatch> &batch,
 void WriteRpcRequest(const std::shared_ptr<arrow::io::OutputStream> &sink,
                      const std::string &method_name,
                      const std::shared_ptr<arrow::RecordBatch> &params_batch,
-                     const std::shared_ptr<arrow::KeyValueMetadata> &extra_metadata) {
+                     const std::shared_ptr<arrow::KeyValueMetadata> &extra_metadata,
+                     const VgiProtocolId &protocol) {
 	// Create an IPC stream writer with the params schema
 	auto writer_result = arrow::ipc::MakeStreamWriter(sink, params_batch->schema());
 	if (!writer_result.ok()) {
@@ -126,12 +126,21 @@ void WriteRpcRequest(const std::shared_ptr<arrow::io::OutputStream> &sink,
 	// the server at the dispatch boundary; a mismatch surfaces as IOException
 	// with directional "upgrade the client" / "upgrade the worker" guidance
 	// before any user data crosses the wire.
+	//
+	// On this transport the metadata is the only carrier of the protocol
+	// routing key, so it is what makes the request routable at all. Reserved
+	// server-level methods are resolved by the server before routing and are
+	// owned by no protocol, so they are sent without the key.
 	std::vector<std::string> keys = {RPC_METHOD_KEY, RPC_REQUEST_VERSION_KEY, RPC_PROTOCOL_VERSION_KEY};
 	std::vector<std::string> values = {
 	    method_name,
 	    RPC_REQUEST_VERSION_VALUE,
-	    std::string(::duckdb::vgi::generated::VGI_PROTOCOL_VERSION),
+	    std::string(protocol.version),
 	};
+	if (!IsReservedRpcMethod(method_name)) {
+		keys.push_back(RPC_PROTOCOL_KEY);
+		values.push_back(protocol.name);
+	}
 	if (extra_metadata) {
 		for (int64_t i = 0; i < extra_metadata->size(); ++i) {
 			keys.push_back(extra_metadata->key(i));
@@ -155,18 +164,19 @@ void WriteRpcRequest(const std::shared_ptr<arrow::io::OutputStream> &sink,
 
 void WriteRpcRequest(int fd, const std::string &method_name,
                      const std::shared_ptr<arrow::RecordBatch> &params_batch,
-                     const std::shared_ptr<arrow::KeyValueMetadata> &extra_metadata) {
-	WriteRpcRequest(std::make_shared<FdOutputStream>(fd), method_name, params_batch, extra_metadata);
+                     const std::shared_ptr<arrow::KeyValueMetadata> &extra_metadata,
+                     const VgiProtocolId &protocol) {
+	WriteRpcRequest(std::make_shared<FdOutputStream>(fd), method_name, params_batch, extra_metadata, protocol);
 }
 
-void WriteEmptyRpcRequest(int fd, const std::string &method_name) {
+void WriteEmptyRpcRequest(int fd, const std::string &method_name, const VgiProtocolId &protocol) {
 	// Create an empty schema with zero fields
 	auto schema = arrow::schema({});
 
 	// Create a 1-row batch with zero columns
 	auto batch = arrow::RecordBatch::Make(schema, 1, std::vector<std::shared_ptr<arrow::Array>> {});
 
-	WriteRpcRequest(fd, method_name, batch);
+	WriteRpcRequest(fd, method_name, batch, /*extra_metadata=*/nullptr, protocol);
 }
 
 // ============================================================================
@@ -420,18 +430,22 @@ StreamHeaderResult ReadStreamHeader(const std::shared_ptr<arrow::io::InputStream
 
 std::vector<uint8_t> SerializeRpcRequest(
     const std::string &method_name, const std::shared_ptr<arrow::RecordBatch> &params_batch,
-    const std::string &protocol_version_override,
+    const VgiProtocolId &protocol,
     const std::vector<std::pair<std::string, std::string>> &extra_metadata) {
-	// Create custom metadata with method, wire version, and application
-	// protocol_version (enforced server-side at dispatch boundary). A non-empty
-	// override (the secret protocol's VGI_SECRET_PROTOCOL_VERSION) replaces the
-	// global worker/catalog version.
-	std::string protocol_version = protocol_version_override.empty()
-	                                   ? std::string(::duckdb::vgi::generated::VGI_PROTOCOL_VERSION)
-	                                   : protocol_version_override;
+	// Create custom metadata with method, wire version, the protocol routing key,
+	// and the addressed protocol's own surface version (both enforced server-side
+	// at the dispatch boundary). Over HTTP the routing key is the canonical
+	// carrier and the URL's protocol segment its projection: the server rejects a
+	// request whose two disagree, so both are built from this one VgiProtocolId.
+	// Reserved server-level methods are owned by no protocol and carry no key.
 	std::vector<std::string> meta_keys = {RPC_METHOD_KEY, RPC_REQUEST_VERSION_KEY,
 	                                      RPC_PROTOCOL_VERSION_KEY};
-	std::vector<std::string> meta_values = {method_name, RPC_REQUEST_VERSION_VALUE, protocol_version};
+	std::vector<std::string> meta_values = {method_name, RPC_REQUEST_VERSION_VALUE,
+	                                        std::string(protocol.version)};
+	if (!IsReservedRpcMethod(method_name)) {
+		meta_keys.emplace_back(RPC_PROTOCOL_KEY);
+		meta_values.emplace_back(protocol.name);
+	}
 	for (const auto &kv : extra_metadata) {
 		meta_keys.push_back(kv.first);
 		meta_values.push_back(kv.second);
@@ -444,10 +458,11 @@ std::vector<uint8_t> SerializeRpcRequest(
 	return SerializeToIpcBytes(params_batch, metadata);
 }
 
-std::vector<uint8_t> SerializeEmptyRpcRequest(const std::string &method_name) {
+std::vector<uint8_t> SerializeEmptyRpcRequest(const std::string &method_name,
+                                              const VgiProtocolId &protocol) {
 	auto schema = arrow::schema({});
 	auto batch = arrow::RecordBatch::Make(schema, 1, std::vector<std::shared_ptr<arrow::Array>> {});
-	return SerializeRpcRequest(method_name, batch);
+	return SerializeRpcRequest(method_name, batch, protocol);
 }
 
 // Helper: copy raw data into an owning Arrow buffer.

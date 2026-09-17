@@ -373,7 +373,7 @@ BindResult HttpFunctionConnection::PerformBindRpc() {
 		ServerCapabilities b_caps = CurrentCapabilities();
 		auto resp = HttpInvokeUnary(context_, base_url_, "bind", rpc_params, auth,
 		                             /*cookie_jar=*/nullptr, cached_params,
-		                             "", "", "", "", "", &http_client_, &b_caps,
+		                             "", "", "", "", VGI_MAIN_PROTOCOL, &http_client_, &b_caps,
 		                             attach_params_ ? attach_params_->iroh() : nullptr);
 		PublishHarvestedCapabilities(b_caps);
 		if (!resp.batch || resp.batch->num_rows() == 0) {
@@ -493,12 +493,13 @@ InitResult HttpFunctionConnection::PerformInit(const BindResult &bind_result,
 		}
 		cond_sent_ = true;
 	}
-	auto body = SerializeRpcRequest("init", rpc_params, /*protocol_version_override=*/"", extra_metadata);
+	auto body = SerializeRpcRequest("init", rpc_params, VGI_MAIN_PROTOCOL, extra_metadata);
 #ifdef __EMSCRIPTEN__
 #endif
 
-	// POST to {base_url}/init/init
-	std::string init_url = base_url_ + "/init/init";
+	// POST to {base}/{protocol}/init/init -- the protocol segment projects the routing
+	// key the body carries; the server rejects a request whose two disagree.
+	std::string init_url = base_url_ + "/" + VGI_MAIN_PROTOCOL.name + "/init/init";
 
 	{
 		auto fields = BuildConnLogFields(*this);
@@ -753,7 +754,7 @@ HttpFunctionConnection::RpcTableBufferingProcess(const std::string &function_nam
 	auto resp = HttpInvokeUnary(context_, base_url_, "table_buffering_process", rpc_params, auth,
 	                             /*cookie_jar=*/nullptr, cached_params,
 	                             GetExecutionIdHex(), GetAttachOpaqueDataHex(), "", GetConnIdHex(),
-	                             /*protocol_version_override=*/"", &http_client_, &tb_caps,
+	                             VGI_MAIN_PROTOCOL, &http_client_, &tb_caps,
 	                             attach_params_ ? attach_params_->iroh() : nullptr);
 	PublishHarvestedCapabilities(tb_caps);
 	auto inner = DecodeHttpOuterResponse(resp, "table_buffering_process", base_url_);
@@ -779,7 +780,7 @@ HttpFunctionConnection::RpcTableBufferingCombine(const std::string &function_nam
 	auto resp = HttpInvokeUnary(context_, base_url_, "table_buffering_combine", rpc_params, auth,
 	                             /*cookie_jar=*/nullptr, cached_params,
 	                             GetExecutionIdHex(), GetAttachOpaqueDataHex(), "", GetConnIdHex(),
-	                             /*protocol_version_override=*/"", &http_client_, &tb_caps,
+	                             VGI_MAIN_PROTOCOL, &http_client_, &tb_caps,
 	                             attach_params_ ? attach_params_->iroh() : nullptr);
 	PublishHarvestedCapabilities(tb_caps);
 	auto inner = DecodeHttpOuterResponse(resp, "table_buffering_combine", base_url_);
@@ -811,7 +812,7 @@ void HttpFunctionConnection::RpcTableBufferingDestructor(const std::string &func
 	auto resp = HttpInvokeUnary(context_, base_url_, "table_buffering_destructor", rpc_params, auth,
 	                             /*cookie_jar=*/nullptr, cached_params,
 	                             GetExecutionIdHex(), GetAttachOpaqueDataHex(), "", GetConnIdHex(),
-	                             /*protocol_version_override=*/"", &http_client_, &tb_caps,
+	                             VGI_MAIN_PROTOCOL, &http_client_, &tb_caps,
 	                             attach_params_ ? attach_params_->iroh() : nullptr);
 	PublishHarvestedCapabilities(tb_caps);
 	auto inner = DecodeHttpOuterResponse(resp, "table_buffering_destructor", base_url_);
@@ -851,7 +852,7 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 
 		auto body = SerializeBatchWithState(tick_batch, tick_schema);
 
-		std::string exchange_url = base_url_ + "/init/exchange";
+		std::string exchange_url = base_url_ + "/" + VGI_MAIN_PROTOCOL.name + "/init/exchange";
 
 		// Gated: fires once per continuation on the producer hot path.
 		if (VgiInfoLogActive(context_)) {
@@ -935,7 +936,7 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 		}
 	}
 
-	std::string exchange_url = base_url_ + "/init/exchange";
+	std::string exchange_url = base_url_ + "/" + VGI_MAIN_PROTOCOL.name + "/init/exchange";
 
 	auto x_auth = attach_params_ ? attach_params_->auth() : nullptr;
 	auto x_cached_params = attach_params_ && IsHttpTransport(exchange_url)
@@ -1092,7 +1093,7 @@ void HttpFunctionConnection::CancelStream(const std::vector<uint8_t> &state_toke
 	auto buffer = finish_result.ValueUnsafe();
 	std::vector<uint8_t> body(buffer->data(), buffer->data() + buffer->size());
 
-	std::string exchange_url = base_url_ + "/init/exchange";
+	std::string exchange_url = base_url_ + "/" + VGI_MAIN_PROTOCOL.name + "/init/exchange";
 	auto c_auth = attach_params_ ? attach_params_->auth() : nullptr;
 	// Route through ``live_context`` (dispatcher's bot context), NOT ``context_``:
 	// this runs off-thread after the originating query's ClientContext (and its

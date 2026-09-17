@@ -278,7 +278,7 @@ void VgiSabEnsureChannelOnRealm(int) {
 UnaryResponseResult WebWorkerInvokeUnary(ClientContext &context, const std::string &worker_path,
                                          const std::string &method_name,
                                          const std::shared_ptr<arrow::RecordBatch> &params,
-                                         const std::string &protocol_version_override) {
+                                         const VgiProtocolId &protocol) {
 	const std::string location = CanonicalizeBrowserWorkerTarget(worker_path);
 	int region_offset = 0;
 #if defined(__EMSCRIPTEN__)
@@ -303,8 +303,8 @@ UnaryResponseResult WebWorkerInvokeUnary(ClientContext &context, const std::stri
 		}
 	} releaser {region_offset, slot};
 
-	std::vector<uint8_t> request = params ? SerializeRpcRequest(method_name, params, protocol_version_override)
-	                                      : SerializeEmptyRpcRequest(method_name);
+	std::vector<uint8_t> request = params ? SerializeRpcRequest(method_name, params, protocol)
+	                                      : SerializeEmptyRpcRequest(method_name, protocol);
 	auto out = std::make_shared<SabOutputStream>(region_offset, slot);
 	auto write_status = out->Write(request.data(), static_cast<int64_t>(request.size()));
 	if (!write_status.ok()) {

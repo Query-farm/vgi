@@ -18,7 +18,6 @@
 #include "duckdb/main/secret/secret_manager.hpp"
 
 #include "generated/vgi_secret_protocol_schemas.hpp"
-#include "generated/vgi_secret_protocol_version.hpp"
 #include "generated/vgi_secret_request_builders.hpp"
 #include "vgi_arrow_utils.hpp"
 #include "vgi_logging.hpp"
@@ -277,7 +276,9 @@ VgiRemoteSecretStorage::FetchRemote(const string &path, const string &type,
 		opts.use_pool = false;
 		opts.auth = auth_;
 		opts.phase = "secret_lookup";
-		opts.protocol_version_override = std::string(generated::VGI_SECRET_PROTOCOL_VERSION);
+		// Routes to the standalone secret service's own protocol, not the
+		// worker protocol: a server co-hosting both dispatches on this key.
+		opts.protocol = VGI_SECRET_PROTOCOL;
 
 		auto response = InvokePooledUnaryRpc(opts, "secret_lookup", params);
 

@@ -50,6 +50,10 @@ constexpr const char *ARROW_IPC_CONTENT_TYPE = "application/vnd.apache.arrow.str
 // ServerCapabilitiesCache should load into a local, pass it, and store it back,
 // so the codec choice (in particular "this server takes identity bodies only")
 // is learned once per catalog instead of once per RPC.
+// protocol: which application protocol the call addresses. Selects the URL's
+// protocol path segment AND the request's vgi_rpc.protocol routing key — the
+// server requires the two to agree. Reserved server-level methods (``__x__``)
+// are mounted flat and carry neither.
 UnaryResponseResult HttpInvokeUnary(ClientContext &context,
                                      const std::string &worker_path,
                                      const std::string &method_name,
@@ -61,7 +65,7 @@ UnaryResponseResult HttpInvokeUnary(ClientContext &context,
                                      const std::string &attach_opaque_data_hex = "",
                                      const std::string &transaction_opaque_data_hex = "",
                                      const std::string &conn_id_hex = "",
-                                     const std::string &protocol_version_override = "",
+                                     const VgiProtocolId &protocol = VGI_MAIN_PROTOCOL,
                                      duckdb::unique_ptr<HTTPClient> *client_holder = nullptr,
                                      ServerCapabilities *caps = nullptr,
                                      const std::shared_ptr<IrohClientConfig> &iroh_config = nullptr);

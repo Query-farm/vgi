@@ -85,9 +85,9 @@ UnaryResponseResult AttemptUnaryRpc(const UnaryRpcOptions &opts, const std::stri
 	UnaryResponseResult response;
 	try {
 		if (params) {
-			WriteRpcRequest(proc->GetStdinFd(), method_name, params);
+			WriteRpcRequest(proc->GetStdinFd(), method_name, params, /*extra_metadata=*/nullptr, opts.protocol);
 		} else {
-			WriteEmptyRpcRequest(proc->GetStdinFd(), method_name);
+			WriteEmptyRpcRequest(proc->GetStdinFd(), method_name, opts.protocol);
 		}
 		// Disable in-band log message forwarding when enable_logging is false —
 		// HandleBatchLogMessage would otherwise call VGI_LOG from this thread.
@@ -165,7 +165,7 @@ UnaryResponseResult InvokePooledUnaryRpc(const UnaryRpcOptions &opts, const std:
 		auto result = HttpInvokeUnary(
 		    opts.context, opts.worker_path, method_name, params, opts.auth, opts.cookie_jar, opts.cached_http_params,
 		                              /*invocation_id_hex=*/"", /*attach_opaque_data_hex=*/"",
-		    /*transaction_opaque_data_hex=*/"", /*conn_id_hex=*/"", opts.protocol_version_override.value_or(""),
+		    /*transaction_opaque_data_hex=*/"", /*conn_id_hex=*/"", opts.protocol,
 		    opts.http_client_pool ? &pooled : nullptr, opts.server_caps ? &caps : nullptr, opts.iroh);
 		if (opts.server_caps) {
 			opts.server_caps->Store(caps);
@@ -183,12 +183,12 @@ UnaryResponseResult InvokePooledUnaryRpc(const UnaryRpcOptions &opts, const std:
 #if defined(__EMSCRIPTEN__)
 		auto result = HttpInvokeUnary(opts.context, CanonicalizeHttpiLocation(opts.worker_path), method_name, params,
 		                       opts.auth, opts.cookie_jar, opts.cached_http_params, "", "", "", "",
-		                       opts.protocol_version_override.value_or(""), nullptr,
+		                       opts.protocol, nullptr,
 		                       opts.server_caps ? &caps : nullptr);
 #else
 		auto result = HttpInvokeUnary(opts.context, CanonicalizeHttpiLocation(opts.worker_path), method_name, params,
 		                       opts.auth, opts.cookie_jar, nullptr, "", "", "", "",
-		                       opts.protocol_version_override.value_or(""), nullptr,
+		                       opts.protocol, nullptr,
 		                       opts.server_caps ? &caps : nullptr, opts.iroh);
 #endif
 		if (opts.server_caps) {
@@ -202,7 +202,7 @@ UnaryResponseResult InvokePooledUnaryRpc(const UnaryRpcOptions &opts, const std:
 	// self-contained unary over a transient SAB slot (open/write+EOS/read/release).
 	if (IsWebWorkerTransport(opts.worker_path) || IsIrohTransport(opts.worker_path)) {
 		return WebWorkerInvokeUnary(opts.context, opts.worker_path, method_name, params,
-		                            opts.protocol_version_override.value_or(""));
+		                            opts.protocol);
 	}
 #endif
 #if !defined(__EMSCRIPTEN__)
@@ -212,11 +212,11 @@ UnaryResponseResult InvokePooledUnaryRpc(const UnaryRpcOptions &opts, const std:
 		}
 		auto duplex = OpenIrohArrowMuxStream(opts.iroh, &opts.context);
 		if (params) {
-			WriteRpcRequest(duplex.output, method_name, params);
+			WriteRpcRequest(duplex.output, method_name, params, /*extra_metadata=*/nullptr, opts.protocol);
 		} else {
 			auto empty = arrow::RecordBatch::Make(arrow::schema({}), 1,
 			                                      std::vector<std::shared_ptr<arrow::Array>> {});
-			WriteRpcRequest(duplex.output, method_name, empty);
+			WriteRpcRequest(duplex.output, method_name, empty, /*extra_metadata=*/nullptr, opts.protocol);
 		}
 		return ReadUnaryResponse(duplex.input, &opts.context, opts.worker_path);
 	}
@@ -246,14 +246,14 @@ UnaryResponseResult InvokePooledUnaryRpc(const UnaryRpcOptions &opts, const std:
 				if (ep.mode == ContainerConnMode::HTTP) {
 					return HttpInvokeUnary(opts.context, ep.url, method_name, params, opts.auth, opts.cookie_jar,
 					                       /*cached_http_params=*/nullptr, "", "", "", "",
-					                        opts.protocol_version_override.value_or(""));
+					                        opts.protocol);
 				}
 				// tcp (and, later, unix): native vgi-rpc over the connected fd.
 				auto worker = ConnectSharedContainer(ep);
 				if (params) {
-					WriteRpcRequest(worker->GetStdinFd(), method_name, params);
+					WriteRpcRequest(worker->GetStdinFd(), method_name, params, /*extra_metadata=*/nullptr, opts.protocol);
 				} else {
-					WriteEmptyRpcRequest(worker->GetStdinFd(), method_name);
+					WriteEmptyRpcRequest(worker->GetStdinFd(), method_name, opts.protocol);
 				}
 				auto *log_ctx = opts.enable_logging ? &opts.context : nullptr;
 				return ReadUnaryResponse(worker->GetStdoutFd(), log_ctx, opts.worker_path, /*pid=*/-1);
@@ -286,9 +286,9 @@ UnaryResponseResult InvokePooledUnaryRpc(const UnaryRpcOptions &opts, const std:
 		}
 		UnixSocketWorker worker(fd);
 		if (params) {
-			WriteRpcRequest(worker.GetStdinFd(), method_name, params);
+			WriteRpcRequest(worker.GetStdinFd(), method_name, params, /*extra_metadata=*/nullptr, opts.protocol);
 		} else {
-			WriteEmptyRpcRequest(worker.GetStdinFd(), method_name);
+			WriteEmptyRpcRequest(worker.GetStdinFd(), method_name, opts.protocol);
 		}
 		auto *log_ctx = opts.enable_logging ? &opts.context : nullptr;
 		return ReadUnaryResponse(worker.GetStdoutFd(), log_ctx, opts.worker_path, /*pid=*/-1);
@@ -305,9 +305,9 @@ UnaryResponseResult InvokePooledUnaryRpc(const UnaryRpcOptions &opts, const std:
 		}
 		NamedPipeWorker worker(fd);
 		if (params) {
-			WriteRpcRequest(worker.GetStdinFd(), method_name, params);
+			WriteRpcRequest(worker.GetStdinFd(), method_name, params, /*extra_metadata=*/nullptr, opts.protocol);
 		} else {
-			WriteEmptyRpcRequest(worker.GetStdinFd(), method_name);
+			WriteEmptyRpcRequest(worker.GetStdinFd(), method_name, opts.protocol);
 		}
 		auto *log_ctx = opts.enable_logging ? &opts.context : nullptr;
 		return ReadUnaryResponse(worker.GetStdoutFd(), log_ctx, opts.worker_path, /*pid=*/-1);
@@ -339,9 +339,9 @@ UnaryResponseResult InvokePooledUnaryRpc(const UnaryRpcOptions &opts, const std:
 		auto sock = ResolveAndConnect(opts.worker_path, std::chrono::seconds(10), overrides);
 		UnixSocketWorker worker(sock.Release());
 		if (params) {
-			WriteRpcRequest(worker.GetStdinFd(), method_name, params);
+			WriteRpcRequest(worker.GetStdinFd(), method_name, params, /*extra_metadata=*/nullptr, opts.protocol);
 		} else {
-			WriteEmptyRpcRequest(worker.GetStdinFd(), method_name);
+			WriteEmptyRpcRequest(worker.GetStdinFd(), method_name, opts.protocol);
 		}
 		auto *log_ctx = opts.enable_logging ? &opts.context : nullptr;
 		return ReadUnaryResponse(worker.GetStdoutFd(), log_ctx, opts.worker_path, /*pid=*/-1);
@@ -364,9 +364,9 @@ UnaryResponseResult InvokePooledUnaryRpc(const UnaryRpcOptions &opts, const std:
 		}
 		NamedPipeWorker worker(NamedPipeConnect(pipe_name, std::chrono::seconds(10)));
 		if (params) {
-			WriteRpcRequest(worker.GetStdinFd(), method_name, params);
+			WriteRpcRequest(worker.GetStdinFd(), method_name, params, /*extra_metadata=*/nullptr, opts.protocol);
 		} else {
-			WriteEmptyRpcRequest(worker.GetStdinFd(), method_name);
+			WriteEmptyRpcRequest(worker.GetStdinFd(), method_name, opts.protocol);
 		}
 		auto *log_ctx = opts.enable_logging ? &opts.context : nullptr;
 		return ReadUnaryResponse(worker.GetStdoutFd(), log_ctx, opts.worker_path, /*pid=*/-1);

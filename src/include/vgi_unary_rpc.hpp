@@ -70,12 +70,12 @@ struct UnaryRpcOptions {
 	// → use ``LaunchConfig`` defaults.
 	std::optional<std::chrono::milliseconds> launcher_idle_timeout;
 	std::optional<std::string> launcher_state_dir;
-	// Per-call application protocol version. When set, replaces the global
-	// VGI_PROTOCOL_VERSION stamped into the request metadata — used by the
-	// separately-versioned secret protocol (HTTP transport only; subprocess
-	// secret RPCs don't exist). Placed last so positional call sites are
-	// unaffected.
-	std::optional<std::string> protocol_version_override;
+	// Which application protocol this call addresses. Selects the vgi_rpc.protocol
+	// routing key the server dispatches on, the URL's protocol segment on HTTP,
+	// and the surface version stamped alongside — the secret protocol is
+	// versioned independently of the worker protocol, which is why this used to
+	// be a bare version override. Defaults to the worker/catalog protocol.
+	VgiProtocolId protocol = VGI_MAIN_PROTOCOL;
 	// Per-catalog keep-alive HTTP client pool (see VgiHttpClientPool in
 	// vgi_http_client.hpp). When set on HTTP transport, the RPC checks a
 	// client out for the call and returns it on success, so consecutive

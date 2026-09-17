@@ -147,7 +147,14 @@ jobs:
           git -C /tmp/vgi-rpc-rust checkout 9e7dfb59686682be0ff4a46183988e2724416393
           cargo build --locked --release --manifest-path /tmp/vgi-rpc-rust/Cargo.toml -p vgi-iroh-bridge
           git clone --filter=blob:none https://github.com/Query-farm/vgi-rpc-python.git /tmp/vgi-rpc-python
-          git -C /tmp/vgi-rpc-python checkout 365395a6144256ec163b17cf9b755b9b5f6a386c
+          # This editable install REPLACES vgi-rpc in the fixture venv for the
+          # rest of the job, so the pin governs every later step -- not just the
+          # Iroh one. It must therefore stay at or above the version vgi-python
+          # itself requires (>=0.46.0), where `vgi_rpc.protocol` became a
+          # required routing key and HTTP routes moved to
+          # {prefix}/{protocol}/{method}. The previous pin sat at 0.45.0, which
+          # predates both and would silently downgrade the whole suite.
+          git -C /tmp/vgi-rpc-python checkout e78bc535753153b1de0c156ff828ee667be29f40
           uv pip install --python /tmp/vgi-python/.venv/bin/python --editable '/tmp/vgi-rpc-python[http]'
 
       - name: Run native Iroh raw and HTTP integration
