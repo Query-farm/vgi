@@ -1,0 +1,157 @@
+# name: test/sql/integration/table_in_out/blended_any.test
+# description: Blended ("UNNEST-style") table-in-out functions whose POSITIONAL
+#   input columns are declared ANY. A blended function's worker-input schema is
+#   built from its DECLARED arg types (so a literal f(52) still arrives as the
+#   DOUBLE signature) — but ANY is a binder placeholder, not a type Arrow can
+#   carry, so for an ANY arg the client must use the type DuckDB resolved for the
+#   call instead. Before that fallback every call here failed at bind with
+#   "Unsupported Arrow type ANY".
+#
+#   Fixtures (both are 1->1 echoes whose output type is bound from the input):
+#     blended_any(value ANY)             -> value <resolved input type>
+#     blended_any_varargs(values ANY...) -> col0..colN-1 <each resolved type>
+#
+#   Assertions use DuckDB's own typeof() and the round-tripped values, never an
+#   SDK's rendering of a type name, so the file is language-neutral.
+# group: [vgi_integration_table_in_out]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+# HTTP transport ATTACH needs httpfs loaded (else a "VGI HTTP transport requires
+# the httpfs extension" error — containing "HTTP" — makes the harness silently
+# skip the whole file). Harmless on subprocess.
+require httpfs
+
+statement ok
+ATTACH 'example' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# ---------------------------------------------------------------------------
+# catalog: the arg is advertised as ANY and the function is blended
+# ---------------------------------------------------------------------------
+
+query TTT
+SELECT arg_name, arg_type, input_from_args::VARCHAR
+FROM vgi_function_arguments()
+WHERE catalog_name = 'ex' AND function_name = 'blended_any';
+----
+value	ANY	true
+
+# ---------------------------------------------------------------------------
+# LITERAL form (childless PhysicalTableScan single-row scan-mode). With no
+# declared type to cast to, the worker receives the constant's natural type.
+# ---------------------------------------------------------------------------
+
+query TT
+SELECT value, typeof(value) FROM ex.blended_any('hello');
+----
+hello	VARCHAR
+
+query IT
+SELECT value, typeof(value) FROM ex.blended_any(42);
+----
+42	INTEGER
+
+query TT
+SELECT value, typeof(value) FROM ex.blended_any({'message': 'hi', 'n': 3});
+----
+{'message': hi, 'n': 3}	STRUCT(message VARCHAR, n INTEGER)
+
+query TT
+SELECT value, typeof(value) FROM ex.blended_any(['a', 'b']);
+----
+[a, b]	VARCHAR[]
+
+# ---------------------------------------------------------------------------
+# COLUMN and LATERAL forms (streaming input)
+# ---------------------------------------------------------------------------
+
+# a struct assembled per row from outer columns
+query ITT
+SELECT id, value, typeof(value)
+FROM (VALUES (1, 'lost pkg', 'gold'), (2, 'charged twice', 'free')) t(id, body, tier),
+     LATERAL ex.blended_any({'message': t.body, 'tier': t.tier})
+ORDER BY id;
+----
+1	{'message': lost pkg, 'tier': gold}	STRUCT(message VARCHAR, tier VARCHAR)
+2	{'message': charged twice, 'tier': free}	STRUCT(message VARCHAR, tier VARCHAR)
+
+# the WHOLE ROW as the input value: f(t)
+query TT
+SELECT value, typeof(value) FROM (VALUES (1, 'lost pkg')) t(id, body), LATERAL ex.blended_any(t);
+----
+{'id': 1, 'body': lost pkg}	STRUCT(id INTEGER, body VARCHAR)
+
+# implicit-lateral column form, with a NULL struct and a NULL field — both must
+# survive the round trip rather than being conflated
+query IT
+SELECT id, value
+FROM (VALUES (1, {'m': 'a'}), (2, NULL), (3, {'m': NULL})) t(id, s), ex.blended_any(t.s)
+ORDER BY id;
+----
+1	{'m': a}
+2	NULL
+3	{'m': NULL}
+
+# a list column
+query ITT
+SELECT id, value, typeof(value)
+FROM (VALUES (1, [1, 2]), (2, [3])) t(id, l), LATERAL ex.blended_any(t.l)
+ORDER BY id;
+----
+1	[1, 2]	INTEGER[]
+2	[3]	INTEGER[]
+
+# multi-batch: 5000 rows spans several input chunks; every output row must be
+# paired with ITS OWN input row (the correlated columns are stamped by the client)
+query II
+SELECT count(*), count(*) FILTER (WHERE value.id = t.id AND value.body = t.body)
+FROM (SELECT i AS id, 'body ' || i AS body FROM range(5000) r(i)) t,
+     LATERAL ex.blended_any({'id': t.id, 'body': t.body});
+----
+5000	5000
+
+# the same registration serves different resolved types in one session — the
+# input schema is per-bind, not cached per function
+query TT
+SELECT typeof(a.value), typeof(b.value)
+FROM ex.blended_any(1.5::DOUBLE) a, ex.blended_any(DATE '2026-01-02') b;
+----
+DOUBLE	DATE
+
+# ---------------------------------------------------------------------------
+# VARARGS: every runtime column resolves its own type
+# ---------------------------------------------------------------------------
+
+query TTT
+SELECT arg_name, arg_type, input_from_args::VARCHAR
+FROM vgi_function_arguments()
+WHERE catalog_name = 'ex' AND function_name = 'blended_any_varargs';
+----
+values	ANY	true
+
+# literal, three columns of three different types
+query ITTTTT
+SELECT col0, col1, col2, typeof(col0), typeof(col1), typeof(col2)
+FROM ex.blended_any_varargs(1, 'two', {'k': 3.5::DOUBLE});
+----
+1	two	{'k': 3.5}	INTEGER	VARCHAR	STRUCT(k DOUBLE)
+
+# a different arity and type in the same session
+query TT
+SELECT col0, typeof(col0) FROM ex.blended_any_varargs(DATE '2026-01-02');
+----
+2026-01-02	DATE
+
+# LATERAL form, mixed scalar + list columns
+query ITTTT
+SELECT id, col0, col1, typeof(col0), typeof(col1)
+FROM (VALUES (1, 'a', [1, 2]), (2, 'b', [3])) t(id, s, l), LATERAL ex.blended_any_varargs(t.s, t.l)
+ORDER BY id;
+----
+1	a	[1, 2]	VARCHAR	INTEGER[]
+2	b	[3]	VARCHAR	INTEGER[]
+
+statement ok
+DETACH ex;

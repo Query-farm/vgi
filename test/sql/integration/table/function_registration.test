@@ -78,7 +78,7 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 #   producer is lock-step, so one batch completes in one turn and never needs a
 #   continuation. Two or more do — and that path silently truncated to the first
 #   batch until this fixture existed. See table_in_out/multi_batch_finalize.test)
-# 7 blended ("UNNEST-style") fixtures (geo_encode + geo_encode3, arity-overloaded
+# 9 blended ("UNNEST-style") fixtures (geo_encode + geo_encode3, arity-overloaded
 #   RowTransformFunctions sharing the name "geo_encode"; row_sum, a VARARGS blended
 #   fn; blended_drop, a 1->0 scan-mode edge-case map — positional args ARE the
 #   per-row input columns, one registration serves literal / column / LATERAL; see
@@ -87,7 +87,10 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 #   per input row with vgi_rpc.parent_row provenance; projectable_blended, a 1->1 map
 #   with projection_pushdown + two output columns exercising the operator's projection
 #   path; hostile_provenance, an adversarial fixture emitting a malformed parent_row
-#   the extension must reject)
+#   the extension must reject. Plus 2 whose positional input columns are declared
+#   ANY (table_in_out/blended_any.test): blended_any, a 1->1 echo of one ANY column,
+#   and blended_any_varargs, the VARARGS form — the worker-input schema must come
+#   from the type DuckDB resolved for the call, since ANY names no Arrow type)
 # 12 result-cache fixtures (cacheable_numbers, cache_nonce, cache_no_store,
 #   cache_scoped_txn, cache_big, cache_multicol, cache_revalidatable, cache_whoami,
 #   cache_versioned_scan, cache_projection, cache_poison, cache_external_fail —
@@ -144,7 +147,7 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 #   re-emits its splits across pages); and four pair splits with another
 #   feature (split_batch_index, split_partitioned, split_dynamic_filter,
 #   split_cacheable). Back splits/*.test.
-# = 164 portable baseline registrations.
+# = 166 portable baseline registrations.
 #
 # SDK fixture workers may additionally ship implementation-specific backing
 # scans that are not part of the portable fixture surface. C# uses
@@ -169,7 +172,7 @@ WHERE database_name = 'example' AND function_type = 'table'
     'generated_sequence_scan'
   );
 ----
-164
+166
 
 query I
 SELECT CASE
