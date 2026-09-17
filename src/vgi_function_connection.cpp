@@ -29,6 +29,7 @@
 #include "vgi_github.hpp"
 #include "vgi_transport.hpp"
 
+#include <algorithm>
 #include <map>
 #include <mutex>
 
@@ -505,6 +506,13 @@ FunctionConnection::FunctionConnection(std::unique_ptr<SubProcess> proc, const s
 }
 
 FunctionConnection::~FunctionConnection() {
+#if VGI_SHM_TRANSPORT
+	// The mapping is shared-owned and outlives us for as long as a retained
+	// batch still views it; the NAME has no such reason to linger.
+	if (shm_segment_) {
+		shm_segment_->Unlink();
+	}
+#endif
 	// Terminate the subprocess first — EOF on stderr unblocks the drainer's
 	// blocking read(), so the drainer's destructor can join its thread quickly.
 	proc_.reset();
@@ -737,10 +745,17 @@ InitResult FunctionConnection::PerformInit(const BindResult &bind_result, const 
 			if (!shm_segment_) {
 				shm_segment_ = VgiShmSegment::Create(shm_size);
 			} else {
-				shm_segment_->ResetAllocator();
+				// Start the worker's allocator fresh — except for slots a batch
+				// from an earlier request still views (a cache that retained it).
+				// Wiping those entries would let the worker allocate over live data.
+				ReleaseUnreferencedShmSlots();
+				std::vector<uint64_t> leased;
+				leased.reserve(shm_leases_.size());
+				for (auto &lease : shm_leases_) {
+					leased.push_back(lease->offset);
+				}
+				shm_segment_->RetainOnly(leased);
 			}
-			// All prior allocations were just invalidated by the reset.
-			shm_last_offset_ = -1;
 			// Python's multiprocessing.shared_memory prepends '/' itself
 			// (controlled by _prepend_leading_slash), so we advertise the
 			// posix-shm name WITHOUT the leading slash. shm_open is fine
@@ -753,6 +768,9 @@ InitResult FunctionConnection::PerformInit(const BindResult &bind_result, const 
 			    {py_name, std::to_string(shm_segment_->size())});
 		} catch (const std::exception &e) {
 			// Best-effort: fall back to inline transport if shm setup fails.
+			// (Dropping our leases does not unmap under a retained batch: each
+			// lease co-owns the segment.)
+			shm_leases_.clear();
 			shm_segment_.reset();
 			shm_metadata.reset();
 		}
@@ -1061,10 +1079,9 @@ void FunctionConnection::ResetForNextSplit() {
 	cond_if_none_match_.clear();
 	cond_if_modified_since_.clear();
 
-	// Shared memory: the allocator is reset inside PerformInit's negotiated-shm
-	// branch, but shm_last_offset_ is ours to clear. Leaving a stale offset would
-	// have the next ReadDataBatch free a slot belonging to the previous split.
-	shm_last_offset_ = -1;
+	// Shared memory: nothing to clear here. shm_leases_ deliberately survives the
+	// split boundary — PerformInit's negotiated-shm branch resets the allocator
+	// around whichever of them are still referenced.
 
 	// NOT cleared, deliberately: proc_ and its pipes (the transport), tick_filter_state_
 	// (a shared gstate object PerformInit never touches, so dynamic join-key pushdown
@@ -1263,21 +1280,21 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 
 		// shm pointer batches: 0-row batches with shm_offset/shm_length in
 		// custom_metadata. Resolve to the actual batch from the segment.
-		// Free the prior batch's slot first — the lockstep RPC protocol
-		// guarantees DuckDB has fully consumed the previous chunk by the
-		// time it asks us for the next one. Without this, the allocator
-		// fills monotonically and the worker silently falls back to inline.
+		// Hand back the slots nobody references any more first. The lockstep
+		// RPC protocol makes this a safe point to edit the allocator table;
+		// it does NOT mean the previous batch is finished with — a consumer may
+		// have retained it (result-cache capture, memo arena), and such a slot
+		// stays leased until that holder lets go. Without the sweep the
+		// allocator fills monotonically and the worker falls back to inline.
 		// (POSIX-only: shm_segment_ is never non-null on Windows.)
 #if VGI_SHM_TRANSPORT
 		if (shm_segment_) {
-			if (shm_last_offset_ >= 0) {
-				shm_segment_->FreeAllocation(static_cast<uint64_t>(shm_last_offset_));
-				shm_last_offset_ = -1;
-			}
-			int64_t resolved_offset = -1;
-			auto resolved = shm_segment_->MaybeResolveBatch(result.batch, result.custom_metadata, &resolved_offset);
+			ReleaseUnreferencedShmSlots();
+			std::shared_ptr<VgiShmSlotLease> lease;
+			auto resolved = shm_segment_->MaybeResolveBatch(result.batch, result.custom_metadata, &lease);
 			if (resolved) {
-				shm_last_offset_ = resolved_offset;
+				const int64_t resolved_offset = static_cast<int64_t>(lease->offset);
+				shm_leases_.push_back(std::move(lease));
 				if (std::getenv("VGI_RPC_SHM_DEBUG")) {
 					fprintf(stderr, "[shm] resolved batch off=%lld len=%lld\n", (long long)resolved_offset,
 					        (long long)resolved->num_rows());
@@ -1624,39 +1641,57 @@ void FunctionConnection::CloseInputWriter() {
 // "TABLE_BUFFERING"), establishing execution_id on the worker side. The
 // caller threads gstate.execution_id through every subsequent RPC.
 
-namespace {
-
-// Inner-request builders live in vgi_table_buffering_builders.cpp and are
-// shared with the HTTP transport. We reach them through ::duckdb::vgi::.
-
 #if VGI_SHM_TRANSPORT
 // Resolve a shm pointer batch returned by a *unary* RPC response in place.
 // The worker offloads large non-dict responses to the shared-memory segment
 // exactly as it does for streaming scan output; the only difference is the
-// read path. Mirrors the ReadDataBatch resolution but frees immediately:
-// each unary call is request→response→decode, and under the lockstep RPC
-// protocol the worker stays blocked on the next request until we send it, so
-// the resolved batch's view into the segment remains valid through decode
-// even though its allocation is already freed (FreeAllocation only edits the
-// allocator header; the bytes survive until the worker's next write).
-void ResolveUnaryShm(VgiShmSegment *shm, UnaryResponseResult &response) {
-	if (!shm || !response.batch) {
+// read path. Same ownership rule as ReadDataBatch: the slot is leased to the
+// resolved batch and handed back at a later sweep, once nothing references it.
+// (This used to free at once and rely on "the bytes survive until the worker's
+// next write" — true only while no caller keeps the decoded batch past the next
+// request.) We are just past a response, the worker is blocked on our next
+// request, so this is a lockstep point and sweeping here is safe.
+void FunctionConnection::ResolveUnaryShm(UnaryResponseResult &response) {
+	if (!shm_segment_ || !response.batch) {
 		return;
 	}
-	int64_t resolved_offset = -1;
-	auto resolved = shm->MaybeResolveBatch(response.batch, response.metadata, &resolved_offset);
+	ReleaseUnreferencedShmSlots();
+	std::shared_ptr<VgiShmSlotLease> lease;
+	auto resolved = shm_segment_->MaybeResolveBatch(response.batch, response.metadata, &lease);
 	if (resolved) {
 		response.batch = resolved;
-		if (resolved_offset >= 0) {
-			shm->FreeAllocation(static_cast<uint64_t>(resolved_offset));
-		}
 		if (std::getenv("VGI_RPC_SHM_DEBUG")) {
-			fprintf(stderr, "[shm] resolved unary response off=%lld rows=%lld\n", (long long)resolved_offset,
+			fprintf(stderr, "[shm] resolved unary response off=%lld rows=%lld\n", (long long)lease->offset,
 			        (long long)response.batch->num_rows());
 		}
+		shm_leases_.push_back(std::move(lease));
 	}
 }
+
+void FunctionConnection::ReleaseUnreferencedShmSlots() {
+	if (!shm_segment_) {
+		return;
+	}
+	// use_count() == 1 means ours is the only reference. That is stable, not
+	// merely a snapshot: the other holders are the slot's buffers, and once the
+	// last of them is gone nothing can mint a new one (only we hold the lease).
+	// A count above 1 may be about to drop on another thread — then the slot
+	// simply waits for the next sweep.
+	auto unreferenced = [this](const std::shared_ptr<VgiShmSlotLease> &lease) {
+		if (lease.use_count() != 1) {
+			return false;
+		}
+		shm_segment_->FreeAllocation(lease->offset);
+		return true;
+	};
+	shm_leases_.erase(std::remove_if(shm_leases_.begin(), shm_leases_.end(), unreferenced), shm_leases_.end());
+}
 #endif // VGI_POSIX_TRANSPORT
+
+namespace {
+
+// Inner-request builders live in vgi_table_buffering_builders.cpp and are
+// shared with the HTTP transport. We reach them through ::duckdb::vgi::.
 
 // Decode the outer-envelope response into the registered result schema.
 // The 'result' column of the outer envelope is a binary blob containing
@@ -1716,7 +1751,7 @@ FunctionConnection::RpcTableBufferingProcess(const std::string &function_name, c
 	WriteTransportRpc("table_buffering_process", process_params, process_meta);
 	auto response = ReadTransportUnary();
 #if VGI_SHM_TRANSPORT
-	ResolveUnaryShm(shm_segment_.get(), response);
+	ResolveUnaryShm(response);
 #endif
 	auto inner = DecodeOuterResponse(response, "table_buffering_process", worker_path_);
 	vgi::ValidateResponseSchema(inner, "table_buffering_process", worker_path_);
@@ -1738,7 +1773,7 @@ FunctionConnection::RpcTableBufferingCombine(const std::string &function_name, c
 	WriteTransportRpc("table_buffering_combine", rpc_params);
 	auto response = ReadTransportUnary();
 #if VGI_SHM_TRANSPORT
-	ResolveUnaryShm(shm_segment_.get(), response);
+	ResolveUnaryShm(response);
 #endif
 	auto inner = DecodeOuterResponse(response, "table_buffering_combine", worker_path_);
 	vgi::ValidateResponseSchema(inner, "table_buffering_combine", worker_path_);
@@ -1767,7 +1802,7 @@ void FunctionConnection::RpcTableBufferingDestructor(const std::string &function
 	WriteTransportRpc("table_buffering_destructor", rpc_params);
 	auto response = ReadTransportUnary();
 #if VGI_SHM_TRANSPORT
-	ResolveUnaryShm(shm_segment_.get(), response);
+	ResolveUnaryShm(response);
 #endif
 	auto inner = DecodeOuterResponse(response, "table_buffering_destructor", worker_path_);
 	vgi::ValidateResponseSchema(inner, "table_buffering_destructor", worker_path_);

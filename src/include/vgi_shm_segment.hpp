@@ -16,8 +16,18 @@
 //   * Client recognizes pointer batches in ReadDataBatch, parses the IPC
 //     bytes from the segment, returns the resolved RecordBatch.
 //
-// Lifecycle: client owns the segment. Reset between requests so the
-// server's allocator starts fresh. shm_unlink + munmap on destruction.
+// Lifecycle: the connection creates the segment and resets its allocator
+// between requests so the server's allocator starts fresh. The NAME is
+// unlinked when the connection goes away; the MAPPING is shared-owned and
+// stays valid for as long as any resolved batch still views it (see
+// VgiShmSlotLease) — munmap on the last release.
+//
+// Resolved batches are zero-copy views of a slot, and they own that slot: a
+// batch may be RETAINED (a result-cache capture, a memo arena, anything) for
+// as long as its holder likes. The slot is handed back to the worker only once
+// nothing references it. A full segment is not an error — the worker falls
+// back to inline transport — so a long-lived holder costs throughput at worst,
+// never correctness. Size the segment with VGI_RPC_SHM_SIZE_BYTES.
 #pragma once
 
 #include <cstddef>
@@ -25,6 +35,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include <arrow/record_batch.h>
 #include <arrow/util/key_value_metadata.h>
@@ -50,12 +61,31 @@ constexpr uint32_t VGI_SHM_VERSION = 1;
 // against it before iterating the entry table.
 constexpr uint32_t VGI_SHM_MAX_ALLOCS = (VGI_SHM_HEADER_SIZE - 24) / 16;
 
-class VgiShmSegment {
+class VgiShmSegment;
+
+// A lease on one allocated slot of a segment, held by every Arrow buffer that
+// views the slot (and so, transitively, by the resolved RecordBatch and any
+// slice of it).
+//
+// The lease keeps the segment's MAPPING alive. It deliberately does NOT free
+// the slot when it dies: the allocator table lives in the shared header with
+// no lock — both sides rely on the lockstep RPC protocol for exclusion — so a
+// free fired from a destructor, on whatever thread and at whatever moment the
+// last reference happened to drop, could race the worker's next allocate and
+// corrupt the table. Instead the connection holds its own reference to each
+// lease and, at the lockstep points where it already freed slots, frees the
+// ones whose only remaining reference is its own.
+struct VgiShmSlotLease {
+	std::shared_ptr<const VgiShmSegment> segment;
+	uint64_t offset;
+};
+
+class VgiShmSegment : public std::enable_shared_from_this<VgiShmSegment> {
 public:
 	// Create a fresh segment of size `size_bytes` (must be > VGI_SHM_HEADER_SIZE).
 	// The OS may round up to a page boundary; the actual mapped size is
-	// written into the header.
-	static std::unique_ptr<VgiShmSegment> Create(size_t size_bytes);
+	// written into the header. Shared-owned: leases keep it alive.
+	static std::shared_ptr<VgiShmSegment> Create(size_t size_bytes);
 
 	~VgiShmSegment();
 
@@ -79,6 +109,18 @@ public:
 	// so the worker's allocator starts fresh; the lockstep RPC protocol
 	// guarantees the worker isn't writing while we reset.
 	void ResetAllocator();
+
+	// ResetAllocator(), except the entries at `offsets` survive. Used between
+	// requests when batches resolved by an earlier request are still referenced:
+	// wiping their entries would let the worker allocate over memory a live
+	// batch still views. Unknown offsets are ignored. Same lockstep requirement.
+	void RetainOnly(const std::vector<uint64_t> &offsets);
+
+	// Remove the segment's NAME now (POSIX shm_unlink), leaving the mapping
+	// intact. Called when the owning connection goes away, so a segment kept
+	// alive by a long-retained batch does not also pin a name in the shm
+	// namespace. Idempotent; no-op on Windows (no unlink there).
+	void Unlink();
 
 	// Free the allocation entry whose offset matches `offset`. Called after
 	// the client has fully consumed a pointer-batch's bytes so the slot can
@@ -115,13 +157,13 @@ public:
 	// If `custom_metadata` carries SHM_OFFSET_KEY (i.e. the batch is a
 	// shm pointer batch), parse the IPC bytes from the segment and return
 	// the resolved RecordBatch. Returns nullptr when not a pointer batch.
-	// On a successful resolve, *out_offset is set to the segment offset
-	// the caller is responsible for FreeAllocation()-ing once DuckDB has
-	// finished consuming the resolved batch.
+	// On a successful resolve, *out_lease is the slot's lease: the returned
+	// batch's buffers share it, so the caller FreeAllocation()s the slot only
+	// once out_lease->use_count() == 1, i.e. its own reference is the last.
 	std::shared_ptr<arrow::RecordBatch>
 	MaybeResolveBatch(const std::shared_ptr<arrow::RecordBatch> &batch,
 	                  const std::shared_ptr<arrow::KeyValueMetadata> &custom_metadata,
-	                  int64_t *out_offset) const;
+	                  std::shared_ptr<VgiShmSlotLease> *out_lease) const;
 
 private:
 #if defined(_WIN32)

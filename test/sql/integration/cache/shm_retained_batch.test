@@ -1,0 +1,86 @@
+# name: test/sql/integration/cache/shm_retained_batch.test
+# description: A worker output batch may be RETAINED past the read that returned it.
+#   Over the shared-memory side channel (VGI_RPC_SHM_SIZE_BYTES) a resolved batch is a
+#   zero-copy view of a segment slot. The client used to hand that slot back to the
+#   worker on the very next read, and unmap the segment with the connection — on the
+#   assumption that every batch is fully consumed before the next is requested. Two
+#   cache layers do not consume a batch, they keep it: the scalar per-value memo arena
+#   (its un-compacted tail WAS the worker's batch — a later exchange overwrote it, so a
+#   hit served another query's values) and the buffered whole-input capture (serialized
+#   in the sink-state destructor, after the finalize connection is gone — SIGSEGV).
+#   A resolved batch now owns a lease on its slot, and the slot is released only once
+#   nothing references it, so keeping a batch is safe and costs no copy. Assertions are
+#   transport-neutral: this is plain cache correctness on every lane, and only bites
+#   where shm carries the batch (VGI_RPC_SHM_MIN_BATCH_BYTES=0 forces that for these
+#   small results).
+# group: [vgi_integration_cache]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS ex (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# threads=1 keeps each query to one exchange, so the arena's shape is deterministic.
+statement ok
+SET threads=1;
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+# ---------------------------------------------------------------------------
+# Scalar per-value memo arena.
+# ---------------------------------------------------------------------------
+
+# 200 distinct values: the first store compacts, giving the arena an owned base.
+query I
+SELECT sum(ex.cached_double_scalar(x)) FROM range(200) g(x);
+----
+39800
+
+# 10 new values: a tail too small to trigger compaction (tail*2 < base), so the arena
+# keeps the batch it was handed — over shm, a view of the worker's slot.
+query I
+SELECT sum(ex.cached_double_scalar(x)) FROM range(1000, 1010) g(x);
+----
+20090
+
+# A further exchange. Before leases this reused the very slot the retained tail viewed.
+query I
+SELECT sum(ex.cached_double_scalar(x)) FROM range(2000, 2010) g(x);
+----
+40090
+
+# Served from the arena — must be the values stored two queries ago, not the ones the
+# worker wrote into the recycled slot since.
+query I
+SELECT sum(ex.cached_double_scalar(x)) FROM range(1000, 1010) g(x);
+----
+20090
+
+# ---------------------------------------------------------------------------
+# Buffered whole-input capture: the MISS commits its captured finalize batches in the
+# sink-state destructor; the HIT must replay exactly what the worker produced.
+# ---------------------------------------------------------------------------
+
+statement ok
+SELECT * FROM vgi_result_cache_flush();
+
+statement ok
+CREATE TABLE t AS SELECT x::BIGINT AS x FROM range(10) g(x);
+
+query I
+SELECT x AS total FROM ex.cached_sum_all((SELECT x FROM t));
+----
+45
+
+query I
+SELECT x AS total FROM ex.cached_sum_all((SELECT x FROM t));
+----
+45
+
+statement ok
+DETACH ex;

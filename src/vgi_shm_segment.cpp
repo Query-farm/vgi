@@ -12,6 +12,7 @@
 
 #include "vgi_shm_segment.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
@@ -51,6 +52,19 @@ namespace duckdb {
 namespace vgi {
 
 namespace {
+
+// An arrow::Buffer viewing one slot of the segment that co-owns the slot's
+// lease. Arrow keeps a sliced buffer's parent alive, so holding the lease here
+// is enough for every array cut from this buffer to pin the slot.
+class ShmSlotBuffer final : public arrow::Buffer {
+public:
+	ShmSlotBuffer(const uint8_t *data, int64_t size, std::shared_ptr<VgiShmSlotLease> lease)
+	    : arrow::Buffer(data, size), lease_(std::move(lease)) {
+	}
+
+private:
+	std::shared_ptr<VgiShmSlotLease> lease_;
+};
 
 // Virtually concatenates a list of byte regions and exposes them as a single
 // arrow::io::InputStream — no allocation, no copy of the regions themselves.
@@ -185,7 +199,7 @@ std::string GenerateName() {
 
 } // namespace
 
-std::unique_ptr<VgiShmSegment> VgiShmSegment::Create(size_t size_bytes) {
+std::shared_ptr<VgiShmSegment> VgiShmSegment::Create(size_t size_bytes) {
 	if (size_bytes <= VGI_SHM_HEADER_SIZE) {
 		throw IOException("VgiShmSegment: size must be > " + std::to_string(VGI_SHM_HEADER_SIZE));
 	}
@@ -258,9 +272,9 @@ std::unique_ptr<VgiShmSegment> VgiShmSegment::Create(size_t size_bytes) {
 	StoreU32LE(base + 20, 0);
 
 #if defined(_WIN32)
-	return std::unique_ptr<VgiShmSegment>(new VgiShmSegment(h, std::move(name), base, actual_size));
+	return std::shared_ptr<VgiShmSegment>(new VgiShmSegment(h, std::move(name), base, actual_size));
 #else
-	return std::unique_ptr<VgiShmSegment>(new VgiShmSegment(fd, std::move(name), base, actual_size));
+	return std::shared_ptr<VgiShmSegment>(new VgiShmSegment(fd, std::move(name), base, actual_size));
 #endif
 }
 
@@ -305,6 +319,45 @@ void VgiShmSegment::ResetAllocator() {
 	if (base_) {
 		StoreU32LE(base_ + 16, 0);
 	}
+}
+
+void VgiShmSegment::RetainOnly(const std::vector<uint64_t> &offsets) {
+	if (!base_) {
+		return;
+	}
+	if (offsets.empty()) {
+		ResetAllocator();
+		return;
+	}
+	uint32_t num = LoadU32LE(base_ + 16);
+	if (num > VGI_SHM_MAX_ALLOCS) {
+		throw IOException("VgiShmSegment: corrupt header num_allocs=" + std::to_string(num) +
+		                  " exceeds max " + std::to_string(VGI_SHM_MAX_ALLOCS));
+	}
+	// Compact the kept entries to the front, preserving their order (the
+	// first-fit allocator walks them as an offset-sorted list).
+	uint8_t *entries = base_ + 24;
+	uint32_t kept = 0;
+	for (uint32_t i = 0; i < num; i++) {
+		uint64_t entry_off = LoadU64LE(entries + i * 16);
+		if (std::find(offsets.begin(), offsets.end(), entry_off) == offsets.end()) {
+			continue;
+		}
+		if (kept != i) {
+			std::memmove(entries + kept * 16, entries + i * 16, 16);
+		}
+		kept++;
+	}
+	StoreU32LE(base_ + 16, kept);
+}
+
+void VgiShmSegment::Unlink() {
+#if !defined(_WIN32)
+	if (!name_.empty()) {
+		::shm_unlink(name_.c_str());
+		name_.clear();
+	}
+#endif
 }
 
 void VgiShmSegment::FreeAllocation(uint64_t offset) {
@@ -395,9 +448,9 @@ std::optional<uint64_t> VgiShmSegment::AllocateAndWrite(const uint8_t *data, siz
 std::shared_ptr<arrow::RecordBatch>
 VgiShmSegment::MaybeResolveBatch(const std::shared_ptr<arrow::RecordBatch> &batch,
                                  const std::shared_ptr<arrow::KeyValueMetadata> &custom_metadata,
-                                 int64_t *out_offset) const {
-	if (out_offset) {
-		*out_offset = -1;
+                                 std::shared_ptr<VgiShmSlotLease> *out_lease) const {
+	if (out_lease) {
+		out_lease->reset();
 	}
 	if (!custom_metadata) {
 		return nullptr;
@@ -429,7 +482,12 @@ VgiShmSegment::MaybeResolveBatch(const std::shared_ptr<arrow::RecordBatch> &batc
 		                  ", length=" + std::to_string(length) + ", size=" + std::to_string(size_) + ")");
 	}
 
-	// Wrap the segment slice as a non-owning Arrow buffer.
+	// Wrap the segment slice as an Arrow buffer that OWNS a lease on the slot.
+	// The IPC reader hands out zero-copy slices whose parent is this buffer
+	// (BufferReader and ChainedBufferInputStream both slice their owner), so
+	// every array of the resolved batch pins the slot — and the mapping —
+	// for as long as it lives. Nothing downstream has to know it is shm.
+	auto lease = std::make_shared<VgiShmSlotLease>(VgiShmSlotLease {shared_from_this(), offset});
 	// Per vgi_rpc/shm.py:
 	//   * Non-dictionary schemas: shm slice is a complete IPC stream
 	//     (schema + record batch + EOS). open_stream reads directly.
@@ -453,9 +511,8 @@ VgiShmSegment::MaybeResolveBatch(const std::shared_ptr<arrow::RecordBatch> &batc
 	std::shared_ptr<arrow::io::InputStream> input;
 	if (!has_dict) {
 		// Non-dict: shm slice is already a complete IPC stream
-		// (schema + record batch + EOS). Wrap as a non-owning Buffer view —
-		// zero copy.
-		auto buffer = std::make_shared<arrow::Buffer>(base_ + offset, static_cast<int64_t>(length));
+		// (schema + record batch + EOS). Wrap as a Buffer view — zero copy.
+		auto buffer = std::make_shared<ShmSlotBuffer>(base_ + offset, static_cast<int64_t>(length), lease);
 		input = std::make_shared<arrow::io::BufferReader>(buffer);
 	} else {
 		// Dict path: build/cache the schema message bytes once per scan
@@ -499,8 +556,7 @@ VgiShmSegment::MaybeResolveBatch(const std::shared_ptr<arrow::RecordBatch> &batc
 		// EOS marker as a tiny non-owning buffer (the byte array is static).
 		auto eos_buffer =
 		    std::make_shared<arrow::Buffer>(kEosMarker, static_cast<int64_t>(sizeof(kEosMarker)));
-		auto slice_buffer =
-		    std::make_shared<arrow::Buffer>(base_ + offset, static_cast<int64_t>(length));
+		auto slice_buffer = std::make_shared<ShmSlotBuffer>(base_ + offset, static_cast<int64_t>(length), lease);
 
 		std::vector<ChainedBufferInputStream::Region> regions;
 		regions.reserve(3);
@@ -524,8 +580,8 @@ VgiShmSegment::MaybeResolveBatch(const std::shared_ptr<arrow::RecordBatch> &batc
 	if (!resolved) {
 		throw IOException("VgiShmSegment: empty IPC stream in segment slice");
 	}
-	if (out_offset) {
-		*out_offset = static_cast<int64_t>(offset);
+	if (out_lease) {
+		*out_lease = std::move(lease);
 	}
 	return resolved;
 }

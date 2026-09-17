@@ -536,11 +536,19 @@ private:
 	bool split_reset_failed_ = false;
 
 #if VGI_SHM_TRANSPORT
-	std::unique_ptr<class VgiShmSegment> shm_segment_;
-	// Offset of the most-recently-resolved shm batch. Freed when the next
-	// ReadDataBatch is called (lockstep: DuckDB has finished with the
-	// previous chunk before requesting the next), and on connection close.
-	int64_t shm_last_offset_ = -1;
+	std::shared_ptr<class VgiShmSegment> shm_segment_;
+	// One lease per slot the worker filled and we resolved, shared with the
+	// resolved batch's buffers. A slot goes back to the worker only when ours is
+	// the LAST reference — so whoever is handed a batch may keep it (a result-
+	// cache capture, a memo arena) without copying and without it being
+	// overwritten under them. Swept by ReleaseUnreferencedShmSlots().
+	std::vector<std::shared_ptr<struct VgiShmSlotLease>> shm_leases_;
+	// Free every slot nobody references any more. Call ONLY at a lockstep point
+	// (the allocator table is unlocked shared memory): the top of ReadDataBatch,
+	// after a unary response, and the between-requests reset.
+	void ReleaseUnreferencedShmSlots();
+	// Resolve a unary response's shm pointer batch in place, leasing its slot.
+	void ResolveUnaryShm(struct UnaryResponseResult &response);
 
 #endif
 
