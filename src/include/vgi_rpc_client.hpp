@@ -98,8 +98,8 @@ inline constexpr VgiProtocolId VGI_SECRET_PROTOCOL {
     ::duckdb::vgi::generated::VGI_SECRET_PROTOCOL_NAME,
     ::duckdb::vgi::generated::VGI_SECRET_PROTOCOL_VERSION};
 
-// Reserved, server-level methods (``__transport_options__``, ``__upload_url__``,
-// ``__introspect_token__``) belong to no protocol: the server resolves them from
+// Reserved, server-level methods (``__transport_options__``, ``__upload_url__``)
+// belong to no protocol: the server resolves them from
 // a built-in table *before* routing, and over HTTP they are mounted flat at
 // ``{prefix}/{method}`` rather than under a protocol segment. Stamping a routing
 // key on one is not merely redundant — over HTTP the server compares the key
