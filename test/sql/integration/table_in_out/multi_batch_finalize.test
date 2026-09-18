@@ -69,21 +69,28 @@ SELECT COUNT(*) FROM ex.multi_batch_finish((SELECT i AS n FROM range(1, 1) t(i))
 0
 
 # ---------------------------------------------------------------------------
-# Parallel — several substreams, each flushing several batches. The invariants
-# are per-substream sums and counts, so they hold at any fan-out.
+# threads=8, plus independent concurrent flushes. The invariants are
+# per-substream sums and counts, so they hold at any fan-out.
+#
+# A small in-memory table is ONE row group, so a scan of `big` is a single task
+# and a single substream even at threads=8 (real fan-out needs >122,880 input
+# rows, i.e. that many one-row batches). What this section adds is the threaded
+# scheduler, two flushes running at once (UNION ALL) and a fresh worker per
+# acquire (pool false). Each finalize batch is one lock-step HTTP turn, so `big`
+# stays at 300 rows: 5,000 cost ~20,000 turns and ~45 s here for no more coverage.
 # ---------------------------------------------------------------------------
 
 statement ok
 SET threads=8;
 
 statement ok
-CREATE TABLE big AS SELECT i AS n FROM range(1, 5001) t(i);
+CREATE TABLE big AS SELECT i AS n FROM range(1, 301) t(i);
 
-# sum(1..5000) = 12502500, and one output row per input row.
+# sum(1..300) = 45150, and one output row per input row.
 query II
 SELECT COUNT(*), SUM(n) FROM ex.multi_batch_finish((SELECT n FROM big));
 ----
-5000	12502500
+300	45150
 
 # UNION ALL: each branch is its own substream, so this is several independent
 # multi-batch flushes unioned together.
@@ -94,7 +101,7 @@ SELECT COUNT(*), SUM(n) FROM (
     SELECT n FROM ex.multi_batch_finish((SELECT n FROM big))
 );
 ----
-10000	25005000
+600	90300
 
 # pool false → a fresh worker per substream acquire, so a flush that depended on
 # state left behind on a shared worker would show up here.
@@ -104,4 +111,4 @@ ATTACH 'example' AS ex2 (TYPE vgi, LOCATION '${VGI_TEST_WORKER}', pool false);
 query II
 SELECT COUNT(*), SUM(n) FROM ex2.multi_batch_finish((SELECT n FROM big));
 ----
-5000	12502500
+300	45150
