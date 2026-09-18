@@ -268,14 +268,30 @@ std::string ResolveAndEnsureStateDir(const std::optional<std::string> &override_
 	return dir;
 }
 
-// Best-effort connect probe — true iff a worker is currently accepting on path.
+// Connect probe — true iff a worker is listening on path.
+//
+// A listener whose accept queue is full is alive, only busy — and a false
+// "dead" here is destructive, because Launch() then unlinks the socket out
+// from under the live worker and spawns a duplicate, orphaning the original
+// and racing clients onto a vanished path.  Linux reports a full queue as
+// EAGAIN, distinct from the ECONNREFUSED of an unbound socket, so it counts as
+// alive.  macOS reports both as ECONNREFUSED, so a refusal is re-probed briefly
+// before it is believed; a socket left by a dead worker pays that once.  This
+// asks "is anything listening", not "is it responsive": a connect lands in the
+// queue of a worker that never accepts, so a successful one never proved that
+// either.  Mirrors ``vgi_rpc.launcher._probe``.
 bool ProbeAlive(const std::string &path) {
-	try {
-		auto sock = UnixSocket::Connect(path, std::chrono::milliseconds(2000));
-		(void)sock; // immediately closes via RAII
-		return true;
-	} catch (...) {
-		return false;
+	static const std::chrono::milliseconds kRefusedBackoff[] = {
+	    std::chrono::milliseconds(50), std::chrono::milliseconds(100), std::chrono::milliseconds(200)};
+	for (std::size_t attempt = 0;; ++attempt) {
+		int err = UnixSocket::ProbeOnce(path);
+		if (err == 0 || UnixSocket::IsAcceptQueueFull(err)) {
+			return true;
+		}
+		if (err != ECONNREFUSED || attempt == sizeof(kRefusedBackoff) / sizeof(kRefusedBackoff[0])) {
+			return false;
+		}
+		std::this_thread::sleep_for(kRefusedBackoff[attempt]);
 	}
 }
 

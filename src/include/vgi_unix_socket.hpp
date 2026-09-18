@@ -36,9 +36,21 @@ public:
 	// Optional connect timeout (default 2s) bounds how long we wait for
 	// the kernel to accept; a hung worker doesn't make us hang forever.
 	// Throws ``IOException`` on path-too-long, socket()/connect() failure,
-	// timeout, or refused connection.
+	// timeout, or refused connection.  A listener whose accept queue is full
+	// (``IsAcceptQueueFull``) is retried until the timeout, not refused.
 	static UnixSocket Connect(const std::string &path,
 	                           std::chrono::milliseconds connect_timeout = std::chrono::seconds(2));
+
+	// One non-blocking connect() to *path*, closed at once, for a liveness
+	// probe.  Returns 0 when it connected (or is connecting), else its errno.
+	// Never throws.
+	static int ProbeOnce(const std::string &path);
+
+	// True for the errno of a connect() that found a listener with a full
+	// accept queue — alive, only busy.  Linux reports it as EAGAIN; macOS
+	// reports ECONNREFUSED, the same as no listener, so it cannot be told
+	// apart there.
+	static bool IsAcceptQueueFull(int err);
 
 	// True iff a fd is currently held.
 	bool IsOpen() const {

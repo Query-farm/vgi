@@ -24,15 +24,19 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <fcntl.h>
 #include <filesystem>
 #include <future>
 #include <random>
 #include <signal.h>
 #include <sys/file.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
+#include <vector>
 
 using namespace std::chrono_literals;
 using duckdb::IOException;
@@ -200,6 +204,123 @@ TEST_CASE("Launch unlinks a stale socket file and respawns", "[launcher][e2e]") 
 	auto sock = UnixSocket::Connect(path2);
 	REQUIRE(sock.IsOpen());
 	(void)path; // first call only proves the basic path works
+}
+
+// A listener at *path* that never accepts on its own, with its accept queue
+// filled by non-blocking connects it holds open — a worker too busy to take
+// another connection.  Full means the next connect failed: EAGAIN on Linux,
+// ECONNREFUSED on macOS.
+class FullListener {
+public:
+	explicit FullListener(const std::string &path) {
+		listen_fd_ = ::socket(AF_UNIX, SOCK_STREAM, 0);
+		REQUIRE(listen_fd_ >= 0);
+		auto addr = Address(path);
+		REQUIRE(::bind(listen_fd_, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)) == 0);
+		REQUIRE(::listen(listen_fd_, 0) == 0);
+		for (int i = 0; i < 256; ++i) {
+			int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+			REQUIRE(fd >= 0);
+			::fcntl(fd, F_SETFL, ::fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+			if (::connect(fd, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)) != 0) {
+				::close(fd);
+				return;
+			}
+			queued_.push_back(fd);
+		}
+		FAIL("the accept queue never filled");
+	}
+	FullListener(const FullListener &) = delete;
+	FullListener &operator=(const FullListener &) = delete;
+	~FullListener() {
+		for (int fd : queued_) {
+			::close(fd);
+		}
+		::close(listen_fd_);
+	}
+
+	// Accept (and drop) one queued connection after *delay*, freeing a slot.
+	std::thread AcceptOneAfter(std::chrono::milliseconds delay) {
+		return std::thread([this, delay] {
+			std::this_thread::sleep_for(delay);
+			int fd = ::accept(listen_fd_, nullptr, nullptr);
+			if (fd >= 0) {
+				::close(fd);
+			}
+		});
+	}
+
+private:
+	static struct sockaddr_un Address(const std::string &path) {
+		struct sockaddr_un addr;
+		std::memset(&addr, 0, sizeof(addr));
+		addr.sun_family = AF_UNIX;
+		std::strncpy(addr.sun_path, path.c_str(), sizeof(addr.sun_path) - 1);
+		return addr;
+	}
+
+	int listen_fd_ = -1;
+	std::vector<int> queued_;
+};
+
+static ino_t InodeOf(const std::string &path) {
+	struct stat st;
+	REQUIRE(::stat(path.c_str(), &st) == 0);
+	return st.st_ino;
+}
+
+#ifdef __linux__
+// Only Linux tells a full accept queue (EAGAIN) from no listener at all.
+TEST_CASE("Launch leaves a worker with a full accept queue alone", "[launcher][e2e]") {
+	// Under a burst of connections the worker's accept queue fills and the
+	// probe's connect fails with EAGAIN.  Reading that as "dead" unlinked the
+	// live worker's socket and spawned a duplicate on every busy probe.
+	IsolatedStateDir dir;
+	std::string sock = dir.path() + "/busy.sock";
+	FullListener busy(sock);
+	auto inode = InodeOf(sock);
+
+	// Would throw ("exits before readiness") if Launch spawned it.
+	auto cfg = BaselineConfig(dir.path(), {"--exit-with", "1"});
+	cfg.socket_path_override = sock;
+	REQUIRE(duckdb::vgi::Launch(cfg) == sock);
+	REQUIRE(InodeOf(sock) == inode);
+}
+
+TEST_CASE("Connect waits out a full accept queue", "[launcher][e2e]") {
+	// Failing here sent ResolveAndConnect to relaunch a worker that was fine.
+	IsolatedStateDir dir;
+	std::string sock = dir.path() + "/busy.sock";
+	FullListener busy(sock);
+	auto drain = busy.AcceptOneAfter(100ms);
+	auto conn = UnixSocket::Connect(sock, 5s);
+	drain.join();
+	REQUIRE(conn.IsOpen());
+}
+
+TEST_CASE("Connect gives up on an accept queue that stays full", "[launcher][e2e]") {
+	IsolatedStateDir dir;
+	std::string sock = dir.path() + "/busy.sock";
+	FullListener busy(sock);
+	REQUIRE_THROWS_WITH(UnixSocket::Connect(sock, 200ms), Catch::Contains("accept queue stayed full"));
+}
+#endif
+
+TEST_CASE("Launch counts a momentarily full accept queue as alive", "[launcher][e2e]") {
+	// However the platform reports it — EAGAIN, or macOS's ECONNREFUSED,
+	// which the probe re-tries before believing.
+	IsolatedStateDir dir;
+	std::string sock = dir.path() + "/busy.sock";
+	FullListener busy(sock);
+	auto inode = InodeOf(sock);
+	auto drain = busy.AcceptOneAfter(30ms);
+
+	auto cfg = BaselineConfig(dir.path(), {"--exit-with", "1"});
+	cfg.socket_path_override = sock;
+	auto path = duckdb::vgi::Launch(cfg);
+	drain.join();
+	REQUIRE(path == sock);
+	REQUIRE(InodeOf(sock) == inode);
 }
 
 TEST_CASE("Launch fails when worker exits before readiness", "[launcher][e2e]") {

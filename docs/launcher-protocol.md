@@ -205,6 +205,16 @@ When the idle timer fires, the worker MUST:
 Launcher invocations encountering a `<hash>.sock` that exists but
 refuses connect MUST `unlink()` it before binding.
 
+A connect that fails because the listener's accept queue is full is a
+live, busy worker, not a stale socket, and MUST NOT be unlinked — doing so
+orphans the worker and spawns a duplicate on every busy probe. Linux reports
+a full queue as `EAGAIN`/`EWOULDBLOCK`, distinct from `ECONNREFUSED`, so it
+counts as alive. macOS reports it as `ECONNREFUSED`, indistinguishable from
+no listener, so a launcher SHOULD re-probe a refusal briefly (the reference
+implementations wait 50, 100 and 200 ms) before believing it. A client
+connect that meets a full queue SHOULD wait for a slot until its connect
+timeout rather than failing.
+
 ## Lock semantics
 
 The flock primitive is `flock(2)` (POSIX advisory file lock by open file
