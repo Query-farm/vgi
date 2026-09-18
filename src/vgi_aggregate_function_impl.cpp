@@ -211,6 +211,18 @@ AggregateRpcResult InvokeAggregateRpc(ClientContext &context, const VgiAggregate
 	                      bind_data.attach_params->cookie_jar(),
 	                      enable_logging};
 	opts.iroh = bind_data.attach_params->iroh();
+	// The same HTTP plumbing the catalog RPCs get. Without it every aggregate
+	// RPC -- one per output row for a windowed aggregate on engines without the
+	// batched window callback -- rebuilt its HTTP params through the secret
+	// manager and probed HEAD /health for capabilities before the POST.
+	const auto &agg_worker_path = bind_data.attach_params->worker_path();
+	if (IsHttpTransport(agg_worker_path) || IsHttpiTransport(agg_worker_path)) {
+		if (IsHttpTransport(agg_worker_path)) {
+			opts.cached_http_params = bind_data.attach_params->GetOrInitHttpParams(context, agg_worker_path);
+		}
+		opts.http_client_pool = bind_data.attach_params->GetOrInitHttpClientPool();
+		opts.server_caps = bind_data.attach_params->server_caps();
+	}
 	// Forward launcher overrides for `launch:` LOCATIONs (no-op for other transports).
 	if (bind_data.attach_params->launcher_idle_timeout_seconds().has_value()) {
 		opts.launcher_idle_timeout =
