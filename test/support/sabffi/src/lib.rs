@@ -117,7 +117,6 @@ pub extern "C" fn vgi_rust_serve_sab_slot(slot: i32) {
     let mut server = RpcServer::builder()
         .server_id("sabffi")
         .protocol_name("Svc")
-        .enable_describe(true)
         .build();
     Svc::register_with(&mut server, Arc::new(Svc));
     let server = Arc::new(server);
