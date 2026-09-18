@@ -296,9 +296,13 @@ struct VgiDynamicFilterInfo {
 	//! Whether this filter is wrapped in ConjunctionOr with IsNull (NULLS_FIRST)
 	bool nulls_first = false;
 	//! Stable v2 predicate identity and monotonic revision for tick deltas.
+	//! The revision advances only when the value (or active state) changes.
 	string predicate_id;
 	uint64_t revision = 0;
 	bool active = false;
+	//! The value emitted under `revision` while active, to detect a change.
+	ExpressionType emitted_comparison = ExpressionType::INVALID;
+	Value emitted_constant;
 };
 
 // ============================================================================

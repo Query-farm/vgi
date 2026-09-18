@@ -57,6 +57,7 @@ public:
 
 	void SetTickFilterState(shared_ptr<TickFilterState> state) override {
 		tick_filter_state_ = std::move(state);
+		tick_filter_cursor_.Reset();
 	}
 
 	// Bind RPC. See IFunctionConnection::PerformBindRpc.
@@ -298,6 +299,8 @@ private:
 
 	// Dynamic filter state for tick-based pushdown
 	shared_ptr<TickFilterState> tick_filter_state_;
+	// Which delta of tick_filter_state_ the current stream has been sent.
+	TickFilterCursor tick_filter_cursor_;
 
 	// Helper: serialize a batch with optional stream_state token as metadata
 	std::vector<uint8_t> SerializeBatchWithState(const std::shared_ptr<arrow::RecordBatch> &batch,

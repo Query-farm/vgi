@@ -861,6 +861,8 @@ InitResult WebWorkerFunctionConnection::PerformInit(
 		ThrowVgiIOException("WebWorkerFunctionConnection::PerformInit called twice", location_, -1,
 		                    GetExecutionIdHex());
 	}
+	// A new stream: its worker has applied no dynamic-filter delta yet.
+	tick_filter_cursor_.Reset();
 
 	std::vector<int64_t> projection_ids_64;
 	projection_ids_64.reserve(projection_ids.size());
@@ -1162,10 +1164,11 @@ std::shared_ptr<arrow::RecordBatch> WebWorkerFunctionConnection::ReadDataBatch()
 		auto tick_batch = arrow::RecordBatch::Make(tick_schema_, 0, std::vector<std::shared_ptr<arrow::Array>>{});
 		std::shared_ptr<const arrow::KeyValueMetadata> tick_metadata;
 		if (tick_filter_state_) {
-			lock_guard<mutex> l(tick_filter_state_->lock);
-			if (tick_filter_state_->has_filters) {
-				tick_metadata =
-				    arrow::KeyValueMetadata::Make({"vgi_pushdown_filters"}, {tick_filter_state_->encoded_filters});
+			// Only a delta this stream has not been sent yet; an unchanged filter
+			// rides no tick at all (see UpdateDynamicFilterState).
+			auto delta = tick_filter_cursor_.Take(*tick_filter_state_);
+			if (!delta.empty()) {
+				tick_metadata = arrow::KeyValueMetadata::Make({"vgi_pushdown_filters"}, {std::move(delta)});
 			}
 		}
 		auto write_status = tick_metadata ? input_writer_->WriteRecordBatch(*tick_batch, tick_metadata)

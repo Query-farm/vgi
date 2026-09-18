@@ -44,6 +44,34 @@ struct TickFilterState {
 	string encoded_filters;
 	//! True when encoded_filters contains the latest delta.
 	bool has_filters = false;
+	//! Bumped each time a new delta replaces encoded_filters. A connection sends
+	//! a delta once per stream: only when this differs from the generation it last
+	//! sent (see TickFilterCursor), never again on every tick.
+	uint64_t generation = 0;
+};
+
+//! Per-connection record of which TickFilterState delta the CURRENT stream has
+//! already been sent. Every connection kind shares this so the rule lives once.
+//! Reset whenever a new stream starts on the connection (a fresh init, the next
+//! split, a new shared TickFilterState): the new stream's worker has seen no
+//! delta, so it must receive the latest one on its first tick.
+struct TickFilterCursor {
+	uint64_t sent_generation = 0;
+
+	void Reset() {
+		sent_generation = 0;
+	}
+
+	//! The delta this tick should carry, or empty when the stream already has it.
+	//! Marks it sent: a tick that fails to reach the worker fails the scan.
+	string Take(TickFilterState &state) {
+		lock_guard<mutex> l(state.lock);
+		if (!state.has_filters || state.generation == sent_generation) {
+			return string();
+		}
+		sent_generation = state.generation;
+		return state.encoded_filters;
+	}
 };
 
 class IFunctionConnection {

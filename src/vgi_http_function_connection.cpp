@@ -186,10 +186,12 @@ std::vector<uint8_t> HttpFunctionConnection::SerializeBatchWithState(
 		meta_values.push_back(call_state_token_);
 	}
 	if (tick_filter_state_) {
-		lock_guard<mutex> l(tick_filter_state_->lock);
-		if (tick_filter_state_->has_filters) {
+		// Only a delta this stream has not been sent yet; an unchanged filter
+		// rides no tick at all (see UpdateDynamicFilterState).
+		auto delta = tick_filter_cursor_.Take(*tick_filter_state_);
+		if (!delta.empty()) {
 			meta_keys.push_back("vgi_pushdown_filters");
-			meta_values.push_back(tick_filter_state_->encoded_filters);
+			meta_values.push_back(std::move(delta));
 		}
 	}
 	// Conditional-revalidation validators (M6): send once on the first tick that
@@ -426,6 +428,8 @@ InitResult HttpFunctionConnection::PerformInit(const BindResult &bind_result,
 	if (init_done_) {
 		throw IOException("HttpFunctionConnection::PerformInit called twice [url: %s]", base_url_);
 	}
+	// A new stream: its worker state has applied no dynamic-filter delta yet.
+	tick_filter_cursor_.Reset();
 
 	// Convert projection_ids to int64_t
 	std::vector<int64_t> projection_ids_64;

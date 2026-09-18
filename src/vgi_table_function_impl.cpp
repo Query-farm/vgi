@@ -3002,7 +3002,20 @@ std::shared_ptr<arrow::Buffer> VgiSerializeDynamicFilterDelta(ClientContext &con
 }
 
 //! Update the TickFilterState with current DynamicFilter values.
-//! Called before each ReadDataBatch to ensure the tick carries the latest filter.
+//! Called before each ReadDataBatch so the next tick can carry the latest filter.
+//!
+//! A new delta is produced ONLY when some filter actually changed since the last
+//! one: a revision identifies a value, so re-sending an unchanged value under a
+//! bumped revision is a no-op the worker still has to decode, validate and
+//! remember. It used to happen on every tick, and it was not merely wasted work:
+//! an HTTP worker carries the deltas it has applied in its per-turn state and
+//! replays them on every turn, so a 100-tick Top-N scan paid 5,050 predicate
+//! validations and dynamic_filter.test took ~200 s (vgi-python now compacts what
+//! it carries as well, which covers a filter that really does move every tick).
+//! Each delta still describes
+//! EVERY emitted filter (at its current revision), so a stream that skipped
+//! intermediate deltas converges from the latest one alone; which delta a given
+//! connection has already sent is tracked per connection by `generation`.
 static void UpdateDynamicFilterState(VgiTableFunctionGlobalState &global_state, ClientContext &context,
                                      const VgiTableFunctionBindData &bind_data) {
 	if (global_state.dynamic_filters.empty() || !global_state.tick_filter_state) {
@@ -3011,7 +3024,9 @@ static void UpdateDynamicFilterState(VgiTableFunctionGlobalState &global_state, 
 
 	// Revisions and active/tombstone transitions are protected with the same
 	// lock the connection uses to read encoded tick metadata.
-	lock_guard<mutex> state_lock(global_state.tick_filter_state->lock);
+	auto &tick_state = *global_state.tick_filter_state;
+	lock_guard<mutex> state_lock(tick_state.lock);
+	bool changed = false;
 	vector<unique_ptr<TableFilter>> update_filters;
 	vector<VgiDynamicFilterDeltaUpdate> updates;
 	for (auto &df : global_state.dynamic_filters) {
@@ -3019,16 +3034,35 @@ static void UpdateDynamicFilterState(VgiTableFunctionGlobalState &global_state, 
 			if (df.active) {
 				df.revision++;
 				df.active = false;
+				changed = true;
+			}
+			// A filter that was ever emitted keeps riding every later delta as a
+			// tombstone at its current revision: a stream that already removed it
+			// sees a stale no-op, and one that skipped the removal still gets it.
+			if (df.revision > 0) {
 				updates.push_back({df.predicate_id, df.revision, df.column_index, df.column_name, nullptr});
 			}
 			continue;
 		}
 
-		// Read the current value under lock
-		lock_guard<mutex> l(df.filter_data->lock);
-		auto &const_filter = *df.filter_data->filter;
-		auto filter_copy = make_uniq<ConstantFilter>(const_filter.comparison_type, const_filter.constant);
+		// Read the current value under lock; bump the revision only if it moved.
+		ExpressionType comparison;
+		Value constant;
+		{
+			lock_guard<mutex> l(df.filter_data->lock);
+			comparison = df.filter_data->filter->comparison_type;
+			constant = df.filter_data->filter->constant;
+		}
+		if (!df.active || comparison != df.emitted_comparison ||
+		    !Value::NotDistinctFrom(constant, df.emitted_constant)) {
+			df.revision++;
+			df.active = true;
+			df.emitted_comparison = comparison;
+			df.emitted_constant = std::move(constant);
+			changed = true;
+		}
 
+		auto filter_copy = make_uniq<ConstantFilter>(df.emitted_comparison, df.emitted_constant);
 		unique_ptr<TableFilter> pushed;
 		if (df.nulls_first) {
 			auto or_filter = make_uniq<ConjunctionOrFilter>();
@@ -3038,31 +3072,28 @@ static void UpdateDynamicFilterState(VgiTableFunctionGlobalState &global_state, 
 		} else {
 			pushed = std::move(filter_copy);
 		}
-
-		df.revision++;
-		df.active = true;
 		auto filter_ptr = pushed.get();
 		update_filters.push_back(std::move(pushed));
 		updates.push_back({df.predicate_id, df.revision, df.column_index, df.column_name, filter_ptr});
 	}
 
-	if (updates.empty()) {
-		global_state.tick_filter_state->encoded_filters.clear();
-		global_state.tick_filter_state->has_filters = false;
+	if (!changed) {
+		// The latest delta (or the absence of one) still describes every filter.
 		return;
 	}
+	tick_state.generation++;
 
 	// Runtime metadata carries a delta, never a replacement snapshot. Every
 	// upsert is advisory; a reset emits a revisioned remove tombstone.
 	try {
 		auto bytes = VgiSerializeDynamicFilterDelta(context, bind_data.worker_path(), updates);
-		global_state.tick_filter_state->encoded_filters =
+		tick_state.encoded_filters =
 		    Blob::ToBase64(string_t(reinterpret_cast<const char *>(bytes->data()), static_cast<idx_t>(bytes->size())));
-		global_state.tick_filter_state->has_filters = true;
+		tick_state.has_filters = true;
 	} catch (...) {
 		// Dynamic filters are advisory. A failure omits this complete delta.
-		global_state.tick_filter_state->encoded_filters.clear();
-		global_state.tick_filter_state->has_filters = false;
+		tick_state.encoded_filters.clear();
+		tick_state.has_filters = false;
 	}
 }
 

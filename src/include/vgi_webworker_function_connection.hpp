@@ -94,6 +94,7 @@ public:
 
 	void SetTickFilterState(shared_ptr<TickFilterState> state) override {
 		tick_filter_state_ = std::move(state);
+		tick_filter_cursor_.Reset();
 	}
 
 	BindResult PerformBindRpc() override;
@@ -283,6 +284,8 @@ private:
 
 	// Dynamic filter state for tick-based pushdown (shared with the scan operator)
 	shared_ptr<TickFilterState> tick_filter_state_;
+	// Which delta of tick_filter_state_ the current stream has been sent.
+	TickFilterCursor tick_filter_cursor_;
 
 	// Raw metadata parsed off the most recent data batch's custom_metadata.
 	idx_t last_batch_index_ = DConstants::INVALID_INDEX;

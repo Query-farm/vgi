@@ -686,6 +686,8 @@ InitResult FunctionConnection::PerformInit(const BindResult &bind_result, const 
 		ThrowVgiIOException("FunctionConnection::PerformInit called twice", worker_path_, TransportPid(),
 		                    GetExecutionIdHex());
 	}
+	// A new stream: its worker has applied no dynamic-filter delta yet.
+	tick_filter_cursor_.Reset();
 
 	// Convert projection_ids to int64_t
 	std::vector<int64_t> projection_ids_64;
@@ -1142,10 +1144,11 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 		// Attach dynamic filter metadata as IPC custom metadata if available
 		std::shared_ptr<const arrow::KeyValueMetadata> tick_metadata;
 		if (tick_filter_state_) {
-			lock_guard<mutex> l(tick_filter_state_->lock);
-			if (tick_filter_state_->has_filters) {
-				tick_metadata =
-				    arrow::KeyValueMetadata::Make({"vgi_pushdown_filters"}, {tick_filter_state_->encoded_filters});
+			// Only a delta this stream has not been sent yet; an unchanged filter
+			// rides no tick at all (see UpdateDynamicFilterState).
+			auto delta = tick_filter_cursor_.Take(*tick_filter_state_);
+			if (!delta.empty()) {
+				tick_metadata = arrow::KeyValueMetadata::Make({"vgi_pushdown_filters"}, {std::move(delta)});
 			}
 		}
 
