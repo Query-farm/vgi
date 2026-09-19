@@ -27,6 +27,7 @@
 #include "vgi_schema_registry.hpp"
 #include "vgi_table_buffering_builders.hpp"
 #include "vgi_transport.hpp"
+#include "vgi_worker_pool.hpp" // complete PooledWorker for ReleaseForPooling's deleter
 
 #include <algorithm>
 #include <atomic>
@@ -1332,6 +1333,10 @@ std::shared_ptr<arrow::RecordBatch> WebWorkerFunctionConnection::ReadDataBatch()
 		// 0-row batches. 0-row batches are valid responses in exchange mode.
 		return result.batch;
 	}
+}
+
+std::unique_ptr<PooledWorker> WebWorkerFunctionConnection::ReleaseForPooling() {
+	return nullptr; // never pooled: the JS bridge owns the worker's lifecycle
 }
 
 std::string WebWorkerFunctionConnection::GetExecutionIdHex() const {

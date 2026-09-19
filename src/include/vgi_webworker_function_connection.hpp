@@ -209,9 +209,12 @@ public:
 	}
 
 	// The SAB transport is never pooled (the JS bridge owns worker lifecycle).
-	std::unique_ptr<PooledWorker> ReleaseForPooling() override {
-		return nullptr;
-	}
+	// Out-of-line: returns nullptr, but `unique_ptr<PooledWorker>` needs the complete
+	// type to instantiate its deleter, and this header only sees the forward
+	// declaration. libstdc++ enforces that even for a null return (clang/libc++
+	// defers it, so macOS and the clang wasm build never noticed). Defined in the
+	// .cpp where vgi_worker_pool.hpp is included — as CachedReplayConnection does.
+	std::unique_ptr<PooledWorker> ReleaseForPooling() override;
 
 	// Non-copyable and non-movable (contains reference)
 	WebWorkerFunctionConnection(const WebWorkerFunctionConnection &) = delete;
