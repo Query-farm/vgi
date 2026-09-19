@@ -231,6 +231,28 @@ VGI_TEST_WORKER="uv run --project ~/Development/vgi-python vgi-fixture-worker" \
 ./test/run_http_integration.sh "test/sql/integration/scalar/double.test"
 ```
 
+### C++ unit tests (`vgi_unit_tests`)
+
+A separate Catch binary (`test/cpp/`) for the launcher helpers, transport detection,
+OAuth, telemetry, schema parity, protocol routing and the native SAB transport. It is
+configured only when `BUILD_VGI_UNIT_TESTS` is set **at configure time**, and it links
+two Rust staticlibs that CMake does not build — `test/support/sabffi` (a bare vgi-rpc
+server; path dep on `../vgi-rpc-rust`) and `test/support/sabtable` (a vgi-rust
+table-function worker; path dep on `../vgi-rust`). Build those first: with the option
+set, `vgi_unit_tests` is part of the default target, so `make release` itself fails to
+link without them.
+
+```bash
+make unit_test_rust_libs                        # cargo build --release in both crates
+BUILD_VGI_UNIT_TESTS=1 GEN=ninja make release
+./build/release/extension/vgi/vgi_unit_tests 2>&1 | tee /tmp/vgi-unit.log
+./build/release/extension/vgi/vgi_unit_tests "[sab-conn]"   # one tag
+```
+
+The two `[flock]` parity cases shell out to `python3` and quietly pass as skipped
+("python3 filelock not available") when it cannot `import filelock`; put a venv that has
+it first on `PATH` (e.g. vgi-python's `.venv/bin`) to actually run them.
+
 ### General Notes
 
 Each test file should complete in <10 seconds per suite.

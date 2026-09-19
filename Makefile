@@ -662,14 +662,26 @@ test_languages:
 #   make schema_parity_cpp        # just the C++ client leg (no pytest, fast)
 #
 # The C++ leg needs the unit-test target, which is guarded by an env var read at
-# CONFIGURE time — so if you have never built it:
+# CONFIGURE time — so if you have never built it (see unit_test_rust_libs below):
+#   make unit_test_rust_libs
 #   BUILD_VGI_UNIT_TESTS=1 GEN=ninja make release
-.PHONY: schema_parity schema_parity_cpp test_filter_v2
+.PHONY: schema_parity schema_parity_cpp test_filter_v2 unit_test_rust_libs
 schema_parity:
 	./scripts/check_schema_parity.sh
 
 schema_parity_cpp:
 	./scripts/check_schema_parity.sh --cpp-only
+
+# vgi_unit_tests links two Rust staticlibs that CMake does not build:
+# test/support/sabffi (a bare vgi-rpc server) and test/support/sabtable (a vgi-rust
+# table-function worker), for the native [sab-e2e] / [sab-conn] cases. Build them
+# BEFORE configuring with BUILD_VGI_UNIT_TESTS: that puts vgi_unit_tests in the
+# default target, so `make release` itself fails to link without them. They take
+# path dependencies on sibling checkouts: sabffi on ../vgi-rpc-rust, sabtable on
+# ../vgi-rust.
+unit_test_rust_libs:
+	cd test/support/sabffi && cargo build --release
+	cd test/support/sabtable && cargo build --release
 
 # Configure with BUILD_VGI_FILTER_V2_TESTS=1, then run the real C++ producer
 # tests independently of the launcher/SAB unit-test target.

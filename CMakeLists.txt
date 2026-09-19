@@ -444,14 +444,16 @@ if(WIN32 AND BUILD_VGI_OAUTH_STORE_TESTS)
     VERBATIM)
 endif()
 
-# Optional C++ unit-test binary for the launcher's pure helpers.  Built when
-# ``BUILD_VGI_UNIT_TESTS=ON`` is passed to CMake (or as an env var).  Pure
-# helpers are intentionally DuckDB-free (they throw std::invalid_argument and
-# get translated by the orchestration layer), so the test binary only needs
-# duckdb_mbedtls for SHA-256 — no libduckdb_static, no extension stubs.
-# Run via:
-#     cmake --build build/<config> --target vgi_unit_tests
-#     ./build/<config>/extension/vgi/vgi_unit_tests
+# Optional C++ unit-test binary (launcher helpers, transport detection, OAuth,
+# telemetry, schema parity, protocol routing, and the native SAB transport e2e).
+# Built when ``BUILD_VGI_UNIT_TESTS`` is set at CONFIGURE time (a CMake option or
+# an env var). It links duckdb_static plus two Rust staticlibs CMake does not
+# build — test/support/sabffi and test/support/sabtable — so build those first
+# (`make unit_test_rust_libs`); with the option set, the default build target
+# includes this binary and fails to link without them.  Run via:
+#     make unit_test_rust_libs
+#     BUILD_VGI_UNIT_TESTS=1 GEN=ninja make release
+#     ./build/release/extension/vgi/vgi_unit_tests
 # These are AF_UNIX / launcher / flock parity tests — inherently POSIX. They
 # exercise exactly the transports excluded on Windows (HTTP-only there), so the
 # whole target is gated off on Windows.

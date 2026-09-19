@@ -107,13 +107,13 @@ run_cpp_parity() {
     local build_dir="$VGI_DIR/build/$BUILD_CONFIG"
     if [ ! -f "$build_dir/CMakeCache.txt" ]; then
         echo "no configured build at $build_dir."
-        echo "Build it first:  BUILD_VGI_UNIT_TESTS=1 GEN=ninja make $BUILD_CONFIG"
+        echo "Build it first:  make unit_test_rust_libs && BUILD_VGI_UNIT_TESTS=1 GEN=ninja make $BUILD_CONFIG"
         return 1
     fi
     if ! grep -q '^BUILD_VGI_UNIT_TESTS' "$build_dir/CMakeCache.txt"; then
         echo "$build_dir was configured without BUILD_VGI_UNIT_TESTS, so the"
         echo "vgi_unit_tests target does not exist there. Reconfigure with:"
-        echo "    BUILD_VGI_UNIT_TESTS=1 GEN=ninja make $BUILD_CONFIG"
+        echo "    make unit_test_rust_libs && BUILD_VGI_UNIT_TESTS=1 GEN=ninja make $BUILD_CONFIG"
         return 1
     fi
     cmake --build "$build_dir" --target vgi_unit_tests || return 1
