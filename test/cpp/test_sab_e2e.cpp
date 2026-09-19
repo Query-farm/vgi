@@ -36,6 +36,52 @@ extern "C" void vgi_rust_serve_sab_slot(int slot);
 // The version is not enforced: the server declares none.
 constexpr VgiProtocolId SVC_PROTOCOL {"Svc", "1.0.0"};
 
+// The Rust worker serving one claimed slot on its own thread, owning both the
+// thread and the slot. Every exit from a test body passes through the
+// destructor, including the exception a failed REQUIRE or FAIL throws, so the
+// worker is always stopped and joined and the slot always released.
+//
+// A bare std::thread did not survive a failing check: unwinding destroyed it
+// still joinable, which is std::terminate, so the binary aborted with
+// "terminate called without an active exception" (SIGABRT) instead of
+// reporting the failure, and no later case ran.
+class RustSlotWorker {
+public:
+	RustSlotWorker(int region, int slot)
+	    : region_(region), slot_(slot), thread_([slot]() { vgi_rust_serve_sab_slot(slot); }) {
+	}
+	RustSlotWorker(const RustSlotWorker &) = delete;
+	RustSlotWorker &operator=(const RustSlotWorker &) = delete;
+
+	// The case has finished its conversation and closed c2w: wait for serve() to
+	// return on that EOF. Nothing is forced, so a case that gets here still
+	// proves the worker stops on the client's end-of-stream by itself.
+	void Join() {
+		thread_.join();
+	}
+
+	~RustSlotWorker() {
+		const bool abandoned = thread_.joinable();
+		if (abandoned) {
+			// The body threw mid-conversation, leaving the worker blocked on the
+			// ring. EOF on c2w ends a worker blocked reading; it has to come first,
+			// since write_eos is a no-op on a released slot.
+			vgi_wasm_slot_write_eos(region_, slot_);
+		}
+		// Releasing also wakes a worker blocked on a full w2c, whose writes then
+		// fail, so serve() returns either way and the join below cannot hang.
+		vgi_wasm_slot_release(region_, slot_);
+		if (abandoned) {
+			thread_.join();
+		}
+	}
+
+private:
+	int region_;
+	int slot_;
+	std::thread thread_;
+};
+
 // Next batch of a worker response. vgi-rpc reports an error in-band, as a 0-row
 // batch whose custom metadata carries vgi_rpc.log_level=EXCEPTION; fail with the
 // worker's message rather than reading column(0) of an envelope, which for an
@@ -60,7 +106,7 @@ TEST_CASE("C++ producer client <-> Rust serve_sab (count_to) over the ring", "[s
 	REQUIRE(slot >= 0);
 
 	// The Rust worker serves this slot on its own thread.
-	std::thread rust_worker([slot]() { vgi_rust_serve_sab_slot(slot); });
+	RustSlotWorker rust_worker(region, slot);
 
 	// --- C++ producer client ------------------------------------------------
 	// 1. Invocation request: params batch {total: 3}.
@@ -111,9 +157,7 @@ TEST_CASE("C++ producer client <-> Rust serve_sab (count_to) over the ring", "[s
 	REQUIRE(tick_writer->Close().ok());
 	vgi_wasm_slot_write_eos(region, slot);
 
-	rust_worker.join();
-	vgi_wasm_slot_release(region, slot);
-
+	rust_worker.Join();
 	CHECK(got == std::vector<int64_t>({0, 1, 2}));
 }
 
@@ -126,7 +170,7 @@ TEST_CASE("unary RPC then producer RPC on one slot (bind->init sequencing)", "[s
 	constexpr int region = 0;
 	int slot = vgi_wasm_slot_open("test", region);
 	REQUIRE(slot >= 0);
-	std::thread rust_worker([slot]() { vgi_rust_serve_sab_slot(slot); });
+	RustSlotWorker rust_worker(region, slot);
 
 	// --- Phase 1: unary add_one(41) -> 42 (the "bind" analog) ---
 	{
@@ -185,8 +229,7 @@ TEST_CASE("unary RPC then producer RPC on one slot (bind->init sequencing)", "[s
 		vgi_wasm_slot_write_eos(region, slot);
 	}
 
-	rust_worker.join();
-	vgi_wasm_slot_release(region, slot);
+	rust_worker.Join();
 	CHECK(got == std::vector<int64_t>({0, 1, 2}));
 }
 
@@ -198,7 +241,7 @@ TEST_CASE("exchange RPC (scale) over the ring", "[sab-e2e]") {
 	constexpr int region = 0;
 	int slot = vgi_wasm_slot_open("test", region);
 	REQUIRE(slot >= 0);
-	std::thread rust_worker([slot]() { vgi_rust_serve_sab_slot(slot); });
+	RustSlotWorker rust_worker(region, slot);
 
 	// 1. request scale(factor = 10.0).
 	arrow::DoubleBuilder fb;
@@ -238,6 +281,5 @@ TEST_CASE("exchange RPC (scale) over the ring", "[sab-e2e]") {
 	vgi_wasm_slot_write_eos(region, slot);
 	CHECK(NextBatch(*reader) == nullptr);
 
-	rust_worker.join();
-	vgi_wasm_slot_release(region, slot);
+	rust_worker.Join();
 }
