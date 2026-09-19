@@ -240,7 +240,9 @@ FROM (
 
 # ============================================================================
 # Large partition — exceeds STANDARD_VECTOR_SIZE (2048) to ensure
-# PartitionToArrow handles multi-chunk materialisation correctly.
+# PartitionToArrow handles multi-chunk materialisation correctly. 2100 rows is
+# two chunks, which is the claim; more rows only add per-row window calls (one
+# RPC each until the engine's batched window callback is available).
 # ============================================================================
 
 query I
@@ -251,14 +253,14 @@ FROM (
     x,
     example.main.vgi_window_sum(x::BIGINT) OVER (ORDER BY x ROWS BETWEEN 5 PRECEDING AND 5 FOLLOWING)
     = sum(x::BIGINT) OVER (ORDER BY x ROWS BETWEEN 5 PRECEDING AND 5 FOLLOWING) AS match
-  FROM generate_series(1, 5000) t(x)
+  FROM generate_series(1, 2100) t(x)
 );
 ----
 0
 
 # ============================================================================
 # Many partitions — cache-key isolation and destructor cleanup under load.
-# 100 partitions × 20 rows each.
+# 100 partitions × 4 rows each: the partition count is what this exercises.
 # ============================================================================
 
 query I
@@ -270,7 +272,7 @@ FROM (
     example.main.vgi_window_sum(x::BIGINT) OVER (PARTITION BY g ORDER BY x ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
     = sum(x::BIGINT) OVER (PARTITION BY g ORDER BY x ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS match
   FROM (
-    SELECT (i % 100) AS g, i AS x FROM generate_series(1, 2000) t(i)
+    SELECT (i % 100) AS g, i AS x FROM generate_series(1, 400) t(i)
   )
 );
 ----
