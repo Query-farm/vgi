@@ -89,7 +89,7 @@ reproduction / regression harness (it loops the trigger and asserts no engine fr
 - **VGI wasm extension** — deployed under `<haybarn-wasm>/extensions/<ver>/wasm_threads/`
   (see `../../../build-wasm-coi.sh`, pointed at the haybarn engine's Arrow).
 - **Worker module** — `../vgi_worker.{js,wasm}`, built via `../build.sh` (needs sabtable's
-  wasm staticlib: `cd ../sabtable && RUSTFLAGS='-C target-feature=+atomics,+bulk-memory,+mutable-globals -C link-args=-pthread' cargo +nightly build --target wasm32-unknown-emscripten -Z build-std=std,panic_abort --release`
+  wasm staticlib: `cd ../sabtable && RUSTFLAGS='-C target-feature=+atomics,+bulk-memory,+mutable-globals -C link-args=-pthread' cargo +nightly build --locked --target wasm32-unknown-emscripten -Z build-std=std,panic_abort --release`
   — the `RUSTFLAGS` are required so `-Z build-std`'s recompiled `compiler_builtins` supports
   `--shared-memory`, else wasm-ld rejects the link).
 - **puppeteer + esbuild** resolvable from `<haybarn-wasm>/node_modules` (used headless).

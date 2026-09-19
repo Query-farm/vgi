@@ -8,15 +8,22 @@
 set -eo pipefail
 cd "$(dirname "$0")"
 : "${EMSDK_DIR:=/tmp/emsdk}"
-# emsdk_env.sh UNSETS EMSDK_DIR on source, so stash it and restore before we use it.
+# emsdk_env.sh UNSETS EMSDK_DIR and EMSDK_PYTHON on source, so stash both and
+# restore them before use. EMSDK_PYTHON is emsdk's knob for a host whose python3
+# is older than emscripten's minimum (3.10; Amazon Linux 2023 ships 3.9), and the
+# emcc wrapper reads it on every call, so dropping it fails the link below.
 _VGI_EMSDK_DIR="$EMSDK_DIR"
+_VGI_EMSDK_PYTHON="${EMSDK_PYTHON:-}"
 set +u; source "$EMSDK_DIR/emsdk_env.sh" >/dev/null 2>&1; set -u
 EMSDK_DIR="$_VGI_EMSDK_DIR"
+if [ -n "$_VGI_EMSDK_PYTHON" ]; then
+  export EMSDK_PYTHON="$_VGI_EMSDK_PYTHON"
+fi
 export PATH="$EMSDK_DIR/upstream/emscripten:$PATH"
 SABLIB="${SABLIB:-$(cd ../sabtable && pwd)/target/wasm32-unknown-emscripten/release/libsabtable.a}"
 # NB: -Z build-std recompiles compiler_builtins, which needs +atomics,+bulk-memory
 # via RUSTFLAGS or wasm-ld rejects --shared-memory ("disallowed by compiler_builtins").
-[ -f "$SABLIB" ] || { echo "build sabtable first: (cd ../sabtable && RUSTFLAGS='-C target-feature=+atomics,+bulk-memory,+mutable-globals -C link-args=-pthread' cargo +nightly build --target wasm32-unknown-emscripten -Z build-std=std,panic_abort --release)"; exit 1; }
+[ -f "$SABLIB" ] || { echo "build sabtable first: (cd ../sabtable && RUSTFLAGS='-C target-feature=+atomics,+bulk-memory,+mutable-globals -C link-args=-pthread' cargo +nightly build --locked --target wasm32-unknown-emscripten -Z build-std=std,panic_abort --release)"; exit 1; }
 # PTHREAD_POOL_SIZE must be >= the channel slot count (EnsureVgiSabChannel = 4) so
 # every serve thread gets a pre-spawned pool worker (pthread_create-after-dlopen is
 # flaky, so pre-spawn the full set). --pre-js injects DuckDB's SAB into each pthread
