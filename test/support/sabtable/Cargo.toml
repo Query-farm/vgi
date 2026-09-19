@@ -19,7 +19,16 @@ path = "src/lib.rs"
 # default-features=false drops `sqlite` (bundled libsqlite3) and `transport-http`
 # (tokio); the worker falls back to the zero-dep FsStorage backend, so the native
 # staticlib builds with no heavy/C deps.
-vgi = { path = "../../../../vgi-rust/vgi", default-features = false }
+#
+# From crates.io, not a path to a sibling vgi-rust checkout: a path dependency
+# builds against whatever branch that checkout is on, and rewrites Cargo.lock
+# whenever its version differs from the one recorded here. To try an unreleased
+# SDK change, add an uncommitted `[patch.crates-io] vgi = { path = ... }`, the
+# same convention vgi-rust uses for vgi-rpc.
+#
+# Bumping this moves the vgi-rpc sabtable resolves; sabffi's direct vgi-rpc
+# requirement must move with it (see scripts/check_rust_fixture_locks.sh).
+vgi = { version = "0.35.1", default-features = false }
 # No direct `vgi-rpc` dependency: the trait signatures name vgi-rpc's
 # `Result`/`RpcError`/`OutputCollector`, and `vgi` re-exports that crate
 # (`vgi::vgi_rpc`, `vgi::{Result, RpcError}`) so a worker never names its

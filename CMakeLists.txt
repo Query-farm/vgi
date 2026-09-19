@@ -515,11 +515,11 @@ if((BUILD_VGI_UNIT_TESTS OR DEFINED ENV{BUILD_VGI_UNIT_TESTS}) AND NOT WIN32)
   # Layer-2 helpers themselves stay DuckDB-free but link into the same binary
   # for convenience.
   # Rust FFI worker staticlib for the cross-language SAB e2e (test_sab_e2e.cpp).
-  # Built out-of-band via `cargo build --release` in test/support/sabffi.
+  # Built out-of-band by `make unit_test_rust_libs` (cargo --locked, crates.io).
   set(SABFFI_LIB
     ${CMAKE_CURRENT_SOURCE_DIR}/test/support/sabffi/target/release/libsabffi.a)
   # Table-function worker staticlib (vgi crate) for the WebWorkerFunctionConnection
-  # runtime e2e. Built via `cargo build --release` in test/support/sabtable.
+  # runtime e2e. Built by `make unit_test_rust_libs`, alongside sabffi.
   set(SABTABLE_LIB
     ${CMAKE_CURRENT_SOURCE_DIR}/test/support/sabtable/target/release/libsabtable.a)
   target_link_libraries(vgi_unit_tests

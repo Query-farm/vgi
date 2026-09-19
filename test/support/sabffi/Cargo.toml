@@ -14,7 +14,21 @@ crate-type = ["staticlib"]
 path = "src/lib.rs"
 
 [dependencies]
-vgi-rpc = { path = "../../../../vgi-rpc-rust/vgi-rpc", default-features = false, features = ["macros", "stream-codec"] }
+# From crates.io, never a path or [patch.crates-io] to a sibling vgi-rpc-rust
+# checkout: that made this build depend on whatever branch the sibling was on,
+# and a checkout at another version silently rewrote Cargo.lock.
+#
+# A direct dependency, unlike sabtable (which takes vgi-rpc through vgi's
+# re-export): this is a bare vgi-rpc server, and #[service] /
+# #[derive(StreamState)] expand to absolute `::vgi_rpc::` paths, which only a
+# crate named vgi_rpc in this crate's own dependency list satisfies.
+#
+# It MUST resolve the same vgi-rpc as sabtable's `vgi` (vgi-rust v0.35.x wants
+# 0.25.0): both staticlibs link into one vgi_unit_tests binary. The lockfiles
+# are the pin; `make unit_test_rust_libs` builds with --locked and first runs
+# scripts/check_rust_fixture_locks.sh, which fails naming both versions if they
+# drift apart. Bump this together with sabtable's `vgi`.
+vgi-rpc = { version = "0.25.0", default-features = false, features = ["macros", "stream-codec"] }
 arrow-array = "59"
 arrow-schema = "59"
 serde = { version = "1", features = ["derive"] }

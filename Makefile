@@ -676,12 +676,15 @@ schema_parity_cpp:
 # test/support/sabffi (a bare vgi-rpc server) and test/support/sabtable (a vgi-rust
 # table-function worker), for the native [sab-e2e] / [sab-conn] cases. Build them
 # BEFORE configuring with BUILD_VGI_UNIT_TESTS: that puts vgi_unit_tests in the
-# default target, so `make release` itself fails to link without them. They take
-# path dependencies on sibling checkouts: sabffi on ../vgi-rpc-rust, sabtable on
-# ../vgi-rust.
+# default target, so `make release` itself fails to link without them. Both
+# resolve from crates.io against their committed lockfiles, never a sibling
+# checkout, and --locked means a build can neither re-resolve nor rewrite them.
+# The lock check first refuses a pair that would link two different vgi-rpcs
+# (sabffi pins it directly; sabtable gets it through vgi).
 unit_test_rust_libs:
-	cd test/support/sabffi && cargo build --release
-	cd test/support/sabtable && cargo build --release
+	./scripts/check_rust_fixture_locks.sh
+	cd test/support/sabffi && cargo build --release --locked
+	cd test/support/sabtable && cargo build --release --locked
 
 # Configure with BUILD_VGI_FILTER_V2_TESTS=1, then run the real C++ producer
 # tests independently of the launcher/SAB unit-test target.

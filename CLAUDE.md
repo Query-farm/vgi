@@ -237,10 +237,20 @@ A separate Catch binary (`test/cpp/`) for the launcher helpers, transport detect
 OAuth, telemetry, schema parity, protocol routing and the native SAB transport. It is
 configured only when `BUILD_VGI_UNIT_TESTS` is set **at configure time**, and it links
 two Rust staticlibs that CMake does not build — `test/support/sabffi` (a bare vgi-rpc
-server; path dep on `../vgi-rpc-rust`) and `test/support/sabtable` (a vgi-rust
-table-function worker; path dep on `../vgi-rust`). Build those first: with the option
-set, `vgi_unit_tests` is part of the default target, so `make release` itself fails to
-link without them.
+server; depends on `vgi-rpc` directly) and `test/support/sabtable` (a vgi-rust
+table-function worker; depends on `vgi`, and takes vgi-rpc through its re-export). Build
+those first: with the option set, `vgi_unit_tests` is part of the default target, so
+`make release` itself fails to link without them.
+
+Both come from **crates.io against committed lockfiles**, built `--locked` — never a
+path or `[patch.crates-io]` to a sibling `../vgi-rust` / `../vgi-rpc-rust`, which made
+the build follow whatever branch the sibling was on and silently rewrote the lockfiles.
+They must resolve **one** vgi-rpc (both link into the same binary), and nothing in Cargo
+enforces that across two lockfiles, so `scripts/check_rust_fixture_locks.sh` (run first
+by `make unit_test_rust_libs`) fails naming both versions when they drift. Bumping
+sabtable's `vgi` to an SDK minor that moved vgi-rpc therefore means bumping sabffi's
+`vgi-rpc` in the same change. To try an unreleased SDK, keep a local-checkout
+`[patch.crates-io]` uncommitted.
 
 ```bash
 make unit_test_rust_libs                        # cargo build --release in both crates
