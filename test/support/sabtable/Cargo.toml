@@ -20,14 +20,13 @@ path = "src/lib.rs"
 # (tokio); the worker falls back to the zero-dep FsStorage backend, so the native
 # staticlib builds with no heavy/C deps.
 vgi = { path = "../../../../vgi-rust/vgi", default-features = false }
-# Must match the exact vgi-rpc that `vgi` resolves to (the local checkout via
-# the [patch.crates-io] below) so the `OutputCollector` /
-# `Result` / `RpcError` types are one crate instance, not two. A stale version
-# requirement here silently resolves a SECOND vgi-rpc from crates.io and the
-# build fails on mismatched `RpcError`/`TableProducer` types.
-# Still default-features = false: no `http`, so no axum/tokio/zstd. `vgi` pulls
-# in `crypto` (AEAD split tokens, server-stack-free) via feature unification.
-vgi-rpc = { version = "0.23.0", default-features = false, features = ["macros", "stream-codec"] }
+# No direct `vgi-rpc` dependency: the trait signatures name vgi-rpc's
+# `Result`/`RpcError`/`OutputCollector`, and `vgi` re-exports that crate
+# (`vgi::vgi_rpc`, `vgi::{Result, RpcError}`) so a worker never names its
+# version. A direct requirement here is how this fixture broke twice: whenever it
+# lagged the SDK's vgi-rpc minor (0.x minors never unify), Cargo resolved a
+# SECOND vgi-rpc beside vgi's and every trait impl failed with E0053
+# (`expected vgi::RpcError, found vgi_rpc::RpcError`).
 arrow-array = "59"
 arrow-schema = "59"
 serde = { version = "1", features = ["derive"] }
@@ -35,8 +34,6 @@ serde = { version = "1", features = ["derive"] }
 [profile.release]
 opt-level = 2
 
-# vgi (via ../../../../vgi-rust) resolves vgi-rpc to the local checkout;
-# point this standalone crate at the same source so both unify to ONE vgi-rpc
-# instance.
-[patch.crates-io]
-vgi-rpc = { path = "../../../../vgi-rpc-rust/vgi-rpc" }
+# No [patch.crates-io]: vgi-rust resolves vgi-rpc from crates.io (its workspace
+# keeps any local-checkout patch uncommitted), so this crate resolves it the same
+# way rather than against whatever branch a sibling vgi-rpc-rust checkout is on.

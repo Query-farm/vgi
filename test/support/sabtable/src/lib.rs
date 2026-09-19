@@ -13,7 +13,10 @@ use std::time::Duration;
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::Int64Type;
-use arrow_array::{Array, ArrayRef, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray};
+use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray};
+// Only the emscripten-only browser fixtures build these column types.
+#[cfg(target_os = "emscripten")]
+use arrow_array::{BooleanArray, Float64Array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 
 use vgi::aggregate::{AggregateBindParams, AggregateFunction};
@@ -21,7 +24,10 @@ use vgi::cache_control::CacheControl;
 use vgi::function::{ArgSpec, BindParams, BindResponse, FunctionMetadata, ProcessParams, ScalarFunction};
 use vgi::table_function::{TableFunction, TableProducer};
 use vgi::table_in_out::{project_batch, TableInOutFunction};
-use vgi_rpc::{OutputCollector, Result, RpcError};
+// Through vgi's re-export, never a direct vgi-rpc dependency: this is always
+// the vgi-rpc the traits were compiled against (see Cargo.toml).
+use vgi::vgi_rpc::OutputCollector;
+use vgi::{Result, RpcError};
 
 // Worker-side ring ops, implemented in C++ (test/support/vgi_sab_native_ring.cpp)
 // natively, or in the browser worker module's --js-library (vgi_worker_lib.js).
