@@ -111,6 +111,25 @@ static bool WaitForPathGone(const std::string &path, std::chrono::milliseconds t
 	return false;
 }
 
+// PID of the worker listening on the far end of a connected AF_UNIX socket, as
+// the kernel recorded it. Tells one worker process from another without taking
+// the worker's word for anything.
+static pid_t PeerPid(const UnixSocket &sock) {
+#if defined(__linux__)
+	struct ucred cred {};
+	socklen_t len = sizeof(cred);
+	REQUIRE(::getsockopt(sock.GetFd(), SOL_SOCKET, SO_PEERCRED, &cred, &len) == 0);
+	return cred.pid;
+#elif defined(__APPLE__)
+	pid_t pid = 0;
+	socklen_t len = sizeof(pid);
+	REQUIRE(::getsockopt(sock.GetFd(), SOL_LOCAL, LOCAL_PEERPID, &pid, &len) == 0);
+	return pid;
+#else
+#error "PeerPid: no AF_UNIX peer-PID query for this platform"
+#endif
+}
+
 // ---------------------------------------------------------------------------
 
 TEST_CASE("Launch spawns a worker and connects to its socket", "[launcher][e2e]") {
@@ -400,28 +419,58 @@ TEST_CASE("ResolveAndConnect transparently respawns an idle-shutdown worker",
 }
 
 TEST_CASE("ResolveAndConnect respawns an idle-shutdown launch: worker", "[launcher][e2e][slow]") {
-	// Same scenario as above but with the ``launch:`` scheme, where the
-	// cache invalidation triggers a fresh Launch() that brings up a new
-	// worker.  This is the path that actually self-heals.  Sleeps past the
-	// idle timeout to force the cached worker to disappear, then asserts
-	// the next ResolveAndConnect call succeeds without manual intervention.
-	IsolatedStateDir dir;
-	auto worker_argv = TestWorkerPath();
-	std::string location = "launch:" + worker_argv;
-
-	// Set up a tight idle timeout via the launch worker's argv pass-through.
-	// The launcher pipeline appends --idle-timeout SEC to whatever argv we
-	// give it; we can't change the SEC value through ResolveAndConnect
-	// (it's hard-coded to LaunchConfig defaults).  Instead, use Launch()
-	// directly with a 1-s idle to set up the worker, then exercise the
-	// cache path by passing the resolved-back location.
+	// The self-healing path a long-lived session depends on. The cached
+	// `launch:` worker idle-shuts down while the cache still names its socket,
+	// so the next ResolveAndConnect is refused on the dead path and must
+	// invalidate the entry and bring up a fresh worker, with nothing flushed
+	// by hand. (The unix:// case above ends in an IOException instead: nothing
+	// respawns an operator-managed worker.)
 	//
-	// The simpler shape: Launch via the cache (which uses default 300s
-	// idle).  Wait briefly, then verify a second ResolveAndConnect works.
-	// This doesn't exercise the actual stale-after-idle path, so we use
-	// the more targeted unit test above for that.  Here we just verify
-	// that ResolveAndConnect doesn't break the happy-path round-trip.
-	(void)location; // SKIPPED — covered by the unix:// variant + unit-level retry test below.
+	// This case was an empty placeholder until LaunchOverrides existed:
+	// ResolveAndConnect could only launch with LaunchConfig's 300 s idle
+	// timeout, far too long to wait out in a test. The overrides now carry a
+	// short idle timeout (and an isolated state dir) through it.
+	IsolatedStateDir dir;
+	const std::string location = "launch:" + TestWorkerPath();
+	duckdb::vgi::LaunchOverrides overrides;
+	overrides.idle_timeout = 1s;
+	overrides.state_dir = dir.path();
+
+	// The cache is process-wide and pins overrides per location. Start clean,
+	// and drop this entry on every exit, a failed REQUIRE included, so a later
+	// case resolving the same location with other overrides is not refused
+	// with a BinderException.
+	duckdb::vgi::ClearLauncherSocketCache();
+	struct ForgetLocation {
+		std::string location;
+		~ForgetLocation() {
+			duckdb::vgi::InvalidateLauncherSocketCache(location);
+		}
+	} forget {location};
+
+	std::string path;
+	pid_t first_pid = 0;
+	{
+		auto sock = duckdb::vgi::ResolveAndConnect(location, 10s, overrides);
+		REQUIRE(sock.IsOpen());
+		first_pid = PeerPid(sock);
+		path = duckdb::vgi::ResolveLauncherSocketPath(location, overrides); // cache hit
+	} // the only client disconnects; the worker's idle clock starts
+	REQUIRE(first_pid > 0);
+
+	// The worker exits and unlinks its socket...
+	REQUIRE(WaitForPathGone(path, 3500ms));
+	// ...but the cache still hands out that path, so the connect below is
+	// refused first and only the invalidate-and-relaunch retry can recover.
+	REQUIRE(duckdb::vgi::ResolveLauncherSocketPath(location, overrides) == path);
+
+	auto sock = duckdb::vgi::ResolveAndConnect(location, 10s, overrides);
+	REQUIRE(sock.IsOpen());
+	// A new worker process, at the same per-hash socket path.
+	const pid_t second_pid = PeerPid(sock);
+	CHECK(second_pid > 0);
+	CHECK(second_pid != first_pid);
+	CHECK(duckdb::vgi::ResolveLauncherSocketPath(location, overrides) == path);
 }
 
 TEST_CASE("ResolveAndConnect retries once when the cached path goes stale",
