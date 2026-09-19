@@ -23,9 +23,36 @@
 using duckdb::vgi::SabInputStream;
 using duckdb::vgi::SabOutputStream;
 using duckdb::vgi::SerializeRpcRequest;
+using duckdb::vgi::VgiProtocolId;
 
 // Rust FFI worker (sabffi staticlib): serve one slot to completion.
 extern "C" void vgi_rust_serve_sab_slot(int slot);
+
+// The sabffi worker is a bare vgi-rpc server hosting ONE protocol, "Svc"
+// (`RpcServer::builder().protocol_name("Svc")` in test/support/sabffi). vgi-rpc
+// requires every request's `vgi_rpc.protocol` to name a hosted protocol, so these
+// requests address it rather than SerializeRpcRequest's default — the VGI worker
+// protocol, which this server does not host and answers with an error envelope.
+// The version is not enforced: the server declares none.
+constexpr VgiProtocolId SVC_PROTOCOL {"Svc", "1.0.0"};
+
+// Next batch of a worker response. vgi-rpc reports an error in-band, as a 0-row
+// batch whose custom metadata carries vgi_rpc.log_level=EXCEPTION; fail with the
+// worker's message rather than reading column(0) of an envelope, which for an
+// error with an empty schema is a segfault that names nothing.
+static std::shared_ptr<arrow::RecordBatch> NextBatch(arrow::ipc::RecordBatchStreamReader &reader) {
+	auto next = reader.ReadNext();
+	REQUIRE(next.ok());
+	const auto &md = next->custom_metadata;
+	if (md) {
+		auto level = md->Get(duckdb::vgi::RPC_LOG_LEVEL_KEY);
+		if (level.ok() && *level == "EXCEPTION") {
+			auto message = md->Get(duckdb::vgi::RPC_LOG_MESSAGE_KEY);
+			FAIL("worker answered with an error: " << (message.ok() ? *message : std::string("<no message>")));
+		}
+	}
+	return next->batch;
+}
 
 TEST_CASE("C++ producer client <-> Rust serve_sab (count_to) over the ring", "[sab-e2e]") {
 	constexpr int region = 0;
@@ -45,10 +72,9 @@ TEST_CASE("C++ producer client <-> Rust serve_sab (count_to) over the ring", "[s
 	// validates it field-by-field before dispatch, and Arrow's two-argument
 	// arrow::field() defaults to NULLABLE while the Rust #[service]-derived
 	// schema declares <i64 as VgiArrow>::nullable() == false. A mismatch is
-	// answered with an exception envelope, whose 0-column batch then
-	// segfaults the column(0) read below rather than failing legibly.
+	// answered with an exception envelope, which NextBatch reports.
 	auto params = arrow::RecordBatch::Make(arrow::schema({arrow::field("total", arrow::int64(), /*nullable=*/false)}), 1, {ta});
-	std::vector<uint8_t> req = SerializeRpcRequest("count_to", params);
+	std::vector<uint8_t> req = SerializeRpcRequest("count_to", params, SVC_PROTOCOL);
 
 	auto out = std::make_shared<SabOutputStream>(region, slot);
 	REQUIRE(out->Write(req.data(), static_cast<int64_t>(req.size())).ok());
@@ -71,7 +97,7 @@ TEST_CASE("C++ producer client <-> Rust serve_sab (count_to) over the ring", "[s
 	std::vector<int64_t> got;
 	std::shared_ptr<arrow::RecordBatch> batch;
 	for (;;) {
-		REQUIRE(reader->ReadNext(&batch).ok());
+		batch = NextBatch(*reader);
 		if (!batch) {
 			break; // EOS
 		}
@@ -109,20 +135,18 @@ TEST_CASE("unary RPC then producer RPC on one slot (bind->init sequencing)", "[s
 		std::shared_ptr<arrow::Array> xa;
 		REQUIRE(xb.Finish(&xa).ok());
 		auto params = arrow::RecordBatch::Make(arrow::schema({arrow::field("x", arrow::int64(), /*nullable=*/false)}), 1, {xa});
-		auto req = SerializeRpcRequest("add_one", params);
+		auto req = SerializeRpcRequest("add_one", params, SVC_PROTOCOL);
 
 		auto out = std::make_shared<SabOutputStream>(region, slot);
 		REQUIRE(out->Write(req.data(), static_cast<int64_t>(req.size())).ok());
 
 		auto in = std::make_shared<SabInputStream>(region, slot);
 		auto reader = *arrow::ipc::RecordBatchStreamReader::Open(in);
-		std::shared_ptr<arrow::RecordBatch> resp;
-		REQUIRE(reader->ReadNext(&resp).ok());
+		auto resp = NextBatch(*reader);
 		REQUIRE(resp != nullptr);
 		auto rcol = std::static_pointer_cast<arrow::Int64Array>(resp->column(0));
 		CHECK(rcol->Value(0) == 42);
-		REQUIRE(reader->ReadNext(&resp).ok()); // drain the response's EOS
-		CHECK(resp == nullptr);
+		CHECK(NextBatch(*reader) == nullptr); // drain the response's EOS
 	}
 
 	// --- Phase 2: producer count_to(3) -> [0,1,2] on the SAME slot (the "init" analog) ---
@@ -133,7 +157,7 @@ TEST_CASE("unary RPC then producer RPC on one slot (bind->init sequencing)", "[s
 		std::shared_ptr<arrow::Array> ta;
 		REQUIRE(tb.Finish(&ta).ok());
 		auto params = arrow::RecordBatch::Make(arrow::schema({arrow::field("total", arrow::int64(), /*nullable=*/false)}), 1, {ta});
-		auto req = SerializeRpcRequest("count_to", params);
+		auto req = SerializeRpcRequest("count_to", params, SVC_PROTOCOL);
 
 		auto out = std::make_shared<SabOutputStream>(region, slot); // fresh stream, same slot
 		REQUIRE(out->Write(req.data(), static_cast<int64_t>(req.size())).ok());
@@ -147,7 +171,7 @@ TEST_CASE("unary RPC then producer RPC on one slot (bind->init sequencing)", "[s
 		auto reader = *arrow::ipc::RecordBatchStreamReader::Open(in);
 		std::shared_ptr<arrow::RecordBatch> batch;
 		for (;;) {
-			REQUIRE(reader->ReadNext(&batch).ok());
+			batch = NextBatch(*reader);
 			if (!batch) {
 				break;
 			}
@@ -182,7 +206,7 @@ TEST_CASE("exchange RPC (scale) over the ring", "[sab-e2e]") {
 	std::shared_ptr<arrow::Array> fa;
 	REQUIRE(fb.Finish(&fa).ok());
 	auto params = arrow::RecordBatch::Make(arrow::schema({arrow::field("factor", arrow::float64(), /*nullable=*/false)}), 1, {fa});
-	auto req = SerializeRpcRequest("scale", params);
+	auto req = SerializeRpcRequest("scale", params, SVC_PROTOCOL);
 
 	auto out = std::make_shared<SabOutputStream>(region, slot);
 	REQUIRE(out->Write(req.data(), static_cast<int64_t>(req.size())).ok());
@@ -200,8 +224,7 @@ TEST_CASE("exchange RPC (scale) over the ring", "[sab-e2e]") {
 	// 3. read the 1:1 scaled output batch.
 	auto in = std::make_shared<SabInputStream>(region, slot);
 	auto reader = *arrow::ipc::RecordBatchStreamReader::Open(in);
-	std::shared_ptr<arrow::RecordBatch> outb;
-	REQUIRE(reader->ReadNext(&outb).ok());
+	auto outb = NextBatch(*reader);
 	REQUIRE(outb != nullptr);
 	auto ocol = std::static_pointer_cast<arrow::DoubleArray>(outb->column(0));
 	std::vector<double> got;
@@ -213,8 +236,7 @@ TEST_CASE("exchange RPC (scale) over the ring", "[sab-e2e]") {
 	// 4. close input (Arrow EOS + ring EOF), drain output EOS.
 	REQUIRE(input_writer->Close().ok());
 	vgi_wasm_slot_write_eos(region, slot);
-	REQUIRE(reader->ReadNext(&outb).ok());
-	CHECK(outb == nullptr);
+	CHECK(NextBatch(*reader) == nullptr);
 
 	rust_worker.join();
 	vgi_wasm_slot_release(region, slot);
