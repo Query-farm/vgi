@@ -44,6 +44,11 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 #   rff_simple_scan so it adds no function) +
 # 1 filter-pushdown-through-view fixture (filter_echo_table_scan, backs
 #   example.data.filter_echo_table — see filter_pushdown_through_view.test) +
+# 1 boolean-column predicate fixture (bool_filter_echo — the only fixture with a
+#   BOOLEAN column, which is what it takes to push `WHERE flag` / `WHERE NOT flag`
+#   at a worker at all: DuckDB sends those as a bare column_ref, and every port's
+#   filter-v2 decoder has to accept one. Backs
+#   filter_pushdown/boolean_column_predicate.test) +
 # 1 large-output-batch buffering repro (buffer_emit_wide, see
 #   table_in_out/table_buffering_large_batch.test) +
 # 2 time-travel + pushdown fixtures (tt_pushdown_scan, tt_pushdown_cols_scan,
@@ -147,7 +152,7 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 #   re-emits its splits across pages); and four pair splits with another
 #   feature (split_batch_index, split_partitioned, split_dynamic_filter,
 #   split_cacheable). Back splits/*.test.
-# = 166 portable baseline registrations.
+# = 167 portable baseline registrations.
 #
 # SDK fixture workers may additionally ship implementation-specific backing
 # scans that are not part of the portable fixture surface. C# uses
@@ -155,14 +160,6 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 # three-column projected scanner. The exchange-cache probes are also excluded
 # from the portable inventory count, then validated as an exact optional set so
 # a partial registration still fails.
-#
-# bool_filter_echo is excluded on the same footing, for now: it is the only
-# fixture with a BOOLEAN column, added with
-# filter_pushdown/boolean_column_predicate.test to cover `WHERE flag` /
-# `WHERE NOT flag` -- shapes DuckDB pushes down as a bare column_ref, which
-# every port's filter-v2 decoder has to accept and which none of them had a
-# case for. It belongs in the portable baseline (167) once the other SDK
-# fixture workers ship it; until then counting it here would fail them all.
 query I
 SELECT COUNT(*)
 FROM duckdb_functions()
@@ -177,11 +174,10 @@ WHERE database_name = 'example' AND function_type = 'table'
     'cached_reval_sum_all',
     'cached_serial_echo',
     'cached_slow_sum_all',
-    'generated_sequence_scan',
-    'bool_filter_echo'
+    'generated_sequence_scan'
   );
 ----
-166
+167
 
 query I
 SELECT CASE

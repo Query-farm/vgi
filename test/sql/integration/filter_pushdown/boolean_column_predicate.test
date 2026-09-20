@@ -37,8 +37,12 @@ require httpfs
 statement ok
 ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
-# `pushed_filters` is the fixture's diagnostic rendering, which substitutes the
-# bound parameter with Python's repr — hence `flag = True`, not `flag = true`.
+# `pushed_filters` is the fixture's diagnostic rendering, which inlines the bound
+# parameter using each language's own formatting — Python's `str(True)` gives
+# `True`, every other SDK gives `true`. `lower()` normalises that one difference
+# so the same assertion holds against all six fixture workers; everything else
+# about the rendering is already identical by construction.
+#
 # What matters is that a predicate appears at all: a shape that parses but
 # renders no SQL would show "(none)" here while still returning the right rows.
 
@@ -68,9 +72,9 @@ SELECT n, flag FROM example.bool_filter_echo(6) WHERE flag ORDER BY n;
 3	true
 
 query I
-SELECT DISTINCT pushed_filters FROM example.bool_filter_echo(6) WHERE flag;
+SELECT DISTINCT lower(pushed_filters) FROM example.bool_filter_echo(6) WHERE flag;
 ----
-flag = True
+flag = true
 
 # ============================================================================
 # `WHERE NOT flag`
@@ -85,9 +89,9 @@ SELECT n, flag FROM example.bool_filter_echo(6) WHERE NOT flag ORDER BY n;
 4	false
 
 query I
-SELECT DISTINCT pushed_filters FROM example.bool_filter_echo(6) WHERE NOT flag;
+SELECT DISTINCT lower(pushed_filters) FROM example.bool_filter_echo(6) WHERE NOT flag;
 ----
-flag = False
+flag = false
 
 # ============================================================================
 # The bare column inside a conjunction
