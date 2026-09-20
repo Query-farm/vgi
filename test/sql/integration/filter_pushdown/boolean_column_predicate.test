@@ -1,0 +1,130 @@
+# name: test/sql/integration/filter_pushdown/boolean_column_predicate.test
+# description: A BOOLEAN column is a predicate on its own — `WHERE flag`, `WHERE NOT flag`.
+#   DuckDB pushes these down as a bare `column_ref`, NOT as `flag = true`.
+#   That is a different wire shape, and under filter encoding v2 the
+#   decoder refused it outright ("predicate root must resolve to BOOLEAN")
+#   because its boolean gate enumerated node kinds instead of asking for
+#   the resolved type — even though it had already resolved the column to
+#   BOOLEAN. Every query with `WHERE <bool col>` failed. Fixed in
+#   vgi-python 0.36.2.
+#
+#   This needs a TABLE FUNCTION with a boolean column, which is why it is
+#   its own file rather than more cases in booleans.test:
+#
+#     - filter_echo has no boolean column, so the predicate cannot be
+#       written against it at all.
+#     - The table-in-out `example.echo` path (which booleans.test uses)
+#       is not handed a bare boolean column as a pushed predicate, so
+#       cases written there pass whether or not the worker can decode
+#       one — false confidence, which is worse than no test.
+#
+#   bool_filter_echo(n) emits `flag` cycling TRUE, FALSE, NULL and echoes
+#   the SQL rendering of whatever was pushed. Both halves are covered:
+#   the rows prove the decode (auto_apply_filters=true), and
+#   `pushed_filters` proves `to_sql()` renders it — a shape that parses
+#   but renders no SQL shows up here as "(none)", and for a worker that
+#   builds a WHERE clause from it that is silently wrong rows, because
+#   DuckDB does not re-apply what it pushed down.
+#
+# group: [vgi_integration_filter_pushdown]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# `pushed_filters` is the fixture's diagnostic rendering, which substitutes the
+# bound parameter with Python's repr — hence `flag = True`, not `flag = true`.
+# What matters is that a predicate appears at all: a shape that parses but
+# renders no SQL would show "(none)" here while still returning the right rows.
+
+# Baseline: flag cycles TRUE, FALSE, NULL and nothing is pushed.
+query III
+SELECT * FROM example.bool_filter_echo(6) ORDER BY n;
+----
+0	true	(none)
+1	false	(none)
+2	NULL	(none)
+3	true	(none)
+4	false	(none)
+5	NULL	(none)
+
+# ============================================================================
+# `WHERE flag` — the bare column
+#
+# Keeps only TRUE. The NULL rows are excluded: a NULL predicate is not
+# satisfied, which is exactly what `flag = true` does, and is why the decoder
+# may rewrite one into the other.
+# ============================================================================
+
+query II
+SELECT n, flag FROM example.bool_filter_echo(6) WHERE flag ORDER BY n;
+----
+0	true
+3	true
+
+query I
+SELECT DISTINCT pushed_filters FROM example.bool_filter_echo(6) WHERE flag;
+----
+flag = True
+
+# ============================================================================
+# `WHERE NOT flag`
+#
+# Keeps only FALSE — `NOT NULL` is NULL, so the NULL rows drop here too.
+# ============================================================================
+
+query II
+SELECT n, flag FROM example.bool_filter_echo(6) WHERE NOT flag ORDER BY n;
+----
+1	false
+4	false
+
+query I
+SELECT DISTINCT pushed_filters FROM example.bool_filter_echo(6) WHERE NOT flag;
+----
+flag = False
+
+# ============================================================================
+# The bare column inside a conjunction
+#
+# The shape that actually turns up in queries. One child the worker cannot
+# render costs the WHOLE conjunction its pushdown, so cover it explicitly
+# rather than trusting the single-predicate cases above.
+# ============================================================================
+
+query II
+SELECT n, flag FROM example.bool_filter_echo(9) WHERE flag AND n > 2 ORDER BY n;
+----
+3	true
+6	true
+
+query II
+SELECT n, flag FROM example.bool_filter_echo(9) WHERE NOT flag OR n = 0 ORDER BY n;
+----
+0	true
+1	false
+4	false
+7	false
+
+# ============================================================================
+# Explicit spellings still work — the rewrite must not disturb them
+# ============================================================================
+
+query II
+SELECT n, flag FROM example.bool_filter_echo(6) WHERE flag = true ORDER BY n;
+----
+0	true
+3	true
+
+query II
+SELECT n, flag FROM example.bool_filter_echo(6) WHERE flag IS NOT TRUE ORDER BY n;
+----
+1	false
+2	NULL
+4	false
+5	NULL
