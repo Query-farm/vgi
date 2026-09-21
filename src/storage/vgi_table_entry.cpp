@@ -508,6 +508,10 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 	bool has_filter_pushdown = false;
 	bool has_sampling_pushdown = false;
 	bool has_late_materialization = false;
+	// PartitionColumns opt-in, read off the worker metadata like
+	// late_materialization below — the synthetic vgi_table_scan is built fresh,
+	// so nothing carries over from the function-set registration path.
+	auto scan_partition_kind = vgi::VgiPartitionKind::NotPartitioned;
 	// Default to INSERTION_ORDER (same as DuckDB's TableFunction default).
 	// Overridden below to the resolved function's declared preservation when
 	// at least one overload of the bound function pins it — required so the
@@ -708,6 +712,9 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 				// here and gate func.late_materialization on it.
 				has_late_materialization =
 				    has_late_materialization || vgi_tf_info.function_info().late_materialization.value_or(false);
+				if (vgi_tf_info.function_info().partition_kind != vgi::VgiPartitionKind::NotPartitioned) {
+					scan_partition_kind = vgi_tf_info.function_info().partition_kind;
+				}
 			}
 		}
 	}
@@ -736,6 +743,41 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 	// resolution after a logical-plan deep copy.
 	scan_bind_data->at_unit = at_unit;
 	scan_bind_data->at_value = at_value;
+
+	// PartitionColumns: carry the declared kind and resolve the partition
+	// column indices, exactly as ``VgiCatalogTableFunctionBind`` does for the
+	// function-call path. Both are read by ``VgiGetPartitionInfo`` (planning)
+	// and ``VgiGetPartitionData`` (execution); leaving them unset is why a
+	// catalog table never got PhysicalPartitionedAggregate even when the
+	// worker declared SINGLE_VALUE_PARTITIONS.
+	//
+	// Resolved from the TABLE's own arrow schema rather than a bind result:
+	// it is always available here, it is the same schema the bind returns for
+	// a function-backed table, and per-field metadata survives the catalog's
+	// Arrow IPC round-trip (``row_id_column`` above is detected the same way).
+	// Indices are worker-schema positions — the rowid column included — which
+	// is the space ``VgiGetPartitionData`` maps the sink's request into.
+	if (scan_partition_kind != vgi::VgiPartitionKind::NotPartitioned && table_info_.arrow_schema) {
+		for (int i = 0; i < table_info_.arrow_schema->num_fields(); ++i) {
+			const auto &field = table_info_.arrow_schema->field(i);
+			const auto &meta = field->metadata();
+			if (!meta) {
+				continue;
+			}
+			int idx = meta->FindKey("vgi.partition_column");
+			if (idx >= 0 && meta->value(idx) == "true") {
+				scan_bind_data->partition_column_indices.push_back(static_cast<idx_t>(i));
+			}
+		}
+		// A declared kind with no annotated field is a worker bug; degrade to
+		// NOT_PARTITIONED rather than letting the planner pick a partitioned
+		// aggregate we cannot answer for.
+		if (!scan_bind_data->partition_column_indices.empty()) {
+			scan_bind_data->partition_kind = scan_partition_kind;
+		} else {
+			scan_partition_kind = vgi::VgiPartitionKind::NotPartitioned;
+		}
+	}
 
 	// Pass row_id info to bind data
 	if (table_info_.row_id_column >= 0) {
@@ -887,6 +929,16 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 		// stay false.
 		func.late_materialization =
 		    has_late_materialization && has_filter_pushdown && has_projection_pushdown;
+	}
+
+	// PartitionColumns: without ``get_partition_info`` the planner skips the
+	// source outright ("this source does not expose partition information",
+	// plan_aggregate.cpp), so a catalog table could never plan a partitioned
+	// aggregate however it was declared. ``get_partition_data`` supplies the
+	// per-column (min, max) the sink then reads.
+	if (scan_partition_kind != vgi::VgiPartitionKind::NotPartitioned) {
+		func.get_partition_info = vgi::VgiGetPartitionInfo;
+		func.get_partition_data = vgi::VgiGetPartitionData;
 	}
 
 	return func;

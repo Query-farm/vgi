@@ -4421,6 +4421,29 @@ void VgiSetScanOrder(unique_ptr<RowGroupOrderOptions> order_options, optional_pt
 // ``partition_data`` re-ordered to match
 // ``input.partition_info.partition_columns`` — the column indices the
 // sink is asking about.
+//! Map a DuckDB BASE (table) column index to a WORKER-schema index.
+//!
+//! The two spaces differ by the hidden rowid pseudocolumn: DuckDB's table
+//! column list excludes it, while ``partition_column_indices`` are positions in
+//! the worker's output schema, which INCLUDES it. Same shift
+//! ``VgiSerializeFilters`` applies for filter columns. Without it, a table whose
+//! rowid sits BEFORE a partition column resolves to the wrong column — which
+//! ``VgiGetPartitionInfo`` reports as NOT_PARTITIONED, silently disabling the
+//! partitioned aggregate rather than failing.
+static idx_t WorkerIndexFromBaseColumn(const VgiTableFunctionBindData &bind_data, column_t base_col) {
+	if (base_col == COLUMN_IDENTIFIER_ROW_ID) {
+		return bind_data.rowid_worker_col_index >= 0
+		           ? NumericCast<idx_t>(bind_data.rowid_worker_col_index)
+		           : base_col;
+	}
+	idx_t worker_col = base_col;
+	if (bind_data.rowid_worker_col_index >= 0 &&
+	    worker_col >= NumericCast<idx_t>(bind_data.rowid_worker_col_index)) {
+		worker_col++;
+	}
+	return worker_col;
+}
+
 OperatorPartitionData VgiGetPartitionData(ClientContext &, TableFunctionGetPartitionInput &input) {
 	auto &local_state = input.local_state->Cast<VgiTableFunctionLocalState>();
 	auto &bind_data = input.bind_data->Cast<VgiTableFunctionBindData>();
@@ -4432,12 +4455,58 @@ OperatorPartitionData VgiGetPartitionData(ClientContext &, TableFunctionGetParti
 	// declared partition columns the sink doesn't care about.
 	if (!local_state.current_partition_data.empty() &&
 	    !input.partition_info.partition_columns.empty()) {
+		// The sink's column indices and ours live in DIFFERENT SPACES, and
+		// DuckDB only maps between them on the planning side:
+		// ``CanUsePartitionedAggregate`` (plan_aggregate.cpp) maps the group
+		// columns through ``projection_ids`` and then ``column_ids`` to build
+		// ``base_columns``, and asks ``VgiGetPartitionInfo`` about THOSE —
+		// worker-schema indices, which is what ``partition_column_indices``
+		// holds. But it stores the un-``column_ids``-mapped vector on
+		// ``PhysicalPartitionedAggregate``, so what comes back here is
+		// SCAN-LOCAL (a position in this scan's ``column_ids``). Comparing the
+		// two directly matches only when the scan projects every column in
+		// order; any projected scan — i.e. the normal case, since GROUP BY
+		// projects just the grouping column — mismatched and threw the
+		// InternalException below, which is FATAL (it invalidates the
+		// database). So map scan-local -> worker-schema here first.
+		//
+		// ``GlobalState::projection_ids`` is exactly that mapping: InitGlobal
+		// built it from ``input.column_ids``, already shifted for the hidden
+		// rowid column. It is empty when the function has no projection
+		// pushdown, in which case the scan-local index IS the table column
+		// index and only the rowid shift applies (same rule as
+		// ``VgiSerializeFilters``).
+		optional_ptr<VgiTableFunctionGlobalState> gstate;
+		if (input.global_state) {
+			gstate = &input.global_state->Cast<VgiTableFunctionGlobalState>();
+		}
+		auto to_worker_index = [&](column_t requested_col) -> idx_t {
+			if (requested_col == COLUMN_IDENTIFIER_ROW_ID) {
+				return bind_data.rowid_worker_col_index >= 0
+				           ? NumericCast<idx_t>(bind_data.rowid_worker_col_index)
+				           : requested_col;
+			}
+			if (gstate && !gstate->projection_ids.empty()) {
+				if (requested_col < gstate->projection_ids.size()) {
+					return NumericCast<idx_t>(gstate->projection_ids[requested_col]);
+				}
+				return requested_col;
+			}
+			// No projection pushdown: the scan emits every base column in
+			// schema order, so the sink's index IS the base-column index and
+			// only the rowid gap remains. (DuckDB reaches this shape only once
+			// duckdb/duckdb#24557 is present — before it, the planner crashes
+			// mapping these indices; see the guard in CanUsePartitionedAggregate.)
+			return WorkerIndexFromBaseColumn(bind_data, requested_col);
+		};
+
 		result.partition_data.reserve(input.partition_info.partition_columns.size());
 		for (column_t requested_col : input.partition_info.partition_columns) {
 			// Find this column in the declared partition indices.
+			const idx_t worker_col = to_worker_index(requested_col);
 			idx_t declared_pos = DConstants::INVALID_INDEX;
 			for (idx_t i = 0; i < bind_data.partition_column_indices.size(); ++i) {
-				if (bind_data.partition_column_indices[i] == requested_col) {
+				if (bind_data.partition_column_indices[i] == worker_col) {
 					declared_pos = i;
 					break;
 				}
@@ -4448,10 +4517,11 @@ OperatorPartitionData VgiGetPartitionData(ClientContext &, TableFunctionGetParti
 				// we didn't declare, so the planner shouldn't pick
 				// PartitionedAggregate. Belt-and-suspenders.
 				throw InternalException(
-				    "VGI function '%s': sink requested partition column %llu that "
-				    "is not in the declared partition set",
+				    "VGI function '%s': sink requested partition column %llu "
+				    "(worker-schema %llu) that is not in the declared partition set",
 				    bind_data.function_name,
-				    static_cast<unsigned long long>(requested_col));
+				    static_cast<unsigned long long>(requested_col),
+				    static_cast<unsigned long long>(worker_col));
 			}
 			result.partition_data.push_back(local_state.current_partition_data[declared_pos]);
 		}
@@ -4470,10 +4540,17 @@ TablePartitionInfo VgiGetPartitionInfo(ClientContext &, TableFunctionPartitionIn
 	}
 	// Every column the planner asks about must be in our declared
 	// partition set, otherwise we can't guarantee the partition shape.
+	//
+	// ``partition_ids`` are BASE (table) column indices — DuckDB built them by
+	// mapping through column_ids — while the declared set is in worker-schema
+	// space. Normalize before comparing, or a table whose rowid precedes a
+	// partition column answers NOT_PARTITIONED for a column it does partition
+	// on, quietly losing the optimization with nothing to debug.
 	for (auto col_id : input.partition_ids) {
+		const idx_t worker_col = WorkerIndexFromBaseColumn(bind_data, col_id);
 		bool found = false;
 		for (idx_t declared : bind_data.partition_column_indices) {
-			if (declared == col_id) {
+			if (declared == worker_col) {
 				found = true;
 				break;
 			}

@@ -152,7 +152,10 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 #   re-emits its splits across pages); and four pair splits with another
 #   feature (split_batch_index, split_partitioned, split_dynamic_filter,
 #   split_cacheable). Back splits/*.test.
-# = 167 portable baseline registrations.
+# 1 partition-column fixture whose partition column is NOT first
+#   (trailing_partition_sales) — also exposed as a catalog table, so the
+#   catalog scan path is covered too. Back table/partition_columns.test.
+# = 168 portable baseline registrations.
 #
 # SDK fixture workers may additionally ship implementation-specific backing
 # scans that are not part of the portable fixture surface. C# uses
@@ -177,7 +180,7 @@ WHERE database_name = 'example' AND function_type = 'table'
     'generated_sequence_scan'
   );
 ----
-167
+168
 
 query I
 SELECT CASE

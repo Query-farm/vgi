@@ -222,6 +222,108 @@ statement ok
 SET threads=4;
 
 # ============================================================================
+# Partition column NOT at index 0, reached as a CATALOG TABLE
+# ============================================================================
+# Regression guard for two bugs that hid each other (fixed 2026-09-21):
+#
+#   1. The catalog-table scan function (vgi_table_entry.cpp) never installed
+#      get_partition_info, so the planner skipped the source outright — "this
+#      source does not expose partition information" (plan_aggregate.cpp) — and
+#      a TABLE fell back to HASH_GROUP_BY however the worker declared it. Every
+#      case above calls the FUNCTION form, which installs the callback on a
+#      different path, so the gap was invisible here.
+#
+#   2. VgiGetPartitionData compared the sink's SCAN-LOCAL column index against
+#      the WORKER-SCHEMA indices the worker declared. Those coincide only when
+#      the partition column sits at index 0 — true of every other fixture in
+#      this file. `trailing_partition_sales` declares `country` LAST (index 3)
+#      and `GROUP BY country` projects just country+sales, so the sink asks
+#      about scan-local 0 against declared 3. That raised an InternalException,
+#      which is FATAL: it invalidates the database for the rest of the session.
+#
+# The table binds rows_per_country = 100 and emits the same values as
+# country_partitioned_sales(100), so the sums match that case exactly.
+
+query II
+EXPLAIN SELECT country, SUM(sales)
+FROM example.data.trailing_partition_sales GROUP BY country;
+----
+physical_plan	<REGEX>:.*PARTITIONED_AGGREGATE.*
+
+query II rowsort
+SELECT country, SUM(sales)
+FROM example.data.trailing_partition_sales GROUP BY country;
+----
+AU	4950
+BR	100004950
+CA	200004950
+FR	300004950
+US	400004950
+
+# The function form of the SAME fixture: one result, both paths.
+query II
+EXPLAIN SELECT country, SUM(sales)
+FROM example.trailing_partition_sales(100) GROUP BY country;
+----
+physical_plan	<REGEX>:.*PARTITIONED_AGGREGATE.*
+
+query II rowsort
+SELECT country, SUM(sales)
+FROM example.trailing_partition_sales(100) GROUP BY country;
+----
+AU	4950
+BR	100004950
+CA	200004950
+FR	300004950
+US	400004950
+
+# A different projection width moves the partition column to another
+# scan-local position — the mapping must hold for each shape, not just one.
+query II rowsort
+SELECT country, COUNT(*)
+FROM example.data.trailing_partition_sales GROUP BY country;
+----
+AU	100
+BR	100
+CA	100
+FR	100
+US	100
+
+query III rowsort
+SELECT country, COUNT(*), SUM(seq)
+FROM example.data.trailing_partition_sales GROUP BY country;
+----
+AU	100	4950
+BR	100	4950
+CA	100	4950
+FR	100	4950
+US	100	4950
+
+# Unprojected scan still returns every row of every partition.
+query II
+SELECT COUNT(*), COUNT(DISTINCT country)
+FROM example.data.trailing_partition_sales;
+----
+500	5
+
+# threads=1: same numbers, single-threaded partition delivery.
+statement ok
+SET threads=1;
+
+query II rowsort
+SELECT country, SUM(sales)
+FROM example.data.trailing_partition_sales GROUP BY country;
+----
+AU	4950
+BR	100004950
+CA	200004950
+FR	300004950
+US	400004950
+
+statement ok
+SET threads=4;
+
+# ============================================================================
 # Cleanup
 # ============================================================================
 
