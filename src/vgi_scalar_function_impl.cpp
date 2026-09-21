@@ -478,6 +478,9 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 		// worker whose bind-time secret request is input-dependent.
 		local_state.secret_dependent =
 		    (bind_data && bind_data->secret_dependent) || bind_result.secret_dependent;
+		// This bind's secrets are the ones the worker computes with on this
+		// connection, so its fingerprint — not the planner bind's — keys the cache.
+		local_state.secret_scope = bind_result.secret_scope;
 		connection->PerformInit(bind_result);
 		connection->OpenInputWriter();
 
@@ -602,8 +605,9 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 		const std::string op_kind = "scalar\x1f" + result.GetType().ToString();
 		if (BuildExchangeCacheKeyStaticFields(context, bind_data->attach_params, bind_data->function_name,
 		                                      bind_data->schema_name, canon_args, bind_data->settings, {},
-		                                      local_state.secret_dependent, local_state.cache_static_key,
-		                                      local_state.cache_catalog_name, cver, reason, op_kind)) {
+		                                      local_state.secret_dependent, local_state.secret_scope,
+		                                      local_state.cache_static_key, local_state.cache_catalog_name, cver,
+		                                      reason, op_kind)) {
 			local_state.cache_eligible = true;
 			local_state.cache_static_fp = local_state.cache_static_key.Fingerprint();
 			Value ttl_v;

@@ -273,8 +273,9 @@ bool BuildExchangeCacheKeyStaticFields(ClientContext &context,
                                        const std::string &canonical_arguments,
                                        const std::map<std::string, Value> &settings,
                                        const std::vector<int32_t> &projection_ids, bool secret_dependent,
-                                       VgiResultCacheKey &key, std::string &catalog_name, int64_t &catalog_version,
-                                       const char *&reason, const std::string &operator_kind) {
+                                       const std::string &secret_scope, VgiResultCacheKey &key,
+                                       std::string &catalog_name, int64_t &catalog_version, const char *&reason,
+                                       const std::string &operator_kind) {
 	reason = nullptr;
 	catalog_version = 0;
 
@@ -292,13 +293,12 @@ bool BuildExchangeCacheKeyStaticFields(ClientContext &context,
 		reason = "disabled_attach";
 		return false;
 	}
-	// Resolved secret values are deliberately absent from cache identity and
-	// diagnostics. A function that requested any secret can therefore neither
-	// safely probe nor populate a result cache: rotation/removal must be visible
-	// on the very next call, and hashing secret material into a key would retain
-	// credentials in process/disk state. Fail closed for every exchange shape.
-	if (secret_dependent) {
-		reason = "secret_dependent";
+	// A secret-dependent result is keyed on secret_scope — a fingerprint of the
+	// secrets the bind sent, never their values — so rotation or removal is
+	// visible on the very next call as a miss. A secret-dependent bind with no
+	// fingerprint has nothing to key on: fail closed for every exchange shape.
+	if (secret_dependent && secret_scope.empty()) {
+		reason = "secret_fingerprint_missing";
 		return false;
 	}
 
@@ -349,6 +349,7 @@ bool BuildExchangeCacheKeyStaticFields(ClientContext &context,
 	key.implementation_version = attach_params->implementation_version();
 	key.catalog_version = catalog_version;
 	key.shape_key = operator_kind; // SHAPE discriminator — see VgiResultCacheKey::shape_key
+	key.secret_scope = secret_dependent ? secret_scope : "";
 	// Producer-only dimensions stay empty for exchange-mode: at_unit/at_value,
 	// filter_bytes, order_by_hint, sample_hint, transaction_id. input_hash is set by
 	// the caller per memoization event.
@@ -361,8 +362,8 @@ bool BuildExchangeCacheKeyStatic(ClientContext &context, const VgiTableInOutBind
                                  const std::string &operator_kind) {
 	return BuildExchangeCacheKeyStaticFields(context, bd.attach_params, bd.function_name, bd.schema_name,
 	                                         bd.arguments.array ? bd.arguments.array->ToString() : "", bd.settings,
-	                                         projection_ids, bd.secret_dependent, key, catalog_name, catalog_version,
-	                                         reason, operator_kind);
+	                                         projection_ids, bd.secret_dependent, bd.bind_result.secret_scope, key,
+	                                         catalog_name, catalog_version, reason, operator_kind);
 }
 
 // ----------------------------------------------------------------------------

@@ -32,6 +32,11 @@ struct BindResult {
 	// metadata or the worker requested them during the two-phase bind. Secret
 	// names, scopes, and values deliberately do not escape the bind machinery.
 	bool secret_dependent = false;
+	// When secret_dependent: ComputeSecretCacheFingerprint over the exact secrets
+	// this bind sent to the worker — the ones init replays via bind_request_bytes.
+	// The result cache keys on it, so a changed or dropped secret misses. Empty
+	// when not secret_dependent, or when hashing failed (cache must then refuse).
+	std::string secret_scope;
 };
 
 // Result from init RPC call

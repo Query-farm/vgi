@@ -198,6 +198,9 @@ struct VgiScalarFunctionLocalState : public FunctionLocalState {
 	// Execute performs a fresh bind, so keep any newly discovered secret provenance
 	// here rather than mutating shared FunctionData from a parallel executor thread.
 	bool secret_dependent = false;
+	// That execute-time bind's BindResult::secret_scope: the cache key's secret
+	// fingerprint, since its secrets are the ones this connection's worker holds.
+	std::string secret_scope;
 	bool cache_key_built = false;
 	bool cache_eligible = false;
 	vgi::VgiResultCacheKey cache_static_key;

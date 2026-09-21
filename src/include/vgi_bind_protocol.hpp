@@ -92,12 +92,16 @@ std::vector<uint8_t> BuildBindRequestBytes(
 // `TableInfo.bind_result`), return a populated `BindResult` ready to hand
 // to PerformInit / cardinality / statistics. Skips the wire RPC entirely.
 //
+// `resolved_secrets` must be the map that built `bind_request_bytes`: it is
+// what init hands the worker, so it is what the result cache keys on.
+//
 // Throws IOException if the inlined blob is malformed or carries a
 // secret-scope request (which can only be resolved over the RPC path).
 // Callers should catch and fall back to the on-demand bind RPC.
 BindResult BuildBindResultFromInlinedBytes(std::vector<uint8_t> bind_request_bytes,
                                            const std::vector<uint8_t> &bind_response_bytes,
-                                           const std::string &worker_label, bool secret_dependent);
+                                           const std::string &worker_label, bool secret_dependent,
+                                           const std::map<std::string, std::map<std::string, Value>> &resolved_secrets);
 
 } // namespace vgi
 } // namespace duckdb

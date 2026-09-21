@@ -330,7 +330,8 @@ bool VgiResultCacheKey::operator==(const VgiResultCacheKey &o) const {
 	       implementation_version == o.implementation_version && catalog_version == o.catalog_version &&
 	       at_unit == o.at_unit && at_value == o.at_value && filter_bytes == o.filter_bytes &&
 	       order_by_hint == o.order_by_hint && sample_hint == o.sample_hint &&
-	       transaction_id == o.transaction_id && input_hash == o.input_hash && shape_key == o.shape_key;
+	       transaction_id == o.transaction_id && input_hash == o.input_hash && shape_key == o.shape_key &&
+	       secret_scope == o.secret_scope;
 }
 
 uint64_t VgiResultCacheKey::Hash() const {
@@ -354,6 +355,7 @@ uint64_t VgiResultCacheKey::Hash() const {
 	HashStr(seed, transaction_id);
 	HashStr(seed, input_hash);
 	HashStr(seed, shape_key);
+	HashStr(seed, secret_scope);
 	return seed;
 }
 
@@ -394,6 +396,13 @@ std::string VgiResultCacheKey::Fingerprint() const {
 	add(transaction_id);
 	add(input_hash);
 	add(shape_key);
+	// Appended only when set, so every key without a secret keeps the digest
+	// it had before this field existed (its on-disk entries stay reachable).
+	// Still injective: the length-prefixed stream decodes to a different number
+	// of fields, so no key with a secret_scope can collide with one without.
+	if (!secret_scope.empty()) {
+		add(secret_scope);
+	}
 	return Sha256Hex(m); // "" if SHA-256 unavailable → caller skips disk tier
 }
 

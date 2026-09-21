@@ -155,7 +155,11 @@ ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 # 1 partition-column fixture whose partition column is NOT first
 #   (trailing_partition_sales) — also exposed as a catalog table, so the
 #   catalog scan path is covered too. Back table/partition_columns.test.
-# = 168 portable baseline registrations.
+# 2 secret-dependent cacheable fixtures (secret_cache_nonce, a one-row producer
+#   declaring the vgi_example secret, ALSO an inline-bound data Table;
+#   secret_cached_lateral, a per-value blended map requesting it in on_bind) —
+#   results keyed on the secret's fingerprint. Back cache/secret_scope.test.
+# = 170 portable baseline registrations.
 #
 # SDK fixture workers may additionally ship implementation-specific backing
 # scans that are not part of the portable fixture surface. C# uses
@@ -180,7 +184,7 @@ WHERE database_name = 'example' AND function_type = 'table'
     'generated_sequence_scan'
   );
 ----
-168
+170
 
 query I
 SELECT CASE

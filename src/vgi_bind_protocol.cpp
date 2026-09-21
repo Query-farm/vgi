@@ -3,11 +3,19 @@
 
 #include "duckdb/common/exception.hpp"
 #include "vgi_arrow_utils.hpp"
+#include "vgi_cache_identity.hpp"
 #include "vgi_catalog_rpc.hpp"
 #include "vgi_rpc_types.hpp"
 
 namespace duckdb {
 namespace vgi {
+
+//! The result-cache identity of a bind's secrets: empty unless the bind
+//! depended on a secret, then a fingerprint of the exact set it resolved.
+static std::string SecretScopeFor(bool secret_dependent,
+                                  const std::map<std::string, std::map<std::string, Value>> &resolved_secrets) {
+	return secret_dependent ? ComputeSecretCacheFingerprint(resolved_secrets) : std::string();
+}
 
 std::vector<uint8_t> BuildBindRequestBytes(
     ClientContext &context,
@@ -73,7 +81,8 @@ std::vector<uint8_t> BuildBindRequestBytes(
 
 BindResult BuildBindResultFromInlinedBytes(std::vector<uint8_t> bind_request_bytes,
                                            const std::vector<uint8_t> &bind_response_bytes,
-                                           const std::string &worker_label, bool secret_dependent) {
+                                           const std::string &worker_label, bool secret_dependent,
+                                           const std::map<std::string, std::map<std::string, Value>> &resolved_secrets) {
 	// Deserialize the inlined BindResponse blob.
 	auto bind_response_batch = DeserializeFromIpcBytes(
 	    bind_response_bytes.data(), bind_response_bytes.size());
@@ -98,7 +107,7 @@ BindResult BuildBindResultFromInlinedBytes(std::vector<uint8_t> bind_request_byt
 	auto output_schema_bytes = SerializeSchemaToIpcBytes(bind_response.output_schema);
 
 	return BindResult {bind_response.output_schema, bind_response.opaque_data, std::move(bind_request_bytes),
-	                   output_schema_bytes, secret_dependent};
+	                   output_schema_bytes, secret_dependent, SecretScopeFor(secret_dependent, resolved_secrets)};
 }
 
 BindResult PerformBindProtocol(
@@ -173,8 +182,10 @@ BindResult PerformBindProtocol(
 	auto bind_response = ParseBindResponse(bind_response_batch, worker_label);
 	auto output_schema_bytes = SerializeSchemaToIpcBytes(bind_response.output_schema);
 
+	// `secrets` is now exactly what the final bind_request_bytes carried —
+	// including any scoped secrets merged in by the two-phase retry.
 	return BindResult {bind_response.output_schema, bind_response.opaque_data, std::move(bind_request_bytes),
-	                   output_schema_bytes, secret_dependent};
+	                   output_schema_bytes, secret_dependent, SecretScopeFor(secret_dependent, secrets)};
 }
 
 } // namespace vgi

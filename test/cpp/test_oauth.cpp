@@ -201,6 +201,74 @@ TEST_CASE("credential cache fingerprints fail closed on empty inputs", "[oauth][
 }
 
 //===--------------------------------------------------------------------===//
+// Secret cache fingerprint — keys a secret-dependent cached result
+//===--------------------------------------------------------------------===//
+
+namespace {
+using ResolvedSecrets = std::map<std::string, std::map<std::string, duckdb::Value>>;
+
+ResolvedSecrets OneSecret(const std::string &secret_string, const std::string &api_key) {
+	return {{"s", {{"type", duckdb::Value("vgi_example")},
+	               {"secret_string", duckdb::Value(secret_string)},
+	               {"api_key", duckdb::Value(api_key)},
+	               {"port", duckdb::Value::INTEGER(1001)}}}};
+}
+} // namespace
+
+TEST_CASE("secret cache fingerprints are opaque and stable", "[oauth][cache]") {
+	const auto fp = duckdb::vgi::ComputeSecretCacheFingerprint(OneSecret("sekrit", "key-1"));
+	REQUIRE(fp.size() == std::string("secrets:").size() + 64);
+	CHECK(fp.find("sekrit") == std::string::npos);
+	CHECK(fp.find("key-1") == std::string::npos);
+	CHECK(fp == duckdb::vgi::ComputeSecretCacheFingerprint(OneSecret("sekrit", "key-1")));
+}
+
+TEST_CASE("secret cache fingerprints change with every field", "[oauth][cache]") {
+	const auto base = duckdb::vgi::ComputeSecretCacheFingerprint(OneSecret("sekrit", "key-1"));
+	// A rotation of the value a worker reads, and of one it does not.
+	CHECK(base != duckdb::vgi::ComputeSecretCacheFingerprint(OneSecret("other", "key-1")));
+	CHECK(base != duckdb::vgi::ComputeSecretCacheFingerprint(OneSecret("sekrit", "key-2")));
+	// The same fields under another secret name are another secret.
+	auto renamed = OneSecret("sekrit", "key-1");
+	renamed["t"] = renamed["s"];
+	renamed.erase("s");
+	CHECK(base != duckdb::vgi::ComputeSecretCacheFingerprint(renamed));
+	// '1001' the VARCHAR is not 1001 the INTEGER.
+	auto retyped = OneSecret("sekrit", "key-1");
+	retyped["s"]["port"] = duckdb::Value("1001");
+	CHECK(base != duckdb::vgi::ComputeSecretCacheFingerprint(retyped));
+	// A NULL field is not the string "N" nor an absent field.
+	auto nulled = OneSecret("sekrit", "key-1");
+	nulled["s"]["api_key"] = duckdb::Value(duckdb::LogicalType::VARCHAR);
+	auto literal_n = OneSecret("sekrit", "N");
+	auto absent = OneSecret("sekrit", "key-1");
+	absent["s"].erase("api_key");
+	const auto fp_null = duckdb::vgi::ComputeSecretCacheFingerprint(nulled);
+	CHECK(fp_null != duckdb::vgi::ComputeSecretCacheFingerprint(literal_n));
+	CHECK(fp_null != duckdb::vgi::ComputeSecretCacheFingerprint(absent));
+}
+
+TEST_CASE("secret cache fingerprints ignore resolution order", "[oauth][cache]") {
+	// Two secrets resolved in either order are the same set.
+	ResolvedSecrets ab = OneSecret("a", "k");
+	ab["z"] = OneSecret("b", "k")["s"];
+	ResolvedSecrets ba;
+	ba["z"] = OneSecret("b", "k")["s"];
+	ba["s"] = OneSecret("a", "k")["s"];
+	CHECK(duckdb::vgi::ComputeSecretCacheFingerprint(ab) == duckdb::vgi::ComputeSecretCacheFingerprint(ba));
+}
+
+TEST_CASE("an unresolved secret still has a fingerprint of its own", "[oauth][cache]") {
+	// A declared secret that resolves to nothing must key its result apart from
+	// every resolved one — never fall back to "" (which callers treat as "do not
+	// cache") and never collide with a populated set.
+	const auto none = duckdb::vgi::ComputeSecretCacheFingerprint({});
+	REQUIRE_FALSE(none.empty());
+	CHECK(none != duckdb::vgi::ComputeSecretCacheFingerprint(OneSecret("sekrit", "key-1")));
+	CHECK(none != duckdb::vgi::ComputeSecretCacheFingerprint({{"s", {}}}));
+}
+
+//===--------------------------------------------------------------------===//
 // ParseAuthParams — the WWW-Authenticate challenge parser
 //===--------------------------------------------------------------------===//
 

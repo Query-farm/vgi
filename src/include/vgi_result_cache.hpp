@@ -141,6 +141,13 @@ struct VgiResultCacheKey {
 	// other. (A worker-output-schema fingerprint may be appended here when the on-disk
 	// backend lands, as defence-in-depth against shape drift across restart.)
 	std::string shape_key;
+	// SECRET identity: ComputeSecretCacheFingerprint of the secrets the bind sent
+	// to the worker. Empty for a function that uses no secret. A secret-dependent
+	// result is keyed on it so a rotated, re-scoped or dropped secret MISSES
+	// instead of serving what the old credential produced. A fingerprint only —
+	// secret values never enter a key. Kept separate from identity_scope because
+	// that one also names the disk shard and scopes FlushCatalog to a principal.
+	std::string secret_scope;
 
 	bool operator==(const VgiResultCacheKey &o) const;
 	// 64-bit bucket hash over all fields.

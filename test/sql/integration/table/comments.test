@@ -68,6 +68,7 @@ rowid_last	Table with row_id at column index 2
 rowid_middle	Table with row_id at column index 1
 rowid_string	Table with string row_id
 rowid_struct	Table with struct row_id
+secret_cache_nonce	One-row cacheable result keyed on the vgi_example secret
 secret_demo_table	Function-backed table over the secret-using secret_demo function
 ten_thousand_table	Function-backed table over the no-arg ten_thousand function
 test_same_name_table	Schema-disambiguation probe; the data-schema table

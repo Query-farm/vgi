@@ -85,6 +85,7 @@ random_bytes
 random_int
 return_secret_value
 scale_by_setting
+secret_cached_scalar
 secret_field
 sha256_hex
 smart_format
@@ -420,7 +421,7 @@ sum_values	ANY
 # non-varargs additions described above. The named-argument probe is asserted
 # separately in the inventory section.
 query I
-SELECT COUNT(*) BETWEEN 46 AND 49
+SELECT COUNT(*) BETWEEN 47 AND 50
 FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'scalar' AND varargs IS NULL
   AND function_name <> 'argument_names_probe';
@@ -429,7 +430,7 @@ true
 
 # ============================================================================
 # Stability
-# At least the 49 portable scalar rows are CONSISTENT; the Rust-only additions
+# At least the 50 portable scalar rows are CONSISTENT; the Rust-only additions
 # are CONSISTENT too. bernoulli and random_int are VOLATILE;
 # query_seed is CONSISTENT_WITHIN_QUERY. All three stability variants are
 # emitted by a fixture so the wire enum stays covered (and other-language
@@ -446,7 +447,7 @@ bernoulli
 random_int
 
 query I
-SELECT COUNT(*) BETWEEN 49 AND 52
+SELECT COUNT(*) BETWEEN 50 AND 53
 FROM duckdb_functions()
 WHERE database_name = 'example' AND function_type = 'scalar' AND stability = 'CONSISTENT'
   AND function_name <> 'argument_names_probe';

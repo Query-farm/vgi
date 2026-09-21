@@ -304,7 +304,8 @@ void PerformVgiTableFunctionBind(ClientContext &context, VgiTableFunctionBindDat
 				    /*copy_from=*/nullptr, /*copy_to=*/nullptr, bind_data.schema_name);
 				auto bind_result =
 				    vgi::BuildBindResultFromInlinedBytes(std::move(bind_request_bytes), *tinfo.bind_result,
-				                                         bind_data.worker_path(), !bind_data.required_secrets.empty());
+				                                         bind_data.worker_path(), !bind_data.required_secrets.empty(),
+				                                         resolved_secrets);
 
 				VGI_LOG(context, "table_function.inline_bind_used",
 				        {{"worker_path", bind_data.worker_path()},
@@ -1691,11 +1692,13 @@ CacheEligibility EvaluateCacheEligibility(ClientContext &context,
 		e.ineligible_reason = "disabled_attach";
 		return e;
 	}
-	// Secret values are intentionally neither serialized into the key nor retained
-	// by the cache. Any declared secret dependency makes the result sensitive to
-	// rotation/removal, so probing or storing it would serve stale credentials.
-	if (bind_data.secret_dependent) {
-		e.ineligible_reason = "secret_dependent";
+	// A secret-dependent result is keyed on a fingerprint of the secrets its bind
+	// resolved (never the values) — the bind whose request init replays to the
+	// worker — so a rotated or dropped secret misses. Without that fingerprint
+	// there is nothing to key on: fail closed.
+	const std::string &secret_scope = bind_data.bind_result.secret_scope;
+	if (bind_data.secret_dependent && secret_scope.empty()) {
+		e.ineligible_reason = "secret_fingerprint_missing";
 		return e;
 	}
 	// Identity + version dimensions. Two paths (M5 adds the direct one):
@@ -1816,6 +1819,7 @@ CacheEligibility EvaluateCacheEligibility(ClientContext &context,
 	e.key.catalog_version = version;
 	e.key.at_unit = bind_data.at_unit;
 	e.key.at_value = bind_data.at_value;
+	e.key.secret_scope = bind_data.secret_dependent ? secret_scope : "";
 	// Static pushdown key components (M3).
 	e.key.filter_bytes = std::move(filter_key);
 	e.key.order_by_hint = std::move(order_key);
