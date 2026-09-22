@@ -1014,36 +1014,38 @@ TableStorageInfo VgiTableEntry::GetStorageInfo(ClientContext &context) {
 	// Constraint indices from the worker are in Arrow schema space (which includes
 	// the row_id column). DuckDB's physical column space excludes virtual columns
 	// like row_id. Adjust by shifting indices down when they're after row_id.
-	auto adjust_col = [&](int col) -> column_t {
-		auto adjusted = col;
-		if (table_info_.row_id_column >= 0 && col > table_info_.row_id_column) {
-			adjusted--;
-		} else if (table_info_.row_id_column >= 0 && col == table_info_.row_id_column) {
-			// row_id itself should never be a constraint column
-			throw InternalException("row_id column cannot be part of a constraint");
-		}
-		return NumericCast<column_t>(adjusted);
-	};
-
-	for (auto &pk : table_info_.primary_key_constraints) {
+	//
+	// The constraint lists are worker metadata, so a row_id column inside one is
+	// bad input, not an invariant: it is skipped, exactly as the CREATE-side
+	// conversion in vgi_catalog_api.cpp does, and a key left with no columns is
+	// dropped. (This used to throw InternalException, and since duckdb_tables()
+	// calls GetStorageInfo for every table, one worker could invalidate the
+	// database for anyone listing tables.)
+	auto add_index = [&](const std::vector<int> &cols, bool is_primary) {
 		IndexInfo idx_info;
 		idx_info.is_unique = true;
-		idx_info.is_primary = true;
+		idx_info.is_primary = is_primary;
 		idx_info.is_foreign = false;
-		for (auto col : pk) {
-			idx_info.column_set.insert(adjust_col(col));
+		for (auto col : cols) {
+			if (table_info_.row_id_column >= 0 && col == table_info_.row_id_column) {
+				continue;
+			}
+			auto adjusted = (table_info_.row_id_column >= 0 && col > table_info_.row_id_column) ? col - 1 : col;
+			if (adjusted < 0) {
+				throw InvalidInputException("VGI: %s constraint on table '%s' references column index %d",
+				                            is_primary ? "PRIMARY KEY" : "UNIQUE", name, col);
+			}
+			idx_info.column_set.insert(NumericCast<column_t>(adjusted));
 		}
-		info.index_info.push_back(std::move(idx_info));
+		if (!idx_info.column_set.empty()) {
+			info.index_info.push_back(std::move(idx_info));
+		}
+	};
+	for (auto &pk : table_info_.primary_key_constraints) {
+		add_index(pk, true);
 	}
 	for (auto &unique : table_info_.unique_constraints) {
-		IndexInfo idx_info;
-		idx_info.is_unique = true;
-		idx_info.is_primary = false;
-		idx_info.is_foreign = false;
-		for (auto col : unique) {
-			idx_info.column_set.insert(adjust_col(col));
-		}
-		info.index_info.push_back(std::move(idx_info));
+		add_index(unique, false);
 	}
 
 	return info;

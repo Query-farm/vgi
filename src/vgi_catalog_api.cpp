@@ -2812,7 +2812,10 @@ CreateTableInfo CreateTableInfoFromVgiTable(ClientContext &context, VgiTableInfo
 			}
 			col_names.push_back(create_info.columns.GetColumn(LogicalIndex(adjusted)).Name());
 		}
-		create_info.constraints.push_back(make_uniq<UniqueConstraint>(std::move(col_names), false));
+		// A key made only of the (skipped) row_id column has nothing left to constrain.
+		if (!col_names.empty()) {
+			create_info.constraints.push_back(make_uniq<UniqueConstraint>(std::move(col_names), false));
+		}
 	}
 
 	// Apply PRIMARY KEY constraints (UniqueConstraint with is_primary_key=true)
@@ -2835,7 +2838,9 @@ CreateTableInfo CreateTableInfoFromVgiTable(ClientContext &context, VgiTableInfo
 			}
 			col_names.push_back(create_info.columns.GetColumn(LogicalIndex(adjusted)).Name());
 		}
-		create_info.constraints.push_back(make_uniq<UniqueConstraint>(std::move(col_names), true));
+		if (!col_names.empty()) {
+			create_info.constraints.push_back(make_uniq<UniqueConstraint>(std::move(col_names), true));
+		}
 	}
 
 	// Apply CHECK constraints

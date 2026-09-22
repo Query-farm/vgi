@@ -1,0 +1,51 @@
+# name: test/sql/integration/table/rowid_constraint_metadata.test
+# description: Worker constraint metadata naming the row_id column is bad input, not a fatal error
+# group: [vgi_integration_table]
+
+# test/support/rowid_constraint_worker.py declares:
+#   items               PRIMARY KEY (rowid)
+#   items_no_returning  PRIMARY KEY (id, rowid), UNIQUE (rowid, name)
+# The client used to raise an InternalException from GetStorageInfo for these,
+# and because duckdb_tables() calls it for every table, listing tables
+# invalidated the whole database.
+
+require-env VGI_ROWID_CONSTRAINT_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'simple_writable' AS w (TYPE vgi, LOCATION '${VGI_ROWID_CONSTRAINT_WORKER}');
+
+query T
+SELECT table_name FROM duckdb_tables() WHERE database_name = 'w' ORDER BY 1;
+----
+items
+items_broken_returning
+items_insert_only
+items_no_returning
+
+# row_id is skipped in a key, and a key left empty is dropped.
+query TTT
+SELECT table_name, constraint_type, constraint_column_names
+FROM duckdb_constraints()
+WHERE database_name = 'w' AND constraint_type IN ('PRIMARY KEY', 'UNIQUE')
+ORDER BY ALL;
+----
+items_no_returning	PRIMARY KEY	[id]
+items_no_returning	UNIQUE	[name]
+
+# The surviving key still satisfies DuckDB's ON CONFLICT binder...
+statement ok
+EXPLAIN INSERT INTO w.main.items_no_returning VALUES (1, 'a', 1) ON CONFLICT (id) DO NOTHING;
+
+# ...and the dropped one is simply absent.
+statement error
+INSERT INTO w.main.items VALUES (1, 'a', 1) ON CONFLICT DO NOTHING;
+----
+There are no UNIQUE/PRIMARY KEY constraints that refer to this table
+
+# The database is still usable.
+query I
+SELECT 42;
+----
+42
