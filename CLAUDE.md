@@ -1085,8 +1085,20 @@ of string data for `full` (a pure string-transfer `count(*)` roughly doubles,
 real queries dilute it). Hostile fixture: `test/support/malformed_batch_worker.py`
 (`VGI_MALFORMED_BATCH_WORKER`); test: `table/malformed_worker_batches.test` —
 never read those batches with validation `none`, that is a real OOB read.
-Not covered yet: a worker sending data whose *type* differs from what it declared
-at bind (type confusion) — that needs a schema-vs-bind check.
+**Type-confusion guard.** Beyond buffer contents, the producer table-function
+path also checks that a batch's column *types* match what the worker declared at
+bind (`ValidateWireBatchTypes` in `InstallBatch`, gated by the same setting;
+skipped on a cached-replay connection — `IFunctionConnection::IsCachedReplay()`).
+`ArrowToDuckDB` reads each buffer using the BIND-TIME type
+(`arrow_conversion.cpp`), so a batch whose wire type disagrees (e.g. utf8 labeled
+int64, with valid utf8 buffers that pass `ValidateFull`) would be a misread, not
+a cast. A conforming worker can't trigger it (vgi-rpc's producer writer is bound
+to `output_schema`); it defends against a hostile / non-conforming worker.
+Expected types come from `bind_result.output_schema` indexed by the scan's
+`projection_ids` (empty = full schema). Still only on the producer path — the
+scalar / aggregate / table-in-out / buffered / write conversions
+(`ArrowToDuckDB` with their own bind schema) are a documented follow-up; the
+buffer-content check above already covers their malformed-buffer cases.
 
 ## Query Farm Telemetry
 

@@ -99,6 +99,14 @@ public:
 	// read this split's init response as its own stream header.
 	virtual void ResetForNextSplit() = 0;
 
+	//! True only for the cached-replay connection, which streams our own captured
+	//! bytes rather than a live worker's. Callers skip live-worker-only checks
+	//! (e.g. wire-type conformance) for it: the bytes were validated at capture,
+	//! and the result cache may replay a projection subset from a wider entry.
+	virtual bool IsCachedReplay() const {
+		return false;
+	}
+
 	//! Mark this connection unusable because a split init failed partway.
 	//!
 	//! ResetForNextSplit clears the in-flight flags before the next init is

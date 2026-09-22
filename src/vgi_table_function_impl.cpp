@@ -5,6 +5,7 @@
 #include <pthread.h>
 #include <unistd.h>
 #include "vgi_wasm_async_pool.hpp"
+#include "vgi_batch_validation.hpp"
 #endif
 
 #include "storage/vgi_table_entry.hpp"
@@ -3457,6 +3458,37 @@ static bool InstallBatch(ClientContext &context, const VgiTableFunctionBindData 
 			local_state.current_batch_index =
 			    global_state.synthetic_batch_index.fetch_add(1, std::memory_order_relaxed);
 		}
+	}
+
+	// Type-confusion guard: verify the wire batch's column types match the types
+	// the worker declared at bind. ArrowToDuckDB reads each buffer using the
+	// BIND-TIME type, so a type mismatch is a misread, not a cast. The wire batch
+	// carries the worker's projected columns; projection_ids[i] indexes the full
+	// declared output_schema for wire column i (empty => full schema, all columns).
+	// Gated by vgi_validate_worker_batches (NONE opts out, like the buffer check).
+	// Skip on a cache serve: a CachedReplayConnection replays our own captured
+	// bytes (validated at capture), and the result cache can serve a projection
+	// subset from a wider entry, so the replay batch need not match this query's
+	// projection_ids. Only a live worker batch is checked.
+	if (!local_state.connection()->IsCachedReplay() &&
+	    GetWorkerBatchValidation(&context) != WorkerBatchValidation::NONE && bind_data.bind_result.output_schema) {
+		const auto &declared = *bind_data.bind_result.output_schema;
+		const auto &proj = global_state.projection_ids;
+		std::vector<std::shared_ptr<arrow::DataType>> expected;
+		if (proj.empty()) {
+			expected.reserve(declared.num_fields());
+			for (int i = 0; i < declared.num_fields(); i++) {
+				expected.push_back(declared.field(i)->type());
+			}
+		} else {
+			expected.reserve(proj.size());
+			for (int32_t original : proj) {
+				expected.push_back(original >= 0 && original < declared.num_fields()
+				                       ? declared.field(original)->type()
+				                       : nullptr);
+			}
+		}
+		ValidateWireBatchTypes(*arrow_batch, expected, bind_data.worker_path(), bind_data.function_name);
 	}
 
 	auto chunk = make_uniq<ArrowArrayWrapper>();

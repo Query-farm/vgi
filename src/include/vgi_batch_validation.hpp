@@ -12,10 +12,14 @@
 // memory returned as query data. Every batch that enters from a worker is
 // therefore validated at the level `vgi_validate_worker_batches` selects.
 
+#include <memory>
 #include <string>
+#include <vector>
 
 namespace arrow {
 class RecordBatch;
+class DataType;
+class Schema;
 }
 
 namespace duckdb {
@@ -46,6 +50,17 @@ WorkerBatchValidation GetWorkerBatchValidation(ClientContext *context);
 // Validate `batch` at `level`; throw IOException naming `worker` if it is
 // malformed. A null batch is ignored.
 void ValidateWorkerBatch(const arrow::RecordBatch *batch, WorkerBatchValidation level, const std::string &worker);
+
+// Throw IOException if `batch`'s column types do not match `expected` (one entry
+// per wire column; type structure only -- nullability and field metadata are
+// ignored, matching what ArrowToDuckDB actually reads). A column-count mismatch
+// is an error too. This catches a worker whose scan-time batch type disagrees
+// with the type it declared at bind: ArrowToDuckDB reads each buffer using the
+// BIND-TIME type (arrow_conversion.cpp), so a mismatch is a type-confusion
+// misread, not a clean cast. Cheap (O(columns), no data scan).
+void ValidateWireBatchTypes(const arrow::RecordBatch &batch,
+                            const std::vector<std::shared_ptr<arrow::DataType>> &expected,
+                            const std::string &worker, const std::string &function);
 
 // Convenience: validate at the level configured for `context`.
 inline void ValidateWorkerBatch(ClientContext *context, const arrow::RecordBatch *batch, const std::string &worker) {

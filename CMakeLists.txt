@@ -467,6 +467,7 @@ if((BUILD_VGI_UNIT_TESTS OR DEFINED ENV{BUILD_VGI_UNIT_TESTS}) AND NOT WIN32)
     test/cpp/test_launcher_e2e.cpp
     test/cpp/test_launcher_flock_parity.cpp
     test/cpp/test_transport_detection.cpp
+    test/cpp/test_batch_validation.cpp
     test/cpp/test_container_runtime.cpp
     test/cpp/test_oauth.cpp
     test/cpp/test_telemetry.cpp

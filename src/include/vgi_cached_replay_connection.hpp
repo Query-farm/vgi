@@ -24,6 +24,11 @@ namespace vgi {
 
 class CachedReplayConnection : public IFunctionConnection {
 public:
+	bool IsCachedReplay() const override {
+		return true;
+	}
+
+public:
 	// Replays every batch of `entry` in a single ordered stream. When any
 	// cached batch carries a batch_index, batches are replayed in
 	// non-decreasing batch_index order (InstallBatch enforces per-stream
