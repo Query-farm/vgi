@@ -172,5 +172,41 @@ WHERE id = 'id5' AND bbox.xmin > 0 AND bbox.ymin > 0 AND bbox.ymax <= 100;
 ----
 Missing: bbox.xmax.
 
+# ============================================================================
+# Native delegation relies on a VGI optimizer extension replacing its
+# placeholder. With optimizer extensions switched off (settable by any user)
+# the bind refuses with an ordinary error; the database is NOT invalidated.
+# ============================================================================
+
+statement ok
+SET disabled_optimizers = 'extension';
+
+statement error
+SELECT count(*) FROM example.data.rff_parquet
+WHERE bbox.xmin >= 50 AND bbox.ymin > 0 AND bbox.ymax <= 100 AND bbox.xmax <= 100.2;
+----
+needs DuckDB's optimizer extensions, which are disabled
+
+statement ok
+RESET disabled_optimizers;
+
+statement ok
+PRAGMA disable_optimizer;
+
+statement error
+SELECT count(*) FROM example.data.rff_parquet
+WHERE bbox.xmin >= 50 AND bbox.ymin > 0 AND bbox.ymax <= 100 AND bbox.xmax <= 100.2;
+----
+needs DuckDB's optimizer, which is disabled
+
+statement ok
+PRAGMA enable_optimizer;
+
+query I
+SELECT count(*) FROM example.data.rff_parquet
+WHERE bbox.xmin >= 50 AND bbox.ymin > 0 AND bbox.ymax <= 100 AND bbox.xmax <= 100.2;
+----
+50
+
 statement ok
 DETACH example;

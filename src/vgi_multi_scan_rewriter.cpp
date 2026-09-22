@@ -32,6 +32,7 @@
 #include "duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp"
 #include "duckdb/catalog/entry_lookup_info.hpp"
 #include "duckdb/common/types/value.hpp"
+#include "duckdb/main/client_config.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/extension_helper.hpp"
 #include "duckdb/optimizer/column_binding_replacer.hpp"
@@ -63,11 +64,27 @@ namespace vgi {
 // Marker placeholder function (never executed; rewriter must replace it)
 // ---------------------------------------------------------------------------
 
+// Bind refuses when the rewriter cannot run (RequireVgiOptimizerExtensions), so
+// this is a backstop. It must stay an ordinary error: an InternalException
+// invalidates the whole database, and this is reachable from user settings.
 static void MultiBranchMarkerExecute(ClientContext &, TableFunctionInput &, DataChunk &) {
-	throw InternalException(
+	throw InvalidInputException(
 	    "VgiMultiScanRewriter did not fire — multi-branch placeholder reached execution. "
-	    "Check that the vgi_multi_branch_scans setting is true and that the optimizer "
-	    "extension is registered. This is a bug — please report it.");
+	    "Check that the vgi_multi_branch_scans setting is true, that the optimizer is enabled, "
+	    "and that 'extension' is not in disabled_optimizers.");
+}
+
+void RequireVgiOptimizerExtensions(ClientContext &context, const std::string &what) {
+	if (!ClientConfig::GetConfig(context).enable_optimizer) {
+		throw BinderException("%s needs DuckDB's optimizer, which is disabled. Re-enable it with "
+		                      "PRAGMA enable_optimizer.",
+		                      what);
+	}
+	if (Optimizer::OptimizerDisabled(context, OptimizerType::EXTENSION)) {
+		throw BinderException("%s needs DuckDB's optimizer extensions, which are disabled ('extension' is in "
+		                      "disabled_optimizers). Remove it from disabled_optimizers.",
+		                      what);
+	}
 }
 
 TableFunction MakeMultiBranchMarkerFunction() {

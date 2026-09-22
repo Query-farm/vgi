@@ -1,0 +1,44 @@
+# name: test/sql/integration/catalog/multi_branch_optimizer_disabled.test
+# description: Multi-branch scans refuse cleanly when optimizer extensions are off, instead of invalidating the database
+# group: [vgi_integration_catalog]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+# The multi-branch placeholder is only valid if VgiMultiScanRewriter replaces
+# it. Any user can switch optimizer extensions off; that used to let the
+# placeholder reach execution and raise an InternalException, which
+# invalidated the whole database.
+statement ok
+SET disabled_optimizers = 'extension';
+
+statement error
+SELECT count(*) FROM example.data.multi_branch_numbers;
+----
+Multi-branch VGI table data.multi_branch_numbers needs DuckDB's optimizer extensions, which are disabled
+
+statement ok
+RESET disabled_optimizers;
+
+statement ok
+PRAGMA disable_optimizer;
+
+statement error
+SELECT count(*) FROM example.data.multi_branch_numbers;
+----
+needs DuckDB's optimizer, which is disabled
+
+statement ok
+PRAGMA enable_optimizer;
+
+# The database is still usable.
+query I
+SELECT count(*) FROM example.data.multi_branch_numbers;
+----
+100

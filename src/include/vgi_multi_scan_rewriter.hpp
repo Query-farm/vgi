@@ -79,6 +79,14 @@ struct VgiMultiBranchMarkerBindData : public TableFunctionData {
 // executed.
 TableFunction MakeMultiBranchMarkerFunction();
 
+// The multi-branch and native-delegation placeholders are only valid if one of
+// VGI's optimizer extensions replaces them before execution. DuckDB skips every
+// optimizer extension when the optimizer is off (PRAGMA disable_optimizer) or
+// when 'extension' is in disabled_optimizers — both settable by any user. Call
+// before returning a placeholder: throws BinderException naming `what` and the
+// setting to change, instead of letting the placeholder reach execution.
+void RequireVgiOptimizerExtensions(ClientContext &context, const std::string &what);
+
 // Register the optimizer extension. Called from VgiExtension::Load().
 void RegisterVgiMultiScanRewriter(DBConfig &config);
 

@@ -33,11 +33,13 @@ namespace {
 // Marker placeholder TableFunction — never executed; the optimizer
 // extension must replace it. Mirrors MakeMultiBranchMarkerFunction in
 // vgi_multi_scan_rewriter.cpp.
+// Backstop only (bind refuses via RequireVgiOptimizerExtensions); an ordinary
+// error because an InternalException would invalidate the database.
 void NativeDelegationMarkerExecute(ClientContext &, TableFunctionInput &, DataChunk &) {
-	throw InternalException(
+	throw InvalidInputException(
 	    "VgiRequiredFiltersOptimizer did not fire — native-delegation placeholder "
-	    "reached execution. Check that the optimizer extension is registered and "
-	    "that no other pass dropped the marker. This is a bug — please report it.");
+	    "reached execution. Check that the optimizer is enabled and that 'extension' "
+	    "is not in disabled_optimizers.");
 }
 
 }  // namespace
@@ -444,6 +446,9 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 				    static_cast<int>(branches_result.branches.size()));
 			}
 
+			vgi::RequireVgiOptimizerExtensions(
+			    context, StringUtil::Format("Multi-branch VGI table %s.%s", ParentSchema().name, name));
+
 			// Return the marker placeholder TableFunction. VgiMultiScanRewriter
 			// (pre_optimize_function in vgi_extension.cpp) detects the marker
 			// bind_data and rewrites the LogicalGet into a LogicalSetOperation
@@ -601,6 +606,8 @@ TableFunction VgiTableEntry::GetScanFunctionImpl(ClientContext &context, unique_
 	}
 
 	if (from_system_catalog && func_entry) {
+		vgi::RequireVgiOptimizerExtensions(context, StringUtil::Format("VGI table %s.%s (native delegation to '%s')",
+		                                                          ParentSchema().name, name, scan_result.function_name));
 		// Native delegation: bind the system function eagerly here, then return
 		// a marker carrying the bound function + bind_data + return shapes.
 		// VgiRequiredFiltersOptimizer (vgi_extension.cpp) enforces this table's
