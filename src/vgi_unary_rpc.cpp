@@ -208,7 +208,7 @@ UnaryResponseResult InvokePooledUnaryRpc(const UnaryRpcOptions &opts, const std:
 #if !defined(__EMSCRIPTEN__)
 	if (IsIrohTransport(opts.worker_path)) {
 		if (!opts.iroh) {
-			throw InternalException("vgi: native iroh:// unary RPC is missing its ATTACH configuration");
+			throw InvalidInputException("vgi: native iroh:// unary RPC is missing its ATTACH configuration");
 		}
 		auto duplex = OpenIrohArrowMuxStream(opts.iroh, &opts.context);
 		if (params) {

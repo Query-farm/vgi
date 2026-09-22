@@ -369,7 +369,7 @@ static std::string HttpPostArrowIpcInternal(
 		response_body = out_response->browser->body;
 #else
 		if (!iroh_config) {
-			throw InternalException("vgi: native httpi:// request is missing its ATTACH configuration");
+			throw InvalidInputException("vgi: native httpi:// request is missing its ATTACH configuration");
 		}
 		auto parsed = ParseHttpiUrl(url);
 		out_response->iroh = PerformIrohHttpRequest(
@@ -1230,7 +1230,7 @@ ServerCapabilities HttpDiscoverCapabilities(ClientContext &context, const std::s
 		return ParseCapabilityHeaders(response);
 #else
 		if (!iroh_config) {
-			throw InternalException("vgi: native httpi:// capability discovery is missing its ATTACH configuration");
+			throw InvalidInputException("vgi: native httpi:// capability discovery is missing its ATTACH configuration");
 		}
 		auto parsed = ParseHttpiUrl(url);
 		RpcHttpResponse response;

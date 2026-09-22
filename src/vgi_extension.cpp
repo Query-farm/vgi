@@ -1625,11 +1625,7 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	string oauth_cache_mode;
 	string bearer_token;
 	string tcp_proxy;
-	string iroh_secret_key;
-	std::vector<string> iroh_relay_urls;
-	bool iroh_no_relay = false;
-	string iroh_remote_relay_url;
-	std::vector<string> iroh_direct_addresses;
+	vgi::IrohOptions iroh_options; // iroh_* options (shared parser with vgi_catalogs)
 	string data_version_spec;
 	string implementation_version;
 	// Per-LOCATION launcher overrides — only valid with ``launch:`` LOCATIONs;
@@ -1734,62 +1730,8 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 			if (tcp_proxy.empty()) {
 				throw BinderException("tcp_proxy, if set, must not be empty");
 			}
-		} else if (lower_name == "iroh_secret_key") {
-			iroh_secret_key = value.ToString();
-			if (iroh_secret_key.empty()) {
-				throw BinderException("iroh_secret_key must not be empty");
-			}
-		} else if (lower_name == "iroh_no_relay") {
-			iroh_no_relay = value.DefaultCastAs(LogicalType::BOOLEAN).GetValue<bool>();
-		} else if (lower_name == "iroh_relay_urls") {
-			iroh_relay_urls.clear();
-			if (value.type().id() == LogicalTypeId::LIST || value.type().id() == LogicalTypeId::ARRAY) {
-				for (const auto &child : ListValue::GetChildren(value)) {
-					iroh_relay_urls.push_back(child.DefaultCastAs(LogicalType::VARCHAR).ToString());
-				}
-			} else {
-				// Connection-string values are VARCHAR. Accept a comma-separated
-				// spelling there while the typed ATTACH form uses VARCHAR[].
-				auto encoded = value.ToString();
-				size_t start = 0;
-				while (start <= encoded.size()) {
-					auto comma = encoded.find(',', start);
-					auto relay = encoded.substr(start, comma == string::npos ? string::npos : comma - start);
-					if (!relay.empty()) {
-						iroh_relay_urls.push_back(std::move(relay));
-					}
-					if (comma == string::npos) {
-						break;
-					}
-					start = comma + 1;
-				}
-			}
-		} else if (lower_name == "iroh_remote_relay_url") {
-			iroh_remote_relay_url = value.ToString();
-			if (iroh_remote_relay_url.empty()) {
-				throw BinderException("iroh_remote_relay_url must not be empty");
-			}
-		} else if (lower_name == "iroh_direct_addresses") {
-			iroh_direct_addresses.clear();
-			if (value.type().id() == LogicalTypeId::LIST || value.type().id() == LogicalTypeId::ARRAY) {
-				for (const auto &child : ListValue::GetChildren(value)) {
-					iroh_direct_addresses.push_back(child.DefaultCastAs(LogicalType::VARCHAR).ToString());
-				}
-			} else {
-				auto encoded = value.ToString();
-				size_t start = 0;
-				while (start <= encoded.size()) {
-					auto comma = encoded.find(',', start);
-					auto address = encoded.substr(start, comma == string::npos ? string::npos : comma - start);
-					if (!address.empty()) {
-						iroh_direct_addresses.push_back(std::move(address));
-					}
-					if (comma == string::npos) {
-						break;
-					}
-					start = comma + 1;
-				}
-			}
+		} else if (vgi::ApplyIrohOption(lower_name, value, iroh_options)) {
+			// iroh_* options: parsed by the shared helper (see vgi_iroh_config.hpp).
 		} else if (lower_name == "data_version_spec") {
 			data_version_spec = value.ToString();
 		} else if (lower_name == "implementation_version") {
@@ -1921,37 +1863,11 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 		throw BinderException("tcp_proxy is only valid for tcp:// LOCATIONs");
 	}
 
-	std::shared_ptr<vgi::IrohClientConfig> iroh_config;
 	const bool is_iroh_location = vgi::IsIrohTransport(worker_path) || vgi::IsHttpiTransport(worker_path);
-	if (!is_iroh_location &&
-	    (!iroh_secret_key.empty() || !iroh_relay_urls.empty() || iroh_no_relay ||
-	     !iroh_remote_relay_url.empty() || !iroh_direct_addresses.empty())) {
-		throw BinderException("Iroh ATTACH options require an "
-		                      "iroh:// or httpi:// LOCATION");
-	}
 	if (is_iroh_location) {
 		use_pool = false; // Iroh owns its endpoint/QUIC connection pool.
-#if defined(__EMSCRIPTEN__)
-		if (!iroh_secret_key.empty() || !iroh_relay_urls.empty() || iroh_no_relay ||
-		    !iroh_remote_relay_url.empty() || !iroh_direct_addresses.empty()) {
-			throw BinderException("DuckDB-WASM Iroh identity and address resolution are owned by the application adapter");
-		}
-#else
-		auto positive_setting = [&](const char *name, int64_t fallback) -> uint64_t {
-			Value value;
-			auto configured = context.TryGetCurrentSetting(name, value) ? value.GetValue<int64_t>() : fallback;
-			if (configured <= 0) {
-				throw BinderException("%s must be greater than zero", name);
-			}
-			return static_cast<uint64_t>(configured);
-		};
-		iroh_config = vgi::ResolveIrohClientConfig(
-		    context, worker_path, std::move(iroh_secret_key), std::move(iroh_relay_urls), iroh_no_relay,
-		    std::move(iroh_remote_relay_url), std::move(iroh_direct_addresses),
-		    positive_setting("vgi_iroh_connect_timeout_seconds", 30),
-		    positive_setting("vgi_iroh_io_timeout_seconds", 300));
-#endif
 	}
+	auto iroh_config = vgi::BuildIrohClientConfigForLocation(context, worker_path, std::move(iroh_options), "ATTACH");
 
 	// Telemetry capture — the event fires only on the success path, near the
 	// return. Snapshot the raw (pre-rewrite) location + the user's options here,

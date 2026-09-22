@@ -4,6 +4,7 @@
 #include "vgi_logging.hpp"
 #include "vgi_transport.hpp"
 #include "vgi_location_policy.hpp"
+#include "vgi_iroh_config.hpp"
 
 #include <string>
 #include <vector>
@@ -22,6 +23,9 @@ namespace {
 
 struct VgiCatalogsBindData : public TableFunctionData {
 	std::string worker_path;
+	// Built at bind for iroh:// / httpi:// (native): the same configuration an
+	// ATTACH of this LOCATION with the same iroh_* options would use.
+	std::shared_ptr<vgi::IrohClientConfig> iroh;
 };
 
 struct VgiCatalogsGlobalState : public GlobalTableFunctionState {
@@ -43,6 +47,13 @@ static unique_ptr<FunctionData> VgiCatalogsBind(ClientContext &context, TableFun
 	// is actually contacted) so a statement prepared before the policy was
 	// narrowed cannot run under EXECUTE without being re-checked.
 	vgi::CheckLocationPolicy(context, bind_data->worker_path, vgi::LocationEntryPoint::VGI_CATALOGS);
+
+	vgi::IrohOptions iroh_options;
+	for (auto &kv : input.named_parameters) {
+		vgi::ApplyIrohOption(StringUtil::Lower(kv.first), kv.second, iroh_options);
+	}
+	bind_data->iroh =
+	    vgi::BuildIrohClientConfigForLocation(context, bind_data->worker_path, std::move(iroh_options), "vgi_catalogs()");
 
 	if (vgi::IsHttpTransport(bind_data->worker_path)) {
 		auto &db = DatabaseInstance::GetDatabase(context);
@@ -99,7 +110,9 @@ static unique_ptr<GlobalTableFunctionState> VgiCatalogsInitGlobal(ClientContext 
 	auto state = make_uniq<VgiCatalogsGlobalState>();
 
 	vgi::CheckLocationPolicy(context, bind_data.worker_path, vgi::LocationEntryPoint::VGI_CATALOGS);
-	state->catalogs = vgi::InvokeCatalogs(bind_data.worker_path, context);
+	state->catalogs = vgi::InvokeCatalogs(bind_data.worker_path, context, /*worker_debug=*/false, /*use_pool=*/true,
+	                                      /*auth=*/nullptr, std::nullopt, std::nullopt, /*worker_artifact_anchor=*/nullptr,
+	                                      /*tcp_proxy=*/"", bind_data.iroh);
 
 	VGI_LOG(context, "vgi_catalogs.init",
 	        {{"worker_path", bind_data.worker_path}, {"num_catalogs", std::to_string(state->catalogs.size())}});
@@ -196,6 +209,15 @@ static InsertionOrderPreservingMap<string> VgiCatalogsToString(TableFunctionToSt
 
 void RegisterVgiCatalogsFunction(ExtensionLoader &loader) {
 	TableFunction func("vgi_catalogs", {LogicalType::VARCHAR}, VgiCatalogsScan, VgiCatalogsBind, VgiCatalogsInitGlobal);
+
+	// Optional iroh_* options, with the same names and meaning as the ATTACH
+	// options, for iroh:// / httpi:// LOCATIONs. Without them the default
+	// configuration applies (scoped TYPE iroh secret, else ephemeral identity).
+	func.named_parameters["iroh_secret_key"] = LogicalType::VARCHAR;
+	func.named_parameters["iroh_relay_urls"] = LogicalType::LIST(LogicalType::VARCHAR);
+	func.named_parameters["iroh_no_relay"] = LogicalType::BOOLEAN;
+	func.named_parameters["iroh_remote_relay_url"] = LogicalType::VARCHAR;
+	func.named_parameters["iroh_direct_addresses"] = LogicalType::LIST(LogicalType::VARCHAR);
 
 	// Enable EXPLAIN output
 	func.to_string = VgiCatalogsToString;

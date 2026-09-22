@@ -9,6 +9,7 @@
 namespace duckdb {
 
 class ClientContext;
+class Value;
 
 namespace vgi {
 
@@ -77,6 +78,37 @@ ResolveIrohClientConfig(ClientContext &context, const std::string &location,
 	                    uint64_t connect_timeout_seconds, uint64_t io_timeout_seconds);
 
 const char *IrohIdentitySourceName(IrohIdentitySource source);
+
+// The user-facing `iroh_*` options, shared by ATTACH and vgi_catalogs() so both
+// entry points accept the same names, types and validation.
+struct IrohOptions {
+	std::string secret_key;
+	std::vector<std::string> relay_urls;
+	bool no_relay = false;
+	std::string remote_relay_url;
+	std::vector<std::string> direct_addresses;
+
+	bool Any() const {
+		return !secret_key.empty() || !relay_urls.empty() || no_relay || !remote_relay_url.empty() ||
+		       !direct_addresses.empty();
+	}
+};
+
+// If `lower_name` is an `iroh_*` option, apply `value` to `out` and return true.
+// List options take a VARCHAR[] or (for connection-string values) a
+// comma-separated VARCHAR. Throws BinderException on an invalid value.
+bool ApplyIrohOption(const std::string &lower_name, const Value &value, IrohOptions &out);
+
+// Build the Iroh configuration for `location` at an entry point (`entry_name` is
+// used in errors, e.g. "ATTACH"). Returns nullptr for a location that is not
+// iroh:// / httpi://, and on DuckDB-WASM (where the page adapter owns identity
+// and addressing); throws BinderException if options were given for such a
+// location. With no options this is the default configuration: a scoped
+// `TYPE iroh` secret if one matches, else an ephemeral identity, default relays,
+// and the vgi_iroh_*_timeout_seconds settings.
+std::shared_ptr<IrohClientConfig> BuildIrohClientConfigForLocation(ClientContext &context,
+                                                                   const std::string &location, IrohOptions options,
+                                                                   const char *entry_name);
 
 } // namespace vgi
 } // namespace duckdb

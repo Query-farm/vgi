@@ -53,6 +53,18 @@ worker's relay URL and `iroh_direct_addresses` accepts a `VARCHAR[]` of Iroh
 socket-address strings. These are public routing hints, not identities; the
 authenticated EndpointId remains authoritative.
 
+`vgi_catalogs()` reaches `iroh://` and `httpi://` LOCATIONs with the same
+configuration ATTACH would build: with no options, a scoped `TYPE iroh` secret if
+one matches, else the ephemeral identity. It accepts the same `iroh_*` options as
+named parameters, with the same validation (both entry points share one parser):
+
+```sql
+SELECT * FROM vgi_catalogs('iroh://<EndpointId>');
+SELECT * FROM vgi_catalogs('iroh://<EndpointId>',
+                           iroh_remote_relay_url := 'https://relay.example',
+                           iroh_direct_addresses := ['203.0.113.7:4433']);
+```
+
 Externalized HTTP response pointers must still be absolute HTTP(S) URLs. An Iroh
 worker that cannot expose such object storage should use HTTP continuations
 within the advertised response budget instead.

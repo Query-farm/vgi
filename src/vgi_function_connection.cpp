@@ -1941,7 +1941,7 @@ CreateFunctionConnection(const std::string &worker_path, const std::string &func
 		                                                required_secrets, attach_params);
 #else
 		if (!attach_params || !attach_params->iroh()) {
-			throw InternalException("vgi: native httpi:// connection is missing its ATTACH configuration");
+			throw InvalidInputException("vgi: native httpi:// connection is missing its ATTACH configuration");
 		}
 		return std::make_unique<HttpFunctionConnection>(CanonicalizeHttpiLocation(worker_path), function_name,
 		                                                arguments, attach_opaque_data, transaction_opaque_data, context,
@@ -1962,7 +1962,7 @@ CreateFunctionConnection(const std::string &worker_path, const std::string &func
 #if !defined(__EMSCRIPTEN__)
 	if (IsIrohTransport(worker_path)) {
 		if (!attach_params || !attach_params->iroh()) {
-			throw InternalException("vgi: native iroh:// connection is missing its ATTACH configuration");
+			throw InvalidInputException("vgi: native iroh:// connection is missing its ATTACH configuration");
 		}
 		return std::make_unique<FunctionConnection>(
 		    worker_path, function_name, arguments, attach_opaque_data, transaction_opaque_data, context,

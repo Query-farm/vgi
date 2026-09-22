@@ -3,6 +3,9 @@
 #include "vgi_iroh_config.hpp"
 
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/string_util.hpp"
+#include "duckdb/common/types/value.hpp"
+#include "duckdb/main/client_context.hpp"
 #include "duckdb/main/secret/secret.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
 #include "duckdb/catalog/catalog_transaction.hpp"
@@ -145,6 +148,95 @@ ResolveIrohClientConfig(ClientContext &context, const std::string &location,
 		result->secret_key = std::make_shared<IrohSecretKey>(std::move(encoded_key));
 	}
 	return result;
+}
+
+namespace {
+
+std::vector<std::string> IrohListOption(const Value &value) {
+	std::vector<std::string> out;
+	if (value.IsNull()) {
+		return out;
+	}
+	if (value.type().id() == LogicalTypeId::LIST || value.type().id() == LogicalTypeId::ARRAY) {
+		for (const auto &child : ListValue::GetChildren(value)) {
+			out.push_back(child.DefaultCastAs(LogicalType::VARCHAR).ToString());
+		}
+		return out;
+	}
+	// Connection-string values are VARCHAR: accept a comma-separated spelling.
+	auto encoded = value.ToString();
+	size_t start = 0;
+	while (start <= encoded.size()) {
+		auto comma = encoded.find(',', start);
+		auto item = encoded.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+		if (!item.empty()) {
+			out.push_back(std::move(item));
+		}
+		if (comma == std::string::npos) {
+			break;
+		}
+		start = comma + 1;
+	}
+	return out;
+}
+
+std::string NonEmptyIrohString(const std::string &name, const Value &value) {
+	auto s = value.IsNull() ? std::string() : value.ToString();
+	if (s.empty()) {
+		throw BinderException("%s must not be empty", name);
+	}
+	return s;
+}
+
+} // namespace
+
+bool ApplyIrohOption(const std::string &lower_name, const Value &value, IrohOptions &out) {
+	if (lower_name == "iroh_secret_key") {
+		out.secret_key = NonEmptyIrohString(lower_name, value);
+	} else if (lower_name == "iroh_no_relay") {
+		out.no_relay = !value.IsNull() && value.DefaultCastAs(LogicalType::BOOLEAN).GetValue<bool>();
+	} else if (lower_name == "iroh_relay_urls") {
+		out.relay_urls = IrohListOption(value);
+	} else if (lower_name == "iroh_remote_relay_url") {
+		out.remote_relay_url = NonEmptyIrohString(lower_name, value);
+	} else if (lower_name == "iroh_direct_addresses") {
+		out.direct_addresses = IrohListOption(value);
+	} else {
+		return false;
+	}
+	return true;
+}
+
+std::shared_ptr<IrohClientConfig> BuildIrohClientConfigForLocation(ClientContext &context,
+                                                                   const std::string &location, IrohOptions options,
+                                                                   const char *entry_name) {
+	const bool is_iroh_location = IsIrohTransport(location) || IsHttpiTransport(location);
+	if (!is_iroh_location) {
+		if (options.Any()) {
+			throw BinderException("Iroh %s options require an iroh:// or httpi:// LOCATION", entry_name);
+		}
+		return nullptr;
+	}
+#if defined(__EMSCRIPTEN__)
+	if (options.Any()) {
+		throw BinderException("DuckDB-WASM Iroh identity and address resolution are owned by the application adapter");
+	}
+	return nullptr;
+#else
+	auto positive_setting = [&](const char *name, int64_t fallback) -> uint64_t {
+		Value value;
+		auto configured = context.TryGetCurrentSetting(name, value) ? value.GetValue<int64_t>() : fallback;
+		if (configured <= 0) {
+			throw BinderException("%s must be greater than zero", name);
+		}
+		return static_cast<uint64_t>(configured);
+	};
+	return ResolveIrohClientConfig(context, location, std::move(options.secret_key), std::move(options.relay_urls),
+	                               options.no_relay, std::move(options.remote_relay_url),
+	                               std::move(options.direct_addresses),
+	                               positive_setting("vgi_iroh_connect_timeout_seconds", 30),
+	                               positive_setting("vgi_iroh_io_timeout_seconds", 300));
+#endif
 }
 
 const char *IrohIdentitySourceName(IrohIdentitySource source) {

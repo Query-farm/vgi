@@ -133,4 +133,23 @@ SELECT sum(i) FROM remote.main.sequence(10000) t(i);
 grep -Fxq '42' <<<"$RAW_RESULT"
 grep -Fxq '49995000' <<<"$RAW_RESULT"
 
-echo "Native VGI Iroh integration passed (httpi required identity + scalar; raw scalar + streaming)."
+# vgi_catalogs() builds the same default Iroh configuration ATTACH does (no
+# options: scoped TYPE iroh secret, else an ephemeral identity), so discovery
+# works over both Iroh transports without an ATTACH. The named iroh_* options
+# mirror ATTACH's.
+CATALOGS_RESULT="$($HAYBARN :memory: -csv -noheader -c "
+SELECT 'raw', catalog FROM vgi_catalogs('iroh://${RAW_ENDPOINT}');
+SELECT 'http', catalog FROM vgi_catalogs('httpi://${HTTP_ENDPOINT}');
+SELECT 'http_opts', catalog FROM vgi_catalogs('httpi://${HTTP_ENDPOINT}', iroh_no_relay := false, iroh_relay_urls := []);
+CREATE SECRET iroh_raw (TYPE iroh, SCOPE 'iroh://${RAW_ENDPOINT}', SECRET_KEY '$(printf '%064x' 7)');
+SELECT 'raw_secret', catalog FROM vgi_catalogs('iroh://${RAW_ENDPOINT}');
+")"
+for label in raw http http_opts raw_secret; do
+    if ! grep -Fxq "${label},example" <<<"$CATALOGS_RESULT"; then
+        echo "vgi_catalogs() over Iroh (${label}) did not list the example catalog" >&2
+        printf '%s\n' "$CATALOGS_RESULT" >&2
+        exit 1
+    fi
+done
+
+echo "Native VGI Iroh integration passed (httpi required identity + scalar; raw scalar + streaming; vgi_catalogs over both)."

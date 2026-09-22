@@ -1162,7 +1162,7 @@ The `launch:` and `unix://` paths share one warm worker process across every Duc
 
 | Function | Type | Description |
 |----------|------|-------------|
-| `vgi_catalogs(worker_path)` | Table | List available catalogs from a worker. `worker_path` accepts any LOCATION scheme incl. `oci://` (container resolved on first use with default options) |
+| `vgi_catalogs(worker_path, iroh_* := …)` | Table | List available catalogs from a worker. `worker_path` accepts any LOCATION scheme incl. `oci://` (container resolved on first use with default options) and `iroh://` / `httpi://` (same default Iroh config as ATTACH: scoped `TYPE iroh` secret, else ephemeral identity; optional named `iroh_secret_key` / `iroh_relay_urls` / `iroh_no_relay` / `iroh_remote_relay_url` / `iroh_direct_addresses` mirror the ATTACH options via the shared `ApplyIrohOption`). Not `database://` (only ATTACH resolves it). Gated by `vgi_allowed_transports` |
 | `vgi_worker_pool()` | Table | Diagnostic: list **subprocess**-pooled workers (worker_path, pid, age_seconds). Returns no rows for `launch:` / `unix://` transports — see *Transports* section. |
 | `vgi_worker_pool_stats()` | Table | Diagnostic: hit/miss statistics by worker_path. Subprocess pool only. |
 | `vgi_worker_pool_flush()` | Table | Clear all subprocess-pooled workers; returns one row with the count flushed (`flushed`). Has no effect on `launch:` / `unix://` workers. |

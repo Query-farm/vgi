@@ -1,0 +1,40 @@
+# name: test/sql/integration/vgi_catalogs_iroh_options.test
+# description: vgi_catalogs() takes the same iroh_* options as ATTACH and validates them before any network I/O
+# group: [vgi_integration_transport]
+
+require vgi
+
+# Iroh options only make sense for an iroh:// / httpi:// LOCATION.
+statement error
+SELECT * FROM vgi_catalogs('tcp://127.0.0.1:1', iroh_no_relay := true);
+----
+Iroh vgi_catalogs() options require an iroh:// or httpi:// LOCATION
+
+statement error
+SELECT * FROM vgi_catalogs('iroh://0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
+                           iroh_no_relay := true, iroh_relay_urls := ['https://relay.example.invalid']);
+----
+iroh_no_relay and iroh_relay_urls are mutually exclusive
+
+statement error
+SELECT * FROM vgi_catalogs('httpi://0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
+                           iroh_remote_relay_url := '');
+----
+iroh_remote_relay_url must not be empty
+
+statement error
+SELECT * FROM vgi_catalogs('iroh://0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
+                           iroh_direct_addresses := ['']);
+----
+iroh_direct_addresses must not contain an empty address
+
+statement error
+SELECT * FROM vgi_catalogs('iroh://0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF');
+----
+EndpointId must be 64 lowercase hexadecimal characters
+
+# None of the failures above invalidated the database.
+query I
+SELECT 42;
+----
+42
