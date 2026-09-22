@@ -1,0 +1,58 @@
+# name: test/sql/integration/location_policy/external_access.test
+# description: enable_external_access=false refuses every local VGI transport, with vgi_allowed_transports at its default
+# group: [vgi_integration_location_policy]
+
+require vgi
+
+statement ok
+SET enable_external_access = false;
+
+# (glob() is unavailable with external access disabled, so these assert on the
+# specific refusal, which is raised before any process could start.)
+
+statement error
+ATTACH 'sh -c "true"' AS p (TYPE vgi);
+----
+LOCATION transport 'subprocess' is local (it can start a process or connect to local IPC) and is not permitted while enable_external_access is false
+
+statement error
+ATTACH 'cat' AS p (TYPE vgi, LOCATION 'launch:true');
+----
+LOCATION transport 'launch' is local
+
+statement error
+ATTACH 'cat' AS p (TYPE vgi, LOCATION 'unix:///tmp/vgi-policy-test.sock');
+----
+LOCATION transport 'unix' is local
+
+statement error
+ATTACH 'cat' AS p (TYPE vgi, LOCATION 'oci://example.invalid/image:tag');
+----
+LOCATION transport 'oci' is local
+
+statement error
+ATTACH 'cat' AS p (TYPE vgi, LOCATION 'github://owner/repo@v1/asset');
+----
+LOCATION transport 'github' is local
+
+statement error
+ATTACH 'cat' AS p (TYPE vgi, LOCATION 'database://memory/main/packages/worker?package_version=1');
+----
+LOCATION transport 'database' is local
+
+statement error
+ATTACH 'cat' AS p (TYPE vgi, LOCATION 'worker:true');
+----
+LOCATION transport 'subprocess' is local
+
+statement error
+SELECT * FROM vgi_catalogs('sh -c "true"');
+----
+LOCATION transport 'subprocess' is local
+
+# Network transports are not refused by the policy: this reaches the connect
+# step (and fails there, since nothing listens on port 1).
+statement error
+ATTACH 'cat' AS p (TYPE vgi, LOCATION 'tcp://127.0.0.1:1');
+----
+failed to connect to tcp worker

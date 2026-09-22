@@ -1,0 +1,115 @@
+# name: test/sql/integration/location_policy/refusals.test
+# description: Every LOCATION form is classified as the transport dispatch really uses, and refused before any I/O
+# group: [vgi_integration_location_policy]
+
+require vgi
+
+statement ok
+SET vgi_allowed_transports = 'https';
+
+# --- Local transports: no worker, daemon or network is needed because the
+# --- check runs before any of them would be touched.
+
+statement error
+ATTACH 'sh -c "touch __TEST_DIR__/policy_sentinel_bare"' AS p (TYPE vgi);
+----
+LOCATION transport 'subprocess' is not permitted by vgi_allowed_transports (allowed: https)
+
+# The bare connection-string form (no LOCATION option).
+statement error
+ATTACH 'sh -c "touch __TEST_DIR__/policy_sentinel_connstr"' (TYPE vgi);
+----
+LOCATION transport 'subprocess' is not permitted
+
+statement error
+ATTACH 'cat' AS p (TYPE vgi, LOCATION 'launch:sh -c "touch __TEST_DIR__/policy_sentinel_launch"');
+----
+LOCATION transport 'launch' is not permitted
+
+statement error
+ATTACH 'cat' AS p (TYPE vgi, LOCATION 'unix:///tmp/vgi-policy-test.sock');
+----
+LOCATION transport 'unix' is not permitted
+
+statement error
+ATTACH 'cat' AS p (TYPE vgi, LOCATION 'oci://example.invalid/image:tag');
+----
+LOCATION transport 'oci' is not permitted
+
+statement error
+ATTACH 'cat' AS p (TYPE vgi, LOCATION 'DOCKER://example.invalid/image:tag');
+----
+LOCATION transport 'oci' is not permitted
+
+statement error
+ATTACH 'cat' AS p (TYPE vgi, LOCATION 'github://owner/repo@v1/asset');
+----
+LOCATION transport 'github' is not permitted
+
+statement error
+ATTACH 'cat' AS p (TYPE vgi, LOCATION 'github-auto://owner/repo@v1');
+----
+LOCATION transport 'github' is not permitted
+
+statement error
+ATTACH 'cat' AS p (TYPE vgi, LOCATION 'database://memory/main/packages/worker?package_version=1');
+----
+LOCATION transport 'database' is not permitted
+
+# --- Network transports are classified too.
+
+statement error
+ATTACH 'cat' AS p (TYPE vgi, LOCATION 'tcp://127.0.0.1:1');
+----
+LOCATION transport 'tcp' is not permitted
+
+statement error
+ATTACH 'cat' AS p (TYPE vgi, LOCATION 'iroh://0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef');
+----
+LOCATION transport 'iroh' is not permitted
+
+statement error
+ATTACH 'cat' AS p (TYPE vgi, LOCATION 'httpi://0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef');
+----
+LOCATION transport 'httpi' is not permitted
+
+# --- Strings that LOOK like a network transport but dispatch to the shell are
+# --- classified as what they actually run as.
+
+# worker: only has a branch of its own in DuckDB-WASM; natively it is a command.
+statement error
+ATTACH 'cat' AS p (TYPE vgi, LOCATION 'worker:x; touch __TEST_DIR__/policy_sentinel_worker');
+----
+LOCATION transport 'subprocess' is not permitted
+
+# iroh:// is matched case-sensitively, so IROH:// is a command.
+statement error
+ATTACH 'cat' AS p (TYPE vgi, LOCATION 'IROH://x; touch __TEST_DIR__/policy_sentinel_iroh');
+----
+LOCATION transport 'subprocess' is not permitted
+
+# Leading whitespace defeats every scheme prefix.
+statement error
+ATTACH 'cat' AS p (TYPE vgi, LOCATION ' https://example.invalid');
+----
+LOCATION transport 'subprocess' is not permitted
+
+# --- vgi_catalogs() is gated the same way.
+
+statement error
+SELECT * FROM vgi_catalogs('sh -c "touch __TEST_DIR__/policy_sentinel_catalogs"');
+----
+LOCATION transport 'subprocess' is not permitted
+
+# vgi_catalogs() never resolves database://, so it is refused outright (it would
+# otherwise reach the shell) regardless of policy.
+statement error
+SELECT * FROM vgi_catalogs('database://x; touch __TEST_DIR__/policy_sentinel_dbcat');
+----
+does not resolve database:// LOCATIONs
+
+# Nothing above started a process.
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/policy_sentinel_*');
+----
+0

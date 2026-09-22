@@ -90,6 +90,7 @@
 #endif
 #include "vgi_table_function_impl.hpp"
 #include "vgi_transport.hpp"
+#include "vgi_location_policy.hpp"
 #include "vgi_worker_pool.hpp"
 #include "vgi_table_statistics_function.hpp"
 #include "vgi_table_branches_function.hpp"
@@ -943,6 +944,18 @@ public:
 		return dispatcher_;
 	}
 
+	vgi::VgiLocationPolicy &GetLocationPolicy() {
+		return location_policy_;
+	}
+
+	static vgi::VgiLocationPolicy *FindLocationPolicy(DatabaseInstance &db) {
+		auto ext = StorageExtension::Find(DBConfig::GetConfig(db), "vgi");
+		if (!ext) {
+			return nullptr;
+		}
+		return &static_cast<VgiStorageExtension &>(*ext).location_policy_;
+	}
+
 	// Convenience: locate the VGI extension on a DatabaseInstance and
 	// return its dispatcher. nullptr if the extension isn't registered.
 	static vgi::VgiCancelDispatcher *FindCancelDispatcher(DatabaseInstance &db) {
@@ -1190,6 +1203,8 @@ private:
 	mutable std::mutex redact_mutex_;
 	std::unordered_map<std::string, case_insensitive_set_t> redact_keys_;
 	vgi::VgiCancelDispatcher dispatcher_;
+	// Effective vgi_allowed_transports allowlist (narrow-only). See vgi_location_policy.hpp.
+	vgi::VgiLocationPolicy location_policy_;
 	mutable std::mutex secret_mutex_;
 	std::map<std::string, vgi::VgiRemoteSecretStorage *> secret_providers_;
 	int64_t next_secret_offset_ = 100;
@@ -1898,6 +1913,10 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	if (worker_path.empty()) {
 		throw BinderException("VGI ATTACH requires LOCATION option specifying the worker path");
 	}
+	// Transport policy gate: before ANY I/O on the location (container runtime
+	// detection / image inspection, database:// resolution, Iroh configuration,
+	// the discovery RPC). Checks the raw user LOCATION, before the rewrites below.
+	vgi::CheckLocationPolicy(context, worker_path, vgi::LocationEntryPoint::ATTACH);
 	if (!tcp_proxy.empty() && !vgi::IsTcpTransport(worker_path)) {
 		throw BinderException("tcp_proxy is only valid for tcp:// LOCATIONs");
 	}
@@ -3466,7 +3485,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	// Register VGI storage extension
 	auto &config = DBConfig::GetConfig(loader.GetDatabaseInstance());
-	StorageExtension::Register(config, "vgi", make_shared_ptr<VgiStorageExtension>(loader.GetDatabaseInstance()));
+	auto vgi_storage = make_shared_ptr<VgiStorageExtension>(loader.GetDatabaseInstance());
+	StorageExtension::Register(config, "vgi", vgi_storage);
+	// LOCATION transport allowlist. Registered right after the storage extension
+	// that owns its state, and before anything can ATTACH.
+	vgi::RegisterLocationPolicySetting(config, vgi_storage->GetLocationPolicy());
 
 	// Register the transport-owned Iroh identity secret independently of any
 	// worker-advertised secret types so it is available immediately after LOAD.
@@ -4152,6 +4175,9 @@ std::string VgiExtension::Version() const {
 namespace vgi {
 VgiCancelDispatcher *FindVgiCancelDispatcher(DatabaseInstance &db) {
 	return ::duckdb::VgiStorageExtension::FindCancelDispatcher(db);
+}
+VgiLocationPolicy *FindVgiLocationPolicy(DatabaseInstance &db) {
+	return ::duckdb::VgiStorageExtension::FindLocationPolicy(db);
 }
 } // namespace vgi
 

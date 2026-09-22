@@ -3,6 +3,7 @@
 #include "vgi_catalog_rpc.hpp"
 #include "vgi_logging.hpp"
 #include "vgi_transport.hpp"
+#include "vgi_location_policy.hpp"
 
 #include <string>
 #include <vector>
@@ -38,6 +39,10 @@ static unique_ptr<FunctionData> VgiCatalogsBind(ClientContext &context, TableFun
 	auto bind_data = make_uniq<VgiCatalogsBindData>();
 
 	bind_data->worker_path = input.inputs[0].GetValue<string>();
+	// Checked here for an early error, and again at InitGlobal (where the worker
+	// is actually contacted) so a statement prepared before the policy was
+	// narrowed cannot run under EXECUTE without being re-checked.
+	vgi::CheckLocationPolicy(context, bind_data->worker_path, vgi::LocationEntryPoint::VGI_CATALOGS);
 
 	if (vgi::IsHttpTransport(bind_data->worker_path)) {
 		auto &db = DatabaseInstance::GetDatabase(context);
@@ -93,6 +98,7 @@ static unique_ptr<GlobalTableFunctionState> VgiCatalogsInitGlobal(ClientContext 
 	auto &bind_data = input.bind_data->Cast<VgiCatalogsBindData>();
 	auto state = make_uniq<VgiCatalogsGlobalState>();
 
+	vgi::CheckLocationPolicy(context, bind_data.worker_path, vgi::LocationEntryPoint::VGI_CATALOGS);
 	state->catalogs = vgi::InvokeCatalogs(bind_data.worker_path, context);
 
 	VGI_LOG(context, "vgi_catalogs.init",

@@ -1,0 +1,45 @@
+# name: test/sql/integration/location_policy/internal_and_prepared.test
+# description: Internal LOCATION tokens are always refused; prepared vgi_catalogs() is re-checked at execution
+# group: [vgi_integration_location_policy]
+
+require vgi
+
+# --- Internal tokens are refused regardless of policy.
+
+statement error
+ATTACH 'cat' AS p (TYPE vgi, LOCATION 'vgi-artifact:abc:def');
+----
+uses an internal VGI token prefix
+
+statement error
+ATTACH 'cat' AS p (TYPE vgi, LOCATION 'container-shared:oci://x#abc');
+----
+uses an internal VGI token prefix
+
+statement error
+SELECT * FROM vgi_catalogs('vgi-artifact:abc:def');
+----
+uses an internal VGI token prefix
+
+statement error
+SELECT * FROM vgi_catalogs('database://memory/main/packages/worker?package_version=1');
+----
+does not resolve database:// LOCATIONs
+
+# --- A statement prepared before narrowing is re-checked when executed.
+
+statement ok
+PREPARE catalogs_p AS SELECT * FROM vgi_catalogs('sh -c "touch __TEST_DIR__/policy_sentinel_prepared"');
+
+statement ok
+SET vgi_allowed_transports = 'https';
+
+statement error
+EXECUTE catalogs_p;
+----
+LOCATION transport 'subprocess' is not permitted
+
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/policy_sentinel_*');
+----
+0

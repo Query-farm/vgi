@@ -1,0 +1,54 @@
+# name: test/sql/integration/location_policy/grandfather.test
+# description: A catalog attached before the policy was narrowed keeps working; new ATTACHes are refused
+# group: [vgi_integration_location_policy]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+query I
+SELECT example.double(21);
+----
+42
+
+statement ok
+SET vgi_allowed_transports = 'none';
+
+# Already attached: keeps working, including when a fresh worker must be acquired.
+query I
+SELECT example.double(4);
+----
+8
+
+statement ok
+SELECT * FROM vgi_worker_pool_flush();
+
+query I
+SELECT example.double(5);
+----
+10
+
+# The same LOCATION can no longer be attached again, whatever transport it is.
+statement error
+ATTACH 'example' AS example2 (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+----
+is not permitted by vgi_allowed_transports (allowed: none)
+
+statement error
+SELECT * FROM vgi_catalogs('${VGI_TEST_WORKER}');
+----
+is not permitted by vgi_allowed_transports (allowed: none)
+
+# DETACH + re-ATTACH counts as a new ATTACH.
+statement ok
+DETACH example;
+
+statement error
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+----
+is not permitted by vgi_allowed_transports (allowed: none)

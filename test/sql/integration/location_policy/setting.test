@@ -1,0 +1,120 @@
+# name: test/sql/integration/location_policy/setting.test
+# description: vgi_allowed_transports is database-wide and narrow-only
+# group: [vgi_integration_location_policy]
+
+require vgi
+
+query T
+SELECT current_setting('vgi_allowed_transports');
+----
+all
+
+# Narrowing is accepted and stored canonically (lowercase, declaration order).
+statement ok
+SET vgi_allowed_transports = ' IROH, https , tcp';
+
+query T
+SELECT current_setting('vgi_allowed_transports');
+----
+https,tcp,iroh
+
+# Re-setting the same set is a no-op, not a widening.
+statement ok
+SET vgi_allowed_transports = 'tcp,iroh,https';
+
+# Further narrowing is fine.
+statement ok
+SET GLOBAL vgi_allowed_transports = 'https,iroh';
+
+query T
+SELECT current_setting('vgi_allowed_transports');
+----
+https,iroh
+
+# Adding anything back is refused.
+statement error
+SET vgi_allowed_transports = 'https,iroh,tcp';
+----
+Cannot widen vgi_allowed_transports while the database is running
+
+statement error
+SET vgi_allowed_transports = 'all';
+----
+Cannot widen vgi_allowed_transports
+
+# RESET would restore the default ('all'), which is a widening.
+statement error
+RESET vgi_allowed_transports;
+----
+Cannot widen vgi_allowed_transports
+
+# Database-wide only: a session value could otherwise diverge from what is enforced.
+statement error
+SET SESSION vgi_allowed_transports = 'https';
+----
+can only be set globally
+
+statement error
+RESET SESSION vgi_allowed_transports;
+----
+can only be set globally
+
+# Typos and empty entries fail closed rather than being ignored.
+statement error
+SET vgi_allowed_transports = 'htps';
+----
+unknown transport 'htps'
+
+statement error
+SET vgi_allowed_transports = 'https,,iroh';
+----
+contains an empty entry
+
+statement error
+SET vgi_allowed_transports = '';
+----
+contains an empty entry
+
+statement error
+SET vgi_allowed_transports = NULL;
+----
+must not be NULL
+
+# Refused attempts leave the policy unchanged.
+query T
+SELECT current_setting('vgi_allowed_transports');
+----
+https,iroh
+
+statement ok
+SET vgi_allowed_transports = 'none';
+
+query T
+SELECT current_setting('vgi_allowed_transports');
+----
+none
+
+statement error
+SET vgi_allowed_transports = 'https';
+----
+Cannot widen vgi_allowed_transports
+
+# A value that reaches a new database instance WITHOUT going through SET (the
+# test runner hands the same DBConfig to the restarted instance, as a host
+# passing config at open would) is seeded into the enforced policy at load.
+restart
+
+query T
+SELECT current_setting('vgi_allowed_transports');
+----
+none
+
+statement error
+ATTACH 'sh -c "true"' AS p (TYPE vgi);
+----
+LOCATION transport 'subprocess' is not permitted by vgi_allowed_transports (allowed: none)
+
+statement error
+SET vgi_allowed_transports = 'https';
+----
+Cannot widen vgi_allowed_transports
