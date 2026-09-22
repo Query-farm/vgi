@@ -202,6 +202,42 @@ void WriteEmptyRpcRequest(int fd, const std::string &method_name,
 // Response Reading
 // ============================================================================
 
+// How a unary / stream-header read treats its worker stream. Every transport
+// reads the same shape -- log and error batches, one data batch, then a drain to
+// EOS -- and differs only in these knobs. (This used to be eight hand-copied
+// loops: fd, buffer, browser SAB and external-location readers.)
+struct WorkerStreamOptions {
+	ClientContext *context = nullptr;
+	// Worker path, or the URL for HTTP-style messages; appears in errors.
+	std::string worker;
+	// Worker named in log records when it differs from `worker` (a fetched
+	// external location still logs against the worker that pointed at it).
+	std::string log_worker;
+	pid_t pid = -1;
+	// Error wording: subprocess style ("... [worker: X]") or HTTP style ("... [url: X]").
+	bool http_messages = false;
+	// Lenient transports (HTTP bodies, browser SAB): a stream that ends without
+	// the Arrow EOS marker ends the read instead of failing it, and errors while
+	// draining after the data batch are ignored. Strict (fd, Iroh): every read
+	// error is raised.
+	bool lenient = false;
+	// Unary only: what the stream is called in errors. Empty = "RPC response"
+	// (or "HTTP RPC response" with http_messages).
+	std::string noun;
+	// Called before every read: fd readiness + cancellation. Empty = none.
+	std::function<void()> before_read;
+	std::string invocation_id_hex;
+	std::string attach_opaque_data_hex;
+	std::string transaction_opaque_data_hex;
+	std::string conn_id_hex;
+};
+
+// If `batch` is a log or error batch, handle it (log it, or throw the worker's
+// error) and return true; return false for a data batch.
+bool DispatchWorkerBatch(const std::shared_ptr<arrow::RecordBatch> &batch,
+                         const std::shared_ptr<arrow::KeyValueMetadata> &custom_metadata,
+                         const WorkerStreamOptions &opts);
+
 // Result from reading a unary response
 struct UnaryResponseResult {
 	std::shared_ptr<arrow::RecordBatch> batch;           // The data batch (1-row with "result" column, or empty for void)
@@ -245,6 +281,15 @@ struct StreamHeaderResult {
 	std::shared_ptr<arrow::RecordBatch> header_batch;    // The header data batch (1-row)
 	std::shared_ptr<arrow::KeyValueMetadata> metadata;   // Custom metadata from the header batch
 };
+
+// Read a unary response / stream header from any worker stream. The fd, buffer
+// and SAB entry points are thin wrappers over these. The stream-header reader
+// leaves `input` positioned just past the header stream, where the data stream
+// begins.
+UnaryResponseResult ReadWorkerUnaryStream(const std::shared_ptr<arrow::io::InputStream> &input,
+                                          const WorkerStreamOptions &opts);
+StreamHeaderResult ReadWorkerStreamHeader(const std::shared_ptr<arrow::io::InputStream> &input,
+                                          const WorkerStreamOptions &opts);
 
 // Read a stream header (phase 1.5) from a file descriptor.
 // Opens an IPC stream reader on the header schema, dispatches log batches,

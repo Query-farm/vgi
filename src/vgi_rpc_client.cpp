@@ -99,6 +99,170 @@ static bool DispatchBatch(const std::shared_ptr<arrow::RecordBatch> &batch,
 }
 
 // ============================================================================
+// Shared unary / stream-header reading
+// ============================================================================
+
+bool DispatchWorkerBatch(const std::shared_ptr<arrow::RecordBatch> &batch,
+                         const std::shared_ptr<arrow::KeyValueMetadata> &custom_metadata,
+                         const WorkerStreamOptions &opts) {
+	return DispatchBatch(batch, custom_metadata, opts.context, opts.log_worker.empty() ? opts.worker : opts.log_worker,
+	                     opts.pid, opts.invocation_id_hex, opts.attach_opaque_data_hex,
+	                     opts.transaction_opaque_data_hex, opts.conn_id_hex);
+}
+
+namespace {
+
+template <typename... ARGS>
+[[noreturn]] void ThrowWorkerStreamError(const WorkerStreamOptions &opts, const std::string &msg, ARGS... params) {
+	if (opts.http_messages) {
+		throw IOException(msg + " [url: %s]", params..., opts.worker);
+	}
+	ThrowVgiIOException(msg, opts.worker, opts.pid, std::string(), params...);
+}
+
+std::shared_ptr<arrow::ipc::RecordBatchStreamReader>
+OpenWorkerStream(const std::shared_ptr<arrow::io::InputStream> &input, const WorkerStreamOptions &opts,
+                 const std::string &eof_msg, const std::string &open_msg) {
+	if (opts.before_read) {
+		opts.before_read();
+	}
+	auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(input);
+	if (!reader_result.ok()) {
+		auto status = reader_result.status();
+		if (status.IsInvalid()) {
+			ThrowWorkerStreamError(opts, eof_msg);
+		}
+		ThrowWorkerStreamError(opts, open_msg, status.ToString());
+	}
+	return reader_result.ValueUnsafe();
+}
+
+enum class WorkerReadMode {
+	STRICT,            // every read error is raised
+	EOS_ON_TRUNCATION, // a stream that ends without the EOS marker is EOS; other errors are raised
+	STOP_ON_ERROR,     // any read error ends the read
+};
+
+// Read the next batch into `out`. False at end of stream (or on a read error
+// the mode tolerates). Cancellation always interrupts.
+bool NextWorkerBatch(arrow::ipc::RecordBatchStreamReader &reader, const WorkerStreamOptions &opts,
+                     arrow::RecordBatchWithMetadata &out, const std::string &fail_msg, WorkerReadMode mode) {
+	if (opts.before_read) {
+		opts.before_read();
+	}
+	auto read_result = reader.ReadNext();
+	if (!read_result.ok()) {
+		auto status = read_result.status();
+		if (status.IsCancelled()) {
+			throw InterruptException();
+		}
+		if (mode == WorkerReadMode::STOP_ON_ERROR ||
+		    (mode == WorkerReadMode::EOS_ON_TRUNCATION && status.IsInvalid())) {
+			return false;
+		}
+		ThrowWorkerStreamError(opts, fail_msg, status.ToString());
+	}
+	out = read_result.MoveValueUnsafe();
+	return out.batch != nullptr;
+}
+
+// Drain to EOS after the data batch, still honouring log / error batches.
+void DrainWorkerStream(arrow::ipc::RecordBatchStreamReader &reader, const WorkerStreamOptions &opts,
+                       const std::string &fail_msg) {
+	auto mode = opts.lenient ? WorkerReadMode::STOP_ON_ERROR : WorkerReadMode::STRICT;
+	arrow::RecordBatchWithMetadata bwm;
+	while (NextWorkerBatch(reader, opts, bwm, fail_msg, mode)) {
+		DispatchWorkerBatch(bwm.batch, bwm.custom_metadata, opts);
+	}
+}
+
+} // namespace
+
+UnaryResponseResult ReadWorkerUnaryStream(const std::shared_ptr<arrow::io::InputStream> &input,
+                                          const WorkerStreamOptions &opts) {
+	const std::string noun =
+	    !opts.noun.empty() ? opts.noun : (opts.http_messages ? "HTTP RPC response" : "RPC response");
+	auto reader = OpenWorkerStream(input, opts, noun + " stream EOF (no schema)", "Failed to open " + noun + " stream: %s");
+
+	// Log / error batches until the data batch.
+	UnaryResponseResult result;
+	arrow::RecordBatchWithMetadata bwm;
+	const auto mode = opts.lenient ? WorkerReadMode::EOS_ON_TRUNCATION : WorkerReadMode::STRICT;
+	bool at_eos = true;
+	while (NextWorkerBatch(*reader, opts, bwm, "Failed to read " + noun + " batch: %s", mode)) {
+		if (DispatchWorkerBatch(bwm.batch, bwm.custom_metadata, opts)) {
+			continue;
+		}
+		result.batch = std::move(bwm.batch);
+		result.metadata = std::move(bwm.custom_metadata);
+		at_eos = false;
+		break;
+	}
+	if (!at_eos) {
+		DrainWorkerStream(*reader, opts, "Failed while draining " + noun + ": %s");
+	}
+	return result;
+}
+
+StreamHeaderResult ReadWorkerStreamHeader(const std::shared_ptr<arrow::io::InputStream> &input,
+                                          const WorkerStreamOptions &opts) {
+	const bool http = opts.http_messages;
+	auto reader = OpenWorkerStream(input, opts, http ? "HTTP stream header EOF (no schema)" : "Stream header EOF (no schema)",
+	                               http ? "Failed to open HTTP stream header: %s" : "Failed to open stream header: %s");
+	arrow::RecordBatchWithMetadata bwm;
+
+	// An empty schema is an error stream (init failed): decode the error, drain,
+	// then rethrow it.
+	if (reader->schema()->num_fields() == 0) {
+		std::exception_ptr caught_exception;
+		bool more = NextWorkerBatch(*reader, opts, bwm, "Failed to read stream error batch: %s",
+		                            opts.lenient ? WorkerReadMode::STOP_ON_ERROR : WorkerReadMode::STRICT);
+		if (more) {
+			try {
+				DispatchWorkerBatch(bwm.batch, bwm.custom_metadata, opts);
+			} catch (...) {
+				caught_exception = std::current_exception();
+			}
+		}
+		while (more) {
+			// Preserve a worker-supplied error already decoded above; otherwise a
+			// truncated drain must not masquerade as a clean EOS.
+			auto mode = (opts.lenient || caught_exception) ? WorkerReadMode::STOP_ON_ERROR : WorkerReadMode::STRICT;
+			more = NextWorkerBatch(*reader, opts, bwm, "Failed while draining stream error response: %s", mode);
+		}
+		if (caught_exception) {
+			std::rethrow_exception(caught_exception);
+		}
+		ThrowWorkerStreamError(opts, http ? "HTTP stream init failed (empty error schema)"
+		                                  : "Stream init failed (empty error schema)");
+	}
+
+	StreamHeaderResult result;
+	const auto mode = opts.lenient ? WorkerReadMode::EOS_ON_TRUNCATION : WorkerReadMode::STRICT;
+	bool at_eos = true;
+	while (NextWorkerBatch(*reader, opts, bwm,
+	                       http ? "Failed to read HTTP stream header batch: %s" : "Failed to read stream header batch: %s",
+	                       mode)) {
+		if (DispatchWorkerBatch(bwm.batch, bwm.custom_metadata, opts)) {
+			continue;
+		}
+		result.header_batch = std::move(bwm.batch);
+		result.metadata = std::move(bwm.custom_metadata);
+		at_eos = false;
+		break;
+	}
+	// The header is a complete IPC stream ending in its EOS marker; the data
+	// stream begins right after it on the same input.
+	if (!at_eos) {
+		DrainWorkerStream(*reader, opts, "Failed while draining stream header: %s");
+	}
+	if (!result.header_batch) {
+		ThrowWorkerStreamError(opts, http ? "HTTP stream header missing data batch" : "Stream header missing data batch");
+	}
+	return result;
+}
+
+// ============================================================================
 // Request Writing
 // ============================================================================
 //
@@ -188,78 +352,16 @@ static UnaryResponseResult ReadUnaryResponseImpl(
     const std::string &worker_path, pid_t worker_pid, const std::string &invocation_id_hex,
     const std::string &attach_opaque_data_hex, const std::string &transaction_opaque_data_hex,
     const std::string &conn_id_hex, const std::function<void()> &before_read) {
-	before_read();
-	auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(input);
-	if (!reader_result.ok()) {
-		auto status = reader_result.status();
-		if (status.IsInvalid()) {
-			ThrowVgiIOException("RPC response stream EOF (no schema)", worker_path, worker_pid, "");
-		}
-		ThrowVgiIOException("Failed to open RPC response stream: %s", worker_path, worker_pid, "",
-		                    status.ToString());
-	}
-	auto reader = reader_result.ValueUnsafe();
-
-	// Read batches, dispatching log/error until we find a data batch
-	UnaryResponseResult result;
-	while (true) {
-		// Gate every read on cancellation: WaitForReadableUntilCancel was called
-		// only before stream open, so without this a worker that stalls mid-stream
-		// (schema sent, body withheld) would wedge the query with Ctrl-C ignored.
-		before_read();
-		auto read_result = reader->ReadNext();
-		if (!read_result.ok()) {
-			auto status = read_result.status();
-			if (status.IsCancelled()) {
-				throw InterruptException();
-			}
-			ThrowVgiIOException("Failed to read RPC response batch: %s", worker_path, worker_pid, "",
-			                    status.ToString());
-		}
-		auto batch_with_metadata = read_result.ValueUnsafe();
-
-		// Null batch means EOS
-		if (!batch_with_metadata.batch) {
-			break;
-		}
-
-		// Dispatch log/error batches
-		if (DispatchBatch(batch_with_metadata.batch, batch_with_metadata.custom_metadata,
-		                  context, worker_path, worker_pid,
-		                  invocation_id_hex, attach_opaque_data_hex,
-		                  transaction_opaque_data_hex, conn_id_hex)) {
-			continue; // Was a log batch, read next
-		}
-
-		// This is the data batch - store it
-		result.batch = batch_with_metadata.batch;
-		result.metadata = batch_with_metadata.custom_metadata;
-		break;
-	}
-
-	// Drain remaining stream to EOS
-	while (true) {
-		before_read();
-		auto drain_result = reader->ReadNext();
-		if (!drain_result.ok()) {
-			auto status = drain_result.status();
-			if (status.IsCancelled()) {
-				throw InterruptException();
-			}
-			ThrowVgiIOException("Failed while draining RPC response: %s", worker_path, worker_pid, "",
-			                    status.ToString());
-		}
-		if (!drain_result.ValueUnsafe().batch) {
-			break;
-		}
-		// Dispatch any remaining log batches after the data batch
-		auto &bwm = drain_result.ValueUnsafe();
-		DispatchBatch(bwm.batch, bwm.custom_metadata, context, worker_path, worker_pid,
-		              invocation_id_hex, attach_opaque_data_hex,
-		              transaction_opaque_data_hex, conn_id_hex);
-	}
-
-	return result;
+	WorkerStreamOptions opts;
+	opts.context = context;
+	opts.worker = worker_path;
+	opts.pid = worker_pid;
+	opts.before_read = before_read;
+	opts.invocation_id_hex = invocation_id_hex;
+	opts.attach_opaque_data_hex = attach_opaque_data_hex;
+	opts.transaction_opaque_data_hex = transaction_opaque_data_hex;
+	opts.conn_id_hex = conn_id_hex;
+	return ReadWorkerUnaryStream(input, opts);
 }
 
 UnaryResponseResult ReadUnaryResponse(int fd, ClientContext *context,
@@ -289,124 +391,12 @@ static StreamHeaderResult ReadStreamHeaderImpl(const std::shared_ptr<arrow::io::
                                                ClientContext *context,
                                                const std::string &worker_path, pid_t worker_pid,
                                                const std::function<void()> &before_read) {
-	before_read();
-	auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(input);
-	if (!reader_result.ok()) {
-		auto status = reader_result.status();
-		if (status.IsInvalid()) {
-			ThrowVgiIOException("Stream header EOF (no schema)", worker_path, worker_pid, "");
-		}
-		ThrowVgiIOException("Failed to open stream header: %s", worker_path, worker_pid, "",
-		                    status.ToString());
-	}
-	auto reader = reader_result.ValueUnsafe();
-
-	// Check if this is an error stream (empty schema means error during init)
-	auto response_schema = reader->schema();
-	if (response_schema->num_fields() == 0) {
-		// Error stream - read the error batch, capturing any exception so we can drain first
-		std::exception_ptr caught_exception;
-		before_read();
-		auto read_result = reader->ReadNext();
-		if (!read_result.ok()) {
-			auto status = read_result.status();
-			if (status.IsCancelled()) {
-				throw InterruptException();
-			}
-			ThrowVgiIOException("Failed to read stream error batch: %s", worker_path, worker_pid, "",
-			                    status.ToString());
-		} else {
-			auto bwm = read_result.ValueUnsafe();
-			if (bwm.batch) {
-				try {
-					DispatchBatch(bwm.batch, bwm.custom_metadata, context, worker_path, worker_pid);
-				} catch (...) {
-					caught_exception = std::current_exception();
-				}
-			}
-		}
-		// Drain remaining stream data before rethrowing
-		while (true) {
-			before_read();
-			auto drain = reader->ReadNext();
-			if (!drain.ok()) {
-				auto status = drain.status();
-				if (status.IsCancelled()) {
-					throw InterruptException();
-				}
-				// Preserve a worker-supplied error already decoded above. Otherwise
-				// truncation or an idle timeout must not masquerade as clean EOS.
-				if (!caught_exception) {
-					ThrowVgiIOException("Failed while draining stream error response: %s", worker_path,
-					                    worker_pid, "", status.ToString());
-				}
-				break;
-			}
-			if (!drain.ValueUnsafe().batch) {
-				break;
-			}
-		}
-		if (caught_exception) {
-			std::rethrow_exception(caught_exception);
-		}
-		ThrowVgiIOException("Stream init failed (empty error schema)", worker_path, worker_pid, "");
-	}
-
-	// Read batches, dispatching log/error until we find the header data batch
-	StreamHeaderResult result;
-	while (true) {
-		before_read();
-		auto read_result = reader->ReadNext();
-		if (!read_result.ok()) {
-			auto status = read_result.status();
-			if (status.IsCancelled()) {
-				throw InterruptException();
-			}
-			ThrowVgiIOException("Failed to read stream header batch: %s", worker_path, worker_pid, "",
-			                    status.ToString());
-		}
-		auto batch_with_metadata = read_result.ValueUnsafe();
-
-		if (!batch_with_metadata.batch) {
-			break;
-		}
-
-		if (DispatchBatch(batch_with_metadata.batch, batch_with_metadata.custom_metadata,
-		                  context, worker_path, worker_pid)) {
-			continue;
-		}
-
-		result.header_batch = batch_with_metadata.batch;
-		result.metadata = batch_with_metadata.custom_metadata;
-		break;
-	}
-
-	// Drain remaining header stream to EOS
-	// The header is a complete IPC stream that ends with EOS marker.
-	// After EOS, a new data IPC stream begins on the same fd.
-	while (true) {
-		before_read();
-		auto drain_result = reader->ReadNext();
-		if (!drain_result.ok()) {
-			auto status = drain_result.status();
-			if (status.IsCancelled()) {
-				throw InterruptException();
-			}
-			ThrowVgiIOException("Failed while draining stream header: %s", worker_path, worker_pid, "",
-			                    status.ToString());
-		}
-		if (!drain_result.ValueUnsafe().batch) {
-			break;
-		}
-		auto &bwm = drain_result.ValueUnsafe();
-		DispatchBatch(bwm.batch, bwm.custom_metadata, context, worker_path, worker_pid);
-	}
-
-	if (!result.header_batch) {
-		ThrowVgiIOException("Stream header missing data batch", worker_path, worker_pid, "");
-	}
-
-	return result;
+	WorkerStreamOptions opts;
+	opts.context = context;
+	opts.worker = worker_path;
+	opts.pid = worker_pid;
+	opts.before_read = before_read;
+	return ReadWorkerStreamHeader(input, opts);
 }
 
 StreamHeaderResult ReadStreamHeader(int fd, ClientContext *context,
@@ -489,61 +479,16 @@ static UnaryResponseResult ReadUnaryResponseFromOwnedBuffer(
     const std::string &attach_opaque_data_hex,
     const std::string &transaction_opaque_data_hex,
     const std::string &conn_id_hex) {
-	auto input = std::make_shared<arrow::io::BufferReader>(std::move(buffer));
-	auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(input);
-	if (!reader_result.ok()) {
-		auto status = reader_result.status();
-		if (status.IsInvalid()) {
-			throw IOException("HTTP RPC response stream EOF (no schema) [url: %s]", url);
-		}
-		throw IOException("Failed to open HTTP RPC response stream: %s [url: %s]",
-		                  status.ToString(), url);
-	}
-	auto reader = reader_result.ValueUnsafe();
-
-	// Read batches, dispatching log/error until we find a data batch
-	UnaryResponseResult result;
-	while (true) {
-		auto read_result = reader->ReadNext();
-		if (!read_result.ok()) {
-			auto status = read_result.status();
-			if (status.IsInvalid()) {
-				break;
-			}
-			throw IOException("Failed to read HTTP RPC response batch: %s [url: %s]",
-			                  status.ToString(), url);
-		}
-		auto batch_with_metadata = read_result.ValueUnsafe();
-
-		if (!batch_with_metadata.batch) {
-			break;
-		}
-
-		if (DispatchBatch(batch_with_metadata.batch, batch_with_metadata.custom_metadata,
-		                  context, url, -1,
-		                  invocation_id_hex, attach_opaque_data_hex,
-		                  transaction_opaque_data_hex, conn_id_hex)) {
-			continue;
-		}
-
-		result.batch = batch_with_metadata.batch;
-		result.metadata = batch_with_metadata.custom_metadata;
-		break;
-	}
-
-	// Drain remaining stream to EOS
-	while (true) {
-		auto drain_result = reader->ReadNext();
-		if (!drain_result.ok() || !drain_result.ValueUnsafe().batch) {
-			break;
-		}
-		auto &bwm = drain_result.ValueUnsafe();
-		DispatchBatch(bwm.batch, bwm.custom_metadata, context, url, -1,
-		              invocation_id_hex, attach_opaque_data_hex,
-		              transaction_opaque_data_hex, conn_id_hex);
-	}
-
-	return result;
+	WorkerStreamOptions opts;
+	opts.context = context;
+	opts.worker = url;
+	opts.http_messages = true;
+	opts.lenient = true;
+	opts.invocation_id_hex = invocation_id_hex;
+	opts.attach_opaque_data_hex = attach_opaque_data_hex;
+	opts.transaction_opaque_data_hex = transaction_opaque_data_hex;
+	opts.conn_id_hex = conn_id_hex;
+	return ReadWorkerUnaryStream(std::make_shared<arrow::io::BufferReader>(std::move(buffer)), opts);
 }
 
 void DispatchErrorStreamsFromBuffer(const uint8_t *data, size_t len, ClientContext *context,
@@ -613,86 +558,14 @@ BufferStreamHeaderResult ReadStreamHeaderFromBuffer(const uint8_t *data, size_t 
 BufferStreamHeaderResult ReadStreamHeaderFromBuffer(std::shared_ptr<arrow::Buffer> buffer,
                                                      ClientContext *context,
                                                      const std::string &url) {
+	WorkerStreamOptions opts;
+	opts.context = context;
+	opts.worker = url;
+	opts.http_messages = true;
+	opts.lenient = true;
 	auto input = std::make_shared<arrow::io::BufferReader>(std::move(buffer));
-	auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(input);
-	if (!reader_result.ok()) {
-		auto status = reader_result.status();
-		if (status.IsInvalid()) {
-			throw IOException("HTTP stream header EOF (no schema) [url: %s]", url);
-		}
-		throw IOException("Failed to open HTTP stream header: %s [url: %s]",
-		                  status.ToString(), url);
-	}
-	auto reader = reader_result.ValueUnsafe();
-
-	// Check for error stream (empty schema)
-	auto response_schema = reader->schema();
-	if (response_schema->num_fields() == 0) {
-		std::exception_ptr caught_exception;
-		auto read_result = reader->ReadNext();
-		if (read_result.ok()) {
-			auto bwm = read_result.ValueUnsafe();
-			if (bwm.batch) {
-				try {
-					DispatchBatch(bwm.batch, bwm.custom_metadata, context, url, -1);
-				} catch (...) {
-					caught_exception = std::current_exception();
-				}
-			}
-		}
-		while (true) {
-			auto drain = reader->ReadNext();
-			if (!drain.ok() || !drain.ValueUnsafe().batch) {
-				break;
-			}
-		}
-		if (caught_exception) {
-			std::rethrow_exception(caught_exception);
-		}
-		throw IOException("HTTP stream init failed (empty error schema) [url: %s]", url);
-	}
-
-	// Read header batches
 	BufferStreamHeaderResult result;
-	while (true) {
-		auto read_result = reader->ReadNext();
-		if (!read_result.ok()) {
-			auto status = read_result.status();
-			if (status.IsInvalid()) {
-				break;
-			}
-			throw IOException("Failed to read HTTP stream header batch: %s [url: %s]",
-			                  status.ToString(), url);
-		}
-		auto batch_with_metadata = read_result.ValueUnsafe();
-
-		if (!batch_with_metadata.batch) {
-			break;
-		}
-
-		if (DispatchBatch(batch_with_metadata.batch, batch_with_metadata.custom_metadata,
-		                  context, url, -1)) {
-			continue;
-		}
-
-		result.header.header_batch = batch_with_metadata.batch;
-		result.header.metadata = batch_with_metadata.custom_metadata;
-		break;
-	}
-
-	// Drain remaining header stream to EOS
-	while (true) {
-		auto drain_result = reader->ReadNext();
-		if (!drain_result.ok() || !drain_result.ValueUnsafe().batch) {
-			break;
-		}
-		auto &bwm = drain_result.ValueUnsafe();
-		DispatchBatch(bwm.batch, bwm.custom_metadata, context, url, -1);
-	}
-
-	if (!result.header.header_batch) {
-		throw IOException("HTTP stream header missing data batch [url: %s]", url);
-	}
+	result.header = ReadWorkerStreamHeader(input, opts);
 
 	// Record the byte offset where the data IPC stream begins
 	auto tell_result = input->Tell();
@@ -700,7 +573,6 @@ BufferStreamHeaderResult ReadStreamHeaderFromBuffer(std::shared_ptr<arrow::Buffe
 		throw IOException("Failed to get buffer position after header [url: %s]", url);
 	}
 	result.data_offset = static_cast<size_t>(tell_result.ValueUnsafe());
-
 	return result;
 }
 

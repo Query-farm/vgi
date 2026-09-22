@@ -44,178 +44,45 @@ namespace duckdb {
 namespace vgi {
 
 // ============================================================================
-// Stream-based RPC read helpers (the SAB analogs of the fd-based
-// ReadUnaryResponse / ReadStreamHeader in vgi_rpc_client.cpp).
+// Stream-based RPC read helpers: the SAB entry points onto the shared
+// ReadWorkerUnaryStream / ReadWorkerStreamHeader (vgi_rpc_client.cpp).
 //
-// The fd helpers are gated behind VGI_SUBPROCESS_TRANSPORT and dispatch log
-// batches through the file-local DispatchBatch helper. We can't reach that
-// helper here, so we replicate its ClassifyBatch + HandleBatchLogMessage logic
-// over a RecordBatchStreamReader opened on a SabInputStream. SabInputStream::Read
-// already polls the ClientContext for cancellation (parity with FdInputStream),
-// so there is no per-batch WaitForReadableUntilCancel — a cancelled read surfaces
-// as an IOError status from ReadNext, which the loops treat as end-of-stream.
+// SabInputStream::Read already polls the ClientContext for cancellation (parity
+// with FdInputStream), so there is no per-batch readiness wait. The SAB ring is
+// a lenient transport: a stream that ends without the Arrow EOS marker ends the
+// read, and errors while draining after the data batch are ignored.
 // ============================================================================
 namespace {
 
-// Mirror of DispatchBatch (vgi_rpc_client.cpp): throw on ERROR, forward LOG to
-// the logger and report "handled", report DATA as "caller should process".
-bool SabDispatchBatch(const std::shared_ptr<arrow::RecordBatch> &batch,
-                      const std::shared_ptr<arrow::KeyValueMetadata> &custom_metadata, ClientContext *context,
-                      const std::string &worker_path, const std::string &invocation_id_hex = "",
-                      const std::string &attach_opaque_data_hex = "",
-                      const std::string &transaction_opaque_data_hex = "", const std::string &conn_id_hex = "") {
-	auto type = ClassifyBatch(batch, custom_metadata);
-	switch (type) {
-	case RpcBatchType::ERROR:
-		HandleBatchLogMessage(batch, custom_metadata, context, worker_path, -1, invocation_id_hex,
-		                      attach_opaque_data_hex, transaction_opaque_data_hex, conn_id_hex);
-		// HandleBatchLogMessage throws for EXCEPTION level, but just in case:
-		throw IOException("VGI RPC error from worker [worker: %s]", worker_path);
-	case RpcBatchType::LOG:
-		HandleBatchLogMessage(batch, custom_metadata, context, worker_path, -1, invocation_id_hex,
-		                      attach_opaque_data_hex, transaction_opaque_data_hex, conn_id_hex);
-		return true; // Handled, caller should read next batch
-	case RpcBatchType::DATA:
-	default:
-		return false; // Data batch, caller should process it
-	}
+WorkerStreamOptions SabStreamOptions(ClientContext *context, const std::string &worker_path) {
+	WorkerStreamOptions opts;
+	opts.context = context;
+	opts.worker = worker_path;
+	opts.lenient = true;
+	return opts;
 }
 
-// SAB analog of ReadUnaryResponse: open a reader on the worker->client ring,
-// dispatch log/error until the first data batch, then drain to EOS.
+// Read a unary response from the slot's response ring: dispatch log/error
+// until the first data batch, then drain to EOS.
 UnaryResponseResult SabReadUnaryResponse(int region_offset, int slot, ClientContext *context,
                                          const std::string &worker_path, const std::string &invocation_id_hex = "",
                                          const std::string &attach_opaque_data_hex = "",
                                          const std::string &transaction_opaque_data_hex = "",
                                          const std::string &conn_id_hex = "") {
-	auto input = std::make_shared<SabInputStream>(region_offset, slot, context);
-	auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(input);
-	if (!reader_result.ok()) {
-		auto status = reader_result.status();
-		if (status.IsInvalid()) {
-			ThrowVgiIOException("RPC response stream EOF (no schema)", worker_path, -1, "");
-		}
-		ThrowVgiIOException("Failed to open RPC response stream: %s", worker_path, -1, "", status.ToString());
-	}
-	auto reader = reader_result.ValueUnsafe();
-
-	UnaryResponseResult result;
-	while (true) {
-		auto read_result = reader->ReadNext();
-		if (!read_result.ok()) {
-			auto status = read_result.status();
-			if (status.IsInvalid()) {
-				break; // End of stream without data batch - void return
-			}
-			ThrowVgiIOException("Failed to read RPC response batch: %s", worker_path, -1, "", status.ToString());
-		}
-		auto bwm = read_result.ValueUnsafe();
-		if (!bwm.batch) {
-			break; // EOS
-		}
-		if (SabDispatchBatch(bwm.batch, bwm.custom_metadata, context, worker_path, invocation_id_hex,
-		                     attach_opaque_data_hex, transaction_opaque_data_hex, conn_id_hex)) {
-			continue; // log batch, read next
-		}
-		result.batch = bwm.batch;
-		result.metadata = bwm.custom_metadata;
-		break;
-	}
-
-	// Drain remaining stream to EOS
-	while (true) {
-		auto drain = reader->ReadNext();
-		if (!drain.ok() || !drain.ValueUnsafe().batch) {
-			break;
-		}
-		auto &bwm = drain.ValueUnsafe();
-		SabDispatchBatch(bwm.batch, bwm.custom_metadata, context, worker_path, invocation_id_hex,
-		                 attach_opaque_data_hex, transaction_opaque_data_hex, conn_id_hex);
-	}
-	return result;
+	auto opts = SabStreamOptions(context, worker_path);
+	opts.invocation_id_hex = invocation_id_hex;
+	opts.attach_opaque_data_hex = attach_opaque_data_hex;
+	opts.transaction_opaque_data_hex = transaction_opaque_data_hex;
+	opts.conn_id_hex = conn_id_hex;
+	return ReadWorkerUnaryStream(std::make_shared<SabInputStream>(region_offset, slot, context), opts);
 }
 
-// SAB analog of ReadStreamHeader: handle the empty-schema error stream, then
-// dispatch log/error until the header data batch, then drain to EOS. After EOS
-// the data IPC stream begins on the same ring (a fresh SabInputStream/reader
-// picks it up), exactly as on the subprocess fd.
+// Read the stream header; the data IPC stream then begins on the same ring (a
+// fresh SabInputStream/reader picks it up), exactly as on the subprocess fd.
 StreamHeaderResult SabReadStreamHeader(int region_offset, int slot, ClientContext *context,
                                        const std::string &worker_path) {
-	auto input = std::make_shared<SabInputStream>(region_offset, slot, context);
-	auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(input);
-	if (!reader_result.ok()) {
-		auto status = reader_result.status();
-		if (status.IsInvalid()) {
-			ThrowVgiIOException("Stream header EOF (no schema)", worker_path, -1, "");
-		}
-		ThrowVgiIOException("Failed to open stream header: %s", worker_path, -1, "", status.ToString());
-	}
-	auto reader = reader_result.ValueUnsafe();
-
-	// Empty schema means an error stream during init.
-	auto response_schema = reader->schema();
-	if (response_schema->num_fields() == 0) {
-		std::exception_ptr caught_exception;
-		auto read_result = reader->ReadNext();
-		if (read_result.ok()) {
-			auto bwm = read_result.ValueUnsafe();
-			if (bwm.batch) {
-				try {
-					SabDispatchBatch(bwm.batch, bwm.custom_metadata, context, worker_path);
-				} catch (...) {
-					caught_exception = std::current_exception();
-				}
-			}
-		}
-		while (true) {
-			auto drain = reader->ReadNext();
-			if (!drain.ok() || !drain.ValueUnsafe().batch) {
-				break;
-			}
-		}
-		if (caught_exception) {
-			std::rethrow_exception(caught_exception);
-		}
-		ThrowVgiIOException("Stream init failed (empty error schema)", worker_path, -1, "");
-	}
-
-	StreamHeaderResult result;
-	while (true) {
-		auto read_result = reader->ReadNext();
-		if (!read_result.ok()) {
-			auto status = read_result.status();
-			if (status.IsInvalid()) {
-				break;
-			}
-			ThrowVgiIOException("Failed to read stream header batch: %s", worker_path, -1, "", status.ToString());
-		}
-		auto bwm = read_result.ValueUnsafe();
-		if (!bwm.batch) {
-			break;
-		}
-		if (SabDispatchBatch(bwm.batch, bwm.custom_metadata, context, worker_path)) {
-			continue;
-		}
-		result.header_batch = bwm.batch;
-		result.metadata = bwm.custom_metadata;
-		break;
-	}
-
-	// Drain remaining header stream to EOS. The header is a complete IPC stream
-	// ending with an EOS marker; the data IPC stream begins after it.
-	while (true) {
-		auto drain = reader->ReadNext();
-		if (!drain.ok() || !drain.ValueUnsafe().batch) {
-			break;
-		}
-		auto &bwm = drain.ValueUnsafe();
-		SabDispatchBatch(bwm.batch, bwm.custom_metadata, context, worker_path);
-	}
-
-	if (!result.header_batch) {
-		ThrowVgiIOException("Stream header missing data batch", worker_path, -1, "");
-	}
-	return result;
+	return ReadWorkerStreamHeader(std::make_shared<SabInputStream>(region_offset, slot, context),
+	                              SabStreamOptions(context, worker_path));
 }
 
 // Decode the outer-envelope response for a buffered-table unary RPC. Mirrors

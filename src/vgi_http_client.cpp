@@ -969,60 +969,21 @@ UnaryResponseResult ResolveExternalLocation(ClientContext &context, const std::s
 	// The SHA-256 check above already consumed ``body`` by reference.
 	auto owned = arrow::Buffer::FromString(std::move(body));
 
-	auto input = std::make_shared<arrow::io::BufferReader>(owned);
-	auto reader_result = arrow::ipc::RecordBatchStreamReader::Open(input);
-	if (!reader_result.ok()) {
-		throw IOException("Failed to open external location IPC stream: %s [url: %s]",
-		                  reader_result.status().ToString(), location_url);
-	}
-	auto reader = reader_result.ValueUnsafe();
-
-	// Use the provided worker_path for log context, falling back to location_url
-	auto &log_worker_path = worker_path.empty() ? location_url : worker_path;
-
-	UnaryResponseResult result;
-	while (true) {
-		auto read_result = reader->ReadNext();
-		if (!read_result.ok() || !read_result.ValueUnsafe().batch) {
-			break;
-		}
-		auto &bwm = read_result.ValueUnsafe();
-		auto batch_type = ClassifyBatch(bwm.batch, bwm.custom_metadata);
-
-		if (batch_type == RpcBatchType::ERROR) {
-			HandleBatchLogMessage(bwm.batch, bwm.custom_metadata, &context, log_worker_path, -1, invocation_id_hex,
-			                      attach_opaque_data_hex);
-			throw IOException("VGI external location error [url: %s]", location_url);
-		}
-		if (batch_type == RpcBatchType::LOG) {
-			HandleBatchLogMessage(bwm.batch, bwm.custom_metadata, &context, log_worker_path, -1, invocation_id_hex,
-			                      attach_opaque_data_hex);
-			continue;
-		}
-		if (batch_type == RpcBatchType::EXTERNAL_LOCATION) {
-			throw IOException("VGI external location redirect loop: resolved batch from %s "
-			                  "contains another vgi_rpc.location",
-			                  location_url);
-		}
-
-		// Data batch
-		result.batch = bwm.batch;
-		result.metadata = bwm.custom_metadata;
-		break;
-	}
-
-	// Drain remaining
-	while (true) {
-		auto drain_result = reader->ReadNext();
-		if (!drain_result.ok() || !drain_result.ValueUnsafe().batch) {
-			break;
-		}
-		auto &bwm = drain_result.ValueUnsafe();
-		auto bt = ClassifyBatch(bwm.batch, bwm.custom_metadata);
-		if (bt == RpcBatchType::LOG || bt == RpcBatchType::ERROR) {
-			HandleBatchLogMessage(bwm.batch, bwm.custom_metadata, &context, log_worker_path, -1, invocation_id_hex,
-			                      attach_opaque_data_hex);
-		}
+	// Errors name the fetched URL; log records keep the worker that pointed at it.
+	WorkerStreamOptions opts;
+	opts.context = &context;
+	opts.worker = location_url;
+	opts.log_worker = worker_path;
+	opts.http_messages = true;
+	opts.lenient = true;
+	opts.noun = "external location";
+	opts.invocation_id_hex = invocation_id_hex;
+	opts.attach_opaque_data_hex = attach_opaque_data_hex;
+	auto result = ReadWorkerUnaryStream(std::make_shared<arrow::io::BufferReader>(owned), opts);
+	if (result.batch && ClassifyBatch(result.batch, result.metadata) == RpcBatchType::EXTERNAL_LOCATION) {
+		throw IOException("VGI external location redirect loop: resolved batch from %s "
+		                  "contains another vgi_rpc.location",
+		                  location_url);
 	}
 
 	if (!result.batch) {
