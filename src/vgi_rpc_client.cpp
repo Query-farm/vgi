@@ -163,7 +163,11 @@ bool NextWorkerBatch(arrow::ipc::RecordBatchStreamReader &reader, const WorkerSt
 		ThrowWorkerStreamError(opts, fail_msg, status.ToString());
 	}
 	out = read_result.MoveValueUnsafe();
-	return out.batch != nullptr;
+	if (!out.batch) {
+		return false;
+	}
+	ValidateWorkerBatch(opts.context, out.batch.get(), opts.worker);
+	return true;
 }
 
 // Drain to EOS after the data batch, still honouring log / error batches.

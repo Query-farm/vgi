@@ -53,6 +53,8 @@ VGI_SIMPLE_WRITABLE_WORKER ?= uv run --project $(HOME)/Development/vgi-python vg
 # Hostile-metadata fixture (constraints naming the row_id column); lives in this
 # repo and runs in vgi-python's environment, like the Iroh fixtures.
 VGI_ROWID_CONSTRAINT_WORKER ?= uv run --project $(HOME)/Development/vgi-python python $(CURDIR)/test/support/rowid_constraint_worker.py
+# Hostile-data fixture (well-framed IPC with malformed buffer contents).
+VGI_MALFORMED_BATCH_WORKER ?= uv run --project $(HOME)/Development/vgi-python python $(CURDIR)/test/support/malformed_batch_worker.py
 
 # The schema_reconcile and projection_pushdown_repro fixtures are now
 # hosted inside vgi-fixture-worker (VGI_TEST_WORKER) — no separate worker
@@ -104,6 +106,7 @@ test_shm:
 	VGI_BAD_ENUM_WORKER="$(VGI_BAD_ENUM_WORKER)" \
 	VGI_SIMPLE_WRITABLE_WORKER="$(VGI_SIMPLE_WRITABLE_WORKER)" \
 	VGI_ROWID_CONSTRAINT_WORKER="$(VGI_ROWID_CONSTRAINT_WORKER)" \
+	VGI_MALFORMED_BATCH_WORKER="$(VGI_MALFORMED_BATCH_WORKER)" \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
 	VGI_TEST_DEDICATED_WORKER=1 \
 	python3 scripts/run_tests.py --build release "test/*" "~test/sql/integration/writable/*"
@@ -120,6 +123,7 @@ test_shm_debug:
 	VGI_BAD_ENUM_WORKER="$(VGI_BAD_ENUM_WORKER)" \
 	VGI_SIMPLE_WRITABLE_WORKER="$(VGI_SIMPLE_WRITABLE_WORKER)" \
 	VGI_ROWID_CONSTRAINT_WORKER="$(VGI_ROWID_CONSTRAINT_WORKER)" \
+	VGI_MALFORMED_BATCH_WORKER="$(VGI_MALFORMED_BATCH_WORKER)" \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
 	VGI_TEST_DEDICATED_WORKER=1 \
 	python3 scripts/run_tests.py --build debug "test/*" "~test/sql/integration/writable/*"
@@ -146,6 +150,7 @@ test_spawn:
 	VGI_BAD_ENUM_WORKER="$(VGI_BAD_ENUM_WORKER)" \
 	VGI_SIMPLE_WRITABLE_WORKER="$(VGI_SIMPLE_WRITABLE_WORKER)" \
 	VGI_ROWID_CONSTRAINT_WORKER="$(VGI_ROWID_CONSTRAINT_WORKER)" \
+	VGI_MALFORMED_BATCH_WORKER="$(VGI_MALFORMED_BATCH_WORKER)" \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
 	VGI_TEST_DEDICATED_WORKER=1 \
 	python3 scripts/run_tests.py --build release "test/*" "~test/sql/integration/writable/*"
@@ -161,6 +166,7 @@ test_spawn_debug:
 	VGI_BAD_ENUM_WORKER="$(VGI_BAD_ENUM_WORKER)" \
 	VGI_SIMPLE_WRITABLE_WORKER="$(VGI_SIMPLE_WRITABLE_WORKER)" \
 	VGI_ROWID_CONSTRAINT_WORKER="$(VGI_ROWID_CONSTRAINT_WORKER)" \
+	VGI_MALFORMED_BATCH_WORKER="$(VGI_MALFORMED_BATCH_WORKER)" \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
 	VGI_TEST_DEDICATED_WORKER=1 \
 	python3 scripts/run_tests.py --build debug "test/*" "~test/sql/integration/writable/*"
@@ -201,6 +207,7 @@ test_launcher:
 	VGI_BAD_ENUM_WORKER="launch:$(VGI_BAD_ENUM_WORKER)" \
 	VGI_SIMPLE_WRITABLE_WORKER="launch:$(VGI_SIMPLE_WRITABLE_WORKER)" \
 	VGI_ROWID_CONSTRAINT_WORKER="launch:$(VGI_ROWID_CONSTRAINT_WORKER)" \
+	VGI_MALFORMED_BATCH_WORKER="launch:$(VGI_MALFORMED_BATCH_WORKER)" \
 	VGI_REQUIRE_LAUNCHER_TRANSPORT=1 \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
 	./build/release/test/unittest "test/*" \
@@ -218,6 +225,7 @@ test_launcher_debug:
 	VGI_BAD_ENUM_WORKER="launch:$(VGI_BAD_ENUM_WORKER)" \
 	VGI_SIMPLE_WRITABLE_WORKER="launch:$(VGI_SIMPLE_WRITABLE_WORKER)" \
 	VGI_ROWID_CONSTRAINT_WORKER="launch:$(VGI_ROWID_CONSTRAINT_WORKER)" \
+	VGI_MALFORMED_BATCH_WORKER="launch:$(VGI_MALFORMED_BATCH_WORKER)" \
 	VGI_REQUIRE_LAUNCHER_TRANSPORT=1 \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
 	./build/debug/test/unittest "test/*" \
@@ -254,6 +262,7 @@ test_launcher_cloudflare_do:
 	VGI_BAD_ENUM_WORKER="launch:$(VGI_BAD_ENUM_WORKER)" \
 	VGI_SIMPLE_WRITABLE_WORKER="launch:$(VGI_SIMPLE_WRITABLE_WORKER)" \
 	VGI_ROWID_CONSTRAINT_WORKER="launch:$(VGI_ROWID_CONSTRAINT_WORKER)" \
+	VGI_MALFORMED_BATCH_WORKER="launch:$(VGI_MALFORMED_BATCH_WORKER)" \
 	VGI_REQUIRE_LAUNCHER_TRANSPORT=1 \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
 	VGI_WORKER_SHARED_STORAGE=cloudflare-do \
@@ -278,6 +287,7 @@ test_launcher_cloudflare_do_debug:
 	VGI_BAD_ENUM_WORKER="launch:$(VGI_BAD_ENUM_WORKER)" \
 	VGI_SIMPLE_WRITABLE_WORKER="launch:$(VGI_SIMPLE_WRITABLE_WORKER)" \
 	VGI_ROWID_CONSTRAINT_WORKER="launch:$(VGI_ROWID_CONSTRAINT_WORKER)" \
+	VGI_MALFORMED_BATCH_WORKER="launch:$(VGI_MALFORMED_BATCH_WORKER)" \
 	VGI_REQUIRE_LAUNCHER_TRANSPORT=1 \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
 	VGI_WORKER_SHARED_STORAGE=cloudflare-do \
@@ -536,6 +546,7 @@ test_python:
 	VGI_BAD_ENUM_WORKER="launch:$(VGI_BAD_ENUM_WORKER)" \
 	VGI_SIMPLE_WRITABLE_WORKER="launch:$(VGI_SIMPLE_WRITABLE_WORKER)" \
 	VGI_ROWID_CONSTRAINT_WORKER="launch:$(VGI_ROWID_CONSTRAINT_WORKER)" \
+	VGI_MALFORMED_BATCH_WORKER="launch:$(VGI_MALFORMED_BATCH_WORKER)" \
 	VGI_REQUIRE_LAUNCHER_TRANSPORT=1 \
 	VGI_SCHEMA_RECONCILE_DB="$$(mktemp -d)/vgi_schema_reconcile.sqlite" \
 	    python3 scripts/run_tests.py -j 6 \
@@ -626,6 +637,7 @@ VGI_EXPECTED_SKIPS := \
 	--allow-skip 'require-env VGI_WORKER_SUPPORTS_DYNAMIC_CODE' \
 	--allow-skip 'require-env VGI_SIMPLE_WRITABLE_WORKER' \
 	--allow-skip 'require-env VGI_ROWID_CONSTRAINT_WORKER' \
+	--allow-skip 'require-env VGI_MALFORMED_BATCH_WORKER' \
 	--allow-skip 'require-env VGI_SCHEMA_RECONCILE_DB' \
 	--allow-skip 'require-env VGI_RULES_WORKER' \
 	--allow-skip 'require-env VGI_REQUIRE_LAUNCHER_TRANSPORT'

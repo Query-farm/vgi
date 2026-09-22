@@ -1,0 +1,93 @@
+# name: test/sql/integration/table/malformed_worker_batches.test
+# description: Arrow batches from a worker are validated before DuckDB reads them (vgi_validate_worker_batches)
+# group: [vgi_integration_table]
+
+# test/support/malformed_batch_worker.py emits well-framed IPC whose buffer
+# CONTENTS are invalid. Arrow's IPC reader accepts all four; without validation
+# DuckDB read out of bounds (a ~1 MiB string of process memory, a 3M-element
+# list) or stored invalid UTF-8 in a VARCHAR.
+#
+# Never read these with validation set to 'none': that is a real out-of-bounds
+# read in the test process.
+
+require-env VGI_MALFORMED_BATCH_WORKER
+
+require vgi
+
+statement ok
+ATTACH 'malformed' AS m (TYPE vgi, LOCATION '${VGI_MALFORMED_BATCH_WORKER}');
+
+# ---- setting ----
+
+query T
+SELECT current_setting('vgi_validate_worker_batches');
+----
+full
+
+statement error
+SET vgi_validate_worker_batches = 'fulll';
+----
+vgi_validate_worker_batches must be 'full', 'structural' or 'none'
+
+statement ok
+SET vgi_validate_worker_batches = 'STRUCTURAL';
+
+query T
+SELECT current_setting('vgi_validate_worker_batches');
+----
+structural
+
+statement ok
+SET vgi_validate_worker_batches = 'none';
+
+statement ok
+RESET vgi_validate_worker_batches;
+
+# ---- full (default): every case is rejected ----
+
+statement error
+SELECT * FROM m.main.malformed_string_offsets();
+----
+worker sent a malformed Arrow batch (full validation)
+
+statement error
+SELECT * FROM m.main.malformed_list_offsets();
+----
+worker sent a malformed Arrow batch (full validation)
+
+statement error
+SELECT * FROM m.main.malformed_bad_utf8();
+----
+Invalid UTF8 sequence
+
+statement error
+SELECT * FROM m.main.malformed_dict_index();
+----
+Dictionary indices invalid
+
+# ---- structural: offsets that run past their buffers are still rejected ----
+
+statement ok
+SET vgi_validate_worker_batches = 'structural';
+
+statement error
+SELECT * FROM m.main.malformed_string_offsets();
+----
+worker sent a malformed Arrow batch (structural validation)
+
+statement error
+SELECT * FROM m.main.malformed_list_offsets();
+----
+worker sent a malformed Arrow batch (structural validation)
+
+# (bad_utf8 and dict_index pass structural validation by design: catching them
+# needs a per-value scan, which is what 'full' is for.)
+
+statement ok
+RESET vgi_validate_worker_batches;
+
+# The failures did not invalidate the database.
+query I
+SELECT 42;
+----
+42

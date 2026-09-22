@@ -422,7 +422,7 @@ void VgiAggregateWindow(AggregateInputData &aggr_input_data, const WindowPartiti
 	}
 	auto rb_view = rb_binary->GetView(0);
 	auto result_batch = DeserializeFromIpcBytes(
-	    reinterpret_cast<const uint8_t *>(rb_view.data()), rb_view.size());
+	    reinterpret_cast<const uint8_t *>(rb_view.data()), rb_view.size(), GetWorkerBatchValidation(&context));
 
 	if (!result_batch || result_batch->num_rows() != 1 || result_batch->num_columns() != 1) {
 		throw IOException("VGI aggregate_window returned invalid one-row result");
@@ -506,7 +506,7 @@ void VgiAggregateWindowBatch(AggregateInputData &aggr_input_data, const WindowPa
 	}
 	auto rb_view = rb_binary->GetView(0);
 	auto result_batch = DeserializeFromIpcBytes(
-	    reinterpret_cast<const uint8_t *>(rb_view.data()), rb_view.size());
+	    reinterpret_cast<const uint8_t *>(rb_view.data()), rb_view.size(), GetWorkerBatchValidation(&context));
 
 	if (!result_batch || result_batch->num_columns() != 1) {
 		throw IOException("VGI aggregate_window_batch returned invalid result");

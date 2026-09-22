@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "duckdb/common/insertion_order_preserving_map.hpp"
+#include "vgi_batch_validation.hpp"
 
 namespace duckdb {
 namespace vgi {
@@ -31,8 +32,12 @@ std::vector<uint8_t> SerializeToIpcBytes(const std::shared_ptr<arrow::RecordBatc
                                           const std::shared_ptr<arrow::KeyValueMetadata> &custom_metadata = nullptr);
 
 // Deserialize a RecordBatch from IPC bytes.
-std::shared_ptr<arrow::RecordBatch> DeserializeFromIpcBytes(const std::vector<uint8_t> &bytes);
-std::shared_ptr<arrow::RecordBatch> DeserializeFromIpcBytes(const uint8_t *data, size_t len);
+std::shared_ptr<arrow::RecordBatch> DeserializeFromIpcBytes(const std::vector<uint8_t> &bytes,
+                                                             WorkerBatchValidation validation = WorkerBatchValidation::FULL);
+// Nested IPC payloads come from workers, so the decoded batch is validated
+// (vgi_batch_validation.hpp). Callers without a query context keep FULL.
+std::shared_ptr<arrow::RecordBatch> DeserializeFromIpcBytes(const uint8_t *data, size_t len,
+                                                             WorkerBatchValidation validation = WorkerBatchValidation::FULL);
 
 // Zero-copy variant: decode the inner IPC stream stored in cell ``index`` of a
 // BinaryArray (the "dataclass-as-binary" envelope pattern) WITHOUT copying the
@@ -42,7 +47,8 @@ std::shared_ptr<arrow::RecordBatch> DeserializeFromIpcBytes(const uint8_t *data,
 // paths (bind results, table-buffering envelopes, catalog results) where the
 // pointer-based overload would alloc+memcpy the whole inner payload.
 std::shared_ptr<arrow::RecordBatch> DeserializeFromIpcBytesZeroCopy(const arrow::BinaryArray &bin,
-                                                                     int64_t index);
+                                                                     int64_t index,
+                                                                     WorkerBatchValidation validation = WorkerBatchValidation::FULL);
 
 // Deserialized batch with optional custom metadata from the IPC message.
 struct DeserializedBatch {
@@ -51,7 +57,8 @@ struct DeserializedBatch {
 };
 
 // Deserialize a RecordBatch from IPC bytes, preserving custom metadata.
-DeserializedBatch DeserializeFromIpcBytesWithMetadata(const uint8_t *data, size_t len);
+DeserializedBatch DeserializeFromIpcBytesWithMetadata(const uint8_t *data, size_t len,
+                                                      WorkerBatchValidation validation = WorkerBatchValidation::FULL);
 
 // Serialize an Arrow Schema to IPC bytes.
 std::vector<uint8_t> SerializeSchemaToIpcBytes(const std::shared_ptr<arrow::Schema> &schema);

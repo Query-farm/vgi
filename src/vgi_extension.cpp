@@ -91,6 +91,7 @@
 #include "vgi_table_function_impl.hpp"
 #include "vgi_transport.hpp"
 #include "vgi_location_policy.hpp"
+#include "vgi_batch_validation.hpp"
 #include "vgi_worker_pool.hpp"
 #include "vgi_table_statistics_function.hpp"
 #include "vgi_table_branches_function.hpp"
@@ -3489,6 +3490,18 @@ static void LoadInternal(ExtensionLoader &loader) {
 	}
 
 	// Register HTTP timeout setting
+	// Worker batch validation (vgi_batch_validation.hpp). A worker's Arrow batches
+	// are checked before DuckDB reads them; `full` is the safe default.
+	config.AddExtensionOption(
+	    vgi::kWorkerBatchValidationSetting,
+	    "How thoroughly Arrow batches received from VGI workers are validated before use: full (default; every "
+	    "offset, UTF-8 string and dictionary index), structural (buffer sizes and lengths only), or none",
+	    LogicalType::VARCHAR, Value("full"), [](ClientContext &, SetScope, Value &parameter) {
+		    // Reject typos; store the canonical spelling.
+		    auto level = vgi::ParseWorkerBatchValidation(parameter.IsNull() ? std::string() : parameter.ToString());
+		    parameter = Value(vgi::WorkerBatchValidationName(level));
+	    });
+
 	config.AddExtensionOption("vgi_http_timeout_seconds",
 	                          "Timeout in seconds for VGI HTTP requests (catalog, init, and exchange operations)",
 	                          LogicalType::BIGINT, Value::BIGINT(300));

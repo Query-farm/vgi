@@ -1271,8 +1271,10 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 		// so subprocess workers get externalization just like HTTP ones. (A batch
 		// is either an external-location pointer OR a shm pointer OR inline — the
 		// shm block below is skipped for a resolved external batch.)
+		bool resolved_external = false;
 		if (result.custom_metadata &&
 		    ClassifyBatch(result.batch, result.custom_metadata) == RpcBatchType::EXTERNAL_LOCATION) {
+			resolved_external = true;
 			int loc_idx = result.custom_metadata->FindKey(RPC_LOCATION_KEY);
 			const std::string location_url = result.custom_metadata->value(loc_idx);
 			auto resolved = ResolveExternalLocation(context_, location_url, worker_path_, GetExecutionIdHex(),
@@ -1316,6 +1318,12 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 			}
 		}
 #endif // VGI_POSIX_TRANSPORT (shm)
+
+		// Validate the batch DuckDB will read (inline or shm-resolved). An
+		// externalized batch was validated by the reader that fetched it.
+		if (!resolved_external) {
+			ValidateWorkerBatch(&context_, result.batch.get(), worker_path_);
+		}
 
 		// Parse vgi_partition_values#b64 off the wire metadata. Base64-
 		// decode here; IPC decode + validation happen in InstallBatch on

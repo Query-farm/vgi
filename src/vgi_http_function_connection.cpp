@@ -311,6 +311,10 @@ void HttpFunctionConnection::BufferDataBatches(std::shared_ptr<arrow::Buffer> ow
 			continue;
 		}
 
+		// Validate what DuckDB will read (externalized batches above are
+		// validated by the reader that fetched them).
+		ValidateWorkerBatch(&context_, bwm.batch.get(), base_url_);
+
 		// Extract stream_state from regular data batches.
 		ExtractStreamState(bwm.batch, bwm.custom_metadata);
 		buffered_batches_.push_back(bwm.batch);
@@ -1006,6 +1010,8 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 			new_state_token = ExtractStreamStateValue(resolved.metadata);
 			continue;
 		}
+
+		ValidateWorkerBatch(&context_, bwm.batch.get(), base_url_);
 
 		// Data batch — extract stream_state
 		new_state_token = ExtractStreamStateValue(bwm.custom_metadata);

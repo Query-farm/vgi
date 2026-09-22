@@ -407,7 +407,8 @@ std::vector<uint8_t> SerializeToIpcBytes(const std::shared_ptr<arrow::RecordBatc
 	return out;
 }
 
-std::shared_ptr<arrow::RecordBatch> DeserializeFromIpcBytes(const uint8_t *data, size_t len) {
+std::shared_ptr<arrow::RecordBatch> DeserializeFromIpcBytes(const uint8_t *data, size_t len,
+                                                             WorkerBatchValidation validation) {
 	auto alloc_result = arrow::AllocateBuffer(static_cast<int64_t>(len));
 	if (!alloc_result.ok()) {
 		throw IOException("Failed to allocate buffer for IPC deserialization: %s",
@@ -427,15 +428,18 @@ std::shared_ptr<arrow::RecordBatch> DeserializeFromIpcBytes(const uint8_t *data,
 	if (!status.ok()) {
 		throw IOException("Failed to read batch from IPC bytes: %s", status.ToString());
 	}
+	ValidateWorkerBatch(batch.get(), validation, "nested IPC payload");
 	return batch;
 }
 
-std::shared_ptr<arrow::RecordBatch> DeserializeFromIpcBytes(const std::vector<uint8_t> &bytes) {
-	return DeserializeFromIpcBytes(bytes.data(), bytes.size());
+std::shared_ptr<arrow::RecordBatch> DeserializeFromIpcBytes(const std::vector<uint8_t> &bytes,
+                                                             WorkerBatchValidation validation) {
+	return DeserializeFromIpcBytes(bytes.data(), bytes.size(), validation);
 }
 
 std::shared_ptr<arrow::RecordBatch> DeserializeFromIpcBytesZeroCopy(const arrow::BinaryArray &bin,
-                                                                     int64_t index) {
+                                                                     int64_t index,
+                                                                     WorkerBatchValidation validation) {
 	// Slice the cell straight out of the array's values buffer — the slice
 	// holds a reference to the parent buffer, so batches decoded from it
 	// (Arrow IPC reads are zero-copy views) stay valid after the outer batch
@@ -454,10 +458,12 @@ std::shared_ptr<arrow::RecordBatch> DeserializeFromIpcBytesZeroCopy(const arrow:
 	if (!status.ok()) {
 		throw IOException("Failed to read batch from IPC bytes: %s", status.ToString());
 	}
+	ValidateWorkerBatch(batch.get(), validation, "nested IPC payload");
 	return batch;
 }
 
-DeserializedBatch DeserializeFromIpcBytesWithMetadata(const uint8_t *data, size_t len) {
+DeserializedBatch DeserializeFromIpcBytesWithMetadata(const uint8_t *data, size_t len,
+                                                      WorkerBatchValidation validation) {
 	auto alloc_result = arrow::AllocateBuffer(static_cast<int64_t>(len));
 	if (!alloc_result.ok()) {
 		throw IOException("Failed to allocate buffer for IPC deserialization: %s",
@@ -478,6 +484,7 @@ DeserializedBatch DeserializeFromIpcBytesWithMetadata(const uint8_t *data, size_
 		throw IOException("Failed to read batch from IPC bytes: %s", result.status().ToString());
 	}
 	auto bwm = result.ValueUnsafe();
+	ValidateWorkerBatch(bwm.batch.get(), validation, "nested IPC payload");
 	return {bwm.batch, bwm.custom_metadata};
 }
 

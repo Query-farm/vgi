@@ -254,7 +254,7 @@ AggregateRpcResult InvokeAggregateRpc(ClientContext &context, const VgiAggregate
 			auto v = bin->GetView(0);
 			try {
 				inner = DeserializeFromIpcBytes(reinterpret_cast<const uint8_t *>(v.data()),
-				                                v.size());
+				                                v.size(), GetWorkerBatchValidation(&context));
 			} catch (const std::exception &e) {
 				throw IOException("Failed to deserialize IPC response for %s [worker: %s]: %s",
 				                  method_name, worker_path, e.what());
@@ -545,7 +545,8 @@ void VgiAggregateFinalize(Vector &state_vector, AggregateInputData &aggr_input_d
 		throw IOException("VGI aggregate_finalize response has null result_batch for '%s'", bind_data.function_name);
 	}
 	auto rb_view = rb_binary->GetView(0);
-	auto result_batch = DeserializeFromIpcBytes(reinterpret_cast<const uint8_t *>(rb_view.data()), rb_view.size());
+	auto result_batch = DeserializeFromIpcBytes(reinterpret_cast<const uint8_t *>(rb_view.data()), rb_view.size(),
+	                                            GetWorkerBatchValidation(&context));
 
 	if (!result_batch || result_batch->num_columns() != 1) {
 		throw IOException("VGI aggregate_finalize returned invalid result for '%s'", bind_data.function_name);

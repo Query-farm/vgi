@@ -1057,6 +1057,37 @@ Other fixtures (vgi-python `_test_fixtures/table_in_out.py`):
 `test/sql/integration/cache/exchange_{streaming,lateral,buffered}.test` (both transports;
 hit-skips-worker, LATERAL order-independence + correlated correctness, shared surface + flush).
 
+## Worker Batch Validation
+
+Arrow's IPC reader verifies only message framing (flatbuffer metadata, buffer
+offsets aligned and inside the body). It does not check buffer *contents*, and
+DuckDB's Arrow conversion trusts them: a string offset past its data returned a
+~1 MiB string of process memory, a list offset a 3M-element list, and invalid
+UTF-8 / out-of-range dictionary indices went straight into VARCHAR columns.
+So every batch that enters from a worker is validated (`vgi_batch_validation.{hpp,cpp}`)
+at the `vgi_validate_worker_batches` level (default `full`):
+
+- **Data plane:** each transport's `ReadDataBatch` validates the batch DuckDB will
+  read, after shm / external-location resolution (subprocess/unix/tcp/iroh in
+  `FunctionConnection`, both HTTP loops, the SAB web worker — which reuses its
+  non-blocking slot teardown on failure).
+- **Control plane:** the shared unary / stream-header reader (`NextWorkerBatch`
+  in `vgi_rpc_client.cpp`) validates every batch; externalized batches are
+  validated there, once.
+- **Nested IPC payloads:** `DeserializeFromIpcBytes*` take a level (default
+  `full`; small catalog/metadata blobs have no query context). The aggregate
+  result paths pass the configured level. Partition-value payloads are validated too.
+- Local cache bytes (memo arena, exchange/replay caches) are not re-validated —
+  they were validated when received.
+
+Cost (release, Apple Silicon): nothing measurable for fixed-width columns; ~7 GB/s
+of string data for `full` (a pure string-transfer `count(*)` roughly doubles,
+real queries dilute it). Hostile fixture: `test/support/malformed_batch_worker.py`
+(`VGI_MALFORMED_BATCH_WORKER`); test: `table/malformed_worker_batches.test` —
+never read those batches with validation `none`, that is a real OOB read.
+Not covered yet: a worker sending data whose *type* differs from what it declared
+at bind (type confusion) — that needs a schema-vs-bind check.
+
 ## Query Farm Telemetry
 
 Anonymous, opt-out usage telemetry. Two fire-and-forget async HTTPS events: the long-standing
@@ -1074,6 +1105,7 @@ transport in `src/query_farm_telemetry.cpp`. Full field reference: [docs/telemet
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
+| `vgi_validate_worker_batches` | VARCHAR | `full` | How thoroughly Arrow batches received from workers are validated before DuckDB reads them: `full` (`RecordBatch::ValidateFull()` — every offset, UTF-8 string, dictionary index), `structural` (`Validate()` — buffer sizes/lengths/offset bounds, per column), `none`. Arrow's IPC reader checks only framing, so without this a hostile or buggy worker makes DuckDB read out of bounds. Session-settable. See *Worker Batch Validation* |
 | `vgi_allowed_transports` | VARCHAR | `all` | **Narrow-only, database-wide** allowlist of LOCATION transports `ATTACH` / `vgi_catalogs()` may use (`subprocess`, `launch`, `unix`, `oci`, `github`, `database`, `http`, `https`, `tcp`, `httpi`, `iroh`, `worker`, or `all`/`none`). A SET may only remove transports; widening, `RESET` and `SET SESSION` are refused. Independently, `enable_external_access=false` refuses every local transport (the first six). Already-attached catalogs keep working. The classifier mirrors dispatch (native `worker:x` / `IROH://x` are subprocess). See [docs/location_policy.md](docs/location_policy.md) |
 | `vgi_http_timeout_seconds` | BIGINT | 300 | Timeout for HTTP requests (catalog, init, exchange). Generous because HTTP workers may do heavy server-side compute per request |
 | `vgi_oauth_timeout_seconds` | BIGINT | 120 | Window for a human to complete device-code / browser OAuth. Further capped by the provider's `expires_in` |
@@ -1221,6 +1253,7 @@ The `launch:` and `unix://` paths share one warm worker process across every Duc
 | `vgi_arrow_utils.cpp` | Arrow-to-DuckDB type conversion |
 | `vgi_logging.cpp` | `VgiLogType`, `VgiStderrLogEnabled()`, `VgiLogToStderr()` |
 | `vgi_catalogs.cpp` | `vgi_catalogs()` SQL function |
+| `vgi_batch_validation.cpp` | `vgi_validate_worker_batches` levels + `ValidateWorkerBatch` (Arrow `Validate`/`ValidateFull` on worker batches). See *Worker Batch Validation* |
 | `vgi_location_policy.cpp` | `vgi_allowed_transports` narrow-only LOCATION transport allowlist: classifier (mirrors dispatch), parser, per-DB CAS-narrowed state (owned by `VgiStorageExtension`), `CheckLocationPolicy` |
 | `vgi_clear_cache.cpp` | `vgi_clear_cache()` SQL function — clears all VGI catalog caches |
 | `vgi_global_functions.cpp` | Global (`system.main`) function publishing: prefix application (`VgiGlobalFunctionName`) + bind-time resolution of the live catalog behind a registration that outlives DETACH (`ResolveVgiGlobalBinding` / `ResolveVgiFunctionBinding`). Registration itself + `vgi_global_functions()` live in `vgi_extension.cpp`; the function-set builders live in the `storage/vgi_*_function_set.cpp` files. See *Global Functions (system.main)* |

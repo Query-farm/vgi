@@ -315,6 +315,7 @@ src/vgi_oauth_env.cpp
 src/vgi_oauth_store.cpp
 src/vgi_catalogs.cpp
 src/vgi_location_policy.cpp
+src/vgi_batch_validation.cpp
 src/vgi_table_function_impl.cpp
 src/vgi_table_in_out_impl.cpp
 src/vgi_scalar_function_impl.cpp
@@ -481,6 +482,7 @@ if((BUILD_VGI_UNIT_TESTS OR DEFINED ENV{BUILD_VGI_UNIT_TESTS}) AND NOT WIN32)
     src/vgi_webworker_function_connection.cpp
     src/vgi_rpc_client.cpp
     src/vgi_rpc_types.cpp
+    src/vgi_batch_validation.cpp
     src/vgi_bind_protocol.cpp
     src/vgi_arrow_utils.cpp
     src/vgi_result_cache.cpp

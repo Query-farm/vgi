@@ -1070,6 +1070,17 @@ std::shared_ptr<arrow::RecordBatch> WebWorkerFunctionConnection::ReadDataBatch()
 			input_writer_closed_ = true;
 		}
 	};
+	// Store+notify-only teardown for a throw mid-stream (see the log-batch catch
+	// below for why it must never wait).
+	auto abandon_slot = [this]() {
+		data_finished_ = true;
+		input_writer_closed_ = true; // abandon the Arrow writer; ring EOS below drives teardown
+		if (slot_ >= 0) {
+			vgi_wasm_slot_write_eos(region_offset_, slot_);
+			vgi_wasm_slot_release(region_offset_, slot_);
+			slot_ = -1;
+		}
+	};
 
 	while (true) {
 		auto read_result = data_reader_->ReadNext();
@@ -1120,13 +1131,7 @@ std::shared_ptr<arrow::RecordBatch> WebWorkerFunctionConnection::ReadDataBatch()
 			// freed slot rides the next slot_open's worker-done handshake (unique claim id +
 			// the worker closing w2c before it re-parks), not a drain here. Freeing now (vs
 			// the deferred destructor) avoids "channel exhausted" for a following scan.
-			data_finished_ = true;
-			input_writer_closed_ = true; // abandon the Arrow writer; ring EOS below drives teardown
-			if (slot_ >= 0) {
-				vgi_wasm_slot_write_eos(region_offset_, slot_);
-				vgi_wasm_slot_release(region_offset_, slot_);
-				slot_ = -1;
-			}
+			abandon_slot();
 			throw;
 		}
 
@@ -1139,6 +1144,15 @@ std::shared_ptr<arrow::RecordBatch> WebWorkerFunctionConnection::ReadDataBatch()
 			throw IOException("VGI worker: external-location batches are not supported over the "
 			                  "worker: (SAB) transport [worker: %s]",
 			                  location_);
+		}
+
+		// Validate the batch DuckDB will read; a malformed one fails the scan with
+		// the same non-blocking slot teardown as a worker error.
+		try {
+			ValidateWorkerBatch(&context_, result.batch.get(), location_);
+		} catch (...) {
+			abandon_slot();
+			throw;
 		}
 
 		// Parse vgi_partition_values#b64 off the wire metadata. Base64-decode

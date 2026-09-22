@@ -250,7 +250,7 @@ std::shared_ptr<arrow::RecordBatch> VgiAggregateStreamingChunk(
 	}
 	auto rb_view = rb_bin->GetView(0);
 	auto result_batch = DeserializeFromIpcBytes(
-	    reinterpret_cast<const uint8_t *>(rb_view.data()), rb_view.size());
+	    reinterpret_cast<const uint8_t *>(rb_view.data()), rb_view.size(), GetWorkerBatchValidation(&context));
 
 	if (!result_batch) {
 		throw IOException(

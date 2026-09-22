@@ -3188,6 +3188,11 @@ static bool DecodePartitionMinTuple(ClientContext &context, const std::string &p
 	if (pv_batch->num_rows() != 2) {
 		return false;
 	}
+	try {
+		ValidateWorkerBatch(&context, pv_batch.get(), "partition values");
+	} catch (const std::exception &) {
+		return false;
+	}
 	auto cpd = ConvertPartitionValuesBatch(context, pv_batch);
 	out.clear();
 	out.reserve(cpd.size());
@@ -3363,6 +3368,8 @@ static bool InstallBatch(ClientContext &context, const VgiTableFunctionBindData 
 			                  bind_data.function_name);
 		}
 		auto pv_batch = next_result.ValueUnsafe().batch;
+		ValidateWorkerBatch(&context, pv_batch.get(),
+		                    StringUtil::Format("function '%s' vgi_partition_values", bind_data.function_name));
 		if (pv_batch->num_rows() != 2) {
 			throw IOException("VGI function '%s' emitted vgi_partition_values with %lld rows "
 			                  "(expected exactly 2: row 0 = min, row 1 = max)",
