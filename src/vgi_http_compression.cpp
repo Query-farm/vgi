@@ -29,23 +29,21 @@ static constexpr int kDefaultGzipLevel = 6;
 // internally on every call.
 //
 // This used to keep a `thread_local` context per thread and reuse it, to skip
-// that allocation on the per-chunk HTTP exchange hot path. Removed 2026-09-22:
-// correctness of that cache rests entirely on `thread_local` isolating the
-// context per thread, and under emscripten these entry points run inside a
-// dynamically loaded SIDE_MODULE whose TLS block has to be initialized for
-// every thread, including ones that already existed when the module loaded.
-// A DuckDB-Wasm client running ~6 concurrent exchange POSTs sent a request
-// body that was the right length but entirely zeroed — the signature of the
-// zero-initialized destination vector in ZstdCompress below never being
-// written, which is what a CCtx shared between concurrent compressions
-// produces. That cache was the only shared mutable state on the path; the TLS
-// failure itself was observed only by its effect, not proven directly.
-// Nothing above this layer can catch it either: the body carries a correct
-// Content-Length and a `Content-Encoding: zstd` header, so it fails at the far
-// end as an unreadable frame.
+// that allocation on the per-chunk HTTP exchange hot path. Removed 2026-09-22
+// while chasing DuckDB-Wasm request bodies that arrived at the server with a
+// correct Content-Length but unrelated contents.
 //
-// The allocation this reinstates is microseconds against the network round
-// trip it precedes. Do not reintroduce a shared context without first proving
+// **That cache was NOT the cause** — the corruption reproduced unchanged on a
+// build without it. The real bug was in DuckDB-Wasm's EM_JS XHR glue, where a
+// pointer above 2 GiB arrives negative and `HEAPU8.slice()` then reads from
+// the wrong end of the heap (haybarn-wasm `lib/src/http_wasm.cc`, fixed in
+// `0c3ca4d6`). Nothing in this file was ever at fault; don't re-litigate the
+// zstd path if a similar report appears.
+//
+// Kept one-shot anyway, on its own merits: the per-call context allocation is
+// microseconds against the network round trip it precedes, and it removes any
+// dependence on `thread_local` semantics inside a dynamically loaded
+// SIDE_MODULE. Do not reintroduce a shared context without first proving
 // that side-module TLS isolates it on every supported client.
 
 static std::string ZstdDecompress(const char *data, size_t size, size_t max_bytes) {
