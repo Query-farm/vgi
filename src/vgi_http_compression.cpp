@@ -24,49 +24,29 @@ static constexpr int kDefaultGzipLevel = 6;
 // zstd
 // ---------------------------------------------------------------------------
 
-// Reused per-thread compression / decompression contexts. The one-shot
-// ZSTD_compress / ZSTD_decompress entry points allocate and free a full
-// CCtx/DCtx internally on EVERY call — measurable on the per-chunk HTTP
-// exchange hot path (one compress + one decompress per 2048-row vector).
-// A context is created lazily per thread and reused for its lifetime;
-// creation failure falls back to the one-shot API (never throws here).
-namespace {
-
-struct ZstdCCtxHolder {
-	duckdb_zstd::ZSTD_CCtx *ctx = nullptr;
-	~ZstdCCtxHolder() {
-		if (ctx) {
-			duckdb_zstd::ZSTD_freeCCtx(ctx);
-		}
-	}
-};
-
-struct ZstdDCtxHolder {
-	duckdb_zstd::ZSTD_DCtx *ctx = nullptr;
-	~ZstdDCtxHolder() {
-		if (ctx) {
-			duckdb_zstd::ZSTD_freeDCtx(ctx);
-		}
-	}
-};
-
-duckdb_zstd::ZSTD_CCtx *GetThreadZstdCCtx() {
-	thread_local ZstdCCtxHolder holder;
-	if (!holder.ctx) {
-		holder.ctx = duckdb_zstd::ZSTD_createCCtx();
-	}
-	return holder.ctx;
-}
-
-duckdb_zstd::ZSTD_DCtx *GetThreadZstdDCtx() {
-	thread_local ZstdDCtxHolder holder;
-	if (!holder.ctx) {
-		holder.ctx = duckdb_zstd::ZSTD_createDCtx();
-	}
-	return holder.ctx;
-}
-
-} // namespace
+// Compression and decompression go through the one-shot ZSTD_compress /
+// ZSTD_decompress entry points, which allocate and free their CCtx/DCtx
+// internally on every call.
+//
+// This used to keep a `thread_local` context per thread and reuse it, to skip
+// that allocation on the per-chunk HTTP exchange hot path. Removed 2026-09-22:
+// correctness of that cache rests entirely on `thread_local` isolating the
+// context per thread, and under emscripten these entry points run inside a
+// dynamically loaded SIDE_MODULE whose TLS block has to be initialized for
+// every thread, including ones that already existed when the module loaded.
+// A DuckDB-Wasm client running ~6 concurrent exchange POSTs sent a request
+// body that was the right length but entirely zeroed — the signature of the
+// zero-initialized destination vector in ZstdCompress below never being
+// written, which is what a CCtx shared between concurrent compressions
+// produces. That cache was the only shared mutable state on the path; the TLS
+// failure itself was observed only by its effect, not proven directly.
+// Nothing above this layer can catch it either: the body carries a correct
+// Content-Length and a `Content-Encoding: zstd` header, so it fails at the far
+// end as an unreadable frame.
+//
+// The allocation this reinstates is microseconds against the network round
+// trip it precedes. Do not reintroduce a shared context without first proving
+// that side-module TLS isolates it on every supported client.
 
 static std::string ZstdDecompress(const char *data, size_t size, size_t max_bytes) {
 	using namespace duckdb_zstd;
@@ -83,9 +63,7 @@ static std::string ZstdDecompress(const char *data, size_t size, size_t max_byte
 			    static_cast<unsigned long long>(max_bytes));
 		}
 		std::string decompressed(frame_size, '\0');
-		auto *dctx = GetThreadZstdDCtx();
-		auto result = dctx ? ZSTD_decompressDCtx(dctx, decompressed.data(), frame_size, data, size)
-		                   : ZSTD_decompress(decompressed.data(), frame_size, data, size);
+		auto result = ZSTD_decompress(decompressed.data(), frame_size, data, size);
 		if (ZSTD_isError(result)) {
 			throw IOException("VGI zstd decompression failed: %s", ZSTD_getErrorName(result));
 		}
@@ -130,9 +108,7 @@ static std::vector<uint8_t> ZstdCompress(const uint8_t *data, size_t size, int l
 	using namespace duckdb_zstd;
 	auto bound = ZSTD_compressBound(size);
 	std::vector<uint8_t> compressed(bound);
-	auto *cctx = GetThreadZstdCCtx();
-	auto result = cctx ? ZSTD_compressCCtx(cctx, compressed.data(), bound, data, size, level)
-	                   : ZSTD_compress(compressed.data(), bound, data, size, level);
+	auto result = ZSTD_compress(compressed.data(), bound, data, size, level);
 	if (ZSTD_isError(result)) {
 		throw IOException("VGI zstd compression failed: %s", ZSTD_getErrorName(result));
 	}
