@@ -56,8 +56,17 @@ namespace {
 class PidReaper {
 public:
 	static PidReaper &Instance() {
-		static PidReaper inst;
-		return inst;
+		// Intentionally leaked (same rationale as VgiWorkerPool / VgiResultCache):
+		// Run() executes on a DETACHED thread that locks mu_ for the whole process
+		// lifetime. A function-local ``static PidReaper inst;`` is destroyed during
+		// __cxa_finalize at process exit while that thread is still running, so its
+		// next mu_.lock() hits a destroyed mutex → std::mutex::lock() throws EINVAL
+		// → uncaught on the reaper thread → std::terminate → SIGABRT. (Observed as an
+		// intermittent teardown abort under the parallel cross-SDK test matrix.)
+		// Leaking keeps mu_ (and pids_) alive so the detached reaper never races
+		// static teardown.
+		static PidReaper *inst = new PidReaper();
+		return *inst;
 	}
 
 	void Register(pid_t pid) {
