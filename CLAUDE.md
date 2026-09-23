@@ -1094,11 +1094,16 @@ skipped on a cached-replay connection — `IFunctionConnection::IsCachedReplay()
 int64, with valid utf8 buffers that pass `ValidateFull`) would be a misread, not
 a cast. A conforming worker can't trigger it (vgi-rpc's producer writer is bound
 to `output_schema`); it defends against a hostile / non-conforming worker.
-Expected types come from `bind_result.output_schema` indexed by the scan's
-`projection_ids` (empty = full schema). Still only on the producer path — the
-scalar / aggregate / table-in-out / buffered / write conversions
-(`ArrowToDuckDB` with their own bind schema) are a documented follow-up; the
-buffer-content check above already covers their malformed-buffer cases.
+Expected types come from the path's declared output schema, and where the wire
+batch is projection-narrowed (producer, table-in-out, LATERAL) from that schema
+indexed by the scan's `projection_ids` (empty = full schema); the shared
+`ValidateProjectedWireBatch` builds the expected per-wire-column types. The
+guard covers every path that feeds `ArrowToDuckDB` from a worker batch:
+producer scan, scalar, streaming table-in-out + finalize, batched LATERAL,
+buffered Source, and aggregate finalize/window/streaming. Each skips a
+cached-replay connection (`IsCachedReplay` — the result cache may serve a
+projection subset from a wider entry). The write/RETURNING path is covered
+separately by `ValidateReturningSchema` (field-type check before conversion).
 
 ## Query Farm Telemetry
 
