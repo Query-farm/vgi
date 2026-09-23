@@ -80,6 +80,29 @@ void ValidateWireBatchTypes(const arrow::RecordBatch &batch,
 	}
 }
 
+void ValidateProjectedWireBatch(ClientContext *context, const arrow::RecordBatch &batch,
+                                const std::shared_ptr<arrow::Schema> &declared,
+                                const std::vector<int32_t> &projection_ids, const std::string &worker,
+                                const std::string &function) {
+	if (!declared || GetWorkerBatchValidation(context) == WorkerBatchValidation::NONE) {
+		return;
+	}
+	std::vector<std::shared_ptr<arrow::DataType>> expected;
+	if (projection_ids.empty()) {
+		expected.reserve(declared->num_fields());
+		for (int i = 0; i < declared->num_fields(); i++) {
+			expected.push_back(declared->field(i)->type());
+		}
+	} else {
+		expected.reserve(projection_ids.size());
+		for (int32_t original : projection_ids) {
+			expected.push_back(original >= 0 && original < declared->num_fields() ? declared->field(original)->type()
+			                                                                      : nullptr);
+		}
+	}
+	ValidateWireBatchTypes(batch, expected, worker, function);
+}
+
 void ValidateWorkerBatch(const arrow::RecordBatch *batch, WorkerBatchValidation level, const std::string &worker) {
 	if (!batch || level == WorkerBatchValidation::NONE) {
 		return;

@@ -1,5 +1,6 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "vgi_table_in_out_impl.hpp"
+#include "vgi_batch_validation.hpp"
 #include "vgi_arrow_utils.hpp"
 #include "vgi_client_timing.hpp"
 #include "vgi_cancel_dispatcher.hpp"
@@ -876,6 +877,11 @@ OperatorResultType VgiTableInOutFunction(ExecutionContext &context, TableFunctio
 			if (output_batch->num_rows() == 0) {
 				continue; // empty-but-not-EOS: keep reading, never return 0 rows mid-stream
 			}
+			if (!conn.IsCachedReplay()) {
+				vgi::ValidateProjectedWireBatch(&client_context, *output_batch, bind_data.output_schema,
+				                                global_state.projection_ids, bind_data.worker_path(),
+				                                bind_data.function_name);
+			}
 			LoadBatchIntoScanState(local_state, output_batch);
 			idx_t rows_copied =
 			    ProduceOutputFromBatch(local_state, bind_data.arrow_table, output, bind_data.projection_pushdown);
@@ -1058,6 +1064,15 @@ OperatorResultType VgiTableInOutFunction(ExecutionContext &context, TableFunctio
 		return OperatorResultType::NEED_MORE_INPUT;
 	}
 
+	// Type-confusion guard: the worker output batch's types must match what it
+	// declared at bind (skipped on a cached-replay connection). See
+	// vgi_batch_validation.hpp.
+	if (!conn.IsCachedReplay()) {
+		vgi::ValidateProjectedWireBatch(&client_context, *output_batch, bind_data.output_schema,
+		                                global_state.projection_ids, bind_data.worker_path(),
+		                                bind_data.function_name);
+	}
+
 	// Load batch into scan state and produce output
 	idx_t rows_copied;
 	if (timing) {
@@ -1207,6 +1222,14 @@ OperatorFinalizeResultType VgiTableInOutFinalize(ExecutionContext &context, Tabl
 		// End of stream - clean up
 		release_and_finish();
 		return OperatorFinalizeResultType::FINISHED;
+	}
+
+	// Type-confusion guard on the finalize output batch (skipped on a
+	// cached-replay connection). See vgi_batch_validation.hpp.
+	if (!conn->IsCachedReplay()) {
+		vgi::ValidateProjectedWireBatch(&client_context, *output_batch, bind_data.output_schema,
+		                                global_state.projection_ids, bind_data.worker_path(),
+		                                bind_data.function_name);
 	}
 
 	// Load batch into scan state and produce output

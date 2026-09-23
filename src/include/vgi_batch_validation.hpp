@@ -62,6 +62,18 @@ void ValidateWireBatchTypes(const arrow::RecordBatch &batch,
                             const std::vector<std::shared_ptr<arrow::DataType>> &expected,
                             const std::string &worker, const std::string &function);
 
+// Validate a worker OUTPUT batch against a declared output schema projected by
+// `projection_ids` (worker-original column indices; empty = the full schema,
+// all columns in order). Builds the expected per-wire-column types and defers
+// to ValidateWireBatchTypes. A no-op when `context`'s level is NONE or
+// `declared` is null. This is the shared form for every path whose wire batch
+// is the worker's (possibly projection-narrowed) output: the producer table
+// scan and the exchange table-in-out / buffered / lateral operators.
+void ValidateProjectedWireBatch(ClientContext *context, const arrow::RecordBatch &batch,
+                                const std::shared_ptr<arrow::Schema> &declared,
+                                const std::vector<int32_t> &projection_ids, const std::string &worker,
+                                const std::string &function);
+
 // Convenience: validate at the level configured for `context`.
 inline void ValidateWorkerBatch(ClientContext *context, const arrow::RecordBatch *batch, const std::string &worker) {
 	ValidateWorkerBatch(batch, GetWorkerBatchValidation(context), worker);
