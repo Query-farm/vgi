@@ -1,5 +1,6 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "vgi_aggregate_function_impl.hpp"
+#include "vgi_batch_validation.hpp"
 #include "vgi_aggregate_window_impl.hpp"
 #include "vgi_arrow_utils.hpp"
 #include "vgi_catalog_rpc.hpp"
@@ -562,6 +563,13 @@ void VgiAggregateFinalize(Vector &state_vector, AggregateInputData &aggr_input_d
 	vector<LogicalType> output_types;
 	vector<string> output_names;
 	ArrowSchemaToDuckDBTypes(context, result_batch->schema(), c_schema, arrow_table, output_types, output_names);
+
+	// Type-confusion guard: the worker's finalize result is converted (via a type
+	// map built from its own schema) into a result Vector of the declared return
+	// type, so a result whose type disagrees with what the worker declared at
+	// bind is a misread. No projection on this path. See vgi_batch_validation.hpp.
+	ValidateProjectedWireBatch(&context, *result_batch, bind_data.resolved_output_schema, {},
+	                           bind_data.attach_params->worker_path(), bind_data.function_name);
 
 	auto chunk_wrapper = make_uniq<ArrowArrayWrapper>();
 	ExportRecordBatch(result_batch, *chunk_wrapper);

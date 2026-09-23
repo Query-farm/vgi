@@ -1,5 +1,6 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "vgi_streaming_window_operator.hpp"
+#include "vgi_batch_validation.hpp"
 
 #include <arrow/c/bridge.h>
 
@@ -357,6 +358,10 @@ OperatorResultType PhysicalVgiStreamingWindow::Execute(ExecutionContext &context
 		vector<LogicalType> out_types;
 		vector<string> out_names;
 		ArrowSchemaToDuckDBTypes(client_context, result_batch->schema(), c_schema, arrow_table, out_types, out_names);
+
+		// Type-confusion guard: worker streaming-window result vs the bind-declared output type.
+		ValidateProjectedWireBatch(&client_context, *result_batch, bind_data.resolved_output_schema, {},
+		                           bind_data.attach_params->worker_path(), bind_data.function_name);
 
 		auto chunk_wrapper = make_uniq<ArrowArrayWrapper>();
 		ExportRecordBatch(result_batch, *chunk_wrapper);

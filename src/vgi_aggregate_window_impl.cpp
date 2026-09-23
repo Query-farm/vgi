@@ -1,5 +1,6 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "vgi_aggregate_window_impl.hpp"
+#include "vgi_batch_validation.hpp"
 
 #include <cstring>
 
@@ -435,6 +436,10 @@ void VgiAggregateWindow(AggregateInputData &aggr_input_data, const WindowPartiti
 	vector<string> out_names;
 	ArrowSchemaToDuckDBTypes(context, result_batch->schema(), c_schema, arrow_table, out_types, out_names);
 
+	// Type-confusion guard: worker window result vs the bind-declared output type.
+	ValidateProjectedWireBatch(&context, *result_batch, bind_data.resolved_output_schema, {},
+	                           bind_data.attach_params->worker_path(), bind_data.function_name);
+
 	auto chunk_wrapper = make_uniq<ArrowArrayWrapper>();
 	ExportRecordBatch(result_batch, *chunk_wrapper);
 	ArrowScanLocalState scan_state(std::move(chunk_wrapper), context);
@@ -523,6 +528,10 @@ void VgiAggregateWindowBatch(AggregateInputData &aggr_input_data, const WindowPa
 	vector<LogicalType> out_types;
 	vector<string> out_names;
 	ArrowSchemaToDuckDBTypes(context, result_batch->schema(), c_schema, arrow_table, out_types, out_names);
+
+	// Type-confusion guard: worker window-batch result vs the bind-declared output type.
+	ValidateProjectedWireBatch(&context, *result_batch, bind_data.resolved_output_schema, {},
+	                           bind_data.attach_params->worker_path(), bind_data.function_name);
 
 	auto chunk_wrapper = make_uniq<ArrowArrayWrapper>();
 	ExportRecordBatch(result_batch, *chunk_wrapper);
