@@ -1,5 +1,6 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "vgi_scalar_function_impl.hpp"
+#include "vgi_batch_validation.hpp"
 #include "storage/vgi_transaction.hpp"
 #include "vgi_arrow_utils.hpp"
 #include "vgi_client_timing.hpp"
@@ -885,6 +886,23 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 	// PopulateArrowTableSchema + GetDuckDBTypesFromArrowTable per batch
 	// (~1 µs each at 2K rows, ~3-5% of total per-batch cost for cheap-compute
 	// scalars like multiply).
+	// Type-confusion guard: the worker's output batch must carry the type it
+	// declared at bind. ArrowToDuckDB below reads the batch's buffers into a
+	// result Vector of the declared return type (and caches the Arrow type map
+	// from the first batch), so a batch whose type disagrees is a misread, not a
+	// cast. Gated by vgi_validate_worker_batches (NONE opts out, like the
+	// producer path). See vgi_batch_validation.hpp.
+	if (bind_data && bind_data->resolved_output_schema &&
+	    GetWorkerBatchValidation(&context) != WorkerBatchValidation::NONE) {
+		const auto &declared = *bind_data->resolved_output_schema;
+		std::vector<std::shared_ptr<arrow::DataType>> expected;
+		expected.reserve(declared.num_fields());
+		for (int i = 0; i < declared.num_fields(); i++) {
+			expected.push_back(declared.field(i)->type());
+		}
+		ValidateWireBatchTypes(*output_batch, expected, func_info.worker_path(), func_info.function_name);
+	}
+
 	if (!local_state.output_schema_cached) {
 		if (timing) {
 			ScopedNs _t(ClientTiming::Instance().schema_ns);
