@@ -1,5 +1,6 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "vgi_lateral_batch_operator.hpp"
+#include "vgi_batch_validation.hpp"
 
 #include <atomic>
 #include <cstring>
@@ -1006,6 +1007,24 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 		state.parent_index = std::move(worker_parent);
 	}
 	state.input_size_at_decode = input.size();
+
+	// Type-confusion guard: the worker exchange output batch's types must match
+	// what the worker declared at bind (ArrowToDuckDB below reads buffers by the
+	// bind-time type). This is always a live worker batch — the cache-serve path
+	// is EmitServedSlice, not here — but the IsCachedReplay guard keeps it
+	// uniform. Expected types come from bd.output_schema projected by the
+	// worker's column ids. See vgi_batch_validation.hpp.
+	if (!state.connection || !state.connection->IsCachedReplay()) {
+		std::vector<int32_t> proj;
+		if (projection_pushdown) {
+			proj.reserve(worker_column_ids.size());
+			for (auto c : worker_column_ids) {
+				proj.push_back(static_cast<int32_t>(c));
+			}
+		}
+		vgi::ValidateProjectedWireBatch(&client_context, *output_batch, bd.output_schema, proj, bd.worker_path(),
+		                                bd.function_name);
+	}
 
 	LoadBatchIntoScanState(state.scan, output_batch);
 	idx_t start = state.scan.chunk_offset; // 0 for a freshly loaded batch

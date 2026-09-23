@@ -1,5 +1,6 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "vgi_table_buffering_impl.hpp"
+#include "vgi_batch_validation.hpp"
 
 #include <arrow/c/bridge.h>
 #include <arrow/util/byte_size.h> // TotalBufferSize — bound the whole-input RAM capture
@@ -1245,6 +1246,16 @@ SourceResultType PhysicalVgiTableBufferingFunction::GetDataInternal(ExecutionCon
 	lstate.arrow_table = ArrowTableSchema();
 	ArrowTableFunction::PopulateArrowTableSchema(context.client, lstate.arrow_table,
 	                                              lstate.c_schema.arrow_schema);
+
+	// Type-confusion guard: this path builds its Arrow type map from the batch's
+	// own schema but writes into output vectors of the declared return type, so a
+	// batch whose type disagrees with the bind-declared output_schema is a
+	// misread. Skipped on a cached-replay worker (M3 hit). See
+	// vgi_batch_validation.hpp.
+	if (!lstate.worker->IsCachedReplay()) {
+		vgi::ValidateProjectedWireBatch(&context.client, *batch, bd.output_schema, projection_ids, bd.worker_path(),
+		                                bd.function_name);
+	}
 
 	auto chunk_wrapper = make_uniq<ArrowArrayWrapper>();
 	ExportRecordBatch(batch, *chunk_wrapper);
