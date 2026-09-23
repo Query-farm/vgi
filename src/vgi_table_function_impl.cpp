@@ -2067,7 +2067,27 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 
 	// Extract projection IDs from input.column_ids for the worker.
 	// Only send projection IDs when the function supports projection pushdown.
-	// When unsupported, send empty list (meaning "all columns" in the protocol).
+	//
+	// When unsupported this vector stays empty, and BuildInitRequest encodes an
+	// empty vector as NULL on the wire (vgi_rpc_types.cpp, "append null
+	// projection_ids") — not as an empty list. A receiver reads null as "no
+	// projection pushdown", i.e. send every column, which is what we want.
+	//
+	// (The previous comment here said we send an "empty list meaning all
+	// columns". That was the pre-vgi_rpc convention; it arrived with the
+	// migration in 3f81f4b already describing code that no longer existed.)
+	//
+	// A consequence worth knowing: because an empty vector is spoken for by
+	// null, there is currently NO way to express a genuine zero-column
+	// projection — the count(*) shape, where only the row count is wanted and
+	// no column data need be read. vgi-python already distinguishes the two
+	// (`projection_ids: list[int] | None`, where [] means "project nothing"),
+	// and its table-function fixtures handle the empty-output_schema case. To
+	// reach it, this vector and the PerformInit / BuildInitRequest chain would
+	// have to carry std::optional, with nullopt -> null and an empty vector ->
+	// an empty list. Note DuckDB was measured pushing one column
+	// (projection_ids=[0]) even for a bare count(*), so that plumbing alone
+	// would not make counts cheaper without a DuckDB-side change too.
 	std::vector<int32_t> projection_ids;
 	if (bind_data.projection_pushdown) {
 		projection_ids.reserve(input.column_ids.size());
