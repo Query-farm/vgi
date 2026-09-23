@@ -207,6 +207,8 @@ jobs:
             --allow-skip 'require-env VGI_RULES_WORKER' \
             --allow-skip 'require-env VGI_REQUIRE_LAUNCHER_TRANSPORT' \
             --allow-skip 'require-env VGI_WORKER_SUPPORTS_DYNAMIC_CODE' \
+            --allow-skip 'require-env VGI_MALFORMED_BATCH_WORKER' \
+            --allow-skip 'require-env VGI_ROWID_CONSTRAINT_WORKER' \
             "test/sql/integration/*"
 
       - name: Cache statistics
