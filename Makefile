@@ -463,7 +463,7 @@ test_all_debug: test_spawn_debug test_shm_debug test_unix_debug test_http_debug 
 
 VGI_GO_DIR     ?= $(HOME)/Development/vgi-go
 VGI_TS_DIR     ?= $(HOME)/Development/vgi-typescript
-VGI_JAVA_DIR   ?= $(HOME)/vgi-java
+VGI_JAVA_DIR   ?= $(HOME)/Development/vgi-java
 VGI_RUST_DIR   ?= $(HOME)/Development/vgi-rust
 VGI_CSHARP_DIR ?= $(HOME)/Development/vgi-csharp
 
