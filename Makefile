@@ -329,6 +329,11 @@ test_http_debug:
 	    "~test/sql/integration/writable/*" \
 	    "~test/sql/integration/projection_pushdown_repro.test"
 
+# Local OAuth discovery fixture: refresh/session reuse without a real login.
+.PHONY: test_catalog_discovery_auth
+test_catalog_discovery_auth:
+	VGI_PYTHON_DIR="$(VGI_PYTHON_DIR)" python3 test/catalog_discovery_auth.py
+
 # HTTP bearer auth tests
 test_http_bearer:
 	./test/run_http_bearer_integration.sh "test/sql/integration/bearer_auth/*"

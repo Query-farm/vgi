@@ -141,6 +141,15 @@ jobs:
       - name: Install the vgi-python fixture workers
         run: ./scripts/ci_install_fixtures.sh
 
+      - name: Test authenticated catalog discovery
+        env:
+          VGI_PYTHON_DIR: /tmp/vgi-python
+          QUERY_FARM_TELEMETRY_OPT_OUT: "1"
+        run: |
+          make test_http_bearer 2>&1 | tee /tmp/vgi-bearer.log
+          make test_catalog_discovery_auth 2>&1 | tee /tmp/vgi-discovery-auth.log
+          ./build/release/test/unittest "test/sql/oauth/catalog_discovery_options.test" 2>&1 | tee /tmp/vgi-discovery-options.log
+
       - name: Build pinned Iroh qualification bridge
         run: |
           git clone --filter=blob:none https://github.com/Query-farm/vgi-rpc-rust.git /tmp/vgi-rpc-rust

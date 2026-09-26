@@ -1,0 +1,65 @@
+# Discovery validates auth options before I/O, just like ATTACH.
+require vgi
+
+set ignore_error_messages Unable to connect
+
+statement error
+SELECT * FROM vgi_catalogs('https://127.0.0.1:1', bearer_token := 'a', oauth_refresh_token := 'b');
+----
+Cannot specify both bearer_token and oauth_refresh_token
+
+statement error
+SELECT * FROM vgi_catalogs('https://127.0.0.1:1', oauth_cache := 'bogus');
+----
+oauth_cache must be auto, persistent, memory, or none
+
+statement error
+SELECT * FROM vgi_catalogs('https://127.0.0.1:1', oauth_profile := '');
+----
+oauth_profile must not be empty
+
+statement error
+SELECT * FROM vgi_catalogs('https://127.0.0.1:1', bearer_token := NULL);
+----
+bearer_token must not be NULL
+
+statement error
+SELECT * FROM vgi_catalogs('https://127.0.0.1:1', oauth_refresh_token := NULL);
+----
+oauth_refresh_token must not be NULL
+
+statement error
+SELECT * FROM vgi_catalogs('unused-worker', bearer_token := 'a');
+----
+only valid for HTTP transport
+
+statement error
+SELECT * FROM vgi_catalogs('unused-worker', oauth_refresh_token := 'b');
+----
+only valid for HTTP transport
+
+# EXPLAIN binds without contacting the worker. All cache modes are accepted.
+statement ok
+EXPLAIN SELECT * FROM vgi_catalogs('unused-worker', oauth_cache := 'MEMORY');
+
+statement ok
+EXPLAIN SELECT * FROM vgi_catalogs('unused-worker', oauth_cache := 'none');
+
+statement ok
+EXPLAIN SELECT * FROM vgi_catalogs('unused-worker', oauth_cache := 'persistent');
+
+statement ok
+SET vgi_oauth_cache = 'memory';
+
+statement ok
+EXPLAIN SELECT * FROM vgi_catalogs('unused-worker');
+
+statement error
+SELECT * FROM vgi_catalogs('https://127.0.0.1:1', oauth_profile := NULL);
+----
+oauth_profile must not be NULL
+
+statement error
+SELECT * FROM vgi_catalogs('https://127.0.0.1:1', oauth_cache := NULL);
+----
+oauth_cache must not be NULL

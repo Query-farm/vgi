@@ -1,0 +1,31 @@
+# Authenticated catalog discovery uses the same bearer handler as ATTACH.
+require-env VGI_TEST_WORKER
+
+require-env VGI_TEST_BEARER_TOKEN
+
+require vgi
+
+require httpfs
+
+set ignore_error_messages Unable to connect
+
+query T
+SELECT catalog FROM vgi_catalogs('${VGI_TEST_WORKER}', bearer_token := '${VGI_TEST_BEARER_TOKEN}') WHERE catalog = 'example';
+----
+example
+
+statement error
+SELECT * FROM vgi_catalogs('${VGI_TEST_WORKER}', bearer_token := 'wrong-token');
+----
+bearer token was rejected
+
+statement error
+SELECT * FROM vgi_catalogs('${VGI_TEST_WORKER}');
+----
+The server requires authentication but advertised no OAuth challenge
+
+# Failure does not poison a subsequent discovery.
+query I
+SELECT count(*) > 0 FROM vgi_catalogs('${VGI_TEST_WORKER}', bearer_token := '${VGI_TEST_BEARER_TOKEN}');
+----
+true
