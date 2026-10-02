@@ -3404,6 +3404,20 @@ static void LoadInternal(ExtensionLoader &loader) {
 	auto &config = DBConfig::GetConfig(loader.GetDatabaseInstance());
 	auto vgi_storage = make_shared_ptr<VgiStorageExtension>(loader.GetDatabaseInstance());
 	StorageExtension::Register(config, "vgi", vgi_storage);
+#ifdef __EMSCRIPTEN__
+	// Start the cancel dispatcher's thread now, on the main runtime thread
+	// (haybarn-wasm runs LOAD single-threaded). Creating it lazily, from the
+	// destructor of an interrupted scan running on a pthread, deadlocked the
+	// engine; see VgiCancelDispatcher::EnsureWorkerStarted. It waits for
+	// requests, waking every 100ms, and takes one slot of the PTHREAD_POOL_SIZE
+	// pool. If it can't be created, LOAD still succeeds: cancels are dropped
+	// and server-side streams expire by TTL.
+	try {
+		vgi_storage->GetCancelDispatcher().StartWorker();
+	} catch (const std::exception &e) {
+		VGI_STDERR_DEBUG("[VGI] cancel_dispatcher.start_failed what=%s\n", e.what());
+	}
+#endif
 	// LOCATION transport allowlist. Registered right after the storage extension
 	// that owns its state, and before anything can ATTACH.
 	vgi::RegisterLocationPolicySetting(config, vgi_storage->GetLocationPolicy());

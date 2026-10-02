@@ -22,8 +22,8 @@ constexpr auto kShutdownJoinDeadline = std::chrono::seconds(2);
 
 } // namespace
 
-VgiCancelDispatcher::VgiCancelDispatcher(DatabaseInstance &db)
-    : db_(db), queue_(1024), streaming_close_queue_(1024) {
+VgiCancelDispatcher::VgiCancelDispatcher(DatabaseInstance &db, VgiCancelWorkerStart start)
+    : db_(db), start_(start), queue_(1024), streaming_close_queue_(1024) {
 }
 
 VgiCancelDispatcher::~VgiCancelDispatcher() {
@@ -63,6 +63,7 @@ VgiCancelDispatcher::~VgiCancelDispatcher() {
 		}
 	}
 
+	std::lock_guard<std::mutex> conn_lock(conn_mutex_);
 	if (!detached) {
 		// Worker has exited — safe to close the bot connection.
 		conn_.reset();
@@ -89,7 +90,9 @@ bool VgiCancelDispatcher::Enqueue(CancelRequest req) noexcept {
 	// plausibly throw — wrap in try/catch so Enqueue stays noexcept
 	// as promised.
 	try {
-		EnsureWorkerStarted();
+		if (!EnsureWorkerStarted()) {
+			return false;
+		}
 	} catch (...) {
 		return false;
 	}
@@ -111,7 +114,9 @@ bool VgiCancelDispatcher::EnqueueStreamingClose(StreamingCloseRequest req) noexc
 		return false;
 	}
 	try {
-		EnsureWorkerStarted();
+		if (!EnsureWorkerStarted()) {
+			return false;
+		}
 	} catch (...) {
 		return false;
 	}
@@ -126,7 +131,33 @@ bool VgiCancelDispatcher::EnqueueStreamingClose(StreamingCloseRequest req) noexc
 	return true;
 }
 
-void VgiCancelDispatcher::EnsureWorkerStarted() {
+bool VgiCancelDispatcher::EnsureWorkerStarted() {
+	if (worker_running_.load(std::memory_order_acquire)) {
+		return true;
+	}
+	if (start_ == VgiCancelWorkerStart::kExplicitOnly) {
+		// On WASM the worker is started once, at extension load (StartWorker), and
+		// never here. Enqueue runs from destructors, often on a pthread: a table
+		// scan's local state is destroyed on whichever thread ran its task. There,
+		// pthread_create is a synchronous call proxied to the main runtime thread,
+		// and when a query is interrupted that thread is spinning in
+		// Executor::CancelTasks, waiting for this very task to unregister. It never
+		// services the proxied call, so the two wait on each other forever: in
+		// Cupola, the first cancel of a VGI scan after a page load hung the engine
+		// in 6 of 10 runs at threads > 1, and in 0 of 10 with cancel disabled.
+		// Creating a thread after side modules are dlopen'd is also unreliable on
+		// WASM (see vgi_wasm_async_pool.hpp). Until the worker is running the
+		// caller drops the request; the server-side stream then expires by TTL.
+		// "Running", not "started": a created pthread that never starts would
+		// otherwise accept requests nothing drains.
+		return false;
+	}
+	// A request queued before the new thread runs is drained once it does.
+	StartWorker();
+	return true;
+}
+
+void VgiCancelDispatcher::StartWorker() {
 	if (worker_started_.load(std::memory_order_acquire)) {
 		return;
 	}
@@ -134,15 +165,25 @@ void VgiCancelDispatcher::EnsureWorkerStarted() {
 	if (worker_started_.load(std::memory_order_relaxed)) {
 		return;
 	}
-	// Open the bot connection. Kept alive for the dispatcher's
-	// lifetime so context.db is always valid on the worker thread.
-	conn_ = std::make_unique<duckdb::Connection>(db_);
-
 	worker_ = std::thread([this]() { WorkerLoop(); });
 	worker_started_.store(true, std::memory_order_release);
 }
 
+duckdb::Connection &VgiCancelDispatcher::BotConnection() {
+	// Kept alive for the dispatcher's lifetime so context.db is always valid
+	// on the worker thread. Opened here rather than in StartWorker, which on
+	// WASM runs during extension load, before the database is ready for one.
+	// The reference stays valid after the lock is released: only the
+	// destructor drops conn_, after joining the worker, or leaks it.
+	std::lock_guard<std::mutex> lock(conn_mutex_);
+	if (!conn_) {
+		conn_ = std::make_unique<duckdb::Connection>(db_);
+	}
+	return *conn_;
+}
+
 void VgiCancelDispatcher::WorkerLoop() {
+	worker_running_.store(true, std::memory_order_release);
 	while (!shutdown_.load(std::memory_order_acquire)) {
 		CancelRequest req;
 		if (queue_.try_dequeue(req)) {
@@ -173,7 +214,7 @@ void VgiCancelDispatcher::ProcessOne(CancelRequest &req) noexcept {
 		// context_ references the originating query's ClientContext, which is
 		// typically destroyed by the time we run here (off-thread). Using it
 		// would use-after-free its Logger inside CancelStream's VGI_LOG.
-		req.connection->CancelStream(req.state_token, *conn_->context);
+		req.connection->CancelStream(req.state_token, *BotConnection().context);
 	} catch (const std::exception &e) {
 		// Best-effort; log and move on. Never propagate.
 		try {
@@ -190,7 +231,11 @@ void VgiCancelDispatcher::ProcessOne(CancelRequest &req) noexcept {
 
 void VgiCancelDispatcher::ProcessStreamingClose(StreamingCloseRequest &req) noexcept {
 	try {
-		if (!req.attach_params || !conn_ || !conn_->context) {
+		if (!req.attach_params) {
+			return;
+		}
+		auto &bot = BotConnection();
+		if (!bot.context) {
 			return;
 		}
 		// Synthesise the minimum bind data InvokeAggregateRpc needs:
@@ -207,7 +252,7 @@ void VgiCancelDispatcher::ProcessStreamingClose(StreamingCloseRequest &req) noex
 		session.execution_id = std::move(req.execution_id);
 		session.attach_opaque_data = std::move(req.attach_opaque_data);
 
-		VgiAggregateStreamingClose(*conn_->context, synth_bind, session,
+		VgiAggregateStreamingClose(*bot.context, synth_bind, session,
 		                            /*enable_logging=*/false);
 	} catch (const std::exception &e) {
 		try {

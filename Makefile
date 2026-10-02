@@ -722,6 +722,12 @@ test_filter_v2:
 	cmake --build build/release --target vgi_filter_v2_tests
 	./build/release/extension/vgi/vgi_filter_v2_tests
 
+# Configure with BUILD_VGI_CANCEL_DISPATCHER_TESTS=1 (or BUILD_VGI_UNIT_TESTS),
+# then run the cancel dispatcher's worker-start and shutdown tests.
+test_cancel_dispatcher:
+	cmake --build build/release --target vgi_cancel_dispatcher_tests
+	./build/release/extension/vgi/vgi_cancel_dispatcher_tests
+
 # Interactive DuckDB shell with the vgi extension loaded and the example
 # python worker pre-attached as the `example` catalog. Use `make shell`
 # (release) or `make shell_debug` for the debug build. Override the worker

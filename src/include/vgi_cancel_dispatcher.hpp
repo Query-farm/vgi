@@ -51,6 +51,21 @@ struct StreamingCloseRequest {
 	std::vector<uint8_t> attach_opaque_data;
 };
 
+// When the dispatcher's worker thread may be created.
+enum class VgiCancelWorkerStart {
+	// On the first Enqueue, from whatever thread calls it.
+	kOnFirstUse,
+	// Only by an explicit StartWorker(). Enqueue drops requests until the
+	// worker is running. Required on WASM; see EnsureWorkerStarted.
+	kExplicitOnly,
+};
+
+#ifdef __EMSCRIPTEN__
+constexpr VgiCancelWorkerStart kDefaultCancelWorkerStart = VgiCancelWorkerStart::kExplicitOnly;
+#else
+constexpr VgiCancelWorkerStart kDefaultCancelWorkerStart = VgiCancelWorkerStart::kOnFirstUse;
+#endif
+
 // Process-wide (per-DatabaseInstance) background thread that drains
 // CancelRequests from destructors. See plan file for rationale: keeps
 // std::bad_alloc and TLS/HTTPS exceptions off the destructor stack,
@@ -58,7 +73,8 @@ struct StreamingCloseRequest {
 // remains valid for the dispatcher's lifetime.
 class VgiCancelDispatcher {
 public:
-	explicit VgiCancelDispatcher(DatabaseInstance &db);
+	explicit VgiCancelDispatcher(DatabaseInstance &db,
+	                             VgiCancelWorkerStart start = kDefaultCancelWorkerStart);
 	~VgiCancelDispatcher();
 
 	VgiCancelDispatcher(const VgiCancelDispatcher &) = delete;
@@ -75,6 +91,12 @@ public:
 	// ClientContext on the destruction thread.
 	bool EnqueueStreamingClose(StreamingCloseRequest req) noexcept;
 
+	// Start the worker thread now rather than on first use. Idempotent. Throws
+	// std::system_error if the thread cannot be created. With kExplicitOnly
+	// (WASM) this is the only way the worker starts, and it must be called from
+	// the main runtime thread at extension load (see EnsureWorkerStarted).
+	void StartWorker();
+
 	// Test-only: synchronously drain pending work on the caller's
 	// thread. Does not interact with the worker thread.
 	void DrainForTesting();
@@ -86,16 +108,26 @@ public:
 		return pending_count_.load(std::memory_order_relaxed);
 	}
 
+	// Test-only: whether the worker thread has started running WorkerLoop.
+	bool WorkerRunningForTesting() const noexcept {
+		return worker_running_.load(std::memory_order_acquire);
+	}
+
 private:
-	void EnsureWorkerStarted();
+	bool EnsureWorkerStarted();
+	duckdb::Connection &BotConnection();
 	void WorkerLoop();
 	void ProcessOne(CancelRequest &req) noexcept;
 	void ProcessStreamingClose(StreamingCloseRequest &req) noexcept;
 
 	DatabaseInstance &db_;
+	const VgiCancelWorkerStart start_;
 
-	// Bot connection. Opened lazily with the worker thread so a
-	// process that never cancels pays zero startup cost.
+	// Bot connection. Opened lazily by the first request processed, on the
+	// thread processing it, so a process that never cancels pays zero
+	// startup cost. Guarded by conn_mutex_: the worker opens it while
+	// DrainForTesting or the destructor's detach path may touch it.
+	std::mutex conn_mutex_;
 	std::unique_ptr<duckdb::Connection> conn_;
 
 	duckdb_moodycamel::ConcurrentQueue<CancelRequest> queue_;
@@ -104,6 +136,9 @@ private:
 
 	std::thread worker_;
 	std::atomic<bool> worker_started_{false};
+	// Set by the worker thread itself once it runs. A started thread is not
+	// necessarily running: on WASM a pthread can be created and never start.
+	std::atomic<bool> worker_running_{false};
 	std::atomic<bool> shutdown_{false};
 
 	std::mutex start_mutex_;

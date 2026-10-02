@@ -567,3 +567,21 @@ if((BUILD_VGI_FILTER_V2_TESTS OR DEFINED ENV{BUILD_VGI_FILTER_V2_TESTS} OR BUILD
     duckdb_static
     dummy_static_extension_loader)
 endif()
+
+# VgiCancelDispatcher's worker-start policy (the WASM explicit-start rule) and
+# bot connection, against the real dispatcher in the static extension. Same
+# gating and dependencies as the filter tests.
+if((BUILD_VGI_CANCEL_DISPATCHER_TESTS OR DEFINED ENV{BUILD_VGI_CANCEL_DISPATCHER_TESTS} OR
+    BUILD_VGI_UNIT_TESTS OR DEFINED ENV{BUILD_VGI_UNIT_TESTS}) AND NOT WIN32)
+  add_executable(vgi_cancel_dispatcher_tests
+    test/cpp/test_main.cpp
+    test/cpp/test_cancel_dispatcher.cpp)
+  target_include_directories(vgi_cancel_dispatcher_tests PRIVATE
+    src/include
+    duckdb/src/include
+    duckdb/third_party/catch)
+  target_link_libraries(vgi_cancel_dispatcher_tests
+    ${EXTENSION_NAME}
+    duckdb_static
+    dummy_static_extension_loader)
+endif()
