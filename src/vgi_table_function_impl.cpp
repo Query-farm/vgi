@@ -123,13 +123,13 @@ VgiTableFunctionLocalState::~VgiTableFunctionLocalState() noexcept {
 			CancelRequest req;
 			req.connection = std::move(connection);
 			req.state_token = !token.empty() ? std::move(token) : prefetch_slot_->last_state_token;
-			if (dispatcher->Enqueue(std::move(req))) {
-				return;
-			}
-			// Saturation: fall back to normal pool-release below so the
-			// connection is not leaked. req.connection holds the unique_ptr
-			// only if Enqueue returned false — move it back.
-			connection = std::move(req.connection);
+			// Enqueue takes the request by value, so whether or not it is
+			// accepted the connection is gone from here: on saturation, after
+			// shutdown, or before the WASM worker runs, it is dropped without a
+			// cancel. That is the right outcome — a stream that isn't done must
+			// not go back to the pool — and the server's stream expires by TTL.
+			(void)dispatcher->Enqueue(std::move(req));
+			return;
 		}
 	}
 
