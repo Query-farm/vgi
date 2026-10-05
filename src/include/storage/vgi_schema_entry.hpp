@@ -74,6 +74,19 @@ public:
 	std::shared_ptr<const case_insensitive_set_t> GetMacroCallableNames(const vgi::CatalogRpcContext &rpc_ctx,
 	                                                                    bool trust_empty_kinds, ClientContext &context);
 
+	// catalog_contents seeding. The schema set calls SeedContents once, when it
+	// builds this entry from a catalog_contents snapshot; each child set's first
+	// load then takes its seed instead of issuing catalog_schema_contents_*.
+	// Seeds are consumed once — a reload after vgi_clear_cache() goes back to the
+	// per-schema RPCs. The seed mutex is a leaf: nothing is called while it is held.
+	void SeedContents(vgi::VgiSchemaContents &&contents);
+	//! Whether an unconsumed seed exists for a VgiCatalogSet::CacheKindName kind.
+	bool HasSeed(const std::string &kind);
+	//! The seeded tables (consumed), or the catalog_schema_contents_tables RPC.
+	std::vector<vgi::VgiTableInfo> TakeTables(const vgi::CatalogRpcContext &rpc_ctx, ClientContext &context);
+	//! The seeded views (consumed), or the catalog_schema_contents_views RPC.
+	std::vector<vgi::VgiViewInfo> TakeViews(const vgi::CatalogRpcContext &rpc_ctx, ClientContext &context);
+
 private:
 	VgiCatalogSet &GetCatalogSet(CatalogType type);
 
@@ -92,6 +105,18 @@ private:
 	std::optional<std::vector<vgi::VgiFunctionInfo>> scalar_function_inventory_;
 	std::optional<std::vector<vgi::VgiFunctionInfo>> aggregate_function_inventory_;
 	std::optional<std::vector<vgi::VgiFunctionInfo>> table_function_inventory_;
+	// Undecoded catalog_contents snapshot for this schema, plus which kinds
+	// have been taken from it. Each kind is decoded once, on first load.
+	std::mutex seed_mutex_;
+	std::shared_ptr<const vgi::VgiSchemaContents> seed_;
+	case_insensitive_set_t seed_taken_;
+	//! Claim the seed for `kind` (marks it taken); null if absent or already taken.
+	std::shared_ptr<const vgi::VgiSchemaContents> ClaimSeed(const std::string &kind);
+	//! Function / macro inventory from the seed if unclaimed, else the RPC.
+	std::vector<vgi::VgiFunctionInfo> FetchFunctions(const vgi::CatalogRpcContext &rpc_ctx, const char *rpc_type,
+	                                                 ClientContext &context);
+	std::vector<vgi::VgiMacroInfo> FetchMacros(const vgi::CatalogRpcContext &rpc_ctx, const char *rpc_type,
+	                                           ClientContext &context);
 	std::shared_ptr<const case_insensitive_set_t> macro_callable_names_;
 	// True after every function kind has been inspected for macro dependencies.
 	// Estimated zero counts are deliberately not trusted at this correctness

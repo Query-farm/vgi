@@ -144,6 +144,10 @@ struct CatalogAttachResult {
 	std::string resolved_data_version;
 	// Concrete implementation version the worker resolved for this attach.
 	std::string resolved_implementation_version;
+	// The worker serves catalog_contents: the whole catalog in one RPC instead
+	// of catalog_schemas + a catalog_schema_contents_* call per schema and kind.
+	// Older workers omit the field and read as false. See docs/catalog_contents.md.
+	bool supports_catalog_contents = false;
 };
 
 // One published data version of a catalog, surfaced via catalog_catalogs().
@@ -760,6 +764,24 @@ VgiMacroInfo ParseMacroInfo(const std::shared_ptr<arrow::RecordBatch> &batch, co
 // The arguments field is a nested IPC batch with arg_0, arg_1, ... for positional args and named args by name
 VgiScanFunctionResult ParseScanFunctionResult(ClientContext &context, const std::shared_ptr<arrow::RecordBatch> &batch,
                                                const std::string &worker_path);
+
+// One schema and everything in it, from catalog_contents. Only `schema` is
+// decoded up front; `entry` is the schema's SchemaContents record, whose
+// per-kind item lists are decoded on first use (DecodeContents* in
+// vgi_catalog_rpc.hpp), so a query touching two schemas does not pay to decode
+// the whole catalog. Each kind is complete: an empty list means none.
+struct VgiSchemaContents {
+	VgiSchemaInfo schema;
+	std::shared_ptr<arrow::RecordBatch> entry;
+	std::string worker_path;
+};
+
+// Result of catalog_contents: the whole catalog at catalog_version (a
+// worker-defined, session-scoped value).
+struct VgiCatalogContents {
+	int64_t catalog_version = 0;
+	std::vector<VgiSchemaContents> schemas;
+};
 
 } // namespace vgi
 } // namespace duckdb

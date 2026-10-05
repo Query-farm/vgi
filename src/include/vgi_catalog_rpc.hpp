@@ -99,6 +99,19 @@ std::vector<VgiCatalogInfo> InvokeCatalogs(const std::string &worker_path, Clien
 // Invoke catalog_schemas: list schemas in an attached catalog
 std::vector<VgiSchemaInfo> InvokeCatalogSchemas(const CatalogRpcContext &ctx, ClientContext &context);
 
+// Invoke catalog_contents: every schema and all of its contents in one RPC.
+// Only call when the attach result sets supports_catalog_contents.
+VgiCatalogContents InvokeCatalogContents(const CatalogRpcContext &ctx, ClientContext &context);
+
+// Decode one kind of a catalog_contents schema entry (done lazily, on a set's
+// first load). function_type / macro_type use the RPC spellings
+// (SCALAR_FUNCTION, TABLE_MACRO, ...).
+std::vector<VgiTableInfo> DecodeContentsTables(const VgiSchemaContents &contents, ClientContext &context);
+std::vector<VgiViewInfo> DecodeContentsViews(const VgiSchemaContents &contents);
+std::vector<VgiFunctionInfo> DecodeContentsFunctions(const VgiSchemaContents &contents,
+                                                     const std::string &function_type);
+std::vector<VgiMacroInfo> DecodeContentsMacros(const VgiSchemaContents &contents, const std::string &macro_type);
+
 // Invoke catalog_schema_contents_tables: list tables in a schema
 std::vector<VgiTableInfo> InvokeCatalogSchemaContentsTables(const CatalogRpcContext &ctx,
                                                             const std::string &schema_name, ClientContext &context);

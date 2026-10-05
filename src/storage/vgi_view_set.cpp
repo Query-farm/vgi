@@ -161,7 +161,7 @@ void VgiViewSet::LoadEntries(ClientContext &context, const std::lock_guard<std::
 	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_opaque_data, vgi_tx_load.GetTransactionOpaqueData()};
 	rpc_ctx.entity_kind = "schema";
 	rpc_ctx.entity_qualifier = schema_.name;
-	auto views = vgi::InvokeCatalogSchemaContentsViews(rpc_ctx, schema_.name, context);
+	auto views = schema_.TakeViews(rpc_ctx, context);
 
 	for (auto &view_info : views) {
 		auto view_entry = CreateViewEntryFromInfo(catalog_, schema_, view_info);

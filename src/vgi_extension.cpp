@@ -3987,6 +3987,16 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// every elided RPC will fire instead. Used by support engineers to rule
 	// the bypass in/out without restarting the worker; read per-call so it
 	// takes effect immediately (no re-attach needed).
+	// Whole-catalog load in one RPC when the worker advertises
+	// supports_catalog_contents; read per schema-set load, so a SET takes
+	// effect on the next load (e.g. after vgi_clear_cache()).
+	config.AddExtensionOption(
+	    "vgi_catalog_contents",
+	    "Load a VGI catalog with a single catalog_contents RPC when the worker supports it, instead of "
+	    "catalog_schemas plus a catalog_schema_contents_* call per schema and kind. Set to false to force "
+	    "the per-schema RPCs.",
+	    LogicalType::BOOLEAN, Value::BOOLEAN(true));
+
 	config.AddExtensionOption(
 	    "vgi_trust_empty_kinds",
 	    "Trust worker assertions that estimated_object_count[kind] == 0 means the kind is empty "

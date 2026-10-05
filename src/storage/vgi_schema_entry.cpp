@@ -37,13 +37,64 @@ VgiSchemaEntry::VgiSchemaEntry(Catalog &catalog, CreateSchemaInfo &info, const v
 
 VgiSchemaEntry::~VgiSchemaEntry() = default;
 
+void VgiSchemaEntry::SeedContents(vgi::VgiSchemaContents &&contents) {
+	std::lock_guard<std::mutex> lock(seed_mutex_);
+	seed_ = std::make_shared<const vgi::VgiSchemaContents>(std::move(contents));
+	seed_taken_.clear();
+}
+
+std::shared_ptr<const vgi::VgiSchemaContents> VgiSchemaEntry::ClaimSeed(const std::string &kind) {
+	std::lock_guard<std::mutex> lock(seed_mutex_);
+	if (!seed_ || !seed_taken_.insert(kind).second) {
+		return nullptr;
+	}
+	return seed_;
+}
+
+bool VgiSchemaEntry::HasSeed(const std::string &kind) {
+	std::lock_guard<std::mutex> lock(seed_mutex_);
+	return seed_ && seed_taken_.find(kind) == seed_taken_.end();
+}
+
+std::vector<vgi::VgiTableInfo> VgiSchemaEntry::TakeTables(const vgi::CatalogRpcContext &rpc_ctx,
+                                                          ClientContext &context) {
+	if (auto seed = ClaimSeed("table")) {
+		return vgi::DecodeContentsTables(*seed, context);
+	}
+	return vgi::InvokeCatalogSchemaContentsTables(rpc_ctx, name, context);
+}
+
+std::vector<vgi::VgiViewInfo> VgiSchemaEntry::TakeViews(const vgi::CatalogRpcContext &rpc_ctx,
+                                                        ClientContext &context) {
+	if (auto seed = ClaimSeed("view")) {
+		return vgi::DecodeContentsViews(*seed);
+	}
+	return vgi::InvokeCatalogSchemaContentsViews(rpc_ctx, name, context);
+}
+
+std::vector<vgi::VgiFunctionInfo> VgiSchemaEntry::FetchFunctions(const vgi::CatalogRpcContext &rpc_ctx,
+                                                                 const char *rpc_type, ClientContext &context) {
+	if (auto seed = ClaimSeed(rpc_type)) {
+		return vgi::DecodeContentsFunctions(*seed, rpc_type);
+	}
+	return vgi::InvokeCatalogSchemaContentsFunctions(rpc_ctx, name, rpc_type, context);
+}
+
+std::vector<vgi::VgiMacroInfo> VgiSchemaEntry::FetchMacros(const vgi::CatalogRpcContext &rpc_ctx,
+                                                           const char *rpc_type, ClientContext &context) {
+	if (auto seed = ClaimSeed(rpc_type)) {
+		return vgi::DecodeContentsMacros(*seed, rpc_type);
+	}
+	return vgi::InvokeCatalogSchemaContentsMacros(rpc_ctx, name, rpc_type, context);
+}
+
 std::vector<vgi::VgiMacroInfo> VgiSchemaEntry::GetMacroInventory(const vgi::CatalogRpcContext &rpc_ctx,
                                                                  CatalogType macro_type, ClientContext &context) {
 	std::lock_guard<std::mutex> lock(macro_discovery_mutex_);
 	auto &inventory = macro_type == CatalogType::MACRO_ENTRY ? scalar_macro_inventory_ : table_macro_inventory_;
 	if (!inventory) {
 		const char *rpc_type = macro_type == CatalogType::MACRO_ENTRY ? "SCALAR_MACRO" : "TABLE_MACRO";
-		inventory = vgi::InvokeCatalogSchemaContentsMacros(rpc_ctx, name, rpc_type, context);
+		inventory = FetchMacros(rpc_ctx, rpc_type, context);
 	}
 	return *inventory;
 }
@@ -71,7 +122,7 @@ std::vector<vgi::VgiFunctionInfo> VgiSchemaEntry::GetFunctionInventory(const vgi
 		throw InternalException("Unsupported VGI function inventory catalog type");
 	}
 	if (!*inventory) {
-		*inventory = vgi::InvokeCatalogSchemaContentsFunctions(rpc_ctx, name, rpc_type, context);
+		*inventory = FetchFunctions(rpc_ctx, rpc_type, context);
 	}
 	return **inventory;
 }
@@ -86,10 +137,10 @@ VgiSchemaEntry::GetMacroCallableNames(const vgi::CatalogRpcContext &rpc_ctx, boo
 	(void)trust_empty_kinds;
 
 	if (!scalar_macro_inventory_) {
-		scalar_macro_inventory_ = vgi::InvokeCatalogSchemaContentsMacros(rpc_ctx, name, "SCALAR_MACRO", context);
+		scalar_macro_inventory_ = FetchMacros(rpc_ctx, "SCALAR_MACRO", context);
 	}
 	if (!table_macro_inventory_) {
-		table_macro_inventory_ = vgi::InvokeCatalogSchemaContentsMacros(rpc_ctx, name, "TABLE_MACRO", context);
+		table_macro_inventory_ = FetchMacros(rpc_ctx, "TABLE_MACRO", context);
 	}
 
 	auto callable_names = std::make_shared<case_insensitive_set_t>();
@@ -107,7 +158,7 @@ VgiSchemaEntry::GetMacroCallableNames(const vgi::CatalogRpcContext &rpc_ctx, boo
 		const auto add_functions = [&](std::optional<std::vector<vgi::VgiFunctionInfo>> &inventory,
 		                               const char *function_type) {
 			if (!inventory) {
-				inventory = vgi::InvokeCatalogSchemaContentsFunctions(rpc_ctx, name, function_type, context);
+				inventory = FetchFunctions(rpc_ctx, function_type, context);
 			}
 			for (const auto &function : *inventory) {
 				callable_names->insert(function.name);

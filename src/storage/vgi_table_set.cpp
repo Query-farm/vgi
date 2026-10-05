@@ -38,7 +38,7 @@ void VgiTableSet::LoadEntries(ClientContext &context,
 	vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_opaque_data, vgi_tx_load.GetTransactionOpaqueData()};
 	rpc_ctx.entity_kind = "schema";
 	rpc_ctx.entity_qualifier = schema_.name;
-	auto tables = vgi::InvokeCatalogSchemaContentsTables(rpc_ctx, schema_.name, context);
+	auto tables = schema_.TakeTables(rpc_ctx, context);
 
 	// Publish each entry under entry_lock_ briefly (per-entry, not whole loop).
 	// Mirrors UnityCatalog UCTableSet::LoadEntries.
@@ -110,7 +110,7 @@ optional_ptr<CatalogEntry> VgiTableSet::GetEntry(ClientContext &context, const s
 			vgi::CatalogRpcContext rpc_ctx{attach_params, attach_result->attach_opaque_data, vgi_tx.GetTransactionOpaqueData()};
 			rpc_ctx.entity_kind = "schema";
 			rpc_ctx.entity_qualifier = schema_.name;
-			auto tables = vgi::InvokeCatalogSchemaContentsTables(rpc_ctx, schema_.name, context);
+			auto tables = schema_.TakeTables(rpc_ctx, context);
 
 			// Build entries OUTSIDE entry_lock_ (CreateTableInfoFromVgiTable
 			// may resolve types that re-enter the catalog). Publish each

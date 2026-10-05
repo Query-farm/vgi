@@ -472,6 +472,142 @@ std::vector<VgiSchemaInfo> InvokeCatalogSchemas(const CatalogRpcContext &ctx, Cl
 	return schemas;
 }
 
+namespace {
+
+// Decode one list<binary> column of a SchemaContents row into item batches,
+// validating each against the item schema of the per-schema RPC that returns
+// the same items (`items_method`).
+std::vector<std::shared_ptr<arrow::RecordBatch>> ContentsItems(const std::shared_ptr<arrow::RecordBatch> &entry,
+                                                               const char *column, const char *items_method,
+                                                               const std::string &worker_path) {
+	std::vector<std::shared_ptr<arrow::RecordBatch>> items;
+	auto col = entry->GetColumnByName(column);
+	if (!col) {
+		throw IOException("catalog_contents: SchemaContents is missing column '%s' [worker: %s]", column, worker_path);
+	}
+	auto list_array = std::dynamic_pointer_cast<arrow::ListArray>(col);
+	if (!list_array) {
+		throw IOException("catalog_contents: SchemaContents column '%s' is not list<binary> [worker: %s]", column,
+		                  worker_path);
+	}
+	if (list_array->IsNull(0)) {
+		return items;
+	}
+	auto values = std::static_pointer_cast<arrow::BinaryArray>(list_array->values());
+	for (int64_t i = list_array->value_offset(0); i < list_array->value_offset(1); i++) {
+		if (values->IsNull(i)) {
+			continue;
+		}
+		auto view = values->GetView(i);
+		auto item = DeserializeFromIpcBytes(std::vector<uint8_t>(view.data(), view.data() + view.size()));
+		if (!item || item->num_rows() == 0) {
+			continue;
+		}
+		ValidateItemSchema(item, items_method, worker_path, static_cast<size_t>(i - list_array->value_offset(0)));
+		items.push_back(std::move(item));
+	}
+	return items;
+}
+
+} // namespace
+
+VgiCatalogContents InvokeCatalogContents(const CatalogRpcContext &ctx, ClientContext &context) {
+	auto &worker_path = ctx.params->worker_path();
+	auto params = generated::BuildCatalogContentsParams(ctx.attach_opaque_data);
+	auto response = InvokeRpcMethod(ctx, "catalog_contents", params, context);
+	auto result_batch = ExtractAndDeserializeResult(response, "catalog_contents", worker_path);
+	if (!result_batch || result_batch->num_rows() == 0) {
+		throw IOException("Empty response from catalog_contents [worker: %s]", worker_path);
+	}
+
+	VgiCatalogContents result;
+	auto version_col = std::dynamic_pointer_cast<arrow::Int64Array>(result_batch->GetColumnByName("catalog_version"));
+	if (version_col && !version_col->IsNull(0)) {
+		result.catalog_version = version_col->Value(0);
+	}
+
+	// `schemas` is list<binary> like an `items` column; each element is one
+	// IPC-serialized SchemaContents record.
+	auto schemas_col = std::dynamic_pointer_cast<arrow::ListArray>(result_batch->GetColumnByName("schemas"));
+	if (!schemas_col) {
+		throw IOException("catalog_contents: response has no list<binary> 'schemas' column [worker: %s]", worker_path);
+	}
+	if (schemas_col->IsNull(0)) {
+		return result;
+	}
+	auto schema_values = std::static_pointer_cast<arrow::BinaryArray>(schemas_col->values());
+	for (int64_t i = schemas_col->value_offset(0); i < schemas_col->value_offset(1); i++) {
+		auto view = schema_values->GetView(i);
+		auto entry = DeserializeFromIpcBytes(std::vector<uint8_t>(view.data(), view.data() + view.size()));
+		if (!entry || entry->num_rows() == 0) {
+			throw IOException("catalog_contents: empty SchemaContents record [worker: %s]", worker_path);
+		}
+
+		VgiSchemaContents contents;
+		auto schema_col = std::dynamic_pointer_cast<arrow::BinaryArray>(entry->GetColumnByName("schema"));
+		if (!schema_col || schema_col->IsNull(0)) {
+			throw IOException("catalog_contents: SchemaContents has no 'schema' [worker: %s]", worker_path);
+		}
+		auto schema_view = schema_col->GetView(0);
+		auto schema_batch =
+		    DeserializeFromIpcBytes(std::vector<uint8_t>(schema_view.data(), schema_view.data() + schema_view.size()));
+		ValidateItemSchema(schema_batch, "catalog_schemas", worker_path, static_cast<size_t>(i));
+		contents.schema = ParseSchemaInfo(schema_batch, worker_path);
+
+		// Item lists stay encoded until a set first loads them.
+		contents.entry = std::move(entry);
+		contents.worker_path = worker_path;
+		result.schemas.push_back(std::move(contents));
+	}
+	return result;
+}
+
+std::vector<VgiTableInfo> DecodeContentsTables(const VgiSchemaContents &contents, ClientContext &context) {
+	std::vector<VgiTableInfo> out;
+	for (auto &b : ContentsItems(contents.entry, "tables", "catalog_schema_contents_tables", contents.worker_path)) {
+		out.push_back(ParseTableInfo(context, b, contents.worker_path));
+	}
+	return out;
+}
+
+std::vector<VgiViewInfo> DecodeContentsViews(const VgiSchemaContents &contents) {
+	std::vector<VgiViewInfo> out;
+	for (auto &b : ContentsItems(contents.entry, "views", "catalog_schema_contents_views", contents.worker_path)) {
+		out.push_back(ParseViewInfo(b, contents.worker_path));
+	}
+	return out;
+}
+
+std::vector<VgiFunctionInfo> DecodeContentsFunctions(const VgiSchemaContents &contents,
+                                                     const std::string &function_type) {
+	const char *column = function_type == "SCALAR_FUNCTION"      ? "scalar_functions"
+	                     : function_type == "AGGREGATE_FUNCTION" ? "aggregate_functions"
+	                     : function_type == "TABLE_FUNCTION"     ? "table_functions"
+	                                                             : nullptr;
+	if (!column) {
+		throw InternalException("catalog_contents: unknown function type %s", function_type);
+	}
+	std::vector<VgiFunctionInfo> out;
+	for (auto &b : ContentsItems(contents.entry, column, "catalog_schema_contents_functions", contents.worker_path)) {
+		out.push_back(ParseFunctionInfo(b, 0, contents.worker_path));
+	}
+	return out;
+}
+
+std::vector<VgiMacroInfo> DecodeContentsMacros(const VgiSchemaContents &contents, const std::string &macro_type) {
+	const char *column = macro_type == "SCALAR_MACRO" ? "scalar_macros"
+	                     : macro_type == "TABLE_MACRO" ? "table_macros"
+	                                                   : nullptr;
+	if (!column) {
+		throw InternalException("catalog_contents: unknown macro type %s", macro_type);
+	}
+	std::vector<VgiMacroInfo> out;
+	for (auto &b : ContentsItems(contents.entry, column, "catalog_schema_contents_macros", contents.worker_path)) {
+		out.push_back(ParseMacroInfo(b, contents.worker_path));
+	}
+	return out;
+}
+
 std::vector<VgiTableInfo> InvokeCatalogSchemaContentsTables(const CatalogRpcContext &ctx,
                                                             const std::string &schema_name, ClientContext &context) {
 	auto &worker_path = ctx.params->worker_path();
@@ -2151,6 +2287,9 @@ CatalogAttachResult ParseCatalogAttachResult(const std::shared_ptr<arrow::Record
 	// omitted a constraint)
 	result.resolved_data_version = row["resolved_data_version"].value_or(std::string(""));
 	result.resolved_implementation_version = row["resolved_implementation_version"].value_or(std::string(""));
+
+	// catalog_contents capability (backward-compatible: older workers omit it)
+	result.supports_catalog_contents = row["supports_catalog_contents"].value_or(false);
 
 	return result;
 }

@@ -34,6 +34,11 @@ bool VgiCatalogSet::ShouldEagerLoadLocked() {
 	if (is_loaded_) {
 		return false;
 	}
+	// A catalog_contents seed is already in memory: loading it costs no RPC,
+	// so always take the bulk path rather than per-name single-entry RPCs.
+	if (schema_entry_ && schema_entry_->HasSeed(CacheKindName())) {
+		return true;
+	}
 	ResolveEagerLoadParamsLocked();
 	return estimated_count_ <= threshold_;
 }
