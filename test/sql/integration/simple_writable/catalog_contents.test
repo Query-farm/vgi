@@ -1,0 +1,79 @@
+# name: test/sql/integration/simple_writable/catalog_contents.test
+# description: The simple writable fixture overrides catalog_attach and does not
+#              advertise supports_catalog_contents, so the client loads it with
+#              catalog_schemas + catalog_schema_contents_* and never sends
+#              catalog_contents — including after DML and vgi_clear_cache().
+# group: [vgi_integration_simple_writable]
+
+require-env VGI_SIMPLE_WRITABLE_WORKER
+
+require vgi
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+statement ok
+CREATE MACRO rpc_count(m) AS (
+    SELECT COUNT(*) FROM duckdb_logs() WHERE type = 'VGI'
+      AND message LIKE '%catalog.rpc%'
+      AND message LIKE '%method=' || m || ',%');
+
+statement ok
+ATTACH 'simple_writable' AS w (TYPE vgi, LOCATION '${VGI_SIMPLE_WRITABLE_WORKER}');
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT COUNT(*) > 0 FROM duckdb_tables() WHERE database_name = 'w' AND table_name = 'items';
+----
+true
+
+query I
+SELECT COUNT(*) >= 0 FROM duckdb_functions() WHERE database_name = 'w';
+----
+true
+
+query I
+SELECT rpc_count('catalog_contents');
+----
+0
+
+query I
+SELECT rpc_count('catalog_schemas');
+----
+1
+
+query I
+SELECT rpc_count('catalog_schema_contents_tables') >= 1;
+----
+true
+
+statement ok
+INSERT INTO w.main.items VALUES (9001, 'catalog_contents', 1);
+
+statement ok
+CALL vgi_clear_cache();
+
+query I
+SELECT COUNT(*) FROM w.main.items WHERE id = 9001;
+----
+1
+
+query I
+SELECT COUNT(*) > 0 FROM duckdb_tables() WHERE database_name = 'w';
+----
+true
+
+query I
+SELECT rpc_count('catalog_contents');
+----
+0
+
+query I
+SELECT rpc_count('catalog_schemas') >= 2;
+----
+true
+
+statement ok
+DETACH w;

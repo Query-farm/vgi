@@ -141,6 +141,18 @@ follow-up work, not needed for the latency win.
    (today's behaviour).
 5. `vgi_clear_cache()` / a version bump clears the sets and seeds; the next
    enumeration calls `catalog_contents` again.
+6. DDL invalidates only the touched set (as before) and discards that kind's
+   not-yet-taken seed: the snapshot predates the DDL, so the set reloads with
+   its per-schema RPC (transaction-aware) instead. Without this a view created
+   inside a transaction, after the snapshot but before views were first loaded,
+   was missing from `duckdb_views()`.
+
+Observability (`SET enable_logging = true; SET enable_log_types = 'VGI'`):
+`catalog.rpc method=catalog_contents` per call; `catalog.contents` with
+`outcome=loaded` (`schemas`, `catalog_version`) or `outcome=fallback`
+(`error_message`); and `catalog.seed_decode` (`schema`, `kind`, `items`) each
+time a kind is decoded from the snapshot — at most once per schema and kind.
+Tests: `test/sql/integration/catalog/catalog_contents*.test`.
 
 Future: gate on the `estimated_object_count` totals (bulk below a threshold,
 lazy above) — requires the counts before the call, e.g. on the attach result.

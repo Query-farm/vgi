@@ -11,6 +11,14 @@ require vgi
 
 require httpfs
 
+# This file pins the per-schema load path (catalog_schemas +
+# catalog_schema_contents_* and the per-name *_get RPCs). The example fixture
+# advertises supports_catalog_contents, which would load the whole catalog in
+# one catalog_contents RPC and seed every set instead, so turn that off here;
+# catalog_contents.test covers the bulk path.
+statement ok
+SET vgi_catalog_contents = false;
+
 # ============================================================================
 # Below-threshold path: the example fixture's ``data`` schema has only a
 # handful of tables; with the default threshold of 1000 they all qualify for

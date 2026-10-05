@@ -542,6 +542,8 @@ VgiCatalogContents InvokeCatalogContents(const CatalogRpcContext &ctx, ClientCon
 		if (!entry || entry->num_rows() == 0) {
 			throw IOException("catalog_contents: empty SchemaContents record [worker: %s]", worker_path);
 		}
+		ValidateItemSchema(entry, "catalog_contents", worker_path,
+		                   static_cast<size_t>(i - schemas_col->value_offset(0)));
 
 		VgiSchemaContents contents;
 		auto schema_col = std::dynamic_pointer_cast<arrow::BinaryArray>(entry->GetColumnByName("schema"));

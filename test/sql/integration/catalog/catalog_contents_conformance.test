@@ -1,0 +1,133 @@
+# name: test/sql/integration/catalog/catalog_contents_conformance.test
+# description: Cross-SDK conformance for catalog_contents, against whatever
+#              worker VGI_TEST_WORKER is. A worker that advertises
+#              supports_catalog_contents must serve it (no fallback), and the
+#              whole enumeration then issues exactly one catalog_contents and no
+#              catalog_schemas / catalog_schema_contents_*. A worker that does not
+#              advertise it must never be sent catalog_contents. Either way the
+#              catalog seen by duckdb_tables/columns/views/functions is identical
+#              to the per-schema path (SET vgi_catalog_contents = false). The
+#              detailed tests that need vgi-python's contents_* fixture catalogs
+#              are catalog_contents.test / _fallback.test / _ddl.test.
+# group: [vgi_integration_catalog]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+statement ok
+CREATE MACRO rpc_count(m) AS (
+    SELECT COUNT(*) FROM duckdb_logs() WHERE type = 'VGI'
+      AND message LIKE '%catalog.rpc%'
+      AND message LIKE '%method=' || m || ',%');
+
+statement ok
+CREATE MACRO per_schema_rpc_count() AS (
+    SELECT COUNT(*) FROM duckdb_logs() WHERE type = 'VGI'
+      AND message LIKE '%catalog.rpc%'
+      AND (message LIKE '%method=catalog_schemas,%' OR message LIKE '%method=catalog_schema_contents_%'));
+
+# A snapshot of what the attached catalog `c` looks like through the catalog
+# functions. Volatile fields (oids, estimated sizes) are left out.
+statement ok
+CREATE MACRO catalog_shape(db) AS TABLE
+    SELECT 'table' AS kind, schema_name, table_name AS name, CAST(column_count AS VARCHAR) AS detail
+    FROM duckdb_tables() WHERE database_name = db
+    UNION ALL
+    SELECT 'column', schema_name, table_name || '.' || column_name, data_type
+    FROM duckdb_columns() WHERE database_name = db
+    UNION ALL
+    SELECT 'view', schema_name, view_name, CAST(column_count AS VARCHAR)
+    FROM duckdb_views() WHERE database_name = db AND NOT internal
+    UNION ALL
+    SELECT 'function', schema_name, function_name,
+           function_type || '(' || COALESCE(array_to_string(parameter_types, ','), '') || ')->' || COALESCE(return_type, '')
+    FROM duckdb_functions() WHERE database_name = db;
+
+# ============================================================================
+# Default (catalog_contents when advertised).
+# ============================================================================
+
+statement ok
+ATTACH 'example' AS c (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE TABLE shape_contents AS SELECT * FROM catalog_shape('c');
+
+# At most one catalog_contents for a full enumeration ...
+query I
+SELECT rpc_count('catalog_contents') <= 1;
+----
+true
+
+# ... an advertised capability must be served, never fall back ...
+query I
+SELECT COUNT(*) FROM duckdb_logs() WHERE type = 'VGI'
+  AND message LIKE '%catalog.contents%' AND message LIKE '%outcome=fallback%';
+----
+0
+
+# ... and when it was used, no per-schema listing RPC fires at all.
+query I
+SELECT CASE WHEN rpc_count('catalog_contents') = 1 THEN per_schema_rpc_count() = 0 ELSE true END;
+----
+true
+
+query I
+SELECT COUNT(*) > 0 FROM shape_contents WHERE kind = 'table';
+----
+true
+
+statement ok
+DETACH c;
+
+# ============================================================================
+# Per-schema path: same catalog, no catalog_contents.
+# ============================================================================
+
+statement ok
+SET vgi_catalog_contents = false;
+
+statement ok
+ATTACH 'example' AS c (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+CALL truncate_duckdb_logs();
+
+statement ok
+CREATE TABLE shape_per_schema AS SELECT * FROM catalog_shape('c');
+
+query I
+SELECT rpc_count('catalog_contents');
+----
+0
+
+query I
+SELECT rpc_count('catalog_schemas');
+----
+1
+
+# Identical catalogs both ways.
+query I
+SELECT COUNT(*) FROM (SELECT * FROM shape_contents EXCEPT ALL SELECT * FROM shape_per_schema);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (SELECT * FROM shape_per_schema EXCEPT ALL SELECT * FROM shape_contents);
+----
+0
+
+statement ok
+DETACH c;
+
+statement ok
+RESET vgi_catalog_contents;

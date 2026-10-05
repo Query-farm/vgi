@@ -1,0 +1,246 @@
+# name: test/sql/integration/catalog/catalog_contents_fallback.test
+# description: catalog_contents fallbacks. A worker that advertises
+#              supports_catalog_contents but fails the call is still fully
+#              usable through catalog_schemas + catalog_schema_contents_*, and
+#              the client logs a catalog.contents outcome=fallback event. A
+#              worker that does not advertise it (an older worker) is never
+#              sent catalog_contents. Fixture: vgi-python
+#              vgi/_test_fixtures/catalog_contents.py (contents_broken,
+#              contents_legacy — the same catalog as contents_probe).
+#              Gated on VGI_CATALOG_CONTENTS_WORKER (vgi-python only);
+#              catalog_contents_conformance.test is the every-SDK check.
+# group: [vgi_integration_catalog]
+
+require-env VGI_CATALOG_CONTENTS_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+statement ok
+CREATE MACRO rpc_count(m) AS (
+    SELECT COUNT(*) FROM duckdb_logs() WHERE type = 'VGI'
+      AND message LIKE '%catalog.rpc%'
+      AND message LIKE '%method=' || m || ',%');
+
+statement ok
+CREATE MACRO failed_rpc_count(m) AS (
+    SELECT COUNT(*) FROM duckdb_logs() WHERE type = 'VGI'
+      AND message LIKE '%catalog.rpc%'
+      AND message LIKE '%method=' || m || ',%'
+      AND message LIKE '%outcome=error%');
+
+statement ok
+CREATE MACRO fallback_count() AS (
+    SELECT COUNT(*) FROM duckdb_logs() WHERE type = 'VGI'
+      AND message LIKE '%catalog.contents%'
+      AND message LIKE '%outcome=fallback%'
+      AND message LIKE '%catalog_contents deliberately fails%');
+
+# ============================================================================
+# Advertised but failing: one failed catalog_contents, a fallback event, then
+# the per-schema RPCs — and every object is still there.
+# ============================================================================
+
+statement ok
+ATTACH 'contents_broken' AS cb (TYPE vgi, LOCATION '${VGI_CATALOG_CONTENTS_WORKER}');
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query II
+SELECT schema_name, table_name FROM duckdb_tables() WHERE database_name = 'cb' ORDER BY ALL;
+----
+extra	five
+main	ten
+
+query III
+SELECT schema_name, function_name, function_type FROM duckdb_functions()
+WHERE database_name = 'cb' ORDER BY ALL;
+----
+main	contents_range	table_macro
+main	contents_triple	macro
+main	double	scalar
+main	sequence	table
+main	vgi_sum	aggregate
+
+query II
+SELECT schema_name, view_name FROM duckdb_views() WHERE database_name = 'cb' ORDER BY ALL;
+----
+main	answer
+
+query I
+SELECT rpc_count('catalog_contents');
+----
+1
+
+query I
+SELECT failed_rpc_count('catalog_contents');
+----
+1
+
+query I
+SELECT fallback_count();
+----
+1
+
+query I
+SELECT rpc_count('catalog_schemas');
+----
+1
+
+query I
+SELECT rpc_count('catalog_schema_contents_tables');
+----
+2
+
+query I
+SELECT rpc_count('catalog_schema_contents_functions') >= 1 AND rpc_count('catalog_schema_contents_macros') >= 1;
+----
+true
+
+# Nothing is seeded on the fallback path.
+query I
+SELECT COUNT(*) FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%catalog.seed_decode%';
+----
+0
+
+query I
+SELECT SUM(n) FROM cb.main.ten;
+----
+45
+
+query I
+SELECT COUNT(*) FROM cb.extra.five;
+----
+5
+
+query I
+SELECT cb.main.contents_triple(5);
+----
+15
+
+query I
+SELECT * FROM cb.main.answer;
+----
+42
+
+# The failure is not sticky: after vgi_clear_cache() the client tries
+# catalog_contents again (and falls back again).
+statement ok
+CALL vgi_clear_cache();
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT COUNT(*) FROM duckdb_tables() WHERE database_name = 'cb';
+----
+2
+
+query I
+SELECT rpc_count('catalog_contents');
+----
+1
+
+query I
+SELECT fallback_count();
+----
+1
+
+query I
+SELECT rpc_count('catalog_schemas');
+----
+1
+
+statement ok
+DETACH cb;
+
+# With the setting off, the failing RPC is not even attempted.
+statement ok
+SET vgi_catalog_contents = false;
+
+statement ok
+ATTACH 'contents_broken' AS cb_off (TYPE vgi, LOCATION '${VGI_CATALOG_CONTENTS_WORKER}');
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT COUNT(*) FROM duckdb_tables() WHERE database_name = 'cb_off';
+----
+2
+
+query I
+SELECT rpc_count('catalog_contents') + fallback_count();
+----
+0
+
+query I
+SELECT rpc_count('catalog_schemas');
+----
+1
+
+statement ok
+DETACH cb_off;
+
+statement ok
+RESET vgi_catalog_contents;
+
+# ============================================================================
+# Not advertised (older worker): catalog_contents is never sent; the catalog
+# loads through the per-schema RPCs exactly as before the feature.
+# ============================================================================
+
+statement ok
+ATTACH 'contents_legacy' AS cl (TYPE vgi, LOCATION '${VGI_CATALOG_CONTENTS_WORKER}');
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query II
+SELECT schema_name, table_name FROM duckdb_tables() WHERE database_name = 'cl' ORDER BY ALL;
+----
+extra	five
+main	ten
+
+query III
+SELECT schema_name, function_name, function_type FROM duckdb_functions()
+WHERE database_name = 'cl' ORDER BY ALL;
+----
+main	contents_range	table_macro
+main	contents_triple	macro
+main	double	scalar
+main	sequence	table
+main	vgi_sum	aggregate
+
+query I
+SELECT rpc_count('catalog_contents');
+----
+0
+
+query I
+SELECT COUNT(*) FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%catalog.contents%';
+----
+0
+
+query I
+SELECT rpc_count('catalog_schemas');
+----
+1
+
+query I
+SELECT rpc_count('catalog_schema_contents_tables');
+----
+2
+
+query I
+SELECT SUM(n) FROM cl.main.ten;
+----
+45
+
+statement ok
+DETACH cl;

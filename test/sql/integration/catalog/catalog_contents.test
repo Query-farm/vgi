@@ -1,0 +1,379 @@
+# name: test/sql/integration/catalog/catalog_contents.test
+# description: A worker that advertises supports_catalog_contents is loaded with
+#              one catalog_contents RPC instead of catalog_schemas plus a
+#              catalog_schema_contents_* call per schema and kind. Each schema's
+#              kinds are decoded lazily, once, on first use. SET
+#              vgi_catalog_contents = false forces the per-schema RPCs, with
+#              identical results. vgi_clear_cache() reloads with a fresh
+#              catalog_contents. See docs/catalog_contents.md.
+#              Fixture: vgi-python vgi/_test_fixtures/catalog_contents.py
+#              (contents_probe: schemas main + extra, every object kind).
+#              Gated on VGI_CATALOG_CONTENTS_WORKER (vgi-python only);
+#              catalog_contents_conformance.test is the every-SDK check.
+# group: [vgi_integration_catalog]
+
+require-env VGI_CATALOG_CONTENTS_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+# Counts of the catalog RPCs issued since the last truncate_duckdb_logs().
+statement ok
+CREATE MACRO rpc_count(m) AS (
+    SELECT COUNT(*) FROM duckdb_logs() WHERE type = 'VGI'
+      AND message LIKE '%catalog.rpc%'
+      AND message LIKE '%method=' || m || ',%');
+
+statement ok
+CREATE MACRO per_schema_rpc_count() AS (
+    SELECT COUNT(*) FROM duckdb_logs() WHERE type = 'VGI'
+      AND message LIKE '%catalog.rpc%'
+      AND (message LIKE '%method=catalog_schemas,%' OR message LIKE '%method=catalog_schema_contents_%'));
+
+statement ok
+CREATE MACRO per_name_rpc_count() AS (
+    SELECT COUNT(*) FROM duckdb_logs() WHERE type = 'VGI'
+      AND message LIKE '%catalog.rpc%'
+      AND regexp_matches(message, 'method=catalog_(table|view|macro|function|schema)_get,'));
+
+# (schema, kind) pairs decoded from the snapshot since the last truncate.
+statement ok
+CREATE MACRO decodes() AS TABLE
+    SELECT regexp_extract(message, 'schema=([^,}]*)', 1) AS schema_name,
+           regexp_extract(message, 'kind=([^,}]*)', 1) AS kind
+    FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%catalog.seed_decode%';
+
+# ============================================================================
+# Full enumeration over catalog_contents: exactly one RPC, no per-schema RPCs.
+# ============================================================================
+
+statement ok
+ATTACH 'contents_probe' AS cc (TYPE vgi, LOCATION '${VGI_CATALOG_CONTENTS_WORKER}');
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query II
+SELECT schema_name, table_name FROM duckdb_tables() WHERE database_name = 'cc' ORDER BY ALL;
+----
+extra	five
+main	ten
+
+query III
+SELECT schema_name, function_name, function_type FROM duckdb_functions()
+WHERE database_name = 'cc' ORDER BY ALL;
+----
+main	contents_range	table_macro
+main	contents_triple	macro
+main	double	scalar
+main	sequence	table
+main	vgi_sum	aggregate
+
+query II
+SELECT schema_name, view_name FROM duckdb_views() WHERE database_name = 'cc' ORDER BY ALL;
+----
+main	answer
+
+query I
+SELECT schema_name FROM duckdb_schemas() WHERE database_name = 'cc' ORDER BY ALL;
+----
+extra
+main
+
+query I
+SELECT rpc_count('catalog_contents');
+----
+1
+
+query I
+SELECT per_schema_rpc_count();
+----
+0
+
+query I
+SELECT per_name_rpc_count();
+----
+0
+
+query I
+SELECT COUNT(*) FROM duckdb_logs() WHERE type = 'VGI'
+  AND message LIKE '%catalog.contents%' AND message LIKE '%outcome=loaded%' AND message LIKE '%schemas=2%';
+----
+1
+
+# Each (schema, kind) is decoded at most once, however often it is enumerated.
+query I
+SELECT COUNT(*) FROM (SELECT schema_name, kind FROM decodes() GROUP BY ALL HAVING COUNT(*) > 1);
+----
+0
+
+# Enumerating again is served from the cache: no RPC, no decode.
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT COUNT(*) FROM duckdb_tables() WHERE database_name = 'cc';
+----
+2
+
+query I
+SELECT COUNT(*) FROM duckdb_functions() WHERE database_name = 'cc';
+----
+5
+
+query I
+SELECT rpc_count('catalog_contents') + per_schema_rpc_count() + per_name_rpc_count();
+----
+0
+
+query I
+SELECT COUNT(*) FROM decodes();
+----
+0
+
+# The seeded objects work.
+query I
+SELECT SUM(n) FROM cc.main.ten;
+----
+45
+
+query I
+SELECT COUNT(*) FROM cc.extra.five;
+----
+5
+
+query I
+SELECT * FROM cc.main.answer;
+----
+42
+
+query I
+SELECT cc.main.contents_triple(5);
+----
+15
+
+query I
+SELECT COUNT(*) FROM cc.main.contents_range(4);
+----
+4
+
+query I
+SELECT cc.main.double(21);
+----
+42
+
+query I
+SELECT rpc_count('catalog_contents') + per_schema_rpc_count();
+----
+0
+
+statement ok
+DETACH cc;
+
+# ============================================================================
+# Lazy decode: querying one table decodes only what that query needs (the
+# table kind of `main`, plus the table function backing it); `extra` is never
+# decoded, and no per-schema RPC fires.
+# ============================================================================
+
+statement ok
+ATTACH 'contents_probe' AS lazy (TYPE vgi, LOCATION '${VGI_CATALOG_CONTENTS_WORKER}');
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT COUNT(*) FROM lazy.main.ten;
+----
+10
+
+query I
+SELECT rpc_count('catalog_contents');
+----
+1
+
+query I
+SELECT per_schema_rpc_count() + per_name_rpc_count();
+----
+0
+
+query I
+SELECT COUNT(*) FROM decodes() WHERE schema_name = 'main' AND kind = 'table';
+----
+1
+
+query I
+SELECT COUNT(*) FROM decodes() WHERE schema_name = 'extra';
+----
+0
+
+query I
+SELECT COUNT(*) FROM decodes() WHERE kind IN ('view', 'SCALAR_MACRO', 'TABLE_MACRO', 'SCALAR_FUNCTION', 'AGGREGATE_FUNCTION');
+----
+0
+
+# Touching the second schema later decodes it then — still no RPC.
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT COUNT(*) FROM lazy.extra.five;
+----
+5
+
+query I
+SELECT rpc_count('catalog_contents') + per_schema_rpc_count() + per_name_rpc_count();
+----
+0
+
+query I
+SELECT COUNT(*) FROM decodes() WHERE schema_name = 'extra' AND kind = 'table';
+----
+1
+
+query I
+SELECT COUNT(*) FROM decodes() WHERE schema_name = 'main' AND kind = 'table';
+----
+0
+
+# ============================================================================
+# vgi_clear_cache(): the schema set is rebuilt from a fresh catalog_contents
+# (not the per-schema RPCs), and every kind is decoded again from it.
+# ============================================================================
+
+statement ok
+CALL vgi_clear_cache();
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query II
+SELECT schema_name, table_name FROM duckdb_tables() WHERE database_name = 'lazy' ORDER BY ALL;
+----
+extra	five
+main	ten
+
+query I
+SELECT COUNT(*) FROM duckdb_functions() WHERE database_name = 'lazy';
+----
+5
+
+query I
+SELECT rpc_count('catalog_contents');
+----
+1
+
+query I
+SELECT per_schema_rpc_count() + per_name_rpc_count();
+----
+0
+
+query I
+SELECT COUNT(*) FROM decodes() WHERE kind = 'table';
+----
+2
+
+statement ok
+DETACH lazy;
+
+# ============================================================================
+# SET vgi_catalog_contents = false: the same enumeration goes through
+# catalog_schemas + catalog_schema_contents_* with identical results, and
+# catalog_contents is never called.
+# ============================================================================
+
+statement ok
+SET vgi_catalog_contents = false;
+
+statement ok
+ATTACH 'contents_probe' AS off (TYPE vgi, LOCATION '${VGI_CATALOG_CONTENTS_WORKER}');
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query II
+SELECT schema_name, table_name FROM duckdb_tables() WHERE database_name = 'off' ORDER BY ALL;
+----
+extra	five
+main	ten
+
+query III
+SELECT schema_name, function_name, function_type FROM duckdb_functions()
+WHERE database_name = 'off' ORDER BY ALL;
+----
+main	contents_range	table_macro
+main	contents_triple	macro
+main	double	scalar
+main	sequence	table
+main	vgi_sum	aggregate
+
+query II
+SELECT schema_name, view_name FROM duckdb_views() WHERE database_name = 'off' ORDER BY ALL;
+----
+main	answer
+
+query I
+SELECT rpc_count('catalog_contents');
+----
+0
+
+query I
+SELECT rpc_count('catalog_schemas');
+----
+1
+
+query I
+SELECT rpc_count('catalog_schema_contents_tables');
+----
+2
+
+query I
+SELECT rpc_count('catalog_schema_contents_functions') >= 1 AND rpc_count('catalog_schema_contents_macros') >= 1;
+----
+true
+
+query I
+SELECT COUNT(*) FROM decodes();
+----
+0
+
+query I
+SELECT SUM(n) FROM off.main.ten;
+----
+45
+
+# The setting is read on each schema-set load, so it applies to an existing
+# attach after vgi_clear_cache(): flipping it back reloads via catalog_contents.
+statement ok
+SET vgi_catalog_contents = true;
+
+statement ok
+CALL vgi_clear_cache();
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT COUNT(*) FROM duckdb_tables() WHERE database_name = 'off';
+----
+2
+
+query I
+SELECT rpc_count('catalog_contents');
+----
+1
+
+query I
+SELECT per_schema_rpc_count();
+----
+0
+
+statement ok
+DETACH off;
+
+statement ok
+RESET vgi_catalog_contents;

@@ -234,6 +234,9 @@ void VgiCatalogSet::Scan(ClientContext &context, const std::function<void(Catalo
 }
 
 void VgiCatalogSet::ClearEntries() {
+	if (schema_entry_) {
+		schema_entry_->DiscardSeed(CacheKindName());
+	}
 	std::lock_guard<std::mutex> lock(entry_lock_);
 	if (!entries_.empty() || is_loaded_) {
 		generation_.fetch_add(1, std::memory_order_release);
@@ -243,6 +246,12 @@ void VgiCatalogSet::ClearEntries() {
 }
 
 std::vector<unique_ptr<CatalogEntry>> VgiCatalogSet::HarvestEntries() {
+	// A harvest invalidates the set (DDL / cache clear): a catalog_contents
+	// seed it has not taken yet is now stale, so the reload must not use it.
+	// The seed mutex is a leaf, taken before entry_lock_.
+	if (schema_entry_) {
+		schema_entry_->DiscardSeed(CacheKindName());
+	}
 	std::lock_guard<std::mutex> lock(entry_lock_);
 	std::vector<unique_ptr<CatalogEntry>> harvested;
 	harvested.reserve(entries_.size());
@@ -258,6 +267,9 @@ std::vector<unique_ptr<CatalogEntry>> VgiCatalogSet::HarvestEntries() {
 }
 
 unique_ptr<CatalogEntry> VgiCatalogSet::HarvestEntry(const std::string &name) {
+	if (schema_entry_) {
+		schema_entry_->DiscardSeed(CacheKindName());
+	}
 	std::lock_guard<std::mutex> lock(entry_lock_);
 	auto it = entries_.find(name);
 	if (it == entries_.end()) {

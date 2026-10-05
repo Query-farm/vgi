@@ -77,11 +77,18 @@ public:
 	// catalog_contents seeding. The schema set calls SeedContents once, when it
 	// builds this entry from a catalog_contents snapshot; each child set's first
 	// load then takes its seed instead of issuing catalog_schema_contents_*.
-	// Seeds are consumed once — a reload after vgi_clear_cache() goes back to the
-	// per-schema RPCs. The seed mutex is a leaf: nothing is called while it is held.
+	// Each kind's seed is consumed once. Invalidating a child set (DDL) discards
+	// its untaken seed, so that set reloads through the per-schema RPC;
+	// vgi_clear_cache() / a version bump rebuilds the schema entries from a fresh
+	// catalog_contents. The seed mutex is a leaf: nothing is called while it is held.
 	void SeedContents(vgi::VgiSchemaContents &&contents);
 	//! Whether an unconsumed seed exists for a VgiCatalogSet::CacheKindName kind.
 	bool HasSeed(const std::string &kind);
+	//! Drop the unconsumed seed for a VgiCatalogSet::CacheKindName kind, so the
+	//! set's next load issues the per-schema RPC. Called whenever a child set is
+	//! invalidated (DDL): the snapshot predates the change, and taking it would
+	//! hide what the DDL created (or resurrect what it dropped).
+	void DiscardSeed(const std::string &kind);
 	//! The seeded tables (consumed), or the catalog_schema_contents_tables RPC.
 	std::vector<vgi::VgiTableInfo> TakeTables(const vgi::CatalogRpcContext &rpc_ctx, ClientContext &context);
 	//! The seeded views (consumed), or the catalog_schema_contents_views RPC.

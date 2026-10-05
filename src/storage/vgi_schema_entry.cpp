@@ -20,6 +20,7 @@
 #include "storage/vgi_transaction.hpp"
 #include "vgi_arrow_utils.hpp"
 #include "vgi_catalog_rpc.hpp"
+#include "vgi_logging.hpp"
 #include "vgi_rpc_types.hpp"
 
 namespace duckdb {
@@ -51,15 +52,44 @@ std::shared_ptr<const vgi::VgiSchemaContents> VgiSchemaEntry::ClaimSeed(const st
 	return seed_;
 }
 
+void VgiSchemaEntry::DiscardSeed(const std::string &kind) {
+	std::lock_guard<std::mutex> lock(seed_mutex_);
+	if (!seed_) {
+		return;
+	}
+	// Seeds are claimed under their RPC spelling; the macro sets share one
+	// CacheKindName ("macro") for both macro kinds. Function kinds match their
+	// RPC spelling case-insensitively (scalar_function == SCALAR_FUNCTION).
+	if (StringUtil::CIEquals(kind, "macro")) {
+		seed_taken_.insert("SCALAR_MACRO");
+		seed_taken_.insert("TABLE_MACRO");
+	} else {
+		seed_taken_.insert(kind);
+	}
+}
+
 bool VgiSchemaEntry::HasSeed(const std::string &kind) {
 	std::lock_guard<std::mutex> lock(seed_mutex_);
 	return seed_ && seed_taken_.find(kind) == seed_taken_.end();
 }
 
+namespace {
+// One event per seeded kind decoded — each kind of each schema is decoded at
+// most once, on first use. Lets tests (and profiling) see which parts of a
+// catalog_contents snapshot a workload actually touched.
+template <class T>
+std::vector<T> LogSeedDecode(ClientContext &context, const std::string &schema, const char *kind,
+                             std::vector<T> items) {
+	VGI_LOG(context, "catalog.seed_decode",
+	        {{"schema", schema}, {"kind", kind}, {"items", std::to_string(items.size())}});
+	return items;
+}
+} // namespace
+
 std::vector<vgi::VgiTableInfo> VgiSchemaEntry::TakeTables(const vgi::CatalogRpcContext &rpc_ctx,
                                                           ClientContext &context) {
 	if (auto seed = ClaimSeed("table")) {
-		return vgi::DecodeContentsTables(*seed, context);
+		return LogSeedDecode(context, name, "table", vgi::DecodeContentsTables(*seed, context));
 	}
 	return vgi::InvokeCatalogSchemaContentsTables(rpc_ctx, name, context);
 }
@@ -67,7 +97,7 @@ std::vector<vgi::VgiTableInfo> VgiSchemaEntry::TakeTables(const vgi::CatalogRpcC
 std::vector<vgi::VgiViewInfo> VgiSchemaEntry::TakeViews(const vgi::CatalogRpcContext &rpc_ctx,
                                                         ClientContext &context) {
 	if (auto seed = ClaimSeed("view")) {
-		return vgi::DecodeContentsViews(*seed);
+		return LogSeedDecode(context, name, "view", vgi::DecodeContentsViews(*seed));
 	}
 	return vgi::InvokeCatalogSchemaContentsViews(rpc_ctx, name, context);
 }
@@ -75,7 +105,7 @@ std::vector<vgi::VgiViewInfo> VgiSchemaEntry::TakeViews(const vgi::CatalogRpcCon
 std::vector<vgi::VgiFunctionInfo> VgiSchemaEntry::FetchFunctions(const vgi::CatalogRpcContext &rpc_ctx,
                                                                  const char *rpc_type, ClientContext &context) {
 	if (auto seed = ClaimSeed(rpc_type)) {
-		return vgi::DecodeContentsFunctions(*seed, rpc_type);
+		return LogSeedDecode(context, name, rpc_type, vgi::DecodeContentsFunctions(*seed, rpc_type));
 	}
 	return vgi::InvokeCatalogSchemaContentsFunctions(rpc_ctx, name, rpc_type, context);
 }
@@ -83,7 +113,7 @@ std::vector<vgi::VgiFunctionInfo> VgiSchemaEntry::FetchFunctions(const vgi::Cata
 std::vector<vgi::VgiMacroInfo> VgiSchemaEntry::FetchMacros(const vgi::CatalogRpcContext &rpc_ctx,
                                                            const char *rpc_type, ClientContext &context) {
 	if (auto seed = ClaimSeed(rpc_type)) {
-		return vgi::DecodeContentsMacros(*seed, rpc_type);
+		return LogSeedDecode(context, name, rpc_type, vgi::DecodeContentsMacros(*seed, rpc_type));
 	}
 	return vgi::InvokeCatalogSchemaContentsMacros(rpc_ctx, name, rpc_type, context);
 }

@@ -135,6 +135,13 @@ DETACH example;
 
 # Macro dependencies are qualified to the catalog alias chosen by the caller,
 # rather than the worker's catalog name or the current search path.
+#
+# The RPC counts below pin the per-schema inventory path; with catalog_contents
+# (the example fixture advertises it) there are no per-schema RPCs at all, so
+# use the per-schema path here. catalog_contents.test covers the bulk path.
+statement ok
+SET vgi_catalog_contents = false;
+
 statement ok
 ATTACH 'example' AS renamed (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 

@@ -67,6 +67,16 @@ Emitted by `VgiTableEntry::GetStatistics` once per call, after the load gate has
 
 Note: each *column* DuckDB asks about emits a separate event. A query that touches 8 columns of a fresh table will produce 1 `fetched` event followed by 7 `fresh_hit` events.
 
+### `catalog.contents` / `catalog.seed_decode`
+
+Emitted when the worker advertises `supports_catalog_contents` and the schema
+set loads with one `catalog_contents` RPC (see `docs/catalog_contents.md`).
+
+| Event | Fields |
+|-------|--------|
+| `catalog.contents` | `outcome` (`loaded` or `fallback`); `schemas`, `catalog_version` when loaded; `error_message` on fallback (the client then uses `catalog_schemas` + `catalog_schema_contents_*`) |
+| `catalog.seed_decode` | `schema`, `kind` (`table`, `view`, `SCALAR_FUNCTION`, `AGGREGATE_FUNCTION`, `TABLE_FUNCTION`, `SCALAR_MACRO`, `TABLE_MACRO`), `items` — one per kind decoded from the snapshot, at most once per schema and kind |
+
 ### `catalog.cache_clear` / `catalog.cache_clear_summary`
 
 Emitted by `vgi_clear_cache()`. One per-catalog event plus one summary.
