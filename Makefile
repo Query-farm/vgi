@@ -728,6 +728,12 @@ test_cancel_dispatcher:
 	cmake --build build/release --target vgi_cancel_dispatcher_tests
 	./build/release/extension/vgi/vgi_cancel_dispatcher_tests
 
+# Configure with BUILD_VGI_HTTP_INTERRUPT_TESTS=1 (or BUILD_VGI_UNIT_TESTS),
+# then check that an interrupt aborts an in-flight VGI HTTP request.
+test_http_interrupt:
+	cmake --build build/release --target vgi_http_interrupt_tests
+	./build/release/extension/vgi/vgi_http_interrupt_tests
+
 # Interactive DuckDB shell with the vgi extension loaded and the example
 # python worker pre-attached as the `example` catalog. Use `make shell`
 # (release) or `make shell_debug` for the debug build. Override the worker

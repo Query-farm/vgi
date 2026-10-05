@@ -588,3 +588,25 @@ if((BUILD_VGI_CANCEL_DISPATCHER_TESTS OR DEFINED ENV{BUILD_VGI_CANCEL_DISPATCHER
     duckdb_static
     dummy_static_extension_loader)
 endif()
+
+# Interrupting an in-flight VGI HTTP request, against the real client and
+# httpfs's curl backend (the in-tree httplib fallback cannot abort a transfer).
+# Same gating as the dispatcher tests. httpfs is defined after this file runs
+# (extension_config.cmake loads it on every non-MinGW build), so it is named
+# by generator expression rather than probed with if(TARGET).
+if((BUILD_VGI_HTTP_INTERRUPT_TESTS OR DEFINED ENV{BUILD_VGI_HTTP_INTERRUPT_TESTS} OR
+    BUILD_VGI_UNIT_TESTS OR DEFINED ENV{BUILD_VGI_UNIT_TESTS}) AND NOT WIN32)
+  add_executable(vgi_http_interrupt_tests
+    test/cpp/test_main.cpp
+    test/cpp/test_http_interrupt.cpp)
+  target_include_directories(vgi_http_interrupt_tests PRIVATE
+    src/include
+    duckdb/src/include
+    duckdb/third_party/catch
+    $<TARGET_PROPERTY:httpfs_extension,SOURCE_DIR>/src/include)
+  target_link_libraries(vgi_http_interrupt_tests
+    ${EXTENSION_NAME}
+    httpfs_extension
+    duckdb_static
+    dummy_static_extension_loader)
+endif()
