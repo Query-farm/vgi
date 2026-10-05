@@ -708,11 +708,15 @@ struct VgiPrefetchSlot {
 //! by query cancellation before the scheduler got to us.
 class VgiPrefetchTask : public AsyncTask {
 public:
-	explicit VgiPrefetchTask(std::shared_ptr<VgiPrefetchSlot> slot) : slot_(std::move(slot)) {
+	// The context outlives the task: it runs as an executor task, and the query's
+	// executor waits for those before the query ends.
+	VgiPrefetchTask(ClientContext &context, std::shared_ptr<VgiPrefetchSlot> slot)
+	    : context_(context), slot_(std::move(slot)) {
 	}
 	void Execute() override;
 
 private:
+	ClientContext &context_;
 	std::shared_ptr<VgiPrefetchSlot> slot_;
 };
 

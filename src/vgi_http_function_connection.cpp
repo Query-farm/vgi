@@ -272,6 +272,11 @@ void HttpFunctionConnection::BufferDataBatches(std::shared_ptr<arrow::Buffer> ow
 	int64_t spike_log_batches = 0;
 	int64_t spike_external_batches = 0;
 	while (true) {
+		// A bundled response can hold many batches, each possibly an external
+		// location costing its own GET.
+		if (context_.interrupted) {
+			throw InterruptException();
+		}
 		auto read_result = reader->ReadNext();
 		if (!read_result.ok() || !read_result.ValueUnsafe().batch) {
 			break;
@@ -855,7 +860,12 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 			return nullptr;
 		}
 
-		// Continuation: POST exchange with state token to get more data
+		// Continuation: POST exchange with state token to get more data. The
+		// request itself is cancellable, but a fast worker answers each one before
+		// an interrupt lands mid-transfer, so check between them too.
+		if (context_.interrupted) {
+			throw InterruptException();
+		}
 		auto tick_schema = arrow::schema({});
 		auto tick_batch = arrow::RecordBatch::Make(tick_schema, 0, std::vector<std::shared_ptr<arrow::Array>>{});
 

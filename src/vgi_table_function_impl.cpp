@@ -3869,6 +3869,11 @@ static bool GetNextBatch(ClientContext &context, const VgiTableFunctionBindData 
 	// HandleBatchLogMessage, so any 0-row batch surfaced here is a real empty
 	// response from the worker — pointless for producer-mode table functions.
 	while (true) {
+		// Empty batches and split claims loop here without returning to DuckDB,
+		// whose own interrupt check runs only between chunks.
+		if (context.interrupted) {
+			throw InterruptException();
+		}
 		// Update dynamic filter state before each tick is sent
 		UpdateDynamicFilterState(global_state, context, bind_data);
 		auto arrow_batch = local_state.connection()->ReadDataBatch();
@@ -3945,6 +3950,13 @@ void VgiPrefetchTask::Execute() {
 		// non-empty batch, matching the sync path's invariant.
 		std::shared_ptr<arrow::RecordBatch> batch;
 		while (true) {
+			// Thrown into the catch below: the consumer rethrows it from the
+			// ERROR slot, and a torn-down consumer never reads it. Either way
+			// this task returns now instead of after the next RPC — DuckDB
+			// waits for every executor task before an interrupted query ends.
+			if (context_.interrupted) {
+				throw InterruptException();
+			}
 			batch = slot_->connection->ReadDataBatch();
 			if (!batch || batch->num_rows() > 0) {
 				break;
@@ -3958,10 +3970,11 @@ void VgiPrefetchTask::Execute() {
 	}
 }
 
-static void LaunchPrefetch(TableFunctionInput &input, VgiTableFunctionLocalState &local_state) {
+static void LaunchPrefetch(ClientContext &context, TableFunctionInput &input,
+                           VgiTableFunctionLocalState &local_state) {
 	local_state.prefetch_slot_->state.store(PrefetchState::IN_FLIGHT);
 	vector<unique_ptr<AsyncTask>> tasks;
-	tasks.push_back(make_uniq<VgiPrefetchTask>(local_state.prefetch_slot_));
+	tasks.push_back(make_uniq<VgiPrefetchTask>(context, local_state.prefetch_slot_));
 	input.async_result = AsyncResult(std::move(tasks));
 }
 
@@ -4128,7 +4141,7 @@ void VgiTableFunctionScan(ClientContext &context, TableFunctionInput &input, Dat
 		// Update dynamic filter state before the prefetch task sends a tick
 		UpdateDynamicFilterState(global_state, context, bind_data);
 		// Subsequent batches: launch prefetch and return BLOCKED
-		LaunchPrefetch(input, local_state);
+		LaunchPrefetch(context, input, local_state);
 		output.SetCardinality(0);
 		return;
 	}
