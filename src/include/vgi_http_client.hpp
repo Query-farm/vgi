@@ -1,6 +1,7 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <memory>
@@ -136,6 +137,12 @@ private:
 // separate HEAD /health round trip per connection. Pass the same per-catalog
 // snapshot (see ServerCapabilitiesCache) on every call to keep the codec
 // choice warm.
+// cancellation: the query's interrupt flag (&context.interrupted) for a request
+// that belongs to that query's scan. The backend aborts the transfer when it
+// flips, and the call throws InterruptException rather than a transport error.
+// Opt-in, never defaulted to the context's own flag: unary RPCs (rollback,
+// table_buffering_destructor) and the cancel dispatcher's server-side cancel all
+// run while the user's query is still marked interrupted, and must go out.
 std::string HttpPostArrowIpc(ClientContext &context,
                               const std::string &url,
                               const std::vector<uint8_t> &body,
@@ -144,12 +151,14 @@ std::string HttpPostArrowIpc(ClientContext &context,
                               const std::shared_ptr<HTTPParams> &cached_http_params = nullptr,
                               duckdb::unique_ptr<HTTPClient> *client_holder = nullptr,
                               ServerCapabilities *harvested_caps = nullptr,
-                              const std::shared_ptr<IrohClientConfig> &iroh_config = nullptr);
+                              const std::shared_ptr<IrohClientConfig> &iroh_config = nullptr,
+                              const std::atomic<bool> *cancellation = nullptr);
 
 // HTTP GET raw bytes from a URL. Used for fetching externalized batches.
 // Handles X-VGI-Content-Encoding decompression (zstd or gzip). No auth
-// headers sent.
-std::string HttpGetBytes(ClientContext &context, const std::string &url);
+// headers sent. cancellation: as for HttpPostArrowIpc.
+std::string HttpGetBytes(ClientContext &context, const std::string &url,
+                         const std::atomic<bool> *cancellation = nullptr);
 
 // Resolve an external location pointer batch by fetching and parsing the URL.
 // Returns the resolved data batch. Throws on redirect loops or fetch failures.
@@ -162,7 +171,8 @@ UnaryResponseResult ResolveExternalLocation(ClientContext &context,
                                              const std::string &worker_path = "",
                                              const std::string &invocation_id_hex = "",
                                              const std::string &attach_opaque_data_hex = "",
-                                             const std::shared_ptr<arrow::KeyValueMetadata> &pointer_metadata = nullptr);
+                                             const std::shared_ptr<arrow::KeyValueMetadata> &pointer_metadata = nullptr,
+                                             const std::atomic<bool> *cancellation = nullptr);
 
 // Check if a batch result is a pointer batch and resolve it if so.
 // Returns the original result if not a pointer batch, or the resolved result.

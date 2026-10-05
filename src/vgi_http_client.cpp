@@ -272,6 +272,19 @@ static std::vector<std::string> CollectSetCookieHeaders(const RpcHttpResponse &r
 	return out;
 }
 
+// Whether a request armed with ``cancellation`` ended because the flag flipped.
+// The curl backend marks such a response cancelled; a backend that cannot abort
+// mid-transfer (the in-tree httplib fallback) instead fails it or lets it finish,
+// and a failure with the flag set is still the interrupt, not a transport fault.
+// A response that completed normally is kept: the scan loop reports the
+// interrupt at its next check, and the stream token stays in step meanwhile.
+static bool IsInterruptedRequest(const std::atomic<bool> *cancellation, const HTTPResponse *response) {
+	if (!cancellation || !cancellation->load()) {
+		return false;
+	}
+	return !response || response->IsCancelled() || response->HasRequestError();
+}
+
 // Forward declarations — defined below with the capability-header parsing.
 template <class RESPONSE>
 static ServerCapabilities ParseCapabilityHeaders(const RESPONSE &response);
@@ -297,7 +310,8 @@ static std::string HttpPostArrowIpcInternal(
     const std::shared_ptr<HTTPParams> &cached_http_params = nullptr, HttpEncoding request_encoding = HttpEncoding::ZSTD,
     bool allow_codec_retry = true, duckdb::unique_ptr<HTTPClient> *client_holder = nullptr,
                                              ServerCapabilities *harvested_caps = nullptr,
-                                             const std::shared_ptr<IrohClientConfig> &iroh_config = nullptr) {
+                                             const std::shared_ptr<IrohClientConfig> &iroh_config = nullptr,
+                                             const std::atomic<bool> *cancellation = nullptr) {
 	const bool is_httpi = IsHttpiTransport(url);
 	const uint64_t timeout_seconds = GetHttpTimeoutSeconds(context);
 	const int64_t accepted_max_response_bytes = GetAcceptedMaxResponseBytes(context);
@@ -399,11 +413,20 @@ static std::string HttpPostArrowIpcInternal(
 		PostRequestInfo post(url, headers, *params, reinterpret_cast<const_data_ptr_t>(req_body_data),
 	                     static_cast<idx_t>(req_body_size));
 	post.try_request = true;
+		// Per request, never on the cached params: those are shared by every
+		// query against this ATTACH.
+		post.cancellation = cancellation;
 	if (client_holder) {
 			out_response->native = http_util.Request(post, *client_holder);
 	} else {
 			out_response->native = http_util.Request(post);
 	}
+		// Checked before anything reads the response: an aborted transfer carries
+		// no capability headers either, so it would otherwise surface as a
+		// misleading "does not advertise" or transport error.
+		if (IsInterruptedRequest(cancellation, out_response->native.get())) {
+			throw InterruptException();
+		}
 		if (!out_response->native) {
 		throw IOException("VGI HTTP POST returned no response (transport failure) [url: %s]", url);
 	}
@@ -501,7 +524,8 @@ static std::string HttpPostArrowIpcInternal(
 		if (alternate != request_encoding) {
 			return HttpPostArrowIpcInternal(context, url, body, bearer_token, cookie_jar, out_response,
 			                                cached_http_params, alternate,
-			                                /*allow_codec_retry=*/false, client_holder, harvested_caps, iroh_config);
+			                                /*allow_codec_retry=*/false, client_holder, harvested_caps, iroh_config,
+			                                cancellation);
 		}
 	}
 
@@ -716,7 +740,8 @@ std::string HttpPostArrowIpc(ClientContext &context, const std::string &url, con
                               const std::shared_ptr<SessionCookieJar> &cookie_jar,
                               const std::shared_ptr<HTTPParams> &cached_http_params,
                              duckdb::unique_ptr<HTTPClient> *client_holder, ServerCapabilities *harvested_caps,
-                             const std::shared_ptr<IrohClientConfig> &iroh_config) {
+                             const std::shared_ptr<IrohClientConfig> &iroh_config,
+                             const std::atomic<bool> *cancellation) {
 	// Get cached token from per-catalog auth (if any)
 	std::string token;
 	if (auth) {
@@ -732,7 +757,7 @@ std::string HttpPostArrowIpc(ClientContext &context, const std::string &url, con
 	std::unique_ptr<RpcHttpResponse> response;
 	auto result = HttpPostArrowIpcInternal(context, url, body, token, cookie_jar, response, cached_http_params,
 	                                       request_encoding, /*allow_codec_retry=*/true, client_holder, harvested_caps,
-	                                       iroh_config);
+	                                       iroh_config, cancellation);
 
 	if (response->Status() != HTTPStatusCode::Unauthorized_401) {
 		return result;
@@ -801,7 +826,8 @@ std::string HttpPostArrowIpc(ClientContext &context, const std::string &url, con
 	// Retry with new token
 	result = HttpPostArrowIpcInternal(context, url, body, new_token, cookie_jar, response, cached_http_params,
 	                                  harvested_caps ? ChooseRequestEncoding(*harvested_caps) : request_encoding,
-	                                  /*allow_codec_retry=*/true, client_holder, harvested_caps, iroh_config);
+	                                  /*allow_codec_retry=*/true, client_holder, harvested_caps, iroh_config,
+	                                  cancellation);
 	if (response->Status() == HTTPStatusCode::Unauthorized_401) {
 		throw IOException("VGI HTTP authentication failed after auth flow (HTTP 401) [url: %s]. "
 		                  "Response: %s",
@@ -882,7 +908,7 @@ UnaryResponseResult HttpInvokeUnary(ClientContext &context, const std::string &w
 // External Location Support
 // ============================================================================
 
-std::string HttpGetBytes(ClientContext &context, const std::string &url) {
+std::string HttpGetBytes(ClientContext &context, const std::string &url, const std::atomic<bool> *cancellation) {
 	auto &db = *context.db;
 	auto &http_util = HTTPUtil::Get(db);
 	auto params = http_util.InitializeParameters(context, url);
@@ -904,7 +930,11 @@ std::string HttpGetBytes(ClientContext &context, const std::string &url) {
 	};
 
 	GetRequestInfo get(url, headers, *params, response_handler, content_handler);
+	get.cancellation = cancellation;
 	auto response = http_util.Request(get);
+	if (IsInterruptedRequest(cancellation, response.get())) {
+		throw InterruptException();
+	}
 	if (!response) {
 		throw IOException("VGI external location fetch returned no response (transport failure) [url: %s]", url);
 	}
@@ -926,14 +956,15 @@ std::string HttpGetBytes(ClientContext &context, const std::string &url) {
 UnaryResponseResult ResolveExternalLocation(ClientContext &context, const std::string &location_url,
                                             const std::string &worker_path, const std::string &invocation_id_hex,
                                              const std::string &attach_opaque_data_hex,
-                                             const std::shared_ptr<arrow::KeyValueMetadata> &pointer_metadata) {
+                                             const std::shared_ptr<arrow::KeyValueMetadata> &pointer_metadata,
+                                             const std::atomic<bool> *cancellation) {
 	if (IsHttpiTransport(location_url)) {
 		throw IOException("VGI external locations over httpi:// are unsupported; the worker must return an "
 		                  "https:// pre-signed URL [url: %s]",
 		                  location_url);
 	}
 	// Fetch the external data
-	auto body = HttpGetBytes(context, location_url);
+	auto body = HttpGetBytes(context, location_url, cancellation);
 
 	if (body.empty()) {
 		throw IOException("VGI external location returned empty response [url: %s]", location_url);

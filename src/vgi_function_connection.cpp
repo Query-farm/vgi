@@ -1278,7 +1278,8 @@ std::shared_ptr<arrow::RecordBatch> FunctionConnection::ReadDataBatch() {
 			int loc_idx = result.custom_metadata->FindKey(RPC_LOCATION_KEY);
 			const std::string location_url = result.custom_metadata->value(loc_idx);
 			auto resolved = ResolveExternalLocation(context_, location_url, worker_path_, GetExecutionIdHex(),
-			                                        GetAttachOpaqueDataHex(), result.custom_metadata);
+			                                        GetAttachOpaqueDataHex(), result.custom_metadata,
+			                                        &context_.interrupted);
 			result.batch = resolved.batch;
 			result.custom_metadata = resolved.metadata;
 		}

@@ -298,7 +298,7 @@ void HttpFunctionConnection::BufferDataBatches(std::shared_ptr<arrow::Buffer> ow
 			auto location_url = bwm.custom_metadata->value(bwm.custom_metadata->FindKey(RPC_LOCATION_KEY));
 			auto resolved = ResolveExternalLocation(context_, location_url,
 			                                         base_url_, GetExecutionIdHex(), GetAttachOpaqueDataHex(),
-			                                         bwm.custom_metadata);
+			                                         bwm.custom_metadata, &context_.interrupted);
 			buffered_batches_.push_back(resolved.batch);
 			buffered_batch_indexes_.push_back(ParseVgiBatchIndex(resolved.metadata, base_url_));
 			buffered_partition_values_bytes_.push_back(
@@ -534,7 +534,8 @@ InitResult HttpFunctionConnection::PerformInit(const BindResult &bind_result,
 	ServerCapabilities harvested = CurrentCapabilities();
 	auto response_body = HttpPostArrowIpc(context_, init_url, body, auth,
 	                                        /*cookie_jar=*/nullptr, cached_params_init, &http_client_,
-	                                        &harvested, attach_params_ ? attach_params_->iroh() : nullptr);
+	                                        &harvested, attach_params_ ? attach_params_->iroh() : nullptr,
+	                                        &context_.interrupted);
 	PublishHarvestedCapabilities(harvested);
 #ifdef __EMSCRIPTEN__
 #endif
@@ -555,7 +556,7 @@ InitResult HttpFunctionConnection::PerformInit(const BindResult &bind_result,
 		if (loc_idx >= 0) {
 			auto location_url = header_result.header.metadata->value(loc_idx);
 			auto resolved = ResolveExternalLocation(context_, location_url, base_url_,
-			                                         "", "", header_result.header.metadata);
+			                                         "", "", header_result.header.metadata, &context_.interrupted);
 			header_result.header.header_batch = resolved.batch;
 			header_result.header.metadata = resolved.metadata;
 		}
@@ -875,7 +876,8 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 		ServerCapabilities p_harvested = CurrentCapabilities();
 		auto response_body = HttpPostArrowIpc(context_, exchange_url, body, p_auth,
 		                                        /*cookie_jar=*/nullptr, p_cached_params, &http_client_,
-		                                        &p_harvested, attach_params_ ? attach_params_->iroh() : nullptr);
+		                                        &p_harvested, attach_params_ ? attach_params_->iroh() : nullptr,
+		                                        &context_.interrupted);
 		PublishHarvestedCapabilities(p_harvested);
 
 		// Parse response — buffer new data batches (adopt the body, no copy)
@@ -952,7 +954,8 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 	ServerCapabilities x_harvested = CurrentCapabilities();
 	auto response_body = HttpPostArrowIpc(context_, exchange_url, body, x_auth,
 	                                        /*cookie_jar=*/nullptr, x_cached_params, &http_client_,
-	                                        &x_harvested, attach_params_ ? attach_params_->iroh() : nullptr);
+	                                        &x_harvested, attach_params_ ? attach_params_->iroh() : nullptr,
+	                                        &context_.interrupted);
 	PublishHarvestedCapabilities(x_harvested);
 
 	// Parse response — copy into owning buffer since Arrow IPC reads zero-copy reference it
@@ -1003,7 +1006,7 @@ std::shared_ptr<arrow::RecordBatch> HttpFunctionConnection::ReadDataBatch() {
 			auto location_url = bwm.custom_metadata->value(bwm.custom_metadata->FindKey(RPC_LOCATION_KEY));
 			auto resolved = ResolveExternalLocation(context_, location_url,
 			                                         base_url_, GetExecutionIdHex(), GetAttachOpaqueDataHex(),
-			                                         bwm.custom_metadata);
+			                                         bwm.custom_metadata, &context_.interrupted);
 			if (!output_batch) {
 				output_batch = resolved.batch;
 			}
