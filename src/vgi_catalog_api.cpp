@@ -2008,6 +2008,9 @@ VgiAttachOptionSpec ParseAttachOptionSpec(const std::vector<uint8_t> &bytes, con
 	// Added after the original four columns: a worker that predates it simply
 	// doesn't send the column, and value_or() reads that as "not required".
 	spec.required = row["required"].value_or(false);
+	// Appended after `required`, read by name the same way: absent or null
+	// means not a credential.
+	spec.secret = row["secret"].value_or(false);
 
 	return spec;
 }

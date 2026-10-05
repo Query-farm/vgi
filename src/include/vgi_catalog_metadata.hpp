@@ -66,6 +66,10 @@ struct VgiAttachOptionSpec {
 	// satisfiable without the caller. Absent from a worker that predates the
 	// field, which reads as false.
 	bool required = false;
+	// The option is a credential: never written to the result-cache key in plain
+	// text (a salted HMAC instead), redacted from duckdb_databases(), never
+	// logged. Absent from a worker that predates the field, which reads as false.
+	bool secret = false;
 };
 
 // A parameter definition for a VGI secret type

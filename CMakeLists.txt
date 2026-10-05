@@ -356,6 +356,8 @@ src/vgi_wasm_async_pool.cpp
 src/vgi_table_statistics_function.cpp
 src/vgi_clear_cache.cpp
 src/vgi_secret_storage.cpp
+src/vgi_attach_credentials.cpp
+src/vgi_attach_secret.cpp
 src/storage/vgi_catalog.cpp
 src/storage/vgi_catalog_set.cpp
 src/storage/vgi_schema_set.cpp
@@ -471,6 +473,7 @@ if((BUILD_VGI_UNIT_TESTS OR DEFINED ENV{BUILD_VGI_UNIT_TESTS}) AND NOT WIN32)
     test/cpp/test_container_runtime.cpp
     test/cpp/test_oauth.cpp
     test/cpp/test_telemetry.cpp
+    test/cpp/test_attach_credentials.cpp
     test/cpp/test_request_schema_parity.cpp
     test/cpp/test_protocol_routing.cpp
     test/cpp/test_sab_stream.cpp
@@ -488,6 +491,7 @@ if((BUILD_VGI_UNIT_TESTS OR DEFINED ENV{BUILD_VGI_UNIT_TESTS}) AND NOT WIN32)
     src/vgi_arrow_utils.cpp
     src/vgi_result_cache.cpp
     src/vgi_sha256.cpp
+    src/vgi_attach_credentials.cpp
     src/vgi_cache_identity.cpp
     src/vgi_table_buffering_builders.cpp
     src/vgi_schema_registry.cpp

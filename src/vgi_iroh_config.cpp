@@ -9,6 +9,7 @@
 #include "duckdb/main/secret/secret.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
 #include "duckdb/catalog/catalog_transaction.hpp"
+#include "vgi_attach_secret.hpp"
 #include "vgi_transport.hpp"
 
 #include <algorithm>
@@ -57,14 +58,15 @@ std::string IrohSecretKey::CopyEncoded() const {
 
 namespace {
 
+// Same URL-boundary rule as `vgi_attach` lookup (see vgi_attach_secret.hpp):
+// an unscoped `iroh` secret never matches, and `iroh://abc` does not match
+// `iroh://abcdef`. DuckDB's own LookupSecret is a plain string prefix.
 std::string SecretKeyFromScope(ClientContext &context, const std::string &scope) {
-	auto &manager = SecretManager::Get(context);
-	auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
-	auto match = manager.LookupSecret(transaction, scope, "iroh");
-	if (!match.HasMatch()) {
+	auto match = LookupScopedKeyValueSecret(context, scope, "iroh");
+	if (!match) {
 		return {};
 	}
-	const auto *kv = dynamic_cast<const KeyValueSecret *>(&match.GetSecret());
+	const auto *kv = dynamic_cast<const KeyValueSecret *>(match->secret.get());
 	if (!kv) {
 		throw BinderException("VGI Iroh identity secret for '%s' is not a key-value secret", scope);
 	}
