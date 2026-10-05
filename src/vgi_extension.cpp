@@ -60,7 +60,6 @@
 #include "storage/vgi_table_entry.hpp"
 #include "storage/vgi_transaction.hpp"
 #include "vgi_attach_credentials.hpp"
-#include "vgi_attach_secret.hpp"
 #include "vgi_cancel_dispatcher.hpp"
 #include "vgi_catalog_rpc.hpp"
 #include "vgi_catalogs.hpp"
@@ -1672,13 +1671,9 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	// sorted for a stable serialization.
 	std::map<std::string, std::string> key_options;
 	// Cache-key entries for worker-declared options, held back until the spec is
-	// known: a credential (spec `secret`, or any value sourced from a vgi_attach
-	// secret) enters the key only as a salted HMAC, never in plain text.
+	// known: a credential (spec `secret`) enters the key only as a salted HMAC,
+	// never in plain text.
 	std::map<std::string, std::string> deferred_key_options;
-	// `attach_secret '<name>'` picks the vgi_attach secret by name; `''` turns
-	// resolution off; absent, the secret is looked up by LOCATION scope.
-	bool attach_secret_named = false;
-	string attach_secret_name;
 	// Option names given in the ATTACH path's '?query', so a credential there
 	// can be redacted from info.path once the spec says it is one.
 	std::set<std::string> path_query_keys;
@@ -1686,14 +1681,13 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	// Per-option handler, shared between the connection-string query (below) and
 	// the explicit (TYPE vgi, ...) options clause so both honour the same names.
 	auto apply_option = [&](const string &lower_name, const Value &value) {
-		// Record for the cache key — every option except the secret tokens,
-		// attach_secret (a name, not a value; the values it resolves are keyed
-		// separately) and LOCATION/PATH (LOCATION is already the key's
-		// worker_path; the tokens must never enter the key or the on-disk digest).
+		// Record for the cache key — every option except the secret tokens and
+		// LOCATION/PATH (LOCATION is already the key's worker_path; the tokens
+		// must never enter the key or the on-disk digest). Worker-declared
+		// options are deferred until their spec says whether they are secret.
 		const bool keyable = lower_name != "type" && lower_name != "location" && lower_name != "path" &&
 		                     lower_name != "bearer_token" && lower_name != "oauth_refresh_token" &&
-		                     lower_name != "iroh_secret_key" && lower_name != "attach_secret" &&
-		                     value.type().id() != LogicalTypeId::STRUCT;
+		                     lower_name != "iroh_secret_key" && value.type().id() != LogicalTypeId::STRUCT;
 		bool worker_option = false;
 		if (lower_name == "type") {
 			return;
@@ -1744,9 +1738,6 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 			if (tcp_proxy.empty()) {
 				throw BinderException("tcp_proxy, if set, must not be empty");
 			}
-		} else if (lower_name == "attach_secret") {
-			attach_secret_named = true;
-			attach_secret_name = value.IsNull() ? string() : value.ToString();
 		} else if (vgi::ApplyIrohOption(lower_name, value, iroh_options)) {
 			// iroh_* options: parsed by the shared helper (see vgi_iroh_config.hpp).
 		} else if (lower_name == "data_version_spec") {
@@ -1900,52 +1891,6 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	// detection / image inspection, database:// resolution, Iroh configuration,
 	// the discovery RPC). Checks the raw user LOCATION, before the rewrites below.
 	vgi::CheckLocationPolicy(context, worker_path, vgi::LocationEntryPoint::ATTACH);
-
-	// vgi_attach secret: resolved once, after the policy gate (a refused LOCATION
-	// never resolves a secret) and against the raw LOCATION the user wrote. Only
-	// the user's attach_secret and LOCATION choose it; nothing a worker sends is
-	// consulted. Explicit options win over the secret's values. Applies to this
-	// catalog only, never to its companions.
-	std::map<std::string, Value> secret_option_candidates;
-	{
-		auto resolved = vgi::ResolveAttachSecret(context, worker_path, attach_secret_named, attach_secret_name);
-		if (resolved.found) {
-			const bool explicit_auth = !bearer_token.empty() || !oauth_refresh_token.empty();
-			bool used_bearer = false;
-			bool used_refresh = false;
-			if (!explicit_auth) {
-				if (!resolved.bearer_token.empty()) {
-					bearer_token = resolved.bearer_token;
-					used_bearer = true;
-				}
-				if (!resolved.oauth_refresh_token.empty()) {
-					oauth_refresh_token = resolved.oauth_refresh_token;
-					used_refresh = true;
-				}
-			}
-			string candidate_names;
-			for (auto &kv : resolved.options) {
-				if (attach_options.count(kv.first)) {
-					continue; // explicit wins
-				}
-				if (!candidate_names.empty()) {
-					candidate_names += ",";
-				}
-				candidate_names += kv.first;
-				secret_option_candidates.emplace(kv.first, kv.second);
-			}
-			// Names only — never a value.
-			VGI_LOG(context, "attach.secret_resolved",
-			        {{"secret", resolved.name},
-			         {"source", resolved.source},
-			         {"bearer_token", used_bearer ? "true" : "false"},
-			         {"oauth_refresh_token", used_refresh ? "true" : "false"},
-			         {"option_names", candidate_names}});
-		}
-	}
-	if (!bearer_token.empty() && !oauth_refresh_token.empty()) {
-		throw BinderException("Cannot specify both bearer_token and oauth_refresh_token");
-	}
 
 	if (!tcp_proxy.empty() && !vgi::IsTcpTransport(worker_path)) {
 		throw BinderException("tcp_proxy is only valid for tcp:// LOCATIONs");
@@ -2205,10 +2150,7 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	// the catalog name for the bare connection-string form, or to validate
 	// attach-time options against the catalog's declared AttachOptionSpec list.
 	// Catalogs without options on the explicit form pay no overhead (no RPC).
-	// A vgi_attach secret carrying options needs the spec too, to learn which of
-	// them the catalog declares; the RPC is authenticated with the secret's
-	// token when it has one (auth above already holds it).
-	if (discover_catalog || !attach_options.empty() || !secret_option_candidates.empty()) {
+	if (discover_catalog || !attach_options.empty()) {
 		auto catalogs = vgi::InvokeCatalogs(worker_path, context, worker_debug, use_pool, auth,
 		                                    launcher_idle_for_attach, launcher_state_dir_for_attach,
 		                                    worker_artifact_anchor, tcp_proxy, iroh_config);
@@ -2254,7 +2196,7 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 
 		// Validate attach-time options against the resolved catalog's declared
 		// AttachOptionSpec list (skipped on the bare form when no options given).
-		if (!attach_options.empty() || !secret_option_candidates.empty()) {
+		if (!attach_options.empty()) {
 			const vgi::VgiCatalogInfo *matching_info = nullptr;
 			for (const auto &info_entry : catalogs) {
 				if (info_entry.name == catalog_name) {
@@ -2334,27 +2276,6 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 				validated_options.emplace(matching_spec->name, std::move(casted));
 			}
 
-			// Options supplied by the vgi_attach secret: only the ones this catalog
-			// declares are sent, each cast by its spec like an explicit value, and
-			// always treated as a credential (hashed key, never in info.options,
-			// never logged), whatever the spec says.
-			for (const auto &cand : secret_option_candidates) {
-				const auto *matching_spec = find_spec(cand.first);
-				if (!matching_spec) {
-					VGI_LOG_LEVEL(context, LogLevel::LOG_DEBUG, "attach.secret_option_ignored",
-					              {{"option", cand.first}, {"reason", "not declared by catalog"}});
-					continue;
-				}
-				Value casted;
-				std::string cast_error; // never surfaced: it would quote the value
-				if (!cand.second.DefaultTryCastAs(matching_spec->type, casted, &cast_error)) {
-					throw BinderException("Cannot cast ATTACH option '%s' from the vgi_attach secret to declared "
-					                      "type %s",
-					                      matching_spec->name, matching_spec->type.ToString());
-				}
-				key_options[cand.first] = hashed_key(cand.first, casted);
-				validated_options.emplace(matching_spec->name, std::move(casted));
-			}
 			attach_options = std::move(validated_options);
 
 			// Redact explicit options the spec marks secret, from the options
@@ -2411,8 +2332,8 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 	auto &secret_manager = SecretManager::Get(context);
 	auto vgi_ext = StorageExtension::Find(config, "vgi");
 	for (const auto &st : attach_result.secret_types) {
-		// The extension owns `vgi_attach` and `iroh`. A worker advertising either
-		// name is refused, so it can never shadow their redaction or provider.
+		// The extension owns `iroh`. A worker advertising it is refused, so it
+		// can never shadow its redaction or provider.
 		if (vgi::IsReservedSecretTypeName(st.name)) {
 			VGI_LOG(context, "attach.secret_type_refused",
 			        {{"catalog", catalog_name}, {"secret_type", st.name}, {"reason", "reserved by the vgi extension"}});
@@ -3596,8 +3517,6 @@ static void LoadInternal(ExtensionLoader &loader) {
 	iroh_secret_function.function = IrohCreateSecret;
 	iroh_secret_function.named_parameters["secret_key"] = LogicalType::VARCHAR;
 	loader.RegisterFunction(std::move(iroh_secret_function));
-	// ATTACH-time credentials (docs/attach_credentials.md): also worker-independent.
-	vgi::RegisterAttachSecretType(loader);
 
 	// -------------------------------------------------------------------------
 	// Register native GeoArrow Arrow extension types

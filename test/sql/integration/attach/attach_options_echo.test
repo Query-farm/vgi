@@ -164,3 +164,34 @@ DETACH ao_defaults;
 
 statement ok
 DETACH ao_other;
+
+# ============================================================================
+# `secret` flag absent or false; the options clause wins over the path's ?query
+# ============================================================================
+
+# Every option of the main catalog is non-secret, whether the worker sends the
+# column (false) or predates it (absent, read as false).
+query T
+SELECT DISTINCT opt.secret
+FROM (
+    SELECT UNNEST(attach_options) AS opt
+    FROM vgi_catalogs('${VGI_ATTACH_OPTIONS_WORKER}')
+    WHERE catalog = 'attach_options'
+);
+----
+false
+
+statement ok
+ATTACH 'attach_options?location=${VGI_ATTACH_OPTIONS_WORKER}&opt_string=from-path&opt_int32=7' AS ao (
+    TYPE vgi,
+    opt_string 'from-clause'
+);
+
+# The clause wins on the conflict; the query still supplies the rest.
+query TI
+SELECT opt_string, opt_int32 FROM ao.echo_attach_options();
+----
+from-clause	7
+
+statement ok
+DETACH ao;

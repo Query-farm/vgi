@@ -131,7 +131,7 @@ bool LoadOrCreateDirSalt(const std::string &dir, std::string &out) {
 
 bool IsReservedSecretTypeName(const std::string &name) {
 	auto lower = ToLowerAscii(name);
-	return lower == VGI_ATTACH_SECRET_TYPE || lower == "iroh";
+	return lower == "iroh";
 }
 
 bool ScopeMatchesAtBoundary(const std::string &scope, const std::string &location) {

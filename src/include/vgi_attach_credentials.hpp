@@ -1,10 +1,10 @@
 // © Copyright 2026 Query Farm LLC - https://query.farm
 #pragma once
 //
-// DuckDB-free helpers for credentials supplied at ATTACH: the URL-boundary scope
-// rule used by `vgi_attach` (and `iroh`) secret lookup, and the salted HMAC that
-// keeps credential-valued attach options out of the result-cache key in plain
-// text. See docs/attach_credentials.md.
+// DuckDB-free helpers for credentials: the salted HMAC that keeps
+// credential-valued (`secret`) attach options out of the result-cache key in
+// plain text, and the URL-boundary scope rule the `iroh` identity-secret lookup
+// uses. See docs/attach_credentials.md.
 //
 // Kept free of DuckDB / Arrow includes so the vgi_unit_tests binary can link it
 // directly.
@@ -16,12 +16,9 @@
 namespace duckdb {
 namespace vgi {
 
-//! The secret type the extension registers at LOAD for ATTACH-time credentials.
-constexpr const char *VGI_ATTACH_SECRET_TYPE = "vgi_attach";
-
-//! True when `name` is a secret type the extension owns (`vgi_attach`, `iroh`).
-//! A worker advertising one of these names is refused, so it can never shadow
-//! the extension's own type (and its redaction).
+//! True when `name` is a secret type the extension itself registers at LOAD
+//! (`iroh`). A worker advertising it is refused, so it can never shadow the
+//! extension's own type (and its redaction).
 bool IsReservedSecretTypeName(const std::string &name);
 
 //! True when `scope` matches `location` under the URL-boundary rule: `location`

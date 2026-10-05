@@ -1,5 +1,5 @@
 # name: test/sql/integration/attach/attach_options_required.test
-# description: attach options declared `required` are advertised at discovery and enforced at ATTACH
+# description: attach options declared `required` / `secret` are advertised at discovery, enforced, forwarded and redacted
 # group: [vgi_integration_attach]
 
 # Gated separately from attach_options_echo.test: the gated catalog is a
@@ -56,6 +56,112 @@ ATTACH 'attach_options_required' AS gated (
     LOCATION '${VGI_ATTACH_OPTIONS_REQUIRED_WORKER}',
     api_key 'secret'
 );
+
+statement ok
+DETACH gated;
+
+# ============================================================================
+# Secret options (cross-SDK: every attach-options worker declares api_key
+# required + secret, so a worker that stops advertising the flag fails here)
+# ============================================================================
+
+query TTT
+SELECT opt.name, opt.required, opt.secret
+FROM (
+    SELECT UNNEST(attach_options) AS opt
+    FROM vgi_catalogs('${VGI_ATTACH_OPTIONS_REQUIRED_WORKER}')
+    WHERE catalog = 'attach_options_required'
+)
+ORDER BY opt.name;
+----
+api_key	true	true
+region	false	false
+
+query T
+SELECT DISTINCT opt.secret
+FROM (
+    SELECT UNNEST(attach_options) AS opt
+    FROM vgi_catalogs('${VGI_ATTACH_OPTIONS_REQUIRED_WORKER}')
+    WHERE catalog = 'attach_options'
+);
+----
+false
+
+# ============================================================================
+# Forwarded: the gated catalog refuses without api_key and attaches with it
+# ============================================================================
+
+statement error
+ATTACH 'attach_options_required' AS gated (TYPE vgi, LOCATION '${VGI_ATTACH_OPTIONS_REQUIRED_WORKER}');
+----
+required option 'api_key'
+
+statement ok
+ATTACH 'attach_options_required' AS gated (
+    TYPE vgi,
+    LOCATION '${VGI_ATTACH_OPTIONS_REQUIRED_WORKER}',
+    api_key 'sk-explicit-must-not-leak',
+    region 'eu-west-1'
+);
+
+# ============================================================================
+# Redacted from duckdb_databases(); an ordinary option is not
+# ============================================================================
+
+query I
+SELECT count(*) FROM duckdb_databases()
+WHERE database_name = 'gated' AND options::VARCHAR LIKE '%must-not-leak%';
+----
+0
+
+query I
+SELECT count(*) FROM duckdb_databases()
+WHERE database_name = 'gated' AND options::VARCHAR LIKE '%<redacted>%' AND options::VARCHAR LIKE '%eu-west-1%';
+----
+1
+
+statement ok
+DETACH gated;
+
+# ============================================================================
+# An expression: the credential need not be a literal in the ATTACH text
+# (in the CLI, `api_key getenv('SALES_API_KEY')`)
+# ============================================================================
+
+statement ok
+ATTACH 'attach_options_required' AS gated (
+    TYPE vgi,
+    LOCATION '${VGI_ATTACH_OPTIONS_REQUIRED_WORKER}',
+    api_key 'sk-' || 'abc'
+);
+
+query I
+SELECT count(*) FROM duckdb_databases()
+WHERE database_name = 'gated' AND options::VARCHAR LIKE '%sk-abc%';
+----
+0
+
+query I
+SELECT count(*) FROM duckdb_databases()
+WHERE database_name = 'gated' AND options::VARCHAR LIKE '%<redacted>%';
+----
+1
+
+statement ok
+DETACH gated;
+
+# ============================================================================
+# Connection-string form: the whole query is redacted from the path
+# ============================================================================
+
+statement ok
+ATTACH 'attach_options_required?location=${VGI_ATTACH_OPTIONS_REQUIRED_WORKER}&api_key=sk-path-must-not-leak' AS gated (TYPE vgi);
+
+query I
+SELECT count(*) FROM duckdb_databases()
+WHERE database_name = 'gated' AND (coalesce(path, '') LIKE '%must-not-leak%' OR options::VARCHAR LIKE '%must-not-leak%');
+----
+0
 
 statement ok
 DETACH gated;

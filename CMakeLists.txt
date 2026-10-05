@@ -357,7 +357,6 @@ src/vgi_table_statistics_function.cpp
 src/vgi_clear_cache.cpp
 src/vgi_secret_storage.cpp
 src/vgi_attach_credentials.cpp
-src/vgi_attach_secret.cpp
 src/storage/vgi_catalog.cpp
 src/storage/vgi_catalog_set.cpp
 src/storage/vgi_schema_set.cpp

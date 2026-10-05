@@ -9,7 +9,7 @@
 #include "duckdb/main/secret/secret.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
 #include "duckdb/catalog/catalog_transaction.hpp"
-#include "vgi_attach_secret.hpp"
+#include "vgi_attach_credentials.hpp"
 #include "vgi_transport.hpp"
 
 #include <algorithm>
@@ -58,11 +58,49 @@ std::string IrohSecretKey::CopyEncoded() const {
 
 namespace {
 
-// Same URL-boundary rule as `vgi_attach` lookup (see vgi_attach_secret.hpp):
-// an unscoped `iroh` secret never matches, and `iroh://abc` does not match
-// `iroh://abcdef`. DuckDB's own LookupSecret is a plain string prefix.
+// The `iroh` identity secret for a LOCATION, under the URL-boundary rule
+// (vgi_attach_credentials.hpp): an unscoped `iroh` secret never matches, and
+// `iroh://abc` does not match `iroh://abcdef`. DuckDB's own LookupSecret is a
+// plain string prefix, with an unscoped secret matching everything. Only the
+// local storages (memory, local_file) are consulted, never a worker-backed one.
+// Ties on scope length prefer a temporary secret, then the smaller name, as
+// DuckDB does.
+std::unique_ptr<SecretEntry> LookupIrohSecret(ClientContext &context, const std::string &location) {
+	auto &manager = SecretManager::Get(context);
+	auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
+	auto all = manager.AllSecrets(transaction);
+	const SecretEntry *best = nullptr;
+	int64_t best_score = -1;
+	bool best_temporary = false;
+	for (const auto &entry : all) {
+		if (!entry.secret || !StringUtil::CIEquals(entry.secret->GetType(), "iroh")) {
+			continue;
+		}
+		const bool temporary = entry.storage_mode == SecretManager::TEMPORARY_STORAGE_NAME;
+		if (!temporary && entry.storage_mode != SecretManager::LOCAL_FILE_STORAGE_NAME) {
+			continue;
+		}
+		const auto &scope = entry.secret->GetScope();
+		const int64_t score = BoundaryScopeScore(std::vector<std::string>(scope.begin(), scope.end()), location);
+		if (score < 0) {
+			continue;
+		}
+		bool better = !best || score > best_score;
+		if (!better && score == best_score) {
+			better = temporary != best_temporary ? temporary
+			                                     : entry.secret->GetName() < best->secret->GetName();
+		}
+		if (better) {
+			best = &entry;
+			best_score = score;
+			best_temporary = temporary;
+		}
+	}
+	return best ? make_uniq<SecretEntry>(*best) : nullptr;
+}
+
 std::string SecretKeyFromScope(ClientContext &context, const std::string &scope) {
-	auto match = LookupScopedKeyValueSecret(context, scope, "iroh");
+	auto match = LookupIrohSecret(context, scope);
 	if (!match) {
 		return {};
 	}

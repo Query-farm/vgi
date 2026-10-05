@@ -139,9 +139,9 @@ TEST_CASE("BoundaryScopeScore picks the longest boundary match; unscoped never m
 }
 
 TEST_CASE("Reserved secret type names", "[attach-credentials]") {
-	CHECK(IsReservedSecretTypeName("vgi_attach"));
-	CHECK(IsReservedSecretTypeName("VGI_ATTACH"));
 	CHECK(IsReservedSecretTypeName("iroh"));
+	CHECK(IsReservedSecretTypeName("IROH"));
 	CHECK_FALSE(IsReservedSecretTypeName("vgi"));
+	CHECK_FALSE(IsReservedSecretTypeName("vgi_attach"));
 	CHECK_FALSE(IsReservedSecretTypeName("my_api"));
 }

@@ -29,6 +29,20 @@ set ignore_error_messages Unable to connect
 statement ok
 ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}', bearer_token '${VGI_TEST_BEARER_TOKEN}');
 
+# The token is redacted from duckdb_databases(), which reads DuckDB's own copy
+# of the ATTACH options (it was shown there in plain text before).
+query I
+SELECT count(*) FROM duckdb_databases()
+WHERE database_name = 'example' AND options::VARCHAR LIKE '%${VGI_TEST_BEARER_TOKEN}%';
+----
+0
+
+query I
+SELECT count(*) FROM duckdb_databases()
+WHERE database_name = 'example' AND options::VARCHAR LIKE '%<redacted>%';
+----
+1
+
 # ============================================================================
 # Basic scalar function works with bearer auth
 # ============================================================================

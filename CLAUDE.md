@@ -424,34 +424,24 @@ plus the shm-aware code paths in `src/vgi_function_connection.cpp`
 
 **vgi-python function classes**: Function names are CamelCased with a `Function` suffix (e.g., `projected_data` → `ProjectedDataFunction` in vgi-python).
 
-## Credentials at ATTACH (`vgi_attach` secrets)
+## Credentials passed as ATTACH options (`AttachOptionSpec.secret`)
 
-Design and decisions: [docs/attach_credentials.md](docs/attach_credentials.md). Code:
-`src/vgi_attach_secret.cpp` (type, resolution, `vgi_which_attach_secret`) and
-`src/vgi_attach_credentials.cpp` (DuckDB-free: boundary rule, HMAC, salt; unit-tested in
-`test/cpp/test_attach_credentials.cpp`).
+Details: [docs/attach_credentials.md](docs/attach_credentials.md). DuckDB-free helpers (HMAC,
+salt, boundary rule) live in `src/vgi_attach_credentials.cpp`, unit-tested in
+`test/cpp/test_attach_credentials.cpp`.
 
-- **Spec flag.** `AttachOptionSpec` carries a nullable `secret` column after `required`, read by
-  name (absent/null = false). A secret option is HMAC-hashed into the result-cache key with the
-  per-cache-dir salt `<vgi_result_cache_dir>/attach_option_key.salt` (per-process salt without a
-  dir), redacted from `duckdb_databases().options` / the path's `?query`, and never logged.
-  Plain-text cache-key entries for worker options are added only after spec validation.
-- **The `vgi_attach` type** is registered at LOAD (beside `iroh`), every key redacted. Parameters:
-  `BEARER_TOKEN`, `OAUTH_REFRESH_TOKEN`, and `OPTIONS MAP(VARCHAR, VARCHAR)` for worker options:
-  DuckDB's `CREATE SECRET` rejects undeclared parameter names, so `api_key 'x'` can't be a
-  top-level key. Workers can't register `vgi_attach` or `iroh` (refused + logged).
-- **Resolution** happens once per ATTACH, after `CheckLocationPolicy`, against the raw LOCATION:
-  `attach_secret` by name, else boundary-rule scope lookup over the **local** storages only
-  (`memory`, `local_file`; never the Orchard remote storage). Boundary rule: unscoped never
-  matches; the match must end at `/` `?` `#` `:` or end-of-string, or the scope ends in `/`. The
-  `iroh` identity lookup uses the same rule.
-- **Applying it.** Explicit options (clause or `?query`) win; explicit auth of either kind wins
-  over both secret tokens. `OPTIONS` entries the catalog declares are cast by spec and always
-  treated as secret; undeclared ones are ignored (debug log, name only). A secret with `OPTIONS`
-  forces the discovery RPC, authenticated with the secret's token. Companions never see it.
-- **Tests:** `test/sql/integration/attach_secrets/` via `make test_http_attach_options`, which now
-  also starts a bearer-auth instance of the attach-options fixture.
-  `VGI_ATTACH_OPTIONS_WORKER_CMD=<binary>` runs them against another SDK's worker.
+- `AttachOptionSpec` carries a nullable `secret` column after `required`, read by name
+  (absent/null = false), exposed by `vgi_catalogs()` as `attach_options[].secret`.
+- A secret option enters the result-cache key only as `name=h:<HMAC-SHA256>` under the per-cache-dir
+  salt `<vgi_result_cache_dir>/attach_option_key.salt` (per-process salt without a dir). Cache-key
+  entries for worker options are added only after spec validation; non-secret ones are unchanged.
+- It is redacted from `duckdb_databases()` — which reads DuckDB's `AttachOptions` copy, not
+  `info.options`, so **both** are redacted (the three tokens too) — and from the path's `?query`.
+  Cast errors don't quote it; nothing logs it.
+- Recommended usage: inline, as an expression — `api_key getenv('SALES_API_KEY')` in the CLI.
+- A `vgi_attach` secret type was implemented and removed (redundant with the above); see the doc.
+- The `iroh` identity-secret lookup applies a URL-boundary rule (no unscoped match; match ends at
+  `/` `?` `#` `:` or end, or scope ends in `/`) over the local storages only.
 
 ## Remote Secret Provider
 
@@ -1209,7 +1199,6 @@ Catalogs may register additional settings at `ATTACH` time (e.g., `greeting`, `m
 | `worker_debug` | BOOLEAN | false | Enable worker debug output |
 | `oauth_refresh_token` | VARCHAR | (none) | Pre-seed OAuth refresh token for HTTP transport (skips interactive auth) |
 | `bearer_token` | VARCHAR | (none) | Static bearer token for HTTP transport (reused for the remote secret provider too). Throws on 401 (no recovery), unlike OAuth |
-| `attach_secret` | VARCHAR | (scope lookup) | Which `vgi_attach` secret supplies this ATTACH's credentials. Unset: looked up by LOCATION scope (URL-boundary rule, unscoped secrets ignored). `'name'`: that secret (must be type `vgi_attach`; scope not checked). `''`: none. Never forwarded to the worker or put in the cache key. See *Credentials at ATTACH* |
 | `secrets` | BOOLEAN | true | Auto-register the Orchard remote secret provider when the catalog advertises a secret-service URL. Set `false` to opt out for this catalog. See *Remote Secret Provider* |
 | `attach_companions` | BOOLEAN | true | Provision companion catalogs advertised via the catalog_attach `attach_catalogs` manifest (lakehouse federation). Set `false` to opt out. Guarded by a scheme allowlist + never-clobber conflict policy. See *Companion Catalogs* |
 | `attach_companion_secrets` | BOOLEAN | false | Opt IN to injecting a worker-named `secret_ref` credential into a companion's ATTACH options. Off by default: a worker chooses both the secret name and target host, so auto-injection would allow credential exfiltration. See *Companion Catalogs* |
@@ -1263,7 +1252,6 @@ The `launch:` and `unix://` paths share one warm worker process across every Duc
 | `vgi_global_functions()` | Table | Diagnostic: one row per function an attached VGI catalog published into DuckDB's global function namespace. Columns: `global_name` (the name to call unqualified), `catalog_name` (owning attach alias — first attach wins), `function_name`, `schema_name` (the worker's dispatch coordinates), `function_type`, `worker_path`, `live` (false once the owning catalog is DETACHed — the registration persists for the process lifetime but calling it then throws). See [docs/global_functions.md](docs/global_functions.md) |
 | `vgi_secret_providers()` | Table | Diagnostic: one row per auto-registered Orchard remote secret provider. Columns: `catalog_name`, `endpoint`, `tie_break_offset`, `active`, `cached_secrets`, `ttl_seconds`. See *Remote Secret Provider* |
 | `vgi_companion_catalogs()` | Table | Diagnostic: one row per companion catalog attached by VGI catalogs (lakehouse federation). Columns: `catalog_name` (alias), `target`, `db_type`, `hidden` (BOOLEAN — surfaces companions invisible to `duckdb_databases()`), `refcount` (how many attached VGI catalogs share it). See *Companion Catalogs* |
-| `vgi_which_attach_secret(location)` | Table | Which `vgi_attach` secret an ATTACH of `location` would pick by scope lookup: `name`, `persistent`, `storage`; no row when none. Boundary-rule counterpart of DuckDB's `which_secret`. Never returns values |
 | `vgi_secret_provider_flush(catalog := NULL)` | Table | Clear a provider's TTL cache (all providers when `catalog` omitted). Returns the count of positive secrets dropped |
 
 ## Key Source Files
