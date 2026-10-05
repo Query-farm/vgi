@@ -1,0 +1,179 @@
+# name: test/sql/integration/table_in_out/table_buffering_empty_input.test
+# description: A table-buffering function whose input is empty still runs its full
+#   lifecycle -- init, combine with an EMPTY state_ids list, then finalize -- so a
+#   whole-input reduction answers for empty input (sum_all_columns emits its zero row)
+#   instead of returning no rows. Functions with nothing to say for empty input
+#   (buffer_input) still return no rows. Only inputs that are empty at RUNTIME reach
+#   the operator: DuckDB's optimizer folds a statically-empty input (WHERE false) to
+#   an empty result before VGI sees it.
+# group: [vgi_integration_table_in_out]
+
+require-env VGI_TEST_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+ATTACH 'example' AS example (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
+
+statement ok
+CREATE TABLE empty_t (a BIGINT, b BIGINT);
+
+statement ok
+CREATE TABLE full_t AS SELECT range AS a, range * 10 AS b FROM range(5000);
+
+# ============================================================================
+# Reductions answer for empty input
+# ============================================================================
+
+# Empty table: no Sink thread ever receives rows, yet combine + finalize run.
+query II
+SELECT * FROM example.sum_all_columns((SELECT a, b FROM empty_t));
+----
+0	0
+
+# A runtime filter that matches nothing on a non-empty, multi-batch table.
+query II
+SELECT * FROM example.sum_all_columns((SELECT a, b FROM full_t WHERE a < 0));
+----
+0	0
+
+# The same with several sink threads: none of them receives a row.
+statement ok
+SET threads=4;
+
+query II
+SELECT * FROM example.sum_all_columns((SELECT a, b FROM full_t WHERE a < 0));
+----
+0	0
+
+statement ok
+RESET threads;
+
+# The empty-input result composes like any other relation.
+query III
+SELECT s.a, s.b, x.n
+FROM example.sum_all_columns((SELECT a, b FROM empty_t)) s,
+     (SELECT 7 AS n) x;
+----
+0	0	7
+
+# ============================================================================
+# Functions that emit nothing for empty input still return no rows
+# ============================================================================
+
+query I
+SELECT count(*) FROM example.buffer_input((SELECT a, b FROM empty_t));
+----
+0
+
+query I
+SELECT count(*) FROM example.buffer_input((SELECT a, b FROM full_t WHERE a < 0));
+----
+0
+
+# ============================================================================
+# combine really runs on empty input -- and its errors surface
+# ============================================================================
+
+statement error
+SELECT * FROM example.crash_on_combine((SELECT a FROM empty_t));
+----
+Intentional exception during combine()
+
+# The catalog stays usable after the failed empty-input combine.
+query II
+SELECT * FROM example.sum_all_columns((SELECT a, b FROM empty_t));
+----
+0	0
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query II
+SELECT * FROM example.sum_all_columns((SELECT a, b FROM empty_t));
+----
+0	0
+
+# The extension inited a worker itself (no Sink thread did) ...
+query I
+SELECT count(*) > 0
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'table_buffering.init'
+  AND message LIKE '%empty_input%'
+  AND message LIKE '%sum_all_columns%';
+----
+true
+
+# ... and sent combine an empty state_ids list.
+query I
+SELECT count(*) > 0
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'table_buffering.combine'
+  AND regexp_matches(message, 'num_state_ids=0[,}]')
+  AND message LIKE '%sum_all_columns%';
+----
+true
+
+# ============================================================================
+# Result cache: an empty-input result is cached and replayed like any other
+# ============================================================================
+
+statement ok
+SET threads=1;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT a FROM example.cached_sum_all((SELECT a FROM empty_t));
+----
+0
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT a FROM example.cached_sum_all((SELECT a FROM empty_t));
+----
+0
+
+# Second run is a HIT: no combine RPC, result replayed.
+query I
+SELECT count(*)
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'table_buffering.combine'
+  AND message LIKE '%cached_sum_all%';
+----
+0
+
+query I
+SELECT count(*) > 0
+FROM duckdb_logs()
+WHERE type = 'VGI'
+  AND regexp_extract(message, '''event'': ([a-z_.]+)', 1) = 'result_cache.hit'
+  AND message LIKE '%cached_sum_all%';
+----
+true
+
+statement ok
+RESET threads;
+
+# ============================================================================
+# Statically-empty input never reaches the operator
+# ============================================================================
+
+# DuckDB's EmptyResultPullup folds the whole call to EMPTY_RESULT before the VGI
+# rewriter runs, so even a reduction returns no rows here. Pinned so a planner
+# change that starts routing these through the operator is noticed.
+query I
+SELECT count(*) FROM example.sum_all_columns((SELECT a, b FROM full_t WHERE false));
+----
+0

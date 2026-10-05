@@ -565,6 +565,21 @@ FunctionConnectionParams BuildAcquireParams(const VgiTableInOutBindData &bd,
 	return params;
 }
 
+// The init RPC opens a Stream on the wire; for TABLE_BUFFERING we don't use
+// it (all subsequent traffic is unary RPCs). In exchange-mode (which is
+// selected because we pass a non-null input_schema at bind), the worker is
+// blocked waiting for input. Open the input writer and close it (sends EOS)
+// so the worker's exchange loop completes, then drain ReadDataBatch to EOS.
+// After that stdin/stdout are free for the unary table_buffering_* RPCs.
+void DrainBufferingInitStream(IFunctionConnection &conn) {
+	conn.OpenInputWriter();
+	conn.CloseInputWriter();
+	auto batch = conn.ReadDataBatch();
+	while (batch) {
+		batch = conn.ReadDataBatch();
+	}
+}
+
 // Emit up to STANDARD_VECTOR_SIZE rows from the scan_state's current batch into
 // `chunk`, advancing chunk_offset. Mirrors ProduceOutputFromBatch in
 // vgi_table_in_out_impl.cpp; the Source phase never has appended LATERAL
@@ -667,22 +682,7 @@ SinkResultType PhysicalVgiTableBufferingFunction::Sink(ExecutionContext &context
 	// arrive runs PerformInit on its OWN per-thread worker; that init mints
 	// the execution_id. Other threads wait on a CV until execution_id is
 	// publishable, then run their own per-thread secondary inits in parallel.
-	//
-	// The init RPC opens a Stream on the wire; for TABLE_BUFFERING we don't
-	// use it (all subsequent traffic is unary RPCs). In exchange-mode (which
-	// is selected because we pass a non-null input_schema at bind), the
-	// worker is blocked waiting for input. Open the input writer and close
-	// it (sends EOS) so the worker's exchange loop completes, then drain
-	// ReadDataBatch to EOS. After that stdin/stdout are free for the unary
-	// table_buffering_* RPCs.
-	auto drain_init_stream = [](IFunctionConnection &conn) {
-		conn.OpenInputWriter();
-		conn.CloseInputWriter();
-		auto batch = conn.ReadDataBatch();
-		while (batch) {
-			batch = conn.ReadDataBatch();
-		}
-	};
+	// (Each new connection's init stream is drained with DrainBufferingInitStream.)
 
 	if (!lstate.connection) {
 		bool i_am_runner = false;
@@ -756,7 +756,7 @@ SinkResultType PhysicalVgiTableBufferingFunction::Sink(ExecutionContext &context
 				                                                    join_keys_buffers,
 				                                                    /*phase=*/"TABLE_BUFFERING");
 				minted_exec_id = std::move(init_result.execution_id);
-				drain_init_stream(*lstate.connection);
+				DrainBufferingInitStream(*lstate.connection);
 				// state_id is now assigned by the worker (returned on the
 				// RpcTableBufferingProcess response in Sink()).
 				if (VgiInfoLogActive(context.client)) {
@@ -790,7 +790,7 @@ SinkResultType PhysicalVgiTableBufferingFunction::Sink(ExecutionContext &context
 			                                pushdown_filters,
 			                                join_keys_buffers,
 			                                /*phase=*/"TABLE_BUFFERING");
-			drain_init_stream(*lstate.connection);
+			DrainBufferingInitStream(*lstate.connection);
 			// state_id assigned by worker on first Sink RPC.
 			if (VgiInfoLogActive(context.client)) {
 				VGI_LOG(context.client, "table_buffering.init",
@@ -946,15 +946,60 @@ SinkFinalizeType PhysicalVgiTableBufferingFunction::Finalize(Pipeline & /*pipeli
 	std::unique_ptr<IFunctionConnection> combine_worker;
 	{
 		std::lock_guard<std::mutex> lk(gstate.workers_mutex);
-		if (gstate.workers.empty()) {
-			// No Sink thread ever ran process() — no input arrived. Skip
-			// combine entirely.
-			gstate.finalized.store(true);
-			return SinkFinalizeType::READY;
+		if (!gstate.workers.empty()) {
+			state_ids_snapshot = gstate.state_ids;
+			combine_worker = std::move(gstate.workers.back());
+			gstate.workers.pop_back();
 		}
-		state_ids_snapshot = gstate.state_ids;
-		combine_worker = std::move(gstate.workers.back());
-		gstate.workers.pop_back();
+	}
+	if (!combine_worker) {
+		// Empty input: no Sink thread ever received rows, so no worker was
+		// acquired or inited. Still run the full lifecycle -- init, combine
+		// with an EMPTY state_ids list, then the normal source/finalize drain
+		// -- so whole-input reductions answer for empty input (a row count
+		// emits 0, a sum emits its zero row) instead of returning no rows.
+		// Functions with nothing to say for empty input (sort, top-k, echo)
+		// simply emit nothing from finalize. This matches the reference
+		// Python client and COPY TO (VgiCopyToFinalize).
+		//
+		// The init must be a primary TABLE_BUFFERING-phase init: it mints the
+		// execution_id and is where every worker SDK persists the bind state
+		// (args, schemas) that combine and finalize read back. Finalize runs
+		// single-threaded after every Combine, so no init_mutex handshake with
+		// Sink threads is needed.
+		//
+		// Note: a statically-empty input (e.g. `WHERE false`) never reaches
+		// this operator -- DuckDB's optimizer folds the whole call to an empty
+		// result first. This path covers inputs that are empty at runtime.
+		auto &bd = bind_data->Cast<VgiTableInOutBindData>();
+		try {
+			auto params = BuildAcquireParams(bd, /*global_execution_id=*/{});
+			auto acquired = AcquireConnectionForInit(context, params);
+			combine_worker = std::move(acquired.connection);
+			auto init_result = combine_worker->PerformInit(bd.bind_result, projection_ids, pushdown_filters,
+			                                               join_keys_buffers, /*phase=*/"TABLE_BUFFERING");
+			DrainBufferingInitStream(*combine_worker);
+			{
+				std::lock_guard<std::mutex> lk(gstate.init_mutex);
+				gstate.execution_id = std::move(init_result.execution_id);
+				gstate.init_done.store(true, std::memory_order_release);
+			}
+			VGI_LOG(context, "table_buffering.init",
+			        {{"conn", combine_worker->GetConnIdHex()},
+			         {"function_name", bd.function_name},
+			         {"role", "empty_input"}});
+		} catch (...) {
+			gstate.finalized.store(true);
+			auto *dispatcher = gstate.db ? FindVgiCancelDispatcher(*gstate.db) : nullptr;
+			if (combine_worker && dispatcher) {
+				auto token = combine_worker->GetLastStateToken();
+				CancelRequest req;
+				req.connection = std::move(combine_worker);
+				req.state_token = std::move(token);
+				(void)dispatcher->Enqueue(std::move(req));
+			}
+			throw;
+		}
 	}
 
 	// Run combine outside the lock — it's a network round-trip.
@@ -988,6 +1033,7 @@ SinkFinalizeType PhysicalVgiTableBufferingFunction::Finalize(Pipeline & /*pipeli
 		//       reasoning easier.
 		gstate.finalized.store(true);
 		{
+			// (On the empty-input path state_ids is empty, so nothing pops.)
 			std::lock_guard<std::mutex> lk(gstate.workers_mutex);
 			if (!gstate.state_ids.empty()) {
 				gstate.state_ids.pop_back();
