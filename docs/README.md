@@ -52,22 +52,13 @@ data sources as queryable tables and views.
 
 ## Quick Start
 
-Install the extension and attach a worker:
+Install the Python worker SDK in your Python environment:
 
-```sql
--- First time only
-INSTALL vgi FROM community;
-LOAD vgi;
-
--- Attach a worker as a catalog
-ATTACH 'my_funcs' (TYPE vgi, LOCATION './my_worker.py');
-
--- Call the functions it exposes
-SELECT upper_case(name) FROM users;
-SELECT * FROM my_table_function('arg');
+```sh
+python3 -m pip install vgi-python
 ```
 
-A minimal Python worker (using `vgi-python`):
+Save this worker as `my_worker.py`:
 
 ```python
 # my_worker.py
@@ -95,6 +86,23 @@ class MyWorker(Worker):
 
 if __name__ == "__main__":
     MyWorker().run()
+```
+
+Start DuckDB from the directory containing `my_worker.py`, using the same Python
+environment (keep your virtual environment activated if you use one). Then install
+the extension and attach the worker:
+
+```sql
+-- First time only
+INSTALL vgi FROM community;
+LOAD vgi;
+
+-- Attach the worker as a catalog, invoking Python explicitly
+ATTACH 'my_funcs' (TYPE vgi, LOCATION 'python3 ./my_worker.py');
+
+-- Call the function through its catalog name
+SELECT my_funcs.upper_case('hello') AS greeting;
+-- Returns: HELLO
 ```
 
 ## Features
