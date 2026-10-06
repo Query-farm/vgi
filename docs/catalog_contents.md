@@ -253,9 +253,9 @@ agree) — no rows if the worker does not advertise it. It does not touch the
 caches; the conformance test uses it to check revalidation on any worker.
 
 Tests: `test/sql/integration/catalog/catalog_contents*.test`
-(`catalog_contents_conformance.test` runs against every SDK's example worker;
-the rest use vgi-python fixtures and are gated on
-`VGI_CATALOG_CONTENTS_WORKER`).
+(all run against every SDK's test worker: `catalog_contents_conformance.test`
+checks any worker, the rest use the `contents_*` fixture catalogs that every
+SDK's test worker serves).
 
 Future: gate on the `estimated_object_count` totals (bulk below a threshold,
 lazy above) — requires the counts before the call, e.g. on the attach result.

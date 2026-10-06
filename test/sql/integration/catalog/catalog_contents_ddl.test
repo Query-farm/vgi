@@ -12,11 +12,10 @@
 #              (contents_reval: a DDL-capable in-memory catalog, private per
 #              ATTACH, that advertises supports_catalog_contents and revalidates
 #              with an etag bumped by every DDL).
-#              Gated on VGI_CATALOG_CONTENTS_WORKER (vgi-python only);
-#              catalog_contents_conformance.test is the every-SDK check.
+#              Every SDK's test worker serves these fixture catalogs.
 # group: [vgi_integration_catalog]
 
-require-env VGI_CATALOG_CONTENTS_WORKER
+require-env VGI_TEST_WORKER
 
 require vgi
 
@@ -32,7 +31,7 @@ CREATE MACRO rpc_count(m) AS (
       AND message LIKE '%method=' || m || ',%');
 
 statement ok
-ATTACH 'contents_reval' AS mem (TYPE vgi, LOCATION '${VGI_CATALOG_CONTENTS_WORKER}');
+ATTACH 'contents_reval' AS mem (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
 statement ok
 CALL truncate_duckdb_logs();

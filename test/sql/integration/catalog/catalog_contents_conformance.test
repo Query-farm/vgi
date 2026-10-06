@@ -9,9 +9,9 @@
 #              to the per-schema path (SET vgi_catalog_contents = false). The
 #              response's schema paths match the catalog, and a worker that
 #              returns an etag answers a conditional call with it not_modified
-#              (any other etag: full contents). The
-#              detailed tests that need vgi-python's contents_* fixture catalogs
-#              are catalog_contents.test / _fallback.test / _ddl.test.
+#              (any other etag: full contents). The detailed tests over the
+#              contents_* fixture catalogs are catalog_contents.test /
+#              _fallback.test / _ddl.test / _revalidation.test / _versions.test.
 # group: [vgi_integration_catalog]
 
 require-env VGI_TEST_WORKER

@@ -11,10 +11,10 @@
 #              Fixtures: vgi-python vgi/_test_fixtures/catalog_contents.py
 #              (contents_memory: DDL-capable, version 0, no etag;
 #              contents_reval: DDL-capable, etag "gen-<version>"), private per
-#              ATTACH. Gated on VGI_CATALOG_CONTENTS_WORKER (vgi-python only).
+#              ATTACH. Every SDK's test worker serves them.
 # group: [vgi_integration_catalog]
 
-require-env VGI_CATALOG_CONTENTS_WORKER
+require-env VGI_TEST_WORKER
 
 require vgi
 
@@ -44,7 +44,7 @@ CREATE MACRO invalidations(a) AS (
 # ============================================================================
 
 statement ok
-ATTACH 'contents_memory' AS mem (TYPE vgi, LOCATION '${VGI_CATALOG_CONTENTS_WORKER}');
+ATTACH 'contents_memory' AS mem (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
 statement ok
 CALL truncate_duckdb_logs();
@@ -117,7 +117,7 @@ SELECT rpc_count('catalog_contents');
 
 # A new attach is a first load again.
 statement ok
-ATTACH 'contents_memory' AS mem2 (TYPE vgi, LOCATION '${VGI_CATALOG_CONTENTS_WORKER}');
+ATTACH 'contents_memory' AS mem2 (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
 statement ok
 CALL truncate_duckdb_logs();
@@ -143,7 +143,7 @@ DETACH mem;
 # ============================================================================
 
 statement ok
-ATTACH 'contents_reval' AS rv (TYPE vgi, LOCATION '${VGI_CATALOG_CONTENTS_WORKER}');
+ATTACH 'contents_reval' AS rv (TYPE vgi, LOCATION '${VGI_TEST_WORKER}');
 
 statement ok
 CREATE VIEW rv.main.v AS SELECT 5 AS x;

@@ -184,7 +184,6 @@ jobs:
       - name: Run the integration suite
         env:
           VGI_TEST_WORKER: launch:uv run --project /tmp/vgi-python vgi-fixture-worker
-          VGI_CATALOG_CONTENTS_WORKER: launch:uv run --project /tmp/vgi-python vgi-fixture-worker
           VGI_TEST_BRANCH_DIR: /tmp/vgi-branch
         run: |
           mkdir -p "$VGI_TEST_BRANCH_DIR"
@@ -213,7 +212,6 @@ jobs:
             --allow-skip 'require-env VGI_BAD_PROTOCOL_WORKER' \
             --allow-skip 'require-env VGI_BAD_ENUM_WORKER' \
             --allow-skip 'require-env VGI_SIMPLE_WRITABLE_WORKER' \
-            --allow-skip 'require-env VGI_CATALOG_CONTENTS_WORKER' \
             --allow-skip 'require-env VGI_SCHEMA_RECONCILE_DB' \
             --allow-skip 'require-env VGI_RULES_WORKER' \
             --allow-skip 'require-env VGI_REQUIRE_LAUNCHER_TRANSPORT' \
