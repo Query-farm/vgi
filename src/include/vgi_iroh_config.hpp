@@ -1,6 +1,7 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #pragma once
 
+#include "vgi_settings_defaults.hpp"
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -61,8 +62,8 @@ struct IrohClientConfig {
 	bool no_relay = false;
 	std::string remote_relay_url;
 	std::vector<std::string> direct_addresses;
-	uint64_t connect_timeout_seconds = 30;
-	uint64_t io_timeout_seconds = 300;
+	uint64_t connect_timeout_seconds = defaults::IROH_CONNECT_TIMEOUT_SECONDS;
+	uint64_t io_timeout_seconds = defaults::IROH_IO_TIMEOUT_SECONDS;
 };
 
 // Build and validate the immutable Iroh configuration captured by ATTACH.

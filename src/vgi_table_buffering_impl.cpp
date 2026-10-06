@@ -1,4 +1,5 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
+#include "vgi_settings_defaults.hpp"
 #include "vgi_table_buffering_impl.hpp"
 #include "vgi_batch_validation.hpp"
 
@@ -307,7 +308,7 @@ public:
 	// A capture crossing max_entry_bytes or the process-global in-flight budget aborts
 	// to uncached (keeps streaming to DuckDB). All three guarded by capture_mu; the
 	// reserved inflight budget is released in the dtor.
-	int64_t cache_max_entry_bytes = 67108864;
+	int64_t cache_max_entry_bytes = defaults::RESULT_CACHE_MAX_ENTRY_BYTES;
 	int64_t capture_bytes = 0;
 	int64_t reserved_inflight_bytes = 0;
 };
@@ -410,10 +411,10 @@ VgiTableBufferingGlobalSinkState::~VgiTableBufferingGlobalSinkState() {
 	    finalize_eos_count.load(std::memory_order_acquire) == total_finalize_states &&
 	    capture_cc.Cacheable()) {
 		try {
-			auto sr = StoreExchangeMemoEntry(cache_key, capture_cc, cache_catalog_name,
+			auto sr = StoreExchangeMemoEntry(GetResultCache(*db), cache_key, capture_cc, cache_catalog_name,
 			                                 cache_default_ttl_seconds, capture_batches, /*allow_disk=*/true);
 			if (sr.stored) {
-				VgiResultCache::Instance().RecordExchangeStore();
+				GetResultCache(*db).RecordExchangeStore();
 			}
 		} catch (...) {
 			// Destructor must not throw; a failed cache store is non-fatal.
@@ -422,7 +423,7 @@ VgiTableBufferingGlobalSinkState::~VgiTableBufferingGlobalSinkState() {
 	// [S6] Release the in-flight capture budget this gstate reserved (0 if it never
 	// captured or aborted early). Held from first captured batch until here — the
 	// transient window that bounds concurrent buffered-capture RAM.
-	VgiResultCache::Instance().ReleaseInflightCapture(reserved_inflight_bytes);
+	GetResultCache(*db).ReleaseInflightCapture(reserved_inflight_bytes);
 }
 
 class VgiTableBufferingLocalSinkState : public LocalSinkState {
@@ -923,9 +924,9 @@ SinkFinalizeType PhysicalVgiTableBufferingFunction::Finalize(Pipeline & /*pipeli
 	if (gstate.cache_eligible) {
 		gstate.cache_key.input_hash =
 		    FinalizeInputDigest(gstate.digest_lo.load(), gstate.digest_hi.load(), gstate.digest_rows.load());
-		auto entry = VgiResultCache::Instance().Lookup(gstate.cache_key, std::chrono::steady_clock::now());
+		auto entry = GetResultCache(*gstate.db).Lookup(gstate.cache_key, std::chrono::steady_clock::now());
 		if (entry) {
-			VgiResultCache::Instance().RecordExchangeHit(entry->total_bytes);
+			GetResultCache(*gstate.db).RecordExchangeHit(entry->total_bytes);
 			VGI_LOG(context, "result_cache.hit",
 			        {{"function", gstate.function_name}, {"key_hash", gstate.cache_key.HexDigest()}, {"tier", "memory"}});
 			gstate.serving_from_cache = true;
@@ -934,7 +935,7 @@ SinkFinalizeType PhysicalVgiTableBufferingFunction::Finalize(Pipeline & /*pipeli
 			return SinkFinalizeType::READY; // Source replays; no combine, no worker drain
 		}
 		// Not a hit — the combine below runs (a fresh whole-input miss).
-		VgiResultCache::Instance().RecordExchangeMiss();
+		GetResultCache(*gstate.db).RecordExchangeMiss();
 	}
 
 	// Snapshot state_ids and pop one worker for the combine RPC, all under
@@ -1259,10 +1260,10 @@ SourceResultType PhysicalVgiTableBufferingFunction::GetDataInternal(ExecutionCon
 			// then won't commit. The query keeps streaming to DuckDB unaffected.
 			int64_t sz = arrow::util::TotalBufferSize(*batch);
 			if (gstate.capture_bytes + sz > gstate.cache_max_entry_bytes ||
-			    !VgiResultCache::Instance().TryReserveInflightCapture(sz)) {
+			    !GetResultCache(*gstate.db).TryReserveInflightCapture(sz)) {
 				gstate.capture_aborted.store(true);
-				VgiResultCache::Instance().NoteCaptureAbort();
-				VgiResultCache::Instance().ReleaseInflightCapture(gstate.reserved_inflight_bytes);
+				GetResultCache(*gstate.db).NoteCaptureAbort();
+				GetResultCache(*gstate.db).ReleaseInflightCapture(gstate.reserved_inflight_bytes);
 				gstate.reserved_inflight_bytes = 0;
 				gstate.capture_bytes = 0;
 				gstate.capture_batches.clear();

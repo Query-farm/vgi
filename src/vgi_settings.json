@@ -1,0 +1,650 @@
+[
+  {
+    "name": "vgi_allowed_transports",
+    "type": "VARCHAR",
+    "default": "all",
+    "scope": "global",
+    "effect": "Immediately for new ATTACH and vgi_catalogs operations; existing catalogs continue. Restrictions cannot be widened or reset.",
+    "platform": "all",
+    "description": "Allowed worker LOCATION transports: all, none, or a comma-separated subset of subprocess, launch, unix, oci, github, database, http, https, tcp, httpi, iroh, worker."
+  },
+  {
+    "name": "vgi_async_prefetch",
+    "type": "BOOLEAN",
+    "default": false,
+    "scope": "session",
+    "effect": "Next operation; an already-running operation retains its captured values.",
+    "platform": "all",
+    "description": "Enable async I/O prefetch for VGI table function scans (default off: DuckDB's POSITIONAL JOIN operator does not handle BLOCKED sources)"
+  },
+  {
+    "name": "vgi_batch_lateral",
+    "type": "BOOLEAN",
+    "default": true,
+    "scope": "session",
+    "effect": "Next bind, optimization, or scan plan; does not rewrite a running/prepared execution.",
+    "platform": "all",
+    "description": "Batch correlated LATERAL calls to blended VGI table functions through a single worker exchange per input chunk instead of DuckDB's row-by-row driver. Set to false to fall back to the row-by-row PhysicalTableInOutFunction."
+  },
+  {
+    "name": "vgi_cancel_enabled",
+    "type": "BOOLEAN",
+    "default": true,
+    "scope": "session",
+    "effect": "Next operation; an already-running operation retains its captured values.",
+    "platform": "all",
+    "description": "Notify VGI workers (on both subprocess and HTTP transports) when a stream is torn down early so their on_cancel hook can release resources. Set to false to disable: destructors skip the cancel dispatch entirely, on_cancel is never invoked, and workers learn the stream is gone only via normal stream-close / HTTP TTL."
+  },
+  {
+    "name": "vgi_catalog_contents",
+    "type": "BOOLEAN",
+    "default": true,
+    "scope": "session",
+    "effect": "Next catalog metadata load/revalidation; cached metadata remains until invalidated.",
+    "platform": "all",
+    "description": "Load a VGI catalog with a single catalog_contents RPC when the worker supports it, instead of catalog_schemas plus a catalog_schema_contents_* call per schema and kind. Set to false to force the per-schema RPCs."
+  },
+  {
+    "name": "vgi_eager_load_threshold",
+    "type": "MAP(VARCHAR, BIGINT)",
+    "default": {
+      "table": 1000,
+      "view": 1000,
+      "index": 1000,
+      "scalar_function": 1000,
+      "aggregate_function": 1000,
+      "table_function": 1000,
+      "macro": 1000
+    },
+    "scope": "session",
+    "effect": "Captured at ATTACH; re-ATTACH to apply changes to an existing catalog.",
+    "platform": "all",
+    "description": "Per-kind eager metadata load threshold. Missing keys use the per-kind default. Whole-catalog seeds take precedence.",
+    "minimum": 0,
+    "maximum": 9223372036854775807
+  },
+  {
+    "name": "vgi_exchange_input_dedup",
+    "type": "BOOLEAN",
+    "default": true,
+    "scope": "session",
+    "effect": "Next operation; an already-running operation retains its captured values.",
+    "platform": "all",
+    "description": "Before an exchange-mode MAP call (scalar / streaming table-in-out / batched correlated LATERAL), ship only the DISTINCT worker-input tuples in each chunk to the worker and scatter the results back \u2014 turning e.g. 2048 evals over a low-cardinality column into the distinct count. Compute-only (no cache); sound under the same per-row-purity the cacheability opt-in asserts. Default ON"
+  },
+  {
+    "name": "vgi_github_cache_dir",
+    "type": "VARCHAR",
+    "default": "",
+    "scope": "session",
+    "effect": "Next worker-package resolution/install; existing workers and leases retain their artifacts.",
+    "platform": "native",
+    "description": "Cache directory for worker binaries downloaded from GitHub releases (github:// / github-auto:// LOCATIONs); empty = ${XDG_CACHE_HOME:-~/.cache}/vgi/releases"
+  },
+  {
+    "name": "vgi_http_accepted_max_response_bytes",
+    "type": "BIGINT",
+    "default": 268435456,
+    "scope": "session",
+    "effect": "Next operation; an already-running operation retains its captured values.",
+    "platform": "all",
+    "description": "Decoded Arrow IPC bytes accepted per VGI HTTP response (minimum 65536; advertised to the worker)",
+    "wasm_default": 67108864,
+    "minimum": 65536,
+    "maximum": 9007199254740991
+  },
+  {
+    "name": "vgi_http_timeout_seconds",
+    "type": "BIGINT",
+    "default": 300,
+    "scope": "session",
+    "effect": "Next HTTP request; catalog metadata HTTP parameters retain the value from first use until re-ATTACH.",
+    "platform": "all",
+    "description": "Timeout in seconds for VGI HTTP requests (catalog, init, and exchange operations)",
+    "minimum": 1,
+    "maximum": 2147483647
+  },
+  {
+    "name": "vgi_iroh_connect_timeout_seconds",
+    "type": "BIGINT",
+    "default": 30,
+    "scope": "session",
+    "effect": "Next operation; an already-running operation retains its captured values.",
+    "platform": "native",
+    "description": "Timeout in seconds for Iroh endpoint resolution and QUIC connection establishment",
+    "minimum": 1,
+    "maximum": 2147483647
+  },
+  {
+    "name": "vgi_iroh_io_timeout_seconds",
+    "type": "BIGINT",
+    "default": 300,
+    "scope": "session",
+    "effect": "Next operation; an already-running operation retains its captured values.",
+    "platform": "native",
+    "description": "Idle read/write timeout in seconds for native Iroh VGI streams",
+    "minimum": 1,
+    "maximum": 2147483647
+  },
+  {
+    "name": "vgi_join_keys_max_bytes",
+    "type": "UBIGINT",
+    "default": 67108864,
+    "scope": "session",
+    "effect": "Next operation; an already-running operation retains its captured values.",
+    "platform": "all",
+    "description": "Max estimated byte size for join keys batch (skip pushdown if exceeded)",
+    "minimum": 0,
+    "maximum": 9223372036854775807,
+    "zero": "Do not push nonempty join-key batches."
+  },
+  {
+    "name": "vgi_multi_branch_scans",
+    "type": "BOOLEAN",
+    "default": true,
+    "scope": "session",
+    "effect": "Next bind, optimization, or scan plan; does not rewrite a running/prepared execution.",
+    "platform": "all",
+    "description": "Rewrite VGI multi-branch table scans into LogicalSetOperation(UNION_ALL, ...) via the optimizer extension. Set to false to disable the rewrite \u2014 multi-branch table scans will then throw at execution time (the marker placeholder's loud-fail). Emergency-rollback knob; not generally useful."
+  },
+  {
+    "name": "vgi_oauth_cache",
+    "type": "VARCHAR",
+    "default": "auto",
+    "scope": "session",
+    "effect": "Captured by ATTACH authentication or a new vgi_catalogs call; existing authentication objects keep their cache mode.",
+    "platform": "all",
+    "description": "OAuth credential cache: auto (persistent on macOS/Windows, memory on Linux), persistent, memory, or none",
+    "choices": [
+      "auto",
+      "persistent",
+      "memory",
+      "none"
+    ]
+  },
+  {
+    "name": "vgi_oauth_enabled",
+    "type": "BOOLEAN",
+    "default": true,
+    "scope": "session",
+    "effect": "Next operation; an already-running operation retains its captured values.",
+    "platform": "all",
+    "description": "Enable interactive OAuth (PKCE or device-code) authentication on HTTP 401. Set false to fail fast instead of prompting."
+  },
+  {
+    "name": "vgi_oauth_flow",
+    "type": "VARCHAR",
+    "default": "auto",
+    "scope": "session",
+    "effect": "Next operation; an already-running operation retains its captured values.",
+    "platform": "all",
+    "description": "OAuth flow type: auto (default), device_code, or pkce",
+    "choices": [
+      "auto",
+      "device_code",
+      "pkce"
+    ]
+  },
+  {
+    "name": "vgi_oauth_prompt",
+    "type": "VARCHAR",
+    "default": "none",
+    "scope": "session",
+    "effect": "Next operation; an already-running operation retains its captured values.",
+    "platform": "all",
+    "description": "OAuth prompt behavior: none (default), login, select_account, or consent",
+    "choices": [
+      "none",
+      "login",
+      "select_account",
+      "consent"
+    ]
+  },
+  {
+    "name": "vgi_oauth_timeout_seconds",
+    "type": "BIGINT",
+    "default": 120,
+    "scope": "session",
+    "effect": "Next operation; an already-running operation retains its captured values.",
+    "platform": "all",
+    "description": "Window in seconds for a human to complete interactive OAuth (device-code or browser/PKCE) authentication. Further capped by the provider's token expires_in.",
+    "minimum": 1,
+    "maximum": 2147483647
+  },
+  {
+    "name": "vgi_result_cache",
+    "type": "BOOLEAN",
+    "default": true,
+    "scope": "session",
+    "effect": "Next operation; an already-running operation retains its captured values.",
+    "platform": "all",
+    "description": "Enable the VGI table-function result cache (master switch; still double-gated by worker advertisement + per-catalog `cache` option)"
+  },
+  {
+    "name": "vgi_result_cache_default_ttl_seconds",
+    "type": "UBIGINT",
+    "default": 0,
+    "scope": "session",
+    "effect": "Next operation; an already-running operation retains its captured values.",
+    "platform": "all",
+    "description": "Default cache TTL when a worker advertises cacheability without a ttl (0 = require a worker-supplied ttl/expires)",
+    "minimum": 0,
+    "maximum": 315360000,
+    "zero": "Require worker freshness metadata, except frozen/time-pinned results."
+  },
+  {
+    "name": "vgi_result_cache_dir",
+    "type": "VARCHAR",
+    "default": "",
+    "scope": "global",
+    "effect": "Shared by connections to this database; applied at the next cache operation. Existing readers may retain their buffers.",
+    "platform": "native disk tier",
+    "description": "Shared disk-cache root. Empty disables both disk tiers. Whole-result storage also requires positive result_cache_disk_max_bytes; the per-value SQLite tier has its own independent budget."
+  },
+  {
+    "name": "vgi_result_cache_disk_compression",
+    "type": "VARCHAR",
+    "default": "zstd",
+    "scope": "global",
+    "effect": "Shared by connections to this database; applied at the next cache operation. Existing readers may retain their buffers.",
+    "platform": "native disk tier",
+    "description": "Compression codec for the on-disk result-cache tier (Arrow built-in IPC compression, applied per batch so seek is preserved; memory tier is never compressed): 'zstd' (default), 'lz4', or 'none'. Default-on when the disk tier is enabled",
+    "choices": [
+      "zstd",
+      "lz4",
+      "none"
+    ]
+  },
+  {
+    "name": "vgi_result_cache_disk_compression_level",
+    "type": "UBIGINT",
+    "default": 1,
+    "scope": "global",
+    "effect": "Shared by connections to this database; applied at the next cache operation. Existing readers may retain their buffers.",
+    "platform": "native disk tier",
+    "description": "zstd compression level for the on-disk result-cache tier (ignored for lz4/none). Keep it low \u2014 the default 1 is Pareto-optimal (near-zstd-3 ratio at ~half the CPU)",
+    "minimum": 1,
+    "maximum": 22
+  },
+  {
+    "name": "vgi_result_cache_disk_max_bytes",
+    "type": "UBIGINT",
+    "default": 0,
+    "scope": "global",
+    "effect": "Shared by connections to this database; applied at the next cache operation. Existing readers may retain their buffers.",
+    "platform": "native disk tier",
+    "description": "Whole-result loose/packed disk-store budget. Does not include the per-value SQLite store, whose budget is result_cache_per_value_disk_max_bytes. Reaping is eventual; not a filesystem quota.",
+    "minimum": 0,
+    "maximum": 9223372036854775807,
+    "zero": "Disable the whole-result disk tier; does not disable the separate per-value SQLite tier."
+  },
+  {
+    "name": "vgi_result_cache_disk_reap_interval_seconds",
+    "type": "UBIGINT",
+    "default": 60,
+    "scope": "global",
+    "effect": "Shared by connections to this database; applied at the next cache operation. Existing readers may retain their buffers.",
+    "platform": "native disk tier",
+    "description": "How often the on-disk result-cache tier is reaped (reading every ref is O(total refs) I/O, so this runs on a coarser cadence than the 1s memory reap)",
+    "minimum": 1,
+    "maximum": 2147483647
+  },
+  {
+    "name": "vgi_result_cache_exchange_disk_max_refs",
+    "type": "UBIGINT",
+    "default": 100000,
+    "scope": "global",
+    "effect": "Shared by connections to this database; applied at the next cache operation. Existing readers may retain their buffers.",
+    "platform": "native disk tier",
+    "description": "File-count cap for EXCHANGE-mode disk entries (streaming table-in-out / correlated LATERAL / buffered). Every exchange memo may persist to disk regardless of payload size (so a small-but-expensive result still warms the cross-process cache); the reaper LRU-evicts oldest exchange refs above this count so per-input-chunk fan-out can't spray unbounded files. Scoped to exchange refs so a memo flood never evicts a large producer entry (0 = unbounded; default 100000). Loose store only; the packed backend below bounds file count structurally",
+    "minimum": 0,
+    "maximum": 9223372036854775807,
+    "zero": "Unlimited loose exchange ref count."
+  },
+  {
+    "name": "vgi_result_cache_max_bytes",
+    "type": "UBIGINT",
+    "default": 268435456,
+    "scope": "global",
+    "effect": "Shared by connections to this database; applied at the next cache operation. Existing readers may retain their buffers.",
+    "platform": "all",
+    "description": "Retained-memory accounting limit applied separately to whole-result entries and per-value memo arenas in this database. Combined accounted retention can approach twice this value; not a process RSS limit. Active readers and in-flight captures are additional.",
+    "minimum": 0,
+    "maximum": 9223372036854775807,
+    "zero": "No retained whole-result or per-value memory-cache budget."
+  },
+  {
+    "name": "vgi_result_cache_max_entries",
+    "type": "UBIGINT",
+    "default": 131072,
+    "scope": "global",
+    "effect": "Shared by connections to this database; applied at the next cache operation. Existing readers may retain their buffers.",
+    "platform": "all",
+    "description": "Entry-count cap for the in-memory result cache (LRU eviction above it; 0 = unlimited). Bounds unbounded small-entry accumulation under the byte cap",
+    "minimum": 0,
+    "maximum": 9223372036854775807,
+    "zero": "Unlimited entry count (byte budget still applies)."
+  },
+  {
+    "name": "vgi_result_cache_max_entry_bytes",
+    "type": "UBIGINT",
+    "default": 67108864,
+    "scope": "global",
+    "effect": "Shared by connections to this database; applied at the next cache operation. Existing readers may retain their buffers.",
+    "platform": "all",
+    "description": "Per-entry capture/materialization threshold in bytes. Eligible producer results spill above it when the whole-result disk tier is enabled; otherwise capture aborts to uncached execution.",
+    "minimum": 0,
+    "maximum": 9223372036854775807,
+    "zero": "No in-memory capture allowance; eligible producer captures can spill when disk caching is enabled."
+  },
+  {
+    "name": "vgi_result_cache_max_inflight_bytes",
+    "type": "UBIGINT",
+    "default": 268435456,
+    "scope": "global",
+    "effect": "Shared by connections to this database; applied at the next cache operation. Existing readers may retain their buffers.",
+    "platform": "all",
+    "description": "Database-wide budget for tracked in-flight result-capture buffers, separate from retained cache entries and memo arenas; 0 is unbounded.",
+    "minimum": 0,
+    "maximum": 9223372036854775807,
+    "zero": "Unlimited in-flight capture budget."
+  },
+  {
+    "name": "vgi_result_cache_pack",
+    "type": "BOOLEAN",
+    "default": true,
+    "scope": "global",
+    "effect": "Shared by connections to this database; applied at the next cache operation. Existing readers may retain their buffers.",
+    "platform": "native disk tier",
+    "description": "Use packed files for small eligible exchange disk entries; large entries remain loose. Backend routing does not remove the loose-entry file-count limit."
+  },
+  {
+    "name": "vgi_result_cache_pack_compaction_dead_pct",
+    "type": "UBIGINT",
+    "default": 50,
+    "scope": "global",
+    "effect": "Shared by connections to this database; applied at the next cache operation. Existing readers may retain their buffers.",
+    "platform": "native disk tier",
+    "description": "Compact an owned pack file when this percent of its bytes is dead (expired/evicted); rewrites live records to a fresh pack and drops the old (git gc). 0..100, default 50",
+    "minimum": 0,
+    "maximum": 100,
+    "zero": "Compact at the earliest eligible opportunity."
+  },
+  {
+    "name": "vgi_result_cache_pack_max_entry_bytes",
+    "type": "UBIGINT",
+    "default": 262144,
+    "scope": "global",
+    "effect": "Shared by connections to this database; applied at the next cache operation. Existing readers may retain their buffers.",
+    "platform": "native disk tier",
+    "description": "Route threshold for the packed disk backend: on-disk entries below this size are packed, at/above are stored as loose objects (default 262144 = 256 KB)",
+    "minimum": 0,
+    "maximum": 9223372036854775807,
+    "zero": "No entries qualify for packing."
+  },
+  {
+    "name": "vgi_result_cache_pack_target_bytes",
+    "type": "UBIGINT",
+    "default": 67108864,
+    "scope": "global",
+    "effect": "Shared by connections to this database; applied at the next cache operation. Existing readers may retain their buffers.",
+    "platform": "native disk tier",
+    "description": "Roll to a fresh pack file once the current one exceeds this size (bounds one compaction unit; default 67108864 = 64 MB)",
+    "minimum": 1,
+    "maximum": 9223372036854775807
+  },
+  {
+    "name": "vgi_result_cache_partition_max_enumerated",
+    "type": "UBIGINT",
+    "default": 1024,
+    "scope": "session",
+    "effect": "Next operation; an already-running operation retains its captured values.",
+    "platform": "all",
+    "description": "Cap on the number of distinct partitions handled per scan by the per-partition cache: bounds both the enumerated =/IN cross-product at serve time and the distinct-partition count at capture (split) time. Over the cap, the scan falls back to the whole-scan cache / worker. Default 1024",
+    "minimum": 0,
+    "maximum": 9223372036854775807,
+    "zero": "No nonempty partition enumeration qualifies."
+  },
+  {
+    "name": "vgi_result_cache_partition_scope",
+    "type": "BOOLEAN",
+    "default": true,
+    "scope": "session",
+    "effect": "Next operation; an already-running operation retains its captured values.",
+    "platform": "all",
+    "description": "Per-PARTITION result caching for SINGLE_VALUE_PARTITIONS table functions that advertise vgi.cache.partition_scope. When on, a cacheable partitioned scan ALSO caches its result split by partition value (one entry per distinct partition-value tuple), so a later =/IN-filtered scan on the partition column(s) serves the requested partitions from cache without the worker. Additive \u2014 the whole-scan entry is still stored/served. Default ON"
+  },
+  {
+    "name": "vgi_result_cache_per_value",
+    "type": "BOOLEAN",
+    "default": true,
+    "scope": "session",
+    "effect": "Next operation; an already-running operation retains its captured values.",
+    "platform": "all",
+    "description": "CEILING (not an enabler) over per-VALUE memoization for exchange-mode maps: after input dedup, memoize the worker output keyed on the individual input tuple, so a fully-warm distinct set serves without the worker (cross-chunk / cross-query / cross-restart value reuse the per-chunk cache misses). The tier is OFF unless the worker advertises `vgi.cache.per_value` on its output batch, because a per-value serve's fixed cost (key probe + decode + assembly) only pays back when one worker call is dearer than that \u2014 for a cheap map it is a large net loss. Setting this false vetoes the tier even for a worker that asks for it; setting it true does NOT enable it. Default true (no veto)"
+  },
+  {
+    "name": "vgi_result_cache_per_value_disk_max_bytes",
+    "type": "UBIGINT",
+    "default": 1073741824,
+    "scope": "global",
+    "effect": "Shared by connections to this database; applied at the next cache operation. Existing readers may retain their buffers.",
+    "platform": "native disk tier",
+    "description": "Independent per-value SQLite disk budget when result_cache_dir is nonempty. Eviction runs on stores; 0 is unlimited. Not included in result_cache_disk_max_bytes.",
+    "minimum": 0,
+    "maximum": 9223372036854775807,
+    "zero": "Unlimited per-value SQLite disk budget."
+  },
+  {
+    "name": "vgi_result_cache_per_value_max_stores_per_chunk",
+    "type": "UBIGINT",
+    "default": 256,
+    "scope": "session",
+    "effect": "Next operation; an already-running operation retains its captured values.",
+    "platform": "all",
+    "description": "Cap on how many NEW per-value memo entries a single input chunk may store (0 = unlimited). Bounds entry-count amplification on a high-cardinality input (one distinct value \u2192 one tiny entry): a chunk memoizes at most this many new values, the rest are recomputed next time. A cap on STORES, not lookups, so it never breaks store-then-hit for a low-cardinality workload (K new < cap \u2192 all stored). Default 256",
+    "minimum": 0,
+    "maximum": 9223372036854775807,
+    "zero": "Unlimited new per-value stores per chunk."
+  },
+  {
+    "name": "vgi_result_cache_revalidate_min_bytes",
+    "type": "UBIGINT",
+    "default": 262144,
+    "scope": "session",
+    "effect": "Next operation; an already-running operation retains its captured values.",
+    "platform": "all",
+    "description": "Minimum stored-payload size before a stale revalidatable entry is conditionally revalidated (below it, refetch instead of a conditional request)",
+    "minimum": 0,
+    "maximum": 9223372036854775807,
+    "zero": "Revalidate even empty/small eligible results."
+  },
+  {
+    "name": "vgi_secret_default_ttl_seconds",
+    "type": "BIGINT",
+    "default": 300,
+    "scope": "session",
+    "effect": "Captured at ATTACH; re-ATTACH to apply changes to an existing catalog.",
+    "platform": "all",
+    "description": "Default cache TTL (seconds) for credentials fetched from an Orchard remote secret provider. Capped per-credential by the credential's own expiry. Read at ATTACH and frozen per-provider.",
+    "minimum": 0,
+    "maximum": 2147483647,
+    "zero": "No positive default credential-cache lifetime."
+  },
+  {
+    "name": "vgi_split_plan_max_pages",
+    "type": "UBIGINT",
+    "default": 1024,
+    "scope": "session",
+    "effect": "Next bind, optimization, or scan plan; does not rewrite a running/prepared execution.",
+    "platform": "all",
+    "description": "Cap on how many pages of scan-planning the client will follow before refusing. A worker may paginate its split enumeration by returning a cursor; a worker that never exhausts that cursor would otherwise hang the query, and stopping early would be worse still \u2014 it would scan a PARTIAL enumeration and report it as the whole answer. So a breach throws. Raise it for a worker that legitimately paginates a very large table: this bounds PAGES, not splits, so the reachable split count is this times the worker's page size, which may be far below the 1048576 split cap. Default 1024",
+    "minimum": 1,
+    "maximum": 9223372036854775807
+  },
+  {
+    "name": "vgi_split_scans",
+    "type": "BOOLEAN",
+    "default": true,
+    "scope": "session",
+    "effect": "Next bind, optimization, or scan plan; does not rewrite a running/prepared execution.",
+    "platform": "all",
+    "description": "Use the split-based scan path for workers that advertise supports_splits: plan() the scan into named, independently redeemable units, then init() per split. Set to false to fall back to primary/secondary init. Emergency-rollback knob; a worker that only implements splits will then fail loudly."
+  },
+  {
+    "name": "vgi_split_token_min_ttl_seconds",
+    "type": "UBIGINT",
+    "default": 30,
+    "scope": "session",
+    "effect": "Next bind, optimization, or scan plan; does not rewrite a running/prepared execution.",
+    "platform": "all",
+    "description": "Shortest split-token lifetime this client will accept, in seconds. A split token expires, and NOTHING re-plans when it does \u2014 a distributed engine retries the serialized task it was handed, with no path back to the planner \u2014 so an expired token fails the query outright. The mitigation is to refuse the plan up front, at the one moment the shortfall is cheap to discover, rather than at read time after the work has been scheduled. Raise it to match a longer horizon between planning and reading; a worker declaring no TTL means unbounded and always passes. 0 disables the check. Default 30",
+    "minimum": 0,
+    "maximum": 2147483647,
+    "zero": "Disable the minimum split-token lifetime check."
+  },
+  {
+    "name": "vgi_streaming_window",
+    "type": "BOOLEAN",
+    "default": true,
+    "scope": "session",
+    "effect": "Next bind, optimization, or scan plan; does not rewrite a running/prepared execution.",
+    "platform": "all",
+    "description": "Route eligible OVER (...) queries against VGI aggregates with streaming_partitioned=true through the custom streaming operator. Set to false to fall back to PhysicalWindow / WindowCustomAggregator."
+  },
+  {
+    "name": "vgi_table_buffering",
+    "type": "BOOLEAN",
+    "default": true,
+    "scope": "session",
+    "effect": "Next bind, optimization, or scan plan; does not rewrite a running/prepared execution.",
+    "platform": "all",
+    "description": "Rewrite calls to TableBufferingFunction subclasses through the Sink+Source PhysicalVgiTableBufferingFunction operator. Set to false to disable the rewrite \u2014 table_buffering queries will then throw a clear InternalException instead of running."
+  },
+  {
+    "name": "vgi_target_split_bytes",
+    "type": "UBIGINT",
+    "default": 0,
+    "scope": "session",
+    "effect": "Next bind, optimization, or scan plan; does not rewrite a running/prepared execution.",
+    "platform": "all",
+    "description": "Requested size in bytes for each scan split, passed to the worker's plan() as target_split_bytes. 0 (the default) omits the field, leaving sizing to the worker.",
+    "minimum": 0,
+    "maximum": 9223372036854775807,
+    "zero": "Let the worker choose split sizing."
+  },
+  {
+    "name": "vgi_trust_empty_kinds",
+    "type": "BOOLEAN",
+    "default": true,
+    "scope": "session",
+    "effect": "Next metadata lookup; does not invalidate already-loaded metadata.",
+    "platform": "all",
+    "description": "Trust worker assertions that estimated_object_count[kind] == 0 means the kind is empty (skip catalog_schema_contents_* RPC). Set to false to force every RPC to fire even when the worker reports zero \u2014 debug escape hatch for diagnosing worker bugs."
+  },
+  {
+    "name": "vgi_validate_worker_batches",
+    "type": "VARCHAR",
+    "default": "full",
+    "scope": "session",
+    "effect": "Next operation; an already-running operation retains its captured values.",
+    "platform": "all",
+    "description": "How thoroughly Arrow batches received from VGI workers are validated before use: full (default; every offset, UTF-8 string and dictionary index), structural (buffer sizes and lengths only), or none",
+    "choices": [
+      "full",
+      "structural",
+      "none"
+    ]
+  },
+  {
+    "name": "vgi_worker_cache_dir",
+    "type": "VARCHAR",
+    "default": "",
+    "scope": "session",
+    "effect": "Next worker-package resolution/install; existing workers and leases retain their artifacts.",
+    "platform": "native",
+    "description": "Cache directory for immutable database worker packages; empty follows vgi_github_cache_dir, then the VGI release cache directory"
+  },
+  {
+    "name": "vgi_worker_cache_max_bytes",
+    "type": "UBIGINT",
+    "default": 5368709120,
+    "scope": "session",
+    "effect": "Next package-cache cleanup/prune; leased artifacts are retained. On-disk artifacts are shared across processes.",
+    "platform": "native",
+    "description": "Maximum managed worker-package cache size; 0 disables size eviction. Default 5 GiB",
+    "minimum": 0,
+    "maximum": 9223372036854775807,
+    "zero": "Disable artifact size eviction."
+  },
+  {
+    "name": "vgi_worker_cache_ttl_seconds",
+    "type": "UBIGINT",
+    "default": 2592000,
+    "scope": "session",
+    "effect": "Next package-cache cleanup/prune; leased artifacts are retained. On-disk artifacts are shared across processes.",
+    "platform": "native",
+    "description": "Evict unused worker packages older than this age; 0 disables TTL eviction. Default 30 days",
+    "minimum": 0,
+    "maximum": 2147483647,
+    "zero": "Disable artifact TTL eviction."
+  },
+  {
+    "name": "vgi_worker_package_max_bytes",
+    "type": "UBIGINT",
+    "default": 536870912,
+    "scope": "session",
+    "effect": "Next worker-package resolution/install; existing workers and leases retain their artifacts.",
+    "platform": "native",
+    "description": "Maximum compressed/raw database worker package size. Default 512 MiB",
+    "minimum": 0,
+    "maximum": 9223372036854775807,
+    "zero": "Disable the compressed/raw package size limit."
+  },
+  {
+    "name": "vgi_worker_package_max_extracted_bytes",
+    "type": "UBIGINT",
+    "default": 1073741824,
+    "scope": "session",
+    "effect": "Next worker-package resolution/install; existing workers and leases retain their artifacts.",
+    "platform": "native",
+    "description": "Maximum total extracted database worker package size. Default 1 GiB",
+    "minimum": 1,
+    "maximum": 9223372036854775807
+  },
+  {
+    "name": "vgi_worker_package_max_files",
+    "type": "UBIGINT",
+    "default": 10000,
+    "scope": "session",
+    "effect": "Next worker-package resolution/install; existing workers and leases retain their artifacts.",
+    "platform": "native",
+    "description": "Maximum number of entries in a database worker archive. Default 10000",
+    "minimum": 1,
+    "maximum": 9223372036854775807
+  },
+  {
+    "name": "vgi_worker_pool_idle_limit_seconds",
+    "type": "BIGINT",
+    "default": 5,
+    "scope": "session",
+    "effect": "Captured at ATTACH; re-ATTACH to apply changes to an existing catalog.",
+    "platform": "native",
+    "description": "Idle age in seconds before a retained subprocess worker is removed; ATTACH pool_timeout overrides this default. Pools are shared process-wide by worker identity.",
+    "minimum": 0,
+    "maximum": 2147483647,
+    "zero": "Workers become eligible for cleanup immediately."
+  },
+  {
+    "name": "vgi_worker_pool_max",
+    "type": "BIGINT",
+    "default": 256,
+    "scope": "session",
+    "effect": "Captured at ATTACH; re-ATTACH to apply changes to an existing catalog.",
+    "platform": "native",
+    "description": "Maximum idle workers retained per pool bucket, configured by worker path; 0 disables pooling. Not a concurrency limit. ATTACH pool_max overrides this default.",
+    "minimum": 0,
+    "maximum": 9223372036854775807,
+    "zero": "Disable worker pooling."
+  }
+]

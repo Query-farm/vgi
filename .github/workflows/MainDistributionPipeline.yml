@@ -31,6 +31,8 @@ jobs:
         # CLAUDE.md "Header hygiene") transitively pulls in the Arrow umbrella.
         # Pure source scan — no build needed.
         run: python3 scripts/header_reach.py --check
+      - name: Check generated settings and reference
+        run: python3 scripts/generate_settings.py --check
 
   duckdb-stable-build:
     name: Build extension binaries

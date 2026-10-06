@@ -1,4 +1,5 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
+#include "vgi_settings_defaults.hpp"
 #include "vgi_lateral_batch_operator.hpp"
 #include "vgi_batch_validation.hpp"
 
@@ -189,7 +190,7 @@ struct VgiLateralBatchOperatorState : public OperatorState {
 	// registry key. Computed once when the static key is built.
 	std::string cache_static_fp;
 	int64_t cache_default_ttl_seconds = 0;
-	int64_t cache_revalidate_min_bytes = 262144;
+	int64_t cache_revalidate_min_bytes = defaults::RESULT_CACHE_REVALIDATE_MIN_BYTES;
 	VgiCacheControl cache_cc;   // latched from the first exchange output
 	bool cache_cc_latched = false;
 	// Latched `vgi.cache.per_value` advertisement. Per-value memoization is OFF until the
@@ -361,11 +362,11 @@ OperatorResultType EmitServedSlice(VgiLateralBatchOperatorState &state, const Ar
 // memory-only cache entry (allow_disk=false). Clears the capture state. Returns
 // true iff an entry was actually stored (for the EXPLAIN ANALYZE store counter).
 bool CommitCapture(VgiLateralBatchOperatorState &state, const VgiTableInOutBindData &bd, ClientContext &ctx) {
-	auto sr = StoreExchangeMemoEntry(state.capture_key, state.cache_cc, state.cache_catalog_name,
+	auto sr = StoreExchangeMemoEntry(GetResultCache(ctx), state.capture_key, state.cache_cc, state.cache_catalog_name,
 	                                 state.cache_default_ttl_seconds, state.capture_pending,
 	                                 /*allow_disk=*/true);
 	if (sr.stored) {
-		VgiResultCache::Instance().RecordExchangeStore();
+		GetResultCache(ctx).RecordExchangeStore();
 		VGI_LOG(ctx, "result_cache.store",
 		        {{"function", bd.function_name},
 		         {"key_hash", state.capture_key.HexDigest()},
@@ -542,14 +543,14 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 		// Probe conditional revalidation FIRST (Lookup evicts a stale entry). If a
 		// large-enough stale revalidatable entry exists, arm the exchange with its
 		// validators; the worker confirms (304 → reuse stored) or returns fresh data.
-		auto reval = VgiResultCache::Instance().LookupForRevalidation(state.capture_key, now);
+		auto reval = GetResultCache(client_context).LookupForRevalidation(state.capture_key, now);
 		if (reval && reval->revalidatable && !reval->streams.empty() &&
 		    reval->total_bytes >= state.cache_revalidate_min_bytes) {
 			reval_entry = reval;
 		} else {
-			auto entry = VgiResultCache::Instance().Lookup(state.capture_key, now);
+			auto entry = GetResultCache(client_context).Lookup(state.capture_key, now);
 			if (entry) {
-				VgiResultCache::Instance().RecordExchangeHit(entry->total_bytes);
+				GetResultCache(client_context).RecordExchangeHit(entry->total_bytes);
 				gstate.cache_hits.fetch_add(1, std::memory_order_relaxed); // whole-chunk (M2) hit
 				VGI_LOG(client_context, "result_cache.hit",
 				        {{"function", bd.function_name}, {"key_hash", state.capture_key.HexDigest()}, {"tier", "memory"}});
@@ -665,7 +666,7 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 	// the live cache-control, so the very first exchange still memoizes what the worker
 	// asked it to, and the next scan probes for it.
 	if (!state.cache_pv_opt_in && state.cache_eligible) {
-		state.cache_pv_opt_in = VgiResultCache::Instance().HasPerValueOptIn(state.cache_static_key);
+		state.cache_pv_opt_in = GetResultCache(client_context).HasPerValueOptIn(state.cache_static_key);
 	}
 	const bool pv_enabled = pv_setting && state.cache_pv_opt_in && dedup_active && state.cache_eligible &&
 	                        !reval_entry;
@@ -681,7 +682,7 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 	ArenaProbeResult pv_probe; // carries served_bytes + latch aggregates
 	if (pv_enabled) {
 		pv_blobs = InputRowSortKeys(client_context, worker_input);
-		if (auto arena = VgiMemoArenaRegistry::Instance().Get(state.cache_static_fp)) {
+		if (auto arena = GetMemoArenaRegistry(client_context).Get(state.cache_static_fp)) {
 			pv_probe = arena->Probe(pv_blobs, std::chrono::steady_clock::now());
 			pv_hit = std::move(pv_probe.hit);
 			pv_cached = pv_probe.rows;
@@ -704,7 +705,7 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 		output_batch = pv_cached;
 		worker_parent = std::move(pv_cached_parent);
 		if (pv_probe.served_bytes) {
-			VgiResultCache::Instance().RecordExchangeHit(pv_probe.served_bytes);
+			GetResultCache(client_context).RecordExchangeHit(pv_probe.served_bytes);
 		}
 		// Latch cache-control off the served per-value slots for the coarse whole-chunk (M2)
 		// store, when this operator state has not yet seen an exchange (cache_cc is normally
@@ -718,7 +719,7 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 			cc.ttl_seconds =
 			    pv_probe.latch_all_never_expires ? VGI_CACHE_MAX_TTL_SECONDS : pv_probe.latch_min_remaining_s;
 			if (pv_probe.latch_validators_agree && pv_probe.latch_validator_ref >= 0) {
-				if (auto arena = VgiMemoArenaRegistry::Instance().Get(state.cache_static_fp)) {
+				if (auto arena = GetMemoArenaRegistry(client_context).Get(state.cache_static_fp)) {
 					auto v = arena->GetValidator(pv_probe.latch_validator_ref);
 					cc.scope = v.scope.empty() ? std::string(VGI_CACHE_SCOPE_CATALOG) : v.scope;
 					cc.etag = v.etag;
@@ -809,9 +810,9 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 			if (output_batch->num_rows() == 0) {
 				auto cc = state.connection->GetLastCacheControl();
 				if (cc.not_modified) {
-					SlideRevalidatedExchangeEntry(*reval_entry, cc, state.cache_default_ttl_seconds,
+					SlideRevalidatedExchangeEntry(GetResultCache(client_context), *reval_entry, cc, state.cache_default_ttl_seconds,
 					                              /*allow_disk=*/true);
-					VgiResultCache::Instance().RecordExchangeRevalidation(reval_entry->total_bytes);
+					GetResultCache(client_context).RecordExchangeRevalidation(reval_entry->total_bytes);
 					VGI_LOG(client_context, "result_cache.revalidate",
 					        {{"function", bd.function_name},
 					         {"key_hash", state.capture_key.HexDigest()},
@@ -825,7 +826,7 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 
 		// Reaching here = a fresh exchange for this chunk (not a cache hit, not a 304).
 		if (state.cache_eligible) {
-			VgiResultCache::Instance().RecordExchangeMiss();
+			GetResultCache(client_context).RecordExchangeMiss();
 		}
 
 		// Latch the worker's cache-control advertisement off the first exchange output.
@@ -835,7 +836,7 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 			if (state.cache_cc.per_value) {
 				// Arm this scan's later chunks AND every later scan of this function.
 				state.cache_pv_opt_in = true;
-				VgiResultCache::Instance().NotePerValueOptIn(state.cache_static_key);
+				GetResultCache(client_context).NotePerValueOptIn(state.cache_static_key);
 			}
 		}
 
@@ -918,7 +919,7 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 		if (pv_store && state.cache_cc.Cacheable() && output_batch) {
 			// Cap new stores per chunk to bound fill on a high-cardinality input (0 =
 			// unlimited). Counts attempts; a cached tuple `continue`s before the cap check.
-			uint64_t store_cap = 256;
+			uint64_t store_cap = defaults::RESULT_CACHE_PER_VALUE_MAX_STORES_PER_CHUNK;
 			{
 				Value scv;
 				if (client_context.TryGetCurrentSetting("vgi_result_cache_per_value_max_stores_per_chunk", scv) &&
@@ -959,7 +960,7 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 				}
 				auto expires = std::chrono::steady_clock::now() + std::chrono::seconds(ttl);
 				auto arena =
-				    VgiMemoArenaRegistry::Instance().GetOrCreate(state.cache_static_fp, output_batch->schema());
+				    GetMemoArenaRegistry(client_context).GetOrCreate(state.cache_static_fp, output_batch->schema());
 				if (arena) {
 					ArenaValidator av;
 					av.scope = state.cache_cc.scope;
@@ -973,9 +974,9 @@ OperatorResultType PhysicalVgiLateralBatch::Execute(ExecutionContext &context, D
 					std::shared_ptr<arrow::RecordBatch> store_batch =
 					    take_idx.empty() ? output_batch->Slice(0, 0) : TakeRecordBatch(output_batch, take_idx, bd);
 					const int64_t delta = arena->Store(store_batch, specs, expires, /*never_expires=*/false);
-					VgiMemoArenaRegistry::Instance().NoteFootprintDelta(state.cache_static_fp, delta);
+					GetMemoArenaRegistry(client_context).NoteFootprintDelta(state.cache_static_fp, delta, arena.get());
 					for (size_t j = 0; j < specs.size(); j++) {
-						VgiResultCache::Instance().RecordExchangeStore();
+						GetResultCache(client_context).RecordExchangeStore();
 						gstate.cache_stores.fetch_add(1, std::memory_order_relaxed);
 					}
 				}

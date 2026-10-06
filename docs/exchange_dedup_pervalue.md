@@ -159,14 +159,10 @@ A clean **layering**, outer (coarse) to inner (fine):
 - **On a per-batch miss**, dedup + per-value minimize worker calls and populate the per-value tier.
 - **M3 buffered is untouched** — a reduce's output depends on the whole input multiset, so
   whole-input keying is correct and there is no per-value analog.
-- **Storage-amplification guard.** Storing *both* a whole-batch entry and K per-value entries for the
-  same data is redundant for low-cardinality inputs (per-value already covers a future identical-chunk
-  replay). So the **per-batch store is gated on the distinct ratio**: only write the coarse whole-unit
-  entry when `K/N` is high (per-value would give a poor hit rate on a future replay). This is a
-  *store*-side gate on a per-chunk cardinality signal — **not** a miss-history back-off, so it does
-  **not** reproduce the store-then-hit hazard that got the adaptive-hashing back-off declined
-  (per-value still always stores its misses; only the redundant coarse copy is skipped). Reads always
-  probe both tiers.
+- **Whole-batch replay stays cached.** The coarse whole-unit entry is always stored when eligible,
+  regardless of the chunk's distinct ratio. Replaying it takes one decode per chunk; reconstructing
+  the same rows from per-value entries takes K decodes plus assembly. Per-value entries complement
+  the coarse cache by supporting reuse across different chunks.
 
 The `input_hash` granularity discriminator (§4) keeps the two entry kinds in one keyspace without
 collision, so `vgi_result_cache()` / stats / flush / disk tier all treat them uniformly.
@@ -178,7 +174,6 @@ collision, so `vgi_result_cache()` / stats / flush / disk tier all treat them un
 | `vgi_exchange_input_dedup` | `true` | Dedup distinct worker-input tuples in a chunk before the exchange (compute win; scalar + streaming + LATERAL). No persistence, no correctness risk beyond the per-row-purity opt-in. |
 | `vgi_result_cache_per_value` | `true` | **CEILING, not an enabler.** Per-value memoization is OFF unless the worker advertises `vgi.cache.per_value` on an output batch. Setting this `false` vetoes the tier even for a worker that asks; setting it `true` does not enable it. Also gated by the master `vgi_result_cache` + per-catalog `cache` opt-out like every other cache tier. |
 | `vgi.cache.per_value` (worker metadata) | *absent* | The actual switch. A per-value serve costs a key probe, an IPC decode and an assembly step per distinct value; that only pays back when one worker call is dearer than that. Measured on a trivial arithmetic map it is ~50x slower than simply calling the worker, so the tier is opt-in and only the function author can judge it. Advertise it for model inference, geocoding, or a rate-limited remote fetch. |
-| `vgi_exchange_per_batch_min_distinct_ratio` | `0.5` | **DEPRECATED / NO-OP.** Formerly suppressed the coarse whole-unit (M1/M2) entry below this `K/N` on the theory that per-value covered the replay. It does not: an M2 serve is ONE decode per chunk while the per-value reassembly of the same rows is K decodes plus a K-way concat, so suppressing M2 made the warm path ~14x SLOWER. The coarse entry is now always stored when eligible. Still accepted so existing scripts do not error. |
 | `vgi_result_cache_per_value_max_stores_per_chunk` | `256` | Cap on NEW per-value entries a single chunk may store (0 = unlimited). Bounds entry-count amplification on a high-cardinality input. A cap on STORES not lookups, so it never breaks store-then-hit for a low-cardinality workload. |
 
 Dedup is a compute optimization and defaults ON independently of the disk tier; per-value persistence

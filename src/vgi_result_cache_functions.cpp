@@ -42,8 +42,8 @@ static void VgiResultCacheFlushScan(ClientContext &context, TableFunctionInput &
 	// VgiResultCache::FlushAll() removes the cache directory — on Windows the open
 	// vgi_per_value.sqlite handle would otherwise block the delete ("used by another
 	// process"). The next per-value call re-opens the backend.
-	vgi::VgiMemoArenaRegistry::Instance().ReleaseBackend();
-	auto count = VgiResultCache::Instance().FlushAll();
+	vgi::GetMemoArenaRegistry(context).ReleaseBackend();
+	auto count = GetResultCache(context).FlushAll();
 	output.SetValue(0, 0, Value::BIGINT(static_cast<int64_t>(count)));
 	output.SetCardinality(1);
 	data.finished = true;
@@ -93,10 +93,10 @@ static void VgiResultCacheReapScan(ClientContext &context, TableFunctionInput &d
 		return;
 	}
 	// Honor a bare `SET vgi_result_cache_*` issued before the reap (disk dir/caps, the
-	// exchange ref-count cap): push the current settings into the singleton so ReapNow
-	// sees them — otherwise settings only reach the singleton when a scan runs.
+	// exchange ref-count cap): push the current settings into the database cache so ReapNow
+	// sees them — otherwise settings only reach the cache when a scan runs.
 	SyncResultCacheSettings(context);
-	auto stats = VgiResultCache::Instance().ReapNow(data.advance_seconds);
+	auto stats = GetResultCache(context).ReapNow(data.advance_seconds);
 	output.SetValue(0, 0, Value::BIGINT(static_cast<int64_t>(stats.memory_reaped)));
 	output.SetValue(1, 0, Value::BIGINT(static_cast<int64_t>(stats.disk_refs_removed)));
 	output.SetCardinality(1);
@@ -125,7 +125,7 @@ struct VgiResultCacheListData : public TableFunctionData {
 	idx_t current_idx = 0;
 };
 
-static unique_ptr<FunctionData> VgiResultCacheListBind(ClientContext &, TableFunctionBindInput &input,
+static unique_ptr<FunctionData> VgiResultCacheListBind(ClientContext &context, TableFunctionBindInput &input,
                                                        vector<LogicalType> &return_types,
                                                        vector<string> &names) {
 	names = {"catalog",         "function",        "key_hash",     "scope",
@@ -140,13 +140,14 @@ static unique_ptr<FunctionData> VgiResultCacheListBind(ClientContext &, TableFun
 	                LogicalType::BIGINT,  LogicalType::BIGINT,  LogicalType::BIGINT,  LogicalType::BOOLEAN,
 	                LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BOOLEAN,
 	                LogicalType::UBIGINT, LogicalType::VARCHAR, LogicalType::VARCHAR};
+	SyncResultCacheSettings(context);
 	auto data = make_uniq<VgiResultCacheListData>();
-	data->entries = VgiResultCache::Instance().Snapshot();
+	data->entries = GetResultCache(context).Snapshot();
 	// Per-value memo arenas are a SEPARATE registry (one arena per function, not per
 	// value), so surface them as one row each (tier='arena'): num_batches = live slots,
 	// num_rows = total stored rows (live + dead), total_bytes = the arena's real footprint.
 	// ttl_seconds is -1 because slots expire heterogeneously.
-	for (auto &ar : vgi::VgiMemoArenaRegistry::Instance().Snapshot()) {
+	for (auto &ar : vgi::GetMemoArenaRegistry(context).Snapshot()) {
 		VgiResultCache::EntryInfo e;
 		e.function_name = "(per-value arena)";
 		e.key_hex = ar.static_fp.substr(0, 16);
@@ -162,7 +163,7 @@ static unique_ptr<FunctionData> VgiResultCacheListBind(ClientContext &, TableFun
 	// (which never enter the in-memory index) are observable (tier='disk').
 	auto it = input.named_parameters.find("include_disk");
 	if (it != input.named_parameters.end() && !it->second.IsNull() && it->second.GetValue<bool>()) {
-		auto disk = VgiResultCache::Instance().SnapshotDisk();
+		auto disk = GetResultCache(context).SnapshotDisk();
 		for (auto &e : disk) {
 			data->entries.push_back(std::move(e));
 		}
@@ -218,7 +219,7 @@ void RegisterVgiResultCacheFunction(ExtensionLoader &loader) {
 }
 
 // ---- vgi_result_cache_stats() -------------------------------------------
-// Surfaces the process-global aggregate counters (the only way to observe reaper
+// Surfaces the database-wide aggregate counters (the only way to observe reaper
 // evictions, which emit no duckdb_logs events).
 
 struct VgiResultCacheStatsData : public TableFunctionData {
@@ -228,7 +229,7 @@ struct VgiResultCacheStatsData : public TableFunctionData {
 	int64_t total_bytes = 0;
 };
 
-static unique_ptr<FunctionData> VgiResultCacheStatsBind(ClientContext &, TableFunctionBindInput &,
+static unique_ptr<FunctionData> VgiResultCacheStatsBind(ClientContext &context, TableFunctionBindInput &,
                                                         vector<LogicalType> &return_types,
                                                         vector<string> &names) {
 	names = {"hits",           "misses",         "inserts",         "evictions_lru",
@@ -239,9 +240,10 @@ static unique_ptr<FunctionData> VgiResultCacheStatsBind(ClientContext &, TableFu
 	                LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::BIGINT,  LogicalType::BIGINT,
 	                LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT,
 	                LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT, LogicalType::UBIGINT};
+	SyncResultCacheSettings(context);
 	auto data = make_uniq<VgiResultCacheStatsData>();
-	data->counters = VgiResultCache::Instance().GetCounters();
-	auto snap = VgiResultCache::Instance().Snapshot();
+	data->counters = GetResultCache(context).GetCounters();
+	auto snap = GetResultCache(context).Snapshot();
 	data->entries = static_cast<int64_t>(snap.size());
 	for (const auto &e : snap) {
 		data->total_bytes += e.total_bytes;

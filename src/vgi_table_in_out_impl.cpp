@@ -932,7 +932,7 @@ OperatorResultType VgiTableInOutFunction(ExecutionContext &context, TableFunctio
 		auto now = std::chrono::steady_clock::now();
 		// Probe conditional revalidation FIRST — Lookup() drops (evicts) a stale entry,
 		// so calling it first would destroy the very entry we want to revalidate.
-		auto reval = VgiResultCache::Instance().LookupForRevalidation(batch_key, now);
+		auto reval = GetResultCache(client_context).LookupForRevalidation(batch_key, now);
 		if (reval && reval->revalidatable && !reval->streams.empty() &&
 		    reval->total_bytes >= global_state.cache_revalidate_min_bytes) {
 			// Arm the exchange with its validators; do NOT serve yet — the worker
@@ -940,11 +940,11 @@ OperatorResultType VgiTableInOutFunction(ExecutionContext &context, TableFunctio
 			reval_entry = reval;
 			conn.SetConditionalRequest(reval->etag, reval->last_modified);
 		} else {
-			auto entry = VgiResultCache::Instance().Lookup(batch_key, now);
+			auto entry = GetResultCache(client_context).Lookup(batch_key, now);
 			if (entry && !entry->streams.empty() && !entry->streams[0].batches.empty()) {
 				output_batch = DeserializeCachedRecordBatch(*entry, entry->streams[0].batches[0]);
 				cache_hit = true;
-				VgiResultCache::Instance().RecordExchangeHit(entry->total_bytes);
+				GetResultCache(client_context).RecordExchangeHit(entry->total_bytes);
 				VGI_LOG(client_context, "result_cache.hit",
 				        {{"function", bind_data.function_name},
 				         {"key_hash", batch_key.HexDigest()},
@@ -998,11 +998,11 @@ OperatorResultType VgiTableInOutFunction(ExecutionContext &context, TableFunctio
 			if (output_batch && output_batch->num_rows() == 0) {
 				auto cc = conn.GetLastCacheControl();
 				if (cc.not_modified) {
-					SlideRevalidatedExchangeEntry(*reval_entry, cc, global_state.cache_default_ttl_seconds,
+					SlideRevalidatedExchangeEntry(GetResultCache(client_context), *reval_entry, cc, global_state.cache_default_ttl_seconds,
 					                              /*allow_disk=*/true);
 					output_batch = DeserializeCachedRecordBatch(*reval_entry, reval_entry->streams[0].batches[0]);
 					cache_hit = true; // serve the stored bytes; skip the store below
-					VgiResultCache::Instance().RecordExchangeRevalidation(reval_entry->total_bytes);
+					GetResultCache(client_context).RecordExchangeRevalidation(reval_entry->total_bytes);
 					VGI_LOG(client_context, "result_cache.revalidate",
 					        {{"function", bind_data.function_name},
 					         {"key_hash", batch_key.HexDigest()},
@@ -1015,18 +1015,18 @@ OperatorResultType VgiTableInOutFunction(ExecutionContext &context, TableFunctio
 		// output, then (if cacheable) memoize this input batch's output. Skip on the
 		// terminal EOS batch (nullptr) — there is nothing to cache and cc rides data.
 		if (!cache_hit && global_state.cache_eligible && output_batch) {
-			VgiResultCache::Instance().RecordExchangeMiss(); // fresh exchange (not a hit / 304)
+			GetResultCache(client_context).RecordExchangeMiss(); // fresh exchange (not a hit / 304)
 			if (!local_state.cache_cc_latched) {
 				local_state.cache_cc = conn.GetLastCacheControl();
 				local_state.cache_cc_latched = true;
 			}
 			if (local_state.cache_cc.Cacheable()) {
-				auto sr = StoreExchangeMemoEntry(batch_key, local_state.cache_cc,
+				auto sr = StoreExchangeMemoEntry(GetResultCache(client_context), batch_key, local_state.cache_cc,
 				                                 global_state.cache_catalog_name,
 				                                 global_state.cache_default_ttl_seconds, {output_batch},
 				                                 /*allow_disk=*/true);
 				if (sr.stored) {
-					VgiResultCache::Instance().RecordExchangeStore();
+					GetResultCache(client_context).RecordExchangeStore();
 					VGI_LOG(client_context, "result_cache.store",
 					        {{"function", bind_data.function_name},
 					         {"key_hash", batch_key.HexDigest()},

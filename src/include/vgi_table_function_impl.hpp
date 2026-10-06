@@ -1,6 +1,7 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #pragma once
 
+#include "vgi_settings_defaults.hpp"
 #include <atomic>
 #include <future>
 #include <map>
@@ -315,6 +316,7 @@ struct VgiDynamicFilterInfo {
 // first-batch cache-control latch). Committed to the cache in the gstate
 // destructor iff the complete result was drained (never-partial invariant).
 struct VgiResultCaptureCtx {
+	VgiResultCache *cache = nullptr; // owning database outlives query capture
 	VgiResultCacheKey key;
 	std::string catalog_name;
 	//! Current transaction id; folded into the key at commit iff the worker
@@ -326,7 +328,7 @@ struct VgiResultCaptureCtx {
 	bool catalog_version_frozen = false; // allows never-expires (at-pinned / frozen)
 
 	std::atomic<int64_t> total_bytes {0};
-	// [S6] Bytes this capture has reserved against the process-global in-flight
+	// [S6] Bytes this capture has reserved against the database-wide in-flight
 	// budget (VgiResultCache::TryReserveInflightCapture). Released in full at
 	// gstate teardown (commit or abort) so concurrent captures can't OOM the box.
 	std::atomic<int64_t> reserved_inflight_bytes {0};
@@ -387,7 +389,7 @@ struct VgiResultCaptureCtx {
 	std::vector<LogicalType> partition_types;      // matching declared partition types
 	std::vector<std::string> partition_names;      // matching declared partition column names
 	std::string residual_filter_bytes;             // filter_bytes with the partition predicate stripped
-	uint64_t partition_max = 1024;                  // cap on distinct partitions per split
+	uint64_t partition_max = defaults::RESULT_CACHE_PARTITION_MAX_ENUMERATED;                  // cap on distinct partitions per split
 
 	// Allocate + register a per-local-state substream. Increments `launched`.
 	CachedStream *NewStream() {

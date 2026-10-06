@@ -1,6 +1,7 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #pragma once
 
+#include "vgi_settings_defaults.hpp"
 #include "vgi_stderr_drainer.hpp"
 #include "vgi_subprocess.hpp"
 
@@ -22,7 +23,7 @@ namespace vgi {
 // Per-path pool configuration, set at ATTACH time via ConfigurePath().
 struct PoolSettings {
 	size_t max_pool_size = 0;        // 0 = pool disabled
-	size_t idle_timeout_seconds = 5; // How long idle workers survive
+	size_t idle_timeout_seconds = defaults::WORKER_POOL_IDLE_LIMIT_SECONDS; // How long idle workers survive
 };
 
 // Pool key: workers are only reused when all three dimensions match.
@@ -215,7 +216,7 @@ private:
 	std::map<std::string, PoolSettings> path_configs_;
 
 	// Default settings for paths without explicit per-path config
-	PoolSettings default_settings_ {256, 5};
+	PoolSettings default_settings_ {defaults::WORKER_POOL_MAX, defaults::WORKER_POOL_IDLE_LIMIT_SECONDS};
 
 	// Hit/miss statistics by worker path
 	std::map<std::string, std::pair<uint64_t, uint64_t>> stats_; // {hits, misses}

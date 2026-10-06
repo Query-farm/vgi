@@ -9,6 +9,7 @@
 // (those few bits + .zip support + .exe entrypoint selection are the remaining
 // Windows-port work); the FileSystem refactor keeps that delta small.
 
+#include "vgi_settings_defaults.hpp"
 #include "vgi_github.hpp"
 #include "vgi_worker_archive.hpp"
 
@@ -363,7 +364,7 @@ std::string GithubApiGet(ClientContext &context, const std::string &url) {
 	auto &db = *context.db;
 	auto &http_util = HTTPUtil::Get(db);
 	auto params = http_util.InitializeParameters(context, url);
-	params->timeout = static_cast<uint64_t>(GetIntSetting(context, "vgi_http_timeout_seconds", 300));
+	params->timeout = static_cast<uint64_t>(GetIntSetting(context, "vgi_http_timeout_seconds", defaults::HTTP_TIMEOUT_SECONDS));
 
 	HTTPHeaders headers;
 	headers.Insert("Accept", "application/vnd.github+json");

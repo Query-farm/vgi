@@ -27,7 +27,7 @@ full
 statement error
 SET vgi_validate_worker_batches = 'fulll';
 ----
-vgi_validate_worker_batches must be 'full', 'structural' or 'none'
+vgi_validate_worker_batches must be one of full,structural,none
 
 statement ok
 SET vgi_validate_worker_batches = 'STRUCTURAL';

@@ -1,5 +1,6 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 
+#include "vgi_settings_defaults.hpp"
 #include "vgi_iroh_config.hpp"
 
 #include "duckdb/common/exception.hpp"
@@ -274,8 +275,8 @@ std::shared_ptr<IrohClientConfig> BuildIrohClientConfigForLocation(ClientContext
 	return ResolveIrohClientConfig(context, location, std::move(options.secret_key), std::move(options.relay_urls),
 	                               options.no_relay, std::move(options.remote_relay_url),
 	                               std::move(options.direct_addresses),
-	                               positive_setting("vgi_iroh_connect_timeout_seconds", 30),
-	                               positive_setting("vgi_iroh_io_timeout_seconds", 300));
+	                               positive_setting("vgi_iroh_connect_timeout_seconds", defaults::IROH_CONNECT_TIMEOUT_SECONDS),
+	                               positive_setting("vgi_iroh_io_timeout_seconds", defaults::IROH_IO_TIMEOUT_SECONDS));
 #endif
 }
 

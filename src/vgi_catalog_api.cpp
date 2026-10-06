@@ -1,4 +1,5 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
+#include "vgi_settings_defaults.hpp"
 #include "vgi_catalog_api.hpp"
 
 #include "duckdb.hpp"
@@ -172,7 +173,7 @@ std::shared_ptr<HTTPParams> VgiAttachParameters::GetOrInitHttpParams(
 		if (context.TryGetCurrentSetting("vgi_http_timeout_seconds", timeout_val)) {
 			cached_http_params_->timeout = static_cast<uint64_t>(timeout_val.GetValue<int64_t>());
 		} else {
-			cached_http_params_->timeout = 300;
+			cached_http_params_->timeout = defaults::HTTP_TIMEOUT_SECONDS;
 		}
 	}
 	return cached_http_params_;
@@ -1386,7 +1387,7 @@ VgiScanPlan InvokeTableFunctionPlan(const CatalogRpcContext &ctx,
 	// legitimately paginates a very large table — this bounds PAGES, not splits,
 	// so the reachable split count is this times the worker's page size, which
 	// may sit far below the split cap below.
-	idx_t max_pages = 1024;
+	idx_t max_pages = defaults::SPLIT_PLAN_MAX_PAGES;
 	Value max_pages_value;
 	if (context.TryGetCurrentSetting("vgi_split_plan_max_pages", max_pages_value) &&
 	    !max_pages_value.IsNull()) {

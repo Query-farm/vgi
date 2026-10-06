@@ -215,10 +215,10 @@ std::string FinalizeInputDigest(uint64_t sum_lo, uint64_t sum_hi, uint64_t row_c
 // Static key builder
 // ----------------------------------------------------------------------------
 
-// Sync the process-global cache config (byte caps, disk dir/caps, compression) from
-// this query's settings into the singleton, so SET takes effect on the exchange path
+// Sync the database-wide cache config (byte caps, disk dir/caps, compression) from
+// this query's settings into the database cache, so SET takes effect on the exchange path
 // exactly as it does on the producer path (which does this before eligibility). Without
-// this the singleton's disk_dir stays empty and allow_disk=true is a silent no-op.
+// this the cache's disk_dir stays empty and allow_disk=true is a silent no-op.
 // ConfigureIfChanged is lock-free when the settings are unchanged (the steady state).
 void SyncResultCacheSettings(ClientContext &context) {
 	VgiResultCache::Settings s;
@@ -252,19 +252,19 @@ void SyncResultCacheSettings(ClientContext &context) {
 	u64("vgi_result_cache_pack_max_entry_bytes", s.pack_max_entry_bytes);
 	u64("vgi_result_cache_pack_target_bytes", s.pack_target_bytes);
 	u64("vgi_result_cache_pack_compaction_dead_pct", s.pack_compaction_dead_pct);
-	VgiResultCache::Instance().ConfigureIfChanged(s);
+	GetResultCache(context).ConfigureIfChanged(s);
 	// The per-value memo arena is a separate registry with its own byte budget; it shares
-	// the whole-cache max_bytes so `SET vgi_result_cache_max_bytes` bounds it too.
-	VgiMemoArenaRegistry::Instance().SetMaxBytes(static_cast<int64_t>(s.max_bytes));
+	// the same configured max_bytes independently. This is NOT a combined cap.
+	GetMemoArenaRegistry(context).SetMaxBytes(static_cast<int64_t>(s.max_bytes));
 	// `SET vgi_result_cache_dir` turns on the per-value disk tier (same-host multi-process
 	// + cross-restart warm reuse); `..._per_value_disk_max_bytes` caps its on-disk size
 	// (LRU eviction + expired-row reaping), 0 = unlimited.
-	uint64_t pv_disk_max = 0;
+	uint64_t pv_disk_max = defaults::RESULT_CACHE_PER_VALUE_DISK_MAX_BYTES;
 	Value pdmv;
 	if (context.TryGetCurrentSetting("vgi_result_cache_per_value_disk_max_bytes", pdmv) && !pdmv.IsNull()) {
 		pv_disk_max = pdmv.GetValue<uint64_t>();
 	}
-	VgiMemoArenaRegistry::Instance().EnsureSqliteBackend(s.disk_dir, static_cast<int64_t>(pv_disk_max));
+	GetMemoArenaRegistry(context).EnsureSqliteBackend(s.disk_dir, static_cast<int64_t>(pv_disk_max));
 }
 
 bool BuildExchangeCacheKeyStaticFields(ClientContext &context,
@@ -279,7 +279,7 @@ bool BuildExchangeCacheKeyStaticFields(ClientContext &context,
 	reason = nullptr;
 	catalog_version = 0;
 
-	// Apply cache config from this query's settings (disk tier, caps) to the singleton.
+	// Apply cache config from this query's settings (disk tier, caps) to the database cache.
 	SyncResultCacheSettings(context);
 
 	// Global master switch.
@@ -372,7 +372,7 @@ bool BuildExchangeCacheKeyStatic(ClientContext &context, const VgiTableInOutBind
 
 // Process-static local FileSystem for disk-backed replay. A FileHandle keeps a
 // reference to the FileSystem that opened it, so the FS must outlive the handle —
-// a function-local static (leaked, like the cache singleton) guarantees that.
+// a process-static FileSystem outlives the database-owned replay entries.
 namespace {
 FileSystem &ExchangeReplayFs() {
 	static std::unique_ptr<FileSystem> fs = FileSystem::CreateLocal();
@@ -415,7 +415,7 @@ std::shared_ptr<arrow::RecordBatch> DeserializeCachedRecordBatch(const VgiResult
 	return next_result.ValueUnsafe().batch;
 }
 
-void SlideRevalidatedExchangeEntry(const VgiResultCacheEntry &entry, const VgiCacheControl &cc,
+void SlideRevalidatedExchangeEntry(VgiResultCache &cache, const VgiResultCacheEntry &entry, const VgiCacheControl &cc,
                                    int64_t /*default_ttl_seconds*/, bool allow_disk) {
 	auto fresh = std::make_shared<VgiResultCacheEntry>(entry); // shallow copy (shared Buffers)
 	fresh->stored_at = std::chrono::steady_clock::now();
@@ -444,10 +444,10 @@ void SlideRevalidatedExchangeEntry(const VgiResultCacheEntry &entry, const VgiCa
 	// An immediately-stale (always-revalidate) entry is memory-only: LookupForRevalidation
 	// probes the in-memory index, and a disk immediately-stale blob is un-loadable.
 	bool eff_allow_disk = allow_disk && (entry.never_expires || fresh->expires_at > fresh->stored_at);
-	VgiResultCache::Instance().Insert(fresh, eff_allow_disk);
+	cache.Insert(fresh, eff_allow_disk);
 }
 
-ExchangeStoreResult StoreExchangeMemoEntry(const VgiResultCacheKey &key, const VgiCacheControl &cc,
+ExchangeStoreResult StoreExchangeMemoEntry(VgiResultCache &cache, const VgiResultCacheKey &key, const VgiCacheControl &cc,
                                            const std::string &catalog_name, int64_t default_ttl_seconds,
                                            const std::vector<std::shared_ptr<arrow::RecordBatch>> &out_batches,
                                            bool allow_disk, bool allow_immediately_stale) {
@@ -521,7 +521,7 @@ ExchangeStoreResult StoreExchangeMemoEntry(const VgiResultCacheKey &key, const V
 	// small-but-expensive result is exactly where a warm disk cache pays off. Per-chunk
 	// file fan-out is bounded instead by the reaper's exchange ref-count cap
 	// (vgi_result_cache_exchange_disk_max_refs), not by excluding tiny entries here.
-	if (!VgiResultCache::Instance().Insert(std::move(entry), eff_allow_disk)) {
+	if (!cache.Insert(std::move(entry), eff_allow_disk)) {
 		return skip("too_large_for_memory");
 	}
 	res.stored = true;

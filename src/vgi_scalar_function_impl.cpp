@@ -1,4 +1,5 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
+#include "vgi_settings_defaults.hpp"
 #include "vgi_scalar_function_impl.hpp"
 #include "vgi_batch_validation.hpp"
 #include "storage/vgi_transaction.hpp"
@@ -635,7 +636,7 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 	// is a CEILING over the advertisement, never an enabler. See VGI_CACHE_PER_VALUE_KEY.
 	if (!local_state.cache_pv_opt_in && local_state.cache_eligible) {
 		local_state.cache_pv_opt_in =
-		    VgiResultCache::Instance().HasPerValueOptIn(local_state.cache_static_key);
+		    GetResultCache(context).HasPerValueOptIn(local_state.cache_static_key);
 	}
 	const bool pv_enabled = pv_setting && local_state.cache_pv_opt_in && dedup_enabled && !is_volatile &&
 	                        local_state.cache_eligible;
@@ -648,13 +649,13 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 	int64_t pv_hit_count = 0;
 	if (pv_enabled) {
 		pv_blobs = InputRowSortKeys(context, *ship);
-		if (auto arena = VgiMemoArenaRegistry::Instance().Get(local_state.cache_static_fp)) {
+		if (auto arena = GetMemoArenaRegistry(context).Get(local_state.cache_static_fp)) {
 			auto pr = arena->Probe(pv_blobs, std::chrono::steady_clock::now());
 			pv_hit = std::move(pr.hit);
 			pv_cached = pr.rows;
 			pv_hit_count = pr.num_hits;
 			if (pr.served_bytes) {
-				VgiResultCache::Instance().RecordExchangeHit(pr.served_bytes);
+				GetResultCache(context).RecordExchangeHit(pr.served_bytes);
 			}
 		}
 	}
@@ -821,10 +822,10 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 		if (pv_store && !local_state.cache_pv_opt_in) {
 			// Arm this local state's later chunks AND every later scan of this function.
 			local_state.cache_pv_opt_in = true;
-			VgiResultCache::Instance().NotePerValueOptIn(local_state.cache_static_key);
+			GetResultCache(context).NotePerValueOptIn(local_state.cache_static_key);
 		}
 		if (pv_store) {
-			VgiResultCache::Instance().RecordExchangeMiss();
+			GetResultCache(context).RecordExchangeMiss();
 		}
 		if (pv_store && cc.Cacheable() && !miss_indices.empty()) {
 			// The missed tuples' rows are exactly `fresh` (m rows, ascending-d-among-misses);
@@ -833,7 +834,7 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 			if (pv_blobs.empty()) {
 				pv_blobs = InputRowSortKeys(context, *ship);
 			}
-			uint64_t store_cap = 256;
+			uint64_t store_cap = defaults::RESULT_CACHE_PER_VALUE_MAX_STORES_PER_CHUNK;
 			{
 				Value scv;
 				if (context.TryGetCurrentSetting("vgi_result_cache_per_value_max_stores_per_chunk", scv) &&
@@ -850,7 +851,7 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 				ttl = VGI_CACHE_MAX_TTL_SECONDS;
 			}
 			auto expires = std::chrono::steady_clock::now() + std::chrono::seconds(ttl);
-			auto arena = VgiMemoArenaRegistry::Instance().GetOrCreate(local_state.cache_static_fp, fresh->schema());
+			auto arena = GetMemoArenaRegistry(context).GetOrCreate(local_state.cache_static_fp, fresh->schema());
 			if (arena) {
 				ArenaValidator av;
 				av.scope = cc.scope;
@@ -866,9 +867,9 @@ void VgiScalarFunctionExecute(DataChunk &args, ExpressionState &state, Vector &r
 				}
 				auto store_rows = fresh->Slice(0, static_cast<int64_t>(to_store));
 				const int64_t delta = arena->Store(store_rows, specs, expires, /*never_expires=*/false);
-				VgiMemoArenaRegistry::Instance().NoteFootprintDelta(local_state.cache_static_fp, delta);
+				GetMemoArenaRegistry(context).NoteFootprintDelta(local_state.cache_static_fp, delta, arena.get());
 				for (idx_t j = 0; j < to_store; j++) {
-					VgiResultCache::Instance().RecordExchangeStore();
+					GetResultCache(context).RecordExchangeStore();
 				}
 			}
 		}

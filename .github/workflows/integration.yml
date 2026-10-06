@@ -125,6 +125,9 @@ jobs:
       - name: Run Filter v2 producer tests
         run: make test_filter_v2
 
+      - name: Run settings validation and cache ownership tests
+        run: make test_settings
+
       # enable-cache is off deliberately. The only uv project here is the
       # fixture checkout at /tmp/vgi-python, created after this step runs and
       # outside the workspace; the action's post-job "Pruning cache" step hung

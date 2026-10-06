@@ -1,4 +1,5 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
+#include "vgi_settings_defaults.hpp"
 #include "vgi_database_worker.hpp"
 
 #include "duckdb/common/exception.hpp"
@@ -44,11 +45,11 @@ namespace vgi {
 
 namespace {
 
-constexpr uint64_t DEFAULT_MAX_PACKAGE_BYTES = 512ULL * 1024ULL * 1024ULL;
-constexpr uint64_t DEFAULT_MAX_EXTRACTED_BYTES = 1024ULL * 1024ULL * 1024ULL;
-constexpr uint64_t DEFAULT_MAX_PACKAGE_FILES = 10000;
-constexpr uint64_t DEFAULT_CACHE_MAX_BYTES = 5ULL * 1024ULL * 1024ULL * 1024ULL;
-constexpr int64_t DEFAULT_CACHE_TTL_SECONDS = 30LL * 24LL * 60LL * 60LL;
+constexpr uint64_t DEFAULT_MAX_PACKAGE_BYTES = defaults::WORKER_PACKAGE_MAX_BYTES;
+constexpr uint64_t DEFAULT_MAX_EXTRACTED_BYTES = defaults::WORKER_PACKAGE_MAX_EXTRACTED_BYTES;
+constexpr uint64_t DEFAULT_MAX_PACKAGE_FILES = defaults::WORKER_PACKAGE_MAX_FILES;
+constexpr uint64_t DEFAULT_CACHE_MAX_BYTES = defaults::WORKER_CACHE_MAX_BYTES;
+constexpr int64_t DEFAULT_CACHE_TTL_SECONDS = defaults::WORKER_CACHE_TTL_SECONDS;
 
 FileSystem &LocalFs() {
 	static unique_ptr<FileSystem> fs = FileSystem::CreateLocal();

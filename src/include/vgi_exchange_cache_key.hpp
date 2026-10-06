@@ -19,6 +19,7 @@ class ClientContext;
 class DataChunk;
 
 namespace vgi {
+class VgiResultCache;
 
 struct VgiResultCacheKey;      // vgi_result_cache.hpp
 struct VgiResultCacheEntry;    // vgi_result_cache.hpp
@@ -161,7 +162,7 @@ struct ExchangeStoreResult {
 //! On a 304 not_modified reply, re-insert the stored entry with a slid TTL (and any
 //! refreshed validators from `cc`) so future lookups hit fresh without re-fetching.
 //! Mirrors the producer's MaybeSlideRevalidatedEntry. Best-effort.
-void SlideRevalidatedExchangeEntry(const VgiResultCacheEntry &entry, const VgiCacheControl &cc,
+void SlideRevalidatedExchangeEntry(VgiResultCache &cache, const VgiResultCacheEntry &entry, const VgiCacheControl &cc,
                                    int64_t default_ttl_seconds, bool allow_disk);
 
 //! Build a cache entry from one input unit's output batches and Insert it. Freshness
@@ -177,7 +178,7 @@ void SlideRevalidatedExchangeEntry(const VgiResultCacheEntry &entry, const VgiCa
 //! no revalidation path, so an immediately-stale per-value entry would be found stale
 //! and evicted on the very next probe — a store/insert/evict/serialize churn loop
 //! with a 0% hit rate every chunk (B3). Refusing to store it is strictly better.
-ExchangeStoreResult StoreExchangeMemoEntry(const VgiResultCacheKey &key, const VgiCacheControl &cc,
+ExchangeStoreResult StoreExchangeMemoEntry(VgiResultCache &cache, const VgiResultCacheKey &key, const VgiCacheControl &cc,
                                            const std::string &catalog_name, int64_t default_ttl_seconds,
                                            const std::vector<std::shared_ptr<arrow::RecordBatch>> &out_batches,
                                            bool allow_disk = false, bool allow_immediately_stale = true);

@@ -722,6 +722,13 @@ test_filter_v2:
 	cmake --build build/release --target vgi_filter_v2_tests
 	./build/release/extension/vgi/vgi_filter_v2_tests
 
+# Uses the same independent C++ test configuration as test_filter_v2.
+.PHONY: test_settings
+test_settings:
+	python3 scripts/generate_settings.py --check
+	cmake --build build/release --target vgi_settings_tests
+	./build/release/extension/vgi/vgi_settings_tests
+
 # Configure with BUILD_VGI_CANCEL_DISPATCHER_TESTS=1 (or BUILD_VGI_UNIT_TESTS),
 # then run the cancel dispatcher's worker-start and shutdown tests.
 test_cancel_dispatcher:

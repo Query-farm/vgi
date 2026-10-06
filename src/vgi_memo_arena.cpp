@@ -481,7 +481,7 @@ std::shared_ptr<VgiMemoArena> VgiMemoArenaRegistry::GetOrCreate(const std::strin
 	auto arena = std::make_shared<VgiMemoArena>(schema);
 	int64_t fp_bytes = 0;
 	if (backend_) {
-		arena->SetPersistence(backend_.get(), static_fp);
+		arena->SetPersistence(backend_, static_fp);
 		fp_bytes = arena->LoadFromBackend(NowUnix()); // hydrate prior-process / peer slots
 	}
 	Entry e;
@@ -508,7 +508,7 @@ std::shared_ptr<VgiMemoArena> VgiMemoArenaRegistry::Get(const std::string &stati
 	// slots for this key (otherwise a probe of an unmemoized function would create empties).
 	if (backend_) {
 		auto arena = std::make_shared<VgiMemoArena>(nullptr);
-		arena->SetPersistence(backend_.get(), static_fp);
+		arena->SetPersistence(backend_, static_fp);
 		const int64_t fp_bytes = arena->LoadFromBackend(NowUnix());
 		if (arena->GetStats().live_slots > 0) {
 			Entry e;
@@ -528,6 +528,13 @@ std::shared_ptr<VgiMemoArena> VgiMemoArenaRegistry::Get(const std::string &stati
 
 void VgiMemoArenaRegistry::EvictToFitLocked(int64_t incoming, const std::string &keep) {
 	(void)incoming;
+	// A single arena cannot be retained above the budget. Active readers may
+	// still own it, but new queries must not keep growing that retained arena.
+	auto current = arenas_.find(keep);
+	if (current != arenas_.end() && current->second.bytes > max_bytes_) {
+		total_bytes_ -= current->second.bytes;
+		arenas_.erase(current);
+	}
 	while (total_bytes_ > max_bytes_) {
 		// Find the coldest evictable arena that is not `keep`.
 		auto victim = arenas_.end();
@@ -542,18 +549,18 @@ void VgiMemoArenaRegistry::EvictToFitLocked(int64_t incoming, const std::string 
 			}
 		}
 		if (victim == arenas_.end()) {
-			break; // only `keep` remains; a single over-cap arena is bounded by arena_max_slots
+			break; // only the protected, within-budget arena remains
 		}
 		total_bytes_ -= victim->second.bytes;
 		arenas_.erase(victim);
 	}
 }
 
-bool VgiMemoArenaRegistry::NoteFootprintDelta(const std::string &static_fp, int64_t delta) {
+bool VgiMemoArenaRegistry::NoteFootprintDelta(const std::string &static_fp, int64_t delta, const VgiMemoArena *arena) {
 	std::lock_guard<std::mutex> lg(mu_);
 	auto it = arenas_.find(static_fp);
-	if (it == arenas_.end()) {
-		return false;
+	if (it == arenas_.end() || it->second.arena.get() != arena) {
+		return false; // An active query may still own an evicted or old-directory arena.
 	}
 	it->second.bytes += delta;
 	it->second.last_used = ++tick_;
@@ -561,7 +568,7 @@ bool VgiMemoArenaRegistry::NoteFootprintDelta(const std::string &static_fp, int6
 	if (total_bytes_ > max_bytes_) {
 		EvictToFitLocked(0, static_fp);
 	}
-	return true;
+	return arenas_.find(static_fp) != arenas_.end();
 }
 
 void VgiMemoArenaRegistry::SetMaxBytes(int64_t max_bytes) {
@@ -580,9 +587,13 @@ void VgiMemoArenaRegistry::SetBackend(std::shared_ptr<PerValueDiskBackend> backe
 void VgiMemoArenaRegistry::EnsureSqliteBackend(const std::string &dir, int64_t disk_max_bytes) {
 	std::lock_guard<std::mutex> lg(mu_);
 	if (dir != backend_dir_) {
+		auto backend = dir.empty() ? nullptr : MakeSqliteDiskBackend(dir);
+		backend_ = std::move(backend);
 		backend_dir_ = dir;
-		backend_ = dir.empty() ? nullptr : MakeSqliteDiskBackend(dir);
-		// Existing in-memory arenas keep serving; new/cold ones will use the new backend.
+		// New queries must not reuse arenas still persisting to the old directory.
+		// Active queries retain their arena/backend snapshots through shared ownership.
+		arenas_.clear();
+		total_bytes_ = 0;
 	}
 	if (backend_) {
 		backend_->SetMaxBytes(disk_max_bytes); // refresh the cap even when the dir is unchanged

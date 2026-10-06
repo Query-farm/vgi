@@ -472,7 +472,7 @@ VgiCacheControl ParseVgiCacheControl(const std::shared_ptr<const arrow::KeyValue
 }
 
 // ============================================================================
-// VgiResultCache singleton
+// VgiResultCache
 // ============================================================================
 
 // ============================================================================
@@ -1097,11 +1097,8 @@ VgiResultCache::VgiResultCache() {
 }
 
 VgiResultCache::~VgiResultCache() {
-	// NOTE: Instance() intentionally leaks this singleton (Arrow static-
-	// destruction-order hazard), so this destructor never actually runs in a
-	// normal process — the reaper thread is a daemon reaped at process exit.
-	// The shutdown handshake below only matters if the singleton is ever
-	// explicitly deleted (e.g. a future test harness).
+	// Database-owned caches stop their reaper before releasing Arrow buffers.
+	// The standalone Instance() used by benchmarks retains its process lifetime.
 	shutdown_.store(true);
 	cleanup_cv_.notify_all();
 #if VGI_SUBPROCESS_TRANSPORT
@@ -1147,7 +1144,7 @@ void VgiResultCache::Configure(const Settings &settings) {
 	// FileSystem (absent in the browser) and its incremental blob hashing still
 	// calls mbedtls directly (SHA256State), which is not resolvable from the
 	// dlopen'd side-module on emscripten. Force the disk dir empty here — the
-	// single chokepoint every singleton disk path (Lookup/Insert/pack/reap) reads
+	// single chokepoint every cache disk path (Lookup/Insert/pack/reap) reads
 	// disk_dir_ from — so `SET vgi_result_cache_dir` is a clean no-op on WASM
 	// rather than a latent crash. The producer spill path is gated at its own
 	// setting read (vgi_table_function_impl.cpp). Native is unchanged.
@@ -1161,6 +1158,9 @@ void VgiResultCache::Configure(const Settings &settings) {
 	// Shrinking the cap mid-flight is honored on the next Insert / reap tick;
 	// evict now so a lowered cap takes effect immediately.
 	EvictToFitLocked(0);
+	// Publish under the configuration lock so concurrent updates cannot leave a
+	// signature describing different settings from those actually installed.
+	config_signature_.store(SettingsSignature(settings), std::memory_order_relaxed);
 }
 
 void VgiResultCache::ConfigureIfChanged(const Settings &settings) {
@@ -1172,7 +1172,6 @@ void VgiResultCache::ConfigureIfChanged(const Settings &settings) {
 		return;
 	}
 	Configure(settings);
-	config_signature_.store(sig, std::memory_order_relaxed);
 }
 
 bool VgiResultCache::TryReserveInflightCapture(int64_t bytes) {
@@ -1182,14 +1181,18 @@ bool VgiResultCache::TryReserveInflightCapture(int64_t bytes) {
 		std::lock_guard<std::mutex> lock(mutex_);
 		budget = settings_.max_inflight_bytes;
 	}
-	if (budget == 0) {
-		return true; // 0 = unbounded (opt-out)
+	if (bytes <= 0) {
+		return true;
 	}
-	int64_t prev = inflight_capture_bytes_.fetch_add(bytes, std::memory_order_relaxed);
-	if (prev + bytes > static_cast<int64_t>(budget)) {
-		inflight_capture_bytes_.fetch_sub(bytes, std::memory_order_relaxed);
-		return false;
-	}
+	// Track unlimited captures too: a later cap must include outstanding buffers.
+	const int64_t limit = budget == 0 ? INT64_MAX : static_cast<int64_t>(budget);
+	int64_t previous = inflight_capture_bytes_.load(std::memory_order_relaxed);
+	do {
+		if (bytes > limit || previous > limit - bytes) {
+			return false;
+		}
+	} while (!inflight_capture_bytes_.compare_exchange_weak(previous, previous + bytes,
+	                                                       std::memory_order_relaxed));
 	return true;
 }
 
@@ -1242,8 +1245,9 @@ VgiResultCache::Lookup(const VgiResultCacheKey &key, std::chrono::steady_clock::
 				std::lock_guard<std::mutex> lock(mutex_);
 				auto existing = index_.find(key);
 				if (existing == index_.end() &&
-				    packed->total_bytes <= static_cast<int64_t>(max_entry_bytes)) {
-					EvictToFitLocked(packed->total_bytes);
+				    packed->total_bytes <= static_cast<int64_t>(settings_.max_entry_bytes) &&
+				    packed->total_bytes <= static_cast<int64_t>(settings_.max_bytes)) {
+					EvictToFitLocked(packed->total_bytes, true);
 					total_bytes_ += packed->total_bytes;
 					packed->hits++;
 					lru_.push_front(packed);
@@ -1273,8 +1277,9 @@ VgiResultCache::Lookup(const VgiResultCacheKey &key, std::chrono::steady_clock::
 				// Adopt into memory (no re-persist). Evict-to-fit first.
 				auto existing = index_.find(key);
 				if (existing == index_.end() &&
-				    disk_entry->total_bytes <= static_cast<int64_t>(max_entry_bytes)) {
-					EvictToFitLocked(disk_entry->total_bytes);
+				    disk_entry->total_bytes <= static_cast<int64_t>(settings_.max_entry_bytes) &&
+				    disk_entry->total_bytes <= static_cast<int64_t>(settings_.max_bytes)) {
+					EvictToFitLocked(disk_entry->total_bytes, true);
 					total_bytes_ += disk_entry->total_bytes;
 					disk_entry->hits++;
 					lru_.push_front(disk_entry);
@@ -1346,6 +1351,7 @@ bool VgiResultCache::Insert(std::shared_ptr<VgiResultCacheEntry> entry, bool all
 	uint64_t disk_level = 1;
 	bool use_pack = false;
 	uint64_t pack_target = 0;
+	bool retained = false;
 	{
 		std::lock_guard<std::mutex> lock(mutex_);
 		if (entry->total_bytes > static_cast<int64_t>(settings_.max_entry_bytes)) {
@@ -1358,11 +1364,13 @@ bool VgiResultCache::Insert(std::shared_ptr<VgiResultCacheEntry> entry, bool all
 			lru_.erase(existing->second);
 			index_.erase(existing);
 		}
-		EvictToFitLocked(entry->total_bytes);
-		total_bytes_ += entry->total_bytes;
-		lru_.push_front(entry);
-		index_[entry->key] = lru_.begin();
-		inserts_.fetch_add(1, std::memory_order_relaxed);
+		retained = entry->total_bytes <= static_cast<int64_t>(settings_.max_bytes);
+		if (retained) {
+			EvictToFitLocked(entry->total_bytes, true);
+			total_bytes_ += entry->total_bytes;
+			lru_.push_front(entry);
+			index_[entry->key] = lru_.begin();
+		}
 		if (allow_disk && DiskEnabledLocked()) {
 			disk_dir = disk_dir_;
 			disk_max = disk_max_bytes_;
@@ -1377,6 +1385,9 @@ bool VgiResultCache::Insert(std::shared_ptr<VgiResultCacheEntry> entry, bool all
 				use_pack = true;
 				pack_target = settings_.pack_target_bytes;
 			}
+		}
+		if (retained || !disk_dir.empty()) {
+			inserts_.fetch_add(1, std::memory_order_relaxed);
 		}
 	}
 	// Persist to the disk tier OUTSIDE the cache lock (file I/O), over the
@@ -1395,18 +1406,19 @@ bool VgiResultCache::Insert(std::shared_ptr<VgiResultCacheEntry> entry, bool all
 			PersistToDisk(*entry, disk_dir, disk_max, disk_codec, disk_level);
 		}
 	}
-	return true;
+	return retained || !disk_dir.empty();
 }
 
-void VgiResultCache::EvictToFitLocked(int64_t incoming_bytes) {
+void VgiResultCache::EvictToFitLocked(int64_t incoming_bytes, bool admitting_entry) {
 	// [S5] Evict oldest while over the BYTE cap OR the ENTRY-COUNT cap. The count
 	// cap bounds unbounded small-entry accumulation (a workload with high key
 	// cardinality could otherwise pin ~700k tiny entries under the byte cap),
 	// which in turn keeps the reaper/Snapshot O(N) walks small.
 	const bool count_capped = settings_.max_entries > 0;
 	while (!lru_.empty() &&
-	       (total_bytes_ + incoming_bytes > static_cast<int64_t>(settings_.max_bytes) ||
-	        (count_capped && lru_.size() >= settings_.max_entries))) {
+	       (incoming_bytes > static_cast<int64_t>(settings_.max_bytes) ||
+	        total_bytes_ > static_cast<int64_t>(settings_.max_bytes) - incoming_bytes ||
+	        (count_capped && lru_.size() + (admitting_entry ? 1 : 0) > settings_.max_entries))) {
 		auto &victim = lru_.back();
 		total_bytes_ -= victim->total_bytes;
 		index_.erase(victim->key);

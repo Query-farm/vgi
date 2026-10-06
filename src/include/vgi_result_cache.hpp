@@ -1,7 +1,7 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #pragma once
 
-// VgiResultCache — process-wide cache of complete table-function results.
+// VgiResultCache — database-owned cache of complete table-function results.
 //
 // When a worker advertises `vgi.cache.*` metadata on the first batch of a
 // result, the client caches the entire (multi-batch) result and serves
@@ -28,6 +28,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "vgi_settings_defaults.hpp"
 #include "vgi_cache_control.hpp" // vgi.cache.* constants + VgiCacheControl + ParseVgiCacheControl
 
 namespace arrow {
@@ -38,9 +39,15 @@ class KeyValueMetadata;
 namespace duckdb {
 
 class ExtensionLoader;
+class ClientContext;
+class DatabaseInstance;
 class FileHandle; // full type only in the .cpp (streaming-capture writer)
 
 namespace vgi {
+
+class VgiResultCache;
+VgiResultCache &GetResultCache(ClientContext &context);
+VgiResultCache &GetResultCache(DatabaseInstance &db);
 
 // Register the vgi_result_cache() / vgi_result_cache_flush() /
 // vgi_result_cache_reap() diagnostics.
@@ -244,22 +251,22 @@ private:
 };
 
 // ============================================================================
-// VgiResultCache — leaked process-wide singleton (mirrors VgiWorkerPool)
+// VgiResultCache — database-owned result retention and disk store
 // ============================================================================
 class VgiResultCache {
 public:
 	struct Settings {
-		uint64_t max_bytes = 268435456;       // 256 MB in-memory global cap
-		uint64_t max_entry_bytes = 67108864;  // 64 MB per-entry cap
-		uint64_t max_entries = 131072;        // entry-count cap (0 = unlimited) [S5]
-		uint64_t max_inflight_bytes = 268435456; // global in-flight capture budget [S6]
-		std::string disk_dir;                 // empty = disk tier off
-		uint64_t disk_max_bytes = 0;          // 0 = disk tier off
-		uint64_t disk_reap_interval_seconds = 60; // disk reaper cadence [S7]
+		uint64_t max_bytes = defaults::RESULT_CACHE_MAX_BYTES;       // 256 MB in-memory global cap
+		uint64_t max_entry_bytes = defaults::RESULT_CACHE_MAX_ENTRY_BYTES;  // 64 MB per-entry cap
+		uint64_t max_entries = defaults::RESULT_CACHE_MAX_ENTRIES;        // entry-count cap (0 = unlimited) [S5]
+		uint64_t max_inflight_bytes = defaults::RESULT_CACHE_MAX_INFLIGHT_BYTES; // global in-flight capture budget [S6]
+		std::string disk_dir = defaults::RESULT_CACHE_DIR;                 // empty = disk tier off
+		uint64_t disk_max_bytes = defaults::RESULT_CACHE_DISK_MAX_BYTES;          // 0 = disk tier off
+		uint64_t disk_reap_interval_seconds = defaults::RESULT_CACHE_DISK_REAP_INTERVAL_SECONDS; // disk reaper cadence [S7]
 		// Disk-tier on-write compression (Arrow built-in IPC codec; memory tier is
 		// never compressed). "zstd" default (level 1), "lz4", or "none".
-		std::string disk_compression = "zstd";
-		uint64_t disk_compression_level = 1; // zstd only; ignored for lz4/none
+		std::string disk_compression = defaults::RESULT_CACHE_DISK_COMPRESSION;
+		uint64_t disk_compression_level = defaults::RESULT_CACHE_DISK_COMPRESSION_LEVEL; // zstd only; ignored for lz4/none
 		// [S9] File-count cap for EXCHANGE-mode disk entries. Per-input-batch/-chunk
 		// memos are tiny but numerous (one per input chunk), so keying the disk
 		// decision on payload size would wrongly exclude a small-but-EXPENSIVE result
@@ -269,21 +276,21 @@ public:
 		// refs (input_hash present) so a memo flood never evicts a large producer
 		// entry. 0 = unbounded. Default 100k. (Loose store only; the packed store
 		// below bounds file count structurally.)
-		uint64_t exchange_disk_max_refs = 100000;
+		uint64_t exchange_disk_max_refs = defaults::RESULT_CACHE_EXCHANGE_DISK_MAX_REFS;
 		// --- Packed small-entry disk backend (git-style loose-vs-packed split) ---
 		// Master switch: route SMALL entries into append-only per-process pack files +
 		// a rebuildable index instead of a loose .vrc/.ref pair each, so thousands of
 		// tiny per-chunk memos cost a few files. Large entries stay loose. Default ON
 		// (the disk tier itself is opt-in, so this only takes effect once a disk dir is
 		// configured); the loose store is still used for large entries.
-		bool pack = true;
+		bool pack = defaults::RESULT_CACHE_PACK;
 		// Route threshold: entries with total_bytes below this pack; at/above go loose.
-		uint64_t pack_max_entry_bytes = 262144; // 256 KB
+		uint64_t pack_max_entry_bytes = defaults::RESULT_CACHE_PACK_MAX_ENTRY_BYTES; // 256 KB
 		// Roll to a new pack file past this size (bounds one compaction unit).
-		uint64_t pack_target_bytes = 67108864; // 64 MB
+		uint64_t pack_target_bytes = defaults::RESULT_CACHE_PACK_TARGET_BYTES; // 64 MB
 		// Compact an OWN pack when this fraction of its bytes is dead (0..100, percent,
 		// integer so it folds into the settings signature cleanly). Default 50%.
-		uint64_t pack_compaction_dead_pct = 50;
+		uint64_t pack_compaction_dead_pct = defaults::RESULT_CACHE_PACK_COMPACTION_DEAD_PCT;
 	};
 
 	// Snapshot row for the vgi_result_cache() diagnostic.
@@ -373,9 +380,10 @@ public:
 	void NotePerValueOptIn(const VgiResultCacheKey &static_key);
 	bool HasPerValueOptIn(const VgiResultCacheKey &static_key);
 
+	// Standalone benchmark/test compatibility; production uses GetResultCache(context).
 	static VgiResultCache &Instance();
 
-	// Push process-global caps + disk-tier config (takes the lock + evicts-to-fit).
+	// Push database-wide caps + disk-tier config (takes the lock + evicts-to-fit).
 	void Configure(const Settings &settings);
 
 	// [S1] Cheap per-query config sync: compares a signature of `settings` to the
@@ -384,7 +392,7 @@ public:
 	// — is then lock-free instead of contending the global mutex on every query.
 	void ConfigureIfChanged(const Settings &settings);
 
-	// [S6] Reserve `bytes` of in-flight capture budget against a process-global
+	// [S6] Reserve `bytes` of in-flight capture budget against a database-wide
 	// ceiling (max_inflight_bytes). Returns false when the reservation would
 	// exceed it — the caller then aborts that capture to uncached, bounding total
 	// concurrent-capture RAM regardless of query concurrency. Released via
@@ -419,8 +427,9 @@ public:
 	LookupForRevalidation(const VgiResultCacheKey &key, std::chrono::steady_clock::time_point now);
 
 	// Insert (or replace) an entry. Rejects entries larger than max_entry_bytes;
-	// evicts from LRU until the new entry fits under max_bytes. Returns false if
-	// the entry was rejected (too large).
+	// retains only entries that fit max_bytes, evicting older entries as needed.
+	// Eligible entries can still persist to disk when they exceed max_bytes.
+	// Returns false when neither tier accepts the entry.
 	// `allow_disk=false` keeps the entry memory-only (skips PersistToDisk) — used for
 	// transaction-scoped entries, whose txn-id key is ephemeral + process-local.
 	bool Insert(std::shared_ptr<VgiResultCacheEntry> entry, bool allow_disk = true);
@@ -468,16 +477,18 @@ public:
 		capture_aborts_.fetch_add(1, std::memory_order_relaxed);
 	}
 
-private:
+public:
 	VgiResultCache();
 	~VgiResultCache();
+
+private:
 	VgiResultCache(const VgiResultCache &) = delete;
 	VgiResultCache &operator=(const VgiResultCache &) = delete;
 
 	void CleanupThread();
 	// Reaps stale non-revalidatable entries; returns how many were removed.
 	size_t ReapStaleLocked(std::chrono::steady_clock::time_point now);
-	void EvictToFitLocked(int64_t incoming_bytes);
+	void EvictToFitLocked(int64_t incoming_bytes, bool admitting_entry = false);
 
 	// --- Disk tier (M2): content-addressed store, cross-process ---
 	// NOTE: `disk_dir_` / `disk_max_bytes_` are guarded by `mutex_` — Configure()

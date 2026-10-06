@@ -1,4 +1,5 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
+#include "vgi_settings_defaults.hpp"
 #include "vgi_http_client.hpp"
 
 #include <algorithm>
@@ -40,11 +41,7 @@ static constexpr int64_t kMaxSafeInteger = 9007199254740991LL;
 // streaming chunks into WASM; DuckDB's native POST API currently exposes the
 // completed string only, so its check is necessarily post-read.
 static constexpr size_t kMaxBufferedRepresentationBytes = 1024ULL * 1024ULL * 1024ULL;
-#if defined(__EMSCRIPTEN__)
-static constexpr int64_t kDefaultAcceptedMaxResponseBytes = 64LL << 20;
-#else
-static constexpr int64_t kDefaultAcceptedMaxResponseBytes = 256LL << 20;
-#endif
+static constexpr int64_t kDefaultAcceptedMaxResponseBytes = defaults::HTTP_ACCEPTED_MAX_RESPONSE_BYTES;
 
 // Comma-joined list of codecs we can produce / decode, in our preference
 // order — sent on every request so the server can pick a codec for its
@@ -191,7 +188,7 @@ static uint64_t GetHttpTimeoutSeconds(ClientContext &context) {
 	if (context.TryGetCurrentSetting("vgi_http_timeout_seconds", timeout_val)) {
 		return static_cast<uint64_t>(timeout_val.GetValue<int64_t>());
 	}
-	return 300; // fallback: 5 minutes
+	return defaults::HTTP_TIMEOUT_SECONDS;
 }
 
 static int64_t GetAcceptedMaxResponseBytes(ClientContext &context) {

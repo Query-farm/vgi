@@ -1,6 +1,7 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #pragma once
 
+#include "vgi_settings_defaults.hpp"
 #include <memory>
 #include <mutex>
 #include <string>
@@ -231,7 +232,7 @@ struct VgiTableInOutGlobalState : public GlobalTableFunctionState {
 	int64_t cache_default_ttl_seconds = 0;
 	// Min stored-payload size before a stale revalidatable entry is conditionally
 	// revalidated (below it, refetch instead of a conditional request).
-	int64_t cache_revalidate_min_bytes = 262144;
+	int64_t cache_revalidate_min_bytes = defaults::RESULT_CACHE_REVALIDATE_MIN_BYTES;
 };
 
 // ============================================================================

@@ -1,4 +1,5 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
+#include "vgi_settings_defaults.hpp"
 #include "vgi_table_function_impl.hpp"
 #include "vgi_platform.hpp" // VGI_ASYNC_INIT_ENABLED
 #ifdef __EMSCRIPTEN__
@@ -1045,7 +1046,7 @@ SerializedFilters VgiSerializeFilters(ClientContext &context, const vector<colum
 	}
 
 	// Read byte size limit for join keys from settings
-	idx_t join_keys_max_bytes = 0;
+	idx_t join_keys_max_bytes = defaults::JOIN_KEYS_MAX_BYTES;
 	Value max_bytes_val;
 	if (context.TryGetCurrentSetting("vgi_join_keys_max_bytes", max_bytes_val) && !max_bytes_val.IsNull()) {
 		join_keys_max_bytes = max_bytes_val.GetValue<idx_t>();
@@ -1407,7 +1408,7 @@ struct CacheEligibility {
 	std::vector<idx_t> partition_column_indices;                 // output-schema indices, declared order
 	std::vector<LogicalType> partition_types;                    // matching declared partition types
 	std::vector<std::string> partition_names;                    // matching declared partition column names
-	uint64_t partition_max = 1024;                               // cap on distinct/enumerated partitions
+	uint64_t partition_max = defaults::RESULT_CACHE_PARTITION_MAX_ENUMERATED;                               // cap on distinct/enumerated partitions
 };
 
 //! Resolve partition column names (from the Arrow bind output schema — the index
@@ -1886,13 +1887,13 @@ VgiTableFunctionGlobalState::~VgiTableFunctionGlobalState() {
 	// freed). Do it first so no early-return leaks the reservation.
 	int64_t reserved = cap.reserved_inflight_bytes.exchange(0, std::memory_order_relaxed);
 	if (reserved > 0) {
-		VgiResultCache::Instance().ReleaseInflightCapture(reserved);
+		(*cap.cache).ReleaseInflightCapture(reserved);
 	}
 	// Any path that does NOT commit must discard a streamed temp blob (no ref is
 	// written, so an un-aborted temp would linger until the reaper sweeps it).
 	auto abort_stream = [&]() {
 		if (cap.disk_writer) {
-			VgiResultCache::Instance().AbortStreamingCapture(*cap.disk_writer);
+			(*cap.cache).AbortStreamingCapture(*cap.disk_writer);
 		}
 	};
 	// Best-effort store diagnostics. The dtor runs during query teardown while the
@@ -2001,11 +2002,11 @@ VgiTableFunctionGlobalState::~VgiTableFunctionGlobalState() {
 		for (auto &sp : cap.streams) {
 			if (!sp->batches.empty() && !DrainSubstreamToWriter(*sp, *cap.disk_writer)) {
 				skip("drain_failed");
-				VgiResultCache::Instance().AbortStreamingCapture(*cap.disk_writer);
+				(*cap.cache).AbortStreamingCapture(*cap.disk_writer);
 				return;
 			}
 		}
-		if (VgiResultCache::Instance().CommitStreamingCapture(*cap.disk_writer, *entry)) {
+		if ((*cap.cache).CommitStreamingCapture(*cap.disk_writer, *entry)) {
 			log_store("result_cache.store", {{"function", cap.key.function_name},
 			                                 {"key_hash", entry->key.HexDigest()},
 			                                 {"tier", "disk"},
@@ -2043,7 +2044,7 @@ VgiTableFunctionGlobalState::~VgiTableFunctionGlobalState() {
 	entry->total_bytes = bytes;
 	const std::string stored_key_hash = entry->key.HexDigest();
 	// Transaction-scoped entries never persist to disk (ephemeral, process-local id).
-	if (VgiResultCache::Instance().Insert(std::move(entry), /*allow_disk=*/!txn_scoped)) {
+	if ((*cap.cache).Insert(std::move(entry), /*allow_disk=*/!txn_scoped)) {
 		log_store("result_cache.store", {{"function", cap.key.function_name},
 		                                 {"key_hash", stored_key_hash},
 		                                 {"tier", "memory"},
@@ -2145,7 +2146,7 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 		// rather than handled downstream, because LookupForRevalidation() has the
 		// side effect of arming revalidation mode.
 		auto reval = split_path ? nullptr
-		                        : VgiResultCache::Instance().LookupForRevalidation(cache_eval.key, now_tp);
+		                        : GetResultCache(context).LookupForRevalidation(cache_eval.key, now_tp);
 		if (reval) {
 			// Only worth a conditional round-trip when re-streaming would cost
 			// more than the check — gate on the payload size threshold.
@@ -2153,7 +2154,7 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 			uint64_t reval_min_bytes =
 			    context.TryGetCurrentSetting("vgi_result_cache_revalidate_min_bytes", rmv) && !rmv.IsNull()
 			        ? rmv.GetValue<uint64_t>()
-			        : 262144;
+			        : defaults::RESULT_CACHE_REVALIDATE_MIN_BYTES;
 			if (static_cast<uint64_t>(reval->total_bytes) >= reval_min_bytes) {
 				revalidation_entry = std::move(reval);
 				LogResultCache(context, "result_cache.revalidate",
@@ -2165,14 +2166,14 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 			// else: too small — fall through to a plain refetch (capture below).
 		}
 		if (!revalidation_entry) {
-			auto entry = VgiResultCache::Instance().Lookup(cache_eval.key, now_tp);
+			auto entry = GetResultCache(context).Lookup(cache_eval.key, now_tp);
 			if (!entry && !cache_eval.transaction_id.empty()) {
 				// The catalog key (txn_id empty) didn't match; a scope=transaction
 				// result stored earlier in THIS transaction lives under (key + txn_id),
 				// so probe that too. A different transaction has a different id → miss.
 				VgiResultCacheKey txn_key = cache_eval.key;
 				txn_key.transaction_id = cache_eval.transaction_id;
-				entry = VgiResultCache::Instance().Lookup(txn_key, now_tp);
+				entry = GetResultCache(context).Lookup(txn_key, now_tp);
 			}
 			if (entry) {
 				// HIT — serve from cache; no worker acquire / init RPC / pool touch.
@@ -2212,7 +2213,7 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 					pkeys.push_back(
 					    BuildPartitionKey(cache_eval.key, cache_eval.partition_residual_filter_bytes, disc));
 				}
-				auto hits = VgiResultCache::Instance().LookupBatch(pkeys, now_tp);
+				auto hits = GetResultCache(context).LookupBatch(pkeys, now_tp);
 				bool all_hit = !pkeys.empty();
 				int64_t missing = 0;
 				for (auto &h : hits) {
@@ -2260,7 +2261,7 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 					gstate->max_processes = 1;
 					gstate->init_applied.store(true, std::memory_order_release);
 					gstate->client_context_for_explain = &context;
-					VgiResultCache::Instance().RecordPartitionHit();
+					GetResultCache(context).RecordPartitionHit();
 					LogResultCache(context, "result_cache.partition_hit",
 					               {{"catalog", cache_eval.catalog_name},
 					                {"function", bind_data.function_name},
@@ -2268,7 +2269,7 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 					                {"partitions", std::to_string(pkeys.size())}});
 					return unique_ptr<GlobalTableFunctionState>(std::move(gstate));
 				}
-				VgiResultCache::Instance().RecordPartitionMiss();
+				GetResultCache(context).RecordPartitionMiss();
 				LogResultCache(context, "result_cache.partition_miss",
 				               {{"catalog", cache_eval.catalog_name},
 				                {"function", bind_data.function_name},
@@ -2470,7 +2471,7 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 		// outlives any fixed window.
 		if (bind_data.split_token_ttl_seconds.has_value()) {
 			Value min_ttl_value;
-			int64_t min_ttl = 30;
+			int64_t min_ttl = defaults::SPLIT_TOKEN_MIN_TTL_SECONDS;
 			if (context.TryGetCurrentSetting("vgi_split_token_min_ttl_seconds", min_ttl_value) &&
 			    !min_ttl_value.IsNull()) {
 				min_ttl = static_cast<int64_t>(min_ttl_value.GetValue<uint64_t>());
@@ -2542,6 +2543,7 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 	// its own substream; commit happens in the gstate destructor (never-partial).
 	if (cache_eval.eligible) {
 		auto cap = std::make_shared<VgiResultCaptureCtx>();
+		cap->cache = &GetResultCache(context);
 		cap->key = cache_eval.key;
 		cap->catalog_name = cache_eval.catalog_name;
 		cap->catalog_version_frozen = cache_eval.catalog_version_frozen;
@@ -2555,10 +2557,10 @@ unique_ptr<GlobalTableFunctionState> VgiTableFunctionInitGlobal(ClientContext &c
 		Value sv;
 		cap->max_entry_bytes = context.TryGetCurrentSetting("vgi_result_cache_max_entry_bytes", sv)
 		                           ? static_cast<int64_t>(sv.GetValue<uint64_t>())
-		                           : 67108864;
+		                           : defaults::RESULT_CACHE_MAX_ENTRY_BYTES;
 		cap->max_bytes = context.TryGetCurrentSetting("vgi_result_cache_max_bytes", sv)
 		                     ? static_cast<int64_t>(sv.GetValue<uint64_t>())
-		                     : 268435456;
+		                     : defaults::RESULT_CACHE_MAX_BYTES;
 		cap->default_ttl_seconds =
 		    context.TryGetCurrentSetting("vgi_result_cache_default_ttl_seconds", sv)
 		        ? sv.GetValue<uint64_t>()
@@ -3288,8 +3290,8 @@ static void SplitAndStorePartitionEntries(ClientContext *ctx, VgiResultCaptureCt
 		pe->rows = kv.second.rows;
 		pe->total_bytes = kv.second.bytes;
 		pe->streams.push_back(std::move(s));
-		if (VgiResultCache::Instance().Insert(std::move(pe), allow_disk)) {
-			VgiResultCache::Instance().RecordPartitionStore();
+		if ((*cap.cache).Insert(std::move(pe), allow_disk)) {
+			(*cap.cache).RecordPartitionStore();
 			++stored;
 		}
 	}
@@ -3556,7 +3558,7 @@ static bool InstallBatch(ClientContext &context, const VgiTableFunctionBindData 
 			};
 			auto log_disk_too_large = [&]() {
 				cap.aborted.store(true, std::memory_order_relaxed);
-				VgiResultCache::Instance().NoteCaptureAbort();
+				GetResultCache(context).NoteCaptureAbort();
 				LogResultCache(context, "result_cache.abort",
 				               {{"key_hash", cap.key.HexDigest()},
 				                {"reason", "disk_entry_too_large"},
@@ -3618,7 +3620,7 @@ static bool InstallBatch(ClientContext &context, const VgiTableFunctionBindData 
 					if (!cap.disk_dir.empty() && cap.disk_max > 0) {
 						std::lock_guard<std::mutex> lk(cap.mu);
 						if (!cap.disk_writer && !cap.aborted.load(std::memory_order_relaxed)) {
-							cap.disk_writer = VgiResultCache::Instance().BeginStreamingCapture(
+							cap.disk_writer = GetResultCache(context).BeginStreamingCapture(
 							    cap.key, cap.disk_dir, cap.disk_max, cap.disk_compression,
 							    cap.disk_compression_level);
 							if (cap.disk_writer) {
@@ -3647,18 +3649,18 @@ static bool InstallBatch(ClientContext &context, const VgiTableFunctionBindData 
 					} else {
 						// No disk tier → abort to uncached, keep streaming to DuckDB.
 						cap.aborted.store(true, std::memory_order_relaxed);
-						VgiResultCache::Instance().NoteCaptureAbort();
+						GetResultCache(context).NoteCaptureAbort();
 						LogResultCache(context, "result_cache.abort",
 						               {{"key_hash", cap.key.HexDigest()},
 						                {"reason", "entry_too_large"},
 						                {"bytes_seen", std::to_string(running)}});
 					}
-				} else if (!VgiResultCache::Instance().TryReserveInflightCapture(sz)) {
+				} else if (!GetResultCache(context).TryReserveInflightCapture(sz)) {
 					// [S6] Global in-flight capture budget exhausted (too many
 					// concurrent captures) — abort THIS one to uncached, keep
 					// streaming. Bounds total transient capture RAM under load.
 					cap.aborted.store(true, std::memory_order_relaxed);
-					VgiResultCache::Instance().NoteCaptureAbort();
+					GetResultCache(context).NoteCaptureAbort();
 					LogResultCache(context, "result_cache.abort",
 					               {{"key_hash", cap.key.HexDigest()},
 					                {"reason", "inflight_budget"},
@@ -3712,7 +3714,7 @@ static void MaybeSlideRevalidatedEntry(ClientContext &context, const VgiTableFun
 	if (!cc.last_modified.empty()) {
 		fresh->last_modified = cc.last_modified;
 	}
-	VgiResultCache::Instance().Insert(fresh);
+	GetResultCache(context).Insert(fresh);
 	LogResultCache(context, "result_cache.revalidate",
 	               {{"catalog", global_state.revalidation_entry->catalog_name},
 	                {"function", bind_data.function_name},

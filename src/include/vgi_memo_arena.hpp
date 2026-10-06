@@ -15,9 +15,11 @@
 //
 // The arena is PURE arrow + std — no DuckDB types — so the operators convert at
 // the boundary (they already hold the worker output as an arrow::RecordBatch).
-// Arenas live in the process-wide VgiMemoArenaRegistry, keyed by a static-key
+// Arenas live in the database-owned VgiMemoArenaRegistry, keyed by a static-key
 // fingerprint, NOT in the VgiResultCache LRU (heterogeneous per-slot expiry would
 // mis-fire the whole-entry staleness reaper).
+
+#include "vgi_settings_defaults.hpp"
 
 #include <chrono>
 #include <cstdint>
@@ -32,7 +34,10 @@
 #include <arrow/type.h>
 
 namespace duckdb {
+class ClientContext;
 namespace vgi {
+class VgiMemoArenaRegistry;
+VgiMemoArenaRegistry &GetMemoArenaRegistry(ClientContext &context);
 
 // ----------------------------------------------------------------------------
 // PerValueDiskBackend — optional persistence for arena slots
@@ -140,8 +145,8 @@ public:
 
 	// Attach a persistence backend + this arena's static-key fingerprint. When set, Store
 	// also persists new slots and a cold arena can be hydrated (LoadFromBackend). The
-	// backend outlives all arenas (owned by the registry singleton), so a raw pointer.
-	void SetPersistence(PerValueDiskBackend *backend, std::string static_fp) {
+	// backend is shared so outstanding arenas survive configuration changes.
+	void SetPersistence(std::shared_ptr<PerValueDiskBackend> backend, std::string static_fp) {
 		backend_ = backend;
 		static_fp_ = std::move(static_fp);
 	}
@@ -195,7 +200,7 @@ private:
 	uint64_t tick_ = 0;
 	std::unordered_map<std::string, VgiMemoSlot> slots_;
 	std::vector<ArenaValidator> validators_;
-	PerValueDiskBackend *backend_ = nullptr; // optional; owned by the registry
+	std::shared_ptr<PerValueDiskBackend> backend_; // retained while this arena is in use
 	std::string static_fp_;
 
 	// Serialize the newly-stored slots (their rows sliced from `batch`, offset held in the
@@ -216,7 +221,7 @@ private:
 };
 
 // ----------------------------------------------------------------------------
-// Process-wide arena registry
+// Database-owned arena registry
 // ----------------------------------------------------------------------------
 // Keyed by a static-key fingerprint (SHA-256 of the exchange static key, minus the
 // per-value input_hash). Holds shared_ptr<VgiMemoArena> so a reader that fetched an
@@ -235,8 +240,10 @@ public:
 
 	// Fold an arena's footprint change into the global byte budget and evict-to-fit
 	// (whole arenas, coldest first). Called by an arena after append/compaction.
-	// Returns false if the growth cannot be accommodated (caller drops the append).
-	bool NoteFootprintDelta(const std::string &static_fp, int64_t delta);
+	// Returns false if that arena is no longer retained; active readers can finish
+	// with their shared snapshot. The pointer prevents accounting an old snapshot
+	// against a replacement arena with the same key.
+	bool NoteFootprintDelta(const std::string &static_fp, int64_t delta, const VgiMemoArena *arena);
 
 	void SetMaxBytes(int64_t max_bytes);
 	// Attach the persistence backend (null = memory-only). New arenas hydrate from it on
@@ -264,7 +271,7 @@ public:
 private:
 	std::mutex mu_;
 	int64_t total_bytes_ = 0;
-	int64_t max_bytes_ = 256LL * 1024 * 1024;
+	int64_t max_bytes_ = defaults::RESULT_CACHE_MAX_BYTES;
 	uint64_t tick_ = 0;
 	struct Entry {
 		std::shared_ptr<VgiMemoArena> arena;

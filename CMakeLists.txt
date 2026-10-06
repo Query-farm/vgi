@@ -283,6 +283,7 @@ include_directories(duckdb/third_party/miniz)
 
 set(EXTENSION_SOURCES
 src/vgi_extension.cpp
+src/vgi_settings.cpp
 src/query_farm_telemetry.cpp
 src/vgi_telemetry.cpp
 src/vgi_telemetry_util.cpp
@@ -569,6 +570,20 @@ if((BUILD_VGI_FILTER_V2_TESTS OR DEFINED ENV{BUILD_VGI_FILTER_V2_TESTS} OR BUILD
   target_link_libraries(vgi_filter_v2_tests
     ${EXTENSION_NAME}
     duckdb_static
+    dummy_static_extension_loader)
+
+  add_executable(vgi_settings_tests
+    test/cpp/test_main.cpp
+    test/cpp/test_settings.cpp)
+  target_include_directories(vgi_settings_tests PRIVATE
+    src/include
+    duckdb/src/include
+    duckdb/extension/core_functions/include
+    duckdb/third_party/catch)
+  target_link_libraries(vgi_settings_tests
+    ${EXTENSION_NAME}
+    duckdb_static
+    core_functions_extension
     dummy_static_extension_loader)
 endif()
 

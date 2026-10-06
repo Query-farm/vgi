@@ -1,4 +1,5 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
+#include "vgi_settings_defaults.hpp"
 #include "vgi_oauth.hpp"
 
 #include <cctype>
@@ -895,7 +896,7 @@ static void PrintPromptIfColab(const std::string &msg) {
 // The interactive-flow budget, in seconds. Read fresh per flow so a `SET` takes
 // effect without re-attaching.
 static int64_t GetOAuthTimeoutSeconds(ClientContext &context) {
-	int64_t timeout_seconds = 120;
+	int64_t timeout_seconds = defaults::OAUTH_TIMEOUT_SECONDS;
 	Value timeout_val;
 	if (context.TryGetCurrentSetting("vgi_oauth_timeout_seconds", timeout_val)) {
 		timeout_seconds = timeout_val.GetValue<int64_t>();
@@ -1169,7 +1170,7 @@ OAuthTokenSet PerformAuthFlow(const OAuthChallenge &challenge,
                                ClientContext &context,
                                OAuthRefreshContext &refresh_ctx_out) {
 	// Read flow setting
-	std::string flow = "auto";
+	std::string flow = defaults::OAUTH_FLOW;
 	Value flow_val;
 	if (context.TryGetCurrentSetting("vgi_oauth_flow", flow_val)) {
 		flow = flow_val.GetValue<std::string>();
@@ -1702,7 +1703,7 @@ static OAuthTokenSet PerformPKCEFlowImpl(const OAuthChallenge &challenge,
 	// Valid values: none (default, omit parameter), login, select_account, consent.
 	// See: https://openid.net/specs/openid-connect-core-1_0.html#AuthRequest
 	{
-		std::string prompt = "none";
+		std::string prompt = defaults::OAUTH_PROMPT;
 		Value prompt_val;
 		if (context.TryGetCurrentSetting("vgi_oauth_prompt", prompt_val)) {
 			prompt = prompt_val.GetValue<std::string>();

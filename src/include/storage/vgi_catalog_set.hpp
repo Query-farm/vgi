@@ -1,6 +1,7 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #pragma once
 
+#include "vgi_settings_defaults.hpp"
 #include <atomic>
 #include <functional>
 #include <mutex>
@@ -186,7 +187,7 @@ protected:
 	// path — no string lookups, no map traversals — but resolved lazily
 	// once via ResolveEagerLoadParamsLocked the first time it matters.
 	int64_t estimated_count_ = 1;
-	int64_t threshold_ = 1000;
+	int64_t threshold_ = vgi::defaults::EAGER_LOAD_THRESHOLD;
 	bool eager_load_resolved_ = false;
 };
 

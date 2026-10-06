@@ -333,7 +333,7 @@ void VgiCatalog::ClearCache(bool force) {
 		// disk shard so we drop ONLY this identity's on-disk entries.
 		auto identity = vgi::BuildCatalogIdentityScope(attach_parameters_->catalog_name(),
 		                                               attach_parameters_->auth());
-		vgi::VgiResultCache::Instance().FlushCatalog(attach_parameters_->catalog_name(), identity);
+		vgi::GetResultCache(GetDatabase()).FlushCatalog(attach_parameters_->catalog_name(), identity);
 	}
 	{
 		// A revalidation snapshot not yet taken predates whatever this clear is

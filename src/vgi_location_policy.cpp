@@ -1,5 +1,6 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #include "vgi_location_policy.hpp"
+#include "vgi_settings.hpp"
 
 #include "vgi_logging.hpp"
 #include "vgi_transport.hpp"
@@ -222,13 +223,12 @@ void CheckLocationPolicy(ClientContext &context, const std::string &location, Lo
 	}
 }
 
+void ApplyAllowedTransportsSetting(ClientContext &context, SetScope scope, Value &parameter) {
+	AllowedTransportsSetCallback(context, scope, parameter);
+}
+
 void RegisterLocationPolicySetting(DBConfig &config, VgiLocationPolicy &policy) {
-	config.AddExtensionOption(kSettingName,
-	                          "Comma-separated worker LOCATION transports ATTACH / vgi_catalogs() may use: all "
-	                          "(default), none, or any of subprocess, launch, unix, oci, github, database, http, "
-	                          "https, tcp, httpi, iroh, worker. Narrow-only: once restricted it cannot be widened or "
-	                          "reset for the life of the database instance.",
-	                          LogicalType::VARCHAR, Value("all"), AllowedTransportsSetCallback, SetScope::GLOBAL);
+	RegisterVgiSetting(config, kSettingName);
 	// A value given at database open (e.g. duckdb.connect(config=...)) is copied
 	// into the option WITHOUT invoking the callback, so seed from what is stored.
 	// A bad value throws here: failing the load is the fail-closed outcome.

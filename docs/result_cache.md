@@ -38,8 +38,10 @@ can route to different data/locations. Worker-advertised `ttl` is clamped to `VG
 (HTTP; bearer alice/bob), `cache/at_isolation.test`, `cache/projection_pushdown.test`,
 `cache/poison{,_external}.test` (never-partial under mid-stream error / external-resolution failure).
 
-**Architecture.** Leaked process-wide singleton `VgiResultCache` (LRU + byte caps + background
-TTL/disk reaper, mirrors `VgiWorkerPool`). Three hooks in the table-function scan: (A) parse
+**Architecture.** Each database instance owns its `VgiResultCache` (LRU + byte caps + background
+TTL/disk reaper) and per-value memo registry. Cache resource settings are GLOBAL within that
+database; separate databases have independent memory caches and counters. The reaper is stopped
+and joined when the database closes. See [settings scope and budget accounting](reference.md#extension-settings). Three hooks in the table-function scan: (A) parse
 `vgi.cache.*` off each batch in `FunctionConnection::ReadDataBatch` → `GetLastCacheControl()`;
 (B) capture per-thread substreams in `InstallBatch` with an all-EOS never-partial commit in the
 gstate destructor (+ per-entry size-ceiling abort); (C) on a hit, `InitGlobal` short-circuits the
@@ -108,7 +110,7 @@ spill wiring (`VgiResultCaptureCtx.disk_writer`/`spilling`, `InstallBatch`, gsta
 
 **Streaming disk serve for results larger than RAM (S8).** On an in-memory miss, `Lookup` first
 `PeekDiskRefBytes` (a cheap ref read): entries **≤ `max_entry_bytes`** take `LoadFromDisk` (materialize
-+ adopt into the memory LRU for fast repeat hits); entries **> `max_entry_bytes`** take
++ adopt into the memory LRU for fast repeat hits if they also fit `max_bytes`); entries **> `max_entry_bytes`** take
 `LoadFromDiskStreaming`, which reads only the blob **header + per-batch TOC** (fixed fields + partition
 values, seeking past each IPC payload) and records `disk_ipc_offset`/`disk_ipc_length` per
 `VgiCachedBatch` — the multi-GB payload is never read at load. The disk-backed entry is served but **not**
@@ -118,8 +120,7 @@ held `FileHandle`) and does a positioned `FileSystem::Read` of just `disk_ipc_le
 `arrow::io::BufferReader` → `RecordBatchStreamReader`. One batch resident at a time → RAM stays flat
 regardless of result size (a 194 MB entry serves at ~34 MB peak RSS). Positioned pread, **not** mmap:
 replay is a single sequential pass (mmap's random-access/zero-copy wins don't apply), it needs no
-blob-format change, and it avoids handing DuckDB Arrow buffers whose lifetime collides with the leaked
-singleton's Arrow-static-destruction rationale. The re-hash integrity check (D) is skipped on the
+blob-format change, and it keeps each replay buffer alive only while its batch is in use. The re-hash integrity check (D) is skipped on the
 streaming path (it would require reading the whole blob); the content-addressed name + `keyfp` still bind
 the object to the key, and a corrupt batch throws cleanly at IPC-decode on replay. The `result_cache.hit`
 log carries `tier=disk_streaming` vs `tier=memory` so the streaming path is test-observable.
@@ -138,7 +139,7 @@ surfaces that init-request metadata to the producer's first `process()` — so `
 identically. Detection/consumption (`GetLastCacheControl` → `MaybeSlideRevalidatedEntry` → replay swap)
 is transport-agnostic (the 304 arrives in the `/init` response buffer over HTTP).
 
-**Files:** `src/vgi_result_cache.cpp` (singleton + disk tier + revalidation lookup),
+**Files:** `src/vgi_result_cache.cpp` (database cache + disk tier + revalidation lookup),
 `src/vgi_cached_replay_connection.cpp` (serve), `src/vgi_result_cache_functions.cpp` (diagnostics),
 `src/include/vgi_cache_control.hpp` (vocabulary), plus hooks in `vgi_function_connection.cpp`
 (first-tick conditional metadata) / `vgi_http_function_connection.cpp` / `vgi_table_function_impl.cpp`
@@ -163,7 +164,7 @@ abort,revalidate}` event via `VGI_LOG` (queryable in `duckdb_logs WHERE type='VG
 signal, vs inferring from an absent abort); `store_skipped {reason=not_cacheable|no_freshness|
 immediately_stale|transaction_scoped_spill|drain_failed|…}` fires on the silent refusal branches.
 `EXPLAIN ANALYZE` surfaces per-operator cache effectiveness in the plan box (complementing the
-process-global `vgi_result_cache_stats()`): the producer table-function scan shows `Cache: hit
+database-wide `vgi_result_cache_stats()`): the producer table-function scan shows `Cache: hit
 (memory|disk_streaming)` on a hit and `Cache: miss` on an eligible miss (a hit skips the worker
 entirely — `VgiTableFunctionDynamicToString`; the `cache_eligible` gstate flag drives the miss
 label so an *ineligible* scan gets no line). The **exchange-mode** operators report too: the
@@ -177,7 +178,7 @@ pre-execution so it CAN'T carry runtime counters — the post-exec hooks above a
 The streaming table-in-out map (DuckDB's own `PhysicalTableInOutFunction`) and scalar per-value
 have no owned-operator surface, so they stay on `vgi_result_cache_stats()` / `duckdb_logs`. Test:
 `cache/explain_stats.test` (both transports). Cleanup (LRU eviction + TTL/disk reaping) runs on
-the context-less singleton / background thread and emits **no** `duckdb_logs` events; observe it via
+the context-less cache / background thread and emits **no** `duckdb_logs` events; observe it via
 `vgi_result_cache_stats()` (the `evictions_*` / `capture_aborts` counters — the only SQL surface for
 reaper work), `vgi_result_cache(include_disk := true)` (memory **and** disk-only entries), and `glob()`
 (disk `objects/`+`refs/`). Reap runs on a 1s wall-clock-keyed thread, so
@@ -260,7 +261,7 @@ The result cache above is producer-mode (table-function) only — its key is **s
 (table-in-out, correlated LATERAL, buffered) also depend on **input data**, so their
 key gains one field — `VgiResultCacheKey::input_hash` (empty for producer entries, so
 producer keys are byte-identical). Everything else is **shared**: the same
-`VgiResultCache` singleton (LRU/byte caps/disk tier), stats (`vgi_result_cache_stats()`),
+database-owned `VgiResultCache` (LRU/byte caps/disk tier), stats (`vgi_result_cache_stats()`),
 diagnostics (`vgi_result_cache()`), the auth-folded `identity_scope` security boundary,
 `catalog_version`/DDL invalidation (`vgi_clear_cache()`), the `vgi_result_cache` setting
 + per-catalog `cache` opt-out, opt-in via `vgi.cache.*` on the **output**, and the
@@ -312,7 +313,7 @@ All exchange entries participate in the **on-disk tier** (`allow_disk=true`) for
 cross-process + cross-restart warm cache, same as producer entries — the disk tier is off
 by default (needs `vgi_result_cache_dir`), so this only persists when configured.
 `BuildExchangeCacheKeyStatic` calls `SyncResultCacheSettings` (mirroring the producer's
-`ConfigureIfChanged`) so `SET vgi_result_cache_dir/…` reaches the singleton on the exchange
+`ConfigureIfChanged`) so `SET vgi_result_cache_dir/…` reaches the database cache on the exchange
 path; `DeserializeCachedRecordBatch` is disk-aware (positioned-reads a streaming entry's
 batch from the blob). Transaction scope is refused for exchange entries in v1.
 
@@ -356,7 +357,7 @@ dead-writer reclaim are follow-ups (phases 3–4). See
 **Bounded buffered capture ([S6]).** Unlike the producer path (which spills a large capture to
 a streaming disk blob), the buffered operator accumulates the whole-input result in RAM
 (`capture_batches`) before the gstate dtor commits — so it is bounded **during** capture:
-a capture crossing `vgi_result_cache_max_entry_bytes` **or** the process-global
+a capture crossing `vgi_result_cache_max_entry_bytes` **or** the database-wide
 `vgi_result_cache_max_inflight_bytes` budget (`arrow::util::TotalBufferSize` per batch,
 `TryReserveInflightCapture`) aborts to uncached, drops the accumulated batches, and keeps
 streaming to DuckDB (`result_cache.abort` → `capture_aborts`). The reserved budget is released

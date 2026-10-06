@@ -1,7 +1,10 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #define DUCKDB_EXTENSION_MAIN
 
+#include "vgi_settings_defaults.hpp"
 #include "vgi_extension.hpp"
+#include "vgi_settings.hpp"
+#include "vgi_memo_arena.hpp"
 
 #include "vgi_platform.hpp"
 
@@ -947,6 +950,17 @@ public:
 		return dispatcher_;
 	}
 
+	static vgi::VgiResultCache &ResultCache(DatabaseInstance &db) {
+		auto ext = Find(db);
+		if (!ext) { throw InternalException("VGI extension is not loaded"); }
+		return *ext->result_cache_;
+	}
+	static vgi::VgiMemoArenaRegistry &MemoArenas(DatabaseInstance &db) {
+		auto ext = Find(db);
+		if (!ext) { throw InternalException("VGI extension is not loaded"); }
+		return *ext->memo_arenas_;
+	}
+
 	vgi::VgiLocationPolicy &GetLocationPolicy() {
 		return location_policy_;
 	}
@@ -1208,6 +1222,8 @@ private:
 	vgi::VgiCancelDispatcher dispatcher_;
 	// Effective vgi_allowed_transports allowlist (narrow-only). See vgi_location_policy.hpp.
 	vgi::VgiLocationPolicy location_policy_;
+	std::unique_ptr<vgi::VgiResultCache> result_cache_ = std::make_unique<vgi::VgiResultCache>();
+	std::unique_ptr<vgi::VgiMemoArenaRegistry> memo_arenas_ = std::make_unique<vgi::VgiMemoArenaRegistry>();
 	mutable std::mutex secret_mutex_;
 	std::map<std::string, vgi::VgiRemoteSecretStorage *> secret_providers_;
 	int64_t next_secret_offset_ = 100;
@@ -2481,7 +2497,7 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 			}
 		}
 		// Default for missing keys is 1000 (per setting docs); ObjectCountsFromMap fills in.
-		eager_thresholds = ObjectCountsFromMap(threshold_map, 1000);
+		eager_thresholds = ObjectCountsFromMap(threshold_map, vgi::defaults::EAGER_LOAD_THRESHOLD);
 	}
 
 	// Auto-register Orchard's remote secret provider when the catalog advertises
@@ -2509,7 +2525,7 @@ static unique_ptr<Catalog> VgiCatalogAttach(optional_ptr<StorageExtensionInfo> s
 				    catalog_name, secret_endpoint);
 			}
 			// Default cache TTL frozen per-provider at attach time.
-			int64_t default_ttl = 300;
+			int64_t default_ttl = vgi::defaults::SECRET_DEFAULT_TTL_SECONDS;
 			Value ttl_val;
 			if (context.TryGetCurrentSetting("vgi_secret_default_ttl_seconds", ttl_val) && !ttl_val.IsNull()) {
 				default_ttl = ttl_val.GetValue<int64_t>();
@@ -3585,435 +3601,13 @@ static void LoadInternal(ExtensionLoader &loader) {
 		}
 	}
 
-	// Register HTTP timeout setting
-	// Worker batch validation (vgi_batch_validation.hpp). A worker's Arrow batches
-	// are checked before DuckDB reads them; `full` is the safe default.
-	config.AddExtensionOption(
-	    vgi::kWorkerBatchValidationSetting,
-	    "How thoroughly Arrow batches received from VGI workers are validated before use: full (default; every "
-	    "offset, UTF-8 string and dictionary index), structural (buffer sizes and lengths only), or none",
-	    LogicalType::VARCHAR, Value("full"), [](ClientContext &, SetScope, Value &parameter) {
-		    // Reject typos; store the canonical spelling.
-		    auto level = vgi::ParseWorkerBatchValidation(parameter.IsNull() ? std::string() : parameter.ToString());
-		    parameter = Value(vgi::WorkerBatchValidationName(level));
-	    });
-
-	config.AddExtensionOption("vgi_http_timeout_seconds",
-	                          "Timeout in seconds for VGI HTTP requests (catalog, init, and exchange operations)",
-	                          LogicalType::BIGINT, Value::BIGINT(300));
-	config.AddExtensionOption("vgi_iroh_connect_timeout_seconds",
-	                          "Timeout in seconds for Iroh endpoint resolution and QUIC connection establishment",
-	                          LogicalType::BIGINT, Value::BIGINT(30));
-	config.AddExtensionOption("vgi_iroh_io_timeout_seconds",
-	                          "Idle read/write timeout in seconds for native Iroh VGI streams",
-	                          LogicalType::BIGINT, Value::BIGINT(300));
-
-	config.AddExtensionOption(
-	    "vgi_http_accepted_max_response_bytes",
-	    "Decoded Arrow IPC bytes accepted per VGI HTTP response (minimum 65536; advertised to the worker)",
-	    LogicalType::BIGINT,
-#if defined(__EMSCRIPTEN__)
-	    Value::BIGINT(64LL << 20));
-#else
-	    Value::BIGINT(256LL << 20));
-#endif
-
-	config.AddExtensionOption(
-	    "vgi_secret_default_ttl_seconds",
-	    "Default cache TTL (seconds) for credentials fetched from an Orchard remote secret provider. "
-	    "Capped per-credential by the credential's own expiry. Read at ATTACH and frozen per-provider.",
-	    LogicalType::BIGINT, Value::BIGINT(300));
-
-	// Register OAuth settings
-	config.AddExtensionOption("vgi_oauth_timeout_seconds",
-	                          "Window in seconds for a human to complete interactive OAuth (device-code or "
-	                          "browser/PKCE) authentication. Further capped by the provider's token expires_in.",
-	                          LogicalType::BIGINT, Value::BIGINT(120));
-	config.AddExtensionOption("vgi_oauth_enabled",
-	                          "Enable interactive OAuth (PKCE or device-code) authentication on HTTP 401. "
-	                          "Set false to fail fast instead of prompting.",
-	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
-	config.AddExtensionOption("vgi_oauth_flow",
-	                          "OAuth flow type: auto (default), device_code, or pkce",
-	                          LogicalType::VARCHAR, Value("auto"));
-	config.AddExtensionOption("vgi_oauth_prompt",
-	                          "OAuth prompt behavior: none (default), login, select_account, or consent",
-	                          LogicalType::VARCHAR, Value("none"));
-	config.AddExtensionOption("vgi_oauth_cache",
-	                          "OAuth credential cache: auto (persistent on macOS/Windows, memory on Linux), "
-	                          "persistent, memory, or none",
-	                          LogicalType::VARCHAR, Value("auto"));
-
-	// Register async prefetch setting. Default is off: async prefetch returns
-	// SourceResultType::BLOCKED from table-scan sources, which DuckDB's
-	// PositionalTableScanner operator does not handle (it throws
-	// NotImplementedException). Other join forms (CROSS / NATURAL / ASOF /
-	// LATERAL / INNER / HASH) route through PipelineExecutor and suspend
-	// correctly on BLOCKED, so users running queries without POSITIONAL JOIN
-	// can opt in via ``SET vgi_async_prefetch=true;`` to reclaim the
-	// subprocess-RPC latency hiding.
-	config.AddExtensionOption("vgi_async_prefetch",
-	                          "Enable async I/O prefetch for VGI table function scans (default off: "
-	                          "DuckDB's POSITIONAL JOIN operator does not handle BLOCKED sources)",
-	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
-	config.AddExtensionOption("vgi_cancel_enabled",
-	                          "Notify VGI workers (on both subprocess and HTTP transports) when a stream is torn "
-	                          "down early so their on_cancel hook can release resources. Set to false to disable: "
-	                          "destructors skip the cancel dispatch entirely, on_cancel is never invoked, and "
-	                          "workers learn the stream is gone only via normal stream-close / HTTP TTL.",
-	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
-
-	// DuckDB's dynamic_or_filter_threshold is authoritative for exact runtime
-	// IN filters. VGI only applies an independent encoded-size limit.
-	config.AddExtensionOption("vgi_join_keys_max_bytes",
-	                          "Max estimated byte size for join keys batch (skip pushdown if exceeded)",
-	                          LogicalType::UBIGINT, Value::UBIGINT(67108864)); // 64MB
-
-	// =========================================================================
-	// The multi-scan rewriter runs pre-optimize. It
-	// replaces the marker LogicalGet with a LogicalSetOperation(UNION_ALL,
-	// [LogicalGet(vgi_fn), ...]) before DuckDB's standard filter pushdown.
-	//
-	// Phase-split rationale (PRE-pushdown rewrite vs. POST-pushdown rewrite
-	// for buffered_table) is documented at the buffered_table registration
-	// site below. The multi-scan rewriter is intentionally pre-pushdown so
-	// that DuckDB's standard filter-pushdown distributes parent filters
-	// into each arm after we've produced LogicalSetOperation. =========================================
-	// Split-based scans: plan() once for named, independently redeemable units,
-	// then init() per split. Client-side kill switch ONLY — setting it false stops
-	// DuckDB calling plan(); it makes no promise about the worker. A worker that
-	// migrated fully to splits and dropped its queue_push/queue_pop path will fail
-	// loudly here, which is correct: silently returning some other set of rows
-	// would be worse. Same emergency-rollback shape as vgi_multi_branch_scans and
-	// vgi_table_buffering. Read at BIND, not init.
-	config.AddExtensionOption(
-	    "vgi_split_scans",
-	    "Use the split-based scan path for workers that advertise supports_splits: "
-	    "plan() the scan into named, independently redeemable units, then init() per "
-	    "split. Set to false to fall back to primary/secondary init. Emergency-rollback "
-	    "knob; a worker that only implements splits will then fail loudly.",
-	    LogicalType::BOOLEAN, Value::BOOLEAN(true));
-
-	// Requested split size, handed to the worker as ``target_split_bytes``. DuckDB
-	// has no natural byte target of its own — it claims splits greedily as
-	// interchangeable units — so the default is 0, meaning "omit the field and let
-	// the worker size its own splits". A fabricated default would be actively wrong
-	// for a compute-bound worker where bytes do not predict cost.
-	config.AddExtensionOption(
-	    "vgi_target_split_bytes",
-	    "Requested size in bytes for each scan split, passed to the worker's plan() "
-	    "as target_split_bytes. 0 (the default) omits the field, leaving sizing to "
-	    "the worker.",
-	    LogicalType::UBIGINT, Value::UBIGINT(0));
-
-	config.AddExtensionOption(
-	    "vgi_multi_branch_scans",
-	    "Rewrite VGI multi-branch table scans into LogicalSetOperation(UNION_ALL, ...) "
-	    "via the optimizer extension. Set to false to disable the rewrite — multi-branch "
-	    "table scans will then throw at execution time (the marker placeholder's loud-fail). "
-	    "Emergency-rollback knob; not generally useful.",
-	    LogicalType::BOOLEAN, Value::BOOLEAN(true));
+	// Built-in settings and their validation/defaults/docs share src/vgi_settings.json.
+	vgi::RegisterVgiSettings(config);
 	vgi::RegisterVgiMultiScanRewriter(config);
-
-	// Streaming-window optimizer rule: rewrite eligible LogicalWindow ->
-	// LogicalVgiStreamingWindow. Gate on a session setting so benchmarks /
-	// fallback paths can disable it without recompiling.
-	config.AddExtensionOption("vgi_streaming_window",
-	                          "Route eligible OVER (...) queries against VGI aggregates with "
-	                          "streaming_partitioned=true through the custom streaming operator. "
-	                          "Set to false to fall back to PhysicalWindow / WindowCustomAggregator.",
-	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
 	OptimizerExtension::Register(config, VgiStreamingWindowOptimizer());
-
-	// Table sink+source function rewriter — replace LogicalGet of any
-	// TableBufferingFunction subclass with our Sink+Source physical op.
-	// Gated on a session setting so a regression has an emergency rollback
-	// path. When disabled, the loud-failure asserts in VgiTableInOutFunction /
-	// VgiTableInOutFinalize will surface a clear error rather than the
-	// pre-fix UNION-ALL corruption.
-	config.AddExtensionOption("vgi_table_buffering",
-	                          "Rewrite calls to TableBufferingFunction subclasses through "
-	                          "the Sink+Source PhysicalVgiTableBufferingFunction operator. "
-	                          "Set to false to disable the rewrite — table_buffering queries "
-	                          "will then throw a clear InternalException instead of running.",
-	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
 	OptimizerExtension::Register(config, VgiTableBufferingRewriter());
-
-	// Batched correlated LATERAL for blended VGI table-in-out functions. Replaces
-	// DuckDB's row-by-row PhysicalTableInOutFunction (one worker exchange per input
-	// row) with PhysicalVgiLateralBatch (one exchange per input chunk), recovering
-	// the input->output row mapping via worker-emitted provenance. optimize_function
-	// (post-decorrelation, opaque extension node). See docs / the operator file.
-	config.AddExtensionOption("vgi_batch_lateral",
-	                          "Batch correlated LATERAL calls to blended VGI table functions through a single "
-	                          "worker exchange per input chunk instead of DuckDB's row-by-row driver. "
-	                          "Set to false to fall back to the row-by-row PhysicalTableInOutFunction.",
-	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
 	vgi::RegisterVgiLateralBatchRewriter(config);
-
-	// Enforce Table.required_filters at bind/optimize time.
-	// Post-optimize so DuckDB's FilterPushdown has settled filters into
-	// LogicalGet::table_filters. Zero overhead for tables that don't opt in
-	// (the optimizer does an O(plan_size) walk; tables with an empty
-	// required-paths list return immediately after the VgiTableEntry cast).
 	OptimizerExtension::Register(config, VgiRequiredFiltersOptimizer());
-
-	// VgiMultiScanRewriter is pre_optimize_function (rewrites into standard DuckDB operators that
-	// benefit from filter pushdown). VgiStreamingWindowOptimizer and
-	// VgiTableBufferingRewriter above are optimize_function (post-pushdown)
-	// because their LogicalExtensionOperator outputs are opaque to pushdown.
-
-	// Register worker pool settings
-	config.AddExtensionOption("vgi_worker_pool_idle_limit_seconds",
-	                          "Maximum idle time in seconds before pooled workers are removed", LogicalType::BIGINT,
-	                          Value::BIGINT(5));
-	config.AddExtensionOption("vgi_worker_pool_max", "Default per-path pool limit for VGI workers (0 = disabled)",
-	                          LogicalType::BIGINT, Value::BIGINT(256));
-
-	// Result cache (milestone 1: in-memory tier). Caches the complete result of
-	// a worker-advertised-cacheable table-function call and serves identical
-	// future calls from memory. Double-gated: only results advertising
-	// vgi.cache.* are stored, and a catalog opts out with the `cache` ATTACH option.
-	config.AddExtensionOption("vgi_result_cache",
-	                          "Enable the VGI table-function result cache (master switch; still "
-	                          "double-gated by worker advertisement + per-catalog `cache` option)",
-	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
-	config.AddExtensionOption("vgi_result_cache_max_bytes",
-	                          "Global byte cap for the in-memory result cache (LRU eviction above it)",
-	                          LogicalType::UBIGINT, Value::UBIGINT(268435456));
-	config.AddExtensionOption("vgi_result_cache_max_entry_bytes",
-	                          "Per-entry byte cap; capture aborts (streams uncached) above it",
-	                          LogicalType::UBIGINT, Value::UBIGINT(67108864));
-	config.AddExtensionOption("vgi_result_cache_max_entries",
-	                          "Entry-count cap for the in-memory result cache (LRU eviction above it; "
-	                          "0 = unlimited). Bounds unbounded small-entry accumulation under the byte cap",
-	                          LogicalType::UBIGINT, Value::UBIGINT(131072));
-	config.AddExtensionOption("vgi_result_cache_max_inflight_bytes",
-	                          "Process-global budget for in-flight capture buffers; a capture that would "
-	                          "exceed it streams uncached (bounds concurrent-capture RAM; 0 = unbounded)",
-	                          LogicalType::UBIGINT, Value::UBIGINT(268435456));
-	config.AddExtensionOption("vgi_result_cache_disk_reap_interval_seconds",
-	                          "How often the on-disk result-cache tier is reaped (reading every ref is "
-	                          "O(total refs) I/O, so this runs on a coarser cadence than the 1s memory reap)",
-	                          LogicalType::UBIGINT, Value::UBIGINT(60));
-	config.AddExtensionOption("vgi_result_cache_default_ttl_seconds",
-	                          "Default cache TTL when a worker advertises cacheability without a ttl "
-	                          "(0 = require a worker-supplied ttl/expires)",
-	                          LogicalType::UBIGINT, Value::UBIGINT(0));
-	config.AddExtensionOption("vgi_result_cache_revalidate_min_bytes",
-	                          "Minimum stored-payload size before a stale revalidatable entry is "
-	                          "conditionally revalidated (below it, refetch instead of a conditional request)",
-	                          LogicalType::UBIGINT, Value::UBIGINT(262144));
-	config.AddExtensionOption("vgi_result_cache_dir",
-	                          "Directory for the on-disk result-cache tier (content-addressed store; "
-	                          "cross-process + cross-restart). Empty = disk tier off (memory only)",
-	                          LogicalType::VARCHAR, Value(""));
-	config.AddExtensionOption("vgi_result_cache_disk_max_bytes",
-	                          "Byte cap for the on-disk result-cache tier (0 = disk tier off)",
-	                          LogicalType::UBIGINT, Value::UBIGINT(0));
-	config.AddExtensionOption("vgi_result_cache_disk_compression",
-	                          "Compression codec for the on-disk result-cache tier (Arrow built-in IPC "
-	                          "compression, applied per batch so seek is preserved; memory tier is never "
-	                          "compressed): 'zstd' (default), 'lz4', or 'none'. Default-on when the disk "
-	                          "tier is enabled",
-	                          LogicalType::VARCHAR, Value("zstd"));
-	config.AddExtensionOption("vgi_result_cache_disk_compression_level",
-	                          "zstd compression level for the on-disk result-cache tier (ignored for "
-	                          "lz4/none). Keep it low — the default 1 is Pareto-optimal (near-zstd-3 ratio "
-	                          "at ~half the CPU)",
-	                          LogicalType::UBIGINT, Value::UBIGINT(1));
-	config.AddExtensionOption("vgi_result_cache_exchange_disk_max_refs",
-	                          "File-count cap for EXCHANGE-mode disk entries (streaming table-in-out / "
-	                          "correlated LATERAL / buffered). Every exchange memo may persist to disk "
-	                          "regardless of payload size (so a small-but-expensive result still warms the "
-	                          "cross-process cache); the reaper LRU-evicts oldest exchange refs above this "
-	                          "count so per-input-chunk fan-out can't spray unbounded files. Scoped to "
-	                          "exchange refs so a memo flood never evicts a large producer entry (0 = "
-	                          "unbounded; default 100000). Loose store only; the packed backend below "
-	                          "bounds file count structurally",
-	                          LogicalType::UBIGINT, Value::UBIGINT(100000));
-	config.AddExtensionOption("vgi_result_cache_pack",
-	                          "Route SMALL on-disk result-cache entries into append-only per-process pack "
-	                          "files + a rebuildable index (git-style loose-vs-packed split) instead of a "
-	                          "loose object+ref file pair each, so thousands of tiny per-input-chunk exchange "
-	                          "memos cost a few files. Large entries stay loose. Default ON (the disk tier "
-	                          "itself is opt-in, so this only bites once a cache dir is configured)",
-	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
-	config.AddExtensionOption("vgi_result_cache_pack_max_entry_bytes",
-	                          "Route threshold for the packed disk backend: on-disk entries below this size "
-	                          "are packed, at/above are stored as loose objects (default 262144 = 256 KB)",
-	                          LogicalType::UBIGINT, Value::UBIGINT(262144));
-	config.AddExtensionOption("vgi_result_cache_pack_target_bytes",
-	                          "Roll to a fresh pack file once the current one exceeds this size (bounds one "
-	                          "compaction unit; default 67108864 = 64 MB)",
-	                          LogicalType::UBIGINT, Value::UBIGINT(67108864));
-	config.AddExtensionOption("vgi_result_cache_pack_compaction_dead_pct",
-	                          "Compact an owned pack file when this percent of its bytes is dead "
-	                          "(expired/evicted); rewrites live records to a fresh pack and drops the old "
-	                          "(git gc). 0..100, default 50",
-	                          LogicalType::UBIGINT, Value::UBIGINT(50));
-	config.AddExtensionOption("vgi_exchange_input_dedup",
-	                          "Before an exchange-mode MAP call (scalar / streaming table-in-out / batched "
-	                          "correlated LATERAL), ship only the DISTINCT worker-input tuples in each chunk "
-	                          "to the worker and scatter the results back — turning e.g. 2048 evals over a "
-	                          "low-cardinality column into the distinct count. Compute-only (no cache); sound "
-	                          "under the same per-row-purity the cacheability opt-in asserts. Default ON",
-	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
-	config.AddExtensionOption(
-	    "vgi_result_cache_partition_scope",
-	    "Per-PARTITION result caching for SINGLE_VALUE_PARTITIONS table functions that advertise "
-	    "vgi.cache.partition_scope. When on, a cacheable partitioned scan ALSO caches its result split "
-	    "by partition value (one entry per distinct partition-value tuple), so a later =/IN-filtered "
-	    "scan on the partition column(s) serves the requested partitions from cache without the worker. "
-	    "Additive — the whole-scan entry is still stored/served. Default ON",
-	    LogicalType::BOOLEAN, Value::BOOLEAN(true));
-	config.AddExtensionOption(
-	    "vgi_split_token_min_ttl_seconds",
-	    "Shortest split-token lifetime this client will accept, in seconds. A split token expires, and "
-	    "NOTHING re-plans when it does — a distributed engine retries the serialized task it was handed, "
-	    "with no path back to the planner — so an expired token fails the query outright. The mitigation "
-	    "is to refuse the plan up front, at the one moment the shortfall is cheap to discover, rather "
-	    "than at read time after the work has been scheduled. Raise it to match a longer horizon between "
-	    "planning and reading; a worker declaring no TTL means unbounded and always passes. 0 disables "
-	    "the check. Default 30",
-	    LogicalType::UBIGINT, Value::UBIGINT(30));
-	config.AddExtensionOption(
-	    "vgi_split_plan_max_pages",
-	    "Cap on how many pages of scan-planning the client will follow before refusing. A worker may "
-	    "paginate its split enumeration by returning a cursor; a worker that never exhausts that cursor "
-	    "would otherwise hang the query, and stopping early would be worse still — it would scan a "
-	    "PARTIAL enumeration and report it as the whole answer. So a breach throws. Raise it for a "
-	    "worker that legitimately paginates a very large table: this bounds PAGES, not splits, so the "
-	    "reachable split count is this times the worker's page size, which may be far below "
-	    "the 1048576 split cap. Default 1024",
-	    LogicalType::UBIGINT, Value::UBIGINT(1024));
-	config.AddExtensionOption(
-	    "vgi_result_cache_partition_max_enumerated",
-	    "Cap on the number of distinct partitions handled per scan by the per-partition cache: bounds "
-	    "both the enumerated =/IN cross-product at serve time and the distinct-partition count at "
-	    "capture (split) time. Over the cap, the scan falls back to the whole-scan cache / worker. "
-	    "Default 1024",
-	    LogicalType::UBIGINT, Value::UBIGINT(1024));
-	config.AddExtensionOption("vgi_result_cache_per_value",
-	                          "CEILING (not an enabler) over per-VALUE memoization for exchange-mode maps: "
-	                          "after input dedup, memoize the worker output keyed on the individual input "
-	                          "tuple, so a fully-warm distinct set serves without the worker (cross-chunk / "
-	                          "cross-query / cross-restart value reuse the per-chunk cache misses). The tier "
-	                          "is OFF unless the worker advertises `vgi.cache.per_value` on its output batch, "
-	                          "because a per-value serve's fixed cost (key probe + decode + assembly) only "
-	                          "pays back when one worker call is dearer than that — for a cheap map it is a "
-	                          "large net loss. Setting this false vetoes the tier even for a worker that asks "
-	                          "for it; setting it true does NOT enable it. Default true (no veto)",
-	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
-	config.AddExtensionOption("vgi_result_cache_per_value_max_stores_per_chunk",
-	                          "Cap on how many NEW per-value memo entries a single input chunk may store "
-	                          "(0 = unlimited). Bounds entry-count amplification on a high-cardinality input "
-	                          "(one distinct value → one tiny entry): a chunk memoizes at most this many new "
-	                          "values, the rest are recomputed next time. A cap on STORES, not lookups, so it "
-	                          "never breaks store-then-hit for a low-cardinality workload (K new < cap → all "
-	                          "stored). Default 256",
-	                          LogicalType::UBIGINT, Value::UBIGINT(256));
-	config.AddExtensionOption("vgi_result_cache_per_value_disk_max_bytes",
-	                          "Cap on the on-disk size (bytes) of the per-value memo SQLite store when "
-	                          "vgi_result_cache_dir is set. Over the cap, the backend reaps expired rows and "
-	                          "evicts least-recently-used entries (LRU) to stay under it — enforced on store "
-	                          "(a cache miss), off the hot path. 0 = unlimited. Default 1 GiB",
-	                          LogicalType::UBIGINT, Value::UBIGINT(1073741824ULL));
-	config.AddExtensionOption("vgi_exchange_per_batch_min_distinct_ratio",
-	                          "DEPRECATED / NO-OP. Formerly suppressed the coarse per-chunk (M2) exchange-cache "
-	                          "entry when the chunk's distinct ratio (K/N) fell below this, on the theory that "
-	                          "the per-value tier already covered an identical-chunk replay. It does not: an M2 "
-	                          "serve is ONE decode per chunk while the per-value reassembly of the same rows is "
-	                          "K decodes plus a K-way concat, so suppressing M2 made the warm path ~14x slower "
-	                          "rather than cheaper. The coarse entry is now always stored when eligible and this "
-	                          "setting is ignored. Still accepted so existing scripts do not error",
-	                          LogicalType::DOUBLE, Value::DOUBLE(0.5));
-
-	// Cache directory for worker binaries downloaded via github:// / github-auto://
-	// LOCATIONs. Empty (default) → ${XDG_CACHE_HOME:-~/.cache}/vgi/releases. Must be
-	// on an exec-capable filesystem (not a noexec runtime/tmp mount).
-	config.AddExtensionOption("vgi_github_cache_dir",
-	                          "Cache directory for worker binaries downloaded from GitHub releases "
-	                          "(github:// / github-auto:// LOCATIONs); empty = ${XDG_CACHE_HOME:-~/.cache}/vgi/releases",
-	                          LogicalType::VARCHAR, Value(""));
-	config.AddExtensionOption("vgi_worker_cache_dir",
-	                          "Cache directory for immutable database worker packages; empty follows "
-	                          "vgi_github_cache_dir, then the VGI release cache directory",
-	                          LogicalType::VARCHAR, Value(""));
-	config.AddExtensionOption("vgi_worker_cache_max_bytes",
-	                          "Maximum managed worker-package cache size; 0 disables size eviction. Default 5 GiB",
-	                          LogicalType::UBIGINT, Value::UBIGINT(5ULL * 1024ULL * 1024ULL * 1024ULL));
-	config.AddExtensionOption("vgi_worker_cache_ttl_seconds",
-	                          "Evict unused worker packages older than this age; 0 disables TTL eviction. Default 30 days",
-	                          LogicalType::UBIGINT, Value::UBIGINT(30ULL * 24ULL * 60ULL * 60ULL));
-	config.AddExtensionOption("vgi_worker_package_max_bytes",
-	                          "Maximum compressed/raw database worker package size. Default 512 MiB",
-	                          LogicalType::UBIGINT, Value::UBIGINT(512ULL * 1024ULL * 1024ULL));
-	config.AddExtensionOption("vgi_worker_package_max_extracted_bytes",
-	                          "Maximum total extracted database worker package size. Default 1 GiB",
-	                          LogicalType::UBIGINT, Value::UBIGINT(1024ULL * 1024ULL * 1024ULL));
-	config.AddExtensionOption("vgi_worker_package_max_files",
-	                          "Maximum number of entries in a database worker archive. Default 10000",
-	                          LogicalType::UBIGINT, Value::UBIGINT(10000));
-
-	// Eager-load thresholds. Per-kind: a schema's estimated_object_count[kind]
-	// is compared against the corresponding value here; below or equal triggers
-	// a single bulk LoadEntries() instead of per-name single-entry RPCs. Read
-	// once at ATTACH time and snapshotted onto the VgiCatalog — mid-session SET
-	// changes do NOT affect already-attached catalogs.
-	{
-		vector<Value> threshold_keys;
-		vector<Value> threshold_values;
-		for (const char *kind : {"table", "view", "index", "scalar_function", "aggregate_function",
-		                         "table_function", "macro"}) {
-			threshold_keys.emplace_back(kind);
-			threshold_values.emplace_back(Value::BIGINT(1000));
-		}
-		auto default_threshold = Value::MAP(LogicalType::VARCHAR, LogicalType::BIGINT,
-		                                    std::move(threshold_keys), std::move(threshold_values));
-		config.AddExtensionOption(
-		    "vgi_eager_load_threshold",
-		    "Per-object-kind threshold (keyed by VgiCatalogSet::CacheKindName: table, view, index, "
-		    "scalar_function, aggregate_function, table_function, macro). When a schema's "
-		    "estimated_object_count[kind] is <= the threshold, the first GetEntry() triggers a single "
-		    "bulk LoadEntries() instead of N per-name RPCs. Read at ATTACH; mid-session SET requires "
-		    "re-ATTACH to take effect.",
-		    LogicalType::MAP(LogicalType::VARCHAR, LogicalType::BIGINT), std::move(default_threshold));
-	}
-
-	// When a worker reports estimated_object_count[kind] == 0, the client
-	// treats it as a hard guarantee and skips both the bulk
-	// catalog_schema_contents_* RPC and the per-name single-entry RPCs for
-	// that kind (table/view/index). Set this to false to disable the bypass —
-	// every elided RPC will fire instead. Used by support engineers to rule
-	// the bypass in/out without restarting the worker; read per-call so it
-	// takes effect immediately (no re-attach needed).
-	// Whole-catalog load in one RPC when the worker advertises
-	// supports_catalog_contents; read per schema-set load, so a SET takes
-	// effect on the next load (e.g. after vgi_clear_cache()).
-	config.AddExtensionOption(
-	    "vgi_catalog_contents",
-	    "Load a VGI catalog with a single catalog_contents RPC when the worker supports it, instead of "
-	    "catalog_schemas plus a catalog_schema_contents_* call per schema and kind. Set to false to force "
-	    "the per-schema RPCs.",
-	    LogicalType::BOOLEAN, Value::BOOLEAN(true));
-
-	config.AddExtensionOption(
-	    "vgi_trust_empty_kinds",
-	    "Trust worker assertions that estimated_object_count[kind] == 0 means the kind is empty "
-	    "(skip catalog_schema_contents_* RPC). Set to false to force every RPC to fire even when "
-	    "the worker reports zero — debug escape hatch for diagnosing worker bugs.",
-	    LogicalType::BOOLEAN, Value::BOOLEAN(true));
-
-	// Set default pool settings for paths without explicit per-path config
-	// (e.g., vgi_catalogs() calls that don't go through ATTACH)
-	vgi::VgiWorkerPool::Instance().SetDefaultSettings({256, 5});
-
-	// Configure the result-cache global byte caps (process-global; match the
-	// AddExtensionOption defaults above). SET on these settings tightens the
-	// per-query capture guard (read from context at scan time); the global LRU
-	// cap here governs eviction.
-	vgi::VgiResultCache::Instance().Configure(vgi::VgiResultCache::Settings{});
 
 	// Register VGI table functions
 	RegisterVgiCatalogsFunction(loader);
@@ -4211,6 +3805,15 @@ std::string VgiExtension::Version() const {
 namespace vgi {
 VgiCancelDispatcher *FindVgiCancelDispatcher(DatabaseInstance &db) {
 	return ::duckdb::VgiStorageExtension::FindCancelDispatcher(db);
+}
+VgiResultCache &GetResultCache(DatabaseInstance &db) {
+	return ::duckdb::VgiStorageExtension::ResultCache(db);
+}
+VgiResultCache &GetResultCache(ClientContext &context) {
+	return GetResultCache(*context.db);
+}
+VgiMemoArenaRegistry &GetMemoArenaRegistry(ClientContext &context) {
+	return ::duckdb::VgiStorageExtension::MemoArenas(*context.db);
 }
 VgiLocationPolicy *FindVgiLocationPolicy(DatabaseInstance &db) {
 	return ::duckdb::VgiStorageExtension::FindLocationPolicy(db);
