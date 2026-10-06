@@ -780,6 +780,12 @@ struct VgiSchemaContents {
 // worker-defined, session-scoped value).
 struct VgiCatalogContents {
 	int64_t catalog_version = 0;
+	// Opaque validator for this snapshot; nullopt when the worker does not
+	// revalidate. Sent back as if_none_match at transaction start.
+	std::optional<std::string> etag;
+	// The worker matched if_none_match: `schemas` is empty and the client
+	// keeps what it has.
+	bool not_modified = false;
 	std::vector<VgiSchemaContents> schemas;
 };
 

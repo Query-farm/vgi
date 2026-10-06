@@ -511,7 +511,18 @@ std::vector<std::shared_ptr<arrow::RecordBatch>> ContentsItems(const std::shared
 
 } // namespace
 
-VgiCatalogContents InvokeCatalogContents(const CatalogRpcContext &ctx, ClientContext &context) {
+bool UseCatalogContents(ClientContext &context) {
+	Value val;
+	if (context.TryGetCurrentSetting("vgi_catalog_contents", val) && !val.IsNull()) {
+		return val.GetValue<bool>();
+	}
+	return true;
+}
+
+VgiCatalogContents InvokeCatalogContents(const CatalogRpcContext &ctx, ClientContext &context,
+                                         const std::optional<std::string> &if_none_match) {
+	// TODO(v2 wire): send if_none_match once the params carry it.
+	(void)if_none_match;
 	auto &worker_path = ctx.params->worker_path();
 	auto params = generated::BuildCatalogContentsParams(ctx.attach_opaque_data);
 	auto response = InvokeRpcMethod(ctx, "catalog_contents", params, context);

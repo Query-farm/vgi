@@ -33,20 +33,6 @@ std::string VgiSchemaSet::GetDefaultSchema(ClientContext &context) {
 	return "main";
 }
 
-namespace {
-
-// `vgi_catalog_contents` (default true): use catalog_contents when the worker
-// advertises it. Off forces the per-schema RPCs, for comparison and debugging.
-bool UseCatalogContents(ClientContext &context) {
-	Value val;
-	if (context.TryGetCurrentSetting("vgi_catalog_contents", val) && !val.IsNull()) {
-		return val.GetValue<bool>();
-	}
-	return true;
-}
-
-} // namespace
-
 void VgiSchemaSet::LoadEntries(ClientContext &context, const std::lock_guard<std::mutex> &/*_load_lock*/) {
 	auto &vgi_catalog = catalog_.Cast<VgiCatalog>();
 	auto &attach_params = vgi_catalog.attach_parameters();
@@ -62,22 +48,14 @@ void VgiSchemaSet::LoadEntries(ClientContext &context, const std::lock_guard<std
 
 	// Whole-catalog load: one catalog_contents RPC replaces catalog_schemas plus
 	// a catalog_schema_contents_* call per schema and kind. The contents seed
-	// each schema entry's per-kind caches. Any failure falls back to the
-	// per-schema path. See docs/catalog_contents.md.
+	// each schema entry's per-kind caches. The catalog decides whether to use
+	// it (setting, reload and version rules, a snapshot already fetched by
+	// revalidation); null means the per-schema path. See docs/catalog_contents.md.
 	std::vector<vgi::VgiSchemaContents> contents;
 	bool have_contents = false;
-	if (attach_result->supports_catalog_contents && UseCatalogContents(context)) {
-		try {
-			auto snapshot = vgi::InvokeCatalogContents(rpc_ctx, context);
-			contents = std::move(snapshot.schemas);
-			have_contents = true;
-			VGI_LOG(context, "catalog.contents",
-			        {{"outcome", "loaded"},
-			         {"schemas", std::to_string(contents.size())},
-			         {"catalog_version", std::to_string(snapshot.catalog_version)}});
-		} catch (std::exception &e) {
-			VGI_LOG(context, "catalog.contents", {{"outcome", "fallback"}, {"error_message", e.what()}});
-		}
+	if (auto snapshot = vgi_catalog.TakeCatalogContents(context, rpc_ctx)) {
+		contents = std::move(snapshot->schemas);
+		have_contents = true;
 	}
 
 	std::vector<vgi::VgiSchemaInfo> schema_list;

@@ -1,0 +1,88 @@
+# name: test/sql/integration/catalog/catalog_contents_versions.test
+# description: catalog_contents version rules (docs/catalog_contents.md,
+#              "Caching and revalidation"). Version adoption: a snapshot at
+#              least as new as the version the client knows is kept and its
+#              catalog_version becomes the known one, so the next
+#              transaction-start catalog_version check does not clear it again.
+#              Fixture: vgi-python vgi/_test_fixtures/catalog_contents.py
+#              (contents_memory: DDL-capable, non-frozen, version bumped by
+#              every DDL, private per ATTACH).
+#              Gated on VGI_CATALOG_CONTENTS_WORKER (vgi-python only).
+# group: [vgi_integration_catalog]
+
+require-env VGI_CATALOG_CONTENTS_WORKER
+
+require vgi
+
+require httpfs
+
+statement ok
+CALL enable_logging(level := 'debug');
+
+statement ok
+CREATE MACRO rpc_count(m) AS (
+    SELECT COUNT(*) FROM duckdb_logs() WHERE type = 'VGI'
+      AND message LIKE '%catalog.rpc%'
+      AND message LIKE '%method=' || m || ',%');
+
+statement ok
+CREATE MACRO invalidations(a) AS (
+    SELECT COUNT(*) FROM duckdb_logs() WHERE type = 'VGI'
+      AND message LIKE '%catalog.invalidate,%' AND message LIKE '%action=' || a || '%');
+
+# ============================================================================
+# Version adoption
+# ============================================================================
+
+statement ok
+ATTACH 'contents_memory' AS mem (TYPE vgi, LOCATION '${VGI_CATALOG_CONTENTS_WORKER}');
+
+statement ok
+CREATE VIEW mem.main.v AS SELECT 3 AS x;
+
+# CREATE SCHEMA bumps the worker's version and clears the schema set; the
+# enumeration inside the same transaction reloads it with catalog_contents,
+# whose snapshot is at the new version. The client adopts that version ...
+statement ok
+BEGIN;
+
+statement ok
+CREATE SCHEMA mem.s2;
+
+query I
+SELECT schema_name FROM duckdb_schemas() WHERE database_name = 'mem' ORDER BY ALL;
+----
+main
+s2
+
+statement ok
+COMMIT;
+
+statement ok
+CALL truncate_duckdb_logs();
+
+# ... so the next transaction's catalog_version check finds nothing changed:
+# no clear, no second catalog_contents. (Binding a view starts the VGI
+# transaction; duckdb_schemas() alone would not.)
+query I
+SELECT x FROM mem.main.v;
+----
+3
+
+query I
+SELECT invalidations('noop');
+----
+1
+
+query I
+SELECT invalidations('clear_');
+----
+0
+
+query I
+SELECT rpc_count('catalog_contents') + rpc_count('catalog_schemas');
+----
+0
+
+statement ok
+DETACH mem;

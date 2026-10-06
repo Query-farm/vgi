@@ -2,7 +2,10 @@
 #pragma once
 
 #include <atomic>
+#include <memory>
 #include <mutex>
+#include <optional>
+#include <string>
 #include <vector>
 
 #include "duckdb/catalog/catalog.hpp"
@@ -15,6 +18,9 @@
 namespace duckdb {
 
 class VgiSchemaEntry;
+namespace vgi {
+struct CatalogRpcContext;
+}
 
 class VgiCatalog : public Catalog {
 public:
@@ -90,10 +96,20 @@ public:
 	void AbsorbDroppedEntry(unique_ptr<CatalogEntry> entry);
 	void AbsorbDroppedEntries(std::vector<unique_ptr<CatalogEntry>> entries);
 
-	/// Check the worker's catalog version; clear cache only if it has changed.
-	/// No-op if catalog_version_frozen is true.
-	/// Returns true if cache was cleared.
+	/// Transaction-start freshness check; clears the cache only if the catalog
+	/// changed. No-op if catalog_version_frozen is true. A catalog whose last
+	/// catalog_contents response carried an etag is revalidated with
+	/// catalog_contents(if_none_match) instead of polling catalog_version (a
+	/// full answer replaces the snapshot). Returns true if the cache was cleared.
 	bool CheckAndInvalidateCache(ClientContext &context, const std::vector<uint8_t> &transaction_opaque_data);
+
+	/// The catalog_contents snapshot the schema set should build itself from,
+	/// or nullptr to use catalog_schemas + the per-schema RPCs. Takes the
+	/// snapshot a revalidation already fetched, else calls catalog_contents
+	/// subject to the reload and version-adoption rules. Called once per
+	/// schema-set load. See docs/catalog_contents.md, "Caching and revalidation".
+	std::shared_ptr<vgi::VgiCatalogContents> TakeCatalogContents(ClientContext &context,
+	                                                             const vgi::CatalogRpcContext &rpc_ctx);
 
 	const std::string &internal_name() const {
 		return internal_name_;
@@ -124,6 +140,19 @@ public:
 private:
 	void DropSchema(ClientContext &context, DropInfo &info) override;
 
+	/// Raise the known catalog version to `version` if it is not older (a
+	/// snapshot at `version` is current). Returns false if it is older.
+	bool AdoptCatalogVersion(int64_t version);
+	/// Reloads (any schema-set load after the first) use catalog_contents only
+	/// when that cannot turn into a full download per statement: the catalog is
+	/// version-frozen, reports a non-zero version, or revalidates via an etag.
+	bool ReloadUsesCatalogContents();
+	/// catalog_contents(if_none_match = etag) at transaction start. Returns
+	/// nullopt when revalidation failed (the caller polls catalog_version),
+	/// else whether the cache was cleared.
+	std::optional<bool> RevalidateContents(ClientContext &context, const vgi::CatalogRpcContext &rpc_ctx,
+	                                       const std::string &etag);
+
 private:
 	AccessMode access_mode_;
 	std::shared_ptr<vgi::VgiAttachParameters> attach_parameters_;
@@ -139,6 +168,18 @@ private:
 	/// Last known catalog version from the worker. Initialized from attach_result.
 	/// Atomic since it can be read/written from concurrent transactions.
 	std::atomic<int64_t> last_known_catalog_version_{0};
+
+	/// catalog_contents state, guarded by contents_mutex_ (a leaf: nothing is
+	/// called while it is held).
+	std::mutex contents_mutex_;
+	/// A schema-set load already happened (the next one is a reload).
+	bool contents_loaded_once_ = false;
+	/// Etag of the snapshot the caches were built from; nullopt = the worker
+	/// does not revalidate (or the last load did not use catalog_contents).
+	std::optional<std::string> contents_etag_;
+	/// A full revalidation response, waiting for the schema set's next load.
+	/// Dropped by ClearCache (DDL), since it predates the change.
+	std::shared_ptr<vgi::VgiCatalogContents> pending_contents_;
 
 	/// Deferred-drop graveyard. Each ClearCache() (non-force) moves the
 	/// schema set's entries here so any bound query holding a raw pointer

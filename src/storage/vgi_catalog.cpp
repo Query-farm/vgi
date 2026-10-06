@@ -329,6 +329,12 @@ void VgiCatalog::ClearCache(bool force) {
 		                                               attach_parameters_->auth());
 		vgi::VgiResultCache::Instance().FlushCatalog(attach_parameters_->catalog_name(), identity);
 	}
+	{
+		// A revalidation snapshot not yet taken predates whatever this clear is
+		// for (DDL, a version bump, vgi_clear_cache()); the reload fetches anew.
+		std::lock_guard<std::mutex> lk(contents_mutex_);
+		pending_contents_.reset();
+	}
 	auto harvested = schemas.HarvestEntries();
 	if (force) {
 		// User-facing vgi_clear_cache(): purge the graveyard too. Bound
@@ -384,8 +390,22 @@ bool VgiCatalog::CheckAndInvalidateCache(ClientContext &context, const std::vect
 		return false;
 	}
 
-	// Query current version from the worker
 	vgi::CatalogRpcContext rpc_ctx{attach_parameters_, attach_result_->attach_opaque_data, transaction_opaque_data};
+
+	// Conditional revalidation replaces the catalog_version poll when the
+	// caches were built from a catalog_contents snapshot that carried an etag.
+	std::optional<std::string> etag;
+	{
+		std::lock_guard<std::mutex> lk(contents_mutex_);
+		etag = contents_etag_;
+	}
+	if (etag && attach_result_->supports_catalog_contents && vgi::UseCatalogContents(context)) {
+		if (auto cleared = RevalidateContents(context, rpc_ctx, *etag)) {
+			return *cleared;
+		}
+	}
+
+	// Query current version from the worker
 	int64_t current_version = vgi::InvokeCatalogVersion(rpc_ctx, context);
 	int64_t last_version = last_known_catalog_version_.load();
 
@@ -416,6 +436,149 @@ bool VgiCatalog::CheckAndInvalidateCache(ClientContext &context, const std::vect
 	         {"last_version", std::to_string(last_version)},
 	         {"action", "noop"}});
 	return false;
+}
+
+bool VgiCatalog::AdoptCatalogVersion(int64_t version) {
+	// Versions are monotonic within a session: keep the larger of the two, and
+	// report a snapshot older than what is already known.
+	int64_t known = last_known_catalog_version_.load(std::memory_order_acquire);
+	while (version >= known) {
+		if (version == known ||
+		    last_known_catalog_version_.compare_exchange_weak(known, version, std::memory_order_acq_rel)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+bool VgiCatalog::ReloadUsesCatalogContents() {
+	if (attach_result_->catalog_version_frozen || GetKnownCatalogVersion() != 0) {
+		return true;
+	}
+	std::lock_guard<std::mutex> lk(contents_mutex_);
+	return contents_etag_.has_value();
+}
+
+std::shared_ptr<vgi::VgiCatalogContents> VgiCatalog::TakeCatalogContents(ClientContext &context,
+                                                                         const vgi::CatalogRpcContext &rpc_ctx) {
+	if (!attach_result_ || !attach_result_->supports_catalog_contents) {
+		return nullptr;
+	}
+	std::shared_ptr<vgi::VgiCatalogContents> pending;
+	bool reload;
+	{
+		std::lock_guard<std::mutex> lk(contents_mutex_);
+		pending = std::move(pending_contents_);
+		reload = contents_loaded_once_;
+		contents_loaded_once_ = true;
+	}
+	const auto forget_etag = [&]() {
+		// Caches about to be built without catalog_contents have no etag:
+		// the next transaction start polls catalog_version instead.
+		std::lock_guard<std::mutex> lk(contents_mutex_);
+		contents_etag_.reset();
+	};
+	if (!vgi::UseCatalogContents(context)) {
+		forget_etag();
+		return nullptr;
+	}
+	if (pending) {
+		VGI_LOG(context, "catalog.contents",
+		        {{"outcome", "loaded"},
+		         {"source", "revalidation"},
+		         {"schemas", std::to_string(pending->schemas.size())},
+		         {"catalog_version", std::to_string(pending->catalog_version)}});
+		return pending;
+	}
+	// Version-0 rule: a non-frozen worker reporting version 0 without an etag
+	// has its cache cleared at every transaction start; reloading the whole
+	// catalog each time would download it per statement, so reload lazily.
+	if (reload && !ReloadUsesCatalogContents()) {
+		VGI_LOG(context, "catalog.contents", {{"outcome", "skipped"}, {"reason", "unversioned_reload"}});
+		return nullptr;
+	}
+	// Version adoption: a snapshot at least as new as the known version is
+	// current, and its version becomes the known one (so the next
+	// transaction-start check does not clear it as "changed"). An older one
+	// (a lagging replica / reordered response) is retried once, then the
+	// per-schema RPCs are used. A snapshot version of 0 means "unknown", as
+	// for catalog_version, and is accepted without adopting it.
+	for (int attempt = 1; attempt <= 2; attempt++) {
+		std::shared_ptr<vgi::VgiCatalogContents> snapshot;
+		try {
+			snapshot = std::make_shared<vgi::VgiCatalogContents>(vgi::InvokeCatalogContents(rpc_ctx, context));
+		} catch (std::exception &e) {
+			VGI_LOG(context, "catalog.contents", {{"outcome", "fallback"}, {"error_message", e.what()}});
+			forget_etag();
+			return nullptr;
+		}
+		const int64_t known = GetKnownCatalogVersion();
+		if (snapshot->catalog_version == 0 || AdoptCatalogVersion(snapshot->catalog_version)) {
+			{
+				std::lock_guard<std::mutex> lk(contents_mutex_);
+				contents_etag_ = snapshot->etag;
+			}
+			VGI_LOG(context, "catalog.contents",
+			        {{"outcome", "loaded"},
+			         {"schemas", std::to_string(snapshot->schemas.size())},
+			         {"catalog_version", std::to_string(snapshot->catalog_version)},
+			         {"etag", snapshot->etag.value_or("")}});
+			return snapshot;
+		}
+		VGI_LOG(context, "catalog.contents",
+		        {{"outcome", "stale"},
+		         {"attempt", std::to_string(attempt)},
+		         {"catalog_version", std::to_string(snapshot->catalog_version)},
+		         {"known_version", std::to_string(known)}});
+	}
+	VGI_LOG(context, "catalog.contents", {{"outcome", "fallback"}, {"error_message", "snapshot older than known catalog_version"}});
+	forget_etag();
+	return nullptr;
+}
+
+std::optional<bool> VgiCatalog::RevalidateContents(ClientContext &context, const vgi::CatalogRpcContext &rpc_ctx,
+                                                   const std::string &etag) {
+	std::shared_ptr<vgi::VgiCatalogContents> snapshot;
+	try {
+		snapshot = std::make_shared<vgi::VgiCatalogContents>(vgi::InvokeCatalogContents(rpc_ctx, context, etag));
+	} catch (std::exception &e) {
+		VGI_LOG(context, "catalog.invalidate",
+		        {{"via", "catalog_contents"}, {"action", "revalidate_failed"}, {"error_message", e.what()}});
+		std::lock_guard<std::mutex> lk(contents_mutex_);
+		contents_etag_.reset();
+		return std::nullopt;
+	}
+	const int64_t last_version = GetKnownCatalogVersion();
+	const auto log = [&](const char *action) {
+		VGI_LOG(context, "catalog.invalidate",
+		        {{"via", "catalog_contents"},
+		         {"current_version", std::to_string(snapshot->catalog_version)},
+		         {"last_version", std::to_string(last_version)},
+		         {"etag", snapshot->etag.value_or("")},
+		         {"action", action}});
+	};
+	if (snapshot->not_modified) {
+		// Same contents: keep every cache. The version may still have moved
+		// (e.g. a DDL that was undone); record it.
+		if (snapshot->catalog_version != 0) {
+			AdoptCatalogVersion(snapshot->catalog_version);
+		}
+		log("not_modified");
+		return false;
+	}
+	// The catalog changed (or the worker stopped revalidating). Replace the
+	// snapshot: clear the sets, then hand the fresh contents to the next
+	// schema-set load. An older snapshot (version went backwards) is not
+	// reused; the reload fetches its own, under the adoption rule.
+	const bool current = snapshot->catalog_version == 0 || AdoptCatalogVersion(snapshot->catalog_version);
+	log(current ? "clear_modified" : "clear_stale");
+	ClearCache();
+	std::lock_guard<std::mutex> lk(contents_mutex_);
+	contents_etag_ = current ? snapshot->etag : std::nullopt;
+	if (current) {
+		pending_contents_ = std::move(snapshot);
+	}
+	return true;
 }
 
 void VgiCatalog::DropSchema(ClientContext &context, DropInfo &info) {

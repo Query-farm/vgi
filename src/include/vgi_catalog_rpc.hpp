@@ -100,8 +100,15 @@ std::vector<VgiCatalogInfo> InvokeCatalogs(const std::string &worker_path, Clien
 std::vector<VgiSchemaInfo> InvokeCatalogSchemas(const CatalogRpcContext &ctx, ClientContext &context);
 
 // Invoke catalog_contents: every schema and all of its contents in one RPC.
-// Only call when the attach result sets supports_catalog_contents.
-VgiCatalogContents InvokeCatalogContents(const CatalogRpcContext &ctx, ClientContext &context);
+// Only call when the attach result sets supports_catalog_contents. With
+// `if_none_match` (an etag from an earlier response) the worker may answer
+// not_modified with no schemas instead.
+VgiCatalogContents InvokeCatalogContents(const CatalogRpcContext &ctx, ClientContext &context,
+                                         const std::optional<std::string> &if_none_match = std::nullopt);
+
+// The `vgi_catalog_contents` setting (default true). False means the client
+// never calls catalog_contents: neither to load nor to revalidate.
+bool UseCatalogContents(ClientContext &context);
 
 // Decode one kind of a catalog_contents schema entry (done lazily, on a set's
 // first load). function_type / macro_type use the RPC spellings
