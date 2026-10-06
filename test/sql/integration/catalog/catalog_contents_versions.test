@@ -1,13 +1,17 @@
 # name: test/sql/integration/catalog/catalog_contents_versions.test
 # description: catalog_contents version rules (docs/catalog_contents.md,
-#              "Caching and revalidation"). Version adoption: a snapshot at
-#              least as new as the version the client knows is kept and its
-#              catalog_version becomes the known one, so the next
-#              transaction-start catalog_version check does not clear it again.
-#              Fixture: vgi-python vgi/_test_fixtures/catalog_contents.py
-#              (contents_memory: DDL-capable, non-frozen, version bumped by
-#              every DDL, private per ATTACH).
-#              Gated on VGI_CATALOG_CONTENTS_WORKER (vgi-python only).
+#              "Caching and revalidation"):
+#              - version-0 rule: a non-frozen worker reporting version 0 with no
+#                etag is loaded with catalog_contents once per attach; reloads
+#                (it is cleared at every transaction start) use the lazy
+#                per-schema RPCs, so it is never re-downloaded per statement;
+#              - version adoption: a snapshot's catalog_version becomes the
+#                version the client knows, so the next transaction-start check
+#                does not treat it as changed.
+#              Fixtures: vgi-python vgi/_test_fixtures/catalog_contents.py
+#              (contents_memory: DDL-capable, version 0, no etag;
+#              contents_reval: DDL-capable, etag "gen-<version>"), private per
+#              ATTACH. Gated on VGI_CATALOG_CONTENTS_WORKER (vgi-python only).
 # group: [vgi_integration_catalog]
 
 require-env VGI_CATALOG_CONTENTS_WORKER
@@ -26,31 +30,140 @@ CREATE MACRO rpc_count(m) AS (
       AND message LIKE '%method=' || m || ',%');
 
 statement ok
+CREATE MACRO contents_events(o) AS (
+    SELECT COUNT(*) FROM duckdb_logs() WHERE type = 'VGI'
+      AND message LIKE '%catalog.contents,%' AND message LIKE '%outcome=' || o || '%');
+
+statement ok
 CREATE MACRO invalidations(a) AS (
     SELECT COUNT(*) FROM duckdb_logs() WHERE type = 'VGI'
       AND message LIKE '%catalog.invalidate,%' AND message LIKE '%action=' || a || '%');
 
 # ============================================================================
-# Version adoption
+# Version-0 rule (contents_memory: version 0, no etag)
 # ============================================================================
 
 statement ok
 ATTACH 'contents_memory' AS mem (TYPE vgi, LOCATION '${VGI_CATALOG_CONTENTS_WORKER}');
 
 statement ok
+CALL truncate_duckdb_logs();
+
+# The first load of the attach uses catalog_contents.
+statement ok
 CREATE VIEW mem.main.v AS SELECT 3 AS x;
+
+query I
+SELECT rpc_count('catalog_contents');
+----
+1
+
+query I
+SELECT rpc_count('catalog_schemas');
+----
+0
+
+# Every later statement clears the cache (version 0 = unknown) and reloads
+# lazily: catalog_schemas + the per-schema RPC it needs, never catalog_contents.
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT x FROM mem.main.v;
+----
+3
+
+query I
+SELECT x FROM mem.main.v;
+----
+3
+
+query I
+SELECT invalidations('clear_unknown');
+----
+2
+
+query I
+SELECT rpc_count('catalog_contents');
+----
+0
+
+query I
+SELECT rpc_count('catalog_schemas');
+----
+2
+
+query I
+SELECT contents_events('skipped') = 2 AND contents_events('loaded') = 0;
+----
+true
+
+# vgi_clear_cache() is a reload too.
+statement ok
+CALL vgi_clear_cache();
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT view_name FROM duckdb_views() WHERE database_name = 'mem';
+----
+v
+
+query I
+SELECT rpc_count('catalog_contents');
+----
+0
+
+# A new attach is a first load again.
+statement ok
+ATTACH 'contents_memory' AS mem2 (TYPE vgi, LOCATION '${VGI_CATALOG_CONTENTS_WORKER}');
+
+statement ok
+CALL truncate_duckdb_logs();
+
+query I
+SELECT COUNT(*) FROM duckdb_views() WHERE database_name = 'mem2';
+----
+0
+
+query I
+SELECT rpc_count('catalog_contents');
+----
+1
+
+statement ok
+DETACH mem2;
+
+statement ok
+DETACH mem;
+
+# ============================================================================
+# Version adoption (contents_reval: version bumped by every DDL)
+# ============================================================================
+
+statement ok
+ATTACH 'contents_reval' AS rv (TYPE vgi, LOCATION '${VGI_CATALOG_CONTENTS_WORKER}');
+
+statement ok
+CREATE VIEW rv.main.v AS SELECT 5 AS x;
+
+query I
+SELECT x FROM rv.main.v;
+----
+5
 
 # CREATE SCHEMA bumps the worker's version and clears the schema set; the
 # enumeration inside the same transaction reloads it with catalog_contents,
-# whose snapshot is at the new version. The client adopts that version ...
+# at the new version, which the client adopts ...
 statement ok
 BEGIN;
 
 statement ok
-CREATE SCHEMA mem.s2;
+CREATE SCHEMA rv.s2;
 
 query I
-SELECT schema_name FROM duckdb_schemas() WHERE database_name = 'mem' ORDER BY ALL;
+SELECT schema_name FROM duckdb_schemas() WHERE database_name = 'rv' ORDER BY ALL;
 ----
 main
 s2
@@ -61,28 +174,33 @@ COMMIT;
 statement ok
 CALL truncate_duckdb_logs();
 
-# ... so the next transaction's catalog_version check finds nothing changed:
-# no clear, no second catalog_contents. (Binding a view starts the VGI
-# transaction; duckdb_schemas() alone would not.)
+# ... so the next transaction-start check knows that version already: the
+# snapshot it holds is current (not_modified, version unchanged), no reload.
 query I
-SELECT x FROM mem.main.v;
+SELECT x FROM rv.main.v;
 ----
-3
+5
 
 query I
-SELECT invalidations('noop');
+SELECT invalidations('not_modified');
 ----
 1
 
 query I
-SELECT invalidations('clear_');
+SELECT COUNT(*) FROM duckdb_logs() WHERE type = 'VGI' AND message LIKE '%catalog.invalidate,%'
+  AND regexp_extract(message, 'current_version=([0-9]+)', 1) = regexp_extract(message, 'last_version=([0-9]+)', 1);
 ----
-0
+1
 
 query I
-SELECT rpc_count('catalog_contents') + rpc_count('catalog_schemas');
+SELECT rpc_count('catalog_contents');
+----
+1
+
+query I
+SELECT rpc_count('catalog_schemas') + rpc_count('catalog_version');
 ----
 0
 
 statement ok
-DETACH mem;
+DETACH rv;

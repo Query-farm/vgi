@@ -1,6 +1,8 @@
 // © Copyright 2025, 2026 Query Farm LLC - https://query.farm
 #pragma once
 
+#include <atomic>
+#include <memory>
 #include <mutex>
 #include <optional>
 
@@ -25,6 +27,10 @@ struct CatalogRpcContext;
 class VgiSchemaEntry : public SchemaCatalogEntry {
 public:
 	VgiSchemaEntry(Catalog &catalog, CreateSchemaInfo &info, const vgi::VgiSchemaInfo &schema_info);
+	//! A schema from a catalog_contents snapshot, seeded with its contents.
+	//! `info` carries only the name (from SchemaContents.path); the SchemaInfo
+	//! (comment, tags, estimated counts) is decoded on first use.
+	VgiSchemaEntry(Catalog &catalog, CreateSchemaInfo &info, std::shared_ptr<const vgi::VgiSchemaContents> seed);
 	~VgiSchemaEntry() override;
 
 public:
@@ -50,16 +56,23 @@ public:
 
 	optional_ptr<CatalogEntry> LookupEntry(CatalogTransaction transaction, const EntryLookupInfo &lookup_info) override;
 
-	const vgi::VgiSchemaInfo &GetSchemaInfo() const {
+	const vgi::VgiSchemaInfo &GetSchemaInfo() {
+		EnsureSchemaInfo();
 		return schema_info_;
 	}
+
+	//! Decode a seeded schema's SchemaInfo if not yet done, filling the entry's
+	//! comment and tags. Called before the entry is handed to a schema scan
+	//! (duckdb_schemas() & co. read comment/tags directly).
+	void EnsureSchemaInfo();
 
 	// Estimated per-kind populations from the worker. Built once at
 	// construction from ``schema_info_.estimated_object_count`` (a
 	// map<string,int64>). Read by VgiCatalogSet::ResolveEagerLoadParamsLocked
 	// to pick the eager-vs-lazy load policy for each child set without
 	// re-walking the wire-format map.
-	const VgiObjectCounts &GetEstimatedCounts() const {
+	const VgiObjectCounts &GetEstimatedCounts() {
+		EnsureSchemaInfo();
 		return estimated_counts_;
 	}
 
@@ -74,14 +87,13 @@ public:
 	std::shared_ptr<const case_insensitive_set_t> GetMacroCallableNames(const vgi::CatalogRpcContext &rpc_ctx,
 	                                                                    bool trust_empty_kinds, ClientContext &context);
 
-	// catalog_contents seeding. The schema set calls SeedContents once, when it
-	// builds this entry from a catalog_contents snapshot; each child set's first
-	// load then takes its seed instead of issuing catalog_schema_contents_*.
+	// catalog_contents seeding. The schema set builds a seeded entry from each
+	// schema of a catalog_contents snapshot; each child set's first load then
+	// takes its seed instead of issuing catalog_schema_contents_*.
 	// Each kind's seed is consumed once. Invalidating a child set (DDL) discards
 	// its untaken seed, so that set reloads through the per-schema RPC;
 	// vgi_clear_cache() / a version bump rebuilds the schema entries from a fresh
 	// catalog_contents. The seed mutex is a leaf: nothing is called while it is held.
-	void SeedContents(vgi::VgiSchemaContents &&contents);
 	//! Whether an unconsumed seed exists for a VgiCatalogSet::CacheKindName kind.
 	bool HasSeed(const std::string &kind);
 	//! Drop the unconsumed seed for a VgiCatalogSet::CacheKindName kind, so the
@@ -97,8 +109,13 @@ public:
 private:
 	VgiCatalogSet &GetCatalogSet(CatalogType type);
 
+	// Decoded lazily for a seeded entry (from info_source_); set at
+	// construction otherwise. schema_info_ready_ publishes them.
 	vgi::VgiSchemaInfo schema_info_;
 	VgiObjectCounts estimated_counts_;
+	std::shared_ptr<const vgi::VgiSchemaContents> info_source_;
+	std::mutex schema_info_mutex_;
+	std::atomic<bool> schema_info_ready_ {true};
 	VgiTableSet tables_;
 	VgiViewSet views_;
 	VgiScalarFunctionSet scalar_functions_;

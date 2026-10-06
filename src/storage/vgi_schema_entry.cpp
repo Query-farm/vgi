@@ -36,12 +36,33 @@ VgiSchemaEntry::VgiSchemaEntry(Catalog &catalog, CreateSchemaInfo &info, const v
       table_macros_(catalog, *this, CatalogType::TABLE_MACRO_ENTRY) {
 }
 
+VgiSchemaEntry::VgiSchemaEntry(Catalog &catalog, CreateSchemaInfo &info,
+                               std::shared_ptr<const vgi::VgiSchemaContents> seed)
+    : SchemaCatalogEntry(catalog, info), info_source_(seed), schema_info_ready_(false), tables_(catalog, *this),
+      views_(catalog, *this), scalar_functions_(catalog, *this), aggregate_functions_(catalog, *this),
+      table_functions_(catalog, *this), scalar_macros_(catalog, *this, CatalogType::MACRO_ENTRY),
+      table_macros_(catalog, *this, CatalogType::TABLE_MACRO_ENTRY), seed_(std::move(seed)) {
+}
+
 VgiSchemaEntry::~VgiSchemaEntry() = default;
 
-void VgiSchemaEntry::SeedContents(vgi::VgiSchemaContents &&contents) {
-	std::lock_guard<std::mutex> lock(seed_mutex_);
-	seed_ = std::make_shared<const vgi::VgiSchemaContents>(std::move(contents));
-	seed_taken_.clear();
+void VgiSchemaEntry::EnsureSchemaInfo() {
+	if (schema_info_ready_.load(std::memory_order_acquire)) {
+		return;
+	}
+	std::lock_guard<std::mutex> lock(schema_info_mutex_);
+	if (schema_info_ready_.load(std::memory_order_relaxed)) {
+		return;
+	}
+	schema_info_ = vgi::DecodeContentsSchemaInfo(*info_source_);
+	estimated_counts_ = ObjectCountsFromMap(schema_info_.estimated_object_count, /*default_value=*/1);
+	if (!schema_info_.comment.empty()) {
+		comment = Value(schema_info_.comment);
+	}
+	for (auto &tag : schema_info_.tags) {
+		tags[tag.first] = tag.second;
+	}
+	schema_info_ready_.store(true, std::memory_order_release);
 }
 
 std::shared_ptr<const vgi::VgiSchemaContents> VgiSchemaEntry::ClaimSeed(const std::string &kind) {

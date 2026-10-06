@@ -102,8 +102,9 @@ const std::unordered_map<std::string, ResponseSchema> &Registry() {
 		// --- Strictly-typed single-struct responses -----------------------
 		m["catalog_attach"] = ResponseSchema{CatalogAttachResultSchema(), nullptr, false, nullptr};
 		m["catalog_version"] = ResponseSchema{CatalogVersionResultSchema(), nullptr, false, nullptr};
-		// Each `schemas` element is one IPC-serialized SchemaContents record.
-		m["catalog_contents"] = ResponseSchema{CatalogContentsResultSchema(), SchemaContentsSchema(), false, nullptr};
+		// Typed result; `schemas` is list<struct<SchemaContents>> (validated as
+		// part of the result schema), whose binary fields are per-kind items.
+		m["catalog_contents"] = ResponseSchema{CatalogContentsResultSchema(), nullptr, false, nullptr};
 		m["catalog_transaction_begin"] =
 		    ResponseSchema{CatalogTransactionBeginResultSchema(), nullptr, false, nullptr};
 		m["table_function_cardinality"] =

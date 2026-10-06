@@ -58,6 +58,11 @@ bool VgiCatalogSet::ShouldBypassRpcLocked(ClientContext &context, bool trust_emp
 	if (is_loaded_) {
 		return false;
 	}
+	// A catalog_contents seed is authoritative and free to load; no need to
+	// consult (and decode) the schema's estimated counts.
+	if (schema_entry_ && schema_entry_->HasSeed(CacheKindName())) {
+		return false;
+	}
 	ResolveEagerLoadParamsLocked();
 	if (estimated_count_ != 0) {
 		return false;

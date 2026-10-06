@@ -122,7 +122,13 @@ optional_ptr<CatalogEntry> VgiCatalog::CreateSchema(CatalogTransaction transacti
 }
 
 void VgiCatalog::ScanSchemas(ClientContext &context, std::function<void(SchemaCatalogEntry &)> callback) {
-	schemas.Scan(context, [&](CatalogEntry &entry) { callback(entry.Cast<SchemaCatalogEntry>()); });
+	schemas.Scan(context, [&](CatalogEntry &entry) {
+		// A schema seeded from catalog_contents decodes its SchemaInfo lazily;
+		// scans (duckdb_schemas() & co.) read its comment and tags.
+		auto &schema = entry.Cast<VgiSchemaEntry>();
+		schema.EnsureSchemaInfo();
+		callback(schema);
+	});
 }
 
 optional_ptr<SchemaCatalogEntry> VgiCatalog::LookupSchema(CatalogTransaction transaction,
@@ -400,6 +406,13 @@ bool VgiCatalog::CheckAndInvalidateCache(ClientContext &context, const std::vect
 		etag = contents_etag_;
 	}
 	if (etag && attach_result_->supports_catalog_contents && vgi::UseCatalogContents(context)) {
+		if (!schemas.Loaded()) {
+			// Nothing is cached (cleared by DDL / vgi_clear_cache()): the next
+			// schema-set load fetches a fresh snapshot anyway, so a conditional
+			// call now could only cost a second catalog_contents.
+			VGI_LOG(context, "catalog.invalidate.skip", {{"reason", "not_loaded"}});
+			return false;
+		}
 		if (auto cleared = RevalidateContents(context, rpc_ctx, *etag)) {
 			return *cleared;
 		}

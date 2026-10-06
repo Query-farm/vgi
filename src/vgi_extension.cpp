@@ -97,6 +97,7 @@
 #include "vgi_table_statistics_function.hpp"
 #include "vgi_table_branches_function.hpp"
 #include "vgi_function_arguments_function.hpp"
+#include "vgi_catalog_contents_function.hpp"
 #include "vgi_clear_cache.hpp"
 #include "vgi_result_cache.hpp"
 #include "vgi_companion_catalogs.hpp"
@@ -4089,6 +4090,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	// Register cache management function
 	vgi::RegisterVgiClearCacheFunction(loader);
+	vgi::RegisterVgiCatalogContentsFunction(loader);
 
 	// Register result-cache diagnostics
 	vgi::RegisterVgiResultCacheFunction(loader);

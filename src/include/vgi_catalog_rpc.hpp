@@ -110,6 +110,10 @@ VgiCatalogContents InvokeCatalogContents(const CatalogRpcContext &ctx, ClientCon
 // never calls catalog_contents: neither to load nor to revalidate.
 bool UseCatalogContents(ClientContext &context);
 
+// Decode a catalog_contents schema's SchemaInfo (lazily, on first use).
+// Throws if its path differs from SchemaContents.path.
+VgiSchemaInfo DecodeContentsSchemaInfo(const VgiSchemaContents &contents);
+
 // Decode one kind of a catalog_contents schema entry (done lazily, on a set's
 // first load). function_type / macro_type use the RPC spellings
 // (SCALAR_FUNCTION, TABLE_MACRO, ...).

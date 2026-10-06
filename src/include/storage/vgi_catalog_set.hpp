@@ -81,6 +81,12 @@ public:
 		return catalog_;
 	}
 
+	// Whether the set currently holds a loaded listing (takes entry_lock_).
+	bool Loaded() {
+		std::lock_guard<std::mutex> lock(entry_lock_);
+		return is_loaded_;
+	}
+
 	// Defensive flip after local DDL that adds an entry of this kind. Clears
 	// the cached zero-count emptiness signal so the next GetEntry() does not
 	// short-circuit. Public because it's called from VgiSchemaEntry's DDL

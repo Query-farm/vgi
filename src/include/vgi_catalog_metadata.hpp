@@ -36,6 +36,7 @@
 namespace arrow {
 class Schema;
 class RecordBatch;
+class StructArray;
 } // namespace arrow
 
 namespace duckdb {
@@ -184,6 +185,7 @@ struct VgiCatalogInfo {
 // Schema metadata from the worker
 struct VgiSchemaInfo {
 	std::string name;
+	std::vector<std::string> path;
 	std::string comment;
 	std::map<std::string, std::string> tags;
 	// Approximate population per object kind, keyed by VgiCatalogSet::CacheKindName()
@@ -765,14 +767,18 @@ VgiMacroInfo ParseMacroInfo(const std::shared_ptr<arrow::RecordBatch> &batch, co
 VgiScanFunctionResult ParseScanFunctionResult(ClientContext &context, const std::shared_ptr<arrow::RecordBatch> &batch,
                                                const std::string &worker_path);
 
-// One schema and everything in it, from catalog_contents. Only `schema` is
-// decoded up front; `entry` is the schema's SchemaContents record, whose
-// per-kind item lists are decoded on first use (DecodeContents* in
+// One schema and everything in it, from catalog_contents: row `row` of the
+// response's `schemas` struct column, held in place (every schema of a
+// snapshot shares `rows`, and so the response buffers; nothing is copied).
+// Only `path` is read up front, to name the schema entry. The SchemaInfo and
+// each kind's item list are decoded on first use (DecodeContents* in
 // vgi_catalog_rpc.hpp), so a query touching two schemas does not pay to decode
 // the whole catalog. Each kind is complete: an empty list means none.
 struct VgiSchemaContents {
-	VgiSchemaInfo schema;
-	std::shared_ptr<arrow::RecordBatch> entry;
+	std::string name;              // SchemaNameFromPath(path)
+	std::vector<std::string> path; // SchemaContents.path; must equal SchemaInfo.path
+	std::shared_ptr<arrow::StructArray> rows;
+	int64_t row = 0;
 	std::string worker_path;
 };
 

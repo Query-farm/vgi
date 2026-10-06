@@ -3,14 +3,15 @@
 #              invalidates the touched set and drops that kind's not-yet-taken
 #              snapshot seed, so the set reloads through the per-schema RPC
 #              (which sees the change) instead of the stale snapshot; the next
-#              transaction sees the catalog_version bump, clears the cache, and
-#              reloads with a fresh catalog_contents.
+#              transaction's revalidation (catalog_contents with the held etag)
+#              gets the changed catalog in full and reloads from it.
 #              Regression: before seeds were discarded on invalidation, a view
 #              created inside a transaction after the snapshot was taken (but
 #              before views were first loaded) was missing from duckdb_views().
 #              Fixture: vgi-python vgi/_test_fixtures/catalog_contents.py
-#              (contents_memory: a DDL-capable in-memory catalog, private per
-#              ATTACH, that advertises supports_catalog_contents).
+#              (contents_reval: a DDL-capable in-memory catalog, private per
+#              ATTACH, that advertises supports_catalog_contents and revalidates
+#              with an etag bumped by every DDL).
 #              Gated on VGI_CATALOG_CONTENTS_WORKER (vgi-python only);
 #              catalog_contents_conformance.test is the every-SDK check.
 # group: [vgi_integration_catalog]
@@ -31,7 +32,7 @@ CREATE MACRO rpc_count(m) AS (
       AND message LIKE '%method=' || m || ',%');
 
 statement ok
-ATTACH 'contents_memory' AS mem (TYPE vgi, LOCATION '${VGI_CATALOG_CONTENTS_WORKER}');
+ATTACH 'contents_reval' AS mem (TYPE vgi, LOCATION '${VGI_CATALOG_CONTENTS_WORKER}');
 
 statement ok
 CALL truncate_duckdb_logs();
@@ -52,8 +53,9 @@ SELECT rpc_count('catalog_schemas');
 0
 
 # ============================================================================
-# Autocommit DDL: each statement bumps the worker's catalog_version, so the
-# next transaction clears the cache and reloads with catalog_contents.
+# Autocommit DDL: each statement changes the worker's etag, so the next
+# transaction's revalidation returns the full catalog and the cache reloads
+# from it.
 # ============================================================================
 
 statement ok
@@ -99,7 +101,7 @@ SELECT rpc_count('catalog_schemas');
 statement ok
 BEGIN;
 
-# Loads the schema set from a fresh catalog_contents (v1 bumped the version)
+# Loads the schema set from a fresh catalog_contents (v1 changed the etag)
 # and takes only the table seed; the view seed is still untaken.
 query I
 SELECT table_name FROM duckdb_tables() WHERE database_name = 'mem' ORDER BY ALL;

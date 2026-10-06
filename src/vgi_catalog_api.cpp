@@ -474,39 +474,49 @@ std::vector<VgiSchemaInfo> InvokeCatalogSchemas(const CatalogRpcContext &ctx, Cl
 
 namespace {
 
-// Decode one list<binary> column of a SchemaContents row into item batches,
-// validating each against the item schema of the per-schema RPC that returns
-// the same items (`items_method`).
-std::vector<std::shared_ptr<arrow::RecordBatch>> ContentsItems(const std::shared_ptr<arrow::RecordBatch> &entry,
-                                                               const char *column, const char *items_method,
-                                                               const std::string &worker_path) {
+// One list<binary> field of a SchemaContents struct row: its items, decoded
+// zero-copy from the response buffers and validated against the item schema of
+// the per-schema RPC that returns the same items (`items_method`).
+std::vector<std::shared_ptr<arrow::RecordBatch>> ContentsItems(const VgiSchemaContents &contents, const char *column,
+                                                               const char *items_method) {
+	auto &worker_path = contents.worker_path;
+	auto list_array = std::dynamic_pointer_cast<arrow::ListArray>(contents.rows->GetFieldByName(column));
+	if (!list_array || list_array->value_type()->id() != arrow::Type::BINARY) {
+		throw IOException("catalog_contents: SchemaContents field '%s' is missing or not list<binary> [worker: %s]",
+		                  column, worker_path);
+	}
 	std::vector<std::shared_ptr<arrow::RecordBatch>> items;
-	auto col = entry->GetColumnByName(column);
-	if (!col) {
-		throw IOException("catalog_contents: SchemaContents is missing column '%s' [worker: %s]", column, worker_path);
-	}
-	auto list_array = std::dynamic_pointer_cast<arrow::ListArray>(col);
-	if (!list_array) {
-		throw IOException("catalog_contents: SchemaContents column '%s' is not list<binary> [worker: %s]", column,
-		                  worker_path);
-	}
-	if (list_array->IsNull(0)) {
+	if (list_array->IsNull(contents.row)) {
 		return items;
 	}
 	auto values = std::static_pointer_cast<arrow::BinaryArray>(list_array->values());
-	for (int64_t i = list_array->value_offset(0); i < list_array->value_offset(1); i++) {
+	const int64_t begin = list_array->value_offset(contents.row);
+	const int64_t end = list_array->value_offset(contents.row + 1);
+	items.reserve(static_cast<size_t>(end - begin));
+	for (int64_t i = begin; i < end; i++) {
 		if (values->IsNull(i)) {
 			continue;
 		}
-		auto view = values->GetView(i);
-		auto item = DeserializeFromIpcBytes(std::vector<uint8_t>(view.data(), view.data() + view.size()));
+		auto item = DeserializeFromIpcBytesZeroCopy(*values, i);
 		if (!item || item->num_rows() == 0) {
 			continue;
 		}
-		ValidateItemSchema(item, items_method, worker_path, static_cast<size_t>(i - list_array->value_offset(0)));
+		ValidateItemSchema(item, items_method, worker_path, static_cast<size_t>(i - begin));
 		items.push_back(std::move(item));
 	}
 	return items;
+}
+
+std::vector<std::string> StringListAt(const arrow::ListArray &list, int64_t row) {
+	std::vector<std::string> out;
+	if (list.IsNull(row)) {
+		return out;
+	}
+	auto values = std::static_pointer_cast<arrow::StringArray>(list.values());
+	for (int64_t i = list.value_offset(row); i < list.value_offset(row + 1); i++) {
+		out.push_back(values->GetString(i));
+	}
+	return out;
 }
 
 } // namespace
@@ -521,63 +531,78 @@ bool UseCatalogContents(ClientContext &context) {
 
 VgiCatalogContents InvokeCatalogContents(const CatalogRpcContext &ctx, ClientContext &context,
                                          const std::optional<std::string> &if_none_match) {
-	// TODO(v2 wire): send if_none_match once the params carry it.
-	(void)if_none_match;
 	auto &worker_path = ctx.params->worker_path();
-	auto params = generated::BuildCatalogContentsParams(ctx.attach_opaque_data);
+	auto params = generated::BuildCatalogContentsParams(ctx.attach_opaque_data, if_none_match);
 	auto response = InvokeRpcMethod(ctx, "catalog_contents", params, context);
+	// The registry validates the whole typed response, nested struct included.
 	auto result_batch = ExtractAndDeserializeResult(response, "catalog_contents", worker_path);
 	if (!result_batch || result_batch->num_rows() == 0) {
 		throw IOException("Empty response from catalog_contents [worker: %s]", worker_path);
 	}
 
 	VgiCatalogContents result;
-	auto version_col = std::dynamic_pointer_cast<arrow::Int64Array>(result_batch->GetColumnByName("catalog_version"));
-	if (version_col && !version_col->IsNull(0)) {
-		result.catalog_version = version_col->Value(0);
+	auto version_col = std::static_pointer_cast<arrow::Int64Array>(result_batch->GetColumnByName("catalog_version"));
+	result.catalog_version = version_col->Value(0);
+	auto etag_col = std::static_pointer_cast<arrow::StringArray>(result_batch->GetColumnByName("etag"));
+	if (!etag_col->IsNull(0)) {
+		result.etag = etag_col->GetString(0);
+	}
+	auto not_modified_col =
+	    std::static_pointer_cast<arrow::BooleanArray>(result_batch->GetColumnByName("not_modified"));
+	result.not_modified = !not_modified_col->IsNull(0) && not_modified_col->Value(0);
+	if (result.not_modified) {
+		// Only meaningful as the answer to a matching if_none_match.
+		if (!if_none_match || result.etag != if_none_match) {
+			throw IOException("catalog_contents answered not_modified without a matching if_none_match [worker: %s]",
+			                  worker_path);
+		}
+		return result;
 	}
 
-	// `schemas` is list<binary> like an `items` column; each element is one
-	// IPC-serialized SchemaContents record.
-	auto schemas_col = std::dynamic_pointer_cast<arrow::ListArray>(result_batch->GetColumnByName("schemas"));
-	if (!schemas_col) {
-		throw IOException("catalog_contents: response has no list<binary> 'schemas' column [worker: %s]", worker_path);
-	}
+	// `schemas` is list<struct<SchemaContents>>: one struct row per schema. Keep
+	// the struct column and index its rows in place; read only `path` now.
+	auto schemas_col = std::static_pointer_cast<arrow::ListArray>(result_batch->GetColumnByName("schemas"));
 	if (schemas_col->IsNull(0)) {
 		return result;
 	}
-	auto schema_values = std::static_pointer_cast<arrow::BinaryArray>(schemas_col->values());
-	for (int64_t i = schemas_col->value_offset(0); i < schemas_col->value_offset(1); i++) {
-		auto view = schema_values->GetView(i);
-		auto entry = DeserializeFromIpcBytes(std::vector<uint8_t>(view.data(), view.data() + view.size()));
-		if (!entry || entry->num_rows() == 0) {
-			throw IOException("catalog_contents: empty SchemaContents record [worker: %s]", worker_path);
-		}
-		ValidateItemSchema(entry, "catalog_contents", worker_path,
-		                   static_cast<size_t>(i - schemas_col->value_offset(0)));
-
+	auto rows = std::static_pointer_cast<arrow::StructArray>(schemas_col->values());
+	auto path_col = std::static_pointer_cast<arrow::ListArray>(rows->GetFieldByName("path"));
+	const int64_t begin = schemas_col->value_offset(0);
+	const int64_t end = schemas_col->value_offset(1);
+	result.schemas.reserve(static_cast<size_t>(end - begin));
+	for (int64_t i = begin; i < end; i++) {
 		VgiSchemaContents contents;
-		auto schema_col = std::dynamic_pointer_cast<arrow::BinaryArray>(entry->GetColumnByName("schema"));
-		if (!schema_col || schema_col->IsNull(0)) {
-			throw IOException("catalog_contents: SchemaContents has no 'schema' [worker: %s]", worker_path);
-		}
-		auto schema_view = schema_col->GetView(0);
-		auto schema_batch =
-		    DeserializeFromIpcBytes(std::vector<uint8_t>(schema_view.data(), schema_view.data() + schema_view.size()));
-		ValidateItemSchema(schema_batch, "catalog_schemas", worker_path, static_cast<size_t>(i));
-		contents.schema = ParseSchemaInfo(schema_batch, worker_path);
-
-		// Item lists stay encoded until a set first loads them.
-		contents.entry = std::move(entry);
+		contents.path = StringListAt(*path_col, i);
+		contents.name = SchemaNameFromPath(contents.path, "SchemaContents.path");
+		contents.rows = rows;
+		contents.row = i;
 		contents.worker_path = worker_path;
 		result.schemas.push_back(std::move(contents));
 	}
 	return result;
 }
 
+VgiSchemaInfo DecodeContentsSchemaInfo(const VgiSchemaContents &contents) {
+	auto &worker_path = contents.worker_path;
+	auto schema_col = std::dynamic_pointer_cast<arrow::BinaryArray>(contents.rows->GetFieldByName("schema"));
+	if (!schema_col || schema_col->IsNull(contents.row)) {
+		throw IOException("catalog_contents: schema '%s' has no SchemaInfo [worker: %s]", contents.name, worker_path);
+	}
+	auto batch = DeserializeFromIpcBytesZeroCopy(*schema_col, contents.row);
+	ValidateItemSchema(batch, "catalog_schemas", worker_path, static_cast<size_t>(contents.row));
+	auto info = ParseSchemaInfo(batch, worker_path);
+	if (info.path != contents.path) {
+		throw IOException("catalog_contents: SchemaContents.path [%s] differs from its SchemaInfo.path [%s] "
+		                  "[worker: %s]",
+		                  StringUtil::Join(duckdb::vector<std::string>(contents.path.begin(), contents.path.end()), "."),
+		                  StringUtil::Join(duckdb::vector<std::string>(info.path.begin(), info.path.end()), "."), worker_path);
+	}
+	return info;
+}
+
 std::vector<VgiTableInfo> DecodeContentsTables(const VgiSchemaContents &contents, ClientContext &context) {
 	std::vector<VgiTableInfo> out;
-	for (auto &b : ContentsItems(contents.entry, "tables", "catalog_schema_contents_tables", contents.worker_path)) {
+	for (auto &b : ContentsItems(contents, "tables", "catalog_schema_contents_tables")) {
 		out.push_back(ParseTableInfo(context, b, contents.worker_path));
 	}
 	return out;
@@ -585,7 +610,7 @@ std::vector<VgiTableInfo> DecodeContentsTables(const VgiSchemaContents &contents
 
 std::vector<VgiViewInfo> DecodeContentsViews(const VgiSchemaContents &contents) {
 	std::vector<VgiViewInfo> out;
-	for (auto &b : ContentsItems(contents.entry, "views", "catalog_schema_contents_views", contents.worker_path)) {
+	for (auto &b : ContentsItems(contents, "views", "catalog_schema_contents_views")) {
 		out.push_back(ParseViewInfo(b, contents.worker_path));
 	}
 	return out;
@@ -601,7 +626,7 @@ std::vector<VgiFunctionInfo> DecodeContentsFunctions(const VgiSchemaContents &co
 		throw InternalException("catalog_contents: unknown function type %s", function_type);
 	}
 	std::vector<VgiFunctionInfo> out;
-	for (auto &b : ContentsItems(contents.entry, column, "catalog_schema_contents_functions", contents.worker_path)) {
+	for (auto &b : ContentsItems(contents, column, "catalog_schema_contents_functions")) {
 		out.push_back(ParseFunctionInfo(b, 0, contents.worker_path));
 	}
 	return out;
@@ -615,7 +640,7 @@ std::vector<VgiMacroInfo> DecodeContentsMacros(const VgiSchemaContents &contents
 		throw InternalException("catalog_contents: unknown macro type %s", macro_type);
 	}
 	std::vector<VgiMacroInfo> out;
-	for (auto &b : ContentsItems(contents.entry, column, "catalog_schema_contents_macros", contents.worker_path)) {
+	for (auto &b : ContentsItems(contents, column, "catalog_schema_contents_macros")) {
 		out.push_back(ParseMacroInfo(b, contents.worker_path));
 	}
 	return out;
@@ -2315,7 +2340,8 @@ VgiSchemaInfo ParseSchemaInfo(const std::shared_ptr<arrow::RecordBatch> &batch, 
 	}
 
 	RecordBatchSingleRow row(batch, 0, "SchemaInfo", worker_path);
-	info.name = SchemaNameFromPath(row["path"].value_not_null<std::vector<std::string>>(), "SchemaInfo.path");
+	info.path = row["path"].value_not_null<std::vector<std::string>>();
+	info.name = SchemaNameFromPath(info.path, "SchemaInfo.path");
 	info.comment = row["comment"].value_or("");
 	info.tags = row["tags"].value_not_null<std::map<std::string, std::string>>();
 	// nullable map — workers may omit it entirely; downstream defaults missing keys to 1
@@ -2513,7 +2539,8 @@ std::vector<VgiSchemaInfo> ParseSchemaList(const std::shared_ptr<arrow::RecordBa
 	for (int64_t i = 0; i < batch->num_rows(); i++) {
 		RecordBatchSingleRow row(batch, i, "SchemaInfo", worker_path);
 		VgiSchemaInfo info;
-		info.name = SchemaNameFromPath(row["path"].value_not_null<std::vector<std::string>>(), "SchemaInfo.path");
+		info.path = row["path"].value_not_null<std::vector<std::string>>();
+		info.name = SchemaNameFromPath(info.path, "SchemaInfo.path");
 		info.comment = row["comment"].value_or("");
 		info.tags = row["tags"].value_not_null<std::map<std::string, std::string>>();
 		schemas.push_back(std::move(info));

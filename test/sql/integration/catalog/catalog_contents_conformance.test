@@ -7,6 +7,9 @@
 #              advertise it must never be sent catalog_contents. Either way the
 #              catalog seen by duckdb_tables/columns/views/functions is identical
 #              to the per-schema path (SET vgi_catalog_contents = false). The
+#              response's schema paths match the catalog, and a worker that
+#              returns an etag answers a conditional call with it not_modified
+#              (any other etag: full contents). The
 #              detailed tests that need vgi-python's contents_* fixture catalogs
 #              are catalog_contents.test / _fallback.test / _ddl.test.
 # group: [vgi_integration_catalog]
@@ -85,6 +88,44 @@ query I
 SELECT COUNT(*) > 0 FROM shape_contents WHERE kind = 'table';
 ----
 true
+
+# vgi_catalog_contents() issues one catalog_contents and reports the answer
+# (no rows when the worker does not advertise it, so every check below holds
+# vacuously then). A full response names exactly the catalog's schemas, and
+# each SchemaContents.path equals its SchemaInfo.path (the client verifies it
+# when it decodes the SchemaInfo).
+query I
+SELECT bool_and(NOT not_modified
+                AND list_sort(schemas) = (SELECT list_sort(list(schema_name)) FROM duckdb_schemas() WHERE database_name = 'c')
+                AND schemas = schema_info_names) IS NOT FALSE
+FROM vgi_catalog_contents('c');
+----
+true
+
+# Revalidation, for a worker that returns an etag (null = it does not
+# revalidate): a conditional call with that etag is not_modified with no
+# schemas and the same etag ...
+statement ok
+SET VARIABLE c_etag = (SELECT etag FROM vgi_catalog_contents('c'));
+
+query I
+SELECT bool_and(CASE WHEN getvariable('c_etag') IS NULL THEN NOT not_modified
+                     ELSE not_modified AND len(schemas) = 0 AND etag = getvariable('c_etag') END) IS NOT FALSE
+FROM vgi_catalog_contents('c', if_none_match := getvariable('c_etag'));
+----
+true
+
+# ... and a different etag (which a worker without etags must ignore) gets
+# the full contents.
+query I
+SELECT bool_and(NOT not_modified
+                AND len(schemas) = (SELECT len(schemas) FROM vgi_catalog_contents('c'))) IS NOT FALSE
+FROM vgi_catalog_contents('c', if_none_match := 'vgi-conformance-not-a-current-etag');
+----
+true
+
+statement ok
+RESET VARIABLE c_etag;
 
 statement ok
 DETACH c;

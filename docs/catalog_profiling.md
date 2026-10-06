@@ -67,15 +67,20 @@ Emitted by `VgiTableEntry::GetStatistics` once per call, after the load gate has
 
 Note: each *column* DuckDB asks about emits a separate event. A query that touches 8 columns of a fresh table will produce 1 `fetched` event followed by 7 `fresh_hit` events.
 
-### `catalog.contents` / `catalog.seed_decode`
+### `catalog.contents` / `catalog.seed_decode` / `catalog.invalidate`
 
-Emitted when the worker advertises `supports_catalog_contents` and the schema
-set loads with one `catalog_contents` RPC (see `docs/catalog_contents.md`).
+Emitted when the worker advertises `supports_catalog_contents` (see
+`docs/catalog_contents.md`, "Caching and revalidation").
 
 | Event | Fields |
 |-------|--------|
-| `catalog.contents` | `outcome` (`loaded` or `fallback`); `schemas`, `catalog_version` when loaded; `error_message` on fallback (the client then uses `catalog_schemas` + `catalog_schema_contents_*`) |
+| `catalog.contents` | per schema-set load: `outcome` = `loaded` (`schemas`, `catalog_version`, `etag`; `source=revalidation` when the snapshot came from the transaction-start check), `skipped` (`reason=unversioned_reload`: version-0 rule, per-schema RPCs used), `stale` (`attempt`, `catalog_version`, `known_version`: snapshot older than the known version), or `fallback` (`error_message`; the client then uses `catalog_schemas` + `catalog_schema_contents_*`) |
 | `catalog.seed_decode` | `schema`, `kind` (`table`, `view`, `SCALAR_FUNCTION`, `AGGREGATE_FUNCTION`, `TABLE_FUNCTION`, `SCALAR_MACRO`, `TABLE_MACRO`), `items` — one per kind decoded from the snapshot, at most once per schema and kind |
+| `catalog.invalidate` | per transaction start (non-frozen catalogs): `current_version`, `last_version`, `action`. With an etag the check is `catalog_contents(if_none_match)`, logged `via=catalog_contents` with `etag` and `action` = `not_modified` (caches kept), `clear_modified` (snapshot replaced), `clear_stale`, or `revalidate_failed` (then the version poll runs). The version poll's actions are `noop`, `clear_changed`, `clear_unknown` (version 0). With an etag but nothing cached, the check is skipped: `catalog.invalidate.skip reason=not_loaded` |
+
+To count revalidation calls per transaction: `catalog.rpc` events with
+`method=catalog_contents` next to `catalog.invalidate` events with
+`via=catalog_contents` — one of each per transaction, and no `catalog_version`.
 
 ### `catalog.cache_clear` / `catalog.cache_clear_summary`
 

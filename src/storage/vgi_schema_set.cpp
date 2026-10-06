@@ -51,26 +51,21 @@ void VgiSchemaSet::LoadEntries(ClientContext &context, const std::lock_guard<std
 	// each schema entry's per-kind caches. The catalog decides whether to use
 	// it (setting, reload and version rules, a snapshot already fetched by
 	// revalidation); null means the per-schema path. See docs/catalog_contents.md.
-	std::vector<vgi::VgiSchemaContents> contents;
-	bool have_contents = false;
 	if (auto snapshot = vgi_catalog.TakeCatalogContents(context, rpc_ctx)) {
-		contents = std::move(snapshot->schemas);
-		have_contents = true;
-	}
-
-	std::vector<vgi::VgiSchemaInfo> schema_list;
-	if (have_contents) {
-		schema_list.reserve(contents.size());
-		for (auto &c : contents) {
-			schema_list.push_back(c.schema);
+		// Name each entry from SchemaContents.path; its SchemaInfo is decoded
+		// on first use. Every entry shares the snapshot's response buffers.
+		for (auto &contents : snapshot->schemas) {
+			CreateSchemaInfo info;
+			info.schema = contents.name;
+			auto seed = std::make_shared<const vgi::VgiSchemaContents>(std::move(contents));
+			auto schema_entry = make_uniq<VgiSchemaEntry>(catalog_, info, std::move(seed));
+			std::lock_guard<std::mutex> entry_lk(entry_lock_);
+			CreateEntryLocked(std::move(schema_entry));
 		}
-	} else {
-		schema_list = vgi::InvokeCatalogSchemas(rpc_ctx, context);
+		return;
 	}
 
-	// Create schema entries
-	for (size_t i = 0; i < schema_list.size(); i++) {
-		auto &schema_info = schema_list[i];
+	for (auto &schema_info : vgi::InvokeCatalogSchemas(rpc_ctx, context)) {
 		CreateSchemaInfo info;
 		info.schema = schema_info.name;
 		if (!schema_info.comment.empty()) {
@@ -79,12 +74,9 @@ void VgiSchemaSet::LoadEntries(ClientContext &context, const std::lock_guard<std
 		for (auto &[key, val] : schema_info.tags) {
 			info.tags[key] = val;
 		}
-
 		auto schema_entry = make_uniq<VgiSchemaEntry>(catalog_, info, schema_info);
-		if (have_contents) {
-			schema_entry->SeedContents(std::move(contents[i]));
-		}
-		{ std::lock_guard<std::mutex> __entry_lk(entry_lock_); CreateEntryLocked(std::move(schema_entry)); }
+		std::lock_guard<std::mutex> entry_lk(entry_lock_);
+		CreateEntryLocked(std::move(schema_entry));
 	}
 }
 
