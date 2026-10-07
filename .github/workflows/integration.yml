@@ -162,11 +162,11 @@ jobs:
           # This editable install REPLACES vgi-rpc in the fixture venv for the
           # rest of the job, so the pin governs every later step -- not just the
           # Iroh one. It must therefore stay at or above the version vgi-python
-          # itself requires (>=0.46.0), where `vgi_rpc.protocol` became a
-          # required routing key and HTTP routes moved to
-          # {prefix}/{protocol}/{method}. The previous pin sat at 0.45.0, which
-          # predates both and would silently downgrade the whole suite.
-          git -C /tmp/vgi-rpc-python checkout e78bc535753153b1de0c156ff828ee667be29f40
+          # itself requires (>=0.50.0: the error model's `vgi_rpc.errors`, the
+          # public reflection client). An older pin silently downgrades the
+          # whole suite; at 0.46 every fixture worker failed with
+          # "No module named 'vgi_rpc.errors'" once vgi-python required 0.50.
+          git -C /tmp/vgi-rpc-python checkout 609e333505bd50947c5893419131a63dea8f5649  # v0.50.0
           uv pip install --python /tmp/vgi-python/.venv/bin/python --editable '/tmp/vgi-rpc-python[http]'
 
       - name: Run native Iroh raw and HTTP integration
